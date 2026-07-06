@@ -1,17 +1,15 @@
 import type { AgentEvent, AgentTimelineBlock, AgentTimelineResult, PermissionRequest } from '@deepcode/protocol';
-import { findActiveSessionInteraction } from '../../state/sessionInteractions';
 
 export interface AgentComposerDecisionOption {
   id: string;
   label: string;
   description?: string;
   recommended?: boolean;
-  // R4：用户介入卡 option 的状态机副作用。GUI 据此向用户展示
-  // "选择后会触发什么"，避免模型/用户对结果不一致的伪造（卡片所读即事实）。
+
   effect?: AgentRequirementOptionEffectView;
 }
 
-// 与 session-core protocolV3.normalizeOptionEffect 对齐（运行时视图，结构最小）。
+
 export type AgentRequirementOptionEffectView =
   | { kind: 'continueWithAction' }
   | { kind: 'skipCurrentTask' }
@@ -58,45 +56,6 @@ export type AgentComposerPendingDecision =
       summary?: string;
       resolving?: boolean;
     };
-
-export function findPendingComposerDecision(input: {
-  events: AgentEvent[];
-  pendingPermission?: PermissionRequest | null;
-  resolvingRequirement?: { runId: string; requirementId: string } | null;
-  resolvingPlan?: { runId: string; planId: string } | null;
-  resolvingReview?: { runId: string } | null;
-  resolvingPermission?: { id: string } | null;
-}): AgentComposerPendingDecision | null {
-  const active = findActiveSessionInteraction({
-    events: input.events,
-    pendingPermission: input.pendingPermission,
-  });
-  if (!active) return null;
-  if (active.kind === 'permission') {
-    return {
-      ...active,
-      resolving: input.resolvingPermission?.id === active.requestId,
-    };
-  }
-  if (active.kind === 'requirement') {
-    return {
-      ...active,
-      decisionRequest: findRequirementDecisionRequest(input.events, active.runId, active.requirementId),
-      resolving: input.resolvingRequirement?.runId === active.runId &&
-        input.resolvingRequirement?.requirementId === active.requirementId,
-    };
-  }
-  if (active.kind === 'plan') {
-    return {
-      ...active,
-      resolving: input.resolvingPlan?.runId === active.runId && input.resolvingPlan?.planId === active.planId,
-    };
-  }
-  return {
-    ...active,
-    resolving: input.resolvingReview?.runId === active.runId,
-  };
-}
 
 export function findPendingComposerDecisionFromProjection(input: {
   timeline: AgentTimelineResult;
@@ -195,6 +154,7 @@ function pendingPlanFromEvent(
   const runId = stringField(payload, 'runId');
   const planId = stringField(payload, 'planId');
   if (!runId || !planId) return null;
+  if (hasTerminalRunState(events, runId)) return null;
   if (hasTerminalPlanDecision(events, runId, planId)) return null;
   return {
     kind: 'plan',
@@ -216,6 +176,7 @@ function pendingReviewFromEvent(
   if (!runId) return null;
   const reviewId = stringField(payload, 'reviewId');
   const sourcePlanId = stringField(payload, 'sourcePlanId');
+  if (hasTerminalRunState(events, runId)) return null;
   if (hasTerminalReviewDecision(events, runId, reviewId, sourcePlanId)) return null;
   return {
     kind: 'review',
@@ -235,6 +196,7 @@ function pendingRequirementFromEvent(
   const runId = stringField(payload, 'runId');
   const requirementId = stringField(payload, 'requirementId');
   if (!runId || !requirementId) return null;
+  if (hasTerminalRunState(events, runId)) return null;
   if (hasTerminalRequirementDecision(events, runId, requirementId)) return null;
   return {
     kind: 'requirement',
@@ -329,6 +291,15 @@ function hasTerminalRequirementDecision(events: AgentEvent[], runId: string, req
     const payload = asRecord(event.payload);
     if (!payload || !isTerminalStatus(stringField(payload, 'status'))) return false;
     return stringField(payload, 'runId') === runId && stringField(payload, 'requirementId') === requirementId;
+  });
+}
+
+function hasTerminalRunState(events: AgentEvent[], runId: string): boolean {
+  return events.some((event) => {
+    if (event.kind !== 'session_run_state') return false;
+    const payload = asRecord(event.payload);
+    if (!payload || stringField(payload, 'runId') !== runId) return false;
+    return isTerminalStatus(stringField(payload, 'status'));
   });
 }
 

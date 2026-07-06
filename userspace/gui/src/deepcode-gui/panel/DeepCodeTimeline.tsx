@@ -6,23 +6,24 @@ import type {
   AgentTimelineBlock,
   AgentTimelineResult,
   AgentTimelineTurn,
-  ProjectionDelta,
 } from '@deepcode/protocol';
 import { isInternalOrchestrationStage } from '@deepcode/session-core';
 import { t, resolveDiagnosticText, type UiLanguage } from '../../i18n';
 import { submitAgentFeedback } from '../../services/runtimeAdapter';
 import MarkdownContent from '../../components/agent-panel/LazyMarkdownContent';
 import ToolEvidenceDetails from '../../components/agent-panel/ToolEvidenceDetails';
+import {
+  hasStructuredProjection,
+  StructuredProjectionContent,
+  structuredProjectionText,
+} from '../../components/agent-panel/StructuredProjectionContent';
 import { useSettingsStore } from '../../state/settingsStore';
 import { formatToolEvidence } from '../../utils/toolEvidence';
-import { buildUiTimelineProjection } from '../../utils/uiTimelineProjection';
 
 interface DeepCodeTimelineProps {
-  timeline: AgentTimelineResult | null;
-  fallbackEvents: AgentEvent[];
+  timeline: AgentTimelineResult;
   loading: boolean;
   language: UiLanguage;
-  activeDeltas?: ProjectionDelta[];
   followLatestSignal?: number;
   scrollWatchElement?: HTMLElement | null;
   onTypewriterActiveChange?: (active: boolean) => void;
@@ -37,31 +38,34 @@ interface DeepCodeTimelineProps {
 type TypewriterSpeed = NonNullable<NonNullable<AgentTimelineBlock['displayHints']>['typewriterSpeed']>;
 type TimelineFollowMode = 'following' | 'detached';
 const MAX_TYPEWRITER_CHARS = 1600;
+const TYPEWRITER_BUFFER_DELAY_MS = 36;
 const LIVE_REASONING_FAST_BACKLOG_CHARS = 4000;
 const LIVE_REASONING_SNAP_BACKLOG_CHARS = 12000;
 
 const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
   timeline,
-  fallbackEvents,
   loading,
   language,
-  activeDeltas = [],
   followLatestSignal = 0,
   scrollWatchElement = null,
   onTypewriterActiveChange,
   onPlanResolve,
 }) => {
-  const coalescedActiveDeltas = useCoalescedProjectionDeltas(activeDeltas, 50);
-  const view = useMemo(
-    () => buildUiTimelineProjection({
-      sessionId: timeline?.sessionId ?? fallbackEvents[0]?.sessionId ?? 'session',
-      events: fallbackEvents,
-      activeDeltas: coalescedActiveDeltas,
-      timeline,
-    }),
-    [coalescedActiveDeltas, fallbackEvents, timeline]
+  const view = timeline;
+  const [completedTypewriterBlockLengths, setCompletedTypewriterBlockLengths] = useState<Map<string, number>>(
+    () => new Map()
   );
-  const livePlayback = useProjectedTimelinePlayback(view, loading, 1000);
+  const typewriterEnabled = useSettingsStore((s) =>
+    Boolean(s.effectiveSettings['gui.typewriterAnimation'] ?? true)
+  );
+  const typewriterBlockIds = useTypewriterBlockIds(view, loading && typewriterEnabled);
+  const livePlayback = useProjectedTimelinePlayback(
+    view,
+    loading,
+    1000,
+    completedTypewriterBlockLengths,
+    typewriterBlockIds
+  );
   const viewWithActive = useMemo(
     () => livePlayback.view,
     [livePlayback.view]
@@ -83,16 +87,12 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
     () => timelineScrollSignature(viewWithActive, loading),
     [viewWithActive, loading]
   );
-  const typewriterEnabled = useSettingsStore((s) =>
-    Boolean(s.effectiveSettings['gui.typewriterAnimation'] ?? true)
-  );
   const timelineDensity = useSettingsStore((s) =>
     String(s.effectiveSettings['gui.timelineDensity'] ?? 'normal')
   );
   const collapseCompletedThinking = useSettingsStore((s) =>
     Boolean(s.effectiveSettings['gui.collapseCompletedThinking'] ?? true)
   );
-  const typewriterBlockIds = useTypewriterBlockIds(viewWithActive, loading && typewriterEnabled);
   const typewriterBlockLengths = useMemo(
     () => collectTypewriterBlockLengths(viewWithActive, typewriterBlockIds),
     [typewriterBlockIds, viewWithActive]
@@ -103,9 +103,6 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
       .sort()
       .join('|'),
     [typewriterBlockLengths]
-  );
-  const [completedTypewriterBlockLengths, setCompletedTypewriterBlockLengths] = useState<Map<string, number>>(
-    () => new Map()
   );
   const timelineDensityClass = timelineDensity === 'compact' ? ' deepcode-gui-timeline--compact' : '';
   const hasPendingTypewriter = useMemo(() => {
@@ -393,18 +390,22 @@ interface ProjectedTimelinePlaybackResult {
 function useProjectedTimelinePlayback(
   view: AgentTimelineResult,
   enabled: boolean,
-  holdMs: number
+  holdMs: number,
+  completedTextLengths: Map<string, number>,
+  playbackBlockIds: Set<string>
 ): ProjectedTimelinePlaybackResult {
-  const liveBlockSignature = useMemo(() => livePlaybackBlockIds(view).join('|'), [view]);
+  const playbackBlockSignature = useMemo(
+    () => [...playbackBlockIds].sort().join('|'),
+    [playbackBlockIds]
+  );
   const [releasedBlockIds, setReleasedBlockIds] = useState<Set<string>>(() => new Set());
 
   useEffect(() => {
-    const liveIds = new Set(livePlaybackBlockIds(view));
     setReleasedBlockIds((current) => {
       let changed = false;
       const next = new Set<string>();
       for (const id of current) {
-        if (liveIds.has(id)) {
+        if (playbackBlockIds.has(id)) {
           next.add(id);
         } else {
           changed = true;
@@ -412,23 +413,29 @@ function useProjectedTimelinePlayback(
       }
       return changed || next.size !== current.size ? next : current;
     });
-  }, [liveBlockSignature, view]);
+  }, [playbackBlockIds, playbackBlockSignature]);
 
   const blockingBlockId = useMemo(() => {
     if (!enabled) return null;
     const blocks = flattenTimelineBlocks(view);
     for (let index = 0; index < blocks.length - 1; index += 1) {
       const block = blocks[index];
-      if (!isBlockingLiveTextBlock(block)) continue;
+      if (!isPlaybackBlockingTextBlock(block, playbackBlockIds)) continue;
       if (releasedBlockIds.has(block.id)) continue;
       const hasLaterVisibleBlock = blocks.slice(index + 1).some(isVisibleTimelineBlock);
       if (hasLaterVisibleBlock) return block.id;
     }
     return null;
-  }, [enabled, releasedBlockIds, view]);
+  }, [enabled, playbackBlockIds, releasedBlockIds, view]);
 
   useEffect(() => {
     if (!enabled || !blockingBlockId) return undefined;
+    const block = findTimelineBlock(view, blockingBlockId);
+    if (!block) return undefined;
+    const textLength = visibleTypewriterMarkdown(block).length;
+    if (textLength > 0 && (completedTextLengths.get(blockingBlockId) ?? 0) < textLength) {
+      return undefined;
+    }
     const timer = window.setTimeout(() => {
       setReleasedBlockIds((current) => {
         if (current.has(blockingBlockId)) return current;
@@ -438,7 +445,7 @@ function useProjectedTimelinePlayback(
       });
     }, holdMs);
     return () => window.clearTimeout(timer);
-  }, [blockingBlockId, enabled, holdMs]);
+  }, [blockingBlockId, completedTextLengths, enabled, holdMs, view]);
 
   const visibleView = useMemo(
     () => blockingBlockId ? truncateTimelineAfterBlock(view, blockingBlockId) : view,
@@ -455,8 +462,8 @@ function flattenTimelineBlocks(view: AgentTimelineResult): AgentTimelineBlock[] 
   return view.turns.flatMap((turn) => turn.blocks);
 }
 
-function livePlaybackBlockIds(view: AgentTimelineResult): string[] {
-  return flattenTimelineBlocks(view).filter(isLiveOverlayBlock).map((block) => block.id);
+function findTimelineBlock(view: AgentTimelineResult, blockId: string): AgentTimelineBlock | undefined {
+  return flattenTimelineBlocks(view).find((block) => block.id === blockId);
 }
 
 function isLiveOverlayBlock(block: AgentTimelineBlock): boolean {
@@ -464,8 +471,11 @@ function isLiveOverlayBlock(block: AgentTimelineBlock): boolean {
     (block.rawEventRefs ?? []).some((ref) => ref.startsWith('event:live:'));
 }
 
-function isBlockingLiveTextBlock(block: AgentTimelineBlock): boolean {
-  if (!isLiveOverlayBlock(block)) return false;
+function isPlaybackBlockingTextBlock(
+  block: AgentTimelineBlock,
+  playbackBlockIds: Set<string>
+): boolean {
+  if (!playbackBlockIds.has(block.id)) return false;
   if (visibleTypewriterMarkdown(block).length === 0) return false;
   return block.narrativeKind === 'assistantNarration' ||
     block.narrativeKind === 'assistantText' ||
@@ -485,15 +495,7 @@ function truncateTimelineAfterBlock(view: AgentTimelineResult, blockId: string):
     if (found) break;
     const blocks: AgentTimelineBlock[] = [];
     for (const block of turn.blocks) {
-      blocks.push(block.id === blockId ? {
-        ...block,
-        defaultCollapsed: false,
-        displayHints: {
-          ...(block.displayHints ?? {}),
-          initialOpen: true,
-          renderMode: 'instant',
-        },
-      } : block);
+      blocks.push(block);
       if (block.id === blockId) {
         found = true;
         break;
@@ -624,17 +626,21 @@ function useTypewriterBlockIds(
 ): Set<string> {
   const activeSessionIdRef = useRef<string | null>(null);
   const seenBlockIdsRef = useRef<Set<string>>(new Set());
+  const seenAnimationKeysRef = useRef<Set<string>>(new Set());
   const typewriterBlockIdsRef = useRef<Set<string>>(new Set());
   const liveSessionIdRef = useRef<string | null>(null);
 
   return useMemo(() => {
     const sessionId = view.sessionId;
-    const candidateIds = collectTypewriterBlockIds(view);
-    const candidateIdSet = new Set(candidateIds);
+    const candidateBlocks = collectTypewriterBlocks(view);
+    const latestInteractionTime = latestUserInteractionTime(view);
+    const candidateBlockById = new Map(candidateBlocks.map((block) => [block.id, block]));
+    const candidateIds = candidateBlocks.map((block) => block.id);
 
     if (activeSessionIdRef.current !== sessionId) {
       activeSessionIdRef.current = sessionId;
       seenBlockIdsRef.current = new Set(candidateIds);
+      seenAnimationKeysRef.current = new Set(candidateBlocks.map(typewriterAnimationKey));
       typewriterBlockIdsRef.current = new Set();
       liveSessionIdRef.current = loading ? sessionId : null;
       return new Set<string>();
@@ -644,14 +650,22 @@ function useTypewriterBlockIds(
       liveSessionIdRef.current = sessionId;
     }
     typewriterBlockIdsRef.current = new Set(
-      [...typewriterBlockIdsRef.current].filter((blockId) => candidateIdSet.has(blockId))
+      [...typewriterBlockIdsRef.current].filter((blockId) => {
+        const block = candidateBlockById.get(blockId);
+        return Boolean(block) && blockAfterInteraction(block!, latestInteractionTime);
+      })
     );
     const shouldAnimateNewAssistant = liveSessionIdRef.current === sessionId;
-    for (const blockId of candidateIds) {
+    for (const block of candidateBlocks) {
+      const blockId = block.id;
+      const animationKey = typewriterAnimationKey(block);
       if (seenBlockIdsRef.current.has(blockId)) continue;
       seenBlockIdsRef.current.add(blockId);
       if (shouldAnimateNewAssistant) {
-        typewriterBlockIdsRef.current.add(blockId);
+        if (blockAfterInteraction(block, latestInteractionTime) && !seenAnimationKeysRef.current.has(animationKey)) {
+          typewriterBlockIdsRef.current.add(blockId);
+        }
+        seenAnimationKeysRef.current.add(animationKey);
       }
     }
 
@@ -659,40 +673,84 @@ function useTypewriterBlockIds(
   }, [loading, view]);
 }
 
-function useCoalescedProjectionDeltas(deltas: ProjectionDelta[], delayMs: number): ProjectionDelta[] {
-  const [coalesced, setCoalesced] = useState(deltas);
-  const latestRef = useRef(deltas);
-  const timerRef = useRef<number | null>(null);
-
-  useEffect(() => {
-    latestRef.current = deltas;
-    if (timerRef.current !== null) return undefined;
-    timerRef.current = window.setTimeout(() => {
-      timerRef.current = null;
-      setCoalesced(latestRef.current);
-    }, delayMs);
-    return undefined;
-  }, [deltas, delayMs]);
-
-  useEffect(() => () => {
-    if (timerRef.current !== null) {
-      window.clearTimeout(timerRef.current);
-      timerRef.current = null;
-    }
-  }, []);
-
-  return coalesced;
-}
-
-function collectTypewriterBlockIds(view: AgentTimelineResult): string[] {
+function collectTypewriterBlocks(view: AgentTimelineResult): AgentTimelineBlock[] {
   return view.turns.flatMap((turn) =>
     turn.blocks
       .filter((block) => {
         const markdown = visibleTypewriterMarkdown(block);
-        return markdown.length > 0 && markdown.length <= MAX_TYPEWRITER_CHARS && shouldAnimateTimelineBlock(block);
+        const withinLimit = markdown.length <= MAX_TYPEWRITER_CHARS ||
+          block.kind === 'thinking' ||
+          block.narrativeKind === 'thinking';
+        return markdown.length > 0 && withinLimit && shouldAnimateTimelineBlock(block);
       })
-      .map((block) => block.id)
   );
+}
+
+function latestUserInteractionTime(view: AgentTimelineResult): number {
+  let latest = 0;
+  for (const event of flattenTimelineEvents(view)) {
+    if (!isUserInteractionEvent(event)) continue;
+    const time = Date.parse(event.ts);
+    if (Number.isFinite(time)) latest = Math.max(latest, time);
+  }
+  return latest;
+}
+
+function flattenTimelineEvents(view: AgentTimelineResult): AgentEvent[] {
+  return view.turns.flatMap((turn) => turn.blocks.flatMap((block) => block.events));
+}
+
+function isUserInteractionEvent(event: AgentEvent): boolean {
+  if (event.kind === 'user_msg' || event.kind === 'user_guidance') return true;
+  if (event.kind === 'requirement_decision') return true;
+  if (event.kind === 'permission_result') return true;
+  if (event.kind !== 'plan_review') return false;
+  if (!isRecord(event.payload)) return true;
+  const status = stringField(event.payload, 'status');
+  return status === 'accepted' || status === 'rejected' || status === 'revise';
+}
+
+function blockAfterInteraction(block: AgentTimelineBlock, latestInteractionTime: number): boolean {
+  if (latestInteractionTime <= 0) return true;
+  const eventTimes = block.events
+    .map((event) => Date.parse(event.ts))
+    .filter((time) => Number.isFinite(time));
+  if (eventTimes.length === 0) return true;
+  return Math.max(...eventTimes) > latestInteractionTime;
+}
+
+function typewriterAnimationKey(block: AgentTimelineBlock): string {
+  const markdown = visibleTypewriterMarkdown(block);
+  const structuralEventKey = block.events
+    .map((event) => {
+      const payload = isRecord(event.payload) ? event.payload : {};
+      return [
+        event.kind,
+        stringField(payload, 'runId'),
+        stringField(payload, 'planId'),
+        stringField(payload, 'reviewId'),
+        stringField(payload, 'sourcePlanId'),
+        stringField(payload, 'requirementId'),
+        stringField(payload, 'proposalId'),
+      ].filter(Boolean).join(':');
+    })
+    .filter(Boolean)
+    .join('|');
+  return [
+    block.kind,
+    block.narrativeKind ?? '',
+    structuralEventKey,
+    markdown.length,
+    hashString(markdown),
+  ].join('::');
+}
+
+function hashString(value: string): string {
+  let hash = 5381;
+  for (let index = 0; index < value.length; index += 1) {
+    hash = ((hash << 5) + hash) ^ value.charCodeAt(index);
+  }
+  return (hash >>> 0).toString(36);
 }
 
 function collectTypewriterBlockLengths(
@@ -922,13 +980,26 @@ const TimelineBlock: React.FC<{
   if (!isVisibleTimelineBlock(block)) return null;
   const narrativeClass = block.narrativeKind ? ` deepcode-gui-block--narrative-${block.narrativeKind}` : '';
   const densityClass = block.displayHints?.density ? ` deepcode-gui-block--density-${block.displayHints.density}` : '';
+  if (isReviewAcceptedBlock(block)) {
+    return (
+      <ReviewAcceptedBlock
+        block={block}
+        language={language}
+        animate={animateAssistant}
+        onLiveContentChange={onLiveContentChange}
+        onTypewriterComplete={onTypewriterComplete}
+      />
+    );
+  }
+
   if (block.kind === 'user') {
     const attachments = blockAttachments(block);
+    const content = localizedUserBlockContent(block, language);
     return (
       <article className={`deepcode-gui-block deepcode-gui-block--user${narrativeClass}${densityClass}${phaseClassName(block)}`}>
         <div className="deepcode-gui-block__label">{t(language, 'agent.message.user')}</div>
         <DeepCodeAttachmentChips attachments={attachments} language={language} />
-        <MarkdownContent content={block.bodyMarkdown ?? block.summary} />
+        <MarkdownContent content={content} />
       </article>
     );
   }
@@ -965,19 +1036,6 @@ const TimelineBlock: React.FC<{
     );
   }
 
-  if (block.kind === 'plan') {
-    return (
-      <PlanBlock
-        block={block}
-        language={language}
-        animate={animateAssistant}
-        onLiveContentChange={onLiveContentChange}
-        onTypewriterComplete={onTypewriterComplete}
-        onPlanResolve={onPlanResolve}
-      />
-    );
-  }
-
   if (block.kind === 'thinking' || block.narrativeKind === 'thinking') {
     return (
       <ThinkingBlock
@@ -987,6 +1045,19 @@ const TimelineBlock: React.FC<{
         collapseCompletedThinking={collapseCompletedThinking}
         onLiveContentChange={onLiveContentChange}
         onTypewriterComplete={onTypewriterComplete}
+      />
+    );
+  }
+
+  if (block.kind === 'plan') {
+    return (
+      <PlanBlock
+        block={block}
+        language={language}
+        animate={animateAssistant}
+        onLiveContentChange={onLiveContentChange}
+        onTypewriterComplete={onTypewriterComplete}
+        onPlanResolve={onPlanResolve}
       />
     );
   }
@@ -1032,6 +1103,30 @@ const TimelineBlock: React.FC<{
         {detailEvents.length > 0 && <EventList events={detailEvents} language={language} />}
       </div>
     </details>
+  );
+};
+
+const ReviewAcceptedBlock: React.FC<{
+  block: AgentTimelineBlock;
+  language: UiLanguage;
+  animate: boolean;
+  onLiveContentChange: () => void;
+  onTypewriterComplete: (blockId: string, textLength: number) => void;
+}> = ({ block, language, animate, onLiveContentChange, onTypewriterComplete }) => {
+  const markdown = reviewAcceptedMarkdown(block, language);
+  return (
+    <article className={`deepcode-gui-block deepcode-gui-block--review deepcode-gui-review-accepted${phaseClassName(block)}`}>
+      <span className="deepcode-gui-review-accepted__status" aria-hidden="true" />
+      <div className="deepcode-gui-review-accepted__content">
+        <TypewriterMarkdown
+          content={markdown}
+          animate={animate && shouldAnimateTimelineBlock(block)}
+          speed={block.displayHints?.typewriterSpeed}
+          onVisibleContentChange={onLiveContentChange}
+          onAnimationComplete={() => onTypewriterComplete(block.id, markdown.length)}
+        />
+      </div>
+    </article>
   );
 };
 
@@ -1086,10 +1181,21 @@ const ReviewBlock: React.FC<{
   onLiveContentChange: () => void;
   onTypewriterComplete: (blockId: string, textLength: number) => void;
 }> = ({ block, language, animate, onLiveContentChange, onTypewriterComplete }) => {
+  const [copyStatus, setCopyStatus] = useState<'idle' | 'copied' | 'error'>('idle');
   const narrativeClass = block.narrativeKind ? ` deepcode-gui-block--narrative-${block.narrativeKind}` : '';
   const densityClass = block.displayHints?.density ? ` deepcode-gui-block--density-${block.displayHints.density}` : '';
   const open = !block.defaultCollapsed || block.status === 'running' || block.status === 'waiting' || block.status === 'blocked';
-  const markdown = reviewBlockMarkdown(block);
+  const markdown = reviewBlockMarkdown(block, language);
+  const reviewPayload = reviewPayloadFromBlock(block);
+  const acceptedBlock = isReviewAcceptedBlock(block);
+  const copyReview = async () => {
+    try {
+      await copyText(markdown);
+      setCopyStatus('copied');
+    } catch {
+      setCopyStatus('error');
+    }
+  };
 
   return (
     <details className={`deepcode-gui-block deepcode-gui-block--review${narrativeClass}${densityClass}${phaseClassName(block)}`} open={open}>
@@ -1098,16 +1204,47 @@ const ReviewBlock: React.FC<{
         <span className="deepcode-gui-block__title">
           {localizedTimelineText(language, block.title || t(language, 'deepcodeGui.tasks.review'))}
         </span>
+        <button
+          type="button"
+          className={`deepcode-gui-plan-copy deepcode-gui-plan-copy--${copyStatus}`}
+          onMouseDown={(event) => {
+            event.preventDefault();
+            event.stopPropagation();
+          }}
+          onClick={(event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            void copyReview();
+          }}
+          title={t(language, 'deepcodeGui.review.copyStructured')}
+          aria-label={t(language, 'deepcodeGui.review.copyStructured')}
+        >
+          <DeepCodeTurnActionIcon name="copy" />
+        </button>
       </summary>
       <div className="deepcode-gui-block__details">
-        {markdown && (
+        {reviewPayload && hasStructuredProjection(reviewPayload, 'review') ? (
+          <StructuredProjectionTypewriter
+            payload={reviewPayload}
+            language={language}
+            kind="review"
+            animate={animate && shouldAnimateTimelineBlock(block)}
+            speed={block.displayHints?.typewriterSpeed}
+            onVisibleContentChange={onLiveContentChange}
+            onAnimationComplete={() => onTypewriterComplete(block.id, markdown.length)}
+          />
+        ) : acceptedBlock && markdown ? (
           <TypewriterMarkdown
             content={markdown}
             animate={animate && shouldAnimateTimelineBlock(block)}
             speed={block.displayHints?.typewriterSpeed}
             onVisibleContentChange={onLiveContentChange}
-            onAnimationComplete={() => onTypewriterComplete(block.id, visibleTypewriterMarkdown(block).length)}
+            onAnimationComplete={() => onTypewriterComplete(block.id, markdown.length)}
           />
+        ) : (
+          <div className="deepcode-gui-block__empty">
+            {t(language, 'session.projection.unsupportedLegacy')}
+          </div>
         )}
         <DeepCodeGitReviewDiffDetails gitReview={gitReviewFromBlock(block)} language={language} />
       </div>
@@ -1198,7 +1335,7 @@ const ThinkingBlock: React.FC<{
   const markdown = thinkingMarkdown(block);
   const running = block.status === 'running' || block.status === 'waiting';
   const liveReasoning = isLiveOverlayBlock(block) && running;
-  // 空"推理过程"块不渲染（避免空壳卡片）。
+  // Empty reasoning shells are hidden unless the provider is still streaming.
   if (!markdown && !running) return null;
   const initialOpen = block.displayHints?.initialOpen ?? true;
   const [open, setOpen] = useState(initialOpen);
@@ -1392,7 +1529,7 @@ const PlanBlock: React.FC<{
   const narrativeClass = block.narrativeKind ? ` deepcode-gui-block--narrative-${block.narrativeKind}` : '';
   const densityClass = block.displayHints?.density ? ` deepcode-gui-block--density-${block.displayHints.density}` : '';
   const open = !block.defaultCollapsed || block.status === 'running' || block.status === 'waiting';
-  const markdown = planBlockMarkdown(block);
+  const markdown = planBlockMarkdown(block, language);
   const copyPlan = async () => {
     try {
       await copyText(markdown);
@@ -1422,24 +1559,131 @@ const PlanBlock: React.FC<{
             event.stopPropagation();
             void copyPlan();
           }}
-          title={t(language, 'deepcodeGui.plan.copyMarkdown')}
-          aria-label={t(language, 'deepcodeGui.plan.copyMarkdown')}
+          title={t(language, 'deepcodeGui.plan.copyStructured')}
+          aria-label={t(language, 'deepcodeGui.plan.copyStructured')}
         >
           <DeepCodeTurnActionIcon name="copy" />
         </button>
       </summary>
       <div className="deepcode-gui-block__details">
-        {block.bodyMarkdown && (
-          <TypewriterMarkdown
-            content={block.bodyMarkdown}
+        {hasStructuredProjection(payload, 'plan') ? (
+          <StructuredProjectionTypewriter
+            payload={payload}
+            language={language}
+            kind="plan"
             animate={animate && shouldAnimateTimelineBlock(block)}
             speed={block.displayHints?.typewriterSpeed}
             onVisibleContentChange={onLiveContentChange}
-            onAnimationComplete={() => onTypewriterComplete(block.id, visibleTypewriterMarkdown(block).length)}
+            onAnimationComplete={() => onTypewriterComplete(block.id, markdown.length)}
           />
+        ) : (
+          <div className="deepcode-gui-block__empty">
+            {t(language, 'session.projection.unsupportedLegacy')}
+          </div>
         )}
       </div>
     </details>
+  );
+};
+
+const StructuredProjectionTypewriter: React.FC<{
+  payload: Record<string, unknown>;
+  language: UiLanguage;
+  kind: 'plan' | 'review';
+  animate: boolean;
+  speed?: TypewriterSpeed;
+  onVisibleContentChange: () => void;
+  onAnimationComplete: () => void;
+}> = ({
+  payload,
+  language,
+  kind,
+  animate,
+  speed = 'normal',
+  onVisibleContentChange,
+  onAnimationComplete,
+}) => {
+  const text = structuredProjectionText(payload, language, kind);
+  const totalLength = text.length;
+  const shouldAnimate = animate && totalLength <= MAX_TYPEWRITER_CHARS;
+  const [visibleCharacters, setVisibleCharacters] = useState(() => (shouldAnimate ? 0 : totalLength));
+  const visibleRef = useRef(visibleCharacters);
+  const timerRef = useRef<number | null>(null);
+  const completedRef = useRef(false);
+  const onAnimationCompleteRef = useRef(onAnimationComplete);
+  const onVisibleContentChangeRef = useRef(onVisibleContentChange);
+  const renderedCharacters = shouldAnimate ? visibleCharacters : totalLength;
+
+  useEffect(() => {
+    visibleRef.current = visibleCharacters;
+  }, [visibleCharacters]);
+
+  useEffect(() => {
+    onAnimationCompleteRef.current = onAnimationComplete;
+  }, [onAnimationComplete]);
+
+  useEffect(() => {
+    onVisibleContentChangeRef.current = onVisibleContentChange;
+  }, [onVisibleContentChange]);
+
+  useLayoutEffect(() => {
+    onVisibleContentChangeRef.current();
+  }, [renderedCharacters]);
+
+  useEffect(() => {
+    if (timerRef.current !== null) {
+      window.clearTimeout(timerRef.current);
+      timerRef.current = null;
+    }
+    completedRef.current = false;
+
+    if (!shouldAnimate || totalLength <= 0) {
+      visibleRef.current = totalLength;
+      setVisibleCharacters(totalLength);
+      if (!completedRef.current) {
+        completedRef.current = true;
+        onAnimationCompleteRef.current();
+      }
+      return undefined;
+    }
+
+    let index = 0;
+    visibleRef.current = index;
+    setVisibleCharacters(index);
+
+    const tick = () => {
+      const backlog = Math.max(0, totalLength - index);
+      const step = typewriterBufferedStep(backlog, speed);
+      index = Math.min(totalLength, index + step);
+      visibleRef.current = index;
+      setVisibleCharacters(index);
+      onVisibleContentChangeRef.current();
+      if (index >= totalLength) {
+        if (!completedRef.current) {
+          completedRef.current = true;
+          onAnimationCompleteRef.current();
+        }
+        return;
+      }
+      timerRef.current = window.setTimeout(tick, typewriterBufferedDelay(speed));
+    };
+
+    timerRef.current = window.setTimeout(tick, typewriterBufferedDelay(speed));
+    return () => {
+      if (timerRef.current !== null) {
+        window.clearTimeout(timerRef.current);
+        timerRef.current = null;
+      }
+    };
+  }, [shouldAnimate, speed, text, totalLength]);
+
+  return (
+    <StructuredProjectionContent
+      payload={payload}
+      language={language}
+      kind={kind}
+      visibleCharacters={shouldAnimate ? visibleCharacters : undefined}
+    />
   );
 };
 
@@ -1453,7 +1697,10 @@ const TypewriterMarkdown: React.FC<{
   const shouldAnimate = animate && content.length <= MAX_TYPEWRITER_CHARS;
   const [visible, setVisible] = useState(() => (shouldAnimate ? '' : content));
   const visibleRef = useRef(visible);
+  const latestRef = useRef(content);
+  const timerRef = useRef<number | null>(null);
   const onAnimationCompleteRef = useRef(onAnimationComplete);
+  const onVisibleContentChangeRef = useRef(onVisibleContentChange);
   const renderedContent = shouldAnimate ? visible : content;
 
   useLayoutEffect(() => {
@@ -1469,34 +1716,77 @@ const TypewriterMarkdown: React.FC<{
   }, [onAnimationComplete]);
 
   useEffect(() => {
-    if (!shouldAnimate) {
-      setVisible(content);
-      onAnimationCompleteRef.current?.();
-      return undefined;
-    }
-    const startIndex = content.startsWith(visibleRef.current) ? visibleRef.current.length : 0;
-    setVisible(content.slice(0, startIndex));
-    if (!content || startIndex >= content.length) {
-      onAnimationCompleteRef.current?.();
-      return undefined;
-    }
-    let index = startIndex;
-    const step = speed === 'fast' ? 12 : speed === 'slow' ? 2 : 4;
-    const delayMs = speed === 'fast' ? 8 : speed === 'slow' ? 20 : 12;
-    const id = window.setInterval(() => {
-      index = Math.min(content.length, index + step);
-      setVisible(content.slice(0, index));
-      window.requestAnimationFrame(onVisibleContentChange);
-      if (index >= content.length) {
-        window.clearInterval(id);
-        onAnimationCompleteRef.current?.();
+    onVisibleContentChangeRef.current = onVisibleContentChange;
+  }, [onVisibleContentChange]);
+
+  useEffect(() => {
+    latestRef.current = content;
+    const clearTimer = () => {
+      if (timerRef.current !== null) {
+        window.clearTimeout(timerRef.current);
+        timerRef.current = null;
       }
-    }, delayMs);
-    return () => window.clearInterval(id);
-  }, [shouldAnimate, content]);
+    };
+
+    const commitVisible = (next: string) => {
+      visibleRef.current = next;
+      setVisible(next);
+      window.requestAnimationFrame(onVisibleContentChangeRef.current);
+    };
+
+    if (!shouldAnimate) {
+      clearTimer();
+      commitVisible(content);
+      onAnimationCompleteRef.current?.();
+      return undefined;
+    }
+
+    if (!content.startsWith(visibleRef.current)) {
+      commitVisible(content);
+      onAnimationCompleteRef.current?.();
+      return undefined;
+    }
+
+    const tick = () => {
+      timerRef.current = null;
+      const latest = latestRef.current;
+      const current = visibleRef.current;
+      if (!latest.startsWith(current)) {
+        commitVisible(latest);
+        onAnimationCompleteRef.current?.();
+        return;
+      }
+      const backlog = latest.length - current.length;
+      if (backlog <= 0) {
+        onAnimationCompleteRef.current?.();
+        return;
+      }
+      const step = typewriterBufferedStep(backlog, speed);
+      commitVisible(latest.slice(0, Math.min(latest.length, current.length + step)));
+      timerRef.current = window.setTimeout(tick, typewriterBufferedDelay(speed));
+    };
+
+    if (timerRef.current === null) {
+      timerRef.current = window.setTimeout(tick, TYPEWRITER_BUFFER_DELAY_MS);
+    }
+    return clearTimer;
+  }, [shouldAnimate, content, speed]);
 
   return <MarkdownContent content={renderedContent} />;
 };
+
+function typewriterBufferedStep(backlog: number, speed: TypewriterSpeed): number {
+  const base = speed === 'fast' ? 32 : speed === 'slow' ? 6 : 16;
+  if (backlog >= 1000) return base * 5;
+  if (backlog >= 400) return base * 3;
+  return base;
+}
+
+function typewriterBufferedDelay(speed: TypewriterSpeed): number {
+  if (speed === 'fast') return 24;
+  if (speed === 'slow') return 52;
+  return TYPEWRITER_BUFFER_DELAY_MS;
+}
 
 const EventList: React.FC<{ events: AgentEvent[]; compact?: boolean; language: UiLanguage }> = ({ events, compact, language }) => (
   <div className={`deepcode-gui-event-list ${compact ? 'deepcode-gui-event-list--compact' : ''}`}>
@@ -1529,6 +1819,38 @@ function localizedEventSummary(language: UiLanguage, event: AgentEvent): string 
   return localizedTimelineText(language, eventSummary(event));
 }
 
+function localizedUserBlockContent(block: AgentTimelineBlock, language: UiLanguage): string {
+  for (let index = block.events.length - 1; index >= 0; index -= 1) {
+    const event = block.events[index];
+    const payload: Record<string, unknown> | undefined = event && isRecord(event.payload)
+      ? event.payload
+      : undefined;
+    if (!payload) continue;
+    const contentKey = stringField(payload, 'contentKey') ??
+      stringField(payload, 'messageKey') ??
+      stringField(payload, 'summaryKey');
+    if (!contentKey) continue;
+    const translated = t(language, contentKey, payloadI18nVariables(payload));
+    if (translated !== contentKey) return translated;
+  }
+  return block.bodyMarkdown ?? block.summary ?? '';
+}
+
+function payloadI18nVariables(payload: Record<string, unknown>): Record<string, string> {
+  const args = isRecord(payload.contentArgs)
+    ? payload.contentArgs
+    : isRecord(payload.messageArgs)
+      ? payload.messageArgs
+      : isRecord(payload.summaryArgs)
+        ? payload.summaryArgs
+        : {};
+  const result: Record<string, string> = {};
+  for (const [key, value] of Object.entries(args)) {
+    if (value !== undefined && value !== null) result[key] = String(value);
+  }
+  return result;
+}
+
 function localizedTimelineText(language: UiLanguage, text: string): string {
   if (!text) return '';
   const replacements: Array<[string, string]> = [
@@ -1543,6 +1865,7 @@ function localizedTimelineText(language: UiLanguage, text: string): string {
     ['Requirement confirmation', t(language, 'deepcodeGui.timeline.requirementConfirmation')],
     ['Kernel state contract entered.', t(language, 'deepcodeGui.timeline.kernelStateEntered')],
     ['Session DriverRequest produced by Kernel.', t(language, 'deepcodeGui.timeline.driverRequestProduced')],
+    ['Run cancelled by user.', t(language, 'agent.run.cancelled')],
     ['Resource context resolved', t(language, 'deepcodeGui.timeline.resourceContextResolved')],
     ['Provider Call', t(language, 'deepcodeGui.timeline.providerCall')],
     ['Provider Tool Resume', t(language, 'deepcodeGui.timeline.providerToolResume')],
@@ -1575,30 +1898,81 @@ function isVisibleTimelineBlock(block: AgentTimelineBlock): boolean {
   return !block.events.every(isInternalKernelCheckpointEvent);
 }
 
-// P5-lite：规则统一抽至 @deepcode/session-core/timelineFilter，与 live 路径共用。
-// 此处仅做 AgentEvent → {stage, kernelEventKind} 形状适配。
+const GUI_INTERNAL_STATUS_STAGES = new Set<string>([
+  'accepted_plan.batch_checkpoint',
+  'accepted_plan.task_savepoint',
+  'review_gate.evaluated',
+  'session.provider_status',
+]);
+
+// Adapts AgentEvent payloads to the orchestration-stage probe shape.
 function isInternalKernelCheckpointEvent(event: AgentEvent): boolean {
   if (event.kind !== 'workflow_stage') return false;
   if (!isRecord(event.payload)) return false;
   const stage = stringField(event.payload, 'stage');
+  if (stage && GUI_INTERNAL_STATUS_STAGES.has(stage)) return true;
   const kernelEvent = isRecord(event.payload.kernelEvent) ? event.payload.kernelEvent : null;
   const kernelEventKind = kernelEvent ? stringField(kernelEvent, 'kind') : undefined;
   return isInternalOrchestrationStage({ stage, kernelEventKind });
 }
 
-function planBlockMarkdown(block: AgentTimelineBlock): string {
-  const body = (block.bodyMarkdown ?? block.summary ?? '').trim();
-  const title = block.title.trim();
-  if (!title || body.startsWith('#')) return body;
-  return [`# ${title}`, body].filter(Boolean).join('\n\n');
+function planBlockMarkdown(block: AgentTimelineBlock, language: UiLanguage): string {
+  const payload = planPayloadFromBlock(block);
+  return payload ? structuredProjectionText(payload, language, 'plan') : '';
 }
 
-function reviewBlockMarkdown(block: AgentTimelineBlock): string {
-  const body = (block.bodyMarkdown ?? '').trim();
-  if (!body) return '';
-  const summary = (block.summary ?? '').trim();
-  if (summary && body === summary) return '';
-  return trimReviewFooter(body);
+function reviewBlockMarkdown(block: AgentTimelineBlock, language: UiLanguage = 'zh-CN'): string {
+  if (isReviewAcceptedBlock(block)) return reviewAcceptedMarkdown(block, language);
+  const payload = reviewPayloadFromBlock(block);
+  return payload ? structuredProjectionText(payload, language, 'review') : '';
+}
+
+function isReviewAcceptedBlock(block: AgentTimelineBlock): boolean {
+  return reviewAcceptedPayloadFromBlock(block) !== undefined;
+}
+
+function reviewAcceptedPayloadFromBlock(block: AgentTimelineBlock): Record<string, unknown> | undefined {
+  for (const event of block.events) {
+    if (event.kind !== 'review_summary' || !isRecord(event.payload)) continue;
+    const status = stringField(event.payload, 'status');
+    if (status === 'accepted' || status === 'passed') return event.payload;
+  }
+  return undefined;
+}
+
+function reviewAcceptedMarkdown(block: AgentTimelineBlock, language: UiLanguage): string {
+  const payload = reviewAcceptedPayloadFromBlock(block);
+  const continuationCount = payload
+    ? numberField(payload, 'continuationCount') ?? listField(payload, 'continuations').length
+    : 0;
+  const lines = [
+    `**${t(language, 'deepcodeGui.review.acceptedTitle')}**`,
+    '',
+    continuationCount > 0
+      ? t(language, 'deepcodeGui.review.acceptedWithContinuation')
+      : t(language, 'deepcodeGui.review.acceptedNoContinuation'),
+  ];
+  return lines.join('\n').trim();
+}
+
+function planPayloadFromBlock(block: AgentTimelineBlock): Record<string, unknown> | undefined {
+  for (const event of block.events) {
+    if (event.kind === 'plan_card' && isRecord(event.payload)) return event.payload;
+  }
+  return undefined;
+}
+
+function reviewPayloadFromBlock(block: AgentTimelineBlock): Record<string, unknown> | undefined {
+  for (const event of block.events) {
+    if (event.kind === 'review_summary' && isRecord(event.payload)) return event.payload;
+  }
+  return undefined;
+}
+
+function listField(value: Record<string, unknown> | undefined, key: string): unknown[] {
+  if (!value) return [];
+  const field = value[key];
+  return Array.isArray(field) ? field : [];
 }
 
 function trimReviewFooter(markdown: string): string {
@@ -1710,7 +2084,7 @@ function blockCopyText(block: AgentTimelineBlock, language: UiLanguage): string[
   if (block.kind === 'turnActions') return [];
   const title = blockCopyTitle(block, language);
   const activityBody = block.activity ? activityBodyMarkdown(block.activity, language) : '';
-  const body = blockCopyBody(block, activityBody);
+  const body = blockCopyBody(block, activityBody, language);
   const attachmentText = block.kind === 'user'
     ? attachmentCopyText(blockAttachments(block), language)
     : '';
@@ -1725,9 +2099,9 @@ function blockCopyText(block: AgentTimelineBlock, language: UiLanguage): string[
   return attachmentText ? [attachmentText] : [];
 }
 
-function blockCopyBody(block: AgentTimelineBlock, activityBody: string): string {
+function blockCopyBody(block: AgentTimelineBlock, activityBody: string, language: UiLanguage): string {
   if (block.kind === 'review' || block.narrativeKind === 'review') {
-    return reviewBlockMarkdown(block);
+    return reviewBlockMarkdown(block, language);
   }
   if (block.kind === 'thinking' || block.narrativeKind === 'thinking') {
     return thinkingMarkdown(block);
@@ -1739,10 +2113,11 @@ function blockCopyBody(block: AgentTimelineBlock, activityBody: string): string 
 }
 
 function visibleTypewriterMarkdown(block: AgentTimelineBlock, language?: UiLanguage): string {
-  if (block.kind === 'review' || block.narrativeKind === 'review') return reviewBlockMarkdown(block);
+  if (block.kind === 'plan' || block.narrativeKind === 'plan') return planBlockMarkdown(block, language ?? 'zh-CN');
+  if (block.kind === 'review' || block.narrativeKind === 'review') return reviewBlockMarkdown(block, language ?? 'zh-CN');
   if (block.kind === 'thinking' || block.narrativeKind === 'thinking') return thinkingMarkdown(block);
   if (block.activity) return block.bodyMarkdown ?? '';
-  // diagnostic 事件本地化：源事件携带 diagnosticCode 时按 i18n 翻译
+  // Diagnostic events resolve display text through i18n when a diagnostic code is present.
   if (language && block.events.length > 0) {
     const payload = isRecord(block.events[0].payload) ? block.events[0].payload : undefined;
     if (payload && payload.diagnostic === true) {
@@ -1750,7 +2125,7 @@ function visibleTypewriterMarkdown(block: AgentTimelineBlock, language?: UiLangu
       if (translated) return translated;
     }
   }
-  return (block.bodyMarkdown ?? block.summary ?? '').trim();
+  return localizedTimelineText(language ?? 'zh-CN', (block.bodyMarkdown ?? block.summary ?? '').trim());
 }
 
 function blockCopyTitle(block: AgentTimelineBlock, language: UiLanguage): string {
@@ -1783,8 +2158,7 @@ async function copyText(text: string): Promise<void> {
   document.body.removeChild(textarea);
 }
 
-// R4 DeepCodeTimeline 壳：从 requirement_confirmation block 提取 options 与 effect，
-// 在卡片中显式渲染"选择后副作用"，与 agent-panel 壳保持一致。
+// Requirement blocks expose option effects so both shells render the same decision choices.
 interface DeepCodeRequirementOption {
   id: string;
   label: string;
@@ -1868,8 +2242,8 @@ const DeepCodeRequirementOptionsList: React.FC<{
   );
 };
 
-// P4(B)：返回 block 的 phase 视觉 className 片段（用于 plan 探索 vs complete 执行的视觉分区）。
 function phaseClassName(block: AgentTimelineBlock): string {
+  if (block.kind === 'thinking' || block.narrativeKind === 'thinking') return '';
   const phase = block.displayHints?.phase;
   return phase ? ` deepcode-gui-block--phase-${phase}` : '';
 }
@@ -1877,6 +2251,11 @@ function phaseClassName(block: AgentTimelineBlock): string {
 function stringField(payload: Record<string, unknown>, key: string): string | undefined {
   const value = payload[key];
   return typeof value === 'string' && value.trim() ? value : undefined;
+}
+
+function numberField(payload: Record<string, unknown> | undefined, key: string): number | undefined {
+  const value = payload?.[key];
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

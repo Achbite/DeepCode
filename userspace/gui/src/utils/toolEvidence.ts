@@ -130,13 +130,13 @@ function activityActionLabel(
   language: UiLanguage,
 ): string {
   const name = toolName ?? '';
-  if (name.includes('write') || activityKind === 'editFileStarted' || activityKind === 'editFileCompleted' || activityKind === 'editFileFailed') {
-    return t(language, 'agent.toolEvidence.action.write');
-  }
   if (name.includes('delete')) return t(language, 'agent.toolEvidence.action.delete');
   if (name.includes('search') || activityKind === 'resourceSearch') return t(language, 'agent.toolEvidence.action.search');
   if (name.includes('list')) return t(language, 'agent.toolEvidence.action.list');
   if (name.includes('read') || activityKind === 'resourceRead') return t(language, 'agent.toolEvidence.action.read');
+  if (name.includes('write') || activityKind === 'editFileStarted' || activityKind === 'editFileCompleted' || activityKind === 'editFileFailed') {
+    return t(language, 'agent.toolEvidence.action.write');
+  }
   return t(language, 'agent.toolEvidence.action.tool');
 }
 
@@ -310,14 +310,25 @@ function evidenceTitle(
   }
   const fileCount = items.filter((item) => item.kind === 'file').length;
   const directoryCount = items.filter((item) => item.kind === 'directory').length;
+  const fileItems = items.filter((item) => item.kind === 'file');
+  const directoryItems = items.filter((item) => item.kind === 'directory');
+  const fileAction = commonAction(fileItems);
+  const directoryAction = commonAction(directoryItems);
   if (fileCount > 0 && directoryCount === 0) {
-    return t(language, 'agent.toolEvidence.title.files', { count: fileCount });
+    return fileAction
+      ? t(language, 'agent.toolEvidence.title.actionFiles', { action: fileAction, count: fileCount })
+      : t(language, 'agent.toolEvidence.title.files', { count: fileCount });
   }
   if (directoryCount > 0 && fileCount === 0) {
-    return t(language, 'agent.toolEvidence.title.directories', { count: directoryCount });
+    return directoryAction
+      ? t(language, 'agent.toolEvidence.title.actionDirectories', { action: directoryAction, count: directoryCount })
+      : t(language, 'agent.toolEvidence.title.directories', { count: directoryCount });
   }
   if (fileCount + directoryCount > 0) {
-    return t(language, 'agent.toolEvidence.title.resources', { count: fileCount + directoryCount });
+    const resourceAction = commonAction([...fileItems, ...directoryItems]);
+    return resourceAction
+      ? t(language, 'agent.toolEvidence.title.actionResources', { action: resourceAction, count: fileCount + directoryCount })
+      : t(language, 'agent.toolEvidence.title.resources', { count: fileCount + directoryCount });
   }
   const toolCount = items.filter((item) => item.kind === 'tool').length;
   if (toolCount > 0 && toolCount === items.length) {
@@ -331,6 +342,12 @@ function evidenceTitle(
     return t(language, 'agent.toolEvidence.title.toolOperations', { count: items.length });
   }
   return fallbackTitle || t(language, 'agent.toolEvidence.title.operations', { count: items.length });
+}
+
+function commonAction(items: ToolEvidenceItem[]): string | undefined {
+  if (items.length === 0) return undefined;
+  const first = items[0]?.action;
+  return first && items.every((item) => item.action === first) ? first : undefined;
 }
 
 function evidenceSummary(

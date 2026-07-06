@@ -59,7 +59,6 @@ function markStartup(name: string): void {
   if (typeof performance === 'undefined') return;
   performance.mark(name);
   if (import.meta.env.DEV) {
-    // eslint-disable-next-line no-console
     console.debug(`[startup] ${name}`, Math.round(performance.now()));
   }
 }
@@ -214,7 +213,6 @@ const App: React.FC = () => {
     void destroyCurrentWindow();
   }, [showUnsavedCloseDialog]);
 
-  // ---- 1. Load workspace and user settings ----
   useEffect(() => {
     return afterFirstPaint(() => {
       void loadWorkspace().finally(() => markStartup('deepcode:workspace-loaded'));
@@ -222,8 +220,7 @@ const App: React.FC = () => {
     });
   }, [loadWorkspace, loadUserSettings]);
 
-  // If the desktop shell renders before the background Kernel Host is ready,
-  // the first workspace/settings calls can fail. Retry once when health connects.
+
   useEffect(() => {
     if (apiStatus !== 'connected' || connectedReloadDoneRef.current) return;
     connectedReloadDoneRef.current = true;
@@ -231,12 +228,12 @@ const App: React.FC = () => {
     void loadUserSettings().finally(() => markStartup('deepcode:settings-reloaded-after-connect'));
   }, [apiStatus, loadWorkspace, loadUserSettings]);
 
-  // ---- 1.1 Workspace settings overlay ----
+
   useEffect(() => {
     syncWorkspaceSettings(workspaceSettings);
   }, [workspaceSettings, syncWorkspaceSettings]);
 
-  // ---- 1.2 Theme sync ----
+
   useEffect(() => {
     document.documentElement.dataset.theme = colorTheme;
   }, [colorTheme]);
@@ -247,7 +244,7 @@ const App: React.FC = () => {
     window.localStorage.setItem('deepcode.ui.language', language);
   }, [language]);
 
-  // ---- 2. Runtime status + API health ----
+
   useEffect(() => {
     let cancelled = false;
     let interval: ReturnType<typeof setInterval> | null = null;
@@ -282,7 +279,7 @@ const App: React.FC = () => {
     };
   }, [language, setApiStatus, setErrorMessage, setServerVersion]);
 
-  // ---- 3. Heartbeat ----
+
   useEffect(() => {
     let disconnect: (() => void) | null = null;
     let cancelled = false;
@@ -300,7 +297,7 @@ const App: React.FC = () => {
     };
   }, []);
 
-  // ---- 3.1 Terminal runtime warmup ----
+
   useEffect(() => {
     if (terminalPrewarm !== 'afterStartup') return;
     let cancelIdle: (() => void) | null = null;
@@ -318,7 +315,7 @@ const App: React.FC = () => {
     };
   }, [terminalPrewarm]);
 
-  // ---- 4. Basic shortcuts ----
+
   useEffect(() => {
     if (!enableBasicShortcuts) return;
 
@@ -354,7 +351,6 @@ const App: React.FC = () => {
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [enableBasicShortcuts, saveCurrentActiveFile]);
 
-  // ---- 5. Auto save ----
   useEffect(() => {
     if (autoSave !== 'afterDelay' || !dirtySignature) return;
     const delay = Math.max(250, autoSaveDelay);
@@ -364,7 +360,7 @@ const App: React.FC = () => {
     return () => window.clearTimeout(timer);
   }, [autoSave, autoSaveDelay, dirtySignature]);
 
-  // ---- 6. Close guard ----
+
   useEffect(() => {
     if (!hotExit) return;
 
@@ -378,7 +374,7 @@ const App: React.FC = () => {
     return () => window.removeEventListener('beforeunload', onBeforeUnload);
   }, [hotExit]);
 
-  // ---- 6.1 Custom titlebar close guard ----
+
   useEffect(() => {
     const onCloseRequest = () => requestWindowClose();
     window.addEventListener(APP_CLOSE_REQUEST_EVENT, onCloseRequest);

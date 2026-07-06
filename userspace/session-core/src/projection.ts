@@ -14,7 +14,7 @@ import type {
   PermissionRequest,
   ProjectionDelta,
 } from '@deepcode/protocol';
-import type { AgentPlanParts } from './agent-plan/types.js';
+import type { AgentPlanParts } from './protocol/types.js';
 import type { ResourcePacket, ResourceRequest } from './context/types.js';
 import type { ReviewPacket } from './review/types.js';
 import { isInternalOrchestrationStage, isMainTimelineActivityShape } from './timelineFilter.js';
@@ -178,7 +178,6 @@ export function buildNarrativeTimelineProjection(input: NarrativeTimelineProject
   let currentTurn: AgentTimelineResult['turns'][number] | null = null;
   let syntheticTurnIndex = 0;
 
-  // P4(B)：预扫描 plan_review.accepted 的事件索引，作为 plan(explore) → execute 阶段分界。
   // 不依赖具体 planId，简单按"是否已出现任何 accepted 的 plan_review"判定。
   const acceptedReviewIndex = findFirstAcceptedReviewIndex(input.events);
 
@@ -240,7 +239,6 @@ export function buildNarrativeTimelineProjection(input: NarrativeTimelineProject
 
   if (currentTurn) turns.push(finalizeNarrativeTurn(currentTurn));
 
-  // P4(B)：按 plan_review.accepted 边界给 displayHints 注入 phase。
   // 使用 block.rawEventRefs 推断最早事件索引（rawEventRefs 与事件顺序一致）。
   if (acceptedReviewIndex >= 0) {
     annotateBlocksWithPhase(turns, input.events, acceptedReviewIndex);
@@ -505,6 +503,8 @@ function conversationActivityFromEvent(event: AgentEvent): AgentConversationActi
 function userInputBubbleEvent(event: AgentEvent, index: number): AgentEvent | null {
   const content = userInputBubbleContent(event);
   if (!content) return null;
+  const contentKey = userInputBubbleContentKey(event);
+  const contentArgs = userInputBubbleContentArgs(event);
   return {
     id: `user-input-${event.id || index}`,
     sessionId: event.sessionId,
@@ -512,6 +512,8 @@ function userInputBubbleEvent(event: AgentEvent, index: number): AgentEvent | nu
     kind: 'user_msg',
     payload: {
       content,
+      ...(contentKey ? { contentKey } : {}),
+      ...(contentArgs ? { contentArgs } : {}),
       source: 'user',
       sourceEventId: event.id,
       sourceEventKind: event.kind,
@@ -539,12 +541,42 @@ function userInputBubbleContent(event: AgentEvent): string | undefined {
     if (status !== 'accepted' && status !== 'rejected' && status !== 'needsRevision') return undefined;
     return firstPayloadText(event.payload, ['guidance', 'summary', 'message']);
   }
+  if (event.kind === 'review_summary') {
+    const status = stringField(event.payload, 'status');
+    if (status !== 'accepted' && status !== 'rejected' && status !== 'needsRevision') return undefined;
+    if (status === 'accepted') return undefined;
+    return firstPayloadText(event.payload, ['guidance', 'content', 'summary', 'message']);
+  }
   return undefined;
+}
+
+function userInputBubbleContentKey(event: AgentEvent): string | undefined {
+  if (!isRecordPayload(event.payload)) return undefined;
+  return stringField(event.payload, 'contentKey') ??
+    stringField(event.payload, 'messageKey') ??
+    stringField(event.payload, 'summaryKey');
+}
+
+function userInputBubbleContentArgs(event: AgentEvent): Record<string, string> | undefined {
+  if (!isRecordPayload(event.payload)) return undefined;
+  const args = recordStringValues(event.payload.contentArgs) ??
+    recordStringValues(event.payload.messageArgs) ??
+    recordStringValues(event.payload.summaryArgs);
+  return args && Object.keys(args).length > 0 ? args : undefined;
 }
 
 function selectedOptionLabel(payload: Record<string, unknown>): string | undefined {
   const selectedOption = isRecordPayload(payload.selectedOption) ? payload.selectedOption : undefined;
   return selectedOption ? stringField(selectedOption, 'label') : undefined;
+}
+
+function recordStringValues(value: unknown): Record<string, string> | undefined {
+  if (!isRecordPayload(value)) return undefined;
+  const result: Record<string, string> = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (item !== undefined && item !== null) result[key] = String(item);
+  }
+  return result;
 }
 
 function firstPayloadText(payload: Record<string, unknown>, keys: string[]): string | undefined {
@@ -558,7 +590,7 @@ function firstPayloadText(payload: Record<string, unknown>, keys: string[]): str
 function isUserInputAuditOnlyEvent(event: AgentEvent): boolean {
   return event.kind === 'user_guidance' ||
     event.kind === 'requirement_decision' ||
-    (event.kind === 'plan_review' && Boolean(userInputBubbleContent(event)));
+    ((event.kind === 'plan_review' || event.kind === 'review_summary') && Boolean(userInputBubbleContent(event)));
 }
 
 function annotateLiveOverlayBlocks(
@@ -593,11 +625,17 @@ function annotateLiveOverlayBlocks(
         return {
           ...block,
           status: shouldStream ? 'running' : block.status,
-          defaultCollapsed: block.narrativeKind === 'thinking' && shouldSeal,
+          defaultCollapsed: block.narrativeKind === 'thinking' && shouldSeal
+            ? true
+            : block.defaultCollapsed,
           displayHints: {
             ...(block.displayHints ?? {}),
             renderMode,
-            initialOpen: shouldStream || block.displayHints?.initialOpen,
+            initialOpen: shouldStream
+              ? true
+              : shouldSeal && block.narrativeKind === 'thinking'
+                ? false
+                : block.displayHints?.initialOpen,
             replaceOnComplete: block.narrativeKind === 'thinking' ? true : block.displayHints?.replaceOnComplete,
           },
         };
@@ -1293,13 +1331,10 @@ function summarizeAgentEvents(events: AgentEvent[]): string {
 
 function narrativeBody(events: AgentEvent[], kind: AgentTimelineNarrativeKind): string | undefined {
   if (kind === 'operationEvidence') return undefined;
+  if (kind === 'plan' || kind === 'review') return undefined;
   if (kind === 'thinking') {
     const reasoning = events.map(reasoningEventBody).join('').trim();
     return reasoning || undefined;
-  }
-  if (kind === 'review') {
-    const text = trimReviewFooter(events.map(reviewEventBody).filter(Boolean).join('\n\n')).trim();
-    return text || undefined;
   }
   const text = firstNonEmpty(events, ['content', 'message', 'summary', 'details']);
   return text?.trim() ? text : undefined;
@@ -1502,7 +1537,6 @@ function isBlankReasoningEvent(event: AgentEvent): boolean {
   return body.replace(/```+/g, '').trim().length === 0;
 }
 
-// P4(B)：定位"plan accepted"边界——第一次 plan_review(status=accepted) 出现的事件索引。
 // 在此索引之前的 operationEvidence / thinking 视为 explore 阶段，之后为 execute 阶段。
 function findFirstAcceptedReviewIndex(events: AgentEvent[]): number {
   for (let i = 0; i < events.length; i += 1) {
@@ -1513,9 +1547,6 @@ function findFirstAcceptedReviewIndex(events: AgentEvent[]): number {
   return -1;
 }
 
-// P4(B)：按事件索引把 phase 写入 block.displayHints。
-// 只对 thinking / operationEvidence / assistantNarration 等"过程性"块标注，
-// 用户消息、plan/review/permission/requirement 等不标注（语义不需要分阶段）。
 function annotateBlocksWithPhase(
   turns: AgentTimelineResult['turns'],
   events: AgentEvent[],

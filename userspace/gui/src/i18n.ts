@@ -72,8 +72,6 @@ export function settingText(language: UiLanguage, key: string): SettingText | un
   return pack.settings?.[key];
 }
 
-// diagnostic 事件本地化：session-core 产出 diagnosticCode + diagnosticParams + 英文 fallback，
-// GUI 按 code 走 i18n 翻译，存量无 code 事件回退 payload.content。
 export function resolveDiagnosticText(
   payload: Record<string, unknown> | undefined,
   language: UiLanguage,
@@ -86,6 +84,5 @@ export function resolveDiagnosticText(
     ? payload.diagnosticParams as Record<string, string | number>
     : undefined;
   const translated = t(language, `diagnostic.${code}`, params);
-  // i18n key 未命中时 t() 返回 key 本身，此时回退 fallback
   return translated === `diagnostic.${code}` ? content : translated;
 }

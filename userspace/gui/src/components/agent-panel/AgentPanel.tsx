@@ -9,7 +9,7 @@ import AgentSessionSelector from './AgentSessionSelector';
 import AgentTaskList from './AgentTaskList';
 import MessageList from './MessageList';
 import PermissionRequestBubble from './PermissionRequestBubble';
-import { findPendingComposerDecision } from './pendingDecision';
+import { findPendingComposerDecisionFromProjection } from './pendingDecision';
 import { buildUiTimelineProjection } from '../../utils/uiTimelineProjection';
 import './agentPanel.css';
 
@@ -59,8 +59,8 @@ const AgentPanel: React.FC = () => {
     }),
     [coalescedActiveDeltas, events, session?.id]
   );
-  const pendingDecision = findPendingComposerDecision({
-    events,
+  const pendingDecision = findPendingComposerDecisionFromProjection({
+    timeline: timelineProjection,
     pendingPermission: pendingPermission?.request ?? null,
     resolvingRequirement,
     resolvingPlan,

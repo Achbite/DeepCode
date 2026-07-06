@@ -66,7 +66,6 @@ export type CardModel =
   | ToolCardModel
   | WorkMetaCardModel;
 
-// ---- 把 protocol AgentChangeSet 风格的 operations 投影为 DiffFile[] ----
 export function diffFilesFromOperations(
   operations: ReadonlyArray<{ filePath?: string; path?: string; diff?: string; truncated?: boolean }>,
 ): DiffFile[] {
@@ -79,11 +78,7 @@ export function diffFilesFromOperations(
   return files;
 }
 
-/**
- * ToolCardView：工具卡的类型化视图（P3 迁移，G1）。
- * 把 `tool_call/tool_result/permission_*` 事件的 `payload: unknown` 一次性解析为强类型字段，
- * 让 ToolCallBubble 不再散落 stringField 取值。不做 i18n、不裁决，纯数据投影。
- */
+
 export interface ToolCardView {
   toolName: string;
   command?: string;

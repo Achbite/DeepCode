@@ -14,7 +14,8 @@ import type {
   ToolCall,
 } from '@deepcode/protocol';
 import { buildSessionMemorySnapshot } from './context/memory.js';
-import { SessionDriverLoop, type SessionDecisionResolverInput } from './driver/sessionDriverLoop.js';
+import { SessionDriverLoop } from './driver/sessionDriverLoop.js';
+import type { SessionDecisionResolverInput } from './driver/types.js';
 import { SessionStorageClient } from './storageClient.js';
 import type { ProjectWorkingDirectory } from './context/types.js';
 
@@ -311,7 +312,8 @@ async function llmChatStream(
       if (event.usage) usage = event.usage;
       if (event.chunk?.usage) usage = event.chunk.usage;
       if (event.type === 'provider_error') {
-        errorMessage = event.error ?? event.chunk?.error ?? 'Provider stream error.';
+        const eventMessage = (event as LlmChatStreamEvent & { message?: string }).message;
+        errorMessage = event.error ?? eventMessage ?? event.chunk?.error ?? 'Provider stream error.';
       }
       await onEvent(event);
     };

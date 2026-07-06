@@ -1,4 +1,4 @@
-export * from './agent-plan/index.js';
+export * from './protocol/index.js';
 export * from './cache/index.js';
 export * from './cadence/index.js';
 export * from './confirmation/index.js';

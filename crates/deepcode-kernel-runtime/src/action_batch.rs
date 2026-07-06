@@ -45,7 +45,9 @@ impl DeepCodeKernelRuntime {
             .and_then(Value::as_str)
             .unwrap_or("action-batch")
             .to_string();
+        let contract_id = batch_contract_id(&batch);
         let mut has_pending_permission = false;
+        let mut permission_group_ids = std::collections::BTreeMap::<String, String>::new();
 
         let operations = match compiler.compile_batch(&batch) {
             Ok(operations) => operations,
@@ -301,6 +303,62 @@ impl DeepCodeKernelRuntime {
                 events.push(requested);
 
                 let permission_id = tool_call_id.clone();
+                let permission_bundle_id = contract_id.as_deref().and_then(|contract_id| {
+                    permission_bundle_id_for_operation(
+                        &self.state,
+                        &run_id_text,
+                        contract_id,
+                        &action_id,
+                        &compiled.tool_name,
+                    )
+                });
+                let affected_operation_ids = permission_bundle_id
+                    .as_deref()
+                    .and_then(|bundle_id| {
+                        permission_bundle_operation_ids(
+                            &self.state,
+                            &run_id_text,
+                            contract_id.as_deref(),
+                            bundle_id,
+                        )
+                    })
+                    .unwrap_or_else(|| vec![action_id.clone()]);
+                let work_unit_ids = affected_operation_ids
+                    .iter()
+                    .map(|operation_id| {
+                        format!(
+                            "work-unit-{}-{}",
+                            safe_work_unit_segment(&plan_id),
+                            safe_work_unit_segment(operation_id)
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let pending_item = PendingKernelToolItem {
+                    tool_call_id: tool_call_id.clone(),
+                    tool_name: compiled.tool_name.clone(),
+                    arguments: compiled.arguments.clone(),
+                    request_id: Some(request_id.0.clone()),
+                    work_unit_id: Some(work_unit_id.clone()),
+                    action_id: Some(action_id.clone()),
+                    plan_id: Some(plan_id.clone()),
+                    operation_kind: Some(kind.to_string()),
+                    read_set: operation.read_set.clone(),
+                    write_set: operation.write_set.clone(),
+                };
+                let permission_group_key = permission_bundle_id
+                    .as_deref()
+                    .map(|bundle_id| format!("bundle:{bundle_id}"))
+                    .unwrap_or_else(|| format!("tool-call:{tool_call_id}"));
+                if let Some(existing_permission_id) =
+                    permission_group_ids.get(&permission_group_key)
+                {
+                    if let Some(pending) = self.state.pending_tools.get_mut(existing_permission_id)
+                    {
+                        pending.group_items.push(pending_item);
+                    }
+                    continue;
+                }
+                permission_group_ids.insert(permission_group_key, permission_id.clone());
                 self.state.pending_tools.insert(
                     permission_id.clone(),
                     PendingKernelTool {
@@ -308,6 +366,10 @@ impl DeepCodeKernelRuntime {
                         session_id: session_id_text.clone(),
                         tool_name: compiled.tool_name.clone(),
                         arguments: compiled.arguments.clone(),
+                        permission_bundle_id: permission_bundle_id.clone(),
+                        contract_id: contract_id.clone(),
+                        affected_operation_ids: affected_operation_ids.clone(),
+                        work_unit_ids: work_unit_ids.clone(),
                         request_id: Some(request_id.0.clone()),
                         work_unit_id: Some(work_unit_id.clone()),
                         action_id: Some(action_id.clone()),
@@ -315,6 +377,7 @@ impl DeepCodeKernelRuntime {
                         operation_kind: Some(kind.to_string()),
                         read_set: operation.read_set.clone(),
                         write_set: operation.write_set.clone(),
+                        group_items: vec![pending_item],
                     },
                 );
                 let permission_sequence = self.ledger.next_sequence(&run_id_text)?;
@@ -323,6 +386,11 @@ impl DeepCodeKernelRuntime {
                     session_id: SessionId(session_id_text.clone()),
                     request: deepcode_kernel_abi::PermissionRequestEnvelope {
                         id: permission_id.clone(),
+                        permission_bundle_id: permission_bundle_id.clone(),
+                        contract_id: contract_id.clone(),
+                        affected_operation_ids: affected_operation_ids.clone(),
+                        work_unit_ids: work_unit_ids.clone(),
+                        tool_id: Some(compiled.tool_name.clone()),
                         capability: capability_for_tool(&compiled.tool_name).to_string(),
                         risk_level: risk_for_tool(&compiled.tool_name).to_string(),
                         summary: format!(
@@ -355,6 +423,10 @@ impl DeepCodeKernelRuntime {
                         "toolName": &compiled.tool_name,
                         "capability": capability_for_tool(&compiled.tool_name),
                         "riskLevel": risk_for_tool(&compiled.tool_name),
+                        "permissionBundleId": permission_bundle_id,
+                        "contractId": contract_id,
+                        "affectedOperationIds": affected_operation_ids,
+                        "workUnitIds": work_unit_ids,
                         "requestId": &request_id.0,
                         "workUnitId": &work_unit_id,
                         "actionId": &action_id,
@@ -796,6 +868,22 @@ fn validate_operations_against_execution_contract(
             .get("capability")
             .and_then(Value::as_str)
             .unwrap_or_default();
+        let contract_tool_id = contract_operation
+            .get("toolId")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !contract_tool_id.is_empty() {
+            let registry = KernelToolRegistry::new();
+            let operation_tool_id = operation
+                .tool_id(&registry)
+                .unwrap_or(operation.capability.as_str());
+            if contract_tool_id != operation_tool_id {
+                return Err(KernelError::InvalidCommand(format!(
+                    "action {} toolId {} does not match Kernel execution contract toolId {}",
+                    operation.id, operation_tool_id, contract_tool_id
+                )));
+            }
+        }
         if contract_capability != operation.capability {
             return Err(KernelError::InvalidCommand(format!(
                 "action {} capability {} does not match Kernel execution contract capability {}",
@@ -822,6 +910,78 @@ fn validate_operations_against_execution_contract(
         }
     }
     Ok(())
+}
+
+fn batch_contract_id(batch: &Value) -> Option<String> {
+    batch
+        .get("contractId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn permission_bundle_id_for_operation(
+    state: &RuntimeState,
+    run_id: &str,
+    contract_id: &str,
+    operation_id: &str,
+    tool_name: &str,
+) -> Option<String> {
+    let contract = state
+        .execution_contracts_by_run
+        .get(run_id)
+        .and_then(|contracts| contracts.get(contract_id))?;
+    let capability = capability_for_tool(tool_name);
+    contract
+        .get("permissionBundles")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|bundle| {
+            let matches_operation = bundle
+                .get("operationIds")
+                .and_then(Value::as_array)
+                .map(|items| items.iter().any(|item| item.as_str() == Some(operation_id)))
+                .unwrap_or(false);
+            let matches_capability = bundle
+                .get("capability")
+                .and_then(Value::as_str)
+                .map(|value| value == capability)
+                .unwrap_or(false);
+            matches_operation || matches_capability
+        })
+        .and_then(|bundle| bundle.get("id"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn permission_bundle_operation_ids(
+    state: &RuntimeState,
+    run_id: &str,
+    contract_id: Option<&str>,
+    bundle_id: &str,
+) -> Option<Vec<String>> {
+    let contract_id = contract_id?;
+    let contract = state
+        .execution_contracts_by_run
+        .get(run_id)
+        .and_then(|contracts| contracts.get(contract_id))?;
+    let ids = contract
+        .get("permissionBundles")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|bundle| bundle.get("id").and_then(Value::as_str) == Some(bundle_id))?
+        .get("operationIds")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if ids.is_empty() {
+        None
+    } else {
+        Some(ids)
+    }
 }
 
 fn contract_paths_match(left: &str, right: &str) -> bool {

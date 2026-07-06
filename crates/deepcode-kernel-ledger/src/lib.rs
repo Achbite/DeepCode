@@ -847,8 +847,6 @@ impl TempArtifactRegistry {
                     "refusing to promote unknown temp artifact lease {lease_id}"
                 ))
             })?;
-        // 单调升级约束：Run→Session→Persistent 允许，逆向降级返回 PermissionDenied。
-        // 等级数值化后比较：Run=0 / Session=1 / Persistent=2。new_scope 必须 >= 当前 scope。
         let current_rank = scope_rank(&artifact.scope);
         let new_rank = scope_rank(&new_scope);
         if new_rank < current_rank {
@@ -1021,8 +1019,6 @@ impl TempArtifactRegistry {
     }
 }
 
-/// 把 TempArtifactScope 映射为单调升级用的整数等级：Run=0 / Session=1 / Persistent=2。
-/// promote_lease 据此约束 new_scope 必须 >= 当前 scope，禁止逆向降级。
 fn optional_match(actual: Option<&str>, expected: Option<&str>) -> bool {
     expected
         .map(|expected| Some(expected) == actual)
@@ -1536,12 +1532,10 @@ mod tests {
                 Some(b"demote"),
             )
             .unwrap();
-        // 允许 Session -> Persistent（单调升级）。
         let promoted = registry
             .promote_lease(&lease.lease_id, TempArtifactScope::Persistent)
             .unwrap();
         assert_eq!(promoted.scope, TempArtifactScope::Persistent);
-        // 禁止 Persistent -> Run（逆向降级）。
         let demote_err = registry
             .promote_lease(&lease.lease_id, TempArtifactScope::Run)
             .unwrap_err();

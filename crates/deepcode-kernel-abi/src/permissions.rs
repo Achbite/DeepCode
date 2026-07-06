@@ -23,6 +23,16 @@ pub enum PermissionDecisionKind {
 #[serde(rename_all = "camelCase")]
 pub struct PermissionRequestEnvelope {
     pub id: String,
+    #[serde(default)]
+    pub permission_bundle_id: Option<String>,
+    #[serde(default)]
+    pub contract_id: Option<String>,
+    #[serde(default)]
+    pub affected_operation_ids: Vec<String>,
+    #[serde(default)]
+    pub work_unit_ids: Vec<String>,
+    #[serde(default)]
+    pub tool_id: Option<String>,
     pub capability: String,
     pub risk_level: String,
     pub summary: String,

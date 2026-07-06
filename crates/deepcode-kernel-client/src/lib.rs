@@ -13,8 +13,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt as UnixCommandExt;
 #[cfg(windows)]
-use std::os::windows::process::CommandExt;
+use std::os::windows::process::CommandExt as WindowsCommandExt;
 
 #[derive(Debug, Error)]
 pub enum KernelClientError {
@@ -533,9 +535,12 @@ impl KernelBootstrapGuard {
 
 impl Drop for KernelBootstrapGuard {
     fn drop(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+        // The kernel process is a daemon shared by one-shot CLI/TUI commands.
+        // Dropping the handle must not kill it; otherwise a follow-up command
+        // such as `sessions new` -> `ask --session ...` loses the in-memory
+        // session runtime before the next command can resolve it.
+        if let Some(child) = self.child.take() {
+            std::mem::forget(child);
         }
     }
 }
@@ -1130,23 +1135,28 @@ fn find_kernel_binary() -> Option<PathBuf> {
         }
     }
 
-    let mut roots = Vec::new();
+    let mut search_dirs = Vec::new();
     if let Ok(exe) = std::env::current_exe() {
         if let Some(parent) = exe.parent() {
-            roots.push(parent.to_path_buf());
+            push_unique_path(&mut search_dirs, parent.to_path_buf());
             if cfg!(target_os = "macos") {
                 if let Some(contents) = parent.parent() {
-                    roots.push(contents.join("MacOS"));
-                    roots.push(contents.join("Resources"));
+                    push_unique_path(&mut search_dirs, contents.to_path_buf());
+                    push_unique_path(&mut search_dirs, contents.join("MacOS"));
+                    push_unique_path(&mut search_dirs, contents.join("Resources"));
                 }
             }
+            add_target_profile_dirs(&mut search_dirs, parent);
+            add_packaged_kernel_dirs(&mut search_dirs, parent);
         }
     }
     if let Ok(cwd) = std::env::current_dir() {
-        roots.push(cwd);
+        push_unique_path(&mut search_dirs, cwd.clone());
+        add_packaged_kernel_dirs(&mut search_dirs, &cwd);
+        add_target_profile_dirs(&mut search_dirs, &cwd);
     }
 
-    for root in &roots {
+    for root in &search_dirs {
         for candidate in kernel_binary_candidates(root) {
             if candidate.is_file() {
                 return Some(candidate);
@@ -1154,9 +1164,48 @@ fn find_kernel_binary() -> Option<PathBuf> {
         }
     }
 
-    for root in roots {
+    for root in search_dirs {
         for ancestor in root.ancestors() {
-            for profile in ["debug", "release"] {
+            for platform_dir in kernel_platform_dir_names() {
+                for profile in ["release", "debug"] {
+                    for name in kernel_binary_names() {
+                        let direct = ancestor
+                            .join("target")
+                            .join(platform_dir)
+                            .join(profile)
+                            .join(name);
+                        if direct.is_file() {
+                            return Some(direct);
+                        }
+                        let nested = ancestor
+                            .join("DeepCode")
+                            .join("target")
+                            .join(platform_dir)
+                            .join(profile)
+                            .join(name);
+                        if nested.is_file() {
+                            return Some(nested);
+                        }
+                    }
+                }
+            }
+            for platform_dir in kernel_platform_dir_names() {
+                for name in kernel_binary_names() {
+                    let direct = ancestor.join("bin").join(platform_dir).join(name);
+                    if direct.is_file() {
+                        return Some(direct);
+                    }
+                    let nested = ancestor
+                        .join("DeepCode")
+                        .join("bin")
+                        .join(platform_dir)
+                        .join(name);
+                    if nested.is_file() {
+                        return Some(nested);
+                    }
+                }
+            }
+            for profile in ["release", "debug"] {
                 for name in kernel_binary_names() {
                     let direct = ancestor.join("target").join(profile).join(name);
                     if direct.is_file() {
@@ -1177,6 +1226,45 @@ fn find_kernel_binary() -> Option<PathBuf> {
     None
 }
 
+fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !paths.iter().any(|existing| existing == &path) {
+        paths.push(path);
+    }
+}
+
+fn add_packaged_kernel_dirs(paths: &mut Vec<PathBuf>, root: &Path) {
+    for ancestor in root.ancestors() {
+        for platform_dir in kernel_platform_dir_names() {
+            push_unique_path(paths, ancestor.join("bin").join(platform_dir));
+            push_unique_path(
+                paths,
+                ancestor.join("DeepCode").join("bin").join(platform_dir),
+            );
+        }
+    }
+}
+
+fn add_target_profile_dirs(paths: &mut Vec<PathBuf>, root: &Path) {
+    for ancestor in root.ancestors() {
+        for platform_dir in kernel_platform_dir_names() {
+            for profile in ["release", "debug"] {
+                push_unique_path(
+                    paths,
+                    ancestor.join("target").join(platform_dir).join(profile),
+                );
+                push_unique_path(
+                    paths,
+                    ancestor
+                        .join("DeepCode")
+                        .join("target")
+                        .join(platform_dir)
+                        .join(profile),
+                );
+            }
+        }
+    }
+}
+
 fn kernel_binary_candidates(root: &Path) -> Vec<PathBuf> {
     kernel_binary_names()
         .into_iter()
@@ -1186,9 +1274,27 @@ fn kernel_binary_candidates(root: &Path) -> Vec<PathBuf> {
 
 fn kernel_binary_names() -> Vec<&'static str> {
     if cfg!(windows) {
-        vec!["deepcode-kernel.exe", "deepcode-kernel-daemon.exe"]
+        vec!["deepcode-kernel-daemon.exe", "deepcode-kernel.exe"]
     } else {
-        vec!["deepcode-kernel", "deepcode-kernel-daemon"]
+        vec!["deepcode-kernel-daemon", "deepcode-kernel"]
+    }
+}
+
+fn kernel_platform_dir_names() -> Vec<&'static str> {
+    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        vec!["macos-arm64"]
+    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+        vec!["macos-x64", "macos-arm64"]
+    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        vec!["linux-x64"]
+    } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+        vec!["linux-arm64", "linux-x64"]
+    } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+        vec!["windows-x64"]
+    } else if cfg!(all(target_os = "windows", target_arch = "aarch64")) {
+        vec!["windows-arm64", "windows-x64"]
+    } else {
+        Vec::new()
     }
 }
 
@@ -1209,6 +1315,9 @@ fn spawn_kernel_binary(kernel_bin: &Path, host: &str, port: &str) -> KernelClien
         .stdin(Stdio::null())
         .stdout(Stdio::from(log_file))
         .stderr(Stdio::from(stderr));
+
+    #[cfg(unix)]
+    command.process_group(0);
 
     #[cfg(windows)]
     command.creation_flags(0x0800_0000);

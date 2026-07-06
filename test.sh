@@ -452,8 +452,8 @@ search "invalid_proposal_stays_without_transition|plan_draft_advances_to_check|a
 	! search "PlanContractSubmit|PlanAccept|PlanReject|PlanRevise" crates/deepcode-kernel-abi/src crates/deepcode-kernel-runtime/src crates/deepcode-kernel-daemon/src userspace/session-core/src userspace/protocol/src userspace/gui/src || fail "legacy live Plan* commands must not remain"
 	search "fn proposal_action_bundle_review_report|fn review_facts_for_run|fn review_gate_evaluate|proposal.reviewed|review.facts_produced|review_gate.evaluated" crates/deepcode-kernel-runtime/src/workflow.rs >/dev/null
 	search "ActionBatchSubmit|WorkUnitQueued|WorkUnitStarted|WorkUnitCompleted|WorkUnitBlocked|ReviewFactsGet|ReviewGateEvaluate" crates/deepcode-kernel-runtime/src/tests.rs >/dev/null
-	search "parseProposalEnvelope|ProposalEnvelope|actionBundle|expectedValidation|reviewGuide" userspace/session-core/src/agent-plan >/dev/null
-	search "resourceRequest|ResourceRequestDraft|manifestEntryId" userspace/session-core/src/agent-plan >/dev/null
+	search "parseProposalEnvelope|ProposalEnvelope|actionBundle|expectedValidation|reviewGuide" userspace/session-core/src/protocol >/dev/null
+	search "resourceRequest|ResourceRequestDraft|manifestEntryId" userspace/session-core/src/protocol >/dev/null
 	! search "createPlanContractSubmitCommand|compileActionBundleToPlanContract" userspace/session-core/src userspace/protocol/src userspace/gui/src || fail "Session must not bridge v3 actionBundle through legacy plan contract"
 	search "DraftTaskQueue|ApprovedTaskQueue" userspace/session-core/src/task-queue >/dev/null
 search "PlanConfirmationPolicy|PermissionAutoApprovalPolicy|AutoConfirmDecision|DEFAULT_PLAN_CONFIRMATION_POLICY|decidePlanConfirmation|decidePermissionAutoApproval|autoApproveDelete" userspace/session-core/src/confirmation userspace/session-core/src/task-queue >/dev/null
@@ -480,8 +480,8 @@ search "canonicalizePrompt|canonicalizeToolSchema|stablePrefixHash|dynamicSuffix
   || fail "old prompt settings/editor/profile terms must not return"
 search "readConversationArchiveFile|getConversationArchive|AgentArchiveActions|复制完整对话|复制调试包|打开归档目录" userspace/gui/src/services userspace/gui/src/components/agent-panel >/dev/null
 search "manualChunks|markdown-renderer|chunkSizeWarningLimit" userspace/gui/vite.config.ts >/dev/null
-! search "format=\\\"yaml\\\"|YAML ACTION_BUNDLE|strict YAML subset" userspace/session-core/src/agent-plan userspace/session-core/src/task-queue userspace/session-core/src/requirement userspace/session-core/src/cadence userspace/session-core/src/review userspace/session-core/src/context userspace/session-core/src/cache || fail "session-core must not support YAML ACTION_BUNDLE V1"
-! search "PermissionGate|DeepCodeKernelRuntime|workspace\\.write\\(|workspace\\.delete\\(|shell\\.exec\\(|ReviewGate accepted|ValidationResult" userspace/session-core/src/agent-plan userspace/session-core/src/task-queue userspace/session-core/src/requirement userspace/session-core/src/cadence userspace/session-core/src/review userspace/session-core/src/context userspace/session-core/src/cache || fail "session-core must not execute tools or own Kernel decisions"
+! search "format=\\\"yaml\\\"|YAML ACTION_BUNDLE|strict YAML subset" userspace/session-core/src/protocol userspace/session-core/src/task-queue userspace/session-core/src/requirement userspace/session-core/src/cadence userspace/session-core/src/review userspace/session-core/src/context userspace/session-core/src/cache || fail "session-core must not support YAML ACTION_BUNDLE V1"
+! search "PermissionGate|DeepCodeKernelRuntime|workspace\\.write\\(|workspace\\.delete\\(|shell\\.exec\\(|ReviewGate accepted|ValidationResult" userspace/session-core/src/protocol userspace/session-core/src/task-queue userspace/session-core/src/requirement userspace/session-core/src/cadence userspace/session-core/src/review userspace/session-core/src/context userspace/session-core/src/cache || fail "session-core must not execute tools or own Kernel decisions"
 test ! -e userspace/gui/src/components/agent-panel/AgentWorkflowSelector.tsx \
   || fail "GUI composer must not expose fixed workflow selector"
 ! search "agent-workflow-selector|plan-check-complete-review" userspace/gui/src/components/agent-panel \

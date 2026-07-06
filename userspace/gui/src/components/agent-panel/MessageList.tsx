@@ -9,6 +9,10 @@ import type {
 } from '@deepcode/protocol';
 import { t, resolveDiagnosticText, type UiLanguage } from '../../i18n';
 import MarkdownContent from './LazyMarkdownContent';
+import {
+  hasStructuredProjection,
+  StructuredProjectionContent,
+} from './StructuredProjectionContent';
 import ToolCallBubble from './ToolCallBubble';
 import ToolEvidenceDetails from './ToolEvidenceDetails';
 import DiffCard from './DiffCard';
@@ -141,6 +145,60 @@ function payloadText(payload: unknown): string {
   );
 }
 
+type PayloadI18nVariables = Record<string, string | number | boolean | null | undefined>;
+
+function payloadI18nVariables(payload: unknown, key: string): PayloadI18nVariables | undefined {
+  if (!isRecord(payload) || !isRecord(payload[key])) return undefined;
+  const variables: PayloadI18nVariables = {};
+  for (const [name, value] of Object.entries(payload[key])) {
+    if (
+      typeof value === 'string' ||
+      typeof value === 'number' ||
+      typeof value === 'boolean' ||
+      value === null ||
+      value === undefined
+    ) {
+      variables[name] = value;
+    }
+  }
+  return variables;
+}
+
+function translatePayloadKey(
+  payload: unknown,
+  language: UiLanguage,
+  keyField: string,
+  fallback?: string,
+): string | undefined {
+  const key = stringField(payload, keyField);
+  if (!key) return fallback;
+  const variables =
+    payloadI18nVariables(payload, `${keyField.replace(/Key$/, '')}Args`) ??
+    payloadI18nVariables(payload, 'messageArgs');
+  const translated = t(language, key, variables);
+  return translated === key ? fallback : translated;
+}
+
+function localizedPayloadField(
+  payload: unknown,
+  language: UiLanguage,
+  field: string,
+  keyField: string,
+  fallbackKey?: string,
+): string | undefined {
+  const fallback = stringField(payload, field) ?? (fallbackKey ? t(language, fallbackKey) : undefined);
+  return translatePayloadKey(payload, language, keyField, fallback);
+}
+
+function localizedPayloadText(payload: unknown, language: UiLanguage): string {
+  return sanitizeDisplayText(
+    translatePayloadKey(payload, language, 'contentKey', stringField(payload, 'content')) ??
+    translatePayloadKey(payload, language, 'messageKey', stringField(payload, 'message')) ??
+    translatePayloadKey(payload, language, 'summaryKey', stringField(payload, 'summary')) ??
+    payloadText(payload)
+  );
+}
+
 function thinkingMarkdown(block: AgentTimelineBlock): string {
   for (let index = block.events.length - 1; index >= 0; index -= 1) {
     const text = thinkingEventText(block.events[index]);
@@ -226,24 +284,8 @@ function AttachmentChips({
   );
 }
 
-/**
- * 判断 AgentEvent 是否含可见正文/摘要/工具事实，用于折叠卡空容器过滤。
- * 阶段 7/8 review 反馈中 F4 残留横线根因之一是空 details 容器；通过此判定
- * 在渲染前剔除"只有边框没有内容"的折叠卡。
- *
- * 当前调用点：作为备用 helper 保留；上一轮在 TraceGroupCard 中的强过滤已按
- * 用户反馈回退（用户期望折叠卡始终可见，不消失），故此 helper 暂未挂入主链路。
- * 仍由 test.sh 行 478 grep 门禁保证未来回退/扩展时能快速定位。
- *
- * 判定规则：
- *   - 任意 string 字段（content / message / summary / details / output 等）非空 -> 有内容
- *   - tool_call / tool_result / permission_* 因含工具事实，默认视为有内容
- *   - workflow_stage / workflow_decision 必须有 stage 或 summary 字段才视为有内容
- *   - 其他默认按 payload 是否为非空对象判断
- */
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
+
 function hasMeaningfulContent(event: AgentEvent): boolean {
-  // 工具时间线事件即便 payload 仅含 toolName 也视为有内容（tool 卡可独立成立）。
   if (
     event.kind === 'tool_call' ||
     event.kind === 'tool_result' ||
@@ -259,7 +301,6 @@ function hasMeaningfulContent(event: AgentEvent): boolean {
   if (!isRecord(payload)) {
     return false;
   }
-  // workflow 类事件要求至少含 stage / summary / details / decision 之一可见字段。
   if (event.kind === 'workflow_stage' || event.kind === 'workflow_decision') {
     return Boolean(
       stringField(payload, 'stage') ??
@@ -269,7 +310,6 @@ function hasMeaningfulContent(event: AgentEvent): boolean {
         (isRecord(payload.decision) ? 'decision' : undefined),
     );
   }
-  // 通用判定：任一文本字段非空即视为有内容。
   const meaningfulKeys = [
     'content',
     'message',
@@ -1034,10 +1074,8 @@ function PlanCard({
   const [expanded, setExpanded] = React.useState(false);
   const title = stringField(event.payload, 'title') ?? t(language, 'deepcodeGui.tasks.plan');
   const summary = stringField(event.payload, 'summary') ?? payloadText(event.payload);
-  const content = stringField(event.payload, 'content');
-  const expectedValidation = stringField(event.payload, 'expectedValidation');
-  const reviewGuide = stringField(event.payload, 'reviewGuide');
   const facts = payloadArray(event.payload, 'facts');
+  const structuredPlan = hasStructuredProjection(event.payload, 'plan');
 
   if (confirmed) {
     return (
@@ -1059,22 +1097,11 @@ function PlanCard({
         </button>
         {expanded && (
           <div className="agent-thinking-trace__body agent-plan-confirmed__body">
-            <div className="agent-flow-card__summary">{summary}</div>
-            {content && content !== summary && <MarkdownContent content={content} />}
-            {expectedValidation && (
-              <div className="agent-flow-card__section">
-                <div className="agent-flow-card__section-title">
-                  {t(language, 'agent.plan.expectedValidation')}
-                </div>
-                <MarkdownContent content={expectedValidation} />
-              </div>
-            )}
-            {reviewGuide && (
-              <div className="agent-flow-card__section">
-                <div className="agent-flow-card__section-title">
-                  {t(language, 'agent.plan.reviewGuide')}
-                </div>
-                <MarkdownContent content={reviewGuide} />
+            {structuredPlan ? (
+              <StructuredProjectionContent payload={event.payload} language={language} kind="plan" />
+            ) : (
+              <div className="agent-flow-card__summary">
+                {t(language, 'session.projection.unsupportedLegacy')}
               </div>
             )}
             {facts.length > 0 && (
@@ -1091,22 +1118,11 @@ function PlanCard({
   return (
     <section key={event.id} className="agent-flow-card agent-flow-card--plan">
       <div className="agent-flow-card__title">{title}</div>
-      <div className="agent-flow-card__summary">{summary}</div>
-      {content && content !== summary && <MarkdownContent content={content} />}
-      {expectedValidation && (
-        <div className="agent-flow-card__section">
-          <div className="agent-flow-card__section-title">
-            {t(language, 'agent.plan.expectedValidation')}
-          </div>
-          <MarkdownContent content={expectedValidation} />
-        </div>
-      )}
-      {reviewGuide && (
-        <div className="agent-flow-card__section">
-          <div className="agent-flow-card__section-title">
-            {t(language, 'agent.plan.reviewGuide')}
-          </div>
-          <MarkdownContent content={reviewGuide} />
+      {structuredPlan ? (
+        <StructuredProjectionContent payload={event.payload} language={language} kind="plan" />
+      ) : (
+        <div className="agent-flow-card__summary">
+          {t(language, 'session.projection.unsupportedLegacy')}
         </div>
       )}
       {facts.length > 0 && <ul className="agent-flow-card__facts">{facts.map((fact) => <li key={fact}>{fact}</li>)}</ul>}
@@ -1135,8 +1151,6 @@ function RequirementConfirmationCard({
   );
 }
 
-// R4：从 requirement_confirmation 事件中提取 options 与 effect，供卡片渲染"选择后副作用"。
-// payload 路径与 session-core 写入对齐：payload.decisionRequest.options[].effect
 interface RequirementOptionView {
   id: string;
   label: string;
@@ -1293,19 +1307,14 @@ function ReviewSummaryCard({
   event: AgentEvent;
   language: UiLanguage;
 }) {
-  const title = stringField(event.payload, 'title') ?? t(language, 'agent.review.title');
-  const summary = stringField(event.payload, 'summary') ?? payloadText(event.payload);
-  const content = stringField(event.payload, 'content');
+  const title = localizedPayloadField(event.payload, language, 'title', 'titleKey', 'agent.review.title') ??
+    t(language, 'agent.review.title');
+  const summary = localizedPayloadField(event.payload, language, 'summary', 'summaryKey') ??
+    localizedPayloadText(event.payload, language);
   const llmGuidance = stringField(event.payload, 'llmGuidance');
   const status = stringField(event.payload, 'status') ?? 'waitingUserReview';
   const facts = payloadArray(event.payload, 'facts');
   const gitReview = isRecord(event.payload) ? event.payload.gitReview : undefined;
-  const readableReview = isRecord(event.payload) && isRecord(event.payload.readableReview)
-    ? event.payload.readableReview
-    : undefined;
-  const readableChangedFiles = Array.isArray(readableReview?.changedFiles)
-    ? readableReview.changedFiles.filter(isRecord)
-    : [];
   const continuationCount =
     isRecord(event.payload) && typeof event.payload.continuationCount === 'number'
       ? event.payload.continuationCount
@@ -1314,38 +1323,12 @@ function ReviewSummaryCard({
     <section key={event.id} className={`agent-flow-card agent-flow-card--review agent-flow-card--${status}`}>
       <div className="agent-flow-card__title">{title}</div>
       <div className="agent-flow-card__summary">{summary}</div>
-      {readableChangedFiles.length > 0 && (
-        <div className="agent-flow-card__section">
-          <div className="agent-flow-card__section-title">
-            {t(language, 'agent.review.changedFiles')}
-          </div>
-          <ul className="agent-flow-card__facts">
-            {readableChangedFiles.slice(0, 64).map((file, index) => {
-              const path = stringField(file, 'path') ?? `file-${index + 1}`;
-              const operation = stringField(file, 'operation') ?? 'modify';
-              const statusText = stringField(file, 'status') ?? 'unknown';
-              const reason = stringField(file, 'failureReason') || stringField(file, 'failureClassification');
-              return (
-                <li key={`${path}-${operation}-${index}`}>
-                  {t(language, 'review.changedFile', { path, operation, status: statusText })}
-                  {reason && (
-                    <span className="agent-flow-card__fact-detail">
-                      {' '}
-                      {t(language, 'review.changedFile.reason', { reason })}
-                    </span>
-                  )}
-                </li>
-              );
-            })}
-          </ul>
+      {hasStructuredProjection(event.payload, 'review') ? (
+        <StructuredProjectionContent payload={event.payload} language={language} kind="review" />
+      ) : (
+        <div className="agent-flow-card__summary">
+          {t(language, 'session.projection.unsupportedLegacy')}
         </div>
-      )}
-      {content && content !== summary && readableChangedFiles.length === 0 && <MarkdownContent content={content} />}
-      {content && content !== summary && readableChangedFiles.length > 0 && (
-        <details className="agent-flow-card__details">
-          <summary>{t(language, 'agent.review.markdownFallback')}</summary>
-          <MarkdownContent content={content} />
-        </details>
       )}
       {continuationCount > 0 && (
         <div className="agent-flow-card__section">
@@ -1434,7 +1417,7 @@ function renderTraceEvent(event: AgentEvent, language: UiLanguage) {
         <div className="agent-message__meta">
           {t(language, 'agent.trace.output', { stage: localizedStage(stage, language) })}
         </div>
-        <MarkdownContent content={payloadText(event.payload)} />
+        <MarkdownContent content={localizedPayloadText(event.payload, language)} />
       </div>
     );
   }
@@ -1457,11 +1440,6 @@ function TraceGroupCard({ group, language }: { group: TraceGroup; language: UiLa
       wasRunningRef.current = false;
     }
   }, [group.running]);
-
-  // 注意：上一轮 review 曾在此处加 return null 过滤"空容器"，但用户反馈
-  // 期望折叠状态下也保留卡片（让"思考过程 - 1 条"按钮可见，点击可展开），
-  // 而非完全消失。当前规则：始终渲染折叠卡片；空内容由视觉收口（CSS）处理，
-  // 不再隐藏整个容器。`hasMeaningfulContent` helper 暂留作其他场景备用。
 
   return (
     <div className={`agent-thinking-trace ${group.running ? 'agent-thinking-trace--running' : ''}`}>
@@ -1490,8 +1468,7 @@ function TraceGroupCard({ group, language }: { group: TraceGroup; language: UiLa
 function NarrativeThinkingCard({ block, language }: { block: AgentTimelineBlock; language: UiLanguage }) {
   const running = block.status === 'running' || block.status === 'waiting';
   const markdown = thinkingMarkdown(block);
-  // 超长 reasoning（如执行阶段完整 CoT，可达上万字符）默认折叠且不随运行态自动展开，
-  // 避免主面板被一次性大段文本撑爆；标题摘要仍提供预览，用户可手动展开。
+
   const longContent = markdown.length > 1600;
   const [expanded, setExpanded] = React.useState(
     block.displayHints?.initialOpen ?? (longContent ? false : running || !block.defaultCollapsed)
@@ -1890,7 +1867,7 @@ function renderMessage(
   const pending = isRecord(event.payload) && event.payload.pending === true;
   const isDiagnostic = isRecord(event.payload) && event.payload.diagnostic === true;
   const text = (isDiagnostic ? resolveDiagnosticText(event.payload as Record<string, unknown>, language) : undefined)
-    ?? payloadText(event.payload);
+    ?? localizedPayloadText(event.payload, language);
   const renderMarkdown = event.kind === 'assistant_msg' || event.kind === 'user_msg';
   const shouldCollapse = shouldCollapseAssistantMessage(event, text);
   const attachments = event.kind === 'user_msg' ? payloadAttachments(event.payload) : [];

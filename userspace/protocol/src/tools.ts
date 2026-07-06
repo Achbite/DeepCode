@@ -24,10 +24,14 @@ export interface KernelToolCatalogTool {
   family: 'workspace' | 'git' | 'process' | 'network' | 'browser' | 'provider' | string;
   operationKind?: string;
   providerSchema: object;
+  providerVisible?: boolean;
+  forbiddenFields?: string[];
   risk: 'low' | 'medium' | 'high' | 'critical' | string;
   permissionMode: 'allow' | 'ask' | 'deny' | string;
+  permissionSummary?: string;
   pathScopePolicy: string;
   executionMode: 'execute' | 'previewOnly' | 'blocked' | string;
+  hardDenyRules?: string[];
   needsWorkspace: boolean;
   readOnly: boolean;
 }

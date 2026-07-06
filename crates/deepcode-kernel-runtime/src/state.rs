@@ -59,6 +59,25 @@ pub(crate) struct PendingKernelTool {
     pub(crate) session_id: String,
     pub(crate) tool_name: String,
     pub(crate) arguments: Value,
+    pub(crate) permission_bundle_id: Option<String>,
+    pub(crate) contract_id: Option<String>,
+    pub(crate) affected_operation_ids: Vec<String>,
+    pub(crate) work_unit_ids: Vec<String>,
+    pub(crate) request_id: Option<String>,
+    pub(crate) work_unit_id: Option<String>,
+    pub(crate) action_id: Option<String>,
+    pub(crate) plan_id: Option<String>,
+    pub(crate) operation_kind: Option<String>,
+    pub(crate) read_set: Vec<String>,
+    pub(crate) write_set: Vec<String>,
+    pub(crate) group_items: Vec<PendingKernelToolItem>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PendingKernelToolItem {
+    pub(crate) tool_call_id: String,
+    pub(crate) tool_name: String,
+    pub(crate) arguments: Value,
     pub(crate) request_id: Option<String>,
     pub(crate) work_unit_id: Option<String>,
     pub(crate) action_id: Option<String>,

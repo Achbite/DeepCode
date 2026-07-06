@@ -1,15 +1,4 @@
-/**
- * 基本文件编辑器组件（Monaco Editor 版本）
- *
- * 接入要点：
- *   1. 使用 @monaco-editor/react 的 Editor 组件实现语法高亮、Ctrl+S 保存等；
- *   2. 每个 modelKey 对应一个 ITextModel；关闭 Tab 时由外部调用 closeModel(modelKey) 释放；
- *   3. 根据 filePath 扩展名推断 languageId，未知类型默认 plaintext；
- *   4. value 受控；onChange 回调驱动 editorStore；
- *   5. 二进制文件 / 超过 16 MiB 大文件给出只读提示；超过 4 MiB 给出性能预警；
- *   6. 状态栏显示行/列/语言/编码/大小/dirty；
- *   7. Ctrl+S / Cmd+S 触发 onSave。
- */
+
 import React, { useRef, useCallback, useEffect, useState } from 'react';
 import Editor, { OnMount } from '@monaco-editor/react';
 import type { editor as MonacoEditor } from 'monaco-editor';
@@ -18,27 +7,17 @@ import { normalizeUiLanguage, t } from '../../i18n';
 import { registerModel } from './modelRegistry';
 import './codeEditor.css';
 
-// ---- 公共接口 ----
 interface CodeEditorProps {
-  /** 当前打开的文件路径（null 表示无文件） */
   filePath: string | null;
-  /** modelKey：editorStore 中的 Tab id（folderId::path），用于唯一定位 ITextModel */
   modelKey: string | null;
-  /** 文件内容 */
   content: string;
-  /** 内容变更回调 */
   onContentChange: (content: string) => void;
-  /** 是否处于已修改未保存状态 */
   isDirty: boolean;
-  /** 是否为二进制 */
   binary?: boolean;
-  /** 文件大小，字节 */
   sizeBytes?: number;
-  /** 保存文件回调（参数为 modelKey） */
   onSave: (modelKey: string) => void;
 }
 
-// ---- 编辑器常量 ----
 const LARGE_FILE_WARNING_THRESHOLD = 4 * 1024 * 1024; // 4 MiB
 const LARGE_FILE_HARD_THRESHOLD = 16 * 1024 * 1024; // 16 MiB
 
@@ -97,8 +76,6 @@ const EXT_TO_LANGUAGE: Record<string, string> = {
 
 function inferLanguageId(filePath: string | null): string {
   if (!filePath) return 'plaintext';
-  // .code-workspace（VS Code-style 工作区文件）：阶段 4 / S4-3 起允许在 Monaco 中编辑保存，
-  // 实际文件内容是允许注释的 JSON（jsonc），与 .vscode/settings.json 同语言。
   if (/\.code-workspace$/i.test(filePath)) return 'jsonc';
   const ext = filePath.split('.').pop()?.toLowerCase() ?? '';
   return EXT_TO_LANGUAGE[ext] ?? 'plaintext';
@@ -177,7 +154,6 @@ const CodeEditor: React.FC<CodeEditorProps> = ({
     applyEditorOptions();
 
     editor.addCommand(
-      // eslint-disable-next-line no-bitwise
       monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS,
       () => {
         if (modelKey) {
@@ -187,7 +163,6 @@ const CodeEditor: React.FC<CodeEditorProps> = ({
     );
 
     editor.addCommand(
-      // eslint-disable-next-line no-bitwise
       monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyA,
       () => {
         void editor.getAction('editor.action.selectAll')?.run();
@@ -200,7 +175,6 @@ const CodeEditor: React.FC<CodeEditorProps> = ({
     registerModel(modelKey, monacoRef.current?.getModel() ?? null);
   }, [modelKey, content]);
 
-  // ---- 空状态 ----
   if (!filePath || !modelKey) {
     return (
       <div className="code-editor code-editor--empty">
@@ -232,7 +206,6 @@ const CodeEditor: React.FC<CodeEditorProps> = ({
     );
   }
 
-  // ---- 超大文件 ----
   if (sizeBytes > LARGE_FILE_HARD_THRESHOLD) {
     return (
       <div className="code-editor code-editor--readonly">
@@ -253,7 +226,6 @@ const CodeEditor: React.FC<CodeEditorProps> = ({
     );
   }
 
-  // ---- Monaco 编辑器主体 ----
   return (
     <div className="code-editor">
       {sizeBytes > LARGE_FILE_WARNING_THRESHOLD && (

@@ -517,6 +517,314 @@ fn action_batch_submit_rejects_file_operation_outside_execution_contract() {
 }
 
 #[test]
+fn action_batch_permission_request_carries_contract_gate_metadata() {
+    let (mut runtime, _temp) = runtime_with_workspace();
+    runtime
+        .dispatch(KernelCommand::RunCreate {
+            request_id: RequestId("req-run-create-contract-permission".to_string()),
+            session_id: Some(SessionId("session-contract-permission".to_string())),
+            input: UserInput {
+                text: "Write one generic contract file.".to_string(),
+                attachments: vec![],
+            },
+            workspace_binding: None,
+            profile_ref: None,
+            workflow_ref: None,
+            run_overrides: None,
+        })
+        .expect("runCreate succeeds");
+
+    let proposal_events = runtime
+        .dispatch(KernelCommand::ProposalSubmit {
+            request_id: RequestId("req-proposal-contract-permission".to_string()),
+            run_id: RunId("run-1".to_string()),
+            session_id: Some(SessionId("session-contract-permission".to_string())),
+            proposal: ProposalEnvelope {
+                schema_version: "deepcode.agent.protocol.v3".to_string(),
+                proposal_id: "proposal-contract-permission".to_string(),
+                run_id: RunId("run-1".to_string()),
+                session_id: Some(SessionId("session-contract-permission".to_string())),
+                source: deepcode_kernel_abi::ProposalEnvelopeSource::Llm,
+                kind: ProposalEnvelopeKind::ActionBundle,
+                payload: serde_json::json!({
+                    "userPlanMarkdown": "# Plan\n\n## Summary\nWrite one generic contract file.",
+                    "codeBlocks": [
+                        {
+                            "id": "code-contract-permission",
+                            "targetPath": "contract-output.txt",
+                            "content": "contract output\n"
+                        }
+                    ],
+                    "actionBundle": {
+                        "id": "bundle-contract-permission",
+                        "goal": "Write one generic contract file.",
+                        "actions": [
+                            {
+                                "id": "write-contract-output",
+                                "title": "Write generic contract output",
+                                "kind": "write",
+                                "toolId": "fs.write",
+                                "targetPath": "contract-output.txt",
+                                "resourceScope": ["contract-output.txt"],
+                                "sourceBlockId": "code-contract-permission"
+                            }
+                        ],
+                        "validationExpectations": [
+                            { "id": "validation-generic", "description": "Kernel records file write facts." }
+                        ],
+                        "reviewExpectations": [
+                            { "id": "review-generic", "description": "User reviews the generated file." }
+                        ]
+                    }
+                }),
+                referenced_resource_packet_refs: vec![],
+                referenced_evidence_refs: vec![],
+                parser_diagnostics: None,
+            },
+        })
+        .expect("actionBundle proposal command succeeds");
+    let contract_id = proposal_events
+        .iter()
+        .find_map(|event| match event {
+            KernelEvent::ProposalReviewed { report, .. } => report
+                .get("executionContract")
+                .and_then(|contract| contract.get("id"))
+                .and_then(Value::as_str),
+            _ => None,
+        })
+        .expect("execution contract id");
+
+    let batch_events = runtime
+        .dispatch(KernelCommand::ActionBatchSubmit {
+            request_id: RequestId("req-action-batch-contract-permission".to_string()),
+            run_id: RunId("run-1".to_string()),
+            session_id: Some(SessionId("session-contract-permission".to_string())),
+            batch: serde_json::json!({
+                "planId": "bundle-contract-permission",
+                "contractId": contract_id,
+                "codeBlocks": [
+                    {
+                        "id": "code-contract-permission",
+                        "targetPath": "contract-output.txt",
+                        "content": "contract output\n"
+                    }
+                ],
+                "actionBundle": {
+                    "id": "bundle-contract-permission",
+                    "goal": "Write one generic contract file.",
+                    "actions": [
+                        {
+                            "id": "write-contract-output",
+                            "title": "Write generic contract output",
+                            "kind": "write",
+                            "toolId": "fs.write",
+                            "targetPath": "contract-output.txt",
+                            "resourceScope": ["contract-output.txt"],
+                            "sourceBlockId": "code-contract-permission"
+                        }
+                    ]
+                }
+            }),
+        })
+        .expect("contract batch requests permission");
+
+    let request = batch_events
+        .iter()
+        .find_map(|event| match event {
+            KernelEvent::PermissionRequested { request, .. } => Some(request),
+            _ => None,
+        })
+        .expect("permission requested");
+    assert_eq!(request.tool_id.as_deref(), Some("fs.write"));
+    assert_eq!(request.contract_id.as_deref(), Some(contract_id));
+    assert!(request.permission_bundle_id.as_deref().is_some_and(|id| {
+        id.contains("bundle-contract-permission") && id.contains("fs-write")
+    }));
+    assert_eq!(
+        request.affected_operation_ids,
+        vec!["write-contract-output"]
+    );
+    assert!(request
+        .work_unit_ids
+        .iter()
+        .any(|id| id.contains("write-contract-output")));
+}
+
+#[test]
+fn action_batch_groups_contract_permission_for_same_bundle() {
+    let (mut runtime, temp) = runtime_with_workspace();
+    fs::write(temp.join("stale-a.tmp"), "stale a\n").expect("write generic stale file");
+    fs::write(temp.join("stale-b.tmp"), "stale b\n").expect("write generic stale file");
+
+    runtime
+        .dispatch(KernelCommand::RunCreate {
+            request_id: RequestId("req-run-create-contract-delete-bundle".to_string()),
+            session_id: Some(SessionId("session-contract-delete-bundle".to_string())),
+            input: UserInput {
+                text: "Delete two generic files.".to_string(),
+                attachments: vec![],
+            },
+            workspace_binding: None,
+            profile_ref: None,
+            workflow_ref: None,
+            run_overrides: None,
+        })
+        .expect("runCreate succeeds");
+
+    let proposal_events = runtime
+        .dispatch(KernelCommand::ProposalSubmit {
+            request_id: RequestId("req-proposal-contract-delete-bundle".to_string()),
+            run_id: RunId("run-1".to_string()),
+            session_id: Some(SessionId("session-contract-delete-bundle".to_string())),
+            proposal: ProposalEnvelope {
+                schema_version: "deepcode.agent.protocol.v3".to_string(),
+                proposal_id: "proposal-contract-delete-bundle".to_string(),
+                run_id: RunId("run-1".to_string()),
+                session_id: Some(SessionId("session-contract-delete-bundle".to_string())),
+                source: deepcode_kernel_abi::ProposalEnvelopeSource::Llm,
+                kind: ProposalEnvelopeKind::ActionBundle,
+                payload: serde_json::json!({
+                    "userPlanMarkdown": "# Plan\n\n## Summary\nDelete two generic files.",
+                    "actionBundle": {
+                        "id": "bundle-contract-delete-bundle",
+                        "goal": "Delete two generic files.",
+                        "actions": [
+                            {
+                                "id": "delete-stale-a",
+                                "title": "Delete first generic stale file",
+                                "kind": "delete",
+                                "toolId": "fs.delete",
+                                "targetPath": "stale-a.tmp",
+                                "resourceScope": ["stale-a.tmp"]
+                            },
+                            {
+                                "id": "delete-stale-b",
+                                "title": "Delete second generic stale file",
+                                "kind": "delete",
+                                "toolId": "fs.delete",
+                                "targetPath": "stale-b.tmp",
+                                "resourceScope": ["stale-b.tmp"]
+                            }
+                        ],
+                        "validationExpectations": [
+                            { "id": "validation-generic-delete", "description": "Kernel records file delete facts." }
+                        ],
+                        "reviewExpectations": [
+                            { "id": "review-generic-delete", "description": "User reviews deleted file facts." }
+                        ]
+                    }
+                }),
+                referenced_resource_packet_refs: vec![],
+                referenced_evidence_refs: vec![],
+                parser_diagnostics: None,
+            },
+        })
+        .expect("actionBundle proposal command succeeds");
+    let contract_id = proposal_events
+        .iter()
+        .find_map(|event| match event {
+            KernelEvent::ProposalReviewed { report, .. } => report
+                .get("executionContract")
+                .and_then(|contract| contract.get("id"))
+                .and_then(Value::as_str),
+            _ => None,
+        })
+        .expect("execution contract id");
+
+    let batch_events = runtime
+        .dispatch(KernelCommand::ActionBatchSubmit {
+            request_id: RequestId("req-action-batch-contract-delete-bundle".to_string()),
+            run_id: RunId("run-1".to_string()),
+            session_id: Some(SessionId("session-contract-delete-bundle".to_string())),
+            batch: serde_json::json!({
+                "planId": "bundle-contract-delete-bundle",
+                "contractId": contract_id,
+                "actionBundle": {
+                    "id": "bundle-contract-delete-bundle",
+                    "goal": "Delete two generic files.",
+                    "actions": [
+                        {
+                            "id": "delete-stale-a",
+                            "title": "Delete first generic stale file",
+                            "kind": "delete",
+                            "toolId": "fs.delete",
+                            "targetPath": "stale-a.tmp",
+                            "resourceScope": ["stale-a.tmp"]
+                        },
+                        {
+                            "id": "delete-stale-b",
+                            "title": "Delete second generic stale file",
+                            "kind": "delete",
+                            "toolId": "fs.delete",
+                            "targetPath": "stale-b.tmp",
+                            "resourceScope": ["stale-b.tmp"]
+                        }
+                    ]
+                }
+            }),
+        })
+        .expect("contract delete batch requests permission");
+
+    let permission_requests = batch_events
+        .iter()
+        .filter_map(|event| match event {
+            KernelEvent::PermissionRequested { request, .. } => Some(request),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(permission_requests.len(), 1);
+    let request = permission_requests[0];
+    assert_eq!(request.tool_id.as_deref(), Some("fs.delete"));
+    assert_eq!(request.contract_id.as_deref(), Some(contract_id));
+    assert!(request
+        .permission_bundle_id
+        .as_deref()
+        .is_some_and(|id| id.contains("fs-delete")));
+    assert_eq!(
+        request.affected_operation_ids,
+        vec!["delete-stale-a", "delete-stale-b"]
+    );
+
+    let accepted = runtime
+        .dispatch(KernelCommand::PermissionResolve {
+            request_id: RequestId("req-permission-accept-delete-bundle".to_string()),
+            permission_id: request.id.clone(),
+            decision: deepcode_kernel_abi::PermissionDecisionKind::Accept,
+        })
+        .expect("permission accept succeeds");
+
+    let completed_deletes = accepted
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                KernelEvent::ToolCompleted {
+                    tool_name,
+                    ok: true,
+                    ..
+                } if tool_name == "fs.delete"
+            )
+        })
+        .count();
+    assert_eq!(completed_deletes, 2);
+    assert_eq!(
+        accepted
+            .iter()
+            .filter(|event| matches!(event, KernelEvent::WorkUnitCompleted { .. }))
+            .count(),
+        2
+    );
+    assert!(!temp.join("stale-a.tmp").exists());
+    assert!(!temp.join("stale-b.tmp").exists());
+    assert!(accepted.iter().any(|event| {
+        matches!(
+            event,
+            KernelEvent::StageChanged { phase, .. } if phase == "review"
+        )
+    }));
+}
+
+#[test]
 fn proposal_submit_plan_review_accepts_matching_action_id_alias() {
     let (mut runtime, _temp) = runtime_with_workspace();
     runtime
@@ -1272,6 +1580,8 @@ fn action_batch_submit_requests_permission_for_workspace_write_without_grant() {
             event,
             KernelEvent::PermissionRequested { request, .. }
                 if request.capability == "fs.write"
+                    && request.tool_id.as_deref() == Some("fs.write")
+                    && request.permission_bundle_id.is_none()
         )
     }));
     assert!(!events.iter().any(|event| {

@@ -63,6 +63,11 @@ is_registry_network_error() {
     "$output_file"
 }
 
+is_sccache_startup_error() {
+  local output_file="$1"
+  grep -Eiq 'sccache: error: Timed out waiting for server startup' "$output_file"
+}
+
 has_proxy_protocol_hint() {
   local output_file="$1"
   grep -Eiq 'packet length too long' "$output_file"
@@ -218,6 +223,19 @@ if run_with_capture "$output_file" run_with_primary_source "$@"; then
   exit 0
 else
   primary_status=$?
+fi
+
+if [ -n "${RUSTC_WRAPPER:-}" ] && is_sccache_startup_error "$output_file"; then
+  log "primary Cargo command failed because sccache did not start; retrying without RUSTC_WRAPPER"
+  if command -v sccache >/dev/null 2>&1; then
+    sccache --stop-server >/dev/null 2>&1 || true
+  fi
+  unset RUSTC_WRAPPER
+  if run_with_capture "$output_file" run_with_primary_source "$@"; then
+    exit 0
+  else
+    primary_status=$?
+  fi
 fi
 
 log "primary Cargo command failed in DEEPCODE_CARGO_SOURCE=auto; inspecting output for registry/network errors"

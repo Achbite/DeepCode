@@ -32,7 +32,6 @@ const CodeWorkspaceChoiceDialog: React.FC = () => {
   const fileName = target.path.split('/').pop() ?? target.path;
 
   const handleOpenAsWorkspace = async () => {
-    // 把相对路径解析为绝对路径再调 openWorkspace；后端可解析绝对的 .code-workspace 文件
     const folder = getActiveFolder();
     if (!folder) {
       hide();

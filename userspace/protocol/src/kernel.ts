@@ -301,6 +301,7 @@ export interface KernelFileTargetRef {
 export interface KernelRequiredFileOperation {
   operation: 'write' | 'create' | 'delete' | 'rename' | string;
   targetPath: string;
+  toolId?: string;
   capability: string;
   actionId?: string;
   targetRef?: KernelFileTargetRef;
@@ -310,6 +311,7 @@ export interface KernelRequiredFileOperation {
 
 export interface KernelPermissionBundle {
   id: string;
+  toolId?: string;
   capability: string;
   resourceKind: string;
   resourcePath?: string;
@@ -325,9 +327,11 @@ export interface KernelGateInterventionRequired {
   id: string;
   interventionKind: string;
   status: string;
+  toolId?: string;
   capability?: string;
   permissionBundleId?: string;
   summary: string;
+  affectedOperationIds?: string[];
   options?: string[];
 }
 
@@ -335,7 +339,9 @@ export interface KernelExecutionOperation {
   id: string;
   title: string;
   operation: string;
+  toolId?: string;
   capability: string;
+  argsTemplate?: unknown;
   targetPath: string;
   targetRef?: KernelFileTargetRef;
   targetKind: 'workspaceRelative' | 'rootRelative' | 'absolutePath' | string;

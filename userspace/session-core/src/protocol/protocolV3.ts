@@ -206,8 +206,6 @@ function normalizeActionBundle(value: Record<string, unknown>, proposalId: strin
   }
   return {
     ...value,
-    // S2：actionBundle.version 在 v3 协议中固定为 "1"，模型给出缺失/数字/其它值时强制归一，
-    // 避免下游 version 强校验因模型笔误整轮失败（仍保留对结构性错误的拒绝）。
     version: '1',
     id: optionalString(value, 'id') ?? `${proposalId}-action-bundle`,
     goal: deriveActionBundleGoal(value, proposalId, userPlan),
@@ -389,12 +387,7 @@ function normalizeExpectations(value: unknown, label: string): Array<Record<stri
   if (value === undefined || value === null) return [];
   if (typeof value === 'string') {
     const description = value.trim();
-    if (!description) {
-      throw new AgentPlanParseError(
-        'invalid_action_bundle_expectation',
-        `Agent Protocol v3.actionBundle.${label} string value must be non-empty; use [{ "id": "${label}-1", "description": "..." }].`
-      );
-    }
+    if (!description) return [];
     return [{ id: `${label}-1`, description }];
   }
   if (!Array.isArray(value)) {
@@ -403,30 +396,19 @@ function normalizeExpectations(value: unknown, label: string): Array<Record<stri
       `Agent Protocol v3.actionBundle.${label} must be an array of { id, description } objects; string and string[] are accepted only as compatibility input.`
     );
   }
-  return value.map((item, index) => {
+  return value.flatMap((item, index) => {
     if (typeof item === 'string') {
       const description = item.trim();
-      if (!description) {
-        throw new AgentPlanParseError(
-          'invalid_action_bundle_expectation',
-          `Agent Protocol v3.actionBundle.${label}[${index}] string value must be non-empty; use { "id": "${label}-${index + 1}", "description": "..." }.`
-        );
-      }
-      return { id: `${label}-${index + 1}`, description };
+      return description ? [{ id: `${label}-${index + 1}`, description }] : [];
     }
     const record = requireObject(item, `Agent Protocol v3.actionBundle.${label}[${index}]`);
     const description = optionalString(record, 'description');
-    if (!description) {
-      throw new AgentPlanParseError(
-        'invalid_action_bundle_expectation',
-        `Agent Protocol v3.actionBundle.${label}[${index}].description must be a non-empty string; minimal shape is { "id": "${label}-${index + 1}", "description": "..." }.`
-      );
-    }
-    return {
+    if (!description) return [];
+    return [{
       ...record,
       id: optionalString(record, 'id') ?? `${label}-${index + 1}`,
       description,
-    };
+    }];
   });
 }
 
@@ -540,6 +522,12 @@ function normalizeDecisionRequest(value: Record<string, unknown>): Record<string
         description: optionalString(record, 'description') ?? '',
         recommended: typeof record.recommended === 'boolean' ? record.recommended : index === 0,
       };
+      const labelKey = optionalString(record, 'labelKey');
+      if (labelKey) normalized.labelKey = labelKey;
+      const descriptionKey = optionalString(record, 'descriptionKey');
+      if (descriptionKey) normalized.descriptionKey = descriptionKey;
+      const messageArgs = optionalStringRecord(record.messageArgs);
+      if (messageArgs) normalized.messageArgs = messageArgs;
       const effect = normalizeOptionEffect(record.effect);
       if (effect) normalized.effect = effect;
       return normalized;
@@ -547,8 +535,15 @@ function normalizeDecisionRequest(value: Record<string, unknown>): Record<string
   };
 }
 
-// 归一化用户介入卡 option.effect：未声明或非法时返回 undefined（按 continueWithAction 处理）。
-// 不在此处把 undefined 写回字段，保持事件 payload 干净（无 effect 即向下兼容）。
+function optionalStringRecord(value: unknown): Record<string, string> | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const out: Record<string, string> = {};
+  for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof item === 'string') out[key] = item;
+  }
+  return Object.keys(out).length ? out : undefined;
+}
+
 function normalizeOptionEffect(value: unknown): Record<string, unknown> | undefined {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
   const record = value as Record<string, unknown>;
@@ -628,9 +623,6 @@ function parseJsonObject(raw: string, label: string): Record<string, unknown> {
   return requireObject(parsed, label);
 }
 
-// S1 宽松提取：模型常在合法 JSON 前后附带说明文字或 ```json 代码围栏，
-// 严格 JSON.parse 会因尾随内容整体失败。此处先去围栏，若仍不可解析则按平衡花括号
-// 截取首个完整的顶层 JSON 对象，丢弃其前后噪声。仅做"提取"，不改变 JSON 语义。
 function extractJsonCandidate(raw: string): string {
   let text = raw.trim();
   const fence = text.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
@@ -639,7 +631,6 @@ function extractJsonCandidate(raw: string): string {
     JSON.parse(text);
     return text;
   } catch {
-    // 继续尝试截取首个平衡对象
   }
   const start = text.indexOf('{');
   if (start < 0) return text;

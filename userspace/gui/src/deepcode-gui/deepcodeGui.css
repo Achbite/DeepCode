@@ -708,6 +708,46 @@ button {
   margin: 0;
 }
 
+.deepcode-gui-review-accepted {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  width: auto;
+  max-width: none;
+  margin: 0;
+  padding: 12px 13px;
+  border-radius: 8px;
+  font-size: 13px;
+  line-height: 1.65;
+}
+
+.deepcode-gui-review-accepted__status {
+  width: 8px;
+  height: 8px;
+  flex: none;
+  margin-top: 8px;
+  border-radius: 50%;
+  background: #24a148;
+}
+
+.deepcode-gui-review-accepted__content {
+  min-width: 0;
+}
+
+.deepcode-gui-review-accepted__content .markdown-content {
+  color: inherit;
+  font-size: inherit;
+  line-height: inherit;
+}
+
+.deepcode-gui-review-accepted__content .markdown-content p {
+  margin: 0 0 4px;
+}
+
+.deepcode-gui-review-accepted__content .markdown-content p:last-child {
+  margin-bottom: 0;
+}
+
 .deepcode-gui-reasoning-stream {
   display: grid;
   gap: 8px;
@@ -764,7 +804,7 @@ button {
   align-items: center;
   gap: 8px;
   border: 1px solid #ebe3d7;
-  border-radius: 9px;
+  border-radius: 8px;
   background: #fffdf9;
   padding: 7px 9px;
   color: #202124;
@@ -1085,7 +1125,7 @@ button {
 
 .agent-composer-decision {
   border: 1px solid var(--line);
-  border-radius: 18px;
+  border-radius: 8px;
   background: #ffffff;
   color: var(--text);
   padding: 16px;
@@ -1165,7 +1205,7 @@ button {
   align-items: center;
   gap: 12px;
   border: 1px solid transparent;
-  border-radius: 12px;
+  border-radius: 8px;
   background: transparent;
   color: var(--text);
   padding: 8px 12px;
@@ -1243,7 +1283,7 @@ button {
 .agent-composer-decision__resolving {
   margin-top: 12px;
   border: 1px solid var(--line);
-  border-radius: 10px;
+  border-radius: 8px;
   background: #f7f7f5;
   color: var(--text-muted);
   padding: 9px 10px;
@@ -1358,7 +1398,7 @@ button {
   display: block;
   box-sizing: border-box;
   border-color: transparent;
-  border-radius: 10px;
+  border-radius: 8px;
   background: transparent;
   color: var(--text);
   padding: 6px 0;
@@ -3142,7 +3182,7 @@ button {
 
 .deepcode-gui-block {
   border-color: #e4e1d8;
-  border-radius: 14px;
+  border-radius: 8px;
   background: #ffffff;
   box-shadow: none;
 }
@@ -3249,6 +3289,27 @@ button {
 
 .deepcode-gui-activity {
   gap: 9px;
+}
+
+.deepcode-gui-review-accepted {
+  width: auto;
+  max-width: none;
+  margin: 0;
+  padding: 12px 13px;
+  border-radius: 8px;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.deepcode-gui-review-accepted__status {
+  width: 7px;
+  height: 7px;
+  margin-top: 8px;
+  background: #217452;
+}
+
+.deepcode-gui-review-accepted__content {
+  min-width: 0;
 }
 
 .deepcode-gui-activity__head {
@@ -3409,7 +3470,7 @@ button {
   gap: 12px;
   padding: 16px;
   border: 1px solid #ece9e1;
-  border-radius: 14px;
+  border-radius: 8px;
   background: #ffffff;
   box-shadow: 0 8px 22px rgba(32, 33, 36, 0.08);
 }
@@ -3435,7 +3496,7 @@ button {
   display: grid;
   place-items: center;
   border: 1px dashed #e5e1d7;
-  border-radius: 12px;
+  border-radius: 8px;
   color: #9aa0a6;
   font-size: 12px;
 }
@@ -3447,7 +3508,7 @@ button {
   gap: 10px;
   padding: 10px;
   border: 1px solid #ebe7de;
-  border-radius: 12px;
+  border-radius: 8px;
   background: #fbfaf6;
 }
 
@@ -3524,7 +3585,7 @@ button {
   gap: 4px;
   padding: 6px 10px;
   border: 1px solid #dfdcd2;
-  border-radius: 14px;
+  border-radius: 8px;
   background: #ffffff;
   box-shadow: 0 10px 26px rgba(32, 33, 36, 0.1);
   transition: width 160ms ease, padding 160ms ease, box-shadow 160ms ease;
@@ -3580,7 +3641,7 @@ button {
 }
 
 .agent-composer--decision .agent-composer-decision {
-  border-radius: 16px;
+  border-radius: 8px;
   padding: 12px 14px;
   margin-bottom: 0;
 }
@@ -3603,7 +3664,7 @@ button {
 .agent-composer--decision .agent-composer-decision__option {
   min-height: 38px;
   gap: 10px;
-  border-radius: 10px;
+  border-radius: 8px;
   padding: 6px 10px;
 }
 

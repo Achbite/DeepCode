@@ -6,7 +6,10 @@ import { useWorkspaceStore } from '../../state/workspaceStore';
 import { t, type UiLanguage } from '../../i18n';
 import AgentComposer from '../../components/agent-panel/AgentComposer';
 import PermissionRequestBubble from '../../components/agent-panel/PermissionRequestBubble';
-import { findPendingComposerDecision } from '../../components/agent-panel/pendingDecision';
+import {
+  findPendingComposerDecisionFromProjection,
+  type AgentComposerPendingDecision,
+} from '../../components/agent-panel/pendingDecision';
 import { buildUiTimelineProjection } from '../../utils/uiTimelineProjection';
 import DeepCodeTimeline from './DeepCodeTimeline';
 
@@ -125,8 +128,8 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
   const hasTimelineTurns = uiTimelineProjection.turns.length > 0;
   const pendingDecision = suppressPendingDecision
     ? null
-    : findPendingComposerDecision({
-      events,
+    : findPendingComposerDecisionFromProjection({
+      timeline: uiTimelineProjection,
       pendingPermission: pendingPermission?.request ?? null,
       resolvingRequirement,
       resolvingPlan,
@@ -249,11 +252,9 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
       </header>
 
       <DeepCodeTimeline
-        timeline={timeline}
-        fallbackEvents={events}
+        timeline={uiTimelineProjection}
         loading={sessionRunning}
         language={language}
-        activeDeltas={activeDeltas}
         followLatestSignal={followLatestSignal}
         scrollWatchElement={bottomChromeElement}
         onTypewriterActiveChange={setTimelineTypewriterActive}
@@ -295,9 +296,7 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
   );
 };
 
-function pendingDecisionIdentity(
-  decision: ReturnType<typeof findPendingComposerDecision>
-): string | null {
+function pendingDecisionIdentity(decision: AgentComposerPendingDecision | null): string | null {
   if (!decision) return null;
   if (decision.kind === 'requirement') {
     return `${decision.kind}:${decision.runId}:${decision.requirementId}`;
