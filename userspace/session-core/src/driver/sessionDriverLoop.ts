@@ -165,6 +165,7 @@ import {
   type SessionRunStateStatus,
 } from './projection/index.js';
 import type { DriverProviderTurnFrame, LlmTurnResult, SessionDriverLoopRunState } from './runFrame.js';
+import { clip, diag, objectRecord, stringValue, visibleLanguageForRequest } from './runtimeSupport.js';
 import { AgentRunReactor } from './agentRunReactor.js';
 
 export interface SessionDriverLoopPorts {
@@ -1738,16 +1739,6 @@ function reviewDecisionProjection(): ReviewDecisionProjectionBuilder {
   return new ReviewDecisionProjectionBuilder();
 }
 
-interface DiagnosticInfo {
-  code: string;
-  fallback: string;
-  params?: Record<string, string | number>;
-}
-
-function diag(code: string, fallback: string, params?: Record<string, string | number>): DiagnosticInfo {
-  return { code, fallback, params };
-}
-
 function protocolGate(): ProtocolGate {
   const validator = proposalSemanticValidator();
   return new ProtocolGate({
@@ -1784,32 +1775,4 @@ function executionPromptCoordinator(): ExecutionPromptCoordinator<SessionPlanCon
     defaultValidationExpectation: (actions) => validator.defaultValidationExpectation(actions),
     defaultReviewExpectation: (actions) => validator.defaultReviewExpectation(actions),
   });
-}
-
-function stringValue(value: unknown): string | undefined {
-  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
-}
-
-function stringArrayValue(value: unknown): string[] {
-  if (!Array.isArray(value)) {
-    const single = stringValue(value);
-    return single ? [single] : [];
-  }
-  return value
-    .map((item) => stringValue(item))
-    .filter((item): item is string => Boolean(item));
-}
-
-type VisibleLanguage = 'zh-CN' | 'en-US';
-
-function visibleLanguageForRequest(userRequest: string): VisibleLanguage {
-  return /[\u3400-\u9fff]/.test(userRequest) ? 'zh-CN' : 'en-US';
-}
-
-function objectRecord(value: unknown): Record<string, unknown> | undefined {
-  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
-}
-
-function clip(value: string, max: number): string {
-  return value.length <= max ? value : `${value.slice(0, max - 20)}... [truncated]`;
 }

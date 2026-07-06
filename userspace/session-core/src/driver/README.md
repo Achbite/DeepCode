@@ -9,6 +9,14 @@ semantics, tool execution, Kernel facts, or UI rendering.
 extraction should happen only when it creates a stable class or factory
 boundary. Do not split code only to reduce line count.
 
+Top-level support files:
+
+- `runFrame.ts`: driver run-frame, provider-turn frame, and loop runtime state
+  types.
+- `runtimeSupport.ts`: shared driver support helpers used by wiring and
+  projection builders. Keep generic parsing, clipping, language, and diagnostic
+  helpers here instead of growing the loop.
+
 ## Directories
 
 - `context/`: context frames, resource requests, resource evidence, and
