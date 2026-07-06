@@ -17,9 +17,12 @@ Top-level support files:
   state transitions or proposal behavior into this file.
 - `runFrame.ts`: driver run-frame, provider-turn frame, and loop runtime state
   types.
+- `types.ts`: public driver request, loop port, user-turn, and decision input
+  types shared by host bridge and driver facade.
 - `runtimeSupport.ts`: shared driver support helpers used by wiring and
   projection builders. Keep generic parsing, clipping, language, and diagnostic
-  helpers here instead of growing the loop.
+  helpers here instead of growing the loop. Driver-local error support also
+  lives here.
 
 ## Directories
 

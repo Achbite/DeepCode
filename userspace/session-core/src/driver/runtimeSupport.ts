@@ -25,3 +25,17 @@ export function objectRecord(value: unknown): Record<string, unknown> | undefine
 export function clip(value: string, max: number): string {
   return value.length <= max ? value : `${value.slice(0, max - 20)}... [truncated]`;
 }
+
+export class SessionDriverLoopError extends Error {
+  constructor(
+    public readonly code: string,
+    message: string
+  ) {
+    super(message);
+    this.name = 'SessionDriverLoopError';
+  }
+}
+
+export function isEmptyResponseError(error: unknown): boolean {
+  return error instanceof SessionDriverLoopError && error.code === 'llm_empty_response';
+}
