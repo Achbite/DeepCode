@@ -1,7 +1,8 @@
 import type { AgentContextAttachment } from '@deepcode/protocol';
+import type { InterventionLevel } from '../sessionModes.js';
 
 export type ExecutionSliceRole = 'sourceCode' | 'infra' | 'script' | 'test' | 'docs' | 'config' | 'review';
-export type AcceptedPlanInterventionLevel = 'low' | 'medium' | 'high';
+export type AcceptedPlanInterventionLevel = InterventionLevel;
 
 export interface TaskExecutionCursor {
   cursorId: string;

@@ -19,7 +19,18 @@ import type { ProposalEnvelope } from '../protocol/types.js';
 import type { PromptEnvelope } from '../prompt/types.js';
 import type { ProjectMemoryMode } from '../context/index.js';
 import type { RequirementRecord } from '../requirement/types.js';
+import type {
+  InterventionLevel,
+  RequirementConfirmationMode,
+  ReviewContinuationMode,
+} from '../sessionModes.js';
 import type { TranscriptEntry } from '../transcript.js';
+
+export type {
+  InterventionLevel,
+  RequirementConfirmationMode,
+  ReviewContinuationMode,
+} from '../sessionModes.js';
 
 export type EntryIntent = 'readOnlyAnswer' | 'resourceDiscovery' | 'developmentTask' | 'repairLoop';
 
@@ -105,10 +116,6 @@ export interface SessionDriverLoopInput {
   acceptedImplementationPlan?: AcceptedImplementationPlanContext;
   interactionOverlay?: InteractionOverlayContext;
 }
-
-export type RequirementConfirmationMode = 'auto' | 'always' | 'off';
-export type ReviewContinuationMode = 'auto' | 'ask' | 'off';
-export type InterventionLevel = 'low' | 'medium' | 'high';
 
 export interface SessionDecisionResolverInput {
   sessionId: string;
