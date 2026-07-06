@@ -7851,6 +7851,10 @@ function assertRequirementProjectionBuilderCreatesDecisionEvents(): void {
   const selectedOption = payload.selectedOption as Record<string, unknown>;
   assertEqual(decision.kind, 'requirement_decision', 'requirement projection creates requirement decision events');
   assertEqual(payload.status, 'accepted', 'requirement projection maps accepted decisions to accepted status');
+  assertEqual(payload.titleKey, 'session.driver.requirementDecision.title', 'requirement decision event exposes title i18n key');
+  assertEqual(payload.summaryKey, 'session.driver.requirementDecision.selectedOption', 'requirement decision event exposes selected-option summary key');
+  assertEqual(payload.messageKey, 'session.driver.requirementDecision.selectedOption', 'requirement decision event exposes message key');
+  assertEqual((payload.messageArgs as Record<string, unknown>).label, `Selected ${suffix}`, 'requirement decision event exposes selected option as i18n arg');
   assertEqual(selectedOption.id, selectedOptionId, 'requirement projection selects the guided option');
   assertEqual(payload.overlayRunId, runId, 'requirement projection preserves overlay payload from ports');
   const confirmation = builder.confirmationEvent({
@@ -7894,6 +7898,7 @@ function assertRequirementProjectionBuilderCreatesDecisionEvents(): void {
   const confirmationPayload = confirmation.payload as Record<string, any>;
   assertEqual(confirmation.kind, 'requirement_confirmation', 'requirement projection creates confirmation events');
   assertEqual(confirmationPayload.status, 'waitingUserConfirmation', 'requirement projection marks confirmations as waiting');
+  assertEqual(confirmationPayload.titleKey, 'session.driver.requirementConfirmation.title', 'requirement confirmation event exposes title i18n key');
   assertEqual(confirmationPayload.decisionRequest, decisionRequest, 'requirement projection preserves decision request payload');
   assertEqual(confirmationPayload.executionRoot.ref, `root-${suffix}`, 'requirement projection preserves execution root payload');
   assertEqual(confirmationPayload.overlayRunId, runId, 'requirement projection preserves confirmation overlay payload');

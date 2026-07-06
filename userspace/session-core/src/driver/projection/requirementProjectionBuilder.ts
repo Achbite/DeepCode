@@ -30,6 +30,12 @@ export interface RequirementDecisionEventInput {
   id: string;
 }
 
+interface RequirementLocalizedSummary {
+  text: string;
+  key: string;
+  args: Record<string, string>;
+}
+
 export interface RequirementConfirmationEventInput {
   sessionId: string;
   runId: string;
@@ -60,6 +66,7 @@ export class RequirementProjectionBuilder {
       kind: 'requirement_confirmation',
       payload: {
         title: '用户介入请求',
+        titleKey: 'session.driver.requirementConfirmation.title',
         summary,
         content,
         status: 'waitingUserConfirmation',
@@ -96,7 +103,11 @@ export class RequirementProjectionBuilder {
       kind: 'requirement_decision',
       payload: {
         title: 'Requirement decision',
-        summary,
+        titleKey: 'session.driver.requirementDecision.title',
+        summary: summary.text,
+        summaryKey: summary.key,
+        messageKey: summary.key,
+        messageArgs: summary.args,
         status: input.decision === 'accept' ? 'accepted' : input.decision === 'revise' ? 'needsRevision' : 'rejected',
         runId: stringValue(payload.runId),
         requirementId: stringValue(payload.requirementId),
@@ -165,17 +176,61 @@ export class RequirementProjectionBuilder {
     decision: RequirementDecisionKind,
     selectedOption: RequirementDecisionOption | undefined,
     language: RequirementDecisionLanguage
-  ): string {
+  ): RequirementLocalizedSummary {
     if (language === 'en-US') {
-      if (decision === 'accept' && selectedOption?.label) return `Selected option: ${selectedOption.label}`;
-      if (decision === 'accept') return 'The user confirmed the requirement understanding.';
-      if (decision === 'revise') return 'The user requested requirement revisions.';
-      return 'The user rejected the current requirement understanding.';
+      if (decision === 'accept' && selectedOption?.label) {
+        return {
+          text: `Selected option: ${selectedOption.label}`,
+          key: 'session.driver.requirementDecision.selectedOption',
+          args: { label: selectedOption.label },
+        };
+      }
+      if (decision === 'accept') {
+        return {
+          text: 'The user confirmed the requirement understanding.',
+          key: 'session.driver.requirementDecision.accepted',
+          args: {},
+        };
+      }
+      if (decision === 'revise') {
+        return {
+          text: 'The user requested requirement revisions.',
+          key: 'session.driver.requirementDecision.needsRevision',
+          args: {},
+        };
+      }
+      return {
+        text: 'The user rejected the current requirement understanding.',
+        key: 'session.driver.requirementDecision.rejected',
+        args: {},
+      };
     }
-    if (decision === 'accept' && selectedOption?.label) return `已选择方案：${selectedOption.label}`;
-    if (decision === 'accept') return '用户已确认需求理解。';
-    if (decision === 'revise') return '用户要求修订需求理解。';
-    return '用户拒绝当前需求理解。';
+    if (decision === 'accept' && selectedOption?.label) {
+      return {
+        text: `已选择方案：${selectedOption.label}`,
+        key: 'session.driver.requirementDecision.selectedOption',
+        args: { label: selectedOption.label },
+      };
+    }
+    if (decision === 'accept') {
+      return {
+        text: '用户已确认需求理解。',
+        key: 'session.driver.requirementDecision.accepted',
+        args: {},
+      };
+    }
+    if (decision === 'revise') {
+      return {
+        text: '用户要求修订需求理解。',
+        key: 'session.driver.requirementDecision.needsRevision',
+        args: {},
+      };
+    }
+    return {
+      text: '用户拒绝当前需求理解。',
+      key: 'session.driver.requirementDecision.rejected',
+      args: {},
+    };
   }
 
   private renderRequirementConfirmationMarkdown(requirement: RequirementRecord): string {
