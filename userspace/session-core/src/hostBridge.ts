@@ -14,7 +14,8 @@ import type {
   ToolCall,
 } from '@deepcode/protocol';
 import { buildSessionMemorySnapshot } from './context/memory.js';
-import { SessionDriverLoop, type SessionDecisionResolverInput } from './driver/sessionDriverLoop.js';
+import { SessionDriverLoop } from './driver/sessionDriverLoop.js';
+import type { SessionDecisionResolverInput } from './driver/types.js';
 import { SessionStorageClient } from './storageClient.js';
 import type { ProjectWorkingDirectory } from './context/types.js';
 
