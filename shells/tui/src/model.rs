@@ -85,7 +85,9 @@ impl CardModel {
         let body = block
             .get_str("bodyMarkdown")
             .filter(|value| !value.trim().is_empty())
-            .unwrap_or(summary);
+            .map(str::to_string)
+            .or_else(|| structured_projection_text(block))
+            .unwrap_or_else(|| summary.to_string());
         let card_kind = match narrative_kind {
             "user" => CardKind::User,
             "assistant" | "assistantText" => CardKind::Final,
@@ -123,6 +125,70 @@ impl CardModel {
             body: body.into(),
         }
     }
+}
+
+fn structured_projection_text(block: &Value) -> Option<String> {
+    let events = block.get("events").and_then(Value::as_array)?;
+    for event in events {
+        let kind = event
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let payload = event.get("payload")?;
+        let readable = match kind {
+            "plan_card" => payload.get("readablePlan"),
+            "review_summary" => payload.get("readableReview"),
+            _ => None,
+        };
+        if let Some(readable) = readable {
+            let rendered = render_readable_projection(readable);
+            if !rendered.trim().is_empty() {
+                return Some(rendered);
+            }
+        }
+    }
+    None
+}
+
+fn render_readable_projection(readable: &Value) -> String {
+    let mut lines = Vec::new();
+    if let Some(summary) = readable.get("summary").and_then(Value::as_str) {
+        lines.push(summary.to_string());
+    } else if let Some(summary_key) = readable.get("summaryKey").and_then(Value::as_str) {
+        lines.push(summary_key.to_string());
+    }
+    if let Some(sections) = readable.get("sections").and_then(Value::as_array) {
+        for section in sections {
+            if let Some(title) = section
+                .get("titleKey")
+                .or_else(|| section.get("title"))
+                .and_then(Value::as_str)
+            {
+                lines.push(format!("## {title}"));
+            }
+            let items = section
+                .get("items")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if items.is_empty() {
+                if let Some(empty) = section.get("emptyMessageKey").and_then(Value::as_str) {
+                    lines.push(format!("- {empty}"));
+                }
+            }
+            for item in items {
+                let text = item
+                    .get("text")
+                    .or_else(|| item.get("messageKey"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if !text.is_empty() {
+                    lines.push(format!("- {text}"));
+                }
+            }
+        }
+    }
+    lines.join("\n")
 }
 
 pub fn command_help() -> &'static str {

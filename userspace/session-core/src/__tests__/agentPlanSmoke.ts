@@ -5245,7 +5245,9 @@ async function assertPlanDecisionHandlerRejectsActivePlan(): Promise<void> {
 
   assertEqual(resumed, 0, 'plan reject does not resume provider loop');
   assertEqual(executed, 0, 'plan reject does not execute accepted action bundle');
-  assertEqual(result.events.some((event) => event.kind === 'plan_review' && (event.payload as any)?.status === 'rejected'), true, 'plan handler records rejected plan review');
+  const rejectedReview = result.events.find((event) => event.kind === 'plan_review' && (event.payload as any)?.status === 'rejected');
+  assert(Boolean(rejectedReview), 'plan handler records rejected plan review');
+  assertEqual((rejectedReview?.payload as any)?.messageKey, 'session.driver.planReviewRejected', 'plan reject uses rejected i18n key');
   const cancelled = result.events.find((event) => event.kind === 'session_run_state' && (event.payload as any)?.status === 'cancelled');
   assert(Boolean(cancelled), 'plan handler appends cancelled run state');
   const cancelledPayload = cancelled?.payload as Record<string, unknown> | undefined;
@@ -5311,23 +5313,19 @@ function assertProjectionBuildersKeepKernelAndReviewReadModels(): void {
   }]);
   assertEqual(readableReview.changedFiles[0]?.path, targetPath, 'review projection keeps changed file target');
   assertEqual(readableReview.changedFiles[0]?.operation, 'write', 'review projection keeps changed file operation');
-  const reviewContent = reviewProjection.waitingContent({
+  const reviewSections = reviewProjection.reviewSections({
     plan: {
       userPlan: `plan-${token}`,
-      expectedValidation: '',
-      reviewGuide: '',
       actionBundle: { reviewExpectations: [] },
     },
     readableReview,
-    summary: reviewProjection.waitingSummary(0, 0, 'en-US'),
     completed: 1,
     failed: 0,
     blocked: 0,
     toolResults: 0,
     continuations: [],
-    language: 'en-US',
   });
-  assert(reviewContent.includes(targetPath), 'review projection renders changed file path in review content');
+  assert(JSON.stringify(reviewSections).includes(targetPath), 'review projection renders changed file path in structured review sections');
 
   const reviewSummaryProjection = new ReviewProjectionBuilder<any, { id: string }, { completedTaskIds: string[] }>({
     reviewFactLines: () => [`fact-${token}`],
@@ -5346,7 +5344,6 @@ function assertProjectionBuildersKeepKernelAndReviewReadModels(): void {
       toolResults: [],
     }),
     concreteContinuationExpectations: (value) => Array.isArray(value) ? value : [],
-    languageForRequest: () => 'en-US',
     acceptedPlanContext: () => ({ id: `accepted-${token}` }),
     acceptedPlanBatchCompletedTaskIds: () => [`task-${token}`],
     acceptedPlanAfterBatch: (acceptedPlan) => acceptedPlan,
@@ -5360,8 +5357,6 @@ function assertProjectionBuildersKeepKernelAndReviewReadModels(): void {
       runId,
       planId: `plan-${token}`,
       userPlan: `plan-${token}`,
-      expectedValidation: '',
-      reviewGuide: '',
       implementationPlan: { id: `implementation-${token}` },
       actionBundle: {
         reviewExpectations: [],
@@ -5385,6 +5380,12 @@ function assertProjectionBuildersKeepKernelAndReviewReadModels(): void {
   const reviewPayload = reviewEvent.payload as any;
   assertEqual(reviewPayload.factCounts.workUnitsCompleted, 1, 'review summary event counts completed work units');
   assertEqual(reviewPayload.changedFiles[0]?.path, targetPath, 'review summary event carries changed files');
+  assertEqual(reviewPayload.content, undefined, 'review summary event does not emit markdown fallback content');
+  assertEqual(reviewPayload.readableReview.schemaVersion, 'deepcode.session.readable-review.v1', 'review summary event carries structured readable review');
+  assert(
+    JSON.stringify(reviewPayload.readableReview.sections).includes(targetPath),
+    'review summary event renders changed file target in structured sections'
+  );
   assertEqual(reviewPayload.reviewFactsContext.changedFileCount, 1, 'review summary event carries review facts context');
   assert(reviewPayload.developerDetails.facts.includes(`fact-${token}`), 'review summary event carries review facts details');
 
@@ -5451,7 +5452,9 @@ function assertProjectionBuildersKeepKernelAndReviewReadModels(): void {
   const actionPayload = actionBundlePlan.payload as any;
   assertEqual(actionBundlePlan.kind, 'plan_card', 'plan projection builds actionBundle plan card event');
   assertEqual(actionPayload.requiredFileOperations[0]?.targetPath, targetPath, 'plan projection preserves file operation target');
-  assert(String(actionPayload.content).includes(targetPath), 'plan projection renders operation target in plan content');
+  assertEqual(actionPayload.content, undefined, 'plan projection does not emit markdown fallback content');
+  assertEqual(actionPayload.readablePlan.schemaVersion, 'deepcode.session.readable-plan.v1', 'plan projection carries structured readable plan');
+  assert(JSON.stringify(actionPayload.readablePlan.sections).includes(targetPath), 'plan projection renders operation target in structured plan sections');
 
   const implementationPlan = planProjection.implementationPlanCardEvent({
     state: planState,
@@ -5484,7 +5487,8 @@ function assertProjectionBuildersKeepKernelAndReviewReadModels(): void {
   });
   const implementationPayload = implementationPlan.payload as any;
   assertEqual(implementationPayload.confirmable, true, 'plan projection keeps implementation plan confirmable');
-  assert(String(implementationPayload.content).includes(targetPath), 'plan projection renders implementation plan target');
+  assertEqual(implementationPayload.content, undefined, 'implementation plan projection does not emit markdown fallback content');
+  assert(JSON.stringify(implementationPayload.readablePlan.sections).includes(targetPath), 'plan projection renders implementation plan target in structured sections');
 
   const decisionEvent = planProjection.planReviewDecisionEvent({
     sessionId: `session-${token}`,
@@ -5503,6 +5507,19 @@ function assertProjectionBuildersKeepKernelAndReviewReadModels(): void {
   assertEqual(decisionPayload.messageKey, 'session.driver.planReviewAccepted', 'plan projection marks accepted plan review with i18n key');
   assertEqual(decisionPayload.facts[0], `fact-${token}`, 'plan projection preserves plan review facts');
   assertEqual(decisionPayload.overlayId, `overlay-${token}`, 'plan projection preserves interaction overlay payload');
+
+  const rejectedDecisionEvent = planProjection.planReviewDecisionEvent({
+    sessionId: `session-${token}`,
+    plan: {
+      runId,
+      planId: `plan-${token}`,
+      planReviewReport: { executionContract: { id: `contract-${token}` } },
+    },
+    status: 'rejected',
+    ts: new Date(0).toISOString(),
+    id: `plan-rejected-${token}`,
+  });
+  assertEqual((rejectedDecisionEvent.payload as any).messageKey, 'session.driver.planReviewRejected', 'plan projection marks rejected plan review with i18n key');
 }
 
 async function assertAgentRunReactorCoordinatesPorts(): Promise<void> {
@@ -14507,9 +14524,13 @@ async function assertSessionDriverLoopAcceptedImplementationPlanContinuesUntilTa
   assertEqual(actionBatchSubmits, 2, 'accepted implementationPlan executes both in-scope batches');
   assertEqual(result.events.filter((event) => event.kind === 'review_summary' && (event.payload as any)?.status === 'waitingUserReview').length, 1, 'accepted implementationPlan produces only one terminal review');
   const terminalReview = result.events.find((event) => event.kind === 'review_summary' && (event.payload as any)?.status === 'waitingUserReview');
-  const terminalReviewContent = String((terminalReview?.payload as any)?.content ?? '');
+  const terminalReviewPayload = terminalReview?.payload as any;
+  const terminalChangedFiles = Array.isArray(terminalReviewPayload?.readableReview?.changedFiles)
+    ? terminalReviewPayload.readableReview.changedFiles.map((item: any) => String(item?.path ?? ''))
+    : [];
+  assertEqual(terminalReviewPayload?.content, undefined, 'terminal accepted-plan review does not emit markdown fallback content');
   assert(
-    terminalReviewContent.includes('generic-one.txt') && terminalReviewContent.includes('generic-two.txt'),
+    terminalChangedFiles.includes('generic-one.txt') && terminalChangedFiles.includes('generic-two.txt'),
     'terminal accepted-plan review aggregates changed files from every executed task batch'
   );
   assertEqual(

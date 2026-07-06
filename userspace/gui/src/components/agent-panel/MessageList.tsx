@@ -9,6 +9,10 @@ import type {
 } from '@deepcode/protocol';
 import { t, resolveDiagnosticText, type UiLanguage } from '../../i18n';
 import MarkdownContent from './LazyMarkdownContent';
+import {
+  hasStructuredProjection,
+  StructuredProjectionContent,
+} from './StructuredProjectionContent';
 import ToolCallBubble from './ToolCallBubble';
 import ToolEvidenceDetails from './ToolEvidenceDetails';
 import DiffCard from './DiffCard';
@@ -1070,10 +1074,8 @@ function PlanCard({
   const [expanded, setExpanded] = React.useState(false);
   const title = stringField(event.payload, 'title') ?? t(language, 'deepcodeGui.tasks.plan');
   const summary = stringField(event.payload, 'summary') ?? payloadText(event.payload);
-  const content = stringField(event.payload, 'content');
-  const expectedValidation = stringField(event.payload, 'expectedValidation');
-  const reviewGuide = stringField(event.payload, 'reviewGuide');
   const facts = payloadArray(event.payload, 'facts');
+  const structuredPlan = hasStructuredProjection(event.payload, 'plan');
 
   if (confirmed) {
     return (
@@ -1095,22 +1097,11 @@ function PlanCard({
         </button>
         {expanded && (
           <div className="agent-thinking-trace__body agent-plan-confirmed__body">
-            <div className="agent-flow-card__summary">{summary}</div>
-            {content && content !== summary && <MarkdownContent content={content} />}
-            {expectedValidation && (
-              <div className="agent-flow-card__section">
-                <div className="agent-flow-card__section-title">
-                  {t(language, 'agent.plan.expectedValidation')}
-                </div>
-                <MarkdownContent content={expectedValidation} />
-              </div>
-            )}
-            {reviewGuide && (
-              <div className="agent-flow-card__section">
-                <div className="agent-flow-card__section-title">
-                  {t(language, 'agent.plan.reviewGuide')}
-                </div>
-                <MarkdownContent content={reviewGuide} />
+            {structuredPlan ? (
+              <StructuredProjectionContent payload={event.payload} language={language} kind="plan" />
+            ) : (
+              <div className="agent-flow-card__summary">
+                {t(language, 'session.projection.unsupportedLegacy')}
               </div>
             )}
             {facts.length > 0 && (
@@ -1127,22 +1118,11 @@ function PlanCard({
   return (
     <section key={event.id} className="agent-flow-card agent-flow-card--plan">
       <div className="agent-flow-card__title">{title}</div>
-      <div className="agent-flow-card__summary">{summary}</div>
-      {content && content !== summary && <MarkdownContent content={content} />}
-      {expectedValidation && (
-        <div className="agent-flow-card__section">
-          <div className="agent-flow-card__section-title">
-            {t(language, 'agent.plan.expectedValidation')}
-          </div>
-          <MarkdownContent content={expectedValidation} />
-        </div>
-      )}
-      {reviewGuide && (
-        <div className="agent-flow-card__section">
-          <div className="agent-flow-card__section-title">
-            {t(language, 'agent.plan.reviewGuide')}
-          </div>
-          <MarkdownContent content={reviewGuide} />
+      {structuredPlan ? (
+        <StructuredProjectionContent payload={event.payload} language={language} kind="plan" />
+      ) : (
+        <div className="agent-flow-card__summary">
+          {t(language, 'session.projection.unsupportedLegacy')}
         </div>
       )}
       {facts.length > 0 && <ul className="agent-flow-card__facts">{facts.map((fact) => <li key={fact}>{fact}</li>)}</ul>}
@@ -1331,17 +1311,10 @@ function ReviewSummaryCard({
     t(language, 'agent.review.title');
   const summary = localizedPayloadField(event.payload, language, 'summary', 'summaryKey') ??
     localizedPayloadText(event.payload, language);
-  const content = translatePayloadKey(event.payload, language, 'contentKey', stringField(event.payload, 'content'));
   const llmGuidance = stringField(event.payload, 'llmGuidance');
   const status = stringField(event.payload, 'status') ?? 'waitingUserReview';
   const facts = payloadArray(event.payload, 'facts');
   const gitReview = isRecord(event.payload) ? event.payload.gitReview : undefined;
-  const readableReview = isRecord(event.payload) && isRecord(event.payload.readableReview)
-    ? event.payload.readableReview
-    : undefined;
-  const readableChangedFiles = Array.isArray(readableReview?.changedFiles)
-    ? readableReview.changedFiles.filter(isRecord)
-    : [];
   const continuationCount =
     isRecord(event.payload) && typeof event.payload.continuationCount === 'number'
       ? event.payload.continuationCount
@@ -1350,38 +1323,12 @@ function ReviewSummaryCard({
     <section key={event.id} className={`agent-flow-card agent-flow-card--review agent-flow-card--${status}`}>
       <div className="agent-flow-card__title">{title}</div>
       <div className="agent-flow-card__summary">{summary}</div>
-      {readableChangedFiles.length > 0 && (
-        <div className="agent-flow-card__section">
-          <div className="agent-flow-card__section-title">
-            {t(language, 'agent.review.changedFiles')}
-          </div>
-          <ul className="agent-flow-card__facts">
-            {readableChangedFiles.slice(0, 64).map((file, index) => {
-              const path = stringField(file, 'path') ?? `file-${index + 1}`;
-              const operation = stringField(file, 'operation') ?? 'modify';
-              const statusText = stringField(file, 'status') ?? 'unknown';
-              const reason = stringField(file, 'failureReason') || stringField(file, 'failureClassification');
-              return (
-                <li key={`${path}-${operation}-${index}`}>
-                  {t(language, 'review.changedFile', { path, operation, status: statusText })}
-                  {reason && (
-                    <span className="agent-flow-card__fact-detail">
-                      {' '}
-                      {t(language, 'review.changedFile.reason', { reason })}
-                    </span>
-                  )}
-                </li>
-              );
-            })}
-          </ul>
+      {hasStructuredProjection(event.payload, 'review') ? (
+        <StructuredProjectionContent payload={event.payload} language={language} kind="review" />
+      ) : (
+        <div className="agent-flow-card__summary">
+          {t(language, 'session.projection.unsupportedLegacy')}
         </div>
-      )}
-      {content && content !== summary && readableChangedFiles.length === 0 && <MarkdownContent content={content} />}
-      {content && content !== summary && readableChangedFiles.length > 0 && (
-        <details className="agent-flow-card__details">
-          <summary>{t(language, 'agent.review.markdownFallback')}</summary>
-          <MarkdownContent content={content} />
-        </details>
       )}
       {continuationCount > 0 && (
         <div className="agent-flow-card__section">

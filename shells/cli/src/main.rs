@@ -1054,13 +1054,89 @@ fn render_timeline(timeline: &Value) {
                 .get("bodyMarkdown")
                 .or_else(|| block.get("summary"))
                 .and_then(Value::as_str)
-                .unwrap_or("");
+                .map(str::to_string)
+                .or_else(|| structured_projection_text(block))
+                .unwrap_or_default();
             println!("  {kind}: {title}");
             for line in body.lines().take(12) {
                 println!("    {line}");
             }
         }
     }
+}
+
+fn structured_projection_text(block: &Value) -> Option<String> {
+    let events = block.get("events").and_then(Value::as_array)?;
+    for event in events {
+        let kind = event
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let payload = event.get("payload")?;
+        let readable = match kind {
+            "plan_card" => payload.get("readablePlan"),
+            "review_summary" => payload.get("readableReview"),
+            _ => None,
+        };
+        if let Some(readable) = readable {
+            let rendered = render_readable_projection(readable);
+            if !rendered.trim().is_empty() {
+                return Some(rendered);
+            }
+        }
+    }
+    None
+}
+
+fn render_readable_projection(readable: &Value) -> String {
+    let mut lines = Vec::new();
+    if let Some(summary) = readable.get("summary").and_then(Value::as_str) {
+        lines.push(summary.to_string());
+    } else if let Some(summary_key) = readable.get("summaryKey").and_then(Value::as_str) {
+        lines.push(summary_key.to_string());
+    }
+    if let Some(sections) = readable.get("sections").and_then(Value::as_array) {
+        for section in sections {
+            if let Some(title) = section
+                .get("titleKey")
+                .or_else(|| section.get("title"))
+                .and_then(Value::as_str)
+            {
+                lines.push(format!("## {title}"));
+            }
+            let items = section
+                .get("items")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if items.is_empty() {
+                if let Some(empty) = section.get("emptyMessageKey").and_then(Value::as_str) {
+                    lines.push(format!("- {empty}"));
+                }
+            }
+            for item in items {
+                let text = item
+                    .get("text")
+                    .or_else(|| item.get("messageKey"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if !text.is_empty() {
+                    lines.push(format!("- {text}"));
+                }
+                if let Some(targets) = item.get("targetRefs").and_then(Value::as_array) {
+                    let target_text = targets
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    if !target_text.is_empty() {
+                        lines.push(format!("  - targets: {target_text}"));
+                    }
+                }
+            }
+        }
+    }
+    lines.join("\n")
 }
 
 fn find_pending_session_decision(

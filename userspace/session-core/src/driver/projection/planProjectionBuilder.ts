@@ -5,6 +5,12 @@ import {
   AcceptedPlanExecutionRootResolver,
   type ImplementationBatchContext,
 } from '../execution/index.js';
+import type {
+  ReadablePlanProjection,
+  ReadablePlanTask,
+  ReadableProjectionItem,
+  ReadableProjectionSection,
+} from './structuredProjectionReadModels.js';
 
 export type PlanProjectionLanguage = 'zh-CN' | 'en-US';
 
@@ -63,6 +69,7 @@ export class PlanProjectionBuilder {
     plan: {
       runId: string;
       planId: string;
+      userPlan?: string;
       planReviewReport?: Record<string, unknown>;
       interactionOverlay?: unknown;
     };
@@ -74,8 +81,11 @@ export class PlanProjectionBuilder {
     const overlayPayload = this.ports.interactionOverlayProjection(input.plan.interactionOverlay);
     const messageKey = input.status === 'accepted'
       ? 'session.driver.planReviewAccepted'
-      : 'session.driver.planReviewNeedsRevision';
-    const summary = input.summary ?? defaultPlanReviewDecisionSummary(input.status);
+      : input.status === 'rejected'
+        ? 'session.driver.planReviewRejected'
+        : 'session.driver.planReviewNeedsRevision';
+    const language = this.ports.visibleLanguageForRequest(input.summary ?? input.plan.userPlan ?? '');
+    const summary = input.summary ?? defaultPlanReviewDecisionSummary(input.status, language);
     return {
       id: input.id,
       sessionId: input.sessionId,
@@ -122,7 +132,11 @@ export class PlanProjectionBuilder {
     const status = stringValue(report?.status) ?? 'pending';
     const planId = actionBundle?.id ?? proposal.proposalId;
     const confirmable = planReviewStatusAwaitingUser(status);
-    const kernelPlan = this.renderKernelExecutionContractPlan(userPlan, report);
+    const readablePlan = this.readableKernelExecutionContractPlan(userPlan, report, {
+      runId: proposal.runId,
+      planId,
+      proposalId: proposal.proposalId,
+    });
     const overlayPayload = this.ports.interactionOverlayProjection(state.interactionOverlay);
     const executionRoot = AcceptedPlanExecutionRootResolver.fromState(state);
     return {
@@ -131,9 +145,9 @@ export class PlanProjectionBuilder {
       ts,
       kind: 'plan_card',
       payload: {
-        title: 'Plan',
-        summary: kernelPlan.summary,
-        content: kernelPlan.content,
+        titleKey: 'session.projection.plan.title',
+        summary: readablePlan.summary,
+        readablePlan,
         runId: proposal.runId,
         planId,
         proposalId: proposal.proposalId,
@@ -152,8 +166,6 @@ export class PlanProjectionBuilder {
         actionBundle,
         codeBlocks: Array.isArray(payload.codeBlocks) ? payload.codeBlocks : [],
         commandBlocks: Array.isArray(payload.commandBlocks) ? payload.commandBlocks : [],
-        expectedValidation: typeof payload.expectedValidation === 'string' ? payload.expectedValidation : '',
-        reviewGuide: typeof payload.reviewGuide === 'string' ? payload.reviewGuide : '',
         planReviewReport: report,
         requiredFileOperations: this.ports.requiredFileOperationsFromReport(report),
         requiredAccessScopes: this.ports.requiredAccessScopesFromReport(report),
@@ -175,11 +187,15 @@ export class PlanProjectionBuilder {
   }): AgentEvent {
     const { state, proposal, ts, id } = input;
     const implementationPlan = objectRecord(proposal.payload) ?? {};
-    const language = this.ports.visibleLanguageForRequest(state.userRequest);
     const planId = stringValue(implementationPlan.id) ?? proposal.proposalId;
-    const title = stringValue(implementationPlan.title) ?? localizedImplementationPlanHeading(language);
-    const summary = stringValue(implementationPlan.summary) ?? title;
-    const content = renderImplementationPlanMarkdown(implementationPlan, summary, language);
+    const summary = stringValue(implementationPlan.summary)
+      ?? stringValue(implementationPlan.title)
+      ?? 'Implementation plan';
+    const readablePlan = readableImplementationPlan(implementationPlan, summary, {
+      runId: proposal.runId,
+      planId,
+      proposalId: proposal.proposalId,
+    });
     const overlayPayload = this.ports.interactionOverlayProjection(state.interactionOverlay);
     const executionRoot = AcceptedPlanExecutionRootResolver.fromState(state);
     return {
@@ -188,9 +204,9 @@ export class PlanProjectionBuilder {
       ts,
       kind: 'plan_card',
       payload: {
-        title,
+        titleKey: 'session.projection.plan.title',
         summary,
-        content,
+        readablePlan,
         runId: proposal.runId,
         planId,
         proposalId: proposal.proposalId,
@@ -220,10 +236,6 @@ export class PlanProjectionBuilder {
         },
         codeBlocks: [],
         commandBlocks: [],
-        expectedValidation: '',
-        reviewGuide: language === 'zh-CN'
-          ? '请先审查任务清单、验收标准和失败重规划条件；确认后再生成编辑内容。'
-          : 'Review the task checklist, acceptance criteria, and failure criteria before edits are generated.',
         channel: 'action',
         visibility: 'conversation',
         presentation: 'body',
@@ -231,10 +243,11 @@ export class PlanProjectionBuilder {
     };
   }
 
-  private renderKernelExecutionContractPlan(
+  private readableKernelExecutionContractPlan(
     userPlan: string,
-    report: Record<string, unknown> | undefined
-  ): { summary: string; content: string } {
+    report: Record<string, unknown> | undefined,
+    sourceRefs: Record<string, string>
+  ): ReadablePlanProjection {
     const status = stringValue(report?.status) ?? 'pending';
     const kernelSummary = stringValue(report?.kernelGeneratedPermissionSummary)
       ?? `Kernel gate status=${status}.`;
@@ -247,41 +260,82 @@ export class PlanProjectionBuilder {
       ...stringArrayValue(report?.blockedReasons),
       ...stringArrayValue(report?.deniedReasons),
     ];
-    const sections = [
-      '# Kernel 执行合约',
-      '',
-      '## 门禁状态',
-      `- 状态：${status}`,
-      `- 摘要：${kernelSummary}`,
-      contract?.id ? `- 合约：${String(contract.id)}` : undefined,
-      '',
-      '## 将发生的操作',
-      operations.length
-        ? operations.map((operation) => `- ${operation.operation} ${operation.targetPath} (${operation.capability})`).join('\n')
-        : '- 当前 Kernel report 未列出可执行文件操作。',
-      '',
-      '## 权限门禁',
-      bundles.length
-        ? bundles.map((bundle) => {
-          const targets = bundle.targets.length ? `；目标：${bundle.targets.join(', ')}` : '';
-          return `- ${bundle.capability} / ${bundle.resourceKind} / ${bundle.riskLevel}${targets}`;
-        }).join('\n')
-        : '- 当前合约没有额外权限 bundle。',
-      '',
-      '## 用户介入',
-      interventions.length
-        ? interventions.map((item) => `- ${item.interventionKind}: ${item.summary}`).join('\n')
-        : '- 无额外用户介入项。',
-      diagnostics.length
-        ? '\n## Kernel 诊断\n' + [...new Set(diagnostics)].map((item) => `- ${item}`).join('\n')
-        : undefined,
-      '',
-      '## LLM 说明',
-      userPlan,
-    ].filter((item): item is string => typeof item === 'string');
     return {
+      schemaVersion: 'deepcode.session.readable-plan.v1',
+      titleKey: 'session.projection.plan.title',
       summary: kernelSummary,
-      content: sections.join('\n'),
+      sourceRefs,
+      tasks: [],
+      sections: [
+        {
+          sectionId: 'kernelGate',
+          titleKey: 'session.projection.plan.section.kernelGate',
+          items: [
+            projectionItem('gate-status', 'fact', {
+              messageKey: 'session.projection.plan.kernelGate.status',
+              messageArgs: { status },
+              status,
+            }),
+            projectionItem('gate-summary', 'fact', { text: kernelSummary }),
+            ...(contract?.id ? [projectionItem('gate-contract', 'fact', {
+              messageKey: 'session.projection.plan.kernelGate.contract',
+              messageArgs: { id: String(contract.id) },
+            })] : []),
+          ],
+        },
+        {
+          sectionId: 'operations',
+          titleKey: 'session.projection.plan.section.operations',
+          emptyMessageKey: 'session.projection.plan.empty.operations',
+          items: operations.map((operation, index) => projectionItem(`operation-${index + 1}`, 'operation', {
+            messageKey: 'session.projection.plan.operation',
+            messageArgs: {
+              operation: operation.operation,
+              targetPath: operation.targetPath,
+              capability: operation.capability,
+            },
+            targetRefs: [operation.targetPath],
+            metadata: operation as unknown as Record<string, unknown>,
+          })),
+        },
+        {
+          sectionId: 'permissionBundles',
+          titleKey: 'session.projection.plan.section.permissionBundles',
+          emptyMessageKey: 'session.projection.plan.empty.permissionBundles',
+          items: bundles.map((bundle) => projectionItem(bundle.id, 'permission', {
+            messageKey: 'session.projection.plan.permissionBundle',
+            messageArgs: {
+              capability: bundle.capability,
+              resourceKind: bundle.resourceKind,
+              riskLevel: bundle.riskLevel,
+              targets: bundle.targets.join(', '),
+            },
+            targetRefs: bundle.targets,
+            metadata: bundle as unknown as Record<string, unknown>,
+          })),
+        },
+        {
+          sectionId: 'interventions',
+          titleKey: 'session.projection.plan.section.interventions',
+          emptyMessageKey: 'session.projection.plan.empty.interventions',
+          items: interventions.map((item) => projectionItem(item.id, 'decision', {
+            text: item.summary,
+            status: item.status,
+            metadata: item as unknown as Record<string, unknown>,
+          })),
+        },
+        {
+          sectionId: 'diagnostics',
+          titleKey: 'session.projection.plan.section.diagnostics',
+          emptyMessageKey: 'session.projection.plan.empty.diagnostics',
+          items: [...new Set(diagnostics)].map((item, index) => projectionItem(`diagnostic-${index + 1}`, 'diagnostic', { text: item })),
+        },
+        {
+          sectionId: 'agentPlan',
+          titleKey: 'session.projection.plan.section.agentPlan',
+          items: [projectionItem('agent-plan', 'text', { text: userPlan })],
+        },
+      ],
     };
   }
 
@@ -311,78 +365,81 @@ export class PlanProjectionBuilder {
   }
 }
 
-function renderImplementationPlanMarkdown(
+function readableImplementationPlan(
   plan: Record<string, unknown>,
   fallbackSummary: string,
-  language: PlanProjectionLanguage
-): string {
-  const headings = implementationPlanMarkdownLabels(language);
-  const lines = [`## ${headings.plan}`, '', fallbackSummary, ''];
+  sourceRefs: Record<string, string>
+): ReadablePlanProjection {
   const tasks = Array.isArray(plan.tasks) ? plan.tasks : [];
-  if (tasks.length) {
-    lines.push(`## ${headings.checklist}`, '');
-    for (const task of tasks) {
-      const record = objectRecord(task) ?? {};
-      const title = stringValue(record.title) ?? stringValue(record.taskId) ?? headings.task;
-      lines.push(`- ${title}`);
-      const target = stringArrayValue(record.target);
-      if (target.length) lines.push(`  - Target: ${target.join(', ')}`);
-      const scope = stringValue(record.scope);
-      if (scope) lines.push(`  - Scope: ${scope}`);
-      const capability = stringValue(record.capability);
-      if (capability) lines.push(`  - Capability: ${capability}`);
-      const acceptance = stringArrayValue(record.acceptanceCriteria);
-      if (acceptance.length) lines.push(`  - Acceptance: ${acceptance.join('; ')}`);
-      const failure = stringArrayValue(record.failureCriteria);
-      if (failure.length) lines.push(`  - Stop/Replan: ${failure.join('; ')}`);
-    }
-    lines.push('');
-  }
+  const readableTasks = tasks.flatMap((task, index): ReadablePlanTask[] => {
+    const record = objectRecord(task) ?? {};
+    const taskId = stringValue(record.taskId) ?? stringValue(record.id) ?? `task-${index + 1}`;
+    const title = stringValue(record.title) ?? taskId;
+    const targets = stringArrayValue(record.target);
+    return [{
+      taskId,
+      title,
+      objective: stringValue(record.objective) ?? stringValue(record.scope),
+      targets,
+      acceptance: stringArrayValue(record.acceptanceCriteria),
+      failure: stringArrayValue(record.failureCriteria),
+      intentKind: stringValue(record.capability),
+      metadata: record,
+    }];
+  });
   const risks = stringArrayValue(plan.risks);
-  if (risks.length) {
-    lines.push(`## ${headings.risks}`, '', ...risks.map((item) => `- ${item}`), '');
-  }
   const checkpoints = stringArrayValue(plan.reviewCheckpoints);
-  if (checkpoints.length) {
-    lines.push(`## ${headings.reviewCheckpoints}`, '', ...checkpoints.map((item) => `- ${item}`), '');
-  }
-  lines.push(`## ${headings.boundary}`, '', `- ${headings.boundaryMessage}`);
-  return lines.join('\n');
-}
-
-function localizedImplementationPlanHeading(language: PlanProjectionLanguage): string {
-  return language === 'zh-CN' ? '实现计划' : 'Implementation plan';
-}
-
-function implementationPlanMarkdownLabels(language: PlanProjectionLanguage): {
-  plan: string;
-  checklist: string;
-  task: string;
-  risks: string;
-  reviewCheckpoints: string;
-  boundary: string;
-  boundaryMessage: string;
-} {
-  if (language === 'zh-CN') {
-    return {
-      plan: '计划',
-      checklist: '任务清单',
-      task: '任务',
-      risks: '风险',
-      reviewCheckpoints: 'Review 节点',
-      boundary: '边界',
-      boundaryMessage: '这只是计划，不是执行结果；代码和命令只会在用户确认后生成。',
-    };
-  }
   return {
-    plan: 'Plan',
-    checklist: 'Checklist',
-    task: 'Task',
-    risks: 'Risks',
-    reviewCheckpoints: 'Review Checkpoints',
-    boundary: 'Boundary',
-    boundaryMessage: 'This plan is not execution. Code and commands are generated only after user acceptance.',
+    schemaVersion: 'deepcode.session.readable-plan.v1',
+    titleKey: 'session.projection.plan.title',
+    summary: fallbackSummary,
+    sourceRefs,
+    tasks: readableTasks,
+    sections: [
+      {
+        sectionId: 'summary',
+        titleKey: 'session.projection.plan.section.summary',
+        items: [projectionItem('summary', 'text', { text: fallbackSummary })],
+      },
+      {
+        sectionId: 'tasks',
+        titleKey: 'session.projection.plan.section.tasks',
+        emptyMessageKey: 'session.projection.plan.empty.tasks',
+        items: readableTasks.map((task) => projectionItem(task.taskId, 'task', {
+          text: task.title,
+          targetRefs: task.targets,
+          metadata: task as unknown as Record<string, unknown>,
+        })),
+      },
+      {
+        sectionId: 'risks',
+        titleKey: 'session.projection.plan.section.risks',
+        emptyMessageKey: 'session.projection.plan.empty.risks',
+        items: risks.map((item, index) => projectionItem(`risk-${index + 1}`, 'diagnostic', { text: item })),
+      },
+      {
+        sectionId: 'reviewCheckpoints',
+        titleKey: 'session.projection.plan.section.reviewCheckpoints',
+        emptyMessageKey: 'session.projection.plan.empty.reviewCheckpoints',
+        items: checkpoints.map((item, index) => projectionItem(`review-checkpoint-${index + 1}`, 'fact', { text: item })),
+      },
+      {
+        sectionId: 'boundary',
+        titleKey: 'session.projection.plan.section.boundary',
+        items: [projectionItem('boundary', 'fact', {
+          messageKey: 'session.projection.plan.boundary.notExecution',
+        })],
+      },
+    ],
   };
+}
+
+function projectionItem(
+  itemId: string,
+  kind: ReadableProjectionItem['kind'],
+  value: Omit<ReadableProjectionItem, 'itemId' | 'kind'>
+): ReadableProjectionItem {
+  return { itemId, kind, ...value };
 }
 
 function planReviewStatusAwaitingUser(status: string | undefined): boolean {
@@ -392,10 +449,22 @@ function planReviewStatusAwaitingUser(status: string | undefined): boolean {
     status === undefined;
 }
 
-function defaultPlanReviewDecisionSummary(status: 'accepted' | 'rejected' | 'needsRevision'): string {
+function defaultPlanReviewDecisionSummary(
+  status: 'accepted' | 'rejected' | 'needsRevision',
+  language: PlanProjectionLanguage
+): string {
+  if (language === 'zh-CN') {
+    return status === 'accepted'
+      ? '用户已确认计划，准备进入执行。'
+      : status === 'rejected'
+        ? '用户已忽略计划，本轮会话已中止。'
+        : '用户要求修改计划。';
+  }
   return status === 'accepted'
     ? 'The user accepted the plan; execution can continue.'
-    : 'The user requested plan changes.';
+    : status === 'rejected'
+      ? 'The user ignored the plan; this run has been cancelled.'
+      : 'The user requested plan changes.';
 }
 
 function accessScopesFromImplementationPlan(plan: Record<string, unknown> | undefined): unknown[] {

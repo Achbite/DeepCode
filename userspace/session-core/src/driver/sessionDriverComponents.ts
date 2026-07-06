@@ -172,7 +172,6 @@ export const reviewProjectionBuilder = new ReviewProjectionBuilder<SessionPlanCo
   staticSyntaxReviewFactLines: (kernelEvents) => reviewAssembler().staticSyntaxReviewFactLines(kernelEvents),
   findReviewFacts: (kernelEvents) => reviewAssembler().findReviewFacts(kernelEvents),
   concreteContinuationExpectations: (value) => implementationBatchContextBuilder().concreteContinuationExpectations(value),
-  languageForRequest: (userPlan) => visibleLanguageForRequest(userPlan),
   acceptedPlanContext: (plan) => plan.implementationPlan
     ? acceptedImplementationPlanContextBuilder().build({ plan, interventionLevel: undefined, executionRoot: plan.executionRoot })
     : undefined,

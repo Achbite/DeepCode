@@ -154,6 +154,7 @@ function pendingPlanFromEvent(
   const runId = stringField(payload, 'runId');
   const planId = stringField(payload, 'planId');
   if (!runId || !planId) return null;
+  if (hasTerminalRunState(events, runId)) return null;
   if (hasTerminalPlanDecision(events, runId, planId)) return null;
   return {
     kind: 'plan',
@@ -175,6 +176,7 @@ function pendingReviewFromEvent(
   if (!runId) return null;
   const reviewId = stringField(payload, 'reviewId');
   const sourcePlanId = stringField(payload, 'sourcePlanId');
+  if (hasTerminalRunState(events, runId)) return null;
   if (hasTerminalReviewDecision(events, runId, reviewId, sourcePlanId)) return null;
   return {
     kind: 'review',
@@ -194,6 +196,7 @@ function pendingRequirementFromEvent(
   const runId = stringField(payload, 'runId');
   const requirementId = stringField(payload, 'requirementId');
   if (!runId || !requirementId) return null;
+  if (hasTerminalRunState(events, runId)) return null;
   if (hasTerminalRequirementDecision(events, runId, requirementId)) return null;
   return {
     kind: 'requirement',
@@ -288,6 +291,15 @@ function hasTerminalRequirementDecision(events: AgentEvent[], runId: string, req
     const payload = asRecord(event.payload);
     if (!payload || !isTerminalStatus(stringField(payload, 'status'))) return false;
     return stringField(payload, 'runId') === runId && stringField(payload, 'requirementId') === requirementId;
+  });
+}
+
+function hasTerminalRunState(events: AgentEvent[], runId: string): boolean {
+  return events.some((event) => {
+    if (event.kind !== 'session_run_state') return false;
+    const payload = asRecord(event.payload);
+    if (!payload || stringField(payload, 'runId') !== runId) return false;
+    return isTerminalStatus(stringField(payload, 'status'));
   });
 }
 

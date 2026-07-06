@@ -503,6 +503,8 @@ function conversationActivityFromEvent(event: AgentEvent): AgentConversationActi
 function userInputBubbleEvent(event: AgentEvent, index: number): AgentEvent | null {
   const content = userInputBubbleContent(event);
   if (!content) return null;
+  const contentKey = userInputBubbleContentKey(event);
+  const contentArgs = userInputBubbleContentArgs(event);
   return {
     id: `user-input-${event.id || index}`,
     sessionId: event.sessionId,
@@ -510,6 +512,8 @@ function userInputBubbleEvent(event: AgentEvent, index: number): AgentEvent | nu
     kind: 'user_msg',
     payload: {
       content,
+      ...(contentKey ? { contentKey } : {}),
+      ...(contentArgs ? { contentArgs } : {}),
       source: 'user',
       sourceEventId: event.id,
       sourceEventKind: event.kind,
@@ -546,9 +550,33 @@ function userInputBubbleContent(event: AgentEvent): string | undefined {
   return undefined;
 }
 
+function userInputBubbleContentKey(event: AgentEvent): string | undefined {
+  if (!isRecordPayload(event.payload)) return undefined;
+  return stringField(event.payload, 'contentKey') ??
+    stringField(event.payload, 'messageKey') ??
+    stringField(event.payload, 'summaryKey');
+}
+
+function userInputBubbleContentArgs(event: AgentEvent): Record<string, string> | undefined {
+  if (!isRecordPayload(event.payload)) return undefined;
+  const args = recordStringValues(event.payload.contentArgs) ??
+    recordStringValues(event.payload.messageArgs) ??
+    recordStringValues(event.payload.summaryArgs);
+  return args && Object.keys(args).length > 0 ? args : undefined;
+}
+
 function selectedOptionLabel(payload: Record<string, unknown>): string | undefined {
   const selectedOption = isRecordPayload(payload.selectedOption) ? payload.selectedOption : undefined;
   return selectedOption ? stringField(selectedOption, 'label') : undefined;
+}
+
+function recordStringValues(value: unknown): Record<string, string> | undefined {
+  if (!isRecordPayload(value)) return undefined;
+  const result: Record<string, string> = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (item !== undefined && item !== null) result[key] = String(item);
+  }
+  return result;
 }
 
 function firstPayloadText(payload: Record<string, unknown>, keys: string[]): string | undefined {
@@ -1303,13 +1331,10 @@ function summarizeAgentEvents(events: AgentEvent[]): string {
 
 function narrativeBody(events: AgentEvent[], kind: AgentTimelineNarrativeKind): string | undefined {
   if (kind === 'operationEvidence') return undefined;
+  if (kind === 'plan' || kind === 'review') return undefined;
   if (kind === 'thinking') {
     const reasoning = events.map(reasoningEventBody).join('').trim();
     return reasoning || undefined;
-  }
-  if (kind === 'review') {
-    const text = trimReviewFooter(events.map(reviewEventBody).filter(Boolean).join('\n\n')).trim();
-    return text || undefined;
   }
   const text = firstNonEmpty(events, ['content', 'message', 'summary', 'details']);
   return text?.trim() ? text : undefined;
