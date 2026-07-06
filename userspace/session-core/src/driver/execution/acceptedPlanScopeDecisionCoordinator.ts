@@ -4,6 +4,11 @@ import type {
   AgentSessionResult,
 } from '@deepcode/protocol';
 import type { ProposalEnvelope } from '../../protocol/types.js';
+import type {
+  AcceptedImplementationPlanContext,
+  AcceptedPlanBatchValidationResult,
+} from '../../accepted-plan/types.js';
+import { AcceptedPlanScopeIntervention } from '../../accepted-plan/AcceptedPlanScopeIntervention.js';
 import type { RequirementRecord } from '../../requirement/types.js';
 import type { InteractionOverlayContext, SessionTurnPhase } from '../pipelines/interactionOverlayCodec.js';
 
@@ -18,11 +23,18 @@ export interface AcceptedPlanScopeDecisionRequest {
   attachments?: AgentContextAttachment[];
 }
 
+export interface AcceptedPlanScopeDecisionInterventionState {
+  userRequest: string;
+  acceptedPlan?: AcceptedImplementationPlanContext;
+  currentTaskId?: string;
+}
+
 export interface AcceptedPlanScopeDecisionCoordinatorInput<
   State extends AcceptedPlanScopeDecisionState
 > {
   now(): string;
   createId(prefix: string): string;
+  visibleLanguageForRequest(userRequest: string): 'en-US' | 'zh-CN';
   requirementPipeline: {
     requirementRecordFromProposal(input: {
       proposal: ProposalEnvelope;
@@ -78,6 +90,16 @@ export interface AcceptedPlanScopeDecisionRunInput<
   runStateIdPrefix?: string;
 }
 
+export interface AcceptedPlanOutOfScopeDecisionRunInput<
+  State extends AcceptedPlanScopeDecisionState
+> {
+  state: State;
+  intervention: AcceptedPlanScopeDecisionInterventionState;
+  proposal: ProposalEnvelope;
+  validation: AcceptedPlanBatchValidationResult;
+  request: AcceptedPlanScopeDecisionRequest;
+}
+
 export class AcceptedPlanScopeDecisionCoordinator<
   State extends AcceptedPlanScopeDecisionState = AcceptedPlanScopeDecisionState
 > {
@@ -130,5 +152,28 @@ export class AcceptedPlanScopeDecisionCoordinator<
         id: this.input.createId(runInput.runStateIdPrefix ?? 'session-run-waiting-accepted-plan-repair-decision'),
       }),
     ]);
+  }
+
+  async waitForOutOfScopeDecision(
+    runInput: AcceptedPlanOutOfScopeDecisionRunInput<State>
+  ): Promise<AgentSessionResult> {
+    const decisionProposal = new AcceptedPlanScopeIntervention({
+      createId: (prefix) => this.input.createId(prefix),
+      visibleLanguageForRequest: (userRequest) => this.input.visibleLanguageForRequest(userRequest),
+    }).createDecisionProposal({
+      runId: runInput.state.runId,
+      sessionId: runInput.state.sessionId,
+      userRequest: runInput.intervention.userRequest,
+      acceptedPlan: runInput.intervention.acceptedPlan,
+      currentTaskId: runInput.intervention.currentTaskId,
+    }, runInput.proposal, runInput.validation);
+
+    return this.waitForDecision({
+      state: runInput.state,
+      proposal: decisionProposal,
+      request: runInput.request,
+      confirmationIdPrefix: 'accepted-plan-scope-confirmation',
+      runStateIdPrefix: 'session-run-waiting-accepted-plan-scope',
+    });
   }
 }

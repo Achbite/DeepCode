@@ -126,6 +126,7 @@ async function main(): Promise<void> {
   assertAcceptedPlanScopeDecisionOverlayExpandsCurrentTask();
   await assertAcceptedPlanScopeRepairCoordinatorRepairsProposal();
   await assertAcceptedPlanScopeDecisionCoordinatorBuildsWaitingEvents();
+  await assertAcceptedPlanScopeDecisionCoordinatorBuildsOutOfScopeIntervention();
   await assertAcceptedPlanScopeResourceFollowupCoordinatorHandlesResourceRequests();
   assertAcceptedPlanOperationTargetResolverFindsExactGrant();
   assertAcceptedPlanExecutorBuildsExecutionBatch();
@@ -3729,6 +3730,7 @@ async function assertAcceptedPlanScopeDecisionCoordinatorBuildsWaitingEvents(): 
   const coordinator = new AcceptedPlanScopeDecisionCoordinator<typeof state>({
     now: () => `ts-${token}`,
     createId: (prefix) => `${prefix}-${token}`,
+    visibleLanguageForRequest: () => 'en-US',
     requirementPipeline: {
       requirementRecordFromProposal: ({ runId: nextRunId, proposal: nextProposal, userRequest }) => {
         assertEqual(nextRunId, runId, 'scope decision coordinator passes run state');
@@ -3813,6 +3815,134 @@ async function assertAcceptedPlanScopeDecisionCoordinatorBuildsWaitingEvents(): 
   assertEqual(appendedEvents[0]?.kind, 'requirement_confirmation', 'scope decision coordinator appends confirmation first');
   assertEqual(appendedEvents[1]?.kind, 'session_run_state', 'scope decision coordinator appends run-state second');
   assertEqual(result.events.length, 2, 'scope decision coordinator returns append result');
+}
+
+async function assertAcceptedPlanScopeDecisionCoordinatorBuildsOutOfScopeIntervention(): Promise<void> {
+  const token = randomSmokeToken('scope-out-of-scope');
+  const sessionId = `session-${token}`;
+  const runId = `run-${token}`;
+  const taskId = `task-${token}`;
+  const targetPath = `target-${token}`;
+  const state = {
+    sessionId,
+    runId,
+    phase: 'executing_accepted_plan' as const,
+  };
+  const sourceProposal = {
+    schemaVersion: 'deepcode.agent.protocol.v3',
+    proposalId: `proposal-${token}`,
+    runId,
+    sessionId,
+    source: 'llm',
+    kind: 'actionBundle',
+    payload: {
+      actionBundle: {
+        version: '1',
+        id: `batch-${token}`,
+        goal: `goal-${token}`,
+        actions: [],
+      },
+    },
+  } as ProposalEnvelope;
+  let observedDecisionPayload: Record<string, unknown> | undefined;
+  const coordinator = new AcceptedPlanScopeDecisionCoordinator<typeof state>({
+    now: () => `ts-${token}`,
+    createId: (prefix) => `${prefix}-${token}`,
+    visibleLanguageForRequest: () => 'en-US',
+    requirementPipeline: {
+      requirementRecordFromProposal: ({ proposal }) => {
+        assertEqual(proposal.kind, 'decisionRequest', 'out-of-scope intervention creates decision request proposal');
+        observedDecisionPayload = proposal.payload as Record<string, unknown>;
+        return {
+          requirementId: `requirement-${token}`,
+          sessionId,
+          initialUserRequest: `request-${token}`,
+          status: 'probing',
+          createdAt: `ts-${token}`,
+          updatedAt: `ts-${token}`,
+        };
+      },
+    },
+    interactionOverlayCodec: {
+      toPayload: (overlay) => ({ parentPhase: overlay.parentPhase }),
+    },
+    requirementProjection: {
+      confirmationEvent: ({ sessionId: nextSessionId, requirement }) => ({
+        id: `confirmation-${token}`,
+        sessionId: nextSessionId,
+        ts: `ts-${token}`,
+        kind: 'requirement_confirmation',
+        payload: { requirementId: requirement.requirementId },
+      }),
+    },
+    progressProjection: {
+      sessionRunStateEvent: ({ sessionId: nextSessionId, phase }) => ({
+        id: `run-state-${token}`,
+        sessionId: nextSessionId,
+        ts: `ts-${token}`,
+        kind: 'session_run_state',
+        payload: { phase },
+      }),
+    },
+    append: async (nextSessionId, events) => ({
+      session: {
+        id: nextSessionId,
+        mode: 'plan',
+        createdAt: `ts-${token}`,
+        updatedAt: `ts-${token}`,
+      },
+      events,
+    }),
+  });
+
+  await coordinator.waitForOutOfScopeDecision({
+    state,
+    proposal: sourceProposal,
+    validation: {
+      ok: false,
+      reasons: [`reason-${token}`],
+      issues: [{
+        code: 'targetOutOfScope',
+        message: `message-${token}`,
+        targetPath: `${targetPath}/`,
+        targetResourceKind: 'directory',
+        recursive: true,
+      }],
+    },
+    request: {
+      content: `request-${token}`,
+      attachments: [],
+    },
+    intervention: {
+      userRequest: `request-${token}`,
+      acceptedPlan: {
+        planId: `plan-${token}`,
+        runId,
+        tasks: [{
+          taskId,
+          title: `title-${token}`,
+          capability: 'fs.delete',
+          targets: [],
+          dependencies: [],
+          conflictKeys: [],
+        }],
+        capabilities: ['fs.delete'],
+        targetScopes: [],
+        exactOperationGrants: [],
+        accessScopes: [],
+        batchIndex: 1,
+        completedTaskIds: [],
+        rawPlan: {},
+      },
+      currentTaskId: taskId,
+    },
+  });
+
+  const options = observedDecisionPayload?.options as Array<{ effect?: { kind?: string; targetPath?: string; recursive?: boolean } }> | undefined;
+  const expansion = options?.find((option) => option.effect?.kind === 'expandCurrentTaskScope')?.effect;
+  assertEqual(state.phase, 'waiting_permission', 'out-of-scope intervention waits for permission');
+  assertEqual(expansion?.targetPath, targetPath, 'out-of-scope intervention normalizes target path');
+  assertEqual(expansion?.recursive, true, 'out-of-scope intervention preserves directory recursion');
 }
 
 async function assertAcceptedPlanScopeResourceFollowupCoordinatorHandlesResourceRequests(): Promise<void> {

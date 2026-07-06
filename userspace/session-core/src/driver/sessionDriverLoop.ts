@@ -28,7 +28,6 @@ import {
   ActionBundleAdmissionRepairCoordinator,
   ActionBatchFailureIndex,
   CompletedWorkUnitFactIndex,
-  AcceptedPlanScopeIntervention,
   AcceptedPlanScopeMatcher,
   AcceptedPlanTargetParser,
   AcceptedPlanTaskLedgerCoordinator,
@@ -693,7 +692,20 @@ export class SessionDriverLoop {
       assessActionProposal: (assessmentInput) => acceptedPlanExecutor.assessActionProposal(assessmentInput as unknown as Parameters<typeof acceptedPlanExecutor.assessActionProposal>[0]),
       admission: () => acceptedPlanAdmission(),
       appendScopeIntervention: (handlerInput, state, proposal, validation) =>
-        this.appendAcceptedPlanBatchOutOfScope(handlerInput, state, proposal, validation as AcceptedPlanBatchValidationResult),
+        this.acceptedPlanScopeDecisionCoordinator.waitForOutOfScopeDecision({
+          state,
+          proposal,
+          validation: validation as AcceptedPlanBatchValidationResult,
+          request: {
+            content: handlerInput.content,
+            attachments: handlerInput.attachments ?? [],
+          },
+          intervention: {
+            userRequest: state.userRequest,
+            acceptedPlan: state.acceptedImplementationPlan,
+            currentTaskId: state.currentTaskContext?.taskId,
+          },
+        }),
       appendThinking: async (state, message, idPrefix, metadata) => {
         await this.append(state.sessionId, [
           assistantProjectionBuilder.thinkingEvent(
@@ -863,6 +875,7 @@ export class SessionDriverLoop {
     this.acceptedPlanScopeDecisionCoordinator = new AcceptedPlanScopeDecisionCoordinator<SessionDriverLoopRunState>({
       now: () => this.ts(),
       createId: (prefix) => this.id(prefix),
+      visibleLanguageForRequest,
       requirementPipeline: userInputPipeline,
       interactionOverlayCodec,
       requirementProjection: requirementProjectionBuilder,
@@ -1738,31 +1751,6 @@ export class SessionDriverLoop {
     return this.acceptedPlanActionProposalSubmitter.submit(input, state, prompt, proposal, fallback);
   }
 
-  private async appendAcceptedPlanBatchOutOfScope(
-    input: SessionDriverLoopInput,
-    state: SessionDriverLoopRunState,
-    proposal: ProposalEnvelope,
-    validation: AcceptedPlanBatchValidationResult
-  ): Promise<AgentSessionResult> {
-    const decisionProposal = acceptedPlanScopeIntervention((prefix) => this.id(prefix)).createDecisionProposal({
-      runId: state.runId,
-      sessionId: state.sessionId,
-      userRequest: state.userRequest,
-      acceptedPlan: state.acceptedImplementationPlan,
-      currentTaskId: state.currentTaskContext?.taskId,
-    }, proposal, validation);
-    return this.acceptedPlanScopeDecisionCoordinator.waitForDecision({
-      state,
-      proposal: decisionProposal,
-      request: {
-        content: input.content,
-        attachments: input.attachments ?? [],
-      },
-      confirmationIdPrefix: 'accepted-plan-scope-confirmation',
-      runStateIdPrefix: 'session-run-waiting-accepted-plan-scope',
-    });
-  }
-
   private async emitProjectionDelta(
     state: SessionDriverLoopRunState,
     delta: Omit<ProjectionDelta, 'sessionId' | 'runId' | 'turnId' | 'seq'>
@@ -1894,13 +1882,6 @@ function acceptedPlanTaskLedger(): AcceptedPlanTaskLedgerCoordinator {
   return new AcceptedPlanTaskLedgerCoordinator({
     workUnitIdsFromKernelEvents: (events) => kernelEventStatusIndex.workUnitIds(events),
     actionBatchHasFailureOrBlocker: (events) => kernelEventStatusIndex.hasFailureOrBlocker(events),
-  });
-}
-
-function acceptedPlanScopeIntervention(createId: (prefix: string) => string): AcceptedPlanScopeIntervention {
-  return new AcceptedPlanScopeIntervention({
-    createId,
-    visibleLanguageForRequest,
   });
 }
 
