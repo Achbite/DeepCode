@@ -6277,15 +6277,6 @@ function assertAcceptedImplementationPlanContextBuilderBuildsRuntimeContext(): v
   const projector = new PlanReviewGrantProjector();
   const targetParser = new AcceptedPlanTargetParser();
   const builder = new AcceptedImplementationPlanContextBuilder({
-    objectRecord: (value) => value && typeof value === 'object' && !Array.isArray(value)
-      ? value as Record<string, unknown>
-      : undefined,
-    stringValue: (value) => typeof value === 'string' && value.trim() ? value.trim() : undefined,
-    stringArrayValue: (value) => Array.isArray(value)
-      ? value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
-      : typeof value === 'string' && value.trim()
-        ? [value.trim()]
-        : [],
     normalizePlanScope: (value) => value.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+/g, '/').trim(),
     uniqueStrings: (values) => [...new Set(values.filter((item): item is string => Boolean(item)))],
     acceptedPlanTaskTargets: (record) => targetParser.taskTargets(record),

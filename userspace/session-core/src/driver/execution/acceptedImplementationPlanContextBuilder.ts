@@ -16,9 +16,6 @@ export interface AcceptedImplementationPlanSource {
 }
 
 export interface AcceptedImplementationPlanContextBuilderPorts {
-  objectRecord(value: unknown): Record<string, unknown> | undefined;
-  stringValue(value: unknown): string | undefined;
-  stringArrayValue(value: unknown): string[];
   normalizePlanScope(value: string): string;
   uniqueStrings(values: Array<string | undefined>): string[];
   acceptedPlanTaskTargets(record: Record<string, unknown>): string[];
@@ -46,20 +43,20 @@ export class AcceptedImplementationPlanContextBuilder {
     const rawPlan = plan.implementationPlan ?? {};
     const tasks = Array.isArray(rawPlan.tasks) ? rawPlan.tasks : [];
     const taskContexts = tasks.flatMap((item, index): AcceptedImplementationPlanTaskContext[] => {
-      const record = this.ports.objectRecord(item);
+      const record = objectRecord(item);
       if (!record) return [];
-      const taskId = this.ports.stringValue(record.taskId) ?? this.ports.stringValue(record.id) ?? `task-${index + 1}`;
-      const legacyDependencies = this.ports.stringArrayValue(record.dependencies)
-        .concat(this.ports.stringArrayValue(record.dependsOn))
+      const taskId = stringValue(record.taskId) ?? stringValue(record.id) ?? `task-${index + 1}`;
+      const legacyDependencies = stringArrayValue(record.dependencies)
+        .concat(stringArrayValue(record.dependsOn))
         .map((value) => this.ports.normalizePlanScope(value))
         .filter(Boolean);
-      const conflictKeys = this.ports.stringArrayValue(record.conflictKeys)
+      const conflictKeys = stringArrayValue(record.conflictKeys)
         .map((value) => this.ports.normalizePlanScope(value))
         .filter(Boolean);
       return [{
         taskId,
-        title: this.ports.stringValue(record.title),
-        capability: this.ports.stringValue(record.capability),
+        title: stringValue(record.title),
+        capability: stringValue(record.capability),
         targets: this.ports.acceptedPlanTaskTargets(record),
         dependencies: legacyDependencies,
         conflictKeys,
@@ -85,8 +82,8 @@ export class AcceptedImplementationPlanContextBuilder {
     return {
       planId: plan.planId,
       runId: plan.runId,
-      title: this.ports.stringValue(rawPlan.title),
-      summary: this.ports.stringValue(rawPlan.summary),
+      title: stringValue(rawPlan.title),
+      summary: stringValue(rawPlan.summary),
       tasks: taskContexts,
       capabilities: acceptedCapabilities,
       targetScopes,
@@ -115,4 +112,24 @@ function executionSliceRoleValue(value: unknown): ExecutionSliceRole | undefined
     return role;
   }
   return undefined;
+}
+
+function objectRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function stringValue(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function stringArrayValue(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    const single = stringValue(value);
+    return single ? [single] : [];
+  }
+  return value
+    .map((item) => stringValue(item))
+    .filter((item): item is string => Boolean(item));
 }

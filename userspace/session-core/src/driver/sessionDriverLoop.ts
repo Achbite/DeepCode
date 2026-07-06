@@ -1892,9 +1892,6 @@ function implementationBatchContextBuilder(): ImplementationBatchContextBuilder 
 
 function acceptedImplementationPlanContextBuilder(): AcceptedImplementationPlanContextBuilder {
   return new AcceptedImplementationPlanContextBuilder({
-    objectRecord,
-    stringValue,
-    stringArrayValue,
     normalizePlanScope: (value) => pathIdentity.normalizePlanScope(value),
     uniqueStrings: (values) => driverActivityBuilder.uniqueStrings(values),
     acceptedPlanTaskTargets: (record) => acceptedPlanTargetParser.taskTargets(record),
