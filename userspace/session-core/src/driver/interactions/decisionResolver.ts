@@ -10,11 +10,12 @@ import type { PermissionDecisionHandler } from './permissionDecisionHandler.js';
 import type { PlanDecisionHandler } from './planDecisionHandler.js';
 import type { RequirementDecisionHandler } from './requirementDecisionHandler.js';
 import type { ReviewDecisionHandler } from './reviewDecisionHandler.js';
+import type { InterventionLevel, ReviewContinuationMode } from '../types.js';
 
 export type DecisionResolverKind = 'requirement' | 'plan' | 'review' | 'permission' | 'boundary';
 export type DecisionResolverDecision = 'accept' | 'reject' | 'revise';
-export type DecisionResolverReviewContinuationMode = 'auto' | 'ask' | 'off';
-export type DecisionResolverInterventionLevel = 'low' | 'medium' | 'high';
+export type DecisionResolverReviewContinuationMode = ReviewContinuationMode;
+export type DecisionResolverInterventionLevel = InterventionLevel;
 
 export interface DecisionResolverInput {
   sessionId: string;

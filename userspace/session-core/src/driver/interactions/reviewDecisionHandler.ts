@@ -12,10 +12,11 @@ import type { KernelEventStatusIndex } from '../execution/kernelEventStatusIndex
 import type { SessionTurnPhase } from '../pipelines/interactionOverlayCodec.js';
 import type { ReviewAssembler } from '../review/reviewAssembler.js';
 import type { ReviewDecisionProjectionBuilder } from '../review/reviewDecisionProjection.js';
+import type { InterventionLevel, ReviewContinuationMode } from '../types.js';
 
 export type ReviewDecisionHandlerDecision = 'accept' | 'reject' | 'revise';
-export type ReviewDecisionHandlerContinuationMode = 'auto' | 'ask' | 'off';
-export type ReviewDecisionHandlerInterventionLevel = 'low' | 'medium' | 'high';
+export type ReviewDecisionHandlerContinuationMode = ReviewContinuationMode;
+export type ReviewDecisionHandlerInterventionLevel = InterventionLevel;
 
 export interface ReviewDecisionHandlerInput {
   sessionId: string;

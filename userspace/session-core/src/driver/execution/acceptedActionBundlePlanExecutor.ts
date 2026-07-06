@@ -11,11 +11,12 @@ import type { ProjectWorkingDirectory, ResourcePacket } from '../../context/type
 import type { AcceptedImplementationPlanContext } from '../../accepted-plan/types.js';
 import type { InteractionOverlayContext } from '../pipelines/interactionOverlayCodec.js';
 import type { PlanContext } from '../proposal/planContextIndex.js';
+import type { InterventionLevel, ReviewContinuationMode } from '../types.js';
 import { assertKernelReplyOk, kernelReplyErrorMessage } from './kernelReplyGuard.js';
 
 export type AcceptedActionBundlePlanDecision = 'accept' | 'reject' | 'revise';
-export type AcceptedActionBundlePlanReviewContinuationMode = 'auto' | 'ask' | 'off';
-export type AcceptedActionBundlePlanInterventionLevel = 'low' | 'medium' | 'high';
+export type AcceptedActionBundlePlanReviewContinuationMode = ReviewContinuationMode;
+export type AcceptedActionBundlePlanInterventionLevel = InterventionLevel;
 
 export interface AcceptedActionBundlePlanInput {
   sessionId: string;

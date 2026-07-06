@@ -13,10 +13,11 @@ import type {
 import type { InteractionOverlayContext, SessionTurnPhase } from '../pipelines/interactionOverlayCodec.js';
 import type { PlanContext, PlanContextIndex } from '../proposal/planContextIndex.js';
 import type { PlanProjectionBuilder } from '../projection/planProjectionBuilder.js';
+import type { InterventionLevel, ReviewContinuationMode } from '../types.js';
 
 export type PlanDecisionHandlerDecision = 'accept' | 'reject' | 'revise';
-export type PlanDecisionHandlerContinuationMode = 'auto' | 'ask' | 'off';
-export type PlanDecisionHandlerInterventionLevel = 'low' | 'medium' | 'high';
+export type PlanDecisionHandlerContinuationMode = ReviewContinuationMode;
+export type PlanDecisionHandlerInterventionLevel = InterventionLevel;
 
 export interface PlanDecisionHandlerInput {
   sessionId: string;

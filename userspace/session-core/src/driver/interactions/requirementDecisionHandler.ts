@@ -29,11 +29,12 @@ import type {
   RequirementProjectionBuilder,
   SessionProgressProjectionBuilder,
 } from '../projection/index.js';
+import type { InterventionLevel, RequirementConfirmationMode, ReviewContinuationMode } from '../types.js';
 
 export type RequirementDecisionHandlerDecision = 'accept' | 'reject' | 'revise';
-export type RequirementDecisionHandlerContinuationMode = 'auto' | 'ask' | 'off';
-export type RequirementDecisionHandlerInterventionLevel = 'low' | 'medium' | 'high';
-export type RequirementDecisionHandlerConfirmationMode = 'auto' | 'always' | 'off';
+export type RequirementDecisionHandlerContinuationMode = ReviewContinuationMode;
+export type RequirementDecisionHandlerInterventionLevel = InterventionLevel;
+export type RequirementDecisionHandlerConfirmationMode = RequirementConfirmationMode;
 export type RequirementDecisionHandlerVisibleLanguage = 'zh-CN' | 'en-US';
 
 export interface RequirementDecisionHandlerInput {
