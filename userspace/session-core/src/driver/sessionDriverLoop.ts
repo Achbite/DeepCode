@@ -387,10 +387,6 @@ const kernelEventStatusIndex = new KernelEventStatusIndex();
 const repairLoop = new RepairLoop();
 const pathIdentity = new PathIdentity();
 const providerContextSupport = new ProviderContextSupport({
-  currentTaskOperations: (acceptedPlan) => {
-    const operations = objectRecord(executionPromptCoordinator().sanitizedContext(acceptedPlan))?.currentTaskOperations;
-    return Array.isArray(operations) ? operations : undefined;
-  },
   acceptedContext: (acceptedPlan) => executionPromptCoordinator().sanitizedContext(acceptedPlan),
 });
 const acceptedPlanScopeMatcher = new AcceptedPlanScopeMatcher();

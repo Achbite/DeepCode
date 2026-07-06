@@ -16,7 +16,6 @@ export interface ProviderContextSupportState {
 }
 
 export interface ProviderContextSupportPorts {
-  currentTaskOperations(acceptedPlan: AcceptedImplementationPlanContext): unknown[] | undefined;
   acceptedContext(acceptedPlan: AcceptedImplementationPlanContext | undefined): Record<string, unknown> | undefined;
 }
 
@@ -34,7 +33,7 @@ export class ProviderContextSupport {
     ];
     if (acceptedPlan) {
       const currentTask = acceptedPlan.tasks.find((task) => !acceptedPlan.completedTaskIds.includes(task.taskId));
-      const currentTaskOperations = this.ports.currentTaskOperations(acceptedPlan);
+      const currentTaskOperations = this.currentTaskOperations(acceptedPlan);
       hints.push(
         `Accepted taskPlan active: planId=${acceptedPlan.planId}; currentTask=${currentTask?.taskId ?? 'complete'}; completedTasks=${acceptedPlan.completedTaskIds.length}/${acceptedPlan.tasks.length}. Automatic execution is allowed only for the current task when targets and capabilities stay inside the accepted plan.`,
         currentTask
@@ -78,5 +77,10 @@ export class ProviderContextSupport {
         : undefined,
       completedTaskCount: state.acceptedImplementationPlan?.completedTaskIds.length ?? 0,
     };
+  }
+
+  private currentTaskOperations(acceptedPlan: AcceptedImplementationPlanContext): unknown[] | undefined {
+    const operations = this.ports.acceptedContext(acceptedPlan)?.currentTaskOperations;
+    return Array.isArray(operations) ? operations : undefined;
   }
 }
