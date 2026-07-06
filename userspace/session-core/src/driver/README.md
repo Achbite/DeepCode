@@ -11,6 +11,10 @@ boundary. Do not split code only to reduce line count.
 
 Top-level support files:
 
+- `sessionDriverComponents.ts`: driver component registry and factory boundary.
+  Keep shared singleton builders, component instances, and factory functions
+  here when they are wiring concerns rather than turn-state logic. Do not move
+  state transitions or proposal behavior into this file.
 - `runFrame.ts`: driver run-frame, provider-turn frame, and loop runtime state
   types.
 - `runtimeSupport.ts`: shared driver support helpers used by wiring and

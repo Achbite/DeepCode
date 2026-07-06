@@ -12,161 +12,128 @@ import type {
   ProjectionDelta,
 } from '@deepcode/protocol';
 import {
-  AcceptedPlanAdmission,
   AcceptedActionBundlePlanExecutor,
   AcceptedPlanActionProposalSubmitter,
-  AcceptedPlanBatchPreflight,
-  AcceptedPlanExecutor,
   AcceptedPlanExecutionRootResolver,
-  AcceptedPlanOperationTargetResolver,
-  AcceptedPlanScopeCoverage,
   AcceptedPlanScopeDecisionCoordinator,
-  AcceptedPlanScopeDecisionOverlay,
   AcceptedPlanScopeRepairCoordinator,
   AcceptedPlanScopeResourceFollowupCoordinator,
   AcceptedPlanReadOnlyTaskExecutor,
   ActionBundleAdmissionRepairCoordinator,
-  ActionBatchFailureIndex,
-  CompletedWorkUnitFactIndex,
-  AcceptedPlanScopeMatcher,
-  AcceptedPlanTargetParser,
-  AcceptedPlanTaskLedgerCoordinator,
   ActionBundleAdmissionCoordinator,
-  AcceptedImplementationPlanContextBuilder,
-  ExecutionPromptCoordinator,
-  ImplementationBatchContextBuilder,
-  KernelEventStatusIndex,
-  RepairLoop,
   ReviewFactsAggregator,
   assertKernelReplyOk as assertExecutionKernelReplyOk,
   type AcceptedImplementationPlanContext,
-  type AcceptedImplementationPlanExecutionRoot,
-  type AcceptedPlanAccessScope,
   type AcceptedPlanBatchValidationResult,
-  type AcceptedPlanExactOperationGrant,
   type CurrentTaskContext,
-  type ImplementationBatchContext,
   type TaskExecutionCursor,
 } from './execution/index.js';
+import type { ProposalEnvelope } from '../protocol/types.js';
 import type {
-  ProposalEnvelope,
-  ResourceRequestDraft,
-} from '../protocol/types.js';
-import type {
-  InitialContextPacket,
-  ConversationResourceRoot,
   ProjectWorkingDirectory,
-  ResourceManifest,
   ResourcePacket,
 } from '../context/types.js';
 import {
   assembleContext,
   buildSessionMemoryDocument,
   collectUserGuidanceEvents,
-  type PromptCachePlan,
   type ProjectMemoryMode,
 } from '../context/index.js';
 import type { PromptEnvelope } from '../prompt/types.js';
-import { AcceptedPlanResourceResumePromptBuilder } from '../prompt/AcceptedPlanResourceResumePromptBuilder.js';
-import { ProviderRepairMessageBuilder, type ProviderRepairMessageState } from '../prompt/ProviderRepairMessageBuilder.js';
+import type { ProviderRepairMessageState } from '../prompt/ProviderRepairMessageBuilder.js';
 import {
-  NativeToolCoordinator,
   NativeToolCoordinatorError,
   NativeToolHandlerPortsFactory,
-  NativeToolProgressEventBuilder,
   NativeToolProviderCoordinator,
-  NativeToolProviderLoop,
-  NativeToolProjectionBuilder,
-  NativeToolRepairCoordinator,
-  NativeToolRepairRunner,
-  NativeToolResultMessageBuilder,
-  NativeToolResourceRecorder,
-  NativeToolResumeMessageBuilder,
-  NativeToolTurnHandler,
-  ProposalOnlyProviderRunner,
-  ProviderJsonModeCoordinator,
-  ProviderPipeline,
   ProviderProposalCoordinator,
-  ProviderStreamCoordinator,
   ProviderStreamRuntime,
-  ProviderTurnPolicy,
   ProviderTurnRunner,
-  ProviderTraceRecorder,
   ProviderToolCallBuffer,
 } from './pipelines/providerPipeline.js';
-import { InteractionOverlayCodec, type InteractionOverlayContext, type SessionTurnPhase } from './pipelines/interactionOverlayCodec.js';
+import type { InteractionOverlayContext } from './pipelines/interactionOverlayCodec.js';
 import { RunLifecyclePipeline } from './pipelines/lifecyclePipeline.js';
-import { PermissionPipeline } from './pipelines/permissionPipeline.js';
 import { ProviderRuntimeBridge } from './pipelines/providerRuntimeBridge.js';
 import { ProviderTurnCycle } from './pipelines/providerTurnCycle.js';
-import { UserGuidanceQueue } from './pipelines/userGuidanceQueue.js';
-import { UserInputPipeline } from './pipelines/userInputPipeline.js';
 import {
   AcceptedPlanResourceResumeCoordinator,
   ActionBundleAdmissionResourceFollowupCoordinator,
-  ContextFrameBuilder,
-  GeneratedArtifactEvidenceIndex,
-  PathIdentity,
-  ProviderContextSupport,
   ProviderTurnContextCoordinator,
-  ResourceEvidenceIndex,
-  ResourceManifestBuilder,
   ResourceOrchestrator,
   ResourceRequestProposalHandler,
   ResourceRequestRepairCoordinator,
-  ResourceRequestLoop,
-  ResourceRequestResolver,
-  type GeneratedArtifactEvidence,
 } from './context/index.js';
-import { DriverFailureMessageCatalog, DriverParseErrorCatalog } from './diagnostics/index.js';
 import type { RequirementRecord } from '../requirement/types.js';
 import type { TranscriptEntry } from '../transcript.js';
 import {
-  buildAcceptedPlanPromptFrame,
-  buildReviewFactsContext,
-  buildTaskLedgerSnapshot,
-  type AcceptedPlanPromptFrame,
-  type TaskLedgerSnapshot,
-} from '../run-state/index.js';
-import type { DriverRequestRef, KernelStateContractRef } from './types.js';
-import {
   AcceptedPlanReviewHandoffCoordinator,
   AcceptedPlanStaticSyntaxReviewCoordinator,
-  ReviewAssembler,
-  ReviewDecisionProjectionBuilder,
-  type SessionReviewContext,
 } from './review/index.js';
-import { DecisionResolver, DriverInteractionIndex, PermissionDecisionHandler, PlanDecisionHandler, ProviderDecisionRequestHandler, RequirementConfirmationCoordinator, RequirementDecisionHandler, ReviewDecisionHandler, TerminalGuidanceRevisionCoordinator } from './interactions/index.js';
+import { DecisionResolver, PermissionDecisionHandler, PlanDecisionHandler, ProviderDecisionRequestHandler, RequirementConfirmationCoordinator, RequirementDecisionHandler, ReviewDecisionHandler, TerminalGuidanceRevisionCoordinator } from './interactions/index.js';
 import {
   ActionProposalSubmitter,
-  ActionBundleActionInspector,
-  PlanContextIndex,
-  PlanInteractionIndex,
-  PlanReviewGrantProjector,
-  PlanReviewReportAnalyzer,
   ProviderPlanProposalHandler,
   ProviderTerminalProposalHandler,
   ProposalRouter,
-  ProposalSemanticValidator,
-  ProtocolGate,
   type PlanContext as SessionPlanContext,
 } from './proposal/index.js';
-import {
-  AssistantProjectionBuilder,
-  DriverActivityBuilder,
-  KernelEventProjectionBuilder,
-  PlanProjectionBuilder,
-  RequirementProjectionBuilder,
-  ReviewProjectionBuilder,
-  SessionFailureProjectionBuilder,
-  SessionProgressProjectionBuilder,
-  type DecisionOwnerRef,
-  type SessionRunStateReason,
-  type SessionRunStateStatus,
-} from './projection/index.js';
-import type { DriverProviderTurnFrame, LlmTurnResult, SessionDriverLoopRunState } from './runFrame.js';
-import { clip, diag, objectRecord, stringValue, visibleLanguageForRequest } from './runtimeSupport.js';
+import type { LlmTurnResult, SessionDriverLoopRunState } from './runFrame.js';
+import { diag, objectRecord, stringValue, visibleLanguageForRequest } from './runtimeSupport.js';
 import { AgentRunReactor } from './agentRunReactor.js';
+import {
+  acceptedImplementationPlanContextBuilder,
+  acceptedPlanAdmission,
+  acceptedPlanBatchPreflight,
+  acceptedPlanExecutor,
+  acceptedPlanResourceResumePromptBuilder,
+  acceptedPlanScopeDecisionOverlay,
+  acceptedPlanTaskLedger,
+  assistantProjectionBuilder,
+  contextFrameBuilder,
+  driverActivityBuilder,
+  driverFailureMessageCatalog,
+  driverInteractionIndex,
+  driverParseErrorCatalog,
+  executionPromptCoordinator,
+  generatedArtifactEvidenceIndex,
+  implementationBatchContextBuilder,
+  interactionOverlayCodec,
+  kernelEventProjectionBuilder,
+  kernelEventStatusIndex,
+  nativeToolCoordinator,
+  nativeToolProgressEventBuilder,
+  nativeToolProviderLoop,
+  nativeToolProjectionBuilder,
+  nativeToolRepairRunner,
+  nativeToolResourceRecorder,
+  nativeToolResultMessageBuilder,
+  permissionPipeline,
+  planContextIndex,
+  planProjectionBuilder,
+  planReviewGrantProjector,
+  planReviewReportAnalyzer,
+  proposalOnlyProviderRunner,
+  protocolGate,
+  providerContextSupport,
+  providerJsonModeCoordinator,
+  providerRepairMessageBuilder,
+  providerStreamCoordinator,
+  providerTraceRecorder,
+  providerTurnPolicy,
+  repairLoop,
+  requirementProjectionBuilder,
+  resourceManifestBuilder,
+  resourceRequestLoop,
+  resourceRequestResolver,
+  reviewAssembler,
+  reviewDecisionProjection,
+  reviewProjectionBuilder,
+  sessionFailureProjectionBuilder,
+  sessionProgressProjectionBuilder,
+  userGuidanceQueue,
+  userInputPipeline,
+  PROVIDER_REASONING_FLUSH_CHARS,
+  PROVIDER_REASONING_FLUSH_MS,
+} from './sessionDriverComponents.js';
 
 export interface SessionDriverLoopPorts {
   appendEvents(sessionId: string, events: AgentEvent[]): Promise<AgentSessionResult>;
@@ -223,229 +190,6 @@ export interface SessionDecisionResolverInput {
   projectMemoryMode?: ProjectMemoryMode;
   interactionOverlay?: InteractionOverlayContext;
 }
-
-const MAX_DERIVED_MANIFEST_ENTRIES = 240;
-const RESOURCE_MANIFEST_MAX_BYTES = 512 * 1024;
-const MAX_ACTION_BUNDLE_TOTAL_CODE_BYTES = 384 * 1024;
-const providerRepairMessageBuilder = new ProviderRepairMessageBuilder(MAX_ACTION_BUNDLE_TOTAL_CODE_BYTES);
-const acceptedPlanResourceResumePromptBuilder = new AcceptedPlanResourceResumePromptBuilder(providerRepairMessageBuilder);
-const providerPipeline = new ProviderPipeline();
-const providerJsonModeCoordinator = new ProviderJsonModeCoordinator();
-const providerStreamCoordinator = new ProviderStreamCoordinator();
-const providerTraceRecorder = new ProviderTraceRecorder();
-const actionBundleActionInspector = new ActionBundleActionInspector();
-const driverActivityBuilder = new DriverActivityBuilder({
-  providerStageSummary: (stage, part, language) => providerStreamCoordinator.stageSummary(stage, part, language),
-  visibleLanguageForRequest,
-  actionFileTargetPath: (action) => actionBundleActionInspector.actionFileTargetPath(action),
-});
-const permissionPipeline = new PermissionPipeline();
-const userInputPipeline = new UserInputPipeline();
-const userGuidanceQueue = new UserGuidanceQueue();
-const interactionOverlayCodec = new InteractionOverlayCodec();
-const acceptedPlanTargetParser = new AcceptedPlanTargetParser();
-const planReviewGrantProjector = new PlanReviewGrantProjector();
-const planReviewReportAnalyzer = new PlanReviewReportAnalyzer({
-  requiredFileOperationsFromReport: (report) => planReviewGrantProjector.requiredFileOperationsFromReport(report),
-});
-const planContextIndex = new PlanContextIndex({
-  interactionOverlayFromPayload: (payload) => interactionOverlayCodec.fromPayload(payload),
-  executionRootFromPayload: (payload) => AcceptedPlanExecutionRootResolver.fromPayload(payload),
-});
-const planInteractionIndex = new PlanInteractionIndex<SessionPlanContext>({
-  planCardAwaitingDecision: (payload) => planReviewReportAnalyzer.planCardAwaitingDecision(payload),
-  planReviewEventAwaitingDecision: (payload) => planReviewReportAnalyzer.planReviewEventAwaitingDecision(payload),
-  planContextFromEvent: (event, payload) => planContextIndex.contextFromEvent(event, payload),
-  findPlanCard: (events, runId, planId) => planContextIndex.findPlanCard(events, runId, planId),
-  planAlreadyResolved: (events, plan) => planContextIndex.alreadyResolved(events, plan),
-});
-const driverInteractionIndex = new DriverInteractionIndex({
-  latestActiveReviewInteraction: (events) => reviewAssembler().findLatestActiveReviewInteraction(events),
-  latestActivePlanInteraction: (events) => planInteractionIndex.findLatestActivePlanInteraction(events),
-  latestActiveRequirementInteraction: (events) => userInputPipeline.findLatestActiveRequirementInteraction(events),
-  findPlanCard: (events, runId, planId) => planContextIndex.findPlanCard(events, runId, planId),
-  executionRootFromDecision: (input, events) => AcceptedPlanExecutionRootResolver.fromDecision(input, events),
-  buildAcceptedPlan: (input) => acceptedImplementationPlanContextBuilder().build(input),
-  withLatestCheckpoint: (acceptedPlan, events) => acceptedPlanTaskLedger().withLatestCheckpoint(acceptedPlan, events),
-  afterBatch: (acceptedPlan, completedTaskIds) => acceptedPlanTaskLedger().afterBatch(acceptedPlan, completedTaskIds),
-});
-const kernelEventProjectionBuilder = new KernelEventProjectionBuilder({
-  requiredFileOperationsFromReport: (report) => planReviewGrantProjector.requiredFileOperationsFromReport(report),
-  requiredAccessScopesFromReport: (report) => planReviewGrantProjector.requiredAccessScopesFromReport(report),
-  permissionBundlesFromReport: (report) => planReviewGrantProjector.permissionBundlesFromReport(report),
-  gateInterventionsFromReport: (report) => planReviewGrantProjector.gateInterventionsFromReport(report),
-  planReviewFacts: (report) => planReviewReportAnalyzer.facts(report),
-});
-const planProjectionBuilder = new PlanProjectionBuilder({
-  readActionBundle: (proposal) => driverActivityBuilder.readActionBundle(proposal),
-  requiredFileOperationsFromReport: (report) => planReviewGrantProjector.requiredFileOperationsFromReport(report),
-  requiredAccessScopesFromReport: (report) => planReviewGrantProjector.requiredAccessScopesFromReport(report),
-  permissionBundlesFromReport: (report) => planReviewGrantProjector.permissionBundlesFromReport(report),
-  gateInterventionsFromReport: (report) => planReviewGrantProjector.gateInterventionsFromReport(report),
-  planReviewFacts: (report) => planReviewReportAnalyzer.facts(report),
-  interactionOverlayProjection: (overlay) => interactionOverlayCodec.toPayload(overlay as InteractionOverlayContext | undefined),
-  visibleLanguageForRequest,
-});
-const requirementProjectionBuilder = new RequirementProjectionBuilder({
-  visibleLanguageForRequest,
-  interactionOverlayPayload: (payload) => interactionOverlayCodec.toPayload(interactionOverlayCodec.fromPayload(payload)),
-});
-const assistantProjectionBuilder = new AssistantProjectionBuilder({
-  visibleLanguageForRequest,
-  guidanceRevisionTransitionMessage: (language) => providerStreamCoordinator.guidanceRevisionTransitionMessage(language),
-});
-const sessionProgressProjectionBuilder = new SessionProgressProjectionBuilder({
-  interactionOverlayPayload: (overlay) => interactionOverlayCodec.toPayload(overlay),
-  hasFailureOrBlocker: (kernelEvents) => kernelEventStatusIndex.hasFailureOrBlocker(kernelEvents),
-  auditAcceptedPlanBatch: (batch) => acceptedPlanBatchPreflight.audit(batch),
-  actionBundleAdmissionBatch: (proposal) => driverActivityBuilder.proposalActionBundleAdmissionBatch(proposal),
-  acceptedPlanTaskLedger: (accepted) => acceptedPlanTaskLedger().ledger(accepted),
-  acceptedPlanPromptFrame: (accepted, taskLedger) => acceptedPlanTaskLedger().promptFrame(accepted, taskLedger),
-});
-const sessionFailureProjectionBuilder = new SessionFailureProjectionBuilder({
-  actionBatchFailureDetails: (kernelEvents, batch) => actionBatchFailureIndex.details(kernelEvents, batch),
-  actionBatchFailureSummary: (failure) => actionBatchFailureIndex.summary(failure),
-  sessionRunStateEvent: (input) => sessionProgressProjectionBuilder.sessionRunStateEvent(input),
-});
-const reviewProjectionBuilder = new ReviewProjectionBuilder<SessionPlanContext, AcceptedImplementationPlanContext, TaskLedgerSnapshot>({
-  reviewFactLines: (kernelEvents) => reviewAssembler().reviewFactLines(kernelEvents),
-  staticSyntaxReviewFactLines: (kernelEvents) => reviewAssembler().staticSyntaxReviewFactLines(kernelEvents),
-  findReviewFacts: (kernelEvents) => reviewAssembler().findReviewFacts(kernelEvents),
-  concreteContinuationExpectations: (value) => implementationBatchContextBuilder().concreteContinuationExpectations(value),
-  languageForRequest: (userPlan) => visibleLanguageForRequest(userPlan),
-  acceptedPlanContext: (plan) => plan.implementationPlan
-    ? acceptedImplementationPlanContextBuilder().build({ plan, interventionLevel: undefined, executionRoot: plan.executionRoot })
-    : undefined,
-  acceptedPlanBatchCompletedTaskIds: (acceptedPlan, plan, kernelEvents) =>
-    acceptedPlanTaskLedger().batchProgress({ acceptedPlan, proposal: planContextIndex.proposalEnvelope(plan), kernelEvents }).completedTaskIds,
-  acceptedPlanAfterBatch: (acceptedPlan, completedTaskIds) => acceptedPlanTaskLedger().afterBatch(acceptedPlan, completedTaskIds),
-  acceptedPlanTaskLedger: (acceptedPlan) => acceptedPlanTaskLedger().ledger(acceptedPlan),
-  buildReviewFactsContext: (input) => buildReviewFactsContext(input),
-});
-const actionBatchFailureIndex = new ActionBatchFailureIndex();
-const kernelEventStatusIndex = new KernelEventStatusIndex();
-const repairLoop = new RepairLoop();
-const pathIdentity = new PathIdentity();
-const providerContextSupport = new ProviderContextSupport({
-  acceptedContext: (acceptedPlan) => executionPromptCoordinator().sanitizedContext(acceptedPlan),
-});
-const acceptedPlanScopeMatcher = new AcceptedPlanScopeMatcher();
-const acceptedPlanScopeCoverage = new AcceptedPlanScopeCoverage({
-  taskTargets: (task) => acceptedPlanTargetParser.taskTargets(task),
-});
-const acceptedPlanOperationTargetResolver = new AcceptedPlanOperationTargetResolver({
-  normalizeTargetScope: (value, accepted) => acceptedPlanScopeMatcher.normalizeTargetScope(value, accepted),
-  normalizePlanScope: (value) => pathIdentity.normalizePlanScope(value),
-  concreteDirectoryOperationTarget: (value) => planReviewGrantProjector.concreteDirectoryOperationTarget(value),
-  concreteFileOperationTarget: (value) => planReviewGrantProjector.concreteFileOperationTarget(value),
-  exactGrantCapabilityMatches: (grant, capability) => acceptedPlanScopeCoverage.exactGrantCapabilityMatches(grant, capability),
-  actionEffectiveCapability: (action) => actionBundleActionInspector.actionEffectiveCapability(action),
-  actionFileTargetPath: (action) => actionBundleActionInspector.actionFileTargetPath(action),
-});
-const acceptedPlanScopeDecisionOverlay = new AcceptedPlanScopeDecisionOverlay({
-  planAcceptedAutoGrantCapability: (capability) => planReviewGrantProjector.planAcceptedAutoGrantCapability(capability),
-  concreteDirectoryOperationTarget: (value) => planReviewGrantProjector.concreteDirectoryOperationTarget(value),
-  concreteFileOperationTarget: (value) => planReviewGrantProjector.concreteFileOperationTarget(value),
-  normalizeAcceptedPlanExactOperationGrants: (grants, executionRoot) =>
-    planReviewGrantProjector.normalizeAcceptedPlanExactOperationGrants(grants, executionRoot),
-  normalizeTargetForExecutionRoot: (value, executionRoot) =>
-    acceptedPlanScopeMatcher.normalizeTargetForExecutionRoot(value, executionRoot),
-});
-const acceptedPlanBatchPreflight = new AcceptedPlanBatchPreflight({
-  batchActionRecords: (batch) => driverActivityBuilder.batchActionRecords(batch),
-  actionEffectiveCapability: (action) => actionBundleActionInspector.actionEffectiveCapability(action),
-  actionFileTargetPath: (action) => actionBundleActionInspector.actionFileTargetPath(action),
-  deleteActionTargetResourceKind: (action) => actionBundleActionInspector.deleteActionTargetResourceKind(action),
-  deleteActionRecursive: (action) => actionBundleActionInspector.deleteActionRecursive(action),
-  normalizePlanScope: (value) => pathIdentity.normalizePlanScope(value),
-  containsDirectoryPath: (resourcePackets, path) => resourceRequestLoop.containsDirectoryPath(resourcePackets, path),
-});
-const completedWorkUnitFactIndex = new CompletedWorkUnitFactIndex({
-  kernelEventTargets: (record) => kernelEventProjectionBuilder.kernelEventTargets(record),
-  normalizeRelativePath: (value) => pathIdentity.normalizeRelativePath(value),
-  comparablePath: (value) => pathIdentity.comparablePath(value),
-});
-const nativeToolCoordinator = new NativeToolCoordinator();
-const nativeToolTurnHandler = new NativeToolTurnHandler(nativeToolCoordinator);
-const nativeToolRepairCoordinator = new NativeToolRepairCoordinator({
-  conversationActivity: (input) => driverActivityBuilder.conversationActivity(input),
-  parseProposal: (input) => protocolGate().parseAndValidateProposal(input),
-  parseRepairedProposal: (input) => protocolGate().parseAndValidateRepairedProposal(input),
-});
-const acceptedPlanExecutor = new AcceptedPlanExecutor({
-  readActionBundle: (proposal) => driverActivityBuilder.readActionBundle(proposal),
-  operationTargetResolver: acceptedPlanOperationTargetResolver,
-  actionFileTargetPath: (action) => actionBundleActionInspector.actionFileTargetPath(action),
-  fileTargetRefFromPath: (path) => actionBundleActionInspector.fileTargetRefFromPath(path),
-  deleteActionTargetResourceKind: (action) => actionBundleActionInspector.deleteActionTargetResourceKind(action),
-  deleteActionRecursive: (action) => actionBundleActionInspector.deleteActionRecursive(action),
-  kernelExecutionContractId: (report) => planReviewGrantProjector.kernelExecutionContractId(report),
-  proposalTargetScopes: (proposal, accepted) =>
-    acceptedPlanScopeMatcher.proposalTargetScopes(proposal, accepted).map((target) => target.normalized),
-  actionTargetScopes: (action, proposal, accepted) =>
-    acceptedPlanScopeMatcher.actionTargetScopes(action, proposal)
-      .map((target) => acceptedPlanScopeMatcher.normalizeTargetScope(target, accepted))
-      .filter(Boolean),
-  scopeCoveredForCapability: (scope, capability, accepted) =>
-    acceptedPlanScopeCoverage.scopeCoveredForCapability(scope, capability, accepted),
-  resourceEvidenceIndex: resourceEvidenceIndex(),
-});
-const contextFrameBuilder = new ContextFrameBuilder();
-const resourceRequestLoop = new ResourceRequestLoop({
-  maxDerivedManifestEntries: MAX_DERIVED_MANIFEST_ENTRIES,
-});
-const nativeToolProjectionBuilder = new NativeToolProjectionBuilder({
-  conversationActivity: (input) => driverActivityBuilder.conversationActivity(input),
-  packetActivity: (packet, activityId, runId) => resourceRequestLoop.packetActivity(packet, activityId, runId),
-  runningSummary: (toolName, language) => providerStreamCoordinator.nativeToolResolveRunningSummary(toolName, language),
-  completedSummary: (toolName, language) => providerStreamCoordinator.nativeToolResolveCompletedSummary(toolName, language),
-});
-const NATIVE_TOOL_RESULT_MAX_CHARS = 12 * 1024;
-const nativeToolResultMessageBuilder = new NativeToolResultMessageBuilder({
-  duplicateResult: (toolCall, existing) => nativeToolCoordinator.duplicateResult(toolCall, existing),
-  resultFromPacket: (toolCall, packet) => nativeToolCoordinator.resultFromPacket(toolCall, packet),
-}, NATIVE_TOOL_RESULT_MAX_CHARS);
-const nativeToolResourceRecorder = new NativeToolResourceRecorder({
-  packetContentHash: (packet) => nativeToolCoordinator.packetContentHash(packet),
-  addDiscoveredManifestEntries: (manifest, packet) => resourceRequestLoop.addDiscoveredManifestEntries(manifest, packet),
-  packetEvent: (sessionId, packet, ts, id) => resourceRequestLoop.packetEvent(sessionId, packet, ts, id),
-});
-const nativeToolResumeMessageBuilder = new NativeToolResumeMessageBuilder({
-  callToProtocol: (toolCall) => nativeToolCoordinator.callToProtocol(toolCall),
-});
-const nativeToolProgressEventBuilder = new NativeToolProgressEventBuilder();
-const nativeToolProviderLoop = new NativeToolProviderLoop<SessionDriverLoopRunState, PromptEnvelope, LlmTurnResult>({
-  providerPipeline,
-  turnHandler: nativeToolTurnHandler,
-  resumeMessageBuilder: nativeToolResumeMessageBuilder,
-});
-const proposalOnlyProviderRunner = new ProposalOnlyProviderRunner<SessionDriverLoopRunState, LlmTurnResult>({
-  providerPipeline,
-  repairCoordinator: nativeToolRepairCoordinator,
-});
-const nativeToolRepairRunner = new NativeToolRepairRunner({
-  repairCoordinator: nativeToolRepairCoordinator,
-});
-const PROVIDER_REASONING_FLUSH_CHARS = 768;
-const PROVIDER_REASONING_FLUSH_MS = 120;
-const SIDE_EFFECT_CAPABILITIES = new Set([
-  'fs.write',
-  'fs.patch',
-  'fs.delete',
-  'fs.rename',
-  'process.exec',
-  'network.egress',
-  'git.write',
-  'git.push',
-  'config.modify',
-  'browser.control',
-  'provider.egress',
-]);
-const providerTurnPolicy = new ProviderTurnPolicy({
-  sideEffectCapabilities: SIDE_EFFECT_CAPABILITIES,
-});
-const driverFailureMessageCatalog = new DriverFailureMessageCatalog();
-const driverParseErrorCatalog = new DriverParseErrorCatalog();
 
 export class SessionDriverLoop {
   private readonly agentRunReactor: AgentRunReactor<SessionDriverLoopRunState>;
@@ -1649,130 +1393,4 @@ export class SessionDriverLoopError extends Error {
     super(message);
     this.name = 'SessionDriverLoopError';
   }
-}
-
-function resourceManifestBuilder(): ResourceManifestBuilder {
-  return new ResourceManifestBuilder({
-    maxDerivedManifestEntries: MAX_DERIVED_MANIFEST_ENTRIES,
-    resourceManifestMaxBytes: RESOURCE_MANIFEST_MAX_BYTES,
-    comparablePath: (value) => pathIdentity.comparablePath(value),
-    isAbsolutePath: (value) => pathIdentity.isAbsolutePath(value),
-  });
-}
-
-function resourceRequestResolver(): ResourceRequestResolver {
-  return new ResourceRequestResolver();
-}
-
-function resourceEvidenceIndex(): ResourceEvidenceIndex {
-  return new ResourceEvidenceIndex({
-    normalizeTarget: (value) => pathIdentity.normalizePlanScope(value),
-    clip,
-  });
-}
-
-function generatedArtifactEvidenceIndex(): GeneratedArtifactEvidenceIndex {
-  return new GeneratedArtifactEvidenceIndex({
-    normalizeRelativePath: (value) => pathIdentity.normalizeRelativePath(value),
-    comparablePath: (value) => pathIdentity.comparablePath(value),
-    batchActionRecords: (batch) => driverActivityBuilder.batchActionRecords(batch),
-    actionEffectiveCapability: (action) => actionBundleActionInspector.actionEffectiveCapability(action),
-    actionFileTargetPath: (action) => actionBundleActionInspector.actionFileTargetPath(action),
-    completedWorkUnitFacts: (events) => completedWorkUnitFactIndex.completedWorkUnitFacts(events),
-    completedActionMatches: (actionId, targetPath, completed) =>
-      completedWorkUnitFactIndex.completedActionMatches(actionId, targetPath, completed),
-    codeBlockContent: (block) => completedWorkUnitFactIndex.codeBlockContent(block),
-    resolveRelativePath: (value, rootId, roots) =>
-      resourceRequestResolver().resolveRelativePath(value, rootId, roots),
-  });
-}
-
-function implementationBatchContextBuilder(): ImplementationBatchContextBuilder {
-  return new ImplementationBatchContextBuilder({
-    concreteFileOperationTarget: (value) => planReviewGrantProjector.concreteFileOperationTarget(value),
-  });
-}
-
-function acceptedImplementationPlanContextBuilder(): AcceptedImplementationPlanContextBuilder {
-  return new AcceptedImplementationPlanContextBuilder({
-    normalizePlanScope: (value) => pathIdentity.normalizePlanScope(value),
-    uniqueStrings: (values) => driverActivityBuilder.uniqueStrings(values),
-    acceptedPlanTaskTargets: (record) => acceptedPlanTargetParser.taskTargets(record),
-    exactOperationGrantsFromImplementationPlan: (plan, executionRoot) =>
-      planReviewGrantProjector.exactOperationGrantsFromImplementationPlan(plan, executionRoot),
-    exactOperationGrantsFromPlanReviewReport: (report, executionRoot) =>
-      planReviewGrantProjector.exactOperationGrantsFromPlanReviewReport(report, executionRoot),
-    accessScopesFromImplementationPlan: (plan) => planReviewGrantProjector.accessScopesFromImplementationPlan(plan),
-    requiredAccessScopesFromReport: (report) => planReviewGrantProjector.requiredAccessScopesFromReport(report),
-  });
-}
-
-function acceptedPlanAdmission(): AcceptedPlanAdmission {
-  return new AcceptedPlanAdmission({
-    scopeMatcher: new AcceptedPlanScopeMatcher(),
-    fileOperationFreshnessReasons: (accepted, proposal, resourcePackets) =>
-      acceptedPlanExecutor.fileOperationFreshnessValidationReasons(accepted, proposal, resourcePackets),
-  });
-}
-
-function acceptedPlanTaskLedger(): AcceptedPlanTaskLedgerCoordinator {
-  return new AcceptedPlanTaskLedgerCoordinator({
-    workUnitIdsFromKernelEvents: (events) => kernelEventStatusIndex.workUnitIds(events),
-    actionBatchHasFailureOrBlocker: (events) => kernelEventStatusIndex.hasFailureOrBlocker(events),
-  });
-}
-
-function reviewAssembler(): ReviewAssembler {
-  return new ReviewAssembler({
-    completedWorkUnitFacts: (events) => completedWorkUnitFactIndex.completedWorkUnitFacts(events),
-    batchActionRecords: (batch) => driverActivityBuilder.batchActionRecords(batch),
-    actionEffectiveCapability: (action) => actionBundleActionInspector.actionEffectiveCapability(action),
-    actionFileTargetPath: (action) => actionBundleActionInspector.actionFileTargetPath(action),
-    normalizeAcceptedPlanTargetScope: (value, accepted) =>
-      acceptedPlanScopeMatcher.normalizeTargetScope(value, accepted),
-    comparablePath: (value) => pathIdentity.comparablePath(value),
-    resourceTextForTarget: (packets, target) => resourceEvidenceIndex().textForTarget(packets, target),
-  });
-}
-
-function reviewDecisionProjection(): ReviewDecisionProjectionBuilder {
-  return new ReviewDecisionProjectionBuilder();
-}
-
-function protocolGate(): ProtocolGate {
-  const validator = proposalSemanticValidator();
-  return new ProtocolGate({
-    canonicalizeWriteActionSourceBlockRefs: (proposal) => validator.canonicalizeWriteActionSourceBlockRefs(proposal),
-    ensureReviewableExpectations: (proposal) => executionPromptCoordinator().ensureReviewableExpectations(proposal),
-    validateProposalSemantics: (proposal, options) => validator.validateProposalSemantics(proposal, options),
-  });
-}
-
-function proposalSemanticValidator(): ProposalSemanticValidator {
-  return new ProposalSemanticValidator({
-    maxActionBundleTotalCodeBytes: MAX_ACTION_BUNDLE_TOTAL_CODE_BYTES,
-    sideEffectCapabilities: SIDE_EFFECT_CAPABILITIES,
-    readActionBundle: (proposal) => driverActivityBuilder.readActionBundle(proposal),
-    actionEffectiveCapability: (action) => actionBundleActionInspector.actionEffectiveCapability(action),
-    actionFileTargetPath: (action) => actionBundleActionInspector.actionFileTargetPath(action),
-    deleteActionTargetResourceKind: (action) => actionBundleActionInspector.deleteActionTargetResourceKind(action),
-    deleteActionRecursive: (action) => actionBundleActionInspector.deleteActionRecursive(action),
-  });
-}
-
-function executionPromptCoordinator(): ExecutionPromptCoordinator<SessionPlanContext> {
-  const validator = proposalSemanticValidator();
-  return new ExecutionPromptCoordinator<SessionPlanContext>({
-    maxActionBundleTotalCodeBytes: MAX_ACTION_BUNDLE_TOTAL_CODE_BYTES,
-    sideEffectCapabilities: SIDE_EFFECT_CAPABILITIES,
-    objectRecord,
-    stringValue,
-    planId: (plan) => plan.planId,
-    actionEffectiveCapability: (action) => actionBundleActionInspector.actionEffectiveCapability(action),
-    isDetailedUserPlanMarkdown: (userPlan) => validator.isDetailedUserPlanMarkdown(userPlan),
-    defaultActionBundleUserPlanMarkdown: (input) => validator.defaultActionBundleUserPlanMarkdown(input),
-    expectationsHaveDescription: (value) => validator.expectationsHaveDescription(value),
-    defaultValidationExpectation: (actions) => validator.defaultValidationExpectation(actions),
-    defaultReviewExpectation: (actions) => validator.defaultReviewExpectation(actions),
-  });
 }
