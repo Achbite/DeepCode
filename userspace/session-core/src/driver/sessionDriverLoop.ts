@@ -122,7 +122,6 @@ import {
   ResourceRequestLoop,
   ResourceRequestResolver,
   type GeneratedArtifactEvidence,
-  type ResourceRequestResolution,
 } from './context/index.js';
 import { DriverFailureMessageCatalog, DriverParseErrorCatalog } from './diagnostics/index.js';
 import type { RequirementRecord } from '../requirement/types.js';
@@ -674,7 +673,7 @@ export class SessionDriverLoop {
       runRepair: (handlerInput, state, stage, messages) =>
         this.providerRuntimeBridge.llm(handlerInput.profileId, state, stage, messages),
       submitActionProposal: (handlerInput, state, prompt, proposal, fallback) =>
-        this.submitActionProposal(handlerInput, state, prompt, proposal, fallback),
+        this.actionProposalSubmitter.submit(handlerInput, state, prompt, proposal, fallback),
       submitNonExecutableProposal: (state, proposal, fallback) =>
         this.actionProposalSubmitter.submitNonExecutable(state, proposal, fallback),
     });
@@ -1016,7 +1015,7 @@ export class SessionDriverLoop {
       createId: (prefix) => this.id(prefix),
       append: (sessionId, events) => this.append(sessionId, events),
       reviseAnswer: (handlerInput, state, proposal) =>
-        this.maybeReviseTerminalAnswerWithGuidance(handlerInput, state, proposal),
+        this.terminalGuidanceRevisionCoordinator.revise(handlerInput, state, proposal),
       answerEvent: (answerSessionId, proposal, ts, id) =>
         assistantProjectionBuilder.answerEvent(answerSessionId, proposal, ts, id),
       finalDiagnosticEvent: (diagnosticSessionId, summary, ts, id) =>
@@ -1039,7 +1038,7 @@ export class SessionDriverLoop {
       handleResourceRequest: (handlerInput) =>
         this.resourceRequestProposalHandler.handle(handlerInput),
       submitActionProposal: (handlerInput, state, prompt, proposal, fallback) =>
-        this.submitActionProposal(handlerInput, state, prompt, proposal, fallback),
+        this.actionProposalSubmitter.submit(handlerInput, state, prompt, proposal, fallback),
       submitNonExecutableProposal: (state, proposal, fallback) =>
         this.actionProposalSubmitter.submitNonExecutable(state, proposal, fallback),
     });
@@ -1052,7 +1051,7 @@ export class SessionDriverLoop {
       buildProviderTurnContract: (contractInput) =>
         contextFrameBuilder.buildSessionProviderTurnContract(contractInput),
       callProviderAndParse: (handlerInput, state, prompt) =>
-        this.callProviderAndParse(handlerInput, state, prompt),
+        this.providerProposalCoordinator.callAndParse(handlerInput, state, prompt),
       createError: (code, message) => new SessionDriverLoopError(code, message),
       requirementRecordFromProposal: (proposalInput) =>
         userInputPipeline.requirementRecordFromProposal(proposalInput),
@@ -1172,7 +1171,13 @@ export class SessionDriverLoop {
       resolveResourceRequest: (manifest, request, roots) =>
         resourceRequestResolver().resolve(manifest, request, roots),
       repairResourceRequest: (input, state, prompt, proposal, resolution) =>
-        this.repairResourceRequest(input, state, prompt, proposal, resolution),
+        this.resourceRequestRepairCoordinator.repair({
+          state,
+          prompt,
+          proposal,
+          resolutionDiagnostic: resourceRequestLoop.resolutionDiagnostic(resolution).fallback,
+          runRepair: (stage, messages) => this.providerRuntimeBridge.llm(input.profileId, state, stage, messages),
+        }),
       answerEvent: (sessionId, proposal, ts, id) =>
         assistantProjectionBuilder.answerEvent(sessionId, proposal, ts, id),
       finalDiagnosticEvent: (sessionId, content, ts, id) =>
@@ -1197,7 +1202,7 @@ export class SessionDriverLoop {
       callResourceResume: (input, state, prompt, proposal, packet) =>
         this.acceptedPlanReadOnlyTaskExecutor.callResourceResume(input, state, prompt, proposal, packet),
       submitActionProposal: (input, state, prompt, proposal, fallback) =>
-        this.submitActionProposal(input, state, prompt, proposal, fallback),
+        this.actionProposalSubmitter.submit(input, state, prompt, proposal, fallback),
       submitNonExecutableProposal: (state, proposal, fallback) =>
         this.actionProposalSubmitter.submitNonExecutable(state, proposal, fallback),
       errorMessage: (error) => error instanceof Error ? error.message : String(error),
@@ -1300,7 +1305,7 @@ export class SessionDriverLoop {
           resumeResourcePackets: true,
         }),
       submitActionProposal: (handlerInput, state, prompt, proposal, fallback) =>
-        this.submitActionProposal(handlerInput, state, prompt, proposal, fallback),
+        this.actionProposalSubmitter.submit(handlerInput, state, prompt, proposal, fallback),
       submitNonExecutableProposal: (state, proposal, fallback) =>
         this.actionProposalSubmitter.submitNonExecutable(state, proposal, fallback),
       requirementRecordFromProposal: (recordInput) =>
@@ -1331,9 +1336,9 @@ export class SessionDriverLoop {
       deleteAdmissionReasons: (batch, resourcePackets) =>
         acceptedPlanBatchPreflight.deleteReasons(batch, resourcePackets),
       repairActionBundleAdmission: (handlerInput, state, prompt, proposal, reasons, fallback) =>
-        this.repairActionBundleAdmission(handlerInput, state, prompt, proposal, reasons, fallback),
+        this.actionBundleAdmissionCoordinator.repair(handlerInput, state, prompt, proposal, reasons, fallback),
       submitAcceptedPlanActionProposal: (handlerInput, state, prompt, proposal, fallback) =>
-        this.submitAcceptedPlanActionProposal(handlerInput, state, prompt, proposal, fallback),
+        this.acceptedPlanActionProposalSubmitter.submit(handlerInput, state, prompt, proposal, fallback),
       submitProposal: (state, proposal, requestId) => this.kernel({
         command: {
           kind: 'proposalSubmit',
@@ -1600,7 +1605,7 @@ export class SessionDriverLoop {
           lastResult,
         }),
       callProviderAndParse: (handlerInput, state, prompt) =>
-        this.callProviderAndParse(handlerInput, state, prompt),
+        this.providerProposalCoordinator.callAndParse(handlerInput, state, prompt),
       route: (routerInput) => this.proposalRouter.route(routerInput),
       appendDriverFailure: async (state, error) => {
         if (!(error instanceof SessionDriverLoopError)) return null;
@@ -1686,69 +1691,6 @@ export class SessionDriverLoop {
     }
 
     return lastResult;
-  }
-
-  private async maybeReviseTerminalAnswerWithGuidance(
-    input: SessionDriverLoopInput,
-    state: SessionDriverLoopRunState,
-    draftAnswer: ProposalEnvelope
-  ): Promise<AgentSessionResult | null> {
-    return this.terminalGuidanceRevisionCoordinator.revise(input, state, draftAnswer);
-  }
-
-  private async callProviderAndParse(
-    input: SessionDriverLoopInput,
-    state: SessionDriverLoopRunState,
-    prompt: PromptEnvelope
-  ): Promise<ProposalEnvelope> {
-    return this.providerProposalCoordinator.callAndParse(input, state, prompt);
-  }
-
-  private async repairResourceRequest(
-    input: SessionDriverLoopInput,
-    state: SessionDriverLoopRunState,
-    prompt: PromptEnvelope,
-    proposal: ProposalEnvelope,
-    resolution: ResourceRequestResolution
-  ): Promise<ProposalEnvelope> {
-    return this.resourceRequestRepairCoordinator.repair({
-      state,
-      prompt,
-      proposal,
-      resolutionDiagnostic: resourceRequestLoop.resolutionDiagnostic(resolution).fallback,
-      runRepair: (stage, messages) => this.providerRuntimeBridge.llm(input.profileId, state, stage, messages),
-    });
-  }
-
-  private async repairActionBundleAdmission(
-    input: SessionDriverLoopInput,
-    state: SessionDriverLoopRunState,
-    prompt: PromptEnvelope,
-    proposal: ProposalEnvelope,
-    reasons: string[],
-    fallback: AgentSessionResult
-  ): Promise<AgentSessionResult> {
-    return this.actionBundleAdmissionCoordinator.repair(input, state, prompt, proposal, reasons, fallback);
-  }
-
-  private async submitActionProposal(
-    input: SessionDriverLoopInput,
-    state: SessionDriverLoopRunState,
-    prompt: PromptEnvelope,
-    proposal: ProposalEnvelope,
-    fallback: AgentSessionResult
-  ): Promise<AgentSessionResult> {
-    return this.actionProposalSubmitter.submit(input, state, prompt, proposal, fallback);
-  }
-
-  private async submitAcceptedPlanActionProposal(
-    input: SessionDriverLoopInput,
-    state: SessionDriverLoopRunState,
-    prompt: PromptEnvelope,
-    proposal: ProposalEnvelope,
-    fallback: AgentSessionResult
-  ): Promise<AgentSessionResult> {
-    return this.acceptedPlanActionProposalSubmitter.submit(input, state, prompt, proposal, fallback);
   }
 
   private async emitProjectionDelta(
