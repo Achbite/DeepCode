@@ -1,5 +1,5 @@
 import type { KernelPlanReviewReport } from '@deepcode/protocol';
-import type { ActionBundleDraft, ValidationExpectationDraft } from '../agent-plan/types.js';
+import type { ActionBundleDraft, ValidationExpectationDraft } from '../protocol/types.js';
 
 export type ReviewPacketStatus = 'selfChecked' | 'waitingUserReview' | 'accepted' | 'revisionRequested';
 

@@ -14,7 +14,7 @@ import type {
   PermissionRequest,
   ProjectionDelta,
 } from '@deepcode/protocol';
-import type { AgentPlanParts } from './agent-plan/types.js';
+import type { AgentPlanParts } from './protocol/types.js';
 import type { ResourcePacket, ResourceRequest } from './context/types.js';
 import type { ReviewPacket } from './review/types.js';
 import { isInternalOrchestrationStage, isMainTimelineActivityShape } from './timelineFilter.js';

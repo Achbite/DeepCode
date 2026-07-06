@@ -13,9 +13,9 @@ import type {
   ResourcePacket,
 } from '../../context/types.js';
 import type { AcceptedImplementationPlanContext } from '../../accepted-plan/types.js';
-import type { ProposalEnvelope, ResourceRequestDraft } from '../../agent-plan/types.js';
+import type { ProposalEnvelope, ResourceRequestDraft } from '../../protocol/types.js';
 import type { PromptEnvelope } from '../../prompt/types.js';
-import type { ProviderTurnContract } from '../runFrame.js';
+import type { DriverProviderTurnFrame } from '../runFrame.js';
 import type { PlanContext } from '../proposal/planContextIndex.js';
 import type { AcceptedPlanReadOnlyResourceCompletion } from './acceptedPlanExecutor.js';
 
@@ -59,7 +59,7 @@ export interface AcceptedPlanReadOnlyResourceResumeInput<State extends AcceptedP
   callProposalOnly(input: {
     state: State;
     prompt: PromptEnvelope;
-    contract: ProviderTurnContract;
+    contract: DriverProviderTurnFrame;
     stage: string;
     messages: LlmChatRequest['messages'];
   }): Promise<string | ProposalEnvelope>;
@@ -142,7 +142,7 @@ export interface AcceptedPlanReadOnlyTaskExecutorPorts<
     input: Input,
     state: State,
     prompt: PromptEnvelope,
-    contract: ProviderTurnContract,
+    contract: DriverProviderTurnFrame,
     stage: string,
     messages: LlmChatRequest['messages']
   ): Promise<string | ProposalEnvelope>;

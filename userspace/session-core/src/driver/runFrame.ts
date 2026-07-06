@@ -64,7 +64,7 @@ export interface ToolIntentTemplate {
   readonly evidencePolicy?: string;
 }
 
-export interface ProviderTurnContract {
+export interface DriverProviderTurnFrame {
   readonly schemaVersion: 'deepcode.session.provider-turn-contract.v1';
   readonly contractId: string;
   readonly sessionId: string;

@@ -1,5 +1,5 @@
 import type { AgentContextAttachment, AgentEvent } from '@deepcode/protocol';
-import type { ProposalEnvelope } from '../../agent-plan/types.js';
+import type { ProposalEnvelope } from '../../protocol/types.js';
 import type {
   ContextAssemblyInput,
   ContextAssemblyRecord,
@@ -16,7 +16,7 @@ import type {
 } from '../../context/types.js';
 import type { RequirementRecord } from '../../requirement/types.js';
 import type { PromptEnvelope } from '../../prompt/types.js';
-import type { ProviderTurnContract } from '../runFrame.js';
+import type { DriverProviderTurnFrame } from '../runFrame.js';
 
 export interface RequirementConfirmationInput {
   sessionId: string;
@@ -40,7 +40,7 @@ export interface RequirementConfirmationState {
   generatedArtifactEvidence: { size: number };
   cachePlan?: PromptCachePlan;
   contextAssembly?: ContextAssemblyRecord;
-  providerTurnContract?: ProviderTurnContract;
+  providerTurnFrame?: DriverProviderTurnFrame;
 }
 
 export interface RequirementConfirmationCoordinatorPorts<
@@ -66,7 +66,7 @@ export interface RequirementConfirmationCoordinatorPorts<
     generatedArtifactCount: number;
     repairPolicy: 'deterministicIntervention';
     nextActionInstruction: string;
-  }): ProviderTurnContract;
+  }): DriverProviderTurnFrame;
   callProviderAndParse(input: Input, state: State, prompt: PromptEnvelope): Promise<ProposalEnvelope>;
   createError(code: string, message: string): Error;
   requirementRecordFromProposal(input: {
@@ -133,7 +133,7 @@ export class RequirementConfirmationCoordinator<
     state.cachePlan = assembledContext.cachePlan;
     state.contextAssembly = assembledContext.contextAssembly;
     const prompt = assembledContext.prompt;
-    state.providerTurnContract = this.ports.buildProviderTurnContract({
+    state.providerTurnFrame = this.ports.buildProviderTurnContract({
       contractId: this.ports.createId('provider-turn-contract-requirement'),
       sessionId: state.sessionId,
       runId: state.runId,

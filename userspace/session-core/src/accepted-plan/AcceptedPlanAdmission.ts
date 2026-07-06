@@ -1,4 +1,4 @@
-import type { ProposalEnvelope } from '../agent-plan/types.js';
+import type { ProposalEnvelope } from '../protocol/types.js';
 import type { ResourcePacket } from '../context/types.js';
 import type { AcceptedPlanScopeMatcher } from './AcceptedPlanScopeMatcher.js';
 import type {

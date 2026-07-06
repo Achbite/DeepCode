@@ -1,5 +1,5 @@
 import type { AgentEvent } from '@deepcode/protocol';
-import type { ProposalEnvelope } from '../../agent-plan/types.js';
+import type { ProposalEnvelope } from '../../protocol/types.js';
 import type { UserGuidanceEvent } from '../../context/index.js';
 
 export type AssistantProjectionLanguage = 'zh-CN' | 'en-US';

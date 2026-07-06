@@ -14,7 +14,7 @@ import type {
 } from '../../context/types.js';
 import type { RequirementRecord } from '../../requirement/types.js';
 import type { PromptEnvelope } from '../../prompt/types.js';
-import type { ProviderTurnContract } from '../runFrame.js';
+import type { DriverProviderTurnFrame } from '../runFrame.js';
 
 export interface ProviderTurnContextState {
   sessionId: string;
@@ -38,7 +38,7 @@ export interface ProviderTurnContextState {
   generatedArtifactEvidence: Map<string, unknown>;
   cachePlan?: unknown;
   contextAssembly?: ContextAssemblyRecord;
-  providerTurnContract?: ProviderTurnContract;
+  providerTurnFrame?: DriverProviderTurnFrame;
 }
 
 export interface ProviderTurnContextInput {
@@ -86,7 +86,7 @@ export interface ProviderTurnContextCoordinatorPorts<State extends ProviderTurnC
     currentTaskContext?: CurrentTaskContext;
     resourcePackets: ResourcePacket[];
     generatedArtifactCount: number;
-  }): ProviderTurnContract;
+  }): DriverProviderTurnFrame;
 }
 
 export class ProviderTurnContextCoordinator<State extends ProviderTurnContextState> {
@@ -131,7 +131,7 @@ export class ProviderTurnContextCoordinator<State extends ProviderTurnContextSta
 
     const lastResult = await this.appendConsumedUserGuidanceEvents(state, input.lastResult);
     const prompt = assembledContext.prompt;
-    state.providerTurnContract = this.ports.buildProviderTurnContract({
+    state.providerTurnFrame = this.ports.buildProviderTurnContract({
       contractId: input.contractId,
       sessionId: state.sessionId,
       runId: state.runId,

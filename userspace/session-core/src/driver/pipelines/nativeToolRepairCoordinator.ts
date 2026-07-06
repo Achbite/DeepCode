@@ -2,7 +2,7 @@ import type {
   AgentConversationActivity,
   ProjectionDelta,
 } from '@deepcode/protocol';
-import type { ProposalEnvelope } from '../../agent-plan/types.js';
+import type { ProposalEnvelope } from '../../protocol/types.js';
 import type {
   NativeToolCallProposal,
   NativeToolReadLedgerEntry,

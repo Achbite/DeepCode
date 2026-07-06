@@ -1,5 +1,5 @@
 import type { KernelPlanReviewReport } from '@deepcode/protocol';
-import type { ActionBundleDraft } from '../agent-plan/types.js';
+import type { ActionBundleDraft } from '../protocol/types.js';
 import type { AutoConfirmDecision } from '../confirmation/types.js';
 import type { ApprovedTaskQueue, DraftTask, DraftTaskQueue, RepairBudget } from './types.js';
 

@@ -4,7 +4,7 @@ import {
   type ProposalEnvelope,
   type ReviewExpectationDraft,
   type ValidationExpectationDraft,
-} from '../../agent-plan/types.js';
+} from '../../protocol/types.js';
 
 export interface ProposalSemanticValidatorPorts {
   maxActionBundleTotalCodeBytes: number;

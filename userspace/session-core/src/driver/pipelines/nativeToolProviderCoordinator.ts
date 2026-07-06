@@ -3,7 +3,7 @@ import type {
   ProjectionDelta,
   ToolDefinition,
 } from '@deepcode/protocol';
-import type { ProposalEnvelope } from '../../agent-plan/types.js';
+import type { ProposalEnvelope } from '../../protocol/types.js';
 import type {
   ResourceManifest,
   ResourcePacket,
@@ -20,7 +20,7 @@ import type {
   NativeToolReadSignature,
 } from '../../provider/providerStreamParts.js';
 import type { PromptEnvelope } from '../../prompt/types.js';
-import type { ProviderTurnContract } from '../runFrame.js';
+import type { DriverProviderTurnFrame } from '../runFrame.js';
 import type { NativeToolRepairDuplicate } from './nativeToolRepairCoordinator.js';
 import type { NativeToolRepairRunner } from './nativeToolRepairRunner.js';
 import type { NativeToolHandlerPortsFactory } from './nativeToolHandlerPortsFactory.js';
@@ -77,7 +77,7 @@ export interface NativeToolProviderCoordinatorInput<TState extends NativeToolPro
   profileId?: string;
   state: TState;
   prompt: PromptEnvelope;
-  contract: ProviderTurnContract;
+  contract: DriverProviderTurnFrame;
 }
 
 export class NativeToolProviderCoordinator<

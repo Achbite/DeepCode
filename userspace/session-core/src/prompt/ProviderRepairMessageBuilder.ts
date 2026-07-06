@@ -1,6 +1,6 @@
 import type { LlmChatRequest } from '@deepcode/protocol';
-import { actionBundleProtocolShapeLines, actionBundleProtocolShapeReference, resourceRequestProtocolShapeLine } from '../agent-plan/protocolContract.js';
-import type { ProposalEnvelope } from '../agent-plan/types.js';
+import { actionBundleProtocolShapeLines, actionBundleProtocolShapeReference, resourceRequestProtocolShapeLine } from '../protocol/protocolContract.js';
+import type { ProposalEnvelope } from '../protocol/types.js';
 import type { NativeToolCallProposal } from '../provider/providerStreamParts.js';
 import type { PromptEnvelope } from './types.js';
 import { RepairProviderTurnContractBuilder, type RepairProviderTurnContractInput } from './RepairProviderTurnContractBuilder.js';

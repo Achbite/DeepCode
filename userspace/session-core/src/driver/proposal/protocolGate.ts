@@ -1,5 +1,5 @@
-import { parseProposalEnvelope } from '../../agent-plan/protocolV3.js';
-import { AgentPlanParseError, type ProposalEnvelope, type ProposalEnvelopeSource } from '../../agent-plan/types.js';
+import { parseProposalEnvelope } from '../../protocol/protocolV3.js';
+import { AgentPlanParseError, type ProposalEnvelope, type ProposalEnvelopeSource } from '../../protocol/types.js';
 
 export interface ProtocolGatePorts {
   canonicalizeWriteActionSourceBlockRefs(proposal: ProposalEnvelope): void;

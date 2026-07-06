@@ -4,12 +4,12 @@ import type {
   LlmChatRequest,
   ProjectionDelta,
 } from '@deepcode/protocol';
-import type { ProposalEnvelope } from '../../agent-plan/types.js';
+import type { ProposalEnvelope } from '../../protocol/types.js';
 import type { ProviderEmptyProposalRetryOptions } from '../../provider/ProviderEmptyProposalRetry.js';
 import type { NativeToolTurnResult } from '../../provider/NativeToolTurnHandler.js';
 import type { NativeToolCallProposal } from '../../provider/providerStreamParts.js';
 import type { PromptEnvelope } from '../../prompt/types.js';
-import type { ProviderTurnContract } from '../runFrame.js';
+import type { DriverProviderTurnFrame } from '../runFrame.js';
 import type {
   NativeToolProviderCoordinator,
   NativeToolProviderCoordinatorState,
@@ -67,7 +67,7 @@ export class ProviderRuntimeBridge<
     profileId?: string;
     state: State;
     prompt: PromptEnvelope;
-    contract: ProviderTurnContract;
+    contract: DriverProviderTurnFrame;
   }): Promise<string | ProposalEnvelope> {
     return this.dependencies.nativeToolProviderCoordinator.run(input);
   }
@@ -76,7 +76,7 @@ export class ProviderRuntimeBridge<
     profileId?: string;
     state: State;
     prompt: PromptEnvelope;
-    contract: ProviderTurnContract;
+    contract: DriverProviderTurnFrame;
     stage: string;
     messages?: LlmChatRequest['messages'];
   }): Promise<string | ProposalEnvelope> {

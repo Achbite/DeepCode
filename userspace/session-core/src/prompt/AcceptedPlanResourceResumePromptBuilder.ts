@@ -1,5 +1,5 @@
-import { resourceRequestProtocolShapeLine } from '../agent-plan/protocolContract.js';
-import type { ProposalEnvelope } from '../agent-plan/types.js';
+import { resourceRequestProtocolShapeLine } from '../protocol/protocolContract.js';
+import type { ProposalEnvelope } from '../protocol/types.js';
 import type { ResourcePacket } from '../context/types.js';
 import type { ProviderRepairMessageBuilder, ProviderRepairMessageState } from './ProviderRepairMessageBuilder.js';
 

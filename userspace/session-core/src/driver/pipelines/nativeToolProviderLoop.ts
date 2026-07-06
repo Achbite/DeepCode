@@ -2,7 +2,7 @@ import type {
   LlmChatRequest,
   ToolDefinition,
 } from '@deepcode/protocol';
-import type { ProposalEnvelope } from '../../agent-plan/types.js';
+import type { ProposalEnvelope } from '../../protocol/types.js';
 import type { ProviderEmptyProposalRetryOptions } from '../../provider/ProviderEmptyProposalRetry.js';
 import type {
   NativeToolHandlingResult,
@@ -15,13 +15,13 @@ import type {
   ProviderPipelineRunTurnInput,
   ProviderPipelineTurn,
 } from './providerPipeline.js';
-import type { ProviderTurnContract } from '../runFrame.js';
+import type { DriverProviderTurnFrame } from '../runFrame.js';
 
 export interface NativeToolProviderPipelineLike<
   TState extends NativeToolTurnHandlerState,
   TTurn extends ProviderPipelineTurn,
 > {
-  messages(contract: ProviderTurnContract): LlmChatRequest['messages'];
+  messages(contract: DriverProviderTurnFrame): LlmChatRequest['messages'];
   runWithNativeTools(input: ProviderPipelineRunTurnInput<TState, TTurn>): Promise<TTurn>;
 }
 
@@ -59,7 +59,7 @@ export interface NativeToolProviderLoopInput<
   profileId?: string;
   state: TState;
   prompt: TPrompt;
-  contract: ProviderTurnContract;
+  contract: DriverProviderTurnFrame;
   providerTools: ToolDefinition[];
   handlerPorts: NativeToolTurnHandlerPorts<TState, TPrompt, TTurn>;
   runTurn(

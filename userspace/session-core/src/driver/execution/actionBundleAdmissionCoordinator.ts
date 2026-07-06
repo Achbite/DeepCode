@@ -1,5 +1,5 @@
 import type { AgentContextAttachment, AgentEvent, AgentSessionResult } from '@deepcode/protocol';
-import type { ProposalEnvelope, ResourceRequestDraft } from '../../agent-plan/types.js';
+import type { ProposalEnvelope, ResourceRequestDraft } from '../../protocol/types.js';
 import type { PromptEnvelope } from '../../prompt/types.js';
 import type { RequirementRecord } from '../../requirement/types.js';
 

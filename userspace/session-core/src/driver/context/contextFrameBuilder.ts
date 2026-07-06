@@ -2,7 +2,7 @@ import type {
   ProviderContextFrame,
   ProviderProjectionVisibility,
   ProviderRepairPolicy,
-  ProviderTurnContract,
+  DriverProviderTurnFrame,
   ProviderTurnMode,
   ToolIntentTemplate,
 } from '../runFrame.js';
@@ -60,7 +60,7 @@ export interface BuildSessionProviderTurnContractInput {
 }
 
 export class ContextFrameBuilder {
-  buildProviderTurnContract(input: BuildProviderTurnContractInput): ProviderTurnContract {
+  buildProviderTurnContract(input: BuildProviderTurnContractInput): DriverProviderTurnFrame {
     const frames: ProviderContextFrame[] = [
       {
         kind: 'SystemContract',
@@ -169,7 +169,7 @@ export class ContextFrameBuilder {
     };
   }
 
-  buildSessionProviderTurnContract(input: BuildSessionProviderTurnContractInput): ProviderTurnContract {
+  buildSessionProviderTurnContract(input: BuildSessionProviderTurnContractInput): DriverProviderTurnFrame {
     return this.buildProviderTurnContract({
       contractId: input.contractId,
       sessionId: input.sessionId,

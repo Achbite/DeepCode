@@ -1,7 +1,7 @@
 import type { LlmChatRequest } from '@deepcode/protocol';
 import type {
   ProviderContextFrame,
-  ProviderTurnContract,
+  DriverProviderTurnFrame,
   ToolIntentTemplate,
 } from '../runFrame.js';
 import {
@@ -57,7 +57,7 @@ export interface ProviderPipelineTurn {
 export interface ProviderPipelineRunTurnInput<TState, TTurn extends ProviderPipelineTurn> {
   profileId?: string;
   state: TState;
-  contract: ProviderTurnContract;
+  contract: DriverProviderTurnFrame;
   stage: string;
   messages?: LlmChatRequest['messages'];
   options?: ProviderEmptyProposalRetryOptions;
@@ -74,7 +74,7 @@ export interface ProviderPipelineRunTurnInput<TState, TTurn extends ProviderPipe
 export class ProviderPipeline {
   constructor(private readonly emptyProposalRetry = new ProviderEmptyProposalRetry()) {}
 
-  messages(contract: ProviderTurnContract): LlmChatRequest['messages'] {
+  messages(contract: DriverProviderTurnFrame): LlmChatRequest['messages'] {
     return [
       { role: 'system', content: contract.prompt.stablePrefix },
       { role: 'user', content: this.renderUserPrompt(contract.prompt.dynamicSuffix, contract) },
@@ -118,7 +118,7 @@ export class ProviderPipeline {
 
   private withContractFrame(
     messages: LlmChatRequest['messages'],
-    contract: ProviderTurnContract
+    contract: DriverProviderTurnFrame
   ): LlmChatRequest['messages'] {
     if (!messages.length) return this.messages(contract);
     const lastIndex = messages.length - 1;
@@ -138,7 +138,7 @@ export class ProviderPipeline {
     });
   }
 
-  private renderUserPrompt(dynamicContent: string, contract: ProviderTurnContract): string {
+  private renderUserPrompt(dynamicContent: string, contract: DriverProviderTurnFrame): string {
     return [
       dynamicContent,
       'ProviderTurnContract:',

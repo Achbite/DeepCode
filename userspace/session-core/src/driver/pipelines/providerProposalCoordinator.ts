@@ -3,9 +3,9 @@ import type {
   AgentSessionResult,
   LlmChatRequest,
 } from '@deepcode/protocol';
-import type { ProposalEnvelope } from '../../agent-plan/types.js';
+import type { ProposalEnvelope } from '../../protocol/types.js';
 import type { PromptEnvelope } from '../../prompt/types.js';
-import type { ProviderTurnContract } from '../runFrame.js';
+import type { DriverProviderTurnFrame } from '../runFrame.js';
 
 export interface ProviderProposalParseError {
   code: string;
@@ -20,7 +20,7 @@ export interface ProviderProposalCoordinatorState {
   sessionId: string;
   runId: string;
   acceptedImplementationPlan?: unknown;
-  providerTurnContract?: ProviderTurnContract;
+  providerTurnFrame?: DriverProviderTurnFrame;
 }
 
 export interface ProviderProposalCoordinatorPorts<
@@ -31,7 +31,7 @@ export interface ProviderProposalCoordinatorPorts<
   createId(prefix: string): string;
   now(): string;
   thinkingEvent(sessionId: string, content: string, ts: string, id: string): AgentEvent;
-  providerResult(input: Input, state: State, prompt: PromptEnvelope, contract: ProviderTurnContract): Promise<string | ProposalEnvelope>;
+  providerResult(input: Input, state: State, prompt: PromptEnvelope, contract: DriverProviderTurnFrame): Promise<string | ProposalEnvelope>;
   runRepair(input: Input, state: State, stage: string, messages: LlmChatRequest['messages']): Promise<string>;
   repairMessageState(state: State): unknown;
   repairMessages(
@@ -76,7 +76,7 @@ export class ProviderProposalCoordinator<
   async callAndParse(input: Input, state: State, prompt: PromptEnvelope): Promise<ProposalEnvelope> {
     let raw: string;
     try {
-      const contract = state.providerTurnContract;
+      const contract = state.providerTurnFrame;
       if (!contract) {
         throw this.ports.createError(
           'provider_turn_contract_missing',

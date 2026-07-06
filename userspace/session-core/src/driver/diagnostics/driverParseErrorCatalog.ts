@@ -1,4 +1,4 @@
-import { AgentPlanParseError } from '../../agent-plan/types.js';
+import { AgentPlanParseError } from '../../protocol/types.js';
 
 export interface DriverParseErrorInfo {
   code: string;

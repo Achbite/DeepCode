@@ -1,4 +1,4 @@
-import type { ProposalEnvelope, ActionBundleDraft } from '../agent-plan/types.js';
+import type { ProposalEnvelope, ActionBundleDraft } from '../protocol/types.js';
 import type {
   AcceptedImplementationPlanContext,
   AcceptedImplementationPlanExecutionRoot,

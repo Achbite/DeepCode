@@ -1,5 +1,5 @@
 import type { AgentContextAttachment, AgentEvent } from '@deepcode/protocol';
-import type { ProposalEnvelope } from '../../agent-plan/types.js';
+import type { ProposalEnvelope } from '../../protocol/types.js';
 import type { RequirementRecord } from '../../requirement/types.js';
 
 export type RequirementDecisionKind = 'accept' | 'reject' | 'revise';

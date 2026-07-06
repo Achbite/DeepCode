@@ -52,7 +52,7 @@ import {
 import type {
   ProposalEnvelope,
   ResourceRequestDraft,
-} from '../agent-plan/types.js';
+} from '../protocol/types.js';
 import type {
   InitialContextPacket,
   ConversationResourceRoot,
@@ -171,7 +171,7 @@ import {
   type SessionRunStateReason,
   type SessionRunStateStatus,
 } from './projection/index.js';
-import type { ProviderTurnContract } from './runFrame.js';
+import type { DriverProviderTurnFrame } from './runFrame.js';
 import { AgentRunReactor } from './agentRunReactor.js';
 
 export interface SessionDriverLoopPorts {
@@ -251,7 +251,7 @@ interface SessionDriverLoopRunState {
   currentTaskContext?: CurrentTaskContext;
   taskLedger?: TaskLedgerSnapshot;
   acceptedPlanPromptFrame?: AcceptedPlanPromptFrame;
-  providerTurnContract?: ProviderTurnContract;
+  providerTurnFrame?: DriverProviderTurnFrame;
   implementationBatch: ImplementationBatchContext;
   acceptedImplementationPlan?: AcceptedImplementationPlanContext;
   resourceRequestRepairAttempted: boolean;

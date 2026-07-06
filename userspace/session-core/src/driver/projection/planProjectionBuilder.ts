@@ -1,5 +1,5 @@
 import type { AgentEvent } from '@deepcode/protocol';
-import type { ActionBundleDraft, ProposalEnvelope } from '../../agent-plan/types.js';
+import type { ActionBundleDraft, ProposalEnvelope } from '../../protocol/types.js';
 import type { ConversationResourceRoot } from '../../context/types.js';
 import {
   AcceptedPlanExecutionRootResolver,

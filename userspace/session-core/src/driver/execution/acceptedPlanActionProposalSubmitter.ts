@@ -10,7 +10,7 @@ import type {
 import type { ProjectMemoryMode } from '../../context/index.js';
 import type { ProjectWorkingDirectory } from '../../context/types.js';
 import type { AcceptedImplementationPlanContext } from '../../accepted-plan/types.js';
-import type { ProposalEnvelope, ResourceRequestDraft } from '../../agent-plan/types.js';
+import type { ProposalEnvelope, ResourceRequestDraft } from '../../protocol/types.js';
 import type { PromptEnvelope } from '../../prompt/types.js';
 import type { InteractionOverlayContext } from '../pipelines/interactionOverlayCodec.js';
 import { kernelReplyErrorMessage } from './kernelReplyGuard.js';

@@ -32,7 +32,7 @@ import type {
 } from '../../run-state/index.js';
 import type { DriverRequestRef, KernelStateContractRef } from '../types.js';
 import type { InteractionOverlayContext, SessionTurnPhase } from './interactionOverlayCodec.js';
-import type { ProviderTurnContract } from '../runFrame.js';
+import type { DriverProviderTurnFrame } from '../runFrame.js';
 
 export interface RunLifecycleInput {
   sessionId: string;
@@ -72,7 +72,7 @@ export interface RunLifecycleState {
   currentTaskContext?: CurrentTaskContext;
   taskLedger?: TaskLedgerSnapshot;
   acceptedPlanPromptFrame?: AcceptedPlanPromptFrame;
-  providerTurnContract?: ProviderTurnContract;
+  providerTurnFrame?: DriverProviderTurnFrame;
   implementationBatch: ImplementationBatchContext;
   acceptedImplementationPlan?: AcceptedImplementationPlanContext;
   resourceRequestRepairAttempted: boolean;

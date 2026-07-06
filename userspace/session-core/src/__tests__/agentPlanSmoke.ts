@@ -2782,7 +2782,7 @@ async function assertAcceptedPlanResourceResumeCoordinatorBuildsProviderTurn(): 
   assertEqual(observedStage, 'accepted_plan_resource_resume', 'resource resume coordinator uses stable provider stage');
   assertEqual(observedMessages[0]?.role, 'system', 'resource resume coordinator sends stable prefix as system message');
   assertEqual(
-    (state as { providerTurnContract?: { turnMode?: string } }).providerTurnContract?.turnMode,
+    (state as { providerTurnFrame?: { turnMode?: string } }).providerTurnFrame?.turnMode,
     'resourceResume',
     'resource resume coordinator stores provider turn contract on state'
   );

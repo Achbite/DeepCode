@@ -1,5 +1,5 @@
 import type { AgentEvent, AgentSessionResult } from '@deepcode/protocol';
-import type { ProposalEnvelope } from '../../agent-plan/types.js';
+import type { ProposalEnvelope } from '../../protocol/types.js';
 import type { PlanProjectionState } from '../projection/planProjectionBuilder.js';
 
 export interface ProviderPlanProposalState extends PlanProjectionState {

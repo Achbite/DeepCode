@@ -1,5 +1,5 @@
 import type { AgentEvent } from '@deepcode/protocol';
-import type { ProposalEnvelope } from '../../agent-plan/types.js';
+import type { ProposalEnvelope } from '../../protocol/types.js';
 import type { AcceptedImplementationPlanExecutionRoot } from '../../accepted-plan/types.js';
 import type { InteractionOverlayContext } from '../pipelines/interactionOverlayCodec.js';
 

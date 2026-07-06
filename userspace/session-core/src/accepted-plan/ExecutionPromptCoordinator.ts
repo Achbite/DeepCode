@@ -2,7 +2,7 @@ import type {
   ProposalEnvelope,
   ReviewExpectationDraft,
   ValidationExpectationDraft,
-} from '../agent-plan/types.js';
+} from '../protocol/types.js';
 import type { AcceptedImplementationPlanContext } from './types.js';
 import { AcceptedTaskRegistry } from './AcceptedTaskRegistry.js';
 

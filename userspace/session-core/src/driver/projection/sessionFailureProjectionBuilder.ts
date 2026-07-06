@@ -1,5 +1,5 @@
 import type { AgentConversationActivity, AgentEvent } from '@deepcode/protocol';
-import type { ProposalEnvelope } from '../../agent-plan/types.js';
+import type { ProposalEnvelope } from '../../protocol/types.js';
 import type { AcceptedImplementationPlanContext, ActionBatchFailureDetail } from '../execution/index.js';
 import type { InteractionOverlayContext, SessionTurnPhase } from '../pipelines/index.js';
 import type { DecisionOwnerRef, SessionRunStateReason, SessionRunStateStatus } from './sessionProgressProjectionBuilder.js';

@@ -2,7 +2,7 @@ import type {
   AgentSessionResult,
   LlmChatRequest,
 } from '@deepcode/protocol';
-import type { ProposalEnvelope } from '../../agent-plan/types.js';
+import type { ProposalEnvelope } from '../../protocol/types.js';
 import type {
   AcceptedImplementationPlanContext,
   CurrentTaskContext,
@@ -16,7 +16,7 @@ import type {
   ProviderRepairMessageState,
 } from '../../prompt/ProviderRepairMessageBuilder.js';
 import type { PromptEnvelope } from '../../prompt/types.js';
-import type { ProviderTurnContract } from '../runFrame.js';
+import type { DriverProviderTurnFrame } from '../runFrame.js';
 import type { ContextFrameBuilder } from './contextFrameBuilder.js';
 
 export interface AcceptedPlanResourceResumeCoordinatorState {
@@ -29,7 +29,7 @@ export interface AcceptedPlanResourceResumeCoordinatorState {
   contextAssembly?: ContextAssemblyRecord;
   resourcePackets: ResourcePacket[];
   generatedArtifactEvidence: { size: number };
-  providerTurnContract?: ProviderTurnContract;
+  providerTurnFrame?: DriverProviderTurnFrame;
 }
 
 export interface AcceptedPlanResourceResumeParseError {
@@ -66,7 +66,7 @@ export interface AcceptedPlanResourceResumeRunInput<State extends AcceptedPlanRe
   callProposalOnly(input: {
     state: State;
     prompt: PromptEnvelope;
-    contract: ProviderTurnContract;
+    contract: DriverProviderTurnFrame;
     stage: string;
     messages: LlmChatRequest['messages'];
   }): Promise<string | ProposalEnvelope>;
@@ -81,7 +81,7 @@ export class AcceptedPlanResourceResumeCoordinator<
   async run(runInput: AcceptedPlanResourceResumeRunInput<State>): Promise<ProposalEnvelope> {
     const messages = this.messages(runInput);
     const contract = this.contract(runInput);
-    runInput.state.providerTurnContract = contract;
+    runInput.state.providerTurnFrame = contract;
     const providerResult = await runInput.callProposalOnly({
       state: runInput.state,
       prompt: runInput.prompt,
@@ -143,7 +143,7 @@ export class AcceptedPlanResourceResumeCoordinator<
     ];
   }
 
-  private contract(runInput: AcceptedPlanResourceResumeRunInput<State>): ProviderTurnContract {
+  private contract(runInput: AcceptedPlanResourceResumeRunInput<State>): DriverProviderTurnFrame {
     return this.input.contextFrameBuilder.buildSessionProviderTurnContract({
       contractId: this.input.createId('provider-turn-contract-resource-resume'),
       sessionId: runInput.state.sessionId,

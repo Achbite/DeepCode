@@ -1,5 +1,5 @@
 import type { AgentSessionResult } from '@deepcode/protocol';
-import type { ProposalEnvelope } from '../../agent-plan/types.js';
+import type { ProposalEnvelope } from '../../protocol/types.js';
 import type { PromptEnvelope } from '../../prompt/types.js';
 import type { ProposalRouterResult } from '../proposal/proposalRouter.js';
 

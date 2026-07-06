@@ -1,4 +1,4 @@
-import type { ActionBundleDraft, ProposalEnvelope, ResourceRequestDraft } from '../../agent-plan/types.js';
+import type { ActionBundleDraft, ProposalEnvelope, ResourceRequestDraft } from '../../protocol/types.js';
 import type { AcceptedPlanAdmission } from '../../accepted-plan/AcceptedPlanAdmission.js';
 import type { ResourcePacket, ResourcePacketItem } from '../../context/types.js';
 import type {

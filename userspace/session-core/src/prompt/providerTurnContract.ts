@@ -1,4 +1,4 @@
-import { actionBundleProtocolShapeLines, kernelCatalogToolIdList, resourceRequestProtocolShapeLine } from '../agent-plan/protocolContract.js';
+import { actionBundleProtocolShapeLines, kernelCatalogToolIdList, resourceRequestProtocolShapeLine } from '../protocol/protocolContract.js';
 import type { PromptEnvelopeBuilderInput } from './types.js';
 import { buildPromptPacketFrames, renderPromptPacketFrames, type PromptPacketFrame } from './promptPacket.js';
 

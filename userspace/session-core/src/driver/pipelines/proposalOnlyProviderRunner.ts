@@ -2,14 +2,14 @@ import type {
   LlmChatRequest,
   ProjectionDelta,
 } from '@deepcode/protocol';
-import type { ProposalEnvelope } from '../../agent-plan/types.js';
+import type { ProposalEnvelope } from '../../protocol/types.js';
 import type { ProviderEmptyProposalRetryOptions } from '../../provider/ProviderEmptyProposalRetry.js';
 import type { NativeToolCallProposal } from '../../provider/providerStreamParts.js';
 import type {
   ProviderPipelineRunTurnInput,
   ProviderPipelineTurn,
 } from './providerPipeline.js';
-import type { ProviderTurnContract } from '../runFrame.js';
+import type { DriverProviderTurnFrame } from '../runFrame.js';
 
 export interface ProposalOnlyProviderState {
   sessionId: string;
@@ -61,7 +61,7 @@ export interface ProposalOnlyProviderRunnerInput<
 > {
   profileId?: string;
   state: TState;
-  contract: ProviderTurnContract;
+  contract: DriverProviderTurnFrame;
   stage: string;
   messages?: LlmChatRequest['messages'];
   acceptedPlanId?: string;

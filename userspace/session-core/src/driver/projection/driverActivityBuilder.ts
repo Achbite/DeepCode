@@ -1,5 +1,5 @@
 import type { AgentConversationActivity } from '@deepcode/protocol';
-import type { ActionBundleDraft, ProposalEnvelope } from '../../agent-plan/types.js';
+import type { ActionBundleDraft, ProposalEnvelope } from '../../protocol/types.js';
 import type { AcceptedImplementationPlanContext } from '../execution/index.js';
 
 export type DriverActivityLanguage = 'zh-CN' | 'en-US';

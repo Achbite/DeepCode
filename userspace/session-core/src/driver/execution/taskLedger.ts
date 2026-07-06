@@ -1,5 +1,5 @@
 import type { AgentEvent } from '@deepcode/protocol';
-import type { ProposalEnvelope } from '../../agent-plan/types.js';
+import type { ProposalEnvelope } from '../../protocol/types.js';
 import { AcceptedPlanProgressAggregator } from '../../accepted-plan/AcceptedPlanProgressAggregator.js';
 import { AcceptedPlanScopeMatcher } from '../../accepted-plan/AcceptedPlanScopeMatcher.js';
 import { AcceptedTaskRegistry } from '../../accepted-plan/AcceptedTaskRegistry.js';

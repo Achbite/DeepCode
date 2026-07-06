@@ -1,5 +1,5 @@
 import { stableHash } from '../../cache/canonicalizer.js';
-import type { ResourceRequestDraft } from '../../agent-plan/types.js';
+import type { ResourceRequestDraft } from '../../protocol/types.js';
 import type {
   ConversationResourceRoot,
   ResourcePacket,

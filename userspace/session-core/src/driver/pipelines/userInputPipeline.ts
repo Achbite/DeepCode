@@ -1,6 +1,6 @@
 import type { AgentContextAttachment, AgentEvent } from '@deepcode/protocol';
 import { AcceptedPlanExecutionRootResolver } from '../../accepted-plan/AcceptedPlanExecutionRootResolver.js';
-import type { ProposalEnvelope } from '../../agent-plan/types.js';
+import type { ProposalEnvelope } from '../../protocol/types.js';
 import type { RequirementChecklist, RequirementRecord } from '../../requirement/types.js';
 import { InteractionOverlayCodec } from './interactionOverlayCodec.js';
 
