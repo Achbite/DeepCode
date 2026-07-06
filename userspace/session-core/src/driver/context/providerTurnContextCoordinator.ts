@@ -60,20 +60,19 @@ export interface ProviderTurnContextResult {
 export interface ProviderTurnContextCoordinatorPorts<State extends ProviderTurnContextState> {
   now(): string;
   createId(prefix: string): string;
-  append(sessionId: string, events: AgentEvent[]): Promise<AgentSessionResult>;
   assembleContext(input: ContextAssemblyInput): ContextAssemblyResult;
   allowedProposals(kernelAllowed: string[], state: State): string[];
   capabilityCatalogSummary(state: State): string;
   memoryHints(state: State): string[];
   collectUserGuidanceEvents(events: AgentEvent[], runId: string): ContextAssemblyInput['userGuidance'];
-  consumedUserGuidanceEvents(input: {
+  appendConsumedGuidance(input: {
     sessionId: string;
-    events: AgentEvent[];
+    result: AgentSessionResult;
     consumedIds: string[];
     runId: string;
     appliedAtProviderStage: string;
     userRequest: string;
-  }): AgentEvent[];
+  }): Promise<AgentSessionResult>;
   buildProviderTurnContract(input: {
     contractId: string;
     sessionId: string;
@@ -129,7 +128,14 @@ export class ProviderTurnContextCoordinator<State extends ProviderTurnContextSta
     state.cachePlan = assembledContext.cachePlan;
     state.contextAssembly = assembledContext.contextAssembly;
 
-    const lastResult = await this.appendConsumedUserGuidanceEvents(state, input.lastResult);
+    const lastResult = await this.ports.appendConsumedGuidance({
+      sessionId: state.sessionId,
+      result: input.lastResult,
+      consumedIds: state.contextAssembly?.consumedUserGuidanceIds ?? [],
+      runId: state.runId,
+      appliedAtProviderStage: 'provider_call',
+      userRequest: state.userRequest,
+    });
     const prompt = assembledContext.prompt;
     state.providerTurnFrame = this.ports.buildProviderTurnContract({
       contractId: input.contractId,
@@ -146,21 +152,5 @@ export class ProviderTurnContextCoordinator<State extends ProviderTurnContextSta
     });
 
     return { prompt, allowedProposals, lastResult };
-  }
-
-  private async appendConsumedUserGuidanceEvents(
-    state: State,
-    result: AgentSessionResult
-  ): Promise<AgentSessionResult> {
-    const consumedIds = state.contextAssembly?.consumedUserGuidanceIds ?? [];
-    const events = this.ports.consumedUserGuidanceEvents({
-      sessionId: state.sessionId,
-      events: result.events,
-      consumedIds,
-      runId: state.runId,
-      appliedAtProviderStage: 'provider_call',
-      userRequest: state.userRequest,
-    });
-    return events.length > 0 ? this.ports.append(state.sessionId, events) : result;
   }
 }

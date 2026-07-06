@@ -1080,14 +1080,19 @@ export class SessionDriverLoop {
       capabilityCatalogSummary: (state) => nativeToolCoordinator.capabilityCatalogSummary(state),
       implementationBatchHints: (state) => providerContextSupport.implementationBatchHints(state.implementationBatch),
       appendConsumedGuidanceEvents: (guidanceInput) =>
-        this.appendConsumedUserGuidanceEvents(
-          guidanceInput.sessionId,
-          guidanceInput.result,
-          guidanceInput.contextAssembly,
-          guidanceInput.runId,
-          guidanceInput.userRequest,
-          guidanceInput.appliedAtProviderStage
-        ),
+        userGuidanceQueue.appendConsumed({
+          sessionId: guidanceInput.sessionId,
+          result: guidanceInput.result,
+          consumedIds: guidanceInput.contextAssembly?.consumedUserGuidanceIds ?? [],
+          runId: guidanceInput.runId,
+          appliedAtProviderStage: guidanceInput.appliedAtProviderStage,
+          summary: providerStreamCoordinator.userGuidanceConsumedSummary(
+            visibleLanguageForRequest(guidanceInput.userRequest)
+          ),
+          append: (sessionId, events) => this.append(sessionId, events),
+          now: () => this.ts(),
+          createId: (prefix) => this.id(prefix),
+        }),
       runRevision: (revisionInput, state, messages) =>
         this.providerRuntimeBridge.llm(revisionInput.profileId, state, 'guidance_revision', messages),
       parseProposal: (raw, state) =>
@@ -1543,7 +1548,6 @@ export class SessionDriverLoop {
     this.providerTurnContextCoordinator = new ProviderTurnContextCoordinator<SessionDriverLoopRunState>({
       now: () => this.ts(),
       createId: (prefix) => this.id(prefix),
-      append: (sessionId, events) => this.append(sessionId, events),
       assembleContext: (contextInput) => assembleContext(contextInput),
       allowedProposals: (kernelAllowed, state) =>
         providerTurnPolicy.allowedProposals(kernelAllowed, state),
@@ -1553,16 +1557,17 @@ export class SessionDriverLoop {
         ...providerContextSupport.implementationBatchHints(state.implementationBatch, state.acceptedImplementationPlan),
       ],
       collectUserGuidanceEvents: (events, runId) => collectUserGuidanceEvents(events, runId),
-      consumedUserGuidanceEvents: (guidanceInput) =>
-        userGuidanceQueue.consumedEvents({
+      appendConsumedGuidance: (guidanceInput) =>
+        userGuidanceQueue.appendConsumed({
           sessionId: guidanceInput.sessionId,
-          events: guidanceInput.events,
+          result: guidanceInput.result,
           consumedIds: guidanceInput.consumedIds,
           runId: guidanceInput.runId,
           appliedAtProviderStage: guidanceInput.appliedAtProviderStage,
           summary: providerStreamCoordinator.userGuidanceConsumedSummary(
             visibleLanguageForRequest(guidanceInput.userRequest)
           ),
+          append: (sessionId, events) => this.append(sessionId, events),
           now: () => this.ts(),
           createId: (prefix) => this.id(prefix),
         }),
@@ -1788,29 +1793,6 @@ export class SessionDriverLoop {
 
   private async append(sessionId: string, events: AgentEvent[]): Promise<AgentSessionResult> {
     return this.agentRunReactor.append(sessionId, events);
-  }
-
-  private async appendConsumedUserGuidanceEvents(
-    sessionId: string,
-    result: AgentSessionResult,
-    contextAssembly: ContextAssemblyRecord | undefined,
-    runId: string,
-    userRequest: string,
-    appliedAtProviderStage = 'provider_call'
-  ): Promise<AgentSessionResult> {
-    const consumedIds = contextAssembly?.consumedUserGuidanceIds ?? [];
-    const events = userGuidanceQueue.consumedEvents({
-      sessionId,
-      events: result.events,
-      consumedIds,
-      runId,
-      appliedAtProviderStage,
-      summary: providerStreamCoordinator.userGuidanceConsumedSummary(visibleLanguageForRequest(userRequest)),
-      now: () => this.ts(),
-      createId: (prefix) => this.id(prefix),
-    });
-
-    return events.length > 0 ? this.append(sessionId, events) : result;
   }
 
   private async appendProjectedKernelEvents(sessionId: string, reply: KernelReply): Promise<AgentSessionResult> {

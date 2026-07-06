@@ -1,5 +1,6 @@
 import type {
   AgentEvent,
+  AgentSessionResult,
   LlmChatRequest,
 } from '@deepcode/protocol';
 import type { UserGuidanceEvent } from '../../context/index.js';
@@ -27,6 +28,18 @@ export interface UserGuidanceQueueConsumedInput {
   runId: string;
   appliedAtProviderStage: string;
   summary: string;
+  now(): string;
+  createId(prefix: string): string;
+}
+
+export interface UserGuidanceQueueAppendConsumedInput {
+  sessionId: string;
+  result: AgentSessionResult;
+  consumedIds: string[];
+  runId: string;
+  appliedAtProviderStage: string;
+  summary: string;
+  append(sessionId: string, events: AgentEvent[]): Promise<AgentSessionResult>;
   now(): string;
   createId(prefix: string): string;
 }
@@ -138,6 +151,20 @@ export class UserGuidanceQueue {
       });
     }
     return events;
+  }
+
+  async appendConsumed(input: UserGuidanceQueueAppendConsumedInput): Promise<AgentSessionResult> {
+    const events = this.consumedEvents({
+      sessionId: input.sessionId,
+      events: input.result.events,
+      consumedIds: input.consumedIds,
+      runId: input.runId,
+      appliedAtProviderStage: input.appliedAtProviderStage,
+      summary: input.summary,
+      now: input.now,
+      createId: input.createId,
+    });
+    return events.length > 0 ? input.append(input.sessionId, events) : input.result;
   }
 }
 
