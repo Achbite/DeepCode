@@ -554,11 +554,11 @@ export class SessionDriverLoop {
       errorMessage: (error) => error instanceof Error ? error.message : String(error),
     });
     this.acceptedActionBundlePlanExecutor = new AcceptedActionBundlePlanExecutor({
-      now: () => this.ts(),
-      createId: (prefix) => this.id(prefix),
-      append: (sessionId, events) => this.append(sessionId, events),
-      kernel: (request) => this.kernel(request),
-      appendProjectedKernelEvents: (sessionId, reply) => this.appendProjectedKernelEvents(sessionId, reply),
+      now: () => this.agentRunReactor.ts(),
+      createId: (prefix) => this.agentRunReactor.id(prefix),
+      append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
+      kernel: (request) => this.agentRunReactor.kernel(request),
+      appendProjectedKernelEvents: (sessionId, reply) => this.agentRunReactor.appendProjectedKernelEvents(sessionId, reply),
       resumeUserTurn: (resumeInput) => this.runUserTurn(resumeInput),
       kernelExecutionContractId: (report) => planReviewGrantProjector.kernelExecutionContractId(report),
       temporaryGrantsForPlan: (plan) => planReviewGrantProjector.temporaryGrantsForPlan(plan),
@@ -601,9 +601,9 @@ export class SessionDriverLoop {
       reviewHandoff: (handoffInput) => this.acceptedPlanReviewHandoffCoordinator.handoff(handoffInput),
     });
     this.acceptedPlanReadOnlyTaskExecutor = new AcceptedPlanReadOnlyTaskExecutor<SessionDriverLoopInput, SessionDriverLoopRunState>({
-      now: () => this.ts(),
-      createId: (prefix) => this.id(prefix),
-      append: (sessionId, events) => this.append(sessionId, events),
+      now: () => this.agentRunReactor.ts(),
+      createId: (prefix) => this.agentRunReactor.id(prefix),
+      append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
       runUserTurn: (resumeInput) => this.runUserTurn(resumeInput),
       readActionBundle: (proposal) => driverActivityBuilder.readActionBundle(proposal),
       refreshRuntimeState: (state) => acceptedPlanTaskLedger().refreshRuntimeState(state),
@@ -678,13 +678,13 @@ export class SessionDriverLoop {
         this.actionProposalSubmitter.submitNonExecutable(state, proposal, fallback),
     });
     this.acceptedPlanActionProposalSubmitter = new AcceptedPlanActionProposalSubmitter<SessionDriverLoopInput, SessionDriverLoopRunState>({
-      now: () => this.ts(),
-      createId: (prefix) => this.id(prefix),
-      append: (sessionId, events) => this.append(sessionId, events),
-      kernel: (request) => this.kernel(request),
-      appendProjectedKernelEvents: (sessionId, reply) => this.appendProjectedKernelEvents(sessionId, reply),
-      emitProjectionDelta: (state, delta) => this.emitProjectionDelta(state, delta),
-      emitKernelActivityDeltas: (state, events, stage) => this.emitKernelActivityDeltas(state, events, stage),
+      now: () => this.agentRunReactor.ts(),
+      createId: (prefix) => this.agentRunReactor.id(prefix),
+      append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
+      kernel: (request) => this.agentRunReactor.kernel(request),
+      appendProjectedKernelEvents: (sessionId, reply) => this.agentRunReactor.appendProjectedKernelEvents(sessionId, reply),
+      emitProjectionDelta: (state, delta) => this.agentRunReactor.emitProjectionDelta(state, delta),
+      emitKernelActivityDeltas: (state, events, stage) => this.agentRunReactor.emitKernelActivityDeltas(state, events, stage),
       readActionBundle: (proposal) => driverActivityBuilder.readActionBundle(proposal),
       tryCompleteReadOnlyActionBundle: (handlerInput, state, prompt, proposal, fallback) =>
         this.acceptedPlanReadOnlyTaskExecutor.tryCompleteActionBundle(handlerInput, state, prompt, proposal, fallback),
@@ -706,12 +706,12 @@ export class SessionDriverLoop {
           },
         }),
       appendThinking: async (state, message, idPrefix, metadata) => {
-        await this.append(state.sessionId, [
+        await this.agentRunReactor.append(state.sessionId, [
           assistantProjectionBuilder.thinkingEvent(
             state.sessionId,
             message,
-            this.ts(),
-            this.id(idPrefix),
+            this.agentRunReactor.ts(),
+            this.agentRunReactor.id(idPrefix),
             metadata as Parameters<typeof assistantProjectionBuilder.thinkingEvent>[4]
           ),
         ]);
@@ -738,12 +738,12 @@ export class SessionDriverLoop {
           proposal,
           request,
         }),
-      appendDiagnostic: (state, code, fallback, params, idPrefix) => this.append(state.sessionId, [
+      appendDiagnostic: (state, code, fallback, params, idPrefix) => this.agentRunReactor.append(state.sessionId, [
         assistantProjectionBuilder.finalDiagnosticEvent(
           state.sessionId,
           diag(code, fallback, params),
-          this.ts(),
-          this.id(idPrefix)
+          this.agentRunReactor.ts(),
+          this.agentRunReactor.id(idPrefix)
         ),
       ]),
       submitNonExecutableProposal: (state, proposal, fallback) =>
@@ -830,15 +830,15 @@ export class SessionDriverLoop {
       contextFrameBuilder,
       repairMessageBuilder: providerRepairMessageBuilder,
       repairState: (state) => providerContextSupport.repairMessageState(state),
-      createId: (prefix) => this.id(prefix),
+      createId: (prefix) => this.agentRunReactor.id(prefix),
       parseError: (error) => driverParseErrorCatalog.normalize(error),
       createError: (code, message) => new SessionDriverLoopError(code, message),
-      appendRepairNotice: (state, message) => this.append(state.sessionId, [
+      appendRepairNotice: (state, message) => this.agentRunReactor.append(state.sessionId, [
         assistantProjectionBuilder.thinkingEvent(
           state.sessionId,
           message,
-          this.ts(),
-          this.id('accepted-plan-resource-resume-repair')
+          this.agentRunReactor.ts(),
+          this.agentRunReactor.id('accepted-plan-resource-resume-repair')
         ),
       ]),
       parseProviderProposal: ({ raw, state }) => protocolGate().parseAndValidateProposal({
@@ -872,21 +872,21 @@ export class SessionDriverLoop {
       }),
     });
     this.acceptedPlanScopeDecisionCoordinator = new AcceptedPlanScopeDecisionCoordinator<SessionDriverLoopRunState>({
-      now: () => this.ts(),
-      createId: (prefix) => this.id(prefix),
+      now: () => this.agentRunReactor.ts(),
+      createId: (prefix) => this.agentRunReactor.id(prefix),
       visibleLanguageForRequest,
       requirementPipeline: userInputPipeline,
       interactionOverlayCodec,
       requirementProjection: requirementProjectionBuilder,
       progressProjection: sessionProgressProjectionBuilder,
-      append: (sessionId, events) => this.append(sessionId, events),
+      append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
     });
     this.acceptedPlanReviewHandoffCoordinator = new AcceptedPlanReviewHandoffCoordinator<SessionPlanContext>({
-      now: () => this.ts(),
-      createId: (prefix) => this.id(prefix),
-      kernel: (request) => this.kernel(request),
-      appendProjectedKernelEvents: (sessionId, reply) => this.appendProjectedKernelEvents(sessionId, reply),
-      append: (sessionId, events) => this.append(sessionId, events),
+      now: () => this.agentRunReactor.ts(),
+      createId: (prefix) => this.agentRunReactor.id(prefix),
+      kernel: (request) => this.agentRunReactor.kernel(request),
+      appendProjectedKernelEvents: (sessionId, reply) => this.agentRunReactor.appendProjectedKernelEvents(sessionId, reply),
+      append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
       assertKernelReplyOk: (reply, code, fallback) =>
         assertExecutionKernelReplyOk(
           reply,
@@ -899,20 +899,20 @@ export class SessionDriverLoop {
       progressProjection: sessionProgressProjectionBuilder,
     });
     this.acceptedPlanStaticSyntaxReviewCoordinator = new AcceptedPlanStaticSyntaxReviewCoordinator<SessionDriverLoopRunState>({
-      now: () => this.ts(),
-      createId: (prefix) => this.id(prefix),
-      emitProjectionDelta: (state, delta) => this.emitProjectionDelta(state, delta),
+      now: () => this.agentRunReactor.ts(),
+      createId: (prefix) => this.agentRunReactor.id(prefix),
+      emitProjectionDelta: (state, delta) => this.agentRunReactor.emitProjectionDelta(state, delta),
       runStaticSyntaxReview: ({ profileId, state, stage, messages }) =>
         this.providerRuntimeBridge.llm(profileId, state, stage, messages),
-      event: (sessionId, kind, payload) => this.event(sessionId, kind, payload),
+      event: (sessionId, kind, payload) => this.agentRunReactor.event(sessionId, kind, payload),
       reviewAssembler: reviewAssembler(),
     });
     this.permissionDecisionHandler = new PermissionDecisionHandler<SessionPlanContext>({
-      now: () => this.ts(),
-      createId: (prefix) => this.id(prefix),
-      kernel: (request) => this.kernel(request),
-      appendProjectedKernelEvents: (sessionId, reply) => this.appendProjectedKernelEvents(sessionId, reply),
-      append: (sessionId, events) => this.append(sessionId, events),
+      now: () => this.agentRunReactor.ts(),
+      createId: (prefix) => this.agentRunReactor.id(prefix),
+      kernel: (request) => this.agentRunReactor.kernel(request),
+      appendProjectedKernelEvents: (sessionId, reply) => this.agentRunReactor.appendProjectedKernelEvents(sessionId, reply),
+      append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
       permissionPipeline,
       kernelStatus: kernelEventStatusIndex,
       planIndex: planContextIndex,
@@ -920,9 +920,9 @@ export class SessionDriverLoop {
       progressProjection: sessionProgressProjectionBuilder,
     });
     this.planDecisionHandler = new PlanDecisionHandler({
-      now: () => this.ts(),
-      createId: (prefix) => this.id(prefix),
-      append: (sessionId, events) => this.append(sessionId, events),
+      now: () => this.agentRunReactor.ts(),
+      createId: (prefix) => this.agentRunReactor.id(prefix),
+      append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
       resumeUserTurn: (resumeInput) => this.runUserTurn(resumeInput),
       executeAcceptedActionBundlePlan: (handlerInput, plan, initialResult, acceptedOverlay) =>
         this.acceptedActionBundlePlanExecutor.execute(handlerInput, plan, initialResult, acceptedOverlay),
@@ -940,9 +940,9 @@ export class SessionDriverLoop {
       progressProjection: sessionProgressProjectionBuilder,
     });
     this.requirementDecisionHandler = new RequirementDecisionHandler({
-      now: () => this.ts(),
-      createId: (prefix) => this.id(prefix),
-      append: (sessionId, events) => this.append(sessionId, events),
+      now: () => this.agentRunReactor.ts(),
+      createId: (prefix) => this.agentRunReactor.id(prefix),
+      append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
       resumeUserTurn: (resumeInput) => this.runUserTurn(resumeInput),
       activeDriverInteraction: (events) => driverInteractionIndex.active(events),
       executionRootFromDecision: (handlerInput, events) =>
@@ -964,12 +964,12 @@ export class SessionDriverLoop {
       repairLoop,
     });
     this.reviewDecisionHandler = new ReviewDecisionHandler({
-      now: () => this.ts(),
-      createId: (prefix) => this.id(prefix),
-      kernel: (request) => this.kernel(request),
+      now: () => this.agentRunReactor.ts(),
+      createId: (prefix) => this.agentRunReactor.id(prefix),
+      kernel: (request) => this.agentRunReactor.kernel(request),
       kernelAudit: (request) => this.ports.kernelCommand(request),
-      appendProjectedKernelEvents: (sessionId, reply) => this.appendProjectedKernelEvents(sessionId, reply),
-      append: (sessionId, events) => this.append(sessionId, events),
+      appendProjectedKernelEvents: (sessionId, reply) => this.agentRunReactor.appendProjectedKernelEvents(sessionId, reply),
+      append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
       resumeUserTurn: (resumeInput) => this.runUserTurn(resumeInput),
       reviewAssembler: reviewAssembler(),
       reviewDecisionProjection: reviewDecisionProjection(),
@@ -977,9 +977,9 @@ export class SessionDriverLoop {
       progressProjection: sessionProgressProjectionBuilder,
     });
     this.decisionResolver = new DecisionResolver({
-      now: () => this.ts(),
-      createId: (prefix) => this.id(prefix),
-      append: (sessionId, events) => this.append(sessionId, events),
+      now: () => this.agentRunReactor.ts(),
+      createId: (prefix) => this.agentRunReactor.id(prefix),
+      append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
       finalDiagnosticEvent: (sessionId, content, ts, id) =>
         assistantProjectionBuilder.finalDiagnosticEvent(sessionId, content, ts, id),
       missingDecisionKindMessage: (kind) =>
@@ -990,9 +990,9 @@ export class SessionDriverLoop {
       reviewHandler: this.reviewDecisionHandler,
     });
     this.providerDecisionRequestHandler = new ProviderDecisionRequestHandler<SessionDriverLoopInput, SessionDriverLoopRunState>({
-      now: () => this.ts(),
-      createId: (prefix) => this.id(prefix),
-      append: (sessionId, events) => this.append(sessionId, events),
+      now: () => this.agentRunReactor.ts(),
+      createId: (prefix) => this.agentRunReactor.id(prefix),
+      append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
       requirementRecordFromProposal: (proposalInput) =>
         userInputPipeline.requirementRecordFromProposal(proposalInput),
       confirmationEvent: (confirmationInput) =>
@@ -1002,18 +1002,18 @@ export class SessionDriverLoop {
         sessionProgressProjectionBuilder.sessionRunStateEvent(runStateInput),
     });
     this.providerPlanProposalHandler = new ProviderPlanProposalHandler<SessionDriverLoopRunState>({
-      now: () => this.ts(),
-      createId: (prefix) => this.id(prefix),
-      append: (sessionId, events) => this.append(sessionId, events),
+      now: () => this.agentRunReactor.ts(),
+      createId: (prefix) => this.agentRunReactor.id(prefix),
+      append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
       implementationPlanCardEvent: (planInput) =>
         planProjectionBuilder.implementationPlanCardEvent(planInput),
       sessionRunStateEvent: (runStateInput) =>
         sessionProgressProjectionBuilder.sessionRunStateEvent(runStateInput),
     });
     this.providerTerminalProposalHandler = new ProviderTerminalProposalHandler<SessionDriverLoopInput, SessionDriverLoopRunState>({
-      now: () => this.ts(),
-      createId: (prefix) => this.id(prefix),
-      append: (sessionId, events) => this.append(sessionId, events),
+      now: () => this.agentRunReactor.ts(),
+      createId: (prefix) => this.agentRunReactor.id(prefix),
+      append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
       reviseAnswer: (handlerInput, state, proposal) =>
         this.terminalGuidanceRevisionCoordinator.revise(handlerInput, state, proposal),
       answerEvent: (answerSessionId, proposal, ts, id) =>
@@ -1022,9 +1022,9 @@ export class SessionDriverLoop {
         assistantProjectionBuilder.finalDiagnosticEvent(diagnosticSessionId, summary, ts, id),
     });
     this.proposalRouter = new ProposalRouter<SessionDriverLoopInput, SessionDriverLoopRunState>({
-      now: () => this.ts(),
-      createId: (prefix) => this.id(prefix),
-      append: (sessionId, events) => this.append(sessionId, events),
+      now: () => this.agentRunReactor.ts(),
+      createId: (prefix) => this.agentRunReactor.id(prefix),
+      append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
       proposalNarrationEvent: (narrationSessionId, proposal, ts, id) =>
         assistantProjectionBuilder.proposalNarrationEvent(narrationSessionId, proposal, ts, id),
       handleAnswer: (handlerInput, state, proposal) =>
@@ -1043,8 +1043,8 @@ export class SessionDriverLoop {
         this.actionProposalSubmitter.submitNonExecutable(state, proposal, fallback),
     });
     this.requirementConfirmationCoordinator = new RequirementConfirmationCoordinator<SessionDriverLoopInput, SessionDriverLoopRunState>({
-      now: () => this.ts(),
-      createId: (prefix) => this.id(prefix),
+      now: () => this.agentRunReactor.ts(),
+      createId: (prefix) => this.agentRunReactor.id(prefix),
       assembleContext: (contextInput) => assembleContext(contextInput),
       capabilityCatalogSummary: (state) => nativeToolCoordinator.capabilityCatalogSummary(state),
       collectUserGuidanceEvents: (events, runId) => collectUserGuidanceEvents(events, runId),
@@ -1063,9 +1063,9 @@ export class SessionDriverLoop {
         ),
     });
     this.terminalGuidanceRevisionCoordinator = new TerminalGuidanceRevisionCoordinator<SessionDriverLoopInput, SessionDriverLoopRunState>({
-      now: () => this.ts(),
-      createId: (prefix) => this.id(prefix),
-      append: (sessionId, events) => this.append(sessionId, events),
+      now: () => this.agentRunReactor.ts(),
+      createId: (prefix) => this.agentRunReactor.id(prefix),
+      append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
       collectQueued: (events, runId) => userGuidanceQueue.collectQueued(events, runId),
       transitionEvent: (transitionInput) =>
         assistantProjectionBuilder.guidanceRevisionTransitionEvent(
@@ -1101,9 +1101,9 @@ export class SessionDriverLoop {
           summary: providerStreamCoordinator.userGuidanceConsumedSummary(
             visibleLanguageForRequest(guidanceInput.userRequest)
           ),
-          append: (sessionId, events) => this.append(sessionId, events),
-          now: () => this.ts(),
-          createId: (prefix) => this.id(prefix),
+          append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
+          now: () => this.agentRunReactor.ts(),
+          createId: (prefix) => this.agentRunReactor.id(prefix),
         }),
       runRevision: (revisionInput, state, messages) =>
         this.providerRuntimeBridge.llm(revisionInput.profileId, state, 'guidance_revision', messages),
@@ -1129,12 +1129,12 @@ export class SessionDriverLoop {
       createError: (code, message) => new SessionDriverLoopError(code, message),
     });
     this.runLifecyclePipeline = new RunLifecyclePipeline<SessionDriverLoopRunState>({
-      createId: (prefix) => this.id(prefix),
-      append: (sessionId, events) => this.append(sessionId, events),
-      kernel: (request) => this.kernel(request),
-      appendProjectedKernelEvents: (sessionId, reply) => this.appendProjectedKernelEvents(sessionId, reply),
+      createId: (prefix) => this.agentRunReactor.id(prefix),
+      append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
+      kernel: (request) => this.agentRunReactor.kernel(request),
+      appendProjectedKernelEvents: (sessionId, reply) => this.agentRunReactor.appendProjectedKernelEvents(sessionId, reply),
       userMessageEvent: ({ sessionId, content, attachments }) =>
-        this.event(sessionId, 'user_msg', {
+        this.agentRunReactor.event(sessionId, 'user_msg', {
           content,
           attachments,
           channel: 'user',
@@ -1159,9 +1159,9 @@ export class SessionDriverLoop {
       ).result,
     });
     this.resourceRequestProposalHandler = new ResourceRequestProposalHandler<SessionDriverLoopInput, SessionDriverLoopRunState>({
-      now: () => this.ts(),
-      createId: (prefix) => this.id(prefix),
-      append: (sessionId, events) => this.append(sessionId, events),
+      now: () => this.agentRunReactor.ts(),
+      createId: (prefix) => this.agentRunReactor.id(prefix),
+      append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
       generatedPacketForRequest: (state, request, packetId) =>
         generatedArtifactEvidenceIndex().packetForRequest(state, request, packetId),
       recordAndAppend: (state, packet, eventIdPrefix) =>
@@ -1212,8 +1212,8 @@ export class SessionDriverLoop {
       resolver: resourceRequestResolver(),
       resourceLoop: resourceRequestLoop,
       orchestrator: this.resourceOrchestrator,
-      createId: (prefix) => this.id(prefix),
-      appendFailure: ({ state, detail, eventId }) => this.append(state.sessionId, [
+      createId: (prefix) => this.agentRunReactor.id(prefix),
+      appendFailure: ({ state, detail, eventId }) => this.agentRunReactor.append(state.sessionId, [
         assistantProjectionBuilder.finalDiagnosticEvent(
           state.sessionId,
           diag(
@@ -1221,7 +1221,7 @@ export class SessionDriverLoop {
             `Automatic execution batch requires additional resource evidence, but the repaired resourceRequest could not be located: ${detail}`,
             { detail }
           ),
-          this.ts(),
+          this.agentRunReactor.ts(),
           eventId
         ),
       ]),
@@ -1242,24 +1242,24 @@ export class SessionDriverLoop {
       resolver: resourceRequestResolver(),
       resourceLoop: resourceRequestLoop,
       orchestrator: this.resourceOrchestrator,
-      createId: (prefix) => this.id(prefix),
-      appendFailure: ({ state, proposal, reasons, eventId }) => this.append(
+      createId: (prefix) => this.agentRunReactor.id(prefix),
+      appendFailure: ({ state, proposal, reasons, eventId }) => this.agentRunReactor.append(
         state.sessionId,
         sessionFailureProjectionBuilder.actionBundleAdmissionFailureEvents(
           state.sessionId,
           state.runId,
           proposal,
           reasons,
-          this.ts(),
+          this.agentRunReactor.ts(),
           eventId
         )
       ),
       followupRequest: (request) => repairLoop.actionBundleAdmissionResourceFollowupRequest(request),
     });
     this.actionBundleAdmissionCoordinator = new ActionBundleAdmissionCoordinator<SessionDriverLoopInput, SessionDriverLoopRunState>({
-      now: () => this.ts(),
-      createId: (prefix) => this.id(prefix),
-      append: (sessionId, events) => this.append(sessionId, events),
+      now: () => this.agentRunReactor.ts(),
+      createId: (prefix) => this.agentRunReactor.id(prefix),
+      append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
       admissionFailureEvents: (admissionInput) =>
         sessionFailureProjectionBuilder.actionBundleAdmissionFailureEvents(
           admissionInput.sessionId,
@@ -1327,10 +1327,10 @@ export class SessionDriverLoop {
       diagnostic: (code, fallback, params) => diag(code, fallback, params),
     });
     this.actionProposalSubmitter = new ActionProposalSubmitter<SessionDriverLoopInput, SessionDriverLoopRunState>({
-      now: () => this.ts(),
-      createId: (prefix) => this.id(prefix),
-      append: (sessionId, events) => this.append(sessionId, events),
-      appendProjectedKernelEvents: (sessionId, reply) => this.appendProjectedKernelEvents(sessionId, reply),
+      now: () => this.agentRunReactor.ts(),
+      createId: (prefix) => this.agentRunReactor.id(prefix),
+      append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
+      appendProjectedKernelEvents: (sessionId, reply) => this.agentRunReactor.appendProjectedKernelEvents(sessionId, reply),
       readActionBundle: (proposal) => driverActivityBuilder.readActionBundle(proposal),
       actionBundleAdmissionBatch: (proposal) => driverActivityBuilder.proposalActionBundleAdmissionBatch(proposal),
       deleteAdmissionReasons: (batch, resourcePackets) =>
@@ -1339,7 +1339,7 @@ export class SessionDriverLoop {
         this.actionBundleAdmissionCoordinator.repair(handlerInput, state, prompt, proposal, reasons, fallback),
       submitAcceptedPlanActionProposal: (handlerInput, state, prompt, proposal, fallback) =>
         this.acceptedPlanActionProposalSubmitter.submit(handlerInput, state, prompt, proposal, fallback),
-      submitProposal: (state, proposal, requestId) => this.kernel({
+      submitProposal: (state, proposal, requestId) => this.agentRunReactor.kernel({
         command: {
           kind: 'proposalSubmit',
           requestId,
@@ -1402,11 +1402,11 @@ export class SessionDriverLoop {
       resultMessageBuilder: nativeToolResultMessageBuilder,
       resourceRecorder: nativeToolResourceRecorder,
       visibleLanguage: (userRequest) => visibleLanguageForRequest(userRequest),
-      event: (sessionId, kind, payload) => this.event(sessionId, kind, payload),
-      append: (sessionId, events) => this.append(sessionId, events),
-      emitProjectionDelta: (state, delta) => this.emitProjectionDelta(state, delta),
-      now: () => this.ts(),
-      createId: (prefix) => this.id(prefix),
+      event: (sessionId, kind, payload) => this.agentRunReactor.event(sessionId, kind, payload),
+      append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
+      emitProjectionDelta: (state, delta) => this.agentRunReactor.emitProjectionDelta(state, delta),
+      now: () => this.agentRunReactor.ts(),
+      createId: (prefix) => this.agentRunReactor.id(prefix),
     });
     this.nativeToolProviderCoordinator = new NativeToolProviderCoordinator<SessionDriverLoopRunState, LlmTurnResult>({
       providerLoop: nativeToolProviderLoop,
@@ -1420,7 +1420,7 @@ export class SessionDriverLoop {
       isEmptyResponseError,
       consumeGuidanceMessages: (state, stage) =>
         this.providerRuntimeBridge.consumeGuidanceMessages(state, stage),
-      emitProjectionDelta: (state, delta) => this.emitProjectionDelta(state, delta),
+      emitProjectionDelta: (state, delta) => this.agentRunReactor.emitProjectionDelta(state, delta),
       buildSideEffectRepairMessages: (prompt, state, toolCall, turn, acceptedExecution) =>
         providerRepairMessageBuilder.sideEffectNativeToolRepairMessages(
           prompt,
@@ -1448,9 +1448,9 @@ export class SessionDriverLoop {
       visibleLanguageForRequest,
       providerActivity: (input) => driverActivityBuilder.providerActivity(input),
       conversationActivity: (input) => driverActivityBuilder.conversationActivity(input),
-      emitProjectionDelta: (state, delta) => this.emitProjectionDelta(state, delta),
+      emitProjectionDelta: (state, delta) => this.agentRunReactor.emitProjectionDelta(state, delta),
       kernelCommand: (request) => this.ports.kernelCommand(request),
-      createId: (prefix) => this.id(prefix),
+      createId: (prefix) => this.agentRunReactor.id(prefix),
     });
     this.providerTurnRunner = new ProviderTurnRunner<SessionDriverLoopRunState>({
       jsonModeCoordinator: providerJsonModeCoordinator,
@@ -1459,7 +1459,7 @@ export class SessionDriverLoop {
       traceRecorder: providerTraceRecorder,
       visibleLanguageForRequest,
       providerActivity: (input) => driverActivityBuilder.providerActivity(input),
-      emitProjectionDelta: (state, delta) => this.emitProjectionDelta(state, delta),
+      emitProjectionDelta: (state, delta) => this.agentRunReactor.emitProjectionDelta(state, delta),
       cacheTelemetryEvent: (input) => sessionProgressProjectionBuilder.cacheTelemetryEvent(input),
       reasoningEvent: (sessionId, reasoning, ts, id) =>
         assistantProjectionBuilder.reasoningEvent(sessionId, reasoning, ts, id),
@@ -1472,8 +1472,8 @@ export class SessionDriverLoop {
         ? { code: error.code, message: error.message }
         : undefined,
       createError: (code, message) => new SessionDriverLoopError(code, message),
-      now: () => this.ts(),
-      createId: (prefix) => this.id(prefix),
+      now: () => this.agentRunReactor.ts(),
+      createId: (prefix) => this.agentRunReactor.id(prefix),
     });
     this.providerRuntimeBridge = new ProviderRuntimeBridge<SessionDriverLoopRunState, LlmTurnResult>({
       nativeToolProviderCoordinator: this.nativeToolProviderCoordinator,
@@ -1481,10 +1481,10 @@ export class SessionDriverLoop {
       providerTurnRunner: this.providerTurnRunner,
     }, {
       ...this.ports,
-      append: (sessionId, events) => this.append(sessionId, events),
-      emitProjectionDelta: (state, delta) => this.emitProjectionDelta(state, delta),
+      append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
+      emitProjectionDelta: (state, delta) => this.agentRunReactor.emitProjectionDelta(state, delta),
       consumeGuidanceMessages: async (state, stage) => {
-        const current = await this.append(state.sessionId, []);
+        const current = await this.agentRunReactor.append(state.sessionId, []);
         const language = visibleLanguageForRequest(state.userRequest);
         const resume = userGuidanceQueue.providerResume({
           sessionId: state.sessionId,
@@ -1492,10 +1492,10 @@ export class SessionDriverLoop {
           runId: state.runId,
           stage,
           summary: providerStreamCoordinator.userGuidanceConsumedSummary(language),
-          now: () => this.ts(),
-          createId: (prefix) => this.id(prefix),
+          now: () => this.agentRunReactor.ts(),
+          createId: (prefix) => this.agentRunReactor.id(prefix),
         });
-        if (resume.events.length) await this.append(state.sessionId, resume.events);
+        if (resume.events.length) await this.agentRunReactor.append(state.sessionId, resume.events);
         return resume.messages;
       },
       acceptedPlanId: (state) => state.acceptedImplementationPlan?.planId,
@@ -1511,9 +1511,9 @@ export class SessionDriverLoop {
       isEmptyResponseError,
     });
     this.providerProposalCoordinator = new ProviderProposalCoordinator<SessionDriverLoopInput, SessionDriverLoopRunState>({
-      append: (sessionId, events) => this.append(sessionId, events),
-      createId: (prefix) => this.id(prefix),
-      now: () => this.ts(),
+      append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
+      createId: (prefix) => this.agentRunReactor.id(prefix),
+      now: () => this.agentRunReactor.ts(),
       thinkingEvent: (sessionId, content, ts, id) =>
         assistantProjectionBuilder.thinkingEvent(sessionId, content, ts, id),
       providerResult: (providerInput, state, prompt, contract) =>
@@ -1564,8 +1564,8 @@ export class SessionDriverLoop {
         error instanceof SessionDriverLoopError && error.code === code,
     });
     this.providerTurnContextCoordinator = new ProviderTurnContextCoordinator<SessionDriverLoopRunState>({
-      now: () => this.ts(),
-      createId: (prefix) => this.id(prefix),
+      now: () => this.agentRunReactor.ts(),
+      createId: (prefix) => this.agentRunReactor.id(prefix),
       assembleContext: (contextInput) => assembleContext(contextInput),
       allowedProposals: (kernelAllowed, state) =>
         providerTurnPolicy.allowedProposals(kernelAllowed, state),
@@ -1585,9 +1585,9 @@ export class SessionDriverLoop {
           summary: providerStreamCoordinator.userGuidanceConsumedSummary(
             visibleLanguageForRequest(guidanceInput.userRequest)
           ),
-          append: (sessionId, events) => this.append(sessionId, events),
-          now: () => this.ts(),
-          createId: (prefix) => this.id(prefix),
+          append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
+          now: () => this.agentRunReactor.ts(),
+          createId: (prefix) => this.agentRunReactor.id(prefix),
         }),
       buildProviderTurnContract: (contractInput) =>
         contextFrameBuilder.buildSessionProviderTurnContract(contractInput),
@@ -1596,8 +1596,8 @@ export class SessionDriverLoop {
       refreshRuntimeState: (state) => acceptedPlanTaskLedger().refreshRuntimeState(state),
       prepareProviderContext: (handlerInput, state, lastResult) =>
         this.providerTurnContextCoordinator.prepare(state, {
-          contextAssemblyId: this.id('context-assembly'),
-          contractId: this.id('provider-turn-contract'),
+          contextAssemblyId: this.agentRunReactor.id('context-assembly'),
+          contractId: this.agentRunReactor.id('provider-turn-contract'),
           inputContent: handlerInput.content,
           projectMemoryMode: handlerInput.projectMemoryMode,
           interventionLevel: handlerInput.interventionLevel,
@@ -1609,22 +1609,22 @@ export class SessionDriverLoop {
       route: (routerInput) => this.proposalRouter.route(routerInput),
       appendDriverFailure: async (state, error) => {
         if (!(error instanceof SessionDriverLoopError)) return null;
-        return this.append(state.sessionId, [
+        return this.agentRunReactor.append(state.sessionId, [
           assistantProjectionBuilder.finalDiagnosticEvent(
             state.sessionId,
             driverFailureMessageCatalog.driverFailure(error.code, error.message),
-            this.ts(),
-            this.id(error.code)
+            this.agentRunReactor.ts(),
+            this.agentRunReactor.id(error.code)
           ),
         ]);
       },
       appendProviderFailure: (state, error) =>
-        this.append(state.sessionId, [
+        this.agentRunReactor.append(state.sessionId, [
           assistantProjectionBuilder.finalDiagnosticEvent(
             state.sessionId,
             driverFailureMessageCatalog.providerFailure(error),
-            this.ts(),
-            this.id('provider_call_failed')
+            this.agentRunReactor.ts(),
+            this.agentRunReactor.id('provider_call_failed')
           ),
         ]),
     });
@@ -1645,7 +1645,7 @@ export class SessionDriverLoop {
         const event = await this.requirementConfirmationCoordinator.build(input, state);
         state.phase = 'waiting_requirement_confirmation';
         const payload = objectRecord(event.payload) ?? {};
-        return this.append(sessionId, [
+        return this.agentRunReactor.append(sessionId, [
           event,
           sessionProgressProjectionBuilder.sessionRunStateEvent({
             sessionId,
@@ -1658,18 +1658,18 @@ export class SessionDriverLoop {
               targetId: stringValue(payload.requirementId),
               requirementId: stringValue(payload.requirementId),
             },
-            ts: this.ts(),
-            id: this.id('session-run-waiting-requirement'),
+            ts: this.agentRunReactor.ts(),
+            id: this.agentRunReactor.id('session-run-waiting-requirement'),
           }),
         ]);
       } catch (error) {
         const message = error instanceof SessionDriverLoopError ? error.message : String(error);
-        return this.append(sessionId, [
+        return this.agentRunReactor.append(sessionId, [
           assistantProjectionBuilder.finalDiagnosticEvent(
             sessionId,
             diag('requirementConfirmationFailed', `Requirement confirmation generation failed: ${message}`, { message }),
-            this.ts(),
-            this.id('requirement-confirmation-failed')
+            this.agentRunReactor.ts(),
+            this.agentRunReactor.id('requirement-confirmation-failed')
           ),
         ]);
       }
@@ -1693,53 +1693,6 @@ export class SessionDriverLoop {
     return lastResult;
   }
 
-  private async emitProjectionDelta(
-    state: SessionDriverLoopRunState,
-    delta: Omit<ProjectionDelta, 'sessionId' | 'runId' | 'turnId' | 'seq'>
-  ): Promise<void> {
-    return this.agentRunReactor.emitProjectionDelta(state, delta);
-  }
-
-  private async emitKernelActivityDeltas(
-    state: SessionDriverLoopRunState,
-    kernelEvents: unknown[],
-    stage: string
-  ): Promise<void> {
-    return this.agentRunReactor.emitKernelActivityDeltas(state, kernelEvents, stage);
-  }
-
-  private async kernel(request: KernelCommandEnvelope): Promise<KernelReply> {
-    return this.agentRunReactor.kernel(request);
-  }
-
-  private async tryKernelAudit(
-    sessionId: string,
-    request: KernelCommandEnvelope,
-    traceKind: AgentEvent['kind'],
-    summary: string
-  ): Promise<AgentSessionResult> {
-    return this.agentRunReactor.tryKernelAudit(sessionId, request, traceKind, summary);
-  }
-
-  private async append(sessionId: string, events: AgentEvent[]): Promise<AgentSessionResult> {
-    return this.agentRunReactor.append(sessionId, events);
-  }
-
-  private async appendProjectedKernelEvents(sessionId: string, reply: KernelReply): Promise<AgentSessionResult> {
-    return this.agentRunReactor.appendProjectedKernelEvents(sessionId, reply);
-  }
-
-  private event(sessionId: string, kind: AgentEvent['kind'], payload: unknown): AgentEvent {
-    return this.agentRunReactor.event(sessionId, kind, payload);
-  }
-
-  private id(prefix: string): string {
-    return this.agentRunReactor.id(prefix);
-  }
-
-  private ts(): string {
-    return this.agentRunReactor.ts();
-  }
 }
 
 function isEmptyResponseError(error: unknown): boolean {
