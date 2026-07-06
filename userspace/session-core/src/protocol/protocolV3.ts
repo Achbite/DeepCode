@@ -522,11 +522,26 @@ function normalizeDecisionRequest(value: Record<string, unknown>): Record<string
         description: optionalString(record, 'description') ?? '',
         recommended: typeof record.recommended === 'boolean' ? record.recommended : index === 0,
       };
+      const labelKey = optionalString(record, 'labelKey');
+      if (labelKey) normalized.labelKey = labelKey;
+      const descriptionKey = optionalString(record, 'descriptionKey');
+      if (descriptionKey) normalized.descriptionKey = descriptionKey;
+      const messageArgs = optionalStringRecord(record.messageArgs);
+      if (messageArgs) normalized.messageArgs = messageArgs;
       const effect = normalizeOptionEffect(record.effect);
       if (effect) normalized.effect = effect;
       return normalized;
     }),
   };
+}
+
+function optionalStringRecord(value: unknown): Record<string, string> | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const out: Record<string, string> = {};
+  for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof item === 'string') out[key] = item;
+  }
+  return Object.keys(out).length ? out : undefined;
 }
 
 function normalizeOptionEffect(value: unknown): Record<string, unknown> | undefined {

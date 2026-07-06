@@ -3938,11 +3938,20 @@ async function assertAcceptedPlanScopeDecisionCoordinatorBuildsOutOfScopeInterve
     },
   });
 
-  const options = observedDecisionPayload?.options as Array<{ effect?: { kind?: string; targetPath?: string; recursive?: boolean } }> | undefined;
-  const expansion = options?.find((option) => option.effect?.kind === 'expandCurrentTaskScope')?.effect;
+  const options = observedDecisionPayload?.options as Array<{
+    labelKey?: string;
+    descriptionKey?: string;
+    messageArgs?: Record<string, string>;
+    effect?: { kind?: string; targetPath?: string; recursive?: boolean };
+  }> | undefined;
+  const expansionOption = options?.find((option) => option.effect?.kind === 'expandCurrentTaskScope');
+  const expansion = expansionOption?.effect;
   assertEqual(state.phase, 'waiting_permission', 'out-of-scope intervention waits for permission');
   assertEqual(expansion?.targetPath, targetPath, 'out-of-scope intervention normalizes target path');
   assertEqual(expansion?.recursive, true, 'out-of-scope intervention preserves directory recursion');
+  assertEqual(expansionOption?.labelKey, 'session.driver.acceptedPlanScope.option.expand.label', 'out-of-scope intervention exposes option label i18n key');
+  assertEqual(expansionOption?.descriptionKey, 'session.driver.acceptedPlanScope.option.expand.description', 'out-of-scope intervention exposes option description i18n key');
+  assertEqual(expansionOption?.messageArgs?.targetPath, targetPath, 'out-of-scope intervention exposes target path as i18n arg');
 }
 
 async function assertAcceptedPlanScopeResourceFollowupCoordinatorHandlesResourceRequests(): Promise<void> {
@@ -7082,7 +7091,14 @@ function assertV3Parser(): void {
       outputLanguage: 'en-US',
       reason: 'Need user choice for a generic boundary.',
       options: [
-        { id: 'retry', label: 'Retry', description: 'Retry with the current accepted scope.' },
+        {
+          id: 'retry',
+          label: 'Retry',
+          labelKey: 'session.driver.acceptedPlanScope.option.regenerate.label',
+          description: 'Retry with the current accepted scope.',
+          descriptionKey: 'session.driver.acceptedPlanScope.option.regenerate.description',
+          messageArgs: { targetPath: `target-${randomSmokeToken('decision-option')}` },
+        },
         { id: 'revise', label: 'Revise', description: 'Ask the user to revise the scope.' },
       ],
     }),
@@ -7090,6 +7106,9 @@ function assertV3Parser(): void {
   const decisionPayload = shorthandDecisionRequest.payload as any;
   assertEqual(decisionPayload.question, 'Need user choice for a generic boundary.', 'v3 decisionRequest shorthand is canonicalized to a question');
   assertEqual(decisionPayload.options.length, 2, 'v3 decisionRequest shorthand preserves valid options');
+  assertEqual(decisionPayload.options[0].labelKey, 'session.driver.acceptedPlanScope.option.regenerate.label', 'v3 decisionRequest preserves option label i18n key');
+  assertEqual(decisionPayload.options[0].descriptionKey, 'session.driver.acceptedPlanScope.option.regenerate.description', 'v3 decisionRequest preserves option description i18n key');
+  assert(typeof decisionPayload.options[0].messageArgs?.targetPath === 'string', 'v3 decisionRequest preserves string option i18n args');
 
   assertThrows(() => parseProposalEnvelope({
     runId: 'run-generic',

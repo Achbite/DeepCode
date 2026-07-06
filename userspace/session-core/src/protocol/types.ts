@@ -187,7 +187,10 @@ export interface AnswerDraft {
 export interface DecisionRequestOptionDraft {
   id: string;
   label: string;
+  labelKey?: string;
   description: string;
+  descriptionKey?: string;
+  messageArgs?: Record<string, string>;
   recommended?: boolean;
   effect?: AgentRequirementOptionEffect;
 }

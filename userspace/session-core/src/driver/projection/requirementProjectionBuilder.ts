@@ -8,7 +8,10 @@ export type RequirementDecisionLanguage = 'zh-CN' | 'en-US';
 export interface RequirementDecisionOption {
   id: string;
   label: string;
+  labelKey?: string;
   description?: string;
+  descriptionKey?: string;
+  messageArgs?: Record<string, string>;
   recommended?: boolean;
   effect?: unknown;
 }
@@ -134,7 +137,10 @@ export class RequirementProjectionBuilder {
       return [{
         id,
         label,
+        labelKey: stringValue(record.labelKey),
         description,
+        descriptionKey: stringValue(record.descriptionKey),
+        messageArgs: stringRecordValue(record.messageArgs),
         recommended: record.recommended === true,
         effect: record.effect,
       }];
@@ -239,4 +245,14 @@ function objectRecord(value: unknown): Record<string, unknown> | undefined {
 
 function stringValue(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function stringRecordValue(value: unknown): Record<string, string> | undefined {
+  const record = objectRecord(value);
+  if (!record) return undefined;
+  const out: Record<string, string> = {};
+  for (const [key, item] of Object.entries(record)) {
+    if (typeof item === 'string') out[key] = item;
+  }
+  return Object.keys(out).length ? out : undefined;
 }

@@ -40,7 +40,10 @@ export class AcceptedPlanScopeIntervention {
         ...(expansion ? [{
           id: 'expand-current-task-scope',
           label: 'Allow this target',
+          labelKey: 'session.driver.acceptedPlanScope.option.expand.label',
           description: `Expand only the current accepted task to include ${expansion.targetPath}.`,
+          descriptionKey: 'session.driver.acceptedPlanScope.option.expand.description',
+          messageArgs: { targetPath: expansion.targetPath },
           recommended: true,
           effect: {
             kind: 'expandCurrentTaskScope',
@@ -54,14 +57,20 @@ export class AcceptedPlanScopeIntervention {
         {
           id: 'regenerate-in-scope',
           label: expansion ? 'Regenerate without expanding' : 'Regenerate in scope',
+          labelKey: expansion
+            ? 'session.driver.acceptedPlanScope.option.regenerateNoExpand.label'
+            : 'session.driver.acceptedPlanScope.option.regenerate.label',
           description: 'Keep the accepted plan and ask the agent to output the next batch within its targets and capabilities.',
+          descriptionKey: 'session.driver.acceptedPlanScope.option.regenerate.description',
           recommended: !expansion,
           effect: { kind: 'continueCurrentTask' },
         },
         {
           id: 'revise-plan',
           label: 'Revise plan scope',
+          labelKey: 'session.driver.acceptedPlanScope.option.revise.label',
           description: 'Treat the new targets or capabilities as a plan revision before continuing.',
+          descriptionKey: 'session.driver.acceptedPlanScope.option.revise.description',
           effect: { kind: 'replan', reason: 'revise accepted plan scope' },
         },
       ]
@@ -69,7 +78,10 @@ export class AcceptedPlanScopeIntervention {
         ...(expansion ? [{
           id: 'expand-current-task-scope',
           label: '允许当前目标',
+          labelKey: 'session.driver.acceptedPlanScope.option.expand.label',
           description: `仅将 ${expansion.targetPath} 加入当前已确认任务的执行范围。`,
+          descriptionKey: 'session.driver.acceptedPlanScope.option.expand.description',
+          messageArgs: { targetPath: expansion.targetPath },
           recommended: true,
           effect: {
             kind: 'expandCurrentTaskScope',
@@ -83,14 +95,20 @@ export class AcceptedPlanScopeIntervention {
         {
           id: 'regenerate-in-scope',
           label: expansion ? '不扩权并重新生成' : '重新生成合规批次',
+          labelKey: expansion
+            ? 'session.driver.acceptedPlanScope.option.regenerateNoExpand.label'
+            : 'session.driver.acceptedPlanScope.option.regenerate.label',
           description: '保持已确认计划不变，让 Agent 重新输出落在目标和能力范围内的下一批。',
+          descriptionKey: 'session.driver.acceptedPlanScope.option.regenerate.description',
           recommended: !expansion,
           effect: { kind: 'continueCurrentTask' },
         },
         {
           id: 'revise-plan',
           label: '修订计划范围',
+          labelKey: 'session.driver.acceptedPlanScope.option.revise.label',
           description: '把新增目标或能力作为计划修订先确认，再继续执行。',
+          descriptionKey: 'session.driver.acceptedPlanScope.option.revise.description',
           effect: { kind: 'replan', reason: 'revise accepted plan scope' },
         },
       ];
