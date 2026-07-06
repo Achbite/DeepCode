@@ -1,4 +1,4 @@
-import { renderProviderTurnContract, type ProviderTurnContract, type ProviderTurnMode } from './providerTurnContract.js';
+import { renderProviderTurnContract, type RenderedProviderTurnContract, type ProviderTurnMode } from './providerTurnContract.js';
 import type { PromptPacketFrame } from './promptPacket.js';
 
 export interface RepairProviderTurnContractCurrentTask {
@@ -13,7 +13,7 @@ export interface RepairProviderTurnContractInput {
   turnMode: ProviderTurnMode;
   allowedKinds: string[];
   requiredKind?: string;
-  repairPolicy?: ProviderTurnContract['repairPolicy'];
+  repairPolicy?: RenderedProviderTurnContract['repairPolicy'];
   errorLines?: string[];
   acceptedContext?: Record<string, unknown>;
   currentTaskContext?: RepairProviderTurnContractCurrentTask;

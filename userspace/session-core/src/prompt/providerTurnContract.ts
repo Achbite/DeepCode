@@ -16,7 +16,7 @@ export type ProviderRepairPolicy =
   | 'deterministicIntervention'
   | 'diagnosticOnly';
 
-export interface ProviderTurnContract {
+export interface RenderedProviderTurnContract {
   schemaVersion: 'deepcode.session.provider-turn-contract.v1';
   turnMode: ProviderTurnMode;
   allowedKinds: string[];
@@ -27,18 +27,18 @@ export interface ProviderTurnContract {
   frames: PromptPacketFrame[];
 }
 
-export interface ProviderTurnContractOptions {
+export interface RenderedProviderTurnContractOptions {
   turnMode?: ProviderTurnMode;
   allowedKinds?: string[];
   requiredKind?: string;
   repairPolicy?: ProviderRepairPolicy;
-  projectionVisibility?: ProviderTurnContract['projectionVisibility'];
+  projectionVisibility?: RenderedProviderTurnContract['projectionVisibility'];
 }
 
 export function buildProviderTurnContract(
   input: PromptEnvelopeBuilderInput,
-  options: ProviderTurnContractOptions = {}
-): ProviderTurnContract {
+  options: RenderedProviderTurnContractOptions = {}
+): RenderedProviderTurnContract {
   const turnMode = options.turnMode ?? inferProviderTurnMode(input);
   const allowedKinds = narrowAllowedKinds(options.allowedKinds ?? input.allowedProposals, turnMode);
   const scopedInput = { ...input, allowedProposals: allowedKinds };
@@ -56,12 +56,12 @@ export function buildProviderTurnContract(
 
 export function renderProviderTurnContractLayer(
   input: PromptEnvelopeBuilderInput,
-  options: ProviderTurnContractOptions = {}
+  options: RenderedProviderTurnContractOptions = {}
 ): string {
   return renderProviderTurnContract(buildProviderTurnContract(input, options));
 }
 
-export function renderProviderTurnContract(contract: ProviderTurnContract): string {
+export function renderProviderTurnContract(contract: RenderedProviderTurnContract): string {
   return [
     '<ProviderTurnContract schemaVersion="deepcode.session.provider-turn-contract.v1">',
     `turnMode: ${contract.turnMode}`,
