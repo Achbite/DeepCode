@@ -1,6 +1,7 @@
 import type { AgentContextAttachment, AgentEvent, AgentWorkspaceBinding } from '@deepcode/protocol';
 import type { ProjectMemoryMode } from '../context/index.js';
 import type { ProjectWorkingDirectory } from '../context/types.js';
+import type { RequirementRecord } from '../requirement/types.js';
 import type { AcceptedImplementationPlanContext } from './execution/index.js';
 import type { InteractionOverlayContext } from './pipelines/interactionOverlayCodec.js';
 import type { InterventionLevel, ReviewContinuationMode } from './types.js';
@@ -23,6 +24,7 @@ export interface DecisionContinuationOverride {
   existingEvents?: AgentEvent[];
   reviewContinuationMode?: ReviewContinuationMode;
   resumeResourcePackets?: boolean;
+  confirmedRequirement?: RequirementRecord;
   acceptedImplementationPlan?: AcceptedImplementationPlanContext;
   interactionOverlay?: InteractionOverlayContext;
 }
@@ -42,6 +44,7 @@ export type DecisionContinuationInput<Extra extends object = Record<string, neve
   interventionLevel?: InterventionLevel;
   projectMemoryMode?: ProjectMemoryMode;
   resumeResourcePackets?: boolean;
+  confirmedRequirement?: RequirementRecord;
   acceptedImplementationPlan?: AcceptedImplementationPlanContext;
   interactionOverlay?: InteractionOverlayContext;
 } & Extra;
@@ -56,6 +59,7 @@ export function decisionContinuationInput<Extra extends object = Record<string, 
     existingEvents,
     reviewContinuationMode,
     resumeResourcePackets,
+    confirmedRequirement,
     acceptedImplementationPlan,
     interactionOverlay,
     ...extra
@@ -76,6 +80,7 @@ export function decisionContinuationInput<Extra extends object = Record<string, 
     interventionLevel: source.interventionLevel,
     projectMemoryMode: source.projectMemoryMode,
     resumeResourcePackets,
+    confirmedRequirement,
     acceptedImplementationPlan,
     interactionOverlay: interactionOverlay ?? source.interactionOverlay,
   } as DecisionContinuationInput<Extra>;

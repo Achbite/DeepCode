@@ -29,6 +29,7 @@ import type {
   RequirementProjectionBuilder,
   SessionProgressProjectionBuilder,
 } from '../projection/index.js';
+import { decisionContinuationInput } from '../runContinuation.js';
 import type { InterventionLevel, RequirementConfirmationMode, ReviewContinuationMode } from '../types.js';
 
 export type RequirementDecisionHandlerDecision = 'accept' | 'reject' | 'revise';
@@ -231,8 +232,7 @@ export class RequirementDecisionHandler {
     current: AgentSessionResult
   ): Promise<AgentSessionResult> {
     const originalRequest = this.ports.userInputPipeline.requirementOriginalRequest(confirmation);
-    return this.ports.resumeUserTurn({
-      sessionId: input.sessionId,
+    return this.ports.resumeUserTurn(decisionContinuationInput(input, {
       content: input.decision === 'revise' && input.guidance
         ? [
             originalRequest,
@@ -247,17 +247,9 @@ export class RequirementDecisionHandler {
         : originalRequest,
       attachments: this.ports.userInputPipeline.requirementAttachments(confirmation),
       existingEvents: current.events,
-      workspaceBinding: input.workspaceBinding,
-      projectWorkingDirectory: input.projectWorkingDirectory,
-      profileId: input.profileId,
-      workflow: input.workflow,
-      appendUserMessage: false,
-      requirementConfirmationMode: 'off',
-      projectMemoryMode: input.projectMemoryMode,
-      interventionLevel: input.interventionLevel,
       resumeResourcePackets: true,
       interactionOverlay,
-    });
+    }));
   }
 
   private async resolveAcceptedPlanScopeDecision(
@@ -277,23 +269,14 @@ export class RequirementDecisionHandler {
       ?? (runId ? this.ports.planIndex.latestExecutablePlan(current.events, runId) : null);
 
     if (input.decision === 'revise' || selectedOptionId === 'revise-plan') {
-      return this.ports.resumeUserTurn({
-        sessionId: input.sessionId,
+      return this.ports.resumeUserTurn(decisionContinuationInput(input, {
         content: this.ports.repairLoop.acceptedPlanScopeRevisionRequest({ confirmation, plan, guidance: input.guidance }),
         attachments: this.ports.userInputPipeline.requirementAttachments(confirmation),
         existingEvents: current.events,
-        workspaceBinding: input.workspaceBinding,
-        projectWorkingDirectory: input.projectWorkingDirectory,
-        profileId: input.profileId,
-        workflow: input.workflow,
-        appendUserMessage: false,
-        requirementConfirmationMode: 'off',
         reviewContinuationMode: input.reviewContinuationMode,
-        interventionLevel: input.interventionLevel,
-        projectMemoryMode: input.projectMemoryMode,
         resumeResourcePackets: true,
         interactionOverlay,
-      });
+      }));
     }
 
     if (!plan || !plan.implementationPlan) {
@@ -318,24 +301,15 @@ export class RequirementDecisionHandler {
     const guidance = input.guidance?.trim()
       ? `User guidance for the accepted-plan scope intervention (verbatim):\n${input.guidance.trim()}`
       : this.ports.acceptedPlanScopeDecisionOverlay.resumeGuidance(selectedEffect);
-    return this.ports.resumeUserTurn({
-      sessionId: input.sessionId,
+    return this.ports.resumeUserTurn(decisionContinuationInput(input, {
       content: this.ports.executionPrompt.executionRequest(plan, nextAcceptedPlan, guidance),
       attachments: nextAcceptedPlan.executionRoot ? [nextAcceptedPlan.executionRoot.attachment] : this.ports.userInputPipeline.requirementAttachments(confirmation),
       existingEvents: current.events,
-      workspaceBinding: input.workspaceBinding,
-      projectWorkingDirectory: input.projectWorkingDirectory,
-      profileId: input.profileId,
-      workflow: input.workflow,
-      appendUserMessage: false,
-      requirementConfirmationMode: 'off',
       reviewContinuationMode: input.reviewContinuationMode,
-      interventionLevel: input.interventionLevel,
-      projectMemoryMode: input.projectMemoryMode,
       resumeResourcePackets: true,
       acceptedImplementationPlan: nextAcceptedPlan,
       interactionOverlay,
-    });
+    }));
   }
 
   private async resolveAcceptedPlanExecutionDecision(
@@ -362,6 +336,19 @@ export class RequirementDecisionHandler {
       input.decision,
       input.guidance
     );
+    if (input.decision !== 'revise') {
+      return this.ports.resumeUserTurn(decisionContinuationInput(input, {
+        content: this.ports.executionPrompt.executionRequest(acceptedContext.plan, acceptedContext.acceptedPlan, guidance),
+        attachments: acceptedContext.acceptedPlan.executionRoot
+          ? [acceptedContext.acceptedPlan.executionRoot.attachment]
+          : this.ports.userInputPipeline.requirementAttachments(confirmation),
+        existingEvents: current.events,
+        reviewContinuationMode: input.reviewContinuationMode,
+        resumeResourcePackets: true,
+        acceptedImplementationPlan: acceptedContext.acceptedPlan,
+        interactionOverlay,
+      }));
+    }
     return this.ports.resumeUserTurn({
       sessionId: input.sessionId,
       content: this.ports.executionPrompt.executionRequest(acceptedContext.plan, acceptedContext.acceptedPlan, guidance),
@@ -571,23 +558,14 @@ export class RequirementDecisionHandler {
 
     const result = await this.ports.append(input.sessionId, events) ?? current;
     const originalRequest = this.ports.userInputPipeline.requirementDecisionResumeRequest(confirmation, decisionEvent, input.decision, input.guidance);
-    return this.ports.resumeUserTurn({
-      sessionId: input.sessionId,
+    return this.ports.resumeUserTurn(decisionContinuationInput(input, {
       content: originalRequest,
       attachments: this.ports.userInputPipeline.requirementAttachments(confirmation),
       existingEvents: result.events,
-      workspaceBinding: input.workspaceBinding,
-      projectMemoryMode: input.projectMemoryMode,
-      projectWorkingDirectory: input.projectWorkingDirectory,
-      profileId: input.profileId,
-      workflow: input.workflow,
-      appendUserMessage: false,
       confirmedRequirement: this.ports.userInputPipeline.requirementRecordFromEvent(confirmation, 'confirmed'),
-      requirementConfirmationMode: 'off',
-      interventionLevel: input.interventionLevel,
       acceptedImplementationPlan: nextAccepted,
       interactionOverlay,
-    });
+    }));
   }
 
   private recoverAcceptedPlanForRequirement(

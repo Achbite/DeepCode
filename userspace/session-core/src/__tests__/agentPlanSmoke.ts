@@ -376,12 +376,14 @@ function assertDecisionContinuationInputKeepsDecisionResumeInSameLoop(): void {
     reviewContinuationMode: 'auto',
     interactionOverlay: overrideOverlay,
     resumeResourcePackets: true,
+    confirmedRequirement: { requirementId: `requirement-${token}`, status: 'confirmed' } as any,
   });
   assertEqual(input.appendUserMessage, false, 'decision continuation never appends a new user message');
   assertEqual(input.requirementConfirmationMode, 'off', 'decision continuation does not re-enter requirement confirmation');
   assertEqual(input.reviewContinuationMode, 'auto', 'decision continuation allows explicit continuation mode override');
   assertEqual(input.interactionOverlay, overrideOverlay, 'decision continuation preserves the active owner override');
   assertEqual(input.resumeResourcePackets, true, 'decision continuation can carry resource packets into the same loop');
+  assertEqual(input.confirmedRequirement?.requirementId, `requirement-${token}`, 'decision continuation can carry confirmed requirement authority');
 }
 
 function assertProviderTurnSnapshotRecordsContextAdmissionShape(): void {
