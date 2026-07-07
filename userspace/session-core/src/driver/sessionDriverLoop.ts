@@ -459,7 +459,7 @@ export class SessionDriverLoop {
           id
         ),
       executionRequest: (plan, acceptedPlan) => executionPromptCoordinator().executionRequest(plan, acceptedPlan),
-      runUserTurn: this.sameLoopContinuation.runUserTurn,
+      continueSameLoop: this.sameLoopContinuation.runUserTurn,
       staticSyntaxReview: (reviewInput) => this.acceptedPlanStaticSyntaxReviewCoordinator.run(reviewInput),
       reviewHandoff: (handoffInput) => this.acceptedPlanReviewHandoffCoordinator.handoff(handoffInput),
     });
