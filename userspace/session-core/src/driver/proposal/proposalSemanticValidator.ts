@@ -191,6 +191,10 @@ export class ProposalSemanticValidator {
   validateProposalSemantics(proposal: ProposalEnvelope, options?: {
     allowBriefActionBundleUserPlan?: boolean;
   }): void {
+    if (proposal.kind === 'taskPlan' || proposal.kind === 'implementationPlan') {
+      this.validateTaskPlanSemantics(proposal);
+      return;
+    }
     if (proposal.kind !== 'actionBundle') return;
     const payload = objectRecord(proposal.payload) ?? {};
     const bundle = this.ports.readActionBundle(proposal);
@@ -329,6 +333,27 @@ export class ProposalSemanticValidator {
     }
   }
 
+  private validateTaskPlanSemantics(proposal: ProposalEnvelope): void {
+    const plan = objectRecord(proposal.payload) ?? {};
+    const tasks = Array.isArray(plan.tasks) ? plan.tasks : [];
+    for (const [index, item] of tasks.entries()) {
+      const record = objectRecord(item) ?? {};
+      const targets = [
+        ...stringArrayValue(record.target),
+        ...stringArrayValue(record.targets),
+      ];
+      if (!targets.length) {
+        throw new AgentPlanParseError('invalid_task_plan', `taskPlan.tasks[${index}].target must include at least one concrete target.`);
+      }
+      if (!stringArrayValue(record.acceptanceCriteria).length) {
+        throw new AgentPlanParseError('invalid_task_plan', `taskPlan.tasks[${index}].acceptanceCriteria must include at least one reviewable criterion.`);
+      }
+      if (!stringArrayValue(record.failureCriteria).length) {
+        throw new AgentPlanParseError('invalid_task_plan', `taskPlan.tasks[${index}].failureCriteria must include at least one stop or replan criterion.`);
+      }
+    }
+  }
+
   private deleteActionTargetError(action: ActionBundleDraft['actions'][number]): string | undefined {
     const target = this.ports.actionFileTargetPath(action as unknown as Record<string, unknown>);
     if (!target) {
@@ -406,6 +431,13 @@ function objectRecord(value: unknown): Record<string, unknown> | undefined {
 
 function stringValue(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function stringArrayValue(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0).map((item) => item.trim());
+  }
+  return typeof value === 'string' && value.trim() ? [value.trim()] : [];
 }
 
 function normalizePlanScope(value: string): string {

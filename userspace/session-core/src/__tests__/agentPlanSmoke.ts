@@ -2055,6 +2055,76 @@ function assertProposalSemanticValidatorCanonicalizesAndDefaults(): void {
   const bundle = (proposal.payload as Record<string, any>).actionBundle;
   assertEqual(bundle.validationExpectations[0].messageKey, 'session.driver.defaultValidation.targets', 'proposal semantic validator adds validation expectation key');
   assertEqual(bundle.reviewExpectations[0].messageKey, 'session.driver.defaultReview.targets', 'proposal semantic validator adds review expectation key');
+
+  const validTaskPlan = {
+    schemaVersion: 'deepcode.agent.protocol.v3',
+    proposalId: `task-plan-${token}`,
+    runId: `run-${token}`,
+    sessionId: `session-${token}`,
+    source: 'llm',
+    kind: 'taskPlan',
+    payload: {
+      version: '1',
+      id: `task-plan-${token}`,
+      title: `Plan ${token}`,
+      summary: `Plan summary ${token}`,
+      tasks: [{
+        taskId: `task-${token}`,
+        title: `Task ${token}`,
+        target: [target],
+        acceptanceCriteria: [`Acceptance ${token}`],
+        failureCriteria: [`Failure ${token}`],
+      }],
+      risks: [],
+      reviewCheckpoints: [],
+    },
+  } as ProposalEnvelope;
+  validator.validateProposalSemantics(validTaskPlan);
+
+  const missingTargetTaskPlan = {
+    ...validTaskPlan,
+    payload: {
+      ...(validTaskPlan.payload as Record<string, any>),
+      tasks: [{
+        taskId: `task-missing-target-${token}`,
+        title: `Task missing target ${token}`,
+        target: [],
+        acceptanceCriteria: [`Acceptance ${token}`],
+        failureCriteria: [`Failure ${token}`],
+      }],
+    },
+  } as ProposalEnvelope;
+  assertThrows(() => validator.validateProposalSemantics(missingTargetTaskPlan), 'target must include at least one concrete target');
+
+  const missingAcceptanceTaskPlan = {
+    ...validTaskPlan,
+    payload: {
+      ...(validTaskPlan.payload as Record<string, any>),
+      tasks: [{
+        taskId: `task-missing-acceptance-${token}`,
+        title: `Task missing acceptance ${token}`,
+        target: [target],
+        acceptanceCriteria: [],
+        failureCriteria: [`Failure ${token}`],
+      }],
+    },
+  } as ProposalEnvelope;
+  assertThrows(() => validator.validateProposalSemantics(missingAcceptanceTaskPlan), 'acceptanceCriteria must include at least one reviewable criterion');
+
+  const missingFailureTaskPlan = {
+    ...validTaskPlan,
+    payload: {
+      ...(validTaskPlan.payload as Record<string, any>),
+      tasks: [{
+        taskId: `task-missing-failure-${token}`,
+        title: `Task missing failure ${token}`,
+        target: [target],
+        acceptanceCriteria: [`Acceptance ${token}`],
+        failureCriteria: [],
+      }],
+    },
+  } as ProposalEnvelope;
+  assertThrows(() => validator.validateProposalSemantics(missingFailureTaskPlan), 'failureCriteria must include at least one stop or replan criterion');
 }
 
 async function assertProviderPipelineUsesProviderTurnContract(): Promise<void> {
@@ -8694,6 +8764,7 @@ function assertPromptEnvelope(): void {
   assert(!prompt.stablePrefix.includes('expectedValidation'), 'prompt no longer teaches expectedValidation to providers');
   assert(!prompt.stablePrefix.includes('reviewGuide'), 'prompt no longer teaches reviewGuide to providers');
   assert(prompt.dynamicSuffix.includes('tasks[] is a Session-advanced ordered implementation queue'), 'provider turn schema treats taskPlan as an ordered queue');
+  assert(prompt.dynamicSuffix.includes('every task must include non-empty target or targets, acceptanceCriteria, and failureCriteria'), 'provider turn schema requires executable-quality task slices');
   assert(!prompt.stablePrefix.includes('Session can schedule parallel graph nodes'), 'prompt no longer requires provider-facing graph scheduling');
   assert(!prompt.stablePrefix.includes('payload object matching that kind'), 'prompt avoids payload wrapper wording');
   assert(!prompt.stablePrefix.includes('actionBundle payload:'), 'prompt avoids ambiguous actionBundle payload wording');
