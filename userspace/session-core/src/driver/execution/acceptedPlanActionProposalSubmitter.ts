@@ -13,7 +13,7 @@ import type { AcceptedImplementationPlanContext, AcceptedPlanBatchProgress } fro
 import type { ProposalEnvelope, ResourceRequestDraft } from '../../protocol/types.js';
 import type { PromptEnvelope } from '../../prompt/types.js';
 import type { InteractionOverlayContext } from '../pipelines/interactionOverlayCodec.js';
-import { decisionContinuationInput } from '../runContinuation.js';
+import { acceptedPlanContinuationInput } from '../runContinuation.js';
 import { kernelReplyErrorMessage } from './kernelReplyGuard.js';
 
 export interface AcceptedPlanActionProposalInput {
@@ -281,12 +281,11 @@ export class AcceptedPlanActionProposalSubmitter<
             result: fallback,
           });
           if (followup.kind === 'failed') return followup.result;
-          return this.ports.runUserTurn(decisionContinuationInput(input, {
+          return this.ports.runUserTurn(acceptedPlanContinuationInput(input, {
             content: followup.content,
             attachments: accepted.executionRoot ? [accepted.executionRoot.attachment] : [],
             existingEvents: followup.result.events,
             reviewContinuationMode: input.reviewContinuationMode,
-            resumeResourcePackets: true,
             acceptedImplementationPlan: accepted,
           }));
         }
@@ -615,7 +614,7 @@ export class AcceptedPlanActionProposalSubmitter<
     }
 
     if (!this.ports.hasFailureOrBlocker(batchReply.events ?? []) && !this.ports.complete(nextAccepted)) {
-      return this.ports.runUserTurn(decisionContinuationInput(input, {
+      return this.ports.runUserTurn(acceptedPlanContinuationInput(input, {
         content: this.ports.executionRequest(
           {
             ...this.ports.executionContext({
@@ -632,7 +631,6 @@ export class AcceptedPlanActionProposalSubmitter<
         attachments: nextAccepted.executionRoot ? [nextAccepted.executionRoot.attachment] : [],
         existingEvents: result.events,
         reviewContinuationMode: input.reviewContinuationMode,
-        resumeResourcePackets: true,
         acceptedImplementationPlan: nextAccepted,
       }));
     }
@@ -766,7 +764,7 @@ export class AcceptedPlanActionProposalSubmitter<
     }
 
     if (!this.ports.complete(nextAccepted)) {
-      return this.ports.runUserTurn(decisionContinuationInput(input, {
+      return this.ports.runUserTurn(acceptedPlanContinuationInput(input, {
         content: this.ports.executionRequest(
           {
             sessionId: state.sessionId,
@@ -781,7 +779,6 @@ export class AcceptedPlanActionProposalSubmitter<
         attachments: nextAccepted.executionRoot ? [nextAccepted.executionRoot.attachment] : [],
         existingEvents: checkpointResult.events,
         reviewContinuationMode: input.reviewContinuationMode,
-        resumeResourcePackets: true,
         acceptedImplementationPlan: nextAccepted,
       }));
     }

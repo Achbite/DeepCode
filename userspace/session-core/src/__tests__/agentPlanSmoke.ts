@@ -48,7 +48,7 @@ import { AgentRunReactor } from '../driver/agentRunReactor.js';
 import { ContextFrameBuilder } from '../driver/context/contextFrameBuilder.js';
 import { ProviderTurnCycle } from '../driver/pipelines/providerTurnCycle.js';
 import { routeProposalKind } from '../driver/proposal/proposalRouter.js';
-import { decisionContinuationInput, SameLoopContinuation } from '../driver/runContinuation.js';
+import { acceptedPlanContinuationInput, decisionContinuationInput, SameLoopContinuation } from '../driver/runContinuation.js';
 import { renderProviderTurnContractLayer } from '../prompt/providerTurnContract.js';
 import { AcceptedPlanResourceResumeCoordinator, ActionBundleAdmissionResourceFollowupCoordinator, GeneratedArtifactEvidenceIndex, PathIdentity, ResourceEvidenceIndex, ResourceOrchestrator, ResourceRequestLoop, ResourceRequestRepairCoordinator, buildProviderTurnSnapshot } from '../driver/context/index.js';
 import {
@@ -105,6 +105,7 @@ async function main(): Promise<void> {
   assertProposalSemanticValidatorCanonicalizesAndDefaults();
   assertPromptEnvelope();
   assertDecisionContinuationInputKeepsDecisionResumeInSameLoop();
+  assertAcceptedPlanContinuationDefaultsResourceResume();
   await assertSameLoopContinuationUsesSingleResumePort();
   await assertRunEngineContinuationUsesSameLifecycle();
   await assertRunEngineContinuesOnlyForResourceRequestRoute();
@@ -403,6 +404,27 @@ function assertDecisionContinuationInputKeepsDecisionResumeInSameLoop(): void {
   assertEqual(minimal.attachments?.length, 0, 'decision continuation defaults missing attachments to an empty list');
   assertEqual(minimal.appendUserMessage, false, 'minimal continuation still does not append a new user message');
   assertEqual(minimal.requirementConfirmationMode, 'off', 'minimal continuation still avoids requirement reconfirmation');
+}
+
+function assertAcceptedPlanContinuationDefaultsResourceResume(): void {
+  const token = randomSmokeToken('accepted-plan-continuation');
+  const acceptedPlan = {
+    planId: `plan-${token}`,
+    tasks: [],
+    completedTaskIds: [],
+  } as unknown as AcceptedImplementationPlanContext;
+  const input = acceptedPlanContinuationInput({
+    sessionId: `session-${token}`,
+    reviewContinuationMode: 'auto',
+  }, {
+    content: `continue accepted plan ${token}`,
+    existingEvents: [],
+    acceptedImplementationPlan: acceptedPlan,
+  });
+  assertEqual(input.appendUserMessage, false, 'accepted-plan continuation does not append a new user message');
+  assertEqual(input.requirementConfirmationMode, 'off', 'accepted-plan continuation does not re-enter requirement confirmation');
+  assertEqual(input.resumeResourcePackets, true, 'accepted-plan continuation defaults resource packet resume on');
+  assertEqual(input.acceptedImplementationPlan, acceptedPlan, 'accepted-plan continuation carries accepted plan authority');
 }
 
 async function assertSameLoopContinuationUsesSingleResumePort(): Promise<void> {

@@ -29,6 +29,10 @@ export interface DecisionContinuationOverride {
   interactionOverlay?: InteractionOverlayContext;
 }
 
+export interface AcceptedPlanContinuationOverride extends DecisionContinuationOverride {
+  acceptedImplementationPlan: AcceptedImplementationPlanContext;
+}
+
 export class SameLoopContinuation<Input> {
   constructor(private readonly resume: (input: Input) => Promise<AgentSessionResult>) {}
 
@@ -92,4 +96,14 @@ export function decisionContinuationInput<Extra extends object = Record<string, 
     acceptedImplementationPlan,
     interactionOverlay: interactionOverlay ?? source.interactionOverlay,
   } as DecisionContinuationInput<Extra>;
+}
+
+export function acceptedPlanContinuationInput<Extra extends object = Record<string, never>>(
+  source: DecisionContinuationSource,
+  override: AcceptedPlanContinuationOverride & Extra
+): DecisionContinuationInput<Extra> {
+  return decisionContinuationInput(source, {
+    ...override,
+    resumeResourcePackets: override.resumeResourcePackets ?? true,
+  });
 }

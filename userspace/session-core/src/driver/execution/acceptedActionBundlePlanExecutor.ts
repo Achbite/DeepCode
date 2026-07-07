@@ -12,7 +12,7 @@ import type { AcceptedImplementationPlanContext, AcceptedPlanBatchProgress } fro
 import type { InteractionOverlayContext } from '../pipelines/interactionOverlayCodec.js';
 import type { PlanContext } from '../proposal/planContextIndex.js';
 import type { ProposalEnvelope } from '../../protocol/types.js';
-import { decisionContinuationInput } from '../runContinuation.js';
+import { acceptedPlanContinuationInput } from '../runContinuation.js';
 import type { InterventionLevel, ReviewContinuationMode } from '../types.js';
 import { assertKernelReplyOk, kernelReplyErrorMessage } from './kernelReplyGuard.js';
 
@@ -357,12 +357,11 @@ export class AcceptedActionBundlePlanExecutor {
           ),
         ]) ?? result;
         if (!this.ports.acceptedPlanComplete(nextAccepted)) {
-          return this.ports.resumeUserTurn(decisionContinuationInput(input, {
+          return this.ports.resumeUserTurn(acceptedPlanContinuationInput(input, {
             content: this.ports.executionRequest(acceptedOverlay.plan, nextAccepted),
             attachments: nextAccepted.executionRoot ? [nextAccepted.executionRoot.attachment] : [],
             existingEvents: result.events,
             reviewContinuationMode: input.reviewContinuationMode,
-            resumeResourcePackets: true,
             acceptedImplementationPlan: nextAccepted,
             interactionOverlay: plan.interactionOverlay ?? input.interactionOverlay,
           }));
