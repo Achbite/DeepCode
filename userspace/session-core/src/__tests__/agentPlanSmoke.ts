@@ -8725,9 +8725,7 @@ function assertPromptEnvelope(): void {
   });
   assert(renderedContract.includes('<PromptPacket schemaVersion="deepcode.session.prompt-packet.v1">'), 'provider turn contract renders prompt packet frames');
   assert(renderedContract.includes('kind: DynamicDialogue'), 'prompt packet labels dynamic dialogue frame');
-  assert(renderedContract.includes('use existing ResourceEvidence and AccessIndex first'), 'provider turn contract planning tool intent prefers existing evidence');
-  assert(renderedContract.includes('plan review is the normal confirmation checkpoint for reviewable assumptions'), 'provider turn contract planning intent narrows decisionRequest');
-  assert(renderedContract.includes('do not re-audit protocol rules'), 'provider turn contract keeps planning reasoning focused');
+  assert(renderedContract.includes('[ToolIntentTemplates]\n\n- none\n\n[/ToolIntentTemplates]'), 'planning provider turn does not duplicate next-action guidance in tool intent templates');
   assert(renderedContract.includes('trust: userIntent'), 'prompt packet marks dynamic dialogue as user intent');
   assert(renderedContract.includes('kind: ResourceEvidence'), 'prompt packet includes kernel-observed resource evidence frame');
   assert(renderedContract.includes('trust: kernelObservedFact'), 'prompt packet marks resource evidence as observed facts');
