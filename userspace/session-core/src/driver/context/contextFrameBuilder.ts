@@ -223,6 +223,8 @@ export class ContextFrameBuilder {
       `resourcePackets=${contextAssembly.resourcePacketCount}`,
       `resourceBlocks=${contextAssembly.resourceBlocks.length}`,
       `tailCount=${contextAssembly.resourceEvidenceTailCount}`,
+      `contentKinds=${resourceContentKindCounts(contextAssembly.resourceBlocks) || 'none'}`,
+      'resourceBlockDetails=see AccessIndex frame',
     ].join('; ');
   }
 
@@ -324,6 +326,15 @@ function resourceAccessIndexLine(block: ContextAssemblyResourceBlockRecord): str
     `chars=${block.charLength}`,
     `use=${resourceReuseInstruction(block)}`,
   ].join('; ');
+}
+
+function resourceContentKindCounts(blocks: readonly ContextAssemblyResourceBlockRecord[]): string {
+  const counts = blocks.reduce<Record<string, number>>((result, block) => {
+    const kind = block.contentKind ?? 'unknown';
+    result[kind] = (result[kind] ?? 0) + 1;
+    return result;
+  }, {});
+  return Object.keys(counts).sort().map((kind) => `${kind}=${counts[kind]}`).join(',');
 }
 
 function resourceRangeLabel(block: ContextAssemblyResourceBlockRecord): string {

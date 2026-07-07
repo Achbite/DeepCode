@@ -719,6 +719,10 @@ function assertProviderTurnSnapshotRecordsContextAdmissionShape(): void {
   });
   const accessFrame = contract.frames.find((frame) => frame.kind === 'AccessIndex');
   const accessSummary = accessFrame?.summary ?? '';
+  const resourceFrame = contract.frames.find((frame) => frame.kind === 'ResourceEvidence');
+  const resourceSummary = resourceFrame?.summary ?? '';
+  assert(resourceSummary.includes('contentKinds=directoryTree=1,fileText=1'), 'provider turn resource evidence records resource content kind counts');
+  assert(resourceSummary.includes('resourceBlockDetails=see AccessIndex frame'), 'provider turn resource evidence points detailed block reuse to access index');
   assert(accessSummary.includes(`ref=file-${token}.txt`), 'provider turn access index records resource identity');
   assert(accessSummary.includes('range=full-or-directory'), 'provider turn access index records resource range identity');
   assert(accessSummary.includes('use=file text is available'), 'provider turn access index records file text reuse instruction');
