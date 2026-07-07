@@ -445,7 +445,6 @@ function contextAssemblyPartitionCharCounts(segments: PromptSegment[]): ContextA
     'protocolContract',
     'builtinSystemPrompt',
     'systemStructure',
-    'toolCatalogSummary',
     'rulerContext',
     'authoritativeDocExcerpts',
   ]);

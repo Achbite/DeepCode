@@ -89,8 +89,8 @@ export function buildPromptEnvelope(input: PromptEnvelopeBuilderInput): PromptEn
     },
     {
       priority: 3,
-      stable: true,
-      cacheClass: 'workspaceStable',
+      stable: false,
+      cacheClass: 'turnDynamic',
       name: 'toolCatalogSummary',
       content: providerVisibleSchemaDigest(input),
     },

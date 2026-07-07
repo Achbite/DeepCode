@@ -8655,14 +8655,14 @@ function assertPromptEnvelope(): void {
   assert(prompt.dynamicSuffix.includes('targetPath/codeBlocks targetPath must be a concrete file path relative to the primary root'), 'prompt tells the model to avoid root-prefixed write paths');
   assert(prompt.dynamicSuffix.includes('rootId+path'), 'provider turn schema documents path-based resourceRequest without long JSON examples');
   assert(prompt.stablePrefix.includes('optional top-level narration'), 'prompt documents model-generated narration');
-  assert(prompt.stablePrefix.includes('reviewSummary is Session-generated'), 'provider turn schema excludes reviewSummary from provider proposal kinds');
+  assert(prompt.dynamicSuffix.includes('reviewSummary is Session-generated'), 'provider turn schema excludes reviewSummary from provider proposal kinds');
   assert(!prompt.stablePrefix.includes('Implementation payload budget'), 'stable prefix does not expose execution payload budgeting');
   assert(!prompt.stablePrefix.includes('implementationPlan top-level field'), 'prompt no longer documents implementationPlan as a provider kind');
   assert(!prompt.stablePrefix.includes('actionBundle.actions[] are executable Kernel tool actions shaped {actionId,toolId,args,description}'), 'stable prefix no longer exposes execution action shape');
   assert(!prompt.dynamicSuffix.includes('actionBundle.actions[] are executable Kernel tool actions shaped {actionId,toolId,args,description}'), 'planning provider turn does not expose execution action shape');
-  assert(prompt.stablePrefix.includes('Execution-only proposal schema is withheld in this turn'), 'planning provider turn withholds execution proposal schema');
-  assert(!prompt.stablePrefix.includes('Current schema digest covers only: answer, resourceRequest, actionBundle'), 'planning schema digest does not list execution-only actionBundle as a visible shape');
-  assert(!prompt.stablePrefix.includes('taskOutcome top-level field'), 'planning schema digest does not list accepted-task outcome shape');
+  assert(prompt.dynamicSuffix.includes('Execution-only proposal schema is withheld in this turn'), 'planning provider turn withholds execution proposal schema');
+  assert(!prompt.dynamicSuffix.includes('Current schema digest covers only: answer, resourceRequest, actionBundle'), 'planning schema digest does not list execution-only actionBundle as a visible shape');
+  assert(!prompt.dynamicSuffix.includes('taskOutcome top-level field'), 'planning schema digest does not list accepted-task outcome shape');
   assert(prompt.stablePrefix.includes('Use resourceRequest only when current ResourceEvidence and AccessIndex do not contain the concrete facts needed'), 'stable prompt gates resourceRequest behind missing concrete facts');
   assert(prompt.stablePrefix.includes('Plan review is the normal confirmation checkpoint for reviewable implementation assumptions'), 'stable prompt routes reviewable assumptions through taskPlan review');
   assert(prompt.stablePrefix.includes('blocking user choice is required before any valid taskPlan can be formed'), 'stable prompt narrows decisionRequest to blocking choices');
@@ -8678,7 +8678,7 @@ function assertPromptEnvelope(): void {
   assert(!prompt.stablePrefix.includes('Session derives routine defaults when they are omitted'), 'stable prefix no longer teaches execution defaults');
   assert(!prompt.stablePrefix.includes('expectedValidation'), 'prompt no longer teaches expectedValidation to providers');
   assert(!prompt.stablePrefix.includes('reviewGuide'), 'prompt no longer teaches reviewGuide to providers');
-  assert(prompt.stablePrefix.includes('tasks[] is a Session-advanced ordered implementation queue'), 'provider turn schema treats taskPlan as an ordered queue');
+  assert(prompt.dynamicSuffix.includes('tasks[] is a Session-advanced ordered implementation queue'), 'provider turn schema treats taskPlan as an ordered queue');
   assert(!prompt.stablePrefix.includes('Session can schedule parallel graph nodes'), 'prompt no longer requires provider-facing graph scheduling');
   assert(!prompt.stablePrefix.includes('payload object matching that kind'), 'prompt avoids payload wrapper wording');
   assert(!prompt.stablePrefix.includes('actionBundle payload:'), 'prompt avoids ambiguous actionBundle payload wording');
@@ -8787,9 +8787,9 @@ function assertPromptEnvelope(): void {
       completedTaskIds: [],
     },
   });
-  assert(acceptedPrompt.stablePrefix.includes('Current schema digest covers only: actionBundle, resourceRequest, decisionRequest, taskOutcome, diagnostic'), 'accepted execution schema digest lists current execution shapes');
-  assert(acceptedPrompt.stablePrefix.includes('actionBundle proposal top-level fields'), 'accepted execution schema digest documents actionBundle shape');
-  assert(acceptedPrompt.stablePrefix.includes('taskOutcome top-level field'), 'accepted execution schema digest documents taskOutcome shape');
+  assert(acceptedPrompt.dynamicSuffix.includes('Current schema digest covers only: actionBundle, resourceRequest, decisionRequest, taskOutcome, diagnostic'), 'accepted execution schema digest lists current execution shapes');
+  assert(acceptedPrompt.dynamicSuffix.includes('actionBundle proposal top-level fields'), 'accepted execution schema digest documents actionBundle shape');
+  assert(acceptedPrompt.dynamicSuffix.includes('taskOutcome top-level field'), 'accepted execution schema digest documents taskOutcome shape');
 
   const acceptedFrames = buildPromptPacketFrames({
     workflowState: 'executing_accepted_plan',
@@ -9667,6 +9667,23 @@ function assertContextAssemblerCachePlan(): void {
     },
     templateVersion: 'cache-plan-test',
   });
+  const proposalModeChange = assembleContext({
+    workflowState: 'needProposal',
+    allowedProposals: ['actionBundle', 'resourceRequest', 'decisionRequest', 'taskOutcome', 'diagnostic'],
+    capabilityCatalogSummary: 'fs.read',
+    userRequest: 'Answer a follow-up from the same reusable context.',
+    memoryDocument,
+    initialContext: {
+      id: 'initial-cache-generic',
+      workspaceScopeKey: manifest.workspaceScopeKey,
+      manifest,
+    },
+    profile: {
+      provider: 'deepseek',
+      model: 'deepseek-chat',
+    },
+    templateVersion: 'cache-plan-test',
+  });
 
   assertEqual(base.cachePlan.deepseekPrefixCache.requestParameterRequired, false, 'DeepSeek cache plan does not require request parameters');
   assertEqual(base.cachePlan.cacheAffectsCorrectness, false, 'cache plan is observability only');
@@ -9677,7 +9694,9 @@ function assertContextAssemblerCachePlan(): void {
   assert(base.cachePlan.providerCacheAttribution.partitionSnapshots.some((partition) => partition.name === 'ProjectMemory'), 'cache attribution snapshots include project memory partition');
   assertEqual(base.cachePlan.providerCacheAttribution.changedPartitions.length, 0, 'cache attribution does not report changes without a previous baseline');
   assertEqual(base.cachePlan.stablePrefixHash, followUp.cachePlan.stablePrefixHash, 'same stable layers keep stable prefix hash');
+  assertEqual(base.cachePlan.stablePrefixHash, proposalModeChange.cachePlan.stablePrefixHash, 'allowed proposal changes do not change stable prefix hash');
   assert(base.cachePlan.dynamicSuffixHash !== followUp.cachePlan.dynamicSuffixHash, 'current request changes dynamic suffix hash');
+  assert(base.cachePlan.dynamicSuffixHash !== proposalModeChange.cachePlan.dynamicSuffixHash, 'allowed proposal changes stay in dynamic suffix');
   assert(base.cachePlan.cacheHash !== followUp.cachePlan.cacheHash, 'overall cache hash changes with the dynamic suffix');
   assert(!base.prompt.stablePrefix.includes('Summarize the reusable context.'), 'stable prefix excludes current user request');
   assert(base.prompt.dynamicSuffix.includes('Summarize the reusable context.'), 'dynamic suffix carries current user request');
@@ -9752,8 +9771,9 @@ function assertContextAssemblerCachePlan(): void {
     'context assembly records stable protocol segments'
   );
   const toolCatalogSegment = base.contextAssembly.segments.find((segment) => segment.name === 'toolCatalogSummary');
-  assertEqual(toolCatalogSegment?.cacheClass, 'workspaceStable', 'tool catalog digest stays outside the turn-dynamic suffix');
-  assertEqual(toolCatalogSegment?.stablePrefix, true, 'tool catalog digest is part of the stable prefix');
+  assertEqual(toolCatalogSegment?.cacheClass, 'turnDynamic', 'tool catalog digest follows current allowed proposal state');
+  assertEqual(toolCatalogSegment?.stablePrefix, false, 'tool catalog digest stays outside the stable prefix');
+  assert(base.prompt.dynamicLayerNames.includes('toolCatalogSummary'), 'tool catalog digest is rendered in the dynamic suffix');
   assertEqual(
     base.contextAssembly.segments.some((segment) => segment.cacheClass === 'reusableResource' && segment.name === 'reusableResourceContext'),
     true,
