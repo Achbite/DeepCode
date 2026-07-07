@@ -747,7 +747,7 @@ impl SkillExecutor for GitPushExecutor {
             RiskLevel::Critical,
             vec![CapabilityEffect::PushesGit],
             vec!["complete"],
-            true,
+            false,
         )
     }
 
@@ -1696,6 +1696,14 @@ fn limit_text(value: &str, max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn git_push_executor_descriptor_is_reserved_from_model_catalog() {
+        let executor = GitPushExecutor;
+        let descriptor = executor.descriptor();
+        assert_eq!(descriptor.id, "git.push");
+        assert!(!descriptor.model_visible);
+    }
 
     #[test]
     fn exact_block_patch_replaces_unique_match() {

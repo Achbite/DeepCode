@@ -285,7 +285,7 @@ impl InMemorySkillRegistry {
                 RiskLevel::Critical,
                 vec![CapabilityEffect::PushesGit],
                 vec!["complete"],
-                true,
+                false,
             ),
             builtin(
                 "browser.open",
@@ -462,6 +462,12 @@ mod tests {
             Some(Capability::git_read())
         );
         assert!(git_status.effects.contains(&CapabilityEffect::ReadsGit));
+
+        let git_push = registry.get("git.push").unwrap().unwrap();
+        assert_eq!(git_push.risk_level, RiskLevel::Critical);
+        assert_eq!(git_push.primary_capability(), Some(Capability::git_push()));
+        assert!(!git_push.model_visible);
+        assert!(git_push.effects.contains(&CapabilityEffect::PushesGit));
 
         let browser_click = registry.get("browser.click").unwrap().unwrap();
         assert_eq!(

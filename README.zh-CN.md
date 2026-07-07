@@ -2,9 +2,11 @@
 
 > English default version: [README.md](README.md)
 
-DeepCode v0.5.23 是一个本地优先的 AI 编程工作台稳定基线版本，目标是把 Agent 会话协议、Kernel 工具执行、权限审计、上下文压缩、Editor/GUI/CLI/TUI 多入口封装在同一套后端事实源上。本版本稳定了 Session 协议 / parser、accepted-plan 执行、文件节点编排门禁、生成产物证据回填和 Review 前审查链路，同时保留可复现的本地构建 / 打包流程和 provider、工具、Session、Kernel、UI shell 的清晰职责边界。
+DeepCode v0.5.25 是一个本地优先的 AI 编程工作台稳定基线版本，目标是把 Agent 会话协议、Kernel 工具执行、权限审计、上下文压缩、Editor/GUI/CLI/TUI 多入口封装在同一套后端事实源上。本版本稳定了 Session 协议 / parser、accepted-plan 执行、文件节点编排门禁、生成产物证据回填、Review 前审查链路和 Kernel 工具目录基线，同时保留可复现的本地构建 / 打包流程和 provider、工具、Session、Kernel、UI shell 的清晰职责边界。
 
-v0.5.23 中子代理仍属于实验能力。由于并行草稿编排路径还不够稳定，默认设置已改为关闭；用户仍可在 Agent 设置中手动启用子代理做定向实验。Parent Session 仍是唯一负责校验草稿并提交 Kernel action 的权威路径。
+v0.5.25 中子代理仍属于实验能力。由于并行草稿编排路径还不够稳定，默认设置已改为关闭；用户仍可在 Agent 设置中手动启用子代理做定向实验。Parent Session 仍是唯一负责校验草稿并提交 Kernel action 的权威路径。
+
+发布文档当前使用 `v0.5.25 stable baseline` 口径。部分 Cargo 和 package 元数据可能仍显示 `0.5.24`；该版本元数据漂移已记录为后续发布元数据统一项，不改变本文描述的运行时边界。
 
 ## 构建与发布模式
 
@@ -183,7 +185,7 @@ conversation root 下的路径：
 - 最终回答和 review 总结跟随用户语言，默认中文。
 - `resourceRequest.items[]` 必须包含 `manifestEntryId` 或 `path` 二选一。存在多个 conversation root 时，`path` 应搭配 `rootId`。
 - `path` 只由 Session 在显式附件、项目默认工作目录或已证明的 conversation roots 内解析，然后提交 Kernel `ResourceResolve`；LLM 自行生成的任意本地绝对路径无效。
-- `actionBundle.actions[].capability` 使用 Kernel catalog id，如 `fs.write`、`fs.patch`、`fs.delete`、`network.egress`。
+- `actionBundle.actions[].toolId` 使用 Kernel catalog id，如 `fs.write`、`fs.patch`、`fs.delete`、`web.search`、`web.fetch`。
 - 文件操作必须使用 `fs.*` catalog id；`workspace` 只表示已授权的 scope/root 概念，不再是工具命名空间。
 - 写入草案通过 top-level `codeBlocks` 表达，action 通过 `sourceBlockId` 引用。
 - v3 parser 保持 fail-closed；解析失败只允许 Session 中的一次受控 LLM repair。Kernel 只验证结构化 proposal，不组装 prompt，也不 repair 模型输出。
@@ -192,11 +194,17 @@ conversation root 下的路径：
 
 当前 Kernel-visible tool catalog 包含：
 
-- 文件与搜索：`fs.list`、`fs.read`、`fs.diff`、`fs.write`、`fs.delete`、`code.search`
-- 进程：`process.exec`（当前版本为阻断 / 权限预览）
-- 联网证据：`web.search`、`web.fetch`
-- Git：`git.status`、`git.diff`、`git.stage`、`git.unstage`、`git.commit`
-- 内部浏览器：`browser.open`、`browser.reload`、`browser.snapshot`、`browser.inspect`、`browser.click`、`browser.type`、`browser.scroll`
+| 能力域 | Tool ids | 当前状态 |
+| --- | --- | --- |
+| 文件与搜索 | `fs.list`、`fs.read`、`fs.diff`、`code.search` | 可执行只读 / 搜索工具 |
+| 文件修改 | `fs.write`、`fs.patch`、`fs.delete` | 只能通过 Kernel proposal review、权限门禁和 audit 执行 |
+| 联网证据 | `web.search`、`web.fetch` | 受门禁控制的只读外部证据 |
+| Git | `git.status`、`git.diff`、`git.stage`、`git.unstage`、`git.commit` | V1 正式 Git 范围，写操作受门禁控制 |
+| Git 预留 | `git.push` | reserved / blocked，不是当前可执行能力 |
+| 进程 | `shell.propose` | preview-only 命令说明 / 提案能力 |
+| 进程预留 | `process.exec` | blocked / permission preview，不是当前可执行能力 |
+| 浏览器预留 | `browser.open`、`browser.reload`、`browser.snapshot`、`browser.inspect`、`browser.click`、`browser.type`、`browser.scroll` | 已注册但 blocked / reserved |
+| Provider 预留 | `provider.call` | 已注册但 blocked / reserved；provider transport 仍归 daemon 承载 |
 
 高风险能力必须经过 Kernel PermissionGate 与 audit 链路。`fs.delete` 对 LLM 可见，但属于高风险删除能力；用户拒绝后不得 fallback 成 shell 删除。
 
