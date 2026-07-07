@@ -446,6 +446,7 @@ function contextAssemblyPartitionCharCounts(segments: PromptSegment[]): ContextA
     'builtinSystemPrompt',
     'systemStructure',
     'agentInterventionContract',
+    'resourceEvidencePolicyContract',
     'rulerContext',
     'authoritativeDocExcerpts',
   ]);
@@ -544,6 +545,7 @@ function contextAssemblyPartitionName(segment: PromptSegment): ContextAssemblyPa
     case 'builtinSystemPrompt':
     case 'systemStructure':
     case 'agentInterventionContract':
+    case 'resourceEvidencePolicyContract':
       return 'AgentOperatingContract';
     case 'toolCatalogSummary':
       return 'StaticToolCatalogDigest';

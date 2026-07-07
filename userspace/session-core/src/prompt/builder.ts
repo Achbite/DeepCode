@@ -94,6 +94,13 @@ export function buildPromptEnvelope(input: PromptEnvelopeBuilderInput): PromptEn
       content: agentInterventionContractSummary(),
     },
     {
+      name: 'resourceEvidencePolicyContract',
+      priority: 2.6,
+      stable: true,
+      cacheClass: 'globalStable',
+      content: resourceEvidencePolicyContractSummary(),
+    },
+    {
       priority: 3,
       stable: false,
       cacheClass: 'turnDynamic',
@@ -284,14 +291,30 @@ function agentInterventionContractSummary(): string {
 }
 
 function currentResourceResultsSummary(input: PromptEnvelopeBuilderInput): string {
+  const resourceContext = input.resourcePromptContext;
   const lines: string[] = [];
-  lines.push('Evidence tail policy: read-only confirmations, resource snippets, search results, and current-turn tool results belong at the end of the dynamic context.');
-  lines.push('This section records evidence availability only. The final NextActionInstruction decides whether to propose now or request more evidence.');
-  lines.push('Prefer targeted search/grep-style queries and focused file ranges before requesting a whole large file or directory again.');
-  lines.push('Use existing ResourceEvidence and AccessIndex before requesting more resources; request more only when the missing fact would materially change the next proposal.');
-  lines.push('Avoid low-value repetition: do not request the exact same path/range/query again unless a previous ResourcePacket shows an error, memory appears stale, or a different segment is needed.');
-  lines.push('Current-turn tool results, permission facts, review feedback, and transient run state belong here or later in the dynamic suffix; they must not be promoted into the stable prefix.');
+  lines.push('Current resource result status.');
+  lines.push(`resourcePackets=${input.resourcePackets?.length ?? 0}`);
+  lines.push(`resourceBlocks=${resourceContext?.resourceBlocks.length ?? 0}`);
+  lines.push(`full=${resourceContext?.fullBlockCount ?? 0}`);
+  lines.push(`summary=${resourceContext?.summaryBlockCount ?? 0}`);
+  lines.push(`handleOnly=${resourceContext?.handleOnlyBlockCount ?? 0}`);
+  lines.push(`denied=${resourceContext?.deniedBlockCount ?? 0}`);
+  lines.push(`error=${resourceContext?.errorBlockCount ?? 0}`);
+  lines.push(`resourceFullTextChars=${resourceContext?.resourceFullTextCharCount ?? 0}`);
+  lines.push(`resourceSummaryChars=${resourceContext?.resourceSummaryCharCount ?? 0}`);
   return lines.join('\n');
+}
+
+function resourceEvidencePolicyContractSummary(): string {
+  return [
+    'Evidence tail policy: read-only confirmations, resource snippets, search results, and current-turn tool results belong at the end of the dynamic context.',
+    'Resource result status records evidence availability only. The final NextActionInstruction decides whether to propose now or request more evidence.',
+    'Prefer targeted search/grep-style queries and focused file ranges before requesting a whole large file or directory again.',
+    'Use existing ResourceEvidence and AccessIndex before requesting more resources; request more only when the missing fact would materially change the next proposal.',
+    'Avoid low-value repetition: do not request the exact same path/range/query again unless a previous ResourcePacket shows an error, memory appears stale, or a different segment is needed.',
+    'Current-turn tool results, permission facts, review feedback, and transient run state belong in the dynamic suffix; they must not be promoted into stable factual context.',
+  ].join('\n');
 }
 
 function requirementTranscriptSummary(input: PromptEnvelopeBuilderInput): string {

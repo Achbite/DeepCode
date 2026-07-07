@@ -8873,6 +8873,9 @@ function assertPromptEnvelope(): void {
   assert(prompt.stablePrefix.includes('<agentInterventionContract'), 'prompt keeps stable intervention contract in the protected prefix');
   assert(prompt.dynamicSuffix.includes('Agent user intervention level: medium.'), 'dynamic suffix carries the current intervention level');
   assert(!prompt.dynamicSuffix.includes('decisionRequest is a short intermediate planning checkpoint'), 'dynamic suffix does not repeat stable intervention contract text');
+  assert(prompt.stablePrefix.includes('<resourceEvidencePolicyContract'), 'prompt keeps stable resource evidence policy in the protected prefix');
+  assert(prompt.dynamicSuffix.includes('Current resource result status.'), 'dynamic suffix carries current resource result counters');
+  assert(!prompt.dynamicSuffix.includes('Evidence tail policy: read-only confirmations'), 'dynamic suffix does not repeat stable evidence policy text');
   assert(prompt.stablePrefix.includes('black-box validation'), 'prompt treats tests as black-box validation');
   assert(prompt.stablePrefix.includes('Do not optimize for known tests'), 'prompt rejects test-specific optimization');
   assert(prompt.stablePrefix.includes('fixed prompts'), 'prompt forbids fixed prompt special-casing');
@@ -8968,8 +8971,8 @@ function assertPromptEnvelope(): void {
   assert(prompt.dynamicSuffix.includes('generic content'), 'prompt includes ResourcePacket content');
   assert(!prompt.dynamicSuffix.includes('evidence-generic'), 'prompt excludes volatile evidence refs from provider-visible resource context');
   assert(!prompt.dynamicSuffix.includes('Read-only resource budget:'), 'prompt does not expose fixed read-only resource budget');
-  assert(prompt.dynamicSuffix.includes('final NextActionInstruction decides whether to propose now or request more evidence'), 'evidence tail defers read/propose choice to next-action instruction');
-  assert(prompt.dynamicSuffix.includes('missing fact would materially change the next proposal'), 'evidence tail narrows additional reads to proposal-changing facts');
+  assert(prompt.stablePrefix.includes('final NextActionInstruction decides whether to propose now or request more evidence'), 'stable evidence policy defers read/propose choice to next-action instruction');
+  assert(prompt.stablePrefix.includes('missing fact would materially change the next proposal'), 'stable evidence policy narrows additional reads to proposal-changing facts');
   assert(!prompt.dynamicSuffix.includes('not governed by a fixed Session round budget'), 'evidence tail no longer encourages open-ended read loops');
   assert(!prompt.dynamicSuffix.includes('do not answer prematurely'), 'evidence tail no longer tells planning turns to delay proposals');
   assert(prompt.dynamicSuffix.includes('offsetBytes/limitBytes'), 'prompt hints range reread for truncated resources');
@@ -10080,6 +10083,10 @@ function assertContextAssemblerCachePlan(): void {
   assert(
     base.contextAssembly.partitionRecords.find((partition) => partition.name === 'AgentOperatingContract')?.segmentNames.includes('agentInterventionContract') === true,
     'agent operating contract contains the stable intervention contract'
+  );
+  assert(
+    base.contextAssembly.partitionRecords.find((partition) => partition.name === 'AgentOperatingContract')?.segmentNames.includes('resourceEvidencePolicyContract') === true,
+    'agent operating contract contains the stable resource evidence policy'
   );
   assert(
     base.contextAssembly.partitionRecords.find((partition) => partition.name === 'AgentOperatingContract')?.segmentNames.includes('agentInterventionPolicy') !== true,
