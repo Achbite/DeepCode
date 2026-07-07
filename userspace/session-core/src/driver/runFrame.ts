@@ -178,11 +178,14 @@ export interface ModelContextBundle {
   readonly hookTrace: readonly HookResult[];
 }
 
-export interface SessionDriverLoopRunState {
+export interface SessionDriverIdentityState {
   sessionId: string;
   runId: string;
   userRequest: string;
   phase: SessionTurnPhase;
+}
+
+export interface SessionDriverResourceState {
   workspaceScopeKey: string;
   stateContract?: KernelStateContractRef;
   driverRequest?: DriverRequestRef;
@@ -191,28 +194,52 @@ export interface SessionDriverLoopRunState {
   initialContext: InitialContextPacket;
   resourcePackets: ResourcePacket[];
   generatedArtifactEvidence: Map<string, GeneratedArtifactEvidence>;
+}
+
+export interface SessionDriverMemoryState {
   memoryDocument: SessionMemoryDocument;
   memoryHints: string[];
   cachePlan?: PromptCachePlan;
   contextAssembly?: ContextAssemblyRecord;
+}
+
+export interface SessionDriverAcceptedPlanState {
   taskExecutionCursor?: TaskExecutionCursor;
   currentTaskContext?: CurrentTaskContext;
   taskLedger?: TaskLedgerSnapshot;
   acceptedPlanPromptFrame?: AcceptedPlanPromptFrame;
-  providerTurnFrame?: DriverProviderTurnFrame;
-  modelContextBundle?: ModelContextBundle;
   implementationBatch: ImplementationBatchContext;
   acceptedImplementationPlan?: AcceptedImplementationPlanContext;
+}
+
+export interface SessionDriverRepairState {
   resourceRequestRepairAttempted: boolean;
   actionBundleAdmissionRepairAttempted: boolean;
   planReviewRepairAttempted: boolean;
   acceptedPlanScopeRepairAttempted: boolean;
   terminalGuidanceRevisionAttempted: boolean;
+}
+
+export interface SessionDriverProviderState {
+  providerTurnFrame?: DriverProviderTurnFrame;
+  modelContextBundle?: ModelContextBundle;
   nativeToolReadLedger: Map<string, NativeToolReadLedgerEntry>;
   nativeToolDuplicateRepairAttempted: boolean;
   activeTurn?: ActiveTurnState;
+}
+
+export interface SessionDriverInteractionState {
   interactionOverlay?: InteractionOverlayContext;
 }
+
+export interface SessionDriverLoopRunState
+  extends SessionDriverIdentityState,
+    SessionDriverResourceState,
+    SessionDriverMemoryState,
+    SessionDriverAcceptedPlanState,
+    SessionDriverRepairState,
+    SessionDriverProviderState,
+    SessionDriverInteractionState {}
 
 export interface ActiveTurnState {
   turnId: string;
