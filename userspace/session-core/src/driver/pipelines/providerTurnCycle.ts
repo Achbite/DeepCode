@@ -31,8 +31,8 @@ export interface ProviderTurnCyclePorts<Input, State extends ProviderTurnCycleSt
 }
 
 export type ProviderTurnCycleResult =
-  | { kind: 'return'; result: AgentSessionResult }
-  | { kind: 'continue'; lastResult: AgentSessionResult; proposal: ProposalEnvelope };
+  | { kind: 'return'; result: AgentSessionResult; proposal?: ProposalEnvelope; routed?: RoutedProposal }
+  | { kind: 'continue'; lastResult: AgentSessionResult; proposal: ProposalEnvelope; routed: RoutedProposal };
 
 export class ProviderTurnCycle<Input, State extends ProviderTurnCycleState> {
   constructor(private readonly ports: ProviderTurnCyclePorts<Input, State>) {}
@@ -65,12 +65,18 @@ export class ProviderTurnCycle<Input, State extends ProviderTurnCycleState> {
       lastResult: providerContext.lastResult,
     });
     if (routed.kind === 'return') {
-      return { kind: 'return', result: routed.result };
+      return {
+        kind: 'return',
+        result: routed.result,
+        proposal,
+        routed: routedProposal,
+      };
     }
     return {
       kind: 'continue',
       lastResult: routed.lastResult,
       proposal,
+      routed: routedProposal,
     };
   }
 }

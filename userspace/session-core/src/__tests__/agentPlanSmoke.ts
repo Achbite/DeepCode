@@ -46,6 +46,7 @@ import {
 import { AcceptedPlanScopeMatcher, AcceptedTaskRegistry, type AcceptedImplementationPlanContext } from '../accepted-plan/index.js';
 import { AgentRunReactor } from '../driver/agentRunReactor.js';
 import { ContextFrameBuilder } from '../driver/context/contextFrameBuilder.js';
+import { ProviderTurnCycle } from '../driver/pipelines/providerTurnCycle.js';
 import { routeProposalKind } from '../driver/proposal/proposalRouter.js';
 import { decisionContinuationInput } from '../driver/runContinuation.js';
 import { renderProviderTurnContractLayer } from '../prompt/providerTurnContract.js';
@@ -169,6 +170,7 @@ async function main(): Promise<void> {
   assertPlanInteractionIndexFindsActivePlan();
   assertPlanReviewGrantProjectorBuildsExecutionReadModels();
   assertProposalRouterPlansPureRoutes();
+  await assertProviderTurnCycleReturnsRoutedProposal();
   assertAcceptedPlanTargetParserExtractsStructuredTargets();
   assertAcceptedPlanScopeMatcherNormalizesProposalTargets();
   assertAcceptedImplementationPlanContextBuilderBuildsRuntimeContext();
@@ -8440,6 +8442,59 @@ function assertProposalRouterPlansPureRoutes(): void {
   assertEqual(routeProposalKind(proposal('actionBundle')).kind, 'action', 'proposal router routes action bundles to action handling');
   assertEqual(routeProposalKind(proposal('taskOutcome')).kind, 'action', 'proposal router routes task outcomes to action handling');
   assertEqual(routeProposalKind(proposal('unknown-kind')).kind, 'nonExecutable', 'proposal router closes unknown proposal kinds as non-executable');
+}
+
+async function assertProviderTurnCycleReturnsRoutedProposal(): Promise<void> {
+  const suffix = randomSmokeToken('provider-cycle-route');
+  const result: AgentSessionResult = {
+    session: {
+      id: `session-${suffix}`,
+      mode: 'plan',
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+      eventCount: 0,
+    },
+    events: [],
+  };
+  const proposal = {
+    schemaVersion: 'deepcode.agent.protocol.v3',
+    proposalId: `proposal-${suffix}`,
+    runId: `run-${suffix}`,
+    sessionId: `session-${suffix}`,
+    source: 'llm',
+    kind: 'resourceRequest',
+    payload: {},
+    referencedResourcePacketRefs: [],
+    referencedEvidenceRefs: [],
+  } as ProposalEnvelope;
+  const cycle = new ProviderTurnCycle<
+    { sessionId: string },
+    { sessionId: string; phase: string }
+  >({
+    refreshRuntimeState: () => undefined,
+    prepareProviderContext: async () => ({
+      prompt: { messages: [] },
+      lastResult: result,
+    } as never),
+    callProviderAndParse: async () => proposal,
+    routeProposal: (nextProposal) => routeProposalKind(nextProposal),
+    executeRoutedProposal: async () => ({
+      kind: 'continue',
+      lastResult: result,
+    }),
+    appendDriverFailure: async () => null,
+    appendProviderFailure: async () => result,
+  });
+  const routed = await cycle.run({
+    input: { sessionId: `session-${suffix}` },
+    state: { sessionId: `session-${suffix}`, phase: 'initialized' },
+    lastResult: result,
+  });
+  assertEqual(routed.kind, 'continue', 'provider turn cycle can continue after routed resource requests');
+  if (routed.kind === 'continue') {
+    assertEqual(routed.routed.kind, 'resourceRequest', 'provider turn cycle returns the routed proposal to RunEngine');
+    assertEqual(routed.proposal, proposal, 'provider turn cycle preserves provider proposal with routed result');
+  }
 }
 
 function assertInteractionLedgerResolvesTerminalSourcePlanReview(): void {

@@ -83,13 +83,19 @@ export class RunEngine<Input, State extends RunEngineState> {
         if (!state || !lastResult) throw new Error('RunEngine provider state is missing.');
         const cycle = await this.ports.runProviderTurn({ input, state, lastResult });
         if (cycle.kind === 'return') {
-          const effect: RunEffect<State> = { kind: 'providerCycleReturned', result: cycle.result };
+          const effect: RunEffect<State> = {
+            kind: 'providerCycleReturned',
+            result: cycle.result,
+            proposal: cycle.proposal,
+            routed: cycle.routed,
+          };
           return this.terminal(effect.result);
         }
         const effect: RunEffect<State> = {
           kind: 'resourceRequestContinue',
           lastResult: cycle.lastResult,
           proposal: cycle.proposal,
+          routed: cycle.routed,
         };
         lastResult = effect.lastResult;
         command = { kind: 'callProviderAndParse' };
