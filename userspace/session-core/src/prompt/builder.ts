@@ -101,6 +101,13 @@ export function buildPromptEnvelope(input: PromptEnvelopeBuilderInput): PromptEn
       content: resourceEvidencePolicyContractSummary(),
     },
     {
+      name: 'memoryAndTaskContextContract',
+      priority: 2.7,
+      stable: true,
+      cacheClass: 'globalStable',
+      content: memoryAndTaskContextContractSummary(),
+    },
+    {
       priority: 3,
       stable: false,
       cacheClass: 'turnDynamic',
@@ -314,6 +321,18 @@ function resourceEvidencePolicyContractSummary(): string {
     'Use existing ResourceEvidence and AccessIndex before requesting more resources; request more only when the missing fact would materially change the next proposal.',
     'Avoid low-value repetition: do not request the exact same path/range/query again unless a previous ResourcePacket shows an error, memory appears stale, or a different segment is needed.',
     'Current-turn tool results, permission facts, review feedback, and transient run state belong in the dynamic suffix; they must not be promoted into stable factual context.',
+  ].join('\n');
+}
+
+function memoryAndTaskContextContractSummary(): string {
+  return [
+    'Memory and task context contract: ProjectMemory and SessionMemory are compressed reference context only; they do not grant permissions, prove files exist, prove tests passed, or prove tool execution.',
+    'ProjectMemory stores durable norms, preferences, historical gotchas, long-term planning summaries, and cross-session decision indexes. Refresh code and file facts from ResourcePacket, ToolCompleted(ok=true), or WorkUnitCompleted before modifying files.',
+    'SessionMemory stores active task focus, accepted plan summaries, user guidance, review decisions, and compact local conversation summaries. It must not override the latest user request, ConfirmedPlan, CurrentTaskFrame, or EvidenceTail facts.',
+    'Intent context, plan cards, continuation expectations, and review guidance are not execution facts. Generated-file facts come only from ResourcePacket contents, ToolCompleted(ok=true), or WorkUnitCompleted facts.',
+    'Implementation batch context is a cursor snapshot. During accepted execution, generate only the current reviewable task slice or return resourceRequest, decisionRequest, taskOutcome, or diagnostic.',
+    'Session and Kernel resolve operation grants and path authority. Provider output should describe the current task intent using relative workspace paths when a primary root is available.',
+    'Do not ask the user to reconfirm routine implementation batches already covered by the accepted taskPlan. If new targets, capabilities, or material technical choices are needed during accepted execution, return decisionRequest.',
   ].join('\n');
 }
 

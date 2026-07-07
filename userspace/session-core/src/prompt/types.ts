@@ -11,6 +11,7 @@ export interface PromptSystemLayer {
     | 'systemStructure'
     | 'agentInterventionContract'
     | 'resourceEvidencePolicyContract'
+    | 'memoryAndTaskContextContract'
     | 'toolCatalogSummary'
     | 'rulerContext'
     | 'authoritativeDocExcerpts'

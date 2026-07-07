@@ -8874,8 +8874,13 @@ function assertPromptEnvelope(): void {
   assert(prompt.dynamicSuffix.includes('Agent user intervention level: medium.'), 'dynamic suffix carries the current intervention level');
   assert(!prompt.dynamicSuffix.includes('decisionRequest is a short intermediate planning checkpoint'), 'dynamic suffix does not repeat stable intervention contract text');
   assert(prompt.stablePrefix.includes('<resourceEvidencePolicyContract'), 'prompt keeps stable resource evidence policy in the protected prefix');
+  assert(prompt.stablePrefix.includes('<memoryAndTaskContextContract'), 'prompt keeps stable memory/task context contract in the protected prefix');
+  assert(prompt.stablePrefix.includes('Memory and task context contract'), 'stable prefix owns memory and task boundary policy');
   assert(prompt.dynamicSuffix.includes('Current resource result status.'), 'dynamic suffix carries current resource result counters');
   assert(!prompt.dynamicSuffix.includes('Evidence tail policy: read-only confirmations'), 'dynamic suffix does not repeat stable evidence policy text');
+  assert(!prompt.dynamicSuffix.includes('Boundary: shared project memory stores durable norms'), 'dynamic suffix does not repeat stable project memory boundary text');
+  assert(!prompt.dynamicSuffix.includes('Boundary: session memory stores the active task focus'), 'dynamic suffix does not repeat stable session memory boundary text');
+  assert(!prompt.dynamicSuffix.includes('Authoritative generated-file facts come only from ResourcePacket contents'), 'dynamic suffix does not repeat generated-file authority policy');
   assert(prompt.stablePrefix.includes('black-box validation'), 'prompt treats tests as black-box validation');
   assert(prompt.stablePrefix.includes('Do not optimize for known tests'), 'prompt rejects test-specific optimization');
   assert(prompt.stablePrefix.includes('fixed prompts'), 'prompt forbids fixed prompt special-casing');
@@ -10090,6 +10095,10 @@ function assertContextAssemblerCachePlan(): void {
   assert(
     base.contextAssembly.partitionRecords.find((partition) => partition.name === 'AgentOperatingContract')?.segmentNames.includes('resourceEvidencePolicyContract') === true,
     'agent operating contract contains the stable resource evidence policy'
+  );
+  assert(
+    base.contextAssembly.partitionRecords.find((partition) => partition.name === 'AgentOperatingContract')?.segmentNames.includes('memoryAndTaskContextContract') === true,
+    'agent operating contract contains the stable memory/task context contract'
   );
   assert(
     base.contextAssembly.partitionRecords.find((partition) => partition.name === 'AgentOperatingContract')?.segmentNames.includes('agentInterventionPolicy') !== true,

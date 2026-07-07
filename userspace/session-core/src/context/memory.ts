@@ -436,7 +436,6 @@ function buildLegacySessionMemoryDocument(events: AgentEvent[]): SessionMemoryDo
 export function renderProjectMemoryHints(document: SessionMemoryDocument): string[] {
   return [
     'ProjectMemoryIndexDigest (project-scoped, 128k emergency soft cap):',
-    'Boundary: shared project memory stores durable norms, user preferences, historical gotchas, long-term planning summaries, and cross-session decision indexes. It is not Kernel authority and must be refreshed from ResourcePacket/tool facts when code may have changed.',
     `mode=${document.archiveMetadata?.projectMemoryMode ?? 'confirm'}`,
     `archiveHash=${document.archiveMetadata?.projectMemoryArchiveHash ?? 'none'}`,
     document.archiveMetadata?.expandedMemoryItemIds.length
@@ -454,7 +453,7 @@ export function renderProjectMemoryHints(document: SessionMemoryDocument): strin
 export function renderProjectMemoryRecallHints(document: SessionMemoryDocument): string[] {
   const lines = document.projectMemoryItems.map(compactMemoryBullet);
   return [
-    'ProjectMemoryRecall (dynamic selected project memory; refresh file facts before modifying files):',
+    'ProjectMemoryRecall (dynamic selected project memory):',
     lines.length
       ? `selectedProjectMemory:\n${capMemoryLines(lines, 16_000).map((item) => `- ${item}`).join('\n')}`
       : 'selectedProjectMemory: none',
@@ -565,7 +564,6 @@ export function renderSessionScopedMemoryHints(document: SessionMemoryDocument):
   const lines = document.sessionMemoryItems.map(compactMemoryBullet);
   return [
     'SessionMemoryCompact (single-session, 256k emergency soft cap):',
-    'Boundary: session memory stores the active task focus, accepted plan, user guidance, review decisions, and compressed local conversation summary. It must not crowd out current user input or EvidenceTail facts.',
     `archiveHash=${document.archiveMetadata?.sessionMemoryArchiveHash ?? 'none'}`,
     document.archiveMetadata?.expandedMemoryItemIds.length
       ? `selectedItemIds=${document.archiveMetadata.expandedMemoryItemIds.filter((id) => id.includes(':session:')).slice(0, 32).join(', ')}`
@@ -601,7 +599,6 @@ function compactMemoryBullet(item: MemoryItemV4): string {
 export function renderSessionMemoryHints(document: SessionMemoryDocument): string[] {
   return [
     'Session short-term memory document:',
-    'Boundary: intentContext is not evidence; factContext is the only generated-file evidence; decisionContext records user decisions and guidance; resourceContext records reusable attachment/resource facts.',
     document.intentContext.length
       ? `intentContext:\n${document.intentContext.map((item) => `- ${item}`).join('\n')}`
       : 'intentContext: none',
