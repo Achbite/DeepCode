@@ -130,6 +130,7 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
     ? null
     : findPendingComposerDecisionFromProjection({
       timeline: uiTimelineProjection,
+      events,
       pendingPermission: pendingPermission?.request ?? null,
       resolvingRequirement,
       resolvingPlan,

@@ -230,7 +230,8 @@ function isTerminalStatus(status?: string): boolean {
     status === 'rejected' ||
     status === 'needsRevision' ||
     status === 'cancelled' ||
-    status === 'failed';
+    status === 'failed' ||
+    status === 'completed';
 }
 
 function planCardAwaitingDecision(payload: Record<string, unknown>): boolean {

@@ -59,14 +59,15 @@ export type AgentComposerPendingDecision =
 
 export function findPendingComposerDecisionFromProjection(input: {
   timeline: AgentTimelineResult;
+  events?: readonly AgentEvent[];
   pendingPermission?: PermissionRequest | null;
   resolvingRequirement?: { runId: string; requirementId: string } | null;
   resolvingPlan?: { runId: string; planId: string } | null;
   resolvingReview?: { runId: string } | null;
   resolvingPermission?: { id: string } | null;
 }): AgentComposerPendingDecision | null {
-  const events = timelineEvents(input.timeline);
-  const active = findActiveTimelineInteraction(input.timeline, input.pendingPermission);
+  const events = mergeDecisionEvents(input.events, timelineEvents(input.timeline));
+  const active = findActiveTimelineInteraction(events, input.pendingPermission);
   if (!active) return null;
   return withResolvingState(active, events, input);
 }
@@ -108,7 +109,7 @@ function withResolvingState(
 }
 
 function findActiveTimelineInteraction(
-  timeline: AgentTimelineResult,
+  events: AgentEvent[],
   pendingPermission?: PermissionRequest | null
 ): AgentComposerPendingDecision | null {
   if (pendingPermission) {
@@ -120,25 +121,19 @@ function findActiveTimelineInteraction(
     };
   }
 
-  const blocks = flattenBlocks(timeline);
-  const events = blocks.flatMap((block) => block.events);
-
-  for (let blockIndex = blocks.length - 1; blockIndex >= 0; blockIndex -= 1) {
-    const block = blocks[blockIndex];
-    for (let eventIndex = block.events.length - 1; eventIndex >= 0; eventIndex -= 1) {
-      const event = block.events[eventIndex];
-      if (event.kind === 'plan_card' || event.kind === 'plan_review') {
-        const pending = pendingPlanFromEvent(event, events);
-        if (pending) return pending;
-      }
-      if (event.kind === 'review_summary') {
-        const pending = pendingReviewFromEvent(event, events);
-        if (pending) return pending;
-      }
-      if (event.kind === 'requirement_confirmation') {
-        const pending = pendingRequirementFromEvent(event, events);
-        if (pending) return pending;
-      }
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (event.kind === 'plan_card' || event.kind === 'plan_review') {
+      const pending = pendingPlanFromEvent(event, events);
+      if (pending) return pending;
+    }
+    if (event.kind === 'review_summary') {
+      const pending = pendingReviewFromEvent(event, events);
+      if (pending) return pending;
+    }
+    if (event.kind === 'requirement_confirmation') {
+      const pending = pendingRequirementFromEvent(event, events);
+      if (pending) return pending;
     }
   }
 
@@ -253,6 +248,32 @@ function timelineEvents(timeline: AgentTimelineResult): AgentEvent[] {
   return flattenBlocks(timeline).flatMap((block) => block.events);
 }
 
+function mergeDecisionEvents(
+  rawEvents: readonly AgentEvent[] | undefined,
+  projectedEvents: readonly AgentEvent[]
+): AgentEvent[] {
+  const byId = new Map<string, { event: AgentEvent; index: number }>();
+  let index = 0;
+  for (const event of rawEvents ?? []) {
+    if (!byId.has(event.id)) byId.set(event.id, { event, index });
+    index += 1;
+  }
+  for (const event of projectedEvents) {
+    if (!byId.has(event.id)) byId.set(event.id, { event, index });
+    index += 1;
+  }
+  return [...byId.values()]
+    .sort((left, right) => {
+      const leftTime = Date.parse(left.event.ts);
+      const rightTime = Date.parse(right.event.ts);
+      if (Number.isFinite(leftTime) && Number.isFinite(rightTime) && leftTime !== rightTime) {
+        return leftTime - rightTime;
+      }
+      return left.index - right.index;
+    })
+    .map((entry) => entry.event);
+}
+
 function flattenBlocks(timeline: AgentTimelineResult): AgentTimelineBlock[] {
   return timeline.turns.flatMap((turn) => turn.blocks);
 }
@@ -308,7 +329,8 @@ function isTerminalStatus(status?: string): boolean {
     status === 'rejected' ||
     status === 'needsRevision' ||
     status === 'cancelled' ||
-    status === 'failed';
+    status === 'failed' ||
+    status === 'completed';
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {

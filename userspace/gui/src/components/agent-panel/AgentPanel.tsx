@@ -61,6 +61,7 @@ const AgentPanel: React.FC = () => {
   );
   const pendingDecision = findPendingComposerDecisionFromProjection({
     timeline: timelineProjection,
+    events,
     pendingPermission: pendingPermission?.request ?? null,
     resolvingRequirement,
     resolvingPlan,
