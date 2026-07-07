@@ -126,6 +126,7 @@ async function main(): Promise<void> {
   assertProviderTurnSnapshotRecordsContextAdmissionShape();
   await assertProviderTurnContextCoordinatorUsesFreshAssembly();
   await assertProviderTurnContextCoordinatorNarrowsPlanningAllowedKinds();
+  await assertProviderTurnContextCoordinatorScopesAcceptedExecutionCatalog();
   await assertHookObserverProducesTraceOnly();
   await assertProviderPipelineUsesProviderTurnContract();
   assertProviderJsonModeCoordinator();
@@ -904,6 +905,87 @@ async function assertProviderTurnContextCoordinatorNarrowsPlanningAllowedKinds()
   assertEqual(contractAllowed.includes('actionBundle'), false, 'planning provider contract does not expose actionBundle');
   assertEqual(result.allowedProposals.includes('actionBundle'), false, 'planning result allowed proposals are provider-visible only');
   assertEqual(result.modelContextBundle.providerTurnContract.allowedKinds.includes('taskPlan'), true, 'planning still allows taskPlan');
+}
+
+async function assertProviderTurnContextCoordinatorScopesAcceptedExecutionCatalog(): Promise<void> {
+  const token = randomSmokeToken('provider-context-scoped-catalog');
+  const fullCatalogMarker = `FULL_TOOL_CATALOG_SHOULD_NOT_APPEAR_${token}`;
+  let assemblyCapabilitySummary = '';
+  const coordinator = new ProviderTurnContextCoordinator<any>({
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${token}`,
+    assembleContext: (input) => {
+      assemblyCapabilitySummary = input.capabilityCatalogSummary;
+      return assembleContext({
+        ...input,
+        contextAssemblyId: `assembly-${token}`,
+      });
+    },
+    allowedProposals: (allowed) => allowed,
+    capabilityCatalogSummary: () => fullCatalogMarker,
+    memoryHints: () => [],
+    collectUserGuidanceEvents: () => [],
+    appendConsumedGuidance: async ({ result }) => result,
+    buildProviderTurnContract: (input) => new ContextFrameBuilder().buildSessionProviderTurnContract({
+      contractId: input.contractId,
+      sessionId: input.sessionId,
+      runId: input.runId,
+      allowedKinds: input.allowedKinds,
+      prompt: input.prompt,
+      contextAssembly: input.contextAssembly,
+      userRequest: input.userRequest,
+      confirmedDecisionSummary: input.confirmedDecisionSummary,
+      acceptedPlanActive: input.acceptedPlanActive,
+      currentTaskContext: input.currentTaskContext,
+      resourcePackets: input.resourcePackets,
+      generatedArtifactCount: input.generatedArtifactCount,
+      toolIntentTemplates: input.toolIntentTemplates,
+      nextActionInstruction: input.nextActionInstruction,
+    }),
+  });
+
+  const result = await coordinator.prepare({
+    sessionId: `session-${token}`,
+    runId: `run-${token}`,
+    userRequest: `request ${token}`,
+    stateContract: {
+      stateId: `state-${token}`,
+      allowedProposals: ['resourceRequest', 'actionBundle', 'taskOutcome', 'diagnostic'],
+    },
+    memoryDocument: buildSessionMemoryDocument([]),
+    resourcePackets: [],
+    conversationRoots: [],
+    generatedArtifactEvidence: new Map(),
+    acceptedImplementationPlan: {
+      planId: `plan-${token}`,
+      title: `Plan ${token}`,
+      summary: `Summary ${token}`,
+      tasks: [{ taskId: `task-${token}` }],
+      completedTaskIds: [],
+    },
+    currentTaskContext: {
+      taskId: `task-${token}`,
+      taskTitle: `Task ${token}`,
+      goal: `Handle ${token}`,
+      targets: [`target-${token}.txt`],
+      capabilities: ['fs.write'],
+    },
+  }, {
+    contextAssemblyId: `requested-${token}`,
+    contractId: `contract-${token}`,
+    inputContent: `input ${token}`,
+    lastResult: genericSessionResult(`session-${token}`),
+  });
+  const dynamicPrompt = result.modelContextBundle.prompt.dynamicSuffix;
+  const renderedContract = JSON.stringify(result.modelContextBundle.providerTurnContract);
+
+  assertEqual(assemblyCapabilitySummary.includes(fullCatalogMarker), false, 'accepted execution does not pass the full capability catalog into ContextAdmission');
+  assert(assemblyCapabilitySummary.includes('Accepted execution task tool intent summary.'), 'accepted execution passes a scoped capability summary');
+  assert(assemblyCapabilitySummary.includes('currentTaskCapabilities=fs.write'), 'scoped summary records current task capabilities');
+  assert(assemblyCapabilitySummary.includes(`currentTaskTargets=target-${token}.txt`), 'scoped summary records current task targets');
+  assertEqual(dynamicPrompt.includes(fullCatalogMarker), false, 'accepted execution dynamic prompt does not expose full capability catalog');
+  assertEqual(renderedContract.includes(fullCatalogMarker), false, 'accepted execution provider contract does not expose full capability catalog');
+  assert(dynamicPrompt.includes('Current accepted task tool intent scope:'), 'accepted execution workflow state labels scoped tool intent');
 }
 
 async function assertHookObserverProducesTraceOnly(): Promise<void> {

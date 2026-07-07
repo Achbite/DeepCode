@@ -119,7 +119,9 @@ export class ProviderTurnContextCoordinator<State extends ProviderTurnContextSta
       contextAssemblyId: input.contextAssemblyId,
       workflowState: state.stateContract?.stateId ?? state.driverRequest?.kind ?? 'needProposal',
       allowedProposals,
-      capabilityCatalogSummary: this.ports.capabilityCatalogSummary(state),
+      capabilityCatalogSummary: acceptedExecution
+        ? this.acceptedExecutionCapabilitySummary(state)
+        : this.ports.capabilityCatalogSummary(state),
       memoryDocument: acceptedExecution ? undefined : state.memoryDocument,
       projectMemoryMode: input.projectMemoryMode,
       extraMemoryHints: this.ports.memoryHints(state),
@@ -225,6 +227,42 @@ export class ProviderTurnContextCoordinator<State extends ProviderTurnContextSta
       `TaskLedger: completedByKernelFacts=${completedCount}; totalTasks=${taskCount}`,
       `CurrentTaskFrame: taskId=${taskId}${taskTitle ? `; title=${oneLine(taskTitle, 240)}` : ''}${targets.length ? `; targets=${targets.join(', ')}` : ''}`,
       'Use TaskFrame, ResourceEvidence, AccessIndex, ErrorContext, and NextActionInstruction as the execution authority for this turn.',
+    ].join('\n');
+  }
+
+  private acceptedExecutionCapabilitySummary(state: State): string {
+    const task = state.currentTaskContext;
+    if (!task) {
+      return [
+        'Accepted execution task tool intent summary.',
+        'currentTaskCapabilities=none',
+        'currentTaskTargets=none',
+        'No current task is active; return diagnostic, taskOutcome, resourceRequest, or decisionRequest according to the current contract.',
+      ].join('\n');
+    }
+    const targets = task.targets ?? [];
+    const capabilities = task.capabilities ?? [];
+    const templates = this.currentTaskToolIntentTemplates(state)
+      .map((template) => {
+        const templateRecord = objectRecord(template.template);
+        const toolId = stringValue(templateRecord?.toolId) ?? template.operation;
+        const args = objectRecord(templateRecord?.args);
+        const path = stringValue(args?.path);
+        return [
+          `intent=${template.intentId}`,
+          `toolId=${toolId}`,
+          `operation=${template.operation}`,
+          `targets=${template.targets.length ? template.targets.join(',') : 'none'}`,
+          path ? `path=${path}` : '',
+        ].filter(Boolean).join(';');
+      });
+    return [
+      'Accepted execution task tool intent summary.',
+      `currentTaskId=${task.taskId}`,
+      `currentTaskCapabilities=${capabilities.length ? capabilities.join(', ') : 'none'}`,
+      `currentTaskTargets=${targets.length ? targets.join(', ') : 'none'}`,
+      templates.length ? `currentTaskActionTemplates=${templates.join(' | ')}` : 'currentTaskActionTemplates=none',
+      'Kernel remains the permission, execution, fact, and audit authority; this summary is not an authorization grant.',
     ].join('\n');
   }
 

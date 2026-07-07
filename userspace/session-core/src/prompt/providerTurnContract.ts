@@ -145,7 +145,7 @@ export function providerVisibleWorkflowState(input: PromptEnvelopeBuilderInput):
     `Provider turn mode: ${mode}.`,
   ];
   if (mode === 'acceptedTaskExecution') {
-    lines.push(`Kernel tool catalog visible for current accepted task as schema only, not authorization:\n${input.capabilityCatalogSummary || 'none'}`);
+    lines.push(`Current accepted task tool intent scope:\n${input.capabilityCatalogSummary || 'none'}`);
   } else {
     lines.push('Kernel execution tool argument catalog is not visible in this turn. Use taskPlan operation intent, focused resourceRequest, decisionRequest, answer, or diagnostic as allowed.');
   }
