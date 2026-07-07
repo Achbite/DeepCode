@@ -74,7 +74,7 @@ export interface AcceptedPlanReadOnlyTaskExecutorPorts<
   now(): string;
   createId(prefix: string): string;
   append(sessionId: string, events: AgentEvent[]): Promise<AgentSessionResult | undefined>;
-  runUserTurn(input: AcceptedPlanReadOnlyTaskResumeInput): Promise<AgentSessionResult>;
+  continueSameLoop(input: AcceptedPlanReadOnlyTaskResumeInput): Promise<AgentSessionResult>;
   readActionBundle(proposal: ProposalEnvelope): unknown | undefined;
   refreshRuntimeState(state: State): void;
   readOnlyResourceCompletion(
@@ -213,7 +213,7 @@ export class AcceptedPlanReadOnlyTaskExecutor<
     let result = await this.ports.append(state.sessionId, [checkpoint]) ?? fallback;
 
     if (!this.ports.complete(nextAccepted)) {
-      return this.ports.runUserTurn(acceptedPlanContinuationInput(input, {
+      return this.ports.continueSameLoop(acceptedPlanContinuationInput(input, {
         content: this.ports.executionRequest(
           {
             sessionId: state.sessionId,

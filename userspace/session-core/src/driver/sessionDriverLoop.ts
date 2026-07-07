@@ -242,7 +242,7 @@ export class SessionDriverLoop {
       now: () => this.agentRunReactor.ts(),
       createId: (prefix) => this.agentRunReactor.id(prefix),
       append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
-      runUserTurn: this.sameLoopContinuation.runUserTurn,
+      continueSameLoop: this.sameLoopContinuation.runUserTurn,
       readActionBundle: (proposal) => driverActivityBuilder.readActionBundle(proposal),
       refreshRuntimeState: (state) => acceptedPlanTaskLedger().refreshRuntimeState(state),
       readOnlyResourceCompletion: (accepted, cursor, current, packet) =>
