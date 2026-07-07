@@ -8664,6 +8664,12 @@ function assertPromptEnvelope(): void {
   assert(prompt.dynamicSuffix.includes('targetPath/codeBlocks targetPath must be a concrete file path relative to the primary root'), 'prompt tells the model to avoid root-prefixed write paths');
   assert(prompt.dynamicSuffix.includes('rootId+path'), 'provider turn schema documents path-based resourceRequest without long JSON examples');
   assert(prompt.stablePrefix.includes('optional top-level narration'), 'prompt documents model-generated narration');
+  assertEqual(
+    (prompt.stablePrefix.match(/Unknown JSON fields, invalid JSON, and unsafe paths fail closed\./g) ?? []).length,
+    1,
+    'stable protocol contract keeps fail-closed rule once'
+  );
+  assert(prompt.stablePrefix.includes('Language policy: set outputLanguage and all user-visible prose from the current user request language'), 'stable protocol contract keeps compact language policy');
   assert(prompt.dynamicSuffix.includes('reviewSummary is Session-generated'), 'provider turn schema excludes reviewSummary from provider proposal kinds');
   assert(!prompt.stablePrefix.includes('Implementation payload budget'), 'stable prefix does not expose execution payload budgeting');
   assert(!prompt.stablePrefix.includes('implementationPlan top-level field'), 'prompt no longer documents implementationPlan as a provider kind');

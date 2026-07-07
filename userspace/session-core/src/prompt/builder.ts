@@ -46,9 +46,7 @@ export function buildPromptEnvelope(input: PromptEnvelopeBuilderInput): PromptEn
         'Use resourceRequest only when current ResourceEvidence and AccessIndex do not contain the concrete facts needed for the next proposal. When requesting evidence, use manifestEntryId, rootId+path, or kind="search" under available conversation roots; do not ask to run shell search commands directly.',
         'When Session returns ResourcePacket facts for a file/list target and byte range, do not request the same read-only target/range again in the same checkpoint. Use the existing facts to output a taskPlan, answer, actionBundle, taskOutcome, or diagnostic as allowed, or request a different target/range/search query only if it adds new evidence.',
         'If the user requests write, user review, then delete, current actionBundle.actions only writes and waits for terminal review; put the post-review delete intent in actionBundle.continuationExpectations. Continuations that require user review must not execute until Kernel ReviewGate is accepted by the user.',
-        'Unknown JSON fields, invalid JSON, and unsafe paths fail closed.',
-        'Language policy: all user-visible answer, review summary, narration, and transition/progress prose must follow the current user language; protocol/schema/structured fields stay English; code identifiers and tool names stay English.',
-        'Set outputLanguage from the current user request language. Protocol examples do not decide the response language.',
+        'Language policy: set outputLanguage and all user-visible prose from the current user request language; protocol/schema fields, tool names, and code identifiers stay English.',
       ].join('\n'),
     },
     {
