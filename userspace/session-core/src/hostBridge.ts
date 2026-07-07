@@ -620,6 +620,9 @@ function inferHostRunLifecycle(
     }
 
     if (kind === 'review_summary' && stringField(payload, 'status') === 'waitingUserReview') {
+      if (waitingOwnerWasConsumed(kind, payload, consumedOwners)) {
+        continue;
+      }
       return {
         runStatus: 'waiting',
         decisionKind: 'review',
@@ -708,6 +711,9 @@ function collectConsumedInteractionOwners(events: unknown[]): ConsumedInteractio
           stringField(payload, 'interactionId'),
           stringField(payload, 'sourceInteractionId'),
           stringField(payload, 'targetId'));
+        addStrings(consumed.plans,
+          stringField(payload, 'planId'),
+          stringField(payload, 'sourcePlanId'));
       }
       continue;
     }
@@ -724,6 +730,38 @@ function collectConsumedInteractionOwners(events: unknown[]): ConsumedInteractio
     if (kind === 'session_run_state') {
       const status = stringField(payload, 'status');
       const reason = stringField(payload, 'reason');
+      if (status === 'completed' || status === 'cancelled' || status === 'failed') {
+        const owner = objectRecord(payload.decisionOwner);
+        const decisionKind = stringField(payload, 'decisionKind') ?? stringField(owner, 'kind');
+        if (decisionKind === 'plan') {
+          addStrings(consumed.plans,
+            stringField(payload, 'planId'),
+            stringField(payload, 'targetId'),
+            stringField(owner, 'planId'),
+            stringField(owner, 'targetId'));
+        }
+        if (decisionKind === 'requirement') {
+          addStrings(consumed.requirements,
+            stringField(payload, 'requirementId'),
+            stringField(payload, 'targetId'),
+            stringField(owner, 'requirementId'),
+            stringField(owner, 'targetId'));
+        }
+        if (decisionKind === 'review') {
+          addStrings(consumed.reviews,
+            stringField(payload, 'reviewId'),
+            stringField(payload, 'targetId'),
+            stringField(owner, 'reviewId'),
+            stringField(owner, 'targetId'));
+        }
+        if (decisionKind === 'permission') {
+          addStrings(consumed.permissions,
+            stringField(payload, 'permissionId'),
+            stringField(payload, 'targetId'),
+            stringField(owner, 'permissionId'),
+            stringField(owner, 'targetId'));
+        }
+      }
       if (status === 'running' && reason === 'accepted_plan_execution') {
         const owner = objectRecord(payload.decisionOwner);
         addStrings(consumed.plans,
@@ -772,6 +810,13 @@ function waitingOwnerWasConsumed(
     if (decisionKind === 'permission') {
       return hasAny(consumed.permissions, targetId, stringField(payload, 'permissionId'), stringField(owner, 'permissionId'));
     }
+  }
+  if (kind === 'review_summary') {
+    return hasAny(consumed.reviews,
+      stringField(payload, 'reviewId'),
+      stringField(payload, 'targetId'),
+      stringField(payload, 'interactionId'),
+      stringField(payload, 'sourceInteractionId'));
   }
   return false;
 }

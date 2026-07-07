@@ -30,6 +30,7 @@ import {
   collectUserGuidanceEvents,
   createResourcePacket,
   evaluateRunState,
+  findActiveInteraction,
   findLatestPendingPermission,
   normalizeDecisionEffect,
   parseProposalEnvelope,
@@ -152,6 +153,9 @@ async function main(): Promise<void> {
   assertRequirementProjectionBuilderCreatesDecisionEvents();
   assertPlanReviewReportAnalyzerKeepsReviewSemantics();
   assertPlanContextIndexBuildsPlanReadModels();
+  assertInteractionLedgerResolvesTerminalSourcePlanReview();
+  assertInteractionLedgerTerminalRunStateClosesPlan();
+  assertProjectionResolvesPlanAfterSourceReview();
   assertPlanInteractionIndexFindsActivePlan();
   assertPlanReviewGrantProjectorBuildsExecutionReadModels();
   assertAcceptedPlanTargetParserExtractsStructuredTargets();
@@ -7914,9 +7918,157 @@ function assertPlanContextIndexBuildsPlanReadModels(): void {
     sessionId,
     ts: '2026-01-01T00:00:02.000Z',
     kind: 'review_summary',
-    payload: { runId: `${runId}-child`, planId },
+    payload: { runId: `${runId}-child`, sourcePlanId: planId, status: 'accepted' },
   } as AgentEvent;
-  assertEqual(index.alreadyResolved([planCard, accepted, review], found!), true, 'plan context index treats accepted reviewed child-run plans as resolved by plan id');
+  assertEqual(index.alreadyResolved([planCard, accepted, review], found!), true, 'plan context index treats terminal sourcePlanId reviews as source plan resolution');
+}
+
+function assertInteractionLedgerResolvesTerminalSourcePlanReview(): void {
+  const suffix = randomSmokeToken('interaction-ledger');
+  const sessionId = `session-${suffix}`;
+  const planRunId = `run-plan-${suffix}`;
+  const reviewRunId = `run-review-${suffix}`;
+  const planId = `plan-${suffix}`;
+  const planCard = {
+    id: `event-${suffix}-plan`,
+    sessionId,
+    ts: '2026-01-01T00:00:00.000Z',
+    kind: 'plan_card',
+    payload: {
+      runId: planRunId,
+      planId,
+      title: 'Generic plan',
+      summary: 'Review a generic plan.',
+      status: 'pending',
+      confirmable: true,
+    },
+  } as AgentEvent;
+  const waitingReview = {
+    id: `event-${suffix}-review-waiting`,
+    sessionId,
+    ts: '2026-01-01T00:00:01.000Z',
+    kind: 'review_summary',
+    payload: {
+      runId: reviewRunId,
+      reviewId: `review-${suffix}`,
+      sourcePlanId: planId,
+      status: 'waitingUserReview',
+      confirmable: true,
+    },
+  } as AgentEvent;
+  assertEqual(
+    findActiveInteraction({ events: [planCard, waitingReview] })?.kind,
+    'review',
+    'interaction ledger prioritizes active review over the source plan'
+  );
+  const acceptedReview = {
+    id: `event-${suffix}-review-accepted`,
+    sessionId,
+    ts: '2026-01-01T00:00:02.000Z',
+    kind: 'review_summary',
+    payload: {
+      runId: reviewRunId,
+      reviewId: `review-${suffix}`,
+      sourcePlanId: planId,
+      status: 'accepted',
+      confirmable: false,
+    },
+  } as AgentEvent;
+  assertEqual(
+    findActiveInteraction({ events: [planCard, waitingReview, acceptedReview] }),
+    null,
+    'interaction ledger closes the source plan when a terminal review references sourcePlanId'
+  );
+}
+
+function assertInteractionLedgerTerminalRunStateClosesPlan(): void {
+  const suffix = randomSmokeToken('interaction-state');
+  const sessionId = `session-${suffix}`;
+  const runId = `run-${suffix}`;
+  const planId = `plan-${suffix}`;
+  const planCard = {
+    id: `event-${suffix}-plan`,
+    sessionId,
+    ts: '2026-01-01T00:00:00.000Z',
+    kind: 'plan_card',
+    payload: {
+      runId,
+      planId,
+      title: 'Generic plan',
+      status: 'pending',
+      confirmable: true,
+    },
+  } as AgentEvent;
+  const terminalState = {
+    id: `event-${suffix}-state`,
+    sessionId,
+    ts: '2026-01-01T00:00:01.000Z',
+    kind: 'session_run_state',
+    payload: {
+      runId,
+      status: 'cancelled',
+      decisionKind: 'plan',
+      targetId: planId,
+      decisionOwner: {
+        kind: 'plan',
+        planId,
+        targetId: planId,
+      },
+    },
+  } as AgentEvent;
+  assertEqual(
+    findActiveInteraction({ events: [planCard, terminalState] }),
+    null,
+    'interaction ledger closes a pending plan when its run-state owner reaches a terminal status'
+  );
+}
+
+function assertProjectionResolvesPlanAfterSourceReview(): void {
+  const suffix = randomSmokeToken('projection-source-review');
+  const sessionId = `session-${suffix}`;
+  const planRunId = `run-plan-${suffix}`;
+  const reviewRunId = `run-review-${suffix}`;
+  const planId = `plan-${suffix}`;
+  const planCard = {
+    id: `event-${suffix}-plan`,
+    sessionId,
+    ts: '2026-01-01T00:00:00.000Z',
+    kind: 'plan_card',
+    payload: {
+      runId: planRunId,
+      planId,
+      title: 'Generic implementation plan',
+      summary: 'Review generic implementation work.',
+      status: 'pending',
+      confirmable: true,
+    },
+  } as AgentEvent;
+  const acceptedReview = {
+    id: `event-${suffix}-review`,
+    sessionId,
+    ts: '2026-01-01T00:00:01.000Z',
+    kind: 'review_summary',
+    payload: {
+      runId: reviewRunId,
+      reviewId: `review-${suffix}`,
+      sourcePlanId: planId,
+      status: 'accepted',
+      confirmable: false,
+    },
+  } as AgentEvent;
+  const projection = buildNarrativeTimelineProjection({
+    sessionId,
+    events: [planCard, acceptedReview],
+    generatedAt: '2026-01-01T00:00:02.000Z',
+  });
+  const planBlock = projection.turns
+    .flatMap((turn) => turn.blocks)
+    .find((block) => block.events.some((event) => event.id === planCard.id));
+  assertEqual(
+    planBlock?.status,
+    'completed',
+    'timeline projection closes the source plan block after a terminal sourcePlanId review'
+  );
 }
 
 function assertPlanInteractionIndexFindsActivePlan(): void {
@@ -9813,7 +9965,7 @@ function assertImplementationPlanTaskProjectionProgress(): void {
         payload: {
           stage: 'accepted_plan.batch_checkpoint',
           runId: 'run-directory-projection-child',
-          planId: 'plan-directory-projection',
+          sourcePlanId: 'plan-directory-projection',
           completedTaskIds: ['task-build-dir', 'task-source-dir'],
           remainingTaskIds: [],
           taskLedger: {

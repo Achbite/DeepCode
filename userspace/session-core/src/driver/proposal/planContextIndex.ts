@@ -151,6 +151,7 @@ export class PlanContextIndex {
       const owner = objectRecord(payload.decisionOwner);
       const batch = objectRecord(kernelEvent?.batch);
       const planId = stringValue(payload.planId)
+        ?? stringValue(payload.sourcePlanId)
         ?? stringValue(owner?.planId)
         ?? stringValue(kernelEvent?.planId)
         ?? stringValue(batch?.planId);

@@ -834,8 +834,16 @@ function implementationTaskStatus(
 
 function samePlanDecision(payload: Record<string, unknown>, planRunId?: string, planId?: string): boolean {
   const decisionRunId = stringField(payload, 'runId');
-  const decisionPlanId = stringField(payload, 'planId');
-  // Accepted-plan execution batches can use child runIds; planId is the stable task/progress key.
+  const owner = isRecordPayload(payload.decisionOwner) ? payload.decisionOwner : undefined;
+  const ownerKind = stringField(payload, 'decisionKind') ?? (owner ? stringField(owner, 'kind') : undefined);
+  const ownerPlanId = ownerKind === 'plan'
+    ? stringField(payload, 'targetId') ?? (owner ? stringField(owner, 'targetId') : undefined)
+    : undefined;
+  const decisionPlanId = stringField(payload, 'planId') ??
+    stringField(payload, 'sourcePlanId') ??
+    (owner ? stringField(owner, 'planId') : undefined) ??
+    ownerPlanId;
+  // Plan ownership is keyed by planId across child runs; sourcePlanId and decisionOwner close the source confirmation.
   if (planId && decisionPlanId) return decisionPlanId === planId;
   return !planRunId || !decisionRunId || decisionRunId === planRunId;
 }
@@ -1298,10 +1306,7 @@ function narrativeStatus(events: AgentEvent[]): AgentTimelineStatus {
   ) {
     return 'waiting';
   }
-  if (events.some((event) => event.kind === 'plan_card' && planCardEventAwaitingDecision(event))) {
-    return 'waiting';
-  }
-  if (events.some((event) => event.kind === 'plan_review' && planReviewEventAwaitingDecision(event))) {
+  if (events.some((event) => planEventAwaitingDecision(event, events))) {
     return 'waiting';
   }
   if (events.some((event) => event.kind === 'tool_call' || stringValueFromPayload(event.payload, 'status') === 'running')) {
@@ -1344,11 +1349,24 @@ function planInteractionResolved(event: AgentEvent, events: AgentEvent[]): boole
   const planId = stringField(payload, 'planId');
   if (!runId || !planId) return false;
   return events.some((candidate) => {
-    if (candidate.kind !== 'plan_review') return false;
     const candidatePayload = isRecordPayload(candidate.payload) ? candidate.payload : {};
     if (!decisionStatusResolved(stringField(candidatePayload, 'status'))) return false;
-    return samePlanDecision(candidatePayload, runId, planId);
+    if (candidate.kind === 'plan_review' || candidate.kind === 'review_summary') {
+      return samePlanDecision(candidatePayload, runId, planId);
+    }
+    if (candidate.kind !== 'session_run_state') return false;
+    return samePlanDecision(candidatePayload, runId, planId) &&
+      runStatusResolved(stringField(candidatePayload, 'status'));
   });
+}
+
+function planEventAwaitingDecision(event: AgentEvent, events: AgentEvent[]): boolean {
+  const awaiting = event.kind === 'plan_card'
+    ? planCardEventAwaitingDecision(event)
+    : event.kind === 'plan_review'
+      ? planReviewEventAwaitingDecision(event)
+      : false;
+  return awaiting && !planInteractionResolved(event, events);
 }
 
 function reviewInteractionResolved(event: AgentEvent, events: AgentEvent[]): boolean {
