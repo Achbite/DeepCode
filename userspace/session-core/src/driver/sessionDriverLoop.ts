@@ -62,6 +62,7 @@ import {
   type PlanContext as SessionPlanContext,
 } from './proposal/index.js';
 import type { LlmTurnResult, SessionDriverLoopRunState } from './runFrame.js';
+import { decisionContinuationInput } from './runContinuation.js';
 import { RunEngine } from './runEngine.js';
 import { diag, isEmptyResponseError, objectRecord, SessionDriverLoopError, stringValue, visibleLanguageForRequest } from './runtimeSupport.js';
 import { AgentRunReactor } from './agentRunReactor.js';
@@ -923,22 +924,13 @@ export class SessionDriverLoop {
       resourceFollowup: (followupInput) =>
         this.actionBundleAdmissionResourceFollowupCoordinator.handle(followupInput),
       resumeAfterResourceFollowup: ({ originalInput, followup }) =>
-        this.runUserTurn({
-          sessionId: originalInput.sessionId,
+        this.runUserTurn(decisionContinuationInput(originalInput, {
           content: followup.content,
           attachments: originalInput.attachments ?? [],
           existingEvents: followup.result.events,
-          workspaceBinding: originalInput.workspaceBinding,
-          projectWorkingDirectory: originalInput.projectWorkingDirectory,
-          profileId: originalInput.profileId,
-          workflow: originalInput.workflow,
-          appendUserMessage: false,
-          requirementConfirmationMode: 'off',
           reviewContinuationMode: originalInput.reviewContinuationMode,
-          interventionLevel: originalInput.interventionLevel,
-          projectMemoryMode: originalInput.projectMemoryMode,
           resumeResourcePackets: true,
-        }),
+        })),
       submitActionProposal: (handlerInput, state, prompt, proposal, fallback) =>
         this.actionProposalSubmitter.submit(handlerInput, state, prompt, proposal, fallback),
       submitNonExecutableProposal: (state, proposal, fallback) =>

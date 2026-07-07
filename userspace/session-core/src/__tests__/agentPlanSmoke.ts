@@ -384,6 +384,16 @@ function assertDecisionContinuationInputKeepsDecisionResumeInSameLoop(): void {
   assertEqual(input.interactionOverlay, overrideOverlay, 'decision continuation preserves the active owner override');
   assertEqual(input.resumeResourcePackets, true, 'decision continuation can carry resource packets into the same loop');
   assertEqual(input.confirmedRequirement?.requirementId, `requirement-${token}`, 'decision continuation can carry confirmed requirement authority');
+
+  const minimal = decisionContinuationInput({ sessionId: `session-minimal-${token}` }, {
+    content: `resume ${token}`,
+    existingEvents: [],
+    resumeResourcePackets: true,
+  });
+  assertEqual(minimal.sessionId, `session-minimal-${token}`, 'decision continuation accepts minimal coordinator input');
+  assertEqual(minimal.attachments?.length, 0, 'decision continuation defaults missing attachments to an empty list');
+  assertEqual(minimal.appendUserMessage, false, 'minimal continuation still does not append a new user message');
+  assertEqual(minimal.requirementConfirmationMode, 'off', 'minimal continuation still avoids requirement reconfirmation');
 }
 
 function assertProviderTurnSnapshotRecordsContextAdmissionShape(): void {
