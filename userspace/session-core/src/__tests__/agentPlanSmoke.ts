@@ -99,6 +99,7 @@ async function main(): Promise<void> {
   assertV3Parser();
   assertLegacyProviderShapesAreRejected();
   assertActionBundleProtocolFields();
+  assertProviderRepairMessageBuilderAvoidsDuplicateActionBundleReference();
   assertProtocolGateCanonicalizesBareRepair();
   assertActionBundleActionInspectorReadsActionShape();
   assertPathIdentityNormalizesWorkspacePaths();
@@ -8418,6 +8419,52 @@ function assertActionBundleProtocolFields(): void {
     runId: 'run-missing-continuation-description',
     raw: missingContinuationDescriptionRaw,
   }), 'continuationExpectations[0].description must be a non-empty string');
+}
+
+function assertProviderRepairMessageBuilderAvoidsDuplicateActionBundleReference(): void {
+  const token = randomSmokeToken('repair-reference');
+  const prompt = buildPromptEnvelope({
+    workflowState: `accepted-${token}`,
+    allowedProposals: ['actionBundle', 'resourceRequest', 'decisionRequest', 'taskOutcome', 'diagnostic'],
+    capabilityCatalogSummary: `currentTaskCapabilities=fs.write`,
+    userRequest: `Repair accepted task ${token}`,
+  });
+  const messages = new ProviderRepairMessageBuilder().repairMessages(prompt, {
+    runId: `run-${token}`,
+    userRequest: `Repair accepted task ${token}`,
+    conversationRoots: [],
+    resourcePackets: [],
+    acceptedContext: {
+      currentTask: { taskId: `task-${token}`, targets: [`target-${token}.txt`], capability: 'fs.write' },
+      currentTaskActionTemplates: [{
+        intentId: `template-${token}`,
+        operation: 'fs.write',
+        targets: [`target-${token}.txt`],
+        template: { toolId: 'fs.write', args: { path: `target-${token}.txt` } },
+      }],
+    },
+    currentTaskContext: {
+      taskId: `task-${token}`,
+      taskTitle: `Task ${token}`,
+      goal: `Handle target ${token}`,
+      targets: [`target-${token}.txt`],
+      capabilities: ['fs.write'],
+    },
+    completedTaskCount: 0,
+  }, '{invalid}', {
+    code: 'invalid_action_bundle',
+    message: 'Invalid action bundle.',
+  });
+  const joined = messages
+    .map((message) => typeof message.content === 'string' ? message.content : JSON.stringify(message.content))
+    .join('\n');
+  const shapeLine = 'The nested actionBundle object must include {version,id,goal,actions,...};';
+
+  assertEqual(joined.split(shapeLine).length - 1, 1, 'repair prompt includes the full actionBundle shape reference only once');
+  assert(joined.includes('<ProviderTurnContract schemaVersion="deepcode.session.provider-turn-contract.v1">'), 'repair prompt includes ProviderTurnContract');
+  assert(joined.includes('Minimal actionBundle skeleton'), 'repair prompt keeps a minimal actionBundle skeleton for invalid actionBundle errors');
+  const validationLine = 'actionBundle.validationExpectations[] are optional reviewable validation notes shaped';
+  assertEqual(joined.split(validationLine).length - 1, 1, 'repair quick reference does not duplicate actionBundle validation schema lines');
 }
 
 function assertPromptEnvelope(): void {

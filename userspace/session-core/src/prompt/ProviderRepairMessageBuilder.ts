@@ -1,5 +1,5 @@
 import type { LlmChatRequest } from '@deepcode/protocol';
-import { actionBundleProtocolShapeLines, actionBundleProtocolShapeReference, resourceRequestProtocolShapeLine } from '../protocol/protocolContract.js';
+import { actionBundleProtocolShapeLines, resourceRequestProtocolShapeLine } from '../protocol/protocolContract.js';
 import type { ProposalEnvelope } from '../protocol/types.js';
 import type { NativeToolCallProposal } from '../provider/providerStreamParts.js';
 import type { PromptEnvelope } from './types.js';
@@ -583,7 +583,6 @@ export class ProviderRepairMessageBuilder {
       allows('actionBundle')
         ? 'Empty content is valid only for operation="createEmpty" on an explicit empty file, or for patch/replace/insert operations when the protocol explicitly permits it.'
         : '',
-      allows('actionBundle') ? actionBundleProtocolShapeReference() : '',
       'Never output capability, permissionLabels, accessScopes, resourceScope, commandBlocks, or legacy implementationPlan.',
     ].filter(Boolean);
     if (allows('actionBundle') && (errorCode === 'invalid_action_bundle' || errorCode === 'invalid_object')) {
