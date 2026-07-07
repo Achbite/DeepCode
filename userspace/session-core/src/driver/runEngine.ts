@@ -34,7 +34,7 @@ export class RunEngine<Input, State extends RunEngineState> {
   }
 
   async continueSameLoop(input: Input): Promise<AgentSessionResult> {
-    return this.runFromCommand(input, { kind: 'continueSameLoop' });
+    return this.runFromCommand(input, { kind: 'continueSameLoop', source: 'coordinatorResume' });
   }
 
   private async runFromCommand(input: Input, initialCommand: RunCommand): Promise<AgentSessionResult> {
@@ -44,7 +44,10 @@ export class RunEngine<Input, State extends RunEngineState> {
 
     while (true) {
       if (command.kind === 'continueSameLoop') {
-        command = this.nextCommandAfterContinuation({ kind: 'continuationEntered' });
+        command = this.nextCommandAfterContinuation({
+          kind: 'continuationEntered',
+          source: command.source,
+        });
         continue;
       }
 
