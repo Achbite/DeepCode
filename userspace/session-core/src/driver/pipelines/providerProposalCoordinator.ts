@@ -162,7 +162,7 @@ export class ProviderProposalCoordinator<
       return this.ports.parseRepairedProposal({
         raw: repairedRaw,
         state,
-        allowedKinds: ['actionBundle', 'resourceRequest', 'decisionRequest', 'diagnostic'],
+        allowedKinds: ['actionBundle', 'resourceRequest', 'decisionRequest', 'taskOutcome', 'diagnostic'],
         allowBriefActionBundleUserPlan: Boolean(state.acceptedImplementationPlan),
       });
     } catch (repairError) {

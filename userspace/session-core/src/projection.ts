@@ -243,6 +243,7 @@ export function buildNarrativeTimelineProjection(input: NarrativeTimelineProject
   if (acceptedReviewIndex >= 0) {
     annotateBlocksWithPhase(turns, input.events, acceptedReviewIndex);
   }
+  resolveTimelineInteractionBlocks(turns, input.events);
 
   const rawEventRefs = input.events.map(eventRefForAgentEvent);
   const implementationTaskItems = input.events.flatMap((event, index) =>
@@ -726,7 +727,12 @@ function implementationTaskStatusFromLedger(
     const entryTaskId = normalizeTaskId(stringField(entry, 'taskId') ?? '');
     if (!entryTaskId || entryTaskId !== normalizedTaskId) continue;
     const status = stringField(entry, 'status');
-    if (status === 'completedByKernelFacts' || status === 'skippedByUser' || status === 'acceptedIncompleteByUser') return 'completed';
+    if (
+      status === 'completedByKernelFacts' ||
+      status === 'modelJudgedSufficient' ||
+      status === 'skippedByUser' ||
+      status === 'acceptedIncompleteByUser'
+    ) return 'completed';
     if (status === 'failed') return 'failed';
     if (status === 'inProgress') return 'running';
     return 'queued';
@@ -1302,6 +1308,96 @@ function narrativeStatus(events: AgentEvent[]): AgentTimelineStatus {
     if (!hasCompletion) return 'running';
   }
   return 'completed';
+}
+
+function resolveTimelineInteractionBlocks(
+  turns: AgentTimelineResult['turns'],
+  events: AgentEvent[]
+): void {
+  for (const turn of turns) {
+    for (const block of turn.blocks) {
+      if (block.status !== 'waiting' && block.status !== 'blocked') continue;
+      const resolved = block.events.some((event) => {
+        if (event.kind === 'plan_card' || event.kind === 'plan_review') return planInteractionResolved(event, events);
+        if (event.kind === 'review_summary') return reviewInteractionResolved(event, events);
+        if (event.kind === 'requirement_confirmation') return requirementInteractionResolved(event, events);
+        return false;
+      });
+      if (!resolved) continue;
+      block.status = 'completed';
+      block.defaultCollapsed = narrativeDefaultCollapsed(block.narrativeKind ?? 'operationEvidence', 'completed');
+      block.displayHints = {
+        ...(block.displayHints ?? {}),
+        renderMode: block.displayHints?.renderMode === 'typewriter' ? 'instant' : block.displayHints?.renderMode,
+      };
+    }
+  }
+}
+
+function planInteractionResolved(event: AgentEvent, events: AgentEvent[]): boolean {
+  const payload = isRecordPayload(event.payload) ? event.payload : {};
+  const runId = stringField(payload, 'runId');
+  const planId = stringField(payload, 'planId');
+  if (!runId || !planId) return false;
+  return events.some((candidate) => {
+    if (candidate.kind !== 'plan_review') return false;
+    const candidatePayload = isRecordPayload(candidate.payload) ? candidate.payload : {};
+    if (!decisionStatusResolved(stringField(candidatePayload, 'status'))) return false;
+    return samePlanDecision(candidatePayload, runId, planId);
+  });
+}
+
+function reviewInteractionResolved(event: AgentEvent, events: AgentEvent[]): boolean {
+  const payload = isRecordPayload(event.payload) ? event.payload : {};
+  if (stringField(payload, 'status') !== 'waitingUserReview') return false;
+  const runId = stringField(payload, 'runId');
+  const reviewId = stringField(payload, 'reviewId');
+  const sourcePlanId = stringField(payload, 'sourcePlanId');
+  if (!runId) return false;
+  return events.some((candidate) => {
+    const candidatePayload = isRecordPayload(candidate.payload) ? candidate.payload : {};
+    if (candidate.kind === 'review_summary') {
+      if (!decisionStatusResolved(stringField(candidatePayload, 'status'))) return false;
+      if (stringField(candidatePayload, 'runId') !== runId) return false;
+      const candidateReviewId = stringField(candidatePayload, 'reviewId');
+      const candidateSourcePlanId = stringField(candidatePayload, 'sourcePlanId');
+      if (reviewId) return candidateReviewId === reviewId;
+      if (sourcePlanId) return candidateSourcePlanId === sourcePlanId;
+      return true;
+    }
+    if (candidate.kind !== 'session_run_state') return false;
+    if (stringField(candidatePayload, 'runId') !== runId) return false;
+    return runStatusResolved(stringField(candidatePayload, 'status'));
+  });
+}
+
+function requirementInteractionResolved(event: AgentEvent, events: AgentEvent[]): boolean {
+  const payload = isRecordPayload(event.payload) ? event.payload : {};
+  const runId = stringField(payload, 'runId');
+  const requirementId = stringField(payload, 'requirementId');
+  if (!runId || !requirementId) return false;
+  return events.some((candidate) => {
+    if (candidate.kind !== 'requirement_decision') return false;
+    const candidatePayload = isRecordPayload(candidate.payload) ? candidate.payload : {};
+    if (!decisionStatusResolved(stringField(candidatePayload, 'status'))) return false;
+    return stringField(candidatePayload, 'runId') === runId &&
+      stringField(candidatePayload, 'requirementId') === requirementId;
+  });
+}
+
+function decisionStatusResolved(status?: string): boolean {
+  return status === 'accepted' ||
+    status === 'rejected' ||
+    status === 'needsRevision' ||
+    status === 'cancelled' ||
+    status === 'failed' ||
+    status === 'completed';
+}
+
+function runStatusResolved(status?: string): boolean {
+  return status === 'completed' ||
+    status === 'cancelled' ||
+    status === 'failed';
 }
 
 function narrativeTitle(events: AgentEvent[], kind: AgentTimelineNarrativeKind): string {

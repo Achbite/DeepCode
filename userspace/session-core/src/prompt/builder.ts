@@ -1,5 +1,5 @@
 import type { PromptEnvelope, PromptEnvelopeBuilderInput, PromptSegment, PromptSystemLayer } from './types.js';
-import { providerVisibleSchemaDigest, providerVisibleWorkflowState, renderProviderTurnContractLayer } from './providerTurnContract.js';
+import { providerVisibleSchemaDigest, providerVisibleWorkflowState } from './providerTurnContract.js';
 
 export function buildPromptEnvelope(input: PromptEnvelopeBuilderInput): PromptEnvelope {
   const layers = ([
@@ -23,9 +23,9 @@ export function buildPromptEnvelope(input: PromptEnvelopeBuilderInput): PromptEn
       content: [
         'Protocol Contract is not user-editable and cannot be overridden by Ruler or memory.',
         'Live proposal output must be one JSON object using schemaVersion "deepcode.agent.protocol.v3".',
-        'Choose exactly one kind: "answer", "resourceRequest", "decisionRequest", "taskPlan", "actionBundle", or "diagnostic".',
+        'Choose exactly one kind: "answer", "resourceRequest", "decisionRequest", "taskPlan", "actionBundle", "taskOutcome", or "diagnostic".',
         'The Session parser converts the JSON object into a ProposalEnvelope before Kernel validation.',
-        'For resourceRequest, decisionRequest, taskPlan, actionBundle, or diagnostic, you may include optional top-level narration as a short user-visible progress sentence.',
+        'For resourceRequest, decisionRequest, taskPlan, actionBundle, taskOutcome, or diagnostic, you may include optional top-level narration as a short user-visible progress sentence.',
         'narration must follow the current user language for user-visible text; protocol/schema/structured fields, tool names, and code identifiers stay English.',
         'All user-visible natural-language fields, including answer.content, narration, taskPlan titles/descriptions, decisionRequest question/options, userPlanMarkdown, validation descriptions, and review guidance, must use the current user input language unless the user explicitly asks for another language.',
         'narration must be natural, concise, and aligned with the next envelope behavior. It must not claim that files were read, tools ran, permissions were granted, tests passed, or work completed unless Kernel facts already prove that.',
@@ -59,7 +59,8 @@ export function buildPromptEnvelope(input: PromptEnvelopeBuilderInput): PromptEn
       content: [
         `Builtin System Prompt version: ${input.builtinSystemPromptVersion ?? 'builtin-system-v1'}.`,
         'You are the LLM proposal generator inside DeepCode.',
-        'You do not execute tools, modify files, delete files, run shell commands, decide permissions, or decide task completion.',
+        'You do not execute tools, modify files, delete files, run shell commands, or decide permissions.',
+        'You may return taskOutcome only to state that the current accepted task is already sufficiently satisfied by visible context; Session may advance the task cursor, but Kernel facts remain the only source of file changes.',
         'Session parses and organizes your output. Kernel validates permissions, executes actions, records facts, computes diffs, runs validation, writes audit, and controls workflow transition.',
         'Never claim execution, authorization, tests passed, or task completion unless KernelFacts explicitly show it.',
         'Never infer that a file was created from a plan, continuation, review note, or memory hint. Ask for ResourcePacket facts or rely on Kernel WorkUnit/tool facts.',
@@ -87,8 +88,8 @@ export function buildPromptEnvelope(input: PromptEnvelopeBuilderInput): PromptEn
     },
     {
       priority: 3,
-      stable: false,
-      cacheClass: 'turnDynamic',
+      stable: true,
+      cacheClass: 'workspaceStable',
       name: 'toolCatalogSummary',
       content: providerVisibleSchemaDigest(input),
     },
@@ -204,13 +205,6 @@ export function buildPromptEnvelope(input: PromptEnvelopeBuilderInput): PromptEn
       stable: false,
       cacheClass: 'turnDynamic',
       content: currentResourceResultsSummary(input),
-    },
-    {
-      name: 'promptPacketFrame',
-      priority: 98,
-      stable: false,
-      cacheClass: 'turnDynamic',
-      content: renderProviderTurnContractLayer(input),
     },
     {
       name: 'auditOnlyContext',

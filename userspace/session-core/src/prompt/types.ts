@@ -23,7 +23,6 @@ export interface PromptSystemLayer {
     | 'currentWorkflowState'
     | 'currentRequirement'
     | 'currentResourceResults'
-    | 'promptPacketFrame'
     | 'auditOnlyContext';
   priority: number;
   stable: boolean;

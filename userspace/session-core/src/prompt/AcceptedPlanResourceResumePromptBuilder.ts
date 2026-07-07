@@ -50,7 +50,7 @@ export class AcceptedPlanResourceResumePromptBuilder {
     return [
       this.repairMessageBuilder.renderRepairProviderTurnContract(input.repairState, {
         turnMode: 'resourceResume',
-        allowedKinds: ['actionBundle', 'resourceRequest', 'decisionRequest', 'answer', 'diagnostic'],
+        allowedKinds: ['actionBundle', 'resourceRequest', 'decisionRequest', 'taskOutcome', 'answer', 'diagnostic'],
         repairPolicy: 'diagnosticOnly',
         errorLines: [`ResourcePacket ${packet.id} resolved ${packet.items.length} item(s) for the current accepted task.`],
       }),
@@ -58,9 +58,9 @@ export class AcceptedPlanResourceResumePromptBuilder {
       'You are resuming the same accepted task after Session resolved read-only evidence. Do not restart planning, do not ask for already-confirmed scope, and do not claim execution facts.',
       'Before the final JSON proposal, stream visible edit drafts with <deepcode-part>{...}</deepcode-part> frames when generating long codeBlocks/actionBundles. These frames are draft ledger previews only; final workspace writes still come only from the complete actionBundle JSON.',
       'All user-visible natural language in narration, userPlanMarkdown, validation descriptions, and review guidance must follow the current user input language.',
-      'Return exactly one Agent Protocol v3 proposal: actionBundle, resourceRequest, decisionRequest, answer, or diagnostic.',
+      'Return exactly one Agent Protocol v3 proposal: actionBundle, resourceRequest, decisionRequest, taskOutcome, answer, or diagnostic.',
       resourceRequestProtocolShapeLine(),
-      'Prefer actionBundle if the just-resolved evidence is sufficient for an edit task. If the current task is read-only validation and the ResourcePacket is enough, return answer summarizing only the resolved evidence. If more evidence is needed, request only a different focused resource. If scope is insufficient, return decisionRequest.',
+      'Prefer actionBundle if the just-resolved evidence is sufficient for an edit task. If the current task is already sufficiently satisfied and no Kernel action is needed, return taskOutcome. If the current task is read-only validation and the ResourcePacket is enough, return answer summarizing only the resolved evidence. If more evidence is needed, request only a different focused resource. If scope is insufficient, return decisionRequest.',
       acceptedPlan ? `Accepted plan progress: planId=${acceptedPlan.planId}; completedTaskCount=${acceptedPlan.completedTaskIds.length}; remainingTaskCount=${acceptedPlan.tasks.filter((task) => !acceptedPlan.completedTaskIds.includes(task.taskId)).length}.` : '',
       cursor ? `TaskExecutionCursor: currentTaskId=${cursor.currentTaskId ?? 'none'}; completedTaskCount=${cursor.completedTaskIds.length}; lastResourcePackets=${cursor.lastResourcePacketIds.join(', ') || 'none'}.` : '',
       currentTask ? `CurrentTaskGoal: ${currentTask.goal}` : '',

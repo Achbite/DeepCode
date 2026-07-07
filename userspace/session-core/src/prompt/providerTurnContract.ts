@@ -88,11 +88,12 @@ export function providerVisibleSchemaDigest(input: PromptEnvelopeBuilderInput): 
   const turnMode = inferProviderTurnMode(input);
   const common = [
     'Agent Protocol v3 schema digest: every live proposal is one JSON object with schemaVersion="deepcode.agent.protocol.v3", kind, outputLanguage, optional narration, and the kind-specific top-level field for the current ProviderTurnContract.',
-    'Allowed proposal kinds only: answer, resourceRequest, decisionRequest, taskPlan, actionBundle, diagnostic. reviewSummary is Session-generated from Kernel facts and must never be returned by the provider.',
+    'Allowed proposal kinds only: answer, resourceRequest, decisionRequest, taskPlan, actionBundle, taskOutcome, diagnostic. reviewSummary is Session-generated from Kernel facts and must never be returned by the provider.',
     'answer top-level field: answer.format="markdown" and answer.content contains the user-visible response.',
     resourceRequestProtocolShapeLine(),
     'decisionRequest top-level field: decisionRequest.version/id/question/reason/summary/options/allowsFreeform; question must be a non-empty user-visible string. Use 2-3 mutually exclusive options with one recommended option.',
     'taskPlan top-level field: taskPlan.version/id/title/summary/tasks/risks/reviewCheckpoints. tasks[] is a Session-advanced ordered implementation queue. Do not output scheduling graph structures, source code, codeBlocks, actionBundle, commandBlocks, patches, or executable tool calls.',
+    'taskOutcome top-level field: taskOutcome.version/id/taskId/status/reason/evidenceRefs. Use it only during accepted task execution when the current task is already sufficiently satisfied and no Kernel write/delete action is needed.',
     'diagnostic top-level field: diagnostic.version/id/severity/summary/details; diagnostic explains terminal protocol/context failure and never queues execution.',
   ];
   if (turnMode !== 'acceptedTaskExecution') {
@@ -109,6 +110,7 @@ export function providerVisibleSchemaDigest(input: PromptEnvelopeBuilderInput): 
     `actionBundle.actions[].toolId must use Kernel catalog ids: ${kernelCatalogToolIdList()}.`,
     'File operation actions must use fs.* toolIds. Action entries use actionId, toolId, args, and description; Kernel derives capability, permission, readSet/writeSet, and conflictKeys.',
     'Do not output capability, permissionLabels, accessScopes, resourceScope, commandBlocks, legacy implementationPlan, or payload wrapper fields.',
+    'If the current accepted task is already satisfied by visible ResourceEvidence, generated artifact evidence, or confirmed task state and no action is needed, return taskOutcome with status="modelJudgedSufficient" instead of inventing an empty actionBundle.',
   ].join('\n');
 }
 

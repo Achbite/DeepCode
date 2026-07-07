@@ -93,7 +93,7 @@ export class ProposalRouter<Input, State extends ProposalRouterState> {
       if (handled.kind === 'return' && handled.result) return { kind: 'return', result: handled.result };
       return { kind: 'continue', lastResult: handled.lastResult ?? lastResult };
     }
-    if (proposal.kind === 'actionBundle') {
+    if (proposal.kind === 'actionBundle' || proposal.kind === 'taskOutcome') {
       return {
         kind: 'return',
         result: await this.ports.submitActionProposal(input, state, prompt, proposal, lastResult),

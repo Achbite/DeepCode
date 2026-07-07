@@ -9,6 +9,7 @@ const V3_KINDS = new Set([
   'decisionRequest',
   'taskPlan',
   'actionBundle',
+  'taskOutcome',
   'diagnostic',
 ]);
 
@@ -55,8 +56,35 @@ function proposalPayload(envelope: Record<string, unknown>, kind: string, propos
   if (kind === 'resourceRequest') return normalizeResourceRequest(requireObject(envelope.resourceRequest, 'Agent Protocol v3.resourceRequest'));
   if (kind === 'decisionRequest') return normalizeDecisionRequest(decisionRequestPayload(envelope));
   if (kind === 'taskPlan') return normalizeTaskPlan(requireObject(envelope.taskPlan, 'Agent Protocol v3.taskPlan'));
+  if (kind === 'taskOutcome') return normalizeTaskOutcome(requireObject(envelope.taskOutcome, 'Agent Protocol v3.taskOutcome'));
   if (kind === 'diagnostic') return normalizeDiagnostic(requireObject(envelope.diagnostic, 'Agent Protocol v3.diagnostic'));
   return normalizeActionBundlePayload(envelope, proposalId);
+}
+
+function normalizeTaskOutcome(value: Record<string, unknown>): Record<string, unknown> {
+  const status = optionalString(value, 'status') ?? 'modelJudgedSufficient';
+  if (!['modelJudgedSufficient', 'blocked', 'failed'].includes(status)) {
+    throw new AgentPlanParseError(
+      'invalid_task_outcome',
+      'Agent Protocol v3.taskOutcome.status must be "modelJudgedSufficient", "blocked", or "failed".'
+    );
+  }
+  const reason = optionalString(value, 'reason') ?? optionalString(value, 'summary') ?? optionalString(value, 'details');
+  if (!reason) {
+    throw new AgentPlanParseError(
+      'invalid_task_outcome',
+      'Agent Protocol v3.taskOutcome.reason must be a non-empty string.'
+    );
+  }
+  return {
+    ...value,
+    version: optionalString(value, 'version') ?? '1',
+    id: optionalString(value, 'id') ?? 'task-outcome',
+    taskId: optionalString(value, 'taskId'),
+    status,
+    reason,
+    evidenceRefs: normalizeStringList(value.evidenceRefs),
+  };
 }
 
 function decisionRequestPayload(envelope: Record<string, unknown>): Record<string, unknown> {

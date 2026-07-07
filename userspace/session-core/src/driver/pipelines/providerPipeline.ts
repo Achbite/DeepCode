@@ -182,6 +182,7 @@ function renderToolIntentTemplate(template: ToolIntentTemplate): Record<string, 
     operation: template.operation,
     targets: template.targets,
     ...(template.evidencePolicy ? { evidencePolicy: template.evidencePolicy } : {}),
+    ...(template.template ? { template: template.template } : {}),
   };
 }
 

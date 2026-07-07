@@ -23,8 +23,10 @@ export class AcceptedTaskRegistry {
     const acceptedPlan = this.acceptedPlan;
     if (!acceptedPlan) return undefined;
     const completed = new Set(acceptedPlan.completedTaskIds);
+    const modelJudgedSufficient = new Set(acceptedPlan.modelJudgedSufficientTaskIds ?? []);
     const currentTask = acceptedPlan.tasks.find((task) =>
       !completed.has(task.taskId) &&
+      !modelJudgedSufficient.has(task.taskId) &&
       task.taskId !== failedTaskId &&
       !skippedTaskIds.includes(task.taskId) &&
       !acceptedIncompleteTaskIds.includes(task.taskId)
@@ -39,6 +41,7 @@ export class AcceptedTaskRegistry {
         capability: task.capability,
       })),
       completedTaskIds: acceptedPlan.completedTaskIds,
+      modelJudgedSufficientTaskIds: acceptedPlan.modelJudgedSufficientTaskIds ?? [],
       failedTaskId,
       skippedTaskIds,
       acceptedIncompleteTaskIds,
@@ -63,8 +66,9 @@ export class AcceptedTaskRegistry {
     const acceptedPlan = this.acceptedPlan;
     if (!acceptedPlan) return undefined;
     const ledger = this.ledger();
-    const completedTasks = new Set(acceptedPlan.completedTaskIds);
-    const currentTask = acceptedPlan.tasks.find((task) => !completedTasks.has(task.taskId))
+    const modelJudgedSufficient = new Set(acceptedPlan.modelJudgedSufficientTaskIds ?? []);
+    const settledTasks = new Set([...acceptedPlan.completedTaskIds, ...modelJudgedSufficient]);
+    const currentTask = acceptedPlan.tasks.find((task) => !settledTasks.has(task.taskId))
       ?? acceptedPlan.tasks[Math.max(0, acceptedPlan.batchIndex - 1)];
     const lastResourcePacketIds = resourcePackets
       .map((packet) => packet.id)
@@ -83,7 +87,8 @@ export class AcceptedTaskRegistry {
       currentTaskId: currentTask?.taskId,
       taskOrder: ledger?.taskOrder ?? acceptedPlan.tasks.map((task) => task.taskId),
       pendingTaskIds: ledger?.pendingTaskIds ?? [],
-      completedTaskIds: [...acceptedPlan.completedTaskIds],
+      completedTaskIds: [...settledTasks],
+      modelJudgedSufficientTaskIds: [...modelJudgedSufficient],
       lastResourcePacketIds,
       lastSavepointId,
     };
@@ -122,6 +127,7 @@ export class AcceptedTaskRegistry {
       dependsOn: [],
       evidenceNeeds: [],
       completedTaskIds: cursor.completedTaskIds,
+      modelJudgedSufficientTaskIds: cursor.modelJudgedSufficientTaskIds,
     };
   }
 
@@ -129,12 +135,41 @@ export class AcceptedTaskRegistry {
     const acceptedPlan = this.acceptedPlan;
     if (!acceptedPlan) return undefined;
     const completed = new Set(completedTaskIds);
-    const nextIndex = acceptedPlan.tasks.findIndex((task) => !completed.has(task.taskId));
+    const modelJudgedSufficient = new Set((acceptedPlan.modelJudgedSufficientTaskIds ?? []).filter((taskId) => !completed.has(taskId)));
+    const settled = new Set([...completed, ...modelJudgedSufficient]);
+    const nextIndex = acceptedPlan.tasks.findIndex((task) => !settled.has(task.taskId));
     return {
       ...acceptedPlan,
       completedTaskIds,
+      modelJudgedSufficientTaskIds: [...modelJudgedSufficient],
       batchIndex: nextIndex >= 0 ? nextIndex + 1 : acceptedPlan.tasks.length + 1,
     };
+  }
+
+  withModelJudgedSufficient(taskId: string): AcceptedImplementationPlanContext | undefined {
+    const acceptedPlan = this.acceptedPlan;
+    if (!acceptedPlan) return undefined;
+    const completed = new Set(acceptedPlan.completedTaskIds);
+    const modelJudgedSufficient = new Set(acceptedPlan.modelJudgedSufficientTaskIds ?? []);
+    if (!completed.has(taskId)) modelJudgedSufficient.add(taskId);
+    const settled = new Set([...completed, ...modelJudgedSufficient]);
+    const nextIndex = acceptedPlan.tasks.findIndex((task) => !settled.has(task.taskId));
+    return {
+      ...acceptedPlan,
+      modelJudgedSufficientTaskIds: [...modelJudgedSufficient],
+      batchIndex: nextIndex >= 0 ? nextIndex + 1 : acceptedPlan.tasks.length + 1,
+    };
+  }
+
+  complete(): boolean {
+    const acceptedPlan = this.acceptedPlan;
+    if (!acceptedPlan) return false;
+    if (!acceptedPlan.tasks.length) return true;
+    const settled = new Set([
+      ...acceptedPlan.completedTaskIds,
+      ...(acceptedPlan.modelJudgedSufficientTaskIds ?? []),
+    ]);
+    return acceptedPlan.tasks.every((task) => settled.has(task.taskId));
   }
 }
 

@@ -80,6 +80,7 @@ import {
 import { DriverInteractionIndex } from './interactions/index.js';
 import { ReviewAssembler, ReviewDecisionProjectionBuilder } from './review/index.js';
 import { DriverFailureMessageCatalog, DriverParseErrorCatalog } from './diagnostics/index.js';
+import { builtinHooks, HookPolicy, HookRegistry, HookRuntime } from './hooks/index.js';
 import type { LlmTurnResult, SessionDriverLoopRunState } from './runFrame.js';
 import { clip, objectRecord, stringValue, visibleLanguageForRequest } from './runtimeSupport.js';
 
@@ -93,6 +94,9 @@ export const providerPipeline = new ProviderPipeline();
 export const providerJsonModeCoordinator = new ProviderJsonModeCoordinator();
 export const providerStreamCoordinator = new ProviderStreamCoordinator();
 export const providerTraceRecorder = new ProviderTraceRecorder();
+export const hookRegistry = new HookRegistry();
+for (const hook of builtinHooks()) hookRegistry.register(hook);
+export const hookRuntime = new HookRuntime(hookRegistry, HookPolicy.observerOnly());
 export const actionBundleActionInspector = new ActionBundleActionInspector();
 export const driverActivityBuilder = new DriverActivityBuilder({
   providerStageSummary: (stage, part, language) => providerStreamCoordinator.stageSummary(stage, part, language),

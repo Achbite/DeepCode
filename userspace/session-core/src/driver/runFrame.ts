@@ -24,6 +24,7 @@ import type {
   ProviderPartFrameParser,
 } from '../provider/providerStreamParts.js';
 import type { GeneratedArtifactEvidence } from './context/index.js';
+import type { HookResult } from './hooks/hookResult.js';
 import type { InteractionOverlayContext, SessionTurnPhase } from './pipelines/interactionOverlayCodec.js';
 import type { DriverRequestRef, KernelStateContractRef } from './types.js';
 
@@ -88,6 +89,66 @@ export interface ToolIntentTemplate {
   readonly operation: string;
   readonly targets: string[];
   readonly evidencePolicy?: string;
+  readonly template?: unknown;
+}
+
+export interface ProviderTurnSnapshotSegment {
+  readonly id: string;
+  readonly name: string;
+  readonly cacheClass: string;
+  readonly stablePrefix: boolean;
+  readonly auditOnly: boolean;
+  readonly contentHash: string;
+  readonly charLength: number;
+}
+
+export interface ProviderTurnSnapshotFrame {
+  readonly index: number;
+  readonly kind: string;
+  readonly source: ProviderFrameSource;
+  readonly trust: ProviderFrameTrust;
+  readonly scope?: string;
+  readonly useHash: string;
+  readonly summaryHash?: string;
+  readonly refsCount: number;
+  readonly dataHash?: string;
+}
+
+export interface ProviderTurnSnapshotResourceBlock {
+  readonly index: number;
+  readonly blockKey: string;
+  readonly displayRef: string;
+  readonly retention: string;
+  readonly status: string;
+  readonly readPolicy: string;
+  readonly contentHash: string;
+  readonly charLength: number;
+  readonly summaryCharLength: number;
+  readonly fullTextCharLength: number;
+}
+
+export interface ProviderTurnSnapshot {
+  readonly schemaVersion: 'deepcode.session.provider-turn-snapshot.v1';
+  readonly contractId: string;
+  readonly sessionId: string;
+  readonly runId: string;
+  readonly turnMode: ProviderTurnMode;
+  readonly allowedKinds: string[];
+  readonly requiredKind?: string;
+  readonly repairPolicy: ProviderRepairPolicy;
+  readonly projectionVisibility: ProviderProjectionVisibility;
+  readonly stablePrefixHash: string;
+  readonly dynamicSuffixHash: string;
+  readonly stablePrefixCharLength: number;
+  readonly dynamicSuffixCharLength: number;
+  readonly providerTurnContractHash: string;
+  readonly providerTurnContractCharLength: number;
+  readonly segmentOrder: string[];
+  readonly segments: ProviderTurnSnapshotSegment[];
+  readonly frames: ProviderTurnSnapshotFrame[];
+  readonly resourceBlocks: ProviderTurnSnapshotResourceBlock[];
+  readonly resourceRetentionCounts: Record<string, number>;
+  readonly cacheClasses: Record<string, number>;
 }
 
 export interface DriverProviderTurnFrame {
@@ -105,6 +166,16 @@ export interface DriverProviderTurnFrame {
   readonly nextActionInstruction: ProviderContextFrame;
   readonly prompt: PromptEnvelope;
   readonly contextAssembly?: ContextAssemblyRecord;
+  readonly snapshot?: ProviderTurnSnapshot;
+  readonly hookTrace?: readonly HookResult[];
+}
+
+export interface ModelContextBundle {
+  readonly prompt: PromptEnvelope;
+  readonly providerTurnContract: DriverProviderTurnFrame;
+  readonly contextAssembly?: ContextAssemblyRecord;
+  readonly snapshot: ProviderTurnSnapshot;
+  readonly hookTrace: readonly HookResult[];
 }
 
 export interface SessionDriverLoopRunState {
@@ -129,6 +200,7 @@ export interface SessionDriverLoopRunState {
   taskLedger?: TaskLedgerSnapshot;
   acceptedPlanPromptFrame?: AcceptedPlanPromptFrame;
   providerTurnFrame?: DriverProviderTurnFrame;
+  modelContextBundle?: ModelContextBundle;
   implementationBatch: ImplementationBatchContext;
   acceptedImplementationPlan?: AcceptedImplementationPlanContext;
   resourceRequestRepairAttempted: boolean;

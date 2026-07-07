@@ -80,6 +80,7 @@ import {
   driverParseErrorCatalog,
   executionPromptCoordinator,
   generatedArtifactEvidenceIndex,
+  hookRuntime,
   implementationBatchContextBuilder,
   interactionOverlayCodec,
   kernelEventProjectionBuilder,
@@ -424,6 +425,7 @@ export class SessionDriverLoop {
       permissionId: (events) => kernelEventStatusIndex.permissionId(events),
       batchProgress: (progressInput) => acceptedPlanTaskLedger().batchProgress(progressInput),
       afterBatch: (accepted, completedTaskIds) => acceptedPlanTaskLedger().afterBatch(accepted, completedTaskIds),
+      afterTaskOutcome: (accepted, taskId) => acceptedPlanTaskLedger().afterTaskOutcome(accepted, taskId),
       refreshRuntimeState: (state) => acceptedPlanTaskLedger().refreshRuntimeState(state),
       complete: (accepted) => acceptedPlanTaskLedger().complete(accepted),
       batchCheckpointEvent: (sessionId, runId, accepted, proposal, kernelEvents, progress, ts, id) =>
@@ -1101,6 +1103,7 @@ export class SessionDriverLoop {
       nativeToolError: (error) => error instanceof NativeToolCoordinatorError
         ? { code: error.code, message: error.message }
         : undefined,
+      runHook: (hookInput) => hookRuntime.run(hookInput),
       createError: (code, message) => new SessionDriverLoopError(code, message),
       now: () => this.agentRunReactor.ts(),
       createId: (prefix) => this.agentRunReactor.id(prefix),
@@ -1221,6 +1224,7 @@ export class SessionDriverLoop {
         }),
       buildProviderTurnContract: (contractInput) =>
         contextFrameBuilder.buildSessionProviderTurnContract(contractInput),
+      runHook: (hookInput) => hookRuntime.run(hookInput),
     });
     this.providerTurnCycle = new ProviderTurnCycle<SessionDriverLoopInput, SessionDriverLoopRunState>({
       refreshRuntimeState: (state) => acceptedPlanTaskLedger().refreshRuntimeState(state),

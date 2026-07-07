@@ -2,6 +2,7 @@ export type TaskLedgerStatus =
   | 'pending'
   | 'inProgress'
   | 'completedByKernelFacts'
+  | 'modelJudgedSufficient'
   | 'failed'
   | 'skippedByUser'
   | 'acceptedIncompleteByUser';
@@ -18,6 +19,7 @@ export interface TaskLedgerInput {
   runId: string;
   tasks: TaskLedgerTaskInput[];
   completedTaskIds?: string[];
+  modelJudgedSufficientTaskIds?: string[];
   failedTaskId?: string;
   skippedTaskIds?: string[];
   acceptedIncompleteTaskIds?: string[];
@@ -39,6 +41,7 @@ export interface TaskLedgerSnapshot {
   taskOrder: string[];
   currentTaskId?: string;
   completedTaskIds: string[];
+  modelJudgedSufficientTaskIds: string[];
   failedTaskId?: string;
   skippedTaskIds: string[];
   acceptedIncompleteTaskIds: string[];
@@ -48,11 +51,13 @@ export interface TaskLedgerSnapshot {
 
 export function buildTaskLedgerSnapshot(input: TaskLedgerInput): TaskLedgerSnapshot {
   const completed = new Set(input.completedTaskIds ?? []);
+  const modelJudgedSufficient = new Set(input.modelJudgedSufficientTaskIds ?? []);
   const skipped = new Set(input.skippedTaskIds ?? []);
   const acceptedIncomplete = new Set(input.acceptedIncompleteTaskIds ?? []);
   const taskOrder = input.tasks.map((task) => task.taskId);
   const currentTaskId = input.currentTaskId ?? input.tasks.find((task) =>
     !completed.has(task.taskId) &&
+    !modelJudgedSufficient.has(task.taskId) &&
     !skipped.has(task.taskId) &&
     !acceptedIncomplete.has(task.taskId) &&
     task.taskId !== input.failedTaskId
@@ -61,6 +66,7 @@ export function buildTaskLedgerSnapshot(input: TaskLedgerInput): TaskLedgerSnaps
     let status: TaskLedgerStatus = 'pending';
     if (task.taskId === input.failedTaskId) status = 'failed';
     else if (completed.has(task.taskId)) status = 'completedByKernelFacts';
+    else if (modelJudgedSufficient.has(task.taskId)) status = 'modelJudgedSufficient';
     else if (skipped.has(task.taskId)) status = 'skippedByUser';
     else if (acceptedIncomplete.has(task.taskId)) status = 'acceptedIncompleteByUser';
     else if (task.taskId === currentTaskId) status = 'inProgress';
@@ -74,6 +80,7 @@ export function buildTaskLedgerSnapshot(input: TaskLedgerInput): TaskLedgerSnaps
   });
   const closed = new Set([
     ...[...completed],
+    ...[...modelJudgedSufficient],
     ...[...skipped],
     ...[...acceptedIncomplete],
     ...(input.failedTaskId ? [input.failedTaskId] : []),
@@ -85,6 +92,7 @@ export function buildTaskLedgerSnapshot(input: TaskLedgerInput): TaskLedgerSnaps
     taskOrder,
     currentTaskId,
     completedTaskIds: taskOrder.filter((taskId) => completed.has(taskId)),
+    modelJudgedSufficientTaskIds: taskOrder.filter((taskId) => modelJudgedSufficient.has(taskId)),
     failedTaskId: input.failedTaskId,
     skippedTaskIds: taskOrder.filter((taskId) => skipped.has(taskId)),
     acceptedIncompleteTaskIds: taskOrder.filter((taskId) => acceptedIncomplete.has(taskId)),
@@ -96,8 +104,8 @@ export function buildTaskLedgerSnapshot(input: TaskLedgerInput): TaskLedgerSnaps
 export function taskLedgerAllSettled(ledger: TaskLedgerSnapshot): boolean {
   return ledger.entries.every((entry) =>
     entry.status === 'completedByKernelFacts' ||
+    entry.status === 'modelJudgedSufficient' ||
     entry.status === 'skippedByUser' ||
     entry.status === 'acceptedIncompleteByUser'
   );
 }
-

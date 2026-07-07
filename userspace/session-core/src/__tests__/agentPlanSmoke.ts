@@ -45,7 +45,8 @@ import {
 import { AcceptedPlanScopeMatcher, AcceptedTaskRegistry, type AcceptedImplementationPlanContext } from '../accepted-plan/index.js';
 import { AgentRunReactor } from '../driver/agentRunReactor.js';
 import { ContextFrameBuilder } from '../driver/context/contextFrameBuilder.js';
-import { AcceptedPlanResourceResumeCoordinator, ActionBundleAdmissionResourceFollowupCoordinator, GeneratedArtifactEvidenceIndex, PathIdentity, ResourceEvidenceIndex, ResourceOrchestrator, ResourceRequestLoop, ResourceRequestRepairCoordinator } from '../driver/context/index.js';
+import { renderProviderTurnContractLayer } from '../prompt/providerTurnContract.js';
+import { AcceptedPlanResourceResumeCoordinator, ActionBundleAdmissionResourceFollowupCoordinator, GeneratedArtifactEvidenceIndex, PathIdentity, ResourceEvidenceIndex, ResourceOrchestrator, ResourceRequestLoop, ResourceRequestRepairCoordinator, buildProviderTurnSnapshot } from '../driver/context/index.js';
 import {
   AcceptedActionBundlePlanExecutor,
   AcceptedImplementationPlanContextBuilder,
@@ -72,6 +73,7 @@ import { ActionBundleActionInspector, PlanContextIndex, PlanInteractionIndex, Pl
 import { AssistantProjectionBuilder, DriverActivityBuilder, KernelEventProjectionBuilder, PlanProjectionBuilder, RequirementProjectionBuilder, ReviewProjectionBuilder, SessionFailureProjectionBuilder, SessionProgressProjectionBuilder } from '../driver/projection/index.js';
 import { AcceptedPlanReviewHandoffCoordinator, AcceptedPlanStaticSyntaxReviewCoordinator, ReviewAssembler, ReviewDecisionProjectionBuilder } from '../driver/review/index.js';
 import { PermissionDecisionHandler, PlanDecisionHandler, RequirementDecisionHandler, ReviewDecisionHandler } from '../driver/interactions/index.js';
+import { HookPolicy, HookRegistry, HookRuntime } from '../driver/hooks/index.js';
 import { AcceptedPlanResourceResumePromptBuilder } from '../prompt/AcceptedPlanResourceResumePromptBuilder.js';
 import { ProviderRepairMessageBuilder } from '../prompt/ProviderRepairMessageBuilder.js';
 import type { PromptEnvelope } from '../prompt/types.js';
@@ -97,6 +99,8 @@ async function main(): Promise<void> {
   assertPromptEnvelope();
   assertContextAssemblerCachePlan();
   assertProviderTurnContractFrameOrder();
+  assertProviderTurnSnapshotRecordsContextAdmissionShape();
+  await assertHookObserverProducesTraceOnly();
   await assertProviderPipelineUsesProviderTurnContract();
   assertProviderJsonModeCoordinator();
   assertProviderStreamCoordinatorClassifiesStages();
@@ -165,6 +169,7 @@ async function main(): Promise<void> {
   await assertProviderLifecycleStatusDoesNotEnterReasoningBody();
   assertSettingsCatalogBoundaries();
   assertNarrativeTimelineProjection();
+  assertNarrativeTimelineProjectionResolvesAcceptedPlanInteractions();
   assertTimelineProjectionWithLiveOverlay();
   assertImplementationPlanTaskProjectionProgress();
   assertSessionDriverSkeleton();
@@ -287,16 +292,151 @@ function assertProviderTurnContractFrameOrder(): void {
   const kinds = contract.frames.map((frame) => frame.kind);
   assertEqual(kinds[0], 'SystemContract', 'provider turn contract starts with system contract');
   assertEqual(kinds[1], 'ProtocolContract', 'provider turn contract keeps protocol contract before dynamic context');
-  assertEqual(kinds[2], 'Memory', 'provider turn contract places memory before user request');
-  assertEqual(kinds[3], 'UserRequest', 'provider turn contract places user request after memory');
+  assertEqual(kinds[2], 'MemoryPlaceholder', 'provider turn contract places memory placeholder before dynamic dialogue');
+  assertEqual(kinds[3], 'DynamicDialogue', 'provider turn contract places dynamic dialogue after memory placeholder');
+  assertEqual(kinds.includes('AccessIndex'), true, 'provider turn contract includes access index');
+  assertEqual(kinds.includes('HookContext'), true, 'provider turn contract includes hook context');
+  assertEqual(kinds.includes('ProviderStepSummary'), true, 'provider turn contract includes provider step summary');
   assertEqual(kinds.at(-1), 'NextActionInstruction', 'provider turn contract ends with next action instruction');
   const resourceFrame = contract.frames.find((frame) => frame.kind === 'ResourceEvidence');
   assertEqual(resourceFrame?.trust, 'kernelObservedFact', 'resource evidence is marked as Kernel-observed fact');
-  const accessFrame = contract.frames.find((frame) => frame.kind === 'AccessSummary');
-  assertEqual(accessFrame?.trust, 'derivedObservedFact', 'access summary is marked as derived observed fact');
-  const memoryFrame = contract.frames.find((frame) => frame.kind === 'Memory');
+  const accessFrame = contract.frames.find((frame) => frame.kind === 'AccessIndex');
+  assertEqual(accessFrame?.trust, 'derivedObservedFact', 'access index is marked as derived observed fact');
+  const memoryFrame = contract.frames.find((frame) => frame.kind === 'MemoryPlaceholder');
   assertEqual(memoryFrame?.trust, 'compressedReference', 'memory is marked as compressed reference');
   assertEqual(contract.nextActionInstruction.kind, 'NextActionInstruction', 'contract exposes next action instruction directly');
+}
+
+function assertProviderTurnSnapshotRecordsContextAdmissionShape(): void {
+  const token = randomSmokeToken('provider-turn-snapshot');
+  const manifest: ResourceManifest = {
+    id: `manifest-${token}`,
+    workspaceScopeKey: `scope-${token}`,
+    entries: [{
+      id: `entry-${token}`,
+      kind: 'file',
+      label: `File ${token}`,
+      resourceRef: `file-${token}.txt`,
+      readPolicy: 'autoRead',
+      reason: 'Read generic evidence.',
+    }],
+    budget: { maxEntries: 4, maxBytes: 4096 },
+    defaultDenyPatterns: [],
+  };
+  const initialContext = {
+    id: `initial-${token}`,
+    workspaceScopeKey: `scope-${token}`,
+    manifest,
+    roots: [{
+      kind: 'directory' as const,
+      rootId: `root-${token}`,
+      label: `workspace-${token}`,
+      displayPath: `workspace-${token}`,
+      absolutePath: `/tmp/workspace-${token}`,
+      source: 'currentAttachment' as const,
+      primary: true,
+    }],
+  };
+  const conversationRoots = initialContext.roots;
+  const resourcePacket = createResourcePacket({
+    packetId: `packet-${token}`,
+    manifest,
+    request: {
+      id: `request-${token}`,
+      items: [{ id: `item-${token}`, manifestEntryId: `entry-${token}`, reason: 'Read generic evidence.' }],
+    },
+    kernelEvidence: {
+      [`entry-${token}`]: {
+        contentKind: 'fileText',
+        promptContent: `generic content ${token}`,
+        evidenceRefs: [`evidence-${token}`],
+      },
+    },
+  });
+  const prompt = buildPromptEnvelope({
+    workflowState: `workflow-${token}`,
+    allowedProposals: ['actionBundle', 'resourceRequest'],
+    capabilityCatalogSummary: `capability-${token}`,
+    userRequest: `request-${token}`,
+    resourcePromptContext: buildResourcePromptContext({
+      initialContext,
+      resourcePackets: [resourcePacket],
+      conversationRoots,
+    }),
+  });
+  const context = assembleContext({
+    contextAssemblyId: `assembly-${token}`,
+    workflowState: `workflow-${token}`,
+    allowedProposals: ['actionBundle', 'resourceRequest'],
+    capabilityCatalogSummary: `capability-${token}`,
+    userRequest: `request-${token}`,
+    initialContext,
+    resourcePackets: [resourcePacket],
+    conversationRoots,
+  });
+  const contract = new ContextFrameBuilder().buildProviderTurnContract({
+    contractId: `contract-${token}`,
+    sessionId: `session-${token}`,
+    runId: `run-${token}`,
+    turnMode: 'acceptedTaskExecution',
+    allowedKinds: ['actionBundle', 'resourceRequest'],
+    prompt,
+    contextAssembly: context.contextAssembly,
+    userRequest: `request-${token}`,
+    currentTask: {
+      taskId: `task-${token}`,
+      title: `Task ${token}`,
+      goal: `Handle target ${token}`,
+      targets: [`target-${token}.txt`],
+    },
+    resourceEvidenceRefs: [resourcePacket.id],
+    nextActionInstruction: `next-${token}`,
+  });
+  const snapshot = buildProviderTurnSnapshot(contract);
+  assertEqual(snapshot.schemaVersion, 'deepcode.session.provider-turn-snapshot.v1', 'provider turn snapshot has schema version');
+  assertEqual(snapshot.segmentOrder.length > 0, true, 'provider turn snapshot records segment order');
+  assertEqual(snapshot.segments.every((segment) => segment.contentHash.length > 0), true, 'provider turn snapshot records segment hashes');
+  assertEqual(snapshot.segments.every((segment) => typeof segment.charLength === 'number'), true, 'provider turn snapshot records segment lengths');
+  assertEqual(Object.keys(snapshot.cacheClasses).length > 0, true, 'provider turn snapshot records cache classes');
+  assertEqual(snapshot.frames.at(-1)?.kind, 'NextActionInstruction', 'provider turn snapshot records final next action frame');
+  assertEqual(snapshot.resourceBlocks.length > 0, true, 'provider turn snapshot records resource block metadata');
+  assertEqual(snapshot.providerTurnContractHash.length > 0, true, 'provider turn snapshot records provider contract hash');
+}
+
+async function assertHookObserverProducesTraceOnly(): Promise<void> {
+  const token = randomSmokeToken('hook-observer');
+  const registry = new HookRegistry();
+  registry.register({
+    id: `hook-${token}`,
+    type: 'observer',
+    run: async (input) => ({
+      status: 'ok',
+      effects: [{
+        kind: 'appendTrace',
+        data: {
+          point: input.point,
+          contractId: input.contractId,
+        },
+      }],
+    }),
+  });
+  const runtime = new HookRuntime(registry, HookPolicy.observerOnly());
+  const blockedRuntime = new HookRuntime(registry);
+  const denied = await blockedRuntime.run({
+    point: 'contextAdmission.after',
+    sessionId: `session-${token}`,
+  });
+  assertEqual(denied.length, 0, 'hook policy denies observer hooks by default');
+  const results = await runtime.run({
+    point: 'providerCall.before',
+    sessionId: `session-${token}`,
+    runId: `run-${token}`,
+    contractId: `contract-${token}`,
+    allowedKinds: ['answer'],
+  });
+  assertEqual(results.length, 1, 'observer hook runs at providerCall.before');
+  assertEqual(results[0]?.status, 'ok', 'observer hook returns trace result');
+  assertEqual(results[0]?.status === 'ok' && results[0].effects?.[0]?.kind, 'appendTrace', 'observer hook effect is trace-only');
 }
 
 function assertActionBundleActionInspectorReadsActionShape(): void {
@@ -6771,7 +6911,10 @@ async function assertSessionDriverLoopRequirementChoiceEntersResumePrompt(): Pro
   assert(promptText.includes('Do not repeat the same decisionRequest'), 'resume prompt guards against repeating the same decision request');
   assert(!/[\u3400-\u9FFF]/.test(promptText), 'resume prompt does not inject CJK system instructions for an English user request');
   assert(promptText.includes('current user request language'), 'resume prompt constrains user-visible output language separately from English system instructions');
-  assert(promptText.includes('kind: ConfirmedDecision'), 'resume prompt contains a formal confirmed decision frame');
+  assert(
+    promptText.includes('kind: ConfirmedDecision') || promptText.includes('"kind": "ConfirmedDecision"'),
+    'resume prompt contains a formal confirmed decision frame'
+  );
   assert(promptText.includes('state=ConfirmedRequirementContinuation'), 'resume prompt narrows the next action after a confirmed requirement choice');
   assert(promptText.includes('Do not infer extra preserved/deleted/modified targets'), 'resume prompt prevents target guessing after a confirmed choice');
 }
@@ -7010,6 +7153,26 @@ function assertV3Parser(): void {
   assertEqual(answer.kind, 'answer', 'v3 answer parses');
   assertEqual(answer.runId, 'run-generic', 'v3 parser binds run id');
   assertEqual(answer.narration, 'This narration is ignored for final answer rendering.', 'v3 parser preserves optional narration');
+
+  const taskOutcome = parseProposalEnvelope({
+    runId: 'run-generic',
+    sessionId: 'session-generic',
+    raw: JSON.stringify({
+      schemaVersion: 'deepcode.agent.protocol.v3',
+      kind: 'taskOutcome',
+      outputLanguage: 'en-US',
+      taskOutcome: {
+        version: '1',
+        id: 'task-outcome-generic',
+        taskId: 'task-generic',
+        status: 'modelJudgedSufficient',
+        reason: 'The visible task state is already sufficient for the current accepted task.',
+        evidenceRefs: ['evidence-generic'],
+      },
+    }),
+  });
+  assertEqual(taskOutcome.kind, 'taskOutcome', 'v3 taskOutcome parses');
+  assertEqual((taskOutcome.payload as Record<string, any>).status, 'modelJudgedSufficient', 'taskOutcome preserves model judged sufficient status');
 
   const resourceRequest = parseProposalEnvelope({
     runId: 'run-generic',
@@ -7413,12 +7576,12 @@ function assertPromptEnvelope(): void {
   assert(prompt.dynamicSuffix.includes('targetPath/codeBlocks targetPath must be a concrete file path relative to the primary root'), 'prompt tells the model to avoid root-prefixed write paths');
   assert(prompt.dynamicSuffix.includes('rootId+path'), 'provider turn schema documents path-based resourceRequest without long JSON examples');
   assert(prompt.stablePrefix.includes('optional top-level narration'), 'prompt documents model-generated narration');
-  assert(prompt.dynamicSuffix.includes('reviewSummary is Session-generated'), 'provider turn schema excludes reviewSummary from provider proposal kinds');
+  assert(prompt.stablePrefix.includes('reviewSummary is Session-generated'), 'provider turn schema excludes reviewSummary from provider proposal kinds');
   assert(!prompt.stablePrefix.includes('Implementation payload budget'), 'stable prefix does not expose execution payload budgeting');
   assert(!prompt.stablePrefix.includes('implementationPlan top-level field'), 'prompt no longer documents implementationPlan as a provider kind');
   assert(!prompt.stablePrefix.includes('actionBundle.actions[] are executable Kernel tool actions shaped {actionId,toolId,args,description}'), 'stable prefix no longer exposes execution action shape');
   assert(!prompt.dynamicSuffix.includes('actionBundle.actions[] are executable Kernel tool actions shaped {actionId,toolId,args,description}'), 'planning provider turn does not expose execution action shape');
-  assert(prompt.dynamicSuffix.includes('Execution tool argument schema is withheld in this turn'), 'planning provider turn withholds execution tool schema');
+  assert(prompt.stablePrefix.includes('Execution tool argument schema is withheld in this turn'), 'planning provider turn withholds execution tool schema');
   assert(!prompt.stablePrefix.includes('dependsOn'), 'prompt no longer teaches provider action dependency fields');
   assert(!prompt.stablePrefix.includes('hard dependencies'), 'prompt no longer teaches hard dependency planning');
   assert(!prompt.stablePrefix.includes('prerequisite'), 'prompt no longer teaches prerequisite planning');
@@ -7430,7 +7593,7 @@ function assertPromptEnvelope(): void {
   assert(!prompt.stablePrefix.includes('Session derives routine defaults when they are omitted'), 'stable prefix no longer teaches execution defaults');
   assert(!prompt.stablePrefix.includes('expectedValidation'), 'prompt no longer teaches expectedValidation to providers');
   assert(!prompt.stablePrefix.includes('reviewGuide'), 'prompt no longer teaches reviewGuide to providers');
-  assert(prompt.dynamicSuffix.includes('tasks[] is a Session-advanced ordered implementation queue'), 'provider turn schema treats taskPlan as an ordered queue');
+  assert(prompt.stablePrefix.includes('tasks[] is a Session-advanced ordered implementation queue'), 'provider turn schema treats taskPlan as an ordered queue');
   assert(!prompt.stablePrefix.includes('Session can schedule parallel graph nodes'), 'prompt no longer requires provider-facing graph scheduling');
   assert(!prompt.stablePrefix.includes('payload object matching that kind'), 'prompt avoids payload wrapper wording');
   assert(!prompt.stablePrefix.includes('actionBundle payload:'), 'prompt avoids ambiguous actionBundle payload wording');
@@ -7449,28 +7612,43 @@ function assertPromptEnvelope(): void {
   assert(!prompt.stablePrefix.includes('zh-CN'), 'stable prefix excludes localized JSON example payloads');
   assert(prompt.dynamicSuffix.includes('Current workflow state: needProposal'), 'dynamic suffix carries current workflow state');
   assert(prompt.dynamicSuffix.includes('Allowed proposals: answer, resourceRequest, actionBundle'), 'dynamic suffix carries allowed proposals');
-  assert(prompt.dynamicSuffix.includes('<ProviderTurnContract schemaVersion="deepcode.session.provider-turn-contract.v1">'), 'dynamic suffix carries provider turn contract');
-  assert(prompt.dynamicSuffix.includes('turnMode: planning'), 'provider turn contract marks planning mode');
-  assert(prompt.dynamicLayerNames.includes('promptPacketFrame'), 'prompt packet is an explicit provider-visible frame partition');
-  assert(prompt.dynamicSuffix.includes('<PromptPacket schemaVersion="deepcode.session.prompt-packet.v1">'), 'prompt packet frame renders into dynamic suffix');
-  assert(prompt.dynamicSuffix.includes('kind: UserRequest'), 'prompt packet labels user request frame');
-  assert(prompt.dynamicSuffix.includes('trust: userIntent'), 'prompt packet marks user request as user intent');
-  assert(prompt.dynamicSuffix.includes('kind: ResourceEvidence'), 'prompt packet includes kernel-observed resource evidence frame');
-  assert(prompt.dynamicSuffix.includes('trust: kernelObservedFact'), 'prompt packet marks resource evidence as observed facts');
-  assert(prompt.dynamicSuffix.includes('kind: AccessSummary'), 'prompt packet includes access summary from resource evidence');
-  assert(prompt.dynamicSuffix.includes('trust: derivedObservedFact'), 'prompt packet marks access summary as derived from observed resources');
-  assert(prompt.dynamicSuffix.includes('kind: Memory'), 'prompt packet labels compacted memory frame');
-  assert(prompt.dynamicSuffix.includes('trust: compressedReference'), 'prompt packet marks memory as reference rather than fact');
-  assert(prompt.dynamicSuffix.includes('kind: NextActionInstruction'), 'prompt packet includes final next-action instruction');
-  const memoryFrameIndex = prompt.dynamicSuffix.indexOf('kind: Memory');
-  const userFrameIndex = prompt.dynamicSuffix.indexOf('kind: UserRequest');
-  const resourceEvidenceIndex = prompt.dynamicSuffix.indexOf('kind: ResourceEvidence');
-  const accessSummaryIndex = prompt.dynamicSuffix.indexOf('kind: AccessSummary');
-  const nextActionIndex = prompt.dynamicSuffix.indexOf('kind: NextActionInstruction');
-  assert(memoryFrameIndex > -1 && userFrameIndex > memoryFrameIndex, 'prompt packet renders Memory before the current UserRequest');
-  assert(resourceEvidenceIndex > userFrameIndex, 'prompt packet renders ResourceEvidence after task/user context');
-  assert(accessSummaryIndex > resourceEvidenceIndex, 'prompt packet renders AccessSummary after ResourceEvidence');
-  assert(nextActionIndex > accessSummaryIndex, 'prompt packet renders NextActionInstruction at the end');
+  assert(!prompt.dynamicSuffix.includes('<ProviderTurnContract schemaVersion="deepcode.session.provider-turn-contract.v1">'), 'dynamic suffix does not duplicate provider turn contract');
+  assert(!prompt.dynamicLayerNames.includes('promptPacketFrame'), 'provider turn contract is rendered once by ProviderPipeline');
+  const renderedContract = renderProviderTurnContractLayer({
+    workflowState: 'needProposal',
+    allowedProposals: ['answer', 'resourceRequest', 'actionBundle'],
+    capabilityCatalogSummary: 'fs.read\nfs.write',
+    memoryHints: ['Recent user turn: generic request attachments=file:generic/file.txt'],
+    userRequest: 'Analyze the attached resource.',
+    initialContext,
+    conversationRoots,
+    resourcePromptContext,
+  });
+  assert(renderedContract.includes('<PromptPacket schemaVersion="deepcode.session.prompt-packet.v1">'), 'provider turn contract renders prompt packet frames');
+  assert(renderedContract.includes('kind: DynamicDialogue'), 'prompt packet labels dynamic dialogue frame');
+  assert(renderedContract.includes('trust: userIntent'), 'prompt packet marks dynamic dialogue as user intent');
+  assert(renderedContract.includes('kind: ResourceEvidence'), 'prompt packet includes kernel-observed resource evidence frame');
+  assert(renderedContract.includes('trust: kernelObservedFact'), 'prompt packet marks resource evidence as observed facts');
+  assert(renderedContract.includes('kind: AccessIndex'), 'prompt packet includes access index from resource evidence');
+  assert(renderedContract.includes('trust: derivedObservedFact'), 'prompt packet marks access index as derived from observed resources');
+  assert(renderedContract.includes('kind: HookContext'), 'prompt packet includes hook context frame');
+  assert(renderedContract.includes('kind: ProviderStepSummary'), 'prompt packet includes provider step summary frame');
+  assert(renderedContract.includes('kind: MemoryPlaceholder'), 'prompt packet labels compacted memory frame');
+  assert(renderedContract.includes('trust: compressedReference'), 'prompt packet marks memory as reference rather than fact');
+  assert(renderedContract.includes('kind: NextActionInstruction'), 'prompt packet includes final next-action instruction');
+  const memoryFrameIndex = renderedContract.indexOf('kind: MemoryPlaceholder');
+  const dynamicDialogueIndex = renderedContract.indexOf('kind: DynamicDialogue');
+  const resourceEvidenceIndex = renderedContract.indexOf('kind: ResourceEvidence');
+  const accessIndex = renderedContract.indexOf('kind: AccessIndex');
+  const hookContextIndex = renderedContract.indexOf('kind: HookContext');
+  const providerStepSummaryIndex = renderedContract.indexOf('kind: ProviderStepSummary');
+  const nextActionIndex = renderedContract.indexOf('kind: NextActionInstruction');
+  assert(memoryFrameIndex > -1 && dynamicDialogueIndex > memoryFrameIndex, 'prompt packet renders MemoryPlaceholder before DynamicDialogue');
+  assert(resourceEvidenceIndex > dynamicDialogueIndex, 'prompt packet renders ResourceEvidence after task/dialogue context');
+  assert(accessIndex > resourceEvidenceIndex, 'prompt packet renders AccessIndex after ResourceEvidence');
+  assert(hookContextIndex > accessIndex, 'prompt packet renders HookContext after AccessIndex');
+  assert(providerStepSummaryIndex > hookContextIndex, 'prompt packet renders ProviderStepSummary after HookContext');
+  assert(nextActionIndex > providerStepSummaryIndex, 'prompt packet renders NextActionInstruction at the end');
   assert(!prompt.dynamicSuffix.includes('Kernel tool catalog visible to provider as schema only'), 'planning turn does not expose execution tool catalog');
   assert(prompt.stableLayerNames.includes('projectMemory'), 'project memory index digest is an explicit stable context partition');
   assert(prompt.dynamicLayerNames.includes('projectMemoryRecall'), 'project memory recall is an explicit dynamic context partition');
@@ -7599,6 +7777,13 @@ function assertRunStateMachineTaskLedger(): void {
   const afterBatch = coordinator.afterBatch(acceptedPlan, progress.completedTaskIds);
   assertEqual(afterBatch.completedTaskIds.includes(taskIds[2]), true, 'task ledger coordinator advances accepted plan completed ids');
   assertEqual(coordinator.complete(afterBatch), false, 'task ledger coordinator keeps incomplete accepted plan open');
+
+  const afterOutcome = coordinator.afterTaskOutcome(afterBatch, taskIds[3]);
+  const outcomeLedger = coordinator.ledger(afterOutcome);
+  assertEqual(afterOutcome.modelJudgedSufficientTaskIds?.includes(taskIds[3]), true, 'taskOutcome records model-judged sufficient task ids');
+  assertEqual(outcomeLedger?.entries.find((entry) => entry.taskId === taskIds[3])?.status, 'modelJudgedSufficient', 'task ledger exposes model judged sufficient task status');
+  assertEqual(outcomeLedger?.currentTaskId, taskIds[4], 'task ledger advances to the next task after taskOutcome');
+
   const checkpoint = {
     id: `checkpoint-${suffix}`,
     sessionId: `session-${suffix}`,
@@ -8071,6 +8256,9 @@ function assertContextAssemblerCachePlan(): void {
     true,
     'context assembly records stable protocol segments'
   );
+  const toolCatalogSegment = base.contextAssembly.segments.find((segment) => segment.name === 'toolCatalogSummary');
+  assertEqual(toolCatalogSegment?.cacheClass, 'workspaceStable', 'tool catalog digest stays outside the turn-dynamic suffix');
+  assertEqual(toolCatalogSegment?.stablePrefix, true, 'tool catalog digest is part of the stable prefix');
   assertEqual(
     base.contextAssembly.segments.some((segment) => segment.cacheClass === 'reusableResource' && segment.name === 'reusableResourceContext'),
     true,
@@ -9143,6 +9331,125 @@ function assertNarrativeTimelineProjection(): void {
     projection.rawEventRefs?.includes('event:event-tool'),
     true,
     'raw event refs are preserved for debug views'
+  );
+}
+
+function assertNarrativeTimelineProjectionResolvesAcceptedPlanInteractions(): void {
+  const events: AgentEvent[] = [
+    {
+      id: 'event-plan-user',
+      sessionId: 'session-plan-resolution',
+      ts: '2026-01-01T00:00:00.000Z',
+      kind: 'user_msg',
+      payload: { content: 'Create a generic workspace artifact.' },
+    },
+    {
+      id: 'event-plan-card',
+      sessionId: 'session-plan-resolution',
+      ts: '2026-01-01T00:00:01.000Z',
+      kind: 'plan_card',
+      payload: {
+        runId: 'run-plan-resolution',
+        planId: 'plan-resolution',
+        title: 'Generic structured plan',
+        summary: 'Create a generic artifact.',
+        status: 'pending',
+        confirmable: true,
+        implementationPlan: {
+          summary: 'Create a generic artifact.',
+          tasks: [{
+            taskId: 'task-write-generic-artifact',
+            title: 'Write generic artifact',
+            target: 'src/generic-artifact.txt',
+            acceptanceCriteria: ['The artifact exists.'],
+          }],
+        },
+      },
+    },
+    {
+      id: 'event-plan-accepted',
+      sessionId: 'session-plan-resolution',
+      ts: '2026-01-01T00:00:02.000Z',
+      kind: 'plan_review',
+      payload: {
+        runId: 'run-plan-resolution',
+        planId: 'plan-resolution',
+        status: 'accepted',
+        confirmable: false,
+        summary: 'The user accepted the plan; execution can continue.',
+      },
+    },
+    {
+      id: 'event-work-completed',
+      sessionId: 'session-plan-resolution',
+      ts: '2026-01-01T00:00:03.000Z',
+      kind: 'workflow_stage',
+      payload: {
+        runId: 'run-plan-resolution',
+        stage: 'work_unit.completed',
+        status: 'completed',
+        path: 'src/generic-artifact.txt',
+        kernelEvent: {
+          kind: 'work_unit.completed',
+          output: { path: 'src/generic-artifact.txt' },
+          workUnit: { id: 'work-unit-generic-artifact' },
+        },
+      },
+    },
+    {
+      id: 'event-review-waiting',
+      sessionId: 'session-plan-resolution',
+      ts: '2026-01-01T00:00:04.000Z',
+      kind: 'review_summary',
+      payload: {
+        runId: 'run-plan-resolution',
+        reviewId: 'review-plan-resolution',
+        sourcePlanId: 'plan-resolution',
+        status: 'waitingUserReview',
+        confirmable: true,
+        title: 'Review',
+        summary: 'Review the generic artifact.',
+      },
+    },
+    {
+      id: 'event-review-accepted',
+      sessionId: 'session-plan-resolution',
+      ts: '2026-01-01T00:00:05.000Z',
+      kind: 'review_summary',
+      payload: {
+        runId: 'run-plan-resolution',
+        reviewId: 'review-plan-resolution',
+        sourcePlanId: 'plan-resolution',
+        status: 'accepted',
+        confirmable: false,
+        title: 'Review accepted',
+        summary: 'Review accepted.',
+      },
+    },
+    {
+      id: 'event-run-completed',
+      sessionId: 'session-plan-resolution',
+      ts: '2026-01-01T00:00:06.000Z',
+      kind: 'session_run_state',
+      payload: {
+        runId: 'run-plan-resolution',
+        status: 'completed',
+        decisionKind: 'review',
+      },
+    },
+  ];
+  const projection = buildNarrativeTimelineProjection({
+    sessionId: 'session-plan-resolution',
+    events,
+    generatedAt: '2026-01-01T00:00:07.000Z',
+  });
+  const blocks = projection.turns.flatMap((turn) => turn.blocks);
+  const planBlock = blocks.find((block) => block.events.some((event) => event.id === 'event-plan-card'));
+  assertEqual(planBlock?.status, 'completed', 'accepted plan card no longer remains waiting after raw plan_review acceptance');
+  assertEqual(
+    projection.taskProjection?.items.find((item) => item.title === 'Write generic artifact')?.status,
+    'completed',
+    'task projection uses completed work-unit facts after plan acceptance'
   );
 }
 

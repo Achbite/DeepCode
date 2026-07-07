@@ -57,7 +57,7 @@ export class AcceptedPlanScopeRepairCoordinator<
       return this.input.parseRepairedProposal({
         raw,
         state: runInput.state,
-        allowedKinds: ['actionBundle', 'resourceRequest', 'decisionRequest', 'diagnostic'],
+        allowedKinds: ['actionBundle', 'resourceRequest', 'decisionRequest', 'taskOutcome', 'diagnostic'],
       });
     } catch (error) {
       throw this.input.createError(

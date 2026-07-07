@@ -1,8 +1,3 @@
 export type HookPoint =
-  | 'beforeUserTurn'
-  | 'beforeProviderCall'
-  | 'afterProviderCall'
-  | 'beforeKernelCommand'
-  | 'afterKernelCommand'
-  | 'beforeProjectionAppend'
-  | 'afterProjectionAppend';
+  | 'contextAdmission.after'
+  | 'providerCall.before';

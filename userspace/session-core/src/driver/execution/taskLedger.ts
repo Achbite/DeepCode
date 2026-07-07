@@ -144,6 +144,13 @@ export class AcceptedPlanTaskLedgerCoordinator {
     return this.withCompleted(acceptedPlan, completedTaskIds) ?? acceptedPlan;
   }
 
+  afterTaskOutcome(
+    acceptedPlan: AcceptedImplementationPlanContext,
+    taskId: string
+  ): AcceptedImplementationPlanContext {
+    return new AcceptedTaskRegistry(acceptedPlan).withModelJudgedSufficient(taskId) ?? acceptedPlan;
+  }
+
   withLatestCheckpoint(
     acceptedPlan: AcceptedImplementationPlanContext,
     events: AgentEvent[]
@@ -155,16 +162,19 @@ export class AcceptedPlanTaskLedgerCoordinator {
       if (stringValue(payload.stage) !== 'accepted_plan.batch_checkpoint') continue;
       if (stringValue(payload.runId) !== acceptedPlan.runId || stringValue(payload.planId) !== acceptedPlan.planId) continue;
       const completedTaskIds = stringArrayValue(payload.completedTaskIds);
-      if (!completedTaskIds.length) return acceptedPlan;
-      return this.afterBatch(acceptedPlan, completedTaskIds);
+      const modelJudgedSufficientTaskIds = stringArrayValue(payload.modelJudgedSufficientTaskIds);
+      let nextAccepted = acceptedPlan;
+      if (completedTaskIds.length) nextAccepted = this.afterBatch(nextAccepted, completedTaskIds);
+      for (const taskId of modelJudgedSufficientTaskIds) {
+        nextAccepted = this.afterTaskOutcome(nextAccepted, taskId);
+      }
+      return nextAccepted;
     }
     return acceptedPlan;
   }
 
   complete(acceptedPlan: AcceptedImplementationPlanContext): boolean {
-    if (!acceptedPlan.tasks.length) return true;
-    const completed = new Set(acceptedPlan.completedTaskIds);
-    return acceptedPlan.tasks.every((task) => completed.has(task.taskId));
+    return new AcceptedTaskRegistry(acceptedPlan).complete();
   }
 
   lastSavepointId(events: AgentEvent[]): string | undefined {

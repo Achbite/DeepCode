@@ -115,7 +115,7 @@ export class AcceptedPlanResourceResumeCoordinator<
         return this.input.parseRepairedProviderProposal({
           raw: repairedRaw,
           state: runInput.state,
-          allowedKinds: ['actionBundle', 'resourceRequest', 'decisionRequest', 'diagnostic'],
+          allowedKinds: ['actionBundle', 'resourceRequest', 'decisionRequest', 'taskOutcome', 'diagnostic'],
         });
       } catch (repairError) {
         throw this.input.createError(
@@ -149,7 +149,7 @@ export class AcceptedPlanResourceResumeCoordinator<
       sessionId: runInput.state.sessionId,
       runId: runInput.state.runId,
       turnMode: 'resourceResume',
-      allowedKinds: ['actionBundle', 'resourceRequest', 'decisionRequest', 'diagnostic'],
+      allowedKinds: ['actionBundle', 'resourceRequest', 'decisionRequest', 'taskOutcome', 'diagnostic'],
       prompt: runInput.prompt,
       contextAssembly: runInput.state.contextAssembly,
       userRequest: runInput.userRequest,
@@ -157,7 +157,7 @@ export class AcceptedPlanResourceResumeCoordinator<
       currentTaskContext: runInput.state.currentTaskContext,
       resourcePackets: runInput.state.resourcePackets,
       generatedArtifactCount: runInput.state.generatedArtifactEvidence.size,
-      nextActionInstruction: 'Use the newly resolved ResourcePacket for the current accepted task. Return one actionBundle, resourceRequest, decisionRequest, or diagnostic proposal.',
+      nextActionInstruction: 'Use the newly resolved ResourcePacket for the current accepted task. Return one actionBundle, resourceRequest, decisionRequest, taskOutcome, or diagnostic proposal.',
     });
   }
 }

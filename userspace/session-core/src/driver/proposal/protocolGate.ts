@@ -67,6 +67,7 @@ export class ProtocolGate {
       'decisionRequest',
       'taskPlan',
       'actionBundle',
+      'taskOutcome',
       'diagnostic',
     ].includes(kind));
     if (!allowedKinds.length) return null;
@@ -94,10 +95,10 @@ export class ProtocolGate {
 
   repairAllowedKinds(input: ProtocolGateAllowedKindsInput): string[] {
     if (input.errorCode === 'action_bundle_budget_exceeded') {
-      return ['actionBundle', 'resourceRequest', 'decisionRequest', 'diagnostic'];
+      return ['actionBundle', 'resourceRequest', 'decisionRequest', 'taskOutcome', 'diagnostic'];
     }
     return input.acceptedPlanActive
-      ? ['actionBundle', 'resourceRequest', 'decisionRequest', 'diagnostic']
+      ? ['actionBundle', 'resourceRequest', 'decisionRequest', 'taskOutcome', 'diagnostic']
       : ['answer', 'resourceRequest', 'decisionRequest', 'taskPlan', 'diagnostic'];
   }
 }
@@ -119,6 +120,7 @@ function bareRepairShapeMatches(kind: string, record: Record<string, unknown>): 
   if (kind === 'answer') return typeof repairString(record.content) === 'string' || typeof repairString(record.markdown) === 'string';
   if (kind === 'diagnostic') return typeof repairString(record.summary) === 'string' && typeof repairString(record.severity) === 'string';
   if (kind === 'actionBundle') return Array.isArray(record.actions) || record.actionBundle !== undefined;
+  if (kind === 'taskOutcome') return typeof repairString(record.reason) === 'string' || typeof repairString(record.summary) === 'string';
   return false;
 }
 
@@ -129,6 +131,7 @@ function kindPayloadField(kind: string): string | undefined {
   if (kind === 'taskPlan') return 'taskPlan';
   if (kind === 'diagnostic') return 'diagnostic';
   if (kind === 'actionBundle') return 'actionBundle';
+  if (kind === 'taskOutcome') return 'taskOutcome';
   return undefined;
 }
 

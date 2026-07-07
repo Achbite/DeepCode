@@ -8,16 +8,20 @@ import type {
   ProjectionDelta,
 } from '@deepcode/protocol';
 import type { ContextAssemblyRecord, PromptCachePlan } from '../../context/index.js';
+import type { DriverProviderTurnFrame } from '../runFrame.js';
 import type { ProviderTraceRecorderPorts } from './providerTraceRecorder.js';
 import type { ProviderJsonModeCoordinator } from './providerJsonModeCoordinator.js';
 import type { ProviderStreamCoordinator, ProviderStreamVisibleLanguage } from './providerStreamCoordinator.js';
 import type { ProviderStreamRuntime, ProviderStreamRuntimeState } from './providerStreamRuntime.js';
 import type { ProviderTraceRecorder } from './providerTraceRecorder.js';
+import type { HookInput, HookResult } from '../hooks/index.js';
+import { buildProviderTurnSnapshot } from '../context/providerTurnSnapshot.js';
 import { ProviderToolCallBuffer, stripProviderPartFrames, type NativeToolCallProposal } from '../../provider/providerStreamParts.js';
 
 export interface ProviderTurnRunnerState extends ProviderStreamRuntimeState {
   cachePlan?: PromptCachePlan;
   contextAssembly?: ContextAssemblyRecord;
+  providerTurnFrame?: DriverProviderTurnFrame;
 }
 
 export interface ProviderTurnResult {
@@ -67,6 +71,7 @@ export interface ProviderTurnRunnerDependencies<TState extends ProviderTurnRunne
   createToolCallBuffer(): ProviderToolCallBuffer;
   collectToolCalls(result: LlmChatResult, buffer: ProviderToolCallBuffer): NativeToolCallProposal[];
   nativeToolError(error: unknown): { code: string; message: string } | undefined;
+  runHook?(input: HookInput): Promise<HookResult[]>;
   createError(code: string, message: string): Error;
   now(): string;
   createId(prefix: string): string;
@@ -86,11 +91,17 @@ export class ProviderTurnRunner<TState extends ProviderTurnRunnerState> {
     const options = input.options ?? {};
     const { state, stage, ports } = input;
     const jsonModeMessages = this.dependencies.jsonModeCoordinator.ensureMessages(input.messages, options.responseFormat);
+    const providerCallHookTrace = await this.runProviderCallHook(state);
     await this.dependencies.traceRecorder.append(state, `${stage}.request`, {
       profileId: input.profileId,
       messages: jsonModeMessages,
       cachePlan: state.cachePlan,
       contextAssembly: state.contextAssembly,
+      providerTurnSnapshot: state.providerTurnFrame?.snapshot,
+      hookTrace: [
+        ...(state.providerTurnFrame?.hookTrace ?? []),
+        ...providerCallHookTrace,
+      ],
       responseFormat: options.responseFormat,
       responseFormatAudit: this.dependencies.jsonModeCoordinator.audit(input.messages, options.responseFormat),
     }, ports);
@@ -217,6 +228,32 @@ export class ProviderTurnRunner<TState extends ProviderTurnRunnerState> {
       reasoning,
       toolCalls,
     };
+  }
+
+  private async runProviderCallHook(state: TState): Promise<HookResult[]> {
+    const frame = state.providerTurnFrame;
+    if (!frame) return [];
+    const snapshot = frame.snapshot ?? buildProviderTurnSnapshot(frame);
+    const results = await this.dependencies.runHook?.({
+      point: 'providerCall.before',
+      sessionId: frame.sessionId,
+      runId: frame.runId,
+      contractId: frame.contractId,
+      turnMode: frame.turnMode,
+      allowedKinds: frame.allowedKinds,
+      snapshot,
+    }) ?? [];
+    if (!frame.snapshot || results.length) {
+      state.providerTurnFrame = {
+        ...frame,
+        snapshot,
+        hookTrace: [
+          ...(frame.hookTrace ?? []),
+          ...results,
+        ],
+      };
+    }
+    return results;
   }
 }
 

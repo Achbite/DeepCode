@@ -77,17 +77,17 @@ export class ContextFrameBuilder {
         summary: `Allowed kinds: ${input.allowedKinds.join(', ')}`,
       },
       {
-        kind: 'Memory',
+        kind: 'MemoryPlaceholder',
         source: 'memory',
         trust: 'compressedReference',
         use: 'Reference only; not an execution fact, permission grant, or patch evidence.',
         summary: this.memorySummary(input.contextAssembly),
       },
       {
-        kind: 'UserRequest',
+        kind: 'DynamicDialogue',
         source: 'user',
         trust: 'userConfirmedFact',
-        use: 'Current reliable user intent for this turn.',
+        use: 'Current dynamic user turn and dialogue-local instructions.',
         summary: input.userRequest,
       },
     ];
@@ -122,15 +122,29 @@ export class ContextFrameBuilder {
       summary: this.resourceEvidenceSummary(input.contextAssembly),
     });
 
-    if (input.accessSummary) {
-      frames.push({
-        kind: 'AccessSummary',
-        source: 'derived',
-        trust: 'derivedObservedFact',
-        use: 'Helps avoid repeated low-value reads; not a permission grant or exact patch evidence.',
-        summary: input.accessSummary,
-      });
-    }
+    frames.push({
+      kind: 'AccessIndex',
+      source: 'derived',
+      trust: 'derivedObservedFact',
+      use: 'Index of already accessed resources; not a permission grant or exact patch evidence.',
+      summary: input.accessSummary ?? this.accessIndexSummary(input.contextAssembly),
+    });
+
+    frames.push({
+      kind: 'HookContext',
+      source: 'session',
+      trust: 'sessionInstruction',
+      use: 'Observer hook state for this provider turn. Hooks cannot change prompt, tools, Kernel facts, or projection facts.',
+      summary: 'Hook observer mode is enabled for developer trace only.',
+    });
+
+    frames.push({
+      kind: 'ProviderStepSummary',
+      source: 'session',
+      trust: 'sessionInstruction',
+      use: 'Summarizes this provider step without adding execution facts.',
+      summary: this.providerStepSummary(input),
+    });
 
     if (input.errorSummary) {
       frames.push({
@@ -212,6 +226,26 @@ export class ContextFrameBuilder {
     ].join('; ');
   }
 
+  private accessIndexSummary(contextAssembly: ContextAssemblyRecord | undefined): string {
+    if (!contextAssembly) return 'No access index is available for this turn.';
+    return [
+      `resourceBlocks=${contextAssembly.resourceBlocks.length}`,
+      `full=${contextAssembly.resourceRetentionCounts.full ?? 0}`,
+      `summary=${contextAssembly.resourceRetentionCounts.summary ?? 0}`,
+      `handleOnly=${contextAssembly.resourceRetentionCounts.handleOnly ?? 0}`,
+    ].join('; ');
+  }
+
+  private providerStepSummary(input: BuildProviderTurnContractInput): string {
+    return [
+      `turnMode=${input.turnMode}`,
+      `allowedKinds=${input.allowedKinds.join(', ') || 'none'}`,
+      `requiredKind=${input.requiredKind ?? 'none'}`,
+      `resourceRefs=${input.resourceEvidenceRefs?.length ?? 0}`,
+      `toolIntents=${input.toolIntentTemplates?.length ?? 0}`,
+    ].join('; ');
+  }
+
   private turnMode(
     acceptedPlanActive: boolean | undefined,
     currentTaskContext: CurrentTaskContext | undefined,
@@ -253,9 +287,10 @@ export class ContextFrameBuilder {
       return [
         'Use the current task cursor only.',
         `Allowed proposal kinds: ${allowedKinds.join(', ')}.`,
-        'If evidence is sufficient, return an actionBundle for the current task.',
+        'If file changes are needed and evidence is sufficient, return an actionBundle for the current task.',
         'If evidence is missing, return a focused resourceRequest.',
         'If the current task needs targets or operations outside the accepted scope, return a decisionRequest.',
+        'If the current task is already sufficiently satisfied and no Kernel action is needed, return taskOutcome with status="modelJudgedSufficient".',
       ].join(' ');
     }
     return [

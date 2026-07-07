@@ -184,6 +184,7 @@ export class SessionProgressProjectionBuilder {
       runId,
       tasks: this.taskRecords(accepted),
       completedTaskIds,
+      modelJudgedSufficientTaskIds: accepted.modelJudgedSufficientTaskIds ?? [],
       skippedTaskIds: effectKind === 'skipCurrentTask' ? newlyCompletedTaskIds : [],
       acceptedIncompleteTaskIds: effectKind === 'markAcceptedIncomplete' ? newlyCompletedTaskIds : [],
     });
@@ -245,6 +246,7 @@ export class SessionProgressProjectionBuilder {
       runId,
       tasks: this.taskRecords(accepted),
       completedTaskIds: progress.completedTaskIds,
+      modelJudgedSufficientTaskIds: progress.modelJudgedSufficientTaskIds ?? accepted.modelJudgedSufficientTaskIds ?? [],
       failedTaskId: failedOrBlocked
         ? accepted.tasks.find((task) => !progress.completedTaskIds.includes(task.taskId))?.taskId
         : undefined,
@@ -272,6 +274,8 @@ export class SessionProgressProjectionBuilder {
         workUnitIds: progress.workUnitIds,
         newlyCompletedTaskIds: progress.newlyCompletedTaskIds,
         completedTaskIds: progress.completedTaskIds,
+        newlyModelJudgedSufficientTaskIds: progress.newlyModelJudgedSufficientTaskIds ?? [],
+        modelJudgedSufficientTaskIds: progress.modelJudgedSufficientTaskIds ?? accepted.modelJudgedSufficientTaskIds ?? [],
         remainingTaskIds: progress.remainingTaskIds,
         taskLedger: ledger,
         taskOrder: ledger.taskOrder,
@@ -311,6 +315,7 @@ export class SessionProgressProjectionBuilder {
       runId,
       tasks: this.taskRecords(accepted),
       completedTaskIds: completion.completedTaskIds,
+      modelJudgedSufficientTaskIds: accepted.modelJudgedSufficientTaskIds ?? [],
     });
     const summary = complete
       ? 'Read-only evidence satisfied the remaining accepted task; ready for final review.'
@@ -530,6 +535,8 @@ export class SessionProgressProjectionBuilder {
         taskId: context?.taskId,
         completedTaskIds: progress.completedTaskIds,
         newlyCompletedTaskIds: progress.newlyCompletedTaskIds,
+        modelJudgedSufficientTaskIds: progress.modelJudgedSufficientTaskIds ?? nextAccepted.modelJudgedSufficientTaskIds ?? [],
+        newlyModelJudgedSufficientTaskIds: progress.newlyModelJudgedSufficientTaskIds ?? [],
         remainingTaskIds: progress.remainingTaskIds,
         taskLedger: ledger,
         taskOrder: ledger?.taskOrder ?? [],

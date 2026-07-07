@@ -60,7 +60,7 @@ export class ProviderRepairMessageBuilder {
     const acceptedExecution = Boolean(state.acceptedContext && Object.keys(state.acceptedContext).length > 0) || Boolean(state.currentTaskContext);
     const actionBundleRepair = acceptedExecution || this.isActionBundleRepairError(parseError.code);
     const allowedKinds = actionBundleRepair
-      ? ['actionBundle', 'resourceRequest', 'decisionRequest', 'diagnostic']
+      ? ['actionBundle', 'resourceRequest', 'decisionRequest', 'taskOutcome', 'diagnostic']
       : ['answer', 'resourceRequest', 'decisionRequest', 'taskPlan', 'diagnostic'];
     const repairSystemLines = [
       'You are the DeepCode Agent Protocol v3 repair step.',
@@ -144,7 +144,7 @@ export class ProviderRepairMessageBuilder {
         content: [
           this.renderRepairProviderTurnContract(state, {
             turnMode: 'acceptedTaskExecution',
-            allowedKinds: ['actionBundle', 'resourceRequest', 'decisionRequest', 'diagnostic'],
+            allowedKinds: ['actionBundle', 'resourceRequest', 'decisionRequest', 'taskOutcome', 'diagnostic'],
             requiredKind: 'actionBundle',
             repairPolicy: 'sameKindOnly',
             errorLines: [reason],
@@ -181,7 +181,7 @@ export class ProviderRepairMessageBuilder {
         content: [
           this.renderRepairProviderTurnContract(state, {
             turnMode: 'acceptedTaskExecution',
-            allowedKinds: ['actionBundle', 'resourceRequest', 'decisionRequest', 'diagnostic'],
+            allowedKinds: ['actionBundle', 'resourceRequest', 'decisionRequest', 'taskOutcome', 'diagnostic'],
             repairPolicy: 'sameKindOnly',
             errorLines: [`Provider-native tool call was blocked in Complete stage: ${toolCall.name}`],
           }),
@@ -233,7 +233,7 @@ export class ProviderRepairMessageBuilder {
           this.renderRepairProviderTurnContract(state, {
             turnMode: afterAcceptedPlan ? 'acceptedTaskExecution' : 'protocolRepair',
             allowedKinds: afterAcceptedPlan
-              ? ['actionBundle', 'resourceRequest', 'decisionRequest', 'diagnostic']
+              ? ['actionBundle', 'resourceRequest', 'decisionRequest', 'taskOutcome', 'diagnostic']
               : ['decisionRequest', 'taskPlan', 'resourceRequest', 'diagnostic'],
             repairPolicy: 'sameKindOnly',
             errorLines: [`Provider-native side-effect tool call was blocked: ${toolCall.name}`],
@@ -280,7 +280,7 @@ export class ProviderRepairMessageBuilder {
           this.renderRepairProviderTurnContract(state, {
             turnMode: afterAcceptedPlan ? 'resourceResume' : 'protocolRepair',
             allowedKinds: afterAcceptedPlan
-              ? ['actionBundle', 'resourceRequest', 'decisionRequest', 'answer', 'diagnostic']
+              ? ['actionBundle', 'resourceRequest', 'decisionRequest', 'taskOutcome', 'answer', 'diagnostic']
               : ['answer', 'resourceRequest', 'decisionRequest', 'diagnostic'],
             repairPolicy: 'sameKindOnly',
             errorLines: ['Duplicate provider-native read request after Kernel ResourcePacket facts were already returned.'],
@@ -328,7 +328,7 @@ export class ProviderRepairMessageBuilder {
           this.renderRepairProviderTurnContract(state, {
             turnMode: state.acceptedContext && Object.keys(state.acceptedContext).length > 0 ? 'resourceResume' : 'protocolRepair',
             allowedKinds: state.acceptedContext && Object.keys(state.acceptedContext).length > 0
-              ? ['actionBundle', 'resourceRequest', 'decisionRequest', 'answer', 'diagnostic']
+              ? ['actionBundle', 'resourceRequest', 'decisionRequest', 'taskOutcome', 'answer', 'diagnostic']
               : ['answer', 'resourceRequest', 'decisionRequest', 'diagnostic'],
             repairPolicy: 'sameKindOnly',
             errorLines: [resolutionDiagnostic],
@@ -370,7 +370,7 @@ export class ProviderRepairMessageBuilder {
           this.renderRepairProviderTurnContract(state, {
             turnMode: acceptedExecution ? 'acceptedTaskExecution' : 'protocolRepair',
             allowedKinds: acceptedExecution
-              ? ['actionBundle', 'resourceRequest', 'decisionRequest', 'diagnostic']
+              ? ['actionBundle', 'resourceRequest', 'decisionRequest', 'taskOutcome', 'diagnostic']
               : ['actionBundle', 'resourceRequest', 'decisionRequest', 'taskPlan', 'diagnostic'],
             requiredKind: 'actionBundle',
             repairPolicy: 'sameKindOnly',
@@ -421,7 +421,7 @@ export class ProviderRepairMessageBuilder {
           this.renderRepairProviderTurnContract(state, {
             turnMode: acceptedExecution ? 'acceptedTaskExecution' : 'protocolRepair',
             allowedKinds: acceptedExecution
-              ? ['actionBundle', 'resourceRequest', 'decisionRequest', 'diagnostic']
+              ? ['actionBundle', 'resourceRequest', 'decisionRequest', 'taskOutcome', 'diagnostic']
               : ['actionBundle', 'resourceRequest', 'decisionRequest', 'taskPlan', 'diagnostic'],
             repairPolicy: 'sameKindOnly',
             errorLines: reasons,
@@ -477,7 +477,7 @@ export class ProviderRepairMessageBuilder {
         content: [
           this.renderRepairProviderTurnContract(state, {
             turnMode: 'scopeIntervention',
-            allowedKinds: ['actionBundle', 'resourceRequest', 'decisionRequest', 'diagnostic'],
+            allowedKinds: ['actionBundle', 'resourceRequest', 'decisionRequest', 'taskOutcome', 'diagnostic'],
             repairPolicy: 'deterministicIntervention',
             errorLines: validationReasons,
           }),
@@ -567,6 +567,9 @@ export class ProviderRepairMessageBuilder {
         : '',
       allows('actionBundle')
         ? 'For kind="actionBundle", put userPlanMarkdown, codeBlocks, and actionBundle directly on the top-level JSON object. Do not wrap them in a payload object. validationExpectations[] and reviewExpectations[] are optional provider notes; Session derives routine defaults when they are omitted.'
+        : '',
+      allows('taskOutcome')
+        ? 'For kind="taskOutcome", put taskOutcome:{version:"1",id,taskId,status:"modelJudgedSufficient",reason,evidenceRefs:[]} on the top-level JSON object. Use it only for the current accepted task when no Kernel action is needed.'
         : '',
       allows('actionBundle')
         ? 'codeBlocks[] uses {blockId,targetPath,language?,operation?,contentLines,allowEmptyContent?}; contentLines is the only source-code carrier.'

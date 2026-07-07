@@ -25,7 +25,7 @@ export class ProviderTurnPolicy {
     if (state.acceptedImplementationPlan) {
       merged.delete('taskPlan');
       merged.delete('implementationPlan');
-      for (const kind of ['actionBundle', 'resourceRequest', 'decisionRequest', 'diagnostic']) merged.add(kind);
+      for (const kind of ['actionBundle', 'resourceRequest', 'decisionRequest', 'taskOutcome', 'diagnostic']) merged.add(kind);
     } else {
       merged.add('taskPlan');
     }

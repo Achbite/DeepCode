@@ -23,6 +23,8 @@ export interface ProviderTraceArchiveRecord {
   payload?: unknown;
   cachePlan?: unknown;
   contextAssembly?: unknown;
+  providerTurnSnapshot?: unknown;
+  hookTrace?: unknown;
 }
 
 export interface ProviderTraceToolDefinitionDigest {
@@ -89,6 +91,8 @@ export class ProviderTraceArchive {
         },
         cachePlan: compactArchiveValue(record.cachePlan),
         contextAssembly: compactArchiveValue(record.contextAssembly),
+        providerTurnSnapshot: compactArchiveValue(record.providerTurnSnapshot),
+        hookTrace: compactArchiveValue(record.hookTrace),
       };
     }
 

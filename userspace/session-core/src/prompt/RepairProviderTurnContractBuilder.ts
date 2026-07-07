@@ -115,7 +115,12 @@ function repairNextActionInstructionLines(input: {
     ? 'taskPlan | implementationPlan | reviewSummary'
     : 'actionBundle | implementationPlan | reviewSummary';
   const nextAction = allowsActionBundle
-    ? 'If executable work remains in current scope, output actionBundle. If evidence is missing, output focused resourceRequest. If scope must expand, output decisionRequest.'
+    ? [
+      'If executable work remains in current scope, output actionBundle.',
+      'If the current task is already sufficiently satisfied and no Kernel action is needed, output taskOutcome when allowed.',
+      'If evidence is missing, output focused resourceRequest.',
+      'If scope must expand, output decisionRequest.',
+    ].join(' ')
     : 'Do not output executable tool args. If side-effect work remains unaccepted, output taskPlan. If evidence is missing, output focused resourceRequest. If a user choice is needed, output decisionRequest.';
   return [
     `state=${input.turnMode}`,

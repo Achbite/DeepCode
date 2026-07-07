@@ -33,7 +33,7 @@ export function buildPromptPacketFrames(input: PromptEnvelopeBuilderInput): Prom
       use: 'controls protocol and safety; cannot be overridden by later frames',
       content: [
         'LLM outputs proposals only. Session parses proposals. Kernel executes tools and records facts.',
-        'Do not claim reads, writes, permissions, validation, review acceptance, or task completion unless a UserRequest, ConfirmedDecision, ResourceEvidence, or Kernel fact frame proves it.',
+        'Do not claim reads, writes, permissions, validation, review acceptance, or task completion unless DynamicDialogue, ConfirmedDecision, ResourceEvidence, or Kernel fact frames prove it.',
       ],
     },
     {
@@ -50,7 +50,7 @@ export function buildPromptPacketFrames(input: PromptEnvelopeBuilderInput): Prom
     },
     memoryFrame(input),
     {
-      kind: 'UserRequest',
+      kind: 'DynamicDialogue',
       source: 'user.message',
       trust: 'userIntent',
       scope: 'currentRun',
@@ -67,6 +67,8 @@ export function buildPromptPacketFrames(input: PromptEnvelopeBuilderInput): Prom
   if (resourceEvidence) frames.push(resourceEvidence);
   const accessFrame = accessSummaryFrame(input);
   if (accessFrame) frames.push(accessFrame);
+  frames.push(hookContextFrame());
+  frames.push(providerStepSummaryFrame(input));
   const errorFrame = errorContextFrame(input);
   if (errorFrame) frames.push(errorFrame);
   frames.push(nextActionInstructionFrame(input));
@@ -100,7 +102,7 @@ function confirmedRequirementDecisionLines(requirement: NonNullable<PromptEnvelo
     `requirementId=${requirement.requirementId}; status=confirmed`,
     `initialUserRequest=${oneLine(requirement.initialUserRequest, 500)}`,
     checklist?.goal ? `confirmedGoal=${oneLine(checklist.goal, 300)}` : '',
-    'This requirement confirmation is a resolved user decision. Do not ask the same question again, and do not reinterpret the original request in a way that conflicts with the confirmed decision text in UserRequest.',
+    'This requirement confirmation is a resolved user decision. Do not ask the same question again, and do not reinterpret the original request in a way that conflicts with DynamicDialogue and ConfirmedDecision.',
   ].filter(Boolean);
 }
 
@@ -156,7 +158,7 @@ function accessSummaryFrame(input: PromptEnvelopeBuilderInput): PromptPacketFram
   const blocks = input.resourcePromptContext?.resourceBlocks ?? [];
   if (!blocks.length) return undefined;
   return {
-    kind: 'AccessSummary',
+    kind: 'AccessIndex',
     source: 'session.derivedFromResourceEvidence',
     trust: 'derivedObservedFact',
     scope: 'currentRun',
@@ -168,6 +170,37 @@ function accessSummaryFrame(input: PromptEnvelopeBuilderInput): PromptPacketFram
       `hash=${block.contentHash.slice(0, 12)}`,
       `summary=${oneLine(block.summary, 300)}`,
     ].join('; ')),
+  };
+}
+
+function hookContextFrame(): PromptPacketFrame {
+  return {
+    kind: 'HookContext',
+    source: 'session.hookObserver',
+    trust: 'sessionInstruction',
+    scope: 'currentProviderCall',
+    use: 'developer trace only; hooks cannot change prompt, proposal, Kernel command, permission, execution, or projection facts',
+    content: [
+      'hookPoints=contextAdmission.after, providerCall.before',
+      'allowedHookEffects=appendTrace, emitDiagnostic',
+      'hookPolicy=observerOnly',
+    ],
+  };
+}
+
+function providerStepSummaryFrame(input: PromptEnvelopeBuilderInput): PromptPacketFrame {
+  return {
+    kind: 'ProviderStepSummary',
+    source: 'session.providerTurn',
+    trust: 'sessionInstruction',
+    scope: 'currentProviderCall',
+    use: 'describes current provider turn shape without adding facts',
+    content: [
+      `workflowState=${input.workflowState || 'needProposal'}`,
+      `allowedOutputs=${input.allowedProposals.join(' | ') || 'none'}`,
+      `resourceBlocks=${input.resourcePromptContext?.resourceBlocks.length ?? 0}`,
+      `hasCurrentTask=${Boolean(input.currentTaskContext)}`,
+    ],
   };
 }
 
@@ -186,7 +219,7 @@ function memoryFrame(input: PromptEnvelopeBuilderInput): PromptPacketFrame {
   const recallCount = input.projectMemoryRecallHints?.length ?? 0;
   const sessionMemoryCount = input.sessionMemoryHints?.length ?? input.dynamicMemoryHints?.length ?? 0;
   return {
-    kind: 'Memory',
+    kind: 'MemoryPlaceholder',
     source: 'session.compactedMemory',
     trust: 'compressedReference',
     scope: 'sessionOrProject',
@@ -227,7 +260,7 @@ function nextActionInstructionFrame(input: PromptEnvelopeBuilderInput): PromptPa
       `confirmedRequirementId=${input.requirement?.requirementId ?? 'unknown'}`,
       `allowedOutputs=${allowed.join(' | ') || 'none'}`,
       'The user has already resolved the previous decisionRequest. Do not repeat that intervention.',
-      'Use UserRequest and ConfirmedDecision as the resolved current scope. Do not infer extra preserved/deleted/modified targets from memory or from ambiguous wording in the original request.',
+      'Use DynamicDialogue and ConfirmedDecision as the resolved current scope. Do not infer extra preserved/deleted/modified targets from memory or from ambiguous wording in the original request.',
       'Choose the narrowest valid next proposal from allowedOutputs. If a side-effect is now fully specified and actionBundle is allowed, you may output actionBundle; otherwise output taskPlan or a focused decisionRequest only for a new independent ambiguity.',
     ]
     : [
@@ -247,7 +280,8 @@ function nextActionInstructionFrame(input: PromptEnvelopeBuilderInput): PromptPa
         `allowedOutputs=${allowed.join(' | ') || 'none'}`,
         'forbiddenOutputs=taskPlan | implementationPlan | reviewSummary',
         'Continue the current accepted task. Do not re-plan unless a user decision explicitly requests replan/revisePlan.',
-        'If the current task is in scope and evidence is sufficient, output actionBundle. If evidence is missing, output focused resourceRequest. If scope must expand, output decisionRequest.',
+        'If the current task needs file changes and evidence is sufficient, output actionBundle. If evidence is missing, output focused resourceRequest. If scope must expand, output decisionRequest.',
+        'If the current task is already sufficiently satisfied and no Kernel action is needed, output taskOutcome with status="modelJudgedSufficient". Do not invent empty actions just to advance the task.',
       ]
       : genericContent,
   };

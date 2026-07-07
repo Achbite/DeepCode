@@ -9,7 +9,7 @@ import type {
 } from '@deepcode/protocol';
 import type { ProjectMemoryMode } from '../../context/index.js';
 import type { ProjectWorkingDirectory } from '../../context/types.js';
-import type { AcceptedImplementationPlanContext } from '../../accepted-plan/types.js';
+import type { AcceptedImplementationPlanContext, AcceptedPlanBatchProgress } from '../../accepted-plan/types.js';
 import type { ProposalEnvelope, ResourceRequestDraft } from '../../protocol/types.js';
 import type { PromptEnvelope } from '../../prompt/types.js';
 import type { InteractionOverlayContext } from '../pipelines/interactionOverlayCodec.js';
@@ -153,6 +153,7 @@ export interface AcceptedPlanActionProposalSubmitterPorts<
     kernelEvents: unknown[];
   }): { completedTaskIds: string[] };
   afterBatch(accepted: AcceptedImplementationPlanContext, completedTaskIds: string[]): AcceptedImplementationPlanContext;
+  afterTaskOutcome(accepted: AcceptedImplementationPlanContext, taskId: string): AcceptedImplementationPlanContext;
   refreshRuntimeState(state: State): void;
   complete(accepted: AcceptedImplementationPlanContext): boolean;
   batchCheckpointEvent(
@@ -212,6 +213,9 @@ export class AcceptedPlanActionProposalSubmitter<
     fallback: AgentSessionResult
   ): Promise<AgentSessionResult> {
     const accepted = state.acceptedImplementationPlan;
+    if (proposal.kind === 'taskOutcome') {
+      return this.submitTaskOutcome(input, state, prompt, proposal, fallback);
+    }
     const actionBundle = this.ports.readActionBundle(proposal);
     if (!accepted || !actionBundle) return fallback;
 
@@ -662,6 +666,158 @@ export class AcceptedPlanActionProposalSubmitter<
       requestIdPrefix: 'accepted-plan-review-facts-get',
     });
   }
+
+  private async submitTaskOutcome(
+    input: Input,
+    state: State,
+    prompt: PromptEnvelope,
+    proposal: ProposalEnvelope,
+    fallback: AgentSessionResult
+  ): Promise<AgentSessionResult> {
+    void prompt;
+    const accepted = state.acceptedImplementationPlan;
+    const payload = objectRecord(proposal.payload);
+    const currentTaskId = stringValue(state.currentTaskContext?.taskId);
+    const taskId = stringValue(payload?.taskId) ?? currentTaskId;
+    const status = stringValue(payload?.status) ?? 'modelJudgedSufficient';
+    const reason = stringValue(payload?.reason) ?? stringValue(payload?.summary);
+    if (!accepted || !payload || !taskId || !currentTaskId) {
+      const appended = await this.ports.appendDiagnostic(
+        state,
+        'invalidTaskOutcome',
+        'taskOutcome can only be used while an accepted task cursor is active.',
+        undefined,
+        'task-outcome-invalid-state'
+      );
+      return appended ?? fallback;
+    }
+    if (taskId !== currentTaskId) {
+      const appended = await this.ports.appendDiagnostic(
+        state,
+        'taskOutcomeTaskMismatch',
+        'taskOutcome.taskId must match the current accepted task cursor.',
+        { taskId, currentTaskId },
+        'task-outcome-task-mismatch'
+      );
+      return appended ?? fallback;
+    }
+    if (status !== 'modelJudgedSufficient') {
+      const appended = await this.ports.appendDiagnostic(
+        state,
+        'unsupportedTaskOutcomeStatus',
+        'Only taskOutcome.status="modelJudgedSufficient" advances the accepted task cursor; use diagnostic for blocked or failed tasks.',
+        { status },
+        'task-outcome-unsupported-status'
+      );
+      return appended ?? fallback;
+    }
+    if (!reason) {
+      const appended = await this.ports.appendDiagnostic(
+        state,
+        'taskOutcomeMissingReason',
+        'taskOutcome.reason is required so the task cursor can be audited without creating Kernel facts.',
+        undefined,
+        'task-outcome-missing-reason'
+      );
+      return appended ?? fallback;
+    }
+
+    const nextAccepted = this.ports.afterTaskOutcome(accepted, taskId);
+    state.acceptedImplementationPlan = nextAccepted;
+    this.ports.refreshRuntimeState(state);
+    const modelJudgedSufficientTaskIds = nextAccepted.modelJudgedSufficientTaskIds ?? [];
+    const settled = new Set([
+      ...nextAccepted.completedTaskIds,
+      ...modelJudgedSufficientTaskIds,
+    ]);
+    const progress: AcceptedPlanBatchProgress = {
+      actionIds: [],
+      targetPaths: currentTaskTargets(state),
+      workUnitIds: [],
+      newlyCompletedTaskIds: [],
+      completedTaskIds: nextAccepted.completedTaskIds,
+      newlyModelJudgedSufficientTaskIds: [taskId],
+      modelJudgedSufficientTaskIds,
+      remainingTaskIds: nextAccepted.tasks
+        .map((task) => task.taskId)
+        .filter((id) => !settled.has(id)),
+    };
+    const savepointId = this.ports.createId('accepted-plan-task-savepoint');
+    const checkpointResult = await this.ports.append(state.sessionId, [
+      this.ports.batchCheckpointEvent(
+        state.sessionId,
+        state.runId,
+        accepted,
+        proposal,
+        [],
+        progress,
+        this.ports.now(),
+        this.ports.createId('accepted-plan-task-outcome-checkpoint')
+      ),
+      this.ports.taskSavepointEvent(
+        state.sessionId,
+        state.runId,
+        accepted,
+        nextAccepted,
+        progress,
+        [],
+        state.taskExecutionCursor,
+        state.currentTaskContext,
+        this.ports.now(),
+        savepointId
+      ),
+    ]) ?? fallback;
+    if (state.taskExecutionCursor) {
+      (state.taskExecutionCursor as { lastSavepointId?: string }).lastSavepointId = savepointId;
+    }
+
+    if (!this.ports.complete(nextAccepted)) {
+      return this.ports.runUserTurn({
+        sessionId: input.sessionId,
+        content: this.ports.executionRequest(
+          {
+            sessionId: state.sessionId,
+            runId: state.runId,
+            acceptedPlan: accepted,
+            proposal,
+            taskOutcome: payload,
+            implementationPlan: accepted.rawPlan,
+          },
+          nextAccepted
+        ),
+        attachments: nextAccepted.executionRoot ? [nextAccepted.executionRoot.attachment] : [],
+        existingEvents: checkpointResult.events,
+        workspaceBinding: input.workspaceBinding,
+        projectWorkingDirectory: input.projectWorkingDirectory,
+        profileId: input.profileId,
+        workflow: input.workflow,
+        appendUserMessage: false,
+        requirementConfirmationMode: 'off',
+        reviewContinuationMode: input.reviewContinuationMode,
+        interventionLevel: input.interventionLevel,
+        projectMemoryMode: input.projectMemoryMode,
+        resumeResourcePackets: true,
+        acceptedImplementationPlan: nextAccepted,
+      });
+    }
+
+    const plan = this.ports.executionContext({
+      sessionId: state.sessionId,
+      runId: state.runId,
+      acceptedPlan: nextAccepted,
+      proposal,
+      taskOutcome: payload,
+    });
+    return this.ports.reviewHandoff({
+      sessionId: state.sessionId,
+      runId: state.runId,
+      planId: nextAccepted.planId,
+      plan,
+      result: checkpointResult,
+      currentKernelEvents: [],
+      requestIdPrefix: 'accepted-plan-task-outcome-review-facts-get',
+    });
+  }
 }
 
 function objectRecord(value: unknown): Record<string, unknown> | undefined {
@@ -671,4 +827,12 @@ function objectRecord(value: unknown): Record<string, unknown> | undefined {
 
 function stringValue(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function currentTaskTargets(state: AcceptedPlanActionProposalState): string[] {
+  const record = objectRecord(state.currentTaskContext);
+  const targets = record?.targets;
+  return Array.isArray(targets)
+    ? targets.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+    : [];
 }
