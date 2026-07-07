@@ -1,4 +1,4 @@
-import { actionBundleProtocolShapeLines, kernelCatalogToolIdList, resourceRequestProtocolShapeLine } from '../protocol/protocolContract.js';
+import { actionBundleProtocolShapeLines, resourceRequestProtocolShapeLine } from '../protocol/protocolContract.js';
 import type { PromptEnvelopeBuilderInput } from './types.js';
 import { buildPromptPacketFrames, renderPromptPacketFrames, type PromptPacketFrame } from './promptPacket.js';
 
@@ -126,7 +126,7 @@ export function providerVisibleSchemaDigest(input: PromptEnvelopeBuilderInput): 
         'actionBundle proposal top-level fields: userPlanMarkdown, codeBlocks, actionBundle. Use it only for the current accepted task.',
         ...actionBundleProtocolShapeLines(),
         'codeBlocks items use {blockId,targetPath,language?,operation?,contentLines,allowEmptyContent?}. contentLines is the only provider-facing source-code content carrier.',
-        `actionBundle.actions[].toolId must use Kernel catalog ids: ${kernelCatalogToolIdList()}.`,
+        'actionBundle.actions[].toolId must match a current ToolIntentTemplates template.toolId when a template is present, otherwise use one currentTaskCapabilities id from this ProviderTurnContract.',
         'File operation actions must use fs.* toolIds. Action entries use actionId, toolId, args, and description; Kernel derives capability, permission, readSet/writeSet, and conflictKeys.',
         'Do not output capability, permissionLabels, accessScopes, resourceScope, commandBlocks, legacy implementationPlan, or payload wrapper fields.',
       ].join('\n')

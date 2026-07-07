@@ -985,6 +985,8 @@ async function assertProviderTurnContextCoordinatorScopesAcceptedExecutionCatalo
   assert(assemblyCapabilitySummary.includes(`currentTaskTargets=target-${token}.txt`), 'scoped summary records current task targets');
   assertEqual(dynamicPrompt.includes(fullCatalogMarker), false, 'accepted execution dynamic prompt does not expose full capability catalog');
   assertEqual(renderedContract.includes(fullCatalogMarker), false, 'accepted execution provider contract does not expose full capability catalog');
+  assertEqual(renderedContract.includes('browser.click'), false, 'accepted execution provider contract does not enumerate unrelated Kernel catalog tool ids');
+  assert(renderedContract.includes('template.toolId'), 'accepted execution schema points action tool selection at current task templates');
   assert(dynamicPrompt.includes('Current accepted task tool intent scope:'), 'accepted execution workflow state labels scoped tool intent');
 }
 
