@@ -11,10 +11,10 @@ import type {
   ProviderTurnSnapshotResourceBlock,
   ProviderTurnSnapshotSegment,
 } from '../runFrame.js';
-import { renderProviderTurnUserPrompt } from './providerTurnPromptRenderer.js';
+import { buildProviderTurnContractPayload, renderProviderTurnUserPrompt } from './providerTurnPromptRenderer.js';
 
 export function buildProviderTurnSnapshot(contract: DriverProviderTurnFrame): ProviderTurnSnapshot {
-  const renderedContract = renderContractForSnapshot(contract);
+  const renderedContract = JSON.stringify(buildProviderTurnContractPayload(contract, contract.prompt.dynamicSuffix));
   const finalUserPrompt = renderProviderTurnUserPrompt(contract.prompt.dynamicSuffix, contract);
   const contextAssembly = contract.contextAssembly;
   const frames = contract.frames.map((frame, index) => snapshotFrame(frame, index, contract.prompt.dynamicSuffix));
@@ -125,28 +125,4 @@ function cacheClasses(segments: readonly ContextAssemblySegmentRecord[]): Record
     counts[segment.cacheClass] = (counts[segment.cacheClass] ?? 0) + 1;
     return counts;
   }, {});
-}
-
-function renderContractForSnapshot(contract: DriverProviderTurnFrame): string {
-  return JSON.stringify({
-    schemaVersion: contract.schemaVersion,
-    contractId: contract.contractId,
-    turnMode: contract.turnMode,
-    allowedKinds: contract.allowedKinds,
-    requiredKind: contract.requiredKind,
-    repairPolicy: contract.repairPolicy,
-    projectionVisibility: contract.projectionVisibility,
-    frames: contract.frames.map((frame) => ({
-      kind: frame.kind,
-      source: frame.source,
-      trust: frame.trust,
-      scope: frame.scope,
-      use: frame.use,
-      summary: frame.summary,
-      refsCount: frame.refs?.length ?? 0,
-      dataHash: frame.data === undefined ? undefined : stableHash(JSON.stringify(frame.data)),
-    })),
-    toolIntentTemplates: contract.toolIntentTemplates,
-    nextActionInstruction: contract.nextActionInstruction.summary ?? '',
-  });
 }
