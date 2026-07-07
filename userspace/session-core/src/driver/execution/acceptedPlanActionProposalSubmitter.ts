@@ -148,13 +148,22 @@ export interface AcceptedPlanActionProposalSubmitterPorts<
   actionBatchReadyForReview(events: unknown[]): boolean;
   hasPermissionRequest(events: unknown[]): boolean;
   permissionId(events: unknown[]): string | undefined;
-  batchProgress(input: {
+  recordKernelBatchProgress(input: {
     acceptedPlan: AcceptedImplementationPlanContext;
     proposal: ProposalEnvelope;
     kernelEvents: unknown[];
-  }): { completedTaskIds: string[] };
-  afterBatch(accepted: AcceptedImplementationPlanContext, completedTaskIds: string[]): AcceptedImplementationPlanContext;
-  afterTaskOutcome(accepted: AcceptedImplementationPlanContext, taskId: string): AcceptedImplementationPlanContext;
+  }): {
+    progress: AcceptedPlanBatchProgress;
+    completedTaskIds: string[];
+    nextAcceptedPlan: AcceptedImplementationPlanContext;
+  };
+  recordModelTaskOutcome(input: {
+    acceptedPlan: AcceptedImplementationPlanContext;
+    taskId: string;
+  }): {
+    taskId: string;
+    nextAcceptedPlan: AcceptedImplementationPlanContext;
+  };
   refreshRuntimeState(state: State): void;
   complete(accepted: AcceptedImplementationPlanContext): boolean;
   batchCheckpointEvent(
@@ -572,8 +581,9 @@ export class AcceptedPlanActionProposalSubmitter<
       }
       return result;
     }
-    const batchProgress = this.ports.batchProgress({ acceptedPlan: accepted, proposal: executionProposal, kernelEvents: batchReply.events ?? [] });
-    const nextAccepted = this.ports.afterBatch(accepted, batchProgress.completedTaskIds);
+    const ledgerEffect = this.ports.recordKernelBatchProgress({ acceptedPlan: accepted, proposal: executionProposal, kernelEvents: batchReply.events ?? [] });
+    const batchProgress = ledgerEffect.progress;
+    const nextAccepted = ledgerEffect.nextAcceptedPlan;
     this.ports.refreshRuntimeState(state);
     const savepointId = this.ports.createId('accepted-plan-task-savepoint');
     result = await this.ports.append(state.sessionId, [
@@ -705,7 +715,8 @@ export class AcceptedPlanActionProposalSubmitter<
       return appended ?? fallback;
     }
 
-    const nextAccepted = this.ports.afterTaskOutcome(accepted, taskId);
+    const ledgerEffect = this.ports.recordModelTaskOutcome({ acceptedPlan: accepted, taskId });
+    const nextAccepted = ledgerEffect.nextAcceptedPlan;
     state.acceptedImplementationPlan = nextAccepted;
     this.ports.refreshRuntimeState(state);
     const modelJudgedSufficientTaskIds = nextAccepted.modelJudgedSufficientTaskIds ?? [];

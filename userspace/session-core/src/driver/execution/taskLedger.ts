@@ -36,8 +36,114 @@ export interface AcceptedPlanTaskLedgerCoordinatorPorts {
   actionBatchHasFailureOrBlocker(kernelEvents: unknown[]): boolean;
 }
 
+export type AcceptedPlanLedgerCommand =
+  | {
+    kind: 'recordKernelBatchProgress';
+    acceptedPlan: AcceptedImplementationPlanContext;
+    proposal: ProposalEnvelope;
+    kernelEvents: unknown[];
+  }
+  | {
+    kind: 'recordModelTaskOutcome';
+    acceptedPlan: AcceptedImplementationPlanContext;
+    taskId: string;
+  }
+  | {
+    kind: 'recoverLatestCheckpoint';
+    acceptedPlan: AcceptedImplementationPlanContext;
+    events: AgentEvent[];
+  };
+
+export type AcceptedPlanLedgerEffect =
+  | {
+    kind: 'kernelBatchProgressRecorded';
+    progress: AcceptedPlanBatchProgress;
+    completedTaskIds: string[];
+    nextAcceptedPlan: AcceptedImplementationPlanContext;
+  }
+  | {
+    kind: 'modelTaskOutcomeRecorded';
+    taskId: string;
+    nextAcceptedPlan: AcceptedImplementationPlanContext;
+  }
+  | {
+    kind: 'latestCheckpointRecovered';
+    nextAcceptedPlan: AcceptedImplementationPlanContext;
+  };
+
 export class AcceptedPlanTaskLedgerCoordinator {
   constructor(private readonly ports?: AcceptedPlanTaskLedgerCoordinatorPorts) {}
+
+  // Accepted-plan ledger mutations are command effects so projections and cursors share one state transition owner.
+  execute(command: AcceptedPlanLedgerCommand): AcceptedPlanLedgerEffect {
+    if (command.kind === 'recordKernelBatchProgress') {
+      const progress = this.batchProgress({
+        acceptedPlan: command.acceptedPlan,
+        proposal: command.proposal,
+        kernelEvents: command.kernelEvents,
+      });
+      return {
+        kind: 'kernelBatchProgressRecorded',
+        progress,
+        completedTaskIds: progress.completedTaskIds,
+        nextAcceptedPlan: this.afterBatch(command.acceptedPlan, progress.completedTaskIds),
+      };
+    }
+    if (command.kind === 'recordModelTaskOutcome') {
+      return {
+        kind: 'modelTaskOutcomeRecorded',
+        taskId: command.taskId,
+        nextAcceptedPlan: this.afterTaskOutcome(command.acceptedPlan, command.taskId),
+      };
+    }
+    return {
+      kind: 'latestCheckpointRecovered',
+      nextAcceptedPlan: this.withLatestCheckpoint(command.acceptedPlan, command.events),
+    };
+  }
+
+  recordKernelBatchProgress(input: {
+    acceptedPlan: AcceptedImplementationPlanContext;
+    proposal: ProposalEnvelope;
+    kernelEvents: unknown[];
+  }): Extract<AcceptedPlanLedgerEffect, { kind: 'kernelBatchProgressRecorded' }> {
+    const effect = this.execute({
+      kind: 'recordKernelBatchProgress',
+      ...input,
+    });
+    if (effect.kind !== 'kernelBatchProgressRecorded') {
+      throw new Error(`Unexpected accepted-plan ledger effect: ${effect.kind}`);
+    }
+    return effect;
+  }
+
+  recordModelTaskOutcome(input: {
+    acceptedPlan: AcceptedImplementationPlanContext;
+    taskId: string;
+  }): Extract<AcceptedPlanLedgerEffect, { kind: 'modelTaskOutcomeRecorded' }> {
+    const effect = this.execute({
+      kind: 'recordModelTaskOutcome',
+      ...input,
+    });
+    if (effect.kind !== 'modelTaskOutcomeRecorded') {
+      throw new Error(`Unexpected accepted-plan ledger effect: ${effect.kind}`);
+    }
+    return effect;
+  }
+
+  recoverLatestCheckpoint(input: {
+    acceptedPlan: AcceptedImplementationPlanContext;
+    events: AgentEvent[];
+  }): Extract<AcceptedPlanLedgerEffect, { kind: 'latestCheckpointRecovered' }> {
+    const effect = this.execute({
+      kind: 'recoverLatestCheckpoint',
+      ...input,
+    });
+    if (effect.kind !== 'latestCheckpointRecovered') {
+      throw new Error(`Unexpected accepted-plan ledger effect: ${effect.kind}`);
+    }
+    return effect;
+  }
 
   runtimeSnapshot(input: {
     acceptedPlan?: AcceptedImplementationPlanContext;

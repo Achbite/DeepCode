@@ -8238,11 +8238,18 @@ function assertRunStateMachineTaskLedger(): void {
   const progress = coordinator.batchProgress({ acceptedPlan, proposal, kernelEvents: [] });
   assertEqual(progress.newlyCompletedTaskIds[0], taskIds[2], 'task ledger coordinator marks the current covered task complete');
   assertEqual(progress.workUnitIds[0], workUnitId, 'task ledger coordinator preserves work unit ids from kernel events');
+  const progressEffect = coordinator.recordKernelBatchProgress({ acceptedPlan, proposal, kernelEvents: [] });
+  assertEqual(progressEffect.kind, 'kernelBatchProgressRecorded', 'task ledger records kernel batch progress through command effect');
+  assertEqual(progressEffect.completedTaskIds.includes(taskIds[2]), true, 'task ledger command effect carries completed task ids');
+  assertEqual(progressEffect.nextAcceptedPlan.completedTaskIds.includes(taskIds[2]), true, 'task ledger command effect carries next accepted plan');
   const afterBatch = coordinator.afterBatch(acceptedPlan, progress.completedTaskIds);
   assertEqual(afterBatch.completedTaskIds.includes(taskIds[2]), true, 'task ledger coordinator advances accepted plan completed ids');
   assertEqual(coordinator.complete(afterBatch), false, 'task ledger coordinator keeps incomplete accepted plan open');
 
   const afterOutcome = coordinator.afterTaskOutcome(afterBatch, taskIds[3]);
+  const outcomeEffect = coordinator.recordModelTaskOutcome({ acceptedPlan: afterBatch, taskId: taskIds[3] });
+  assertEqual(outcomeEffect.kind, 'modelTaskOutcomeRecorded', 'task ledger records model task outcome through command effect');
+  assertEqual(outcomeEffect.nextAcceptedPlan.modelJudgedSufficientTaskIds?.includes(taskIds[3]), true, 'task ledger taskOutcome effect carries next accepted plan');
   const outcomeLedger = coordinator.ledger(afterOutcome);
   assertEqual(afterOutcome.modelJudgedSufficientTaskIds?.includes(taskIds[3]), true, 'taskOutcome records model-judged sufficient task ids');
   assertEqual(outcomeLedger?.entries.find((entry) => entry.taskId === taskIds[3])?.status, 'modelJudgedSufficient', 'task ledger exposes model judged sufficient task status');
@@ -8261,6 +8268,9 @@ function assertRunStateMachineTaskLedger(): void {
     },
   } as AgentEvent;
   const restored = coordinator.withLatestCheckpoint(acceptedPlan, [checkpoint]);
+  const recoverEffect = coordinator.recoverLatestCheckpoint({ acceptedPlan, events: [checkpoint] });
+  assertEqual(recoverEffect.kind, 'latestCheckpointRecovered', 'task ledger restores checkpoint through command effect');
+  assertEqual(coordinator.complete(recoverEffect.nextAcceptedPlan), true, 'task ledger checkpoint effect restores completed state');
   assertEqual(coordinator.complete(restored), true, 'task ledger coordinator restores completed checkpoint state');
   const runtimeState: AcceptedPlanTaskRuntimeState = {
     acceptedImplementationPlan: acceptedPlan,

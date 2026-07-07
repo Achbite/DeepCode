@@ -427,9 +427,8 @@ export class SessionDriverLoop {
       actionBatchReadyForReview: (events) => kernelEventStatusIndex.actionBatchReadyForReview(events),
       hasPermissionRequest: (events) => kernelEventStatusIndex.hasPermissionRequest(events),
       permissionId: (events) => kernelEventStatusIndex.permissionId(events),
-      batchProgress: (progressInput) => acceptedPlanTaskLedger().batchProgress(progressInput),
-      afterBatch: (accepted, completedTaskIds) => acceptedPlanTaskLedger().afterBatch(accepted, completedTaskIds),
-      afterTaskOutcome: (accepted, taskId) => acceptedPlanTaskLedger().afterTaskOutcome(accepted, taskId),
+      recordKernelBatchProgress: (progressInput) => acceptedPlanTaskLedger().recordKernelBatchProgress(progressInput),
+      recordModelTaskOutcome: (outcomeInput) => acceptedPlanTaskLedger().recordModelTaskOutcome(outcomeInput),
       refreshRuntimeState: (state) => acceptedPlanTaskLedger().refreshRuntimeState(state),
       complete: (accepted) => acceptedPlanTaskLedger().complete(accepted),
       batchCheckpointEvent: (sessionId, runId, accepted, proposal, kernelEvents, progress, ts, id) =>
