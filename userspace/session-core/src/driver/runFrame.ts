@@ -108,7 +108,9 @@ export interface ProviderTurnSnapshotFrame {
   readonly source: ProviderFrameSource;
   readonly trust: ProviderFrameTrust;
   readonly scope?: string;
+  readonly useCharLength: number;
   readonly useHash: string;
+  readonly summaryCharLength: number;
   readonly summaryHash?: string;
   readonly refsCount: number;
   readonly dataHash?: string;

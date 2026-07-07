@@ -714,6 +714,16 @@ function assertProviderTurnSnapshotRecordsContextAdmissionShape(): void {
   assertEqual(snapshot.segments.every((segment) => typeof segment.charLength === 'number'), true, 'provider turn snapshot records segment lengths');
   assertEqual(Object.keys(snapshot.cacheClasses).length > 0, true, 'provider turn snapshot records cache classes');
   assertEqual(snapshot.frames.at(-1)?.kind, 'NextActionInstruction', 'provider turn snapshot records final next action frame');
+  assertEqual(
+    snapshot.frames.some((frame) => frame.kind === 'AccessIndex' && frame.summaryCharLength > 0),
+    true,
+    'provider turn snapshot records access index summary length'
+  );
+  assertEqual(
+    snapshot.frames.every((frame) => frame.useCharLength > 0),
+    true,
+    'provider turn snapshot records frame use length'
+  );
   assertEqual(snapshot.resourceBlocks.length > 0, true, 'provider turn snapshot records resource block metadata');
   assertEqual(snapshot.providerTurnContractHash.length > 0, true, 'provider turn snapshot records provider contract hash');
   assertEqual(snapshot.finalUserPromptHash.length > 0, true, 'provider turn snapshot records final user prompt hash');
