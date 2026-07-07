@@ -180,6 +180,8 @@ export class ProviderProposalCoordinator<
     raw: string,
     parseError: ProviderProposalParseError
   ): Promise<ProposalEnvelope> {
+    const protocolOnly = this.tryParseProtocolOnlyFailure(state, raw, parseError);
+    if (protocolOnly) return protocolOnly;
     await this.ports.append(state.sessionId, [
       this.ports.thinkingEvent(
         state.sessionId,
@@ -211,5 +213,31 @@ export class ProviderProposalCoordinator<
         `Model output still does not satisfy Agent Protocol v3 after repair: ${this.ports.normalizeParseError(repairError).message}`
       );
     }
+  }
+
+  private tryParseProtocolOnlyFailure(
+    state: State,
+    raw: string,
+    parseError: ProviderProposalParseError
+  ): ProposalEnvelope | undefined {
+    if (!this.isSchemaVersionProtocolError(parseError)) return undefined;
+    try {
+      return this.ports.parseRepairedProposal({
+        raw,
+        state,
+        allowedKinds: this.ports.repairAllowedKinds({
+          acceptedPlanActive: Boolean(state.acceptedImplementationPlan),
+          errorCode: parseError.code,
+        }),
+        allowBriefActionBundleUserPlan: Boolean(state.acceptedImplementationPlan),
+      });
+    } catch {
+      return undefined;
+    }
+  }
+
+  private isSchemaVersionProtocolError(error: ProviderProposalParseError): boolean {
+    if (!error.message.includes('schemaVersion')) return false;
+    return error.code === 'missing_string' || error.code === 'unsupported_protocol_schema';
   }
 }

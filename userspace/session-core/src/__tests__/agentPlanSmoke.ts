@@ -236,6 +236,7 @@ async function main(): Promise<void> {
   await assertSessionDriverLoopAllowsManyCodeBlocksWithoutBatchRepair();
   await assertSessionDriverLoopRepairsOversizedActionBundle();
   await assertSessionDriverLoopRepairsEmptyActionBundleResponse();
+  await assertSessionDriverLoopCanonicalizesSchemaVersionOnlyProposal();
   await assertSessionDriverLoopCanonicalizesBareTaskPlanRepair();
   await assertSessionDriverLoopAcceptsLocalizedStructuredPlan();
   await assertSessionDriverLoopPlanRevisionReturnsToPlanning();
@@ -13316,6 +13317,53 @@ async function assertSessionDriverLoopRepairsEmptyActionBundleResponse(): Promis
     ),
     false,
     'planning empty response must not be projected as actionBundle compaction repair'
+  );
+}
+
+async function assertSessionDriverLoopCanonicalizesSchemaVersionOnlyProposal(): Promise<void> {
+  const events: AgentEvent[] = [];
+  const submittedPlans: Array<Record<string, any>> = [];
+  const repairRequests: LlmChatRequest[] = [];
+  let llmCalls = 0;
+  const session: AgentSession = {
+    id: 'session-schema-version-only',
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => planKernel(request, 'session-schema-version-only', submittedPlans),
+    llmChat: async (request): Promise<ApiResponse<LlmChatResult>> => {
+      llmCalls += 1;
+      if (llmCalls > 1) repairRequests.push(request);
+      const proposal = genericTaskPlanProposal();
+      proposal.schemaVersion = '1.0';
+      return jsonLlmResponse(proposal);
+    },
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + submittedPlans.length + repairRequests.length + 1}`,
+  });
+
+  const result = await loop.runUserTurn({
+    sessionId: 'session-schema-version-only',
+    content: 'Create a generic workspace change in reviewable batches.',
+    requirementConfirmationMode: 'off',
+  });
+  assertEqual(llmCalls, 1, 'schemaVersion-only proposal repair is handled without a second provider call');
+  assertEqual(repairRequests.length, 0, 'schemaVersion-only proposal does not build an LLM repair request');
+  assertEqual(submittedPlans.length, 0, 'schemaVersion-only taskPlan remains non-executable');
+  assertEqual(result.events.some((event) => event.kind === 'plan_card'), true, 'schemaVersion-only taskPlan renders a plan card');
+  assertEqual(
+    result.events.some((event) =>
+      event.kind === 'workflow_stage' &&
+      String((event.payload as any)?.summary ?? '').includes('Agent Protocol v3 repair')
+    ),
+    false,
+    'schemaVersion-only proposal does not project a protocol repair stage'
   );
 }
 
