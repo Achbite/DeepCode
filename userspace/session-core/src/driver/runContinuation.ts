@@ -1,4 +1,4 @@
-import type { AgentContextAttachment, AgentEvent, AgentWorkspaceBinding } from '@deepcode/protocol';
+import type { AgentContextAttachment, AgentEvent, AgentSessionResult, AgentWorkspaceBinding } from '@deepcode/protocol';
 import type { ProjectMemoryMode } from '../context/index.js';
 import type { ProjectWorkingDirectory } from '../context/types.js';
 import type { RequirementRecord } from '../requirement/types.js';
@@ -27,6 +27,14 @@ export interface DecisionContinuationOverride {
   confirmedRequirement?: RequirementRecord;
   acceptedImplementationPlan?: AcceptedImplementationPlanContext;
   interactionOverlay?: InteractionOverlayContext;
+}
+
+export class SameLoopContinuation<Input> {
+  constructor(private readonly resume: (input: Input) => Promise<AgentSessionResult>) {}
+
+  readonly resumeUserTurn = (input: Input): Promise<AgentSessionResult> => this.resume(input);
+
+  readonly runUserTurn = (input: Input): Promise<AgentSessionResult> => this.resume(input);
 }
 
 export type DecisionContinuationInput<Extra extends object = Record<string, never>> = {

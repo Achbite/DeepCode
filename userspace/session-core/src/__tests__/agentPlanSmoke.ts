@@ -48,7 +48,7 @@ import { AgentRunReactor } from '../driver/agentRunReactor.js';
 import { ContextFrameBuilder } from '../driver/context/contextFrameBuilder.js';
 import { ProviderTurnCycle } from '../driver/pipelines/providerTurnCycle.js';
 import { routeProposalKind } from '../driver/proposal/proposalRouter.js';
-import { decisionContinuationInput } from '../driver/runContinuation.js';
+import { decisionContinuationInput, SameLoopContinuation } from '../driver/runContinuation.js';
 import { renderProviderTurnContractLayer } from '../prompt/providerTurnContract.js';
 import { AcceptedPlanResourceResumeCoordinator, ActionBundleAdmissionResourceFollowupCoordinator, GeneratedArtifactEvidenceIndex, PathIdentity, ResourceEvidenceIndex, ResourceOrchestrator, ResourceRequestLoop, ResourceRequestRepairCoordinator, buildProviderTurnSnapshot } from '../driver/context/index.js';
 import {
@@ -105,6 +105,7 @@ async function main(): Promise<void> {
   assertProposalSemanticValidatorCanonicalizesAndDefaults();
   assertPromptEnvelope();
   assertDecisionContinuationInputKeepsDecisionResumeInSameLoop();
+  await assertSameLoopContinuationUsesSingleResumePort();
   await assertRunEngineContinuationUsesSameLifecycle();
   await assertRunEngineContinuesOnlyForResourceRequestRoute();
   await assertRunEngineRejectsUnexpectedContinueRoute();
@@ -402,6 +403,25 @@ function assertDecisionContinuationInputKeepsDecisionResumeInSameLoop(): void {
   assertEqual(minimal.attachments?.length, 0, 'decision continuation defaults missing attachments to an empty list');
   assertEqual(minimal.appendUserMessage, false, 'minimal continuation still does not append a new user message');
   assertEqual(minimal.requirementConfirmationMode, 'off', 'minimal continuation still avoids requirement reconfirmation');
+}
+
+async function assertSameLoopContinuationUsesSingleResumePort(): Promise<void> {
+  const token = randomSmokeToken('same-loop-port');
+  const calls: string[] = [];
+  const continuation = new SameLoopContinuation<{ sessionId: string; marker: string }>(async (input) => {
+    calls.push(`${input.sessionId}:${input.marker}`);
+    return genericSessionResult(input.sessionId);
+  });
+
+  const first = await continuation.resumeUserTurn({ sessionId: `session-${token}`, marker: 'resume' });
+  const second = await continuation.runUserTurn({ sessionId: `session-${token}`, marker: 'run' });
+  assertEqual(first.session.id, `session-${token}`, 'same-loop resume returns the shared continuation result');
+  assertEqual(second.session.id, `session-${token}`, 'same-loop run returns the shared continuation result');
+  assertEqual(
+    calls.join('|'),
+    `session-${token}:resume|session-${token}:run`,
+    'same-loop continuation keeps resume and run ports on one lifecycle entry'
+  );
 }
 
 async function assertRunEngineContinuationUsesSameLifecycle(): Promise<void> {

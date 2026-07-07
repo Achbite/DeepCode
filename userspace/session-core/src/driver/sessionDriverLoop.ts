@@ -63,7 +63,7 @@ import {
   type PlanContext as SessionPlanContext,
 } from './proposal/index.js';
 import type { LlmTurnResult, SessionDriverLoopRunState } from './runFrame.js';
-import { decisionContinuationInput } from './runContinuation.js';
+import { decisionContinuationInput, SameLoopContinuation } from './runContinuation.js';
 import { RunEngine } from './runEngine.js';
 import { diag, isEmptyResponseError, objectRecord, SessionDriverLoopError, stringValue, visibleLanguageForRequest } from './runtimeSupport.js';
 import { AgentRunReactor } from './agentRunReactor.js';
@@ -180,6 +180,7 @@ export class SessionDriverLoop {
   private readonly runEngine: RunEngine<SessionDriverLoopInput, SessionDriverLoopRunState>;
   private readonly runLifecyclePipeline: RunLifecyclePipeline<SessionDriverLoopRunState>;
   private readonly providerTurnRunner: ProviderTurnRunner<SessionDriverLoopRunState>;
+  private readonly sameLoopContinuation: SameLoopContinuation<SessionDriverLoopInput>;
 
   constructor(private readonly ports: SessionDriverLoopPorts) {
     this.agentRunReactor = new AgentRunReactor<SessionDriverLoopRunState>({
@@ -190,13 +191,14 @@ export class SessionDriverLoop {
       errorCode: (error, fallback) => error instanceof SessionDriverLoopError ? error.code : fallback,
       errorMessage: (error) => error instanceof Error ? error.message : String(error),
     });
+    this.sameLoopContinuation = new SameLoopContinuation((resumeInput) => this.continueSameLoop(resumeInput));
     this.acceptedActionBundlePlanExecutor = new AcceptedActionBundlePlanExecutor({
       now: () => this.agentRunReactor.ts(),
       createId: (prefix) => this.agentRunReactor.id(prefix),
       append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
       kernel: (request) => this.agentRunReactor.kernel(request),
       appendProjectedKernelEvents: (sessionId, reply) => this.agentRunReactor.appendProjectedKernelEvents(sessionId, reply),
-      resumeUserTurn: (resumeInput) => this.continueSameLoop(resumeInput),
+      resumeUserTurn: this.sameLoopContinuation.resumeUserTurn,
       kernelExecutionContractId: (report) => planReviewGrantProjector.kernelExecutionContractId(report),
       temporaryGrantsForPlan: (plan) => planReviewGrantProjector.temporaryGrantsForPlan(plan),
       recentResourcePackets: (events) => resourceRequestLoop.recentPackets(events),
@@ -240,7 +242,7 @@ export class SessionDriverLoop {
       now: () => this.agentRunReactor.ts(),
       createId: (prefix) => this.agentRunReactor.id(prefix),
       append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
-      runUserTurn: (resumeInput) => this.continueSameLoop(resumeInput),
+      runUserTurn: this.sameLoopContinuation.runUserTurn,
       readActionBundle: (proposal) => driverActivityBuilder.readActionBundle(proposal),
       refreshRuntimeState: (state) => acceptedPlanTaskLedger().refreshRuntimeState(state),
       readOnlyResourceCompletion: (accepted, cursor, current, packet) =>
@@ -457,7 +459,7 @@ export class SessionDriverLoop {
           id
         ),
       executionRequest: (plan, acceptedPlan) => executionPromptCoordinator().executionRequest(plan, acceptedPlan),
-      runUserTurn: (resumeInput) => this.continueSameLoop(resumeInput),
+      runUserTurn: this.sameLoopContinuation.runUserTurn,
       staticSyntaxReview: (reviewInput) => this.acceptedPlanStaticSyntaxReviewCoordinator.run(reviewInput),
       reviewHandoff: (handoffInput) => this.acceptedPlanReviewHandoffCoordinator.handoff(handoffInput),
     });
@@ -559,7 +561,7 @@ export class SessionDriverLoop {
       now: () => this.agentRunReactor.ts(),
       createId: (prefix) => this.agentRunReactor.id(prefix),
       append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
-      resumeUserTurn: (resumeInput) => this.continueSameLoop(resumeInput),
+      resumeUserTurn: this.sameLoopContinuation.resumeUserTurn,
       executeAcceptedActionBundlePlan: (handlerInput, plan, initialResult, acceptedOverlay) =>
         this.acceptedActionBundlePlanExecutor.execute(handlerInput, plan, initialResult, acceptedOverlay),
       activeDriverInteraction: (events) => driverInteractionIndex.active(events),
@@ -579,7 +581,7 @@ export class SessionDriverLoop {
       now: () => this.agentRunReactor.ts(),
       createId: (prefix) => this.agentRunReactor.id(prefix),
       append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
-      resumeUserTurn: (resumeInput) => this.continueSameLoop(resumeInput),
+      resumeUserTurn: this.sameLoopContinuation.resumeUserTurn,
       activeDriverInteraction: (events) => driverInteractionIndex.active(events),
       executionRootFromDecision: (handlerInput, events) =>
         AcceptedPlanExecutionRootResolver.fromDecision(handlerInput, events),
@@ -606,7 +608,7 @@ export class SessionDriverLoop {
       kernelAudit: (request) => this.ports.kernelCommand(request),
       appendProjectedKernelEvents: (sessionId, reply) => this.agentRunReactor.appendProjectedKernelEvents(sessionId, reply),
       append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
-      resumeUserTurn: (resumeInput) => this.continueSameLoop(resumeInput),
+      resumeUserTurn: this.sameLoopContinuation.resumeUserTurn,
       reviewAssembler: reviewAssembler(),
       reviewDecisionProjection: reviewDecisionProjection(),
       kernelStatus: kernelEventStatusIndex,
