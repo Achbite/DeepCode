@@ -8883,6 +8883,8 @@ function assertPromptEnvelope(): void {
       taskTitle: 'Remove generated directory',
       targets: ['generated-dir'],
       capabilities: ['fs.delete'],
+      acceptanceCriteria: ['Kernel records the generated directory delete fact.'],
+      failureCriteria: ['Stop if the delete leaves the accepted target scope.'],
       pendingTaskIds: ['task-generic-delete'],
       completedTaskIds: [],
     },
@@ -8903,12 +8905,16 @@ function assertPromptEnvelope(): void {
       taskTitle: 'Remove generated directory',
       targets: ['generated-dir'],
       capabilities: ['fs.delete'],
+      acceptanceCriteria: ['Kernel records the generated directory delete fact.'],
+      failureCriteria: ['Stop if the delete leaves the accepted target scope.'],
       pendingTaskIds: ['task-generic-delete'],
       completedTaskIds: [],
     },
   });
   const acceptedTaskFrame = acceptedFrames.find((frame) => frame.kind === 'TaskFrame');
   assert(acceptedTaskFrame?.trust === 'confirmedTaskInstruction', 'accepted execution prompt packet marks task frame as confirmed instruction');
+  assert(acceptedTaskFrame?.content.some((line) => line.includes('acceptanceCriteria=Kernel records the generated directory delete fact.')), 'accepted execution task frame carries current task acceptance criteria');
+  assert(acceptedTaskFrame?.content.some((line) => line.includes('failureCriteria=Stop if the delete leaves the accepted target scope.')), 'accepted execution task frame carries current task failure criteria');
   const nextAction = acceptedFrames.find((frame) => frame.kind === 'NextActionInstruction');
   assert(nextAction, 'accepted execution prompt packet includes next action frame');
   const allowedLine = nextAction?.content.find((line) => line.startsWith('allowedOutputs=')) ?? '';
@@ -9186,6 +9192,8 @@ function assertAcceptedTaskRegistryUsesExactOperationGrants(): void {
       taskId,
       title: 'Write grant-backed file',
       targets: [],
+      acceptanceCriteria: ['Kernel records the grant-backed write fact.'],
+      failureCriteria: ['Stop if the grant-backed write leaves the reviewed scope.'],
       dependencies: [],
       conflictKeys: [],
     }],
@@ -9208,6 +9216,8 @@ function assertAcceptedTaskRegistryUsesExactOperationGrants(): void {
   const context = registry.currentTaskContext(registry.cursor([]));
   assertEqual(context?.targets.includes(targetPath), true, 'current task context includes exact operation grant target when task targets are empty');
   assertEqual(context?.capabilities.includes('fs.write'), true, 'current task context includes exact operation grant capability');
+  assertEqual(context?.acceptanceCriteria?.[0], 'Kernel records the grant-backed write fact.', 'current task context keeps accepted task acceptance criteria');
+  assertEqual(context?.failureCriteria?.[0], 'Stop if the grant-backed write leaves the reviewed scope.', 'current task context keeps accepted task failure criteria');
 }
 
 function assertPlanContextIndexBuildsPlanReadModels(): void {
@@ -14693,6 +14703,8 @@ async function assertSessionDriverLoopAcceptedImplementationPlanAutoExecutesBatc
   assertEqual(llmRequests.length, 1, 'accepted implementationPlan execution calls provider once');
   const promptText = llmRequests.flatMap((request) => request.messages.map((message) => message.content)).join('\n');
   assert(promptText.includes('Accepted execution sanitized context'), 'accepted execution sends sanitized context');
+  assert(promptText.includes('CurrentTaskAcceptance: Kernel records the generic output write fact.'), 'accepted execution exposes current task acceptance criteria');
+  assert(promptText.includes('CurrentTaskStopOrReplan: Stop if the write leaves the accepted target scope.'), 'accepted execution exposes current task failure criteria');
   assert(!promptText.includes(originalRequest), 'accepted execution does not re-expand the original user request');
   assert(!promptText.includes('Accepted execution contract context'), 'accepted execution does not send raw contract JSON');
   assert(!promptText.includes('taskOrder='), 'accepted execution does not expose taskOrder in provider text');

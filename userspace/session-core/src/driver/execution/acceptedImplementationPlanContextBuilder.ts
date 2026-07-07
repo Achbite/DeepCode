@@ -58,6 +58,8 @@ export class AcceptedImplementationPlanContextBuilder {
         title: stringValue(record.title),
         capability: stringValue(record.capability),
         targets: this.ports.acceptedPlanTaskTargets(record),
+        acceptanceCriteria: stringArrayValue(record.acceptanceCriteria),
+        failureCriteria: stringArrayValue(record.failureCriteria),
         dependencies: legacyDependencies,
         conflictKeys,
         batchKind: executionSliceRoleValue(record.batchKind) ?? executionSliceRoleValue(record.role),

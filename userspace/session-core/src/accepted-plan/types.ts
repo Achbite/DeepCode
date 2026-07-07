@@ -23,6 +23,8 @@ export interface CurrentTaskContext {
   taskTitle?: string;
   targets: string[];
   capabilities: string[];
+  acceptanceCriteria?: string[];
+  failureCriteria?: string[];
   taskOrder: string[];
   pendingTaskIds: string[];
   dependsOn: string[];
@@ -36,6 +38,8 @@ export interface AcceptedImplementationPlanTaskContext {
   title?: string;
   capability?: string;
   targets: string[];
+  acceptanceCriteria?: string[];
+  failureCriteria?: string[];
   dependencies: string[];
   conflictKeys: string[];
   batchKind?: ExecutionSliceRole;

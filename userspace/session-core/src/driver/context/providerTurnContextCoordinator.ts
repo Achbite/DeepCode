@@ -218,6 +218,8 @@ export class ProviderTurnContextCoordinator<State extends ProviderTurnContextSta
     const taskId = stringValue(currentTask?.taskId) ?? 'none';
     const taskTitle = stringValue(currentTask?.taskTitle);
     const targets = stringArray(currentTask?.targets);
+    const acceptanceCriteria = stringArray(currentTask?.acceptanceCriteria);
+    const failureCriteria = stringArray(currentTask?.failureCriteria);
     const completedCount = Array.isArray(accepted?.completedTaskIds) ? accepted.completedTaskIds.length : 0;
     const taskCount = Array.isArray(accepted?.tasks) ? accepted.tasks.length : 0;
     return [
@@ -226,8 +228,10 @@ export class ProviderTurnContextCoordinator<State extends ProviderTurnContextSta
       `ConfirmedPlan: planId=${planId}${title ? `; title=${oneLine(title, 240)}` : ''}${summary ? `; summary=${oneLine(summary, 360)}` : ''}`,
       `TaskLedger: completedByKernelFacts=${completedCount}; totalTasks=${taskCount}`,
       `CurrentTaskFrame: taskId=${taskId}${taskTitle ? `; title=${oneLine(taskTitle, 240)}` : ''}${targets.length ? `; targets=${targets.join(', ')}` : ''}`,
+      acceptanceCriteria.length ? `CurrentTaskAcceptance: ${acceptanceCriteria.map((item) => oneLine(item, 240)).join(' | ')}` : '',
+      failureCriteria.length ? `CurrentTaskStopOrReplan: ${failureCriteria.map((item) => oneLine(item, 240)).join(' | ')}` : '',
       'Use TaskFrame, ResourceEvidence, AccessIndex, ErrorContext, and NextActionInstruction as the execution authority for this turn.',
-    ].join('\n');
+    ].filter(Boolean).join('\n');
   }
 
   private acceptedExecutionCapabilitySummary(state: State): string {

@@ -26,6 +26,8 @@ export interface BuildProviderTurnContractInput {
     title?: string;
     goal?: string;
     targets?: string[];
+    acceptanceCriteria?: string[];
+    failureCriteria?: string[];
   };
   resourceEvidenceRefs?: string[];
   accessSummary?: string;
@@ -270,6 +272,8 @@ export class ContextFrameBuilder {
       title: context.taskTitle,
       goal: context.goal,
       targets: [...context.targets],
+      acceptanceCriteria: [...(context.acceptanceCriteria ?? [])],
+      failureCriteria: [...(context.failureCriteria ?? [])],
     };
   }
 

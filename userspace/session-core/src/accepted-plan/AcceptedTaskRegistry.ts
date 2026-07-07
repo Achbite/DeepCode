@@ -122,6 +122,8 @@ export class AcceptedTaskRegistry {
       taskTitle: task?.title,
       targets,
       capabilities,
+      acceptanceCriteria: task?.acceptanceCriteria ?? [],
+      failureCriteria: task?.failureCriteria ?? [],
       taskOrder: cursor.taskOrder,
       pendingTaskIds: cursor.pendingTaskIds,
       dependsOn: [],
