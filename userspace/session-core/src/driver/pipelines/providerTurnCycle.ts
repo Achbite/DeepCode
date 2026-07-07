@@ -1,7 +1,7 @@
 import type { AgentSessionResult } from '@deepcode/protocol';
 import type { ProposalEnvelope } from '../../protocol/types.js';
 import type { PromptEnvelope } from '../../prompt/types.js';
-import type { ProposalRouterResult } from '../proposal/proposalRouter.js';
+import type { ProposalRouterResult, RoutedProposal } from '../proposal/proposalRouter.js';
 
 export interface ProviderTurnCycleState {
   sessionId: string;
@@ -17,11 +17,13 @@ export interface ProviderTurnCyclePorts<Input, State extends ProviderTurnCycleSt
   refreshRuntimeState(state: State): void;
   prepareProviderContext(input: Input, state: State, lastResult: AgentSessionResult): Promise<ProviderTurnCycleContextResult>;
   callProviderAndParse(input: Input, state: State, prompt: PromptEnvelope): Promise<ProposalEnvelope>;
-  route(input: {
+  routeProposal(proposal: ProposalEnvelope): RoutedProposal;
+  executeRoutedProposal(input: {
     input: Input;
     state: State;
     prompt: PromptEnvelope;
     proposal: ProposalEnvelope;
+    routed: RoutedProposal;
     lastResult: AgentSessionResult;
   }): Promise<ProposalRouterResult>;
   appendDriverFailure(state: State, error: unknown): Promise<AgentSessionResult | null | undefined>;
@@ -53,11 +55,13 @@ export class ProviderTurnCycle<Input, State extends ProviderTurnCycleState> {
       if (driverFailure) return { kind: 'return', result: driverFailure };
       return { kind: 'return', result: await this.ports.appendProviderFailure(state, error) };
     }
-    const routed = await this.ports.route({
+    const routedProposal = this.ports.routeProposal(proposal);
+    const routed = await this.ports.executeRoutedProposal({
       input: input.input,
       state,
       prompt,
       proposal,
+      routed: routedProposal,
       lastResult: providerContext.lastResult,
     });
     if (routed.kind === 'return') {

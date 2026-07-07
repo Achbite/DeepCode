@@ -1237,10 +1237,8 @@ export class SessionDriverLoop {
         }),
       callProviderAndParse: (handlerInput, state, prompt) =>
         this.providerProposalCoordinator.callAndParse(handlerInput, state, prompt),
-      route: (routerInput) => this.proposalRouteExecutor.execute({
-        ...routerInput,
-        routed: this.proposalRouter.route(routerInput.proposal),
-      }),
+      routeProposal: (proposal) => this.proposalRouter.route(proposal),
+      executeRoutedProposal: (routerInput) => this.proposalRouteExecutor.execute(routerInput),
       appendDriverFailure: async (state, error) => {
         if (!(error instanceof SessionDriverLoopError)) return null;
         return this.agentRunReactor.append(state.sessionId, [
