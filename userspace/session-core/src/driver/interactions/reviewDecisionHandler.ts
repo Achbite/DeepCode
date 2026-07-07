@@ -50,6 +50,19 @@ export interface ReviewDecisionResumeInput {
   projectMemoryMode?: ProjectMemoryMode;
 }
 
+export interface ReviewDecisionRunCommand {
+  readonly kind: 'resolveReviewDecision';
+  readonly input: ReviewDecisionHandlerInput;
+}
+
+export type ReviewDecisionRunEffect =
+  | { readonly kind: 'reviewDecisionNoop'; readonly result: AgentSessionResult }
+  | { readonly kind: 'reviewRejected'; readonly result: AgentSessionResult }
+  | { readonly kind: 'reviewRevisionRequested'; readonly result: AgentSessionResult }
+  | { readonly kind: 'reviewAccepted'; readonly result: AgentSessionResult }
+  | { readonly kind: 'reviewContinuationChoiceRequired'; readonly result: AgentSessionResult }
+  | { readonly kind: 'reviewContinuationStarted'; readonly result: AgentSessionResult };
+
 export interface ReviewDecisionHandlerPorts {
   now(): string;
   createId(prefix: string): string;
@@ -93,11 +106,17 @@ export class ReviewDecisionHandler {
   constructor(private readonly ports: ReviewDecisionHandlerPorts) {}
 
   async resolve(input: ReviewDecisionHandlerInput): Promise<AgentSessionResult> {
+    const effect = await this.execute({ kind: 'resolveReviewDecision', input });
+    return effect.result;
+  }
+
+  private async execute(command: ReviewDecisionRunCommand): Promise<ReviewDecisionRunEffect> {
+    const input = command.input;
     const events = input.existingEvents ?? [];
     const activeReview = this.ports.reviewAssembler.findLatestActiveReviewInteraction(events);
     const review = this.ports.reviewAssembler.findWaitingReview(events, input.runId, activeReview);
     if (!review || this.ports.reviewAssembler.reviewAlreadyResolved(events, review)) {
-      return this.appendNoop(input);
+      return { kind: 'reviewDecisionNoop', result: await this.appendNoop(input) };
     }
 
     if (input.decision === 'reject') {
@@ -130,7 +149,7 @@ export class ReviewDecisionHandler {
   private async reject(
     input: ReviewDecisionHandlerInput,
     review: NonNullable<ReturnType<ReviewAssembler['findWaitingReview']>>
-  ): Promise<AgentSessionResult> {
+  ): Promise<ReviewDecisionRunEffect> {
     let result = await this.ports.append(input.sessionId, [
       this.ports.reviewDecisionProjection.event({
         sessionId: input.sessionId,
@@ -163,15 +182,16 @@ export class ReviewDecisionHandler {
       },
     });
     result = await this.ports.appendProjectedKernelEvents(input.sessionId, decisionReply);
-    return this.ports.append(input.sessionId, [
+    result = await this.ports.append(input.sessionId, [
       this.reviewRunStateEvent(input.sessionId, review, 'cancelled', 'cancelled', 'session-run-cancelled-review'),
     ]) ?? result;
+    return { kind: 'reviewRejected', result };
   }
 
   private async revise(
     input: ReviewDecisionHandlerInput,
     review: NonNullable<ReturnType<ReviewAssembler['findWaitingReview']>>
-  ): Promise<AgentSessionResult> {
+  ): Promise<ReviewDecisionRunEffect> {
     let result = await this.ports.append(input.sessionId, [
       this.ports.reviewDecisionProjection.event({
         sessionId: input.sessionId,
@@ -184,18 +204,19 @@ export class ReviewDecisionHandler {
       }),
     ]);
     result = await this.recordRevisionAudit(input, review) ?? result;
-    return this.ports.resumeUserTurn(decisionContinuationInput(input, {
+    result = await this.ports.resumeUserTurn(decisionContinuationInput(input, {
       content: this.ports.reviewAssembler.revisionRequest(review, input.guidance),
       attachments: [],
       existingEvents: result.events,
     }));
+    return { kind: 'reviewRevisionRequested', result };
   }
 
   private async accept(
     input: ReviewDecisionHandlerInput,
     events: AgentEvent[],
     review: NonNullable<ReturnType<ReviewAssembler['findWaitingReview']>>
-  ): Promise<AgentSessionResult> {
+  ): Promise<ReviewDecisionRunEffect> {
     const terminalAcceptedPlan = this.ports.reviewAssembler.isTerminalAcceptedPlan(events, review);
     const accepted = this.ports.reviewDecisionProjection.event({
       sessionId: input.sessionId,
@@ -248,10 +269,10 @@ export class ReviewDecisionHandler {
           this.reviewRunStateEvent(input.sessionId, review, 'completed', 'completed', 'session-run-completed-review'),
         ]) ?? result;
       }
-      return result;
+      return { kind: 'reviewAccepted', result };
     }
     if (continuationMode === 'ask') {
-      return this.ports.append(input.sessionId, [
+      result = await this.ports.append(input.sessionId, [
         this.ports.reviewDecisionProjection.continuationPromptEvent({
           sessionId: input.sessionId,
           review,
@@ -260,13 +281,15 @@ export class ReviewDecisionHandler {
           id: this.ports.createId('review-continuation-choice'),
         }),
       ]) ?? result;
+      return { kind: 'reviewContinuationChoiceRequired', result };
     }
-    return this.ports.resumeUserTurn(decisionContinuationInput(input, {
+    result = await this.ports.resumeUserTurn(decisionContinuationInput(input, {
       content: this.ports.reviewAssembler.continuationRequest(review),
       attachments: [],
       existingEvents: result.events,
       reviewContinuationMode: continuationMode,
     }));
+    return { kind: 'reviewContinuationStarted', result };
   }
 
   private async recordRevisionAudit(
