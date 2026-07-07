@@ -622,6 +622,13 @@ function assertProviderTurnSnapshotRecordsContextAdmissionShape(): void {
       resourceRef: `file-${token}.txt`,
       readPolicy: 'autoRead',
       reason: 'Read generic evidence.',
+    }, {
+      id: `dir-${token}`,
+      kind: 'directory',
+      label: `Directory ${token}`,
+      resourceRef: `dir-${token}`,
+      readPolicy: 'autoRead',
+      reason: 'Read generic directory evidence.',
     }],
     budget: { maxEntries: 4, maxBytes: 4096 },
     defaultDenyPatterns: [],
@@ -646,13 +653,21 @@ function assertProviderTurnSnapshotRecordsContextAdmissionShape(): void {
     manifest,
     request: {
       id: `request-${token}`,
-      items: [{ id: `item-${token}`, manifestEntryId: `entry-${token}`, reason: 'Read generic evidence.' }],
+      items: [
+        { id: `item-${token}`, manifestEntryId: `entry-${token}`, reason: 'Read generic evidence.' },
+        { id: `dir-item-${token}`, manifestEntryId: `dir-${token}`, reason: 'Read generic directory evidence.' },
+      ],
     },
     kernelEvidence: {
       [`entry-${token}`]: {
         contentKind: 'fileText',
         promptContent: `generic content ${token}`,
         evidenceRefs: [`evidence-${token}`],
+      },
+      [`dir-${token}`]: {
+        contentKind: 'directoryTree',
+        promptContent: `dir-${token}/\n  child-${token}.txt`,
+        evidenceRefs: [`dir-evidence-${token}`],
       },
     },
   });
@@ -706,7 +721,8 @@ function assertProviderTurnSnapshotRecordsContextAdmissionShape(): void {
   const accessSummary = accessFrame?.summary ?? '';
   assert(accessSummary.includes(`ref=file-${token}.txt`), 'provider turn access index records resource identity');
   assert(accessSummary.includes('range=full-or-directory'), 'provider turn access index records resource range identity');
-  assert(accessSummary.includes('use=full evidence is available'), 'provider turn access index records reuse instruction');
+  assert(accessSummary.includes('use=file text is available'), 'provider turn access index records file text reuse instruction');
+  assert(accessSummary.includes('use=directory inventory is available'), 'provider turn access index records directory inventory reuse instruction');
   const snapshot = buildProviderTurnSnapshot(contract);
   assertEqual(snapshot.schemaVersion, 'deepcode.session.provider-turn-snapshot.v1', 'provider turn snapshot has schema version');
   assertEqual(snapshot.segmentOrder.length > 0, true, 'provider turn snapshot records segment order');
