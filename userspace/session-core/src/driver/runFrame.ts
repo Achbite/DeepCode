@@ -285,6 +285,48 @@ export class SessionDriverRepairRuntimeAccessor {
   }
 }
 
+export interface SessionDriverActiveTurnRuntimeState {
+  activeTurn?: ActiveTurnState;
+}
+
+export class SessionDriverActiveTurnRuntimeAccessor {
+  constructor(private readonly state: SessionDriverActiveTurnRuntimeState) {}
+
+  ensure(stage: string | undefined, createId: (prefix: string) => string): ActiveTurnState {
+    const activeTurn = this.state.activeTurn ?? {
+      turnId: createId('active-turn'),
+      seq: 0,
+      stage: stage ?? 'provider_call',
+    };
+    activeTurn.stage = stage ?? activeTurn.stage;
+    this.state.activeTurn = activeTurn;
+    return activeTurn;
+  }
+
+  advance(stage: string | undefined, createId: (prefix: string) => string): ActiveTurnState {
+    const activeTurn = this.ensure(stage, createId);
+    activeTurn.seq += 1;
+    this.state.activeTurn = activeTurn;
+    return activeTurn;
+  }
+}
+
+export interface SessionDriverNativeToolRuntimeState {
+  nativeToolDuplicateRepairAttempted: boolean;
+}
+
+export class SessionDriverNativeToolRuntimeAccessor {
+  constructor(private readonly state: SessionDriverNativeToolRuntimeState) {}
+
+  duplicateRepairAttempted(): boolean {
+    return this.state.nativeToolDuplicateRepairAttempted === true;
+  }
+
+  markDuplicateRepairAttempted(): void {
+    this.state.nativeToolDuplicateRepairAttempted = true;
+  }
+}
+
 export interface SessionDriverInteractionState {
   interactionOverlay?: InteractionOverlayContext;
 }

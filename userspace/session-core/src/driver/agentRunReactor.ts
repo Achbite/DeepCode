@@ -6,6 +6,7 @@ import type {
   KernelReply,
   ProjectionDelta,
 } from '@deepcode/protocol';
+import { SessionDriverActiveTurnRuntimeAccessor } from './runFrame.js';
 
 export interface AgentRunReactorState {
   sessionId: string;
@@ -79,14 +80,10 @@ export class AgentRunReactor<State extends AgentRunReactorState = AgentRunReacto
     delta: Omit<ProjectionDelta, 'sessionId' | 'runId' | 'turnId' | 'seq'>
   ): Promise<void> {
     if (!this.input.ports.onProjectionDelta) return;
-    const activeTurn = state.activeTurn ?? {
-      turnId: this.id('active-turn'),
-      seq: 0,
-      stage: delta.stage ?? 'provider_call',
-    };
-    activeTurn.seq += 1;
-    activeTurn.stage = delta.stage ?? activeTurn.stage;
-    state.activeTurn = activeTurn;
+    const activeTurn = new SessionDriverActiveTurnRuntimeAccessor(state).advance(
+      delta.stage,
+      (prefix) => this.id(prefix)
+    );
     const activity = delta.activity ?? this.input.kernelProjection.projectionDeltaActivity({
       runId: state.runId,
       delta,

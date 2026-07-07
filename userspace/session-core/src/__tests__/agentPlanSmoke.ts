@@ -81,8 +81,11 @@ import { PermissionDecisionHandler, PlanDecisionHandler, RequirementDecisionHand
 import { HookPolicy, HookRegistry, HookRuntime } from '../driver/hooks/index.js';
 import { RunEngine } from '../driver/runEngine.js';
 import {
+  SessionDriverActiveTurnRuntimeAccessor,
+  SessionDriverNativeToolRuntimeAccessor,
   SessionDriverProviderRuntimeAccessor,
   SessionDriverRepairRuntimeAccessor,
+  type ActiveTurnState,
   type DriverProviderTurnFrame,
   type ModelContextBundle,
 } from '../driver/runFrame.js';
@@ -8569,6 +8572,24 @@ function assertSessionDriverRuntimeAccessors(): void {
   repairRuntime.markAttempted('planReviewRepairAttempted');
   assertEqual(repairState.planReviewRepairAttempted, true, 'repair runtime accessor writes repair flag');
   assertEqual(repairRuntime.attempted('planReviewRepairAttempted'), true, 'repair runtime accessor reads active repair flag');
+
+  const activeTurnState: { activeTurn?: ActiveTurnState } = {};
+  const activeTurnRuntime = new SessionDriverActiveTurnRuntimeAccessor(activeTurnState);
+  const activeTurn = activeTurnRuntime.ensure(`stage-${suffix}`, (prefix) => `${prefix}-${suffix}`);
+  assertEqual(activeTurn.turnId, `active-turn-${suffix}`, 'active turn runtime accessor creates active turn id');
+  assertEqual(activeTurn.stage, `stage-${suffix}`, 'active turn runtime accessor initializes active turn stage');
+  const advancedTurn = activeTurnRuntime.advance(undefined, (prefix) => `${prefix}-unused`);
+  assertEqual(advancedTurn.seq, 1, 'active turn runtime accessor advances sequence');
+  assertEqual(advancedTurn.stage, `stage-${suffix}`, 'active turn runtime accessor preserves stage when none is supplied');
+  activeTurnRuntime.advance(`stage-next-${suffix}`, (prefix) => `${prefix}-unused`);
+  assertEqual(activeTurnState.activeTurn?.stage, `stage-next-${suffix}`, 'active turn runtime accessor updates stage');
+
+  const nativeToolState = { nativeToolDuplicateRepairAttempted: false };
+  const nativeToolRuntime = new SessionDriverNativeToolRuntimeAccessor(nativeToolState);
+  assertEqual(nativeToolRuntime.duplicateRepairAttempted(), false, 'native tool runtime accessor reads inactive duplicate repair guard');
+  nativeToolRuntime.markDuplicateRepairAttempted();
+  assertEqual(nativeToolState.nativeToolDuplicateRepairAttempted, true, 'native tool runtime accessor writes duplicate repair guard');
+  assertEqual(nativeToolRuntime.duplicateRepairAttempted(), true, 'native tool runtime accessor reads active duplicate repair guard');
 }
 
 function assertAcceptedTaskRegistryUsesExactOperationGrants(): void {

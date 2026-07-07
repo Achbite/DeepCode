@@ -21,6 +21,7 @@ import type {
 } from '../../provider/providerStreamParts.js';
 import type { PromptEnvelope } from '../../prompt/types.js';
 import type { DriverProviderTurnFrame } from '../runFrame.js';
+import { SessionDriverNativeToolRuntimeAccessor } from '../runFrame.js';
 import type { NativeToolRepairDuplicate } from './nativeToolRepairCoordinator.js';
 import type { NativeToolRepairRunner } from './nativeToolRepairRunner.js';
 import type { NativeToolHandlerPortsFactory } from './nativeToolHandlerPortsFactory.js';
@@ -154,14 +155,13 @@ export class NativeToolProviderCoordinator<
     duplicates: Array<{ toolCall: NativeToolCallProposal; signature: NativeToolReadSignature; entry: NativeToolReadLedgerEntry }>
   ): Promise<ProposalEnvelope> {
     const acceptedExecution = this.acceptedExecution(state);
+    const nativeRuntime = new SessionDriverNativeToolRuntimeAccessor(state);
     const result = await this.dependencies.repairRunner.repairDuplicate({
       state,
       turn,
       duplicates,
-      duplicateRepairAttempted: state.nativeToolDuplicateRepairAttempted,
-      markDuplicateRepairAttempted: () => {
-        state.nativeToolDuplicateRepairAttempted = true;
-      },
+      duplicateRepairAttempted: nativeRuntime.duplicateRepairAttempted(),
+      markDuplicateRepairAttempted: () => nativeRuntime.markDuplicateRepairAttempted(),
       emitProjectionDelta: (runState, delta) => this.dependencies.emitProjectionDelta(runState, delta),
       buildRepairMessages: (repairTurn, repairDuplicates, repairAcceptedExecution) =>
         this.dependencies.buildDuplicateRepairMessages(prompt, state, repairTurn, repairDuplicates, repairAcceptedExecution),

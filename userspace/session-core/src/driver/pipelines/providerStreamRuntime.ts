@@ -9,6 +9,7 @@ import type {
 } from '@deepcode/protocol';
 import { ProviderPartFrameParser, type ProviderToolCallBuffer } from '../../provider/providerStreamParts.js';
 import type { ProviderStreamCoordinator, ProviderStreamVisibleLanguage } from './providerStreamCoordinator.js';
+import { SessionDriverActiveTurnRuntimeAccessor } from '../runFrame.js';
 
 export interface ProviderStreamRuntimeActiveTurn {
   turnId: string;
@@ -213,11 +214,10 @@ export class ProviderStreamRuntime<TState extends ProviderStreamRuntimeState> {
     stage: string,
     content: string
   ): Promise<void> {
-    const activeTurn = state.activeTurn ?? {
-      turnId: this.dependencies.createId('active-turn'),
-      seq: 0,
+    const activeTurn = new SessionDriverActiveTurnRuntimeAccessor(state).ensure(
       stage,
-    };
+      (prefix) => this.dependencies.createId(prefix)
+    );
     activeTurn.providerJsonStreamProgress ??= {};
     const progress = activeTurn.providerJsonStreamProgress[stage] ?? {
       receivedChars: 0,
@@ -225,7 +225,6 @@ export class ProviderStreamRuntime<TState extends ProviderStreamRuntimeState> {
     };
     progress.receivedChars += content.length;
     activeTurn.providerJsonStreamProgress[stage] = progress;
-    state.activeTurn = activeTurn;
 
     const shouldEmit = progress.lastEmittedChars === 0 ||
       progress.receivedChars - progress.lastEmittedChars >= 1_500;
@@ -256,13 +255,11 @@ export class ProviderStreamRuntime<TState extends ProviderStreamRuntimeState> {
     stage: string,
     content: string
   ): AgentStreamPartFrame[] {
-    const activeTurn = state.activeTurn ?? {
-      turnId: this.dependencies.createId('active-turn'),
-      seq: 0,
+    const activeTurn = new SessionDriverActiveTurnRuntimeAccessor(state).ensure(
       stage,
-    };
+      (prefix) => this.dependencies.createId(prefix)
+    );
     activeTurn.partFrameParser ??= new ProviderPartFrameParser();
-    state.activeTurn = activeTurn;
     return activeTurn.partFrameParser.push(content);
   }
 
