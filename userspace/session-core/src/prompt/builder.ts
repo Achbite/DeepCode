@@ -87,6 +87,13 @@ export function buildPromptEnvelope(input: PromptEnvelopeBuilderInput): PromptEn
       ].join('\n'),
     },
     {
+      name: 'agentInterventionContract',
+      priority: 2.5,
+      stable: true,
+      cacheClass: 'globalStable',
+      content: agentInterventionContractSummary(),
+    },
+    {
       priority: 3,
       stable: false,
       cacheClass: 'turnDynamic',
@@ -256,12 +263,7 @@ function agentInterventionPolicySummary(input: PromptEnvelopeBuilderInput): stri
   const level = input.interventionLevel === 'low' || input.interventionLevel === 'high'
     ? input.interventionLevel
     : 'medium';
-  const lines = [
-    `Agent user intervention level: ${level}.`,
-    'When a user-facing engineering choice is needed, use kind="decisionRequest" with one concise question, 2-3 mutually exclusive options, exactly one recommended option, short impact descriptions, and allowsFreeform=true.',
-    'decisionRequest is a short intermediate planning checkpoint; do not replace it with an actionBundle and do not include source code, patches, or executable commands.',
-    'Plan review is the default confirmation path for reviewable assumptions. Prefer taskPlan with explicit assumptions and review checkpoints over decisionRequest unless no valid taskPlan can be formed without the user choosing first.',
-  ];
+  const lines = [`Agent user intervention level: ${level}.`];
   if (level === 'low') {
     lines.push('Low: ask only for permission boundaries, protocol or architecture changes, broad rewrites, destructive work, cross-project writes, or validation scope expansion after failure. Choose ordinary implementation details yourself and list assumptions in the later plan.');
   } else if (level === 'high') {
@@ -269,8 +271,16 @@ function agentInterventionPolicySummary(input: PromptEnvelopeBuilderInput): stri
   } else {
     lines.push('Medium: ask for choices that materially affect implementation direction, including directory/module layout, external library or runtime strategy, Docker/script workflow, validation approach, architecture boundary expansion, protocol or permission changes, and broad refactors. Do not interrupt for routine local implementation details.');
   }
-  lines.push('All user-visible question, option labels, descriptions, recommendation wording, narration, and summaries must follow the current user language.');
   return lines.join('\n');
+}
+
+function agentInterventionContractSummary(): string {
+  return [
+    'Agent intervention contract: when a user-facing engineering choice is needed, use kind="decisionRequest" with one concise question, 2-3 mutually exclusive options, exactly one recommended option, short impact descriptions, and allowsFreeform=true.',
+    'decisionRequest is a short intermediate planning checkpoint; do not replace it with an actionBundle and do not include source code, patches, or executable commands.',
+    'Plan review is the default confirmation path for reviewable assumptions. Prefer taskPlan with explicit assumptions and review checkpoints over decisionRequest unless no valid taskPlan can be formed without the user choosing first.',
+    'All user-visible question, option labels, descriptions, recommendation wording, narration, and summaries must follow the current user language.',
+  ].join('\n');
 }
 
 function currentResourceResultsSummary(input: PromptEnvelopeBuilderInput): string {

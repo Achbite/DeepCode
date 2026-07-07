@@ -9,6 +9,7 @@ export interface PromptSystemLayer {
     | 'protocolContract'
     | 'builtinSystemPrompt'
     | 'systemStructure'
+    | 'agentInterventionContract'
     | 'toolCatalogSummary'
     | 'rulerContext'
     | 'authoritativeDocExcerpts'

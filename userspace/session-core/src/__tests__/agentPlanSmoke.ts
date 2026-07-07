@@ -8870,6 +8870,9 @@ function assertPromptEnvelope(): void {
   assert(!prompt.stablePrefix.includes('actionBundle payload:'), 'prompt avoids ambiguous actionBundle payload wording');
   assert(!prompt.stablePrefix.includes('at most 4 codeBlocks'), 'prompt does not impose a codeBlock count limit');
   assert(prompt.stablePrefix.includes('<systemStructure'), 'prompt includes the system structure layer');
+  assert(prompt.stablePrefix.includes('<agentInterventionContract'), 'prompt keeps stable intervention contract in the protected prefix');
+  assert(prompt.dynamicSuffix.includes('Agent user intervention level: medium.'), 'dynamic suffix carries the current intervention level');
+  assert(!prompt.dynamicSuffix.includes('decisionRequest is a short intermediate planning checkpoint'), 'dynamic suffix does not repeat stable intervention contract text');
   assert(prompt.stablePrefix.includes('black-box validation'), 'prompt treats tests as black-box validation');
   assert(prompt.stablePrefix.includes('Do not optimize for known tests'), 'prompt rejects test-specific optimization');
   assert(prompt.stablePrefix.includes('fixed prompts'), 'prompt forbids fixed prompt special-casing');
@@ -10073,6 +10076,10 @@ function assertContextAssemblerCachePlan(): void {
   assert(
     base.contextAssembly.partitionRecords.find((partition) => partition.name === 'PlatformProtocolContract')?.segmentNames.includes('protocolContract') === true,
     'platform protocol partition contains the protocol contract segment'
+  );
+  assert(
+    base.contextAssembly.partitionRecords.find((partition) => partition.name === 'AgentOperatingContract')?.segmentNames.includes('agentInterventionContract') === true,
+    'agent operating contract contains the stable intervention contract'
   );
   assert(
     base.contextAssembly.partitionRecords.find((partition) => partition.name === 'AgentOperatingContract')?.segmentNames.includes('agentInterventionPolicy') !== true,
