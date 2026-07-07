@@ -8461,9 +8461,37 @@ function assertProviderRepairMessageBuilderAvoidsDuplicateActionBundleReference(
     .map((message) => typeof message.content === 'string' ? message.content : JSON.stringify(message.content))
     .join('\n');
   const shapeLine = 'The nested actionBundle object must include {version,id,goal,actions,...};';
+  const compactionRepair = new ProviderRepairMessageBuilder().actionBundleCompactionRepairMessages(prompt, {
+    runId: `run-${token}`,
+    userRequest: `Repair accepted task ${token}`,
+    conversationRoots: [],
+    resourcePackets: [],
+    implementationBatch: {},
+    acceptedContext: {
+      currentTask: { taskId: `task-${token}`, targets: [`target-${token}.txt`], capability: 'fs.write' },
+      currentTaskActionTemplates: [{
+        intentId: `template-${token}`,
+        operation: 'fs.write',
+        targets: [`target-${token}.txt`],
+        template: { toolId: 'fs.write', args: { path: `target-${token}.txt` } },
+      }],
+    },
+    currentTaskContext: {
+      taskId: `task-${token}`,
+      taskTitle: `Task ${token}`,
+      goal: `Handle target ${token}`,
+      targets: [`target-${token}.txt`],
+      capabilities: ['fs.write'],
+    },
+    completedTaskCount: 0,
+  }, 'Payload budget exceeded.', '{invalid}')
+    .map((message) => typeof message.content === 'string' ? message.content : JSON.stringify(message.content))
+    .join('\n');
 
   assertEqual(joined.split(shapeLine).length - 1, 1, 'repair prompt includes the full actionBundle shape reference only once');
+  assertEqual(compactionRepair.split(shapeLine).length - 1, 1, 'compaction repair keeps one full actionBundle shape reference');
   assert(joined.includes('<ProviderTurnContract schemaVersion="deepcode.session.provider-turn-contract.v1">'), 'repair prompt includes ProviderTurnContract');
+  assert(compactionRepair.includes('<ProviderTurnContract schemaVersion="deepcode.session.provider-turn-contract.v1">'), 'compaction repair includes ProviderTurnContract');
   assert(joined.includes('Minimal actionBundle skeleton'), 'repair prompt keeps a minimal actionBundle skeleton for invalid actionBundle errors');
   const validationLine = 'actionBundle.validationExpectations[] are optional reviewable validation notes shaped';
   assertEqual(joined.split(validationLine).length - 1, 1, 'repair quick reference does not duplicate actionBundle validation schema lines');
