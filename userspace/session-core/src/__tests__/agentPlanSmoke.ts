@@ -8691,6 +8691,8 @@ function assertPromptEnvelope(): void {
   assert(prompt.stablePrefix.includes('tokenizer branches'), 'prompt forbids tokenizer-specific branches');
   assert(prompt.stablePrefix.includes('example-specific branches'), 'prompt forbids example-specific logic');
   assert(prompt.stablePrefix.includes('<protectedStablePrefix'), 'prompt starts with explicit protected stable prefix boundary');
+  assert(prompt.stablePrefix.includes('Turn-specific schema digests and tool intent summaries are dynamic context'), 'stable prefix records schema/tool intent summaries as dynamic context');
+  assert(!prompt.stablePrefix.includes('tool catalog summaries must stay before project memory'), 'stable prefix no longer treats schema/tool summaries as protected prefix content');
   assert(prompt.stableLayerNames[0] === 'protectedStablePrefix', 'protected stable prefix is the first stable layer');
   assert(!prompt.stablePrefix.includes('Current workflow state'), 'stable prefix excludes current workflow state');
   assert(!prompt.stablePrefix.includes('Recent user turn'), 'stable prefix excludes session-local memory hints');
