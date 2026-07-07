@@ -1495,7 +1495,7 @@ function assertNativeToolResumeMessageBuilderAppendsToolMessages(): void {
 
   assertEqual(messages.length, 4, 'native tool resume message builder appends assistant and tool messages');
   assertEqual(messages[2]?.role, 'assistant', 'native tool resume message builder places assistant resume before tool result');
-  assertEqual((messages[2] as any).reasoningContent, `reasoning-${token}`, 'native tool resume message builder preserves reasoning content');
+  assertEqual((messages[2] as any).reasoningContent, undefined, 'native tool resume message builder does not replay private reasoning');
   assertEqual((messages[2] as any).toolCalls[0].id, toolCall.callId, 'native tool resume message builder converts native tool call to protocol call');
   assertEqual(messages[3]?.role, 'tool', 'native tool resume message builder appends tool message after assistant');
 }
