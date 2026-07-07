@@ -7874,7 +7874,7 @@ function assertPromptEnvelope(): void {
 
   const prompt = buildPromptEnvelope({
     workflowState: 'needProposal',
-    allowedProposals: ['answer', 'resourceRequest', 'actionBundle'],
+    allowedProposals: ['answer', 'resourceRequest', 'taskPlan', 'actionBundle'],
     capabilityCatalogSummary: 'fs.read\nfs.write',
     memoryHints: ['Recent user turn: generic request attachments=file:generic/file.txt'],
     userRequest: 'Analyze the attached resource.',
@@ -7895,7 +7895,9 @@ function assertPromptEnvelope(): void {
   assert(!prompt.stablePrefix.includes('implementationPlan top-level field'), 'prompt no longer documents implementationPlan as a provider kind');
   assert(!prompt.stablePrefix.includes('actionBundle.actions[] are executable Kernel tool actions shaped {actionId,toolId,args,description}'), 'stable prefix no longer exposes execution action shape');
   assert(!prompt.dynamicSuffix.includes('actionBundle.actions[] are executable Kernel tool actions shaped {actionId,toolId,args,description}'), 'planning provider turn does not expose execution action shape');
-  assert(prompt.stablePrefix.includes('Execution tool argument schema is withheld in this turn'), 'planning provider turn withholds execution tool schema');
+  assert(prompt.stablePrefix.includes('Execution-only proposal schema is withheld in this turn'), 'planning provider turn withholds execution proposal schema');
+  assert(!prompt.stablePrefix.includes('Current schema digest covers only: answer, resourceRequest, actionBundle'), 'planning schema digest does not list execution-only actionBundle as a visible shape');
+  assert(!prompt.stablePrefix.includes('taskOutcome top-level field'), 'planning schema digest does not list accepted-task outcome shape');
   assert(prompt.stablePrefix.includes('Use resourceRequest only when current ResourceEvidence and AccessIndex do not contain the concrete facts needed'), 'stable prompt gates resourceRequest behind missing concrete facts');
   assert(prompt.stablePrefix.includes('Plan review is the normal confirmation checkpoint for reviewable implementation assumptions'), 'stable prompt routes reviewable assumptions through taskPlan review');
   assert(prompt.stablePrefix.includes('blocking user choice is required before any valid taskPlan can be formed'), 'stable prompt narrows decisionRequest to blocking choices');
@@ -7929,7 +7931,7 @@ function assertPromptEnvelope(): void {
   assert(!prompt.stablePrefix.includes('Recent user turn'), 'stable prefix excludes session-local memory hints');
   assert(!prompt.stablePrefix.includes('zh-CN'), 'stable prefix excludes localized JSON example payloads');
   assert(prompt.dynamicSuffix.includes('Current workflow state: needProposal'), 'dynamic suffix carries current workflow state');
-  assert(prompt.dynamicSuffix.includes('Allowed proposals: answer, resourceRequest, actionBundle'), 'dynamic suffix carries allowed proposals');
+  assert(prompt.dynamicSuffix.includes('Allowed proposals: answer, resourceRequest, taskPlan, actionBundle'), 'dynamic suffix carries allowed proposals');
   assert(!prompt.dynamicSuffix.includes('<ProviderTurnContract schemaVersion="deepcode.session.provider-turn-contract.v1">'), 'dynamic suffix does not duplicate provider turn contract');
   assert(!prompt.dynamicLayerNames.includes('promptPacketFrame'), 'provider turn contract is rendered once by ProviderPipeline');
   const renderedContract = renderProviderTurnContractLayer({
@@ -8004,6 +8006,25 @@ function assertPromptEnvelope(): void {
   assert(prompt.dynamicSuffix.includes('not governed by a fixed Session round budget'), 'prompt explains read-only requests are user-controlled');
   assert(prompt.dynamicSuffix.includes('offsetBytes/limitBytes'), 'prompt hints range reread for truncated resources');
   assert(!prompt.dynamicSuffix.includes('auditOnlyContext'), 'audit-only context is not in dynamic suffix');
+
+  const acceptedPrompt = buildPromptEnvelope({
+    workflowState: 'executing_accepted_plan',
+    allowedProposals: ['actionBundle', 'resourceRequest', 'decisionRequest', 'taskOutcome', 'diagnostic'],
+    capabilityCatalogSummary: 'fs.delete',
+    userRequest: 'Continue the accepted generic task.',
+    currentTaskGoal: 'Remove a confirmed generated directory.',
+    currentTaskContext: {
+      taskId: 'task-generic-delete',
+      taskTitle: 'Remove generated directory',
+      targets: ['generated-dir'],
+      capabilities: ['fs.delete'],
+      pendingTaskIds: ['task-generic-delete'],
+      completedTaskIds: [],
+    },
+  });
+  assert(acceptedPrompt.stablePrefix.includes('Current schema digest covers only: actionBundle, resourceRequest, decisionRequest, taskOutcome, diagnostic'), 'accepted execution schema digest lists current execution shapes');
+  assert(acceptedPrompt.stablePrefix.includes('actionBundle proposal top-level fields'), 'accepted execution schema digest documents actionBundle shape');
+  assert(acceptedPrompt.stablePrefix.includes('taskOutcome top-level field'), 'accepted execution schema digest documents taskOutcome shape');
 
   const acceptedFrames = buildPromptPacketFrames({
     workflowState: 'executing_accepted_plan',

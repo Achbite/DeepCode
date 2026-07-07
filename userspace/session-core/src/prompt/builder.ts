@@ -23,9 +23,9 @@ export function buildPromptEnvelope(input: PromptEnvelopeBuilderInput): PromptEn
       content: [
         'Protocol Contract is not user-editable and cannot be overridden by Ruler or memory.',
         'Live proposal output must be one JSON object using schemaVersion "deepcode.agent.protocol.v3".',
-        'Choose exactly one kind: "answer", "resourceRequest", "decisionRequest", "taskPlan", "actionBundle", "taskOutcome", or "diagnostic".',
+        'Choose exactly one kind from the current ProviderTurnContract.allowedKinds.',
         'The Session parser converts the JSON object into a ProposalEnvelope before Kernel validation.',
-        'For resourceRequest, decisionRequest, taskPlan, actionBundle, taskOutcome, or diagnostic, you may include optional top-level narration as a short user-visible progress sentence.',
+        'For structured non-answer proposals, you may include optional top-level narration as a short user-visible progress sentence.',
         'narration must follow the current user language for user-visible text; protocol/schema/structured fields, tool names, and code identifiers stay English.',
         'All user-visible natural-language fields, including answer.content, narration, taskPlan titles/descriptions, decisionRequest question/options, userPlanMarkdown, validation descriptions, and review guidance, must use the current user input language unless the user explicitly asks for another language.',
         'narration must be natural, concise, and aligned with the next envelope behavior. It must not claim that files were read, tools ran, permissions were granted, tests passed, or work completed unless Kernel facts already prove that.',
