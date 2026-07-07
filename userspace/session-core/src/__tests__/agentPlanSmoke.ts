@@ -8582,9 +8582,11 @@ function assertProviderRepairMessageBuilderScopesNativeRepairReferences(): void 
   assertEqual(duplicateBeforeAccepted.split(shapeLine).length - 1, 0, 'pre-plan duplicate native read repair does not expose actionBundle shape');
   assert(!beforeAccepted.includes('No executable tool intent templates are visible'), 'pre-plan native repair omits redundant non-executable tool template prose');
   assert(beforeAccepted.includes('[ToolIntentTemplates]\n\n- none\n\n[/ToolIntentTemplates]'), 'pre-plan native repair leaves tool intent templates empty');
+  assert(!beforeAccepted.includes('ToolIntentTemplates or currentTaskCapabilities'), 'pre-plan native repair does not mention action tool intent selection');
   assertEqual(scopeRepair.split(shapeLine).length - 1, 0, 'accepted-plan scope repair relies on current task contract instead of full actionBundle shape');
   assertEqual(planReviewRepair.split(shapeLine).length - 1, 0, 'plan review repair relies on Kernel report and provider turn contract instead of full actionBundle shape');
   assert(scopeRepair.includes('ProviderTurnContract'), 'scope repair still includes provider turn contract');
+  assert(scopeRepair.includes('current task action templates in ProviderTurnContract'), 'scope repair keeps actionBundle repair tool intent guidance');
   assert(scopeRepair.includes('currentTaskActionTemplates'), 'scope repair still exposes current task action templates');
   assert(planReviewRepair.includes('ProviderTurnContract'), 'plan review repair still includes provider turn contract');
 }
