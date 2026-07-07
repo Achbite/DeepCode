@@ -62,6 +62,7 @@ import {
   type PlanContext as SessionPlanContext,
 } from './proposal/index.js';
 import type { LlmTurnResult, SessionDriverLoopRunState } from './runFrame.js';
+import { RunEngine } from './runEngine.js';
 import { diag, isEmptyResponseError, objectRecord, SessionDriverLoopError, stringValue, visibleLanguageForRequest } from './runtimeSupport.js';
 import { AgentRunReactor } from './agentRunReactor.js';
 import {
@@ -172,6 +173,7 @@ export class SessionDriverLoop {
   private readonly providerRuntimeBridge: ProviderRuntimeBridge<SessionDriverLoopRunState, LlmTurnResult>;
   private readonly providerTurnContextCoordinator: ProviderTurnContextCoordinator<SessionDriverLoopRunState>;
   private readonly providerTurnCycle: ProviderTurnCycle<SessionDriverLoopInput, SessionDriverLoopRunState>;
+  private readonly runEngine: RunEngine<SessionDriverLoopInput, SessionDriverLoopRunState>;
   private readonly runLifecyclePipeline: RunLifecyclePipeline<SessionDriverLoopRunState>;
   private readonly providerTurnRunner: ProviderTurnRunner<SessionDriverLoopRunState>;
 
@@ -1262,6 +1264,46 @@ export class SessionDriverLoop {
           ),
         ]),
     });
+    this.runEngine = new RunEngine<SessionDriverLoopInput, SessionDriverLoopRunState>({
+      initialize: (runInput) => this.runLifecyclePipeline.initialize(runInput),
+      shouldBuildRequirementConfirmation: (runInput) =>
+        this.requirementConfirmationCoordinator.shouldBuild(runInput),
+      waitForRequirementDecision: async (runInput, state) => {
+        try {
+          const event = await this.requirementConfirmationCoordinator.build(runInput, state);
+          state.phase = 'waiting_requirement_confirmation';
+          const payload = objectRecord(event.payload) ?? {};
+          return this.agentRunReactor.append(runInput.sessionId, [
+            event,
+            sessionProgressProjectionBuilder.sessionRunStateEvent({
+              sessionId: runInput.sessionId,
+              runId: state.runId,
+              phase: 'waiting_requirement_confirmation',
+              reason: 'requirement',
+              decisionOwner: {
+                kind: 'requirement',
+                runId: state.runId,
+                targetId: stringValue(payload.requirementId),
+                requirementId: stringValue(payload.requirementId),
+              },
+              ts: this.agentRunReactor.ts(),
+              id: this.agentRunReactor.id('session-run-waiting-requirement'),
+            }),
+          ]);
+        } catch (error) {
+          const message = error instanceof SessionDriverLoopError ? error.message : String(error);
+          return this.agentRunReactor.append(runInput.sessionId, [
+            assistantProjectionBuilder.finalDiagnosticEvent(
+              runInput.sessionId,
+              diag('requirementConfirmationFailed', message, { message }),
+              this.agentRunReactor.ts(),
+              this.agentRunReactor.id('requirement-confirmation-failed')
+            ),
+          ]);
+        }
+      },
+      runProviderTurn: (cycleInput) => this.providerTurnCycle.run(cycleInput),
+    });
   }
 
   async resolveDecision(input: SessionDecisionResolverInput): Promise<AgentSessionResult> {
@@ -1269,62 +1311,19 @@ export class SessionDriverLoop {
   }
 
   async runUserTurn(input: SessionDriverLoopInput): Promise<AgentSessionResult> {
-    const sessionId = input.sessionId;
-    const lifecycle = await this.runLifecyclePipeline.initialize(input);
-    const state = lifecycle.state;
-    let lastResult = lifecycle.lastResult;
-
-    if (this.requirementConfirmationCoordinator.shouldBuild(input)) {
-      try {
-        const event = await this.requirementConfirmationCoordinator.build(input, state);
-        state.phase = 'waiting_requirement_confirmation';
-        const payload = objectRecord(event.payload) ?? {};
-        return this.agentRunReactor.append(sessionId, [
-          event,
-          sessionProgressProjectionBuilder.sessionRunStateEvent({
-            sessionId,
-            runId: state.runId,
-            phase: 'waiting_requirement_confirmation',
-            reason: 'requirement',
-            decisionOwner: {
-              kind: 'requirement',
-              runId: state.runId,
-              targetId: stringValue(payload.requirementId),
-              requirementId: stringValue(payload.requirementId),
-            },
-            ts: this.agentRunReactor.ts(),
-            id: this.agentRunReactor.id('session-run-waiting-requirement'),
-          }),
-        ]);
-      } catch (error) {
-        const message = error instanceof SessionDriverLoopError ? error.message : String(error);
-        return this.agentRunReactor.append(sessionId, [
-          assistantProjectionBuilder.finalDiagnosticEvent(
-            sessionId,
-            diag('requirementConfirmationFailed', `Requirement confirmation generation failed: ${message}`, { message }),
-            this.agentRunReactor.ts(),
-            this.agentRunReactor.id('requirement-confirmation-failed')
-          ),
-        ]);
-      }
+    try {
+      return await this.runEngine.run(input);
+    } catch (error) {
+      const message = error instanceof SessionDriverLoopError ? error.message : String(error);
+      return this.agentRunReactor.append(input.sessionId, [
+        assistantProjectionBuilder.finalDiagnosticEvent(
+          input.sessionId,
+          diag('runEngineFailed', `Session RunEngine failed: ${message}`, { message }),
+          this.agentRunReactor.ts(),
+          this.agentRunReactor.id('run-engine-failed')
+        ),
+      ]);
     }
-
-    while (true) {
-      const cycle = await this.providerTurnCycle.run({
-        input,
-        state,
-        lastResult,
-      });
-      if (cycle.kind === 'return') {
-        return cycle.result;
-      }
-      lastResult = cycle.lastResult;
-      if (cycle.proposal.kind === 'resourceRequest') {
-        continue;
-      }
-    }
-
-    return lastResult;
   }
 
 }
