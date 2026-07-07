@@ -291,10 +291,10 @@ export class RequirementDecisionHandler {
     }
 
     const executionRoot = plan.executionRoot ?? this.ports.executionRootFromDecision(input, current.events);
-    const acceptedPlan = this.ports.acceptedPlanLedger.withLatestCheckpoint(
-      this.ports.buildAcceptedImplementationPlan({ plan, interventionLevel: input.interventionLevel, executionRoot }),
-      current.events
-    );
+    const acceptedPlan = this.ports.acceptedPlanLedger.recoverLatestCheckpoint({
+      acceptedPlan: this.ports.buildAcceptedImplementationPlan({ plan, interventionLevel: input.interventionLevel, executionRoot }),
+      events: current.events,
+    }).nextAcceptedPlan;
     const selectedEffect = this.ports.userInputPipeline.selectedRequirementDecisionOptionEffect(decisionEvent)
       ?? (input.decision === 'accept' ? this.ports.userInputPipeline.defaultRequirementDecisionOptionEffect(confirmation) : undefined);
     const nextAcceptedPlan = this.ports.acceptedPlanScopeDecisionOverlay.apply(acceptedPlan, selectedEffect);
@@ -520,7 +520,10 @@ export class RequirementDecisionHandler {
       return undefined;
     }
     const mergedCompletedTaskIds = [...accepted.completedTaskIds, ...newlyCompleted];
-    const nextAccepted = this.ports.acceptedPlanLedger.afterBatch(accepted, mergedCompletedTaskIds);
+    const nextAccepted = this.ports.acceptedPlanLedger.recordTaskCompletion({
+      acceptedPlan: accepted,
+      completedTaskIds: mergedCompletedTaskIds,
+    }).nextAcceptedPlan;
     const remainingTaskIds = accepted.tasks
       .map((task) => task.taskId)
       .filter((id) => !mergedCompletedTaskIds.includes(id));
@@ -578,7 +581,10 @@ export class RequirementDecisionHandler {
       ?? (runId ? this.ports.planIndex.latestExecutablePlan(events, runId) : null);
     if (!plan || !plan.implementationPlan) return undefined;
     const base = this.ports.buildAcceptedImplementationPlan({ plan, interventionLevel: undefined, executionRoot: plan.executionRoot });
-    return this.ports.acceptedPlanLedger.withLatestCheckpoint(base, events);
+    return this.ports.acceptedPlanLedger.recoverLatestCheckpoint({
+      acceptedPlan: base,
+      events,
+    }).nextAcceptedPlan;
   }
 
   private resumeParentFlow(

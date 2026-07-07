@@ -131,8 +131,8 @@ export const driverInteractionIndex = new DriverInteractionIndex({
   findPlanCard: (events, runId, planId) => planContextIndex.findPlanCard(events, runId, planId),
   executionRootFromDecision: (input, events) => AcceptedPlanExecutionRootResolver.fromDecision(input, events),
   buildAcceptedPlan: (input) => acceptedImplementationPlanContextBuilder().build(input),
-  withLatestCheckpoint: (acceptedPlan, events) => acceptedPlanTaskLedger().withLatestCheckpoint(acceptedPlan, events),
-  afterBatch: (acceptedPlan, completedTaskIds) => acceptedPlanTaskLedger().afterBatch(acceptedPlan, completedTaskIds),
+  recoverLatestCheckpoint: (input) => acceptedPlanTaskLedger().recoverLatestCheckpoint(input),
+  recordTaskCompletion: (input) => acceptedPlanTaskLedger().recordTaskCompletion(input),
 });
 export const kernelEventProjectionBuilder = new KernelEventProjectionBuilder({
   requiredFileOperationsFromReport: (report) => planReviewGrantProjector.requiredFileOperationsFromReport(report),
@@ -181,8 +181,8 @@ export const reviewProjectionBuilder = new ReviewProjectionBuilder<SessionPlanCo
     ? acceptedImplementationPlanContextBuilder().build({ plan, interventionLevel: undefined, executionRoot: plan.executionRoot })
     : undefined,
   acceptedPlanBatchCompletedTaskIds: (acceptedPlan, plan, kernelEvents) =>
-    acceptedPlanTaskLedger().batchProgress({ acceptedPlan, proposal: planContextIndex.proposalEnvelope(plan), kernelEvents }).completedTaskIds,
-  acceptedPlanAfterBatch: (acceptedPlan, completedTaskIds) => acceptedPlanTaskLedger().afterBatch(acceptedPlan, completedTaskIds),
+    acceptedPlanTaskLedger().recordKernelBatchProgress({ acceptedPlan, proposal: planContextIndex.proposalEnvelope(plan), kernelEvents }).completedTaskIds,
+  acceptedPlanAfterBatch: (acceptedPlan, completedTaskIds) => acceptedPlanTaskLedger().recordTaskCompletion({ acceptedPlan, completedTaskIds }).nextAcceptedPlan,
   acceptedPlanTaskLedger: (acceptedPlan) => acceptedPlanTaskLedger().ledger(acceptedPlan),
   buildReviewFactsContext: (input) => buildReviewFactsContext(input),
 });
