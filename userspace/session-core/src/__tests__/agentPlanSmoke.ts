@@ -10006,6 +10006,7 @@ function assertResourcePromptBlocksStabilize(): void {
       'directory-root': {
         contentKind: 'directoryTree',
         promptContent: directoryInventory,
+        contentSummary: 'Generic directory resolver summary without inventory entries.',
       },
     },
   });

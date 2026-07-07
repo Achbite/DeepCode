@@ -176,9 +176,11 @@ function resourceSummary(item: ResourcePacketItem, content: string, retention: R
   if (retention === 'error') return item.denialReason ?? 'Resource read failed.';
   if (item.status === 'skipped') return item.skipMessage ?? item.contentSummary ?? 'Resource was skipped by Kernel content policy.';
   if (retention === 'handleOnly') return item.contentSummary ?? 'Resource handle only; request a focused range if full content is needed.';
-  if (isInformativeSummary(item.contentSummary)) return item.contentSummary!.trim();
   const normalized = normalizeContent(content);
   if (item.contentKind === 'directoryTree') {
+    if (!normalized) {
+      return item.contentSummary ?? 'Directory inventory handle only; request a focused directory read if file listing is needed.';
+    }
     if (normalized.length <= DIRECTORY_TREE_SUMMARY_CHAR_LIMIT) return normalized;
     return [
       normalized.slice(0, DIRECTORY_TREE_SUMMARY_CHAR_LIMIT - SUMMARY_TAIL_CHARS),
@@ -186,6 +188,7 @@ function resourceSummary(item: ResourcePacketItem, content: string, retention: R
       normalized.slice(-SUMMARY_TAIL_CHARS),
     ].join('\n');
   }
+  if (isInformativeSummary(item.contentSummary)) return item.contentSummary!.trim();
   if (normalized.length <= SUMMARY_HEAD_CHARS + SUMMARY_TAIL_CHARS + 40) {
     return normalized;
   }
