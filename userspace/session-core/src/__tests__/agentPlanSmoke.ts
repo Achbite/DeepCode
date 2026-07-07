@@ -14134,7 +14134,20 @@ async function assertSessionDriverLoopAcceptedScopeExecutesReviewedDirectoryDele
 }
 
 async function assertSessionDriverLoopAcceptedImplementationPlanAutoExecutesBatch(): Promise<void> {
-  const events = [acceptedImplementationPlanCardEvent('session-accepted-plan-auto', 'run-accepted-plan-auto')];
+  const token = randomSmokeToken('accepted-exec-original');
+  const originalRequest = `T60_FULL_ORIGINAL_REQUEST_${token}_SHOULD_NOT_BE_REEXPANDED`;
+  const events: AgentEvent[] = [
+    {
+      id: `event-${token}-user`,
+      sessionId: 'session-accepted-plan-auto',
+      ts: '2026-01-01T00:00:00.000Z',
+      kind: 'user_msg',
+      payload: {
+        content: originalRequest,
+      },
+    },
+    acceptedImplementationPlanCardEvent('session-accepted-plan-auto', 'run-accepted-plan-auto'),
+  ];
   const session: AgentSession = {
     id: 'session-accepted-plan-auto',
     mode: 'plan',
@@ -14229,6 +14242,7 @@ async function assertSessionDriverLoopAcceptedImplementationPlanAutoExecutesBatc
   assertEqual(llmRequests.length, 1, 'accepted implementationPlan execution calls provider once');
   const promptText = llmRequests.flatMap((request) => request.messages.map((message) => message.content)).join('\n');
   assert(promptText.includes('Accepted execution sanitized context'), 'accepted execution sends sanitized context');
+  assert(!promptText.includes(originalRequest), 'accepted execution does not re-expand the original user request');
   assert(!promptText.includes('Accepted execution contract context'), 'accepted execution does not send raw contract JSON');
   assert(!promptText.includes('taskOrder='), 'accepted execution does not expose taskOrder in provider text');
   assert(!promptText.includes('pendingTasks='), 'accepted execution does not expose pending task ids in provider text');

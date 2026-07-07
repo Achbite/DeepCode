@@ -120,7 +120,7 @@ export class ProviderTurnContextCoordinator<State extends ProviderTurnContextSta
       workflowState: state.stateContract?.stateId ?? state.driverRequest?.kind ?? 'needProposal',
       allowedProposals,
       capabilityCatalogSummary: this.ports.capabilityCatalogSummary(state),
-      memoryDocument: state.memoryDocument,
+      memoryDocument: acceptedExecution ? undefined : state.memoryDocument,
       projectMemoryMode: input.projectMemoryMode,
       extraMemoryHints: this.ports.memoryHints(state),
       interventionLevel: input.interventionLevel,
