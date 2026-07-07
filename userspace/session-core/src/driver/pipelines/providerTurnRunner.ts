@@ -194,7 +194,7 @@ export class ProviderTurnRunner<TState extends ProviderTurnRunnerState> {
     }
     await this.dependencies.traceRecorder.append(state, `${stage}.response`, result.data, ports);
     const reasoning = collectReasoning(result.data);
-    if (reasoning.trim()) {
+    if (reasoning.trim() && this.dependencies.streamCoordinator.exposesReasoningTrace(stage)) {
       await ports.appendEvents(state.sessionId, [
         this.dependencies.reasoningEvent(state.sessionId, reasoning, this.dependencies.now(), this.dependencies.createId(`reasoning-${stage}`)),
       ]);

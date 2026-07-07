@@ -99,6 +99,7 @@ export class ProviderStreamRuntime<TState extends ProviderStreamRuntimeState> {
       return;
     }
     if (event.type === 'provider_reasoning_delta' && chunk?.content) {
+      if (!this.dependencies.streamCoordinator.exposesReasoningTrace(stage)) return;
       await this.bufferProviderReasoningDelta(state, stage, reasoningBuffer, chunk);
       return;
     }

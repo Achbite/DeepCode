@@ -8901,6 +8901,9 @@ function assertPromptEnvelope(): void {
   });
   assert(planningSchemaDigest.includes('decisionRequest top-level field'), 'schema digest keeps decisionRequest field shape');
   assert(planningSchemaDigest.includes('taskPlan top-level field'), 'schema digest keeps taskPlan field shape');
+  assert(planningSchemaDigest.includes('current turn schema selector'), 'schema digest is scoped to current turn selection');
+  assert(!planningSchemaDigest.includes('every live proposal is one JSON object'), 'schema digest does not repeat full protocol contract framing');
+  assert(planningSchemaDigest.length < 1500, 'planning schema digest remains a compact turn selector');
   assert(!planningSchemaDigest.includes('During planning, prefer taskPlan'), 'schema digest does not duplicate planning decision policy');
   assert(!planningSchemaDigest.includes('blocking user choice is required before any valid taskPlan'), 'schema digest does not duplicate decisionRequest policy');
   const renderedContract = renderProviderTurnContractLayer({
@@ -13228,7 +13231,7 @@ async function assertSessionDriverLoopCanonicalizesBareTaskPlanRepair(): Promise
           },
         };
       }
-      return jsonLlmResponse({
+      const repairedPlan = {
         version: '1',
         id: `task-plan-${token}`,
         title: 'Generic repaired task plan',
@@ -13245,7 +13248,18 @@ async function assertSessionDriverLoopCanonicalizesBareTaskPlanRepair(): Promise
         ],
         risks: ['Workspace writes remain under Kernel permission policy.'],
         reviewCheckpoints: ['Review Kernel facts after Complete stage execution.'],
-      });
+      };
+      return {
+        ok: true,
+        data: {
+          chunks: [{ type: 'reasoning_delta', content: `hidden repair reasoning ${token}` }, { type: 'done' }],
+          assistantMessage: {
+            role: 'assistant',
+            reasoningContent: `hidden repair reasoning ${token}`,
+            content: JSON.stringify(repairedPlan),
+          },
+        },
+      };
     },
     now: () => '2026-01-01T00:00:00.000Z',
     createId: (prefix) => `${prefix}-${events.length + submittedPlans.length + 1}`,
@@ -13259,6 +13273,14 @@ async function assertSessionDriverLoopCanonicalizesBareTaskPlanRepair(): Promise
   assertEqual(llmCalls, 2, 'invalid planning JSON triggers one protocol repair');
   assertEqual(submittedPlans.length, 0, 'bare repaired taskPlan remains non-executable');
   assertEqual(result.events.some((event) => event.kind === 'plan_card'), true, 'bare repaired taskPlan renders a plan card');
+  assertEqual(
+    result.events.some((event) =>
+      event.kind === 'assistant_msg' &&
+      String((event.payload as any)?.content ?? '').includes(`hidden repair reasoning ${token}`)
+    ),
+    false,
+    'protocol repair reasoning stays in provider trace instead of user-visible assistant messages'
+  );
   assertEqual(
     result.events.some((event) =>
       event.kind === 'assistant_msg' &&

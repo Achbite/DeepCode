@@ -91,29 +91,29 @@ export function providerVisibleSchemaDigest(input: PromptEnvelopeBuilderInput): 
     [...allowedKinds].filter((kind) => turnMode === 'acceptedTaskExecution' || (kind !== 'actionBundle' && kind !== 'taskOutcome'))
   );
   const schemaLines = [
-    'Agent Protocol v3 schema digest: every live proposal is one JSON object with schemaVersion="deepcode.agent.protocol.v3", kind, outputLanguage, optional narration, and the kind-specific top-level field allowed by the current ProviderTurnContract.',
+    'Agent Protocol v3 current turn schema selector: one JSON object; choose one ProviderTurnContract.allowedKinds kind.',
     `Current schema digest covers only: ${[...visibleSchemaKinds].join(', ') || 'none'}. reviewSummary is Session-generated from Kernel facts and must never be returned by the provider.`,
     visibleSchemaKinds.has('answer')
-      ? 'answer top-level field: answer.format="markdown" and answer.content contains the user-visible response.'
+      ? 'answer top-level field: answer.format="markdown"; answer.content is the user-visible response.'
       : '',
     visibleSchemaKinds.has('resourceRequest') ? resourceRequestProtocolShapeLine() : '',
     visibleSchemaKinds.has('decisionRequest')
-      ? 'decisionRequest top-level field: decisionRequest.version/id/question/reason/summary/options/allowsFreeform; question must be a non-empty user-visible string. Use 2-3 mutually exclusive options with one recommended option.'
+      ? 'decisionRequest top-level field: decisionRequest.version/id/question/options/allowsFreeform; question must be a non-empty user-visible string; use 2-3 mutually exclusive options with one recommended option.'
       : '',
     visibleSchemaKinds.has('taskPlan')
-      ? 'taskPlan top-level field: taskPlan.version/id/title/summary/tasks/risks/reviewCheckpoints. tasks[] is a Session-advanced ordered implementation queue; every task must include non-empty target or targets, acceptanceCriteria, and failureCriteria. Do not output scheduling graph structures, source code, codeBlocks, actionBundle, commandBlocks, patches, or executable tool calls.'
+      ? 'taskPlan top-level field: taskPlan.version/id/title/summary/tasks/risks/reviewCheckpoints. tasks[] is a Session-advanced ordered implementation queue; every task must include non-empty target or targets, acceptanceCriteria, and failureCriteria; no codeBlocks, actionBundle, commandBlocks, patches, source code, or scheduling graph structures.'
       : '',
     turnMode === 'acceptedTaskExecution' && visibleSchemaKinds.has('taskOutcome')
-      ? 'taskOutcome top-level field: taskOutcome.version/id/taskId/status/reason/evidenceRefs. Use it only during accepted task execution when the current task is already sufficiently satisfied and no Kernel write/delete action is needed.'
+      ? 'taskOutcome top-level field: taskOutcome.version/id/taskId/status/reason/evidenceRefs; use only when the current accepted task is already sufficiently satisfied and no Kernel write/delete action is needed.'
       : '',
     visibleSchemaKinds.has('diagnostic')
-      ? 'diagnostic top-level field: diagnostic.version/id/severity/summary/details; diagnostic explains terminal protocol/context failure and never queues execution.'
+      ? 'diagnostic top-level field: diagnostic.version/id/severity/summary/details; terminal explanation only, never execution.'
       : '',
   ].filter(Boolean);
   if (turnMode !== 'acceptedTaskExecution') {
     return [
       ...schemaLines,
-      'Execution-only proposal schema is withheld in this turn. If side-effect work is needed, output taskPlan unless the final NextActionInstruction explicitly requires another allowed kind.',
+      'Execution-only proposal schema is withheld in this turn. For side-effect work, output taskPlan unless the final NextActionInstruction explicitly requires another allowed kind.',
     ].join('\n');
   }
   return [
