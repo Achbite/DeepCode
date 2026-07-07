@@ -416,14 +416,16 @@ function buildProviderCacheAttribution(input: {
     dynamicMessageHash: input.dynamicSuffixHash,
     cacheEligiblePrefixCharLength: input.prompt.stablePrefix.length,
     cacheEligiblePrefixTokenEstimate: estimateTokens(input.prompt.stablePrefix.length),
-    changedPartitions: input.partitionRecords
+    partitionSnapshots: input.partitionRecords
       .filter((partition) => partition.charLength > 0)
       .map((partition) => ({
         name: partition.name,
         currentHash: partition.contentHash,
-        charDelta: partition.charLength,
+        charLength: partition.charLength,
+        stablePrefix: partition.stablePrefix,
         reason: cachePartitionReason(partition),
       })),
+    changedPartitions: [],
   };
 }
 

@@ -8672,7 +8672,8 @@ function assertContextAssemblerCachePlan(): void {
   assertEqual(base.cachePlan.providerCacheAttribution.cacheEligiblePrefixCharLength, base.prompt.stablePrefix.length, 'cache attribution records prefix char length');
   assertEqual(base.cachePlan.providerCacheAttribution.stableMessageHash, base.cachePlan.stablePrefixHash, 'cache attribution uses stable prefix hash');
   assertEqual(base.cachePlan.providerCacheAttribution.dynamicMessageHash, base.cachePlan.dynamicSuffixHash, 'cache attribution uses dynamic suffix hash');
-  assert(base.cachePlan.providerCacheAttribution.changedPartitions.some((partition) => partition.name === 'ProjectMemory'), 'cache attribution includes project memory partition');
+  assert(base.cachePlan.providerCacheAttribution.partitionSnapshots.some((partition) => partition.name === 'ProjectMemory'), 'cache attribution snapshots include project memory partition');
+  assertEqual(base.cachePlan.providerCacheAttribution.changedPartitions.length, 0, 'cache attribution does not report changes without a previous baseline');
   assertEqual(base.cachePlan.stablePrefixHash, followUp.cachePlan.stablePrefixHash, 'same stable layers keep stable prefix hash');
   assert(base.cachePlan.dynamicSuffixHash !== followUp.cachePlan.dynamicSuffixHash, 'current request changes dynamic suffix hash');
   assert(base.cachePlan.cacheHash !== followUp.cachePlan.cacheHash, 'overall cache hash changes with the dynamic suffix');
