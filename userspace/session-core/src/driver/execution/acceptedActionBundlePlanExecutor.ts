@@ -64,7 +64,7 @@ export interface AcceptedActionBundlePlanExecutorPorts {
   append(sessionId: string, events: AgentEvent[]): Promise<AgentSessionResult>;
   kernel(request: KernelCommandEnvelope): Promise<KernelReply>;
   appendProjectedKernelEvents(sessionId: string, reply: KernelReply): Promise<AgentSessionResult | undefined>;
-  resumeUserTurn(input: AcceptedActionBundlePlanResumeInput): Promise<AgentSessionResult>;
+  continueSameLoop(input: AcceptedActionBundlePlanResumeInput): Promise<AgentSessionResult>;
   kernelExecutionContractId(report?: Record<string, unknown>): string | undefined;
   temporaryGrantsForPlan(plan: PlanContext): unknown[];
   recentResourcePackets(events: AgentEvent[]): ResourcePacket[];
@@ -357,7 +357,7 @@ export class AcceptedActionBundlePlanExecutor {
           ),
         ]) ?? result;
         if (!this.ports.acceptedPlanComplete(nextAccepted)) {
-          return this.ports.resumeUserTurn(acceptedPlanContinuationInput(input, {
+          return this.ports.continueSameLoop(acceptedPlanContinuationInput(input, {
             content: this.ports.executionRequest(acceptedOverlay.plan, nextAccepted),
             attachments: nextAccepted.executionRoot ? [nextAccepted.executionRoot.attachment] : [],
             existingEvents: result.events,

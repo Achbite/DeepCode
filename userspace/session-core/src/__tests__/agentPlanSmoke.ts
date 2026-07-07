@@ -5139,7 +5139,7 @@ async function assertAcceptedActionBundlePlanExecutorSubmitsBatchAndReviews(): P
       } as AgentEvent)));
       return { session: { ...session, eventCount: store.length }, events: [...store] };
     },
-    resumeUserTurn: async () => {
+    continueSameLoop: async () => {
       throw new Error('single batch success should not resume provider loop');
     },
     kernelExecutionContractId: () => `contract-${token}`,

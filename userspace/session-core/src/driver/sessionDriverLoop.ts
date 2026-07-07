@@ -198,7 +198,7 @@ export class SessionDriverLoop {
       append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
       kernel: (request) => this.agentRunReactor.kernel(request),
       appendProjectedKernelEvents: (sessionId, reply) => this.agentRunReactor.appendProjectedKernelEvents(sessionId, reply),
-      resumeUserTurn: this.sameLoopContinuation.resumeUserTurn,
+      continueSameLoop: this.sameLoopContinuation.resumeUserTurn,
       kernelExecutionContractId: (report) => planReviewGrantProjector.kernelExecutionContractId(report),
       temporaryGrantsForPlan: (plan) => planReviewGrantProjector.temporaryGrantsForPlan(plan),
       recentResourcePackets: (events) => resourceRequestLoop.recentPackets(events),
