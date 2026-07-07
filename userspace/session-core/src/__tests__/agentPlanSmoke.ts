@@ -106,6 +106,8 @@ async function main(): Promise<void> {
   assertPromptEnvelope();
   assertDecisionContinuationInputKeepsDecisionResumeInSameLoop();
   await assertRunEngineContinuationUsesSameLifecycle();
+  await assertRunEngineContinuesOnlyForResourceRequestRoute();
+  await assertRunEngineRejectsUnexpectedContinueRoute();
   assertContextAssemblerCachePlan();
   assertProviderTurnContractFrameOrder();
   assertProviderTurnSnapshotRecordsContextAdmissionShape();
@@ -446,6 +448,112 @@ async function assertRunEngineContinuationUsesSameLifecycle(): Promise<void> {
     `initialize:session-${token}|maybe-requirement|provider:initialized`,
     'RunEngine continuation enters the same lifecycle through an explicit command'
   );
+}
+
+async function assertRunEngineContinuesOnlyForResourceRequestRoute(): Promise<void> {
+  const token = randomSmokeToken('run-engine-route');
+  const firstResult = genericSessionResult(`session-${token}`);
+  const finalResult = genericSessionResult(`session-final-${token}`);
+  const resourceProposal = genericProposal(`resource-${token}`, 'resourceRequest');
+  const answerProposal = genericProposal(`answer-${token}`, 'answer');
+  let providerTurns = 0;
+  const engine = new RunEngine<
+    { sessionId: string },
+    { sessionId: string; runId: string; phase: string }
+  >({
+    initialize: async (input) => ({
+      state: { sessionId: input.sessionId, runId: `run-${token}`, phase: 'initialized' },
+      lastResult: firstResult,
+    }),
+    shouldBuildRequirementConfirmation: () => false,
+    waitForRequirementDecision: async () => {
+      throw new Error('resource continuation smoke should not wait for requirement decision');
+    },
+    runProviderTurn: async () => {
+      providerTurns += 1;
+      if (providerTurns === 1) {
+        return {
+          kind: 'continue',
+          lastResult: firstResult,
+          proposal: resourceProposal,
+          routed: routeProposalKind(resourceProposal),
+        };
+      }
+      return {
+        kind: 'return',
+        result: finalResult,
+        proposal: answerProposal,
+        routed: routeProposalKind(answerProposal),
+      };
+    },
+  });
+
+  const output = await engine.run({ sessionId: `session-${token}` });
+  assertEqual(output, finalResult, 'RunEngine resumes provider after routed resourceRequest continuation');
+  assertEqual(providerTurns, 2, 'RunEngine limits continue loops to explicit resourceRequest evidence refresh');
+}
+
+async function assertRunEngineRejectsUnexpectedContinueRoute(): Promise<void> {
+  const token = randomSmokeToken('run-engine-route-guard');
+  const result = genericSessionResult(`session-${token}`);
+  const answerProposal = genericProposal(`answer-${token}`, 'answer');
+  const engine = new RunEngine<
+    { sessionId: string },
+    { sessionId: string; runId: string; phase: string }
+  >({
+    initialize: async (input) => ({
+      state: { sessionId: input.sessionId, runId: `run-${token}`, phase: 'initialized' },
+      lastResult: result,
+    }),
+    shouldBuildRequirementConfirmation: () => false,
+    waitForRequirementDecision: async () => {
+      throw new Error('route guard smoke should not wait for requirement decision');
+    },
+    runProviderTurn: async () => ({
+      kind: 'continue',
+      lastResult: result,
+      proposal: answerProposal,
+      routed: routeProposalKind(answerProposal),
+    }),
+  });
+
+  try {
+    await engine.run({ sessionId: `session-${token}` });
+  } catch (error) {
+    assert(
+      error instanceof Error && error.message.includes('provider continue requires resourceRequest route'),
+      'RunEngine rejects non-resourceRequest provider continue results'
+    );
+    return;
+  }
+  throw new Error('expected RunEngine to reject non-resourceRequest provider continue results');
+}
+
+function genericSessionResult(sessionId: string): AgentSessionResult {
+  return {
+    session: {
+      id: sessionId,
+      mode: 'plan',
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+      eventCount: 0,
+    },
+    events: [],
+  };
+}
+
+function genericProposal(id: string, kind: string): ProposalEnvelope {
+  return {
+    schemaVersion: 'deepcode.agent.protocol.v3',
+    proposalId: `proposal-${id}`,
+    runId: `run-${id}`,
+    sessionId: `session-${id}`,
+    source: 'llm',
+    kind,
+    payload: {},
+    referencedResourcePacketRefs: [],
+    referencedEvidenceRefs: [],
+  } as ProposalEnvelope;
 }
 
 function assertProviderTurnSnapshotRecordsContextAdmissionShape(): void {

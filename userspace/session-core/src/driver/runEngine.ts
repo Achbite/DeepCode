@@ -82,23 +82,12 @@ export class RunEngine<Input, State extends RunEngineState> {
       if (command.kind === 'callProviderAndParse') {
         if (!state || !lastResult) throw new Error('RunEngine provider state is missing.');
         const cycle = await this.ports.runProviderTurn({ input, state, lastResult });
-        if (cycle.kind === 'return') {
-          const effect: RunEffect<State> = {
-            kind: 'providerCycleReturned',
-            result: cycle.result,
-            proposal: cycle.proposal,
-            routed: cycle.routed,
-          };
+        const effect = this.effectFromProviderCycle(cycle);
+        if (effect.kind === 'providerCycleReturned') {
           return this.terminal(effect.result);
         }
-        const effect: RunEffect<State> = {
-          kind: 'resourceRequestContinue',
-          lastResult: cycle.lastResult,
-          proposal: cycle.proposal,
-          routed: cycle.routed,
-        };
         lastResult = effect.lastResult;
-        command = { kind: 'callProviderAndParse' };
+        command = this.nextCommandAfterResourceRequest(effect);
         continue;
       }
 
@@ -108,6 +97,36 @@ export class RunEngine<Input, State extends RunEngineState> {
 
   private nextCommandAfterContinuation(_effect: Extract<RunEffect<State>, { kind: 'continuationEntered' }>): RunCommand {
     return { kind: 'initializeRun' };
+  }
+
+  private effectFromProviderCycle(cycle: ProviderTurnCycleResult): Extract<
+    RunEffect<State>,
+    { kind: 'providerCycleReturned' } | { kind: 'resourceRequestContinue' }
+  > {
+    if (cycle.kind === 'return') {
+      return {
+        kind: 'providerCycleReturned',
+        result: cycle.result,
+        proposal: cycle.proposal,
+        routed: cycle.routed,
+      };
+    }
+    if (cycle.routed.kind !== 'resourceRequest') {
+      // A continue result means ResourceRequestLoop appended new evidence and the provider must retry.
+      throw new Error(`RunEngine provider continue requires resourceRequest route, got ${cycle.routed.kind}.`);
+    }
+    return {
+      kind: 'resourceRequestContinue',
+      lastResult: cycle.lastResult,
+      proposal: cycle.proposal,
+      routed: cycle.routed,
+    };
+  }
+
+  private nextCommandAfterResourceRequest(
+    _effect: Extract<RunEffect<State>, { kind: 'resourceRequestContinue' }>
+  ): RunCommand {
+    return { kind: 'callProviderAndParse' };
   }
 
   private terminal(result: AgentSessionResult): AgentSessionResult {
