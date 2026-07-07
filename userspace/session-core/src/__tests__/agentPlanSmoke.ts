@@ -8538,12 +8538,21 @@ function assertProviderRepairMessageBuilderScopesNativeRepairReferences(): void 
   } as ProposalEnvelope, [`target outside accepted scope ${token}`])
     .map((message) => typeof message.content === 'string' ? message.content : JSON.stringify(message.content))
     .join('\n');
+  const planReviewRepair = builder.planReviewRepairMessages(prompt, state, {
+    proposalId: `proposal-review-${token}`,
+    kind: 'actionBundle',
+    payload: { actionBundle: { actions: [] } },
+  } as ProposalEnvelope, { reasons: [`plan review issue ${token}`] })
+    .map((message) => typeof message.content === 'string' ? message.content : JSON.stringify(message.content))
+    .join('\n');
 
   assertEqual(beforeAccepted.split(shapeLine).length - 1, 0, 'pre-plan native side-effect repair does not expose actionBundle shape');
   assertEqual(duplicateBeforeAccepted.split(shapeLine).length - 1, 0, 'pre-plan duplicate native read repair does not expose actionBundle shape');
   assertEqual(scopeRepair.split(shapeLine).length - 1, 0, 'accepted-plan scope repair relies on current task contract instead of full actionBundle shape');
+  assertEqual(planReviewRepair.split(shapeLine).length - 1, 0, 'plan review repair relies on Kernel report and provider turn contract instead of full actionBundle shape');
   assert(scopeRepair.includes('ProviderTurnContract'), 'scope repair still includes provider turn contract');
   assert(scopeRepair.includes('currentTaskActionTemplates'), 'scope repair still exposes current task action templates');
+  assert(planReviewRepair.includes('ProviderTurnContract'), 'plan review repair still includes provider turn contract');
 }
 
 function assertPromptEnvelope(): void {
