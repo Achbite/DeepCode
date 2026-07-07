@@ -12,6 +12,7 @@ import type { KernelEventStatusIndex } from '../execution/kernelEventStatusIndex
 import type { SessionTurnPhase } from '../pipelines/interactionOverlayCodec.js';
 import type { ReviewAssembler } from '../review/reviewAssembler.js';
 import type { ReviewDecisionProjectionBuilder } from '../review/reviewDecisionProjection.js';
+import { decisionContinuationInput } from '../runContinuation.js';
 import type { InterventionLevel, ReviewContinuationMode } from '../types.js';
 
 export type ReviewDecisionHandlerDecision = 'accept' | 'reject' | 'revise';
@@ -183,20 +184,11 @@ export class ReviewDecisionHandler {
       }),
     ]);
     result = await this.recordRevisionAudit(input, review) ?? result;
-    return this.ports.resumeUserTurn({
-      sessionId: input.sessionId,
+    return this.ports.resumeUserTurn(decisionContinuationInput(input, {
       content: this.ports.reviewAssembler.revisionRequest(review, input.guidance),
       attachments: [],
       existingEvents: result.events,
-      workspaceBinding: input.workspaceBinding,
-      projectWorkingDirectory: input.projectWorkingDirectory,
-      profileId: input.profileId,
-      workflow: input.workflow,
-      appendUserMessage: false,
-      requirementConfirmationMode: 'off',
-      interventionLevel: input.interventionLevel,
-      projectMemoryMode: input.projectMemoryMode,
-    });
+    }));
   }
 
   private async accept(
@@ -269,21 +261,12 @@ export class ReviewDecisionHandler {
         }),
       ]) ?? result;
     }
-    return this.ports.resumeUserTurn({
-      sessionId: input.sessionId,
+    return this.ports.resumeUserTurn(decisionContinuationInput(input, {
       content: this.ports.reviewAssembler.continuationRequest(review),
       attachments: [],
       existingEvents: result.events,
-      workspaceBinding: input.workspaceBinding,
-      projectWorkingDirectory: input.projectWorkingDirectory,
-      profileId: input.profileId,
-      workflow: input.workflow,
-      appendUserMessage: false,
-      requirementConfirmationMode: 'off',
       reviewContinuationMode: continuationMode,
-      interventionLevel: input.interventionLevel,
-      projectMemoryMode: input.projectMemoryMode,
-    });
+    }));
   }
 
   private async recordRevisionAudit(

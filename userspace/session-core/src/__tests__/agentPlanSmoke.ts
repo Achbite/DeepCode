@@ -46,6 +46,7 @@ import {
 import { AcceptedPlanScopeMatcher, AcceptedTaskRegistry, type AcceptedImplementationPlanContext } from '../accepted-plan/index.js';
 import { AgentRunReactor } from '../driver/agentRunReactor.js';
 import { ContextFrameBuilder } from '../driver/context/contextFrameBuilder.js';
+import { decisionContinuationInput } from '../driver/runContinuation.js';
 import { renderProviderTurnContractLayer } from '../prompt/providerTurnContract.js';
 import { AcceptedPlanResourceResumeCoordinator, ActionBundleAdmissionResourceFollowupCoordinator, GeneratedArtifactEvidenceIndex, PathIdentity, ResourceEvidenceIndex, ResourceOrchestrator, ResourceRequestLoop, ResourceRequestRepairCoordinator, buildProviderTurnSnapshot } from '../driver/context/index.js';
 import {
@@ -100,6 +101,7 @@ async function main(): Promise<void> {
   await assertNativeToolRepairRunnerHandlesRepairs();
   assertProposalSemanticValidatorCanonicalizesAndDefaults();
   assertPromptEnvelope();
+  assertDecisionContinuationInputKeepsDecisionResumeInSameLoop();
   assertContextAssemblerCachePlan();
   assertProviderTurnContractFrameOrder();
   assertProviderTurnSnapshotRecordsContextAdmissionShape();
@@ -342,6 +344,44 @@ function assertProviderTurnContractFrameOrder(): void {
     String(planningContract.nextActionInstruction.summary ?? '').includes('do not re-audit protocol rules'),
     'planning provider turn keeps reasoning focused on current frames'
   );
+}
+
+function assertDecisionContinuationInputKeepsDecisionResumeInSameLoop(): void {
+  const token = randomSmokeToken('decision-continuation');
+  const sourceOverlay = {
+    parentRunId: `parent-${token}`,
+    parentPhase: 'waiting_plan_review' as const,
+    interactionRunId: `run-${token}`,
+    interactionId: `plan-${token}`,
+  };
+  const overrideOverlay = {
+    parentRunId: `parent-${token}`,
+    parentPhase: 'waiting_review' as const,
+    interactionRunId: `run-${token}`,
+    interactionId: `review-${token}`,
+  };
+  const input = decisionContinuationInput({
+    sessionId: `session-${token}`,
+    workspaceBinding: { workspaceId: `workspace-${token}` } as any,
+    projectWorkingDirectory: { path: `/tmp/workspace-${token}` } as any,
+    profileId: `profile-${token}`,
+    workflow: `workflow-${token}`,
+    reviewContinuationMode: 'ask',
+    interventionLevel: 'medium',
+    projectMemoryMode: 'auto',
+    interactionOverlay: sourceOverlay,
+  }, {
+    content: `continue ${token}`,
+    existingEvents: [],
+    reviewContinuationMode: 'auto',
+    interactionOverlay: overrideOverlay,
+    resumeResourcePackets: true,
+  });
+  assertEqual(input.appendUserMessage, false, 'decision continuation never appends a new user message');
+  assertEqual(input.requirementConfirmationMode, 'off', 'decision continuation does not re-enter requirement confirmation');
+  assertEqual(input.reviewContinuationMode, 'auto', 'decision continuation allows explicit continuation mode override');
+  assertEqual(input.interactionOverlay, overrideOverlay, 'decision continuation preserves the active owner override');
+  assertEqual(input.resumeResourcePackets, true, 'decision continuation can carry resource packets into the same loop');
 }
 
 function assertProviderTurnSnapshotRecordsContextAdmissionShape(): void {

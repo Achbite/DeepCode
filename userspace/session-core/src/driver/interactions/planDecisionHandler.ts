@@ -14,6 +14,7 @@ import type { InteractionOverlayContext, SessionTurnPhase } from '../pipelines/i
 import type { PlanContext, PlanContextIndex } from '../proposal/planContextIndex.js';
 import type { PlanProjectionBuilder } from '../projection/planProjectionBuilder.js';
 import type { InterventionLevel, ReviewContinuationMode } from '../types.js';
+import { decisionContinuationInput } from '../runContinuation.js';
 
 export type PlanDecisionHandlerDecision = 'accept' | 'reject' | 'revise';
 export type PlanDecisionHandlerContinuationMode = ReviewContinuationMode;
@@ -154,24 +155,15 @@ export class PlanDecisionHandler {
         interventionLevel: input.interventionLevel,
         executionRoot,
       });
-      return this.ports.resumeUserTurn({
-        sessionId: input.sessionId,
+      return this.ports.resumeUserTurn(decisionContinuationInput(input, {
         content: this.ports.executionRequest(plan, acceptedPlan, input.guidance),
         attachments: acceptedPlan.executionRoot ? [acceptedPlan.executionRoot.attachment] : [],
         existingEvents: result.events,
-        workspaceBinding: input.workspaceBinding,
-        projectWorkingDirectory: input.projectWorkingDirectory,
-        profileId: input.profileId,
-        workflow: input.workflow,
-        projectMemoryMode: input.projectMemoryMode,
-        appendUserMessage: false,
-        requirementConfirmationMode: 'off',
         reviewContinuationMode: input.reviewContinuationMode,
-        interventionLevel: input.interventionLevel,
         resumeResourcePackets: true,
         acceptedImplementationPlan: acceptedPlan,
         interactionOverlay: plan.interactionOverlay ?? input.interactionOverlay,
-      });
+      }));
     }
     const acceptedOverlay = this.ports.recoverAcceptedPlanFromOverlay(input, result.events, plan.interactionOverlay ?? input.interactionOverlay);
     return this.ports.executeAcceptedActionBundlePlan(input, plan, result, acceptedOverlay);
@@ -222,22 +214,13 @@ export class PlanDecisionHandler {
       }),
     ]);
     if (input.decision === 'revise') {
-      return this.ports.resumeUserTurn({
-        sessionId: input.sessionId,
+      return this.ports.resumeUserTurn(decisionContinuationInput(input, {
         content: this.ports.planRevisionRequest({ plan, guidance: input.guidance }),
         attachments: [],
         existingEvents: result.events,
-        workspaceBinding: input.workspaceBinding,
-        projectWorkingDirectory: input.projectWorkingDirectory,
-        profileId: input.profileId,
-        workflow: input.workflow,
-        appendUserMessage: false,
-        requirementConfirmationMode: 'off',
         reviewContinuationMode: input.reviewContinuationMode,
-        interventionLevel: input.interventionLevel,
-        projectMemoryMode: input.projectMemoryMode,
         interactionOverlay: plan.interactionOverlay ?? input.interactionOverlay,
-      });
+      }));
     }
 
     if (input.decision === 'reject') {
