@@ -2,6 +2,7 @@ import type { AgentSessionResult } from '@deepcode/protocol';
 import type { ProposalEnvelope } from '../protocol/types.js';
 
 export type RunEffect<State> =
+  | { readonly kind: 'continuationEntered' }
   | { readonly kind: 'initialized'; readonly state: State; readonly lastResult: AgentSessionResult }
   | { readonly kind: 'requirementDecisionRequired'; readonly result: AgentSessionResult }
   | { readonly kind: 'providerCycleReturned'; readonly result: AgentSessionResult }

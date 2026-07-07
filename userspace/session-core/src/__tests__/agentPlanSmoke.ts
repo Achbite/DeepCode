@@ -76,6 +76,7 @@ import { AssistantProjectionBuilder, DriverActivityBuilder, KernelEventProjectio
 import { AcceptedPlanReviewHandoffCoordinator, AcceptedPlanStaticSyntaxReviewCoordinator, ReviewAssembler, ReviewDecisionProjectionBuilder } from '../driver/review/index.js';
 import { PermissionDecisionHandler, PlanDecisionHandler, RequirementDecisionHandler, ReviewDecisionHandler } from '../driver/interactions/index.js';
 import { HookPolicy, HookRegistry, HookRuntime } from '../driver/hooks/index.js';
+import { RunEngine } from '../driver/runEngine.js';
 import { AcceptedPlanResourceResumePromptBuilder } from '../prompt/AcceptedPlanResourceResumePromptBuilder.js';
 import { ProviderRepairMessageBuilder } from '../prompt/ProviderRepairMessageBuilder.js';
 import { ResourceManifestBuilder } from '../resources/index.js';
@@ -102,6 +103,7 @@ async function main(): Promise<void> {
   assertProposalSemanticValidatorCanonicalizesAndDefaults();
   assertPromptEnvelope();
   assertDecisionContinuationInputKeepsDecisionResumeInSameLoop();
+  await assertRunEngineContinuationUsesSameLifecycle();
   assertContextAssemblerCachePlan();
   assertProviderTurnContractFrameOrder();
   assertProviderTurnSnapshotRecordsContextAdmissionShape();
@@ -394,6 +396,52 @@ function assertDecisionContinuationInputKeepsDecisionResumeInSameLoop(): void {
   assertEqual(minimal.attachments?.length, 0, 'decision continuation defaults missing attachments to an empty list');
   assertEqual(minimal.appendUserMessage, false, 'minimal continuation still does not append a new user message');
   assertEqual(minimal.requirementConfirmationMode, 'off', 'minimal continuation still avoids requirement reconfirmation');
+}
+
+async function assertRunEngineContinuationUsesSameLifecycle(): Promise<void> {
+  const token = randomSmokeToken('run-engine-continuation');
+  const calls: string[] = [];
+  const result: AgentSessionResult = {
+    session: {
+      id: `session-${token}`,
+      mode: 'plan',
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+      eventCount: 0,
+    },
+    events: [],
+  };
+  const engine = new RunEngine<
+    { sessionId: string },
+    { sessionId: string; runId: string; phase: string }
+  >({
+    initialize: async (input) => {
+      calls.push(`initialize:${input.sessionId}`);
+      return {
+        state: { sessionId: input.sessionId, runId: `run-${token}`, phase: 'initialized' },
+        lastResult: result,
+      };
+    },
+    shouldBuildRequirementConfirmation: () => {
+      calls.push('maybe-requirement');
+      return false;
+    },
+    waitForRequirementDecision: async () => {
+      throw new Error('continuation smoke should not wait for requirement decision');
+    },
+    runProviderTurn: async ({ state }) => {
+      calls.push(`provider:${state.phase}`);
+      return { kind: 'return', result };
+    },
+  });
+
+  const output = await engine.continueSameLoop({ sessionId: `session-${token}` });
+  assertEqual(output, result, 'RunEngine continuation returns provider cycle result');
+  assertEqual(
+    calls.join('|'),
+    `initialize:session-${token}|maybe-requirement|provider:initialized`,
+    'RunEngine continuation enters the same lifecycle through an explicit command'
+  );
 }
 
 function assertProviderTurnSnapshotRecordsContextAdmissionShape(): void {

@@ -1309,12 +1309,17 @@ export class SessionDriverLoop {
   }
 
   private async continueSameLoop(input: SessionDriverLoopInput): Promise<AgentSessionResult> {
-    return this.runLoopInput(input);
+    return this.runLoopInput(input, 'continueSameLoop');
   }
 
-  private async runLoopInput(input: SessionDriverLoopInput): Promise<AgentSessionResult> {
+  private async runLoopInput(
+    input: SessionDriverLoopInput,
+    mode: 'userTurn' | 'continueSameLoop' = 'userTurn'
+  ): Promise<AgentSessionResult> {
     try {
-      return await this.runEngine.run(input);
+      return mode === 'continueSameLoop'
+        ? await this.runEngine.continueSameLoop(input)
+        : await this.runEngine.run(input);
     } catch (error) {
       const message = error instanceof SessionDriverLoopError ? error.message : String(error);
       return this.agentRunReactor.append(input.sessionId, [

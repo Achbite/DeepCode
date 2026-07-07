@@ -30,11 +30,24 @@ export class RunEngine<Input, State extends RunEngineState> {
   constructor(private readonly ports: RunEnginePorts<Input, State>) {}
 
   async run(input: Input): Promise<AgentSessionResult> {
-    let command: RunCommand = { kind: 'initializeRun' };
+    return this.runFromCommand(input, { kind: 'initializeRun' });
+  }
+
+  async continueSameLoop(input: Input): Promise<AgentSessionResult> {
+    return this.runFromCommand(input, { kind: 'continueSameLoop' });
+  }
+
+  private async runFromCommand(input: Input, initialCommand: RunCommand): Promise<AgentSessionResult> {
+    let command: RunCommand = initialCommand;
     let state: State | undefined;
     let lastResult: AgentSessionResult | undefined;
 
     while (true) {
+      if (command.kind === 'continueSameLoop') {
+        command = this.nextCommandAfterContinuation({ kind: 'continuationEntered' });
+        continue;
+      }
+
       if (command.kind === 'initializeRun') {
         const effect: RunEffect<State> = {
           kind: 'initialized',
@@ -82,6 +95,10 @@ export class RunEngine<Input, State extends RunEngineState> {
 
       throw new Error('RunEngine command is not wired yet.');
     }
+  }
+
+  private nextCommandAfterContinuation(_effect: Extract<RunEffect<State>, { kind: 'continuationEntered' }>): RunCommand {
+    return { kind: 'initializeRun' };
   }
 
   private terminal(result: AgentSessionResult): AgentSessionResult {
