@@ -927,7 +927,7 @@ export class SessionDriverLoop {
       resourceFollowup: (followupInput) =>
         this.actionBundleAdmissionResourceFollowupCoordinator.handle(followupInput),
       resumeAfterResourceFollowup: ({ originalInput, followup }) =>
-        this.continueSameLoop(decisionContinuationInput(originalInput, {
+        this.sameLoopContinuation.runUserTurn(decisionContinuationInput(originalInput, {
           content: followup.content,
           attachments: originalInput.attachments ?? [],
           existingEvents: followup.result.events,
