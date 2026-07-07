@@ -17,6 +17,7 @@ import type {
 import type { RequirementRecord } from '../../requirement/types.js';
 import type { PromptEnvelope } from '../../prompt/types.js';
 import type { DriverProviderTurnFrame } from '../runFrame.js';
+import { SessionDriverProviderRuntimeAccessor } from '../runFrame.js';
 
 export interface RequirementConfirmationInput {
   sessionId: string;
@@ -130,10 +131,13 @@ export class RequirementConfirmationCoordinator<
         sessionId: state.sessionId,
       },
     });
-    state.cachePlan = assembledContext.cachePlan;
-    state.contextAssembly = assembledContext.contextAssembly;
+    const runtime = new SessionDriverProviderRuntimeAccessor(state);
+    runtime.applyContextAssembly({
+      cachePlan: assembledContext.cachePlan,
+      contextAssembly: assembledContext.contextAssembly,
+    });
     const prompt = assembledContext.prompt;
-    state.providerTurnFrame = this.ports.buildProviderTurnContract({
+    runtime.applyProviderTurnFrame(this.ports.buildProviderTurnContract({
       contractId: this.ports.createId('provider-turn-contract-requirement'),
       sessionId: state.sessionId,
       runId: state.runId,
@@ -147,7 +151,7 @@ export class RequirementConfirmationCoordinator<
       generatedArtifactCount: state.generatedArtifactEvidence.size,
       repairPolicy: 'deterministicIntervention',
       nextActionInstruction: 'Return exactly one decisionRequest proposal for the concrete user decision needed before planning side-effect work.',
-    });
+    }));
     const proposal = await this.ports.callProviderAndParse(input, state, prompt);
     if (proposal.kind !== 'decisionRequest') {
       throw this.ports.createError(

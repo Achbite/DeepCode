@@ -19,7 +19,10 @@ import type {
   ResourcePacket,
 } from '../../context/types.js';
 import type { RequirementRecord } from '../../requirement/types.js';
-import { SessionDriverRepairRuntimeAccessor } from '../runFrame.js';
+import {
+  SessionDriverProviderRuntimeAccessor,
+  SessionDriverRepairRuntimeAccessor,
+} from '../runFrame.js';
 
 export interface TerminalGuidanceRevisionInput {
   content: string;
@@ -141,12 +144,15 @@ export class TerminalGuidanceRevisionCoordinator<
         sessionId: state.sessionId,
       },
     });
-    state.cachePlan = assembledContext.cachePlan;
-    state.contextAssembly = assembledContext.contextAssembly;
+    const providerRuntime = new SessionDriverProviderRuntimeAccessor(state);
+    providerRuntime.applyContextAssembly({
+      cachePlan: assembledContext.cachePlan,
+      contextAssembly: assembledContext.contextAssembly,
+    });
     result = await this.ports.appendConsumedGuidanceEvents({
       sessionId: state.sessionId,
       result,
-      contextAssembly: state.contextAssembly,
+      contextAssembly: assembledContext.contextAssembly,
       runId: state.runId,
       userRequest: input.content,
       appliedAtProviderStage: 'guidance_revision',

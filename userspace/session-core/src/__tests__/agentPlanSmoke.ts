@@ -89,6 +89,7 @@ import {
 import { AcceptedPlanResourceResumePromptBuilder } from '../prompt/AcceptedPlanResourceResumePromptBuilder.js';
 import { ProviderRepairMessageBuilder } from '../prompt/ProviderRepairMessageBuilder.js';
 import { ResourceManifestBuilder } from '../resources/index.js';
+import type { ContextAssemblyRecord, PromptCachePlan } from '../context/index.js';
 import type { PromptEnvelope } from '../prompt/types.js';
 
 async function main(): Promise<void> {
@@ -8511,10 +8512,40 @@ function assertSessionDriverRuntimeAccessors(): void {
   };
   const snapshot = buildProviderTurnSnapshot(contract);
   const providerState: {
+    cachePlan?: PromptCachePlan;
+    contextAssembly?: ContextAssemblyRecord;
     providerTurnFrame?: DriverProviderTurnFrame;
     modelContextBundle?: ModelContextBundle;
   } = {};
   const providerRuntime = new SessionDriverProviderRuntimeAccessor(providerState);
+  const manifest: ResourceManifest = {
+    id: `manifest-${suffix}`,
+    workspaceScopeKey: `workspace-${suffix}`,
+    entries: [],
+    budget: { maxEntries: 8, maxBytes: 8192 },
+    defaultDenyPatterns: [],
+  };
+  const assembledRuntimeContext = assembleContext({
+    workflowState: `workflow-runtime-${suffix}`,
+    allowedProposals: ['answer'],
+    capabilityCatalogSummary: `capability-runtime-${suffix}`,
+    userRequest: `request-runtime-${suffix}`,
+    memoryDocument: buildSessionMemoryDocument([]),
+    initialContext: {
+      id: `initial-${suffix}`,
+      workspaceScopeKey: manifest.workspaceScopeKey,
+      manifest,
+    },
+  });
+  const contextAssembly = assembledRuntimeContext.contextAssembly;
+  providerRuntime.applyContextAssembly({
+    cachePlan: assembledRuntimeContext.cachePlan,
+    contextAssembly,
+  });
+  assertEqual(providerState.cachePlan?.contextAssemblyId, contextAssembly.contextAssemblyId, 'provider runtime accessor writes cache plan');
+  assertEqual(providerState.contextAssembly, contextAssembly, 'provider runtime accessor writes context assembly without model bundle');
+  assertEqual(providerRuntime.applyProviderTurnFrame(contract), contract, 'provider runtime accessor returns the applied provider turn frame');
+  assertEqual(providerState.providerTurnFrame?.contractId, contract.contractId, 'provider runtime accessor writes standalone provider turn frame');
   const bundle = providerRuntime.applyModelContext({
     prompt,
     providerTurnFrame: { ...contract, snapshot, hookTrace: [] },

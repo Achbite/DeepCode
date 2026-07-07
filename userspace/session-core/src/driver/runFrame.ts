@@ -238,6 +238,20 @@ export interface SessionDriverProviderRuntimeState {
 export class SessionDriverProviderRuntimeAccessor {
   constructor(private readonly state: SessionDriverProviderRuntimeState) {}
 
+  applyContextAssembly(input: {
+    cachePlan?: PromptCachePlan;
+    contextAssembly?: ContextAssemblyRecord;
+  }): ContextAssemblyRecord | undefined {
+    this.state.cachePlan = input.cachePlan;
+    this.state.contextAssembly = input.contextAssembly;
+    return this.state.contextAssembly;
+  }
+
+  applyProviderTurnFrame(providerTurnFrame: DriverProviderTurnFrame): DriverProviderTurnFrame {
+    this.state.providerTurnFrame = providerTurnFrame;
+    return providerTurnFrame;
+  }
+
   applyModelContext(input: {
     prompt: PromptEnvelope;
     cachePlan?: PromptCachePlan;
@@ -246,9 +260,8 @@ export class SessionDriverProviderRuntimeAccessor {
     snapshot: ProviderTurnSnapshot;
     hookTrace: readonly HookResult[];
   }): ModelContextBundle {
-    this.state.cachePlan = input.cachePlan;
-    this.state.contextAssembly = input.contextAssembly;
-    this.state.providerTurnFrame = input.providerTurnFrame;
+    this.applyContextAssembly(input);
+    this.applyProviderTurnFrame(input.providerTurnFrame);
     this.state.modelContextBundle = {
       prompt: input.prompt,
       providerTurnContract: input.providerTurnFrame,
