@@ -166,8 +166,12 @@ function accessSummaryFrame(input: PromptEnvelopeBuilderInput): PromptPacketFram
     content: blocks.slice(-12).map((block) => [
       `ref=${block.displayRef}`,
       `kind=${block.contentKind ?? 'unknown'}`,
+      `status=${block.status}`,
       `retention=${block.retention}`,
+      `range=${resourceRangeLabel(block)}`,
       `hash=${block.contentHash.slice(0, 12)}`,
+      `chars=${block.charLength}`,
+      `use=${resourceReuseInstruction(block)}`,
       `summary=${oneLine(block.summary, 300)}`,
     ].join('; ')),
   };
@@ -212,6 +216,25 @@ function resourceRangeLabel(block: NonNullable<PromptEnvelopeBuilderInput['resou
     typeof block.rangeComplete === 'boolean' ? `rangeComplete=${block.rangeComplete}` : '',
   ].filter(Boolean).join(',');
   return range || 'full-or-directory';
+}
+
+function resourceReuseInstruction(block: NonNullable<PromptEnvelopeBuilderInput['resourcePromptContext']>['resourceBlocks'][number]): string {
+  if (block.status === 'needsUserApproval' || block.status === 'denied') {
+    return 'unavailable without user approval; do not repeat the same request blindly';
+  }
+  if (block.status === 'error') {
+    return 'previous read failed; request a different focused segment only if it adds evidence';
+  }
+  if (block.retention === 'full') {
+    return 'full evidence is available; use it directly and do not reread the same path/range';
+  }
+  if (block.retention === 'summary') {
+    return 'summary evidence is available; request a focused range only when exact content is required';
+  }
+  if (block.retention === 'handleOnly') {
+    return 'handle is available; request a focused range before exact edits';
+  }
+  return 'resource is not usable as exact patch evidence';
 }
 
 function memoryFrame(input: PromptEnvelopeBuilderInput): PromptPacketFrame {

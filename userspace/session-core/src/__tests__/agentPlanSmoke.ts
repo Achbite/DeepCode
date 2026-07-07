@@ -378,24 +378,36 @@ function assertProviderTurnSnapshotRecordsContextAdmissionShape(): void {
     resourcePackets: [resourcePacket],
     conversationRoots,
   });
-  const contract = new ContextFrameBuilder().buildProviderTurnContract({
+  const contract = new ContextFrameBuilder().buildSessionProviderTurnContract({
     contractId: `contract-${token}`,
     sessionId: `session-${token}`,
     runId: `run-${token}`,
-    turnMode: 'acceptedTaskExecution',
     allowedKinds: ['actionBundle', 'resourceRequest'],
     prompt,
     contextAssembly: context.contextAssembly,
     userRequest: `request-${token}`,
-    currentTask: {
+    acceptedPlanActive: true,
+    currentTaskContext: {
       taskId: `task-${token}`,
-      title: `Task ${token}`,
+      taskTitle: `Task ${token}`,
       goal: `Handle target ${token}`,
       targets: [`target-${token}.txt`],
+      capabilities: ['fs.write'],
+      taskOrder: [`task-${token}`],
+      pendingTaskIds: [`task-${token}`],
+      dependsOn: [],
+      evidenceNeeds: [],
+      completedTaskIds: [],
     },
-    resourceEvidenceRefs: [resourcePacket.id],
+    resourcePackets: [resourcePacket],
+    generatedArtifactCount: 0,
     nextActionInstruction: `next-${token}`,
   });
+  const accessFrame = contract.frames.find((frame) => frame.kind === 'AccessIndex');
+  const accessSummary = accessFrame?.summary ?? '';
+  assert(accessSummary.includes(`ref=file-${token}.txt`), 'provider turn access index records resource identity');
+  assert(accessSummary.includes('range=full-or-directory'), 'provider turn access index records resource range identity');
+  assert(accessSummary.includes('use=full evidence is available'), 'provider turn access index records reuse instruction');
   const snapshot = buildProviderTurnSnapshot(contract);
   assertEqual(snapshot.schemaVersion, 'deepcode.session.provider-turn-snapshot.v1', 'provider turn snapshot has schema version');
   assertEqual(snapshot.segmentOrder.length > 0, true, 'provider turn snapshot records segment order');
@@ -7635,6 +7647,9 @@ function assertPromptEnvelope(): void {
   assert(renderedContract.includes('trust: kernelObservedFact'), 'prompt packet marks resource evidence as observed facts');
   assert(renderedContract.includes('kind: AccessIndex'), 'prompt packet includes access index from resource evidence');
   assert(renderedContract.includes('trust: derivedObservedFact'), 'prompt packet marks access index as derived from observed resources');
+  assert(renderedContract.includes('range=full-or-directory'), 'prompt packet access index records range identity');
+  assert(renderedContract.includes('use='), 'prompt packet access index records reuse policy');
+  assert(renderedContract.includes('request a focused range only when exact content is required'), 'prompt packet access index guides focused follow-up reads');
   assert(renderedContract.includes('kind: HookContext'), 'prompt packet includes hook context frame');
   assert(renderedContract.includes('kind: ProviderStepSummary'), 'prompt packet includes provider step summary frame');
   assert(renderedContract.includes('kind: MemoryPlaceholder'), 'prompt packet labels compacted memory frame');

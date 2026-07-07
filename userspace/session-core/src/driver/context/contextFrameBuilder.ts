@@ -7,7 +7,7 @@ import type {
   ToolIntentTemplate,
 } from '../runFrame.js';
 import type { CurrentTaskContext } from '../../accepted-plan/index.js';
-import type { ContextAssemblyRecord } from '../../context/index.js';
+import type { ContextAssemblyRecord, ContextAssemblyResourceBlockRecord } from '../../context/index.js';
 import type { ResourcePacket } from '../../context/types.js';
 import type { PromptEnvelope } from '../../prompt/types.js';
 
@@ -228,12 +228,16 @@ export class ContextFrameBuilder {
 
   private accessIndexSummary(contextAssembly: ContextAssemblyRecord | undefined): string {
     if (!contextAssembly) return 'No access index is available for this turn.';
-    return [
+    const lines = [
       `resourceBlocks=${contextAssembly.resourceBlocks.length}`,
       `full=${contextAssembly.resourceRetentionCounts.full ?? 0}`,
       `summary=${contextAssembly.resourceRetentionCounts.summary ?? 0}`,
       `handleOnly=${contextAssembly.resourceRetentionCounts.handleOnly ?? 0}`,
-    ].join('; ');
+      `denied=${contextAssembly.resourceRetentionCounts.denied ?? 0}`,
+      `error=${contextAssembly.resourceRetentionCounts.error ?? 0}`,
+    ];
+    lines.push(...contextAssembly.resourceBlocks.slice(-12).map((block) => resourceAccessIndexLine(block)));
+    return lines.join('\n');
   }
 
   private providerStepSummary(input: BuildProviderTurnContractInput): string {
@@ -270,12 +274,16 @@ export class ContextFrameBuilder {
   private accessSummary(input: BuildSessionProviderTurnContractInput): string | undefined {
     const resourcePacketCount = input.resourcePackets?.length ?? 0;
     const generatedArtifactCount = input.generatedArtifactCount ?? 0;
-    if (resourcePacketCount === 0 && generatedArtifactCount === 0) return undefined;
-    return [
+    const resourceBlocks = input.contextAssembly?.resourceBlocks ?? [];
+    if (resourcePacketCount === 0 && generatedArtifactCount === 0 && resourceBlocks.length === 0) return undefined;
+    const lines = [
       `resourcePackets=${resourcePacketCount}`,
       `generatedArtifacts=${generatedArtifactCount}`,
       `currentTask=${input.currentTaskContext?.taskId ?? 'none'}`,
-    ].join('; ');
+      `accessedResources=${resourceBlocks.length}`,
+    ];
+    lines.push(...resourceBlocks.slice(-12).map((block) => resourceAccessIndexLine(block)));
+    return lines.join('\n');
   }
 
   private nextActionInstruction(
@@ -299,4 +307,46 @@ export class ContextFrameBuilder {
       'Do not infer execution facts or permissions from memory.',
     ].join(' ');
   }
+}
+
+function resourceAccessIndexLine(block: ContextAssemblyResourceBlockRecord): string {
+  return [
+    `ref=${block.displayRef}`,
+    `kind=${block.contentKind ?? 'unknown'}`,
+    `status=${block.status}`,
+    `retention=${block.retention}`,
+    `range=${resourceRangeLabel(block)}`,
+    `hash=${block.contentHash.slice(0, 12)}`,
+    `chars=${block.charLength}`,
+    `use=${resourceReuseInstruction(block)}`,
+  ].join('; ');
+}
+
+function resourceRangeLabel(block: ContextAssemblyResourceBlockRecord): string {
+  const range = [
+    typeof block.offsetBytes === 'number' ? `offsetBytes=${block.offsetBytes}` : '',
+    typeof block.limitBytes === 'number' ? `limitBytes=${block.limitBytes}` : '',
+    typeof block.returnedBytes === 'number' ? `returnedBytes=${block.returnedBytes}` : '',
+    typeof block.rangeComplete === 'boolean' ? `rangeComplete=${block.rangeComplete}` : '',
+  ].filter(Boolean).join(',');
+  return range || 'full-or-directory';
+}
+
+function resourceReuseInstruction(block: ContextAssemblyResourceBlockRecord): string {
+  if (block.status === 'needsUserApproval' || block.status === 'denied') {
+    return 'unavailable without user approval; do not repeat the same request blindly';
+  }
+  if (block.status === 'error') {
+    return 'previous read failed; request a different focused segment only if it adds evidence';
+  }
+  if (block.retention === 'full') {
+    return 'full evidence is available; use it directly and do not reread the same path/range';
+  }
+  if (block.retention === 'summary') {
+    return 'summary evidence is available; request a focused range only when exact content is required';
+  }
+  if (block.retention === 'handleOnly') {
+    return 'handle is available; request a focused range before exact edits';
+  }
+  return 'resource is not usable as exact patch evidence';
 }
