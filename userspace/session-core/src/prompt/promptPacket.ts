@@ -289,7 +289,9 @@ function nextActionInstructionFrame(input: PromptEnvelopeBuilderInput): PromptPa
     : [
       `state=${input.workflowState || 'needProposal'}`,
       `allowedOutputs=${allowed.join(' | ') || 'none'}`,
-      'Choose the next proposal kind from the allowed outputs. For side-effect work, plan first unless Session already provided an accepted task.',
+      'If ResourceEvidence and AccessIndex already contain enough workspace facts for the user request, output taskPlan or answer as allowed instead of rereading low-value context.',
+      'Use resourceRequest only for missing concrete evidence needed to plan, answer, or edit safely. Keep it focused on a different path/range/search query that adds new facts.',
+      'For side-effect work, plan first unless Session already provided an accepted task.',
     ];
   return {
     kind: 'NextActionInstruction',

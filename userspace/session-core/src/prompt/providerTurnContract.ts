@@ -148,7 +148,10 @@ function defaultRepairPolicy(turnMode: ProviderTurnMode): ProviderRepairPolicy {
 
 function toolIntentTemplates(input: PromptEnvelopeBuilderInput, turnMode: ProviderTurnMode): string[] {
   if (turnMode !== 'acceptedTaskExecution' && turnMode !== 'resourceResume' && turnMode !== 'scopeIntervention') {
-    return ['planning/read/decision turn: do not output executable tool args or actionBundle unless the ProviderTurnContract allowedKinds explicitly includes actionBundle for a tiny single-step side effect.'];
+    return [
+      'planning/read/decision turn: use existing ResourceEvidence and AccessIndex first; output resourceRequest only for missing concrete facts that would change the next plan or answer.',
+      'planning/read/decision turn: do not output executable tool args or actionBundle unless the ProviderTurnContract allowedKinds explicitly includes actionBundle for a tiny single-step side effect.',
+    ];
   }
   const record = objectRecord(input.currentTaskContext);
   const targets = stringArray(record?.targets);
