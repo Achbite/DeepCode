@@ -8572,6 +8572,8 @@ function assertSessionDriverRuntimeAccessors(): void {
   repairRuntime.markAttempted('planReviewRepairAttempted');
   assertEqual(repairState.planReviewRepairAttempted, true, 'repair runtime accessor writes repair flag');
   assertEqual(repairRuntime.attempted('planReviewRepairAttempted'), true, 'repair runtime accessor reads active repair flag');
+  repairRuntime.markAttempted('acceptedPlanScopeRepairAttempted');
+  assertEqual(repairRuntime.attempted('acceptedPlanScopeRepairAttempted'), true, 'repair runtime accessor covers accepted-plan scope repair flag');
 
   const activeTurnState: { activeTurn?: ActiveTurnState } = {};
   const activeTurnRuntime = new SessionDriverActiveTurnRuntimeAccessor(activeTurnState);

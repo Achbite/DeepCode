@@ -14,6 +14,7 @@ import type { ProposalEnvelope, ResourceRequestDraft } from '../../protocol/type
 import type { PromptEnvelope } from '../../prompt/types.js';
 import type { InteractionOverlayContext } from '../pipelines/interactionOverlayCodec.js';
 import { acceptedPlanContinuationInput } from '../runContinuation.js';
+import { SessionDriverRepairRuntimeAccessor } from '../runFrame.js';
 import { kernelReplyErrorMessage } from './kernelReplyGuard.js';
 
 export interface AcceptedPlanActionProposalInput {
@@ -238,12 +239,13 @@ export class AcceptedPlanActionProposalSubmitter<
     );
     if (readOnlyActionResult) return readOnlyActionResult;
 
+    const repairRuntime = new SessionDriverRepairRuntimeAccessor(state);
     const assessment = this.ports.assessActionProposal({
       accepted,
       proposal,
       actionBundle,
       resourcePackets: state.resourcePackets,
-      scopeRepairAttempted: state.acceptedPlanScopeRepairAttempted,
+      scopeRepairAttempted: repairRuntime.attempted('acceptedPlanScopeRepairAttempted'),
       admission: this.ports.admission(),
     });
     if (assessment.kind === 'missingActionBundle') return fallback;
@@ -251,7 +253,7 @@ export class AcceptedPlanActionProposalSubmitter<
       return this.ports.appendScopeIntervention(input, state, proposal, assessment.validation);
     }
     if (assessment.kind === 'scopeRepair') {
-      state.acceptedPlanScopeRepairAttempted = true;
+      repairRuntime.markAttempted('acceptedPlanScopeRepairAttempted');
       await this.ports.appendThinking(
         state,
         'The current execution batch is outside the confirmed current-task scope; Session is asking the model to continue the current task or request additional authorization.',
@@ -375,8 +377,8 @@ export class AcceptedPlanActionProposalSubmitter<
       );
       return appended ?? result;
     }
-    if (this.ports.acceptedPlanNeedsRepair(reviewReport) && !state.planReviewRepairAttempted) {
-      state.planReviewRepairAttempted = true;
+    if (this.ports.acceptedPlanNeedsRepair(reviewReport) && !repairRuntime.attempted('planReviewRepairAttempted')) {
+      repairRuntime.markAttempted('planReviewRepairAttempted');
       await this.ports.appendThinking(
         state,
         'Kernel PlanReview requires revising the current accepted-plan batch; Session is running one controlled repair attempt.',
