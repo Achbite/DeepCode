@@ -2099,6 +2099,8 @@ async function assertProviderPipelineUsesProviderTurnContract(): Promise<void> {
   const firstUserPrompt = String(firstMessages[0]?.[1]?.content ?? '');
   assertEqual(firstUserPrompt.startsWith(prompt.dynamicSuffix), true, 'provider pipeline keeps dynamic suffix first');
   assertEqual(firstUserPrompt.includes('ProviderTurnContract:'), true, 'provider pipeline renders provider turn contract');
+  assertEqual(firstUserPrompt.includes('<PromptPacket schemaVersion="deepcode.session.prompt-packet.v1">'), false, 'main provider prompt does not inject legacy prompt-packet renderer');
+  assertEqual(firstUserPrompt.includes('"kind": "NextActionInstruction"'), true, 'main provider prompt carries next action through driver contract frames');
   assertEqual(firstUserPrompt.includes(`answer-${token}`), true, 'provider pipeline renders next action instruction');
   assertEqual(firstUserPrompt.includes('"nextActionInstruction"'), false, 'provider turn contract omits duplicated top-level next action field');
   assertEqual((firstUserPrompt.match(new RegExp(`answer-${token}`, 'g')) ?? []).length, 2, 'next action appears only as frame summary and final instruction');
