@@ -11,6 +11,7 @@ import type { ProjectWorkingDirectory, ResourcePacket } from '../../context/type
 import type { AcceptedImplementationPlanContext } from '../../accepted-plan/types.js';
 import type { InteractionOverlayContext } from '../pipelines/interactionOverlayCodec.js';
 import type { PlanContext } from '../proposal/planContextIndex.js';
+import { decisionContinuationInput } from '../runContinuation.js';
 import type { InterventionLevel, ReviewContinuationMode } from '../types.js';
 import { assertKernelReplyOk, kernelReplyErrorMessage } from './kernelReplyGuard.js';
 
@@ -351,24 +352,15 @@ export class AcceptedActionBundlePlanExecutor {
           ),
         ]) ?? result;
         if (!this.ports.acceptedPlanComplete(nextAccepted)) {
-          return this.ports.resumeUserTurn({
-            sessionId: input.sessionId,
+          return this.ports.resumeUserTurn(decisionContinuationInput(input, {
             content: this.ports.executionRequest(acceptedOverlay.plan, nextAccepted),
             attachments: nextAccepted.executionRoot ? [nextAccepted.executionRoot.attachment] : [],
             existingEvents: result.events,
-            workspaceBinding: input.workspaceBinding,
-            projectWorkingDirectory: input.projectWorkingDirectory,
-            profileId: input.profileId,
-            workflow: input.workflow,
-            appendUserMessage: false,
-            requirementConfirmationMode: 'off',
             reviewContinuationMode: input.reviewContinuationMode,
-            interventionLevel: input.interventionLevel,
-            projectMemoryMode: input.projectMemoryMode,
             resumeResourcePackets: true,
             acceptedImplementationPlan: nextAccepted,
             interactionOverlay: plan.interactionOverlay ?? input.interactionOverlay,
-          });
+          }));
         }
         plan = {
           ...plan,

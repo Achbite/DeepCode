@@ -16,6 +16,7 @@ import type { AcceptedImplementationPlanContext } from '../../accepted-plan/type
 import type { ProposalEnvelope, ResourceRequestDraft } from '../../protocol/types.js';
 import type { PromptEnvelope } from '../../prompt/types.js';
 import type { DriverProviderTurnFrame } from '../runFrame.js';
+import { decisionContinuationInput } from '../runContinuation.js';
 import type { PlanContext } from '../proposal/planContextIndex.js';
 import type { AcceptedPlanReadOnlyResourceCompletion } from './acceptedPlanExecutor.js';
 
@@ -202,8 +203,7 @@ export class AcceptedPlanReadOnlyTaskExecutor<
     let result = await this.ports.append(state.sessionId, [checkpoint]) ?? fallback;
 
     if (!this.ports.complete(nextAccepted)) {
-      return this.ports.runUserTurn({
-        sessionId: input.sessionId,
+      return this.ports.runUserTurn(decisionContinuationInput(input, {
         content: this.ports.executionRequest(
           {
             sessionId: state.sessionId,
@@ -228,18 +228,10 @@ export class AcceptedPlanReadOnlyTaskExecutor<
         ),
         attachments: nextAccepted.executionRoot ? [nextAccepted.executionRoot.attachment] : [],
         existingEvents: result.events,
-        workspaceBinding: input.workspaceBinding,
-        projectWorkingDirectory: input.projectWorkingDirectory,
-        profileId: input.profileId,
-        workflow: input.workflow,
-        appendUserMessage: false,
-        requirementConfirmationMode: 'off',
         reviewContinuationMode: input.reviewContinuationMode,
-        interventionLevel: input.interventionLevel,
-        projectMemoryMode: input.projectMemoryMode,
         resumeResourcePackets: true,
         acceptedImplementationPlan: nextAccepted,
-      });
+      }));
     }
 
     const plan = this.ports.readOnlyReviewContext({
