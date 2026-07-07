@@ -758,6 +758,9 @@ function assertProviderTurnSnapshotRecordsContextAdmissionShape(): void {
   assertEqual(snapshot.providerTurnContractHash.length > 0, true, 'provider turn snapshot records provider contract hash');
   assertEqual(typeof snapshot.dynamicFrameOverlapCharLength, 'number', 'provider turn snapshot records aggregate dynamic frame overlap length');
   assertEqual(typeof snapshot.dynamicFrameOverlapRatio, 'number', 'provider turn snapshot records aggregate dynamic frame overlap ratio');
+  assertEqual(snapshot.dynamicDialogueSummaryCharLength > 0, true, 'provider turn snapshot records dynamic dialogue summary length');
+  assertEqual(snapshot.dynamicDialogueDynamicSuffixOccurrences, 1, 'provider turn snapshot counts dynamic dialogue text in dynamic suffix');
+  assertEqual(snapshot.dynamicDialogueFrameTextOccurrences >= 1, true, 'provider turn snapshot counts dynamic dialogue text in provider contract frames');
   assertEqual(snapshot.finalUserPromptHash.length > 0, true, 'provider turn snapshot records final user prompt hash');
   assertEqual(snapshot.finalUserPromptCharLength > snapshot.dynamicSuffixCharLength, true, 'provider turn snapshot records rendered contract appended to dynamic prompt');
 }

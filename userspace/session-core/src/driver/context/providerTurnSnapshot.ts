@@ -18,6 +18,8 @@ export function buildProviderTurnSnapshot(contract: DriverProviderTurnFrame): Pr
   const finalUserPrompt = renderProviderTurnUserPrompt(contract.prompt.dynamicSuffix, contract);
   const contextAssembly = contract.contextAssembly;
   const frames = contract.frames.map((frame, index) => snapshotFrame(frame, index, contract.prompt.dynamicSuffix));
+  const dynamicDialogueSummary = contract.frames.find((frame) => frame.kind === 'DynamicDialogue')?.summary ?? '';
+  const frameText = contract.frames.map((frame) => [frame.use, frame.summary ?? ''].join('\n')).join('\n');
   const frameTextCharLength = frames.reduce((total, frame) => total + frame.useCharLength + frame.summaryCharLength, 0);
   const dynamicFrameOverlapCharLength = frames.reduce(
     (total, frame) => total + frame.dynamicUseOverlapCharLength + frame.dynamicSummaryOverlapCharLength,
@@ -41,6 +43,10 @@ export function buildProviderTurnSnapshot(contract: DriverProviderTurnFrame): Pr
     finalUserPromptCharLength: finalUserPrompt.length,
     providerTurnContractHash: stableHash(renderedContract),
     providerTurnContractCharLength: renderedContract.length,
+    dynamicDialogueSummaryHash: dynamicDialogueSummary ? stableHash(dynamicDialogueSummary) : undefined,
+    dynamicDialogueSummaryCharLength: dynamicDialogueSummary.length,
+    dynamicDialogueDynamicSuffixOccurrences: exactOccurrenceCount(contract.prompt.dynamicSuffix, dynamicDialogueSummary),
+    dynamicDialogueFrameTextOccurrences: exactOccurrenceCount(frameText, dynamicDialogueSummary),
     dynamicFrameOverlapCharLength,
     dynamicFrameOverlapRatio: frameTextCharLength > 0 ? dynamicFrameOverlapCharLength / frameTextCharLength : 0,
     segmentOrder: contextAssembly?.segmentOrder ? [...contextAssembly.segmentOrder] : [],
@@ -84,6 +90,19 @@ function snapshotFrame(frame: ProviderContextFrame, index: number, dynamicSuffix
 
 function exactOverlapCharLength(haystack: string, needle: string): number {
   return needle && haystack.includes(needle) ? needle.length : 0;
+}
+
+function exactOccurrenceCount(haystack: string, needle: string): number {
+  if (!needle) return 0;
+  let count = 0;
+  let fromIndex = 0;
+  while (fromIndex <= haystack.length) {
+    const found = haystack.indexOf(needle, fromIndex);
+    if (found < 0) break;
+    count += 1;
+    fromIndex = found + Math.max(needle.length, 1);
+  }
+  return count;
 }
 
 function snapshotResourceBlock(block: ContextAssemblyResourceBlockRecord, index: number): ProviderTurnSnapshotResourceBlock {

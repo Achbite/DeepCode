@@ -149,6 +149,10 @@ export interface ProviderTurnSnapshot {
   readonly finalUserPromptCharLength: number;
   readonly providerTurnContractHash: string;
   readonly providerTurnContractCharLength: number;
+  readonly dynamicDialogueSummaryHash?: string;
+  readonly dynamicDialogueSummaryCharLength: number;
+  readonly dynamicDialogueDynamicSuffixOccurrences: number;
+  readonly dynamicDialogueFrameTextOccurrences: number;
   readonly dynamicFrameOverlapCharLength: number;
   readonly dynamicFrameOverlapRatio: number;
   readonly segmentOrder: string[];
