@@ -66,6 +66,18 @@ export type DriverInteractionRef =
   | { kind: 'plan'; runId: string; planId: string }
   | { kind: 'requirement'; runId: string; requirementId: string };
 
+export interface PlanDecisionRunCommand {
+  readonly kind: 'resolvePlanDecision';
+  readonly input: PlanDecisionHandlerInput;
+}
+
+export type PlanDecisionRunEffect =
+  | { readonly kind: 'planDecisionNoop'; readonly result: AgentSessionResult }
+  | { readonly kind: 'planAcceptedForImplementation'; readonly result: AgentSessionResult }
+  | { readonly kind: 'planAcceptedForActionBundle'; readonly result: AgentSessionResult }
+  | { readonly kind: 'planRevisionRequested'; readonly result: AgentSessionResult }
+  | { readonly kind: 'planRejected'; readonly result: AgentSessionResult };
+
 export interface PlanDecisionHandlerPorts {
   now(): string;
   createId(prefix: string): string;
@@ -125,20 +137,33 @@ export class PlanDecisionHandler {
   constructor(private readonly ports: PlanDecisionHandlerPorts) {}
 
   async resolve(input: PlanDecisionHandlerInput): Promise<AgentSessionResult> {
+    const effect = await this.execute({ kind: 'resolvePlanDecision', input });
+    return effect.result;
+  }
+
+  private async execute(command: PlanDecisionRunCommand): Promise<PlanDecisionRunEffect> {
+    const input = command.input;
     const events = input.existingEvents ?? [];
     if (!this.activePlanMatches(input, events)) {
-      return this.appendNoop(input);
+      return { kind: 'planDecisionNoop', result: await this.appendNoop(input) };
     }
 
     const plan = this.ports.planIndex.findPlanCard(events, input.runId, input.targetId);
     if (!plan || this.ports.planIndex.alreadyResolved(events, plan)) {
-      return this.appendNoop(input);
+      return { kind: 'planDecisionNoop', result: await this.appendNoop(input) };
     }
 
     if (input.decision !== 'accept') {
       return this.resolveNonAccept(input, plan);
     }
 
+    return this.acceptPlan(input, plan);
+  }
+
+  private async acceptPlan(
+    input: PlanDecisionHandlerInput,
+    plan: PlanContext
+  ): Promise<PlanDecisionRunEffect> {
     let result = await this.ports.append(input.sessionId, [
       this.ports.planProjection.planReviewDecisionEvent({
         sessionId: input.sessionId,
@@ -155,7 +180,7 @@ export class PlanDecisionHandler {
         interventionLevel: input.interventionLevel,
         executionRoot,
       });
-      return this.ports.resumeUserTurn(decisionContinuationInput(input, {
+      result = await this.ports.resumeUserTurn(decisionContinuationInput(input, {
         content: this.ports.executionRequest(plan, acceptedPlan, input.guidance),
         attachments: acceptedPlan.executionRoot ? [acceptedPlan.executionRoot.attachment] : [],
         existingEvents: result.events,
@@ -164,9 +189,11 @@ export class PlanDecisionHandler {
         acceptedImplementationPlan: acceptedPlan,
         interactionOverlay: plan.interactionOverlay ?? input.interactionOverlay,
       }));
+      return { kind: 'planAcceptedForImplementation', result };
     }
     const acceptedOverlay = this.ports.recoverAcceptedPlanFromOverlay(input, result.events, plan.interactionOverlay ?? input.interactionOverlay);
-    return this.ports.executeAcceptedActionBundlePlan(input, plan, result, acceptedOverlay);
+    result = await this.ports.executeAcceptedActionBundlePlan(input, plan, result, acceptedOverlay);
+    return { kind: 'planAcceptedForActionBundle', result };
   }
 
   private activePlanMatches(input: PlanDecisionHandlerInput, events: AgentEvent[]): boolean {
@@ -201,7 +228,7 @@ export class PlanDecisionHandler {
   private async resolveNonAccept(
     input: PlanDecisionHandlerInput,
     plan: PlanContext
-  ): Promise<AgentSessionResult> {
+  ): Promise<PlanDecisionRunEffect> {
     const status = input.decision === 'revise' ? 'needsRevision' : 'rejected';
     let result = await this.ports.append(input.sessionId, [
       this.ports.planProjection.planReviewDecisionEvent({
@@ -214,13 +241,14 @@ export class PlanDecisionHandler {
       }),
     ]);
     if (input.decision === 'revise') {
-      return this.ports.resumeUserTurn(decisionContinuationInput(input, {
+      result = await this.ports.resumeUserTurn(decisionContinuationInput(input, {
         content: this.ports.planRevisionRequest({ plan, guidance: input.guidance }),
         attachments: [],
         existingEvents: result.events,
         reviewContinuationMode: input.reviewContinuationMode,
         interactionOverlay: plan.interactionOverlay ?? input.interactionOverlay,
       }));
+      return { kind: 'planRevisionRequested', result };
     }
 
     if (input.decision === 'reject') {
@@ -243,6 +271,6 @@ export class PlanDecisionHandler {
         }),
       ]) ?? result;
     }
-    return result;
+    return { kind: 'planRejected', result };
   }
 }
