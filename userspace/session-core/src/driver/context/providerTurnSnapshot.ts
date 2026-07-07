@@ -17,6 +17,12 @@ export function buildProviderTurnSnapshot(contract: DriverProviderTurnFrame): Pr
   const renderedContract = renderContractForSnapshot(contract);
   const finalUserPrompt = renderProviderTurnUserPrompt(contract.prompt.dynamicSuffix, contract);
   const contextAssembly = contract.contextAssembly;
+  const frames = contract.frames.map((frame, index) => snapshotFrame(frame, index, contract.prompt.dynamicSuffix));
+  const frameTextCharLength = frames.reduce((total, frame) => total + frame.useCharLength + frame.summaryCharLength, 0);
+  const dynamicFrameOverlapCharLength = frames.reduce(
+    (total, frame) => total + frame.dynamicUseOverlapCharLength + frame.dynamicSummaryOverlapCharLength,
+    0
+  );
   return {
     schemaVersion: 'deepcode.session.provider-turn-snapshot.v1',
     contractId: contract.contractId,
@@ -35,9 +41,11 @@ export function buildProviderTurnSnapshot(contract: DriverProviderTurnFrame): Pr
     finalUserPromptCharLength: finalUserPrompt.length,
     providerTurnContractHash: stableHash(renderedContract),
     providerTurnContractCharLength: renderedContract.length,
+    dynamicFrameOverlapCharLength,
+    dynamicFrameOverlapRatio: frameTextCharLength > 0 ? dynamicFrameOverlapCharLength / frameTextCharLength : 0,
     segmentOrder: contextAssembly?.segmentOrder ? [...contextAssembly.segmentOrder] : [],
     segments: contextAssembly?.segments.map(snapshotSegment) ?? [],
-    frames: contract.frames.map(snapshotFrame),
+    frames,
     resourceBlocks: contextAssembly?.resourceBlocks.map(snapshotResourceBlock) ?? [],
     resourceRetentionCounts: { ...(contextAssembly?.resourceRetentionCounts ?? {}) },
     cacheClasses: cacheClasses(contextAssembly?.segments ?? []),
@@ -56,7 +64,7 @@ function snapshotSegment(segment: ContextAssemblySegmentRecord): ProviderTurnSna
   };
 }
 
-function snapshotFrame(frame: ProviderContextFrame, index: number): ProviderTurnSnapshotFrame {
+function snapshotFrame(frame: ProviderContextFrame, index: number, dynamicSuffix: string): ProviderTurnSnapshotFrame {
   return {
     index,
     kind: frame.kind,
@@ -65,11 +73,17 @@ function snapshotFrame(frame: ProviderContextFrame, index: number): ProviderTurn
     scope: frame.scope,
     useCharLength: frame.use.length,
     useHash: stableHash(frame.use),
+    dynamicUseOverlapCharLength: exactOverlapCharLength(dynamicSuffix, frame.use),
     summaryCharLength: frame.summary?.length ?? 0,
     summaryHash: frame.summary ? stableHash(frame.summary) : undefined,
+    dynamicSummaryOverlapCharLength: exactOverlapCharLength(dynamicSuffix, frame.summary ?? ''),
     refsCount: frame.refs?.length ?? 0,
     dataHash: frame.data === undefined ? undefined : stableHash(JSON.stringify(frame.data)),
   };
+}
+
+function exactOverlapCharLength(haystack: string, needle: string): number {
+  return needle && haystack.includes(needle) ? needle.length : 0;
 }
 
 function snapshotResourceBlock(block: ContextAssemblyResourceBlockRecord, index: number): ProviderTurnSnapshotResourceBlock {

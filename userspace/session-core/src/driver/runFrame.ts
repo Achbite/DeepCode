@@ -110,8 +110,10 @@ export interface ProviderTurnSnapshotFrame {
   readonly scope?: string;
   readonly useCharLength: number;
   readonly useHash: string;
+  readonly dynamicUseOverlapCharLength: number;
   readonly summaryCharLength: number;
   readonly summaryHash?: string;
+  readonly dynamicSummaryOverlapCharLength: number;
   readonly refsCount: number;
   readonly dataHash?: string;
 }
@@ -147,6 +149,8 @@ export interface ProviderTurnSnapshot {
   readonly finalUserPromptCharLength: number;
   readonly providerTurnContractHash: string;
   readonly providerTurnContractCharLength: number;
+  readonly dynamicFrameOverlapCharLength: number;
+  readonly dynamicFrameOverlapRatio: number;
   readonly segmentOrder: string[];
   readonly segments: ProviderTurnSnapshotSegment[];
   readonly frames: ProviderTurnSnapshotFrame[];
