@@ -54,8 +54,31 @@ export interface ProposalRouterInput<Input, State extends ProposalRouterState> {
   lastResult: AgentSessionResult;
 }
 
+export type RoutedProposal =
+  | { kind: 'answer'; proposal: ProposalEnvelope }
+  | { kind: 'decisionRequest'; proposal: ProposalEnvelope }
+  | { kind: 'diagnostic'; proposal: ProposalEnvelope }
+  | { kind: 'plan'; proposal: ProposalEnvelope }
+  | { kind: 'resourceRequest'; proposal: ProposalEnvelope }
+  | { kind: 'action'; proposal: ProposalEnvelope }
+  | { kind: 'nonExecutable'; proposal: ProposalEnvelope };
+
+export function routeProposalKind(proposal: ProposalEnvelope): RoutedProposal {
+  if (proposal.kind === 'answer') return { kind: 'answer', proposal };
+  if (proposal.kind === 'decisionRequest') return { kind: 'decisionRequest', proposal };
+  if (proposal.kind === 'diagnostic') return { kind: 'diagnostic', proposal };
+  if (proposal.kind === 'taskPlan' || proposal.kind === 'implementationPlan') return { kind: 'plan', proposal };
+  if (proposal.kind === 'resourceRequest') return { kind: 'resourceRequest', proposal };
+  if (proposal.kind === 'actionBundle' || proposal.kind === 'taskOutcome') return { kind: 'action', proposal };
+  return { kind: 'nonExecutable', proposal };
+}
+
 export class ProposalRouter<Input, State extends ProposalRouterState> {
   constructor(private readonly ports: ProposalRouterPorts<Input, State>) {}
+
+  planRoute(proposal: ProposalEnvelope): RoutedProposal {
+    return routeProposalKind(proposal);
+  }
 
   async route(routerInput: ProposalRouterInput<Input, State>): Promise<ProposalRouterResult> {
     const { input, state, prompt, proposal } = routerInput;
@@ -70,19 +93,20 @@ export class ProposalRouter<Input, State extends ProposalRouterState> {
       lastResult = await this.ports.append(state.sessionId, [narration]);
     }
 
-    if (proposal.kind === 'answer') {
+    const routed = this.planRoute(proposal);
+    if (routed.kind === 'answer') {
       return { kind: 'return', result: await this.ports.handleAnswer(input, state, proposal) };
     }
-    if (proposal.kind === 'decisionRequest') {
+    if (routed.kind === 'decisionRequest') {
       return { kind: 'return', result: await this.ports.handleDecisionRequest(input, state, proposal) };
     }
-    if (proposal.kind === 'diagnostic') {
+    if (routed.kind === 'diagnostic') {
       return { kind: 'return', result: await this.ports.handleDiagnostic(state, proposal) };
     }
-    if (proposal.kind === 'taskPlan' || proposal.kind === 'implementationPlan') {
+    if (routed.kind === 'plan') {
       return { kind: 'return', result: await this.ports.handlePlan(state, proposal) };
     }
-    if (proposal.kind === 'resourceRequest') {
+    if (routed.kind === 'resourceRequest') {
       const handled = await this.ports.handleResourceRequest({
         input,
         state,
@@ -93,7 +117,7 @@ export class ProposalRouter<Input, State extends ProposalRouterState> {
       if (handled.kind === 'return' && handled.result) return { kind: 'return', result: handled.result };
       return { kind: 'continue', lastResult: handled.lastResult ?? lastResult };
     }
-    if (proposal.kind === 'actionBundle' || proposal.kind === 'taskOutcome') {
+    if (routed.kind === 'action') {
       return {
         kind: 'return',
         result: await this.ports.submitActionProposal(input, state, prompt, proposal, lastResult),

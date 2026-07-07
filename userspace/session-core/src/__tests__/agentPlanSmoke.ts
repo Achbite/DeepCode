@@ -46,6 +46,7 @@ import {
 import { AcceptedPlanScopeMatcher, AcceptedTaskRegistry, type AcceptedImplementationPlanContext } from '../accepted-plan/index.js';
 import { AgentRunReactor } from '../driver/agentRunReactor.js';
 import { ContextFrameBuilder } from '../driver/context/contextFrameBuilder.js';
+import { routeProposalKind } from '../driver/proposal/proposalRouter.js';
 import { decisionContinuationInput } from '../driver/runContinuation.js';
 import { renderProviderTurnContractLayer } from '../prompt/providerTurnContract.js';
 import { AcceptedPlanResourceResumeCoordinator, ActionBundleAdmissionResourceFollowupCoordinator, GeneratedArtifactEvidenceIndex, PathIdentity, ResourceEvidenceIndex, ResourceOrchestrator, ResourceRequestLoop, ResourceRequestRepairCoordinator, buildProviderTurnSnapshot } from '../driver/context/index.js';
@@ -167,6 +168,7 @@ async function main(): Promise<void> {
   assertProjectionResolvesPlanAfterSourceReview();
   assertPlanInteractionIndexFindsActivePlan();
   assertPlanReviewGrantProjectorBuildsExecutionReadModels();
+  assertProposalRouterPlansPureRoutes();
   assertAcceptedPlanTargetParserExtractsStructuredTargets();
   assertAcceptedPlanScopeMatcherNormalizesProposalTargets();
   assertAcceptedImplementationPlanContextBuilderBuildsRuntimeContext();
@@ -8414,6 +8416,30 @@ function assertPlanContextIndexBuildsPlanReadModels(): void {
     payload: { runId: `${runId}-child`, sourcePlanId: planId, status: 'accepted' },
   } as AgentEvent;
   assertEqual(index.alreadyResolved([planCard, accepted, review], found!), true, 'plan context index treats terminal sourcePlanId reviews as source plan resolution');
+}
+
+function assertProposalRouterPlansPureRoutes(): void {
+  const suffix = randomSmokeToken('proposal-route');
+  const proposal = (kind: string) => ({
+    schemaVersion: 'deepcode.agent.protocol.v3',
+    proposalId: `proposal-${suffix}-${kind}`,
+    runId: `run-${suffix}`,
+    sessionId: `session-${suffix}`,
+    source: 'llm',
+    kind,
+    payload: {},
+    referencedResourcePacketRefs: [],
+    referencedEvidenceRefs: [],
+  }) as ProposalEnvelope;
+  assertEqual(routeProposalKind(proposal('answer')).kind, 'answer', 'proposal router routes answer proposals without side effects');
+  assertEqual(routeProposalKind(proposal('decisionRequest')).kind, 'decisionRequest', 'proposal router routes decision requests without side effects');
+  assertEqual(routeProposalKind(proposal('diagnostic')).kind, 'diagnostic', 'proposal router routes diagnostics without side effects');
+  assertEqual(routeProposalKind(proposal('taskPlan')).kind, 'plan', 'proposal router routes task plans to plan handling');
+  assertEqual(routeProposalKind(proposal('implementationPlan')).kind, 'plan', 'proposal router routes implementation plans to plan handling');
+  assertEqual(routeProposalKind(proposal('resourceRequest')).kind, 'resourceRequest', 'proposal router routes resource requests without side effects');
+  assertEqual(routeProposalKind(proposal('actionBundle')).kind, 'action', 'proposal router routes action bundles to action handling');
+  assertEqual(routeProposalKind(proposal('taskOutcome')).kind, 'action', 'proposal router routes task outcomes to action handling');
+  assertEqual(routeProposalKind(proposal('unknown-kind')).kind, 'nonExecutable', 'proposal router closes unknown proposal kinds as non-executable');
 }
 
 function assertInteractionLedgerResolvesTerminalSourcePlanReview(): void {
