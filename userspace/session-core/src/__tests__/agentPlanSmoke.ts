@@ -10083,6 +10083,28 @@ function assertSessionMemoryDocument(): void {
       },
     },
     {
+      id: 'memory-provider-reasoning',
+      sessionId: 'session-memory',
+      ts: '2026-01-01T00:00:03.200Z',
+      kind: 'assistant_msg',
+      payload: {
+        channel: 'reasoning',
+        source: 'provider',
+        content: 'Provider protocol self-audit should stay visible only and must not enter memory context.',
+      },
+    },
+    {
+      id: 'memory-llm-progress',
+      sessionId: 'session-memory',
+      ts: '2026-01-01T00:00:03.300Z',
+      kind: 'assistant_msg',
+      payload: {
+        channel: 'progress',
+        source: 'llm',
+        content: 'LLM progress narration should not become reusable memory context.',
+      },
+    },
+    {
       id: 'memory-answer',
       sessionId: 'session-memory',
       ts: '2026-01-01T00:00:04.000Z',
@@ -10118,6 +10140,16 @@ function assertSessionMemoryDocument(): void {
   assert(document.shortTermContext.some((item) => item.includes('Assistant final summary')), 'assistant finals are summarized as short-term context');
   assertEqual(document.intentContext.some((item) => item.includes('Assistant final')), false, 'assistant final text is not promoted as stable intent');
   assertEqual(document.factContext.some((item) => item.includes('Plan intent')), false, 'plan intent does not enter factContext');
+  const providerVisibleContext = [
+    ...document.intentContext,
+    ...document.factContext,
+    ...document.decisionContext,
+    ...document.resourceContext,
+    ...document.shortTermContext,
+    ...document.sessionMemoryContext,
+  ].join('\n');
+  assertEqual(providerVisibleContext.includes('Provider protocol self-audit'), false, 'provider reasoning does not enter session memory');
+  assertEqual(providerVisibleContext.includes('LLM progress narration'), false, 'llm progress narration does not enter session memory');
 
   const autoDocument = buildSessionMemoryDocument([
     {
