@@ -65,6 +65,7 @@ import {
   AcceptedPlanExecutor,
   AcceptedPlanTargetParser,
   AcceptedPlanTaskLedgerCoordinator,
+  AcceptedPlanTaskRuntimeAccessor,
   type AcceptedPlanTaskRuntimeState,
   ActionBatchFailureIndex,
   CompletedWorkUnitFactIndex,
@@ -8461,6 +8462,17 @@ function assertRunStateMachineTaskLedger(): void {
   assertEqual(runtimeState.currentTaskContext?.taskId, taskIds[2], 'task ledger coordinator refreshes current task context');
   assertEqual(runtimeState.taskLedger?.entries.length, taskIds.length, 'task ledger coordinator refreshes task ledger');
   assertEqual(runtimeState.acceptedPlanPromptFrame?.taskLedger.currentTaskId, taskIds[2], 'task ledger coordinator refreshes prompt frame');
+  const runtimeAccessor = new AcceptedPlanTaskRuntimeAccessor(runtimeState);
+  const runtimeInput = runtimeAccessor.snapshotInput();
+  assertEqual(runtimeInput.acceptedPlan, acceptedPlan, 'accepted-plan runtime accessor reads accepted plan authority');
+  assertEqual(runtimeInput.resourcePackets, runtimeState.resourcePackets, 'accepted-plan runtime accessor reads resource packets');
+  const accessorTargetState: AcceptedPlanTaskRuntimeState = {
+    acceptedImplementationPlan: acceptedPlan,
+    resourcePackets: [],
+  };
+  new AcceptedPlanTaskRuntimeAccessor(accessorTargetState).apply(coordinator.runtimeSnapshot(runtimeInput));
+  assertEqual(accessorTargetState.currentTaskContext?.taskId, taskIds[2], 'accepted-plan runtime accessor applies current task context');
+  assertEqual(accessorTargetState.taskLedger?.currentTaskId, taskIds[2], 'accepted-plan runtime accessor applies task ledger');
 }
 
 function assertAcceptedTaskRegistryUsesExactOperationGrants(): void {

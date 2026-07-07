@@ -31,6 +31,30 @@ export interface AcceptedPlanTaskRuntimeState {
   acceptedPlanPromptFrame?: AcceptedPlanPromptFrame;
 }
 
+// The accepted-plan runtime fields are a single snapshot boundary for task projection and provider context.
+export class AcceptedPlanTaskRuntimeAccessor {
+  constructor(private readonly state: AcceptedPlanTaskRuntimeState) {}
+
+  snapshotInput(): {
+    acceptedPlan?: AcceptedImplementationPlanContext;
+    resourcePackets: ResourcePacket[];
+    lastSavepointId?: string;
+  } {
+    return {
+      acceptedPlan: this.state.acceptedImplementationPlan,
+      resourcePackets: this.state.resourcePackets,
+      lastSavepointId: this.state.taskExecutionCursor?.lastSavepointId,
+    };
+  }
+
+  apply(snapshot: AcceptedPlanTaskRuntimeSnapshot): void {
+    this.state.taskExecutionCursor = snapshot.taskExecutionCursor;
+    this.state.currentTaskContext = snapshot.currentTaskContext;
+    this.state.taskLedger = snapshot.taskLedger;
+    this.state.acceptedPlanPromptFrame = snapshot.acceptedPlanPromptFrame;
+  }
+}
+
 export interface AcceptedPlanTaskLedgerCoordinatorPorts {
   workUnitIdsFromKernelEvents(kernelEvents: unknown[]): string[];
   actionBatchHasFailureOrBlocker(kernelEvents: unknown[]): boolean;
@@ -197,15 +221,8 @@ export class AcceptedPlanTaskLedgerCoordinator {
   }
 
   refreshRuntimeState(state: AcceptedPlanTaskRuntimeState): void {
-    const snapshot = this.runtimeSnapshot({
-      acceptedPlan: state.acceptedImplementationPlan,
-      resourcePackets: state.resourcePackets,
-      lastSavepointId: state.taskExecutionCursor?.lastSavepointId,
-    });
-    state.taskExecutionCursor = snapshot.taskExecutionCursor;
-    state.currentTaskContext = snapshot.currentTaskContext;
-    state.taskLedger = snapshot.taskLedger;
-    state.acceptedPlanPromptFrame = snapshot.acceptedPlanPromptFrame;
+    const runtime = new AcceptedPlanTaskRuntimeAccessor(state);
+    runtime.apply(this.runtimeSnapshot(runtime.snapshotInput()));
   }
 
   ledger(
