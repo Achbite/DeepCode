@@ -18,7 +18,6 @@ export function renderProviderTurnUserPrompt(dynamicContent: string, contract: D
       projectionVisibility: contract.projectionVisibility,
       frames: contract.frames.map(renderFrame),
       toolIntentTemplates: contract.toolIntentTemplates.map(renderToolIntentTemplate),
-      nextActionInstruction: contract.nextActionInstruction.summary ?? '',
     }),
     [
       'Provider turn instruction:',
