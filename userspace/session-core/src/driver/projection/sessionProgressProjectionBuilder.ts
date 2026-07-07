@@ -82,6 +82,8 @@ export class SessionProgressProjectionBuilder {
     promptSegmentDigests: Array<Record<string, unknown>>;
     stablePrefixHash?: string;
     dynamicSuffixHash?: string;
+    finalUserPromptHash?: string;
+    finalUserPromptCharLength?: number;
     cacheHash?: string;
     ts: string;
     id: string;
@@ -120,6 +122,8 @@ export class SessionProgressProjectionBuilder {
         promptSegmentDigests: input.promptSegmentDigests,
         stablePrefixHash: input.stablePrefixHash,
         dynamicSuffixHash: input.dynamicSuffixHash,
+        finalUserPromptHash: input.finalUserPromptHash,
+        finalUserPromptCharLength: input.finalUserPromptCharLength,
         cacheHash: input.cacheHash,
         cacheAffectsCorrectness: false,
       },

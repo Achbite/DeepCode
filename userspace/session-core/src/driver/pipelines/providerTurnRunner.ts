@@ -63,6 +63,8 @@ export interface ProviderTurnRunnerDependencies<TState extends ProviderTurnRunne
     promptSegmentDigests: Array<Record<string, unknown>>;
     stablePrefixHash?: string;
     dynamicSuffixHash?: string;
+    finalUserPromptHash?: string;
+    finalUserPromptCharLength?: number;
     cacheHash?: string;
     ts: string;
     id: string;
@@ -181,6 +183,8 @@ export class ProviderTurnRunner<TState extends ProviderTurnRunnerState> {
       })) ?? [],
       stablePrefixHash: state.contextAssembly?.stablePrefixHash,
       dynamicSuffixHash: state.contextAssembly?.dynamicSuffixHash,
+      finalUserPromptHash: state.providerTurnFrame?.snapshot?.finalUserPromptHash,
+      finalUserPromptCharLength: state.providerTurnFrame?.snapshot?.finalUserPromptCharLength,
       cacheHash: state.contextAssembly?.cacheHash,
       ts: this.dependencies.now(),
       id: this.dependencies.createId(`cache-${stage}`),

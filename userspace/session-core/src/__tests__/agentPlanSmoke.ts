@@ -6645,6 +6645,8 @@ function assertSessionProgressProjectionBuilderCreatesRunAndCheckpointEvents(): 
     }],
     stablePrefixHash: `stable-${token}`,
     dynamicSuffixHash: `dynamic-${token}`,
+    finalUserPromptHash: `final-user-${token}`,
+    finalUserPromptCharLength: 2048,
     cacheHash: `cache-${token}`,
     ts: '2026-01-01T00:00:00.500Z',
     id: `cache-${token}`,
@@ -6652,6 +6654,8 @@ function assertSessionProgressProjectionBuilderCreatesRunAndCheckpointEvents(): 
   assert(cache, 'session progress projection emits cache telemetry when usage or segments exist');
   assertEqual((cache?.payload as any).promptCacheHitTokens, 7, 'session progress projection normalizes cache usage tokens');
   assertEqual((cache?.payload as any).promptSegmentDigests[0].id, `segment-${token}`, 'session progress projection preserves prompt segment digests');
+  assertEqual((cache?.payload as any).finalUserPromptHash, `final-user-${token}`, 'session progress projection preserves final user prompt hash');
+  assertEqual((cache?.payload as any).finalUserPromptCharLength, 2048, 'session progress projection preserves final user prompt length');
 
   const accepted: AcceptedImplementationPlanContext = {
     planId: `plan-${token}`,
