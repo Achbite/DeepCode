@@ -228,8 +228,7 @@ export class SessionDriverLoop {
       hasPermissionRequest: (events) => kernelEventStatusIndex.hasPermissionRequest(events),
       permissionId: (events) => kernelEventStatusIndex.permissionId(events),
       planProposal: (plan) => planContextIndex.proposalEnvelope(plan),
-      batchProgress: (input) => acceptedPlanTaskLedger().batchProgress(input as Parameters<ReturnType<typeof acceptedPlanTaskLedger>['batchProgress']>[0]),
-      acceptedPlanAfterBatch: (accepted, completedTaskIds) => acceptedPlanTaskLedger().afterBatch(accepted, completedTaskIds),
+      recordKernelBatchProgress: (input) => acceptedPlanTaskLedger().recordKernelBatchProgress(input),
       runtimeSnapshot: (input) => acceptedPlanTaskLedger().runtimeSnapshot(input),
       acceptedPlanComplete: (accepted) => acceptedPlanTaskLedger().complete(accepted),
       executionRequest: (plan, acceptedPlan) => executionPromptCoordinator().executionRequest(plan, acceptedPlan),
@@ -249,7 +248,7 @@ export class SessionDriverLoop {
           current as CurrentTaskContext | undefined,
           packet
         ),
-      afterBatch: (accepted, completedTaskIds) => acceptedPlanTaskLedger().afterBatch(accepted, completedTaskIds),
+      recordTaskCompletion: (completionInput) => acceptedPlanTaskLedger().recordTaskCompletion(completionInput),
       complete: (accepted) => acceptedPlanTaskLedger().complete(accepted),
       resourceValidationCheckpointEvent: (sessionId, runId, accepted, packet, completion, ts, id) =>
         sessionProgressProjectionBuilder.acceptedPlanResourceValidationCheckpointEvent(

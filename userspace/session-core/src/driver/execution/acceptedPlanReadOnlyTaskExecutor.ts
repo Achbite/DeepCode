@@ -83,7 +83,13 @@ export interface AcceptedPlanReadOnlyTaskExecutorPorts<
     current: unknown,
     packet: ResourcePacket
   ): ({ ok: true } & AcceptedPlanReadOnlyResourceCompletion) | { ok: false };
-  afterBatch(accepted: AcceptedImplementationPlanContext, completedTaskIds: string[]): AcceptedImplementationPlanContext;
+  recordTaskCompletion(input: {
+    acceptedPlan: AcceptedImplementationPlanContext;
+    completedTaskIds: string[];
+  }): {
+    completedTaskIds: string[];
+    nextAcceptedPlan: AcceptedImplementationPlanContext;
+  };
   complete(accepted: AcceptedImplementationPlanContext): boolean;
   resourceValidationCheckpointEvent(
     sessionId: string,
@@ -190,7 +196,11 @@ export class AcceptedPlanReadOnlyTaskExecutor<
     );
     if (!completion.ok) return null;
 
-    const nextAccepted = this.ports.afterBatch(accepted, completion.completedTaskIds);
+    const ledgerEffect = this.ports.recordTaskCompletion({
+      acceptedPlan: accepted,
+      completedTaskIds: completion.completedTaskIds,
+    });
+    const nextAccepted = ledgerEffect.nextAcceptedPlan;
     const checkpoint = this.ports.resourceValidationCheckpointEvent(
       state.sessionId,
       state.runId,

@@ -8,9 +8,10 @@ import type {
 } from '@deepcode/protocol';
 import type { ProjectMemoryMode } from '../../context/index.js';
 import type { ProjectWorkingDirectory, ResourcePacket } from '../../context/types.js';
-import type { AcceptedImplementationPlanContext } from '../../accepted-plan/types.js';
+import type { AcceptedImplementationPlanContext, AcceptedPlanBatchProgress } from '../../accepted-plan/types.js';
 import type { InteractionOverlayContext } from '../pipelines/interactionOverlayCodec.js';
 import type { PlanContext } from '../proposal/planContextIndex.js';
+import type { ProposalEnvelope } from '../../protocol/types.js';
 import { decisionContinuationInput } from '../runContinuation.js';
 import type { InterventionLevel, ReviewContinuationMode } from '../types.js';
 import { assertKernelReplyOk, kernelReplyErrorMessage } from './kernelReplyGuard.js';
@@ -125,13 +126,16 @@ export interface AcceptedActionBundlePlanExecutorPorts {
   actionBatchReadyForReview(events: unknown[]): boolean;
   hasPermissionRequest(events: unknown[]): boolean;
   permissionId(events: unknown[]): string | undefined;
-  planProposal(plan: PlanContext): unknown;
-  batchProgress(input: {
+  planProposal(plan: PlanContext): ProposalEnvelope;
+  recordKernelBatchProgress(input: {
     acceptedPlan: AcceptedImplementationPlanContext;
-    proposal: unknown;
+    proposal: ProposalEnvelope;
     kernelEvents: unknown[];
-  }): { completedTaskIds: string[] };
-  acceptedPlanAfterBatch(accepted: AcceptedImplementationPlanContext, completedTaskIds: string[]): AcceptedImplementationPlanContext;
+  }): {
+    progress: AcceptedPlanBatchProgress;
+    completedTaskIds: string[];
+    nextAcceptedPlan: AcceptedImplementationPlanContext;
+  };
   runtimeSnapshot(input: {
     acceptedPlan: AcceptedImplementationPlanContext;
     resourcePackets: ResourcePacket[];
@@ -316,12 +320,13 @@ export class AcceptedActionBundlePlanExecutor {
 
       if (acceptedOverlay) {
         const progressProposal = this.ports.planProposal(plan);
-        const progress = this.ports.batchProgress({
+        const ledgerEffect = this.ports.recordKernelBatchProgress({
           acceptedPlan: acceptedOverlay.acceptedPlan,
           proposal: progressProposal,
           kernelEvents: batchEvents,
         });
-        const nextAccepted = this.ports.acceptedPlanAfterBatch(acceptedOverlay.acceptedPlan, progress.completedTaskIds);
+        const progress = ledgerEffect.progress;
+        const nextAccepted = ledgerEffect.nextAcceptedPlan;
         const runtime = this.ports.runtimeSnapshot({
           acceptedPlan: acceptedOverlay.acceptedPlan,
           resourcePackets: this.ports.recentResourcePackets(result.events),

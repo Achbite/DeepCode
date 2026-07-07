@@ -5007,9 +5007,29 @@ async function assertAcceptedActionBundlePlanExecutorSubmitsBatchAndReviews(): P
     actionBatchReadyForReview: () => true,
     hasPermissionRequest: () => false,
     permissionId: () => undefined,
-    planProposal: () => ({ proposalId: `proposal-${token}` }),
-    batchProgress: () => ({ completedTaskIds: [] }),
-    acceptedPlanAfterBatch: (accepted) => accepted,
+    planProposal: () => ({
+      schemaVersion: 'deepcode.agent.protocol.v3',
+      proposalId: `proposal-${token}`,
+      runId,
+      sessionId,
+      source: 'llm',
+      kind: 'actionBundle',
+      payload: {},
+      referencedResourcePacketRefs: [],
+      referencedEvidenceRefs: [],
+    } as ProposalEnvelope),
+    recordKernelBatchProgress: (progressInput) => ({
+      progress: {
+        actionIds: [],
+        targetPaths: [],
+        workUnitIds: [],
+        newlyCompletedTaskIds: [],
+        completedTaskIds: [],
+        remainingTaskIds: [],
+      },
+      completedTaskIds: [],
+      nextAcceptedPlan: progressInput.acceptedPlan,
+    }),
     runtimeSnapshot: () => ({}),
     acceptedPlanComplete: () => true,
     executionRequest: () => `execution-${token}`,
@@ -8245,6 +8265,9 @@ function assertRunStateMachineTaskLedger(): void {
   const afterBatch = coordinator.afterBatch(acceptedPlan, progress.completedTaskIds);
   assertEqual(afterBatch.completedTaskIds.includes(taskIds[2]), true, 'task ledger coordinator advances accepted plan completed ids');
   assertEqual(coordinator.complete(afterBatch), false, 'task ledger coordinator keeps incomplete accepted plan open');
+  const completionEffect = coordinator.recordTaskCompletion({ acceptedPlan, completedTaskIds: progress.completedTaskIds });
+  assertEqual(completionEffect.kind, 'taskCompletionRecorded', 'task ledger records deterministic task completion through command effect');
+  assertEqual(completionEffect.nextAcceptedPlan.completedTaskIds.includes(taskIds[2]), true, 'task completion effect carries next accepted plan');
 
   const afterOutcome = coordinator.afterTaskOutcome(afterBatch, taskIds[3]);
   const outcomeEffect = coordinator.recordModelTaskOutcome({ acceptedPlan: afterBatch, taskId: taskIds[3] });

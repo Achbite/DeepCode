@@ -49,6 +49,11 @@ export type AcceptedPlanLedgerCommand =
     taskId: string;
   }
   | {
+    kind: 'recordTaskCompletion';
+    acceptedPlan: AcceptedImplementationPlanContext;
+    completedTaskIds: string[];
+  }
+  | {
     kind: 'recoverLatestCheckpoint';
     acceptedPlan: AcceptedImplementationPlanContext;
     events: AgentEvent[];
@@ -64,6 +69,11 @@ export type AcceptedPlanLedgerEffect =
   | {
     kind: 'modelTaskOutcomeRecorded';
     taskId: string;
+    nextAcceptedPlan: AcceptedImplementationPlanContext;
+  }
+  | {
+    kind: 'taskCompletionRecorded';
+    completedTaskIds: string[];
     nextAcceptedPlan: AcceptedImplementationPlanContext;
   }
   | {
@@ -96,6 +106,13 @@ export class AcceptedPlanTaskLedgerCoordinator {
         nextAcceptedPlan: this.afterTaskOutcome(command.acceptedPlan, command.taskId),
       };
     }
+    if (command.kind === 'recordTaskCompletion') {
+      return {
+        kind: 'taskCompletionRecorded',
+        completedTaskIds: command.completedTaskIds,
+        nextAcceptedPlan: this.afterBatch(command.acceptedPlan, command.completedTaskIds),
+      };
+    }
     return {
       kind: 'latestCheckpointRecovered',
       nextAcceptedPlan: this.withLatestCheckpoint(command.acceptedPlan, command.events),
@@ -126,6 +143,20 @@ export class AcceptedPlanTaskLedgerCoordinator {
       ...input,
     });
     if (effect.kind !== 'modelTaskOutcomeRecorded') {
+      throw new Error(`Unexpected accepted-plan ledger effect: ${effect.kind}`);
+    }
+    return effect;
+  }
+
+  recordTaskCompletion(input: {
+    acceptedPlan: AcceptedImplementationPlanContext;
+    completedTaskIds: string[];
+  }): Extract<AcceptedPlanLedgerEffect, { kind: 'taskCompletionRecorded' }> {
+    const effect = this.execute({
+      kind: 'recordTaskCompletion',
+      ...input,
+    });
+    if (effect.kind !== 'taskCompletionRecorded') {
       throw new Error(`Unexpected accepted-plan ledger effect: ${effect.kind}`);
     }
     return effect;
