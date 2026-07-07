@@ -8580,6 +8580,8 @@ function assertProviderRepairMessageBuilderScopesNativeRepairReferences(): void 
 
   assertEqual(beforeAccepted.split(shapeLine).length - 1, 0, 'pre-plan native side-effect repair does not expose actionBundle shape');
   assertEqual(duplicateBeforeAccepted.split(shapeLine).length - 1, 0, 'pre-plan duplicate native read repair does not expose actionBundle shape');
+  assert(!beforeAccepted.includes('No executable tool intent templates are visible'), 'pre-plan native repair omits redundant non-executable tool template prose');
+  assert(beforeAccepted.includes('[ToolIntentTemplates]\n\n- none\n\n[/ToolIntentTemplates]'), 'pre-plan native repair leaves tool intent templates empty');
   assertEqual(scopeRepair.split(shapeLine).length - 1, 0, 'accepted-plan scope repair relies on current task contract instead of full actionBundle shape');
   assertEqual(planReviewRepair.split(shapeLine).length - 1, 0, 'plan review repair relies on Kernel report and provider turn contract instead of full actionBundle shape');
   assert(scopeRepair.includes('ProviderTurnContract'), 'scope repair still includes provider turn contract');

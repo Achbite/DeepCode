@@ -137,10 +137,7 @@ function repairToolIntentTemplates(
   acceptedContext: Record<string, unknown>
 ): string[] {
   if (!input.allowedKinds.includes('actionBundle')) {
-    return [
-      'No executable tool intent templates are visible in this repair call.',
-      'Use taskPlan operation intent, focused resourceRequest, decisionRequest, answer, or diagnostic according to allowedOutputs.',
-    ];
+    return [];
   }
   const templates = Array.isArray(acceptedContext.currentTaskActionTemplates)
     ? acceptedContext.currentTaskActionTemplates
