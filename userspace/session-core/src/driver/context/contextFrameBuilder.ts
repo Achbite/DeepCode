@@ -305,10 +305,10 @@ export class ContextFrameBuilder {
     }
     return [
       `Allowed proposal kinds: ${allowedKinds.join(', ')}.`,
-      'If ResourceEvidence and AccessIndex already contain enough workspace facts for the user request, output taskPlan or answer as allowed instead of rereading low-value context.',
-      'Use resourceRequest only for missing concrete evidence needed to plan, answer, or edit safely. Keep it focused on a different path/range/search query that adds new facts.',
-      'Plan review is the normal confirmation checkpoint for reviewable assumptions; use decisionRequest only when a blocking user choice prevents forming any valid taskPlan.',
-      'Decide from the current PromptPacket frames; do not re-audit protocol rules, permission gates, or unrelated prior requirements in reasoning.',
+      'If ResourceEvidence or AccessIndex is enough to form a useful taskPlan or answer, output that proposal now; do not narrate or debate whether to read more context.',
+      'Use resourceRequest only for missing concrete evidence that would change the next proposal. Keep it focused on a different path/range/search query that adds new facts.',
+      'Use decisionRequest only when a blocking user choice prevents any valid taskPlan; put reviewable assumptions in taskPlan risks or reviewCheckpoints.',
+      'Decide from the current PromptPacket frames; do not re-audit protocol rules, permission gates, resource policy, or unrelated prior requirements in reasoning.',
       'For side-effect work, plan first unless Session already provided an accepted task.',
       'Do not infer execution facts or permissions from memory.',
     ].join(' ');

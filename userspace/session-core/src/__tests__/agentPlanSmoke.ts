@@ -361,15 +361,15 @@ function assertProviderTurnContractFrameOrder(): void {
     generatedArtifactCount: 0,
   });
   assert(
-    String(planningContract.nextActionInstruction.summary ?? '').includes('ResourceEvidence and AccessIndex already contain enough workspace facts'),
-    'planning provider turn instructs the model to reuse existing evidence before resourceRequest'
+    String(planningContract.nextActionInstruction.summary ?? '').includes('output that proposal now; do not narrate or debate whether to read more context'),
+    'planning provider turn tells the model to produce the proposal instead of debating reads'
   );
   assert(
-    String(planningContract.nextActionInstruction.summary ?? '').includes('Plan review is the normal confirmation checkpoint'),
+    String(planningContract.nextActionInstruction.summary ?? '').includes('blocking user choice prevents any valid taskPlan'),
     'planning provider turn keeps decisionRequest behind blocking choices'
   );
   assert(
-    String(planningContract.nextActionInstruction.summary ?? '').includes('do not re-audit protocol rules'),
+    String(planningContract.nextActionInstruction.summary ?? '').includes('do not re-audit protocol rules, permission gates, resource policy'),
     'planning provider turn keeps reasoning focused on current frames'
   );
 }
@@ -8678,7 +8678,7 @@ function assertPromptEnvelope(): void {
   assert(prompt.dynamicSuffix.includes('Execution-only proposal schema is withheld in this turn'), 'planning provider turn withholds execution proposal schema');
   assert(!prompt.dynamicSuffix.includes('Current schema digest covers only: answer, resourceRequest, actionBundle'), 'planning schema digest does not list execution-only actionBundle as a visible shape');
   assert(!prompt.dynamicSuffix.includes('taskOutcome top-level field'), 'planning schema digest does not list accepted-task outcome shape');
-  assert(prompt.stablePrefix.includes('Use resourceRequest only when current ResourceEvidence and AccessIndex do not contain the concrete facts needed'), 'stable prompt gates resourceRequest behind missing concrete facts');
+  assert(prompt.stablePrefix.includes('resourceRequest is only for missing concrete facts that would change the next proposal'), 'stable prompt gates resourceRequest behind proposal-changing missing facts');
   assert(prompt.stablePrefix.includes('Plan review is the normal confirmation checkpoint for reviewable implementation assumptions'), 'stable prompt routes reviewable assumptions through taskPlan review');
   assert(prompt.stablePrefix.includes('blocking user choice is required before any valid taskPlan can be formed'), 'stable prompt narrows decisionRequest to blocking choices');
   assert(prompt.stablePrefix.includes('Keep private reasoning concise'), 'stable prompt asks provider reasoning to stay concise');
@@ -8752,8 +8752,9 @@ function assertPromptEnvelope(): void {
   assert(renderedContract.includes('kind: MemoryPlaceholder'), 'prompt packet labels compacted memory frame');
   assert(renderedContract.includes('trust: compressedReference'), 'prompt packet marks memory as reference rather than fact');
   assert(renderedContract.includes('kind: NextActionInstruction'), 'prompt packet includes final next-action instruction');
-  assert(renderedContract.includes('Plan review is the normal confirmation checkpoint for reviewable assumptions'), 'prompt packet next action narrows planning decisionRequest');
-  assert(renderedContract.includes('Decide from the current PromptPacket frames'), 'prompt packet next action asks for concise current-frame reasoning');
+  assert(renderedContract.includes('output that proposal now; do not narrate or debate whether to read more context'), 'prompt packet next action avoids read-policy narration loops');
+  assert(renderedContract.includes('blocking user choice prevents any valid taskPlan'), 'prompt packet next action narrows planning decisionRequest');
+  assert(renderedContract.includes('do not re-audit protocol rules, permission gates, resource policy'), 'prompt packet next action asks for concise current-frame reasoning');
   const memoryFrameIndex = renderedContract.indexOf('kind: MemoryPlaceholder');
   const dynamicDialogueIndex = renderedContract.indexOf('kind: DynamicDialogue');
   const resourceEvidenceIndex = renderedContract.indexOf('kind: ResourceEvidence');
