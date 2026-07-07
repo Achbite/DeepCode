@@ -2188,6 +2188,26 @@ async function assertProviderPipelineUsesProviderTurnContract(): Promise<void> {
     true,
     'provider pipeline keeps provider turn contract in retry base prompt'
   );
+  const preRenderedMessages = pipeline.messages(contract);
+  const preRenderedTurns: LlmChatRequest['messages'][] = [];
+  await pipeline.runWithNativeTools({
+    profileId: `profile-prerendered-${token}`,
+    state: { token },
+    contract,
+    stage: `stage-prerendered-${token}`,
+    messages: preRenderedMessages,
+    isEmptyResponseError: () => false,
+    runTurn: async (_profileId, _state, _stage, messages) => {
+      preRenderedTurns.push(messages);
+      return { content: `{"kind":"answer","token":"${token}"}`, toolCalls: [] };
+    },
+  });
+  const preRenderedUserPrompt = String(preRenderedTurns[0]?.find((message) => message.role === 'user')?.content ?? '');
+  assertEqual(
+    (preRenderedUserPrompt.match(/ProviderTurnContract:/g) ?? []).length,
+    1,
+    'provider pipeline does not append a second provider turn contract to pre-rendered messages'
+  );
   const resumedMessages: LlmChatRequest['messages'][] = [];
   await pipeline.runProposalOnly({
     profileId: `profile-resume-${token}`,

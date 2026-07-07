@@ -121,6 +121,9 @@ export class ProviderPipeline {
     if (!messages.length) return this.messages(contract);
     const lastIndex = messages.length - 1;
     const lastMessage = messages[lastIndex];
+    if (lastMessage?.role === 'user' && typeof lastMessage.content === 'string' && lastMessage.content.includes('ProviderTurnContract:')) {
+      return messages;
+    }
     if (lastMessage?.role !== 'user' || typeof lastMessage.content !== 'string') {
       return [
         ...messages,
