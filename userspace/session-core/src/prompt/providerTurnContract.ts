@@ -100,9 +100,6 @@ export function providerVisibleSchemaDigest(input: PromptEnvelopeBuilderInput): 
     visibleSchemaKinds.has('decisionRequest')
       ? 'decisionRequest top-level field: decisionRequest.version/id/question/reason/summary/options/allowsFreeform; question must be a non-empty user-visible string. Use 2-3 mutually exclusive options with one recommended option.'
       : '',
-    turnMode !== 'acceptedTaskExecution' && (visibleSchemaKinds.has('decisionRequest') || visibleSchemaKinds.has('taskPlan'))
-      ? planningDecisionPolicyLines().join('\n')
-      : '',
     visibleSchemaKinds.has('taskPlan')
       ? 'taskPlan top-level field: taskPlan.version/id/title/summary/tasks/risks/reviewCheckpoints. tasks[] is a Session-advanced ordered implementation queue. Do not output scheduling graph structures, source code, codeBlocks, actionBundle, commandBlocks, patches, or executable tool calls.'
       : '',

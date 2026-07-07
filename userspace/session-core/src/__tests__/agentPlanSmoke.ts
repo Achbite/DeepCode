@@ -49,7 +49,7 @@ import { ContextFrameBuilder } from '../driver/context/contextFrameBuilder.js';
 import { ProviderTurnCycle } from '../driver/pipelines/providerTurnCycle.js';
 import { routeProposalKind } from '../driver/proposal/proposalRouter.js';
 import { acceptedPlanContinuationInput, decisionContinuationInput, SameLoopContinuation } from '../driver/runContinuation.js';
-import { renderProviderTurnContractLayer } from '../prompt/providerTurnContract.js';
+import { providerVisibleSchemaDigest, renderProviderTurnContractLayer } from '../prompt/providerTurnContract.js';
 import { AcceptedPlanResourceResumeCoordinator, ActionBundleAdmissionResourceFollowupCoordinator, GeneratedArtifactEvidenceIndex, PathIdentity, ProviderTurnContextCoordinator, ResourceEvidenceIndex, ResourceOrchestrator, ResourceRequestLoop, ResourceRequestRepairCoordinator, buildProviderTurnSnapshot } from '../driver/context/index.js';
 import {
   AcceptedActionBundlePlanExecutor,
@@ -8701,6 +8701,16 @@ function assertPromptEnvelope(): void {
   assert(prompt.dynamicSuffix.includes('Allowed proposals: answer, resourceRequest, taskPlan, actionBundle'), 'dynamic suffix carries allowed proposals');
   assert(!prompt.dynamicSuffix.includes('<ProviderTurnContract schemaVersion="deepcode.session.provider-turn-contract.v1">'), 'dynamic suffix does not duplicate provider turn contract');
   assert(!prompt.dynamicLayerNames.includes('promptPacketFrame'), 'provider turn contract is rendered once by ProviderPipeline');
+  const planningSchemaDigest = providerVisibleSchemaDigest({
+    workflowState: 'needProposal',
+    allowedProposals: ['answer', 'resourceRequest', 'decisionRequest', 'taskPlan'],
+    capabilityCatalogSummary: 'fs.read',
+    userRequest: 'Plan the current request.',
+  });
+  assert(planningSchemaDigest.includes('decisionRequest top-level field'), 'schema digest keeps decisionRequest field shape');
+  assert(planningSchemaDigest.includes('taskPlan top-level field'), 'schema digest keeps taskPlan field shape');
+  assert(!planningSchemaDigest.includes('During planning, prefer taskPlan'), 'schema digest does not duplicate planning decision policy');
+  assert(!planningSchemaDigest.includes('blocking user choice is required before any valid taskPlan'), 'schema digest does not duplicate decisionRequest policy');
   const renderedContract = renderProviderTurnContractLayer({
     workflowState: 'needProposal',
     allowedProposals: ['answer', 'resourceRequest', 'actionBundle'],
