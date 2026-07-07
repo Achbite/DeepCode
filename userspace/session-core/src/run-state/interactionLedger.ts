@@ -251,7 +251,9 @@ function collectResolvedPlanKeys(events: AgentEvent[]): Set<string> {
     const payload = asRecord(event.payload);
     if (!payload || !isTerminalStatus(stringField(payload, 'status'))) continue;
     const runId = stringField(payload, 'runId');
-    const planId = stringField(payload, 'planId') ?? stringField(payload, 'sourcePlanId');
+    const planId = stringField(payload, 'planId') ??
+      stringField(payload, 'sourcePlanId') ??
+      stringField(payload, 'targetId');
     const key = planDecisionKey(runId, planId);
     if (key) resolved.add(key);
   }

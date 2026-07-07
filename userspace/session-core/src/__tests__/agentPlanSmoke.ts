@@ -9423,6 +9423,23 @@ function assertInteractionLedgerResolvesTerminalSourcePlanReview(): void {
     null,
     'interaction ledger closes the source plan when a terminal review references sourcePlanId'
   );
+  const targetOnlyPlanReview = {
+    id: `event-${suffix}-plan-target-review`,
+    sessionId,
+    ts: '2026-01-01T00:00:03.000Z',
+    kind: 'plan_review',
+    payload: {
+      runId: planRunId,
+      targetId: planId,
+      status: 'accepted',
+      confirmable: false,
+    },
+  } as AgentEvent;
+  assertEqual(
+    findActiveInteraction({ events: [planCard, targetOnlyPlanReview] }),
+    null,
+    'interaction ledger closes a pending plan when terminal plan review only carries targetId'
+  );
 }
 
 function assertInteractionLedgerTerminalRunStateClosesPlan(): void {
@@ -9512,6 +9529,81 @@ function assertProjectionResolvesPlanAfterSourceReview(): void {
     planBlock?.status,
     'completed',
     'timeline projection closes the source plan block after a terminal sourcePlanId review'
+  );
+  const targetOnlyReview = {
+    id: `event-${suffix}-target-review`,
+    sessionId,
+    ts: '2026-01-01T00:00:03.000Z',
+    kind: 'plan_review',
+    payload: {
+      runId: planRunId,
+      targetId: planId,
+      status: 'accepted',
+      confirmable: false,
+    },
+  } as AgentEvent;
+  const targetOnlyProjection = buildNarrativeTimelineProjection({
+    sessionId,
+    events: [planCard, targetOnlyReview],
+    generatedAt: '2026-01-01T00:00:04.000Z',
+  });
+  const targetOnlyBlock = targetOnlyProjection.turns
+    .flatMap((turn) => turn.blocks)
+    .find((block) => block.events.some((event) => event.id === planCard.id));
+  assertEqual(
+    targetOnlyBlock?.status,
+    'completed',
+    'timeline projection closes the source plan block when terminal plan review only carries targetId'
+  );
+  const targetOnlyCheckpoint = {
+    id: `event-${suffix}-target-checkpoint`,
+    sessionId,
+    ts: '2026-01-01T00:00:04.000Z',
+    kind: 'workflow_stage',
+    payload: {
+      runId: `run-child-${suffix}`,
+      targetId: planId,
+      stage: 'accepted_plan.batch_checkpoint',
+      taskLedger: {
+        schemaVersion: 'deepcode.session.task-ledger.v1',
+        planId,
+        runId: `run-child-${suffix}`,
+        taskOrder: ['task-target-only-generic'],
+        completedTaskIds: ['task-target-only-generic'],
+        pendingTaskIds: [],
+        entries: [{
+          taskId: 'task-target-only-generic',
+          title: 'Write target-only generic artifact',
+          targets: ['src/target-only-generic.txt'],
+          status: 'completedByKernelFacts',
+        }],
+      },
+    },
+  } as AgentEvent;
+  const targetOnlyPlanWithTask = {
+    ...planCard,
+    id: `event-${suffix}-target-plan`,
+    payload: {
+      ...(planCard.payload as Record<string, unknown>),
+      implementationPlan: {
+        tasks: [{
+          taskId: 'task-target-only-generic',
+          title: 'Write target-only generic artifact',
+          target: 'src/target-only-generic.txt',
+          acceptanceCriteria: ['Kernel facts show the target-only artifact.'],
+        }],
+      },
+    },
+  } as AgentEvent;
+  const targetOnlyTaskProjection = buildNarrativeTimelineProjection({
+    sessionId,
+    events: [targetOnlyPlanWithTask, targetOnlyReview, targetOnlyCheckpoint],
+    generatedAt: '2026-01-01T00:00:05.000Z',
+  });
+  assertEqual(
+    targetOnlyTaskProjection.taskProjection?.items.find((item) => item.title === 'Write target-only generic artifact')?.status,
+    'completed',
+    'task projection consumes accepted-plan taskLedger checkpoints when the checkpoint only carries targetId'
   );
 }
 

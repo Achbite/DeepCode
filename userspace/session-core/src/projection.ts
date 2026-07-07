@@ -841,9 +841,9 @@ function samePlanDecision(payload: Record<string, unknown>, planRunId?: string, 
     : undefined;
   const decisionPlanId = stringField(payload, 'planId') ??
     stringField(payload, 'sourcePlanId') ??
+    stringField(payload, 'targetId') ??
     (owner ? stringField(owner, 'planId') : undefined) ??
     ownerPlanId;
-  // Plan ownership is keyed by planId across child runs; sourcePlanId and decisionOwner close the source confirmation.
   if (planId && decisionPlanId) return decisionPlanId === planId;
   return !planRunId || !decisionRunId || decisionRunId === planRunId;
 }
