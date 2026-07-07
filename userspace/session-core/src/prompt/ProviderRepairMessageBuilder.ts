@@ -221,10 +221,12 @@ export class ProviderRepairMessageBuilder {
           'Never claim that files were written, commands ran, permissions were granted, or validation passed.',
           'If returning decisionRequest, ask one concise question with 2-3 mutually exclusive options, exactly one recommended option, impact descriptions, allowsFreeform=true, and user-visible text in the current user language.',
           'If returning taskPlan, put taskPlan.version/id/title/summary/tasks/risks/reviewCheckpoints directly on the top-level JSON object. tasks[] must be ordered by practical development sequence; deprecated graph fields may be parsed for telemetry but are not required. taskPlan must not include source code, codeBlocks, actionBundle, commandBlocks, patches, or executable tool calls.',
-          'If returning actionBundle after acceptedTaskPlan, put userPlanMarkdown, codeBlocks, and actionBundle directly on the top-level JSON object. Do not wrap them in a payload object. validationExpectations[] and reviewExpectations[] are optional provider notes; Session derives routine defaults when they are omitted.',
-          ...actionBundleProtocolShapeLines(),
-          'Command plans use actionBundle.actions[] with toolId="process.exec" and typed args; do not output commandBlocks.',
-          'Use codeBlocks[].contentLines for source code in Complete-stage actionBundle only. Do not output capability, permissionLabels, accessScopes, resourceScope, commandBlocks, legacy implementationPlan, or large/multiline codeBlocks.content strings.',
+          ...(afterAcceptedPlan ? [
+            'If returning actionBundle after acceptedTaskPlan, put userPlanMarkdown, codeBlocks, and actionBundle directly on the top-level JSON object. Do not wrap them in a payload object.',
+            'Use current ProviderTurnContract ToolIntentTemplates or currentTaskCapabilities to choose action toolIds and targets.',
+            'Use codeBlocks[].contentLines for source code in Complete-stage actionBundle only.',
+          ] : []),
+          'Do not output capability, permissionLabels, accessScopes, resourceScope, commandBlocks, legacy implementationPlan, or large/multiline codeBlocks.content strings.',
         ].join('\n'),
       },
       {
@@ -269,9 +271,11 @@ export class ProviderRepairMessageBuilder {
             ? 'A plan has already been accepted. If executable work is ready, return kind="actionBundle" within the accepted plan scope.'
             : 'If enough facts are available, return kind="answer"; otherwise return kind="resourceRequest" only for a different target/range or search query that adds new evidence.',
           'Never request fs.read or fs.list for any duplicate target/range listed below. Use the existing ResourcePacket facts.',
-          'For kind="actionBundle", put userPlanMarkdown, codeBlocks, and actionBundle directly on the top-level JSON object. Do not wrap them in a payload object. validationExpectations[] and reviewExpectations[] are optional provider notes; Session derives routine defaults when they are omitted.',
-          ...actionBundleProtocolShapeLines(),
-          'Use codeBlocks[].contentLines for source code.',
+          ...(afterAcceptedPlan ? [
+            'For kind="actionBundle", put userPlanMarkdown, codeBlocks, and actionBundle directly on the top-level JSON object. Do not wrap them in a payload object.',
+            'Use current ProviderTurnContract ToolIntentTemplates or currentTaskCapabilities to choose action toolIds and targets.',
+            'Use codeBlocks[].contentLines for source code.',
+          ] : []),
         ].join('\n'),
       },
       {
@@ -458,8 +462,8 @@ export class ProviderRepairMessageBuilder {
           'If executable work is still valid, return kind="actionBundle" with one related implementation batch. Multiple related files are allowed when all targets are inside the accepted plan.',
           'Before the final JSON proposal, stream visible edit drafts with <deepcode-part>{...}</deepcode-part> frames when generating long codeBlocks/actionBundles. Final workspace writes still come only from the complete actionBundle JSON.',
           'All user-visible natural language in narration, userPlanMarkdown, validation descriptions, and review guidance must follow the current user input language.',
-          'For kind="actionBundle", put userPlanMarkdown, codeBlocks, and actionBundle directly on the top-level JSON object. Do not wrap them in a payload object. validationExpectations[] and reviewExpectations[] are optional provider notes; Session derives routine defaults when they are omitted.',
-          ...actionBundleProtocolShapeLines(),
+          'For kind="actionBundle", put userPlanMarkdown, codeBlocks, and actionBundle directly on the top-level JSON object. Do not wrap them in a payload object.',
+          'Use current ProviderTurnContract ToolIntentTemplates or currentTaskCapabilities to choose action toolIds and targets.',
           resourceRequestProtocolShapeLine(),
           'Use codeBlocks[].contentLines for source code.',
           'Do not output legacy implementationPlan, commandBlocks, capability, permissionLabels, accessScopes, resourceScope, or large/multiline codeBlocks.content strings.',

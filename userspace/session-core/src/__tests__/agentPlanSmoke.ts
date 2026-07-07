@@ -91,6 +91,7 @@ import {
 } from '../driver/runFrame.js';
 import { AcceptedPlanResourceResumePromptBuilder } from '../prompt/AcceptedPlanResourceResumePromptBuilder.js';
 import { ProviderRepairMessageBuilder } from '../prompt/ProviderRepairMessageBuilder.js';
+import type { NativeToolCallProposal } from '../provider/providerStreamParts.js';
 import { ResourceManifestBuilder } from '../resources/index.js';
 import type { ContextAssemblyRecord, PromptCachePlan } from '../context/index.js';
 import type { PromptEnvelope } from '../prompt/types.js';
@@ -100,6 +101,7 @@ async function main(): Promise<void> {
   assertLegacyProviderShapesAreRejected();
   assertActionBundleProtocolFields();
   assertProviderRepairMessageBuilderAvoidsDuplicateActionBundleReference();
+  assertProviderRepairMessageBuilderScopesNativeRepairReferences();
   assertProtocolGateCanonicalizesBareRepair();
   assertActionBundleActionInspectorReadsActionShape();
   assertPathIdentityNormalizesWorkspacePaths();
@@ -8465,6 +8467,83 @@ function assertProviderRepairMessageBuilderAvoidsDuplicateActionBundleReference(
   assert(joined.includes('Minimal actionBundle skeleton'), 'repair prompt keeps a minimal actionBundle skeleton for invalid actionBundle errors');
   const validationLine = 'actionBundle.validationExpectations[] are optional reviewable validation notes shaped';
   assertEqual(joined.split(validationLine).length - 1, 1, 'repair quick reference does not duplicate actionBundle validation schema lines');
+}
+
+function assertProviderRepairMessageBuilderScopesNativeRepairReferences(): void {
+  const token = randomSmokeToken('native-repair-reference');
+  const prompt = buildPromptEnvelope({
+    workflowState: `repair-${token}`,
+    allowedProposals: ['resourceRequest', 'decisionRequest', 'taskPlan', 'diagnostic'],
+    capabilityCatalogSummary: 'none',
+    userRequest: `Repair native tool call ${token}`,
+  });
+  const state = {
+    runId: `run-${token}`,
+    userRequest: `Repair native tool call ${token}`,
+    conversationRoots: [],
+    resourcePackets: [],
+    implementationBatch: {},
+    acceptedContext: {
+      currentTask: { taskId: `task-${token}`, targets: [`target-${token}.txt`], capability: 'fs.write' },
+      currentTaskActionTemplates: [{
+        intentId: `template-${token}`,
+        operation: 'fs.write',
+        targets: [`target-${token}.txt`],
+        template: { toolId: 'fs.write', args: { path: `target-${token}.txt` } },
+      }],
+    },
+    currentTaskContext: {
+      taskId: `task-${token}`,
+      taskTitle: `Task ${token}`,
+      goal: `Handle target ${token}`,
+      targets: [`target-${token}.txt`],
+      capabilities: ['fs.write'],
+    },
+    completedTaskCount: 0,
+  };
+  const toolCall = {
+    index: 0,
+    callId: `call-${token}`,
+    name: 'fs.write',
+    arguments: { path: `target-${token}.txt` },
+  } as NativeToolCallProposal;
+  const turn = { content: `native tool attempt ${token}` };
+  const builder = new ProviderRepairMessageBuilder();
+  const shapeLine = 'The nested actionBundle object must include {version,id,goal,actions,...};';
+  const beforeAccepted = builder.sideEffectNativeToolRepairMessages(prompt, state, toolCall, turn, false)
+    .map((message) => typeof message.content === 'string' ? message.content : JSON.stringify(message.content))
+    .join('\n');
+  const duplicateBeforeAccepted = builder.nativeToolDuplicateRepairMessages(prompt, state, turn, [{
+    toolCall,
+    signature: {
+      key: `key-${token}`,
+      toolName: 'fs.read',
+      path: `target-${token}.txt`,
+    },
+    entry: {
+      signature: {
+        key: `key-${token}`,
+        toolName: 'fs.read',
+        path: `target-${token}.txt`,
+      },
+      packet: { id: `packet-${token}` },
+      contentHash: `hash-${token}`,
+      repeatCount: 2,
+    },
+  }], false).map((message) => typeof message.content === 'string' ? message.content : JSON.stringify(message.content)).join('\n');
+  const scopeRepair = builder.acceptedPlanScopeRepairMessages(prompt, state, {
+    proposalId: `proposal-${token}`,
+    kind: 'actionBundle',
+    payload: { actionBundle: { actions: [] } },
+  } as ProposalEnvelope, [`target outside accepted scope ${token}`])
+    .map((message) => typeof message.content === 'string' ? message.content : JSON.stringify(message.content))
+    .join('\n');
+
+  assertEqual(beforeAccepted.split(shapeLine).length - 1, 0, 'pre-plan native side-effect repair does not expose actionBundle shape');
+  assertEqual(duplicateBeforeAccepted.split(shapeLine).length - 1, 0, 'pre-plan duplicate native read repair does not expose actionBundle shape');
+  assertEqual(scopeRepair.split(shapeLine).length - 1, 0, 'accepted-plan scope repair relies on current task contract instead of full actionBundle shape');
+  assert(scopeRepair.includes('ProviderTurnContract'), 'scope repair still includes provider turn contract');
+  assert(scopeRepair.includes('currentTaskActionTemplates'), 'scope repair still exposes current task action templates');
 }
 
 function assertPromptEnvelope(): void {
