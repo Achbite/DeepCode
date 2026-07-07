@@ -11,9 +11,11 @@ import type {
   ProviderTurnSnapshotResourceBlock,
   ProviderTurnSnapshotSegment,
 } from '../runFrame.js';
+import { renderProviderTurnUserPrompt } from './providerTurnPromptRenderer.js';
 
 export function buildProviderTurnSnapshot(contract: DriverProviderTurnFrame): ProviderTurnSnapshot {
   const renderedContract = renderContractForSnapshot(contract);
+  const finalUserPrompt = renderProviderTurnUserPrompt(contract.prompt.dynamicSuffix, contract);
   const contextAssembly = contract.contextAssembly;
   return {
     schemaVersion: 'deepcode.session.provider-turn-snapshot.v1',
@@ -29,6 +31,8 @@ export function buildProviderTurnSnapshot(contract: DriverProviderTurnFrame): Pr
     dynamicSuffixHash: contextAssembly?.dynamicSuffixHash ?? stableHash(contract.prompt.dynamicSuffix),
     stablePrefixCharLength: contract.prompt.stablePrefix.length,
     dynamicSuffixCharLength: contract.prompt.dynamicSuffix.length,
+    finalUserPromptHash: stableHash(finalUserPrompt),
+    finalUserPromptCharLength: finalUserPrompt.length,
     providerTurnContractHash: stableHash(renderedContract),
     providerTurnContractCharLength: renderedContract.length,
     segmentOrder: contextAssembly?.segmentOrder ? [...contextAssembly.segmentOrder] : [],

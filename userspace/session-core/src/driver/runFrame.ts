@@ -141,6 +141,8 @@ export interface ProviderTurnSnapshot {
   readonly dynamicSuffixHash: string;
   readonly stablePrefixCharLength: number;
   readonly dynamicSuffixCharLength: number;
+  readonly finalUserPromptHash: string;
+  readonly finalUserPromptCharLength: number;
   readonly providerTurnContractHash: string;
   readonly providerTurnContractCharLength: number;
   readonly segmentOrder: string[];

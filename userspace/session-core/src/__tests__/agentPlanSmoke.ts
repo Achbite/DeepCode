@@ -716,6 +716,8 @@ function assertProviderTurnSnapshotRecordsContextAdmissionShape(): void {
   assertEqual(snapshot.frames.at(-1)?.kind, 'NextActionInstruction', 'provider turn snapshot records final next action frame');
   assertEqual(snapshot.resourceBlocks.length > 0, true, 'provider turn snapshot records resource block metadata');
   assertEqual(snapshot.providerTurnContractHash.length > 0, true, 'provider turn snapshot records provider contract hash');
+  assertEqual(snapshot.finalUserPromptHash.length > 0, true, 'provider turn snapshot records final user prompt hash');
+  assertEqual(snapshot.finalUserPromptCharLength > snapshot.dynamicSuffixCharLength, true, 'provider turn snapshot records rendered contract appended to dynamic prompt');
 }
 
 async function assertHookObserverProducesTraceOnly(): Promise<void> {
@@ -1825,6 +1827,7 @@ async function assertProviderPipelineUsesProviderTurnContract(): Promise<void> {
   assertEqual(firstUserPrompt.startsWith(prompt.dynamicSuffix), true, 'provider pipeline keeps dynamic suffix first');
   assertEqual(firstUserPrompt.includes('ProviderTurnContract:'), true, 'provider pipeline renders provider turn contract');
   assertEqual(firstUserPrompt.includes(`answer-${token}`), true, 'provider pipeline renders next action instruction');
+  assertEqual(buildProviderTurnSnapshot(contract).finalUserPromptCharLength, firstUserPrompt.length, 'provider pipeline and context admission snapshot share user prompt renderer');
   assertEqual(firstMessages[1]?.length, 3, 'provider pipeline appends one retry instruction after empty response');
   const retryUserPrompt = String(firstMessages[1]?.[1]?.content ?? '');
   assertEqual(
