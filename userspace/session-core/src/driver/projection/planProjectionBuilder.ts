@@ -186,7 +186,7 @@ export class PlanProjectionBuilder {
     id: string;
   }): AgentEvent {
     const { state, proposal, ts, id } = input;
-    const implementationPlan = objectRecord(proposal.payload) ?? {};
+    const implementationPlan = sanitizePlanProjectionPayload(objectRecord(proposal.payload) ?? {});
     const planId = stringValue(implementationPlan.id) ?? proposal.proposalId;
     const summary = stringValue(implementationPlan.summary)
       ?? stringValue(implementationPlan.title)
@@ -384,7 +384,7 @@ function readableImplementationPlan(
       acceptance: stringArrayValue(record.acceptanceCriteria),
       failure: stringArrayValue(record.failureCriteria),
       intentKind: stringValue(record.capability),
-      metadata: record,
+      metadata: sanitizePlanTaskProjectionMetadata(record),
     }];
   });
   const risks = stringArrayValue(plan.risks);
@@ -432,6 +432,24 @@ function readableImplementationPlan(
       },
     ],
   };
+}
+
+function sanitizePlanProjectionPayload(plan: Record<string, unknown>): Record<string, unknown> {
+  const tasks = Array.isArray(plan.tasks)
+    ? plan.tasks.map((task) => sanitizePlanTaskProjectionMetadata(objectRecord(task) ?? {}))
+    : plan.tasks;
+  return {
+    ...plan,
+    ...(tasks !== undefined ? { tasks } : {}),
+  };
+}
+
+function sanitizePlanTaskProjectionMetadata(record: Record<string, unknown>): Record<string, unknown> {
+  const result = { ...record };
+  delete result.dependencies;
+  delete result.dependsOn;
+  delete result.dependencyDepth;
+  return result;
 }
 
 function projectionItem(

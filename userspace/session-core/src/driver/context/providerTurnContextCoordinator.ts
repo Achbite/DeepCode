@@ -102,7 +102,7 @@ export class ProviderTurnContextCoordinator<State extends ProviderTurnContextSta
   constructor(private readonly ports: ProviderTurnContextCoordinatorPorts<State>) {}
 
   async prepare(state: State, input: ProviderTurnContextInput): Promise<ProviderTurnContextResult> {
-    const allowedProposals = this.ports.allowedProposals(state.stateContract?.allowedProposals ?? [
+    const kernelAllowedProposals = this.ports.allowedProposals(state.stateContract?.allowedProposals ?? [
       'answer',
       'resourceRequest',
       'decisionRequest',
@@ -110,6 +110,8 @@ export class ProviderTurnContextCoordinator<State extends ProviderTurnContextSta
       'actionBundle',
       'diagnostic',
     ], state);
+    const acceptedExecution = Boolean(state.acceptedImplementationPlan || state.currentTaskContext);
+    const allowedProposals = providerVisibleAllowedProposals(kernelAllowedProposals, acceptedExecution);
     const providerUserRequest = this.providerVisibleUserRequest(state, input.inputContent);
     const userGuidance = this.ports.collectUserGuidanceEvents(input.lastResult.events, state.runId);
 
@@ -307,6 +309,16 @@ export class ProviderTurnContextCoordinator<State extends ProviderTurnContextSta
         : 'Use only current task targets unless a decisionRequest expands scope.',
     }));
   }
+}
+
+export function providerVisibleAllowedProposals(
+  allowedProposals: readonly string[],
+  acceptedExecution: boolean
+): string[] {
+  const blocked = acceptedExecution
+    ? new Set(['taskPlan', 'implementationPlan', 'reviewSummary'])
+    : new Set(['actionBundle', 'taskOutcome', 'implementationPlan', 'reviewSummary']);
+  return [...new Set(allowedProposals)].filter((kind) => !blocked.has(kind));
 }
 
 function objectRecord(value: unknown): Record<string, unknown> | undefined {

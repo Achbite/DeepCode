@@ -125,6 +125,7 @@ async function main(): Promise<void> {
   assertProviderTurnContractFrameOrder();
   assertProviderTurnSnapshotRecordsContextAdmissionShape();
   await assertProviderTurnContextCoordinatorUsesFreshAssembly();
+  await assertProviderTurnContextCoordinatorNarrowsPlanningAllowedKinds();
   await assertHookObserverProducesTraceOnly();
   await assertProviderPipelineUsesProviderTurnContract();
   assertProviderJsonModeCoordinator();
@@ -837,6 +838,72 @@ async function assertProviderTurnContextCoordinatorUsesFreshAssembly(): Promise<
   assertEqual(result.modelContextBundle.contextAssembly?.contextAssemblyId, fresh.contextAssembly.contextAssemblyId, 'model context bundle keeps the same fresh context');
   assertEqual(result.modelContextBundle.providerTurnContract.contextAssembly?.contextAssemblyId, fresh.contextAssembly.contextAssemblyId, 'provider turn frame keeps the same fresh context');
   assertEqual(result.modelContextBundle.providerTurnContract.contextAssembly?.contextAssemblyId === stale.contextAssembly.contextAssemblyId, false, 'stale state context assembly does not overwrite the current admission');
+}
+
+async function assertProviderTurnContextCoordinatorNarrowsPlanningAllowedKinds(): Promise<void> {
+  const token = randomSmokeToken('provider-context-allowed');
+  let assembledAllowed: string[] = [];
+  let contractAllowed: string[] = [];
+  const coordinator = new ProviderTurnContextCoordinator<any>({
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${token}`,
+    assembleContext: (input) => {
+      assembledAllowed = [...input.allowedProposals];
+      return assembleContext({
+        ...input,
+        contextAssemblyId: `assembly-${token}`,
+      });
+    },
+    allowedProposals: (allowed) => allowed,
+    capabilityCatalogSummary: () => `capability-${token}`,
+    memoryHints: () => [],
+    collectUserGuidanceEvents: () => [],
+    appendConsumedGuidance: async ({ result }) => result,
+    buildProviderTurnContract: (input) => {
+      contractAllowed = [...input.allowedKinds];
+      return new ContextFrameBuilder().buildSessionProviderTurnContract({
+        contractId: input.contractId,
+        sessionId: input.sessionId,
+        runId: input.runId,
+        allowedKinds: input.allowedKinds,
+        prompt: input.prompt,
+        contextAssembly: input.contextAssembly,
+        userRequest: input.userRequest,
+        confirmedDecisionSummary: input.confirmedDecisionSummary,
+        acceptedPlanActive: input.acceptedPlanActive,
+        currentTaskContext: input.currentTaskContext,
+        resourcePackets: input.resourcePackets,
+        generatedArtifactCount: input.generatedArtifactCount,
+        toolIntentTemplates: input.toolIntentTemplates,
+        nextActionInstruction: input.nextActionInstruction,
+      });
+    },
+  });
+
+  const result = await coordinator.prepare({
+    sessionId: `session-${token}`,
+    runId: `run-${token}`,
+    userRequest: `request ${token}`,
+    stateContract: {
+      stateId: `state-${token}`,
+      allowedProposals: ['answer', 'resourceRequest', 'decisionRequest', 'taskPlan', 'actionBundle', 'taskOutcome', 'diagnostic'],
+    },
+    memoryDocument: buildSessionMemoryDocument([]),
+    resourcePackets: [],
+    conversationRoots: [],
+    generatedArtifactEvidence: new Map(),
+  }, {
+    contextAssemblyId: `requested-${token}`,
+    contractId: `contract-${token}`,
+    inputContent: `input ${token}`,
+    lastResult: genericSessionResult(`session-${token}`),
+  });
+
+  assertEqual(assembledAllowed.includes('actionBundle'), false, 'planning ContextAdmission does not expose actionBundle');
+  assertEqual(assembledAllowed.includes('taskOutcome'), false, 'planning ContextAdmission does not expose taskOutcome');
+  assertEqual(contractAllowed.includes('actionBundle'), false, 'planning provider contract does not expose actionBundle');
+  assertEqual(result.allowedProposals.includes('actionBundle'), false, 'planning result allowed proposals are provider-visible only');
+  assertEqual(result.modelContextBundle.providerTurnContract.allowedKinds.includes('taskPlan'), true, 'planning still allows taskPlan');
 }
 
 async function assertHookObserverProducesTraceOnly(): Promise<void> {
@@ -6339,6 +6406,9 @@ function assertProjectionBuildersKeepKernelAndReviewReadModels(): void {
           capability: 'fs.write',
           acceptanceCriteria: [`Accept ${token}`],
           failureCriteria: [`Fail ${token}`],
+          dependencies: [`dependency-${token}`],
+          dependsOn: [`depends-${token}`],
+          dependencyDepth: 1,
         }],
       },
       referencedResourcePacketRefs: [],
@@ -6351,6 +6421,10 @@ function assertProjectionBuildersKeepKernelAndReviewReadModels(): void {
   assertEqual(implementationPayload.confirmable, true, 'plan projection keeps implementation plan confirmable');
   assertEqual(implementationPayload.content, undefined, 'implementation plan projection does not emit markdown fallback content');
   assert(JSON.stringify(implementationPayload.readablePlan.sections).includes(targetPath), 'plan projection renders implementation plan target in structured sections');
+  const implementationPayloadText = JSON.stringify(implementationPayload);
+  assert(!implementationPayloadText.includes('dependencies'), 'plan projection does not expose legacy dependencies field');
+  assert(!implementationPayloadText.includes('dependsOn'), 'plan projection does not expose legacy dependsOn field');
+  assert(!implementationPayloadText.includes('dependencyDepth'), 'plan projection does not expose legacy dependencyDepth field');
 
   const decisionEvent = planProjection.planReviewDecisionEvent({
     sessionId: `session-${token}`,
