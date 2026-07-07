@@ -10354,6 +10354,83 @@ function assertResourcePromptBlocksStabilize(): void {
   assertEqual(directoryBlock.fullTextCharLength, 0, 'directory inventory does not count as full text');
   assertEqual(directoryContext.resourceFullTextCharCount, 0, 'directory inventory keeps dynamic full text budget unchanged');
   assert(directoryBlock.summary.includes(directoryInventoryMarker), 'directory inventory summary preserves visible path entries within compact inventories');
+
+  const jsonDirectoryToken = randomSmokeToken('json-directory');
+  const jsonFilePath = `${jsonDirectoryToken}/src/${randomSmokeToken('unit')}.cpp`;
+  const jsonTree = JSON.stringify([
+    {
+      path: jsonDirectoryToken,
+      name: jsonDirectoryToken,
+      type: 'directory',
+      children: [
+        {
+          path: `${jsonDirectoryToken}/src`,
+          name: 'src',
+          type: 'directory',
+          children: [
+            {
+              path: jsonFilePath,
+              name: jsonFilePath.split('/').pop(),
+              type: 'file',
+              fileClassification: {
+                kind: 'file',
+                extension: 'cpp',
+                sizeBytes: 321,
+                readableText: true,
+                executable: false,
+                binary: false,
+              },
+            },
+          ],
+        },
+      ],
+    },
+  ], null, 2);
+  const jsonDirectoryManifest: ResourceManifest = {
+    id: `manifest-${jsonDirectoryToken}`,
+    workspaceScopeKey: `workspace-${jsonDirectoryToken}`,
+    entries: [{
+      id: `directory-${jsonDirectoryToken}`,
+      kind: 'directory',
+      label: `Directory ${jsonDirectoryToken}`,
+      resourceRef: jsonDirectoryToken,
+      readPolicy: 'autoRead',
+      reason: 'Generic structured directory inventory.',
+    }],
+    budget: { maxEntries: 4, maxBytes: 64000 },
+    defaultDenyPatterns: [],
+  };
+  const jsonDirectoryPacket = createResourcePacket({
+    packetId: `packet-${jsonDirectoryToken}`,
+    manifest: jsonDirectoryManifest,
+    request: {
+      id: `request-${jsonDirectoryToken}`,
+      items: [{ id: `item-${jsonDirectoryToken}`, manifestEntryId: `directory-${jsonDirectoryToken}`, reason: 'Read structured directory inventory.' }],
+    },
+    kernelEvidence: {
+      [`directory-${jsonDirectoryToken}`]: {
+        contentKind: 'directoryTree',
+        promptContent: jsonTree,
+        contentSummary: 'Generic directory tree summary.',
+      },
+    },
+  });
+  const jsonDirectoryContext = buildResourcePromptContext({
+    initialContext: {
+      id: `initial-${jsonDirectoryToken}`,
+      workspaceScopeKey: jsonDirectoryManifest.workspaceScopeKey,
+      manifest: jsonDirectoryManifest,
+    },
+    resourcePackets: [jsonDirectoryPacket],
+  });
+  const jsonDirectoryBlock = jsonDirectoryContext.resourceBlocks.find((block) => block.displayRef === jsonDirectoryToken);
+  assert(jsonDirectoryBlock, 'structured directory tree resource block exists');
+  if (!jsonDirectoryBlock) throw new Error('structured directory tree resource block test setup failed');
+  assert(jsonDirectoryBlock.summary.includes('Directory inventory summary'), 'structured directory tree uses compact inventory summary');
+  assert(jsonDirectoryBlock.summary.includes(`- file ${jsonFilePath}`), 'structured directory tree keeps observed file path');
+  assert(jsonDirectoryBlock.summary.includes('ext=cpp') && jsonDirectoryBlock.summary.includes('bytes=321'), 'structured directory tree keeps file classification facts');
+  assert(!jsonDirectoryBlock.summary.includes('"children"'), 'structured directory tree summary does not expose verbose JSON shape');
+  assert(jsonDirectoryBlock.summary.length < jsonTree.length, 'structured directory tree summary is more compact than raw JSON');
 }
 
 function assertSessionMemoryDocument(): void {

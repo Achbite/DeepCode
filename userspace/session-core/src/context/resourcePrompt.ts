@@ -15,6 +15,7 @@ const DYNAMIC_READ_FULL_TEXT_BUDGET_CHARS = 24000;
 const SUMMARY_HEAD_CHARS = 720;
 const SUMMARY_TAIL_CHARS = 220;
 const DIRECTORY_TREE_SUMMARY_CHAR_LIMIT = 4000;
+const DIRECTORY_TREE_COMPACT_ENTRY_LIMIT = 160;
 const MANIFEST_ENTRY_LIMIT = 80;
 const DEFAULT_MANIFEST_SUMMARY = 'auto-read resource approved by manifest policy';
 
@@ -181,6 +182,8 @@ function resourceSummary(item: ResourcePacketItem, content: string, retention: R
     if (!normalized) {
       return item.contentSummary ?? 'Directory inventory handle only; request a focused directory read if file listing is needed.';
     }
+    const compact = compactDirectoryTreeSummary(normalized);
+    if (compact) return compact;
     if (normalized.length <= DIRECTORY_TREE_SUMMARY_CHAR_LIMIT) return normalized;
     return [
       normalized.slice(0, DIRECTORY_TREE_SUMMARY_CHAR_LIMIT - SUMMARY_TAIL_CHARS),
@@ -197,6 +200,60 @@ function resourceSummary(item: ResourcePacketItem, content: string, retention: R
     '[... resource summary clipped; request a focused range if more detail is needed ...]',
     normalized.slice(-SUMMARY_TAIL_CHARS),
   ].join('\n');
+}
+
+function compactDirectoryTreeSummary(content: string): string | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(content);
+  } catch {
+    return undefined;
+  }
+  const roots = Array.isArray(parsed) ? parsed : [parsed];
+  const entries: string[] = [];
+  let observed = 0;
+  const visit = (node: unknown): void => {
+    if (observed >= DIRECTORY_TREE_COMPACT_ENTRY_LIMIT || !node || typeof node !== 'object' || Array.isArray(node)) return;
+    const record = node as Record<string, unknown>;
+    observed += 1;
+    if (entries.length < DIRECTORY_TREE_COMPACT_ENTRY_LIMIT) {
+      entries.push(compactDirectoryTreeNode(record));
+    }
+    const children = Array.isArray(record.children) ? record.children : [];
+    for (const child of children) visit(child);
+  };
+  for (const root of roots) visit(root);
+  if (!observed && !entries.length) return undefined;
+  const lines = [
+    'Directory inventory summary (Kernel observed):',
+    ...entries,
+  ];
+  if (observed >= DIRECTORY_TREE_COMPACT_ENTRY_LIMIT) {
+    lines.push(`- additional entries omitted after limit=${DIRECTORY_TREE_COMPACT_ENTRY_LIMIT}; request a focused directory read if omitted detail is required.`);
+  }
+  return lines.join('\n');
+}
+
+function compactDirectoryTreeNode(record: Record<string, unknown>): string {
+  const type = typeof record.type === 'string' ? record.type : 'entry';
+  const path = typeof record.path === 'string'
+    ? record.path
+    : typeof record.name === 'string'
+      ? record.name
+      : '<unknown>';
+  if (type === 'directory') return `- dir ${path}`;
+  const classification = record.fileClassification && typeof record.fileClassification === 'object' && !Array.isArray(record.fileClassification)
+    ? record.fileClassification as Record<string, unknown>
+    : {};
+  const attrs = [
+    typeof classification.kind === 'string' ? `kind=${classification.kind}` : '',
+    typeof classification.extension === 'string' ? `ext=${classification.extension}` : '',
+    typeof classification.sizeBytes === 'number' ? `bytes=${classification.sizeBytes}` : '',
+    typeof classification.readableText === 'boolean' ? `readableText=${classification.readableText}` : '',
+    typeof classification.executable === 'boolean' ? `executable=${classification.executable}` : '',
+    typeof classification.binary === 'boolean' ? `binary=${classification.binary}` : '',
+  ].filter(Boolean).join(' ');
+  return attrs ? `- file ${path} ${attrs}` : `- ${type} ${path}`;
 }
 
 function isInformativeSummary(value: string | undefined): boolean {
