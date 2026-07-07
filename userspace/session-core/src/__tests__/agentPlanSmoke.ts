@@ -80,6 +80,12 @@ import { AcceptedPlanReviewHandoffCoordinator, AcceptedPlanStaticSyntaxReviewCoo
 import { PermissionDecisionHandler, PlanDecisionHandler, RequirementDecisionHandler, ReviewDecisionHandler } from '../driver/interactions/index.js';
 import { HookPolicy, HookRegistry, HookRuntime } from '../driver/hooks/index.js';
 import { RunEngine } from '../driver/runEngine.js';
+import {
+  SessionDriverProviderRuntimeAccessor,
+  SessionDriverRepairRuntimeAccessor,
+  type DriverProviderTurnFrame,
+  type ModelContextBundle,
+} from '../driver/runFrame.js';
 import { AcceptedPlanResourceResumePromptBuilder } from '../prompt/AcceptedPlanResourceResumePromptBuilder.js';
 import { ProviderRepairMessageBuilder } from '../prompt/ProviderRepairMessageBuilder.js';
 import { ResourceManifestBuilder } from '../resources/index.js';
@@ -180,6 +186,7 @@ async function main(): Promise<void> {
   assertAcceptedPlanScopeMatcherNormalizesProposalTargets();
   assertAcceptedImplementationPlanContextBuilderBuildsRuntimeContext();
   assertRunStateMachineTaskLedger();
+  assertSessionDriverRuntimeAccessors();
   assertAcceptedTaskRegistryUsesExactOperationGrants();
   assertResourcePromptBlocksStabilize();
   assertSessionMemoryDocument();
@@ -8473,6 +8480,64 @@ function assertRunStateMachineTaskLedger(): void {
   new AcceptedPlanTaskRuntimeAccessor(accessorTargetState).apply(coordinator.runtimeSnapshot(runtimeInput));
   assertEqual(accessorTargetState.currentTaskContext?.taskId, taskIds[2], 'accepted-plan runtime accessor applies current task context');
   assertEqual(accessorTargetState.taskLedger?.currentTaskId, taskIds[2], 'accepted-plan runtime accessor applies task ledger');
+}
+
+function assertSessionDriverRuntimeAccessors(): void {
+  const suffix = randomSmokeToken('driver-runtime');
+  const prompt = buildPromptEnvelope({
+    workflowState: `workflow-${suffix}`,
+    allowedProposals: ['answer'],
+    capabilityCatalogSummary: `capability-${suffix}`,
+    userRequest: `request-${suffix}`,
+  });
+  const contract: DriverProviderTurnFrame = {
+    schemaVersion: 'deepcode.session.provider-turn-contract.v1',
+    contractId: `contract-${suffix}`,
+    sessionId: `session-${suffix}`,
+    runId: `run-${suffix}`,
+    turnMode: 'planning',
+    allowedKinds: ['answer'],
+    frames: [],
+    toolIntentTemplates: [],
+    repairPolicy: 'sameKindOnly',
+    projectionVisibility: 'traceOnly',
+    nextActionInstruction: {
+      kind: 'NextActionInstruction',
+      source: 'session',
+      trust: 'sessionInstruction',
+      use: `answer-${suffix}`,
+    },
+    prompt,
+  };
+  const snapshot = buildProviderTurnSnapshot(contract);
+  const providerState: {
+    providerTurnFrame?: DriverProviderTurnFrame;
+    modelContextBundle?: ModelContextBundle;
+  } = {};
+  const providerRuntime = new SessionDriverProviderRuntimeAccessor(providerState);
+  const bundle = providerRuntime.applyModelContext({
+    prompt,
+    providerTurnFrame: { ...contract, snapshot, hookTrace: [] },
+    snapshot,
+    hookTrace: [],
+  });
+  assertEqual(providerState.providerTurnFrame?.contractId, contract.contractId, 'provider runtime accessor writes provider turn frame');
+  assertEqual(providerState.modelContextBundle, bundle, 'provider runtime accessor stores the returned context bundle');
+  assertEqual(bundle.providerTurnContract.snapshot?.contractId, contract.contractId, 'provider runtime accessor keeps snapshot on provider contract');
+  assertEqual(bundle.snapshot.contractId, contract.contractId, 'provider runtime accessor keeps bundle snapshot authority');
+
+  const repairState = {
+    resourceRequestRepairAttempted: false,
+    actionBundleAdmissionRepairAttempted: false,
+    planReviewRepairAttempted: false,
+    acceptedPlanScopeRepairAttempted: false,
+    terminalGuidanceRevisionAttempted: false,
+  };
+  const repairRuntime = new SessionDriverRepairRuntimeAccessor(repairState);
+  assertEqual(repairRuntime.attempted('planReviewRepairAttempted'), false, 'repair runtime accessor reads inactive repair flag');
+  repairRuntime.markAttempted('planReviewRepairAttempted');
+  assertEqual(repairState.planReviewRepairAttempted, true, 'repair runtime accessor writes repair flag');
+  assertEqual(repairRuntime.attempted('planReviewRepairAttempted'), true, 'repair runtime accessor reads active repair flag');
 }
 
 function assertAcceptedTaskRegistryUsesExactOperationGrants(): void {

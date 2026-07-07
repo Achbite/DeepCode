@@ -4,6 +4,7 @@ import type {
   ContextAssemblyInput,
   ContextAssemblyRecord,
   ContextAssemblyResult,
+  PromptCachePlan,
   ProjectMemoryMode,
   SessionMemoryDocument,
 } from '../../context/index.js';
@@ -16,6 +17,7 @@ import type { RequirementRecord } from '../../requirement/types.js';
 import type { PromptEnvelope } from '../../prompt/types.js';
 import type { HookInput, HookResult } from '../hooks/index.js';
 import type { DriverProviderTurnFrame, ModelContextBundle, ProviderTurnSnapshot, ToolIntentTemplate } from '../runFrame.js';
+import { SessionDriverProviderRuntimeAccessor } from '../runFrame.js';
 import { buildProviderTurnSnapshot } from './providerTurnSnapshot.js';
 
 export interface ProviderTurnContextState {
@@ -38,7 +40,7 @@ export interface ProviderTurnContextState {
   acceptedImplementationPlan?: unknown;
   implementationBatch?: unknown;
   generatedArtifactEvidence: Map<string, unknown>;
-  cachePlan?: unknown;
+  cachePlan?: PromptCachePlan;
   contextAssembly?: ContextAssemblyRecord;
   providerTurnFrame?: DriverProviderTurnFrame;
   modelContextBundle?: ModelContextBundle;
@@ -135,13 +137,12 @@ export class ProviderTurnContextCoordinator<State extends ProviderTurnContextSta
       },
     });
 
-    state.cachePlan = assembledContext.cachePlan;
-    state.contextAssembly = assembledContext.contextAssembly;
+    const runtime = new SessionDriverProviderRuntimeAccessor(state);
 
     const lastResult = await this.ports.appendConsumedGuidance({
       sessionId: state.sessionId,
       result: input.lastResult,
-      consumedIds: state.contextAssembly?.consumedUserGuidanceIds ?? [],
+      consumedIds: assembledContext.contextAssembly.consumedUserGuidanceIds ?? [],
       runId: state.runId,
       appliedAtProviderStage: 'provider_call',
       userRequest: state.userRequest,
@@ -165,24 +166,25 @@ export class ProviderTurnContextCoordinator<State extends ProviderTurnContextSta
     });
     const snapshot = buildProviderTurnSnapshot(providerTurnFrame);
     const hookTrace = await this.runContextAdmissionHook(providerTurnFrame, snapshot);
-    state.providerTurnFrame = {
+    const providerTurnFrameWithSnapshot = {
       ...providerTurnFrame,
       snapshot,
       hookTrace,
     };
-    state.modelContextBundle = {
+    const modelContextBundle = runtime.applyModelContext({
       prompt,
-      providerTurnContract: state.providerTurnFrame,
-      contextAssembly: state.contextAssembly,
+      cachePlan: assembledContext.cachePlan,
+      contextAssembly: assembledContext.contextAssembly,
+      providerTurnFrame: providerTurnFrameWithSnapshot,
       snapshot,
       hookTrace,
-    };
+    });
 
     return {
       prompt,
       allowedProposals,
       lastResult,
-      modelContextBundle: state.modelContextBundle,
+      modelContextBundle,
     };
   }
 

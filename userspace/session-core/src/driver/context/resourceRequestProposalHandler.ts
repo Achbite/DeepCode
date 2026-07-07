@@ -11,6 +11,7 @@ import type {
 import type { PromptEnvelope } from '../../prompt/types.js';
 import type { ResourceRequestResolution } from '../../resources/ResourceRequestResolver.js';
 import type { AssistantDiagnosticInfo } from '../projection/assistantProjectionBuilder.js';
+import { SessionDriverRepairRuntimeAccessor } from '../runFrame.js';
 import type { ResourcePacketAppendResult } from './resourceOrchestrator.js';
 
 export interface ResourceRequestProposalHandlerState {
@@ -152,8 +153,9 @@ export class ResourceRequestProposalHandler<
       generated.remaining,
       state.conversationRoots
     );
-    if (!subset.manifest.entries.length && !state.resourceRequestRepairAttempted) {
-      state.resourceRequestRepairAttempted = true;
+    const repairRuntime = new SessionDriverRepairRuntimeAccessor(state);
+    if (!subset.manifest.entries.length && !repairRuntime.attempted('resourceRequestRepairAttempted')) {
+      repairRuntime.markAttempted('resourceRequestRepairAttempted');
       try {
         const repaired = await this.ports.repairResourceRequest(input, state, prompt, proposal, subset);
         if (repaired.kind === 'answer') {

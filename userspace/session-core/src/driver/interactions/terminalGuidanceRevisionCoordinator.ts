@@ -19,6 +19,7 @@ import type {
   ResourcePacket,
 } from '../../context/types.js';
 import type { RequirementRecord } from '../../requirement/types.js';
+import { SessionDriverRepairRuntimeAccessor } from '../runFrame.js';
 
 export interface TerminalGuidanceRevisionInput {
   content: string;
@@ -97,8 +98,9 @@ export class TerminalGuidanceRevisionCoordinator<
     state: State,
     draftAnswer: ProposalEnvelope
   ): Promise<AgentSessionResult | null> {
-    if (state.terminalGuidanceRevisionAttempted) return null;
-    state.terminalGuidanceRevisionAttempted = true;
+    const repairRuntime = new SessionDriverRepairRuntimeAccessor(state);
+    if (repairRuntime.attempted('terminalGuidanceRevisionAttempted')) return null;
+    repairRuntime.markAttempted('terminalGuidanceRevisionAttempted');
 
     let result = await this.ports.append(state.sessionId, []);
     const guidance = this.ports.collectQueued(result.events, state.runId);

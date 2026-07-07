@@ -7,6 +7,7 @@ import type {
 import type { ProposalEnvelope } from '../../protocol/types.js';
 import type { ResourcePacket } from '../../context/types.js';
 import type { PromptEnvelope } from '../../prompt/types.js';
+import { SessionDriverRepairRuntimeAccessor } from '../runFrame.js';
 
 export interface ActionProposalSubmitterInput {
   profileId?: string;
@@ -146,8 +147,9 @@ export class ActionProposalSubmitter<
         ),
       ]);
     }
-    if (this.ports.needsRepair(reviewReport) && !state.planReviewRepairAttempted) {
-      state.planReviewRepairAttempted = true;
+    const repairRuntime = new SessionDriverRepairRuntimeAccessor(state);
+    if (this.ports.needsRepair(reviewReport) && !repairRuntime.attempted('planReviewRepairAttempted')) {
+      repairRuntime.markAttempted('planReviewRepairAttempted');
       await this.ports.append(state.sessionId, [
         this.ports.thinkingEvent(
           state.sessionId,

@@ -228,6 +228,50 @@ export interface SessionDriverProviderState {
   activeTurn?: ActiveTurnState;
 }
 
+export interface SessionDriverProviderRuntimeState {
+  cachePlan?: PromptCachePlan;
+  contextAssembly?: ContextAssemblyRecord;
+  providerTurnFrame?: DriverProviderTurnFrame;
+  modelContextBundle?: ModelContextBundle;
+}
+
+export class SessionDriverProviderRuntimeAccessor {
+  constructor(private readonly state: SessionDriverProviderRuntimeState) {}
+
+  applyModelContext(input: {
+    prompt: PromptEnvelope;
+    cachePlan?: PromptCachePlan;
+    contextAssembly?: ContextAssemblyRecord;
+    providerTurnFrame: DriverProviderTurnFrame;
+    snapshot: ProviderTurnSnapshot;
+    hookTrace: readonly HookResult[];
+  }): ModelContextBundle {
+    this.state.cachePlan = input.cachePlan;
+    this.state.contextAssembly = input.contextAssembly;
+    this.state.providerTurnFrame = input.providerTurnFrame;
+    this.state.modelContextBundle = {
+      prompt: input.prompt,
+      providerTurnContract: input.providerTurnFrame,
+      contextAssembly: input.contextAssembly,
+      snapshot: input.snapshot,
+      hookTrace: input.hookTrace,
+    };
+    return this.state.modelContextBundle;
+  }
+}
+
+export class SessionDriverRepairRuntimeAccessor {
+  constructor(private readonly state: Partial<SessionDriverRepairState>) {}
+
+  attempted(flag: keyof SessionDriverRepairState): boolean {
+    return this.state[flag] === true;
+  }
+
+  markAttempted(flag: keyof SessionDriverRepairState): void {
+    this.state[flag] = true;
+  }
+}
+
 export interface SessionDriverInteractionState {
   interactionOverlay?: InteractionOverlayContext;
 }

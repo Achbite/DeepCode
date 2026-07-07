@@ -2,6 +2,7 @@ import type { AgentContextAttachment, AgentEvent, AgentSessionResult } from '@de
 import type { ProposalEnvelope, ResourceRequestDraft } from '../../protocol/types.js';
 import type { PromptEnvelope } from '../../prompt/types.js';
 import type { RequirementRecord } from '../../requirement/types.js';
+import { SessionDriverRepairRuntimeAccessor } from '../runFrame.js';
 
 export interface ActionBundleAdmissionCoordinatorInput {
   sessionId: string;
@@ -137,7 +138,8 @@ export class ActionBundleAdmissionCoordinator<
     reasons: string[],
     fallback: AgentSessionResult
   ): Promise<AgentSessionResult> {
-    if (state.actionBundleAdmissionRepairAttempted) {
+    const repairRuntime = new SessionDriverRepairRuntimeAccessor(state);
+    if (repairRuntime.attempted('actionBundleAdmissionRepairAttempted')) {
       return this.ports.append(state.sessionId, this.ports.admissionFailureEvents({
         sessionId: state.sessionId,
         runId: state.runId,
@@ -147,7 +149,7 @@ export class ActionBundleAdmissionCoordinator<
         id: this.ports.createId('action-bundle-admission-failed'),
       })) ?? fallback;
     }
-    state.actionBundleAdmissionRepairAttempted = true;
+    repairRuntime.markAttempted('actionBundleAdmissionRepairAttempted');
     let result = await this.ports.append(state.sessionId, [
       this.ports.admissionRepairingEvent({
         sessionId: state.sessionId,
