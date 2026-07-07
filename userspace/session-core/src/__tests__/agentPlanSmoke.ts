@@ -9973,6 +9973,57 @@ function assertResourcePromptBlocksStabilize(): void {
   assert(overBudget.prompt.dynamicSuffix.includes('summary:'), 'over-budget summary keeps a compact text summary');
   assert(!overBudget.prompt.dynamicSuffix.includes(largeMarkers[0]), 'over-budget old middle marker is removed from provider-visible full text');
   assert(overBudget.prompt.dynamicSuffix.includes(newestLargeMarker), 'over-budget newest full text remains provider-visible');
+
+  const directoryInventoryMarker = 'DIRECTORY_TREE_INVENTORY_MARKER_RETAINED';
+  const directoryLines = Array.from({ length: 80 }, (_, index) => {
+    if (index === 40) return `- generic/catalog/${directoryInventoryMarker}/leaf-${index}.txt`;
+    return `- generic/catalog/branch-${String(index).padStart(2, '0')}/leaf-${index}.txt`;
+  });
+  const directoryInventory = directoryLines.join('\n');
+  assert(directoryInventory.length > 1000, 'directory inventory test exceeds generic summary window');
+  const directoryManifest: ResourceManifest = {
+    id: 'manifest-directory-inventory',
+    workspaceScopeKey: 'workspace-directory-inventory',
+    entries: [{
+      id: 'directory-root',
+      kind: 'directory',
+      label: 'Directory generic/catalog',
+      resourceRef: 'generic/catalog',
+      readPolicy: 'autoRead',
+      reason: 'Generic directory inventory.',
+    }],
+    budget: { maxEntries: 4, maxBytes: 64000 },
+    defaultDenyPatterns: [],
+  };
+  const directoryPacket = createResourcePacket({
+    packetId: 'packet-directory-inventory',
+    manifest: directoryManifest,
+    request: {
+      id: 'request-directory-inventory',
+      items: [{ id: 'item-directory-inventory', manifestEntryId: 'directory-root', reason: 'Read directory inventory.' }],
+    },
+    kernelEvidence: {
+      'directory-root': {
+        contentKind: 'directoryTree',
+        promptContent: directoryInventory,
+      },
+    },
+  });
+  const directoryContext = buildResourcePromptContext({
+    initialContext: {
+      id: 'initial-directory-inventory',
+      workspaceScopeKey: directoryManifest.workspaceScopeKey,
+      manifest: directoryManifest,
+    },
+    resourcePackets: [directoryPacket],
+  });
+  const directoryBlock = directoryContext.resourceBlocks.find((block) => block.displayRef === 'generic/catalog');
+  assert(directoryBlock, 'directory inventory resource block exists');
+  if (!directoryBlock) throw new Error('directory inventory resource block test setup failed');
+  assertEqual(directoryBlock.retention, 'summary', 'directory inventory remains a summary block');
+  assertEqual(directoryBlock.fullTextCharLength, 0, 'directory inventory does not count as full text');
+  assertEqual(directoryContext.resourceFullTextCharCount, 0, 'directory inventory keeps dynamic full text budget unchanged');
+  assert(directoryBlock.summary.includes(directoryInventoryMarker), 'directory inventory summary preserves visible path entries within compact inventories');
 }
 
 function assertSessionMemoryDocument(): void {

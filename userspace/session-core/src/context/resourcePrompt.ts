@@ -14,6 +14,7 @@ const FULL_TEXT_CHAR_LIMIT = 6000;
 const DYNAMIC_READ_FULL_TEXT_BUDGET_CHARS = 24000;
 const SUMMARY_HEAD_CHARS = 720;
 const SUMMARY_TAIL_CHARS = 220;
+const DIRECTORY_TREE_SUMMARY_CHAR_LIMIT = 4000;
 const MANIFEST_ENTRY_LIMIT = 80;
 const DEFAULT_MANIFEST_SUMMARY = 'auto-read resource approved by manifest policy';
 
@@ -177,6 +178,14 @@ function resourceSummary(item: ResourcePacketItem, content: string, retention: R
   if (retention === 'handleOnly') return item.contentSummary ?? 'Resource handle only; request a focused range if full content is needed.';
   if (isInformativeSummary(item.contentSummary)) return item.contentSummary!.trim();
   const normalized = normalizeContent(content);
+  if (item.contentKind === 'directoryTree') {
+    if (normalized.length <= DIRECTORY_TREE_SUMMARY_CHAR_LIMIT) return normalized;
+    return [
+      normalized.slice(0, DIRECTORY_TREE_SUMMARY_CHAR_LIMIT - SUMMARY_TAIL_CHARS),
+      '[... directory inventory clipped; request a focused directory read only when omitted detail is required ...]',
+      normalized.slice(-SUMMARY_TAIL_CHARS),
+    ].join('\n');
+  }
   if (normalized.length <= SUMMARY_HEAD_CHARS + SUMMARY_TAIL_CHARS + 40) {
     return normalized;
   }
