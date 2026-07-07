@@ -77,6 +77,7 @@ import { PermissionDecisionHandler, PlanDecisionHandler, RequirementDecisionHand
 import { HookPolicy, HookRegistry, HookRuntime } from '../driver/hooks/index.js';
 import { AcceptedPlanResourceResumePromptBuilder } from '../prompt/AcceptedPlanResourceResumePromptBuilder.js';
 import { ProviderRepairMessageBuilder } from '../prompt/ProviderRepairMessageBuilder.js';
+import { ResourceManifestBuilder } from '../resources/index.js';
 import type { PromptEnvelope } from '../prompt/types.js';
 
 async function main(): Promise<void> {
@@ -115,6 +116,8 @@ async function main(): Promise<void> {
   assertUserInputPipelineFindsRequirementInteractions();
   await assertProviderTraceRecorderArchivesPayload();
   await assertResourceRequestLoopBuildsPacketEvents();
+  assertResourceManifestBuilderSeedsWorkspaceRootEntries();
+  await assertSessionDriverLoopPreResolvesProjectWorkspaceRoot();
   await assertResourceOrchestratorResolvesAndRecordsPackets();
   await assertAcceptedPlanResourceResumeCoordinatorBuildsProviderTurn();
   await assertResourceRequestRepairCoordinatorRepairsProposal();
@@ -2710,6 +2713,155 @@ async function assertResourceRequestLoopBuildsPacketEvents(): Promise<void> {
     loop.containsDirectoryPath([directoryPacket], `./root-${token}/nested-${token}/`),
     'resource request loop recognizes directory targets from ResourcePacket directory trees'
   );
+}
+
+function assertResourceManifestBuilderSeedsWorkspaceRootEntries(): void {
+  const token = randomSmokeToken('resource-manifest-root');
+  const builder = new ResourceManifestBuilder({
+    maxDerivedManifestEntries: 8,
+    resourceManifestMaxBytes: 4096,
+    comparablePath: (value) => value.replace(/\/+$/g, ''),
+    isAbsolutePath: (value) => value.startsWith('/'),
+  });
+  const projectRoot = `/tmp/${token}/${randomSmokeToken('project')}`;
+  const project = builder.build({
+    sessionId: `session-${token}`,
+    projectWorkingDirectory: {
+      rootId: `root-${token}`,
+      label: `Project ${token}`,
+      displayPath: projectRoot,
+      absolutePath: projectRoot,
+      source: 'projectWorkingDirectory',
+    },
+  }, `manifest-${token}`);
+
+  assertEqual(project.manifest.entries.length, 1, 'project working directory becomes an initial manifest entry');
+  assertEqual(project.manifest.entries[0]?.id, `root-${token}`, 'project working directory manifest entry preserves root id');
+  assertEqual(project.manifest.entries[0]?.kind, 'directory', 'project working directory manifest entry is a directory');
+  assertEqual(project.manifest.entries[0]?.resourceRef, projectRoot, 'project working directory manifest entry preserves resource ref');
+  assertEqual(project.manifest.entries[0]?.readPolicy, 'autoRead', 'project working directory manifest entry is auto-read');
+  assertEqual(project.conversationRoots[0]?.rootId, `root-${token}`, 'project working directory remains a conversation root');
+
+  const editorRoot = `/tmp/${token}/${randomSmokeToken('editor')}`;
+  const editor = builder.build({
+    sessionId: `session-editor-${token}`,
+    workspaceBinding: { openPath: editorRoot },
+  }, `manifest-editor-${token}`);
+
+  assertEqual(editor.manifest.entries.length, 1, 'editor workspace binding becomes an initial manifest entry');
+  assertEqual(editor.manifest.entries[0]?.kind, 'directory', 'editor workspace manifest entry is a directory');
+  assertEqual(editor.manifest.entries[0]?.resourceRef, editorRoot, 'editor workspace manifest entry preserves open path');
+  assertEqual(editor.conversationRoots[0]?.source, 'workspaceBinding', 'editor workspace remains a conversation root');
+
+  const deduped = builder.build({
+    sessionId: `session-dedup-${token}`,
+    projectWorkingDirectory: {
+      rootId: `root-dedup-${token}`,
+      label: `Project ${token}`,
+      displayPath: projectRoot,
+      absolutePath: projectRoot,
+      source: 'projectWorkingDirectory',
+    },
+    workspaceBinding: { openPath: `${projectRoot}/` },
+  }, `manifest-dedup-${token}`);
+
+  assertEqual(deduped.manifest.entries.length, 1, 'project root and editor binding dedupe by normalized resource ref');
+  assertEqual(deduped.conversationRoots.length, 1, 'deduped workspace root is not duplicated in conversation roots');
+}
+
+async function assertSessionDriverLoopPreResolvesProjectWorkspaceRoot(): Promise<void> {
+  const token = randomSmokeToken('initial-root');
+  const sessionId = `session-${token}`;
+  const workspaceRoot = `/tmp/${token}/${randomSmokeToken('workspace')}`;
+  const events: AgentEvent[] = [];
+  const callOrder: string[] = [];
+  const resourceResolveManifests: Array<Record<string, any>> = [];
+  const session: AgentSession = {
+    id: sessionId,
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  let llmCalls = 0;
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => {
+      const command = request.command as Record<string, any>;
+      if (command.kind === 'runCreate') {
+        callOrder.push('kernel:runCreate');
+        return fakeKernel(request);
+      }
+      if (command.kind === 'resourceResolve') {
+        callOrder.push('kernel:resourceResolve');
+        const manifest = command.request?.manifest as Record<string, any>;
+        resourceResolveManifests.push(manifest);
+        const entry = manifest.entries[0] ?? {};
+        return {
+          ok: true,
+          events: [{
+            kind: 'resource.packet_produced',
+            runId: `run-${token}`,
+            sessionId,
+            packet: {
+              id: `packet-${token}`,
+              workspaceScopeKey: manifest.workspaceScopeKey,
+              requestId: command.requestId,
+              items: [{
+                requestItemId: `item-${token}`,
+                manifestEntryId: entry.id,
+                readPolicy: 'autoRead',
+                status: 'resolved',
+                sourceKind: 'directory',
+                contentKind: 'directoryTree',
+                path: '.',
+                absolutePath: entry.resourceRef,
+                nodes: [{ type: 'file', path: `${randomSmokeToken('file')}.txt` }],
+                evidenceRefs: [`evidence-${token}`],
+              }],
+            },
+          }],
+        };
+      }
+      return fakeKernel(request);
+    },
+    llmChat: async (): Promise<ApiResponse<LlmChatResult>> => {
+      callOrder.push('llm');
+      llmCalls += 1;
+      return jsonLlmResponse({
+        schemaVersion: 'deepcode.agent.protocol.v3',
+        kind: 'answer',
+        outputLanguage: 'en-US',
+        answer: { format: 'markdown', content: `Generic workspace root evidence was available for ${token}.` },
+      });
+    },
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + llmCalls + resourceResolveManifests.length + 1}`,
+  });
+
+  const result = await loop.runUserTurn({
+    sessionId,
+    content: 'Summarize the generic project workspace.',
+    projectWorkingDirectory: {
+      rootId: `root-${token}`,
+      label: `Workspace ${token}`,
+      displayPath: workspaceRoot,
+      absolutePath: workspaceRoot,
+      source: 'projectWorkingDirectory',
+    },
+  });
+
+  assertEqual(resourceResolveManifests.length, 1, 'project workspace root is resolved during run initialization');
+  assertEqual(resourceResolveManifests[0]?.entries?.[0]?.kind, 'directory', 'initial resource resolve reads a directory root');
+  assertEqual(resourceResolveManifests[0]?.entries?.[0]?.resourceRef, workspaceRoot, 'initial resource resolve uses the project workspace root');
+  assert(
+    callOrder.indexOf('kernel:resourceResolve') > callOrder.indexOf('kernel:runCreate') &&
+    callOrder.indexOf('kernel:resourceResolve') < callOrder.indexOf('llm'),
+    'workspace root ResourceResolve runs after runCreate and before the first provider call'
+  );
+  assertEqual(result.events.some((event) => event.kind === 'tool_result'), true, 'initial root evidence is projected as a resource tool result');
 }
 
 async function assertResourceOrchestratorResolvesAndRecordsPackets(): Promise<void> {
