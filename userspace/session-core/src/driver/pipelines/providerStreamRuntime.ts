@@ -10,6 +10,7 @@ import type {
 import { ProviderPartFrameParser, type ProviderToolCallBuffer } from '../../provider/providerStreamParts.js';
 import type { ProviderStreamCoordinator, ProviderStreamVisibleLanguage } from './providerStreamCoordinator.js';
 import { SessionDriverActiveTurnRuntimeAccessor } from '../runFrame.js';
+import { VISIBLE_REASONING_MAX_CHARS, projectVisibleReasoning } from '../projection/index.js';
 
 export interface ProviderStreamRuntimeActiveTurn {
   turnId: string;
@@ -30,11 +31,15 @@ export interface ProviderReasoningDeltaBuffer {
   pending: string;
   lastFlushAt: number;
   itemId?: string;
+  receivedChars: number;
+  visibleCharsEmitted: number;
+  truncated: boolean;
 }
 
 export interface ProviderStreamRuntimeDependencies<TState extends ProviderStreamRuntimeState> {
   reasoningFlushChars: number;
   reasoningFlushMs: number;
+  visibleReasoningMaxChars?: number;
   streamCoordinator: ProviderStreamCoordinator;
   visibleLanguageForRequest(userRequest: string): ProviderStreamVisibleLanguage;
   providerActivity(input: {
@@ -57,6 +62,9 @@ export class ProviderStreamRuntime<TState extends ProviderStreamRuntimeState> {
       pending: '',
       lastFlushAt: Date.now(),
       itemId: undefined,
+      receivedChars: 0,
+      visibleCharsEmitted: 0,
+      truncated: false,
     };
   }
 
@@ -173,6 +181,10 @@ export class ProviderStreamRuntime<TState extends ProviderStreamRuntimeState> {
     const delta = buffer.pending;
     buffer.pending = '';
     buffer.lastFlushAt = Date.now();
+    const projected = this.projectReasoningDelta(delta, buffer);
+    if (!projected.content) return;
+    buffer.visibleCharsEmitted += projected.content.length;
+    buffer.truncated = buffer.truncated || projected.truncated;
     await this.dependencies.emitProjectionDelta(state, {
       type: 'reasoning_delta',
       stage,
@@ -180,12 +192,15 @@ export class ProviderStreamRuntime<TState extends ProviderStreamRuntimeState> {
       channel: 'reasoning',
       source: 'provider',
       itemId: buffer.itemId,
-      delta,
+      delta: projected.content,
       activity: this.dependencies.providerActivity({ runId: state.runId, userRequest: state.userRequest, stage, status: 'running' }),
       payload: {
         presentation: 'reasoningTrace',
         streamMode: 'markdownBlocks',
         buffered: true,
+        reasoningProjectionTruncated: buffer.truncated,
+        reasoningProjectionFullCharLength: buffer.receivedChars,
+        reasoningProjectionVisibleCharLength: buffer.visibleCharsEmitted,
       },
     });
   }
@@ -198,6 +213,7 @@ export class ProviderStreamRuntime<TState extends ProviderStreamRuntimeState> {
   ): Promise<void> {
     if (typeof chunk.content !== 'string' || chunk.content.length === 0) return;
     buffer.pending += chunk.content;
+    buffer.receivedChars += chunk.content.length;
     buffer.itemId = chunk.callId ?? buffer.itemId;
     const now = Date.now();
     if (
@@ -207,6 +223,22 @@ export class ProviderStreamRuntime<TState extends ProviderStreamRuntimeState> {
       return;
     }
     await this.flushReasoningBuffer(state, stage, buffer);
+  }
+
+  private projectReasoningDelta(delta: string, buffer: ProviderReasoningDeltaBuffer): { content: string; truncated: boolean } {
+    const maxChars = this.dependencies.visibleReasoningMaxChars ?? VISIBLE_REASONING_MAX_CHARS;
+    if (!Number.isFinite(maxChars) || maxChars <= 0) {
+      return { content: delta, truncated: false };
+    }
+    const remaining = maxChars - buffer.visibleCharsEmitted;
+    if (remaining <= 0) {
+      return { content: '', truncated: true };
+    }
+    const projected = projectVisibleReasoning(delta, remaining);
+    return {
+      content: projected.content,
+      truncated: projected.truncated,
+    };
   }
 
   private async emitProviderJsonStreamProgress(

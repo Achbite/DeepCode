@@ -123,6 +123,7 @@ import {
   userInputPipeline,
   PROVIDER_REASONING_FLUSH_CHARS,
   PROVIDER_REASONING_FLUSH_MS,
+  VISIBLE_REASONING_MAX_CHARS,
 } from './sessionDriverComponents.js';
 import type {
   SessionDecisionResolverInput,
@@ -1075,6 +1076,7 @@ export class SessionDriverLoop {
     this.providerStreamRuntime = new ProviderStreamRuntime<SessionDriverLoopRunState>({
       reasoningFlushChars: PROVIDER_REASONING_FLUSH_CHARS,
       reasoningFlushMs: PROVIDER_REASONING_FLUSH_MS,
+      visibleReasoningMaxChars: VISIBLE_REASONING_MAX_CHARS,
       streamCoordinator: providerStreamCoordinator,
       visibleLanguageForRequest,
       providerActivity: (input) => driverActivityBuilder.providerActivity(input),

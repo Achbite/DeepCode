@@ -299,6 +299,7 @@ export class ProviderTurnContextCoordinator<State extends ProviderTurnContextSta
       'Use the confirmed requirement and confirmed decision as the resolved current scope.',
       'Do not infer extra preserved/deleted/modified targets from memory or from ambiguous wording in the original request.',
       'Choose the narrowest valid next proposal from allowedOutputs.',
+      'Keep visible reasoning/progress action-oriented: state the current action or proposal, not protocol, tool, permission, or evidence-policy deliberation.',
     ].join(' ');
   }
 

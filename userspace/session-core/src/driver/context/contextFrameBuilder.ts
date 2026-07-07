@@ -305,6 +305,7 @@ export class ContextFrameBuilder {
         'If evidence is missing, return a focused resourceRequest.',
         'If the current task needs targets or operations outside the accepted scope, return a decisionRequest.',
         'If the current task is already sufficiently satisfied and no Kernel action is needed, return taskOutcome with status="modelJudgedSufficient".',
+        'Keep visible reasoning/progress action-oriented: state the current action or task outcome, not protocol, tool, permission, or evidence-policy deliberation.',
       ].join(' ');
     }
     return [
@@ -313,6 +314,7 @@ export class ContextFrameBuilder {
       'Use resourceRequest only for missing concrete evidence that would change the next proposal. Keep it focused on a different path/range/search query that adds new facts.',
       'Use decisionRequest only when a blocking user choice prevents any valid taskPlan; put reviewable assumptions in taskPlan risks or reviewCheckpoints.',
       'Decide from the current PromptPacket frames; do not re-audit protocol rules, permission gates, resource policy, or unrelated prior requirements in reasoning.',
+      'Keep visible reasoning/progress action-oriented: state the current action or proposal, not protocol, tool, permission, or evidence-policy deliberation.',
       'For side-effect work, plan first unless Session already provided an accepted task.',
       'Do not infer execution facts or permissions from memory.',
     ].join(' ');

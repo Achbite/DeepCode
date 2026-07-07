@@ -75,7 +75,7 @@ import {
 } from '../driver/execution/index.js';
 import { InteractionOverlayCodec, NativeToolExposurePolicy, NativeToolHandlerPortsFactory, NativeToolProgressEventBuilder, NativeToolProviderLoop, NativeToolProjectionBuilder, NativeToolRepairCoordinator, NativeToolRepairRunner, NativeToolResourceRecorder, NativeToolResultMessageBuilder, NativeToolResumeMessageBuilder, PermissionPipeline, ProposalOnlyProviderRunner, ProviderJsonModeCoordinator, ProviderPipeline, ProviderStreamCoordinator, ProviderStreamRuntime, ProviderToolCallBuffer, ProviderTraceRecorder, ProviderTurnRunner, UserGuidanceQueue, UserInputPipeline } from '../driver/pipelines/index.js';
 import { ActionBundleActionInspector, PlanContextIndex, PlanInteractionIndex, PlanReviewGrantProjector, PlanReviewReportAnalyzer, ProposalSemanticValidator, ProtocolGate } from '../driver/proposal/index.js';
-import { AssistantProjectionBuilder, DriverActivityBuilder, KernelEventProjectionBuilder, PlanProjectionBuilder, RequirementProjectionBuilder, ReviewProjectionBuilder, SessionFailureProjectionBuilder, SessionProgressProjectionBuilder } from '../driver/projection/index.js';
+import { AssistantProjectionBuilder, DriverActivityBuilder, KernelEventProjectionBuilder, PlanProjectionBuilder, RequirementProjectionBuilder, ReviewProjectionBuilder, SessionFailureProjectionBuilder, SessionProgressProjectionBuilder, VISIBLE_REASONING_MAX_CHARS } from '../driver/projection/index.js';
 import { AcceptedPlanReviewHandoffCoordinator, AcceptedPlanStaticSyntaxReviewCoordinator, ReviewAssembler, ReviewDecisionProjectionBuilder } from '../driver/review/index.js';
 import { PermissionDecisionHandler, PlanDecisionHandler, RequirementDecisionHandler, ReviewDecisionHandler } from '../driver/interactions/index.js';
 import { HookPolicy, HookRegistry, HookRuntime } from '../driver/hooks/index.js';
@@ -135,6 +135,7 @@ async function main(): Promise<void> {
   assertProviderJsonModeCoordinator();
   assertProviderStreamCoordinatorClassifiesStages();
   await assertProviderStreamRuntimeHandlesStreamEvents();
+  await assertProviderStreamRuntimeBudgetsVisibleReasoning();
   await assertProviderTurnRunnerRunsProviderLifecycle();
   assertUserGuidanceQueueBuildsResumeAndConsumedEvents();
   assertPermissionPipelineFindsPendingPermission();
@@ -371,6 +372,10 @@ function assertProviderTurnContractFrameOrder(): void {
   assert(
     String(planningContract.nextActionInstruction.summary ?? '').includes('do not re-audit protocol rules, permission gates, resource policy'),
     'planning provider turn keeps reasoning focused on current frames'
+  );
+  assert(
+    String(planningContract.nextActionInstruction.summary ?? '').includes('Keep visible reasoning/progress action-oriented'),
+    'planning provider turn keeps visible reasoning action oriented'
   );
 }
 
@@ -2446,6 +2451,70 @@ async function assertProviderStreamRuntimeHandlesStreamEvents(): Promise<void> {
   assert(
     deltas.some((delta) => delta.type === 'error' && delta.summary === `err-${token}`),
     'provider stream runtime emits provider stream errors'
+  );
+}
+
+async function assertProviderStreamRuntimeBudgetsVisibleReasoning(): Promise<void> {
+  const token = randomSmokeToken('provider-runtime-budget');
+  const deltas: Array<Omit<ProjectionDelta, 'sessionId' | 'runId' | 'turnId' | 'seq'>> = [];
+  const runtime = new ProviderStreamRuntime<any>({
+    reasoningFlushChars: 1,
+    reasoningFlushMs: 999_999,
+    visibleReasoningMaxChars: 32,
+    streamCoordinator: new ProviderStreamCoordinator(),
+    visibleLanguageForRequest: () => 'en-US',
+    providerActivity: (input) => ({
+      activityId: `provider-${input.stage}-${token}`,
+      kind: 'providerThinking',
+      status: input.status,
+      title: `provider-${input.stage}`,
+      summary: `provider-${input.stage}-${input.status}`,
+      source: 'provider',
+      runId: input.runId,
+    }),
+    conversationActivity: (activity) => activity,
+    emitProjectionDelta: async (_state, delta) => {
+      deltas.push(delta);
+    },
+    kernelCommand: async () => ({ ok: true, events: [] }) as KernelReply,
+    createId: (prefix) => `${prefix}-${token}`,
+  });
+  const reasoningBuffer = runtime.createReasoningBuffer();
+  const state = {
+    sessionId: `session-${token}`,
+    runId: `run-${token}`,
+    userRequest: `request-${token}`,
+  };
+  const toolCallBuffer = new ProviderToolCallBuffer({
+    parseArguments: (raw) => raw ? JSON.parse(raw) as Record<string, unknown> : {},
+    normalizeToolName: (name) => name,
+  });
+
+  await runtime.handleEvent({
+    state,
+    stage: 'provider_call',
+    event: {
+      type: 'provider_reasoning_delta',
+      chunk: {
+        type: 'reasoning_delta',
+        content: `${token}-`.repeat(20),
+      },
+    } as any,
+    toolCallBuffer,
+    reasoningBuffer,
+  });
+  await runtime.flushReasoningBuffer(state, 'provider_call', reasoningBuffer);
+
+  const reasoningDelta = deltas.find((delta) => delta.type === 'reasoning_delta');
+  if (!reasoningDelta) throw new Error('provider stream runtime should emit a visible reasoning delta');
+  assert(
+    String(reasoningDelta.delta ?? '').length <= 32,
+    'streaming provider reasoning is bounded before entering conversation projection'
+  );
+  assertEqual((reasoningDelta.payload as any).reasoningProjectionTruncated, true, 'streaming reasoning delta records truncation metadata');
+  assert(
+    Number((reasoningDelta.payload as any).reasoningProjectionFullCharLength) > Number((reasoningDelta.payload as any).reasoningProjectionVisibleCharLength),
+    'streaming reasoning delta records full and visible character lengths'
   );
 }
 
@@ -6864,6 +6933,12 @@ function assertAssistantProjectionBuilderCreatesConversationEvents(): void {
   const reasoning = builder.reasoningEvent(`session-${token}`, `reasoning-${token}`, '2026-01-01T00:00:02.000Z', `reasoning-${token}`);
   assertEqual((reasoning.payload as any).channel, 'reasoning', 'assistant projection marks provider reasoning');
   assertEqual((reasoning.payload as any).presentation, 'collapsible', 'assistant projection keeps reasoning collapsible');
+  const longReasoning = builder.reasoningEvent(`session-${token}`, `${token}-`.repeat(1000), '2026-01-01T00:00:02.500Z', `long-reasoning-${token}`);
+  assert(
+    String((longReasoning.payload as any).content ?? '').length <= VISIBLE_REASONING_MAX_CHARS,
+    'assistant projection bounds visible provider reasoning content'
+  );
+  assertEqual((longReasoning.payload as any).reasoningProjectionTruncated, true, 'assistant projection marks truncated reasoning');
 
   const progressProposal: ProposalEnvelope = { ...proposal, kind: 'taskPlan' };
   const narration = builder.proposalNarrationEvent(
@@ -8751,6 +8826,7 @@ function assertPromptEnvelope(): void {
   assert(prompt.stablePrefix.includes('resourceRequest is only for missing concrete facts that would change the next proposal'), 'stable prompt gates resourceRequest behind proposal-changing missing facts');
   assert(prompt.stablePrefix.includes('Plan review is the normal confirmation checkpoint for reviewable implementation assumptions'), 'stable prompt routes reviewable assumptions through taskPlan review');
   assert(prompt.stablePrefix.includes('blocking user choice is required before any valid taskPlan can be formed'), 'stable prompt narrows decisionRequest to blocking choices');
+  assert(prompt.stablePrefix.includes('Visible reasoning/progress, when streamed, must be concise and action-oriented'), 'stable prompt scopes visible reasoning and progress to action-oriented output');
   assert(prompt.stablePrefix.includes('Keep private reasoning concise'), 'stable prompt asks provider reasoning to stay concise');
   assert(!prompt.stablePrefix.includes('dependsOn'), 'prompt no longer teaches provider action dependency fields');
   assert(!prompt.stablePrefix.includes('hard dependencies'), 'prompt no longer teaches hard dependency planning');
@@ -8920,6 +8996,34 @@ function assertPromptEnvelope(): void {
   const allowedLine = nextAction?.content.find((line) => line.startsWith('allowedOutputs=')) ?? '';
   assert(!allowedLine.includes('taskPlan') && allowedLine.includes('actionBundle'), 'accepted execution narrows allowed outputs away from taskPlan');
   assert(nextAction?.content.some((line) => line.includes('forbiddenOutputs=taskPlan')), 'accepted execution explicitly forbids plan output');
+
+  const acceptedDriverContract = new ContextFrameBuilder().buildSessionProviderTurnContract({
+    contractId: 'contract-accepted-reasoning-smoke',
+    sessionId: 'session-accepted-reasoning-smoke',
+    runId: 'run-accepted-reasoning-smoke',
+    allowedKinds: ['actionBundle', 'resourceRequest', 'decisionRequest', 'taskOutcome', 'diagnostic'],
+    prompt: acceptedPrompt,
+    userRequest: 'Continue the accepted generic task.',
+    acceptedPlanActive: true,
+    currentTaskContext: {
+      taskId: 'task-generic-delete',
+      taskTitle: 'Remove generated directory',
+      goal: 'Remove a confirmed generated directory.',
+      targets: ['generated-dir'],
+      capabilities: ['fs.delete'],
+      acceptanceCriteria: ['Kernel records the generated directory delete fact.'],
+      failureCriteria: ['Stop if the delete leaves the accepted target scope.'],
+      taskOrder: ['task-generic-delete'],
+      pendingTaskIds: ['task-generic-delete'],
+      dependsOn: [],
+      evidenceNeeds: [],
+      completedTaskIds: [],
+    },
+  });
+  assert(
+    String(acceptedDriverContract.nextActionInstruction.summary ?? '').includes('Keep visible reasoning/progress action-oriented'),
+    'accepted execution provider turn keeps visible reasoning action oriented'
+  );
 }
 
 function assertRunStateMachineTaskLedger(): void {
@@ -10522,6 +10626,16 @@ async function assertProviderTraceArchiveCompactsStreamingChunks(): Promise<void
     content: 'Answer a generic high-volume streaming question.',
     requirementConfirmationMode: 'off',
   });
+
+  const visibleReasoning = events.find((event) =>
+    event.kind === 'assistant_msg' && (event.payload as any)?.channel === 'reasoning'
+  );
+  if (!visibleReasoning) throw new Error('provider reasoning should still be projected as a conversation event');
+  assert(
+    String((visibleReasoning.payload as any).content ?? '').length <= VISIBLE_REASONING_MAX_CHARS,
+    'provider reasoning conversation event is bounded even when trace archives full response'
+  );
+  assertEqual((visibleReasoning.payload as any).reasoningProjectionTruncated, true, 'provider reasoning conversation event records truncation');
 
   const responseTrace = transcript.find((entry): entry is TranscriptEntry & { type: 'metadata'; payload: any } =>
     entry.type === 'metadata' &&

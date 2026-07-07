@@ -77,6 +77,7 @@ import {
   ReviewProjectionBuilder,
   SessionFailureProjectionBuilder,
   SessionProgressProjectionBuilder,
+  VISIBLE_REASONING_MAX_CHARS,
 } from './projection/index.js';
 import { DriverInteractionIndex } from './interactions/index.js';
 import { ReviewAssembler, ReviewDecisionProjectionBuilder } from './review/index.js';
@@ -293,6 +294,7 @@ export const nativeToolRepairRunner = new NativeToolRepairRunner({
 });
 export const PROVIDER_REASONING_FLUSH_CHARS = 768;
 export const PROVIDER_REASONING_FLUSH_MS = 120;
+export { VISIBLE_REASONING_MAX_CHARS };
 export const SIDE_EFFECT_CAPABILITIES = new Set([
   'fs.write',
   'fs.patch',
