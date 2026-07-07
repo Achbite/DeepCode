@@ -27,13 +27,16 @@ export function renderProviderTurnUserPrompt(dynamicContent: string, contract: D
 }
 
 function renderFrame(frame: ProviderContextFrame): Record<string, unknown> {
+  const summary = frame.kind === 'NextActionInstruction'
+    ? 'See final Provider turn instruction.'
+    : frame.summary;
   return {
     kind: frame.kind,
     source: frame.source,
     trust: frame.trust,
     ...(frame.scope ? { scope: frame.scope } : {}),
     use: frame.use,
-    ...(frame.summary ? { summary: frame.summary } : {}),
+    ...(summary ? { summary } : {}),
     ...(frame.refs?.length ? { refs: frame.refs } : {}),
     ...(frame.data ? { data: frame.data } : {}),
   };

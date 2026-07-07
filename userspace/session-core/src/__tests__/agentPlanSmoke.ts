@@ -2103,7 +2103,8 @@ async function assertProviderPipelineUsesProviderTurnContract(): Promise<void> {
   assertEqual(firstUserPrompt.includes('"kind": "NextActionInstruction"'), true, 'main provider prompt carries next action through driver contract frames');
   assertEqual(firstUserPrompt.includes(`answer-${token}`), true, 'provider pipeline renders next action instruction');
   assertEqual(firstUserPrompt.includes('"nextActionInstruction"'), false, 'provider turn contract omits duplicated top-level next action field');
-  assertEqual((firstUserPrompt.match(new RegExp(`answer-${token}`, 'g')) ?? []).length, 2, 'next action appears only as frame summary and final instruction');
+  assertEqual((firstUserPrompt.match(new RegExp(`answer-${token}`, 'g')) ?? []).length, 1, 'next action appears only as final instruction');
+  assertEqual(firstUserPrompt.includes('See final Provider turn instruction.'), true, 'next action frame points to the final instruction without duplicating it');
   assertEqual(buildProviderTurnSnapshot(contract).finalUserPromptCharLength, firstUserPrompt.length, 'provider pipeline and context admission snapshot share user prompt renderer');
   assertEqual(firstMessages[1]?.length, 3, 'provider pipeline appends one retry instruction after empty response');
   const retryUserPrompt = String(firstMessages[1]?.[1]?.content ?? '');
