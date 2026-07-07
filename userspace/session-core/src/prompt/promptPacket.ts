@@ -292,6 +292,7 @@ function nextActionInstructionFrame(input: PromptEnvelopeBuilderInput): PromptPa
       'If ResourceEvidence and AccessIndex already contain enough workspace facts for the user request, output taskPlan or answer as allowed instead of rereading low-value context.',
       'Use resourceRequest only for missing concrete evidence needed to plan, answer, or edit safely. Keep it focused on a different path/range/search query that adds new facts.',
       'Plan review is the normal confirmation checkpoint for reviewable assumptions; use decisionRequest only when a blocking user choice prevents forming any valid taskPlan.',
+      'Decide from the current PromptPacket frames; do not re-audit protocol rules, permission gates, or unrelated prior requirements in reasoning.',
       'For side-effect work, plan first unless Session already provided an accepted task.',
     ];
   return {

@@ -152,6 +152,7 @@ function toolIntentTemplates(input: PromptEnvelopeBuilderInput, turnMode: Provid
     return [
       'planning/read/decision turn: use existing ResourceEvidence and AccessIndex first; output resourceRequest only for missing concrete facts that would change the next plan or answer.',
       'planning/read/decision turn: plan review is the normal confirmation checkpoint for reviewable assumptions; use decisionRequest only for blocking choices that prevent a valid taskPlan.',
+      'planning/read/decision turn: decide from the current PromptPacket frames; do not re-audit protocol rules, permission gates, or unrelated prior requirements in reasoning.',
       'planning/read/decision turn: do not output executable tool args or actionBundle unless the ProviderTurnContract allowedKinds explicitly includes actionBundle for a tiny single-step side effect.',
     ];
   }
