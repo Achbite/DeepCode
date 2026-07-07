@@ -334,6 +334,10 @@ function assertProviderTurnContractFrameOrder(): void {
     String(planningContract.nextActionInstruction.summary ?? '').includes('ResourceEvidence and AccessIndex already contain enough workspace facts'),
     'planning provider turn instructs the model to reuse existing evidence before resourceRequest'
   );
+  assert(
+    String(planningContract.nextActionInstruction.summary ?? '').includes('Plan review is the normal confirmation checkpoint'),
+    'planning provider turn keeps decisionRequest behind blocking choices'
+  );
 }
 
 function assertProviderTurnSnapshotRecordsContextAdmissionShape(): void {
@@ -7889,6 +7893,8 @@ function assertPromptEnvelope(): void {
   assert(!prompt.dynamicSuffix.includes('actionBundle.actions[] are executable Kernel tool actions shaped {actionId,toolId,args,description}'), 'planning provider turn does not expose execution action shape');
   assert(prompt.stablePrefix.includes('Execution tool argument schema is withheld in this turn'), 'planning provider turn withholds execution tool schema');
   assert(prompt.stablePrefix.includes('Use resourceRequest only when current ResourceEvidence and AccessIndex do not contain the concrete facts needed'), 'stable prompt gates resourceRequest behind missing concrete facts');
+  assert(prompt.stablePrefix.includes('Plan review is the normal confirmation checkpoint for reviewable implementation assumptions'), 'stable prompt routes reviewable assumptions through taskPlan review');
+  assert(prompt.stablePrefix.includes('blocking user choice is required before any valid taskPlan can be formed'), 'stable prompt narrows decisionRequest to blocking choices');
   assert(!prompt.stablePrefix.includes('dependsOn'), 'prompt no longer teaches provider action dependency fields');
   assert(!prompt.stablePrefix.includes('hard dependencies'), 'prompt no longer teaches hard dependency planning');
   assert(!prompt.stablePrefix.includes('prerequisite'), 'prompt no longer teaches prerequisite planning');
@@ -7934,6 +7940,7 @@ function assertPromptEnvelope(): void {
   assert(renderedContract.includes('<PromptPacket schemaVersion="deepcode.session.prompt-packet.v1">'), 'provider turn contract renders prompt packet frames');
   assert(renderedContract.includes('kind: DynamicDialogue'), 'prompt packet labels dynamic dialogue frame');
   assert(renderedContract.includes('use existing ResourceEvidence and AccessIndex first'), 'provider turn contract planning tool intent prefers existing evidence');
+  assert(renderedContract.includes('plan review is the normal confirmation checkpoint for reviewable assumptions'), 'provider turn contract planning intent narrows decisionRequest');
   assert(renderedContract.includes('trust: userIntent'), 'prompt packet marks dynamic dialogue as user intent');
   assert(renderedContract.includes('kind: ResourceEvidence'), 'prompt packet includes kernel-observed resource evidence frame');
   assert(renderedContract.includes('trust: kernelObservedFact'), 'prompt packet marks resource evidence as observed facts');
@@ -7947,6 +7954,7 @@ function assertPromptEnvelope(): void {
   assert(renderedContract.includes('kind: MemoryPlaceholder'), 'prompt packet labels compacted memory frame');
   assert(renderedContract.includes('trust: compressedReference'), 'prompt packet marks memory as reference rather than fact');
   assert(renderedContract.includes('kind: NextActionInstruction'), 'prompt packet includes final next-action instruction');
+  assert(renderedContract.includes('Plan review is the normal confirmation checkpoint for reviewable assumptions'), 'prompt packet next action narrows planning decisionRequest');
   const memoryFrameIndex = renderedContract.indexOf('kind: MemoryPlaceholder');
   const dynamicDialogueIndex = renderedContract.indexOf('kind: DynamicDialogue');
   const resourceEvidenceIndex = renderedContract.indexOf('kind: ResourceEvidence');

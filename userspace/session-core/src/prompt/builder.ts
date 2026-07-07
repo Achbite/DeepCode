@@ -1,5 +1,5 @@
 import type { PromptEnvelope, PromptEnvelopeBuilderInput, PromptSegment, PromptSystemLayer } from './types.js';
-import { providerVisibleSchemaDigest, providerVisibleWorkflowState } from './providerTurnContract.js';
+import { planningDecisionPolicyLines, providerVisibleSchemaDigest, providerVisibleWorkflowState } from './providerTurnContract.js';
 
 export function buildPromptEnvelope(input: PromptEnvelopeBuilderInput): PromptEnvelope {
   const layers = ([
@@ -30,8 +30,8 @@ export function buildPromptEnvelope(input: PromptEnvelopeBuilderInput): PromptEn
         'All user-visible natural-language fields, including answer.content, narration, taskPlan titles/descriptions, decisionRequest question/options, userPlanMarkdown, validation descriptions, and review guidance, must use the current user input language unless the user explicitly asks for another language.',
         'narration must be natural, concise, and aligned with the next envelope behavior. It must not claim that files were read, tools ran, permissions were granted, tests passed, or work completed unless Kernel facts already prove that.',
         'Do not put raw JSON, parser repair details, hidden reasoning, provider/debug text, or protocol explanations in narration.',
-        'For pure read-only explanations or capability answers, use kind="answer" only. If more context is needed, use kind="resourceRequest" only. If user intervention is required for ambiguity, engineering alternatives, boundary expansion, delete/interface removal, cross-project write, permission gap, or failed validation scope expansion, use kind="decisionRequest" only.',
-        'For important engineering choices, decisionRequest is the checkpoint: ask one concrete question, provide 2-3 mutually exclusive options, mark one recommendation, and wait for the user choice before producing taskPlan or executable work.',
+        'For pure read-only explanations or capability answers, use kind="answer" only. If more context is needed, use kind="resourceRequest" only.',
+        ...planningDecisionPolicyLines(),
         'For non-trivial side-effect work, first use kind="taskPlan". taskPlan is the Plan/Check artifact: it lists a Session-advanced ordered tasks[] queue, targets, capabilities, acceptance criteria, failure criteria, risks, and review checkpoints. Choose a reasonable engineering order for the queue, but do not model a graph or ask the model to manage cross-task scheduling. It must not include source code, patches, codeBlocks, actionBundle, commandBlocks, or executable tool calls.',
         'Use kind="actionBundle" only when the current ProviderTurnContract explicitly allows it for an accepted current task, or for a tiny single-step side effect explicitly allowed by Session. Detailed actionBundle and tool argument schema is provided by ProviderTurnContract only for execution-capable turns.',
         'For protocol failure, permission insufficiency, context insufficiency, or repair failure terminal explanation, use kind="diagnostic"; diagnostic never creates a plan or execution queue.',
@@ -260,6 +260,7 @@ function agentInterventionPolicySummary(input: PromptEnvelopeBuilderInput): stri
     `Agent user intervention level: ${level}.`,
     'When a user-facing engineering choice is needed, use kind="decisionRequest" with one concise question, 2-3 mutually exclusive options, exactly one recommended option, short impact descriptions, and allowsFreeform=true.',
     'decisionRequest is a short intermediate planning checkpoint; do not replace it with an actionBundle and do not include source code, patches, or executable commands.',
+    'Plan review is the default confirmation path for reviewable assumptions. Prefer taskPlan with explicit assumptions and review checkpoints over decisionRequest unless no valid taskPlan can be formed without the user choosing first.',
   ];
   if (level === 'low') {
     lines.push('Low: ask only for permission boundaries, protocol or architecture changes, broad rewrites, destructive work, cross-project writes, or validation scope expansion after failure. Choose ordinary implementation details yourself and list assumptions in the later plan.');

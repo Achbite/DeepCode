@@ -92,6 +92,7 @@ export function providerVisibleSchemaDigest(input: PromptEnvelopeBuilderInput): 
     'answer top-level field: answer.format="markdown" and answer.content contains the user-visible response.',
     resourceRequestProtocolShapeLine(),
     'decisionRequest top-level field: decisionRequest.version/id/question/reason/summary/options/allowsFreeform; question must be a non-empty user-visible string. Use 2-3 mutually exclusive options with one recommended option.',
+    ...planningDecisionPolicyLines(),
     'taskPlan top-level field: taskPlan.version/id/title/summary/tasks/risks/reviewCheckpoints. tasks[] is a Session-advanced ordered implementation queue. Do not output scheduling graph structures, source code, codeBlocks, actionBundle, commandBlocks, patches, or executable tool calls.',
     'taskOutcome top-level field: taskOutcome.version/id/taskId/status/reason/evidenceRefs. Use it only during accepted task execution when the current task is already sufficiently satisfied and no Kernel write/delete action is needed.',
     'diagnostic top-level field: diagnostic.version/id/severity/summary/details; diagnostic explains terminal protocol/context failure and never queues execution.',
@@ -150,6 +151,7 @@ function toolIntentTemplates(input: PromptEnvelopeBuilderInput, turnMode: Provid
   if (turnMode !== 'acceptedTaskExecution' && turnMode !== 'resourceResume' && turnMode !== 'scopeIntervention') {
     return [
       'planning/read/decision turn: use existing ResourceEvidence and AccessIndex first; output resourceRequest only for missing concrete facts that would change the next plan or answer.',
+      'planning/read/decision turn: plan review is the normal confirmation checkpoint for reviewable assumptions; use decisionRequest only for blocking choices that prevent a valid taskPlan.',
       'planning/read/decision turn: do not output executable tool args or actionBundle unless the ProviderTurnContract allowedKinds explicitly includes actionBundle for a tiny single-step side effect.',
     ];
   }
@@ -183,4 +185,11 @@ function stringArray(value: unknown): string[] {
   return Array.isArray(value)
     ? value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0).map((item) => item.trim())
     : [];
+}
+
+export function planningDecisionPolicyLines(): string[] {
+  return [
+    'Plan review is the normal confirmation checkpoint for reviewable implementation assumptions. During planning, prefer taskPlan with explicit assumptions, risks, and review checkpoints over decisionRequest for routine classifications, reversible cleanup choices, file organization details, or choices the user can approve or revise in the plan card.',
+    'Use kind="decisionRequest" only when a blocking user choice is required before any valid taskPlan can be formed: mutually exclusive product or architecture direction, destructive scope not inferable from confirmed text, cross-workspace scope, permission boundary expansion, or validation authority change.',
+  ];
 }
