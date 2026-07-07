@@ -7822,6 +7822,25 @@ function assertV3Parser(): void {
   const resourcePayload = resourceRequest.payload as any;
   assertEqual(resourcePayload.items[0].path, 'src/generic.txt', 'v3 resourceRequest keeps root-relative path');
 
+  const rootResourceRequest = parseProposalEnvelope({
+    runId: 'run-generic',
+    sessionId: 'session-generic',
+    raw: JSON.stringify({
+      schemaVersion: 'deepcode.agent.protocol.v3',
+      kind: 'resourceRequest',
+      outputLanguage: 'en-US',
+      resourceRequest: {
+        version: '1',
+        id: 'request-generic-root',
+        reason: 'Need the generic root directory.',
+        items: [{ id: 'root-item', kind: 'directory', rootId: 'root-generic', path: '', reason: 'Read root directory.' }],
+      },
+    }),
+  });
+  const rootPayload = rootResourceRequest.payload as any;
+  assertEqual(rootPayload.items[0].manifestEntryId, 'root-generic', 'v3 resourceRequest rootId plus empty path canonicalizes to root manifest entry');
+  assertEqual(rootPayload.items[0].path, undefined, 'v3 resourceRequest root path canonicalization omits empty path');
+
   const aliasResourceRequest = parseProposalEnvelope({
     runId: 'run-generic',
     sessionId: 'session-generic',
@@ -7946,6 +7965,19 @@ function assertV3Parser(): void {
         version: '1',
         id: 'invalid-resource-request',
         items: [{ id: 'missing-target', reason: 'Missing manifestEntryId and path.' }],
+      },
+    }),
+  }), 'manifestEntryId, path, or kind="search"');
+
+  assertThrows(() => parseProposalEnvelope({
+    runId: 'run-generic',
+    raw: JSON.stringify({
+      schemaVersion: 'deepcode.agent.protocol.v3',
+      kind: 'resourceRequest',
+      resourceRequest: {
+        version: '1',
+        id: 'invalid-empty-path-resource-request',
+        items: [{ id: 'empty-path-target', path: '', reason: 'Empty path without root must remain invalid.' }],
       },
     }),
   }), 'manifestEntryId, path, or kind="search"');

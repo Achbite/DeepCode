@@ -460,9 +460,10 @@ function normalizeResourceRequest(value: Record<string, unknown>): Record<string
         ? resourceType
         : undefined
     );
-    const manifestEntryId = optionalString(record, 'manifestEntryId');
-    const path = optionalString(record, 'path');
     const rootId = optionalString(record, 'rootId');
+    const path = optionalString(record, 'path');
+    const rootPathRequest = rootId && typeof record.path === 'string' && record.path.trim() === '';
+    const manifestEntryId = optionalString(record, 'manifestEntryId') ?? (rootPathRequest ? rootId : undefined);
     const query = optionalString(record, 'query');
     const include = optionalStringArray(record, 'include');
     const contextLines = optionalNonNegativeInteger(record, 'contextLines');
