@@ -7720,6 +7720,41 @@ function assertProtocolGateCanonicalizesBareRepair(): void {
   });
   assertEqual(plan.kind, 'taskPlan', 'protocol gate canonicalizes bare task plan repair');
   assertEqual(plan.runId, `run-${token}`, 'protocol gate fills repaired run id');
+  const wrongVersionPlan = gate.parseAndValidateRepairedProposal({
+    raw: {
+      schemaVersion: '1.0',
+      kind: 'taskPlan',
+      taskPlan: {
+        title: `Version plan ${token}`,
+        summary: `Version summary ${token}`,
+        tasks: [
+          {
+            taskId: `version-task-${token}`,
+            title: `Version task ${token}`,
+            target: [`version-target-${token}.txt`],
+            acceptanceCriteria: [`version-accepted-${token}`],
+          },
+        ],
+      },
+    },
+    runId: `run-version-${token}`,
+    sessionId: `session-version-${token}`,
+    source: 'llm',
+    allowedKinds: ['taskPlan'],
+  });
+  assertEqual(wrongVersionPlan.kind, 'taskPlan', 'protocol gate canonicalizes wrong repaired schema version');
+  assertThrows(
+    () => gate.parseAndValidateRepairedProposal({
+      raw: {
+        schemaVersion: '1.0',
+        kind: 'taskPlan',
+      },
+      runId: `run-version-missing-${token}`,
+      source: 'llm',
+      allowedKinds: ['taskPlan'],
+    }),
+    'Agent Protocol v3.taskPlan.tasks must be a non-empty array'
+  );
   const decision = gate.parseAndValidateRepairedProposal({
     raw: {
       question: `Question ${token}?`,
