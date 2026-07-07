@@ -275,9 +275,9 @@ function agentInterventionPolicySummary(input: PromptEnvelopeBuilderInput): stri
 function currentResourceResultsSummary(input: PromptEnvelopeBuilderInput): string {
   const lines: string[] = [];
   lines.push('Evidence tail policy: read-only confirmations, resource snippets, search results, and current-turn tool results belong at the end of the dynamic context.');
-  lines.push('Read-only resource requests are not governed by a fixed Session round budget; users may stop the run or add guidance while reading continues.');
+  lines.push('This section records evidence availability only. The final NextActionInstruction decides whether to propose now or request more evidence.');
   lines.push('Prefer targeted search/grep-style queries and focused file ranges before requesting a whole large file or directory again.');
-  lines.push('Request the directories, files, search results, or file segments that are useful for the task; do not answer prematurely if key facts are still missing.');
+  lines.push('Use existing ResourceEvidence and AccessIndex before requesting more resources; request more only when the missing fact would materially change the next proposal.');
   lines.push('Avoid low-value repetition: do not request the exact same path/range/query again unless a previous ResourcePacket shows an error, memory appears stale, or a different segment is needed.');
   lines.push('Current-turn tool results, permission facts, review feedback, and transient run state belong here or later in the dynamic suffix; they must not be promoted into the stable prefix.');
   return lines.join('\n');

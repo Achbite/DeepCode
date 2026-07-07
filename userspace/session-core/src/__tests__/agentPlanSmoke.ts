@@ -8794,7 +8794,10 @@ function assertPromptEnvelope(): void {
   assert(prompt.dynamicSuffix.includes('generic content'), 'prompt includes ResourcePacket content');
   assert(!prompt.dynamicSuffix.includes('evidence-generic'), 'prompt excludes volatile evidence refs from provider-visible resource context');
   assert(!prompt.dynamicSuffix.includes('Read-only resource budget:'), 'prompt does not expose fixed read-only resource budget');
-  assert(prompt.dynamicSuffix.includes('not governed by a fixed Session round budget'), 'prompt explains read-only requests are user-controlled');
+  assert(prompt.dynamicSuffix.includes('final NextActionInstruction decides whether to propose now or request more evidence'), 'evidence tail defers read/propose choice to next-action instruction');
+  assert(prompt.dynamicSuffix.includes('missing fact would materially change the next proposal'), 'evidence tail narrows additional reads to proposal-changing facts');
+  assert(!prompt.dynamicSuffix.includes('not governed by a fixed Session round budget'), 'evidence tail no longer encourages open-ended read loops');
+  assert(!prompt.dynamicSuffix.includes('do not answer prematurely'), 'evidence tail no longer tells planning turns to delay proposals');
   assert(prompt.dynamicSuffix.includes('offsetBytes/limitBytes'), 'prompt hints range reread for truncated resources');
   assert(!prompt.dynamicSuffix.includes('auditOnlyContext'), 'audit-only context is not in dynamic suffix');
 
