@@ -254,7 +254,9 @@ function planReviewStatusAwaitingUser(status?: string): boolean {
 }
 
 function planDecisionKey(runId?: string, planId?: string): string {
-  return runId && planId ? `${runId}::${planId}` : '';
+  // Plan confirmations are owned by planId; accepted execution may advance with child runIds.
+  if (planId) return `plan:${planId}`;
+  return runId ? `run:${runId}` : '';
 }
 
 function requirementDecisionKey(runId?: string, requirementId?: string): string {

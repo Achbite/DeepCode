@@ -283,7 +283,10 @@ function hasTerminalPlanDecision(events: AgentEvent[], runId: string, planId: st
     if (event.kind !== 'plan_review') return false;
     const payload = asRecord(event.payload);
     if (!payload || !isTerminalStatus(stringField(payload, 'status'))) return false;
-    return stringField(payload, 'runId') === runId && stringField(payload, 'planId') === planId;
+    const candidatePlanId = stringField(payload, 'planId');
+    // Accepted-plan execution can continue under child runIds; planId closes the original confirmation.
+    if (candidatePlanId) return candidatePlanId === planId;
+    return stringField(payload, 'runId') === runId;
   });
 }
 

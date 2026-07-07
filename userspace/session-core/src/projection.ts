@@ -682,7 +682,10 @@ function implementationPlanTaskProjectionItems(
     const acceptance = stringArrayField(item, 'acceptanceCriteria');
     const failure = stringArrayField(item, 'failureCriteria');
     const scope = stringField(item, 'scope');
-    const targets = stringArrayOrSingleField(item, 'target');
+    const targets = [
+      ...stringArrayOrSingleField(item, 'target'),
+      ...stringArrayOrSingleField(item, 'targets'),
+    ];
     const summary = [
       scope,
       acceptance.length ? `Acceptance: ${acceptance.join('; ')}` : '',
@@ -832,8 +835,9 @@ function implementationTaskStatus(
 function samePlanDecision(payload: Record<string, unknown>, planRunId?: string, planId?: string): boolean {
   const decisionRunId = stringField(payload, 'runId');
   const decisionPlanId = stringField(payload, 'planId');
-  return (!planRunId || !decisionRunId || decisionRunId === planRunId) &&
-    (!planId || !decisionPlanId || decisionPlanId === planId);
+  // Accepted-plan execution batches can use child runIds; planId is the stable task/progress key.
+  if (planId && decisionPlanId) return decisionPlanId === planId;
+  return !planRunId || !decisionRunId || decisionRunId === planRunId;
 }
 
 interface ImplementationFact {
@@ -875,7 +879,7 @@ function eventPathCandidates(payload: Record<string, unknown>): string[] {
   const candidates: string[] = [];
   const collect = (value: unknown): void => {
     if (!isRecordPayload(value)) return;
-    for (const key of ['path', 'absolutePath', 'resourceScope', 'target']) {
+    for (const key of ['path', 'absolutePath', 'normalizedTargetPath', 'resourceScope', 'target', 'targets', 'targetPath', 'writeSet', 'deleteSet']) {
       const field = value[key];
       if (typeof field === 'string' && field.trim()) candidates.push(field);
       if (Array.isArray(field)) {

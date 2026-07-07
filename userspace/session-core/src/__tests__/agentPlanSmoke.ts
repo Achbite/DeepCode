@@ -7907,16 +7907,16 @@ function assertPlanContextIndexBuildsPlanReadModels(): void {
     sessionId,
     ts: '2026-01-01T00:00:01.000Z',
     kind: 'plan_review',
-    payload: { runId, planId, status: 'accepted' },
+    payload: { runId: `${runId}-child`, planId, status: 'accepted' },
   } as AgentEvent;
   const review = {
     id: `event-${suffix}-summary`,
     sessionId,
     ts: '2026-01-01T00:00:02.000Z',
     kind: 'review_summary',
-    payload: { runId, planId },
+    payload: { runId: `${runId}-child`, planId },
   } as AgentEvent;
-  assertEqual(index.alreadyResolved([planCard, accepted, review], found!), true, 'plan context index treats accepted reviewed plans as resolved');
+  assertEqual(index.alreadyResolved([planCard, accepted, review], found!), true, 'plan context index treats accepted reviewed child-run plans as resolved by plan id');
 }
 
 function assertPlanInteractionIndexFindsActivePlan(): void {
@@ -9780,7 +9780,7 @@ function assertImplementationPlanTaskProjectionProgress(): void {
               {
                 taskId: 'task-build-dir',
                 title: 'Remove generated directory',
-                target: ['alpha-build/'],
+                targets: ['alpha-build/'],
                 acceptanceCriteria: ['Kernel facts show the directory removal.'],
               },
               {
@@ -9812,14 +9812,14 @@ function assertImplementationPlanTaskProjectionProgress(): void {
         kind: 'workflow_stage',
         payload: {
           stage: 'accepted_plan.batch_checkpoint',
-          runId: 'run-directory-projection',
+          runId: 'run-directory-projection-child',
           planId: 'plan-directory-projection',
           completedTaskIds: ['task-build-dir', 'task-source-dir'],
           remainingTaskIds: [],
           taskLedger: {
             schemaVersion: 'deepcode.session.task-ledger.v1',
             planId: 'plan-directory-projection',
-            runId: 'run-directory-projection',
+            runId: 'run-directory-projection-child',
             taskOrder: ['task-build-dir', 'task-source-dir'],
             completedTaskIds: ['task-build-dir', 'task-source-dir'],
             skippedTaskIds: [],
@@ -9848,7 +9848,7 @@ function assertImplementationPlanTaskProjectionProgress(): void {
   assertEqual(
     directoryItems.filter((item) => item.id.includes('implementation-plan')).every((item) => item.status === 'completed'),
     true,
-    'accepted-plan taskLedger checkpoint overrides plan-card task statuses for directory targets'
+    'accepted-plan taskLedger checkpoint from a child run overrides plan-card task statuses for directory targets'
   );
 }
 
