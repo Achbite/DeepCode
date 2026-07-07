@@ -58,6 +58,7 @@ import {
   ActionProposalSubmitter,
   ProviderPlanProposalHandler,
   ProviderTerminalProposalHandler,
+  ProposalRouteExecutor,
   ProposalRouter,
   type PlanContext as SessionPlanContext,
 } from './proposal/index.js';
@@ -159,7 +160,8 @@ export class SessionDriverLoop {
   private readonly providerDecisionRequestHandler: ProviderDecisionRequestHandler<SessionDriverLoopInput, SessionDriverLoopRunState>;
   private readonly providerPlanProposalHandler: ProviderPlanProposalHandler<SessionDriverLoopRunState>;
   private readonly providerTerminalProposalHandler: ProviderTerminalProposalHandler<SessionDriverLoopInput, SessionDriverLoopRunState>;
-  private readonly proposalRouter: ProposalRouter<SessionDriverLoopInput, SessionDriverLoopRunState>;
+  private readonly proposalRouter: ProposalRouter;
+  private readonly proposalRouteExecutor: ProposalRouteExecutor<SessionDriverLoopInput, SessionDriverLoopRunState>;
   private readonly requirementConfirmationCoordinator: RequirementConfirmationCoordinator<SessionDriverLoopInput, SessionDriverLoopRunState>;
   private readonly requirementDecisionHandler: RequirementDecisionHandler;
   private readonly reviewDecisionHandler: ReviewDecisionHandler;
@@ -655,7 +657,8 @@ export class SessionDriverLoop {
       finalDiagnosticEvent: (diagnosticSessionId, summary, ts, id) =>
         assistantProjectionBuilder.finalDiagnosticEvent(diagnosticSessionId, summary, ts, id),
     });
-    this.proposalRouter = new ProposalRouter<SessionDriverLoopInput, SessionDriverLoopRunState>({
+    this.proposalRouter = new ProposalRouter();
+    this.proposalRouteExecutor = new ProposalRouteExecutor<SessionDriverLoopInput, SessionDriverLoopRunState>({
       now: () => this.agentRunReactor.ts(),
       createId: (prefix) => this.agentRunReactor.id(prefix),
       append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
@@ -1234,7 +1237,10 @@ export class SessionDriverLoop {
         }),
       callProviderAndParse: (handlerInput, state, prompt) =>
         this.providerProposalCoordinator.callAndParse(handlerInput, state, prompt),
-      route: (routerInput) => this.proposalRouter.route(routerInput),
+      route: (routerInput) => this.proposalRouteExecutor.execute({
+        ...routerInput,
+        routed: this.proposalRouter.route(routerInput.proposal),
+      }),
       appendDriverFailure: async (state, error) => {
         if (!(error instanceof SessionDriverLoopError)) return null;
         return this.agentRunReactor.append(state.sessionId, [

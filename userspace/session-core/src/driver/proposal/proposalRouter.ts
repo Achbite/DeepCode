@@ -16,7 +16,7 @@ export interface ProposalRouterResourceResult {
   lastResult?: AgentSessionResult;
 }
 
-export interface ProposalRouterPorts<Input, State extends ProposalRouterState> {
+export interface ProposalRouteExecutorPorts<Input, State extends ProposalRouterState> {
   now(): string;
   createId(prefix: string): string;
   append(sessionId: string, events: AgentEvent[]): Promise<AgentSessionResult>;
@@ -46,12 +46,16 @@ export interface ProposalRouterPorts<Input, State extends ProposalRouterState> {
   ): Promise<AgentSessionResult>;
 }
 
+export type ProposalRouterPorts<Input, State extends ProposalRouterState> =
+  ProposalRouteExecutorPorts<Input, State>;
+
 export interface ProposalRouterInput<Input, State extends ProposalRouterState> {
   input: Input;
   state: State;
   prompt: PromptEnvelope;
   proposal: ProposalEnvelope;
   lastResult: AgentSessionResult;
+  routed?: RoutedProposal;
 }
 
 export type RoutedProposal =
@@ -73,14 +77,20 @@ export function routeProposalKind(proposal: ProposalEnvelope): RoutedProposal {
   return { kind: 'nonExecutable', proposal };
 }
 
-export class ProposalRouter<Input, State extends ProposalRouterState> {
-  constructor(private readonly ports: ProposalRouterPorts<Input, State>) {}
-
+export class ProposalRouter {
   planRoute(proposal: ProposalEnvelope): RoutedProposal {
     return routeProposalKind(proposal);
   }
 
-  async route(routerInput: ProposalRouterInput<Input, State>): Promise<ProposalRouterResult> {
+  route(proposal: ProposalEnvelope): RoutedProposal {
+    return this.planRoute(proposal);
+  }
+}
+
+export class ProposalRouteExecutor<Input, State extends ProposalRouterState> {
+  constructor(private readonly ports: ProposalRouteExecutorPorts<Input, State>) {}
+
+  async execute(routerInput: ProposalRouterInput<Input, State>): Promise<ProposalRouterResult> {
     const { input, state, prompt, proposal } = routerInput;
     let lastResult = routerInput.lastResult;
     const narration = this.ports.proposalNarrationEvent(
@@ -93,7 +103,7 @@ export class ProposalRouter<Input, State extends ProposalRouterState> {
       lastResult = await this.ports.append(state.sessionId, [narration]);
     }
 
-    const routed = this.planRoute(proposal);
+    const routed = routerInput.routed ?? routeProposalKind(proposal);
     if (routed.kind === 'answer') {
       return { kind: 'return', result: await this.ports.handleAnswer(input, state, proposal) };
     }
