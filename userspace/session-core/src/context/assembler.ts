@@ -541,7 +541,6 @@ function contextAssemblyPartitionName(segment: PromptSegment): ContextAssemblyPa
       return 'PlatformProtocolContract';
     case 'builtinSystemPrompt':
     case 'systemStructure':
-    case 'agentInterventionPolicy':
       return 'AgentOperatingContract';
     case 'toolCatalogSummary':
       return 'StaticToolCatalogDigest';
@@ -558,6 +557,7 @@ function contextAssemblyPartitionName(segment: PromptSegment): ContextAssemblyPa
     case 'currentWorkflowState':
     case 'currentRequirement':
     case 'currentUserOverlay':
+    case 'agentInterventionPolicy':
       return 'CurrentRunStateAndRequest';
     case 'reusableResourceContext':
     case 'currentResourceResults':

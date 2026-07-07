@@ -8723,6 +8723,14 @@ function assertContextAssemblerCachePlan(): void {
     'platform protocol partition contains the protocol contract segment'
   );
   assert(
+    base.contextAssembly.partitionRecords.find((partition) => partition.name === 'AgentOperatingContract')?.segmentNames.includes('agentInterventionPolicy') !== true,
+    'agent operating contract excludes dynamic intervention policy'
+  );
+  assert(
+    base.contextAssembly.partitionRecords.find((partition) => partition.name === 'CurrentRunStateAndRequest')?.segmentNames.includes('agentInterventionPolicy') === true,
+    'current run state partition contains dynamic intervention policy'
+  );
+  assert(
     base.contextAssembly.partitionRecords.find((partition) => partition.name === 'ProjectMemory')?.segmentNames.includes('projectMemoryRecall') === true,
     'project memory partition includes dynamic recall segment'
   );
