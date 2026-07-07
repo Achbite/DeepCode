@@ -69,7 +69,7 @@ import {
   KernelEventStatusIndex,
   RepairLoop,
 } from '../driver/execution/index.js';
-import { InteractionOverlayCodec, NativeToolHandlerPortsFactory, NativeToolProgressEventBuilder, NativeToolProviderLoop, NativeToolProjectionBuilder, NativeToolRepairCoordinator, NativeToolRepairRunner, NativeToolResourceRecorder, NativeToolResultMessageBuilder, NativeToolResumeMessageBuilder, PermissionPipeline, ProposalOnlyProviderRunner, ProviderJsonModeCoordinator, ProviderPipeline, ProviderStreamCoordinator, ProviderStreamRuntime, ProviderToolCallBuffer, ProviderTraceRecorder, ProviderTurnRunner, UserGuidanceQueue, UserInputPipeline } from '../driver/pipelines/index.js';
+import { InteractionOverlayCodec, NativeToolExposurePolicy, NativeToolHandlerPortsFactory, NativeToolProgressEventBuilder, NativeToolProviderLoop, NativeToolProjectionBuilder, NativeToolRepairCoordinator, NativeToolRepairRunner, NativeToolResourceRecorder, NativeToolResultMessageBuilder, NativeToolResumeMessageBuilder, PermissionPipeline, ProposalOnlyProviderRunner, ProviderJsonModeCoordinator, ProviderPipeline, ProviderStreamCoordinator, ProviderStreamRuntime, ProviderToolCallBuffer, ProviderTraceRecorder, ProviderTurnRunner, UserGuidanceQueue, UserInputPipeline } from '../driver/pipelines/index.js';
 import { ActionBundleActionInspector, PlanContextIndex, PlanInteractionIndex, PlanReviewGrantProjector, PlanReviewReportAnalyzer, ProposalSemanticValidator, ProtocolGate } from '../driver/proposal/index.js';
 import { AssistantProjectionBuilder, DriverActivityBuilder, KernelEventProjectionBuilder, PlanProjectionBuilder, RequirementProjectionBuilder, ReviewProjectionBuilder, SessionFailureProjectionBuilder, SessionProgressProjectionBuilder } from '../driver/projection/index.js';
 import { AcceptedPlanReviewHandoffCoordinator, AcceptedPlanStaticSyntaxReviewCoordinator, ReviewAssembler, ReviewDecisionProjectionBuilder } from '../driver/review/index.js';
@@ -93,6 +93,7 @@ async function main(): Promise<void> {
   assertNativeToolResultMessageBuilderBuildsToolMessages();
   assertNativeToolResourceRecorderRecordsPackets();
   assertNativeToolResumeMessageBuilderAppendsToolMessages();
+  assertNativeToolExposurePolicySuppressesPlanningReadToolsAfterEvidence();
   await assertNativeToolProviderLoopResumesAfterToolMessages();
   await assertNativeToolHandlerPortsFactoryBuildsPorts();
   await assertProposalOnlyProviderRunnerRepairsToolViolation();
@@ -118,6 +119,7 @@ async function main(): Promise<void> {
   await assertResourceRequestLoopBuildsPacketEvents();
   assertResourceManifestBuilderSeedsWorkspaceRootEntries();
   await assertSessionDriverLoopPreResolvesProjectWorkspaceRoot();
+  await assertSessionDriverLoopSuppressesPlanningNativeReadToolsAfterInitialEvidence();
   await assertResourceOrchestratorResolvesAndRecordsPackets();
   await assertAcceptedPlanResourceResumeCoordinatorBuildsProviderTurn();
   await assertResourceRequestRepairCoordinatorRepairsProposal();
@@ -947,6 +949,42 @@ function assertNativeToolResumeMessageBuilderAppendsToolMessages(): void {
   assertEqual((messages[2] as any).reasoningContent, `reasoning-${token}`, 'native tool resume message builder preserves reasoning content');
   assertEqual((messages[2] as any).toolCalls[0].id, toolCall.callId, 'native tool resume message builder converts native tool call to protocol call');
   assertEqual(messages[3]?.role, 'tool', 'native tool resume message builder appends tool message after assistant');
+}
+
+function assertNativeToolExposurePolicySuppressesPlanningReadToolsAfterEvidence(): void {
+  const token = randomSmokeToken('native-tool-policy');
+  const policy = new NativeToolExposurePolicy();
+  const tools = [{ name: `fs-read-${token}` } as any, { name: `fs-list-${token}` } as any];
+  const planningFrame = {
+    turnMode: 'planning',
+    allowedKinds: ['answer', 'resourceRequest', 'taskPlan'],
+  } as any;
+
+  assertEqual(
+    policy.providerTools({
+      providerTurnFrame: planningFrame,
+      resourcePackets: [{ id: `packet-${token}` } as ResourcePacket],
+    }, tools).length,
+    0,
+    'planning native read tools are hidden when current ResourceEvidence is already available'
+  );
+  assertEqual(
+    policy.providerTools({
+      providerTurnFrame: planningFrame,
+      resourcePackets: [],
+    }, tools).length,
+    tools.length,
+    'planning native read tools remain available before any ResourceEvidence exists'
+  );
+  assertEqual(
+    policy.providerTools({
+      acceptedImplementationPlan: { id: `plan-${token}` },
+      providerTurnFrame: { ...planningFrame, turnMode: 'acceptedTaskExecution' },
+      resourcePackets: [{ id: `packet-${token}` } as ResourcePacket],
+    }, tools).length,
+    tools.length,
+    'accepted execution does not inherit the planning native read tool suppression'
+  );
 }
 
 async function assertNativeToolProviderLoopResumesAfterToolMessages(): Promise<void> {
@@ -2882,6 +2920,86 @@ async function assertSessionDriverLoopPreResolvesProjectWorkspaceRoot(): Promise
     'workspace root ResourceResolve runs after runCreate and before the first provider call'
   );
   assertEqual(result.events.some((event) => event.kind === 'tool_result'), true, 'initial root evidence is projected as a resource tool result');
+}
+
+async function assertSessionDriverLoopSuppressesPlanningNativeReadToolsAfterInitialEvidence(): Promise<void> {
+  const token = randomSmokeToken('planning-tool-policy');
+  const sessionId = `session-${token}`;
+  const workspaceRoot = `/tmp/${token}/${randomSmokeToken('workspace')}`;
+  const events: AgentEvent[] = [];
+  const llmRequests: LlmChatRequest[] = [];
+  const session: AgentSession = {
+    id: sessionId,
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => {
+      const command = request.command as Record<string, any>;
+      if (command.kind === 'resourceResolve') {
+        const manifest = command.request?.manifest as Record<string, any>;
+        const entry = manifest.entries[0] ?? {};
+        return {
+          ok: true,
+          events: [{
+            kind: 'resource.packet_produced',
+            runId: `run-${token}`,
+            sessionId,
+            packet: {
+              id: `packet-${token}`,
+              workspaceScopeKey: manifest.workspaceScopeKey,
+              requestId: command.requestId,
+              items: [{
+                requestItemId: `item-${token}`,
+                manifestEntryId: entry.id,
+                readPolicy: 'autoRead',
+                status: 'resolved',
+                sourceKind: 'directory',
+                contentKind: 'directoryTree',
+                path: '.',
+                absolutePath: entry.resourceRef,
+                nodes: [{ type: 'file', path: `${randomSmokeToken('file')}.txt` }],
+                evidenceRefs: [`evidence-${token}`],
+              }],
+            },
+          }],
+        };
+      }
+      return fakeKernel(request);
+    },
+    llmChat: async (request): Promise<ApiResponse<LlmChatResult>> => {
+      llmRequests.push(request);
+      assertEqual(Array.isArray(request.tools), true, 'planning provider request carries an explicit tools list');
+      assertEqual(request.tools?.length ?? -1, 0, 'planning provider hides native read tools after initial ResourceEvidence');
+      return jsonLlmResponse({
+        schemaVersion: 'deepcode.agent.protocol.v3',
+        kind: 'answer',
+        outputLanguage: 'en-US',
+        answer: { format: 'markdown', content: `Generic planning used existing evidence for ${token}.` },
+      });
+    },
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + llmRequests.length + 1}`,
+  });
+
+  await loop.runUserTurn({
+    sessionId,
+    content: 'Plan from the current generic workspace evidence.',
+    projectWorkingDirectory: {
+      rootId: `root-${token}`,
+      label: `Workspace ${token}`,
+      displayPath: workspaceRoot,
+      absolutePath: workspaceRoot,
+      source: 'projectWorkingDirectory',
+    },
+  });
+
+  assertEqual(llmRequests.length, 1, 'planning turn completes without a native read tool resume');
 }
 
 async function assertResourceOrchestratorResolvesAndRecordsPackets(): Promise<void> {
@@ -17309,7 +17427,6 @@ async function assertSessionDriverLoopNativeReadToolStreamsThroughResourceResolv
   const result = await loop.runUserTurn({
     sessionId: 'session-native-read',
     content: 'Use a native read tool only if resource context is needed.',
-    attachments: [{ kind: 'directory', path: '.', absolutePath: '/tmp/generic-workspace', source: 'userSelected', scope: 'session' }],
   });
 
   assertEqual(streamRequests.length, 2, 'native read tool triggers provider resume after Kernel result');
@@ -17413,7 +17530,6 @@ async function assertSessionDriverLoopNativeReadToolStreamFailureFallsBackToNonS
   const result = await loop.runUserTurn({
     sessionId: session.id,
     content: `Read a generic file if needed for ${token}.`,
-    attachments: [{ kind: 'directory', path: '.', absolutePath: '/tmp/generic-workspace', source: 'userSelected', scope: 'session' }],
   });
 
   assertEqual(streamRequests.length, 2, 'native read tool resume first attempts streaming provider call');
@@ -17507,7 +17623,6 @@ async function assertSessionDriverLoopNativeReadToolLoopHasNoFourRoundLimit(): P
   const result = await loop.runUserTurn({
     sessionId: 'session-native-read-unbounded',
     content: '分析这个项目，需要连续读取多个只读文件后再回答。',
-    attachments: [{ kind: 'directory', path: '.', absolutePath: '/tmp/generic-workspace', source: 'userSelected', scope: 'session' }],
   });
 
   assertEqual(streamRequests.length, 7, 'native read tool loop continues past the former four-resume limit and then converges');
@@ -17624,7 +17739,6 @@ async function assertSessionDriverLoopNativeReadToolDuplicateLoopRepairsToPropos
   const result = await loop.runUserTurn({
     sessionId: 'session-native-read-duplicate',
     content: 'Read a generic file if needed, then answer.',
-    attachments: [{ kind: 'directory', path: '.', absolutePath: '/tmp/generic-workspace', source: 'userSelected', scope: 'session' }],
   });
 
   const nativeResourceResolveManifests = resourceResolveManifests.filter((manifest) =>
@@ -17727,7 +17841,6 @@ async function assertSessionDriverLoopNativeReadToolDuplicateProposalWinsOverToo
   const result = await loop.runUserTurn({
     sessionId: 'session-native-read-duplicate-proposal',
     content: 'Read a generic file if needed, then answer.',
-    attachments: [{ kind: 'directory', path: '.', absolutePath: '/tmp/generic-workspace', source: 'userSelected', scope: 'session' }],
   });
 
   const nativeResourceResolveManifests = resourceResolveManifests.filter((manifest) =>

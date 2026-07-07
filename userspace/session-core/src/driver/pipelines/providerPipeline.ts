@@ -20,6 +20,7 @@ export { NativeToolHandlerPortsFactory } from './nativeToolHandlerPortsFactory.j
 export { NativeToolProgressEventBuilder } from './nativeToolProgressEventBuilder.js';
 export { NativeToolProviderLoop } from './nativeToolProviderLoop.js';
 export { NativeToolProviderCoordinator } from './nativeToolProviderCoordinator.js';
+export { NativeToolExposurePolicy } from './nativeToolExposurePolicy.js';
 export { NativeToolProjectionBuilder } from './nativeToolProjectionBuilder.js';
 export { NativeToolResultMessageBuilder } from './nativeToolResultMessageBuilder.js';
 export { NativeToolResourceRecorder } from './nativeToolResourceRecorder.js';

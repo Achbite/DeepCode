@@ -48,6 +48,7 @@ import {
 import {
   NativeToolCoordinator,
   NativeToolProgressEventBuilder,
+  NativeToolExposurePolicy,
   NativeToolProviderLoop,
   NativeToolProjectionBuilder,
   NativeToolRepairCoordinator,
@@ -229,6 +230,7 @@ export const completedWorkUnitFactIndex = new CompletedWorkUnitFactIndex({
   comparablePath: (value) => pathIdentity.comparablePath(value),
 });
 export const nativeToolCoordinator = new NativeToolCoordinator();
+export const nativeToolExposurePolicy = new NativeToolExposurePolicy();
 export const nativeToolTurnHandler = new NativeToolTurnHandler(nativeToolCoordinator);
 export const nativeToolRepairCoordinator = new NativeToolRepairCoordinator({
   conversationActivity: (input) => driverActivityBuilder.conversationActivity(input),

@@ -87,6 +87,7 @@ import {
   kernelEventProjectionBuilder,
   kernelEventStatusIndex,
   nativeToolCoordinator,
+  nativeToolExposurePolicy,
   nativeToolProgressEventBuilder,
   nativeToolProviderLoop,
   nativeToolProjectionBuilder,
@@ -1046,7 +1047,8 @@ export class SessionDriverLoop {
       providerLoop: nativeToolProviderLoop,
       handlerPortsFactory: this.nativeToolHandlerPortsFactory,
       repairRunner: nativeToolRepairRunner,
-      providerTools: (state) => nativeToolCoordinator.providerTools(state),
+      providerTools: (state) =>
+        nativeToolExposurePolicy.providerTools(state, nativeToolCoordinator.providerTools(state)),
       readManifest: (state, toolCall) => nativeToolCoordinator.readManifest(state, toolCall),
       resolveResource: (state, manifest) => this.resourceOrchestrator.resolve(state, manifest),
       runTurn: (profileId, state, stage, messages, options) =>
