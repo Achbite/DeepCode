@@ -110,7 +110,7 @@ export function buildPromptEnvelope(input: PromptEnvelopeBuilderInput): PromptEn
     {
       name: 'projectMemory',
       priority: 6,
-      stable: true,
+      stable: false,
       cacheClass: 'projectMemory',
       content: (input.projectMemoryHints ?? input.stableMemoryHints)?.length
         ? (input.projectMemoryHints ?? input.stableMemoryHints ?? []).join('\n')

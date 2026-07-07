@@ -7969,9 +7969,26 @@ function assertPromptEnvelope(): void {
   assert(providerStepSummaryIndex > hookContextIndex, 'prompt packet renders ProviderStepSummary after HookContext');
   assert(nextActionIndex > providerStepSummaryIndex, 'prompt packet renders NextActionInstruction at the end');
   assert(!prompt.dynamicSuffix.includes('Kernel tool catalog visible to provider as schema only'), 'planning turn does not expose execution tool catalog');
-  assert(prompt.stableLayerNames.includes('projectMemory'), 'project memory index digest is an explicit stable context partition');
+  assert(!prompt.stableLayerNames.includes('projectMemory'), 'project memory index digest stays out of the stable prefix');
+  assert(prompt.dynamicLayerNames.includes('projectMemory'), 'project memory index digest is an explicit dynamic memory partition');
   assert(prompt.dynamicLayerNames.includes('projectMemoryRecall'), 'project memory recall is an explicit dynamic context partition');
   assert(prompt.dynamicLayerNames.includes('sessionMemory'), 'session memory is an explicit dynamic context partition');
+  const projectMemoryA = buildPromptEnvelope({
+    workflowState: 'needProposal',
+    allowedProposals: ['answer'],
+    capabilityCatalogSummary: 'fs.read',
+    userRequest: 'Compare cache partitions.',
+    projectMemoryHints: ['ProjectMemoryIndexDigest: alpha'],
+  });
+  const projectMemoryB = buildPromptEnvelope({
+    workflowState: 'needProposal',
+    allowedProposals: ['answer'],
+    capabilityCatalogSummary: 'fs.read',
+    userRequest: 'Compare cache partitions.',
+    projectMemoryHints: ['ProjectMemoryIndexDigest: beta'],
+  });
+  assertEqual(projectMemoryA.stablePrefix, projectMemoryB.stablePrefix, 'project memory index changes do not change the stable prefix');
+  assert(projectMemoryA.dynamicSuffix !== projectMemoryB.dynamicSuffix, 'project memory index changes remain visible in dynamic context');
   assert(prompt.dynamicLayerNames.includes('reusableResourceContext'), 'reusable resource context is separated from current request');
   assert(prompt.dynamicSuffix.includes('blockKey='), 'prompt includes stable resource block keys');
   assert(prompt.dynamicSuffix.includes('generic content'), 'prompt includes ResourcePacket content');
