@@ -50,7 +50,7 @@ import { ProviderTurnCycle } from '../driver/pipelines/providerTurnCycle.js';
 import { routeProposalKind } from '../driver/proposal/proposalRouter.js';
 import { acceptedPlanContinuationInput, decisionContinuationInput, SameLoopContinuation } from '../driver/runContinuation.js';
 import { renderProviderTurnContractLayer } from '../prompt/providerTurnContract.js';
-import { AcceptedPlanResourceResumeCoordinator, ActionBundleAdmissionResourceFollowupCoordinator, GeneratedArtifactEvidenceIndex, PathIdentity, ResourceEvidenceIndex, ResourceOrchestrator, ResourceRequestLoop, ResourceRequestRepairCoordinator, buildProviderTurnSnapshot } from '../driver/context/index.js';
+import { AcceptedPlanResourceResumeCoordinator, ActionBundleAdmissionResourceFollowupCoordinator, GeneratedArtifactEvidenceIndex, PathIdentity, ProviderTurnContextCoordinator, ResourceEvidenceIndex, ResourceOrchestrator, ResourceRequestLoop, ResourceRequestRepairCoordinator, buildProviderTurnSnapshot } from '../driver/context/index.js';
 import {
   AcceptedActionBundlePlanExecutor,
   AcceptedImplementationPlanContextBuilder,
@@ -124,6 +124,7 @@ async function main(): Promise<void> {
   assertContextAssemblerCachePlan();
   assertProviderTurnContractFrameOrder();
   assertProviderTurnSnapshotRecordsContextAdmissionShape();
+  await assertProviderTurnContextCoordinatorUsesFreshAssembly();
   await assertHookObserverProducesTraceOnly();
   await assertProviderPipelineUsesProviderTurnContract();
   assertProviderJsonModeCoordinator();
@@ -763,6 +764,79 @@ function assertProviderTurnSnapshotRecordsContextAdmissionShape(): void {
   assertEqual(snapshot.dynamicDialogueFrameTextOccurrences >= 1, true, 'provider turn snapshot counts dynamic dialogue text in provider contract frames');
   assertEqual(snapshot.finalUserPromptHash.length > 0, true, 'provider turn snapshot records final user prompt hash');
   assertEqual(snapshot.finalUserPromptCharLength > snapshot.dynamicSuffixCharLength, true, 'provider turn snapshot records rendered contract appended to dynamic prompt');
+}
+
+async function assertProviderTurnContextCoordinatorUsesFreshAssembly(): Promise<void> {
+  const token = randomSmokeToken('provider-context-fresh');
+  const stale = assembleContext({
+    contextAssemblyId: `stale-${token}`,
+    workflowState: `workflow-stale-${token}`,
+    allowedProposals: ['answer'],
+    capabilityCatalogSummary: `capability-stale-${token}`,
+    userRequest: `stale request ${token}`,
+  });
+  const fresh = assembleContext({
+    contextAssemblyId: `fresh-${token}`,
+    workflowState: `workflow-fresh-${token}`,
+    allowedProposals: ['answer'],
+    capabilityCatalogSummary: `capability-fresh-${token}`,
+    userRequest: `fresh request ${token}`,
+  });
+  let contractAssemblyId: string | undefined;
+  const coordinator = new ProviderTurnContextCoordinator<any>({
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${token}`,
+    assembleContext: () => fresh,
+    allowedProposals: (allowed) => allowed,
+    capabilityCatalogSummary: () => `capability-${token}`,
+    memoryHints: () => [],
+    collectUserGuidanceEvents: () => [],
+    appendConsumedGuidance: async ({ result }) => result,
+    buildProviderTurnContract: (input) => {
+      contractAssemblyId = input.contextAssembly?.contextAssemblyId;
+      return new ContextFrameBuilder().buildSessionProviderTurnContract({
+        contractId: input.contractId,
+        sessionId: input.sessionId,
+        runId: input.runId,
+        allowedKinds: input.allowedKinds,
+        prompt: input.prompt,
+        contextAssembly: input.contextAssembly,
+        userRequest: input.userRequest,
+        confirmedDecisionSummary: input.confirmedDecisionSummary,
+        acceptedPlanActive: input.acceptedPlanActive,
+        currentTaskContext: input.currentTaskContext,
+        resourcePackets: input.resourcePackets,
+        generatedArtifactCount: input.generatedArtifactCount,
+        toolIntentTemplates: input.toolIntentTemplates,
+        nextActionInstruction: input.nextActionInstruction,
+      });
+    },
+  });
+
+  const result = await coordinator.prepare({
+    sessionId: `session-${token}`,
+    runId: `run-${token}`,
+    userRequest: `original request ${token}`,
+    stateContract: {
+      stateId: `state-${token}`,
+      allowedProposals: ['answer'],
+    },
+    memoryDocument: buildSessionMemoryDocument([]),
+    resourcePackets: [],
+    conversationRoots: [],
+    generatedArtifactEvidence: new Map(),
+    contextAssembly: stale.contextAssembly,
+  }, {
+    contextAssemblyId: `requested-${token}`,
+    contractId: `contract-${token}`,
+    inputContent: `input ${token}`,
+    lastResult: genericSessionResult(`session-${token}`),
+  });
+
+  assertEqual(contractAssemblyId, fresh.contextAssembly.contextAssemblyId, 'provider turn contract uses the freshly assembled context');
+  assertEqual(result.modelContextBundle.contextAssembly?.contextAssemblyId, fresh.contextAssembly.contextAssemblyId, 'model context bundle keeps the same fresh context');
+  assertEqual(result.modelContextBundle.providerTurnContract.contextAssembly?.contextAssemblyId, fresh.contextAssembly.contextAssemblyId, 'provider turn frame keeps the same fresh context');
+  assertEqual(result.modelContextBundle.providerTurnContract.contextAssembly?.contextAssemblyId === stale.contextAssembly.contextAssemblyId, false, 'stale state context assembly does not overwrite the current admission');
 }
 
 async function assertHookObserverProducesTraceOnly(): Promise<void> {

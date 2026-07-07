@@ -148,13 +148,14 @@ export class ProviderTurnContextCoordinator<State extends ProviderTurnContextSta
       userRequest: state.userRequest,
     });
     const prompt = assembledContext.prompt;
+    // ProviderTurnContract and PromptEnvelope must share one ContextAdmission assembly.
     const providerTurnFrame = this.ports.buildProviderTurnContract({
       contractId: input.contractId,
       sessionId: state.sessionId,
       runId: state.runId,
       allowedKinds: allowedProposals,
       prompt,
-      contextAssembly: state.contextAssembly,
+      contextAssembly: assembledContext.contextAssembly,
       userRequest: providerUserRequest,
       confirmedDecisionSummary: this.confirmedDecisionSummary(userGuidance, input.confirmedRequirement),
       acceptedPlanActive: Boolean(state.acceptedImplementationPlan),
