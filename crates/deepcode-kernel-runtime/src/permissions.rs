@@ -383,6 +383,20 @@ impl DeepCodeKernelRuntime {
                             .as_ref()
                             .map(|value| RequestId(value.clone()))
                             .unwrap_or_else(|| request_id.clone());
+                        if KernelToolRegistry::default()
+                            .get(&item.tool_name)
+                            .map(|descriptor| descriptor.execution_mode)
+                            == Some(OperationExecutionMode::Blocked)
+                        {
+                            events.push(self.work_unit_blocked_event(
+                                &item_request_id,
+                                &run_id,
+                                &session_id,
+                                work_unit_id,
+                                "permission accepted but the tool is blocked by Kernel policy",
+                            )?);
+                            continue;
+                        }
                         let tool_event = self.execute_bound_tool(
                             &run_id,
                             &session_id,

@@ -138,8 +138,21 @@ impl DeepCodeKernelRuntime {
             );
             let capability = operation.capability.as_str();
             let kind = operation_kind_name(operation);
-            let mut compiled_result = if operation.execution_mode == OperationExecutionMode::Execute
-            {
+            let tool_registry = KernelToolRegistry::default();
+            let can_request_blocked_permission = operation
+                .tool_id(&tool_registry)
+                .and_then(|tool_id| tool_registry.get(tool_id))
+                .map(|descriptor| {
+                    descriptor.permission_mode == ToolPermissionMode::Ask
+                        && descriptor.execution_mode == OperationExecutionMode::Blocked
+                        && descriptor.risk == deepcode_kernel_tools::ToolRiskLevel::Critical
+                        && descriptor.capability == operation.capability
+                })
+                .unwrap_or(false);
+            let should_compile_operation = operation.execution_mode
+                == OperationExecutionMode::Execute
+                || can_request_blocked_permission;
+            let mut compiled_result = if should_compile_operation {
                 match compile_operation(self, &record, operation)
                     .and_then(|compiled| validate_compiled_operation(operation, compiled))
                 {
@@ -202,7 +215,9 @@ impl DeepCodeKernelRuntime {
                 work_unit,
             )?);
 
-            if operation.execution_mode != OperationExecutionMode::Execute {
+            if operation.execution_mode != OperationExecutionMode::Execute
+                && !can_request_blocked_permission
+            {
                 events.push(self.work_unit_blocked_event(
                     &request_id,
                     &run_id_text,
