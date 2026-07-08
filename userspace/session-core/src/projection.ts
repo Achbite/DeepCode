@@ -20,6 +20,10 @@ import type { ReviewPacket } from './review/types.js';
 import { isInternalOrchestrationStage, isMainTimelineActivityShape } from './timelineFilter.js';
 import type { TranscriptMessageEntry } from './transcript.js';
 import type { DynamicWorkflowPlan } from './workflow/types.js';
+import {
+  findActiveInteraction,
+  type InteractionLedgerActiveInteraction,
+} from './run-state/interactionLedger.js';
 
 export interface PendingPermissionProjection {
   request: PermissionRequest;
@@ -199,12 +203,15 @@ export function buildNarrativeTimelineProjection(input: NarrativeTimelineProject
     const userInputEvent = userInputBubbleEvent(event, index);
     if (userInputEvent) {
       if (currentTurn) turns.push(finalizeNarrativeTurn(currentTurn));
+      const userBlockEvents = isUserInputAuditOnlyEvent(event)
+        ? [userInputEvent, event]
+        : [userInputEvent];
       currentTurn = {
         id: `turn-${userInputEvent.id || index}`,
         sessionId: input.sessionId,
         status: 'running',
         startedAt: userInputEvent.ts,
-        blocks: [narrativeBlockFromEvents([userInputEvent], index)],
+        blocks: [narrativeBlockFromEvents(userBlockEvents, index)],
       };
       if (isUserInputAuditOnlyEvent(event)) {
         return;
@@ -1283,24 +1290,24 @@ function narrativeKindForLegacyKind(kind: AgentTimelineBlockKind): AgentTimeline
 }
 
 function narrativeStatus(events: AgentEvent[]): AgentTimelineStatus {
-  if (events.some((event) => event.kind === 'error' || stringValueFromPayload(event.payload, 'status') === 'error')) {
+  if (events.some((event) => event.kind === 'error' || narrativeEventStatus(event) === 'failed')) {
     return 'failed';
   }
   if (events.some((event) => event.kind === 'user_guidance')) {
-    return events.some((event) => stringValueFromPayload(event.payload, 'status') === 'consumed')
+    return events.some((event) => narrativeEventStatus(event) === 'consumed')
       ? 'completed'
       : 'queued';
   }
   if (events.some((event) => event.kind === 'permission_request') && !events.some((event) => event.kind === 'permission_result')) {
     return 'waiting';
   }
-  if (events.some((event) => event.kind === 'session_run_state' && stringValueFromPayload(event.payload, 'status') === 'waiting')) {
+  if (events.some((event) => event.kind === 'session_run_state' && narrativeEventStatus(event) === 'waiting')) {
     return 'waiting';
   }
   if (
     events.some((event) =>
       event.kind === 'requirement_confirmation' &&
-      stringValueFromPayload(event.payload, 'status') === 'waitingUserConfirmation'
+      narrativeEventStatus(event) === 'waitingUserConfirmation'
     ) &&
     !events.some((event) => event.kind === 'requirement_decision')
   ) {
@@ -1309,27 +1316,53 @@ function narrativeStatus(events: AgentEvent[]): AgentTimelineStatus {
   if (events.some((event) => planEventAwaitingDecision(event, events))) {
     return 'waiting';
   }
-  if (events.some((event) => event.kind === 'tool_call' || stringValueFromPayload(event.payload, 'status') === 'running')) {
+  if (events.some((event) => event.kind === 'tool_call' || narrativeEventStatus(event) === 'running')) {
     const hasCompletion = events.some((event) =>
       event.kind === 'tool_result' ||
-      ['completed', 'done', 'ok', 'succeeded'].includes(stringValueFromPayload(event.payload, 'status') ?? '')
+      ['completed', 'done', 'ok', 'succeeded'].includes(narrativeEventStatus(event) ?? '')
     );
     if (!hasCompletion) return 'running';
   }
   return 'completed';
 }
 
+function narrativeEventStatus(event: AgentEvent): string | undefined {
+  if (!isRecordPayload(event.payload)) return undefined;
+  const kernelStatus = kernelEventTimelineStatus(event.payload);
+  if (kernelStatus) return kernelStatus;
+  return stringValueFromPayload(event.payload, 'status');
+}
+
+function kernelEventTimelineStatus(payload: Record<string, unknown>): AgentTimelineStatus | 'consumed' | undefined {
+  const kernelEvent = isRecordPayload(payload.kernelEvent) ? payload.kernelEvent : undefined;
+  const kind = kernelEvent ? stringField(kernelEvent, 'kind') : undefined;
+  if (!kind) return undefined;
+  if (
+    kind === 'review_gate.evaluated' ||
+    kind === 'review.facts_produced' ||
+    kind === 'work_unit.completed' ||
+    kind === 'tool.completed' ||
+    kind === 'permission.resolved'
+  ) return 'completed';
+  if (kind === 'work_unit.failed' || kind === 'tool.failed') return 'failed';
+  if (kind === 'work_unit.blocked') return 'blocked';
+  if (kind === 'work_unit.started' || kind === 'work_unit.queued' || kind === 'tool.started') return 'running';
+  return undefined;
+}
+
 function resolveTimelineInteractionBlocks(
   turns: AgentTimelineResult['turns'],
   events: AgentEvent[]
 ): void {
-  for (const turn of turns) {
+  for (let turnIndex = 0; turnIndex < turns.length; turnIndex += 1) {
+    const turn = turns[turnIndex];
     for (const block of turn.blocks) {
       if (block.status !== 'waiting' && block.status !== 'blocked') continue;
       const resolved = block.events.some((event) => {
         if (event.kind === 'plan_card' || event.kind === 'plan_review') return planInteractionResolved(event, events);
         if (event.kind === 'review_summary') return reviewInteractionResolved(event, events);
         if (event.kind === 'requirement_confirmation') return requirementInteractionResolved(event, events);
+        if (event.kind === 'session_run_state') return runStateInteractionResolved(event, events);
         return false;
       });
       if (!resolved) continue;
@@ -1340,7 +1373,74 @@ function resolveTimelineInteractionBlocks(
         renderMode: block.displayHints?.renderMode === 'typewriter' ? 'instant' : block.displayHints?.renderMode,
       };
     }
+    turns[turnIndex] = finalizeNarrativeTurn(turn);
   }
+}
+
+function runStateInteractionResolved(event: AgentEvent, events: AgentEvent[]): boolean {
+  const payload = isRecordPayload(event.payload) ? event.payload : {};
+  if (stringField(payload, 'status') !== 'waiting') return false;
+  const ownerKind = runStateInteractionOwnerKind(payload);
+  if (ownerKind !== 'plan' && ownerKind !== 'review' && ownerKind !== 'requirement') return false;
+  const activeInteraction = findActiveInteraction({ events });
+  if (!activeInteraction) return true;
+  return !sameRunStateInteractionOwner(activeInteraction, payload, ownerKind);
+}
+
+function sameRunStateInteractionOwner(
+  activeInteraction: InteractionLedgerActiveInteraction,
+  payload: Record<string, unknown>,
+  ownerKind: 'plan' | 'review' | 'requirement'
+): boolean {
+  const owner = isRecordPayload(payload.decisionOwner) ? payload.decisionOwner : {};
+  const runId = stringField(payload, 'runId') ?? stringField(owner, 'runId');
+  if (ownerKind === 'plan') {
+    if (activeInteraction.kind !== 'plan') return false;
+    if (runId && activeInteraction.runId !== runId) return false;
+    const planId = runStateInteractionOwnerId(payload, owner, 'plan');
+    if (planId && activeInteraction.planId !== planId) return false;
+    return Boolean(runId || planId);
+  }
+  if (ownerKind === 'requirement') {
+    if (activeInteraction.kind !== 'requirement') return false;
+    if (runId && activeInteraction.runId !== runId) return false;
+    const requirementId = runStateInteractionOwnerId(payload, owner, 'requirement');
+    if (requirementId && activeInteraction.requirementId !== requirementId) return false;
+    return Boolean(runId || requirementId);
+  }
+  if (activeInteraction.kind !== 'review') return false;
+  if (runId && activeInteraction.runId !== runId) return false;
+  const reviewId = runStateInteractionOwnerId(payload, owner, 'review');
+  return Boolean(runId || reviewId);
+}
+
+function runStateInteractionOwnerKind(payload: Record<string, unknown>): string | undefined {
+  const owner = isRecordPayload(payload.decisionOwner) ? payload.decisionOwner : undefined;
+  return stringField(payload, 'decisionKind') ?? (owner ? stringField(owner, 'kind') : undefined);
+}
+
+function runStateInteractionOwnerId(
+  payload: Record<string, unknown>,
+  owner: Record<string, unknown>,
+  ownerKind: 'plan' | 'review' | 'requirement'
+): string | undefined {
+  if (ownerKind === 'plan') {
+    return stringField(payload, 'planId') ??
+      stringField(payload, 'sourcePlanId') ??
+      stringField(payload, 'targetId') ??
+      stringField(owner, 'planId') ??
+      stringField(owner, 'targetId');
+  }
+  if (ownerKind === 'requirement') {
+    return stringField(payload, 'requirementId') ??
+      stringField(payload, 'targetId') ??
+      stringField(owner, 'requirementId') ??
+      stringField(owner, 'targetId');
+  }
+  return stringField(payload, 'reviewId') ??
+    stringField(payload, 'targetId') ??
+    stringField(owner, 'reviewId') ??
+    stringField(owner, 'targetId');
 }
 
 function planInteractionResolved(event: AgentEvent, events: AgentEvent[]): boolean {

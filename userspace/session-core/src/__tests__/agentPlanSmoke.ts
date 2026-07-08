@@ -31,6 +31,7 @@ import {
   createResourcePacket,
   evaluateRunState,
   findActiveInteraction,
+  interactionEventsFromTimeline,
   findLatestPendingPermission,
   normalizeDecisionEffect,
   parseProposalEnvelope,
@@ -197,6 +198,7 @@ async function main(): Promise<void> {
   assertInteractionLedgerResolvesTerminalSourcePlanReview();
   assertInteractionLedgerTerminalRunStateClosesPlan();
   assertProjectionResolvesPlanAfterSourceReview();
+  assertProjectionPreservesDecisionEventsForInteractionLedger();
   assertPlanInteractionIndexFindsActivePlan();
   assertPlanReviewGrantProjectorBuildsExecutionReadModels();
   assertProposalRouterPlansPureRoutes();
@@ -11060,6 +11062,174 @@ function assertProjectionResolvesPlanAfterSourceReview(): void {
     targetOnlyTaskProjection.taskProjection?.items.find((item) => item.title === 'Write target-only generic artifact')?.status,
     'completed',
     'task projection consumes accepted-plan taskLedger checkpoints when the checkpoint only carries targetId'
+  );
+}
+
+function assertProjectionPreservesDecisionEventsForInteractionLedger(): void {
+  const suffix = randomSmokeToken('projection-decision-facts');
+  const sessionId = `session-${suffix}`;
+  const runId = `run-${suffix}`;
+  const planId = `plan-${suffix}`;
+  const planCard = {
+    id: `event-${suffix}-plan`,
+    sessionId,
+    ts: '2026-01-01T00:00:00.000Z',
+    kind: 'plan_card',
+    payload: {
+      runId,
+      planId,
+      title: 'Generic plan',
+      summary: 'Review a generic plan.',
+      status: 'pending',
+      confirmable: true,
+    },
+  } as AgentEvent;
+  const acceptedDecision = {
+    id: `event-${suffix}-accepted`,
+    sessionId,
+    ts: '2026-01-01T00:00:01.000Z',
+    kind: 'plan_review',
+    payload: {
+      runId,
+      planId,
+      status: 'accepted',
+      confirmable: false,
+      summary: 'The user accepted the plan; execution can continue.',
+    },
+  } as AgentEvent;
+  const projection = buildNarrativeTimelineProjection({
+    sessionId,
+    events: [planCard, acceptedDecision],
+    generatedAt: '2026-01-01T00:00:02.000Z',
+  });
+  const timelineEvents = interactionEventsFromTimeline(projection);
+  const planTurn = projection.turns.find((turn) =>
+    turn.blocks.some((block) => block.events.some((event) => event.id === planCard.id))
+  );
+  assertEqual(
+    planTurn?.status,
+    'completed',
+    'timeline projection recomputes turn status after a pending plan block is resolved'
+  );
+  assertEqual(
+    timelineEvents.some((event) => event.id === acceptedDecision.id && event.kind === 'plan_review'),
+    true,
+    'timeline projection keeps original plan decision events for interaction resolution'
+  );
+  assertEqual(
+    findActiveInteraction({ events: timelineEvents }),
+    null,
+    'interaction ledger does not revive an accepted plan when only timeline events are available'
+  );
+  const waitingPlanRunState = {
+    id: `event-${suffix}-waiting-plan-state`,
+    sessionId,
+    ts: '2026-01-01T00:00:00.500Z',
+    kind: 'session_run_state',
+    payload: {
+      runId,
+      status: 'waiting',
+      phase: 'waiting_plan_review',
+      decisionOwner: {
+        kind: 'plan',
+        runId,
+        planId,
+        targetId: planId,
+      },
+    },
+  } as AgentEvent;
+  const resolvedProjection = buildNarrativeTimelineProjection({
+    sessionId,
+    events: [planCard, waitingPlanRunState, acceptedDecision],
+    generatedAt: '2026-01-01T00:00:03.000Z',
+  });
+  const waitingPlanStateBlock = resolvedProjection.turns
+    .flatMap((turn) => turn.blocks)
+    .find((block) => block.events.some((event) => event.id === waitingPlanRunState.id));
+  assertEqual(
+    waitingPlanStateBlock?.status,
+    'completed',
+    'timeline projection closes waiting plan run-state blocks after the owner is resolved'
+  );
+  const reviewRunId = `run-review-${suffix}`;
+  const reviewId = `review-${suffix}`;
+  const waitingReview = {
+    id: `event-${suffix}-waiting-review`,
+    sessionId,
+    ts: '2026-01-01T00:00:04.000Z',
+    kind: 'review_summary',
+    payload: {
+      runId: reviewRunId,
+      reviewId,
+      sourcePlanId: planId,
+      title: 'Generic review',
+      status: 'waitingUserReview',
+      confirmable: true,
+    },
+  } as AgentEvent;
+  const waitingReviewRunState = {
+    id: `event-${suffix}-waiting-review-state`,
+    sessionId,
+    ts: '2026-01-01T00:00:04.500Z',
+    kind: 'session_run_state',
+    payload: {
+      runId: reviewRunId,
+      status: 'waiting',
+      phase: 'waiting_review',
+      decisionOwner: {
+        kind: 'review',
+        runId: reviewRunId,
+        reviewId,
+        sourcePlanId: planId,
+      },
+    },
+  } as AgentEvent;
+  const acceptedReview = {
+    id: `event-${suffix}-accepted-review`,
+    sessionId,
+    ts: '2026-01-01T00:00:05.000Z',
+    kind: 'review_summary',
+    payload: {
+      runId: reviewRunId,
+      reviewId,
+      sourcePlanId: planId,
+      status: 'accepted',
+      confirmable: false,
+    },
+  } as AgentEvent;
+  const terminalReviewGate = {
+    id: `event-${suffix}-review-gate`,
+    sessionId,
+    ts: '2026-01-01T00:00:05.500Z',
+    kind: 'workflow_stage',
+    payload: {
+      runId: reviewRunId,
+      status: 'running',
+      kernelEvent: {
+        kind: 'review_gate.evaluated',
+        runId: reviewRunId,
+        reviewId,
+        result: { status: 'accepted' },
+      },
+    },
+  } as AgentEvent;
+  const resolvedReviewProjection = buildNarrativeTimelineProjection({
+    sessionId,
+    events: [waitingReview, waitingReviewRunState, acceptedReview, terminalReviewGate],
+    generatedAt: '2026-01-01T00:00:06.000Z',
+  });
+  const waitingReviewStateBlock = resolvedReviewProjection.turns
+    .flatMap((turn) => turn.blocks)
+    .find((block) => block.events.some((event) => event.id === waitingReviewRunState.id));
+  assertEqual(
+    waitingReviewStateBlock?.status,
+    'completed',
+    'timeline projection closes waiting review run-state blocks after review is accepted'
+  );
+  assertEqual(
+    resolvedReviewProjection.turns[0]?.status,
+    'completed',
+    'timeline projection recomputes review turn status after waiting run-state blocks and terminal kernel stages are closed'
   );
 }
 

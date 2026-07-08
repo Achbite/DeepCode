@@ -39,6 +39,7 @@ pub(crate) async fn agent_session_timeline(
 
 fn build_agent_timeline(session_id: &str, events: Vec<Value>) -> Value {
     let event_count = events.len();
+    let all_events = events.clone();
     let mut turns: Vec<AgentTimelineTurn> = Vec::new();
     let mut current: Option<AgentTimelineTurn> = None;
     let mut synthetic_index = 0usize;
@@ -86,6 +87,8 @@ fn build_agent_timeline(session_id: &str, events: Vec<Value>) -> Value {
         turns.push(finalize_turn(turn));
     }
 
+    resolve_interaction_blocks(&mut turns, &all_events);
+
     json!({
         "sessionId": session_id,
         "generatedAt": now_text(),
@@ -122,6 +125,275 @@ fn finalize_turn(mut turn: AgentTimelineTurn) -> AgentTimelineTurn {
             .find_map(event_ts);
     }
     turn
+}
+
+// The API timeline receives archived projection events without the in-memory
+// InteractionLedger. Resolve obsolete waiting blocks from consumed owners so
+// shells do not expose stale confirmation prompts as active work.
+fn resolve_interaction_blocks(turns: &mut Vec<AgentTimelineTurn>, events: &[Value]) {
+    let consumed = collect_consumed_interaction_owners(events);
+    for turn in turns.iter_mut() {
+        for block in turn.blocks.iter_mut() {
+            if block.status != "waiting" && block.status != "blocked" {
+                continue;
+            }
+            if block
+                .events
+                .iter()
+                .any(|event| waiting_owner_was_consumed(event, &consumed))
+            {
+                block.status = "completed".to_string();
+                block.default_collapsed = should_collapse(&block.kind, &block.status);
+            }
+        }
+        *turn = finalize_turn(turn.clone());
+    }
+}
+
+#[derive(Default)]
+struct ConsumedInteractionOwners {
+    plans: std::collections::HashSet<String>,
+    requirements: std::collections::HashSet<String>,
+    reviews: std::collections::HashSet<String>,
+    permissions: std::collections::HashSet<String>,
+}
+
+fn collect_consumed_interaction_owners(events: &[Value]) -> ConsumedInteractionOwners {
+    let mut consumed = ConsumedInteractionOwners::default();
+    for event in events {
+        let kind = event_kind(event);
+        let payload = payload(event);
+        match kind.as_str() {
+            "requirement_decision" => {
+                add_strings(
+                    &mut consumed.requirements,
+                    [
+                        string_field(payload, "requirementId"),
+                        string_field(payload, "interactionId"),
+                        string_field(payload, "sourceInteractionId"),
+                        string_field(payload, "targetId"),
+                    ],
+                );
+            }
+            "plan_review" => {
+                let status = event_status(event).to_ascii_lowercase();
+                if matches!(
+                    status.as_str(),
+                    "accepted"
+                        | "rejected"
+                        | "needsrevision"
+                        | "failed"
+                        | "completed"
+                        | "cancelled"
+                ) {
+                    add_strings(
+                        &mut consumed.plans,
+                        [
+                            string_field(payload, "planId"),
+                            string_field(payload, "interactionId"),
+                            string_field(payload, "sourceInteractionId"),
+                            string_field(payload, "targetId"),
+                        ],
+                    );
+                }
+            }
+            "review_summary" => {
+                let status = event_status(event).to_ascii_lowercase();
+                if !status.is_empty() && status != "waitinguserreview" && status != "pending" {
+                    add_strings(
+                        &mut consumed.reviews,
+                        [
+                            string_field(payload, "reviewId"),
+                            string_field(payload, "interactionId"),
+                            string_field(payload, "sourceInteractionId"),
+                            string_field(payload, "targetId"),
+                        ],
+                    );
+                    add_strings(
+                        &mut consumed.plans,
+                        [
+                            string_field(payload, "planId"),
+                            string_field(payload, "sourcePlanId"),
+                        ],
+                    );
+                }
+            }
+            "permission_decision" => {
+                add_strings(
+                    &mut consumed.permissions,
+                    [
+                        string_field(payload, "permissionId"),
+                        string_field(payload, "interactionId"),
+                        string_field(payload, "sourceInteractionId"),
+                        string_field(payload, "targetId"),
+                    ],
+                );
+            }
+            "session_run_state" => {
+                let status = event_status(event);
+                if status == "completed" || status == "cancelled" || status == "failed" {
+                    add_session_run_state_owner(payload, &mut consumed);
+                }
+                if status == "running"
+                    && string_field(payload, "reason").as_deref() == Some("accepted_plan_execution")
+                {
+                    let owner = object_payload(payload.get("decisionOwner"));
+                    add_strings(
+                        &mut consumed.plans,
+                        [
+                            string_field(payload, "planId"),
+                            string_field(payload, "targetId"),
+                            string_field(&owner, "targetId"),
+                            string_field(&owner, "planId"),
+                        ],
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    consumed
+}
+
+fn add_session_run_state_owner(payload: &Value, consumed: &mut ConsumedInteractionOwners) {
+    let owner = object_payload(payload.get("decisionOwner"));
+    let decision_kind =
+        string_field(payload, "decisionKind").or_else(|| string_field(&owner, "kind"));
+    match decision_kind.as_deref() {
+        Some("plan") => add_strings(
+            &mut consumed.plans,
+            [
+                string_field(payload, "planId"),
+                string_field(payload, "targetId"),
+                string_field(&owner, "planId"),
+                string_field(&owner, "targetId"),
+            ],
+        ),
+        Some("requirement") => add_strings(
+            &mut consumed.requirements,
+            [
+                string_field(payload, "requirementId"),
+                string_field(payload, "targetId"),
+                string_field(&owner, "requirementId"),
+                string_field(&owner, "targetId"),
+            ],
+        ),
+        Some("review") => add_strings(
+            &mut consumed.reviews,
+            [
+                string_field(payload, "reviewId"),
+                string_field(payload, "targetId"),
+                string_field(&owner, "reviewId"),
+                string_field(&owner, "targetId"),
+            ],
+        ),
+        Some("permission") => add_strings(
+            &mut consumed.permissions,
+            [
+                string_field(payload, "permissionId"),
+                string_field(payload, "targetId"),
+                string_field(&owner, "permissionId"),
+                string_field(&owner, "targetId"),
+            ],
+        ),
+        _ => {}
+    }
+}
+
+fn waiting_owner_was_consumed(event: &Value, consumed: &ConsumedInteractionOwners) -> bool {
+    let payload = payload(event);
+    match event_kind(event).as_str() {
+        "plan_card" => has_any(
+            &consumed.plans,
+            [
+                string_field(payload, "planId"),
+                string_field(payload, "targetId"),
+                string_field(payload, "interactionId"),
+                string_field(payload, "sourceInteractionId"),
+            ],
+        ),
+        "requirement_confirmation" => has_any(
+            &consumed.requirements,
+            [
+                string_field(payload, "requirementId"),
+                string_field(payload, "targetId"),
+                string_field(payload, "interactionId"),
+                string_field(payload, "sourceInteractionId"),
+            ],
+        ),
+        "review_summary" => has_any(
+            &consumed.reviews,
+            [
+                string_field(payload, "reviewId"),
+                string_field(payload, "targetId"),
+                string_field(payload, "interactionId"),
+                string_field(payload, "sourceInteractionId"),
+            ],
+        ),
+        "session_run_state" => session_run_state_owner_consumed(payload, consumed),
+        _ => false,
+    }
+}
+
+fn session_run_state_owner_consumed(payload: &Value, consumed: &ConsumedInteractionOwners) -> bool {
+    let owner = object_payload(payload.get("decisionOwner"));
+    let decision_kind =
+        string_field(payload, "decisionKind").or_else(|| string_field(&owner, "kind"));
+    let target_id = string_field(payload, "targetId").or_else(|| string_field(&owner, "targetId"));
+    match decision_kind.as_deref() {
+        Some("plan") => has_any(
+            &consumed.plans,
+            [
+                target_id,
+                string_field(payload, "planId"),
+                string_field(&owner, "planId"),
+            ],
+        ),
+        Some("requirement") => has_any(
+            &consumed.requirements,
+            [
+                target_id,
+                string_field(payload, "requirementId"),
+                string_field(&owner, "requirementId"),
+            ],
+        ),
+        Some("review") => has_any(
+            &consumed.reviews,
+            [
+                target_id,
+                string_field(payload, "reviewId"),
+                string_field(&owner, "reviewId"),
+            ],
+        ),
+        Some("permission") => has_any(
+            &consumed.permissions,
+            [
+                target_id,
+                string_field(payload, "permissionId"),
+                string_field(&owner, "permissionId"),
+            ],
+        ),
+        _ => false,
+    }
+}
+
+fn add_strings<const N: usize>(
+    target: &mut std::collections::HashSet<String>,
+    values: [Option<String>; N],
+) {
+    for value in values.into_iter().flatten() {
+        target.insert(value);
+    }
+}
+
+fn has_any<const N: usize>(
+    target: &std::collections::HashSet<String>,
+    values: [Option<String>; N],
+) -> bool {
+    values
+        .into_iter()
+        .flatten()
+        .any(|value| target.contains(&value))
 }
 
 fn append_event_block(turn: &mut AgentTimelineTurn, event: Value, index: usize) {
@@ -253,10 +525,10 @@ fn block_body(event: &Value, kind: &str) -> Option<String> {
 }
 
 fn group_status(events: &[Value]) -> String {
-    if events
-        .iter()
-        .any(|event| event_kind(event) == "error" || event_status(event) == "error")
-    {
+    if events.iter().any(|event| {
+        let status = event_status(event);
+        event_kind(event) == "error" || status == "error" || status == "failed"
+    }) {
         return "failed".to_string();
     }
     if events
@@ -283,7 +555,14 @@ fn group_status(events: &[Value]) -> String {
         }
     }
     if events.iter().any(|event| {
-        event_status(event) == "awaitingUserApproval" || event_status(event) == "pending"
+        matches!(
+            event_status(event).as_str(),
+            "awaitingUserApproval"
+                | "pending"
+                | "waiting"
+                | "waitingUserReview"
+                | "waitingUserConfirmation"
+        )
     }) {
         return "waiting".to_string();
     }
@@ -321,6 +600,9 @@ fn event_status(event: &Value) -> String {
     if payload.get("ok").and_then(Value::as_bool) == Some(true) {
         return "ok".to_string();
     }
+    if let Some(status) = kernel_event_status(payload) {
+        return status.to_string();
+    }
     string_field(payload, "status")
         .or_else(|| string_field(payload, "decision"))
         .unwrap_or_else(|| {
@@ -330,6 +612,22 @@ fn event_status(event: &Value) -> String {
                 "completed".to_string()
             }
         })
+}
+
+fn kernel_event_status(payload: &Value) -> Option<&'static str> {
+    let kernel_event = payload.get("kernelEvent")?;
+    let kind = string_field(kernel_event, "kind")?;
+    match kind.as_str() {
+        "review_gate.evaluated"
+        | "review.facts_produced"
+        | "work_unit.completed"
+        | "tool.completed"
+        | "permission.resolved" => Some("completed"),
+        "work_unit.failed" | "tool.failed" => Some("failed"),
+        "work_unit.blocked" => Some("blocked"),
+        "work_unit.started" | "work_unit.queued" | "tool.started" => Some("running"),
+        _ => None,
+    }
 }
 
 fn event_text(event: &Value) -> Option<String> {
@@ -342,6 +640,13 @@ fn event_text(event: &Value) -> Option<String> {
 
 fn payload(event: &Value) -> &Value {
     event.get("payload").unwrap_or(event)
+}
+
+fn object_payload(value: Option<&Value>) -> Value {
+    value
+        .filter(|item| item.is_object())
+        .cloned()
+        .unwrap_or_else(|| json!({}))
 }
 
 fn string_field(value: &Value, key: &str) -> Option<String> {
@@ -393,5 +698,184 @@ mod tests {
             .find(|block| block.get("kind").and_then(Value::as_str) == Some("thinking"))
             .expect("thinking block must be retained");
         assert_eq!(thinking["bodyMarkdown"], "internal reasoning");
+    }
+
+    #[test]
+    fn accepted_plan_review_closes_pending_plan_block() {
+        let timeline = build_agent_timeline(
+            "session-generic-plan",
+            vec![
+                json!({
+                    "id": "user-generic-plan",
+                    "kind": "user_msg",
+                    "ts": "2026-01-01T00:00:00Z",
+                    "payload": { "content": "Prepare a generic plan." }
+                }),
+                json!({
+                    "id": "plan-generic",
+                    "kind": "plan_card",
+                    "ts": "2026-01-01T00:00:01Z",
+                    "payload": {
+                        "runId": "run-generic-plan",
+                        "planId": "plan-generic",
+                        "title": "Generic plan",
+                        "status": "pending"
+                    }
+                }),
+                json!({
+                    "id": "state-generic-plan",
+                    "kind": "session_run_state",
+                    "ts": "2026-01-01T00:00:02Z",
+                    "payload": {
+                        "runId": "run-generic-plan",
+                        "status": "waiting",
+                        "decisionOwner": {
+                            "kind": "plan",
+                            "runId": "run-generic-plan",
+                            "planId": "plan-generic",
+                            "targetId": "plan-generic"
+                        }
+                    }
+                }),
+                json!({
+                    "id": "plan-generic-accepted",
+                    "kind": "plan_review",
+                    "ts": "2026-01-01T00:00:03Z",
+                    "payload": {
+                        "runId": "run-generic-plan",
+                        "planId": "plan-generic",
+                        "status": "accepted"
+                    }
+                }),
+            ],
+        );
+        let turn = &timeline["turns"][0];
+        assert_eq!(turn["status"], "completed");
+        let blocks = turn["blocks"].as_array().unwrap();
+        let pending_plan = blocks
+            .iter()
+            .find(|block| {
+                block["events"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|event| event["id"] == "plan-generic")
+            })
+            .expect("pending plan block must remain visible");
+        assert_eq!(pending_plan["status"], "completed");
+        let waiting_state = blocks
+            .iter()
+            .find(|block| {
+                block["events"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|event| event["id"] == "state-generic-plan")
+            })
+            .expect("waiting run-state block must remain visible");
+        assert_eq!(waiting_state["status"], "completed");
+    }
+
+    #[test]
+    fn accepted_review_closes_waiting_review_block() {
+        let timeline = build_agent_timeline(
+            "session-generic-review",
+            vec![
+                json!({
+                    "id": "user-generic-review",
+                    "kind": "user_msg",
+                    "ts": "2026-01-01T00:00:00Z",
+                    "payload": { "content": "Run a generic review." }
+                }),
+                json!({
+                    "id": "review-generic-waiting",
+                    "kind": "review_summary",
+                    "ts": "2026-01-01T00:00:01Z",
+                    "payload": {
+                        "runId": "run-generic-review",
+                        "reviewId": "review-generic",
+                        "sourcePlanId": "plan-generic",
+                        "title": "Generic review",
+                        "status": "waitingUserReview"
+                    }
+                }),
+                json!({
+                    "id": "review-generic-state",
+                    "kind": "session_run_state",
+                    "ts": "2026-01-01T00:00:02Z",
+                    "payload": {
+                        "runId": "run-generic-review",
+                        "status": "waiting",
+                        "decisionOwner": {
+                            "kind": "review",
+                            "runId": "run-generic-review",
+                            "reviewId": "review-generic",
+                            "targetId": "review-generic"
+                        }
+                    }
+                }),
+                json!({
+                    "id": "review-generic-accepted",
+                    "kind": "review_summary",
+                    "ts": "2026-01-01T00:00:03Z",
+                    "payload": {
+                        "runId": "run-generic-review",
+                        "reviewId": "review-generic",
+                        "sourcePlanId": "plan-generic",
+                        "status": "accepted"
+                    }
+                }),
+                json!({
+                    "id": "review-gate-terminal",
+                    "kind": "workflow_stage",
+                    "ts": "2026-01-01T00:00:04Z",
+                    "payload": {
+                        "status": "running",
+                        "kernelEvent": {
+                            "kind": "review_gate.evaluated",
+                            "runId": "run-generic-review",
+                            "reviewId": "review-generic",
+                            "result": { "status": "accepted" }
+                        }
+                    }
+                }),
+            ],
+        );
+        let turn = &timeline["turns"][0];
+        assert_eq!(turn["status"], "completed");
+        let blocks = turn["blocks"].as_array().unwrap();
+        let waiting_review = blocks
+            .iter()
+            .find(|block| {
+                block["events"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|event| event["id"] == "review-generic-waiting")
+            })
+            .expect("waiting review block must remain visible");
+        assert_eq!(waiting_review["status"], "completed");
+        let waiting_state = blocks
+            .iter()
+            .find(|block| {
+                block["events"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|event| event["id"] == "review-generic-state")
+            })
+            .expect("waiting review run-state block must remain visible");
+        assert_eq!(waiting_state["status"], "completed");
+        let review_gate = blocks
+            .iter()
+            .find(|block| {
+                block["events"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|event| event["id"] == "review-gate-terminal")
+            })
+            .expect("terminal review gate block must remain visible");
+        assert_eq!(review_gate["status"], "completed");
     }
 }
