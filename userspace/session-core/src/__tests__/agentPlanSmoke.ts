@@ -9938,8 +9938,11 @@ function assertProviderRepairMessageBuilderScopesNativeRepairReferences(): void 
   assertEqual(scopeRepair.split(shapeLine).length - 1, 0, 'accepted-plan scope repair relies on current task contract instead of full actionBundle shape');
   assertEqual(planReviewRepair.split(shapeLine).length - 1, 0, 'plan review repair relies on Kernel report and provider turn contract instead of full actionBundle shape');
   assert(scopeRepair.includes('ProviderTurnContract'), 'scope repair still includes provider turn contract');
+  assert(scopeRepair.includes('requiredSchemaVersion=deepcode.agent.protocol.v3'), 'scope repair contract carries the Agent Protocol schema version');
   assert(scopeRepair.includes('current task action templates in ProviderTurnContract'), 'scope repair keeps actionBundle repair tool intent guidance');
   assert(scopeRepair.includes('currentTaskActionTemplates'), 'scope repair still exposes current task action templates');
+  assert(!scopeRepair.includes('Minimal patch shape'), 'scope repair avoids embedding full actionBundle skeletons outside ProviderTurnContract guidance');
+  assert(!scopeRepair.includes('DecisionRequest minimal shape'), 'scope repair avoids embedding full decisionRequest skeletons outside ProviderTurnContract guidance');
   assert(planReviewRepair.includes('ProviderTurnContract'), 'plan review repair still includes provider turn contract');
 }
 

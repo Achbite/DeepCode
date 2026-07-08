@@ -126,6 +126,7 @@ function repairNextActionInstructionLines(input: {
     `state=${input.turnMode}`,
     `allowedOutputs=${input.allowedKinds.join(' | ') || 'none'}`,
     input.requiredKind ? `requiredOutput=${input.requiredKind}` : '',
+    'requiredSchemaVersion=deepcode.agent.protocol.v3',
     `forbiddenOutputs=${forbidden}`,
     'Return exactly one valid Agent Protocol v3 JSON object. No prose, markdown fences, or protocol explanation.',
     nextAction,
