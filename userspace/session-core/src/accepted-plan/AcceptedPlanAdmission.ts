@@ -5,6 +5,7 @@ import type {
   AcceptedImplementationPlanContext,
   AcceptedPlanBatchValidationIssue,
   AcceptedPlanBatchValidationResult,
+  AcceptedImplementationPlanTaskContext,
 } from './types.js';
 
 export interface AcceptedPlanAdmissionPorts {
@@ -83,7 +84,13 @@ export class AcceptedPlanAdmission {
       const scopes = matcher.actionTargetScopes(action, proposal)
         .map((scope) => matcher.normalizeTargetScope(scope, accepted))
         .filter(Boolean);
-      if (scopes.length === 0) {
+      const currentTaskDerived = scopes.length
+        ? undefined
+        : currentTaskTargetScopesForPathlessAction(accepted, capability, matcher);
+      const effectiveScopes = scopes.length
+        ? scopes
+        : currentTaskDerived?.scopes ?? [];
+      if (effectiveScopes.length === 0) {
         addIssue({
           code: 'missingTarget',
           message: `动作 ${actionId || '[unnamed]'} 缺少 target/resourceScope，不能证明其落在已确认计划范围内。`,
@@ -93,8 +100,8 @@ export class AcceptedPlanAdmission {
         continue;
       }
 
-      for (const scope of scopes) {
-        if (!matcher.scopeCovered(scope, capability, accepted)) {
+      for (const scope of effectiveScopes) {
+        if (!currentTaskDerived?.derivedFromCurrentTask && !matcher.scopeCovered(scope, capability, accepted)) {
           addIssue({
             code: 'targetOutOfScope',
             message: `目标 ${scope} 超出已确认 implementationPlan 的 target 范围。`,
@@ -125,4 +132,59 @@ export class AcceptedPlanAdmission {
       issue.code === 'capabilityRequiresDecision'
     );
   }
+}
+
+function currentTaskTargetScopesForPathlessAction(
+  accepted: AcceptedImplementationPlanContext,
+  capability: string,
+  matcher: AcceptedPlanScopeMatcher
+): { scopes: string[]; derivedFromCurrentTask: true } | undefined {
+  if (pathScopedActionRequiresProviderTarget(capability)) return undefined;
+  const settled = new Set([
+    ...accepted.completedTaskIds,
+    ...(accepted.modelJudgedSufficientTaskIds ?? []),
+  ]);
+  const batchTask = accepted.tasks[Math.max(0, accepted.batchIndex - 1)];
+  const ledgerTask = accepted.tasks.find((task) => !settled.has(task.taskId));
+  const candidates = uniqueTasks([batchTask, ledgerTask]);
+  const currentTask = candidates.find((task) =>
+    task.targets.length > 0 &&
+    currentTaskCapabilityAllows(task, capability, accepted, matcher)
+  );
+  if (!currentTask) return undefined;
+  // Provider Protocol v3 keeps execution-only fields out of LLM output; admission derives
+  // pathless tool scope from the current accepted task contract instead.
+  return { scopes: currentTask.targets, derivedFromCurrentTask: true };
+}
+
+function pathScopedActionRequiresProviderTarget(capability: string): boolean {
+  return capability === 'fs.write' ||
+    capability === 'fs.patch' ||
+    capability === 'fs.delete' ||
+    capability === 'fs.rename';
+}
+
+function uniqueTasks(
+  tasks: Array<AcceptedImplementationPlanTaskContext | undefined>
+): AcceptedImplementationPlanTaskContext[] {
+  const seen = new Set<string>();
+  const output: AcceptedImplementationPlanTaskContext[] = [];
+  for (const task of tasks) {
+    if (!task || seen.has(task.taskId)) continue;
+    seen.add(task.taskId);
+    output.push(task);
+  }
+  return output;
+}
+
+function currentTaskCapabilityAllows(
+  task: AcceptedImplementationPlanTaskContext,
+  capability: string,
+  accepted: AcceptedImplementationPlanContext,
+  matcher: AcceptedPlanScopeMatcher
+): boolean {
+  if (task.capability) {
+    return matcher.capabilitySetAllows(new Set([task.capability]), capability);
+  }
+  return matcher.capabilitySetAllows(matcher.canonicalCapabilities(accepted), capability);
 }

@@ -43,7 +43,7 @@ import {
   type ResourceRequestDraft,
   type TranscriptEntry,
 } from '../index.js';
-import { AcceptedPlanScopeMatcher, AcceptedTaskRegistry, type AcceptedImplementationPlanContext } from '../accepted-plan/index.js';
+import { AcceptedPlanAdmission, AcceptedPlanScopeMatcher, AcceptedTaskRegistry, type AcceptedImplementationPlanContext } from '../accepted-plan/index.js';
 import { AgentRunReactor } from '../driver/agentRunReactor.js';
 import { ContextFrameBuilder } from '../driver/context/contextFrameBuilder.js';
 import { ProviderTurnCycle } from '../driver/pipelines/providerTurnCycle.js';
@@ -196,6 +196,7 @@ async function main(): Promise<void> {
   await assertProviderTurnCycleReturnsRoutedProposal();
   assertAcceptedPlanTargetParserExtractsStructuredTargets();
   assertAcceptedPlanScopeMatcherNormalizesProposalTargets();
+  assertAcceptedPlanAdmissionUsesCurrentTaskTargetsForPathlessTools();
   assertAcceptedImplementationPlanContextBuilderBuildsRuntimeContext();
   assertRunStateMachineTaskLedger();
   assertSessionDriverRuntimeAccessors();
@@ -7737,6 +7738,173 @@ function assertAcceptedPlanScopeMatcherNormalizesProposalTargets(): void {
     }, proposal).includes(blockTarget),
     true,
     'scope matcher resolves action sourceBlockId targets'
+  );
+}
+
+function assertAcceptedPlanAdmissionUsesCurrentTaskTargetsForPathlessTools(): void {
+  const token = randomSmokeToken('pathless-tool');
+  const targets = [
+    `scripts/${token}-build.sh`,
+    `scripts/${token}-run.sh`,
+  ];
+  const accepted: AcceptedImplementationPlanContext = {
+    planId: `plan-${token}`,
+    runId: `run-${token}`,
+    tasks: [{
+      taskId: `task-${token}`,
+      title: 'Run accepted script command',
+      targets,
+      capability: 'process.exec',
+      acceptanceCriteria: ['Kernel permission gate receives the command.'],
+      failureCriteria: ['Session must not request provider-only scope fields.'],
+      dependencies: [],
+      conflictKeys: [],
+    }],
+    capabilities: ['process.exec'],
+    targetScopes: targets,
+    exactOperationGrants: [],
+    accessScopes: [],
+    batchIndex: 1,
+    completedTaskIds: [],
+    rawPlan: { id: `plan-${token}` },
+  };
+  const matcher = new AcceptedPlanScopeMatcher();
+  const admission = new AcceptedPlanAdmission({
+    scopeMatcher: matcher,
+    fileOperationFreshnessReasons: () => [],
+  });
+  const processProposal = {
+    schemaVersion: 'deepcode.agent.protocol.v3',
+    proposalId: `proposal-${token}`,
+    runId: accepted.runId,
+    sessionId: `session-${token}`,
+    source: 'llm',
+    kind: 'actionBundle',
+    payload: {
+      actionBundle: {
+        version: '1',
+        id: `bundle-${token}`,
+        goal: 'Run the accepted pathless command.',
+        actions: [{
+          id: `exec-${token}`,
+          actionId: `exec-${token}`,
+          title: 'Run accepted script command',
+          toolId: 'process.exec',
+          capability: 'process.exec',
+          args: { argv: ['bash', targets[0]] },
+          resourceScope: [],
+        }],
+      },
+      codeBlocks: [],
+    },
+    referencedResourcePacketRefs: [],
+    referencedEvidenceRefs: [],
+  } as ProposalEnvelope;
+  const processResult = admission.validate(accepted, processProposal);
+  assertEqual(
+    processResult.ok,
+    true,
+    'accepted-plan admission derives pathless process.exec scope from current task targets'
+  );
+
+  const descriptiveTarget = `run verification ${token}`;
+  const cursorAccepted: AcceptedImplementationPlanContext = {
+    ...accepted,
+    tasks: [
+      {
+        taskId: `done-${token}`,
+        title: 'Completed task',
+        targets: [`src/${token}.cpp`],
+        capability: 'fs.write',
+        acceptanceCriteria: [],
+        failureCriteria: [],
+        dependencies: [],
+        conflictKeys: [],
+      },
+      {
+        taskId: `exec-task-${token}`,
+        title: 'Run accepted verification',
+        targets: [descriptiveTarget],
+        capability: 'process.exec',
+        acceptanceCriteria: [],
+        failureCriteria: [],
+        dependencies: [],
+        conflictKeys: [],
+      },
+    ],
+    capabilities: ['fs.write', 'process.exec'],
+    targetScopes: [`src/${token}.cpp`, descriptiveTarget],
+    completedTaskIds: [],
+    batchIndex: 2,
+  };
+  const cursorResult = admission.validate(cursorAccepted, processProposal);
+  assertEqual(
+    cursorResult.ok,
+    true,
+    'accepted-plan admission uses batch cursor for pathless current-task scope'
+  );
+
+  const outOfScopeProposal = {
+    ...processProposal,
+    proposalId: `outside-proposal-${token}`,
+    payload: {
+      actionBundle: {
+        version: '1',
+        id: `outside-bundle-${token}`,
+        goal: 'Run an out-of-scope path.',
+        actions: [{
+          id: `outside-${token}`,
+          actionId: `outside-${token}`,
+          title: 'Run out-of-scope command',
+          toolId: 'process.exec',
+          capability: 'process.exec',
+          args: {
+            path: `outside/${token}.sh`,
+            argv: ['bash', `outside/${token}.sh`],
+          },
+          resourceScope: [],
+        }],
+      },
+      codeBlocks: [],
+    },
+  } as ProposalEnvelope;
+  const outOfScopeResult = admission.validate(accepted, outOfScopeProposal);
+  assertEqual(
+    outOfScopeResult.issues?.some((issue) => issue.code === 'targetOutOfScope'),
+    true,
+    'accepted-plan admission still rejects explicit out-of-scope process targets'
+  );
+
+  const writeProposal = {
+    ...processProposal,
+    proposalId: `write-proposal-${token}`,
+    payload: {
+      actionBundle: {
+        version: '1',
+        id: `write-bundle-${token}`,
+        goal: 'Write without a provider target.',
+        actions: [{
+          id: `write-${token}`,
+          actionId: `write-${token}`,
+          title: 'Write without target',
+          toolId: 'fs.write',
+          capability: 'fs.write',
+          args: { sourceBlockId: `block-${token}` },
+          resourceScope: [],
+          sourceBlockId: `block-${token}`,
+        }],
+      },
+      codeBlocks: [{
+        id: `block-${token}`,
+        content: 'generic content',
+      }],
+    },
+  } as ProposalEnvelope;
+  const writeResult = admission.validate(accepted, writeProposal);
+  assertEqual(
+    writeResult.issues?.some((issue) => issue.code === 'missingTarget'),
+    true,
+    'accepted-plan admission still requires provider targets for path-scoped file writes'
   );
 }
 
