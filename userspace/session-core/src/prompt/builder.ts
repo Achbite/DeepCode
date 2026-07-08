@@ -33,6 +33,7 @@ export function buildPromptEnvelope(input: PromptEnvelopeBuilderInput): PromptEn
         'For pure read-only explanations or capability answers, use kind="answer" only. If more context is needed, use kind="resourceRequest" only.',
         ...planningDecisionPolicyLines(),
         'For non-trivial side-effect work, first use kind="taskPlan". taskPlan is the Plan/Check artifact: it lists a Session-advanced ordered tasks[] queue, each task capability, concrete non-root targets, acceptance criteria, failure criteria, risks, and review checkpoints. Use Kernel capability names such as fs.write, fs.patch, fs.delete, process.exec, git.read, git.write, network.egress, or browser.control. Choose a reasonable engineering order for the queue, but do not model a graph or ask the model to manage cross-task scheduling. It must not include source code, patches, codeBlocks, actionBundle, commandBlocks, or executable tool calls.',
+        'File and directory create, update, patch, delete, cleanup, or overwrite intents must use fs.write, fs.patch, or fs.delete task capabilities when those capabilities can represent the side effect. Do not wrap workspace file changes in process.exec shell commands. Use process.exec for build, test, run, or inspection commands whose primary purpose is command execution.',
         'Use kind="actionBundle" only when the current ProviderTurnContract explicitly allows it for an accepted current task, or for a tiny single-step side effect explicitly allowed by Session. Detailed actionBundle and tool argument schema is provided by ProviderTurnContract only for execution-capable turns.',
         'For protocol failure, permission insufficiency, context insufficiency, or repair failure terminal explanation, use kind="diagnostic"; diagnostic never creates a plan or execution queue.',
         'Do not output resourceRequest with taskPlan or actionBundle in the same turn.',
@@ -303,6 +304,7 @@ function currentResourceResultsSummary(input: PromptEnvelopeBuilderInput): strin
   lines.push('Current resource result status.');
   lines.push(`resourcePackets=${input.resourcePackets?.length ?? 0}`);
   lines.push(`resourceBlocks=${resourceContext?.resourceBlocks.length ?? 0}`);
+  lines.push(`contentKinds=${resourceContentKindCounts(resourceContext?.resourceBlocks ?? []) || 'none'}`);
   lines.push(`full=${resourceContext?.fullBlockCount ?? 0}`);
   lines.push(`summary=${resourceContext?.summaryBlockCount ?? 0}`);
   lines.push(`handleOnly=${resourceContext?.handleOnlyBlockCount ?? 0}`);
@@ -317,11 +319,21 @@ function resourceEvidencePolicyContractSummary(): string {
   return [
     'Evidence tail policy: read-only confirmations, resource snippets, search results, and current-turn tool results belong at the end of the dynamic context.',
     'Resource result status records evidence availability only. The final NextActionInstruction decides whether to propose now or request more evidence.',
+    'Directory inventory ResourceEvidence is sufficient for file/directory existence checks and taskPlan target planning; request file text only when exact content would change the proposal.',
     'Prefer targeted search/grep-style queries and focused file ranges before requesting a whole large file or directory again.',
     'Use existing ResourceEvidence and AccessIndex before requesting more resources; request more only when the missing fact would materially change the next proposal.',
     'Avoid low-value repetition: do not request the exact same path/range/query again unless a previous ResourcePacket shows an error, memory appears stale, or a different segment is needed.',
     'Current-turn tool results, permission facts, review feedback, and transient run state belong in the dynamic suffix; they must not be promoted into stable factual context.',
   ].join('\n');
+}
+
+function resourceContentKindCounts(blocks: ReadonlyArray<NonNullable<PromptEnvelopeBuilderInput['resourcePromptContext']>['resourceBlocks'][number]>): string {
+  const counts = blocks.reduce<Record<string, number>>((result, block) => {
+    const kind = block.contentKind ?? 'unknown';
+    result[kind] = (result[kind] ?? 0) + 1;
+    return result;
+  }, {});
+  return Object.keys(counts).sort().map((kind) => `${kind}=${counts[kind]}`).join(',');
 }
 
 function memoryAndTaskContextContractSummary(): string {

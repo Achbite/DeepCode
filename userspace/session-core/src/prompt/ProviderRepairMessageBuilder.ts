@@ -79,7 +79,10 @@ export class ProviderRepairMessageBuilder {
         : 'Execution actionBundle schema and Kernel tool args are intentionally withheld in this repair call.',
       actionBundleRepair
         ? 'For fs.write, args.sourceBlockId must reference a top-level codeBlocks[].blockId for the same args.path. Directory targets are planning scopes; do not repair by creating empty .gitkeep or other placeholder files.'
-        : 'Represent future file operations as taskPlan tasks with concrete non-root targets and a task capability such as fs.write, fs.patch, fs.delete, process.exec, git.read, git.write, network.egress, or browser.control. Do not invent toolIds or executable args.',
+        : 'Represent future work as taskPlan tasks with concrete non-root targets, capability, acceptanceCriteria, and failureCriteria. Use fs.write/fs.patch/fs.delete for workspace file-system changes; do not use process.exec for mkdir/rm/cp/sed/cat-redirection or other workspace file mutations.',
+      actionBundleRepair
+        ? ''
+        : 'Do not create standalone directory-creation tasks unless a concrete directory tool is available; parent directories may be implied by planned concrete file writes.',
       'Do not output legacy implementationPlan, commandBlocks, permissionLabels, accessScopes, resourceScope, or payload wrapper fields. capability is allowed only as taskPlan.tasks[].capability; actionBundle actions must use toolId and must not output capability fields.',
       'Output ONLY the single JSON object - no prose, no explanation, and no markdown ``` code fences before or after it.',
       actionBundleRepair
@@ -569,7 +572,7 @@ export class ProviderRepairMessageBuilder {
         ? 'For kind="decisionRequest", put decisionRequest:{id,question,reason?,summary?,options:[{id,label,description,recommended?}],allowsFreeform?} on the top-level JSON object. Do not return bare reason/options without decisionRequest.'
         : '',
       allows('taskPlan')
-        ? 'For kind="taskPlan", put taskPlan.version/id/title/summary/tasks/risks/reviewCheckpoints at the top level. tasks[] must be a Session-advanced ordered engineering queue, not a graph. Each task must include capability and concrete non-root target or targets; do not use workspace root, project root, ".", "/", or wildcard targets. It must not include codeBlocks, actionBundle, commandBlocks, patches, source code, or executable tool calls.'
+        ? 'For kind="taskPlan", put taskPlan.version/id/title/summary/tasks/risks/reviewCheckpoints at the top level. tasks[] must be a Session-advanced ordered engineering queue, not a graph. Each task must include capability, concrete non-root target or targets, acceptanceCriteria[], and failureCriteria[]; do not use workspace root, project root, ".", "/", or wildcard targets. It must not include codeBlocks, actionBundle, commandBlocks, patches, source code, or executable tool calls.'
         : '',
       allows('actionBundle')
         ? 'For kind="actionBundle", put userPlanMarkdown, codeBlocks, and actionBundle directly on the top-level JSON object. Do not wrap them in a payload object. validationExpectations[] and reviewExpectations[] are optional provider notes; Session derives routine defaults when they are omitted.'
@@ -594,6 +597,11 @@ export class ProviderRepairMessageBuilder {
     if (allows('actionBundle') && (errorCode === 'invalid_action_bundle' || errorCode === 'invalid_object')) {
       common.push(
         `Minimal actionBundle skeleton:\n${this.minimalActionBundleRepairSkeleton()}`
+      );
+    }
+    if (allows('taskPlan')) {
+      common.push(
+        `Minimal taskPlan skeleton:\n${this.minimalTaskPlanRepairSkeleton()}`
       );
     }
     return common.join('\n');
@@ -635,6 +643,31 @@ export class ProviderRepairMessageBuilder {
         ],
         validationExpectations: [{ id: 'validation-1', description: 'Kernel facts show the expected file operation.' }],
         reviewExpectations: [{ id: 'review-1', description: 'Review the written file and Kernel facts.' }],
+      },
+    }, null, 2);
+  }
+
+  private minimalTaskPlanRepairSkeleton(): string {
+    return JSON.stringify({
+      schemaVersion: 'deepcode.agent.protocol.v3',
+      kind: 'taskPlan',
+      taskPlan: {
+        version: '1',
+        id: 'task-plan',
+        title: 'Reviewable task plan',
+        summary: 'Plan the requested work as an ordered queue.',
+        tasks: [
+          {
+            taskId: 'task-1',
+            title: 'Prepare concrete workspace change',
+            capability: 'fs.write',
+            target: ['relative/file.ext'],
+            acceptanceCriteria: ['Reviewable completion criterion for this task.'],
+            failureCriteria: ['Stop or replan condition for this task.'],
+          },
+        ],
+        risks: [],
+        reviewCheckpoints: [],
       },
     }, null, 2);
   }

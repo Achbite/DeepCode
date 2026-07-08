@@ -229,6 +229,15 @@ function resourceReuseInstruction(block: NonNullable<PromptEnvelopeBuilderInput[
   if (block.status === 'error') {
     return 'previous read failed; request a different focused segment only if it adds evidence';
   }
+  if (block.contentKind === 'directoryTree' && (block.retention === 'full' || block.retention === 'summary')) {
+    return 'directory inventory is available for existence checks and taskPlan targets; request file text only when exact content is required';
+  }
+  if (block.contentKind === 'searchResults' && (block.retention === 'full' || block.retention === 'summary')) {
+    return 'search evidence is available; use returned matches before repeating the same query';
+  }
+  if (block.contentKind === 'fileText' && block.retention === 'full') {
+    return 'file text is available; use it directly and do not reread the same path/range';
+  }
   if (block.retention === 'full') {
     return 'full evidence is available; use it directly and do not reread the same path/range';
   }

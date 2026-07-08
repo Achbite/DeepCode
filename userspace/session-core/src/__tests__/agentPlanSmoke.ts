@@ -102,6 +102,7 @@ async function main(): Promise<void> {
   assertLegacyProviderShapesAreRejected();
   assertActionBundleProtocolFields();
   assertProviderRepairMessageBuilderAvoidsDuplicateActionBundleReference();
+  assertProviderRepairMessageBuilderKeepsTaskPlanRepairShape();
   assertProviderRepairMessageBuilderScopesNativeRepairReferences();
   assertProtocolGateCanonicalizesBareRepair();
   assertActionBundleActionInspectorReadsActionShape();
@@ -9726,6 +9727,35 @@ function assertProviderRepairMessageBuilderAvoidsDuplicateActionBundleReference(
   assertEqual(joined.split(validationLine).length - 1, 1, 'repair quick reference does not duplicate actionBundle validation schema lines');
 }
 
+function assertProviderRepairMessageBuilderKeepsTaskPlanRepairShape(): void {
+  const token = randomSmokeToken('task-plan-repair-shape');
+  const prompt = buildPromptEnvelope({
+    workflowState: `plan-${token}`,
+    allowedProposals: ['answer', 'resourceRequest', 'decisionRequest', 'taskPlan', 'diagnostic'],
+    capabilityCatalogSummary: 'fs.read',
+    userRequest: `Plan generic workspace work ${token}`,
+  });
+  const messages = new ProviderRepairMessageBuilder().repairMessages(prompt, {
+    runId: `run-${token}`,
+    userRequest: `Plan generic workspace work ${token}`,
+    conversationRoots: [],
+    resourcePackets: [],
+  }, '{"schemaVersion":"deepcode.agent.protocol.v3"}', {
+    code: 'invalid_task_plan',
+    message: 'taskPlan.tasks[0].acceptanceCriteria must include at least one reviewable criterion.',
+  });
+  const joined = messages
+    .map((message) => typeof message.content === 'string' ? message.content : JSON.stringify(message.content))
+    .join('\n');
+
+  assert(joined.includes('Minimal taskPlan skeleton'), 'taskPlan repair prompt includes a minimal valid taskPlan skeleton');
+  assert(joined.includes('acceptanceCriteria'), 'taskPlan repair prompt requires task acceptance criteria');
+  assert(joined.includes('failureCriteria'), 'taskPlan repair prompt requires task failure criteria');
+  assert(joined.includes('Use fs.write/fs.patch/fs.delete for workspace file-system changes'), 'taskPlan repair prompt routes file-system changes to fs capabilities');
+  assert(joined.includes('do not use process.exec for mkdir/rm/cp/sed/cat-redirection'), 'taskPlan repair prompt avoids shell wrappers for workspace file mutations');
+  assert(joined.includes('parent directories may be implied by planned concrete file writes'), 'taskPlan repair prompt avoids standalone directory creation tasks');
+}
+
 function assertProviderRepairMessageBuilderScopesNativeRepairReferences(): void {
   const token = randomSmokeToken('native-repair-reference');
   const prompt = buildPromptEnvelope({
@@ -9920,6 +9950,8 @@ function assertPromptEnvelope(): void {
   assert(!prompt.stablePrefix.includes('reviewGuide'), 'prompt no longer teaches reviewGuide to providers');
   assert(prompt.dynamicSuffix.includes('tasks[] is an ordered queue'), 'provider turn schema treats taskPlan as an ordered queue');
   assert(prompt.dynamicSuffix.includes('every task must include capability, concrete non-root target or targets, acceptanceCriteria, and failureCriteria'), 'provider turn schema requires capability and concrete non-root task slices');
+  assert(prompt.stablePrefix.includes('Do not wrap workspace file changes in process.exec shell commands'), 'stable prompt routes file changes to fs capabilities instead of shell wrappers');
+  assert(prompt.dynamicSuffix.includes('Use fs.write/fs.patch/fs.delete for file-system changes'), 'planning schema routes file-system task intents to fs capabilities');
   assert(!prompt.stablePrefix.includes('Session can schedule parallel graph nodes'), 'prompt no longer requires provider-facing graph scheduling');
   assert(!prompt.stablePrefix.includes('payload object matching that kind'), 'prompt avoids payload wrapper wording');
   assert(!prompt.stablePrefix.includes('actionBundle payload:'), 'prompt avoids ambiguous actionBundle payload wording');
@@ -11418,6 +11450,33 @@ function assertResourcePromptBlocksStabilize(): void {
   assertEqual(directoryBlock.fullTextCharLength, 0, 'directory inventory does not count as full text');
   assertEqual(directoryContext.resourceFullTextCharCount, 0, 'directory inventory keeps dynamic full text budget unchanged');
   assert(directoryBlock.summary.includes(directoryInventoryMarker), 'directory inventory summary preserves visible path entries within compact inventories');
+  const directoryPrompt = buildPromptEnvelope({
+    workflowState: 'needProposal',
+    allowedProposals: ['answer', 'resourceRequest', 'taskPlan'],
+    capabilityCatalogSummary: 'fs.read',
+    userRequest: 'Plan with a generic directory inventory.',
+    initialContext: {
+      id: 'initial-directory-inventory',
+      workspaceScopeKey: directoryManifest.workspaceScopeKey,
+      manifest: directoryManifest,
+    },
+    resourcePromptContext: directoryContext,
+  });
+  const directoryContract = renderProviderTurnContractLayer({
+    workflowState: 'needProposal',
+    allowedProposals: ['answer', 'resourceRequest', 'taskPlan'],
+    capabilityCatalogSummary: 'fs.read',
+    userRequest: 'Plan with a generic directory inventory.',
+    initialContext: {
+      id: 'initial-directory-inventory',
+      workspaceScopeKey: directoryManifest.workspaceScopeKey,
+      manifest: directoryManifest,
+    },
+    resourcePromptContext: directoryContext,
+  });
+  assert(directoryPrompt.dynamicSuffix.includes('contentKinds=directoryTree=1'), 'current resource result status records directory inventory content kind');
+  assert(directoryPrompt.stablePrefix.includes('Directory inventory ResourceEvidence is sufficient for file/directory existence checks and taskPlan target planning'), 'stable evidence policy treats directory inventory as planning evidence');
+  assert(directoryContract.includes('directory inventory is available for existence checks and taskPlan targets'), 'prompt packet access index treats directory inventory as sufficient for task planning');
 
   const jsonDirectoryToken = randomSmokeToken('json-directory');
   const jsonFilePath = `${jsonDirectoryToken}/src/${randomSmokeToken('unit')}.cpp`;
