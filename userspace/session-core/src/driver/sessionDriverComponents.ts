@@ -245,6 +245,7 @@ export const acceptedPlanExecutor = new AcceptedPlanExecutor({
   fileTargetRefFromPath: (path) => actionBundleActionInspector.fileTargetRefFromPath(path),
   deleteActionTargetResourceKind: (action) => actionBundleActionInspector.deleteActionTargetResourceKind(action),
   deleteActionRecursive: (action) => actionBundleActionInspector.deleteActionRecursive(action),
+  containsDirectoryPath: (resourcePackets, path) => resourceRequestLoop.containsDirectoryPath(resourcePackets, path),
   kernelExecutionContractId: (report) => planReviewGrantProjector.kernelExecutionContractId(report),
   proposalTargetScopes: (proposal, accepted) =>
     acceptedPlanScopeMatcher.proposalTargetScopes(proposal, accepted).map((target) => target.normalized),

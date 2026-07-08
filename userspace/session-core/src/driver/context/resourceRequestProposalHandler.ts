@@ -14,6 +14,8 @@ import type { AssistantDiagnosticInfo } from '../projection/assistantProjectionB
 import { SessionDriverRepairRuntimeAccessor } from '../runFrame.js';
 import type { ResourcePacketAppendResult } from './resourceOrchestrator.js';
 
+const MAX_ACCEPTED_PLAN_RESOURCE_RESUME_REQUESTS = 3;
+
 export interface ResourceRequestProposalHandlerState {
   sessionId: string;
   runId: string;
@@ -119,6 +121,7 @@ export interface ResourceRequestProposalHandlerInput<
   prompt: PromptEnvelope;
   proposal: ProposalEnvelope;
   lastResult: AgentSessionResult;
+  acceptedPlanResourceResumeRequestCount?: number;
 }
 
 export class ResourceRequestProposalHandler<
@@ -256,6 +259,33 @@ export class ResourceRequestProposalHandler<
           result: await this.ports.submitNonExecutableProposal(state, resumed, lastResult),
         };
       }
+      // Keep chained read requests inside the accepted task and terminate before the run can stay in progress.
+      const nextCount = (handlerInput.acceptedPlanResourceResumeRequestCount ?? 0) + 1;
+      if (nextCount >= MAX_ACCEPTED_PLAN_RESOURCE_RESUME_REQUESTS) {
+        return {
+          kind: 'return',
+          result: await this.ports.append(state.sessionId, [
+            this.ports.finalDiagnosticEvent(
+              state.sessionId,
+              {
+                code: 'acceptedPlanResourceResumeLimit',
+                fallback: 'Accepted-plan resource resume returned too many consecutive resource requests; Session stopped the loop before leaving the run in progress.',
+                params: {
+                  limit: String(MAX_ACCEPTED_PLAN_RESOURCE_RESUME_REQUESTS),
+                },
+              },
+              this.ports.now(),
+              this.ports.createId('accepted-plan-resource-resume-limit')
+            ),
+          ]),
+        };
+      }
+      return this.handle({
+        ...handlerInput,
+        proposal: resumed,
+        lastResult,
+        acceptedPlanResourceResumeRequestCount: nextCount,
+      });
     }
     return { kind: 'continue', lastResult };
   }

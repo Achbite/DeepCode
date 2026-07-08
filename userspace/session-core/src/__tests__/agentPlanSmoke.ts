@@ -104,6 +104,7 @@ async function main(): Promise<void> {
   assertProviderRepairMessageBuilderScopesNativeRepairReferences();
   assertProtocolGateCanonicalizesBareRepair();
   assertActionBundleActionInspectorReadsActionShape();
+  assertProposalSemanticValidatorRejectsRootScopeTaskTargets();
   assertPathIdentityNormalizesWorkspacePaths();
   assertNativeToolRepairCoordinatorBuildsRepairContracts();
   assertNativeToolProgressEventBuilderBuildsAssistantProgress();
@@ -266,6 +267,7 @@ async function main(): Promise<void> {
   await assertSessionDriverLoopAcceptedImplementationPlanAutoExecutesDeleteAction();
   await assertSessionDriverLoopAcceptedImplementationPlanCanonicalizesMultiDeleteBriefPlan();
   await assertSessionDriverLoopAcceptedImplementationPlanUsesDirectoryDeleteTemplate();
+  await assertSessionDriverLoopAcceptedImplementationPlanInfersDirectoryDeleteFromResourceEvidence();
   await assertSessionDriverLoopAcceptedImplementationRejectsDeleteRootTarget();
   await assertSessionDriverLoopAcceptedImplementationPlanClassifiesDeleteCompileMismatch();
   await assertSessionDriverLoopAcceptedImplementationPlanClassifiesPatchEvidenceMismatch();
@@ -273,6 +275,7 @@ async function main(): Promise<void> {
   await assertSessionDriverLoopAcceptedImplementationPlanResumesAfterDecisionRequest();
   await assertSessionDriverLoopAcceptedImplementationPlanReadsGeneratedArtifactEvidence();
   await assertSessionDriverLoopAcceptedImplementationPlanResumesFromResourceCursor();
+  await assertSessionDriverLoopAcceptedImplementationPlanChainsResourceResumeRequests();
   await assertSessionDriverLoopAcceptedReadOnlyResourceValidationCompletesWithoutProviderLoop();
   await assertSessionDriverLoopAcceptedReadOnlyActionBundleCompletesThroughResourceResolve();
   await assertSessionDriverLoopAcceptedImplementationPlanAllowsPlannedProcessExecPermissionGate();
@@ -418,6 +421,19 @@ function assertDecisionContinuationInputKeepsDecisionResumeInSameLoop(): void {
   assertEqual(input.interactionOverlay, overrideOverlay, 'decision continuation preserves the active owner override');
   assertEqual(input.resumeResourcePackets, true, 'decision continuation can carry resource packets into the same loop');
   assertEqual(input.confirmedRequirement?.requirementId, `requirement-${token}`, 'decision continuation can carry confirmed requirement authority');
+
+  const rootIsolated = decisionContinuationInput({
+    sessionId: `session-root-isolated-${token}`,
+    workspaceBinding: { workspaceId: `decision-workspace-${token}` } as any,
+    projectWorkingDirectory: { path: `/tmp/decision-workspace-${token}` } as any,
+  }, {
+    content: `continue with original root ${token}`,
+    existingEvents: [],
+    workspaceBinding: undefined,
+    projectWorkingDirectory: undefined,
+  });
+  assertEqual(rootIsolated.workspaceBinding, undefined, 'decision continuation can clear a host-shell workspace binding');
+  assertEqual(rootIsolated.projectWorkingDirectory, undefined, 'decision continuation can clear a host-shell project working directory');
 
   const minimal = decisionContinuationInput({ sessionId: `session-minimal-${token}` }, {
     content: `resume ${token}`,
@@ -1092,6 +1108,11 @@ function assertActionBundleActionInspectorReadsActionShape(): void {
     'action inspector reads recursive flag from args'
   );
   assertEqual(
+    inspector.deleteActionRecursive({ args: { recursive: 'true' } }),
+    true,
+    'action inspector accepts string recursive flag from compatibility input'
+  );
+  assertEqual(
     inspector.fileTargetRefFromPath(`/tmp/${token}`).kind,
     'absolutePath',
     'action inspector marks absolute target refs'
@@ -1101,6 +1122,92 @@ function assertActionBundleActionInspectorReadsActionShape(): void {
     'workspaceRelative',
     'action inspector marks workspace relative target refs'
   );
+}
+
+function assertProposalSemanticValidatorRejectsRootScopeTaskTargets(): void {
+  const token = randomSmokeToken('root-task-target');
+  const inspector = new ActionBundleActionInspector();
+  const validator = new ProposalSemanticValidator({
+    maxActionBundleTotalCodeBytes: 128 * 1024,
+    sideEffectCapabilities: new Set(['fs.write', 'fs.patch', 'fs.delete']),
+    readActionBundle: () => undefined,
+    actionEffectiveCapability: (action) => inspector.actionEffectiveCapability(action),
+    actionFileTargetPath: (action) => inspector.actionFileTargetPath(action),
+    deleteActionTargetResourceKind: (action) => inspector.deleteActionTargetResourceKind(action),
+    deleteActionRecursive: (action) => inspector.deleteActionRecursive(action),
+  });
+  const rootPlan = {
+    kind: 'taskPlan',
+    payload: {
+      title: `Plan ${token}`,
+      summary: `Summary ${token}`,
+      tasks: [{
+        taskId: `task-${token}`,
+        title: `Task ${token}`,
+        capability: 'fs.delete',
+        target: ['workspace root'],
+        acceptanceCriteria: [`accepted-${token}`],
+        failureCriteria: [`failed-${token}`],
+      }],
+    },
+  } as ProposalEnvelope;
+  assertThrows(
+    () => validator.validateProposalSemantics(rootPlan),
+    'target must not use workspace root'
+  );
+  const missingCapabilityPlan = {
+    kind: 'taskPlan',
+    payload: {
+      title: `Missing capability plan ${token}`,
+      summary: `Missing capability summary ${token}`,
+      tasks: [{
+        taskId: `missing-capability-task-${token}`,
+        title: `Missing capability task ${token}`,
+        target: [`dir-${token}/file.txt`],
+        acceptanceCriteria: [`accepted-${token}`],
+        failureCriteria: [`failed-${token}`],
+      }],
+    },
+  } as ProposalEnvelope;
+  assertThrows(
+    () => validator.validateProposalSemantics(missingCapabilityPlan),
+    'capability must be a non-empty Kernel capability'
+  );
+  const unsupportedCapabilityPlan = {
+    kind: 'taskPlan',
+    payload: {
+      title: `Unsupported capability plan ${token}`,
+      summary: `Unsupported capability summary ${token}`,
+      tasks: [{
+        taskId: `unsupported-capability-task-${token}`,
+        title: `Unsupported capability task ${token}`,
+        capability: `custom.${token}`,
+        target: [`dir-${token}/file.txt`],
+        acceptanceCriteria: [`accepted-${token}`],
+        failureCriteria: [`failed-${token}`],
+      }],
+    },
+  } as ProposalEnvelope;
+  assertThrows(
+    () => validator.validateProposalSemantics(unsupportedCapabilityPlan),
+    'capability is not supported in taskPlan'
+  );
+  const concretePlan = {
+    kind: 'taskPlan',
+    payload: {
+      title: `Concrete plan ${token}`,
+      summary: `Concrete summary ${token}`,
+      tasks: [{
+        taskId: `concrete-task-${token}`,
+        title: `Concrete task ${token}`,
+        capability: 'fs.write',
+        target: [`dir-${token}/file.txt`],
+        acceptanceCriteria: [`accepted-${token}`],
+        failureCriteria: [`failed-${token}`],
+      }],
+    },
+  } as ProposalEnvelope;
+  validator.validateProposalSemantics(concretePlan);
 }
 
 function assertPathIdentityNormalizesWorkspacePaths(): void {
@@ -2077,6 +2184,7 @@ function assertProposalSemanticValidatorCanonicalizesAndDefaults(): void {
       tasks: [{
         taskId: `task-${token}`,
         title: `Task ${token}`,
+        capability: 'fs.write',
         target: [target],
         acceptanceCriteria: [`Acceptance ${token}`],
         failureCriteria: [`Failure ${token}`],
@@ -2094,6 +2202,7 @@ function assertProposalSemanticValidatorCanonicalizesAndDefaults(): void {
       tasks: [{
         taskId: `task-missing-target-${token}`,
         title: `Task missing target ${token}`,
+        capability: 'fs.write',
         target: [],
         acceptanceCriteria: [`Acceptance ${token}`],
         failureCriteria: [`Failure ${token}`],
@@ -2109,6 +2218,7 @@ function assertProposalSemanticValidatorCanonicalizesAndDefaults(): void {
       tasks: [{
         taskId: `task-missing-acceptance-${token}`,
         title: `Task missing acceptance ${token}`,
+        capability: 'fs.write',
         target: [target],
         acceptanceCriteria: [],
         failureCriteria: [`Failure ${token}`],
@@ -2124,6 +2234,7 @@ function assertProposalSemanticValidatorCanonicalizesAndDefaults(): void {
       tasks: [{
         taskId: `task-missing-failure-${token}`,
         title: `Task missing failure ${token}`,
+        capability: 'fs.write',
         target: [target],
         acceptanceCriteria: [`Acceptance ${token}`],
         failureCriteria: [],
@@ -5332,6 +5443,7 @@ function assertAcceptedPlanExecutorBuildsExecutionBatch(): void {
     fileTargetRefFromPath: (path) => ({ path }),
     deleteActionTargetResourceKind: (action) => typeof action.targetKind === 'string' ? action.targetKind : undefined,
     deleteActionRecursive: (action) => action.recursive === true,
+    containsDirectoryPath: () => false,
     kernelExecutionContractId: (report) => typeof report?.contractId === 'string' ? report.contractId : undefined,
     proposalTargetScopes: (proposal, accepted) =>
       scopeMatcher.proposalTargetScopes(proposal, accepted).map((scope) => scope.normalized),
@@ -7872,6 +7984,8 @@ async function assertSessionDriverLoopRequirementConfirmationCarriesExecutionRoo
   };
   let llmCalls = 0;
   let runCreateAttachments: any[] = [];
+  let runCreateWorkspaceBinding: any;
+  let runCreateProjectWorkingDirectory: any;
   const loop = new SessionDriverLoop({
     appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
       events.push(...nextEvents);
@@ -7881,6 +7995,8 @@ async function assertSessionDriverLoopRequirementConfirmationCarriesExecutionRoo
       const command = request.command as Record<string, any>;
       if (command.kind === 'runCreate') {
         runCreateAttachments = command.input?.attachments ?? [];
+        runCreateWorkspaceBinding = command.input?.workspaceBinding;
+        runCreateProjectWorkingDirectory = command.input?.projectWorkingDirectory;
         return fakeKernel(request);
       }
       return fakeKernel(request);
@@ -7933,6 +8049,8 @@ async function assertSessionDriverLoopRequirementConfirmationCarriesExecutionRoo
   assertEqual(runCreateAttachments.length, 1, 'requirement continuation recovers one execution root attachment');
   assertEqual(runCreateAttachments[0]?.absolutePath, root, 'requirement continuation execution root wins over decision-time workspace binding');
   assertEqual(runCreateAttachments[0]?.rootId, `root-${token}`, 'requirement continuation preserves execution root id');
+  assertEqual(runCreateWorkspaceBinding, undefined, 'requirement continuation does not carry decision-time workspace binding when execution root is known');
+  assertEqual(runCreateProjectWorkingDirectory, undefined, 'requirement continuation does not carry decision-time project working directory when execution root is known');
 }
 
 async function assertSessionDriverLoopRequirementChoiceEntersResumePrompt(): Promise<void> {
@@ -8899,8 +9017,8 @@ function assertPromptEnvelope(): void {
   assert(!prompt.stablePrefix.includes('Session derives routine defaults when they are omitted'), 'stable prefix no longer teaches execution defaults');
   assert(!prompt.stablePrefix.includes('expectedValidation'), 'prompt no longer teaches expectedValidation to providers');
   assert(!prompt.stablePrefix.includes('reviewGuide'), 'prompt no longer teaches reviewGuide to providers');
-  assert(prompt.dynamicSuffix.includes('tasks[] is a Session-advanced ordered implementation queue'), 'provider turn schema treats taskPlan as an ordered queue');
-  assert(prompt.dynamicSuffix.includes('every task must include non-empty target or targets, acceptanceCriteria, and failureCriteria'), 'provider turn schema requires executable-quality task slices');
+  assert(prompt.dynamicSuffix.includes('tasks[] is an ordered queue'), 'provider turn schema treats taskPlan as an ordered queue');
+  assert(prompt.dynamicSuffix.includes('every task must include capability, concrete non-root target or targets, acceptanceCriteria, and failureCriteria'), 'provider turn schema requires capability and concrete non-root task slices');
   assert(!prompt.stablePrefix.includes('Session can schedule parallel graph nodes'), 'prompt no longer requires provider-facing graph scheduling');
   assert(!prompt.stablePrefix.includes('payload object matching that kind'), 'prompt avoids payload wrapper wording');
   assert(!prompt.stablePrefix.includes('actionBundle payload:'), 'prompt avoids ambiguous actionBundle payload wording');
@@ -16457,6 +16575,102 @@ async function assertSessionDriverLoopAcceptedImplementationPlanUsesDirectoryDel
   assertEqual(submittedDeleteAction?.args?.recursive, true, 'submitted delete action keeps recursive=true');
 }
 
+async function assertSessionDriverLoopAcceptedImplementationPlanInfersDirectoryDeleteFromResourceEvidence(): Promise<void> {
+  const token = randomSmokeToken('dir-resource-evidence');
+  const dirPath = `${token}/`;
+  const childNames = [`${randomSmokeToken('child')}.txt`, `${randomSmokeToken('child')}.md`];
+  const sessionId = `session-${token}`;
+  const runId = `run-${token}`;
+  const normalizedDir = dirPath.replace(/\/+$/, '');
+  const events = [
+    genericDirectoryResourceEvent(sessionId, normalizedDir, childNames.map((childName) => `${normalizedDir}/${childName}`)),
+    directoryDeleteAcceptedImplementationPlanCardEvent(sessionId, runId, dirPath, childNames),
+  ];
+  const session: AgentSession = {
+    id: sessionId,
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  let proposalSubmits = 0;
+  let actionBatchSubmits = 0;
+  let submittedDeleteAction: Record<string, any> | undefined;
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => {
+      const command = request.command as Record<string, any>;
+      if (command.kind === 'proposalSubmit') {
+        proposalSubmits += 1;
+        return {
+          ok: true,
+          events: [
+            { kind: 'proposal.accepted', runId, sessionId, proposal: command.proposal },
+            {
+              kind: 'proposal.reviewed',
+              runId,
+              sessionId,
+              proposalId: command.proposal?.proposalId,
+              report: proposalReviewReport(command.proposal?.payload?.actionBundle ?? {}),
+            },
+          ],
+        };
+      }
+      if (command.kind === 'permissionGrantTemporary') return { ok: true, events: [] };
+      if (command.kind === 'actionBatchSubmit') {
+        actionBatchSubmits += 1;
+        submittedDeleteAction = command.batch?.actionBundle?.actions?.[0];
+        return {
+          ok: true,
+          events: [
+            { kind: 'action_batch.accepted', runId, sessionId, batch: { planId: command.batch?.planId } },
+            {
+              kind: 'work_unit.completed',
+              runId,
+              sessionId,
+              workUnitId: 'work-unit-directory-delete-recursive-intent',
+              actionId: submittedDeleteAction?.actionId,
+              output: { path: dirPath.replace(/\/+$/, ''), kind: 'directory', recursive: true },
+            },
+          ],
+        };
+      }
+      if (command.kind === 'reviewFactsGet') return { ok: true, events: [] };
+      return fakeKernel(request);
+    },
+    llmChat: async (): Promise<ApiResponse<LlmChatResult>> => {
+      const proposal = deleteActionBundleProposal(normalizedDir) as any;
+      return jsonLlmResponse(proposal);
+    },
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + proposalSubmits + actionBatchSubmits + 1}`,
+  });
+
+  const result = await loop.resolveDecision({
+    sessionId,
+    kind: 'plan',
+    decision: 'accept',
+    runId,
+    targetId: `impl-${dirPath.replace(/[^A-Za-z0-9_.-]+/g, '-')}`,
+    existingEvents: events,
+  });
+
+  assertEqual(proposalSubmits, 1, 'directory delete target with ResourceEvidence reaches Kernel PlanReview');
+  assertEqual(actionBatchSubmits, 1, 'directory delete target with ResourceEvidence executes after Session canonicalization');
+  assertEqual(
+    result.events.some((event) => event.kind === 'error' && (event.payload as any).code === 'accepted_plan_action_batch_preflight_failed'),
+    false,
+    'directory delete target with ResourceEvidence does not fail accepted-plan preflight'
+  );
+  assertEqual(submittedDeleteAction?.targetKind, 'directory', 'directory ResourceEvidence sets top-level directory targetKind');
+  assertEqual(submittedDeleteAction?.targetResourceKind, 'directory', 'directory ResourceEvidence sets top-level directory targetResourceKind');
+  assertEqual(submittedDeleteAction?.recursive, true, 'directory ResourceEvidence sets top-level recursive=true');
+  assertEqual(submittedDeleteAction?.args?.targetKind, 'directory', 'directory ResourceEvidence sets args directory targetKind');
+  assertEqual(submittedDeleteAction?.args?.recursive, true, 'directory ResourceEvidence sets args recursive=true');
+}
+
 async function assertSessionDriverLoopAcceptedImplementationRejectsDeleteRootTarget(): Promise<void> {
   const events = [deleteAcceptedImplementationPlanCardEvent('session-accepted-plan-delete-root', 'run-accepted-plan-delete-root')];
   const session: AgentSession = {
@@ -17409,6 +17623,134 @@ async function assertSessionDriverLoopAcceptedImplementationPlanResumesFromResou
     ),
     true,
     'accepted-plan execution writes a task savepoint after the resumed batch'
+  );
+  assert(providerPrompts[0] && !providerPrompts[0].includes('Accepted-plan resource resume checkpoint'), 'first call remains the normal accepted-plan provider call');
+}
+
+async function assertSessionDriverLoopAcceptedImplementationPlanChainsResourceResumeRequests(): Promise<void> {
+  const token = randomSmokeToken('resource-chain');
+  const sessionId = `session-${token}`;
+  const runId = `run-${token}`;
+  const events = [acceptedImplementationPlanCardEvent(sessionId, runId)];
+  const session: AgentSession = {
+    id: sessionId,
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  const providerPrompts: string[] = [];
+  let llmCalls = 0;
+  let actionBatchSubmits = 0;
+  let resourceResolveCalls = 0;
+  const evidencePaths = [
+    `${randomSmokeToken('evidence')}/${randomSmokeToken('file')}.txt`,
+    `${randomSmokeToken('evidence')}/${randomSmokeToken('file')}.txt`,
+  ];
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => {
+      const command = request.command as Record<string, any>;
+      if (command.kind === 'proposalSubmit') {
+        return {
+          ok: true,
+          events: [
+            { kind: 'proposal.accepted', runId: 'run-generic', sessionId: session.id, proposal: command.proposal },
+            {
+              kind: 'proposal.reviewed',
+              runId: 'run-generic',
+              sessionId: session.id,
+              proposalId: command.proposal?.proposalId,
+              report: proposalReviewReport(command.proposal?.payload?.actionBundle ?? {}),
+            },
+          ],
+        };
+      }
+      if (command.kind === 'permissionGrantTemporary') return { ok: true, events: [] };
+      if (command.kind === 'resourceResolve') {
+        resourceResolveCalls += 1;
+        return fakeKernel(request);
+      }
+      if (command.kind === 'actionBatchSubmit') {
+        actionBatchSubmits += 1;
+        return {
+          ok: true,
+          events: [
+            { kind: 'action_batch.accepted', runId: 'run-generic', sessionId: session.id, batch: { planId: command.batch?.planId } },
+            {
+              kind: 'work_unit.completed',
+              runId: 'run-generic',
+              sessionId: session.id,
+              workUnitId: `work-unit-${token}`,
+              actionId: 'write-generic-output',
+              output: { path: 'generic-output.txt' },
+            },
+          ],
+        };
+      }
+      if (command.kind === 'reviewFactsGet') return { ok: true, events: [] };
+      return fakeKernel(request);
+    },
+    llmChat: async (request): Promise<ApiResponse<LlmChatResult>> => {
+      llmCalls += 1;
+      const userMessage = request.messages.find((message) => message.role === 'user')?.content ?? '';
+      providerPrompts.push(userMessage);
+      if (llmCalls === 1 || llmCalls === 2) {
+        if (llmCalls === 2) {
+          assert(userMessage.includes('Accepted-plan resource resume checkpoint'), 'second call stays on resource resume prompt');
+        }
+        return jsonLlmResponse({
+          schemaVersion: 'deepcode.agent.protocol.v3',
+          kind: 'resourceRequest',
+          outputLanguage: 'en-US',
+          resourceRequest: {
+            version: '1',
+            id: `request-${token}-${llmCalls}`,
+            reason: `Read additional generic evidence ${llmCalls}.`,
+            items: [{
+              id: `item-${token}-${llmCalls}`,
+              kind: 'file',
+              path: evidencePaths[llmCalls - 1],
+              reason: 'Use current file evidence for the accepted task.',
+            }],
+          },
+        });
+      }
+      assert(userMessage.includes('Accepted-plan resource resume checkpoint'), 'third call remains on resource resume prompt');
+      return jsonLlmResponse(genericWriteProposal(false));
+    },
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + llmCalls + actionBatchSubmits + resourceResolveCalls + 1}`,
+  });
+
+  const result = await loop.resolveDecision({
+    sessionId,
+    kind: 'plan',
+    decision: 'accept',
+    runId,
+    targetId: 'impl-generic-auto',
+    existingEvents: events,
+    projectWorkingDirectory: {
+      rootId: `root-${token}`,
+      label: 'Generic workspace',
+      displayPath: `/tmp/${token}`,
+      absolutePath: `/tmp/${token}`,
+      source: 'projectWorkingDirectory',
+    },
+  });
+
+  assertEqual(llmCalls, 3, 'chained resource resume requests terminate with the resumed action');
+  assertEqual(actionBatchSubmits, 1, 'chained resource resume actionBundle is submitted once');
+  assertEqual(resourceResolveCalls, 2, 'each chained resourceRequest resolves through Kernel ResourceResolve');
+  assertEqual(
+    result.events.filter((event) =>
+      event.kind === 'workflow_stage' &&
+      (event.payload as any)?.stage === 'accepted_plan.resource_resume'
+    ).length,
+    2,
+    'each chained resource resume writes a cursor projection'
   );
   assert(providerPrompts[0] && !providerPrompts[0].includes('Accepted-plan resource resume checkpoint'), 'first call remains the normal accepted-plan provider call');
 }

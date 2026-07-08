@@ -22,6 +22,8 @@ export interface DecisionContinuationOverride {
   content: string;
   attachments?: AgentContextAttachment[];
   existingEvents?: AgentEvent[];
+  workspaceBinding?: AgentWorkspaceBinding;
+  projectWorkingDirectory?: ProjectWorkingDirectory;
   reviewContinuationMode?: ReviewContinuationMode;
   resumeResourcePackets?: boolean;
   confirmedRequirement?: RequirementRecord;
@@ -69,6 +71,8 @@ export function decisionContinuationInput<Extra extends object = Record<string, 
     content,
     attachments,
     existingEvents,
+    workspaceBinding,
+    projectWorkingDirectory,
     reviewContinuationMode,
     resumeResourcePackets,
     confirmedRequirement,
@@ -76,14 +80,16 @@ export function decisionContinuationInput<Extra extends object = Record<string, 
     interactionOverlay,
     ...extra
   } = override;
+  const hasWorkspaceBindingOverride = hasOwnProperty(override, 'workspaceBinding');
+  const hasProjectWorkingDirectoryOverride = hasOwnProperty(override, 'projectWorkingDirectory');
   return {
     ...extra,
     sessionId: source.sessionId,
     content,
     attachments: attachments ?? [],
     existingEvents,
-    workspaceBinding: source.workspaceBinding,
-    projectWorkingDirectory: source.projectWorkingDirectory,
+    workspaceBinding: hasWorkspaceBindingOverride ? workspaceBinding : source.workspaceBinding,
+    projectWorkingDirectory: hasProjectWorkingDirectoryOverride ? projectWorkingDirectory : source.projectWorkingDirectory,
     profileId: source.profileId,
     workflow: source.workflow,
     appendUserMessage: false,
@@ -106,4 +112,8 @@ export function acceptedPlanContinuationInput<Extra extends object = Record<stri
     ...override,
     resumeResourcePackets: override.resumeResourcePackets ?? true,
   });
+}
+
+function hasOwnProperty(object: object, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(object, key);
 }

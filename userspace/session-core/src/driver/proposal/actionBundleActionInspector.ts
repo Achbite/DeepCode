@@ -59,7 +59,7 @@ export class ActionBundleActionInspector {
 
   deleteActionRecursive(action: { recursive?: unknown; toolArgs?: unknown; args?: unknown }): boolean {
     const toolArgs = objectRecord(action.args) ?? objectRecord(action.toolArgs);
-    return action.recursive === true || toolArgs?.recursive === true;
+    return booleanLike(action.recursive) || booleanLike(toolArgs?.recursive);
   }
 }
 
@@ -71,6 +71,13 @@ function objectRecord(value: unknown): Record<string, unknown> | undefined {
 
 function stringValue(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function booleanLike(value: unknown): boolean {
+  if (value === true) return true;
+  if (typeof value !== 'string') return false;
+  const normalized = value.trim().toLowerCase();
+  return normalized === 'true' || normalized === '1' || normalized === 'yes';
 }
 
 function stringArrayValue(value: unknown): string[] {

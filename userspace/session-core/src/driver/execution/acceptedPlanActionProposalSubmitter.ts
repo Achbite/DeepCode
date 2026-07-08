@@ -463,6 +463,7 @@ export class AcceptedPlanActionProposalSubmitter<
       planId: accepted.planId,
       plan,
       acceptedPlan: accepted,
+      resourcePackets: state.resourcePackets,
     });
     if (!normalizedBatch.ok) {
       return (await this.ports.append(state.sessionId, this.ports.normalizationFailureEvents(

@@ -69,6 +69,7 @@ export interface AcceptedPlanExecutorPorts {
   fileTargetRefFromPath(path: string): Record<string, unknown>;
   deleteActionTargetResourceKind(action: Record<string, unknown>): string | undefined;
   deleteActionRecursive(action: Record<string, unknown>): boolean;
+  containsDirectoryPath(resourcePackets: ResourcePacket[], path: string): boolean;
   kernelExecutionContractId(report?: Record<string, unknown>): string | undefined;
   proposalTargetScopes(proposal: ProposalEnvelope, accepted: AcceptedImplementationPlanContext): string[];
   actionTargetScopes(
@@ -322,6 +323,7 @@ export class AcceptedPlanExecutor {
     planId: string;
     plan: PlanContext;
     acceptedPlan?: AcceptedImplementationPlanContext;
+    resourcePackets?: ResourcePacket[];
   }): NormalizedAcceptedPlanKernelBatch {
     const ports = this.requirePorts();
     const actionBundle = objectRecord(input.plan.actionBundle);
@@ -373,11 +375,27 @@ export class AcceptedPlanExecutor {
           next.targetPath = target;
           next.resourceScope = [target];
           next.targetRef = objectRecord(next.targetRef) ?? ports.fileTargetRefFromPath(target);
-          const targetResourceKind = ports.deleteActionTargetResourceKind(next) ?? deleteGrant?.targetResourceKind;
+          const recursiveDeleteIntent = ports.deleteActionRecursive(next) || deleteGrant?.recursive === true;
+          const resourceEvidenceSaysDirectory = ports.containsDirectoryPath(input.resourcePackets ?? [], target);
+          const explicitTargetResourceKind = ports.deleteActionTargetResourceKind(next) ?? deleteGrant?.targetResourceKind;
+          const targetResourceKind = explicitTargetResourceKind ?? (recursiveDeleteIntent || resourceEvidenceSaysDirectory ? 'directory' : undefined);
           if (targetResourceKind === 'directory') {
+            // Clear recursive delete intent is normalized into the Kernel directory-delete schema before preflight.
             next.targetKind = 'directory';
             next.targetResourceKind = 'directory';
-            next.recursive = ports.deleteActionRecursive(next) || deleteGrant?.recursive === true;
+            next.recursive = true;
+            next.args = {
+              ...(objectRecord(next.args) ?? {}),
+              targetKind: 'directory',
+              targetResourceKind: 'directory',
+              recursive: true,
+            };
+            next.toolArgs = {
+              ...(objectRecord(next.toolArgs) ?? objectRecord(next.args) ?? {}),
+              targetKind: 'directory',
+              targetResourceKind: 'directory',
+              recursive: true,
+            };
           }
         }
         return next;

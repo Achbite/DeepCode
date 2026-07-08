@@ -232,6 +232,7 @@ export class RequirementDecisionHandler {
     current: AgentSessionResult
   ): Promise<AgentSessionResult> {
     const originalRequest = this.ports.userInputPipeline.requirementOriginalRequest(confirmation);
+    const attachments = this.ports.userInputPipeline.requirementAttachments(confirmation);
     return this.ports.resumeUserTurn(decisionContinuationInput(input, {
       content: input.decision === 'revise' && input.guidance
         ? [
@@ -245,10 +246,11 @@ export class RequirementDecisionHandler {
             'Write user-visible proposal fields in the current user request language; keep protocol keys and evidence refs unchanged.',
           ].join('\n')
         : originalRequest,
-      attachments: this.ports.userInputPipeline.requirementAttachments(confirmation),
+      attachments,
       existingEvents: current.events,
       resumeResourcePackets: true,
       interactionOverlay,
+      ...continuationRootOverride(attachments),
     }));
   }
 
@@ -269,13 +271,15 @@ export class RequirementDecisionHandler {
       ?? (runId ? this.ports.planIndex.latestExecutablePlan(current.events, runId) : null);
 
     if (input.decision === 'revise' || selectedOptionId === 'revise-plan') {
+      const attachments = this.ports.userInputPipeline.requirementAttachments(confirmation);
       return this.ports.resumeUserTurn(decisionContinuationInput(input, {
         content: this.ports.repairLoop.acceptedPlanScopeRevisionRequest({ confirmation, plan, guidance: input.guidance }),
-        attachments: this.ports.userInputPipeline.requirementAttachments(confirmation),
+        attachments,
         existingEvents: current.events,
         reviewContinuationMode: input.reviewContinuationMode,
         resumeResourcePackets: true,
         interactionOverlay,
+        ...continuationRootOverride(attachments),
       }));
     }
 
@@ -298,17 +302,19 @@ export class RequirementDecisionHandler {
     const selectedEffect = this.ports.userInputPipeline.selectedRequirementDecisionOptionEffect(decisionEvent)
       ?? (input.decision === 'accept' ? this.ports.userInputPipeline.defaultRequirementDecisionOptionEffect(confirmation) : undefined);
     const nextAcceptedPlan = this.ports.acceptedPlanScopeDecisionOverlay.apply(acceptedPlan, selectedEffect);
+    const attachments = nextAcceptedPlan.executionRoot ? [nextAcceptedPlan.executionRoot.attachment] : this.ports.userInputPipeline.requirementAttachments(confirmation);
     const guidance = input.guidance?.trim()
       ? `User guidance for the accepted-plan scope intervention (verbatim):\n${input.guidance.trim()}`
       : this.ports.acceptedPlanScopeDecisionOverlay.resumeGuidance(selectedEffect);
     return this.ports.resumeUserTurn(decisionContinuationInput(input, {
       content: this.ports.executionPrompt.executionRequest(plan, nextAcceptedPlan, guidance),
-      attachments: nextAcceptedPlan.executionRoot ? [nextAcceptedPlan.executionRoot.attachment] : this.ports.userInputPipeline.requirementAttachments(confirmation),
+      attachments,
       existingEvents: current.events,
       reviewContinuationMode: input.reviewContinuationMode,
       resumeResourcePackets: true,
       acceptedImplementationPlan: nextAcceptedPlan,
       interactionOverlay,
+      ...continuationRootOverride(attachments),
     }));
   }
 
@@ -337,27 +343,30 @@ export class RequirementDecisionHandler {
       input.guidance
     );
     if (input.decision !== 'revise') {
+      const attachments = acceptedContext.acceptedPlan.executionRoot
+        ? [acceptedContext.acceptedPlan.executionRoot.attachment]
+        : this.ports.userInputPipeline.requirementAttachments(confirmation);
       return this.ports.resumeUserTurn(decisionContinuationInput(input, {
         content: this.ports.executionPrompt.executionRequest(acceptedContext.plan, acceptedContext.acceptedPlan, guidance),
-        attachments: acceptedContext.acceptedPlan.executionRoot
-          ? [acceptedContext.acceptedPlan.executionRoot.attachment]
-          : this.ports.userInputPipeline.requirementAttachments(confirmation),
+        attachments,
         existingEvents: current.events,
         reviewContinuationMode: input.reviewContinuationMode,
         resumeResourcePackets: true,
         acceptedImplementationPlan: acceptedContext.acceptedPlan,
         interactionOverlay,
+        ...continuationRootOverride(attachments),
       }));
     }
+    const attachments = acceptedContext.acceptedPlan.executionRoot
+      ? [acceptedContext.acceptedPlan.executionRoot.attachment]
+      : this.ports.userInputPipeline.requirementAttachments(confirmation);
     return this.ports.resumeUserTurn({
       sessionId: input.sessionId,
       content: this.ports.executionPrompt.executionRequest(acceptedContext.plan, acceptedContext.acceptedPlan, guidance),
-      attachments: acceptedContext.acceptedPlan.executionRoot
-        ? [acceptedContext.acceptedPlan.executionRoot.attachment]
-        : this.ports.userInputPipeline.requirementAttachments(confirmation),
+      attachments,
       existingEvents: current.events,
-      workspaceBinding: input.workspaceBinding,
-      projectWorkingDirectory: input.projectWorkingDirectory,
+      workspaceBinding: continuationWorkspaceBinding(input, attachments),
+      projectWorkingDirectory: continuationProjectWorkingDirectory(input, attachments),
       profileId: input.profileId,
       workflow: input.workflow,
       appendUserMessage: false,
@@ -561,13 +570,15 @@ export class RequirementDecisionHandler {
 
     const result = await this.ports.append(input.sessionId, events) ?? current;
     const originalRequest = this.ports.userInputPipeline.requirementDecisionResumeRequest(confirmation, decisionEvent, input.decision, input.guidance);
+    const attachments = this.ports.userInputPipeline.requirementAttachments(confirmation);
     return this.ports.resumeUserTurn(decisionContinuationInput(input, {
       content: originalRequest,
-      attachments: this.ports.userInputPipeline.requirementAttachments(confirmation),
+      attachments,
       existingEvents: result.events,
       confirmedRequirement: this.ports.userInputPipeline.requirementRecordFromEvent(confirmation, 'confirmed'),
       acceptedImplementationPlan: nextAccepted,
       interactionOverlay,
+      ...continuationRootOverride(attachments),
     }));
   }
 
@@ -595,14 +606,16 @@ export class RequirementDecisionHandler {
     current: AgentSessionResult
   ): Promise<AgentSessionResult> {
     const originalRequest = this.ports.userInputPipeline.requirementDecisionResumeRequest(confirmation, decisionEvent, input.decision, input.guidance);
+    const attachments = this.ports.userInputPipeline.requirementAttachments(confirmation);
     return this.ports.resumeUserTurn({
       sessionId: input.sessionId,
       content: originalRequest,
-      attachments: this.ports.userInputPipeline.requirementAttachments(confirmation),
+      attachments,
       existingEvents: current.events,
-      workspaceBinding: input.workspaceBinding,
+      // Requirement decisions continue the original interaction root; a host-shell cwd must not replace it.
+      workspaceBinding: continuationWorkspaceBinding(input, attachments),
       projectMemoryMode: input.projectMemoryMode,
-      projectWorkingDirectory: input.projectWorkingDirectory,
+      projectWorkingDirectory: continuationProjectWorkingDirectory(input, attachments),
       profileId: input.profileId,
       workflow: input.workflow,
       appendUserMessage: false,
@@ -612,6 +625,35 @@ export class RequirementDecisionHandler {
       interactionOverlay,
     });
   }
+}
+
+function continuationRootOverride(attachments: AgentContextAttachment[]): {
+  workspaceBinding?: AgentWorkspaceBinding;
+  projectWorkingDirectory?: ProjectWorkingDirectory;
+} {
+  return hasDirectoryRootAttachment(attachments)
+    ? { workspaceBinding: undefined, projectWorkingDirectory: undefined }
+    : {};
+}
+
+function continuationWorkspaceBinding(
+  input: RequirementDecisionHandlerInput,
+  attachments: AgentContextAttachment[]
+): AgentWorkspaceBinding | undefined {
+  return hasDirectoryRootAttachment(attachments) ? undefined : input.workspaceBinding;
+}
+
+function continuationProjectWorkingDirectory(
+  input: RequirementDecisionHandlerInput,
+  attachments: AgentContextAttachment[]
+): ProjectWorkingDirectory | undefined {
+  return hasDirectoryRootAttachment(attachments) ? undefined : input.projectWorkingDirectory;
+}
+
+function hasDirectoryRootAttachment(attachments: AgentContextAttachment[]): boolean {
+  return attachments.some((attachment) =>
+    attachment.kind === 'directory' && Boolean(attachment.absolutePath ?? attachment.path)
+  );
 }
 
 function objectRecord(value: unknown): Record<string, unknown> | undefined {

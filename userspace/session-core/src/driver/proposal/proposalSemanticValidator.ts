@@ -345,6 +345,16 @@ export class ProposalSemanticValidator {
       if (!targets.length) {
         throw new AgentPlanParseError('invalid_task_plan', `taskPlan.tasks[${index}].target must include at least one concrete target.`);
       }
+      if (targets.some((target) => isRootScopeTarget(target))) {
+        throw new AgentPlanParseError('invalid_task_plan', `taskPlan.tasks[${index}].target must not use workspace root, project root, ".", "/", or other root-scope aliases; list concrete file or directory targets instead.`);
+      }
+      const capability = stringValue(record.capability);
+      if (!capability) {
+        throw new AgentPlanParseError('invalid_task_plan', `taskPlan.tasks[${index}].capability must be a non-empty Kernel capability such as fs.write, fs.patch, fs.delete, process.exec, git.read, git.write, network.egress, or browser.control.`);
+      }
+      if (!TASK_PLAN_CAPABILITIES.has(capability)) {
+        throw new AgentPlanParseError('invalid_task_plan', `taskPlan.tasks[${index}].capability is not supported in taskPlan: ${capability}.`);
+      }
       if (!stringArrayValue(record.acceptanceCriteria).length) {
         throw new AgentPlanParseError('invalid_task_plan', `taskPlan.tasks[${index}].acceptanceCriteria must include at least one reviewable criterion.`);
       }
@@ -423,6 +433,21 @@ export class ProposalSemanticValidator {
   }
 }
 
+const TASK_PLAN_CAPABILITIES = new Set([
+  'fs.read',
+  'fs.write',
+  'fs.patch',
+  'fs.delete',
+  'fs.rename',
+  'process.exec',
+  'git.read',
+  'git.write',
+  'git.push',
+  'network.egress',
+  'browser.control',
+  'provider.egress',
+]);
+
 function objectRecord(value: unknown): Record<string, unknown> | undefined {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
@@ -450,6 +475,21 @@ function normalizePlanScope(value: string): string {
 
 function normalizeSlashes(value: string): string {
   return value.trim().replace(/\\/g, '/').replace(/\/+/g, '/');
+}
+
+function isRootScopeTarget(value: string): boolean {
+  const normalized = normalizeSlashes(value)
+    .replace(/\/+$/, '')
+    .toLowerCase();
+  return normalized === '' ||
+    normalized === '.' ||
+    normalized === './' ||
+    normalized === '/' ||
+    normalized === 'root' ||
+    normalized === 'workspace root' ||
+    normalized === 'project root' ||
+    normalized === 'repository root' ||
+    normalized === 'repo root';
 }
 
 function utf8Bytes(value: string): number {

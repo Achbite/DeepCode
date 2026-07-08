@@ -101,7 +101,7 @@ export function providerVisibleSchemaDigest(input: PromptEnvelopeBuilderInput): 
       ? 'decisionRequest top-level field: decisionRequest.version/id/question/options/allowsFreeform; question must be a non-empty user-visible string; use 2-3 mutually exclusive options with one recommended option.'
       : '',
     visibleSchemaKinds.has('taskPlan')
-      ? 'taskPlan top-level field: taskPlan.version/id/title/summary/tasks/risks/reviewCheckpoints. tasks[] is a Session-advanced ordered implementation queue; every task must include non-empty target or targets, acceptanceCriteria, and failureCriteria; no codeBlocks, actionBundle, commandBlocks, patches, source code, or scheduling graph structures.'
+      ? 'taskPlan top-level field: taskPlan.version/id/title/summary/tasks/risks/reviewCheckpoints. tasks[] is an ordered queue; every task must include capability, concrete non-root target or targets, acceptanceCriteria, and failureCriteria. Use Kernel capability names; no codeBlocks, actionBundle, commandBlocks, patches, source code, or graph structures.'
       : '',
     turnMode === 'acceptedTaskExecution' && visibleSchemaKinds.has('taskOutcome')
       ? 'taskOutcome top-level field: taskOutcome.version/id/taskId/status/reason/evidenceRefs; use only when the current accepted task is already sufficiently satisfied and no Kernel write/delete action is needed.'

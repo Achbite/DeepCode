@@ -78,8 +78,8 @@ export class ProviderRepairMessageBuilder {
         : 'Execution actionBundle schema and Kernel tool args are intentionally withheld in this repair call.',
       actionBundleRepair
         ? 'For fs.write, args.sourceBlockId must reference a top-level codeBlocks[].blockId for the same args.path. Directory targets are planning scopes; do not repair by creating empty .gitkeep or other placeholder files.'
-        : 'Represent future file operations as taskPlan targets/capabilities only; do not invent toolIds or executable args.',
-      'Do not output legacy implementationPlan, commandBlocks, capability, permissionLabels, accessScopes, resourceScope, or payload wrapper fields.',
+        : 'Represent future file operations as taskPlan tasks with concrete non-root targets and a task capability such as fs.write, fs.patch, fs.delete, process.exec, git.read, git.write, network.egress, or browser.control. Do not invent toolIds or executable args.',
+      'Do not output legacy implementationPlan, commandBlocks, permissionLabels, accessScopes, resourceScope, or payload wrapper fields. capability is allowed only as taskPlan.tasks[].capability; actionBundle actions must use toolId and must not output capability fields.',
       'Output ONLY the single JSON object - no prose, no explanation, and no markdown ``` code fences before or after it.',
       actionBundleRepair
         ? 'actionBundle.version must be exactly the string "1".'
@@ -220,13 +220,13 @@ export class ProviderRepairMessageBuilder {
           guardrail,
           'Never claim that files were written, commands ran, permissions were granted, or validation passed.',
           'If returning decisionRequest, ask one concise question with 2-3 mutually exclusive options, exactly one recommended option, impact descriptions, allowsFreeform=true, and user-visible text in the current user language.',
-          'If returning taskPlan, put taskPlan.version/id/title/summary/tasks/risks/reviewCheckpoints directly on the top-level JSON object. tasks[] must be ordered by practical development sequence; deprecated graph fields may be parsed for telemetry but are not required. taskPlan must not include source code, codeBlocks, actionBundle, commandBlocks, patches, or executable tool calls.',
+          'If returning taskPlan, put taskPlan.version/id/title/summary/tasks/risks/reviewCheckpoints directly on the top-level JSON object. tasks[] must be ordered by practical development sequence and each task must include capability plus concrete, non-root file or directory targets. Deprecated graph fields may be parsed for telemetry but are not required. taskPlan must not include source code, codeBlocks, actionBundle, commandBlocks, patches, or executable tool calls.',
           ...(afterAcceptedPlan ? [
             'If returning actionBundle after acceptedTaskPlan, put userPlanMarkdown, codeBlocks, and actionBundle directly on the top-level JSON object. Do not wrap them in a payload object.',
             'For actionBundle repair, use current task action templates in ProviderTurnContract when present; otherwise use currentTaskCapabilities and current task targets.',
             'Use codeBlocks[].contentLines for source code in Complete-stage actionBundle only.',
           ] : []),
-          'Do not output capability, permissionLabels, accessScopes, resourceScope, commandBlocks, legacy implementationPlan, or large/multiline codeBlocks.content strings.',
+          'Do not output permissionLabels, accessScopes, resourceScope, commandBlocks, legacy implementationPlan, or large/multiline codeBlocks.content strings. capability is allowed only as taskPlan.tasks[].capability; actionBundle actions must use toolId and must not output capability fields.',
         ].join('\n'),
       },
       {
@@ -568,7 +568,7 @@ export class ProviderRepairMessageBuilder {
         ? 'For kind="decisionRequest", put decisionRequest:{id,question,reason?,summary?,options:[{id,label,description,recommended?}],allowsFreeform?} on the top-level JSON object. Do not return bare reason/options without decisionRequest.'
         : '',
       allows('taskPlan')
-        ? 'For kind="taskPlan", put taskPlan.version/id/title/summary/tasks/risks/reviewCheckpoints at the top level. tasks[] must be a Session-advanced ordered engineering queue, not a graph. It must not include codeBlocks, actionBundle, commandBlocks, patches, source code, or executable tool calls.'
+        ? 'For kind="taskPlan", put taskPlan.version/id/title/summary/tasks/risks/reviewCheckpoints at the top level. tasks[] must be a Session-advanced ordered engineering queue, not a graph. Each task must include capability and concrete non-root target or targets; do not use workspace root, project root, ".", "/", or wildcard targets. It must not include codeBlocks, actionBundle, commandBlocks, patches, source code, or executable tool calls.'
         : '',
       allows('actionBundle')
         ? 'For kind="actionBundle", put userPlanMarkdown, codeBlocks, and actionBundle directly on the top-level JSON object. Do not wrap them in a payload object. validationExpectations[] and reviewExpectations[] are optional provider notes; Session derives routine defaults when they are omitted.'
@@ -588,7 +588,7 @@ export class ProviderRepairMessageBuilder {
       allows('actionBundle')
         ? 'Empty content is valid only for operation="createEmpty" on an explicit empty file, or for patch/replace/insert operations when the protocol explicitly permits it.'
         : '',
-      'Never output capability, permissionLabels, accessScopes, resourceScope, commandBlocks, or legacy implementationPlan.',
+      'Never output permissionLabels, accessScopes, resourceScope, commandBlocks, or legacy implementationPlan. capability is allowed only as taskPlan.tasks[].capability; actionBundle actions must use toolId and must not output capability fields.',
     ].filter(Boolean);
     if (allows('actionBundle') && (errorCode === 'invalid_action_bundle' || errorCode === 'invalid_object')) {
       common.push(
