@@ -404,6 +404,28 @@ export class AcceptedPlanExecutor {
         return next;
       }
 
+      if (capability === 'process.exec') {
+        next.kind = kind ?? 'command';
+        const toolArgs = objectRecord(next.toolArgs) ?? objectRecord(next.args) ?? {};
+        const argv = stringArrayValue(next.argv).length
+          ? stringArrayValue(next.argv)
+          : stringArrayValue(toolArgs.argv);
+        if (!argv.length) {
+          reasons.push(`actionBundle.actions[${index}] process.exec is missing typed args.argv.`);
+          return next;
+        }
+        next.argv = argv;
+        const cwd = stringValue(next.cwd) ?? stringValue(toolArgs.cwd);
+        if (cwd) next.cwd = cwd;
+        const timeoutMs = numberValue(next.timeoutMs) ?? numberValue(toolArgs.timeoutMs);
+        if (timeoutMs !== undefined) next.timeoutMs = timeoutMs;
+        const envPolicy = stringValue(next.envPolicy) ?? stringValue(toolArgs.envPolicy);
+        if (envPolicy) next.envPolicy = envPolicy;
+        next.toolArgs = { ...toolArgs, argv, ...(cwd ? { cwd } : {}), ...(timeoutMs !== undefined ? { timeoutMs } : {}), ...(envPolicy ? { envPolicy } : {}) };
+        next.args = objectRecord(next.args) ?? next.toolArgs;
+        return next;
+      }
+
       if (capability !== 'fs.write' && capability !== 'fs.patch') {
         return next;
       }
@@ -806,6 +828,10 @@ function rawStringValue(value: unknown): string | undefined {
 
 function stringValue(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function numberValue(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
 }
 
 function stringArrayValue(value: unknown): string[] {

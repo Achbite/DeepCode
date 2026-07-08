@@ -124,7 +124,8 @@ export function providerVisibleSchemaDigest(input: PromptEnvelopeBuilderInput): 
         'actionBundle proposal top-level fields: userPlanMarkdown, codeBlocks, actionBundle. Use it only for the current accepted task.',
         ...actionBundleProtocolShapeLines(),
         'codeBlocks items use {blockId,targetPath,language?,operation?,contentLines,allowEmptyContent?}. contentLines is the only provider-facing source-code content carrier.',
-        'actionBundle.actions[].toolId must match a current ToolIntentTemplates template.toolId when a template is present, otherwise use one currentTaskCapabilities id from this ProviderTurnContract.',
+        'When ToolIntentTemplates are present, actionBundle.actions[] must follow those templates as the current task boundary. Do not add targets from the original user request, plan summary, memory, or later tasks.',
+        'When no ToolIntentTemplates are present, use one currentTaskCapabilities id from this ProviderTurnContract and only currentTaskTargets.',
         'File operation actions must use fs.* toolIds. Action entries use actionId, toolId, args, and description; Kernel derives capability, permission, readSet/writeSet, and conflictKeys.',
         'Do not output capability, permissionLabels, accessScopes, resourceScope, commandBlocks, legacy implementationPlan, or payload wrapper fields.',
       ].join('\n')
@@ -177,7 +178,7 @@ function toolIntentTemplates(input: PromptEnvelopeBuilderInput, turnMode: Provid
   const lines = [
     `currentTaskTargets=${targets.length ? targets.join(', ') : 'none'}`,
     `currentTaskCapabilities=${capabilities.length ? capabilities.join(', ') : 'none'}`,
-    'Use only currentTaskTargets unless decisionRequest asks the user to expand current task scope.',
+    'Use only currentTaskTargets unless decisionRequest asks the user to expand current task scope. Do not import targets from plan summary, memory, original user request, or later tasks.',
   ];
   if (capabilities.includes('fs.delete')) {
     lines.push('fs.delete intent: args.path must be one normalized current task target; directory delete requires args.targetKind="directory" and args.recursive=true only for an accepted directory target.');

@@ -271,7 +271,7 @@ export class ProviderTurnContextCoordinator<State extends ProviderTurnContextSta
       `currentTaskTargets=${targets.length ? targets.join(', ') : 'none'}`,
       templates.length ? `currentTaskActionTemplates=${templates.join(' | ')}` : 'currentTaskActionTemplates=none',
       templates.length
-        ? 'Use only listed currentTaskActionTemplates for actionBundle tool calls.'
+        ? 'When currentTaskActionTemplates are listed, actionBundle tool calls must use those templates as the current task boundary. Do not add targets from the original user request, plan summary, memory, or later tasks.'
         : 'No executable action template is available for this current task; use taskOutcome when visible facts already satisfy it, resourceRequest when read-only evidence is missing, or diagnostic/decisionRequest when it cannot continue.',
       'Kernel remains the permission, execution, fact, and audit authority; this summary is not an authorization grant.',
     ].join('\n');
@@ -313,11 +313,15 @@ export class ProviderTurnContextCoordinator<State extends ProviderTurnContextSta
   private currentTaskToolIntentTemplates(state: State): ToolIntentTemplate[] {
     const currentTaskId = state.currentTaskContext?.taskId;
     if (!state.currentTaskContext) return [];
+    const currentTargets = new Set((state.currentTaskContext.targets ?? []).map(normalizeEvidencePath));
     const accepted = objectRecord(state.acceptedImplementationPlan);
     const grantTemplates = arrayRecords(accepted?.exactOperationGrants)
       .filter((grant) => {
         const sourceTaskId = stringValue(grant.sourceTaskId);
-        return !currentTaskId || !sourceTaskId || sourceTaskId === currentTaskId;
+        if (sourceTaskId) return !currentTaskId || sourceTaskId === currentTaskId;
+        // Unscoped grants are accepted only when their target belongs to the active task.
+        const targetPath = stringValue(grant.targetRefPath) ?? stringValue(grant.targetPath);
+        return Boolean(targetPath && currentTargets.has(normalizeEvidencePath(targetPath)));
       })
       .map((grant, index): ToolIntentTemplate | undefined => {
         const targetPath = stringValue(grant.targetRefPath) ?? stringValue(grant.targetPath);
@@ -366,7 +370,19 @@ export class ProviderTurnContextCoordinator<State extends ProviderTurnContextSta
         targets,
         evidencePolicy: capability === 'fs.patch'
           ? 'Use ResourceEvidence exact text or request focused evidence before patching.'
-          : 'Use only current task targets unless a decisionRequest expands scope.',
+          : capability === 'process.exec'
+            ? 'Use argv/cwd/timeoutMs typed args for the current task command; Kernel handles permission before execution.'
+            : 'Use only current task targets unless a decisionRequest expands scope.',
+        template: capability === 'process.exec'
+          ? {
+            toolId: 'process.exec',
+            args: {
+              argv: ['<program>', '<arg>'],
+              cwd: '.',
+              timeoutMs: 120000,
+            },
+          }
+          : { toolId: capability, args: targets.length === 1 ? { path: targets[0] } : {} },
       }));
   }
 
@@ -378,7 +394,7 @@ export class ProviderTurnContextCoordinator<State extends ProviderTurnContextSta
       tool.capability === capabilityOrToolId || tool.toolId === capabilityOrToolId
     );
     if (!matches.length) return true;
-    return matches.some((tool) => tool.executionMode === 'execute');
+    return matches.some((tool) => tool.executionMode === 'execute' || tool.executionMode === 'blocked');
   }
 }
 

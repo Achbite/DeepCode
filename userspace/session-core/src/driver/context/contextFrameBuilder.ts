@@ -301,7 +301,8 @@ export class ContextFrameBuilder {
       return [
         'Use the current task cursor only.',
         `Allowed proposal kinds: ${allowedKinds.join(', ')}.`,
-        'If file changes are needed and evidence is sufficient, return an actionBundle for the current task.',
+        'Use TaskFrame targets and currentTaskActionTemplates as the current task boundary; do not add targets from the original user request, plan summary, memory, or later tasks.',
+        'If file changes are needed and evidence is sufficient, return an actionBundle using only current task templates.',
         'If evidence is missing, return a focused resourceRequest.',
         'If the current task needs targets or operations outside the accepted scope, return a decisionRequest.',
         'If the current task is already sufficiently satisfied and no Kernel action is needed, return taskOutcome with status="modelJudgedSufficient".',

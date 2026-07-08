@@ -180,7 +180,7 @@ export class ResourceRequestProposalHandler<
             repaired.payload as ResourceRequestDraft,
             state.conversationRoots
           );
-        } else if (repaired.kind === 'actionBundle') {
+        } else if (repaired.kind === 'actionBundle' || (state.acceptedImplementationPlan && repaired.kind === 'taskOutcome')) {
           return {
             kind: 'return',
             result: await this.ports.submitActionProposal(input, state, prompt, repaired, lastResult),
@@ -247,7 +247,8 @@ export class ResourceRequestProposalHandler<
         return { kind: 'return', result: readOnlyCompletion };
       }
       const resumed = await this.ports.callResourceResume(input, state, prompt, proposal, packet);
-      if (resumed.kind === 'actionBundle') {
+      // Accepted taskOutcome advances the task ledger and must not enter Kernel proposal decoding.
+      if (resumed.kind === 'actionBundle' || resumed.kind === 'taskOutcome') {
         return {
           kind: 'return',
           result: await this.ports.submitActionProposal(input, state, prompt, resumed, lastResult),

@@ -50,7 +50,7 @@ import { ProviderTurnCycle } from '../driver/pipelines/providerTurnCycle.js';
 import { routeProposalKind } from '../driver/proposal/proposalRouter.js';
 import { acceptedPlanContinuationInput, decisionContinuationInput, SameLoopContinuation } from '../driver/runContinuation.js';
 import { providerVisibleSchemaDigest, renderProviderTurnContractLayer } from '../prompt/providerTurnContract.js';
-import { AcceptedPlanResourceResumeCoordinator, ActionBundleAdmissionResourceFollowupCoordinator, GeneratedArtifactEvidenceIndex, PathIdentity, ProviderTurnContextCoordinator, ResourceEvidenceIndex, ResourceOrchestrator, ResourceRequestLoop, ResourceRequestRepairCoordinator, buildProviderTurnSnapshot } from '../driver/context/index.js';
+import { AcceptedPlanResourceResumeCoordinator, ActionBundleAdmissionResourceFollowupCoordinator, GeneratedArtifactEvidenceIndex, PathIdentity, ProviderTurnContextCoordinator, ResourceEvidenceIndex, ResourceOrchestrator, ResourceRequestLoop, ResourceRequestProposalHandler, ResourceRequestRepairCoordinator, buildProviderTurnSnapshot } from '../driver/context/index.js';
 import {
   AcceptedActionBundlePlanExecutor,
   AcceptedImplementationPlanContextBuilder,
@@ -132,6 +132,7 @@ async function main(): Promise<void> {
   await assertProviderTurnContextCoordinatorUsesFreshAssembly();
   await assertProviderTurnContextCoordinatorNarrowsPlanningAllowedKinds();
   await assertProviderTurnContextCoordinatorScopesAcceptedExecutionCatalog();
+  await assertProviderTurnContextCoordinatorFiltersUnscopedGrantsToCurrentTask();
   await assertHookObserverProducesTraceOnly();
   await assertProviderPipelineUsesProviderTurnContract();
   assertProviderJsonModeCoordinator();
@@ -152,6 +153,7 @@ async function main(): Promise<void> {
   await assertSessionDriverLoopSuppressesPlanningNativeReadToolsAfterInitialEvidence();
   await assertResourceOrchestratorResolvesAndRecordsPackets();
   await assertAcceptedPlanResourceResumeCoordinatorBuildsProviderTurn();
+  await assertResourceRequestProposalHandlerRoutesAcceptedTaskOutcomeResume();
   await assertAcceptedPlanReadOnlyTaskExecutorRoutesTaskOutcomeThroughActionSubmitter();
   await assertResourceRequestRepairCoordinatorRepairsProposal();
   await assertActionBundleAdmissionRepairCoordinatorRepairsProposal();
@@ -1038,13 +1040,119 @@ async function assertProviderTurnContextCoordinatorScopesAcceptedExecutionCatalo
   assert(assemblyCapabilitySummary.includes('currentTaskCapabilities=fs.write, process.exec'), 'scoped summary records current task capabilities');
   assert(assemblyCapabilitySummary.includes(`currentTaskTargets=target-${token}.txt`), 'scoped summary records current task targets');
   assert(assemblyCapabilitySummary.includes('toolId=fs.write'), 'scoped summary keeps executable current task template');
-  assertEqual(assemblyCapabilitySummary.includes('toolId=process.exec'), false, 'scoped summary hides blocked current task action templates');
+  assert(assemblyCapabilitySummary.includes('toolId=process.exec'), 'scoped summary keeps blocked current task command intent for Kernel permission handling');
   assertEqual(dynamicPrompt.includes(fullCatalogMarker), false, 'accepted execution dynamic prompt does not expose full capability catalog');
   assertEqual(renderedContract.includes(fullCatalogMarker), false, 'accepted execution provider contract does not expose full capability catalog');
   assertEqual(renderedContract.includes('browser.click'), false, 'accepted execution provider contract does not enumerate unrelated Kernel catalog tool ids');
-  assertEqual(renderedContract.includes('"toolId":"process.exec"'), false, 'accepted execution provider contract does not expose blocked task templates');
-  assert(renderedContract.includes('template.toolId'), 'accepted execution schema points action tool selection at current task templates');
+  assert(renderedContract.includes('"toolId":"process.exec"'), 'accepted execution provider contract exposes blocked process intent as a Kernel-gated current task template');
+  assert(
+    renderedContract.includes('current task boundary'),
+    'accepted execution schema points action tool selection at current task templates'
+  );
   assert(dynamicPrompt.includes('Current accepted task tool intent scope:'), 'accepted execution workflow state labels scoped tool intent');
+}
+
+async function assertProviderTurnContextCoordinatorFiltersUnscopedGrantsToCurrentTask(): Promise<void> {
+  const token = randomSmokeToken('provider-context-current-task-grants');
+  const currentTarget = `current-${randomSmokeToken('file')}.txt`;
+  const futureTarget = `future-${randomSmokeToken('file')}.txt`;
+  let assemblyCapabilitySummary = '';
+  const coordinator = new ProviderTurnContextCoordinator<any>({
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${token}`,
+    assembleContext: (input) => {
+      assemblyCapabilitySummary = input.capabilityCatalogSummary;
+      return assembleContext({
+        ...input,
+        contextAssemblyId: `assembly-${token}`,
+      });
+    },
+    allowedProposals: (allowed) => allowed,
+    capabilityCatalogSummary: () => `full-catalog-${token}`,
+    memoryHints: () => [],
+    collectUserGuidanceEvents: () => [],
+    appendConsumedGuidance: async ({ result }) => result,
+    buildProviderTurnContract: (input) => new ContextFrameBuilder().buildSessionProviderTurnContract({
+      contractId: input.contractId,
+      sessionId: input.sessionId,
+      runId: input.runId,
+      allowedKinds: input.allowedKinds,
+      prompt: input.prompt,
+      contextAssembly: input.contextAssembly,
+      userRequest: input.userRequest,
+      confirmedDecisionSummary: input.confirmedDecisionSummary,
+      acceptedPlanActive: input.acceptedPlanActive,
+      currentTaskContext: input.currentTaskContext,
+      resourcePackets: input.resourcePackets,
+      generatedArtifactCount: input.generatedArtifactCount,
+      toolIntentTemplates: input.toolIntentTemplates,
+      nextActionInstruction: input.nextActionInstruction,
+    }),
+  });
+
+  const result = await coordinator.prepare({
+    sessionId: `session-${token}`,
+    runId: `run-${token}`,
+    userRequest: `request ${token}`,
+    stateContract: {
+      stateId: `state-${token}`,
+      allowedProposals: ['resourceRequest', 'actionBundle', 'taskOutcome', 'diagnostic'],
+      toolCatalogSnapshot: genericToolCatalogSnapshot() as any,
+    },
+    memoryDocument: buildSessionMemoryDocument([]),
+    resourcePackets: [],
+    conversationRoots: [],
+    generatedArtifactEvidence: new Map(),
+    acceptedImplementationPlan: {
+      planId: `plan-${token}`,
+      title: `Plan ${token}`,
+      summary: `Summary ${token}`,
+      tasks: [
+        { taskId: `task-current-${token}`, targets: [currentTarget] },
+        { taskId: `task-future-${token}`, targets: [futureTarget] },
+      ],
+      completedTaskIds: [],
+      exactOperationGrants: [
+        {
+          operation: 'fs.write',
+          capability: 'fs.write',
+          targetPath: currentTarget,
+          source: 'kernelPlanReview',
+        },
+        {
+          operation: 'fs.write',
+          capability: 'fs.write',
+          targetPath: futureTarget,
+          source: 'kernelPlanReview',
+        },
+      ],
+    },
+    currentTaskContext: {
+      taskId: `task-current-${token}`,
+      taskTitle: `Current task ${token}`,
+      goal: `Write only current target ${token}`,
+      targets: [currentTarget],
+      capabilities: ['fs.write'],
+    },
+  }, {
+    contextAssemblyId: `requested-${token}`,
+    contractId: `contract-${token}`,
+    inputContent: `input ${token}`,
+    lastResult: genericSessionResult(`session-${token}`),
+  });
+
+  const contract = result.modelContextBundle.providerTurnContract;
+  const renderedContract = JSON.stringify(contract);
+  assert(assemblyCapabilitySummary.includes(`path=${currentTarget}`), 'current task scoped grant remains visible');
+  assertEqual(assemblyCapabilitySummary.includes(futureTarget), false, 'future task unscoped grant is hidden from current task summary');
+  assert(renderedContract.includes(currentTarget), 'provider contract keeps the current target template');
+  assertEqual(renderedContract.includes(futureTarget), false, 'provider contract does not expose future task target templates');
+  assertEqual(contract.toolIntentTemplates.length, 1, 'only current task matching unscoped grant becomes a tool template');
+  assertEqual(
+    (contract.toolIntentTemplates[0]?.template as any)?.args?.path,
+    currentTarget,
+    'current task template path is exact'
+  );
 }
 
 async function assertHookObserverProducesTraceOnly(): Promise<void> {
@@ -4165,6 +4273,171 @@ async function assertAcceptedPlanResourceResumeCoordinatorBuildsProviderTurn(): 
   assertEqual(proposal.kind, 'diagnostic', 'resource resume coordinator parses provider proposal');
 }
 
+async function assertResourceRequestProposalHandlerRoutesAcceptedTaskOutcomeResume(): Promise<void> {
+  const token = randomSmokeToken('accepted-resource-task-outcome');
+  const sessionId = `session-${token}`;
+  const runId = `run-${token}`;
+  const taskId = `task-${token}`;
+  const targetPath = `target-${randomSmokeToken('file')}.txt`;
+  const fallback = genericSessionResult(sessionId);
+  const appendResult = genericSessionResult(sessionId);
+  const submitterResult = genericSessionResult(sessionId);
+  let submitActionCalls = 0;
+  let submitNonExecutableCalls = 0;
+  const packet: ResourcePacket = {
+    id: `packet-${token}`,
+    requestId: `request-${token}`,
+    workspaceScopeKey: `workspace-${token}`,
+    items: [{
+      requestItemId: `item-${token}`,
+      manifestEntryId: `entry-${token}`,
+      readPolicy: 'autoRead',
+      status: 'resolved',
+      contentKind: 'fileText',
+      path: targetPath,
+      contentSummary: `content-${token}`,
+    }],
+  };
+  const state = {
+    sessionId,
+    runId,
+    workspaceScopeKey: `workspace-${token}`,
+    manifest: {
+      id: `manifest-${token}`,
+      workspaceScopeKey: `workspace-${token}`,
+      entries: [{
+        id: `entry-${token}`,
+        kind: 'file',
+        label: targetPath,
+        resourceRef: targetPath,
+        readPolicy: 'autoRead',
+        reason: `reason-${token}`,
+      }],
+      budget: { maxEntries: 10, maxBytes: 1024 },
+      defaultDenyPatterns: [],
+    } as ResourceManifest,
+    conversationRoots: [],
+    resourcePackets: [],
+    generatedArtifactEvidence: new Map(),
+    acceptedImplementationPlan: {
+      planId: `plan-${token}`,
+      runId,
+      tasks: [{ taskId, targets: [targetPath], dependencies: [], conflictKeys: [] }],
+      capabilities: ['fs.write'],
+      targetScopes: [targetPath],
+      exactOperationGrants: [],
+      accessScopes: [],
+      batchIndex: 1,
+      completedTaskIds: [],
+      rawPlan: {},
+    } as AcceptedImplementationPlanContext,
+    taskExecutionCursor: { currentTaskId: taskId },
+    currentTaskContext: {
+      taskId,
+      goal: `Task already satisfied ${token}`,
+      targets: [targetPath],
+      capabilities: ['fs.write'],
+    },
+    resourceRequestRepairAttempted: false,
+  };
+  const handler = new ResourceRequestProposalHandler<any, any>({
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${token}`,
+    append: async (_sessionId, events) => ({
+      session: { id: sessionId, mode: 'plan', createdAt: '', updatedAt: '', eventCount: events.length },
+      events,
+    }),
+    generatedPacketForRequest: (_state, request) => ({ remaining: request }),
+    recordAndAppend: async () => ({ packet, event: {} as AgentEvent, result: appendResult }),
+    resolveRecordAndAppend: async () => ({ packet, event: {} as AgentEvent, result: appendResult }),
+    resolveResourceRequest: (manifest) => ({
+      manifest,
+      unresolved: [],
+      ambiguous: [],
+      availableRoots: [],
+    }),
+    repairResourceRequest: async () => {
+      throw new Error('accepted resource task outcome test should not repair resource requests');
+    },
+    answerEvent: () => ({} as AgentEvent),
+    finalDiagnosticEvent: () => ({} as AgentEvent),
+    resourceResolutionDiagnostic: () => ({ code: 'unexpected', fallback: 'unexpected' }),
+    resourceRepairFailedDiagnostic: () => ({ code: 'unexpected', fallback: 'unexpected' }),
+    refreshTaskRuntimeState: () => undefined,
+    acceptedPlanResourceResumeEvent: () => ({
+      id: `resume-${token}`,
+      kind: 'workflow_stage',
+      sessionId,
+      ts: '2026-01-01T00:00:00.000Z',
+      payload: { stage: 'accepted_plan.resource_resume', runId },
+    } as AgentEvent),
+    tryCompleteResourceTask: async () => null,
+    callResourceResume: async () => parseProposalEnvelope({
+      runId,
+      sessionId,
+      raw: JSON.stringify({
+        schemaVersion: 'deepcode.agent.protocol.v3',
+        kind: 'taskOutcome',
+        outputLanguage: 'en-US',
+        taskOutcome: {
+          version: '1',
+          id: `outcome-${token}`,
+          taskId,
+          status: 'modelJudgedSufficient',
+          reason: `visible resource evidence satisfies ${token}`,
+          evidenceRefs: [],
+        },
+      }),
+    }),
+    submitActionProposal: async (_input, _state, _prompt, proposal, result) => {
+      submitActionCalls += 1;
+      assertEqual(proposal.kind, 'taskOutcome', 'accepted resource resume taskOutcome reaches action submitter');
+      assertEqual(result.session.id, sessionId, 'accepted resource resume taskOutcome receives resource append result');
+      return submitterResult;
+    },
+    submitNonExecutableProposal: async () => {
+      submitNonExecutableCalls += 1;
+      return genericSessionResult(sessionId);
+    },
+    errorMessage: (error) => error instanceof Error ? error.message : String(error),
+  });
+
+  const result = await handler.handle({
+    input: { sessionId, content: `request-${token}` },
+    state,
+    prompt: {
+      stablePrefix: `stable-${token}`,
+      dynamicSuffix: '',
+      auditOnlyContext: '',
+      layers: [],
+      segments: [],
+      stableLayerNames: [],
+      dynamicLayerNames: [],
+      auditOnlyLayerNames: [],
+    },
+    proposal: parseProposalEnvelope({
+      runId,
+      sessionId,
+      raw: JSON.stringify({
+        schemaVersion: 'deepcode.agent.protocol.v3',
+        kind: 'resourceRequest',
+        outputLanguage: 'en-US',
+        resourceRequest: {
+          version: '1',
+          id: `request-${token}`,
+          items: [{ id: `item-${token}`, kind: 'file', path: targetPath, reason: `reason-${token}` }],
+        },
+      }),
+    }),
+    lastResult: fallback,
+  });
+
+  assertEqual(result.kind, 'return', 'accepted resource resume taskOutcome returns through handler');
+  assertEqual(result.kind === 'return' ? result.result : undefined, submitterResult, 'accepted resource resume taskOutcome returns submitter result');
+  assertEqual(submitActionCalls, 1, 'accepted resource resume taskOutcome uses action submitter');
+  assertEqual(submitNonExecutableCalls, 0, 'accepted resource resume taskOutcome is not submitted as non-executable Kernel proposal');
+}
+
 async function assertAcceptedPlanReadOnlyTaskExecutorRoutesTaskOutcomeThroughActionSubmitter(): Promise<void> {
   const token = randomSmokeToken('readonly-task-outcome');
   const sessionId = `session-${token}`;
@@ -5876,6 +6149,65 @@ function assertAcceptedPlanExecutorBuildsExecutionBatch(): void {
   assertEqual(deleteAction.recursive, true, 'accepted plan executor sets top-level recursive delete intent');
   assertEqual(deleteAction.args?.targetKind, 'directory', 'accepted plan executor sets args directory target kind');
   assertEqual(deleteAction.args?.recursive, true, 'accepted plan executor sets args recursive delete intent');
+  const processAcceptedPlan: AcceptedImplementationPlanContext = {
+    planId: `process-plan-${token}`,
+    runId: `process-run-${token}`,
+    tasks: [{
+      taskId: `process-task-${token}`,
+      title: 'Run accepted command task',
+      targets: [`script-${token}.sh`],
+      capability: 'process.exec',
+      dependencies: [],
+      conflictKeys: [],
+    }],
+    capabilities: ['process.exec'],
+    targetScopes: [`script-${token}.sh`],
+    exactOperationGrants: [],
+    accessScopes: [],
+    batchIndex: 1,
+    completedTaskIds: [],
+    rawPlan: { id: `process-plan-${token}` },
+  };
+  const processProposal = {
+    ...proposal,
+    proposalId: `process-proposal-${token}`,
+    runId: processAcceptedPlan.runId,
+    payload: {
+      userPlan: 'Generic accepted process batch.',
+      actionBundle: {
+        version: '1',
+        id: `process-bundle-${token}`,
+        goal: 'Run one accepted command.',
+        actions: [{
+          actionId: `process-action-${token}`,
+          toolId: 'process.exec',
+          args: { argv: ['bash', `script-${token}.sh`], cwd: '.', timeoutMs: 120000 },
+        }],
+      },
+      codeBlocks: [],
+      commandBlocks: [],
+    },
+  } as ProposalEnvelope;
+  const processPlan = executor.executionContext({
+    sessionId,
+    runId: processAcceptedPlan.runId,
+    acceptedPlan: processAcceptedPlan,
+    proposal: processProposal,
+    planReviewReport: { contractId: `process-contract-${token}` },
+  });
+  const normalizedProcess = executor.normalizeKernelBatch({
+    planId: processAcceptedPlan.planId,
+    plan: processPlan,
+    acceptedPlan: processAcceptedPlan,
+  });
+  assertEqual(normalizedProcess.ok, true, 'accepted plan executor normalizes typed process.exec args');
+  if (!normalizedProcess.ok) throw new Error(normalizedProcess.reasons.join('; '));
+  const processAction = (normalizedProcess.batch.actionBundle.actions as Array<Record<string, any>>)[0];
+  assertEqual(processAction.kind, 'command', 'accepted plan executor sets process action kind');
+  assertEqual(processAction.argv[0], 'bash', 'accepted plan executor promotes args.argv to Kernel action argv');
+  assertEqual(processAction.argv[1], `script-${token}.sh`, 'accepted plan executor preserves command argv target');
+  assertEqual(processAction.cwd, '.', 'accepted plan executor promotes args.cwd to Kernel action cwd');
+  assertEqual(processAction.timeoutMs, 120000, 'accepted plan executor promotes args.timeoutMs to Kernel action timeout');
   const canonicalized = executor.canonicalizeAccessScopes(acceptedPlan, proposal);
   assertEqual(canonicalized.changed, true, 'accepted plan executor removes unsafe access scopes');
   assertEqual(canonicalized.actionTargets.includes(target), true, 'accepted plan executor preserves proposal action targets');

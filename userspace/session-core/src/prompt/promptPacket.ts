@@ -311,7 +311,8 @@ function nextActionInstructionFrame(input: PromptEnvelopeBuilderInput): PromptPa
         `allowedOutputs=${allowed.join(' | ') || 'none'}`,
         'forbiddenOutputs=taskPlan | implementationPlan | reviewSummary',
         'Continue the current accepted task. Do not re-plan unless a user decision explicitly requests replan/revisePlan.',
-        'If the current task needs file changes and evidence is sufficient, output actionBundle. If evidence is missing, output focused resourceRequest. If scope must expand, output decisionRequest.',
+        'Use TaskFrame targets and currentTaskActionTemplates as the current task boundary. Do not add targets from the original user request, plan summary, memory, or later tasks.',
+        'If the current task needs file changes and evidence is sufficient, output actionBundle using only current task templates. If evidence is missing, output focused resourceRequest. If scope must expand, output decisionRequest.',
         'If the current task is already sufficiently satisfied and no Kernel action is needed, output taskOutcome with status="modelJudgedSufficient". Do not invent empty actions just to advance the task.',
       ]
       : genericContent,
