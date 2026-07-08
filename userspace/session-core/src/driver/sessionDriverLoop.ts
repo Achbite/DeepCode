@@ -547,6 +547,7 @@ export class SessionDriverLoop {
         this.providerRuntimeBridge.llm(profileId, state, stage, messages),
       event: (sessionId, kind, payload) => this.agentRunReactor.event(sessionId, kind, payload),
       reviewAssembler: reviewAssembler(),
+      contextFrameBuilder,
     });
     this.permissionDecisionHandler = new PermissionDecisionHandler<SessionPlanContext>({
       now: () => this.agentRunReactor.ts(),
@@ -757,6 +758,7 @@ export class SessionDriverLoop {
           source: 'llm',
         }),
       createError: (code, message) => new SessionDriverLoopError(code, message),
+      contextFrameBuilder,
     });
     this.actionBundleAdmissionRepairCoordinator = new ActionBundleAdmissionRepairCoordinator<SessionDriverLoopRunState>({
       repairMessageBuilder: providerRepairMessageBuilder,

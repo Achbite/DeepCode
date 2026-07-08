@@ -19,9 +19,11 @@ import type {
   ResourcePacket,
 } from '../../context/types.js';
 import type { RequirementRecord } from '../../requirement/types.js';
+import type { ContextFrameBuilder } from '../context/index.js';
+import { prepareProviderSideCallMessagesContextAdmission } from '../context/index.js';
 import {
-  SessionDriverProviderRuntimeAccessor,
   SessionDriverRepairRuntimeAccessor,
+  type SessionDriverProviderRuntimeState,
 } from '../runFrame.js';
 
 export interface TerminalGuidanceRevisionInput {
@@ -32,9 +34,10 @@ export interface TerminalGuidanceRevisionInput {
   confirmedRequirement?: RequirementRecord;
 }
 
-export interface TerminalGuidanceRevisionState {
+export interface TerminalGuidanceRevisionState extends SessionDriverProviderRuntimeState {
   sessionId: string;
   runId: string;
+  userRequest: string;
   terminalGuidanceRevisionAttempted: boolean;
   memoryDocument: SessionMemoryDocument;
   initialContext?: InitialContextPacket;
@@ -88,6 +91,7 @@ export interface TerminalGuidanceRevisionCoordinatorPorts<
   runRevision(input: Input, state: State, messages: LlmChatRequest['messages']): Promise<string>;
   parseProposal(raw: string, state: State): ProposalEnvelope;
   createError(code: string, message: string): Error;
+  contextFrameBuilder: ContextFrameBuilder;
 }
 
 export class TerminalGuidanceRevisionCoordinator<
@@ -144,11 +148,6 @@ export class TerminalGuidanceRevisionCoordinator<
         sessionId: state.sessionId,
       },
     });
-    const providerRuntime = new SessionDriverProviderRuntimeAccessor(state);
-    providerRuntime.applyContextAssembly({
-      cachePlan: assembledContext.cachePlan,
-      contextAssembly: assembledContext.contextAssembly,
-    });
     result = await this.ports.appendConsumedGuidanceEvents({
       sessionId: state.sessionId,
       result,
@@ -160,10 +159,26 @@ export class TerminalGuidanceRevisionCoordinator<
 
     let revised: ProposalEnvelope;
     try {
-      const raw = await this.ports.runRevision(input, state, [
-        { role: 'system', content: assembledContext.prompt.stablePrefix },
-        { role: 'user', content: assembledContext.prompt.dynamicSuffix },
-      ]);
+      const admission = prepareProviderSideCallMessagesContextAdmission({
+        state,
+        prompt: assembledContext.prompt,
+        contextFrameBuilder: this.ports.contextFrameBuilder,
+        contractId: this.ports.createId('guidance-revision-contract'),
+        turnMode: 'reviewAnswer',
+        allowedKinds: ['answer'],
+        requiredKind: 'answer',
+        messages: [
+          { role: 'system', content: assembledContext.prompt.stablePrefix },
+          { role: 'user', content: assembledContext.prompt.dynamicSuffix },
+        ],
+        userRequest: input.content,
+        contextAssembly: assembledContext.contextAssembly,
+        resourcePackets: state.resourcePackets,
+        repairPolicy: 'sameKindOnly',
+        projectionVisibility: 'traceOnly',
+        nextActionInstruction: 'Return exactly one Agent Protocol v3 answer proposal that applies the queued user guidance to the draft terminal answer. Do not output a plan, tool request, actionBundle, markdown outside JSON, or prose outside JSON.',
+      });
+      const raw = await this.ports.runRevision(input, state, admission.messages);
       revised = this.ports.parseProposal(raw, state);
       if (revised.kind !== 'answer') {
         throw this.ports.createError(

@@ -1,16 +1,19 @@
 import type { AgentEvent, AgentEventKind, LlmChatRequest, ProjectionDelta } from '@deepcode/protocol';
 import type { ResourcePacket } from '../../context/types.js';
 import type { PromptEnvelope } from '../../prompt/types.js';
-import type { GeneratedArtifactEvidence } from '../context/index.js';
+import type { ContextFrameBuilder, GeneratedArtifactEvidence } from '../context/index.js';
+import { prepareProviderSideCallMessagesContextAdmission } from '../context/index.js';
 import type { AcceptedImplementationPlanContext } from '../execution/index.js';
+import type { SessionDriverProviderRuntimeState } from '../runFrame.js';
 import type { ReviewAssembler } from './reviewAssembler.js';
 
 const STATIC_SYNTAX_REVIEW_STAGE = 'accepted_plan.static_syntax_review';
 const STATIC_SYNTAX_REVIEW_PROVIDER_STAGE = 'accepted_plan_static_syntax_review';
 
-export interface AcceptedPlanStaticSyntaxReviewState {
+export interface AcceptedPlanStaticSyntaxReviewState extends SessionDriverProviderRuntimeState {
   sessionId: string;
   runId: string;
+  userRequest: string;
   generatedArtifactEvidence: Map<string, GeneratedArtifactEvidence>;
   resourcePackets: ResourcePacket[];
 }
@@ -37,6 +40,7 @@ export interface AcceptedPlanStaticSyntaxReviewCoordinatorPorts<TState extends A
   }): Promise<string>;
   event(sessionId: string, kind: AgentEventKind, payload: Record<string, unknown>): AgentEvent;
   reviewAssembler: ReviewAssembler;
+  contextFrameBuilder: ContextFrameBuilder;
 }
 
 export class AcceptedPlanStaticSyntaxReviewCoordinator<TState extends AcceptedPlanStaticSyntaxReviewState> {
@@ -73,16 +77,32 @@ export class AcceptedPlanStaticSyntaxReviewCoordinator<TState extends AcceptedPl
 
     let parsed: Record<string, unknown>;
     try {
-      const reviewPromise = this.ports.runStaticSyntaxReview({
-        profileId: input.profileId,
+      const admission = prepareProviderSideCallMessagesContextAdmission({
         state,
-        stage: STATIC_SYNTAX_REVIEW_PROVIDER_STAGE,
+        prompt,
+        contextFrameBuilder: this.ports.contextFrameBuilder,
+        contractId: this.ports.createId('static-syntax-review-contract'),
+        turnMode: 'reviewAnswer',
+        allowedKinds: ['staticSyntaxReview'],
+        requiredKind: 'staticSyntaxReview',
         messages: this.ports.reviewAssembler.staticSyntaxReviewMessages({
           prompt,
           runId: state.runId,
           accepted,
           packet,
         }),
+        userRequest: state.userRequest,
+        resourcePackets: state.resourcePackets,
+        generatedArtifactCount: state.generatedArtifactEvidence.size,
+        repairPolicy: 'diagnosticOnly',
+        projectionVisibility: 'traceOnly',
+        nextActionInstruction: 'Return exactly one staticSyntaxReview JSON object for the provided generated files. Do not output Agent Protocol proposals, markdown, tool requests, or prose.',
+      });
+      const reviewPromise = this.ports.runStaticSyntaxReview({
+        profileId: input.profileId,
+        state,
+        stage: STATIC_SYNTAX_REVIEW_PROVIDER_STAGE,
+        messages: admission.messages,
       });
       const timeoutMs = this.ports.staticSyntaxReviewTimeoutMs ?? 45_000;
       const raw = timeoutMs > 0
