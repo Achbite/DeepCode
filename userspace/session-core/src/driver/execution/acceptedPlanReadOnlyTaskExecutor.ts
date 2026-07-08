@@ -316,7 +316,7 @@ export class AcceptedPlanReadOnlyTaskExecutor<
     if (readOnlyCompletion) return readOnlyCompletion;
 
     const resumed = await this.callResourceResume(input, state, prompt, proposal, packet);
-    if (resumed.kind === 'actionBundle') {
+    if (resumed.kind === 'actionBundle' || resumed.kind === 'taskOutcome') {
       return this.ports.submitActionProposal(input, state, prompt, resumed, result);
     }
     if (resumed.kind !== 'resourceRequest') {

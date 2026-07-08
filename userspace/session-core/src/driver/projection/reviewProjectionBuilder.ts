@@ -93,6 +93,7 @@ export class ReviewProjectionBuilder<
     sessionId: string;
     plan: Plan;
     kernelEvents: unknown[];
+    events?: AgentEvent[];
     ts: string;
     id: string;
   }): AgentEvent {
@@ -131,12 +132,18 @@ export class ReviewProjectionBuilder<
     const acceptedPlanForReview = input.plan.implementationPlan
       ? ports.acceptedPlanContext(input.plan)
       : undefined;
-    const reviewTaskLedger = acceptedPlanForReview
+    // Review task status is a checkpoint projection; prefer the latest ledger facts over the stale accepted-plan snapshot.
+    const checkpointTaskLedger = latestAcceptedPlanTaskLedgerFromEvents<TaskLedger>(
+      input.events ?? [],
+      input.plan.runId,
+      input.plan.planId
+    );
+    const reviewTaskLedger = checkpointTaskLedger ?? (acceptedPlanForReview
       ? ports.acceptedPlanTaskLedger(ports.acceptedPlanAfterBatch(
         acceptedPlanForReview,
         ports.acceptedPlanBatchCompletedTaskIds(acceptedPlanForReview, input.plan, input.kernelEvents)
       ))
-      : undefined;
+      : undefined);
     const reviewFactsContextInput: ReviewFactsContextInput<TaskLedger> = {
       planId: input.plan.planId,
       runId: input.plan.runId,
@@ -426,6 +433,36 @@ export class ReviewProjectionBuilder<
 
 function arrayLength(value: unknown): number {
   return Array.isArray(value) ? value.length : 0;
+}
+
+function latestAcceptedPlanTaskLedgerFromEvents<TaskLedger>(
+  events: AgentEvent[],
+  planRunId?: string,
+  planId?: string
+): TaskLedger | undefined {
+  for (const event of [...events].reverse()) {
+    if (event.kind !== 'workflow_stage') continue;
+    const payload = objectRecord(event.payload) ?? {};
+    if (stringValue(payload.stage) !== 'accepted_plan.batch_checkpoint') continue;
+    if (!sameAcceptedPlan(payload, planRunId, planId)) continue;
+    const ledger = objectRecord(payload.taskLedger);
+    if (ledger) return ledger as TaskLedger;
+  }
+  return undefined;
+}
+
+function sameAcceptedPlan(
+  payload: Record<string, unknown>,
+  planRunId?: string,
+  planId?: string
+): boolean {
+  const payloadRunId = stringValue(payload.runId);
+  const payloadPlanId = stringValue(payload.planId) ?? stringValue(payload.sourcePlanId);
+  if (planId && payloadPlanId && payloadPlanId !== planId) return false;
+  if (planRunId && payloadRunId && payloadRunId !== planRunId) {
+    return Boolean(planId && payloadPlanId === planId);
+  }
+  return true;
 }
 
 function addReviewWorkUnitFile(

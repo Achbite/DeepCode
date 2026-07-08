@@ -359,7 +359,8 @@ export class AcceptedPlanExecutor {
         return action;
       }
       const next = { ...record };
-      const capability = stringValue(next.capability);
+      // Keep batch normalization aligned with preflight and admission when providers emit toolId-only actions.
+      const capability = actionEffectiveCapability(next);
       const kind = stringValue(next.kind);
       if (capability === 'fs.delete') {
         next.kind = kind ?? 'delete';
@@ -378,7 +379,9 @@ export class AcceptedPlanExecutor {
           const recursiveDeleteIntent = ports.deleteActionRecursive(next) || deleteGrant?.recursive === true;
           const resourceEvidenceSaysDirectory = ports.containsDirectoryPath(input.resourcePackets ?? [], target);
           const explicitTargetResourceKind = ports.deleteActionTargetResourceKind(next) ?? deleteGrant?.targetResourceKind;
-          const targetResourceKind = explicitTargetResourceKind ?? (recursiveDeleteIntent || resourceEvidenceSaysDirectory ? 'directory' : undefined);
+          const targetResourceKind = resourceEvidenceSaysDirectory
+            ? 'directory'
+            : explicitTargetResourceKind ?? (recursiveDeleteIntent ? 'directory' : undefined);
           if (targetResourceKind === 'directory') {
             // Clear recursive delete intent is normalized into the Kernel directory-delete schema before preflight.
             next.targetKind = 'directory';

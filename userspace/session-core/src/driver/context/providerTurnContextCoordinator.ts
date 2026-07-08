@@ -1,4 +1,4 @@
-import type { AgentEvent, AgentSessionResult } from '@deepcode/protocol';
+import type { AgentEvent, AgentSessionResult, KernelToolCatalogSnapshot } from '@deepcode/protocol';
 import type { CurrentTaskContext, TaskExecutionCursor } from '../../accepted-plan/index.js';
 import type {
   ContextAssemblyInput,
@@ -27,9 +27,13 @@ export interface ProviderTurnContextState {
   stateContract?: {
     stateId?: string;
     allowedProposals?: string[];
+    toolCatalogSnapshot?: KernelToolCatalogSnapshot;
   };
   driverRequest?: {
     kind?: string;
+    stateContract?: {
+      toolCatalogSnapshot?: KernelToolCatalogSnapshot;
+    };
   };
   memoryDocument?: SessionMemoryDocument;
   initialContext?: InitialContextPacket;
@@ -266,6 +270,9 @@ export class ProviderTurnContextCoordinator<State extends ProviderTurnContextSta
       `currentTaskCapabilities=${capabilities.length ? capabilities.join(', ') : 'none'}`,
       `currentTaskTargets=${targets.length ? targets.join(', ') : 'none'}`,
       templates.length ? `currentTaskActionTemplates=${templates.join(' | ')}` : 'currentTaskActionTemplates=none',
+      templates.length
+        ? 'Use only listed currentTaskActionTemplates for actionBundle tool calls.'
+        : 'No executable action template is available for this current task; use taskOutcome when visible facts already satisfy it, resourceRequest when read-only evidence is missing, or diagnostic/decisionRequest when it cannot continue.',
       'Kernel remains the permission, execution, fact, and audit authority; this summary is not an authorization grant.',
     ].join('\n');
   }
@@ -319,10 +326,18 @@ export class ProviderTurnContextCoordinator<State extends ProviderTurnContextSta
         if (!targetPath || !operation) return undefined;
         const targetResourceKind = stringValue(grant.targetResourceKind);
         const recursive = grant.recursive === true;
+        if (!this.currentTaskCapabilityExecutable(state, capability ?? operation)) return undefined;
         const args: Record<string, unknown> = { path: targetPath };
         if (operation === 'fs.delete' || capability === 'fs.delete') {
-          args.targetKind = targetResourceKind === 'directory' ? 'directory' : 'file';
-          args.recursive = args.targetKind === 'directory' || recursive;
+          const evidenceKind = resourceEvidenceTargetKind(state.resourcePackets, targetPath);
+          const deleteTargetKind = evidenceKind ?? (recursive ? 'directory' : targetResourceKind);
+          if (deleteTargetKind === 'directory') {
+            args.targetKind = 'directory';
+            args.recursive = true;
+          } else if (deleteTargetKind === 'file') {
+            args.targetKind = 'file';
+            args.recursive = false;
+          }
         }
         return {
           intentId: `current-task-template-${index + 1}`,
@@ -342,15 +357,28 @@ export class ProviderTurnContextCoordinator<State extends ProviderTurnContextSta
     if (grantTemplates.length) return grantTemplates;
     const targets = state.currentTaskContext.targets ?? [];
     const capabilities = state.currentTaskContext.capabilities ?? [];
-    return capabilities.map((capability, index): ToolIntentTemplate => ({
-      intentId: `current-task-template-${index + 1}`,
-      label: 'currentTaskActionTemplates',
-      operation: capability,
-      targets,
-      evidencePolicy: capability === 'fs.patch'
-        ? 'Use ResourceEvidence exact text or request focused evidence before patching.'
-        : 'Use only current task targets unless a decisionRequest expands scope.',
-    }));
+    return capabilities
+      .filter((capability) => this.currentTaskCapabilityExecutable(state, capability))
+      .map((capability, index): ToolIntentTemplate => ({
+        intentId: `current-task-template-${index + 1}`,
+        label: 'currentTaskActionTemplates',
+        operation: capability,
+        targets,
+        evidencePolicy: capability === 'fs.patch'
+          ? 'Use ResourceEvidence exact text or request focused evidence before patching.'
+          : 'Use only current task targets unless a decisionRequest expands scope.',
+      }));
+  }
+
+  private currentTaskCapabilityExecutable(state: State, capabilityOrToolId: string | undefined): boolean {
+    if (!capabilityOrToolId) return false;
+    const snapshot = toolCatalogSnapshot(state);
+    if (!snapshot?.tools?.length) return true;
+    const matches = snapshot.tools.filter((tool) =>
+      tool.capability === capabilityOrToolId || tool.toolId === capabilityOrToolId
+    );
+    if (!matches.length) return true;
+    return matches.some((tool) => tool.executionMode === 'execute');
   }
 }
 
@@ -384,6 +412,59 @@ function arrayRecords(value: unknown): Record<string, unknown>[] {
   return Array.isArray(value)
     ? value.filter((item): item is Record<string, unknown> => Boolean(objectRecord(item)))
     : [];
+}
+
+function toolCatalogSnapshot(state: ProviderTurnContextState): KernelToolCatalogSnapshot | undefined {
+  return state.stateContract?.toolCatalogSnapshot ?? state.driverRequest?.stateContract?.toolCatalogSnapshot;
+}
+
+function resourceEvidenceTargetKind(
+  packets: ResourcePacket[] | undefined,
+  targetPath: string
+): 'directory' | 'file' | undefined {
+  const target = normalizeEvidencePath(targetPath);
+  if (!target || !packets?.length) return undefined;
+  for (const packet of packets) {
+    for (const item of packet.items ?? []) {
+      if (item.status !== 'resolved' && item.status !== 'provided') continue;
+      const directPath = normalizeEvidencePath(item.path ?? item.absolutePath ?? '');
+      if (directPath && (directPath === target || directPath.endsWith(`/${target}`))) {
+        if (item.contentKind === 'directoryTree') return 'directory';
+        if (item.contentKind === 'fileText' || item.contentKind === 'fileSkipped' || item.fileClassification) return 'file';
+      }
+      const fromNodes = resourceNodeTargetKind(objectRecord(item)?.nodes, target);
+      if (fromNodes) return fromNodes;
+    }
+  }
+  return undefined;
+}
+
+function resourceNodeTargetKind(value: unknown, targetPath: string): 'directory' | 'file' | undefined {
+  if (!Array.isArray(value)) return undefined;
+  for (const item of value) {
+    const node = objectRecord(item);
+    if (!node) continue;
+    const path = normalizeEvidencePath(stringValue(node.path) ?? stringValue(node.name) ?? '');
+    const type = stringValue(node.type);
+    if (path && (path === targetPath || path.endsWith(`/${targetPath}`))) {
+      if (type === 'directory' || type === 'dir') return 'directory';
+      if (type === 'file') return 'file';
+    }
+    const child = resourceNodeTargetKind(node.children, targetPath);
+    if (child) return child;
+  }
+  return undefined;
+}
+
+function normalizeEvidencePath(value: string): string {
+  const normalized = value
+    .trim()
+    .replace(/\\/g, '/')
+    .replace(/^\.\//, '')
+    .replace(/\/+/g, '/')
+    .replace(/\/+$/, '');
+  if (!normalized || normalized === '/' || normalized === '.') return '.';
+  return normalized;
 }
 
 function oneLine(value: string, limit: number): string {

@@ -63,6 +63,7 @@ import {
   AcceptedPlanScopeResourceFollowupCoordinator,
   ActionBundleAdmissionRepairCoordinator,
   AcceptedPlanExecutor,
+  AcceptedPlanReadOnlyTaskExecutor,
   AcceptedPlanTargetParser,
   AcceptedPlanTaskLedgerCoordinator,
   AcceptedPlanTaskRuntimeAccessor,
@@ -151,6 +152,7 @@ async function main(): Promise<void> {
   await assertSessionDriverLoopSuppressesPlanningNativeReadToolsAfterInitialEvidence();
   await assertResourceOrchestratorResolvesAndRecordsPackets();
   await assertAcceptedPlanResourceResumeCoordinatorBuildsProviderTurn();
+  await assertAcceptedPlanReadOnlyTaskExecutorRoutesTaskOutcomeThroughActionSubmitter();
   await assertResourceRequestRepairCoordinatorRepairsProposal();
   await assertActionBundleAdmissionRepairCoordinatorRepairsProposal();
   await assertActionBundleAdmissionResourceFollowupCoordinatorHandlesResourceRequests();
@@ -173,6 +175,7 @@ async function main(): Promise<void> {
   assertKernelEventStatusIndexReadsStructuredEvents();
   await assertAcceptedPlanReviewHandoffCoordinatorBuildsReviewState();
   await assertAcceptedPlanStaticSyntaxReviewCoordinatorBuildsEvents();
+  await assertAcceptedPlanStaticSyntaxReviewCoordinatorTimesOut();
   assertReviewAssemblerFormatsReviewFacts();
   assertReviewAssemblerFindsWaitingReviewContext();
   assertReviewDecisionProjectionUsesI18nKeys();
@@ -937,6 +940,30 @@ async function assertProviderTurnContextCoordinatorScopesAcceptedExecutionCatalo
   const token = randomSmokeToken('provider-context-scoped-catalog');
   const fullCatalogMarker = `FULL_TOOL_CATALOG_SHOULD_NOT_APPEAR_${token}`;
   let assemblyCapabilitySummary = '';
+  const baseCatalog = genericToolCatalogSnapshot() as any;
+  const scopedCatalog = {
+    ...baseCatalog,
+    tools: [
+      ...baseCatalog.tools,
+      {
+        toolId: 'process.exec',
+        capability: 'process.exec',
+        family: 'process',
+        risk: 'high',
+        permissionMode: 'ask',
+        pathScopePolicy: 'none',
+        executionMode: 'blocked',
+        needsWorkspace: false,
+        readOnly: false,
+        operationKind: 'exec',
+        providerSchema: {
+          type: 'object',
+          properties: { argv: { type: 'array', items: { type: 'string' } } },
+          required: ['argv'],
+        },
+      },
+    ],
+  };
   const coordinator = new ProviderTurnContextCoordinator<any>({
     now: () => '2026-01-01T00:00:00.000Z',
     createId: (prefix) => `${prefix}-${token}`,
@@ -977,6 +1004,7 @@ async function assertProviderTurnContextCoordinatorScopesAcceptedExecutionCatalo
     stateContract: {
       stateId: `state-${token}`,
       allowedProposals: ['resourceRequest', 'actionBundle', 'taskOutcome', 'diagnostic'],
+      toolCatalogSnapshot: scopedCatalog,
     },
     memoryDocument: buildSessionMemoryDocument([]),
     resourcePackets: [],
@@ -994,7 +1022,7 @@ async function assertProviderTurnContextCoordinatorScopesAcceptedExecutionCatalo
       taskTitle: `Task ${token}`,
       goal: `Handle ${token}`,
       targets: [`target-${token}.txt`],
-      capabilities: ['fs.write'],
+      capabilities: ['fs.write', 'process.exec'],
     },
   }, {
     contextAssemblyId: `requested-${token}`,
@@ -1007,11 +1035,14 @@ async function assertProviderTurnContextCoordinatorScopesAcceptedExecutionCatalo
 
   assertEqual(assemblyCapabilitySummary.includes(fullCatalogMarker), false, 'accepted execution does not pass the full capability catalog into ContextAdmission');
   assert(assemblyCapabilitySummary.includes('Accepted execution task tool intent summary.'), 'accepted execution passes a scoped capability summary');
-  assert(assemblyCapabilitySummary.includes('currentTaskCapabilities=fs.write'), 'scoped summary records current task capabilities');
+  assert(assemblyCapabilitySummary.includes('currentTaskCapabilities=fs.write, process.exec'), 'scoped summary records current task capabilities');
   assert(assemblyCapabilitySummary.includes(`currentTaskTargets=target-${token}.txt`), 'scoped summary records current task targets');
+  assert(assemblyCapabilitySummary.includes('toolId=fs.write'), 'scoped summary keeps executable current task template');
+  assertEqual(assemblyCapabilitySummary.includes('toolId=process.exec'), false, 'scoped summary hides blocked current task action templates');
   assertEqual(dynamicPrompt.includes(fullCatalogMarker), false, 'accepted execution dynamic prompt does not expose full capability catalog');
   assertEqual(renderedContract.includes(fullCatalogMarker), false, 'accepted execution provider contract does not expose full capability catalog');
   assertEqual(renderedContract.includes('browser.click'), false, 'accepted execution provider contract does not enumerate unrelated Kernel catalog tool ids');
+  assertEqual(renderedContract.includes('"toolId":"process.exec"'), false, 'accepted execution provider contract does not expose blocked task templates');
   assert(renderedContract.includes('template.toolId'), 'accepted execution schema points action tool selection at current task templates');
   assert(dynamicPrompt.includes('Current accepted task tool intent scope:'), 'accepted execution workflow state labels scoped tool intent');
 }
@@ -2169,6 +2200,56 @@ function assertProposalSemanticValidatorCanonicalizesAndDefaults(): void {
   const bundle = (proposal.payload as Record<string, any>).actionBundle;
   assertEqual(bundle.validationExpectations[0].messageKey, 'session.driver.defaultValidation.targets', 'proposal semantic validator adds validation expectation key');
   assertEqual(bundle.reviewExpectations[0].messageKey, 'session.driver.defaultReview.targets', 'proposal semantic validator adds review expectation key');
+
+  const patchTarget = `targets/${token}-patch.txt`;
+  const patchBlockId = `patch-block-${token}`;
+  const patchProposal = {
+    ...proposal,
+    proposalId: `patch-proposal-${token}`,
+    payload: {
+      userPlan: `Patch ${token}`,
+      actionBundle: {
+        version: '1',
+        id: `patch-bundle-${token}`,
+        goal: `Patch goal ${token}`,
+        actions: [{
+          id: `patch-action-${token}`,
+          title: `Patch ${token}`,
+          capability: 'fs.patch',
+          kind: 'patch',
+          targetPath: patchTarget,
+          resourceScope: [patchTarget],
+        }],
+      },
+      codeBlocks: [{
+        id: patchBlockId,
+        targetPath: patchTarget,
+        content: [
+          `--- a/${patchTarget}`,
+          `+++ b/${patchTarget}`,
+          '@@ -1,2 +1,2 @@',
+          ` keep-${token}`,
+          `-old-${token}`,
+          `+new-${token}`,
+        ].join('\n'),
+      }],
+    },
+  } as ProposalEnvelope;
+  validator.canonicalizeWriteActionSourceBlockRefs(patchProposal);
+  const patchAction = (patchProposal.payload as Record<string, any>).actionBundle.actions[0];
+  const patchBlock = (patchProposal.payload as Record<string, any>).codeBlocks[0];
+  assertEqual(patchAction.replacementBlockId, patchBlockId, 'proposal semantic validator canonicalizes patch replacementBlockId');
+  assertEqual(
+    patchAction.patchSpec.match.text,
+    [`keep-${token}`, `old-${token}`].join('\n'),
+    'proposal semantic validator converts unified diff old hunk to exact patch match'
+  );
+  assertEqual(
+    patchBlock.content,
+    [`keep-${token}`, `new-${token}`].join('\n'),
+    'proposal semantic validator converts unified diff new hunk to replacement block content'
+  );
+  validator.validateProposalSemantics(patchProposal, { allowBriefActionBundleUserPlan: true });
 
   const validTaskPlan = {
     schemaVersion: 'deepcode.agent.protocol.v3',
@@ -4084,6 +4165,187 @@ async function assertAcceptedPlanResourceResumeCoordinatorBuildsProviderTurn(): 
   assertEqual(proposal.kind, 'diagnostic', 'resource resume coordinator parses provider proposal');
 }
 
+async function assertAcceptedPlanReadOnlyTaskExecutorRoutesTaskOutcomeThroughActionSubmitter(): Promise<void> {
+  const token = randomSmokeToken('readonly-task-outcome');
+  const sessionId = `session-${token}`;
+  const runId = `run-${token}`;
+  const taskId = `task-${token}`;
+  const acceptedPlan: AcceptedImplementationPlanContext = {
+    planId: `plan-${token}`,
+    runId,
+    tasks: [{
+      taskId,
+      title: `Task ${token}`,
+      targets: [`target-${token}.txt`],
+      capability: 'fs.read',
+      acceptanceCriteria: [],
+      failureCriteria: [],
+      dependencies: [],
+      conflictKeys: [],
+    }],
+    capabilities: ['fs.read'],
+    targetScopes: [`target-${token}.txt`],
+    exactOperationGrants: [],
+    accessScopes: [],
+    batchIndex: 1,
+    completedTaskIds: [],
+    rawPlan: {},
+  };
+  const packet: ResourcePacket = {
+    id: `packet-${token}`,
+    requestId: `request-${token}`,
+    workspaceScopeKey: 'workspace',
+    items: [{
+      requestItemId: `item-${token}`,
+      manifestEntryId: `entry-${token}`,
+      readPolicy: 'autoRead',
+      status: 'resolved',
+      contentKind: 'fileText',
+      path: `target-${token}.txt`,
+      contentSummary: `content-${token}`,
+    }],
+  };
+  let submitActionCalls = 0;
+  let submitNonExecutableCalls = 0;
+  const fallback = genericSessionResult(sessionId);
+  const submitterResult = genericSessionResult(sessionId);
+  const executor = new AcceptedPlanReadOnlyTaskExecutor<any, any>({
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${token}`,
+    append: async (_sessionId, events) => ({
+      session: { id: sessionId, mode: 'plan', createdAt: '', updatedAt: '', eventCount: events.length },
+      events,
+    }),
+    continueSameLoop: async () => genericSessionResult(sessionId),
+    readActionBundle: (proposal) => ((proposal as ProposalEnvelope).payload as Record<string, any>)?.actionBundle,
+    refreshRuntimeState: () => undefined,
+    readOnlyResourceCompletion: () => ({ ok: false }),
+    recordTaskCompletion: ({ acceptedPlan }) => ({ completedTaskIds: [], nextAcceptedPlan: acceptedPlan }),
+    complete: () => false,
+    resourceValidationCheckpointEvent: () => ({
+      id: `checkpoint-${token}`,
+      kind: 'workflow_stage',
+      sessionId,
+      ts: '2026-01-01T00:00:00.000Z',
+      payload: { stage: 'checkpoint', runId },
+    } as AgentEvent),
+    executionRequest: () => `resume-${token}`,
+    readOnlyReviewContext: () => ({ sessionId, runId, planId: acceptedPlan.planId } as any),
+    reviewHandoff: async ({ result }) => result,
+    currentTaskIsReadOnlyResourceValidation: () => true,
+    resourceRequestFromReadOnlyActionBundle: () => ({
+      version: '1',
+      id: `resource-request-${token}`,
+      reason: `reason-${token}`,
+      items: [{ id: `item-${token}`, kind: 'file', path: `target-${token}.txt`, reason: `reason-${token}` }],
+    }),
+    resolveResourceRequest: () => ({
+      manifest: {
+        id: `manifest-${token}`,
+        workspaceScopeKey: 'workspace',
+        entries: [{ id: `entry-${token}`, kind: 'file', label: `target-${token}.txt`, resourceRef: `target-${token}.txt`, readPolicy: 'autoRead', reason: `reason-${token}` }],
+        budget: { maxEntries: 10, maxBytes: 1024 },
+        defaultDenyPatterns: [],
+      },
+    }),
+    resolveAndRecord: async () => packet,
+    packetEvent: () => ({
+      id: `packet-event-${token}`,
+      kind: 'tool_result',
+      sessionId,
+      ts: '2026-01-01T00:00:00.000Z',
+      payload: { toolName: 'kernel.resourceResolve', status: 'ok', output: packet },
+    } as AgentEvent),
+    resourceResumeEvent: () => ({
+      id: `resume-event-${token}`,
+      kind: 'workflow_stage',
+      sessionId,
+      ts: '2026-01-01T00:00:00.000Z',
+      payload: { stage: 'accepted_plan.resource_resume', runId },
+    } as AgentEvent),
+    resourceResume: async () => parseProposalEnvelope({
+      runId,
+      sessionId,
+      raw: JSON.stringify({
+        schemaVersion: 'deepcode.agent.protocol.v3',
+        kind: 'taskOutcome',
+        outputLanguage: 'en-US',
+        taskOutcome: {
+          version: '1',
+          id: `outcome-${token}`,
+          taskId,
+          status: 'modelJudgedSufficient',
+          reason: `resource evidence satisfies ${token}`,
+          evidenceRefs: [],
+        },
+      }),
+    }),
+    callProviderProposalOnly: async () => {
+      throw new Error('test uses resourceResume port directly');
+    },
+    runRepair: async () => {
+      throw new Error('taskOutcome resume should not require repair');
+    },
+    submitActionProposal: async (_input, _state, _prompt, proposal, result) => {
+      submitActionCalls += 1;
+      assertEqual(proposal.kind, 'taskOutcome', 'read-only task executor routes taskOutcome through action submitter');
+      assertEqual(result.session.id, sessionId, 'taskOutcome submitter receives the resource append result');
+      return submitterResult;
+    },
+    submitNonExecutableProposal: async () => {
+      submitNonExecutableCalls += 1;
+      return genericSessionResult(sessionId);
+    },
+  });
+  const result = await executor.tryCompleteActionBundle(
+    { sessionId, content: `request-${token}` },
+    {
+      sessionId,
+      runId,
+      acceptedImplementationPlan: acceptedPlan,
+      manifest: {
+        id: `manifest-${token}`,
+        workspaceScopeKey: 'workspace',
+        entries: [],
+        budget: { maxEntries: 10, maxBytes: 1024 },
+        defaultDenyPatterns: [],
+      },
+      conversationRoots: [],
+      taskExecutionCursor: { currentTaskId: taskId },
+      currentTaskContext: { taskId, targets: [`target-${token}.txt`], capabilities: ['fs.read'] },
+    },
+    {
+      stablePrefix: `stable-${token}`,
+      dynamicSuffix: '',
+      auditOnlyContext: '',
+      layers: [],
+      segments: [],
+      stableLayerNames: [],
+      dynamicLayerNames: [],
+      auditOnlyLayerNames: [],
+    },
+    parseProposalEnvelope({
+      runId,
+      sessionId,
+      raw: JSON.stringify({
+        schemaVersion: 'deepcode.agent.protocol.v3',
+        kind: 'actionBundle',
+        outputLanguage: 'en-US',
+        actionBundle: {
+          version: '1',
+          id: `bundle-${token}`,
+          goal: `goal-${token}`,
+          actions: [{ actionId: `read-${token}`, toolId: 'fs.read', args: { path: `target-${token}.txt` } }],
+        },
+      }),
+    }),
+    fallback
+  );
+  assertEqual(result, submitterResult, 'taskOutcome resume returns the action submitter result');
+  assertEqual(submitActionCalls, 1, 'taskOutcome resource resume uses accepted-plan action submitter');
+  assertEqual(submitNonExecutableCalls, 0, 'taskOutcome resource resume is not sent through non-executable Kernel submit');
+}
+
 async function assertResourceRequestRepairCoordinatorRepairsProposal(): Promise<void> {
   const token = randomSmokeToken('resource-request-repair');
   const sessionId = `session-${token}`;
@@ -5435,6 +5697,7 @@ function assertAcceptedPlanExecutorBuildsExecutionBatch(): void {
   const target = `generated-${token}.txt`;
   const blockId = `block-${token}`;
   const normalize = (value: string): string => value.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, '');
+  const actionInspector = new ActionBundleActionInspector();
   const scopeMatcher = new AcceptedPlanScopeMatcher();
   const scopeCoverage = new AcceptedPlanScopeCoverage({
     taskTargets: (record) => Array.isArray(record.targets)
@@ -5447,20 +5710,16 @@ function assertAcceptedPlanExecutorBuildsExecutionBatch(): void {
     concreteDirectoryOperationTarget: (value) => value && !value.includes('*') ? normalize(value) : undefined,
     concreteFileOperationTarget: (value) => value && !value.endsWith('/') && !value.includes('*') ? normalize(value) : undefined,
     exactGrantCapabilityMatches: (grant, capability) => grant.capability === capability,
-    actionEffectiveCapability: (action) => typeof action.capability === 'string'
-      ? action.capability
-      : typeof action.toolId === 'string'
-        ? action.toolId
-        : '',
-    actionFileTargetPath: (action) => typeof action.targetPath === 'string' ? action.targetPath : undefined,
+    actionEffectiveCapability: (action) => actionInspector.actionEffectiveCapability(action),
+    actionFileTargetPath: (action) => actionInspector.actionFileTargetPath(action),
   });
   const executor = new AcceptedPlanExecutor({
     readActionBundle: (proposal) => (proposal.payload as Record<string, any>).actionBundle as ActionBundleDraft,
     operationTargetResolver: resolver,
-    actionFileTargetPath: (action) => typeof action.targetPath === 'string' ? action.targetPath : undefined,
+    actionFileTargetPath: (action) => actionInspector.actionFileTargetPath(action),
     fileTargetRefFromPath: (path) => ({ path }),
-    deleteActionTargetResourceKind: (action) => typeof action.targetKind === 'string' ? action.targetKind : undefined,
-    deleteActionRecursive: (action) => action.recursive === true,
+    deleteActionTargetResourceKind: (action) => actionInspector.deleteActionTargetResourceKind(action),
+    deleteActionRecursive: (action) => actionInspector.deleteActionRecursive(action),
     containsDirectoryPath: () => false,
     kernelExecutionContractId: (report) => typeof report?.contractId === 'string' ? report.contractId : undefined,
     proposalTargetScopes: (proposal, accepted) =>
@@ -5550,6 +5809,73 @@ function assertAcceptedPlanExecutorBuildsExecutionBatch(): void {
   assertEqual(action.targetRef.path, target, 'accepted plan executor fills targetRef path');
   assertEqual(block.targetPath, target, 'accepted plan executor normalizes codeBlock target path');
   assertEqual(normalized.batch.contractId, `contract-${token}`, 'accepted plan executor preserves kernel contract id');
+  const directoryTarget = `accepted-dir-${token}`;
+  const deleteAcceptedPlan: AcceptedImplementationPlanContext = {
+    planId: `delete-plan-${token}`,
+    runId: `delete-run-${token}`,
+    tasks: [{
+      taskId: `delete-task-${token}`,
+      title: 'Generic directory delete task',
+      targets: [directoryTarget],
+      capability: 'fs.delete',
+      dependencies: [],
+      conflictKeys: [],
+    }],
+    capabilities: ['fs.delete'],
+    targetScopes: [directoryTarget],
+    exactOperationGrants: [{
+      operation: 'delete',
+      targetPath: directoryTarget,
+      targetResourceKind: 'directory',
+      capability: 'fs.delete',
+      source: 'implementationPlan',
+      recursive: true,
+    }],
+    accessScopes: [],
+    batchIndex: 1,
+    completedTaskIds: [],
+    rawPlan: { id: `delete-plan-${token}` },
+  };
+  const deleteProposal = {
+    ...proposal,
+    proposalId: `delete-proposal-${token}`,
+    runId: deleteAcceptedPlan.runId,
+    payload: {
+      userPlan: 'Generic accepted directory delete batch.',
+      actionBundle: {
+        version: '1',
+        id: `delete-bundle-${token}`,
+        goal: 'Delete one accepted directory target.',
+        actions: [{
+          actionId: `delete-action-${token}`,
+          toolId: 'fs.delete',
+          args: { path: `./${directoryTarget}/` },
+        }],
+      },
+      codeBlocks: [],
+      commandBlocks: [],
+    },
+  } as ProposalEnvelope;
+  const deletePlan = executor.executionContext({
+    sessionId,
+    runId: deleteAcceptedPlan.runId,
+    acceptedPlan: deleteAcceptedPlan,
+    proposal: deleteProposal,
+    planReviewReport: { contractId: `delete-contract-${token}` },
+  });
+  const normalizedDelete = executor.normalizeKernelBatch({
+    planId: deleteAcceptedPlan.planId,
+    plan: deletePlan,
+    acceptedPlan: deleteAcceptedPlan,
+  });
+  assertEqual(normalizedDelete.ok, true, 'accepted plan executor normalizes toolId-only directory delete batch');
+  if (!normalizedDelete.ok) throw new Error(normalizedDelete.reasons.join('; '));
+  const deleteAction = (normalizedDelete.batch.actionBundle.actions as Array<Record<string, any>>)[0];
+  assertEqual(deleteAction.targetPath, directoryTarget, 'accepted plan executor normalizes directory delete action target');
+  assertEqual(deleteAction.targetKind, 'directory', 'accepted plan executor sets top-level directory target kind from grant');
+  assertEqual(deleteAction.recursive, true, 'accepted plan executor sets top-level recursive delete intent');
+  assertEqual(deleteAction.args?.targetKind, 'directory', 'accepted plan executor sets args directory target kind');
+  assertEqual(deleteAction.args?.recursive, true, 'accepted plan executor sets args recursive delete intent');
   const canonicalized = executor.canonicalizeAccessScopes(acceptedPlan, proposal);
   assertEqual(canonicalized.changed, true, 'accepted plan executor removes unsafe access scopes');
   assertEqual(canonicalized.actionTargets.includes(target), true, 'accepted plan executor preserves proposal action targets');
@@ -6117,6 +6443,64 @@ async function assertAcceptedPlanStaticSyntaxReviewCoordinatorBuildsEvents(): Pr
   assertEqual(payload.status, 'blocked', 'static syntax review marks issues as blocked');
   assertEqual(payload.messageKey, 'session.driver.acceptedPlanStaticSyntaxReviewBlocked', 'static syntax review event carries blocked i18n key');
   assertEqual(payload.issues?.[0]?.targetPath, targetPath, 'static syntax review event carries normalized issue target');
+}
+
+async function assertAcceptedPlanStaticSyntaxReviewCoordinatorTimesOut(): Promise<void> {
+  const token = randomSmokeToken('static-review-timeout');
+  const sessionId = `session-${token}`;
+  const runId = `run-${token}`;
+  const planId = `plan-${token}`;
+  const targetPath = `generated-${token}.ts`;
+  const coordinator = new AcceptedPlanStaticSyntaxReviewCoordinator({
+    now: () => `ts-${token}`,
+    createId: (prefix) => `${prefix}-${token}`,
+    staticSyntaxReviewTimeoutMs: 1,
+    emitProjectionDelta: async () => undefined,
+    runStaticSyntaxReview: async () => new Promise<string>(() => undefined),
+    event: (nextSessionId, kind, payload) => ({
+      id: `event-${token}`,
+      sessionId: nextSessionId,
+      ts: `ts-${token}`,
+      kind,
+      payload,
+    }),
+    reviewAssembler: {
+      staticSyntaxReviewPacket: () => ({
+        planId,
+        files: [{
+          targetPath,
+          language: 'typescript',
+          content: `const value${token.replace(/-/g, '')} = 1;`,
+          contentHash: `hash-${token}`,
+        }],
+      }),
+      staticSyntaxReviewMessages: () => [{
+        role: 'user',
+        content: `packet-${token}`,
+      }],
+      normalizeStaticSyntaxIssues: (value: unknown) => Array.isArray(value) ? value as Array<Record<string, unknown>> : [],
+    } as unknown as ReviewAssembler,
+  });
+
+  const events = await coordinator.run({
+    state: {
+      sessionId,
+      runId,
+      generatedArtifactEvidence: new Map(),
+      resourcePackets: [],
+    },
+    prompt: { stablePrefix: `stable-${token}`, messages: [] } as unknown as PromptEnvelope,
+    accepted: { planId } as unknown as AcceptedImplementationPlanContext,
+    batch: {},
+    batchEvents: [],
+  });
+
+  assertEqual(events.length, 1, 'static syntax review timeout still returns one workflow event');
+  const payload = events[0]?.payload as Record<string, any>;
+  assertEqual(payload.status, 'failed', 'static syntax review timeout is recorded as failed advisory check');
+  assertEqual(payload.messageKey, 'session.driver.acceptedPlanStaticSyntaxReviewFailed', 'static syntax review timeout keeps i18n key');
+  assertEqual(payload.issues?.[0]?.severity, 'warning', 'static syntax review timeout is downgraded to a warning issue');
+  assert(String(payload.issues?.[0]?.message ?? '').includes('timed out'), 'static syntax review timeout records the timeout reason');
 }
 
 function assertReviewAssemblerFormatsReviewFacts(): void {
@@ -16827,6 +17211,8 @@ async function assertSessionDriverLoopAcceptedImplementationPlanInfersDirectoryD
     },
     llmChat: async (): Promise<ApiResponse<LlmChatResult>> => {
       const proposal = deleteActionBundleProposal(normalizedDir) as any;
+      proposal.actionBundle.actions[0].args.targetKind = 'file';
+      proposal.actionBundle.actions[0].args.recursive = false;
       return jsonLlmResponse(proposal);
     },
     now: () => '2026-01-01T00:00:00.000Z',
@@ -16847,7 +17233,7 @@ async function assertSessionDriverLoopAcceptedImplementationPlanInfersDirectoryD
   assertEqual(
     result.events.some((event) => event.kind === 'error' && (event.payload as any).code === 'accepted_plan_action_batch_preflight_failed'),
     false,
-    'directory delete target with ResourceEvidence does not fail accepted-plan preflight'
+    'directory delete target with ResourceEvidence overrides stale file delete args before preflight'
   );
   assertEqual(submittedDeleteAction?.targetKind, 'directory', 'directory ResourceEvidence sets top-level directory targetKind');
   assertEqual(submittedDeleteAction?.targetResourceKind, 'directory', 'directory ResourceEvidence sets top-level directory targetResourceKind');
@@ -17398,6 +17784,14 @@ async function assertSessionDriverLoopAcceptedImplementationPlanContinuesUntilTa
   assert(
     terminalChangedFiles.includes('generic-one.txt') && terminalChangedFiles.includes('generic-two.txt'),
     'terminal accepted-plan review aggregates changed files from every executed task batch'
+  );
+  const terminalReviewLedger = terminalReviewPayload?.reviewFactsContext?.taskLedger;
+  assertEqual(
+    Array.isArray(terminalReviewLedger?.completedTaskIds) &&
+      terminalReviewLedger.completedTaskIds.includes('task-generic-one') &&
+      terminalReviewLedger.completedTaskIds.includes('task-generic-two'),
+    true,
+    'terminal accepted-plan review facts context uses the latest task checkpoint ledger'
   );
   assertEqual(
     result.events.some((event) =>

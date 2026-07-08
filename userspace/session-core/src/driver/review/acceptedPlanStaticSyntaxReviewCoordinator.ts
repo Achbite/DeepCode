@@ -27,6 +27,7 @@ export interface AcceptedPlanStaticSyntaxReviewInput<TState extends AcceptedPlan
 export interface AcceptedPlanStaticSyntaxReviewCoordinatorPorts<TState extends AcceptedPlanStaticSyntaxReviewState> {
   now(): string;
   createId(prefix: string): string;
+  staticSyntaxReviewTimeoutMs?: number;
   emitProjectionDelta(state: TState, delta: ProjectionDelta): Promise<void>;
   runStaticSyntaxReview(input: {
     profileId?: string;
@@ -72,7 +73,7 @@ export class AcceptedPlanStaticSyntaxReviewCoordinator<TState extends AcceptedPl
 
     let parsed: Record<string, unknown>;
     try {
-      const raw = await this.ports.runStaticSyntaxReview({
+      const reviewPromise = this.ports.runStaticSyntaxReview({
         profileId: input.profileId,
         state,
         stage: STATIC_SYNTAX_REVIEW_PROVIDER_STAGE,
@@ -83,6 +84,10 @@ export class AcceptedPlanStaticSyntaxReviewCoordinator<TState extends AcceptedPl
           packet,
         }),
       });
+      const timeoutMs = this.ports.staticSyntaxReviewTimeoutMs ?? 45_000;
+      const raw = timeoutMs > 0
+        ? await withTimeout(reviewPromise, timeoutMs)
+        : await reviewPromise;
       parsed = JSON.parse(raw) as Record<string, unknown>;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -139,4 +144,16 @@ export class AcceptedPlanStaticSyntaxReviewCoordinator<TState extends AcceptedPl
 
 function stringValue(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value : undefined;
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(`static syntax review timed out after ${timeoutMs} ms`));
+    }, timeoutMs);
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
 }

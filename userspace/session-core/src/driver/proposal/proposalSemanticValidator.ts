@@ -140,8 +140,8 @@ export class ProposalSemanticValidator {
       const record = objectRecord(block);
       const id = stringValue(record?.id) ?? stringValue(record?.blockId);
       const targetPath = stringValue(record?.targetPath) ?? stringValue(record?.path);
-      if (!id || !targetPath) return [];
-      return [{ id, targetPath: normalizePlanScope(targetPath) }];
+      if (!record || !id || !targetPath) return [];
+      return [{ id, targetPath: normalizePlanScope(targetPath), record }];
     });
     if (!blocks.length) return;
 
@@ -174,6 +174,87 @@ export class ProposalSemanticValidator {
         path: normalizedTarget,
         sourceBlockId: matches[0].id,
         reason: 'unique_codeBlock_targetPath_match',
+      });
+    }
+
+    for (const [index, action] of actions.entries()) {
+      const record = objectRecord(action);
+      if (!record) continue;
+      const capability = this.ports.actionEffectiveCapability(record);
+      const actionKind = stringValue(record.kind);
+      const patchLike = capability === 'fs.patch' || ['patch', 'replaceBlock', 'insertBefore', 'insertAfter'].includes(actionKind ?? '');
+      if (!patchLike) continue;
+      const args = objectRecord(record.args) ?? objectRecord(record.toolArgs);
+      const nextArgs = { ...(args ?? {}) };
+      const targetPath = this.ports.actionFileTargetPath(record);
+      const normalizedTarget = targetPath ? normalizePlanScope(targetPath) : '';
+      const explicitBlockId = stringValue(record.replacementBlockId)
+        ?? stringValue(nextArgs.replacementBlockId)
+        ?? stringValue(record.sourceBlockId)
+        ?? stringValue(nextArgs.sourceBlockId);
+      let block = explicitBlockId ? blocks.find((item) => item.id === explicitBlockId) : undefined;
+      if (!block && normalizedTarget) {
+        const matches = blocks.filter((item) => item.targetPath === normalizedTarget);
+        if (matches.length === 1) block = matches[0];
+      }
+
+      let changed = false;
+      const argsPatchSpec = objectRecord(nextArgs.patchSpec);
+      const recordPatchSpec = objectRecord(record.patchSpec);
+      let patchSpec = recordPatchSpec ?? argsPatchSpec;
+      if (!patchSpec) {
+        const diffText = stringValue(record.patchSpec)
+          ?? stringValue(nextArgs.patchSpec)
+          ?? blockText(block?.record);
+        const parsed = diffText ? parseSingleHunkUnifiedDiff(diffText) : undefined;
+        if (parsed) {
+          patchSpec = {
+            match: {
+              kind: 'exactBlock',
+              text: parsed.matchText,
+            },
+          };
+          if (block) {
+            block.record.content = parsed.replacementText;
+            block.record.contentLines = parsed.replacementText.split('\n');
+            block.record.operation = stringValue(block.record.operation) ?? 'patch';
+          }
+          changed = true;
+        }
+      }
+      if (patchSpec && !recordPatchSpec) {
+        record.patchSpec = patchSpec;
+        changed = true;
+      }
+      if (patchSpec && !argsPatchSpec) {
+        nextArgs.patchSpec = patchSpec;
+        changed = true;
+      }
+      if (block) {
+        const replacementBlockId = stringValue(record.replacementBlockId) ?? stringValue(nextArgs.replacementBlockId);
+        const sourceBlockId = stringValue(record.sourceBlockId) ?? stringValue(nextArgs.sourceBlockId);
+        if (!replacementBlockId && !sourceBlockId) {
+          record.replacementBlockId = block.id;
+          nextArgs.replacementBlockId = block.id;
+          changed = true;
+        } else if (!stringValue(record.replacementBlockId) && replacementBlockId) {
+          record.replacementBlockId = replacementBlockId;
+          changed = true;
+        } else if (!stringValue(record.sourceBlockId) && sourceBlockId) {
+          record.sourceBlockId = sourceBlockId;
+          changed = true;
+        }
+      }
+      if (!changed) continue;
+      record.args = nextArgs;
+      record.toolArgs = nextArgs;
+      fixes.push({
+        kind: 'fs_patch_shape_canonicalized',
+        actionIndex: index,
+        actionId: stringValue(record.actionId) ?? stringValue(record.id),
+        path: normalizedTarget,
+        replacementBlockId: stringValue(record.replacementBlockId),
+        reason: 'structured_patch_shape',
       });
     }
 
@@ -463,6 +544,49 @@ function stringArrayValue(value: unknown): string[] {
     return value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0).map((item) => item.trim());
   }
   return typeof value === 'string' && value.trim() ? [value.trim()] : [];
+}
+
+function blockText(block: Record<string, unknown> | undefined): string | undefined {
+  if (!block) return undefined;
+  const content = stringValue(block.content);
+  if (content) return content;
+  const lines = Array.isArray(block.contentLines)
+    ? block.contentLines.map((line) => typeof line === 'string' ? line : undefined)
+    : [];
+  return lines.every((line): line is string => line !== undefined) && lines.length
+    ? lines.join('\n')
+    : undefined;
+}
+
+function parseSingleHunkUnifiedDiff(value: string): { matchText: string; replacementText: string } | undefined {
+  const oldLines: string[] = [];
+  const newLines: string[] = [];
+  let changed = false;
+  for (const line of value.split(/\r?\n/)) {
+    if (!line || line.startsWith('---') || line.startsWith('+++') || line.startsWith('@@')) continue;
+    if (line.startsWith('-')) {
+      oldLines.push(line.slice(1));
+      changed = true;
+      continue;
+    }
+    if (line.startsWith('+')) {
+      newLines.push(line.slice(1));
+      changed = true;
+      continue;
+    }
+    if (line.startsWith(' ')) {
+      oldLines.push(line.slice(1));
+      newLines.push(line.slice(1));
+      continue;
+    }
+    oldLines.push(line);
+    newLines.push(line);
+  }
+  if (!changed || !oldLines.length || !newLines.length) return undefined;
+  return {
+    matchText: oldLines.join('\n'),
+    replacementText: newLines.join('\n'),
+  };
 }
 
 function normalizePlanScope(value: string): string {
