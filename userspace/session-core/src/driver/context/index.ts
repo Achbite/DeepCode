@@ -7,6 +7,7 @@ export * from './generatedArtifactEvidenceIndex.js';
 export * from './pathIdentity.js';
 export * from './providerContextSupport.js';
 export * from './providerTurnContextCoordinator.js';
+export * from './providerSideCallContextAdmission.js';
 export * from './providerTurnPromptRenderer.js';
 export * from './providerTurnSnapshot.js';
 export * from './resourceEvidenceIndex.js';

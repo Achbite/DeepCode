@@ -6,6 +6,8 @@ import type {
 } from '../../prompt/ProviderRepairMessageBuilder.js';
 import type { PromptEnvelope } from '../../prompt/types.js';
 import type { AcceptedPlanBatchValidationResult } from '../../accepted-plan/types.js';
+import type { ContextFrameBuilder } from '../context/contextFrameBuilder.js';
+import { prepareProviderSideCallMessagesContextAdmission } from '../context/providerSideCallContextAdmission.js';
 
 export interface AcceptedPlanScopeRepairCoordinatorState {
   sessionId: string;
@@ -20,7 +22,9 @@ export interface AcceptedPlanScopeRepairParseError {
 
 export interface AcceptedPlanScopeRepairCoordinatorInput<State extends AcceptedPlanScopeRepairCoordinatorState> {
   repairMessageBuilder: ProviderRepairMessageBuilder;
+  contextFrameBuilder: ContextFrameBuilder;
   repairState(state: State): ProviderRepairMessageState;
+  createId(prefix: string): string;
   parseError(error: unknown): AcceptedPlanScopeRepairParseError;
   createError(code: string, message: string): Error;
   parseRepairedProposal(input: {
@@ -44,20 +48,31 @@ export class AcceptedPlanScopeRepairCoordinator<
   constructor(private readonly input: AcceptedPlanScopeRepairCoordinatorInput<State>) {}
 
   async repair(runInput: AcceptedPlanScopeRepairRunInput<State>): Promise<ProposalEnvelope> {
-    const raw = await runInput.runRepair(
-      'accepted_plan_scope_repair',
-      this.input.repairMessageBuilder.acceptedPlanScopeRepairMessages(
-        runInput.prompt,
-        this.input.repairState(runInput.state),
-        runInput.proposal,
-        runInput.validation.reasons
-      )
+    const allowedKinds = ['actionBundle', 'resourceRequest', 'decisionRequest', 'taskOutcome', 'diagnostic'];
+    const messages = this.input.repairMessageBuilder.acceptedPlanScopeRepairMessages(
+      runInput.prompt,
+      this.input.repairState(runInput.state),
+      runInput.proposal,
+      runInput.validation.reasons
     );
+    const admission = prepareProviderSideCallMessagesContextAdmission({
+      state: runInput.state,
+      prompt: runInput.prompt,
+      contextFrameBuilder: this.input.contextFrameBuilder,
+      contractId: this.input.createId('provider-turn-contract-accepted-plan-scope-repair'),
+      turnMode: 'scopeIntervention',
+      allowedKinds,
+      messages,
+      repairPolicy: 'deterministicIntervention',
+      projectionVisibility: 'developerOnly',
+      nextActionInstruction: `Repair the current accepted task scope issue only. Return one of: ${allowedKinds.join(', ')}.`,
+    });
+    const raw = await runInput.runRepair('accepted_plan_scope_repair', admission.messages);
     try {
       return this.input.parseRepairedProposal({
         raw,
         state: runInput.state,
-        allowedKinds: ['actionBundle', 'resourceRequest', 'decisionRequest', 'taskOutcome', 'diagnostic'],
+        allowedKinds,
       });
     } catch (error) {
       throw this.input.createError(

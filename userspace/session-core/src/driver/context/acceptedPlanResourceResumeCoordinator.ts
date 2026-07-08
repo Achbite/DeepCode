@@ -21,6 +21,7 @@ import type {
 import type { PromptEnvelope } from '../../prompt/types.js';
 import type { DriverProviderTurnFrame } from '../runFrame.js';
 import type { ContextFrameBuilder } from './contextFrameBuilder.js';
+import { prepareProviderSideCallContextAdmission } from './providerSideCallContextAdmission.js';
 
 export interface AcceptedPlanResourceResumeCoordinatorState {
   sessionId: string;
@@ -82,15 +83,13 @@ export class AcceptedPlanResourceResumeCoordinator<
   constructor(private readonly input: AcceptedPlanResourceResumeCoordinatorInput<State>) {}
 
   async run(runInput: AcceptedPlanResourceResumeRunInput<State>): Promise<ProposalEnvelope> {
-    const messages = this.messages(runInput);
-    const contract = this.contract(runInput);
-    runInput.state.providerTurnFrame = contract;
+    const admission = this.contextAdmission(runInput);
     const providerResult = await runInput.callProposalOnly({
       state: runInput.state,
-      prompt: runInput.prompt,
-      contract,
+      prompt: admission.prompt,
+      contract: admission.contract,
       stage: 'accepted_plan_resource_resume',
-      messages,
+      messages: admission.messages,
     });
     if (typeof providerResult !== 'string') return providerResult;
 
@@ -129,38 +128,39 @@ export class AcceptedPlanResourceResumeCoordinator<
     }
   }
 
-  private messages(runInput: AcceptedPlanResourceResumeRunInput<State>): LlmChatRequest['messages'] {
-    return [
-      { role: 'system', content: runInput.prompt.stablePrefix },
-      {
-        role: 'user',
-        content: this.input.promptBuilder.render({
-          repairState: this.input.repairState(runInput.state),
-          acceptedPlan: runInput.state.acceptedImplementationPlan,
-          cursor: runInput.state.taskExecutionCursor,
-          currentTask: runInput.state.currentTaskContext,
-          requestProposal: runInput.requestProposal,
-          packet: runInput.packet,
-        }),
-      },
-    ];
-  }
-
-  private contract(runInput: AcceptedPlanResourceResumeRunInput<State>): DriverProviderTurnFrame {
-    return this.input.contextFrameBuilder.buildSessionProviderTurnContract({
+  private contextAdmission(runInput: AcceptedPlanResourceResumeRunInput<State>): {
+    prompt: PromptEnvelope;
+    contract: DriverProviderTurnFrame;
+    messages: LlmChatRequest['messages'];
+  } {
+    const dynamicContent = this.input.promptBuilder.render({
+      repairState: this.input.repairState(runInput.state),
+      acceptedPlan: runInput.state.acceptedImplementationPlan,
+      cursor: runInput.state.taskExecutionCursor,
+      currentTask: runInput.state.currentTaskContext,
+      requestProposal: runInput.requestProposal,
+      packet: runInput.packet,
+    });
+    const admission = prepareProviderSideCallContextAdmission({
+      state: runInput.state,
+      prompt: runInput.prompt,
+      contextFrameBuilder: this.input.contextFrameBuilder,
       contractId: this.input.createId('provider-turn-contract-resource-resume'),
-      sessionId: runInput.state.sessionId,
-      runId: runInput.state.runId,
       turnMode: 'resourceResume',
       allowedKinds: [...ACCEPTED_PLAN_RESOURCE_RESUME_ALLOWED_KINDS],
-      prompt: runInput.prompt,
+      dynamicContent,
       contextAssembly: runInput.state.contextAssembly,
       userRequest: runInput.userRequest,
-      acceptedPlanActive: Boolean(runInput.state.acceptedImplementationPlan),
       currentTaskContext: runInput.state.currentTaskContext,
       resourcePackets: runInput.state.resourcePackets,
       generatedArtifactCount: runInput.state.generatedArtifactEvidence.size,
+      repairPolicy: 'diagnosticOnly',
       nextActionInstruction: `Use the newly resolved ResourcePacket for the current accepted task. Return one of: ${ACCEPTED_PLAN_RESOURCE_RESUME_ALLOWED_KINDS.join(', ')}.`,
     });
+    return {
+      prompt: admission.prompt,
+      contract: admission.contract,
+      messages: admission.messages,
+    };
   }
 }

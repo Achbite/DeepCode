@@ -498,7 +498,9 @@ export class SessionDriverLoop {
     });
     this.acceptedPlanScopeRepairCoordinator = new AcceptedPlanScopeRepairCoordinator<SessionDriverLoopRunState>({
       repairMessageBuilder: providerRepairMessageBuilder,
+      contextFrameBuilder,
       repairState: (state) => providerContextSupport.repairMessageState(state),
+      createId: (prefix) => this.agentRunReactor.id(prefix),
       parseError: (error) => driverParseErrorCatalog.normalize(error),
       createError: (code, message) => new SessionDriverLoopError(code, message),
       parseRepairedProposal: ({ raw, state, allowedKinds }) => protocolGate().parseAndValidateRepairedProposal({
@@ -758,7 +760,9 @@ export class SessionDriverLoop {
     });
     this.actionBundleAdmissionRepairCoordinator = new ActionBundleAdmissionRepairCoordinator<SessionDriverLoopRunState>({
       repairMessageBuilder: providerRepairMessageBuilder,
+      contextFrameBuilder,
       repairState: (state) => providerContextSupport.repairMessageState(state),
+      createId: (prefix) => this.agentRunReactor.id(prefix),
       parseError: (error) => driverParseErrorCatalog.normalize(error),
       createError: (code, message) => new SessionDriverLoopError(code, message),
       parseRepairedProposal: ({ raw, state, allowedKinds }) => protocolGate().parseAndValidateRepairedProposal({ raw, runId: state.runId, sessionId: state.sessionId, source: 'llm', allowedKinds }),
@@ -1016,7 +1020,9 @@ export class SessionDriverLoop {
     });
     this.resourceRequestRepairCoordinator = new ResourceRequestRepairCoordinator<SessionDriverLoopRunState>({
       repairMessageBuilder: providerRepairMessageBuilder,
+      contextFrameBuilder,
       repairState: (state) => providerContextSupport.repairMessageState(state),
+      createId: (prefix) => this.agentRunReactor.id(prefix),
       parseError: (error) => driverParseErrorCatalog.normalize(error),
       createError: (code, message) => new SessionDriverLoopError(code, message),
       parseRepairedProposal: ({ raw, state, allowedKinds }) => protocolGate().parseAndValidateRepairedProposal({

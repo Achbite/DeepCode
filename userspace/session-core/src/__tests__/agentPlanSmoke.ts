@@ -4369,10 +4369,28 @@ async function assertAcceptedPlanResourceResumeCoordinatorBuildsProviderTurn(): 
     resumeUserPrompt.includes('For kind="actionBundle", put userPlanMarkdown, codeBlocks, and actionBundle directly on the top-level JSON object'),
     'resource resume prompt shows the required top-level actionBundle shape'
   );
+  assert(
+    resumeUserPrompt.includes('ProviderTurnContract:'),
+    'resource resume prompt is rendered through the shared ProviderTurnContract prompt renderer'
+  );
+  assert(
+    resumeUserPrompt.includes('"turnMode": "resourceResume"'),
+    'resource resume prompt exposes the driver ProviderTurnContract turn mode'
+  );
   assertEqual(
     (state as { providerTurnFrame?: { turnMode?: string } }).providerTurnFrame?.turnMode,
     'resourceResume',
     'resource resume coordinator stores provider turn contract on state'
+  );
+  assertEqual(
+    (state as { modelContextBundle?: { providerTurnContract?: { turnMode?: string } } }).modelContextBundle?.providerTurnContract?.turnMode,
+    'resourceResume',
+    'resource resume coordinator stores ModelContextBundle on state'
+  );
+  assertEqual(
+    (state as { providerTurnFrame?: { snapshot?: { finalUserPromptCharLength?: number } } }).providerTurnFrame?.snapshot?.finalUserPromptCharLength,
+    resumeUserPrompt.length,
+    'resource resume snapshot tracks the actual final user prompt length'
   );
   assertEqual(proposal.kind, 'diagnostic', 'resource resume coordinator parses provider proposal');
 }
@@ -4730,12 +4748,14 @@ async function assertResourceRequestRepairCoordinatorRepairsProposal(): Promise<
   const repairBuilder = new ProviderRepairMessageBuilder();
   const coordinator = new ResourceRequestRepairCoordinator({
     repairMessageBuilder: repairBuilder,
+    contextFrameBuilder: new ContextFrameBuilder(),
     repairState: (state) => ({
       runId: state.runId,
       userRequest: state.userRequest,
       conversationRoots: [],
       resourcePackets: [],
     }),
+    createId: (prefix) => `${prefix}-${token}`,
     parseError: (error) => error instanceof Error
       ? { code: 'error', message: error.message }
       : { code: 'error', message: String(error) },
@@ -4805,6 +4825,16 @@ async function assertResourceRequestRepairCoordinatorRepairsProposal(): Promise<
   });
   assertEqual(observedStage, 'resource_request_repair', 'resource request repair coordinator uses stable repair stage');
   assertEqual(observedMessages[0]?.role, 'system', 'resource request repair coordinator sends system repair contract');
+  const resourceRepairPrompt = observedMessages.find((message) => message.role === 'user')?.content ?? '';
+  assert(
+    resourceRepairPrompt.includes('ProviderTurnContract:') && resourceRepairPrompt.includes('"turnMode": "protocolRepair"'),
+    'resource request repair coordinator renders side-call ProviderTurnContract'
+  );
+  assertEqual(
+    (state as { modelContextBundle?: { providerTurnContract?: { turnMode?: string } } }).modelContextBundle?.providerTurnContract?.turnMode,
+    'protocolRepair',
+    'resource request repair coordinator stores ModelContextBundle on state'
+  );
   assertEqual(proposal.kind, 'diagnostic', 'resource request repair coordinator parses repaired proposal');
 }
 
@@ -4815,12 +4845,14 @@ async function assertActionBundleAdmissionRepairCoordinatorRepairsProposal(): Pr
   const repairBuilder = new ProviderRepairMessageBuilder();
   const coordinator = new ActionBundleAdmissionRepairCoordinator({
     repairMessageBuilder: repairBuilder,
+    contextFrameBuilder: new ContextFrameBuilder(),
     repairState: (state) => ({
       runId: state.runId,
       userRequest: state.userRequest,
       conversationRoots: [],
       resourcePackets: [],
     }),
+    createId: (prefix) => `${prefix}-${token}`,
     parseError: (error) => error instanceof Error
       ? { code: 'error', message: error.message }
       : { code: 'error', message: String(error) },
@@ -4896,6 +4928,16 @@ async function assertActionBundleAdmissionRepairCoordinatorRepairsProposal(): Pr
   });
   assertEqual(observedStage, 'action_bundle_admission_repair', 'action bundle admission repair coordinator uses stable repair stage');
   assertEqual(observedMessages[0]?.role, 'system', 'action bundle admission repair coordinator sends system repair contract');
+  const admissionRepairPrompt = observedMessages.find((message) => message.role === 'user')?.content ?? '';
+  assert(
+    admissionRepairPrompt.includes('ProviderTurnContract:') && admissionRepairPrompt.includes('"turnMode": "protocolRepair"'),
+    'action bundle admission repair coordinator renders side-call ProviderTurnContract'
+  );
+  assertEqual(
+    (state as { modelContextBundle?: { providerTurnContract?: { turnMode?: string } } }).modelContextBundle?.providerTurnContract?.turnMode,
+    'protocolRepair',
+    'action bundle admission repair coordinator stores ModelContextBundle on state'
+  );
   assertEqual(proposal.kind, 'diagnostic', 'action bundle admission repair coordinator parses repaired proposal');
 }
 
@@ -5547,6 +5589,7 @@ async function assertAcceptedPlanScopeRepairCoordinatorRepairsProposal(): Promis
   const repairBuilder = new ProviderRepairMessageBuilder();
   const coordinator = new AcceptedPlanScopeRepairCoordinator({
     repairMessageBuilder: repairBuilder,
+    contextFrameBuilder: new ContextFrameBuilder(),
     repairState: (state) => ({
       runId: state.runId,
       userRequest: state.userRequest,
@@ -5558,6 +5601,7 @@ async function assertAcceptedPlanScopeRepairCoordinatorRepairsProposal(): Promis
         currentTask: `task-${token}`,
       },
     }),
+    createId: (prefix) => `${prefix}-${token}`,
     parseError: (error) => error instanceof Error
       ? { code: 'error', message: error.message }
       : { code: 'error', message: String(error) },
@@ -5629,6 +5673,16 @@ async function assertAcceptedPlanScopeRepairCoordinatorRepairsProposal(): Promis
   });
   assertEqual(observedStage, 'accepted_plan_scope_repair', 'accepted plan scope repair coordinator uses stable repair stage');
   assertEqual(observedMessages[0]?.role, 'system', 'accepted plan scope repair coordinator sends system repair contract');
+  const scopeRepairPrompt = observedMessages.find((message) => message.role === 'user')?.content ?? '';
+  assert(
+    scopeRepairPrompt.includes('ProviderTurnContract:') && scopeRepairPrompt.includes('"turnMode": "scopeIntervention"'),
+    'accepted plan scope repair coordinator renders side-call ProviderTurnContract'
+  );
+  assertEqual(
+    (state as { modelContextBundle?: { providerTurnContract?: { turnMode?: string } } }).modelContextBundle?.providerTurnContract?.turnMode,
+    'scopeIntervention',
+    'accepted plan scope repair coordinator stores ModelContextBundle on state'
+  );
   assertEqual(proposal.kind, 'diagnostic', 'accepted plan scope repair coordinator parses repaired proposal');
 }
 

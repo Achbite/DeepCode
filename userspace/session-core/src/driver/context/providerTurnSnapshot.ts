@@ -17,6 +17,8 @@ export function buildProviderTurnSnapshot(contract: DriverProviderTurnFrame): Pr
   const renderedContract = JSON.stringify(buildProviderTurnContractPayload(contract, contract.prompt.dynamicSuffix));
   const finalUserPrompt = renderProviderTurnUserPrompt(contract.prompt.dynamicSuffix, contract);
   const contextAssembly = contract.contextAssembly;
+  const stablePrefixHash = stableHash(contract.prompt.stablePrefix);
+  const dynamicSuffixHash = stableHash(contract.prompt.dynamicSuffix);
   const frames = contract.frames.map((frame, index) => snapshotFrame(frame, index, contract.prompt.dynamicSuffix));
   const dynamicDialogueSummary = contract.frames.find((frame) => frame.kind === 'DynamicDialogue')?.summary ?? '';
   const frameText = contract.frames.map((frame) => [frame.use, frame.summary ?? ''].join('\n')).join('\n');
@@ -35,8 +37,8 @@ export function buildProviderTurnSnapshot(contract: DriverProviderTurnFrame): Pr
     requiredKind: contract.requiredKind,
     repairPolicy: contract.repairPolicy,
     projectionVisibility: contract.projectionVisibility,
-    stablePrefixHash: contextAssembly?.stablePrefixHash ?? stableHash(contract.prompt.stablePrefix),
-    dynamicSuffixHash: contextAssembly?.dynamicSuffixHash ?? stableHash(contract.prompt.dynamicSuffix),
+    stablePrefixHash,
+    dynamicSuffixHash,
     stablePrefixCharLength: contract.prompt.stablePrefix.length,
     dynamicSuffixCharLength: contract.prompt.dynamicSuffix.length,
     finalUserPromptHash: stableHash(finalUserPrompt),
