@@ -70,7 +70,7 @@ export class AcceptedPlanResourceResumePromptBuilder {
       `Return exactly one Agent Protocol v3 proposal: ${ACCEPTED_PLAN_RESOURCE_RESUME_ALLOWED_KINDS.join(', ')}.`,
       ...resourceResumeProposalShapeLines(),
       resourceRequestProtocolShapeLine(),
-      'Prefer actionBundle if the just-resolved evidence is sufficient for an edit task. If the current task is already sufficiently satisfied and no Kernel action is needed, return a taskOutcome object. If more evidence is needed, request only a different focused resource. If scope is insufficient, return decisionRequest.',
+      'Prefer actionBundle if the just-resolved evidence is sufficient for an edit task. If the current task is already sufficiently satisfied and no Kernel action is needed, return a taskOutcome object. If more evidence is needed, request only a different focused resource. If a concrete operation exceeds accepted scope, Session and Kernel will interrupt for user approval after proposal validation.',
       acceptedPlan ? `Accepted plan progress: planId=${acceptedPlan.planId}; completedTaskCount=${acceptedPlan.completedTaskIds.length}; remainingTaskCount=${acceptedPlan.tasks.filter((task) => !acceptedPlan.completedTaskIds.includes(task.taskId)).length}.` : '',
       cursor ? `TaskExecutionCursor: currentTaskId=${cursor.currentTaskId ?? 'none'}; completedTaskCount=${cursor.completedTaskIds.length}; lastResourcePackets=${cursor.lastResourcePacketIds.join(', ') || 'none'}.` : '',
       currentTask ? `CurrentTaskGoal: ${currentTask.goal}` : '',

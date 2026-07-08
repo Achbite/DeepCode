@@ -93,9 +93,9 @@ export interface AcceptedPlanScopeResourceFollowupRunInput<
 const ACCEPTED_PLAN_SCOPE_RESOURCE_FOLLOWUP_GUIDANCE = [
   'Session has resolved the read-only search/read evidence required for the current edit.',
   'Use the ResourcePacket evidence to continue the same accepted taskPlan cursor.',
-  'If evidence is sufficient and the current task remains in scope, output the next actionBundle.',
+  'If evidence is sufficient, output the next actionBundle with concrete operation intent.',
   'If evidence is still missing, output a focused resourceRequest.',
-  'If scope must expand, output decisionRequest instead of guessing.',
+  'If a concrete operation exceeds accepted scope, Session and Kernel will interrupt for user approval after proposal validation.',
   'Write user-visible proposal fields in the current user request language; keep protocol keys, toolIds, paths, and evidence refs unchanged.',
 ].join('\n');
 

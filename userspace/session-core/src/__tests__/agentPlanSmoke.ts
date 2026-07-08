@@ -75,7 +75,7 @@ import {
   RepairLoop,
 } from '../driver/execution/index.js';
 import { InteractionOverlayCodec, NativeToolExposurePolicy, NativeToolHandlerPortsFactory, NativeToolProgressEventBuilder, NativeToolProviderLoop, NativeToolProjectionBuilder, NativeToolRepairCoordinator, NativeToolRepairRunner, NativeToolResourceRecorder, NativeToolResultMessageBuilder, NativeToolResumeMessageBuilder, PermissionPipeline, ProposalOnlyProviderRunner, ProviderJsonModeCoordinator, ProviderPipeline, ProviderStreamCoordinator, ProviderStreamRuntime, ProviderToolCallBuffer, ProviderTraceRecorder, ProviderTurnRunner, UserGuidanceQueue, UserInputPipeline } from '../driver/pipelines/index.js';
-import { ActionBundleActionInspector, PlanContextIndex, PlanInteractionIndex, PlanReviewGrantProjector, PlanReviewReportAnalyzer, ProposalSemanticValidator, ProtocolGate } from '../driver/proposal/index.js';
+import { ActionBundleActionInspector, ActionProposalSubmitter, PlanContextIndex, PlanInteractionIndex, PlanReviewGrantProjector, PlanReviewReportAnalyzer, ProposalSemanticValidator, ProtocolGate } from '../driver/proposal/index.js';
 import { AssistantProjectionBuilder, DriverActivityBuilder, KernelEventProjectionBuilder, PlanProjectionBuilder, RequirementProjectionBuilder, ReviewProjectionBuilder, SessionFailureProjectionBuilder, SessionProgressProjectionBuilder, VISIBLE_REASONING_MAX_CHARS } from '../driver/projection/index.js';
 import { AcceptedPlanReviewHandoffCoordinator, AcceptedPlanStaticSyntaxReviewCoordinator, ReviewAssembler, ReviewDecisionProjectionBuilder } from '../driver/review/index.js';
 import { PermissionDecisionHandler, PlanDecisionHandler, RequirementDecisionHandler, ReviewDecisionHandler } from '../driver/interactions/index.js';
@@ -106,6 +106,7 @@ async function main(): Promise<void> {
   assertProviderRepairMessageBuilderScopesNativeRepairReferences();
   assertProtocolGateCanonicalizesBareRepair();
   assertActionBundleActionInspectorReadsActionShape();
+  await assertActionProposalSubmitterRoutesAcceptedTaskOutcomeInternally();
   assertProposalSemanticValidatorRejectsRootScopeTaskTargets();
   assertPathIdentityNormalizesWorkspacePaths();
   assertNativeToolRepairCoordinatorBuildsRepairContracts();
@@ -761,7 +762,7 @@ function assertProviderTurnSnapshotRecordsContextAdmissionShape(): void {
   assert(accessSummary.includes(`ref=file-${token}.txt`), 'provider turn access index records resource identity');
   assert(accessSummary.includes('range=full-or-directory'), 'provider turn access index records resource range identity');
   assert(accessSummary.includes('use=file text is available'), 'provider turn access index records file text reuse instruction');
-  assert(accessSummary.includes('use=directory inventory is available'), 'provider turn access index records directory inventory reuse instruction');
+  assert(accessSummary.includes('use=directory inventory is available for existence checks and taskPlan targets'), 'provider turn access index uses shared directory inventory reuse instruction');
   const snapshot = buildProviderTurnSnapshot(contract);
   assertEqual(snapshot.schemaVersion, 'deepcode.session.provider-turn-snapshot.v1', 'provider turn snapshot has schema version');
   assertEqual(snapshot.segmentOrder.length > 0, true, 'provider turn snapshot records segment order');
@@ -1055,7 +1056,7 @@ async function assertProviderTurnContextCoordinatorScopesAcceptedExecutionCatalo
 
 async function assertProviderTurnContextCoordinatorFiltersUnscopedGrantsToCurrentTask(): Promise<void> {
   const token = randomSmokeToken('provider-context-current-task-grants');
-  const currentTarget = `current-${randomSmokeToken('file')}.txt`;
+  const currentTarget = `Current-${randomSmokeToken('file')}/CaseFile-${randomSmokeToken('target')}.TXT`;
   const futureTarget = `future-${randomSmokeToken('file')}.txt`;
   let assemblyCapabilitySummary = '';
   const coordinator = new ProviderTurnContextCoordinator<any>({
@@ -1265,6 +1266,100 @@ function assertActionBundleActionInspectorReadsActionShape(): void {
   );
 }
 
+async function assertActionProposalSubmitterRoutesAcceptedTaskOutcomeInternally(): Promise<void> {
+  const token = randomSmokeToken('task-outcome-submit');
+  const sessionId = `session-${token}`;
+  const runId = `run-${token}`;
+  const fallback = genericSessionResult(sessionId);
+  let acceptedSubmitCalls = 0;
+  let kernelSubmitCalls = 0;
+  const unexpected = (label: string): never => {
+    throw new Error(`taskOutcome route should not call ${label}`);
+  };
+  const submitter = new ActionProposalSubmitter<any, any>({
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${token}`,
+    append: async () => fallback,
+    appendProjectedKernelEvents: async () => fallback,
+    readActionBundle: () => undefined,
+    actionBundleAdmissionBatch: () => unexpected('actionBundleAdmissionBatch'),
+    deleteAdmissionReasons: () => unexpected('deleteAdmissionReasons'),
+    repairActionBundleAdmission: async () => unexpected('repairActionBundleAdmission'),
+    submitAcceptedPlanActionProposal: async () => {
+      acceptedSubmitCalls += 1;
+      return fallback;
+    },
+    submitProposal: async () => {
+      kernelSubmitCalls += 1;
+      return { ok: true, events: [] };
+    },
+    findReviewReport: () => undefined,
+    appendTrace: async () => undefined,
+    needsRepair: () => false,
+    denied: () => false,
+    diagnosticSummary: () => '',
+    buildRepairMessages: () => [],
+    runRepair: async () => unexpected('runRepair'),
+    parseRepairedProposal: () => unexpected('parseRepairedProposal'),
+    repairErrorMessage: (error) => String(error),
+    thinkingEvent: (eventSessionId, content, ts, id) => ({
+      id,
+      sessionId: eventSessionId,
+      ts,
+      kind: 'assistant_msg',
+      payload: { content },
+    }),
+    finalDiagnosticEvent: (eventSessionId, content, ts, id) => ({
+      id,
+      sessionId: eventSessionId,
+      ts,
+      kind: 'assistant_msg',
+      payload: { content },
+    }),
+    answerEvent: (eventSessionId, proposal, ts, id) => ({
+      id,
+      sessionId: eventSessionId,
+      ts,
+      kind: 'assistant_msg',
+      payload: { proposal },
+    }),
+    planCardEvent: () => unexpected('planCardEvent'),
+    sessionRunStateEvent: () => unexpected('sessionRunStateEvent'),
+    diagnostic: (code, fallbackMessage, params) => ({ code, fallback: fallbackMessage, params }),
+  });
+  await submitter.submit(
+    { profileId: `profile-${token}` },
+    {
+      sessionId,
+      runId,
+      resourcePackets: [],
+      acceptedImplementationPlan: { planId: `plan-${token}` },
+      planReviewRepairAttempted: false,
+    },
+    {} as PromptEnvelope,
+    {
+      schemaVersion: 'deepcode.agent.protocol.v3',
+      proposalId: `proposal-${token}`,
+      runId,
+      sessionId,
+      source: 'llm',
+      kind: 'taskOutcome',
+      payload: {
+        version: '1',
+        id: `outcome-${token}`,
+        taskId: `task-${token}`,
+        status: 'modelJudgedSufficient',
+        reason: `Current task is already satisfied ${token}.`,
+      },
+      referencedResourcePacketRefs: [],
+      referencedEvidenceRefs: [],
+    } as ProposalEnvelope,
+    fallback
+  );
+  assertEqual(acceptedSubmitCalls, 1, 'accepted taskOutcome is routed to the accepted-plan submitter');
+  assertEqual(kernelSubmitCalls, 0, 'accepted taskOutcome is not submitted to Kernel proposal decoding');
+}
+
 function assertProposalSemanticValidatorRejectsRootScopeTaskTargets(): void {
   const token = randomSmokeToken('root-task-target');
   const inspector = new ActionBundleActionInspector();
@@ -1356,6 +1451,7 @@ function assertPathIdentityNormalizesWorkspacePaths(): void {
   const root = `scope-${token}`;
   const child = `child-${randomSmokeToken('child')}`;
   const file = `file-${randomSmokeToken('file')}.txt`;
+  const mixedCase = `Case-${randomSmokeToken('dir')}/MiXeD-${randomSmokeToken('file')}.TXT`;
   const identity = new PathIdentity();
 
   assertEqual(
@@ -1372,6 +1468,11 @@ function assertPathIdentityNormalizesWorkspacePaths(): void {
     identity.comparablePath(`${root}//${child}/`),
     `${root}/${child}`,
     'path identity compares paths without trailing slash'
+  );
+  assertEqual(
+    identity.comparablePath(`${mixedCase}/`),
+    mixedCase,
+    'path identity preserves path casing while comparing slash-normalized paths'
   );
   assertEqual(
     identity.normalizePlanScope(`./${root}//${child}/`),
@@ -8310,6 +8411,10 @@ function assertPlanReviewGrantProjectorBuildsExecutionReadModels(): void {
   const token = randomSmokeToken('plan-review-grants');
   const fileTarget = `dir-${token}/file-${token}.txt`;
   const directoryTarget = `dir-${token}/`;
+  const mixedDirectory = `CaseDir-${randomSmokeToken('dir')}`;
+  const mixedFileTarget = `${mixedDirectory}/MiXeD-${randomSmokeToken('file')}.TXT`;
+  const mixedRoot = `/tmp/Root-${randomSmokeToken('root')}`;
+  const mixedAbsoluteTarget = `${mixedRoot}/${mixedFileTarget}`;
   const projector = new PlanReviewGrantProjector();
   const report = {
     permissionGaps: ['fs.write', 'fs.delete'],
@@ -8373,6 +8478,32 @@ function assertPlanReviewGrantProjectorBuildsExecutionReadModels(): void {
     projector.concreteFileOperationTarget(`./${fileTarget}`),
     fileTarget,
     'grant projector normalizes concrete file operation targets'
+  );
+  const mixedCaseGrants = projector.exactOperationGrantsFromImplementationPlan({
+    tasks: [{
+      taskId: `task-${token}`,
+      capability: 'fs.write',
+      fileOperations: [{
+        operation: 'write',
+        capability: 'fs.write',
+        targetPath: mixedAbsoluteTarget,
+      }],
+    }],
+  }, {
+    ref: mixedRoot,
+    source: 'recentAttachment',
+    attachment: {
+      kind: 'directory',
+      path: mixedRoot,
+      absolutePath: mixedRoot,
+      source: 'userSelected',
+      scope: 'message',
+    },
+  });
+  assertEqual(
+    mixedCaseGrants[0]?.targetPath,
+    mixedFileTarget,
+    'grant projector preserves target path casing when stripping execution root'
   );
 }
 
@@ -9519,6 +9650,80 @@ function assertActionBundleProtocolFields(): void {
     'Session parser derives missing actionBundle.goal from top-level userPlanMarkdown'
   );
 
+  const targetHintToken = randomSmokeToken('block-target');
+  const targetHintPath = `targets/${targetHintToken}.txt`;
+  const targetHintBlockId = `block-${targetHintToken}`;
+  const targetHintRaw = providerFacingWriteProposalWithoutMachineIds() as any;
+  targetHintRaw.codeBlocks[0] = {
+    blockId: targetHintBlockId,
+    language: 'text',
+    contentLines: [`content-${targetHintToken}`],
+  };
+  targetHintRaw.actionBundle.actions[0].args = { path: targetHintPath, sourceBlockId: targetHintBlockId };
+  const targetHintProposal = parseProposalEnvelope({
+    runId: `run-${targetHintToken}`,
+    sessionId: `session-${targetHintToken}`,
+    raw: targetHintRaw,
+  });
+  assertEqual(
+    (targetHintProposal.payload as any).codeBlocks[0].targetPath,
+    targetHintPath,
+    'Session parser infers missing codeBlock targetPath from the matching fs.write action block reference'
+  );
+
+  const contentLinesStringToken = randomSmokeToken('content-lines-string');
+  const contentLinesStringRaw = providerFacingWriteProposalWithoutMachineIds() as any;
+  contentLinesStringRaw.codeBlocks[0] = {
+    blockId: `block-${contentLinesStringToken}`,
+    targetPath: `targets/${contentLinesStringToken}.txt`,
+    language: 'text',
+    contentLines: `line-a-${contentLinesStringToken}\nline-b-${contentLinesStringToken}`,
+  };
+  contentLinesStringRaw.actionBundle.actions[0].args = {
+    path: `targets/${contentLinesStringToken}.txt`,
+    sourceBlockId: `block-${contentLinesStringToken}`,
+  };
+  const contentLinesStringProposal = parseProposalEnvelope({
+    runId: `run-${contentLinesStringToken}`,
+    sessionId: `session-${contentLinesStringToken}`,
+    raw: contentLinesStringRaw,
+  });
+  assertEqual(
+    (contentLinesStringProposal.payload as any).codeBlocks[0].content,
+    `line-a-${contentLinesStringToken}\nline-b-${contentLinesStringToken}`,
+    'Session parser canonicalizes contentLines string into provider code block content'
+  );
+  assertEqual(
+    (contentLinesStringProposal.payload as any).codeBlocks[0].contentLines.length,
+    2,
+    'Session parser splits contentLines string into line array'
+  );
+
+  const missingKindToken = randomSmokeToken('missing-kind');
+  const missingKindRaw = providerFacingWriteProposalWithoutMachineIds() as any;
+  delete missingKindRaw.kind;
+  missingKindRaw.actionBundle.id = `bundle-${missingKindToken}`;
+  const missingKindProposal = parseProposalEnvelope({
+    runId: `run-${missingKindToken}`,
+    sessionId: `session-${missingKindToken}`,
+    raw: missingKindRaw,
+  });
+  assertEqual(
+    missingKindProposal.kind,
+    'actionBundle',
+    'Session parser infers a missing envelope kind from a unique top-level proposal payload'
+  );
+
+  const ambiguousMissingKindRaw = providerFacingWriteProposalWithoutMachineIds() as any;
+  delete ambiguousMissingKindRaw.kind;
+  ambiguousMissingKindRaw.resourceRequest = {
+    items: [{ id: `item-${missingKindToken}`, path: `targets/${missingKindToken}.txt`, reason: 'Read generic target.' }],
+  };
+  assertThrows(() => parseProposalEnvelope({
+    runId: `run-ambiguous-${missingKindToken}`,
+    raw: ambiguousMissingKindRaw,
+  }), 'Agent Protocol v3.kind must be a non-empty string');
+
   const missingToolActionRaw = providerFacingWriteProposalWithoutMachineIds() as any;
   missingToolActionRaw.actionBundle = {
     ...missingToolActionRaw.actionBundle,
@@ -9949,8 +10154,10 @@ function assertPromptEnvelope(): void {
   assert(!prompt.stablePrefix.includes('expectedValidation'), 'prompt no longer teaches expectedValidation to providers');
   assert(!prompt.stablePrefix.includes('reviewGuide'), 'prompt no longer teaches reviewGuide to providers');
   assert(prompt.dynamicSuffix.includes('tasks[] is an ordered queue'), 'provider turn schema treats taskPlan as an ordered queue');
-  assert(prompt.dynamicSuffix.includes('every task must include capability, concrete non-root target or targets, acceptanceCriteria, and failureCriteria'), 'provider turn schema requires capability and concrete non-root task slices');
+  assert(prompt.dynamicSuffix.includes('reviewable batches'), 'provider turn schema treats taskPlan items as reviewable engineering batches');
+  assert(prompt.dynamicSuffix.includes('Every task must include capability, concrete non-root target or targets, acceptanceCriteria, and failureCriteria'), 'provider turn schema requires capability and concrete non-root task slices');
   assert(prompt.stablePrefix.includes('Do not wrap workspace file changes in process.exec shell commands'), 'stable prompt routes file changes to fs capabilities instead of shell wrappers');
+  assert(prompt.stablePrefix.includes('Do not plan standalone mkdir/process.exec tasks for workspace directory structure'), 'stable prompt avoids standalone directory scaffolding commands');
   assert(prompt.dynamicSuffix.includes('Use fs.write/fs.patch/fs.delete for file-system changes'), 'planning schema routes file-system task intents to fs capabilities');
   assert(!prompt.stablePrefix.includes('Session can schedule parallel graph nodes'), 'prompt no longer requires provider-facing graph scheduling');
   assert(!prompt.stablePrefix.includes('payload object matching that kind'), 'prompt avoids payload wrapper wording');
@@ -10410,22 +10617,40 @@ function assertSessionDriverRuntimeAccessors(): void {
 
 function assertAcceptedTaskRegistryUsesExactOperationGrants(): void {
   const suffix = randomSmokeToken('grant-frame');
-  const taskId = `task-${suffix}`;
-  const targetPath = `${suffix}/generated-${randomSmokeToken('file')}.txt`;
+  const firstTaskId = `task-${suffix}-first`;
+  const sufficientTaskId = `task-${suffix}-sufficient`;
+  const taskId = `task-${suffix}-current`;
+  const targetPath = `Case-${suffix}/Generated-${randomSmokeToken('file')}.TXT`;
   const acceptedPlan: AcceptedImplementationPlanContext = {
     planId: `plan-${suffix}`,
     runId: `run-${suffix}`,
     title: 'Grant-backed task',
     summary: 'Task targets are intentionally empty; exact grants carry executable scope.',
-    tasks: [{
-      taskId,
-      title: 'Write grant-backed file',
-      targets: [],
-      acceptanceCriteria: ['Kernel records the grant-backed write fact.'],
-      failureCriteria: ['Stop if the grant-backed write leaves the reviewed scope.'],
-      dependencies: [],
-      conflictKeys: [],
-    }],
+    tasks: [
+      {
+        taskId: firstTaskId,
+        title: 'Completed setup',
+        targets: [],
+        dependencies: [],
+        conflictKeys: [],
+      },
+      {
+        taskId: sufficientTaskId,
+        title: 'Already sufficient setup',
+        targets: [],
+        dependencies: [],
+        conflictKeys: [],
+      },
+      {
+        taskId,
+        title: 'Write grant-backed file',
+        targets: [],
+        acceptanceCriteria: ['Kernel records the grant-backed write fact.'],
+        failureCriteria: ['Stop if the grant-backed write leaves the reviewed scope.'],
+        dependencies: [],
+        conflictKeys: [],
+      },
+    ],
     capabilities: [],
     targetScopes: [],
     exactOperationGrants: [{
@@ -10438,11 +10663,13 @@ function assertAcceptedTaskRegistryUsesExactOperationGrants(): void {
     }],
     accessScopes: [],
     batchIndex: 1,
-    completedTaskIds: [],
+    completedTaskIds: [firstTaskId],
+    modelJudgedSufficientTaskIds: [sufficientTaskId],
     rawPlan: {},
   };
   const registry = new AcceptedTaskRegistry(acceptedPlan);
   const context = registry.currentTaskContext(registry.cursor([]));
+  assertEqual(context?.taskId, taskId, 'current task context skips completed and model-sufficient tasks');
   assertEqual(context?.targets.includes(targetPath), true, 'current task context includes exact operation grant target when task targets are empty');
   assertEqual(context?.capabilities.includes('fs.write'), true, 'current task context includes exact operation grant capability');
   assertEqual(context?.acceptanceCriteria?.[0], 'Kernel records the grant-backed write fact.', 'current task context keeps accepted task acceptance criteria');
@@ -11476,6 +11703,7 @@ function assertResourcePromptBlocksStabilize(): void {
   });
   assert(directoryPrompt.dynamicSuffix.includes('contentKinds=directoryTree=1'), 'current resource result status records directory inventory content kind');
   assert(directoryPrompt.stablePrefix.includes('Directory inventory ResourceEvidence is sufficient for file/directory existence checks and taskPlan target planning'), 'stable evidence policy treats directory inventory as planning evidence');
+  assert(directoryPrompt.stablePrefix.includes('Delete or cleanup taskPlan targets must be present in ResourceEvidence/AccessIndex or explicitly named'), 'stable evidence policy prevents invented cleanup targets');
   assert(directoryContract.includes('directory inventory is available for existence checks and taskPlan targets'), 'prompt packet access index treats directory inventory as sufficient for task planning');
 
   const jsonDirectoryToken = randomSmokeToken('json-directory');
@@ -17526,6 +17754,9 @@ async function assertSessionDriverLoopAcceptedImplementationPlanUsesDirectoryDel
   assertEqual(actionBatchSubmits, 1, 'directory delete template batch executes without returning to Plan');
   assertEqual(result.events.some((event) => event.kind === 'requirement_confirmation'), false, 'directory delete template stays inside accepted scope');
   assert(providerPrompt.includes('currentTaskActionTemplates'), 'accepted execution prompt exposes current task action templates');
+  assert(!providerPrompt.includes('New target/tool needs must return decisionRequest'), 'accepted execution prompt does not make scope expansion an LLM preflight decision');
+  assert(!providerPrompt.includes('If scope must expand, output decisionRequest'), 'accepted execution prompt leaves scope interrupts to Session and Kernel');
+  assert(providerPrompt.includes('Session and Kernel validate'), 'accepted execution prompt explains deterministic scope validation ownership');
   assert(providerPrompt.includes('"targetKind": "directory"'), 'directory delete action template exposes directory target kind');
   assert(providerPrompt.includes('"recursive": true'), 'directory delete action template exposes recursive delete intent');
   for (const childName of childNames) {

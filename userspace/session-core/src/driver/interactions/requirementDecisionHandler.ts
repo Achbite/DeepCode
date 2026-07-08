@@ -513,8 +513,11 @@ export class RequirementDecisionHandler {
     const accepted = this.recoverAcceptedPlanForRequirement(current.events, runId, planId);
     if (!accepted) return undefined;
 
-    const currentCompleted = new Set(accepted.completedTaskIds);
-    const currentTaskId = accepted.tasks.find((task) => !currentCompleted.has(task.taskId))?.taskId;
+    const settledTaskIds = new Set([
+      ...accepted.completedTaskIds,
+      ...(accepted.modelJudgedSufficientTaskIds ?? []),
+    ]);
+    const currentTaskId = accepted.tasks.find((task) => !settledTaskIds.has(task.taskId))?.taskId;
     const newlyCompleted: string[] = [];
     let acceptedIncompleteTaskIds: string[] = [];
     if (normalizedEffect.kind === 'skipTask') {
@@ -522,7 +525,7 @@ export class RequirementDecisionHandler {
       newlyCompleted.push(currentTaskId);
     } else if (normalizedEffect.kind === 'markAcceptedIncomplete') {
       const ids = normalizedEffect.taskIds?.length ? normalizedEffect.taskIds : (currentTaskId ? [currentTaskId] : []);
-      acceptedIncompleteTaskIds = ids.filter((id) => !currentCompleted.has(id) && accepted.tasks.some((task) => task.taskId === id));
+      acceptedIncompleteTaskIds = ids.filter((id) => !settledTaskIds.has(id) && accepted.tasks.some((task) => task.taskId === id));
       newlyCompleted.push(...acceptedIncompleteTaskIds);
       if (newlyCompleted.length === 0) return undefined;
     } else {
@@ -533,9 +536,13 @@ export class RequirementDecisionHandler {
       acceptedPlan: accepted,
       completedTaskIds: mergedCompletedTaskIds,
     }).nextAcceptedPlan;
+    const mergedSettledTaskIds = new Set([
+      ...mergedCompletedTaskIds,
+      ...(accepted.modelJudgedSufficientTaskIds ?? []),
+    ]);
     const remainingTaskIds = accepted.tasks
       .map((task) => task.taskId)
-      .filter((id) => !mergedCompletedTaskIds.includes(id));
+      .filter((id) => !mergedSettledTaskIds.has(id));
     const allDone = remainingTaskIds.length === 0;
 
     const checkpointId = this.ports.createId('requirement-driven-task-checkpoint');

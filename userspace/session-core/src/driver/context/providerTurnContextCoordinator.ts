@@ -271,8 +271,8 @@ export class ProviderTurnContextCoordinator<State extends ProviderTurnContextSta
       `currentTaskTargets=${targets.length ? targets.join(', ') : 'none'}`,
       templates.length ? `currentTaskActionTemplates=${templates.join(' | ')}` : 'currentTaskActionTemplates=none',
       templates.length
-        ? 'When currentTaskActionTemplates are listed, actionBundle tool calls must use those templates as the current task boundary. Do not add targets from the original user request, plan summary, memory, or later tasks.'
-        : 'No executable action template is available for this current task; use taskOutcome when visible facts already satisfy it, resourceRequest when read-only evidence is missing, or diagnostic/decisionRequest when it cannot continue.',
+        ? 'When currentTaskActionTemplates are listed, prefer those templates for the current task. If correctness requires a concrete adjacent operation, include that explicit operation intent; Session and Kernel validate scope and may interrupt for user approval. Do not add unrelated targets from the original user request, plan summary, memory, or later tasks.'
+        : 'No executable action template is available for this current task; use taskOutcome when visible facts already satisfy it, resourceRequest when read-only evidence is missing, or diagnostic/decisionRequest when a material user choice is required.',
       'Kernel remains the permission, execution, fact, and audit authority; this summary is not an authorization grant.',
     ].join('\n');
   }
@@ -349,8 +349,10 @@ export class ProviderTurnContextCoordinator<State extends ProviderTurnContextSta
           operation,
           targets: [targetPath],
           evidencePolicy: operation === 'fs.patch'
-            ? 'Use ResourceEvidence exact text or request focused evidence before patching.'
-            : 'Use only this current task template unless a decisionRequest expands scope.',
+          ? 'Use ResourceEvidence exact text or request focused evidence before patching.'
+          : operation === 'fs.write' || capability === 'fs.write'
+            ? 'For complete writes, provide replacement content directly when task intent is clear; existing text is only required when preserving or patching content.'
+          : 'Prefer this current task template; Session and Kernel validate any additional concrete operation before execution.',
           template: {
             toolId: capability ?? operation,
             args,
@@ -370,9 +372,11 @@ export class ProviderTurnContextCoordinator<State extends ProviderTurnContextSta
         targets,
         evidencePolicy: capability === 'fs.patch'
           ? 'Use ResourceEvidence exact text or request focused evidence before patching.'
+          : capability === 'fs.write'
+            ? 'For complete writes, provide replacement content directly when task intent is clear; existing text is only required when preserving or patching content.'
           : capability === 'process.exec'
             ? 'Use argv/cwd/timeoutMs typed args for the current task command; Kernel handles permission before execution.'
-            : 'Use only current task targets unless a decisionRequest expands scope.',
+            : 'Prefer current task targets; Session and Kernel validate any additional concrete operation before execution.',
         template: capability === 'process.exec'
           ? {
             toolId: 'process.exec',

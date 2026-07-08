@@ -7,7 +7,11 @@ import type {
   ToolIntentTemplate,
 } from '../runFrame.js';
 import type { CurrentTaskContext } from '../../accepted-plan/index.js';
-import type { ContextAssemblyRecord, ContextAssemblyResourceBlockRecord } from '../../context/index.js';
+import {
+  resourceEvidenceAccessIndexLine,
+  resourceEvidenceContentKindCounts,
+} from '../../context/index.js';
+import type { ContextAssemblyRecord } from '../../context/index.js';
 import type { ResourcePacket } from '../../context/types.js';
 import type { PromptEnvelope } from '../../prompt/types.js';
 
@@ -225,7 +229,7 @@ export class ContextFrameBuilder {
       `resourcePackets=${contextAssembly.resourcePacketCount}`,
       `resourceBlocks=${contextAssembly.resourceBlocks.length}`,
       `tailCount=${contextAssembly.resourceEvidenceTailCount}`,
-      `contentKinds=${resourceContentKindCounts(contextAssembly.resourceBlocks) || 'none'}`,
+      `contentKinds=${resourceEvidenceContentKindCounts(contextAssembly.resourceBlocks) || 'none'}`,
       'resourceBlockDetails=see AccessIndex frame',
     ].join('; ');
   }
@@ -240,7 +244,7 @@ export class ContextFrameBuilder {
       `denied=${contextAssembly.resourceRetentionCounts.denied ?? 0}`,
       `error=${contextAssembly.resourceRetentionCounts.error ?? 0}`,
     ];
-    lines.push(...contextAssembly.resourceBlocks.slice(-12).map((block) => resourceAccessIndexLine(block)));
+    lines.push(...contextAssembly.resourceBlocks.slice(-12).map((block) => resourceEvidenceAccessIndexLine(block)));
     return lines.join('\n');
   }
 
@@ -288,7 +292,7 @@ export class ContextFrameBuilder {
       `currentTask=${input.currentTaskContext?.taskId ?? 'none'}`,
       `accessedResources=${resourceBlocks.length}`,
     ];
-    lines.push(...resourceBlocks.slice(-12).map((block) => resourceAccessIndexLine(block)));
+    lines.push(...resourceBlocks.slice(-12).map((block) => resourceEvidenceAccessIndexLine(block)));
     return lines.join('\n');
   }
 
@@ -301,10 +305,10 @@ export class ContextFrameBuilder {
       return [
         'Use the current task cursor only.',
         `Allowed proposal kinds: ${allowedKinds.join(', ')}.`,
-        'Use TaskFrame targets and currentTaskActionTemplates as the current task boundary; do not add targets from the original user request, plan summary, memory, or later tasks.',
-        'If file changes are needed and evidence is sufficient, return an actionBundle using only current task templates.',
+        'Use TaskFrame targets and currentTaskActionTemplates as the preferred current task boundary; do not import unrelated targets from the original user request, plan summary, memory, or later tasks.',
+        'If file changes are needed and evidence is sufficient, return an actionBundle with the concrete operations needed for the current task.',
         'If evidence is missing, return a focused resourceRequest.',
-        'If the current task needs targets or operations outside the accepted scope, return a decisionRequest.',
+        'If a concrete operation later exceeds accepted scope, Session and Kernel will interrupt for user approval; do not pre-ask for routine permission or scope expansion.',
         'If the current task is already sufficiently satisfied and no Kernel action is needed, return taskOutcome with status="modelJudgedSufficient".',
         'Keep visible reasoning/progress action-oriented: state the current action or task outcome, not protocol, tool, permission, or evidence-policy deliberation.',
       ].join(' ');
@@ -314,70 +318,12 @@ export class ContextFrameBuilder {
       'If ResourceEvidence or AccessIndex is enough to form a useful taskPlan or answer, output that proposal now; do not narrate or debate whether to read more context.',
       'Use resourceRequest only for missing concrete evidence that would change the next proposal. Keep it focused on a different path/range/search query that adds new facts.',
       'Use decisionRequest only when a blocking user choice prevents any valid taskPlan; put reviewable assumptions in taskPlan risks or reviewCheckpoints.',
+      'For delete or cleanup plans, target only paths that are visible in ResourceEvidence/AccessIndex or explicitly named by the current user or ConfirmedDecision.',
+      'For project scaffolding, plan concrete file writes instead of standalone directory creation; Kernel creates parent directories when fs.write creates files.',
       'Decide from the current PromptPacket frames; do not re-audit protocol rules, permission gates, resource policy, or unrelated prior requirements in reasoning.',
       'Keep visible reasoning/progress action-oriented: state the current action or proposal, not protocol, tool, permission, or evidence-policy deliberation.',
       'For side-effect work, plan first unless Session already provided an accepted task.',
       'Do not infer execution facts or permissions from memory.',
     ].join(' ');
   }
-}
-
-function resourceAccessIndexLine(block: ContextAssemblyResourceBlockRecord): string {
-  return [
-    `ref=${block.displayRef}`,
-    `kind=${block.contentKind ?? 'unknown'}`,
-    `status=${block.status}`,
-    `retention=${block.retention}`,
-    `range=${resourceRangeLabel(block)}`,
-    `hash=${block.contentHash.slice(0, 12)}`,
-    `chars=${block.charLength}`,
-    `use=${resourceReuseInstruction(block)}`,
-  ].join('; ');
-}
-
-function resourceContentKindCounts(blocks: readonly ContextAssemblyResourceBlockRecord[]): string {
-  const counts = blocks.reduce<Record<string, number>>((result, block) => {
-    const kind = block.contentKind ?? 'unknown';
-    result[kind] = (result[kind] ?? 0) + 1;
-    return result;
-  }, {});
-  return Object.keys(counts).sort().map((kind) => `${kind}=${counts[kind]}`).join(',');
-}
-
-function resourceRangeLabel(block: ContextAssemblyResourceBlockRecord): string {
-  const range = [
-    typeof block.offsetBytes === 'number' ? `offsetBytes=${block.offsetBytes}` : '',
-    typeof block.limitBytes === 'number' ? `limitBytes=${block.limitBytes}` : '',
-    typeof block.returnedBytes === 'number' ? `returnedBytes=${block.returnedBytes}` : '',
-    typeof block.rangeComplete === 'boolean' ? `rangeComplete=${block.rangeComplete}` : '',
-  ].filter(Boolean).join(',');
-  return range || 'full-or-directory';
-}
-
-function resourceReuseInstruction(block: ContextAssemblyResourceBlockRecord): string {
-  if (block.status === 'needsUserApproval' || block.status === 'denied') {
-    return 'unavailable without user approval; do not repeat the same request blindly';
-  }
-  if (block.status === 'error') {
-    return 'previous read failed; request a different focused segment only if it adds evidence';
-  }
-  if (block.contentKind === 'directoryTree' && (block.retention === 'full' || block.retention === 'summary')) {
-    return 'directory inventory is available; use it for file and directory existence planning, and request file text only when exact content is required';
-  }
-  if (block.contentKind === 'searchResults' && (block.retention === 'full' || block.retention === 'summary')) {
-    return 'search evidence is available; use returned matches before repeating the same query';
-  }
-  if (block.contentKind === 'fileText' && block.retention === 'full') {
-    return 'file text is available; use it directly and do not reread the same path/range';
-  }
-  if (block.retention === 'full') {
-    return 'full evidence is available; use it directly and do not reread the same path/range';
-  }
-  if (block.retention === 'summary') {
-    return 'summary evidence is available; request a focused range only when exact content is required';
-  }
-  if (block.retention === 'handleOnly') {
-    return 'handle is available; request a focused range before exact edits';
-  }
-  return 'resource is not usable as exact patch evidence';
 }

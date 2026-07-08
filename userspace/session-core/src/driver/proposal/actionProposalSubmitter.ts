@@ -114,6 +114,9 @@ export class ActionProposalSubmitter<
     proposal: ProposalEnvelope,
     fallback: AgentSessionResult
   ): Promise<AgentSessionResult> {
+    if (proposal.kind === 'taskOutcome' && state.acceptedImplementationPlan) {
+      return this.ports.submitAcceptedPlanActionProposal(input, state, prompt, proposal, fallback);
+    }
     const actionBundle = this.ports.readActionBundle(proposal);
     if (actionBundle && state.acceptedImplementationPlan) {
       return this.ports.submitAcceptedPlanActionProposal(input, state, prompt, proposal, fallback);

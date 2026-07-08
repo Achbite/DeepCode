@@ -1,3 +1,7 @@
+import {
+  resourceEvidenceAccessIndexLine,
+  resourceEvidenceRangeLabel,
+} from '../context/resourceEvidenceAccess.js';
 import type { PromptEnvelopeBuilderInput } from './types.js';
 
 export interface PromptPacketFrame {
@@ -45,7 +49,7 @@ export function buildPromptPacketFrames(input: PromptEnvelopeBuilderInput): Prom
       content: [
         `Allowed proposal kinds for this call: ${input.allowedProposals.join(', ') || 'none'}.`,
         'Frames later in this packet are context, not protocol examples. Use source/trust/use to decide whether a frame is user intent, observed resource evidence, compressed memory, or an immediate instruction.',
-        'If current facts are enough, produce the next proposal. If facts are missing, request focused resources. If user choice or scope expansion is required, use decisionRequest.',
+        'If current facts are enough, produce the next proposal. If facts are missing, request focused resources. Use decisionRequest only for a material user choice that cannot be expressed as a concrete proposal.',
       ],
     },
     memoryFrame(input),
@@ -122,7 +126,7 @@ function taskFrameFromInput(input: PromptEnvelopeBuilderInput): PromptPacketFram
     source: 'session.acceptedPlanCursor',
     trust: 'confirmedTaskInstruction',
     scope: 'currentAcceptedTask',
-    use: 'execute or request evidence only for this task unless a decisionRequest asks user to expand scope',
+    use: 'execute or request evidence for this task; Session and Kernel validate concrete operation scope before execution',
     content: [
       `taskId=${taskId}`,
       title ? `title=${oneLine(title, 240)}` : '',
@@ -150,7 +154,7 @@ function resourceEvidenceFrame(input: PromptEnvelopeBuilderInput): PromptPacketF
       `kind=${block.contentKind ?? 'unknown'}`,
       `status=${block.status}`,
       `retention=${block.retention}`,
-      `range=${resourceRangeLabel(block)}`,
+      `range=${resourceEvidenceRangeLabel(block)}`,
       `hash=${block.contentHash.slice(0, 12)}`,
       `chars=${block.charLength}`,
       `summary=${oneLine(block.summary, 300)}`,
@@ -167,17 +171,10 @@ function accessSummaryFrame(input: PromptEnvelopeBuilderInput): PromptPacketFram
     trust: 'derivedObservedFact',
     scope: 'currentRun',
     use: 'index of already confirmed resources; do not reread the same low-value path/range unless a different segment is needed',
-    content: blocks.slice(-12).map((block) => [
-      `ref=${block.displayRef}`,
-      `kind=${block.contentKind ?? 'unknown'}`,
-      `status=${block.status}`,
-      `retention=${block.retention}`,
-      `range=${resourceRangeLabel(block)}`,
-      `hash=${block.contentHash.slice(0, 12)}`,
-      `chars=${block.charLength}`,
-      `use=${resourceReuseInstruction(block)}`,
-      `summary=${oneLine(block.summary, 300)}`,
-    ].join('; ')),
+    content: blocks.slice(-12).map((block) => resourceEvidenceAccessIndexLine(block, {
+      includeSummary: true,
+      summaryLimit: 300,
+    })),
   };
 }
 
@@ -210,44 +207,6 @@ function providerStepSummaryFrame(input: PromptEnvelopeBuilderInput): PromptPack
       `hasCurrentTask=${Boolean(input.currentTaskContext)}`,
     ],
   };
-}
-
-function resourceRangeLabel(block: NonNullable<PromptEnvelopeBuilderInput['resourcePromptContext']>['resourceBlocks'][number]): string {
-  const range = [
-    typeof block.offsetBytes === 'number' ? `offsetBytes=${block.offsetBytes}` : '',
-    typeof block.limitBytes === 'number' ? `limitBytes=${block.limitBytes}` : '',
-    typeof block.returnedBytes === 'number' ? `returnedBytes=${block.returnedBytes}` : '',
-    typeof block.rangeComplete === 'boolean' ? `rangeComplete=${block.rangeComplete}` : '',
-  ].filter(Boolean).join(',');
-  return range || 'full-or-directory';
-}
-
-function resourceReuseInstruction(block: NonNullable<PromptEnvelopeBuilderInput['resourcePromptContext']>['resourceBlocks'][number]): string {
-  if (block.status === 'needsUserApproval' || block.status === 'denied') {
-    return 'unavailable without user approval; do not repeat the same request blindly';
-  }
-  if (block.status === 'error') {
-    return 'previous read failed; request a different focused segment only if it adds evidence';
-  }
-  if (block.contentKind === 'directoryTree' && (block.retention === 'full' || block.retention === 'summary')) {
-    return 'directory inventory is available for existence checks and taskPlan targets; request file text only when exact content is required';
-  }
-  if (block.contentKind === 'searchResults' && (block.retention === 'full' || block.retention === 'summary')) {
-    return 'search evidence is available; use returned matches before repeating the same query';
-  }
-  if (block.contentKind === 'fileText' && block.retention === 'full') {
-    return 'file text is available; use it directly and do not reread the same path/range';
-  }
-  if (block.retention === 'full') {
-    return 'full evidence is available; use it directly and do not reread the same path/range';
-  }
-  if (block.retention === 'summary') {
-    return 'summary evidence is available; request a focused range only when exact content is required';
-  }
-  if (block.retention === 'handleOnly') {
-    return 'handle is available; request a focused range before exact edits';
-  }
-  return 'resource is not usable as exact patch evidence';
 }
 
 function memoryFrame(input: PromptEnvelopeBuilderInput): PromptPacketFrame {
@@ -320,8 +279,8 @@ function nextActionInstructionFrame(input: PromptEnvelopeBuilderInput): PromptPa
         `allowedOutputs=${allowed.join(' | ') || 'none'}`,
         'forbiddenOutputs=taskPlan | implementationPlan | reviewSummary',
         'Continue the current accepted task. Do not re-plan unless a user decision explicitly requests replan/revisePlan.',
-        'Use TaskFrame targets and currentTaskActionTemplates as the current task boundary. Do not add targets from the original user request, plan summary, memory, or later tasks.',
-        'If the current task needs file changes and evidence is sufficient, output actionBundle using only current task templates. If evidence is missing, output focused resourceRequest. If scope must expand, output decisionRequest.',
+        'Use TaskFrame targets and currentTaskActionTemplates as the preferred current task boundary. Do not add unrelated targets from the original user request, plan summary, memory, or later tasks.',
+        'If the current task needs file changes and evidence is sufficient, output actionBundle with the concrete operation intent. If evidence is missing, output focused resourceRequest. If a concrete operation exceeds accepted scope, Session and Kernel interrupt for user approval.',
         'If the current task is already sufficiently satisfied and no Kernel action is needed, output taskOutcome with status="modelJudgedSufficient". Do not invent empty actions just to advance the task.',
       ]
       : genericContent,

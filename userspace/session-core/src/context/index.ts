@@ -4,5 +4,6 @@ export * from './memoryArchive.js';
 export * from './memory.js';
 export * from './memoryCompiler.js';
 export * from './resource.js';
+export * from './resourceEvidenceAccess.js';
 export * from './resourcePrompt.js';
 export * from './types.js';

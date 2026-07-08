@@ -102,7 +102,7 @@ export function providerVisibleSchemaDigest(input: PromptEnvelopeBuilderInput): 
       ? 'decisionRequest top-level field: decisionRequest.version/id/question/options/allowsFreeform; question must be a non-empty user-visible string; use 2-3 mutually exclusive options with one recommended option.'
       : '',
     visibleSchemaKinds.has('taskPlan')
-      ? 'taskPlan top-level field: taskPlan.version/id/title/summary/tasks/risks/reviewCheckpoints. tasks[] is an ordered queue; every task must include capability, concrete non-root target or targets, acceptanceCriteria, and failureCriteria. Use fs.write/fs.patch/fs.delete for file-system changes; no codeBlocks, actionBundle, commandBlocks, patches, source code, or graph structures.'
+      ? 'taskPlan top-level field: taskPlan.version/id/title/summary/tasks/risks/reviewCheckpoints. tasks[] is an ordered queue of reviewable batches, not one task per file; group related files/ops. Every task must include capability, concrete non-root target or targets, acceptanceCriteria, and failureCriteria. Use fs.write/fs.patch/fs.delete for file-system changes; no codeBlocks, actionBundle, commandBlocks, patches, source code, or graph structures.'
       : '',
     executionLikeTurn && visibleSchemaKinds.has('taskOutcome')
       ? 'taskOutcome top-level field: taskOutcome.version/id/taskId/status/reason/evidenceRefs; use only when the current accepted task is already sufficiently satisfied and no Kernel write/delete action is needed.'
@@ -124,8 +124,8 @@ export function providerVisibleSchemaDigest(input: PromptEnvelopeBuilderInput): 
         'actionBundle proposal top-level fields: userPlanMarkdown, codeBlocks, actionBundle. Use it only for the current accepted task.',
         ...actionBundleProtocolShapeLines(),
         'codeBlocks items use {blockId,targetPath,language?,operation?,contentLines,allowEmptyContent?}. contentLines is the only provider-facing source-code content carrier.',
-        'When ToolIntentTemplates are present, actionBundle.actions[] must follow those templates as the current task boundary. Do not add targets from the original user request, plan summary, memory, or later tasks.',
-        'When no ToolIntentTemplates are present, use one currentTaskCapabilities id from this ProviderTurnContract and only currentTaskTargets.',
+        'When ToolIntentTemplates are present, actionBundle.actions[] should prefer those templates for the current task. Concrete adjacent operations needed for correctness may be included; Session and Kernel validate scope before execution.',
+        'When no ToolIntentTemplates are present, use one currentTaskCapabilities id from this ProviderTurnContract and concrete targets required by the current task.',
         'File operation actions must use fs.* toolIds. Action entries use actionId, toolId, args, and description; Kernel derives capability, permission, readSet/writeSet, and conflictKeys.',
         'Do not output capability, permissionLabels, accessScopes, resourceScope, commandBlocks, legacy implementationPlan, or payload wrapper fields.',
       ].join('\n')
@@ -178,13 +178,13 @@ function toolIntentTemplates(input: PromptEnvelopeBuilderInput, turnMode: Provid
   const lines = [
     `currentTaskTargets=${targets.length ? targets.join(', ') : 'none'}`,
     `currentTaskCapabilities=${capabilities.length ? capabilities.join(', ') : 'none'}`,
-    'Use only currentTaskTargets unless decisionRequest asks the user to expand current task scope. Do not import targets from plan summary, memory, original user request, or later tasks.',
+    'Prefer currentTaskTargets for actionBundle operations. If the current task needs a concrete adjacent target, include it explicitly; Session and Kernel validate scope before execution. Do not import unrelated targets from plan summary, memory, original user request, or later tasks.',
   ];
   if (capabilities.includes('fs.delete')) {
     lines.push('fs.delete intent: args.path must be one normalized current task target; directory delete requires args.targetKind="directory" and args.recursive=true only for an accepted directory target.');
   }
   if (capabilities.includes('fs.write')) {
-    lines.push('fs.write intent: write concrete file paths under current task targets; use codeBlocks[].contentLines and args.sourceBlockId.');
+    lines.push('fs.write intent: write complete replacement content for concrete current task paths; use codeBlocks[].contentLines and args.sourceBlockId. Do not request existing text only to replace the whole file.');
   }
   if (capabilities.includes('fs.patch')) {
     lines.push('fs.patch intent: request focused ResourceEvidence first unless exact current match text is already visible; args.patchSpec.match.text must copy Kernel-observed evidence.');
