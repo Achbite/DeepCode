@@ -4059,6 +4059,23 @@ async function assertAcceptedPlanResourceResumeCoordinatorBuildsProviderTurn(): 
   });
   assertEqual(observedStage, 'accepted_plan_resource_resume', 'resource resume coordinator uses stable provider stage');
   assertEqual(observedMessages[0]?.role, 'system', 'resource resume coordinator sends stable prefix as system message');
+  const resumeUserPrompt = observedMessages.find((message) => message.role === 'user')?.content ?? '';
+  assert(
+    resumeUserPrompt.includes('Return exactly one Agent Protocol v3 proposal: actionBundle, resourceRequest, decisionRequest, taskOutcome, diagnostic.'),
+    'resource resume prompt aligns provider-visible allowed kinds with driver parsing'
+  );
+  assert(
+    !resumeUserPrompt.includes('taskOutcome, answer'),
+    'resource resume prompt does not expose answer as an execution-stage output'
+  );
+  assert(
+    resumeUserPrompt.includes('For kind="taskOutcome", put taskOutcome:{version:"1",id,taskId,status:"modelJudgedSufficient",reason,evidenceRefs:[]}'),
+    'resource resume prompt shows the required taskOutcome object shape'
+  );
+  assert(
+    resumeUserPrompt.includes('For kind="actionBundle", put userPlanMarkdown, codeBlocks, and actionBundle directly on the top-level JSON object'),
+    'resource resume prompt shows the required top-level actionBundle shape'
+  );
   assertEqual(
     (state as { providerTurnFrame?: { turnMode?: string } }).providerTurnFrame?.turnMode,
     'resourceResume',

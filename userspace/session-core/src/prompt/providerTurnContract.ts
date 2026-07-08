@@ -86,9 +86,10 @@ export function inferProviderTurnMode(input: PromptEnvelopeBuilderInput): Provid
 
 export function providerVisibleSchemaDigest(input: PromptEnvelopeBuilderInput): string {
   const turnMode = inferProviderTurnMode(input);
+  const executionLikeTurn = turnMode === 'acceptedTaskExecution' || turnMode === 'resourceResume' || turnMode === 'scopeIntervention';
   const allowedKinds = new Set(narrowAllowedKinds(input.allowedProposals, turnMode));
   const visibleSchemaKinds = new Set(
-    [...allowedKinds].filter((kind) => turnMode === 'acceptedTaskExecution' || (kind !== 'actionBundle' && kind !== 'taskOutcome'))
+    [...allowedKinds].filter((kind) => executionLikeTurn || (kind !== 'actionBundle' && kind !== 'taskOutcome'))
   );
   const schemaLines = [
     'Agent Protocol v3 current turn schema selector: one JSON object; choose one ProviderTurnContract.allowedKinds kind.',
@@ -103,14 +104,14 @@ export function providerVisibleSchemaDigest(input: PromptEnvelopeBuilderInput): 
     visibleSchemaKinds.has('taskPlan')
       ? 'taskPlan top-level field: taskPlan.version/id/title/summary/tasks/risks/reviewCheckpoints. tasks[] is an ordered queue; every task must include capability, concrete non-root target or targets, acceptanceCriteria, and failureCriteria. Use Kernel capability names; no codeBlocks, actionBundle, commandBlocks, patches, source code, or graph structures.'
       : '',
-    turnMode === 'acceptedTaskExecution' && visibleSchemaKinds.has('taskOutcome')
+    executionLikeTurn && visibleSchemaKinds.has('taskOutcome')
       ? 'taskOutcome top-level field: taskOutcome.version/id/taskId/status/reason/evidenceRefs; use only when the current accepted task is already sufficiently satisfied and no Kernel write/delete action is needed.'
       : '',
     visibleSchemaKinds.has('diagnostic')
       ? 'diagnostic top-level field: diagnostic.version/id/severity/summary/details; terminal explanation only, never execution.'
       : '',
   ].filter(Boolean);
-  if (turnMode !== 'acceptedTaskExecution') {
+  if (!executionLikeTurn) {
     return [
       ...schemaLines,
       'Execution-only proposal schema is withheld in this turn. For side-effect work, output taskPlan unless the final NextActionInstruction explicitly requires another allowed kind.',

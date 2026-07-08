@@ -3,6 +3,7 @@ import { actionBundleProtocolShapeLines, resourceRequestProtocolShapeLine } from
 import type { ProposalEnvelope } from '../protocol/types.js';
 import type { NativeToolCallProposal } from '../provider/providerStreamParts.js';
 import type { PromptEnvelope } from './types.js';
+import { ACCEPTED_PLAN_RESOURCE_RESUME_ALLOWED_KINDS } from './AcceptedPlanResourceResumePromptBuilder.js';
 import { RepairProviderTurnContractBuilder, type RepairProviderTurnContractInput } from './RepairProviderTurnContractBuilder.js';
 
 const DEFAULT_MAX_ACTION_BUNDLE_TOTAL_CODE_BYTES = 384 * 1024;
@@ -68,7 +69,7 @@ export class ProviderRepairMessageBuilder {
       'Do not add execution facts, permissions, or tool results.',
       `Allowed proposal kinds: ${allowedKinds.join(', ')}.`,
       acceptedExecution
-        ? 'An accepted task is already active. Do not output taskPlan or implementationPlan; repair toward the current task actionBundle/resourceRequest/decisionRequest/diagnostic only.'
+        ? 'An accepted task is already active. Do not output taskPlan or implementationPlan; repair toward the current task actionBundle/resourceRequest/decisionRequest/taskOutcome/diagnostic only.'
         : actionBundleRepair
           ? 'Repair the existing actionBundle proposal only if it remains a valid reviewable side-effect proposal; otherwise output taskPlan, resourceRequest, decisionRequest, or diagnostic as allowed.'
           : 'For initial side-effect work, output taskPlan unless acceptedTaskPlan context is already present. Do not output actionBundle in this repair call.',
@@ -284,7 +285,7 @@ export class ProviderRepairMessageBuilder {
           this.renderRepairProviderTurnContract(state, {
             turnMode: afterAcceptedPlan ? 'resourceResume' : 'protocolRepair',
             allowedKinds: afterAcceptedPlan
-              ? ['actionBundle', 'resourceRequest', 'decisionRequest', 'taskOutcome', 'answer', 'diagnostic']
+              ? [...ACCEPTED_PLAN_RESOURCE_RESUME_ALLOWED_KINDS]
               : ['answer', 'resourceRequest', 'decisionRequest', 'diagnostic'],
             repairPolicy: 'sameKindOnly',
             errorLines: ['Duplicate provider-native read request after Kernel ResourcePacket facts were already returned.'],
@@ -332,7 +333,7 @@ export class ProviderRepairMessageBuilder {
           this.renderRepairProviderTurnContract(state, {
             turnMode: state.acceptedContext && Object.keys(state.acceptedContext).length > 0 ? 'resourceResume' : 'protocolRepair',
             allowedKinds: state.acceptedContext && Object.keys(state.acceptedContext).length > 0
-              ? ['actionBundle', 'resourceRequest', 'decisionRequest', 'taskOutcome', 'answer', 'diagnostic']
+              ? [...ACCEPTED_PLAN_RESOURCE_RESUME_ALLOWED_KINDS]
               : ['answer', 'resourceRequest', 'decisionRequest', 'diagnostic'],
             repairPolicy: 'sameKindOnly',
             errorLines: [resolutionDiagnostic],
