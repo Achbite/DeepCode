@@ -534,7 +534,7 @@ async fn ask(
         let mut text = result.run.final_text.clone().unwrap_or_default();
         if text.trim().is_empty() {
             if let Ok(timeline) = client.agent_timeline(&result.run.session_id).await {
-                text = extract_final_text(&timeline).unwrap_or_default();
+                text = extract_plain_text(&timeline).unwrap_or_default();
             }
         }
         if text.trim().is_empty() {
@@ -1023,6 +1023,7 @@ async fn bootstrap_kernel(
 }
 
 fn render_timeline(timeline: &Value) {
+    let timeline = timeline_payload(timeline);
     let turns = timeline
         .get("turns")
         .and_then(Value::as_array)
@@ -1050,19 +1051,28 @@ fn render_timeline(timeline: &Value) {
                 .and_then(Value::as_str)
                 .filter(|value| !value.is_empty())
                 .unwrap_or(kind);
-            let body = block
-                .get("bodyMarkdown")
-                .or_else(|| block.get("summary"))
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .or_else(|| structured_projection_text(block))
-                .unwrap_or_default();
+            let body = timeline_block_text(block, kind);
             println!("  {kind}: {title}");
             for line in body.lines().take(12) {
                 println!("    {line}");
             }
         }
     }
+}
+
+fn timeline_block_text(block: &Value, kind: &str) -> String {
+    if matches!(kind, "plan" | "review") {
+        if let Some(text) = structured_projection_text(block) {
+            return text;
+        }
+    }
+    block
+        .get("bodyMarkdown")
+        .or_else(|| block.get("summary"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| structured_projection_text(block))
+        .unwrap_or_default()
 }
 
 fn structured_projection_text(block: &Value) -> Option<String> {
@@ -1097,11 +1107,7 @@ fn render_readable_projection(readable: &Value) -> String {
     }
     if let Some(sections) = readable.get("sections").and_then(Value::as_array) {
         for section in sections {
-            if let Some(title) = section
-                .get("titleKey")
-                .or_else(|| section.get("title"))
-                .and_then(Value::as_str)
-            {
+            if let Some(title) = readable_section_title(section) {
                 lines.push(format!("## {title}"));
             }
             let items = section
@@ -1111,16 +1117,13 @@ fn render_readable_projection(readable: &Value) -> String {
                 .unwrap_or_default();
             if items.is_empty() {
                 if let Some(empty) = section.get("emptyMessageKey").and_then(Value::as_str) {
-                    lines.push(format!("- {empty}"));
+                    if let Some(message) = readable_empty_message(empty) {
+                        lines.push(format!("- {message}"));
+                    }
                 }
             }
             for item in items {
-                let text = item
-                    .get("text")
-                    .or_else(|| item.get("messageKey"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                if !text.is_empty() {
+                if let Some(text) = readable_item_text(&item) {
                     lines.push(format!("- {text}"));
                 }
                 if let Some(targets) = item.get("targetRefs").and_then(Value::as_array) {
@@ -1137,6 +1140,66 @@ fn render_readable_projection(readable: &Value) -> String {
         }
     }
     lines.join("\n")
+}
+
+fn readable_item_text(item: &Value) -> Option<String> {
+    if let Some(text) = item.get("text").and_then(Value::as_str) {
+        if !text.trim().is_empty() {
+            return Some(text.to_string());
+        }
+    }
+    item.get("messageKey")
+        .and_then(Value::as_str)
+        .and_then(readable_message_key)
+        .map(str::to_string)
+}
+
+fn readable_message_key(key: &str) -> Option<&'static str> {
+    match key {
+        "session.projection.plan.boundary.notExecution" => {
+            Some("This is a plan, not an execution result.")
+        }
+        _ => None,
+    }
+}
+
+fn readable_section_title(section: &Value) -> Option<String> {
+    if let Some(title) = section.get("title").and_then(Value::as_str) {
+        return Some(title.to_string());
+    }
+    let key = section
+        .get("sectionId")
+        .or_else(|| section.get("titleKey"))
+        .and_then(Value::as_str)?;
+    Some(
+        match key {
+            "summary" | "session.projection.plan.section.summary" => "Summary",
+            "tasks" | "session.projection.plan.section.tasks" => "Tasks",
+            "risks" | "session.projection.plan.section.risks" => "Risks",
+            "reviewCheckpoints" | "session.projection.plan.section.reviewCheckpoints" => {
+                "Review checkpoints"
+            }
+            "boundary" | "session.projection.plan.section.boundary" => "Boundary",
+            "execution" | "session.projection.review.section.execution" => "Execution",
+            "changedFiles" | "session.projection.review.section.changedFiles" => "Changed files",
+            "validation" | "session.projection.review.section.validation" => "Validation",
+            "audit" | "session.projection.review.section.audit" => "Audit",
+            _ => key,
+        }
+        .to_string(),
+    )
+}
+
+fn readable_empty_message(key: &str) -> Option<&'static str> {
+    match key {
+        "session.projection.plan.empty.tasks" => Some("No tasks recorded."),
+        "session.projection.plan.empty.risks" => Some("No risks recorded."),
+        "session.projection.plan.empty.reviewCheckpoints" => {
+            Some("No review checkpoints recorded.")
+        }
+        "session.projection.review.empty.changedFiles" => Some("No changed files recorded."),
+        _ => None,
+    }
 }
 
 fn find_pending_session_decision(
@@ -1226,6 +1289,7 @@ fn pending_requirement_from_event(
 }
 
 fn timeline_events(timeline: &Value) -> Vec<&Value> {
+    let timeline = timeline_payload(timeline);
     let mut events = Vec::new();
     if let Some(top_level_events) = timeline.get("events").and_then(Value::as_array) {
         events.extend(top_level_events);
@@ -1348,8 +1412,102 @@ fn extract_final_text(timeline: &Value) -> Option<String> {
     None
 }
 
+fn extract_plain_text(timeline: &Value) -> Option<String> {
+    extract_final_text(timeline).or_else(|| extract_pending_decision_text(timeline))
+}
+
+fn extract_pending_decision_text(timeline: &Value) -> Option<String> {
+    let events = timeline_events(timeline);
+    let session_id = timeline_payload(timeline)
+        .get("sessionId")
+        .and_then(Value::as_str);
+    for event in events.iter().rev() {
+        let event = *event;
+        let Some(kind) = event_kind(event) else {
+            continue;
+        };
+        let pending = match kind {
+            "plan_card" | "plan_review" => pending_plan_from_event(event, &events)
+                .map(|pending| ("plan", "Pending plan decision", pending)),
+            "review_summary" => pending_review_from_event(event, &events)
+                .map(|pending| ("review", "Pending review decision", pending)),
+            "requirement_confirmation" => pending_requirement_from_event(event, &events)
+                .map(|pending| ("requirement", "Pending requirement decision", pending)),
+            _ => None,
+        };
+        if let Some((decision_kind, heading, pending)) = pending {
+            return Some(render_pending_decision_text(
+                session_id,
+                decision_kind,
+                heading,
+                event,
+                pending,
+            ));
+        }
+    }
+    None
+}
+
+fn render_pending_decision_text(
+    session_id: Option<&str>,
+    decision_kind: &str,
+    heading: &str,
+    event: &Value,
+    pending: PendingSessionDecision,
+) -> String {
+    let mut lines = vec![heading.to_string()];
+    if let Some(title) = payload_string(event, "title")
+        .or_else(|| payload_string(event, "question"))
+        .or_else(|| payload_string(event, "summary"))
+    {
+        lines.push(title.to_string());
+    }
+    if let Some(readable) = readable_projection_for_event(event) {
+        let rendered = render_readable_projection(readable);
+        if !rendered.trim().is_empty() {
+            lines.push(rendered);
+        }
+    } else if let Some(text) = pending_event_text(event) {
+        lines.push(text);
+    }
+    lines.push(format!(
+        "Decision target: {decision_kind} run={} target={}",
+        pending.run_id,
+        pending.target_id.as_deref().unwrap_or("-")
+    ));
+    if let Some(session_id) = session_id {
+        lines.push(format!(
+            "Accept: DeepCode-CLI --session {session_id} decision {decision_kind} accept"
+        ));
+        lines.push(format!(
+            "Revise: DeepCode-CLI --session {session_id} decision {decision_kind} revise <guidance>"
+        ));
+    }
+    lines.join("\n")
+}
+
+fn readable_projection_for_event(event: &Value) -> Option<&Value> {
+    let payload = event.get("payload")?;
+    match event_kind(event)? {
+        "plan_card" | "plan_review" => payload.get("readablePlan"),
+        "review_summary" => payload.get("readableReview"),
+        _ => None,
+    }
+}
+
+fn pending_event_text(event: &Value) -> Option<String> {
+    payload_string(event, "content")
+        .or_else(|| payload_string(event, "message"))
+        .or_else(|| payload_string(event, "summary"))
+        .map(ToOwned::to_owned)
+}
+
 fn session_id(session: &Value) -> Option<&str> {
     session.get("id").and_then(Value::as_str)
+}
+
+fn timeline_payload(timeline: &Value) -> &Value {
+    timeline.get("data").unwrap_or(timeline)
 }
 
 fn session_title(session: &Value) -> &str {
@@ -1573,5 +1731,98 @@ mod tests {
                 target_id: Some("review-a".to_string()),
             }
         );
+    }
+
+    #[test]
+    fn print_text_uses_pending_plan_projection() {
+        let timeline = json!({
+            "sessionId": "session-print",
+            "turns": [
+                {
+                    "blocks": [
+                        {
+                            "events": [
+                                {
+                                    "kind": "plan_card",
+                                    "payload": {
+                                        "confirmable": true,
+                                        "runId": "run-print",
+                                        "planId": "plan-print",
+                                        "title": "Prepare generic work",
+                                        "readablePlan": {
+                                            "summary": "Plan summary text",
+                                            "sections": [
+                                                {
+                                                    "sectionId": "tasks",
+                                                    "titleKey": "session.projection.plan.section.tasks",
+                                                    "items": [
+                                                {
+                                                    "kind": "task",
+                                                    "text": "Write generic module",
+                                                    "targetRefs": ["src/generic.ts"]
+                                                },
+                                                {
+                                                    "kind": "fact",
+                                                    "messageKey": "session.projection.plan.boundary.notExecution"
+                                                }
+                                            ]
+                                        }
+                                            ]
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ]
+        });
+
+        let text = extract_plain_text(&timeline).expect("pending plan text");
+        assert!(text.contains("Pending plan decision"));
+        assert!(text.contains("Plan summary text"));
+        assert!(text.contains("## Tasks"));
+        assert!(text.contains("Write generic module"));
+        assert!(text.contains("This is a plan, not an execution result."));
+        assert!(text.contains("Decision target: plan run=run-print target=plan-print"));
+        assert!(text.contains("DeepCode-CLI --session session-print decision plan accept"));
+        assert!(!text.contains("session.projection.plan.section.tasks"));
+    }
+
+    #[test]
+    fn print_text_uses_pending_plan_projection_from_api_wrapper() {
+        let timeline = json!({
+            "ok": true,
+            "data": {
+                "sessionId": "session-print-wrapper",
+                "turns": [
+                    {
+                        "blocks": [
+                            {
+                                "events": [
+                                    {
+                                        "kind": "plan_card",
+                                        "payload": {
+                                            "confirmable": true,
+                                            "runId": "run-wrapper",
+                                            "planId": "plan-wrapper",
+                                            "readablePlan": {
+                                                "summary": "Wrapped plan summary"
+                                            }
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                ]
+            }
+        });
+
+        let text = extract_plain_text(&timeline).expect("pending plan text");
+        assert!(text.contains("Pending plan decision"));
+        assert!(text.contains("Wrapped plan summary"));
+        assert!(text.contains("Decision target: plan run=run-wrapper target=plan-wrapper"));
+        assert!(text.contains("DeepCode-CLI --session session-print-wrapper decision plan accept"));
     }
 }
