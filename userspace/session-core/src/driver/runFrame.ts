@@ -102,6 +102,19 @@ export interface ProviderTurnSnapshotSegment {
   readonly charLength: number;
 }
 
+export interface ProviderTurnSnapshotDynamicAppendLogEntry {
+  readonly index: number;
+  readonly segmentId: string;
+  readonly name: string;
+  readonly cacheClass: string;
+  readonly partitionName: string;
+  readonly foldPolicy: string;
+  readonly contentHash: string;
+  readonly renderedHash: string;
+  readonly charLength: number;
+  readonly renderedCharLength: number;
+}
+
 export interface ProviderTurnSnapshotFrame {
   readonly index: number;
   readonly kind: string;
@@ -157,6 +170,9 @@ export interface ProviderTurnSnapshot {
   readonly dynamicFrameOverlapRatio: number;
   readonly segmentOrder: string[];
   readonly segments: ProviderTurnSnapshotSegment[];
+  readonly dynamicAppendLog: ProviderTurnSnapshotDynamicAppendLogEntry[];
+  readonly dynamicAppendLogHash?: string;
+  readonly dynamicAppendLogCharLength: number;
   readonly frames: ProviderTurnSnapshotFrame[];
   readonly resourceBlocks: ProviderTurnSnapshotResourceBlock[];
   readonly resourceRetentionCounts: Record<string, number>;

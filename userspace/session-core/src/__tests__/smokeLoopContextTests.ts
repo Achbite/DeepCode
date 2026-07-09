@@ -452,6 +452,18 @@ export function assertProviderTurnSnapshotRecordsContextAdmissionShape(): void {
   assertEqual(snapshot.segmentOrder.length > 0, true, 'provider turn snapshot records segment order');
   assertEqual(snapshot.segments.every((segment) => segment.contentHash.length > 0), true, 'provider turn snapshot records segment hashes');
   assertEqual(snapshot.segments.every((segment) => typeof segment.charLength === 'number'), true, 'provider turn snapshot records segment lengths');
+  assertEqual(
+    snapshot.dynamicAppendLog.map((entry) => entry.name).join(','),
+    context.contextAssembly.dynamicAppendLog.map((entry) => entry.name).join(','),
+    'provider turn snapshot preserves context dynamic append log order'
+  );
+  assertEqual(snapshot.dynamicAppendLogHash, context.contextAssembly.dynamicAppendLogHash, 'provider turn snapshot preserves dynamic append log hash');
+  assertEqual(snapshot.dynamicAppendLogCharLength, context.contextAssembly.dynamicAppendLogCharLength, 'provider turn snapshot preserves dynamic append log rendered length');
+  assertEqual(
+    snapshot.dynamicAppendLog.some((entry) => entry.foldPolicy === 'retainEvidenceHandle'),
+    true,
+    'provider turn snapshot preserves dynamic append fold policy'
+  );
   assertEqual(Object.keys(snapshot.cacheClasses).length > 0, true, 'provider turn snapshot records cache classes');
   assertEqual(snapshot.frames.at(-1)?.kind, 'NextActionInstruction', 'provider turn snapshot records final next action frame');
   assertEqual(
@@ -876,4 +888,3 @@ export async function assertHookObserverProducesTraceOnly(): Promise<void> {
   assertEqual(results[0]?.status, 'ok', 'observer hook returns trace result');
   assertEqual(results[0]?.status === 'ok' && results[0].effects?.[0]?.kind, 'appendTrace', 'observer hook effect is trace-only');
 }
-

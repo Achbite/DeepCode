@@ -1,5 +1,6 @@
 import { stableHash } from '../../cache/canonicalizer.js';
 import type {
+  ContextAssemblyDynamicAppendLogEntry,
   ContextAssemblyResourceBlockRecord,
   ContextAssemblySegmentRecord,
 } from '../../context/index.js';
@@ -7,6 +8,7 @@ import type {
   DriverProviderTurnFrame,
   ProviderContextFrame,
   ProviderTurnSnapshot,
+  ProviderTurnSnapshotDynamicAppendLogEntry,
   ProviderTurnSnapshotFrame,
   ProviderTurnSnapshotResourceBlock,
   ProviderTurnSnapshotSegment,
@@ -53,6 +55,9 @@ export function buildProviderTurnSnapshot(contract: DriverProviderTurnFrame): Pr
     dynamicFrameOverlapRatio: frameTextCharLength > 0 ? dynamicFrameOverlapCharLength / frameTextCharLength : 0,
     segmentOrder: contextAssembly?.segmentOrder ? [...contextAssembly.segmentOrder] : [],
     segments: contextAssembly?.segments.map(snapshotSegment) ?? [],
+    dynamicAppendLog: contextAssembly?.dynamicAppendLog.map(snapshotDynamicAppendLogEntry) ?? [],
+    dynamicAppendLogHash: contextAssembly?.dynamicAppendLogHash,
+    dynamicAppendLogCharLength: contextAssembly?.dynamicAppendLogCharLength ?? 0,
     frames,
     resourceBlocks: contextAssembly?.resourceBlocks.map(snapshotResourceBlock) ?? [],
     resourceRetentionCounts: { ...(contextAssembly?.resourceRetentionCounts ?? {}) },
@@ -69,6 +74,23 @@ function snapshotSegment(segment: ContextAssemblySegmentRecord): ProviderTurnSna
     auditOnly: segment.auditOnly,
     contentHash: segment.contentHash,
     charLength: segment.charLength,
+  };
+}
+
+function snapshotDynamicAppendLogEntry(
+  entry: ContextAssemblyDynamicAppendLogEntry
+): ProviderTurnSnapshotDynamicAppendLogEntry {
+  return {
+    index: entry.index,
+    segmentId: entry.segmentId,
+    name: entry.name,
+    cacheClass: entry.cacheClass,
+    partitionName: entry.partitionName,
+    foldPolicy: entry.foldPolicy,
+    contentHash: entry.contentHash,
+    renderedHash: entry.renderedHash,
+    charLength: entry.charLength,
+    renderedCharLength: entry.renderedCharLength,
   };
 }
 

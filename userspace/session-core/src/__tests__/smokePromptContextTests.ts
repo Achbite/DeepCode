@@ -453,6 +453,33 @@ export function assertContextAssemblerCachePlan(): void {
   assertEqual(base.contextAssembly.resourceBlocks.length, 0, 'simple chat path has no resource blocks');
   assertEqual(base.contextAssembly.resourceFullTextCharCount, 0, 'simple chat path has no full resource text');
   assertEqual(base.contextAssembly.resourceEvidenceTailCount, 0, 'simple chat path has no resource evidence tail entries');
+  assertEqual(
+    base.contextAssembly.dynamicAppendLog.map((entry) => entry.name).join(','),
+    base.prompt.dynamicLayerNames.join(','),
+    'context assembly dynamic append log follows prompt dynamic layer order'
+  );
+  assertEqual(
+    base.contextAssembly.dynamicAppendLog.every((entry, index) => entry.index === index),
+    true,
+    'context assembly dynamic append log has monotonic append indexes'
+  );
+  assertEqual(
+    base.contextAssembly.dynamicAppendLog.some((entry) => entry.name === 'protectedStablePrefix' || entry.name === 'auditOnlyContext'),
+    false,
+    'context assembly dynamic append log excludes stable and audit-only segments'
+  );
+  assertEqual(
+    base.contextAssembly.dynamicAppendLog.some((entry) => entry.foldPolicy === 'retainEvidenceHandle'),
+    true,
+    'context assembly dynamic append log marks evidence-tail segments for handle retention'
+  );
+  assertEqual(
+    base.contextAssembly.dynamicAppendLog.some((entry) => entry.foldPolicy === 'retainProjectMemory'),
+    true,
+    'context assembly dynamic append log marks project memory segments for memory retention'
+  );
+  assertEqual(base.contextAssembly.dynamicAppendLogHash.length > 0, true, 'context assembly dynamic append log records a stable hash');
+  assertEqual(base.contextAssembly.dynamicAppendLogCharLength > 0, true, 'context assembly dynamic append log records rendered dynamic length');
   assertEqual(base.contextAssembly.providerVisibleTokenEstimate, base.contextAssembly.partitionTokenEstimates.providerVisibleTotal, 'provider visible token estimate mirrors partition total');
   assert(base.contextAssembly.partitionCharCounts.protectedPrefix > 0, 'context assembly records protected prefix partition');
   assert(base.contextAssembly.partitionCharCounts.projectMemory > 0, 'context assembly records project memory partition');

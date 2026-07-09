@@ -87,6 +87,26 @@ export interface ContextAssemblyResourceBlockRecord {
   preview: string;
 }
 
+export type ContextAssemblyDynamicAppendFoldPolicy =
+  | 'dropAfterTask'
+  | 'retainEvidenceHandle'
+  | 'retainProjectMemory'
+  | 'retainSessionMemory'
+  | 'retainTurnContract';
+
+export interface ContextAssemblyDynamicAppendLogEntry {
+  index: number;
+  segmentId: string;
+  name: PromptSegment['name'];
+  cacheClass: PromptSegment['cacheClass'];
+  partitionName: ContextAssemblyPartitionName;
+  foldPolicy: ContextAssemblyDynamicAppendFoldPolicy;
+  contentHash: string;
+  renderedHash: string;
+  charLength: number;
+  renderedCharLength: number;
+}
+
 export interface ContextAssemblyBudgetPlan {
   policy: 'softCapReserveOutput';
   contextWindowTokens: number;
@@ -159,6 +179,9 @@ export interface ContextAssemblyRecord {
   cacheAffectsCorrectness: false;
   segmentOrder: string[];
   segments: ContextAssemblySegmentRecord[];
+  dynamicAppendLog: ContextAssemblyDynamicAppendLogEntry[];
+  dynamicAppendLogHash: string;
+  dynamicAppendLogCharLength: number;
   partitionRecords: ContextAssemblyPartitionRecord[];
   resourceBlocks: ContextAssemblyResourceBlockRecord[];
   resourceFullTextCharCount: number;
@@ -284,6 +307,7 @@ export function assembleContext(input: ContextAssemblyInput): ContextAssemblyRes
   const partitionCharCounts = contextAssemblyPartitionCharCounts(prompt.segments);
   const partitionTokenEstimates = contextAssemblyPartitionTokenEstimates(partitionCharCounts);
   const partitionRecords = contextAssemblyPartitionRecords(prompt.segments);
+  const dynamicAppendLog = contextAssemblyDynamicAppendLog(prompt.segments);
   const providerCacheAttribution = buildProviderCacheAttribution({
     provider,
     model,
@@ -323,6 +347,15 @@ export function assembleContext(input: ContextAssemblyInput): ContextAssemblyRes
     cacheAffectsCorrectness: false,
     segmentOrder: prompt.segments.map((segment) => segment.id),
     segments: prompt.segments.map(contextAssemblySegment),
+    dynamicAppendLog,
+    dynamicAppendLogHash: stableHash(JSON.stringify(dynamicAppendLog.map((entry) => ({
+      index: entry.index,
+      segmentId: entry.segmentId,
+      contentHash: entry.contentHash,
+      renderedHash: entry.renderedHash,
+      foldPolicy: entry.foldPolicy,
+    })))),
+    dynamicAppendLogCharLength: dynamicAppendLog.reduce((total, entry) => total + entry.renderedCharLength, 0),
     partitionRecords,
     resourceBlocks: resourcePromptContext.resourceBlocks.map(contextAssemblyResourceBlock),
     resourceFullTextCharCount: resourcePromptContext.resourceFullTextCharCount,
@@ -574,6 +607,53 @@ function contextAssemblyPartitionName(segment: PromptSegment): ContextAssemblyPa
     default:
       return 'CurrentRunStateAndRequest';
   }
+}
+
+function contextAssemblyDynamicAppendLog(segments: PromptSegment[]): ContextAssemblyDynamicAppendLogEntry[] {
+  return segments
+    .filter((segment) => !segment.stable && !segment.auditOnly)
+    .map((segment, index) => {
+      const rendered = renderPromptSegment(segment);
+      const partitionName = contextAssemblyPartitionName(segment);
+      return {
+        index,
+        segmentId: segment.id,
+        name: segment.name,
+        cacheClass: segment.cacheClass,
+        partitionName,
+        foldPolicy: dynamicAppendFoldPolicy(partitionName),
+        contentHash: stableHash(segment.content),
+        renderedHash: stableHash(rendered),
+        charLength: segment.content.length,
+        renderedCharLength: rendered.length,
+      };
+    });
+}
+
+function dynamicAppendFoldPolicy(
+  partitionName: ContextAssemblyPartitionName
+): ContextAssemblyDynamicAppendFoldPolicy {
+  switch (partitionName) {
+    case 'StaticToolCatalogDigest':
+      return 'retainTurnContract';
+    case 'ProjectMemory':
+      return 'retainProjectMemory';
+    case 'SessionMemory':
+      return 'retainSessionMemory';
+    case 'EvidenceTail':
+      return 'retainEvidenceHandle';
+    case 'CurrentRunStateAndRequest':
+    case 'UserRulerAndProjectInstructions':
+    case 'PlatformProtocolContract':
+    case 'AgentOperatingContract':
+    case 'AuditOnly':
+    default:
+      return 'dropAfterTask';
+  }
+}
+
+function renderPromptSegment(segment: PromptSegment): string {
+  return `<${segment.name} priority="${segment.priority}">\n${segment.content}\n</${segment.name}>`;
 }
 
 function estimateTokens(chars: number): number {
