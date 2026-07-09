@@ -23,6 +23,10 @@ export interface BuildResourcePromptContextInput {
   initialContext?: InitialContextPacket;
   conversationRoots?: ConversationResourceRoot[];
   resourcePackets?: ResourcePacket[];
+  taskLocalCompaction?: {
+    active: boolean;
+    currentTaskTargets?: string[];
+  };
 }
 
 interface ResourcePromptBlockDraft {
@@ -43,6 +47,7 @@ export function buildResourcePromptContext(input: BuildResourcePromptContextInpu
   const drafts: ResourcePromptBlockDraft[] = [];
   const orderedKeys: string[] = [];
   const blocksByKey = new Map<string, ResourcePromptBlock>();
+  const currentTaskTargets = normalizedTargetSet(input.taskLocalCompaction?.currentTaskTargets ?? []);
 
   for (let packetIndex = 0; packetIndex < resourcePackets.length; packetIndex += 1) {
     const packet = resourcePackets[packetIndex]!;
@@ -70,7 +75,10 @@ export function buildResourcePromptContext(input: BuildResourcePromptContextInpu
     }
   }
 
-  const fullTextBlockKeys = selectFullTextResourceBlockKeys(drafts);
+  const fullTextBlockKeys = selectFullTextResourceBlockKeys(drafts, {
+    foldNonCurrentTaskBlocks: input.taskLocalCompaction?.active === true,
+    currentTaskTargets,
+  });
   for (const draft of drafts) {
     const { blockKey, packet, item, content, contentHash, displayRef } = draft;
     const retention = chooseRetention(item, content, fullTextBlockKeys.has(blockKey));
@@ -125,18 +133,38 @@ export function buildResourcePromptContext(input: BuildResourcePromptContextInpu
   };
 }
 
-function selectFullTextResourceBlockKeys(drafts: ResourcePromptBlockDraft[]): Set<string> {
+function selectFullTextResourceBlockKeys(
+  drafts: ResourcePromptBlockDraft[],
+  options: {
+    foldNonCurrentTaskBlocks: boolean;
+    currentTaskTargets: Set<string>;
+  }
+): Set<string> {
   const selected = new Set<string>();
   let used = 0;
   for (let index = drafts.length - 1; index >= 0; index -= 1) {
     const draft = drafts[index]!;
     if (selected.has(draft.blockKey) || !resourceBlockFullTextEligible(draft.item, draft.content)) continue;
+    if (options.foldNonCurrentTaskBlocks && !resourceBlockMatchesCurrentTask(draft, options.currentTaskTargets)) continue;
     const nextUsed = used + draft.content.length;
     if (nextUsed > DYNAMIC_READ_FULL_TEXT_BUDGET_CHARS) continue;
     selected.add(draft.blockKey);
     used = nextUsed;
   }
   return selected;
+}
+
+function resourceBlockMatchesCurrentTask(
+  draft: ResourcePromptBlockDraft,
+  currentTaskTargets: Set<string>
+): boolean {
+  if (currentTaskTargets.size === 0) return false;
+  const ref = normalizeResourcePathForMatch(draft.displayRef);
+  if (!ref) return false;
+  for (const target of currentTaskTargets) {
+    if (ref === target || ref.startsWith(`${target}/`)) return true;
+  }
+  return false;
 }
 
 function resourceBlockFullTextEligible(item: ResourcePacketItem, content: string): boolean {
@@ -170,6 +198,20 @@ function resourceHandle(item: ResourcePacketItem, displayRef: string): string {
     typeof item.limitBytes === 'number' ? `limitBytes=${item.limitBytes}` : '',
   ].filter(Boolean).join(' ');
   return range ? `${displayRef} ${range}` : displayRef;
+}
+
+function normalizedTargetSet(targets: string[]): Set<string> {
+  return new Set(targets.map(normalizeResourcePathForMatch).filter((target): target is string => Boolean(target)));
+}
+
+function normalizeResourcePathForMatch(value: string | undefined): string | undefined {
+  const normalized = value
+    ?.trim()
+    .replace(/\\/g, '/')
+    .replace(/\/+/g, '/')
+    .replace(/^\.\//, '')
+    .replace(/\/$/, '');
+  return normalized || undefined;
 }
 
 function resourceSummary(item: ResourcePacketItem, content: string, retention: ResourceBlockRetention): string {

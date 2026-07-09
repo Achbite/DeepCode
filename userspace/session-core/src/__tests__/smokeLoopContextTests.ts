@@ -731,6 +731,96 @@ export function assertTaskLocalCompactRecordFlowsThroughCheckpoints(): void {
   assertEqual(nextAssembly.contextAssembly.latestTaskLocalCompactHash, compact.compactHash, 'ContextAdmission exposes latest task-local compact hash');
   assertEqual(snapshot.taskLocalCompactRecordCount, extracted.length, 'provider snapshot records task-local compact count');
   assertEqual(snapshot.latestTaskLocalCompactHash, compact.compactHash, 'provider snapshot records latest task-local compact hash');
+
+  const currentPath = `generated/current-${token}.txt`;
+  const previousPath = `generated/previous-${token}.txt`;
+  const foldManifest: ResourceManifest = {
+    id: `fold-manifest-${token}`,
+    workspaceScopeKey: `workspace-${token}`,
+    entries: [
+      {
+        id: `current-entry-${token}`,
+        kind: 'file',
+        label: `Current ${token}`,
+        resourceRef: currentPath,
+        readPolicy: 'autoRead',
+        reason: 'Current task evidence.',
+      },
+      {
+        id: `previous-entry-${token}`,
+        kind: 'file',
+        label: `Previous ${token}`,
+        resourceRef: previousPath,
+        readPolicy: 'autoRead',
+        reason: 'Previous task evidence.',
+      },
+    ],
+    budget: { maxEntries: 4, maxBytes: 4096 },
+    defaultDenyPatterns: [],
+  };
+  const foldPacket = createResourcePacket({
+    packetId: `fold-packet-${token}`,
+    manifest: foldManifest,
+    request: {
+      id: `fold-request-${token}`,
+      items: [
+        { id: `current-item-${token}`, manifestEntryId: `current-entry-${token}`, reason: 'Read current task evidence.' },
+        { id: `previous-item-${token}`, manifestEntryId: `previous-entry-${token}`, reason: 'Read previous task evidence.' },
+      ],
+    },
+    kernelEvidence: {
+      [`current-entry-${token}`]: {
+        contentKind: 'fileText',
+        promptContent: `current full text ${token}`,
+        evidenceRefs: [`current-evidence-${token}`],
+      },
+      [`previous-entry-${token}`]: {
+        contentKind: 'fileText',
+        promptContent: `previous full text ${token}`,
+        evidenceRefs: [`previous-evidence-${token}`],
+      },
+    },
+  });
+  const foldedAssembly = assembleContext({
+    workflowState: 'acceptedTaskExecution',
+    allowedProposals: ['actionBundle', 'resourceRequest', 'taskOutcome', 'diagnostic'],
+    capabilityCatalogSummary: 'fs.write',
+    userRequest: `folded next task ${token}`,
+    initialContext: {
+      id: `fold-context-${token}`,
+      workspaceScopeKey: `workspace-${token}`,
+      manifest: foldManifest,
+    },
+    resourcePackets: [foldPacket],
+    currentTaskContext: {
+      taskId: `current-task-${token}`,
+      targets: [currentPath],
+    },
+    taskLocalCompactRecords: [compact],
+  });
+  const currentBlock = foldedAssembly.contextAssembly.resourceBlocks.find((block) => block.displayRef === currentPath);
+  const previousBlock = foldedAssembly.contextAssembly.resourceBlocks.find((block) => block.displayRef === previousPath);
+  assertEqual(currentBlock?.retention, 'full', 'task-local compaction keeps current task target full text');
+  assertEqual(previousBlock?.retention, 'summary', 'task-local compaction folds non-current task full text to summary');
+
+  const noTargetAssembly = assembleContext({
+    workflowState: 'acceptedTaskExecution',
+    allowedProposals: ['actionBundle', 'resourceRequest', 'taskOutcome', 'diagnostic'],
+    capabilityCatalogSummary: 'fs.write',
+    userRequest: `no explicit target ${token}`,
+    initialContext: {
+      id: `no-target-context-${token}`,
+      workspaceScopeKey: `workspace-${token}`,
+      manifest: foldManifest,
+    },
+    resourcePackets: [foldPacket],
+    currentTaskContext: {
+      taskId: `no-target-task-${token}`,
+    },
+    taskLocalCompactRecords: [compact],
+  });
+  const noTargetPreviousBlock = noTargetAssembly.contextAssembly.resourceBlocks.find((block) => block.displayRef === previousPath);
+  assertEqual(noTargetPreviousBlock?.retention, 'full', 'task-local compaction does not fold full text when current task targets are unavailable');
 }
 
 export async function assertProviderTurnContextCoordinatorPassesTaskLocalCompactRecords(): Promise<void> {

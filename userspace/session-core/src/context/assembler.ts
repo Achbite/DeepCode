@@ -319,10 +319,16 @@ export function assembleContext(input: ContextAssemblyInput): ContextAssemblyRes
     projectMemoryMode: input.projectMemoryMode,
   });
   const userGuidance = input.userGuidance ?? collectUserGuidanceEvents(input.existingEvents ?? []);
+  const taskLocalCompactRecords = input.taskLocalCompactRecords ?? [];
+  const compactCurrentTaskTargets = currentTaskTargets(input.currentTaskContext);
   const resourcePromptContext = buildResourcePromptContext({
     initialContext: input.initialContext,
     conversationRoots: input.conversationRoots,
     resourcePackets: input.resourcePackets,
+    taskLocalCompaction: {
+      active: taskLocalCompactRecords.length > 0 && compactCurrentTaskTargets.length > 0,
+      currentTaskTargets: compactCurrentTaskTargets,
+    },
   });
   const promptInput: PromptEnvelopeBuilderInput = {
     workflowState: input.workflowState,
@@ -380,7 +386,6 @@ export function assembleContext(input: ContextAssemblyInput): ContextAssemblyRes
     foldPolicy: entry.foldPolicy,
   }))));
   const dynamicAppendLogCharLength = dynamicAppendLog.reduce((total, entry) => total + entry.renderedCharLength, 0);
-  const taskLocalCompactRecords = input.taskLocalCompactRecords ?? [];
   const taskLocalCompactRecordsHash = stableHash(JSON.stringify(taskLocalCompactRecords.map((record) => ({
     compactHash: record.compactHash,
     taskId: record.taskId,
@@ -799,6 +804,12 @@ function renderPromptSegment(segment: PromptSegment): string {
 
 function estimateTokens(chars: number): number {
   return Math.ceil(chars / 4);
+}
+
+function currentTaskTargets(value: unknown): string[] {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return [];
+  const targets = (value as Record<string, unknown>).targets;
+  return Array.isArray(targets) ? targets.filter((target): target is string => typeof target === 'string') : [];
 }
 
 function contextAssemblyResourceBlock(block: ResourcePromptBlock): ContextAssemblyResourceBlockRecord {
