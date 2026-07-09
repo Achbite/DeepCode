@@ -690,11 +690,27 @@ export function assertTaskLocalCompactRecordFlowsThroughCheckpoints(): void {
   assertEqual(extracted.length, 2, 'task-local compact extractor keeps recent checkpoint records');
   assertEqual(extracted.at(-1)?.compactHash, compact.compactHash, 'task-local compact extractor preserves compact hash');
 
+  const previousTaskMarker = `previous task full text marker ${token}`;
+  const decisionMarker = `preserve user decision marker ${token}`;
   const nextAssembly = assembleContext({
     workflowState: 'acceptedTaskExecution',
     allowedProposals: ['actionBundle', 'resourceRequest', 'taskOutcome', 'diagnostic'],
     capabilityCatalogSummary: 'fs.write',
     userRequest: `next accepted task ${token}`,
+    existingEvents: [
+      {
+        id: `previous-user-msg-${token}`,
+        kind: 'user_msg',
+        ts: '2026-01-01T00:00:00.000Z',
+        payload: { content: `${previousTaskMarker} ${'detail '.repeat(80)}` },
+      },
+      {
+        id: `previous-plan-review-${token}`,
+        kind: 'plan_review',
+        ts: '2026-01-01T00:00:01.000Z',
+        payload: { status: 'accepted', guidance: decisionMarker },
+      },
+    ] as any,
     currentTaskGoal: `continue generic target ${token}`,
     currentTaskContext: {
       taskId: `next-task-${token}`,
@@ -702,6 +718,21 @@ export function assertTaskLocalCompactRecordFlowsThroughCheckpoints(): void {
     },
     taskLocalCompactRecords: extracted,
   });
+  assertEqual(
+    nextAssembly.prompt.dynamicSuffix.includes(previousTaskMarker),
+    false,
+    'task-local compaction folds previous task session-memory content out of provider-visible prompt'
+  );
+  assertEqual(
+    nextAssembly.prompt.dynamicSuffix.includes('contentFolded=true'),
+    true,
+    'task-local compaction leaves a content-folded session-memory handle'
+  );
+  assertEqual(
+    nextAssembly.prompt.dynamicSuffix.includes(decisionMarker),
+    true,
+    'task-local compaction preserves explicit user decisions'
+  );
   const contract = new ContextFrameBuilder().buildSessionProviderTurnContract({
     contractId: `contract-${token}`,
     sessionId: `session-${token}`,

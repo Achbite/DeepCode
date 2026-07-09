@@ -321,6 +321,7 @@ export function assembleContext(input: ContextAssemblyInput): ContextAssemblyRes
   const userGuidance = input.userGuidance ?? collectUserGuidanceEvents(input.existingEvents ?? []);
   const taskLocalCompactRecords = input.taskLocalCompactRecords ?? [];
   const compactCurrentTaskTargets = currentTaskTargets(input.currentTaskContext);
+  const taskLocalMemoryCompactionActive = taskLocalCompactRecords.length > 0 && Boolean(input.currentTaskContext);
   const resourcePromptContext = buildResourcePromptContext({
     initialContext: input.initialContext,
     conversationRoots: input.conversationRoots,
@@ -337,7 +338,13 @@ export function assembleContext(input: ContextAssemblyInput): ContextAssemblyRes
     projectMemoryHints: renderProjectMemoryHints(memoryDocument),
     projectMemoryRecallHints: renderProjectMemoryRecallHints(memoryDocument),
     sessionMemoryHints: [
-      ...renderSessionScopedMemoryHints(memoryDocument),
+      ...renderSessionScopedMemoryHints(memoryDocument, {
+        taskLocalCompaction: {
+          active: taskLocalMemoryCompactionActive,
+          compactRecordCount: taskLocalCompactRecords.length,
+          latestCompactHash: taskLocalCompactRecords.at(-1)?.compactHash,
+        },
+      }),
       ...(input.extraMemoryHints ?? []),
     ],
     interventionLevel: input.interventionLevel,
