@@ -8204,6 +8204,7 @@ function assertProviderRepairMessageBuilderKeepsTaskPlanRepairShape(): void {
 
 function assertProviderRepairMessageBuilderScopesNativeRepairReferences(): void {
   const token = randomSmokeToken('native-repair-reference');
+  const rawAcceptedPlanMarker = `raw-accepted-plan-marker-${token}`;
   const prompt = buildPromptEnvelope({
     workflowState: `repair-${token}`,
     allowedProposals: ['resourceRequest', 'decisionRequest', 'taskPlan', 'diagnostic'],
@@ -8224,6 +8225,9 @@ function assertProviderRepairMessageBuilderScopesNativeRepairReferences(): void 
         targets: [`target-${token}.txt`],
         template: { toolId: 'fs.write', args: { path: `target-${token}.txt` } },
       }],
+      pendingTasks: [{ taskId: `later-${token}`, title: rawAcceptedPlanMarker }],
+      accessScopes: [{ path: rawAcceptedPlanMarker }],
+      rawPlan: { summary: rawAcceptedPlanMarker },
     },
     currentTaskContext: {
       taskId: `task-${token}`,
@@ -8292,7 +8296,9 @@ function assertProviderRepairMessageBuilderScopesNativeRepairReferences(): void 
   assert(scopeRepair.includes('currentTaskActionTemplates'), 'scope repair still exposes current task action templates');
   assert(!scopeRepair.includes('Minimal patch shape'), 'scope repair avoids embedding full actionBundle skeletons outside ProviderTurnContract guidance');
   assert(!scopeRepair.includes('DecisionRequest minimal shape'), 'scope repair avoids embedding full decisionRequest skeletons outside ProviderTurnContract guidance');
+  assert(!scopeRepair.includes(rawAcceptedPlanMarker), 'scope repair does not expose raw accepted plan context fields');
   assert(planReviewRepair.includes('ProviderTurnContract'), 'plan review repair still includes provider turn contract');
+  assert(!planReviewRepair.includes(rawAcceptedPlanMarker), 'plan review repair does not expose raw accepted plan context fields');
 }
 
 function assertRunStateMachineTaskLedger(): void {

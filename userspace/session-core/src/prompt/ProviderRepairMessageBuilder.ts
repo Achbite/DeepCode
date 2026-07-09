@@ -492,8 +492,8 @@ export class ProviderRepairMessageBuilder {
             errorLines: validationReasons,
           }),
           ...this.compactRepairContextLines(prompt, state, { includeImplementationBatch: true, includeAcceptedPlan: true }),
-          'Accepted task context:',
-          fenced(clip(JSON.stringify(state.acceptedContext ?? {}, null, 2), 4_000)),
+          'Accepted task summary:',
+          fenced(JSON.stringify(acceptedRepairContextSummary(state), null, 2)),
           'Invalid proposal summary:',
           fenced(clip(JSON.stringify({
             proposalId: proposal.proposalId,
@@ -523,9 +523,12 @@ export class ProviderRepairMessageBuilder {
   ): string[] {
     const roots = clip(JSON.stringify(state.conversationRoots, null, 2), 2_000);
     const packets = clip(JSON.stringify(state.resourcePackets.slice(-6), null, 2), 6_000);
+    const acceptedExecution = Boolean(state.acceptedContext && Object.keys(state.acceptedContext).length > 0) || Boolean(state.currentTaskContext);
     const lines = [
-      'Current user goal summary:',
-      fenced(clip(state.userRequest, 1_200)),
+      acceptedExecution
+        ? 'Original user request source reference, not execution authority:'
+        : 'Current user goal summary:',
+      fenced(acceptedExecution ? clip(oneLineText(state.userRequest, 240), 240) : clip(state.userRequest, 1_200)),
       'Available conversation roots summary:',
       fenced(roots || '[]'),
       'Recent ResourcePacket summary, clipped:',
@@ -540,7 +543,7 @@ export class ProviderRepairMessageBuilder {
       lines.push('Implementation batch context summary:', fenced(clip(JSON.stringify(state.implementationBatch, null, 2), 2_000)));
     }
     if (options?.includeAcceptedPlan) {
-      lines.push('Accepted plan context summary:', fenced(clip(JSON.stringify(state.acceptedContext ?? {}, null, 2), 3_000)));
+      lines.push('Accepted current task summary:', fenced(JSON.stringify(acceptedRepairContextSummary(state), null, 2)));
     }
     return lines;
   }
@@ -661,6 +664,35 @@ function decisionRequestCarrierGuidanceLine(): string {
   return 'Carrier fields by kind: decisionRequest uses top-level decisionRequest with a non-empty question, 2-3 options, and allowsFreeform=true when user input is required.';
 }
 
+function acceptedRepairContextSummary(state: ProviderRepairMessageState): Record<string, unknown> {
+  const acceptedContext = state.acceptedContext ?? {};
+  const currentTask = objectRecord(acceptedContext.currentTask);
+  const currentTaskTargets = state.currentTaskContext?.targets.length
+    ? state.currentTaskContext.targets
+    : stringArrayValue(currentTask?.targets ?? currentTask?.target);
+  const currentTaskCapabilities = state.currentTaskContext?.capabilities.length
+    ? state.currentTaskContext.capabilities
+    : stringArrayValue(currentTask?.capabilities ?? currentTask?.capability);
+  return {
+    authority: 'confirmed current accepted task',
+    originalUserRequest: 'source reference only',
+    currentTask: {
+      taskId: state.currentTaskContext?.taskId ?? stringValue(currentTask?.taskId),
+      title: state.currentTaskContext?.taskTitle ?? stringValue(currentTask?.title),
+      objective: state.currentTaskContext?.goal ?? stringValue(currentTask?.objective),
+      targets: currentTaskTargets,
+      capabilities: currentTaskCapabilities,
+    },
+    completedTaskCount: state.completedTaskCount ?? 0,
+    currentTaskOperations: Array.isArray(acceptedContext.currentTaskOperations)
+      ? acceptedContext.currentTaskOperations.length
+      : 0,
+    currentTaskActionTemplates: Array.isArray(acceptedContext.currentTaskActionTemplates)
+      ? acceptedContext.currentTaskActionTemplates.length
+      : 0,
+  };
+}
+
 function objectRecord(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
@@ -669,6 +701,17 @@ function objectRecord(value: unknown): Record<string, unknown> | undefined {
 
 function stringValue(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+function stringArrayValue(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0);
+  }
+  return typeof value === 'string' && value.trim().length > 0 ? [value.trim()] : [];
+}
+
+function oneLineText(value: string, maxChars: number): string {
+  return clip(value.replace(/\s+/g, ' ').trim(), maxChars);
 }
 
 function clip(value: string, max: number): string {
