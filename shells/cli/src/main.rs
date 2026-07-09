@@ -1100,12 +1100,18 @@ fn structured_projection_text(block: &Value) -> Option<String> {
 
 fn render_readable_projection(readable: &Value) -> String {
     let mut lines = Vec::new();
-    if let Some(summary) = readable.get("summary").and_then(Value::as_str) {
-        lines.push(summary.to_string());
-    } else if let Some(summary_key) = readable.get("summaryKey").and_then(Value::as_str) {
-        lines.push(summary_key.to_string());
+    let sections = readable.get("sections").and_then(Value::as_array);
+    let summary_is_structured = sections
+        .map(|sections| sections.iter().any(readable_section_has_summary_items))
+        .unwrap_or(false);
+    if !summary_is_structured {
+        if let Some(summary) = readable.get("summary").and_then(Value::as_str) {
+            lines.push(summary.to_string());
+        } else if let Some(summary_key) = readable.get("summaryKey").and_then(Value::as_str) {
+            lines.push(summary_key.to_string());
+        }
     }
-    if let Some(sections) = readable.get("sections").and_then(Value::as_array) {
+    if let Some(sections) = sections {
         for section in sections {
             if let Some(title) = readable_section_title(section) {
                 lines.push(format!("## {title}"));
@@ -1140,6 +1146,25 @@ fn render_readable_projection(readable: &Value) -> String {
         }
     }
     lines.join("\n")
+}
+
+fn readable_section_has_summary_items(section: &Value) -> bool {
+    let section_key = section
+        .get("sectionId")
+        .or_else(|| section.get("titleKey"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !matches!(
+        section_key,
+        "summary" | "session.projection.plan.section.summary"
+    ) {
+        return false;
+    }
+    section
+        .get("items")
+        .and_then(Value::as_array)
+        .map(|items| items.iter().any(|item| readable_item_text(item).is_some()))
+        .unwrap_or(false)
 }
 
 fn readable_item_text(item: &Value) -> Option<String> {
@@ -1455,14 +1480,20 @@ fn render_pending_decision_text(
     event: &Value,
     pending: PendingSessionDecision,
 ) -> String {
+    // CLI groups shared projection fields for readability; event payloads remain the fact source.
     let mut lines = vec![heading.to_string()];
-    if let Some(title) = payload_string(event, "title")
-        .or_else(|| payload_string(event, "question"))
-        .or_else(|| payload_string(event, "summary"))
-    {
-        lines.push(title.to_string());
-    }
     if let Some(readable) = readable_projection_for_event(event) {
+        let readable_summary = readable_projection_summary(readable);
+        if let Some(title) = payload_string(event, "title")
+            .or_else(|| payload_string(event, "question"))
+            .filter(|title| {
+                readable_summary
+                    .map(|summary| !equivalent_render_text(title, summary))
+                    .unwrap_or(true)
+            })
+        {
+            lines.push(title.to_string());
+        }
         let rendered = render_readable_projection(readable);
         if !rendered.trim().is_empty() {
             lines.push(rendered);
@@ -1484,6 +1515,21 @@ fn render_pending_decision_text(
         ));
     }
     lines.join("\n")
+}
+
+fn readable_projection_summary(readable: &Value) -> Option<&str> {
+    readable
+        .get("summary")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn equivalent_render_text(left: &str, right: &str) -> bool {
+    normalize_render_text(left) == normalize_render_text(right)
+}
+
+fn normalize_render_text(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn readable_projection_for_event(event: &Value) -> Option<&Value> {
@@ -1787,6 +1833,64 @@ mod tests {
         assert!(text.contains("Decision target: plan run=run-print target=plan-print"));
         assert!(text.contains("DeepCode-CLI --session session-print decision plan accept"));
         assert!(!text.contains("session.projection.plan.section.tasks"));
+    }
+
+    #[test]
+    fn print_text_deduplicates_structured_plan_summary() {
+        let timeline = json!({
+            "sessionId": "session-dedupe",
+            "turns": [
+                {
+                    "blocks": [
+                        {
+                            "events": [
+                                {
+                                    "kind": "plan_card",
+                                    "payload": {
+                                        "confirmable": true,
+                                        "runId": "run-dedupe",
+                                        "planId": "plan-dedupe",
+                                        "summary": "Shared summary",
+                                        "readablePlan": {
+                                            "summary": "Shared summary",
+                                            "sections": [
+                                                {
+                                                    "sectionId": "summary",
+                                                    "titleKey": "session.projection.plan.section.summary",
+                                                    "items": [
+                                                        {
+                                                            "kind": "text",
+                                                            "text": "Shared summary"
+                                                        }
+                                                    ]
+                                                },
+                                                {
+                                                    "sectionId": "tasks",
+                                                    "titleKey": "session.projection.plan.section.tasks",
+                                                    "items": [
+                                                        {
+                                                            "kind": "task",
+                                                            "text": "Complete generic step"
+                                                        }
+                                                    ]
+                                                }
+                                            ]
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ]
+        });
+
+        let text = extract_plain_text(&timeline).expect("pending plan text");
+        assert_eq!(text.matches("Shared summary").count(), 1);
+        assert!(text.contains("## Summary"));
+        assert!(text.contains("## Tasks"));
+        assert!(text.contains("Complete generic step"));
+        assert!(text.contains("Decision target: plan run=run-dedupe target=plan-dedupe"));
     }
 
     #[test]
