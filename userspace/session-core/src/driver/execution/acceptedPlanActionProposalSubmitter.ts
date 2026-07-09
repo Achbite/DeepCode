@@ -7,7 +7,12 @@ import type {
   KernelReply,
   ProjectionDelta,
 } from '@deepcode/protocol';
-import type { ProjectMemoryMode } from '../../context/index.js';
+import {
+  buildTaskLocalCompactRecord,
+  type ContextAssemblyRecord,
+  type ContextAssemblyTaskLocalCompactRecord,
+  type ProjectMemoryMode,
+} from '../../context/index.js';
 import type { ProjectWorkingDirectory } from '../../context/types.js';
 import type { AcceptedImplementationPlanContext, AcceptedPlanBatchProgress } from '../../accepted-plan/types.js';
 import type { ProposalEnvelope, ResourceRequestDraft } from '../../protocol/types.js';
@@ -51,6 +56,7 @@ export interface AcceptedPlanActionProposalState {
   currentTaskContext?: {
     taskId?: string;
   };
+  contextAssembly?: ContextAssemblyRecord;
   acceptedPlanScopeRepairAttempted?: boolean;
   planReviewRepairAttempted?: boolean;
 }
@@ -175,7 +181,8 @@ export interface AcceptedPlanActionProposalSubmitterPorts<
     kernelEvents: unknown[],
     progress: unknown,
     ts: string,
-    id: string
+    id: string,
+    contextCompactRecord?: ContextAssemblyTaskLocalCompactRecord
   ): AgentEvent;
   taskSavepointEvent(
     sessionId: string,
@@ -187,7 +194,8 @@ export interface AcceptedPlanActionProposalSubmitterPorts<
     cursor: unknown,
     context: unknown,
     ts: string,
-    id: string
+    id: string,
+    contextCompactRecord?: ContextAssemblyTaskLocalCompactRecord
   ): AgentEvent;
   executionRequest(plan: any, acceptedPlan: AcceptedImplementationPlanContext): string;
   continueSameLoop(input: AcceptedPlanActionProposalResumeInput): Promise<AgentSessionResult>;
@@ -588,6 +596,14 @@ export class AcceptedPlanActionProposalSubmitter<
     const nextAccepted = ledgerEffect.nextAcceptedPlan;
     this.ports.refreshRuntimeState(state);
     const savepointId = this.ports.createId('accepted-plan-task-savepoint');
+    const contextCompactRecord = buildTaskLocalCompactRecord({
+      contextAssembly: state.contextAssembly,
+      source: 'kernelBatchCheckpoint',
+      status: 'completedByKernelFacts',
+      planId: accepted.planId,
+      runId: state.runId,
+      taskId: state.currentTaskContext?.taskId,
+    });
     result = await this.ports.append(state.sessionId, [
       this.ports.batchCheckpointEvent(
         state.sessionId,
@@ -597,7 +613,8 @@ export class AcceptedPlanActionProposalSubmitter<
         batchReply.events ?? [],
         batchProgress,
         this.ports.now(),
-        this.ports.createId('accepted-plan-batch-checkpoint')
+        this.ports.createId('accepted-plan-batch-checkpoint'),
+        contextCompactRecord
       ),
       this.ports.taskSavepointEvent(
         state.sessionId,
@@ -609,7 +626,8 @@ export class AcceptedPlanActionProposalSubmitter<
         state.taskExecutionCursor,
         state.currentTaskContext,
         this.ports.now(),
-        savepointId
+        savepointId,
+        contextCompactRecord
       ),
     ]) ?? result;
     if (state.taskExecutionCursor) {
@@ -738,6 +756,14 @@ export class AcceptedPlanActionProposalSubmitter<
         .filter((id) => !settled.has(id)),
     };
     const savepointId = this.ports.createId('accepted-plan-task-savepoint');
+    const contextCompactRecord = buildTaskLocalCompactRecord({
+      contextAssembly: state.contextAssembly,
+      source: 'modelTaskOutcome',
+      status: 'modelJudgedSufficient',
+      planId: accepted.planId,
+      runId: state.runId,
+      taskId,
+    });
     const checkpointResult = await this.ports.append(state.sessionId, [
       this.ports.batchCheckpointEvent(
         state.sessionId,
@@ -747,7 +773,8 @@ export class AcceptedPlanActionProposalSubmitter<
         [],
         progress,
         this.ports.now(),
-        this.ports.createId('accepted-plan-task-outcome-checkpoint')
+        this.ports.createId('accepted-plan-task-outcome-checkpoint'),
+        contextCompactRecord
       ),
       this.ports.taskSavepointEvent(
         state.sessionId,
@@ -759,7 +786,8 @@ export class AcceptedPlanActionProposalSubmitter<
         state.taskExecutionCursor,
         state.currentTaskContext,
         this.ports.now(),
-        savepointId
+        savepointId,
+        contextCompactRecord
       ),
     ]) ?? fallback;
     if (state.taskExecutionCursor) {

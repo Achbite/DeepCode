@@ -255,7 +255,7 @@ export class SessionDriverLoop {
         ),
       recordTaskCompletion: (completionInput) => acceptedPlanTaskLedger().recordTaskCompletion(completionInput),
       complete: (accepted) => acceptedPlanTaskLedger().complete(accepted),
-      resourceValidationCheckpointEvent: (sessionId, runId, accepted, packet, completion, ts, id) =>
+      resourceValidationCheckpointEvent: (sessionId, runId, accepted, packet, completion, ts, id, contextCompactRecord) =>
         sessionProgressProjectionBuilder.acceptedPlanResourceValidationCheckpointEvent(
           sessionId,
           runId,
@@ -263,7 +263,8 @@ export class SessionDriverLoop {
           packet,
           completion,
           ts,
-          id
+          id,
+          contextCompactRecord
         ),
       executionRequest: (plan, acceptedPlan) =>
         executionPromptCoordinator().executionRequest(
@@ -435,7 +436,7 @@ export class SessionDriverLoop {
       recordModelTaskOutcome: (outcomeInput) => acceptedPlanTaskLedger().recordModelTaskOutcome(outcomeInput),
       refreshRuntimeState: (state) => acceptedPlanTaskLedger().refreshRuntimeState(state),
       complete: (accepted) => acceptedPlanTaskLedger().complete(accepted),
-      batchCheckpointEvent: (sessionId, runId, accepted, proposal, kernelEvents, progress, ts, id) =>
+      batchCheckpointEvent: (sessionId, runId, accepted, proposal, kernelEvents, progress, ts, id, contextCompactRecord) =>
         sessionProgressProjectionBuilder.acceptedPlanBatchCheckpointEvent(
           sessionId,
           runId,
@@ -444,9 +445,10 @@ export class SessionDriverLoop {
           kernelEvents,
           progress as Parameters<typeof sessionProgressProjectionBuilder.acceptedPlanBatchCheckpointEvent>[5],
           ts,
-          id
+          id,
+          contextCompactRecord
         ),
-      taskSavepointEvent: (sessionId, runId, accepted, nextAccepted, progress, kernelEvents, cursor, context, ts, id) =>
+      taskSavepointEvent: (sessionId, runId, accepted, nextAccepted, progress, kernelEvents, cursor, context, ts, id, contextCompactRecord) =>
         sessionProgressProjectionBuilder.acceptedPlanTaskSavepointEvent(
           sessionId,
           runId,
@@ -457,7 +459,8 @@ export class SessionDriverLoop {
           cursor as Parameters<typeof sessionProgressProjectionBuilder.acceptedPlanTaskSavepointEvent>[6],
           context as Parameters<typeof sessionProgressProjectionBuilder.acceptedPlanTaskSavepointEvent>[7],
           ts,
-          id
+          id,
+          contextCompactRecord
         ),
       executionRequest: (plan, acceptedPlan) => executionPromptCoordinator().executionRequest(plan, acceptedPlan),
       continueSameLoop: this.sameLoopContinuation.runUserTurn,

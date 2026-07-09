@@ -1,6 +1,7 @@
 import type { AgentSessionResult } from '@deepcode/protocol';
 import {
   assembleContext,
+  buildTaskLocalCompactRecord,
   buildPromptEnvelope,
   buildResourcePromptContext,
   buildSessionMemoryDocument,
@@ -14,9 +15,11 @@ import {
   ProviderTurnContextCoordinator,
 } from '../driver/context/index.js';
 import { HookPolicy, HookRegistry, HookRuntime } from '../driver/hooks/index.js';
+import { SessionProgressProjectionBuilder } from '../driver/projection/index.js';
 import { routeProposalKind } from '../driver/proposal/proposalRouter.js';
 import { acceptedPlanContinuationInput, decisionContinuationInput, SameLoopContinuation } from '../driver/runContinuation.js';
 import { RunEngine } from '../driver/runEngine.js';
+import { buildTaskLedgerSnapshot } from '../run-state/index.js';
 import {
   assert,
   assertEqual,
@@ -506,6 +509,178 @@ export function assertProviderTurnSnapshotRecordsContextAdmissionShape(): void {
   assertEqual(snapshot.dynamicDialogueFrameTextOccurrences >= 1, true, 'provider turn snapshot counts dynamic dialogue text in provider contract frames');
   assertEqual(snapshot.finalUserPromptHash.length > 0, true, 'provider turn snapshot records final user prompt hash');
   assertEqual(snapshot.finalUserPromptCharLength > snapshot.dynamicSuffixCharLength, true, 'provider turn snapshot records rendered contract appended to dynamic prompt');
+}
+
+export function assertTaskLocalCompactRecordFlowsThroughCheckpoints(): void {
+  const token = randomSmokeToken('task-compact');
+  const context = assembleContext({
+    workflowState: 'acceptedTaskExecution',
+    allowedProposals: ['actionBundle', 'resourceRequest', 'taskOutcome', 'diagnostic'],
+    capabilityCatalogSummary: 'fs.write',
+    userRequest: `accepted task ${token}`,
+    currentTaskGoal: `write generic target ${token}`,
+    currentTaskContext: {
+      taskId: `task-${token}`,
+      targets: [`generated/${token}.txt`],
+    },
+    taskCursor: {
+      cursorId: `cursor-${token}`,
+      lastSavepointId: `savepoint-${token}`,
+    },
+  });
+  const compact = buildTaskLocalCompactRecord({
+    contextAssembly: context.contextAssembly,
+    source: 'kernelBatchCheckpoint',
+    status: 'completedByKernelFacts',
+    planId: `plan-${token}`,
+    runId: `run-${token}`,
+    taskId: `task-${token}`,
+  });
+  assert(compact, 'task-local compact record is produced from context assembly');
+  if (!compact) throw new Error('task-local compact record setup failed');
+  assertEqual(compact.boundary, 'sessionContextMetadataOnly', 'task-local compact record stays metadata-only');
+  assertEqual(compact.dynamicAppendLogHash, context.contextAssembly.dynamicAppendLogHash, 'task-local compact record points to dynamic append log');
+  assertEqual(compact.taskLocalFoldPlanHash, context.contextAssembly.taskLocalFoldPlanHash, 'task-local compact record points to fold plan');
+  assertEqual(compact.foldablePolicies.includes('dropAfterTask'), true, 'task-local compact record preserves foldable policy');
+  assertEqual(compact.compactHash.length > 0, true, 'task-local compact record has stable hash');
+
+  const accepted: AcceptedImplementationPlanContext = {
+    planId: `plan-${token}`,
+    runId: `run-${token}`,
+    title: `Plan ${token}`,
+    tasks: [{
+      taskId: `task-${token}`,
+      title: `Task ${token}`,
+      targets: [`generated/${token}.txt`],
+      capability: 'fs.write',
+      dependencies: [],
+      conflictKeys: [],
+    }],
+    capabilities: ['fs.write'],
+    targetScopes: [`generated/${token}.txt`],
+    exactOperationGrants: [],
+    accessScopes: [],
+    batchIndex: 0,
+    completedTaskIds: [],
+    rawPlan: {},
+  };
+  const builder = new SessionProgressProjectionBuilder({
+    interactionOverlayPayload: () => ({}),
+    hasFailureOrBlocker: () => false,
+    auditAcceptedPlanBatch: () => ({}),
+    actionBundleAdmissionBatch: () => ({}),
+    acceptedPlanTaskLedger: (plan) => buildTaskLedgerSnapshot({
+      planId: plan.planId,
+      runId: plan.runId,
+      tasks: plan.tasks.map((task) => ({
+        taskId: task.taskId,
+        title: task.title,
+        targets: task.targets,
+        capability: task.capability,
+      })),
+      completedTaskIds: plan.completedTaskIds,
+      modelJudgedSufficientTaskIds: plan.modelJudgedSufficientTaskIds ?? [],
+    }),
+    acceptedPlanPromptFrame: () => undefined,
+  });
+  const progress = {
+    actionIds: [`action-${token}`],
+    targetPaths: [`generated/${token}.txt`],
+    workUnitIds: [`work-unit-${token}`],
+    newlyCompletedTaskIds: [`task-${token}`],
+    completedTaskIds: [`task-${token}`],
+    remainingTaskIds: [],
+  };
+  const checkpoint = builder.acceptedPlanBatchCheckpointEvent(
+    `session-${token}`,
+    `run-${token}`,
+    accepted,
+    genericProposal(token, 'actionBundle'),
+    [],
+    progress,
+    '2026-01-01T00:00:00.000Z',
+    `checkpoint-${token}`,
+    compact
+  );
+  const savepoint = builder.acceptedPlanTaskSavepointEvent(
+    `session-${token}`,
+    `run-${token}`,
+    accepted,
+    { ...accepted, completedTaskIds: [`task-${token}`] },
+    progress,
+    [],
+    {
+      cursorId: `cursor-${token}`,
+      planId: `plan-${token}`,
+      currentTaskId: `task-${token}`,
+      taskOrder: [`task-${token}`],
+      pendingTaskIds: [],
+      completedTaskIds: [`task-${token}`],
+      lastResourcePacketIds: [],
+    },
+    {
+      goal: `write generic target ${token}`,
+      taskId: `task-${token}`,
+      targets: [`generated/${token}.txt`],
+      capabilities: ['fs.write'],
+      taskOrder: [`task-${token}`],
+      pendingTaskIds: [],
+      dependsOn: [],
+      evidenceNeeds: [],
+      completedTaskIds: [`task-${token}`],
+    },
+    '2026-01-01T00:00:00.000Z',
+    `savepoint-${token}`,
+    compact
+  );
+  const manifest: ResourceManifest = {
+    id: `manifest-${token}`,
+    workspaceScopeKey: `workspace-${token}`,
+    entries: [{
+      id: `entry-${token}`,
+      kind: 'file',
+      label: `File generated/${token}.txt`,
+      resourceRef: `generated/${token}.txt`,
+      readPolicy: 'autoRead',
+      reason: 'Generic resource validation input.',
+    }],
+    budget: { maxEntries: 4, maxBytes: 4096 },
+    defaultDenyPatterns: [],
+  };
+  const packet = createResourcePacket({
+    packetId: `packet-${token}`,
+    manifest,
+    request: {
+      id: `request-${token}`,
+      items: [{ id: `item-${token}`, manifestEntryId: `entry-${token}`, reason: 'Read generic resource.' }],
+    },
+    kernelEvidence: {
+      [`entry-${token}`]: {
+        contentKind: 'fileText',
+        promptContent: `content ${token}`,
+        evidenceRefs: [`evidence-${token}`],
+      },
+    },
+  });
+  const validationCheckpoint = builder.acceptedPlanResourceValidationCheckpointEvent(
+    `session-${token}`,
+    `run-${token}`,
+    accepted,
+    packet,
+    {
+      taskId: `task-${token}`,
+      newlyCompletedTaskIds: [`task-${token}`],
+      completedTaskIds: [`task-${token}`],
+      remainingTaskIds: [],
+      coveredTargets: [`generated/${token}.txt`],
+    },
+    '2026-01-01T00:00:00.000Z',
+    `validation-checkpoint-${token}`,
+    compact
+  );
+  assertEqual((checkpoint.payload as any).contextCompactRecord?.compactHash, compact.compactHash, 'batch checkpoint carries task-local compact record');
+  assertEqual((savepoint.payload as any).contextCompactRecord?.compactHash, compact.compactHash, 'task savepoint carries task-local compact record');
+  assertEqual((validationCheckpoint.payload as any).contextCompactRecord?.compactHash, compact.compactHash, 'resource validation checkpoint carries task-local compact record');
 }
 
 export async function assertProviderTurnContextCoordinatorUsesFreshAssembly(): Promise<void> {

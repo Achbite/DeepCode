@@ -1,5 +1,6 @@
 import type { AgentConversationActivity, AgentEvent } from '@deepcode/protocol';
 import type { ProposalEnvelope } from '../../protocol/types.js';
+import type { ContextAssemblyTaskLocalCompactRecord } from '../../context/index.js';
 import type { ResourcePacket } from '../../context/types.js';
 import type {
   AcceptedImplementationPlanContext,
@@ -241,7 +242,8 @@ export class SessionProgressProjectionBuilder {
     kernelEvents: unknown[],
     progress: AcceptedPlanBatchProgress,
     ts: string,
-    id: string
+    id: string,
+    contextCompactRecord?: ContextAssemblyTaskLocalCompactRecord
   ): AgentEvent {
     const failedOrBlocked = this.ports.hasFailureOrBlocker(kernelEvents);
     const complete = !failedOrBlocked && progress.remainingTaskIds.length === 0;
@@ -284,6 +286,7 @@ export class SessionProgressProjectionBuilder {
         taskLedger: ledger,
         taskOrder: ledger.taskOrder,
         nextPendingTaskIds: ledger.pendingTaskIds,
+        contextCompactRecord,
         channel: 'progress',
         visibility: 'conversation',
         presentation: 'collapsible',
@@ -311,7 +314,8 @@ export class SessionProgressProjectionBuilder {
     packet: ResourcePacket,
     completion: AcceptedPlanReadOnlyResourceCompletion,
     ts: string,
-    id: string
+    id: string,
+    contextCompactRecord?: ContextAssemblyTaskLocalCompactRecord
   ): AgentEvent {
     const complete = completion.remainingTaskIds.length === 0;
     const ledger = buildTaskLedgerSnapshot({
@@ -347,6 +351,7 @@ export class SessionProgressProjectionBuilder {
         taskLedger: ledger,
         taskOrder: ledger.taskOrder,
         nextPendingTaskIds: ledger.pendingTaskIds,
+        contextCompactRecord,
         channel: 'progress',
         visibility: 'conversation',
         presentation: 'collapsible',
@@ -509,7 +514,8 @@ export class SessionProgressProjectionBuilder {
     cursor: TaskExecutionCursor | undefined,
     context: CurrentTaskContext | undefined,
     ts: string,
-    id: string
+    id: string,
+    contextCompactRecord?: ContextAssemblyTaskLocalCompactRecord
   ): AgentEvent {
     const complete = progress.remainingTaskIds.length === 0 && !this.ports.hasFailureOrBlocker(kernelEvents);
     const ledger = this.ports.acceptedPlanTaskLedger(nextAccepted);
@@ -549,6 +555,7 @@ export class SessionProgressProjectionBuilder {
         targetPaths: progress.targetPaths,
         workUnitIds: progress.workUnitIds,
         kernelEventCount: kernelEvents.length,
+        contextCompactRecord,
         memoryUpdateSummary: 'SessionMemory will retain the active task focus, completed task ids, and next checkpoint as derived intent/checkpoint memory.',
         channel: 'progress',
         visibility: 'conversation',

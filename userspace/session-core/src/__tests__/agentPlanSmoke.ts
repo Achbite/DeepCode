@@ -176,6 +176,7 @@ import {
   assertRunEngineContinuesOnlyForResourceRequestRoute,
   assertRunEngineRejectsUnexpectedContinueRoute,
   assertSameLoopContinuationUsesSingleResumePort,
+  assertTaskLocalCompactRecordFlowsThroughCheckpoints,
 } from './smokeLoopContextTests.js';
 import {
   assertContextAssemblerCachePlan,
@@ -225,6 +226,7 @@ async function main(): Promise<void> {
   assertContextAssemblerCachePlan();
   assertProviderTurnContractFrameOrder();
   assertProviderTurnSnapshotRecordsContextAdmissionShape();
+  assertTaskLocalCompactRecordFlowsThroughCheckpoints();
   await assertProviderTurnContextCoordinatorUsesFreshAssembly();
   await assertProviderTurnContextCoordinatorNarrowsPlanningAllowedKinds();
   await assertProviderTurnContextCoordinatorScopesAcceptedExecutionCatalog();

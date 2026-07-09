@@ -5,7 +5,12 @@ import type {
   AgentWorkspaceBinding,
   LlmChatRequest,
 } from '@deepcode/protocol';
-import type { ProjectMemoryMode } from '../../context/index.js';
+import {
+  buildTaskLocalCompactRecord,
+  type ContextAssemblyRecord,
+  type ContextAssemblyTaskLocalCompactRecord,
+  type ProjectMemoryMode,
+} from '../../context/index.js';
 import type {
   ConversationResourceRoot,
   ProjectWorkingDirectory,
@@ -49,6 +54,7 @@ export interface AcceptedPlanReadOnlyTaskState {
   conversationRoots: ConversationResourceRoot[];
   taskExecutionCursor?: unknown;
   currentTaskContext?: unknown;
+  contextAssembly?: ContextAssemblyRecord;
 }
 
 export interface AcceptedPlanReadOnlyResourceResumeInput<State extends AcceptedPlanReadOnlyTaskState> {
@@ -98,7 +104,8 @@ export interface AcceptedPlanReadOnlyTaskExecutorPorts<
     packet: ResourcePacket,
     completion: AcceptedPlanReadOnlyResourceCompletion,
     ts: string,
-    id: string
+    id: string,
+    contextCompactRecord?: ContextAssemblyTaskLocalCompactRecord
   ): AgentEvent;
   executionRequest(plan: Record<string, unknown>, acceptedPlan: AcceptedImplementationPlanContext): string;
   readOnlyReviewContext(input: {
@@ -201,6 +208,14 @@ export class AcceptedPlanReadOnlyTaskExecutor<
       completedTaskIds: completion.completedTaskIds,
     });
     const nextAccepted = ledgerEffect.nextAcceptedPlan;
+    const contextCompactRecord = buildTaskLocalCompactRecord({
+      contextAssembly: state.contextAssembly,
+      source: 'resourceValidation',
+      status: 'completedByReadOnlyEvidence',
+      planId: accepted.planId,
+      runId: state.runId,
+      taskId: completion.taskId,
+    });
     const checkpoint = this.ports.resourceValidationCheckpointEvent(
       state.sessionId,
       state.runId,
@@ -208,7 +223,8 @@ export class AcceptedPlanReadOnlyTaskExecutor<
       packet,
       completion,
       this.ports.now(),
-      this.ports.createId('accepted-plan-resource-validation-checkpoint')
+      this.ports.createId('accepted-plan-resource-validation-checkpoint'),
+      contextCompactRecord
     );
     let result = await this.ports.append(state.sessionId, [checkpoint]) ?? fallback;
 
