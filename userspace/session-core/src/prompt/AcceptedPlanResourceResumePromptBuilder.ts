@@ -1,4 +1,3 @@
-import { actionBundleProtocolShapeLines, resourceRequestProtocolShapeLine } from '../protocol/protocolContract.js';
 import type { ProposalEnvelope } from '../protocol/types.js';
 import type { ResourcePacket } from '../context/types.js';
 import type { ProviderRepairMessageBuilder, ProviderRepairMessageState } from './ProviderRepairMessageBuilder.js';
@@ -68,8 +67,7 @@ export class AcceptedPlanResourceResumePromptBuilder {
       'Before the final JSON proposal, stream visible edit drafts with <deepcode-part>{...}</deepcode-part> frames when generating long codeBlocks/actionBundles. These frames are draft ledger previews only; final workspace writes still come only from the complete actionBundle JSON.',
       'All user-visible natural language in narration, userPlanMarkdown, validation descriptions, and review guidance must follow the current user input language.',
       `Return exactly one Agent Protocol v3 proposal: ${ACCEPTED_PLAN_RESOURCE_RESUME_ALLOWED_KINDS.join(', ')}.`,
-      ...resourceResumeProposalShapeLines(),
-      resourceRequestProtocolShapeLine(),
+      resourceResumeCarrierLine(),
       'Prefer actionBundle if the just-resolved evidence is sufficient for an edit task. If the current task is already sufficiently satisfied and no Kernel action is needed, return a taskOutcome object. If more evidence is needed, request only a different focused resource. If a concrete operation exceeds accepted scope, Session and Kernel will interrupt for user approval after proposal validation.',
       acceptedPlan ? `Accepted plan progress: planId=${acceptedPlan.planId}; completedTaskCount=${acceptedPlan.completedTaskIds.length}; remainingTaskCount=${acceptedPlan.tasks.filter((task) => !acceptedPlan.completedTaskIds.includes(task.taskId)).length}.` : '',
       cursor ? `TaskExecutionCursor: currentTaskId=${cursor.currentTaskId ?? 'none'}; completedTaskCount=${cursor.completedTaskIds.length}; lastResourcePackets=${cursor.lastResourcePacketIds.join(', ') || 'none'}.` : '',
@@ -84,14 +82,9 @@ export class AcceptedPlanResourceResumePromptBuilder {
   }
 }
 
-function resourceResumeProposalShapeLines(): string[] {
-  return [
-    'For kind="actionBundle", put userPlanMarkdown, codeBlocks, and actionBundle directly on the top-level JSON object. Do not wrap them in payload.',
-    ...actionBundleProtocolShapeLines(),
-    'For kind="taskOutcome", put taskOutcome:{version:"1",id,taskId,status:"modelJudgedSufficient",reason,evidenceRefs:[]} on the top-level JSON object. Do not return taskOutcome as a string, boolean, array, or markdown summary.',
-    'For kind="decisionRequest", put decisionRequest:{version:"1",id,question,options,allowsFreeform} on the top-level JSON object.',
-    'For kind="diagnostic", put diagnostic:{version:"1",id,severity,summary,details?} on the top-level JSON object.',
-  ];
+function resourceResumeCarrierLine(): string {
+  // ProviderTurnContract owns the schema details; this checkpoint only names the top-level carriers.
+  return 'Use the ProviderTurnContract above as the schema authority. Carrier fields by kind: actionBundle uses userPlanMarkdown/codeBlocks/actionBundle; resourceRequest uses resourceRequest; taskOutcome uses taskOutcome; decisionRequest uses decisionRequest; diagnostic uses diagnostic. Do not add payload wrappers or explanatory prose outside the final JSON object.';
 }
 
 function objectRecord(value: unknown): Record<string, unknown> | undefined {

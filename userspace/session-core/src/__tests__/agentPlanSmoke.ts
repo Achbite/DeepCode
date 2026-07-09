@@ -2720,12 +2720,20 @@ async function assertAcceptedPlanResourceResumeCoordinatorBuildsProviderTurn(): 
     'resource resume prompt does not expose answer as an execution-stage output'
   );
   assert(
-    resumeUserPrompt.includes('For kind="taskOutcome", put taskOutcome:{version:"1",id,taskId,status:"modelJudgedSufficient",reason,evidenceRefs:[]}'),
-    'resource resume prompt shows the required taskOutcome object shape'
+    resumeUserPrompt.includes('Use the ProviderTurnContract above as the schema authority.'),
+    'resource resume prompt delegates schema details to ProviderTurnContract'
   );
   assert(
-    resumeUserPrompt.includes('For kind="actionBundle", put userPlanMarkdown, codeBlocks, and actionBundle directly on the top-level JSON object'),
-    'resource resume prompt shows the required top-level actionBundle shape'
+    resumeUserPrompt.includes('Carrier fields by kind: actionBundle uses userPlanMarkdown/codeBlocks/actionBundle; resourceRequest uses resourceRequest; taskOutcome uses taskOutcome; decisionRequest uses decisionRequest; diagnostic uses diagnostic.'),
+    'resource resume prompt keeps only compact carrier guidance'
+  );
+  assert(
+    !resumeUserPrompt.includes('fs.write actions must use args={path,sourceBlockId}'),
+    'resource resume prompt does not duplicate full actionBundle protocol details'
+  );
+  assert(
+    !resumeUserPrompt.includes('resourceRequest field must be shaped'),
+    'resource resume prompt does not duplicate full resourceRequest protocol details'
   );
   assert(
     resumeUserPrompt.includes('ProviderTurnContract:'),
