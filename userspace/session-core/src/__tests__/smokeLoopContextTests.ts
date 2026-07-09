@@ -11,6 +11,7 @@ import {
 } from '../index.js';
 import type { AcceptedImplementationPlanContext } from '../accepted-plan/index.js';
 import { ContextFrameBuilder } from '../driver/context/contextFrameBuilder.js';
+import { renderProviderTurnUserPrompt } from '../driver/context/providerTurnPromptRenderer.js';
 import {
   buildProviderTurnSnapshot,
   ProviderTurnContextCoordinator,
@@ -510,6 +511,22 @@ export function assertProviderTurnSnapshotRecordsContextAdmissionShape(): void {
   assertEqual(snapshot.dynamicDialogueFrameTextOccurrences >= 1, true, 'provider turn snapshot counts dynamic dialogue text in provider contract frames');
   assertEqual(snapshot.finalUserPromptHash.length > 0, true, 'provider turn snapshot records final user prompt hash');
   assertEqual(snapshot.finalUserPromptCharLength > snapshot.dynamicSuffixCharLength, true, 'provider turn snapshot records rendered contract appended to dynamic prompt');
+
+  const finalUserPrompt = renderProviderTurnUserPrompt(contract.prompt.dynamicSuffix, contract);
+  assertEqual(
+    exactTextOccurrences(finalUserPrompt, `request-${token}`),
+    1,
+    'provider user prompt renders DynamicDialogue text once and references it from the contract'
+  );
+  assert(
+    finalUserPrompt.includes('"summaryRef": "dynamicSuffix"'),
+    'provider user prompt uses summaryRef for DynamicDialogue content already present in dynamic suffix'
+  );
+}
+
+function exactTextOccurrences(source: string, needle: string): number {
+  if (!needle) return 0;
+  return source.split(needle).length - 1;
 }
 
 export function assertTaskLocalCompactRecordFlowsThroughCheckpoints(): void {
