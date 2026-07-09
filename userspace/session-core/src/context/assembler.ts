@@ -107,6 +107,30 @@ export interface ContextAssemblyDynamicAppendLogEntry {
   renderedCharLength: number;
 }
 
+export interface ContextAssemblyDynamicAppendFoldSummary {
+  policy: ContextAssemblyDynamicAppendFoldPolicy;
+  segmentCount: number;
+  renderedCharLength: number;
+  contentHash: string;
+  renderedHash: string;
+  segmentIds: string[];
+}
+
+export interface ContextAssemblyTaskLocalFoldPlan {
+  schemaVersion: 'deepcode.session.context-task-fold.v1';
+  taskCursorId?: string;
+  lastTaskSavepointId?: string;
+  currentTaskGoalHash?: string;
+  currentTaskContextHash?: string;
+  dynamicAppendLogHash: string;
+  foldableSegmentCount: number;
+  foldableRenderedCharLength: number;
+  retainedSegmentCount: number;
+  retainedRenderedCharLength: number;
+  policySummaries: ContextAssemblyDynamicAppendFoldSummary[];
+  boundary: 'metadataOnlyNoPromptMutation';
+}
+
 export interface ContextAssemblyBudgetPlan {
   policy: 'softCapReserveOutput';
   contextWindowTokens: number;
@@ -182,6 +206,8 @@ export interface ContextAssemblyRecord {
   dynamicAppendLog: ContextAssemblyDynamicAppendLogEntry[];
   dynamicAppendLogHash: string;
   dynamicAppendLogCharLength: number;
+  taskLocalFoldPlan: ContextAssemblyTaskLocalFoldPlan;
+  taskLocalFoldPlanHash: string;
   partitionRecords: ContextAssemblyPartitionRecord[];
   resourceBlocks: ContextAssemblyResourceBlockRecord[];
   resourceFullTextCharCount: number;
@@ -308,6 +334,23 @@ export function assembleContext(input: ContextAssemblyInput): ContextAssemblyRes
   const partitionTokenEstimates = contextAssemblyPartitionTokenEstimates(partitionCharCounts);
   const partitionRecords = contextAssemblyPartitionRecords(prompt.segments);
   const dynamicAppendLog = contextAssemblyDynamicAppendLog(prompt.segments);
+  const dynamicAppendLogHash = stableHash(JSON.stringify(dynamicAppendLog.map((entry) => ({
+    index: entry.index,
+    segmentId: entry.segmentId,
+    contentHash: entry.contentHash,
+    renderedHash: entry.renderedHash,
+    foldPolicy: entry.foldPolicy,
+  }))));
+  const dynamicAppendLogCharLength = dynamicAppendLog.reduce((total, entry) => total + entry.renderedCharLength, 0);
+  const taskLocalFoldPlan = contextAssemblyTaskLocalFoldPlan({
+    dynamicAppendLog,
+    dynamicAppendLogHash,
+    currentTaskGoalHash: input.currentTaskGoal ? stableHash(input.currentTaskGoal) : undefined,
+    currentTaskContextHash: input.currentTaskContext ? stableHash(JSON.stringify(input.currentTaskContext)) : undefined,
+    taskCursorId: input.taskCursor?.cursorId,
+    lastTaskSavepointId: input.taskCursor?.lastSavepointId,
+  });
+  const taskLocalFoldPlanHash = stableHash(JSON.stringify(taskLocalFoldPlan));
   const providerCacheAttribution = buildProviderCacheAttribution({
     provider,
     model,
@@ -348,14 +391,10 @@ export function assembleContext(input: ContextAssemblyInput): ContextAssemblyRes
     segmentOrder: prompt.segments.map((segment) => segment.id),
     segments: prompt.segments.map(contextAssemblySegment),
     dynamicAppendLog,
-    dynamicAppendLogHash: stableHash(JSON.stringify(dynamicAppendLog.map((entry) => ({
-      index: entry.index,
-      segmentId: entry.segmentId,
-      contentHash: entry.contentHash,
-      renderedHash: entry.renderedHash,
-      foldPolicy: entry.foldPolicy,
-    })))),
-    dynamicAppendLogCharLength: dynamicAppendLog.reduce((total, entry) => total + entry.renderedCharLength, 0),
+    dynamicAppendLogHash,
+    dynamicAppendLogCharLength,
+    taskLocalFoldPlan,
+    taskLocalFoldPlanHash,
     partitionRecords,
     resourceBlocks: resourcePromptContext.resourceBlocks.map(contextAssemblyResourceBlock),
     resourceFullTextCharCount: resourcePromptContext.resourceFullTextCharCount,
@@ -386,8 +425,8 @@ export function assembleContext(input: ContextAssemblyInput): ContextAssemblyRes
     providerCacheAttribution,
     resourceEvidenceTailCount: resourcePromptContext.resourceBlocks.length,
     traceArchiveMode: 'compact-provider-trace',
-    currentTaskGoalHash: input.currentTaskGoal ? stableHash(input.currentTaskGoal) : undefined,
-    currentTaskContextHash: input.currentTaskContext ? stableHash(JSON.stringify(input.currentTaskContext)) : undefined,
+    currentTaskGoalHash: taskLocalFoldPlan.currentTaskGoalHash,
+    currentTaskContextHash: taskLocalFoldPlan.currentTaskContextHash,
     taskCursorId: input.taskCursor?.cursorId,
     lastTaskSavepointId: input.taskCursor?.lastSavepointId,
     redactionNote: 'Segment previews and provider traces are compacted for inspection; raw provider token deltas and full prompt messages are not stored in transcript.',
@@ -628,6 +667,58 @@ function contextAssemblyDynamicAppendLog(segments: PromptSegment[]): ContextAsse
         renderedCharLength: rendered.length,
       };
     });
+}
+
+function contextAssemblyTaskLocalFoldPlan(input: {
+  dynamicAppendLog: ContextAssemblyDynamicAppendLogEntry[];
+  dynamicAppendLogHash: string;
+  currentTaskGoalHash?: string;
+  currentTaskContextHash?: string;
+  taskCursorId?: string;
+  lastTaskSavepointId?: string;
+}): ContextAssemblyTaskLocalFoldPlan {
+  const foldable = input.dynamicAppendLog.filter((entry) => entry.foldPolicy === 'dropAfterTask');
+  const retained = input.dynamicAppendLog.filter((entry) => entry.foldPolicy !== 'dropAfterTask');
+  return {
+    schemaVersion: 'deepcode.session.context-task-fold.v1',
+    taskCursorId: input.taskCursorId,
+    lastTaskSavepointId: input.lastTaskSavepointId,
+    currentTaskGoalHash: input.currentTaskGoalHash,
+    currentTaskContextHash: input.currentTaskContextHash,
+    dynamicAppendLogHash: input.dynamicAppendLogHash,
+    foldableSegmentCount: foldable.length,
+    foldableRenderedCharLength: foldable.reduce((total, entry) => total + entry.renderedCharLength, 0),
+    retainedSegmentCount: retained.length,
+    retainedRenderedCharLength: retained.reduce((total, entry) => total + entry.renderedCharLength, 0),
+    policySummaries: contextAssemblyDynamicAppendFoldSummaries(input.dynamicAppendLog),
+    boundary: 'metadataOnlyNoPromptMutation',
+  };
+}
+
+function contextAssemblyDynamicAppendFoldSummaries(
+  entries: ContextAssemblyDynamicAppendLogEntry[]
+): ContextAssemblyDynamicAppendFoldSummary[] {
+  const policyOrder: ContextAssemblyDynamicAppendFoldPolicy[] = [
+    'retainTurnContract',
+    'retainProjectMemory',
+    'retainSessionMemory',
+    'retainEvidenceHandle',
+    'dropAfterTask',
+  ];
+  return policyOrder
+    .map((policy) => {
+      const selected = entries.filter((entry) => entry.foldPolicy === policy);
+      if (selected.length === 0) return undefined;
+      return {
+        policy,
+        segmentCount: selected.length,
+        renderedCharLength: selected.reduce((total, entry) => total + entry.renderedCharLength, 0),
+        contentHash: stableHash(selected.map((entry) => entry.contentHash).join('\n')),
+        renderedHash: stableHash(selected.map((entry) => entry.renderedHash).join('\n')),
+        segmentIds: selected.map((entry) => entry.segmentId),
+      };
+    })
+    .filter((summary): summary is ContextAssemblyDynamicAppendFoldSummary => summary !== undefined);
 }
 
 function dynamicAppendFoldPolicy(

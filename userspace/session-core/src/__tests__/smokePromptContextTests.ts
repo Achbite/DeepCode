@@ -480,6 +480,25 @@ export function assertContextAssemblerCachePlan(): void {
   );
   assertEqual(base.contextAssembly.dynamicAppendLogHash.length > 0, true, 'context assembly dynamic append log records a stable hash');
   assertEqual(base.contextAssembly.dynamicAppendLogCharLength > 0, true, 'context assembly dynamic append log records rendered dynamic length');
+  assertEqual(base.contextAssembly.taskLocalFoldPlan.schemaVersion, 'deepcode.session.context-task-fold.v1', 'context assembly records task-local fold plan schema');
+  assertEqual(base.contextAssembly.taskLocalFoldPlan.boundary, 'metadataOnlyNoPromptMutation', 'task-local fold plan is metadata only');
+  assertEqual(base.contextAssembly.taskLocalFoldPlan.dynamicAppendLogHash, base.contextAssembly.dynamicAppendLogHash, 'task-local fold plan references the dynamic append log');
+  assertEqual(
+    base.contextAssembly.taskLocalFoldPlan.foldableSegmentCount + base.contextAssembly.taskLocalFoldPlan.retainedSegmentCount,
+    base.contextAssembly.dynamicAppendLog.length,
+    'task-local fold plan accounts for every dynamic append segment'
+  );
+  assertEqual(
+    base.contextAssembly.taskLocalFoldPlan.foldableRenderedCharLength + base.contextAssembly.taskLocalFoldPlan.retainedRenderedCharLength,
+    base.contextAssembly.dynamicAppendLogCharLength,
+    'task-local fold plan accounts for rendered dynamic length'
+  );
+  assertEqual(
+    base.contextAssembly.taskLocalFoldPlan.policySummaries.some((summary) => summary.policy === 'dropAfterTask'),
+    true,
+    'task-local fold plan marks task-local prompt state as foldable'
+  );
+  assertEqual(base.contextAssembly.taskLocalFoldPlanHash.length > 0, true, 'context assembly records task-local fold plan hash');
   assertEqual(base.contextAssembly.providerVisibleTokenEstimate, base.contextAssembly.partitionTokenEstimates.providerVisibleTotal, 'provider visible token estimate mirrors partition total');
   assert(base.contextAssembly.partitionCharCounts.protectedPrefix > 0, 'context assembly records protected prefix partition');
   assert(base.contextAssembly.partitionCharCounts.projectMemory > 0, 'context assembly records project memory partition');

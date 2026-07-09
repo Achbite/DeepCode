@@ -1,6 +1,7 @@
 import { stableHash } from '../../cache/canonicalizer.js';
 import type {
   ContextAssemblyDynamicAppendLogEntry,
+  ContextAssemblyTaskLocalFoldPlan,
   ContextAssemblyResourceBlockRecord,
   ContextAssemblySegmentRecord,
 } from '../../context/index.js';
@@ -9,6 +10,7 @@ import type {
   ProviderContextFrame,
   ProviderTurnSnapshot,
   ProviderTurnSnapshotDynamicAppendLogEntry,
+  ProviderTurnSnapshotTaskLocalFoldPlan,
   ProviderTurnSnapshotFrame,
   ProviderTurnSnapshotResourceBlock,
   ProviderTurnSnapshotSegment,
@@ -58,10 +60,40 @@ export function buildProviderTurnSnapshot(contract: DriverProviderTurnFrame): Pr
     dynamicAppendLog: contextAssembly?.dynamicAppendLog.map(snapshotDynamicAppendLogEntry) ?? [],
     dynamicAppendLogHash: contextAssembly?.dynamicAppendLogHash,
     dynamicAppendLogCharLength: contextAssembly?.dynamicAppendLogCharLength ?? 0,
+    taskLocalFoldPlan: contextAssembly?.taskLocalFoldPlan
+      ? snapshotTaskLocalFoldPlan(contextAssembly.taskLocalFoldPlan)
+      : undefined,
+    taskLocalFoldPlanHash: contextAssembly?.taskLocalFoldPlanHash,
     frames,
     resourceBlocks: contextAssembly?.resourceBlocks.map(snapshotResourceBlock) ?? [],
     resourceRetentionCounts: { ...(contextAssembly?.resourceRetentionCounts ?? {}) },
     cacheClasses: cacheClasses(contextAssembly?.segments ?? []),
+  };
+}
+
+function snapshotTaskLocalFoldPlan(
+  plan: ContextAssemblyTaskLocalFoldPlan
+): ProviderTurnSnapshotTaskLocalFoldPlan {
+  return {
+    schemaVersion: plan.schemaVersion,
+    taskCursorId: plan.taskCursorId,
+    lastTaskSavepointId: plan.lastTaskSavepointId,
+    currentTaskGoalHash: plan.currentTaskGoalHash,
+    currentTaskContextHash: plan.currentTaskContextHash,
+    dynamicAppendLogHash: plan.dynamicAppendLogHash,
+    foldableSegmentCount: plan.foldableSegmentCount,
+    foldableRenderedCharLength: plan.foldableRenderedCharLength,
+    retainedSegmentCount: plan.retainedSegmentCount,
+    retainedRenderedCharLength: plan.retainedRenderedCharLength,
+    policySummaries: plan.policySummaries.map((summary) => ({
+      policy: summary.policy,
+      segmentCount: summary.segmentCount,
+      renderedCharLength: summary.renderedCharLength,
+      contentHash: summary.contentHash,
+      renderedHash: summary.renderedHash,
+      segmentIds: [...summary.segmentIds],
+    })),
+    boundary: plan.boundary,
   };
 }
 

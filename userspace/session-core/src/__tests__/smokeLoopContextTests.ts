@@ -459,6 +459,17 @@ export function assertProviderTurnSnapshotRecordsContextAdmissionShape(): void {
   );
   assertEqual(snapshot.dynamicAppendLogHash, context.contextAssembly.dynamicAppendLogHash, 'provider turn snapshot preserves dynamic append log hash');
   assertEqual(snapshot.dynamicAppendLogCharLength, context.contextAssembly.dynamicAppendLogCharLength, 'provider turn snapshot preserves dynamic append log rendered length');
+  assertEqual(snapshot.taskLocalFoldPlanHash, context.contextAssembly.taskLocalFoldPlanHash, 'provider turn snapshot preserves task-local fold plan hash');
+  assertEqual(
+    snapshot.taskLocalFoldPlan?.dynamicAppendLogHash,
+    context.contextAssembly.dynamicAppendLogHash,
+    'provider turn snapshot fold plan points to the same dynamic append log'
+  );
+  assertEqual(
+    snapshot.taskLocalFoldPlan?.foldableSegmentCount,
+    context.contextAssembly.taskLocalFoldPlan.foldableSegmentCount,
+    'provider turn snapshot preserves foldable dynamic segment count'
+  );
   assertEqual(
     snapshot.dynamicAppendLog.some((entry) => entry.foldPolicy === 'retainEvidenceHandle'),
     true,

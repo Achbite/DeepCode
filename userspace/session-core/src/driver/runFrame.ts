@@ -115,6 +115,30 @@ export interface ProviderTurnSnapshotDynamicAppendLogEntry {
   readonly renderedCharLength: number;
 }
 
+export interface ProviderTurnSnapshotDynamicAppendFoldSummary {
+  readonly policy: string;
+  readonly segmentCount: number;
+  readonly renderedCharLength: number;
+  readonly contentHash: string;
+  readonly renderedHash: string;
+  readonly segmentIds: string[];
+}
+
+export interface ProviderTurnSnapshotTaskLocalFoldPlan {
+  readonly schemaVersion: 'deepcode.session.context-task-fold.v1';
+  readonly taskCursorId?: string;
+  readonly lastTaskSavepointId?: string;
+  readonly currentTaskGoalHash?: string;
+  readonly currentTaskContextHash?: string;
+  readonly dynamicAppendLogHash: string;
+  readonly foldableSegmentCount: number;
+  readonly foldableRenderedCharLength: number;
+  readonly retainedSegmentCount: number;
+  readonly retainedRenderedCharLength: number;
+  readonly policySummaries: ProviderTurnSnapshotDynamicAppendFoldSummary[];
+  readonly boundary: 'metadataOnlyNoPromptMutation';
+}
+
 export interface ProviderTurnSnapshotFrame {
   readonly index: number;
   readonly kind: string;
@@ -173,6 +197,8 @@ export interface ProviderTurnSnapshot {
   readonly dynamicAppendLog: ProviderTurnSnapshotDynamicAppendLogEntry[];
   readonly dynamicAppendLogHash?: string;
   readonly dynamicAppendLogCharLength: number;
+  readonly taskLocalFoldPlan?: ProviderTurnSnapshotTaskLocalFoldPlan;
+  readonly taskLocalFoldPlanHash?: string;
   readonly frames: ProviderTurnSnapshotFrame[];
   readonly resourceBlocks: ProviderTurnSnapshotResourceBlock[];
   readonly resourceRetentionCounts: Record<string, number>;
