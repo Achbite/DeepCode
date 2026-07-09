@@ -8,10 +8,12 @@ import type {
 } from '@deepcode/protocol';
 import type {
   ContextAssemblyRecord,
+  ContextAssemblyTaskLocalCompactRecord,
   PromptCachePlan,
   ProjectMemoryMode,
   SessionMemoryDocument,
 } from '../../context/index.js';
+import { collectTaskLocalCompactRecords } from '../../context/index.js';
 import type {
   ConversationResourceRoot,
   InitialContextPacket,
@@ -68,6 +70,7 @@ export interface RunLifecycleState {
   memoryHints: string[];
   cachePlan?: PromptCachePlan;
   contextAssembly?: ContextAssemblyRecord;
+  taskLocalCompactRecords?: ContextAssemblyTaskLocalCompactRecord[];
   taskExecutionCursor?: TaskExecutionCursor;
   currentTaskContext?: CurrentTaskContext;
   taskLedger?: TaskLedgerSnapshot;
@@ -171,6 +174,10 @@ export class RunLifecyclePipeline<State extends RunLifecycleState> {
     const restoredResourcePackets = input.resumeResourcePackets
       ? this.ports.recentResourcePackets(events)
       : [];
+    const taskLocalCompactRecords = collectTaskLocalCompactRecords(events, {
+      limit: 8,
+      planId: acceptedImplementationPlan?.planId,
+    });
     const initialTaskRuntime = this.ports.initialTaskRuntime({
       acceptedPlan: acceptedImplementationPlan,
       resourcePackets: restoredResourcePackets,
@@ -197,6 +204,7 @@ export class RunLifecyclePipeline<State extends RunLifecycleState> {
         projectMemoryMode: input.projectMemoryMode,
       }),
       memoryHints: this.ports.implementationBatchHints(implementationBatch, acceptedImplementationPlan),
+      taskLocalCompactRecords,
       taskExecutionCursor: initialTaskRuntime.taskExecutionCursor,
       currentTaskContext: initialTaskRuntime.currentTaskContext,
       taskLedger: initialTaskRuntime.taskLedger,

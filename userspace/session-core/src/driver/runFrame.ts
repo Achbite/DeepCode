@@ -1,6 +1,7 @@
 import type { LlmChatResult } from '@deepcode/protocol';
 import type {
   ContextAssemblyRecord,
+  ContextAssemblyTaskLocalCompactRecord,
   PromptCachePlan,
   SessionMemoryDocument,
 } from '../context/index.js';
@@ -199,6 +200,10 @@ export interface ProviderTurnSnapshot {
   readonly dynamicAppendLogCharLength: number;
   readonly taskLocalFoldPlan?: ProviderTurnSnapshotTaskLocalFoldPlan;
   readonly taskLocalFoldPlanHash?: string;
+  readonly taskLocalCompactRecords: ContextAssemblyTaskLocalCompactRecord[];
+  readonly taskLocalCompactRecordCount: number;
+  readonly taskLocalCompactRecordsHash?: string;
+  readonly latestTaskLocalCompactHash?: string;
   readonly frames: ProviderTurnSnapshotFrame[];
   readonly resourceBlocks: ProviderTurnSnapshotResourceBlock[];
   readonly resourceRetentionCounts: Record<string, number>;
@@ -255,6 +260,7 @@ export interface SessionDriverMemoryState {
   memoryHints: string[];
   cachePlan?: PromptCachePlan;
   contextAssembly?: ContextAssemblyRecord;
+  taskLocalCompactRecords?: ContextAssemblyTaskLocalCompactRecord[];
 }
 
 export interface SessionDriverAcceptedPlanState {

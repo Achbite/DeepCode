@@ -1,38 +1,11 @@
 import { stableHash } from '../cache/canonicalizer.js';
-import type { ContextAssemblyRecord, ContextAssemblyTaskLocalFoldPlan } from './assembler.js';
-
-export type ContextAssemblyTaskLocalCompactSource =
-  | 'kernelBatchCheckpoint'
-  | 'modelTaskOutcome'
-  | 'resourceValidation';
-
-export type ContextAssemblyTaskLocalCompactStatus =
-  | 'completedByKernelFacts'
-  | 'modelJudgedSufficient'
-  | 'completedByReadOnlyEvidence';
-
-export interface ContextAssemblyTaskLocalCompactRecord {
-  schemaVersion: 'deepcode.session.context-task-compact.v1';
-  source: ContextAssemblyTaskLocalCompactSource;
-  status: ContextAssemblyTaskLocalCompactStatus;
-  boundary: 'sessionContextMetadataOnly';
-  planId?: string;
-  runId?: string;
-  taskId?: string;
-  taskCursorId?: string;
-  lastTaskSavepointId?: string;
-  currentTaskGoalHash?: string;
-  currentTaskContextHash?: string;
-  dynamicAppendLogHash: string;
-  taskLocalFoldPlanHash: string;
-  foldableSegmentCount: number;
-  foldableRenderedCharLength: number;
-  retainedSegmentCount: number;
-  retainedRenderedCharLength: number;
-  retainedPolicies: string[];
-  foldablePolicies: string[];
-  compactHash: string;
-}
+import type {
+  ContextAssemblyRecord,
+  ContextAssemblyTaskLocalCompactRecord,
+  ContextAssemblyTaskLocalCompactSource,
+  ContextAssemblyTaskLocalCompactStatus,
+  ContextAssemblyTaskLocalFoldPlan,
+} from './assembler.js';
 
 export function buildTaskLocalCompactRecord(input: {
   contextAssembly?: ContextAssemblyRecord;
@@ -82,4 +55,83 @@ function foldablePolicies(plan: ContextAssemblyTaskLocalFoldPlan): string[] {
   return plan.policySummaries
     .filter((summary) => summary.policy === 'dropAfterTask')
     .map((summary) => summary.policy);
+}
+
+export function collectTaskLocalCompactRecords(
+  events: readonly unknown[] | undefined,
+  options?: { limit?: number; runId?: string; planId?: string }
+): ContextAssemblyTaskLocalCompactRecord[] {
+  const collected: ContextAssemblyTaskLocalCompactRecord[] = [];
+  for (const event of events ?? []) {
+    const payload = objectRecord(objectRecord(event)?.payload);
+    const record = parseTaskLocalCompactRecord(payload?.contextCompactRecord);
+    if (!record) continue;
+    if (options?.runId && record.runId !== options.runId) continue;
+    if (options?.planId && record.planId !== options.planId) continue;
+    collected.push(record);
+  }
+  const limit = options?.limit ?? collected.length;
+  return limit > 0 ? collected.slice(-limit) : [];
+}
+
+function parseTaskLocalCompactRecord(value: unknown): ContextAssemblyTaskLocalCompactRecord | undefined {
+  const record = objectRecord(value);
+  if (!record) return undefined;
+  if (record.schemaVersion !== 'deepcode.session.context-task-compact.v1') return undefined;
+  if (record.boundary !== 'sessionContextMetadataOnly') return undefined;
+  const source = stringValue(record.source);
+  const status = stringValue(record.status);
+  if (!isCompactSource(source) || !isCompactStatus(status)) return undefined;
+  const dynamicAppendLogHash = stringValue(record.dynamicAppendLogHash);
+  const taskLocalFoldPlanHash = stringValue(record.taskLocalFoldPlanHash);
+  const compactHash = stringValue(record.compactHash);
+  if (!dynamicAppendLogHash || !taskLocalFoldPlanHash || !compactHash) return undefined;
+  return {
+    schemaVersion: 'deepcode.session.context-task-compact.v1',
+    source,
+    status,
+    boundary: 'sessionContextMetadataOnly',
+    planId: stringValue(record.planId),
+    runId: stringValue(record.runId),
+    taskId: stringValue(record.taskId),
+    taskCursorId: stringValue(record.taskCursorId),
+    lastTaskSavepointId: stringValue(record.lastTaskSavepointId),
+    currentTaskGoalHash: stringValue(record.currentTaskGoalHash),
+    currentTaskContextHash: stringValue(record.currentTaskContextHash),
+    dynamicAppendLogHash,
+    taskLocalFoldPlanHash,
+    foldableSegmentCount: numberValue(record.foldableSegmentCount),
+    foldableRenderedCharLength: numberValue(record.foldableRenderedCharLength),
+    retainedSegmentCount: numberValue(record.retainedSegmentCount),
+    retainedRenderedCharLength: numberValue(record.retainedRenderedCharLength),
+    retainedPolicies: stringArray(record.retainedPolicies),
+    foldablePolicies: stringArray(record.foldablePolicies),
+    compactHash,
+  };
+}
+
+function isCompactSource(value: string | undefined): value is ContextAssemblyTaskLocalCompactSource {
+  return value === 'kernelBatchCheckpoint' || value === 'modelTaskOutcome' || value === 'resourceValidation';
+}
+
+function isCompactStatus(value: string | undefined): value is ContextAssemblyTaskLocalCompactStatus {
+  return value === 'completedByKernelFacts' || value === 'modelJudgedSufficient' || value === 'completedByReadOnlyEvidence';
+}
+
+function objectRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function stringValue(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value : undefined;
+}
+
+function numberValue(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0;
+}
+
+function stringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
 }

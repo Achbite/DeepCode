@@ -5,6 +5,7 @@ import {
   buildPromptEnvelope,
   buildResourcePromptContext,
   buildSessionMemoryDocument,
+  collectTaskLocalCompactRecords,
   createResourcePacket,
   type ResourceManifest,
 } from '../index.js';
@@ -681,6 +682,149 @@ export function assertTaskLocalCompactRecordFlowsThroughCheckpoints(): void {
   assertEqual((checkpoint.payload as any).contextCompactRecord?.compactHash, compact.compactHash, 'batch checkpoint carries task-local compact record');
   assertEqual((savepoint.payload as any).contextCompactRecord?.compactHash, compact.compactHash, 'task savepoint carries task-local compact record');
   assertEqual((validationCheckpoint.payload as any).contextCompactRecord?.compactHash, compact.compactHash, 'resource validation checkpoint carries task-local compact record');
+
+  const extracted = collectTaskLocalCompactRecords([checkpoint, savepoint, validationCheckpoint], {
+    limit: 2,
+    planId: `plan-${token}`,
+  });
+  assertEqual(extracted.length, 2, 'task-local compact extractor keeps recent checkpoint records');
+  assertEqual(extracted.at(-1)?.compactHash, compact.compactHash, 'task-local compact extractor preserves compact hash');
+
+  const nextAssembly = assembleContext({
+    workflowState: 'acceptedTaskExecution',
+    allowedProposals: ['actionBundle', 'resourceRequest', 'taskOutcome', 'diagnostic'],
+    capabilityCatalogSummary: 'fs.write',
+    userRequest: `next accepted task ${token}`,
+    currentTaskGoal: `continue generic target ${token}`,
+    currentTaskContext: {
+      taskId: `next-task-${token}`,
+      targets: [`generated/next-${token}.txt`],
+    },
+    taskLocalCompactRecords: extracted,
+  });
+  const contract = new ContextFrameBuilder().buildSessionProviderTurnContract({
+    contractId: `contract-${token}`,
+    sessionId: `session-${token}`,
+    runId: `run-${token}`,
+    allowedKinds: ['actionBundle', 'resourceRequest', 'taskOutcome', 'diagnostic'],
+    prompt: nextAssembly.prompt,
+    contextAssembly: nextAssembly.contextAssembly,
+    userRequest: `next accepted task ${token}`,
+    acceptedPlanActive: true,
+    currentTaskContext: {
+      taskId: `next-task-${token}`,
+      taskTitle: `Next task ${token}`,
+      goal: `continue generic target ${token}`,
+      targets: [`generated/next-${token}.txt`],
+      capabilities: ['fs.write'],
+      taskOrder: [`next-task-${token}`],
+      pendingTaskIds: [`next-task-${token}`],
+      dependsOn: [],
+      evidenceNeeds: [],
+      completedTaskIds: [],
+    },
+    resourcePackets: [],
+    generatedArtifactCount: 0,
+  });
+  const snapshot = buildProviderTurnSnapshot(contract);
+  assertEqual(nextAssembly.contextAssembly.taskLocalCompactRecordCount, extracted.length, 'ContextAdmission records task-local compact inputs');
+  assertEqual(nextAssembly.contextAssembly.latestTaskLocalCompactHash, compact.compactHash, 'ContextAdmission exposes latest task-local compact hash');
+  assertEqual(snapshot.taskLocalCompactRecordCount, extracted.length, 'provider snapshot records task-local compact count');
+  assertEqual(snapshot.latestTaskLocalCompactHash, compact.compactHash, 'provider snapshot records latest task-local compact hash');
+}
+
+export async function assertProviderTurnContextCoordinatorPassesTaskLocalCompactRecords(): Promise<void> {
+  const token = randomSmokeToken('provider-context-compact');
+  const previous = assembleContext({
+    workflowState: 'acceptedTaskExecution',
+    allowedProposals: ['actionBundle', 'resourceRequest', 'taskOutcome', 'diagnostic'],
+    capabilityCatalogSummary: 'fs.write',
+    userRequest: `previous task ${token}`,
+    currentTaskGoal: `write previous target ${token}`,
+    currentTaskContext: {
+      taskId: `task-${token}`,
+      targets: [`generated/${token}.txt`],
+    },
+  });
+  const compact = buildTaskLocalCompactRecord({
+    contextAssembly: previous.contextAssembly,
+    source: 'modelTaskOutcome',
+    status: 'modelJudgedSufficient',
+    planId: `plan-${token}`,
+    runId: `run-${token}`,
+    taskId: `task-${token}`,
+  });
+  assert(compact, 'provider context compact setup produced compact record');
+  if (!compact) throw new Error('provider context compact setup failed');
+  let capturedCompactHash: string | undefined;
+  const coordinator = new ProviderTurnContextCoordinator<any>({
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${token}`,
+    assembleContext: (input) => {
+      capturedCompactHash = input.taskLocalCompactRecords?.at(-1)?.compactHash;
+      return assembleContext({
+        ...input,
+        contextAssemblyId: `assembly-${token}`,
+      });
+    },
+    allowedProposals: (allowed) => allowed,
+    capabilityCatalogSummary: () => `capability-${token}`,
+    memoryHints: () => [],
+    collectUserGuidanceEvents: () => [],
+    appendConsumedGuidance: async ({ result }) => result,
+    buildProviderTurnContract: (input) =>
+      new ContextFrameBuilder().buildSessionProviderTurnContract({
+        contractId: input.contractId,
+        sessionId: input.sessionId,
+        runId: input.runId,
+        allowedKinds: input.allowedKinds,
+        prompt: input.prompt,
+        contextAssembly: input.contextAssembly,
+        userRequest: input.userRequest,
+        confirmedDecisionSummary: input.confirmedDecisionSummary,
+        acceptedPlanActive: input.acceptedPlanActive,
+        currentTaskContext: input.currentTaskContext,
+        resourcePackets: input.resourcePackets,
+        generatedArtifactCount: input.generatedArtifactCount,
+        toolIntentTemplates: input.toolIntentTemplates,
+        nextActionInstruction: input.nextActionInstruction,
+      }),
+  });
+
+  const result = await coordinator.prepare({
+    sessionId: `session-${token}`,
+    runId: `run-${token}`,
+    userRequest: `original request ${token}`,
+    stateContract: {
+      stateId: `state-${token}`,
+      allowedProposals: ['resourceRequest', 'actionBundle', 'taskOutcome', 'diagnostic'],
+    },
+    acceptedImplementationPlan: {
+      planId: `plan-${token}`,
+      runId: `run-${token}`,
+      tasks: [],
+    },
+    currentTaskContext: {
+      taskId: `next-task-${token}`,
+      taskTitle: `Next task ${token}`,
+      goal: `continue generic target ${token}`,
+      targets: [`generated/next-${token}.txt`],
+    },
+    taskLocalCompactRecords: [compact],
+    memoryDocument: buildSessionMemoryDocument([]),
+    resourcePackets: [],
+    conversationRoots: [],
+    generatedArtifactEvidence: new Map(),
+  }, {
+    contextAssemblyId: `requested-${token}`,
+    contractId: `contract-${token}`,
+    inputContent: `input ${token}`,
+    lastResult: genericSessionResult(`session-${token}`),
+  });
+
+  assertEqual(capturedCompactHash, compact.compactHash, 'provider context coordinator passes task-local compact records into ContextAdmission');
+  assertEqual(result.modelContextBundle.contextAssembly?.taskLocalCompactRecordCount, 1, 'model context bundle records task-local compact count');
+  assertEqual(result.modelContextBundle.snapshot.latestTaskLocalCompactHash, compact.compactHash, 'provider snapshot keeps task-local compact hash from coordinator state');
 }
 
 export async function assertProviderTurnContextCoordinatorUsesFreshAssembly(): Promise<void> {

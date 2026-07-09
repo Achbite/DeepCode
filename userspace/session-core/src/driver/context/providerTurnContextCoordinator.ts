@@ -3,6 +3,7 @@ import type { CurrentTaskContext, TaskExecutionCursor } from '../../accepted-pla
 import type {
   ContextAssemblyInput,
   ContextAssemblyRecord,
+  ContextAssemblyTaskLocalCompactRecord,
   ContextAssemblyResult,
   PromptCachePlan,
   ProjectMemoryMode,
@@ -46,6 +47,7 @@ export interface ProviderTurnContextState {
   generatedArtifactEvidence: Map<string, unknown>;
   cachePlan?: PromptCachePlan;
   contextAssembly?: ContextAssemblyRecord;
+  taskLocalCompactRecords?: ContextAssemblyTaskLocalCompactRecord[];
   providerTurnFrame?: DriverProviderTurnFrame;
   modelContextBundle?: ModelContextBundle;
 }
@@ -135,6 +137,7 @@ export class ProviderTurnContextCoordinator<State extends ProviderTurnContextSta
       currentTaskGoal: state.currentTaskContext?.goal,
       currentTaskContext: state.currentTaskContext,
       taskCursor: state.taskExecutionCursor,
+      taskLocalCompactRecords: state.taskLocalCompactRecords,
       initialContext: state.initialContext,
       resourcePackets: state.resourcePackets,
       conversationRoots: state.conversationRoots,

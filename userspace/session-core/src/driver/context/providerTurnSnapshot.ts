@@ -64,6 +64,14 @@ export function buildProviderTurnSnapshot(contract: DriverProviderTurnFrame): Pr
       ? snapshotTaskLocalFoldPlan(contextAssembly.taskLocalFoldPlan)
       : undefined,
     taskLocalFoldPlanHash: contextAssembly?.taskLocalFoldPlanHash,
+    taskLocalCompactRecords: contextAssembly?.taskLocalCompactRecords.map((record) => ({
+      ...record,
+      retainedPolicies: [...record.retainedPolicies],
+      foldablePolicies: [...record.foldablePolicies],
+    })) ?? [],
+    taskLocalCompactRecordCount: contextAssembly?.taskLocalCompactRecordCount ?? 0,
+    taskLocalCompactRecordsHash: contextAssembly?.taskLocalCompactRecordsHash,
+    latestTaskLocalCompactHash: contextAssembly?.latestTaskLocalCompactHash,
     frames,
     resourceBlocks: contextAssembly?.resourceBlocks.map(snapshotResourceBlock) ?? [],
     resourceRetentionCounts: { ...(contextAssembly?.resourceRetentionCounts ?? {}) },

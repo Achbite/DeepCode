@@ -131,6 +131,39 @@ export interface ContextAssemblyTaskLocalFoldPlan {
   boundary: 'metadataOnlyNoPromptMutation';
 }
 
+export type ContextAssemblyTaskLocalCompactSource =
+  | 'kernelBatchCheckpoint'
+  | 'modelTaskOutcome'
+  | 'resourceValidation';
+
+export type ContextAssemblyTaskLocalCompactStatus =
+  | 'completedByKernelFacts'
+  | 'modelJudgedSufficient'
+  | 'completedByReadOnlyEvidence';
+
+export interface ContextAssemblyTaskLocalCompactRecord {
+  schemaVersion: 'deepcode.session.context-task-compact.v1';
+  source: ContextAssemblyTaskLocalCompactSource;
+  status: ContextAssemblyTaskLocalCompactStatus;
+  boundary: 'sessionContextMetadataOnly';
+  planId?: string;
+  runId?: string;
+  taskId?: string;
+  taskCursorId?: string;
+  lastTaskSavepointId?: string;
+  currentTaskGoalHash?: string;
+  currentTaskContextHash?: string;
+  dynamicAppendLogHash: string;
+  taskLocalFoldPlanHash: string;
+  foldableSegmentCount: number;
+  foldableRenderedCharLength: number;
+  retainedSegmentCount: number;
+  retainedRenderedCharLength: number;
+  retainedPolicies: string[];
+  foldablePolicies: string[];
+  compactHash: string;
+}
+
 export interface ContextAssemblyBudgetPlan {
   policy: 'softCapReserveOutput';
   contextWindowTokens: number;
@@ -208,6 +241,10 @@ export interface ContextAssemblyRecord {
   dynamicAppendLogCharLength: number;
   taskLocalFoldPlan: ContextAssemblyTaskLocalFoldPlan;
   taskLocalFoldPlanHash: string;
+  taskLocalCompactRecords: ContextAssemblyTaskLocalCompactRecord[];
+  taskLocalCompactRecordCount: number;
+  taskLocalCompactRecordsHash: string;
+  latestTaskLocalCompactHash?: string;
   partitionRecords: ContextAssemblyPartitionRecord[];
   resourceBlocks: ContextAssemblyResourceBlockRecord[];
   resourceFullTextCharCount: number;
@@ -273,6 +310,7 @@ export interface ContextAssemblyInput {
     cursorId?: string;
     lastSavepointId?: string;
   };
+  taskLocalCompactRecords?: ContextAssemblyTaskLocalCompactRecord[];
   auditOnly?: PromptEnvelopeBuilderInput['auditOnly'];
 }
 
@@ -342,6 +380,14 @@ export function assembleContext(input: ContextAssemblyInput): ContextAssemblyRes
     foldPolicy: entry.foldPolicy,
   }))));
   const dynamicAppendLogCharLength = dynamicAppendLog.reduce((total, entry) => total + entry.renderedCharLength, 0);
+  const taskLocalCompactRecords = input.taskLocalCompactRecords ?? [];
+  const taskLocalCompactRecordsHash = stableHash(JSON.stringify(taskLocalCompactRecords.map((record) => ({
+    compactHash: record.compactHash,
+    taskId: record.taskId,
+    taskCursorId: record.taskCursorId,
+    source: record.source,
+    status: record.status,
+  }))));
   const taskLocalFoldPlan = contextAssemblyTaskLocalFoldPlan({
     dynamicAppendLog,
     dynamicAppendLogHash,
@@ -395,6 +441,10 @@ export function assembleContext(input: ContextAssemblyInput): ContextAssemblyRes
     dynamicAppendLogCharLength,
     taskLocalFoldPlan,
     taskLocalFoldPlanHash,
+    taskLocalCompactRecords,
+    taskLocalCompactRecordCount: taskLocalCompactRecords.length,
+    taskLocalCompactRecordsHash,
+    latestTaskLocalCompactHash: taskLocalCompactRecords.at(-1)?.compactHash,
     partitionRecords,
     resourceBlocks: resourcePromptContext.resourceBlocks.map(contextAssemblyResourceBlock),
     resourceFullTextCharCount: resourcePromptContext.resourceFullTextCharCount,

@@ -168,6 +168,7 @@ import {
   assertHookObserverProducesTraceOnly,
   assertProviderTurnContextCoordinatorFiltersUnscopedGrantsToCurrentTask,
   assertProviderTurnContextCoordinatorNarrowsPlanningAllowedKinds,
+  assertProviderTurnContextCoordinatorPassesTaskLocalCompactRecords,
   assertProviderTurnContextCoordinatorScopesAcceptedExecutionCatalog,
   assertProviderTurnContextCoordinatorUsesFreshAssembly,
   assertProviderTurnContractFrameOrder,
@@ -227,6 +228,7 @@ async function main(): Promise<void> {
   assertProviderTurnContractFrameOrder();
   assertProviderTurnSnapshotRecordsContextAdmissionShape();
   assertTaskLocalCompactRecordFlowsThroughCheckpoints();
+  await assertProviderTurnContextCoordinatorPassesTaskLocalCompactRecords();
   await assertProviderTurnContextCoordinatorUsesFreshAssembly();
   await assertProviderTurnContextCoordinatorNarrowsPlanningAllowedKinds();
   await assertProviderTurnContextCoordinatorScopesAcceptedExecutionCatalog();
