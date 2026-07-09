@@ -5362,6 +5362,8 @@ function assertReviewDecisionProjectionUsesI18nKeys(): void {
   assertEqual(acceptedPayload.contentKey, 'review.decision.accepted.content', 'review decision projection emits accepted content key');
   assertEqual((acceptedPayload.messageArgs as Record<string, unknown>).continuationCount, '1', 'review decision projection records continuation count as an i18n arg');
   assertEqual(Array.isArray(acceptedPayload.continuations), true, 'review decision projection preserves continuation facts structurally');
+  assertEqual((acceptedPayload.decisionOwner as Record<string, unknown>).kind, 'review', 'review decision projection carries a review decision owner');
+  assertEqual((acceptedPayload.decisionOwner as Record<string, unknown>).planId, review.sourcePlanId, 'review decision owner carries the source plan id');
 
   const guidance = `guidance-${token}`;
   const revision = builder.event({
@@ -10490,6 +10492,76 @@ function assertImplementationPlanTaskProjectionProgress(): void {
     true,
     'accepted-plan taskLedger checkpoint from a child run overrides plan-card task statuses for directory targets'
   );
+
+  const staleLedgerProjection = buildNarrativeTimelineProjection({
+    sessionId: 'session-task-projection',
+    events: [
+      planEvent,
+      {
+        id: 'event-stale-ledger-plan-accepted',
+        sessionId: 'session-task-projection',
+        ts: '2026-01-01T00:00:01.000Z',
+        kind: 'plan_review',
+        payload: {
+          runId: 'run-task-projection',
+          planId: 'plan-task-projection',
+          status: 'accepted',
+        },
+      },
+      {
+        id: 'event-stale-ledger-checkpoint',
+        sessionId: 'session-task-projection',
+        ts: '2026-01-01T00:00:02.000Z',
+        kind: 'workflow_stage',
+        payload: {
+          stage: 'accepted_plan.batch_checkpoint',
+          runId: 'run-task-projection-child',
+          planId: 'plan-task-projection',
+          taskLedger: {
+            schemaVersion: 'deepcode.session.task-ledger.v1',
+            planId: 'plan-task-projection',
+            runId: 'run-task-projection-child',
+            taskOrder: ['task-alpha', 'task-beta'],
+            completedTaskIds: [],
+            skippedTaskIds: [],
+            acceptedIncompleteTaskIds: [],
+            pendingTaskIds: ['task-alpha', 'task-beta'],
+            entries: [
+              {
+                taskId: 'task-alpha',
+                title: 'Update generic module',
+                targets: ['src/generic-module.ts'],
+                status: 'pending',
+              },
+              {
+                taskId: 'task-beta',
+                title: 'Update generic validation',
+                targets: ['src/generic-validation.ts'],
+                status: 'pending',
+              },
+            ],
+          },
+        },
+      },
+      {
+        id: 'event-stale-ledger-work-alpha',
+        sessionId: 'session-task-projection',
+        ts: '2026-01-01T00:00:03.000Z',
+        kind: 'workflow_stage',
+        payload: {
+          stage: 'work_unit.completed',
+          kernelEvent: {
+            kind: 'work_unit.completed',
+            output: { path: 'src/generic-module.ts' },
+          },
+        },
+      },
+    ],
+  });
+  const staleLedgerAlpha = staleLedgerProjection.taskProjection?.items.find((item) => item.title === 'Update generic module');
+  const staleLedgerBeta = staleLedgerProjection.taskProjection?.items.find((item) => item.title === 'Update generic validation');
+  assertEqual(staleLedgerAlpha?.status, 'completed', 'Kernel completion facts advance stale pending task-ledger projection entries');
+  assertEqual(staleLedgerBeta?.status, 'queued', 'pending task-ledger entries remain queued when no Kernel facts match');
 }
 
 function assertSessionDriverSkeleton(): void {

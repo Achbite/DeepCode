@@ -698,11 +698,13 @@ function implementationPlanTaskProjectionItems(
       acceptance.length ? `Acceptance: ${acceptance.join('; ')}` : '',
       failure.length ? `Stop/Replan: ${failure.join('; ')}` : '',
     ].filter(Boolean).join(' · ');
+    const ledgerStatus = implementationTaskStatusFromLedger(taskLedger, taskId);
+    const factStatus = implementationTaskStatus(lifecycle, targets, taskId);
     return [{
       id: `implementation-plan-${event.id || eventIndex}-${taskId}`,
       title,
       summary: summary || stringField(implementationPlan, 'summary') || '',
-      status: implementationTaskStatusFromLedger(taskLedger, taskId) ?? implementationTaskStatus(lifecycle, targets, taskId),
+      status: mergeImplementationTaskStatus(ledgerStatus, factStatus),
       blockId: `plan-${event.id || eventIndex}`,
       narrativeKind: 'plan' as const,
     }];
@@ -748,6 +750,18 @@ function implementationTaskStatusFromLedger(
     return 'queued';
   }
   return undefined;
+}
+
+function mergeImplementationTaskStatus(
+  ledgerStatus: AgentTimelineStatus | undefined,
+  factStatus: AgentTimelineStatus
+): AgentTimelineStatus {
+  // Kernel facts can advance a stale checkpoint ledger; terminal ledger states still remain authoritative.
+  if (!ledgerStatus) return factStatus;
+  if (ledgerStatus === 'failed' || factStatus === 'failed' || factStatus === 'blocked') return 'failed';
+  if (ledgerStatus === 'completed' || factStatus === 'completed') return 'completed';
+  if (ledgerStatus === 'running' || factStatus === 'running') return 'running';
+  return ledgerStatus;
 }
 
 interface ImplementationPlanLifecycle {
