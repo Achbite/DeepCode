@@ -1,5 +1,4 @@
 import type { LlmChatRequest } from '@deepcode/protocol';
-import { actionBundleProtocolShapeLines, resourceRequestProtocolShapeLine } from '../protocol/protocolContract.js';
 import type { ProposalEnvelope } from '../protocol/types.js';
 import type { NativeToolCallProposal } from '../provider/providerStreamParts.js';
 import type { PromptEnvelope } from './types.js';
@@ -73,7 +72,8 @@ export class ProviderRepairMessageBuilder {
         : actionBundleRepair
           ? 'Repair the existing actionBundle proposal only if it remains a valid reviewable side-effect proposal; otherwise output taskPlan, resourceRequest, decisionRequest, or diagnostic as allowed.'
           : 'For initial side-effect work, output taskPlan unless acceptedTaskPlan context is already present. Do not output actionBundle in this repair call.',
-      ...(actionBundleRepair ? actionBundleProtocolShapeLines() : []),
+      repairSchemaAuthorityLine(),
+      ...(actionBundleRepair ? [actionBundleCarrierGuidanceLine()] : []),
       actionBundleRepair
         ? 'Use codeBlocks[].contentLines for source code. Do not output large codeBlocks.content strings and do not manually escape multiline source code into JSON strings.'
         : 'Execution actionBundle schema and Kernel tool args are intentionally withheld in this repair call.',
@@ -108,7 +108,7 @@ export class ProviderRepairMessageBuilder {
             errorLines: [`${parseError.code}: ${parseError.message}`],
           }),
           ...this.compactRepairContextLines(prompt, state),
-          'Protocol field quick reference:',
+          'Repair carrier reminder:',
           fenced(this.protocolRepairShapeReference(parseError.code, allowedKinds)),
           `Parser error code: ${parseError.code}`,
           `Parser error message: ${parseError.message}`,
@@ -132,8 +132,8 @@ export class ProviderRepairMessageBuilder {
           'You are the DeepCode Agent Protocol v3 implementation batch repair step.',
           'Return exactly one valid JSON object using schemaVersion "deepcode.agent.protocol.v3".',
           'If proposing executable work, return kind="actionBundle" for a coherent batch that fits the payload budget.',
-          'For kind="actionBundle", put userPlanMarkdown, codeBlocks, and actionBundle directly on the top-level JSON object. Do not wrap them in a payload object. validationExpectations[] and reviewExpectations[] are optional provider notes; Session derives routine defaults when they are omitted.',
-          ...actionBundleProtocolShapeLines(),
+          repairSchemaAuthorityLine(),
+          actionBundleCarrierGuidanceLine(),
           'Use codeBlocks[].contentLines for source code.',
           'Do not output legacy implementationPlan, commandBlocks, capability, permissionLabels, accessScopes, resourceScope, or large/multiline codeBlocks.content strings.',
           `Payload budget: at most ${this.maxActionBundleTotalCodeBytes} bytes total joined contentLines. File count, task count, and codeBlock count are not permission boundaries.`,
@@ -196,8 +196,8 @@ export class ProviderRepairMessageBuilder {
           'Provider narration before blocked tool:',
           fenced(clip(turn.content || '[empty]', 2_000)),
           ...this.compactRepairContextLines(prompt, state, { includeAcceptedPlan: true }),
-          'Minimum actionBundle skeleton:',
-          fenced(this.minimalActionBundleRepairSkeleton()),
+          'ActionBundle carrier reminder:',
+          fenced(actionBundleCarrierGuidanceLine()),
         ].join('\n\n'),
       },
     ];
@@ -324,8 +324,9 @@ export class ProviderRepairMessageBuilder {
           'Return exactly one valid JSON object using schemaVersion "deepcode.agent.protocol.v3".',
           'Use kind="answer" if the available ResourcePacket facts are enough.',
           'Use kind="resourceRequest" only when requesting manifestEntryId, root-relative path, or kind="search" with a non-empty query under the listed conversation roots.',
-          resourceRequestProtocolShapeLine(),
-          'Use kind="decisionRequest" only when user input is required; minimal shape is {"schemaVersion":"deepcode.agent.protocol.v3","kind":"decisionRequest","decisionRequest":{"id":"decision-1","question":"...","options":[{"id":"option-1","label":"...","description":"...","effect":{"kind":"continueWithAction"}},{"id":"option-2","label":"...","description":"...","effect":{"kind":"continueWithAction"}}],"allowsFreeform":true}}.',
+          repairSchemaAuthorityLine(),
+          resourceRequestCarrierGuidanceLine(),
+          decisionRequestCarrierGuidanceLine(),
           'Each decisionRequest option SHOULD declare its state-machine effect via option.effect. Allowed kinds: "continueWithAction" (default, generate next actionBundle), "skipCurrentTask" (skip the current accepted-plan task), "markAcceptedIncomplete" with optional taskIds[] and reason, "replan" with reason, "finishWithAnswer", and "cancel". When the user-visible question implies "the task is already satisfied / nothing to do / stop and summarize", at least one option MUST use skipCurrentTask, markAcceptedIncomplete, or finishWithAnswer so the session can advance without forcing an empty actionBundle.',
           'Do not invent arbitrary absolute local paths. Absolute file paths are only for user-provided outside-workspace targets that require Kernel PlanReview/permission.',
         ].join('\n'),
@@ -468,15 +469,16 @@ export class ProviderRepairMessageBuilder {
           'All user-visible natural language in narration, userPlanMarkdown, validation descriptions, and review guidance must follow the current user input language.',
           'For kind="actionBundle", put userPlanMarkdown, codeBlocks, and actionBundle directly on the top-level JSON object. Do not wrap them in a payload object.',
           'For actionBundle repair, use current task action templates in ProviderTurnContract when present; otherwise use currentTaskCapabilities and current task targets.',
-          resourceRequestProtocolShapeLine(),
+          repairSchemaAuthorityLine(),
+          resourceRequestCarrierGuidanceLine(),
           'Use codeBlocks[].contentLines for source code.',
           'Do not output legacy implementationPlan, commandBlocks, capability, permissionLabels, accessScopes, resourceScope, or large/multiline codeBlocks.content strings.',
           'Accepted-plan execution batches should not request workspace root, ".", module root, wildcard, or traversal scope. The accepted Kernel contract is already the authorization source; list concrete args.path/codeBlock.targetPath instead.',
           'If a patch needs current file evidence, return kind="resourceRequest" with kind="search" or a focused file/range read under the conversation roots; Session will resolve it and resume the accepted plan.',
           'Patch actions must use patchSpec.match.kind="exactBlock" and patchSpec.match.text copied from current ResourcePacket fileText/searchResults evidence.',
           'If a material product, architecture, or implementation choice is missing, return kind="decisionRequest". Do not use decisionRequest for routine permission or scope expansion that can be represented as a concrete operation intent.',
-          'For kind="decisionRequest", include decisionRequest.question as a non-empty string, plus decisionRequest.options with 2-3 options and allowsFreeform=true.',
-          'For decisionRequest options that continue the same accepted task, include option.effect. Use effect.kind="expandCurrentTaskScope" with taskId, targetPath, targetResourceKind="file"|"directory", recursive=true when asking the user to approve a concrete folder/file expansion. Use effect.kind="continueCurrentTask" only when no scope expansion is needed. Use effect.kind="replan" only when the user must revise the accepted plan.',
+          decisionRequestCarrierGuidanceLine(),
+          'For decisionRequest options that continue the same accepted task, use effect.kind="expandCurrentTaskScope", "continueCurrentTask", or "replan" according to the ProviderTurnContract and the reported scope issue.',
           'Do not claim execution, permissions, tests passed, or task completion.',
         ].join('\n'),
       },
@@ -564,26 +566,27 @@ export class ProviderRepairMessageBuilder {
   private protocolRepairShapeReference(errorCode: string, allowedKinds: string[]): string {
     const allows = (kind: string): boolean => allowedKinds.includes(kind);
     const common = [
+      repairSchemaAuthorityLine(),
       'Provider output must be one Agent Protocol v3 JSON object.',
       `Allowed proposal kinds for this repair call: ${allowedKinds.join(', ') || 'none'}.`,
       'reviewSummary is Session-generated and must not be returned by the provider.',
       allows('answer')
-        ? 'For kind="answer", put answer:{format:"markdown",content:"..."} on the top-level JSON object.'
+        ? 'Carrier: answer uses top-level answer.'
         : '',
       allows('resourceRequest')
-        ? resourceRequestProtocolShapeLine()
+        ? resourceRequestCarrierGuidanceLine()
         : '',
       allows('decisionRequest')
-        ? 'For kind="decisionRequest", put decisionRequest:{id,question,reason?,summary?,options:[{id,label,description,recommended?}],allowsFreeform?} on the top-level JSON object. Do not return bare reason/options without decisionRequest.'
+        ? decisionRequestCarrierGuidanceLine()
         : '',
       allows('taskPlan')
         ? 'For kind="taskPlan", put taskPlan.version/id/title/summary/tasks/risks/reviewCheckpoints at the top level. tasks[] must be a Session-advanced ordered queue of reviewable engineering batches, not a graph and not one task per file. Group related files or operations that should be implemented together. Each task must include capability, concrete non-root target or targets, acceptanceCriteria[], and failureCriteria[]; do not use workspace root, project root, ".", "/", or wildcard targets. It must not include codeBlocks, actionBundle, commandBlocks, patches, source code, or executable tool calls.'
         : '',
       allows('actionBundle')
-        ? 'For kind="actionBundle", put userPlanMarkdown, codeBlocks, and actionBundle directly on the top-level JSON object. Do not wrap them in a payload object. validationExpectations[] and reviewExpectations[] are optional provider notes; Session derives routine defaults when they are omitted.'
+        ? actionBundleCarrierGuidanceLine()
         : '',
       allows('taskOutcome')
-        ? 'For kind="taskOutcome", put taskOutcome:{version:"1",id,taskId,status:"modelJudgedSufficient",reason,evidenceRefs:[]} on the top-level JSON object. Use it only for the current accepted task when no Kernel action is needed.'
+        ? 'Carrier: taskOutcome uses top-level taskOutcome. Use it only for the current accepted task when no Kernel action is needed.'
         : '',
       allows('actionBundle')
         ? 'codeBlocks[] uses {blockId,targetPath,language?,operation?,contentLines,allowEmptyContent?}; contentLines is the only source-code carrier.'
@@ -599,11 +602,7 @@ export class ProviderRepairMessageBuilder {
         : '',
       'Never output permissionLabels, accessScopes, resourceScope, commandBlocks, or legacy implementationPlan. capability is allowed only as taskPlan.tasks[].capability; actionBundle actions must use toolId and must not output capability fields.',
     ].filter(Boolean);
-    if (allows('actionBundle') && (errorCode === 'invalid_action_bundle' || errorCode === 'invalid_object')) {
-      common.push(
-        `Minimal actionBundle skeleton:\n${this.minimalActionBundleRepairSkeleton()}`
-      );
-    }
+    void errorCode;
     if (allows('taskPlan')) {
       common.push(
         `Minimal taskPlan skeleton:\n${this.minimalTaskPlanRepairSkeleton()}`
@@ -617,39 +616,6 @@ export class ProviderRepairMessageBuilder {
       || errorCode === 'invalid_action_bundle_expectation'
       || errorCode === 'invalid_action_bundle_continuation'
       || errorCode === 'action_bundle_budget_exceeded';
-  }
-
-  private minimalActionBundleRepairSkeleton(): string {
-    return JSON.stringify({
-      schemaVersion: 'deepcode.agent.protocol.v3',
-      kind: 'actionBundle',
-      outputLanguage: 'zh-CN',
-      userPlanMarkdown: '# Plan\n\n## Summary\n...\n\n## Key Changes\n...\n\n## Interfaces\n...\n\n## Test Plan\n...\n\n## Assumptions\n...',
-      codeBlocks: [
-        {
-          blockId: 'block-1',
-          targetPath: 'relative/file.ext',
-          language: 'text',
-          operation: 'create',
-          contentLines: ['line 1', 'line 2'],
-        },
-      ],
-      actionBundle: {
-        version: '1',
-        id: 'batch-id',
-        goal: '...',
-        actions: [
-          {
-            actionId: 'write-file',
-            toolId: 'fs.write',
-            args: { path: 'relative/file.ext', sourceBlockId: 'block-1' },
-            description: 'Create the file.',
-          },
-        ],
-        validationExpectations: [{ id: 'validation-1', description: 'Kernel facts show the expected file operation.' }],
-        reviewExpectations: [{ id: 'review-1', description: 'Review the written file and Kernel facts.' }],
-      },
-    }, null, 2);
   }
 
   private minimalTaskPlanRepairSkeleton(): string {
@@ -676,6 +642,23 @@ export class ProviderRepairMessageBuilder {
       },
     }, null, 2);
   }
+}
+
+// Repair side calls must not duplicate full protocol skeletons outside ProviderTurnContract.
+function repairSchemaAuthorityLine(): string {
+  return 'Use the ProviderTurnContract above as the schema authority. Do not add payload wrappers or explanatory prose outside the final JSON object.';
+}
+
+function actionBundleCarrierGuidanceLine(): string {
+  return 'Carrier fields by kind: actionBundle uses top-level userPlanMarkdown, codeBlocks, and actionBundle. validationExpectations/reviewExpectations are optional provider notes; Session derives routine defaults when omitted.';
+}
+
+function resourceRequestCarrierGuidanceLine(): string {
+  return 'Carrier fields by kind: resourceRequest uses top-level resourceRequest. Use items[] for manifestEntryId, rootId+path, or search query under listed conversation roots.';
+}
+
+function decisionRequestCarrierGuidanceLine(): string {
+  return 'Carrier fields by kind: decisionRequest uses top-level decisionRequest with a non-empty question, 2-3 options, and allowsFreeform=true when user input is required.';
 }
 
 function objectRecord(value: unknown): Record<string, unknown> | undefined {

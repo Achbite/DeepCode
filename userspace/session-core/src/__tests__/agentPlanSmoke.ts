@@ -8133,7 +8133,7 @@ function assertProviderRepairMessageBuilderAvoidsDuplicateActionBundleReference(
   const joined = messages
     .map((message) => typeof message.content === 'string' ? message.content : JSON.stringify(message.content))
     .join('\n');
-  const shapeLine = 'The nested actionBundle object must include {version,id,goal,actions,...};';
+  const fullShapeLine = 'The nested actionBundle object must include {version,id,goal,actions,...};';
   const compactionRepair = new ProviderRepairMessageBuilder().actionBundleCompactionRepairMessages(prompt, {
     runId: `run-${token}`,
     userRequest: `Repair accepted task ${token}`,
@@ -8161,13 +8161,16 @@ function assertProviderRepairMessageBuilderAvoidsDuplicateActionBundleReference(
     .map((message) => typeof message.content === 'string' ? message.content : JSON.stringify(message.content))
     .join('\n');
 
-  assertEqual(joined.split(shapeLine).length - 1, 1, 'repair prompt includes the full actionBundle shape reference only once');
-  assertEqual(compactionRepair.split(shapeLine).length - 1, 1, 'compaction repair keeps one full actionBundle shape reference');
+  assertEqual(joined.split(fullShapeLine).length - 1, 0, 'repair prompt delegates full actionBundle schema to ProviderTurnContract');
+  assertEqual(compactionRepair.split(fullShapeLine).length - 1, 0, 'compaction repair delegates full actionBundle schema to ProviderTurnContract');
   assert(joined.includes('<ProviderTurnContract schemaVersion="deepcode.session.provider-turn-contract.v1">'), 'repair prompt includes ProviderTurnContract');
   assert(compactionRepair.includes('<ProviderTurnContract schemaVersion="deepcode.session.provider-turn-contract.v1">'), 'compaction repair includes ProviderTurnContract');
-  assert(joined.includes('Minimal actionBundle skeleton'), 'repair prompt keeps a minimal actionBundle skeleton for invalid actionBundle errors');
+  assert(joined.includes('Use the ProviderTurnContract above as the schema authority.'), 'repair prompt names ProviderTurnContract as schema authority');
+  assert(compactionRepair.includes('Use the ProviderTurnContract above as the schema authority.'), 'compaction repair names ProviderTurnContract as schema authority');
+  assert(joined.includes('Carrier fields by kind: actionBundle uses top-level userPlanMarkdown, codeBlocks, and actionBundle'), 'repair prompt keeps compact actionBundle carrier guidance');
+  assert(!joined.includes('Minimal actionBundle skeleton'), 'repair prompt does not re-inject an actionBundle skeleton');
   const validationLine = 'actionBundle.validationExpectations[] are optional reviewable validation notes shaped';
-  assertEqual(joined.split(validationLine).length - 1, 1, 'repair quick reference does not duplicate actionBundle validation schema lines');
+  assertEqual(joined.split(validationLine).length - 1, 0, 'repair quick reference does not duplicate actionBundle validation schema lines');
 }
 
 function assertProviderRepairMessageBuilderKeepsTaskPlanRepairShape(): void {
