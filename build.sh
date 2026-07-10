@@ -166,6 +166,7 @@ Environment:
   DEEPCODE_BUILD_LINUX_TAURI_SHELL=1 Build optional Linux Tauri shell.
   DEEPCODE_MACOS_PACKAGE_MODE=auto|off|require
                                       From Docker, submit a macOS package request after full package stage.
+  DEEPCODE_MACOS_PACKAGE_AUTOSTART=1  Start the host package service automatically when build.sh is running on macOS.
   DEEPCODE_MACOS_PACKAGE_WAIT=1       Wait for the host package service request to finish.
   DEEPCODE_MACOS_PACKAGE_TIMEOUT_SECONDS
                                       Timeout for macOS package service requests.
@@ -457,6 +458,24 @@ macos_package_service_is_running() {
   bash ./scripts/macos-package-service.sh status --quiet >/dev/null 2>&1
 }
 
+ensure_macos_package_service_running() {
+  macos_package_service_is_running && return 0
+  if [ "${DEEPCODE_MACOS_PACKAGE_AUTOSTART:-1}" != "1" ]; then
+    return 1
+  fi
+  if is_docker_environment; then
+    echo "==[build][package-macos]== macOS package service is not running; Docker cannot start host-side service automatically"
+    return 1
+  fi
+  if [ "$(uname -s)" != "Darwin" ]; then
+    return 1
+  fi
+
+  echo "==[build][package-macos]== macOS package service is not running; starting host service"
+  start_macos_package_service_from_host
+  macos_package_service_is_running
+}
+
 submit_macos_package_request() {
   local product="$1"
   local required="${2:-1}"
@@ -475,7 +494,7 @@ submit_macos_package_request() {
     args+=(--wait)
   fi
 
-  if ! macos_package_service_is_running; then
+  if ! ensure_macos_package_service_running; then
     if [ "$required" = "1" ]; then
       echo "==[build][error]== macOS package service is not running." >&2
       echo "==[build][error]== Run on the macOS host first: bash ./build.sh --stage macos-package-service" >&2

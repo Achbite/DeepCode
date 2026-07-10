@@ -103,7 +103,7 @@ RUN_ARGS := \
 	-e PATH=/root/.local/share/pnpm:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
 	$(NETWORK_ENV_ARGS)
 
-.PHONY: help shell build-deepcode-gui build-deepcode-gui-tauri dev-deepcode-gui clean macos-package-service macos-package-service-status macos-package-service-stop package-macos package-macos-clean package-macos-deepcode-gui _ensure_image _ensure_container
+.PHONY: help shell build-deepcode-gui build-deepcode-gui-tauri dev-deepcode-gui clean macos-package-service macos-package-service-status macos-package-service-stop package-macos package-macos-clean package-macos-deepcode-gui _ensure_macos_package_service _ensure_image _ensure_container
 
 # ---- help：默认目标，列出可用入口 ----
 help:
@@ -140,6 +140,16 @@ package-macos-clean:
 
 package-macos-deepcode-gui:
 	@bash ./build.sh --stage package-macos-deepcode-gui
+
+_ensure_macos_package_service:
+	@if [ "$$(uname -s 2>/dev/null)" = "Darwin" ] && [ "$${DEEPCODE_MACOS_PACKAGE_AUTOSTART:-1}" = "1" ]; then \
+		if bash ./scripts/macos-package-service.sh status --quiet >/dev/null 2>&1; then \
+			echo "[make] macOS package service 已运行"; \
+		else \
+			echo "[make] macOS package service 未运行，自动启动..."; \
+			bash ./build.sh --stage macos-package-service; \
+		fi; \
+	fi
 
 # ---- _ensure_image：镜像不存在则构建 ----
 _ensure_image:
@@ -188,7 +198,7 @@ _ensure_container: _ensure_image
 	fi
 
 # ---- shell：唯一交互入口 ----
-shell: _ensure_container
+shell: _ensure_macos_package_service _ensure_container
 	@echo "[make] exec 进入容器 $(CONTAINER_NAME) ..."
 	@docker exec -it $(NETWORK_ENV_ARGS) $(CONTAINER_NAME) bash
 
