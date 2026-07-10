@@ -1,6 +1,6 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import type { AgentTimelineResult } from '@deepcode/protocol';
-import { getLlmProfiles, getAgentTimeline } from '../../services/runtimeAdapter';
+import { getLlmProfiles } from '../../services/runtimeAdapter';
 import { useAgentSessionStore } from '../../state/agentSessionStore';
 import { useWorkspaceStore } from '../../state/workspaceStore';
 import { t, type UiLanguage } from '../../i18n';
@@ -10,11 +10,11 @@ import {
   findPendingComposerDecisionFromProjection,
   type AgentComposerPendingDecision,
 } from '../../components/agent-panel/pendingDecision';
-import { buildUiTimelineProjection } from '../../utils/uiTimelineProjection';
 import DeepCodeTimeline from './DeepCodeTimeline';
 
 interface DeepCodeAgentPanelProps {
   language: UiLanguage;
+  timeline: AgentTimelineResult;
   forceHome?: boolean;
   homeProjectTitle?: string | null;
   suppressPendingDecision?: boolean;
@@ -32,6 +32,7 @@ function displaySessionTitle(language: UiLanguage, title?: string): string {
 
 const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
   language,
+  timeline,
   forceHome = false,
   homeProjectTitle,
   suppressPendingDecision = false,
@@ -50,7 +51,6 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
   const resolvingRequirement = useAgentSessionStore((s) => s.resolvingRequirement);
   const resolvingPlan = useAgentSessionStore((s) => s.resolvingPlan);
   const resolvingReview = useAgentSessionStore((s) => s.resolvingReview);
-  const activeDeltas = useAgentSessionStore((s) => s.activeDeltas);
   const loadOrCreate = useAgentSessionStore((s) => s.loadOrCreate);
   const refreshSessions = useAgentSessionStore((s) => s.refreshSessions);
   const setProfileId = useAgentSessionStore((s) => s.setProfileId);
@@ -64,9 +64,7 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
   const resolvePlan = useAgentSessionStore((s) => s.resolvePlan);
   const resolveReview = useAgentSessionStore((s) => s.resolveReview);
   const workspaceRevision = useWorkspaceStore((s) => s.treeRevision);
-  const [timeline, setTimeline] = useState<AgentTimelineResult | null>(null);
-  const [timelineError, setTimelineError] = useState<string | null>(null);
-  const [timelineTypewriterActive, setTimelineTypewriterActive] = useState(false);
+  const [timelineTypewriterBlockIds, setTimelineTypewriterBlockIds] = useState<string[]>([]);
   const [revealedPendingDecisionKey, setRevealedPendingDecisionKey] = useState<string | null>(null);
   const [followLatestSignal, setFollowLatestSignal] = useState(0);
   const [bottomChromeElement, setBottomChromeElement] = useState<HTMLDivElement | null>(null);
@@ -90,74 +88,41 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
     void refreshSessions();
   }, [loadOrCreate, refreshSessions, workspaceRevision]);
 
-  useEffect(() => {
-    let cancelled = false;
-    const loadTimeline = async () => {
-      if (!session?.id) {
-        setTimeline(null);
-        setTimelineError(null);
-        return;
-      }
-      const result = await getAgentTimeline(session.id);
-      if (cancelled) return;
-      if (result.ok && result.data) {
-        setTimeline(result.data);
-        setTimelineError(null);
-      } else {
-        setTimelineError(result.message ?? result.error ?? 'Timeline unavailable');
-      }
-    };
-    void loadTimeline();
-    const interval = sessionRunning ? window.setInterval(() => void loadTimeline(), 1000) : null;
-    return () => {
-      cancelled = true;
-      if (interval !== null) window.clearInterval(interval);
-    };
-  }, [events.length, session?.id, sessionRunning]);
-
   const activeSessionTitle = displaySessionTitle(language, session?.title);
-  const uiTimelineProjection = useMemo(
-    () => buildUiTimelineProjection({
-      sessionId: session?.id,
-      events,
-      activeDeltas,
-      timeline,
-    }),
-    [activeDeltas, events, session?.id, timeline]
-  );
-  const hasTimelineTurns = uiTimelineProjection.turns.length > 0;
+  const hasTimelineTurns = timeline.turns.length > 0;
   const pendingDecision = suppressPendingDecision
     ? null
     : findPendingComposerDecisionFromProjection({
-      timeline: uiTimelineProjection,
-      events,
-      pendingPermission: pendingPermission?.request ?? null,
+      timeline,
       resolvingRequirement,
       resolvingPlan,
       resolvingReview,
       resolvingPermission,
     });
   const pendingDecisionKey = pendingDecisionIdentity(pendingDecision);
+  const pendingDecisionTypewriterActive = Boolean(
+    pendingDecision?.blockId && timelineTypewriterBlockIds.includes(pendingDecision.blockId)
+  );
   useEffect(() => {
     if (!pendingDecisionKey) {
       setRevealedPendingDecisionKey(null);
       return;
     }
-    if (!timelineTypewriterActive) {
+    if (!pendingDecisionTypewriterActive) {
       setRevealedPendingDecisionKey(pendingDecisionKey);
     }
-  }, [pendingDecisionKey, timelineTypewriterActive]);
+  }, [pendingDecisionKey, pendingDecisionTypewriterActive]);
   const decisionReadyForComposer = Boolean(
     pendingDecisionKey &&
     revealedPendingDecisionKey === pendingDecisionKey &&
-    !timelineTypewriterActive
+    !pendingDecisionTypewriterActive
   );
   const pendingDecisionResolving = Boolean(pendingDecision?.resolving);
-  const composerPendingDecision = decisionReadyForComposer && !pendingDecisionResolving
+  const composerPendingDecision = decisionReadyForComposer && !pendingDecisionResolving && pendingDecision?.kind !== 'permission'
     ? pendingDecision
     : null;
   const showHome = forceHome || (
-    !sessionRunning && !composerPendingDecision && !errorMessage && !timelineError
+    !sessionRunning && !composerPendingDecision && !errorMessage
     && events.length === 0 && !hasTimelineTurns
   );
   const composerRunning = forceHome ? false : (sessionRunning || pendingDecisionResolving);
@@ -253,12 +218,12 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
       </header>
 
       <DeepCodeTimeline
-        timeline={uiTimelineProjection}
+        timeline={timeline}
         loading={sessionRunning}
         language={language}
         followLatestSignal={followLatestSignal}
         scrollWatchElement={bottomChromeElement}
-        onTypewriterActiveChange={setTimelineTypewriterActive}
+        onTypewriterBlocksChange={setTimelineTypewriterBlockIds}
         onPlanResolve={(runId, planId, decision, guidance) => {
           requestFollowLatest();
           void resolvePlan(runId, planId, decision, guidance);
@@ -266,7 +231,7 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
       />
 
       <div ref={setBottomChromeElement}>
-        {!timelineTypewriterActive && pendingPermission && (
+        {pendingPermission && (
           <PermissionRequestBubble
             request={pendingPermission.request}
             language={language}
@@ -287,8 +252,8 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
           />
         )}
 
-        {(errorMessage || timelineError) && (
-          <div className="deepcode-gui-agent-panel__error">{errorMessage ?? timelineError}</div>
+        {errorMessage && (
+          <div className="deepcode-gui-agent-panel__error">{errorMessage}</div>
         )}
 
         {composer}

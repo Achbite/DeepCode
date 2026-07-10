@@ -22,7 +22,7 @@ import { useSettingsStore } from '../../state/settingsStore';
 import { useWorkspaceStore } from '../../state/workspaceStore';
 import { useAgentSessionStore } from '../../state/agentSessionStore';
 import { deriveTokenUsageStats, formatPercent, formatTokenCount } from '../../utils/tokenUsageStats';
-import { buildUiTimelineProjection, latestPlanTaskItemsFromProjection } from '../../utils/uiTimelineProjection';
+import { latestPlanTaskItemsFromProjection, useUiTimelineProjection } from '../../utils/uiTimelineProjection';
 import AgentMemoryViewer from '../../components/agent-memory/AgentMemoryViewer';
 import DeepCodeAgentPanel from '../panel/DeepCodeAgentPanel';
 import '../../components/workspace-open-dialog/workspaceOpenDialog.css';
@@ -855,14 +855,11 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
     : t(language, 'deepcodeGui.status.pending');
   const projectDraftActive = Boolean(draftTargetProjectId);
   const projectionEvents = projectDraftActive ? EMPTY_AGENT_EVENTS : events;
-  const liveTimelineProjection = useMemo(
-    () => buildUiTimelineProjection({
-      sessionId: projectDraftActive ? 'project-draft' : activeSession?.id ?? projectionEvents[0]?.sessionId ?? 'session',
-      events: projectionEvents,
-      activeDeltas: projectDraftActive ? [] : activeDeltas,
-    }),
-    [activeDeltas, activeSession?.id, projectDraftActive, projectionEvents]
-  );
+  const liveTimelineProjection = useUiTimelineProjection({
+    sessionId: projectDraftActive ? 'project-draft' : activeSession?.id ?? projectionEvents[0]?.sessionId ?? 'session',
+    events: projectionEvents,
+    activeDeltas: projectDraftActive ? EMPTY_PROJECTION_DELTAS : activeDeltas,
+  });
   const taskItems = useMemo(() => {
     const taskSessionId = projectDraftActive ? null : activeSession?.id ?? null;
     const fallbackItems = lastPlanTaskItemsRef.current.sessionId === taskSessionId
@@ -1496,6 +1493,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
         <main className="deepcode-gui-session-main">
           <DeepCodeAgentPanel
             language={language}
+            timeline={liveTimelineProjection}
             forceHome={projectDraftActive}
             homeProjectTitle={draftProject?.title ?? activeProject?.title ?? null}
             suppressPendingDecision={projectDraftActive}

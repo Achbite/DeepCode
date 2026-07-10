@@ -1,4 +1,4 @@
-import type { AgentEvent, AgentTimelineResult, PermissionRequest } from '@deepcode/protocol';
+import type { AgentEvent, PermissionRequest } from '@deepcode/protocol';
 
 export type InteractionLedgerOptionEffect =
   | { kind: 'continueWithAction' }
@@ -74,42 +74,6 @@ export function findActiveInteraction(input: {
   return findLatestActiveReview(events, resolvedReviews, resolvedReviewRuns)
     ?? findLatestActivePlan(events, resolvedPlans, resolvedPlanRuns)
     ?? findLatestActiveRequirement(events, resolvedRequirements);
-}
-
-export function interactionEventsFromTimeline(timeline?: AgentTimelineResult | null): AgentEvent[] {
-  if (!timeline) return [];
-  const byId = new Map<string, AgentEvent>();
-  for (const turn of timeline.turns) {
-    for (const block of turn.blocks) {
-      for (const event of block.events) {
-        if (!byId.has(event.id)) byId.set(event.id, event);
-      }
-    }
-  }
-  return [...byId.values()];
-}
-
-export function mergeInteractionEventsById(
-  ...sources: Array<readonly AgentEvent[] | undefined | null>
-): AgentEvent[] {
-  const byId = new Map<string, { event: AgentEvent; index: number }>();
-  let index = 0;
-  for (const source of sources) {
-    for (const event of source ?? []) {
-      if (!byId.has(event.id)) byId.set(event.id, { event, index });
-      index += 1;
-    }
-  }
-  return [...byId.values()]
-    .sort((left, right) => {
-      const leftTime = Date.parse(left.event.ts);
-      const rightTime = Date.parse(right.event.ts);
-      if (Number.isFinite(leftTime) && Number.isFinite(rightTime) && leftTime !== rightTime) {
-        return leftTime - rightTime;
-      }
-      return left.index - right.index;
-    })
-    .map((entry) => entry.event);
 }
 
 function findLatestActiveReview(

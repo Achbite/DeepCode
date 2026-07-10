@@ -1,23 +1,21 @@
-import type { AgentEvent, AgentTimelineResult, PermissionRequest } from '@deepcode/protocol';
-import {
-  findActiveInteraction,
-  interactionEventsFromTimeline,
-  mergeInteractionEventsById,
-  type InteractionLedgerActiveInteraction,
-  type InteractionLedgerDecisionOption,
-  type InteractionLedgerDecisionRequest,
-  type InteractionLedgerOptionEffect,
-} from '@deepcode/session-core';
+import type {
+  AgentTimelineDecisionRequest,
+  AgentTimelineInteractionOption,
+  AgentTimelineInteractionOptionEffect,
+  AgentTimelinePendingInteraction,
+  AgentTimelineResult,
+} from '@deepcode/protocol';
 
-export type AgentComposerDecisionOption = InteractionLedgerDecisionOption;
-export type AgentRequirementOptionEffectView = InteractionLedgerOptionEffect;
-export type AgentComposerDecisionRequest = InteractionLedgerDecisionRequest;
+export type AgentComposerDecisionOption = AgentTimelineInteractionOption;
+export type AgentRequirementOptionEffectView = AgentTimelineInteractionOptionEffect;
+export type AgentComposerDecisionRequest = AgentTimelineDecisionRequest;
 
 export type AgentComposerPendingDecision =
   | {
       kind: 'requirement';
       runId: string;
       requirementId: string;
+      blockId?: string;
       title?: string;
       summary?: string;
       decisionRequest?: AgentComposerDecisionRequest;
@@ -27,6 +25,7 @@ export type AgentComposerPendingDecision =
       kind: 'plan';
       runId: string;
       planId: string;
+      blockId?: string;
       title?: string;
       summary?: string;
       resolving?: boolean;
@@ -34,6 +33,7 @@ export type AgentComposerPendingDecision =
   | {
       kind: 'review';
       runId: string;
+      blockId?: string;
       title?: string;
       summary?: string;
       resolving?: boolean;
@@ -41,6 +41,7 @@ export type AgentComposerPendingDecision =
   | {
       kind: 'permission';
       requestId: string;
+      blockId?: string;
       title?: string;
       summary?: string;
       resolving?: boolean;
@@ -48,24 +49,18 @@ export type AgentComposerPendingDecision =
 
 export function findPendingComposerDecisionFromProjection(input: {
   timeline: AgentTimelineResult;
-  events?: readonly AgentEvent[];
-  pendingPermission?: PermissionRequest | null;
   resolvingRequirement?: { runId: string; requirementId: string } | null;
   resolvingPlan?: { runId: string; planId: string } | null;
   resolvingReview?: { runId: string } | null;
   resolvingPermission?: { id: string } | null;
 }): AgentComposerPendingDecision | null {
-  const events = mergeInteractionEventsById(input.events, interactionEventsFromTimeline(input.timeline));
-  const active = findActiveInteraction({
-    events,
-    pendingPermission: input.pendingPermission,
-  });
+  const active = input.timeline.interactionProjection?.pending;
   if (!active) return null;
   return withResolvingState(active, input);
 }
 
 function withResolvingState(
-  active: InteractionLedgerActiveInteraction,
+  active: AgentTimelinePendingInteraction,
   input: {
     resolvingRequirement?: { runId: string; requirementId: string } | null;
     resolvingPlan?: { runId: string; planId: string } | null;

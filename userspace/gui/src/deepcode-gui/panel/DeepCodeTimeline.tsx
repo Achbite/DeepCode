@@ -19,6 +19,7 @@ import {
 } from '../../components/agent-panel/StructuredProjectionContent';
 import { useSettingsStore } from '../../state/settingsStore';
 import { formatToolEvidence } from '../../utils/toolEvidence';
+import { bufferedTypewriterDelay, bufferedTypewriterStep } from '../../utils/typewriterBuffer';
 
 interface DeepCodeTimelineProps {
   timeline: AgentTimelineResult;
@@ -26,7 +27,7 @@ interface DeepCodeTimelineProps {
   language: UiLanguage;
   followLatestSignal?: number;
   scrollWatchElement?: HTMLElement | null;
-  onTypewriterActiveChange?: (active: boolean) => void;
+  onTypewriterBlocksChange?: (blockIds: string[]) => void;
   onPlanResolve?: (
     runId: string,
     planId: string,
@@ -37,7 +38,6 @@ interface DeepCodeTimelineProps {
 
 type TypewriterSpeed = NonNullable<NonNullable<AgentTimelineBlock['displayHints']>['typewriterSpeed']>;
 type TimelineFollowMode = 'following' | 'detached';
-const TYPEWRITER_BUFFER_DELAY_MS = 36;
 const LIVE_REASONING_FAST_BACKLOG_CHARS = 4000;
 const LIVE_REASONING_SNAP_BACKLOG_CHARS = 12000;
 
@@ -47,7 +47,7 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
   language,
   followLatestSignal = 0,
   scrollWatchElement = null,
-  onTypewriterActiveChange,
+  onTypewriterBlocksChange,
   onPlanResolve,
 }) => {
   const view = timeline;
@@ -58,17 +58,7 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
     Boolean(s.effectiveSettings['gui.typewriterAnimation'] ?? true)
   );
   const typewriterBlockIds = useTypewriterBlockIds(view, loading && typewriterEnabled);
-  const livePlayback = useProjectedTimelinePlayback(
-    view,
-    loading,
-    1000,
-    completedTypewriterBlockLengths,
-    typewriterBlockIds
-  );
-  const viewWithActive = useMemo(
-    () => livePlayback.view,
-    [livePlayback.view]
-  );
+  const viewWithActive = view;
   const timelineRef = useRef<HTMLDivElement | null>(null);
   const timelineContentRef = useRef<HTMLDivElement | null>(null);
   const timelineEndRef = useRef<HTMLDivElement | null>(null);
@@ -103,15 +93,12 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
       .join('|'),
     [typewriterBlockLengths]
   );
+  const animatingBlockIds = useMemo(() => new Set(
+    [...typewriterBlockLengths.entries()]
+      .filter(([blockId, textLength]) => (completedTypewriterBlockLengths.get(blockId) ?? 0) < textLength)
+      .map(([blockId]) => blockId)
+  ), [completedTypewriterBlockLengths, typewriterBlockLengths]);
   const timelineDensityClass = timelineDensity === 'compact' ? ' deepcode-gui-timeline--compact' : '';
-  const hasPendingTypewriter = useMemo(() => {
-    for (const [blockId, textLength] of typewriterBlockLengths) {
-      if ((completedTypewriterBlockLengths.get(blockId) ?? 0) < textLength) return true;
-    }
-    return false;
-  }, [completedTypewriterBlockLengths, typewriterBlockLengths]);
-  const hasPendingPlayback = hasPendingTypewriter || livePlayback.isHolding;
-
   useEffect(() => {
     setCompletedTypewriterBlockLengths((current) => {
       let changed = false;
@@ -128,12 +115,12 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
   }, [typewriterBlockLengthSignature, typewriterBlockLengths]);
 
   useEffect(() => {
-    onTypewriterActiveChange?.(hasPendingPlayback);
-  }, [hasPendingPlayback, onTypewriterActiveChange]);
+    onTypewriterBlocksChange?.([...animatingBlockIds]);
+  }, [animatingBlockIds, onTypewriterBlocksChange]);
 
   useEffect(() => () => {
-    onTypewriterActiveChange?.(false);
-  }, [onTypewriterActiveChange]);
+    onTypewriterBlocksChange?.([]);
+  }, [onTypewriterBlocksChange]);
 
   const markTypewriterComplete = useCallback((blockId: string, textLength: number) => {
     setCompletedTypewriterBlockLengths((current) => {
@@ -351,7 +338,7 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
             key={turn.id}
             turn={turn}
             language={language}
-            typewriterBlockIds={typewriterBlockIds}
+            typewriterBlockIds={animatingBlockIds}
             collapseCompletedThinking={collapseCompletedThinking}
             onLiveContentChange={scrollToTimelineEndIfFollowing}
             onTypewriterComplete={markTypewriterComplete}
@@ -381,88 +368,8 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
   );
 };
 
-interface ProjectedTimelinePlaybackResult {
-  view: AgentTimelineResult;
-  isHolding: boolean;
-}
-
-function useProjectedTimelinePlayback(
-  view: AgentTimelineResult,
-  enabled: boolean,
-  holdMs: number,
-  completedTextLengths: Map<string, number>,
-  playbackBlockIds: Set<string>
-): ProjectedTimelinePlaybackResult {
-  const playbackBlockSignature = useMemo(
-    () => [...playbackBlockIds].sort().join('|'),
-    [playbackBlockIds]
-  );
-  const [releasedBlockIds, setReleasedBlockIds] = useState<Set<string>>(() => new Set());
-
-  useEffect(() => {
-    setReleasedBlockIds((current) => {
-      let changed = false;
-      const next = new Set<string>();
-      for (const id of current) {
-        if (playbackBlockIds.has(id)) {
-          next.add(id);
-        } else {
-          changed = true;
-        }
-      }
-      return changed || next.size !== current.size ? next : current;
-    });
-  }, [playbackBlockIds, playbackBlockSignature]);
-
-  const blockingBlockId = useMemo(() => {
-    if (!enabled) return null;
-    const blocks = flattenTimelineBlocks(view);
-    for (let index = 0; index < blocks.length - 1; index += 1) {
-      const block = blocks[index];
-      if (!isPlaybackBlockingTextBlock(block, playbackBlockIds)) continue;
-      if (releasedBlockIds.has(block.id)) continue;
-      const hasLaterVisibleBlock = blocks.slice(index + 1).some(isVisibleTimelineBlock);
-      if (hasLaterVisibleBlock) return block.id;
-    }
-    return null;
-  }, [enabled, playbackBlockIds, releasedBlockIds, view]);
-
-  useEffect(() => {
-    if (!enabled || !blockingBlockId) return undefined;
-    const block = findTimelineBlock(view, blockingBlockId);
-    if (!block) return undefined;
-    const textLength = visibleTypewriterMarkdown(block).length;
-    if (textLength > 0 && (completedTextLengths.get(blockingBlockId) ?? 0) < textLength) {
-      return undefined;
-    }
-    const timer = window.setTimeout(() => {
-      setReleasedBlockIds((current) => {
-        if (current.has(blockingBlockId)) return current;
-        const next = new Set(current);
-        next.add(blockingBlockId);
-        return next;
-      });
-    }, holdMs);
-    return () => window.clearTimeout(timer);
-  }, [blockingBlockId, completedTextLengths, enabled, holdMs, view]);
-
-  const visibleView = useMemo(() => {
-    const releasedView = blockingBlockId ? truncateTimelineAfterBlock(view, blockingBlockId) : view;
-    return applyPlaybackPresentationState(releasedView, playbackBlockIds, releasedBlockIds);
-  }, [blockingBlockId, playbackBlockIds, releasedBlockIds, view]);
-
-  return {
-    view: visibleView,
-    isHolding: Boolean(blockingBlockId),
-  };
-}
-
 function flattenTimelineBlocks(view: AgentTimelineResult): AgentTimelineBlock[] {
   return view.turns.flatMap((turn) => turn.blocks);
-}
-
-function findTimelineBlock(view: AgentTimelineResult, blockId: string): AgentTimelineBlock | undefined {
-  return flattenTimelineBlocks(view).find((block) => block.id === blockId);
 }
 
 function isLiveOverlayBlock(block: AgentTimelineBlock): boolean {
@@ -470,66 +377,6 @@ function isLiveOverlayBlock(block: AgentTimelineBlock): boolean {
     (block.rawEventRefs ?? []).some((ref) => ref.startsWith('event:live:'));
 }
 
-function isPlaybackBlockingTextBlock(
-  block: AgentTimelineBlock,
-  playbackBlockIds: Set<string>
-): boolean {
-  if (!playbackBlockIds.has(block.id)) return false;
-  if (visibleTypewriterMarkdown(block).length === 0) return false;
-  return block.narrativeKind === 'assistantNarration' ||
-    block.narrativeKind === 'assistantText' ||
-    block.narrativeKind === 'thinking' ||
-    block.narrativeKind === 'requirement' ||
-    block.narrativeKind === 'review' ||
-    block.kind === 'assistant' ||
-    block.kind === 'thinking' ||
-    block.kind === 'plan' ||
-    block.kind === 'review';
-}
-
-function truncateTimelineAfterBlock(view: AgentTimelineResult, blockId: string): AgentTimelineResult {
-  let found = false;
-  const turns: AgentTimelineResult['turns'] = [];
-  for (const turn of view.turns) {
-    if (found) break;
-    const blocks: AgentTimelineBlock[] = [];
-    for (const block of turn.blocks) {
-      blocks.push(block);
-      if (block.id === blockId) {
-        found = true;
-        break;
-      }
-    }
-    turns.push({ ...turn, blocks });
-  }
-  return { ...view, turns };
-}
-
-function applyPlaybackPresentationState(
-  view: AgentTimelineResult,
-  playbackBlockIds: Set<string>,
-  releasedBlockIds: Set<string>
-): AgentTimelineResult {
-  return {
-    ...view,
-    turns: view.turns.map((turn) => ({
-      ...turn,
-      blocks: turn.blocks.map((block) => {
-        if (!playbackBlockIds.has(block.id)) return block;
-        const released = releasedBlockIds.has(block.id);
-        const thinking = block.kind === 'thinking' || block.narrativeKind === 'thinking';
-        return {
-          ...block,
-          defaultCollapsed: released && thinking ? true : false,
-          displayHints: {
-            ...(block.displayHints ?? {}),
-            initialOpen: released && thinking ? false : true,
-          },
-        };
-      }),
-    })),
-  };
-}
 
 function activityKindLabel(language: UiLanguage, kind: AgentConversationActivity['kind']): string {
   return t(language, `deepcodeGui.activity.kind.${kind}`);
@@ -686,7 +533,12 @@ function useTypewriterBlockIds(
     for (const block of candidateBlocks) {
       const blockId = block.id;
       const animationKey = typewriterAnimationKey(block);
-      if (seenBlockIdsRef.current.has(blockId)) continue;
+      if (seenBlockIdsRef.current.has(blockId)) {
+        // Active blocks keep the same id while their streamed content grows. Record every
+        // observed content version so the committed replacement is not replayed as new text.
+        seenAnimationKeysRef.current.add(animationKey);
+        continue;
+      }
       seenBlockIdsRef.current.add(blockId);
       if (shouldAnimateNewAssistant) {
         if (blockAfterInteraction(block, latestInteractionTime) && !seenAnimationKeysRef.current.has(animationKey)) {
@@ -1168,6 +1020,9 @@ const ActivityBlock: React.FC<{
     fallbackTitle: activity.title || block.title,
   });
   const hasEvidence = evidence.items.length > 0;
+  const evidenceAction = hasEvidence && evidence.items.every((item) => item.action === evidence.items[0]?.action)
+    ? evidence.items[0]?.action
+    : undefined;
   const title = localizedTimelineText(
     language,
     hasEvidence ? evidence.title : activity.title || block.title || activityKindLabel(language, activity.kind)
@@ -1189,7 +1044,7 @@ const ActivityBlock: React.FC<{
       <div className="deepcode-gui-block__details deepcode-gui-activity">
         <div className="deepcode-gui-activity__head">
           <span className={`deepcode-gui-activity__kind deepcode-gui-activity__kind--${activity.kind}`}>
-            {activityKindLabel(language, activity.kind)}
+            {evidenceAction ?? activityKindLabel(language, activity.kind)}
           </span>
           <span className={`deepcode-gui-activity__status deepcode-gui-activity__status--${activity.status}`}>
             {timelineStatusLabel(language, activity.status)}
@@ -1365,7 +1220,11 @@ const ThinkingBlock: React.FC<{
   const liveReasoning = isLiveOverlayBlock(block) && running;
   // Empty reasoning shells are hidden unless the provider is still streaming.
   if (!markdown && !running) return null;
-  const initialOpen = block.displayHints?.initialOpen ?? true;
+  const initialOpen = running || animate
+    ? true
+    : collapseCompletedThinking
+      ? block.displayHints?.initialOpen ?? !block.defaultCollapsed
+      : true;
   const [open, setOpen] = useState(initialOpen);
 
   useEffect(() => {
@@ -1691,7 +1550,7 @@ const StructuredProjectionTypewriter: React.FC<{
     const tick = () => {
       const latestLength = latestTextRef.current.length;
       const backlog = Math.max(0, latestLength - index);
-      const step = typewriterBufferedStep(backlog, speed);
+      const step = bufferedTypewriterStep(backlog, speed);
       index = Math.min(latestLength, index + step);
       visibleRef.current = index;
       setVisibleCharacters(index);
@@ -1702,10 +1561,10 @@ const StructuredProjectionTypewriter: React.FC<{
         }
         return;
       }
-      timerRef.current = window.setTimeout(tick, typewriterBufferedDelay(speed));
+      timerRef.current = window.setTimeout(tick, bufferedTypewriterDelay(speed));
     };
 
-    timerRef.current = window.setTimeout(tick, typewriterBufferedDelay(speed));
+    timerRef.current = window.setTimeout(tick, bufferedTypewriterDelay(speed));
     return () => {
       if (timerRef.current !== null) {
         window.clearTimeout(timerRef.current);
@@ -1797,32 +1656,19 @@ const TypewriterMarkdown: React.FC<{
         onAnimationCompleteRef.current?.();
         return;
       }
-      const step = typewriterBufferedStep(backlog, speed);
+      const step = bufferedTypewriterStep(backlog, speed);
       commitVisible(latest.slice(0, Math.min(latest.length, current.length + step)));
-      timerRef.current = window.setTimeout(tick, typewriterBufferedDelay(speed));
+      timerRef.current = window.setTimeout(tick, bufferedTypewriterDelay(speed));
     };
 
     if (timerRef.current === null) {
-      timerRef.current = window.setTimeout(tick, TYPEWRITER_BUFFER_DELAY_MS);
+      timerRef.current = window.setTimeout(tick, bufferedTypewriterDelay(speed));
     }
     return clearTimer;
   }, [shouldAnimate, content, speed]);
 
   return <MarkdownContent content={renderedContent} />;
 };
-
-function typewriterBufferedStep(backlog: number, speed: TypewriterSpeed): number {
-  const base = speed === 'fast' ? 32 : speed === 'slow' ? 6 : 16;
-  if (backlog >= 1000) return base * 5;
-  if (backlog >= 400) return base * 3;
-  return base;
-}
-
-function typewriterBufferedDelay(speed: TypewriterSpeed): number {
-  if (speed === 'fast') return 24;
-  if (speed === 'slow') return 52;
-  return TYPEWRITER_BUFFER_DELAY_MS;
-}
 
 const EventList: React.FC<{ events: AgentEvent[]; compact?: boolean; language: UiLanguage }> = ({ events, compact, language }) => (
   <div className={`deepcode-gui-event-list ${compact ? 'deepcode-gui-event-list--compact' : ''}`}>

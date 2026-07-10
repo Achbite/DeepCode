@@ -529,6 +529,7 @@ export interface AgentConversationActivity {
   actionIds?: string[];
   workUnitIds?: string[];
   toolName?: string;
+  operation?: string;
   itemCount?: number;
   errorCode?: string;
   errorMessage?: string;
@@ -565,6 +566,46 @@ export interface AgentTimelineTaskProjectionItem {
 export interface AgentTimelineTaskProjection {
   title: string;
   items: AgentTimelineTaskProjectionItem[];
+}
+
+export type AgentTimelineInteractionOptionEffect =
+  | { kind: 'continueWithAction' }
+  | { kind: 'skipCurrentTask' }
+  | { kind: 'replan'; reason?: string }
+  | { kind: 'finishRun' };
+
+export interface AgentTimelineInteractionOption {
+  id: string;
+  label: string;
+  description?: string;
+  recommended?: boolean;
+  effect?: AgentTimelineInteractionOptionEffect;
+}
+
+export interface AgentTimelineDecisionRequest {
+  id?: string;
+  reason?: string;
+  summary?: string;
+  allowsFreeform: boolean;
+  options: AgentTimelineInteractionOption[];
+}
+
+export type AgentTimelinePendingInteraction =
+  | { kind: 'permission'; requestId: string; blockId?: string; title?: string; summary?: string }
+  | { kind: 'review'; runId: string; blockId?: string; title?: string; summary?: string }
+  | { kind: 'plan'; runId: string; planId: string; blockId?: string; title?: string; summary?: string }
+  | {
+      kind: 'requirement';
+      runId: string;
+      requirementId: string;
+      blockId?: string;
+      title?: string;
+      summary?: string;
+      decisionRequest?: AgentTimelineDecisionRequest;
+    };
+
+export interface AgentTimelineInteractionProjection {
+  pending?: AgentTimelinePendingInteraction;
 }
 
 export interface AgentTimelineTokenUsageTotals {
@@ -627,6 +668,7 @@ export interface AgentTimelineResult {
   turns: AgentTimelineTurn[];
   eventCount: number;
   taskProjection?: AgentTimelineTaskProjection;
+  interactionProjection?: AgentTimelineInteractionProjection;
   tokenUsageProjection?: AgentTimelineTokenUsageProjection;
   rawEventRefs?: string[];
 }

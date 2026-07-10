@@ -258,6 +258,10 @@ export function buildNarrativeTimelineProjection(input: NarrativeTimelineProject
   const implementationTaskItems = input.events.flatMap((event, index) =>
     implementationPlanTaskProjectionItems(input.events, event, index, blockIdsByEventId.get(event.id))
   );
+  const activeInteraction = findActiveInteraction({
+    events: input.events,
+    pendingPermission: findLatestPendingPermission(input.events)?.request,
+  });
 
   return {
     schemaVersion: NARRATIVE_TIMELINE_SCHEMA_VERSION,
@@ -269,9 +273,44 @@ export function buildNarrativeTimelineProjection(input: NarrativeTimelineProject
       title: 'Task projection',
       items: implementationTaskItems.slice(-8),
     },
+    interactionProjection: activeInteraction
+      ? { pending: { ...activeInteraction, blockId: interactionBlockId(turns, activeInteraction) } }
+      : undefined,
     tokenUsageProjection: buildTokenUsageProjection(input.events),
     rawEventRefs,
   };
+}
+
+function interactionBlockId(
+  turns: AgentTimelineResult['turns'],
+  active: InteractionLedgerActiveInteraction
+): string | undefined {
+  const blocks = turns.flatMap((turn) => turn.blocks);
+  for (let index = blocks.length - 1; index >= 0; index -= 1) {
+    const block = blocks[index];
+    if (block.events.some((event) => eventMatchesInteraction(event, active))) return block.id;
+  }
+  return undefined;
+}
+
+function eventMatchesInteraction(event: AgentEvent, active: InteractionLedgerActiveInteraction): boolean {
+  const payload = isRecordPayload(event.payload) ? event.payload : {};
+  if (active.kind === 'permission') {
+    if (event.kind !== 'permission_request') return false;
+    return [stringField(payload, 'id'), stringField(payload, 'requestId'), stringField(payload, 'permissionId')]
+      .includes(active.requestId);
+  }
+  if (active.kind === 'plan') {
+    return (event.kind === 'plan_card' || event.kind === 'plan_review') &&
+      stringField(payload, 'runId') === active.runId &&
+      stringField(payload, 'planId') === active.planId;
+  }
+  if (active.kind === 'review') {
+    return event.kind === 'review_summary' && stringField(payload, 'runId') === active.runId;
+  }
+  return event.kind === 'requirement_confirmation' &&
+    stringField(payload, 'runId') === active.runId &&
+    stringField(payload, 'requirementId') === active.requirementId;
 }
 
 export function buildTimelineProjectionWithLiveOverlay(
@@ -302,12 +341,67 @@ function projectionDeltasToTransientEvents(input: {
       .map(eventActivityId)
       .filter((id): id is string => Boolean(id))
   );
-  return input.activeDeltas
+  return coalesceLiveToolActivities(input.activeDeltas)
     .filter((delta) => delta.sessionId === input.sessionId)
     .filter((delta) => delta.type !== 'committed')
     .filter((delta) => !activeDeltaAlreadyCommitted(delta, committedActivityIds))
     .sort((left, right) => (left.seq ?? 0) - (right.seq ?? 0))
     .flatMap((delta) => projectionDeltaToTransientEvent(delta, input.generatedAt));
+}
+
+function coalesceLiveToolActivities(deltas: ProjectionDelta[]): ProjectionDelta[] {
+  const toolCallsByItem = new Map<string, ProjectionDelta>();
+  const resolvedItems = new Set<string>();
+  for (const delta of deltas) {
+    const key = liveToolItemKey(delta);
+    if (!key) continue;
+    if (delta.type === 'tool_call_delta') toolCallsByItem.set(key, delta);
+    if (delta.type === 'resource_delta') resolvedItems.add(key);
+  }
+
+  return deltas.flatMap((delta) => {
+    const key = liveToolItemKey(delta);
+    if (key && delta.type === 'tool_call_delta' && resolvedItems.has(key)) return [];
+    if (!key || delta.type !== 'resource_delta' || !delta.activity) return [delta];
+    const toolCall = toolCallsByItem.get(key);
+    const toolName = delta.activity.toolName ?? toolCall?.activity?.toolName;
+    return [{
+      ...delta,
+      activity: {
+        ...delta.activity,
+        activityId: toolCall?.activity?.activityId ?? delta.activity.activityId,
+        toolName,
+        operation: delta.activity.operation ?? operationFromLiveToolName(toolName),
+      },
+    }];
+  });
+}
+
+function liveToolItemKey(delta: ProjectionDelta): string | undefined {
+  if (!delta.itemId || !delta.runId) return undefined;
+  if (delta.type !== 'tool_call_delta' && delta.type !== 'resource_delta') return undefined;
+  return `${delta.sessionId}:${delta.runId}:${delta.itemId}`;
+}
+
+function operationFromLiveToolName(toolName: string | undefined): string | undefined {
+  if (!toolName) return undefined;
+  const operations: Record<string, string> = {
+    'fs.read': 'read',
+    fs__read: 'read',
+    'fs.list': 'list',
+    fs__list: 'list',
+    'fs.diff': 'diff',
+    fs__diff: 'diff',
+    'code.search': 'search',
+    code__search: 'search',
+    'fs.write': 'write',
+    fs__write: 'write',
+    'fs.patch': 'patch',
+    fs__patch: 'patch',
+    'fs.delete': 'delete',
+    fs__delete: 'delete',
+  };
+  return operations[toolName];
 }
 
 function projectionDeltaToTransientEvent(delta: ProjectionDelta, generatedAt?: string): AgentEvent[] {
@@ -494,6 +588,7 @@ function isProjectionTimelineHiddenEvent(event: AgentEvent): boolean {
     const kernelEvent = isRecordPayload(payload.kernelEvent) ? payload.kernelEvent : undefined;
     const kernelEventKind = kernelEvent ? stringField(kernelEvent, 'kind') : undefined;
     if (isInternalOrchestrationStage({ stage, kernelEventKind })) return true;
+    if (!activity) return true;
   }
   if (activity && !isMainTimelineActivityShape({ kind: activity.kind, toolName: activity.toolName })) {
     return true;
@@ -1808,6 +1903,7 @@ function activityFromValue(value: unknown): AgentConversationActivity | undefine
     actionIds: stringArrayField(value, 'actionIds'),
     workUnitIds: stringArrayField(value, 'workUnitIds'),
     toolName: stringField(value, 'toolName'),
+    operation: stringField(value, 'operation'),
     itemCount: numberField(value, 'itemCount'),
     errorCode: stringField(value, 'errorCode'),
     errorMessage: stringField(value, 'errorMessage'),

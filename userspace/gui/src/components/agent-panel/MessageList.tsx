@@ -19,12 +19,12 @@ import DiffCard from './DiffCard';
 import WorkMetaRow from './WorkMetaRow';
 import { compactDisplayText, sanitizeDisplayText } from './displayText';
 import { formatToolEvidence } from '../../utils/toolEvidence';
+import { bufferedTypewriterDelay, bufferedTypewriterStep } from '../../utils/typewriterBuffer';
 import {
   getConversationArchive,
   readConversationArchiveFile,
   submitAgentFeedback,
 } from '../../services/runtimeAdapter';
-import { timelineEventsFromProjection } from '../../utils/uiTimelineProjection';
 
 interface MessageListProps {
   timeline: AgentTimelineResult;
@@ -1543,7 +1543,7 @@ function TypewriterMarkdown({
   renderMode?: TimelineRenderMode;
   speed?: TimelineTypewriterSpeed;
 }) {
-  const animate = content.length <= 1600 && (renderMode === 'typewriter' || renderMode === 'accelerated');
+  const animate = renderMode === 'typewriter' || renderMode === 'accelerated';
   const [visible, setVisible] = React.useState(() => (animate ? '' : content));
   const visibleRef = React.useRef(visible);
 
@@ -1559,16 +1559,20 @@ function TypewriterMarkdown({
     const startIndex = content.startsWith(visibleRef.current) ? visibleRef.current.length : 0;
     setVisible(content.slice(0, startIndex));
     let index = startIndex;
-    const step = renderMode === 'accelerated' || speed === 'fast' ? 12 : speed === 'slow' ? 2 : 4;
-    const delayMs = renderMode === 'accelerated' || speed === 'fast' ? 8 : speed === 'slow' ? 20 : 12;
-    const timer = window.setInterval(() => {
-      index = Math.min(content.length, index + step);
+    const effectiveSpeed = renderMode === 'accelerated' ? 'fast' : speed;
+    let timer: number | null = null;
+    const tick = () => {
+      const backlog = content.length - index;
+      index = Math.min(content.length, index + bufferedTypewriterStep(backlog, effectiveSpeed));
       setVisible(content.slice(0, index));
-      if (index >= content.length) {
-        window.clearInterval(timer);
+      if (index < content.length) {
+        timer = window.setTimeout(tick, bufferedTypewriterDelay(effectiveSpeed));
       }
-    }, delayMs);
-    return () => window.clearInterval(timer);
+    };
+    timer = window.setTimeout(tick, bufferedTypewriterDelay(effectiveSpeed));
+    return () => {
+      if (timer !== null) window.clearTimeout(timer);
+    };
   }, [animate, content, renderMode, speed]);
 
   return <MarkdownContent content={animate ? visible : content} />;
@@ -1931,7 +1935,7 @@ const MessageList: React.FC<MessageListProps> = ({
   onReviewResolve,
 }) => {
   const events = React.useMemo(
-    () => timelineEventsFromProjection(timeline),
+    () => timeline.turns.flatMap((turn) => turn.blocks.flatMap((block) => block.events)),
     [timeline]
   );
   const planState = React.useMemo(

@@ -31,7 +31,6 @@ import {
   createResourcePacket,
   evaluateRunState,
   findActiveInteraction,
-  interactionEventsFromTimeline,
   findLatestPendingPermission,
   normalizeDecisionEffect,
   parseProposalEnvelope,
@@ -315,7 +314,7 @@ async function main(): Promise<void> {
   assertInteractionLedgerResolvesTerminalSourcePlanReview();
   assertInteractionLedgerTerminalRunStateClosesPlan();
   assertProjectionResolvesPlanAfterSourceReview();
-  assertProjectionPreservesDecisionEventsForInteractionLedger();
+  assertProjectionPublishesInteractionState();
   assertPlanInteractionIndexFindsActivePlan();
   assertPlanReviewGrantProjectorBuildsExecutionReadModels();
   assertProposalRouterPlansPureRoutes();
@@ -5780,24 +5779,34 @@ function assertProjectionBuildersKeepKernelAndReviewReadModels(): void {
     workUnit: {
       id: workUnitId,
       actionId,
+      kind: 'delete',
+      compiledTool: {
+        toolName: 'fs.delete',
+      },
       writeSet: [targetPath],
     },
   };
-  const completedWithoutTarget = {
+  const completedWithoutAction = {
     kind: 'work_unit.completed',
     runId,
     workUnitId,
+    output: {
+      path: targetPath,
+      operation: 'delete',
+    },
   };
   const facts = kernelProjection.indexKernelWorkUnitFacts([queued]);
-  const enriched = kernelProjection.enrichKernelWorkUnitRecord(completedWithoutTarget, facts);
+  const enriched = kernelProjection.enrichKernelWorkUnitRecord(completedWithoutAction, facts);
   assertEqual(
     kernelProjection.kernelEventTargets(enriched)[0],
     targetPath,
-    'kernel projection enriches completed work unit targets from queued facts'
+    'kernel projection preserves completed work unit targets'
   );
+  assertEqual(enriched.actionId, actionId, 'kernel projection enriches the completed activity identity from queued facts');
   const activity = kernelProjection.kernelEventActivity(enriched, `activity-${token}`, runId);
   assertEqual(activity?.kind, 'editFileCompleted', 'kernel projection builds completed edit activity');
   assertEqual(activity?.targets?.[0], targetPath, 'kernel projection carries activity target');
+  assertEqual(activity?.operation, 'delete', 'kernel projection preserves the structured operation across work-unit updates');
   const projected = kernelProjection.projectKernelEvent({
     sessionId: `session-${token}`,
     event: enriched,
@@ -5805,6 +5814,32 @@ function assertProjectionBuildersKeepKernelAndReviewReadModels(): void {
     id: `event-${token}`,
   });
   assertEqual(projected.kind, 'workflow_stage', 'kernel projection preserves workflow stage event shape');
+  const projectedQueued = kernelProjection.projectKernelEvent({
+    sessionId: `session-${token}`,
+    event: queued,
+    ts: new Date(0).toISOString(),
+    id: `event-queued-${token}`,
+  });
+  const projectedStarted = kernelProjection.projectKernelEvent({
+    sessionId: `session-${token}`,
+    event: kernelProjection.enrichKernelWorkUnitRecord({
+      kind: 'work_unit.started',
+      runId,
+      workUnitId,
+      writeSet: [targetPath],
+    }, facts),
+    ts: new Date(1).toISOString(),
+    id: `event-started-${token}`,
+  });
+  const activityProjection = buildNarrativeTimelineProjection({
+    sessionId: `session-${token}`,
+    events: [projectedQueued, projectedStarted, projected],
+  });
+  assertEqual(
+    activityProjection.turns.flatMap((turn) => turn.blocks).filter((block) => block.activity).length,
+    1,
+    'queued, running, and completed facts update one activity block'
+  );
 
   const reviewProjection = new ReviewProjectionBuilder();
   const readableReview = reviewProjection.readableSummary([{
@@ -5830,6 +5865,14 @@ function assertProjectionBuildersKeepKernelAndReviewReadModels(): void {
     continuations: [],
   });
   assert(JSON.stringify(reviewSections).includes(targetPath), 'review projection renders changed file path in structured review sections');
+  assert(
+    !reviewSections.some((section) => section.sectionId === 'auditDetails' || section.sectionId === 'originalPlan'),
+    'readable review projection keeps audit details and the original plan out of the primary card'
+  );
+  assert(
+    !JSON.stringify(reviewSections).includes(workUnitId),
+    'readable review projection does not expose work-unit identifiers in primary content'
+  );
 
   const reviewSummaryProjection = new ReviewProjectionBuilder<any, { id: string }, { completedTaskIds: string[] }>({
     reviewFactLines: () => [`fact-${token}`],
@@ -9240,7 +9283,7 @@ function assertProjectionResolvesPlanAfterSourceReview(): void {
   );
 }
 
-function assertProjectionPreservesDecisionEventsForInteractionLedger(): void {
+function assertProjectionPublishesInteractionState(): void {
   const suffix = randomSmokeToken('projection-decision-facts');
   const sessionId = `session-${suffix}`;
   const runId = `run-${suffix}`;
@@ -9277,7 +9320,6 @@ function assertProjectionPreservesDecisionEventsForInteractionLedger(): void {
     events: [planCard, acceptedDecision],
     generatedAt: '2026-01-01T00:00:02.000Z',
   });
-  const timelineEvents = interactionEventsFromTimeline(projection);
   const planTurn = projection.turns.find((turn) =>
     turn.blocks.some((block) => block.events.some((event) => event.id === planCard.id))
   );
@@ -9286,16 +9328,7 @@ function assertProjectionPreservesDecisionEventsForInteractionLedger(): void {
     'completed',
     'timeline projection recomputes turn status after a pending plan block is resolved'
   );
-  assertEqual(
-    timelineEvents.some((event) => event.id === acceptedDecision.id && event.kind === 'plan_review'),
-    true,
-    'timeline projection keeps original plan decision events for interaction resolution'
-  );
-  assertEqual(
-    findActiveInteraction({ events: timelineEvents }),
-    null,
-    'interaction ledger does not revive an accepted plan when only timeline events are available'
-  );
+  assertEqual(projection.interactionProjection, undefined, 'timeline projection does not revive an accepted plan interaction');
   const waitingPlanRunState = {
     id: `event-${suffix}-waiting-plan-state`,
     sessionId,
@@ -10312,12 +10345,24 @@ function assertNarrativeTimelineProjectionResolvesAcceptedPlanInteractions(): vo
       },
     },
   ];
+  const pendingProjection = buildNarrativeTimelineProjection({
+    sessionId: 'session-plan-resolution',
+    events: events.slice(0, 2),
+    generatedAt: '2026-01-01T00:00:01.000Z',
+  });
+  assertEqual(pendingProjection.interactionProjection?.pending?.kind, 'plan', 'timeline exposes the pending interaction from the same projection');
+  assertEqual(
+    pendingProjection.interactionProjection?.pending?.blockId,
+    pendingProjection.turns[0]?.blocks.find((block) => block.narrativeKind === 'plan')?.id,
+    'pending interaction references its projected plan block'
+  );
   const projection = buildNarrativeTimelineProjection({
     sessionId: 'session-plan-resolution',
     events,
     generatedAt: '2026-01-01T00:00:07.000Z',
   });
   const blocks = projection.turns.flatMap((turn) => turn.blocks);
+  assertEqual(projection.interactionProjection, undefined, 'resolved review leaves no pending interaction in the timeline');
   const planBlock = blocks.find((block) => block.events.some((event) => event.id === 'event-plan-card'));
   assertEqual(planBlock?.status, 'completed', 'accepted plan card no longer remains waiting after raw plan_review acceptance');
   assertEqual(
@@ -10422,6 +10467,79 @@ function assertTimelineProjectionWithLiveOverlay(): void {
     'live activity uses a structured transient event ref'
   );
 
+  const nativeToolProjection = buildTimelineProjectionWithLiveOverlay({
+    sessionId: 'session-live-overlay',
+    committedEvents: [userEvent],
+    activeDeltas: [
+      {
+        type: 'tool_call_delta',
+        seq: 1,
+        sessionId: 'session-live-overlay',
+        runId: 'run-live-overlay',
+        itemId: 'native-call-generic',
+        stage: 'native_tool_call',
+        status: 'running',
+        channel: 'tool',
+        source: 'session',
+        activity: {
+          activityId: 'native-tool-native-call-generic',
+          kind: 'toolExecution',
+          status: 'running',
+          title: 'Resolve native tool',
+          summary: 'Resolve a read-only native tool.',
+          source: 'session',
+          runId: 'run-live-overlay',
+          toolName: 'fs__list',
+        },
+      },
+      {
+        type: 'stage_delta',
+        seq: 2,
+        sessionId: 'session-live-overlay',
+        runId: 'run-live-overlay',
+        stage: 'native_tool_round_1',
+        status: 'running',
+        channel: 'progress',
+        source: 'session',
+        activity: {
+          activityId: 'native-tool-round-1',
+          kind: 'toolExecution',
+          status: 'running',
+          title: 'Native tool checkpoint',
+          summary: 'Internal routing checkpoint.',
+          source: 'session',
+          runId: 'run-live-overlay',
+        },
+      },
+      {
+        type: 'resource_delta',
+        seq: 3,
+        sessionId: 'session-live-overlay',
+        runId: 'run-live-overlay',
+        itemId: 'native-call-generic',
+        stage: 'native_tool_resource_resolve',
+        status: 'completed',
+        channel: 'resource',
+        source: 'kernel',
+        activity: {
+          activityId: 'native-tool-resource-native-call-generic',
+          kind: 'resourceRead',
+          status: 'completed',
+          title: 'Resource resolved',
+          summary: 'Resolved one directory.',
+          source: 'kernel',
+          runId: 'run-live-overlay',
+          targets: ['.'],
+        },
+      },
+    ],
+  });
+  const nativeToolBlocks = nativeToolProjection.turns[0].blocks.filter((block) => block.activity);
+  assertEqual(nativeToolBlocks.length, 1, 'native tool progress resolves into one activity card');
+  assertEqual(nativeToolBlocks[0]?.activity?.kind, 'resourceRead', 'native tool result replaces the running tool card');
+  assertEqual(nativeToolBlocks[0]?.activity?.toolName, 'fs__list', 'native tool result retains its structured tool identity');
+  assertEqual(nativeToolBlocks[0]?.activity?.operation, 'list', 'native tool result exposes a readable operation type');
+
   const committedProjection = buildNarrativeTimelineProjection({
     sessionId: 'session-live-overlay',
     events: [
@@ -10468,6 +10586,26 @@ function assertTimelineProjectionWithLiveOverlay(): void {
           activity: readActivity,
         },
       },
+      {
+        id: 'event-internal-stage',
+        sessionId: 'session-live-overlay',
+        ts: '2026-01-01T00:00:03.000Z',
+        kind: 'workflow_stage',
+        payload: {
+          stage: 'stage.changed',
+          kernelEvent: { kind: 'stage.changed' },
+        },
+      },
+      {
+        id: 'event-review-facts-produced',
+        sessionId: 'session-live-overlay',
+        ts: '2026-01-01T00:00:04.000Z',
+        kind: 'workflow_stage',
+        payload: {
+          stage: 'review.facts_produced',
+          kernelEvent: { kind: 'review.facts_produced' },
+        },
+      },
     ],
   });
   assertEqual(
@@ -10477,6 +10615,11 @@ function assertTimelineProjectionWithLiveOverlay(): void {
   );
   const committedThinking = committedProjection.turns[0].blocks.find((block) => block.narrativeKind === 'thinking');
   const committedActivity = committedProjection.turns[0].blocks.find((block) => block.activity?.activityId === 'activity-live-read');
+  assertEqual(
+    committedProjection.turns[0].blocks.some((block) => block.events.some((event) => event.id === 'event-internal-stage' || event.id === 'event-review-facts-produced')),
+    false,
+    'internal lifecycle events do not render as empty timeline cards'
+  );
   assertEqual(liveThinking?.id, committedThinking?.id, 'live and committed reasoning keep one stable timeline block id');
   assertEqual(liveActivity?.id, committedActivity?.id, 'live and committed activity keep one stable timeline block id');
 

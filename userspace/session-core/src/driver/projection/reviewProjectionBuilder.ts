@@ -175,7 +175,6 @@ export class ReviewProjectionBuilder<
         toolResults,
         continuations,
         gitReview,
-        reviewFacts,
       }),
     };
     return {
@@ -232,7 +231,6 @@ export class ReviewProjectionBuilder<
     toolResults: number;
     continuations: unknown[];
     gitReview?: Record<string, unknown>;
-    reviewFacts?: Record<string, unknown>;
   }): ReadableProjectionSection[] {
     const {
       plan,
@@ -243,7 +241,6 @@ export class ReviewProjectionBuilder<
       toolResults,
       continuations,
       gitReview,
-      reviewFacts,
     } = input;
     return [
       {
@@ -283,50 +280,13 @@ export class ReviewProjectionBuilder<
             reason: item.failureReason ?? item.failureClassification ?? '',
           },
           status: item.status,
-          targetRefs: [item.path],
-          auditRefs: [item.auditRef, item.workUnitId, ...(item.toolFactIds ?? [])].filter((value): value is string => Boolean(value)),
-          metadata: item as unknown as Record<string, unknown>,
         })),
-      },
-      {
-        sectionId: 'generatedArtifacts',
-        titleKey: 'session.projection.review.section.generatedArtifacts',
-        emptyMessageKey: 'session.projection.review.empty.generatedArtifacts',
-        items: reviewGeneratedArtifactItems(reviewFacts),
-      },
-      {
-        sectionId: 'pathDiagnostics',
-        titleKey: 'session.projection.review.section.pathDiagnostics',
-        emptyMessageKey: 'session.projection.review.empty.pathDiagnostics',
-        items: reviewPathNormalizationItems(reviewFacts),
       },
       {
         sectionId: 'gitChanges',
         titleKey: 'session.projection.review.section.gitChanges',
         emptyMessageKey: 'session.projection.review.empty.gitChanges',
         items: gitReviewItems(gitReview),
-      },
-      {
-        sectionId: 'auditDetails',
-        titleKey: 'session.projection.review.section.auditDetails',
-        emptyMessageKey: 'session.projection.review.empty.auditDetails',
-        items: [
-          projectionItem('developer-details', 'fact', {
-            messageKey: readableReview.developerDetailsAvailable
-              ? 'session.projection.review.audit.available'
-              : 'session.projection.review.audit.unavailable',
-          }),
-          ...readableReview.auditRefs.slice(0, 12).map((ref, index) => projectionItem(`audit-ref-${index + 1}`, 'fact', {
-            messageKey: 'session.projection.review.audit.ref',
-            messageArgs: { ref },
-            auditRefs: [ref],
-          })),
-        ],
-      },
-      {
-        sectionId: 'originalPlan',
-        titleKey: 'session.projection.review.section.originalPlan',
-        items: [projectionItem('original-plan', 'text', { text: clip(plan.userPlan, 1200) })],
       },
       {
         sectionId: 'validation',
@@ -689,61 +649,6 @@ function gitReviewItems(gitReview?: Record<string, unknown>): ReadableProjection
   const diffBlocks = Array.isArray(gitReview.diffBlocks) ? gitReview.diffBlocks : [];
   if (diffBlocks.length) items.push(projectionItem('git-diff-attached', 'git', {
     messageKey: 'session.projection.review.git.diffAttached',
-  }));
-  return items;
-}
-
-function reviewGeneratedArtifactItems(reviewFacts?: Record<string, unknown>): ReadableProjectionItem[] {
-  const artifacts = Array.isArray(reviewFacts?.generatedArtifacts) ? reviewFacts.generatedArtifacts : [];
-  const items = artifacts.slice(0, 24).flatMap((item, index): ReadableProjectionItem[] => {
-    const record = objectRecord(item) ?? {};
-    const path = stringValue(record.path) ?? stringValue(record.absolutePath) ?? 'unknown';
-    const operation = stringValue(record.operation) ?? stringValue(record.toolName) ?? 'write';
-    const hash = stringValue(record.contentHash);
-    return [projectionItem(`artifact-${index + 1}`, 'artifact', {
-      messageKey: 'session.projection.review.generatedArtifact',
-      messageArgs: { path, operation, hash: hash ?? '' },
-      targetRefs: [path],
-      metadata: record,
-    })];
-  });
-  if (artifacts.length > 24) items.push(projectionItem('artifacts-truncated', 'artifact', {
-    messageKey: 'session.projection.review.generatedArtifacts.truncated',
-    messageArgs: { count: String(artifacts.length - 24) },
-  }));
-  return items;
-}
-
-function reviewPathNormalizationItems(reviewFacts?: Record<string, unknown>): ReadableProjectionItem[] {
-  const diagnostics = Array.isArray(reviewFacts?.pathNormalizationDiagnostics)
-    ? reviewFacts.pathNormalizationDiagnostics
-    : [];
-  const items = diagnostics.slice(0, 24).flatMap((item, index): ReadableProjectionItem[] => {
-    const record = objectRecord(item) ?? {};
-    const path = stringValue(record.path) ?? 'unknown';
-    const normalization = objectRecord(record.pathNormalization) ?? {};
-    const original = stringValue(normalization.originalPath);
-    const normalized = stringValue(normalization.normalizedTargetPath);
-    const stripped = Array.isArray(normalization.strippedPathPrefixes)
-      ? normalization.strippedPathPrefixes.filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
-      : [];
-    const duplicate = record.duplicateRootPathDetected === true || normalization.duplicateRootPathDetected === true;
-    return [projectionItem(`path-diagnostic-${index + 1}`, 'diagnostic', {
-      messageKey: 'session.projection.review.pathDiagnostic',
-      messageArgs: {
-        path,
-        original: original ?? '',
-        normalized: normalized ?? '',
-        stripped: stripped.join(', '),
-        duplicate: duplicate ? 'true' : 'false',
-      },
-      targetRefs: [path],
-      metadata: record,
-    })];
-  });
-  if (diagnostics.length > 24) items.push(projectionItem('path-diagnostics-truncated', 'diagnostic', {
-    messageKey: 'session.projection.review.pathDiagnostics.truncated',
-    messageArgs: { count: String(diagnostics.length - 24) },
   }));
   return items;
 }

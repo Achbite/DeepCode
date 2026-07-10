@@ -240,10 +240,47 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function mergeEventsById(existing: AgentEvent[], incoming: AgentEvent[]): AgentEvent[] {
+  const incomingUserEvents = incoming.filter(isCommittedUserInputEvent);
   const byId = new Map<string, AgentEvent>();
-  for (const event of existing) byId.set(event.id, event);
+  for (const event of existing) {
+    if (isPendingLocalUserEvent(event) && incomingUserEvents.some((candidate) => matchesOptimisticUserEvent(event, candidate))) {
+      continue;
+    }
+    byId.set(event.id, event);
+  }
   for (const event of incoming) byId.set(event.id, event);
   return [...byId.values()].sort((left, right) => (left.ts ?? '').localeCompare(right.ts ?? ''));
+}
+
+function isPendingLocalUserEvent(event: AgentEvent): boolean {
+  return event.id.startsWith('local-') &&
+    event.kind === 'user_msg' &&
+    isRecord(event.payload) &&
+    event.payload.pending === true;
+}
+
+function isCommittedUserInputEvent(event: AgentEvent): boolean {
+  return event.kind === 'user_msg' ||
+    event.kind === 'user_guidance' ||
+    event.kind === 'requirement_decision' ||
+    event.kind === 'plan_review';
+}
+
+function userInputText(event: AgentEvent): string | undefined {
+  if (!isRecord(event.payload)) return undefined;
+  for (const key of ['content', 'guidance', 'text', 'message']) {
+    const value = event.payload[key];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return undefined;
+}
+
+function matchesOptimisticUserEvent(local: AgentEvent, committed: AgentEvent): boolean {
+  const localText = userInputText(local);
+  if (!localText || userInputText(committed) !== localText) return false;
+  const localTime = Date.parse(local.ts);
+  const committedTime = Date.parse(committed.ts);
+  return !Number.isFinite(localTime) || !Number.isFinite(committedTime) || committedTime >= localTime - 1_000;
 }
 
 const MAX_ACTIVE_PROGRESS_DELTAS = 240;
@@ -275,13 +312,6 @@ function activeDeltaMergeKey(delta: ProjectionDelta): string {
     delta.stage ?? '',
     delta.channel ?? '',
   ].join('|');
-}
-
-function committedDeltaMatchesActive(committed: ProjectionDelta, active: ProjectionDelta): boolean {
-  if (committed.sessionId !== active.sessionId) return false;
-  if (committed.runId && active.runId !== committed.runId) return false;
-  if (committed.turnId && active.turnId !== committed.turnId) return false;
-  return true;
 }
 
 function mergeActiveDelta(existing: ProjectionDelta, incoming: ProjectionDelta): ProjectionDelta {
@@ -319,7 +349,7 @@ function trimActiveDeltas(deltas: ProjectionDelta[]): ProjectionDelta[] {
 
 function mergeActiveProjectionDelta(existing: ProjectionDelta[], incoming: ProjectionDelta): ProjectionDelta[] {
   if (incoming.type === 'committed') {
-    return existing.filter((delta) => !committedDeltaMatchesActive(incoming, delta));
+    return existing;
   }
   const byKey = new Map<string, ProjectionDelta>();
   for (const delta of existing) byKey.set(activeDeltaMergeKey(delta), delta);
@@ -338,42 +368,84 @@ function eventStringField(event: AgentEvent, key: string): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
 }
 
-function eventActivityId(event: AgentEvent): string | undefined {
-  const activity = eventPayloadRecord(event)?.activity;
-  return isRecord(activity) && typeof activity.activityId === 'string' ? activity.activityId : undefined;
+function activityIdentityKeys(activity: unknown): string[] {
+  if (!isRecord(activity)) return [];
+  const keys: string[] = [];
+  const add = (prefix: string, value: unknown) => {
+    if (typeof value === 'string' && value.trim()) keys.push(`${prefix}:${value.trim()}`);
+  };
+  const addMany = (prefix: string, value: unknown) => {
+    if (!Array.isArray(value)) return;
+    for (const item of value) add(prefix, item);
+  };
+  add('activity', activity.activityId);
+  addMany('action', activity.actionIds);
+  addMany('work-unit', activity.workUnitIds);
+  return keys;
+}
+
+function eventActivityIdentityKeys(event: AgentEvent): string[] {
+  return activityIdentityKeys(eventPayloadRecord(event)?.activity);
+}
+
+function deltaActivityIdentityKeys(delta: ProjectionDelta): string[] {
+  return activityIdentityKeys(delta.activity);
+}
+
+function eventProjectionIdentityKeys(event: AgentEvent): string[] {
+  const payload = eventPayloadRecord(event);
+  const output = isRecord(payload?.output) ? payload.output : null;
+  const keys: string[] = [];
+  const packetId = typeof output?.id === 'string' ? output.id.trim() : '';
+  if (packetId) keys.push(`packet:${packetId}`);
+  const items = Array.isArray(output?.items) ? output.items : [];
+  for (const item of items) {
+    if (!isRecord(item)) continue;
+    const callId = typeof item.manifestEntryId === 'string' ? item.manifestEntryId.trim() : '';
+    if (callId) keys.push(`call:${callId}`);
+  }
+  return keys;
+}
+
+function deltaProjectionIdentityKeys(delta: ProjectionDelta): string[] {
+  const payload = isRecord(delta.payload) ? delta.payload : null;
+  const keys: string[] = [];
+  const packetId = typeof payload?.packetId === 'string' ? payload.packetId.trim() : '';
+  const callId = typeof payload?.callId === 'string' ? payload.callId.trim() : delta.itemId?.trim() ?? '';
+  if (packetId) keys.push(`packet:${packetId}`);
+  if (callId) keys.push(`call:${callId}`);
+  return keys;
+}
+
+function eventRunId(event: AgentEvent): string | undefined {
+  return eventStringField(event, 'runId');
+}
+
+function committedTextDeltaType(event: AgentEvent): ProjectionDelta['type'] | undefined {
+  if (event.kind !== 'assistant_msg') return undefined;
+  const channel = eventStringField(event, 'channel');
+  if (channel === 'reasoning') return 'reasoning_delta';
+  if (channel === 'final' || channel === 'progress') return 'assistant_delta';
+  return undefined;
 }
 
 function pruneActiveDeltasForCommittedEvents(existing: ProjectionDelta[], events: AgentEvent[]): ProjectionDelta[] {
   if (events.length === 0 || existing.length === 0) return existing;
   const sessionIds = new Set(events.map((event) => event.sessionId));
-  const activityIds = new Set(events.map(eventActivityId).filter((id): id is string => Boolean(id)));
-  const committedTextTypes = new Set<ProjectionDelta['type']>();
-  for (const event of events) {
-    if (event.kind === 'assistant_msg') {
-      const channel = eventStringField(event, 'channel');
-      if (channel === 'reasoning') committedTextTypes.add('reasoning_delta');
-      if (channel === 'final') committedTextTypes.add('assistant_delta');
-    }
-    if (
-      event.kind === 'plan_card' ||
-      event.kind === 'review_summary' ||
-      event.kind === 'error' ||
-      event.kind === 'session_run_state' ||
-      (event.kind === 'workflow_stage' && (eventStringField(event, 'stage') ?? '').startsWith('accepted_plan.'))
-    ) {
-      committedTextTypes.add('active_turn');
-      committedTextTypes.add('reasoning_delta');
-      committedTextTypes.add('stage_delta');
-      committedTextTypes.add('draft_delta');
-      committedTextTypes.add('part_delta');
-    }
-  }
-  if (activityIds.size === 0 && committedTextTypes.size === 0) return existing;
+  const activityKeys = new Set(events.flatMap(eventActivityIdentityKeys));
+  const projectionKeys = new Set(events.flatMap(eventProjectionIdentityKeys));
+  const committedText = events.flatMap((event) => {
+    const type = committedTextDeltaType(event);
+    return type ? [{ type, runId: eventRunId(event) }] : [];
+  });
+  if (activityKeys.size === 0 && projectionKeys.size === 0 && committedText.length === 0) return existing;
   return existing.filter((delta) => {
     if (!sessionIds.has(delta.sessionId)) return true;
-    const activityId = delta.activity?.activityId;
-    if (activityId && activityIds.has(activityId)) return false;
-    if (committedTextTypes.has(delta.type)) return false;
+    if (deltaActivityIdentityKeys(delta).some((key) => activityKeys.has(key))) return false;
+    if (deltaProjectionIdentityKeys(delta).some((key) => projectionKeys.has(key))) return false;
+    if (committedText.some((item) => item.type === delta.type && (!item.runId || !delta.runId || item.runId === delta.runId))) {
+      return false;
+    }
     return true;
   });
 }
@@ -819,12 +891,25 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     if (!session) return;
 
     const attachments = readMessageAttachments(get(), attachmentsOverride);
+    const localUserEvent = createLocalEvent(session.id, 'user_msg', {
+      content: trimmed,
+      attachments,
+      pending: true,
+    });
     const activeInteraction = findActiveSessionInteraction({
       events: get().events,
       pendingPermission: get().pendingPermission?.request ?? null,
     });
     if (activeInteraction) {
-      set({ messageAttachments: [], errorMessage: null });
+      if (activeInteraction.kind === 'permission') {
+        set({ errorMessage: 'Permission confirmation is pending. Resolve the permission request before sending new guidance.' });
+        return;
+      }
+      set((state) => ({
+        events: [...state.events, localUserEvent],
+        messageAttachments: [],
+        errorMessage: null,
+      }));
       if (activeInteraction.kind === 'requirement') {
         await get().resolveRequirement(
           activeInteraction.runId,
@@ -842,8 +927,6 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         await get().resolveReview(activeInteraction.runId, 'revise', trimmed);
         return;
       }
-      set({ errorMessage: 'Permission confirmation is pending. Resolve the permission request before sending new guidance.' });
-      return;
     }
 
     if (get().runningSessionIds.includes(session.id)) {
@@ -852,6 +935,11 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         set({ errorMessage: 'No active shared run id is available for guidance. Refresh the session or start a new turn.' });
         return;
       }
+      set((state) => ({
+        events: [...state.events, localUserEvent],
+        messageAttachments: [],
+        errorMessage: null,
+      }));
       const result = await submitAgentRunGuidance(session.id, activeRunId, {
         guidance: trimmed,
         attachments,
@@ -861,7 +949,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
           session: result.data.session,
           sessions: [result.data.session, ...get().sessions.filter((item) => item.id !== result.data!.session.id)],
           currentSessionId: result.data.session.id,
-          events: result.data.events,
+          events: mergeEventsById(get().events, result.data.events),
           pendingPermission: findLatestPendingPermission(result.data.events),
           messageAttachments: [],
           errorMessage: null,
@@ -876,11 +964,6 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       return;
     }
 
-    const localUserEvent = createLocalEvent(session.id, 'user_msg', {
-      content: trimmed,
-      attachments,
-      pending: true,
-    });
     set((state) => ({
       events: [...state.events, localUserEvent],
       messageAttachments: [],
@@ -899,7 +982,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         if (get().session?.id === session.id) {
           set({
             session: current.data.session,
-            events: current.data.events,
+            events: mergeEventsById(get().events, current.data.events),
             pendingPermission: findLatestPendingPermission(current.data.events),
           });
         }
@@ -953,7 +1036,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         if (isActiveSession) {
           nextState.session = data.session;
           nextState.currentSessionId = data.session.id;
-          nextState.events = data.events;
+          nextState.events = mergeEventsById(state.events, data.events);
           nextState.pendingPermission = findLatestPendingPermission(data.events);
         }
         return nextState;
@@ -1011,7 +1094,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         session: result.data.session,
         sessions: [result.data.session, ...get().sessions.filter((item) => item.id !== result.data!.session.id)],
         currentSessionId: result.data.session.id,
-        events: result.data.events,
+        events: mergeEventsById(get().events, result.data.events),
         pendingPermission: findLatestPendingPermission(result.data.events),
         resolvingPermission: null,
         resolvingRequirement: null,
@@ -1059,7 +1142,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         if (get().session?.id === session.id) {
           set({
             session: current.data.session,
-            events: current.data.events,
+            events: mergeEventsById(get().events, current.data.events),
             pendingPermission: findLatestPendingPermission(current.data.events),
           });
         }
@@ -1096,7 +1179,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       refreshWorkspaceTreeForToolFacts(data.events);
       set((state) => ({
         session: data.session,
-        events: data.events,
+        events: mergeEventsById(state.events, data.events),
         pendingPermission: findLatestPendingPermission(data.events),
         resolvingPermission: null,
         activeDeltas: [],
@@ -1135,7 +1218,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         if (get().session?.id === session.id) {
           set({
             session: current.data.session,
-            events: current.data.events,
+            events: mergeEventsById(get().events, current.data.events),
             pendingPermission: findLatestPendingPermission(current.data.events),
           });
         }
@@ -1172,7 +1255,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       refreshWorkspaceTreeForToolFacts(data.events);
       set((state) => ({
         session: data.session,
-        events: data.events,
+        events: mergeEventsById(state.events, data.events),
         pendingPermission: findLatestPendingPermission(data.events),
         resolvingPermission: null,
         activeDeltas: [],
@@ -1212,7 +1295,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         if (get().session?.id === session.id) {
           set({
             session: current.data.session,
-            events: current.data.events,
+            events: mergeEventsById(get().events, current.data.events),
             pendingPermission: findLatestPendingPermission(current.data.events),
           });
         }
@@ -1253,7 +1336,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         session: data.session,
         sessions: [data.session, ...state.sessions.filter((item) => item.id !== data.session.id)],
         currentSessionId: data.session.id,
-        events: data.events,
+        events: mergeEventsById(state.events, data.events),
         pendingPermission: findLatestPendingPermission(data.events),
         resolvingRequirement: null,
         resolvingPermission: null,
@@ -1294,7 +1377,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         if (get().session?.id === session.id) {
           set({
             session: current.data.session,
-            events: current.data.events,
+            events: mergeEventsById(get().events, current.data.events),
             pendingPermission: findLatestPendingPermission(current.data.events),
           });
         }
@@ -1334,7 +1417,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         session: data.session,
         sessions: [data.session, ...state.sessions.filter((item) => item.id !== data.session.id)],
         currentSessionId: data.session.id,
-        events: data.events,
+        events: mergeEventsById(state.events, data.events),
         pendingPermission: findLatestPendingPermission(data.events),
         resolvingPermission: null,
         resolvingRequirement: null,
@@ -1375,7 +1458,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         if (get().session?.id === session.id) {
           set({
             session: current.data.session,
-            events: current.data.events,
+            events: mergeEventsById(get().events, current.data.events),
             pendingPermission: findLatestPendingPermission(current.data.events),
           });
         }
@@ -1417,7 +1500,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         session: data.session,
         sessions: [data.session, ...state.sessions.filter((item) => item.id !== data.session.id)],
         currentSessionId: data.session.id,
-        events: data.events,
+        events: mergeEventsById(state.events, data.events),
         pendingPermission: findLatestPendingPermission(data.events),
         resolvingPermission: null,
         resolvingRequirement: null,

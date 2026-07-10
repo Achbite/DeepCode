@@ -14,6 +14,7 @@ export interface KernelEventProjectionBuilderPorts {
 
 interface KernelWorkUnitFact {
   actionId?: string;
+  operation?: string;
   writeSet: string[];
   deleteSet: string[];
 }
@@ -164,6 +165,7 @@ export class KernelEventProjectionBuilder {
       const fallbackTargets = this.kernelEventTargets(record);
       facts.set(id, {
         actionId: stringValue(record.actionId) ?? stringValue(workUnit?.actionId),
+        operation: this.kernelEventOperation(record),
         writeSet: writeSet.length ? writeSet : fallbackTargets,
         deleteSet,
       });
@@ -177,11 +179,12 @@ export class KernelEventProjectionBuilder {
   ): Record<string, unknown> {
     const kind = stringValue(record.kind);
     if (!kind?.startsWith('work_unit.') || kind === 'work_unit.queued') return record;
-    if (this.kernelEventTargets(record).length > 0) return record;
     const workUnit = objectRecord(record.workUnit);
+    const hasActionId = Boolean(stringValue(record.actionId) ?? stringValue(workUnit?.actionId));
+    if (this.kernelEventTargets(record).length > 0 && this.kernelEventOperation(record) && hasActionId) return record;
     const workUnitId = stringValue(record.workUnitId) ?? stringValue(workUnit?.id);
     const fact = workUnitId ? facts.get(workUnitId) : undefined;
-    if (!fact || (fact.writeSet.length === 0 && fact.deleteSet.length === 0 && !fact.actionId)) return record;
+    if (!fact || (fact.writeSet.length === 0 && fact.deleteSet.length === 0 && !fact.actionId && !fact.operation)) return record;
     const enrichedWorkUnit = {
       ...(workUnit ?? {}),
       ...(workUnitId ? { id: workUnitId } : {}),
@@ -192,6 +195,7 @@ export class KernelEventProjectionBuilder {
     return {
       ...record,
       ...(!stringValue(record.actionId) && fact.actionId ? { actionId: fact.actionId } : {}),
+      ...(!this.kernelEventOperation(record) && fact.operation ? { operation: fact.operation } : {}),
       ...(stringArrayValue(record.writeSet).length === 0 && fact.writeSet.length ? { writeSet: fact.writeSet } : {}),
       ...(stringArrayValue(record.deleteSet).length === 0 && fact.deleteSet.length ? { deleteSet: fact.deleteSet } : {}),
       workUnit: enrichedWorkUnit,
@@ -218,6 +222,7 @@ export class KernelEventProjectionBuilder {
       stringValue(workUnit?.actionId),
     ]);
     const toolName = stringValue(record.toolName) ?? stringValue(tool?.name) ?? stringValue(record.name);
+    const operation = this.kernelEventOperation(record, toolName);
     if (kind === 'work_unit.queued' || kind === 'action_batch.accepted') {
       return conversationActivity({
         activityId,
@@ -230,6 +235,7 @@ export class KernelEventProjectionBuilder {
         targets,
         actionIds,
         workUnitIds,
+        operation,
         itemCount: targets.length || actionIds.length || workUnitIds.length || undefined,
       });
     }
@@ -245,6 +251,7 @@ export class KernelEventProjectionBuilder {
         targets,
         actionIds,
         workUnitIds,
+        operation,
         itemCount: targets.length || undefined,
       });
     }
@@ -260,6 +267,7 @@ export class KernelEventProjectionBuilder {
         targets,
         actionIds,
         workUnitIds,
+        operation,
         itemCount: targets.length || undefined,
       });
     }
@@ -277,6 +285,7 @@ export class KernelEventProjectionBuilder {
         targets,
         actionIds,
         workUnitIds,
+        operation,
         errorCode: stringValue(record.code) ?? stringValue(error?.code),
         errorMessage: message,
       });
@@ -297,6 +306,7 @@ export class KernelEventProjectionBuilder {
         actionIds,
         workUnitIds,
         toolName,
+        operation,
         errorCode: failed ? stringValue(record.code) ?? stringValue(error?.code) : undefined,
         errorMessage: failed ? message : undefined,
       });
@@ -311,10 +321,27 @@ export class KernelEventProjectionBuilder {
         source: 'kernel',
         runId,
         targets,
+        operation: 'read',
         itemCount: targets.length || undefined,
       });
     }
     return undefined;
+  }
+
+  private kernelEventOperation(record: Record<string, unknown>, toolName?: string): string | undefined {
+    const output = objectRecord(record.output);
+    const outputKernelContext = objectRecord(output?.kernelContext);
+    const workUnit = objectRecord(record.workUnit);
+    const compiledTool = objectRecord(workUnit?.compiledTool) ?? objectRecord(record.compiledTool);
+    return normalizeOperation(
+      stringValue(record.operation) ??
+      stringValue(record.operationKind) ??
+      stringValue(output?.operation) ??
+      stringValue(outputKernelContext?.operationKind) ??
+      stringValue(workUnit?.kind) ??
+      stringValue(compiledTool?.toolName) ??
+      toolName
+    );
   }
 
   kernelEventTargets(record: Record<string, unknown>): string[] {
@@ -379,6 +406,12 @@ export class KernelEventProjectionBuilder {
       runId,
       draftId: delta.draftId,
       targets: uniqueStrings([delta.targetPath]),
+      operation: normalizeOperation(
+        stringValue(objectRecord(delta.payload)?.operation) ??
+        stringValue(objectRecord(delta.payload)?.operationKind) ??
+        delta.activity?.operation ??
+        delta.activity?.toolName
+      ),
     };
     if (delta.type === 'resource_delta') {
       return conversationActivity({
@@ -455,6 +488,32 @@ function activityStatusFromDelta(status: ProjectionDelta['status'] | undefined):
   if (status === 'draftReady') return 'completed';
   if (status === 'discarded' || status === 'skipped') return 'blocked';
   return undefined;
+}
+
+function normalizeOperation(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  const normalized = value.trim();
+  const operations: Record<string, string> = {
+    'fs.write': 'write',
+    'fs.patch': 'patch',
+    'fs.delete': 'delete',
+    'fs.read': 'read',
+    'fs.list': 'list',
+    'fs.diff': 'diff',
+    'code.search': 'search',
+    'process.exec': 'exec',
+    write: 'write',
+    create: 'create',
+    patch: 'patch',
+    delete: 'delete',
+    rename: 'rename',
+    read: 'read',
+    list: 'list',
+    diff: 'diff',
+    search: 'search',
+    exec: 'exec',
+  };
+  return operations[normalized] ?? normalized;
 }
 
 function objectRecord(value: unknown): Record<string, unknown> | undefined {
