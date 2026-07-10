@@ -1069,61 +1069,16 @@ fn render_decision_result(timeline: &Value) {
 }
 
 fn extract_decision_result_text(timeline: &Value) -> Option<String> {
-    extract_plain_text(timeline).or_else(|| extract_latest_review_decision_text(timeline))
-}
-
-fn extract_latest_review_decision_text(timeline: &Value) -> Option<String> {
-    let timeline = timeline_payload(timeline);
-    let session_id = timeline.get("sessionId").and_then(Value::as_str);
-    let turns = timeline.get("turns").and_then(Value::as_array)?;
-    for turn in turns.iter().rev() {
-        let Some(blocks) = turn.get("blocks").and_then(Value::as_array) else {
-            continue;
-        };
-        for block in blocks.iter().rev() {
-            let block_kind = block
-                .get("narrativeKind")
-                .or_else(|| block.get("kind"))
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            if block_kind != "review" {
-                continue;
-            }
-            let Some(events) = block.get("events").and_then(Value::as_array) else {
-                continue;
-            };
-            for event in events.iter().rev() {
-                if event_kind(event) != Some("review_summary")
-                    || payload_bool(event, "confirmable") == Some(false)
-                    || is_terminal_status(payload_string(event, "status"))
-                {
-                    continue;
-                }
-                let Some(run_id) = payload_string(event, "runId") else {
-                    continue;
-                };
-                let pending = PendingSessionDecision {
-                    run_id: run_id.to_string(),
-                    target_id: payload_string(event, "reviewId")
-                        .or_else(|| payload_string(event, "sourcePlanId"))
-                        .map(ToOwned::to_owned),
-                };
-                return Some(render_pending_decision_text(
-                    session_id,
-                    "review",
-                    "Pending review decision",
-                    event,
-                    pending,
-                ));
-            }
-        }
-    }
-    None
+    extract_plain_text(timeline)
 }
 
 fn timeline_block_text(block: &Value, kind: &str) -> String {
     if matches!(kind, "plan" | "review") {
-        if let Some(text) = structured_projection_text(block) {
+        if let Some(text) = block
+            .get("structuredProjection")
+            .map(render_readable_projection)
+            .filter(|text| !text.trim().is_empty())
+        {
             return text;
         }
     }
@@ -1132,31 +1087,7 @@ fn timeline_block_text(block: &Value, kind: &str) -> String {
         .or_else(|| block.get("summary"))
         .and_then(Value::as_str)
         .map(str::to_string)
-        .or_else(|| structured_projection_text(block))
         .unwrap_or_default()
-}
-
-fn structured_projection_text(block: &Value) -> Option<String> {
-    let events = block.get("events").and_then(Value::as_array)?;
-    for event in events {
-        let kind = event
-            .get("kind")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let payload = event.get("payload")?;
-        let readable = match kind {
-            "plan_card" => payload.get("readablePlan"),
-            "review_summary" => payload.get("readableReview"),
-            _ => None,
-        };
-        if let Some(readable) = readable {
-            let rendered = render_readable_projection(readable);
-            if !rendered.trim().is_empty() {
-                return Some(rendered);
-            }
-        }
-    }
-    None
 }
 
 fn render_readable_projection(readable: &Value) -> String {
@@ -1463,180 +1394,26 @@ fn find_pending_session_decision(
     requested_kind: &str,
     run_filter: Option<&str>,
 ) -> Option<PendingSessionDecision> {
-    let events = timeline_events(timeline);
-    for event in events.iter().rev() {
-        let Some(kind) = event_kind(event) else {
-            continue;
-        };
-        let pending = match kind {
-            "plan_card" | "plan_review" if requested_kind == "plan" => {
-                pending_plan_from_event(event, &events)
-            }
-            "review_summary" if requested_kind == "review" => {
-                pending_review_from_event(event, &events)
-            }
-            "requirement_confirmation" if requested_kind == "requirement" => {
-                pending_requirement_from_event(event, &events)
-            }
-            _ => None,
-        };
-        if let Some(pending) = pending {
-            if run_filter.is_none_or(|run_id| pending.run_id == run_id) {
-                return Some(pending);
-            }
-        }
-    }
-    None
-}
-
-fn pending_plan_from_event(event: &Value, events: &[&Value]) -> Option<PendingSessionDecision> {
-    if payload_bool(event, "confirmable") != Some(true) {
+    let pending = timeline_payload(timeline)
+        .get("interactionProjection")?
+        .get("pending")?;
+    let kind = pending.get("kind").and_then(Value::as_str)?;
+    if kind != requested_kind {
         return None;
     }
-    let run_id = payload_string(event, "runId")?.to_string();
-    let plan_id = payload_string(event, "planId")?.to_string();
-    if has_terminal_plan_decision(events, &run_id, &plan_id) {
+    let run_id = pending.get("runId").and_then(Value::as_str)?.to_string();
+    if run_filter.is_some_and(|expected| expected != run_id) {
         return None;
     }
-    Some(PendingSessionDecision {
-        run_id,
-        target_id: Some(plan_id),
-    })
-}
-
-fn pending_review_from_event(event: &Value, events: &[&Value]) -> Option<PendingSessionDecision> {
-    if payload_bool(event, "confirmable") == Some(false) {
-        return None;
+    let target_id = match kind {
+        "plan" => pending.get("planId"),
+        "review" => pending.get("reviewId"),
+        "requirement" => pending.get("requirementId"),
+        _ => None,
     }
-    let status = payload_string(event, "status");
-    if is_terminal_status(status) {
-        return None;
-    }
-    let run_id = payload_string(event, "runId")?.to_string();
-    let review_id = payload_string(event, "reviewId");
-    let source_plan_id = payload_string(event, "sourcePlanId");
-    if has_terminal_review_decision(events, &run_id, review_id, source_plan_id) {
-        return None;
-    }
-    Some(PendingSessionDecision {
-        run_id,
-        target_id: review_id.or(source_plan_id).map(ToOwned::to_owned),
-    })
-}
-
-fn pending_requirement_from_event(
-    event: &Value,
-    events: &[&Value],
-) -> Option<PendingSessionDecision> {
-    if payload_bool(event, "confirmable") != Some(true) {
-        return None;
-    }
-    if payload_string(event, "status") != Some("waitingUserConfirmation") {
-        return None;
-    }
-    let run_id = payload_string(event, "runId")?.to_string();
-    let requirement_id = payload_string(event, "requirementId")?.to_string();
-    if has_terminal_requirement_decision(events, &run_id, &requirement_id) {
-        return None;
-    }
-    Some(PendingSessionDecision {
-        run_id,
-        target_id: Some(requirement_id),
-    })
-}
-
-fn timeline_events(timeline: &Value) -> Vec<&Value> {
-    let timeline = timeline_payload(timeline);
-    let mut events = Vec::new();
-    if let Some(top_level_events) = timeline.get("events").and_then(Value::as_array) {
-        events.extend(top_level_events);
-    }
-    let Some(turns) = timeline.get("turns").and_then(Value::as_array) else {
-        return events;
-    };
-    for turn in turns {
-        if let Some(turn_events) = turn.get("events").and_then(Value::as_array) {
-            events.extend(turn_events);
-        }
-        let Some(blocks) = turn.get("blocks").and_then(Value::as_array) else {
-            continue;
-        };
-        for block in blocks {
-            if let Some(block_events) = block.get("events").and_then(Value::as_array) {
-                events.extend(block_events);
-            }
-        }
-    }
-    events
-}
-
-fn has_terminal_plan_decision(events: &[&Value], run_id: &str, plan_id: &str) -> bool {
-    events.iter().any(|event| {
-        event_kind(event) == Some("plan_review")
-            && is_terminal_status(payload_string(event, "status"))
-            && payload_string(event, "runId") == Some(run_id)
-            && payload_string(event, "planId") == Some(plan_id)
-    })
-}
-
-fn has_terminal_review_decision(
-    events: &[&Value],
-    run_id: &str,
-    review_id: Option<&str>,
-    source_plan_id: Option<&str>,
-) -> bool {
-    events.iter().any(|event| {
-        if event_kind(event) != Some("review_summary")
-            || !is_terminal_status(payload_string(event, "status"))
-            || payload_string(event, "runId") != Some(run_id)
-        {
-            return false;
-        }
-        match (review_id, source_plan_id) {
-            (Some(id), _) => payload_string(event, "reviewId") == Some(id),
-            (None, Some(id)) => payload_string(event, "sourcePlanId") == Some(id),
-            (None, None) => true,
-        }
-    })
-}
-
-fn has_terminal_requirement_decision(
-    events: &[&Value],
-    run_id: &str,
-    requirement_id: &str,
-) -> bool {
-    events.iter().any(|event| {
-        event_kind(event) == Some("requirement_decision")
-            && is_terminal_status(payload_string(event, "status"))
-            && payload_string(event, "runId") == Some(run_id)
-            && payload_string(event, "requirementId") == Some(requirement_id)
-    })
-}
-
-fn is_terminal_status(status: Option<&str>) -> bool {
-    matches!(
-        status,
-        Some("accepted" | "rejected" | "needsRevision" | "cancelled" | "failed")
-    )
-}
-
-fn event_kind(event: &Value) -> Option<&str> {
-    event.get("kind").and_then(Value::as_str)
-}
-
-fn event_payload(event: &Value) -> Option<&serde_json::Map<String, Value>> {
-    event.get("payload").and_then(Value::as_object)
-}
-
-fn payload_string<'a>(event: &'a Value, key: &str) -> Option<&'a str> {
-    event_payload(event)?
-        .get(key)
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-}
-
-fn payload_bool(event: &Value, key: &str) -> Option<bool> {
-    event_payload(event)?.get(key).and_then(Value::as_bool)
+    .and_then(Value::as_str)
+    .map(ToOwned::to_owned);
+    Some(PendingSessionDecision { run_id, target_id })
 }
 
 fn extract_final_text(timeline: &Value) -> Option<String> {
@@ -1674,64 +1451,58 @@ fn extract_plain_text(timeline: &Value) -> Option<String> {
 }
 
 fn extract_pending_decision_text(timeline: &Value) -> Option<String> {
-    let events = timeline_events(timeline);
-    let session_id = timeline_payload(timeline)
-        .get("sessionId")
-        .and_then(Value::as_str);
-    for event in events.iter().rev() {
-        let event = *event;
-        let Some(kind) = event_kind(event) else {
-            continue;
-        };
-        let pending = match kind {
-            "plan_card" | "plan_review" => pending_plan_from_event(event, &events)
-                .map(|pending| ("plan", "Pending plan decision", pending)),
-            "review_summary" => pending_review_from_event(event, &events)
-                .map(|pending| ("review", "Pending review decision", pending)),
-            "requirement_confirmation" => pending_requirement_from_event(event, &events)
-                .map(|pending| ("requirement", "Pending requirement decision", pending)),
-            _ => None,
-        };
-        if let Some((decision_kind, heading, pending)) = pending {
-            return Some(render_pending_decision_text(
-                session_id,
-                decision_kind,
-                heading,
-                event,
-                pending,
-            ));
-        }
-    }
-    None
+    let timeline = timeline_payload(timeline);
+    let pending_value = timeline.get("interactionProjection")?.get("pending")?;
+    let decision_kind = pending_value.get("kind").and_then(Value::as_str)?;
+    let pending = find_pending_session_decision(timeline, decision_kind, None)?;
+    let heading = match decision_kind {
+        "plan" => "Pending plan decision",
+        "review" => "Pending review decision",
+        "requirement" => "Pending requirement decision",
+        "permission" => "Pending permission decision",
+        _ => "Pending decision",
+    };
+    let block = pending_value
+        .get("blockId")
+        .and_then(Value::as_str)
+        .and_then(|block_id| timeline_block_by_id(timeline, block_id));
+    Some(render_pending_decision_text(
+        timeline.get("sessionId").and_then(Value::as_str),
+        decision_kind,
+        heading,
+        pending_value,
+        block,
+        pending,
+    ))
 }
 
 fn render_pending_decision_text(
     session_id: Option<&str>,
     decision_kind: &str,
     heading: &str,
-    event: &Value,
+    pending_value: &Value,
+    block: Option<&Value>,
     pending: PendingSessionDecision,
 ) -> String {
-    // CLI groups shared projection fields for readability; event payloads remain the fact source.
     let mut lines = vec![heading.to_string()];
-    if let Some(readable) = readable_projection_for_event(event) {
-        let readable_summary = readable_projection_summary(readable);
-        if let Some(title) = payload_string(event, "title")
-            .or_else(|| payload_string(event, "question"))
-            .filter(|title| {
-                readable_summary
-                    .map(|summary| !equivalent_render_text(title, summary))
-                    .unwrap_or(true)
-            })
-        {
-            lines.push(title.to_string());
-        }
+    if let Some(title) = pending_value
+        .get("title")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        lines.push(title.to_string());
+    }
+    if let Some(readable) = block.and_then(|item| item.get("structuredProjection")) {
         let rendered = render_readable_projection(readable);
         if !rendered.trim().is_empty() {
             lines.push(rendered);
         }
-    } else if let Some(text) = pending_event_text(event) {
-        lines.push(text);
+    } else if let Some(summary) = pending_value
+        .get("summary")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        lines.push(summary.to_string());
     }
     lines.push(format!(
         "Decision target: {decision_kind} run={} target={}",
@@ -1749,35 +1520,19 @@ fn render_pending_decision_text(
     lines.join("\n")
 }
 
-fn readable_projection_summary(readable: &Value) -> Option<&str> {
-    readable
-        .get("summary")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-}
-
-fn equivalent_render_text(left: &str, right: &str) -> bool {
-    normalize_render_text(left) == normalize_render_text(right)
+fn timeline_block_by_id<'a>(timeline: &'a Value, block_id: &str) -> Option<&'a Value> {
+    for turn in timeline.get("turns")?.as_array()? {
+        for block in turn.get("blocks")?.as_array()? {
+            if block.get("id").and_then(Value::as_str) == Some(block_id) {
+                return Some(block);
+            }
+        }
+    }
+    None
 }
 
 fn normalize_render_text(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn readable_projection_for_event(event: &Value) -> Option<&Value> {
-    let payload = event.get("payload")?;
-    match event_kind(event)? {
-        "plan_card" | "plan_review" => payload.get("readablePlan"),
-        "review_summary" => payload.get("readableReview"),
-        _ => None,
-    }
-}
-
-fn pending_event_text(event: &Value) -> Option<String> {
-    payload_string(event, "content")
-        .or_else(|| payload_string(event, "message"))
-        .or_else(|| payload_string(event, "summary"))
-        .map(ToOwned::to_owned)
 }
 
 fn session_id(session: &Value) -> Option<&str> {
@@ -1893,30 +1648,85 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn timeline(events: Vec<Value>) -> Value {
-        json!({
-            "turns": [
-                {
-                    "blocks": [
-                        { "events": events }
-                    ]
+    fn timeline_with_pending(kind: &str, run_id: &str, target_key: &str, target_id: &str) -> Value {
+        let mut timeline = json!({
+            "sessionId": "session-test",
+            "interactionProjection": {
+                "pending": {
+                    "kind": kind,
+                    "runId": run_id
                 }
-            ]
-        })
+            },
+            "turns": []
+        });
+        timeline["interactionProjection"]["pending"][target_key] = json!(target_id);
+        timeline
+    }
+
+    fn canonical_pending_fixture(
+        raw: &Value,
+        session_id: &str,
+        kind: &str,
+        run_id: &str,
+        target_key: &str,
+        target_id: &str,
+    ) -> Value {
+        let readable_key = if kind == "review" {
+            "readableReview"
+        } else {
+            "readablePlan"
+        };
+        let readable = timeline_payload(raw)
+            .get("turns")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .flat_map(|turn| {
+                turn.get("blocks")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+            })
+            .flat_map(|block| {
+                block
+                    .get("events")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+            })
+            .find_map(|event| {
+                event
+                    .get("payload")
+                    .and_then(|payload| payload.get(readable_key))
+            })
+            .cloned()
+            .unwrap_or_else(|| json!({ "sections": [] }));
+        let mut structured = readable;
+        structured["kind"] = json!(kind);
+        let mut timeline = json!({
+            "sessionId": session_id,
+            "interactionProjection": {
+                "pending": {
+                    "kind": kind,
+                    "runId": run_id,
+                    "blockId": "pending-block"
+                }
+            },
+            "turns": [{
+                "blocks": [{
+                    "id": "pending-block",
+                    "narrativeKind": kind,
+                    "structuredProjection": structured
+                }]
+            }]
+        });
+        timeline["interactionProjection"]["pending"][target_key] = json!(target_id);
+        timeline
     }
 
     #[test]
     fn selects_latest_pending_plan_from_projection_events() {
-        let timeline = timeline(vec![
-            json!({
-                "kind": "plan_card",
-                "payload": { "confirmable": true, "runId": "run-a", "planId": "plan-a" }
-            }),
-            json!({
-                "kind": "plan_card",
-                "payload": { "confirmable": true, "runId": "run-b", "planId": "plan-b" }
-            }),
-        ]);
+        let timeline = timeline_with_pending("plan", "run-b", "planId", "plan-b");
 
         let pending = find_pending_session_decision(&timeline, "plan", None).unwrap();
         assert_eq!(
@@ -1930,16 +1740,7 @@ mod tests {
 
     #[test]
     fn selects_pending_plan_matching_explicit_run_filter() {
-        let timeline = timeline(vec![
-            json!({
-                "kind": "plan_card",
-                "payload": { "confirmable": true, "runId": "run-a", "planId": "plan-a" }
-            }),
-            json!({
-                "kind": "plan_card",
-                "payload": { "confirmable": true, "runId": "run-b", "planId": "plan-b" }
-            }),
-        ]);
+        let timeline = timeline_with_pending("plan", "run-a", "planId", "plan-a");
 
         let pending = find_pending_session_decision(&timeline, "plan", Some("run-a")).unwrap();
         assert_eq!(
@@ -1953,31 +1754,15 @@ mod tests {
 
     #[test]
     fn ignores_plan_consumed_by_terminal_plan_review() {
-        let timeline = timeline(vec![
-            json!({
-                "kind": "plan_card",
-                "payload": { "confirmable": true, "runId": "run-a", "planId": "plan-a" }
-            }),
-            json!({
-                "kind": "plan_review",
-                "payload": { "status": "accepted", "runId": "run-a", "planId": "plan-a" }
-            }),
-        ]);
+        let timeline = json!({ "sessionId": "session-test", "turns": [] });
 
         assert!(find_pending_session_decision(&timeline, "plan", None).is_none());
     }
 
     #[test]
     fn selects_pending_requirement_confirmation() {
-        let timeline = timeline(vec![json!({
-            "kind": "requirement_confirmation",
-            "payload": {
-                "confirmable": true,
-                "status": "waitingUserConfirmation",
-                "runId": "run-a",
-                "requirementId": "requirement-a"
-            }
-        })]);
+        let timeline =
+            timeline_with_pending("requirement", "run-a", "requirementId", "requirement-a");
 
         let pending = find_pending_session_decision(&timeline, "requirement", None).unwrap();
         assert_eq!(
@@ -1991,15 +1776,7 @@ mod tests {
 
     #[test]
     fn selects_pending_review_summary() {
-        let timeline = timeline(vec![json!({
-            "kind": "review_summary",
-            "payload": {
-                "status": "waitingUserReview",
-                "runId": "run-a",
-                "reviewId": "review-a",
-                "sourcePlanId": "plan-a"
-            }
-        })]);
+        let timeline = timeline_with_pending("review", "run-a", "reviewId", "review-a");
 
         let pending = find_pending_session_decision(&timeline, "review", None).unwrap();
         assert_eq!(
@@ -2013,15 +1790,7 @@ mod tests {
 
     #[test]
     fn selects_confirmable_review_summary_without_status() {
-        let timeline = timeline(vec![json!({
-            "kind": "review_summary",
-            "payload": {
-                "confirmable": true,
-                "runId": "run-a",
-                "reviewId": "review-a",
-                "sourcePlanId": "plan-a"
-            }
-        })]);
+        let timeline = timeline_with_pending("review", "run-a", "reviewId", "review-a");
 
         let pending = find_pending_session_decision(&timeline, "review", None).unwrap();
         assert_eq!(
@@ -2082,6 +1851,14 @@ mod tests {
                 }
             ]
         });
+        let timeline = canonical_pending_fixture(
+            &timeline,
+            "session-print",
+            "plan",
+            "run-print",
+            "planId",
+            "plan-print",
+        );
 
         let text = extract_plain_text(&timeline).expect("pending plan text");
         assert!(text.contains("Pending plan decision"));
@@ -2143,6 +1920,14 @@ mod tests {
                 }
             ]
         });
+        let timeline = canonical_pending_fixture(
+            &timeline,
+            "session-dedupe",
+            "plan",
+            "run-dedupe",
+            "planId",
+            "plan-dedupe",
+        );
 
         let text = extract_plain_text(&timeline).expect("pending plan text");
         assert_eq!(text.matches("Shared summary").count(), 1);
@@ -2219,6 +2004,14 @@ mod tests {
                 }
             ]
         });
+        let timeline = canonical_pending_fixture(
+            &timeline,
+            "session-review",
+            "review",
+            "run-review",
+            "reviewId",
+            "review-1",
+        );
 
         let text = extract_plain_text(&timeline).expect("pending review text");
         assert!(text.contains("Pending review decision"));
@@ -2267,6 +2060,15 @@ mod tests {
                 ]
             }
         });
+        let canonical = canonical_pending_fixture(
+            &timeline,
+            "session-print-wrapper",
+            "plan",
+            "run-wrapper",
+            "planId",
+            "plan-wrapper",
+        );
+        let timeline = json!({ "ok": true, "data": canonical });
 
         let text = extract_plain_text(&timeline).expect("pending plan text");
         assert!(text.contains("Pending plan decision"));

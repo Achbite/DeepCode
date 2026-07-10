@@ -34,6 +34,7 @@ pub(crate) struct GuiState {
     pub(crate) current_session_id: Option<String>,
     pub(crate) current_session_ids_by_scope: HashMap<String, String>,
     pub(crate) session_projection_cache: HashMap<String, Vec<Value>>,
+    pub(crate) session_timeline_cache: HashMap<String, Value>,
     pub(crate) trace_events: HashMap<String, Vec<Value>>,
     pub(crate) browser: BrowserState,
 }
@@ -108,6 +109,7 @@ impl GuiState {
             current_session_id,
             current_session_ids_by_scope,
             session_projection_cache: HashMap::new(),
+            session_timeline_cache: HashMap::new(),
             trace_events: HashMap::new(),
             browser: BrowserState::default(),
         }

@@ -53,14 +53,6 @@ impl CardModel {
             .unwrap_or_default();
         let mut cards = Vec::new();
         for turn in turns {
-            let status = turn.get_str("status").unwrap_or("unknown");
-            if !matches!(status, "completed" | "done") {
-                cards.push(Self::new(
-                    CardKind::Stage,
-                    "回合状态",
-                    format!("timeline turn status: {status}"),
-                ));
-            }
             let blocks = turn
                 .get("blocks")
                 .and_then(Value::as_array)
@@ -128,26 +120,9 @@ impl CardModel {
 }
 
 fn structured_projection_text(block: &Value) -> Option<String> {
-    let events = block.get("events").and_then(Value::as_array)?;
-    for event in events {
-        let kind = event
-            .get("kind")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let payload = event.get("payload")?;
-        let readable = match kind {
-            "plan_card" => payload.get("readablePlan"),
-            "review_summary" => payload.get("readableReview"),
-            _ => None,
-        };
-        if let Some(readable) = readable {
-            let rendered = render_readable_projection(readable);
-            if !rendered.trim().is_empty() {
-                return Some(rendered);
-            }
-        }
-    }
-    None
+    let readable = block.get("structuredProjection")?;
+    let rendered = render_readable_projection(readable);
+    (!rendered.trim().is_empty()).then_some(rendered)
 }
 
 fn render_readable_projection(readable: &Value) -> String {

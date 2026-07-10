@@ -16,6 +16,10 @@ import type {
 import { buildSessionMemorySnapshot } from './context/memory.js';
 import { SessionDriverLoop } from './driver/sessionDriverLoop.js';
 import type { SessionDecisionResolverInput } from './driver/types.js';
+import {
+  buildNarrativeTimelineProjection,
+  buildTimelineProjectionWithLiveOverlay,
+} from './projection.js';
 import { SessionStorageClient } from './storageClient.js';
 import type { ProjectWorkingDirectory } from './context/types.js';
 
@@ -92,7 +96,8 @@ async function runAsk(request: HostBridgeRequest): Promise<HostBridgeResult> {
 
   const sessionId = sessionResult.session.id;
   const existingEvents = sessionResult.events ?? [];
-  const driver = createDriver(apiBase, request.hostRunId);
+  const projection = createProjectionPublishingDriver(apiBase, request.hostRunId, existingEvents);
+  const driver = projection.driver;
   const result = await driver.runUserTurn({
     sessionId,
     content,
@@ -107,7 +112,7 @@ async function runAsk(request: HostBridgeRequest): Promise<HostBridgeResult> {
     interventionLevel: request.interventionLevel,
   });
   await persistMemoryArchive(apiBase, result.session.id, result.events ?? [], binding, result.session, request.projectMemoryMode);
-  const timeline = await readTimeline(apiBase, result.session.id);
+  const timeline = projection.buildTimeline(result.events ?? []);
   const finalText = extractFinalText(timeline);
   const lifecycle = inferHostRunLifecycle(result.events, finalText);
   return {
@@ -130,7 +135,8 @@ async function resolveDecision(request: HostBridgeRequest): Promise<HostBridgeRe
   const current = await getAgentSession(apiBase, request.sessionId);
   const binding = request.noWorkspace ? undefined : workspaceBindingFromPath(request.workspacePath);
   const projectWorkingDirectory = request.noWorkspace ? undefined : projectWorkingDirectoryFromPath(request.workspacePath);
-  const driver = createDriver(apiBase, request.hostRunId);
+  const projection = createProjectionPublishingDriver(apiBase, request.hostRunId, current.events);
+  const driver = projection.driver;
   const result = await driver.resolveDecision({
     sessionId: request.sessionId,
     kind: request.decisionKind,
@@ -148,7 +154,7 @@ async function resolveDecision(request: HostBridgeRequest): Promise<HostBridgeRe
     projectMemoryMode: request.projectMemoryMode,
   });
   await persistMemoryArchive(apiBase, result.session.id, result.events ?? [], binding, result.session, request.projectMemoryMode);
-  const timeline = await readTimeline(apiBase, result.session.id);
+  const timeline = projection.buildTimeline(result.events ?? []);
   const finalText = extractFinalText(timeline);
   const lifecycle = inferHostRunLifecycle(result.events, finalText);
   return {
@@ -191,27 +197,60 @@ function sessionTitle(value: unknown): string | undefined {
   return typeof title === 'string' && title.trim() ? title : undefined;
 }
 
-function createDriver(apiBase: string, hostRunId?: string): SessionDriverLoop {
+function createProjectionPublishingDriver(
+  apiBase: string,
+  hostRunId: string | undefined,
+  initialEvents: AgentEvent[]
+): {
+  driver: SessionDriverLoop;
+  buildTimeline: (events?: AgentEvent[]) => AgentTimelineResult;
+} {
   const transcriptClient = new SessionStorageClient(apiBase);
-  return new SessionDriverLoop({
+  let committedEvents = [...initialEvents];
+  const activeDeltas: ProjectionDelta[] = [];
+  const buildTimeline = (events: AgentEvent[] = committedEvents): AgentTimelineResult =>
+    activeDeltas.length > 0
+      ? buildTimelineProjectionWithLiveOverlay({
+          sessionId: events[0]?.sessionId ?? committedEvents[0]?.sessionId ?? 'session',
+          committedEvents: events,
+          activeDeltas,
+        })
+      : buildNarrativeTimelineProjection({
+          sessionId: events[0]?.sessionId ?? committedEvents[0]?.sessionId ?? 'session',
+          events,
+        });
+  const driver = new SessionDriverLoop({
     kernelCommand: (request) => kernelCommand(apiBase, request),
     llmChat: (request) => llmChat(apiBase, request),
     llmChatStream: (request, onEvent) => llmChatStream(apiBase, request, onEvent),
     onProjectionDelta: hostRunId
-      ? (delta) => postProjectionDelta(apiBase, hostRunId, delta)
+      ? async (delta) => {
+          activeDeltas.push(delta);
+          await postProjectionDelta(apiBase, hostRunId, delta);
+        }
       : undefined,
     appendTranscript: (sessionId, entry) => transcriptClient.appendTranscript(sessionId, entry),
     appendEvents: async (sessionId, events) => {
+      const nextEvents = [...committedEvents, ...events];
+      const timeline = activeDeltas.length > 0
+        ? buildTimelineProjectionWithLiveOverlay({
+            sessionId,
+            committedEvents: nextEvents,
+            activeDeltas,
+          })
+        : buildNarrativeTimelineProjection({ sessionId, events: nextEvents });
       const response = await postJson<ApiResponse<AgentSessionResult>>(
         `${apiBase}/api/agent/sessions/${encodeURIComponent(sessionId)}/events`,
-        { events }
+        { events, timeline }
       );
       if (!response.ok || !response.data) {
         throw new Error(response.message ?? response.error ?? 'append agent events failed');
       }
+      committedEvents = response.data.events ?? nextEvents;
       return response.data;
     },
   });
+  return { driver, buildTimeline };
 }
 
 async function currentOrCreateSession(
@@ -251,16 +290,6 @@ async function getAgentSession(apiBase: string, sessionId: string): Promise<Agen
   );
   if (!response.ok || !response.data) {
     throw new Error(response.message ?? response.error ?? `read session failed: ${sessionId}`);
-  }
-  return response.data;
-}
-
-async function readTimeline(apiBase: string, sessionId: string): Promise<AgentTimelineResult> {
-  const response = await getJson<ApiResponse<AgentTimelineResult>>(
-    `${apiBase}/api/agent/sessions/${encodeURIComponent(sessionId)}/timeline`
-  );
-  if (!response.ok || !response.data) {
-    throw new Error(response.message ?? response.error ?? `read timeline failed: ${sessionId}`);
   }
   return response.data;
 }

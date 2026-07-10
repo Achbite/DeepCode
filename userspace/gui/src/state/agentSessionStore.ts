@@ -359,97 +359,6 @@ function mergeActiveProjectionDelta(existing: ProjectionDelta[], incoming: Proje
   return trimActiveDeltas([...byKey.values()]);
 }
 
-function eventPayloadRecord(event: AgentEvent): Record<string, unknown> | null {
-  return isRecord(event.payload) ? event.payload : null;
-}
-
-function eventStringField(event: AgentEvent, key: string): string | undefined {
-  const value = eventPayloadRecord(event)?.[key];
-  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
-}
-
-function activityIdentityKeys(activity: unknown): string[] {
-  if (!isRecord(activity)) return [];
-  const keys: string[] = [];
-  const add = (prefix: string, value: unknown) => {
-    if (typeof value === 'string' && value.trim()) keys.push(`${prefix}:${value.trim()}`);
-  };
-  const addMany = (prefix: string, value: unknown) => {
-    if (!Array.isArray(value)) return;
-    for (const item of value) add(prefix, item);
-  };
-  add('activity', activity.activityId);
-  addMany('action', activity.actionIds);
-  addMany('work-unit', activity.workUnitIds);
-  return keys;
-}
-
-function eventActivityIdentityKeys(event: AgentEvent): string[] {
-  return activityIdentityKeys(eventPayloadRecord(event)?.activity);
-}
-
-function deltaActivityIdentityKeys(delta: ProjectionDelta): string[] {
-  return activityIdentityKeys(delta.activity);
-}
-
-function eventProjectionIdentityKeys(event: AgentEvent): string[] {
-  const payload = eventPayloadRecord(event);
-  const output = isRecord(payload?.output) ? payload.output : null;
-  const keys: string[] = [];
-  const packetId = typeof output?.id === 'string' ? output.id.trim() : '';
-  if (packetId) keys.push(`packet:${packetId}`);
-  const items = Array.isArray(output?.items) ? output.items : [];
-  for (const item of items) {
-    if (!isRecord(item)) continue;
-    const callId = typeof item.manifestEntryId === 'string' ? item.manifestEntryId.trim() : '';
-    if (callId) keys.push(`call:${callId}`);
-  }
-  return keys;
-}
-
-function deltaProjectionIdentityKeys(delta: ProjectionDelta): string[] {
-  const payload = isRecord(delta.payload) ? delta.payload : null;
-  const keys: string[] = [];
-  const packetId = typeof payload?.packetId === 'string' ? payload.packetId.trim() : '';
-  const callId = typeof payload?.callId === 'string' ? payload.callId.trim() : delta.itemId?.trim() ?? '';
-  if (packetId) keys.push(`packet:${packetId}`);
-  if (callId) keys.push(`call:${callId}`);
-  return keys;
-}
-
-function eventRunId(event: AgentEvent): string | undefined {
-  return eventStringField(event, 'runId');
-}
-
-function committedTextDeltaType(event: AgentEvent): ProjectionDelta['type'] | undefined {
-  if (event.kind !== 'assistant_msg') return undefined;
-  const channel = eventStringField(event, 'channel');
-  if (channel === 'reasoning') return 'reasoning_delta';
-  if (channel === 'final' || channel === 'progress') return 'assistant_delta';
-  return undefined;
-}
-
-function pruneActiveDeltasForCommittedEvents(existing: ProjectionDelta[], events: AgentEvent[]): ProjectionDelta[] {
-  if (events.length === 0 || existing.length === 0) return existing;
-  const sessionIds = new Set(events.map((event) => event.sessionId));
-  const activityKeys = new Set(events.flatMap(eventActivityIdentityKeys));
-  const projectionKeys = new Set(events.flatMap(eventProjectionIdentityKeys));
-  const committedText = events.flatMap((event) => {
-    const type = committedTextDeltaType(event);
-    return type ? [{ type, runId: eventRunId(event) }] : [];
-  });
-  if (activityKeys.size === 0 && projectionKeys.size === 0 && committedText.length === 0) return existing;
-  return existing.filter((delta) => {
-    if (!sessionIds.has(delta.sessionId)) return true;
-    if (deltaActivityIdentityKeys(delta).some((key) => activityKeys.has(key))) return false;
-    if (deltaProjectionIdentityKeys(delta).some((key) => projectionKeys.has(key))) return false;
-    if (committedText.some((item) => item.type === delta.type && (!item.runId || !delta.runId || item.runId === delta.runId))) {
-      return false;
-    }
-    return true;
-  });
-}
-
 function streamHandlersForSession(sessionId: string): {
   onDelta: (delta: ProjectionDelta) => void;
   onEvents: (events: AgentEvent[]) => void;
@@ -473,7 +382,6 @@ function streamHandlersForSession(sessionId: string): {
         return {
           events: merged,
           pendingPermission: findLatestPendingPermission(merged),
-          activeDeltas: pruneActiveDeltasForCommittedEvents(state.activeDeltas, events),
         };
       });
     },

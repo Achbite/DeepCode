@@ -86,6 +86,7 @@ pub(crate) async fn agent_session_create(
     gui.current_session_ids_by_scope
         .insert(scope_key, id.clone());
     gui.session_projection_cache.insert(id.clone(), Vec::new());
+    gui.session_timeline_cache.remove(&id);
     gui.trace_events.insert(id.clone(), Vec::new());
     gui.sessions.insert(0, session.clone());
     ApiResponse::ok(json!({ "session": session, "events": [] }))
@@ -162,6 +163,7 @@ pub(crate) async fn agent_session_delete(
         let scope_key = session_scope_key(&gui.sessions[position]);
         gui.sessions.remove(position);
         gui.session_projection_cache.remove(&session_id);
+        gui.session_timeline_cache.remove(&session_id);
         gui.trace_events.remove(&session_id);
         gui.current_session_ids_by_scope
             .retain(|_, current_id| current_id != &session_id);
@@ -287,6 +289,11 @@ pub(crate) async fn agent_session_append_events(
         .cloned()
         .unwrap_or_default();
     append_session_projection(&state, &session_id, incoming);
+    if let Some(timeline) = body.get("timeline").cloned() {
+        if let Err(error) = store_session_timeline(&state, &session_id, timeline) {
+            return ApiResponse::error("write_session_timeline_failed", error.to_string());
+        }
+    }
     let mut gui = state.gui.lock().expect("gui state lock");
     refresh_pending_session_titles(&mut gui);
     session_result(&gui, &session_id)

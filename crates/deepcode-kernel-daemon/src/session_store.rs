@@ -406,6 +406,43 @@ pub(crate) fn session_projection(state: &AppState, session_id: &str) -> Vec<Valu
     cached.unwrap_or_else(|| read_session_projection_jsonl(&sessions_dir, session_id))
 }
 
+pub(crate) fn store_session_timeline(
+    state: &AppState,
+    session_id: &str,
+    timeline: Value,
+) -> std::io::Result<()> {
+    let sessions_dir = {
+        let mut gui = state.gui.lock().expect("gui state lock");
+        gui.session_timeline_cache
+            .insert(session_id.to_string(), timeline.clone());
+        gui.paths.sessions_dir.clone()
+    };
+    let dir = sessions_dir.join(safe_path_segment(session_id));
+    fs::create_dir_all(&dir)?;
+    atomic_write_json_file(&dir.join("timeline.json"), &timeline)
+}
+
+pub(crate) fn session_timeline(state: &AppState, session_id: &str) -> Option<Value> {
+    let (cached, sessions_dir) = {
+        let gui = state.gui.lock().expect("gui state lock");
+        (
+            gui.session_timeline_cache.get(session_id).cloned(),
+            gui.paths.sessions_dir.clone(),
+        )
+    };
+    let timeline = cached.or_else(|| {
+        read_json_file(
+            &sessions_dir
+                .join(safe_path_segment(session_id))
+                .join("timeline.json"),
+        )
+    })?;
+    let mut gui = state.gui.lock().expect("gui state lock");
+    gui.session_timeline_cache
+        .insert(session_id.to_string(), timeline.clone());
+    Some(timeline)
+}
+
 pub(crate) fn append_session_projection_jsonl(
     sessions_dir: &FsPath,
     session_id: &str,
@@ -2241,6 +2278,7 @@ mod tests {
                 current_session_id: Some(session_id.to_string()),
                 current_session_ids_by_scope: HashMap::new(),
                 session_projection_cache: HashMap::new(),
+                session_timeline_cache: HashMap::new(),
                 trace_events: HashMap::new(),
                 browser: BrowserState::default(),
             })),

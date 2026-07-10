@@ -12,7 +12,6 @@ import {
   buildFileTabId,
 } from '../../state/editorStore';
 import { useSettingsStore } from '../../state/settingsStore';
-import { useAgentSessionStore } from '../../state/agentSessionStore';
 
 interface WorkbenchLayoutProps {
   apiStatus: string;
@@ -101,7 +100,6 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
   const language = normalizeUiLanguage(
     useSettingsStore((s) => s.effectiveSettings['workbench.language'])
   );
-  const agentEvents = useAgentSessionStore((s) => s.events);
   const settingsTitle = t(language, 'settings.title');
 
   const activeTab = tabs.find((tab) => {
@@ -404,7 +402,6 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
               apiStatus={apiStatus}
               wsStatus={wsStatus}
               serverVersion={serverVersion}
-              events={agentEvents}
             />
           </Suspense>
         ) : activeFile ? (

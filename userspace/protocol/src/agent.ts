@@ -635,6 +635,38 @@ export interface AgentTimelineTokenUsageProjection {
   requests: AgentTimelineTokenUsageRequest[];
 }
 
+export interface AgentTimelineStructuredProjectionItem {
+  itemId: string;
+  kind: string;
+  text?: string;
+  messageKey?: string;
+  messageArgs?: Record<string, string>;
+  status?: string;
+  targetRefs?: string[];
+  auditRefs?: string[];
+  metadata?: Record<string, unknown>;
+}
+
+export interface AgentTimelineStructuredProjectionSection {
+  sectionId: string;
+  titleKey: string;
+  titleArgs?: Record<string, string>;
+  emptyMessageKey?: string;
+  items: AgentTimelineStructuredProjectionItem[];
+}
+
+export interface AgentTimelineStructuredProjection {
+  kind: 'plan' | 'review';
+  schemaVersion: string;
+  title?: string;
+  titleKey?: string;
+  titleArgs?: Record<string, string>;
+  summary?: string;
+  summaryKey?: string;
+  messageArgs?: Record<string, string>;
+  sections: AgentTimelineStructuredProjectionSection[];
+}
+
 export interface AgentTimelineBlock {
   id: string;
   kind: AgentTimelineBlockKind;
@@ -645,6 +677,14 @@ export interface AgentTimelineBlock {
   status: AgentTimelineStatus;
   defaultCollapsed: boolean;
   bodyMarkdown?: string;
+  structuredProjection?: AgentTimelineStructuredProjection;
+  decisionRequest?: AgentTimelineDecisionRequest;
+  attachments?: AgentContextAttachment[];
+  feedbackRef?: {
+    eventId: string;
+    sessionId: string;
+    kind: AgentEventKind;
+  };
   displayHints?: AgentTimelineDisplayHints;
   evidenceRefs?: string[];
   rawEventRefs?: string[];

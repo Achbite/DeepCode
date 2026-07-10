@@ -1,4 +1,5 @@
 import type {
+  AgentContextAttachment,
   AgentEvent,
   AgentConversationActivity,
   AgentEventChannel,
@@ -262,6 +263,12 @@ export function buildNarrativeTimelineProjection(input: NarrativeTimelineProject
     events: input.events,
     pendingPermission: findLatestPendingPermission(input.events)?.request,
   });
+  if (activeInteraction?.kind === 'requirement' && activeInteraction.decisionRequest) {
+    const blockId = interactionBlockId(turns, activeInteraction);
+    for (const block of turns.flatMap((turn) => turn.blocks)) {
+      if (block.id === blockId) block.decisionRequest = activeInteraction.decisionRequest;
+    }
+  }
 
   return {
     schemaVersion: NARRATIVE_TIMELINE_SCHEMA_VERSION,
@@ -336,15 +343,11 @@ function projectionDeltasToTransientEvents(input: {
   activeDeltas: ProjectionDelta[];
   generatedAt?: string;
 }): AgentEvent[] {
-  const committedActivityIds = new Set(
-    input.committedEvents
-      .map(eventActivityId)
-      .filter((id): id is string => Boolean(id))
-  );
+  const committed = committedProjectionIndex(input.committedEvents);
   return coalesceLiveToolActivities(input.activeDeltas)
     .filter((delta) => delta.sessionId === input.sessionId)
     .filter((delta) => delta.type !== 'committed')
-    .filter((delta) => !activeDeltaAlreadyCommitted(delta, committedActivityIds))
+    .filter((delta) => !activeDeltaAlreadyCommitted(delta, committed))
     .sort((left, right) => (left.seq ?? 0) - (right.seq ?? 0))
     .flatMap((delta) => projectionDeltaToTransientEvent(delta, input.generatedAt));
 }
@@ -567,11 +570,77 @@ function projectionStatus(status: ProjectionDelta['status']): string | undefined
 
 function activeDeltaAlreadyCommitted(
   delta: ProjectionDelta,
-  committedActivityIds: Set<string>
+  committed: CommittedProjectionIndex
 ): boolean {
+  if (delta.committedEventIds?.some((id) => committed.eventIds.has(id))) return true;
   const activityId = delta.activity?.activityId;
-  if (activityId && committedActivityIds.has(activityId)) return true;
+  if (activityId && committed.activityIds.has(activityId)) return true;
+  if (projectionIdentityKeysForDelta(delta).some((key) => committed.projectionKeys.has(key))) return true;
+  const textIdentity = textProjectionIdentityForDelta(delta);
+  if (textIdentity && committed.textIdentities.has(textIdentity)) return true;
   return false;
+}
+
+interface CommittedProjectionIndex {
+  eventIds: Set<string>;
+  activityIds: Set<string>;
+  projectionKeys: Set<string>;
+  textIdentities: Set<string>;
+}
+
+function committedProjectionIndex(events: AgentEvent[]): CommittedProjectionIndex {
+  return {
+    eventIds: new Set(events.map((event) => event.id).filter(Boolean)),
+    activityIds: new Set(events.map(eventActivityId).filter((id): id is string => Boolean(id))),
+    projectionKeys: new Set(events.flatMap(projectionIdentityKeysForEvent)),
+    textIdentities: new Set(
+      events
+        .map(textProjectionIdentityForEvent)
+        .filter((identity): identity is string => Boolean(identity))
+    ),
+  };
+}
+
+function projectionIdentityKeysForEvent(event: AgentEvent): string[] {
+  const payload = isRecordPayload(event.payload) ? event.payload : {};
+  const output = isRecordPayload(payload.output) ? payload.output : {};
+  const keys: string[] = [];
+  const packetId = stringField(output, 'id');
+  if (packetId) keys.push(`packet:${packetId}`);
+  if (Array.isArray(output.items)) {
+    for (const item of output.items) {
+      if (!isRecordPayload(item)) continue;
+      const callId = stringField(item, 'manifestEntryId');
+      if (callId) keys.push(`call:${callId}`);
+    }
+  }
+  return keys;
+}
+
+function projectionIdentityKeysForDelta(delta: ProjectionDelta): string[] {
+  const payload = isRecordPayload(delta.payload) ? delta.payload : {};
+  const keys: string[] = [];
+  const packetId = stringField(payload, 'packetId');
+  const callId = stringField(payload, 'callId') ?? delta.itemId?.trim();
+  if (packetId) keys.push(`packet:${packetId}`);
+  if (callId) keys.push(`call:${callId}`);
+  return keys;
+}
+
+function textProjectionIdentityForEvent(event: AgentEvent): string | undefined {
+  if (event.kind !== 'assistant_msg') return undefined;
+  const payload = isRecordPayload(event.payload) ? event.payload : {};
+  const channel = stringField(payload, 'channel');
+  const runId = stringField(payload, 'runId');
+  if (channel === 'reasoning') return `reasoning:${runId ?? ''}`;
+  if (channel === 'final' || channel === 'progress') return `assistant:${runId ?? ''}`;
+  return undefined;
+}
+
+function textProjectionIdentityForDelta(delta: ProjectionDelta): string | undefined {
+  if (delta.type === 'reasoning_delta') return `reasoning:${delta.runId ?? ''}`;
+  if (delta.type === 'assistant_delta') return `assistant:${delta.runId ?? ''}`;
+  return undefined;
 }
 
 function eventActivityId(event: AgentEvent): string | undefined {
@@ -1315,6 +1384,9 @@ function narrativeBlockFromEvents(
   const title = activity?.title ?? narrativeTitle(events, narrativeKind);
   const summary = activity?.summary ?? summarizeAgentEvents(events);
   const body = narrativeBody(events, narrativeKind);
+  const structuredProjection = narrativeStructuredProjection(events, narrativeKind);
+  const attachments = narrativeAttachments(events);
+  const feedbackEvent = [...events].reverse().find((event) => event.kind !== 'user_msg');
   return {
     id: existingId ?? `${narrativeKind}-${first.id || index}`,
     kind: legacyKind,
@@ -1325,12 +1397,89 @@ function narrativeBlockFromEvents(
     status,
     defaultCollapsed: narrativeDefaultCollapsed(narrativeKind, status),
     bodyMarkdown: body,
+    structuredProjection,
+    decisionRequest: undefined,
+    attachments,
+    feedbackRef: feedbackEvent
+      ? { eventId: feedbackEvent.id, sessionId: feedbackEvent.sessionId, kind: feedbackEvent.kind }
+      : undefined,
     displayHints: narrativeDisplayHints(narrativeKind, status, title, summary, body),
     evidenceRefs: events.flatMap(eventEvidenceRefs),
     rawEventRefs: events.map(eventRefForAgentEvent),
     taskProjectionRef: shouldShowNarrativeInTaskList(narrativeKind) ? `task-${narrativeKind}-${first.id || index}` : undefined,
     events,
   };
+}
+
+function narrativeAttachments(events: AgentEvent[]): AgentContextAttachment[] | undefined {
+  const attachments = events.flatMap((event) => {
+    if (!isRecordPayload(event.payload) || !Array.isArray(event.payload.attachments)) return [];
+    return event.payload.attachments.filter(isAgentContextAttachment);
+  });
+  return attachments.length > 0 ? attachments : undefined;
+}
+
+function isAgentContextAttachment(value: unknown): value is AgentContextAttachment {
+  if (!isRecordPayload(value)) return false;
+  return typeof value.path === 'string' &&
+    (value.scope === 'session' || value.scope === 'message') &&
+    (value.kind === 'file' || value.kind === 'directory' || value.kind === 'panelSnapshot') &&
+    (value.source === 'mention' || value.source === 'contextMenu' || value.source === 'browser' || value.source === 'userSelected');
+}
+
+function narrativeStructuredProjection(
+  events: AgentEvent[],
+  kind: AgentTimelineNarrativeKind
+): AgentTimelineBlock['structuredProjection'] {
+  if (kind !== 'plan' && kind !== 'review') return undefined;
+  const field = kind === 'plan' ? 'readablePlan' : 'readableReview';
+  for (const event of [...events].reverse()) {
+    const payload = isRecordPayload(event.payload) ? event.payload : undefined;
+    const readable = payload && isRecordPayload(payload[field]) ? payload[field] : undefined;
+    if (!readable || !Array.isArray(readable.sections)) continue;
+    const schemaVersion = stringField(readable, 'schemaVersion');
+    if (!schemaVersion) continue;
+    return {
+      kind,
+      schemaVersion,
+      title: stringField(readable, 'title'),
+      titleKey: stringField(readable, 'titleKey'),
+      titleArgs: recordStringValues(readable.titleArgs),
+      summary: stringField(readable, 'summary'),
+      summaryKey: stringField(readable, 'summaryKey'),
+      messageArgs: recordStringValues(readable.messageArgs),
+      sections: readable.sections.flatMap((section) => {
+        if (!isRecordPayload(section)) return [];
+        const sectionId = stringField(section, 'sectionId');
+        const titleKey = stringField(section, 'titleKey');
+        if (!sectionId || !titleKey || !Array.isArray(section.items)) return [];
+        return [{
+          sectionId,
+          titleKey,
+          titleArgs: recordStringValues(section.titleArgs),
+          emptyMessageKey: stringField(section, 'emptyMessageKey'),
+          items: section.items.flatMap((item) => {
+            if (!isRecordPayload(item)) return [];
+            const itemId = stringField(item, 'itemId');
+            const itemKind = stringField(item, 'kind');
+            if (!itemId || !itemKind) return [];
+            return [{
+              itemId,
+              kind: itemKind,
+              text: stringField(item, 'text'),
+              messageKey: stringField(item, 'messageKey'),
+              messageArgs: recordStringValues(item.messageArgs),
+              status: stringField(item, 'status'),
+              targetRefs: stringArrayField(item, 'targetRefs'),
+              auditRefs: stringArrayField(item, 'auditRefs'),
+              metadata: isRecordPayload(item.metadata) ? item.metadata : undefined,
+            }];
+          }),
+        }];
+      }),
+    };
+  }
+  return undefined;
 }
 
 function finalizeNarrativeTurn(turn: AgentTimelineResult['turns'][number]): AgentTimelineResult['turns'][number] {
@@ -1739,7 +1888,12 @@ function summarizeAgentEvents(events: AgentEvent[]): string {
 
 function narrativeBody(events: AgentEvent[], kind: AgentTimelineNarrativeKind): string | undefined {
   if (kind === 'operationEvidence') return undefined;
-  if (kind === 'plan' || kind === 'review') return undefined;
+  if (kind === 'plan') return undefined;
+  if (kind === 'review') {
+    if (narrativeStructuredProjection(events, kind)) return undefined;
+    const text = events.map(reviewEventBody).find((value) => value.trim().length > 0);
+    return text?.trim() || undefined;
+  }
   if (kind === 'thinking') {
     const reasoning = events.map(reasoningEventBody).join('').trim();
     return reasoning || undefined;

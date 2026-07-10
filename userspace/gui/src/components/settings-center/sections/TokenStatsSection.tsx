@@ -1,5 +1,5 @@
 import React from 'react';
-import type { AgentEvent, AgentTimelineTokenUsageProjection } from '@deepcode/protocol';
+import type { AgentTimelineTokenUsageProjection } from '@deepcode/protocol';
 import { normalizeUiLanguage, t } from '../../../i18n';
 import { useSettingsStore } from '../../../state/settingsStore';
 import {
@@ -11,7 +11,6 @@ import {
 } from '../../../utils/tokenUsageStats';
 
 interface TokenStatsSectionProps {
-  events: AgentEvent[];
   tokenUsageProjection?: AgentTimelineTokenUsageProjection | null;
 }
 
@@ -22,11 +21,11 @@ interface TokenBarRowProps {
   tone?: 'cache' | 'miss' | 'completion' | 'neutral';
 }
 
-const TokenStatsSection: React.FC<TokenStatsSectionProps> = ({ events, tokenUsageProjection }) => {
+const TokenStatsSection: React.FC<TokenStatsSectionProps> = ({ tokenUsageProjection }) => {
   const language = normalizeUiLanguage(
     useSettingsStore((s) => s.effectiveSettings['workbench.language'])
   );
-  const stats = deriveTokenUsageStats(events, tokenUsageProjection);
+  const stats = deriveTokenUsageStats([], tokenUsageProjection);
   const maxValue = Math.max(
     stats.promptCacheHitTokens,
     stats.promptCacheMissTokens,
