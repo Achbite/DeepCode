@@ -1086,7 +1086,7 @@ async function assertProviderStreamRuntimeHandlesStreamEvents(): Promise<void> {
   const deltas: Array<Omit<ProjectionDelta, 'sessionId' | 'runId' | 'turnId' | 'seq'>> = [];
   const kernelRequests: KernelCommandEnvelope[] = [];
   const runtime = new ProviderStreamRuntime<any>({
-    reasoningFlushChars: 8,
+    reasoningFlushChars: 999_999,
     reasoningFlushMs: 999_999,
     streamCoordinator: new ProviderStreamCoordinator(),
     visibleLanguageForRequest: () => 'en-US',
@@ -1171,7 +1171,6 @@ async function assertProviderStreamRuntimeHandlesStreamEvents(): Promise<void> {
     toolCallBuffer,
     reasoningBuffer,
   });
-  await runtime.flushReasoningBuffer(state, 'provider_call', reasoningBuffer);
   await runtime.handleEvent({
     state,
     stage: 'provider_call',
@@ -1251,6 +1250,16 @@ async function assertProviderStreamRuntimeHandlesStreamEvents(): Promise<void> {
   assert(
     deltas.some((delta) => delta.type === 'tool_call_delta' && delta.itemId === `tool-call-${token}`),
     'provider stream runtime emits tool call deltas'
+  );
+  const reasoningDeltaIndex = deltas.findIndex(
+    (delta) => delta.type === 'reasoning_delta' && delta.delta === `reason-${token}`
+  );
+  const toolCallDeltaIndex = deltas.findIndex(
+    (delta) => delta.type === 'tool_call_delta' && delta.itemId === `tool-call-${token}`
+  );
+  assert(
+    reasoningDeltaIndex >= 0 && toolCallDeltaIndex > reasoningDeltaIndex,
+    'provider stream runtime flushes buffered reasoning before the following tool call delta'
   );
   assert(
     deltas.some((delta) => delta.type === 'stage_delta' && delta.source === 'provider'),
@@ -10391,22 +10400,20 @@ function assertTimelineProjectionWithLiveOverlay(): void {
   const liveKinds = liveBlocks.map((block) => block.narrativeKind);
   assertEqual(
     liveKinds.join('>'),
-    'user>operationEvidence>thinking>operationEvidence',
-    'live overlay shows provider status, structured activity, and live provider reasoning as a thinking trace'
+    'user>thinking>operationEvidence',
+    'live overlay keeps visible reasoning and structured activity without provider lifecycle noise'
   );
   assertEqual(
     liveBlocks.some((block) => block.events.some((event) => (event.payload as any)?.activity?.activityId === 'activity-provider-lifecycle')),
-    true,
-    'live provider lifecycle remains visible as a temporary status'
+    false,
+    'live provider lifecycle stays out of the main timeline'
   );
-  assertEqual(
-    liveBlocks.some((block) =>
-      block.narrativeKind === 'thinking' &&
-      (block.bodyMarkdown ?? '').includes('Need generic context before proposing changes.')
-    ),
-    true,
-    'provider reasoning delta enters the live timeline as a reasoning trace block'
-  );
+  const liveThinking = liveBlocks.find((block) => block.narrativeKind === 'thinking');
+  assert(Boolean(liveThinking?.bodyMarkdown?.includes('Need generic context before proposing changes.')), 'provider reasoning delta enters the live timeline as a reasoning trace block');
+  assertEqual(liveThinking?.status, 'completed', 'later activity seals the live thinking block');
+  assertEqual(liveThinking?.displayHints?.renderMode, 'typewriter', 'sealed live thinking remains eligible for buffered playback');
+  assertEqual(liveThinking?.displayHints?.initialOpen, true, 'sealed live thinking stays open until the shell finishes playback');
+  assertEqual(liveThinking?.defaultCollapsed, false, 'sealed live thinking does not disappear before playback completes');
   const liveActivity = liveBlocks.find((block) => block.activity?.activityId === 'activity-live-read');
   assertEqual(liveActivity?.activity?.kind, 'resourceRead', 'live activity survives projection as structured activity');
   assertEqual(
@@ -10468,6 +10475,10 @@ function assertTimelineProjectionWithLiveOverlay(): void {
     'user>thinking>operationEvidence',
     'committed reasoning remains a separate collapsible audit block when explicitly recorded'
   );
+  const committedThinking = committedProjection.turns[0].blocks.find((block) => block.narrativeKind === 'thinking');
+  const committedActivity = committedProjection.turns[0].blocks.find((block) => block.activity?.activityId === 'activity-live-read');
+  assertEqual(liveThinking?.id, committedThinking?.id, 'live and committed reasoning keep one stable timeline block id');
+  assertEqual(liveActivity?.id, committedActivity?.id, 'live and committed activity keep one stable timeline block id');
 
   const streamingProjection = buildTimelineProjectionWithLiveOverlay({
     sessionId: 'session-live-overlay',
@@ -10504,6 +10515,79 @@ function assertTimelineProjectionWithLiveOverlay(): void {
     1,
     'active activity is suppressed when the same activityId is already committed'
   );
+
+  const firstActionRunning = {
+    activityId: 'activity-action-a-running',
+    kind: 'editFileStarted' as const,
+    status: 'running' as const,
+    title: 'Update generic source',
+    summary: 'Updating a generic source file.',
+    source: 'kernel' as const,
+    runId: 'run-live-overlay',
+    actionIds: ['action-a'],
+    workUnitIds: ['work-unit-a'],
+    targets: ['src/generic-a.ts'],
+  };
+  const firstActionCompleted = {
+    ...firstActionRunning,
+    activityId: 'activity-action-a-completed',
+    kind: 'editFileCompleted' as const,
+    status: 'completed' as const,
+    summary: 'Updated a generic source file.',
+  };
+  const secondActionCompleted = {
+    ...firstActionCompleted,
+    activityId: 'activity-action-b-completed',
+    title: 'Update another generic source',
+    summary: 'Updated another generic source file.',
+    actionIds: ['action-b'],
+    workUnitIds: ['work-unit-b'],
+    targets: ['src/generic-b.ts'],
+  };
+  const actionProjection = buildTimelineProjectionWithLiveOverlay({
+    sessionId: 'session-live-overlay',
+    committedEvents: [userEvent],
+    activeDeltas: [
+      {
+        type: 'workunit_delta',
+        seq: 1,
+        sessionId: 'session-live-overlay',
+        runId: 'run-live-overlay',
+        turnId: 'turn-live-overlay',
+        channel: 'workunit',
+        source: 'kernel',
+        status: 'running',
+        activity: firstActionRunning,
+      },
+      {
+        type: 'workunit_delta',
+        seq: 2,
+        sessionId: 'session-live-overlay',
+        runId: 'run-live-overlay',
+        turnId: 'turn-live-overlay',
+        channel: 'workunit',
+        source: 'kernel',
+        status: 'completed',
+        activity: firstActionCompleted,
+      },
+      {
+        type: 'workunit_delta',
+        seq: 3,
+        sessionId: 'session-live-overlay',
+        runId: 'run-live-overlay',
+        turnId: 'turn-live-overlay',
+        channel: 'workunit',
+        source: 'kernel',
+        status: 'completed',
+        activity: secondActionCompleted,
+      },
+    ],
+  });
+  const actionBlocks = actionProjection.turns[0].blocks.filter((block) => block.activity);
+  assertEqual(actionBlocks.length, 2, 'different actions render as separate activity cards');
+  assertEqual(actionBlocks[0]?.events.length, 2, 'one action updates its activity card in place');
+  assertEqual(actionBlocks[0]?.activity?.status, 'completed', 'the latest action fact controls the grouped activity status');
+  assertEqual(actionBlocks[1]?.activity?.actionIds?.[0], 'action-b', 'the next action keeps an independent activity card');
 }
 
 function assertImplementationPlanTaskProjectionProgress(): void {

@@ -37,7 +37,6 @@ interface DeepCodeTimelineProps {
 
 type TypewriterSpeed = NonNullable<NonNullable<AgentTimelineBlock['displayHints']>['typewriterSpeed']>;
 type TimelineFollowMode = 'following' | 'detached';
-const MAX_TYPEWRITER_CHARS = 1600;
 const TYPEWRITER_BUFFER_DELAY_MS = 36;
 const LIVE_REASONING_FAST_BACKLOG_CHARS = 4000;
 const LIVE_REASONING_SNAP_BACKLOG_CHARS = 12000;
@@ -447,10 +446,10 @@ function useProjectedTimelinePlayback(
     return () => window.clearTimeout(timer);
   }, [blockingBlockId, completedTextLengths, enabled, holdMs, view]);
 
-  const visibleView = useMemo(
-    () => blockingBlockId ? truncateTimelineAfterBlock(view, blockingBlockId) : view,
-    [blockingBlockId, view]
-  );
+  const visibleView = useMemo(() => {
+    const releasedView = blockingBlockId ? truncateTimelineAfterBlock(view, blockingBlockId) : view;
+    return applyPlaybackPresentationState(releasedView, playbackBlockIds, releasedBlockIds);
+  }, [blockingBlockId, playbackBlockIds, releasedBlockIds, view]);
 
   return {
     view: visibleView,
@@ -504,6 +503,32 @@ function truncateTimelineAfterBlock(view: AgentTimelineResult, blockId: string):
     turns.push({ ...turn, blocks });
   }
   return { ...view, turns };
+}
+
+function applyPlaybackPresentationState(
+  view: AgentTimelineResult,
+  playbackBlockIds: Set<string>,
+  releasedBlockIds: Set<string>
+): AgentTimelineResult {
+  return {
+    ...view,
+    turns: view.turns.map((turn) => ({
+      ...turn,
+      blocks: turn.blocks.map((block) => {
+        if (!playbackBlockIds.has(block.id)) return block;
+        const released = releasedBlockIds.has(block.id);
+        const thinking = block.kind === 'thinking' || block.narrativeKind === 'thinking';
+        return {
+          ...block,
+          defaultCollapsed: released && thinking ? true : false,
+          displayHints: {
+            ...(block.displayHints ?? {}),
+            initialOpen: released && thinking ? false : true,
+          },
+        };
+      }),
+    })),
+  };
 }
 
 function activityKindLabel(language: UiLanguage, kind: AgentConversationActivity['kind']): string {
@@ -633,8 +658,10 @@ function useTypewriterBlockIds(
   return useMemo(() => {
     const sessionId = view.sessionId;
     const candidateBlocks = collectTypewriterBlocks(view);
+    const visibleBlocks = flattenTimelineBlocks(view)
+      .filter((block) => visibleTypewriterMarkdown(block).length > 0);
     const latestInteractionTime = latestUserInteractionTime(view);
-    const candidateBlockById = new Map(candidateBlocks.map((block) => [block.id, block]));
+    const visibleBlockById = new Map(visibleBlocks.map((block) => [block.id, block]));
     const candidateIds = candidateBlocks.map((block) => block.id);
 
     if (activeSessionIdRef.current !== sessionId) {
@@ -651,7 +678,7 @@ function useTypewriterBlockIds(
     }
     typewriterBlockIdsRef.current = new Set(
       [...typewriterBlockIdsRef.current].filter((blockId) => {
-        const block = candidateBlockById.get(blockId);
+        const block = visibleBlockById.get(blockId);
         return Boolean(block) && blockAfterInteraction(block!, latestInteractionTime);
       })
     );
@@ -678,10 +705,7 @@ function collectTypewriterBlocks(view: AgentTimelineResult): AgentTimelineBlock[
     turn.blocks
       .filter((block) => {
         const markdown = visibleTypewriterMarkdown(block);
-        const withinLimit = markdown.length <= MAX_TYPEWRITER_CHARS ||
-          block.kind === 'thinking' ||
-          block.narrativeKind === 'thinking';
-        return markdown.length > 0 && withinLimit && shouldAnimateTimelineBlock(block);
+        return markdown.length > 0 && shouldAnimateTimelineBlock(block);
       })
   );
 }
@@ -772,7 +796,11 @@ function shouldAnimateTimelineBlock(block: AgentTimelineBlock): boolean {
   const renderMode = block.displayHints?.renderMode;
   if (renderMode === 'instant' || renderMode === 'static') return false;
   if (block.kind === 'thinking' || block.narrativeKind === 'thinking') {
-    return block.status === 'running' || block.status === 'waiting';
+    return renderMode === 'typewriter' && (
+      block.status === 'running' ||
+      block.status === 'waiting' ||
+      isLiveOverlayBlock(block)
+    );
   }
   return renderMode === 'typewriter' ||
     renderMode === 'accelerated' ||
@@ -1605,9 +1633,10 @@ const StructuredProjectionTypewriter: React.FC<{
 }) => {
   const text = structuredProjectionText(payload, language, kind);
   const totalLength = text.length;
-  const shouldAnimate = animate && totalLength <= MAX_TYPEWRITER_CHARS;
+  const shouldAnimate = animate && totalLength > 0;
   const [visibleCharacters, setVisibleCharacters] = useState(() => (shouldAnimate ? 0 : totalLength));
   const visibleRef = useRef(visibleCharacters);
+  const latestTextRef = useRef(text);
   const timerRef = useRef<number | null>(null);
   const completedRef = useRef(false);
   const onAnimationCompleteRef = useRef(onAnimationComplete);
@@ -1631,11 +1660,11 @@ const StructuredProjectionTypewriter: React.FC<{
   }, [renderedCharacters]);
 
   useEffect(() => {
+    latestTextRef.current = text;
     if (timerRef.current !== null) {
       window.clearTimeout(timerRef.current);
       timerRef.current = null;
     }
-    completedRef.current = false;
 
     if (!shouldAnimate || totalLength <= 0) {
       visibleRef.current = totalLength;
@@ -1647,18 +1676,26 @@ const StructuredProjectionTypewriter: React.FC<{
       return undefined;
     }
 
-    let index = 0;
+    let index = Math.min(visibleRef.current, totalLength);
     visibleRef.current = index;
     setVisibleCharacters(index);
+    if (index >= totalLength) {
+      if (!completedRef.current) {
+        completedRef.current = true;
+        onAnimationCompleteRef.current();
+      }
+      return undefined;
+    }
+    completedRef.current = false;
 
     const tick = () => {
-      const backlog = Math.max(0, totalLength - index);
+      const latestLength = latestTextRef.current.length;
+      const backlog = Math.max(0, latestLength - index);
       const step = typewriterBufferedStep(backlog, speed);
-      index = Math.min(totalLength, index + step);
+      index = Math.min(latestLength, index + step);
       visibleRef.current = index;
       setVisibleCharacters(index);
-      onVisibleContentChangeRef.current();
-      if (index >= totalLength) {
+      if (index >= latestLength) {
         if (!completedRef.current) {
           completedRef.current = true;
           onAnimationCompleteRef.current();
@@ -1694,7 +1731,7 @@ const TypewriterMarkdown: React.FC<{
   onVisibleContentChange: () => void;
   onAnimationComplete?: () => void;
 }> = ({ content, animate, speed = 'normal', onVisibleContentChange, onAnimationComplete }) => {
-  const shouldAnimate = animate && content.length <= MAX_TYPEWRITER_CHARS;
+  const shouldAnimate = animate && content.length > 0;
   const [visible, setVisible] = useState(() => (shouldAnimate ? '' : content));
   const visibleRef = useRef(visible);
   const latestRef = useRef(content);
@@ -1731,7 +1768,6 @@ const TypewriterMarkdown: React.FC<{
     const commitVisible = (next: string) => {
       visibleRef.current = next;
       setVisible(next);
-      window.requestAnimationFrame(onVisibleContentChangeRef.current);
     };
 
     if (!shouldAnimate) {

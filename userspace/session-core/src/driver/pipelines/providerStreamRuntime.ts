@@ -104,6 +104,9 @@ export class ProviderStreamRuntime<TState extends ProviderStreamRuntimeState> {
       return;
     }
     if (event.type === 'provider_tool_call_delta' && chunk) {
+      // Preserve the provider's visible order: publish any buffered reasoning
+      // before the following structured tool activity receives its sequence.
+      await this.flushReasoningBuffer(state, stage, reasoningBuffer);
       const language = this.dependencies.visibleLanguageForRequest(state.userRequest);
       toolCallBuffer.addChunk(chunk);
       const summary = chunk.toolCallDelta?.name
