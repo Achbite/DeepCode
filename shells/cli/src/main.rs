@@ -643,7 +643,7 @@ async fn resolve_session_decision(
         .agent_timeline(&result.run.session_id)
         .await
         .map_err(|error| format!("failed to read timeline: {error}"))?;
-    render_timeline(&timeline);
+    render_decision_result(&timeline);
     Ok(())
 }
 
@@ -1060,6 +1060,67 @@ fn render_timeline(timeline: &Value) {
     }
 }
 
+fn render_decision_result(timeline: &Value) {
+    if let Some(text) = extract_decision_result_text(timeline) {
+        println!("{text}");
+        return;
+    }
+    render_timeline(timeline);
+}
+
+fn extract_decision_result_text(timeline: &Value) -> Option<String> {
+    extract_plain_text(timeline).or_else(|| extract_latest_review_decision_text(timeline))
+}
+
+fn extract_latest_review_decision_text(timeline: &Value) -> Option<String> {
+    let timeline = timeline_payload(timeline);
+    let session_id = timeline.get("sessionId").and_then(Value::as_str);
+    let turns = timeline.get("turns").and_then(Value::as_array)?;
+    for turn in turns.iter().rev() {
+        let Some(blocks) = turn.get("blocks").and_then(Value::as_array) else {
+            continue;
+        };
+        for block in blocks.iter().rev() {
+            let block_kind = block
+                .get("narrativeKind")
+                .or_else(|| block.get("kind"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if block_kind != "review" {
+                continue;
+            }
+            let Some(events) = block.get("events").and_then(Value::as_array) else {
+                continue;
+            };
+            for event in events.iter().rev() {
+                if event_kind(event) != Some("review_summary")
+                    || payload_bool(event, "confirmable") == Some(false)
+                    || is_terminal_status(payload_string(event, "status"))
+                {
+                    continue;
+                }
+                let Some(run_id) = payload_string(event, "runId") else {
+                    continue;
+                };
+                let pending = PendingSessionDecision {
+                    run_id: run_id.to_string(),
+                    target_id: payload_string(event, "reviewId")
+                        .or_else(|| payload_string(event, "sourcePlanId"))
+                        .map(ToOwned::to_owned),
+                };
+                return Some(render_pending_decision_text(
+                    session_id,
+                    "review",
+                    "Pending review decision",
+                    event,
+                    pending,
+                ));
+            }
+        }
+    }
+    None
+}
+
 fn timeline_block_text(block: &Value, kind: &str) -> String {
     if matches!(kind, "plan" | "review") {
         if let Some(text) = structured_projection_text(block) {
@@ -1447,7 +1508,8 @@ fn pending_review_from_event(event: &Value, events: &[&Value]) -> Option<Pending
     if payload_bool(event, "confirmable") == Some(false) {
         return None;
     }
-    if payload_string(event, "status") != Some("waitingUserReview") {
+    let status = payload_string(event, "status");
+    if is_terminal_status(status) {
         return None;
     }
     let run_id = payload_string(event, "runId")?.to_string();
@@ -1950,12 +2012,39 @@ mod tests {
     }
 
     #[test]
+    fn selects_confirmable_review_summary_without_status() {
+        let timeline = timeline(vec![json!({
+            "kind": "review_summary",
+            "payload": {
+                "confirmable": true,
+                "runId": "run-a",
+                "reviewId": "review-a",
+                "sourcePlanId": "plan-a"
+            }
+        })]);
+
+        let pending = find_pending_session_decision(&timeline, "review", None).unwrap();
+        assert_eq!(
+            pending,
+            PendingSessionDecision {
+                run_id: "run-a".to_string(),
+                target_id: Some("review-a".to_string()),
+            }
+        );
+    }
+
+    #[test]
     fn print_text_uses_pending_plan_projection() {
         let timeline = json!({
             "sessionId": "session-print",
             "turns": [
                 {
                     "blocks": [
+                        {
+                            "narrativeKind": "thinking",
+                            "title": "Thinking",
+                            "bodyMarkdown": "internal reasoning should stay out of compact decision output"
+                        },
                         {
                             "events": [
                                 {
@@ -2144,6 +2233,7 @@ mod tests {
         );
         assert!(!text.contains("review.summary.waitingUserReview"));
         assert!(!text.contains("session.projection.review.count.workUnitsCompleted"));
+        assert!(!text.contains("internal reasoning should stay out"));
         assert!(text.contains("Decision target: review run=run-review target=review-1"));
         assert!(text.contains("DeepCode-CLI --session session-review decision review accept"));
     }
