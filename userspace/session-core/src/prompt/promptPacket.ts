@@ -1,7 +1,9 @@
 import {
   resourceEvidenceAccessIndexLine,
+  resourceEvidenceCurrentTaskCoverageLines,
   resourceEvidenceRangeLabel,
 } from '../context/resourceEvidenceAccess.js';
+import { inferProviderTurnMode } from './providerTurnContract.js';
 import type { PromptEnvelopeBuilderInput } from './types.js';
 
 export interface PromptPacketFrame {
@@ -28,6 +30,7 @@ export function renderPromptPacketFrames(frames: PromptPacketFrame[]): string {
 }
 
 export function buildPromptPacketFrames(input: PromptEnvelopeBuilderInput): PromptPacketFrame[] {
+  const acceptedExecution = inferProviderTurnMode(input) === 'acceptedTaskExecution';
   const frames: PromptPacketFrame[] = [
     {
       kind: 'SystemContract',
@@ -55,10 +58,12 @@ export function buildPromptPacketFrames(input: PromptEnvelopeBuilderInput): Prom
     memoryFrame(input),
     {
       kind: 'DynamicDialogue',
-      source: 'user.message',
-      trust: 'userIntent',
+      source: acceptedExecution ? 'session.confirmedPlan' : 'user.message',
+      trust: acceptedExecution ? 'sessionInstruction' : 'userIntent',
       scope: 'currentRun',
-      use: 'primary goal, language, preferences, and user-stated constraints',
+      use: acceptedExecution
+        ? 'sanitized accepted-plan execution context; original user request is a source reference only'
+        : 'primary goal, language, preferences, and user-stated constraints',
       content: [input.userRequest || '[empty]'],
     },
   ];
@@ -165,16 +170,20 @@ function resourceEvidenceFrame(input: PromptEnvelopeBuilderInput): PromptPacketF
 function accessSummaryFrame(input: PromptEnvelopeBuilderInput): PromptPacketFrame | undefined {
   const blocks = input.resourcePromptContext?.resourceBlocks ?? [];
   if (!blocks.length) return undefined;
+  const targets = stringArray(objectRecord(input.currentTaskContext)?.targets);
   return {
     kind: 'AccessIndex',
     source: 'session.derivedFromResourceEvidence',
     trust: 'derivedObservedFact',
     scope: 'currentRun',
     use: 'index of already confirmed resources; do not reread the same low-value path/range unless a different segment is needed',
-    content: blocks.slice(-12).map((block) => resourceEvidenceAccessIndexLine(block, {
-      includeSummary: true,
-      summaryLimit: 300,
-    })),
+    content: [
+      ...blocks.slice(-12).map((block) => resourceEvidenceAccessIndexLine(block, {
+        includeSummary: true,
+        summaryLimit: 300,
+      })),
+      ...resourceEvidenceCurrentTaskCoverageLines(blocks, targets),
+    ],
   };
 }
 

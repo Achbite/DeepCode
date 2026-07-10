@@ -103,7 +103,10 @@ export class ReviewProjectionBuilder<
       ...ports.staticSyntaxReviewFactLines(input.kernelEvents),
     ];
     const reviewFacts = ports.findReviewFacts(input.kernelEvents);
-    const gitReview = reviewFacts ? objectRecord(reviewFacts.gitReview) : undefined;
+    const rawGitReview = reviewFacts ? objectRecord(reviewFacts.gitReview) : undefined;
+    const executionRoot = input.plan.executionRoot
+      ?? latestPlanExecutionRootFromEvents(input.events ?? [], input.plan.planId);
+    const gitReview = gitReviewForProjection(rawGitReview, executionRoot);
     const completed = Math.max(
       reviewFacts ? arrayLength(reviewFacts.completedWorkUnits) : 0,
       input.kernelEvents.filter((event) => objectRecord(event)?.kind === 'work_unit.completed').length
@@ -208,6 +211,7 @@ export class ReviewProjectionBuilder<
           facts,
           reviewFacts,
           gitReview,
+          rawGitReview,
           reviewFactsContext,
         },
         facts,
@@ -465,6 +469,18 @@ function sameAcceptedPlan(
   return true;
 }
 
+function latestPlanExecutionRootFromEvents(events: AgentEvent[], planId?: string): unknown {
+  for (const event of [...events].reverse()) {
+    if (event.kind !== 'plan_card') continue;
+    const payload = objectRecord(event.payload) ?? {};
+    const payloadPlanId = stringValue(payload.planId) ?? stringValue(payload.sourcePlanId);
+    if (planId && payloadPlanId && payloadPlanId !== planId) continue;
+    const executionRoot = objectRecord(payload.executionRoot);
+    if (executionRoot) return executionRoot;
+  }
+  return undefined;
+}
+
 function addReviewWorkUnitFile(
   changedFiles: Map<string, ReadableReviewChangedFile>,
   auditRefs: string[],
@@ -587,6 +603,49 @@ function operationFromToolName(toolName?: string): string {
   if (toolName === 'fs.rename') return 'rename';
   if (toolName.startsWith('fs.')) return toolName.slice(3);
   return toolName;
+}
+
+function gitReviewForProjection(
+  gitReview: Record<string, unknown> | undefined,
+  executionRoot: unknown
+): Record<string, unknown> | undefined {
+  if (!gitReview || gitReview.available === false) return gitReview;
+  const executionRootPath = projectionPath(executionRootPathValue(executionRoot));
+  const root = projectionPath(stringValue(gitReview.root));
+  const repoRoot = projectionPath(stringValue(gitReview.repoRoot));
+  const reviewRoots = [root, repoRoot].filter((value): value is string => Boolean(value));
+  if (!executionRootPath || reviewRoots.length === 0) return gitReview;
+  if (reviewRoots.some((candidate) => sameProjectionRoot(candidate, executionRootPath))) return gitReview;
+
+  return {
+    available: false,
+    reason: `git review root ${reviewRoots[0]} does not match execution root ${executionRootPath}`,
+    root,
+    repoRoot,
+    executionRoot: executionRootPath,
+    projectionFilter: 'executionRootMismatch',
+  };
+}
+
+function executionRootPathValue(executionRoot: unknown): string | undefined {
+  const record = objectRecord(executionRoot);
+  const attachment = objectRecord(record?.attachment);
+  return stringValue(record?.ref)
+    ?? stringValue(record?.absolutePath)
+    ?? stringValue(record?.path)
+    ?? stringValue(attachment?.absolutePath)
+    ?? stringValue(attachment?.path);
+}
+
+function projectionPath(value?: string): string | undefined {
+  const trimmed = value?.trim();
+  if (!trimmed) return undefined;
+  const normalized = trimmed.replace(/\\/g, '/').replace(/\/+/g, '/');
+  return normalized.length > 1 ? normalized.replace(/\/+$/, '') : normalized;
+}
+
+function sameProjectionRoot(left: string, right: string): boolean {
+  return left === right || left.startsWith(`${right}/`) || right.startsWith(`${left}/`);
 }
 
 function gitReviewItems(gitReview?: Record<string, unknown>): ReadableProjectionItem[] {

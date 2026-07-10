@@ -22,6 +22,8 @@ import {
 } from '../index.js';
 import { ContextFrameBuilder } from '../driver/context/contextFrameBuilder.js';
 import { VISIBLE_REASONING_MAX_CHARS } from '../driver/projection/index.js';
+import { AcceptedPlanResourceResumePromptBuilder } from '../prompt/AcceptedPlanResourceResumePromptBuilder.js';
+import { ProviderRepairMessageBuilder } from '../prompt/ProviderRepairMessageBuilder.js';
 import { providerVisibleSchemaDigest, renderProviderTurnContractLayer } from '../prompt/providerTurnContract.js';
 import {
   assert,
@@ -282,6 +284,11 @@ export function assertPromptEnvelope(): void {
   assert(acceptedPrompt.dynamicSuffix.includes('Current schema digest covers only: actionBundle, resourceRequest, decisionRequest, taskOutcome, diagnostic'), 'accepted execution schema digest lists current execution shapes');
   assert(acceptedPrompt.dynamicSuffix.includes('actionBundle proposal top-level fields'), 'accepted execution schema digest documents actionBundle shape');
   assert(acceptedPrompt.dynamicSuffix.includes('taskOutcome top-level field'), 'accepted execution schema digest documents taskOutcome shape');
+  assert(!acceptedPrompt.dynamicSuffix.includes('Requirement: not confirmed yet'), 'accepted execution prompt omits stale unconfirmed requirement wording');
+  assert(!acceptedPrompt.dynamicSuffix.includes('status=notConfirmed'), 'accepted execution prompt omits stale unconfirmed requirement status');
+  assert(acceptedPrompt.dynamicSuffix.includes('No separate requirement confirmation is active.'), 'accepted execution prompt uses neutral requirement state wording');
+  assert(acceptedPrompt.dynamicSuffix.includes('Accepted execution requirement state.'), 'accepted execution prompt marks requirement segment as execution state');
+  assert(!acceptedPrompt.dynamicSuffix.includes('User request: Continue the accepted generic task.'), 'accepted execution requirement segment does not relabel sanitized context as a user request');
 
   const acceptedFrames = buildPromptPacketFrames({
     workflowState: 'executing_accepted_plan',
@@ -289,11 +296,12 @@ export function assertPromptEnvelope(): void {
     capabilityCatalogSummary: 'fs.delete',
     memoryHints: ['Prior plan accepted by user.'],
     userRequest: 'Continue the accepted cleanup task.',
+    resourcePromptContext,
     currentTaskGoal: 'Remove a confirmed generated directory.',
     currentTaskContext: {
       taskId: 'task-generic-delete',
       taskTitle: 'Remove generated directory',
-      targets: ['generated-dir'],
+      targets: ['generic/file.txt'],
       capabilities: ['fs.delete'],
       acceptanceCriteria: ['Kernel records the generated directory delete fact.'],
       failureCriteria: ['Stop if the delete leaves the accepted target scope.'],
@@ -301,10 +309,16 @@ export function assertPromptEnvelope(): void {
       completedTaskIds: [],
     },
   });
+  const acceptedDialogueFrame = acceptedFrames.find((frame) => frame.kind === 'DynamicDialogue');
+  assert(acceptedDialogueFrame?.source === 'session.confirmedPlan', 'accepted execution prompt packet marks dialogue frame as session-confirmed context');
+  assert(acceptedDialogueFrame?.trust === 'sessionInstruction', 'accepted execution prompt packet does not treat sanitized context as raw user intent');
   const acceptedTaskFrame = acceptedFrames.find((frame) => frame.kind === 'TaskFrame');
   assert(acceptedTaskFrame?.trust === 'confirmedTaskInstruction', 'accepted execution prompt packet marks task frame as confirmed instruction');
   assert(acceptedTaskFrame?.content.some((line) => line.includes('acceptanceCriteria=Kernel records the generated directory delete fact.')), 'accepted execution task frame carries current task acceptance criteria');
   assert(acceptedTaskFrame?.content.some((line) => line.includes('failureCriteria=Stop if the delete leaves the accepted target scope.')), 'accepted execution task frame carries current task failure criteria');
+  const acceptedAccessFrame = acceptedFrames.find((frame) => frame.kind === 'AccessIndex');
+  assert(acceptedAccessFrame?.content.some((line) => line.includes('currentTaskEvidence target=generic/file.txt')), 'provider-visible prompt packet records current task evidence coverage');
+  assert(acceptedAccessFrame?.content.some((line) => line.includes('covered=true')), 'provider-visible prompt packet marks covered current task evidence');
   const nextAction = acceptedFrames.find((frame) => frame.kind === 'NextActionInstruction');
   assert(nextAction, 'accepted execution prompt packet includes next action frame');
   const allowedLine = nextAction?.content.find((line) => line.startsWith('allowedOutputs=')) ?? '';
@@ -338,6 +352,9 @@ export function assertPromptEnvelope(): void {
     String(acceptedDriverContract.nextActionInstruction.summary ?? '').includes('Keep visible reasoning/progress action-oriented'),
     'accepted execution provider turn keeps visible reasoning action oriented'
   );
+  const acceptedDriverDialogue = acceptedDriverContract.frames.find((frame) => frame.kind === 'DynamicDialogue');
+  assert(acceptedDriverDialogue?.source === 'session', 'accepted execution driver frame marks dynamic dialogue as session-derived');
+  assert(acceptedDriverDialogue?.trust === 'sessionInstruction', 'accepted execution driver frame does not mark sanitized context as user-confirmed fact');
 }
 
 export function assertContextAssemblerCachePlan(): void {
@@ -1239,4 +1256,84 @@ export async function assertProviderTraceArchiveCompactsStreamingChunks(): Promi
   assert(archivedJson.length < 120_000, 'compact provider trace stays below transcript body risk threshold');
   assert(!archivedJson.includes('raw-provider-payload-4999'), 'compact trace strips raw provider payload values');
   assert(!archivedJson.includes('generic stream fragment 4999'), 'compact trace strips per-token content values');
+}
+
+export function assertAcceptedPlanResourceResumePromptUsesPromptContent(): void {
+  const token = randomSmokeToken('resource-resume-prompt-content');
+  const resourceRef = `src/generic-${token}.txt`;
+  const manifest: ResourceManifest = {
+    id: `manifest-${token}`,
+    workspaceScopeKey: `workspace-${token}`,
+    entries: [{
+      id: `entry-${token}`,
+      kind: 'file',
+      label: `Generic ${token}`,
+      resourceRef,
+      readPolicy: 'autoRead',
+      reason: 'Read a generic accepted-task resource.',
+    }],
+    budget: { maxEntries: 8, maxBytes: 8192 },
+    defaultDenyPatterns: [],
+  };
+  const evidenceText = `resolved evidence ${token}\nfunction generic_${token}() { return true; }`;
+  const packet = createResourcePacket({
+    packetId: `packet-${token}`,
+    manifest,
+    request: {
+      id: `request-${token}`,
+      items: [{
+        id: `item-${token}`,
+        manifestEntryId: `entry-${token}`,
+        reason: 'Read the current accepted task resource.',
+      }],
+    },
+    kernelEvidence: {
+      [`entry-${token}`]: {
+        contentKind: 'fileText',
+        promptContent: evidenceText,
+        contentSummary: `summary-only-${token}`,
+      },
+    },
+  });
+  const prompt = new AcceptedPlanResourceResumePromptBuilder(new ProviderRepairMessageBuilder()).render({
+    repairState: {
+      runId: `run-${token}`,
+      userRequest: `Handle generic resource ${token}.`,
+      conversationRoots: [],
+      resourcePackets: [packet],
+      acceptedContext: { planId: `plan-${token}` },
+      currentTaskContext: {
+        taskId: `task-${token}`,
+        goal: `Use ${resourceRef}.`,
+        targets: [resourceRef],
+        capabilities: ['fs.write'],
+      },
+      completedTaskCount: 0,
+    },
+    acceptedPlan: {
+      planId: `plan-${token}`,
+      completedTaskIds: [],
+      tasks: [{ taskId: `task-${token}` }],
+    },
+    cursor: {
+      currentTaskId: `task-${token}`,
+      completedTaskIds: [],
+      lastResourcePacketIds: [packet.id],
+    },
+    currentTask: {
+      goal: `Use ${resourceRef}.`,
+      targets: [resourceRef],
+      capabilities: ['fs.write'],
+      evidenceNeeds: ['current file text'],
+    },
+    requestProposal: {
+      proposalId: `proposal-${token}`,
+      kind: 'resourceRequest',
+    } as any,
+    packet,
+  });
+
+  assert(prompt.includes(`resolved evidence ${token}`), 'accepted-plan resource resume prompt includes resolved promptContent text');
+  assert(prompt.includes(`function generic_${token}()`), 'accepted-plan resource resume prompt includes resolved promptContent code preview');
+  assert(prompt.includes(`summary-only-${token}`), 'accepted-plan resource resume prompt retains content summary metadata');
 }

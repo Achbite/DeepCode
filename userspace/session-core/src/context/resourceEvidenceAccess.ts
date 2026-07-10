@@ -10,6 +10,7 @@ export interface ResourceEvidenceAccessBlock {
   contentHash: string;
   charLength: number;
   summary?: string;
+  preview?: string;
 }
 
 export interface ResourceEvidenceAccessLineOptions {
@@ -35,6 +36,31 @@ export function resourceEvidenceAccessIndexLine(
     parts.push(`summary=${compactOneLine(block.summary ?? '', options.summaryLimit ?? 300)}`);
   }
   return parts.join('; ');
+}
+
+export function resourceEvidenceCurrentTaskCoverageLines(
+  blocks: readonly ResourceEvidenceAccessBlock[],
+  targets: readonly string[]
+): string[] {
+  if (!blocks.length || !targets.length) return [];
+  return targets.map((target) => {
+    const matches = blocks.filter((block) => resourceBlockMatchesTarget(block, target));
+    const covered = matches.some((block) => block.retention === 'full' || block.retention === 'summary');
+    const fullTextAvailable = matches.some((block) => block.retention === 'full' && block.charLength > 0);
+    const matched = uniqueSorted(matches.map((block) => block.displayRef)).slice(-4);
+    const kinds = uniqueSorted(matches.map((block) => block.contentKind ?? 'unknown'));
+    const use = covered
+      ? 'current task target evidence is available; do not reread the same path/range unless a different range/search is required'
+      : 'no current task evidence found; request a focused resource only if the missing fact changes the next action';
+    return [
+      `currentTaskEvidence target=${target}`,
+      `covered=${covered}`,
+      `fullText=${fullTextAvailable}`,
+      `kinds=${kinds.length ? kinds.join(',') : 'none'}`,
+      `matched=${matched.length ? matched.join(',') : 'none'}`,
+      `use=${use}`,
+    ].join('; ');
+  });
 }
 
 export function resourceEvidenceContentKindCounts(blocks: readonly ResourceEvidenceAccessBlock[]): string {
@@ -87,4 +113,54 @@ export function resourceEvidenceReuseInstruction(block: ResourceEvidenceAccessBl
 function compactOneLine(value: string, max: number): string {
   const normalized = value.replace(/\s+/g, ' ').trim();
   return normalized.length > max ? `${normalized.slice(0, Math.max(0, max - 1))}...` : normalized;
+}
+
+function resourceBlockMatchesTarget(block: ResourceEvidenceAccessBlock, target: string): boolean {
+  const ref = normalizeResourceRef(block.displayRef);
+  const normalizedTarget = normalizeResourceRef(target);
+  if (!ref || !normalizedTarget) return false;
+  if (ref === normalizedTarget || ref.endsWith(`/${normalizedTarget}`) || normalizedTarget.endsWith(`/${ref}`)) {
+    return true;
+  }
+  if (block.contentKind !== 'directoryTree') return false;
+  return directoryInventoryMentionsTarget(block, ref, normalizedTarget);
+}
+
+function normalizeResourceRef(value: string): string {
+  const normalized = value
+    .trim()
+    .replace(/\\/g, '/')
+    .replace(/^\.\//, '')
+    .replace(/\/+/g, '/')
+    .replace(/\/+$/g, '');
+  if (!normalized || normalized === '.' || normalized === '/') return '';
+  return normalized;
+}
+
+function uniqueSorted(values: string[]): string[] {
+  return [...new Set(values.filter(Boolean))].sort();
+}
+
+function directoryInventoryMentionsTarget(
+  block: ResourceEvidenceAccessBlock,
+  normalizedRef: string,
+  normalizedTarget: string
+): boolean {
+  const inventory = normalizeInventoryText(block.summary ?? block.preview ?? '');
+  if (!inventory) return false;
+  const candidates = [normalizedTarget];
+  if (normalizedTarget.startsWith(`${normalizedRef}/`)) {
+    candidates.push(normalizedTarget.slice(normalizedRef.length + 1));
+  }
+  return uniqueSorted(candidates).some((candidate) => inventoryContainsPath(inventory, candidate));
+}
+
+function normalizeInventoryText(value: string): string {
+  return value.trim().replace(/\\/g, '/').replace(/\/+/g, '/');
+}
+
+function inventoryContainsPath(inventory: string, normalizedPath: string): boolean {
+  if (!normalizedPath) return false;
+  const escaped = normalizedPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(^|[^A-Za-z0-9._/-])${escaped}($|[^A-Za-z0-9._/-])`).test(inventory);
 }

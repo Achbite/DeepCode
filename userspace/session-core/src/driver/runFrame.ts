@@ -1,4 +1,4 @@
-import type { LlmChatResult } from '@deepcode/protocol';
+import type { LlmChatRequest, LlmChatResult } from '@deepcode/protocol';
 import type {
   ContextAssemblyRecord,
   ContextAssemblyTaskLocalCompactRecord,
@@ -154,6 +154,12 @@ export interface ProviderTurnSnapshotFrame {
   readonly dynamicSummaryOverlapCharLength: number;
   readonly refsCount: number;
   readonly dataHash?: string;
+  readonly currentTaskEvidenceLineCount: number;
+  readonly currentTaskEvidenceCoveredCount: number;
+  readonly currentTaskEvidenceUncoveredCount: number;
+  readonly currentTaskEvidenceFullTextCount: number;
+  readonly currentTaskEvidenceTargets: string[];
+  readonly currentTaskEvidenceMatchedRefs: string[];
 }
 
 export interface ProviderTurnSnapshotResourceBlock {
@@ -193,6 +199,12 @@ export interface ProviderTurnSnapshot {
   readonly dynamicDialogueFrameTextOccurrences: number;
   readonly dynamicFrameOverlapCharLength: number;
   readonly dynamicFrameOverlapRatio: number;
+  readonly currentTaskEvidenceLineCount: number;
+  readonly currentTaskEvidenceCoveredCount: number;
+  readonly currentTaskEvidenceUncoveredCount: number;
+  readonly currentTaskEvidenceFullTextCount: number;
+  readonly currentTaskEvidenceTargets: string[];
+  readonly currentTaskEvidenceMatchedRefs: string[];
   readonly segmentOrder: string[];
   readonly segments: ProviderTurnSnapshotSegment[];
   readonly dynamicAppendLog: ProviderTurnSnapshotDynamicAppendLogEntry[];
@@ -285,6 +297,8 @@ export interface SessionDriverProviderState {
   modelContextBundle?: ModelContextBundle;
   nativeToolReadLedger: Map<string, NativeToolReadLedgerEntry>;
   nativeToolDuplicateRepairAttempted: boolean;
+  nativeToolResumeMessages?: LlmChatRequest['messages'];
+  nativeToolResumeRound?: number;
   activeTurn?: ActiveTurnState;
 }
 

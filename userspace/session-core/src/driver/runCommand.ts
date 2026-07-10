@@ -2,15 +2,12 @@ import type { ProviderTurnMode } from './runFrame.js';
 
 export type RunCommand =
   | { readonly kind: 'initializeRun' }
-  | {
-    readonly kind: 'continueSameLoop';
-    readonly source: 'coordinatorResume';
-  }
+  | { readonly kind: 'resumeRun' }
   | { readonly kind: 'maybeBuildRequirementConfirmation' }
   | { readonly kind: 'waitForRequirementDecision' }
   | { readonly kind: 'prepareProviderTurn'; readonly mode: ProviderTurnMode }
   | { readonly kind: 'callProviderAndParse' }
-  | { readonly kind: 'routeProposal' }
+  | { readonly kind: 'executeDirective' }
   | { readonly kind: 'resolveResourceRequest' }
   | { readonly kind: 'submitPlanProposal' }
   | { readonly kind: 'submitActionProposal' }

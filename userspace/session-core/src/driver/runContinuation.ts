@@ -4,6 +4,10 @@ import type { ProjectWorkingDirectory } from '../context/types.js';
 import type { RequirementRecord } from '../requirement/types.js';
 import type { AcceptedImplementationPlanContext } from './execution/index.js';
 import type { InteractionOverlayContext } from './pipelines/interactionOverlayCodec.js';
+import type {
+  AcceptedPlanReviewHandoffPlan,
+  AcceptedPlanReviewHandoffRunInput,
+} from './review/acceptedPlanReviewHandoffCoordinator.js';
 import type { InterventionLevel, ReviewContinuationMode } from './types.js';
 
 export interface DecisionContinuationSource {
@@ -16,6 +20,38 @@ export interface DecisionContinuationSource {
   interventionLevel?: InterventionLevel;
   projectMemoryMode?: ProjectMemoryMode;
   interactionOverlay?: InteractionOverlayContext;
+}
+
+export interface SessionLoopResumeInput {
+  sessionId: string;
+  content: string;
+  attachments?: AgentContextAttachment[];
+  existingEvents?: AgentEvent[];
+  workspaceBinding?: AgentWorkspaceBinding;
+  projectWorkingDirectory?: ProjectWorkingDirectory;
+  profileId?: string;
+  workflow?: string;
+  appendUserMessage: false;
+  confirmedRequirement?: RequirementRecord;
+  requirementConfirmationMode: 'off' | 'always';
+  reviewContinuationMode?: ReviewContinuationMode;
+  interventionLevel?: InterventionLevel;
+  projectMemoryMode?: ProjectMemoryMode;
+  resumeResourcePackets?: boolean;
+  acceptedImplementationPlan?: AcceptedImplementationPlanContext;
+  interactionOverlay?: InteractionOverlayContext;
+}
+
+export type SessionLoopControlResult =
+  | { readonly kind: 'return'; readonly result: AgentSessionResult }
+  | { readonly kind: 'resume'; readonly input: SessionLoopResumeInput }
+  | {
+    readonly kind: 'assembleReview';
+    readonly request: AcceptedPlanReviewHandoffRunInput<AcceptedPlanReviewHandoffPlan>;
+  };
+
+export function returnSessionResult(result: AgentSessionResult): SessionLoopControlResult {
+  return { kind: 'return', result };
 }
 
 export interface DecisionContinuationOverride {
@@ -33,14 +69,6 @@ export interface DecisionContinuationOverride {
 
 export interface AcceptedPlanContinuationOverride extends DecisionContinuationOverride {
   acceptedImplementationPlan: AcceptedImplementationPlanContext;
-}
-
-export class SameLoopContinuation<Input> {
-  constructor(private readonly resume: (input: Input) => Promise<AgentSessionResult>) {}
-
-  readonly resumeUserTurn = (input: Input): Promise<AgentSessionResult> => this.resume(input);
-
-  readonly runUserTurn = (input: Input): Promise<AgentSessionResult> => this.resume(input);
 }
 
 export type DecisionContinuationInput<Extra extends object = Record<string, never>> = {

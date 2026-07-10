@@ -409,9 +409,10 @@ export function providerVisibleAllowedProposals(
   allowedProposals: readonly string[],
   acceptedExecution: boolean
 ): string[] {
-  const blocked = acceptedExecution
-    ? new Set(['taskPlan', 'implementationPlan', 'reviewSummary'])
-    : new Set(['actionBundle', 'taskOutcome', 'implementationPlan', 'reviewSummary']);
+  if (acceptedExecution) {
+    return ['actionBundle', 'resourceRequest', 'decisionRequest', 'taskOutcome', 'diagnostic'];
+  }
+  const blocked = new Set(['actionBundle', 'taskOutcome', 'implementationPlan', 'reviewSummary']);
   return [...new Set(allowedProposals)].filter((kind) => !blocked.has(kind));
 }
 

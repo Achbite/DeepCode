@@ -20,8 +20,8 @@ import type {
 import type { AcceptedImplementationPlanContext } from '../../accepted-plan/types.js';
 import type { ProposalEnvelope, ResourceRequestDraft } from '../../protocol/types.js';
 import type { PromptEnvelope } from '../../prompt/types.js';
+import type { ProposalRouterResult } from '../proposal/proposalRouter.js';
 import type { DriverProviderTurnFrame } from '../runFrame.js';
-import { acceptedPlanContinuationInput } from '../runContinuation.js';
 import type { PlanContext } from '../proposal/planContextIndex.js';
 import type { AcceptedPlanReadOnlyResourceCompletion } from './acceptedPlanExecutor.js';
 
@@ -80,7 +80,6 @@ export interface AcceptedPlanReadOnlyTaskExecutorPorts<
   now(): string;
   createId(prefix: string): string;
   append(sessionId: string, events: AgentEvent[]): Promise<AgentSessionResult | undefined>;
-  continueSameLoop(input: AcceptedPlanReadOnlyTaskResumeInput): Promise<AgentSessionResult>;
   readActionBundle(proposal: ProposalEnvelope): unknown | undefined;
   refreshRuntimeState(state: State): void;
   readOnlyResourceCompletion(
@@ -115,15 +114,6 @@ export interface AcceptedPlanReadOnlyTaskExecutorPorts<
     packet: ResourcePacket;
     completion: AcceptedPlanReadOnlyResourceCompletion;
   }): PlanContext;
-  reviewHandoff(input: {
-    sessionId: string;
-    runId: string;
-    planId: string;
-    plan: PlanContext;
-    result: AgentSessionResult;
-    currentKernelEvents: unknown[];
-    requestIdPrefix: string;
-  }): Promise<AgentSessionResult>;
   currentTaskIsReadOnlyResourceValidation(
     accepted: AcceptedImplementationPlanContext,
     cursor: unknown,
@@ -172,7 +162,7 @@ export interface AcceptedPlanReadOnlyTaskExecutorPorts<
     prompt: PromptEnvelope,
     proposal: ProposalEnvelope,
     fallback: AgentSessionResult
-  ): Promise<AgentSessionResult>;
+  ): Promise<AgentSessionResult | ProposalRouterResult>;
   submitNonExecutableProposal(
     state: State,
     proposal: ProposalEnvelope,
@@ -191,7 +181,7 @@ export class AcceptedPlanReadOnlyTaskExecutor<
     state: State,
     packet: ResourcePacket,
     fallback: AgentSessionResult
-  ): Promise<AgentSessionResult | null> {
+  ): Promise<AgentSessionResult | ProposalRouterResult | null> {
     const accepted = state.acceptedImplementationPlan;
     if (!accepted) return null;
     this.ports.refreshRuntimeState(state);
@@ -208,6 +198,8 @@ export class AcceptedPlanReadOnlyTaskExecutor<
       completedTaskIds: completion.completedTaskIds,
     });
     const nextAccepted = ledgerEffect.nextAcceptedPlan;
+    state.acceptedImplementationPlan = nextAccepted;
+    this.ports.refreshRuntimeState(state);
     const contextCompactRecord = buildTaskLocalCompactRecord({
       contextAssembly: state.contextAssembly,
       source: 'resourceValidation',
@@ -229,34 +221,7 @@ export class AcceptedPlanReadOnlyTaskExecutor<
     let result = await this.ports.append(state.sessionId, [checkpoint]) ?? fallback;
 
     if (!this.ports.complete(nextAccepted)) {
-      return this.ports.continueSameLoop(acceptedPlanContinuationInput(input, {
-        content: this.ports.executionRequest(
-          {
-            sessionId: state.sessionId,
-            runId: state.runId,
-            planId: accepted.planId,
-            userPlan: accepted.summary ?? accepted.title ?? 'Accepted implementation plan',
-            actionBundle: {
-              version: '1',
-              id: `${accepted.planId}:read-only-validation`,
-              goal: 'Read-only validation evidence satisfied the current accepted task.',
-              actions: [],
-              validationExpectations: [],
-              reviewExpectations: [],
-            },
-            codeBlocks: [],
-            commandBlocks: [],
-            expectedValidation: '',
-            reviewGuide: '',
-            implementationPlan: accepted.rawPlan,
-          },
-          nextAccepted
-        ),
-        attachments: nextAccepted.executionRoot ? [nextAccepted.executionRoot.attachment] : [],
-        existingEvents: result.events,
-        reviewContinuationMode: input.reviewContinuationMode,
-        acceptedImplementationPlan: nextAccepted,
-      }));
+      return { kind: 'continue', lastResult: result };
     }
 
     const plan = this.ports.readOnlyReviewContext({
@@ -274,15 +239,18 @@ export class AcceptedPlanReadOnlyTaskExecutor<
       output: packet,
     };
 
-    return this.ports.reviewHandoff({
-      sessionId: state.sessionId,
-      runId: state.runId,
-      planId: accepted.planId,
-      plan,
-      result,
-      currentKernelEvents: [resourceFact],
-      requestIdPrefix: 'accepted-plan-review-facts-get',
-    });
+    return {
+      kind: 'assembleReview',
+      request: {
+        sessionId: state.sessionId,
+        runId: state.runId,
+        planId: accepted.planId,
+        plan,
+        result,
+        currentKernelEvents: [resourceFact],
+        requestIdPrefix: 'accepted-plan-review-facts-get',
+      },
+    };
   }
 
   async tryCompleteActionBundle(
@@ -291,7 +259,7 @@ export class AcceptedPlanReadOnlyTaskExecutor<
     prompt: PromptEnvelope,
     proposal: ProposalEnvelope,
     fallback: AgentSessionResult
-  ): Promise<AgentSessionResult | null> {
+  ): Promise<AgentSessionResult | ProposalRouterResult | null> {
     const accepted = state.acceptedImplementationPlan;
     const actionBundle = this.ports.readActionBundle(proposal);
     if (!accepted || !actionBundle) return null;

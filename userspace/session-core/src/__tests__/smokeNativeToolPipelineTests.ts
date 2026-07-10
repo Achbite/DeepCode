@@ -461,23 +461,24 @@ export async function assertNativeToolProviderLoopResumesAfterToolMessages(): Pr
     },
   });
 
-  const result = await loop.run({
-    profileId: `profile-${token}`,
-    state: {
-      sessionId,
-      runId,
-      userRequest: `request-${token}`,
-      manifest: {
-        id: `manifest-${token}`,
-        workspaceScopeKey: `scope-${token}`,
-        entries: [],
-        budget: { maxEntries: 8, maxBytes: 4096 },
-        defaultDenyPatterns: [],
-      },
-      resourcePackets: [],
-      nativeToolReadLedger: new Map(),
-      nativeToolDuplicateRepairAttempted: false,
+  const state = {
+    sessionId,
+    runId,
+    userRequest: `request-${token}`,
+    manifest: {
+      id: `manifest-${token}`,
+      workspaceScopeKey: `scope-${token}`,
+      entries: [],
+      budget: { maxEntries: 8, maxBytes: 4096 },
+      defaultDenyPatterns: [],
     },
+    resourcePackets: [],
+    nativeToolReadLedger: new Map(),
+    nativeToolDuplicateRepairAttempted: false,
+  };
+  const loopInput = {
+    profileId: `profile-${token}`,
+    state,
     prompt: `prompt-${token}`,
     contract: {} as any,
     providerTools: [{ name: `tool-${token}` } as any],
@@ -486,14 +487,17 @@ export async function assertNativeToolProviderLoopResumesAfterToolMessages(): Pr
       throw new Error('native tool provider loop test uses fake provider pipeline');
     },
     isEmptyResponseError: () => false,
-    consumeGuidanceMessages: async (_state, stage) => {
+    consumeGuidanceMessages: async (_state: any, stage: string): Promise<LlmChatRequest['messages']> => {
       guidanceStages.push(stage);
       return [{ role: 'user', content: `guidance-${token}` }];
     },
-  });
+  };
+  const first = await loop.run(loopInput);
+  assertEqual((first as { kind?: string }).kind, 'providerResume', 'native tool provider step yields control after tool handling');
+  const result = await loop.run(loopInput);
 
-  assertEqual(result, `final-${token}`, 'native tool provider loop returns final content after resume');
-  assertEqual(stages.join(','), 'provider_call,provider_tool_resume_1', 'native tool provider loop advances resume stage names');
+  assertEqual(result, `final-${token}`, 'native tool provider step returns final content after RunEngine resumes it');
+  assertEqual(stages.join(','), 'provider_call,provider_tool_resume_1', 'native tool provider steps preserve resume stage names');
   assertEqual(guidanceStages[0], 'provider_call', 'native tool provider loop consumes guidance after tool handling');
   assertEqual(messageCounts[0], 1, 'native tool provider loop starts from provider messages');
   assertEqual(messageCounts[1], 4, 'native tool provider loop resumes with assistant, tool, and guidance messages');

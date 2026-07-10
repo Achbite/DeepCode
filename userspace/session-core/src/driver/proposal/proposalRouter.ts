@@ -1,6 +1,10 @@
 import type { AgentEvent, AgentSessionResult } from '@deepcode/protocol';
 import type { ProposalEnvelope } from '../../protocol/types.js';
 import type { PromptEnvelope } from '../../prompt/types.js';
+import type {
+  AcceptedPlanReviewHandoffPlan,
+  AcceptedPlanReviewHandoffRunInput,
+} from '../review/acceptedPlanReviewHandoffCoordinator.js';
 
 export interface ProposalRouterState {
   sessionId: string;
@@ -8,13 +12,23 @@ export interface ProposalRouterState {
 
 export type ProposalRouterResult =
   | { kind: 'return'; result: AgentSessionResult }
-  | { kind: 'continue'; lastResult: AgentSessionResult };
+  | { kind: 'continue'; lastResult: AgentSessionResult }
+  | {
+    kind: 'assembleReview';
+    request: AcceptedPlanReviewHandoffRunInput<AcceptedPlanReviewHandoffPlan>;
+  };
 
-export interface ProposalRouterResourceResult {
-  kind: 'return' | 'continue';
-  result?: AgentSessionResult;
-  lastResult?: AgentSessionResult;
+export function normalizeProposalRouterResult(
+  value: AgentSessionResult | ProposalRouterResult
+): ProposalRouterResult {
+  const kind = objectRecord(value)?.kind;
+  if (kind === 'return' || kind === 'continue' || kind === 'assembleReview') {
+    return value as ProposalRouterResult;
+  }
+  return { kind: 'return', result: value as AgentSessionResult };
 }
+
+export type ProposalRouterResourceResult = ProposalRouterResult;
 
 export interface ProposalRouteExecutorPorts<Input, State extends ProposalRouterState> {
   now(): string;
@@ -38,7 +52,7 @@ export interface ProposalRouteExecutorPorts<Input, State extends ProposalRouterS
     prompt: PromptEnvelope,
     proposal: ProposalEnvelope,
     fallback: AgentSessionResult
-  ): Promise<AgentSessionResult>;
+  ): Promise<ProposalRouterResult>;
   submitNonExecutableProposal(
     state: State,
     proposal: ProposalEnvelope,
@@ -55,10 +69,11 @@ export interface ProposalRouterInput<Input, State extends ProposalRouterState> {
   prompt: PromptEnvelope;
   proposal: ProposalEnvelope;
   lastResult: AgentSessionResult;
-  routed?: RoutedProposal;
+  routed?: LoopDirective;
 }
 
-export type RoutedProposal =
+export type LoopDirective =
+  | { kind: 'providerResume' }
   | { kind: 'answer'; proposal: ProposalEnvelope }
   | { kind: 'decisionRequest'; proposal: ProposalEnvelope }
   | { kind: 'diagnostic'; proposal: ProposalEnvelope }
@@ -67,7 +82,9 @@ export type RoutedProposal =
   | { kind: 'action'; proposal: ProposalEnvelope }
   | { kind: 'nonExecutable'; proposal: ProposalEnvelope };
 
-export function routeProposalKind(proposal: ProposalEnvelope): RoutedProposal {
+export type RoutedProposal = LoopDirective;
+
+export function routeProposalKind(proposal: ProposalEnvelope): LoopDirective {
   if (proposal.kind === 'answer') return { kind: 'answer', proposal };
   if (proposal.kind === 'decisionRequest') return { kind: 'decisionRequest', proposal };
   if (proposal.kind === 'diagnostic') return { kind: 'diagnostic', proposal };
@@ -78,11 +95,11 @@ export function routeProposalKind(proposal: ProposalEnvelope): RoutedProposal {
 }
 
 export class ProposalRouter {
-  planRoute(proposal: ProposalEnvelope): RoutedProposal {
+  planRoute(proposal: ProposalEnvelope): LoopDirective {
     return routeProposalKind(proposal);
   }
 
-  route(proposal: ProposalEnvelope): RoutedProposal {
+  route(proposal: ProposalEnvelope): LoopDirective {
     return this.planRoute(proposal);
   }
 }
@@ -124,18 +141,21 @@ export class ProposalRouteExecutor<Input, State extends ProposalRouterState> {
         proposal,
         lastResult,
       });
-      if (handled.kind === 'return' && handled.result) return { kind: 'return', result: handled.result };
+      if (handled.kind !== 'continue') return handled;
       return { kind: 'continue', lastResult: handled.lastResult ?? lastResult };
     }
     if (routed.kind === 'action') {
-      return {
-        kind: 'return',
-        result: await this.ports.submitActionProposal(input, state, prompt, proposal, lastResult),
-      };
+      return this.ports.submitActionProposal(input, state, prompt, proposal, lastResult);
     }
     return {
       kind: 'return',
       result: await this.ports.submitNonExecutableProposal(state, proposal, lastResult),
     };
   }
+}
+
+function objectRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
 }

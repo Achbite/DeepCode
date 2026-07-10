@@ -10,6 +10,7 @@ import type { CurrentTaskContext } from '../../accepted-plan/index.js';
 import {
   resourceEvidenceAccessIndexLine,
   resourceEvidenceContentKindCounts,
+  resourceEvidenceCurrentTaskCoverageLines,
 } from '../../context/index.js';
 import type { ContextAssemblyRecord } from '../../context/index.js';
 import type { ResourcePacket } from '../../context/types.js';
@@ -67,6 +68,7 @@ export interface BuildSessionProviderTurnContractInput {
 
 export class ContextFrameBuilder {
   buildProviderTurnContract(input: BuildProviderTurnContractInput): DriverProviderTurnFrame {
+    const acceptedExecution = input.turnMode === 'acceptedTaskExecution';
     const frames: ProviderContextFrame[] = [
       {
         kind: 'SystemContract',
@@ -91,9 +93,11 @@ export class ContextFrameBuilder {
       },
       {
         kind: 'DynamicDialogue',
-        source: 'user',
-        trust: 'userConfirmedFact',
-        use: 'Current dynamic user turn and dialogue-local instructions.',
+        source: acceptedExecution ? 'session' : 'user',
+        trust: acceptedExecution ? 'sessionInstruction' : 'userConfirmedFact',
+        use: acceptedExecution
+          ? 'Sanitized accepted-plan execution context; original user request is a source reference only.'
+          : 'Current dynamic user turn and dialogue-local instructions.',
         summary: input.userRequest,
       },
     ];
@@ -293,6 +297,7 @@ export class ContextFrameBuilder {
       `accessedResources=${resourceBlocks.length}`,
     ];
     lines.push(...resourceBlocks.slice(-12).map((block) => resourceEvidenceAccessIndexLine(block)));
+    lines.push(...resourceEvidenceCurrentTaskCoverageLines(resourceBlocks, input.currentTaskContext?.targets ?? []));
     return lines.join('\n');
   }
 
@@ -308,6 +313,7 @@ export class ContextFrameBuilder {
         'Use TaskFrame targets and currentTaskActionTemplates as the preferred current task boundary; do not import unrelated targets from the original user request, plan summary, memory, or later tasks.',
         'If file changes are needed and evidence is sufficient, return an actionBundle with the concrete operations needed for the current task.',
         'If evidence is missing, return a focused resourceRequest.',
+        'If AccessIndex currentTaskEvidence reports covered=true for the current target, use that evidence instead of repeating the same resourceRequest; request only a different range/search when exact missing content would change the action.',
         'If a concrete operation later exceeds accepted scope, Session and Kernel will interrupt for user approval; do not pre-ask for routine permission or scope expansion.',
         'If the current task is already sufficiently satisfied and no Kernel action is needed, return taskOutcome with status="modelJudgedSufficient".',
         'Keep visible reasoning/progress action-oriented: state the current action or task outcome, not protocol, tool, permission, or evidence-policy deliberation.',
@@ -326,4 +332,5 @@ export class ContextFrameBuilder {
       'Do not infer execution facts or permissions from memory.',
     ].join(' ');
   }
+
 }

@@ -8,6 +8,10 @@ import type { ProposalEnvelope } from '../../protocol/types.js';
 import type { ResourcePacket } from '../../context/types.js';
 import type { PromptEnvelope } from '../../prompt/types.js';
 import { SessionDriverRepairRuntimeAccessor } from '../runFrame.js';
+import {
+  normalizeProposalRouterResult,
+  type ProposalRouterResult,
+} from './proposalRouter.js';
 
 export interface ActionProposalSubmitterInput {
   profileId?: string;
@@ -46,14 +50,14 @@ export interface ActionProposalSubmitterPorts<
     proposal: ProposalEnvelope,
     reasons: string[],
     fallback: AgentSessionResult
-  ): Promise<AgentSessionResult>;
+  ): Promise<AgentSessionResult | ProposalRouterResult>;
   submitAcceptedPlanActionProposal(
     input: Input,
     state: State,
     prompt: PromptEnvelope,
     proposal: ProposalEnvelope,
     fallback: AgentSessionResult
-  ): Promise<AgentSessionResult>;
+  ): Promise<AgentSessionResult | ProposalRouterResult>;
   submitProposal(state: State, proposal: ProposalEnvelope, requestId: string): Promise<KernelReply>;
   findReviewReport(events: unknown[]): Record<string, unknown> | undefined;
   appendTrace(state: State, stage: string, payload: Record<string, unknown>): Promise<void>;
@@ -113,23 +117,34 @@ export class ActionProposalSubmitter<
     prompt: PromptEnvelope,
     proposal: ProposalEnvelope,
     fallback: AgentSessionResult
-  ): Promise<AgentSessionResult> {
+  ): Promise<ProposalRouterResult> {
     if (proposal.kind === 'taskOutcome' && state.acceptedImplementationPlan) {
-      return this.ports.submitAcceptedPlanActionProposal(input, state, prompt, proposal, fallback);
+      return normalizeProposalRouterResult(
+        await this.ports.submitAcceptedPlanActionProposal(input, state, prompt, proposal, fallback)
+      );
     }
     const actionBundle = this.ports.readActionBundle(proposal);
     if (actionBundle && state.acceptedImplementationPlan) {
-      return this.ports.submitAcceptedPlanActionProposal(input, state, prompt, proposal, fallback);
+      return normalizeProposalRouterResult(
+        await this.ports.submitAcceptedPlanActionProposal(input, state, prompt, proposal, fallback)
+      );
     }
     if (actionBundle) {
       const admissionBatch = this.ports.actionBundleAdmissionBatch(proposal);
       const admissionReasons = this.ports.deleteAdmissionReasons(admissionBatch, state.resourcePackets);
       if (admissionReasons.length) {
-        return this.ports.repairActionBundleAdmission(input, state, prompt, proposal, admissionReasons, fallback);
+        return normalizeProposalRouterResult(
+          await this.ports.repairActionBundleAdmission(input, state, prompt, proposal, admissionReasons, fallback)
+        );
       }
     }
     const proposalReply = await this.ports.submitProposal(state, proposal, this.ports.createId('proposal-submit'));
-    if (!actionBundle) return await this.ports.appendProjectedKernelEvents(state.sessionId, proposalReply) ?? fallback;
+    if (!actionBundle) {
+      return {
+        kind: 'return',
+        result: await this.ports.appendProjectedKernelEvents(state.sessionId, proposalReply) ?? fallback,
+      };
+    }
 
     const reviewReport = this.ports.findReviewReport(proposalReply.events);
     await this.ports.appendTrace(state, 'plan_review_report', {
@@ -138,7 +153,7 @@ export class ActionProposalSubmitter<
       events: proposalReply.events,
     });
     if (!reviewReport) {
-      return this.ports.append(state.sessionId, [
+      return { kind: 'return', result: await this.ports.append(state.sessionId, [
         this.ports.finalDiagnosticEvent(
           state.sessionId,
           this.ports.diagnostic(
@@ -148,7 +163,7 @@ export class ActionProposalSubmitter<
           this.ports.now(),
           this.ports.createId('plan-review-missing')
         ),
-      ]);
+      ]) };
     }
     const repairRuntime = new SessionDriverRepairRuntimeAccessor(state);
     if (this.ports.needsRepair(reviewReport) && !repairRuntime.attempted('planReviewRepairAttempted')) {
@@ -166,7 +181,7 @@ export class ActionProposalSubmitter<
         repaired = await this.repairPlanReview(input, state, prompt, proposal, reviewReport);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        return this.ports.append(state.sessionId, [
+        return { kind: 'return', result: await this.ports.append(state.sessionId, [
           this.ports.finalDiagnosticEvent(
             state.sessionId,
             this.ports.diagnostic(
@@ -177,30 +192,30 @@ export class ActionProposalSubmitter<
             this.ports.now(),
             this.ports.createId('plan-review-repair-failed')
           ),
-        ]);
+        ]) };
       }
       if (repaired.kind === 'actionBundle') {
         return this.submit(input, state, prompt, repaired, fallback);
       }
       if (repaired.kind === 'answer') {
-        return this.ports.append(state.sessionId, [
+        return { kind: 'return', result: await this.ports.append(state.sessionId, [
           this.ports.answerEvent(state.sessionId, repaired, this.ports.now(), this.ports.createId('answer')),
-        ]);
+        ]) };
       }
-      return this.submitNonExecutable(state, repaired, fallback);
+      return { kind: 'return', result: await this.submitNonExecutable(state, repaired, fallback) };
     }
 
     let result = await this.ports.appendProjectedKernelEvents(state.sessionId, proposalReply);
     if (this.ports.denied(reviewReport)) {
       const reasons = this.ports.diagnosticSummary(reviewReport);
-      return this.ports.append(state.sessionId, [
+      return { kind: 'return', result: await this.ports.append(state.sessionId, [
         this.ports.finalDiagnosticEvent(
           state.sessionId,
           this.ports.diagnostic('planRejected', `Kernel rejected the plan: ${reasons}`, { reasons }),
           this.ports.now(),
           this.ports.createId('plan-review-denied')
         ),
-      ]);
+      ]) };
     }
     const planCard = this.ports.planCardEvent({
       state,
@@ -228,7 +243,7 @@ export class ActionProposalSubmitter<
         id: this.ports.createId('session-run-waiting-plan'),
       }),
     ]);
-    return result ?? fallback;
+    return { kind: 'return', result: result ?? fallback };
   }
 
   async submitNonExecutable(

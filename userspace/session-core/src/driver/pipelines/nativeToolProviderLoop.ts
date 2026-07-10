@@ -25,6 +25,15 @@ export interface NativeToolProviderPipelineLike<
   runWithNativeTools(input: ProviderPipelineRunTurnInput<TState, TTurn>): Promise<TTurn>;
 }
 
+export interface NativeToolProviderResumeSignal {
+  readonly kind: 'providerResume';
+}
+
+export interface NativeToolProviderLoopState extends NativeToolTurnHandlerState {
+  nativeToolResumeMessages?: LlmChatRequest['messages'];
+  nativeToolResumeRound?: number;
+}
+
 export interface NativeToolProviderTurnHandlerLike<
   TState extends NativeToolTurnHandlerState,
   TPrompt,
@@ -42,7 +51,7 @@ export interface NativeToolProviderResumeMessageBuilderLike<TTurn extends Native
 }
 
 export interface NativeToolProviderLoopDependencies<
-  TState extends NativeToolTurnHandlerState,
+  TState extends NativeToolProviderLoopState,
   TPrompt,
   TTurn extends ProviderPipelineTurn & NativeToolTurnResult,
 > {
@@ -52,7 +61,7 @@ export interface NativeToolProviderLoopDependencies<
 }
 
 export interface NativeToolProviderLoopInput<
-  TState extends NativeToolTurnHandlerState,
+  TState extends NativeToolProviderLoopState,
   TPrompt,
   TTurn extends ProviderPipelineTurn & NativeToolTurnResult,
 > {
@@ -74,46 +83,59 @@ export interface NativeToolProviderLoopInput<
 }
 
 export class NativeToolProviderLoop<
-  TState extends NativeToolTurnHandlerState,
+  TState extends NativeToolProviderLoopState,
   TPrompt,
   TTurn extends ProviderPipelineTurn & NativeToolTurnResult,
 > {
   constructor(private readonly dependencies: NativeToolProviderLoopDependencies<TState, TPrompt, TTurn>) {}
 
-  async run(input: NativeToolProviderLoopInput<TState, TPrompt, TTurn>): Promise<string | ProposalEnvelope> {
-    let currentMessages = this.dependencies.providerPipeline.messages(input.contract);
-    for (let round = 0; ; round += 1) {
-      const stage = round === 0 ? 'provider_call' : `provider_tool_resume_${round}`;
-      const effectiveTurn = await this.dependencies.providerPipeline.runWithNativeTools({
-        profileId: input.profileId,
-        state: input.state,
-        contract: input.contract,
-        stage,
-        messages: currentMessages,
-        options: {
-          tools: input.providerTools,
-        },
-        runTurn: input.runTurn,
-        isEmptyResponseError: input.isEmptyResponseError,
-      });
-      if (effectiveTurn.toolCalls.length === 0) return effectiveTurn.content;
-
-      const handled = await this.dependencies.turnHandler.handle({
-        state: input.state,
-        prompt: input.prompt,
-        turn: effectiveTurn,
-        round,
-        ports: input.handlerPorts,
-      });
-      if (handled.kind === 'proposal') return handled.proposal;
-
-      currentMessages = this.dependencies.resumeMessageBuilder.nextMessages(
-        currentMessages,
-        effectiveTurn,
-        handled.toolMessages
-      );
-      const guidanceMessages = await input.consumeGuidanceMessages(input.state, stage);
-      currentMessages.push(...guidanceMessages);
+  async run(
+    input: NativeToolProviderLoopInput<TState, TPrompt, TTurn>
+  ): Promise<string | ProposalEnvelope | NativeToolProviderResumeSignal> {
+    const round = input.state.nativeToolResumeRound ?? 0;
+    const currentMessages = input.state.nativeToolResumeMessages
+      ?? this.dependencies.providerPipeline.messages(input.contract);
+    const stage = round === 0 ? 'provider_call' : `provider_tool_resume_${round}`;
+    const effectiveTurn = await this.dependencies.providerPipeline.runWithNativeTools({
+      profileId: input.profileId,
+      state: input.state,
+      contract: input.contract,
+      stage,
+      messages: currentMessages,
+      options: {
+        tools: input.providerTools,
+      },
+      runTurn: input.runTurn,
+      isEmptyResponseError: input.isEmptyResponseError,
+    });
+    if (effectiveTurn.toolCalls.length === 0) {
+      input.state.nativeToolResumeMessages = undefined;
+      input.state.nativeToolResumeRound = 0;
+      return effectiveTurn.content;
     }
+
+    const handled = await this.dependencies.turnHandler.handle({
+      state: input.state,
+      prompt: input.prompt,
+      turn: effectiveTurn,
+      round,
+      ports: input.handlerPorts,
+    });
+    if (handled.kind === 'proposal') {
+      input.state.nativeToolResumeMessages = undefined;
+      input.state.nativeToolResumeRound = 0;
+      return handled.proposal;
+    }
+
+    const nextMessages = this.dependencies.resumeMessageBuilder.nextMessages(
+      currentMessages,
+      effectiveTurn,
+      handled.toolMessages
+    );
+    const guidanceMessages = await input.consumeGuidanceMessages(input.state, stage);
+    nextMessages.push(...guidanceMessages);
+    input.state.nativeToolResumeMessages = nextMessages;
+    input.state.nativeToolResumeRound = round + 1;
+    return { kind: 'providerResume' };
   }
 }

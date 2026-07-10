@@ -31,6 +31,12 @@ export function buildProviderTurnSnapshot(contract: DriverProviderTurnFrame): Pr
     (total, frame) => total + frame.dynamicUseOverlapCharLength + frame.dynamicSummaryOverlapCharLength,
     0
   );
+  const currentTaskEvidenceLineCount = frames.reduce((total, frame) => total + frame.currentTaskEvidenceLineCount, 0);
+  const currentTaskEvidenceCoveredCount = frames.reduce((total, frame) => total + frame.currentTaskEvidenceCoveredCount, 0);
+  const currentTaskEvidenceUncoveredCount = frames.reduce((total, frame) => total + frame.currentTaskEvidenceUncoveredCount, 0);
+  const currentTaskEvidenceFullTextCount = frames.reduce((total, frame) => total + frame.currentTaskEvidenceFullTextCount, 0);
+  const currentTaskEvidenceTargets = uniqueSorted(frames.flatMap((frame) => frame.currentTaskEvidenceTargets)).slice(0, 12);
+  const currentTaskEvidenceMatchedRefs = uniqueSorted(frames.flatMap((frame) => frame.currentTaskEvidenceMatchedRefs)).slice(0, 12);
   return {
     schemaVersion: 'deepcode.session.provider-turn-snapshot.v1',
     contractId: contract.contractId,
@@ -55,6 +61,12 @@ export function buildProviderTurnSnapshot(contract: DriverProviderTurnFrame): Pr
     dynamicDialogueFrameTextOccurrences: exactOccurrenceCount(frameText, dynamicDialogueSummary),
     dynamicFrameOverlapCharLength,
     dynamicFrameOverlapRatio: frameTextCharLength > 0 ? dynamicFrameOverlapCharLength / frameTextCharLength : 0,
+    currentTaskEvidenceLineCount,
+    currentTaskEvidenceCoveredCount,
+    currentTaskEvidenceUncoveredCount,
+    currentTaskEvidenceFullTextCount,
+    currentTaskEvidenceTargets,
+    currentTaskEvidenceMatchedRefs,
     segmentOrder: contextAssembly?.segmentOrder ? [...contextAssembly.segmentOrder] : [],
     segments: contextAssembly?.segments.map(snapshotSegment) ?? [],
     dynamicAppendLog: contextAssembly?.dynamicAppendLog.map(snapshotDynamicAppendLogEntry) ?? [],
@@ -135,6 +147,7 @@ function snapshotDynamicAppendLogEntry(
 }
 
 function snapshotFrame(frame: ProviderContextFrame, index: number, dynamicSuffix: string): ProviderTurnSnapshotFrame {
+  const currentTaskEvidence = currentTaskEvidenceStats(frame.summary ?? '');
   return {
     index,
     kind: frame.kind,
@@ -149,7 +162,49 @@ function snapshotFrame(frame: ProviderContextFrame, index: number, dynamicSuffix
     dynamicSummaryOverlapCharLength: exactOverlapCharLength(dynamicSuffix, frame.summary ?? ''),
     refsCount: frame.refs?.length ?? 0,
     dataHash: frame.data === undefined ? undefined : stableHash(JSON.stringify(frame.data)),
+    currentTaskEvidenceLineCount: currentTaskEvidence.lineCount,
+    currentTaskEvidenceCoveredCount: currentTaskEvidence.coveredCount,
+    currentTaskEvidenceUncoveredCount: currentTaskEvidence.uncoveredCount,
+    currentTaskEvidenceFullTextCount: currentTaskEvidence.fullTextCount,
+    currentTaskEvidenceTargets: currentTaskEvidence.targets,
+    currentTaskEvidenceMatchedRefs: currentTaskEvidence.matchedRefs,
   };
+}
+
+function currentTaskEvidenceStats(summary: string): {
+  lineCount: number;
+  coveredCount: number;
+  uncoveredCount: number;
+  fullTextCount: number;
+  targets: string[];
+  matchedRefs: string[];
+} {
+  const evidenceLines = summary.split('\n').filter((line) => line.includes('currentTaskEvidence target='));
+  return {
+    lineCount: evidenceLines.length,
+    coveredCount: evidenceLines.filter((line) => line.includes('covered=true')).length,
+    uncoveredCount: evidenceLines.filter((line) => line.includes('covered=false')).length,
+    fullTextCount: evidenceLines.filter((line) => line.includes('fullText=true')).length,
+    targets: uniqueSorted(evidenceLines.map((line) => currentTaskEvidenceField(line, 'target')).filter(Boolean)).slice(0, 12),
+    matchedRefs: uniqueSorted(evidenceLines.flatMap((line) =>
+      currentTaskEvidenceField(line, 'matched').split(',').filter((value) => value && value !== 'none')
+    )).slice(0, 12),
+  };
+}
+
+function currentTaskEvidenceField(line: string, key: string): string {
+  const prefix = `${key}=`;
+  for (const segment of line.split('; ')) {
+    const index = segment.indexOf(prefix);
+    if (index === 0 || (index > 0 && segment[index - 1] === ' ')) {
+      return segment.slice(index + prefix.length).trim();
+    }
+  }
+  return '';
+}
+
+function uniqueSorted(values: readonly string[]): string[] {
+  return [...new Set(values.filter(Boolean))].sort();
 }
 
 function exactOverlapCharLength(haystack: string, needle: string): number {

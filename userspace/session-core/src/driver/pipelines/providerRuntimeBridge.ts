@@ -14,6 +14,7 @@ import type {
   NativeToolProviderCoordinator,
   NativeToolProviderCoordinatorState,
 } from './nativeToolProviderCoordinator.js';
+import type { NativeToolProviderResumeSignal } from './nativeToolProviderLoop.js';
 import type {
   ProposalOnlyProviderRunner,
   ProposalOnlyProviderTurn,
@@ -68,7 +69,7 @@ export class ProviderRuntimeBridge<
     state: State;
     prompt: PromptEnvelope;
     contract: DriverProviderTurnFrame;
-  }): Promise<string | ProposalEnvelope> {
+  }): Promise<string | ProposalEnvelope | NativeToolProviderResumeSignal> {
     return this.dependencies.nativeToolProviderCoordinator.run(input);
   }
 

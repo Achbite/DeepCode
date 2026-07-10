@@ -1,5 +1,4 @@
 import type {
-  AgentContextAttachment,
   AgentEvent,
   AgentSessionResult,
   AgentWorkspaceBinding,
@@ -14,7 +13,11 @@ import type { InteractionOverlayContext, SessionTurnPhase } from '../pipelines/i
 import type { PlanContext, PlanContextIndex } from '../proposal/planContextIndex.js';
 import type { PlanProjectionBuilder } from '../projection/planProjectionBuilder.js';
 import type { InterventionLevel, ReviewContinuationMode } from '../types.js';
-import { decisionContinuationInput } from '../runContinuation.js';
+import {
+  decisionContinuationInput,
+  returnSessionResult,
+  type SessionLoopControlResult,
+} from '../runContinuation.js';
 
 export type PlanDecisionHandlerDecision = 'accept' | 'reject' | 'revise';
 export type PlanDecisionHandlerContinuationMode = ReviewContinuationMode;
@@ -37,25 +40,6 @@ export interface PlanDecisionHandlerInput {
   interactionOverlay?: InteractionOverlayContext;
 }
 
-export interface PlanDecisionResumeInput {
-  sessionId: string;
-  content: string;
-  attachments?: AgentContextAttachment[];
-  existingEvents?: AgentEvent[];
-  workspaceBinding?: AgentWorkspaceBinding;
-  projectWorkingDirectory?: ProjectWorkingDirectory;
-  profileId?: string;
-  workflow?: string;
-  appendUserMessage: false;
-  requirementConfirmationMode: 'off';
-  reviewContinuationMode?: PlanDecisionHandlerContinuationMode;
-  interventionLevel?: PlanDecisionHandlerInterventionLevel;
-  projectMemoryMode?: ProjectMemoryMode;
-  resumeResourcePackets?: boolean;
-  acceptedImplementationPlan?: AcceptedImplementationPlanContext;
-  interactionOverlay?: InteractionOverlayContext;
-}
-
 export interface RecoveredAcceptedPlanContext {
   plan: PlanContext;
   acceptedPlan: AcceptedImplementationPlanContext;
@@ -72,23 +56,22 @@ export interface PlanDecisionRunCommand {
 }
 
 export type PlanDecisionRunEffect =
-  | { readonly kind: 'planDecisionNoop'; readonly result: AgentSessionResult }
-  | { readonly kind: 'planAcceptedForImplementation'; readonly result: AgentSessionResult }
-  | { readonly kind: 'planAcceptedForActionBundle'; readonly result: AgentSessionResult }
-  | { readonly kind: 'planRevisionRequested'; readonly result: AgentSessionResult }
-  | { readonly kind: 'planRejected'; readonly result: AgentSessionResult };
+  | { readonly kind: 'planDecisionNoop'; readonly control: SessionLoopControlResult }
+  | { readonly kind: 'planAcceptedForImplementation'; readonly control: SessionLoopControlResult }
+  | { readonly kind: 'planAcceptedForActionBundle'; readonly control: SessionLoopControlResult }
+  | { readonly kind: 'planRevisionRequested'; readonly control: SessionLoopControlResult }
+  | { readonly kind: 'planRejected'; readonly control: SessionLoopControlResult };
 
 export interface PlanDecisionHandlerPorts {
   now(): string;
   createId(prefix: string): string;
   append(sessionId: string, events: AgentEvent[]): Promise<AgentSessionResult>;
-  resumeUserTurn(input: PlanDecisionResumeInput): Promise<AgentSessionResult>;
   executeAcceptedActionBundlePlan(
     input: PlanDecisionHandlerInput,
     plan: PlanContext,
     initialResult: AgentSessionResult,
     acceptedOverlay?: RecoveredAcceptedPlanContext
-  ): Promise<AgentSessionResult>;
+  ): Promise<SessionLoopControlResult>;
   activeDriverInteraction(events: AgentEvent[]): DriverInteractionRef | null;
   executionRootFromDecision(input: PlanDecisionHandlerInput, events: AgentEvent[]): AcceptedImplementationPlanExecutionRoot | undefined;
   buildAcceptedImplementationPlan(input: {
@@ -136,21 +119,21 @@ export interface PlanDecisionHandlerPorts {
 export class PlanDecisionHandler {
   constructor(private readonly ports: PlanDecisionHandlerPorts) {}
 
-  async resolve(input: PlanDecisionHandlerInput): Promise<AgentSessionResult> {
+  async resolve(input: PlanDecisionHandlerInput): Promise<SessionLoopControlResult> {
     const effect = await this.execute({ kind: 'resolvePlanDecision', input });
-    return effect.result;
+    return effect.control;
   }
 
   private async execute(command: PlanDecisionRunCommand): Promise<PlanDecisionRunEffect> {
     const input = command.input;
     const events = input.existingEvents ?? [];
     if (!this.activePlanMatches(input, events)) {
-      return { kind: 'planDecisionNoop', result: await this.appendNoop(input) };
+      return { kind: 'planDecisionNoop', control: returnSessionResult(await this.appendNoop(input)) };
     }
 
     const plan = this.ports.planIndex.findPlanCard(events, input.runId, input.targetId);
     if (!plan || this.ports.planIndex.alreadyResolved(events, plan)) {
-      return { kind: 'planDecisionNoop', result: await this.appendNoop(input) };
+      return { kind: 'planDecisionNoop', control: returnSessionResult(await this.appendNoop(input)) };
     }
 
     if (input.decision !== 'accept') {
@@ -180,20 +163,25 @@ export class PlanDecisionHandler {
         interventionLevel: input.interventionLevel,
         executionRoot,
       });
-      result = await this.ports.resumeUserTurn(decisionContinuationInput(input, {
-        content: this.ports.executionRequest(plan, acceptedPlan, input.guidance),
-        attachments: acceptedPlan.executionRoot ? [acceptedPlan.executionRoot.attachment] : [],
-        existingEvents: result.events,
-        reviewContinuationMode: input.reviewContinuationMode,
-        resumeResourcePackets: true,
-        acceptedImplementationPlan: acceptedPlan,
-        interactionOverlay: plan.interactionOverlay ?? input.interactionOverlay,
-      }));
-      return { kind: 'planAcceptedForImplementation', result };
+      return {
+        kind: 'planAcceptedForImplementation',
+        control: {
+          kind: 'resume',
+          input: decisionContinuationInput(input, {
+            content: this.ports.executionRequest(plan, acceptedPlan, input.guidance),
+            attachments: acceptedPlan.executionRoot ? [acceptedPlan.executionRoot.attachment] : [],
+            existingEvents: result.events,
+            reviewContinuationMode: input.reviewContinuationMode,
+            resumeResourcePackets: true,
+            acceptedImplementationPlan: acceptedPlan,
+            interactionOverlay: plan.interactionOverlay ?? input.interactionOverlay,
+          }),
+        },
+      };
     }
     const acceptedOverlay = this.ports.recoverAcceptedPlanFromOverlay(input, result.events, plan.interactionOverlay ?? input.interactionOverlay);
-    result = await this.ports.executeAcceptedActionBundlePlan(input, plan, result, acceptedOverlay);
-    return { kind: 'planAcceptedForActionBundle', result };
+    const control = await this.ports.executeAcceptedActionBundlePlan(input, plan, result, acceptedOverlay);
+    return { kind: 'planAcceptedForActionBundle', control };
   }
 
   private activePlanMatches(input: PlanDecisionHandlerInput, events: AgentEvent[]): boolean {
@@ -241,14 +229,19 @@ export class PlanDecisionHandler {
       }),
     ]);
     if (input.decision === 'revise') {
-      result = await this.ports.resumeUserTurn(decisionContinuationInput(input, {
-        content: this.ports.planRevisionRequest({ plan, guidance: input.guidance }),
-        attachments: [],
-        existingEvents: result.events,
-        reviewContinuationMode: input.reviewContinuationMode,
-        interactionOverlay: plan.interactionOverlay ?? input.interactionOverlay,
-      }));
-      return { kind: 'planRevisionRequested', result };
+      return {
+        kind: 'planRevisionRequested',
+        control: {
+          kind: 'resume',
+          input: decisionContinuationInput(input, {
+            content: this.ports.planRevisionRequest({ plan, guidance: input.guidance }),
+            attachments: [],
+            existingEvents: result.events,
+            reviewContinuationMode: input.reviewContinuationMode,
+            interactionOverlay: plan.interactionOverlay ?? input.interactionOverlay,
+          }),
+        },
+      };
     }
 
     if (input.decision === 'reject') {
@@ -271,6 +264,6 @@ export class PlanDecisionHandler {
         }),
       ]) ?? result;
     }
-    return { kind: 'planRejected', result };
+    return { kind: 'planRejected', control: returnSessionResult(result) };
   }
 }

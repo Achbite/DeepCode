@@ -17,9 +17,10 @@ import {
   ProviderTurnContextCoordinator,
 } from '../driver/context/index.js';
 import { HookPolicy, HookRegistry, HookRuntime } from '../driver/hooks/index.js';
+import { RequirementConfirmationCoordinator } from '../driver/interactions/index.js';
 import { SessionProgressProjectionBuilder } from '../driver/projection/index.js';
 import { routeProposalKind } from '../driver/proposal/proposalRouter.js';
-import { acceptedPlanContinuationInput, decisionContinuationInput, SameLoopContinuation } from '../driver/runContinuation.js';
+import { acceptedPlanContinuationInput, decisionContinuationInput } from '../driver/runContinuation.js';
 import { RunEngine } from '../driver/runEngine.js';
 import { buildTaskLedgerSnapshot } from '../run-state/index.js';
 import {
@@ -191,28 +192,10 @@ export function assertAcceptedPlanContinuationDefaultsResourceResume(): void {
   assertEqual(input.acceptedImplementationPlan, acceptedPlan, 'accepted-plan continuation carries accepted plan authority');
 }
 
-export async function assertSameLoopContinuationUsesSingleResumePort(): Promise<void> {
-  const token = randomSmokeToken('same-loop-port');
-  const calls: string[] = [];
-  const continuation = new SameLoopContinuation<{ sessionId: string; marker: string }>(async (input) => {
-    calls.push(`${input.sessionId}:${input.marker}`);
-    return genericSessionResult(input.sessionId);
-  });
-
-  const first = await continuation.resumeUserTurn({ sessionId: `session-${token}`, marker: 'resume' });
-  const second = await continuation.runUserTurn({ sessionId: `session-${token}`, marker: 'run' });
-  assertEqual(first.session.id, `session-${token}`, 'same-loop resume returns the shared continuation result');
-  assertEqual(second.session.id, `session-${token}`, 'same-loop run returns the shared continuation result');
-  assertEqual(
-    calls.join('|'),
-    `session-${token}:resume|session-${token}:run`,
-    'same-loop continuation keeps resume and run ports on one lifecycle entry'
-  );
-}
-
 export async function assertRunEngineContinuationUsesSameLifecycle(): Promise<void> {
   const token = randomSmokeToken('run-engine-continuation');
   const calls: string[] = [];
+  const proposal = genericProposal(`answer-${token}`, 'answer');
   const result: AgentSessionResult = {
     session: {
       id: `session-${token}`,
@@ -227,8 +210,11 @@ export async function assertRunEngineContinuationUsesSameLifecycle(): Promise<vo
     { sessionId: string },
     { sessionId: string; runId: string; phase: string }
   >({
-    initialize: async (input) => {
-      calls.push(`initialize:${input.sessionId}`);
+    initialize: async () => {
+      throw new Error('continuation smoke should not initialize a new run');
+    },
+    resume: async (input) => {
+      calls.push(`resume:${input.sessionId}`);
       return {
         state: { sessionId: input.sessionId, runId: `run-${token}`, phase: 'initialized' },
         lastResult: result,
@@ -243,17 +229,84 @@ export async function assertRunEngineContinuationUsesSameLifecycle(): Promise<vo
     },
     runProviderTurn: async ({ state }) => {
       calls.push(`provider:${state.phase}`);
+      return {
+        kind: 'directiveReady',
+        prompt: { messages: [] } as never,
+        lastResult: result,
+        proposal,
+        directive: routeProposalKind(proposal),
+      };
+    },
+    executeDirective: async ({ routed }) => {
+      calls.push(`directive:${routed?.kind}`);
       return { kind: 'return', result };
+    },
+    assembleReview: async () => {
+      throw new Error('continuation smoke should not assemble review');
     },
   });
 
-  const output = await engine.continueSameLoop({ sessionId: `session-${token}` });
+  const output = await engine.resume({ sessionId: `session-${token}` });
   assertEqual(output, result, 'RunEngine continuation returns provider cycle result');
   assertEqual(
     calls.join('|'),
-    `initialize:session-${token}|maybe-requirement|provider:initialized`,
-    'RunEngine continuation enters the same lifecycle through an explicit command'
+    `resume:session-${token}|maybe-requirement|provider:initialized|directive:answer`,
+    'RunEngine continuation rehydrates the same lifecycle through an explicit command'
   );
+}
+
+export async function assertRunEngineOwnsNativeProviderResume(): Promise<void> {
+  const token = randomSmokeToken('run-engine-native-resume');
+  const initial = genericSessionResult(`session-${token}`);
+  const final = genericSessionResult(`session-final-${token}`);
+  const proposal = genericProposal(`answer-${token}`, 'answer');
+  let providerTurns = 0;
+  let directiveExecutions = 0;
+  const engine = new RunEngine<
+    { sessionId: string },
+    { sessionId: string; runId: string; phase: string }
+  >({
+    initialize: async (input) => ({
+      state: { sessionId: input.sessionId, runId: `run-${token}`, phase: 'initialized' },
+      lastResult: initial,
+    }),
+    resume: async () => {
+      throw new Error('native provider resume stays inside the active RunEngine');
+    },
+    shouldBuildRequirementConfirmation: () => false,
+    waitForRequirementDecision: async () => {
+      throw new Error('native provider resume does not open requirement confirmation');
+    },
+    runProviderTurn: async () => {
+      providerTurns += 1;
+      return providerTurns === 1
+        ? {
+          kind: 'directiveReady',
+          prompt: { messages: [] } as never,
+          lastResult: initial,
+          directive: { kind: 'providerResume' },
+        }
+        : {
+          kind: 'directiveReady',
+          prompt: { messages: [] } as never,
+          lastResult: initial,
+          proposal,
+          directive: routeProposalKind(proposal),
+        };
+    },
+    executeDirective: async () => {
+      directiveExecutions += 1;
+      return { kind: 'return', result: final };
+    },
+    assembleReview: async () => {
+      throw new Error('native provider resume test does not assemble Review');
+    },
+  });
+
+  const output = await engine.run({ sessionId: `session-${token}` });
+  assertEqual(output, final, 'RunEngine returns the proposal result after native provider resume');
+  assertEqual(providerTurns, 2, 'RunEngine owns both provider steps around the native read');
+  assertEqual(directiveExecutions, 1, 'native provider resume does not enter proposal side-effect execution');
 }
 
 export async function assertRunEngineContinuesOnlyForResourceRequestRoute(): Promise<void> {
@@ -263,6 +316,7 @@ export async function assertRunEngineContinuesOnlyForResourceRequestRoute(): Pro
   const resourceProposal = genericProposal(`resource-${token}`, 'resourceRequest');
   const answerProposal = genericProposal(`answer-${token}`, 'answer');
   let providerTurns = 0;
+  let directiveTurns = 0;
   const engine = new RunEngine<
     { sessionId: string },
     { sessionId: string; runId: string; phase: string }
@@ -271,6 +325,9 @@ export async function assertRunEngineContinuesOnlyForResourceRequestRoute(): Pro
       state: { sessionId: input.sessionId, runId: `run-${token}`, phase: 'initialized' },
       lastResult: firstResult,
     }),
+    resume: async () => {
+      throw new Error('resource continuation smoke should not resume an external decision');
+    },
     shouldBuildRequirementConfirmation: () => false,
     waitForRequirementDecision: async () => {
       throw new Error('resource continuation smoke should not wait for requirement decision');
@@ -279,24 +336,36 @@ export async function assertRunEngineContinuesOnlyForResourceRequestRoute(): Pro
       providerTurns += 1;
       if (providerTurns === 1) {
         return {
-          kind: 'continue',
+          kind: 'directiveReady',
+          prompt: { messages: [] } as never,
           lastResult: firstResult,
           proposal: resourceProposal,
-          routed: routeProposalKind(resourceProposal),
+          directive: routeProposalKind(resourceProposal),
         };
       }
       return {
-        kind: 'return',
-        result: finalResult,
+        kind: 'directiveReady',
+        prompt: { messages: [] } as never,
+        lastResult: firstResult,
         proposal: answerProposal,
-        routed: routeProposalKind(answerProposal),
+        directive: routeProposalKind(answerProposal),
       };
+    },
+    executeDirective: async ({ routed }) => {
+      directiveTurns += 1;
+      return routed?.kind === 'resourceRequest'
+        ? { kind: 'continue', lastResult: firstResult }
+        : { kind: 'return', result: finalResult };
+    },
+    assembleReview: async () => {
+      throw new Error('resource continuation smoke should not assemble review');
     },
   });
 
   const output = await engine.run({ sessionId: `session-${token}` });
   assertEqual(output, finalResult, 'RunEngine resumes provider after routed resourceRequest continuation');
   assertEqual(providerTurns, 2, 'RunEngine limits continue loops to explicit resourceRequest evidence refresh');
+  assertEqual(directiveTurns, 2, 'RunEngine executes each admitted directive through its command loop');
 }
 
 export async function assertRunEngineRejectsUnexpectedContinueRoute(): Promise<void> {
@@ -311,28 +380,91 @@ export async function assertRunEngineRejectsUnexpectedContinueRoute(): Promise<v
       state: { sessionId: input.sessionId, runId: `run-${token}`, phase: 'initialized' },
       lastResult: result,
     }),
+    resume: async () => {
+      throw new Error('route guard smoke should not resume an external decision');
+    },
     shouldBuildRequirementConfirmation: () => false,
     waitForRequirementDecision: async () => {
       throw new Error('route guard smoke should not wait for requirement decision');
     },
     runProviderTurn: async () => ({
-      kind: 'continue',
+      kind: 'directiveReady',
+      prompt: { messages: [] } as never,
       lastResult: result,
       proposal: answerProposal,
-      routed: routeProposalKind(answerProposal),
+      directive: routeProposalKind(answerProposal),
     }),
+    executeDirective: async () => ({ kind: 'continue', lastResult: result }),
+    assembleReview: async () => {
+      throw new Error('route guard smoke should not assemble review');
+    },
   });
 
   try {
     await engine.run({ sessionId: `session-${token}` });
   } catch (error) {
     assert(
-      error instanceof Error && error.message.includes('provider continue requires resourceRequest route'),
-      'RunEngine rejects non-resourceRequest provider continue results'
+      error instanceof Error && error.message.includes('directive continue requires resourceRequest or action'),
+      'RunEngine rejects non-resourceRequest directive continue results'
     );
     return;
   }
   throw new Error('expected RunEngine to reject non-resourceRequest provider continue results');
+}
+
+export async function assertRunEngineOwnsReviewAssembly(): Promise<void> {
+  const token = randomSmokeToken('run-engine-review');
+  const initialResult = genericSessionResult(`session-${token}`);
+  const reviewResult = genericSessionResult(`session-review-${token}`);
+  const proposal = genericProposal(`action-${token}`, 'actionBundle');
+  let initializeCalls = 0;
+  let reviewCalls = 0;
+  const reviewRequest = {
+    sessionId: initialResult.session.id,
+    runId: `run-${token}`,
+    planId: `plan-${token}`,
+    plan: {},
+    result: initialResult,
+    currentKernelEvents: [],
+    requestIdPrefix: `review-${token}`,
+  } as never;
+  const engine = new RunEngine<
+    { sessionId: string },
+    { sessionId: string; runId: string; phase: string }
+  >({
+    initialize: async (input) => {
+      initializeCalls += 1;
+      return {
+        state: { sessionId: input.sessionId, runId: `run-${token}`, phase: 'initialized' },
+        lastResult: initialResult,
+      };
+    },
+    resume: async () => {
+      throw new Error('review assembly smoke should not resume an external decision');
+    },
+    shouldBuildRequirementConfirmation: () => false,
+    waitForRequirementDecision: async () => {
+      throw new Error('review assembly smoke should not wait for requirement decision');
+    },
+    runProviderTurn: async () => ({
+      kind: 'directiveReady',
+      prompt: { messages: [] } as never,
+      lastResult: initialResult,
+      proposal,
+      directive: routeProposalKind(proposal),
+    }),
+    executeDirective: async () => ({ kind: 'assembleReview', request: reviewRequest }),
+    assembleReview: async (request) => {
+      reviewCalls += 1;
+      assertEqual(request, reviewRequest, 'RunEngine forwards the admitted review request unchanged');
+      return reviewResult;
+    },
+  });
+
+  const output = await engine.run({ sessionId: initialResult.session.id });
+  assertEqual(output, reviewResult, 'RunEngine returns the assembled review result');
+  assertEqual(initializeCalls, 1, 'review assembly does not initialize a second run');
+  assertEqual(reviewCalls, 1, 'RunEngine assembles review exactly once');
 }
 
 export function assertProviderTurnSnapshotRecordsContextAdmissionShape(): void {
@@ -430,7 +562,7 @@ export function assertProviderTurnSnapshotRecordsContextAdmissionShape(): void {
       taskId: `task-${token}`,
       taskTitle: `Task ${token}`,
       goal: `Handle target ${token}`,
-      targets: [`target-${token}.txt`],
+      targets: [`file-${token}.txt`, `dir-${token}/child-${token}.txt`],
       capabilities: ['fs.write'],
       taskOrder: [`task-${token}`],
       pendingTaskIds: [`task-${token}`],
@@ -452,7 +584,12 @@ export function assertProviderTurnSnapshotRecordsContextAdmissionShape(): void {
   assert(accessSummary.includes('range=full-or-directory'), 'provider turn access index records resource range identity');
   assert(accessSummary.includes('use=file text is available'), 'provider turn access index records file text reuse instruction');
   assert(accessSummary.includes('use=directory inventory is available for existence checks and taskPlan targets'), 'provider turn access index uses shared directory inventory reuse instruction');
+  assert(accessSummary.includes(`currentTaskEvidence target=file-${token}.txt`), 'provider turn access index records current task target coverage');
+  assert(accessSummary.includes(`currentTaskEvidence target=dir-${token}/child-${token}.txt`), 'provider turn access index records directory inventory target coverage');
+  assert(accessSummary.includes('covered=true'), 'provider turn access index marks covered current task target');
+  assert(accessSummary.includes('do not reread the same path/range'), 'provider turn access index discourages duplicate resource requests');
   const snapshot = buildProviderTurnSnapshot(contract);
+  const accessSnapshotFrame = snapshot.frames.find((frame) => frame.kind === 'AccessIndex');
   assertEqual(snapshot.schemaVersion, 'deepcode.session.provider-turn-snapshot.v1', 'provider turn snapshot has schema version');
   assertEqual(snapshot.segmentOrder.length > 0, true, 'provider turn snapshot records segment order');
   assertEqual(snapshot.segments.every((segment) => segment.contentHash.length > 0), true, 'provider turn snapshot records segment hashes');
@@ -487,6 +624,18 @@ export function assertProviderTurnSnapshotRecordsContextAdmissionShape(): void {
     true,
     'provider turn snapshot records access index summary length'
   );
+  assertEqual(accessSnapshotFrame?.currentTaskEvidenceLineCount, 2, 'provider turn snapshot records current task evidence line count');
+  assertEqual(accessSnapshotFrame?.currentTaskEvidenceCoveredCount, 2, 'provider turn snapshot records covered current task evidence');
+  assertEqual(accessSnapshotFrame?.currentTaskEvidenceUncoveredCount, 0, 'provider turn snapshot records uncovered current task evidence count');
+  assertEqual(accessSnapshotFrame?.currentTaskEvidenceFullTextCount, 1, 'provider turn snapshot records full-text current task evidence');
+  assertEqual(accessSnapshotFrame?.currentTaskEvidenceTargets.join(','), `dir-${token}/child-${token}.txt,file-${token}.txt`, 'provider turn snapshot records current task evidence target refs');
+  assertEqual(accessSnapshotFrame?.currentTaskEvidenceMatchedRefs.join(','), `dir-${token},file-${token}.txt`, 'provider turn snapshot records current task evidence matched refs');
+  assertEqual(snapshot.currentTaskEvidenceLineCount, 2, 'provider turn snapshot aggregates current task evidence line count');
+  assertEqual(snapshot.currentTaskEvidenceCoveredCount, 2, 'provider turn snapshot aggregates covered current task evidence');
+  assertEqual(snapshot.currentTaskEvidenceUncoveredCount, 0, 'provider turn snapshot aggregates uncovered current task evidence count');
+  assertEqual(snapshot.currentTaskEvidenceFullTextCount, 1, 'provider turn snapshot aggregates full-text current task evidence');
+  assertEqual(snapshot.currentTaskEvidenceTargets.join(','), `dir-${token}/child-${token}.txt,file-${token}.txt`, 'provider turn snapshot aggregates current task evidence target refs');
+  assertEqual(snapshot.currentTaskEvidenceMatchedRefs.join(','), `dir-${token},file-${token}.txt`, 'provider turn snapshot aggregates current task evidence matched refs');
   assertEqual(
     snapshot.frames.every((frame) => frame.useCharLength > 0),
     true,
@@ -1171,7 +1320,7 @@ export async function assertProviderTurnContextCoordinatorScopesAcceptedExecutio
     userRequest: `request ${token}`,
     stateContract: {
       stateId: `state-${token}`,
-      allowedProposals: ['resourceRequest', 'actionBundle', 'taskOutcome', 'diagnostic'],
+      allowedProposals: ['answer', 'resourceRequest', 'decisionRequest', 'taskPlan', 'implementationPlan', 'actionBundle', 'taskOutcome', 'diagnostic'],
       toolCatalogSnapshot: scopedCatalog,
     },
     memoryDocument: buildSessionMemoryDocument([]),
@@ -1200,7 +1349,12 @@ export async function assertProviderTurnContextCoordinatorScopesAcceptedExecutio
   });
   const dynamicPrompt = result.modelContextBundle.prompt.dynamicSuffix;
   const renderedContract = JSON.stringify(result.modelContextBundle.providerTurnContract);
+  const expectedExecutionKinds = ['actionBundle', 'resourceRequest', 'decisionRequest', 'taskOutcome', 'diagnostic'];
 
+  assertEqual(result.allowedProposals.join(','), expectedExecutionKinds.join(','), 'accepted execution exposes only execution proposal kinds');
+  assertEqual(result.modelContextBundle.providerTurnContract.allowedKinds.join(','), expectedExecutionKinds.join(','), 'accepted execution provider contract ignores stale planning and answer kinds');
+  assert(dynamicPrompt.includes('Current schema digest covers only: actionBundle, resourceRequest, decisionRequest, taskOutcome, diagnostic'), 'accepted execution prompt schema digest ignores stale planning and answer kinds');
+  assertEqual(dynamicPrompt.includes('Current schema digest covers only: answer'), false, 'accepted execution prompt schema digest does not expose answer');
   assertEqual(assemblyCapabilitySummary.includes(fullCatalogMarker), false, 'accepted execution does not pass the full capability catalog into ContextAdmission');
   assert(assemblyCapabilitySummary.includes('Accepted execution task tool intent summary.'), 'accepted execution passes a scoped capability summary');
   assert(assemblyCapabilitySummary.includes('currentTaskCapabilities=fs.write, process.exec'), 'scoped summary records current task capabilities');
@@ -1318,6 +1472,90 @@ export async function assertProviderTurnContextCoordinatorFiltersUnscopedGrantsT
     (contract.toolIntentTemplates[0]?.template as any)?.args?.path,
     currentTarget,
     'current task template path is exact'
+  );
+}
+
+export async function assertRequirementConfirmationRecordsModelContextBundle(): Promise<void> {
+  const token = randomSmokeToken('requirement-context');
+  const state: any = {
+    sessionId: `session-${token}`,
+    runId: `run-${token}`,
+    memoryDocument: buildSessionMemoryDocument([]),
+    memoryHints: [],
+    resourcePackets: [],
+    conversationRoots: [],
+    generatedArtifactEvidence: new Map(),
+  };
+  const coordinator = new RequirementConfirmationCoordinator<any, any>({
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${token}`,
+    assembleContext: (input) => assembleContext(input),
+    capabilityCatalogSummary: () => `catalog-${token}`,
+    collectUserGuidanceEvents: () => [],
+    buildProviderTurnContract: (input) =>
+      new ContextFrameBuilder().buildSessionProviderTurnContract(input),
+    callProviderAndParse: async (_input, observedState) => {
+      assertEqual(
+        observedState.providerTurnFrame?.snapshot?.turnMode,
+        'requirementDecision',
+        'requirement decision provider frame carries its snapshot before the provider call'
+      );
+      assertEqual(
+        observedState.modelContextBundle?.snapshot?.turnMode,
+        'requirementDecision',
+        'requirement decision records a model context bundle before the provider call'
+      );
+      assertEqual(
+        observedState.modelContextBundle?.providerTurnContract.allowedKinds.join(','),
+        'decisionRequest',
+        'requirement decision model context exposes only decisionRequest'
+      );
+      return genericProposal(token, 'decisionRequest');
+    },
+    createError: (_code, message) => new Error(message),
+    requirementRecordFromProposal: ({ userRequest }) => ({
+      requirementId: `requirement-${token}`,
+      sessionId: state.sessionId,
+      status: 'probing',
+      initialUserRequest: userRequest,
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+    }),
+    confirmationEvent: (input) => ({
+      id: input.id,
+      sessionId: input.sessionId,
+      ts: input.ts,
+      kind: 'requirement_confirmation',
+      payload: {
+        runId: input.runId,
+        requirementId: input.requirement.requirementId,
+        status: input.requirement.status,
+      },
+    }),
+    executionRootPayload: () => undefined,
+  });
+
+  const event = await coordinator.build({
+    sessionId: state.sessionId,
+    content: `request ${token}`,
+    requirementConfirmationMode: 'always',
+  }, state);
+
+  assertEqual(event.kind, 'requirement_confirmation', 'requirement decision still emits the confirmation event');
+  assertEqual(
+    state.contextAssembly?.contextAssemblyId,
+    state.modelContextBundle?.contextAssembly?.contextAssemblyId,
+    'requirement decision model context uses the current ContextAdmission assembly'
+  );
+  assertEqual(
+    state.providerTurnFrame?.snapshot?.finalUserPromptCharLength > 0,
+    true,
+    'requirement decision snapshot records the final provider-visible prompt length'
+  );
+  assertEqual(
+    state.providerTurnFrame?.frames.at(-1)?.kind,
+    'NextActionInstruction',
+    'requirement decision keeps NextActionInstruction as the final frame'
   );
 }
 

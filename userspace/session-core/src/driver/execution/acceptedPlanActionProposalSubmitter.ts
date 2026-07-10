@@ -18,9 +18,10 @@ import type { AcceptedImplementationPlanContext, AcceptedPlanBatchProgress } fro
 import type { ProposalEnvelope, ResourceRequestDraft } from '../../protocol/types.js';
 import type { PromptEnvelope } from '../../prompt/types.js';
 import type { InteractionOverlayContext } from '../pipelines/interactionOverlayCodec.js';
-import { acceptedPlanContinuationInput } from '../runContinuation.js';
+import type { ProposalRouterResult } from '../proposal/proposalRouter.js';
 import { SessionDriverRepairRuntimeAccessor } from '../runFrame.js';
 import { kernelReplyErrorMessage } from './kernelReplyGuard.js';
+import type { KernelReplyObservation } from './kernelEventStatusIndex.js';
 
 export interface AcceptedPlanActionProposalInput {
   sessionId: string;
@@ -69,6 +70,7 @@ export interface AcceptedPlanActionProposalSubmitterPorts<
   createId(prefix: string): string;
   append(sessionId: string, events: AgentEvent[]): Promise<AgentSessionResult | undefined>;
   kernel(request: KernelCommandEnvelope): Promise<KernelReply>;
+  observeKernel(request: KernelCommandEnvelope): Promise<KernelReplyObservation>;
   appendProjectedKernelEvents(sessionId: string, reply: KernelReply): Promise<AgentSessionResult | undefined>;
   emitProjectionDelta(state: State, delta: ProjectionDelta): Promise<void>;
   emitKernelActivityDeltas(state: State, events: unknown[], stage: string): Promise<void>;
@@ -79,7 +81,7 @@ export interface AcceptedPlanActionProposalSubmitterPorts<
     prompt: PromptEnvelope,
     proposal: ProposalEnvelope,
     fallback: AgentSessionResult
-  ): Promise<AgentSessionResult | null>;
+  ): Promise<AgentSessionResult | ProposalRouterResult | null>;
   assessActionProposal(input: Record<string, unknown>): { kind: string; [key: string]: unknown };
   admission(): unknown;
   appendScopeIntervention(
@@ -151,10 +153,6 @@ export interface AcceptedPlanActionProposalSubmitterPorts<
   generatedPacketFromSuccessfulBatch(state: State, batch: Record<string, unknown>, events: unknown[], id: string): unknown | undefined;
   indexGeneratedPacket(index: unknown, packet: unknown): void;
   recordGeneratedPacket(state: State, packet: unknown, stage: string): Promise<{ result?: AgentSessionResult }>;
-  hasFailureOrBlocker(events: unknown[]): boolean;
-  actionBatchReadyForReview(events: unknown[]): boolean;
-  hasPermissionRequest(events: unknown[]): boolean;
-  permissionId(events: unknown[]): string | undefined;
   recordKernelBatchProgress(input: {
     acceptedPlan: AcceptedImplementationPlanContext;
     proposal: ProposalEnvelope;
@@ -198,7 +196,6 @@ export interface AcceptedPlanActionProposalSubmitterPorts<
     contextCompactRecord?: ContextAssemblyTaskLocalCompactRecord
   ): AgentEvent;
   executionRequest(plan: any, acceptedPlan: AcceptedImplementationPlanContext): string;
-  continueSameLoop(input: AcceptedPlanActionProposalResumeInput): Promise<AgentSessionResult>;
   staticSyntaxReview(input: {
     profileId?: string;
     state: State;
@@ -207,15 +204,6 @@ export interface AcceptedPlanActionProposalSubmitterPorts<
     batch: Record<string, unknown>;
     batchEvents: unknown[];
   }): Promise<AgentEvent[]>;
-  reviewHandoff(input: {
-    sessionId: string;
-    runId: string;
-    planId: string;
-    plan: any;
-    result: AgentSessionResult;
-    currentKernelEvents: unknown[];
-    requestIdPrefix: string;
-  }): Promise<AgentSessionResult>;
 }
 
 export class AcceptedPlanActionProposalSubmitter<
@@ -230,7 +218,7 @@ export class AcceptedPlanActionProposalSubmitter<
     prompt: PromptEnvelope,
     proposal: ProposalEnvelope,
     fallback: AgentSessionResult
-  ): Promise<AgentSessionResult> {
+  ): Promise<AgentSessionResult | ProposalRouterResult> {
     const accepted = state.acceptedImplementationPlan;
     if (proposal.kind === 'taskOutcome') {
       return this.submitTaskOutcome(input, state, prompt, proposal, fallback);
@@ -291,13 +279,7 @@ export class AcceptedPlanActionProposalSubmitter<
             result: fallback,
           });
           if (followup.kind === 'failed') return followup.result;
-          return this.ports.continueSameLoop(acceptedPlanContinuationInput(input, {
-            content: followup.content,
-            attachments: accepted.executionRoot ? [accepted.executionRoot.attachment] : [],
-            existingEvents: followup.result.events,
-            reviewContinuationMode: input.reviewContinuationMode,
-            acceptedImplementationPlan: accepted,
-          }));
+          return { kind: 'continue', lastResult: followup.result };
         }
         if (repaired.kind === 'decisionRequest') {
           return this.ports.waitForScopeDecision({
@@ -519,7 +501,7 @@ export class AcceptedPlanActionProposalSubmitter<
       },
     } as ProjectionDelta);
 
-    const batchReply = await this.ports.kernel({
+    const observed = await this.ports.observeKernel({
       command: {
         kind: 'actionBatchSubmit',
         requestId: this.ports.createId('accepted-plan-action-batch-submit'),
@@ -528,11 +510,12 @@ export class AcceptedPlanActionProposalSubmitter<
         batch,
       },
     });
+    const batchReply = observed.reply;
     await this.ports.emitKernelActivityDeltas(state, batchReply.events ?? [], 'accepted_plan.action_batch_submit');
     result = await this.ports.appendProjectedKernelEvents(state.sessionId, batchReply) ?? result;
-    if (!batchReply.ok) {
+    if (observed.kind === 'commandFailed') {
       const message = kernelReplyErrorMessage(batchReply, 'Kernel actionBatchSubmit failed');
-      const code = stringValue(objectRecord(batchReply.error)?.code) ?? 'accepted_plan_execution_failed';
+      const code = observed.code;
       return (await this.ports.append(state.sessionId, this.ports.executionExceptionEvents(
         state.sessionId,
         { runId: state.runId, planId: accepted.planId },
@@ -543,7 +526,7 @@ export class AcceptedPlanActionProposalSubmitter<
       ))) ?? result;
     }
     const batchEvents = batchReply.events ?? [];
-    if (this.ports.hasFailureOrBlocker(batchEvents)) {
+    if (observed.kind === 'factsObserved' && observed.hasFailureOrBlocker) {
       return (await this.ports.append(state.sessionId, this.ports.executionFailureEvents(
         state.sessionId,
         state.runId,
@@ -568,32 +551,33 @@ export class AcceptedPlanActionProposalSubmitter<
         'accepted-plan-generated-artifact-evidence'
       )).result ?? result;
     }
-    if (!this.ports.actionBatchReadyForReview(batchReply.events ?? [])) {
-      if (this.ports.hasPermissionRequest(batchReply.events ?? [])) {
-        const permissionId = this.ports.permissionId(batchReply.events ?? []);
-        return (await this.ports.append(state.sessionId, [
-          this.ports.sessionRunStateEvent({
-            sessionId: state.sessionId,
+    if (observed.kind === 'permissionInterrupted') {
+      const permissionId = observed.permissionId;
+      return (await this.ports.append(state.sessionId, [
+        this.ports.sessionRunStateEvent({
+          sessionId: state.sessionId,
+          runId: state.runId,
+          phase: 'waiting_permission',
+          reason: 'permission',
+          decisionOwner: {
+            kind: 'permission',
             runId: state.runId,
-            phase: 'waiting_permission',
-            reason: 'permission',
-            decisionOwner: {
-              kind: 'permission',
-              runId: state.runId,
-              targetId: permissionId,
-              permissionId,
-              planId: accepted.planId,
-            },
-            ts: this.ports.now(),
-            id: this.ports.createId('session-run-waiting-permission'),
-          }),
-        ])) ?? result;
-      }
+            targetId: permissionId,
+            permissionId,
+            planId: accepted.planId,
+          },
+          ts: this.ports.now(),
+          id: this.ports.createId('session-run-waiting-permission'),
+        }),
+      ])) ?? result;
+    }
+    if (observed.kind !== 'factsObserved' || !observed.readyForReview) {
       return result;
     }
     const ledgerEffect = this.ports.recordKernelBatchProgress({ acceptedPlan: accepted, proposal: executionProposal, kernelEvents: batchReply.events ?? [] });
     const batchProgress = ledgerEffect.progress;
     const nextAccepted = ledgerEffect.nextAcceptedPlan;
+    state.acceptedImplementationPlan = nextAccepted;
     this.ports.refreshRuntimeState(state);
     const savepointId = this.ports.createId('accepted-plan-task-savepoint');
     const contextCompactRecord = buildTaskLocalCompactRecord({
@@ -634,26 +618,8 @@ export class AcceptedPlanActionProposalSubmitter<
       (state.taskExecutionCursor as { lastSavepointId?: string }).lastSavepointId = savepointId;
     }
 
-    if (!this.ports.hasFailureOrBlocker(batchReply.events ?? []) && !this.ports.complete(nextAccepted)) {
-      return this.ports.continueSameLoop(acceptedPlanContinuationInput(input, {
-        content: this.ports.executionRequest(
-          {
-            ...this.ports.executionContext({
-              sessionId: state.sessionId,
-              runId: state.runId,
-              acceptedPlan: accepted,
-              proposal: executionProposal,
-              planReviewReport: reviewReport,
-            }),
-            implementationPlan: accepted.rawPlan,
-          },
-          nextAccepted
-        ),
-        attachments: nextAccepted.executionRoot ? [nextAccepted.executionRoot.attachment] : [],
-        existingEvents: result.events,
-        reviewContinuationMode: input.reviewContinuationMode,
-        acceptedImplementationPlan: nextAccepted,
-      }));
+    if (!observed.hasFailureOrBlocker && !this.ports.complete(nextAccepted)) {
+      return { kind: 'continue', lastResult: result };
     }
 
     const staticReviewEvents = await this.ports.staticSyntaxReview({
@@ -668,15 +634,18 @@ export class AcceptedPlanActionProposalSubmitter<
       result = await this.ports.append(state.sessionId, staticReviewEvents) ?? result;
     }
 
-    return this.ports.reviewHandoff({
-      sessionId: state.sessionId,
-      runId: state.runId,
-      planId: accepted.planId,
-      plan,
-      result,
-      currentKernelEvents: [...(batchReply.events ?? []), ...staticReviewEvents.map((event) => event.payload)],
-      requestIdPrefix: 'accepted-plan-review-facts-get',
-    });
+    return {
+      kind: 'assembleReview',
+      request: {
+        sessionId: state.sessionId,
+        runId: state.runId,
+        planId: accepted.planId,
+        plan,
+        result,
+        currentKernelEvents: [...(batchReply.events ?? []), ...staticReviewEvents.map((event) => event.payload)],
+        requestIdPrefix: 'accepted-plan-review-facts-get',
+      },
+    };
   }
 
   private async submitTaskOutcome(
@@ -685,7 +654,7 @@ export class AcceptedPlanActionProposalSubmitter<
     prompt: PromptEnvelope,
     proposal: ProposalEnvelope,
     fallback: AgentSessionResult
-  ): Promise<AgentSessionResult> {
+  ): Promise<AgentSessionResult | ProposalRouterResult> {
     void prompt;
     const accepted = state.acceptedImplementationPlan;
     const payload = objectRecord(proposal.payload);
@@ -795,23 +764,7 @@ export class AcceptedPlanActionProposalSubmitter<
     }
 
     if (!this.ports.complete(nextAccepted)) {
-      return this.ports.continueSameLoop(acceptedPlanContinuationInput(input, {
-        content: this.ports.executionRequest(
-          {
-            sessionId: state.sessionId,
-            runId: state.runId,
-            acceptedPlan: accepted,
-            proposal,
-            taskOutcome: payload,
-            implementationPlan: accepted.rawPlan,
-          },
-          nextAccepted
-        ),
-        attachments: nextAccepted.executionRoot ? [nextAccepted.executionRoot.attachment] : [],
-        existingEvents: checkpointResult.events,
-        reviewContinuationMode: input.reviewContinuationMode,
-        acceptedImplementationPlan: nextAccepted,
-      }));
+      return { kind: 'continue', lastResult: checkpointResult };
     }
 
     const plan = this.ports.executionContext({
@@ -821,15 +774,18 @@ export class AcceptedPlanActionProposalSubmitter<
       proposal,
       taskOutcome: payload,
     });
-    return this.ports.reviewHandoff({
-      sessionId: state.sessionId,
-      runId: state.runId,
-      planId: nextAccepted.planId,
-      plan,
-      result: checkpointResult,
-      currentKernelEvents: [],
-      requestIdPrefix: 'accepted-plan-task-outcome-review-facts-get',
-    });
+    return {
+      kind: 'assembleReview',
+      request: {
+        sessionId: state.sessionId,
+        runId: state.runId,
+        planId: nextAccepted.planId,
+        plan,
+        result: checkpointResult,
+        currentKernelEvents: [],
+        requestIdPrefix: 'accepted-plan-task-outcome-review-facts-get',
+      },
+    };
   }
 }
 

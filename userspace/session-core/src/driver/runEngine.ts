@@ -1,5 +1,10 @@
 import type { AgentSessionResult } from '@deepcode/protocol';
 import type { ProviderTurnCycleResult } from './pipelines/providerTurnCycle.js';
+import type { ProposalRouterInput, ProposalRouterResult } from './proposal/proposalRouter.js';
+import type {
+  AcceptedPlanReviewHandoffPlan,
+  AcceptedPlanReviewHandoffRunInput,
+} from './review/acceptedPlanReviewHandoffCoordinator.js';
 import type { RunCommand } from './runCommand.js';
 import type { RunEffect } from './runEffect.js';
 
@@ -16,6 +21,7 @@ export interface RunEngineState {
 
 export interface RunEnginePorts<Input, State extends RunEngineState> {
   initialize(input: Input): Promise<RunEngineLifecycleResult<State>>;
+  resume(input: Input): Promise<RunEngineLifecycleResult<State>>;
   shouldBuildRequirementConfirmation(input: Input): boolean;
   waitForRequirementDecision(input: Input, state: State): Promise<AgentSessionResult>;
   runProviderTurn(input: {
@@ -23,6 +29,10 @@ export interface RunEnginePorts<Input, State extends RunEngineState> {
     state: State;
     lastResult: AgentSessionResult;
   }): Promise<ProviderTurnCycleResult>;
+  executeDirective(input: ProposalRouterInput<Input, State>): Promise<ProposalRouterResult>;
+  assembleReview(
+    input: AcceptedPlanReviewHandoffRunInput<AcceptedPlanReviewHandoffPlan>
+  ): Promise<AgentSessionResult>;
 }
 
 // RunEngine owns command/effect transitions; all session side effects stay behind ports.
@@ -33,28 +43,33 @@ export class RunEngine<Input, State extends RunEngineState> {
     return this.runFromCommand(input, { kind: 'initializeRun' });
   }
 
-  async continueSameLoop(input: Input): Promise<AgentSessionResult> {
-    return this.runFromCommand(input, { kind: 'continueSameLoop', source: 'coordinatorResume' });
+  async resume(input: Input): Promise<AgentSessionResult> {
+    return this.runFromCommand(input, { kind: 'resumeRun' });
   }
 
   private async runFromCommand(input: Input, initialCommand: RunCommand): Promise<AgentSessionResult> {
     let command: RunCommand = initialCommand;
     let state: State | undefined;
     let lastResult: AgentSessionResult | undefined;
+    let pendingDirective: Extract<RunEffect<State>, { kind: 'providerDirectiveReady' }> | undefined;
+    let pendingReview: Extract<RunEffect<State>, { kind: 'reviewAssemblyRequired' }> | undefined;
 
     while (true) {
-      if (command.kind === 'continueSameLoop') {
-        command = this.nextCommandAfterContinuation({
-          kind: 'continuationEntered',
-          source: command.source,
-        });
-        continue;
-      }
-
       if (command.kind === 'initializeRun') {
         const effect: RunEffect<State> = {
           kind: 'initialized',
           ...await this.ports.initialize(input),
+        };
+        state = effect.state;
+        lastResult = effect.lastResult;
+        command = { kind: 'maybeBuildRequirementConfirmation' };
+        continue;
+      }
+
+      if (command.kind === 'resumeRun') {
+        const effect: RunEffect<State> = {
+          kind: 'initialized',
+          ...await this.ports.resume(input),
         };
         state = effect.state;
         lastResult = effect.lastResult;
@@ -82,49 +97,99 @@ export class RunEngine<Input, State extends RunEngineState> {
       if (command.kind === 'callProviderAndParse') {
         if (!state || !lastResult) throw new Error('RunEngine provider state is missing.');
         const cycle = await this.ports.runProviderTurn({ input, state, lastResult });
-        const effect = this.effectFromProviderCycle(cycle);
-        if (effect.kind === 'providerCycleReturned') {
+        if (cycle.kind === 'failed') {
+          return this.terminal(cycle.result);
+        }
+        pendingDirective = {
+          kind: 'providerDirectiveReady',
+          prompt: cycle.prompt,
+          lastResult: cycle.lastResult,
+          proposal: cycle.proposal,
+          directive: cycle.directive,
+        };
+        command = { kind: 'executeDirective' };
+        continue;
+      }
+
+      if (command.kind === 'executeDirective') {
+        if (!state || !pendingDirective) throw new Error('RunEngine pending directive is missing.');
+        if (pendingDirective.directive.kind === 'providerResume') {
+          lastResult = pendingDirective.lastResult;
+          pendingDirective = undefined;
+          command = { kind: 'callProviderAndParse' };
+          continue;
+        }
+        if (!pendingDirective.proposal) throw new Error('RunEngine proposal directive is missing its proposal.');
+        const handled = await this.ports.executeDirective({
+          input,
+          state,
+          prompt: pendingDirective.prompt,
+          proposal: pendingDirective.proposal,
+          routed: pendingDirective.directive,
+          lastResult: pendingDirective.lastResult,
+        });
+        const effect = this.effectFromDirective(pendingDirective, handled);
+        pendingDirective = undefined;
+        if (effect.kind === 'directiveReturned') {
           return this.terminal(effect.result);
         }
+        if (effect.kind === 'reviewAssemblyRequired') {
+          pendingReview = effect;
+          command = { kind: 'assembleReview' };
+          continue;
+        }
         lastResult = effect.lastResult;
-        command = this.nextCommandAfterResourceRequest(effect);
+        command = this.nextCommandAfterDirective(effect);
         continue;
+      }
+
+      if (command.kind === 'assembleReview') {
+        if (!pendingReview) throw new Error('RunEngine pending review assembly is missing.');
+        const result = await this.ports.assembleReview(pendingReview.request);
+        pendingReview = undefined;
+        return this.terminal(result);
       }
 
       throw new Error('RunEngine command is not wired yet.');
     }
   }
 
-  private nextCommandAfterContinuation(_effect: Extract<RunEffect<State>, { kind: 'continuationEntered' }>): RunCommand {
-    return { kind: 'initializeRun' };
-  }
-
-  private effectFromProviderCycle(cycle: ProviderTurnCycleResult): Extract<
+  private effectFromDirective(
+    pending: Extract<RunEffect<State>, { kind: 'providerDirectiveReady' }>,
+    handled: ProposalRouterResult
+  ): Extract<
     RunEffect<State>,
-    { kind: 'providerCycleReturned' } | { kind: 'resourceRequestContinue' }
+    { kind: 'directiveReturned' } | { kind: 'directiveContinue' } | { kind: 'reviewAssemblyRequired' }
   > {
-    if (cycle.kind === 'return') {
+    if (handled.kind === 'return') {
       return {
-        kind: 'providerCycleReturned',
-        result: cycle.result,
-        proposal: cycle.proposal,
-        routed: cycle.routed,
+        kind: 'directiveReturned',
+        result: handled.result,
+        proposal: pending.proposal,
+        directive: pending.directive,
       };
     }
-    if (cycle.routed.kind !== 'resourceRequest') {
-      // A continue result means ResourceRequestLoop appended new evidence and the provider must retry.
-      throw new Error(`RunEngine provider continue requires resourceRequest route, got ${cycle.routed.kind}.`);
+    if (handled.kind === 'assembleReview') {
+      return {
+        kind: 'reviewAssemblyRequired',
+        request: handled.request,
+        proposal: pending.proposal,
+        directive: pending.directive,
+      };
+    }
+    if (pending.directive.kind !== 'resourceRequest' && pending.directive.kind !== 'action') {
+      throw new Error(`RunEngine directive continue requires resourceRequest or action, got ${pending.directive.kind}.`);
     }
     return {
-      kind: 'resourceRequestContinue',
-      lastResult: cycle.lastResult,
-      proposal: cycle.proposal,
-      routed: cycle.routed,
+      kind: 'directiveContinue',
+      lastResult: handled.lastResult,
+      proposal: pending.proposal,
+      directive: pending.directive,
     };
   }
 
-  private nextCommandAfterResourceRequest(
-    _effect: Extract<RunEffect<State>, { kind: 'resourceRequestContinue' }>
+  private nextCommandAfterDirective(
+    _effect: Extract<RunEffect<State>, { kind: 'directiveContinue' }>
   ): RunCommand {
     return { kind: 'callProviderAndParse' };
   }

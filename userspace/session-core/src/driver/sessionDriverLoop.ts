@@ -52,6 +52,7 @@ import {
 import {
   AcceptedPlanReviewHandoffCoordinator,
   AcceptedPlanStaticSyntaxReviewCoordinator,
+  type AcceptedPlanReviewHandoffRunInput,
 } from './review/index.js';
 import { DecisionResolver, PermissionDecisionHandler, PlanDecisionHandler, ProviderDecisionRequestHandler, RequirementConfirmationCoordinator, RequirementDecisionHandler, ReviewDecisionHandler, TerminalGuidanceRevisionCoordinator } from './interactions/index.js';
 import {
@@ -63,7 +64,6 @@ import {
   type PlanContext as SessionPlanContext,
 } from './proposal/index.js';
 import type { LlmTurnResult, SessionDriverLoopRunState } from './runFrame.js';
-import { decisionContinuationInput, SameLoopContinuation } from './runContinuation.js';
 import { RunEngine } from './runEngine.js';
 import { diag, isEmptyResponseError, objectRecord, SessionDriverLoopError, stringValue, visibleLanguageForRequest } from './runtimeSupport.js';
 import { AgentRunReactor } from './agentRunReactor.js';
@@ -181,7 +181,6 @@ export class SessionDriverLoop {
   private readonly runEngine: RunEngine<SessionDriverLoopInput, SessionDriverLoopRunState>;
   private readonly runLifecyclePipeline: RunLifecyclePipeline<SessionDriverLoopRunState>;
   private readonly providerTurnRunner: ProviderTurnRunner<SessionDriverLoopRunState>;
-  private readonly sameLoopContinuation: SameLoopContinuation<SessionDriverLoopInput>;
 
   constructor(private readonly ports: SessionDriverLoopPorts) {
     this.agentRunReactor = new AgentRunReactor<SessionDriverLoopRunState>({
@@ -192,14 +191,13 @@ export class SessionDriverLoop {
       errorCode: (error, fallback) => error instanceof SessionDriverLoopError ? error.code : fallback,
       errorMessage: (error) => error instanceof Error ? error.message : String(error),
     });
-    this.sameLoopContinuation = new SameLoopContinuation((resumeInput) => this.continueSameLoop(resumeInput));
     this.acceptedActionBundlePlanExecutor = new AcceptedActionBundlePlanExecutor({
       now: () => this.agentRunReactor.ts(),
       createId: (prefix) => this.agentRunReactor.id(prefix),
       append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
       kernel: (request) => this.agentRunReactor.kernel(request),
+      observeKernel: async (request) => kernelEventStatusIndex.observe(await this.ports.kernelCommand(request)),
       appendProjectedKernelEvents: (sessionId, reply) => this.agentRunReactor.appendProjectedKernelEvents(sessionId, reply),
-      continueSameLoop: this.sameLoopContinuation.resumeUserTurn,
       kernelExecutionContractId: (report) => planReviewGrantProjector.kernelExecutionContractId(report),
       temporaryGrantsForPlan: (plan) => planReviewGrantProjector.temporaryGrantsForPlan(plan),
       recentResourcePackets: (events) => resourceRequestLoop.recentPackets(events),
@@ -228,22 +226,16 @@ export class SessionDriverLoop {
           id
         ),
       deletePreflightReasons: (batch, resourcePackets) => acceptedPlanBatchPreflight.deleteReasons(batch, resourcePackets),
-      hasFailureOrBlocker: (events) => kernelEventStatusIndex.hasFailureOrBlocker(events),
-      actionBatchReadyForReview: (events) => kernelEventStatusIndex.actionBatchReadyForReview(events),
-      hasPermissionRequest: (events) => kernelEventStatusIndex.hasPermissionRequest(events),
-      permissionId: (events) => kernelEventStatusIndex.permissionId(events),
       planProposal: (plan) => planContextIndex.proposalEnvelope(plan),
       recordKernelBatchProgress: (input) => acceptedPlanTaskLedger().recordKernelBatchProgress(input),
       runtimeSnapshot: (input) => acceptedPlanTaskLedger().runtimeSnapshot(input),
       acceptedPlanComplete: (accepted) => acceptedPlanTaskLedger().complete(accepted),
       executionRequest: (plan, acceptedPlan) => executionPromptCoordinator().executionRequest(plan, acceptedPlan),
-      reviewHandoff: (handoffInput) => this.acceptedPlanReviewHandoffCoordinator.handoff(handoffInput),
     });
     this.acceptedPlanReadOnlyTaskExecutor = new AcceptedPlanReadOnlyTaskExecutor<SessionDriverLoopInput, SessionDriverLoopRunState>({
       now: () => this.agentRunReactor.ts(),
       createId: (prefix) => this.agentRunReactor.id(prefix),
       append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
-      continueSameLoop: this.sameLoopContinuation.runUserTurn,
       readActionBundle: (proposal) => driverActivityBuilder.readActionBundle(proposal),
       refreshRuntimeState: (state) => acceptedPlanTaskLedger().refreshRuntimeState(state),
       readOnlyResourceCompletion: (accepted, cursor, current, packet) =>
@@ -272,7 +264,6 @@ export class SessionDriverLoop {
           acceptedPlan
         ),
       readOnlyReviewContext: (reviewInput) => acceptedPlanExecutor.readOnlyReviewContext(reviewInput),
-      reviewHandoff: (handoffInput) => this.acceptedPlanReviewHandoffCoordinator.handoff(handoffInput),
       currentTaskIsReadOnlyResourceValidation: (accepted, cursor, current) =>
         acceptedPlanExecutor.currentTaskIsReadOnlyResourceValidation(
           accepted,
@@ -322,6 +313,7 @@ export class SessionDriverLoop {
       createId: (prefix) => this.agentRunReactor.id(prefix),
       append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
       kernel: (request) => this.agentRunReactor.kernel(request),
+      observeKernel: async (request) => kernelEventStatusIndex.observe(await this.ports.kernelCommand(request)),
       appendProjectedKernelEvents: (sessionId, reply) => this.agentRunReactor.appendProjectedKernelEvents(sessionId, reply),
       emitProjectionDelta: (state, delta) => this.agentRunReactor.emitProjectionDelta(state, delta),
       emitKernelActivityDeltas: (state, events, stage) => this.agentRunReactor.emitKernelActivityDeltas(state, events, stage),
@@ -428,10 +420,6 @@ export class SessionDriverLoop {
         generatedArtifactEvidenceIndex().indexPacket(index as Parameters<ReturnType<typeof generatedArtifactEvidenceIndex>['indexPacket']>[0], packet as Parameters<ReturnType<typeof generatedArtifactEvidenceIndex>['indexPacket']>[1]),
       recordGeneratedPacket: (state, packet, stage) =>
         this.resourceOrchestrator.recordAndAppend(state, packet as ResourcePacket, stage),
-      hasFailureOrBlocker: (events) => kernelEventStatusIndex.hasFailureOrBlocker(events),
-      actionBatchReadyForReview: (events) => kernelEventStatusIndex.actionBatchReadyForReview(events),
-      hasPermissionRequest: (events) => kernelEventStatusIndex.hasPermissionRequest(events),
-      permissionId: (events) => kernelEventStatusIndex.permissionId(events),
       recordKernelBatchProgress: (progressInput) => acceptedPlanTaskLedger().recordKernelBatchProgress(progressInput),
       recordModelTaskOutcome: (outcomeInput) => acceptedPlanTaskLedger().recordModelTaskOutcome(outcomeInput),
       refreshRuntimeState: (state) => acceptedPlanTaskLedger().refreshRuntimeState(state),
@@ -463,9 +451,7 @@ export class SessionDriverLoop {
           contextCompactRecord
         ),
       executionRequest: (plan, acceptedPlan) => executionPromptCoordinator().executionRequest(plan, acceptedPlan),
-      continueSameLoop: this.sameLoopContinuation.runUserTurn,
       staticSyntaxReview: (reviewInput) => this.acceptedPlanStaticSyntaxReviewCoordinator.run(reviewInput),
-      reviewHandoff: (handoffInput) => this.acceptedPlanReviewHandoffCoordinator.handoff(handoffInput),
     });
     this.acceptedPlanResourceResumeCoordinator = new AcceptedPlanResourceResumeCoordinator<SessionDriverLoopRunState>({
       promptBuilder: acceptedPlanResourceResumePromptBuilder,
@@ -555,20 +541,18 @@ export class SessionDriverLoop {
     this.permissionDecisionHandler = new PermissionDecisionHandler<SessionPlanContext>({
       now: () => this.agentRunReactor.ts(),
       createId: (prefix) => this.agentRunReactor.id(prefix),
-      kernel: (request) => this.agentRunReactor.kernel(request),
+      observeKernel: async (request) => kernelEventStatusIndex.observe(await this.ports.kernelCommand(request)),
       appendProjectedKernelEvents: (sessionId, reply) => this.agentRunReactor.appendProjectedKernelEvents(sessionId, reply),
       append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
       permissionPipeline,
       kernelStatus: kernelEventStatusIndex,
       planIndex: planContextIndex,
-      reviewProjection: reviewProjectionBuilder,
       progressProjection: sessionProgressProjectionBuilder,
     });
     this.planDecisionHandler = new PlanDecisionHandler({
       now: () => this.agentRunReactor.ts(),
       createId: (prefix) => this.agentRunReactor.id(prefix),
       append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
-      resumeUserTurn: this.sameLoopContinuation.resumeUserTurn,
       executeAcceptedActionBundlePlan: (handlerInput, plan, initialResult, acceptedOverlay) =>
         this.acceptedActionBundlePlanExecutor.execute(handlerInput, plan, initialResult, acceptedOverlay),
       activeDriverInteraction: (events) => driverInteractionIndex.active(events),
@@ -588,7 +572,6 @@ export class SessionDriverLoop {
       now: () => this.agentRunReactor.ts(),
       createId: (prefix) => this.agentRunReactor.id(prefix),
       append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
-      resumeUserTurn: this.sameLoopContinuation.resumeUserTurn,
       activeDriverInteraction: (events) => driverInteractionIndex.active(events),
       executionRootFromDecision: (handlerInput, events) =>
         AcceptedPlanExecutionRootResolver.fromDecision(handlerInput, events),
@@ -615,7 +598,6 @@ export class SessionDriverLoop {
       kernelAudit: (request) => this.ports.kernelCommand(request),
       appendProjectedKernelEvents: (sessionId, reply) => this.agentRunReactor.appendProjectedKernelEvents(sessionId, reply),
       append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
-      resumeUserTurn: this.sameLoopContinuation.resumeUserTurn,
       reviewAssembler: reviewAssembler(),
       reviewDecisionProjection: reviewDecisionProjection(),
       kernelStatus: kernelEventStatusIndex,
@@ -629,6 +611,10 @@ export class SessionDriverLoop {
         assistantProjectionBuilder.finalDiagnosticEvent(sessionId, content, ts, id),
       missingDecisionKindMessage: (kind) =>
         diag('decisionResolverMissing', `Decision kind "${kind}" is not yet connected to Session DecisionResolver.`, { kind }),
+      resume: (resumeInput) => this.resumeRun(resumeInput),
+      assembleReview: (reviewInput) => this.acceptedPlanReviewHandoffCoordinator.handoff(
+        reviewInput as AcceptedPlanReviewHandoffRunInput<SessionPlanContext>
+      ),
       requirementHandler: this.requirementDecisionHandler,
       planHandler: this.planDecisionHandler,
       permissionHandler: this.permissionDecisionHandler,
@@ -697,7 +683,7 @@ export class SessionDriverLoop {
       buildProviderTurnContract: (contractInput) =>
         contextFrameBuilder.buildSessionProviderTurnContract(contractInput),
       callProviderAndParse: (handlerInput, state, prompt) =>
-        this.providerProposalCoordinator.callAndParse(handlerInput, state, prompt),
+        this.providerProposalCoordinator.callAndParseRequiredProposal(handlerInput, state, prompt),
       createError: (code, message) => new SessionDriverLoopError(code, message),
       requirementRecordFromProposal: (proposalInput) =>
         userInputPipeline.requirementRecordFromProposal(proposalInput),
@@ -936,14 +922,6 @@ export class SessionDriverLoop {
         error instanceof SessionDriverLoopError ? error.message : driverParseErrorCatalog.message(error),
       resourceFollowup: (followupInput) =>
         this.actionBundleAdmissionResourceFollowupCoordinator.handle(followupInput),
-      resumeAfterResourceFollowup: ({ originalInput, followup }) =>
-        this.sameLoopContinuation.runUserTurn(decisionContinuationInput(originalInput, {
-          content: followup.content,
-          attachments: originalInput.attachments ?? [],
-          existingEvents: followup.result.events,
-          reviewContinuationMode: originalInput.reviewContinuationMode,
-          resumeResourcePackets: true,
-        })),
       submitActionProposal: (handlerInput, state, prompt, proposal, fallback) =>
         this.actionProposalSubmitter.submit(handlerInput, state, prompt, proposal, fallback),
       submitNonExecutableProposal: (state, proposal, fallback) =>
@@ -1162,7 +1140,7 @@ export class SessionDriverLoop {
       thinkingEvent: (sessionId, content, ts, id) =>
         assistantProjectionBuilder.thinkingEvent(sessionId, content, ts, id),
       providerResult: (providerInput, state, prompt, contract) =>
-        state.acceptedImplementationPlan
+        state.acceptedImplementationPlan || contract.turnMode === 'requirementDecision'
           ? this.providerRuntimeBridge.runProposalOnly({
             profileId: providerInput.profileId,
             state,
@@ -1252,8 +1230,7 @@ export class SessionDriverLoop {
         }),
       callProviderAndParse: (handlerInput, state, prompt) =>
         this.providerProposalCoordinator.callAndParse(handlerInput, state, prompt),
-      routeProposal: (proposal) => this.proposalRouter.route(proposal),
-      executeRoutedProposal: (routerInput) => this.proposalRouteExecutor.execute(routerInput),
+      admitDirective: (proposal) => this.proposalRouter.route(proposal),
       appendDriverFailure: async (state, error) => {
         if (!(error instanceof SessionDriverLoopError)) return null;
         return this.agentRunReactor.append(state.sessionId, [
@@ -1277,6 +1254,7 @@ export class SessionDriverLoop {
     });
     this.runEngine = new RunEngine<SessionDriverLoopInput, SessionDriverLoopRunState>({
       initialize: (runInput) => this.runLifecyclePipeline.initialize(runInput),
+      resume: (runInput) => this.runLifecyclePipeline.resume(runInput),
       shouldBuildRequirementConfirmation: (runInput) =>
         this.requirementConfirmationCoordinator.shouldBuild(runInput),
       waitForRequirementDecision: async (runInput, state) => {
@@ -1314,6 +1292,10 @@ export class SessionDriverLoop {
         }
       },
       runProviderTurn: (cycleInput) => this.providerTurnCycle.run(cycleInput),
+      executeDirective: (routerInput) => this.proposalRouteExecutor.execute(routerInput),
+      assembleReview: (reviewInput) => this.acceptedPlanReviewHandoffCoordinator.handoff(
+        reviewInput as AcceptedPlanReviewHandoffRunInput<SessionPlanContext>
+      ),
     });
   }
 
@@ -1325,17 +1307,17 @@ export class SessionDriverLoop {
     return this.runLoopInput(input);
   }
 
-  private async continueSameLoop(input: SessionDriverLoopInput): Promise<AgentSessionResult> {
-    return this.runLoopInput(input, 'continueSameLoop');
+  private async resumeRun(input: SessionDriverLoopInput): Promise<AgentSessionResult> {
+    return this.runLoopInput(input, 'resumeRun');
   }
 
   private async runLoopInput(
     input: SessionDriverLoopInput,
-    mode: 'userTurn' | 'continueSameLoop' = 'userTurn'
+    mode: 'userTurn' | 'resumeRun' = 'userTurn'
   ): Promise<AgentSessionResult> {
     try {
-      return mode === 'continueSameLoop'
-        ? await this.runEngine.continueSameLoop(input)
+      return mode === 'resumeRun'
+        ? await this.runEngine.resume(input)
         : await this.runEngine.run(input);
     } catch (error) {
       const message = error instanceof SessionDriverLoopError ? error.message : String(error);

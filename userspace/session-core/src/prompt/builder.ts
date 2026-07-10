@@ -1,5 +1,5 @@
 import type { PromptEnvelope, PromptEnvelopeBuilderInput, PromptSegment, PromptSystemLayer } from './types.js';
-import { planningDecisionPolicyLines, providerVisibleSchemaDigest, providerVisibleWorkflowState } from './providerTurnContract.js';
+import { inferProviderTurnMode, planningDecisionPolicyLines, providerVisibleSchemaDigest, providerVisibleWorkflowState } from './providerTurnContract.js';
 import { resourceEvidenceContentKindCounts } from '../context/resourceEvidenceAccess.js';
 
 export function buildPromptEnvelope(input: PromptEnvelopeBuilderInput): PromptEnvelope {
@@ -201,20 +201,7 @@ export function buildPromptEnvelope(input: PromptEnvelopeBuilderInput): PromptEn
       priority: 13,
       stable: false,
       cacheClass: 'turnDynamic',
-      content: [
-        `User request: ${input.userRequest}`,
-        input.requirement
-          ? [
-            `Requirement: ${input.requirement.requirementId} status=${input.requirement.status}`,
-            `Goal: ${input.requirement.checklist?.goal ?? input.requirement.initialUserRequest}`,
-            `Scope: ${(input.requirement.checklist?.explicitTasks ?? []).join('; ') || 'not specified'}`,
-            `Out of scope: ${(input.requirement.checklist?.outOfScope ?? []).join('; ') || 'not specified'}`,
-            `Constraints: ${(input.requirement.checklist?.inferredTasks ?? []).join('; ') || 'not specified'}`,
-            `Risks: ${(input.requirement.checklist?.riskNotes ?? []).join('; ') || 'not specified'}`,
-            `Acceptance criteria: ${(input.requirement.checklist?.acceptanceCriteriaCandidates ?? []).join('; ') || 'not specified'}`,
-          ].join('\n')
-          : 'Requirement: not confirmed yet',
-      ].join('\n'),
+      content: currentRequirementSummary(input),
     },
     {
       name: 'reusableResourceContext',
@@ -253,6 +240,31 @@ export function buildPromptEnvelope(input: PromptEnvelopeBuilderInput): PromptEn
     dynamicLayerNames: dynamicLayers.map((layer) => layer.name),
     auditOnlyLayerNames: auditOnlyLayers.map((layer) => layer.name),
   };
+}
+
+function currentRequirementSummary(input: PromptEnvelopeBuilderInput): string {
+  const acceptedExecution = inferProviderTurnMode(input) === 'acceptedTaskExecution';
+  if (acceptedExecution && !input.requirement) {
+    return [
+      'Accepted execution requirement state.',
+      'ConfirmedPlan is active. The original user request is retained as a source reference and is not re-expanded in currentRequirement.',
+      'No separate requirement confirmation is active.',
+    ].join('\n');
+  }
+  return [
+    `${acceptedExecution ? 'Accepted execution context' : 'User request'}: ${input.userRequest}`,
+    input.requirement
+      ? [
+        `Requirement: ${input.requirement.requirementId} status=${input.requirement.status}`,
+        `Goal: ${input.requirement.checklist?.goal ?? input.requirement.initialUserRequest}`,
+        `Scope: ${(input.requirement.checklist?.explicitTasks ?? []).join('; ') || 'not specified'}`,
+        `Out of scope: ${(input.requirement.checklist?.outOfScope ?? []).join('; ') || 'not specified'}`,
+        `Constraints: ${(input.requirement.checklist?.inferredTasks ?? []).join('; ') || 'not specified'}`,
+        `Risks: ${(input.requirement.checklist?.riskNotes ?? []).join('; ') || 'not specified'}`,
+        `Acceptance criteria: ${(input.requirement.checklist?.acceptanceCriteriaCandidates ?? []).join('; ') || 'not specified'}`,
+      ].join('\n')
+      : 'No separate requirement confirmation is active.',
+  ].join('\n');
 }
 
 function promptSegmentFromLayer(layer: PromptSystemLayer): PromptSegment {
@@ -350,7 +362,7 @@ function requirementTranscriptSummary(input: PromptEnvelopeBuilderInput): string
   if (input.requirement) {
     lines.push(`Current requirement id=${input.requirement.requirementId} status=${input.requirement.status}`);
   } else {
-    lines.push('Current requirement id=none status=notConfirmed');
+    lines.push('Current requirement id=none; no separate requirement confirmation is active.');
   }
   return lines.join('\n');
 }

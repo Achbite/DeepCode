@@ -25,7 +25,10 @@ import { SessionDriverNativeToolRuntimeAccessor } from '../runFrame.js';
 import type { NativeToolRepairDuplicate } from './nativeToolRepairCoordinator.js';
 import type { NativeToolRepairRunner } from './nativeToolRepairRunner.js';
 import type { NativeToolHandlerPortsFactory } from './nativeToolHandlerPortsFactory.js';
-import type { NativeToolProviderLoop } from './nativeToolProviderLoop.js';
+import type {
+  NativeToolProviderLoop,
+  NativeToolProviderResumeSignal,
+} from './nativeToolProviderLoop.js';
 
 export interface NativeToolProviderCoordinatorState
   extends NativeToolTurnHandlerState,
@@ -33,6 +36,8 @@ export interface NativeToolProviderCoordinatorState
   acceptedImplementationPlan?: unknown;
   implementationBatch: { batchIndex: number };
   nativeToolDuplicateRepairAttempted: boolean;
+  nativeToolResumeMessages?: LlmChatRequest['messages'];
+  nativeToolResumeRound?: number;
 }
 
 export interface NativeToolProviderCoordinatorDependencies<
@@ -87,7 +92,9 @@ export class NativeToolProviderCoordinator<
 > {
   constructor(private readonly dependencies: NativeToolProviderCoordinatorDependencies<TState, TTurn>) {}
 
-  async run(input: NativeToolProviderCoordinatorInput<TState>): Promise<string | ProposalEnvelope> {
+  async run(
+    input: NativeToolProviderCoordinatorInput<TState>
+  ): Promise<string | ProposalEnvelope | NativeToolProviderResumeSignal> {
     return this.dependencies.providerLoop.run({
       profileId: input.profileId,
       state: input.state,

@@ -49,7 +49,11 @@ import { AgentRunReactor } from '../driver/agentRunReactor.js';
 import { ContextFrameBuilder } from '../driver/context/contextFrameBuilder.js';
 import { ProviderTurnCycle } from '../driver/pipelines/providerTurnCycle.js';
 import { routeProposalKind } from '../driver/proposal/proposalRouter.js';
-import { acceptedPlanContinuationInput, decisionContinuationInput, SameLoopContinuation } from '../driver/runContinuation.js';
+import {
+  acceptedPlanContinuationInput,
+  decisionContinuationInput,
+  type SessionLoopControlResult,
+} from '../driver/runContinuation.js';
 import { providerVisibleSchemaDigest, renderProviderTurnContractLayer } from '../prompt/providerTurnContract.js';
 import { AcceptedPlanResourceResumeCoordinator, ActionBundleAdmissionResourceFollowupCoordinator, GeneratedArtifactEvidenceIndex, PathIdentity, ProviderTurnContextCoordinator, ResourceEvidenceIndex, ResourceOrchestrator, ResourceRequestLoop, ResourceRequestProposalHandler, ResourceRequestRepairCoordinator, buildProviderTurnSnapshot } from '../driver/context/index.js';
 import {
@@ -173,13 +177,16 @@ import {
   assertProviderTurnContextCoordinatorUsesFreshAssembly,
   assertProviderTurnContractFrameOrder,
   assertProviderTurnSnapshotRecordsContextAdmissionShape,
+  assertRequirementConfirmationRecordsModelContextBundle,
   assertRunEngineContinuationUsesSameLifecycle,
   assertRunEngineContinuesOnlyForResourceRequestRoute,
+  assertRunEngineOwnsNativeProviderResume,
+  assertRunEngineOwnsReviewAssembly,
   assertRunEngineRejectsUnexpectedContinueRoute,
-  assertSameLoopContinuationUsesSingleResumePort,
   assertTaskLocalCompactRecordFlowsThroughCheckpoints,
 } from './smokeLoopContextTests.js';
 import {
+  assertAcceptedPlanResourceResumePromptUsesPromptContent,
   assertContextAssemblerCachePlan,
   assertDeepSeekCacheStrategyDoesNotInjectRequestParameter,
   assertPromptEnvelope,
@@ -192,6 +199,15 @@ import {
   assertSessionDriverLoopTerminalAnswerGuidanceRevision,
   assertSessionDriverLoopTerminalGuidanceRevisionFallback,
 } from './smokeTerminalGuidanceTests.js';
+
+function returnedSession(
+  control: SessionLoopControlResult,
+  message: string
+): AgentSessionResult {
+  assertEqual(control.kind, 'return', message);
+  if (control.kind !== 'return') throw new Error(message);
+  return control.result;
+}
 
 async function main(): Promise<void> {
   assertV3Parser();
@@ -218,11 +234,13 @@ async function main(): Promise<void> {
   await assertNativeToolRepairRunnerHandlesRepairs();
   assertProposalSemanticValidatorCanonicalizesAndDefaults();
   assertPromptEnvelope();
+  assertAcceptedPlanResourceResumePromptUsesPromptContent();
   assertDecisionContinuationInputKeepsDecisionResumeInSameLoop();
   assertAcceptedPlanContinuationDefaultsResourceResume();
-  await assertSameLoopContinuationUsesSingleResumePort();
   await assertRunEngineContinuationUsesSameLifecycle();
+  await assertRunEngineOwnsNativeProviderResume();
   await assertRunEngineContinuesOnlyForResourceRequestRoute();
+  await assertRunEngineOwnsReviewAssembly();
   await assertRunEngineRejectsUnexpectedContinueRoute();
   assertContextAssemblerCachePlan();
   assertProviderTurnContractFrameOrder();
@@ -233,6 +251,7 @@ async function main(): Promise<void> {
   await assertProviderTurnContextCoordinatorNarrowsPlanningAllowedKinds();
   await assertProviderTurnContextCoordinatorScopesAcceptedExecutionCatalog();
   await assertProviderTurnContextCoordinatorFiltersUnscopedGrantsToCurrentTask();
+  await assertRequirementConfirmationRecordsModelContextBundle();
   await assertHookObserverProducesTraceOnly();
   await assertProviderPipelineUsesProviderTurnContract();
   assertProviderJsonModeCoordinator();
@@ -282,6 +301,7 @@ async function main(): Promise<void> {
   assertReviewAssemblerFindsWaitingReviewContext();
   assertReviewDecisionProjectionUsesI18nKeys();
   await assertReviewDecisionHandlerAcceptsTerminalReview();
+  await assertReviewDecisionHandlerCompletesTerminalReviewWhenKernelRunIsInactive();
   await assertPlanDecisionHandlerRejectsActivePlan();
   assertProjectionBuildersKeepKernelAndReviewReadModels();
   await assertAgentRunReactorCoordinatesPorts();
@@ -1595,7 +1615,6 @@ async function assertPermissionDecisionHandlerAcceptsAndRequestsReviewFacts(): P
   const planId = `plan-${token}`;
   const permissionId = `permission-${token}`;
   const workUnitId = `work-unit-${token}`;
-  const reviewId = `review-${token}`;
   const session: AgentSession = {
     id: sessionId,
     mode: 'plan',
@@ -1647,34 +1666,22 @@ async function assertPermissionDecisionHandlerAcceptsAndRequestsReviewFacts(): P
       workUnitId,
     },
   ];
-  const factsEvent = {
-    kind: 'review.facts_produced',
-    runId,
-    planId,
-    factsId: `facts-${token}`,
-  };
   const planIndex = new PlanContextIndex({
     interactionOverlayFromPayload: () => undefined,
     executionRootFromPayload: () => undefined,
   });
   let projectedEvents: AgentEvent[] = [planEvent, permissionEvent];
-  let reviewKernelEvents: unknown[] = [];
-  let appendedEvents: AgentEvent[] = [];
   const kernelCommands: string[] = [];
   const handler = new PermissionDecisionHandler({
     now: () => `ts-${token}`,
     createId: (prefix) => `${prefix}-${token}`,
-    kernel: async (request: KernelCommandEnvelope): Promise<KernelReply> => {
+    observeKernel: async (request: KernelCommandEnvelope) => {
       const command = request.command as { kind?: string; permissionId?: string; decision?: string; runId?: string };
       kernelCommands.push(command.kind ?? '');
       if (command.kind === 'permissionResolve') {
         assertEqual(command.permissionId, permissionId, 'permission handler resolves the pending permission');
         assertEqual(command.decision, 'accept', 'permission handler forwards accept decision');
-        return { ok: true, events: decisionEvents };
-      }
-      if (command.kind === 'reviewFactsGet') {
-        assertEqual(command.runId, runId, 'permission handler requests review facts for current run');
-        return { ok: true, events: [factsEvent] };
+        return new KernelEventStatusIndex().observe({ ok: true, events: decisionEvents });
       }
       throw new Error(`unexpected kernel command ${command.kind}`);
     },
@@ -1692,24 +1699,11 @@ async function assertPermissionDecisionHandlerAcceptsAndRequestsReviewFacts(): P
     },
     append: async (nextSessionId, events) => {
       assertEqual(nextSessionId, sessionId, 'permission handler appends review events to current session');
-      appendedEvents = events;
       return { session, events: [...projectedEvents, ...events] };
     },
     permissionPipeline: new PermissionPipeline(),
     kernelStatus: new KernelEventStatusIndex(),
     planIndex,
-    reviewProjection: {
-      summaryEvent: ({ kernelEvents }) => {
-        reviewKernelEvents = kernelEvents;
-        return {
-          id: `review-summary-${token}`,
-          sessionId,
-          ts: `ts-${token}`,
-          kind: 'review_summary',
-          payload: { reviewId },
-        };
-      },
-    },
     progressProjection: {
       traceEvent: ({ kind, summary, extra }) => ({
         id: `trace-${token}`,
@@ -1728,7 +1722,7 @@ async function assertPermissionDecisionHandlerAcceptsAndRequestsReviewFacts(): P
     },
   });
 
-  const result = await handler.resolve({
+  const control = await handler.resolve({
     sessionId,
     decision: 'accept',
     runId,
@@ -1736,15 +1730,12 @@ async function assertPermissionDecisionHandlerAcceptsAndRequestsReviewFacts(): P
     existingEvents: [planEvent, permissionEvent],
   });
 
-  assertEqual(kernelCommands.join(','), 'permissionResolve,reviewFactsGet', 'permission handler resolves permission then requests review facts');
-  assertEqual(reviewKernelEvents.length, 3, 'permission handler builds review from decision and facts events');
-  assertEqual(appendedEvents[0]?.kind, 'review_summary', 'permission handler appends review summary');
-  assertEqual(appendedEvents[1]?.kind, 'session_run_state', 'permission handler appends waiting review state');
-  const runStatePayload = appendedEvents[1]?.payload as Record<string, unknown> | undefined;
-  const decisionOwner = runStatePayload?.decisionOwner as Record<string, unknown> | undefined;
-  assertEqual(runStatePayload?.phase, 'waiting_review', 'permission handler enters waiting review');
-  assertEqual(decisionOwner?.reviewId, reviewId, 'permission handler uses review id from summary');
-  assertEqual(result.events.length, projectedEvents.length + appendedEvents.length, 'permission handler returns appended result');
+  assertEqual(kernelCommands.join(','), 'permissionResolve', 'permission handler only resolves the interrupted Kernel command');
+  assertEqual(control.kind, 'assembleReview', 'permission completion returns Review assembly control to the decision owner');
+  if (control.kind !== 'assembleReview') throw new Error('permission completion must request Review assembly');
+  assertEqual(control.request.runId, runId, 'permission Review assembly keeps the original run');
+  assertEqual(control.request.planId, planId, 'permission Review assembly keeps the original plan');
+  assertEqual(control.request.currentKernelEvents.length, 2, 'permission Review assembly carries resumed command facts');
 }
 
 async function assertRequirementDecisionHandlerRejectsActiveRequirement(): Promise<void> {
@@ -1781,17 +1772,12 @@ async function assertRequirementDecisionHandlerRejectsActiveRequirement(): Promi
       },
     },
   } as AgentEvent];
-  let resumed = 0;
   const handler = new RequirementDecisionHandler({
     now: () => `now-${token}`,
     createId: (prefix) => `${prefix}-${token}`,
     append: async (nextSessionId, events) => {
       assertEqual(nextSessionId, sessionId, 'requirement handler appends to current session');
       store.push(...events);
-      return { session: { ...session, eventCount: store.length }, events: [...store] };
-    },
-    resumeUserTurn: async () => {
-      resumed += 1;
       return { session: { ...session, eventCount: store.length }, events: [...store] };
     },
     activeDriverInteraction: () => ({ kind: 'requirement', runId, requirementId }),
@@ -1840,7 +1826,7 @@ async function assertRequirementDecisionHandlerRejectsActiveRequirement(): Promi
     repairLoop: new RepairLoop(),
   });
 
-  const result = await handler.resolve({
+  const control = await handler.resolve({
     sessionId,
     decision: 'reject',
     runId,
@@ -1848,7 +1834,7 @@ async function assertRequirementDecisionHandlerRejectsActiveRequirement(): Promi
     existingEvents: [...store],
   });
 
-  assertEqual(resumed, 0, 'requirement reject does not resume provider loop');
+  const result = returnedSession(control, 'requirement reject returns a terminal decision result');
   assertEqual(result.events.some((event) => event.kind === 'requirement_decision' && (event.payload as any)?.status === 'rejected'), true, 'requirement handler records rejected requirement decision');
   const cancelled = result.events.find((event) => event.kind === 'session_run_state' && (event.payload as any)?.status === 'cancelled');
   assert(Boolean(cancelled), 'requirement handler appends cancelled run state');
@@ -2881,7 +2867,7 @@ async function assertResourceRequestProposalHandlerRoutesAcceptedTaskOutcomeResu
       submitActionCalls += 1;
       assertEqual(proposal.kind, 'taskOutcome', 'accepted resource resume taskOutcome reaches action submitter');
       assertEqual(result.session.id, sessionId, 'accepted resource resume taskOutcome receives resource append result');
-      return submitterResult;
+      return { kind: 'return', result: submitterResult };
     },
     submitNonExecutableProposal: async () => {
       submitNonExecutableCalls += 1;
@@ -2968,7 +2954,6 @@ async function assertAcceptedPlanReadOnlyTaskExecutorRoutesTaskOutcomeThroughAct
       session: { id: sessionId, mode: 'plan', createdAt: '', updatedAt: '', eventCount: events.length },
       events,
     }),
-    continueSameLoop: async () => genericSessionResult(sessionId),
     readActionBundle: (proposal) => ((proposal as ProposalEnvelope).payload as Record<string, any>)?.actionBundle,
     refreshRuntimeState: () => undefined,
     readOnlyResourceCompletion: () => ({ ok: false }),
@@ -2983,7 +2968,6 @@ async function assertAcceptedPlanReadOnlyTaskExecutorRoutesTaskOutcomeThroughAct
     } as AgentEvent),
     executionRequest: () => `resume-${token}`,
     readOnlyReviewContext: () => ({ sessionId, runId, planId: acceptedPlan.planId } as any),
-    reviewHandoff: async ({ result }) => result,
     currentTaskIsReadOnlyResourceValidation: () => true,
     resourceRequestFromReadOnlyActionBundle: () => ({
       version: '1',
@@ -4814,7 +4798,6 @@ async function assertAcceptedActionBundlePlanExecutorSubmitsBatchAndReviews(): P
     payload: {},
   }];
   const commands: string[] = [];
-  let reviewHandoffEvents: unknown[] = [];
   const executor = new AcceptedActionBundlePlanExecutor({
     now: () => `ts-${token}`,
     createId: (prefix) => `${prefix}-${token}`,
@@ -4840,6 +4823,28 @@ async function assertAcceptedActionBundlePlanExecutorSubmitsBatchAndReviews(): P
       }
       return { ok: true, events: [{ kind: `${kind}.ok`, runId, planId }] };
     },
+    observeKernel: async (request) => {
+      const kind = (request.command as Record<string, unknown>).kind;
+      assertEqual(kind, 'actionBatchSubmit', 'accepted action executor observes only action batch replies');
+      commands.push(String(kind));
+      return new KernelEventStatusIndex().observe({
+        ok: true,
+        events: [
+          {
+            kind: 'work_unit.queued',
+            runId,
+            planId,
+            workUnit: { id: `work-unit-${token}` },
+          },
+          {
+            kind: 'work_unit.completed',
+            runId,
+            planId,
+            workUnitId: `work-unit-${token}`,
+          },
+        ],
+      });
+    },
     appendProjectedKernelEvents: async (nextSessionId, reply) => {
       assertEqual(nextSessionId, sessionId, 'accepted action executor projects kernel events to current session');
       store.push(...(reply.events ?? []).map((event, index) => ({
@@ -4850,9 +4855,6 @@ async function assertAcceptedActionBundlePlanExecutorSubmitsBatchAndReviews(): P
         payload: event,
       } as AgentEvent)));
       return { session: { ...session, eventCount: store.length }, events: [...store] };
-    },
-    continueSameLoop: async () => {
-      throw new Error('single batch success should not resume provider loop');
     },
     kernelExecutionContractId: () => `contract-${token}`,
     temporaryGrantsForPlan: () => [],
@@ -4881,10 +4883,6 @@ async function assertAcceptedActionBundlePlanExecutorSubmitsBatchAndReviews(): P
       throw new Error('overlay savepoint is not expected for non-overlay execution');
     },
     deletePreflightReasons: () => [],
-    hasFailureOrBlocker: () => false,
-    actionBatchReadyForReview: () => true,
-    hasPermissionRequest: () => false,
-    permissionId: () => undefined,
     planProposal: () => ({
       schemaVersion: 'deepcode.agent.protocol.v3',
       proposalId: `proposal-${token}`,
@@ -4911,10 +4909,6 @@ async function assertAcceptedActionBundlePlanExecutorSubmitsBatchAndReviews(): P
     runtimeSnapshot: () => ({}),
     acceptedPlanComplete: () => true,
     executionRequest: () => `execution-${token}`,
-    reviewHandoff: async (input) => {
-      reviewHandoffEvents = input.currentKernelEvents;
-      return input.result;
-    },
   });
 
   const plan = {
@@ -4934,7 +4928,7 @@ async function assertAcceptedActionBundlePlanExecutorSubmitsBatchAndReviews(): P
     planReviewReport: {},
   } as any;
 
-  const result = await executor.execute(
+  const control = await executor.execute(
     {
       sessionId,
       decision: 'accept',
@@ -4946,14 +4940,20 @@ async function assertAcceptedActionBundlePlanExecutorSubmitsBatchAndReviews(): P
 
   assertEqual(commands[0], 'userDecisionSubmit', 'accepted action executor submits user decision first');
   assertEqual(commands[1], 'actionBatchSubmit', 'accepted action executor submits action batch after decision');
-  assertEqual(reviewHandoffEvents.length, 1, 'accepted action executor passes batch events to review handoff');
+  assertEqual(control.kind, 'assembleReview', 'accepted action executor returns Review assembly control');
+  if (control.kind !== 'assembleReview') throw new Error('accepted action executor must request Review assembly');
+  const reviewHandoffEvents = control.request.currentKernelEvents;
+  assertEqual(reviewHandoffEvents.length, 2, 'accepted action executor passes batch events to Review assembly');
+  const completedFact = reviewHandoffEvents.find((event) =>
+    (event as Record<string, unknown>).kind === 'work_unit.completed'
+  ) as Record<string, unknown> | undefined;
   assertEqual(
-    (reviewHandoffEvents[0] as Record<string, unknown>).workUnitId,
+    completedFact?.workUnitId,
     `work-unit-${token}`,
     'accepted action executor preserves work unit fact for review'
   );
   assertEqual(
-    result.events.some((event) => event.kind === 'session_run_state'),
+    control.request.result.events.some((event) => event.kind === 'session_run_state'),
     true,
     'accepted action executor records executing run state'
   );
@@ -5025,6 +5025,30 @@ function assertKernelEventStatusIndexReadsStructuredEvents(): void {
     ]),
     `status-${token}`,
     'kernel event status index reads review gate status'
+  );
+  const permissionObservation = index.observe({
+    ok: true,
+    events: [{ kind: 'permission.requested', request: { id: permissionId } }],
+  });
+  assertEqual(permissionObservation.kind, 'permissionInterrupted', 'Kernel reply reducer classifies permission interrupts');
+  const failureObservation = index.observe({
+    ok: false,
+    events: [],
+    error: { code: `code-${token}`, message: `message-${token}` },
+  });
+  assertEqual(failureObservation.kind, 'commandFailed', 'Kernel reply reducer classifies command failures');
+  const factsObservation = index.observe({
+    ok: true,
+    events: [
+      { kind: 'work_unit.queued', workUnit: { id: queuedWorkUnitId } },
+      { kind: 'work_unit.completed', workUnitId: queuedWorkUnitId },
+    ],
+  });
+  assertEqual(factsObservation.kind, 'factsObserved', 'Kernel reply reducer classifies completed facts');
+  assertEqual(
+    factsObservation.kind === 'factsObserved' ? factsObservation.readyForReview : false,
+    true,
+    'Kernel facts observation carries the shared Review readiness decision'
   );
 }
 
@@ -5423,7 +5447,6 @@ async function assertReviewDecisionHandlerAcceptsTerminalReview(): Promise<void>
     },
   }];
   const kernelCommands: string[] = [];
-  let resumeCalls = 0;
   const handler = new ReviewDecisionHandler({
     now: () => `ts-${token}`,
     createId: (prefix) => `${prefix}-${kernelCommands.length}-${store.length}-${token}`,
@@ -5468,10 +5491,6 @@ async function assertReviewDecisionHandlerAcceptsTerminalReview(): Promise<void>
       store.push(...events);
       return { session: { ...session, eventCount: store.length }, events: [...store] };
     },
-    resumeUserTurn: async () => {
-      resumeCalls += 1;
-      return { session: { ...session, eventCount: store.length }, events: [...store] };
-    },
     reviewAssembler: new ReviewAssembler({
       completedWorkUnitFacts: () => ({ actionIds: new Set(), targets: new Set() }),
       batchActionRecords: () => [],
@@ -5501,7 +5520,7 @@ async function assertReviewDecisionHandlerAcceptsTerminalReview(): Promise<void>
     },
   });
 
-  const result = await handler.resolve({
+  const control = await handler.resolve({
     sessionId,
     decision: 'accept',
     runId,
@@ -5509,7 +5528,7 @@ async function assertReviewDecisionHandlerAcceptsTerminalReview(): Promise<void>
   });
 
   assertEqual(kernelCommands.join(','), 'userDecisionSubmit,reviewGateEvaluate', 'review handler submits user decision then evaluates ReviewGate');
-  assertEqual(resumeCalls, 0, 'terminal review accept does not resume provider loop');
+  const result = returnedSession(control, 'terminal review accept returns a completed decision result');
   assertEqual(result.events.some((event) => event.kind === 'review_summary' && (event.payload as any)?.status === 'accepted'), true, 'review handler records accepted review');
   const completed = result.events.find((event) => event.kind === 'session_run_state' && (event.payload as any)?.status === 'completed');
   assert(Boolean(completed), 'review handler appends completed run state');
@@ -5517,6 +5536,111 @@ async function assertReviewDecisionHandlerAcceptsTerminalReview(): Promise<void>
   assertEqual(completedPayload?.phase, 'completed', 'review handler completed state uses completed phase');
   const owner = completedPayload?.decisionOwner as Record<string, unknown> | undefined;
   assertEqual(owner?.reviewId, reviewId, 'review handler completed state keeps review owner');
+}
+
+async function assertReviewDecisionHandlerCompletesTerminalReviewWhenKernelRunIsInactive(): Promise<void> {
+  const token = randomSmokeToken('review-handler-inactive-run');
+  const sessionId = `session-${token}`;
+  const runId = `run-${token}`;
+  const reviewId = `review-${token}`;
+  const session: AgentSession = {
+    id: sessionId,
+    mode: 'plan',
+    createdAt: `created-${token}`,
+    updatedAt: `updated-${token}`,
+  };
+  const store: AgentEvent[] = [{
+    id: `waiting-review-${token}`,
+    sessionId,
+    ts: `ts-${token}`,
+    kind: 'review_summary',
+    payload: {
+      status: 'waitingUserReview',
+      runId,
+      reviewId,
+      sourcePlanId: `plan-${token}`,
+      content: `Review content ${token}`,
+      facts: [`- work unit ${token} completed`],
+      continuations: [],
+      confirmable: true,
+    },
+  }];
+  const kernelCommands: string[] = [];
+  const handler = new ReviewDecisionHandler({
+    now: () => `ts-${token}`,
+    createId: (prefix) => `${prefix}-${kernelCommands.length}-${store.length}-${token}`,
+    kernel: async (request): Promise<KernelReply> => {
+      const command = request.command as Record<string, unknown>;
+      kernelCommands.push(String(command.kind));
+      throw new Error(`invalid command: run ${String(command.runId)} is not active`);
+    },
+    kernelAudit: async () => {
+      throw new Error('terminal review accept must not use revision audit');
+    },
+    appendProjectedKernelEvents: async () => {
+      throw new Error('inactive terminal review must not project rejected Kernel events');
+    },
+    append: async (nextSessionId, events) => {
+      assertEqual(nextSessionId, sessionId, 'inactive review handler appends to current session');
+      store.push(...events);
+      return { session: { ...session, eventCount: store.length }, events: [...store] };
+    },
+    reviewAssembler: new ReviewAssembler({
+      completedWorkUnitFacts: () => ({ actionIds: new Set(), targets: new Set() }),
+      batchActionRecords: () => [],
+      actionEffectiveCapability: () => '',
+      actionFileTargetPath: () => undefined,
+      normalizeAcceptedPlanTargetScope: (target) => target,
+      comparablePath: (value) => value,
+      resourceTextForTarget: () => undefined,
+    }),
+    reviewDecisionProjection: new ReviewDecisionProjectionBuilder(),
+    kernelStatus: new KernelEventStatusIndex(),
+    progressProjection: {
+      traceEvent: ({ kind, summary, extra, id }) => ({
+        id,
+        sessionId,
+        ts: `ts-${token}`,
+        kind,
+        payload: { summary, ...extra },
+      }),
+      sessionRunStateEvent: ({ phase, status, reason, decisionOwner }) => ({
+        id: `run-state-${token}`,
+        sessionId,
+        ts: `ts-${token}`,
+        kind: 'session_run_state',
+        payload: { phase, status, reason, decisionOwner },
+      }),
+    },
+  });
+
+  const control = await handler.resolve({
+    sessionId,
+    decision: 'accept',
+    runId,
+    existingEvents: [...store],
+  });
+
+  assertEqual(kernelCommands.join(','), 'userDecisionSubmit,reviewGateEvaluate', 'inactive review handler still attempts terminal Kernel audit and gate');
+  const result = returnedSession(control, 'inactive terminal review accept returns a completed decision result');
+  assertEqual(
+    result.events.some((event) => event.kind === 'review_summary' && (event.payload as any)?.status === 'accepted'),
+    true,
+    'inactive terminal review accept records accepted review'
+  );
+  assertEqual(
+    result.events.filter((event) => event.kind === 'trace/review_accept_noop').length,
+    2,
+    'inactive terminal review accept records audit and gate noop traces'
+  );
+  const completed = result.events.find((event) =>
+    event.kind === 'session_run_state' &&
+    (event.payload as any)?.status === 'completed' &&
+    (event.payload as any)?.reason === 'review'
+  );
+  assert(Boolean(completed), 'inactive terminal review accept still closes the review run');
+  const owner = (completed?.payload as Record<string, unknown> | undefined)?.decisionOwner as Record<string, unknown> | undefined;
+  assertEqual(owner?.reviewId, reviewId, 'inactive terminal review completed state keeps review owner');
 }
 
 async function assertPlanDecisionHandlerRejectsActivePlan(): Promise<void> {
@@ -5550,7 +5674,6 @@ async function assertPlanDecisionHandlerRejectsActivePlan(): Promise<void> {
       reviewGuide: '',
     },
   } as AgentEvent];
-  let resumed = 0;
   let executed = 0;
   const handler = new PlanDecisionHandler({
     now: () => `now-${token}`,
@@ -5560,13 +5683,12 @@ async function assertPlanDecisionHandlerRejectsActivePlan(): Promise<void> {
       store.push(...events);
       return { session: { ...session, eventCount: store.length }, events: [...store] };
     },
-    resumeUserTurn: async () => {
-      resumed += 1;
-      return { session: { ...session, eventCount: store.length }, events: [...store] };
-    },
     executeAcceptedActionBundlePlan: async () => {
       executed += 1;
-      return { session: { ...session, eventCount: store.length }, events: [...store] };
+      return {
+        kind: 'return',
+        result: { session: { ...session, eventCount: store.length }, events: [...store] },
+      };
     },
     activeDriverInteraction: () => ({ kind: 'plan', runId, planId }),
     executionRootFromDecision: () => undefined,
@@ -5608,7 +5730,7 @@ async function assertPlanDecisionHandlerRejectsActivePlan(): Promise<void> {
     },
   });
 
-  const result = await handler.resolve({
+  const control = await handler.resolve({
     sessionId,
     decision: 'reject',
     runId,
@@ -5616,7 +5738,7 @@ async function assertPlanDecisionHandlerRejectsActivePlan(): Promise<void> {
     existingEvents: [...store],
   });
 
-  assertEqual(resumed, 0, 'plan reject does not resume provider loop');
+  const result = returnedSession(control, 'plan reject returns a terminal decision result');
   assertEqual(executed, 0, 'plan reject does not execute accepted action bundle');
   const rejectedReview = result.events.find((event) => event.kind === 'plan_review' && (event.payload as any)?.status === 'rejected');
   assert(Boolean(rejectedReview), 'plan handler records rejected plan review');
@@ -5761,6 +5883,101 @@ function assertProjectionBuildersKeepKernelAndReviewReadModels(): void {
   );
   assertEqual(reviewPayload.reviewFactsContext.changedFileCount, 1, 'review summary event carries review facts context');
   assert(reviewPayload.developerDetails.facts.includes(`fact-${token}`), 'review summary event carries review facts details');
+
+  const gitReviewSummaryProjection = (gitReview: Record<string, unknown>) => new ReviewProjectionBuilder<any, { id: string }, { completedTaskIds: string[] }>({
+    reviewFactLines: () => [`fact-${token}`],
+    staticSyntaxReviewFactLines: () => [],
+    findReviewFacts: () => ({
+      completedWorkUnits: [{
+        workUnitId,
+        output: {
+          path: targetPath,
+          operation: 'write',
+          actionId,
+        },
+      }],
+      failedWorkUnits: [],
+      blockedWorkUnits: [],
+      toolResults: [],
+      gitReview,
+    }),
+    concreteContinuationExpectations: (value) => Array.isArray(value) ? value : [],
+    acceptedPlanContext: () => ({ id: `accepted-${token}` }),
+    acceptedPlanBatchCompletedTaskIds: () => [`task-${token}`],
+    acceptedPlanAfterBatch: (acceptedPlan) => acceptedPlan,
+    acceptedPlanTaskLedger: () => ({ completedTaskIds: [`task-${token}`] }),
+    buildReviewFactsContext: (input) => input,
+  });
+  const executionRoot = `/tmp/execution-root-${token}`;
+  const executionRootPlanCard = {
+    id: `plan-card-${token}`,
+    sessionId: `session-${token}`,
+    ts: new Date(0).toISOString(),
+    kind: 'plan_card',
+    payload: {
+      planId: `plan-${token}`,
+      executionRoot: {
+        ref: executionRoot,
+        attachment: { kind: 'directory', path: executionRoot, absolutePath: executionRoot },
+      },
+    },
+  } as any;
+  const mismatchedGitEvent = gitReviewSummaryProjection({
+    available: true,
+    root: `/workspace/${token}`,
+    repoRoot: `/workspace/${token}`,
+    stats: { changedFiles: 1, stagedDiffBytes: 0, unstagedDiffBytes: 10 },
+    files: [{ path: `unrelated-${token}.ts` }],
+    summary: `wrong root ${token}`,
+  }).summaryEvent({
+    sessionId: `session-${token}`,
+    plan: {
+      sessionId: `session-${token}`,
+      runId,
+      planId: `plan-${token}`,
+      userPlan: `plan-${token}`,
+      implementationPlan: { id: `implementation-${token}` },
+      actionBundle: { reviewExpectations: [], continuationExpectations: [] },
+    },
+    kernelEvents: [],
+    events: [executionRootPlanCard],
+    ts: new Date(0).toISOString(),
+    id: `review-git-mismatch-${token}`,
+  });
+  const mismatchedGitPayload = mismatchedGitEvent.payload as any;
+  assertEqual(mismatchedGitPayload.gitReview.available, false, 'review projection hides git review when root differs from execution root');
+  assertEqual(mismatchedGitPayload.gitReview.projectionFilter, 'executionRootMismatch', 'review projection records git root filter reason');
+  assertEqual(mismatchedGitPayload.developerDetails.rawGitReview.available, true, 'review projection preserves raw git review for audit');
+  assert(
+    !JSON.stringify(mismatchedGitPayload.readableReview.sections).includes(`unrelated-${token}.ts`),
+    'review projection does not show mismatched git files in readable review'
+  );
+
+  const matchedGitEvent = gitReviewSummaryProjection({
+    available: true,
+    root: executionRoot,
+    repoRoot: executionRoot,
+    stats: { changedFiles: 1, stagedDiffBytes: 0, unstagedDiffBytes: 12 },
+    files: [{ path: targetPath }],
+    summary: `right root ${token}`,
+  }).summaryEvent({
+    sessionId: `session-${token}`,
+    plan: {
+      sessionId: `session-${token}`,
+      runId,
+      planId: `plan-${token}`,
+      userPlan: `plan-${token}`,
+      implementationPlan: { id: `implementation-${token}` },
+      actionBundle: { reviewExpectations: [], continuationExpectations: [] },
+    },
+    kernelEvents: [],
+    events: [executionRootPlanCard],
+    ts: new Date(0).toISOString(),
+    id: `review-git-match-${token}`,
+  });
+  const matchedGitPayload = matchedGitEvent.payload as any;
+  assertEqual(matchedGitPayload.gitReview.available, true, 'review projection keeps git review when root matches execution root');
+  assert(JSON.stringify(matchedGitPayload.readableReview.sections).includes(targetPath), 'review projection shows matched git files');
 
   const planProjection = new PlanProjectionBuilder({
     readActionBundle: (proposal) => (proposal.payload as any).actionBundle,
@@ -7256,9 +7473,11 @@ async function assertSessionDriverLoopRequirementConfirmationCarriesExecutionRoo
     updatedAt: '2026-01-01T00:00:00.000Z',
   };
   let llmCalls = 0;
+  let runCreateCount = 0;
   let runCreateAttachments: any[] = [];
   let runCreateWorkspaceBinding: any;
   let runCreateProjectWorkingDirectory: any;
+  const llmRequests: LlmChatRequest[] = [];
   const loop = new SessionDriverLoop({
     appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
       events.push(...nextEvents);
@@ -7267,6 +7486,7 @@ async function assertSessionDriverLoopRequirementConfirmationCarriesExecutionRoo
     kernelCommand: async (request): Promise<KernelReply> => {
       const command = request.command as Record<string, any>;
       if (command.kind === 'runCreate') {
+        runCreateCount += 1;
         runCreateAttachments = command.input?.attachments ?? [];
         runCreateWorkspaceBinding = command.input?.workspaceBinding;
         runCreateProjectWorkingDirectory = command.input?.projectWorkingDirectory;
@@ -7274,7 +7494,8 @@ async function assertSessionDriverLoopRequirementConfirmationCarriesExecutionRoo
       }
       return fakeKernel(request);
     },
-    llmChat: async (): Promise<ApiResponse<LlmChatResult>> => {
+    llmChat: async (request): Promise<ApiResponse<LlmChatResult>> => {
+      llmRequests.push(request);
       llmCalls += 1;
       if (llmCalls === 1) {
         return jsonLlmResponse(genericDecisionRequestProposal(`decision-${token}`));
@@ -7320,10 +7541,15 @@ async function assertSessionDriverLoopRequirementConfirmationCarriesExecutionRoo
   });
 
   assertEqual(runCreateAttachments.length, 1, 'requirement continuation recovers one execution root attachment');
+  assertEqual(runCreateCount, 1, 'requirement decision resumes the original run without creating another Kernel run');
   assertEqual(runCreateAttachments[0]?.absolutePath, root, 'requirement continuation execution root wins over decision-time workspace binding');
   assertEqual(runCreateAttachments[0]?.rootId, `root-${token}`, 'requirement continuation preserves execution root id');
   assertEqual(runCreateWorkspaceBinding, undefined, 'requirement continuation does not carry decision-time workspace binding when execution root is known');
   assertEqual(runCreateProjectWorkingDirectory, undefined, 'requirement continuation does not carry decision-time project working directory when execution root is known');
+  assert(
+    JSON.stringify(llmRequests.at(-1)?.messages ?? []).includes(root),
+    'requirement continuation preserves the execution root in resumed provider context'
+  );
 }
 
 async function assertSessionDriverLoopRequirementChoiceEntersResumePrompt(): Promise<void> {
@@ -8748,11 +8974,7 @@ async function assertProviderTurnCycleReturnsRoutedProposal(): Promise<void> {
       lastResult: result,
     } as never),
     callProviderAndParse: async () => proposal,
-    routeProposal: (nextProposal) => routeProposalKind(nextProposal),
-    executeRoutedProposal: async () => ({
-      kind: 'continue',
-      lastResult: result,
-    }),
+    admitDirective: (nextProposal) => routeProposalKind(nextProposal),
     appendDriverFailure: async () => null,
     appendProviderFailure: async () => result,
   });
@@ -8761,10 +8983,11 @@ async function assertProviderTurnCycleReturnsRoutedProposal(): Promise<void> {
     state: { sessionId: `session-${suffix}`, phase: 'initialized' },
     lastResult: result,
   });
-  assertEqual(routed.kind, 'continue', 'provider turn cycle can continue after routed resource requests');
-  if (routed.kind === 'continue') {
-    assertEqual(routed.routed.kind, 'resourceRequest', 'provider turn cycle returns the routed proposal to RunEngine');
+  assertEqual(routed.kind, 'directiveReady', 'provider turn cycle returns one admitted directive without executing it');
+  if (routed.kind === 'directiveReady') {
+    assertEqual(routed.directive.kind, 'resourceRequest', 'provider turn cycle returns the admitted directive to RunEngine');
     assertEqual(routed.proposal, proposal, 'provider turn cycle preserves provider proposal with routed result');
+    assertEqual(routed.lastResult, result, 'provider turn cycle preserves the context admission result');
   }
 }
 
@@ -12063,12 +12286,16 @@ async function assertSessionDriverLoopReviewRevisionReturnsToPlanning(): Promise
   };
   const submittedPlans: Array<Record<string, any>> = [];
   const llmRequests: LlmChatRequest[] = [];
+  let runCreates = 0;
   const loop = new SessionDriverLoop({
     appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
       events.push(...nextEvents);
       return { session: { ...session, eventCount: events.length }, events: [...events] };
     },
-    kernelCommand: async (request): Promise<KernelReply> => planKernel(request, 'session-review-revision', submittedPlans),
+    kernelCommand: async (request): Promise<KernelReply> => {
+      if ((request.command as Record<string, unknown>).kind === 'runCreate') runCreates += 1;
+      return planKernel(request, 'session-review-revision', submittedPlans);
+    },
     llmChat: async (request): Promise<ApiResponse<LlmChatResult>> => {
       llmRequests.push(request);
       return jsonLlmResponse(genericWriteProposal(false));
@@ -12090,6 +12317,7 @@ async function assertSessionDriverLoopReviewRevisionReturnsToPlanning(): Promise
   assertEqual(result.events.some((event) => event.kind === 'plan_card'), true, 'review revision starts a new planning turn');
   assertEqual(submittedPlans.length, 1, 'review revision submits the new actionBundle to Kernel PlanReview');
   assertEqual(llmRequests.length, 1, 'review revision calls the provider for a new plan once');
+  assertEqual(runCreates, 0, 'Review revision resumes the original run without Kernel runCreate');
   const promptText = llmRequests.flatMap((request) => request.messages.map((message) => message.content)).join('\n');
   assert(promptText.includes('Add a generic script and document how to run it.'), 'review guidance enters the next PromptEnvelope');
   assert(promptText.includes('ProjectMemoryIndexDigest'), 'structured project memory index digest is included');
@@ -13945,7 +14173,8 @@ async function assertSessionDriverLoopAcceptedImplementationPlanPreservesExecuti
     createdAt: '2026-01-01T00:00:00.000Z',
     updatedAt: '2026-01-01T00:00:00.000Z',
   };
-  let runCreateAttachments: any[] = [];
+  let runCreateCount = 0;
+  const llmRequests: LlmChatRequest[] = [];
   const loop = new SessionDriverLoop({
     appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
       events.push(...nextEvents);
@@ -13954,7 +14183,7 @@ async function assertSessionDriverLoopAcceptedImplementationPlanPreservesExecuti
     kernelCommand: async (request): Promise<KernelReply> => {
       const command = request.command as Record<string, any>;
       if (command.kind === 'runCreate') {
-        runCreateAttachments = command.input?.attachments ?? [];
+        runCreateCount += 1;
         return fakeKernel(request);
       }
       if (command.kind === 'proposalSubmit') {
@@ -13976,7 +14205,10 @@ async function assertSessionDriverLoopAcceptedImplementationPlanPreservesExecuti
       if (command.kind === 'actionBatchSubmit') return { ok: true, events: [] };
       return fakeKernel(request);
     },
-    llmChat: async (): Promise<ApiResponse<LlmChatResult>> => jsonLlmResponse(genericWriteProposal(false)),
+    llmChat: async (request): Promise<ApiResponse<LlmChatResult>> => {
+      llmRequests.push(request);
+      return jsonLlmResponse(genericWriteProposal(false));
+    },
     now: () => '2026-01-01T00:00:00.000Z',
     createId: (prefix) => `${prefix}-${events.length + 1}`,
   });
@@ -13998,8 +14230,11 @@ async function assertSessionDriverLoopAcceptedImplementationPlanPreservesExecuti
     } as any,
   });
 
-  assertEqual(runCreateAttachments.length, 1, 'accepted implementationPlan continuation sends one execution root attachment');
-  assertEqual(runCreateAttachments[0]?.absolutePath, root, 'accepted implementationPlan continuation preserves the primary root');
+  assertEqual(runCreateCount, 0, 'accepted implementationPlan continuation resumes without creating another Kernel run');
+  assert(
+    JSON.stringify(llmRequests.at(-1)?.messages ?? []).includes(root),
+    'accepted implementationPlan continuation preserves the primary root in provider context'
+  );
 }
 
 async function assertSessionDriverLoopAcceptedImplementationPlanUsesPlanCardExecutionRoot(): Promise<void> {
@@ -14026,7 +14261,8 @@ async function assertSessionDriverLoopAcceptedImplementationPlanUsesPlanCardExec
     createdAt: '2026-01-01T00:00:00.000Z',
     updatedAt: '2026-01-01T00:00:00.000Z',
   };
-  let runCreateAttachments: any[] = [];
+  let runCreateCount = 0;
+  const llmRequests: LlmChatRequest[] = [];
   const loop = new SessionDriverLoop({
     appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
       events.push(...nextEvents);
@@ -14035,7 +14271,7 @@ async function assertSessionDriverLoopAcceptedImplementationPlanUsesPlanCardExec
     kernelCommand: async (request): Promise<KernelReply> => {
       const command = request.command as Record<string, any>;
       if (command.kind === 'runCreate') {
-        runCreateAttachments = command.input?.attachments ?? [];
+        runCreateCount += 1;
         return fakeKernel(request);
       }
       if (command.kind === 'proposalSubmit') {
@@ -14057,7 +14293,10 @@ async function assertSessionDriverLoopAcceptedImplementationPlanUsesPlanCardExec
       if (command.kind === 'actionBatchSubmit') return { ok: true, events: [] };
       return fakeKernel(request);
     },
-    llmChat: async (): Promise<ApiResponse<LlmChatResult>> => jsonLlmResponse(genericWriteProposal(false)),
+    llmChat: async (request): Promise<ApiResponse<LlmChatResult>> => {
+      llmRequests.push(request);
+      return jsonLlmResponse(genericWriteProposal(false));
+    },
     now: () => '2026-01-01T00:00:00.000Z',
     createId: (prefix) => `${prefix}-${events.length + 1}`,
   });
@@ -14072,9 +14311,9 @@ async function assertSessionDriverLoopAcceptedImplementationPlanUsesPlanCardExec
     workspaceBinding: { openPath: `/workspace/${randomSmokeToken('conflicting-root')}` },
   });
 
-  assertEqual(runCreateAttachments.length, 1, 'accepted implementationPlan continuation sends one plan-card execution root');
-  assertEqual(runCreateAttachments[0]?.absolutePath, root, 'plan-card execution root wins over decision-time workspace binding');
-  assertEqual(runCreateAttachments[0]?.rootId, `root-${token}`, 'plan-card execution root preserves root id');
+  assertEqual(runCreateCount, 0, 'plan-card continuation resumes without creating another Kernel run');
+  const promptText = JSON.stringify(llmRequests.at(-1)?.messages ?? []);
+  assert(promptText.includes(root), 'plan-card execution root wins over decision-time workspace binding');
 }
 
 async function assertSessionDriverLoopAcceptedImplementationPlanRecoversExecutionRootFromResourcePacket(): Promise<void> {
@@ -14115,7 +14354,8 @@ async function assertSessionDriverLoopAcceptedImplementationPlanRecoversExecutio
     createdAt: '2026-01-01T00:00:00.000Z',
     updatedAt: '2026-01-01T00:00:00.000Z',
   };
-  let runCreateAttachments: any[] = [];
+  let runCreateCount = 0;
+  const llmRequests: LlmChatRequest[] = [];
   const loop = new SessionDriverLoop({
     appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
       events.push(...nextEvents);
@@ -14124,7 +14364,7 @@ async function assertSessionDriverLoopAcceptedImplementationPlanRecoversExecutio
     kernelCommand: async (request): Promise<KernelReply> => {
       const command = request.command as Record<string, any>;
       if (command.kind === 'runCreate') {
-        runCreateAttachments = command.input?.attachments ?? [];
+        runCreateCount += 1;
         return fakeKernel(request);
       }
       if (command.kind === 'proposalSubmit') {
@@ -14146,7 +14386,10 @@ async function assertSessionDriverLoopAcceptedImplementationPlanRecoversExecutio
       if (command.kind === 'actionBatchSubmit') return { ok: true, events: [] };
       return fakeKernel(request);
     },
-    llmChat: async (): Promise<ApiResponse<LlmChatResult>> => jsonLlmResponse(genericWriteProposal(false)),
+    llmChat: async (request): Promise<ApiResponse<LlmChatResult>> => {
+      llmRequests.push(request);
+      return jsonLlmResponse(genericWriteProposal(false));
+    },
     now: () => '2026-01-01T00:00:00.000Z',
     createId: (prefix) => `${prefix}-${events.length + 1}`,
   });
@@ -14161,9 +14404,9 @@ async function assertSessionDriverLoopAcceptedImplementationPlanRecoversExecutio
     workspaceBinding: { openPath: `/workspace/${randomSmokeToken('conflicting-root')}` },
   });
 
-  assertEqual(runCreateAttachments.length, 1, 'accepted implementationPlan continuation recovers one execution root from ResourcePacket');
-  assertEqual(runCreateAttachments[0]?.absolutePath, root, 'ResourcePacket directory fact becomes the accepted execution root attachment');
-  assertEqual(runCreateAttachments[0]?.rootId, `manifest-${token}`, 'ResourcePacket manifest entry is preserved as rootId');
+  assertEqual(runCreateCount, 0, 'ResourcePacket continuation resumes without creating another Kernel run');
+  const promptText = JSON.stringify(llmRequests.at(-1)?.messages ?? []);
+  assert(promptText.includes(root), 'ResourcePacket directory fact becomes the accepted execution root context');
 }
 
 async function assertSessionDriverLoopAcceptedImplementationPlanAutoExecutesMultiTargetBatch(): Promise<void> {
@@ -15471,6 +15714,7 @@ async function assertSessionDriverLoopAcceptedImplementationPlanContinuesUntilTa
   ];
   let llmCalls = 0;
   let actionBatchSubmits = 0;
+  let runCreates = 0;
   const loop = new SessionDriverLoop({
     appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
       events.push(...nextEvents);
@@ -15478,6 +15722,7 @@ async function assertSessionDriverLoopAcceptedImplementationPlanContinuesUntilTa
     },
     kernelCommand: async (request): Promise<KernelReply> => {
       const command = request.command as Record<string, any>;
+      if (command.kind === 'runCreate') runCreates += 1;
       if (command.kind === 'proposalSubmit') {
         return {
           ok: true,
@@ -15542,6 +15787,7 @@ async function assertSessionDriverLoopAcceptedImplementationPlanContinuesUntilTa
 
   assertEqual(llmCalls, 2, 'accepted implementationPlan automatically requests the second provider batch');
   assertEqual(actionBatchSubmits, 2, 'accepted implementationPlan executes both in-scope batches');
+  assertEqual(runCreates, 0, 'accepted implementationPlan resumes the existing run without Kernel runCreate');
   assertEqual(result.events.filter((event) => event.kind === 'review_summary' && (event.payload as any)?.status === 'waitingUserReview').length, 1, 'accepted implementationPlan produces only one terminal review');
   const terminalReview = result.events.find((event) => event.kind === 'review_summary' && (event.payload as any)?.status === 'waitingUserReview');
   const terminalReviewPayload = terminalReview?.payload as any;
@@ -17234,12 +17480,16 @@ async function assertSessionDriverLoopReviewAcceptAutoGeneratesNextPlan(): Promi
   };
   const submittedPlans: Array<Record<string, any>> = [];
   const llmRequests: LlmChatRequest[] = [];
+  let runCreates = 0;
   const loop = new SessionDriverLoop({
     appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
       events.push(...nextEvents);
       return { session: { ...session, eventCount: events.length }, events: [...events] };
     },
-    kernelCommand: async (request): Promise<KernelReply> => planKernel(request, 'session-review-accept', submittedPlans),
+    kernelCommand: async (request): Promise<KernelReply> => {
+      if ((request.command as Record<string, unknown>).kind === 'runCreate') runCreates += 1;
+      return planKernel(request, 'session-review-accept', submittedPlans);
+    },
     llmChat: async (request): Promise<ApiResponse<LlmChatResult>> => {
       llmRequests.push(request);
       return jsonLlmResponse(genericWriteProposal(false));
@@ -17277,6 +17527,7 @@ async function assertSessionDriverLoopReviewAcceptAutoGeneratesNextPlan(): Promi
   assertEqual(result.events.some((event) => event.kind === 'plan_card'), true, 'default review continuation mode generates the next plan');
   assertEqual(submittedPlans.length, 1, 'default review continuation mode submits the next actionBundle for Kernel PlanReview');
   assertEqual(llmRequests.length, 1, 'default review continuation mode calls the provider once for a new plan');
+  assertEqual(runCreates, 0, 'Review continuation resumes the original run without Kernel runCreate');
 }
 
 async function assertSessionDriverLoopReviewAcceptWithoutContinuationCompletesRun(): Promise<void> {
@@ -18135,7 +18386,7 @@ async function assertSessionDriverLoopNativeReadToolDuplicateLoopRepairsToPropos
     Array.isArray(manifest.entries) && manifest.entries.some((entry: any) => String(entry?.id ?? '').startsWith('native-'))
   );
   assertEqual(nativeResourceResolveManifests.length, 1, 'duplicate native read does not repeatedly call Kernel ResourceResolve');
-  assertEqual(streamRequests.length, 4, 'duplicate native read gets one cached resume and one no-tool repair call');
+  assertEqual(streamRequests.length, 2, 'ContextAdmission suppresses a repeated native read after the first ResourceEvidence update');
   assertEqual(
     result.events.some((event) => event.kind === 'assistant_msg' && String((event.payload as any)?.content ?? '').includes('repeated read was stopped')),
     true,

@@ -11,6 +11,10 @@ import type {
 import type { PromptEnvelope } from '../../prompt/types.js';
 import type { ResourceRequestResolution } from '../../resources/ResourceRequestResolver.js';
 import type { AssistantDiagnosticInfo } from '../projection/assistantProjectionBuilder.js';
+import {
+  normalizeProposalRouterResult,
+  type ProposalRouterResult,
+} from '../proposal/proposalRouter.js';
 import { SessionDriverRepairRuntimeAccessor } from '../runFrame.js';
 import type { ResourcePacketAppendResult } from './resourceOrchestrator.js';
 
@@ -35,9 +39,7 @@ export interface GeneratedResourcePacketResult {
   remaining: ResourceRequestDraft;
 }
 
-export type ResourceRequestProposalHandlerResult =
-  | { kind: 'return'; result: AgentSessionResult }
-  | { kind: 'continue'; lastResult: AgentSessionResult };
+export type ResourceRequestProposalHandlerResult = ProposalRouterResult;
 
 export interface ResourceRequestProposalHandlerPorts<
   Input,
@@ -89,7 +91,7 @@ export interface ResourceRequestProposalHandlerPorts<
     state: State,
     packet: ResourcePacket,
     fallback: AgentSessionResult
-  ): Promise<AgentSessionResult | null>;
+  ): Promise<AgentSessionResult | ProposalRouterResult | null>;
   callResourceResume(
     input: Input,
     state: State,
@@ -103,7 +105,7 @@ export interface ResourceRequestProposalHandlerPorts<
     prompt: PromptEnvelope,
     proposal: ProposalEnvelope,
     fallback: AgentSessionResult
-  ): Promise<AgentSessionResult>;
+  ): Promise<ProposalRouterResult>;
   submitNonExecutableProposal(
     state: State,
     proposal: ProposalEnvelope,
@@ -181,10 +183,7 @@ export class ResourceRequestProposalHandler<
             state.conversationRoots
           );
         } else if (repaired.kind === 'actionBundle' || (state.acceptedImplementationPlan && repaired.kind === 'taskOutcome')) {
-          return {
-            kind: 'return',
-            result: await this.ports.submitActionProposal(input, state, prompt, repaired, lastResult),
-          };
+          return this.ports.submitActionProposal(input, state, prompt, repaired, lastResult);
         } else {
           return {
             kind: 'return',
@@ -244,15 +243,12 @@ export class ResourceRequestProposalHandler<
         lastResult
       );
       if (readOnlyCompletion) {
-        return { kind: 'return', result: readOnlyCompletion };
+        return normalizeProposalRouterResult(readOnlyCompletion);
       }
       const resumed = await this.ports.callResourceResume(input, state, prompt, proposal, packet);
       // Accepted taskOutcome advances the task ledger and must not enter Kernel proposal decoding.
       if (resumed.kind === 'actionBundle' || resumed.kind === 'taskOutcome') {
-        return {
-          kind: 'return',
-          result: await this.ports.submitActionProposal(input, state, prompt, resumed, lastResult),
-        };
+        return this.ports.submitActionProposal(input, state, prompt, resumed, lastResult);
       }
       if (resumed.kind !== 'resourceRequest') {
         return {

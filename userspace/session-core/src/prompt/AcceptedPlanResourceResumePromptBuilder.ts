@@ -52,7 +52,8 @@ export class AcceptedPlanResourceResumePromptBuilder {
         manifestEntryId: stringValue(record.manifestEntryId) ?? stringValue(record.id),
         path: stringValue(record.path) ?? stringValue(record.absolutePath) ?? stringValue(record.ref),
         kind: stringValue(record.contentKind) ?? stringValue(record.resolvedKind) ?? stringValue(record.kind),
-        textPreview: clip(stringValue(record.text) ?? stringValue(record.content) ?? stringValue(record.fileText) ?? '', 1200),
+        contentSummary: stringValue(record.contentSummary),
+        textPreview: clip(resourceItemText(record), 1200),
       };
     });
     return [
@@ -95,6 +96,15 @@ function objectRecord(value: unknown): Record<string, unknown> | undefined {
 
 function stringValue(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+function resourceItemText(record: Record<string, unknown>): string {
+  return stringValue(record.promptContent)
+    ?? stringValue(record.text)
+    ?? stringValue(record.content)
+    ?? stringValue(record.fileText)
+    ?? stringValue(record.contentSummary)
+    ?? '';
 }
 
 function clip(value: string, max: number): string {

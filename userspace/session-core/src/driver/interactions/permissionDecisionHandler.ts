@@ -4,32 +4,27 @@ import type {
   KernelCommandEnvelope,
   KernelReply,
 } from '@deepcode/protocol';
-import type { KernelEventStatusIndex } from '../execution/kernelEventStatusIndex.js';
+import type {
+  KernelEventStatusIndex,
+  KernelReplyObservation,
+} from '../execution/kernelEventStatusIndex.js';
 import type { PermissionPipeline } from '../pipelines/permissionPipeline.js';
 import type { PlanContextIndex } from '../proposal/planContextIndex.js';
 import type { ReviewProjectionSummaryPlan } from '../projection/reviewProjectionBuilder.js';
 import type { SessionTurnPhase } from '../pipelines/interactionOverlayCodec.js';
+import { returnSessionResult, type SessionLoopControlResult } from '../runContinuation.js';
 
 export interface PermissionDecisionHandlerPorts<
   Plan extends ReviewProjectionSummaryPlan = ReviewProjectionSummaryPlan
 > {
   now(): string;
   createId(prefix: string): string;
-  kernel(request: KernelCommandEnvelope): Promise<KernelReply>;
+  observeKernel(request: KernelCommandEnvelope): Promise<KernelReplyObservation>;
   appendProjectedKernelEvents(sessionId: string, reply: KernelReply): Promise<AgentSessionResult>;
   append(sessionId: string, events: AgentEvent[]): Promise<AgentSessionResult>;
   permissionPipeline: PermissionPipeline;
   kernelStatus: KernelEventStatusIndex;
   planIndex: PlanContextIndex;
-  reviewProjection: {
-    summaryEvent(input: {
-      sessionId: string;
-      plan: Plan;
-      kernelEvents: unknown[];
-      ts: string;
-      id: string;
-    }): AgentEvent;
-  };
   progressProjection: {
     traceEvent(input: {
       sessionId: string;
@@ -72,11 +67,11 @@ export class PermissionDecisionHandler<
 > {
   constructor(private readonly ports: PermissionDecisionHandlerPorts<Plan>) {}
 
-  async resolve(input: PermissionDecisionHandlerInput): Promise<AgentSessionResult> {
+  async resolve(input: PermissionDecisionHandlerInput): Promise<SessionLoopControlResult> {
     const events = input.existingEvents ?? [];
     const pending = this.ports.permissionPipeline.findPendingPermissionContext(events, input.targetId);
     if (!pending) {
-      return this.ports.append(input.sessionId, [
+      return returnSessionResult(await this.ports.append(input.sessionId, [
         this.ports.progressProjection.traceEvent({
           sessionId: input.sessionId,
           kind: 'trace/permission_accept_noop',
@@ -91,10 +86,10 @@ export class PermissionDecisionHandler<
             decision: input.decision,
           },
         }),
-      ]);
+      ]));
     }
 
-    const decisionReply = await this.ports.kernel({
+    const observed = await this.ports.observeKernel({
       command: {
         kind: 'permissionResolve',
         requestId: this.ports.createId('permission-resolve'),
@@ -102,11 +97,31 @@ export class PermissionDecisionHandler<
         decision: input.decision === 'accept' ? 'accept' : 'reject',
       },
     });
+    const decisionReply = observed.reply;
     let result = await this.ports.appendProjectedKernelEvents(input.sessionId, decisionReply);
+    if (observed.kind === 'commandFailed') {
+      return returnSessionResult(await this.ports.append(input.sessionId, [
+        this.ports.progressProjection.traceEvent({
+          sessionId: input.sessionId,
+          kind: 'trace/permission_accept_noop',
+          summary: 'Kernel could not resume the interrupted command after the permission decision.',
+          ts: this.ports.now(),
+          id: this.ports.createId('permission-resume-failed'),
+          extra: {
+            messageKey: 'session.driver.permissionDecision.resumeFailed',
+            messageArgs: {},
+            runId: pending.runId ?? input.runId,
+            permissionId: pending.id,
+            errorCode: observed.code,
+            errorMessage: observed.message,
+          },
+        }),
+      ]));
+    }
 
     if (input.decision === 'reject') {
       const runId = pending.runId ?? input.runId ?? this.ports.kernelStatus.runId(decisionReply.events ?? []) ?? 'run-unknown';
-      return (await this.ports.append(input.sessionId, [
+      return returnSessionResult((await this.ports.append(input.sessionId, [
         this.ports.progressProjection.sessionRunStateEvent({
           sessionId: input.sessionId,
           runId,
@@ -123,14 +138,13 @@ export class PermissionDecisionHandler<
           ts: this.ports.now(),
           id: this.ports.createId('session-run-cancelled-permission'),
         }),
-      ])) ?? result;
+      ])) ?? result);
     }
 
-    if (!this.ports.kernelStatus.actionBatchReadyForReview(decisionReply.events ?? [])) {
-      if (this.ports.kernelStatus.hasPermissionRequest(decisionReply.events ?? [])) {
+    if (observed.kind === 'permissionInterrupted') {
         const runId = pending.runId ?? input.runId ?? this.ports.kernelStatus.runId(decisionReply.events ?? []) ?? 'run-unknown';
-        const permissionId = this.ports.kernelStatus.permissionId(decisionReply.events ?? []);
-        return (await this.ports.append(input.sessionId, [
+        const permissionId = observed.permissionId;
+        return returnSessionResult((await this.ports.append(input.sessionId, [
           this.ports.progressProjection.sessionRunStateEvent({
             sessionId: input.sessionId,
             runId,
@@ -146,61 +160,28 @@ export class PermissionDecisionHandler<
             ts: this.ports.now(),
             id: this.ports.createId('session-run-waiting-permission'),
           }),
-        ])) ?? result;
-      }
-      return result;
+        ])) ?? result);
+    }
+    if (observed.kind !== 'factsObserved' || !observed.readyForReview) {
+      return returnSessionResult(result);
     }
 
     const runId = pending.runId ?? input.runId ?? this.ports.kernelStatus.runId(decisionReply.events ?? []);
-    if (!runId) return result;
+    if (!runId) return returnSessionResult(result);
     const plan = this.ports.planIndex.findPlanCard(result.events, runId, pending.planId);
-    if (!plan) return result;
+    if (!plan) return returnSessionResult(result);
 
-    const factsReply = await this.ports.kernel({
-      command: {
-        kind: 'reviewFactsGet',
-        requestId: this.ports.createId('review-facts-get'),
-        runId,
+    return {
+      kind: 'assembleReview',
+      request: {
         sessionId: input.sessionId,
+        runId,
+        planId: plan.planId,
+        plan: plan as unknown as Plan,
+        result,
+        currentKernelEvents: decisionReply.events ?? [],
+        requestIdPrefix: 'permission-review-facts-get',
       },
-    });
-    result = await this.ports.appendProjectedKernelEvents(input.sessionId, factsReply);
-
-    const review = this.ports.reviewProjection.summaryEvent({
-      sessionId: input.sessionId,
-      plan: plan as unknown as Plan,
-      kernelEvents: [...(decisionReply.events ?? []), ...(factsReply.events ?? [])],
-      ts: this.ports.now(),
-      id: this.ports.createId('review-summary'),
-    });
-    const reviewPayload = objectRecord(review.payload) ?? {};
-    return (await this.ports.append(input.sessionId, [
-      review,
-      this.ports.progressProjection.sessionRunStateEvent({
-        sessionId: input.sessionId,
-        runId,
-        phase: 'waiting_review',
-        reason: 'review',
-        decisionOwner: {
-          kind: 'review',
-          runId,
-          targetId: stringValue(reviewPayload.reviewId) ?? runId,
-          reviewId: stringValue(reviewPayload.reviewId) ?? runId,
-          planId: plan.planId,
-        },
-        ts: this.ports.now(),
-        id: this.ports.createId('session-run-waiting-review'),
-      }),
-    ])) ?? result;
+    };
   }
-}
-
-function objectRecord(value: unknown): Record<string, unknown> | undefined {
-  return value && typeof value === 'object' && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : undefined;
-}
-
-function stringValue(value: unknown): string | undefined {
-  return typeof value === 'string' && value.trim().length > 0 ? value : undefined;
 }

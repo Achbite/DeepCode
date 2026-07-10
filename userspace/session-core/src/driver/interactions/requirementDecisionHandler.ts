@@ -6,7 +6,6 @@ import type {
 } from '@deepcode/protocol';
 import type { ProjectMemoryMode } from '../../context/index.js';
 import type { ProjectWorkingDirectory } from '../../context/types.js';
-import type { RequirementRecord } from '../../requirement/types.js';
 import {
   buildAnswerFactsContext,
   buildReviewFactsContext,
@@ -29,7 +28,11 @@ import type {
   RequirementProjectionBuilder,
   SessionProgressProjectionBuilder,
 } from '../projection/index.js';
-import { decisionContinuationInput } from '../runContinuation.js';
+import {
+  decisionContinuationInput,
+  returnSessionResult,
+  type SessionLoopControlResult,
+} from '../runContinuation.js';
 import type { InterventionLevel, RequirementConfirmationMode, ReviewContinuationMode } from '../types.js';
 
 export type RequirementDecisionHandlerDecision = 'accept' | 'reject' | 'revise';
@@ -55,26 +58,6 @@ export interface RequirementDecisionHandlerInput {
   interactionOverlay?: InteractionOverlayContext;
 }
 
-export interface RequirementDecisionResumeInput {
-  sessionId: string;
-  content: string;
-  attachments?: AgentContextAttachment[];
-  existingEvents?: AgentEvent[];
-  workspaceBinding?: AgentWorkspaceBinding;
-  projectWorkingDirectory?: ProjectWorkingDirectory;
-  profileId?: string;
-  workflow?: string;
-  appendUserMessage: false;
-  confirmedRequirement?: RequirementRecord;
-  requirementConfirmationMode: RequirementDecisionHandlerConfirmationMode;
-  reviewContinuationMode?: RequirementDecisionHandlerContinuationMode;
-  interventionLevel?: RequirementDecisionHandlerInterventionLevel;
-  projectMemoryMode?: ProjectMemoryMode;
-  resumeResourcePackets?: boolean;
-  acceptedImplementationPlan?: AcceptedImplementationPlanContext;
-  interactionOverlay?: InteractionOverlayContext;
-}
-
 export type RequirementDriverInteractionRef =
   | { kind: 'review'; runId: string }
   | { kind: 'plan'; runId: string; planId: string }
@@ -89,7 +72,6 @@ export interface RequirementDecisionHandlerPorts {
   now(): string;
   createId(prefix: string): string;
   append(sessionId: string, events: AgentEvent[]): Promise<AgentSessionResult>;
-  resumeUserTurn(input: RequirementDecisionResumeInput): Promise<AgentSessionResult>;
   activeDriverInteraction(events: AgentEvent[]): RequirementDriverInteractionRef | null;
   executionRootFromDecision(input: RequirementDecisionHandlerInput, events: AgentEvent[]): AcceptedImplementationPlanExecutionRoot | undefined;
   buildAcceptedImplementationPlan(input: {
@@ -118,7 +100,7 @@ export interface RequirementDecisionHandlerPorts {
 export class RequirementDecisionHandler {
   constructor(private readonly ports: RequirementDecisionHandlerPorts) {}
 
-  async resolve(input: RequirementDecisionHandlerInput): Promise<AgentSessionResult> {
+  async resolve(input: RequirementDecisionHandlerInput): Promise<SessionLoopControlResult> {
     const events = input.existingEvents ?? [];
     const requirementId = input.targetId;
     const confirmation = this.ports.userInputPipeline.findRequirementConfirmation(
@@ -128,7 +110,7 @@ export class RequirementDecisionHandler {
       this.ports.activeDriverInteraction(events)
     );
     if (!confirmation) {
-      return this.appendNoop(input, requirementId);
+      return returnSessionResult(await this.appendNoop(input, requirementId));
     }
 
     const decisionEvent = this.ports.requirementProjection.decisionEvent({
@@ -143,16 +125,28 @@ export class RequirementDecisionHandler {
     const result = await this.ports.append(input.sessionId, [decisionEvent]);
 
     if (input.decision === 'reject') {
-      return this.reject(input, decisionEvent, interactionOverlay, result, requirementId);
+      return returnSessionResult(await this.reject(input, decisionEvent, interactionOverlay, result, requirementId));
     }
     if (this.ports.userInputPipeline.isResourceBudgetConfirmation(confirmation)) {
       return this.resolveResourceBudgetDecision(input, confirmation, interactionOverlay, result);
     }
     if (this.ports.userInputPipeline.isAcceptedPlanScopeConfirmation(confirmation)) {
-      return this.resolveAcceptedPlanScopeDecision(input, confirmation, decisionEvent, interactionOverlay, result);
+      return normalizeRequirementControl(await this.resolveAcceptedPlanScopeDecision(
+        input,
+        confirmation,
+        decisionEvent,
+        interactionOverlay,
+        result
+      ));
     }
     if (this.ports.userInputPipeline.isAcceptedPlanExecutionConfirmation(confirmation)) {
-      return this.resolveAcceptedPlanExecutionDecision(input, confirmation, decisionEvent, interactionOverlay, result);
+      return normalizeRequirementControl(await this.resolveAcceptedPlanExecutionDecision(
+        input,
+        confirmation,
+        decisionEvent,
+        interactionOverlay,
+        result
+      ));
     }
 
     if (input.decision === 'accept') {
@@ -166,7 +160,7 @@ export class RequirementDecisionHandler {
           optionEffect,
           result
         );
-        if (dispatched) return dispatched;
+        if (dispatched) return normalizeRequirementControl(dispatched);
       }
     }
 
@@ -230,28 +224,31 @@ export class RequirementDecisionHandler {
     confirmation: AgentEvent,
     interactionOverlay: InteractionOverlayContext | undefined,
     current: AgentSessionResult
-  ): Promise<AgentSessionResult> {
+  ): SessionLoopControlResult {
     const originalRequest = this.ports.userInputPipeline.requirementOriginalRequest(confirmation);
     const attachments = this.ports.userInputPipeline.requirementAttachments(confirmation);
-    return this.ports.resumeUserTurn(decisionContinuationInput(input, {
-      content: input.decision === 'revise' && input.guidance
-        ? [
-            originalRequest,
-            '',
-            'User guidance after the read-only resource budget checkpoint (verbatim):',
-            input.guidance,
-            '',
-            'If the user asks for an answer from the current evidence, prefer closing with the existing ResourcePackets.',
-            'If the user narrowed the scope and key facts are still missing, continue with focused read-only resourceRequest within the additional budget.',
-            'Write user-visible proposal fields in the current user request language; keep protocol keys and evidence refs unchanged.',
-          ].join('\n')
-        : originalRequest,
-      attachments,
-      existingEvents: current.events,
-      resumeResourcePackets: true,
-      interactionOverlay,
-      ...continuationRootOverride(attachments),
-    }));
+    return {
+      kind: 'resume',
+      input: decisionContinuationInput(input, {
+        content: input.decision === 'revise' && input.guidance
+          ? [
+              originalRequest,
+              '',
+              'User guidance after the read-only resource budget checkpoint (verbatim):',
+              input.guidance,
+              '',
+              'If the user asks for an answer from the current evidence, prefer closing with the existing ResourcePackets.',
+              'If the user narrowed the scope and key facts are still missing, continue with focused read-only resourceRequest within the additional budget.',
+              'Write user-visible proposal fields in the current user request language; keep protocol keys and evidence refs unchanged.',
+            ].join('\n')
+          : originalRequest,
+        attachments,
+        existingEvents: current.events,
+        resumeResourcePackets: true,
+        interactionOverlay,
+        ...continuationRootOverride(attachments),
+      }),
+    };
   }
 
   private async resolveAcceptedPlanScopeDecision(
@@ -260,7 +257,7 @@ export class RequirementDecisionHandler {
     decisionEvent: AgentEvent,
     interactionOverlay: InteractionOverlayContext | undefined,
     current: AgentSessionResult
-  ): Promise<AgentSessionResult> {
+  ): Promise<AgentSessionResult | SessionLoopControlResult> {
     const confirmationPayload = objectRecord(confirmation.payload) ?? {};
     const decisionRequest = objectRecord(confirmationPayload.decisionRequest) ?? {};
     const runId = stringValue(confirmationPayload.runId) ?? input.runId;
@@ -272,15 +269,18 @@ export class RequirementDecisionHandler {
 
     if (input.decision === 'revise' || selectedOptionId === 'revise-plan') {
       const attachments = this.ports.userInputPipeline.requirementAttachments(confirmation);
-      return this.ports.resumeUserTurn(decisionContinuationInput(input, {
-        content: this.ports.repairLoop.acceptedPlanScopeRevisionRequest({ confirmation, plan, guidance: input.guidance }),
-        attachments,
-        existingEvents: current.events,
-        reviewContinuationMode: input.reviewContinuationMode,
-        resumeResourcePackets: true,
-        interactionOverlay,
-        ...continuationRootOverride(attachments),
-      }));
+      return {
+        kind: 'resume',
+        input: decisionContinuationInput(input, {
+          content: this.ports.repairLoop.acceptedPlanScopeRevisionRequest({ confirmation, plan, guidance: input.guidance }),
+          attachments,
+          existingEvents: current.events,
+          reviewContinuationMode: input.reviewContinuationMode,
+          resumeResourcePackets: true,
+          interactionOverlay,
+          ...continuationRootOverride(attachments),
+        }),
+      };
     }
 
     if (!plan || !plan.implementationPlan) {
@@ -306,16 +306,19 @@ export class RequirementDecisionHandler {
     const guidance = input.guidance?.trim()
       ? `User guidance for the accepted-plan scope intervention (verbatim):\n${input.guidance.trim()}`
       : this.ports.acceptedPlanScopeDecisionOverlay.resumeGuidance(selectedEffect);
-    return this.ports.resumeUserTurn(decisionContinuationInput(input, {
-      content: this.ports.executionPrompt.executionRequest(plan, nextAcceptedPlan, guidance),
-      attachments,
-      existingEvents: current.events,
-      reviewContinuationMode: input.reviewContinuationMode,
-      resumeResourcePackets: true,
-      acceptedImplementationPlan: nextAcceptedPlan,
-      interactionOverlay,
-      ...continuationRootOverride(attachments),
-    }));
+    return {
+      kind: 'resume',
+      input: decisionContinuationInput(input, {
+        content: this.ports.executionPrompt.executionRequest(plan, nextAcceptedPlan, guidance),
+        attachments,
+        existingEvents: current.events,
+        reviewContinuationMode: input.reviewContinuationMode,
+        resumeResourcePackets: true,
+        acceptedImplementationPlan: nextAcceptedPlan,
+        interactionOverlay,
+        ...continuationRootOverride(attachments),
+      }),
+    };
   }
 
   private async resolveAcceptedPlanExecutionDecision(
@@ -324,7 +327,7 @@ export class RequirementDecisionHandler {
     decisionEvent: AgentEvent,
     interactionOverlay: InteractionOverlayContext | undefined,
     current: AgentSessionResult
-  ): Promise<AgentSessionResult> {
+  ): Promise<AgentSessionResult | SessionLoopControlResult> {
     const acceptedContext = this.ports.recoverAcceptedPlanFromOverlay(input, current.events, interactionOverlay);
     if (!acceptedContext) {
       return this.ports.append(input.sessionId, [
@@ -346,38 +349,44 @@ export class RequirementDecisionHandler {
       const attachments = acceptedContext.acceptedPlan.executionRoot
         ? [acceptedContext.acceptedPlan.executionRoot.attachment]
         : this.ports.userInputPipeline.requirementAttachments(confirmation);
-      return this.ports.resumeUserTurn(decisionContinuationInput(input, {
-        content: this.ports.executionPrompt.executionRequest(acceptedContext.plan, acceptedContext.acceptedPlan, guidance),
-        attachments,
-        existingEvents: current.events,
-        reviewContinuationMode: input.reviewContinuationMode,
-        resumeResourcePackets: true,
-        acceptedImplementationPlan: acceptedContext.acceptedPlan,
-        interactionOverlay,
-        ...continuationRootOverride(attachments),
-      }));
+      return {
+        kind: 'resume',
+        input: decisionContinuationInput(input, {
+          content: this.ports.executionPrompt.executionRequest(acceptedContext.plan, acceptedContext.acceptedPlan, guidance),
+          attachments,
+          existingEvents: current.events,
+          reviewContinuationMode: input.reviewContinuationMode,
+          resumeResourcePackets: true,
+          acceptedImplementationPlan: acceptedContext.acceptedPlan,
+          interactionOverlay,
+          ...continuationRootOverride(attachments),
+        }),
+      };
     }
     const attachments = acceptedContext.acceptedPlan.executionRoot
       ? [acceptedContext.acceptedPlan.executionRoot.attachment]
       : this.ports.userInputPipeline.requirementAttachments(confirmation);
-    return this.ports.resumeUserTurn({
-      sessionId: input.sessionId,
-      content: this.ports.executionPrompt.executionRequest(acceptedContext.plan, acceptedContext.acceptedPlan, guidance),
-      attachments,
-      existingEvents: current.events,
-      workspaceBinding: continuationWorkspaceBinding(input, attachments),
-      projectWorkingDirectory: continuationProjectWorkingDirectory(input, attachments),
-      profileId: input.profileId,
-      workflow: input.workflow,
-      appendUserMessage: false,
-      requirementConfirmationMode: input.decision === 'revise' ? 'always' : 'off',
-      reviewContinuationMode: input.reviewContinuationMode,
-      interventionLevel: input.interventionLevel,
-      projectMemoryMode: input.projectMemoryMode,
-      resumeResourcePackets: true,
-      acceptedImplementationPlan: acceptedContext.acceptedPlan,
-      interactionOverlay,
-    });
+    return {
+      kind: 'resume',
+      input: {
+        sessionId: input.sessionId,
+        content: this.ports.executionPrompt.executionRequest(acceptedContext.plan, acceptedContext.acceptedPlan, guidance),
+        attachments,
+        existingEvents: current.events,
+        workspaceBinding: continuationWorkspaceBinding(input, attachments),
+        projectWorkingDirectory: continuationProjectWorkingDirectory(input, attachments),
+        profileId: input.profileId,
+        workflow: input.workflow,
+        appendUserMessage: false,
+        requirementConfirmationMode: input.decision === 'revise' ? 'always' : 'off',
+        reviewContinuationMode: input.reviewContinuationMode,
+        interventionLevel: input.interventionLevel,
+        projectMemoryMode: input.projectMemoryMode,
+        resumeResourcePackets: true,
+        acceptedImplementationPlan: acceptedContext.acceptedPlan,
+        interactionOverlay,
+      },
+    };
   }
 
   private async applyRequirementOptionEffect(
@@ -387,7 +396,7 @@ export class RequirementDecisionHandler {
     interactionOverlay: InteractionOverlayContext | undefined,
     effect: RequirementOptionEffect,
     current: AgentSessionResult
-  ): Promise<AgentSessionResult | undefined> {
+  ): Promise<AgentSessionResult | SessionLoopControlResult | undefined> {
     const normalizedEffect = normalizeDecisionEffect(effect);
     const stateDecision = evaluateRunState({ decisionEffect: normalizedEffect });
     if (stateDecision.kind === 'continueAcceptedPlan') return undefined;
@@ -503,7 +512,7 @@ export class RequirementDecisionHandler {
     current: AgentSessionResult,
     runId: string,
     baseOwner: { kind: 'requirement'; runId: string; targetId?: string; requirementId?: string }
-  ): Promise<AgentSessionResult | undefined> {
+  ): Promise<AgentSessionResult | SessionLoopControlResult | undefined> {
     const decisionPayload = objectRecord(decisionEvent.payload) ?? {};
     const confirmationPayload = objectRecord(confirmation.payload) ?? {};
     const decisionRequest = objectRecord(confirmationPayload.decisionRequest) ?? {};
@@ -578,15 +587,18 @@ export class RequirementDecisionHandler {
     const result = await this.ports.append(input.sessionId, events) ?? current;
     const originalRequest = this.ports.userInputPipeline.requirementDecisionResumeRequest(confirmation, decisionEvent, input.decision, input.guidance);
     const attachments = this.ports.userInputPipeline.requirementAttachments(confirmation);
-    return this.ports.resumeUserTurn(decisionContinuationInput(input, {
-      content: originalRequest,
-      attachments,
-      existingEvents: result.events,
-      confirmedRequirement: this.ports.userInputPipeline.requirementRecordFromEvent(confirmation, 'confirmed'),
-      acceptedImplementationPlan: nextAccepted,
-      interactionOverlay,
-      ...continuationRootOverride(attachments),
-    }));
+    return {
+      kind: 'resume',
+      input: decisionContinuationInput(input, {
+        content: originalRequest,
+        attachments,
+        existingEvents: result.events,
+        confirmedRequirement: this.ports.userInputPipeline.requirementRecordFromEvent(confirmation, 'confirmed'),
+        acceptedImplementationPlan: nextAccepted,
+        interactionOverlay,
+        ...continuationRootOverride(attachments),
+      }),
+    };
   }
 
   private recoverAcceptedPlanForRequirement(
@@ -611,26 +623,28 @@ export class RequirementDecisionHandler {
     decisionEvent: AgentEvent,
     interactionOverlay: InteractionOverlayContext | undefined,
     current: AgentSessionResult
-  ): Promise<AgentSessionResult> {
+  ): SessionLoopControlResult {
     const originalRequest = this.ports.userInputPipeline.requirementDecisionResumeRequest(confirmation, decisionEvent, input.decision, input.guidance);
     const attachments = this.ports.userInputPipeline.requirementAttachments(confirmation);
-    return this.ports.resumeUserTurn({
-      sessionId: input.sessionId,
-      content: originalRequest,
-      attachments,
-      existingEvents: current.events,
-      // Requirement decisions continue the original interaction root; a host-shell cwd must not replace it.
-      workspaceBinding: continuationWorkspaceBinding(input, attachments),
-      projectMemoryMode: input.projectMemoryMode,
-      projectWorkingDirectory: continuationProjectWorkingDirectory(input, attachments),
-      profileId: input.profileId,
-      workflow: input.workflow,
-      appendUserMessage: false,
-      confirmedRequirement: input.decision === 'accept' ? this.ports.userInputPipeline.requirementRecordFromEvent(confirmation, 'confirmed') : undefined,
-      requirementConfirmationMode: input.decision === 'revise' ? 'always' : 'off',
-      interventionLevel: input.interventionLevel,
-      interactionOverlay,
-    });
+    return {
+      kind: 'resume',
+      input: {
+        sessionId: input.sessionId,
+        content: originalRequest,
+        attachments,
+        existingEvents: current.events,
+        workspaceBinding: continuationWorkspaceBinding(input, attachments),
+        projectMemoryMode: input.projectMemoryMode,
+        projectWorkingDirectory: continuationProjectWorkingDirectory(input, attachments),
+        profileId: input.profileId,
+        workflow: input.workflow,
+        appendUserMessage: false,
+        confirmedRequirement: input.decision === 'accept' ? this.ports.userInputPipeline.requirementRecordFromEvent(confirmation, 'confirmed') : undefined,
+        requirementConfirmationMode: input.decision === 'revise' ? 'always' : 'off',
+        interventionLevel: input.interventionLevel,
+        interactionOverlay,
+      },
+    };
   }
 }
 
@@ -671,4 +685,13 @@ function objectRecord(value: unknown): Record<string, unknown> | undefined {
 
 function stringValue(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function normalizeRequirementControl(
+  value: AgentSessionResult | SessionLoopControlResult
+): SessionLoopControlResult {
+  const kind = objectRecord(value)?.kind;
+  return kind === 'return' || kind === 'resume' || kind === 'assembleReview'
+    ? value as SessionLoopControlResult
+    : returnSessionResult(value as AgentSessionResult);
 }
