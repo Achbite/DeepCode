@@ -679,7 +679,7 @@ run_with_cargo_fallback_shim() {
 
 tracked_files() {
   if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    git ls-files -- "$@"
+    git ls-files --cached --others --exclude-standard -- "$@"
   else
     find "$@" -type f 2>/dev/null || true
   fi
@@ -699,6 +699,7 @@ find_existing_files() {
 stage_hash() {
   local stage="$1"
   {
+    tracked_files build.sh scripts/cargo-with-fallback.sh
     case "$stage" in
       gui)
         tracked_files package.json pnpm-lock.yaml userspace/protocol userspace/session-core userspace/gui \
@@ -715,24 +716,24 @@ stage_hash() {
           | grep -Ev '(^|/)(dist|dist-deepcode-gui|node_modules|target)/' || true
         ;;
       kernel)
-        tracked_files Cargo.toml crates/deepcode-kernel-abi crates/deepcode-kernel-core \
+        tracked_files Cargo.toml Cargo.lock crates/deepcode-kernel-abi crates/deepcode-kernel-core \
           crates/deepcode-kernel-runtime crates/deepcode-kernel-policy crates/deepcode-kernel-ledger \
           crates/deepcode-kernel-config crates/deepcode-kernel-workflow \
           crates/deepcode-kernel-context crates/deepcode-kernel-skills crates/deepcode-kernel-audit \
           crates/deepcode-kernel-client crates/deepcode-kernel-daemon shells/cli shells/tui
         ;;
       daemon)
-        tracked_files Cargo.toml crates/deepcode-kernel-abi crates/deepcode-kernel-core \
+        tracked_files Cargo.toml Cargo.lock crates/deepcode-kernel-abi crates/deepcode-kernel-core \
           crates/deepcode-kernel-runtime crates/deepcode-kernel-policy crates/deepcode-kernel-ledger \
           crates/deepcode-kernel-config crates/deepcode-kernel-workflow \
           crates/deepcode-kernel-context crates/deepcode-kernel-skills crates/deepcode-kernel-audit \
           crates/deepcode-kernel-daemon
         ;;
       cli)
-        tracked_files Cargo.toml crates/deepcode-kernel-abi crates/deepcode-kernel-client shells/cli
+        tracked_files Cargo.toml Cargo.lock crates/deepcode-kernel-abi crates/deepcode-kernel-client shells/cli
         ;;
       tui)
-        tracked_files Cargo.toml crates/deepcode-kernel-abi crates/deepcode-kernel-client shells/tui
+        tracked_files Cargo.toml Cargo.lock crates/deepcode-kernel-abi crates/deepcode-kernel-client shells/tui
         ;;
       tauri)
         tracked_files package.json pnpm-lock.yaml shells/tauri

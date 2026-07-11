@@ -158,12 +158,16 @@ running_process_ids_for_path() {
 target_app_process_ids() {
   local app_bin="$BIN_DIR/$APP_NAME.app/Contents/MacOS/$TAURI_BIN_NAME"
   local kernel_bin="$BIN_DIR/$APP_NAME.app/Contents/MacOS/deepcode-kernel"
+  local distribution_kernel_bin="$BIN_DIR/deepcode-kernel"
 
   if [ -e "$app_bin" ]; then
     running_process_ids_for_path "$app_bin" || true
   fi
   if [ -e "$kernel_bin" ]; then
     running_process_ids_for_path "$kernel_bin" || true
+  fi
+  if [ -e "$distribution_kernel_bin" ]; then
+    running_process_ids_for_path "$distribution_kernel_bin" || true
   fi
 }
 
@@ -447,9 +451,32 @@ clean_frontend_package_dist() {
 
 refresh_gui_dist_with_docker() {
   command -v docker >/dev/null 2>&1 || return 1
-  docker container inspect deepcode-dev >/dev/null 2>&1 || return 1
-  log "refresh $PRODUCT GUI dist in deepcode-dev Docker container"
-  docker exec deepcode-dev bash -lc "DEEPCODE_FORCE_BUILD=1 bash ./build.sh --stage $DOCKER_GUI_STAGE"
+  docker image inspect deepcode-dev:latest >/dev/null 2>&1 || return 1
+  local workspace_source=""
+  workspace_source="$(
+    docker container inspect \
+      --format '{{range .Mounts}}{{if eq .Destination "/workspace"}}{{.Source}}{{end}}{{end}}' \
+      deepcode-dev 2>/dev/null || true
+  )"
+  if [ -n "$workspace_source" ] \
+    && [ "$(cd "$workspace_source" 2>/dev/null && pwd -P)" = "$(cd "$ROOT_DIR" && pwd -P)" ]; then
+    log "refresh $PRODUCT GUI dist in deepcode-dev Docker container"
+    docker exec deepcode-dev bash -c "DEEPCODE_FORCE_BUILD=1 bash ./build.sh --stage $DOCKER_GUI_STAGE"
+    return
+  fi
+
+  if [ -n "$workspace_source" ]; then
+    log "deepcode-dev uses $workspace_source; build $PRODUCT GUI from the active checkout in an isolated container"
+  else
+    log "build $PRODUCT GUI from the active checkout in an isolated container"
+  fi
+  docker run --rm \
+    --mount "type=bind,src=$ROOT_DIR,dst=/workspace" \
+    --mount "type=volume,src=deepcode-node-modules,dst=/workspace/node_modules" \
+    --mount "type=volume,src=deepcode-pnpm-store,dst=/root/.local/share/pnpm/store" \
+    --workdir /workspace \
+    deepcode-dev:latest \
+    bash -c "DEEPCODE_FORCE_BUILD=1 bash ./build.sh --stage $DOCKER_GUI_STAGE"
 }
 
 ensure_gui_dist() {
