@@ -33,6 +33,7 @@ lerna-debug.log*
 .env
 .env.*
 !.env.example
+.deepcode-worktree.mk
 
 # ---- IDE / 系统 ----
 .DS_Store
