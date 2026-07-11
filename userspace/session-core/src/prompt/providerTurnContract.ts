@@ -1,4 +1,3 @@
-import { actionBundleProtocolShapeLines, resourceRequestProtocolShapeLine } from '../protocol/protocolContract.js';
 import type { PromptEnvelopeBuilderInput } from './types.js';
 import { buildPromptPacketFrames, renderPromptPacketFrames, type PromptPacketFrame } from './promptPacket.js';
 
@@ -87,66 +86,32 @@ export function inferProviderTurnMode(input: PromptEnvelopeBuilderInput): Provid
 export function providerVisibleSchemaDigest(input: PromptEnvelopeBuilderInput): string {
   const turnMode = inferProviderTurnMode(input);
   const executionLikeTurn = turnMode === 'acceptedTaskExecution' || turnMode === 'resourceResume' || turnMode === 'scopeIntervention';
-  const allowedKinds = new Set(narrowAllowedKinds(input.allowedProposals, turnMode));
-  const visibleSchemaKinds = new Set(
-    [...allowedKinds].filter((kind) => executionLikeTurn || (kind !== 'actionBundle' && kind !== 'taskOutcome'))
-  );
-  const schemaLines = [
-    'Agent Protocol v3 current turn schema selector: one JSON object; choose one ProviderTurnContract.allowedKinds kind.',
-    `Current schema digest covers only: ${[...visibleSchemaKinds].join(', ') || 'none'}. reviewSummary is Session-generated from Kernel facts and must never be returned by the provider.`,
-    visibleSchemaKinds.has('answer')
-      ? 'answer top-level field: answer.format="markdown"; answer.content is the user-visible response.'
-      : '',
-    visibleSchemaKinds.has('resourceRequest') ? resourceRequestProtocolShapeLine() : '',
-    visibleSchemaKinds.has('decisionRequest')
-      ? 'decisionRequest top-level field: decisionRequest.version/id/question/options/allowsFreeform; question must be a non-empty user-visible string; use 2-3 mutually exclusive options with one recommended option.'
-      : '',
-    visibleSchemaKinds.has('taskPlan')
-      ? 'taskPlan top-level field: taskPlan.version/id/title/summary/tasks/risks/reviewCheckpoints. tasks[] is an ordered queue of reviewable batches, not one task per file; group related files/ops. Every task must include capability, concrete non-root target or targets, acceptanceCriteria, and failureCriteria. Use fs.write/fs.patch/fs.delete for file-system changes; no codeBlocks, actionBundle, commandBlocks, patches, source code, or graph structures.'
-      : '',
-    executionLikeTurn && visibleSchemaKinds.has('taskOutcome')
-      ? 'taskOutcome top-level field: taskOutcome.version/id/taskId/status/reason/evidenceRefs; use only when the current accepted task is already sufficiently satisfied and no Kernel write/delete action is needed.'
-      : '',
-    visibleSchemaKinds.has('diagnostic')
-      ? 'diagnostic top-level field: diagnostic.version/id/severity/summary/details; terminal explanation only, never execution.'
-      : '',
-  ].filter(Boolean);
-  if (!executionLikeTurn) {
+  if (executionLikeTurn) {
     return [
-      ...schemaLines,
-      'Execution-only proposal schema is withheld in this turn. For side-effect work, output taskPlan unless the final NextActionInstruction explicitly requires another allowed kind.',
+      'Execution uses provider-native Session semantic tools.',
+      'Use exactly one of: session.request_resources, session.request_decision, session.submit_task_artifacts, session.complete_current_task, session.report_diagnostic.',
+      'For generated content, submit only current IntentSlot ids and artifact content. Session compiles the directive into an internal Kernel command.',
+      'Do not output Kernel tool identifiers, actionBundle transport fields, permission fields, WorkUnit fields, or audit fields.',
     ].join('\n');
   }
   return [
-    ...schemaLines,
-    allowedKinds.has('actionBundle')
-      ? [
-        'actionBundle proposal top-level fields: userPlanMarkdown, codeBlocks, actionBundle. Use it only for the current accepted task.',
-        ...actionBundleProtocolShapeLines(),
-        'codeBlocks items use {blockId,targetPath,language?,operation?,contentLines,allowEmptyContent?}. contentLines is the only provider-facing source-code content carrier.',
-        'When ToolIntentTemplates are present, actionBundle.actions[] should prefer those templates for the current task. Concrete adjacent operations needed for correctness may be included; Session and Kernel validate scope before execution.',
-        'When no ToolIntentTemplates are present, use one currentTaskCapabilities id from this ProviderTurnContract and concrete targets required by the current task.',
-        'File operation actions must use fs.* toolIds. Action entries use actionId, toolId, args, and description; Kernel derives capability, permission, readSet/writeSet, and conflictKeys.',
-        'Do not output capability, permissionLabels, accessScopes, resourceScope, commandBlocks, legacy implementationPlan, or payload wrapper fields.',
-      ].join('\n')
-      : '',
-    allowedKinds.has('taskOutcome')
-      ? 'If the current accepted task is already satisfied by visible ResourceEvidence, generated artifact evidence, or confirmed task state and no action is needed, return taskOutcome with status="modelJudgedSufficient" instead of inventing an empty actionBundle.'
-      : '',
-  ].filter(Boolean).join('\n');
+    'Planning uses provider-native Session semantic tools.',
+    'Use exactly one of: session.request_resources, session.request_decision, session.submit_plan, session.submit_answer, session.report_diagnostic.',
+    'A submitted plan is an ordered task queue, not a dependency graph.',
+    'Do not output Kernel tool identifiers, permission fields, WorkUnit fields, or audit fields.',
+  ].join('\n');
 }
 
 export function providerVisibleWorkflowState(input: PromptEnvelopeBuilderInput): string {
   const mode = inferProviderTurnMode(input);
   const lines = [
     `Current workflow state: ${input.workflowState}.`,
-    `Allowed proposals: ${input.allowedProposals.join(', ') || 'none'}.`,
     `Provider turn mode: ${mode}.`,
   ];
   if (mode === 'acceptedTaskExecution') {
-    lines.push(`Current accepted task tool intent scope:\n${input.capabilityCatalogSummary || 'none'}`);
+    lines.push(`Current accepted task IntentSlot scope:\n${input.capabilityCatalogSummary || 'none'}`);
   } else {
-    lines.push('Kernel execution tool argument catalog is not visible in this turn. Use taskPlan operation intent, focused resourceRequest, decisionRequest, answer, or diagnostic as allowed.');
+    lines.push('Use the registered planning semantic tools. Kernel execution contracts are not provider-visible.');
   }
   return lines.join('\n');
 }
@@ -174,21 +139,10 @@ function toolIntentTemplates(input: PromptEnvelopeBuilderInput, turnMode: Provid
   }
   const record = objectRecord(input.currentTaskContext);
   const targets = stringArray(record?.targets);
-  const capabilities = stringArray(record?.capabilities);
   const lines = [
     `currentTaskTargets=${targets.length ? targets.join(', ') : 'none'}`,
-    `currentTaskCapabilities=${capabilities.length ? capabilities.join(', ') : 'none'}`,
-    'Prefer currentTaskTargets for actionBundle operations. If the current task needs a concrete adjacent target, include it explicitly; Session and Kernel validate scope before execution. Do not import unrelated targets from plan summary, memory, original user request, or later tasks.',
+    'Use only IntentSlot ids supplied by Session for artifact submission. Do not submit target paths or Kernel operations.',
   ];
-  if (capabilities.includes('fs.delete')) {
-    lines.push('fs.delete intent: args.path must be one normalized current task target; directory delete requires args.targetKind="directory" and args.recursive=true only for an accepted directory target.');
-  }
-  if (capabilities.includes('fs.write')) {
-    lines.push('fs.write intent: write complete replacement content for concrete current task paths; use codeBlocks[].contentLines and args.sourceBlockId. Do not request existing text only to replace the whole file.');
-  }
-  if (capabilities.includes('fs.patch')) {
-    lines.push('fs.patch intent: request focused ResourceEvidence first unless exact current match text is already visible; args.patchSpec.match.text must copy Kernel-observed evidence.');
-  }
   return lines;
 }
 

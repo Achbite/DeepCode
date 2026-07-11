@@ -16,6 +16,9 @@ import { SessionDriverProviderRuntimeAccessor } from '../runFrame.js';
 import { buildProviderTurnSnapshot } from './providerTurnSnapshot.js';
 import { renderProviderTurnUserPrompt } from './providerTurnPromptRenderer.js';
 import type { ContextFrameBuilder } from './contextFrameBuilder.js';
+import { ProviderProfileRegistry } from '../../provider/ProviderProfileRegistry.js';
+
+const providerProfiles = new ProviderProfileRegistry();
 
 export interface ProviderSideCallContextAdmissionState extends SessionDriverProviderRuntimeState {
   sessionId: string;
@@ -35,6 +38,7 @@ export interface ProviderSideCallContextAdmissionInput<State extends ProviderSid
   requiredKind?: string;
   dynamicContent: string;
   userRequest?: string;
+  errorSummary?: string;
   contextAssembly?: ContextAssemblyRecord;
   currentTaskContext?: CurrentTaskContext;
   resourcePackets?: ResourcePacket[];
@@ -60,8 +64,10 @@ export interface ProviderSideCallContextAdmissionResult {
 export function prepareProviderSideCallContextAdmission<State extends ProviderSideCallContextAdmissionState>(
   input: ProviderSideCallContextAdmissionInput<State>
 ): ProviderSideCallContextAdmissionResult {
+  const profile = providerProfiles.profile(providerProfiles.profileIdForMode(input.turnMode));
   const prompt = {
     ...input.prompt,
+    stablePrefix: profile.systemContract,
     dynamicSuffix: input.dynamicContent,
   };
   const contract = input.contextFrameBuilder.buildSessionProviderTurnContract({
@@ -74,6 +80,7 @@ export function prepareProviderSideCallContextAdmission<State extends ProviderSi
     prompt,
     contextAssembly: input.contextAssembly ?? input.state.contextAssembly,
     userRequest: input.userRequest ?? input.state.userRequest,
+    errorSummary: input.errorSummary,
     acceptedPlanActive: Boolean(input.currentTaskContext),
     currentTaskContext: input.currentTaskContext,
     resourcePackets: input.resourcePackets,
@@ -111,16 +118,10 @@ export function prepareProviderSideCallContextAdmission<State extends ProviderSi
 export function prepareProviderSideCallMessagesContextAdmission<State extends ProviderSideCallContextAdmissionState>(
   input: ProviderSideCallMessagesContextAdmissionInput<State>
 ): ProviderSideCallContextAdmissionResult {
-  const systemContent = input.messages.find((message) => message.role === 'system' && typeof message.content === 'string')?.content
-    ?? input.prompt.stablePrefix;
   const dynamicContent = [...input.messages].reverse().find((message) => message.role === 'user' && typeof message.content === 'string')?.content
     ?? input.prompt.dynamicSuffix;
   return prepareProviderSideCallContextAdmission({
     ...input,
-    prompt: {
-      ...input.prompt,
-      stablePrefix: systemContent,
-    },
     dynamicContent,
   });
 }

@@ -15,11 +15,14 @@ import type {
   ResourcePacket,
 } from '../../context/types.js';
 import type { RequirementRecord } from '../../requirement/types.js';
+import type { AcceptedImplementationPlanContext } from '../../accepted-plan/types.js';
 import type { PromptEnvelope } from '../../prompt/types.js';
 import type { HookInput, HookResult } from '../hooks/index.js';
-import type { DriverProviderTurnFrame, ModelContextBundle, ProviderTurnSnapshot, ToolIntentTemplate } from '../runFrame.js';
+import type { DriverProviderTurnFrame, ModelContextBundle, ProviderTurnSnapshot, SessionDriverTaskResourceProgress, ToolIntentTemplate } from '../runFrame.js';
 import { SessionDriverProviderRuntimeAccessor } from '../runFrame.js';
 import { buildProviderTurnSnapshot } from './providerTurnSnapshot.js';
+import { IntentSlotRegistry } from '../execution/intentSlot.js';
+import { ProviderProfileRegistry } from '../../provider/ProviderProfileRegistry.js';
 
 export interface ProviderTurnContextState {
   sessionId: string;
@@ -45,11 +48,13 @@ export interface ProviderTurnContextState {
   acceptedImplementationPlan?: unknown;
   implementationBatch?: unknown;
   generatedArtifactEvidence: Map<string, unknown>;
+  resourceRequestProgressByTask?: Map<string, SessionDriverTaskResourceProgress>;
   cachePlan?: PromptCachePlan;
   contextAssembly?: ContextAssemblyRecord;
   taskLocalCompactRecords?: ContextAssemblyTaskLocalCompactRecord[];
   providerTurnFrame?: DriverProviderTurnFrame;
   modelContextBundle?: ModelContextBundle;
+  semanticDirectiveErrorSummary?: string;
 }
 
 export interface ProviderTurnContextInput {
@@ -94,6 +99,7 @@ export interface ProviderTurnContextCoordinatorPorts<State extends ProviderTurnC
     contextAssembly?: ContextAssemblyRecord;
     userRequest: string;
     confirmedDecisionSummary?: string;
+    errorSummary?: string;
     acceptedPlanActive: boolean;
     currentTaskContext?: CurrentTaskContext;
     resourcePackets: ResourcePacket[];
@@ -105,6 +111,9 @@ export interface ProviderTurnContextCoordinatorPorts<State extends ProviderTurnC
 }
 
 export class ProviderTurnContextCoordinator<State extends ProviderTurnContextState> {
+  private readonly intentSlots = new IntentSlotRegistry();
+  private readonly profiles = new ProviderProfileRegistry();
+
   constructor(private readonly ports: ProviderTurnContextCoordinatorPorts<State>) {}
 
   async prepare(state: State, input: ProviderTurnContextInput): Promise<ProviderTurnContextResult> {
@@ -127,7 +136,7 @@ export class ProviderTurnContextCoordinator<State extends ProviderTurnContextSta
       allowedProposals,
       capabilityCatalogSummary: acceptedExecution
         ? this.acceptedExecutionCapabilitySummary(state)
-        : this.ports.capabilityCatalogSummary(state),
+        : '',
       memoryDocument: acceptedExecution ? undefined : state.memoryDocument,
       projectMemoryMode: input.projectMemoryMode,
       extraMemoryHints: this.ports.memoryHints(state),
@@ -138,6 +147,9 @@ export class ProviderTurnContextCoordinator<State extends ProviderTurnContextSta
       currentTaskContext: state.currentTaskContext,
       taskCursor: state.taskExecutionCursor,
       taskLocalCompactRecords: state.taskLocalCompactRecords,
+      currentTaskResourcePacketIds: state.currentTaskContext?.taskId
+        ? state.resourceRequestProgressByTask?.get(state.currentTaskContext.taskId)?.packetIds
+        : undefined,
       initialContext: state.initialContext,
       resourcePackets: state.resourcePackets,
       conversationRoots: state.conversationRoots,
@@ -158,7 +170,11 @@ export class ProviderTurnContextCoordinator<State extends ProviderTurnContextSta
       appliedAtProviderStage: 'provider_call',
       userRequest: state.userRequest,
     });
-    const prompt = assembledContext.prompt;
+    const profile = this.profiles.profile(acceptedExecution ? 'execution-v1' : 'planning-v1');
+    const prompt = {
+      ...assembledContext.prompt,
+      stablePrefix: profile.systemContract,
+    };
     // ProviderTurnContract and PromptEnvelope must share one ContextAdmission assembly.
     const providerTurnFrame = this.ports.buildProviderTurnContract({
       contractId: input.contractId,
@@ -169,6 +185,7 @@ export class ProviderTurnContextCoordinator<State extends ProviderTurnContextSta
       contextAssembly: assembledContext.contextAssembly,
       userRequest: providerUserRequest,
       confirmedDecisionSummary: this.confirmedDecisionSummary(userGuidance, input.confirmedRequirement),
+      errorSummary: state.semanticDirectiveErrorSummary,
       acceptedPlanActive: Boolean(state.acceptedImplementationPlan),
       currentTaskContext: state.currentTaskContext,
       resourcePackets: state.resourcePackets,
@@ -245,38 +262,29 @@ export class ProviderTurnContextCoordinator<State extends ProviderTurnContextSta
     const task = state.currentTaskContext;
     if (!task) {
       return [
-        'Accepted execution task tool intent summary.',
-        'currentTaskCapabilities=none',
-        'currentTaskTargets=none',
-        'No current task is active; return diagnostic, taskOutcome, resourceRequest, or decisionRequest according to the current contract.',
+        'Accepted execution Session directive summary.',
+        'currentTask=none',
+        'No current task is active; use the registered diagnostic or task-outcome semantic tool.',
       ].join('\n');
     }
-    const targets = task.targets ?? [];
-    const capabilities = task.capabilities ?? [];
     const templates = this.currentTaskToolIntentTemplates(state)
       .map((template) => {
         const templateRecord = objectRecord(template.template);
-        const toolId = stringValue(templateRecord?.toolId) ?? template.operation;
-        const args = objectRecord(templateRecord?.args);
-        const path = stringValue(args?.path);
         return [
-          `intent=${template.intentId}`,
-          `toolId=${toolId}`,
+          `slotId=${template.intentId}`,
           `operation=${template.operation}`,
-          `targets=${template.targets.length ? template.targets.join(',') : 'none'}`,
-          path ? `path=${path}` : '',
+          `targetRef=${template.targets[0] ?? 'none'}`,
+          `contentMode=${stringValue(templateRecord?.contentMode) ?? 'none'}`,
+          `evidenceRequirement=${stringValue(templateRecord?.evidenceRequirement) ?? 'none'}`,
         ].filter(Boolean).join(';');
       });
     return [
-      'Accepted execution task tool intent summary.',
+      'Accepted execution Session directive summary.',
       `currentTaskId=${task.taskId}`,
-      `currentTaskCapabilities=${capabilities.length ? capabilities.join(', ') : 'none'}`,
-      `currentTaskTargets=${targets.length ? targets.join(', ') : 'none'}`,
-      templates.length ? `currentTaskActionTemplates=${templates.join(' | ')}` : 'currentTaskActionTemplates=none',
+      templates.length ? `intentSlots=${templates.join(' | ')}` : 'intentSlots=none',
       templates.length
-        ? 'When currentTaskActionTemplates are listed, prefer those templates for the current task. If correctness requires a concrete adjacent operation, include that explicit operation intent; Session and Kernel validate scope and may interrupt for user approval. Do not add unrelated targets from the original user request, plan summary, memory, or later tasks.'
-        : 'No executable action template is available for this current task; use taskOutcome when visible facts already satisfy it, resourceRequest when read-only evidence is missing, or diagnostic/decisionRequest when a material user choice is required.',
-      'Kernel remains the permission, execution, fact, and audit authority; this summary is not an authorization grant.',
+        ? 'Submit content only for the listed slot ids. Do not submit paths, Kernel tool identifiers, permission fields, or operations outside the current task.'
+        : 'No artifact slot is available. Use complete_current_task, request_resources, request_decision, or report_diagnostic as appropriate.',
     ].join('\n');
   }
 
@@ -314,94 +322,19 @@ export class ProviderTurnContextCoordinator<State extends ProviderTurnContextSta
   }
 
   private currentTaskToolIntentTemplates(state: State): ToolIntentTemplate[] {
-    const currentTaskId = state.currentTaskContext?.taskId;
-    if (!state.currentTaskContext) return [];
-    const currentTargets = new Set((state.currentTaskContext.targets ?? []).map(normalizeEvidencePath));
-    const accepted = objectRecord(state.acceptedImplementationPlan);
-    const grantTemplates = arrayRecords(accepted?.exactOperationGrants)
-      .filter((grant) => {
-        const sourceTaskId = stringValue(grant.sourceTaskId);
-        if (sourceTaskId) return !currentTaskId || sourceTaskId === currentTaskId;
-        // Unscoped grants are accepted only when their target belongs to the active task.
-        const targetPath = stringValue(grant.targetRefPath) ?? stringValue(grant.targetPath);
-        return Boolean(targetPath && currentTargets.has(normalizeEvidencePath(targetPath)));
-      })
-      .map((grant, index): ToolIntentTemplate | undefined => {
-        const targetPath = stringValue(grant.targetRefPath) ?? stringValue(grant.targetPath);
-        const capability = stringValue(grant.capability);
-        const operation = stringValue(grant.operation) ?? capability;
-        if (!targetPath || !operation) return undefined;
-        const targetResourceKind = stringValue(grant.targetResourceKind);
-        const recursive = grant.recursive === true;
-        if (!this.currentTaskCapabilityExecutable(state, capability ?? operation)) return undefined;
-        const args: Record<string, unknown> = { path: targetPath };
-        if (operation === 'fs.delete' || capability === 'fs.delete') {
-          const evidenceKind = resourceEvidenceTargetKind(state.resourcePackets, targetPath);
-          const deleteTargetKind = evidenceKind ?? (recursive ? 'directory' : targetResourceKind);
-          if (deleteTargetKind === 'directory') {
-            args.targetKind = 'directory';
-            args.recursive = true;
-          } else if (deleteTargetKind === 'file') {
-            args.targetKind = 'file';
-            args.recursive = false;
-          }
-        }
-        return {
-          intentId: `current-task-template-${index + 1}`,
-          label: 'currentTaskActionTemplates',
-          operation,
-          targets: [targetPath],
-          evidencePolicy: operation === 'fs.patch'
-          ? 'Use ResourceEvidence exact text or request focused evidence before patching.'
-          : operation === 'fs.write' || capability === 'fs.write'
-            ? 'For complete writes, provide replacement content directly when task intent is clear; existing text is only required when preserving or patching content.'
-          : 'Prefer this current task template; Session and Kernel validate any additional concrete operation before execution.',
-          template: {
-            toolId: capability ?? operation,
-            args,
-          },
-        };
-      })
-      .filter((template): template is ToolIntentTemplate => Boolean(template));
-    if (grantTemplates.length) return grantTemplates;
-    const targets = state.currentTaskContext.targets ?? [];
-    const capabilities = state.currentTaskContext.capabilities ?? [];
-    return capabilities
-      .filter((capability) => this.currentTaskCapabilityExecutable(state, capability))
-      .map((capability, index): ToolIntentTemplate => ({
-        intentId: `current-task-template-${index + 1}`,
-        label: 'currentTaskActionTemplates',
-        operation: capability,
-        targets,
-        evidencePolicy: capability === 'fs.patch'
-          ? 'Use ResourceEvidence exact text or request focused evidence before patching.'
-          : capability === 'fs.write'
-            ? 'For complete writes, provide replacement content directly when task intent is clear; existing text is only required when preserving or patching content.'
-          : capability === 'process.exec'
-            ? 'Use argv/cwd/timeoutMs typed args for the current task command; Kernel handles permission before execution.'
-            : 'Prefer current task targets; Session and Kernel validate any additional concrete operation before execution.',
-        template: capability === 'process.exec'
-          ? {
-            toolId: 'process.exec',
-            args: {
-              argv: ['<program>', '<arg>'],
-              cwd: '.',
-              timeoutMs: 120000,
-            },
-          }
-          : { toolId: capability, args: targets.length === 1 ? { path: targets[0] } : {} },
-      }));
-  }
-
-  private currentTaskCapabilityExecutable(state: State, capabilityOrToolId: string | undefined): boolean {
-    if (!capabilityOrToolId) return false;
-    const snapshot = toolCatalogSnapshot(state);
-    if (!snapshot?.tools?.length) return true;
-    const matches = snapshot.tools.filter((tool) =>
-      tool.capability === capabilityOrToolId || tool.toolId === capabilityOrToolId
-    );
-    if (!matches.length) return true;
-    return matches.some((tool) => tool.executionMode === 'execute' || tool.executionMode === 'blocked');
+    const acceptedPlan = state.acceptedImplementationPlan as AcceptedImplementationPlanContext | undefined;
+    return this.intentSlots.currentTaskSlots(acceptedPlan).map((slot): ToolIntentTemplate => ({
+      intentId: slot.slotId,
+      label: 'IntentSlot',
+      operation: slot.operation,
+      targets: [slot.targetRef],
+      evidencePolicy: slot.evidenceRequirement,
+      template: {
+        contentMode: slot.contentMode,
+        evidenceRequirement: slot.evidenceRequirement,
+        targetResourceKind: slot.targetResourceKind,
+      },
+    }));
   }
 }
 
@@ -430,65 +363,6 @@ function stringArray(value: unknown): string[] {
   return Array.isArray(value)
     ? value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0).map((item) => item.trim())
     : [];
-}
-
-function arrayRecords(value: unknown): Record<string, unknown>[] {
-  return Array.isArray(value)
-    ? value.filter((item): item is Record<string, unknown> => Boolean(objectRecord(item)))
-    : [];
-}
-
-function toolCatalogSnapshot(state: ProviderTurnContextState): KernelToolCatalogSnapshot | undefined {
-  return state.stateContract?.toolCatalogSnapshot ?? state.driverRequest?.stateContract?.toolCatalogSnapshot;
-}
-
-function resourceEvidenceTargetKind(
-  packets: ResourcePacket[] | undefined,
-  targetPath: string
-): 'directory' | 'file' | undefined {
-  const target = normalizeEvidencePath(targetPath);
-  if (!target || !packets?.length) return undefined;
-  for (const packet of packets) {
-    for (const item of packet.items ?? []) {
-      if (item.status !== 'resolved' && item.status !== 'provided') continue;
-      const directPath = normalizeEvidencePath(item.path ?? item.absolutePath ?? '');
-      if (directPath && (directPath === target || directPath.endsWith(`/${target}`))) {
-        if (item.contentKind === 'directoryTree') return 'directory';
-        if (item.contentKind === 'fileText' || item.contentKind === 'fileSkipped' || item.fileClassification) return 'file';
-      }
-      const fromNodes = resourceNodeTargetKind(objectRecord(item)?.nodes, target);
-      if (fromNodes) return fromNodes;
-    }
-  }
-  return undefined;
-}
-
-function resourceNodeTargetKind(value: unknown, targetPath: string): 'directory' | 'file' | undefined {
-  if (!Array.isArray(value)) return undefined;
-  for (const item of value) {
-    const node = objectRecord(item);
-    if (!node) continue;
-    const path = normalizeEvidencePath(stringValue(node.path) ?? stringValue(node.name) ?? '');
-    const type = stringValue(node.type);
-    if (path && (path === targetPath || path.endsWith(`/${targetPath}`))) {
-      if (type === 'directory' || type === 'dir') return 'directory';
-      if (type === 'file') return 'file';
-    }
-    const child = resourceNodeTargetKind(node.children, targetPath);
-    if (child) return child;
-  }
-  return undefined;
-}
-
-function normalizeEvidencePath(value: string): string {
-  const normalized = value
-    .trim()
-    .replace(/\\/g, '/')
-    .replace(/^\.\//, '')
-    .replace(/\/+/g, '/')
-    .replace(/\/+$/, '');
-  if (!normalized || normalized === '/' || normalized === '.') return '.';
-  return normalized;
 }
 
 function oneLine(value: string, limit: number): string {

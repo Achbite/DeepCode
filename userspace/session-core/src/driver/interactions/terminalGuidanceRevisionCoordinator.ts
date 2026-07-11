@@ -1,7 +1,6 @@
 import type {
   AgentEvent,
   AgentSessionResult,
-  LlmChatRequest,
 } from '@deepcode/protocol';
 import type { ProposalEnvelope } from '../../protocol/types.js';
 import type {
@@ -21,6 +20,8 @@ import type {
 import type { RequirementRecord } from '../../requirement/types.js';
 import type { ContextFrameBuilder } from '../context/index.js';
 import { prepareProviderSideCallMessagesContextAdmission } from '../context/index.js';
+import type { DriverProviderTurnFrame } from '../runFrame.js';
+import type { PromptEnvelope } from '../../prompt/types.js';
 import {
   SessionDriverRepairRuntimeAccessor,
   type SessionDriverProviderRuntimeState,
@@ -45,6 +46,7 @@ export interface TerminalGuidanceRevisionState extends SessionDriverProviderRunt
   conversationRoots: ConversationResourceRoot[];
   cachePlan?: PromptCachePlan;
   contextAssembly?: ContextAssemblyRecord;
+  semanticDirectiveErrorSummary?: string;
 }
 
 export interface TerminalGuidanceRevisionCoordinatorPorts<
@@ -88,8 +90,12 @@ export interface TerminalGuidanceRevisionCoordinatorPorts<
     userRequest: string;
     appliedAtProviderStage: string;
   }): Promise<AgentSessionResult>;
-  runRevision(input: Input, state: State, messages: LlmChatRequest['messages']): Promise<string>;
-  parseProposal(raw: string, state: State): ProposalEnvelope;
+  runRevision(
+    input: Input,
+    state: State,
+    prompt: PromptEnvelope,
+    contract: DriverProviderTurnFrame
+  ): Promise<ProposalEnvelope | { kind: 'providerResume' }>;
   createError(code: string, message: string): Error;
   contextFrameBuilder: ContextFrameBuilder;
 }
@@ -159,7 +165,7 @@ export class TerminalGuidanceRevisionCoordinator<
 
     let revised: ProposalEnvelope;
     try {
-      const admission = prepareProviderSideCallMessagesContextAdmission({
+      let admission = prepareProviderSideCallMessagesContextAdmission({
         state,
         prompt: assembledContext.prompt,
         contextFrameBuilder: this.ports.contextFrameBuilder,
@@ -176,10 +182,39 @@ export class TerminalGuidanceRevisionCoordinator<
         resourcePackets: state.resourcePackets,
         repairPolicy: 'sameKindOnly',
         projectionVisibility: 'traceOnly',
-        nextActionInstruction: 'Return exactly one Agent Protocol v3 answer proposal that applies the queued user guidance to the draft terminal answer. Do not output a plan, tool request, actionBundle, markdown outside JSON, or prose outside JSON.',
+        nextActionInstruction: 'Call session.submit_answer exactly once with the revised final answer that applies the queued user guidance. Do not call planning or execution tools.',
       });
-      const raw = await this.ports.runRevision(input, state, admission.messages);
-      revised = this.ports.parseProposal(raw, state);
+      let revision = await this.ports.runRevision(input, state, admission.prompt, admission.contract);
+      if (revision.kind === 'providerResume') {
+        admission = prepareProviderSideCallMessagesContextAdmission({
+          state,
+          prompt: assembledContext.prompt,
+          contextFrameBuilder: this.ports.contextFrameBuilder,
+          contractId: this.ports.createId('guidance-revision-repair-contract'),
+          turnMode: 'reviewAnswer',
+          allowedKinds: ['answer'],
+          requiredKind: 'answer',
+          messages: [
+            { role: 'system', content: assembledContext.prompt.stablePrefix },
+            { role: 'user', content: assembledContext.prompt.dynamicSuffix },
+          ],
+          userRequest: input.content,
+          errorSummary: state.semanticDirectiveErrorSummary,
+          contextAssembly: assembledContext.contextAssembly,
+          resourcePackets: state.resourcePackets,
+          repairPolicy: 'sameKindOnly',
+          projectionVisibility: 'traceOnly',
+          nextActionInstruction: 'Repair the invalid arguments by calling session.submit_answer exactly once. Keep the answer scope and queued user guidance unchanged.',
+        });
+        revision = await this.ports.runRevision(input, state, admission.prompt, admission.contract);
+      }
+      if (revision.kind === 'providerResume') {
+        throw this.ports.createError(
+          'guidance_revision_semantic_repair_failed',
+          'Guidance revision did not produce a valid Session semantic answer after one same-profile repair.'
+        );
+      }
+      revised = revision;
       if (revised.kind !== 'answer') {
         throw this.ports.createError(
           'guidance_revision_non_answer',

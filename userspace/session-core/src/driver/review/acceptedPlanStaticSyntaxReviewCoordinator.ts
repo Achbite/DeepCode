@@ -6,6 +6,7 @@ import { prepareProviderSideCallMessagesContextAdmission } from '../context/inde
 import type { AcceptedImplementationPlanContext } from '../execution/index.js';
 import type { SessionDriverProviderRuntimeState } from '../runFrame.js';
 import type { ReviewAssembler } from './reviewAssembler.js';
+import type { NativeToolCallProposal } from '../../provider/providerStreamParts.js';
 
 const STATIC_SYNTAX_REVIEW_STAGE = 'accepted_plan.static_syntax_review';
 const STATIC_SYNTAX_REVIEW_PROVIDER_STAGE = 'accepted_plan_static_syntax_review';
@@ -37,7 +38,7 @@ export interface AcceptedPlanStaticSyntaxReviewCoordinatorPorts<TState extends A
     state: TState;
     stage: typeof STATIC_SYNTAX_REVIEW_PROVIDER_STAGE;
     messages: LlmChatRequest['messages'];
-  }): Promise<string>;
+  }): Promise<{ toolCalls: NativeToolCallProposal[] }>;
   event(sessionId: string, kind: AgentEventKind, payload: Record<string, unknown>): AgentEvent;
   reviewAssembler: ReviewAssembler;
   contextFrameBuilder: ContextFrameBuilder;
@@ -96,7 +97,7 @@ export class AcceptedPlanStaticSyntaxReviewCoordinator<TState extends AcceptedPl
         generatedArtifactCount: state.generatedArtifactEvidence.size,
         repairPolicy: 'diagnosticOnly',
         projectionVisibility: 'traceOnly',
-        nextActionInstruction: 'Return exactly one staticSyntaxReview JSON object for the provided generated files. Do not output Agent Protocol proposals, markdown, tool requests, or prose.',
+        nextActionInstruction: 'Call session.submit_static_review exactly once for the provided generated files. Report bounded observations only; do not claim Kernel execution or validation facts.',
       });
       const reviewPromise = this.ports.runStaticSyntaxReview({
         profileId: input.profileId,
@@ -105,10 +106,13 @@ export class AcceptedPlanStaticSyntaxReviewCoordinator<TState extends AcceptedPl
         messages: admission.messages,
       });
       const timeoutMs = this.ports.staticSyntaxReviewTimeoutMs ?? 45_000;
-      const raw = timeoutMs > 0
+      const turn = timeoutMs > 0
         ? await withTimeout(reviewPromise, timeoutMs)
         : await reviewPromise;
-      parsed = JSON.parse(raw) as Record<string, unknown>;
+      if (turn.toolCalls.length !== 1 || turn.toolCalls[0]?.name !== 'session.submit_static_review') {
+        throw new Error('Static review requires exactly one session.submit_static_review directive.');
+      }
+      parsed = turn.toolCalls[0].arguments;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       return [

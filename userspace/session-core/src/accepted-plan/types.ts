@@ -37,6 +37,7 @@ export interface AcceptedImplementationPlanTaskContext {
   taskId: string;
   title?: string;
   capability?: string;
+  semanticOperation?: string;
   targets: string[];
   acceptanceCriteria?: string[];
   failureCriteria?: string[];

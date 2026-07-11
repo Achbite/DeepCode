@@ -188,13 +188,16 @@ export class AcceptedPlanScopeMatcher {
     if (capability === 'fs.delete' || capability === 'fs.rename') return false;
     const acceptedScopes = accepted.targetScopes
       .flatMap(expandPlanTargetTokens)
-      .map(normalizePlanScope)
+      .map((target) => normalizePlanTargetForExecutionRoot(target, accepted.executionRoot))
       .filter(Boolean);
     if (scopeCoveredByAcceptedPlan(normalized, acceptedScopes)) return true;
     return accepted.accessScopes.some((accessScope) => {
       if (accessScope.outsideWorkspace) return false;
       if (!accessScopeCapabilityMatches(accessScope, capability)) return false;
-      return planScopeCovers(accessScope.path, normalized);
+      return planScopeCovers(
+        normalizePlanTargetForExecutionRoot(accessScope.path, accepted.executionRoot),
+        normalized
+      );
     });
   }
 
@@ -239,7 +242,9 @@ export class AcceptedPlanScopeMatcher {
     return accepted.tasks.some((task) =>
       task.targets
         .flatMap(expandPlanTargetTokens)
-        .map(normalizePlanScopeIdentity)
+        .map((target) => normalizePlanScopeIdentity(
+          normalizePlanTargetForExecutionRoot(target, accepted.executionRoot)
+        ))
         .filter(Boolean)
         .some((target) =>
           planScopeCovers(target, normalized) ||
@@ -257,7 +262,9 @@ export class AcceptedPlanScopeMatcher {
     if (!normalized || !capability) return false;
     return accepted.exactOperationGrants.some((grant) => {
       if (!exactOperationGrantCapabilityMatches(grant, capability)) return false;
-      return normalizePlanScopeIdentity(grant.targetPath) === normalized;
+      return normalizePlanScopeIdentity(
+        normalizePlanTargetForExecutionRoot(grant.targetPath, accepted.executionRoot)
+      ) === normalized;
     });
   }
 }

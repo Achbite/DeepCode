@@ -26,6 +26,7 @@ export interface BuildResourcePromptContextInput {
   taskLocalCompaction?: {
     active: boolean;
     currentTaskTargets?: string[];
+    currentTaskPacketIds?: string[];
   };
 }
 
@@ -47,7 +48,10 @@ export function buildResourcePromptContext(input: BuildResourcePromptContextInpu
   const drafts: ResourcePromptBlockDraft[] = [];
   const orderedKeys: string[] = [];
   const blocksByKey = new Map<string, ResourcePromptBlock>();
-  const currentTaskTargets = normalizedTargetSet(input.taskLocalCompaction?.currentTaskTargets ?? []);
+  const currentTaskTargets = normalizedTargetSet(
+    input.taskLocalCompaction?.currentTaskTargets ?? [],
+    input.conversationRoots ?? []
+  );
 
   for (let packetIndex = 0; packetIndex < resourcePackets.length; packetIndex += 1) {
     const packet = resourcePackets[packetIndex]!;
@@ -78,6 +82,8 @@ export function buildResourcePromptContext(input: BuildResourcePromptContextInpu
   const fullTextBlockKeys = selectFullTextResourceBlockKeys(drafts, {
     foldNonCurrentTaskBlocks: input.taskLocalCompaction?.active === true,
     currentTaskTargets,
+    currentTaskPacketIds: new Set(input.taskLocalCompaction?.currentTaskPacketIds ?? []),
+    conversationRoots: input.conversationRoots ?? [],
   });
   for (const draft of drafts) {
     const { blockKey, packet, item, content, contentHash, displayRef } = draft;
@@ -138,6 +144,8 @@ function selectFullTextResourceBlockKeys(
   options: {
     foldNonCurrentTaskBlocks: boolean;
     currentTaskTargets: Set<string>;
+    currentTaskPacketIds: Set<string>;
+    conversationRoots: ConversationResourceRoot[];
   }
 ): Set<string> {
   const selected = new Set<string>();
@@ -145,7 +153,11 @@ function selectFullTextResourceBlockKeys(
   for (let index = drafts.length - 1; index >= 0; index -= 1) {
     const draft = drafts[index]!;
     if (selected.has(draft.blockKey) || !resourceBlockFullTextEligible(draft.item, draft.content)) continue;
-    if (options.foldNonCurrentTaskBlocks && !resourceBlockMatchesCurrentTask(draft, options.currentTaskTargets)) continue;
+    if (
+      options.foldNonCurrentTaskBlocks &&
+      !options.currentTaskPacketIds.has(draft.packet.id) &&
+      !resourceBlockMatchesCurrentTask(draft, options.currentTaskTargets, options.conversationRoots)
+    ) continue;
     const nextUsed = used + draft.content.length;
     if (nextUsed > DYNAMIC_READ_FULL_TEXT_BUDGET_CHARS) continue;
     selected.add(draft.blockKey);
@@ -156,13 +168,16 @@ function selectFullTextResourceBlockKeys(
 
 function resourceBlockMatchesCurrentTask(
   draft: ResourcePromptBlockDraft,
-  currentTaskTargets: Set<string>
+  currentTaskTargets: Set<string>,
+  roots: ConversationResourceRoot[]
 ): boolean {
   if (currentTaskTargets.size === 0) return false;
-  const ref = normalizeResourcePathForMatch(draft.displayRef);
-  if (!ref) return false;
-  for (const target of currentTaskTargets) {
-    if (ref === target || ref.startsWith(`${target}/`)) return true;
+  const refs = resourcePathIdentities(draft.displayRef, roots);
+  if (!refs.length) return false;
+  for (const ref of refs) {
+    for (const target of currentTaskTargets) {
+      if (ref === target || ref.startsWith(`${target}/`)) return true;
+    }
   }
   return false;
 }
@@ -200,8 +215,11 @@ function resourceHandle(item: ResourcePacketItem, displayRef: string): string {
   return range ? `${displayRef} ${range}` : displayRef;
 }
 
-function normalizedTargetSet(targets: string[]): Set<string> {
-  return new Set(targets.map(normalizeResourcePathForMatch).filter((target): target is string => Boolean(target)));
+function normalizedTargetSet(
+  targets: string[],
+  roots: ConversationResourceRoot[]
+): Set<string> {
+  return new Set(targets.flatMap((target) => resourcePathIdentities(target, roots)));
 }
 
 function normalizeResourcePathForMatch(value: string | undefined): string | undefined {
@@ -210,8 +228,25 @@ function normalizeResourcePathForMatch(value: string | undefined): string | unde
     .replace(/\\/g, '/')
     .replace(/\/+/g, '/')
     .replace(/^\.\//, '')
+    .replace(/^\//, '')
     .replace(/\/$/, '');
   return normalized || undefined;
+}
+
+function resourcePathIdentities(
+  value: string | undefined,
+  roots: ConversationResourceRoot[]
+): string[] {
+  const normalized = normalizeResourcePathForMatch(value);
+  if (!normalized) return [];
+  const identities = new Set([normalized]);
+  for (const root of roots) {
+    const rootPath = normalizeResourcePathForMatch(root.absolutePath ?? root.displayPath);
+    if (!rootPath) continue;
+    if (normalized === rootPath) identities.add('.');
+    if (normalized.startsWith(`${rootPath}/`)) identities.add(normalized.slice(rootPath.length + 1));
+  }
+  return [...identities];
 }
 
 function resourceSummary(item: ResourcePacketItem, content: string, retention: ResourceBlockRetention): string {
@@ -307,31 +342,21 @@ function renderResourcePromptContext(
   resourceBlocks: ResourcePromptBlock[]
 ): string {
   const lines: string[] = [
-    'ResourceContext policy: resource content is rendered as stable blocks. Block keys are derived from workspace scope, resource path/ref, byte range, and content hash.',
-    'Volatile run ids, packet ids, request ids, event ids, evidence refs, traces, and timestamps are excluded from provider-visible resource blocks.',
+    'ResourceEvidence contains Kernel-observed read facts. Block keys are stable handles derived from scope, path, range, and content hash.',
   ];
 
   if (input.conversationRoots?.length) {
     lines.push('Conversation roots:');
     for (const root of input.conversationRoots) {
-      lines.push(`- rootId=${root.rootId} source=${root.source} path=${root.displayPath}${root.primary ? ' primary=true' : ''}`);
-      lines.push(`  label=${root.label}`);
+      lines.push(`- rootId=${root.rootId} path=${root.displayPath}${root.primary ? ' primary=true' : ''}`);
     }
-    lines.push('ResourceRequest path rule: use {"rootId":"<rootId>","path":"<relative path>"} for files or directories under these roots, or {"kind":"search","rootId":"<rootId>","query":"literal text","include":["optional/path/filter"],"contextLines":2,"maxResults":50} for targeted search evidence before patching.');
-    const primary = input.conversationRoots.find((root) => root.primary);
-    if (primary) {
-      lines.push(`Primary conversation workspace root: rootId=${primary.rootId} path=${primary.displayPath}`);
-      lines.push('Write path rule: actionBundle targetPath/codeBlocks targetPath must be a concrete file path relative to the primary root. Do not include rootId, manifestEntryId, display path, basename, or absolute path prefixes in write targets.');
-    }
+    lines.push('For more facts, call session.request_resources with rootId plus a relative path, range, or search query. Do not request an already sufficient block again.');
   }
 
   if (input.initialContext) {
-    lines.push(`InitialContextPacket: ${input.initialContext.id}`);
-    lines.push(`ResourceManifest: ${input.initialContext.manifest.id} entries=${input.initialContext.manifest.entries.length}`);
+    lines.push(`ResourceManifest entries=${input.initialContext.manifest.entries.length}`);
     for (const entry of input.initialContext.manifest.entries.slice(0, MANIFEST_ENTRY_LIMIT)) {
       lines.push(`- manifestEntry id=${entry.id} kind=${entry.kind} ref=${entry.resourceRef} policy=${entry.readPolicy}`);
-      lines.push(`  label=${entry.label}`);
-      lines.push(`  reason=${entry.reason}`);
     }
     if (input.initialContext.manifest.entries.length > MANIFEST_ENTRY_LIMIT) {
       lines.push(`- manifestEntry list truncated: ${input.initialContext.manifest.entries.length - MANIFEST_ENTRY_LIMIT} additional entries omitted`);
@@ -345,20 +370,18 @@ function renderResourcePromptContext(
 
   lines.push(`ResourceBlocks: ${resourceBlocks.length}`);
   for (const block of resourceBlocks) {
-    lines.push(`- blockKey=${block.blockKey} ref=${block.displayRef} retention=${block.retention} status=${block.status} policy=${block.readPolicy}`);
-    lines.push(`  manifestEntry=${block.manifestEntryId} contentHash=${block.contentHash} chars=${block.charLength} kind=${block.contentKind ?? 'unknown'}`);
-    if (typeof block.originalBytes === 'number') lines.push(`  originalBytes=${block.originalBytes}`);
-    if (block.truncated) lines.push('  truncated=true');
-    if (typeof block.offsetBytes === 'number') lines.push(`  offsetBytes=${block.offsetBytes}`);
-    if (typeof block.limitBytes === 'number') lines.push(`  limitBytes=${block.limitBytes}`);
-    if (typeof block.returnedBytes === 'number') lines.push(`  returnedBytes=${block.returnedBytes}`);
-    if (typeof block.rangeComplete === 'boolean') lines.push(`  rangeComplete=${block.rangeComplete}`);
-    lines.push(`  handle=${block.handle}`);
-    lines.push('  summary:');
-    lines.push(indentBlock(block.summary));
+    const range = [
+      typeof block.offsetBytes === 'number' ? `offset=${block.offsetBytes}` : '',
+      typeof block.returnedBytes === 'number' ? `bytes=${block.returnedBytes}` : '',
+      block.truncated ? 'truncated=true' : '',
+    ].filter(Boolean).join(' ');
+    lines.push(`- blockKey=${block.blockKey} handle=${block.handle} retention=${block.retention} status=${block.status} hash=${block.contentHash} kind=${block.contentKind ?? 'unknown'}${range ? ` ${range}` : ''}`);
     if (block.content) {
       lines.push('  content:');
       lines.push(indentBlock(fencedText(block.content)));
+    } else {
+      lines.push('  summary:');
+      lines.push(indentBlock(block.summary));
     }
   }
 

@@ -442,6 +442,7 @@ function buildLegacySessionMemoryDocument(events: AgentEvent[]): SessionMemoryDo
 }
 
 export function renderProjectMemoryHints(document: SessionMemoryDocument): string[] {
+  if (!document.projectMemoryItems.length && !document.archiveMetadata?.pendingProjectMemoryCandidateIds.length) return [];
   return [
     'ProjectMemoryIndexDigest (project-scoped, 128k emergency soft cap):',
     `mode=${document.archiveMetadata?.projectMemoryMode ?? 'confirm'}`,
@@ -460,6 +461,7 @@ export function renderProjectMemoryHints(document: SessionMemoryDocument): strin
 
 export function renderProjectMemoryRecallHints(document: SessionMemoryDocument): string[] {
   const lines = document.projectMemoryItems.map((item) => compactMemoryBullet(item));
+  if (!lines.length) return [];
   return [
     'ProjectMemoryRecall (dynamic selected project memory):',
     lines.length
@@ -577,6 +579,7 @@ export function renderSessionScopedMemoryHints(
   const lines = document.sessionMemoryItems.map((item) => compactMemoryBullet(item, {
     foldTaskLocalContent,
   }));
+  if (!lines.length && !taskLocalCompaction?.active) return [];
   return [
     'SessionMemoryCompact (single-session, 256k emergency soft cap):',
     `archiveHash=${document.archiveMetadata?.sessionMemoryArchiveHash ?? 'none'}`,

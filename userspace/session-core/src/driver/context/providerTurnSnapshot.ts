@@ -1,4 +1,5 @@
 import { stableHash } from '../../cache/canonicalizer.js';
+import { ProviderProfileRegistry } from '../../provider/ProviderProfileRegistry.js';
 import type {
   ContextAssemblyDynamicAppendLogEntry,
   ContextAssemblyTaskLocalFoldPlan,
@@ -18,6 +19,8 @@ import type {
 import { buildProviderTurnContractPayload, renderProviderTurnUserPrompt } from './providerTurnPromptRenderer.js';
 
 export function buildProviderTurnSnapshot(contract: DriverProviderTurnFrame): ProviderTurnSnapshot {
+  const profile = new ProviderProfileRegistry().profileForFrame(contract);
+  const systemContent = contract.prompt.stablePrefix;
   const renderedContract = JSON.stringify(buildProviderTurnContractPayload(contract, contract.prompt.dynamicSuffix));
   const finalUserPrompt = renderProviderTurnUserPrompt(contract.prompt.dynamicSuffix, contract);
   const contextAssembly = contract.contextAssembly;
@@ -47,6 +50,11 @@ export function buildProviderTurnSnapshot(contract: DriverProviderTurnFrame): Pr
     requiredKind: contract.requiredKind,
     repairPolicy: contract.repairPolicy,
     projectionVisibility: contract.projectionVisibility,
+    semanticProfileId: profile.id,
+    systemHash: stableHash(systemContent),
+    toolSchemaHash: profile.toolSchemaHash,
+    responseFormatHash: profile.responseFormatHash,
+    messageShapeHash: stableHash('system,user'),
     stablePrefixHash,
     dynamicSuffixHash,
     stablePrefixCharLength: contract.prompt.stablePrefix.length,

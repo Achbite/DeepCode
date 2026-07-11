@@ -22,6 +22,7 @@ export interface ProviderTurnRunnerState extends ProviderStreamRuntimeState {
   cachePlan?: PromptCachePlan;
   contextAssembly?: ContextAssemblyRecord;
   providerTurnFrame?: DriverProviderTurnFrame;
+  providerRequestCacheHistory?: Record<string, { requestText: string; segmentIds: string[] }>;
 }
 
 export interface ProviderTurnResult {
@@ -94,8 +95,10 @@ export class ProviderTurnRunner<TState extends ProviderTurnRunnerState> {
     const { state, stage, ports } = input;
     const jsonModeMessages = this.dependencies.jsonModeCoordinator.ensureMessages(input.messages, options.responseFormat);
     const providerCallHookTrace = await this.runProviderCallHook(state);
+    const cacheTopology = providerRequestCacheTopology(state, jsonModeMessages, options);
     await this.dependencies.traceRecorder.append(state, `${stage}.request`, {
       profileId: input.profileId,
+      semanticProfileId: state.providerTurnFrame?.snapshot?.semanticProfileId,
       messages: jsonModeMessages,
       cachePlan: state.cachePlan,
       contextAssembly: state.contextAssembly,
@@ -105,6 +108,8 @@ export class ProviderTurnRunner<TState extends ProviderTurnRunnerState> {
         ...providerCallHookTrace,
       ],
       responseFormat: options.responseFormat,
+      tools: options.tools,
+      cacheTopology,
       responseFormatAudit: this.dependencies.jsonModeCoordinator.audit(input.messages, options.responseFormat),
     }, ports);
     await this.dependencies.emitProjectionDelta(state, {
@@ -172,15 +177,25 @@ export class ProviderTurnRunner<TState extends ProviderTurnRunnerState> {
       model: state.contextAssembly?.model,
       stage,
       usage,
-      promptSegmentDigests: state.contextAssembly?.segments.map((segment) => ({
-        id: segment.id,
-        name: segment.name,
-        cacheClass: segment.cacheClass,
-        stablePrefix: segment.stablePrefix,
-        auditOnly: segment.auditOnly,
-        contentHash: segment.contentHash,
-        charLength: segment.charLength,
-      })) ?? [],
+      promptSegmentDigests: [
+        ...(state.contextAssembly?.segments.map((segment): Record<string, unknown> => ({
+          id: segment.id,
+          name: segment.name,
+          cacheClass: segment.cacheClass,
+          stablePrefix: segment.stablePrefix,
+          auditOnly: segment.auditOnly,
+          contentHash: segment.contentHash,
+          charLength: segment.charLength,
+        })) ?? []),
+        {
+        id: 'provider-request-topology',
+        name: 'providerRequestTopology',
+        cacheClass: 'providerRequest',
+        stablePrefix: false,
+        auditOnly: true,
+        ...cacheTopology,
+        },
+      ],
       stablePrefixHash: state.contextAssembly?.stablePrefixHash,
       dynamicSuffixHash: state.contextAssembly?.dynamicSuffixHash,
       finalUserPromptHash: state.providerTurnFrame?.snapshot?.finalUserPromptHash,
@@ -273,4 +288,62 @@ function objectRecord(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
     : undefined;
+}
+
+function providerRequestCacheTopology(
+  state: ProviderTurnRunnerState,
+  messages: LlmChatRequest['messages'],
+  options: Pick<LlmChatRequest, 'responseFormat' | 'tools'>
+): Record<string, unknown> {
+  const profileId = state.providerTurnFrame?.snapshot?.semanticProfileId ?? 'unknown';
+  const requestText = JSON.stringify({
+    messages: messages.map((message) => ({ role: message.role, content: message.content })),
+    tools: options.tools?.map((tool) => ({ name: tool.name, inputSchema: tool.inputSchema })) ?? [],
+    responseFormat: options.responseFormat ?? null,
+  });
+  const currentSegments = state.contextAssembly?.segments.map((segment) => `${segment.id}:${segment.contentHash}`) ?? [];
+  const history = state.providerRequestCacheHistory ?? {};
+  const previous = history[profileId];
+  const longestCommonPrefixCharLength = previous
+    ? commonPrefixLength(previous.requestText, requestText)
+    : 0;
+  const changedSegmentIds = previous
+    ? changedSegments(previous.segmentIds, currentSegments)
+    : currentSegments.map((entry) => entry.split(':', 1)[0]);
+  history[profileId] = { requestText, segmentIds: currentSegments };
+  state.providerRequestCacheHistory = history;
+  return {
+    semanticProfileId: profileId,
+    systemHash: state.providerTurnFrame?.snapshot?.systemHash,
+    toolSchemaHash: state.providerTurnFrame?.snapshot?.toolSchemaHash,
+    responseFormatHash: state.providerTurnFrame?.snapshot?.responseFormatHash,
+    messageShapeHash: state.providerTurnFrame?.snapshot?.messageShapeHash,
+    requestCharLength: requestText.length,
+    longestCommonPrefixCharLength,
+    longestCommonPrefixRatio: previous && requestText.length > 0
+      ? longestCommonPrefixCharLength / requestText.length
+      : 0,
+    changedSegmentIds,
+  };
+}
+
+function commonPrefixLength(left: string, right: string): number {
+  const limit = Math.min(left.length, right.length);
+  let index = 0;
+  while (index < limit && left.charCodeAt(index) === right.charCodeAt(index)) index += 1;
+  return index;
+}
+
+function changedSegments(previous: string[], current: string[]): string[] {
+  const previousIndex = new Map(previous.map((entry) => {
+    const separator = entry.lastIndexOf(':');
+    return [entry.slice(0, separator), entry.slice(separator + 1)] as const;
+  }));
+  const currentIndex = new Map(current.map((entry) => {
+    const separator = entry.lastIndexOf(':');
+    return [entry.slice(0, separator), entry.slice(separator + 1)] as const;
+  }));
+  return [...new Set([...previousIndex.keys(), ...currentIndex.keys()])]
+    .filter((id) => previousIndex.get(id) !== currentIndex.get(id))
+    .sort();
 }

@@ -3,9 +3,9 @@ import type {
   AgentEvent,
   AgentSessionResult,
   AgentWorkspaceBinding,
-  LlmChatRequest,
 } from '@deepcode/protocol';
 import {
+  appendTaskLocalCompactRecord,
   buildTaskLocalCompactRecord,
   type ContextAssemblyRecord,
   type ContextAssemblyTaskLocalCompactRecord,
@@ -21,7 +21,6 @@ import type { AcceptedImplementationPlanContext } from '../../accepted-plan/type
 import type { ProposalEnvelope, ResourceRequestDraft } from '../../protocol/types.js';
 import type { PromptEnvelope } from '../../prompt/types.js';
 import type { ProposalRouterResult } from '../proposal/proposalRouter.js';
-import type { DriverProviderTurnFrame } from '../runFrame.js';
 import type { PlanContext } from '../proposal/planContextIndex.js';
 import type { AcceptedPlanReadOnlyResourceCompletion } from './acceptedPlanExecutor.js';
 
@@ -55,22 +54,7 @@ export interface AcceptedPlanReadOnlyTaskState {
   taskExecutionCursor?: unknown;
   currentTaskContext?: unknown;
   contextAssembly?: ContextAssemblyRecord;
-}
-
-export interface AcceptedPlanReadOnlyResourceResumeInput<State extends AcceptedPlanReadOnlyTaskState> {
-  state: State;
-  prompt: PromptEnvelope;
-  userRequest: string;
-  requestProposal: ProposalEnvelope;
-  packet: ResourcePacket;
-  callProposalOnly(input: {
-    state: State;
-    prompt: PromptEnvelope;
-    contract: DriverProviderTurnFrame;
-    stage: string;
-    messages: LlmChatRequest['messages'];
-  }): Promise<string | ProposalEnvelope>;
-  runRepair(stage: string, messages: LlmChatRequest['messages']): Promise<string>;
+  taskLocalCompactRecords?: ContextAssemblyTaskLocalCompactRecord[];
 }
 
 export interface AcceptedPlanReadOnlyTaskExecutorPorts<
@@ -141,33 +125,6 @@ export interface AcceptedPlanReadOnlyTaskExecutorPorts<
     ts: string,
     id: string
   ): AgentEvent;
-  resourceResume(input: AcceptedPlanReadOnlyResourceResumeInput<State>): Promise<ProposalEnvelope>;
-  callProviderProposalOnly(
-    input: Input,
-    state: State,
-    prompt: PromptEnvelope,
-    contract: DriverProviderTurnFrame,
-    stage: string,
-    messages: LlmChatRequest['messages']
-  ): Promise<string | ProposalEnvelope>;
-  runRepair(
-    input: Input,
-    state: State,
-    stage: string,
-    messages: LlmChatRequest['messages']
-  ): Promise<string>;
-  submitActionProposal(
-    input: Input,
-    state: State,
-    prompt: PromptEnvelope,
-    proposal: ProposalEnvelope,
-    fallback: AgentSessionResult
-  ): Promise<AgentSessionResult | ProposalRouterResult>;
-  submitNonExecutableProposal(
-    state: State,
-    proposal: ProposalEnvelope,
-    fallback: AgentSessionResult
-  ): Promise<AgentSessionResult>;
 }
 
 export class AcceptedPlanReadOnlyTaskExecutor<
@@ -208,6 +165,10 @@ export class AcceptedPlanReadOnlyTaskExecutor<
       runId: state.runId,
       taskId: completion.taskId,
     });
+    state.taskLocalCompactRecords = appendTaskLocalCompactRecord(
+      state.taskLocalCompactRecords,
+      contextCompactRecord
+    );
     const checkpoint = this.ports.resourceValidationCheckpointEvent(
       state.sessionId,
       state.runId,
@@ -299,33 +260,6 @@ export class AcceptedPlanReadOnlyTaskExecutor<
     const readOnlyCompletion = await this.tryCompleteResourceTask(input, state, packet, result);
     if (readOnlyCompletion) return readOnlyCompletion;
 
-    const resumed = await this.callResourceResume(input, state, prompt, proposal, packet);
-    if (resumed.kind === 'actionBundle' || resumed.kind === 'taskOutcome') {
-      return this.ports.submitActionProposal(input, state, prompt, resumed, result);
-    }
-    if (resumed.kind !== 'resourceRequest') {
-      return this.ports.submitNonExecutableProposal(state, resumed, result);
-    }
-    return result;
-  }
-
-  async callResourceResume(
-    input: Input,
-    state: State,
-    prompt: PromptEnvelope,
-    requestProposal: ProposalEnvelope,
-    packet: ResourcePacket
-  ): Promise<ProposalEnvelope> {
-    return this.ports.resourceResume({
-      state,
-      prompt,
-      userRequest: input.content,
-      requestProposal,
-      packet,
-      callProposalOnly: ({ state: runState, prompt: runPrompt, contract, stage, messages }) =>
-        this.ports.callProviderProposalOnly(input, runState, runPrompt, contract, stage, messages),
-      runRepair: (stage, messages) =>
-        this.ports.runRepair(input, state, stage, messages),
-    });
+    return { kind: 'continue', lastResult: result };
   }
 }

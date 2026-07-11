@@ -7,12 +7,14 @@ export interface ProviderTraceArchiveRecord {
   kind: 'request' | 'response' | 'generic';
   request?: {
     profileId?: string;
+    semanticProfileId?: string;
     messageCount: number;
     totalContentChars: number;
     messages: ProviderTraceMessageDigest[];
     responseFormat?: unknown;
     toolCount: number;
     tools?: ProviderTraceToolDefinitionDigest[];
+    cacheTopology?: unknown;
   };
   response?: {
     usage?: unknown;
@@ -82,12 +84,14 @@ export class ProviderTraceArchive {
         kind: 'request',
         request: {
           profileId: stringValue(record.profileId),
+          semanticProfileId: stringValue(record.semanticProfileId),
           messageCount: messages.length,
           totalContentChars: messageDigests.reduce((sum, item) => sum + item.contentCharLength, 0),
           messages: messageDigests,
           responseFormat: compactArchiveValue(record.responseFormat),
           toolCount: Array.isArray(record.tools) ? record.tools.length : 0,
           tools: providerTraceToolDefinitions(record.tools),
+          cacheTopology: compactArchiveValue(record.cacheTopology),
         },
         cachePlan: compactArchiveValue(record.cachePlan),
         contextAssembly: compactArchiveValue(record.contextAssembly),

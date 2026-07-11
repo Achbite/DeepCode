@@ -8,6 +8,7 @@ import type {
   ProjectionDelta,
 } from '@deepcode/protocol';
 import {
+  appendTaskLocalCompactRecord,
   buildTaskLocalCompactRecord,
   type ContextAssemblyRecord,
   type ContextAssemblyTaskLocalCompactRecord,
@@ -15,7 +16,7 @@ import {
 } from '../../context/index.js';
 import type { ProjectWorkingDirectory } from '../../context/types.js';
 import type { AcceptedImplementationPlanContext, AcceptedPlanBatchProgress } from '../../accepted-plan/types.js';
-import type { ProposalEnvelope, ResourceRequestDraft } from '../../protocol/types.js';
+import type { ProposalEnvelope } from '../../protocol/types.js';
 import type { PromptEnvelope } from '../../prompt/types.js';
 import type { InteractionOverlayContext } from '../pipelines/interactionOverlayCodec.js';
 import type { ProposalRouterResult } from '../proposal/proposalRouter.js';
@@ -58,6 +59,7 @@ export interface AcceptedPlanActionProposalState {
     taskId?: string;
   };
   contextAssembly?: ContextAssemblyRecord;
+  taskLocalCompactRecords?: ContextAssemblyTaskLocalCompactRecord[];
   acceptedPlanScopeRepairAttempted?: boolean;
   planReviewRepairAttempted?: boolean;
 }
@@ -90,31 +92,7 @@ export interface AcceptedPlanActionProposalSubmitterPorts<
     proposal: ProposalEnvelope,
     validation: unknown
   ): Promise<AgentSessionResult>;
-  appendThinking(state: State, message: string, idPrefix: string, metadata?: Record<string, unknown>): Promise<void>;
-  repairScope(input: {
-    state: State;
-    prompt: PromptEnvelope;
-    proposal: ProposalEnvelope;
-    validation: unknown;
-    input: Input;
-  }): Promise<ProposalEnvelope>;
-  handleScopeResourceFollowup(input: {
-    state: State;
-    acceptedPlan: AcceptedImplementationPlanContext;
-    proposal: ProposalEnvelope;
-    request: ResourceRequestDraft;
-    result: AgentSessionResult;
-  }): Promise<{ kind: 'failed'; result: AgentSessionResult } | { kind: 'resume'; result: AgentSessionResult; content: string }>;
-  waitForScopeDecision(input: {
-    state: State;
-    proposal: ProposalEnvelope;
-    request: {
-      content: string;
-      attachments?: AgentContextAttachment[];
-    };
-  }): Promise<AgentSessionResult>;
   appendDiagnostic(state: State, code: string, fallback: string, params: Record<string, string | number> | undefined, idPrefix: string): Promise<AgentSessionResult | undefined>;
-  submitNonExecutableProposal(state: State, proposal: ProposalEnvelope, fallback: AgentSessionResult): Promise<AgentSessionResult>;
   sessionRunStateEvent(input: Record<string, unknown>): AgentEvent;
   accessScopesCanonicalizedEvent(
     sessionId: string,
@@ -127,8 +105,6 @@ export interface AcceptedPlanActionProposalSubmitterPorts<
   findReviewReport(events: unknown[]): Record<string, unknown> | undefined;
   appendTrace(state: State, stage: string, payload: unknown): Promise<void>;
   acceptedPlanNeedsRepair(report: Record<string, unknown>): boolean;
-  repairPlanReview(input: Input, state: State, prompt: PromptEnvelope, proposal: ProposalEnvelope, report: Record<string, unknown>): Promise<ProposalEnvelope>;
-  answerEvent(sessionId: string, proposal: ProposalEnvelope, ts: string, id: string): AgentEvent;
   denied(report: Record<string, unknown>): boolean;
   diagnosticSummary(report: Record<string, unknown>): string;
   nonAcceptedPermissionGaps(report: Record<string, unknown>, accepted: AcceptedImplementationPlanContext): string[];
@@ -250,61 +226,7 @@ export class AcceptedPlanActionProposalSubmitter<
     }
     if (assessment.kind === 'scopeRepair') {
       repairRuntime.markAttempted('acceptedPlanScopeRepairAttempted');
-      await this.ports.appendThinking(
-        state,
-        'The current execution batch is outside the confirmed current-task scope; Session is asking the model to continue the current task or request additional authorization.',
-        'accepted-plan-scope-repair',
-        {
-          messageKey: 'session.driver.acceptedPlanScopeRepair',
-          messageArgs: {},
-        }
-      );
-      try {
-        const repaired = await this.ports.repairScope({
-          state,
-          prompt,
-          proposal,
-          validation: assessment.validation,
-          input,
-        });
-        if (repaired.kind === 'actionBundle') {
-          return this.submit(input, state, prompt, repaired, fallback);
-        }
-        if (repaired.kind === 'resourceRequest') {
-          const followup = await this.ports.handleScopeResourceFollowup({
-            state,
-            acceptedPlan: accepted,
-            proposal,
-            request: repaired.payload as ResourceRequestDraft,
-            result: fallback,
-          });
-          if (followup.kind === 'failed') return followup.result;
-          return { kind: 'continue', lastResult: followup.result };
-        }
-        if (repaired.kind === 'decisionRequest') {
-          return this.ports.waitForScopeDecision({
-            state,
-            proposal: repaired,
-            request: {
-              content: input.content,
-              attachments: input.attachments,
-            },
-          });
-        }
-        if (repaired.kind === 'taskPlan' || repaired.kind === 'implementationPlan') {
-          const appended = await this.ports.appendDiagnostic(
-            state,
-            'acceptedPlanScopeRepairReturnedPlan',
-            'Accepted-plan execution repair returned a plan proposal. Session will not re-enter plan review from an accepted task; request a scoped actionBundle, resourceRequest, decisionRequest, or diagnostic instead.',
-            { returnedKind: repaired.kind, proposalId: repaired.proposalId },
-            'accepted-plan-scope-repair-plan-forbidden'
-          );
-          return appended ?? fallback;
-        }
-        return this.ports.submitNonExecutableProposal(state, repaired, fallback);
-      } catch {
-        return this.ports.appendScopeIntervention(input, state, proposal, assessment.validation);
-      }
+      return this.ports.appendScopeIntervention(input, state, proposal, assessment.validation);
     }
 
     const scopeCanonicalization = assessment.scopeCanonicalization as { changed: boolean; proposal: ProposalEnvelope };
@@ -369,34 +291,10 @@ export class AcceptedPlanActionProposalSubmitter<
     }
     if (this.ports.acceptedPlanNeedsRepair(reviewReport) && !repairRuntime.attempted('planReviewRepairAttempted')) {
       repairRuntime.markAttempted('planReviewRepairAttempted');
-      await this.ports.appendThinking(
-        state,
-        'Kernel PlanReview requires revising the current accepted-plan batch; Session is running one controlled repair attempt.',
-        'accepted-plan-review-repair'
-      );
-      let repaired: ProposalEnvelope;
-      try {
-        repaired = await this.ports.repairPlanReview(input, state, prompt, executionProposal, reviewReport);
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        const appended = await this.ports.appendDiagnostic(
-          state,
-          'autoBatchRevisionRepairFailed',
-          `The automatic execution batch needs revision, but model repair failed: ${message}`,
-          { message },
-          'accepted-plan-review-repair-failed'
-        );
-        return appended ?? result;
-      }
-      if (repaired.kind === 'actionBundle') {
-        return this.submit(input, state, prompt, repaired, fallback);
-      }
-      if (repaired.kind === 'answer') {
-        return (await this.ports.append(state.sessionId, [
-          this.ports.answerEvent(state.sessionId, repaired, this.ports.now(), this.ports.createId('answer')),
-        ])) ?? result;
-      }
-      return this.ports.submitNonExecutableProposal(state, repaired, fallback);
+      return this.ports.appendScopeIntervention(input, state, executionProposal, {
+        ok: false,
+        reasons: [`Kernel PlanReview requires revising the current batch: ${this.ports.diagnosticSummary(reviewReport)}`],
+      });
     }
 
     result = await this.ports.appendProjectedKernelEvents(state.sessionId, proposalReply) ?? result;
@@ -574,6 +472,7 @@ export class AcceptedPlanActionProposalSubmitter<
     if (observed.kind !== 'factsObserved' || !observed.readyForReview) {
       return result;
     }
+    const completedTaskId = state.currentTaskContext?.taskId;
     const ledgerEffect = this.ports.recordKernelBatchProgress({ acceptedPlan: accepted, proposal: executionProposal, kernelEvents: batchReply.events ?? [] });
     const batchProgress = ledgerEffect.progress;
     const nextAccepted = ledgerEffect.nextAcceptedPlan;
@@ -586,8 +485,12 @@ export class AcceptedPlanActionProposalSubmitter<
       status: 'completedByKernelFacts',
       planId: accepted.planId,
       runId: state.runId,
-      taskId: state.currentTaskContext?.taskId,
+      taskId: completedTaskId,
     });
+    state.taskLocalCompactRecords = appendTaskLocalCompactRecord(
+      state.taskLocalCompactRecords,
+      contextCompactRecord
+    );
     result = await this.ports.append(state.sessionId, [
       this.ports.batchCheckpointEvent(
         state.sessionId,
@@ -733,6 +636,10 @@ export class AcceptedPlanActionProposalSubmitter<
       runId: state.runId,
       taskId,
     });
+    state.taskLocalCompactRecords = appendTaskLocalCompactRecord(
+      state.taskLocalCompactRecords,
+      contextCompactRecord
+    );
     const checkpointResult = await this.ports.append(state.sessionId, [
       this.ports.batchCheckpointEvent(
         state.sessionId,

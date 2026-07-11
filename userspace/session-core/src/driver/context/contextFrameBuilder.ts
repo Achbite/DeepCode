@@ -81,8 +81,8 @@ export class ContextFrameBuilder {
         kind: 'ProtocolContract',
         source: 'protocol',
         trust: 'contract',
-        use: 'Defines the allowed structured proposal kinds for this turn.',
-        summary: `Allowed kinds: ${input.allowedKinds.join(', ')}`,
+        use: 'Defines the registered Session semantic tools for this provider profile.',
+        summary: 'Use exactly one registered Session semantic tool for the next directive.',
       },
       {
         kind: 'MemoryPlaceholder',
@@ -255,10 +255,8 @@ export class ContextFrameBuilder {
   private providerStepSummary(input: BuildProviderTurnContractInput): string {
     return [
       `turnMode=${input.turnMode}`,
-      `allowedKinds=${input.allowedKinds.join(', ') || 'none'}`,
-      `requiredKind=${input.requiredKind ?? 'none'}`,
       `resourceRefs=${input.resourceEvidenceRefs?.length ?? 0}`,
-      `toolIntents=${input.toolIntentTemplates?.length ?? 0}`,
+      `intentSlots=${input.toolIntentTemplates?.length ?? 0}`,
     ].join('; ');
   }
 
@@ -309,26 +307,25 @@ export class ContextFrameBuilder {
     if (acceptedPlanActive || currentTaskContext) {
       return [
         'Use the current task cursor only.',
-        `Allowed proposal kinds: ${allowedKinds.join(', ')}.`,
-        'Use TaskFrame targets and currentTaskActionTemplates as the preferred current task boundary; do not import unrelated targets from the original user request, plan summary, memory, or later tasks.',
-        'If file changes are needed and evidence is sufficient, return an actionBundle with the concrete operations needed for the current task.',
-        'If evidence is missing, return a focused resourceRequest.',
+        'Use exactly one registered execution semantic tool.',
+        'Use TaskFrame and IntentSlot values as the complete current-task boundary; do not import unrelated targets from the original user request, plan summary, memory, or later tasks.',
+        'If every current IntentSlot has evidenceRequirement=none, submit the current artifacts directly; do not read the target or parent directory merely to confirm that the operation may begin.',
+        'If generated content is needed and evidence is sufficient, call session.submit_task_artifacts with slot ids and content only.',
+        'If evidence is missing, call session.request_resources with a focused resource intent.',
         'If AccessIndex currentTaskEvidence reports covered=true for the current target, use that evidence instead of repeating the same resourceRequest; request only a different range/search when exact missing content would change the action.',
-        'If a concrete operation later exceeds accepted scope, Session and Kernel will interrupt for user approval; do not pre-ask for routine permission or scope expansion.',
-        'If the current task is already sufficiently satisfied and no Kernel action is needed, return taskOutcome with status="modelJudgedSufficient".',
+        'Session and Kernel handle execution scope and permission interrupts; do not submit permission fields.',
+        'If the current task is already sufficiently satisfied and no Kernel action is needed, call session.complete_current_task.',
         'Keep visible reasoning/progress action-oriented: state the current action or task outcome, not protocol, tool, permission, or evidence-policy deliberation.',
       ].join(' ');
     }
     return [
-      `Allowed proposal kinds: ${allowedKinds.join(', ')}.`,
-      'If ResourceEvidence or AccessIndex is enough to form a useful taskPlan or answer, output that proposal now; do not narrate or debate whether to read more context.',
-      'Use resourceRequest only for missing concrete evidence that would change the next proposal. Keep it focused on a different path/range/search query that adds new facts.',
-      'Use decisionRequest only when a blocking user choice prevents any valid taskPlan; put reviewable assumptions in taskPlan risks or reviewCheckpoints.',
-      'For delete or cleanup plans, target only paths that are visible in ResourceEvidence/AccessIndex or explicitly named by the current user or ConfirmedDecision.',
-      'For project scaffolding, plan concrete file writes instead of standalone directory creation; Kernel creates parent directories when fs.write creates files.',
-      'Decide from the current PromptPacket frames; do not re-audit protocol rules, permission gates, resource policy, or unrelated prior requirements in reasoning.',
+      'Use exactly one registered planning semantic tool.',
+      'If ResourceEvidence or AccessIndex is enough to form a useful plan or answer, call session.submit_plan or session.submit_answer now.',
+      'Call session.request_resources only for missing concrete evidence that would change the next directive.',
+      'Call session.request_decision only when a blocking user choice prevents any valid plan; put reviewable assumptions in plan risks or review checkpoints.',
+      'For delete or cleanup plans, target only paths visible in ResourceEvidence/AccessIndex or explicitly named by the current user or ConfirmedDecision.',
+      'Decide from the current frames; do not re-audit protocol rules, permission gates, resource policy, or unrelated prior requirements in reasoning.',
       'Keep visible reasoning/progress action-oriented: state the current action or proposal, not protocol, tool, permission, or evidence-policy deliberation.',
-      'For side-effect work, plan first unless Session already provided an accepted task.',
       'Do not infer execution facts or permissions from memory.',
     ].join(' ');
   }

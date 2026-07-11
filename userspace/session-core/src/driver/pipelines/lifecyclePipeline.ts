@@ -35,7 +35,7 @@ import type {
 } from '../../run-state/index.js';
 import type { DriverRequestRef, KernelStateContractRef } from '../types.js';
 import type { InteractionOverlayContext, SessionTurnPhase } from './interactionOverlayCodec.js';
-import type { DriverProviderTurnFrame } from '../runFrame.js';
+import type { DriverProviderTurnFrame, SessionDriverTaskResourceProgress } from '../runFrame.js';
 
 export interface RunLifecycleInput {
   sessionId: string;
@@ -67,6 +67,7 @@ export interface RunLifecycleState {
   initialContext: InitialContextPacket;
   resourcePackets: ResourcePacket[];
   generatedArtifactEvidence: Map<string, unknown>;
+  resourceRequestProgressByTask: Map<string, SessionDriverTaskResourceProgress>;
   memoryDocument: SessionMemoryDocument;
   memoryHints: string[];
   cachePlan?: PromptCachePlan;
@@ -88,6 +89,8 @@ export interface RunLifecycleState {
   nativeToolDuplicateRepairAttempted: boolean;
   nativeToolResumeMessages?: LlmChatRequest['messages'];
   nativeToolResumeRound?: number;
+  semanticDirectiveRepairAttempted?: boolean;
+  semanticDirectiveErrorSummary?: string;
   interactionOverlay?: InteractionOverlayContext;
 }
 
@@ -246,6 +249,7 @@ export class RunLifecyclePipeline<State extends RunLifecycleState> {
       },
       resourcePackets: [...restoredResourcePackets],
       generatedArtifactEvidence: this.ports.generatedArtifactEvidenceFromPackets(restoredResourcePackets),
+      resourceRequestProgressByTask: new Map<string, SessionDriverTaskResourceProgress>(),
       memoryDocument: this.ports.buildMemoryDocument(events, {
         projectMemoryMode: input.projectMemoryMode,
       }),
@@ -266,6 +270,8 @@ export class RunLifecyclePipeline<State extends RunLifecycleState> {
       nativeToolDuplicateRepairAttempted: false,
       nativeToolResumeMessages: undefined,
       nativeToolResumeRound: 0,
+      semanticDirectiveRepairAttempted: false,
+      semanticDirectiveErrorSummary: undefined,
       interactionOverlay: input.interactionOverlay,
     } as State;
 

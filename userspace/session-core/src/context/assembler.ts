@@ -311,6 +311,7 @@ export interface ContextAssemblyInput {
     lastSavepointId?: string;
   };
   taskLocalCompactRecords?: ContextAssemblyTaskLocalCompactRecord[];
+  currentTaskResourcePacketIds?: string[];
   auditOnly?: PromptEnvelopeBuilderInput['auditOnly'];
 }
 
@@ -327,8 +328,11 @@ export function assembleContext(input: ContextAssemblyInput): ContextAssemblyRes
     conversationRoots: input.conversationRoots,
     resourcePackets: input.resourcePackets,
     taskLocalCompaction: {
-      active: taskLocalCompactRecords.length > 0 && compactCurrentTaskTargets.length > 0,
+      active: taskLocalCompactRecords.length > 0 && (
+        compactCurrentTaskTargets.length > 0 || Boolean(input.currentTaskResourcePacketIds?.length)
+      ),
       currentTaskTargets: compactCurrentTaskTargets,
+      currentTaskPacketIds: input.currentTaskResourcePacketIds,
     },
   });
   const promptInput: PromptEnvelopeBuilderInput = {
@@ -712,7 +716,7 @@ function contextAssemblyPartitionName(segment: PromptSegment): ContextAssemblyPa
 
 function contextAssemblyDynamicAppendLog(segments: PromptSegment[]): ContextAssemblyDynamicAppendLogEntry[] {
   return segments
-    .filter((segment) => !segment.stable && !segment.auditOnly)
+    .filter((segment) => !segment.stable && !segment.auditOnly && segment.content.trim())
     .map((segment, index) => {
       const rendered = renderPromptSegment(segment);
       const partitionName = contextAssemblyPartitionName(segment);

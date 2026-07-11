@@ -57,6 +57,7 @@ export class AcceptedImplementationPlanContextBuilder {
         taskId,
         title: stringValue(record.title),
         capability: stringValue(record.capability),
+        semanticOperation: stringValue(record.semanticOperation),
         targets: this.ports.acceptedPlanTaskTargets(record),
         acceptanceCriteria: stringArrayValue(record.acceptanceCriteria),
         failureCriteria: stringArrayValue(record.failureCriteria),

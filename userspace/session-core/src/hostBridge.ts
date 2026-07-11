@@ -4,6 +4,7 @@ import type {
   AgentSessionResult,
   AgentTimelineResult,
   AgentWorkspaceBinding,
+  AppendAgentEventsRequest,
   ApiResponse,
   KernelCommandEnvelope,
   KernelReply,
@@ -232,16 +233,11 @@ function createProjectionPublishingDriver(
     appendTranscript: (sessionId, entry) => transcriptClient.appendTranscript(sessionId, entry),
     appendEvents: async (sessionId, events) => {
       const nextEvents = [...committedEvents, ...events];
-      const timeline = activeDeltas.length > 0
-        ? buildTimelineProjectionWithLiveOverlay({
-            sessionId,
-            committedEvents: nextEvents,
-            activeDeltas,
-          })
-        : buildNarrativeTimelineProjection({ sessionId, events: nextEvents });
+      // Event append is the persistence boundary; the full timeline is derived from committed events.
+      const appendRequest: AppendAgentEventsRequest = { events };
       const response = await postJson<ApiResponse<AgentSessionResult>>(
         `${apiBase}/api/agent/sessions/${encodeURIComponent(sessionId)}/events`,
-        { events, timeline }
+        appendRequest
       );
       if (!response.ok || !response.data) {
         throw new Error(response.message ?? response.error ?? 'append agent events failed');

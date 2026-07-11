@@ -45,6 +45,16 @@ export function buildTaskLocalCompactRecord(input: {
   };
 }
 
+export function appendTaskLocalCompactRecord(
+  records: ContextAssemblyTaskLocalCompactRecord[] | undefined,
+  record: ContextAssemblyTaskLocalCompactRecord | undefined,
+  limit = 8
+): ContextAssemblyTaskLocalCompactRecord[] {
+  if (!record) return records ?? [];
+  const next = [...(records ?? []).filter((item) => item.compactHash !== record.compactHash), record];
+  return next.slice(-Math.max(1, limit));
+}
+
 function retainedPolicies(plan: ContextAssemblyTaskLocalFoldPlan): string[] {
   return plan.policySummaries
     .filter((summary) => summary.policy !== 'dropAfterTask')

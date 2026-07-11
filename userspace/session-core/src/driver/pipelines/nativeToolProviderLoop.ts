@@ -5,17 +5,18 @@ import type {
 import type { ProposalEnvelope } from '../../protocol/types.js';
 import type { ProviderEmptyProposalRetryOptions } from '../../provider/ProviderEmptyProposalRetry.js';
 import type {
-  NativeToolHandlingResult,
   NativeToolTurnHandlerInput,
   NativeToolTurnHandlerPorts,
   NativeToolTurnHandlerState,
   NativeToolTurnResult,
 } from '../../provider/NativeToolTurnHandler.js';
+import type { NativeToolCallProposal } from '../../provider/providerStreamParts.js';
 import type {
   ProviderPipelineRunTurnInput,
   ProviderPipelineTurn,
 } from './providerPipeline.js';
 import type { DriverProviderTurnFrame } from '../runFrame.js';
+import { SessionSemanticDirectiveError } from '../../provider/SessionSemanticToolAdapter.js';
 
 export interface NativeToolProviderPipelineLike<
   TState extends NativeToolTurnHandlerState,
@@ -30,8 +31,8 @@ export interface NativeToolProviderResumeSignal {
 }
 
 export interface NativeToolProviderLoopState extends NativeToolTurnHandlerState {
-  nativeToolResumeMessages?: LlmChatRequest['messages'];
-  nativeToolResumeRound?: number;
+  semanticDirectiveRepairAttempted?: boolean;
+  semanticDirectiveErrorSummary?: string;
 }
 
 export interface NativeToolProviderTurnHandlerLike<
@@ -39,15 +40,7 @@ export interface NativeToolProviderTurnHandlerLike<
   TPrompt,
   TTurn extends NativeToolTurnResult,
 > {
-  handle(input: NativeToolTurnHandlerInput<TState, TPrompt, TTurn>): Promise<NativeToolHandlingResult>;
-}
-
-export interface NativeToolProviderResumeMessageBuilderLike<TTurn extends NativeToolTurnResult> {
-  nextMessages(
-    currentMessages: LlmChatRequest['messages'],
-    turn: TTurn,
-    toolMessages: LlmChatRequest['messages']
-  ): LlmChatRequest['messages'];
+  handle(input: NativeToolTurnHandlerInput<TState, TPrompt, TTurn>): Promise<{ kind: 'proposal'; proposal: ProposalEnvelope }>;
 }
 
 export interface NativeToolProviderLoopDependencies<
@@ -57,7 +50,6 @@ export interface NativeToolProviderLoopDependencies<
 > {
   providerPipeline: NativeToolProviderPipelineLike<TState, TTurn>;
   turnHandler: NativeToolProviderTurnHandlerLike<TState, TPrompt, TTurn>;
-  resumeMessageBuilder: NativeToolProviderResumeMessageBuilderLike<TTurn>;
 }
 
 export interface NativeToolProviderLoopInput<
@@ -70,7 +62,7 @@ export interface NativeToolProviderLoopInput<
   prompt: TPrompt;
   contract: DriverProviderTurnFrame;
   providerTools: ToolDefinition[];
-  handlerPorts: NativeToolTurnHandlerPorts<TState, TPrompt, TTurn>;
+  handlerPorts: NativeToolTurnHandlerPorts<TState>;
   runTurn(
     profileId: string | undefined,
     state: TState,
@@ -79,7 +71,7 @@ export interface NativeToolProviderLoopInput<
     options: ProviderEmptyProposalRetryOptions
   ): Promise<TTurn>;
   isEmptyResponseError(error: unknown): boolean;
-  consumeGuidanceMessages(state: TState, stage: string): Promise<LlmChatRequest['messages']>;
+  semanticDirectiveError(error: unknown): { code: string; message: string } | undefined;
 }
 
 export class NativeToolProviderLoop<
@@ -91,51 +83,72 @@ export class NativeToolProviderLoop<
 
   async run(
     input: NativeToolProviderLoopInput<TState, TPrompt, TTurn>
-  ): Promise<string | ProposalEnvelope | NativeToolProviderResumeSignal> {
-    const round = input.state.nativeToolResumeRound ?? 0;
-    const currentMessages = input.state.nativeToolResumeMessages
-      ?? this.dependencies.providerPipeline.messages(input.contract);
-    const stage = round === 0 ? 'provider_call' : `provider_tool_resume_${round}`;
-    const effectiveTurn = await this.dependencies.providerPipeline.runWithNativeTools({
-      profileId: input.profileId,
-      state: input.state,
-      contract: input.contract,
-      stage,
-      messages: currentMessages,
-      options: {
-        tools: input.providerTools,
-      },
-      runTurn: input.runTurn,
-      isEmptyResponseError: input.isEmptyResponseError,
-    });
-    if (effectiveTurn.toolCalls.length === 0) {
-      input.state.nativeToolResumeMessages = undefined;
-      input.state.nativeToolResumeRound = 0;
-      return effectiveTurn.content;
+  ): Promise<ProposalEnvelope | NativeToolProviderResumeSignal> {
+    let effectiveTurn: TTurn;
+    try {
+      effectiveTurn = await this.dependencies.providerPipeline.runWithNativeTools({
+        profileId: input.profileId,
+        state: input.state,
+        contract: input.contract,
+        stage: 'provider_call',
+        messages: this.dependencies.providerPipeline.messages(input.contract),
+        options: { tools: input.providerTools },
+        runTurn: input.runTurn,
+        isEmptyResponseError: input.isEmptyResponseError,
+      });
+    } catch (error) {
+      const directiveError = input.semanticDirectiveError(error);
+      if (!directiveError) throw error;
+      return this.scheduleSameProfileRetry(input.state, [
+        `code=${directiveError.code}`,
+        `fieldErrors=${directiveError.message}`,
+      ]);
+    }
+    const toolCalls = effectiveTurn.toolCalls as NativeToolCallProposal[];
+    const registeredNames = new Set(input.providerTools.map((tool) => tool.name));
+    const unregistered = toolCalls.find((toolCall) => !registeredNames.has(toolCall.name));
+    if (unregistered) {
+      throw new Error(`Provider emitted unregistered Session semantic tool ${unregistered.name}.`);
+    }
+    if (toolCalls.length === 0) {
+      throw new Error('Provider did not emit a required Session semantic directive.');
     }
 
-    const handled = await this.dependencies.turnHandler.handle({
-      state: input.state,
-      prompt: input.prompt,
-      turn: effectiveTurn,
-      round,
-      ports: input.handlerPorts,
-    });
-    if (handled.kind === 'proposal') {
-      input.state.nativeToolResumeMessages = undefined;
-      input.state.nativeToolResumeRound = 0;
+    try {
+      const handled = await this.dependencies.turnHandler.handle({
+        state: input.state,
+        prompt: input.prompt,
+        turn: effectiveTurn,
+        round: 0,
+        ports: input.handlerPorts,
+      });
+      input.state.semanticDirectiveRepairAttempted = false;
+      input.state.semanticDirectiveErrorSummary = undefined;
       return handled.proposal;
+    } catch (error) {
+      if (!(error instanceof SessionSemanticDirectiveError)) throw error;
+      return this.scheduleSameProfileRetry(input.state, [
+        `code=${error.code}`,
+        `tool=${error.toolName}`,
+        `callId=${error.callId}`,
+        `argumentsHash=${error.argumentsHash}`,
+        `fieldErrors=${error.message}`,
+      ]);
     }
+  }
 
-    const nextMessages = this.dependencies.resumeMessageBuilder.nextMessages(
-      currentMessages,
-      effectiveTurn,
-      handled.toolMessages
-    );
-    const guidanceMessages = await input.consumeGuidanceMessages(input.state, stage);
-    nextMessages.push(...guidanceMessages);
-    input.state.nativeToolResumeMessages = nextMessages;
-    input.state.nativeToolResumeRound = round + 1;
+  private scheduleSameProfileRetry(
+    state: TState,
+    details: string[]
+  ): NativeToolProviderResumeSignal {
+    if (state.semanticDirectiveRepairAttempted) {
+      throw new Error(`Session semantic directive remained invalid after one same-profile retry: ${details.join('; ')}`);
+    }
+    state.semanticDirectiveRepairAttempted = true;
+    state.semanticDirectiveErrorSummary = [
+      ...details,
+      'requiredAction=Call exactly one registered semantic tool with valid JSON arguments matching its schema and the current task contract.',
+    ].join('; ');
     return { kind: 'providerResume' };
   }
 }

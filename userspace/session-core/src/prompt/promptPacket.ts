@@ -48,11 +48,11 @@ export function buildPromptPacketFrames(input: PromptEnvelopeBuilderInput): Prom
       source: 'session.protocol',
       trust: 'schemaInstruction',
       scope: 'currentProviderCall',
-      use: 'choose exactly one allowed proposal kind and follow its top-level Agent Protocol v3 shape',
+      use: 'choose exactly one registered Session semantic tool for the current profile',
       content: [
-        `Allowed proposal kinds for this call: ${input.allowedProposals.join(', ') || 'none'}.`,
-        'Frames later in this packet are context, not protocol examples. Use source/trust/use to decide whether a frame is user intent, observed resource evidence, compressed memory, or an immediate instruction.',
-        'If current facts are enough, produce the next proposal. If facts are missing, request focused resources. Use decisionRequest only for a material user choice that cannot be expressed as a concrete proposal.',
+        'Provider-native tool schemas define the available Session directives for this call.',
+        'Frames later in this packet are context, not tool examples. Use source/trust/use to distinguish user intent, observed resource evidence, compressed memory, and immediate instruction.',
+        'Do not emit Kernel tool identifiers or internal execution transport fields.',
       ],
     },
     memoryFrame(input),
@@ -121,7 +121,6 @@ function taskFrameFromInput(input: PromptEnvelopeBuilderInput): PromptPacketFram
   const taskId = stringValue(record.taskId) ?? 'none';
   const title = stringValue(record.taskTitle);
   const targets = stringArray(record.targets);
-  const capabilities = stringArray(record.capabilities);
   const acceptanceCriteria = stringArray(record.acceptanceCriteria);
   const failureCriteria = stringArray(record.failureCriteria);
   const completed = stringArray(record.completedTaskIds);
@@ -137,7 +136,6 @@ function taskFrameFromInput(input: PromptEnvelopeBuilderInput): PromptPacketFram
       title ? `title=${oneLine(title, 240)}` : '',
       goal ? `objective=${oneLine(goal, 500)}` : '',
       `targets=${targets.length ? targets.join(', ') : 'none'}`,
-      `capabilities=${capabilities.length ? capabilities.join(', ') : 'none'}`,
       `acceptanceCriteria=${acceptanceCriteria.length ? acceptanceCriteria.map((item) => oneLine(item, 180)).join(' | ') : 'none'}`,
       `failureCriteria=${failureCriteria.length ? failureCriteria.map((item) => oneLine(item, 180)).join(' | ') : 'none'}`,
       `completedTaskCount=${completed.length}`,
@@ -211,7 +209,6 @@ function providerStepSummaryFrame(input: PromptEnvelopeBuilderInput): PromptPack
     use: 'describes current provider turn shape without adding facts',
     content: [
       `workflowState=${input.workflowState || 'needProposal'}`,
-      `allowedOutputs=${input.allowedProposals.join(' | ') || 'none'}`,
       `resourceBlocks=${input.resourcePromptContext?.resourceBlocks.length ?? 0}`,
       `hasCurrentTask=${Boolean(input.currentTaskContext)}`,
     ],
@@ -255,26 +252,21 @@ function errorContextFrame(input: PromptEnvelopeBuilderInput): PromptPacketFrame
 function nextActionInstructionFrame(input: PromptEnvelopeBuilderInput): PromptPacketFrame {
   const acceptedExecution = Boolean(input.currentTaskContext);
   const confirmedRequirement = input.requirement?.status === 'confirmed';
-  const allowed = acceptedExecution
-    ? input.allowedProposals.filter((kind) => kind !== 'taskPlan' && kind !== 'implementationPlan')
-    : input.allowedProposals;
   const genericContent = confirmedRequirement
     ? [
       'state=ConfirmedRequirementContinuation',
       `confirmedRequirementId=${input.requirement?.requirementId ?? 'unknown'}`,
-      `allowedOutputs=${allowed.join(' | ') || 'none'}`,
       'The user has already resolved the previous decisionRequest. Do not repeat that intervention.',
       'Use DynamicDialogue and ConfirmedDecision as the resolved current scope. Do not infer extra preserved/deleted/modified targets from memory or from ambiguous wording in the original request.',
-      'Choose the narrowest valid next proposal from allowedOutputs. If a side-effect is now fully specified and actionBundle is allowed, you may output actionBundle; otherwise output taskPlan or a focused decisionRequest only for a new independent ambiguity.',
+      'Use exactly one registered planning semantic tool. Submit a plan when side-effect work is sufficiently specified; request a decision only for a new independent ambiguity.',
     ]
     : [
       `state=${input.workflowState || 'needProposal'}`,
-      `allowedOutputs=${allowed.join(' | ') || 'none'}`,
-      'If ResourceEvidence or AccessIndex is enough to form a useful taskPlan or answer, output that proposal now; do not narrate or debate whether to read more context.',
-      'Use resourceRequest only for missing concrete evidence that would change the next proposal. Keep it focused on a different path/range/search query that adds new facts.',
-      'Use decisionRequest only when a blocking user choice prevents any valid taskPlan; put reviewable assumptions in taskPlan risks or reviewCheckpoints.',
+      'Use exactly one registered planning semantic tool.',
+      'If ResourceEvidence or AccessIndex is enough to form a useful plan or answer, call session.submit_plan or session.submit_answer now.',
+      'Call session.request_resources only for missing concrete evidence that would change the next directive.',
+      'Call session.request_decision only when a blocking user choice prevents any valid plan; put reviewable assumptions in plan risks or review checkpoints.',
       'Decide from the current PromptPacket frames; do not re-audit protocol rules, permission gates, resource policy, or unrelated prior requirements in reasoning.',
-      'For side-effect work, plan first unless Session already provided an accepted task.',
     ];
   return {
     kind: 'NextActionInstruction',
@@ -285,12 +277,12 @@ function nextActionInstructionFrame(input: PromptEnvelopeBuilderInput): PromptPa
     content: acceptedExecution
       ? [
         'state=AcceptedTaskExecution',
-        `allowedOutputs=${allowed.join(' | ') || 'none'}`,
-        'forbiddenOutputs=taskPlan | implementationPlan | reviewSummary',
+        'Use exactly one registered execution semantic tool.',
         'Continue the current accepted task. Do not re-plan unless a user decision explicitly requests replan/revisePlan.',
-        'Use TaskFrame targets and currentTaskActionTemplates as the preferred current task boundary. Do not add unrelated targets from the original user request, plan summary, memory, or later tasks.',
-        'If the current task needs file changes and evidence is sufficient, output actionBundle with the concrete operation intent. If evidence is missing, output focused resourceRequest. If a concrete operation exceeds accepted scope, Session and Kernel interrupt for user approval.',
-        'If the current task is already sufficiently satisfied and no Kernel action is needed, output taskOutcome with status="modelJudgedSufficient". Do not invent empty actions just to advance the task.',
+        'Use TaskFrame and IntentSlot values as the complete current task boundary. Do not add unrelated targets from the original user request, plan summary, memory, or later tasks.',
+        'If every current IntentSlot has evidenceRequirement=none, submit the current artifacts directly; do not read the target or parent directory merely to confirm that a create or process operation may begin.',
+        'If generated content is needed and evidence is sufficient, call session.submit_task_artifacts with slot ids and content only. If evidence is missing, call session.request_resources.',
+        'If the current task is already sufficiently satisfied and no Kernel action is needed, call session.complete_current_task. Do not invent empty artifacts just to advance the task.',
       ]
       : genericContent,
   };

@@ -1,9 +1,10 @@
 import type {
   DriverProviderTurnFrame,
-  ProviderContextFrame,
   ToolIntentTemplate,
 } from '../runFrame.js';
-import { stableHash } from '../../cache/canonicalizer.js';
+import { ProviderProfileRegistry } from '../../provider/ProviderProfileRegistry.js';
+
+const profiles = new ProviderProfileRegistry();
 
 export function renderProviderTurnUserPrompt(dynamicContent: string, contract: DriverProviderTurnFrame): string {
   const payload = buildProviderTurnContractPayload(contract, dynamicContent);
@@ -22,44 +23,34 @@ export function buildProviderTurnContractPayload(
   contract: DriverProviderTurnFrame,
   dynamicContent: string
 ): Record<string, unknown> {
+  const frameRefs = contract.frames.flatMap((frame): Record<string, unknown>[] => {
+    if (frame.kind === 'DynamicDialogue') {
+      return [{ kind: frame.kind, summaryRef: 'dynamicSuffix' }];
+    }
+    if (frame.kind === 'NextActionInstruction') {
+      return [{ kind: frame.kind, summary: 'See final Provider turn instruction.' }];
+    }
+    if (frame.kind === 'ConfirmedDecision' || frame.kind === 'ErrorContext') {
+      return [{ kind: frame.kind, ...(frame.summary ? { summary: frame.summary } : {}) }];
+    }
+    if (frame.kind === 'TaskFrame') {
+      return [{ kind: frame.kind, ...(frame.data ? { data: frame.data } : {}) }];
+    }
+    return [];
+  });
   return {
     schemaVersion: contract.schemaVersion,
     contractId: contract.contractId,
+    semanticProfileId: profiles.profileForFrame(contract).id,
     turnMode: contract.turnMode,
     allowedKinds: contract.allowedKinds,
     ...(contract.requiredKind ? { requiredKind: contract.requiredKind } : {}),
     repairPolicy: contract.repairPolicy,
     projectionVisibility: contract.projectionVisibility,
-    frames: contract.frames.map((frame) => renderFrame(frame, dynamicContent)),
-    toolIntentTemplates: contract.toolIntentTemplates.map(renderToolIntentTemplate),
-  };
-}
-
-function renderFrame(frame: ProviderContextFrame, dynamicContent: string): Record<string, unknown> {
-  const summary = frame.kind === 'NextActionInstruction'
-    ? 'See final Provider turn instruction.'
-    : frame.summary;
-  const rendered: Record<string, unknown> = {
-    kind: frame.kind,
-    source: frame.source,
-    trust: frame.trust,
-    ...(frame.scope ? { scope: frame.scope } : {}),
-    use: frame.use,
-    ...(frame.refs?.length ? { refs: frame.refs } : {}),
-    ...(frame.data ? { data: frame.data } : {}),
-  };
-  if (!summary) return rendered;
-  if (summary.length > 16 && dynamicContent.includes(summary)) {
-    return {
-      ...rendered,
-      summaryRef: 'dynamicSuffix',
-      summaryHash: stableHash(summary),
-      summaryCharLength: summary.length,
-    };
-  }
-  return {
-    ...rendered,
-    summary,
+    frameOrder: contract.frames.map((frame) => frame.kind),
+    frameRefs,
+    intentSlots: contract.toolIntentTemplates.map(renderToolIntentTemplate),
+    dynamicContentIncludedOnce: dynamicContent.length > 0,
   };
 }
 
@@ -70,7 +61,7 @@ function renderToolIntentTemplate(template: ToolIntentTemplate): Record<string, 
     operation: template.operation,
     targets: template.targets,
     ...(template.evidencePolicy ? { evidencePolicy: template.evidencePolicy } : {}),
-    ...(template.template ? { template: template.template } : {}),
+    ...(template.template ? { slotContract: template.template } : {}),
   };
 }
 

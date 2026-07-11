@@ -22,6 +22,7 @@ export interface ProviderTurnCyclePorts<Input, State extends ProviderTurnCycleSt
     state: State,
     prompt: PromptEnvelope
   ): Promise<ProposalEnvelope | NativeToolProviderResumeSignal>;
+  deterministicProposal?(state: State): ProposalEnvelope | undefined;
   admitDirective(proposal: ProposalEnvelope): LoopDirective;
   appendDriverFailure(state: State, error: unknown): Promise<AgentSessionResult | null | undefined>;
   appendProviderFailure(state: State, error: unknown): Promise<AgentSessionResult>;
@@ -49,6 +50,16 @@ export class ProviderTurnCycle<Input, State extends ProviderTurnCycleState> {
     this.ports.refreshRuntimeState(state);
     const providerContext = await this.ports.prepareProviderContext(input.input, state, input.lastResult);
     const prompt = providerContext.prompt;
+    const deterministic = this.ports.deterministicProposal?.(state);
+    if (deterministic) {
+      return {
+        kind: 'directiveReady',
+        prompt,
+        lastResult: providerContext.lastResult,
+        proposal: deterministic,
+        directive: this.ports.admitDirective(deterministic),
+      };
+    }
     state.phase = 'provider_proposing';
     let providerStep: ProposalEnvelope | NativeToolProviderResumeSignal;
     try {

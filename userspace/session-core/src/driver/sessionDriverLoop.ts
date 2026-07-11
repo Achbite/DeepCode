@@ -7,11 +7,7 @@ import {
   AcceptedPlanActionProposalSubmitter,
   AcceptedPlanExecutionRootResolver,
   AcceptedPlanScopeDecisionCoordinator,
-  AcceptedPlanScopeRepairCoordinator,
-  AcceptedPlanScopeResourceFollowupCoordinator,
   AcceptedPlanReadOnlyTaskExecutor,
-  ActionBundleAdmissionRepairCoordinator,
-  ActionBundleAdmissionCoordinator,
   ReviewFactsAggregator,
   assertKernelReplyOk as assertExecutionKernelReplyOk,
   type AcceptedImplementationPlanContext,
@@ -27,7 +23,6 @@ import {
   collectUserGuidanceEvents,
 } from '../context/index.js';
 import type { PromptEnvelope } from '../prompt/types.js';
-import type { ProviderRepairMessageState } from '../prompt/ProviderRepairMessageBuilder.js';
 import {
   NativeToolCoordinatorError,
   NativeToolHandlerPortsFactory,
@@ -42,12 +37,9 @@ import { RunLifecyclePipeline } from './pipelines/lifecyclePipeline.js';
 import { ProviderRuntimeBridge } from './pipelines/providerRuntimeBridge.js';
 import { ProviderTurnCycle } from './pipelines/providerTurnCycle.js';
 import {
-  AcceptedPlanResourceResumeCoordinator,
-  ActionBundleAdmissionResourceFollowupCoordinator,
   ProviderTurnContextCoordinator,
   ResourceOrchestrator,
   ResourceRequestProposalHandler,
-  ResourceRequestRepairCoordinator,
 } from './context/index.js';
 import {
   AcceptedPlanReviewHandoffCoordinator,
@@ -64,6 +56,8 @@ import {
   type PlanContext as SessionPlanContext,
 } from './proposal/index.js';
 import type { LlmTurnResult, SessionDriverLoopRunState } from './runFrame.js';
+import { ProviderProfileRegistry } from '../provider/ProviderProfileRegistry.js';
+import { SessionSemanticToolAdapter } from '../provider/SessionSemanticToolAdapter.js';
 import { RunEngine } from './runEngine.js';
 import { diag, isEmptyResponseError, objectRecord, SessionDriverLoopError, stringValue, visibleLanguageForRequest } from './runtimeSupport.js';
 import { AgentRunReactor } from './agentRunReactor.js';
@@ -72,7 +66,6 @@ import {
   acceptedPlanAdmission,
   acceptedPlanBatchPreflight,
   acceptedPlanExecutor,
-  acceptedPlanResourceResumePromptBuilder,
   acceptedPlanScopeDecisionOverlay,
   acceptedPlanTaskLedger,
   assistantProjectionBuilder,
@@ -80,7 +73,6 @@ import {
   driverActivityBuilder,
   driverFailureMessageCatalog,
   driverInteractionIndex,
-  driverParseErrorCatalog,
   executionPromptCoordinator,
   generatedArtifactEvidenceIndex,
   hookRuntime,
@@ -93,19 +85,14 @@ import {
   nativeToolProgressEventBuilder,
   nativeToolProviderLoop,
   nativeToolProjectionBuilder,
-  nativeToolRepairRunner,
-  nativeToolResourceRecorder,
-  nativeToolResultMessageBuilder,
   permissionPipeline,
   planContextIndex,
   planProjectionBuilder,
   planReviewGrantProjector,
   planReviewReportAnalyzer,
-  proposalOnlyProviderRunner,
   protocolGate,
   providerContextSupport,
   providerJsonModeCoordinator,
-  providerRepairMessageBuilder,
   providerStreamCoordinator,
   providerTraceRecorder,
   providerTurnPolicy,
@@ -142,19 +129,15 @@ export type {
 export { SessionDriverLoopError } from './runtimeSupport.js';
 
 export class SessionDriverLoop {
+  private readonly providerProfileRegistry = new ProviderProfileRegistry();
+  private readonly semanticToolAdapter = new SessionSemanticToolAdapter(this.providerProfileRegistry);
   private readonly agentRunReactor: AgentRunReactor<SessionDriverLoopRunState>;
   private readonly acceptedActionBundlePlanExecutor: AcceptedActionBundlePlanExecutor;
   private readonly acceptedPlanActionProposalSubmitter: AcceptedPlanActionProposalSubmitter<SessionDriverLoopInput, SessionDriverLoopRunState>;
   private readonly acceptedPlanReadOnlyTaskExecutor: AcceptedPlanReadOnlyTaskExecutor<SessionDriverLoopInput, SessionDriverLoopRunState>;
-  private readonly acceptedPlanResourceResumeCoordinator: AcceptedPlanResourceResumeCoordinator<SessionDriverLoopRunState>;
   private readonly acceptedPlanScopeDecisionCoordinator: AcceptedPlanScopeDecisionCoordinator<SessionDriverLoopRunState>;
-  private readonly acceptedPlanScopeRepairCoordinator: AcceptedPlanScopeRepairCoordinator<SessionDriverLoopRunState>;
-  private readonly acceptedPlanScopeResourceFollowupCoordinator: AcceptedPlanScopeResourceFollowupCoordinator<SessionDriverLoopRunState, AcceptedImplementationPlanContext>;
   private readonly acceptedPlanReviewHandoffCoordinator: AcceptedPlanReviewHandoffCoordinator<SessionPlanContext>;
   private readonly acceptedPlanStaticSyntaxReviewCoordinator: AcceptedPlanStaticSyntaxReviewCoordinator<SessionDriverLoopRunState>;
-  private readonly actionBundleAdmissionCoordinator: ActionBundleAdmissionCoordinator<SessionDriverLoopInput, SessionDriverLoopRunState>;
-  private readonly actionBundleAdmissionRepairCoordinator: ActionBundleAdmissionRepairCoordinator<SessionDriverLoopRunState>;
-  private readonly actionBundleAdmissionResourceFollowupCoordinator: ActionBundleAdmissionResourceFollowupCoordinator<SessionDriverLoopRunState>;
   private readonly decisionResolver: DecisionResolver;
   private readonly permissionDecisionHandler: PermissionDecisionHandler<SessionPlanContext>;
   private readonly planDecisionHandler: PlanDecisionHandler;
@@ -170,7 +153,6 @@ export class SessionDriverLoop {
   private readonly actionProposalSubmitter: ActionProposalSubmitter<SessionDriverLoopInput, SessionDriverLoopRunState>;
   private readonly resourceOrchestrator: ResourceOrchestrator<SessionDriverLoopRunState>;
   private readonly resourceRequestProposalHandler: ResourceRequestProposalHandler<SessionDriverLoopInput, SessionDriverLoopRunState>;
-  private readonly resourceRequestRepairCoordinator: ResourceRequestRepairCoordinator<SessionDriverLoopRunState>;
   private readonly nativeToolHandlerPortsFactory: NativeToolHandlerPortsFactory<SessionDriverLoopRunState, PromptEnvelope, LlmTurnResult>;
   private readonly nativeToolProviderCoordinator: NativeToolProviderCoordinator<SessionDriverLoopRunState, LlmTurnResult>;
   private readonly providerStreamRuntime: ProviderStreamRuntime<SessionDriverLoopRunState>;
@@ -291,22 +273,6 @@ export class SessionDriverLoop {
           ts,
           id
         ),
-      resourceResume: (resumeInput) => this.acceptedPlanResourceResumeCoordinator.run(resumeInput),
-      callProviderProposalOnly: (handlerInput, state, prompt, contract, stage, messages) =>
-        this.providerRuntimeBridge.runProposalOnly({
-          profileId: handlerInput.profileId,
-          state,
-          prompt,
-          contract,
-          stage,
-          messages,
-        }),
-      runRepair: (handlerInput, state, stage, messages) =>
-        this.providerRuntimeBridge.llm(handlerInput.profileId, state, stage, messages),
-      submitActionProposal: (handlerInput, state, prompt, proposal, fallback) =>
-        this.actionProposalSubmitter.submit(handlerInput, state, prompt, proposal, fallback),
-      submitNonExecutableProposal: (state, proposal, fallback) =>
-        this.actionProposalSubmitter.submitNonExecutable(state, proposal, fallback),
     });
     this.acceptedPlanActionProposalSubmitter = new AcceptedPlanActionProposalSubmitter<SessionDriverLoopInput, SessionDriverLoopRunState>({
       now: () => this.agentRunReactor.ts(),
@@ -337,39 +303,6 @@ export class SessionDriverLoop {
             currentTaskId: state.currentTaskContext?.taskId,
           },
         }),
-      appendThinking: async (state, message, idPrefix, metadata) => {
-        await this.agentRunReactor.append(state.sessionId, [
-          assistantProjectionBuilder.thinkingEvent(
-            state.sessionId,
-            message,
-            this.agentRunReactor.ts(),
-            this.agentRunReactor.id(idPrefix),
-            metadata as Parameters<typeof assistantProjectionBuilder.thinkingEvent>[4]
-          ),
-        ]);
-      },
-      repairScope: ({ state, prompt, proposal, validation, input: handlerInput }) =>
-        this.acceptedPlanScopeRepairCoordinator.repair({
-          state,
-          prompt,
-          proposal,
-          validation: validation as AcceptedPlanBatchValidationResult,
-          runRepair: (stage, messages) => this.providerRuntimeBridge.llm(handlerInput.profileId, state, stage, messages),
-        }),
-      handleScopeResourceFollowup: ({ state, acceptedPlan, proposal, request, result }) =>
-        this.acceptedPlanScopeResourceFollowupCoordinator.handle({
-          state,
-          acceptedPlan,
-          proposal,
-          request,
-          result,
-        }),
-      waitForScopeDecision: ({ state, proposal, request }) =>
-        this.acceptedPlanScopeDecisionCoordinator.waitForDecision({
-          state,
-          proposal,
-          request,
-        }),
       appendDiagnostic: (state, code, fallback, params, idPrefix) => this.agentRunReactor.append(state.sessionId, [
         assistantProjectionBuilder.finalDiagnosticEvent(
           state.sessionId,
@@ -378,8 +311,6 @@ export class SessionDriverLoop {
           this.agentRunReactor.id(idPrefix)
         ),
       ]),
-      submitNonExecutableProposal: (state, proposal, fallback) =>
-        this.actionProposalSubmitter.submitNonExecutable(state, proposal, fallback),
       sessionRunStateEvent: (eventInput) =>
         sessionProgressProjectionBuilder.sessionRunStateEvent(eventInput as Parameters<typeof sessionProgressProjectionBuilder.sessionRunStateEvent>[0]),
       accessScopesCanonicalizedEvent: (sessionId, runId, accepted, canonicalization, ts, id) =>
@@ -394,9 +325,6 @@ export class SessionDriverLoop {
       findReviewReport: (events) => planReviewReportAnalyzer.findReport(events),
       appendTrace: (state, stage, payload) => providerTraceRecorder.append(state, stage, payload, this.ports),
       acceptedPlanNeedsRepair: (report) => planReviewReportAnalyzer.acceptedPlanNeedsRepair(report),
-      repairPlanReview: (handlerInput, state, prompt, proposal, report) =>
-        this.actionProposalSubmitter.repairPlanReview(handlerInput, state, prompt, proposal, report),
-      answerEvent: (sessionId, proposal, ts, id) => assistantProjectionBuilder.answerEvent(sessionId, proposal, ts, id),
       denied: (report) => planReviewReportAnalyzer.denied(report),
       diagnosticSummary: (report) => planReviewReportAnalyzer.diagnosticSummary(report),
       nonAcceptedPermissionGaps: (report, accepted) =>
@@ -453,54 +381,6 @@ export class SessionDriverLoop {
       executionRequest: (plan, acceptedPlan) => executionPromptCoordinator().executionRequest(plan, acceptedPlan),
       staticSyntaxReview: (reviewInput) => this.acceptedPlanStaticSyntaxReviewCoordinator.run(reviewInput),
     });
-    this.acceptedPlanResourceResumeCoordinator = new AcceptedPlanResourceResumeCoordinator<SessionDriverLoopRunState>({
-      promptBuilder: acceptedPlanResourceResumePromptBuilder,
-      contextFrameBuilder,
-      repairMessageBuilder: providerRepairMessageBuilder,
-      repairState: (state) => providerContextSupport.repairMessageState(state),
-      createId: (prefix) => this.agentRunReactor.id(prefix),
-      parseError: (error) => driverParseErrorCatalog.normalize(error),
-      createError: (code, message) => new SessionDriverLoopError(code, message),
-      appendRepairNotice: (state, message) => this.agentRunReactor.append(state.sessionId, [
-        assistantProjectionBuilder.thinkingEvent(
-          state.sessionId,
-          message,
-          this.agentRunReactor.ts(),
-          this.agentRunReactor.id('accepted-plan-resource-resume-repair')
-        ),
-      ]),
-      parseProviderProposal: ({ raw, state }) => protocolGate().parseAndValidateProposal({
-        raw,
-        runId: state.runId,
-        sessionId: state.sessionId,
-        source: 'llm',
-        allowBriefActionBundleUserPlan: true,
-      }),
-      parseRepairedProviderProposal: ({ raw, state, allowedKinds }) => protocolGate().parseAndValidateRepairedProposal({
-        raw,
-        runId: state.runId,
-        sessionId: state.sessionId,
-        source: 'llm',
-        allowedKinds,
-        allowBriefActionBundleUserPlan: true,
-      }),
-    });
-    this.acceptedPlanScopeRepairCoordinator = new AcceptedPlanScopeRepairCoordinator<SessionDriverLoopRunState>({
-      repairMessageBuilder: providerRepairMessageBuilder,
-      contextFrameBuilder,
-      repairState: (state) => providerContextSupport.repairMessageState(state),
-      createId: (prefix) => this.agentRunReactor.id(prefix),
-      parseError: (error) => driverParseErrorCatalog.normalize(error),
-      createError: (code, message) => new SessionDriverLoopError(code, message),
-      parseRepairedProposal: ({ raw, state, allowedKinds }) => protocolGate().parseAndValidateRepairedProposal({
-        raw,
-        runId: state.runId,
-        sessionId: state.sessionId,
-        source: 'llm',
-        allowedKinds,
-        allowBriefActionBundleUserPlan: true,
-      }),
-    });
     this.acceptedPlanScopeDecisionCoordinator = new AcceptedPlanScopeDecisionCoordinator<SessionDriverLoopRunState>({
       now: () => this.agentRunReactor.ts(),
       createId: (prefix) => this.agentRunReactor.id(prefix),
@@ -533,7 +413,9 @@ export class SessionDriverLoop {
       createId: (prefix) => this.agentRunReactor.id(prefix),
       emitProjectionDelta: (state, delta) => this.agentRunReactor.emitProjectionDelta(state, delta),
       runStaticSyntaxReview: ({ profileId, state, stage, messages }) =>
-        this.providerRuntimeBridge.llm(profileId, state, stage, messages),
+        this.providerRuntimeBridge.llmTurn(profileId, state, stage, messages, {
+          tools: [...this.providerProfileRegistry.profile('review-v1').tools],
+        }),
       event: (sessionId, kind, payload) => this.agentRunReactor.event(sessionId, kind, payload),
       reviewAssembler: reviewAssembler(),
       contextFrameBuilder,
@@ -678,7 +560,7 @@ export class SessionDriverLoop {
       now: () => this.agentRunReactor.ts(),
       createId: (prefix) => this.agentRunReactor.id(prefix),
       assembleContext: (contextInput) => assembleContext(contextInput),
-      capabilityCatalogSummary: (state) => nativeToolCoordinator.capabilityCatalogSummary(state),
+      capabilityCatalogSummary: () => '',
       collectUserGuidanceEvents: (events, runId) => collectUserGuidanceEvents(events, runId),
       buildProviderTurnContract: (contractInput) =>
         contextFrameBuilder.buildSessionProviderTurnContract(contractInput),
@@ -721,7 +603,7 @@ export class SessionDriverLoop {
       diagnosticEvent: (sessionId, message, ts, id) =>
         assistantProjectionBuilder.guidanceRevisionDiagnosticEvent(sessionId, message, ts, id),
       assembleContext: (contextInput) => assembleContext(contextInput),
-      capabilityCatalogSummary: (state) => nativeToolCoordinator.capabilityCatalogSummary(state),
+      capabilityCatalogSummary: () => '',
       implementationBatchHints: (state) => providerContextSupport.implementationBatchHints(state.implementationBatch),
       appendConsumedGuidanceEvents: (guidanceInput) =>
         userGuidanceQueue.appendConsumed({
@@ -737,26 +619,15 @@ export class SessionDriverLoop {
           now: () => this.agentRunReactor.ts(),
           createId: (prefix) => this.agentRunReactor.id(prefix),
         }),
-      runRevision: (revisionInput, state, messages) =>
-        this.providerRuntimeBridge.llm(revisionInput.profileId, state, 'guidance_revision', messages),
-      parseProposal: (raw, state) =>
-        protocolGate().parseAndValidateProposal({
-          raw,
-          runId: state.runId,
-          sessionId: state.sessionId,
-          source: 'llm',
+      runRevision: (revisionInput, state, prompt, contract) =>
+        this.providerRuntimeBridge.runWithNativeTools({
+          profileId: revisionInput.profileId,
+          state,
+          prompt,
+          contract,
         }),
       createError: (code, message) => new SessionDriverLoopError(code, message),
       contextFrameBuilder,
-    });
-    this.actionBundleAdmissionRepairCoordinator = new ActionBundleAdmissionRepairCoordinator<SessionDriverLoopRunState>({
-      repairMessageBuilder: providerRepairMessageBuilder,
-      contextFrameBuilder,
-      repairState: (state) => providerContextSupport.repairMessageState(state),
-      createId: (prefix) => this.agentRunReactor.id(prefix),
-      parseError: (error) => driverParseErrorCatalog.normalize(error),
-      createError: (code, message) => new SessionDriverLoopError(code, message),
-      parseRepairedProposal: ({ raw, state, allowedKinds }) => protocolGate().parseAndValidateRepairedProposal({ raw, runId: state.runId, sessionId: state.sessionId, source: 'llm', allowedKinds }),
     });
     this.resourceOrchestrator = new ResourceOrchestrator<SessionDriverLoopRunState>({
       resourceRequestLoop,
@@ -805,21 +676,9 @@ export class SessionDriverLoop {
         this.resourceOrchestrator.resolveRecordAndAppend(state, manifest, eventIdPrefix),
       resolveResourceRequest: (manifest, request, roots) =>
         resourceRequestResolver().resolve(manifest, request, roots),
-      repairResourceRequest: (input, state, prompt, proposal, resolution) =>
-        this.resourceRequestRepairCoordinator.repair({
-          state,
-          prompt,
-          proposal,
-          resolutionDiagnostic: resourceRequestLoop.resolutionDiagnostic(resolution).fallback,
-          runRepair: (stage, messages) => this.providerRuntimeBridge.llm(input.profileId, state, stage, messages),
-        }),
-      answerEvent: (sessionId, proposal, ts, id) =>
-        assistantProjectionBuilder.answerEvent(sessionId, proposal, ts, id),
       finalDiagnosticEvent: (sessionId, content, ts, id) =>
         assistantProjectionBuilder.finalDiagnosticEvent(sessionId, content, ts, id),
       resourceResolutionDiagnostic: (resolution) => resourceRequestLoop.resolutionDiagnostic(resolution),
-      resourceRepairFailedDiagnostic: (message) =>
-        diag('resourceResolveRepairFailed', `The requested resources could not be located in attachments or project directory, and repair failed: ${message}`, { message }),
       refreshTaskRuntimeState: (state) => acceptedPlanTaskLedger().refreshRuntimeState(state),
       acceptedPlanResourceResumeEvent: (state, packet, ts, id) =>
         sessionProgressProjectionBuilder.acceptedPlanResourceResumeEvent(
@@ -834,233 +693,42 @@ export class SessionDriverLoop {
         ),
       tryCompleteResourceTask: (input, state, packet, fallback) =>
         this.acceptedPlanReadOnlyTaskExecutor.tryCompleteResourceTask(input, state, packet, fallback),
-      callResourceResume: (input, state, prompt, proposal, packet) =>
-        this.acceptedPlanReadOnlyTaskExecutor.callResourceResume(input, state, prompt, proposal, packet),
-      submitActionProposal: (input, state, prompt, proposal, fallback) =>
-        this.actionProposalSubmitter.submit(input, state, prompt, proposal, fallback),
-      submitNonExecutableProposal: (state, proposal, fallback) =>
-        this.actionProposalSubmitter.submitNonExecutable(state, proposal, fallback),
-      errorMessage: (error) => error instanceof Error ? error.message : String(error),
-    });
-    this.acceptedPlanScopeResourceFollowupCoordinator = new AcceptedPlanScopeResourceFollowupCoordinator<SessionDriverLoopRunState, AcceptedImplementationPlanContext>({
-      generatedEvidence: generatedArtifactEvidenceIndex(),
-      resolver: resourceRequestResolver(),
-      resourceLoop: resourceRequestLoop,
-      orchestrator: this.resourceOrchestrator,
-      createId: (prefix) => this.agentRunReactor.id(prefix),
-      appendFailure: ({ state, detail, eventId }) => this.agentRunReactor.append(state.sessionId, [
-        assistantProjectionBuilder.finalDiagnosticEvent(
-          state.sessionId,
-          diag(
-            'autoBatchResourceResolveFailed',
-            `Automatic execution batch requires additional resource evidence, but the repaired resourceRequest could not be located: ${detail}`,
-            { detail }
-          ),
-          this.agentRunReactor.ts(),
-          eventId
-        ),
-      ]),
-      followupRequest: ({ state, acceptedPlan, proposal, guidance }) => executionPromptCoordinator().executionRequest(
-        acceptedPlanExecutor.executionContext({
-          sessionId: state.sessionId,
-          runId: state.runId,
-          acceptedPlan,
-          proposal,
-          planReviewReport: {},
-        }),
-        acceptedPlan,
-        guidance
-      ),
-    });
-    this.actionBundleAdmissionResourceFollowupCoordinator = new ActionBundleAdmissionResourceFollowupCoordinator<SessionDriverLoopRunState>({
-      generatedEvidence: generatedArtifactEvidenceIndex(),
-      resolver: resourceRequestResolver(),
-      resourceLoop: resourceRequestLoop,
-      orchestrator: this.resourceOrchestrator,
-      createId: (prefix) => this.agentRunReactor.id(prefix),
-      appendFailure: ({ state, proposal, reasons, eventId }) => this.agentRunReactor.append(
-        state.sessionId,
-        sessionFailureProjectionBuilder.actionBundleAdmissionFailureEvents(
-          state.sessionId,
-          state.runId,
-          proposal,
-          reasons,
-          this.agentRunReactor.ts(),
-          eventId
-        )
-      ),
-      followupRequest: (request) => repairLoop.actionBundleAdmissionResourceFollowupRequest(request),
-    });
-    this.actionBundleAdmissionCoordinator = new ActionBundleAdmissionCoordinator<SessionDriverLoopInput, SessionDriverLoopRunState>({
-      now: () => this.agentRunReactor.ts(),
-      createId: (prefix) => this.agentRunReactor.id(prefix),
-      append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
-      admissionFailureEvents: (admissionInput) =>
-        sessionFailureProjectionBuilder.actionBundleAdmissionFailureEvents(
-          admissionInput.sessionId,
-          admissionInput.runId,
-          admissionInput.proposal,
-          admissionInput.reasons,
-          admissionInput.ts,
-          admissionInput.id
-        ),
-      admissionRepairingEvent: (admissionInput) =>
-        sessionProgressProjectionBuilder.actionBundleAdmissionRepairingEvent(
-          admissionInput.sessionId,
-          admissionInput.runId,
-          admissionInput.proposal,
-          admissionInput.reasons,
-          admissionInput.ts,
-          admissionInput.id
-        ),
-      repair: (repairInput) =>
-        this.actionBundleAdmissionRepairCoordinator.repair({
-          ...repairInput,
-          runRepair: (stage, messages) => this.providerRuntimeBridge.llm(repairInput.input.profileId, repairInput.state, stage, messages),
-        }),
-      repairErrorMessage: (error) =>
-        error instanceof SessionDriverLoopError ? error.message : driverParseErrorCatalog.message(error),
-      resourceFollowup: (followupInput) =>
-        this.actionBundleAdmissionResourceFollowupCoordinator.handle(followupInput),
-      submitActionProposal: (handlerInput, state, prompt, proposal, fallback) =>
-        this.actionProposalSubmitter.submit(handlerInput, state, prompt, proposal, fallback),
-      submitNonExecutableProposal: (state, proposal, fallback) =>
-        this.actionProposalSubmitter.submitNonExecutable(state, proposal, fallback),
-      requirementRecordFromProposal: (recordInput) =>
-        userInputPipeline.requirementRecordFromProposal(recordInput),
-      confirmationEvent: (confirmationInput) =>
-        requirementProjectionBuilder.confirmationEvent(confirmationInput),
-      sessionRunStateEvent: (runStateInput) =>
-        sessionProgressProjectionBuilder.sessionRunStateEvent(runStateInput),
-      finalDiagnosticEvent: (sessionId, content, ts, id) =>
-        assistantProjectionBuilder.finalDiagnosticEvent(sessionId, content, ts, id),
-      answerEvent: (sessionId, proposal, ts, id) =>
-        assistantProjectionBuilder.answerEvent(sessionId, proposal, ts, id),
-      diagnosticSummary: (proposal) => {
-        const diagnostic = objectRecord(proposal.payload) ?? {};
-        return stringValue(diagnostic.summary)
-          ?? stringValue(diagnostic.details)
-          ?? 'actionBundle admission repair returned a diagnostic instead of a file-level plan.';
-      },
-      diagnostic: (code, fallback, params) => diag(code, fallback, params),
     });
     this.actionProposalSubmitter = new ActionProposalSubmitter<SessionDriverLoopInput, SessionDriverLoopRunState>({
       now: () => this.agentRunReactor.ts(),
       createId: (prefix) => this.agentRunReactor.id(prefix),
       append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
-      appendProjectedKernelEvents: (sessionId, reply) => this.agentRunReactor.appendProjectedKernelEvents(sessionId, reply),
       readActionBundle: (proposal) => driverActivityBuilder.readActionBundle(proposal),
-      actionBundleAdmissionBatch: (proposal) => driverActivityBuilder.proposalActionBundleAdmissionBatch(proposal),
-      deleteAdmissionReasons: (batch, resourcePackets) =>
-        acceptedPlanBatchPreflight.deleteReasons(batch, resourcePackets),
-      repairActionBundleAdmission: (handlerInput, state, prompt, proposal, reasons, fallback) =>
-        this.actionBundleAdmissionCoordinator.repair(handlerInput, state, prompt, proposal, reasons, fallback),
       submitAcceptedPlanActionProposal: (handlerInput, state, prompt, proposal, fallback) =>
         this.acceptedPlanActionProposalSubmitter.submit(handlerInput, state, prompt, proposal, fallback),
-      submitProposal: (state, proposal, requestId) => this.agentRunReactor.kernel({
-        command: {
-          kind: 'proposalSubmit',
-          requestId,
-          runId: state.runId,
-          sessionId: state.sessionId,
-          proposal,
-        },
-      }),
-      findReviewReport: (events) => planReviewReportAnalyzer.findReport(events),
-      appendTrace: (state, stage, payload) =>
-        providerTraceRecorder.append(state, stage, payload, this.ports),
-      needsRepair: (report) => planReviewReportAnalyzer.needsRepair(report),
-      denied: (report) => planReviewReportAnalyzer.denied(report),
-      diagnosticSummary: (report) => planReviewReportAnalyzer.diagnosticSummary(report),
-      buildRepairMessages: (prompt, state, proposal, report) =>
-        providerRepairMessageBuilder.planReviewRepairMessages(
-          prompt,
-          providerContextSupport.repairMessageState(state),
-          proposal,
-          report
-        ),
-      runRepair: (handlerInput, state, stage, messages) =>
-        this.providerRuntimeBridge.llm(handlerInput.profileId, state, stage, messages),
-      parseRepairedProposal: (raw, state, allowedKinds) => protocolGate().parseAndValidateRepairedProposal({
-        raw,
-        runId: state.runId,
-        sessionId: state.sessionId,
-        source: 'llm',
-        allowedKinds,
-      }),
-      repairErrorMessage: (error) => driverParseErrorCatalog.message(error),
-      thinkingEvent: (sessionId, content, ts, id) =>
-        assistantProjectionBuilder.thinkingEvent(sessionId, content, ts, id),
       finalDiagnosticEvent: (sessionId, content, ts, id) =>
         assistantProjectionBuilder.finalDiagnosticEvent(sessionId, content, ts, id),
-      answerEvent: (sessionId, proposal, ts, id) =>
-        assistantProjectionBuilder.answerEvent(sessionId, proposal, ts, id),
-      planCardEvent: (planCardInput) =>
-        planProjectionBuilder.actionBundlePlanCardEvent(planCardInput),
-      sessionRunStateEvent: (runStateInput) =>
-        sessionProgressProjectionBuilder.sessionRunStateEvent(runStateInput),
       diagnostic: (code, fallback, params) => diag(code, fallback, params),
-    });
-    this.resourceRequestRepairCoordinator = new ResourceRequestRepairCoordinator<SessionDriverLoopRunState>({
-      repairMessageBuilder: providerRepairMessageBuilder,
-      contextFrameBuilder,
-      repairState: (state) => providerContextSupport.repairMessageState(state),
-      createId: (prefix) => this.agentRunReactor.id(prefix),
-      parseError: (error) => driverParseErrorCatalog.normalize(error),
-      createError: (code, message) => new SessionDriverLoopError(code, message),
-      parseRepairedProposal: ({ raw, state, allowedKinds }) => protocolGate().parseAndValidateRepairedProposal({
-        raw,
-        runId: state.runId,
-        sessionId: state.sessionId,
-        source: 'llm',
-        allowedKinds,
-      }),
     });
     this.nativeToolHandlerPortsFactory = new NativeToolHandlerPortsFactory({
       progressEventBuilder: nativeToolProgressEventBuilder,
       projectionBuilder: nativeToolProjectionBuilder,
-      resultMessageBuilder: nativeToolResultMessageBuilder,
-      resourceRecorder: nativeToolResourceRecorder,
-      visibleLanguage: (userRequest) => visibleLanguageForRequest(userRequest),
       event: (sessionId, kind, payload) => this.agentRunReactor.event(sessionId, kind, payload),
       append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
       emitProjectionDelta: (state, delta) => this.agentRunReactor.emitProjectionDelta(state, delta),
-      now: () => this.agentRunReactor.ts(),
-      createId: (prefix) => this.agentRunReactor.id(prefix),
     });
     this.nativeToolProviderCoordinator = new NativeToolProviderCoordinator<SessionDriverLoopRunState, LlmTurnResult>({
       providerLoop: nativeToolProviderLoop,
       handlerPortsFactory: this.nativeToolHandlerPortsFactory,
-      repairRunner: nativeToolRepairRunner,
       providerTools: (state) =>
-        nativeToolExposurePolicy.providerTools(state, nativeToolCoordinator.providerTools(state)),
-      readManifest: (state, toolCall) => nativeToolCoordinator.readManifest(state, toolCall),
-      resolveResource: (state, manifest) => this.resourceOrchestrator.resolve(state, manifest),
+        nativeToolExposurePolicy.providerTools(
+          state,
+          [...this.providerProfileRegistry.profileForFrame(state.providerTurnFrame).tools]
+        ),
+      semanticProposal: (state, toolCall) =>
+        this.semanticToolAdapter.proposal(state, toolCall),
       runTurn: (profileId, state, stage, messages, options) =>
         this.providerRuntimeBridge.llmTurn(profileId, state, stage, messages, options),
       isEmptyResponseError,
-      consumeGuidanceMessages: (state, stage) =>
-        this.providerRuntimeBridge.consumeGuidanceMessages(state, stage),
-      emitProjectionDelta: (state, delta) => this.agentRunReactor.emitProjectionDelta(state, delta),
-      buildSideEffectRepairMessages: (prompt, state, toolCall, turn, acceptedExecution) =>
-        providerRepairMessageBuilder.sideEffectNativeToolRepairMessages(
-          prompt,
-          providerContextSupport.repairMessageState(state),
-          toolCall,
-          turn,
-          acceptedExecution
-        ),
-      buildDuplicateRepairMessages: (prompt, state, turn, duplicates, acceptedExecution) =>
-        providerRepairMessageBuilder.nativeToolDuplicateRepairMessages(
-          prompt,
-          providerContextSupport.repairMessageState(state),
-          turn,
-          duplicates,
-          acceptedExecution
-        ),
-      runRepair: (profileId, state, stage, messages) => this.providerRuntimeBridge.llm(profileId, state, stage, messages),
-      repairErrorMessage: (error) => driverParseErrorCatalog.message(error),
-      createError: (code, message) => new SessionDriverLoopError(code, message),
+      semanticDirectiveError: (error) =>
+        error instanceof SessionDriverLoopError && error.code === 'native_tool_arguments_invalid'
+          ? { code: error.code, message: error.message }
+          : undefined,
     });
     this.providerStreamRuntime = new ProviderStreamRuntime<SessionDriverLoopRunState>({
       reasoningFlushChars: PROVIDER_REASONING_FLUSH_CHARS,
@@ -1100,12 +768,9 @@ export class SessionDriverLoop {
     });
     this.providerRuntimeBridge = new ProviderRuntimeBridge<SessionDriverLoopRunState, LlmTurnResult>({
       nativeToolProviderCoordinator: this.nativeToolProviderCoordinator,
-      proposalOnlyProviderRunner,
       providerTurnRunner: this.providerTurnRunner,
     }, {
       ...this.ports,
-      append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
-      emitProjectionDelta: (state, delta) => this.agentRunReactor.emitProjectionDelta(state, delta),
       consumeGuidanceMessages: async (state, stage) => {
         const current = await this.agentRunReactor.append(state.sessionId, []);
         const language = visibleLanguageForRequest(state.userRequest);
@@ -1121,70 +786,17 @@ export class SessionDriverLoop {
         if (resume.events.length) await this.agentRunReactor.append(state.sessionId, resume.events);
         return resume.messages;
       },
-      acceptedPlanId: (state) => state.acceptedImplementationPlan?.planId,
-      buildProposalOnlyRepairMessages: ({ prompt, state, toolCall, turn }) =>
-        providerRepairMessageBuilder.completeStageToolViolationRepairMessages(
-          prompt,
-          providerContextSupport.repairMessageState(state),
-          toolCall,
-          turn
-        ),
-      repairErrorMessage: (error) => driverParseErrorCatalog.message(error),
       createError: (code, message) => new SessionDriverLoopError(code, message),
-      isEmptyResponseError,
     });
     this.providerProposalCoordinator = new ProviderProposalCoordinator<SessionDriverLoopInput, SessionDriverLoopRunState>({
-      append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
-      createId: (prefix) => this.agentRunReactor.id(prefix),
-      now: () => this.agentRunReactor.ts(),
-      thinkingEvent: (sessionId, content, ts, id) =>
-        assistantProjectionBuilder.thinkingEvent(sessionId, content, ts, id),
       providerResult: (providerInput, state, prompt, contract) =>
-        state.acceptedImplementationPlan || contract.turnMode === 'requirementDecision'
-          ? this.providerRuntimeBridge.runProposalOnly({
-            profileId: providerInput.profileId,
-            state,
-            prompt,
-            contract,
-            stage: 'accepted_plan_provider_call',
-          })
-          : this.providerRuntimeBridge.runWithNativeTools({
-            profileId: providerInput.profileId,
-            state,
-            prompt,
-            contract,
-          }),
-      runRepair: (providerInput, state, stage, messages) =>
-        this.providerRuntimeBridge.llm(providerInput.profileId, state, stage, messages),
-      repairMessageState: (state) => providerContextSupport.repairMessageState(state),
-      repairMessages: (prompt, repairState, raw, error) =>
-        providerRepairMessageBuilder.repairMessages(prompt, repairState as ProviderRepairMessageState, raw, error),
-      actionBundleCompactionRepairMessages: (prompt, repairState, reason, raw) =>
-        providerRepairMessageBuilder.actionBundleCompactionRepairMessages(prompt, repairState as ProviderRepairMessageState, reason, raw),
-      repairAllowedKinds: (repairInput) => protocolGate().repairAllowedKinds(repairInput),
-      parseProposal: (parseInput) =>
-        protocolGate().parseAndValidateProposal({
-          raw: parseInput.raw,
-          runId: parseInput.state.runId,
-          sessionId: parseInput.state.sessionId,
-          source: 'llm',
-          allowBriefActionBundleUserPlan: parseInput.allowBriefActionBundleUserPlan,
+        this.providerRuntimeBridge.runWithNativeTools({
+          profileId: providerInput.profileId,
+          state,
+          prompt,
+          contract,
         }),
-      parseRepairedProposal: (parseInput) =>
-        protocolGate().parseAndValidateRepairedProposal({
-          raw: parseInput.raw,
-          runId: parseInput.state.runId,
-          sessionId: parseInput.state.sessionId,
-          source: 'llm',
-          allowedKinds: parseInput.allowedKinds,
-          allowBriefActionBundleUserPlan: parseInput.allowBriefActionBundleUserPlan,
-        }),
-      shouldAttemptActionBundleCompactionRepair: (state) =>
-        providerTurnPolicy.shouldAttemptActionBundleCompactionRepair(state),
-      normalizeParseError: (error) => driverParseErrorCatalog.normalize(error),
       createError: (code, message) => new SessionDriverLoopError(code, message),
-      isDriverErrorCode: (error, code) =>
-        error instanceof SessionDriverLoopError && error.code === code,
     });
     this.providerTurnContextCoordinator = new ProviderTurnContextCoordinator<SessionDriverLoopRunState>({
       now: () => this.agentRunReactor.ts(),
@@ -1192,7 +804,7 @@ export class SessionDriverLoop {
       assembleContext: (contextInput) => assembleContext(contextInput),
       allowedProposals: (kernelAllowed, state) =>
         providerTurnPolicy.allowedProposals(kernelAllowed, state),
-      capabilityCatalogSummary: (state) => nativeToolCoordinator.capabilityCatalogSummary(state),
+      capabilityCatalogSummary: () => '',
       memoryHints: (state) => [
         ...acceptedPlanTaskLedger().memoryHints(state.currentTaskContext),
         ...providerContextSupport.implementationBatchHints(state.implementationBatch, state.acceptedImplementationPlan),
@@ -1230,6 +842,8 @@ export class SessionDriverLoop {
         }),
       callProviderAndParse: (handlerInput, state, prompt) =>
         this.providerProposalCoordinator.callAndParse(handlerInput, state, prompt),
+      deterministicProposal: (state) =>
+        this.semanticToolAdapter.deterministicCurrentTask(state),
       admitDirective: (proposal) => this.proposalRouter.route(proposal),
       appendDriverFailure: async (state, error) => {
         if (!(error instanceof SessionDriverLoopError)) return null;

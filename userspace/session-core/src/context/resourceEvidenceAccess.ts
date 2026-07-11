@@ -90,7 +90,7 @@ export function resourceEvidenceReuseInstruction(block: ResourceEvidenceAccessBl
     return 'previous read failed; request a different focused segment only if it adds evidence';
   }
   if (block.contentKind === 'directoryTree' && (block.retention === 'full' || block.retention === 'summary')) {
-    return 'directory inventory is available for existence checks and taskPlan targets; request file text only when exact content is required';
+    return 'directory inventory is available for existence checks and plan targets; request file text only when exact content is required';
   }
   if (block.contentKind === 'searchResults' && (block.retention === 'full' || block.retention === 'summary')) {
     return 'search evidence is available; use returned matches before repeating the same query';

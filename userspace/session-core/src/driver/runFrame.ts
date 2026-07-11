@@ -185,6 +185,11 @@ export interface ProviderTurnSnapshot {
   readonly requiredKind?: string;
   readonly repairPolicy: ProviderRepairPolicy;
   readonly projectionVisibility: ProviderProjectionVisibility;
+  readonly semanticProfileId: string;
+  readonly systemHash: string;
+  readonly toolSchemaHash: string;
+  readonly responseFormatHash: string;
+  readonly messageShapeHash: string;
   readonly stablePrefixHash: string;
   readonly dynamicSuffixHash: string;
   readonly stablePrefixCharLength: number;
@@ -265,6 +270,13 @@ export interface SessionDriverResourceState {
   initialContext: InitialContextPacket;
   resourcePackets: ResourcePacket[];
   generatedArtifactEvidence: Map<string, GeneratedArtifactEvidence>;
+  resourceRequestProgressByTask: Map<string, SessionDriverTaskResourceProgress>;
+}
+
+export interface SessionDriverTaskResourceProgress {
+  signatures: string[];
+  packetIds: string[];
+  noProgressCount: number;
 }
 
 export interface SessionDriverMemoryState {
@@ -299,7 +311,15 @@ export interface SessionDriverProviderState {
   nativeToolDuplicateRepairAttempted: boolean;
   nativeToolResumeMessages?: LlmChatRequest['messages'];
   nativeToolResumeRound?: number;
+  semanticDirectiveRepairAttempted?: boolean;
+  semanticDirectiveErrorSummary?: string;
+  providerRequestCacheHistory?: Record<string, ProviderRequestCacheHistoryEntry>;
   activeTurn?: ActiveTurnState;
+}
+
+export interface ProviderRequestCacheHistoryEntry {
+  readonly requestText: string;
+  readonly segmentIds: string[];
 }
 
 export interface SessionDriverProviderRuntimeState {
