@@ -18,6 +18,15 @@ bash ./build.sh
 bash ./test.sh
 ```
 
+The default checkout keeps the existing `deepcode-dev` container, shared
+dependency caches, and host port `31246`. Persistent Git worktrees can opt into
+local container isolation by copying `.deepcode-worktree.mk.example` to
+`.deepcode-worktree.mk` and assigning a stable worktree ID plus an unused host
+port. The local file is ignored by Git. Isolated worktrees share the image,
+Cargo registry, and pnpm store, but use separate containers, `target` volumes,
+and `node_modules` volumes. Run `make docker-info` before `make shell` to inspect
+the effective mapping.
+
 The default build target is the complete local distribution flow. Inside the
 container, `bash ./build.sh` builds the shared GUI assets, DeepCode-GUI assets,
 Linux/Windows Rust binaries, optional Linux Tauri shell, and the portable

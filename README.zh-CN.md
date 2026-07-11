@@ -18,6 +18,13 @@ bash ./build.sh
 bash ./test.sh
 ```
 
+默认 checkout 继续使用现有的 `deepcode-dev` 容器、共享依赖缓存和宿主机端口
+`31246`。长期复用的 Git worktree 可以把 `.deepcode-worktree.mk.example` 复制为
+`.deepcode-worktree.mk`，设置稳定的 worktree ID 和未占用的宿主机端口，启用本地
+容器隔离。该本地文件不会进入 Git。隔离后的 worktree 共享镜像、Cargo registry
+和 pnpm store，但分别使用独立容器、`target` volume 与 `node_modules` volume。
+运行 `make shell` 前可先用 `make docker-info` 检查最终映射。
+
 默认构建目标是完整的本地分发闭环。在容器内，`bash ./build.sh` 会构建共享
 GUI assets、DeepCode-GUI assets、Linux/Windows Rust 二进制、可选 Linux Tauri
 shell，以及 portable package layout。macOS 环境下，它随后可以向宿主机打包服务
