@@ -96,6 +96,7 @@ import {
 } from '../driver/runFrame.js';
 import { AcceptedPlanResourceResumePromptBuilder } from '../prompt/AcceptedPlanResourceResumePromptBuilder.js';
 import { ProviderRepairMessageBuilder } from '../prompt/ProviderRepairMessageBuilder.js';
+import { ProviderProfileRegistry } from '../provider/ProviderProfileRegistry.js';
 import type { NativeToolCallProposal } from '../provider/providerStreamParts.js';
 import { ResourceManifestBuilder } from '../resources/index.js';
 import type { ContextAssemblyRecord, PromptCachePlan } from '../context/index.js';
@@ -157,7 +158,9 @@ import {
   assertNativeToolHandlerPortsFactoryBuildsPorts,
   assertNativeToolProgressEventBuilderBuildsAssistantProgress,
   assertNativeToolProjectionBuilderBuildsDeltas,
-  assertNativeToolProviderLoopResumesAfterToolMessages,
+  assertNativeToolProviderLoopAdmitsSemanticProposalWithoutNestedResume,
+  assertNativeToolProviderLoopRetriesMalformedArgumentsInSameProfile,
+  assertNativeToolProviderLoopRetriesInvalidSemanticDirectiveInSameProfile,
   assertNativeToolRepairCoordinatorBuildsRepairContracts,
   assertNativeToolRepairRunnerHandlesRepairs,
   assertNativeToolResourceRecorderRecordsPackets,
@@ -208,32 +211,45 @@ function returnedSession(
   return control.result;
 }
 
+function semanticToolLlmResponse(
+  name: string,
+  argumentsValue: Record<string, unknown>,
+  callId = `semantic-call-${randomSmokeToken('call')}`
+): ApiResponse<LlmChatResult> {
+  return {
+    ok: true,
+    data: {
+      chunks: [{ type: 'done' }],
+      assistantMessage: {
+        role: 'assistant',
+        content: '',
+        toolCalls: [{ id: callId, name, arguments: argumentsValue }],
+      },
+    },
+  };
+}
+
 async function main(): Promise<void> {
   assertV3Parser();
   assertLegacyProviderShapesAreRejected();
   assertActionBundleProtocolFields();
-  assertProviderRepairMessageBuilderAvoidsDuplicateActionBundleReference();
-  assertProviderRepairMessageBuilderKeepsTaskPlanRepairShape();
-  assertProviderRepairMessageBuilderScopesNativeRepairReferences();
   assertProtocolGateCanonicalizesBareRepair();
   assertActionBundleActionInspectorReadsActionShape();
   await assertActionProposalSubmitterRoutesAcceptedTaskOutcomeInternally();
   assertProposalSemanticValidatorRejectsRootScopeTaskTargets();
   assertPathIdentityNormalizesWorkspacePaths();
-  assertNativeToolRepairCoordinatorBuildsRepairContracts();
   assertNativeToolProgressEventBuilderBuildsAssistantProgress();
   assertNativeToolProjectionBuilderBuildsDeltas();
   assertNativeToolResultMessageBuilderBuildsToolMessages();
   assertNativeToolResourceRecorderRecordsPackets();
   assertNativeToolResumeMessageBuilderAppendsToolMessages();
   assertNativeToolExposurePolicySuppressesPlanningReadToolsAfterEvidence();
-  await assertNativeToolProviderLoopResumesAfterToolMessages();
+  await assertNativeToolProviderLoopAdmitsSemanticProposalWithoutNestedResume();
+  await assertNativeToolProviderLoopRetriesMalformedArgumentsInSameProfile();
+  await assertNativeToolProviderLoopRetriesInvalidSemanticDirectiveInSameProfile();
   await assertNativeToolHandlerPortsFactoryBuildsPorts();
-  await assertProposalOnlyProviderRunnerRepairsToolViolation();
-  await assertNativeToolRepairRunnerHandlesRepairs();
   assertProposalSemanticValidatorCanonicalizesAndDefaults();
   assertPromptEnvelope();
-  assertAcceptedPlanResourceResumePromptUsesPromptContent();
   assertDecisionContinuationInputKeepsDecisionResumeInSameLoop();
   assertAcceptedPlanContinuationDefaultsResourceResume();
   await assertRunEngineContinuationUsesSameLifecycle();
@@ -270,12 +286,8 @@ async function main(): Promise<void> {
   await assertSessionDriverLoopPreResolvesProjectWorkspaceRoot();
   await assertSessionDriverLoopSuppressesPlanningNativeReadToolsAfterInitialEvidence();
   await assertResourceOrchestratorResolvesAndRecordsPackets();
-  await assertAcceptedPlanResourceResumeCoordinatorBuildsProviderTurn();
-  await assertResourceRequestProposalHandlerRoutesAcceptedTaskOutcomeResume();
-  await assertAcceptedPlanReadOnlyTaskExecutorRoutesTaskOutcomeThroughActionSubmitter();
-  await assertResourceRequestRepairCoordinatorRepairsProposal();
-  await assertActionBundleAdmissionRepairCoordinatorRepairsProposal();
-  await assertActionBundleAdmissionResourceFollowupCoordinatorHandlesResourceRequests();
+  await assertResourceRequestProposalHandlerContinuesThroughRunEngine();
+  await assertAcceptedPlanReadOnlyTaskExecutorContinuesThroughRunEngine();
   assertResourceEvidenceIndexQueriesPackets();
   assertGeneratedArtifactEvidenceIndexBuildsRunLocalPackets();
   assertImplementationBatchContextBuilderExtractsConcreteContinuations();
@@ -285,10 +297,8 @@ async function main(): Promise<void> {
   assertAcceptedPlanBatchPreflightAuditsDeleteActions();
   assertAcceptedPlanScopeCoverageMatchesStructuredScopes();
   assertAcceptedPlanScopeDecisionOverlayExpandsCurrentTask();
-  await assertAcceptedPlanScopeRepairCoordinatorRepairsProposal();
   await assertAcceptedPlanScopeDecisionCoordinatorBuildsWaitingEvents();
   await assertAcceptedPlanScopeDecisionCoordinatorBuildsOutOfScopeIntervention();
-  await assertAcceptedPlanScopeResourceFollowupCoordinatorHandlesResourceRequests();
   assertAcceptedPlanOperationTargetResolverFindsExactGrant();
   assertAcceptedPlanExecutorBuildsExecutionBatch();
   await assertAcceptedActionBundlePlanExecutorSubmitsBatchAndReviews();
@@ -354,65 +364,24 @@ async function main(): Promise<void> {
   await assertSessionDriverLoopRequirementChoiceEntersResumePrompt();
   await assertSessionDriverLoopRequirementFinishWithAnswerClosesWithoutProviderLoop();
   await assertSessionDriverLoopProjectsTaskPlanBeforeComplete();
-  await assertSessionDriverLoopRepairsSideEffectBundleEvidence();
-  await assertSessionDriverLoopRepairsInvalidSourceBlock();
-  await assertSessionDriverLoopCanonicalizesMissingSourceBlockId();
-  await assertSessionDriverLoopRepairsAmbiguousSourceBlockId();
-  await assertSessionDriverLoopRepairsEmptyDirectoryPlaceholderWrite();
-  await assertSessionDriverLoopAllowsManyNoCodeActionsWithoutBatchRepair();
-  await assertSessionDriverLoopAllowsManyCodeBlocksWithoutBatchRepair();
-  await assertSessionDriverLoopRepairsOversizedActionBundle();
-  await assertSessionDriverLoopRepairsEmptyActionBundleResponse();
-  await assertSessionDriverLoopCanonicalizesSchemaVersionOnlyProposal();
-  await assertSessionDriverLoopCanonicalizesBareTaskPlanRepair();
-  await assertSessionDriverLoopAcceptsLocalizedStructuredPlan();
+  await assertSessionDriverLoopAdmitsSemanticTaskPlanWithoutKernelAction();
   await assertSessionDriverLoopPlanRevisionReturnsToPlanning();
   await assertSessionDriverLoopPlanCardAcceptDoesNotNoopWithoutPlanReview();
   await assertSessionDriverLoopPlanCardAcceptExecutesReviewedDeletePlan();
   await assertSessionDriverLoopAcceptedPlanExecutesReviewedDeleteWithoutTaskTargets();
-  await assertSessionDriverLoopAcceptedPlanDeleteUsesCurrentTaskTargetsWhenCapabilityIsDisplayOnly();
   await assertSessionDriverLoopAcceptedExecutionExceptionClosesRun();
   await assertSessionDriverLoopAcceptedExecutionKernelErrorClosesRun();
   await assertSessionDriverLoopAcceptedDecisionRecoversUnconsumedExecution();
-  await assertSessionDriverLoopRequirementAcceptedActionBundleWaitsForExplicitPlanConfirmation();
-  await assertSessionDriverLoopActionBundleAdmissionRepairsDirectoryDeleteBeforePlanCard();
-  await assertSessionDriverLoopActionBundleAdmissionRejectsRepeatedDirectoryDelete();
   await assertSessionDriverLoopAcceptedScopeRejectsDirectoryDeleteFromResourceEvidence();
   await assertSessionDriverLoopAcceptedScopeExecutesReviewedDirectoryDelete();
   await assertSessionDriverLoopAcceptedImplementationPlanAutoExecutesBatch();
-  await assertSessionDriverLoopAcceptedImplementationPlanNormalizesWriteBatchForKernel();
-  await assertSessionDriverLoopAcceptedImplementationPlanPrefersTargetPathOverRootResourceScope();
-  await assertSessionDriverLoopAcceptedImplementationPlanRepairsPlanReviewRootAccessScope();
-  await assertSessionDriverLoopAcceptedImplementationPlanPreservesExecutionRoot();
-  await assertSessionDriverLoopAcceptedImplementationPlanUsesPlanCardExecutionRoot();
-  await assertSessionDriverLoopAcceptedImplementationPlanRecoversExecutionRootFromResourcePacket();
-  await assertSessionDriverLoopAcceptedImplementationPlanAutoExecutesMultiTargetBatch();
-  await assertSessionDriverLoopAcceptedImplementationPlanSplitsCommaSeparatedTargets();
-  await assertSessionDriverLoopAcceptedImplementationPlanAllowsBriefExecutionBatchPlan();
-  await assertSessionDriverLoopAcceptedImplementationPlanKeepsContinuationNonExecutable();
-  await assertSessionDriverLoopAcceptedImplementationPlanAutoExecutesDeleteAction();
-  await assertSessionDriverLoopAcceptedImplementationPlanCanonicalizesMultiDeleteBriefPlan();
-  await assertSessionDriverLoopAcceptedImplementationPlanUsesDirectoryDeleteTemplate();
-  await assertSessionDriverLoopAcceptedImplementationPlanInfersDirectoryDeleteFromResourceEvidence();
-  await assertSessionDriverLoopAcceptedImplementationRejectsDeleteRootTarget();
-  await assertSessionDriverLoopAcceptedImplementationPlanClassifiesDeleteCompileMismatch();
-  await assertSessionDriverLoopAcceptedImplementationPlanClassifiesPatchEvidenceMismatch();
   await assertSessionDriverLoopAcceptedImplementationPlanContinuesUntilTasksComplete();
   await assertSessionDriverLoopAcceptedImplementationPlanResumesAfterDecisionRequest();
   await assertSessionDriverLoopAcceptedImplementationPlanReadsGeneratedArtifactEvidence();
   await assertSessionDriverLoopAcceptedImplementationPlanResumesFromResourceCursor();
   await assertSessionDriverLoopAcceptedImplementationPlanChainsResourceResumeRequests();
   await assertSessionDriverLoopAcceptedReadOnlyResourceValidationCompletesWithoutProviderLoop();
-  await assertSessionDriverLoopAcceptedReadOnlyActionBundleCompletesThroughResourceResolve();
   await assertSessionDriverLoopAcceptedImplementationPlanAllowsPlannedProcessExecPermissionGate();
-  await assertSessionDriverLoopAcceptedImplementationPlanAllowsAbsoluteAttachmentChildTarget();
-  await assertSessionDriverLoopAcceptedImplementationRejectsAttachmentRootTarget();
-  await assertSessionDriverLoopAcceptedImplementationPlanProjectsWorkUnitFailureReason();
-  await assertSessionDriverLoopAcceptedImplementationRejectsOutOfScopeBatch();
-  await assertSessionDriverLoopAcceptedScopeRepairDecisionWaitsForPermission();
-  await assertSessionDriverLoopAcceptedScopeAcceptUsesDefaultOptionEffect();
-  await assertSessionDriverLoopAcceptedScopeRepairInvalidDecisionFallsBackToIntervention();
-  await assertSessionDriverLoopAcceptedPlanPatchRequestsSearchEvidence();
   await assertSessionDriverLoopAcceptedDecisionGroupsWorkspaceWriteGrants();
   await assertSessionDriverLoopAcceptedDecisionGrantsOutsideWorkspaceFileTargets();
   assertWorkflowStagePermissionProjectsPendingDecision();
@@ -426,13 +395,6 @@ async function main(): Promise<void> {
   await assertSessionDriverLoopReviewRejectCancelsRun();
   await assertSessionDriverLoopPermissionRejectCancelsRun();
   await assertSessionDriverLoopStaleRequirementDecisionNoopsAfterReviewAccept();
-  await assertSessionDriverLoopNativeReadToolStreamsThroughResourceResolve();
-  await assertSessionDriverLoopNativeReadToolStreamFailureFallsBackToNonStreaming();
-  await assertSessionDriverLoopNativeReadToolLoopHasNoFourRoundLimit();
-  await assertSessionDriverLoopNativeReadToolDuplicateLoopRepairsToProposal();
-  await assertSessionDriverLoopNativeReadToolDuplicateProposalWinsOverToolCall();
-  await assertSessionDriverLoopNativeWriteToolTriggersImplementationPlanRepair();
-  await assertSessionDriverLoopAcceptedPlanNativeWriteToolUsesProposalOnlyRepair();
 }
 
 function assertActionBundleActionInspectorReadsActionShape(): void {
@@ -514,43 +476,15 @@ async function assertActionProposalSubmitterRoutesAcceptedTaskOutcomeInternally(
   const runId = `run-${token}`;
   const fallback = genericSessionResult(sessionId);
   let acceptedSubmitCalls = 0;
-  let kernelSubmitCalls = 0;
-  const unexpected = (label: string): never => {
-    throw new Error(`taskOutcome route should not call ${label}`);
-  };
   const submitter = new ActionProposalSubmitter<any, any>({
     now: () => '2026-01-01T00:00:00.000Z',
     createId: (prefix) => `${prefix}-${token}`,
     append: async () => fallback,
-    appendProjectedKernelEvents: async () => fallback,
     readActionBundle: () => undefined,
-    actionBundleAdmissionBatch: () => unexpected('actionBundleAdmissionBatch'),
-    deleteAdmissionReasons: () => unexpected('deleteAdmissionReasons'),
-    repairActionBundleAdmission: async () => unexpected('repairActionBundleAdmission'),
     submitAcceptedPlanActionProposal: async () => {
       acceptedSubmitCalls += 1;
       return fallback;
     },
-    submitProposal: async () => {
-      kernelSubmitCalls += 1;
-      return { ok: true, events: [] };
-    },
-    findReviewReport: () => undefined,
-    appendTrace: async () => undefined,
-    needsRepair: () => false,
-    denied: () => false,
-    diagnosticSummary: () => '',
-    buildRepairMessages: () => [],
-    runRepair: async () => unexpected('runRepair'),
-    parseRepairedProposal: () => unexpected('parseRepairedProposal'),
-    repairErrorMessage: (error) => String(error),
-    thinkingEvent: (eventSessionId, content, ts, id) => ({
-      id,
-      sessionId: eventSessionId,
-      ts,
-      kind: 'assistant_msg',
-      payload: { content },
-    }),
     finalDiagnosticEvent: (eventSessionId, content, ts, id) => ({
       id,
       sessionId: eventSessionId,
@@ -558,15 +492,6 @@ async function assertActionProposalSubmitterRoutesAcceptedTaskOutcomeInternally(
       kind: 'assistant_msg',
       payload: { content },
     }),
-    answerEvent: (eventSessionId, proposal, ts, id) => ({
-      id,
-      sessionId: eventSessionId,
-      ts,
-      kind: 'assistant_msg',
-      payload: { proposal },
-    }),
-    planCardEvent: () => unexpected('planCardEvent'),
-    sessionRunStateEvent: () => unexpected('sessionRunStateEvent'),
     diagnostic: (code, fallbackMessage, params) => ({ code, fallback: fallbackMessage, params }),
   });
   await submitter.submit(
@@ -599,7 +524,6 @@ async function assertActionProposalSubmitterRoutesAcceptedTaskOutcomeInternally(
     fallback
   );
   assertEqual(acceptedSubmitCalls, 1, 'accepted taskOutcome is routed to the accepted-plan submitter');
-  assertEqual(kernelSubmitCalls, 0, 'accepted taskOutcome is not submitted to Kernel proposal decoding');
 }
 
 function assertProposalSemanticValidatorRejectsRootScopeTaskTargets(): void {
@@ -963,7 +887,11 @@ async function assertProviderPipelineUsesProviderTurnContract(): Promise<void> {
   assertEqual(turn.content.includes(token), true, 'provider pipeline returns retried turn content');
   assertEqual(stages[0], `stage-${token}`, 'provider pipeline uses original stage for first call');
   assertEqual(stages[1], `stage-${token}_empty_retry`, 'provider pipeline reuses empty retry stage suffix');
-  assertEqual(firstMessages[0]?.[0]?.content, prompt.stablePrefix, 'provider pipeline reads stable prefix from contract');
+  assertEqual(
+    firstMessages[0]?.[0]?.content,
+    new ProviderProfileRegistry().profile('planning-v1').systemContract,
+    'provider pipeline uses the stable planning profile system contract'
+  );
   const firstUserPrompt = String(firstMessages[0]?.[1]?.content ?? '');
   assertEqual(firstUserPrompt.startsWith(prompt.dynamicSuffix), true, 'provider pipeline keeps dynamic suffix first');
   assertEqual(firstUserPrompt.includes('ProviderTurnContract:'), true, 'provider pipeline renders provider turn contract');
@@ -2755,7 +2683,7 @@ async function assertAcceptedPlanResourceResumeCoordinatorBuildsProviderTurn(): 
   assertEqual(proposal.kind, 'diagnostic', 'resource resume coordinator parses provider proposal');
 }
 
-async function assertResourceRequestProposalHandlerRoutesAcceptedTaskOutcomeResume(): Promise<void> {
+async function assertResourceRequestProposalHandlerContinuesThroughRunEngine(): Promise<void> {
   const token = randomSmokeToken('accepted-resource-task-outcome');
   const sessionId = `session-${token}`;
   const runId = `run-${token}`;
@@ -2763,9 +2691,7 @@ async function assertResourceRequestProposalHandlerRoutesAcceptedTaskOutcomeResu
   const targetPath = `target-${randomSmokeToken('file')}.txt`;
   const fallback = genericSessionResult(sessionId);
   const appendResult = genericSessionResult(sessionId);
-  const submitterResult = genericSessionResult(sessionId);
-  let submitActionCalls = 0;
-  let submitNonExecutableCalls = 0;
+  const resumeAppendResult = genericSessionResult(sessionId);
   const packet: ResourcePacket = {
     id: `packet-${token}`,
     requestId: `request-${token}`,
@@ -2804,7 +2730,14 @@ async function assertResourceRequestProposalHandlerRoutesAcceptedTaskOutcomeResu
     acceptedImplementationPlan: {
       planId: `plan-${token}`,
       runId,
-      tasks: [{ taskId, targets: [targetPath], dependencies: [], conflictKeys: [] }],
+      tasks: [{
+        taskId,
+        targets: [targetPath],
+        capability: 'fs.write',
+        semanticOperation: 'createFile',
+        dependencies: [],
+        conflictKeys: [],
+      }],
       capabilities: ['fs.write'],
       targetScopes: [targetPath],
       exactOperationGrants: [],
@@ -2821,30 +2754,28 @@ async function assertResourceRequestProposalHandlerRoutesAcceptedTaskOutcomeResu
       capabilities: ['fs.write'],
     },
     resourceRequestRepairAttempted: false,
+    resourceRequestProgressByTask: new Map(),
+    semanticDirectiveErrorSummary: undefined as string | undefined,
   };
+  let resolveCalls = 0;
   const handler = new ResourceRequestProposalHandler<any, any>({
     now: () => '2026-01-01T00:00:00.000Z',
     createId: (prefix) => `${prefix}-${token}`,
-    append: async (_sessionId, events) => ({
-      session: { id: sessionId, mode: 'plan', createdAt: '', updatedAt: '', eventCount: events.length },
-      events,
-    }),
+    append: async () => resumeAppendResult,
     generatedPacketForRequest: (_state, request) => ({ remaining: request }),
     recordAndAppend: async () => ({ packet, event: {} as AgentEvent, result: appendResult }),
-    resolveRecordAndAppend: async () => ({ packet, event: {} as AgentEvent, result: appendResult }),
+    resolveRecordAndAppend: async () => {
+      resolveCalls += 1;
+      return { packet, event: {} as AgentEvent, result: appendResult };
+    },
     resolveResourceRequest: (manifest) => ({
       manifest,
       unresolved: [],
       ambiguous: [],
       availableRoots: [],
     }),
-    repairResourceRequest: async () => {
-      throw new Error('accepted resource task outcome test should not repair resource requests');
-    },
-    answerEvent: () => ({} as AgentEvent),
     finalDiagnosticEvent: () => ({} as AgentEvent),
     resourceResolutionDiagnostic: () => ({ code: 'unexpected', fallback: 'unexpected' }),
-    resourceRepairFailedDiagnostic: () => ({ code: 'unexpected', fallback: 'unexpected' }),
     refreshTaskRuntimeState: () => undefined,
     acceptedPlanResourceResumeEvent: () => ({
       id: `resume-${token}`,
@@ -2854,34 +2785,6 @@ async function assertResourceRequestProposalHandlerRoutesAcceptedTaskOutcomeResu
       payload: { stage: 'accepted_plan.resource_resume', runId },
     } as AgentEvent),
     tryCompleteResourceTask: async () => null,
-    callResourceResume: async () => parseProposalEnvelope({
-      runId,
-      sessionId,
-      raw: JSON.stringify({
-        schemaVersion: 'deepcode.agent.protocol.v3',
-        kind: 'taskOutcome',
-        outputLanguage: 'en-US',
-        taskOutcome: {
-          version: '1',
-          id: `outcome-${token}`,
-          taskId,
-          status: 'modelJudgedSufficient',
-          reason: `visible resource evidence satisfies ${token}`,
-          evidenceRefs: [],
-        },
-      }),
-    }),
-    submitActionProposal: async (_input, _state, _prompt, proposal, result) => {
-      submitActionCalls += 1;
-      assertEqual(proposal.kind, 'taskOutcome', 'accepted resource resume taskOutcome reaches action submitter');
-      assertEqual(result.session.id, sessionId, 'accepted resource resume taskOutcome receives resource append result');
-      return { kind: 'return', result: submitterResult };
-    },
-    submitNonExecutableProposal: async () => {
-      submitNonExecutableCalls += 1;
-      return genericSessionResult(sessionId);
-    },
-    errorMessage: (error) => error instanceof Error ? error.message : String(error),
   });
 
   const result = await handler.handle({
@@ -2905,13 +2808,60 @@ async function assertResourceRequestProposalHandlerRoutesAcceptedTaskOutcomeResu
     lastResult: fallback,
   });
 
-  assertEqual(result.kind, 'return', 'accepted resource resume taskOutcome returns through handler');
-  assertEqual(result.kind === 'return' ? result.result : undefined, submitterResult, 'accepted resource resume taskOutcome returns submitter result');
-  assertEqual(submitActionCalls, 1, 'accepted resource resume taskOutcome uses action submitter');
-  assertEqual(submitNonExecutableCalls, 0, 'accepted resource resume taskOutcome is not submitted as non-executable Kernel proposal');
+  assertEqual(result.kind, 'continue', 'accepted resource result returns control to the single RunEngine loop');
+  assertEqual(result.kind === 'continue' ? result.lastResult : undefined, resumeAppendResult, 'RunEngine continuation keeps the latest accepted-plan resume append result');
+  assertEqual(state.resourceRequestProgressByTask.get(taskId)?.signatures.length, 1, 'resolved resource signature is recorded for the active task');
+  assertEqual(state.resourceRequestProgressByTask.get(taskId)?.packetIds.includes(packet.id), true, 'resolved resource packet is attributed to the active task');
+
+  const redirected = await handler.handle({
+    input: { sessionId, content: `repeat-${token}` },
+    state,
+    prompt: smokePromptEnvelope(`stable-repeat-${token}`),
+    proposal: parseProposalEnvelope({
+      runId,
+      sessionId,
+      raw: JSON.stringify({
+        schemaVersion: 'deepcode.agent.protocol.v3',
+        kind: 'resourceRequest',
+        outputLanguage: 'en-US',
+        resourceRequest: {
+          version: '1',
+          id: `repeat-request-${token}`,
+          items: [{ id: `repeat-item-${token}`, kind: 'file', path: targetPath, reason: `repeat-reason-${token}` }],
+        },
+      }),
+    }),
+    lastResult: fallback,
+  });
+  assertEqual(redirected.kind, 'continue', 'duplicate resource request redirects through the main loop');
+  assertEqual(resolveCalls, 1, 'duplicate resource request does not issue a second Kernel resource command');
+  assertEqual(state.semanticDirectiveErrorSummary?.includes('session_resource_no_progress'), true, 'resource no-progress redirect records the structured failure code');
+
+  const terminated = await handler.handle({
+    input: { sessionId, content: `repeat-again-${token}` },
+    state,
+    prompt: smokePromptEnvelope(`stable-repeat-again-${token}`),
+    proposal: parseProposalEnvelope({
+      runId,
+      sessionId,
+      raw: JSON.stringify({
+        schemaVersion: 'deepcode.agent.protocol.v3',
+        kind: 'resourceRequest',
+        outputLanguage: 'en-US',
+        resourceRequest: {
+          version: '1',
+          id: `repeat-again-request-${token}`,
+          items: [{ id: `repeat-again-item-${token}`, kind: 'file', path: targetPath, reason: `repeat-again-reason-${token}` }],
+        },
+      }),
+    }),
+    lastResult: fallback,
+  });
+  assertEqual(terminated.kind, 'return', 'duplicate resource loop terminates after one controlled redirect');
+  assertEqual(resolveCalls, 1, 'resource no-progress termination does not issue another Kernel resource command');
 }
 
-async function assertAcceptedPlanReadOnlyTaskExecutorRoutesTaskOutcomeThroughActionSubmitter(): Promise<void> {
+async function assertAcceptedPlanReadOnlyTaskExecutorContinuesThroughRunEngine(): Promise<void> {
   const token = randomSmokeToken('readonly-task-outcome');
   const sessionId = `session-${token}`;
   const runId = `run-${token}`;
@@ -2951,10 +2901,7 @@ async function assertAcceptedPlanReadOnlyTaskExecutorRoutesTaskOutcomeThroughAct
       contentSummary: `content-${token}`,
     }],
   };
-  let submitActionCalls = 0;
-  let submitNonExecutableCalls = 0;
   const fallback = genericSessionResult(sessionId);
-  const submitterResult = genericSessionResult(sessionId);
   const executor = new AcceptedPlanReadOnlyTaskExecutor<any, any>({
     now: () => '2026-01-01T00:00:00.000Z',
     createId: (prefix) => `${prefix}-${token}`,
@@ -3007,39 +2954,6 @@ async function assertAcceptedPlanReadOnlyTaskExecutorRoutesTaskOutcomeThroughAct
       ts: '2026-01-01T00:00:00.000Z',
       payload: { stage: 'accepted_plan.resource_resume', runId },
     } as AgentEvent),
-    resourceResume: async () => parseProposalEnvelope({
-      runId,
-      sessionId,
-      raw: JSON.stringify({
-        schemaVersion: 'deepcode.agent.protocol.v3',
-        kind: 'taskOutcome',
-        outputLanguage: 'en-US',
-        taskOutcome: {
-          version: '1',
-          id: `outcome-${token}`,
-          taskId,
-          status: 'modelJudgedSufficient',
-          reason: `resource evidence satisfies ${token}`,
-          evidenceRefs: [],
-        },
-      }),
-    }),
-    callProviderProposalOnly: async () => {
-      throw new Error('test uses resourceResume port directly');
-    },
-    runRepair: async () => {
-      throw new Error('taskOutcome resume should not require repair');
-    },
-    submitActionProposal: async (_input, _state, _prompt, proposal, result) => {
-      submitActionCalls += 1;
-      assertEqual(proposal.kind, 'taskOutcome', 'read-only task executor routes taskOutcome through action submitter');
-      assertEqual(result.session.id, sessionId, 'taskOutcome submitter receives the resource append result');
-      return submitterResult;
-    },
-    submitNonExecutableProposal: async () => {
-      submitNonExecutableCalls += 1;
-      return genericSessionResult(sessionId);
-    },
   });
   const result = await executor.tryCompleteActionBundle(
     { sessionId, content: `request-${token}` },
@@ -3076,9 +2990,8 @@ async function assertAcceptedPlanReadOnlyTaskExecutorRoutesTaskOutcomeThroughAct
     }),
     fallback
   );
-  assertEqual(result, submitterResult, 'taskOutcome resume returns the action submitter result');
-  assertEqual(submitActionCalls, 1, 'taskOutcome resource resume uses accepted-plan action submitter');
-  assertEqual(submitNonExecutableCalls, 0, 'taskOutcome resource resume is not sent through non-executable Kernel submit');
+  assertEqual((result as any)?.kind, 'continue', 'read-only resource fallback returns control to RunEngine');
+  assertEqual(Boolean((result as any)?.lastResult), true, 'read-only RunEngine continuation retains the appended ResourcePacket result');
 }
 
 async function assertResourceRequestRepairCoordinatorRepairsProposal(): Promise<void> {
@@ -7099,6 +7012,16 @@ function assertAcceptedPlanScopeMatcherNormalizesProposalTargets(): void {
     actionTarget,
     'scope matcher normalizes execution-root paths'
   );
+  const absoluteAccepted = {
+    ...accepted,
+    capabilities: ['fs.write'],
+    targetScopes: [`${rootRef}/${actionTarget}`],
+  };
+  assertEqual(
+    index.scopeCovered(actionTarget, 'fs.write', absoluteAccepted),
+    true,
+    'scope matcher treats execution-root absolute and workspace-relative targets as one identity'
+  );
   assertEqual(
     index.actionTargetScopes({
       id: `block-action-${token}`,
@@ -7448,22 +7371,15 @@ async function assertSessionDriverLoopProjectsDecisionRequest(): Promise<void> {
     kernelCommand: async (request): Promise<KernelReply> => fakeKernel(request),
     llmChat: async (): Promise<ApiResponse<LlmChatResult>> => {
       llmCalls += 1;
-      return jsonLlmResponse({
-        schemaVersion: 'deepcode.agent.protocol.v3',
-        kind: 'decisionRequest',
-        outputLanguage: 'en-US',
-        decisionRequest: {
-          version: '1',
-          id: 'decision-generic-auto',
-          reason: 'A generic user decision is required before planning.',
-          summary: 'Choose how to proceed with the generic side-effect task.',
-          options: [
-            { id: 'recommended', label: 'Proceed', description: 'Generate the next reviewable plan.', recommended: true },
-            { id: 'stop', label: 'Stop', description: 'Do not generate an implementation plan.' },
-          ],
-          allowsFreeform: true,
-        },
-      });
+      return semanticToolLlmResponse('session.request_decision', {
+        question: 'A generic user decision is required before planning.',
+        summary: 'Choose how to proceed with the generic side-effect task.',
+        options: [
+          { id: 'recommended', label: 'Proceed', description: 'Generate the next reviewable plan.', recommended: true },
+          { id: 'stop', label: 'Stop', description: 'Do not generate an implementation plan.' },
+        ],
+        allowsFreeform: true,
+      }, 'decision-generic-auto');
     },
     now: () => '2026-01-01T00:00:00.000Z',
     createId: (prefix) => `${prefix}-${events.length + 1}`,
@@ -7550,14 +7466,18 @@ async function assertSessionDriverLoopRequirementConfirmationCarriesExecutionRoo
       llmRequests.push(request);
       llmCalls += 1;
       if (llmCalls === 1) {
-        return jsonLlmResponse(genericDecisionRequestProposal(`decision-${token}`));
+        return semanticToolLlmResponse('session.request_decision', {
+          question: `Choose a generic option for ${token}.`,
+          options: [
+            { id: `first-${token}`, label: `First ${token}`, description: `Use the first generic option for ${token}.` },
+            { id: `second-${token}`, label: `Second ${token}`, description: `Use the second generic option for ${token}.` },
+          ],
+          allowsFreeform: true,
+        }, `decision-${token}`);
       }
-      return jsonLlmResponse({
-        schemaVersion: 'deepcode.agent.protocol.v3',
-        kind: 'answer',
-        outputLanguage: 'en-US',
-        answer: { format: 'markdown', content: 'Generic continuation answer.' },
-      });
+      return semanticToolLlmResponse('session.submit_answer', {
+        content: 'Generic continuation answer.',
+      }, `answer-${token}`);
     },
     now: () => '2026-01-01T00:00:00.000Z',
     createId: (prefix) => `${prefix}-${events.length + llmCalls + 1}`,
@@ -7794,7 +7714,20 @@ async function assertSessionDriverLoopProjectsTaskPlanBeforeComplete(): Promise<
     },
     llmChat: async (): Promise<ApiResponse<LlmChatResult>> => {
       llmCalls += 1;
-      return jsonLlmResponse(genericTaskPlanProposal());
+      return semanticToolLlmResponse('session.submit_plan', {
+        title: 'Generic task plan',
+        summary: 'Plan a generic workspace change before implementation.',
+        tasks: [{
+          taskId: 'task-generic-write',
+          title: 'Prepare generic workspace output',
+          operation: 'replaceFile',
+          targets: ['generic-output.txt'],
+          acceptanceCriteria: ['Kernel facts show the accepted target was updated after execution.'],
+          failureCriteria: ['Stop if implementation needs targets outside the accepted task plan.'],
+        }],
+        risks: ['Workspace writes remain under Kernel permission policy.'],
+        reviewCheckpoints: ['Review Kernel facts after execution.'],
+      }, 'task-plan-generic');
     },
     now: () => '2026-01-01T00:00:00.000Z',
     createId: (prefix) => `${prefix}-${events.length + llmCalls + proposalSubmits + 1}`,
@@ -9753,7 +9686,7 @@ async function assertAcceptedPlanStreamingDraftsAndJsonProgress(): Promise<void>
   const draftFrames: unknown[] = [];
   let actionBatchSubmits = 0;
   const proposal = randomMultiWriteProposal([targetPath], { briefUserPlan: true });
-  const proposalText = JSON.stringify(proposal);
+  const artifactContentLines = ((proposal as any).codeBlocks?.[0]?.contentLines ?? []) as string[];
   const frame = {
     schemaVersion: 'deepcode.agent.stream.part.v1',
     partKind: 'codeBlockChunk',
@@ -9838,14 +9771,28 @@ async function assertAcceptedPlanStreamingDraftsAndJsonProgress(): Promise<void>
           content: `<deepcode-part>${JSON.stringify(frame)}</deepcode-part>`,
         },
       });
-      await onEvent({
-        type: 'provider_delta',
-        chunk: {
-          type: 'delta',
-          content: proposalText.slice(0, Math.min(2000, proposalText.length)),
+      return {
+        ok: true,
+        data: {
+          chunks: [],
+          assistantMessage: {
+            role: 'assistant',
+            content: '',
+            toolCalls: [{
+              id: `semantic-artifact-${token}`,
+              name: 'session.submit_task_artifacts',
+              arguments: {
+                taskId: 'task-generic-write',
+                summary: `Write ${targetPath}`,
+                artifacts: [{
+                  slotId: 'slot-task-generic-write-1',
+                  contentLines: artifactContentLines,
+                }],
+              },
+            }],
+          },
         },
-      });
-      return jsonLlmResponse(proposal);
+      };
     },
     onProjectionDelta: async (delta) => {
       deltas.push(delta);
@@ -9882,11 +9829,6 @@ async function assertAcceptedPlanStreamingDraftsAndJsonProgress(): Promise<void>
     deltas.some((delta: any) => delta.type === 'draft_delta'),
     true,
     'accepted-plan stream emits draft_delta before final actionBundle'
-  );
-  assertEqual(
-    deltas.some((delta: any) => delta.type === 'stage_delta' && delta.payload?.reason === 'proposal_json_stream_hidden_from_assistant'),
-    true,
-    'accepted-plan raw JSON delta emits progress instead of a silent wait'
   );
   assertEqual(
     deltas.some((delta: any) => delta.type === 'assistant_delta'),
@@ -11122,42 +11064,14 @@ async function assertSessionDriverLoopPathResourceRequest(): Promise<void> {
     llmChat: async (): Promise<ApiResponse<LlmChatResult>> => {
       llmCalls += 1;
       if (llmCalls === 1) {
-        return {
-          ok: true,
-          data: {
-            chunks: [{ type: 'done' }],
-            assistantMessage: {
-              role: 'assistant',
-              content: JSON.stringify({
-                schemaVersion: 'deepcode.agent.protocol.v3',
-                kind: 'resourceRequest',
-                outputLanguage: 'en-US',
-                resourceRequest: {
-                  version: '1',
-                  id: 'need-generic-file',
-                  reason: 'Need a generic file from the attached directory.',
-                  items: [{ id: 'generic-source', path: 'src/main.txt', reason: 'Read generic project source.' }],
-                },
-              }),
-            },
-          },
-        };
+        return semanticToolLlmResponse('session.request_resources', {
+          reason: 'Need a generic file from the attached directory.',
+          requests: [{ kind: 'fileText', path: 'src/main.txt', reason: 'Read generic project source.' }],
+        }, 'need-generic-file');
       }
-      return {
-        ok: true,
-        data: {
-          chunks: [{ type: 'done' }],
-          assistantMessage: {
-            role: 'assistant',
-            content: JSON.stringify({
-              schemaVersion: 'deepcode.agent.protocol.v3',
-              kind: 'answer',
-              outputLanguage: 'en-US',
-              answer: { format: 'markdown', content: 'Generic directory context was resolved by path.' },
-            }),
-          },
-        },
-      };
+      return semanticToolLlmResponse('session.submit_answer', {
+        content: 'Generic directory context was resolved by path.',
+      }, 'answer-generic-path');
     },
     now: () => '2026-01-01T00:00:00.000Z',
     createId: (prefix) => `${prefix}-${events.length + 1}`,
@@ -11241,32 +11155,21 @@ async function assertSessionDriverLoopSearchResourceRequest(): Promise<void> {
     llmChat: async (): Promise<ApiResponse<LlmChatResult>> => {
       llmCalls += 1;
       if (llmCalls === 1) {
-        return jsonLlmResponse({
-          schemaVersion: 'deepcode.agent.protocol.v3',
-          kind: 'resourceRequest',
-          outputLanguage: 'en-US',
-          resourceRequest: {
-            version: '1',
-            id: 'need-generic-search',
-            reason: 'Need generic search evidence.',
-            items: [{
-              id: 'search-anchor',
-              kind: 'search',
-              query: 'generic anchor',
-              include: ['src/'],
-              contextLines: 2,
-              maxResults: 10,
-              reason: 'Find a generic anchor.',
-            }],
-          },
-        });
+        return semanticToolLlmResponse('session.request_resources', {
+          reason: 'Need generic search evidence.',
+          requests: [{
+            kind: 'search',
+            query: 'generic anchor',
+            include: ['src/'],
+            contextLines: 2,
+            maxResults: 10,
+            reason: 'Find a generic anchor.',
+          }],
+        }, 'need-generic-search');
       }
-      return jsonLlmResponse({
-        schemaVersion: 'deepcode.agent.protocol.v3',
-        kind: 'answer',
-        outputLanguage: 'en-US',
-        answer: { format: 'markdown', content: 'Generic search evidence was resolved.' },
-      });
+      return semanticToolLlmResponse('session.submit_answer', {
+        content: 'Generic search evidence was resolved.',
+      }, 'answer-generic-search');
     },
     now: () => '2026-01-01T00:00:00.000Z',
     createId: (prefix) => `${prefix}-${events.length + 1}`,
@@ -11343,42 +11246,14 @@ async function assertSessionDriverLoopRejectsOutsidePath(): Promise<void> {
     llmChat: async (): Promise<ApiResponse<LlmChatResult>> => {
       llmCalls += 1;
       if (llmCalls === 1) {
-        return {
-          ok: true,
-          data: {
-            chunks: [{ type: 'done' }],
-            assistantMessage: {
-              role: 'assistant',
-              content: JSON.stringify({
-                schemaVersion: 'deepcode.agent.protocol.v3',
-                kind: 'resourceRequest',
-                outputLanguage: 'en-US',
-                resourceRequest: {
-                  version: '1',
-                  id: 'outside-request',
-                  reason: 'Attempt to read an outside path.',
-                  items: [{ id: 'outside-item', path: '/tmp/outside.txt', reason: 'Outside path should not be granted.' }],
-                },
-              }),
-            },
-          },
-        };
+        return semanticToolLlmResponse('session.request_resources', {
+          reason: 'Attempt to read an outside path.',
+          requests: [{ kind: 'fileText', path: '/tmp/outside.txt', reason: 'Outside path should not be granted.' }],
+        }, 'outside-request');
       }
-      return {
-        ok: true,
-        data: {
-          chunks: [{ type: 'done' }],
-          assistantMessage: {
-            role: 'assistant',
-            content: JSON.stringify({
-              schemaVersion: 'deepcode.agent.protocol.v3',
-              kind: 'answer',
-              outputLanguage: 'en-US',
-              answer: { format: 'markdown', content: 'Outside path was not granted.' },
-            }),
-          },
-        },
-      };
+      return semanticToolLlmResponse('session.submit_answer', {
+        content: 'Outside path was not granted.',
+      }, 'answer-outside-path');
     },
     now: () => '2026-01-01T00:00:00.000Z',
     createId: (prefix) => `${prefix}-${events.length + 1}`,
@@ -11465,42 +11340,14 @@ async function assertSessionDriverLoopUsesRecentAttachmentRoot(): Promise<void> 
     llmChat: async (): Promise<ApiResponse<LlmChatResult>> => {
       llmCalls += 1;
       if (llmCalls === 1) {
-        return {
-          ok: true,
-          data: {
-            chunks: [{ type: 'done' }],
-            assistantMessage: {
-              role: 'assistant',
-              content: JSON.stringify({
-                schemaVersion: 'deepcode.agent.protocol.v3',
-                kind: 'resourceRequest',
-                outputLanguage: 'en-US',
-                resourceRequest: {
-                  version: '1',
-                  id: 'recent-path-request',
-                  reason: 'Need a file from the recent attached directory.',
-                  items: [{ id: 'recent-file', path: 'README.txt', reason: 'Read generic overview.' }],
-                },
-              }),
-            },
-          },
-        };
+        return semanticToolLlmResponse('session.request_resources', {
+          reason: 'Need a file from the recent attached directory.',
+          requests: [{ kind: 'fileText', path: 'README.txt', reason: 'Read generic overview.' }],
+        }, 'recent-path-request');
       }
-      return {
-        ok: true,
-        data: {
-          chunks: [{ type: 'done' }],
-          assistantMessage: {
-            role: 'assistant',
-            content: JSON.stringify({
-              schemaVersion: 'deepcode.agent.protocol.v3',
-              kind: 'answer',
-              outputLanguage: 'en-US',
-              answer: { format: 'markdown', content: 'Recent attachment root was reused.' },
-            }),
-          },
-        },
-      };
+      return semanticToolLlmResponse('session.submit_answer', {
+        content: 'Recent attachment root was reused.',
+      }, 'answer-recent-path');
     },
     now: () => '2026-01-01T00:00:00.000Z',
     createId: (prefix) => `${prefix}-${events.length + 1}`,
@@ -11538,33 +11385,14 @@ async function assertSessionDriverLoopReadOnlyRequestsContinueWithoutBudgetDecis
       const promptText = request.messages.map((message) => message.content).join('\n');
       assert(!promptText.includes('Read-only resource budget:'), 'provider prompt does not expose fixed read-only resource budget');
       if (llmCalls > 12) {
-        return jsonLlmResponse({
-          schemaVersion: 'deepcode.agent.protocol.v3',
-          kind: 'answer',
-          outputLanguage: 'en-US',
-          answer: { format: 'markdown', content: 'Read-only exploration continued and then converged.' },
-        });
+        return semanticToolLlmResponse('session.submit_answer', {
+          content: 'Read-only exploration continued and then converged.',
+        }, 'answer-readonly-converged');
       }
-      return {
-        ok: true,
-        data: {
-          chunks: [{ type: 'done' }],
-          assistantMessage: {
-            role: 'assistant',
-            content: JSON.stringify({
-              schemaVersion: 'deepcode.agent.protocol.v3',
-              kind: 'resourceRequest',
-              outputLanguage: 'en-US',
-              resourceRequest: {
-                version: '1',
-                id: `budget-request-${llmCalls}`,
-                reason: 'Need another generic resource.',
-                items: [{ id: `budget-item-${llmCalls}`, path: `src/file-${llmCalls}.txt`, reason: 'Read the next generic source.' }],
-              },
-            }),
-          },
-        },
-      };
+      return semanticToolLlmResponse('session.request_resources', {
+        reason: 'Need another generic resource.',
+        requests: [{ kind: 'fileText', path: `src/file-${llmCalls}.txt`, reason: 'Read the next generic source.' }],
+      }, `budget-request-${llmCalls}`);
     },
     now: () => '2026-01-01T00:00:00.000Z',
     createId: (prefix) => `${prefix}-${events.length + 1}`,
@@ -11644,21 +11472,9 @@ async function assertSessionDriverLoopOldResourceBudgetDecisionStillResumes(): P
       llmCalls += 1;
       const promptText = request.messages.map((message) => message.content).join('\n');
       assert(!promptText.includes('Read-only resource budget:'), 'legacy budget continuation resumes without exposing a new fixed budget');
-      return {
-        ok: true,
-        data: {
-          chunks: [{ type: 'done' }],
-          assistantMessage: {
-            role: 'assistant',
-            content: JSON.stringify({
-              schemaVersion: 'deepcode.agent.protocol.v3',
-              kind: 'answer',
-              outputLanguage: 'en-US',
-              answer: { format: 'markdown', content: 'Continued after legacy budget approval.' },
-            }),
-          },
-        },
-      };
+      return semanticToolLlmResponse('session.submit_answer', {
+        content: 'Continued after legacy budget approval.',
+      }, 'answer-legacy-budget');
     },
     now: () => '2026-01-01T00:00:00.000Z',
     createId: (prefix) => `${prefix}-${events.length + 1}`,
@@ -11724,7 +11540,7 @@ function resourceBudgetKernel(
   return { ok: true, events: [] };
 }
 
-async function assertSessionDriverLoopRepairsSideEffectBundleEvidence(): Promise<void> {
+async function assertSessionDriverLoopAdmitsSemanticTaskPlanWithoutKernelAction(): Promise<void> {
   const events: AgentEvent[] = [];
   const transcript: TranscriptEntry[] = [];
   let llmCalls = 0;
@@ -11772,18 +11588,25 @@ async function assertSessionDriverLoopRepairsSideEffectBundleEvidence(): Promise
     },
     llmChat: async (): Promise<ApiResponse<LlmChatResult>> => {
       llmCalls += 1;
-      const bundle = genericWriteProposal(llmCalls === 1);
-      return {
-        ok: true,
-        data: {
-          chunks: [{ type: 'reasoning_delta', content: `generic reasoning ${llmCalls}` }, { type: 'done' }],
-          assistantMessage: {
-            role: 'assistant',
-            reasoningContent: `generic reasoning ${llmCalls}`,
-            content: JSON.stringify(bundle),
-          },
-        },
-      };
+      const response = semanticToolLlmResponse('session.submit_plan', {
+        title: 'Generic scaffold plan',
+        summary: 'Prepare one generic workspace artifact after user confirmation.',
+        tasks: [{
+          taskId: 'task-generic-scaffold',
+          title: 'Prepare generic workspace artifact',
+          operation: 'replaceFile',
+          targets: ['generic-output.txt'],
+          acceptanceCriteria: ['Kernel facts record the confirmed artifact operation.'],
+          failureCriteria: ['Stop if the target leaves the confirmed task scope.'],
+        }],
+        risks: [],
+        reviewCheckpoints: ['Review Kernel facts after execution.'],
+      }, 'plan-generic-scaffold');
+      if (response.ok && response.data?.assistantMessage) {
+        response.data.chunks = [{ type: 'reasoning_delta', content: `generic reasoning ${llmCalls}` }, { type: 'done' }];
+        response.data.assistantMessage.reasoningContent = `generic reasoning ${llmCalls}`;
+      }
+      return response;
     },
     now: () => '2026-01-01T00:00:00.000Z',
     createId: (prefix) => `${prefix}-${events.length + transcript.length + 1}`,
@@ -11794,20 +11617,14 @@ async function assertSessionDriverLoopRepairsSideEffectBundleEvidence(): Promise
     content: 'Create a generic scaffold.',
     requirementConfirmationMode: 'off',
   });
-  assertEqual(llmCalls, 1, 'side-effect actionBundle missing routine review notes is canonicalized without protocol repair');
-  assertEqual(submittedPlans.length, 1, 'canonicalized actionBundle reaches Kernel ProposalSubmit once');
-  assertEqual(submittedPlans[0].kind, 'actionBundle', 'canonicalized proposal remains an actionBundle');
-  const repairedBundle = submittedPlans[0].payload?.actionBundle ?? {};
-  assertEqual((repairedBundle.validationExpectations ?? []).length, 1, 'canonicalized actionBundle contains validation expectations');
-  assertEqual((repairedBundle.reviewExpectations ?? []).length, 1, 'canonicalized actionBundle contains review expectations');
+  assertEqual(llmCalls, 1, 'planning accepts one Session semantic plan directive');
+  assertEqual(submittedPlans.length, 0, 'planning does not compile or submit Kernel actions before user confirmation');
   const planCards = result.events.filter((event) => event.kind === 'plan_card');
   const planReviews = result.events.filter((event) => event.kind === 'plan_review');
-  assertEqual(planCards.length, 1, 'repaired plan renders one interactive plan card');
+  assertEqual(planCards.length, 1, 'semantic task plan renders one interactive plan card');
   assertEqual((planCards[0]?.payload as any)?.decisionOwner?.kind, 'plan', 'plan card owns the plan decision');
-  assertEqual((planCards[0]?.payload as any)?.status, 'awaitingUserApproval', 'plan card carries Kernel review status');
-  assertEqual(planReviews.length, 1, 'Kernel plan review remains recorded for audit');
-  assertEqual((planReviews[0]?.payload as any)?.confirmable, false, 'Kernel plan review is not a second decision owner');
-  assertEqual((planReviews[0]?.payload as any)?.visibility, 'debug', 'Kernel plan review is debug/audit only');
+  assertEqual((planCards[0]?.payload as any)?.status, 'pending', 'plan card waits for user confirmation');
+  assertEqual(planReviews.length, 0, 'planning does not create a Kernel action review event');
   assertEqual(
     result.events.some((event) =>
       event.kind === 'session_run_state' &&
@@ -12392,6 +12209,7 @@ async function assertSessionDriverLoopAcceptsLocalizedStructuredPlan(): Promise<
 }
 
 async function assertSessionDriverLoopPlanRevisionReturnsToPlanning(): Promise<void> {
+  const token = randomSmokeToken('plan-revision');
   const events = [acceptedImplementationPlanCardEvent('session-plan-revision', 'run-plan-revision')];
   const session: AgentSession = {
     id: 'session-plan-revision',
@@ -12413,7 +12231,20 @@ async function assertSessionDriverLoopPlanRevisionReturnsToPlanning(): Promise<v
     },
     llmChat: async (request): Promise<ApiResponse<LlmChatResult>> => {
       llmRequests.push(request);
-      return jsonLlmResponse(genericTaskPlanProposal());
+      return semanticToolLlmResponse('session.submit_plan', {
+        title: `Revised plan ${token}`,
+        summary: `Revised plan summary ${token}`,
+        tasks: [{
+          taskId: `task-${token}`,
+          title: `Revise target ${token}`,
+          operation: 'replaceFile',
+          targets: [`scope-${token}/target.txt`],
+          acceptanceCriteria: [`Acceptance ${token}`],
+          failureCriteria: [`Failure ${token}`],
+        }],
+        risks: [],
+        reviewCheckpoints: [],
+      });
     },
     now: () => '2026-01-01T00:00:00.000Z',
     createId: (prefix) => `${prefix}-${events.length + llmRequests.length + actionBatchSubmits + 1}`,
@@ -12477,6 +12308,7 @@ function assertWorkflowStagePermissionProjectsPendingDecision(): void {
 }
 
 async function assertSessionDriverLoopReviewRevisionReturnsToPlanning(): Promise<void> {
+  const token = randomSmokeToken('review-revision-plan');
   const events: AgentEvent[] = [{
     id: 'review-waiting-generic',
     sessionId: 'session-review-revision',
@@ -12525,7 +12357,20 @@ async function assertSessionDriverLoopReviewRevisionReturnsToPlanning(): Promise
     },
     llmChat: async (request): Promise<ApiResponse<LlmChatResult>> => {
       llmRequests.push(request);
-      return jsonLlmResponse(genericWriteProposal(false));
+      return semanticToolLlmResponse('session.submit_plan', {
+        title: `Review revision plan ${token}`,
+        summary: `Plan the requested review revision ${token}`,
+        tasks: [{
+          taskId: `task-${token}`,
+          title: `Apply review revision ${token}`,
+          operation: 'replaceFile',
+          targets: [`scope-${token}/revision.txt`],
+          acceptanceCriteria: [`Acceptance ${token}`],
+          failureCriteria: [`Failure ${token}`],
+        }],
+        risks: [],
+        reviewCheckpoints: [],
+      });
     },
     now: () => '2026-01-01T00:00:00.000Z',
     createId: (prefix) => `${prefix}-${events.length + submittedPlans.length + llmRequests.length + 1}`,
@@ -12542,18 +12387,19 @@ async function assertSessionDriverLoopReviewRevisionReturnsToPlanning(): Promise
 
   assertEqual(result.events.some((event) => event.kind === 'review_summary' && (event.payload as any).status === 'needsRevision'), true, 'review guidance is recorded as needsRevision');
   assertEqual(result.events.some((event) => event.kind === 'plan_card'), true, 'review revision starts a new planning turn');
-  assertEqual(submittedPlans.length, 1, 'review revision submits the new actionBundle to Kernel PlanReview');
+  assertEqual(submittedPlans.length, 0, 'review revision projects the semantic task plan before any Kernel execution contract');
   assertEqual(llmRequests.length, 1, 'review revision calls the provider for a new plan once');
   assertEqual(runCreates, 0, 'Review revision resumes the original run without Kernel runCreate');
   const promptText = llmRequests.flatMap((request) => request.messages.map((message) => message.content)).join('\n');
   assert(promptText.includes('Add a generic script and document how to run it.'), 'review guidance enters the next PromptEnvelope');
-  assert(promptText.includes('ProjectMemoryIndexDigest'), 'structured project memory index digest is included');
-  assert(promptText.includes('ProjectMemoryRecall'), 'dynamic project memory recall is included');
+  assert(!promptText.includes('ProjectMemoryIndexDigest'), 'empty project memory metadata is omitted from the provider prompt');
+  assert(!promptText.includes('ProjectMemoryRecall'), 'empty project memory recall is omitted from the provider prompt');
   assert(promptText.includes('SessionMemoryCompact'), 'structured session memory compact summary is included');
   assert(!promptText.includes('content=Review fact'), 'raw review facts are not promoted into ProjectMemory prompt content');
 }
 
 async function assertSessionDriverLoopReviewRevisionContinuesWhenAuditRunInactive(): Promise<void> {
+  const token = randomSmokeToken('inactive-review-revision');
   const events: AgentEvent[] = [{
     id: 'review-waiting-inactive-audit',
     sessionId: 'session-review-revision-inactive-audit',
@@ -12604,7 +12450,20 @@ async function assertSessionDriverLoopReviewRevisionContinuesWhenAuditRunInactiv
     },
     llmChat: async (request): Promise<ApiResponse<LlmChatResult>> => {
       llmRequests.push(request);
-      return jsonLlmResponse(genericWriteProposal(false));
+      return semanticToolLlmResponse('session.submit_plan', {
+        title: `Inactive review revision plan ${token}`,
+        summary: `Plan the requested revision after an inactive audit ${token}`,
+        tasks: [{
+          taskId: `task-${token}`,
+          title: `Apply inactive review revision ${token}`,
+          operation: 'replaceFile',
+          targets: [`scope-${token}/revision.txt`],
+          acceptanceCriteria: [`Acceptance ${token}`],
+          failureCriteria: [`Failure ${token}`],
+        }],
+        risks: [],
+        reviewCheckpoints: [],
+      });
     },
     now: () => '2026-01-01T00:00:00.000Z',
     createId: (prefix) => `${prefix}-${events.length + submittedPlans.length + llmRequests.length + userDecisionSubmits + 1}`,
@@ -12629,7 +12488,7 @@ async function assertSessionDriverLoopReviewRevisionContinuesWhenAuditRunInactiv
     'inactive review audit is recorded as a Session trace'
   );
   assertEqual(result.events.some((event) => event.kind === 'plan_card'), true, 'review revise continues to a new planning turn after audit failure');
-  assertEqual(submittedPlans.length, 1, 'review revise still submits the repaired plan to Kernel PlanReview');
+  assertEqual(submittedPlans.length, 0, 'review revise projects the semantic task plan before Kernel execution admission');
   assertEqual(llmRequests.length, 1, 'review revise calls provider once after best-effort audit failure');
 }
 
@@ -13032,6 +12891,7 @@ async function assertSessionDriverLoopAcceptedPlanExecutesReviewedDeleteWithoutT
   let llmCalls = 0;
   let proposalSubmits = 0;
   let actionBatchSubmits = 0;
+  let deterministicProposal: any;
   const temporaryGrants: Array<Record<string, any>> = [];
   const loop = new SessionDriverLoop({
     appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
@@ -13042,6 +12902,7 @@ async function assertSessionDriverLoopAcceptedPlanExecutesReviewedDeleteWithoutT
       const command = request.command as Record<string, any>;
       if (command.kind === 'proposalSubmit') {
         proposalSubmits += 1;
+        deterministicProposal = command.proposal;
         return {
           ok: true,
           events: [
@@ -13098,8 +12959,13 @@ async function assertSessionDriverLoopAcceptedPlanExecutesReviewedDeleteWithoutT
     existingEvents: events,
   });
 
-  assertEqual(llmCalls, 1, 'reviewed delete exact grant does not trigger scope repair when task target scopes are empty');
-  assertEqual(proposalSubmits, 1, 'reviewed delete exact grant still goes through Kernel PlanReview for the execution batch');
+  assertEqual(llmCalls, 0, 'reviewed exact delete grant uses the deterministic current-task compiler');
+  assertEqual(proposalSubmits, 1, 'deterministic delete still submits the compiled internal batch contract to Kernel PlanReview');
+  const deterministicActions = deterministicProposal?.payload?.actionBundle?.actions ?? [];
+  assertEqual(deterministicActions.length, 1, 'deterministic delete compiles one action for the exact current-task grant');
+  assertEqual(deterministicActions[0]?.targetPath, 'generic-obsolete.txt', 'deterministic delete exposes the canonical Kernel targetPath');
+  assertEqual(deterministicActions[0]?.resourceScope?.[0], 'generic-obsolete.txt', 'deterministic delete exposes the canonical Kernel resourceScope');
+  assertEqual(deterministicActions[0]?.targetRef?.path, 'generic-obsolete.txt', 'deterministic delete preserves the structured target reference');
   assertEqual(actionBatchSubmits, 1, 'reviewed delete exact grant submits actionBatch even when implementationPlan task targets are empty');
   assertEqual(temporaryGrants.length, 1, 'reviewed delete exact grant receives one temporary grant');
   assertEqual(temporaryGrants[0]?.resourcePath, 'generic-obsolete.txt', 'reviewed delete exact grant keeps the file-scoped grant target');
@@ -13970,6 +13836,11 @@ async function assertSessionDriverLoopAcceptedImplementationPlanAutoExecutesBatc
       const command = request.command as Record<string, any>;
       if (command.kind === 'proposalSubmit') {
         proposalSubmits += 1;
+        assertEqual(
+          command.proposal?.payload?.codeBlocks?.[0]?.content,
+          `generic output ${token}`,
+          'artifact compiler submits canonical codeBlock content to Kernel PlanReview'
+        );
         return {
           ok: true,
           events: [
@@ -14023,7 +13894,14 @@ async function assertSessionDriverLoopAcceptedImplementationPlanAutoExecutesBatc
     },
     llmChat: async (request): Promise<ApiResponse<LlmChatResult>> => {
       llmRequests.push(request);
-      return jsonLlmResponse(genericWriteProposal(false));
+      return semanticToolLlmResponse('session.submit_task_artifacts', {
+        taskId: 'task-generic-write',
+        summary: `Generated current task artifact ${token}`,
+        artifacts: [{
+          slotId: 'slot-task-generic-write-1',
+          contentLines: [`generic output ${token}`],
+        }],
+      });
     },
     now: () => '2026-01-01T00:00:00.000Z',
     createId: (prefix) => `${prefix}-${events.length + proposalSubmits + actionBatchSubmits + temporaryGrants + 1}`,
@@ -14044,9 +13922,10 @@ async function assertSessionDriverLoopAcceptedImplementationPlanAutoExecutesBatc
   assertEqual(temporaryGrants, 1, 'accepted implementationPlan grants scoped workspace write permission for in-scope batch');
   assertEqual(llmRequests.length, 1, 'accepted implementationPlan execution calls provider once');
   const promptText = llmRequests.flatMap((request) => request.messages.map((message) => message.content)).join('\n');
-  assert(promptText.includes('Accepted execution sanitized context'), 'accepted execution sends sanitized context');
-  assert(promptText.includes('CurrentTaskAcceptance: Kernel records the generic output write fact.'), 'accepted execution exposes current task acceptance criteria');
-  assert(promptText.includes('CurrentTaskStopOrReplan: Stop if the write leaves the accepted target scope.'), 'accepted execution exposes current task failure criteria');
+  assert(promptText.includes('Session semantic profile: execution-v1'), 'accepted execution uses the stable execution provider profile');
+  assert(promptText.includes('slot-task-generic-write-1'), 'accepted execution exposes the current task IntentSlot id');
+  assert(promptText.includes('Kernel records the generic output write fact.'), 'accepted execution exposes current task acceptance criteria');
+  assert(promptText.includes('Stop if the write leaves the accepted target scope.'), 'accepted execution exposes current task failure criteria');
   assert(!promptText.includes(originalRequest), 'accepted execution does not re-expand the original user request');
   assert(!promptText.includes('Accepted execution contract context'), 'accepted execution does not send raw contract JSON');
   assert(!promptText.includes('taskOrder='), 'accepted execution does not expose taskOrder in provider text');
@@ -15899,7 +15778,14 @@ async function assertSessionDriverLoopAcceptedImplementationPlanAllowsPlannedPro
       }
       return fakeKernel(request);
     },
-    llmChat: async (): Promise<ApiResponse<LlmChatResult>> => jsonLlmResponse(processExecProposal()),
+    llmChat: async (): Promise<ApiResponse<LlmChatResult>> => semanticToolLlmResponse('session.submit_task_artifacts', {
+      taskId: 'task-generic-exec',
+      summary: 'Run the accepted validation command.',
+      artifacts: [{
+        slotId: 'slot-task-generic-exec-1',
+        argv: ['bash', 'scripts/validate.sh'],
+      }],
+    }),
     now: () => '2026-01-01T00:00:00.000Z',
     createId: (prefix) => `${prefix}-${events.length + proposalSubmits + actionBatchSubmits + 1}`,
   });
@@ -15935,9 +15821,17 @@ async function assertSessionDriverLoopAcceptedImplementationPlanContinuesUntilTa
     createdAt: '2026-01-01T00:00:00.000Z',
     updatedAt: '2026-01-01T00:00:00.000Z',
   };
-  const proposals = [
-    relativeTargetWriteProposal('generic-one.txt', 'code-one', 'write-generic-one'),
-    relativeTargetWriteProposal('generic-two.txt', 'code-two', 'write-generic-two'),
+  const directives = [
+    {
+      taskId: 'task-generic-one',
+      slotId: 'slot-task-generic-one-1',
+      content: 'generic one',
+    },
+    {
+      taskId: 'task-generic-two',
+      slotId: 'slot-task-generic-two-1',
+      content: 'generic two',
+    },
   ];
   let llmCalls = 0;
   let actionBatchSubmits = 0;
@@ -15995,9 +15889,16 @@ async function assertSessionDriverLoopAcceptedImplementationPlanContinuesUntilTa
       return fakeKernel(request);
     },
     llmChat: async (): Promise<ApiResponse<LlmChatResult>> => {
-      const proposal = proposals[Math.min(llmCalls, proposals.length - 1)];
+      const directive = directives[Math.min(llmCalls, directives.length - 1)];
       llmCalls += 1;
-      return jsonLlmResponse(proposal);
+      return semanticToolLlmResponse('session.submit_task_artifacts', {
+        taskId: directive.taskId,
+        summary: `Generate ${directive.taskId}`,
+        artifacts: [{
+          slotId: directive.slotId,
+          contentLines: [directive.content],
+        }],
+      });
     },
     now: () => '2026-01-01T00:00:00.000Z',
     createId: (prefix) => `${prefix}-${events.length + llmCalls + actionBatchSubmits + 1}`,
@@ -16062,11 +15963,43 @@ async function assertSessionDriverLoopAcceptedImplementationPlanResumesAfterDeci
     `generic-${token}-two.txt`,
     `generic-${token}-three.txt`,
   ];
-  const proposals = [
-    relativeTargetWriteProposal(targets[0], `code-${token}-one`, `write-${token}-one`),
-    genericDecisionRequestProposal(`decision-${token}`),
-    relativeTargetWriteProposal(targets[1], `code-${token}-two`, `write-${token}-two`),
-    relativeTargetWriteProposal(targets[2], `code-${token}-three`, `write-${token}-three`),
+  const directives = [
+    {
+      name: 'session.submit_task_artifacts',
+      args: {
+        taskId: `task-${token}-one`,
+        summary: `Generate first artifact ${token}`,
+        artifacts: [{ slotId: `slot-task-${token}-one-1`, contentLines: [`content-${token}-one`] }],
+      },
+    },
+    {
+      name: 'session.request_decision',
+      args: {
+        question: `Choose how to continue current task ${token}`,
+        summary: `Current task decision ${token}`,
+        allowsFreeform: true,
+        options: [
+          { id: 'continue', label: `Continue ${token}`, description: `Continue the accepted current task ${token}`, recommended: true },
+          { id: 'stop', label: `Stop ${token}`, description: `Stop before the current task ${token}` },
+        ],
+      },
+    },
+    {
+      name: 'session.submit_task_artifacts',
+      args: {
+        taskId: `task-${token}-two`,
+        summary: `Generate second artifact ${token}`,
+        artifacts: [{ slotId: `slot-task-${token}-two-1`, contentLines: [`content-${token}-two`] }],
+      },
+    },
+    {
+      name: 'session.submit_task_artifacts',
+      args: {
+        taskId: `task-${token}-three`,
+        summary: `Generate third artifact ${token}`,
+        artifacts: [{ slotId: `slot-task-${token}-three-1`, contentLines: [`content-${token}-three`] }],
+      },
+    },
   ];
   let llmCalls = 0;
   let actionBatchSubmits = 0;
@@ -16122,9 +16055,9 @@ async function assertSessionDriverLoopAcceptedImplementationPlanResumesAfterDeci
       return fakeKernel(request);
     },
     llmChat: async (): Promise<ApiResponse<LlmChatResult>> => {
-      const proposal = proposals[Math.min(llmCalls, proposals.length - 1)];
+      const directive = directives[Math.min(llmCalls, directives.length - 1)];
       llmCalls += 1;
-      return jsonLlmResponse(proposal);
+      return semanticToolLlmResponse(directive.name, directive.args);
     },
     now: () => '2026-01-01T00:00:00.000Z',
     createId: (prefix) => `${prefix}-${events.length + llmCalls + actionBatchSubmits + 1}`,
@@ -16188,26 +16121,34 @@ async function assertSessionDriverLoopAcceptedImplementationPlanReadsGeneratedAr
     createdAt: '2026-01-01T00:00:00.000Z',
     updatedAt: '2026-01-01T00:00:00.000Z',
   };
-  const proposals = [
-    singleTargetWriteProposal('generic-generated/input.txt', 'generated-input'),
+  const directives = [
     {
-      schemaVersion: 'deepcode.agent.protocol.v3',
-      kind: 'resourceRequest',
-      outputLanguage: 'en-US',
-      resourceRequest: {
-        version: '1',
-        id: 'request-generated-input',
+      name: 'session.submit_task_artifacts',
+      args: {
+        taskId: 'task-generated-input',
+        summary: 'Generate the accepted input artifact.',
+        artifacts: [{ slotId: 'slot-task-generated-input-1', contentLines: ['generated input'] }],
+      },
+    },
+    {
+      name: 'session.request_resources',
+      args: {
         reason: 'Read the file generated by the previous accepted batch.',
-        items: [{
-          id: 'generated-input',
-          kind: 'file',
-          rootId: 'stale-root-id',
+        requests: [{
+          kind: 'fileText',
           path: 'generic-generated/input.txt',
           reason: 'Use the current run generated artifact as evidence for the next batch.',
         }],
       },
     },
-    singleTargetWriteProposal('generic-generated/output.txt', 'generated-output'),
+    {
+      name: 'session.submit_task_artifacts',
+      args: {
+        taskId: 'task-generated-output',
+        summary: 'Generate the accepted output artifact.',
+        artifacts: [{ slotId: 'slot-task-generated-output-1', contentLines: ['generated output'] }],
+      },
+    },
   ];
   let llmCalls = 0;
   let actionBatchSubmits = 0;
@@ -16269,9 +16210,9 @@ async function assertSessionDriverLoopAcceptedImplementationPlanReadsGeneratedAr
       return fakeKernel(request);
     },
     llmChat: async (): Promise<ApiResponse<LlmChatResult>> => {
-      const proposal = proposals[Math.min(llmCalls, proposals.length - 1)];
+      const directive = directives[Math.min(llmCalls, directives.length - 1)];
       llmCalls += 1;
-      return jsonLlmResponse(proposal);
+      return semanticToolLlmResponse(directive.name, directive.args);
     },
     now: () => '2026-01-01T00:00:00.000Z',
     createId: (prefix) => `${prefix}-${events.length + llmCalls + actionBatchSubmits + resourceResolveCalls + 1}`,
@@ -16299,7 +16240,7 @@ async function assertSessionDriverLoopAcceptedImplementationPlanReadsGeneratedAr
         Array.isArray(item.evidenceRefs) &&
         item.evidenceRefs.includes('generatedArtifactEvidence') &&
         typeof item.promptContent === 'string' &&
-        item.promptContent.includes('generated-input')
+        item.promptContent.includes('generated input')
       )
     ),
     true,
@@ -16316,6 +16257,8 @@ async function assertSessionDriverLoopAcceptedImplementationPlanResumesFromResou
     updatedAt: '2026-01-01T00:00:00.000Z',
   };
   const providerPrompts: string[] = [];
+  const providerSystems: string[] = [];
+  const providerToolShapes: string[] = [];
   let llmCalls = 0;
   let actionBatchSubmits = 0;
   let resourceResolveCalls = 0;
@@ -16381,28 +16324,25 @@ async function assertSessionDriverLoopAcceptedImplementationPlanResumesFromResou
       llmCalls += 1;
       const userMessage = request.messages.find((message) => message.role === 'user')?.content ?? '';
       providerPrompts.push(userMessage);
+      providerSystems.push(request.messages.find((message) => message.role === 'system')?.content ?? '');
+      providerToolShapes.push(JSON.stringify((request.tools ?? []).map((tool) => tool.name)));
       if (llmCalls === 1) {
-        return jsonLlmResponse({
-          schemaVersion: 'deepcode.agent.protocol.v3',
-          kind: 'resourceRequest',
-          outputLanguage: 'en-US',
-          resourceRequest: {
-            version: '1',
-            id: 'request-current-generic-output',
-            reason: 'Read the current generic output evidence before writing.',
-            items: [{
-              id: 'current-generic-output',
-              kind: 'file',
-              path: 'generic-output.txt',
-              reason: 'Use current file evidence for the accepted task.',
-            }],
-          },
+        return semanticToolLlmResponse('session.request_resources', {
+          reason: 'Read the current generic output evidence before writing.',
+          requests: [{
+            kind: 'fileText',
+            path: 'generic-output.txt',
+            reason: 'Use current file evidence for the accepted task.',
+          }],
         });
       }
-      assert(userMessage.includes('Accepted-plan resource resume checkpoint'), 'second provider call uses compact resource resume checkpoint');
-      assert(userMessage.includes('TaskExecutionCursor'), 'resource resume prompt includes the task cursor');
-      assert(userMessage.includes('CurrentTaskGoal'), 'resource resume prompt includes the current task goal');
-      return jsonLlmResponse(genericWriteProposal(false));
+      assert(userMessage.includes('slot-task-generic-write-1'), 'resource resume keeps the same current task IntentSlot');
+      assert(userMessage.includes('ResourceEvidence'), 'resource resume appends ResourceEvidence to the same ContextAdmission shape');
+      return semanticToolLlmResponse('session.submit_task_artifacts', {
+        taskId: 'task-generic-write',
+        summary: 'Generate the accepted artifact after reading current evidence.',
+        artifacts: [{ slotId: 'slot-task-generic-write-1', contentLines: ['generic output after evidence'] }],
+      });
     },
     now: () => '2026-01-01T00:00:00.000Z',
     createId: (prefix) => `${prefix}-${events.length + llmCalls + actionBatchSubmits + resourceResolveCalls + 1}`,
@@ -16425,6 +16365,8 @@ async function assertSessionDriverLoopAcceptedImplementationPlanResumesFromResou
   });
 
   assertEqual(llmCalls, 2, 'accepted-plan resourceRequest resumes through one compact provider call');
+  assertEqual(providerSystems[0], providerSystems[1], 'resource resume keeps the same execution profile system contract');
+  assertEqual(providerToolShapes[0], providerToolShapes[1], 'resource resume keeps the execution semantic tool schema and order stable');
   assertEqual(actionBatchSubmits, 1, 'compact resource resume actionBundle is submitted to Kernel');
   assertEqual(resourceResolveCalls >= 1, true, 'resource resume resolves current evidence through Kernel ResourceResolve');
   assertEqual(
@@ -16444,7 +16386,7 @@ async function assertSessionDriverLoopAcceptedImplementationPlanResumesFromResou
     true,
     'accepted-plan execution writes a task savepoint after the resumed batch'
   );
-  assert(providerPrompts[0] && !providerPrompts[0].includes('Accepted-plan resource resume checkpoint'), 'first call remains the normal accepted-plan provider call');
+  assert(providerPrompts[0] && providerPrompts[0].includes('slot-task-generic-write-1'), 'first call starts with the same current task IntentSlot');
 }
 
 async function assertSessionDriverLoopAcceptedImplementationPlanChainsResourceResumeRequests(): Promise<void> {
@@ -16519,27 +16461,24 @@ async function assertSessionDriverLoopAcceptedImplementationPlanChainsResourceRe
       providerPrompts.push(userMessage);
       if (llmCalls === 1 || llmCalls === 2) {
         if (llmCalls === 2) {
-          assert(userMessage.includes('Accepted-plan resource resume checkpoint'), 'second call stays on resource resume prompt');
+          assert(userMessage.includes(evidencePaths[0]), 'second call appends the first resolved evidence path');
         }
-        return jsonLlmResponse({
-          schemaVersion: 'deepcode.agent.protocol.v3',
-          kind: 'resourceRequest',
-          outputLanguage: 'en-US',
-          resourceRequest: {
-            version: '1',
-            id: `request-${token}-${llmCalls}`,
-            reason: `Read additional generic evidence ${llmCalls}.`,
-            items: [{
-              id: `item-${token}-${llmCalls}`,
-              kind: 'file',
-              path: evidencePaths[llmCalls - 1],
-              reason: 'Use current file evidence for the accepted task.',
-            }],
-          },
+        return semanticToolLlmResponse('session.request_resources', {
+          reason: `Read additional generic evidence ${llmCalls}.`,
+          requests: [{
+            kind: 'fileText',
+            path: evidencePaths[llmCalls - 1],
+            reason: 'Use current file evidence for the accepted task.',
+          }],
         });
       }
-      assert(userMessage.includes('Accepted-plan resource resume checkpoint'), 'third call remains on resource resume prompt');
-      return jsonLlmResponse(genericWriteProposal(false));
+      assert(userMessage.includes(evidencePaths[0]), 'third call retains the first resolved evidence path');
+      assert(userMessage.includes(evidencePaths[1]), 'third call appends the second resolved evidence path');
+      return semanticToolLlmResponse('session.submit_task_artifacts', {
+        taskId: 'task-generic-write',
+        summary: `Generate artifact after chained evidence ${token}`,
+        artifacts: [{ slotId: 'slot-task-generic-write-1', contentLines: [`content-${token}`] }],
+      });
     },
     now: () => '2026-01-01T00:00:00.000Z',
     createId: (prefix) => `${prefix}-${events.length + llmCalls + actionBatchSubmits + resourceResolveCalls + 1}`,
@@ -16572,7 +16511,7 @@ async function assertSessionDriverLoopAcceptedImplementationPlanChainsResourceRe
     2,
     'each chained resource resume writes a cursor projection'
   );
-  assert(providerPrompts[0] && !providerPrompts[0].includes('Accepted-plan resource resume checkpoint'), 'first call remains the normal accepted-plan provider call');
+  assert(providerPrompts[0] && providerPrompts[0].includes('slot-task-generic-write-1'), 'first call starts with the current task IntentSlot');
 }
 
 async function assertSessionDriverLoopAcceptedReadOnlyResourceValidationCompletesWithoutProviderLoop(): Promise<void> {
@@ -16649,21 +16588,13 @@ async function assertSessionDriverLoopAcceptedReadOnlyResourceValidationComplete
     llmChat: async (): Promise<ApiResponse<LlmChatResult>> => {
       llmCalls += 1;
       assertEqual(llmCalls, 1, 'read-only validation should not make a second provider call after ResourcePacket coverage');
-      return jsonLlmResponse({
-        schemaVersion: 'deepcode.agent.protocol.v3',
-        kind: 'resourceRequest',
-        outputLanguage: 'en-US',
-        resourceRequest: {
-          version: '1',
-          id: `request-${token}`,
-          reason: 'Read current evidence for the accepted validation task.',
-          items: targets.map((target, index) => ({
-            id: `item-${token}-${index}`,
-            kind: 'file',
-            path: target,
-            reason: 'Resolve read-only validation evidence.',
-          })),
-        },
+      return semanticToolLlmResponse('session.request_resources', {
+        reason: 'Read current evidence for the accepted validation task.',
+        requests: targets.map((target) => ({
+          kind: 'fileText',
+          path: target,
+          reason: 'Resolve read-only validation evidence.',
+        })),
       });
     },
     now: () => '2026-01-01T00:00:00.000Z',
@@ -17674,6 +17605,7 @@ async function assertSessionDriverLoopAcceptedPlanPatchRequestsSearchEvidence():
 }
 
 async function assertSessionDriverLoopReviewAcceptAutoGeneratesNextPlan(): Promise<void> {
+  const token = randomSmokeToken('review-continuation-plan');
   const events: AgentEvent[] = [{
     id: 'review-waiting-accept-generic',
     sessionId: 'session-review-accept',
@@ -17719,7 +17651,20 @@ async function assertSessionDriverLoopReviewAcceptAutoGeneratesNextPlan(): Promi
     },
     llmChat: async (request): Promise<ApiResponse<LlmChatResult>> => {
       llmRequests.push(request);
-      return jsonLlmResponse(genericWriteProposal(false));
+      return semanticToolLlmResponse('session.submit_plan', {
+        title: `Continuation plan ${token}`,
+        summary: `Plan the accepted review continuation ${token}`,
+        tasks: [{
+          taskId: `task-${token}`,
+          title: `Implement continuation ${token}`,
+          operation: 'createFile',
+          targets: [`scope-${token}/follow-up.sh`],
+          acceptanceCriteria: [`Acceptance ${token}`],
+          failureCriteria: [`Failure ${token}`],
+        }],
+        risks: [],
+        reviewCheckpoints: [],
+      });
     },
     now: () => '2026-01-01T00:00:00.000Z',
     createId: (prefix) => `${prefix}-${events.length + submittedPlans.length + llmRequests.length + 1}`,
@@ -17752,7 +17697,7 @@ async function assertSessionDriverLoopReviewAcceptAutoGeneratesNextPlan(): Promi
     'auto continuation review accept does not mark the current run completed before continuation planning'
   );
   assertEqual(result.events.some((event) => event.kind === 'plan_card'), true, 'default review continuation mode generates the next plan');
-  assertEqual(submittedPlans.length, 1, 'default review continuation mode submits the next actionBundle for Kernel PlanReview');
+  assertEqual(submittedPlans.length, 0, 'default review continuation mode projects the next semantic task plan before Kernel execution admission');
   assertEqual(llmRequests.length, 1, 'default review continuation mode calls the provider once for a new plan');
   assertEqual(runCreates, 0, 'Review continuation resumes the original run without Kernel runCreate');
 }

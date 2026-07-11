@@ -16,8 +16,6 @@ import {
 } from './smokeHelpers.js';
 import {
   fakeKernel,
-  genericWriteProposal,
-  jsonLlmResponse,
 } from './smokeFixtures.js';
 
 export async function assertSessionDriverLoopTerminalAnswerGuidanceRevision(): Promise<void> {
@@ -52,12 +50,7 @@ export async function assertSessionDriverLoopTerminalAnswerGuidanceRevision(): P
             effectiveCheckpoint: 'nextProviderCall',
           },
         });
-        return jsonLlmResponse({
-          schemaVersion: 'deepcode.agent.protocol.v3',
-          kind: 'answer',
-          outputLanguage: 'en-US',
-          answer: { format: 'markdown', content: 'Initial generic plan without metrics.' },
-        });
+        return semanticAnswerResponse('answer-initial-generic', 'Initial generic plan without metrics.');
       }
       const promptText = request.messages.map((message) => message.content).join('\n');
       assert(promptText.includes('ProviderTurnContract:'), 'guidance revision prompt is admitted through ProviderTurnContract');
@@ -77,12 +70,9 @@ export async function assertSessionDriverLoopTerminalAnswerGuidanceRevision(): P
           effectiveCheckpoint: 'nextProviderCall',
         },
       });
-      return jsonLlmResponse({
-        schemaVersion: 'deepcode.agent.protocol.v3',
-        kind: 'answer',
+      return semanticToolResponse('answer-revised-generic', 'session.submit_answer', {
+        content: 'Revised generic plan with an evaluation dashboard and visible metrics.',
         narration: 'I will merge the new evaluation-dashboard guidance into the current answer.',
-        outputLanguage: 'en-US',
-        answer: { format: 'markdown', content: 'Revised generic plan with an evaluation dashboard and visible metrics.' },
       });
     },
     now: () => '2026-01-01T00:00:00.000Z',
@@ -175,14 +165,13 @@ export async function assertSessionDriverLoopTerminalGuidanceRevisionFallback():
             effectiveCheckpoint: 'nextProviderCall',
           },
         });
-        return jsonLlmResponse({
-          schemaVersion: 'deepcode.agent.protocol.v3',
-          kind: 'answer',
-          outputLanguage: 'en-US',
-          answer: { format: 'markdown', content: 'Initial fallback answer.' },
-        });
+        return semanticAnswerResponse('answer-initial-fallback-generic', 'Initial fallback answer.');
       }
-      return jsonLlmResponse(genericWriteProposal(false));
+      return semanticToolResponse('invalid-guidance-kind', 'session.submit_plan', {
+        title: 'Invalid guidance revision plan',
+        summary: 'This planning directive is not allowed in the review answer profile.',
+        tasks: [],
+      });
     },
     now: () => '2026-01-01T00:00:00.000Z',
     createId: (prefix) => `${prefix}-${events.length + llmCalls + 1}`,
@@ -201,4 +190,31 @@ export async function assertSessionDriverLoopTerminalGuidanceRevisionFallback():
   assertEqual(String((finalMessages[0]?.payload as any)?.content ?? ''), 'Initial fallback answer.', 'fallback final answer uses initial draft');
   assertEqual(Boolean((finalMessages[0]?.payload as any)?.guidanceRevisionFailed), true, 'fallback final answer records guidance revision failure');
   assertEqual(result.events.some((event) => event.kind === 'error'), true, 'guidance revision failure records a diagnostic event');
+}
+
+function semanticAnswerResponse(callId: string, content: string): ApiResponse<LlmChatResult> {
+  return semanticToolResponse(callId, 'session.submit_answer', { content });
+}
+
+function semanticToolResponse(
+  callId: string,
+  name: string,
+  argumentsValue: Record<string, unknown>
+): ApiResponse<LlmChatResult> {
+  return {
+    ok: true,
+    data: {
+      chunks: [{ type: 'reasoning_delta', content: 'generic reasoning' }, { type: 'done' }],
+      assistantMessage: {
+        role: 'assistant',
+        content: '',
+        reasoningContent: 'generic reasoning',
+        toolCalls: [{
+          id: callId,
+          name,
+          arguments: argumentsValue,
+        }],
+      },
+    },
+  };
 }

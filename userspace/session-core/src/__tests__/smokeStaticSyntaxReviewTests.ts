@@ -38,15 +38,21 @@ export async function assertAcceptedPlanStaticSyntaxReviewCoordinatorBuildsEvent
     runStaticSyntaxReview: async ({ stage, messages }) => {
       providerStage = stage;
       providerMessages = messages;
-      return JSON.stringify({
-        kind: 'staticSyntaxReview',
-        summary: `summary-${token}`,
-        issues: [{
-          targetPath,
-          severity: 'warning',
-          message: `issue-${token}`,
+      return {
+        toolCalls: [{
+          callId: `static-review-${token}`,
+          index: 0,
+          name: 'session.submit_static_review',
+          arguments: {
+            summary: `summary-${token}`,
+            issues: [{
+              targetRef: targetPath,
+              severity: 'warning',
+              message: `issue-${token}`,
+            }],
+          },
         }],
-      });
+      };
     },
     event: (nextSessionId, kind, payload) => ({
       id: `event-${token}`,
@@ -69,7 +75,9 @@ export async function assertAcceptedPlanStaticSyntaxReviewCoordinatorBuildsEvent
         role: 'user',
         content: `packet-${token}`,
       }],
-      normalizeStaticSyntaxIssues: (value: unknown) => Array.isArray(value) ? value as Array<Record<string, unknown>> : [],
+      normalizeStaticSyntaxIssues: (value: unknown) => Array.isArray(value)
+        ? value.map((item) => ({ ...(item as Record<string, unknown>), targetPath: (item as Record<string, unknown>).targetRef }))
+        : [],
     } as unknown as ReviewAssembler,
     contextFrameBuilder: new ContextFrameBuilder(),
   });
@@ -88,6 +96,7 @@ export async function assertAcceptedPlanStaticSyntaxReviewCoordinatorBuildsEvent
   assertEqual((deltas[0]?.payload as any)?.messageKey, 'session.driver.acceptedPlanStaticSyntaxReviewRunning', 'static syntax review delta carries i18n key');
   assertEqual(providerStage, 'accepted_plan_static_syntax_review', 'static syntax review coordinator uses expected provider stage');
   assertEqual(providerMessages.length, 2, 'static syntax review coordinator emits a side-call system and user message');
+  assert(String(providerMessages[0]?.content ?? '').includes('review-v1'), 'static syntax review uses the stable review provider profile');
   assert(String(providerMessages[1]?.content ?? '').includes('ProviderTurnContract:'), 'static syntax review coordinator renders a ProviderTurnContract wrapper');
   assert(String(providerMessages[1]?.content ?? '').includes(`packet-${token}`), 'static syntax review coordinator preserves assembler packet content');
   assertEqual(state.modelContextBundle?.providerTurnContract.turnMode, 'reviewAnswer', 'static syntax review stores side-call turn mode');
@@ -119,7 +128,7 @@ export async function assertAcceptedPlanStaticSyntaxReviewCoordinatorTimesOut():
     createId: (prefix) => `${prefix}-${token}`,
     staticSyntaxReviewTimeoutMs: 1,
     emitProjectionDelta: async () => undefined,
-    runStaticSyntaxReview: async () => new Promise<string>(() => undefined),
+    runStaticSyntaxReview: async () => new Promise<{ toolCalls: [] }>(() => undefined),
     event: (nextSessionId, kind, payload) => ({
       id: `event-${token}`,
       sessionId: nextSessionId,

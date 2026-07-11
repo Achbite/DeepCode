@@ -1,5 +1,6 @@
 import type { AgentSessionResult } from '@deepcode/protocol';
 import {
+  appendTaskLocalCompactRecord,
   assembleContext,
   buildTaskLocalCompactRecord,
   buildPromptEnvelope,
@@ -91,12 +92,12 @@ export function assertProviderTurnContractFrameOrder(): void {
     generatedArtifactCount: 0,
   });
   assert(
-    String(planningContract.nextActionInstruction.summary ?? '').includes('output that proposal now; do not narrate or debate whether to read more context'),
-    'planning provider turn tells the model to produce the proposal instead of debating reads'
+    String(planningContract.nextActionInstruction.summary ?? '').includes('Use exactly one registered planning semantic tool'),
+    'planning provider turn requires one Session semantic directive'
   );
   assert(
-    String(planningContract.nextActionInstruction.summary ?? '').includes('blocking user choice prevents any valid taskPlan'),
-    'planning provider turn keeps decisionRequest behind blocking choices'
+    String(planningContract.nextActionInstruction.summary ?? '').includes('session.request_decision only when a blocking user choice'),
+    'planning provider turn keeps decision requests behind blocking choices'
   );
   assert(
     String(planningContract.nextActionInstruction.summary ?? '').includes('do not re-audit protocol rules, permission gates, resource policy'),
@@ -583,7 +584,7 @@ export function assertProviderTurnSnapshotRecordsContextAdmissionShape(): void {
   assert(accessSummary.includes(`ref=file-${token}.txt`), 'provider turn access index records resource identity');
   assert(accessSummary.includes('range=full-or-directory'), 'provider turn access index records resource range identity');
   assert(accessSummary.includes('use=file text is available'), 'provider turn access index records file text reuse instruction');
-  assert(accessSummary.includes('use=directory inventory is available for existence checks and taskPlan targets'), 'provider turn access index uses shared directory inventory reuse instruction');
+  assert(accessSummary.includes('use=directory inventory is available for existence checks and plan targets'), 'provider turn access index uses shared directory inventory reuse instruction');
   assert(accessSummary.includes(`currentTaskEvidence target=file-${token}.txt`), 'provider turn access index records current task target coverage');
   assert(accessSummary.includes(`currentTaskEvidence target=dir-${token}/child-${token}.txt`), 'provider turn access index records directory inventory target coverage');
   assert(accessSummary.includes('covered=true'), 'provider turn access index marks covered current task target');
@@ -660,6 +661,11 @@ export function assertProviderTurnSnapshotRecordsContextAdmissionShape(): void {
   assertEqual(snapshot.dynamicDialogueFrameTextOccurrences >= 1, true, 'provider turn snapshot counts dynamic dialogue text in provider contract frames');
   assertEqual(snapshot.finalUserPromptHash.length > 0, true, 'provider turn snapshot records final user prompt hash');
   assertEqual(snapshot.finalUserPromptCharLength > snapshot.dynamicSuffixCharLength, true, 'provider turn snapshot records rendered contract appended to dynamic prompt');
+  assertEqual(snapshot.semanticProfileId, 'execution-v1', 'provider turn snapshot records the stable semantic profile');
+  assertEqual(snapshot.systemHash.length > 0, true, 'provider turn snapshot records the effective system hash');
+  assertEqual(snapshot.toolSchemaHash.length > 0, true, 'provider turn snapshot records the stable tool schema hash');
+  assertEqual(snapshot.responseFormatHash.length > 0, true, 'provider turn snapshot records the response shape hash');
+  assertEqual(snapshot.messageShapeHash.length > 0, true, 'provider turn snapshot records the message shape hash');
 
   const finalUserPrompt = renderProviderTurnUserPrompt(contract.prompt.dynamicSuffix, contract);
   assertEqual(
@@ -668,8 +674,12 @@ export function assertProviderTurnSnapshotRecordsContextAdmissionShape(): void {
     'provider user prompt renders DynamicDialogue text once and references it from the contract'
   );
   assert(
-    finalUserPrompt.includes('"summaryRef": "dynamicSuffix"'),
-    'provider user prompt uses summaryRef for DynamicDialogue content already present in dynamic suffix'
+    finalUserPrompt.includes('"dynamicContentIncludedOnce": true'),
+    'provider user prompt records that dynamic content is rendered once'
+  );
+  assert(
+    finalUserPrompt.includes('"frameOrder"'),
+    'provider user prompt carries frame order without duplicating frame summaries'
   );
 }
 
@@ -710,6 +720,24 @@ export function assertTaskLocalCompactRecordFlowsThroughCheckpoints(): void {
   assertEqual(compact.taskLocalFoldPlanHash, context.contextAssembly.taskLocalFoldPlanHash, 'task-local compact record points to fold plan');
   assertEqual(compact.foldablePolicies.includes('dropAfterTask'), true, 'task-local compact record preserves foldable policy');
   assertEqual(compact.compactHash.length > 0, true, 'task-local compact record has stable hash');
+
+  const compactVariant = {
+    ...compact,
+    taskId: `task-variant-${token}`,
+    compactHash: `compact-variant-${token}`,
+  };
+  const appended = appendTaskLocalCompactRecord([compact], compactVariant, 2);
+  assertEqual(appended.length, 2, 'task-local compact record append preserves bounded history');
+  const deduplicated = appendTaskLocalCompactRecord(appended, compact, 2);
+  assertEqual(deduplicated.length, 2, 'task-local compact record append deduplicates repeated hashes');
+  assertEqual(deduplicated.at(-1)?.compactHash, compact.compactHash, 'task-local compact record append keeps the newest record last');
+  const limited = appendTaskLocalCompactRecord(deduplicated, {
+    ...compact,
+    taskId: `task-limited-${token}`,
+    compactHash: `compact-limited-${token}`,
+  }, 2);
+  assertEqual(limited.length, 2, 'task-local compact record append evicts records beyond the limit');
+  assertEqual(limited.some((record) => record.compactHash === compactVariant.compactHash), false, 'task-local compact record append evicts the oldest record');
 
   const accepted: AcceptedImplementationPlanContext = {
     planId: `plan-${token}`,
@@ -999,6 +1027,59 @@ export function assertTaskLocalCompactRecordFlowsThroughCheckpoints(): void {
   const previousBlock = foldedAssembly.contextAssembly.resourceBlocks.find((block) => block.displayRef === previousPath);
   assertEqual(currentBlock?.retention, 'full', 'task-local compaction keeps current task target full text');
   assertEqual(previousBlock?.retention, 'summary', 'task-local compaction folds non-current task full text to summary');
+
+  const workspaceRoot = `/workspace-${token}`;
+  const absoluteTargetAssembly = assembleContext({
+    workflowState: 'acceptedTaskExecution',
+    allowedProposals: ['actionBundle', 'resourceRequest', 'taskOutcome', 'diagnostic'],
+    capabilityCatalogSummary: 'fs.write',
+    userRequest: `absolute target ${token}`,
+    initialContext: {
+      id: `absolute-target-context-${token}`,
+      workspaceScopeKey: `workspace-${token}`,
+      manifest: foldManifest,
+    },
+    conversationRoots: [{
+      rootId: `root-${token}`,
+      kind: 'directory',
+      label: `Root ${token}`,
+      displayPath: workspaceRoot,
+      absolutePath: workspaceRoot,
+      source: 'workspaceBinding',
+      primary: true,
+    }],
+    resourcePackets: [foldPacket],
+    currentTaskContext: {
+      taskId: `absolute-target-task-${token}`,
+      targets: [`${workspaceRoot}/${currentPath}`],
+    },
+    taskLocalCompactRecords: [compact],
+  });
+  const absoluteTargetCurrentBlock = absoluteTargetAssembly.contextAssembly.resourceBlocks.find((block) => block.displayRef === currentPath);
+  const absoluteTargetPreviousBlock = absoluteTargetAssembly.contextAssembly.resourceBlocks.find((block) => block.displayRef === previousPath);
+  assertEqual(absoluteTargetCurrentBlock?.retention, 'full', 'task-local compaction matches absolute task targets to relative resource references');
+  assertEqual(absoluteTargetPreviousBlock?.retention, 'summary', 'task-local compaction still folds unrelated resources for an absolute task target');
+
+  const requestedDependencyAssembly = assembleContext({
+    workflowState: 'acceptedTaskExecution',
+    allowedProposals: ['actionBundle', 'resourceRequest', 'taskOutcome', 'diagnostic'],
+    capabilityCatalogSummary: 'fs.write',
+    userRequest: `requested dependency ${token}`,
+    initialContext: {
+      id: `requested-dependency-context-${token}`,
+      workspaceScopeKey: `workspace-${token}`,
+      manifest: foldManifest,
+    },
+    resourcePackets: [foldPacket],
+    currentTaskContext: {
+      taskId: `requested-dependency-task-${token}`,
+      targets: [`generated/new-${token}.txt`],
+    },
+    currentTaskResourcePacketIds: [foldPacket.id],
+    taskLocalCompactRecords: [compact],
+  });
+  const requestedDependencyBlock = requestedDependencyAssembly.contextAssembly.resourceBlocks.find((block) => block.displayRef === previousPath);
+  assertEqual(requestedDependencyBlock?.retention, 'full', 'task-local compaction keeps a dependency packet explicitly requested by the current task');
 
   const noTargetAssembly = assembleContext({
     workflowState: 'acceptedTaskExecution',
@@ -1329,10 +1410,31 @@ export async function assertProviderTurnContextCoordinatorScopesAcceptedExecutio
     generatedArtifactEvidence: new Map(),
     acceptedImplementationPlan: {
       planId: `plan-${token}`,
+      runId: `run-${token}`,
       title: `Plan ${token}`,
       summary: `Summary ${token}`,
-      tasks: [{ taskId: `task-${token}` }],
+      tasks: [{
+        taskId: `task-${token}`,
+        title: `Task ${token}`,
+        capability: 'fs.write',
+        targets: [`target-${token}.txt`],
+        dependencies: [],
+        conflictKeys: [],
+      }],
+      capabilities: ['fs.write'],
+      targetScopes: [`target-${token}.txt`],
+      exactOperationGrants: [{
+        operation: 'write',
+        targetPath: `target-${token}.txt`,
+        targetResourceKind: 'file',
+        capability: 'fs.write',
+        sourceTaskId: `task-${token}`,
+        source: 'kernelPlanReview',
+      }],
+      accessScopes: [],
+      batchIndex: 1,
       completedTaskIds: [],
+      rawPlan: {},
     },
     currentTaskContext: {
       taskId: `task-${token}`,
@@ -1353,23 +1455,23 @@ export async function assertProviderTurnContextCoordinatorScopesAcceptedExecutio
 
   assertEqual(result.allowedProposals.join(','), expectedExecutionKinds.join(','), 'accepted execution exposes only execution proposal kinds');
   assertEqual(result.modelContextBundle.providerTurnContract.allowedKinds.join(','), expectedExecutionKinds.join(','), 'accepted execution provider contract ignores stale planning and answer kinds');
-  assert(dynamicPrompt.includes('Current schema digest covers only: actionBundle, resourceRequest, decisionRequest, taskOutcome, diagnostic'), 'accepted execution prompt schema digest ignores stale planning and answer kinds');
-  assertEqual(dynamicPrompt.includes('Current schema digest covers only: answer'), false, 'accepted execution prompt schema digest does not expose answer');
+  assert(result.modelContextBundle.prompt.stablePrefix.includes('Session semantic profile: execution-v1'), 'accepted execution selects the stable execution semantic profile');
+  assert(!dynamicPrompt.includes('Execution uses provider-native Session semantic tools'), 'accepted execution dynamic prompt does not repeat the semantic tool profile');
+  assertEqual(dynamicPrompt.includes('session.submit_answer'), false, 'accepted execution prompt does not expose planning answer tools');
   assertEqual(assemblyCapabilitySummary.includes(fullCatalogMarker), false, 'accepted execution does not pass the full capability catalog into ContextAdmission');
-  assert(assemblyCapabilitySummary.includes('Accepted execution task tool intent summary.'), 'accepted execution passes a scoped capability summary');
-  assert(assemblyCapabilitySummary.includes('currentTaskCapabilities=fs.write, process.exec'), 'scoped summary records current task capabilities');
-  assert(assemblyCapabilitySummary.includes(`currentTaskTargets=target-${token}.txt`), 'scoped summary records current task targets');
-  assert(assemblyCapabilitySummary.includes('toolId=fs.write'), 'scoped summary keeps executable current task template');
-  assert(assemblyCapabilitySummary.includes('toolId=process.exec'), 'scoped summary keeps blocked current task command intent for Kernel permission handling');
+  assert(assemblyCapabilitySummary.includes('Accepted execution Session directive summary.'), 'accepted execution passes a scoped Session directive summary');
+  assert(assemblyCapabilitySummary.includes(`slotId=slot-task-${token}-1`), 'scoped summary records the current IntentSlot');
+  assert(assemblyCapabilitySummary.includes(`targetRef=target-${token}.txt`), 'scoped summary records current slot target ownership');
+  assertEqual(assemblyCapabilitySummary.includes('toolId='), false, 'scoped summary does not expose internal tool ids');
   assertEqual(dynamicPrompt.includes(fullCatalogMarker), false, 'accepted execution dynamic prompt does not expose full capability catalog');
   assertEqual(renderedContract.includes(fullCatalogMarker), false, 'accepted execution provider contract does not expose full capability catalog');
   assertEqual(renderedContract.includes('browser.click'), false, 'accepted execution provider contract does not enumerate unrelated Kernel catalog tool ids');
-  assert(renderedContract.includes('"toolId":"process.exec"'), 'accepted execution provider contract exposes blocked process intent as a Kernel-gated current task template');
+  assertEqual(renderedContract.includes('"toolId"'), false, 'accepted execution provider contract does not expose Kernel tool ids');
   assert(
-    renderedContract.includes('current task boundary'),
-    'accepted execution schema points action tool selection at current task templates'
+    renderedContract.includes('IntentSlot'),
+    'accepted execution contract exposes current IntentSlot metadata'
   );
-  assert(dynamicPrompt.includes('Current accepted task tool intent scope:'), 'accepted execution workflow state labels scoped tool intent');
+  assert(dynamicPrompt.includes('Current accepted task IntentSlot scope:'), 'accepted execution workflow state labels IntentSlot scope');
 }
 
 export async function assertProviderTurnContextCoordinatorFiltersUnscopedGrantsToCurrentTask(): Promise<void> {
@@ -1425,12 +1527,15 @@ export async function assertProviderTurnContextCoordinatorFiltersUnscopedGrantsT
     generatedArtifactEvidence: new Map(),
     acceptedImplementationPlan: {
       planId: `plan-${token}`,
+      runId: `run-${token}`,
       title: `Plan ${token}`,
       summary: `Summary ${token}`,
       tasks: [
-        { taskId: `task-current-${token}`, targets: [currentTarget] },
-        { taskId: `task-future-${token}`, targets: [futureTarget] },
+        { taskId: `task-current-${token}`, targets: [currentTarget], dependencies: [], conflictKeys: [] },
+        { taskId: `task-future-${token}`, targets: [futureTarget], dependencies: [], conflictKeys: [] },
       ],
+      capabilities: ['fs.write'],
+      targetScopes: [currentTarget, futureTarget],
       completedTaskIds: [],
       exactOperationGrants: [
         {
@@ -1446,6 +1551,9 @@ export async function assertProviderTurnContextCoordinatorFiltersUnscopedGrantsT
           source: 'kernelPlanReview',
         },
       ],
+      accessScopes: [],
+      batchIndex: 1,
+      rawPlan: {},
     },
     currentTaskContext: {
       taskId: `task-current-${token}`,
@@ -1463,16 +1571,17 @@ export async function assertProviderTurnContextCoordinatorFiltersUnscopedGrantsT
 
   const contract = result.modelContextBundle.providerTurnContract;
   const renderedContract = JSON.stringify(contract);
-  assert(assemblyCapabilitySummary.includes(`path=${currentTarget}`), 'current task scoped grant remains visible');
+  assert(assemblyCapabilitySummary.includes(`targetRef=${currentTarget}`), 'current task scoped grant remains visible as an IntentSlot');
   assertEqual(assemblyCapabilitySummary.includes(futureTarget), false, 'future task unscoped grant is hidden from current task summary');
   assert(renderedContract.includes(currentTarget), 'provider contract keeps the current target template');
   assertEqual(renderedContract.includes(futureTarget), false, 'provider contract does not expose future task target templates');
-  assertEqual(contract.toolIntentTemplates.length, 1, 'only current task matching unscoped grant becomes a tool template');
+  assertEqual(contract.toolIntentTemplates.length, 1, 'only current task matching unscoped grant becomes an IntentSlot');
   assertEqual(
-    (contract.toolIntentTemplates[0]?.template as any)?.args?.path,
+    contract.toolIntentTemplates[0]?.targets[0],
     currentTarget,
-    'current task template path is exact'
+    'current task IntentSlot target is exact'
   );
+  assertEqual((contract.toolIntentTemplates[0]?.template as any)?.contentMode, 'full', 'current write slot declares full-content mode');
 }
 
 export async function assertRequirementConfirmationRecordsModelContextBundle(): Promise<void> {

@@ -3,7 +3,8 @@ import type {
   LlmChatRequest,
   ProjectionDelta,
 } from '@deepcode/protocol';
-import type { ProposalEnvelope, ResourceManifest, ResourcePacket } from '../index.js';
+import type { ResourceManifest, ResourcePacket } from '../context/types.js';
+import type { ProposalEnvelope } from '../protocol/types.js';
 import {
   NativeToolExposurePolicy,
   NativeToolHandlerPortsFactory,
@@ -18,6 +19,8 @@ import {
   ProposalOnlyProviderRunner,
 } from '../driver/pipelines/index.js';
 import { assert, assertEqual, randomSmokeToken } from './smokeHelpers.js';
+import { ProviderProfileRegistry } from '../provider/ProviderProfileRegistry.js';
+import { SessionSemanticToolAdapter } from '../provider/SessionSemanticToolAdapter.js';
 
 export function assertNativeToolRepairCoordinatorBuildsRepairContracts(): void {
   const token = randomSmokeToken('native-repair');
@@ -96,7 +99,6 @@ export function assertNativeToolRepairCoordinatorBuildsRepairContracts(): void {
   assertEqual(coordinator.parseDuplicateRepair({ raw: '{}', runId, sessionId }).kind, 'resourceRequest', 'native tool repair coordinator parses duplicate repair with focused kinds');
   assertEqual(coordinator.parseProposalOnlyRepair({ raw: '{}', runId, sessionId }).kind, 'actionBundle', 'native tool repair coordinator parses proposal-only repair with executable kinds');
 }
-
 export function assertNativeToolProjectionBuilderBuildsDeltas(): void {
   const token = randomSmokeToken('native-projection');
   const runId = `run-${token}`;
@@ -342,7 +344,7 @@ export function assertNativeToolResumeMessageBuilderAppendsToolMessages(): void 
   const toolCall = {
     callId: `call-${token}`,
     index: 0,
-    name: `read_${randomSmokeToken('tool')}`,
+    name: `tool-${token}`,
     arguments: { path: `scope-${token}/target-${randomSmokeToken('target')}.txt` },
   };
   const builder = new NativeToolResumeMessageBuilder({
@@ -392,8 +394,8 @@ export function assertNativeToolExposurePolicySuppressesPlanningReadToolsAfterEv
       providerTurnFrame: planningFrame,
       resourcePackets: [{ id: `packet-${token}` } as ResourcePacket],
     }, tools).length,
-    0,
-    'planning native read tools are hidden when current ResourceEvidence is already available'
+    tools.length,
+    'provider profile tools remain stable when ResourceEvidence is appended'
   );
   assertEqual(
     policy.providerTools({
@@ -412,59 +414,303 @@ export function assertNativeToolExposurePolicySuppressesPlanningReadToolsAfterEv
     tools.length,
     'accepted execution does not inherit the planning native read tool suppression'
   );
+
+  const profiles = new ProviderProfileRegistry();
+  const planning = profiles.profile('planning-v1');
+  const execution = profiles.profile('execution-v1');
+  assert(planning.tools.length > 0, 'planning profile registers provider-native Session tools');
+  assert(execution.tools.length > 0, 'execution profile registers provider-native Session tools');
+  assert(
+    [...planning.tools, ...execution.tools].every((tool) => tool.name.startsWith('session.')),
+    'provider-facing profile exposes only Session semantic tools'
+  );
+  assert(
+    [...planning.tools, ...execution.tools].every((tool) => !['fs.write', 'fs.patch', 'fs.delete'].includes(tool.name)),
+    'provider-facing profile does not expose Kernel file tool ids'
+  );
+  assertEqual(
+    profiles.profile('planning-v1').toolSchemaHash,
+    planning.toolSchemaHash,
+    'planning profile tool schema hash is stable'
+  );
+  const artifactTool = execution.tools.find((tool) => tool.name === 'session.submit_task_artifacts');
+  const outcomeTool = execution.tools.find((tool) => tool.name === 'session.complete_current_task');
+  assertEqual(Boolean((artifactTool?.inputSchema as any)?.properties?.taskId), false, 'artifact semantic tool binds the current task in Session instead of asking the provider for taskId');
+  assertEqual(Boolean((outcomeTool?.inputSchema as any)?.properties?.taskId), false, 'task outcome semantic tool binds the current task in Session instead of asking the provider for taskId');
+
+  const adapter = new SessionSemanticToolAdapter(profiles);
+  const planProposal = adapter.proposal({
+    sessionId: `session-${token}`,
+    runId: `run-${token}`,
+    providerTurnFrame: { turnMode: 'planning' } as any,
+  }, {
+    callId: `plan-call-${token}`,
+    index: 0,
+    name: 'session.submit_plan',
+    arguments: {
+      title: `title-${token}`,
+      summary: `summary-${token}`,
+      tasks: [{
+        taskId: `task-${token}`,
+        title: `task-title-${token}`,
+        operation: 'replaceFile',
+        targets: [`scope-${token}/target.txt`],
+        acceptanceCriteria: [`accept-${token}`],
+        failureCriteria: [`fail-${token}`],
+      }],
+    },
+  });
+  assertEqual(planProposal?.kind, 'taskPlan', 'planning semantic tool admits a taskPlan proposal');
+  assertEqual((planProposal?.payload as any).tasks[0].capability, 'fs.write', 'Session maps semantic plan operation to its internal capability');
+
+  const deleteTarget = `scope-${token}/obsolete`;
+  const deletePlan = {
+    planId: `delete-plan-${token}`,
+    runId: `run-${token}`,
+    tasks: [{
+      taskId: `delete-task-${token}`,
+      title: `delete-title-${token}`,
+      capability: 'fs.delete',
+      targets: [deleteTarget],
+      dependencies: [],
+      conflictKeys: [],
+    }],
+    capabilities: ['fs.delete'],
+    targetScopes: [deleteTarget],
+    exactOperationGrants: [{
+      operation: 'delete',
+      targetPath: deleteTarget,
+      targetResourceKind: 'directory',
+      recursive: true,
+      capability: 'fs.delete',
+      sourceTaskId: `delete-task-${token}`,
+      source: 'kernelPlanReview',
+    }],
+    accessScopes: [],
+    batchIndex: 1,
+    completedTaskIds: [],
+    rawPlan: {},
+  } as any;
+  const deterministic = adapter.deterministicCurrentTask({
+    sessionId: `session-${token}`,
+    runId: `run-${token}`,
+    acceptedImplementationPlan: deletePlan,
+    providerTurnFrame: { turnMode: 'acceptedTaskExecution' } as any,
+  });
+  assertEqual(deterministic?.kind, 'actionBundle', 'exact accepted delete task compiles without a provider payload');
+  assertEqual((deterministic?.payload as any).actionBundle.actions[0].args.path, deleteTarget, 'deterministic delete keeps the accepted normalized target');
+
+  const unscopedGrant = {
+    ...deletePlan.exactOperationGrants[0],
+    sourceTaskId: undefined,
+  };
+  const singleUntargeted = adapter.deterministicCurrentTask({
+    sessionId: `session-single-${token}`,
+    runId: `run-single-${token}`,
+    acceptedImplementationPlan: {
+      ...deletePlan,
+      tasks: [{ ...deletePlan.tasks[0], targets: [] }],
+      exactOperationGrants: [unscopedGrant],
+    },
+    providerTurnFrame: { turnMode: 'acceptedTaskExecution' } as any,
+  });
+  assertEqual(singleUntargeted?.kind, 'actionBundle', 'one incomplete untargeted task can consume its unambiguous exact operation grant');
+  const ambiguousUntargeted = adapter.deterministicCurrentTask({
+    sessionId: `session-ambiguous-${token}`,
+    runId: `run-ambiguous-${token}`,
+    acceptedImplementationPlan: {
+      ...deletePlan,
+      tasks: [
+        { ...deletePlan.tasks[0], taskId: `delete-a-${token}`, targets: [] },
+        { ...deletePlan.tasks[0], taskId: `delete-b-${token}`, targets: [] },
+      ],
+      exactOperationGrants: [unscopedGrant],
+    },
+    providerTurnFrame: { turnMode: 'acceptedTaskExecution' } as any,
+  });
+  assertEqual(ambiguousUntargeted, undefined, 'multiple untargeted tasks do not guess ownership of an unscoped exact operation grant');
+
+  const writeTarget = `scope-${token}/generated.txt`;
+  const writeTaskId = `write-task-${token}`;
+  const writePlan = {
+    ...deletePlan,
+    planId: `write-plan-${token}`,
+    tasks: [{
+      taskId: writeTaskId,
+      title: `write-title-${token}`,
+      capability: 'fs.write',
+      semanticOperation: 'createFile',
+      targets: [writeTarget],
+      dependencies: [],
+      conflictKeys: [],
+    }],
+    capabilities: ['fs.write'],
+    targetScopes: [writeTarget],
+    exactOperationGrants: [{
+      operation: 'write',
+      targetPath: writeTarget,
+      targetResourceKind: 'file',
+      capability: 'fs.write',
+      sourceTaskId: writeTaskId,
+      source: 'kernelPlanReview',
+    }],
+  } as any;
+  const artifact = adapter.proposal({
+    sessionId: `session-${token}`,
+    runId: `run-${token}`,
+    acceptedImplementationPlan: writePlan,
+    providerTurnFrame: { turnMode: 'acceptedTaskExecution', allowedKinds: ['actionBundle'] } as any,
+  }, {
+    callId: `artifact-call-${token}`,
+    index: 0,
+    name: 'session.submit_task_artifacts',
+    arguments: {
+      summary: `artifact-summary-${token}`,
+      artifacts: [{
+        slotId: `slot-${writeTaskId}-1`,
+        contentLines: [`content-${token}`],
+      }],
+    },
+  });
+  assertEqual((artifact?.payload as any).actionBundle.actions[0].toolId, 'fs.write', 'Session compiles artifact slots into the internal Kernel action DTO');
+  assertEqual(
+    (artifact?.payload as any).actionBundle.actions[0].sourceBlockId,
+    (artifact?.payload as any).actionBundle.actions[0].args.sourceBlockId,
+    'compiled write action keeps Session validation and Kernel command block references aligned'
+  );
+  assertEqual((artifact?.payload as any).codeBlocks[0].targetPath, writeTarget, 'artifact compilation keeps target ownership in Session');
+  assertEqual((artifact?.payload as any).codeBlocks[0].operation, 'create', 'accepted createFile intent is not downgraded to overwrite by a generic fs.write grant');
+  const outcome = adapter.proposal({
+    sessionId: `session-${token}`,
+    runId: `run-${token}`,
+    acceptedImplementationPlan: writePlan,
+    providerTurnFrame: { turnMode: 'acceptedTaskExecution', allowedKinds: ['taskOutcome'] } as any,
+  }, {
+    callId: `outcome-call-${token}`,
+    index: 0,
+    name: 'session.complete_current_task',
+    arguments: { reason: `sufficient-${token}` },
+  });
+  assertEqual((outcome?.payload as any).taskId, writeTaskId, 'Session binds task outcomes to the active accepted task');
 }
 
-export async function assertNativeToolProviderLoopResumesAfterToolMessages(): Promise<void> {
+export async function assertNativeToolProviderLoopAdmitsSemanticProposalWithoutNestedResume(): Promise<void> {
   const token = randomSmokeToken('native-loop');
-  const sessionId = `session-${token}`;
-  const runId = `run-${token}`;
-  const toolCall = {
-    callId: `call-${token}`,
-    index: 0,
-    name: `read_${randomSmokeToken('tool')}`,
-    arguments: { path: `scope-${token}/target-${randomSmokeToken('target')}.txt` },
-  };
-  const turns = [
-    { content: `assistant-${token}`, reasoning: '', toolCalls: [toolCall] },
-    { content: `final-${token}`, reasoning: '', toolCalls: [] },
-  ];
+  const toolName = `tool-${token}`;
+  const proposal = {
+    schemaVersion: 'deepcode.agent.protocol.v3',
+    proposalId: `proposal-${token}`,
+    runId: `run-${token}`,
+    sessionId: `session-${token}`,
+    source: 'llm',
+    kind: 'answer',
+    payload: { format: 'markdown', content: `answer-${token}` },
+  } as ProposalEnvelope;
   const stages: string[] = [];
   const messageCounts: number[] = [];
-  const guidanceStages: string[] = [];
-  const handlerPorts = { marker: token } as any;
   const loop = new NativeToolProviderLoop<any, string, any>({
     providerPipeline: {
-      messages: () => [{ role: 'system', content: `system-${token}` }],
+      messages: () => [
+        { role: 'system', content: `system-${token}` },
+        { role: 'user', content: `user-${token}` },
+      ],
       runWithNativeTools: async (request: any) => {
         stages.push(request.stage);
         messageCounts.push(request.messages.length);
-        assertEqual(request.options.tools[0].name, `tool-${token}`, 'native tool provider loop forwards provider tools');
+        assertEqual(request.options.tools[0].name, toolName, 'semantic provider loop forwards the registered profile tools');
+        return {
+          content: '',
+          reasoning: '',
+          toolCalls: [{
+            callId: `call-${token}`,
+            index: 0,
+            name: toolName,
+            arguments: { content: `answer-${token}` },
+          }],
+        };
+      },
+    },
+    turnHandler: {
+      handle: async () => ({ kind: 'proposal', proposal }),
+    },
+  });
+  const state = {
+    sessionId: proposal.sessionId,
+    runId: proposal.runId,
+    userRequest: `request-${token}`,
+  };
+  const result = await loop.run({
+    profileId: 'planning-v1',
+    state,
+    prompt: `prompt-${token}`,
+    contract: {} as any,
+    providerTools: [{ name: toolName } as any],
+    handlerPorts: {} as any,
+    runTurn: async () => {
+      throw new Error('semantic provider loop smoke uses the fake provider pipeline');
+    },
+    isEmptyResponseError: () => false,
+    semanticDirectiveError: () => undefined,
+  });
+  assertEqual((result as ProposalEnvelope).proposalId, proposal.proposalId, 'semantic callback returns the admitted proposal directly');
+  assertEqual(stages.join(','), 'provider_call', 'semantic callback does not create a nested provider tool resume stage');
+  assertEqual(messageCounts[0], 2, 'semantic provider call uses the fixed ContextAdmission message shape');
+}
+
+export async function assertNativeToolProviderLoopRetriesInvalidSemanticDirectiveInSameProfile(): Promise<void> {
+  const token = randomSmokeToken('semantic-retry');
+  const profiles = new ProviderProfileRegistry();
+  const adapter = new SessionSemanticToolAdapter(profiles);
+  const providerTools = [...profiles.profile('planning-v1').tools];
+  const turns = [
+    {
+      content: '',
+      reasoning: '',
+      toolCalls: [{
+        callId: `invalid-${token}`,
+        index: 0,
+        name: 'session.submit_answer',
+        arguments: {},
+      }],
+    },
+    {
+      content: '',
+      reasoning: '',
+      toolCalls: [{
+        callId: `valid-${token}`,
+        index: 0,
+        name: 'session.submit_answer',
+        arguments: { content: `answer-${token}` },
+      }],
+    },
+  ];
+  const messageCounts: number[] = [];
+  const toolHashes: string[] = [];
+  const loop = new NativeToolProviderLoop<any, string, any>({
+    providerPipeline: {
+      messages: () => [
+        { role: 'system', content: `system-${token}` },
+        { role: 'user', content: `user-${token}` },
+      ],
+      runWithNativeTools: async (request: any) => {
+        messageCounts.push(request.messages.length);
+        toolHashes.push(JSON.stringify(request.options.tools));
         return turns.shift();
       },
     },
     turnHandler: {
-      handle: async (request: any) => {
-        assertEqual(request.round, 0, 'native tool provider loop starts handler at round zero');
-        assertEqual(request.ports, handlerPorts, 'native tool provider loop forwards handler ports');
-        return {
-          kind: 'resume',
-          toolMessages: [{ role: 'tool', toolCallId: toolCall.callId, content: `tool-result-${token}` }],
-        };
+      handle: async ({ state, turn }: any) => {
+        const proposal = adapter.proposal(state, turn.toolCalls[0]);
+        if (!proposal) throw new Error('Expected a registered Session semantic directive.');
+        return { kind: 'proposal', proposal };
       },
     },
-    resumeMessageBuilder: {
-      nextMessages: (currentMessages: LlmChatRequest['messages'], turn: any, toolMessages: LlmChatRequest['messages']) => [
-        ...currentMessages,
-        { role: 'assistant', content: turn.content },
-        ...toolMessages,
-      ],
-    },
   });
-
-  const state = {
-    sessionId,
-    runId,
+  const state: any = {
+    sessionId: `session-${token}`,
+    runId: `run-${token}`,
     userRequest: `request-${token}`,
+    providerTurnFrame: { turnMode: 'planning', allowedKinds: ['answer'] },
     manifest: {
       id: `manifest-${token}`,
       workspaceScopeKey: `scope-${token}`,
@@ -476,142 +722,161 @@ export async function assertNativeToolProviderLoopResumesAfterToolMessages(): Pr
     nativeToolReadLedger: new Map(),
     nativeToolDuplicateRepairAttempted: false,
   };
-  const loopInput = {
-    profileId: `profile-${token}`,
+  const input = {
+    profileId: 'planning-v1',
+    state,
+    prompt: `prompt-${token}`,
+    contract: state.providerTurnFrame as any,
+    providerTools,
+    handlerPorts: {} as any,
+    runTurn: async () => {
+      throw new Error('Semantic retry smoke uses the fake provider pipeline.');
+    },
+    isEmptyResponseError: () => false,
+    semanticDirectiveError: () => undefined,
+  };
+
+  const retry = await loop.run(input);
+  assertEqual((retry as any).kind, 'providerResume', 'invalid semantic directive schedules one same-profile retry');
+  assert(String(state.semanticDirectiveErrorSummary ?? '').includes('argumentsHash='), 'semantic retry records a bounded ErrorContext summary');
+  const proposal = await loop.run(input);
+  assertEqual((proposal as ProposalEnvelope).kind, 'answer', 'valid same-profile retry returns the semantic proposal');
+  assertEqual(messageCounts.join(','), '2,2', 'semantic retry keeps the two-message ContextAdmission topology');
+  assertEqual(toolHashes[0], toolHashes[1], 'semantic retry keeps the provider tool schema and order stable');
+  assertEqual(state.semanticDirectiveErrorSummary, undefined, 'successful semantic retry clears transient ErrorContext state');
+}
+
+export async function assertNativeToolProviderLoopRetriesMalformedArgumentsInSameProfile(): Promise<void> {
+  const token = randomSmokeToken('semantic-json-retry');
+  const proposal = {
+    schemaVersion: 'deepcode.agent.protocol.v3',
+    proposalId: `proposal-${token}`,
+    runId: `run-${token}`,
+    sessionId: `session-${token}`,
+    source: 'llm',
+    kind: 'answer',
+    payload: { format: 'markdown', content: `answer-${token}` },
+  } as ProposalEnvelope;
+  let calls = 0;
+  const loop = new NativeToolProviderLoop<any, string, any>({
+    providerPipeline: {
+      messages: () => [
+        { role: 'system', content: `system-${token}` },
+        { role: 'user', content: `user-${token}` },
+      ],
+      runWithNativeTools: async () => {
+        calls += 1;
+        if (calls === 1) {
+          throw Object.assign(new Error(`malformed-arguments-${token}`), {
+            code: 'native_tool_arguments_invalid',
+          });
+        }
+        return {
+          content: '',
+          reasoning: '',
+          toolCalls: [{
+            callId: `valid-${token}`,
+            index: 0,
+            name: 'session.submit_answer',
+            arguments: { content: `answer-${token}` },
+          }],
+        };
+      },
+    },
+    turnHandler: {
+      handle: async () => ({ kind: 'proposal', proposal }),
+    },
+  });
+  const state: any = {
+    sessionId: proposal.sessionId,
+    runId: proposal.runId,
+    userRequest: `request-${token}`,
+  };
+  const input = {
+    profileId: 'planning-v1',
     state,
     prompt: `prompt-${token}`,
     contract: {} as any,
-    providerTools: [{ name: `tool-${token}` } as any],
-    handlerPorts,
+    providerTools: [{ name: 'session.submit_answer' } as any],
+    handlerPorts: {} as any,
     runTurn: async () => {
-      throw new Error('native tool provider loop test uses fake provider pipeline');
+      throw new Error('Malformed argument retry smoke uses the fake provider pipeline.');
     },
     isEmptyResponseError: () => false,
-    consumeGuidanceMessages: async (_state: any, stage: string): Promise<LlmChatRequest['messages']> => {
-      guidanceStages.push(stage);
-      return [{ role: 'user', content: `guidance-${token}` }];
+    semanticDirectiveError: (error: unknown) => {
+      const record = error as { code?: string; message?: string };
+      return record.code === 'native_tool_arguments_invalid'
+        ? { code: record.code, message: record.message ?? '' }
+        : undefined;
     },
   };
-  const first = await loop.run(loopInput);
-  assertEqual((first as { kind?: string }).kind, 'providerResume', 'native tool provider step yields control after tool handling');
-  const result = await loop.run(loopInput);
 
-  assertEqual(result, `final-${token}`, 'native tool provider step returns final content after RunEngine resumes it');
-  assertEqual(stages.join(','), 'provider_call,provider_tool_resume_1', 'native tool provider steps preserve resume stage names');
-  assertEqual(guidanceStages[0], 'provider_call', 'native tool provider loop consumes guidance after tool handling');
-  assertEqual(messageCounts[0], 1, 'native tool provider loop starts from provider messages');
-  assertEqual(messageCounts[1], 4, 'native tool provider loop resumes with assistant, tool, and guidance messages');
+  const retry = await loop.run(input);
+  assertEqual((retry as any).kind, 'providerResume', 'malformed semantic tool JSON schedules one same-profile retry');
+  assert(String(state.semanticDirectiveErrorSummary).includes('native_tool_arguments_invalid'), 'malformed argument retry records bounded ErrorContext');
+  const repaired = await loop.run(input);
+  assertEqual((repaired as ProposalEnvelope).proposalId, proposal.proposalId, 'valid retry returns the current semantic proposal');
+  assertEqual(calls, 2, 'malformed argument repair performs exactly one additional provider turn');
 }
 
 export async function assertNativeToolHandlerPortsFactoryBuildsPorts(): Promise<void> {
-  const token = randomSmokeToken('native-ports');
+  const token = randomSmokeToken('semantic-ports');
   const sessionId = `session-${token}`;
   const runId = `run-${token}`;
-  const targetPath = `scope-${token}/target-${randomSmokeToken('target')}.txt`;
-  const toolCall = {
-    callId: `call-${token}`,
-    index: 0,
-    name: `read_${randomSmokeToken('tool')}`,
-    arguments: { path: targetPath },
-  };
-  const packet: ResourcePacket = {
-    id: `packet-${token}`,
-    requestId: `request-${token}`,
-    workspaceScopeKey: `scope-${token}`,
-    items: [],
-  };
-  const state = {
-    sessionId,
-    runId,
-    userRequest: `request-${token}`,
-    manifest: {
-      id: `manifest-${token}`,
-      workspaceScopeKey: `scope-${token}`,
-      entries: [],
-      budget: { maxEntries: 8, maxBytes: 4096 },
-      defaultDenyPatterns: [],
-    },
-    resourcePackets: [] as ResourcePacket[],
-    nativeToolReadLedger: new Map(),
-    nativeToolDuplicateRepairAttempted: false,
-  };
-  const appended: AgentEvent[] = [];
+  const events: AgentEvent[] = [];
   const deltas: ProjectionDelta[] = [];
+  const proposal = {
+    schemaVersion: 'deepcode.agent.protocol.v3',
+    proposalId: `proposal-${token}`,
+    runId,
+    sessionId,
+    source: 'llm',
+    kind: 'answer',
+    payload: { format: 'markdown', content: `answer-${token}` },
+  } as ProposalEnvelope;
   const factory = new NativeToolHandlerPortsFactory<any, string, any>({
     progressEventBuilder: {
-      assistantProgressPayload: (input) => ({
-        kind: `progress-${token}`,
-        runId: input.runId,
-        content: input.content,
-      }),
+      assistantProgressPayload: ({ runId: eventRunId, content }) => ({ runId: eventRunId, content }),
     },
     projectionBuilder: {
-      checkpointDelta: (input) => ({ type: 'stage_delta', sessionId: input.sessionId, runId: input.runId, stage: `checkpoint-${token}`, status: 'running' }),
-      duplicateReadDelta: (input) => ({ type: 'stage_delta', sessionId: input.sessionId, runId: input.runId, stage: `duplicate-${input.toolCall.callId}`, status: 'completed' }),
-      toolCallRunningDelta: (input) => ({ type: 'tool_call_delta', sessionId: input.sessionId, runId: input.runId, stage: `running-${input.language}`, status: 'running' }),
-      resourceResolvedDelta: (input) => ({ type: 'resource_delta', sessionId: input.sessionId, runId: input.runId, stage: `resolved-${input.packet.id}`, status: 'completed' }),
+      checkpointDelta: (input) => ({ type: 'provider_checkpoint', payload: input } as any),
     },
-    resultMessageBuilder: {
-      duplicateToolMessage: () => ({ role: 'tool', toolCallId: toolCall.callId, content: `duplicate-${token}` }),
-      packetToolMessage: () => ({ role: 'tool', toolCallId: toolCall.callId, content: `packet-${token}` }),
-    },
-    resourceRecorder: {
-      recordResolvedPacket: (_state, _signature, resolvedPacket, identity) => ({
-        id: identity.id,
-        sessionId,
-        ts: identity.ts,
-        kind: 'tool_result',
-        payload: { packetId: resolvedPacket.id },
-      }),
-    },
-    visibleLanguage: () => 'en-US',
     event: (eventSessionId, kind, payload) => ({
-      id: `event-${token}`,
+      id: `event-${token}-${events.length}`,
       sessionId: eventSessionId,
-      ts: `ts-${token}`,
+      ts: '2026-01-01T00:00:00.000Z',
       kind,
       payload,
     }),
-    append: async (_sessionId, events) => {
-      appended.push(...events);
+    append: async (_sessionId, nextEvents) => {
+      events.push(...nextEvents);
     },
     emitProjectionDelta: async (_state, delta) => {
       deltas.push(delta);
     },
-    now: () => `now-${token}`,
-    createId: (prefix) => `${prefix}-${token}`,
   });
-  let repairPrompt = '';
   const ports = factory.create({
-    prompt: `prompt-${token}`,
-    repairSideEffect: async (_state, prompt) => {
-      repairPrompt = prompt;
-      return { kind: 'diagnostic', proposalId: `proposal-${token}`, runId, sessionId, source: 'llm', payload: {} } as ProposalEnvelope;
-    },
-    tryParseTurnProposal: () => null,
-    repairDuplicate: async () => ({ kind: 'diagnostic', proposalId: `duplicate-${token}`, runId, sessionId, source: 'llm', payload: {} } as ProposalEnvelope),
-    resolveReadToolCall: async () => packet,
+    semanticProposal: () => proposal,
+  });
+  const state = {
+    sessionId,
+    runId,
+    userRequest: `request-${token}`,
+    resourcePackets: [],
+  };
+  await ports.appendAssistantProgress(state, `progress-${token}`);
+  await ports.emitCheckpoint(state, 0, 1);
+  const admitted = ports.semanticProposal(state, {
+    callId: `call-${token}`,
+    index: 0,
+    name: 'session.submit_answer',
+    arguments: { content: `answer-${token}` },
   });
 
-  await ports.appendAssistantProgress(state, `narration-${token}`);
-  await ports.emitCheckpoint(state, 2, 3);
-  await ports.emitToolCallRunning(state, toolCall, 4);
-  await ports.recordResolvedPacket(state, { key: `sig-${token}`, toolName: toolCall.name, path: targetPath }, packet);
-  await ports.emitResourceResolved(state, toolCall, packet, 5);
-  const repaired = await ports.repairSideEffect(state, `ignored-${token}`, toolCall, { content: '', reasoning: '', toolCalls: [] });
-
-  assertEqual((appended[0]?.payload as any).content, `narration-${token}`, 'native tool handler ports factory appends assistant progress content');
-  assertEqual(deltas.map((delta) => delta.stage).join(','), `checkpoint-${token},running-en-US,resolved-${packet.id}`, 'native tool handler ports factory emits checkpoint/running/resolved deltas');
-  assertEqual(appended[1]?.id, `native-resource-context-${token}`, 'native tool handler ports factory records resolved packet event');
-  assertEqual((ports.duplicateToolMessage(toolCall, {
-    signature: { key: `sig-${token}`, toolName: toolCall.name, path: targetPath },
-    packet,
-    contentHash: `hash-${token}`,
-    repeatCount: 1,
-  }) as any).content, `duplicate-${token}`, 'native tool handler ports factory delegates duplicate tool messages');
-  assertEqual((ports.packetToolMessage(toolCall, packet) as any).content, `packet-${token}`, 'native tool handler ports factory delegates packet tool messages');
-  assertEqual(repaired.kind, 'diagnostic', 'native tool handler ports factory delegates side-effect repair');
-  assertEqual(repairPrompt, `prompt-${token}`, 'native tool handler ports factory uses bound prompt for repair callbacks');
+  assertEqual(events.length, 1, 'semantic handler ports append provider narration once');
+  assertEqual((events[0]?.payload as any)?.content, `progress-${token}`, 'semantic handler ports preserve provider narration');
+  assertEqual(deltas.length, 1, 'semantic handler ports emit one provider checkpoint');
+  assertEqual(admitted?.proposalId, proposal.proposalId, 'semantic handler ports admit the Session directive without Kernel tool callbacks');
 }
 
 export async function assertProposalOnlyProviderRunnerRepairsToolViolation(): Promise<void> {

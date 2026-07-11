@@ -99,264 +99,33 @@ export function assertPromptEnvelope(): void {
     conversationRoots,
     resourcePromptContext,
   });
-  assert(prompt.stablePrefix.includes('deepcode.agent.protocol.v3'), 'prompt enforces v3');
+  assert(prompt.stablePrefix.includes('Use exactly one registered Session semantic tool'), 'stable prompt requires one Session semantic directive');
+  assert(!prompt.dynamicSuffix.includes('provider-native Session semantic tools'), 'dynamic prompt does not repeat the registered semantic tool profile');
+  assert(!prompt.stablePrefix.includes('deepcode.agent.protocol.v3'), 'stable prompt no longer teaches the legacy JSON proposal envelope');
+  assert(!prompt.stablePrefix.includes('toolId'), 'stable prompt does not expose internal Kernel tool identifiers');
+  assert(!prompt.stablePrefix.includes('fs.write'), 'stable prompt does not expose Kernel file write ids');
+  assert(!prompt.stablePrefix.includes('fs.patch'), 'stable prompt does not expose Kernel patch ids');
+  assert(!prompt.stablePrefix.includes('fs.delete'), 'stable prompt does not expose Kernel delete ids');
   assert(prompt.dynamicSuffix.includes('manifestEntry id=attachment-0-generic-file'), 'prompt exposes manifest entry ids');
   assert(prompt.dynamicSuffix.includes('Conversation roots'), 'prompt exposes conversation roots');
-  assert(prompt.dynamicSuffix.includes('primary=true'), 'prompt marks the primary conversation root');
-  assert(prompt.dynamicSuffix.includes('Primary conversation workspace root'), 'prompt exposes the primary workspace root');
-  assert(prompt.dynamicSuffix.includes('targetPath/codeBlocks targetPath must be a concrete file path relative to the primary root'), 'prompt tells the model to avoid root-prefixed write paths');
-  assert(prompt.dynamicSuffix.includes('rootId+path'), 'provider turn schema documents path-based resourceRequest without long JSON examples');
-  assert(prompt.stablePrefix.includes('optional top-level narration'), 'prompt documents model-generated narration');
-  assertEqual(
-    (prompt.stablePrefix.match(/Unknown JSON fields, invalid JSON, and unsafe paths fail closed\./g) ?? []).length,
-    1,
-    'stable protocol contract keeps fail-closed rule once'
-  );
-  assert(prompt.stablePrefix.includes('Language policy: set outputLanguage and all user-visible prose from the current user request language'), 'stable protocol contract keeps compact language policy');
-  assert(prompt.dynamicSuffix.includes('reviewSummary is Session-generated'), 'provider turn schema excludes reviewSummary from provider proposal kinds');
-  assert(!prompt.stablePrefix.includes('Implementation payload budget'), 'stable prefix does not expose execution payload budgeting');
-  assert(!prompt.stablePrefix.includes('implementationPlan top-level field'), 'prompt no longer documents implementationPlan as a provider kind');
-  assert(!prompt.stablePrefix.includes('actionBundle.actions[] are executable Kernel tool actions shaped {actionId,toolId,args,description}'), 'stable prefix no longer exposes execution action shape');
-  assert(!prompt.dynamicSuffix.includes('actionBundle.actions[] are executable Kernel tool actions shaped {actionId,toolId,args,description}'), 'planning provider turn does not expose execution action shape');
-  assert(prompt.dynamicSuffix.includes('Execution-only proposal schema is withheld in this turn'), 'planning provider turn withholds execution proposal schema');
-  assert(!prompt.dynamicSuffix.includes('Current schema digest covers only: answer, resourceRequest, actionBundle'), 'planning schema digest does not list execution-only actionBundle as a visible shape');
-  assert(!prompt.dynamicSuffix.includes('taskOutcome top-level field'), 'planning schema digest does not list accepted-task outcome shape');
-  assert(prompt.stablePrefix.includes('resourceRequest is only for missing concrete facts that would change the next proposal'), 'stable prompt gates resourceRequest behind proposal-changing missing facts');
-  assert(prompt.stablePrefix.includes('Plan review is the normal confirmation checkpoint for reviewable implementation assumptions'), 'stable prompt routes reviewable assumptions through taskPlan review');
-  assert(prompt.stablePrefix.includes('blocking user choice is required before any valid taskPlan can be formed'), 'stable prompt narrows decisionRequest to blocking choices');
-  assert(prompt.stablePrefix.includes('Visible reasoning/progress, when streamed, must be concise and action-oriented'), 'stable prompt scopes visible reasoning and progress to action-oriented output');
-  assert(prompt.stablePrefix.includes('Keep private reasoning concise'), 'stable prompt asks provider reasoning to stay concise');
-  assert(!prompt.stablePrefix.includes('dependsOn'), 'prompt no longer teaches provider action dependency fields');
-  assert(!prompt.stablePrefix.includes('hard dependencies'), 'prompt no longer teaches hard dependency planning');
-  assert(!prompt.stablePrefix.includes('prerequisite'), 'prompt no longer teaches prerequisite planning');
-  assert(!prompt.stablePrefix.includes('dependencyDepth'), 'prompt no longer exposes dependency depth');
-  assert(!prompt.stablePrefix.includes('contentLines is the only provider-facing source-code content carrier'), 'stable prefix no longer exposes source-code carrier shape');
-  assert(!prompt.stablePrefix.includes('Do not output capability, permissionLabels, accessScopes, or resourceScope'), 'stable prefix no longer exposes execution permission-field ban details');
-  assert(!prompt.stablePrefix.includes('Do not add a generic payload wrapper'), 'stable prefix no longer carries full schema digest');
-  assert(!prompt.stablePrefix.includes('actionBundle proposal top-level fields'), 'stable prefix no longer documents actionBundle top-level fields');
-  assert(!prompt.stablePrefix.includes('Session derives routine defaults when they are omitted'), 'stable prefix no longer teaches execution defaults');
-  assert(!prompt.stablePrefix.includes('expectedValidation'), 'prompt no longer teaches expectedValidation to providers');
-  assert(!prompt.stablePrefix.includes('reviewGuide'), 'prompt no longer teaches reviewGuide to providers');
-  assert(prompt.dynamicSuffix.includes('tasks[] is an ordered queue'), 'provider turn schema treats taskPlan as an ordered queue');
-  assert(prompt.dynamicSuffix.includes('reviewable batches'), 'provider turn schema treats taskPlan items as reviewable engineering batches');
-  assert(prompt.dynamicSuffix.includes('Every task must include capability, concrete non-root target or targets, acceptanceCriteria, and failureCriteria'), 'provider turn schema requires capability and concrete non-root task slices');
-  assert(prompt.stablePrefix.includes('Do not wrap workspace file changes in process.exec shell commands'), 'stable prompt routes file changes to fs capabilities instead of shell wrappers');
-  assert(prompt.stablePrefix.includes('Do not plan standalone mkdir/process.exec tasks for workspace directory structure'), 'stable prompt avoids standalone directory scaffolding commands');
-  assert(prompt.dynamicSuffix.includes('Use fs.write/fs.patch/fs.delete for file-system changes'), 'planning schema routes file-system task intents to fs capabilities');
-  assert(!prompt.stablePrefix.includes('Session can schedule parallel graph nodes'), 'prompt no longer requires provider-facing graph scheduling');
-  assert(!prompt.stablePrefix.includes('payload object matching that kind'), 'prompt avoids payload wrapper wording');
-  assert(!prompt.stablePrefix.includes('actionBundle payload:'), 'prompt avoids ambiguous actionBundle payload wording');
-  assert(!prompt.stablePrefix.includes('at most 4 codeBlocks'), 'prompt does not impose a codeBlock count limit');
-  assert(prompt.stablePrefix.includes('<systemStructure'), 'prompt includes the system structure layer');
-  assert(prompt.stablePrefix.includes('<agentInterventionContract'), 'prompt keeps stable intervention contract in the protected prefix');
-  assert(prompt.dynamicSuffix.includes('Agent user intervention level: medium.'), 'dynamic suffix carries the current intervention level');
-  assert(!prompt.dynamicSuffix.includes('decisionRequest is a short intermediate planning checkpoint'), 'dynamic suffix does not repeat stable intervention contract text');
-  assert(prompt.stablePrefix.includes('<resourceEvidencePolicyContract'), 'prompt keeps stable resource evidence policy in the protected prefix');
-  assert(prompt.stablePrefix.includes('<memoryAndTaskContextContract'), 'prompt keeps stable memory/task context contract in the protected prefix');
-  assert(prompt.stablePrefix.includes('Memory and task context contract'), 'stable prefix owns memory and task boundary policy');
-  assert(prompt.dynamicSuffix.includes('Current resource result status.'), 'dynamic suffix carries current resource result counters');
-  assert(!prompt.dynamicSuffix.includes('Evidence tail policy: read-only confirmations'), 'dynamic suffix does not repeat stable evidence policy text');
-  assert(!prompt.dynamicSuffix.includes('Boundary: shared project memory stores durable norms'), 'dynamic suffix does not repeat stable project memory boundary text');
-  assert(!prompt.dynamicSuffix.includes('Boundary: session memory stores the active task focus'), 'dynamic suffix does not repeat stable session memory boundary text');
-  assert(!prompt.dynamicSuffix.includes('Authoritative generated-file facts come only from ResourcePacket contents'), 'dynamic suffix does not repeat generated-file authority policy');
-  assert(prompt.stablePrefix.includes('black-box validation'), 'prompt treats tests as black-box validation');
-  assert(prompt.stablePrefix.includes('Do not optimize for known tests'), 'prompt rejects test-specific optimization');
-  assert(prompt.stablePrefix.includes('fixed prompts'), 'prompt forbids fixed prompt special-casing');
-  assert(prompt.stablePrefix.includes('keyword branches'), 'prompt forbids keyword branches');
-  assert(prompt.stablePrefix.includes('tokenizer branches'), 'prompt forbids tokenizer-specific branches');
-  assert(prompt.stablePrefix.includes('example-specific branches'), 'prompt forbids example-specific logic');
-  assert(prompt.stablePrefix.includes('<protectedStablePrefix'), 'prompt starts with explicit protected stable prefix boundary');
-  assert(prompt.stablePrefix.includes('Turn-specific schema digests and tool intent summaries are dynamic context'), 'stable prefix records schema/tool intent summaries as dynamic context');
-  assert(!prompt.stablePrefix.includes('tool catalog summaries must stay before project memory'), 'stable prefix no longer treats schema/tool summaries as protected prefix content');
-  assert(prompt.stableLayerNames[0] === 'protectedStablePrefix', 'protected stable prefix is the first stable layer');
-  assert(!prompt.stablePrefix.includes('Current workflow state'), 'stable prefix excludes current workflow state');
-  assert(!prompt.stablePrefix.includes('Recent user turn'), 'stable prefix excludes session-local memory hints');
-  assert(!prompt.stablePrefix.includes('zh-CN'), 'stable prefix excludes localized JSON example payloads');
-  assert(prompt.dynamicSuffix.includes('Current workflow state: needProposal'), 'dynamic suffix carries current workflow state');
-  assert(prompt.dynamicSuffix.includes('Allowed proposals: answer, resourceRequest, taskPlan, actionBundle'), 'dynamic suffix carries allowed proposals');
-  assert(!prompt.dynamicSuffix.includes('<ProviderTurnContract schemaVersion="deepcode.session.provider-turn-contract.v1">'), 'dynamic suffix does not duplicate provider turn contract');
-  assert(!prompt.dynamicLayerNames.includes('promptPacketFrame'), 'provider turn contract is rendered once by ProviderPipeline');
-  const planningSchemaDigest = providerVisibleSchemaDigest({
-    workflowState: 'needProposal',
-    allowedProposals: ['answer', 'resourceRequest', 'decisionRequest', 'taskPlan'],
-    capabilityCatalogSummary: 'fs.read',
-    userRequest: 'Plan the current request.',
-  });
-  assert(planningSchemaDigest.includes('decisionRequest top-level field'), 'schema digest keeps decisionRequest field shape');
-  assert(planningSchemaDigest.includes('taskPlan top-level field'), 'schema digest keeps taskPlan field shape');
-  assert(planningSchemaDigest.includes('current turn schema selector'), 'schema digest is scoped to current turn selection');
-  assert(!planningSchemaDigest.includes('every live proposal is one JSON object'), 'schema digest does not repeat full protocol contract framing');
-  assert(planningSchemaDigest.length < 1500, 'planning schema digest remains a compact turn selector');
-  assert(!planningSchemaDigest.includes('During planning, prefer taskPlan'), 'schema digest does not duplicate planning decision policy');
-  assert(!planningSchemaDigest.includes('blocking user choice is required before any valid taskPlan'), 'schema digest does not duplicate decisionRequest policy');
-  const renderedContract = renderProviderTurnContractLayer({
-    workflowState: 'needProposal',
-    allowedProposals: ['answer', 'resourceRequest', 'actionBundle'],
-    capabilityCatalogSummary: 'fs.read\nfs.write',
-    memoryHints: ['Recent user turn: generic request attachments=file:generic/file.txt'],
-    userRequest: 'Analyze the attached resource.',
-    initialContext,
-    conversationRoots,
-    resourcePromptContext,
-  });
-  assert(renderedContract.includes('<PromptPacket schemaVersion="deepcode.session.prompt-packet.v1">'), 'provider turn contract renders prompt packet frames');
-  assert(renderedContract.includes('kind: DynamicDialogue'), 'prompt packet labels dynamic dialogue frame');
-  assert(renderedContract.includes('[ToolIntentTemplates]\n\n- none\n\n[/ToolIntentTemplates]'), 'planning provider turn does not duplicate next-action guidance in tool intent templates');
-  assert(renderedContract.includes('trust: userIntent'), 'prompt packet marks dynamic dialogue as user intent');
-  assert(renderedContract.includes('kind: ResourceEvidence'), 'prompt packet includes kernel-observed resource evidence frame');
-  assert(renderedContract.includes('trust: kernelObservedFact'), 'prompt packet marks resource evidence as observed facts');
-  assert(renderedContract.includes('kind: AccessIndex'), 'prompt packet includes access index from resource evidence');
-  assert(renderedContract.includes('trust: derivedObservedFact'), 'prompt packet marks access index as derived from observed resources');
-  assert(renderedContract.includes('range=full-or-directory'), 'prompt packet access index records range identity');
-  assert(renderedContract.includes('use='), 'prompt packet access index records reuse policy');
-  assert(renderedContract.includes('request a focused range only when exact content is required'), 'prompt packet access index guides focused follow-up reads');
-  assert(renderedContract.includes('kind: HookContext'), 'prompt packet includes hook context frame');
-  assert(renderedContract.includes('kind: ProviderStepSummary'), 'prompt packet includes provider step summary frame');
-  assert(renderedContract.includes('kind: MemoryPlaceholder'), 'prompt packet labels compacted memory frame');
-  assert(renderedContract.includes('trust: compressedReference'), 'prompt packet marks memory as reference rather than fact');
-  assert(renderedContract.includes('kind: NextActionInstruction'), 'prompt packet includes final next-action instruction');
-  assert(renderedContract.includes('output that proposal now; do not narrate or debate whether to read more context'), 'prompt packet next action avoids read-policy narration loops');
-  assert(renderedContract.includes('blocking user choice prevents any valid taskPlan'), 'prompt packet next action narrows planning decisionRequest');
-  assert(renderedContract.includes('do not re-audit protocol rules, permission gates, resource policy'), 'prompt packet next action asks for concise current-frame reasoning');
-  const memoryFrameIndex = renderedContract.indexOf('kind: MemoryPlaceholder');
-  const dynamicDialogueIndex = renderedContract.indexOf('kind: DynamicDialogue');
-  const resourceEvidenceIndex = renderedContract.indexOf('kind: ResourceEvidence');
-  const accessIndex = renderedContract.indexOf('kind: AccessIndex');
-  const hookContextIndex = renderedContract.indexOf('kind: HookContext');
-  const providerStepSummaryIndex = renderedContract.indexOf('kind: ProviderStepSummary');
-  const nextActionIndex = renderedContract.indexOf('kind: NextActionInstruction');
-  assert(memoryFrameIndex > -1 && dynamicDialogueIndex > memoryFrameIndex, 'prompt packet renders MemoryPlaceholder before DynamicDialogue');
-  assert(resourceEvidenceIndex > dynamicDialogueIndex, 'prompt packet renders ResourceEvidence after task/dialogue context');
-  assert(accessIndex > resourceEvidenceIndex, 'prompt packet renders AccessIndex after ResourceEvidence');
-  assert(hookContextIndex > accessIndex, 'prompt packet renders HookContext after AccessIndex');
-  assert(providerStepSummaryIndex > hookContextIndex, 'prompt packet renders ProviderStepSummary after HookContext');
-  assert(nextActionIndex > providerStepSummaryIndex, 'prompt packet renders NextActionInstruction at the end');
-  assert(!prompt.dynamicSuffix.includes('Kernel tool catalog visible to provider as schema only'), 'planning turn does not expose execution tool catalog');
-  assert(!prompt.stableLayerNames.includes('projectMemory'), 'project memory index digest stays out of the stable prefix');
-  assert(prompt.dynamicLayerNames.includes('projectMemory'), 'project memory index digest is an explicit dynamic memory partition');
-  assert(prompt.dynamicLayerNames.includes('projectMemoryRecall'), 'project memory recall is an explicit dynamic context partition');
-  assert(prompt.dynamicLayerNames.includes('sessionMemory'), 'session memory is an explicit dynamic context partition');
-  const projectMemoryA = buildPromptEnvelope({
-    workflowState: 'needProposal',
-    allowedProposals: ['answer'],
-    capabilityCatalogSummary: 'fs.read',
-    userRequest: 'Compare cache partitions.',
-    projectMemoryHints: ['ProjectMemoryIndexDigest: alpha'],
-  });
-  const projectMemoryB = buildPromptEnvelope({
-    workflowState: 'needProposal',
-    allowedProposals: ['answer'],
-    capabilityCatalogSummary: 'fs.read',
-    userRequest: 'Compare cache partitions.',
-    projectMemoryHints: ['ProjectMemoryIndexDigest: beta'],
-  });
-  assertEqual(projectMemoryA.stablePrefix, projectMemoryB.stablePrefix, 'project memory index changes do not change the stable prefix');
-  assert(projectMemoryA.dynamicSuffix !== projectMemoryB.dynamicSuffix, 'project memory index changes remain visible in dynamic context');
-  assert(prompt.dynamicLayerNames.includes('reusableResourceContext'), 'reusable resource context is separated from current request');
-  assert(prompt.dynamicSuffix.includes('blockKey='), 'prompt includes stable resource block keys');
   assert(prompt.dynamicSuffix.includes('generic content'), 'prompt includes ResourcePacket content');
-  assert(!prompt.dynamicSuffix.includes('evidence-generic'), 'prompt excludes volatile evidence refs from provider-visible resource context');
-  assert(!prompt.dynamicSuffix.includes('Read-only resource budget:'), 'prompt does not expose fixed read-only resource budget');
-  assert(prompt.stablePrefix.includes('final NextActionInstruction decides whether to propose now or request more evidence'), 'stable evidence policy defers read/propose choice to next-action instruction');
-  assert(prompt.stablePrefix.includes('missing fact would materially change the next proposal'), 'stable evidence policy narrows additional reads to proposal-changing facts');
-  assert(!prompt.dynamicSuffix.includes('not governed by a fixed Session round budget'), 'evidence tail no longer encourages open-ended read loops');
-  assert(!prompt.dynamicSuffix.includes('do not answer prematurely'), 'evidence tail no longer tells planning turns to delay proposals');
-  assert(prompt.dynamicSuffix.includes('offsetBytes/limitBytes'), 'prompt hints range reread for truncated resources');
-  assert(!prompt.dynamicSuffix.includes('auditOnlyContext'), 'audit-only context is not in dynamic suffix');
 
-  const acceptedPrompt = buildPromptEnvelope({
-    workflowState: 'executing_accepted_plan',
-    allowedProposals: ['actionBundle', 'resourceRequest', 'decisionRequest', 'taskOutcome', 'diagnostic'],
-    capabilityCatalogSummary: 'fs.delete',
-    userRequest: 'Continue the accepted generic task.',
-    currentTaskGoal: 'Remove a confirmed generated directory.',
-    currentTaskContext: {
-      taskId: 'task-generic-delete',
-      taskTitle: 'Remove generated directory',
-      targets: ['generated-dir'],
-      capabilities: ['fs.delete'],
-      acceptanceCriteria: ['Kernel records the generated directory delete fact.'],
-      failureCriteria: ['Stop if the delete leaves the accepted target scope.'],
-      pendingTaskIds: ['task-generic-delete'],
-      completedTaskIds: [],
-    },
+  const contract = new ContextFrameBuilder().buildSessionProviderTurnContract({
+    contractId: 'contract-generic',
+    sessionId: 'session-generic',
+    runId: 'run-generic',
+    turnMode: 'planning',
+    allowedKinds: ['answer', 'resourceRequest', 'decisionRequest', 'taskPlan', 'diagnostic'],
+    prompt,
+    userRequest: 'Analyze the attached resource.',
+    resourcePackets: [packet],
+    nextActionInstruction: 'Use exactly one registered planning semantic tool.',
   });
-  assert(acceptedPrompt.dynamicSuffix.includes('Current schema digest covers only: actionBundle, resourceRequest, decisionRequest, taskOutcome, diagnostic'), 'accepted execution schema digest lists current execution shapes');
-  assert(acceptedPrompt.dynamicSuffix.includes('actionBundle proposal top-level fields'), 'accepted execution schema digest documents actionBundle shape');
-  assert(acceptedPrompt.dynamicSuffix.includes('taskOutcome top-level field'), 'accepted execution schema digest documents taskOutcome shape');
-  assert(!acceptedPrompt.dynamicSuffix.includes('Requirement: not confirmed yet'), 'accepted execution prompt omits stale unconfirmed requirement wording');
-  assert(!acceptedPrompt.dynamicSuffix.includes('status=notConfirmed'), 'accepted execution prompt omits stale unconfirmed requirement status');
-  assert(acceptedPrompt.dynamicSuffix.includes('No separate requirement confirmation is active.'), 'accepted execution prompt uses neutral requirement state wording');
-  assert(acceptedPrompt.dynamicSuffix.includes('Accepted execution requirement state.'), 'accepted execution prompt marks requirement segment as execution state');
-  assert(!acceptedPrompt.dynamicSuffix.includes('User request: Continue the accepted generic task.'), 'accepted execution requirement segment does not relabel sanitized context as a user request');
+  const semanticNextActionIndex = contract.frames.findIndex((frame) => frame.kind === 'NextActionInstruction');
+  assertEqual(semanticNextActionIndex, contract.frames.length - 1, 'NextActionInstruction remains the final frame');
+  assert(contract.frames.some((frame) => frame.kind === 'ResourceEvidence' && frame.trust === 'kernelObservedFact'), 'ResourceEvidence remains a Kernel-observed fact frame');
 
-  const acceptedFrames = buildPromptPacketFrames({
-    workflowState: 'executing_accepted_plan',
-    allowedProposals: ['taskPlan', 'actionBundle', 'resourceRequest', 'decisionRequest', 'diagnostic'],
-    capabilityCatalogSummary: 'fs.delete',
-    memoryHints: ['Prior plan accepted by user.'],
-    userRequest: 'Continue the accepted cleanup task.',
-    resourcePromptContext,
-    currentTaskGoal: 'Remove a confirmed generated directory.',
-    currentTaskContext: {
-      taskId: 'task-generic-delete',
-      taskTitle: 'Remove generated directory',
-      targets: ['generic/file.txt'],
-      capabilities: ['fs.delete'],
-      acceptanceCriteria: ['Kernel records the generated directory delete fact.'],
-      failureCriteria: ['Stop if the delete leaves the accepted target scope.'],
-      pendingTaskIds: ['task-generic-delete'],
-      completedTaskIds: [],
-    },
-  });
-  const acceptedDialogueFrame = acceptedFrames.find((frame) => frame.kind === 'DynamicDialogue');
-  assert(acceptedDialogueFrame?.source === 'session.confirmedPlan', 'accepted execution prompt packet marks dialogue frame as session-confirmed context');
-  assert(acceptedDialogueFrame?.trust === 'sessionInstruction', 'accepted execution prompt packet does not treat sanitized context as raw user intent');
-  const acceptedTaskFrame = acceptedFrames.find((frame) => frame.kind === 'TaskFrame');
-  assert(acceptedTaskFrame?.trust === 'confirmedTaskInstruction', 'accepted execution prompt packet marks task frame as confirmed instruction');
-  assert(acceptedTaskFrame?.content.some((line) => line.includes('acceptanceCriteria=Kernel records the generated directory delete fact.')), 'accepted execution task frame carries current task acceptance criteria');
-  assert(acceptedTaskFrame?.content.some((line) => line.includes('failureCriteria=Stop if the delete leaves the accepted target scope.')), 'accepted execution task frame carries current task failure criteria');
-  const acceptedAccessFrame = acceptedFrames.find((frame) => frame.kind === 'AccessIndex');
-  assert(acceptedAccessFrame?.content.some((line) => line.includes('currentTaskEvidence target=generic/file.txt')), 'provider-visible prompt packet records current task evidence coverage');
-  assert(acceptedAccessFrame?.content.some((line) => line.includes('covered=true')), 'provider-visible prompt packet marks covered current task evidence');
-  const nextAction = acceptedFrames.find((frame) => frame.kind === 'NextActionInstruction');
-  assert(nextAction, 'accepted execution prompt packet includes next action frame');
-  const allowedLine = nextAction?.content.find((line) => line.startsWith('allowedOutputs=')) ?? '';
-  assert(!allowedLine.includes('taskPlan') && allowedLine.includes('actionBundle'), 'accepted execution narrows allowed outputs away from taskPlan');
-  assert(nextAction?.content.some((line) => line.includes('forbiddenOutputs=taskPlan')), 'accepted execution explicitly forbids plan output');
-
-  const acceptedDriverContract = new ContextFrameBuilder().buildSessionProviderTurnContract({
-    contractId: 'contract-accepted-reasoning-smoke',
-    sessionId: 'session-accepted-reasoning-smoke',
-    runId: 'run-accepted-reasoning-smoke',
-    allowedKinds: ['actionBundle', 'resourceRequest', 'decisionRequest', 'taskOutcome', 'diagnostic'],
-    prompt: acceptedPrompt,
-    userRequest: 'Continue the accepted generic task.',
-    acceptedPlanActive: true,
-    currentTaskContext: {
-      taskId: 'task-generic-delete',
-      taskTitle: 'Remove generated directory',
-      goal: 'Remove a confirmed generated directory.',
-      targets: ['generated-dir'],
-      capabilities: ['fs.delete'],
-      acceptanceCriteria: ['Kernel records the generated directory delete fact.'],
-      failureCriteria: ['Stop if the delete leaves the accepted target scope.'],
-      taskOrder: ['task-generic-delete'],
-      pendingTaskIds: ['task-generic-delete'],
-      dependsOn: [],
-      evidenceNeeds: [],
-      completedTaskIds: [],
-    },
-  });
-  assert(
-    String(acceptedDriverContract.nextActionInstruction.summary ?? '').includes('Keep visible reasoning/progress action-oriented'),
-    'accepted execution provider turn keeps visible reasoning action oriented'
-  );
-  const acceptedDriverDialogue = acceptedDriverContract.frames.find((frame) => frame.kind === 'DynamicDialogue');
-  assert(acceptedDriverDialogue?.source === 'session', 'accepted execution driver frame marks dynamic dialogue as session-derived');
-  assert(acceptedDriverDialogue?.trust === 'sessionInstruction', 'accepted execution driver frame does not mark sanitized context as user-confirmed fact');
 }
-
 export function assertContextAssemblerCachePlan(): void {
   const manifest: ResourceManifest = {
     id: 'manifest-cache-generic',
@@ -438,7 +207,7 @@ export function assertContextAssemblerCachePlan(): void {
   assertEqual(base.cachePlan.providerCacheAttribution.cacheEligiblePrefixCharLength, base.prompt.stablePrefix.length, 'cache attribution records prefix char length');
   assertEqual(base.cachePlan.providerCacheAttribution.stableMessageHash, base.cachePlan.stablePrefixHash, 'cache attribution uses stable prefix hash');
   assertEqual(base.cachePlan.providerCacheAttribution.dynamicMessageHash, base.cachePlan.dynamicSuffixHash, 'cache attribution uses dynamic suffix hash');
-  assert(base.cachePlan.providerCacheAttribution.partitionSnapshots.some((partition) => partition.name === 'ProjectMemory'), 'cache attribution snapshots include project memory partition');
+  assert(!base.cachePlan.providerCacheAttribution.partitionSnapshots.some((partition) => partition.name === 'ProjectMemory'), 'cache attribution omits an empty project memory partition from provider-visible context');
   assertEqual(base.cachePlan.providerCacheAttribution.changedPartitions.length, 0, 'cache attribution does not report changes without a previous baseline');
   assertEqual(base.cachePlan.stablePrefixHash, followUp.cachePlan.stablePrefixHash, 'same stable layers keep stable prefix hash');
   assertEqual(base.cachePlan.stablePrefixHash, proposalModeChange.cachePlan.stablePrefixHash, 'allowed proposal changes do not change stable prefix hash');
@@ -492,8 +261,8 @@ export function assertContextAssemblerCachePlan(): void {
   );
   assertEqual(
     base.contextAssembly.dynamicAppendLog.some((entry) => entry.foldPolicy === 'retainProjectMemory'),
-    true,
-    'context assembly dynamic append log marks project memory segments for memory retention'
+    false,
+    'context assembly dynamic append log omits empty project memory segments'
   );
   assertEqual(base.contextAssembly.dynamicAppendLogHash.length > 0, true, 'context assembly dynamic append log records a stable hash');
   assertEqual(base.contextAssembly.dynamicAppendLogCharLength > 0, true, 'context assembly dynamic append log records rendered dynamic length');
@@ -518,7 +287,7 @@ export function assertContextAssemblerCachePlan(): void {
   assertEqual(base.contextAssembly.taskLocalFoldPlanHash.length > 0, true, 'context assembly records task-local fold plan hash');
   assertEqual(base.contextAssembly.providerVisibleTokenEstimate, base.contextAssembly.partitionTokenEstimates.providerVisibleTotal, 'provider visible token estimate mirrors partition total');
   assert(base.contextAssembly.partitionCharCounts.protectedPrefix > 0, 'context assembly records protected prefix partition');
-  assert(base.contextAssembly.partitionCharCounts.projectMemory > 0, 'context assembly records project memory partition');
+  assertEqual(base.contextAssembly.partitionCharCounts.projectMemory, 0, 'context assembly records an empty project memory partition without rendering a placeholder');
   assert(base.contextAssembly.partitionCharCounts.sessionMemory > 0, 'context assembly records session memory partition');
   assert(base.contextAssembly.partitionCharCounts.intentMemory > 0, 'context assembly records intent/memory partition');
   const partitionNames = base.contextAssembly.partitionRecords.map((partition) => partition.name);
@@ -578,7 +347,7 @@ export function assertContextAssemblerCachePlan(): void {
   const toolCatalogSegment = base.contextAssembly.segments.find((segment) => segment.name === 'toolCatalogSummary');
   assertEqual(toolCatalogSegment?.cacheClass, 'turnDynamic', 'tool catalog digest follows current allowed proposal state');
   assertEqual(toolCatalogSegment?.stablePrefix, false, 'tool catalog digest stays outside the stable prefix');
-  assert(base.prompt.dynamicLayerNames.includes('toolCatalogSummary'), 'tool catalog digest is rendered in the dynamic suffix');
+  assert(!base.prompt.dynamicLayerNames.includes('toolCatalogSummary'), 'registered provider tools replace the dynamic text catalog digest');
   assertEqual(
     base.contextAssembly.segments.some((segment) => segment.cacheClass === 'reusableResource' && segment.name === 'reusableResourceContext'),
     true,
@@ -836,10 +605,10 @@ export function assertResourcePromptBlocksStabilize(): void {
     },
     resourcePromptContext: directoryContext,
   });
-  assert(directoryPrompt.dynamicSuffix.includes('contentKinds=directoryTree=1'), 'current resource result status records directory inventory content kind');
-  assert(directoryPrompt.stablePrefix.includes('Directory inventory ResourceEvidence is sufficient for file/directory existence checks and taskPlan target planning'), 'stable evidence policy treats directory inventory as planning evidence');
-  assert(directoryPrompt.stablePrefix.includes('Delete or cleanup taskPlan targets must be present in ResourceEvidence/AccessIndex or explicitly named'), 'stable evidence policy prevents invented cleanup targets');
-  assert(directoryContract.includes('directory inventory is available for existence checks and taskPlan targets'), 'prompt packet access index treats directory inventory as sufficient for task planning');
+  assert(directoryPrompt.dynamicSuffix.includes('kinds=directoryTree=1'), 'current resource result status records directory inventory content kind');
+  assert(directoryPrompt.stablePrefix.includes('Directory inventory ResourceEvidence is sufficient for file/directory existence checks and plan target selection'), 'stable evidence policy treats directory inventory as planning evidence');
+  assert(directoryPrompt.stablePrefix.includes('Delete or cleanup plan targets must be present in ResourceEvidence/AccessIndex or explicitly named'), 'stable evidence policy prevents invented cleanup targets');
+  assert(directoryContract.includes('directory inventory is available for existence checks and plan targets'), 'prompt packet access index treats directory inventory as sufficient for task planning');
 
   const jsonDirectoryToken = randomSmokeToken('json-directory');
   const jsonFilePath = `${jsonDirectoryToken}/src/${randomSmokeToken('unit')}.cpp`;
