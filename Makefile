@@ -147,8 +147,8 @@ help:
 	@echo "  make package-macos-deepcode-gui  在 macOS 宿主机上生成 bin/macos-arm64/DeepCode-GUI.app"
 	@echo ""
 	@echo "进入容器后可手动执行："
-	@echo "  ./build.sh   编译并输出统一分发目录到 bin/deepcode/"
-	@echo "  ./test.sh    运行链路 ping 与环境检查"
+	@echo "  bash ./build.sh   编译并输出统一分发目录到 bin/"
+	@echo "  bash ./test.sh    运行稳定架构、workspace 与真实链路验证"
 
 docker-info:
 	@echo "worktreeMode=$(DEEPCODE_WORKTREE_MODE)"

@@ -47,7 +47,7 @@ bash ./build.sh
 ```
 
 默认 Docker-side 构建使用 `DEEPCODE_MACOS_PACKAGE_MODE=auto`：如果宿主机打包
-服务正在运行，构建会自动提交 macOS 打包请求；如果服务未运行，Docker package
+服务正在运行，构建会自动提交一个 product-set 事务；如果服务未运行，Docker package
 仍会完成，macOS 打包会带明确日志跳过。需要发布验收时让 macOS 打包缺失直接失败，
 使用：
 
@@ -55,9 +55,9 @@ bash ./build.sh
 DEEPCODE_MACOS_PACKAGE_MODE=require bash ./build.sh
 ```
 
-macOS product set 默认是 `DeepCode-GUI,DeepCode`。这个顺序是有意的：
-先打包 DeepCode-GUI，再由 Editor package 刷新共享根目录 sidecar 和 `web/`，
-同时保留 `DeepCode-GUI.app`。只在定向重打包时覆盖：
+macOS product set 默认是 `DeepCode-GUI,DeepCode`。两个产品复用同一次前端准备、
+Cargo 依赖检查、Darwin runtime 构建、源码指纹和发布边界。输入未变化时复用前端与
+Rust 阶段缓存；`--clean-cache` 是显式缓存失效入口。只在定向重打包时覆盖：
 
 ```bash
 DEEPCODE_MACOS_PRODUCTS=DeepCode bash ./build.sh --stage package-macos
@@ -101,7 +101,11 @@ bin/macos-arm64/
 
 本阶段 macOS 包是本机可运行包，不包含 DMG、Developer ID 签名或公证。脚本会生成 package-local 配置根，并写入 `build-info.json` 供 `/api/health` 诊断读取。
 
-如果 `/api/health` 没有 `buildCommit`、`protocolVersion` 或 `toolCatalogVersion`，或者新 run 归档仍显示旧中文 tagged protocol prompt 而不是 `deepcode.agent.protocol.v3`，先退出正在运行的 `DeepCode.app`，再执行 `make package-macos-clean`，然后重新打开 App。打包脚本会在目标 App 或其 bundled `deepcode-kernel` 仍在运行时 fail fast，因为旧进程不退出会导致 review 测试继续命中旧 Kernel。
+打包事务会写入并校验当前 commit 与源码内容指纹，在发布前先完成所有请求 App 的
+staging；如果构建期间源码发生变化，则拒绝发布混合 product set。如果
+`/api/health` 没有 `buildCommit`、`sourceFingerprint`、`protocolVersion` 或
+`toolCatalogVersion`，先退出正在运行的 App，再执行 `make package-macos-clean`，然后
+重新打开 App。
 
 ## 当前状态
 
