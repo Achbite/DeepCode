@@ -1456,6 +1456,13 @@ export async function assertProviderTurnContextCoordinatorScopesAcceptedExecutio
   assertEqual(result.allowedProposals.join(','), expectedExecutionKinds.join(','), 'accepted execution exposes only execution proposal kinds');
   assertEqual(result.modelContextBundle.providerTurnContract.allowedKinds.join(','), expectedExecutionKinds.join(','), 'accepted execution provider contract ignores stale planning and answer kinds');
   assert(result.modelContextBundle.prompt.stablePrefix.includes('Session semantic profile: execution-v1'), 'accepted execution selects the stable execution semantic profile');
+  assert(result.modelContextBundle.prompt.stablePrefix.includes('ProtectedStablePrefix begins here.'), 'accepted execution preserves the ContextAdmission stable contract in the provider system message');
+  assertEqual(
+    result.modelContextBundle.contextAssembly?.providerCacheAttribution.cacheEligiblePrefixCharLength,
+    result.modelContextBundle.prompt.stablePrefix.length,
+    'ContextAdmission cache attribution measures the physical provider system prefix'
+  );
+  assert(result.modelContextBundle.contextAssembly?.segments.some((segment) => segment.name === 'providerProfileContract'), 'ContextAdmission records the provider profile as a stable segment');
   assert(!dynamicPrompt.includes('Execution uses provider-native Session semantic tools'), 'accepted execution dynamic prompt does not repeat the semantic tool profile');
   assertEqual(dynamicPrompt.includes('session.submit_answer'), false, 'accepted execution prompt does not expose planning answer tools');
   assertEqual(assemblyCapabilitySummary.includes(fullCatalogMarker), false, 'accepted execution does not pass the full capability catalog into ContextAdmission');

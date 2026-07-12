@@ -851,10 +851,12 @@ function assertProposalSemanticValidatorCanonicalizesAndDefaults(): void {
 async function assertProviderPipelineUsesProviderTurnContract(): Promise<void> {
   const token = randomSmokeToken('provider-pipeline');
   const requestText = `visible dialogue request ${token}`;
+  const planningProfile = new ProviderProfileRegistry().profile('planning-v1');
   const prompt = buildPromptEnvelope({
     workflowState: `workflow-${token}`,
     allowedProposals: ['answer'],
     capabilityCatalogSummary: `capability-${token}`,
+    providerProfileSystemContract: planningProfile.systemContract,
     userRequest: requestText,
   });
   const contract = new ContextFrameBuilder().buildProviderTurnContract({
@@ -889,9 +891,11 @@ async function assertProviderPipelineUsesProviderTurnContract(): Promise<void> {
   assertEqual(stages[1], `stage-${token}_empty_retry`, 'provider pipeline reuses empty retry stage suffix');
   assertEqual(
     firstMessages[0]?.[0]?.content,
-    new ProviderProfileRegistry().profile('planning-v1').systemContract,
-    'provider pipeline uses the stable planning profile system contract'
+    prompt.stablePrefix,
+    'provider pipeline uses the exact ContextAdmission stable prefix'
   );
+  assert(String(firstMessages[0]?.[0]?.content ?? '').includes('ProtectedStablePrefix begins here.'), 'provider system message retains the protected stable contract');
+  assert(String(firstMessages[0]?.[0]?.content ?? '').includes('Session semantic profile: planning-v1'), 'provider system message includes the stable planning profile contract');
   const firstUserPrompt = String(firstMessages[0]?.[1]?.content ?? '');
   assertEqual(firstUserPrompt.startsWith(prompt.dynamicSuffix), true, 'provider pipeline keeps dynamic suffix first');
   assertEqual(firstUserPrompt.includes('ProviderTurnContract:'), true, 'provider pipeline renders provider turn contract');
