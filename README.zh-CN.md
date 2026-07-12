@@ -2,11 +2,11 @@
 
 > English default version: [README.md](README.md)
 
-DeepCode v0.5.25 是一个本地优先的 AI 编程工作台稳定基线版本，目标是把 Agent 会话协议、Kernel 工具执行、权限审计、上下文压缩、Editor/GUI/CLI/TUI 多入口封装在同一套后端事实源上。本版本稳定了 Session 协议 / parser、accepted-plan 执行、文件节点编排门禁、生成产物证据回填、Review 前审查链路和 Kernel 工具目录基线，同时保留可复现的本地构建 / 打包流程和 provider、工具、Session、Kernel、UI shell 的清晰职责边界。
+DeepCode v0.5.30 是一个本地优先的 AI 编程工作台稳定基线版本，目标是把 Agent 会话协议、Kernel 工具执行、权限审计、上下文压缩、Editor/GUI/CLI/TUI 多入口封装在同一套后端事实源上。本版本稳定了 Session 协议 / parser 和 accepted-plan 执行，使规范化 Session timeline 成为 daemon 与 UI 的统一事实投影，支持并发读取 bridge 输出、按 worktree 隔离 Docker 资源，并保证打包入口确定地使用当前 checkout，同时继续保持 provider、工具、Session、Kernel、UI shell 的清晰职责边界。
 
-v0.5.25 中子代理仍属于实验能力。由于并行草稿编排路径还不够稳定，默认设置已改为关闭；用户仍可在 Agent 设置中手动启用子代理做定向实验。Parent Session 仍是唯一负责校验草稿并提交 Kernel action 的权威路径。
+v0.5.30 已移除废弃的子代理 / DAG 执行路径。Agent 设置不再暴露子代理运行时控制项，Parent Session 是唯一负责校验 provider 输出并提交 Kernel action 的编排权威。Kernel client DTO 中仍保留少量始终不生效的可选请求字段用于 transport 兼容；这些字段不会恢复已退出主线的运行时。
 
-发布文档当前使用 `v0.5.25 stable baseline` 口径。部分 Cargo 和 package 元数据可能仍显示 `0.5.24`；该版本元数据漂移已记录为后续发布元数据统一项，不改变本文描述的运行时边界。
+发布文档当前使用 `v0.5.30 stable baseline` 口径。部分 Cargo 和 package 元数据可能仍显示 `0.5.24`；该版本元数据漂移已记录为后续发布元数据统一项，不改变本文描述的运行时边界。
 
 ## 构建与发布模式
 
