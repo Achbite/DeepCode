@@ -172,10 +172,6 @@ function itemDetailLines(item: Record<string, unknown>, language: UiLanguage): s
   if (failure.length) {
     details.push(t(language, 'session.projection.item.failure', { failure: failure.join('; ') }));
   }
-  const auditRefs = stringArrayField(item, 'auditRefs');
-  if (auditRefs.length) {
-    details.push(t(language, 'session.projection.item.auditRefs', { auditRefs: auditRefs.join(', ') }));
-  }
   return details;
 }
 

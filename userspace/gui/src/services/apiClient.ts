@@ -32,6 +32,7 @@ import type {
   RenameAgentSessionRequest,
   ArchiveAgentSessionRequest,
   AgentSessionResult,
+  AgentTimelineResult,
   AppendAgentEventsRequest,
   ResolveAgentPermissionRequest,
   ResolveAgentPlanRequest,
@@ -662,6 +663,14 @@ export function getAgentSession(
 ): Promise<ApiResponse<AgentSessionResult>> {
   return getJson<AgentSessionResult>(
     `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/events`
+  );
+}
+
+export function getAgentTimeline(
+  sessionId: string
+): Promise<ApiResponse<AgentTimelineResult>> {
+  return getJson<AgentTimelineResult>(
+    `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/timeline`
   );
 }
 

@@ -1,13 +1,11 @@
 import React, { Suspense, lazy, useEffect, useMemo, useRef, useState } from 'react';
 import type {
   AgentContextAttachment,
-  AgentEvent,
   AgentSession,
   AgentTimelineResult,
   BrowseEntry,
   BrowsePathResult,
   InitialLocation,
-  ProjectionDelta,
 } from '@deepcode/protocol';
 import type { SessionMemorySnapshot } from '@deepcode/session-core';
 import WindowControls from '../../components/window-controls/WindowControls';
@@ -22,7 +20,7 @@ import { useSettingsStore } from '../../state/settingsStore';
 import { useWorkspaceStore } from '../../state/workspaceStore';
 import { useAgentSessionStore } from '../../state/agentSessionStore';
 import { deriveTokenUsageStats, formatPercent, formatTokenCount } from '../../utils/tokenUsageStats';
-import { latestPlanTaskItemsFromProjection, useUiTimelineProjection } from '../../utils/uiTimelineProjection';
+import { latestPlanTaskItemsFromProjection, timelineOrEmpty } from '../../utils/uiTimelineProjection';
 import AgentMemoryViewer from '../../components/agent-memory/AgentMemoryViewer';
 import DeepCodeAgentPanel from '../panel/DeepCodeAgentPanel';
 import '../../components/workspace-open-dialog/workspaceOpenDialog.css';
@@ -116,8 +114,6 @@ interface PendingProjectSession {
 }
 
 const DEEPCODE_GUI_PROJECTS_STORAGE_KEY = 'deepcode-gui.projects.v1';
-const EMPTY_AGENT_EVENTS: AgentEvent[] = [];
-const EMPTY_PROJECTION_DELTAS: ProjectionDelta[] = [];
 
 const DeepCodeSidebarIcon: React.FC<{ name: DeepCodeSidebarIconName; className?: string }> = ({
   name,
@@ -681,7 +677,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
   const loadingSession = useAgentSessionStore((s) => s.loading);
   const runningSessionIds = useAgentSessionStore((s) => s.runningSessionIds);
   const events = useAgentSessionStore((s) => s.events);
-  const activeDeltas = useAgentSessionStore((s) => s.activeDeltas);
+  const timeline = useAgentSessionStore((s) => s.timeline);
   const createNewSession = useAgentSessionStore((s) => s.createNewSession);
   const activateSession = useAgentSessionStore((s) => s.activateSession);
   const renameSession = useAgentSessionStore((s) => s.renameSession);
@@ -753,12 +749,9 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
     ? new Date(lastHeartbeatAt).toLocaleTimeString()
     : t(language, 'deepcodeGui.status.pending');
   const projectDraftActive = Boolean(draftTargetProjectId);
-  const projectionEvents = projectDraftActive ? EMPTY_AGENT_EVENTS : events;
-  const liveTimelineProjection = useUiTimelineProjection({
-    sessionId: projectDraftActive ? 'project-draft' : activeSession?.id ?? projectionEvents[0]?.sessionId ?? 'session',
-    events: projectionEvents,
-    activeDeltas: projectDraftActive ? EMPTY_PROJECTION_DELTAS : activeDeltas,
-  });
+  const liveTimelineProjection = projectDraftActive
+    ? timelineOrEmpty(null, 'project-draft')
+    : timelineOrEmpty(timeline, activeSession?.id);
   const taskItems = useMemo(() => {
     const taskSessionId = projectDraftActive ? null : activeSession?.id ?? null;
     const fallbackItems = lastPlanTaskItemsRef.current.sessionId === taskSessionId

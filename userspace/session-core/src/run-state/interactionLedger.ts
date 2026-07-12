@@ -26,6 +26,7 @@ export type InteractionLedgerActiveInteraction =
   | {
       kind: 'permission';
       requestId: string;
+      request: PermissionRequest;
       title?: string;
       summary?: string;
     }
@@ -59,6 +60,7 @@ export function findActiveInteraction(input: {
     return {
       kind: 'permission',
       requestId: input.pendingPermission.id,
+      request: input.pendingPermission,
       title: input.pendingPermission.toolName,
       summary: input.pendingPermission.summary,
     };
