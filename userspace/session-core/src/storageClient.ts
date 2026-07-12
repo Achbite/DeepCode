@@ -24,11 +24,16 @@ export class SessionStorageClient {
     return (value.data?.entries ?? []) as TranscriptEntry[];
   }
 
-  async persistMemoryArchive(sessionId: string, snapshot: SessionMemorySnapshot): Promise<void> {
+  async persistMemoryArchive(
+    sessionId: string,
+    snapshot: SessionMemorySnapshot,
+    signal?: AbortSignal
+  ): Promise<void> {
     const response = await fetch(`${this.baseUrl}/api/session-store/${encodeURIComponent(sessionId)}/memory/archive`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ snapshot }),
+      signal,
     });
     if (!response.ok) {
       throw new Error(`persist memory archive failed: HTTP ${response.status}`);

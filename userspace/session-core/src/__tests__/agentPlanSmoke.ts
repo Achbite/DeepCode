@@ -5720,6 +5720,19 @@ function assertProjectionBuildersKeepKernelAndReviewReadModels(): void {
   assertEqual(activity?.kind, 'editFileCompleted', 'kernel projection builds completed edit activity');
   assertEqual(activity?.targets?.[0], targetPath, 'kernel projection carries activity target');
   assertEqual(activity?.operation, 'delete', 'kernel projection preserves the structured operation across work-unit updates');
+  const workspaceRoot = `/tmp/workspace-${token}`;
+  const normalizedTargets = kernelProjection.kernelEventTargets({
+    kind: 'work_unit.completed',
+    output: {
+      path: targetPath,
+      normalizedTargetPath: targetPath,
+      absolutePath: `${workspaceRoot}/${targetPath}`,
+      workspaceRoot,
+      operation: 'delete',
+    },
+  });
+  assertEqual(normalizedTargets.length, 1, 'kernel projection treats workspace-relative and absolute paths as one target');
+  assertEqual(normalizedTargets[0], targetPath, 'kernel projection exposes the workspace-relative target to UI shells');
   const projected = kernelProjection.projectKernelEvent({
     sessionId: `session-${token}`,
     event: enriched,
@@ -10125,16 +10138,17 @@ function assertNarrativeTimelineProjection(): void {
   assertEqual(activityBlock?.title, 'Generic edit completed', 'activity title drives operation block title');
   assertEqual(activityBlock?.status, 'completed', 'activity status drives operation block status');
   const narrationBlock = allBlocks.find((block) => block.narrativeKind === 'assistantNarration');
-  assertEqual(narrationBlock?.displayHints?.renderMode, 'typewriter', 'assistant narration uses typewriter projection hints');
+  assertEqual(narrationBlock?.narrativeKind, 'assistantNarration', 'assistant narration keeps its structured narrative kind');
   assertEqual(narrationBlock?.displayHints?.checkpointKind, 'llmProposal', 'assistant narration is tied to an LLM proposal checkpoint');
-  const thinkingBlock = allBlocks.find((block) => block.narrativeKind === 'thinking');
+  const thinkingBlocks = allBlocks.filter((block) => block.narrativeKind === 'thinking');
   assertEqual(
-    thinkingBlock?.bodyMarkdown,
-    'Need generic context. Continue with generic constraints.',
-    'adjacent reasoning events are projected as one complete thinking body'
+    thinkingBlocks.length,
+    2,
+    'separate committed reasoning events remain separate timeline items'
   );
-  assertEqual(Boolean(thinkingBlock?.displayHints?.replaceOnComplete), true, 'thinking exposes replacement/collapse projection hints');
-  assertEqual(thinkingBlock?.displayHints?.typewriterSpeed, 'slow', 'running thinking uses a slower typewriter speed');
+  assertEqual(thinkingBlocks[0]?.bodyMarkdown, 'Need generic context.', 'first reasoning item preserves its content');
+  assertEqual(thinkingBlocks[1]?.bodyMarkdown, 'Continue with generic constraints.', 'second reasoning item preserves its content');
+  assertEqual(Boolean(thinkingBlocks[0]?.displayHints?.collapseAfterComplete), true, 'thinking exposes semantic collapse guidance');
   const guidanceBlock = allBlocks.find((block) =>
     block.events.some((event) => (event.payload as any)?.sourceEventKind === 'user_guidance')
   );
@@ -10398,8 +10412,6 @@ function assertTimelineProjectionWithLiveOverlay(): void {
   const liveThinking = liveBlocks.find((block) => block.narrativeKind === 'thinking');
   assert(Boolean(liveThinking?.bodyMarkdown?.includes('Need generic context before proposing changes.')), 'provider reasoning delta enters the live timeline as a reasoning trace block');
   assertEqual(liveThinking?.status, 'completed', 'later activity seals the live thinking block');
-  assertEqual(liveThinking?.displayHints?.renderMode, 'typewriter', 'sealed live thinking remains eligible for buffered playback');
-  assertEqual(liveThinking?.displayHints?.initialOpen, true, 'sealed live thinking stays open until the shell finishes playback');
   assertEqual(liveThinking?.defaultCollapsed, false, 'sealed live thinking does not disappear before playback completes');
   const liveActivity = liveBlocks.find((block) => block.activity?.activityId === 'activity-live-read');
   assertEqual(liveActivity?.activity?.kind, 'resourceRead', 'live activity survives projection as structured activity');

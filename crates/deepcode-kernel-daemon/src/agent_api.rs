@@ -941,6 +941,7 @@ fn run_session_bridge_worker(
     }
 }
 
+#[derive(Debug)]
 enum BridgeWorkerStop {
     Cancelled,
     Failed(String),
@@ -949,20 +950,63 @@ enum BridgeWorkerStop {
 fn wait_for_session_bridge_output(
     state: &AppState,
     run_id: &str,
-    mut child: Child,
+    child: Child,
 ) -> Result<Output, BridgeWorkerStop> {
+    wait_for_child_output(
+        child,
+        || run_cancelled(state, run_id),
+        session_host_bridge_timeout(),
+    )
+}
+
+fn wait_for_child_output(
+    mut child: Child,
+    mut should_cancel: impl FnMut() -> bool,
+    timeout: Option<Duration>,
+) -> Result<Output, BridgeWorkerStop> {
+    let Some(mut stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(BridgeWorkerStop::Failed(
+            "session bridge stdout is unavailable".to_string(),
+        ));
+    };
+    let Some(mut stderr) = child.stderr.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(BridgeWorkerStop::Failed(
+            "session bridge stderr is unavailable".to_string(),
+        ));
+    };
+    let stdout_reader = thread::spawn(move || {
+        let mut output = Vec::new();
+        stdout
+            .read_to_end(&mut output)
+            .map(|_| output)
+            .map_err(|error| format!("failed to read session bridge stdout: {error}"))
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut output = Vec::new();
+        stderr
+            .read_to_end(&mut output)
+            .map(|_| output)
+            .map_err(|error| format!("failed to read session bridge stderr: {error}"))
+    });
     let started_at = Instant::now();
-    let timeout = session_host_bridge_timeout();
     loop {
-        if run_cancelled(state, run_id) {
+        if should_cancel() {
             let _ = child.kill();
             let _ = child.wait();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
             return Err(BridgeWorkerStop::Cancelled);
         }
         if let Some(limit) = timeout {
             if started_at.elapsed() >= limit {
                 let _ = child.kill();
                 let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
                 return Err(BridgeWorkerStop::Failed(format!(
                     "session run timed out after {} ms; set DEEPCODE_SESSION_BRIDGE_TIMEOUT_MS=0 to disable the hard timeout",
                     limit.as_millis()
@@ -970,17 +1014,35 @@ fn wait_for_session_bridge_output(
             }
         }
         match child.try_wait() {
-            Ok(Some(_)) => {
-                return child.wait_with_output().map_err(|error| {
-                    BridgeWorkerStop::Failed(format!(
-                        "failed to read session bridge output: {error}"
-                    ))
+            Ok(Some(status)) => {
+                let stdout = stdout_reader
+                    .join()
+                    .map_err(|_| {
+                        BridgeWorkerStop::Failed(
+                            "session bridge stdout reader panicked".to_string(),
+                        )
+                    })?
+                    .map_err(BridgeWorkerStop::Failed)?;
+                let stderr = stderr_reader
+                    .join()
+                    .map_err(|_| {
+                        BridgeWorkerStop::Failed(
+                            "session bridge stderr reader panicked".to_string(),
+                        )
+                    })?
+                    .map_err(BridgeWorkerStop::Failed)?;
+                return Ok(Output {
+                    status,
+                    stdout,
+                    stderr,
                 });
             }
             Ok(None) => thread::sleep(Duration::from_millis(50)),
             Err(error) => {
                 let _ = child.kill();
                 let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
                 return Err(BridgeWorkerStop::Failed(format!(
                     "failed to wait for session bridge output: {error}"
                 )));
@@ -1951,6 +2013,25 @@ pub(crate) fn agent_event(session_id: &str, kind: &str, payload: Value, ts: &str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bridge_output_reader_drains_payloads_larger_than_pipe_capacity() {
+        let script = "i=0; while [ \"$i\" -lt 5000 ]; do printf '0123456789abcdef0123456789abcdef\\n'; printf 'fedcba9876543210fedcba9876543210\\n' >&2; i=$((i + 1)); done";
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn bridge output fixture");
+
+        let output = wait_for_child_output(child, || false, Some(Duration::from_secs(10)))
+            .expect("drain bridge output");
+
+        assert!(output.status.success());
+        assert!(output.stdout.len() > 65_536);
+        assert!(output.stderr.len() > 65_536);
+    }
 
     #[test]
     fn bridge_timeline_requires_current_structured_projection() {

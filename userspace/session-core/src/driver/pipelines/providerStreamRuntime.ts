@@ -61,7 +61,7 @@ export class ProviderStreamRuntime<TState extends ProviderStreamRuntimeState> {
     return {
       pending: '',
       lastFlushAt: Date.now(),
-      itemId: undefined,
+      itemId: this.dependencies.createId('reasoning-segment'),
       receivedChars: 0,
       visibleCharsEmitted: 0,
       truncated: false,

@@ -39,14 +39,12 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
   onBeforeSend,
   onAfterSend,
 }) => {
-  const events = useAgentSessionStore((s) => s.events);
   const session = useAgentSessionStore((s) => s.session);
   const profileId = useAgentSessionStore((s) => s.profileId);
   const runningSessionIds = useAgentSessionStore((s) => s.runningSessionIds);
   const errorMessage = useAgentSessionStore((s) => s.errorMessage);
   const messageAttachments = useAgentSessionStore((s) => s.messageAttachments);
   const sessionAttachments = useAgentSessionStore((s) => s.sessionAttachments);
-  const pendingPermission = useAgentSessionStore((s) => s.pendingPermission);
   const resolvingPermission = useAgentSessionStore((s) => s.resolvingPermission);
   const resolvingRequirement = useAgentSessionStore((s) => s.resolvingRequirement);
   const resolvingPlan = useAgentSessionStore((s) => s.resolvingPlan);
@@ -121,9 +119,12 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
   const composerPendingDecision = decisionReadyForComposer && !pendingDecisionResolving && pendingDecision?.kind !== 'permission'
     ? pendingDecision
     : null;
+  const pendingPermissionRequest = decisionReadyForComposer && pendingDecision?.kind === 'permission'
+    ? pendingDecision.request
+    : null;
   const showHome = forceHome || (
     !sessionRunning && !composerPendingDecision && !errorMessage
-    && events.length === 0 && !hasTimelineTurns
+    && !hasTimelineTurns
   );
   const composerRunning = forceHome ? false : (sessionRunning || pendingDecisionResolving);
   const homePrompt = homeProjectTitle
@@ -172,9 +173,7 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
         }
         if (composerPendingDecision.kind === 'review') {
           void resolveReview(composerPendingDecision.runId, decision, guidance);
-          return;
         }
-        void acceptPermission();
       }}
       onDecisionReject={() => {
         if (!composerPendingDecision) return;
@@ -189,9 +188,7 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
         }
         if (composerPendingDecision.kind === 'review') {
           void resolveReview(composerPendingDecision.runId, 'reject');
-          return;
         }
-        void rejectPermission();
       }}
     />
   );
@@ -231,23 +228,23 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
       />
 
       <div ref={setBottomChromeElement}>
-        {pendingPermission && (
+        {pendingPermissionRequest && (
           <PermissionRequestBubble
-            request={pendingPermission.request}
+            request={pendingPermissionRequest}
             language={language}
             disabled={Boolean(resolvingPermission)}
             resolvingDecision={
-              resolvingPermission?.id === pendingPermission.request.id
+              resolvingPermission?.id === pendingPermissionRequest.id
                 ? resolvingPermission.decision
                 : null
             }
             onAccept={() => {
               requestFollowLatest();
-              void acceptPermission();
+              void acceptPermission(pendingPermissionRequest);
             }}
             onReject={() => {
               requestFollowLatest();
-              void rejectPermission();
+              void rejectPermission(pendingPermissionRequest);
             }}
           />
         )}

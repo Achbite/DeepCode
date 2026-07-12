@@ -4,6 +4,7 @@ import type {
   AgentTimelineInteractionOptionEffect,
   AgentTimelinePendingInteraction,
   AgentTimelineResult,
+  PermissionRequest,
 } from '@deepcode/protocol';
 
 export type AgentComposerDecisionOption = AgentTimelineInteractionOption;
@@ -41,6 +42,7 @@ export type AgentComposerPendingDecision =
   | {
       kind: 'permission';
       requestId: string;
+      request: PermissionRequest;
       blockId?: string;
       title?: string;
       summary?: string;

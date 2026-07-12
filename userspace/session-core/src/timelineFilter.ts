@@ -10,6 +10,8 @@ const INTERNAL_ORCHESTRATION_STAGES = new Set<string>([
   'proposal.accepted',
   'action_batch.accepted',
   'accepted_plan.static_syntax_review',
+  'accepted_plan.batch_checkpoint',
+  'accepted_plan.task_savepoint',
   'needProposal',
   'autonomy.transitioned',
   'message.appended',
