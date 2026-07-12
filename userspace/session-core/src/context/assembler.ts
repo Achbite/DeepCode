@@ -296,6 +296,7 @@ export interface ContextAssemblyInput {
   projectMemoryMode?: ProjectMemoryMode;
   extraMemoryHints?: string[];
   interventionLevel?: PromptEnvelopeBuilderInput['interventionLevel'];
+  providerProfileSystemContract?: string;
   userOverlay?: string;
   profile?: {
     provider?: string;
@@ -352,6 +353,7 @@ export function assembleContext(input: ContextAssemblyInput): ContextAssemblyRes
       ...(input.extraMemoryHints ?? []),
     ],
     interventionLevel: input.interventionLevel,
+    providerProfileSystemContract: input.providerProfileSystemContract,
     userOverlay: input.userOverlay,
     userGuidance,
     userRequest: input.userRequest,
@@ -586,6 +588,7 @@ function contextAssemblyPartitionCharCounts(segments: PromptSegment[]): ContextA
     'agentInterventionContract',
     'resourceEvidencePolicyContract',
     'memoryAndTaskContextContract',
+    'providerProfileContract',
     'rulerContext',
     'authoritativeDocExcerpts',
   ]);
@@ -686,6 +689,7 @@ function contextAssemblyPartitionName(segment: PromptSegment): ContextAssemblyPa
     case 'agentInterventionContract':
     case 'resourceEvidencePolicyContract':
     case 'memoryAndTaskContextContract':
+    case 'providerProfileContract':
       return 'AgentOperatingContract';
     case 'toolCatalogSummary':
       return 'StaticToolCatalogDigest';

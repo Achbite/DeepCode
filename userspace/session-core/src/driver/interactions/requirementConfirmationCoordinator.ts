@@ -19,6 +19,9 @@ import type { PromptEnvelope } from '../../prompt/types.js';
 import type { DriverProviderTurnFrame } from '../runFrame.js';
 import { SessionDriverProviderRuntimeAccessor } from '../runFrame.js';
 import { buildProviderTurnSnapshot } from '../context/providerTurnSnapshot.js';
+import { ProviderProfileRegistry } from '../../provider/ProviderProfileRegistry.js';
+
+const providerProfiles = new ProviderProfileRegistry();
 
 export interface RequirementConfirmationInput {
   sessionId: string;
@@ -116,6 +119,7 @@ export class RequirementConfirmationCoordinator<
       projectMemoryMode: input.projectMemoryMode,
       extraMemoryHints: state.memoryHints,
       interventionLevel: input.interventionLevel,
+      providerProfileSystemContract: providerProfiles.profile('planning-v1').systemContract,
       userGuidance: this.ports.collectUserGuidanceEvents(input.existingEvents ?? [], state.runId),
       userOverlay: [
         'Before proposing side-effect work, request user intervention only if a concrete decision is needed.',

@@ -98,6 +98,13 @@ export function buildPromptEnvelope(input: PromptEnvelopeBuilderInput): PromptEn
       content: memoryAndTaskContextContractSummary(),
     },
     {
+      name: 'providerProfileContract',
+      priority: 2.8,
+      stable: true,
+      cacheClass: 'globalStable',
+      content: input.providerProfileSystemContract?.trim() ?? '',
+    },
+    {
       priority: 3,
       stable: false,
       cacheClass: 'turnDynamic',
@@ -223,6 +230,41 @@ export function buildPromptEnvelope(input: PromptEnvelopeBuilderInput): PromptEn
     auditOnlyContext: auditOnlyLayers.map(renderLayer).join('\n\n'),
     layers,
     segments,
+    stableLayerNames: stableLayers.map((layer) => layer.name),
+    dynamicLayerNames: dynamicLayers.map((layer) => layer.name),
+    auditOnlyLayerNames: auditOnlyLayers.map((layer) => layer.name),
+  };
+}
+
+export function bindPromptProviderProfile(
+  prompt: PromptEnvelope,
+  providerProfileSystemContract: string
+): PromptEnvelope {
+  const profileContent = providerProfileSystemContract.trim();
+  const hasProfileLayer = prompt.layers.some((layer) => layer.name === 'providerProfileContract');
+  const layers = (hasProfileLayer
+    ? prompt.layers.map((layer) => layer.name === 'providerProfileContract'
+      ? { ...layer, content: profileContent }
+      : layer)
+    : [
+        ...prompt.layers,
+        {
+          name: 'providerProfileContract' as const,
+          priority: 2.8,
+          stable: true,
+          cacheClass: 'globalStable' as const,
+          content: profileContent,
+        },
+      ]).sort((left, right) => left.priority - right.priority);
+  const stableLayers = layers.filter((layer) => layer.stable);
+  const dynamicLayers = layers.filter((layer) => !layer.stable && layer.name !== 'auditOnlyContext' && layer.content.trim());
+  const auditOnlyLayers = layers.filter((layer) => layer.name === 'auditOnlyContext');
+  return {
+    stablePrefix: stableLayers.map(renderLayer).join('\n\n'),
+    dynamicSuffix: prompt.dynamicSuffix,
+    auditOnlyContext: prompt.auditOnlyContext,
+    layers,
+    segments: layers.map(promptSegmentFromLayer),
     stableLayerNames: stableLayers.map((layer) => layer.name),
     dynamicLayerNames: dynamicLayers.map((layer) => layer.name),
     auditOnlyLayerNames: auditOnlyLayers.map((layer) => layer.name),

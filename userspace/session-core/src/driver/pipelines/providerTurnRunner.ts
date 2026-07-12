@@ -8,7 +8,7 @@ import type {
   ProjectionDelta,
 } from '@deepcode/protocol';
 import type { ContextAssemblyRecord, PromptCachePlan } from '../../context/index.js';
-import type { DriverProviderTurnFrame } from '../runFrame.js';
+import type { DriverProviderTurnFrame, ProviderRequestCacheHistoryEntry } from '../runFrame.js';
 import type { ProviderTraceRecorderPorts } from './providerTraceRecorder.js';
 import type { ProviderJsonModeCoordinator } from './providerJsonModeCoordinator.js';
 import type { ProviderStreamCoordinator, ProviderStreamVisibleLanguage } from './providerStreamCoordinator.js';
@@ -22,7 +22,7 @@ export interface ProviderTurnRunnerState extends ProviderStreamRuntimeState {
   cachePlan?: PromptCachePlan;
   contextAssembly?: ContextAssemblyRecord;
   providerTurnFrame?: DriverProviderTurnFrame;
-  providerRequestCacheHistory?: Record<string, { requestText: string; segmentIds: string[] }>;
+  providerRequestCacheHistory?: Record<string, ProviderRequestCacheHistoryEntry>;
 }
 
 export interface ProviderTurnResult {
@@ -188,16 +188,17 @@ export class ProviderTurnRunner<TState extends ProviderTurnRunnerState> {
           charLength: segment.charLength,
         })) ?? []),
         {
-        id: 'provider-request-topology',
-        name: 'providerRequestTopology',
-        cacheClass: 'providerRequest',
-        stablePrefix: false,
-        auditOnly: true,
-        ...cacheTopology,
+          id: 'provider-request-topology',
+          name: 'providerRequestTopology',
+          cacheClass: 'providerRequest',
+          stablePrefix: false,
+          auditOnly: true,
+          ...cacheTopology,
         },
       ],
-      stablePrefixHash: state.contextAssembly?.stablePrefixHash,
-      dynamicSuffixHash: state.contextAssembly?.dynamicSuffixHash,
+      // Request telemetry hashes the rendered provider frame, not the provider-scoped assembly cache key.
+      stablePrefixHash: state.providerTurnFrame?.snapshot?.stablePrefixHash,
+      dynamicSuffixHash: state.providerTurnFrame?.snapshot?.dynamicSuffixHash,
       finalUserPromptHash: state.providerTurnFrame?.snapshot?.finalUserPromptHash,
       finalUserPromptCharLength: state.providerTurnFrame?.snapshot?.finalUserPromptCharLength,
       cacheHash: state.contextAssembly?.cacheHash,
@@ -301,16 +302,19 @@ function providerRequestCacheTopology(
     tools: options.tools?.map((tool) => ({ name: tool.name, inputSchema: tool.inputSchema })) ?? [],
     responseFormat: options.responseFormat ?? null,
   });
-  const currentSegments = state.contextAssembly?.segments.map((segment) => `${segment.id}:${segment.contentHash}`) ?? [];
+  const currentSegments = state.providerTurnFrame?.snapshot?.segments.map((segment) => ({
+    id: segment.id,
+    contentHash: segment.contentHash,
+  })) ?? [];
   const history = state.providerRequestCacheHistory ?? {};
   const previous = history[profileId];
   const longestCommonPrefixCharLength = previous
     ? commonPrefixLength(previous.requestText, requestText)
     : 0;
   const changedSegmentIds = previous
-    ? changedSegments(previous.segmentIds, currentSegments)
-    : currentSegments.map((entry) => entry.split(':', 1)[0]);
-  history[profileId] = { requestText, segmentIds: currentSegments };
+    ? changedSegments(previous.segments, currentSegments)
+    : currentSegments.map((entry) => entry.id);
+  history[profileId] = { requestText, segments: currentSegments };
   state.providerRequestCacheHistory = history;
   return {
     semanticProfileId: profileId,
@@ -334,15 +338,12 @@ function commonPrefixLength(left: string, right: string): number {
   return index;
 }
 
-function changedSegments(previous: string[], current: string[]): string[] {
-  const previousIndex = new Map(previous.map((entry) => {
-    const separator = entry.lastIndexOf(':');
-    return [entry.slice(0, separator), entry.slice(separator + 1)] as const;
-  }));
-  const currentIndex = new Map(current.map((entry) => {
-    const separator = entry.lastIndexOf(':');
-    return [entry.slice(0, separator), entry.slice(separator + 1)] as const;
-  }));
+function changedSegments(
+  previous: Array<{ id: string; contentHash: string }>,
+  current: Array<{ id: string; contentHash: string }>
+): string[] {
+  const previousIndex = new Map(previous.map((entry) => [entry.id, entry.contentHash] as const));
+  const currentIndex = new Map(current.map((entry) => [entry.id, entry.contentHash] as const));
   return [...new Set([...previousIndex.keys(), ...currentIndex.keys()])]
     .filter((id) => previousIndex.get(id) !== currentIndex.get(id))
     .sort();

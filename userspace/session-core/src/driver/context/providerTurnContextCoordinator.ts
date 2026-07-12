@@ -127,6 +127,7 @@ export class ProviderTurnContextCoordinator<State extends ProviderTurnContextSta
     ], state);
     const acceptedExecution = Boolean(state.acceptedImplementationPlan || state.currentTaskContext);
     const allowedProposals = providerVisibleAllowedProposals(kernelAllowedProposals, acceptedExecution);
+    const profile = this.profiles.profile(acceptedExecution ? 'execution-v1' : 'planning-v1');
     const providerUserRequest = this.providerVisibleUserRequest(state, input.inputContent);
     const userGuidance = this.ports.collectUserGuidanceEvents(input.lastResult.events, state.runId);
 
@@ -141,6 +142,7 @@ export class ProviderTurnContextCoordinator<State extends ProviderTurnContextSta
       projectMemoryMode: input.projectMemoryMode,
       extraMemoryHints: this.ports.memoryHints(state),
       interventionLevel: input.interventionLevel,
+      providerProfileSystemContract: profile.systemContract,
       userGuidance,
       userRequest: providerUserRequest,
       currentTaskGoal: state.currentTaskContext?.goal,
@@ -170,11 +172,7 @@ export class ProviderTurnContextCoordinator<State extends ProviderTurnContextSta
       appliedAtProviderStage: 'provider_call',
       userRequest: state.userRequest,
     });
-    const profile = this.profiles.profile(acceptedExecution ? 'execution-v1' : 'planning-v1');
-    const prompt = {
-      ...assembledContext.prompt,
-      stablePrefix: profile.systemContract,
-    };
+    const prompt = assembledContext.prompt;
     // ProviderTurnContract and PromptEnvelope must share one ContextAdmission assembly.
     const providerTurnFrame = this.ports.buildProviderTurnContract({
       contractId: input.contractId,

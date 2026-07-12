@@ -17,6 +17,7 @@ import { buildProviderTurnSnapshot } from './providerTurnSnapshot.js';
 import { renderProviderTurnUserPrompt } from './providerTurnPromptRenderer.js';
 import type { ContextFrameBuilder } from './contextFrameBuilder.js';
 import { ProviderProfileRegistry } from '../../provider/ProviderProfileRegistry.js';
+import { bindPromptProviderProfile } from '../../prompt/builder.js';
 
 const providerProfiles = new ProviderProfileRegistry();
 
@@ -66,8 +67,7 @@ export function prepareProviderSideCallContextAdmission<State extends ProviderSi
 ): ProviderSideCallContextAdmissionResult {
   const profile = providerProfiles.profile(providerProfiles.profileIdForMode(input.turnMode));
   const prompt = {
-    ...input.prompt,
-    stablePrefix: profile.systemContract,
+    ...bindPromptProviderProfile(input.prompt, profile.systemContract),
     dynamicSuffix: input.dynamicContent,
   };
   const contract = input.contextFrameBuilder.buildSessionProviderTurnContract({

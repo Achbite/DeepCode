@@ -18,6 +18,7 @@ import type {
   ResourcePacket,
 } from '../../context/types.js';
 import type { RequirementRecord } from '../../requirement/types.js';
+import { ProviderProfileRegistry } from '../../provider/ProviderProfileRegistry.js';
 import type { ContextFrameBuilder } from '../context/index.js';
 import { prepareProviderSideCallMessagesContextAdmission } from '../context/index.js';
 import type { DriverProviderTurnFrame } from '../runFrame.js';
@@ -26,6 +27,8 @@ import {
   SessionDriverRepairRuntimeAccessor,
   type SessionDriverProviderRuntimeState,
 } from '../runFrame.js';
+
+const providerProfiles = new ProviderProfileRegistry();
 
 export interface TerminalGuidanceRevisionInput {
   content: string;
@@ -138,6 +141,7 @@ export class TerminalGuidanceRevisionCoordinator<
       projectMemoryMode: input.projectMemoryMode,
       extraMemoryHints: this.ports.implementationBatchHints(state),
       interventionLevel: input.interventionLevel,
+      providerProfileSystemContract: providerProfiles.profile('review-v1').systemContract,
       userOverlay: this.ports.overlay({
         originalRequest: input.content,
         draftAnswer,

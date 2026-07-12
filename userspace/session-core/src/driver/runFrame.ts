@@ -319,7 +319,10 @@ export interface SessionDriverProviderState {
 
 export interface ProviderRequestCacheHistoryEntry {
   readonly requestText: string;
-  readonly segmentIds: string[];
+  readonly segments: Array<{
+    readonly id: string;
+    readonly contentHash: string;
+  }>;
 }
 
 export interface SessionDriverProviderRuntimeState {
