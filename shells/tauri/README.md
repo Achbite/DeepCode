@@ -21,7 +21,7 @@ pnpm --filter @deepcode/tauri-shell tauri:dev
 Packaged build command:
 
 ```bash
-./build.sh
+bash ./build.sh
 ```
 
 Direct Tauri development still expects the GUI dist to exist first:

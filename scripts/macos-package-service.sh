@@ -28,14 +28,14 @@ Usage:
   scripts/macos-package-service.sh run
   scripts/macos-package-service.sh stop
   scripts/macos-package-service.sh status [--quiet]
-  scripts/macos-package-service.sh submit [--product DeepCode|DeepCode-GUI] [--clean] [--refresh-gui-dist] [--no-kill-running] [--wait] [--timeout-seconds N]
+  scripts/macos-package-service.sh submit [--products DeepCode-GUI,DeepCode] [--clean] [--refresh-gui-dist] [--no-kill-running] [--wait] [--timeout-seconds N]
 
 Commands:
   start   Start the macOS host package worker in the background.
   run     Run the package worker in the foreground.
   stop    Stop the background worker.
   status  Report whether the worker process is alive.
-  submit  Queue one package request. This command can run inside Docker. GUI dist refresh and releasing the old app bundle are the defaults.
+  submit  Queue one product-set transaction. This command can run inside Docker. GUI dist refresh and releasing old app bundles are the defaults.
 USAGE
 }
 
@@ -252,6 +252,25 @@ validate_product() {
   esac
 }
 
+normalize_products() {
+  local raw="${1//,/ }"
+  local product
+  local normalized=""
+  for product in $raw; do
+    validate_product "$product"
+    case ",$normalized," in
+      *",$product,"*) continue ;;
+    esac
+    if [ -n "$normalized" ]; then
+      normalized="$normalized,$product"
+    else
+      normalized="$product"
+    fi
+  done
+  [ -n "$normalized" ] || fail "product set must not be empty"
+  printf '%s\n' "$normalized"
+}
+
 validate_bool() {
   case "$1" in
     0|1) ;;
@@ -261,18 +280,19 @@ validate_bool() {
 
 process_request() {
   local request_path="$1"
-  local request_id product clean refresh kill_running log_path started_at finished_at exit_code package_pid
+  local request_id product products clean refresh kill_running log_path started_at finished_at exit_code package_pid
 
   request_id="$(basename "$request_path" .running)"
+  products="$(read_request_value "$request_path" products)"
   product="$(read_request_value "$request_path" product)"
   clean="$(read_request_value "$request_path" clean)"
   refresh="$(read_request_value "$request_path" refresh_gui_dist)"
   kill_running="$(read_request_value "$request_path" kill_running)"
-  product="${product:-DeepCode}"
+  products="${products:-${product:-DeepCode}}"
+  products="$(normalize_products "$products")"
   clean="${clean:-0}"
   refresh="${refresh:-1}"
   kill_running="${kill_running:-1}"
-  validate_product "$product"
   validate_bool "$clean"
   validate_bool "$refresh"
   validate_bool "$kill_running"
@@ -285,11 +305,11 @@ process_request() {
 
   set +e
   {
-    printf '==[macos-package-service]== request=%s product=%s clean=%s refresh_gui_dist=%s kill_running=%s started_at=%s\n' \
-      "$request_id" "$product" "$clean" "$refresh" "$kill_running" "$started_at"
+    printf '==[macos-package-service]== request=%s products=%s clean=%s refresh_gui_dist=%s kill_running=%s started_at=%s\n' \
+      "$request_id" "$products" "$clean" "$refresh" "$kill_running" "$started_at"
     cd "$ROOT_DIR"
     env \
-      DEEPCODE_MACOS_PRODUCT="$product" \
+      DEEPCODE_MACOS_PRODUCTS="$products" \
       DEEPCODE_MACOS_CLEAN="$clean" \
       DEEPCODE_MACOS_REFRESH_GUI_DIST="$refresh" \
       DEEPCODE_MACOS_KILL_RUNNING="$kill_running" \
@@ -372,7 +392,7 @@ run_cmd() {
 
 submit_cmd() {
   ensure_dirs
-  local product="DeepCode"
+  local products="DeepCode"
   local clean=0
   local refresh=1
   local kill_running="${DEEPCODE_MACOS_KILL_RUNNING:-1}"
@@ -383,7 +403,12 @@ submit_cmd() {
     case "$1" in
       --product)
         [ "$#" -ge 2 ] || fail "--product requires a value"
-        product="$2"
+        products="$2"
+        shift 2
+        ;;
+      --products)
+        [ "$#" -ge 2 ] || fail "--products requires a value"
+        products="$2"
         shift 2
         ;;
       --clean)
@@ -416,7 +441,7 @@ submit_cmd() {
         ;;
     esac
   done
-  validate_product "$product"
+  products="$(normalize_products "$products")"
   validate_bool "$clean"
   validate_bool "$refresh"
   validate_bool "$kill_running"
@@ -431,7 +456,7 @@ submit_cmd() {
   status_path="$STATUS_DIR/$request_id.status"
   log_path="$LOG_DIR/$request_id.log"
   {
-    printf 'product=%s\n' "$product"
+    printf 'products=%s\n' "$products"
     printf 'clean=%s\n' "$clean"
     printf 'refresh_gui_dist=%s\n' "$refresh"
     printf 'kill_running=%s\n' "$kill_running"
@@ -439,7 +464,7 @@ submit_cmd() {
   } >"$request_tmp"
   write_status "$request_id" "queued" "$log_path"
   mv "$request_tmp" "$request_path"
-  log "queued request=$request_id product=$product kill_running=$kill_running"
+  log "queued request=$request_id products=$products kill_running=$kill_running"
 
   if [ "$wait" != "1" ]; then
     return 0
