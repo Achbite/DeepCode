@@ -4,26 +4,26 @@
 # 常规 Linux/Windows 构建在 Docker 中执行；macOS .app 打包入口在 macOS 宿主机执行。
 #
 # 默认行为：
-#   ./build.sh
-#     macOS 宿主机：强制刷新前端并打包最新 DeepCode.app / DeepCode-GUI.app。
+#   bash ./build.sh
+#     macOS 宿主机：按输入指纹增量构建，并以同一事务打包 DeepCode.app / DeepCode-GUI.app。
 #     Docker/Linux：完整构建并输出 bin/linux-x64/ 与 bin/win64/，可自动请求 macOS 打包服务。
 #
 # 分阶段入口：
-#   ./build.sh --stage gui      # pnpm + React GUI + Tauri embedded dist
-#   ./build.sh --stage deepcode-gui # pnpm + DeepCode-GUI dist
-#   ./build.sh --stage macos-package-service # macOS host: start package worker
-#   ./build.sh --stage package-macos # macOS host/Docker request: build complete macOS app set
-#   ./build.sh --stage package-macos-deepcode-gui # macOS host: build DeepCode-GUI.app package
-#   ./build.sh --stage macos-deepcode-gui # compat alias for package-macos-deepcode-gui
-#   ./build.sh --stage daemon   # Linux/Windows Rust Kernel daemon
-#   ./build.sh --stage cli      # Linux/Windows CLI Host shell
-#   ./build.sh --stage tui      # Linux/Windows TUI Host shell
-#   ./build.sh --stage kernel   # 兼容入口：daemon + cli + tui
-#   ./build.sh --stage tauri    # Windows DeepCode.exe Tauri thin shell
-#   ./build.sh --stage deepcode-gui-tauri # Windows DeepCode-GUI.exe Tauri shell
-#   ./build.sh --stage package  # 复制已有构建产物到 bin/
-#   ./build.sh --stage verify-package-runtime # 只读检查已打包 runtime 是否齐全
-#   ./build.sh --stage all      # 等价默认完整构建
+#   bash ./build.sh --stage gui      # pnpm + React GUI + Tauri embedded dist
+#   bash ./build.sh --stage deepcode-gui # pnpm + DeepCode-GUI dist
+#   bash ./build.sh --stage macos-package-service # macOS host: start package worker
+#   bash ./build.sh --stage package-macos # macOS host/Docker request: build complete macOS app set
+#   bash ./build.sh --stage package-macos-deepcode-gui # macOS host: build DeepCode-GUI.app package
+#   bash ./build.sh --stage macos-deepcode-gui # compat alias for package-macos-deepcode-gui
+#   bash ./build.sh --stage daemon   # Linux/Windows Rust Kernel daemon
+#   bash ./build.sh --stage cli      # Linux/Windows CLI Host shell
+#   bash ./build.sh --stage tui      # Linux/Windows TUI Host shell
+#   bash ./build.sh --stage kernel   # 兼容入口：daemon + cli + tui
+#   bash ./build.sh --stage tauri    # Windows DeepCode.exe Tauri thin shell
+#   bash ./build.sh --stage deepcode-gui-tauri # Windows DeepCode-GUI.exe Tauri shell
+#   bash ./build.sh --stage package  # 复制已有构建产物到 bin/
+#   bash ./build.sh --stage verify-package-runtime # 只读检查已打包 runtime 是否齐全
+#   bash ./build.sh --stage all      # 等价默认完整构建
 #
 # 缓存开关：
 #   DEEPCODE_DISABLE_SCCACHE=1  禁用 sccache，回退到普通 cargo。
@@ -99,7 +99,13 @@ elif [ -f /.dockerenv ] && { [ -z "${TMPDIR:-}" ] || [ "${TMPDIR%/}" = "/tmp" ];
 else
   BUILD_TMPDIR="${TMPDIR:-/tmp}"
 fi
-PNPM_STORE_DIR="${PNPM_STORE_DIR:-$ROOT_DIR/.pnpm-store}"
+if [ -n "${PNPM_STORE_DIR:-}" ]; then
+  PNPM_STORE_DIR="$PNPM_STORE_DIR"
+elif [ -f /.dockerenv ] && [ -d /root/.local/share/pnpm/store ]; then
+  PNPM_STORE_DIR="/root/.local/share/pnpm/store"
+else
+  PNPM_STORE_DIR="$ROOT_DIR/.pnpm-store"
+fi
 PNPM_REGISTRY="${DEEPCODE_PNPM_REGISTRY:-https://registry.yarnpkg.com}"
 PNPM_NETWORK_CONCURRENCY="${DEEPCODE_PNPM_NETWORK_CONCURRENCY:-4}"
 PNPM_FETCH_RETRIES="${DEEPCODE_PNPM_FETCH_RETRIES:-2}"
@@ -363,9 +369,9 @@ require_docker_build_environment() {
   exit 3
 }
 
-run_macos_package_from_host() {
-  local product="$1"
-  local output_app="$2"
+run_macos_package_products_from_host() {
+  local products_csv
+  local product
   if is_docker_environment; then
     echo "==[build][error]== macOS package stages must run on the macOS host, not inside Docker." >&2
     exit 3
@@ -375,15 +381,18 @@ run_macos_package_from_host() {
     exit 3
   fi
 
-  echo "==[build][package-macos]== package $product.app on macOS host"
+  products_csv="$(IFS=,; printf '%s' "$*")"
+  echo "==[build][package-macos]== package product set on macOS host: $products_csv"
   if [ "$clean_cache" = "1" ]; then
-    env DEEPCODE_MACOS_CLEAN=1 DEEPCODE_MACOS_REFRESH_GUI_DIST=1 DEEPCODE_MACOS_KILL_RUNNING="$kill_running" DEEPCODE_MACOS_PRODUCT="$product" bash ./scripts/package-macos.sh
+    env DEEPCODE_MACOS_CLEAN=1 DEEPCODE_MACOS_REFRESH_GUI_DIST=1 DEEPCODE_MACOS_KILL_RUNNING="$kill_running" DEEPCODE_MACOS_PRODUCTS="$products_csv" bash ./scripts/package-macos.sh
   else
-    env DEEPCODE_MACOS_REFRESH_GUI_DIST=1 DEEPCODE_MACOS_KILL_RUNNING="$kill_running" DEEPCODE_MACOS_PRODUCT="$product" bash ./scripts/package-macos.sh
+    env DEEPCODE_MACOS_REFRESH_GUI_DIST=1 DEEPCODE_MACOS_KILL_RUNNING="$kill_running" DEEPCODE_MACOS_PRODUCTS="$products_csv" bash ./scripts/package-macos.sh
   fi
   echo ""
   echo "==[build]== DONE"
-  echo "$BIN_ROOT/macos-arm64/$output_app"
+  for product in "$@"; do
+    echo "$BIN_ROOT/macos-arm64/$product.app"
+  done
 }
 
 declare -a resolved_macos_products=()
@@ -429,17 +438,6 @@ resolve_macos_products() {
   fi
 }
 
-run_macos_package_products_from_host() {
-  local product
-  for product in "$@"; do
-    case "$product" in
-      DeepCode) run_macos_package_from_host "DeepCode" "DeepCode.app" ;;
-      DeepCode-GUI) run_macos_package_from_host "DeepCode-GUI" "DeepCode-GUI.app" ;;
-      *) echo "==[build][error]== unsupported macOS product: $product" >&2; exit 2 ;;
-    esac
-  done
-}
-
 start_macos_package_service_from_host() {
   if is_docker_environment; then
     echo "==[build][error]== macOS package service must be started on the macOS host, not inside Docker." >&2
@@ -477,11 +475,13 @@ ensure_macos_package_service_running() {
 }
 
 submit_macos_package_request() {
-  local product="$1"
-  local required="${2:-1}"
+  local required="$1"
+  shift
+  local products_csv
   local wait="${DEEPCODE_MACOS_PACKAGE_WAIT:-1}"
   local timeout="${DEEPCODE_MACOS_PACKAGE_TIMEOUT_SECONDS:-3600}"
-  local args=(submit --product "$product" --timeout-seconds "$timeout")
+  products_csv="$(IFS=,; printf '%s' "$*")"
+  local args=(submit --products "$products_csv" --timeout-seconds "$timeout")
 
   args+=(--refresh-gui-dist)
   if [ "$clean_cache" = "1" ]; then
@@ -505,17 +505,14 @@ submit_macos_package_request() {
     return 0
   fi
 
-  echo "==[build][package-macos]== submit $product request to macOS package service"
+  echo "==[build][package-macos]== submit product set to macOS package service: $products_csv"
   bash ./scripts/macos-package-service.sh "${args[@]}"
 }
 
 submit_macos_package_requests() {
   local required="$1"
   shift
-  local product
-  for product in "$@"; do
-    submit_macos_package_request "$product" "$required"
-  done
+  submit_macos_package_request "$required" "$@"
 }
 
 auto_submit_macos_package_request() {
@@ -566,9 +563,9 @@ if [ "$host_macos_stage_count" -gt 0 ]; then
     fi
   else
     if is_docker_environment; then
-      submit_macos_package_request "DeepCode-GUI" 1
+      submit_macos_package_request 1 "DeepCode-GUI"
     else
-      run_macos_package_from_host "DeepCode-GUI" "DeepCode-GUI.app"
+      run_macos_package_products_from_host "DeepCode-GUI"
     fi
   fi
   exit 0
@@ -681,7 +678,10 @@ tracked_files() {
   if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     git ls-files --cached --others --exclude-standard -- "$@"
   else
-    find "$@" -type f 2>/dev/null || true
+    find "$@" \
+      \( -type d \( -name .git -o -name node_modules -o -name target -o -name dist -o -name 'dist-*' -o -name .build-cache \) -prune \) -o \
+      \( -type f ! -name .DS_Store ! -name '*.tsbuildinfo' -print \) \
+      2>/dev/null || true
   fi
 }
 
@@ -698,7 +698,8 @@ find_existing_files() {
 
 stage_hash() {
   local stage="$1"
-  {
+  local files_hash
+  files_hash="$({
     tracked_files build.sh scripts/cargo-with-fallback.sh
     case "$stage" in
       gui)
@@ -708,12 +709,6 @@ stage_hash() {
       deepcode-gui)
         tracked_files package.json pnpm-lock.yaml userspace/protocol userspace/session-core userspace/gui shells/deepcode-gui \
           | grep -Ev '(^|/)(dist|dist-deepcode-gui|node_modules)/' || true
-        find_existing_files \
-          userspace/gui/deepcode-gui.html \
-          userspace/gui/vite.deepcode-gui.config.ts \
-          userspace/gui/src/deepcode-gui \
-          shells/deepcode-gui \
-          | grep -Ev '(^|/)(dist|dist-deepcode-gui|node_modules|target)/' || true
         ;;
       kernel)
         tracked_files Cargo.toml Cargo.lock crates/deepcode-kernel-abi crates/deepcode-kernel-core \
@@ -754,7 +749,23 @@ stage_hash() {
     | LC_ALL=C sort -u \
     | xargs -r sha256sum \
     | sha256sum \
-    | awk '{print $1}'
+    | awk '{print $1}')"
+
+  {
+    printf 'stage=%s\n' "$stage"
+    printf 'files=%s\n' "$files_hash"
+    case "$stage" in
+      gui|deepcode-gui)
+        printf 'node=%s\n' "$(node --version 2>/dev/null || printf unavailable)"
+        printf 'pnpm=%s\n' "$(pnpm --version 2>/dev/null || printf unavailable)"
+        ;;
+      *)
+        printf 'rustc=%s\n' "$(rustc --version 2>/dev/null || printf unavailable)"
+        printf 'cargo=%s\n' "$(cargo --version 2>/dev/null || printf unavailable)"
+        printf 'target=%s\n' "$CARGO_TARGET_ROOT"
+        ;;
+    esac
+  } | sha256sum | awk '{print $1}'
 }
 
 stage_should_skip() {
@@ -787,7 +798,7 @@ mark_stage_built() {
 
 run_pnpm_install() {
   echo "==[build][deps]== pnpm install"
-  pnpm install --no-frozen-lockfile \
+  pnpm install --frozen-lockfile \
     --store-dir "$PNPM_STORE_DIR" \
     --registry "$PNPM_REGISTRY" \
     --network-concurrency "$PNPM_NETWORK_CONCURRENCY" \
@@ -856,14 +867,26 @@ normalize_deepcode_gui_dist() {
   fi
 }
 
+FRONTEND_SHARED_READY=0
+
+build_frontend_shared() {
+  if [ "$FRONTEND_SHARED_READY" = "1" ]; then
+    return
+  fi
+  echo "==[build][frontend-shared]== build protocol/session-core and check client types"
+  pnpm --filter @deepcode/protocol build
+  pnpm --filter @deepcode/session-core build
+  pnpm --filter @deepcode/client build:types
+  FRONTEND_SHARED_READY=1
+}
+
 build_gui() {
   if stage_should_skip gui "$CLIENT_DIR/dist/index.html" "$ROOT_DIR/shells/tauri/dist/index.html"; then
     return
   fi
-  echo "==[build][gui]== build TS user/session/UI packages"
-  pnpm --filter @deepcode/protocol build
-  pnpm --filter @deepcode/session-core build
-  pnpm --filter @deepcode/client build
+  build_frontend_shared
+  echo "==[build][gui]== build DeepCode web assets"
+  pnpm --filter @deepcode/client build:web
   echo "==[build][gui]== prepare Tauri embedded GUI dist"
   prepare_tauri_dist
   mark_stage_built gui
@@ -873,10 +896,9 @@ build_deepcode_gui() {
   if stage_should_skip deepcode-gui "$CLIENT_DIR/dist-deepcode-gui/index.html" "$ROOT_DIR/shells/deepcode-gui/dist/index.html"; then
     return
   fi
-  echo "==[build][deepcode-gui]== build TS protocol/session-core/DeepCode-GUI packages"
-  pnpm --filter @deepcode/protocol build
-  pnpm --filter @deepcode/session-core build
-  pnpm --filter @deepcode/client build:deepcode-gui
+  build_frontend_shared
+  echo "==[build][deepcode-gui]== build DeepCode-GUI web assets"
+  pnpm --filter @deepcode/client build:deepcode-gui:web
   normalize_deepcode_gui_dist
   echo "==[build][deepcode-gui]== prepare DeepCode-GUI Tauri embedded dist"
   prepare_deepcode_gui_tauri_dist

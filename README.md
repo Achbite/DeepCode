@@ -51,7 +51,7 @@ bash ./build.sh
 ```
 
 By default, Docker-side builds use `DEEPCODE_MACOS_PACKAGE_MODE=auto`: if the
-host package service is running, the build queues the macOS packaging requests;
+host package service is running, the build queues one product-set transaction;
 if it is not running, the Docker package still completes and macOS packaging is
 skipped with a clear log message. For release verification that must fail when
 macOS packaging is unavailable, use:
@@ -60,10 +60,11 @@ macOS packaging is unavailable, use:
 DEEPCODE_MACOS_PACKAGE_MODE=require bash ./build.sh
 ```
 
-The macOS product set defaults to `DeepCode-GUI,DeepCode`. This order is
-intentional: DeepCode-GUI is packaged first, then the Editor package refreshes
-the shared root sidecars and `web/` directory while preserving
-`DeepCode-GUI.app`. Override it only for targeted rebuilds:
+The macOS product set defaults to `DeepCode-GUI,DeepCode`. Both products share
+one frontend preparation, Cargo dependency check, Darwin runtime build, source
+fingerprint, and publish boundary. Unchanged frontend and Rust stages reuse
+their input-keyed caches; `--clean-cache` is the explicit cache invalidation
+path. Override the product set only for targeted rebuilds:
 
 ```bash
 DEEPCODE_MACOS_PRODUCTS=DeepCode bash ./build.sh --stage package-macos
@@ -107,7 +108,12 @@ bin/macos-arm64/
 
 The current macOS package is a local runnable package. It does not include DMG packaging, Developer ID signing, or notarization. The script creates a package-local writable config root and writes `build-info.json` for `/api/health` diagnostics.
 
-If `/api/health` does not include `buildCommit`, `protocolVersion`, or `toolCatalogVersion`, or if a new run archive still shows an old Chinese tagged protocol prompt instead of `deepcode.agent.protocol.v3`, quit the running `DeepCode.app`, run `make package-macos-clean`, and reopen the app. The package script fails fast when the target app or its bundled `deepcode-kernel` is still running, because repackaging while the old process is alive can make review tests hit the stale Kernel.
+The package transaction writes and validates both the current commit and a
+content fingerprint, stages every requested app before publishing, and refuses
+to publish a mixed product set if source files change during the build. If
+`/api/health` does not include `buildCommit`, `sourceFingerprint`,
+`protocolVersion`, or `toolCatalogVersion`, quit the running app, run
+`make package-macos-clean`, and reopen it.
 
 ## Current Status
 

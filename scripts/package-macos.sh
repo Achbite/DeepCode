@@ -23,42 +23,80 @@ if git -C "$ROOT_DIR" diff --quiet --ignore-submodules -- 2>/dev/null \
 else
   SOURCE_DIRTY=1
 fi
-PRODUCT="${DEEPCODE_MACOS_PRODUCT:-DeepCode}"
-case "$PRODUCT" in
-  DeepCode)
-    APP_NAME="DeepCode"
-    BUNDLE_ID="com.achbite.deepcode"
-    TAURI_DIR="$ROOT_DIR/shells/tauri"
-    TAURI_BIN_NAME="DeepCode"
-    CLIENT_DIST_DIR="$CLIENT_DIR/dist"
-    WEB_DIR_NAME="web"
-    BIN_DIR="$ROOT_DIR/bin/macos-arm64"
-    DOCKER_GUI_STAGE="gui"
-    DEFAULT_PORT="31245"
-    TUI_COMMAND_NAME="DeepCode-TUI.command"
-    COPY_ROOT_WEB_DIST="1"
-    WRITE_TUI_LAUNCHER="1"
-    ;;
-  DeepCode-GUI)
-    APP_NAME="DeepCode-GUI"
-    BUNDLE_ID="com.achbite.deepcode.gui"
-    TAURI_DIR="$ROOT_DIR/shells/deepcode-gui"
-    TAURI_BIN_NAME="DeepCode-GUI"
-    CLIENT_DIST_DIR="$CLIENT_DIR/dist-deepcode-gui"
-    WEB_DIR_NAME="web-deepcode-gui"
-    BIN_DIR="$ROOT_DIR/bin/macos-arm64"
-    DOCKER_GUI_STAGE="deepcode-gui"
-    DEFAULT_PORT="31246"
-    TUI_COMMAND_NAME=""
-    COPY_ROOT_WEB_DIST="0"
-    WRITE_TUI_LAUNCHER="0"
-    ;;
-  *)
-    printf '==[macos-package][error]== unsupported DEEPCODE_MACOS_PRODUCT: %s\n' "$PRODUCT" >&2
+REQUESTED_PRODUCTS_RAW="${DEEPCODE_MACOS_PRODUCTS:-${DEEPCODE_MACOS_PRODUCT:-DeepCode}}"
+declare -a REQUESTED_PRODUCTS=()
+PRODUCT=""
+APP_NAME=""
+BUNDLE_ID=""
+TAURI_DIR=""
+TAURI_SRC_DIR=""
+TAURI_BIN_NAME=""
+CLIENT_DIST_DIR=""
+WEB_DIR_NAME=""
+DOCKER_GUI_STAGE=""
+DEFAULT_PORT=""
+TUI_COMMAND_NAME=""
+COPY_ROOT_WEB_DIST="0"
+WRITE_TUI_LAUNCHER="0"
+BIN_DIR="$ROOT_DIR/bin/macos-arm64"
+
+parse_requested_products() {
+  local raw="${REQUESTED_PRODUCTS_RAW//,/ }"
+  local product existing
+  for product in $raw; do
+    case "$product" in
+      DeepCode|DeepCode-GUI) ;;
+      *)
+        printf '==[macos-package][error]== unsupported macOS product: %s\n' "$product" >&2
+        exit 2
+        ;;
+    esac
+    for existing in "${REQUESTED_PRODUCTS[@]:-}"; do
+      [ "$existing" != "$product" ] || continue 2
+    done
+    REQUESTED_PRODUCTS+=("$product")
+  done
+  if [ "${#REQUESTED_PRODUCTS[@]}" -eq 0 ]; then
+    printf '==[macos-package][error]== macOS product set must not be empty\n' >&2
     exit 2
-    ;;
-esac
-TAURI_SRC_DIR="$TAURI_DIR/src-tauri"
+  fi
+}
+
+configure_product() {
+  PRODUCT="$1"
+  case "$PRODUCT" in
+    DeepCode)
+      APP_NAME="DeepCode"
+      BUNDLE_ID="com.achbite.deepcode"
+      TAURI_DIR="$ROOT_DIR/shells/tauri"
+      TAURI_BIN_NAME="DeepCode"
+      CLIENT_DIST_DIR="$CLIENT_DIR/dist"
+      WEB_DIR_NAME="web"
+      DOCKER_GUI_STAGE="gui"
+      DEFAULT_PORT="31245"
+      TUI_COMMAND_NAME="DeepCode-TUI.command"
+      COPY_ROOT_WEB_DIST="1"
+      WRITE_TUI_LAUNCHER="1"
+      ;;
+    DeepCode-GUI)
+      APP_NAME="DeepCode-GUI"
+      BUNDLE_ID="com.achbite.deepcode.gui"
+      TAURI_DIR="$ROOT_DIR/shells/deepcode-gui"
+      TAURI_BIN_NAME="DeepCode-GUI"
+      CLIENT_DIST_DIR="$CLIENT_DIR/dist-deepcode-gui"
+      WEB_DIR_NAME="web-deepcode-gui"
+      DOCKER_GUI_STAGE="deepcode-gui"
+      DEFAULT_PORT="31246"
+      TUI_COMMAND_NAME=""
+      COPY_ROOT_WEB_DIST="0"
+      WRITE_TUI_LAUNCHER="0"
+      ;;
+  esac
+  TAURI_SRC_DIR="$TAURI_DIR/src-tauri"
+}
+
+parse_requested_products
+configure_product "${REQUESTED_PRODUCTS[0]}"
 CARGO_TARGET_ROOT="${DEEPCODE_MACOS_CARGO_TARGET_DIR:-$ROOT_DIR/target/macos-arm64}"
 RUST_TOOLCHAIN="${DEEPCODE_MACOS_RUST_TOOLCHAIN:-1.88.0}"
 NODE_MAJOR="${DEEPCODE_MACOS_NODE_MAJOR:-22}"
@@ -74,6 +112,7 @@ TAURI_NETWORK_FALLBACK="${DEEPCODE_MACOS_TAURI_NETWORK_FALLBACK:-1}"
 CLEAN_PACKAGE_CACHE="${DEEPCODE_MACOS_CLEAN:-0}"
 CLI_COMMAND_NAME="DeepCode-CLI.command"
 LIBEXEC_DIR="$BIN_DIR/libexec"
+PACKAGE_STAGE_ROOT="$CARGO_TARGET_ROOT/package-stage"
 TUI_EXEC_NAME="DeepCode-TUI"
 CLI_EXEC_NAME="DeepCode-CLI"
 
@@ -85,10 +124,15 @@ Usage:
   scripts/package-macos.sh [--clean] [--no-kill-running]
 
 Environment:
+  DEEPCODE_MACOS_PRODUCTS=DeepCode-GUI,DeepCode
+                                Build one ordered product-set transaction.
   DEEPCODE_MACOS_PRODUCT=DeepCode|DeepCode-GUI
+                                Compatibility alias for a single product.
   DEEPCODE_MACOS_CLEAN=1        Clean macOS package build artifacts before rebuilding.
   DEEPCODE_MACOS_REFRESH_GUI_DIST=1
-                                Rebuild GUI dist through the Docker dev container. Defaults to 1 for package builds.
+                                Ensure GUI dist through one incremental Docker build. Defaults to 1 for package builds.
+  DEEPCODE_MACOS_NODE_MODULES_VOLUME=<name>
+                                Override the checkout-scoped frontend dependency volume.
   DEEPCODE_MACOS_KILL_RUNNING=1 Automatically stop processes occupying the target .app bundle. Defaults to 1.
 
 Clean keeps package-local user data:
@@ -143,6 +187,37 @@ log() {
 fail() {
   printf '==[macos-package][error]== %s\n' "$*" >&2
   exit 1
+}
+
+source_fingerprint() {
+  if git -C "$ROOT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    {
+      git -C "$ROOT_DIR" rev-parse HEAD
+      git -C "$ROOT_DIR" diff --binary --no-ext-diff HEAD --
+      git -C "$ROOT_DIR" ls-files --others --exclude-standard \
+        | while IFS= read -r path; do
+            printf 'untracked=%s\n' "$path"
+            [ -f "$ROOT_DIR/$path" ] && shasum -a 256 "$ROOT_DIR/$path"
+          done
+    } | shasum -a 256 | awk '{ print $1 }'
+    return
+  fi
+
+  find "$ROOT_DIR" \
+    \( -type d \( -name .git -o -name node_modules -o -name target -o -name bin -o -name dist -o -name 'dist-*' -o -name .build-cache \) -prune \) -o \
+    \( -type f ! -name .DS_Store ! -name '*.tsbuildinfo' -exec shasum -a 256 {} + \) \
+    | LC_ALL=C sort \
+    | shasum -a 256 \
+    | awk '{ print $1 }'
+}
+
+SOURCE_FINGERPRINT="$(source_fingerprint)"
+
+verify_source_fingerprint_unchanged() {
+  local current
+  current="$(source_fingerprint)"
+  [ "$current" = "$SOURCE_FINGERPRINT" ] \
+    || fail "source changed during package transaction; refusing to publish a mixed product set"
 }
 
 running_processes_for_path() {
@@ -233,28 +308,29 @@ release_or_fail_if_target_app_is_running() {
   fi
 }
 
-clean_macos_package_cache() {
+clean_product_package_cache() {
   log "clean macOS package build artifacts for $PRODUCT"
-  log "preserve package-local user data: config/, sessions/, conversation-archives/, kernel/"
-
   rm -rf "$BIN_DIR/$APP_NAME.app" "$BIN_DIR/$WEB_DIR_NAME" "$TAURI_DIR/dist"
-  rm -rf "$BIN_DIR/session-core" "$BIN_DIR/node_modules" "$BIN_DIR/node" "$LIBEXEC_DIR"
   if [ -n "$TUI_COMMAND_NAME" ]; then
     rm -f "$BIN_DIR/$TUI_COMMAND_NAME"
   fi
+  rm -f "$CARGO_TARGET_ROOT/release/$TAURI_BIN_NAME"
+}
+
+clean_shared_package_cache() {
+  log "clean shared macOS package build artifacts"
+  log "preserve package-local user data: config/, sessions/, conversation-archives/, kernel/"
+  rm -rf "$BIN_DIR/session-core" "$BIN_DIR/node_modules" "$BIN_DIR/node" "$LIBEXEC_DIR"
   rm -f \
     "$BIN_DIR/deepcode-kernel" \
     "$BIN_DIR/deepcode-cli" \
     "$BIN_DIR/deepcode-tui" \
     "$BIN_DIR/$CLI_COMMAND_NAME" \
     "$BIN_DIR/README.txt" \
-    "$BIN_DIR/build-info.json"
-
-  rm -f \
+    "$BIN_DIR/build-info.json" \
     "$CARGO_TARGET_ROOT/release/deepcode-kernel-daemon" \
     "$CARGO_TARGET_ROOT/release/deepcode-cli" \
-    "$CARGO_TARGET_ROOT/release/deepcode-tui" \
-    "$CARGO_TARGET_ROOT/release/$TAURI_BIN_NAME"
+    "$CARGO_TARGET_ROOT/release/deepcode-tui"
 }
 
 ensure_macos_arm64() {
@@ -392,6 +468,22 @@ ensure_rust() {
   command -v rustc >/dev/null 2>&1 || fail "rustc still not found after rustup install."
 }
 
+cargo_cache_ready() {
+  local original_product="$PRODUCT"
+  local product host_target
+  host_target="$(rustc -vV | awk '/^host:/ { print $2; exit }')"
+  [ -n "$host_target" ] || host_target="aarch64-apple-darwin"
+  cargo fetch --locked --offline --target "$host_target" --manifest-path "$ROOT_DIR/Cargo.toml" >/dev/null 2>&1 || return 1
+  for product in "${REQUESTED_PRODUCTS[@]}"; do
+    configure_product "$product"
+    cargo fetch --locked --offline --target "$host_target" --manifest-path "$TAURI_SRC_DIR/Cargo.toml" >/dev/null 2>&1 || {
+      configure_product "$original_product"
+      return 1
+    }
+  done
+  configure_product "$original_product"
+}
+
 seed_cargo_cache_from_docker() {
   [ "$SEED_CARGO_REGISTRY" = "1" ] || return
   command -v docker >/dev/null 2>&1 || return
@@ -403,10 +495,25 @@ seed_cargo_cache_from_docker() {
   docker cp deepcode-dev:/usr/local/cargo/git/. "$HOME/.cargo/git/" >/dev/null 2>&1 || true
 }
 
+ensure_cargo_cache() {
+  if cargo_cache_ready; then
+    log "Cargo cache already satisfies the requested product set"
+    return
+  fi
+
+  log "Cargo offline probe found missing dependencies; seed once from deepcode-dev"
+  seed_cargo_cache_from_docker
+  if [ "$CARGO_OFFLINE" = "1" ] && ! cargo_cache_ready; then
+    fail "Cargo cache is incomplete for offline packaging; refresh the Docker dependency cache or set DEEPCODE_MACOS_CARGO_OFFLINE=0"
+  fi
+}
+
 configure_cargo_network_mode() {
   if [ "$CARGO_OFFLINE" = "1" ]; then
     export CARGO_NET_OFFLINE=true
     log "Cargo offline mode enabled for macOS package build"
+  else
+    unset CARGO_NET_OFFLINE
   fi
 }
 
@@ -444,15 +551,27 @@ frontend_asset_summary() {
   frontend_asset_manifest "$index_file" | tr '\n' ' ' | sed 's/[[:space:]]*$//'
 }
 
-clean_frontend_package_dist() {
-  log "clean $PRODUCT frontend package dist"
-  rm -rf "$CLIENT_DIST_DIR" "$TAURI_DIR/dist"
+requested_gui_stages() {
+  local original_product="$PRODUCT"
+  local product stages=""
+  for product in "${REQUESTED_PRODUCTS[@]}"; do
+    configure_product "$product"
+    if [ -n "$stages" ]; then
+      stages="$stages,$DOCKER_GUI_STAGE"
+    else
+      stages="$DOCKER_GUI_STAGE"
+    fi
+  done
+  configure_product "$original_product"
+  printf '%s\n' "$stages"
 }
 
-refresh_gui_dist_with_docker() {
+refresh_gui_dists_with_docker() {
   command -v docker >/dev/null 2>&1 || return 1
   docker image inspect deepcode-dev:latest >/dev/null 2>&1 || return 1
-  local workspace_source=""
+  local workspace_source="" stages force_build checkout_id node_modules_volume
+  stages="$(requested_gui_stages)"
+  force_build="${DEEPCODE_FORCE_BUILD:-0}"
   workspace_source="$(
     docker container inspect \
       --format '{{range .Mounts}}{{if eq .Destination "/workspace"}}{{.Source}}{{end}}{{end}}' \
@@ -460,62 +579,78 @@ refresh_gui_dist_with_docker() {
   )"
   if [ -n "$workspace_source" ] \
     && [ "$(cd "$workspace_source" 2>/dev/null && pwd -P)" = "$(cd "$ROOT_DIR" && pwd -P)" ]; then
-    log "refresh $PRODUCT GUI dist in deepcode-dev Docker container"
-    docker exec deepcode-dev bash -c "DEEPCODE_FORCE_BUILD=1 bash ./build.sh --stage $DOCKER_GUI_STAGE"
+    log "ensure frontend product set in deepcode-dev: $stages"
+    docker exec \
+      -e PNPM_STORE_DIR=/root/.local/share/pnpm/store \
+      -e DEEPCODE_FORCE_BUILD="$force_build" \
+      deepcode-dev \
+      bash -c "bash ./build.sh --stage '$stages'"
     return
   fi
 
   if [ -n "$workspace_source" ]; then
-    log "deepcode-dev uses $workspace_source; build $PRODUCT GUI from the active checkout in an isolated container"
+    log "deepcode-dev uses $workspace_source; ensure active-checkout frontends in one isolated container"
   else
-    log "build $PRODUCT GUI from the active checkout in an isolated container"
+    log "ensure active-checkout frontends in one isolated container"
   fi
+  checkout_id="$(basename "$ROOT_DIR" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9_.-' '-')"
+  checkout_id="${checkout_id#-}"
+  checkout_id="${checkout_id%-}"
+  [ -n "$checkout_id" ] || checkout_id="checkout"
+  node_modules_volume="${DEEPCODE_MACOS_NODE_MODULES_VOLUME:-deepcode-node-modules-$checkout_id}"
   docker run --rm \
     --mount "type=bind,src=$ROOT_DIR,dst=/workspace" \
-    --mount "type=volume,src=deepcode-node-modules,dst=/workspace/node_modules" \
+    --mount "type=volume,src=$node_modules_volume,dst=/workspace/node_modules" \
     --mount "type=volume,src=deepcode-pnpm-store,dst=/root/.local/share/pnpm/store" \
+    -e PNPM_STORE_DIR=/root/.local/share/pnpm/store \
+    -e DEEPCODE_FORCE_BUILD="$force_build" \
     --workdir /workspace \
     deepcode-dev:latest \
-    bash -c "DEEPCODE_FORCE_BUILD=1 bash ./build.sh --stage $DOCKER_GUI_STAGE"
+    bash -c "bash ./build.sh --stage '$stages'"
 }
 
-ensure_gui_dist() {
-  if [ "$REFRESH_GUI_DIST" = "1" ]; then
-    clean_frontend_package_dist
-    if ! refresh_gui_dist_with_docker; then
-      if [ "$BUILD_GUI_ON_HOST" != "1" ]; then
-        fail "DEEPCODE_MACOS_REFRESH_GUI_DIST=1 was requested, but Docker refresh failed. Set DEEPCODE_MACOS_BUILD_GUI_ON_HOST=1 to build GUI on host."
-      fi
-    else
-      prepare_tauri_dist
-      return
+all_frontend_dists_exist() {
+  local original_product="$PRODUCT"
+  local product
+  for product in "${REQUESTED_PRODUCTS[@]}"; do
+    configure_product "$product"
+    if [ ! -f "$CLIENT_DIST_DIR/index.html" ]; then
+      configure_product "$original_product"
+      return 1
     fi
-  fi
+  done
+  configure_product "$original_product"
+}
 
-  if [ -f "$CLIENT_DIST_DIR/index.html" ]; then
-    log "reuse existing GUI dist at $CLIENT_DIST_DIR"
+prepare_all_tauri_dists() {
+  local original_product="$PRODUCT"
+  local product
+  for product in "${REQUESTED_PRODUCTS[@]}"; do
+    configure_product "$product"
+    validate_frontend_dist "$CLIENT_DIST_DIR" "$PRODUCT"
     prepare_tauri_dist
-    return
+  done
+  configure_product "$original_product"
+}
+
+ensure_gui_dists() {
+  if [ "$REFRESH_GUI_DIST" = "1" ] || ! all_frontend_dists_exist; then
+    if ! refresh_gui_dists_with_docker; then
+      if [ "$BUILD_GUI_ON_HOST" != "1" ] || [ "${#REQUESTED_PRODUCTS[@]}" -ne 1 ] || [ "${REQUESTED_PRODUCTS[0]}" != "DeepCode" ]; then
+        fail "Docker frontend transaction failed; host fallback is supported only for a single DeepCode product"
+      fi
+      configure_product "DeepCode"
+      ensure_node
+      ensure_pnpm
+      install_dependencies
+      build_gui_dist
+    fi
+  else
+    log "reuse current frontend product set"
   fi
 
-  if refresh_gui_dist_with_docker; then
-    prepare_tauri_dist
-    return
-  fi
-
-  if [ "$BUILD_GUI_ON_HOST" = "1" ] && [ "$PRODUCT" = "DeepCode-GUI" ]; then
-    fail "DeepCode-GUI frontend dist must be produced in Docker. Run 'make build-deepcode-gui' first."
-  fi
-
-  if [ "$BUILD_GUI_ON_HOST" = "1" ]; then
-    ensure_node
-    ensure_pnpm
-    install_dependencies
-    build_gui_dist
-    return
-  fi
-
-  fail "GUI dist missing. Run Docker GUI build first, or set DEEPCODE_MACOS_BUILD_GUI_ON_HOST=1 for the original DeepCode GUI."
+  all_frontend_dists_exist || fail "one or more requested frontend distributions are missing"
+  prepare_all_tauri_dists
 }
 
 build_gui_dist() {
@@ -532,18 +667,18 @@ build_gui_dist() {
 
 build_rust_bins() {
   log "build Darwin Kernel/CLI/TUI release binaries"
-  DEEPCODE_BUILD_COMMIT="$BUILD_COMMIT" cargo build --release -p deepcode-kernel-daemon -p deepcode-cli -p deepcode-tui
+  DEEPCODE_BUILD_COMMIT="$BUILD_COMMIT" cargo build --locked --release -p deepcode-kernel-daemon -p deepcode-cli -p deepcode-tui
 }
 
 build_tauri_app() {
   log "build macOS $PRODUCT Tauri shell binary"
-  if (cd "$TAURI_SRC_DIR" && DEEPCODE_BUILD_COMMIT="$BUILD_COMMIT" cargo build --release --bin "$TAURI_BIN_NAME"); then
+  if (cd "$TAURI_SRC_DIR" && DEEPCODE_BUILD_COMMIT="$BUILD_COMMIT" cargo build --locked --release --bin "$TAURI_BIN_NAME"); then
     return
   fi
 
   if [ "$CARGO_OFFLINE" = "1" ] && [ "$TAURI_NETWORK_FALLBACK" = "1" ]; then
     log "retry Tauri shell build with Cargo network enabled"
-    (cd "$TAURI_SRC_DIR" && CARGO_NET_OFFLINE=false DEEPCODE_BUILD_COMMIT="$BUILD_COMMIT" cargo build --release --bin "$TAURI_BIN_NAME")
+    (cd "$TAURI_SRC_DIR" && CARGO_NET_OFFLINE=false DEEPCODE_BUILD_COMMIT="$BUILD_COMMIT" cargo build --locked --release --bin "$TAURI_BIN_NAME")
     return
   fi
 
@@ -1070,6 +1205,7 @@ write_build_info() {
   "buildTimeUtc": "$BUILD_TIME_UTC",
   "sourceDirty": $SOURCE_DIRTY,
   "sourceStatusHash": "$SOURCE_STATUS_HASH",
+  "sourceFingerprint": "$SOURCE_FINGERPRINT",
   "protocolVersion": "deepcode.agent.protocol.v3",
   "toolCatalogVersion": "deepcode.tool_catalog.session-v3.v1",
   "product": "$product"
@@ -1077,117 +1213,128 @@ write_build_info() {
 JSON
 }
 
-package_distribution() {
-  log "prepare $BIN_DIR"
+prepare_shared_distribution() {
+  log "prepare shared runtime in $BIN_DIR"
   mkdir -p "$BIN_DIR"
-  rm -rf "$BIN_DIR/$APP_NAME.app" "$BIN_DIR/$WEB_DIR_NAME" "$LIBEXEC_DIR"
+  rm -rf "$LIBEXEC_DIR" "$BIN_DIR/session-core" "$BIN_DIR/node_modules" "$BIN_DIR/node"
   mkdir -p "$LIBEXEC_DIR"
-  if [ -n "$TUI_COMMAND_NAME" ]; then
-    rm -rf "$BIN_DIR/$TUI_COMMAND_NAME"
-  fi
   rm -f \
     "$BIN_DIR/$CLI_COMMAND_NAME" \
     "$BIN_DIR/deepcode-cli" \
     "$BIN_DIR/deepcode-tui" \
     "$BIN_DIR/README.txt"
-  if [ "$PRODUCT" = "DeepCode-GUI" ]; then
-    rm -rf "$ROOT_DIR/bin/macos-arm64-deepcode-gui"
-    rm -rf "$BIN_DIR/web-deepcode-gui" "$BIN_DIR/DeepCode-GUI-TUI.command"
-  fi
-
-  local app_macos_dir="$BIN_DIR/$APP_NAME.app/Contents/MacOS"
-  local app_resources_dir="$BIN_DIR/$APP_NAME.app/Contents/Resources"
-  mkdir -p "$app_macos_dir" "$app_resources_dir"
+  configure_product "DeepCode"
   prepare_portable_config_root
-  write_app_info_plist "$BIN_DIR/$APP_NAME.app/Contents/Info.plist"
-
-  log "copy Tauri shell into app bundle"
-  copy_required_file "$CARGO_TARGET_ROOT/release/$TAURI_BIN_NAME" "$app_macos_dir/$TAURI_BIN_NAME" 755
-  [ -d "$app_macos_dir" ] || fail "unexpected app layout: missing Contents/MacOS"
-
-  log "copy Darwin sidecars into app bundle and distribution root"
-  copy_required_file "$CARGO_TARGET_ROOT/release/deepcode-kernel-daemon" "$app_macos_dir/deepcode-kernel" 755
   copy_required_file "$CARGO_TARGET_ROOT/release/deepcode-kernel-daemon" "$BIN_DIR/deepcode-kernel" 755
   copy_required_file "$CARGO_TARGET_ROOT/release/deepcode-cli" "$LIBEXEC_DIR/$CLI_EXEC_NAME" 755
   copy_required_file "$CARGO_TARGET_ROOT/release/deepcode-tui" "$LIBEXEC_DIR/$TUI_EXEC_NAME" 755
   copy_session_core_runtime
   ensure_packaged_node_runtime
   write_build_info "$BIN_DIR/build-info.json" "macos-arm64"
+}
+
+stage_product_app() {
+  local stage_app="$PACKAGE_STAGE_ROOT/$APP_NAME.app"
+  local app_macos_dir="$stage_app/Contents/MacOS"
+  local app_resources_dir="$stage_app/Contents/Resources"
+  log "stage $APP_NAME.app"
+  rm -rf "$stage_app"
+  mkdir -p "$app_macos_dir" "$app_resources_dir"
+  write_app_info_plist "$stage_app/Contents/Info.plist"
+
+  copy_required_file "$CARGO_TARGET_ROOT/release/$TAURI_BIN_NAME" "$app_macos_dir/$TAURI_BIN_NAME" 755
+  copy_required_file "$CARGO_TARGET_ROOT/release/deepcode-kernel-daemon" "$app_macos_dir/deepcode-kernel" 755
   write_build_info "$app_macos_dir/build-info.json"
 
   copy_web_dist "$app_macos_dir/$WEB_DIR_NAME"
   verify_copied_web_dist "$app_macos_dir/$WEB_DIR_NAME"
-  if [ "$COPY_ROOT_WEB_DIST" = "1" ]; then
-    copy_web_dist "$BIN_DIR/$WEB_DIR_NAME"
-    verify_copied_web_dist "$BIN_DIR/$WEB_DIR_NAME"
+  sign_app_bundle "$stage_app"
+}
+
+publish_product_apps() {
+  local product stage_app final_app
+  verify_source_fingerprint_unchanged
+  for product in "${REQUESTED_PRODUCTS[@]}"; do
+    configure_product "$product"
+    stage_app="$PACKAGE_STAGE_ROOT/$APP_NAME.app"
+    final_app="$BIN_DIR/$APP_NAME.app"
+    [ -d "$stage_app" ] || fail "missing staged app: $stage_app"
+
+    rm -rf "$final_app"
+    mv "$stage_app" "$final_app"
+    if [ "$COPY_ROOT_WEB_DIST" = "1" ]; then
+      copy_web_dist "$BIN_DIR/$WEB_DIR_NAME"
+      verify_copied_web_dist "$BIN_DIR/$WEB_DIR_NAME"
+    fi
+    sync_signed_kernel_sidecar_to_root
+  done
+  verify_packaged_kernel_markers
+}
+
+finalize_shared_distribution() {
+  configure_product "DeepCode"
+  if [ -f "$BIN_DIR/web/index.html" ]; then
+    write_tui_launcher
+    write_cli_launcher
+  else
+    rm -f "$BIN_DIR/DeepCode-TUI.command" "$BIN_DIR/$CLI_COMMAND_NAME"
   fi
-  write_tui_launcher
-  write_cli_launcher
   write_readme
-  sign_app_bundle "$BIN_DIR/$APP_NAME.app"
-  sync_signed_kernel_sidecar_to_root
 }
 
 verify_packaged_kernel_markers() {
   local kernel_bin="$BIN_DIR/deepcode-kernel"
-  local app_kernel_bin="$BIN_DIR/$APP_NAME.app/Contents/MacOS/deepcode-kernel"
-  local root_hash app_hash
+  local original_product="$PRODUCT"
+  local product app_kernel_bin root_hash app_hash build_info build_info_commit build_info_fingerprint strings_file
   [ -x "$kernel_bin" ] || fail "missing packaged Kernel binary: $kernel_bin"
-  [ -x "$app_kernel_bin" ] || fail "missing bundled Kernel binary: $app_kernel_bin"
-
   root_hash="$(shasum -a 256 "$kernel_bin" | awk '{print $1}')"
-  app_hash="$(shasum -a 256 "$app_kernel_bin" | awk '{print $1}')"
-  [ "$root_hash" = "$app_hash" ] || fail "root deepcode-kernel and bundled app Kernel differ"
-
   [ -f "$BIN_DIR/build-info.json" ] || fail "missing root build-info.json"
-  [ -f "$BIN_DIR/$APP_NAME.app/Contents/MacOS/build-info.json" ] || fail "missing bundled build-info.json"
-  for build_info in "$BIN_DIR/build-info.json" "$BIN_DIR/$APP_NAME.app/Contents/MacOS/build-info.json"; do
-    local build_info_commit
+
+  for build_info in "$BIN_DIR/build-info.json"; do
     build_info_commit="$(awk -F '"' '/"buildCommit"/ { print $4; exit }' "$build_info")"
+    build_info_fingerprint="$(awk -F '"' '/"sourceFingerprint"/ { print $4; exit }' "$build_info")"
     [ "$build_info_commit" = "$BUILD_COMMIT" ] || fail "$build_info buildCommit=$build_info_commit does not match current build commit $BUILD_COMMIT"
+    [ "$build_info_fingerprint" = "$SOURCE_FINGERPRINT" ] || fail "$build_info source fingerprint does not match the package transaction"
   done
 
-  for candidate in "$kernel_bin" "$app_kernel_bin"; do
-    local strings_file
-    strings_file="$(mktemp "${TMPDIR:-/tmp}/deepcode-kernel-strings.XXXXXX")"
-    strings "$candidate" >"$strings_file"
-    if ! grep -Fq 'deepcode.agent.protocol.v3' "$strings_file"; then
-      rm -f "$strings_file"
-      fail "$candidate is missing deepcode.agent.protocol.v3 marker"
-    fi
-    if ! grep -Fq 'deepcode.tool_catalog.session-v3.v1' "$strings_file"; then
-      rm -f "$strings_file"
-      fail "$candidate is missing tool catalog version marker"
-    fi
-    if ! grep -Fq 'web.search' "$strings_file"; then
-      rm -f "$strings_file"
-      fail "$candidate tool catalog is missing web.search"
-    fi
-    if ! grep -Fq 'git.status' "$strings_file"; then
-      rm -f "$strings_file"
-      fail "$candidate tool catalog is missing git.status"
-    fi
-    if ! grep -Fq 'browser.snapshot' "$strings_file"; then
-      rm -f "$strings_file"
-      fail "$candidate tool catalog is missing browser.snapshot"
-    fi
-    if grep -Fq 'Kernel terminal placeholder ready' "$strings_file"; then
-      rm -f "$strings_file"
-      fail "$candidate still contains old placeholder terminal runtime"
-    fi
-    if grep -Fq 'terminal runtime reserved' "$strings_file"; then
-      rm -f "$strings_file"
-      fail "$candidate still contains reserved terminal placeholder output"
-    fi
-    if ! grep -Fq 'Kernel PTY terminal runtime is ready.' "$strings_file"; then
-      rm -f "$strings_file"
-      fail "$candidate is missing PTY terminal runtime marker"
-    fi
-    rm -f "$strings_file"
+  for product in "${REQUESTED_PRODUCTS[@]}"; do
+    configure_product "$product"
+    app_kernel_bin="$BIN_DIR/$APP_NAME.app/Contents/MacOS/deepcode-kernel"
+    build_info="$BIN_DIR/$APP_NAME.app/Contents/MacOS/build-info.json"
+    [ -x "$app_kernel_bin" ] || fail "missing bundled Kernel binary: $app_kernel_bin"
+    app_hash="$(shasum -a 256 "$app_kernel_bin" | awk '{print $1}')"
+    [ "$root_hash" = "$app_hash" ] || fail "root deepcode-kernel and $APP_NAME.app bundled Kernel differ"
+    [ -f "$build_info" ] || fail "missing bundled build-info.json: $build_info"
+    build_info_commit="$(awk -F '"' '/"buildCommit"/ { print $4; exit }' "$build_info")"
+    build_info_fingerprint="$(awk -F '"' '/"sourceFingerprint"/ { print $4; exit }' "$build_info")"
+    [ "$build_info_commit" = "$BUILD_COMMIT" ] || fail "$build_info buildCommit=$build_info_commit does not match current build commit $BUILD_COMMIT"
+    [ "$build_info_fingerprint" = "$SOURCE_FINGERPRINT" ] || fail "$build_info source fingerprint does not match the package transaction"
   done
+  configure_product "$original_product"
+
+  strings_file="$(mktemp "${TMPDIR:-/tmp}/deepcode-kernel-strings.XXXXXX")"
+  strings "$kernel_bin" >"$strings_file"
+  grep -Fq 'deepcode.agent.protocol.v3' "$strings_file" || { rm -f "$strings_file"; fail "$kernel_bin is missing deepcode.agent.protocol.v3 marker"; }
+  grep -Fq 'deepcode.tool_catalog.session-v3.v1' "$strings_file" || { rm -f "$strings_file"; fail "$kernel_bin is missing tool catalog version marker"; }
+  grep -Fq 'web.search' "$strings_file" || { rm -f "$strings_file"; fail "$kernel_bin tool catalog is missing web.search"; }
+  grep -Fq 'git.status' "$strings_file" || { rm -f "$strings_file"; fail "$kernel_bin tool catalog is missing git.status"; }
+  grep -Fq 'browser.snapshot' "$strings_file" || { rm -f "$strings_file"; fail "$kernel_bin tool catalog is missing browser.snapshot"; }
+  ! grep -Fq 'Kernel terminal placeholder ready' "$strings_file" || { rm -f "$strings_file"; fail "$kernel_bin still contains old placeholder terminal runtime"; }
+  ! grep -Fq 'terminal runtime reserved' "$strings_file" || { rm -f "$strings_file"; fail "$kernel_bin still contains reserved terminal placeholder output"; }
+  grep -Fq 'Kernel PTY terminal runtime is ready.' "$strings_file" || { rm -f "$strings_file"; fail "$kernel_bin is missing PTY terminal runtime marker"; }
+  rm -f "$strings_file"
+}
+
+run_timed_phase() {
+  local label="$1"
+  shift
+  local started="$SECONDS"
+  "$@"
+  log "$label completed in $((SECONDS - started))s"
 }
 
 main() {
+  local product
   cd "$ROOT_DIR"
   prepend_path_dir "$HOME/.cargo/bin"
   prepend_path_dir "$HOME/.local/bin"
@@ -1196,22 +1343,43 @@ main() {
 
   ensure_macos_arm64
   ensure_xcode_tools
-  release_or_fail_if_target_app_is_running
+  for product in "${REQUESTED_PRODUCTS[@]}"; do
+    configure_product "$product"
+    release_or_fail_if_target_app_is_running
+  done
   if [ "$CLEAN_PACKAGE_CACHE" = "1" ]; then
-    clean_macos_package_cache
+    clean_shared_package_cache
+    for product in "${REQUESTED_PRODUCTS[@]}"; do
+      configure_product "$product"
+      clean_product_package_cache
+    done
   fi
   ensure_rust
-  seed_cargo_cache_from_docker
+  run_timed_phase "Cargo dependency readiness" ensure_cargo_cache
   configure_cargo_network_mode
-  ensure_gui_dist
-  build_rust_bins
-  build_tauri_app
-  package_distribution
-  verify_packaged_kernel_markers
+  run_timed_phase "frontend product set" ensure_gui_dists
+  run_timed_phase "Darwin shared binaries" build_rust_bins
+
+  rm -rf "$PACKAGE_STAGE_ROOT"
+  mkdir -p "$PACKAGE_STAGE_ROOT"
+  for product in "${REQUESTED_PRODUCTS[@]}"; do
+    configure_product "$product"
+    run_timed_phase "$PRODUCT Tauri shell" build_tauri_app
+    run_timed_phase "$PRODUCT app staging" stage_product_app
+  done
+
+  verify_source_fingerprint_unchanged
+  run_timed_phase "shared runtime assembly" prepare_shared_distribution
+  run_timed_phase "product-set publish" publish_product_apps
+  finalize_shared_distribution
+  verify_source_fingerprint_unchanged
+  rm -rf "$PACKAGE_STAGE_ROOT"
 
   log "done: $BIN_DIR"
-  log "GUI: open $BIN_DIR/$APP_NAME.app"
-  if [ "$WRITE_TUI_LAUNCHER" = "1" ]; then
+  for product in "${REQUESTED_PRODUCTS[@]}"; do
+    log "GUI: open $BIN_DIR/$product.app"
+  done
+  if [ -f "$BIN_DIR/DeepCode-TUI.command" ]; then
     log "TUI: open $BIN_DIR/$TUI_COMMAND_NAME"
     log "CLI: open $BIN_DIR/$CLI_COMMAND_NAME or run it with arguments"
   else

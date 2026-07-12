@@ -7,8 +7,11 @@
   "scripts": {
     "dev": "vite",
     "dev:deepcode-gui": "vite --config vite.deepcode-gui.config.ts",
-    "build": "tsc && vite build",
-    "build:deepcode-gui": "tsc && vite build --config vite.deepcode-gui.config.ts && [ ! -f dist-deepcode-gui/deepcode-gui.html ] || cp dist-deepcode-gui/deepcode-gui.html dist-deepcode-gui/index.html",
+    "build": "pnpm run build:types && pnpm run build:web",
+    "build:types": "tsc",
+    "build:web": "vite build",
+    "build:deepcode-gui": "pnpm run build:types && pnpm run build:deepcode-gui:web",
+    "build:deepcode-gui:web": "vite build --config vite.deepcode-gui.config.ts && [ ! -f dist-deepcode-gui/deepcode-gui.html ] || cp dist-deepcode-gui/deepcode-gui.html dist-deepcode-gui/index.html",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
