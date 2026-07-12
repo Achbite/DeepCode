@@ -41,7 +41,7 @@ pub struct TuiApp {
     runtime_status: String,
     running_preview_active: bool,
     pending_run: Option<PendingRun>,
-    events: Vec<Value>,
+    timeline: Option<Value>,
 }
 
 impl TuiApp {
@@ -60,7 +60,7 @@ impl TuiApp {
             runtime_status,
             running_preview_active: false,
             pending_run: None,
-            events: Vec::new(),
+            timeline: None,
         }
     }
 
@@ -175,7 +175,6 @@ impl TuiApp {
         match self.client.get_agent_session(target_session_id).await {
             Ok(result) => {
                 let event_count = result.events.len();
-                self.events = result.events.clone();
                 let previous_event_count = self
                     .pending_run
                     .as_ref()
@@ -216,6 +215,7 @@ impl TuiApp {
                     self.cards = next_cards;
                     self.running_preview_active = false;
                 }
+                self.timeline = Some(timeline);
                 if let Some(pending) = self
                     .pending_run
                     .as_mut()
@@ -277,7 +277,7 @@ impl TuiApp {
 
     pub fn preview_submit_line(&mut self, line: &str) -> bool {
         let line = line.trim();
-        if latest_pending_decision(&self.events).is_some()
+        if latest_pending_decision(self.timeline.as_ref()).is_some()
             && (line.is_empty()
                 || !looks_like_command(line)
                 || matches!(line, "/reject" | "/end" | "/stop" | "结束" | "拒绝"))
@@ -293,7 +293,7 @@ impl TuiApp {
 
     pub async fn submit_line(&mut self, line: &str) -> bool {
         let line = line.trim();
-        if let Some(pending) = latest_pending_decision(&self.events) {
+        if let Some(pending) = latest_pending_decision(self.timeline.as_ref()) {
             if line.is_empty()
                 || !looks_like_command(line)
                 || matches!(line, "/reject" | "/end" | "/stop" | "结束" | "拒绝")
@@ -735,7 +735,6 @@ impl TuiApp {
             self.current_session_resume_hint = false;
         }
         let event_count = result.events.len();
-        self.events = result.events.clone();
         let previous_event_count = self
             .pending_run
             .as_ref()
@@ -764,7 +763,6 @@ impl TuiApp {
         self.running_preview_active = false;
         self.current_session_id = Some(result.run.session_id.clone());
         self.current_session_resume_hint = false;
-        self.events = result.events.clone();
         self.status = match result.run.status.as_str() {
             "completed" => format!("API {} · 回合完成", self.client.base_url()),
             "waiting" => format!("API {} · 等待用户决策", self.client.base_url()),
@@ -962,9 +960,9 @@ impl TuiApp {
                 } else {
                     next_cards
                 };
+                self.timeline = Some(timeline);
                 self.current_session_id = Some(session_id.to_string());
                 self.current_session_resume_hint = false;
-                self.refresh_events_for_session(session_id).await;
             }
             Err(error) => self
                 .cards
@@ -979,19 +977,13 @@ impl TuiApp {
                 if !next_cards.is_empty() {
                     self.cards = next_cards;
                 }
+                self.timeline = Some(timeline);
                 self.current_session_id = Some(session_id.to_string());
                 self.current_session_resume_hint = false;
-                self.refresh_events_for_session(session_id).await;
             }
             Err(error) => self
                 .cards
                 .push(CardModel::error(format!("读取 timeline 失败：{error}"))),
-        }
-    }
-
-    async fn refresh_events_for_session(&mut self, session_id: &str) {
-        if let Ok(result) = self.client.get_agent_session(session_id).await {
-            self.events = result.events;
         }
     }
 
@@ -1196,103 +1188,28 @@ fn looks_like_command(line: &str) -> bool {
     )
 }
 
-fn latest_pending_decision(events: &[Value]) -> Option<PendingDecision> {
-    for event in events.iter().rev() {
-        let kind = event
-            .get("kind")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let payload = event.get("payload").and_then(Value::as_object);
-        let Some(payload) = payload else {
-            continue;
-        };
-        match kind {
-            "workflow_stage" => {
-                let status = payload
-                    .get("status")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                if matches!(status, "cancelled" | "failed") {
-                    return None;
-                }
-            }
-            "plan_card" => {
-                let run_id = payload.get("runId").and_then(Value::as_str)?;
-                let plan_id = payload.get("planId").and_then(Value::as_str)?;
-                return Some(PendingDecision {
-                    kind: "plan".to_string(),
-                    run_id: run_id.to_string(),
-                    target_id: Some(plan_id.to_string()),
-                    options: Vec::new(),
-                });
-            }
-            "plan_review" => {
-                let status = payload
-                    .get("status")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                if matches!(status, "accepted" | "rejected" | "needsRevision" | "denied") {
-                    return None;
-                }
-                if !matches!(
-                    status,
-                    "awaitingUserApproval" | "awaitingTemporaryGrant" | "pending"
-                ) {
-                    continue;
-                }
-                let run_id = payload.get("runId").and_then(Value::as_str)?;
-                let plan_id = payload.get("planId").and_then(Value::as_str)?;
-                return Some(PendingDecision {
-                    kind: "plan".to_string(),
-                    run_id: run_id.to_string(),
-                    target_id: Some(plan_id.to_string()),
-                    options: Vec::new(),
-                });
-            }
-            "review_summary" => {
-                let status = payload
-                    .get("status")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                if matches!(status, "accepted" | "rejected" | "needsRevision") {
-                    return None;
-                }
-                if status != "waitingUserReview" {
-                    continue;
-                }
-                let run_id = payload.get("runId").and_then(Value::as_str)?;
-                return Some(PendingDecision {
-                    kind: "review".to_string(),
-                    run_id: run_id.to_string(),
-                    target_id: payload
-                        .get("reviewId")
-                        .and_then(Value::as_str)
-                        .map(ToOwned::to_owned),
-                    options: Vec::new(),
-                });
-            }
-            "requirement_confirmation" => {
-                let status = payload
-                    .get("status")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                if status != "waitingUserConfirmation" {
-                    continue;
-                }
-                let run_id = payload.get("runId").and_then(Value::as_str)?;
-                let requirement_id = payload.get("requirementId").and_then(Value::as_str)?;
-                return Some(PendingDecision {
-                    kind: "requirement".to_string(),
-                    run_id: run_id.to_string(),
-                    target_id: Some(requirement_id.to_string()),
-                    options: decision_request_options(payload.get("decisionRequest")),
-                });
-            }
-            "requirement_decision" => return None,
-            _ => {}
-        }
+fn latest_pending_decision(timeline: Option<&Value>) -> Option<PendingDecision> {
+    let pending = timeline?.get("interactionProjection")?.get("pending")?;
+    let kind = pending.get("kind").and_then(Value::as_str)?;
+    let run_id = pending.get("runId").and_then(Value::as_str)?.to_string();
+    let target_id = match kind {
+        "plan" => pending.get("planId"),
+        "review" => pending.get("reviewId"),
+        "requirement" => pending.get("requirementId"),
+        _ => None,
     }
-    None
+    .and_then(Value::as_str)
+    .map(ToOwned::to_owned);
+    Some(PendingDecision {
+        kind: kind.to_string(),
+        run_id,
+        target_id,
+        options: if kind == "requirement" {
+            decision_request_options(pending.get("decisionRequest"))
+        } else {
+            Vec::new()
+        },
+    })
 }
 
 fn decision_request_options(value: Option<&Value>) -> Vec<PendingDecisionOption> {
@@ -1509,15 +1426,14 @@ mod tests {
 
     #[test]
     fn latest_pending_decision_finds_plan_review() {
-        let events = vec![json!({
-            "kind": "plan_review",
-            "payload": {
-                "status": "awaitingTemporaryGrant",
+        let timeline = json!({
+            "interactionProjection": { "pending": {
+                "kind": "plan",
                 "runId": "run-generic",
                 "planId": "plan-generic"
-            }
-        })];
-        let pending = latest_pending_decision(&events).expect("pending plan");
+            } }
+        });
+        let pending = latest_pending_decision(Some(&timeline)).expect("pending plan");
         assert_eq!(pending.kind, "plan");
         assert_eq!(pending.run_id, "run-generic");
         assert_eq!(pending.target_id.as_deref(), Some("plan-generic"));
@@ -1526,14 +1442,14 @@ mod tests {
 
     #[test]
     fn latest_pending_decision_finds_plan_card() {
-        let events = vec![json!({
-            "kind": "plan_card",
-            "payload": {
+        let timeline = json!({
+            "interactionProjection": { "pending": {
+                "kind": "plan",
                 "runId": "run-plan-card",
                 "planId": "plan-card"
-            }
-        })];
-        let pending = latest_pending_decision(&events).expect("pending plan card");
+            } }
+        });
+        let pending = latest_pending_decision(Some(&timeline)).expect("pending plan card");
         assert_eq!(pending.kind, "plan");
         assert_eq!(pending.run_id, "run-plan-card");
         assert_eq!(pending.target_id.as_deref(), Some("plan-card"));
@@ -1542,10 +1458,9 @@ mod tests {
 
     #[test]
     fn latest_pending_decision_keeps_requirement_options() {
-        let events = vec![json!({
-            "kind": "requirement_confirmation",
-            "payload": {
-                "status": "waitingUserConfirmation",
+        let timeline = json!({
+            "interactionProjection": { "pending": {
+                "kind": "requirement",
                 "runId": "run-requirement",
                 "requirementId": "requirement-generic",
                 "decisionRequest": {
@@ -1554,9 +1469,9 @@ mod tests {
                         { "id": "option-b", "label": "Option B", "description": "Second generic option." }
                     ]
                 }
-            }
-        })];
-        let pending = latest_pending_decision(&events).expect("pending requirement");
+            } }
+        });
+        let pending = latest_pending_decision(Some(&timeline)).expect("pending requirement");
         assert_eq!(pending.kind, "requirement");
         assert_eq!(pending.options.len(), 2);
         assert_eq!(pending.options[0].id, "option-a");

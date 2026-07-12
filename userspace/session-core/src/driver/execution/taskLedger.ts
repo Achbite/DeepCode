@@ -31,13 +31,174 @@ export interface AcceptedPlanTaskRuntimeState {
   acceptedPlanPromptFrame?: AcceptedPlanPromptFrame;
 }
 
+// The accepted-plan runtime fields are a single snapshot boundary for task projection and provider context.
+export class AcceptedPlanTaskRuntimeAccessor {
+  constructor(private readonly state: AcceptedPlanTaskRuntimeState) {}
+
+  snapshotInput(): {
+    acceptedPlan?: AcceptedImplementationPlanContext;
+    resourcePackets: ResourcePacket[];
+    lastSavepointId?: string;
+  } {
+    return {
+      acceptedPlan: this.state.acceptedImplementationPlan,
+      resourcePackets: this.state.resourcePackets,
+      lastSavepointId: this.state.taskExecutionCursor?.lastSavepointId,
+    };
+  }
+
+  apply(snapshot: AcceptedPlanTaskRuntimeSnapshot): void {
+    this.state.taskExecutionCursor = snapshot.taskExecutionCursor;
+    this.state.currentTaskContext = snapshot.currentTaskContext;
+    this.state.taskLedger = snapshot.taskLedger;
+    this.state.acceptedPlanPromptFrame = snapshot.acceptedPlanPromptFrame;
+  }
+}
+
 export interface AcceptedPlanTaskLedgerCoordinatorPorts {
   workUnitIdsFromKernelEvents(kernelEvents: unknown[]): string[];
   actionBatchHasFailureOrBlocker(kernelEvents: unknown[]): boolean;
 }
 
+export type AcceptedPlanLedgerCommand =
+  | {
+    kind: 'recordKernelBatchProgress';
+    acceptedPlan: AcceptedImplementationPlanContext;
+    proposal: ProposalEnvelope;
+    kernelEvents: unknown[];
+  }
+  | {
+    kind: 'recordModelTaskOutcome';
+    acceptedPlan: AcceptedImplementationPlanContext;
+    taskId: string;
+  }
+  | {
+    kind: 'recordTaskCompletion';
+    acceptedPlan: AcceptedImplementationPlanContext;
+    completedTaskIds: string[];
+  }
+  | {
+    kind: 'recoverLatestCheckpoint';
+    acceptedPlan: AcceptedImplementationPlanContext;
+    events: AgentEvent[];
+  };
+
+export type AcceptedPlanLedgerEffect =
+  | {
+    kind: 'kernelBatchProgressRecorded';
+    progress: AcceptedPlanBatchProgress;
+    completedTaskIds: string[];
+    nextAcceptedPlan: AcceptedImplementationPlanContext;
+  }
+  | {
+    kind: 'modelTaskOutcomeRecorded';
+    taskId: string;
+    nextAcceptedPlan: AcceptedImplementationPlanContext;
+  }
+  | {
+    kind: 'taskCompletionRecorded';
+    completedTaskIds: string[];
+    nextAcceptedPlan: AcceptedImplementationPlanContext;
+  }
+  | {
+    kind: 'latestCheckpointRecovered';
+    nextAcceptedPlan: AcceptedImplementationPlanContext;
+  };
+
 export class AcceptedPlanTaskLedgerCoordinator {
   constructor(private readonly ports?: AcceptedPlanTaskLedgerCoordinatorPorts) {}
+
+  // Accepted-plan ledger mutations are command effects so projections and cursors share one state transition owner.
+  execute(command: AcceptedPlanLedgerCommand): AcceptedPlanLedgerEffect {
+    if (command.kind === 'recordKernelBatchProgress') {
+      const progress = this.batchProgress({
+        acceptedPlan: command.acceptedPlan,
+        proposal: command.proposal,
+        kernelEvents: command.kernelEvents,
+      });
+      return {
+        kind: 'kernelBatchProgressRecorded',
+        progress,
+        completedTaskIds: progress.completedTaskIds,
+        nextAcceptedPlan: this.afterBatch(command.acceptedPlan, progress.completedTaskIds),
+      };
+    }
+    if (command.kind === 'recordModelTaskOutcome') {
+      return {
+        kind: 'modelTaskOutcomeRecorded',
+        taskId: command.taskId,
+        nextAcceptedPlan: this.afterTaskOutcome(command.acceptedPlan, command.taskId),
+      };
+    }
+    if (command.kind === 'recordTaskCompletion') {
+      return {
+        kind: 'taskCompletionRecorded',
+        completedTaskIds: command.completedTaskIds,
+        nextAcceptedPlan: this.afterBatch(command.acceptedPlan, command.completedTaskIds),
+      };
+    }
+    return {
+      kind: 'latestCheckpointRecovered',
+      nextAcceptedPlan: this.withLatestCheckpoint(command.acceptedPlan, command.events),
+    };
+  }
+
+  recordKernelBatchProgress(input: {
+    acceptedPlan: AcceptedImplementationPlanContext;
+    proposal: ProposalEnvelope;
+    kernelEvents: unknown[];
+  }): Extract<AcceptedPlanLedgerEffect, { kind: 'kernelBatchProgressRecorded' }> {
+    const effect = this.execute({
+      kind: 'recordKernelBatchProgress',
+      ...input,
+    });
+    if (effect.kind !== 'kernelBatchProgressRecorded') {
+      throw new Error(`Unexpected accepted-plan ledger effect: ${effect.kind}`);
+    }
+    return effect;
+  }
+
+  recordModelTaskOutcome(input: {
+    acceptedPlan: AcceptedImplementationPlanContext;
+    taskId: string;
+  }): Extract<AcceptedPlanLedgerEffect, { kind: 'modelTaskOutcomeRecorded' }> {
+    const effect = this.execute({
+      kind: 'recordModelTaskOutcome',
+      ...input,
+    });
+    if (effect.kind !== 'modelTaskOutcomeRecorded') {
+      throw new Error(`Unexpected accepted-plan ledger effect: ${effect.kind}`);
+    }
+    return effect;
+  }
+
+  recordTaskCompletion(input: {
+    acceptedPlan: AcceptedImplementationPlanContext;
+    completedTaskIds: string[];
+  }): Extract<AcceptedPlanLedgerEffect, { kind: 'taskCompletionRecorded' }> {
+    const effect = this.execute({
+      kind: 'recordTaskCompletion',
+      ...input,
+    });
+    if (effect.kind !== 'taskCompletionRecorded') {
+      throw new Error(`Unexpected accepted-plan ledger effect: ${effect.kind}`);
+    }
+    return effect;
+  }
+
+  recoverLatestCheckpoint(input: {
+    acceptedPlan: AcceptedImplementationPlanContext;
+    events: AgentEvent[];
+  }): Extract<AcceptedPlanLedgerEffect, { kind: 'latestCheckpointRecovered' }> {
+    const effect = this.execute({
+      kind: 'recoverLatestCheckpoint',
+      ...input,
+    });
+    if (effect.kind !== 'latestCheckpointRecovered') {
+      throw new Error(`Unexpected accepted-plan ledger effect: ${effect.kind}`);
+    }
+    return effect;
+  }
 
   runtimeSnapshot(input: {
     acceptedPlan?: AcceptedImplementationPlanContext;
@@ -60,15 +221,8 @@ export class AcceptedPlanTaskLedgerCoordinator {
   }
 
   refreshRuntimeState(state: AcceptedPlanTaskRuntimeState): void {
-    const snapshot = this.runtimeSnapshot({
-      acceptedPlan: state.acceptedImplementationPlan,
-      resourcePackets: state.resourcePackets,
-      lastSavepointId: state.taskExecutionCursor?.lastSavepointId,
-    });
-    state.taskExecutionCursor = snapshot.taskExecutionCursor;
-    state.currentTaskContext = snapshot.currentTaskContext;
-    state.taskLedger = snapshot.taskLedger;
-    state.acceptedPlanPromptFrame = snapshot.acceptedPlanPromptFrame;
+    const runtime = new AcceptedPlanTaskRuntimeAccessor(state);
+    runtime.apply(this.runtimeSnapshot(runtime.snapshotInput()));
   }
 
   ledger(
@@ -144,6 +298,13 @@ export class AcceptedPlanTaskLedgerCoordinator {
     return this.withCompleted(acceptedPlan, completedTaskIds) ?? acceptedPlan;
   }
 
+  afterTaskOutcome(
+    acceptedPlan: AcceptedImplementationPlanContext,
+    taskId: string
+  ): AcceptedImplementationPlanContext {
+    return new AcceptedTaskRegistry(acceptedPlan).withModelJudgedSufficient(taskId) ?? acceptedPlan;
+  }
+
   withLatestCheckpoint(
     acceptedPlan: AcceptedImplementationPlanContext,
     events: AgentEvent[]
@@ -155,16 +316,19 @@ export class AcceptedPlanTaskLedgerCoordinator {
       if (stringValue(payload.stage) !== 'accepted_plan.batch_checkpoint') continue;
       if (stringValue(payload.runId) !== acceptedPlan.runId || stringValue(payload.planId) !== acceptedPlan.planId) continue;
       const completedTaskIds = stringArrayValue(payload.completedTaskIds);
-      if (!completedTaskIds.length) return acceptedPlan;
-      return this.afterBatch(acceptedPlan, completedTaskIds);
+      const modelJudgedSufficientTaskIds = stringArrayValue(payload.modelJudgedSufficientTaskIds);
+      let nextAccepted = acceptedPlan;
+      if (completedTaskIds.length) nextAccepted = this.afterBatch(nextAccepted, completedTaskIds);
+      for (const taskId of modelJudgedSufficientTaskIds) {
+        nextAccepted = this.afterTaskOutcome(nextAccepted, taskId);
+      }
+      return nextAccepted;
     }
     return acceptedPlan;
   }
 
   complete(acceptedPlan: AcceptedImplementationPlanContext): boolean {
-    if (!acceptedPlan.tasks.length) return true;
-    const completed = new Set(acceptedPlan.completedTaskIds);
-    return acceptedPlan.tasks.every((task) => completed.has(task.taskId));
+    return new AcceptedTaskRegistry(acceptedPlan).complete();
   }
 
   lastSavepointId(events: AgentEvent[]): string | undefined {

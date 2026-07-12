@@ -108,11 +108,25 @@ export class ResourceManifestBuilder {
       const workingDirectory = input.projectWorkingDirectory;
       const resourceRef = workingDirectory.absolutePath ?? workingDirectory.displayPath;
       const refKey = this.ports.comparablePath(resourceRef);
+      const rootId = workingDirectory.rootId || `project-root-${sanitizeId(workingDirectory.displayPath)}`;
+      const label = workingDirectory.label || `Project workspace ${workingDirectory.displayPath}`;
+      // Workspace roots are manifest entries so lifecycle initialization can seed provider-visible evidence before native read tools.
+      if (!seenEntryRefs.has(refKey)) {
+        seenEntryRefs.add(refKey);
+        entries.push({
+          id: rootId,
+          kind: 'directory',
+          label,
+          resourceRef,
+          readPolicy: 'autoRead',
+          reason: 'Project working directory for the current turn.',
+        });
+      }
       if (!seenRootRefs.has(refKey)) {
         seenRootRefs.add(refKey);
         conversationRoots.push({
           ...workingDirectory,
-          rootId: workingDirectory.rootId || `project-root-${sanitizeId(workingDirectory.displayPath)}`,
+          rootId,
           kind: 'directory',
           absolutePath: workingDirectory.absolutePath ?? (this.ports.isAbsolutePath(resourceRef) ? resourceRef : undefined),
           primary: this.ports.comparablePath(resourceRef) === primaryRootRef,
@@ -123,12 +137,26 @@ export class ResourceManifestBuilder {
     if (input.workspaceBinding?.openPath) {
       const resourceRef = input.workspaceBinding.openPath;
       const refKey = this.ports.comparablePath(resourceRef);
+      const rootId = `editor-workspace-${sanitizeId(resourceRef)}`;
+      const label = `Editor workspace ${resourceRef}`;
+      // Editor workspace bindings follow the same initial-evidence path as explicit project roots.
+      if (!seenEntryRefs.has(refKey)) {
+        seenEntryRefs.add(refKey);
+        entries.push({
+          id: rootId,
+          kind: 'directory',
+          label,
+          resourceRef,
+          readPolicy: 'autoRead',
+          reason: 'Editor workspace binding for the current turn.',
+        });
+      }
       if (!seenRootRefs.has(refKey)) {
         seenRootRefs.add(refKey);
         conversationRoots.push({
-          rootId: `editor-workspace-${sanitizeId(resourceRef)}`,
+          rootId,
           kind: 'directory',
-          label: `Editor workspace ${resourceRef}`,
+          label,
           displayPath: resourceRef,
           absolutePath: resourceRef,
           source: 'workspaceBinding',

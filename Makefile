@@ -1,11 +1,11 @@
 # ====================================================================
 # DeepCode 开发容器入口 (Makefile)
 # 主要目标：
-#   make shell          -> 进入容器（镜像/容器不存在则懒构建；运行中则 restart 刷新环境）
+#   make shell          -> 进入容器（镜像/容器不存在则懒构建；运行中直接复用）
 #   make build-deepcode-gui -> 在 Docker 内构建 DeepCode-GUI dist
 #   make build-deepcode-gui-tauri -> 在 Docker 内构建 Windows DeepCode-GUI.exe
-#   make dev-deepcode-gui   -> 在 Docker 内启动 31246 DeepCode-GUI 调试服务
-#   make clean          -> 全量清理（容器 + 镜像 + named volumes），下次 shell 全量重建
+#   make dev-deepcode-gui   -> 在 Docker 内启动当前配置端口的 DeepCode-GUI 调试服务
+#   make clean          -> 清理当前配置拥有的容器与 volumes；默认模式同时清理共享镜像
 #   make macos-package-service -> 在 macOS 宿主机启动 Docker 可请求的打包服务
 #   make package-macos  -> 生成完整 macOS 发布包：DeepCode.app + DeepCode-GUI.app + CLI/TUI
 #   make package-macos-clean -> 清理打包缓存后重新生成 Darwin GUI/TUI 本机包
@@ -15,13 +15,32 @@
 # 不支持：Windows 原生 PowerShell 直接调用（请先 wsl 进入 Linux 子系统）
 # ====================================================================
 
+# 每个 worktree 可以提供本地未跟踪配置；缺少该文件时保持单容器默认行为。
+-include .deepcode-worktree.mk
+
 # ---- 基础常量（与项目结构强绑定）----
-IMAGE_NAME       := deepcode-dev
-IMAGE_TAG        := latest
+IMAGE_NAME       ?= deepcode-dev
+IMAGE_TAG        ?= latest
 IMAGE            := $(IMAGE_NAME):$(IMAGE_TAG)
-CONTAINER_NAME   := deepcode-dev
-DOCKERFILE       := Dockerfile.dev
-WORKDIR_IN_CTNR  := /workspace
+DOCKERFILE       ?= Dockerfile.dev
+WORKDIR_IN_CTNR  ?= /workspace
+DEEPCODE_WORKTREE_ID ?=
+DEEPCODE_WORKTREE_ROOT := $(abspath $(CURDIR))
+DEEPCODE_HOST_PORT ?= 31246
+DEEPCODE_CONTAINER_PORT ?= 31246
+ifeq ($(strip $(DEEPCODE_WORKTREE_ID)),)
+DEEPCODE_WORKTREE_MODE := 0
+CONTAINER_NAME ?= deepcode-dev
+CONTAINER_HOSTNAME ?= deepcode-dev
+WORKTREE_LABEL_ARGS :=
+else
+DEEPCODE_WORKTREE_MODE := 1
+CONTAINER_NAME ?= deepcode-dev-$(DEEPCODE_WORKTREE_ID)
+CONTAINER_HOSTNAME ?= deepcode-dev-$(DEEPCODE_WORKTREE_ID)
+WORKTREE_LABEL_ARGS := \
+	--label com.deepcode.worktree.id=$(DEEPCODE_WORKTREE_ID) \
+	--label com.deepcode.worktree.root=$(DEEPCODE_WORKTREE_ROOT)
+endif
 DEEPCODE_APT_MIRROR ?= https://mirrors.tuna.tsinghua.edu.cn/debian
 DEEPCODE_APT_SECURITY_MIRROR ?= https://mirrors.tuna.tsinghua.edu.cn/debian-security
 DEEPCODE_NODE_VERSION ?= 22.22.3
@@ -45,11 +64,17 @@ BUILD_ARGS := \
 	--build-arg DEEPCODE_RUSTUP_UPDATE_ROOT=$(DEEPCODE_RUSTUP_UPDATE_ROOT)
 
 # ---- 持久化卷（只有 make clean 才会清空，避免每次 shell 重装依赖）----
-VOL_PNPM_STORE        := deepcode-pnpm-store
-VOL_CARGO_REGISTRY    := deepcode-cargo-registry
-VOL_CARGO_TARGET      := deepcode-cargo-target
-VOL_NODE_MODULES      := deepcode-node-modules
+VOL_PNPM_STORE        ?= deepcode-pnpm-store
+VOL_CARGO_REGISTRY    ?= deepcode-cargo-registry
+ifeq ($(DEEPCODE_WORKTREE_MODE),1)
+VOL_CARGO_TARGET      ?= deepcode-cargo-target-$(DEEPCODE_WORKTREE_ID)
+VOL_NODE_MODULES      ?= deepcode-node-modules-$(DEEPCODE_WORKTREE_ID)
+VOLUMES_ALL := $(VOL_CARGO_TARGET) $(VOL_NODE_MODULES)
+else
+VOL_CARGO_TARGET      ?= deepcode-cargo-target
+VOL_NODE_MODULES      ?= deepcode-node-modules
 VOLUMES_ALL := $(VOL_PNPM_STORE) $(VOL_CARGO_REGISTRY) $(VOL_CARGO_TARGET) $(VOL_NODE_MODULES)
+endif
 
 # ---- WSL / Docker 网络变量透传 ----
 # 默认只在 WSL 自动启用，避免污染 macOS / Linux Docker 开发环境。
@@ -86,9 +111,10 @@ endif
 # - named volumes 覆盖 node_modules / target，避免 Windows ↔ WSL ↔ 容器 IO 雪崩
 RUN_ARGS := \
 	--name $(CONTAINER_NAME) \
-	--hostname deepcode-dev \
+	--hostname $(CONTAINER_HOSTNAME) \
+	$(WORKTREE_LABEL_ARGS) \
 	-w $(WORKDIR_IN_CTNR) \
-	-p 127.0.0.1:31246:31246 \
+	-p 127.0.0.1:$(DEEPCODE_HOST_PORT):$(DEEPCODE_CONTAINER_PORT) \
 	-v $(CURDIR):$(WORKDIR_IN_CTNR) \
 	-v $(VOL_PNPM_STORE):/root/.local/share/pnpm/store \
 	-v $(VOL_CARGO_REGISTRY):/usr/local/cargo/registry \
@@ -103,17 +129,18 @@ RUN_ARGS := \
 	-e PATH=/root/.local/share/pnpm:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
 	$(NETWORK_ENV_ARGS)
 
-.PHONY: help shell build-deepcode-gui build-deepcode-gui-tauri dev-deepcode-gui clean macos-package-service macos-package-service-status macos-package-service-stop package-macos package-macos-clean package-macos-deepcode-gui _ensure_image _ensure_container
+.PHONY: help docker-info shell build-deepcode-gui build-deepcode-gui-tauri dev-deepcode-gui clean macos-package-service macos-package-service-status macos-package-service-stop package-macos package-macos-clean package-macos-deepcode-gui _validate_worktree_config _ensure_macos_package_service _ensure_image _ensure_container
 
 # ---- help：默认目标，列出可用入口 ----
 help:
 	@echo "DeepCode 开发容器入口"
 	@echo ""
-	@echo "  make shell          进入开发容器（容器存在则刷新重启后再 exec）"
+	@echo "  make shell          进入开发容器（容器存在则直接复用后 exec）"
 	@echo "  make build-deepcode-gui  在 Docker 内构建 DeepCode-GUI dist"
 	@echo "  make build-deepcode-gui-tauri  在 Docker 内构建 Windows DeepCode-GUI.exe"
-	@echo "  make dev-deepcode-gui    在 Docker 内启动 DeepCode-GUI 调试服务：127.0.0.1:31246"
-	@echo "  make clean          全量清理（容器 + 镜像 + 4 个 named volumes），下次 shell 全量重建"
+	@echo "  make docker-info    显示当前 worktree 的容器、挂载、端口和 volume 配置"
+	@echo "  make dev-deepcode-gui    在 Docker 内启动 DeepCode-GUI 调试服务：127.0.0.1:$(DEEPCODE_HOST_PORT)"
+	@echo "  make clean          清理当前配置拥有的容器和 volumes"
 	@echo "  make macos-package-service  在 macOS 宿主机启动 Docker 打包请求服务"
 	@echo "  make package-macos  生成完整 macOS 发布包：DeepCode.app + DeepCode-GUI.app + CLI/TUI"
 	@echo "  make package-macos-clean  清理打包缓存后重新生成 macOS 本机包（保留 config/sessions/archives/kernel）"
@@ -122,6 +149,29 @@ help:
 	@echo "进入容器后可手动执行："
 	@echo "  ./build.sh   编译并输出统一分发目录到 bin/deepcode/"
 	@echo "  ./test.sh    运行链路 ping 与环境检查"
+
+docker-info:
+	@echo "worktreeMode=$(DEEPCODE_WORKTREE_MODE)"
+	@echo "worktreeId=$(DEEPCODE_WORKTREE_ID)"
+	@echo "worktreeRoot=$(DEEPCODE_WORKTREE_ROOT)"
+	@echo "image=$(IMAGE)"
+	@echo "container=$(CONTAINER_NAME)"
+	@echo "hostname=$(CONTAINER_HOSTNAME)"
+	@echo "hostPort=$(DEEPCODE_HOST_PORT)"
+	@echo "containerPort=$(DEEPCODE_CONTAINER_PORT)"
+	@echo "cargoTargetVolume=$(VOL_CARGO_TARGET)"
+	@echo "nodeModulesVolume=$(VOL_NODE_MODULES)"
+
+_validate_worktree_config:
+	@if [ "$(DEEPCODE_WORKTREE_MODE)" = "1" ] && ! printf '%s' "$(DEEPCODE_WORKTREE_ID)" | grep -Eq '^[a-z0-9][a-z0-9_.-]*$$'; then \
+		echo "[make][error] DEEPCODE_WORKTREE_ID 只能包含小写字母、数字、点、下划线和连字符" >&2; \
+		exit 1; \
+	fi
+	@case "$(DEEPCODE_HOST_PORT)" in ''|*[!0-9]*) echo "[make][error] DEEPCODE_HOST_PORT 必须是 1-65535 的整数" >&2; exit 1;; esac
+	@if [ "$(DEEPCODE_HOST_PORT)" -lt 1 ] || [ "$(DEEPCODE_HOST_PORT)" -gt 65535 ]; then \
+		echo "[make][error] DEEPCODE_HOST_PORT 必须是 1-65535 的整数" >&2; \
+		exit 1; \
+	fi
 
 macos-package-service:
 	@bash ./build.sh --stage macos-package-service
@@ -141,8 +191,18 @@ package-macos-clean:
 package-macos-deepcode-gui:
 	@bash ./build.sh --stage package-macos-deepcode-gui
 
+_ensure_macos_package_service:
+	@if [ "$$(uname -s 2>/dev/null)" = "Darwin" ] && [ "$${DEEPCODE_MACOS_PACKAGE_AUTOSTART:-1}" = "1" ]; then \
+		if bash ./scripts/macos-package-service.sh status --quiet >/dev/null 2>&1; then \
+			echo "[make] macOS package service 已运行"; \
+		else \
+			echo "[make] macOS package service 未运行，自动启动..."; \
+			bash ./build.sh --stage macos-package-service; \
+		fi; \
+	fi
+
 # ---- _ensure_image：镜像不存在则构建 ----
-_ensure_image:
+_ensure_image: _validate_worktree_config
 	@if ! docker image inspect $(IMAGE) >/dev/null 2>&1; then \
 		echo "[make] 镜像 $(IMAGE) 不存在，开始构建..."; \
 		docker build $(BUILD_ARGS) -f $(DOCKERFILE) -t $(IMAGE) . ; \
@@ -153,7 +213,7 @@ _ensure_image:
 # ---- _ensure_container：容器懒创建 / 刷新启动 ----
 # 状态机：
 #   not exists  -> docker run -d
-#   running     -> reuse            (避免构建/打包阶段杀掉 31246 调试服务)
+#   running     -> reuse            (避免构建/打包阶段杀掉当前调试服务)
 #   exited      -> docker start
 # 实现要点：
 #   - 用 `docker container inspect` 显式判存在；不存在时返回非零，进入 run 分支；
@@ -164,12 +224,29 @@ _ensure_container: _ensure_image
 		echo "[make] 容器 $(CONTAINER_NAME) 不存在，创建并启动..."; \
 		docker run -d $(RUN_ARGS) $(IMAGE) /usr/local/bin/entrypoint.sh >/dev/null ; \
 	else \
-		port_bindings=$$(docker container inspect -f '{{json .NetworkSettings.Ports}}' $(CONTAINER_NAME) 2>/dev/null); \
-		if ! printf '%s\n' "$$port_bindings" | grep -q '"31246/tcp"'; then \
-			echo "[make] 容器 $(CONTAINER_NAME) 缺少 31246 端口映射，重建容器并保留 named volumes..."; \
-			docker rm -f $(CONTAINER_NAME) >/dev/null ; \
-			docker run -d $(RUN_ARGS) $(IMAGE) /usr/local/bin/entrypoint.sh >/dev/null ; \
-			exit 0 ; \
+		if [ "$(DEEPCODE_WORKTREE_MODE)" = "1" ]; then \
+			configured_root=$$(docker container inspect -f '{{index .Config.Labels "com.deepcode.worktree.root"}}' $(CONTAINER_NAME) 2>/dev/null); \
+			mounted_root=$$(docker container inspect -f '{{range .Mounts}}{{if eq .Destination "/workspace"}}{{.Source}}{{end}}{{end}}' $(CONTAINER_NAME) 2>/dev/null); \
+			actual_host_port=$$(docker container port $(CONTAINER_NAME) $(DEEPCODE_CONTAINER_PORT)/tcp 2>/dev/null | awk -F: 'NR == 1 { print $$NF }'); \
+			if [ "$$configured_root" != "$(DEEPCODE_WORKTREE_ROOT)" ] || [ "$$mounted_root" != "$(DEEPCODE_WORKTREE_ROOT)" ]; then \
+				echo "[make][error] 容器 $(CONTAINER_NAME) 绑定了其他 worktree，拒绝复用" >&2; \
+				echo "  expected=$(DEEPCODE_WORKTREE_ROOT)" >&2; \
+				echo "  label=$$configured_root" >&2; \
+				echo "  mount=$$mounted_root" >&2; \
+				exit 1; \
+			fi; \
+			if [ "$$actual_host_port" != "$(DEEPCODE_HOST_PORT)" ]; then \
+				echo "[make][error] 容器 $(CONTAINER_NAME) 的 host 端口为 $$actual_host_port，配置要求 $(DEEPCODE_HOST_PORT)" >&2; \
+				exit 1; \
+			fi; \
+		else \
+			port_bindings=$$(docker container inspect -f '{{json .NetworkSettings.Ports}}' $(CONTAINER_NAME) 2>/dev/null); \
+			if ! printf '%s\n' "$$port_bindings" | grep -q '"$(DEEPCODE_CONTAINER_PORT)/tcp"'; then \
+				echo "[make] 容器 $(CONTAINER_NAME) 缺少 $(DEEPCODE_CONTAINER_PORT) 端口映射，重建容器并保留 named volumes..."; \
+				docker rm -f $(CONTAINER_NAME) >/dev/null ; \
+				docker run -d $(RUN_ARGS) $(IMAGE) /usr/local/bin/entrypoint.sh >/dev/null ; \
+				exit 0 ; \
+			fi; \
 		fi; \
 		status=$$(docker container inspect -f '{{.State.Status}}' $(CONTAINER_NAME) 2>/dev/null | tr -d '[:space:]'); \
 		case "$$status" in \
@@ -188,7 +265,7 @@ _ensure_container: _ensure_image
 	fi
 
 # ---- shell：唯一交互入口 ----
-shell: _ensure_container
+shell: _ensure_macos_package_service _ensure_container
 	@echo "[make] exec 进入容器 $(CONTAINER_NAME) ..."
 	@docker exec -it $(NETWORK_ENV_ARGS) $(CONTAINER_NAME) bash
 
@@ -201,18 +278,22 @@ build-deepcode-gui-tauri: _ensure_container
 	@docker exec $(NETWORK_ENV_ARGS) $(CONTAINER_NAME) bash -c 'bash ./build.sh --stage deepcode-gui-tauri'
 
 dev-deepcode-gui: _ensure_container
-	@echo "[make] Docker 内启动 DeepCode-GUI 调试服务：http://127.0.0.1:31246/"
-	@docker exec -it $(NETWORK_ENV_ARGS) $(CONTAINER_NAME) bash -c 'bash ./build.sh --stage deepcode-gui && DEEPCODE_HOST=0.0.0.0 DEEPCODE_PORT=31246 DEEPCODE_CLIENT_DIST=userspace/gui/dist-deepcode-gui cargo run -p deepcode-host-web'
+	@echo "[make] Docker 内启动 DeepCode-GUI 调试服务：http://127.0.0.1:$(DEEPCODE_HOST_PORT)/"
+	@docker exec -it $(NETWORK_ENV_ARGS) $(CONTAINER_NAME) bash -c 'bash ./build.sh --stage deepcode-gui && DEEPCODE_HOST=0.0.0.0 DEEPCODE_PORT=$(DEEPCODE_CONTAINER_PORT) DEEPCODE_CLIENT_DIST=userspace/gui/dist-deepcode-gui cargo run -p deepcode-host-web'
 
-# ---- clean：全量清理 ----
+# ---- clean：默认模式保持全量清理；worktree 模式只清理当前隔离资源 ----
 clean:
 	@echo "[make] 强制移除容器 $(CONTAINER_NAME) ..."
 	-@docker rm -f $(CONTAINER_NAME) >/dev/null 2>&1 || true
+ifeq ($(DEEPCODE_WORKTREE_MODE),0)
 	@echo "[make] 强制移除镜像 $(IMAGE) ..."
 	-@docker rmi -f $(IMAGE) >/dev/null 2>&1 || true
+else
+	@echo "[make] worktree 模式保留共享镜像 $(IMAGE)、pnpm store 和 Cargo registry"
+endif
 	@echo "[make] 移除 named volumes ..."
 	-@for v in $(VOLUMES_ALL); do \
 		docker volume rm $$v >/dev/null 2>&1 && echo "  - removed volume $$v" || echo "  - skip $$v (不存在)"; \
 	done
-	@echo "[make] 清理完成。下次 'make shell' 将全量重建镜像与容器。"
+	@echo "[make] 清理完成。下次 'make shell' 将重建当前配置需要的容器环境。"
 	@echo "[make] 注意：宿主机 ./bin、./node_modules（如存在于宿主端）未被本目标修改。"

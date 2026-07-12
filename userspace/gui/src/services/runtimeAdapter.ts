@@ -442,6 +442,10 @@ export function getAgentSession(sessionId: string): Promise<ApiResponse<AgentSes
   return api.getAgentSession(sessionId);
 }
 
+export function getAgentTimeline(sessionId: string) {
+  return api.getAgentTimeline(sessionId);
+}
+
 export async function getAgentSessionMemorySnapshot(
   sessionId: string,
   options: { projectMemoryMode?: 'confirm' | 'auto' } = {}
@@ -523,10 +527,6 @@ export function getAgentEventSnapshot(
   sessionId: string
 ): Promise<ApiResponse<GetAgentEventSnapshotResult>> {
   return api.getAgentEventSnapshot(sessionId);
-}
-
-export function getAgentTimeline(sessionId: string) {
-  return api.getAgentTimeline(sessionId);
 }
 
 const agentEventSubscriptions = new Map<string, number>();

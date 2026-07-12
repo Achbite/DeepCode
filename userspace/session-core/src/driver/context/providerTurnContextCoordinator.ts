@@ -1,9 +1,11 @@
-import type { AgentEvent, AgentSessionResult } from '@deepcode/protocol';
+import type { AgentEvent, AgentSessionResult, KernelToolCatalogSnapshot } from '@deepcode/protocol';
 import type { CurrentTaskContext, TaskExecutionCursor } from '../../accepted-plan/index.js';
 import type {
   ContextAssemblyInput,
   ContextAssemblyRecord,
+  ContextAssemblyTaskLocalCompactRecord,
   ContextAssemblyResult,
+  PromptCachePlan,
   ProjectMemoryMode,
   SessionMemoryDocument,
 } from '../../context/index.js';
@@ -13,8 +15,14 @@ import type {
   ResourcePacket,
 } from '../../context/types.js';
 import type { RequirementRecord } from '../../requirement/types.js';
+import type { AcceptedImplementationPlanContext } from '../../accepted-plan/types.js';
 import type { PromptEnvelope } from '../../prompt/types.js';
-import type { DriverProviderTurnFrame } from '../runFrame.js';
+import type { HookInput, HookResult } from '../hooks/index.js';
+import type { DriverProviderTurnFrame, ModelContextBundle, ProviderTurnSnapshot, SessionDriverTaskResourceProgress, ToolIntentTemplate } from '../runFrame.js';
+import { SessionDriverProviderRuntimeAccessor } from '../runFrame.js';
+import { buildProviderTurnSnapshot } from './providerTurnSnapshot.js';
+import { IntentSlotRegistry } from '../execution/intentSlot.js';
+import { ProviderProfileRegistry } from '../../provider/ProviderProfileRegistry.js';
 
 export interface ProviderTurnContextState {
   sessionId: string;
@@ -23,9 +31,13 @@ export interface ProviderTurnContextState {
   stateContract?: {
     stateId?: string;
     allowedProposals?: string[];
+    toolCatalogSnapshot?: KernelToolCatalogSnapshot;
   };
   driverRequest?: {
     kind?: string;
+    stateContract?: {
+      toolCatalogSnapshot?: KernelToolCatalogSnapshot;
+    };
   };
   memoryDocument?: SessionMemoryDocument;
   initialContext?: InitialContextPacket;
@@ -36,9 +48,13 @@ export interface ProviderTurnContextState {
   acceptedImplementationPlan?: unknown;
   implementationBatch?: unknown;
   generatedArtifactEvidence: Map<string, unknown>;
-  cachePlan?: unknown;
+  resourceRequestProgressByTask?: Map<string, SessionDriverTaskResourceProgress>;
+  cachePlan?: PromptCachePlan;
   contextAssembly?: ContextAssemblyRecord;
+  taskLocalCompactRecords?: ContextAssemblyTaskLocalCompactRecord[];
   providerTurnFrame?: DriverProviderTurnFrame;
+  modelContextBundle?: ModelContextBundle;
+  semanticDirectiveErrorSummary?: string;
 }
 
 export interface ProviderTurnContextInput {
@@ -55,6 +71,7 @@ export interface ProviderTurnContextResult {
   prompt: PromptEnvelope;
   allowedProposals: string[];
   lastResult: AgentSessionResult;
+  modelContextBundle: ModelContextBundle;
 }
 
 export interface ProviderTurnContextCoordinatorPorts<State extends ProviderTurnContextState> {
@@ -81,18 +98,26 @@ export interface ProviderTurnContextCoordinatorPorts<State extends ProviderTurnC
     prompt: PromptEnvelope;
     contextAssembly?: ContextAssemblyRecord;
     userRequest: string;
+    confirmedDecisionSummary?: string;
+    errorSummary?: string;
     acceptedPlanActive: boolean;
     currentTaskContext?: CurrentTaskContext;
     resourcePackets: ResourcePacket[];
     generatedArtifactCount: number;
+    toolIntentTemplates?: ToolIntentTemplate[];
+    nextActionInstruction?: string;
   }): DriverProviderTurnFrame;
+  runHook?(input: HookInput): Promise<HookResult[]>;
 }
 
 export class ProviderTurnContextCoordinator<State extends ProviderTurnContextState> {
+  private readonly intentSlots = new IntentSlotRegistry();
+  private readonly profiles = new ProviderProfileRegistry();
+
   constructor(private readonly ports: ProviderTurnContextCoordinatorPorts<State>) {}
 
   async prepare(state: State, input: ProviderTurnContextInput): Promise<ProviderTurnContextResult> {
-    const allowedProposals = this.ports.allowedProposals(state.stateContract?.allowedProposals ?? [
+    const kernelAllowedProposals = this.ports.allowedProposals(state.stateContract?.allowedProposals ?? [
       'answer',
       'resourceRequest',
       'decisionRequest',
@@ -100,21 +125,31 @@ export class ProviderTurnContextCoordinator<State extends ProviderTurnContextSta
       'actionBundle',
       'diagnostic',
     ], state);
+    const acceptedExecution = Boolean(state.acceptedImplementationPlan || state.currentTaskContext);
+    const allowedProposals = providerVisibleAllowedProposals(kernelAllowedProposals, acceptedExecution);
+    const providerUserRequest = this.providerVisibleUserRequest(state, input.inputContent);
+    const userGuidance = this.ports.collectUserGuidanceEvents(input.lastResult.events, state.runId);
 
     const assembledContext = this.ports.assembleContext({
       contextAssemblyId: input.contextAssemblyId,
       workflowState: state.stateContract?.stateId ?? state.driverRequest?.kind ?? 'needProposal',
       allowedProposals,
-      capabilityCatalogSummary: this.ports.capabilityCatalogSummary(state),
-      memoryDocument: state.memoryDocument,
+      capabilityCatalogSummary: acceptedExecution
+        ? this.acceptedExecutionCapabilitySummary(state)
+        : '',
+      memoryDocument: acceptedExecution ? undefined : state.memoryDocument,
       projectMemoryMode: input.projectMemoryMode,
       extraMemoryHints: this.ports.memoryHints(state),
       interventionLevel: input.interventionLevel,
-      userGuidance: this.ports.collectUserGuidanceEvents(input.lastResult.events, state.runId),
-      userRequest: input.inputContent,
+      userGuidance,
+      userRequest: providerUserRequest,
       currentTaskGoal: state.currentTaskContext?.goal,
       currentTaskContext: state.currentTaskContext,
       taskCursor: state.taskExecutionCursor,
+      taskLocalCompactRecords: state.taskLocalCompactRecords,
+      currentTaskResourcePacketIds: state.currentTaskContext?.taskId
+        ? state.resourceRequestProgressByTask?.get(state.currentTaskContext.taskId)?.packetIds
+        : undefined,
       initialContext: state.initialContext,
       resourcePackets: state.resourcePackets,
       conversationRoots: state.conversationRoots,
@@ -125,32 +160,212 @@ export class ProviderTurnContextCoordinator<State extends ProviderTurnContextSta
       },
     });
 
-    state.cachePlan = assembledContext.cachePlan;
-    state.contextAssembly = assembledContext.contextAssembly;
+    const runtime = new SessionDriverProviderRuntimeAccessor(state);
 
     const lastResult = await this.ports.appendConsumedGuidance({
       sessionId: state.sessionId,
       result: input.lastResult,
-      consumedIds: state.contextAssembly?.consumedUserGuidanceIds ?? [],
+      consumedIds: assembledContext.contextAssembly.consumedUserGuidanceIds ?? [],
       runId: state.runId,
       appliedAtProviderStage: 'provider_call',
       userRequest: state.userRequest,
     });
-    const prompt = assembledContext.prompt;
-    state.providerTurnFrame = this.ports.buildProviderTurnContract({
+    const profile = this.profiles.profile(acceptedExecution ? 'execution-v1' : 'planning-v1');
+    const prompt = {
+      ...assembledContext.prompt,
+      stablePrefix: profile.systemContract,
+    };
+    // ProviderTurnContract and PromptEnvelope must share one ContextAdmission assembly.
+    const providerTurnFrame = this.ports.buildProviderTurnContract({
       contractId: input.contractId,
       sessionId: state.sessionId,
       runId: state.runId,
       allowedKinds: allowedProposals,
       prompt,
-      contextAssembly: state.contextAssembly,
-      userRequest: input.inputContent,
+      contextAssembly: assembledContext.contextAssembly,
+      userRequest: providerUserRequest,
+      confirmedDecisionSummary: this.confirmedDecisionSummary(userGuidance, input.confirmedRequirement),
+      errorSummary: state.semanticDirectiveErrorSummary,
       acceptedPlanActive: Boolean(state.acceptedImplementationPlan),
       currentTaskContext: state.currentTaskContext,
       resourcePackets: state.resourcePackets,
       generatedArtifactCount: state.generatedArtifactEvidence.size,
+      toolIntentTemplates: this.currentTaskToolIntentTemplates(state),
+      nextActionInstruction: this.nextActionInstruction(state, input.confirmedRequirement, allowedProposals),
+    });
+    const snapshot = buildProviderTurnSnapshot(providerTurnFrame);
+    const hookTrace = await this.runContextAdmissionHook(providerTurnFrame, snapshot);
+    const providerTurnFrameWithSnapshot = {
+      ...providerTurnFrame,
+      snapshot,
+      hookTrace,
+    };
+    const modelContextBundle = runtime.applyModelContext({
+      prompt,
+      cachePlan: assembledContext.cachePlan,
+      contextAssembly: assembledContext.contextAssembly,
+      providerTurnFrame: providerTurnFrameWithSnapshot,
+      snapshot,
+      hookTrace,
     });
 
-    return { prompt, allowedProposals, lastResult };
+    return {
+      prompt,
+      allowedProposals,
+      lastResult,
+      modelContextBundle,
+    };
   }
+
+  private async runContextAdmissionHook(
+    frame: DriverProviderTurnFrame,
+    snapshot: ProviderTurnSnapshot
+  ): Promise<HookResult[]> {
+    return this.ports.runHook?.({
+      point: 'contextAdmission.after',
+      sessionId: frame.sessionId,
+      runId: frame.runId,
+      contractId: frame.contractId,
+      turnMode: frame.turnMode,
+      allowedKinds: frame.allowedKinds,
+      snapshot,
+    }) ?? [];
+  }
+
+  private providerVisibleUserRequest(state: State, inputContent: string): string {
+    if (!state.acceptedImplementationPlan) return inputContent;
+    const accepted = objectRecord(state.acceptedImplementationPlan);
+    const planId = stringValue(accepted?.planId) ?? 'unknown';
+    const title = stringValue(accepted?.title);
+    const summary = stringValue(accepted?.summary);
+    const currentTask = objectRecord(state.currentTaskContext);
+    const taskId = stringValue(currentTask?.taskId) ?? 'none';
+    const taskTitle = stringValue(currentTask?.taskTitle);
+    const targets = stringArray(currentTask?.targets);
+    const acceptanceCriteria = stringArray(currentTask?.acceptanceCriteria);
+    const failureCriteria = stringArray(currentTask?.failureCriteria);
+    const completedCount = Array.isArray(accepted?.completedTaskIds) ? accepted.completedTaskIds.length : 0;
+    const taskCount = Array.isArray(accepted?.tasks) ? accepted.tasks.length : 0;
+    return [
+      'Accepted execution sanitized context.',
+      'ConfirmedPlan is active. The original user request is retained by Session as a source reference and is not re-expanded in this execution turn.',
+      `ConfirmedPlan: planId=${planId}${title ? `; title=${oneLine(title, 240)}` : ''}${summary ? `; summary=${oneLine(summary, 360)}` : ''}`,
+      `TaskLedger: completedByKernelFacts=${completedCount}; totalTasks=${taskCount}`,
+      `CurrentTaskFrame: taskId=${taskId}${taskTitle ? `; title=${oneLine(taskTitle, 240)}` : ''}${targets.length ? `; targets=${targets.join(', ')}` : ''}`,
+      acceptanceCriteria.length ? `CurrentTaskAcceptance: ${acceptanceCriteria.map((item) => oneLine(item, 240)).join(' | ')}` : '',
+      failureCriteria.length ? `CurrentTaskStopOrReplan: ${failureCriteria.map((item) => oneLine(item, 240)).join(' | ')}` : '',
+      'Use TaskFrame, ResourceEvidence, AccessIndex, ErrorContext, and NextActionInstruction as the execution authority for this turn.',
+    ].filter(Boolean).join('\n');
+  }
+
+  private acceptedExecutionCapabilitySummary(state: State): string {
+    const task = state.currentTaskContext;
+    if (!task) {
+      return [
+        'Accepted execution Session directive summary.',
+        'currentTask=none',
+        'No current task is active; use the registered diagnostic or task-outcome semantic tool.',
+      ].join('\n');
+    }
+    const templates = this.currentTaskToolIntentTemplates(state)
+      .map((template) => {
+        const templateRecord = objectRecord(template.template);
+        return [
+          `slotId=${template.intentId}`,
+          `operation=${template.operation}`,
+          `targetRef=${template.targets[0] ?? 'none'}`,
+          `contentMode=${stringValue(templateRecord?.contentMode) ?? 'none'}`,
+          `evidenceRequirement=${stringValue(templateRecord?.evidenceRequirement) ?? 'none'}`,
+        ].filter(Boolean).join(';');
+      });
+    return [
+      'Accepted execution Session directive summary.',
+      `currentTaskId=${task.taskId}`,
+      templates.length ? `intentSlots=${templates.join(' | ')}` : 'intentSlots=none',
+      templates.length
+        ? 'Submit content only for the listed slot ids. Do not submit paths, Kernel tool identifiers, permission fields, or operations outside the current task.'
+        : 'No artifact slot is available. Use complete_current_task, request_resources, request_decision, or report_diagnostic as appropriate.',
+    ].join('\n');
+  }
+
+  private confirmedDecisionSummary(
+    guidance: ContextAssemblyInput['userGuidance'],
+    requirement: RequirementRecord | undefined
+  ): string | undefined {
+    const lines = (guidance ?? [])
+      .filter((item) => item.source === 'decision' || item.source === 'review' || item.checkpointKind === 'permission')
+      .slice(-6)
+      .map((item) => `id=${item.id}; source=${item.source}; checkpoint=${item.checkpointKind}; content=${oneLine(item.content, 500)}`);
+    if (requirement?.status === 'confirmed') {
+      lines.push(`requirementId=${requirement.requirementId}; status=confirmed`);
+    }
+    return lines.length ? lines.join('\n') : undefined;
+  }
+
+  private nextActionInstruction(
+    state: State,
+    requirement: RequirementRecord | undefined,
+    allowedProposals: string[]
+  ): string | undefined {
+    if (state.acceptedImplementationPlan || state.currentTaskContext) return undefined;
+    if (requirement?.status !== 'confirmed') return undefined;
+    return [
+      'state=ConfirmedRequirementContinuation',
+      `confirmedRequirementId=${requirement.requirementId}`,
+      `allowedOutputs=${allowedProposals.join(' | ') || 'none'}`,
+      'The user has already resolved the previous decisionRequest. Do not repeat that intervention.',
+      'Use the confirmed requirement and confirmed decision as the resolved current scope.',
+      'Do not infer extra preserved/deleted/modified targets from memory or from ambiguous wording in the original request.',
+      'Choose the narrowest valid next proposal from allowedOutputs.',
+      'Keep visible reasoning/progress action-oriented: state the current action or proposal, not protocol, tool, permission, or evidence-policy deliberation.',
+    ].join(' ');
+  }
+
+  private currentTaskToolIntentTemplates(state: State): ToolIntentTemplate[] {
+    const acceptedPlan = state.acceptedImplementationPlan as AcceptedImplementationPlanContext | undefined;
+    return this.intentSlots.currentTaskSlots(acceptedPlan).map((slot): ToolIntentTemplate => ({
+      intentId: slot.slotId,
+      label: 'IntentSlot',
+      operation: slot.operation,
+      targets: [slot.targetRef],
+      evidencePolicy: slot.evidenceRequirement,
+      template: {
+        contentMode: slot.contentMode,
+        evidenceRequirement: slot.evidenceRequirement,
+        targetResourceKind: slot.targetResourceKind,
+      },
+    }));
+  }
+}
+
+export function providerVisibleAllowedProposals(
+  allowedProposals: readonly string[],
+  acceptedExecution: boolean
+): string[] {
+  if (acceptedExecution) {
+    return ['actionBundle', 'resourceRequest', 'decisionRequest', 'taskOutcome', 'diagnostic'];
+  }
+  const blocked = new Set(['actionBundle', 'taskOutcome', 'implementationPlan', 'reviewSummary']);
+  return [...new Set(allowedProposals)].filter((kind) => !blocked.has(kind));
+}
+
+function objectRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function stringValue(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function stringArray(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0).map((item) => item.trim())
+    : [];
+}
+
+function oneLine(value: string, limit: number): string {
+  const normalized = value.replace(/\s+/g, ' ').trim();
+  return normalized.length > limit ? `${normalized.slice(0, Math.max(0, limit - 3))}...` : normalized;
 }

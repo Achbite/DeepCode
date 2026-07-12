@@ -31,6 +31,7 @@ export interface AcceptedPlanReviewHandoffCoordinatorInput<
       sessionId: string;
       plan: Plan;
       kernelEvents: unknown[];
+      events?: AgentEvent[];
       ts: string;
       id: string;
     }): AgentEvent;
@@ -107,6 +108,7 @@ export class AcceptedPlanReviewHandoffCoordinator<
       sessionId: runInput.sessionId,
       plan: runInput.plan,
       kernelEvents: reviewKernelEvents,
+      events: result.events,
       ts: this.input.now(),
       id: this.input.createId('review-summary'),
     });

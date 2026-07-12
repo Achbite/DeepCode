@@ -1,4 +1,56 @@
+import type { KernelReply } from '@deepcode/protocol';
+
+export type KernelReplyObservation =
+  | {
+    kind: 'factsObserved';
+    reply: KernelReply;
+    events: unknown[];
+    readyForReview: boolean;
+    hasFailureOrBlocker: boolean;
+  }
+  | {
+    kind: 'permissionInterrupted';
+    reply: KernelReply;
+    events: unknown[];
+    permissionId?: string;
+  }
+  | {
+    kind: 'commandFailed';
+    reply: KernelReply;
+    events: unknown[];
+    code: string;
+    message: string;
+  };
+
 export class KernelEventStatusIndex {
+  observe(reply: KernelReply): KernelReplyObservation {
+    const events = reply.events ?? [];
+    if (this.hasPermissionRequest(events)) {
+      return {
+        kind: 'permissionInterrupted',
+        reply,
+        events,
+        permissionId: this.permissionId(events),
+      };
+    }
+    if (!reply.ok) {
+      return {
+        kind: 'commandFailed',
+        reply,
+        events,
+        code: reply.error?.code ?? 'kernel_command_failed',
+        message: reply.error?.message ?? 'Kernel command failed.',
+      };
+    }
+    return {
+      kind: 'factsObserved',
+      reply,
+      events,
+      readyForReview: this.actionBatchReadyForReview(events),
+      hasFailureOrBlocker: this.hasFailureOrBlocker(events),
+    };
+  }
+
   workUnitIds(events: unknown[]): string[] {
     const ids = new Set<string>();
     for (const event of events) {

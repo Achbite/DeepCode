@@ -1,8 +1,8 @@
 import type { LlmChatRequest } from '@deepcode/protocol';
-import { actionBundleProtocolShapeLines, actionBundleProtocolShapeReference, resourceRequestProtocolShapeLine } from '../protocol/protocolContract.js';
 import type { ProposalEnvelope } from '../protocol/types.js';
 import type { NativeToolCallProposal } from '../provider/providerStreamParts.js';
 import type { PromptEnvelope } from './types.js';
+import { ACCEPTED_PLAN_RESOURCE_RESUME_ALLOWED_KINDS } from './AcceptedPlanResourceResumePromptBuilder.js';
 import { RepairProviderTurnContractBuilder, type RepairProviderTurnContractInput } from './RepairProviderTurnContractBuilder.js';
 
 const DEFAULT_MAX_ACTION_BUNDLE_TOTAL_CODE_BYTES = 384 * 1024;
@@ -60,7 +60,7 @@ export class ProviderRepairMessageBuilder {
     const acceptedExecution = Boolean(state.acceptedContext && Object.keys(state.acceptedContext).length > 0) || Boolean(state.currentTaskContext);
     const actionBundleRepair = acceptedExecution || this.isActionBundleRepairError(parseError.code);
     const allowedKinds = actionBundleRepair
-      ? ['actionBundle', 'resourceRequest', 'decisionRequest', 'diagnostic']
+      ? ['actionBundle', 'resourceRequest', 'decisionRequest', 'taskOutcome', 'diagnostic']
       : ['answer', 'resourceRequest', 'decisionRequest', 'taskPlan', 'diagnostic'];
     const repairSystemLines = [
       'You are the DeepCode Agent Protocol v3 repair step.',
@@ -68,18 +68,22 @@ export class ProviderRepairMessageBuilder {
       'Do not add execution facts, permissions, or tool results.',
       `Allowed proposal kinds: ${allowedKinds.join(', ')}.`,
       acceptedExecution
-        ? 'An accepted task is already active. Do not output taskPlan or implementationPlan; repair toward the current task actionBundle/resourceRequest/decisionRequest/diagnostic only.'
+        ? 'An accepted task is already active. Do not output taskPlan or implementationPlan; repair toward the current task actionBundle/resourceRequest/decisionRequest/taskOutcome/diagnostic only.'
         : actionBundleRepair
           ? 'Repair the existing actionBundle proposal only if it remains a valid reviewable side-effect proposal; otherwise output taskPlan, resourceRequest, decisionRequest, or diagnostic as allowed.'
           : 'For initial side-effect work, output taskPlan unless acceptedTaskPlan context is already present. Do not output actionBundle in this repair call.',
-      ...(actionBundleRepair ? actionBundleProtocolShapeLines() : []),
+      repairSchemaAuthorityLine(),
+      ...(actionBundleRepair ? [actionBundleCarrierGuidanceLine()] : []),
       actionBundleRepair
         ? 'Use codeBlocks[].contentLines for source code. Do not output large codeBlocks.content strings and do not manually escape multiline source code into JSON strings.'
         : 'Execution actionBundle schema and Kernel tool args are intentionally withheld in this repair call.',
       actionBundleRepair
         ? 'For fs.write, args.sourceBlockId must reference a top-level codeBlocks[].blockId for the same args.path. Directory targets are planning scopes; do not repair by creating empty .gitkeep or other placeholder files.'
-        : 'Represent future file operations as taskPlan targets/capabilities only; do not invent toolIds or executable args.',
-      'Do not output legacy implementationPlan, commandBlocks, capability, permissionLabels, accessScopes, resourceScope, or payload wrapper fields.',
+        : 'Represent future work as taskPlan tasks with concrete non-root targets, capability, acceptanceCriteria, and failureCriteria. Use fs.write/fs.patch/fs.delete for workspace file-system changes; do not use process.exec for mkdir/rm/cp/sed/cat-redirection or other workspace file mutations.',
+      actionBundleRepair
+        ? ''
+        : 'Do not create standalone directory-creation tasks unless a concrete directory tool is available; parent directories may be implied by planned concrete file writes.',
+      'Do not output legacy implementationPlan, commandBlocks, permissionLabels, accessScopes, resourceScope, or payload wrapper fields. capability is allowed only as taskPlan.tasks[].capability; actionBundle actions must use toolId and must not output capability fields.',
       'Output ONLY the single JSON object - no prose, no explanation, and no markdown ``` code fences before or after it.',
       actionBundleRepair
         ? 'actionBundle.version must be exactly the string "1".'
@@ -104,7 +108,7 @@ export class ProviderRepairMessageBuilder {
             errorLines: [`${parseError.code}: ${parseError.message}`],
           }),
           ...this.compactRepairContextLines(prompt, state),
-          'Protocol field quick reference:',
+          'Repair carrier reminder:',
           fenced(this.protocolRepairShapeReference(parseError.code, allowedKinds)),
           `Parser error code: ${parseError.code}`,
           `Parser error message: ${parseError.message}`,
@@ -128,8 +132,8 @@ export class ProviderRepairMessageBuilder {
           'You are the DeepCode Agent Protocol v3 implementation batch repair step.',
           'Return exactly one valid JSON object using schemaVersion "deepcode.agent.protocol.v3".',
           'If proposing executable work, return kind="actionBundle" for a coherent batch that fits the payload budget.',
-          'For kind="actionBundle", put userPlanMarkdown, codeBlocks, and actionBundle directly on the top-level JSON object. Do not wrap them in a payload object. validationExpectations[] and reviewExpectations[] are optional provider notes; Session derives routine defaults when they are omitted.',
-          ...actionBundleProtocolShapeLines(),
+          repairSchemaAuthorityLine(),
+          actionBundleCarrierGuidanceLine(),
           'Use codeBlocks[].contentLines for source code.',
           'Do not output legacy implementationPlan, commandBlocks, capability, permissionLabels, accessScopes, resourceScope, or large/multiline codeBlocks.content strings.',
           `Payload budget: at most ${this.maxActionBundleTotalCodeBytes} bytes total joined contentLines. File count, task count, and codeBlock count are not permission boundaries.`,
@@ -144,7 +148,7 @@ export class ProviderRepairMessageBuilder {
         content: [
           this.renderRepairProviderTurnContract(state, {
             turnMode: 'acceptedTaskExecution',
-            allowedKinds: ['actionBundle', 'resourceRequest', 'decisionRequest', 'diagnostic'],
+            allowedKinds: ['actionBundle', 'resourceRequest', 'decisionRequest', 'taskOutcome', 'diagnostic'],
             requiredKind: 'actionBundle',
             repairPolicy: 'sameKindOnly',
             errorLines: [reason],
@@ -172,7 +176,7 @@ export class ProviderRepairMessageBuilder {
           'Complete-stage provider-native tools are disabled. Do not call tools.',
           'Return exactly one valid Agent Protocol v3 JSON object.',
           'If executable work is ready, return kind="actionBundle" within the accepted taskPlan scope.',
-          'If evidence is missing, return kind="resourceRequest". If the accepted scope is insufficient, return kind="decisionRequest" or diagnostic.',
+          'If evidence is missing, return kind="resourceRequest". If a concrete operation exceeds accepted scope, keep the corrected operation intent explicit; Session will fail closed or produce a deterministic intervention.',
           'Never claim that files were written, commands ran, permissions were granted, validation passed, or tasks completed.',
         ].join('\n'),
       },
@@ -181,7 +185,7 @@ export class ProviderRepairMessageBuilder {
         content: [
           this.renderRepairProviderTurnContract(state, {
             turnMode: 'acceptedTaskExecution',
-            allowedKinds: ['actionBundle', 'resourceRequest', 'decisionRequest', 'diagnostic'],
+            allowedKinds: ['actionBundle', 'resourceRequest', 'decisionRequest', 'taskOutcome', 'diagnostic'],
             repairPolicy: 'sameKindOnly',
             errorLines: [`Provider-native tool call was blocked in Complete stage: ${toolCall.name}`],
           }),
@@ -192,8 +196,8 @@ export class ProviderRepairMessageBuilder {
           'Provider narration before blocked tool:',
           fenced(clip(turn.content || '[empty]', 2_000)),
           ...this.compactRepairContextLines(prompt, state, { includeAcceptedPlan: true }),
-          'Minimum actionBundle skeleton:',
-          fenced(this.minimalActionBundleRepairSkeleton()),
+          'ActionBundle carrier reminder:',
+          fenced(actionBundleCarrierGuidanceLine()),
         ].join('\n\n'),
       },
     ];
@@ -220,11 +224,13 @@ export class ProviderRepairMessageBuilder {
           guardrail,
           'Never claim that files were written, commands ran, permissions were granted, or validation passed.',
           'If returning decisionRequest, ask one concise question with 2-3 mutually exclusive options, exactly one recommended option, impact descriptions, allowsFreeform=true, and user-visible text in the current user language.',
-          'If returning taskPlan, put taskPlan.version/id/title/summary/tasks/risks/reviewCheckpoints directly on the top-level JSON object. tasks[] must be ordered by practical development sequence; deprecated graph fields may be parsed for telemetry but are not required. taskPlan must not include source code, codeBlocks, actionBundle, commandBlocks, patches, or executable tool calls.',
-          'If returning actionBundle after acceptedTaskPlan, put userPlanMarkdown, codeBlocks, and actionBundle directly on the top-level JSON object. Do not wrap them in a payload object. validationExpectations[] and reviewExpectations[] are optional provider notes; Session derives routine defaults when they are omitted.',
-          ...actionBundleProtocolShapeLines(),
-          'Command plans use actionBundle.actions[] with toolId="process.exec" and typed args; do not output commandBlocks.',
-          'Use codeBlocks[].contentLines for source code in Complete-stage actionBundle only. Do not output capability, permissionLabels, accessScopes, resourceScope, commandBlocks, legacy implementationPlan, or large/multiline codeBlocks.content strings.',
+          'If returning taskPlan, put taskPlan.version/id/title/summary/tasks/risks/reviewCheckpoints directly on the top-level JSON object. tasks[] must be ordered reviewable engineering batches, not one task per file; each task includes capability plus concrete, non-root file or directory targets. Deprecated graph fields may be parsed for telemetry but are not required. taskPlan must not include source code, codeBlocks, actionBundle, commandBlocks, patches, or executable tool calls.',
+          ...(afterAcceptedPlan ? [
+            'If returning actionBundle after acceptedTaskPlan, put userPlanMarkdown, codeBlocks, and actionBundle directly on the top-level JSON object. Do not wrap them in a payload object.',
+            'For actionBundle repair, use current task action templates in ProviderTurnContract when present; otherwise use currentTaskCapabilities and current task targets.',
+            'Use codeBlocks[].contentLines for source code in Complete-stage actionBundle only.',
+          ] : []),
+          'Do not output permissionLabels, accessScopes, resourceScope, commandBlocks, legacy implementationPlan, or large/multiline codeBlocks.content strings. capability is allowed only as taskPlan.tasks[].capability; actionBundle actions must use toolId and must not output capability fields.',
         ].join('\n'),
       },
       {
@@ -233,7 +239,7 @@ export class ProviderRepairMessageBuilder {
           this.renderRepairProviderTurnContract(state, {
             turnMode: afterAcceptedPlan ? 'acceptedTaskExecution' : 'protocolRepair',
             allowedKinds: afterAcceptedPlan
-              ? ['actionBundle', 'resourceRequest', 'decisionRequest', 'diagnostic']
+              ? ['actionBundle', 'resourceRequest', 'decisionRequest', 'taskOutcome', 'diagnostic']
               : ['decisionRequest', 'taskPlan', 'resourceRequest', 'diagnostic'],
             repairPolicy: 'sameKindOnly',
             errorLines: [`Provider-native side-effect tool call was blocked: ${toolCall.name}`],
@@ -269,9 +275,11 @@ export class ProviderRepairMessageBuilder {
             ? 'A plan has already been accepted. If executable work is ready, return kind="actionBundle" within the accepted plan scope.'
             : 'If enough facts are available, return kind="answer"; otherwise return kind="resourceRequest" only for a different target/range or search query that adds new evidence.',
           'Never request fs.read or fs.list for any duplicate target/range listed below. Use the existing ResourcePacket facts.',
-          'For kind="actionBundle", put userPlanMarkdown, codeBlocks, and actionBundle directly on the top-level JSON object. Do not wrap them in a payload object. validationExpectations[] and reviewExpectations[] are optional provider notes; Session derives routine defaults when they are omitted.',
-          ...actionBundleProtocolShapeLines(),
-          'Use codeBlocks[].contentLines for source code.',
+          ...(afterAcceptedPlan ? [
+            'For kind="actionBundle", put userPlanMarkdown, codeBlocks, and actionBundle directly on the top-level JSON object. Do not wrap them in a payload object.',
+            'For actionBundle repair, use current task action templates in ProviderTurnContract when present; otherwise use currentTaskCapabilities and current task targets.',
+            'Use codeBlocks[].contentLines for source code.',
+          ] : []),
         ].join('\n'),
       },
       {
@@ -280,7 +288,7 @@ export class ProviderRepairMessageBuilder {
           this.renderRepairProviderTurnContract(state, {
             turnMode: afterAcceptedPlan ? 'resourceResume' : 'protocolRepair',
             allowedKinds: afterAcceptedPlan
-              ? ['actionBundle', 'resourceRequest', 'decisionRequest', 'answer', 'diagnostic']
+              ? [...ACCEPTED_PLAN_RESOURCE_RESUME_ALLOWED_KINDS]
               : ['answer', 'resourceRequest', 'decisionRequest', 'diagnostic'],
             repairPolicy: 'sameKindOnly',
             errorLines: ['Duplicate provider-native read request after Kernel ResourcePacket facts were already returned.'],
@@ -316,8 +324,9 @@ export class ProviderRepairMessageBuilder {
           'Return exactly one valid JSON object using schemaVersion "deepcode.agent.protocol.v3".',
           'Use kind="answer" if the available ResourcePacket facts are enough.',
           'Use kind="resourceRequest" only when requesting manifestEntryId, root-relative path, or kind="search" with a non-empty query under the listed conversation roots.',
-          resourceRequestProtocolShapeLine(),
-          'Use kind="decisionRequest" only when user input is required; minimal shape is {"schemaVersion":"deepcode.agent.protocol.v3","kind":"decisionRequest","decisionRequest":{"id":"decision-1","question":"...","options":[{"id":"option-1","label":"...","description":"...","effect":{"kind":"continueWithAction"}},{"id":"option-2","label":"...","description":"...","effect":{"kind":"continueWithAction"}}],"allowsFreeform":true}}.',
+          repairSchemaAuthorityLine(),
+          resourceRequestCarrierGuidanceLine(),
+          decisionRequestCarrierGuidanceLine(),
           'Each decisionRequest option SHOULD declare its state-machine effect via option.effect. Allowed kinds: "continueWithAction" (default, generate next actionBundle), "skipCurrentTask" (skip the current accepted-plan task), "markAcceptedIncomplete" with optional taskIds[] and reason, "replan" with reason, "finishWithAnswer", and "cancel". When the user-visible question implies "the task is already satisfied / nothing to do / stop and summarize", at least one option MUST use skipCurrentTask, markAcceptedIncomplete, or finishWithAnswer so the session can advance without forcing an empty actionBundle.',
           'Do not invent arbitrary absolute local paths. Absolute file paths are only for user-provided outside-workspace targets that require Kernel PlanReview/permission.',
         ].join('\n'),
@@ -328,7 +337,7 @@ export class ProviderRepairMessageBuilder {
           this.renderRepairProviderTurnContract(state, {
             turnMode: state.acceptedContext && Object.keys(state.acceptedContext).length > 0 ? 'resourceResume' : 'protocolRepair',
             allowedKinds: state.acceptedContext && Object.keys(state.acceptedContext).length > 0
-              ? ['actionBundle', 'resourceRequest', 'decisionRequest', 'answer', 'diagnostic']
+              ? [...ACCEPTED_PLAN_RESOURCE_RESUME_ALLOWED_KINDS]
               : ['answer', 'resourceRequest', 'decisionRequest', 'diagnostic'],
             repairPolicy: 'sameKindOnly',
             errorLines: [resolutionDiagnostic],
@@ -358,7 +367,8 @@ export class ProviderRepairMessageBuilder {
           'Return exactly one valid JSON object using schemaVersion "deepcode.agent.protocol.v3".',
           'Repair the actionBundle so Kernel PlanReview can evaluate concrete completion evidence.',
           'Do not claim execution, permissions, tests passed, or task completion.',
-          ...actionBundleProtocolShapeLines(),
+          'For kind="actionBundle", put userPlanMarkdown, codeBlocks, and actionBundle directly on the top-level JSON object. Do not wrap them in a payload object.',
+          'For actionBundle repair, use current task action templates in ProviderTurnContract when present; otherwise use the Kernel PlanReview report and currentTaskCapabilities to correct action toolIds and targets.',
           'Kernel derives permissions and scope from normalized action args.',
           'Use codeBlocks[].contentLines for source code. Do not output legacy implementationPlan, commandBlocks, capability, permissionLabels, accessScopes, resourceScope, or large/multiline codeBlocks.content strings.',
           'Do not add new toolIds or expand targets unless the Kernel report explicitly requires a repairable correction.',
@@ -370,7 +380,7 @@ export class ProviderRepairMessageBuilder {
           this.renderRepairProviderTurnContract(state, {
             turnMode: acceptedExecution ? 'acceptedTaskExecution' : 'protocolRepair',
             allowedKinds: acceptedExecution
-              ? ['actionBundle', 'resourceRequest', 'decisionRequest', 'diagnostic']
+              ? ['actionBundle', 'resourceRequest', 'decisionRequest', 'taskOutcome', 'diagnostic']
               : ['actionBundle', 'resourceRequest', 'decisionRequest', 'taskPlan', 'diagnostic'],
             requiredKind: 'actionBundle',
             repairPolicy: 'sameKindOnly',
@@ -421,7 +431,7 @@ export class ProviderRepairMessageBuilder {
           this.renderRepairProviderTurnContract(state, {
             turnMode: acceptedExecution ? 'acceptedTaskExecution' : 'protocolRepair',
             allowedKinds: acceptedExecution
-              ? ['actionBundle', 'resourceRequest', 'decisionRequest', 'diagnostic']
+              ? ['actionBundle', 'resourceRequest', 'decisionRequest', 'taskOutcome', 'diagnostic']
               : ['actionBundle', 'resourceRequest', 'decisionRequest', 'taskPlan', 'diagnostic'],
             repairPolicy: 'sameKindOnly',
             errorLines: reasons,
@@ -456,19 +466,19 @@ export class ProviderRepairMessageBuilder {
           'Return exactly one valid JSON object using schemaVersion "deepcode.agent.protocol.v3".',
           'A user has already accepted an execution contract. Repair the current batch so it stays inside the accepted task targets and tool scope.',
           'If executable work is still valid, return kind="actionBundle" with one related implementation batch. Multiple related files are allowed when all targets are inside the accepted plan.',
-          'Before the final JSON proposal, stream visible edit drafts with <deepcode-part>{...}</deepcode-part> frames when generating long codeBlocks/actionBundles. Final workspace writes still come only from the complete actionBundle JSON.',
           'All user-visible natural language in narration, userPlanMarkdown, validation descriptions, and review guidance must follow the current user input language.',
-          'For kind="actionBundle", put userPlanMarkdown, codeBlocks, and actionBundle directly on the top-level JSON object. Do not wrap them in a payload object. validationExpectations[] and reviewExpectations[] are optional provider notes; Session derives routine defaults when they are omitted.',
-          ...actionBundleProtocolShapeLines(),
-          resourceRequestProtocolShapeLine(),
+          'For kind="actionBundle", put userPlanMarkdown, codeBlocks, and actionBundle directly on the top-level JSON object. Do not wrap them in a payload object.',
+          'For actionBundle repair, use current task action templates in ProviderTurnContract when present; otherwise use currentTaskCapabilities and current task targets.',
+          repairSchemaAuthorityLine(),
+          resourceRequestCarrierGuidanceLine(),
           'Use codeBlocks[].contentLines for source code.',
           'Do not output legacy implementationPlan, commandBlocks, capability, permissionLabels, accessScopes, resourceScope, or large/multiline codeBlocks.content strings.',
           'Accepted-plan execution batches should not request workspace root, ".", module root, wildcard, or traversal scope. The accepted Kernel contract is already the authorization source; list concrete args.path/codeBlock.targetPath instead.',
           'If a patch needs current file evidence, return kind="resourceRequest" with kind="search" or a focused file/range read under the conversation roots; Session will resolve it and resume the accepted plan.',
           'Patch actions must use patchSpec.match.kind="exactBlock" and patchSpec.match.text copied from current ResourcePacket fileText/searchResults evidence.',
-          'If the accepted contract is missing a required exact file/folder target, tool, or material technical choice, return kind="decisionRequest" instead of expanding the batch.',
-          'For kind="decisionRequest", include decisionRequest.question as a non-empty string, plus decisionRequest.options with 2-3 options and allowsFreeform=true.',
-          'For decisionRequest options that continue the same accepted task, include option.effect. Use effect.kind="expandCurrentTaskScope" with taskId, targetPath, targetResourceKind="file"|"directory", recursive=true when asking the user to approve a concrete folder/file expansion. Use effect.kind="continueCurrentTask" only when no scope expansion is needed. Use effect.kind="replan" only when the user must revise the accepted plan.',
+          'If a material product, architecture, or implementation choice is missing, return kind="decisionRequest". Do not use decisionRequest for routine permission or scope expansion that can be represented as a concrete operation intent.',
+          decisionRequestCarrierGuidanceLine(),
+          'For decisionRequest options that continue the same accepted task, use effect.kind="expandCurrentTaskScope", "continueCurrentTask", or "replan" according to the ProviderTurnContract and the reported scope issue.',
           'Do not claim execution, permissions, tests passed, or task completion.',
         ].join('\n'),
       },
@@ -477,13 +487,13 @@ export class ProviderRepairMessageBuilder {
         content: [
           this.renderRepairProviderTurnContract(state, {
             turnMode: 'scopeIntervention',
-            allowedKinds: ['actionBundle', 'resourceRequest', 'decisionRequest', 'diagnostic'],
+            allowedKinds: ['actionBundle', 'resourceRequest', 'decisionRequest', 'taskOutcome', 'diagnostic'],
             repairPolicy: 'deterministicIntervention',
             errorLines: validationReasons,
           }),
           ...this.compactRepairContextLines(prompt, state, { includeImplementationBatch: true, includeAcceptedPlan: true }),
-          'Accepted task context:',
-          fenced(clip(JSON.stringify(state.acceptedContext ?? {}, null, 2), 4_000)),
+          'Accepted task summary:',
+          fenced(JSON.stringify(acceptedRepairContextSummary(state), null, 2)),
           'Invalid proposal summary:',
           fenced(clip(JSON.stringify({
             proposalId: proposal.proposalId,
@@ -493,8 +503,14 @@ export class ProviderRepairMessageBuilder {
           }, null, 2), 1_000)),
           'Session validation reasons:',
           fenced(validationReasons.map((reason) => `- ${reason}`).join('\n')),
-          'Repair requirement:',
-          fenced('Return a corrected actionBundle within the accepted current-task scope. Set outputLanguage from the current user language. Prefer currentTaskActionTemplates from the accepted task context when present. Minimal patch shape: {"schemaVersion":"deepcode.agent.protocol.v3","kind":"actionBundle","outputLanguage":"<current-user-language>","userPlanMarkdown":"# Plan\\n\\n## Summary\\n...","codeBlocks":[{"blockId":"block-1","targetPath":"relative/file.ext","contentLines":["replacement line"]}],"actionBundle":{"version":"1","id":"batch-id","goal":"...","actions":[{"actionId":"patch-file","toolId":"fs.patch","args":{"path":"relative/file.ext","replacementBlockId":"block-1","patchSpec":{"match":{"kind":"exactBlock","text":"..."}}},"description":"..."}]}}. DecisionRequest minimal shape: {"schemaVersion":"deepcode.agent.protocol.v3","kind":"decisionRequest","outputLanguage":"<current-user-language>","decisionRequest":{"version":"1","id":"scope-choice","question":"...","options":[{"id":"continue-current-task","label":"...","description":"...","recommended":true,"effect":{"kind":"continueCurrentTask"}},{"id":"revise-plan","label":"...","description":"...","effect":{"kind":"replan","reason":"revise accepted plan scope"}}],"allowsFreeform":true}}. Do not add accessScopes/resourceScope/capability/commandBlocks/payload wrapper. If current patch evidence is missing, return resourceRequest search/read first. Return decisionRequest only if scope expansion is truly required, and include option.effect so Session can resume the same task without re-planning.'),
+          'Repair requirement summary:',
+          fenced([
+            'Return one corrected proposal for the current accepted task only.',
+            'Prefer currentTaskActionTemplates from the ProviderTurnContract when executable work is still valid.',
+            'Return focused resourceRequest when current file evidence is missing.',
+            'Return decisionRequest only for material user choices; routine permission and scope expansion are handled by Session and Kernel gates.',
+            'Do not add accessScopes, resourceScope, capability fields on actionBundle actions, commandBlocks, implementationPlan, or payload wrappers.',
+          ].join('\n')),
         ].join('\n\n'),
       },
     ];
@@ -507,9 +523,12 @@ export class ProviderRepairMessageBuilder {
   ): string[] {
     const roots = clip(JSON.stringify(state.conversationRoots, null, 2), 2_000);
     const packets = clip(JSON.stringify(state.resourcePackets.slice(-6), null, 2), 6_000);
+    const acceptedExecution = Boolean(state.acceptedContext && Object.keys(state.acceptedContext).length > 0) || Boolean(state.currentTaskContext);
     const lines = [
-      'Current user goal summary:',
-      fenced(clip(state.userRequest, 1_200)),
+      acceptedExecution
+        ? 'Original user request source reference, not execution authority:'
+        : 'Current user goal summary:',
+      fenced(acceptedExecution ? clip(oneLineText(state.userRequest, 240), 240) : clip(state.userRequest, 1_200)),
       'Available conversation roots summary:',
       fenced(roots || '[]'),
       'Recent ResourcePacket summary, clipped:',
@@ -524,7 +543,7 @@ export class ProviderRepairMessageBuilder {
       lines.push('Implementation batch context summary:', fenced(clip(JSON.stringify(state.implementationBatch, null, 2), 2_000)));
     }
     if (options?.includeAcceptedPlan) {
-      lines.push('Accepted plan context summary:', fenced(clip(JSON.stringify(state.acceptedContext ?? {}, null, 2), 3_000)));
+      lines.push('Accepted current task summary:', fenced(JSON.stringify(acceptedRepairContextSummary(state), null, 2)));
     }
     return lines;
   }
@@ -550,23 +569,27 @@ export class ProviderRepairMessageBuilder {
   private protocolRepairShapeReference(errorCode: string, allowedKinds: string[]): string {
     const allows = (kind: string): boolean => allowedKinds.includes(kind);
     const common = [
+      repairSchemaAuthorityLine(),
       'Provider output must be one Agent Protocol v3 JSON object.',
       `Allowed proposal kinds for this repair call: ${allowedKinds.join(', ') || 'none'}.`,
       'reviewSummary is Session-generated and must not be returned by the provider.',
       allows('answer')
-        ? 'For kind="answer", put answer:{format:"markdown",content:"..."} on the top-level JSON object.'
+        ? 'Carrier: answer uses top-level answer.'
         : '',
       allows('resourceRequest')
-        ? resourceRequestProtocolShapeLine()
+        ? resourceRequestCarrierGuidanceLine()
         : '',
       allows('decisionRequest')
-        ? 'For kind="decisionRequest", put decisionRequest:{id,question,reason?,summary?,options:[{id,label,description,recommended?}],allowsFreeform?} on the top-level JSON object. Do not return bare reason/options without decisionRequest.'
+        ? decisionRequestCarrierGuidanceLine()
         : '',
       allows('taskPlan')
-        ? 'For kind="taskPlan", put taskPlan.version/id/title/summary/tasks/risks/reviewCheckpoints at the top level. tasks[] must be a Session-advanced ordered engineering queue, not a graph. It must not include codeBlocks, actionBundle, commandBlocks, patches, source code, or executable tool calls.'
+        ? 'For kind="taskPlan", put taskPlan.version/id/title/summary/tasks/risks/reviewCheckpoints at the top level. tasks[] must be a Session-advanced ordered queue of reviewable engineering batches, not a graph and not one task per file. Group related files or operations that should be implemented together. Each task must include capability, concrete non-root target or targets, acceptanceCriteria[], and failureCriteria[]; do not use workspace root, project root, ".", "/", or wildcard targets. It must not include codeBlocks, actionBundle, commandBlocks, patches, source code, or executable tool calls.'
         : '',
       allows('actionBundle')
-        ? 'For kind="actionBundle", put userPlanMarkdown, codeBlocks, and actionBundle directly on the top-level JSON object. Do not wrap them in a payload object. validationExpectations[] and reviewExpectations[] are optional provider notes; Session derives routine defaults when they are omitted.'
+        ? actionBundleCarrierGuidanceLine()
+        : '',
+      allows('taskOutcome')
+        ? 'Carrier: taskOutcome uses top-level taskOutcome. Use it only for the current accepted task when no Kernel action is needed.'
         : '',
       allows('actionBundle')
         ? 'codeBlocks[] uses {blockId,targetPath,language?,operation?,contentLines,allowEmptyContent?}; contentLines is the only source-code carrier.'
@@ -580,12 +603,12 @@ export class ProviderRepairMessageBuilder {
       allows('actionBundle')
         ? 'Empty content is valid only for operation="createEmpty" on an explicit empty file, or for patch/replace/insert operations when the protocol explicitly permits it.'
         : '',
-      allows('actionBundle') ? actionBundleProtocolShapeReference() : '',
-      'Never output capability, permissionLabels, accessScopes, resourceScope, commandBlocks, or legacy implementationPlan.',
+      'Never output permissionLabels, accessScopes, resourceScope, commandBlocks, or legacy implementationPlan. capability is allowed only as taskPlan.tasks[].capability; actionBundle actions must use toolId and must not output capability fields.',
     ].filter(Boolean);
-    if (allows('actionBundle') && (errorCode === 'invalid_action_bundle' || errorCode === 'invalid_object')) {
+    void errorCode;
+    if (allows('taskPlan')) {
       common.push(
-        `Minimal actionBundle skeleton:\n${this.minimalActionBundleRepairSkeleton()}`
+        `Minimal taskPlan skeleton:\n${this.minimalTaskPlanRepairSkeleton()}`
       );
     }
     return common.join('\n');
@@ -598,38 +621,76 @@ export class ProviderRepairMessageBuilder {
       || errorCode === 'action_bundle_budget_exceeded';
   }
 
-  private minimalActionBundleRepairSkeleton(): string {
+  private minimalTaskPlanRepairSkeleton(): string {
     return JSON.stringify({
       schemaVersion: 'deepcode.agent.protocol.v3',
-      kind: 'actionBundle',
-      outputLanguage: 'zh-CN',
-      userPlanMarkdown: '# Plan\n\n## Summary\n...\n\n## Key Changes\n...\n\n## Interfaces\n...\n\n## Test Plan\n...\n\n## Assumptions\n...',
-      codeBlocks: [
-        {
-          blockId: 'block-1',
-          targetPath: 'relative/file.ext',
-          language: 'text',
-          operation: 'create',
-          contentLines: ['line 1', 'line 2'],
-        },
-      ],
-      actionBundle: {
+      kind: 'taskPlan',
+      taskPlan: {
         version: '1',
-        id: 'batch-id',
-        goal: '...',
-        actions: [
+        id: 'task-plan',
+        title: 'Reviewable task plan',
+        summary: 'Plan the requested work as an ordered queue.',
+        tasks: [
           {
-            actionId: 'write-file',
-            toolId: 'fs.write',
-            args: { path: 'relative/file.ext', sourceBlockId: 'block-1' },
-            description: 'Create the file.',
+            taskId: 'task-1',
+            title: 'Prepare concrete workspace change',
+            capability: 'fs.write',
+            target: ['relative/file.ext'],
+            acceptanceCriteria: ['Reviewable completion criterion for this task.'],
+            failureCriteria: ['Stop or replan condition for this task.'],
           },
         ],
-        validationExpectations: [{ id: 'validation-1', description: 'Kernel facts show the expected file operation.' }],
-        reviewExpectations: [{ id: 'review-1', description: 'Review the written file and Kernel facts.' }],
+        risks: [],
+        reviewCheckpoints: [],
       },
     }, null, 2);
   }
+}
+
+// Repair side calls must not duplicate full protocol skeletons outside ProviderTurnContract.
+function repairSchemaAuthorityLine(): string {
+  return 'Use the ProviderTurnContract above as the schema authority. Do not add payload wrappers or explanatory prose outside the final JSON object.';
+}
+
+function actionBundleCarrierGuidanceLine(): string {
+  return 'Carrier fields by kind: actionBundle uses top-level userPlanMarkdown, codeBlocks, and actionBundle. validationExpectations/reviewExpectations are optional provider notes; Session derives routine defaults when omitted.';
+}
+
+function resourceRequestCarrierGuidanceLine(): string {
+  return 'Carrier fields by kind: resourceRequest uses top-level resourceRequest. Use items[] for manifestEntryId, rootId+path, or search query under listed conversation roots.';
+}
+
+function decisionRequestCarrierGuidanceLine(): string {
+  return 'Carrier fields by kind: decisionRequest uses top-level decisionRequest with a non-empty question, 2-3 options, and allowsFreeform=true when user input is required.';
+}
+
+function acceptedRepairContextSummary(state: ProviderRepairMessageState): Record<string, unknown> {
+  const acceptedContext = state.acceptedContext ?? {};
+  const currentTask = objectRecord(acceptedContext.currentTask);
+  const currentTaskTargets = state.currentTaskContext?.targets.length
+    ? state.currentTaskContext.targets
+    : stringArrayValue(currentTask?.targets ?? currentTask?.target);
+  const currentTaskCapabilities = state.currentTaskContext?.capabilities.length
+    ? state.currentTaskContext.capabilities
+    : stringArrayValue(currentTask?.capabilities ?? currentTask?.capability);
+  return {
+    authority: 'confirmed current accepted task',
+    originalUserRequest: 'source reference only',
+    currentTask: {
+      taskId: state.currentTaskContext?.taskId ?? stringValue(currentTask?.taskId),
+      title: state.currentTaskContext?.taskTitle ?? stringValue(currentTask?.title),
+      objective: state.currentTaskContext?.goal ?? stringValue(currentTask?.objective),
+      targets: currentTaskTargets,
+      capabilities: currentTaskCapabilities,
+    },
+    completedTaskCount: state.completedTaskCount ?? 0,
+    currentTaskOperations: Array.isArray(acceptedContext.currentTaskOperations)
+      ? acceptedContext.currentTaskOperations.length
+      : 0,
+    currentTaskActionTemplates: Array.isArray(acceptedContext.currentTaskActionTemplates)
+      ? acceptedContext.currentTaskActionTemplates.length
+      : 0,
+  };
 }
 
 function objectRecord(value: unknown): Record<string, unknown> | undefined {
@@ -640,6 +701,17 @@ function objectRecord(value: unknown): Record<string, unknown> | undefined {
 
 function stringValue(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+function stringArrayValue(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0);
+  }
+  return typeof value === 'string' && value.trim().length > 0 ? [value.trim()] : [];
+}
+
+function oneLineText(value: string, maxChars: number): string {
+  return clip(value.replace(/\s+/g, ' ').trim(), maxChars);
 }
 
 function clip(value: string, max: number): string {

@@ -1,16 +1,20 @@
 import type { AgentEvent, AgentEventKind, LlmChatRequest, ProjectionDelta } from '@deepcode/protocol';
 import type { ResourcePacket } from '../../context/types.js';
 import type { PromptEnvelope } from '../../prompt/types.js';
-import type { GeneratedArtifactEvidence } from '../context/index.js';
+import type { ContextFrameBuilder, GeneratedArtifactEvidence } from '../context/index.js';
+import { prepareProviderSideCallMessagesContextAdmission } from '../context/index.js';
 import type { AcceptedImplementationPlanContext } from '../execution/index.js';
+import type { SessionDriverProviderRuntimeState } from '../runFrame.js';
 import type { ReviewAssembler } from './reviewAssembler.js';
+import type { NativeToolCallProposal } from '../../provider/providerStreamParts.js';
 
 const STATIC_SYNTAX_REVIEW_STAGE = 'accepted_plan.static_syntax_review';
 const STATIC_SYNTAX_REVIEW_PROVIDER_STAGE = 'accepted_plan_static_syntax_review';
 
-export interface AcceptedPlanStaticSyntaxReviewState {
+export interface AcceptedPlanStaticSyntaxReviewState extends SessionDriverProviderRuntimeState {
   sessionId: string;
   runId: string;
+  userRequest: string;
   generatedArtifactEvidence: Map<string, GeneratedArtifactEvidence>;
   resourcePackets: ResourcePacket[];
 }
@@ -27,15 +31,17 @@ export interface AcceptedPlanStaticSyntaxReviewInput<TState extends AcceptedPlan
 export interface AcceptedPlanStaticSyntaxReviewCoordinatorPorts<TState extends AcceptedPlanStaticSyntaxReviewState> {
   now(): string;
   createId(prefix: string): string;
+  staticSyntaxReviewTimeoutMs?: number;
   emitProjectionDelta(state: TState, delta: ProjectionDelta): Promise<void>;
   runStaticSyntaxReview(input: {
     profileId?: string;
     state: TState;
     stage: typeof STATIC_SYNTAX_REVIEW_PROVIDER_STAGE;
     messages: LlmChatRequest['messages'];
-  }): Promise<string>;
+  }): Promise<{ toolCalls: NativeToolCallProposal[] }>;
   event(sessionId: string, kind: AgentEventKind, payload: Record<string, unknown>): AgentEvent;
   reviewAssembler: ReviewAssembler;
+  contextFrameBuilder: ContextFrameBuilder;
 }
 
 export class AcceptedPlanStaticSyntaxReviewCoordinator<TState extends AcceptedPlanStaticSyntaxReviewState> {
@@ -72,18 +78,41 @@ export class AcceptedPlanStaticSyntaxReviewCoordinator<TState extends AcceptedPl
 
     let parsed: Record<string, unknown>;
     try {
-      const raw = await this.ports.runStaticSyntaxReview({
-        profileId: input.profileId,
+      const admission = prepareProviderSideCallMessagesContextAdmission({
         state,
-        stage: STATIC_SYNTAX_REVIEW_PROVIDER_STAGE,
+        prompt,
+        contextFrameBuilder: this.ports.contextFrameBuilder,
+        contractId: this.ports.createId('static-syntax-review-contract'),
+        turnMode: 'reviewAnswer',
+        allowedKinds: ['staticSyntaxReview'],
+        requiredKind: 'staticSyntaxReview',
         messages: this.ports.reviewAssembler.staticSyntaxReviewMessages({
           prompt,
           runId: state.runId,
           accepted,
           packet,
         }),
+        userRequest: state.userRequest,
+        resourcePackets: state.resourcePackets,
+        generatedArtifactCount: state.generatedArtifactEvidence.size,
+        repairPolicy: 'diagnosticOnly',
+        projectionVisibility: 'traceOnly',
+        nextActionInstruction: 'Call session.submit_static_review exactly once for the provided generated files. Report bounded observations only; do not claim Kernel execution or validation facts.',
       });
-      parsed = JSON.parse(raw) as Record<string, unknown>;
+      const reviewPromise = this.ports.runStaticSyntaxReview({
+        profileId: input.profileId,
+        state,
+        stage: STATIC_SYNTAX_REVIEW_PROVIDER_STAGE,
+        messages: admission.messages,
+      });
+      const timeoutMs = this.ports.staticSyntaxReviewTimeoutMs ?? 45_000;
+      const turn = timeoutMs > 0
+        ? await withTimeout(reviewPromise, timeoutMs)
+        : await reviewPromise;
+      if (turn.toolCalls.length !== 1 || turn.toolCalls[0]?.name !== 'session.submit_static_review') {
+        throw new Error('Static review requires exactly one session.submit_static_review directive.');
+      }
+      parsed = turn.toolCalls[0].arguments;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       return [
@@ -139,4 +168,16 @@ export class AcceptedPlanStaticSyntaxReviewCoordinator<TState extends AcceptedPl
 
 function stringValue(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value : undefined;
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(`static syntax review timed out after ${timeoutMs} ms`));
+    }, timeoutMs);
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
 }

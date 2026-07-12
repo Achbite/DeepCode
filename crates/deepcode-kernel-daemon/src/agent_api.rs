@@ -86,6 +86,7 @@ pub(crate) async fn agent_session_create(
     gui.current_session_ids_by_scope
         .insert(scope_key, id.clone());
     gui.session_projection_cache.insert(id.clone(), Vec::new());
+    gui.session_timeline_cache.remove(&id);
     gui.trace_events.insert(id.clone(), Vec::new());
     gui.sessions.insert(0, session.clone());
     ApiResponse::ok(json!({ "session": session, "events": [] }))
@@ -162,6 +163,7 @@ pub(crate) async fn agent_session_delete(
         let scope_key = session_scope_key(&gui.sessions[position]);
         gui.sessions.remove(position);
         gui.session_projection_cache.remove(&session_id);
+        gui.session_timeline_cache.remove(&session_id);
         gui.trace_events.remove(&session_id);
         gui.current_session_ids_by_scope
             .retain(|_, current_id| current_id != &session_id);
@@ -287,6 +289,11 @@ pub(crate) async fn agent_session_append_events(
         .cloned()
         .unwrap_or_default();
     append_session_projection(&state, &session_id, incoming);
+    if let Some(timeline) = body.get("timeline").cloned() {
+        if let Err(error) = store_session_timeline(&state, &session_id, timeline) {
+            return ApiResponse::error("write_session_timeline_failed", error.to_string());
+        }
+    }
     let mut gui = state.gui.lock().expect("gui state lock");
     refresh_pending_session_titles(&mut gui);
     session_result(&gui, &session_id)
@@ -909,12 +916,9 @@ fn run_session_bridge_worker(
         }
     }
 
-    match wait_for_session_bridge_output(&state, &session_id, &run_id, child, start_event_count) {
+    match wait_for_session_bridge_output(&state, &run_id, child) {
         Ok(output) => {
             finish_run_from_bridge_output(&state, &session_id, &run_id, output, start_event_count)
-        }
-        Err(BridgeWorkerStop::Projection(lifecycle)) => {
-            finish_run_from_projection(&state, &run_id, lifecycle)
         }
         Err(BridgeWorkerStop::Cancelled) => {
             let _ = set_run_terminal(
@@ -937,36 +941,72 @@ fn run_session_bridge_worker(
     }
 }
 
+#[derive(Debug)]
 enum BridgeWorkerStop {
-    Projection(RunProjectionLifecycle),
     Cancelled,
     Failed(String),
 }
 
 fn wait_for_session_bridge_output(
     state: &AppState,
-    session_id: &str,
     run_id: &str,
-    mut child: Child,
-    start_event_count: usize,
+    child: Child,
 ) -> Result<Output, BridgeWorkerStop> {
+    wait_for_child_output(
+        child,
+        || run_cancelled(state, run_id),
+        session_host_bridge_timeout(),
+    )
+}
+
+fn wait_for_child_output(
+    mut child: Child,
+    mut should_cancel: impl FnMut() -> bool,
+    timeout: Option<Duration>,
+) -> Result<Output, BridgeWorkerStop> {
+    let Some(mut stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(BridgeWorkerStop::Failed(
+            "session bridge stdout is unavailable".to_string(),
+        ));
+    };
+    let Some(mut stderr) = child.stderr.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(BridgeWorkerStop::Failed(
+            "session bridge stderr is unavailable".to_string(),
+        ));
+    };
+    let stdout_reader = thread::spawn(move || {
+        let mut output = Vec::new();
+        stdout
+            .read_to_end(&mut output)
+            .map(|_| output)
+            .map_err(|error| format!("failed to read session bridge stdout: {error}"))
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut output = Vec::new();
+        stderr
+            .read_to_end(&mut output)
+            .map(|_| output)
+            .map_err(|error| format!("failed to read session bridge stderr: {error}"))
+    });
     let started_at = Instant::now();
-    let timeout = session_host_bridge_timeout();
     loop {
-        if let Some(lifecycle) = projection_lifecycle(state, session_id, start_event_count) {
+        if should_cancel() {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(BridgeWorkerStop::Projection(lifecycle));
-        }
-        if run_cancelled(state, run_id) {
-            let _ = child.kill();
-            let _ = child.wait();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
             return Err(BridgeWorkerStop::Cancelled);
         }
         if let Some(limit) = timeout {
             if started_at.elapsed() >= limit {
                 let _ = child.kill();
                 let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
                 return Err(BridgeWorkerStop::Failed(format!(
                     "session run timed out after {} ms; set DEEPCODE_SESSION_BRIDGE_TIMEOUT_MS=0 to disable the hard timeout",
                     limit.as_millis()
@@ -974,17 +1014,35 @@ fn wait_for_session_bridge_output(
             }
         }
         match child.try_wait() {
-            Ok(Some(_)) => {
-                return child.wait_with_output().map_err(|error| {
-                    BridgeWorkerStop::Failed(format!(
-                        "failed to read session bridge output: {error}"
-                    ))
+            Ok(Some(status)) => {
+                let stdout = stdout_reader
+                    .join()
+                    .map_err(|_| {
+                        BridgeWorkerStop::Failed(
+                            "session bridge stdout reader panicked".to_string(),
+                        )
+                    })?
+                    .map_err(BridgeWorkerStop::Failed)?;
+                let stderr = stderr_reader
+                    .join()
+                    .map_err(|_| {
+                        BridgeWorkerStop::Failed(
+                            "session bridge stderr reader panicked".to_string(),
+                        )
+                    })?
+                    .map_err(BridgeWorkerStop::Failed)?;
+                return Ok(Output {
+                    status,
+                    stdout,
+                    stderr,
                 });
             }
             Ok(None) => thread::sleep(Duration::from_millis(50)),
             Err(error) => {
                 let _ = child.kill();
                 let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
                 return Err(BridgeWorkerStop::Failed(format!(
                     "failed to wait for session bridge output: {error}"
                 )));
@@ -1000,10 +1058,6 @@ fn finish_run_from_bridge_output(
     output: Output,
     start_event_count: usize,
 ) {
-    if let Some(lifecycle) = projection_lifecycle(state, session_id, start_event_count) {
-        finish_run_from_projection(state, run_id, lifecycle);
-        return;
-    }
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let result = match serde_json::from_str::<Value>(stdout.trim()) {
@@ -1043,8 +1097,28 @@ fn finish_run_from_bridge_output(
         return;
     }
 
-    if let Some(lifecycle) = projection_lifecycle(state, session_id, start_event_count) {
-        finish_run_from_projection(state, run_id, lifecycle);
+    let event_count = session_projection(state, session_id).len();
+    let timeline = match validated_bridge_timeline(&result, session_id, event_count) {
+        Ok(timeline) => timeline,
+        Err(message) => {
+            fail_run_with_event(
+                state,
+                session_id,
+                run_id,
+                "session_bridge_timeline_invalid",
+                message,
+            );
+            return;
+        }
+    };
+    if let Err(error) = store_session_timeline(state, session_id, timeline) {
+        fail_run_with_event(
+            state,
+            session_id,
+            run_id,
+            "write_session_timeline_failed",
+            format!("failed to persist canonical session timeline: {error}"),
+        );
         return;
     }
 
@@ -1091,188 +1165,31 @@ fn finish_run_from_bridge_output(
     let _ = set_run_terminal(state, run_id, "completed", None, final_text);
 }
 
-fn finish_run_from_projection(state: &AppState, run_id: &str, lifecycle: RunProjectionLifecycle) {
-    match lifecycle {
-        RunProjectionLifecycle::Completed(final_text) => {
-            let _ = set_run_terminal(state, run_id, "completed", None, final_text);
-        }
-        RunProjectionLifecycle::Waiting(message) => {
-            let _ = set_run_terminal(state, run_id, "waiting", Some(message), None);
-        }
-        RunProjectionLifecycle::Cancelled(message) => {
-            let _ = set_run_terminal(state, run_id, "cancelled", Some(message), None);
-        }
-        RunProjectionLifecycle::Failed(message) => {
-            let _ = set_run_terminal(state, run_id, "failed", Some(message), None);
-        }
-    }
-}
-
-#[derive(Debug, PartialEq)]
-enum RunProjectionLifecycle {
-    Completed(Option<String>),
-    Waiting(String),
-    Cancelled(String),
-    Failed(String),
-}
-
-fn projection_lifecycle(
-    state: &AppState,
+fn validated_bridge_timeline(
+    result: &Value,
     session_id: &str,
-    start_event_count: usize,
-) -> Option<RunProjectionLifecycle> {
-    let events = session_projection(state, session_id);
-    projection_lifecycle_from_events(&events, start_event_count)
-}
-
-fn projection_lifecycle_from_events(
-    events: &[Value],
-    start_event_count: usize,
-) -> Option<RunProjectionLifecycle> {
-    let mut lifecycle = None;
-    for event in events.iter().skip(start_event_count) {
-        if event.get("kind").and_then(Value::as_str) == Some("error") {
-            lifecycle = Some(RunProjectionLifecycle::Failed(
-                event_message(event).unwrap_or_else(|| "session run failed".to_string()),
-            ));
-            continue;
-        }
-        if is_final_assistant_event(event) {
-            lifecycle = Some(RunProjectionLifecycle::Completed(event_message(event)));
-            continue;
-        }
-        if session_run_completed(event) {
-            lifecycle = Some(RunProjectionLifecycle::Completed(None));
-            continue;
-        }
-        if let Some(message) = session_run_cancelled_message(event) {
-            lifecycle = Some(RunProjectionLifecycle::Cancelled(message));
-            continue;
-        }
-        if event_consumes_waiting_lifecycle(event) {
-            lifecycle = None;
-            continue;
-        }
-        if waiting_for_user_message(event).is_some() {
-            lifecycle = waiting_for_user_message(event).map(RunProjectionLifecycle::Waiting);
-        }
+    expected_event_count: usize,
+) -> Result<Value, String> {
+    let timeline = result
+        .get("timeline")
+        .cloned()
+        .ok_or_else(|| "session bridge result is missing the canonical timeline".to_string())?;
+    if timeline.get("schemaVersion").and_then(Value::as_str) != Some("deepcode.session.timeline.v1")
+    {
+        return Err("session bridge timeline has an unsupported schema version".to_string());
     }
-    lifecycle
-}
-
-fn event_consumes_waiting_lifecycle(event: &Value) -> bool {
-    match event.get("kind").and_then(Value::as_str) {
-        Some("requirement_decision") | Some("permission_decision") => true,
-        Some("session_run_state") => {
-            event
-                .get("payload")
-                .and_then(|payload| payload.get("status"))
-                .and_then(Value::as_str)
-                == Some("running")
-        }
-        Some("plan_review") => event
-            .get("payload")
-            .and_then(|payload| payload.get("status"))
-            .and_then(Value::as_str)
-            .map(|status| {
-                let status = status.to_ascii_lowercase();
-                status == "accepted" || status == "rejected" || status == "needsrevision"
-            })
-            .unwrap_or(false),
-        Some("review_summary") => event
-            .get("payload")
-            .and_then(|payload| payload.get("status"))
-            .and_then(Value::as_str)
-            .map(|status| {
-                let status = status.to_ascii_lowercase();
-                status != "waitinguserreview" && status != "pending"
-            })
-            .unwrap_or(false),
-        _ => false,
+    if timeline.get("sessionId").and_then(Value::as_str) != Some(session_id) {
+        return Err("session bridge timeline does not belong to the active session".to_string());
     }
-}
-
-fn session_run_completed(event: &Value) -> bool {
-    event.get("kind").and_then(Value::as_str) == Some("session_run_state")
-        && event
-            .get("payload")
-            .and_then(|payload| payload.get("status"))
-            .and_then(Value::as_str)
-            == Some("completed")
-}
-
-fn session_run_cancelled_message(event: &Value) -> Option<String> {
-    if event.get("kind").and_then(Value::as_str) != Some("session_run_state") {
-        return None;
+    if timeline.get("turns").and_then(Value::as_array).is_none() {
+        return Err("session bridge timeline is missing structured turns".to_string());
     }
-    let status = event
-        .get("payload")
-        .and_then(|payload| payload.get("status"))
-        .and_then(Value::as_str)?;
-    if status != "cancelled" {
-        return None;
+    if timeline.get("eventCount").and_then(Value::as_u64) != Some(expected_event_count as u64) {
+        return Err(format!(
+            "session bridge timeline event count does not match committed projection: expected {expected_event_count}"
+        ));
     }
-    Some(event_message(event).unwrap_or_else(|| "Session run is cancelled.".to_string()))
-}
-
-fn waiting_for_user_message(event: &Value) -> Option<String> {
-    let kind = event.get("kind").and_then(Value::as_str)?;
-    let payload = event.get("payload").unwrap_or(&Value::Null);
-    match kind {
-        "permission_request" => {
-            Some("Session run is waiting for a permission decision.".to_string())
-        }
-        "session_run_state" => {
-            let status = payload
-                .get("status")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            if status == "waiting" {
-                Some(
-                    event_message(event)
-                        .unwrap_or_else(|| "Session run is waiting for user input.".to_string()),
-                )
-            } else {
-                None
-            }
-        }
-        "requirement_confirmation" => {
-            let status = payload
-                .get("status")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            if status == "waitingUserConfirmation" {
-                Some("Session run is waiting for requirement confirmation.".to_string())
-            } else {
-                None
-            }
-        }
-        "plan_card" => {
-            if payload.get("confirmable").and_then(Value::as_bool) == Some(false) {
-                None
-            } else {
-                Some("Session run is waiting for plan review.".to_string())
-            }
-        }
-        "plan_review" | "review_summary" => {
-            if payload.get("confirmable").and_then(Value::as_bool) == Some(false)
-                || payload.get("visibility").and_then(Value::as_str) == Some("debug")
-            {
-                return None;
-            }
-            let status = payload
-                .get("status")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_ascii_lowercase();
-            if status.contains("waiting") || status == "pending" {
-                Some("Session run is waiting for user review.".to_string())
-            } else {
-                None
-            }
-        }
-        _ => None,
-    }
+    Ok(timeline)
 }
 
 fn is_final_assistant_event(event: &Value) -> bool {
@@ -2098,164 +2015,55 @@ mod tests {
     use super::*;
 
     #[test]
-    fn waiting_lifecycle_uses_explicit_session_run_state() {
-        let event = json!({
-            "kind": "session_run_state",
-            "payload": {
-                "status": "waiting",
-                "reason": "plan_review",
-                "summary": "Session run is waiting for plan review.",
-                "visibility": "debug"
+    fn bridge_output_reader_drains_payloads_larger_than_pipe_capacity() {
+        let script = "i=0; while [ \"$i\" -lt 5000 ]; do printf '0123456789abcdef0123456789abcdef\\n'; printf 'fedcba9876543210fedcba9876543210\\n' >&2; i=$((i + 1)); done";
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn bridge output fixture");
+
+        let output = wait_for_child_output(child, || false, Some(Duration::from_secs(10)))
+            .expect("drain bridge output");
+
+        assert!(output.status.success());
+        assert!(output.stdout.len() > 65_536);
+        assert!(output.stderr.len() > 65_536);
+    }
+
+    #[test]
+    fn bridge_timeline_requires_current_structured_projection() {
+        let result = json!({
+            "timeline": {
+                "schemaVersion": "deepcode.session.timeline.v1",
+                "sessionId": "session-current",
+                "generatedAt": "2026-07-11T00:00:00Z",
+                "turns": [],
+                "eventCount": 3
             }
         });
-        assert_eq!(
-            waiting_for_user_message(&event).as_deref(),
-            Some("Session run is waiting for plan review.")
-        );
+        assert!(validated_bridge_timeline(&result, "session-current", 3).is_ok());
+        assert!(validated_bridge_timeline(&result, "session-other", 3).is_err());
+        assert!(validated_bridge_timeline(&result, "session-current", 4).is_err());
     }
 
     #[test]
-    fn completed_lifecycle_uses_explicit_session_run_state() {
-        let event = json!({
-            "kind": "session_run_state",
-            "payload": {
-                "status": "completed",
-                "reason": "review",
-                "summary": "Review accepted; session run completed.",
-                "visibility": "debug"
-            }
-        });
-        assert!(session_run_completed(&event));
-        assert_eq!(waiting_for_user_message(&event), None);
-    }
-
-    #[test]
-    fn cancelled_lifecycle_uses_explicit_session_run_state() {
-        let event = json!({
-            "kind": "session_run_state",
-            "payload": {
-                "status": "cancelled",
-                "reason": "review",
-                "summary": "Session run cancelled by user.",
-                "visibility": "debug"
-            }
-        });
-        assert_eq!(
-            session_run_cancelled_message(&event).as_deref(),
-            Some("Session run cancelled by user.")
-        );
-        assert!(!session_run_completed(&event));
-        assert_eq!(waiting_for_user_message(&event), None);
-    }
-
-    #[test]
-    fn driver_request_progress_is_not_a_lifecycle_owner() {
-        let event = json!({
-            "kind": "workflow_stage",
-            "payload": {
-                "stage": "driver.request_produced",
-                "summary": "Session DriverRequest produced by Kernel.",
-                "kernelEvent": {
-                    "kind": "driver.request_produced"
-                }
-            }
-        });
-        assert!(!session_run_completed(&event));
-        assert_eq!(waiting_for_user_message(&event), None);
-    }
-
-    #[test]
-    fn running_state_consumes_prior_waiting_lifecycle() {
-        let events = vec![
-            json!({
-                "kind": "session_run_state",
-                "payload": {
-                    "status": "waiting",
-                    "reason": "requirement",
-                    "summary": "Session run is waiting for requirement confirmation."
+    fn bridge_timeline_rejects_missing_or_legacy_payloads() {
+        assert!(validated_bridge_timeline(&json!({}), "session-current", 0).is_err());
+        assert!(validated_bridge_timeline(
+            &json!({
+                "timeline": {
+                    "sessionId": "session-current",
+                    "turns": [],
+                    "eventCount": 0
                 }
             }),
-            json!({
-                "kind": "requirement_decision",
-                "payload": {
-                    "requirementId": "requirement-1",
-                    "decision": "accept"
-                }
-            }),
-            json!({
-                "kind": "plan_card",
-                "payload": {
-                    "planId": "plan-1",
-                    "status": "awaitingTemporaryGrant",
-                    "confirmable": true
-                }
-            }),
-            json!({
-                "kind": "plan_review",
-                "payload": {
-                    "planId": "plan-1",
-                    "status": "accepted",
-                    "confirmable": false
-                }
-            }),
-            json!({
-                "kind": "session_run_state",
-                "payload": {
-                    "status": "running",
-                    "reason": "accepted_plan_execution",
-                    "summary": "Accepted plan execution started."
-                }
-            }),
-        ];
-        assert_eq!(projection_lifecycle_from_events(&events, 0), None);
-    }
-
-    #[test]
-    fn overlay_decision_allows_later_plan_waiting_lifecycle() {
-        let events = vec![
-            json!({
-                "kind": "requirement_confirmation",
-                "payload": {
-                    "requirementId": "requirement-1",
-                    "status": "waitingUserConfirmation"
-                }
-            }),
-            json!({
-                "kind": "requirement_decision",
-                "payload": {
-                    "requirementId": "requirement-1",
-                    "decision": "accept"
-                }
-            }),
-            json!({
-                "kind": "plan_card",
-                "payload": {
-                    "planId": "plan-1",
-                    "status": "awaitingTemporaryGrant",
-                    "confirmable": true
-                }
-            }),
-        ];
-        assert_eq!(
-            projection_lifecycle_from_events(&events, 0),
-            Some(RunProjectionLifecycle::Waiting(
-                "Session run is waiting for plan review.".to_string()
-            ))
-        );
-    }
-
-    #[test]
-    fn debug_plan_review_is_not_a_waiting_lifecycle_owner() {
-        let event = json!({
-            "kind": "plan_review",
-            "payload": {
-                "status": "awaitingTemporaryGrant",
-                "confirmable": false,
-                "visibility": "debug",
-                "summary": "Kernel preflight."
-            }
-        });
-        assert_eq!(waiting_for_user_message(&event), None);
+            "session-current",
+            0,
+        )
+        .is_err());
     }
 
     #[test]

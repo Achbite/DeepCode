@@ -11,6 +11,7 @@ export interface TaskExecutionCursor {
   taskOrder: string[];
   pendingTaskIds: string[];
   completedTaskIds: string[];
+  modelJudgedSufficientTaskIds?: string[];
   lastResourcePacketIds: string[];
   lastSavepointId?: string;
 }
@@ -22,18 +23,24 @@ export interface CurrentTaskContext {
   taskTitle?: string;
   targets: string[];
   capabilities: string[];
+  acceptanceCriteria?: string[];
+  failureCriteria?: string[];
   taskOrder: string[];
   pendingTaskIds: string[];
   dependsOn: string[];
   evidenceNeeds: string[];
   completedTaskIds: string[];
+  modelJudgedSufficientTaskIds?: string[];
 }
 
 export interface AcceptedImplementationPlanTaskContext {
   taskId: string;
   title?: string;
   capability?: string;
+  semanticOperation?: string;
   targets: string[];
+  acceptanceCriteria?: string[];
+  failureCriteria?: string[];
   dependencies: string[];
   conflictKeys: string[];
   batchKind?: ExecutionSliceRole;
@@ -85,6 +92,7 @@ export interface AcceptedImplementationPlanContext {
   interventionLevel?: AcceptedPlanInterventionLevel;
   batchIndex: number;
   completedTaskIds: string[];
+  modelJudgedSufficientTaskIds?: string[];
   rawPlan: Record<string, unknown>;
 }
 
@@ -99,6 +107,8 @@ export interface AcceptedPlanBatchProgress {
   workUnitIds: string[];
   newlyCompletedTaskIds: string[];
   completedTaskIds: string[];
+  modelJudgedSufficientTaskIds?: string[];
+  newlyModelJudgedSufficientTaskIds?: string[];
   remainingTaskIds: string[];
 }
 

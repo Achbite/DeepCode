@@ -11,6 +11,14 @@ import type { PlanDecisionHandler } from './planDecisionHandler.js';
 import type { RequirementDecisionHandler } from './requirementDecisionHandler.js';
 import type { ReviewDecisionHandler } from './reviewDecisionHandler.js';
 import type { InterventionLevel, ReviewContinuationMode } from '../types.js';
+import type {
+  SessionLoopControlResult,
+  SessionLoopResumeInput,
+} from '../runContinuation.js';
+import type {
+  AcceptedPlanReviewHandoffPlan,
+  AcceptedPlanReviewHandoffRunInput,
+} from '../review/acceptedPlanReviewHandoffCoordinator.js';
 
 export type DecisionResolverKind = 'requirement' | 'plan' | 'review' | 'permission' | 'boundary';
 export type DecisionResolverDecision = 'accept' | 'reject' | 'revise';
@@ -41,12 +49,33 @@ export interface DecisionResolverDiagnosticInfo {
   params?: Record<string, string | number>;
 }
 
+export interface DecisionRunCommand {
+  readonly kind: 'resolveDecision';
+  readonly input: DecisionResolverInput;
+}
+
+export type DecisionRunEffect =
+  | {
+    readonly kind: 'decisionRouted';
+    readonly decisionKind: Exclude<DecisionResolverKind, 'boundary'>;
+    readonly result: AgentSessionResult;
+  }
+  | {
+    readonly kind: 'unsupportedDecisionKind';
+    readonly decisionKind: DecisionResolverKind;
+    readonly result: AgentSessionResult;
+  };
+
 export interface DecisionResolverPorts {
   now(): string;
   createId(prefix: string): string;
   append(sessionId: string, events: AgentEvent[]): Promise<AgentSessionResult>;
   finalDiagnosticEvent(sessionId: string, content: string | DecisionResolverDiagnosticInfo, ts: string, id: string): AgentEvent;
   missingDecisionKindMessage(kind: string): string | DecisionResolverDiagnosticInfo;
+  resume(input: SessionLoopResumeInput): Promise<AgentSessionResult>;
+  assembleReview(
+    input: AcceptedPlanReviewHandoffRunInput<AcceptedPlanReviewHandoffPlan>
+  ): Promise<AgentSessionResult>;
   requirementHandler: RequirementDecisionHandler;
   planHandler: PlanDecisionHandler;
   permissionHandler: PermissionDecisionHandler;
@@ -57,8 +86,14 @@ export class DecisionResolver {
   constructor(private readonly ports: DecisionResolverPorts) {}
 
   async resolve(input: DecisionResolverInput): Promise<AgentSessionResult> {
+    const effect = await this.execute({ kind: 'resolveDecision', input });
+    return effect.result;
+  }
+
+  private async execute(command: DecisionRunCommand): Promise<DecisionRunEffect> {
+    const input = command.input;
     if (input.kind === 'requirement') {
-      return this.ports.requirementHandler.resolve({
+      const result = await this.settle(await this.ports.requirementHandler.resolve({
         sessionId: input.sessionId,
         decision: input.decision,
         guidance: input.guidance,
@@ -73,10 +108,11 @@ export class DecisionResolver {
         interventionLevel: input.interventionLevel,
         projectMemoryMode: input.projectMemoryMode,
         interactionOverlay: input.interactionOverlay,
-      });
+      }));
+      return { kind: 'decisionRouted', decisionKind: 'requirement', result };
     }
     if (input.kind === 'plan') {
-      return this.ports.planHandler.resolve({
+      const result = await this.settle(await this.ports.planHandler.resolve({
         sessionId: input.sessionId,
         decision: input.decision,
         guidance: input.guidance,
@@ -91,19 +127,21 @@ export class DecisionResolver {
         interventionLevel: input.interventionLevel,
         projectMemoryMode: input.projectMemoryMode,
         interactionOverlay: input.interactionOverlay,
-      });
+      }));
+      return { kind: 'decisionRouted', decisionKind: 'plan', result };
     }
     if (input.kind === 'permission') {
-      return this.ports.permissionHandler.resolve({
+      const result = await this.settle(await this.ports.permissionHandler.resolve({
         sessionId: input.sessionId,
         decision: input.decision,
         runId: input.runId,
         targetId: input.targetId,
         existingEvents: input.existingEvents,
-      });
+      }));
+      return { kind: 'decisionRouted', decisionKind: 'permission', result };
     }
     if (input.kind === 'review') {
-      return this.ports.reviewHandler.resolve({
+      const result = await this.settle(await this.ports.reviewHandler.resolve({
         sessionId: input.sessionId,
         decision: input.decision,
         guidance: input.guidance,
@@ -116,9 +154,10 @@ export class DecisionResolver {
         reviewContinuationMode: input.reviewContinuationMode,
         interventionLevel: input.interventionLevel,
         projectMemoryMode: input.projectMemoryMode,
-      });
+      }));
+      return { kind: 'decisionRouted', decisionKind: 'review', result };
     }
-    return this.ports.append(input.sessionId, [
+    const result = await this.ports.append(input.sessionId, [
       this.ports.finalDiagnosticEvent(
         input.sessionId,
         this.ports.missingDecisionKindMessage(input.kind),
@@ -126,5 +165,12 @@ export class DecisionResolver {
         this.ports.createId('decision-unsupported')
       ),
     ]);
+    return { kind: 'unsupportedDecisionKind', decisionKind: input.kind, result };
+  }
+
+  private settle(control: SessionLoopControlResult): Promise<AgentSessionResult> {
+    if (control.kind === 'return') return Promise.resolve(control.result);
+    if (control.kind === 'resume') return this.ports.resume(control.input);
+    return this.ports.assembleReview(control.request);
   }
 }

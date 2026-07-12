@@ -127,6 +127,14 @@ export interface UserGuidanceEvent {
   checkpointKind: 'llmProposal' | 'resourcePacket' | 'permission' | 'review' | 'nextProviderCall';
 }
 
+export interface SessionMemoryRenderOptions {
+  taskLocalCompaction?: {
+    active: boolean;
+    compactRecordCount: number;
+    latestCompactHash?: string;
+  };
+}
+
 export function buildSessionMemorySnapshot(
   events: AgentEvent[],
   options: BuildSessionMemorySnapshotOptions = {}
@@ -434,9 +442,9 @@ function buildLegacySessionMemoryDocument(events: AgentEvent[]): SessionMemoryDo
 }
 
 export function renderProjectMemoryHints(document: SessionMemoryDocument): string[] {
+  if (!document.projectMemoryItems.length && !document.archiveMetadata?.pendingProjectMemoryCandidateIds.length) return [];
   return [
     'ProjectMemoryIndexDigest (project-scoped, 128k emergency soft cap):',
-    'Boundary: shared project memory stores durable norms, user preferences, historical gotchas, long-term planning summaries, and cross-session decision indexes. It is not Kernel authority and must be refreshed from ResourcePacket/tool facts when code may have changed.',
     `mode=${document.archiveMetadata?.projectMemoryMode ?? 'confirm'}`,
     `archiveHash=${document.archiveMetadata?.projectMemoryArchiveHash ?? 'none'}`,
     document.archiveMetadata?.expandedMemoryItemIds.length
@@ -452,9 +460,10 @@ export function renderProjectMemoryHints(document: SessionMemoryDocument): strin
 }
 
 export function renderProjectMemoryRecallHints(document: SessionMemoryDocument): string[] {
-  const lines = document.projectMemoryItems.map(compactMemoryBullet);
+  const lines = document.projectMemoryItems.map((item) => compactMemoryBullet(item));
+  if (!lines.length) return [];
   return [
-    'ProjectMemoryRecall (dynamic selected project memory; refresh file facts before modifying files):',
+    'ProjectMemoryRecall (dynamic selected project memory):',
     lines.length
       ? `selectedProjectMemory:\n${capMemoryLines(lines, 16_000).map((item) => `- ${item}`).join('\n')}`
       : 'selectedProjectMemory: none',
@@ -561,12 +570,27 @@ function memoryHash(content: string): string {
   return `fnv1a32:${(hash >>> 0).toString(16).padStart(8, '0')}`;
 }
 
-export function renderSessionScopedMemoryHints(document: SessionMemoryDocument): string[] {
-  const lines = document.sessionMemoryItems.map(compactMemoryBullet);
+export function renderSessionScopedMemoryHints(
+  document: SessionMemoryDocument,
+  options: SessionMemoryRenderOptions = {}
+): string[] {
+  const taskLocalCompaction = options.taskLocalCompaction;
+  const foldTaskLocalContent = taskLocalCompaction?.active === true;
+  const lines = document.sessionMemoryItems.map((item) => compactMemoryBullet(item, {
+    foldTaskLocalContent,
+  }));
+  if (!lines.length && !taskLocalCompaction?.active) return [];
   return [
     'SessionMemoryCompact (single-session, 256k emergency soft cap):',
-    'Boundary: session memory stores the active task focus, accepted plan, user guidance, review decisions, and compressed local conversation summary. It must not crowd out current user input or EvidenceTail facts.',
     `archiveHash=${document.archiveMetadata?.sessionMemoryArchiveHash ?? 'none'}`,
+    taskLocalCompaction?.active
+      ? [
+        'taskLocalCompaction=active',
+        `compactRecordCount=${taskLocalCompaction.compactRecordCount}`,
+        `latestCompactHash=${taskLocalCompaction.latestCompactHash ?? 'none'}`,
+        'contentPolicy=foldPreviousTaskNonDecisionContent',
+      ].join(' ')
+      : 'taskLocalCompaction=inactive',
     document.archiveMetadata?.expandedMemoryItemIds.length
       ? `selectedItemIds=${document.archiveMetadata.expandedMemoryItemIds.filter((id) => id.includes(':session:')).slice(0, 32).join(', ')}`
       : 'selectedItemIds=none',
@@ -576,7 +600,10 @@ export function renderSessionScopedMemoryHints(document: SessionMemoryDocument):
   ];
 }
 
-function compactMemoryBullet(item: MemoryItemV4): string {
+function compactMemoryBullet(
+  item: MemoryItemV4,
+  options: { foldTaskLocalContent?: boolean } = {}
+): string {
   const sourceRefs = [
     item.sourceRefs.eventIds.length ? `events=${item.sourceRefs.eventIds.join(',')}` : '',
     item.sourceRefs.ledgerRefs?.length ? `ledger=${item.sourceRefs.ledgerRefs.join(',')}` : '',
@@ -594,14 +621,35 @@ function compactMemoryBullet(item: MemoryItemV4): string {
     item.governance ? `risk=${item.governance.riskClass}` : '',
     freshness || 'freshness=none',
     `sourceRefs=${sourceRefs || 'synthetic:none'}`,
-    `content=${item.content}`,
+    memoryItemContentField(item, options),
   ].filter(Boolean).join(' | ');
+}
+
+function memoryItemContentField(
+  item: MemoryItemV4,
+  options: { foldTaskLocalContent?: boolean }
+): string {
+  if (!options.foldTaskLocalContent || !isTaskLocalFoldableMemoryItem(item)) {
+    return `content=${item.content}`;
+  }
+  const contentHash = item.freshness.contentHash ?? memoryHash(item.content);
+  const originalChars = item.compression?.originalCharCount ?? item.content.length;
+  return [
+    'contentFolded=true',
+    `contentHash=${contentHash}`,
+    `originalChars=${originalChars}`,
+  ].join(' ');
+}
+
+function isTaskLocalFoldableMemoryItem(item: MemoryItemV4): boolean {
+  // Explicit user decisions stay verbatim; previous task intent/checkpoint text may be represented by hashes after compaction.
+  if (item.authority === 'userDecision') return false;
+  return item.kind === 'intent' || item.kind === 'checkpoint' || item.kind === 'fact';
 }
 
 export function renderSessionMemoryHints(document: SessionMemoryDocument): string[] {
   return [
     'Session short-term memory document:',
-    'Boundary: intentContext is not evidence; factContext is the only generated-file evidence; decisionContext records user decisions and guidance; resourceContext records reusable attachment/resource facts.',
     document.intentContext.length
       ? `intentContext:\n${document.intentContext.map((item) => `- ${item}`).join('\n')}`
       : 'intentContext: none',

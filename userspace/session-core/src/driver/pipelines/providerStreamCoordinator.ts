@@ -23,6 +23,14 @@ export class ProviderStreamCoordinator {
     return JSON_PROGRESS_STAGES.has(stage);
   }
 
+  exposesReasoningTrace(stage: string): boolean {
+    return !this.isRepairStage(stage);
+  }
+
+  private isRepairStage(stage: string): boolean {
+    return stage === 'protocol_repair' || stage.endsWith('_repair') || stage.includes('.repair');
+  }
+
   jsonProgressSummary(language: ProviderStreamVisibleLanguage, receivedChars: number): string {
     return language === 'en-US'
       ? `Generating the executable actionBundle draft (${receivedChars} chars received).`

@@ -51,7 +51,7 @@ export class NativeToolRepairCoordinator {
 
   sideEffectAllowedKinds(acceptedExecution: boolean): string[] {
     return acceptedExecution
-      ? ['actionBundle', 'resourceRequest', 'decisionRequest', 'diagnostic']
+      ? ['actionBundle', 'resourceRequest', 'decisionRequest', 'taskOutcome', 'diagnostic']
       : ['decisionRequest', 'taskPlan', 'resourceRequest', 'diagnostic'];
   }
 
@@ -60,7 +60,7 @@ export class NativeToolRepairCoordinator {
   }
 
   proposalOnlyRepairAllowedKinds(): string[] {
-    return ['actionBundle', 'resourceRequest', 'decisionRequest', 'diagnostic'];
+    return ['actionBundle', 'resourceRequest', 'decisionRequest', 'taskOutcome', 'diagnostic'];
   }
 
   sideEffectBlockedDelta(input: {

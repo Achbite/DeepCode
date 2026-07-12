@@ -79,6 +79,7 @@ export function formatDurationMs(value: number | undefined): string | undefined 
 // Kernel 执行文件读写时以 workflow_stage(activity=editFileStarted/toolExecution/editFileCompleted)
 // 形态出现，而非 tool_call/tool_result；此处把同一目标的活动合并为单条读写证据。
 const FILE_ACTIVITY_KINDS = new Set([
+  'editBatchQueued',
   'editFileStarted',
   'editFileCompleted',
   'editFileFailed',
@@ -106,6 +107,7 @@ function pickActivityTarget(targets: string[]): string | undefined {
 }
 
 function activityStatusOf(activityKind: string): ToolEvidenceStatus {
+  if (activityKind === 'editBatchQueued') return 'waiting';
   if (activityKind === 'editFileStarted') return 'running';
   if (activityKind === 'editFileFailed') return 'failed';
   return 'completed';
@@ -118,25 +120,40 @@ function mergeActivityStatus(prev: ToolEvidenceStatus, next: ToolEvidenceStatus)
 
 function activityItemKind(toolName: string | undefined): ToolEvidenceItemKind {
   if (!toolName) return 'file';
-  if (toolName.includes('search')) return 'search';
-  if (toolName.includes('list')) return 'directory';
-  if (toolName === 'process.exec' || toolName.includes('exec')) return 'command';
+  if (toolName === 'code.search') return 'search';
+  if (toolName === 'fs.list') return 'directory';
+  if (toolName === 'process.exec') return 'command';
   return 'file';
+}
+
+function activityOperation(activity: Record<string, unknown>): string | undefined {
+  return normalizeOperation(
+    stringValue(activity, 'operation') ?? stringValue(activity, 'toolName')
+  );
 }
 
 function activityActionLabel(
   activityKind: string,
   toolName: string | undefined,
+  operation: string | undefined,
   language: UiLanguage,
 ): string {
-  const name = toolName ?? '';
-  if (name.includes('delete')) return t(language, 'agent.toolEvidence.action.delete');
-  if (name.includes('search') || activityKind === 'resourceSearch') return t(language, 'agent.toolEvidence.action.search');
-  if (name.includes('list')) return t(language, 'agent.toolEvidence.action.list');
-  if (name.includes('read') || activityKind === 'resourceRead') return t(language, 'agent.toolEvidence.action.read');
-  if (name.includes('write') || activityKind === 'editFileStarted' || activityKind === 'editFileCompleted' || activityKind === 'editFileFailed') {
+  if (operation === 'delete') return t(language, 'agent.toolEvidence.action.delete');
+  if (operation === 'search' || activityKind === 'resourceSearch') return t(language, 'agent.toolEvidence.action.search');
+  if (operation === 'list') return t(language, 'agent.toolEvidence.action.list');
+  if (operation === 'read' || activityKind === 'resourceRead') return t(language, 'agent.toolEvidence.action.read');
+  if (operation === 'diff') return t(language, 'agent.toolEvidence.action.previewDiff');
+  if (operation === 'exec') return t(language, 'agent.toolEvidence.action.run');
+  if (
+    operation === 'write' || operation === 'create' || operation === 'patch' || operation === 'rename' ||
+    activityKind === 'editFileStarted' || activityKind === 'editFileCompleted' || activityKind === 'editFileFailed'
+  ) {
     return t(language, 'agent.toolEvidence.action.write');
   }
+  if (toolName === 'fs.delete') return t(language, 'agent.toolEvidence.action.delete');
+  if (toolName === 'code.search') return t(language, 'agent.toolEvidence.action.search');
+  if (toolName === 'fs.list') return t(language, 'agent.toolEvidence.action.list');
+  if (toolName === 'fs.read') return t(language, 'agent.toolEvidence.action.read');
   return t(language, 'agent.toolEvidence.action.tool');
 }
 
@@ -153,24 +170,26 @@ function collectActivityItems(events: AgentEvent[], language: UiLanguage): ToolE
       ? activity.targets.filter((value): value is string => typeof value === 'string')
       : [];
     const toolName = stringValue(activity, 'toolName');
+    const operation = activityOperation(activity);
     const label = pickActivityTarget(targets) ?? stringValue(activity, 'title') ?? toolName ?? 'operation';
     const itemKind = activityItemKind(toolName);
-    const key = `${itemKind}:${label}`;
+    const key = label;
     const status = activityStatusOf(activityKind);
 
     const existing = byKey.get(key);
     if (existing) {
       existing.status = mergeActivityStatus(existing.status, status);
+      if (itemKind !== 'file') existing.kind = itemKind;
       if (toolName && !existing.detail) existing.detail = toolName;
-      if (toolName && (toolName.includes('write') || toolName.includes('delete'))) {
-        existing.action = activityActionLabel(activityKind, toolName, language);
+      if (operation) {
+        existing.action = activityActionLabel(activityKind, toolName, operation, language);
       }
       continue;
     }
     byKey.set(key, {
       id: `${event.id}:activity`,
       kind: itemKind,
-      action: activityActionLabel(activityKind, toolName, language),
+      action: activityActionLabel(activityKind, toolName, operation, language),
       label,
       detail: toolName,
       status,
@@ -447,12 +466,38 @@ function pathKind(toolName: string, output?: Record<string, unknown>): ToolEvide
 }
 
 function toolAction(toolName: string, kind: ToolEvidenceItemKind, language: UiLanguage): string {
-  if (toolName.includes('write')) return t(language, 'agent.toolEvidence.action.write');
-  if (toolName.includes('delete')) return t(language, 'agent.toolEvidence.action.delete');
-  if (toolName.includes('diff')) return t(language, 'agent.toolEvidence.action.previewDiff');
-  if (toolName.includes('search')) return t(language, 'agent.toolEvidence.action.search');
-  if (toolName.includes('list') || kind === 'directory') return t(language, 'agent.toolEvidence.action.list');
+  const operation = normalizeOperation(toolName);
+  if (operation === 'write' || operation === 'patch' || operation === 'create') return t(language, 'agent.toolEvidence.action.write');
+  if (operation === 'delete') return t(language, 'agent.toolEvidence.action.delete');
+  if (operation === 'diff') return t(language, 'agent.toolEvidence.action.previewDiff');
+  if (operation === 'search') return t(language, 'agent.toolEvidence.action.search');
+  if (operation === 'list' || kind === 'directory') return t(language, 'agent.toolEvidence.action.list');
   return t(language, 'agent.toolEvidence.action.read');
+}
+
+function normalizeOperation(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  const operations: Record<string, string> = {
+    'fs.write': 'write',
+    'fs.patch': 'patch',
+    'fs.delete': 'delete',
+    'fs.read': 'read',
+    'fs.list': 'list',
+    'fs.diff': 'diff',
+    'code.search': 'search',
+    'process.exec': 'exec',
+    write: 'write',
+    create: 'create',
+    patch: 'patch',
+    delete: 'delete',
+    rename: 'rename',
+    read: 'read',
+    list: 'list',
+    diff: 'diff',
+    search: 'search',
+    exec: 'exec',
+  };
+  return operations[value.trim()] ?? value.trim();
 }
 
 function pathDetail(output: Record<string, unknown> | undefined, language: UiLanguage): string | undefined {

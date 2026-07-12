@@ -3954,6 +3954,86 @@ fn action_batch_submit_requests_critical_permission_for_git_push() {
 }
 
 #[test]
+fn action_batch_accepting_blocked_git_push_permission_does_not_execute() {
+    let (mut runtime, temp) = runtime_with_workspace();
+    runtime
+        .dispatch(KernelCommand::RunCreate {
+            request_id: RequestId("req-run-create".to_string()),
+            session_id: Some(SessionId("session-generic".to_string())),
+            input: UserInput {
+                text: "Publish a generic version control update.".to_string(),
+                attachments: vec![],
+            },
+            workspace_binding: Some(WorkspaceBinding {
+                workspace_id: None,
+                workspace_hash: None,
+                open_path: Some(temp.to_string_lossy().to_string()),
+                active_folder_id: None,
+                folder_hash: None,
+            }),
+            profile_ref: None,
+            workflow_ref: None,
+            run_overrides: None,
+        })
+        .expect("runCreate succeeds");
+
+    let events = runtime
+        .dispatch(KernelCommand::ActionBatchSubmit {
+            request_id: RequestId("req-action-batch".to_string()),
+            run_id: RunId("run-1".to_string()),
+            session_id: Some(SessionId("session-generic".to_string())),
+            batch: serde_json::json!({
+                "planId": "plan-generic",
+                "codeBlocks": [],
+                "actionBundle": {
+                    "id": "bundle-generic",
+                    "goal": "Publish a generic version control update.",
+                    "actions": [
+                        {
+                            "id": "git-push-generic",
+                            "title": "Push generic git update",
+                            "toolId": "git.push",
+                            "kind": "push",
+                            "resourceScope": ["workspace"],
+                            "toolArgs": {
+                                "remote": "origin",
+                                "branch": "main"
+                            }
+                        }
+                    ]
+                }
+            }),
+        })
+        .expect("action batch succeeds");
+
+    let permission_id = events
+        .iter()
+        .find_map(|event| match event {
+            KernelEvent::PermissionRequested { request, .. } => Some(request.id.clone()),
+            _ => None,
+        })
+        .expect("git.push permission requested");
+
+    let accepted = runtime
+        .dispatch(KernelCommand::PermissionResolve {
+            request_id: RequestId("req-permission-accept".to_string()),
+            permission_id,
+            decision: deepcode_kernel_abi::PermissionDecisionKind::Accept,
+        })
+        .expect("permission accept succeeds");
+
+    assert!(accepted
+        .iter()
+        .any(|event| matches!(event, KernelEvent::WorkUnitBlocked { .. })));
+    assert!(!accepted.iter().any(|event| {
+        matches!(
+            event,
+            KernelEvent::ToolCompleted { tool_name, .. } if tool_name == "git.push"
+        )
+    }));
+}
+
+#[test]
 fn action_batch_submit_blocks_unsupported_capability() {
     let (mut runtime, _temp) = runtime_with_workspace();
     runtime

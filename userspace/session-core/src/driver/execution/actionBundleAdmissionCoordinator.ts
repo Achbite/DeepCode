@@ -2,6 +2,8 @@ import type { AgentContextAttachment, AgentEvent, AgentSessionResult } from '@de
 import type { ProposalEnvelope, ResourceRequestDraft } from '../../protocol/types.js';
 import type { PromptEnvelope } from '../../prompt/types.js';
 import type { RequirementRecord } from '../../requirement/types.js';
+import type { ProposalRouterResult } from '../proposal/proposalRouter.js';
+import { SessionDriverRepairRuntimeAccessor } from '../runFrame.js';
 
 export interface ActionBundleAdmissionCoordinatorInput {
   sessionId: string;
@@ -65,17 +67,13 @@ export interface ActionBundleAdmissionCoordinatorPorts<
     reasons: string[];
     result: AgentSessionResult;
   }): Promise<ActionBundleAdmissionResourceFollowupResult>;
-  resumeAfterResourceFollowup(input: {
-    originalInput: Input;
-    followup: Extract<ActionBundleAdmissionResourceFollowupResult, { kind: 'resume' }>;
-  }): Promise<AgentSessionResult>;
   submitActionProposal(
     input: Input,
     state: State,
     prompt: PromptEnvelope,
     proposal: ProposalEnvelope,
     fallback: AgentSessionResult
-  ): Promise<AgentSessionResult>;
+  ): Promise<ProposalRouterResult>;
   submitNonExecutableProposal(
     state: State,
     proposal: ProposalEnvelope,
@@ -136,8 +134,9 @@ export class ActionBundleAdmissionCoordinator<
     proposal: ProposalEnvelope,
     reasons: string[],
     fallback: AgentSessionResult
-  ): Promise<AgentSessionResult> {
-    if (state.actionBundleAdmissionRepairAttempted) {
+  ): Promise<AgentSessionResult | ProposalRouterResult> {
+    const repairRuntime = new SessionDriverRepairRuntimeAccessor(state);
+    if (repairRuntime.attempted('actionBundleAdmissionRepairAttempted')) {
       return this.ports.append(state.sessionId, this.ports.admissionFailureEvents({
         sessionId: state.sessionId,
         runId: state.runId,
@@ -147,7 +146,7 @@ export class ActionBundleAdmissionCoordinator<
         id: this.ports.createId('action-bundle-admission-failed'),
       })) ?? fallback;
     }
-    state.actionBundleAdmissionRepairAttempted = true;
+    repairRuntime.markAttempted('actionBundleAdmissionRepairAttempted');
     let result = await this.ports.append(state.sessionId, [
       this.ports.admissionRepairingEvent({
         sessionId: state.sessionId,
@@ -186,7 +185,7 @@ export class ActionBundleAdmissionCoordinator<
         result,
       });
       if (followup.kind === 'failed') return followup.result;
-      return this.ports.resumeAfterResourceFollowup({ originalInput: input, followup });
+      return { kind: 'continue', lastResult: followup.result };
     }
     if (repaired.kind === 'decisionRequest') {
       const requirement = this.ports.requirementRecordFromProposal({

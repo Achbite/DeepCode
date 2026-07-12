@@ -14,6 +14,7 @@ LOG_DIR="$SERVICE_DIR/logs"
 RUN_DIR="$SERVICE_DIR/run"
 PID_FILE="$RUN_DIR/service.pid"
 SERVICE_STATUS_FILE="$RUN_DIR/service.status"
+ACTIVE_REQUEST_FILE="$RUN_DIR/active.request"
 SERVICE_LOG="$LOG_DIR/service.log"
 SCREEN_SESSION="deepcode_macos_package_$(printf '%s' "$ROOT_DIR" | cksum | awk '{ print $1 }')"
 SCREEN_RUNNER="$RUN_DIR/screen-runner.sh"
@@ -57,6 +58,40 @@ is_pid_alive() {
   kill -0 "$pid" >/dev/null 2>&1
 }
 
+file_mtime_epoch() {
+  local path="$1"
+  if stat -f '%m' "$path" >/dev/null 2>&1; then
+    stat -f '%m' "$path"
+  else
+    stat -c '%Y' "$path"
+  fi
+}
+
+next_request_path() {
+  find "$REQUEST_DIR" -maxdepth 1 -type f -name '*.request' -print 2>/dev/null \
+    | LC_ALL=C sort \
+    | sed -n '1p'
+}
+
+active_request_id() {
+  [ -f "$ACTIVE_REQUEST_FILE" ] || return 1
+  tr -d '[:space:]' <"$ACTIVE_REQUEST_FILE"
+}
+
+stalled_request_path() {
+  local now="$1"
+  local request_path request_mtime
+  request_path="$(next_request_path)"
+  [ -n "$request_path" ] || return 1
+  [ -z "$(active_request_id 2>/dev/null || true)" ] || return 1
+  request_mtime="$(file_mtime_epoch "$request_path")"
+  if [ $((now - request_mtime)) -gt "$STALE_SECONDS" ]; then
+    printf '%s\n' "$request_path"
+    return 0
+  fi
+  return 1
+}
+
 service_pid() {
   [ -f "$PID_FILE" ] || return 1
   tr -d '[:space:]' <"$PID_FILE"
@@ -80,23 +115,30 @@ status_cmd() {
     esac
   done
 
-  local pid heartbeat_epoch now age
+  local pid heartbeat_epoch now age stalled_path
   pid="$(service_pid 2>/dev/null || true)"
-  if is_pid_alive "$pid"; then
-    [ "$quiet" = "1" ] || log "running pid=$pid dir=$SERVICE_DIR"
-    return 0
-  fi
   heartbeat_epoch="$(awk -F= '$1 == "updated_at_epoch" { print $2; exit }' "$SERVICE_STATUS_FILE" 2>/dev/null || true)"
+  now="$(date +%s)"
   if [ -n "$heartbeat_epoch" ]; then
-    now="$(date +%s)"
     age=$((now - heartbeat_epoch))
-    if [ "$age" -le "$STALE_SECONDS" ]; then
-      [ "$quiet" = "1" ] || log "running heartbeat_age=${age}s dir=$SERVICE_DIR"
-      return 0
-    fi
+  else
+    age=$((STALE_SECONDS + 1))
   fi
-  [ "$quiet" = "1" ] || log "stopped dir=$SERVICE_DIR"
-  return 1
+  if [ "$age" -gt "$STALE_SECONDS" ]; then
+    [ "$quiet" = "1" ] || log "stopped stale_heartbeat_age=${age}s pid=${pid:-unknown} dir=$SERVICE_DIR"
+    return 1
+  fi
+  stalled_path="$(stalled_request_path "$now" 2>/dev/null || true)"
+  if [ -n "$stalled_path" ]; then
+    [ "$quiet" = "1" ] || log "unhealthy unclaimed_request=$(basename "$stalled_path") heartbeat_age=${age}s dir=$SERVICE_DIR"
+    return 1
+  fi
+  if is_pid_alive "$pid"; then
+    [ "$quiet" = "1" ] || log "running pid=$pid heartbeat_age=${age}s dir=$SERVICE_DIR"
+  else
+    [ "$quiet" = "1" ] || log "running heartbeat_age=${age}s dir=$SERVICE_DIR"
+  fi
+  return 0
 }
 
 start_cmd() {
@@ -107,8 +149,14 @@ start_cmd() {
   local pid
   pid="$(service_pid 2>/dev/null || true)"
   if is_pid_alive "$pid"; then
-    log "already running pid=$pid"
-    return 0
+    if status_cmd --quiet; then
+      log "already running pid=$pid"
+      return 0
+    fi
+    log "replace unhealthy worker pid=$pid"
+    screen -S "$SCREEN_SESSION" -X quit >/dev/null 2>&1 || true
+    kill "$pid" >/dev/null 2>&1 || true
+    rm -f "$PID_FILE" "$SERVICE_STATUS_FILE" "$ACTIVE_REQUEST_FILE"
   fi
 
   screen -S "$SCREEN_SESSION" -X quit >/dev/null 2>&1 || true
@@ -148,6 +196,7 @@ stop_cmd() {
   fi
   rm -f "$PID_FILE"
   rm -f "$SERVICE_STATUS_FILE"
+  rm -f "$ACTIVE_REQUEST_FILE"
   log "stopped pid=${pid:-unknown}"
 }
 
@@ -212,9 +261,9 @@ validate_bool() {
 
 process_request() {
   local request_path="$1"
-  local request_id product clean refresh kill_running log_path started_at finished_at exit_code
+  local request_id product clean refresh kill_running log_path started_at finished_at exit_code package_pid
 
-  request_id="$(basename "$request_path" .request)"
+  request_id="$(basename "$request_path" .running)"
   product="$(read_request_value "$request_path" product)"
   clean="$(read_request_value "$request_path" clean)"
   refresh="$(read_request_value "$request_path" refresh_gui_dist)"
@@ -229,6 +278,8 @@ process_request() {
   validate_bool "$kill_running"
 
   log_path="$LOG_DIR/$request_id.log"
+  printf '%s\n' "$request_id" >"$ACTIVE_REQUEST_FILE.tmp"
+  mv "$ACTIVE_REQUEST_FILE.tmp" "$ACTIVE_REQUEST_FILE"
   write_status "$request_id" "running" "$log_path"
   started_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 
@@ -244,7 +295,13 @@ process_request() {
       DEEPCODE_MACOS_KILL_RUNNING="$kill_running" \
       DEEPCODE_MACOS_CARGO_OFFLINE="${DEEPCODE_MACOS_CARGO_OFFLINE:-0}" \
       bash ./scripts/package-macos.sh
-  } >"$log_path" 2>&1
+  } >"$log_path" 2>&1 &
+  package_pid="$!"
+  while kill -0 "$package_pid" >/dev/null 2>&1; do
+    write_service_heartbeat
+    sleep "$POLL_INTERVAL_SECONDS"
+  done
+  wait "$package_pid"
   exit_code="$?"
   set -e
 
@@ -259,23 +316,56 @@ process_request() {
     write_service_heartbeat
     write_status "$request_id" "failed" "$log_path" "exit_code=$exit_code"
   fi
+  rm -f "$ACTIVE_REQUEST_FILE"
   rm -f "$request_path"
+}
+
+recover_claimed_requests() {
+  local claimed_path request_path request_id log_path
+  while true; do
+    claimed_path="$(
+      find "$REQUEST_DIR" -maxdepth 1 -type f -name '*.running' -print 2>/dev/null \
+        | LC_ALL=C sort \
+        | sed -n '1p'
+    )"
+    [ -n "$claimed_path" ] || break
+    request_path="${claimed_path%.running}.request"
+    request_id="$(basename "$claimed_path" .running)"
+    log_path="$LOG_DIR/$request_id.log"
+    mv "$claimed_path" "$request_path"
+    write_status "$request_id" "queued" "$log_path" "recovered_after_worker_restart=1"
+  done
+  rm -f "$ACTIVE_REQUEST_FILE"
+}
+
+claim_next_request() {
+  local request_path claimed_path
+  request_path="$(next_request_path)"
+  [ -n "$request_path" ] || return 1
+  claimed_path="${request_path%.request}.running"
+  if mv "$request_path" "$claimed_path" 2>/dev/null; then
+    printf '%s\n' "$claimed_path"
+    return 0
+  fi
+  return 1
 }
 
 run_cmd() {
   ensure_macos_host
   ensure_dirs
   printf '%s\n' "$$" >"$PID_FILE"
+  recover_claimed_requests
   write_service_heartbeat
   log "run loop pid=$$ dir=$SERVICE_DIR"
 
   while true; do
     write_service_heartbeat
     local request_path
-    for request_path in "$REQUEST_DIR"/*.request; do
-      [ -f "$request_path" ] || continue
+    request_path="$(claim_next_request 2>/dev/null || true)"
+    if [ -n "$request_path" ]; then
       process_request "$request_path"
-    done
+      continue
+    fi
     sleep "$POLL_INTERVAL_SECONDS"
   done
 }
@@ -334,11 +424,12 @@ submit_cmd() {
     ''|*[!0-9]*) fail "invalid timeout seconds: $timeout_seconds" ;;
   esac
 
-  local request_id request_tmp request_path status_path deadline state log_path now
+  local request_id request_tmp request_path status_path deadline state log_path now last_state
   request_id="$(date -u '+%Y%m%dT%H%M%SZ')-$$"
   request_tmp="$REQUEST_DIR/$request_id.request.tmp"
   request_path="$REQUEST_DIR/$request_id.request"
   status_path="$STATUS_DIR/$request_id.status"
+  log_path="$LOG_DIR/$request_id.log"
   {
     printf 'product=%s\n' "$product"
     printf 'clean=%s\n' "$clean"
@@ -346,6 +437,7 @@ submit_cmd() {
     printf 'kill_running=%s\n' "$kill_running"
     printf 'created_at=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
   } >"$request_tmp"
+  write_status "$request_id" "queued" "$log_path"
   mv "$request_tmp" "$request_path"
   log "queued request=$request_id product=$product kill_running=$kill_running"
 
@@ -354,10 +446,15 @@ submit_cmd() {
   fi
 
   deadline=$(( $(date +%s) + timeout_seconds ))
+  last_state="queued"
   while true; do
     if [ -f "$status_path" ]; then
       state="$(parse_status_state "$status_path")"
       log_path="$(parse_status_log_path "$status_path")"
+      if [ -n "$state" ] && [ "$state" != "$last_state" ]; then
+        log "request=$request_id state=$state log=$log_path"
+        last_state="$state"
+      fi
       case "$state" in
         done)
           log "request=$request_id done log=$log_path"
@@ -374,6 +471,11 @@ submit_cmd() {
     fi
 
     now="$(date +%s)"
+    if [ "$last_state" = "queued" ]; then
+      if ! status_cmd --quiet; then
+        fail "request=$request_id was not claimed by a healthy macOS package worker; restart the host service"
+      fi
+    fi
     if [ "$now" -ge "$deadline" ]; then
       fail "request=$request_id timed out after ${timeout_seconds}s"
     fi

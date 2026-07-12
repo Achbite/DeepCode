@@ -1,5 +1,3 @@
-import { AcceptedPlanResourceResumePromptBuilder } from '../prompt/AcceptedPlanResourceResumePromptBuilder.js';
-import { ProviderRepairMessageBuilder } from '../prompt/ProviderRepairMessageBuilder.js';
 import type { PromptEnvelope } from '../prompt/types.js';
 import {
   buildReviewFactsContext,
@@ -48,15 +46,10 @@ import {
 import {
   NativeToolCoordinator,
   NativeToolProgressEventBuilder,
+  NativeToolExposurePolicy,
   NativeToolProviderLoop,
   NativeToolProjectionBuilder,
-  NativeToolRepairCoordinator,
-  NativeToolRepairRunner,
-  NativeToolResourceRecorder,
-  NativeToolResultMessageBuilder,
-  NativeToolResumeMessageBuilder,
   NativeToolTurnHandler,
-  ProposalOnlyProviderRunner,
   ProviderJsonModeCoordinator,
   ProviderPipeline,
   ProviderStreamCoordinator,
@@ -76,10 +69,12 @@ import {
   ReviewProjectionBuilder,
   SessionFailureProjectionBuilder,
   SessionProgressProjectionBuilder,
+  VISIBLE_REASONING_MAX_CHARS,
 } from './projection/index.js';
 import { DriverInteractionIndex } from './interactions/index.js';
 import { ReviewAssembler, ReviewDecisionProjectionBuilder } from './review/index.js';
 import { DriverFailureMessageCatalog, DriverParseErrorCatalog } from './diagnostics/index.js';
+import { builtinHooks, HookPolicy, HookRegistry, HookRuntime } from './hooks/index.js';
 import type { LlmTurnResult, SessionDriverLoopRunState } from './runFrame.js';
 import { clip, objectRecord, stringValue, visibleLanguageForRequest } from './runtimeSupport.js';
 
@@ -87,12 +82,13 @@ const MAX_DERIVED_MANIFEST_ENTRIES = 240;
 const RESOURCE_MANIFEST_MAX_BYTES = 512 * 1024;
 export const MAX_ACTION_BUNDLE_TOTAL_CODE_BYTES = 384 * 1024;
 
-export const providerRepairMessageBuilder = new ProviderRepairMessageBuilder(MAX_ACTION_BUNDLE_TOTAL_CODE_BYTES);
-export const acceptedPlanResourceResumePromptBuilder = new AcceptedPlanResourceResumePromptBuilder(providerRepairMessageBuilder);
 export const providerPipeline = new ProviderPipeline();
 export const providerJsonModeCoordinator = new ProviderJsonModeCoordinator();
 export const providerStreamCoordinator = new ProviderStreamCoordinator();
 export const providerTraceRecorder = new ProviderTraceRecorder();
+export const hookRegistry = new HookRegistry();
+for (const hook of builtinHooks()) hookRegistry.register(hook);
+export const hookRuntime = new HookRuntime(hookRegistry, HookPolicy.observerOnly());
 export const actionBundleActionInspector = new ActionBundleActionInspector();
 export const driverActivityBuilder = new DriverActivityBuilder({
   providerStageSummary: (stage, part, language) => providerStreamCoordinator.stageSummary(stage, part, language),
@@ -126,8 +122,8 @@ export const driverInteractionIndex = new DriverInteractionIndex({
   findPlanCard: (events, runId, planId) => planContextIndex.findPlanCard(events, runId, planId),
   executionRootFromDecision: (input, events) => AcceptedPlanExecutionRootResolver.fromDecision(input, events),
   buildAcceptedPlan: (input) => acceptedImplementationPlanContextBuilder().build(input),
-  withLatestCheckpoint: (acceptedPlan, events) => acceptedPlanTaskLedger().withLatestCheckpoint(acceptedPlan, events),
-  afterBatch: (acceptedPlan, completedTaskIds) => acceptedPlanTaskLedger().afterBatch(acceptedPlan, completedTaskIds),
+  recoverLatestCheckpoint: (input) => acceptedPlanTaskLedger().recoverLatestCheckpoint(input),
+  recordTaskCompletion: (input) => acceptedPlanTaskLedger().recordTaskCompletion(input),
 });
 export const kernelEventProjectionBuilder = new KernelEventProjectionBuilder({
   requiredFileOperationsFromReport: (report) => planReviewGrantProjector.requiredFileOperationsFromReport(report),
@@ -176,8 +172,8 @@ export const reviewProjectionBuilder = new ReviewProjectionBuilder<SessionPlanCo
     ? acceptedImplementationPlanContextBuilder().build({ plan, interventionLevel: undefined, executionRoot: plan.executionRoot })
     : undefined,
   acceptedPlanBatchCompletedTaskIds: (acceptedPlan, plan, kernelEvents) =>
-    acceptedPlanTaskLedger().batchProgress({ acceptedPlan, proposal: planContextIndex.proposalEnvelope(plan), kernelEvents }).completedTaskIds,
-  acceptedPlanAfterBatch: (acceptedPlan, completedTaskIds) => acceptedPlanTaskLedger().afterBatch(acceptedPlan, completedTaskIds),
+    acceptedPlanTaskLedger().recordKernelBatchProgress({ acceptedPlan, proposal: planContextIndex.proposalEnvelope(plan), kernelEvents }).completedTaskIds,
+  acceptedPlanAfterBatch: (acceptedPlan, completedTaskIds) => acceptedPlanTaskLedger().recordTaskCompletion({ acceptedPlan, completedTaskIds }).nextAcceptedPlan,
   acceptedPlanTaskLedger: (acceptedPlan) => acceptedPlanTaskLedger().ledger(acceptedPlan),
   buildReviewFactsContext: (input) => buildReviewFactsContext(input),
 });
@@ -225,12 +221,8 @@ export const completedWorkUnitFactIndex = new CompletedWorkUnitFactIndex({
   comparablePath: (value) => pathIdentity.comparablePath(value),
 });
 export const nativeToolCoordinator = new NativeToolCoordinator();
-export const nativeToolTurnHandler = new NativeToolTurnHandler(nativeToolCoordinator);
-export const nativeToolRepairCoordinator = new NativeToolRepairCoordinator({
-  conversationActivity: (input) => driverActivityBuilder.conversationActivity(input),
-  parseProposal: (input) => protocolGate().parseAndValidateProposal(input),
-  parseRepairedProposal: (input) => protocolGate().parseAndValidateRepairedProposal(input),
-});
+export const nativeToolExposurePolicy = new NativeToolExposurePolicy();
+export const nativeToolTurnHandler = new NativeToolTurnHandler();
 export const acceptedPlanExecutor = new AcceptedPlanExecutor({
   readActionBundle: (proposal) => driverActivityBuilder.readActionBundle(proposal),
   operationTargetResolver: acceptedPlanOperationTargetResolver,
@@ -238,6 +230,7 @@ export const acceptedPlanExecutor = new AcceptedPlanExecutor({
   fileTargetRefFromPath: (path) => actionBundleActionInspector.fileTargetRefFromPath(path),
   deleteActionTargetResourceKind: (action) => actionBundleActionInspector.deleteActionTargetResourceKind(action),
   deleteActionRecursive: (action) => actionBundleActionInspector.deleteActionRecursive(action),
+  containsDirectoryPath: (resourcePackets, path) => resourceRequestLoop.containsDirectoryPath(resourcePackets, path),
   kernelExecutionContractId: (report) => planReviewGrantProjector.kernelExecutionContractId(report),
   proposalTargetScopes: (proposal, accepted) =>
     acceptedPlanScopeMatcher.proposalTargetScopes(proposal, accepted).map((target) => target.normalized),
@@ -259,34 +252,14 @@ export const nativeToolProjectionBuilder = new NativeToolProjectionBuilder({
   runningSummary: (toolName, language) => providerStreamCoordinator.nativeToolResolveRunningSummary(toolName, language),
   completedSummary: (toolName, language) => providerStreamCoordinator.nativeToolResolveCompletedSummary(toolName, language),
 });
-const NATIVE_TOOL_RESULT_MAX_CHARS = 12 * 1024;
-export const nativeToolResultMessageBuilder = new NativeToolResultMessageBuilder({
-  duplicateResult: (toolCall, existing) => nativeToolCoordinator.duplicateResult(toolCall, existing),
-  resultFromPacket: (toolCall, packet) => nativeToolCoordinator.resultFromPacket(toolCall, packet),
-}, NATIVE_TOOL_RESULT_MAX_CHARS);
-export const nativeToolResourceRecorder = new NativeToolResourceRecorder({
-  packetContentHash: (packet) => nativeToolCoordinator.packetContentHash(packet),
-  addDiscoveredManifestEntries: (manifest, packet) => resourceRequestLoop.addDiscoveredManifestEntries(manifest, packet),
-  packetEvent: (sessionId, packet, ts, id) => resourceRequestLoop.packetEvent(sessionId, packet, ts, id),
-});
-export const nativeToolResumeMessageBuilder = new NativeToolResumeMessageBuilder({
-  callToProtocol: (toolCall) => nativeToolCoordinator.callToProtocol(toolCall),
-});
 export const nativeToolProgressEventBuilder = new NativeToolProgressEventBuilder();
 export const nativeToolProviderLoop = new NativeToolProviderLoop<SessionDriverLoopRunState, PromptEnvelope, LlmTurnResult>({
   providerPipeline,
   turnHandler: nativeToolTurnHandler,
-  resumeMessageBuilder: nativeToolResumeMessageBuilder,
-});
-export const proposalOnlyProviderRunner = new ProposalOnlyProviderRunner<SessionDriverLoopRunState, LlmTurnResult>({
-  providerPipeline,
-  repairCoordinator: nativeToolRepairCoordinator,
-});
-export const nativeToolRepairRunner = new NativeToolRepairRunner({
-  repairCoordinator: nativeToolRepairCoordinator,
 });
 export const PROVIDER_REASONING_FLUSH_CHARS = 768;
 export const PROVIDER_REASONING_FLUSH_MS = 120;
+export { VISIBLE_REASONING_MAX_CHARS };
 export const SIDE_EFFECT_CAPABILITIES = new Set([
   'fs.write',
   'fs.patch',

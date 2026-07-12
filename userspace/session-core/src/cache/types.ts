@@ -20,6 +20,14 @@ export interface ProviderCacheChangedPartition {
   reason: 'initial_or_no_previous_record' | 'stable_policy_changed' | 'project_archive_changed' | 'session_state_changed' | 'evidence_tail_changed' | 'audit_only_changed';
 }
 
+export interface ProviderCachePartitionSnapshot {
+  name: string;
+  currentHash: string;
+  charLength: number;
+  stablePrefix: boolean;
+  reason: ProviderCacheChangedPartition['reason'];
+}
+
 export interface ProviderCacheAttribution {
   provider: ProviderCacheTelemetryKind | string;
   model: string;
@@ -29,6 +37,7 @@ export interface ProviderCacheAttribution {
   dynamicMessageHash: string;
   cacheEligiblePrefixCharLength: number;
   cacheEligiblePrefixTokenEstimate: number;
+  partitionSnapshots: ProviderCachePartitionSnapshot[];
   changedPartitions: ProviderCacheChangedPartition[];
 }
 

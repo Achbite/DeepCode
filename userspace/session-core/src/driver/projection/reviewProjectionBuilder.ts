@@ -93,6 +93,7 @@ export class ReviewProjectionBuilder<
     sessionId: string;
     plan: Plan;
     kernelEvents: unknown[];
+    events?: AgentEvent[];
     ts: string;
     id: string;
   }): AgentEvent {
@@ -102,7 +103,10 @@ export class ReviewProjectionBuilder<
       ...ports.staticSyntaxReviewFactLines(input.kernelEvents),
     ];
     const reviewFacts = ports.findReviewFacts(input.kernelEvents);
-    const gitReview = reviewFacts ? objectRecord(reviewFacts.gitReview) : undefined;
+    const rawGitReview = reviewFacts ? objectRecord(reviewFacts.gitReview) : undefined;
+    const executionRoot = input.plan.executionRoot
+      ?? latestPlanExecutionRootFromEvents(input.events ?? [], input.plan.planId);
+    const gitReview = gitReviewForProjection(rawGitReview, executionRoot);
     const completed = Math.max(
       reviewFacts ? arrayLength(reviewFacts.completedWorkUnits) : 0,
       input.kernelEvents.filter((event) => objectRecord(event)?.kind === 'work_unit.completed').length
@@ -131,12 +135,18 @@ export class ReviewProjectionBuilder<
     const acceptedPlanForReview = input.plan.implementationPlan
       ? ports.acceptedPlanContext(input.plan)
       : undefined;
-    const reviewTaskLedger = acceptedPlanForReview
+    // Review task status is a checkpoint projection; prefer the latest ledger facts over the stale accepted-plan snapshot.
+    const checkpointTaskLedger = latestAcceptedPlanTaskLedgerFromEvents<TaskLedger>(
+      input.events ?? [],
+      input.plan.runId,
+      input.plan.planId
+    );
+    const reviewTaskLedger = checkpointTaskLedger ?? (acceptedPlanForReview
       ? ports.acceptedPlanTaskLedger(ports.acceptedPlanAfterBatch(
         acceptedPlanForReview,
         ports.acceptedPlanBatchCompletedTaskIds(acceptedPlanForReview, input.plan, input.kernelEvents)
       ))
-      : undefined;
+      : undefined);
     const reviewFactsContextInput: ReviewFactsContextInput<TaskLedger> = {
       planId: input.plan.planId,
       runId: input.plan.runId,
@@ -165,7 +175,6 @@ export class ReviewProjectionBuilder<
         toolResults,
         continuations,
         gitReview,
-        reviewFacts,
       }),
     };
     return {
@@ -201,6 +210,7 @@ export class ReviewProjectionBuilder<
           facts,
           reviewFacts,
           gitReview,
+          rawGitReview,
           reviewFactsContext,
         },
         facts,
@@ -221,7 +231,6 @@ export class ReviewProjectionBuilder<
     toolResults: number;
     continuations: unknown[];
     gitReview?: Record<string, unknown>;
-    reviewFacts?: Record<string, unknown>;
   }): ReadableProjectionSection[] {
     const {
       plan,
@@ -232,7 +241,6 @@ export class ReviewProjectionBuilder<
       toolResults,
       continuations,
       gitReview,
-      reviewFacts,
     } = input;
     return [
       {
@@ -272,50 +280,13 @@ export class ReviewProjectionBuilder<
             reason: item.failureReason ?? item.failureClassification ?? '',
           },
           status: item.status,
-          targetRefs: [item.path],
-          auditRefs: [item.auditRef, item.workUnitId, ...(item.toolFactIds ?? [])].filter((value): value is string => Boolean(value)),
-          metadata: item as unknown as Record<string, unknown>,
         })),
-      },
-      {
-        sectionId: 'generatedArtifacts',
-        titleKey: 'session.projection.review.section.generatedArtifacts',
-        emptyMessageKey: 'session.projection.review.empty.generatedArtifacts',
-        items: reviewGeneratedArtifactItems(reviewFacts),
-      },
-      {
-        sectionId: 'pathDiagnostics',
-        titleKey: 'session.projection.review.section.pathDiagnostics',
-        emptyMessageKey: 'session.projection.review.empty.pathDiagnostics',
-        items: reviewPathNormalizationItems(reviewFacts),
       },
       {
         sectionId: 'gitChanges',
         titleKey: 'session.projection.review.section.gitChanges',
         emptyMessageKey: 'session.projection.review.empty.gitChanges',
         items: gitReviewItems(gitReview),
-      },
-      {
-        sectionId: 'auditDetails',
-        titleKey: 'session.projection.review.section.auditDetails',
-        emptyMessageKey: 'session.projection.review.empty.auditDetails',
-        items: [
-          projectionItem('developer-details', 'fact', {
-            messageKey: readableReview.developerDetailsAvailable
-              ? 'session.projection.review.audit.available'
-              : 'session.projection.review.audit.unavailable',
-          }),
-          ...readableReview.auditRefs.slice(0, 12).map((ref, index) => projectionItem(`audit-ref-${index + 1}`, 'fact', {
-            messageKey: 'session.projection.review.audit.ref',
-            messageArgs: { ref },
-            auditRefs: [ref],
-          })),
-        ],
-      },
-      {
-        sectionId: 'originalPlan',
-        titleKey: 'session.projection.review.section.originalPlan',
-        items: [projectionItem('original-plan', 'text', { text: clip(plan.userPlan, 1200) })],
       },
       {
         sectionId: 'validation',
@@ -426,6 +397,48 @@ export class ReviewProjectionBuilder<
 
 function arrayLength(value: unknown): number {
   return Array.isArray(value) ? value.length : 0;
+}
+
+function latestAcceptedPlanTaskLedgerFromEvents<TaskLedger>(
+  events: AgentEvent[],
+  planRunId?: string,
+  planId?: string
+): TaskLedger | undefined {
+  for (const event of [...events].reverse()) {
+    if (event.kind !== 'workflow_stage') continue;
+    const payload = objectRecord(event.payload) ?? {};
+    if (stringValue(payload.stage) !== 'accepted_plan.batch_checkpoint') continue;
+    if (!sameAcceptedPlan(payload, planRunId, planId)) continue;
+    const ledger = objectRecord(payload.taskLedger);
+    if (ledger) return ledger as TaskLedger;
+  }
+  return undefined;
+}
+
+function sameAcceptedPlan(
+  payload: Record<string, unknown>,
+  planRunId?: string,
+  planId?: string
+): boolean {
+  const payloadRunId = stringValue(payload.runId);
+  const payloadPlanId = stringValue(payload.planId) ?? stringValue(payload.sourcePlanId);
+  if (planId && payloadPlanId && payloadPlanId !== planId) return false;
+  if (planRunId && payloadRunId && payloadRunId !== planRunId) {
+    return Boolean(planId && payloadPlanId === planId);
+  }
+  return true;
+}
+
+function latestPlanExecutionRootFromEvents(events: AgentEvent[], planId?: string): unknown {
+  for (const event of [...events].reverse()) {
+    if (event.kind !== 'plan_card') continue;
+    const payload = objectRecord(event.payload) ?? {};
+    const payloadPlanId = stringValue(payload.planId) ?? stringValue(payload.sourcePlanId);
+    if (planId && payloadPlanId && payloadPlanId !== planId) continue;
+    const executionRoot = objectRecord(payload.executionRoot);
+    if (executionRoot) return executionRoot;
+  }
+  return undefined;
 }
 
 function addReviewWorkUnitFile(
@@ -552,6 +565,49 @@ function operationFromToolName(toolName?: string): string {
   return toolName;
 }
 
+function gitReviewForProjection(
+  gitReview: Record<string, unknown> | undefined,
+  executionRoot: unknown
+): Record<string, unknown> | undefined {
+  if (!gitReview || gitReview.available === false) return gitReview;
+  const executionRootPath = projectionPath(executionRootPathValue(executionRoot));
+  const root = projectionPath(stringValue(gitReview.root));
+  const repoRoot = projectionPath(stringValue(gitReview.repoRoot));
+  const reviewRoots = [root, repoRoot].filter((value): value is string => Boolean(value));
+  if (!executionRootPath || reviewRoots.length === 0) return gitReview;
+  if (reviewRoots.some((candidate) => sameProjectionRoot(candidate, executionRootPath))) return gitReview;
+
+  return {
+    available: false,
+    reason: `git review root ${reviewRoots[0]} does not match execution root ${executionRootPath}`,
+    root,
+    repoRoot,
+    executionRoot: executionRootPath,
+    projectionFilter: 'executionRootMismatch',
+  };
+}
+
+function executionRootPathValue(executionRoot: unknown): string | undefined {
+  const record = objectRecord(executionRoot);
+  const attachment = objectRecord(record?.attachment);
+  return stringValue(record?.ref)
+    ?? stringValue(record?.absolutePath)
+    ?? stringValue(record?.path)
+    ?? stringValue(attachment?.absolutePath)
+    ?? stringValue(attachment?.path);
+}
+
+function projectionPath(value?: string): string | undefined {
+  const trimmed = value?.trim();
+  if (!trimmed) return undefined;
+  const normalized = trimmed.replace(/\\/g, '/').replace(/\/+/g, '/');
+  return normalized.length > 1 ? normalized.replace(/\/+$/, '') : normalized;
+}
+
+function sameProjectionRoot(left: string, right: string): boolean {
+  return left === right || left.startsWith(`${right}/`) || right.startsWith(`${left}/`);
+}
+
 function gitReviewItems(gitReview?: Record<string, unknown>): ReadableProjectionItem[] {
   if (!gitReview) return [];
   if (gitReview.available === false) {
@@ -593,61 +649,6 @@ function gitReviewItems(gitReview?: Record<string, unknown>): ReadableProjection
   const diffBlocks = Array.isArray(gitReview.diffBlocks) ? gitReview.diffBlocks : [];
   if (diffBlocks.length) items.push(projectionItem('git-diff-attached', 'git', {
     messageKey: 'session.projection.review.git.diffAttached',
-  }));
-  return items;
-}
-
-function reviewGeneratedArtifactItems(reviewFacts?: Record<string, unknown>): ReadableProjectionItem[] {
-  const artifacts = Array.isArray(reviewFacts?.generatedArtifacts) ? reviewFacts.generatedArtifacts : [];
-  const items = artifacts.slice(0, 24).flatMap((item, index): ReadableProjectionItem[] => {
-    const record = objectRecord(item) ?? {};
-    const path = stringValue(record.path) ?? stringValue(record.absolutePath) ?? 'unknown';
-    const operation = stringValue(record.operation) ?? stringValue(record.toolName) ?? 'write';
-    const hash = stringValue(record.contentHash);
-    return [projectionItem(`artifact-${index + 1}`, 'artifact', {
-      messageKey: 'session.projection.review.generatedArtifact',
-      messageArgs: { path, operation, hash: hash ?? '' },
-      targetRefs: [path],
-      metadata: record,
-    })];
-  });
-  if (artifacts.length > 24) items.push(projectionItem('artifacts-truncated', 'artifact', {
-    messageKey: 'session.projection.review.generatedArtifacts.truncated',
-    messageArgs: { count: String(artifacts.length - 24) },
-  }));
-  return items;
-}
-
-function reviewPathNormalizationItems(reviewFacts?: Record<string, unknown>): ReadableProjectionItem[] {
-  const diagnostics = Array.isArray(reviewFacts?.pathNormalizationDiagnostics)
-    ? reviewFacts.pathNormalizationDiagnostics
-    : [];
-  const items = diagnostics.slice(0, 24).flatMap((item, index): ReadableProjectionItem[] => {
-    const record = objectRecord(item) ?? {};
-    const path = stringValue(record.path) ?? 'unknown';
-    const normalization = objectRecord(record.pathNormalization) ?? {};
-    const original = stringValue(normalization.originalPath);
-    const normalized = stringValue(normalization.normalizedTargetPath);
-    const stripped = Array.isArray(normalization.strippedPathPrefixes)
-      ? normalization.strippedPathPrefixes.filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
-      : [];
-    const duplicate = record.duplicateRootPathDetected === true || normalization.duplicateRootPathDetected === true;
-    return [projectionItem(`path-diagnostic-${index + 1}`, 'diagnostic', {
-      messageKey: 'session.projection.review.pathDiagnostic',
-      messageArgs: {
-        path,
-        original: original ?? '',
-        normalized: normalized ?? '',
-        stripped: stripped.join(', '),
-        duplicate: duplicate ? 'true' : 'false',
-      },
-      targetRefs: [path],
-      metadata: record,
-    })];
-  });
-  if (diagnostics.length > 24) items.push(projectionItem('path-diagnostics-truncated', 'diagnostic', {
-    messageKey: 'session.projection.review.pathDiagnostics.truncated',
-    messageArgs: { count: String(diagnostics.length - 24) },
   }));
   return items;
 }

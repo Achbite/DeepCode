@@ -1,5 +1,4 @@
 import type {
-  AgentContextAttachment,
   AgentEvent,
   AgentSessionResult,
   AgentWorkspaceBinding,
@@ -8,11 +7,18 @@ import type {
 } from '@deepcode/protocol';
 import type { ProjectMemoryMode } from '../../context/index.js';
 import type { ProjectWorkingDirectory, ResourcePacket } from '../../context/types.js';
-import type { AcceptedImplementationPlanContext } from '../../accepted-plan/types.js';
+import type { AcceptedImplementationPlanContext, AcceptedPlanBatchProgress } from '../../accepted-plan/types.js';
 import type { InteractionOverlayContext } from '../pipelines/interactionOverlayCodec.js';
 import type { PlanContext } from '../proposal/planContextIndex.js';
+import type { ProposalEnvelope } from '../../protocol/types.js';
+import {
+  acceptedPlanContinuationInput,
+  returnSessionResult,
+  type SessionLoopControlResult,
+} from '../runContinuation.js';
 import type { InterventionLevel, ReviewContinuationMode } from '../types.js';
 import { assertKernelReplyOk, kernelReplyErrorMessage } from './kernelReplyGuard.js';
+import type { KernelReplyObservation } from './kernelEventStatusIndex.js';
 
 export type AcceptedActionBundlePlanDecision = 'accept' | 'reject' | 'revise';
 export type AcceptedActionBundlePlanReviewContinuationMode = ReviewContinuationMode;
@@ -32,25 +38,6 @@ export interface AcceptedActionBundlePlanInput {
   interactionOverlay?: InteractionOverlayContext;
 }
 
-export interface AcceptedActionBundlePlanResumeInput {
-  sessionId: string;
-  content: string;
-  attachments?: AgentContextAttachment[];
-  existingEvents?: AgentEvent[];
-  workspaceBinding?: AgentWorkspaceBinding;
-  projectWorkingDirectory?: ProjectWorkingDirectory;
-  profileId?: string;
-  workflow?: string;
-  appendUserMessage: false;
-  requirementConfirmationMode: 'off';
-  reviewContinuationMode?: AcceptedActionBundlePlanReviewContinuationMode;
-  interventionLevel?: AcceptedActionBundlePlanInterventionLevel;
-  projectMemoryMode?: ProjectMemoryMode;
-  resumeResourcePackets?: boolean;
-  acceptedImplementationPlan?: AcceptedImplementationPlanContext;
-  interactionOverlay?: InteractionOverlayContext;
-}
-
 export interface AcceptedActionBundlePlanOverlay {
   plan: PlanContext;
   acceptedPlan: AcceptedImplementationPlanContext;
@@ -61,8 +48,8 @@ export interface AcceptedActionBundlePlanExecutorPorts {
   createId(prefix: string): string;
   append(sessionId: string, events: AgentEvent[]): Promise<AgentSessionResult>;
   kernel(request: KernelCommandEnvelope): Promise<KernelReply>;
+  observeKernel(request: KernelCommandEnvelope): Promise<KernelReplyObservation>;
   appendProjectedKernelEvents(sessionId: string, reply: KernelReply): Promise<AgentSessionResult | undefined>;
-  resumeUserTurn(input: AcceptedActionBundlePlanResumeInput): Promise<AgentSessionResult>;
   kernelExecutionContractId(report?: Record<string, unknown>): string | undefined;
   temporaryGrantsForPlan(plan: PlanContext): unknown[];
   recentResourcePackets(events: AgentEvent[]): ResourcePacket[];
@@ -120,17 +107,16 @@ export interface AcceptedActionBundlePlanExecutorPorts {
     id: string
   ): AgentEvent;
   deletePreflightReasons(batch: Record<string, unknown>, resourcePackets: ResourcePacket[]): string[];
-  hasFailureOrBlocker(events: unknown[]): boolean;
-  actionBatchReadyForReview(events: unknown[]): boolean;
-  hasPermissionRequest(events: unknown[]): boolean;
-  permissionId(events: unknown[]): string | undefined;
-  planProposal(plan: PlanContext): unknown;
-  batchProgress(input: {
+  planProposal(plan: PlanContext): ProposalEnvelope;
+  recordKernelBatchProgress(input: {
     acceptedPlan: AcceptedImplementationPlanContext;
-    proposal: unknown;
+    proposal: ProposalEnvelope;
     kernelEvents: unknown[];
-  }): { completedTaskIds: string[] };
-  acceptedPlanAfterBatch(accepted: AcceptedImplementationPlanContext, completedTaskIds: string[]): AcceptedImplementationPlanContext;
+  }): {
+    progress: AcceptedPlanBatchProgress;
+    completedTaskIds: string[];
+    nextAcceptedPlan: AcceptedImplementationPlanContext;
+  };
   runtimeSnapshot(input: {
     acceptedPlan: AcceptedImplementationPlanContext;
     resourcePackets: ResourcePacket[];
@@ -140,20 +126,6 @@ export interface AcceptedActionBundlePlanExecutorPorts {
   };
   acceptedPlanComplete(accepted: AcceptedImplementationPlanContext): boolean;
   executionRequest(plan: PlanContext, acceptedPlan: AcceptedImplementationPlanContext): string;
-  reviewHandoff(input: {
-    sessionId: string;
-    runId: string;
-    planId: string;
-    plan: PlanContext;
-    result: AgentSessionResult;
-    currentKernelEvents: unknown[];
-    requestIdPrefix: string;
-    interactionOverlay?: InteractionOverlayContext;
-    assertFactsReplyOk?: {
-      code: string;
-      fallback: string;
-    };
-  }): Promise<AgentSessionResult>;
 }
 
 export class AcceptedActionBundlePlanExecutor {
@@ -164,7 +136,7 @@ export class AcceptedActionBundlePlanExecutor {
     plan: PlanContext,
     initialResult: AgentSessionResult,
     acceptedOverlay?: AcceptedActionBundlePlanOverlay
-  ): Promise<AgentSessionResult> {
+  ): Promise<SessionLoopControlResult> {
     let result = initialResult;
     try {
       result = await this.ports.append(input.sessionId, [
@@ -205,13 +177,13 @@ export class AcceptedActionBundlePlanExecutor {
 
       const deletePreflightReasons = this.ports.deletePreflightReasons(batch, this.ports.recentResourcePackets(result.events));
       if (deletePreflightReasons.length) {
-        return this.ports.append(input.sessionId, this.ports.planActionBundlePreflightFailureEvents(
+        return returnSessionResult(await this.ports.append(input.sessionId, this.ports.planActionBundlePreflightFailureEvents(
           input.sessionId,
           plan,
           deletePreflightReasons,
           this.ports.now(),
           this.ports.createId('accepted-action-plan-preflight-failed')
-        )) ?? result;
+        )) ?? result);
       }
 
       const decisionReply = await this.ports.kernel({
@@ -261,7 +233,7 @@ export class AcceptedActionBundlePlanExecutor {
         result = await this.ports.appendProjectedKernelEvents(input.sessionId, { ok: true, events: grantEvents }) ?? result;
       }
 
-      const batchReply = await this.ports.kernel({
+      const observed = await this.ports.observeKernel({
         command: {
           kind: 'actionBatchSubmit',
           requestId: this.ports.createId('action-batch-submit'),
@@ -270,57 +242,59 @@ export class AcceptedActionBundlePlanExecutor {
           batch,
         },
       });
+      const batchReply = observed.reply;
       result = await this.ports.appendProjectedKernelEvents(input.sessionId, batchReply) ?? result;
       const batchEvents = batchReply.events ?? [];
-      if (!batchReply.ok && batchEvents.length === 0) {
+      if (observed.kind === 'commandFailed') {
         throw new AcceptedActionBundlePlanExecutionError(
-          stringValue(objectRecord(batchReply.error)?.code) ?? 'accepted_plan_action_batch_submit_failed',
+          observed.code,
           kernelReplyErrorMessage(batchReply, 'Kernel actionBatchSubmit failed without execution facts')
         );
       }
-      if (this.ports.hasFailureOrBlocker(batchEvents)) {
-        return this.ports.append(input.sessionId, this.ports.planActionBundleExecutionFailureEvents(
+      if (observed.kind === 'factsObserved' && observed.hasFailureOrBlocker) {
+        return returnSessionResult(await this.ports.append(input.sessionId, this.ports.planActionBundleExecutionFailureEvents(
           input.sessionId,
           plan,
           batchEvents,
           batch,
           this.ports.now(),
           this.ports.createId('accepted-action-plan-batch-failed')
-        )) ?? result;
+        )) ?? result);
       }
-      if (!this.ports.actionBatchReadyForReview(batchEvents)) {
-        if (this.ports.hasPermissionRequest(batchEvents)) {
-          const permissionId = this.ports.permissionId(batchEvents);
-          return this.ports.append(input.sessionId, [
-            this.ports.sessionRunStateEvent({
-              sessionId: input.sessionId,
+      if (observed.kind === 'permissionInterrupted') {
+        const permissionId = observed.permissionId;
+        return returnSessionResult(await this.ports.append(input.sessionId, [
+          this.ports.sessionRunStateEvent({
+            sessionId: input.sessionId,
+            runId: plan.runId,
+            phase: 'waiting_permission',
+            reason: 'permission',
+            decisionOwner: {
+              kind: 'permission',
               runId: plan.runId,
-              phase: 'waiting_permission',
-              reason: 'permission',
-              decisionOwner: {
-                kind: 'permission',
-                runId: plan.runId,
-                targetId: permissionId,
-                permissionId,
-                planId: plan.planId,
-              },
-              interactionOverlay: plan.interactionOverlay ?? input.interactionOverlay,
-              ts: this.ports.now(),
-              id: this.ports.createId('session-run-waiting-permission'),
-            }),
-          ]) ?? result;
-        }
-        return result;
+              targetId: permissionId,
+              permissionId,
+              planId: plan.planId,
+            },
+            interactionOverlay: plan.interactionOverlay ?? input.interactionOverlay,
+            ts: this.ports.now(),
+            id: this.ports.createId('session-run-waiting-permission'),
+          }),
+        ]) ?? result);
+      }
+      if (observed.kind !== 'factsObserved' || !observed.readyForReview) {
+        return returnSessionResult(result);
       }
 
       if (acceptedOverlay) {
         const progressProposal = this.ports.planProposal(plan);
-        const progress = this.ports.batchProgress({
+        const ledgerEffect = this.ports.recordKernelBatchProgress({
           acceptedPlan: acceptedOverlay.acceptedPlan,
           proposal: progressProposal,
           kernelEvents: batchEvents,
         });
-        const nextAccepted = this.ports.acceptedPlanAfterBatch(acceptedOverlay.acceptedPlan, progress.completedTaskIds);
+        const progress = ledgerEffect.progress;
+        const nextAccepted = ledgerEffect.nextAcceptedPlan;
         const runtime = this.ports.runtimeSnapshot({
           acceptedPlan: acceptedOverlay.acceptedPlan,
           resourcePackets: this.ports.recentResourcePackets(result.events),
@@ -351,24 +325,17 @@ export class AcceptedActionBundlePlanExecutor {
           ),
         ]) ?? result;
         if (!this.ports.acceptedPlanComplete(nextAccepted)) {
-          return this.ports.resumeUserTurn({
-            sessionId: input.sessionId,
-            content: this.ports.executionRequest(acceptedOverlay.plan, nextAccepted),
-            attachments: nextAccepted.executionRoot ? [nextAccepted.executionRoot.attachment] : [],
-            existingEvents: result.events,
-            workspaceBinding: input.workspaceBinding,
-            projectWorkingDirectory: input.projectWorkingDirectory,
-            profileId: input.profileId,
-            workflow: input.workflow,
-            appendUserMessage: false,
-            requirementConfirmationMode: 'off',
-            reviewContinuationMode: input.reviewContinuationMode,
-            interventionLevel: input.interventionLevel,
-            projectMemoryMode: input.projectMemoryMode,
-            resumeResourcePackets: true,
-            acceptedImplementationPlan: nextAccepted,
-            interactionOverlay: plan.interactionOverlay ?? input.interactionOverlay,
-          });
+          return {
+            kind: 'resume',
+            input: acceptedPlanContinuationInput(input, {
+              content: this.ports.executionRequest(acceptedOverlay.plan, nextAccepted),
+              attachments: nextAccepted.executionRoot ? [nextAccepted.executionRoot.attachment] : [],
+              existingEvents: result.events,
+              reviewContinuationMode: input.reviewContinuationMode,
+              acceptedImplementationPlan: nextAccepted,
+              interactionOverlay: plan.interactionOverlay ?? input.interactionOverlay,
+            }),
+          };
         }
         plan = {
           ...plan,
@@ -377,34 +344,37 @@ export class AcceptedActionBundlePlanExecutor {
         };
       }
 
-      return this.ports.reviewHandoff({
-        sessionId: input.sessionId,
-        runId: plan.runId,
-        planId: plan.planId,
-        plan,
-        result,
-        currentKernelEvents: batchEvents,
-        requestIdPrefix: 'review-facts-get',
-        interactionOverlay: plan.interactionOverlay ?? input.interactionOverlay,
-        assertFactsReplyOk: {
-          code: 'accepted_plan_review_facts_failed',
-          fallback: 'Kernel reviewFactsGet failed',
+      return {
+        kind: 'assembleReview',
+        request: {
+          sessionId: input.sessionId,
+          runId: plan.runId,
+          planId: plan.planId,
+          plan,
+          result,
+          currentKernelEvents: batchEvents,
+          requestIdPrefix: 'review-facts-get',
+          interactionOverlay: plan.interactionOverlay ?? input.interactionOverlay,
+          assertFactsReplyOk: {
+            code: 'accepted_plan_review_facts_failed',
+            fallback: 'Kernel reviewFactsGet failed',
+          },
         },
-      });
+      };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const structuredCode = stringValue(objectRecord(error)?.code);
       const code = error instanceof AcceptedActionBundlePlanExecutionError
         ? error.code
         : structuredCode ?? 'accepted_plan_execution_failed';
-      return this.ports.append(input.sessionId, this.ports.planActionBundleExecutionExceptionEvents(
+      return returnSessionResult(await this.ports.append(input.sessionId, this.ports.planActionBundleExecutionExceptionEvents(
         input.sessionId,
         plan,
         message,
         code,
         this.ports.now(),
         this.ports.createId('accepted-action-plan-execution-failed')
-      )) ?? result;
+      )) ?? result);
     }
   }
 }

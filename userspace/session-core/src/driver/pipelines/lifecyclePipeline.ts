@@ -5,13 +5,16 @@ import type {
   AgentWorkspaceBinding,
   KernelCommandEnvelope,
   KernelReply,
+  LlmChatRequest,
 } from '@deepcode/protocol';
 import type {
   ContextAssemblyRecord,
+  ContextAssemblyTaskLocalCompactRecord,
   PromptCachePlan,
   ProjectMemoryMode,
   SessionMemoryDocument,
 } from '../../context/index.js';
+import { collectTaskLocalCompactRecords } from '../../context/index.js';
 import type {
   ConversationResourceRoot,
   InitialContextPacket,
@@ -32,7 +35,7 @@ import type {
 } from '../../run-state/index.js';
 import type { DriverRequestRef, KernelStateContractRef } from '../types.js';
 import type { InteractionOverlayContext, SessionTurnPhase } from './interactionOverlayCodec.js';
-import type { DriverProviderTurnFrame } from '../runFrame.js';
+import type { DriverProviderTurnFrame, SessionDriverTaskResourceProgress } from '../runFrame.js';
 
 export interface RunLifecycleInput {
   sessionId: string;
@@ -64,10 +67,12 @@ export interface RunLifecycleState {
   initialContext: InitialContextPacket;
   resourcePackets: ResourcePacket[];
   generatedArtifactEvidence: Map<string, unknown>;
+  resourceRequestProgressByTask: Map<string, SessionDriverTaskResourceProgress>;
   memoryDocument: SessionMemoryDocument;
   memoryHints: string[];
   cachePlan?: PromptCachePlan;
   contextAssembly?: ContextAssemblyRecord;
+  taskLocalCompactRecords?: ContextAssemblyTaskLocalCompactRecord[];
   taskExecutionCursor?: TaskExecutionCursor;
   currentTaskContext?: CurrentTaskContext;
   taskLedger?: TaskLedgerSnapshot;
@@ -82,6 +87,10 @@ export interface RunLifecycleState {
   terminalGuidanceRevisionAttempted: boolean;
   nativeToolReadLedger: Map<string, unknown>;
   nativeToolDuplicateRepairAttempted: boolean;
+  nativeToolResumeMessages?: LlmChatRequest['messages'];
+  nativeToolResumeRound?: number;
+  semanticDirectiveRepairAttempted?: boolean;
+  semanticDirectiveErrorSummary?: string;
   interactionOverlay?: InteractionOverlayContext;
 }
 
@@ -162,15 +171,62 @@ export class RunLifecyclePipeline<State extends RunLifecycleState> {
 
     const events = input.existingEvents ?? [];
     const runId = firstString(runReply.events, 'runId') ?? this.ports.createId('run');
+    return this.hydrate({
+      input,
+      lastResult,
+      events,
+      runId,
+      stateContract: findStateContract(runReply.events),
+      driverRequest: findDriverRequest(runReply.events),
+      restoreResourcePackets: Boolean(input.resumeResourcePackets),
+      resolveInitialResources: !input.resumeResourcePackets,
+    });
+  }
+
+  async resume(input: RunLifecycleInput): Promise<RunLifecycleResult<State>> {
+    const lastResult = await this.ports.append(input.sessionId, []);
+    const events = input.existingEvents?.length ? input.existingEvents : lastResult.events;
+    const runId = input.acceptedImplementationPlan?.runId
+      ?? latestRunId(events)
+      ?? this.ports.createId('run-resume');
+    return this.hydrate({
+      input,
+      lastResult,
+      events,
+      runId,
+      stateContract: findStateContract(events.map((event) => event.payload)),
+      driverRequest: findDriverRequest(events.map((event) => event.payload)),
+      restoreResourcePackets: true,
+      resolveInitialResources: false,
+    });
+  }
+
+  private async hydrate(options: {
+    input: RunLifecycleInput;
+    lastResult: AgentSessionResult;
+    events: AgentEvent[];
+    runId: string;
+    stateContract?: KernelStateContractRef;
+    driverRequest?: DriverRequestRef;
+    restoreResourcePackets: boolean;
+    resolveInitialResources: boolean;
+  }): Promise<RunLifecycleResult<State>> {
+    const { input, events, runId } = options;
+    const sessionId = input.sessionId;
+    let lastResult = options.lastResult;
     const manifestBuild = this.ports.buildManifest(input, this.ports.createId('resource-manifest'));
     const acceptedImplementationPlan = input.acceptedImplementationPlan;
     const implementationBatch = this.ports.buildImplementationBatch(events);
     if (acceptedImplementationPlan) {
       implementationBatch.batchIndex = acceptedImplementationPlan.batchIndex;
     }
-    const restoredResourcePackets = input.resumeResourcePackets
+    const restoredResourcePackets = options.restoreResourcePackets
       ? this.ports.recentResourcePackets(events)
       : [];
+    const taskLocalCompactRecords = collectTaskLocalCompactRecords(events, {
+      limit: 8,
+      planId: acceptedImplementationPlan?.planId,
+    });
     const initialTaskRuntime = this.ports.initialTaskRuntime({
       acceptedPlan: acceptedImplementationPlan,
       resourcePackets: restoredResourcePackets,
@@ -182,8 +238,8 @@ export class RunLifecyclePipeline<State extends RunLifecycleState> {
       userRequest: input.content,
       phase: 'context_reading',
       workspaceScopeKey: manifestBuild.manifest.workspaceScopeKey,
-      stateContract: findStateContract(runReply.events),
-      driverRequest: findDriverRequest(runReply.events),
+      stateContract: options.stateContract,
+      driverRequest: options.driverRequest,
       manifest: manifestBuild.manifest,
       conversationRoots: manifestBuild.conversationRoots,
       initialContext: {
@@ -193,10 +249,12 @@ export class RunLifecyclePipeline<State extends RunLifecycleState> {
       },
       resourcePackets: [...restoredResourcePackets],
       generatedArtifactEvidence: this.ports.generatedArtifactEvidenceFromPackets(restoredResourcePackets),
+      resourceRequestProgressByTask: new Map<string, SessionDriverTaskResourceProgress>(),
       memoryDocument: this.ports.buildMemoryDocument(events, {
         projectMemoryMode: input.projectMemoryMode,
       }),
       memoryHints: this.ports.implementationBatchHints(implementationBatch, acceptedImplementationPlan),
+      taskLocalCompactRecords,
       taskExecutionCursor: initialTaskRuntime.taskExecutionCursor,
       currentTaskContext: initialTaskRuntime.currentTaskContext,
       taskLedger: initialTaskRuntime.taskLedger,
@@ -210,15 +268,28 @@ export class RunLifecyclePipeline<State extends RunLifecycleState> {
       terminalGuidanceRevisionAttempted: false,
       nativeToolReadLedger: new Map<string, unknown>(),
       nativeToolDuplicateRepairAttempted: false,
+      nativeToolResumeMessages: undefined,
+      nativeToolResumeRound: 0,
+      semanticDirectiveRepairAttempted: false,
+      semanticDirectiveErrorSummary: undefined,
       interactionOverlay: input.interactionOverlay,
     } as State;
 
-    if (state.manifest.entries.length > 0 && !input.resumeResourcePackets) {
+    if (state.manifest.entries.length > 0 && options.resolveInitialResources) {
       lastResult = await this.ports.resolveInitialResources(state);
     }
 
     return { state, lastResult };
   }
+}
+
+function latestRunId(events: AgentEvent[]): string | undefined {
+  for (const event of [...events].reverse()) {
+    const payload = objectRecord(event.payload);
+    const runId = stringValue(payload?.runId) ?? stringValue(objectRecord(payload?.decisionOwner)?.runId);
+    if (runId) return runId;
+  }
+  return undefined;
 }
 
 function findStateContract(events: unknown[] | undefined): KernelStateContractRef | undefined {
@@ -252,4 +323,8 @@ function objectRecord(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
     : undefined;
+}
+
+function stringValue(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
 }

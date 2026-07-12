@@ -87,6 +87,83 @@ export interface ContextAssemblyResourceBlockRecord {
   preview: string;
 }
 
+export type ContextAssemblyDynamicAppendFoldPolicy =
+  | 'dropAfterTask'
+  | 'retainEvidenceHandle'
+  | 'retainProjectMemory'
+  | 'retainSessionMemory'
+  | 'retainTurnContract';
+
+export interface ContextAssemblyDynamicAppendLogEntry {
+  index: number;
+  segmentId: string;
+  name: PromptSegment['name'];
+  cacheClass: PromptSegment['cacheClass'];
+  partitionName: ContextAssemblyPartitionName;
+  foldPolicy: ContextAssemblyDynamicAppendFoldPolicy;
+  contentHash: string;
+  renderedHash: string;
+  charLength: number;
+  renderedCharLength: number;
+}
+
+export interface ContextAssemblyDynamicAppendFoldSummary {
+  policy: ContextAssemblyDynamicAppendFoldPolicy;
+  segmentCount: number;
+  renderedCharLength: number;
+  contentHash: string;
+  renderedHash: string;
+  segmentIds: string[];
+}
+
+export interface ContextAssemblyTaskLocalFoldPlan {
+  schemaVersion: 'deepcode.session.context-task-fold.v1';
+  taskCursorId?: string;
+  lastTaskSavepointId?: string;
+  currentTaskGoalHash?: string;
+  currentTaskContextHash?: string;
+  dynamicAppendLogHash: string;
+  foldableSegmentCount: number;
+  foldableRenderedCharLength: number;
+  retainedSegmentCount: number;
+  retainedRenderedCharLength: number;
+  policySummaries: ContextAssemblyDynamicAppendFoldSummary[];
+  boundary: 'metadataOnlyNoPromptMutation';
+}
+
+export type ContextAssemblyTaskLocalCompactSource =
+  | 'kernelBatchCheckpoint'
+  | 'modelTaskOutcome'
+  | 'resourceValidation';
+
+export type ContextAssemblyTaskLocalCompactStatus =
+  | 'completedByKernelFacts'
+  | 'modelJudgedSufficient'
+  | 'completedByReadOnlyEvidence';
+
+export interface ContextAssemblyTaskLocalCompactRecord {
+  schemaVersion: 'deepcode.session.context-task-compact.v1';
+  source: ContextAssemblyTaskLocalCompactSource;
+  status: ContextAssemblyTaskLocalCompactStatus;
+  boundary: 'sessionContextMetadataOnly';
+  planId?: string;
+  runId?: string;
+  taskId?: string;
+  taskCursorId?: string;
+  lastTaskSavepointId?: string;
+  currentTaskGoalHash?: string;
+  currentTaskContextHash?: string;
+  dynamicAppendLogHash: string;
+  taskLocalFoldPlanHash: string;
+  foldableSegmentCount: number;
+  foldableRenderedCharLength: number;
+  retainedSegmentCount: number;
+  retainedRenderedCharLength: number;
+  retainedPolicies: string[];
+  foldablePolicies: string[];
+  compactHash: string;
+}
+
 export interface ContextAssemblyBudgetPlan {
   policy: 'softCapReserveOutput';
   contextWindowTokens: number;
@@ -159,6 +236,15 @@ export interface ContextAssemblyRecord {
   cacheAffectsCorrectness: false;
   segmentOrder: string[];
   segments: ContextAssemblySegmentRecord[];
+  dynamicAppendLog: ContextAssemblyDynamicAppendLogEntry[];
+  dynamicAppendLogHash: string;
+  dynamicAppendLogCharLength: number;
+  taskLocalFoldPlan: ContextAssemblyTaskLocalFoldPlan;
+  taskLocalFoldPlanHash: string;
+  taskLocalCompactRecords: ContextAssemblyTaskLocalCompactRecord[];
+  taskLocalCompactRecordCount: number;
+  taskLocalCompactRecordsHash: string;
+  latestTaskLocalCompactHash?: string;
   partitionRecords: ContextAssemblyPartitionRecord[];
   resourceBlocks: ContextAssemblyResourceBlockRecord[];
   resourceFullTextCharCount: number;
@@ -224,6 +310,8 @@ export interface ContextAssemblyInput {
     cursorId?: string;
     lastSavepointId?: string;
   };
+  taskLocalCompactRecords?: ContextAssemblyTaskLocalCompactRecord[];
+  currentTaskResourcePacketIds?: string[];
   auditOnly?: PromptEnvelopeBuilderInput['auditOnly'];
 }
 
@@ -232,10 +320,20 @@ export function assembleContext(input: ContextAssemblyInput): ContextAssemblyRes
     projectMemoryMode: input.projectMemoryMode,
   });
   const userGuidance = input.userGuidance ?? collectUserGuidanceEvents(input.existingEvents ?? []);
+  const taskLocalCompactRecords = input.taskLocalCompactRecords ?? [];
+  const compactCurrentTaskTargets = currentTaskTargets(input.currentTaskContext);
+  const taskLocalMemoryCompactionActive = taskLocalCompactRecords.length > 0 && Boolean(input.currentTaskContext);
   const resourcePromptContext = buildResourcePromptContext({
     initialContext: input.initialContext,
     conversationRoots: input.conversationRoots,
     resourcePackets: input.resourcePackets,
+    taskLocalCompaction: {
+      active: taskLocalCompactRecords.length > 0 && (
+        compactCurrentTaskTargets.length > 0 || Boolean(input.currentTaskResourcePacketIds?.length)
+      ),
+      currentTaskTargets: compactCurrentTaskTargets,
+      currentTaskPacketIds: input.currentTaskResourcePacketIds,
+    },
   });
   const promptInput: PromptEnvelopeBuilderInput = {
     workflowState: input.workflowState,
@@ -244,7 +342,13 @@ export function assembleContext(input: ContextAssemblyInput): ContextAssemblyRes
     projectMemoryHints: renderProjectMemoryHints(memoryDocument),
     projectMemoryRecallHints: renderProjectMemoryRecallHints(memoryDocument),
     sessionMemoryHints: [
-      ...renderSessionScopedMemoryHints(memoryDocument),
+      ...renderSessionScopedMemoryHints(memoryDocument, {
+        taskLocalCompaction: {
+          active: taskLocalMemoryCompactionActive,
+          compactRecordCount: taskLocalCompactRecords.length,
+          latestCompactHash: taskLocalCompactRecords.at(-1)?.compactHash,
+        },
+      }),
       ...(input.extraMemoryHints ?? []),
     ],
     interventionLevel: input.interventionLevel,
@@ -284,6 +388,31 @@ export function assembleContext(input: ContextAssemblyInput): ContextAssemblyRes
   const partitionCharCounts = contextAssemblyPartitionCharCounts(prompt.segments);
   const partitionTokenEstimates = contextAssemblyPartitionTokenEstimates(partitionCharCounts);
   const partitionRecords = contextAssemblyPartitionRecords(prompt.segments);
+  const dynamicAppendLog = contextAssemblyDynamicAppendLog(prompt.segments);
+  const dynamicAppendLogHash = stableHash(JSON.stringify(dynamicAppendLog.map((entry) => ({
+    index: entry.index,
+    segmentId: entry.segmentId,
+    contentHash: entry.contentHash,
+    renderedHash: entry.renderedHash,
+    foldPolicy: entry.foldPolicy,
+  }))));
+  const dynamicAppendLogCharLength = dynamicAppendLog.reduce((total, entry) => total + entry.renderedCharLength, 0);
+  const taskLocalCompactRecordsHash = stableHash(JSON.stringify(taskLocalCompactRecords.map((record) => ({
+    compactHash: record.compactHash,
+    taskId: record.taskId,
+    taskCursorId: record.taskCursorId,
+    source: record.source,
+    status: record.status,
+  }))));
+  const taskLocalFoldPlan = contextAssemblyTaskLocalFoldPlan({
+    dynamicAppendLog,
+    dynamicAppendLogHash,
+    currentTaskGoalHash: input.currentTaskGoal ? stableHash(input.currentTaskGoal) : undefined,
+    currentTaskContextHash: input.currentTaskContext ? stableHash(JSON.stringify(input.currentTaskContext)) : undefined,
+    taskCursorId: input.taskCursor?.cursorId,
+    lastTaskSavepointId: input.taskCursor?.lastSavepointId,
+  });
+  const taskLocalFoldPlanHash = stableHash(JSON.stringify(taskLocalFoldPlan));
   const providerCacheAttribution = buildProviderCacheAttribution({
     provider,
     model,
@@ -323,6 +452,15 @@ export function assembleContext(input: ContextAssemblyInput): ContextAssemblyRes
     cacheAffectsCorrectness: false,
     segmentOrder: prompt.segments.map((segment) => segment.id),
     segments: prompt.segments.map(contextAssemblySegment),
+    dynamicAppendLog,
+    dynamicAppendLogHash,
+    dynamicAppendLogCharLength,
+    taskLocalFoldPlan,
+    taskLocalFoldPlanHash,
+    taskLocalCompactRecords,
+    taskLocalCompactRecordCount: taskLocalCompactRecords.length,
+    taskLocalCompactRecordsHash,
+    latestTaskLocalCompactHash: taskLocalCompactRecords.at(-1)?.compactHash,
     partitionRecords,
     resourceBlocks: resourcePromptContext.resourceBlocks.map(contextAssemblyResourceBlock),
     resourceFullTextCharCount: resourcePromptContext.resourceFullTextCharCount,
@@ -353,8 +491,8 @@ export function assembleContext(input: ContextAssemblyInput): ContextAssemblyRes
     providerCacheAttribution,
     resourceEvidenceTailCount: resourcePromptContext.resourceBlocks.length,
     traceArchiveMode: 'compact-provider-trace',
-    currentTaskGoalHash: input.currentTaskGoal ? stableHash(input.currentTaskGoal) : undefined,
-    currentTaskContextHash: input.currentTaskContext ? stableHash(JSON.stringify(input.currentTaskContext)) : undefined,
+    currentTaskGoalHash: taskLocalFoldPlan.currentTaskGoalHash,
+    currentTaskContextHash: taskLocalFoldPlan.currentTaskContextHash,
     taskCursorId: input.taskCursor?.cursorId,
     lastTaskSavepointId: input.taskCursor?.lastSavepointId,
     redactionNote: 'Segment previews and provider traces are compacted for inspection; raw provider token deltas and full prompt messages are not stored in transcript.',
@@ -416,14 +554,16 @@ function buildProviderCacheAttribution(input: {
     dynamicMessageHash: input.dynamicSuffixHash,
     cacheEligiblePrefixCharLength: input.prompt.stablePrefix.length,
     cacheEligiblePrefixTokenEstimate: estimateTokens(input.prompt.stablePrefix.length),
-    changedPartitions: input.partitionRecords
+    partitionSnapshots: input.partitionRecords
       .filter((partition) => partition.charLength > 0)
       .map((partition) => ({
         name: partition.name,
         currentHash: partition.contentHash,
-        charDelta: partition.charLength,
+        charLength: partition.charLength,
+        stablePrefix: partition.stablePrefix,
         reason: cachePartitionReason(partition),
       })),
+    changedPartitions: [],
   };
 }
 
@@ -443,7 +583,9 @@ function contextAssemblyPartitionCharCounts(segments: PromptSegment[]): ContextA
     'protocolContract',
     'builtinSystemPrompt',
     'systemStructure',
-    'toolCatalogSummary',
+    'agentInterventionContract',
+    'resourceEvidencePolicyContract',
+    'memoryAndTaskContextContract',
     'rulerContext',
     'authoritativeDocExcerpts',
   ]);
@@ -541,7 +683,9 @@ function contextAssemblyPartitionName(segment: PromptSegment): ContextAssemblyPa
       return 'PlatformProtocolContract';
     case 'builtinSystemPrompt':
     case 'systemStructure':
-    case 'agentInterventionPolicy':
+    case 'agentInterventionContract':
+    case 'resourceEvidencePolicyContract':
+    case 'memoryAndTaskContextContract':
       return 'AgentOperatingContract';
     case 'toolCatalogSummary':
       return 'StaticToolCatalogDigest';
@@ -558,6 +702,7 @@ function contextAssemblyPartitionName(segment: PromptSegment): ContextAssemblyPa
     case 'currentWorkflowState':
     case 'currentRequirement':
     case 'currentUserOverlay':
+    case 'agentInterventionPolicy':
       return 'CurrentRunStateAndRequest';
     case 'reusableResourceContext':
     case 'currentResourceResults':
@@ -569,8 +714,113 @@ function contextAssemblyPartitionName(segment: PromptSegment): ContextAssemblyPa
   }
 }
 
+function contextAssemblyDynamicAppendLog(segments: PromptSegment[]): ContextAssemblyDynamicAppendLogEntry[] {
+  return segments
+    .filter((segment) => !segment.stable && !segment.auditOnly && segment.content.trim())
+    .map((segment, index) => {
+      const rendered = renderPromptSegment(segment);
+      const partitionName = contextAssemblyPartitionName(segment);
+      return {
+        index,
+        segmentId: segment.id,
+        name: segment.name,
+        cacheClass: segment.cacheClass,
+        partitionName,
+        foldPolicy: dynamicAppendFoldPolicy(partitionName),
+        contentHash: stableHash(segment.content),
+        renderedHash: stableHash(rendered),
+        charLength: segment.content.length,
+        renderedCharLength: rendered.length,
+      };
+    });
+}
+
+function contextAssemblyTaskLocalFoldPlan(input: {
+  dynamicAppendLog: ContextAssemblyDynamicAppendLogEntry[];
+  dynamicAppendLogHash: string;
+  currentTaskGoalHash?: string;
+  currentTaskContextHash?: string;
+  taskCursorId?: string;
+  lastTaskSavepointId?: string;
+}): ContextAssemblyTaskLocalFoldPlan {
+  const foldable = input.dynamicAppendLog.filter((entry) => entry.foldPolicy === 'dropAfterTask');
+  const retained = input.dynamicAppendLog.filter((entry) => entry.foldPolicy !== 'dropAfterTask');
+  return {
+    schemaVersion: 'deepcode.session.context-task-fold.v1',
+    taskCursorId: input.taskCursorId,
+    lastTaskSavepointId: input.lastTaskSavepointId,
+    currentTaskGoalHash: input.currentTaskGoalHash,
+    currentTaskContextHash: input.currentTaskContextHash,
+    dynamicAppendLogHash: input.dynamicAppendLogHash,
+    foldableSegmentCount: foldable.length,
+    foldableRenderedCharLength: foldable.reduce((total, entry) => total + entry.renderedCharLength, 0),
+    retainedSegmentCount: retained.length,
+    retainedRenderedCharLength: retained.reduce((total, entry) => total + entry.renderedCharLength, 0),
+    policySummaries: contextAssemblyDynamicAppendFoldSummaries(input.dynamicAppendLog),
+    boundary: 'metadataOnlyNoPromptMutation',
+  };
+}
+
+function contextAssemblyDynamicAppendFoldSummaries(
+  entries: ContextAssemblyDynamicAppendLogEntry[]
+): ContextAssemblyDynamicAppendFoldSummary[] {
+  const policyOrder: ContextAssemblyDynamicAppendFoldPolicy[] = [
+    'retainTurnContract',
+    'retainProjectMemory',
+    'retainSessionMemory',
+    'retainEvidenceHandle',
+    'dropAfterTask',
+  ];
+  return policyOrder
+    .map((policy) => {
+      const selected = entries.filter((entry) => entry.foldPolicy === policy);
+      if (selected.length === 0) return undefined;
+      return {
+        policy,
+        segmentCount: selected.length,
+        renderedCharLength: selected.reduce((total, entry) => total + entry.renderedCharLength, 0),
+        contentHash: stableHash(selected.map((entry) => entry.contentHash).join('\n')),
+        renderedHash: stableHash(selected.map((entry) => entry.renderedHash).join('\n')),
+        segmentIds: selected.map((entry) => entry.segmentId),
+      };
+    })
+    .filter((summary): summary is ContextAssemblyDynamicAppendFoldSummary => summary !== undefined);
+}
+
+function dynamicAppendFoldPolicy(
+  partitionName: ContextAssemblyPartitionName
+): ContextAssemblyDynamicAppendFoldPolicy {
+  switch (partitionName) {
+    case 'StaticToolCatalogDigest':
+      return 'retainTurnContract';
+    case 'ProjectMemory':
+      return 'retainProjectMemory';
+    case 'SessionMemory':
+      return 'retainSessionMemory';
+    case 'EvidenceTail':
+      return 'retainEvidenceHandle';
+    case 'CurrentRunStateAndRequest':
+    case 'UserRulerAndProjectInstructions':
+    case 'PlatformProtocolContract':
+    case 'AgentOperatingContract':
+    case 'AuditOnly':
+    default:
+      return 'dropAfterTask';
+  }
+}
+
+function renderPromptSegment(segment: PromptSegment): string {
+  return `<${segment.name} priority="${segment.priority}">\n${segment.content}\n</${segment.name}>`;
+}
+
 function estimateTokens(chars: number): number {
   return Math.ceil(chars / 4);
+}
+
+function currentTaskTargets(value: unknown): string[] {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return [];
+  const targets = (value as Record<string, unknown>).targets;
+  return Array.isArray(targets) ? targets.filter((target): target is string => typeof target === 'string') : [];
 }
 
 function contextAssemblyResourceBlock(block: ResourcePromptBlock): ContextAssemblyResourceBlockRecord {

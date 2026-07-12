@@ -1,13 +1,11 @@
 import type { LlmChatRequest } from '@deepcode/protocol';
-import type {
-  ProviderContextFrame,
-  DriverProviderTurnFrame,
-  ToolIntentTemplate,
-} from '../runFrame.js';
+import type { DriverProviderTurnFrame } from '../runFrame.js';
+import { renderProviderTurnUserPrompt } from '../context/providerTurnPromptRenderer.js';
 import {
   ProviderEmptyProposalRetry,
   type ProviderEmptyProposalRetryOptions,
 } from '../../provider/ProviderEmptyProposalRetry.js';
+import { ProviderProfileRegistry } from '../../provider/ProviderProfileRegistry.js';
 
 export { ProviderJsonModeCoordinator } from './providerJsonModeCoordinator.js';
 export {
@@ -20,6 +18,7 @@ export { NativeToolHandlerPortsFactory } from './nativeToolHandlerPortsFactory.j
 export { NativeToolProgressEventBuilder } from './nativeToolProgressEventBuilder.js';
 export { NativeToolProviderLoop } from './nativeToolProviderLoop.js';
 export { NativeToolProviderCoordinator } from './nativeToolProviderCoordinator.js';
+export { NativeToolExposurePolicy } from './nativeToolExposurePolicy.js';
 export { NativeToolProjectionBuilder } from './nativeToolProjectionBuilder.js';
 export { NativeToolResultMessageBuilder } from './nativeToolResultMessageBuilder.js';
 export { NativeToolResourceRecorder } from './nativeToolResourceRecorder.js';
@@ -72,11 +71,14 @@ export interface ProviderPipelineRunTurnInput<TState, TTurn extends ProviderPipe
 }
 
 export class ProviderPipeline {
-  constructor(private readonly emptyProposalRetry = new ProviderEmptyProposalRetry()) {}
+  constructor(
+    private readonly emptyProposalRetry = new ProviderEmptyProposalRetry(),
+    private readonly profiles = new ProviderProfileRegistry()
+  ) {}
 
   messages(contract: DriverProviderTurnFrame): LlmChatRequest['messages'] {
     return [
-      { role: 'system', content: contract.prompt.stablePrefix },
+      { role: 'system', content: this.profiles.profileForFrame(contract).systemContract },
       { role: 'user', content: this.renderUserPrompt(contract.prompt.dynamicSuffix, contract) },
     ];
   }
@@ -93,10 +95,7 @@ export class ProviderPipeline {
   runWithNativeTools<TState, TTurn extends ProviderPipelineTurn>(
     input: ProviderPipelineRunTurnInput<TState, TTurn>
   ): Promise<TTurn> {
-    return this.runWithRetry(input, {
-      responseFormat: { type: 'json_object' },
-      ...input.options,
-    });
+    return this.runWithRetry(input, input.options ?? {});
   }
 
   private runWithRetry<TState, TTurn extends ProviderPipelineTurn>(
@@ -123,6 +122,9 @@ export class ProviderPipeline {
     if (!messages.length) return this.messages(contract);
     const lastIndex = messages.length - 1;
     const lastMessage = messages[lastIndex];
+    if (lastMessage?.role === 'user' && typeof lastMessage.content === 'string' && lastMessage.content.includes('ProviderTurnContract:')) {
+      return messages;
+    }
     if (lastMessage?.role !== 'user' || typeof lastMessage.content !== 'string') {
       return [
         ...messages,
@@ -139,52 +141,6 @@ export class ProviderPipeline {
   }
 
   private renderUserPrompt(dynamicContent: string, contract: DriverProviderTurnFrame): string {
-    return [
-      dynamicContent,
-      'ProviderTurnContract:',
-      fencedJson({
-        schemaVersion: contract.schemaVersion,
-        contractId: contract.contractId,
-        turnMode: contract.turnMode,
-        allowedKinds: contract.allowedKinds,
-        ...(contract.requiredKind ? { requiredKind: contract.requiredKind } : {}),
-        repairPolicy: contract.repairPolicy,
-        projectionVisibility: contract.projectionVisibility,
-        frames: contract.frames.map(renderFrame),
-        toolIntentTemplates: contract.toolIntentTemplates.map(renderToolIntentTemplate),
-        nextActionInstruction: contract.nextActionInstruction.summary ?? '',
-      }),
-      [
-        'Provider turn instruction:',
-        contract.nextActionInstruction.summary ?? '',
-      ].join('\n'),
-    ].filter((part) => part.trim()).join('\n\n');
+    return renderProviderTurnUserPrompt(dynamicContent, contract);
   }
-}
-
-function renderFrame(frame: ProviderContextFrame): Record<string, unknown> {
-  return {
-    kind: frame.kind,
-    source: frame.source,
-    trust: frame.trust,
-    ...(frame.scope ? { scope: frame.scope } : {}),
-    use: frame.use,
-    ...(frame.summary ? { summary: frame.summary } : {}),
-    ...(frame.refs?.length ? { refs: frame.refs } : {}),
-    ...(frame.data ? { data: frame.data } : {}),
-  };
-}
-
-function renderToolIntentTemplate(template: ToolIntentTemplate): Record<string, unknown> {
-  return {
-    intentId: template.intentId,
-    label: template.label,
-    operation: template.operation,
-    targets: template.targets,
-    ...(template.evidencePolicy ? { evidencePolicy: template.evidencePolicy } : {}),
-  };
-}
-
-function fencedJson(value: unknown): string {
-  return `\`\`\`json\n${JSON.stringify(value, null, 2)}\n\`\`\``;
 }

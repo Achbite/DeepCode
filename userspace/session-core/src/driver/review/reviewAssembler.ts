@@ -152,10 +152,10 @@ export class ReviewAssembler {
     return value.map((item, index) => {
       const record = objectRecord(item) ?? {};
       return {
-        targetPath: stringValue(record.targetPath) ?? stringValue(record.path) ?? 'unknown',
+        targetPath: stringValue(record.targetRef) ?? stringValue(record.targetPath) ?? stringValue(record.path) ?? 'unknown',
         severity: stringValue(record.severity) ?? 'warning',
         message: stringValue(record.message) ?? stringValue(record.summary) ?? `Static review issue ${index + 1}`,
-        ...(typeof record.lineHint === 'number' ? { lineHint: record.lineHint } : {}),
+        ...(typeof record.line === 'number' ? { lineHint: record.line } : typeof record.lineHint === 'number' ? { lineHint: record.lineHint } : {}),
         ...(stringValue(record.evidence) ? { evidence: stringValue(record.evidence) } : {}),
       };
     }).filter((item) => stringValue(item.message));

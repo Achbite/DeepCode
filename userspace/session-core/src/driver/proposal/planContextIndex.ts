@@ -128,7 +128,11 @@ export class PlanContextIndex {
       if (status !== 'accepted' && status !== 'rejected' && status !== 'needsRevision') return false;
       const runId = stringValue(payload.runId);
       const planId = stringValue(payload.planId);
-      if (runId !== plan.runId || (planId && !aliases.has(planId))) return false;
+      if (planId) {
+        if (!aliases.has(planId)) return false;
+      } else if (runId !== plan.runId) {
+        return false;
+      }
       if (status === 'rejected' || status === 'needsRevision') return true;
       return this.executionConsumed(events, plan, aliases, index);
     });
@@ -144,15 +148,20 @@ export class PlanContextIndex {
       const event = events[index];
       const payload = objectRecord(event.payload) ?? {};
       const kernelEvent = objectRecord(payload.kernelEvent);
-      const runId = stringValue(payload.runId) ?? stringValue(kernelEvent?.runId);
-      if (runId && runId !== plan.runId) continue;
       const owner = objectRecord(payload.decisionOwner);
       const batch = objectRecord(kernelEvent?.batch);
       const planId = stringValue(payload.planId)
+        ?? stringValue(payload.sourcePlanId)
         ?? stringValue(owner?.planId)
         ?? stringValue(kernelEvent?.planId)
         ?? stringValue(batch?.planId);
-      if (planId && !aliases.has(planId)) continue;
+      // Accepted-plan work units and final review can be emitted by child runs; planId remains stable.
+      if (planId) {
+        if (!aliases.has(planId)) continue;
+      } else {
+        const runId = stringValue(payload.runId) ?? stringValue(kernelEvent?.runId);
+        if (runId && runId !== plan.runId) continue;
+      }
 
       if (event.kind === 'review_summary') return true;
       if (event.kind === 'permission_request') return true;

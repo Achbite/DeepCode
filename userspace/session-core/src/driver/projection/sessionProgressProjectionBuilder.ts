@@ -1,5 +1,6 @@
 import type { AgentConversationActivity, AgentEvent } from '@deepcode/protocol';
 import type { ProposalEnvelope } from '../../protocol/types.js';
+import type { ContextAssemblyTaskLocalCompactRecord } from '../../context/index.js';
 import type { ResourcePacket } from '../../context/types.js';
 import type {
   AcceptedImplementationPlanContext,
@@ -82,6 +83,8 @@ export class SessionProgressProjectionBuilder {
     promptSegmentDigests: Array<Record<string, unknown>>;
     stablePrefixHash?: string;
     dynamicSuffixHash?: string;
+    finalUserPromptHash?: string;
+    finalUserPromptCharLength?: number;
     cacheHash?: string;
     ts: string;
     id: string;
@@ -120,6 +123,8 @@ export class SessionProgressProjectionBuilder {
         promptSegmentDigests: input.promptSegmentDigests,
         stablePrefixHash: input.stablePrefixHash,
         dynamicSuffixHash: input.dynamicSuffixHash,
+        finalUserPromptHash: input.finalUserPromptHash,
+        finalUserPromptCharLength: input.finalUserPromptCharLength,
         cacheHash: input.cacheHash,
         cacheAffectsCorrectness: false,
       },
@@ -184,6 +189,7 @@ export class SessionProgressProjectionBuilder {
       runId,
       tasks: this.taskRecords(accepted),
       completedTaskIds,
+      modelJudgedSufficientTaskIds: accepted.modelJudgedSufficientTaskIds ?? [],
       skippedTaskIds: effectKind === 'skipCurrentTask' ? newlyCompletedTaskIds : [],
       acceptedIncompleteTaskIds: effectKind === 'markAcceptedIncomplete' ? newlyCompletedTaskIds : [],
     });
@@ -236,7 +242,8 @@ export class SessionProgressProjectionBuilder {
     kernelEvents: unknown[],
     progress: AcceptedPlanBatchProgress,
     ts: string,
-    id: string
+    id: string,
+    contextCompactRecord?: ContextAssemblyTaskLocalCompactRecord
   ): AgentEvent {
     const failedOrBlocked = this.ports.hasFailureOrBlocker(kernelEvents);
     const complete = !failedOrBlocked && progress.remainingTaskIds.length === 0;
@@ -245,6 +252,7 @@ export class SessionProgressProjectionBuilder {
       runId,
       tasks: this.taskRecords(accepted),
       completedTaskIds: progress.completedTaskIds,
+      modelJudgedSufficientTaskIds: progress.modelJudgedSufficientTaskIds ?? accepted.modelJudgedSufficientTaskIds ?? [],
       failedTaskId: failedOrBlocked
         ? accepted.tasks.find((task) => !progress.completedTaskIds.includes(task.taskId))?.taskId
         : undefined,
@@ -272,10 +280,13 @@ export class SessionProgressProjectionBuilder {
         workUnitIds: progress.workUnitIds,
         newlyCompletedTaskIds: progress.newlyCompletedTaskIds,
         completedTaskIds: progress.completedTaskIds,
+        newlyModelJudgedSufficientTaskIds: progress.newlyModelJudgedSufficientTaskIds ?? [],
+        modelJudgedSufficientTaskIds: progress.modelJudgedSufficientTaskIds ?? accepted.modelJudgedSufficientTaskIds ?? [],
         remainingTaskIds: progress.remainingTaskIds,
         taskLedger: ledger,
         taskOrder: ledger.taskOrder,
         nextPendingTaskIds: ledger.pendingTaskIds,
+        contextCompactRecord,
         channel: 'progress',
         visibility: 'conversation',
         presentation: 'collapsible',
@@ -303,7 +314,8 @@ export class SessionProgressProjectionBuilder {
     packet: ResourcePacket,
     completion: AcceptedPlanReadOnlyResourceCompletion,
     ts: string,
-    id: string
+    id: string,
+    contextCompactRecord?: ContextAssemblyTaskLocalCompactRecord
   ): AgentEvent {
     const complete = completion.remainingTaskIds.length === 0;
     const ledger = buildTaskLedgerSnapshot({
@@ -311,6 +323,7 @@ export class SessionProgressProjectionBuilder {
       runId,
       tasks: this.taskRecords(accepted),
       completedTaskIds: completion.completedTaskIds,
+      modelJudgedSufficientTaskIds: accepted.modelJudgedSufficientTaskIds ?? [],
     });
     const summary = complete
       ? 'Read-only evidence satisfied the remaining accepted task; ready for final review.'
@@ -338,6 +351,7 @@ export class SessionProgressProjectionBuilder {
         taskLedger: ledger,
         taskOrder: ledger.taskOrder,
         nextPendingTaskIds: ledger.pendingTaskIds,
+        contextCompactRecord,
         channel: 'progress',
         visibility: 'conversation',
         presentation: 'collapsible',
@@ -500,7 +514,8 @@ export class SessionProgressProjectionBuilder {
     cursor: TaskExecutionCursor | undefined,
     context: CurrentTaskContext | undefined,
     ts: string,
-    id: string
+    id: string,
+    contextCompactRecord?: ContextAssemblyTaskLocalCompactRecord
   ): AgentEvent {
     const complete = progress.remainingTaskIds.length === 0 && !this.ports.hasFailureOrBlocker(kernelEvents);
     const ledger = this.ports.acceptedPlanTaskLedger(nextAccepted);
@@ -530,6 +545,8 @@ export class SessionProgressProjectionBuilder {
         taskId: context?.taskId,
         completedTaskIds: progress.completedTaskIds,
         newlyCompletedTaskIds: progress.newlyCompletedTaskIds,
+        modelJudgedSufficientTaskIds: progress.modelJudgedSufficientTaskIds ?? nextAccepted.modelJudgedSufficientTaskIds ?? [],
+        newlyModelJudgedSufficientTaskIds: progress.newlyModelJudgedSufficientTaskIds ?? [],
         remainingTaskIds: progress.remainingTaskIds,
         taskLedger: ledger,
         taskOrder: ledger?.taskOrder ?? [],
@@ -538,6 +555,7 @@ export class SessionProgressProjectionBuilder {
         targetPaths: progress.targetPaths,
         workUnitIds: progress.workUnitIds,
         kernelEventCount: kernelEvents.length,
+        contextCompactRecord,
         memoryUpdateSummary: 'SessionMemory will retain the active task focus, completed task ids, and next checkpoint as derived intent/checkpoint memory.',
         channel: 'progress',
         visibility: 'conversation',

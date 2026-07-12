@@ -15,6 +15,38 @@ export interface AssistantProjectionBuilderPorts {
   guidanceRevisionTransitionMessage(language: AssistantProjectionLanguage): string;
 }
 
+export const VISIBLE_REASONING_MAX_CHARS = 2_400;
+
+export interface VisibleReasoningProjection {
+  content: string;
+  truncated: boolean;
+  fullCharLength: number;
+  visibleCharLength: number;
+}
+
+export function projectVisibleReasoning(
+  content: string,
+  maxChars: number = VISIBLE_REASONING_MAX_CHARS
+): VisibleReasoningProjection {
+  if (!Number.isFinite(maxChars) || maxChars <= 0 || content.length <= maxChars) {
+    return {
+      content,
+      truncated: false,
+      fullCharLength: content.length,
+      visibleCharLength: content.length,
+    };
+  }
+  const suffix = '...';
+  const prefixLength = Math.max(0, maxChars - suffix.length);
+  const visible = `${content.slice(0, prefixLength)}${suffix.slice(0, maxChars)}`;
+  return {
+    content: visible,
+    truncated: true,
+    fullCharLength: content.length,
+    visibleCharLength: visible.length,
+  };
+}
+
 export interface AssistantDecisionEffectAnswerInput {
   sessionId: string;
   runId: string;
@@ -175,18 +207,22 @@ export class AssistantProjectionBuilder {
   }
 
   reasoningEvent(sessionId: string, content: string, ts: string, id: string): AgentEvent {
+    const projected = projectVisibleReasoning(content);
     return {
       id,
       sessionId,
       ts,
       kind: 'assistant_msg',
       payload: {
-        content,
+        content: projected.content,
         channel: 'reasoning',
         source: 'provider',
         visibility: 'conversation',
         presentation: 'collapsible',
         reasoningTrace: true,
+        reasoningProjectionTruncated: projected.truncated,
+        reasoningProjectionFullCharLength: projected.fullCharLength,
+        reasoningProjectionVisibleCharLength: projected.visibleCharLength,
         label: 'Model reasoning',
       },
     };

@@ -69,6 +69,7 @@ export interface AcceptedPlanExecutorPorts {
   fileTargetRefFromPath(path: string): Record<string, unknown>;
   deleteActionTargetResourceKind(action: Record<string, unknown>): string | undefined;
   deleteActionRecursive(action: Record<string, unknown>): boolean;
+  containsDirectoryPath(resourcePackets: ResourcePacket[], path: string): boolean;
   kernelExecutionContractId(report?: Record<string, unknown>): string | undefined;
   proposalTargetScopes(proposal: ProposalEnvelope, accepted: AcceptedImplementationPlanContext): string[];
   actionTargetScopes(
@@ -322,6 +323,7 @@ export class AcceptedPlanExecutor {
     planId: string;
     plan: PlanContext;
     acceptedPlan?: AcceptedImplementationPlanContext;
+    resourcePackets?: ResourcePacket[];
   }): NormalizedAcceptedPlanKernelBatch {
     const ports = this.requirePorts();
     const actionBundle = objectRecord(input.plan.actionBundle);
@@ -357,7 +359,8 @@ export class AcceptedPlanExecutor {
         return action;
       }
       const next = { ...record };
-      const capability = stringValue(next.capability);
+      // Keep batch normalization aligned with preflight and admission when providers emit toolId-only actions.
+      const capability = actionEffectiveCapability(next);
       const kind = stringValue(next.kind);
       if (capability === 'fs.delete') {
         next.kind = kind ?? 'delete';
@@ -373,13 +376,53 @@ export class AcceptedPlanExecutor {
           next.targetPath = target;
           next.resourceScope = [target];
           next.targetRef = objectRecord(next.targetRef) ?? ports.fileTargetRefFromPath(target);
-          const targetResourceKind = ports.deleteActionTargetResourceKind(next) ?? deleteGrant?.targetResourceKind;
+          const recursiveDeleteIntent = ports.deleteActionRecursive(next) || deleteGrant?.recursive === true;
+          const resourceEvidenceSaysDirectory = ports.containsDirectoryPath(input.resourcePackets ?? [], target);
+          const explicitTargetResourceKind = ports.deleteActionTargetResourceKind(next) ?? deleteGrant?.targetResourceKind;
+          const targetResourceKind = resourceEvidenceSaysDirectory
+            ? 'directory'
+            : explicitTargetResourceKind ?? (recursiveDeleteIntent ? 'directory' : undefined);
           if (targetResourceKind === 'directory') {
+            // Clear recursive delete intent is normalized into the Kernel directory-delete schema before preflight.
             next.targetKind = 'directory';
             next.targetResourceKind = 'directory';
-            next.recursive = ports.deleteActionRecursive(next) || deleteGrant?.recursive === true;
+            next.recursive = true;
+            next.args = {
+              ...(objectRecord(next.args) ?? {}),
+              targetKind: 'directory',
+              targetResourceKind: 'directory',
+              recursive: true,
+            };
+            next.toolArgs = {
+              ...(objectRecord(next.toolArgs) ?? objectRecord(next.args) ?? {}),
+              targetKind: 'directory',
+              targetResourceKind: 'directory',
+              recursive: true,
+            };
           }
         }
+        return next;
+      }
+
+      if (capability === 'process.exec') {
+        next.kind = kind ?? 'command';
+        const toolArgs = objectRecord(next.toolArgs) ?? objectRecord(next.args) ?? {};
+        const argv = stringArrayValue(next.argv).length
+          ? stringArrayValue(next.argv)
+          : stringArrayValue(toolArgs.argv);
+        if (!argv.length) {
+          reasons.push(`actionBundle.actions[${index}] process.exec is missing typed args.argv.`);
+          return next;
+        }
+        next.argv = argv;
+        const cwd = stringValue(next.cwd) ?? stringValue(toolArgs.cwd);
+        if (cwd) next.cwd = cwd;
+        const timeoutMs = numberValue(next.timeoutMs) ?? numberValue(toolArgs.timeoutMs);
+        if (timeoutMs !== undefined) next.timeoutMs = timeoutMs;
+        const envPolicy = stringValue(next.envPolicy) ?? stringValue(toolArgs.envPolicy);
+        if (envPolicy) next.envPolicy = envPolicy;
+        next.toolArgs = { ...toolArgs, argv, ...(cwd ? { cwd } : {}), ...(timeoutMs !== undefined ? { timeoutMs } : {}), ...(envPolicy ? { envPolicy } : {}) };
+        next.args = objectRecord(next.args) ?? next.toolArgs;
         return next;
       }
 
@@ -785,6 +828,10 @@ function rawStringValue(value: unknown): string | undefined {
 
 function stringValue(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function numberValue(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
 }
 
 function stringArrayValue(value: unknown): string[] {

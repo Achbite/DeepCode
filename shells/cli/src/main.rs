@@ -534,7 +534,7 @@ async fn ask(
         let mut text = result.run.final_text.clone().unwrap_or_default();
         if text.trim().is_empty() {
             if let Ok(timeline) = client.agent_timeline(&result.run.session_id).await {
-                text = extract_final_text(&timeline).unwrap_or_default();
+                text = extract_plain_text(&timeline).unwrap_or_default();
             }
         }
         if text.trim().is_empty() {
@@ -643,7 +643,7 @@ async fn resolve_session_decision(
         .agent_timeline(&result.run.session_id)
         .await
         .map_err(|error| format!("failed to read timeline: {error}"))?;
-    render_timeline(&timeline);
+    render_decision_result(&timeline);
     Ok(())
 }
 
@@ -1023,6 +1023,7 @@ async fn bootstrap_kernel(
 }
 
 fn render_timeline(timeline: &Value) {
+    let timeline = timeline_payload(timeline);
     let turns = timeline
         .get("turns")
         .and_then(Value::as_array)
@@ -1050,13 +1051,7 @@ fn render_timeline(timeline: &Value) {
                 .and_then(Value::as_str)
                 .filter(|value| !value.is_empty())
                 .unwrap_or(kind);
-            let body = block
-                .get("bodyMarkdown")
-                .or_else(|| block.get("summary"))
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .or_else(|| structured_projection_text(block))
-                .unwrap_or_default();
+            let body = timeline_block_text(block, kind);
             println!("  {kind}: {title}");
             for line in body.lines().take(12) {
                 println!("    {line}");
@@ -1065,45 +1060,59 @@ fn render_timeline(timeline: &Value) {
     }
 }
 
-fn structured_projection_text(block: &Value) -> Option<String> {
-    let events = block.get("events").and_then(Value::as_array)?;
-    for event in events {
-        let kind = event
-            .get("kind")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let payload = event.get("payload")?;
-        let readable = match kind {
-            "plan_card" => payload.get("readablePlan"),
-            "review_summary" => payload.get("readableReview"),
-            _ => None,
-        };
-        if let Some(readable) = readable {
-            let rendered = render_readable_projection(readable);
-            if !rendered.trim().is_empty() {
-                return Some(rendered);
-            }
+fn render_decision_result(timeline: &Value) {
+    if let Some(text) = extract_decision_result_text(timeline) {
+        println!("{text}");
+        return;
+    }
+    render_timeline(timeline);
+}
+
+fn extract_decision_result_text(timeline: &Value) -> Option<String> {
+    extract_plain_text(timeline)
+}
+
+fn timeline_block_text(block: &Value, kind: &str) -> String {
+    if matches!(kind, "plan" | "review") {
+        if let Some(text) = block
+            .get("structuredProjection")
+            .map(render_readable_projection)
+            .filter(|text| !text.trim().is_empty())
+        {
+            return text;
         }
     }
-    None
+    block
+        .get("bodyMarkdown")
+        .or_else(|| block.get("summary"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_default()
 }
 
 fn render_readable_projection(readable: &Value) -> String {
     let mut lines = Vec::new();
-    if let Some(summary) = readable.get("summary").and_then(Value::as_str) {
-        lines.push(summary.to_string());
-    } else if let Some(summary_key) = readable.get("summaryKey").and_then(Value::as_str) {
-        lines.push(summary_key.to_string());
+    let sections = readable.get("sections").and_then(Value::as_array);
+    let summary_is_structured = sections
+        .map(|sections| sections.iter().any(readable_section_has_summary_items))
+        .unwrap_or(false);
+    if !summary_is_structured {
+        if let Some(summary) = readable.get("summary").and_then(Value::as_str) {
+            lines.push(summary.to_string());
+        } else if let Some(summary_key) = readable.get("summaryKey").and_then(Value::as_str) {
+            lines.push(
+                readable_summary_key_text(summary_key)
+                    .unwrap_or(summary_key)
+                    .to_string(),
+            );
+        }
     }
-    if let Some(sections) = readable.get("sections").and_then(Value::as_array) {
+    if let Some(sections) = sections {
         for section in sections {
-            if let Some(title) = section
-                .get("titleKey")
-                .or_else(|| section.get("title"))
-                .and_then(Value::as_str)
-            {
+            if let Some(title) = readable_section_title(section) {
                 lines.push(format!("## {title}"));
             }
+            let mut seen_section_lines: Vec<String> = Vec::new();
             let items = section
                 .get("items")
                 .and_then(Value::as_array)
@@ -1111,17 +1120,19 @@ fn render_readable_projection(readable: &Value) -> String {
                 .unwrap_or_default();
             if items.is_empty() {
                 if let Some(empty) = section.get("emptyMessageKey").and_then(Value::as_str) {
-                    lines.push(format!("- {empty}"));
+                    if let Some(message) = readable_empty_message(empty) {
+                        lines.push(format!("- {message}"));
+                    }
                 }
             }
             for item in items {
-                let text = item
-                    .get("text")
-                    .or_else(|| item.get("messageKey"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                if !text.is_empty() {
-                    lines.push(format!("- {text}"));
+                let item_text = readable_item_text(&item);
+                if let Some(text) = &item_text {
+                    push_unique_render_line(
+                        &mut lines,
+                        &mut seen_section_lines,
+                        format!("- {text}"),
+                    );
                 }
                 if let Some(targets) = item.get("targetRefs").and_then(Value::as_array) {
                     let target_text = targets
@@ -1129,8 +1140,16 @@ fn render_readable_projection(readable: &Value) -> String {
                         .filter_map(Value::as_str)
                         .collect::<Vec<_>>()
                         .join(", ");
-                    if !target_text.is_empty() {
-                        lines.push(format!("  - targets: {target_text}"));
+                    let target_is_already_visible = item_text
+                        .as_ref()
+                        .map(|text| text.contains(&target_text))
+                        .unwrap_or(false);
+                    if !target_text.is_empty() && !target_is_already_visible {
+                        push_unique_render_line(
+                            &mut lines,
+                            &mut seen_section_lines,
+                            format!("  - targets: {target_text}"),
+                        );
                     }
                 }
             }
@@ -1139,183 +1158,262 @@ fn render_readable_projection(readable: &Value) -> String {
     lines.join("\n")
 }
 
+fn push_unique_render_line(lines: &mut Vec<String>, seen: &mut Vec<String>, line: String) {
+    let normalized = normalize_render_text(&line);
+    if seen.iter().any(|item| item == &normalized) {
+        return;
+    }
+    seen.push(normalized);
+    lines.push(line);
+}
+
+fn readable_section_has_summary_items(section: &Value) -> bool {
+    let section_key = section
+        .get("sectionId")
+        .or_else(|| section.get("titleKey"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !matches!(
+        section_key,
+        "summary" | "session.projection.plan.section.summary"
+    ) {
+        return false;
+    }
+    section
+        .get("items")
+        .and_then(Value::as_array)
+        .map(|items| items.iter().any(|item| readable_item_text(item).is_some()))
+        .unwrap_or(false)
+}
+
+fn readable_summary_key_text(key: &str) -> Option<&'static str> {
+    match key {
+        "review.summary.waitingUserReview" => {
+            Some("The current batch has executed. Review the tool facts and validation results.")
+        }
+        "review.summary.needsAttention" => {
+            Some("The current batch has failed or blocked items. Review the facts before deciding whether to revise.")
+        }
+        _ => None,
+    }
+}
+
+fn readable_item_text(item: &Value) -> Option<String> {
+    if let Some(text) = item.get("text").and_then(Value::as_str) {
+        if !text.trim().is_empty() {
+            return Some(text.to_string());
+        }
+    }
+    item.get("messageKey")
+        .and_then(Value::as_str)
+        .and_then(|key| readable_message_text(key, item))
+}
+
+fn readable_message_text(key: &str, item: &Value) -> Option<String> {
+    let arg = |name: &str| readable_message_arg(item, name).unwrap_or_default();
+    match key {
+        "session.projection.plan.boundary.notExecution" => {
+            Some("This is a plan, not an execution result.".to_string())
+        }
+        "review.summary.waitingUserReview" => Some(
+            "The current batch has executed. Review the tool facts and validation results."
+                .to_string(),
+        ),
+        "review.summary.needsAttention" => Some(
+            "The current batch has failed or blocked items. Review the facts before deciding whether to revise."
+                .to_string(),
+        ),
+        "review.changedFile" => Some(format!(
+            "{} operation={} status={}",
+            arg("path"),
+            arg("operation"),
+            arg("status")
+        )),
+        "session.projection.review.changedFileWithReason" => Some(format!(
+            "{} operation={} status={} reason={}",
+            arg("path"),
+            arg("operation"),
+            arg("status"),
+            arg("reason")
+        )),
+        "session.projection.review.count.workUnitsCompleted" => {
+            Some(format!("WorkUnits completed: {}", arg("count")))
+        }
+        "session.projection.review.count.workUnitsFailed" => {
+            Some(format!("WorkUnits failed: {}", arg("count")))
+        }
+        "session.projection.review.count.workUnitsBlocked" => {
+            Some(format!("WorkUnits blocked: {}", arg("count")))
+        }
+        "session.projection.review.count.toolFacts" => {
+            Some(format!("Tool facts: {}", arg("count")))
+        }
+        "session.projection.review.generatedArtifact" => Some(format!(
+            "{} operation={} contentHash={}",
+            arg("path"),
+            arg("operation"),
+            arg("hash")
+        )),
+        "session.projection.review.generatedArtifacts.truncated" => Some(format!(
+            "{} additional generated artifact(s) are not expanded.",
+            arg("count")
+        )),
+        "session.projection.review.pathDiagnostic" => Some(format!(
+            "{} original={} normalized={} stripped={} duplicateRootPathDetected={}",
+            arg("path"),
+            arg("original"),
+            arg("normalized"),
+            arg("stripped"),
+            arg("duplicate")
+        )),
+        "session.projection.review.pathDiagnostics.truncated" => Some(format!(
+            "{} additional path diagnostic(s) are not expanded.",
+            arg("count")
+        )),
+        "session.projection.review.git.unavailable" => {
+            Some(format!("Git diff unavailable: {}", arg("reason")))
+        }
+        "session.projection.review.git.stats" => Some(format!(
+            "Files: {}; staged diff: {} bytes; unstaged diff: {} bytes.",
+            arg("changedFiles"),
+            arg("stagedBytes"),
+            arg("unstagedBytes")
+        )),
+        "session.projection.review.git.truncated" => Some(format!(
+            "{} additional Git file(s) are not expanded.",
+            arg("count")
+        )),
+        "session.projection.review.git.diffAttached" => {
+            Some("Full diff is attached as collapsible Review evidence.".to_string())
+        }
+        "session.projection.review.audit.available" => Some(
+            "Raw Kernel facts, tool facts, and ReviewFacts are retained in developerDetails / audit refs."
+                .to_string(),
+        ),
+        "session.projection.review.audit.unavailable" => {
+            Some("No developerDetails are available.".to_string())
+        }
+        "session.projection.review.audit.ref" => Some(format!("auditRef: {}", arg("ref"))),
+        "session.projection.review.next.failed" => Some(
+            "Accept closes the current batch without retrying failed items; submit Review feedback to revise."
+                .to_string(),
+        ),
+        "session.projection.review.next.success" => Some(
+            "Accept closes the current batch; typed text is treated as Review revision feedback."
+                .to_string(),
+        ),
+        "session.projection.review.next.continuation" => Some(format!(
+            "The current plan recorded {} continuation intent(s).",
+            arg("count")
+        )),
+        "session.projection.review.next.noContinuation" => {
+            Some("The current plan did not record continuation batches.".to_string())
+        }
+        _ => None,
+    }
+}
+
+fn readable_message_arg(item: &Value, name: &str) -> Option<String> {
+    item.get("messageArgs")?
+        .get(name)?
+        .as_str()
+        .map(str::to_string)
+}
+
+fn readable_section_title(section: &Value) -> Option<String> {
+    if let Some(title) = section.get("title").and_then(Value::as_str) {
+        return Some(title.to_string());
+    }
+    let key = section
+        .get("sectionId")
+        .or_else(|| section.get("titleKey"))
+        .and_then(Value::as_str)?;
+    Some(
+        match key {
+            "summary" | "session.projection.plan.section.summary" => "Summary",
+            "tasks" | "session.projection.plan.section.tasks" => "Tasks",
+            "risks" | "session.projection.plan.section.risks" => "Risks",
+            "reviewCheckpoints" | "session.projection.plan.section.reviewCheckpoints" => {
+                "Review checkpoints"
+            }
+            "boundary" | "session.projection.plan.section.boundary" => "Boundary",
+            "executionResult" | "session.projection.review.section.executionResult" => {
+                "Execution result"
+            }
+            "execution" | "session.projection.review.section.execution" => "Execution",
+            "changedFiles" | "session.projection.review.section.changedFiles" => {
+                "Files changed in this batch"
+            }
+            "generatedArtifacts" | "session.projection.review.section.generatedArtifacts" => {
+                "Agent generated artifacts"
+            }
+            "pathDiagnostics" | "session.projection.review.section.pathDiagnostics" => {
+                "Path normalization diagnostics"
+            }
+            "gitChanges" | "session.projection.review.section.gitChanges" => "Git changes",
+            "auditDetails" | "session.projection.review.section.auditDetails" => "Audit details",
+            "originalPlan" | "session.projection.review.section.originalPlan" => {
+                "Original plan summary"
+            }
+            "validation" | "session.projection.review.section.validation" => {
+                "Validation and startup suggestions"
+            }
+            "nextDecision" | "session.projection.review.section.nextDecision" => "Next decision",
+            "audit" | "session.projection.review.section.audit" => "Audit",
+            _ => key,
+        }
+        .to_string(),
+    )
+}
+
+fn readable_empty_message(key: &str) -> Option<&'static str> {
+    match key {
+        "session.projection.plan.empty.tasks" => Some("No tasks recorded."),
+        "session.projection.plan.empty.risks" => Some("No risks recorded."),
+        "session.projection.plan.empty.reviewCheckpoints" => {
+            Some("No review checkpoints recorded.")
+        }
+        "session.projection.review.empty.changedFiles" => Some("No changed files recorded."),
+        "session.projection.review.empty.generatedArtifacts" => {
+            Some("ReviewFacts did not record generated artifacts.")
+        }
+        "session.projection.review.empty.pathDiagnostics" => {
+            Some("No path normalization diagnostics were recorded.")
+        }
+        "session.projection.review.empty.gitChanges" => Some("No Git change facts are available."),
+        "session.projection.review.empty.auditDetails" => Some("No audit details are available."),
+        "session.projection.review.empty.validation" => {
+            Some("No validation guidance was recorded.")
+        }
+        _ => None,
+    }
+}
+
 fn find_pending_session_decision(
     timeline: &Value,
     requested_kind: &str,
     run_filter: Option<&str>,
 ) -> Option<PendingSessionDecision> {
-    let events = timeline_events(timeline);
-    for event in events.iter().rev() {
-        let Some(kind) = event_kind(event) else {
-            continue;
-        };
-        let pending = match kind {
-            "plan_card" | "plan_review" if requested_kind == "plan" => {
-                pending_plan_from_event(event, &events)
-            }
-            "review_summary" if requested_kind == "review" => {
-                pending_review_from_event(event, &events)
-            }
-            "requirement_confirmation" if requested_kind == "requirement" => {
-                pending_requirement_from_event(event, &events)
-            }
-            _ => None,
-        };
-        if let Some(pending) = pending {
-            if run_filter.is_none_or(|run_id| pending.run_id == run_id) {
-                return Some(pending);
-            }
-        }
-    }
-    None
-}
-
-fn pending_plan_from_event(event: &Value, events: &[&Value]) -> Option<PendingSessionDecision> {
-    if payload_bool(event, "confirmable") != Some(true) {
+    let pending = timeline_payload(timeline)
+        .get("interactionProjection")?
+        .get("pending")?;
+    let kind = pending.get("kind").and_then(Value::as_str)?;
+    if kind != requested_kind {
         return None;
     }
-    let run_id = payload_string(event, "runId")?.to_string();
-    let plan_id = payload_string(event, "planId")?.to_string();
-    if has_terminal_plan_decision(events, &run_id, &plan_id) {
+    let run_id = pending.get("runId").and_then(Value::as_str)?.to_string();
+    if run_filter.is_some_and(|expected| expected != run_id) {
         return None;
     }
-    Some(PendingSessionDecision {
-        run_id,
-        target_id: Some(plan_id),
-    })
-}
-
-fn pending_review_from_event(event: &Value, events: &[&Value]) -> Option<PendingSessionDecision> {
-    if payload_bool(event, "confirmable") == Some(false) {
-        return None;
+    let target_id = match kind {
+        "plan" => pending.get("planId"),
+        "review" => pending.get("reviewId"),
+        "requirement" => pending.get("requirementId"),
+        _ => None,
     }
-    if payload_string(event, "status") != Some("waitingUserReview") {
-        return None;
-    }
-    let run_id = payload_string(event, "runId")?.to_string();
-    let review_id = payload_string(event, "reviewId");
-    let source_plan_id = payload_string(event, "sourcePlanId");
-    if has_terminal_review_decision(events, &run_id, review_id, source_plan_id) {
-        return None;
-    }
-    Some(PendingSessionDecision {
-        run_id,
-        target_id: review_id.or(source_plan_id).map(ToOwned::to_owned),
-    })
-}
-
-fn pending_requirement_from_event(
-    event: &Value,
-    events: &[&Value],
-) -> Option<PendingSessionDecision> {
-    if payload_bool(event, "confirmable") != Some(true) {
-        return None;
-    }
-    if payload_string(event, "status") != Some("waitingUserConfirmation") {
-        return None;
-    }
-    let run_id = payload_string(event, "runId")?.to_string();
-    let requirement_id = payload_string(event, "requirementId")?.to_string();
-    if has_terminal_requirement_decision(events, &run_id, &requirement_id) {
-        return None;
-    }
-    Some(PendingSessionDecision {
-        run_id,
-        target_id: Some(requirement_id),
-    })
-}
-
-fn timeline_events(timeline: &Value) -> Vec<&Value> {
-    let mut events = Vec::new();
-    if let Some(top_level_events) = timeline.get("events").and_then(Value::as_array) {
-        events.extend(top_level_events);
-    }
-    let Some(turns) = timeline.get("turns").and_then(Value::as_array) else {
-        return events;
-    };
-    for turn in turns {
-        if let Some(turn_events) = turn.get("events").and_then(Value::as_array) {
-            events.extend(turn_events);
-        }
-        let Some(blocks) = turn.get("blocks").and_then(Value::as_array) else {
-            continue;
-        };
-        for block in blocks {
-            if let Some(block_events) = block.get("events").and_then(Value::as_array) {
-                events.extend(block_events);
-            }
-        }
-    }
-    events
-}
-
-fn has_terminal_plan_decision(events: &[&Value], run_id: &str, plan_id: &str) -> bool {
-    events.iter().any(|event| {
-        event_kind(event) == Some("plan_review")
-            && is_terminal_status(payload_string(event, "status"))
-            && payload_string(event, "runId") == Some(run_id)
-            && payload_string(event, "planId") == Some(plan_id)
-    })
-}
-
-fn has_terminal_review_decision(
-    events: &[&Value],
-    run_id: &str,
-    review_id: Option<&str>,
-    source_plan_id: Option<&str>,
-) -> bool {
-    events.iter().any(|event| {
-        if event_kind(event) != Some("review_summary")
-            || !is_terminal_status(payload_string(event, "status"))
-            || payload_string(event, "runId") != Some(run_id)
-        {
-            return false;
-        }
-        match (review_id, source_plan_id) {
-            (Some(id), _) => payload_string(event, "reviewId") == Some(id),
-            (None, Some(id)) => payload_string(event, "sourcePlanId") == Some(id),
-            (None, None) => true,
-        }
-    })
-}
-
-fn has_terminal_requirement_decision(
-    events: &[&Value],
-    run_id: &str,
-    requirement_id: &str,
-) -> bool {
-    events.iter().any(|event| {
-        event_kind(event) == Some("requirement_decision")
-            && is_terminal_status(payload_string(event, "status"))
-            && payload_string(event, "runId") == Some(run_id)
-            && payload_string(event, "requirementId") == Some(requirement_id)
-    })
-}
-
-fn is_terminal_status(status: Option<&str>) -> bool {
-    matches!(
-        status,
-        Some("accepted" | "rejected" | "needsRevision" | "cancelled" | "failed")
-    )
-}
-
-fn event_kind(event: &Value) -> Option<&str> {
-    event.get("kind").and_then(Value::as_str)
-}
-
-fn event_payload(event: &Value) -> Option<&serde_json::Map<String, Value>> {
-    event.get("payload").and_then(Value::as_object)
-}
-
-fn payload_string<'a>(event: &'a Value, key: &str) -> Option<&'a str> {
-    event_payload(event)?
-        .get(key)
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-}
-
-fn payload_bool(event: &Value, key: &str) -> Option<bool> {
-    event_payload(event)?.get(key).and_then(Value::as_bool)
+    .and_then(Value::as_str)
+    .map(ToOwned::to_owned);
+    Some(PendingSessionDecision { run_id, target_id })
 }
 
 fn extract_final_text(timeline: &Value) -> Option<String> {
@@ -1348,8 +1446,101 @@ fn extract_final_text(timeline: &Value) -> Option<String> {
     None
 }
 
+fn extract_plain_text(timeline: &Value) -> Option<String> {
+    extract_final_text(timeline).or_else(|| extract_pending_decision_text(timeline))
+}
+
+fn extract_pending_decision_text(timeline: &Value) -> Option<String> {
+    let timeline = timeline_payload(timeline);
+    let pending_value = timeline.get("interactionProjection")?.get("pending")?;
+    let decision_kind = pending_value.get("kind").and_then(Value::as_str)?;
+    let pending = find_pending_session_decision(timeline, decision_kind, None)?;
+    let heading = match decision_kind {
+        "plan" => "Pending plan decision",
+        "review" => "Pending review decision",
+        "requirement" => "Pending requirement decision",
+        "permission" => "Pending permission decision",
+        _ => "Pending decision",
+    };
+    let block = pending_value
+        .get("blockId")
+        .and_then(Value::as_str)
+        .and_then(|block_id| timeline_block_by_id(timeline, block_id));
+    Some(render_pending_decision_text(
+        timeline.get("sessionId").and_then(Value::as_str),
+        decision_kind,
+        heading,
+        pending_value,
+        block,
+        pending,
+    ))
+}
+
+fn render_pending_decision_text(
+    session_id: Option<&str>,
+    decision_kind: &str,
+    heading: &str,
+    pending_value: &Value,
+    block: Option<&Value>,
+    pending: PendingSessionDecision,
+) -> String {
+    let mut lines = vec![heading.to_string()];
+    if let Some(title) = pending_value
+        .get("title")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        lines.push(title.to_string());
+    }
+    if let Some(readable) = block.and_then(|item| item.get("structuredProjection")) {
+        let rendered = render_readable_projection(readable);
+        if !rendered.trim().is_empty() {
+            lines.push(rendered);
+        }
+    } else if let Some(summary) = pending_value
+        .get("summary")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        lines.push(summary.to_string());
+    }
+    lines.push(format!(
+        "Decision target: {decision_kind} run={} target={}",
+        pending.run_id,
+        pending.target_id.as_deref().unwrap_or("-")
+    ));
+    if let Some(session_id) = session_id {
+        lines.push(format!(
+            "Accept: DeepCode-CLI --session {session_id} decision {decision_kind} accept"
+        ));
+        lines.push(format!(
+            "Revise: DeepCode-CLI --session {session_id} decision {decision_kind} revise <guidance>"
+        ));
+    }
+    lines.join("\n")
+}
+
+fn timeline_block_by_id<'a>(timeline: &'a Value, block_id: &str) -> Option<&'a Value> {
+    for turn in timeline.get("turns")?.as_array()? {
+        for block in turn.get("blocks")?.as_array()? {
+            if block.get("id").and_then(Value::as_str) == Some(block_id) {
+                return Some(block);
+            }
+        }
+    }
+    None
+}
+
+fn normalize_render_text(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn session_id(session: &Value) -> Option<&str> {
     session.get("id").and_then(Value::as_str)
+}
+
+fn timeline_payload(timeline: &Value) -> &Value {
+    timeline.get("data").unwrap_or(timeline)
 }
 
 fn session_title(session: &Value) -> &str {
@@ -1457,30 +1648,85 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn timeline(events: Vec<Value>) -> Value {
-        json!({
-            "turns": [
-                {
-                    "blocks": [
-                        { "events": events }
-                    ]
+    fn timeline_with_pending(kind: &str, run_id: &str, target_key: &str, target_id: &str) -> Value {
+        let mut timeline = json!({
+            "sessionId": "session-test",
+            "interactionProjection": {
+                "pending": {
+                    "kind": kind,
+                    "runId": run_id
                 }
-            ]
-        })
+            },
+            "turns": []
+        });
+        timeline["interactionProjection"]["pending"][target_key] = json!(target_id);
+        timeline
+    }
+
+    fn canonical_pending_fixture(
+        raw: &Value,
+        session_id: &str,
+        kind: &str,
+        run_id: &str,
+        target_key: &str,
+        target_id: &str,
+    ) -> Value {
+        let readable_key = if kind == "review" {
+            "readableReview"
+        } else {
+            "readablePlan"
+        };
+        let readable = timeline_payload(raw)
+            .get("turns")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .flat_map(|turn| {
+                turn.get("blocks")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+            })
+            .flat_map(|block| {
+                block
+                    .get("events")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+            })
+            .find_map(|event| {
+                event
+                    .get("payload")
+                    .and_then(|payload| payload.get(readable_key))
+            })
+            .cloned()
+            .unwrap_or_else(|| json!({ "sections": [] }));
+        let mut structured = readable;
+        structured["kind"] = json!(kind);
+        let mut timeline = json!({
+            "sessionId": session_id,
+            "interactionProjection": {
+                "pending": {
+                    "kind": kind,
+                    "runId": run_id,
+                    "blockId": "pending-block"
+                }
+            },
+            "turns": [{
+                "blocks": [{
+                    "id": "pending-block",
+                    "narrativeKind": kind,
+                    "structuredProjection": structured
+                }]
+            }]
+        });
+        timeline["interactionProjection"]["pending"][target_key] = json!(target_id);
+        timeline
     }
 
     #[test]
     fn selects_latest_pending_plan_from_projection_events() {
-        let timeline = timeline(vec![
-            json!({
-                "kind": "plan_card",
-                "payload": { "confirmable": true, "runId": "run-a", "planId": "plan-a" }
-            }),
-            json!({
-                "kind": "plan_card",
-                "payload": { "confirmable": true, "runId": "run-b", "planId": "plan-b" }
-            }),
-        ]);
+        let timeline = timeline_with_pending("plan", "run-b", "planId", "plan-b");
 
         let pending = find_pending_session_decision(&timeline, "plan", None).unwrap();
         assert_eq!(
@@ -1494,16 +1740,7 @@ mod tests {
 
     #[test]
     fn selects_pending_plan_matching_explicit_run_filter() {
-        let timeline = timeline(vec![
-            json!({
-                "kind": "plan_card",
-                "payload": { "confirmable": true, "runId": "run-a", "planId": "plan-a" }
-            }),
-            json!({
-                "kind": "plan_card",
-                "payload": { "confirmable": true, "runId": "run-b", "planId": "plan-b" }
-            }),
-        ]);
+        let timeline = timeline_with_pending("plan", "run-a", "planId", "plan-a");
 
         let pending = find_pending_session_decision(&timeline, "plan", Some("run-a")).unwrap();
         assert_eq!(
@@ -1517,31 +1754,15 @@ mod tests {
 
     #[test]
     fn ignores_plan_consumed_by_terminal_plan_review() {
-        let timeline = timeline(vec![
-            json!({
-                "kind": "plan_card",
-                "payload": { "confirmable": true, "runId": "run-a", "planId": "plan-a" }
-            }),
-            json!({
-                "kind": "plan_review",
-                "payload": { "status": "accepted", "runId": "run-a", "planId": "plan-a" }
-            }),
-        ]);
+        let timeline = json!({ "sessionId": "session-test", "turns": [] });
 
         assert!(find_pending_session_decision(&timeline, "plan", None).is_none());
     }
 
     #[test]
     fn selects_pending_requirement_confirmation() {
-        let timeline = timeline(vec![json!({
-            "kind": "requirement_confirmation",
-            "payload": {
-                "confirmable": true,
-                "status": "waitingUserConfirmation",
-                "runId": "run-a",
-                "requirementId": "requirement-a"
-            }
-        })]);
+        let timeline =
+            timeline_with_pending("requirement", "run-a", "requirementId", "requirement-a");
 
         let pending = find_pending_session_decision(&timeline, "requirement", None).unwrap();
         assert_eq!(
@@ -1555,15 +1776,7 @@ mod tests {
 
     #[test]
     fn selects_pending_review_summary() {
-        let timeline = timeline(vec![json!({
-            "kind": "review_summary",
-            "payload": {
-                "status": "waitingUserReview",
-                "runId": "run-a",
-                "reviewId": "review-a",
-                "sourcePlanId": "plan-a"
-            }
-        })]);
+        let timeline = timeline_with_pending("review", "run-a", "reviewId", "review-a");
 
         let pending = find_pending_session_decision(&timeline, "review", None).unwrap();
         assert_eq!(
@@ -1573,5 +1786,294 @@ mod tests {
                 target_id: Some("review-a".to_string()),
             }
         );
+    }
+
+    #[test]
+    fn selects_confirmable_review_summary_without_status() {
+        let timeline = timeline_with_pending("review", "run-a", "reviewId", "review-a");
+
+        let pending = find_pending_session_decision(&timeline, "review", None).unwrap();
+        assert_eq!(
+            pending,
+            PendingSessionDecision {
+                run_id: "run-a".to_string(),
+                target_id: Some("review-a".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn print_text_uses_pending_plan_projection() {
+        let timeline = json!({
+            "sessionId": "session-print",
+            "turns": [
+                {
+                    "blocks": [
+                        {
+                            "narrativeKind": "thinking",
+                            "title": "Thinking",
+                            "bodyMarkdown": "internal reasoning should stay out of compact decision output"
+                        },
+                        {
+                            "events": [
+                                {
+                                    "kind": "plan_card",
+                                    "payload": {
+                                        "confirmable": true,
+                                        "runId": "run-print",
+                                        "planId": "plan-print",
+                                        "title": "Prepare generic work",
+                                        "readablePlan": {
+                                            "summary": "Plan summary text",
+                                            "sections": [
+                                                {
+                                                    "sectionId": "tasks",
+                                                    "titleKey": "session.projection.plan.section.tasks",
+                                                    "items": [
+                                                {
+                                                    "kind": "task",
+                                                    "text": "Write generic module",
+                                                    "targetRefs": ["src/generic.ts"]
+                                                },
+                                                {
+                                                    "kind": "fact",
+                                                    "messageKey": "session.projection.plan.boundary.notExecution"
+                                                }
+                                            ]
+                                        }
+                                            ]
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ]
+        });
+        let timeline = canonical_pending_fixture(
+            &timeline,
+            "session-print",
+            "plan",
+            "run-print",
+            "planId",
+            "plan-print",
+        );
+
+        let text = extract_plain_text(&timeline).expect("pending plan text");
+        assert!(text.contains("Pending plan decision"));
+        assert!(text.contains("Plan summary text"));
+        assert!(text.contains("## Tasks"));
+        assert!(text.contains("Write generic module"));
+        assert!(text.contains("This is a plan, not an execution result."));
+        assert!(text.contains("Decision target: plan run=run-print target=plan-print"));
+        assert!(text.contains("DeepCode-CLI --session session-print decision plan accept"));
+        assert!(!text.contains("session.projection.plan.section.tasks"));
+    }
+
+    #[test]
+    fn print_text_deduplicates_structured_plan_summary() {
+        let timeline = json!({
+            "sessionId": "session-dedupe",
+            "turns": [
+                {
+                    "blocks": [
+                        {
+                            "events": [
+                                {
+                                    "kind": "plan_card",
+                                    "payload": {
+                                        "confirmable": true,
+                                        "runId": "run-dedupe",
+                                        "planId": "plan-dedupe",
+                                        "summary": "Shared summary",
+                                        "readablePlan": {
+                                            "summary": "Shared summary",
+                                            "sections": [
+                                                {
+                                                    "sectionId": "summary",
+                                                    "titleKey": "session.projection.plan.section.summary",
+                                                    "items": [
+                                                        {
+                                                            "kind": "text",
+                                                            "text": "Shared summary"
+                                                        }
+                                                    ]
+                                                },
+                                                {
+                                                    "sectionId": "tasks",
+                                                    "titleKey": "session.projection.plan.section.tasks",
+                                                    "items": [
+                                                        {
+                                                            "kind": "task",
+                                                            "text": "Complete generic step"
+                                                        }
+                                                    ]
+                                                }
+                                            ]
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ]
+        });
+        let timeline = canonical_pending_fixture(
+            &timeline,
+            "session-dedupe",
+            "plan",
+            "run-dedupe",
+            "planId",
+            "plan-dedupe",
+        );
+
+        let text = extract_plain_text(&timeline).expect("pending plan text");
+        assert_eq!(text.matches("Shared summary").count(), 1);
+        assert!(text.contains("## Summary"));
+        assert!(text.contains("## Tasks"));
+        assert!(text.contains("Complete generic step"));
+        assert!(text.contains("Decision target: plan run=run-dedupe target=plan-dedupe"));
+    }
+
+    #[test]
+    fn print_text_renders_pending_review_projection_without_raw_keys() {
+        let timeline = json!({
+            "sessionId": "session-review",
+            "turns": [
+                {
+                    "blocks": [
+                        {
+                            "events": [
+                                {
+                                    "kind": "review_summary",
+                                    "payload": {
+                                        "confirmable": true,
+                                        "status": "waitingUserReview",
+                                        "runId": "run-review",
+                                        "reviewId": "review-1",
+                                        "sourcePlanId": "plan-1",
+                                        "readableReview": {
+                                            "summaryKey": "review.summary.waitingUserReview",
+                                            "sections": [
+                                                {
+                                                    "sectionId": "executionResult",
+                                                    "titleKey": "session.projection.review.section.executionResult",
+                                                    "items": [
+                                                        {
+                                                            "kind": "fact",
+                                                            "messageKey": "session.projection.review.count.workUnitsCompleted",
+                                                            "messageArgs": { "count": "2" }
+                                                        }
+                                                    ]
+                                                },
+                                                {
+                                                    "sectionId": "changedFiles",
+                                                    "titleKey": "session.projection.review.section.changedFiles",
+                                                    "items": [
+                                                        {
+                                                            "kind": "target",
+                                                            "messageKey": "review.changedFile",
+                                                            "messageArgs": {
+                                                                "path": "src/module.txt",
+                                                                "operation": "write",
+                                                                "status": "completed"
+                                                            },
+                                                            "targetRefs": ["src/module.txt"]
+                                                        },
+                                                        {
+                                                            "kind": "target",
+                                                            "messageKey": "review.changedFile",
+                                                            "messageArgs": {
+                                                                "path": "src/module.txt",
+                                                                "operation": "write",
+                                                                "status": "completed"
+                                                            },
+                                                            "targetRefs": ["src/module.txt"]
+                                                        }
+                                                    ]
+                                                }
+                                            ]
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ]
+        });
+        let timeline = canonical_pending_fixture(
+            &timeline,
+            "session-review",
+            "review",
+            "run-review",
+            "reviewId",
+            "review-1",
+        );
+
+        let text = extract_plain_text(&timeline).expect("pending review text");
+        assert!(text.contains("Pending review decision"));
+        assert!(text.contains("The current batch has executed."));
+        assert!(text.contains("## Execution result"));
+        assert!(text.contains("WorkUnits completed: 2"));
+        assert!(text.contains("## Files changed in this batch"));
+        assert_eq!(
+            text.matches("src/module.txt operation=write status=completed")
+                .count(),
+            1
+        );
+        assert!(!text.contains("review.summary.waitingUserReview"));
+        assert!(!text.contains("session.projection.review.count.workUnitsCompleted"));
+        assert!(!text.contains("internal reasoning should stay out"));
+        assert!(text.contains("Decision target: review run=run-review target=review-1"));
+        assert!(text.contains("DeepCode-CLI --session session-review decision review accept"));
+    }
+
+    #[test]
+    fn print_text_uses_pending_plan_projection_from_api_wrapper() {
+        let timeline = json!({
+            "ok": true,
+            "data": {
+                "sessionId": "session-print-wrapper",
+                "turns": [
+                    {
+                        "blocks": [
+                            {
+                                "events": [
+                                    {
+                                        "kind": "plan_card",
+                                        "payload": {
+                                            "confirmable": true,
+                                            "runId": "run-wrapper",
+                                            "planId": "plan-wrapper",
+                                            "readablePlan": {
+                                                "summary": "Wrapped plan summary"
+                                            }
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                ]
+            }
+        });
+        let canonical = canonical_pending_fixture(
+            &timeline,
+            "session-print-wrapper",
+            "plan",
+            "run-wrapper",
+            "planId",
+            "plan-wrapper",
+        );
+        let timeline = json!({ "ok": true, "data": canonical });
+
+        let text = extract_plain_text(&timeline).expect("pending plan text");
+        assert!(text.contains("Pending plan decision"));
+        assert!(text.contains("Wrapped plan summary"));
+        assert!(text.contains("Decision target: plan run=run-wrapper target=plan-wrapper"));
+        assert!(text.contains("DeepCode-CLI --session session-print-wrapper decision plan accept"));
     }
 }

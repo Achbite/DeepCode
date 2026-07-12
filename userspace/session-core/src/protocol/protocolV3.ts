@@ -9,6 +9,7 @@ const V3_KINDS = new Set([
   'decisionRequest',
   'taskPlan',
   'actionBundle',
+  'taskOutcome',
   'diagnostic',
 ]);
 
@@ -30,7 +31,10 @@ export function parseProposalEnvelope(input: ParseProposalEnvelopeInput): Propos
       `Agent Protocol v3.schemaVersion must be ${AGENT_PROTOCOL_V3_SCHEMA_VERSION}`
     );
   }
-  const kind = requireString(envelope, 'kind', 'Agent Protocol v3');
+  const kind = optionalString(envelope, 'kind') ?? inferProposalKind(envelope);
+  if (!kind) {
+    throw new AgentPlanParseError('missing_string', 'Agent Protocol v3.kind must be a non-empty string');
+  }
   if (!V3_KINDS.has(kind)) {
     throw new AgentPlanParseError('unsupported_protocol_kind', `Agent Protocol v3.kind is unsupported: ${kind}`);
   }
@@ -50,13 +54,53 @@ export function parseProposalEnvelope(input: ParseProposalEnvelopeInput): Propos
   };
 }
 
+function inferProposalKind(envelope: Record<string, unknown>): string | undefined {
+  const candidates = [
+    'answer',
+    'resourceRequest',
+    'decisionRequest',
+    'taskPlan',
+    'actionBundle',
+    'taskOutcome',
+    'diagnostic',
+  ].filter((key) => envelope[key] !== undefined);
+  return candidates.length === 1 ? candidates[0] : undefined;
+}
+
 function proposalPayload(envelope: Record<string, unknown>, kind: string, proposalId: string): unknown {
   if (kind === 'answer') return requireObject(envelope.answer, 'Agent Protocol v3.answer');
   if (kind === 'resourceRequest') return normalizeResourceRequest(requireObject(envelope.resourceRequest, 'Agent Protocol v3.resourceRequest'));
   if (kind === 'decisionRequest') return normalizeDecisionRequest(decisionRequestPayload(envelope));
   if (kind === 'taskPlan') return normalizeTaskPlan(requireObject(envelope.taskPlan, 'Agent Protocol v3.taskPlan'));
+  if (kind === 'taskOutcome') return normalizeTaskOutcome(requireObject(envelope.taskOutcome, 'Agent Protocol v3.taskOutcome'));
   if (kind === 'diagnostic') return normalizeDiagnostic(requireObject(envelope.diagnostic, 'Agent Protocol v3.diagnostic'));
   return normalizeActionBundlePayload(envelope, proposalId);
+}
+
+function normalizeTaskOutcome(value: Record<string, unknown>): Record<string, unknown> {
+  const status = optionalString(value, 'status') ?? 'modelJudgedSufficient';
+  if (!['modelJudgedSufficient', 'blocked', 'failed'].includes(status)) {
+    throw new AgentPlanParseError(
+      'invalid_task_outcome',
+      'Agent Protocol v3.taskOutcome.status must be "modelJudgedSufficient", "blocked", or "failed".'
+    );
+  }
+  const reason = optionalString(value, 'reason') ?? optionalString(value, 'summary') ?? optionalString(value, 'details');
+  if (!reason) {
+    throw new AgentPlanParseError(
+      'invalid_task_outcome',
+      'Agent Protocol v3.taskOutcome.reason must be a non-empty string.'
+    );
+  }
+  return {
+    ...value,
+    version: optionalString(value, 'version') ?? '1',
+    id: optionalString(value, 'id') ?? 'task-outcome',
+    taskId: optionalString(value, 'taskId'),
+    status,
+    reason,
+    evidenceRefs: normalizeStringList(value.evidenceRefs),
+  };
 }
 
 function decisionRequestPayload(envelope: Record<string, unknown>): Record<string, unknown> {
@@ -147,16 +191,41 @@ function normalizeActionBundlePayload(envelope: Record<string, unknown>, proposa
   }
   const actionBundle = requireObject(payload.actionBundle, 'Agent Protocol v3.actionBundle');
   const userPlan = optionalString(payload, 'userPlanMarkdown') ?? optionalString(payload, 'userPlan');
+  const codeBlockTargetHints = codeBlockTargetHintsFromActionBundle(actionBundle);
   return {
     userPlan,
-    codeBlocks: normalizeCodeBlocks(payload.codeBlocks),
+    codeBlocks: normalizeCodeBlocks(payload.codeBlocks, codeBlockTargetHints),
     actionBundle: normalizeActionBundle(actionBundle, proposalId, userPlan),
     expectedValidation: optionalString(payload, 'expectedValidation'),
     reviewGuide: optionalString(payload, 'reviewGuide'),
   };
 }
 
-function normalizeCodeBlocks(value: unknown): Array<Record<string, unknown>> {
+function codeBlockTargetHintsFromActionBundle(value: Record<string, unknown>): Map<string, string> {
+  const hints = new Map<string, string>();
+  const ambiguous = new Set<string>();
+  if (!Array.isArray(value.actions)) return hints;
+  for (const item of value.actions) {
+    const record = optionalObjectRecord(item);
+    const args = optionalObjectRecord(record?.args);
+    if (!args) continue;
+    const targetPath = optionalString(args, 'path') ?? optionalString(args, 'targetPath');
+    if (!targetPath) continue;
+    for (const blockRef of [optionalString(args, 'sourceBlockId'), optionalString(args, 'replacementBlockId')]) {
+      if (!blockRef || ambiguous.has(blockRef)) continue;
+      const existing = hints.get(blockRef);
+      if (existing && existing !== targetPath) {
+        hints.delete(blockRef);
+        ambiguous.add(blockRef);
+        continue;
+      }
+      hints.set(blockRef, targetPath);
+    }
+  }
+  return hints;
+}
+
+function normalizeCodeBlocks(value: unknown, targetHints: Map<string, string> = new Map()): Array<Record<string, unknown>> {
   if (!Array.isArray(value)) return [];
   return value.map((item, index) => {
     const record = requireObject(item, `Agent Protocol v3.codeBlocks[${index}]`);
@@ -169,8 +238,10 @@ function normalizeCodeBlocks(value: unknown): Array<Record<string, unknown>> {
       }
     }
     const id = optionalString(record, 'id') ?? optionalString(record, 'blockId') ?? `code-block-${index + 1}`;
-    const path = optionalString(record, 'path') ?? optionalString(record, 'targetPath') ?? '';
-    const contentLines = optionalStringArray(record, 'contentLines');
+    const blockId = optionalString(record, 'blockId') ?? id;
+    // Code block targets are redundant with fs.write/fs.patch action args; keep the parser tolerant when the block ref is unambiguous.
+    const path = optionalString(record, 'path') ?? optionalString(record, 'targetPath') ?? targetHints.get(blockId) ?? targetHints.get(id) ?? '';
+    const contentLines = optionalContentLines(record, 'contentLines');
     const legacyContent = optionalString(record, 'content');
     if (!contentLines.length && typeof legacyContent === 'string' && (legacyContent.includes('\n') || legacyContent.length > 200)) {
       throw new AgentPlanParseError(
@@ -182,7 +253,7 @@ function normalizeCodeBlocks(value: unknown): Array<Record<string, unknown>> {
     return {
       ...record,
       id,
-      blockId: optionalString(record, 'blockId') ?? id,
+      blockId,
       path,
       targetPath: optionalString(record, 'targetPath') ?? path,
       content,
@@ -432,9 +503,10 @@ function normalizeResourceRequest(value: Record<string, unknown>): Record<string
         ? resourceType
         : undefined
     );
-    const manifestEntryId = optionalString(record, 'manifestEntryId');
-    const path = optionalString(record, 'path');
     const rootId = optionalString(record, 'rootId');
+    const path = optionalString(record, 'path');
+    const rootPathRequest = rootId && typeof record.path === 'string' && record.path.trim() === '';
+    const manifestEntryId = optionalString(record, 'manifestEntryId') ?? (rootPathRequest ? rootId : undefined);
     const query = optionalString(record, 'query');
     const include = optionalStringArray(record, 'include');
     const contextLines = optionalNonNegativeInteger(record, 'contextLines');
@@ -688,6 +760,14 @@ function optionalStringArray(value: Record<string, unknown>, key: string): strin
   const raw = value[key];
   if (!Array.isArray(raw)) return [];
   return raw.filter((item): item is string => typeof item === 'string' && item.trim().length > 0);
+}
+
+function optionalContentLines(value: Record<string, unknown>, key: string): string[] {
+  const raw = value[key];
+  if (typeof raw === 'string') {
+    return raw.length ? raw.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n') : [];
+  }
+  return optionalStringArray(value, key);
 }
 
 function normalizeStringList(value: unknown): string[] {

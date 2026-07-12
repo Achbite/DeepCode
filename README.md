@@ -2,9 +2,11 @@
 
 > Chinese translation: [README.zh-CN.md](README.zh-CN.md)
 
-DeepCode v0.5.23 is a stable local-first AI coding workbench baseline. It keeps Agent session protocol, Kernel tool execution, permission audit, context compression, and Editor/GUI/CLI/TUI shells on one shared backend source of truth. This release stabilizes the Session protocol/parser, accepted-plan execution, file-node orchestration safeguards, generated artifact evidence, and Review preflight checks while preserving the reproducible local build/package flow and clear provider, tool, session, kernel, and UI shell boundaries.
+DeepCode v0.5.30 is a stable local-first AI coding workbench baseline. It keeps Agent session protocol, Kernel tool execution, permission audit, context compression, and Editor/GUI/CLI/TUI shells on one shared backend source of truth. This release stabilizes the Session protocol/parser and accepted-plan execution, makes the canonical Session timeline authoritative across the daemon and UI, drains bridge output concurrently, isolates Docker resources per worktree, and keeps active-checkout packaging deterministic while preserving clear provider, tool, session, kernel, and UI shell boundaries.
 
-Sub-agents remain experimental in v0.5.23. They are disabled by default because the parallel draft orchestration path is not stable enough for the default workflow. Users can still enable sub-agents from Agent settings for targeted experiments; Parent Session remains the only authority that validates drafts and submits Kernel actions.
+The retired sub-agent/DAG execution path has been removed in v0.5.30. Agent settings no longer expose sub-agent runtime controls, and Parent Session is the only orchestration authority that validates provider output and submits Kernel actions. A small number of optional request fields remain inert in Kernel client DTOs for transport compatibility; they do not restore the retired runtime.
+
+Release documentation currently uses the `v0.5.30 stable baseline` label. Some Cargo and package metadata may still report `0.5.24`; that version metadata drift is tracked for a later release metadata pass and does not change the runtime boundary described here.
 
 ## Build And Release Mode
 
@@ -15,6 +17,15 @@ make shell
 bash ./build.sh
 bash ./test.sh
 ```
+
+The default checkout keeps the existing `deepcode-dev` container, shared
+dependency caches, and host port `31246`. Persistent Git worktrees can opt into
+local container isolation by copying `.deepcode-worktree.mk.example` to
+`.deepcode-worktree.mk` and assigning a stable worktree ID plus an unused host
+port. The local file is ignored by Git. Isolated worktrees share the image,
+Cargo registry, and pnpm store, but use separate containers, `target` volumes,
+and `node_modules` volumes. Run `make docker-info` before `make shell` to inspect
+the effective mapping.
 
 The default build target is the complete local distribution flow. Inside the
 container, `bash ./build.sh` builds the shared GUI assets, DeepCode-GUI assets,
@@ -196,11 +207,17 @@ Rules:
 
 The current Kernel-visible tool catalog includes:
 
-- Files and search: `fs.list`, `fs.read`, `fs.diff`, `fs.write`, `fs.delete`, `code.search`
-- Process: `process.exec` (blocked / permission preview in the current release)
-- Web evidence: `web.search`, `web.fetch`
-- Git: `git.status`, `git.diff`, `git.stage`, `git.unstage`, `git.commit`
-- Internal browser: `browser.open`, `browser.reload`, `browser.snapshot`, `browser.inspect`, `browser.click`, `browser.type`, `browser.scroll`
+| Area | Tool ids | Current status |
+| --- | --- | --- |
+| Files and search | `fs.list`, `fs.read`, `fs.diff`, `code.search` | Executable read / search tools |
+| Files and mutation | `fs.write`, `fs.patch`, `fs.delete` | Executable only through Kernel proposal review, permission gate, and audit |
+| Web evidence | `web.search`, `web.fetch` | Executable gated read-only external evidence |
+| Git | `git.status`, `git.diff`, `git.stage`, `git.unstage`, `git.commit` | V1 formal Git range, gated for write operations |
+| Git reserved | `git.push` | Reserved / blocked; not a current executable capability |
+| Process | `shell.propose` | Preview-only command explanation / proposal |
+| Process reserved | `process.exec` | Blocked / permission preview; not a current executable capability |
+| Browser reserved | `browser.open`, `browser.reload`, `browser.snapshot`, `browser.inspect`, `browser.click`, `browser.type`, `browser.scroll` | Registered but blocked / reserved |
+| Provider reserved | `provider.call` | Registered but blocked / reserved; provider transport remains daemon-owned |
 
 High-risk capabilities must go through Kernel PermissionGate and audit. `fs.delete` is visible to the LLM, but it is a high-risk delete capability. If the user denies it, the Agent must not fall back to shell deletion.
 

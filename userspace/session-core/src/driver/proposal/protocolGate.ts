@@ -1,4 +1,4 @@
-import { parseProposalEnvelope } from '../../protocol/protocolV3.js';
+import { AGENT_PROTOCOL_V3_SCHEMA_VERSION, parseProposalEnvelope } from '../../protocol/protocolV3.js';
 import { AgentPlanParseError, type ProposalEnvelope, type ProposalEnvelopeSource } from '../../protocol/types.js';
 
 export interface ProtocolGatePorts {
@@ -44,7 +44,7 @@ export class ProtocolGate {
       return this.parseAndValidateProposal(input);
     } catch (error) {
       const parseError = normalizeParseError(error);
-      if (parseError.code !== 'missing_string' || !parseError.message.includes('schemaVersion')) {
+      if (!isSchemaVersionRepairableError(parseError)) {
         throw error;
       }
       const canonical = this.canonicalizeBareRepairedProposal(input);
@@ -60,13 +60,16 @@ export class ProtocolGate {
     const record = typeof input.raw === 'string'
       ? repairJsonObject(input.raw)
       : objectRecord(input.raw);
-    if (!record || typeof repairString(record.schemaVersion) === 'string') return null;
+    if (!record) return null;
+    const schemaVersion = repairString(record.schemaVersion);
+    if (schemaVersion === AGENT_PROTOCOL_V3_SCHEMA_VERSION) return null;
     const allowedKinds = input.allowedKinds.filter((kind) => [
       'answer',
       'resourceRequest',
       'decisionRequest',
       'taskPlan',
       'actionBundle',
+      'taskOutcome',
       'diagnostic',
     ].includes(kind));
     if (!allowedKinds.length) return null;
@@ -80,7 +83,7 @@ export class ProtocolGate {
     const hasKindPayload = record[payload] !== undefined;
     const canonical: Record<string, unknown> = {
       ...record,
-      schemaVersion: 'deepcode.agent.protocol.v3',
+      schemaVersion: AGENT_PROTOCOL_V3_SCHEMA_VERSION,
       kind,
       runId: repairString(record.runId) ?? input.runId,
       sessionId: repairString(record.sessionId) ?? input.sessionId,
@@ -94,10 +97,10 @@ export class ProtocolGate {
 
   repairAllowedKinds(input: ProtocolGateAllowedKindsInput): string[] {
     if (input.errorCode === 'action_bundle_budget_exceeded') {
-      return ['actionBundle', 'resourceRequest', 'decisionRequest', 'diagnostic'];
+      return ['actionBundle', 'resourceRequest', 'decisionRequest', 'taskOutcome', 'diagnostic'];
     }
     return input.acceptedPlanActive
-      ? ['actionBundle', 'resourceRequest', 'decisionRequest', 'diagnostic']
+      ? ['actionBundle', 'resourceRequest', 'decisionRequest', 'taskOutcome', 'diagnostic']
       : ['answer', 'resourceRequest', 'decisionRequest', 'taskPlan', 'diagnostic'];
   }
 }
@@ -119,6 +122,7 @@ function bareRepairShapeMatches(kind: string, record: Record<string, unknown>): 
   if (kind === 'answer') return typeof repairString(record.content) === 'string' || typeof repairString(record.markdown) === 'string';
   if (kind === 'diagnostic') return typeof repairString(record.summary) === 'string' && typeof repairString(record.severity) === 'string';
   if (kind === 'actionBundle') return Array.isArray(record.actions) || record.actionBundle !== undefined;
+  if (kind === 'taskOutcome') return typeof repairString(record.reason) === 'string' || typeof repairString(record.summary) === 'string';
   return false;
 }
 
@@ -129,6 +133,7 @@ function kindPayloadField(kind: string): string | undefined {
   if (kind === 'taskPlan') return 'taskPlan';
   if (kind === 'diagnostic') return 'diagnostic';
   if (kind === 'actionBundle') return 'actionBundle';
+  if (kind === 'taskOutcome') return 'taskOutcome';
   return undefined;
 }
 
@@ -197,6 +202,11 @@ function normalizeParseError(error: unknown): { code: string; message: string } 
   if (error instanceof AgentPlanParseError) return { code: error.code, message: error.message };
   if (error instanceof Error) return { code: 'parse_failed', message: error.message };
   return { code: 'parse_failed', message: String(error) };
+}
+
+function isSchemaVersionRepairableError(error: { code: string; message: string }): boolean {
+  if (!error.message.includes('schemaVersion')) return false;
+  return error.code === 'missing_string' || error.code === 'unsupported_protocol_schema';
 }
 
 function repairString(value: unknown): string | undefined {

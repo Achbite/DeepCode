@@ -5,6 +5,8 @@ import type {
   ProviderRepairMessageState,
 } from '../../prompt/ProviderRepairMessageBuilder.js';
 import type { PromptEnvelope } from '../../prompt/types.js';
+import type { ContextFrameBuilder } from './contextFrameBuilder.js';
+import { prepareProviderSideCallMessagesContextAdmission } from './providerSideCallContextAdmission.js';
 
 export interface ResourceRequestRepairCoordinatorState {
   sessionId: string;
@@ -19,7 +21,9 @@ export interface ResourceRequestRepairParseError {
 
 export interface ResourceRequestRepairCoordinatorInput<State extends ResourceRequestRepairCoordinatorState> {
   repairMessageBuilder: ProviderRepairMessageBuilder;
+  contextFrameBuilder: ContextFrameBuilder;
   repairState(state: State): ProviderRepairMessageState;
+  createId(prefix: string): string;
   parseError(error: unknown): ResourceRequestRepairParseError;
   createError(code: string, message: string): Error;
   parseRepairedProposal(input: {
@@ -43,20 +47,31 @@ export class ResourceRequestRepairCoordinator<
   constructor(private readonly input: ResourceRequestRepairCoordinatorInput<State>) {}
 
   async repair(runInput: ResourceRequestRepairRunInput<State>): Promise<ProposalEnvelope> {
-    const raw = await runInput.runRepair(
-      'resource_request_repair',
-      this.input.repairMessageBuilder.resourceRequestRepairMessages(
-        runInput.prompt,
-        this.input.repairState(runInput.state),
-        runInput.proposal,
-        runInput.resolutionDiagnostic
-      )
+    const allowedKinds = ['resourceRequest', 'decisionRequest', 'diagnostic'];
+    const messages = this.input.repairMessageBuilder.resourceRequestRepairMessages(
+      runInput.prompt,
+      this.input.repairState(runInput.state),
+      runInput.proposal,
+      runInput.resolutionDiagnostic
     );
+    const admission = prepareProviderSideCallMessagesContextAdmission({
+      state: runInput.state,
+      prompt: runInput.prompt,
+      contextFrameBuilder: this.input.contextFrameBuilder,
+      contractId: this.input.createId('provider-turn-contract-resource-request-repair'),
+      turnMode: 'protocolRepair',
+      allowedKinds,
+      messages,
+      repairPolicy: 'sameKindOnly',
+      projectionVisibility: 'developerOnly',
+      nextActionInstruction: `Repair the resourceRequest proposal only. Return one of: ${allowedKinds.join(', ')}.`,
+    });
+    const raw = await runInput.runRepair('resource_request_repair', admission.messages);
     try {
       return this.input.parseRepairedProposal({
         raw,
         state: runInput.state,
-        allowedKinds: ['resourceRequest', 'decisionRequest', 'diagnostic'],
+        allowedKinds,
       });
     } catch (error) {
       throw this.input.createError(

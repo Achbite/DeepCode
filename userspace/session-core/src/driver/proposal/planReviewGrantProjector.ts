@@ -647,8 +647,9 @@ function isAbsolutePath(value: string): boolean {
   return /^\/|^[a-zA-Z]:[\\/]/.test(value);
 }
 
+// Execution targets preserve path casing; comparison only removes slash noise.
 function comparablePath(value: string): string {
-  return normalizeSlashes(value).replace(/\/+$/g, '').toLowerCase();
+  return normalizeSlashes(value).replace(/\/+$/g, '');
 }
 
 function basename(value: string): string {

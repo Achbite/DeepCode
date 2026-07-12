@@ -258,6 +258,15 @@ export interface ImplementationPlanDraft {
   reviewCheckpoints: string[];
 }
 
+export interface TaskOutcomeDraft {
+  version: '1';
+  id: string;
+  taskId?: string;
+  status: 'modelJudgedSufficient' | 'blocked' | 'failed';
+  reason: string;
+  evidenceRefs: string[];
+}
+
 export interface AgentPlanParts {
   userPlan: string;
   actionBundle: ActionBundleDraft;
@@ -295,6 +304,7 @@ export type ProposalEnvelopeKind =
   | 'taskPlan'
   | 'implementationPlan'
   | 'actionBundle'
+  | 'taskOutcome'
   | 'diagnostic';
 
 export interface ProposalEnvelope {

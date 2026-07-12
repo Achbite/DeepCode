@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect } from 'react';
 import { getLlmProfiles } from '../../services/runtimeAdapter';
 import { useAgentSessionStore } from '../../state/agentSessionStore';
 import { useSettingsStore } from '../../state/settingsStore';
@@ -10,12 +10,11 @@ import AgentTaskList from './AgentTaskList';
 import MessageList from './MessageList';
 import PermissionRequestBubble from './PermissionRequestBubble';
 import { findPendingComposerDecisionFromProjection } from './pendingDecision';
-import { buildUiTimelineProjection } from '../../utils/uiTimelineProjection';
+import { timelineOrEmpty } from '../../utils/uiTimelineProjection';
 import './agentPanel.css';
 
 const AgentPanel: React.FC = () => {
-  const events = useAgentSessionStore((s) => s.events);
-  const activeDeltas = useAgentSessionStore((s) => s.activeDeltas);
+  const timeline = useAgentSessionStore((s) => s.timeline);
   const session = useAgentSessionStore((s) => s.session);
   const sessions = useAgentSessionStore((s) => s.sessions);
   const profileId = useAgentSessionStore((s) => s.profileId);
@@ -24,7 +23,6 @@ const AgentPanel: React.FC = () => {
   const errorMessage = useAgentSessionStore((s) => s.errorMessage);
   const messageAttachments = useAgentSessionStore((s) => s.messageAttachments);
   const sessionAttachments = useAgentSessionStore((s) => s.sessionAttachments);
-  const pendingPermission = useAgentSessionStore((s) => s.pendingPermission);
   const resolvingPermission = useAgentSessionStore((s) => s.resolvingPermission);
   const resolvingRequirement = useAgentSessionStore((s) => s.resolvingRequirement);
   const resolvingPlan = useAgentSessionStore((s) => s.resolvingPlan);
@@ -50,25 +48,17 @@ const AgentPanel: React.FC = () => {
     useSettingsStore((s) => s.effectiveSettings['workbench.language'])
   );
   const activeSessionRunning = Boolean(session?.id && runningSessionIds.includes(session.id));
-  const coalescedActiveDeltas = useCoalescedProjectionDeltas(activeDeltas, 50);
-  const timelineProjection = useMemo(
-    () => buildUiTimelineProjection({
-      sessionId: session?.id,
-      events,
-      activeDeltas: coalescedActiveDeltas,
-    }),
-    [coalescedActiveDeltas, events, session?.id]
-  );
+  const timelineProjection = timelineOrEmpty(timeline, session?.id);
   const pendingDecision = findPendingComposerDecisionFromProjection({
     timeline: timelineProjection,
-    pendingPermission: pendingPermission?.request ?? null,
     resolvingRequirement,
     resolvingPlan,
     resolvingReview,
     resolvingPermission,
   });
   const pendingDecisionResolving = Boolean(pendingDecision?.resolving);
-  const composerPendingDecision = pendingDecisionResolving ? null : pendingDecision;
+  const composerPendingDecision = pendingDecisionResolving || pendingDecision?.kind === 'permission' ? null : pendingDecision;
+  const pendingPermissionRequest = pendingDecision?.kind === 'permission' ? pendingDecision.request : null;
   const agentBusy = loading || activeSessionRunning || pendingDecisionResolving;
 
   useEffect(() => {
@@ -125,18 +115,18 @@ const AgentPanel: React.FC = () => {
         }
       />
 
-      {pendingPermission && (
+      {pendingPermissionRequest && (
         <PermissionRequestBubble
-          request={pendingPermission.request}
+          request={pendingPermissionRequest}
           language={language}
           disabled={Boolean(resolvingPermission)}
           resolvingDecision={
-            resolvingPermission?.id === pendingPermission.request.id
+            resolvingPermission?.id === pendingPermissionRequest.id
               ? resolvingPermission.decision
               : null
           }
-          onAccept={() => void acceptPermission()}
-          onReject={() => void rejectPermission()}
+          onAccept={() => void acceptPermission(pendingPermissionRequest)}
+          onReject={() => void rejectPermission(pendingPermissionRequest)}
         />
       )}
 
@@ -175,9 +165,7 @@ const AgentPanel: React.FC = () => {
           }
           if (composerPendingDecision.kind === 'review') {
             void resolveReview(composerPendingDecision.runId, decision, guidance);
-            return;
           }
-          void acceptPermission();
         }}
         onDecisionReject={() => {
           if (!composerPendingDecision) return;
@@ -191,38 +179,11 @@ const AgentPanel: React.FC = () => {
           }
           if (composerPendingDecision.kind === 'review') {
             void resolveReview(composerPendingDecision.runId, 'reject');
-            return;
           }
-          void rejectPermission();
         }}
       />
     </div>
   );
 };
-
-function useCoalescedProjectionDeltas<T>(deltas: T[], delayMs: number): T[] {
-  const [coalesced, setCoalesced] = useState(deltas);
-  const latestRef = useRef(deltas);
-  const timerRef = useRef<number | null>(null);
-
-  useEffect(() => {
-    latestRef.current = deltas;
-    if (timerRef.current !== null) return undefined;
-    timerRef.current = window.setTimeout(() => {
-      timerRef.current = null;
-      setCoalesced(latestRef.current);
-    }, delayMs);
-    return undefined;
-  }, [deltas, delayMs]);
-
-  useEffect(() => () => {
-    if (timerRef.current !== null) {
-      window.clearTimeout(timerRef.current);
-      timerRef.current = null;
-    }
-  }, []);
-
-  return coalesced;
-}
 
 export default AgentPanel;

@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import type { AgentEvent, AgentTimelineTokenUsageProjection } from '@deepcode/protocol';
+import type { AgentTimelineTokenUsageProjection } from '@deepcode/protocol';
 import type { SettingsSurface } from '@deepcode/protocol';
 import './settingsCenter.css';
 import { normalizeUiLanguage, t } from '../../i18n';
@@ -29,7 +29,6 @@ interface SettingsCenterProps {
   apiStatus: string;
   wsStatus: string;
   serverVersion?: string;
-  events?: AgentEvent[];
   tokenUsageProjection?: AgentTimelineTokenUsageProjection | null;
   surface?: Extract<SettingsSurface, 'editor' | 'gui'>;
 }
@@ -44,7 +43,6 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
   apiStatus,
   wsStatus,
   serverVersion,
-  events = [],
   tokenUsageProjection,
   surface = 'editor',
 }) => {
@@ -79,7 +77,7 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
           />
         );
       case 'token':
-        return <TokenStatsSection events={events} tokenUsageProjection={tokenUsageProjection} />;
+        return <TokenStatsSection tokenUsageProjection={tokenUsageProjection} />;
       case 'llm':
         return <LlmSection />;
       case 'skill':

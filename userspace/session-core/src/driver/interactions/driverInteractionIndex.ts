@@ -35,14 +35,14 @@ export interface DriverInteractionIndexPorts {
     interventionLevel?: 'low' | 'medium' | 'high';
     executionRoot?: AcceptedImplementationPlanExecutionRoot;
   }): AcceptedImplementationPlanContext;
-  withLatestCheckpoint(
-    acceptedPlan: AcceptedImplementationPlanContext,
-    events: AgentEvent[]
-  ): AcceptedImplementationPlanContext;
-  afterBatch(
-    acceptedPlan: AcceptedImplementationPlanContext,
-    completedTaskIds: string[]
-  ): AcceptedImplementationPlanContext;
+  recoverLatestCheckpoint(input: {
+    acceptedPlan: AcceptedImplementationPlanContext;
+    events: AgentEvent[];
+  }): { nextAcceptedPlan: AcceptedImplementationPlanContext };
+  recordTaskCompletion(input: {
+    acceptedPlan: AcceptedImplementationPlanContext;
+    completedTaskIds: string[];
+  }): { nextAcceptedPlan: AcceptedImplementationPlanContext };
 }
 
 export class DriverInteractionIndex {
@@ -65,15 +65,18 @@ export class DriverInteractionIndex {
       ?? this.ports.findPlanCard(events, undefined, planId);
     if (!plan?.implementationPlan) return undefined;
     const executionRoot = plan.executionRoot ?? this.ports.executionRootFromDecision(input, events);
-    let acceptedPlan = this.ports.withLatestCheckpoint(
-      this.ports.buildAcceptedPlan({ plan, interventionLevel: input.interventionLevel, executionRoot }),
-      events
-    );
+    let acceptedPlan = this.ports.recoverLatestCheckpoint({
+      acceptedPlan: this.ports.buildAcceptedPlan({ plan, interventionLevel: input.interventionLevel, executionRoot }),
+      events,
+    }).nextAcceptedPlan;
     const overlayCompletedTaskIds = overlay.acceptedCompletedTaskIds ?? [];
     if (overlayCompletedTaskIds.length) {
-      acceptedPlan = this.ports.afterBatch(acceptedPlan, [
-        ...new Set([...acceptedPlan.completedTaskIds, ...overlayCompletedTaskIds]),
-      ]);
+      acceptedPlan = this.ports.recordTaskCompletion({
+        acceptedPlan,
+        completedTaskIds: [
+          ...new Set([...acceptedPlan.completedTaskIds, ...overlayCompletedTaskIds]),
+        ],
+      }).nextAcceptedPlan;
     }
     return { plan, acceptedPlan };
   }

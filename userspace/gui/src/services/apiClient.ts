@@ -32,13 +32,13 @@ import type {
   RenameAgentSessionRequest,
   ArchiveAgentSessionRequest,
   AgentSessionResult,
+  AgentTimelineResult,
   AppendAgentEventsRequest,
   ResolveAgentPermissionRequest,
   ResolveAgentPlanRequest,
   ResolveAgentReviewRequest,
   AgentFeedbackRequest,
   AgentFeedbackResult,
-  AgentTimelineResult,
   GetAgentEventSnapshotResult,
   GetAgentWorkflowConfigResult,
   PatchAgentWorkflowConfigRequest,
@@ -666,6 +666,14 @@ export function getAgentSession(
   );
 }
 
+export function getAgentTimeline(
+  sessionId: string
+): Promise<ApiResponse<AgentTimelineResult>> {
+  return getJson<AgentTimelineResult>(
+    `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/timeline`
+  );
+}
+
 export function startAgentRun(
   sessionId: string,
   request: StartAgentRunRequest
@@ -747,14 +755,6 @@ export function getAgentEventSnapshot(
 ): Promise<ApiResponse<GetAgentEventSnapshotResult>> {
   return getJson<GetAgentEventSnapshotResult>(
     `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/trace`
-  );
-}
-
-export function getAgentTimeline(
-  sessionId: string
-): Promise<ApiResponse<AgentTimelineResult>> {
-  return getJson<AgentTimelineResult>(
-    `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/timeline`
   );
 }
 

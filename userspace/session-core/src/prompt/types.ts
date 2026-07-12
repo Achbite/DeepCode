@@ -9,6 +9,9 @@ export interface PromptSystemLayer {
     | 'protocolContract'
     | 'builtinSystemPrompt'
     | 'systemStructure'
+    | 'agentInterventionContract'
+    | 'resourceEvidencePolicyContract'
+    | 'memoryAndTaskContextContract'
     | 'toolCatalogSummary'
     | 'rulerContext'
     | 'authoritativeDocExcerpts'
@@ -23,7 +26,6 @@ export interface PromptSystemLayer {
     | 'currentWorkflowState'
     | 'currentRequirement'
     | 'currentResourceResults'
-    | 'promptPacketFrame'
     | 'auditOnlyContext';
   priority: number;
   stable: boolean;

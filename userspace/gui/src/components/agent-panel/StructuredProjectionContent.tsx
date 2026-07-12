@@ -1,22 +1,21 @@
 import React from 'react';
+import type { AgentTimelineStructuredProjection } from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
 
 type StructuredProjectionKind = 'plan' | 'review';
 
 interface StructuredProjectionContentProps {
-  payload: unknown;
+  projection: AgentTimelineStructuredProjection | undefined;
   language: UiLanguage;
-  kind: StructuredProjectionKind;
   visibleCharacters?: number;
 }
 
 export function StructuredProjectionContent({
-  payload,
+  projection,
   language,
-  kind,
   visibleCharacters,
 }: StructuredProjectionContentProps) {
-  const readable = readableProjection(payload, kind);
+  const readable = readableProjection(projection);
   if (!readable) return null;
   const budget = visibleCharacters === undefined ? undefined : { remaining: Math.max(0, visibleCharacters) };
   const summary = visibleText(readableSummary(readable, language), budget);
@@ -37,11 +36,10 @@ export function StructuredProjectionContent({
 }
 
 export function structuredProjectionText(
-  payload: unknown,
-  language: UiLanguage,
-  kind: StructuredProjectionKind
+  projection: AgentTimelineStructuredProjection | undefined,
+  language: UiLanguage
 ): string {
-  const readable = readableProjection(payload, kind);
+  const readable = readableProjection(projection);
   if (!readable) return '';
   const title = titleForReadable(readable, language);
   const summary = readableSummary(readable, language);
@@ -65,10 +63,10 @@ export function structuredProjectionText(
 }
 
 export function hasStructuredProjection(
-  payload: unknown,
-  kind: StructuredProjectionKind
+  projection: AgentTimelineStructuredProjection | undefined,
+  kind?: StructuredProjectionKind
 ): boolean {
-  return Boolean(readableProjection(payload, kind));
+  return Boolean(projection && (!kind || projection.kind === kind) && readableProjection(projection));
 }
 
 function StructuredProjectionSection({
@@ -125,16 +123,12 @@ function StructuredProjectionItemDetails({
 }
 
 function readableProjection(
-  payload: unknown,
-  kind: StructuredProjectionKind
+  projection: AgentTimelineStructuredProjection | undefined
 ): Record<string, unknown> | undefined {
-  if (!isRecord(payload)) return undefined;
-  const readable = kind === 'plan' ? payload.readablePlan : payload.readableReview;
-  if (!isRecord(readable)) return undefined;
-  const schemaVersion = stringField(readable, 'schemaVersion');
-  if (kind === 'plan' && schemaVersion !== 'deepcode.session.readable-plan.v1') return undefined;
-  if (kind === 'review' && schemaVersion !== 'deepcode.session.readable-review.v1') return undefined;
-  return readable;
+  if (!projection) return undefined;
+  if (projection.kind === 'plan' && projection.schemaVersion !== 'deepcode.session.readable-plan.v1') return undefined;
+  if (projection.kind === 'review' && projection.schemaVersion !== 'deepcode.session.readable-review.v1') return undefined;
+  return projection as unknown as Record<string, unknown>;
 }
 
 function readableSummary(readable: Record<string, unknown>, language: UiLanguage): string {
@@ -177,10 +171,6 @@ function itemDetailLines(item: Record<string, unknown>, language: UiLanguage): s
   const failure = stringArrayField(metadata, 'failure');
   if (failure.length) {
     details.push(t(language, 'session.projection.item.failure', { failure: failure.join('; ') }));
-  }
-  const auditRefs = stringArrayField(item, 'auditRefs');
-  if (auditRefs.length) {
-    details.push(t(language, 'session.projection.item.auditRefs', { auditRefs: auditRefs.join(', ') }));
   }
   return details;
 }

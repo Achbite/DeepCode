@@ -1,13 +1,11 @@
 import React, { Suspense, lazy, useEffect, useMemo, useRef, useState } from 'react';
 import type {
   AgentContextAttachment,
-  AgentEvent,
   AgentSession,
   AgentTimelineResult,
   BrowseEntry,
   BrowsePathResult,
   InitialLocation,
-  ProjectionDelta,
 } from '@deepcode/protocol';
 import type { SessionMemorySnapshot } from '@deepcode/session-core';
 import WindowControls from '../../components/window-controls/WindowControls';
@@ -22,7 +20,7 @@ import { useSettingsStore } from '../../state/settingsStore';
 import { useWorkspaceStore } from '../../state/workspaceStore';
 import { useAgentSessionStore } from '../../state/agentSessionStore';
 import { deriveTokenUsageStats, formatPercent, formatTokenCount } from '../../utils/tokenUsageStats';
-import { buildUiTimelineProjection, latestPlanTaskItemsFromProjection } from '../../utils/uiTimelineProjection';
+import { latestPlanTaskItemsFromProjection, timelineOrEmpty } from '../../utils/uiTimelineProjection';
 import AgentMemoryViewer from '../../components/agent-memory/AgentMemoryViewer';
 import DeepCodeAgentPanel from '../panel/DeepCodeAgentPanel';
 import '../../components/workspace-open-dialog/workspaceOpenDialog.css';
@@ -116,8 +114,6 @@ interface PendingProjectSession {
 }
 
 const DEEPCODE_GUI_PROJECTS_STORAGE_KEY = 'deepcode-gui.projects.v1';
-const EMPTY_AGENT_EVENTS: AgentEvent[] = [];
-const EMPTY_PROJECTION_DELTAS: ProjectionDelta[] = [];
 
 const DeepCodeSidebarIcon: React.FC<{ name: DeepCodeSidebarIconName; className?: string }> = ({
   name,
@@ -580,106 +576,6 @@ const DeepCodeProjectFolderDialog: React.FC<DeepCodeProjectFolderDialogProps> = 
   );
 };
 
-function eventText(event: AgentEvent): string {
-  if (typeof event.payload === 'string') return event.payload;
-  if (!event.payload || typeof event.payload !== 'object' || Array.isArray(event.payload)) return '';
-  const payload = event.payload as Record<string, unknown>;
-  for (const key of ['summary', 'message', 'content', 'details', 'toolName', 'stage']) {
-    const value = payload[key];
-    if (typeof value === 'string' && value.trim()) return value;
-  }
-  return '';
-}
-
-function taskTitle(language: UiLanguage, event: AgentEvent): string {
-  if (event.kind === 'user_guidance') return t(language, 'deepcodeGui.tasks.guidance');
-  if (event.kind === 'requirement_confirmation' || event.kind === 'requirement_decision') {
-    return t(language, 'deepcodeGui.tasks.requirement');
-  }
-  if (event.kind === 'plan_card' || event.kind === 'plan_review') return t(language, 'deepcodeGui.tasks.plan');
-  if (event.kind === 'review_summary') return t(language, 'deepcodeGui.tasks.review');
-  if (event.kind === 'tool_call' || event.kind === 'tool_result') return t(language, 'deepcodeGui.tasks.tool');
-  if (event.kind === 'permission_request' || event.kind === 'permission_result') return t(language, 'deepcodeGui.tasks.permission');
-  if (event.kind === 'workflow_stage' || event.kind === 'workflow_decision') return t(language, 'deepcodeGui.tasks.workflow');
-  if (event.kind === 'error') return t(language, 'deepcodeGui.tasks.error');
-  return t(language, 'deepcodeGui.tasks.item');
-}
-
-function taskStatus(event: AgentEvent): string {
-  if (event.kind === 'error') return 'failed';
-  if (event.kind === 'user_guidance') {
-    return stringField(event.payload, 'status') === 'consumed' ? 'completed' : 'queued';
-  }
-  if (event.kind === 'requirement_confirmation') {
-    return stringField(event.payload, 'status') === 'waitingUserConfirmation' ? 'waiting' : 'completed';
-  }
-  if (event.kind === 'requirement_decision') {
-    const status = stringField(event.payload, 'status');
-    if (status === 'rejected') return 'failed';
-    if (status === 'needsRevision') return 'waiting';
-    return 'completed';
-  }
-  if (event.kind === 'permission_request' || event.kind === 'plan_card' || event.kind === 'plan_review') return 'waiting';
-  if (event.kind === 'tool_call' || event.kind === 'workflow_stage') return 'running';
-  return 'completed';
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return Boolean(value && typeof value === 'object' && !Array.isArray(value));
-}
-
-function stringField(value: unknown, key: string): string | undefined {
-  if (!isRecord(value)) return undefined;
-  const field = value[key];
-  return typeof field === 'string' && field.trim() ? field : undefined;
-}
-
-function latestTurnEvents(events: AgentEvent[]): AgentEvent[] {
-  const lastUserIndex = events.reduce(
-    (last, event, index) => (event.kind === 'user_msg' ? index : last),
-    -1
-  );
-  return lastUserIndex >= 0 ? events.slice(lastUserIndex + 1) : events;
-}
-
-function taskDedupKey(event: AgentEvent): string {
-  const stage = stringField(event.payload, 'stage') ?? stringField(event.payload, 'phase');
-  const runId = stringField(event.payload, 'runId');
-  const planId = stringField(event.payload, 'planId');
-  const callId = stringField(event.payload, 'callId') ?? stringField(event.payload, 'toolCallId');
-  const requestId = stringField(event.payload, 'requestId') ?? stringField(event.payload, 'permissionId');
-  const toolName = stringField(event.payload, 'toolName') ?? stringField(event.payload, 'tool');
-
-  if (event.kind === 'workflow_stage' || event.kind === 'workflow_decision') {
-    return `workflow:${stage ?? 'workflow'}:${runId ?? ''}`;
-  }
-  if (event.kind === 'tool_call' || event.kind === 'tool_result') {
-    return `tool:${callId ?? toolName ?? eventText(event)}`;
-  }
-  if (event.kind === 'permission_request' || event.kind === 'permission_result') {
-    return `permission:${requestId ?? toolName ?? eventText(event)}`;
-  }
-  if (event.kind === 'plan_card' || event.kind === 'plan_review') {
-    return `plan:${planId ?? runId ?? eventText(event)}`;
-  }
-  if (event.kind === 'requirement_confirmation' || event.kind === 'requirement_decision') {
-    const requirementId = stringField(event.payload, 'requirementId');
-    return `requirement:${requirementId ?? runId ?? eventText(event)}`;
-  }
-  if (event.kind === 'review_summary') {
-    return `review:${runId ?? eventText(event)}`;
-  }
-  if (event.kind === 'user_guidance') {
-    const guidanceId = stringField(event.payload, 'guidanceId');
-    const targetRunId = stringField(event.payload, 'targetRunId');
-    return `guidance:${guidanceId ?? targetRunId ?? runId ?? event.id}`;
-  }
-  if (event.kind === 'error') {
-    return `error:${eventText(event)}`;
-  }
-  return `${event.kind}:${event.id}`;
-}
-
 function dedupeTaskItems(items: DeepCodeTaskItem[]): DeepCodeTaskItem[] {
   const byKey = new Map<string, DeepCodeTaskItem>();
   for (const item of items) {
@@ -727,11 +623,10 @@ function deriveTaskItems(
 }
 
 function deriveCacheHitSummary(
-  events: AgentEvent[],
   language: UiLanguage,
   tokenUsageProjection?: AgentTimelineResult['tokenUsageProjection'] | null
 ): DeepCodeCacheHitSummary | null {
-  const stats = deriveTokenUsageStats(events, tokenUsageProjection);
+  const stats = deriveTokenUsageStats([], tokenUsageProjection);
   const percent = formatPercent(stats.cacheHitRate);
   const label = t(language, 'deepcodeGui.cache.label', { percent });
   if (!stats.hasCacheData) {
@@ -782,7 +677,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
   const loadingSession = useAgentSessionStore((s) => s.loading);
   const runningSessionIds = useAgentSessionStore((s) => s.runningSessionIds);
   const events = useAgentSessionStore((s) => s.events);
-  const activeDeltas = useAgentSessionStore((s) => s.activeDeltas);
+  const timeline = useAgentSessionStore((s) => s.timeline);
   const createNewSession = useAgentSessionStore((s) => s.createNewSession);
   const activateSession = useAgentSessionStore((s) => s.activateSession);
   const renameSession = useAgentSessionStore((s) => s.renameSession);
@@ -854,15 +749,9 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
     ? new Date(lastHeartbeatAt).toLocaleTimeString()
     : t(language, 'deepcodeGui.status.pending');
   const projectDraftActive = Boolean(draftTargetProjectId);
-  const projectionEvents = projectDraftActive ? EMPTY_AGENT_EVENTS : events;
-  const liveTimelineProjection = useMemo(
-    () => buildUiTimelineProjection({
-      sessionId: projectDraftActive ? 'project-draft' : activeSession?.id ?? projectionEvents[0]?.sessionId ?? 'session',
-      events: projectionEvents,
-      activeDeltas: projectDraftActive ? [] : activeDeltas,
-    }),
-    [activeDeltas, activeSession?.id, projectDraftActive, projectionEvents]
-  );
+  const liveTimelineProjection = projectDraftActive
+    ? timelineOrEmpty(null, 'project-draft')
+    : timelineOrEmpty(timeline, activeSession?.id);
   const taskItems = useMemo(() => {
     const taskSessionId = projectDraftActive ? null : activeSession?.id ?? null;
     const fallbackItems = lastPlanTaskItemsRef.current.sessionId === taskSessionId
@@ -883,8 +772,8 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
     return items;
   }, [activeSession?.id, liveTimelineProjection, language, projectDraftActive, runningSessionIds]);
   const cacheHitSummary = useMemo(
-    () => deriveCacheHitSummary(projectionEvents, language, liveTimelineProjection.tokenUsageProjection),
-    [projectionEvents, language, liveTimelineProjection.tokenUsageProjection]
+    () => deriveCacheHitSummary(language, liveTimelineProjection.tokenUsageProjection),
+    [language, liveTimelineProjection.tokenUsageProjection]
   );
   const activeProject = useMemo(
     () => projectRecords.find((project) => project.id === activeProjectId) ?? null,
@@ -1496,6 +1385,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
         <main className="deepcode-gui-session-main">
           <DeepCodeAgentPanel
             language={language}
+            timeline={liveTimelineProjection}
             forceHome={projectDraftActive}
             homeProjectTitle={draftProject?.title ?? activeProject?.title ?? null}
             suppressPendingDecision={projectDraftActive}
@@ -1756,7 +1646,6 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
                   apiStatus={apiStatus}
                   wsStatus={wsStatus}
                   serverVersion={serverVersion}
-                  events={events}
                   tokenUsageProjection={liveTimelineProjection.tokenUsageProjection}
                   surface="gui"
                 />

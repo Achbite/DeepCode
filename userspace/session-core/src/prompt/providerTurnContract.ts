@@ -1,4 +1,3 @@
-import { actionBundleProtocolShapeLines, kernelCatalogToolIdList, resourceRequestProtocolShapeLine } from '../protocol/protocolContract.js';
 import type { PromptEnvelopeBuilderInput } from './types.js';
 import { buildPromptPacketFrames, renderPromptPacketFrames, type PromptPacketFrame } from './promptPacket.js';
 
@@ -86,29 +85,20 @@ export function inferProviderTurnMode(input: PromptEnvelopeBuilderInput): Provid
 
 export function providerVisibleSchemaDigest(input: PromptEnvelopeBuilderInput): string {
   const turnMode = inferProviderTurnMode(input);
-  const common = [
-    'Agent Protocol v3 schema digest: every live proposal is one JSON object with schemaVersion="deepcode.agent.protocol.v3", kind, outputLanguage, optional narration, and the kind-specific top-level field for the current ProviderTurnContract.',
-    'Allowed proposal kinds only: answer, resourceRequest, decisionRequest, taskPlan, actionBundle, diagnostic. reviewSummary is Session-generated from Kernel facts and must never be returned by the provider.',
-    'answer top-level field: answer.format="markdown" and answer.content contains the user-visible response.',
-    resourceRequestProtocolShapeLine(),
-    'decisionRequest top-level field: decisionRequest.version/id/question/reason/summary/options/allowsFreeform; question must be a non-empty user-visible string. Use 2-3 mutually exclusive options with one recommended option.',
-    'taskPlan top-level field: taskPlan.version/id/title/summary/tasks/risks/reviewCheckpoints. tasks[] is a Session-advanced ordered implementation queue. Do not output scheduling graph structures, source code, codeBlocks, actionBundle, commandBlocks, patches, or executable tool calls.',
-    'diagnostic top-level field: diagnostic.version/id/severity/summary/details; diagnostic explains terminal protocol/context failure and never queues execution.',
-  ];
-  if (turnMode !== 'acceptedTaskExecution') {
+  const executionLikeTurn = turnMode === 'acceptedTaskExecution' || turnMode === 'resourceResume' || turnMode === 'scopeIntervention';
+  if (executionLikeTurn) {
     return [
-      ...common,
-      'Execution tool argument schema is withheld in this turn. If side-effect work is needed, output a taskPlan or focused resourceRequest/decisionRequest according to the ProviderTurnContract.',
+      'Execution uses provider-native Session semantic tools.',
+      'Use exactly one of: session.request_resources, session.request_decision, session.submit_task_artifacts, session.complete_current_task, session.report_diagnostic.',
+      'For generated content, submit only current IntentSlot ids and artifact content. Session compiles the directive into an internal Kernel command.',
+      'Do not output Kernel tool identifiers, actionBundle transport fields, permission fields, WorkUnit fields, or audit fields.',
     ].join('\n');
   }
   return [
-    ...common,
-    'actionBundle proposal top-level fields: userPlanMarkdown, codeBlocks, actionBundle. Use it only for the current accepted task.',
-    ...actionBundleProtocolShapeLines(),
-    'codeBlocks items use {blockId,targetPath,language?,operation?,contentLines,allowEmptyContent?}. contentLines is the only provider-facing source-code content carrier.',
-    `actionBundle.actions[].toolId must use Kernel catalog ids: ${kernelCatalogToolIdList()}.`,
-    'File operation actions must use fs.* toolIds. Action entries use actionId, toolId, args, and description; Kernel derives capability, permission, readSet/writeSet, and conflictKeys.',
-    'Do not output capability, permissionLabels, accessScopes, resourceScope, commandBlocks, legacy implementationPlan, or payload wrapper fields.',
+    'Planning uses provider-native Session semantic tools.',
+    'Use exactly one of: session.request_resources, session.request_decision, session.submit_plan, session.submit_answer, session.report_diagnostic.',
+    'A submitted plan is an ordered task queue, not a dependency graph.',
+    'Do not output Kernel tool identifiers, permission fields, WorkUnit fields, or audit fields.',
   ].join('\n');
 }
 
@@ -116,13 +106,12 @@ export function providerVisibleWorkflowState(input: PromptEnvelopeBuilderInput):
   const mode = inferProviderTurnMode(input);
   const lines = [
     `Current workflow state: ${input.workflowState}.`,
-    `Allowed proposals: ${input.allowedProposals.join(', ') || 'none'}.`,
     `Provider turn mode: ${mode}.`,
   ];
   if (mode === 'acceptedTaskExecution') {
-    lines.push(`Kernel tool catalog visible for current accepted task as schema only, not authorization:\n${input.capabilityCatalogSummary || 'none'}`);
+    lines.push(`Current accepted task IntentSlot scope:\n${input.capabilityCatalogSummary || 'none'}`);
   } else {
-    lines.push('Kernel execution tool argument catalog is not visible in this turn. Use taskPlan operation intent, focused resourceRequest, decisionRequest, answer, or diagnostic as allowed.');
+    lines.push('Use the registered planning semantic tools. Kernel execution contracts are not provider-visible.');
   }
   return lines.join('\n');
 }
@@ -146,25 +135,14 @@ function defaultRepairPolicy(turnMode: ProviderTurnMode): ProviderRepairPolicy {
 
 function toolIntentTemplates(input: PromptEnvelopeBuilderInput, turnMode: ProviderTurnMode): string[] {
   if (turnMode !== 'acceptedTaskExecution' && turnMode !== 'resourceResume' && turnMode !== 'scopeIntervention') {
-    return ['planning/read/decision turn: do not output executable tool args or actionBundle unless the ProviderTurnContract allowedKinds explicitly includes actionBundle for a tiny single-step side effect.'];
+    return [];
   }
   const record = objectRecord(input.currentTaskContext);
   const targets = stringArray(record?.targets);
-  const capabilities = stringArray(record?.capabilities);
   const lines = [
     `currentTaskTargets=${targets.length ? targets.join(', ') : 'none'}`,
-    `currentTaskCapabilities=${capabilities.length ? capabilities.join(', ') : 'none'}`,
-    'Use only currentTaskTargets unless decisionRequest asks the user to expand current task scope.',
+    'Use only IntentSlot ids supplied by Session for artifact submission. Do not submit target paths or Kernel operations.',
   ];
-  if (capabilities.includes('fs.delete')) {
-    lines.push('fs.delete intent: args.path must be one normalized current task target; directory delete requires args.targetKind="directory" and args.recursive=true only for an accepted directory target.');
-  }
-  if (capabilities.includes('fs.write')) {
-    lines.push('fs.write intent: write concrete file paths under current task targets; use codeBlocks[].contentLines and args.sourceBlockId.');
-  }
-  if (capabilities.includes('fs.patch')) {
-    lines.push('fs.patch intent: request focused ResourceEvidence first unless exact current match text is already visible; args.patchSpec.match.text must copy Kernel-observed evidence.');
-  }
   return lines;
 }
 
@@ -178,4 +156,11 @@ function stringArray(value: unknown): string[] {
   return Array.isArray(value)
     ? value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0).map((item) => item.trim())
     : [];
+}
+
+export function planningDecisionPolicyLines(): string[] {
+  return [
+    'Plan review is the normal confirmation checkpoint for reviewable implementation assumptions. During planning, prefer taskPlan with explicit assumptions, risks, and review checkpoints over decisionRequest for routine classifications, reversible cleanup choices, file organization details, or choices the user can approve or revise in the plan card.',
+    'Use kind="decisionRequest" only when a blocking user choice is required before any valid taskPlan can be formed: mutually exclusive product or architecture direction, destructive scope not inferable from confirmed text, cross-workspace scope, permission boundary expansion, or validation authority change.',
+  ];
 }

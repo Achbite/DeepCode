@@ -1,4 +1,5 @@
 import type {
+  AgentContextAttachment,
   AgentEvent,
   AgentConversationActivity,
   AgentEventChannel,
@@ -20,6 +21,10 @@ import type { ReviewPacket } from './review/types.js';
 import { isInternalOrchestrationStage, isMainTimelineActivityShape } from './timelineFilter.js';
 import type { TranscriptMessageEntry } from './transcript.js';
 import type { DynamicWorkflowPlan } from './workflow/types.js';
+import {
+  findActiveInteraction,
+  type InteractionLedgerActiveInteraction,
+} from './run-state/interactionLedger.js';
 
 export interface PendingPermissionProjection {
   request: PermissionRequest;
@@ -41,8 +46,6 @@ export interface SessionProjection {
 }
 
 export const NARRATIVE_TIMELINE_SCHEMA_VERSION = 'deepcode.session.timeline.v1' as const;
-
-type NarrativeRenderMode = NonNullable<NonNullable<AgentTimelineBlock['displayHints']>['renderMode']>;
 
 export interface NarrativeTimelineProjectionInput {
   sessionId: string;
@@ -199,12 +202,15 @@ export function buildNarrativeTimelineProjection(input: NarrativeTimelineProject
     const userInputEvent = userInputBubbleEvent(event, index);
     if (userInputEvent) {
       if (currentTurn) turns.push(finalizeNarrativeTurn(currentTurn));
+      const userBlockEvents = isUserInputAuditOnlyEvent(event)
+        ? [userInputEvent, event]
+        : [userInputEvent];
       currentTurn = {
         id: `turn-${userInputEvent.id || index}`,
         sessionId: input.sessionId,
         status: 'running',
         startedAt: userInputEvent.ts,
-        blocks: [narrativeBlockFromEvents([userInputEvent], index)],
+        blocks: [narrativeBlockFromEvents(userBlockEvents, index)],
       };
       if (isUserInputAuditOnlyEvent(event)) {
         return;
@@ -243,11 +249,24 @@ export function buildNarrativeTimelineProjection(input: NarrativeTimelineProject
   if (acceptedReviewIndex >= 0) {
     annotateBlocksWithPhase(turns, input.events, acceptedReviewIndex);
   }
+  resolveTimelineInteractionBlocks(turns, input.events);
+  stabilizeNarrativeBlockIds(turns);
 
   const rawEventRefs = input.events.map(eventRefForAgentEvent);
+  const blockIdsByEventId = timelineBlockIdsByEventId(turns);
   const implementationTaskItems = input.events.flatMap((event, index) =>
-    implementationPlanTaskProjectionItems(input.events, event, index)
+    implementationPlanTaskProjectionItems(input.events, event, index, blockIdsByEventId.get(event.id))
   );
+  const activeInteraction = findActiveInteraction({
+    events: input.events,
+    pendingPermission: findLatestPendingPermission(input.events)?.request,
+  });
+  if (activeInteraction?.kind === 'requirement' && activeInteraction.decisionRequest) {
+    const blockId = interactionBlockId(turns, activeInteraction);
+    for (const block of turns.flatMap((turn) => turn.blocks)) {
+      if (block.id === blockId) block.decisionRequest = activeInteraction.decisionRequest;
+    }
+  }
 
   return {
     schemaVersion: NARRATIVE_TIMELINE_SCHEMA_VERSION,
@@ -259,9 +278,64 @@ export function buildNarrativeTimelineProjection(input: NarrativeTimelineProject
       title: 'Task projection',
       items: implementationTaskItems.slice(-8),
     },
+    interactionProjection: activeInteraction
+      ? { pending: { ...activeInteraction, blockId: interactionBlockId(turns, activeInteraction) } }
+      : undefined,
     tokenUsageProjection: buildTokenUsageProjection(input.events),
+    workspaceProjection: buildWorkspaceProjection(input.events),
     rawEventRefs,
   };
+}
+
+function buildWorkspaceProjection(
+  events: AgentEvent[]
+): NonNullable<AgentTimelineResult['workspaceProjection']> {
+  const changedTargets: string[] = [];
+  let revision = 0;
+  for (const event of events) {
+    const activity = narrativeActivity([event]);
+    if (!activity) continue;
+    if (activity.operation !== 'write' && activity.operation !== 'patch' && activity.operation !== 'delete') {
+      continue;
+    }
+    revision += 1;
+    for (const target of activity.targets ?? []) {
+      if (target && !changedTargets.includes(target)) changedTargets.push(target);
+    }
+  }
+  return { revision, changedTargets };
+}
+
+function interactionBlockId(
+  turns: AgentTimelineResult['turns'],
+  active: InteractionLedgerActiveInteraction
+): string | undefined {
+  const blocks = turns.flatMap((turn) => turn.blocks);
+  for (let index = blocks.length - 1; index >= 0; index -= 1) {
+    const block = blocks[index];
+    if (block.events.some((event) => eventMatchesInteraction(event, active))) return block.id;
+  }
+  return undefined;
+}
+
+function eventMatchesInteraction(event: AgentEvent, active: InteractionLedgerActiveInteraction): boolean {
+  const payload = isRecordPayload(event.payload) ? event.payload : {};
+  if (active.kind === 'permission') {
+    if (event.kind !== 'permission_request') return false;
+    return [stringField(payload, 'id'), stringField(payload, 'requestId'), stringField(payload, 'permissionId')]
+      .includes(active.requestId);
+  }
+  if (active.kind === 'plan') {
+    return (event.kind === 'plan_card' || event.kind === 'plan_review') &&
+      stringField(payload, 'runId') === active.runId &&
+      stringField(payload, 'planId') === active.planId;
+  }
+  if (active.kind === 'review') {
+    return event.kind === 'review_summary' && stringField(payload, 'runId') === active.runId;
+  }
+  return event.kind === 'requirement_confirmation' &&
+    stringField(payload, 'runId') === active.runId &&
+    stringField(payload, 'requirementId') === active.requirementId;
 }
 
 export function buildTimelineProjectionWithLiveOverlay(
@@ -287,17 +361,68 @@ function projectionDeltasToTransientEvents(input: {
   activeDeltas: ProjectionDelta[];
   generatedAt?: string;
 }): AgentEvent[] {
-  const committedActivityIds = new Set(
-    input.committedEvents
-      .map(eventActivityId)
-      .filter((id): id is string => Boolean(id))
-  );
-  return input.activeDeltas
+  const committed = committedProjectionIndex(input.committedEvents);
+  return coalesceLiveToolActivities(input.activeDeltas)
     .filter((delta) => delta.sessionId === input.sessionId)
     .filter((delta) => delta.type !== 'committed')
-    .filter((delta) => !activeDeltaAlreadyCommitted(delta, committedActivityIds))
+    .filter((delta) => !activeDeltaAlreadyCommitted(delta, committed))
     .sort((left, right) => (left.seq ?? 0) - (right.seq ?? 0))
     .flatMap((delta) => projectionDeltaToTransientEvent(delta, input.generatedAt));
+}
+
+function coalesceLiveToolActivities(deltas: ProjectionDelta[]): ProjectionDelta[] {
+  const toolCallsByItem = new Map<string, ProjectionDelta>();
+  const resolvedItems = new Set<string>();
+  for (const delta of deltas) {
+    const key = liveToolItemKey(delta);
+    if (!key) continue;
+    if (delta.type === 'tool_call_delta') toolCallsByItem.set(key, delta);
+    if (delta.type === 'resource_delta') resolvedItems.add(key);
+  }
+
+  return deltas.flatMap((delta) => {
+    const key = liveToolItemKey(delta);
+    if (key && delta.type === 'tool_call_delta' && resolvedItems.has(key)) return [];
+    if (!key || delta.type !== 'resource_delta' || !delta.activity) return [delta];
+    const toolCall = toolCallsByItem.get(key);
+    const toolName = delta.activity.toolName ?? toolCall?.activity?.toolName;
+    return [{
+      ...delta,
+      activity: {
+        ...delta.activity,
+        activityId: toolCall?.activity?.activityId ?? delta.activity.activityId,
+        toolName,
+        operation: delta.activity.operation ?? operationFromLiveToolName(toolName),
+      },
+    }];
+  });
+}
+
+function liveToolItemKey(delta: ProjectionDelta): string | undefined {
+  if (!delta.itemId || !delta.runId) return undefined;
+  if (delta.type !== 'tool_call_delta' && delta.type !== 'resource_delta') return undefined;
+  return `${delta.sessionId}:${delta.runId}:${delta.itemId}`;
+}
+
+function operationFromLiveToolName(toolName: string | undefined): string | undefined {
+  if (!toolName) return undefined;
+  const operations: Record<string, string> = {
+    'fs.read': 'read',
+    fs__read: 'read',
+    'fs.list': 'list',
+    fs__list: 'list',
+    'fs.diff': 'diff',
+    fs__diff: 'diff',
+    'code.search': 'search',
+    code__search: 'search',
+    'fs.write': 'write',
+    fs__write: 'write',
+    'fs.patch': 'patch',
+    fs__patch: 'patch',
+    'fs.delete': 'delete',
+    fs__delete: 'delete',
+  };
+  return operations[toolName];
 }
 
 function projectionDeltaToTransientEvent(delta: ProjectionDelta, generatedAt?: string): AgentEvent[] {
@@ -463,11 +588,77 @@ function projectionStatus(status: ProjectionDelta['status']): string | undefined
 
 function activeDeltaAlreadyCommitted(
   delta: ProjectionDelta,
-  committedActivityIds: Set<string>
+  committed: CommittedProjectionIndex
 ): boolean {
+  if (delta.committedEventIds?.some((id) => committed.eventIds.has(id))) return true;
   const activityId = delta.activity?.activityId;
-  if (activityId && committedActivityIds.has(activityId)) return true;
+  if (activityId && committed.activityIds.has(activityId)) return true;
+  if (projectionIdentityKeysForDelta(delta).some((key) => committed.projectionKeys.has(key))) return true;
+  const textIdentity = textProjectionIdentityForDelta(delta);
+  if (textIdentity && committed.textIdentities.has(textIdentity)) return true;
   return false;
+}
+
+interface CommittedProjectionIndex {
+  eventIds: Set<string>;
+  activityIds: Set<string>;
+  projectionKeys: Set<string>;
+  textIdentities: Set<string>;
+}
+
+function committedProjectionIndex(events: AgentEvent[]): CommittedProjectionIndex {
+  return {
+    eventIds: new Set(events.map((event) => event.id).filter(Boolean)),
+    activityIds: new Set(events.map(eventActivityId).filter((id): id is string => Boolean(id))),
+    projectionKeys: new Set(events.flatMap(projectionIdentityKeysForEvent)),
+    textIdentities: new Set(
+      events
+        .map(textProjectionIdentityForEvent)
+        .filter((identity): identity is string => Boolean(identity))
+    ),
+  };
+}
+
+function projectionIdentityKeysForEvent(event: AgentEvent): string[] {
+  const payload = isRecordPayload(event.payload) ? event.payload : {};
+  const output = isRecordPayload(payload.output) ? payload.output : {};
+  const keys: string[] = [];
+  const packetId = stringField(output, 'id');
+  if (packetId) keys.push(`packet:${packetId}`);
+  if (Array.isArray(output.items)) {
+    for (const item of output.items) {
+      if (!isRecordPayload(item)) continue;
+      const callId = stringField(item, 'manifestEntryId');
+      if (callId) keys.push(`call:${callId}`);
+    }
+  }
+  return keys;
+}
+
+function projectionIdentityKeysForDelta(delta: ProjectionDelta): string[] {
+  const payload = isRecordPayload(delta.payload) ? delta.payload : {};
+  const keys: string[] = [];
+  const packetId = stringField(payload, 'packetId');
+  const callId = stringField(payload, 'callId') ?? delta.itemId?.trim();
+  if (packetId) keys.push(`packet:${packetId}`);
+  if (callId) keys.push(`call:${callId}`);
+  return keys;
+}
+
+function textProjectionIdentityForEvent(event: AgentEvent): string | undefined {
+  if (event.kind !== 'assistant_msg') return undefined;
+  const payload = isRecordPayload(event.payload) ? event.payload : {};
+  const channel = stringField(payload, 'channel');
+  const runId = stringField(payload, 'runId');
+  if (channel === 'reasoning') return `reasoning:${runId ?? ''}`;
+  if (channel === 'final' || channel === 'progress') return `assistant:${runId ?? ''}`;
+  return undefined;
+}
+
+function textProjectionIdentityForDelta(delta: ProjectionDelta): string | undefined {
+  if (delta.type === 'reasoning_delta') return `reasoning:${delta.runId ?? ''}`;
+  if (delta.type === 'assistant_delta') return `assistant:${delta.runId ?? ''}`;
+  return undefined;
 }
 
 function eventActivityId(event: AgentEvent): string | undefined {
@@ -478,16 +669,13 @@ function eventActivityId(event: AgentEvent): string | undefined {
 
 function isProjectionTimelineHiddenEvent(event: AgentEvent): boolean {
   const activity = conversationActivityFromEvent(event);
-  const activeOverlay = Boolean(isRecordPayload(event.payload) && event.payload.activeOverlay === true);
-  if (activeOverlay && activity?.kind === 'providerThinking') {
-    return false;
-  }
   if (event.kind === 'workflow_stage' || event.kind === 'workflow_decision') {
     const payload = isRecordPayload(event.payload) ? event.payload : {};
     const stage = stringField(payload, 'stage');
     const kernelEvent = isRecordPayload(payload.kernelEvent) ? payload.kernelEvent : undefined;
     const kernelEventKind = kernelEvent ? stringField(kernelEvent, 'kind') : undefined;
     if (isInternalOrchestrationStage({ stage, kernelEventKind })) return true;
+    if (!activity) return true;
   }
   if (activity && !isMainTimelineActivityShape({ kind: activity.kind, toolName: activity.toolName })) {
     return true;
@@ -544,7 +732,7 @@ function userInputBubbleContent(event: AgentEvent): string | undefined {
   if (event.kind === 'review_summary') {
     const status = stringField(event.payload, 'status');
     if (status !== 'accepted' && status !== 'rejected' && status !== 'needsRevision') return undefined;
-    if (status === 'accepted') return undefined;
+    if (status === 'accepted') return 'Review accepted';
     return firstPayloadText(event.payload, ['guidance', 'content', 'summary', 'message']);
   }
   return undefined;
@@ -552,6 +740,9 @@ function userInputBubbleContent(event: AgentEvent): string | undefined {
 
 function userInputBubbleContentKey(event: AgentEvent): string | undefined {
   if (!isRecordPayload(event.payload)) return undefined;
+  if (event.kind === 'review_summary' && stringField(event.payload, 'status') === 'accepted') {
+    return 'review.decision.accepted.userBubble';
+  }
   return stringField(event.payload, 'contentKey') ??
     stringField(event.payload, 'messageKey') ??
     stringField(event.payload, 'summaryKey');
@@ -617,27 +808,10 @@ function annotateLiveOverlayBlocks(
         const textBlock = isTimelineTextBlock(block);
         const shouldStream = textBlock && containsLastText && !hasLiveAfterLastText;
         const shouldSeal = textBlock && !shouldStream && block.events.some(isLiveTextEvent);
-        const renderMode: NarrativeRenderMode | undefined = shouldStream
-          ? 'typewriter'
-          : shouldSeal
-            ? 'instant'
-            : block.displayHints?.renderMode;
         return {
           ...block,
-          status: shouldStream ? 'running' : block.status,
-          defaultCollapsed: block.narrativeKind === 'thinking' && shouldSeal
-            ? true
-            : block.defaultCollapsed,
-          displayHints: {
-            ...(block.displayHints ?? {}),
-            renderMode,
-            initialOpen: shouldStream
-              ? true
-              : shouldSeal && block.narrativeKind === 'thinking'
-                ? false
-                : block.displayHints?.initialOpen,
-            replaceOnComplete: block.narrativeKind === 'thinking' ? true : block.displayHints?.replaceOnComplete,
-          },
+          status: shouldStream ? 'running' : shouldSeal ? 'completed' : block.status,
+          defaultCollapsed: shouldStream || shouldSeal ? false : block.defaultCollapsed,
         };
       }),
     })),
@@ -664,7 +838,8 @@ function turnContainsLiveEvent(turn: AgentTimelineResult['turns'][number], liveE
 function implementationPlanTaskProjectionItems(
   events: AgentEvent[],
   event: AgentEvent,
-  eventIndex: number
+  eventIndex: number,
+  projectedBlockId?: string
 ): NonNullable<AgentTimelineResult['taskProjection']>['items'] {
   if (event.kind !== 'plan_card' || !isRecordPayload(event.payload)) return [];
   const implementationPlan = event.payload.implementationPlan;
@@ -681,18 +856,23 @@ function implementationPlanTaskProjectionItems(
     const acceptance = stringArrayField(item, 'acceptanceCriteria');
     const failure = stringArrayField(item, 'failureCriteria');
     const scope = stringField(item, 'scope');
-    const targets = stringArrayOrSingleField(item, 'target');
+    const targets = [
+      ...stringArrayOrSingleField(item, 'target'),
+      ...stringArrayOrSingleField(item, 'targets'),
+    ];
     const summary = [
       scope,
       acceptance.length ? `Acceptance: ${acceptance.join('; ')}` : '',
       failure.length ? `Stop/Replan: ${failure.join('; ')}` : '',
     ].filter(Boolean).join(' · ');
+    const ledgerStatus = implementationTaskStatusFromLedger(taskLedger, taskId);
+    const factStatus = implementationTaskStatus(lifecycle, targets, taskId);
     return [{
       id: `implementation-plan-${event.id || eventIndex}-${taskId}`,
       title,
       summary: summary || stringField(implementationPlan, 'summary') || '',
-      status: implementationTaskStatusFromLedger(taskLedger, taskId) ?? implementationTaskStatus(lifecycle, targets, taskId),
-      blockId: `plan-${event.id || eventIndex}`,
+      status: mergeImplementationTaskStatus(ledgerStatus, factStatus),
+      blockId: projectedBlockId ?? `plan-${event.id || eventIndex}`,
       narrativeKind: 'plan' as const,
     }];
   });
@@ -726,12 +906,29 @@ function implementationTaskStatusFromLedger(
     const entryTaskId = normalizeTaskId(stringField(entry, 'taskId') ?? '');
     if (!entryTaskId || entryTaskId !== normalizedTaskId) continue;
     const status = stringField(entry, 'status');
-    if (status === 'completedByKernelFacts' || status === 'skippedByUser' || status === 'acceptedIncompleteByUser') return 'completed';
+    if (
+      status === 'completedByKernelFacts' ||
+      status === 'modelJudgedSufficient' ||
+      status === 'skippedByUser' ||
+      status === 'acceptedIncompleteByUser'
+    ) return 'completed';
     if (status === 'failed') return 'failed';
     if (status === 'inProgress') return 'running';
     return 'queued';
   }
   return undefined;
+}
+
+function mergeImplementationTaskStatus(
+  ledgerStatus: AgentTimelineStatus | undefined,
+  factStatus: AgentTimelineStatus
+): AgentTimelineStatus {
+  // Kernel facts can advance a stale checkpoint ledger; terminal ledger states still remain authoritative.
+  if (!ledgerStatus) return factStatus;
+  if (ledgerStatus === 'failed' || factStatus === 'failed' || factStatus === 'blocked') return 'failed';
+  if (ledgerStatus === 'completed' || factStatus === 'completed') return 'completed';
+  if (ledgerStatus === 'running' || factStatus === 'running') return 'running';
+  return ledgerStatus;
 }
 
 interface ImplementationPlanLifecycle {
@@ -825,9 +1022,18 @@ function implementationTaskStatus(
 
 function samePlanDecision(payload: Record<string, unknown>, planRunId?: string, planId?: string): boolean {
   const decisionRunId = stringField(payload, 'runId');
-  const decisionPlanId = stringField(payload, 'planId');
-  return (!planRunId || !decisionRunId || decisionRunId === planRunId) &&
-    (!planId || !decisionPlanId || decisionPlanId === planId);
+  const owner = isRecordPayload(payload.decisionOwner) ? payload.decisionOwner : undefined;
+  const ownerKind = stringField(payload, 'decisionKind') ?? (owner ? stringField(owner, 'kind') : undefined);
+  const ownerPlanId = ownerKind === 'plan'
+    ? stringField(payload, 'targetId') ?? (owner ? stringField(owner, 'targetId') : undefined)
+    : undefined;
+  const decisionPlanId = stringField(payload, 'planId') ??
+    stringField(payload, 'sourcePlanId') ??
+    stringField(payload, 'targetId') ??
+    (owner ? stringField(owner, 'planId') : undefined) ??
+    ownerPlanId;
+  if (planId && decisionPlanId) return decisionPlanId === planId;
+  return !planRunId || !decisionRunId || decisionRunId === planRunId;
 }
 
 interface ImplementationFact {
@@ -869,7 +1075,7 @@ function eventPathCandidates(payload: Record<string, unknown>): string[] {
   const candidates: string[] = [];
   const collect = (value: unknown): void => {
     if (!isRecordPayload(value)) return;
-    for (const key of ['path', 'absolutePath', 'resourceScope', 'target']) {
+    for (const key of ['path', 'absolutePath', 'normalizedTargetPath', 'resourceScope', 'target', 'targets', 'targetPath', 'writeSet', 'deleteSet']) {
       const field = value[key];
       if (typeof field === 'string' && field.trim()) candidates.push(field);
       if (Array.isArray(field)) {
@@ -1131,14 +1337,50 @@ function tokenUsageRequestTitle(payload: unknown, index: number): string {
 function appendNarrativeBlock(blocks: AgentTimelineBlock[], event: AgentEvent, index: number): void {
   const nextNarrativeKind = narrativeKindForEvent(event);
   const nextLegacyKind = legacyKindForNarrative(nextNarrativeKind);
-  const groupable = nextNarrativeKind === 'operationEvidence' || nextNarrativeKind === 'thinking';
   const last = blocks[blocks.length - 1];
-  if (groupable && last?.narrativeKind === nextNarrativeKind && last.status !== 'failed') {
+  if (last && canGroupNarrativeEvent(last, event, nextNarrativeKind)) {
     const events = [...last.events, event];
     blocks[blocks.length - 1] = narrativeBlockFromEvents(events, index, last.id, nextLegacyKind, nextNarrativeKind);
     return;
   }
   blocks.push(narrativeBlockFromEvents([event], index, undefined, nextLegacyKind, nextNarrativeKind));
+}
+
+function canGroupNarrativeEvent(
+  last: AgentTimelineBlock,
+  event: AgentEvent,
+  nextNarrativeKind: AgentTimelineNarrativeKind
+): boolean {
+  if (last.narrativeKind !== nextNarrativeKind || last.status === 'failed') return false;
+  // Each provider call is a distinct reasoning item. Streaming chunks for one
+  // call are already coalesced before they enter the narrative projection.
+  if (nextNarrativeKind === 'thinking') return false;
+  if (nextNarrativeKind !== 'operationEvidence') return false;
+
+  const lastActivityKey = narrativeActivityGroupKey(last.events);
+  const nextActivityKey = narrativeActivityGroupKey([event]);
+  if (lastActivityKey || nextActivityKey) {
+    return Boolean(lastActivityKey && nextActivityKey && lastActivityKey === nextActivityKey);
+  }
+  return narrativeStageGroupKey(last.events[last.events.length - 1]) === narrativeStageGroupKey(event);
+}
+
+function narrativeActivityGroupKey(events: AgentEvent[]): string | undefined {
+  const activity = narrativeActivity(events);
+  if (!activity) return undefined;
+  const actionId = activity.actionIds?.[0];
+  if (actionId) return `action:${actionId}`;
+  const workUnitId = activity.workUnitIds?.[0];
+  if (workUnitId) return `work-unit:${workUnitId}`;
+  return `activity:${activity.activityId}`;
+}
+
+function narrativeStageGroupKey(event: AgentEvent | undefined): string | undefined {
+  if (!event) return undefined;
+  const payload = isRecordPayload(event.payload) ? event.payload : {};
+  const stage = stringField(payload, 'stage');
+  const channel = stringField(payload, 'channel');
+  return stage || channel ? `${event.kind}:${stage ?? ''}:${channel ?? ''}` : event.kind;
 }
 
 function narrativeBlockFromEvents(
@@ -1156,6 +1398,9 @@ function narrativeBlockFromEvents(
   const title = activity?.title ?? narrativeTitle(events, narrativeKind);
   const summary = activity?.summary ?? summarizeAgentEvents(events);
   const body = narrativeBody(events, narrativeKind);
+  const structuredProjection = narrativeStructuredProjection(events, narrativeKind);
+  const attachments = narrativeAttachments(events);
+  const feedbackEvent = [...events].reverse().find((event) => event.kind !== 'user_msg');
   return {
     id: existingId ?? `${narrativeKind}-${first.id || index}`,
     kind: legacyKind,
@@ -1166,12 +1411,89 @@ function narrativeBlockFromEvents(
     status,
     defaultCollapsed: narrativeDefaultCollapsed(narrativeKind, status),
     bodyMarkdown: body,
-    displayHints: narrativeDisplayHints(narrativeKind, status, title, summary, body),
+    structuredProjection,
+    decisionRequest: undefined,
+    attachments,
+    feedbackRef: feedbackEvent
+      ? { eventId: feedbackEvent.id, sessionId: feedbackEvent.sessionId, kind: feedbackEvent.kind }
+      : undefined,
+    displayHints: narrativeDisplayHints(narrativeKind, title, summary),
     evidenceRefs: events.flatMap(eventEvidenceRefs),
     rawEventRefs: events.map(eventRefForAgentEvent),
     taskProjectionRef: shouldShowNarrativeInTaskList(narrativeKind) ? `task-${narrativeKind}-${first.id || index}` : undefined,
     events,
   };
+}
+
+function narrativeAttachments(events: AgentEvent[]): AgentContextAttachment[] | undefined {
+  const attachments = events.flatMap((event) => {
+    if (!isRecordPayload(event.payload) || !Array.isArray(event.payload.attachments)) return [];
+    return event.payload.attachments.filter(isAgentContextAttachment);
+  });
+  return attachments.length > 0 ? attachments : undefined;
+}
+
+function isAgentContextAttachment(value: unknown): value is AgentContextAttachment {
+  if (!isRecordPayload(value)) return false;
+  return typeof value.path === 'string' &&
+    (value.scope === 'session' || value.scope === 'message') &&
+    (value.kind === 'file' || value.kind === 'directory' || value.kind === 'panelSnapshot') &&
+    (value.source === 'mention' || value.source === 'contextMenu' || value.source === 'browser' || value.source === 'userSelected');
+}
+
+function narrativeStructuredProjection(
+  events: AgentEvent[],
+  kind: AgentTimelineNarrativeKind
+): AgentTimelineBlock['structuredProjection'] {
+  if (kind !== 'plan' && kind !== 'review') return undefined;
+  const field = kind === 'plan' ? 'readablePlan' : 'readableReview';
+  for (const event of [...events].reverse()) {
+    const payload = isRecordPayload(event.payload) ? event.payload : undefined;
+    const readable = payload && isRecordPayload(payload[field]) ? payload[field] : undefined;
+    if (!readable || !Array.isArray(readable.sections)) continue;
+    const schemaVersion = stringField(readable, 'schemaVersion');
+    if (!schemaVersion) continue;
+    return {
+      kind,
+      schemaVersion,
+      title: stringField(readable, 'title'),
+      titleKey: stringField(readable, 'titleKey'),
+      titleArgs: recordStringValues(readable.titleArgs),
+      summary: stringField(readable, 'summary'),
+      summaryKey: stringField(readable, 'summaryKey'),
+      messageArgs: recordStringValues(readable.messageArgs),
+      sections: readable.sections.flatMap((section) => {
+        if (!isRecordPayload(section)) return [];
+        const sectionId = stringField(section, 'sectionId');
+        const titleKey = stringField(section, 'titleKey');
+        if (!sectionId || !titleKey || !Array.isArray(section.items)) return [];
+        return [{
+          sectionId,
+          titleKey,
+          titleArgs: recordStringValues(section.titleArgs),
+          emptyMessageKey: stringField(section, 'emptyMessageKey'),
+          items: section.items.flatMap((item) => {
+            if (!isRecordPayload(item)) return [];
+            const itemId = stringField(item, 'itemId');
+            const itemKind = stringField(item, 'kind');
+            if (!itemId || !itemKind) return [];
+            return [{
+              itemId,
+              kind: itemKind,
+              text: stringField(item, 'text'),
+              messageKey: stringField(item, 'messageKey'),
+              messageArgs: recordStringValues(item.messageArgs),
+              status: stringField(item, 'status'),
+              targetRefs: stringArrayField(item, 'targetRefs'),
+              auditRefs: stringArrayField(item, 'auditRefs'),
+              metadata: isRecordPayload(item.metadata) ? item.metadata : undefined,
+            }];
+          }),
+        }];
+      }),
+    };
+  }
+  return undefined;
 }
 
 function finalizeNarrativeTurn(turn: AgentTimelineResult['turns'][number]): AgentTimelineResult['turns'][number] {
@@ -1195,6 +1517,71 @@ function finalizeNarrativeTurn(turn: AgentTimelineResult['turns'][number]): Agen
   };
 }
 
+function stabilizeNarrativeBlockIds(turns: AgentTimelineResult['turns']): void {
+  for (const turn of turns) {
+    const occurrences = new Map<string, number>();
+    for (const block of turn.blocks) {
+      const narrativeKind = block.narrativeKind ?? narrativeKindForLegacyKind(block.kind);
+      const base = semanticNarrativeBlockIdentity(block) ?? `flow:${turn.id}:${narrativeKind}`;
+      const occurrence = (occurrences.get(base) ?? 0) + 1;
+      occurrences.set(base, occurrence);
+      block.id = `${base}:${occurrence}`;
+      if (block.taskProjectionRef) block.taskProjectionRef = `task:${block.id}`;
+    }
+  }
+}
+
+function semanticNarrativeBlockIdentity(block: AgentTimelineBlock): string | undefined {
+  if (block.narrativeKind === 'user') {
+    const projectedUserEvent = block.events.find((event) => event.kind === 'user_msg');
+    const payload = projectedUserEvent && isRecordPayload(projectedUserEvent.payload)
+      ? projectedUserEvent.payload
+      : undefined;
+    const sourceEventId = payload ? stringField(payload, 'sourceEventId') : undefined;
+    if (sourceEventId) return `timeline:user-input:${sourceEventId}`;
+  }
+
+  const activityKey = narrativeActivityGroupKey(block.events);
+  if (activityKey) return `timeline:${activityKey}`;
+
+  for (const event of block.events) {
+    const payload = isRecordPayload(event.payload) ? event.payload : {};
+    const runId = stringField(payload, 'runId') ?? 'run';
+    if (event.kind === 'plan_card' || event.kind === 'plan_review') {
+      const planId = stringField(payload, 'planId');
+      if (planId) return `timeline:plan:${runId}:${planId}`;
+    }
+    if (event.kind === 'review_summary') {
+      const reviewId = stringField(payload, 'reviewId') ?? stringField(payload, 'sourcePlanId');
+      if (reviewId) return `timeline:review:${runId}:${reviewId}`;
+    }
+    if (event.kind === 'requirement_confirmation' || event.kind === 'requirement_decision') {
+      const requirementId = stringField(payload, 'requirementId');
+      if (requirementId) return `timeline:requirement:${runId}:${requirementId}`;
+    }
+    if (event.kind === 'permission_request' || event.kind === 'permission_result') {
+      const permissionId = stringField(payload, 'permissionId') ?? stringField(payload, 'requestId');
+      if (permissionId) return `timeline:permission:${runId}:${permissionId}`;
+    }
+    if (event.kind === 'assistant_msg') {
+      const proposalId = stringField(payload, 'proposalId');
+      const channel = stringField(payload, 'channel');
+      if (proposalId && channel) return `timeline:proposal:${proposalId}:${channel}`;
+    }
+  }
+  return undefined;
+}
+
+function timelineBlockIdsByEventId(turns: AgentTimelineResult['turns']): Map<string, string> {
+  const result = new Map<string, string>();
+  for (const turn of turns) {
+    for (const block of turn.blocks) {
+      for (const event of block.events) result.set(event.id, block.id);
+    }
+  }
+  return result;
+}
+
 function narrativeKindForEvent(event: AgentEvent): AgentTimelineNarrativeKind {
   if (event.kind === 'user_msg') return 'user';
   if (event.kind === 'user_guidance') return 'requirement';
@@ -1204,6 +1591,7 @@ function narrativeKindForEvent(event: AgentEvent): AgentTimelineNarrativeKind {
   if (event.kind === 'review_summary') return 'review';
   if (event.kind === 'error') return 'diagnostic';
   if (event.kind === 'assistant_msg') {
+    if (isRecordPayload(event.payload) && event.payload.diagnostic === true) return 'diagnostic';
     const channel = stringValueFromPayload(event.payload, 'channel');
     if (channel === 'reasoning') return 'thinking';
     if (channel === 'progress' && ['llm', 'session', 'provider'].includes(stringValueFromPayload(event.payload, 'source') ?? '')) {
@@ -1265,43 +1653,232 @@ function narrativeKindForLegacyKind(kind: AgentTimelineBlockKind): AgentTimeline
 }
 
 function narrativeStatus(events: AgentEvent[]): AgentTimelineStatus {
-  if (events.some((event) => event.kind === 'error' || stringValueFromPayload(event.payload, 'status') === 'error')) {
+  if (events.some((event) => event.kind === 'error' || narrativeEventStatus(event) === 'failed')) {
     return 'failed';
   }
   if (events.some((event) => event.kind === 'user_guidance')) {
-    return events.some((event) => stringValueFromPayload(event.payload, 'status') === 'consumed')
+    return events.some((event) => narrativeEventStatus(event) === 'consumed')
       ? 'completed'
       : 'queued';
   }
   if (events.some((event) => event.kind === 'permission_request') && !events.some((event) => event.kind === 'permission_result')) {
     return 'waiting';
   }
-  if (events.some((event) => event.kind === 'session_run_state' && stringValueFromPayload(event.payload, 'status') === 'waiting')) {
+  if (events.some((event) => event.kind === 'session_run_state' && narrativeEventStatus(event) === 'waiting')) {
     return 'waiting';
   }
   if (
     events.some((event) =>
       event.kind === 'requirement_confirmation' &&
-      stringValueFromPayload(event.payload, 'status') === 'waitingUserConfirmation'
+      narrativeEventStatus(event) === 'waitingUserConfirmation'
     ) &&
     !events.some((event) => event.kind === 'requirement_decision')
   ) {
     return 'waiting';
   }
-  if (events.some((event) => event.kind === 'plan_card' && planCardEventAwaitingDecision(event))) {
+  if (events.some((event) => planEventAwaitingDecision(event, events))) {
     return 'waiting';
   }
-  if (events.some((event) => event.kind === 'plan_review' && planReviewEventAwaitingDecision(event))) {
-    return 'waiting';
-  }
-  if (events.some((event) => event.kind === 'tool_call' || stringValueFromPayload(event.payload, 'status') === 'running')) {
+  if (events.some((event) => event.kind === 'tool_call' || narrativeEventStatus(event) === 'running')) {
     const hasCompletion = events.some((event) =>
       event.kind === 'tool_result' ||
-      ['completed', 'done', 'ok', 'succeeded'].includes(stringValueFromPayload(event.payload, 'status') ?? '')
+      ['completed', 'done', 'ok', 'succeeded'].includes(narrativeEventStatus(event) ?? '')
     );
     if (!hasCompletion) return 'running';
   }
   return 'completed';
+}
+
+function narrativeEventStatus(event: AgentEvent): string | undefined {
+  if (!isRecordPayload(event.payload)) return undefined;
+  const kernelStatus = kernelEventTimelineStatus(event.payload);
+  if (kernelStatus) return kernelStatus;
+  return stringValueFromPayload(event.payload, 'status');
+}
+
+function kernelEventTimelineStatus(payload: Record<string, unknown>): AgentTimelineStatus | 'consumed' | undefined {
+  const kernelEvent = isRecordPayload(payload.kernelEvent) ? payload.kernelEvent : undefined;
+  const kind = kernelEvent ? stringField(kernelEvent, 'kind') : undefined;
+  if (!kind) return undefined;
+  if (
+    kind === 'review_gate.evaluated' ||
+    kind === 'review.facts_produced' ||
+    kind === 'work_unit.completed' ||
+    kind === 'tool.completed' ||
+    kind === 'permission.resolved'
+  ) return 'completed';
+  if (kind === 'work_unit.failed' || kind === 'tool.failed') return 'failed';
+  if (kind === 'work_unit.blocked') return 'blocked';
+  if (kind === 'work_unit.started' || kind === 'work_unit.queued' || kind === 'tool.started') return 'running';
+  return undefined;
+}
+
+function resolveTimelineInteractionBlocks(
+  turns: AgentTimelineResult['turns'],
+  events: AgentEvent[]
+): void {
+  for (let turnIndex = 0; turnIndex < turns.length; turnIndex += 1) {
+    const turn = turns[turnIndex];
+    for (const block of turn.blocks) {
+      if (block.status !== 'waiting' && block.status !== 'blocked') continue;
+      const resolved = block.events.some((event) => {
+        if (event.kind === 'plan_card' || event.kind === 'plan_review') return planInteractionResolved(event, events);
+        if (event.kind === 'review_summary') return reviewInteractionResolved(event, events);
+        if (event.kind === 'requirement_confirmation') return requirementInteractionResolved(event, events);
+        if (event.kind === 'session_run_state') return runStateInteractionResolved(event, events);
+        return false;
+      });
+      if (!resolved) continue;
+      block.status = 'completed';
+      block.defaultCollapsed = narrativeDefaultCollapsed(block.narrativeKind ?? 'operationEvidence', 'completed');
+    }
+    turns[turnIndex] = finalizeNarrativeTurn(turn);
+  }
+}
+
+function runStateInteractionResolved(event: AgentEvent, events: AgentEvent[]): boolean {
+  const payload = isRecordPayload(event.payload) ? event.payload : {};
+  if (stringField(payload, 'status') !== 'waiting') return false;
+  const ownerKind = runStateInteractionOwnerKind(payload);
+  if (ownerKind !== 'plan' && ownerKind !== 'review' && ownerKind !== 'requirement') return false;
+  const activeInteraction = findActiveInteraction({ events });
+  if (!activeInteraction) return true;
+  return !sameRunStateInteractionOwner(activeInteraction, payload, ownerKind);
+}
+
+function sameRunStateInteractionOwner(
+  activeInteraction: InteractionLedgerActiveInteraction,
+  payload: Record<string, unknown>,
+  ownerKind: 'plan' | 'review' | 'requirement'
+): boolean {
+  const owner = isRecordPayload(payload.decisionOwner) ? payload.decisionOwner : {};
+  const runId = stringField(payload, 'runId') ?? stringField(owner, 'runId');
+  if (ownerKind === 'plan') {
+    if (activeInteraction.kind !== 'plan') return false;
+    if (runId && activeInteraction.runId !== runId) return false;
+    const planId = runStateInteractionOwnerId(payload, owner, 'plan');
+    if (planId && activeInteraction.planId !== planId) return false;
+    return Boolean(runId || planId);
+  }
+  if (ownerKind === 'requirement') {
+    if (activeInteraction.kind !== 'requirement') return false;
+    if (runId && activeInteraction.runId !== runId) return false;
+    const requirementId = runStateInteractionOwnerId(payload, owner, 'requirement');
+    if (requirementId && activeInteraction.requirementId !== requirementId) return false;
+    return Boolean(runId || requirementId);
+  }
+  if (activeInteraction.kind !== 'review') return false;
+  if (runId && activeInteraction.runId !== runId) return false;
+  const reviewId = runStateInteractionOwnerId(payload, owner, 'review');
+  return Boolean(runId || reviewId);
+}
+
+function runStateInteractionOwnerKind(payload: Record<string, unknown>): string | undefined {
+  const owner = isRecordPayload(payload.decisionOwner) ? payload.decisionOwner : undefined;
+  return stringField(payload, 'decisionKind') ?? (owner ? stringField(owner, 'kind') : undefined);
+}
+
+function runStateInteractionOwnerId(
+  payload: Record<string, unknown>,
+  owner: Record<string, unknown>,
+  ownerKind: 'plan' | 'review' | 'requirement'
+): string | undefined {
+  if (ownerKind === 'plan') {
+    return stringField(payload, 'planId') ??
+      stringField(payload, 'sourcePlanId') ??
+      stringField(payload, 'targetId') ??
+      stringField(owner, 'planId') ??
+      stringField(owner, 'targetId');
+  }
+  if (ownerKind === 'requirement') {
+    return stringField(payload, 'requirementId') ??
+      stringField(payload, 'targetId') ??
+      stringField(owner, 'requirementId') ??
+      stringField(owner, 'targetId');
+  }
+  return stringField(payload, 'reviewId') ??
+    stringField(payload, 'targetId') ??
+    stringField(owner, 'reviewId') ??
+    stringField(owner, 'targetId');
+}
+
+function planInteractionResolved(event: AgentEvent, events: AgentEvent[]): boolean {
+  const payload = isRecordPayload(event.payload) ? event.payload : {};
+  const runId = stringField(payload, 'runId');
+  const planId = stringField(payload, 'planId');
+  if (!runId || !planId) return false;
+  return events.some((candidate) => {
+    const candidatePayload = isRecordPayload(candidate.payload) ? candidate.payload : {};
+    if (!decisionStatusResolved(stringField(candidatePayload, 'status'))) return false;
+    if (candidate.kind === 'plan_review' || candidate.kind === 'review_summary') {
+      return samePlanDecision(candidatePayload, runId, planId);
+    }
+    if (candidate.kind !== 'session_run_state') return false;
+    return samePlanDecision(candidatePayload, runId, planId) &&
+      runStatusResolved(stringField(candidatePayload, 'status'));
+  });
+}
+
+function planEventAwaitingDecision(event: AgentEvent, events: AgentEvent[]): boolean {
+  const awaiting = event.kind === 'plan_card'
+    ? planCardEventAwaitingDecision(event)
+    : event.kind === 'plan_review'
+      ? planReviewEventAwaitingDecision(event)
+      : false;
+  return awaiting && !planInteractionResolved(event, events);
+}
+
+function reviewInteractionResolved(event: AgentEvent, events: AgentEvent[]): boolean {
+  const payload = isRecordPayload(event.payload) ? event.payload : {};
+  if (stringField(payload, 'status') !== 'waitingUserReview') return false;
+  const runId = stringField(payload, 'runId');
+  const reviewId = stringField(payload, 'reviewId');
+  const sourcePlanId = stringField(payload, 'sourcePlanId');
+  if (!runId) return false;
+  return events.some((candidate) => {
+    const candidatePayload = isRecordPayload(candidate.payload) ? candidate.payload : {};
+    if (candidate.kind === 'review_summary') {
+      if (!decisionStatusResolved(stringField(candidatePayload, 'status'))) return false;
+      if (stringField(candidatePayload, 'runId') !== runId) return false;
+      const candidateReviewId = stringField(candidatePayload, 'reviewId');
+      const candidateSourcePlanId = stringField(candidatePayload, 'sourcePlanId');
+      if (reviewId) return candidateReviewId === reviewId;
+      if (sourcePlanId) return candidateSourcePlanId === sourcePlanId;
+      return true;
+    }
+    if (candidate.kind !== 'session_run_state') return false;
+    if (stringField(candidatePayload, 'runId') !== runId) return false;
+    return runStatusResolved(stringField(candidatePayload, 'status'));
+  });
+}
+
+function requirementInteractionResolved(event: AgentEvent, events: AgentEvent[]): boolean {
+  const payload = isRecordPayload(event.payload) ? event.payload : {};
+  const runId = stringField(payload, 'runId');
+  const requirementId = stringField(payload, 'requirementId');
+  if (!runId || !requirementId) return false;
+  return events.some((candidate) => {
+    if (candidate.kind !== 'requirement_decision') return false;
+    const candidatePayload = isRecordPayload(candidate.payload) ? candidate.payload : {};
+    if (!decisionStatusResolved(stringField(candidatePayload, 'status'))) return false;
+    return stringField(candidatePayload, 'runId') === runId &&
+      stringField(candidatePayload, 'requirementId') === requirementId;
+  });
+}
+
+function decisionStatusResolved(status?: string): boolean {
+  return status === 'accepted' ||
+    status === 'rejected' ||
+    status === 'needsRevision' ||
+    status === 'cancelled' ||
+    status === 'failed' ||
+    status === 'completed';
+}
+
+function runStatusResolved(status?: string): boolean {
+  return status === 'completed' ||
+    status === 'cancelled' ||
+    status === 'failed';
 }
 
 function narrativeTitle(events: AgentEvent[], kind: AgentTimelineNarrativeKind): string {
@@ -1331,10 +1908,19 @@ function summarizeAgentEvents(events: AgentEvent[]): string {
 
 function narrativeBody(events: AgentEvent[], kind: AgentTimelineNarrativeKind): string | undefined {
   if (kind === 'operationEvidence') return undefined;
-  if (kind === 'plan' || kind === 'review') return undefined;
+  if (kind === 'plan') return undefined;
+  if (kind === 'review') {
+    if (narrativeStructuredProjection(events, kind)) return undefined;
+    const text = events.map(reviewEventBody).find((value) => value.trim().length > 0);
+    return text?.trim() || undefined;
+  }
   if (kind === 'thinking') {
     const reasoning = events.map(reasoningEventBody).join('').trim();
     return reasoning || undefined;
+  }
+  if (kind === 'diagnostic') {
+    const text = firstNonEmpty(events, ['userMessage', 'message', 'summary']);
+    return text?.trim() ? text : undefined;
   }
   const text = firstNonEmpty(events, ['content', 'message', 'summary', 'details']);
   return text?.trim() ? text : undefined;
@@ -1372,43 +1958,26 @@ function trimReviewFooter(markdown: string): string {
 function narrativeDefaultCollapsed(kind: AgentTimelineNarrativeKind, status: AgentTimelineStatus): boolean {
   if (status === 'running' || status === 'waiting') return false;
   if (kind === 'assistantNarration') return false;
-  return kind === 'thinking' || kind === 'operationEvidence' || kind === 'permission';
+  return kind === 'thinking' ||
+    kind === 'operationEvidence' ||
+    kind === 'permission' ||
+    (kind === 'plan' && status === 'completed');
 }
 
 function narrativeDisplayHints(
   kind: AgentTimelineNarrativeKind,
-  status: AgentTimelineStatus,
   title: string,
-  summary: string,
-  body?: string
+  summary: string
 ): AgentTimelineBlock['displayHints'] {
-  const textLength = (body ?? summary ?? '').length;
-  const renderMode = narrativeRenderMode(kind, status);
   return {
     density: kind === 'operationEvidence' ? 'compact' : 'normal',
     evidenceMode: kind === 'operationEvidence' ? 'collapsed' : 'inline',
-    renderMode,
-    initialOpen: status === 'running' || status === 'waiting' || kind === 'assistantNarration',
     collapseAfterComplete: kind === 'thinking' || kind === 'operationEvidence',
-    typewriterSpeed: narrativeTypewriterSpeed(kind, renderMode, textLength),
-    replaceOnComplete: kind === 'thinking',
     checkpointKind: narrativeCheckpointKind(kind),
     showInTaskList: shouldShowNarrativeInTaskList(kind),
     taskListLabel: title,
     taskListSummary: summary,
   };
-}
-
-function narrativeTypewriterSpeed(
-  kind: AgentTimelineNarrativeKind,
-  renderMode: NarrativeRenderMode,
-  textLength: number
-): NonNullable<NonNullable<AgentTimelineBlock['displayHints']>['typewriterSpeed']> | undefined {
-  if (renderMode === 'accelerated') return 'fast';
-  if (renderMode !== 'typewriter') return undefined;
-  if (kind === 'thinking') return 'slow';
-  if (kind === 'assistantText' && textLength > 1600) return 'fast';
-  return 'normal';
 }
 
 function narrativeCheckpointKind(
@@ -1423,23 +1992,6 @@ function narrativeCheckpointKind(
   if (kind === 'review') return 'review';
   if (kind === 'diagnostic') return 'diagnostic';
   return undefined;
-}
-
-function narrativeRenderMode(
-  kind: AgentTimelineNarrativeKind,
-  status: AgentTimelineStatus
-): NarrativeRenderMode {
-  if (kind === 'assistantNarration') return 'typewriter';
-  if (kind === 'assistantText') return 'typewriter';
-  if (kind === 'thinking') return status === 'running' || status === 'waiting' ? 'typewriter' : 'static';
-  if (
-    kind === 'plan' ||
-    kind === 'review' ||
-    kind === 'requirement' ||
-    kind === 'permission' ||
-    kind === 'diagnostic'
-  ) return 'typewriter';
-  return 'static';
 }
 
 function shouldShowNarrativeInTaskList(kind: AgentTimelineNarrativeKind): boolean {
@@ -1495,6 +2047,7 @@ function activityFromValue(value: unknown): AgentConversationActivity | undefine
     actionIds: stringArrayField(value, 'actionIds'),
     workUnitIds: stringArrayField(value, 'workUnitIds'),
     toolName: stringField(value, 'toolName'),
+    operation: stringField(value, 'operation'),
     itemCount: numberField(value, 'itemCount'),
     errorCode: stringField(value, 'errorCode'),
     errorMessage: stringField(value, 'errorMessage'),

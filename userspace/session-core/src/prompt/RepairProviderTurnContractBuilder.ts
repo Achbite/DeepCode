@@ -61,7 +61,7 @@ export class RepairProviderTurnContractBuilder {
         source: 'session.acceptedPlanCursor',
         trust: 'confirmedTaskInstruction',
         scope: 'currentAcceptedTask',
-        use: 'repair only this current task unless decisionRequest asks the user to expand scope',
+        use: 'repair only this current task; Session and Kernel validate concrete operation scope before execution',
         content: [
           `taskId=${input.currentTaskContext?.taskId ?? stringValue(currentTask?.taskId) ?? 'none'}`,
           `title=${oneLineText(input.currentTaskContext?.taskTitle ?? stringValue(currentTask?.title) ?? '', 240) || 'none'}`,
@@ -115,12 +115,18 @@ function repairNextActionInstructionLines(input: {
     ? 'taskPlan | implementationPlan | reviewSummary'
     : 'actionBundle | implementationPlan | reviewSummary';
   const nextAction = allowsActionBundle
-    ? 'If executable work remains in current scope, output actionBundle. If evidence is missing, output focused resourceRequest. If scope must expand, output decisionRequest.'
+    ? [
+      'If executable work remains in current scope, output actionBundle.',
+      'If the current task is already sufficiently satisfied and no Kernel action is needed, output taskOutcome when allowed.',
+      'If evidence is missing, output focused resourceRequest.',
+      'If a concrete operation exceeds accepted scope, Session and Kernel will interrupt for user approval after proposal validation.',
+    ].join(' ')
     : 'Do not output executable tool args. If side-effect work remains unaccepted, output taskPlan. If evidence is missing, output focused resourceRequest. If a user choice is needed, output decisionRequest.';
   return [
     `state=${input.turnMode}`,
     `allowedOutputs=${input.allowedKinds.join(' | ') || 'none'}`,
     input.requiredKind ? `requiredOutput=${input.requiredKind}` : '',
+    'requiredSchemaVersion=deepcode.agent.protocol.v3',
     `forbiddenOutputs=${forbidden}`,
     'Return exactly one valid Agent Protocol v3 JSON object. No prose, markdown fences, or protocol explanation.',
     nextAction,
@@ -132,10 +138,7 @@ function repairToolIntentTemplates(
   acceptedContext: Record<string, unknown>
 ): string[] {
   if (!input.allowedKinds.includes('actionBundle')) {
-    return [
-      'No executable tool intent templates are visible in this repair call.',
-      'Use taskPlan operation intent, focused resourceRequest, decisionRequest, answer, or diagnostic according to allowedOutputs.',
-    ];
+    return [];
   }
   const templates = Array.isArray(acceptedContext.currentTaskActionTemplates)
     ? acceptedContext.currentTaskActionTemplates

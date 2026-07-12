@@ -529,6 +529,7 @@ export interface AgentConversationActivity {
   actionIds?: string[];
   workUnitIds?: string[];
   toolName?: string;
+  operation?: string;
   itemCount?: number;
   errorCode?: string;
   errorMessage?: string;
@@ -537,11 +538,7 @@ export interface AgentConversationActivity {
 export interface AgentTimelineDisplayHints {
   density?: 'normal' | 'compact' | 'debug';
   evidenceMode?: 'inline' | 'collapsed' | 'debugOnly';
-  renderMode?: 'typewriter' | 'instant' | 'accelerated' | 'static';
-  initialOpen?: boolean;
   collapseAfterComplete?: boolean;
-  typewriterSpeed?: 'slow' | 'normal' | 'fast';
-  replaceOnComplete?: boolean;
   checkpointKind?: 'turnStart' | 'llmProposal' | 'resourcePacket' | 'userGuidance' | 'permission' | 'review' | 'final' | 'diagnostic';
   showInTaskList?: boolean;
   taskListLabel?: string;
@@ -565,6 +562,53 @@ export interface AgentTimelineTaskProjectionItem {
 export interface AgentTimelineTaskProjection {
   title: string;
   items: AgentTimelineTaskProjectionItem[];
+}
+
+export type AgentTimelineInteractionOptionEffect =
+  | { kind: 'continueWithAction' }
+  | { kind: 'skipCurrentTask' }
+  | { kind: 'replan'; reason?: string }
+  | { kind: 'finishRun' };
+
+export interface AgentTimelineInteractionOption {
+  id: string;
+  label: string;
+  description?: string;
+  recommended?: boolean;
+  effect?: AgentTimelineInteractionOptionEffect;
+}
+
+export interface AgentTimelineDecisionRequest {
+  id?: string;
+  reason?: string;
+  summary?: string;
+  allowsFreeform: boolean;
+  options: AgentTimelineInteractionOption[];
+}
+
+export type AgentTimelinePendingInteraction =
+  | {
+      kind: 'permission';
+      requestId: string;
+      request: PermissionRequest;
+      blockId?: string;
+      title?: string;
+      summary?: string;
+    }
+  | { kind: 'review'; runId: string; blockId?: string; title?: string; summary?: string }
+  | { kind: 'plan'; runId: string; planId: string; blockId?: string; title?: string; summary?: string }
+  | {
+      kind: 'requirement';
+      runId: string;
+      requirementId: string;
+      blockId?: string;
+      title?: string;
+      summary?: string;
+      decisionRequest?: AgentTimelineDecisionRequest;
+    };
+
+export interface AgentTimelineInteractionProjection {
+  pending?: AgentTimelinePendingInteraction;
 }
 
 export interface AgentTimelineTokenUsageTotals {
@@ -594,8 +638,50 @@ export interface AgentTimelineTokenUsageProjection {
   requests: AgentTimelineTokenUsageRequest[];
 }
 
+export interface AgentTimelineWorkspaceProjection {
+  revision: number;
+  changedTargets: string[];
+}
+
+export interface AgentTimelineStructuredProjectionItem {
+  itemId: string;
+  kind: string;
+  text?: string;
+  messageKey?: string;
+  messageArgs?: Record<string, string>;
+  status?: string;
+  targetRefs?: string[];
+  auditRefs?: string[];
+  metadata?: Record<string, unknown>;
+}
+
+export interface AgentTimelineStructuredProjectionSection {
+  sectionId: string;
+  titleKey: string;
+  titleArgs?: Record<string, string>;
+  emptyMessageKey?: string;
+  items: AgentTimelineStructuredProjectionItem[];
+}
+
+export interface AgentTimelineStructuredProjection {
+  kind: 'plan' | 'review';
+  schemaVersion: string;
+  title?: string;
+  titleKey?: string;
+  titleArgs?: Record<string, string>;
+  summary?: string;
+  summaryKey?: string;
+  messageArgs?: Record<string, string>;
+  sections: AgentTimelineStructuredProjectionSection[];
+}
+
+export type AgentTimelineDeliveryMode = 'live' | 'buffered' | 'replay';
+
 export interface AgentTimelineBlock {
   id: string;
+  sequence?: number;
+  revision?: number;
+  deliveryMode?: AgentTimelineDeliveryMode;
   kind: AgentTimelineBlockKind;
   narrativeKind?: AgentTimelineNarrativeKind;
   activity?: AgentConversationActivity;
@@ -604,6 +690,14 @@ export interface AgentTimelineBlock {
   status: AgentTimelineStatus;
   defaultCollapsed: boolean;
   bodyMarkdown?: string;
+  structuredProjection?: AgentTimelineStructuredProjection;
+  decisionRequest?: AgentTimelineDecisionRequest;
+  attachments?: AgentContextAttachment[];
+  feedbackRef?: {
+    eventId: string;
+    sessionId: string;
+    kind: AgentEventKind;
+  };
   displayHints?: AgentTimelineDisplayHints;
   evidenceRefs?: string[];
   rawEventRefs?: string[];
@@ -613,6 +707,7 @@ export interface AgentTimelineBlock {
 
 export interface AgentTimelineTurn {
   id: string;
+  sequence?: number;
   sessionId: string;
   status: AgentTimelineStatus;
   startedAt?: string;
@@ -623,13 +718,103 @@ export interface AgentTimelineTurn {
 export interface AgentTimelineResult {
   schemaVersion?: 'deepcode.session.timeline.v1';
   sessionId: string;
+  revision?: number;
+  lastDeltaSeq?: number;
   generatedAt: string;
   turns: AgentTimelineTurn[];
   eventCount: number;
   taskProjection?: AgentTimelineTaskProjection;
+  interactionProjection?: AgentTimelineInteractionProjection;
   tokenUsageProjection?: AgentTimelineTokenUsageProjection;
+  workspaceProjection?: AgentTimelineWorkspaceProjection;
   rawEventRefs?: string[];
 }
+
+export interface AgentTimelineDeltaBase {
+  schemaVersion: 'deepcode.session.timeline-delta.v1';
+  op:
+    | 'timeline.synced'
+    | 'block.started'
+    | 'block.updated'
+    | 'text.append'
+    | 'activity.upsert'
+    | 'block.completed'
+    | 'block.committed'
+    | 'block.removed';
+  sessionId: string;
+  runId: string;
+  turnId: string;
+  turnSeq: number;
+  blockId: string;
+  blockSeq: number;
+  revision: number;
+  deltaSeq?: number;
+  sourceEventRefs?: string[];
+}
+
+export interface AgentTimelineSyncedDelta extends AgentTimelineDeltaBase {
+  op: 'timeline.synced';
+  timeline: AgentTimelineResult;
+  deliveryModes?: Record<string, AgentTimelineDeliveryMode>;
+}
+
+export interface AgentTimelineBlockStartedDelta extends AgentTimelineDeltaBase {
+  op: 'block.started';
+  block: AgentTimelineBlock;
+  deliveryMode: AgentTimelineDeliveryMode;
+}
+
+export interface AgentTimelineBlockUpdatedDelta extends AgentTimelineDeltaBase {
+  op: 'block.updated';
+  block: AgentTimelineBlock;
+}
+
+export interface AgentTimelineTextAppendedDelta extends AgentTimelineDeltaBase {
+  op: 'text.append';
+  segmentId: string;
+  offset: number;
+  text: string;
+  format: 'plain' | 'markdown';
+  fullCharLength?: number;
+  visibleCharLength?: number;
+  truncated?: boolean;
+  fullTextRef?: string;
+}
+
+export interface AgentTimelineActivityUpsertedDelta extends AgentTimelineDeltaBase {
+  op: 'activity.upsert';
+  activityId: string;
+  activityRevision: number;
+  activity: AgentConversationActivity;
+}
+
+export interface AgentTimelineBlockCompletedDelta extends AgentTimelineDeltaBase {
+  op: 'block.completed';
+  status: Extract<AgentTimelineStatus, 'completed' | 'waiting' | 'failed' | 'blocked'>;
+  contentHash?: string;
+}
+
+export interface AgentTimelineBlockCommittedDelta extends AgentTimelineDeltaBase {
+  op: 'block.committed';
+  committedEventIds: string[];
+  finalRevision: number;
+  finalContentHash?: string;
+  block: AgentTimelineBlock;
+}
+
+export interface AgentTimelineBlockRemovedDelta extends AgentTimelineDeltaBase {
+  op: 'block.removed';
+}
+
+export type AgentTimelineDelta =
+  | AgentTimelineSyncedDelta
+  | AgentTimelineBlockStartedDelta
+  | AgentTimelineBlockUpdatedDelta
+  | AgentTimelineTextAppendedDelta
+  | AgentTimelineActivityUpsertedDelta
+  | AgentTimelineBlockCompletedDelta
+  | AgentTimelineBlockCommittedDelta
+  | AgentTimelineBlockRemovedDelta;
 
 /**
  * 工作流类事件（workflow_decision / workflow_stage 与 RunCompleted 投影）的 payload 根字段契约。
@@ -724,6 +909,7 @@ export interface AgentFeedbackResult {
 
 export interface AppendAgentEventsRequest {
   events: AgentEvent[];
+  timeline?: AgentTimelineResult;
 }
 
 export interface AgentSessionResult {

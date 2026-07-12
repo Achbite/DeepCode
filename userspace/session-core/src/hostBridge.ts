@@ -2,20 +2,22 @@ import type {
   AgentContextAttachment,
   AgentEvent,
   AgentSessionResult,
+  AgentTimelineDelta,
   AgentTimelineResult,
   AgentWorkspaceBinding,
+  AppendAgentEventsRequest,
   ApiResponse,
   KernelCommandEnvelope,
   KernelReply,
   LlmChatRequest,
   LlmChatResult,
   LlmChatStreamEvent,
-  ProjectionDelta,
   ToolCall,
 } from '@deepcode/protocol';
 import { buildSessionMemorySnapshot } from './context/memory.js';
 import { SessionDriverLoop } from './driver/sessionDriverLoop.js';
 import type { SessionDecisionResolverInput } from './driver/types.js';
+import { CanonicalTimelineProjector } from './timelineDelta.js';
 import { SessionStorageClient } from './storageClient.js';
 import type { ProjectWorkingDirectory } from './context/types.js';
 
@@ -68,6 +70,8 @@ interface HostBridgeResult {
   error?: string;
 }
 
+const MEMORY_ARCHIVE_PERSIST_TIMEOUT_MS = 2_000;
+
 async function main(): Promise<void> {
   const raw = await readStdin();
   const request = JSON.parse(raw || '{}') as HostBridgeRequest;
@@ -92,7 +96,13 @@ async function runAsk(request: HostBridgeRequest): Promise<HostBridgeResult> {
 
   const sessionId = sessionResult.session.id;
   const existingEvents = sessionResult.events ?? [];
-  const driver = createDriver(apiBase, request.hostRunId);
+  const projection = createProjectionPublishingDriver(
+    apiBase,
+    request.hostRunId,
+    sessionId,
+    existingEvents
+  );
+  const driver = projection.driver;
   const result = await driver.runUserTurn({
     sessionId,
     content,
@@ -107,7 +117,7 @@ async function runAsk(request: HostBridgeRequest): Promise<HostBridgeResult> {
     interventionLevel: request.interventionLevel,
   });
   await persistMemoryArchive(apiBase, result.session.id, result.events ?? [], binding, result.session, request.projectMemoryMode);
-  const timeline = await readTimeline(apiBase, result.session.id);
+  const timeline = projection.buildTimeline(result.events ?? []);
   const finalText = extractFinalText(timeline);
   const lifecycle = inferHostRunLifecycle(result.events, finalText);
   return {
@@ -130,7 +140,13 @@ async function resolveDecision(request: HostBridgeRequest): Promise<HostBridgeRe
   const current = await getAgentSession(apiBase, request.sessionId);
   const binding = request.noWorkspace ? undefined : workspaceBindingFromPath(request.workspacePath);
   const projectWorkingDirectory = request.noWorkspace ? undefined : projectWorkingDirectoryFromPath(request.workspacePath);
-  const driver = createDriver(apiBase, request.hostRunId);
+  const projection = createProjectionPublishingDriver(
+    apiBase,
+    request.hostRunId,
+    request.sessionId,
+    current.events
+  );
+  const driver = projection.driver;
   const result = await driver.resolveDecision({
     sessionId: request.sessionId,
     kind: request.decisionKind,
@@ -148,7 +164,7 @@ async function resolveDecision(request: HostBridgeRequest): Promise<HostBridgeRe
     projectMemoryMode: request.projectMemoryMode,
   });
   await persistMemoryArchive(apiBase, result.session.id, result.events ?? [], binding, result.session, request.projectMemoryMode);
-  const timeline = await readTimeline(apiBase, result.session.id);
+  const timeline = projection.buildTimeline(result.events ?? []);
   const finalText = extractFinalText(timeline);
   const lifecycle = inferHostRunLifecycle(result.events, finalText);
   return {
@@ -170,6 +186,8 @@ async function persistMemoryArchive(
   session: unknown,
   projectMemoryMode: 'confirm' | 'auto' | undefined
 ): Promise<void> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), MEMORY_ARCHIVE_PERSIST_TIMEOUT_MS);
   try {
     const client = new SessionStorageClient(apiBase);
     const snapshot = buildSessionMemorySnapshot(events, {
@@ -179,9 +197,11 @@ async function persistMemoryArchive(
       displaySessionName: sessionTitle(session) ?? sessionId,
       projectMemoryMode,
     });
-    await client.persistMemoryArchive(sessionId, snapshot);
+    await client.persistMemoryArchive(sessionId, snapshot, controller.signal);
   } catch (error) {
     process.stderr.write(`memory archive persist skipped: ${error instanceof Error ? error.message : String(error)}\n`);
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
@@ -191,27 +211,56 @@ function sessionTitle(value: unknown): string | undefined {
   return typeof title === 'string' && title.trim() ? title : undefined;
 }
 
-function createDriver(apiBase: string, hostRunId?: string): SessionDriverLoop {
+function createProjectionPublishingDriver(
+  apiBase: string,
+  hostRunId: string | undefined,
+  sessionId: string,
+  initialEvents: AgentEvent[]
+): {
+  driver: SessionDriverLoop;
+  buildTimeline: (events?: AgentEvent[]) => AgentTimelineResult;
+} {
   const transcriptClient = new SessionStorageClient(apiBase);
-  return new SessionDriverLoop({
+  let committedEvents = [...initialEvents];
+  const projector = new CanonicalTimelineProjector(sessionId, initialEvents);
+  const buildTimeline = (): AgentTimelineResult => projector.snapshot();
+  const driver = new SessionDriverLoop({
     kernelCommand: (request) => kernelCommand(apiBase, request),
     llmChat: (request) => llmChat(apiBase, request),
     llmChatStream: (request, onEvent) => llmChatStream(apiBase, request, onEvent),
     onProjectionDelta: hostRunId
-      ? (delta) => postProjectionDelta(apiBase, hostRunId, delta)
+      ? async (delta) => {
+          const timelineDeltas = projector.push(delta);
+          for (const timelineDelta of timelineDeltas) {
+            await postProjectionDelta(apiBase, hostRunId, timelineDelta);
+          }
+        }
       : undefined,
     appendTranscript: (sessionId, entry) => transcriptClient.appendTranscript(sessionId, entry),
     appendEvents: async (sessionId, events) => {
+      const nextEvents = [...committedEvents, ...events];
+      const projectionCommit = projector.commit(nextEvents);
+      const appendRequest: AppendAgentEventsRequest = {
+        events,
+        timeline: projectionCommit.timeline,
+      };
       const response = await postJson<ApiResponse<AgentSessionResult>>(
         `${apiBase}/api/agent/sessions/${encodeURIComponent(sessionId)}/events`,
-        { events }
+        appendRequest
       );
       if (!response.ok || !response.data) {
         throw new Error(response.message ?? response.error ?? 'append agent events failed');
       }
+      committedEvents = response.data.events ?? nextEvents;
+      if (hostRunId) {
+        for (const timelineDelta of projectionCommit.deltas) {
+          await postProjectionDelta(apiBase, hostRunId, timelineDelta);
+        }
+      }
       return response.data;
     },
   });
+  return { driver, buildTimeline };
 }
 
 async function currentOrCreateSession(
@@ -251,16 +300,6 @@ async function getAgentSession(apiBase: string, sessionId: string): Promise<Agen
   );
   if (!response.ok || !response.data) {
     throw new Error(response.message ?? response.error ?? `read session failed: ${sessionId}`);
-  }
-  return response.data;
-}
-
-async function readTimeline(apiBase: string, sessionId: string): Promise<AgentTimelineResult> {
-  const response = await getJson<ApiResponse<AgentTimelineResult>>(
-    `${apiBase}/api/agent/sessions/${encodeURIComponent(sessionId)}/timeline`
-  );
-  if (!response.ok || !response.data) {
-    throw new Error(response.message ?? response.error ?? `read timeline failed: ${sessionId}`);
   }
   return response.data;
 }
@@ -355,7 +394,7 @@ async function llmChatStream(
   }
 }
 
-async function postProjectionDelta(apiBase: string, hostRunId: string, delta: ProjectionDelta): Promise<void> {
+async function postProjectionDelta(apiBase: string, hostRunId: string, delta: AgentTimelineDelta): Promise<void> {
   await postJson<ApiResponse<unknown>>(
     `${apiBase}/api/agent/sessions/${encodeURIComponent(delta.sessionId)}/runs/${encodeURIComponent(hostRunId)}/deltas`,
     delta
@@ -620,6 +659,9 @@ function inferHostRunLifecycle(
     }
 
     if (kind === 'review_summary' && stringField(payload, 'status') === 'waitingUserReview') {
+      if (waitingOwnerWasConsumed(kind, payload, consumedOwners)) {
+        continue;
+      }
       return {
         runStatus: 'waiting',
         decisionKind: 'review',
@@ -708,6 +750,9 @@ function collectConsumedInteractionOwners(events: unknown[]): ConsumedInteractio
           stringField(payload, 'interactionId'),
           stringField(payload, 'sourceInteractionId'),
           stringField(payload, 'targetId'));
+        addStrings(consumed.plans,
+          stringField(payload, 'planId'),
+          stringField(payload, 'sourcePlanId'));
       }
       continue;
     }
@@ -724,6 +769,38 @@ function collectConsumedInteractionOwners(events: unknown[]): ConsumedInteractio
     if (kind === 'session_run_state') {
       const status = stringField(payload, 'status');
       const reason = stringField(payload, 'reason');
+      if (status === 'completed' || status === 'cancelled' || status === 'failed') {
+        const owner = objectRecord(payload.decisionOwner);
+        const decisionKind = stringField(payload, 'decisionKind') ?? stringField(owner, 'kind');
+        if (decisionKind === 'plan') {
+          addStrings(consumed.plans,
+            stringField(payload, 'planId'),
+            stringField(payload, 'targetId'),
+            stringField(owner, 'planId'),
+            stringField(owner, 'targetId'));
+        }
+        if (decisionKind === 'requirement') {
+          addStrings(consumed.requirements,
+            stringField(payload, 'requirementId'),
+            stringField(payload, 'targetId'),
+            stringField(owner, 'requirementId'),
+            stringField(owner, 'targetId'));
+        }
+        if (decisionKind === 'review') {
+          addStrings(consumed.reviews,
+            stringField(payload, 'reviewId'),
+            stringField(payload, 'targetId'),
+            stringField(owner, 'reviewId'),
+            stringField(owner, 'targetId'));
+        }
+        if (decisionKind === 'permission') {
+          addStrings(consumed.permissions,
+            stringField(payload, 'permissionId'),
+            stringField(payload, 'targetId'),
+            stringField(owner, 'permissionId'),
+            stringField(owner, 'targetId'));
+        }
+      }
       if (status === 'running' && reason === 'accepted_plan_execution') {
         const owner = objectRecord(payload.decisionOwner);
         addStrings(consumed.plans,
@@ -772,6 +849,13 @@ function waitingOwnerWasConsumed(
     if (decisionKind === 'permission') {
       return hasAny(consumed.permissions, targetId, stringField(payload, 'permissionId'), stringField(owner, 'permissionId'));
     }
+  }
+  if (kind === 'review_summary') {
+    return hasAny(consumed.reviews,
+      stringField(payload, 'reviewId'),
+      stringField(payload, 'targetId'),
+      stringField(payload, 'interactionId'),
+      stringField(payload, 'sourceInteractionId'));
   }
   return false;
 }

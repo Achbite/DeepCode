@@ -4,19 +4,26 @@ import type {
   AgentEvent,
   AgentMode,
   AgentSession,
+  AgentTimelineDelta,
+  AgentTimelineResult,
   AgentTraceEvent,
   AgentWorkflowConfig,
   AgentWorkflowMode,
   ListAgentSessionsRequest,
   PermissionRequest,
-  ProjectionDelta,
 } from '@deepcode/protocol';
 import {
+  applyAgentTimelineDelta,
+  appendOptimisticUserMessage,
   createWorkspaceBinding,
   createWorkspaceScope,
   createWorkspaceScopeKey,
+  emptyTimeline,
   findLatestPendingPermission,
+  isAgentTimelineDelta,
   mergeContextAttachment,
+  reconcileTimelineSnapshot,
+  timelineAsReplay,
 } from '@deepcode/session-core';
 import {
   activateAgentSession,
@@ -27,6 +34,7 @@ import {
   createAgentSession,
   getAgentRun,
   getAgentSession,
+  getAgentTimeline,
   getAgentWorkflowConfig,
   getAgentEventSnapshot,
   getCurrentAgentSession,
@@ -40,7 +48,6 @@ import {
 import type { AgentRunResult, StartAgentRunRequest } from '../services/apiClient';
 import { useSettingsStore } from './settingsStore';
 import { activeT } from '../i18n';
-import { findActiveSessionInteraction } from './sessionInteractions';
 import { useWorkspaceStore } from './workspaceStore';
 
 interface PendingPermission {
@@ -88,8 +95,8 @@ interface AgentSessionState {
   currentSessionId?: string;
   workspaceScopeKey?: string;
   events: AgentEvent[];
+  timeline: AgentTimelineResult | null;
   traceEvents: AgentTraceEvent[];
-  activeDeltas: ProjectionDelta[];
   mode: AgentMode;
   workflow: AgentWorkflowMode;
   workflowConfig: AgentWorkflowConfig | null;
@@ -129,8 +136,8 @@ interface AgentSessionActions {
   clearMessageAttachments: () => void;
   sendMessage: (content: string, attachmentsOverride?: AgentContextAttachment[]) => Promise<void>;
   cancelCurrentRun: () => Promise<void>;
-  acceptPermission: () => Promise<void>;
-  rejectPermission: () => Promise<void>;
+  acceptPermission: (request?: PermissionRequest) => Promise<void>;
+  rejectPermission: (request?: PermissionRequest) => Promise<void>;
   resolveRequirement: (runId: string, requirementId: string, decision: 'accept' | 'reject' | 'revise', guidance?: string) => Promise<void>;
   resolvePlan: (runId: string, planId: string, decision: 'accept' | 'reject' | 'revise', guidance?: string) => Promise<void>;
   resolveReview: (runId: string, decision: 'accept' | 'reject' | 'revise', guidance?: string) => Promise<void>;
@@ -139,7 +146,7 @@ interface AgentSessionActions {
 type Store = AgentSessionState & AgentSessionActions;
 
 const activeAgentRunIds = new Map<string, string>();
-const workspaceTreeRefreshEventIds = new Set<string>();
+const workspaceTreeRevisionBySession = new Map<string, number>();
 
 function emptyWorkflowConfig(): AgentWorkflowConfig {
   return {} as AgentWorkflowConfig;
@@ -246,154 +253,94 @@ function mergeEventsById(existing: AgentEvent[], incoming: AgentEvent[]): AgentE
   return [...byId.values()].sort((left, right) => (left.ts ?? '').localeCompare(right.ts ?? ''));
 }
 
-const MAX_ACTIVE_PROGRESS_DELTAS = 240;
-const MAX_ACTIVE_TEXT_DELTAS = 32;
-const MAX_ACTIVE_REASONING_CHARS = 120000;
-
-function isActiveTextDelta(delta: ProjectionDelta): boolean {
-  return (
-    delta.type === 'reasoning_delta' ||
-    delta.type === 'assistant_delta' ||
-    delta.type === 'draft_delta' ||
-    delta.type === 'part_delta'
-  ) && typeof delta.delta === 'string';
-}
-
-function activeDeltaMergeKey(delta: ProjectionDelta): string {
-  const activityId = delta.activity?.activityId;
-  if (activityId) return `activity:${delta.sessionId}:${delta.runId ?? ''}:${activityId}`;
-  const branchKey = 'parent';
-  return [
-    delta.sessionId,
-    delta.runId ?? '',
-    delta.turnId ?? '',
-    branchKey,
-    delta.type,
-    delta.draftId ?? '',
-    delta.itemId ?? '',
-    delta.targetPath ?? '',
-    delta.stage ?? '',
-    delta.channel ?? '',
-  ].join('|');
-}
-
-function committedDeltaMatchesActive(committed: ProjectionDelta, active: ProjectionDelta): boolean {
-  if (committed.sessionId !== active.sessionId) return false;
-  if (committed.runId && active.runId !== committed.runId) return false;
-  if (committed.turnId && active.turnId !== committed.turnId) return false;
-  return true;
-}
-
-function mergeActiveDelta(existing: ProjectionDelta, incoming: ProjectionDelta): ProjectionDelta {
-  if (isActiveTextDelta(existing) && isActiveTextDelta(incoming)) {
-    const merged = `${existing.delta ?? ''}${incoming.delta ?? ''}`;
-    const capped = incoming.type === 'reasoning_delta' || incoming.channel === 'reasoning'
-      ? capActiveText(merged, MAX_ACTIVE_REASONING_CHARS)
-      : merged;
-    return {
-      ...existing,
-      ...incoming,
-      delta: capped,
-    };
-  }
-  return {
-    ...existing,
-    ...incoming,
-    seq: existing.seq ?? incoming.seq,
-    activity: incoming.activity ?? existing.activity,
-  };
-}
-
-function capActiveText(value: string, maxChars: number): string {
-  if (value.length <= maxChars) return value;
-  return `...[${value.length - maxChars} chars omitted]\n${value.slice(-maxChars)}`;
-}
-
-function trimActiveDeltas(deltas: ProjectionDelta[]): ProjectionDelta[] {
-  const text = deltas.filter(isActiveTextDelta).slice(-MAX_ACTIVE_TEXT_DELTAS);
-  const activity = deltas.filter((delta) => delta.activity && !isActiveTextDelta(delta));
-  const stable = [...activity, ...text];
-  const progress = deltas.filter((delta) => !delta.activity && !isActiveTextDelta(delta)).slice(-MAX_ACTIVE_PROGRESS_DELTAS);
-  return [...stable, ...progress].sort((left, right) => (left.seq ?? 0) - (right.seq ?? 0));
-}
-
-function mergeActiveProjectionDelta(existing: ProjectionDelta[], incoming: ProjectionDelta): ProjectionDelta[] {
-  if (incoming.type === 'committed') {
-    return existing.filter((delta) => !committedDeltaMatchesActive(incoming, delta));
-  }
-  const byKey = new Map<string, ProjectionDelta>();
-  for (const delta of existing) byKey.set(activeDeltaMergeKey(delta), delta);
-  const key = activeDeltaMergeKey(incoming);
-  const current = byKey.get(key);
-  byKey.set(key, current ? mergeActiveDelta(current, incoming) : incoming);
-  return trimActiveDeltas([...byKey.values()]);
-}
-
-function eventPayloadRecord(event: AgentEvent): Record<string, unknown> | null {
-  return isRecord(event.payload) ? event.payload : null;
-}
-
-function eventStringField(event: AgentEvent, key: string): string | undefined {
-  const value = eventPayloadRecord(event)?.[key];
-  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
-}
-
-function eventActivityId(event: AgentEvent): string | undefined {
-  const activity = eventPayloadRecord(event)?.activity;
-  return isRecord(activity) && typeof activity.activityId === 'string' ? activity.activityId : undefined;
-}
-
-function pruneActiveDeltasForCommittedEvents(existing: ProjectionDelta[], events: AgentEvent[]): ProjectionDelta[] {
-  if (events.length === 0 || existing.length === 0) return existing;
-  const sessionIds = new Set(events.map((event) => event.sessionId));
-  const activityIds = new Set(events.map(eventActivityId).filter((id): id is string => Boolean(id)));
-  const committedTextTypes = new Set<ProjectionDelta['type']>();
-  for (const event of events) {
-    if (event.kind === 'assistant_msg') {
-      const channel = eventStringField(event, 'channel');
-      if (channel === 'reasoning') committedTextTypes.add('reasoning_delta');
-      if (channel === 'final') committedTextTypes.add('assistant_delta');
-    }
-    if (
-      event.kind === 'plan_card' ||
-      event.kind === 'review_summary' ||
-      event.kind === 'error' ||
-      event.kind === 'session_run_state' ||
-      (event.kind === 'workflow_stage' && (eventStringField(event, 'stage') ?? '').startsWith('accepted_plan.'))
-    ) {
-      committedTextTypes.add('active_turn');
-      committedTextTypes.add('reasoning_delta');
-      committedTextTypes.add('stage_delta');
-      committedTextTypes.add('draft_delta');
-      committedTextTypes.add('part_delta');
-    }
-  }
-  if (activityIds.size === 0 && committedTextTypes.size === 0) return existing;
-  return existing.filter((delta) => {
-    if (!sessionIds.has(delta.sessionId)) return true;
-    const activityId = delta.activity?.activityId;
-    if (activityId && activityIds.has(activityId)) return false;
-    if (committedTextTypes.has(delta.type)) return false;
-    return true;
+async function refreshCanonicalTimeline(
+  sessionId: string,
+  preservePlayback: boolean
+): Promise<void> {
+  const result = await getAgentTimeline(sessionId);
+  if (!result.ok || !result.data) return;
+  if (useAgentSessionStore.getState().session?.id !== sessionId) return;
+  const incomingTimeline = result.data;
+  let nextTimeline: AgentTimelineResult | null = null;
+  useAgentSessionStore.setState((state) => {
+    nextTimeline = preservePlayback
+      ? reconcileTimelineSnapshot(state.timeline, incomingTimeline)
+      : timelineAsReplay(incomingTimeline);
+    return { timeline: nextTimeline };
   });
+  if (nextTimeline) refreshWorkspaceTreeForTimeline(nextTimeline);
 }
+
+function refreshWorkspaceTreeForTimeline(timeline: AgentTimelineResult): void {
+  const revision = timeline.workspaceProjection?.revision ?? 0;
+  const previous = workspaceTreeRevisionBySession.get(timeline.sessionId) ?? 0;
+  if (revision <= previous) return;
+  workspaceTreeRevisionBySession.set(timeline.sessionId, revision);
+  useWorkspaceStore.getState().bumpTreeRevision();
+}
+
 
 function streamHandlersForSession(sessionId: string): {
-  onDelta: (delta: ProjectionDelta) => void;
+  onDelta: (delta: AgentTimelineDelta) => void;
   onEvents: (events: AgentEvent[]) => void;
 } {
+  let pendingTextDeltas: AgentTimelineDelta[] = [];
+  let pendingFrame: number | null = null;
+
+  const applyDeltas = (deltas: AgentTimelineDelta[]) => {
+    if (!deltas.length) return;
+    const activeSession = useAgentSessionStore.getState().session;
+    if (activeSession?.id !== sessionId) return;
+    let needsSnapshot = false;
+    let nextTimeline: AgentTimelineResult | null = null;
+    useAgentSessionStore.setState((state) => {
+      let timeline = state.timeline;
+      for (const delta of deltas) {
+        const applied = applyAgentTimelineDelta(timeline, delta);
+        if (applied.status === 'gap') {
+          needsSnapshot = true;
+          break;
+        }
+        timeline = applied.timeline;
+      }
+      nextTimeline = needsSnapshot ? null : timeline;
+      return needsSnapshot ? state : { timeline };
+    });
+    if (nextTimeline) refreshWorkspaceTreeForTimeline(nextTimeline);
+    if (needsSnapshot) void refreshCanonicalTimeline(sessionId, true);
+  };
+
+  const flushTextDeltas = () => {
+    if (pendingFrame !== null) {
+      window.cancelAnimationFrame(pendingFrame);
+      pendingFrame = null;
+    }
+    const deltas = pendingTextDeltas;
+    pendingTextDeltas = [];
+    applyDeltas(deltas);
+  };
+
   return {
     onDelta: (delta) => {
       if (delta.sessionId !== sessionId) return;
-      const activeSession = useAgentSessionStore.getState().session;
-      if (activeSession?.id !== sessionId) return;
-      useAgentSessionStore.setState((state) => ({
-        activeDeltas: mergeActiveProjectionDelta(state.activeDeltas, delta),
-      }));
+      if (delta.op === 'text.append') {
+        pendingTextDeltas.push(delta);
+        if (pendingFrame === null) {
+          pendingFrame = window.requestAnimationFrame(() => {
+            pendingFrame = null;
+            const deltas = pendingTextDeltas;
+            pendingTextDeltas = [];
+            applyDeltas(deltas);
+          });
+        }
+        return;
+      }
+      flushTextDeltas();
+      applyDeltas([delta]);
     },
     onEvents: (events) => {
       if (!events.length) return;
-      refreshWorkspaceTreeForToolFacts(events);
+      flushTextDeltas();
       const activeSession = useAgentSessionStore.getState().session;
       if (activeSession?.id !== sessionId) return;
       useAgentSessionStore.setState((state) => {
@@ -401,7 +348,6 @@ function streamHandlersForSession(sessionId: string): {
         return {
           events: merged,
           pendingPermission: findLatestPendingPermission(merged),
-          activeDeltas: pruneActiveDeltasForCommittedEvents(state.activeDeltas, events),
         };
       });
     },
@@ -420,7 +366,7 @@ async function startAndWaitAgentRun(
   sessionId: string,
   request: StartAgentRunRequest,
   handlers: {
-    onDelta?: (delta: ProjectionDelta) => void;
+    onDelta?: (delta: AgentTimelineDelta) => void;
     onEvents?: (events: AgentEvent[]) => void;
   } = {}
 ): Promise<AgentRunResult> {
@@ -432,6 +378,11 @@ async function startAndWaitAgentRun(
   activeAgentRunIds.set(sessionId, result.run.runId);
   const controller = new AbortController();
   let lastDeltaSeq = 0;
+  let terminalStreamObserved = false;
+  let resolveTerminalStreamEvent: (() => void) | undefined;
+  const terminalStreamEvent = new Promise<void>((resolve) => {
+    resolveTerminalStreamEvent = resolve;
+  });
   const streamDone = streamAgentRun(sessionId, result.run.runId, (event) => {
     const data = event.data;
     if (event.event === 'delta' && isRecord(data)) {
@@ -440,7 +391,7 @@ async function startAndWaitAgentRun(
         const deltaSeq = typeof delta.deltaSeq === 'number' ? delta.deltaSeq : 0;
         if (deltaSeq > 0 && deltaSeq <= lastDeltaSeq) return;
         if (deltaSeq > 0) lastDeltaSeq = deltaSeq;
-        handlers.onDelta?.(delta as unknown as ProjectionDelta);
+        if (isAgentTimelineDelta(delta)) handlers.onDelta?.(delta);
       }
     }
     if (event.event === 'events' && isRecord(data) && Array.isArray(data.events)) {
@@ -448,11 +399,15 @@ async function startAndWaitAgentRun(
     }
     if (event.event === 'terminal' && isRecord(data) && Array.isArray(data.events)) {
       handlers.onEvents?.(data.events.filter(isRecord) as unknown as AgentEvent[]);
+      terminalStreamObserved = true;
+      resolveTerminalStreamEvent?.();
     }
   }, { sinceEventCount: result.events.length }, controller.signal).catch(() => undefined);
   try {
     while (!isTerminalRunStatus(result.run.status)) {
-      await sleep(300);
+      if (!terminalStreamObserved) {
+        await Promise.race([sleep(300), terminalStreamEvent]);
+      }
       const current = await getAgentRun(result.run.sessionId, result.run.runId);
       if (!current.ok || !current.data) {
         throw new Error(current.message ?? current.error ?? 'Shared session run refresh failed');
@@ -461,39 +416,12 @@ async function startAndWaitAgentRun(
     }
     return result;
   } finally {
+    await Promise.race([streamDone, terminalStreamEvent, sleep(1000)]);
     controller.abort();
     await streamDone;
     if (activeAgentRunIds.get(sessionId) === result.run.runId) {
       activeAgentRunIds.delete(sessionId);
     }
-  }
-}
-
-function eventToolName(event: AgentEvent): string | undefined {
-  if (!event.payload || typeof event.payload !== 'object' || Array.isArray(event.payload)) {
-    return undefined;
-  }
-  const payload = event.payload as Record<string, unknown>;
-  const value = payload.toolName ?? payload.name;
-  return typeof value === 'string' ? value : undefined;
-}
-
-function shouldRefreshWorkspaceTree(events: AgentEvent[]): boolean {
-  let shouldRefresh = false;
-  for (const event of events) {
-    if (event.kind !== 'tool_result') continue;
-    const toolName = eventToolName(event);
-    if (toolName !== 'fs.write' && toolName !== 'fs.delete') continue;
-    if (workspaceTreeRefreshEventIds.has(event.id)) continue;
-    workspaceTreeRefreshEventIds.add(event.id);
-    shouldRefresh = true;
-  }
-  return shouldRefresh;
-}
-
-function refreshWorkspaceTreeForToolFacts(events: AgentEvent[]) {
-  if (shouldRefreshWorkspaceTree(events)) {
-    useWorkspaceStore.getState().bumpTreeRevision();
   }
 }
 
@@ -503,8 +431,8 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
   currentSessionId: undefined,
   workspaceScopeKey: undefined,
   events: [],
+  timeline: null,
   traceEvents: [],
-  activeDeltas: [],
   mode: 'plan',
   workflow: 'planFirst',
   workflowConfig: null,
@@ -542,11 +470,14 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       }
       const current = await getCurrentAgentSession(scope);
       if (current.ok && current.data) {
-        refreshWorkspaceTreeForToolFacts(current.data.events);
+        const timelineResult = await getAgentTimeline(current.data.session.id);
         set({
           session: current.data.session,
           workspaceScopeKey: nextScopeKey,
           events: current.data.events,
+          timeline: timelineResult.ok && timelineResult.data
+            ? timelineAsReplay(timelineResult.data)
+            : emptyTimeline(current.data.session.id),
           mode: current.data.session.mode,
           profileId: current.data.session.profileId,
           loading: false,
@@ -556,13 +487,13 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       }
       const created = await createAgentSession({ initialMode, ...scope });
       if (created.ok && created.data) {
-        refreshWorkspaceTreeForToolFacts(created.data.events);
         set({
           session: created.data.session,
           workspaceScopeKey: nextScopeKey,
           sessions: [created.data.session, ...get().sessions.filter((item) => item.id !== created.data!.session.id)],
           currentSessionId: created.data.session.id,
           events: created.data.events,
+          timeline: emptyTimeline(created.data.session.id),
           mode: created.data.session.mode,
           profileId: created.data.session.profileId,
           loading: false,
@@ -602,13 +533,13 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     const initialMode = settingMode(settings['agent.defaultMode']);
     const result = await createAgentSession({ initialMode, ...currentWorkspaceScope() });
     if (result.ok && result.data) {
-      refreshWorkspaceTreeForToolFacts(result.data.events);
       set({
         session: result.data.session,
         workspaceScopeKey: currentWorkspaceScopeKey(),
         sessions: [result.data.session, ...get().sessions.filter((item) => item.id !== result.data!.session.id)],
         currentSessionId: result.data.session.id,
         events: result.data.events,
+        timeline: emptyTimeline(result.data.session.id),
         traceEvents: [],
         mode: result.data.session.mode,
         profileId: result.data.session.profileId,
@@ -632,11 +563,15 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     try {
       const result = await activateAgentSession(sessionId);
       if (result.ok && result.data) {
+        const timelineResult = await getAgentTimeline(result.data.session.id);
         set({
           session: result.data.session,
           workspaceScopeKey: currentWorkspaceScopeKey(),
           currentSessionId: result.data.session.id,
           events: result.data.events,
+          timeline: timelineResult.ok && timelineResult.data
+            ? timelineAsReplay(timelineResult.data)
+            : emptyTimeline(result.data.session.id),
           traceEvents: [],
           mode: result.data.session.mode,
           profileId: result.data.session.profileId,
@@ -648,6 +583,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
           loading: false,
         });
         void get().refreshTraceEvents(result.data.session.id);
+        void refreshCanonicalTimeline(result.data.session.id, false);
         void get().refreshSessions();
         return;
       }
@@ -684,8 +620,8 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         ...(wasActive ? {
           session: null,
           events: [],
+          timeline: null,
           traceEvents: [],
-          activeDeltas: [],
           pendingPermission: null,
           resolvingPermission: null,
           resolvingRequirement: null,
@@ -722,8 +658,8 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         ...(wasActive ? {
           session: null,
           events: [],
+          timeline: null,
           traceEvents: [],
-          activeDeltas: [],
           pendingPermission: null,
           resolvingPermission: null,
           resolvingRequirement: null,
@@ -819,12 +755,22 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     if (!session) return;
 
     const attachments = readMessageAttachments(get(), attachmentsOverride);
-    const activeInteraction = findActiveSessionInteraction({
-      events: get().events,
-      pendingPermission: get().pendingPermission?.request ?? null,
+    const localUserEvent = createLocalEvent(session.id, 'user_msg', {
+      content: trimmed,
+      attachments,
+      pending: true,
     });
+    const activeInteraction = get().timeline?.interactionProjection?.pending ?? null;
     if (activeInteraction) {
-      set({ messageAttachments: [], errorMessage: null });
+      if (activeInteraction.kind === 'permission') {
+        set({ errorMessage: 'Permission confirmation is pending. Resolve the permission request before sending new guidance.' });
+        return;
+      }
+      set((state) => ({
+        timeline: appendOptimisticUserMessage(state.timeline, localUserEvent),
+        messageAttachments: [],
+        errorMessage: null,
+      }));
       if (activeInteraction.kind === 'requirement') {
         await get().resolveRequirement(
           activeInteraction.runId,
@@ -842,8 +788,6 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         await get().resolveReview(activeInteraction.runId, 'revise', trimmed);
         return;
       }
-      set({ errorMessage: 'Permission confirmation is pending. Resolve the permission request before sending new guidance.' });
-      return;
     }
 
     if (get().runningSessionIds.includes(session.id)) {
@@ -852,6 +796,11 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         set({ errorMessage: 'No active shared run id is available for guidance. Refresh the session or start a new turn.' });
         return;
       }
+      set((state) => ({
+        timeline: appendOptimisticUserMessage(state.timeline, localUserEvent),
+        messageAttachments: [],
+        errorMessage: null,
+      }));
       const result = await submitAgentRunGuidance(session.id, activeRunId, {
         guidance: trimmed,
         attachments,
@@ -861,12 +810,13 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
           session: result.data.session,
           sessions: [result.data.session, ...get().sessions.filter((item) => item.id !== result.data!.session.id)],
           currentSessionId: result.data.session.id,
-          events: result.data.events,
+          events: mergeEventsById(get().events, result.data.events),
           pendingPermission: findLatestPendingPermission(result.data.events),
           messageAttachments: [],
           errorMessage: null,
         });
         void get().refreshTraceEvents(result.data.session.id);
+        void refreshCanonicalTimeline(result.data.session.id, true);
       } else {
         set({
           messageAttachments: [],
@@ -876,16 +826,10 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       return;
     }
 
-    const localUserEvent = createLocalEvent(session.id, 'user_msg', {
-      content: trimmed,
-      attachments,
-      pending: true,
-    });
     set((state) => ({
-      events: [...state.events, localUserEvent],
+      timeline: appendOptimisticUserMessage(state.timeline, localUserEvent),
       messageAttachments: [],
       runningSessionIds: addRunningSessionId(state.runningSessionIds, session.id),
-      activeDeltas: [],
       errorMessage: null,
     }));
 
@@ -895,11 +839,10 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       if (pollingStopped) return;
       const current = await getAgentSession(session.id);
       if (current.ok && current.data) {
-        refreshWorkspaceTreeForToolFacts(current.data.events);
         if (get().session?.id === session.id) {
           set({
             session: current.data.session,
-            events: current.data.events,
+            events: mergeEventsById(get().events, current.data.events),
             pendingPermission: findLatestPendingPermission(current.data.events),
           });
         }
@@ -936,7 +879,6 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         session: result.session,
         events: result.events,
       };
-      refreshWorkspaceTreeForToolFacts(data.events);
       pollingStopped = true;
       if (progressTimer !== undefined) window.clearInterval(progressTimer);
       const isActiveSession = get().session?.id === data.session.id;
@@ -948,17 +890,17 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
           resolvingRequirement: null,
           resolvingPlan: null,
           resolvingReview: null,
-          activeDeltas: [],
         };
         if (isActiveSession) {
           nextState.session = data.session;
           nextState.currentSessionId = data.session.id;
-          nextState.events = data.events;
+          nextState.events = mergeEventsById(state.events, data.events);
           nextState.pendingPermission = findLatestPendingPermission(data.events);
         }
         return nextState;
       });
       void get().refreshTraceEvents(data.session.id);
+      void refreshCanonicalTimeline(data.session.id, true);
     } catch (err) {
       pollingStopped = true;
       if (progressTimer !== undefined) window.clearInterval(progressTimer);
@@ -972,7 +914,6 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
           : state.events,
         errorMessage: state.session?.id === session.id ? message : state.errorMessage,
         runningSessionIds: removeRunningSessionId(state.runningSessionIds, session.id),
-        activeDeltas: [],
       }));
     }
 
@@ -991,7 +932,6 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     const activeRunId = activeAgentRunIds.get(session.id);
     set((state) => ({
       runningSessionIds: removeRunningSessionId(state.runningSessionIds, session.id),
-      activeDeltas: [],
       queuedMessages: [],
       pendingPermission: null,
       resolvingPermission: null,
@@ -1005,13 +945,12 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       ? await cancelAgentRunById(session.id, activeRunId)
       : await cancelAgentRun(session.id);
     if (result.ok && result.data) {
-      refreshWorkspaceTreeForToolFacts(result.data.events);
       activeAgentRunIds.delete(session.id);
       set({
         session: result.data.session,
         sessions: [result.data.session, ...get().sessions.filter((item) => item.id !== result.data!.session.id)],
         currentSessionId: result.data.session.id,
-        events: result.data.events,
+        events: mergeEventsById(get().events, result.data.events),
         pendingPermission: findLatestPendingPermission(result.data.events),
         resolvingPermission: null,
         resolvingRequirement: null,
@@ -1021,6 +960,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         errorMessage: null,
       });
       void get().refreshTraceEvents(result.data.session.id);
+      void refreshCanonicalTimeline(result.data.session.id, true);
       return;
     }
 
@@ -1040,12 +980,12 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     }));
   },
 
-  acceptPermission: async () => {
-    const pending = get().pendingPermission;
+  acceptPermission: async (requestOverride) => {
+    const request = requestOverride ?? get().pendingPermission?.request;
     const session = get().session;
-    if (!pending || !session || get().resolvingPermission) return;
+    if (!request || !session || get().resolvingPermission) return;
     set((state) => ({
-      resolvingPermission: { id: pending.request.id, decision: 'accept' },
+      resolvingPermission: { id: request.id, decision: 'accept' },
       runningSessionIds: addRunningSessionId(state.runningSessionIds, session.id),
       errorMessage: null,
     }));
@@ -1055,11 +995,10 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       if (pollingStopped) return;
       const current = await getAgentSession(session.id);
       if (current.ok && current.data) {
-        refreshWorkspaceTreeForToolFacts(current.data.events);
         if (get().session?.id === session.id) {
           set({
             session: current.data.session,
-            events: current.data.events,
+            events: mergeEventsById(get().events, current.data.events),
             pendingPermission: findLatestPendingPermission(current.data.events),
           });
         }
@@ -1075,8 +1014,8 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         op: 'resolveDecision',
         decisionKind: 'permission',
         decision: 'accept',
-        runId: permissionRequestRunId(pending.request),
-        targetId: pending.request.id,
+        runId: permissionRequestRunId(request),
+        targetId: request.id,
         workspacePath: currentWorkspacePath(),
         workflow: get().workflow,
         profileId: get().profileId,
@@ -1093,16 +1032,15 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       };
       pollingStopped = true;
       if (progressTimer !== undefined) window.clearInterval(progressTimer);
-      refreshWorkspaceTreeForToolFacts(data.events);
       set((state) => ({
         session: data.session,
-        events: data.events,
+        events: mergeEventsById(state.events, data.events),
         pendingPermission: findLatestPendingPermission(data.events),
         resolvingPermission: null,
-        activeDeltas: [],
         runningSessionIds: removeRunningSessionId(state.runningSessionIds, data.session.id),
       }));
       void get().refreshTraceEvents(data.session.id);
+      void refreshCanonicalTimeline(data.session.id, true);
     } catch (err) {
       pollingStopped = true;
       if (progressTimer !== undefined) window.clearInterval(progressTimer);
@@ -1115,14 +1053,13 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     }
   },
 
-  rejectPermission: async () => {
-    const pending = get().pendingPermission;
+  rejectPermission: async (requestOverride) => {
+    const request = requestOverride ?? get().pendingPermission?.request;
     const session = get().session;
-    if (!pending || !session || get().resolvingPermission) return;
+    if (!request || !session || get().resolvingPermission) return;
     set((state) => ({
-      resolvingPermission: { id: pending.request.id, decision: 'reject' },
+      resolvingPermission: { id: request.id, decision: 'reject' },
       runningSessionIds: addRunningSessionId(state.runningSessionIds, session.id),
-      activeDeltas: [],
       errorMessage: null,
     }));
     let progressTimer: number | undefined;
@@ -1131,11 +1068,10 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       if (pollingStopped) return;
       const current = await getAgentSession(session.id);
       if (current.ok && current.data) {
-        refreshWorkspaceTreeForToolFacts(current.data.events);
         if (get().session?.id === session.id) {
           set({
             session: current.data.session,
-            events: current.data.events,
+            events: mergeEventsById(get().events, current.data.events),
             pendingPermission: findLatestPendingPermission(current.data.events),
           });
         }
@@ -1151,8 +1087,8 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         op: 'resolveDecision',
         decisionKind: 'permission',
         decision: 'reject',
-        runId: permissionRequestRunId(pending.request),
-        targetId: pending.request.id,
+        runId: permissionRequestRunId(request),
+        targetId: request.id,
         workspacePath: currentWorkspacePath(),
         workflow: get().workflow,
         profileId: get().profileId,
@@ -1169,16 +1105,15 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       };
       pollingStopped = true;
       if (progressTimer !== undefined) window.clearInterval(progressTimer);
-      refreshWorkspaceTreeForToolFacts(data.events);
       set((state) => ({
         session: data.session,
-        events: data.events,
+        events: mergeEventsById(state.events, data.events),
         pendingPermission: findLatestPendingPermission(data.events),
         resolvingPermission: null,
-        activeDeltas: [],
         runningSessionIds: removeRunningSessionId(state.runningSessionIds, data.session.id),
       }));
       void get().refreshTraceEvents(data.session.id);
+      void refreshCanonicalTimeline(data.session.id, true);
     } catch (err) {
       pollingStopped = true;
       if (progressTimer !== undefined) window.clearInterval(progressTimer);
@@ -1198,7 +1133,6 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     set((state) => ({
       resolvingRequirement: { runId, requirementId, decision },
       runningSessionIds: addRunningSessionId(state.runningSessionIds, session.id),
-      activeDeltas: [],
       errorMessage: null,
     }));
 
@@ -1208,11 +1142,10 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       if (pollingStopped) return;
       const current = await getAgentSession(session.id);
       if (current.ok && current.data) {
-        refreshWorkspaceTreeForToolFacts(current.data.events);
         if (get().session?.id === session.id) {
           set({
             session: current.data.session,
-            events: current.data.events,
+            events: mergeEventsById(get().events, current.data.events),
             pendingPermission: findLatestPendingPermission(current.data.events),
           });
         }
@@ -1246,23 +1179,22 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         session: result.session,
         events: result.events,
       };
-      refreshWorkspaceTreeForToolFacts(data.events);
       pollingStopped = true;
       if (progressTimer !== undefined) window.clearInterval(progressTimer);
       set((state) => ({
         session: data.session,
         sessions: [data.session, ...state.sessions.filter((item) => item.id !== data.session.id)],
         currentSessionId: data.session.id,
-        events: data.events,
+        events: mergeEventsById(state.events, data.events),
         pendingPermission: findLatestPendingPermission(data.events),
         resolvingRequirement: null,
         resolvingPermission: null,
         resolvingPlan: null,
         resolvingReview: null,
-        activeDeltas: [],
         runningSessionIds: removeRunningSessionId(state.runningSessionIds, data.session.id),
       }));
       void get().refreshTraceEvents(data.session.id);
+      void refreshCanonicalTimeline(data.session.id, true);
     } catch (err) {
       pollingStopped = true;
       if (progressTimer !== undefined) window.clearInterval(progressTimer);
@@ -1281,7 +1213,6 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     set((state) => ({
       resolvingPlan: { runId, planId, decision },
       runningSessionIds: addRunningSessionId(state.runningSessionIds, session.id),
-      activeDeltas: [],
       errorMessage: null,
     }));
     let progressTimer: number | undefined;
@@ -1290,11 +1221,10 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       if (pollingStopped) return;
       const current = await getAgentSession(session.id);
       if (current.ok && current.data) {
-        refreshWorkspaceTreeForToolFacts(current.data.events);
         if (get().session?.id === session.id) {
           set({
             session: current.data.session,
-            events: current.data.events,
+            events: mergeEventsById(get().events, current.data.events),
             pendingPermission: findLatestPendingPermission(current.data.events),
           });
         }
@@ -1329,21 +1259,20 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       };
       pollingStopped = true;
       if (progressTimer !== undefined) window.clearInterval(progressTimer);
-      refreshWorkspaceTreeForToolFacts(data.events);
       set((state) => ({
         session: data.session,
         sessions: [data.session, ...state.sessions.filter((item) => item.id !== data.session.id)],
         currentSessionId: data.session.id,
-        events: data.events,
+        events: mergeEventsById(state.events, data.events),
         pendingPermission: findLatestPendingPermission(data.events),
         resolvingPermission: null,
         resolvingRequirement: null,
         resolvingPlan: null,
         resolvingReview: null,
-        activeDeltas: [],
         runningSessionIds: removeRunningSessionId(state.runningSessionIds, data.session.id),
       }));
       void get().refreshTraceEvents(data.session.id);
+      void refreshCanonicalTimeline(data.session.id, true);
     } catch (err) {
       pollingStopped = true;
       if (progressTimer !== undefined) window.clearInterval(progressTimer);
@@ -1362,7 +1291,6 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     set((state) => ({
       resolvingReview: { runId, decision },
       runningSessionIds: addRunningSessionId(state.runningSessionIds, session.id),
-      activeDeltas: [],
       errorMessage: null,
     }));
     let progressTimer: number | undefined;
@@ -1371,11 +1299,10 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       if (pollingStopped) return;
       const current = await getAgentSession(session.id);
       if (current.ok && current.data) {
-        refreshWorkspaceTreeForToolFacts(current.data.events);
         if (get().session?.id === session.id) {
           set({
             session: current.data.session,
-            events: current.data.events,
+            events: mergeEventsById(get().events, current.data.events),
             pendingPermission: findLatestPendingPermission(current.data.events),
           });
         }
@@ -1412,21 +1339,20 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       };
       pollingStopped = true;
       if (progressTimer !== undefined) window.clearInterval(progressTimer);
-      refreshWorkspaceTreeForToolFacts(data.events);
       set((state) => ({
         session: data.session,
         sessions: [data.session, ...state.sessions.filter((item) => item.id !== data.session.id)],
         currentSessionId: data.session.id,
-        events: data.events,
+        events: mergeEventsById(state.events, data.events),
         pendingPermission: findLatestPendingPermission(data.events),
         resolvingPermission: null,
         resolvingRequirement: null,
         resolvingPlan: null,
         resolvingReview: null,
-        activeDeltas: [],
         runningSessionIds: removeRunningSessionId(state.runningSessionIds, data.session.id),
       }));
       void get().refreshTraceEvents(data.session.id);
+      void refreshCanonicalTimeline(data.session.id, true);
     } catch (err) {
       pollingStopped = true;
       if (progressTimer !== undefined) window.clearInterval(progressTimer);

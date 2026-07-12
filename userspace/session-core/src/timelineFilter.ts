@@ -1,9 +1,4 @@
-/**
- * P5 共享渲染过滤规则：消除 live/final 两套独立过滤实现的漂移隐患。
- *
- * live overlay 会先被转换为临时 AgentEvent，再走 narrative projection。
- * 本模块只保留结构化事实级过滤规则，确保 live 与 final 对同批事实的"是否显示"判定一致。
- */
+/** Shared visibility rules applied to committed events and live overlay events. */
 
 // 不应单独成块的纯编排/调度生命周期事件 stage / kernelEvent.kind 集合。
 // 注意：不含 work_unit.* 与 tool.* —— 它们携带文件/命令事实，由工具卡呈现。
@@ -15,9 +10,14 @@ const INTERNAL_ORCHESTRATION_STAGES = new Set<string>([
   'proposal.accepted',
   'action_batch.accepted',
   'accepted_plan.static_syntax_review',
+  'accepted_plan.batch_checkpoint',
+  'accepted_plan.task_savepoint',
   'needProposal',
   'autonomy.transitioned',
   'message.appended',
+  'stage.changed',
+  'review.facts_produced',
+  'review_gate.evaluated',
 ]);
 
 // 这些工具的 toolExecution 只是 Provider / native 内部前置步骤，其真正结果会以专属活动呈现
@@ -52,6 +52,7 @@ export function isInternalOrchestrationStage(input: { stage?: string; kernelEven
 function isProviderLifecycleStage(stage: string): boolean {
   return stage === 'provider_call' ||
     stage === 'accepted_plan_provider_call' ||
+    stage.startsWith('native_tool_round_') ||
     stage.startsWith('provider_tool_resume_');
 }
 

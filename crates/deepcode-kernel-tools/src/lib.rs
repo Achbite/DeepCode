@@ -1678,7 +1678,7 @@ fn builtin_tool_descriptors() -> Vec<KernelToolDescriptor> {
             risk: ToolRiskLevel::Critical,
             permission_mode: ToolPermissionMode::Ask,
             executor_ref: "kernel.skill.git.push",
-            execution_mode: OperationExecutionMode::Execute,
+            execution_mode: OperationExecutionMode::Blocked,
             needs_workspace: true,
             read_only: false,
         },
@@ -2254,6 +2254,67 @@ mod tests {
             .iter()
             .any(|rule| rule == "directoryDeleteWithoutRecursive"));
         assert!(delete.permission_summary.contains("Kernel gate"));
+    }
+
+    #[test]
+    fn registry_marks_git_push_as_reserved_blocked() {
+        let snapshot = KernelToolRegistry::default().snapshot();
+        let git_push = snapshot
+            .tools
+            .iter()
+            .find(|tool| tool.tool_id == "git.push")
+            .expect("git.push remains registered as reserved capability");
+        assert!(git_push.provider_visible);
+        assert_eq!(git_push.execution_mode, OperationExecutionMode::Blocked);
+        assert_eq!(git_push.risk, ToolRiskLevel::Critical);
+        assert_eq!(git_push.permission_mode, ToolPermissionMode::Ask);
+        assert_eq!(git_push.capability, "git.push");
+        assert!(git_push
+            .hard_deny_rules
+            .iter()
+            .any(|rule| rule == "unapprovedRemoteWrite"));
+    }
+
+    #[test]
+    fn registry_git_v1_formal_tools_execute_only_through_commit() {
+        let registry = KernelToolRegistry::default();
+        for tool_id in [
+            "git.status",
+            "git.diff",
+            "git.stage",
+            "git.unstage",
+            "git.commit",
+        ] {
+            let descriptor = registry
+                .get(tool_id)
+                .unwrap_or_else(|| panic!("{tool_id} descriptor exists"));
+            assert_eq!(descriptor.execution_mode, OperationExecutionMode::Execute);
+        }
+        assert_eq!(
+            registry.get("git.push").unwrap().execution_mode,
+            OperationExecutionMode::Blocked
+        );
+    }
+
+    #[test]
+    fn registry_keeps_external_control_tools_blocked() {
+        let registry = KernelToolRegistry::default();
+        for tool_id in [
+            "process.exec",
+            "browser.open",
+            "browser.reload",
+            "browser.snapshot",
+            "browser.inspect",
+            "browser.click",
+            "browser.type",
+            "browser.scroll",
+            "provider.call",
+        ] {
+            let descriptor = registry
+                .get(tool_id)
+                .unwrap_or_else(|| panic!("{tool_id} descriptor exists"));
+            assert_eq!(descriptor.execution_mode, OperationExecutionMode::Blocked);
+        }
     }
 
     #[test]

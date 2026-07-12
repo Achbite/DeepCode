@@ -7,6 +7,11 @@ import type {
   ToolIntentTemplate,
 } from '../runFrame.js';
 import type { CurrentTaskContext } from '../../accepted-plan/index.js';
+import {
+  resourceEvidenceAccessIndexLine,
+  resourceEvidenceContentKindCounts,
+  resourceEvidenceCurrentTaskCoverageLines,
+} from '../../context/index.js';
 import type { ContextAssemblyRecord } from '../../context/index.js';
 import type { ResourcePacket } from '../../context/types.js';
 import type { PromptEnvelope } from '../../prompt/types.js';
@@ -26,6 +31,8 @@ export interface BuildProviderTurnContractInput {
     title?: string;
     goal?: string;
     targets?: string[];
+    acceptanceCriteria?: string[];
+    failureCriteria?: string[];
   };
   resourceEvidenceRefs?: string[];
   accessSummary?: string;
@@ -61,6 +68,7 @@ export interface BuildSessionProviderTurnContractInput {
 
 export class ContextFrameBuilder {
   buildProviderTurnContract(input: BuildProviderTurnContractInput): DriverProviderTurnFrame {
+    const acceptedExecution = input.turnMode === 'acceptedTaskExecution';
     const frames: ProviderContextFrame[] = [
       {
         kind: 'SystemContract',
@@ -73,21 +81,23 @@ export class ContextFrameBuilder {
         kind: 'ProtocolContract',
         source: 'protocol',
         trust: 'contract',
-        use: 'Defines the allowed structured proposal kinds for this turn.',
-        summary: `Allowed kinds: ${input.allowedKinds.join(', ')}`,
+        use: 'Defines the registered Session semantic tools for this provider profile.',
+        summary: 'Use exactly one registered Session semantic tool for the next directive.',
       },
       {
-        kind: 'Memory',
+        kind: 'MemoryPlaceholder',
         source: 'memory',
         trust: 'compressedReference',
         use: 'Reference only; not an execution fact, permission grant, or patch evidence.',
         summary: this.memorySummary(input.contextAssembly),
       },
       {
-        kind: 'UserRequest',
-        source: 'user',
-        trust: 'userConfirmedFact',
-        use: 'Current reliable user intent for this turn.',
+        kind: 'DynamicDialogue',
+        source: acceptedExecution ? 'session' : 'user',
+        trust: acceptedExecution ? 'sessionInstruction' : 'userConfirmedFact',
+        use: acceptedExecution
+          ? 'Sanitized accepted-plan execution context; original user request is a source reference only.'
+          : 'Current dynamic user turn and dialogue-local instructions.',
         summary: input.userRequest,
       },
     ];
@@ -122,15 +132,29 @@ export class ContextFrameBuilder {
       summary: this.resourceEvidenceSummary(input.contextAssembly),
     });
 
-    if (input.accessSummary) {
-      frames.push({
-        kind: 'AccessSummary',
-        source: 'derived',
-        trust: 'derivedObservedFact',
-        use: 'Helps avoid repeated low-value reads; not a permission grant or exact patch evidence.',
-        summary: input.accessSummary,
-      });
-    }
+    frames.push({
+      kind: 'AccessIndex',
+      source: 'derived',
+      trust: 'derivedObservedFact',
+      use: 'Index of already accessed resources; not a permission grant or exact patch evidence.',
+      summary: input.accessSummary ?? this.accessIndexSummary(input.contextAssembly),
+    });
+
+    frames.push({
+      kind: 'HookContext',
+      source: 'session',
+      trust: 'sessionInstruction',
+      use: 'Observer hook state for this provider turn. Hooks cannot change prompt, tools, Kernel facts, or projection facts.',
+      summary: 'Hook observer mode is enabled for developer trace only.',
+    });
+
+    frames.push({
+      kind: 'ProviderStepSummary',
+      source: 'session',
+      trust: 'sessionInstruction',
+      use: 'Summarizes this provider step without adding execution facts.',
+      summary: this.providerStepSummary(input),
+    });
 
     if (input.errorSummary) {
       frames.push({
@@ -209,6 +233,30 @@ export class ContextFrameBuilder {
       `resourcePackets=${contextAssembly.resourcePacketCount}`,
       `resourceBlocks=${contextAssembly.resourceBlocks.length}`,
       `tailCount=${contextAssembly.resourceEvidenceTailCount}`,
+      `contentKinds=${resourceEvidenceContentKindCounts(contextAssembly.resourceBlocks) || 'none'}`,
+      'resourceBlockDetails=see AccessIndex frame',
+    ].join('; ');
+  }
+
+  private accessIndexSummary(contextAssembly: ContextAssemblyRecord | undefined): string {
+    if (!contextAssembly) return 'No access index is available for this turn.';
+    const lines = [
+      `resourceBlocks=${contextAssembly.resourceBlocks.length}`,
+      `full=${contextAssembly.resourceRetentionCounts.full ?? 0}`,
+      `summary=${contextAssembly.resourceRetentionCounts.summary ?? 0}`,
+      `handleOnly=${contextAssembly.resourceRetentionCounts.handleOnly ?? 0}`,
+      `denied=${contextAssembly.resourceRetentionCounts.denied ?? 0}`,
+      `error=${contextAssembly.resourceRetentionCounts.error ?? 0}`,
+    ];
+    lines.push(...contextAssembly.resourceBlocks.slice(-12).map((block) => resourceEvidenceAccessIndexLine(block)));
+    return lines.join('\n');
+  }
+
+  private providerStepSummary(input: BuildProviderTurnContractInput): string {
+    return [
+      `turnMode=${input.turnMode}`,
+      `resourceRefs=${input.resourceEvidenceRefs?.length ?? 0}`,
+      `intentSlots=${input.toolIntentTemplates?.length ?? 0}`,
     ].join('; ');
   }
 
@@ -230,18 +278,25 @@ export class ContextFrameBuilder {
       title: context.taskTitle,
       goal: context.goal,
       targets: [...context.targets],
+      acceptanceCriteria: [...(context.acceptanceCriteria ?? [])],
+      failureCriteria: [...(context.failureCriteria ?? [])],
     };
   }
 
   private accessSummary(input: BuildSessionProviderTurnContractInput): string | undefined {
     const resourcePacketCount = input.resourcePackets?.length ?? 0;
     const generatedArtifactCount = input.generatedArtifactCount ?? 0;
-    if (resourcePacketCount === 0 && generatedArtifactCount === 0) return undefined;
-    return [
+    const resourceBlocks = input.contextAssembly?.resourceBlocks ?? [];
+    if (resourcePacketCount === 0 && generatedArtifactCount === 0 && resourceBlocks.length === 0) return undefined;
+    const lines = [
       `resourcePackets=${resourcePacketCount}`,
       `generatedArtifacts=${generatedArtifactCount}`,
       `currentTask=${input.currentTaskContext?.taskId ?? 'none'}`,
-    ].join('; ');
+      `accessedResources=${resourceBlocks.length}`,
+    ];
+    lines.push(...resourceBlocks.slice(-12).map((block) => resourceEvidenceAccessIndexLine(block)));
+    lines.push(...resourceEvidenceCurrentTaskCoverageLines(resourceBlocks, input.currentTaskContext?.targets ?? []));
+    return lines.join('\n');
   }
 
   private nextActionInstruction(
@@ -252,16 +307,27 @@ export class ContextFrameBuilder {
     if (acceptedPlanActive || currentTaskContext) {
       return [
         'Use the current task cursor only.',
-        `Allowed proposal kinds: ${allowedKinds.join(', ')}.`,
-        'If evidence is sufficient, return an actionBundle for the current task.',
-        'If evidence is missing, return a focused resourceRequest.',
-        'If the current task needs targets or operations outside the accepted scope, return a decisionRequest.',
+        'Use exactly one registered execution semantic tool.',
+        'Use TaskFrame and IntentSlot values as the complete current-task boundary; do not import unrelated targets from the original user request, plan summary, memory, or later tasks.',
+        'If every current IntentSlot has evidenceRequirement=none, submit the current artifacts directly; do not read the target or parent directory merely to confirm that the operation may begin.',
+        'If generated content is needed and evidence is sufficient, call session.submit_task_artifacts with slot ids and content only.',
+        'If evidence is missing, call session.request_resources with a focused resource intent.',
+        'If AccessIndex currentTaskEvidence reports covered=true for the current target, use that evidence instead of repeating the same resourceRequest; request only a different range/search when exact missing content would change the action.',
+        'Session and Kernel handle execution scope and permission interrupts; do not submit permission fields.',
+        'If the current task is already sufficiently satisfied and no Kernel action is needed, call session.complete_current_task.',
+        'Keep visible reasoning/progress action-oriented: state the current action or task outcome, not protocol, tool, permission, or evidence-policy deliberation.',
       ].join(' ');
     }
     return [
-      `Allowed proposal kinds: ${allowedKinds.join(', ')}.`,
-      'Choose the proposal kind that matches the current user request and Kernel state contract.',
+      'Use exactly one registered planning semantic tool.',
+      'If ResourceEvidence or AccessIndex is enough to form a useful plan or answer, call session.submit_plan or session.submit_answer now.',
+      'Call session.request_resources only for missing concrete evidence that would change the next directive.',
+      'Call session.request_decision only when a blocking user choice prevents any valid plan; put reviewable assumptions in plan risks or review checkpoints.',
+      'For delete or cleanup plans, target only paths visible in ResourceEvidence/AccessIndex or explicitly named by the current user or ConfirmedDecision.',
+      'Decide from the current frames; do not re-audit protocol rules, permission gates, resource policy, or unrelated prior requirements in reasoning.',
+      'Keep visible reasoning/progress action-oriented: state the current action or proposal, not protocol, tool, permission, or evidence-policy deliberation.',
       'Do not infer execution facts or permissions from memory.',
     ].join(' ');
   }
+
 }

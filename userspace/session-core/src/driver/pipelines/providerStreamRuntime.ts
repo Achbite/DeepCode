@@ -9,6 +9,8 @@ import type {
 } from '@deepcode/protocol';
 import { ProviderPartFrameParser, type ProviderToolCallBuffer } from '../../provider/providerStreamParts.js';
 import type { ProviderStreamCoordinator, ProviderStreamVisibleLanguage } from './providerStreamCoordinator.js';
+import { SessionDriverActiveTurnRuntimeAccessor } from '../runFrame.js';
+import { VISIBLE_REASONING_MAX_CHARS, projectVisibleReasoning } from '../projection/index.js';
 
 export interface ProviderStreamRuntimeActiveTurn {
   turnId: string;
@@ -29,11 +31,15 @@ export interface ProviderReasoningDeltaBuffer {
   pending: string;
   lastFlushAt: number;
   itemId?: string;
+  receivedChars: number;
+  visibleCharsEmitted: number;
+  truncated: boolean;
 }
 
 export interface ProviderStreamRuntimeDependencies<TState extends ProviderStreamRuntimeState> {
   reasoningFlushChars: number;
   reasoningFlushMs: number;
+  visibleReasoningMaxChars?: number;
   streamCoordinator: ProviderStreamCoordinator;
   visibleLanguageForRequest(userRequest: string): ProviderStreamVisibleLanguage;
   providerActivity(input: {
@@ -55,7 +61,10 @@ export class ProviderStreamRuntime<TState extends ProviderStreamRuntimeState> {
     return {
       pending: '',
       lastFlushAt: Date.now(),
-      itemId: undefined,
+      itemId: this.dependencies.createId('reasoning-segment'),
+      receivedChars: 0,
+      visibleCharsEmitted: 0,
+      truncated: false,
     };
   }
 
@@ -90,10 +99,14 @@ export class ProviderStreamRuntime<TState extends ProviderStreamRuntimeState> {
       return;
     }
     if (event.type === 'provider_reasoning_delta' && chunk?.content) {
+      if (!this.dependencies.streamCoordinator.exposesReasoningTrace(stage)) return;
       await this.bufferProviderReasoningDelta(state, stage, reasoningBuffer, chunk);
       return;
     }
     if (event.type === 'provider_tool_call_delta' && chunk) {
+      // Preserve the provider's visible order: publish any buffered reasoning
+      // before the following structured tool activity receives its sequence.
+      await this.flushReasoningBuffer(state, stage, reasoningBuffer);
       const language = this.dependencies.visibleLanguageForRequest(state.userRequest);
       toolCallBuffer.addChunk(chunk);
       const summary = chunk.toolCallDelta?.name
@@ -172,6 +185,10 @@ export class ProviderStreamRuntime<TState extends ProviderStreamRuntimeState> {
     const delta = buffer.pending;
     buffer.pending = '';
     buffer.lastFlushAt = Date.now();
+    const projected = this.projectReasoningDelta(delta, buffer);
+    if (!projected.content) return;
+    buffer.visibleCharsEmitted += projected.content.length;
+    buffer.truncated = buffer.truncated || projected.truncated;
     await this.dependencies.emitProjectionDelta(state, {
       type: 'reasoning_delta',
       stage,
@@ -179,12 +196,15 @@ export class ProviderStreamRuntime<TState extends ProviderStreamRuntimeState> {
       channel: 'reasoning',
       source: 'provider',
       itemId: buffer.itemId,
-      delta,
+      delta: projected.content,
       activity: this.dependencies.providerActivity({ runId: state.runId, userRequest: state.userRequest, stage, status: 'running' }),
       payload: {
         presentation: 'reasoningTrace',
         streamMode: 'markdownBlocks',
         buffered: true,
+        reasoningProjectionTruncated: buffer.truncated,
+        reasoningProjectionFullCharLength: buffer.receivedChars,
+        reasoningProjectionVisibleCharLength: buffer.visibleCharsEmitted,
       },
     });
   }
@@ -197,6 +217,7 @@ export class ProviderStreamRuntime<TState extends ProviderStreamRuntimeState> {
   ): Promise<void> {
     if (typeof chunk.content !== 'string' || chunk.content.length === 0) return;
     buffer.pending += chunk.content;
+    buffer.receivedChars += chunk.content.length;
     buffer.itemId = chunk.callId ?? buffer.itemId;
     const now = Date.now();
     if (
@@ -208,16 +229,31 @@ export class ProviderStreamRuntime<TState extends ProviderStreamRuntimeState> {
     await this.flushReasoningBuffer(state, stage, buffer);
   }
 
+  private projectReasoningDelta(delta: string, buffer: ProviderReasoningDeltaBuffer): { content: string; truncated: boolean } {
+    const maxChars = this.dependencies.visibleReasoningMaxChars ?? VISIBLE_REASONING_MAX_CHARS;
+    if (!Number.isFinite(maxChars) || maxChars <= 0) {
+      return { content: delta, truncated: false };
+    }
+    const remaining = maxChars - buffer.visibleCharsEmitted;
+    if (remaining <= 0) {
+      return { content: '', truncated: true };
+    }
+    const projected = projectVisibleReasoning(delta, remaining);
+    return {
+      content: projected.content,
+      truncated: projected.truncated,
+    };
+  }
+
   private async emitProviderJsonStreamProgress(
     state: TState,
     stage: string,
     content: string
   ): Promise<void> {
-    const activeTurn = state.activeTurn ?? {
-      turnId: this.dependencies.createId('active-turn'),
-      seq: 0,
+    const activeTurn = new SessionDriverActiveTurnRuntimeAccessor(state).ensure(
       stage,
-    };
+      (prefix) => this.dependencies.createId(prefix)
+    );
     activeTurn.providerJsonStreamProgress ??= {};
     const progress = activeTurn.providerJsonStreamProgress[stage] ?? {
       receivedChars: 0,
@@ -225,7 +261,6 @@ export class ProviderStreamRuntime<TState extends ProviderStreamRuntimeState> {
     };
     progress.receivedChars += content.length;
     activeTurn.providerJsonStreamProgress[stage] = progress;
-    state.activeTurn = activeTurn;
 
     const shouldEmit = progress.lastEmittedChars === 0 ||
       progress.receivedChars - progress.lastEmittedChars >= 1_500;
@@ -256,13 +291,11 @@ export class ProviderStreamRuntime<TState extends ProviderStreamRuntimeState> {
     stage: string,
     content: string
   ): AgentStreamPartFrame[] {
-    const activeTurn = state.activeTurn ?? {
-      turnId: this.dependencies.createId('active-turn'),
-      seq: 0,
+    const activeTurn = new SessionDriverActiveTurnRuntimeAccessor(state).ensure(
       stage,
-    };
+      (prefix) => this.dependencies.createId(prefix)
+    );
     activeTurn.partFrameParser ??= new ProviderPartFrameParser();
-    state.activeTurn = activeTurn;
     return activeTurn.partFrameParser.push(content);
   }
 

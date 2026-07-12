@@ -10,7 +10,15 @@ import type {
 } from '../../context/types.js';
 import type { PromptEnvelope } from '../../prompt/types.js';
 import type { ResourceRequestResolution } from '../../resources/ResourceRequestResolver.js';
+import type { AcceptedImplementationPlanContext } from '../../accepted-plan/types.js';
+import { IntentSlotRegistry } from '../execution/intentSlot.js';
+import type { SessionDriverTaskResourceProgress } from '../runFrame.js';
 import type { AssistantDiagnosticInfo } from '../projection/assistantProjectionBuilder.js';
+import {
+  normalizeProposalRouterResult,
+  type ProposalRouterResult,
+} from '../proposal/proposalRouter.js';
+import { SessionDriverRepairRuntimeAccessor } from '../runFrame.js';
 import type { ResourcePacketAppendResult } from './resourceOrchestrator.js';
 
 export interface ResourceRequestProposalHandlerState {
@@ -21,10 +29,12 @@ export interface ResourceRequestProposalHandlerState {
   conversationRoots: ConversationResourceRoot[];
   resourcePackets: ResourcePacket[];
   generatedArtifactEvidence: Map<string, unknown>;
-  acceptedImplementationPlan?: unknown;
+  resourceRequestProgressByTask?: Map<string, SessionDriverTaskResourceProgress>;
+  acceptedImplementationPlan?: AcceptedImplementationPlanContext;
   taskExecutionCursor?: unknown;
   currentTaskContext?: unknown;
   resourceRequestRepairAttempted: boolean;
+  semanticDirectiveErrorSummary?: string;
 }
 
 export interface GeneratedResourcePacketResult {
@@ -32,9 +42,7 @@ export interface GeneratedResourcePacketResult {
   remaining: ResourceRequestDraft;
 }
 
-export type ResourceRequestProposalHandlerResult =
-  | { kind: 'return'; result: AgentSessionResult }
-  | { kind: 'continue'; lastResult: AgentSessionResult };
+export type ResourceRequestProposalHandlerResult = ProposalRouterResult;
 
 export interface ResourceRequestProposalHandlerPorts<
   Input,
@@ -63,14 +71,6 @@ export interface ResourceRequestProposalHandlerPorts<
     request: ResourceRequestDraft,
     roots: ConversationResourceRoot[]
   ): ResourceRequestResolution;
-  repairResourceRequest(
-    input: Input,
-    state: State,
-    prompt: PromptEnvelope,
-    proposal: ProposalEnvelope,
-    resolution: ResourceRequestResolution
-  ): Promise<ProposalEnvelope>;
-  answerEvent(sessionId: string, proposal: ProposalEnvelope, ts: string, id: string): AgentEvent;
   finalDiagnosticEvent(
     sessionId: string,
     content: string | AssistantDiagnosticInfo,
@@ -78,7 +78,6 @@ export interface ResourceRequestProposalHandlerPorts<
     id: string
   ): AgentEvent;
   resourceResolutionDiagnostic(resolution: ResourceRequestResolution): AssistantDiagnosticInfo;
-  resourceRepairFailedDiagnostic(message: string): AssistantDiagnosticInfo;
   refreshTaskRuntimeState(state: State): void;
   acceptedPlanResourceResumeEvent(state: State, packet: ResourcePacket, ts: string, id: string): AgentEvent;
   tryCompleteResourceTask(
@@ -86,27 +85,7 @@ export interface ResourceRequestProposalHandlerPorts<
     state: State,
     packet: ResourcePacket,
     fallback: AgentSessionResult
-  ): Promise<AgentSessionResult | null>;
-  callResourceResume(
-    input: Input,
-    state: State,
-    prompt: PromptEnvelope,
-    proposal: ProposalEnvelope,
-    packet: ResourcePacket
-  ): Promise<ProposalEnvelope>;
-  submitActionProposal(
-    input: Input,
-    state: State,
-    prompt: PromptEnvelope,
-    proposal: ProposalEnvelope,
-    fallback: AgentSessionResult
-  ): Promise<AgentSessionResult>;
-  submitNonExecutableProposal(
-    state: State,
-    proposal: ProposalEnvelope,
-    fallback: AgentSessionResult
-  ): Promise<AgentSessionResult>;
-  errorMessage(error: unknown): string;
+  ): Promise<AgentSessionResult | ProposalRouterResult | null>;
 }
 
 export interface ResourceRequestProposalHandlerInput<
@@ -124,16 +103,51 @@ export class ResourceRequestProposalHandler<
   Input,
   State extends ResourceRequestProposalHandlerState,
 > {
+  private readonly intentSlots = new IntentSlotRegistry();
+
   constructor(private readonly ports: ResourceRequestProposalHandlerPorts<Input, State>) {}
 
   async handle(
     handlerInput: ResourceRequestProposalHandlerInput<Input, State>
   ): Promise<ResourceRequestProposalHandlerResult> {
-    const { input, state, prompt, proposal } = handlerInput;
+    const { input, state, proposal } = handlerInput;
     let lastResult = handlerInput.lastResult;
+    const taskId = this.intentSlots.currentTaskId(state.acceptedImplementationPlan);
+    const request = proposal.payload as ResourceRequestDraft;
+    const requestSignature = resourceRequestSignature(request);
+    const progressByTask = state.resourceRequestProgressByTask ?? new Map<string, SessionDriverTaskResourceProgress>();
+    state.resourceRequestProgressByTask = progressByTask;
+    const taskProgress = taskId ? taskResourceProgress(progressByTask, taskId) : undefined;
+    if (taskId && taskProgress?.signatures.includes(requestSignature)) {
+      if (taskProgress.noProgressCount >= 1) {
+        return {
+          kind: 'return',
+          result: await this.ports.append(state.sessionId, [
+            this.ports.finalDiagnosticEvent(
+              state.sessionId,
+              {
+                code: 'resourceRequestNoProgress',
+                fallback: 'The provider repeated an already resolved resource request for the current task after one controlled redirect.',
+                params: { taskId, noProgressCount: taskProgress.noProgressCount },
+              },
+              this.ports.now(),
+              this.ports.createId('resource-no-progress')
+            ),
+          ]),
+        };
+      }
+      taskProgress.noProgressCount += 1;
+      state.semanticDirectiveErrorSummary = [
+        'code=session_resource_no_progress',
+        `taskId=${taskId}`,
+        `resolvedPacketIds=${taskProgress.packetIds.join(' | ') || 'none'}`,
+        'requiredAction=Use the already resolved ResourceEvidence and choose a non-resource current-task directive, or request a genuinely different target/range/search that adds evidence.',
+      ].join('; ');
+      return { kind: 'continue', lastResult };
+    }
     const generated = this.ports.generatedPacketForRequest(
       state,
-      proposal.payload as ResourceRequestDraft,
+      request,
       this.ports.createId('generated-artifact-resource')
     );
     if (generated.packet) {
@@ -143,6 +157,7 @@ export class ResourceRequestProposalHandler<
         'generated-artifact-resource-context'
       )).result;
       if (!generated.remaining.items.length) {
+        if (taskProgress && generated.packet) recordTaskResourceProgress(taskProgress, requestSignature, generated.packet.id);
         return { kind: 'continue', lastResult };
       }
     }
@@ -152,54 +167,17 @@ export class ResourceRequestProposalHandler<
       generated.remaining,
       state.conversationRoots
     );
-    if (!subset.manifest.entries.length && !state.resourceRequestRepairAttempted) {
-      state.resourceRequestRepairAttempted = true;
-      try {
-        const repaired = await this.ports.repairResourceRequest(input, state, prompt, proposal, subset);
-        if (repaired.kind === 'answer') {
-          return {
-            kind: 'return',
-            result: await this.ports.append(state.sessionId, [
-              this.ports.answerEvent(
-                state.sessionId,
-                repaired,
-                this.ports.now(),
-                this.ports.createId('answer')
-              ),
-            ]),
-          };
-        }
-        if (repaired.kind === 'resourceRequest') {
-          subset = this.ports.resolveResourceRequest(
-            state.manifest,
-            repaired.payload as ResourceRequestDraft,
-            state.conversationRoots
-          );
-        } else if (repaired.kind === 'actionBundle') {
-          return {
-            kind: 'return',
-            result: await this.ports.submitActionProposal(input, state, prompt, repaired, lastResult),
-          };
-        } else {
-          return {
-            kind: 'return',
-            result: await this.ports.submitNonExecutableProposal(state, repaired, lastResult),
-          };
-        }
-      } catch (error) {
-        const message = this.ports.errorMessage(error);
-        return {
-          kind: 'return',
-          result: await this.ports.append(state.sessionId, [
-            this.ports.finalDiagnosticEvent(
-              state.sessionId,
-              this.ports.resourceRepairFailedDiagnostic(message),
-              this.ports.now(),
-              this.ports.createId('resource-repair-failed')
-            ),
-          ]),
-        };
-      }
+    const repairRuntime = new SessionDriverRepairRuntimeAccessor(state);
+    if (!subset.manifest.entries.length && !repairRuntime.attempted('resourceRequestRepairAttempted')) {
+      repairRuntime.markAttempted('resourceRequestRepairAttempted');
+      state.semanticDirectiveErrorSummary = [
+        'code=session_resource_directive_unresolved',
+        `unresolved=${subset.unresolved.slice(0, 8).join(' | ') || 'none'}`,
+        `ambiguous=${subset.ambiguous.slice(0, 8).join(' | ') || 'none'}`,
+        `availableRootCount=${subset.availableRoots.length}`,
+        'requiredAction=Call session.request_resources with one focused target under an available root, or choose another registered semantic directive.',
+      ].join('; ');
+      return { kind: 'continue', lastResult };
     }
 
     if (!subset.manifest.entries.length) {
@@ -222,6 +200,7 @@ export class ResourceRequestProposalHandler<
       'resource-context'
     );
     const packet = resourceAppend.packet;
+    if (taskProgress) recordTaskResourceProgress(taskProgress, requestSignature, packet.id);
     lastResult = resourceAppend.result;
     if (state.acceptedImplementationPlan) {
       this.ports.refreshTaskRuntimeState(state);
@@ -239,22 +218,58 @@ export class ResourceRequestProposalHandler<
         lastResult
       );
       if (readOnlyCompletion) {
-        return { kind: 'return', result: readOnlyCompletion };
+        return normalizeProposalRouterResult(readOnlyCompletion);
       }
-      const resumed = await this.ports.callResourceResume(input, state, prompt, proposal, packet);
-      if (resumed.kind === 'actionBundle') {
-        return {
-          kind: 'return',
-          result: await this.ports.submitActionProposal(input, state, prompt, resumed, lastResult),
-        };
-      }
-      if (resumed.kind !== 'resourceRequest') {
-        return {
-          kind: 'return',
-          result: await this.ports.submitNonExecutableProposal(state, resumed, lastResult),
-        };
-      }
+      return { kind: 'continue', lastResult };
     }
     return { kind: 'continue', lastResult };
   }
+}
+
+function taskResourceProgress(
+  progressByTask: Map<string, SessionDriverTaskResourceProgress>,
+  taskId: string
+): SessionDriverTaskResourceProgress {
+  const existing = progressByTask.get(taskId);
+  if (existing) return existing;
+  const created: SessionDriverTaskResourceProgress = {
+    signatures: [],
+    packetIds: [],
+    noProgressCount: 0,
+  };
+  progressByTask.set(taskId, created);
+  return created;
+}
+
+function recordTaskResourceProgress(
+  progress: SessionDriverTaskResourceProgress,
+  signature: string,
+  packetId: string
+): void {
+  if (!progress.signatures.includes(signature)) progress.signatures.push(signature);
+  if (!progress.packetIds.includes(packetId)) progress.packetIds.push(packetId);
+  progress.signatures = progress.signatures.slice(-12);
+  progress.packetIds = progress.packetIds.slice(-12);
+  progress.noProgressCount = 0;
+}
+
+function resourceRequestSignature(request: ResourceRequestDraft): string {
+  const items = request.items.map((item) => ({
+    kind: item.kind,
+    manifestEntryId: item.manifestEntryId,
+    rootId: item.rootId,
+    path: normalizePath(item.path),
+    query: item.query?.trim(),
+    include: [...(item.include ?? [])].sort(),
+    contextLines: item.contextLines,
+    maxResults: item.maxResults,
+    offsetBytes: item.offsetBytes,
+    limitBytes: item.limitBytes,
+  }));
+  return JSON.stringify(items.sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right))));
+}
+
+function normalizePath(value: string | undefined): string | undefined {
+  const normalized = value?.trim().replace(/\\/g, '/').replace(/\/+/g, '/').replace(/^\.\//, '').replace(/\/$/, '');
+  return normalized || undefined;
 }

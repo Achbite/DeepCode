@@ -55,6 +55,13 @@ export class ReviewDecisionProjectionBuilder {
         runId: input.review.runId,
         reviewId: input.review.reviewId,
         sourcePlanId: input.review.sourcePlanId,
+        decisionOwner: {
+          kind: 'review',
+          runId: input.review.runId,
+          targetId: input.review.reviewId,
+          reviewId: input.review.reviewId,
+          planId: input.review.sourcePlanId,
+        },
         confirmable: false,
         continuationRequested: input.continuationRequested,
         continuationCount: input.review.continuations.length,
