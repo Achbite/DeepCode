@@ -2,11 +2,11 @@
 
 > Chinese translation: [README.zh-CN.md](README.zh-CN.md)
 
-DeepCode v0.5.25 is a stable local-first AI coding workbench baseline. It keeps Agent session protocol, Kernel tool execution, permission audit, context compression, and Editor/GUI/CLI/TUI shells on one shared backend source of truth. This release stabilizes the Session protocol/parser, accepted-plan execution, file-node orchestration safeguards, generated artifact evidence, Review preflight checks, and the Kernel tool catalog baseline while preserving the reproducible local build/package flow and clear provider, tool, session, kernel, and UI shell boundaries.
+DeepCode v0.5.30 is a stable local-first AI coding workbench baseline. It keeps Agent session protocol, Kernel tool execution, permission audit, context compression, and Editor/GUI/CLI/TUI shells on one shared backend source of truth. This release stabilizes the Session protocol/parser and accepted-plan execution, makes the canonical Session timeline authoritative across the daemon and UI, drains bridge output concurrently, isolates Docker resources per worktree, and keeps active-checkout packaging deterministic while preserving clear provider, tool, session, kernel, and UI shell boundaries.
 
-Sub-agents remain experimental in v0.5.25. They are disabled by default because the parallel draft orchestration path is not stable enough for the default workflow. Users can still enable sub-agents from Agent settings for targeted experiments; Parent Session remains the only authority that validates drafts and submits Kernel actions.
+The retired sub-agent/DAG execution path has been removed in v0.5.30. Agent settings no longer expose sub-agent runtime controls, and Parent Session is the only orchestration authority that validates provider output and submits Kernel actions. A small number of optional request fields remain inert in Kernel client DTOs for transport compatibility; they do not restore the retired runtime.
 
-Release documentation currently uses the `v0.5.25 stable baseline` label. Some Cargo and package metadata may still report `0.5.24`; that version metadata drift is tracked for a later release metadata pass and does not change the runtime boundary described here.
+Release documentation currently uses the `v0.5.30 stable baseline` label. Some Cargo and package metadata may still report `0.5.24`; that version metadata drift is tracked for a later release metadata pass and does not change the runtime boundary described here.
 
 ## Build And Release Mode
 
