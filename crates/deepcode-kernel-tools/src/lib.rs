@@ -2,7 +2,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const TOOL_REGISTRY_VERSION: &str = "deepcode.kernel.tools.v1";
+mod sandbox;
+
+pub use sandbox::{
+    CandidateSandboxSpec, CleanupContract, IsolationContract, IsolationFallbackPolicy,
+    IsolationLevel, SandboxCapabilitySnapshot, SandboxSupportState, SealedSandboxPlan,
+    SANDBOX_CAPABILITY_SCHEMA_VERSION, SANDBOX_SPEC_SCHEMA_VERSION,
+};
+
+pub const TOOL_REGISTRY_VERSION: &str = "deepcode.kernel.tools.v2";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -123,6 +131,7 @@ pub struct ExecutionContract {
     pub backend: ExecutionBackendKind,
     pub executor_ref: &'static str,
     pub execution_mode: OperationExecutionMode,
+    pub isolation: IsolationContract,
     #[serde(default)]
     pub shell_allowed: bool,
 }
@@ -135,12 +144,6 @@ pub struct FactContract {
     pub untrusted_evidence: bool,
     #[serde(default)]
     pub validation_kind: Option<&'static str>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CleanupContract {
-    pub policy: &'static str,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -181,6 +184,7 @@ pub struct KernelToolCatalogTool {
     pub permission_summary: String,
     pub path_scope_policy: &'static str,
     pub execution_mode: OperationExecutionMode,
+    pub isolation: IsolationContract,
     #[serde(default)]
     pub hard_deny_rules: Vec<String>,
     pub needs_workspace: bool,
@@ -239,6 +243,7 @@ impl KernelToolRegistry {
                 permission_summary: permission_summary_for_template(&template),
                 path_scope_policy: template.resource.path_scope_policy,
                 execution_mode: template.execution.execution_mode,
+                isolation: template.execution.isolation.clone(),
                 hard_deny_rules: hard_deny_rules_for_tool(template.tool_id),
                 needs_workspace: template.resource.needs_workspace,
                 read_only: template.resource.read_only,
@@ -353,6 +358,7 @@ fn tool_template_for_descriptor(descriptor: &KernelToolDescriptor) -> KernelTool
             backend: backend_for_tool(descriptor),
             executor_ref: descriptor.executor_ref,
             execution_mode: descriptor.execution_mode,
+            isolation: isolation_contract_for_tool(descriptor.tool_id),
             shell_allowed: false,
         },
         fact: FactContract {
@@ -363,9 +369,7 @@ fn tool_template_for_descriptor(descriptor: &KernelToolDescriptor) -> KernelTool
             ),
             validation_kind: validation_kind_for_tool(descriptor.tool_id),
         },
-        cleanup: CleanupContract {
-            policy: cleanup_policy_for_tool(descriptor.tool_id),
-        },
+        cleanup: cleanup_contract_for_tool(descriptor.tool_id),
     }
 }
 
@@ -476,11 +480,53 @@ fn validation_kind_for_tool(tool_id: &str) -> Option<&'static str> {
     }
 }
 
-fn cleanup_policy_for_tool(tool_id: &str) -> &'static str {
+fn isolation_contract_for_tool(tool_id: &str) -> IsolationContract {
     match tool_id {
-        "process.exec" => "kill-on-timeout",
-        "provider.call" => "close-provider-stream",
-        _ => "none",
+        "process.exec" => IsolationContract {
+            minimum_level: IsolationLevel::OsSandbox,
+            support_state: SandboxSupportState::ContractOnly,
+            backend_requirement: Some("bubblewrap".to_string()),
+            profile_ref: Some("bubblewrap.read-only-workspace.v1".to_string()),
+            fallback: IsolationFallbackPolicy::Deny,
+            output_trust: "untrustedEvidence".to_string(),
+        },
+        _ => IsolationContract {
+            minimum_level: IsolationLevel::None,
+            support_state: SandboxSupportState::Unavailable,
+            backend_requirement: None,
+            profile_ref: None,
+            fallback: IsolationFallbackPolicy::Deny,
+            output_trust: "toolFact".to_string(),
+        },
+    }
+}
+
+fn cleanup_contract_for_tool(tool_id: &str) -> CleanupContract {
+    match tool_id {
+        "process.exec" => CleanupContract {
+            lease_policy: "sandboxLease".to_string(),
+            terminate_process_tree: true,
+            remove_scratch: true,
+            revoke_broker_grant: false,
+            deadline_ms: 5_000,
+            failure_policy: "blockReviewAcceptance".to_string(),
+        },
+        "provider.call" => CleanupContract {
+            lease_policy: "providerStream".to_string(),
+            terminate_process_tree: false,
+            remove_scratch: false,
+            revoke_broker_grant: true,
+            deadline_ms: 5_000,
+            failure_policy: "recordFailure".to_string(),
+        },
+        _ => CleanupContract {
+            lease_policy: "none".to_string(),
+            terminate_process_tree: false,
+            remove_scratch: false,
+            revoke_broker_grant: false,
+            deadline_ms: 0,
+            failure_policy: "recordFailure".to_string(),
+        },
     }
 }
 
@@ -2315,6 +2361,69 @@ mod tests {
                 .unwrap_or_else(|| panic!("{tool_id} descriptor exists"));
             assert_eq!(descriptor.execution_mode, OperationExecutionMode::Blocked);
         }
+    }
+
+    #[test]
+    fn process_exec_declares_os_sandbox_without_becoming_executable() {
+        let registry = KernelToolRegistry::default();
+        let template = registry
+            .template("process.exec")
+            .expect("process.exec template exists");
+
+        assert_eq!(
+            template.execution.execution_mode,
+            OperationExecutionMode::Blocked
+        );
+        assert_eq!(
+            template.execution.isolation.minimum_level,
+            IsolationLevel::OsSandbox
+        );
+        assert_eq!(
+            template.execution.isolation.support_state,
+            SandboxSupportState::ContractOnly
+        );
+        assert_eq!(
+            template.execution.isolation.backend_requirement.as_deref(),
+            Some("bubblewrap")
+        );
+        assert_eq!(
+            template.execution.isolation.fallback,
+            IsolationFallbackPolicy::Deny
+        );
+        assert_eq!(template.cleanup.lease_policy, "sandboxLease");
+        assert!(template.cleanup.terminate_process_tree);
+        assert!(template.cleanup.remove_scratch);
+        assert_eq!(template.cleanup.failure_policy, "blockReviewAcceptance");
+    }
+
+    #[test]
+    fn catalog_snapshot_exposes_isolation_contract_as_metadata() {
+        let snapshot = KernelToolRegistry::default().snapshot();
+        assert_eq!(snapshot.catalog_version, "deepcode.kernel.tools.v2");
+
+        let process = snapshot
+            .tools
+            .iter()
+            .find(|tool| tool.tool_id == "process.exec")
+            .expect("process.exec catalog entry exists");
+        assert_eq!(process.execution_mode, OperationExecutionMode::Blocked);
+        assert_eq!(
+            process.isolation.support_state,
+            SandboxSupportState::ContractOnly
+        );
+        assert_eq!(process.isolation.minimum_level, IsolationLevel::OsSandbox);
+
+        let read = snapshot
+            .tools
+            .iter()
+            .find(|tool| tool.tool_id == "fs.read")
+            .expect("fs.read catalog entry exists");
+        assert_eq!(read.isolation.minimum_level, IsolationLevel::None);
+        assert_eq!(
+            read.isolation.support_state,
+            SandboxSupportState::Unavailable
+        );
+        assert!(read.isolation.backend_requirement.is_none());
     }
 
     #[test]

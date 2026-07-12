@@ -1,5 +1,31 @@
 import type { AgentMode, AgentWorkspaceBinding } from './agent.js';
 
+export type IsolationLevel = 'none' | 'supervised' | 'osSandbox';
+export type SandboxSupportState = 'unavailable' | 'contractOnly' | 'experimental' | 'enforced';
+export type IsolationFallbackPolicy = 'deny';
+
+export interface IsolationContract {
+  minimumLevel: IsolationLevel;
+  supportState: SandboxSupportState;
+  backendRequirement?: string;
+  profileRef?: string;
+  fallback: IsolationFallbackPolicy;
+  outputTrust: string;
+}
+
+export interface SandboxCapabilitySnapshot {
+  schemaVersion: string;
+  backend: string;
+  supportState: SandboxSupportState;
+  executablePathRef?: string;
+  backendVersion?: string;
+  platform: string;
+  features: string[];
+  probeStatus: string;
+  probeDiagnostics: string[];
+  observedAt: string;
+}
+
 export interface ToolDefinition {
   name: string;
   description: string;
@@ -13,6 +39,7 @@ export interface ToolDefinition {
   permissionMode?: 'allow' | 'ask' | 'deny' | string;
   pathScopePolicy?: string;
   executionMode?: 'execute' | 'previewOnly' | 'blocked' | string;
+  isolation?: IsolationContract;
   readOnly?: boolean;
   catalogVersion?: string;
   catalogHash?: string;
@@ -31,6 +58,7 @@ export interface KernelToolCatalogTool {
   permissionSummary?: string;
   pathScopePolicy: string;
   executionMode: 'execute' | 'previewOnly' | 'blocked' | string;
+  isolation: IsolationContract;
   hardDenyRules?: string[];
   needsWorkspace: boolean;
   readOnly: boolean;
