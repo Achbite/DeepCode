@@ -349,7 +349,13 @@ export class KernelEventProjectionBuilder {
     const result = objectRecord(record.result);
     const workUnit = objectRecord(record.workUnit);
     const compiledTool = objectRecord(workUnit?.compiledTool) ?? objectRecord(record.compiledTool);
-    return uniqueStrings([
+    const workspaceRoots = uniqueStrings([
+      stringValue(record.workspaceRoot),
+      stringValue(output?.workspaceRoot),
+      stringValue(result?.workspaceRoot),
+      stringValue(workUnit?.workspaceRoot),
+    ]);
+    return uniqueTargetPaths([
       stringValue(record.path),
       stringValue(record.targetPath),
       stringValue(record.normalizedTargetPath),
@@ -366,7 +372,7 @@ export class KernelEventProjectionBuilder {
       stringValue(result?.normalizedTargetPath),
       ...stringArrayValue(workUnit?.writeSet),
       ...stringArrayValue(workUnit?.deleteSet),
-    ]);
+    ], workspaceRoots);
   }
 
   kernelActivityDeltaType(record: Record<string, unknown>): ProjectionDelta['type'] {
@@ -541,4 +547,38 @@ function uniqueStrings(values: Array<string | undefined>): string[] {
     output.push(trimmed);
   }
   return output;
+}
+
+function uniqueTargetPaths(
+  values: Array<string | undefined>,
+  workspaceRoots: string[]
+): string[] {
+  const roots = workspaceRoots.map(normalizeComparablePath).filter(Boolean);
+  const seen = new Set<string>();
+  const output: string[] = [];
+  for (const value of values) {
+    if (!value) continue;
+    const displayPath = value.trim();
+    if (!displayPath) continue;
+    const normalizedPath = normalizeComparablePath(displayPath);
+    const workspaceRelativePath = roots.reduce<string | undefined>((relative, root) => {
+      if (relative) return relative;
+      if (normalizedPath === root) return '.';
+      if (root === '/' && normalizedPath.startsWith('/')) return normalizedPath.slice(1);
+      return normalizedPath.startsWith(`${root}/`)
+        ? normalizedPath.slice(root.length + 1)
+        : undefined;
+    }, undefined);
+    const identity = workspaceRelativePath ?? normalizedPath;
+    if (!identity || seen.has(identity)) continue;
+    seen.add(identity);
+    output.push(workspaceRelativePath ?? displayPath);
+  }
+  return output;
+}
+
+function normalizeComparablePath(value: string): string {
+  const normalized = value.trim().replace(/\\/g, '/');
+  if (normalized === '/') return normalized;
+  return normalized.replace(/^\.\//, '').replace(/\/+$/g, '');
 }

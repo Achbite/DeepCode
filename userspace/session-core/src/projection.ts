@@ -47,8 +47,6 @@ export interface SessionProjection {
 
 export const NARRATIVE_TIMELINE_SCHEMA_VERSION = 'deepcode.session.timeline.v1' as const;
 
-type NarrativeRenderMode = NonNullable<NonNullable<AgentTimelineBlock['displayHints']>['renderMode']>;
-
 export interface NarrativeTimelineProjectionInput {
   sessionId: string;
   events: AgentEvent[];
@@ -284,8 +282,28 @@ export function buildNarrativeTimelineProjection(input: NarrativeTimelineProject
       ? { pending: { ...activeInteraction, blockId: interactionBlockId(turns, activeInteraction) } }
       : undefined,
     tokenUsageProjection: buildTokenUsageProjection(input.events),
+    workspaceProjection: buildWorkspaceProjection(input.events),
     rawEventRefs,
   };
+}
+
+function buildWorkspaceProjection(
+  events: AgentEvent[]
+): NonNullable<AgentTimelineResult['workspaceProjection']> {
+  const changedTargets: string[] = [];
+  let revision = 0;
+  for (const event of events) {
+    const activity = narrativeActivity([event]);
+    if (!activity) continue;
+    if (activity.operation !== 'write' && activity.operation !== 'patch' && activity.operation !== 'delete') {
+      continue;
+    }
+    revision += 1;
+    for (const target of activity.targets ?? []) {
+      if (target && !changedTargets.includes(target)) changedTargets.push(target);
+    }
+  }
+  return { revision, changedTargets };
 }
 
 function interactionBlockId(
@@ -714,7 +732,7 @@ function userInputBubbleContent(event: AgentEvent): string | undefined {
   if (event.kind === 'review_summary') {
     const status = stringField(event.payload, 'status');
     if (status !== 'accepted' && status !== 'rejected' && status !== 'needsRevision') return undefined;
-    if (status === 'accepted') return undefined;
+    if (status === 'accepted') return 'Review accepted';
     return firstPayloadText(event.payload, ['guidance', 'content', 'summary', 'message']);
   }
   return undefined;
@@ -722,6 +740,9 @@ function userInputBubbleContent(event: AgentEvent): string | undefined {
 
 function userInputBubbleContentKey(event: AgentEvent): string | undefined {
   if (!isRecordPayload(event.payload)) return undefined;
+  if (event.kind === 'review_summary' && stringField(event.payload, 'status') === 'accepted') {
+    return 'review.decision.accepted.userBubble';
+  }
   return stringField(event.payload, 'contentKey') ??
     stringField(event.payload, 'messageKey') ??
     stringField(event.payload, 'summaryKey');
@@ -787,19 +808,10 @@ function annotateLiveOverlayBlocks(
         const textBlock = isTimelineTextBlock(block);
         const shouldStream = textBlock && containsLastText && !hasLiveAfterLastText;
         const shouldSeal = textBlock && !shouldStream && block.events.some(isLiveTextEvent);
-        const renderMode: NarrativeRenderMode | undefined = shouldStream || shouldSeal
-          ? 'typewriter'
-          : block.displayHints?.renderMode;
         return {
           ...block,
           status: shouldStream ? 'running' : shouldSeal ? 'completed' : block.status,
           defaultCollapsed: shouldStream || shouldSeal ? false : block.defaultCollapsed,
-          displayHints: {
-            ...(block.displayHints ?? {}),
-            renderMode,
-            initialOpen: shouldStream || shouldSeal ? true : block.displayHints?.initialOpen,
-            replaceOnComplete: block.narrativeKind === 'thinking' ? true : block.displayHints?.replaceOnComplete,
-          },
         };
       }),
     })),
@@ -1340,7 +1352,9 @@ function canGroupNarrativeEvent(
   nextNarrativeKind: AgentTimelineNarrativeKind
 ): boolean {
   if (last.narrativeKind !== nextNarrativeKind || last.status === 'failed') return false;
-  if (nextNarrativeKind === 'thinking') return true;
+  // Each provider call is a distinct reasoning item. Streaming chunks for one
+  // call are already coalesced before they enter the narrative projection.
+  if (nextNarrativeKind === 'thinking') return false;
   if (nextNarrativeKind !== 'operationEvidence') return false;
 
   const lastActivityKey = narrativeActivityGroupKey(last.events);
@@ -1403,7 +1417,7 @@ function narrativeBlockFromEvents(
     feedbackRef: feedbackEvent
       ? { eventId: feedbackEvent.id, sessionId: feedbackEvent.sessionId, kind: feedbackEvent.kind }
       : undefined,
-    displayHints: narrativeDisplayHints(narrativeKind, status, title, summary, body),
+    displayHints: narrativeDisplayHints(narrativeKind, title, summary),
     evidenceRefs: events.flatMap(eventEvidenceRefs),
     rawEventRefs: events.map(eventRefForAgentEvent),
     taskProjectionRef: shouldShowNarrativeInTaskList(narrativeKind) ? `task-${narrativeKind}-${first.id || index}` : undefined,
@@ -1518,6 +1532,15 @@ function stabilizeNarrativeBlockIds(turns: AgentTimelineResult['turns']): void {
 }
 
 function semanticNarrativeBlockIdentity(block: AgentTimelineBlock): string | undefined {
+  if (block.narrativeKind === 'user') {
+    const projectedUserEvent = block.events.find((event) => event.kind === 'user_msg');
+    const payload = projectedUserEvent && isRecordPayload(projectedUserEvent.payload)
+      ? projectedUserEvent.payload
+      : undefined;
+    const sourceEventId = payload ? stringField(payload, 'sourceEventId') : undefined;
+    if (sourceEventId) return `timeline:user-input:${sourceEventId}`;
+  }
+
   const activityKey = narrativeActivityGroupKey(block.events);
   if (activityKey) return `timeline:${activityKey}`;
 
@@ -1568,6 +1591,7 @@ function narrativeKindForEvent(event: AgentEvent): AgentTimelineNarrativeKind {
   if (event.kind === 'review_summary') return 'review';
   if (event.kind === 'error') return 'diagnostic';
   if (event.kind === 'assistant_msg') {
+    if (isRecordPayload(event.payload) && event.payload.diagnostic === true) return 'diagnostic';
     const channel = stringValueFromPayload(event.payload, 'channel');
     if (channel === 'reasoning') return 'thinking';
     if (channel === 'progress' && ['llm', 'session', 'provider'].includes(stringValueFromPayload(event.payload, 'source') ?? '')) {
@@ -1707,10 +1731,6 @@ function resolveTimelineInteractionBlocks(
       if (!resolved) continue;
       block.status = 'completed';
       block.defaultCollapsed = narrativeDefaultCollapsed(block.narrativeKind ?? 'operationEvidence', 'completed');
-      block.displayHints = {
-        ...(block.displayHints ?? {}),
-        renderMode: block.displayHints?.renderMode === 'typewriter' ? 'instant' : block.displayHints?.renderMode,
-      };
     }
     turns[turnIndex] = finalizeNarrativeTurn(turn);
   }
@@ -1898,6 +1918,10 @@ function narrativeBody(events: AgentEvent[], kind: AgentTimelineNarrativeKind): 
     const reasoning = events.map(reasoningEventBody).join('').trim();
     return reasoning || undefined;
   }
+  if (kind === 'diagnostic') {
+    const text = firstNonEmpty(events, ['userMessage', 'message', 'summary']);
+    return text?.trim() ? text : undefined;
+  }
   const text = firstNonEmpty(events, ['content', 'message', 'summary', 'details']);
   return text?.trim() ? text : undefined;
 }
@@ -1934,43 +1958,26 @@ function trimReviewFooter(markdown: string): string {
 function narrativeDefaultCollapsed(kind: AgentTimelineNarrativeKind, status: AgentTimelineStatus): boolean {
   if (status === 'running' || status === 'waiting') return false;
   if (kind === 'assistantNarration') return false;
-  return kind === 'thinking' || kind === 'operationEvidence' || kind === 'permission';
+  return kind === 'thinking' ||
+    kind === 'operationEvidence' ||
+    kind === 'permission' ||
+    (kind === 'plan' && status === 'completed');
 }
 
 function narrativeDisplayHints(
   kind: AgentTimelineNarrativeKind,
-  status: AgentTimelineStatus,
   title: string,
-  summary: string,
-  body?: string
+  summary: string
 ): AgentTimelineBlock['displayHints'] {
-  const textLength = (body ?? summary ?? '').length;
-  const renderMode = narrativeRenderMode(kind, status);
   return {
     density: kind === 'operationEvidence' ? 'compact' : 'normal',
     evidenceMode: kind === 'operationEvidence' ? 'collapsed' : 'inline',
-    renderMode,
-    initialOpen: status === 'running' || status === 'waiting' || kind === 'assistantNarration',
     collapseAfterComplete: kind === 'thinking' || kind === 'operationEvidence',
-    typewriterSpeed: narrativeTypewriterSpeed(kind, renderMode, textLength),
-    replaceOnComplete: kind === 'thinking',
     checkpointKind: narrativeCheckpointKind(kind),
     showInTaskList: shouldShowNarrativeInTaskList(kind),
     taskListLabel: title,
     taskListSummary: summary,
   };
-}
-
-function narrativeTypewriterSpeed(
-  kind: AgentTimelineNarrativeKind,
-  renderMode: NarrativeRenderMode,
-  textLength: number
-): NonNullable<NonNullable<AgentTimelineBlock['displayHints']>['typewriterSpeed']> | undefined {
-  if (renderMode === 'accelerated') return 'fast';
-  if (renderMode !== 'typewriter') return undefined;
-  if (kind === 'thinking') return 'slow';
-  if (kind === 'assistantText' && textLength > 1600) return 'fast';
-  return 'normal';
 }
 
 function narrativeCheckpointKind(
@@ -1985,23 +1992,6 @@ function narrativeCheckpointKind(
   if (kind === 'review') return 'review';
   if (kind === 'diagnostic') return 'diagnostic';
   return undefined;
-}
-
-function narrativeRenderMode(
-  kind: AgentTimelineNarrativeKind,
-  status: AgentTimelineStatus
-): NarrativeRenderMode {
-  if (kind === 'assistantNarration') return 'typewriter';
-  if (kind === 'assistantText') return 'typewriter';
-  if (kind === 'thinking') return status === 'running' || status === 'waiting' ? 'typewriter' : 'static';
-  if (
-    kind === 'plan' ||
-    kind === 'review' ||
-    kind === 'requirement' ||
-    kind === 'permission' ||
-    kind === 'diagnostic'
-  ) return 'typewriter';
-  return 'static';
 }
 
 function shouldShowNarrativeInTaskList(kind: AgentTimelineNarrativeKind): boolean {

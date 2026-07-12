@@ -2,6 +2,7 @@ import type {
   AgentContextAttachment,
   AgentEvent,
   AgentSessionResult,
+  AgentTimelineDelta,
   AgentTimelineResult,
   AgentWorkspaceBinding,
   AppendAgentEventsRequest,
@@ -11,16 +12,12 @@ import type {
   LlmChatRequest,
   LlmChatResult,
   LlmChatStreamEvent,
-  ProjectionDelta,
   ToolCall,
 } from '@deepcode/protocol';
 import { buildSessionMemorySnapshot } from './context/memory.js';
 import { SessionDriverLoop } from './driver/sessionDriverLoop.js';
 import type { SessionDecisionResolverInput } from './driver/types.js';
-import {
-  buildNarrativeTimelineProjection,
-  buildTimelineProjectionWithLiveOverlay,
-} from './projection.js';
+import { CanonicalTimelineProjector } from './timelineDelta.js';
 import { SessionStorageClient } from './storageClient.js';
 import type { ProjectWorkingDirectory } from './context/types.js';
 
@@ -73,6 +70,8 @@ interface HostBridgeResult {
   error?: string;
 }
 
+const MEMORY_ARCHIVE_PERSIST_TIMEOUT_MS = 2_000;
+
 async function main(): Promise<void> {
   const raw = await readStdin();
   const request = JSON.parse(raw || '{}') as HostBridgeRequest;
@@ -97,7 +96,12 @@ async function runAsk(request: HostBridgeRequest): Promise<HostBridgeResult> {
 
   const sessionId = sessionResult.session.id;
   const existingEvents = sessionResult.events ?? [];
-  const projection = createProjectionPublishingDriver(apiBase, request.hostRunId, existingEvents);
+  const projection = createProjectionPublishingDriver(
+    apiBase,
+    request.hostRunId,
+    sessionId,
+    existingEvents
+  );
   const driver = projection.driver;
   const result = await driver.runUserTurn({
     sessionId,
@@ -136,7 +140,12 @@ async function resolveDecision(request: HostBridgeRequest): Promise<HostBridgeRe
   const current = await getAgentSession(apiBase, request.sessionId);
   const binding = request.noWorkspace ? undefined : workspaceBindingFromPath(request.workspacePath);
   const projectWorkingDirectory = request.noWorkspace ? undefined : projectWorkingDirectoryFromPath(request.workspacePath);
-  const projection = createProjectionPublishingDriver(apiBase, request.hostRunId, current.events);
+  const projection = createProjectionPublishingDriver(
+    apiBase,
+    request.hostRunId,
+    request.sessionId,
+    current.events
+  );
   const driver = projection.driver;
   const result = await driver.resolveDecision({
     sessionId: request.sessionId,
@@ -177,6 +186,8 @@ async function persistMemoryArchive(
   session: unknown,
   projectMemoryMode: 'confirm' | 'auto' | undefined
 ): Promise<void> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), MEMORY_ARCHIVE_PERSIST_TIMEOUT_MS);
   try {
     const client = new SessionStorageClient(apiBase);
     const snapshot = buildSessionMemorySnapshot(events, {
@@ -186,9 +197,11 @@ async function persistMemoryArchive(
       displaySessionName: sessionTitle(session) ?? sessionId,
       projectMemoryMode,
     });
-    await client.persistMemoryArchive(sessionId, snapshot);
+    await client.persistMemoryArchive(sessionId, snapshot, controller.signal);
   } catch (error) {
     process.stderr.write(`memory archive persist skipped: ${error instanceof Error ? error.message : String(error)}\n`);
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
@@ -201,6 +214,7 @@ function sessionTitle(value: unknown): string | undefined {
 function createProjectionPublishingDriver(
   apiBase: string,
   hostRunId: string | undefined,
+  sessionId: string,
   initialEvents: AgentEvent[]
 ): {
   driver: SessionDriverLoop;
@@ -208,33 +222,28 @@ function createProjectionPublishingDriver(
 } {
   const transcriptClient = new SessionStorageClient(apiBase);
   let committedEvents = [...initialEvents];
-  const activeDeltas: ProjectionDelta[] = [];
-  const buildTimeline = (events: AgentEvent[] = committedEvents): AgentTimelineResult =>
-    activeDeltas.length > 0
-      ? buildTimelineProjectionWithLiveOverlay({
-          sessionId: events[0]?.sessionId ?? committedEvents[0]?.sessionId ?? 'session',
-          committedEvents: events,
-          activeDeltas,
-        })
-      : buildNarrativeTimelineProjection({
-          sessionId: events[0]?.sessionId ?? committedEvents[0]?.sessionId ?? 'session',
-          events,
-        });
+  const projector = new CanonicalTimelineProjector(sessionId, initialEvents);
+  const buildTimeline = (): AgentTimelineResult => projector.snapshot();
   const driver = new SessionDriverLoop({
     kernelCommand: (request) => kernelCommand(apiBase, request),
     llmChat: (request) => llmChat(apiBase, request),
     llmChatStream: (request, onEvent) => llmChatStream(apiBase, request, onEvent),
     onProjectionDelta: hostRunId
       ? async (delta) => {
-          activeDeltas.push(delta);
-          await postProjectionDelta(apiBase, hostRunId, delta);
+          const timelineDeltas = projector.push(delta);
+          for (const timelineDelta of timelineDeltas) {
+            await postProjectionDelta(apiBase, hostRunId, timelineDelta);
+          }
         }
       : undefined,
     appendTranscript: (sessionId, entry) => transcriptClient.appendTranscript(sessionId, entry),
     appendEvents: async (sessionId, events) => {
       const nextEvents = [...committedEvents, ...events];
-      // Event append is the persistence boundary; the full timeline is derived from committed events.
-      const appendRequest: AppendAgentEventsRequest = { events };
+      const projectionCommit = projector.commit(nextEvents);
+      const appendRequest: AppendAgentEventsRequest = {
+        events,
+        timeline: projectionCommit.timeline,
+      };
       const response = await postJson<ApiResponse<AgentSessionResult>>(
         `${apiBase}/api/agent/sessions/${encodeURIComponent(sessionId)}/events`,
         appendRequest
@@ -243,6 +252,11 @@ function createProjectionPublishingDriver(
         throw new Error(response.message ?? response.error ?? 'append agent events failed');
       }
       committedEvents = response.data.events ?? nextEvents;
+      if (hostRunId) {
+        for (const timelineDelta of projectionCommit.deltas) {
+          await postProjectionDelta(apiBase, hostRunId, timelineDelta);
+        }
+      }
       return response.data;
     },
   });
@@ -380,7 +394,7 @@ async function llmChatStream(
   }
 }
 
-async function postProjectionDelta(apiBase: string, hostRunId: string, delta: ProjectionDelta): Promise<void> {
+async function postProjectionDelta(apiBase: string, hostRunId: string, delta: AgentTimelineDelta): Promise<void> {
   await postJson<ApiResponse<unknown>>(
     `${apiBase}/api/agent/sessions/${encodeURIComponent(delta.sessionId)}/runs/${encodeURIComponent(hostRunId)}/deltas`,
     delta
