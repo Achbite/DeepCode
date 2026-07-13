@@ -107,6 +107,13 @@ staging；如果构建期间源码发生变化，则拒绝发布混合 product s
 `toolCatalogVersion`，先退出正在运行的 App，再执行 `make package-macos-clean`，然后
 重新打开 App。
 
+## Git 分支与 PR 流程
+
+`main` 和 `dev-main` 是永久保护分支，只能通过 PR merge commit 更新。Kernel、
+Session、UI、普通修复、热修复以及明确批准的 release 工作统一使用短期任务分支。
+带防护的命令行入口、PR 路由、共享 hook、审计与合并后清理规则见
+[docs/git-branch-flow.md](docs/git-branch-flow.md)。
+
 ## 当前状态
 
 - Kernel daemon 提供 `/api/health`、会话归档、工具目录、权限审计、工作区、Git、内部浏览器等 API 入口。

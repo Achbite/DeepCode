@@ -1,0 +1,32 @@
+name: branch-policy
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, edited, ready_for_review]
+  push:
+    branches: [main, dev-main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out trusted policy source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.base.sha || github.sha }}
+
+      - name: Validate pull request route
+        if: github.event_name == 'pull_request_target'
+        env:
+          HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
+          BASE_BRANCH: ${{ github.event.pull_request.base.ref }}
+        run: bash ./scripts/branch-flow.sh check-pr-route "$HEAD_BRANCH" "$BASE_BRANCH"
+
+      - name: Validate policy installation
+        if: github.event_name != 'pull_request_target'
+        run: bash ./scripts/branch-flow.sh self-check
