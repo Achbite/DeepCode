@@ -129,7 +129,7 @@ RUN_ARGS := \
 	-e PATH=/root/.local/share/pnpm:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
 	$(NETWORK_ENV_ARGS)
 
-.PHONY: help docker-info shell build-deepcode-gui build-deepcode-gui-tauri dev-deepcode-gui clean macos-package-service macos-package-service-status macos-package-service-stop package-macos package-macos-clean package-macos-deepcode-gui _validate_worktree_config _ensure_macos_package_service _ensure_image _ensure_container
+.PHONY: help docker-info branch-audit branch-hooks shell build-deepcode-gui build-deepcode-gui-tauri dev-deepcode-gui clean macos-package-service macos-package-service-status macos-package-service-stop package-macos package-macos-clean package-macos-deepcode-gui _validate_worktree_config _ensure_macos_package_service _ensure_image _ensure_container
 
 # ---- help：默认目标，列出可用入口 ----
 help:
@@ -139,6 +139,8 @@ help:
 	@echo "  make build-deepcode-gui  在 Docker 内构建 DeepCode-GUI dist"
 	@echo "  make build-deepcode-gui-tauri  在 Docker 内构建 Windows DeepCode-GUI.exe"
 	@echo "  make docker-info    显示当前 worktree 的容器、挂载、端口和 volume 配置"
+	@echo "  make branch-audit   只读检查 worktree 与短期分支生命周期"
+	@echo "  make branch-hooks   安装 main/dev-main 的共享 Git 防护 hook"
 	@echo "  make dev-deepcode-gui    在 Docker 内启动 DeepCode-GUI 调试服务：127.0.0.1:$(DEEPCODE_HOST_PORT)"
 	@echo "  make clean          清理当前配置拥有的容器和 volumes"
 	@echo "  make macos-package-service  在 macOS 宿主机启动 Docker 打包请求服务"
@@ -161,6 +163,12 @@ docker-info:
 	@echo "containerPort=$(DEEPCODE_CONTAINER_PORT)"
 	@echo "cargoTargetVolume=$(VOL_CARGO_TARGET)"
 	@echo "nodeModulesVolume=$(VOL_NODE_MODULES)"
+
+branch-audit:
+	@bash ./scripts/branch-flow.sh audit
+
+branch-hooks:
+	@bash ./scripts/branch-flow.sh install-hooks
 
 _validate_worktree_config:
 	@if [ "$(DEEPCODE_WORKTREE_MODE)" = "1" ] && ! printf '%s' "$(DEEPCODE_WORKTREE_ID)" | grep -Eq '^[a-z0-9][a-z0-9_.-]*$$'; then \
