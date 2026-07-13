@@ -51,9 +51,31 @@ bash ./scripts/branch-flow.sh publish-task \
   --authorized
 ```
 
-The GitHub App creates the ready-for-review PR and merges it with the same
-expected head SHA after required checks pass. A changed SHA, dirty worktree,
-failed check, unresolved review, conflict, or moved target stops the closure.
+GitHub rulesets enforce pull-request-only updates, deletion protection,
+non-fast-forward protection, resolved review conversations, and merge commits.
+They do not prove that local validation ran. Before asking the GitHub App to
+merge, verify the exact remote head and target that were reviewed:
+
+```bash
+bash ./scripts/branch-flow.sh verify-pr \
+  --head kernel/permission-facts \
+  --target dev-main \
+  --expected-head <reviewed-sha> \
+  --expected-target <reviewed-target-sha>
+```
+
+Run the relevant module checks and the repository `test.sh` in the project
+Docker environment before this command. `verify-pr` fetches current remote
+state and rejects an invalid route, moved head, moved target, dirty active head
+worktree, stale target ancestry, missing commits, or diff whitespace errors.
+The GitHub App must merge with the same expected head SHA immediately after the
+local gate. Any later branch movement stops the closure and requires a new
+verification.
+
+This workflow intentionally does not depend on GitHub-hosted Actions runners.
+It is free and works for a single-authority repository, but GitHub cannot
+server-enforce that a local command was run. Repository administrators must not
+manually bypass the documented local gate.
 
 After merge, GitHub removes the remote head branch. The local cleanup command
 also handles a remaining remote ref, but only after proving that the exact head

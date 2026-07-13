@@ -21,6 +21,7 @@ Usage:
   scripts/branch-flow.sh start <kernel|session|ui|fix|hotfix|release> <slug> [--worktree PATH] [--release-approved]
   scripts/branch-flow.sh prepare-pr --target <dev-main|main> [--json]
   scripts/branch-flow.sh publish-task --target <dev-main|main> --expected-head SHA --authorized
+  scripts/branch-flow.sh verify-pr --head NAME --target <dev-main|main> --expected-head SHA --expected-target SHA [--json]
   scripts/branch-flow.sh sync-protected
   scripts/branch-flow.sh finish --branch NAME --target <dev-main|main> --expected-head SHA --authorized
   scripts/branch-flow.sh check-pr-route HEAD BASE
@@ -393,6 +394,78 @@ publish_task() {
   info "published task branch for PR: $head -> $target at $actual_head"
 }
 
+verify_pr() {
+  require_repo
+  local head=''
+  local target=''
+  local expected_head=''
+  local expected_target=''
+  local json='no'
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --head) head="${2:-}"; shift 2 ;;
+      --target) target="${2:-}"; shift 2 ;;
+      --expected-head) expected_head="${2:-}"; shift 2 ;;
+      --expected-target) expected_target="${2:-}"; shift 2 ;;
+      --json) json='yes'; shift ;;
+      *) die "unknown verify-pr option: $1" ;;
+    esac
+  done
+  [ -n "$head" ] && [ -n "$target" ] \
+    && [ -n "$expected_head" ] && [ -n "$expected_target" ] \
+    || die 'verify-pr requires --head, --target, --expected-head, and --expected-target'
+  assert_target "$target"
+  route_allowed "$head" "$target" || die "PR route is not allowed: $head -> $target"
+  [[ "$expected_head" =~ ^[0-9a-f]{40}$ ]] \
+    || die "expected head is not a full commit SHA: $expected_head"
+  [[ "$expected_target" =~ ^[0-9a-f]{40}$ ]] \
+    || die "expected target is not a full commit SHA: $expected_target"
+
+  local actual_head
+  local actual_target
+  local local_head
+  local wt
+  local counts
+  local behind
+  local ahead
+  git fetch origin --prune
+  git show-ref --verify --quiet "refs/remotes/origin/$head" \
+    || die "missing PR head: origin/$head"
+  git show-ref --verify --quiet "refs/remotes/origin/$target" \
+    || die "missing PR target: origin/$target"
+  actual_head="$(git rev-parse "origin/$head")"
+  actual_target="$(git rev-parse "origin/$target")"
+  [ "$actual_head" = "$expected_head" ] \
+    || die "PR head moved: expected $expected_head, found $actual_head"
+  [ "$actual_target" = "$expected_target" ] \
+    || die "PR target moved: expected $expected_target, found $actual_target"
+
+  if git show-ref --verify --quiet "refs/heads/$head"; then
+    local_head="$(git rev-parse "$head")"
+    [ "$local_head" = "$expected_head" ] \
+      || die "local PR head differs from reviewed head: $head"
+    wt="$(worktree_path_for_branch "$head" || true)"
+    [ -z "$wt" ] || assert_clean_worktree "$wt"
+  fi
+
+  if [ "$head" != 'main' ] || [ "$target" != 'dev-main' ]; then
+    git merge-base --is-ancestor "origin/$target" "origin/$head" \
+      || die "PR head is not based on the verified origin/$target"
+  fi
+  git diff --check "origin/$target...origin/$head"
+  counts="$(git rev-list --left-right --count "origin/$target...origin/$head")"
+  behind="${counts%%[[:space:]]*}"
+  ahead="${counts##*[[:space:]]}"
+  [ "$ahead" -gt 0 ] || die "no commits are available for PR: $head -> $target"
+
+  if [ "$json" = 'yes' ]; then
+    printf '{"verified":true,"head":"%s","headSha":"%s","target":"%s","targetSha":"%s","behind":%s,"ahead":%s}\n' \
+      "$head" "$actual_head" "$target" "$actual_target" "$behind" "$ahead"
+  else
+    info "PR verified locally: head=$head headSha=$actual_head target=$target targetSha=$actual_target behind=$behind ahead=$ahead"
+  fi
+}
+
 sync_protected() {
   require_repo
   local branch
@@ -501,6 +574,7 @@ main() {
     start) start_branch "$@" ;;
     prepare-pr) prepare_pr "$@" ;;
     publish-task) publish_task "$@" ;;
+    verify-pr) verify_pr "$@" ;;
     sync-protected) [ "$#" -eq 0 ] || die 'sync-protected takes no arguments'; sync_protected ;;
     finish) finish_branch "$@" ;;
     check-pr-route) check_pr_route "$@" ;;

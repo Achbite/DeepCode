@@ -105,6 +105,24 @@ git -C "$WORK" add tracked.txt
 git -C "$WORK" commit --quiet -m 'test: merged task'
 finished_head="$(git -C "$WORK" rev-parse HEAD)"
 git -C "$WORK" push --quiet -u origin fix/finished
+verified_target="$(git -C "$WORK" rev-parse origin/dev-main)"
+(
+  cd "$WORK"
+  bash ./scripts/branch-flow.sh verify-pr \
+    --head fix/finished \
+    --target dev-main \
+    --expected-head "$finished_head" \
+    --expected-target "$verified_target" >/dev/null
+)
+pass 'exact remote PR head and target are verified locally'
+expect_failure 'moved PR head is rejected' \
+  bash -c "cd '$WORK' && bash ./scripts/branch-flow.sh verify-pr --head fix/finished --target dev-main --expected-head 0000000000000000000000000000000000000000 --expected-target '$verified_target'"
+expect_failure 'moved PR target is rejected' \
+  bash -c "cd '$WORK' && bash ./scripts/branch-flow.sh verify-pr --head fix/finished --target dev-main --expected-head '$finished_head' --expected-target 0000000000000000000000000000000000000000"
+printf 'uncommitted after publish\n' >>"$WORK/tracked.txt"
+expect_failure 'dirty PR worktree is rejected at merge verification' \
+  bash -c "cd '$WORK' && bash ./scripts/branch-flow.sh verify-pr --head fix/finished --target dev-main --expected-head '$finished_head' --expected-target '$verified_target'"
+git -C "$WORK" restore tracked.txt
 git --git-dir="$REMOTE" update-ref refs/heads/dev-main "$finished_head"
 git -C "$WORK" fetch --quiet origin
 (
