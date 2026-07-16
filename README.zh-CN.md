@@ -110,7 +110,7 @@ staging；如果构建期间源码发生变化，则拒绝发布混合 product s
 ## 当前状态
 
 - Kernel daemon 提供 `/api/health`、会话归档、工具目录、权限审计、工作区、Git、内部浏览器等 API 入口。
-- live 会话协议只接受 `deepcode.agent.protocol.v3` JSON Envelope；userspace Session DriverLoop 负责 prompt 组装、provider 调用、parser 和一次 repair。tagged Markdown 协议输出会被 Session parser 拒绝。
+- live 会话协议只接受 `deepcode.agent.protocol.v4` JSON Envelope；userspace Session DriverLoop 负责 prompt 组装、provider 调用、parser 和一次 repair。tagged Markdown 协议输出会被 Session parser 拒绝。
 - Editor 是完整工作台封装：文件树、Monaco-based editor surface、终端、Agent 面板、Git 面板、内部浏览器。右侧 Agent 面板是嵌入在编辑器里的会话框，复用 DeepCode-GUI 的 Session projection 与消息语义，不是独立 Agent runtime。
 - DeepCode-GUI 是简洁对话式 GUI，不等同于完整 Editor。
 - GUI 只读分析可以由显式附件或 Session 记忆的项目默认工作目录锚定；这不同于 Editor workspace binding，后者仍是编辑器文件树和代码修改隔离边界。
@@ -136,11 +136,11 @@ Editor 专属上下文，例如 workspace root、active file、selection、open 
 
 ## 会话协议
 
-live provider-facing 输出以 `deepcode.agent.protocol.v3` JSON Envelope 为准：
+live provider-facing 输出以 `deepcode.agent.protocol.v4` JSON Envelope 为准：
 
 ```json
 {
-  "schemaVersion": "deepcode.agent.protocol.v3",
+  "schemaVersion": "deepcode.agent.protocol.v4",
   "proposalId": "proposal-example",
   "kind": "answer",
   "source": "llm",
@@ -164,7 +164,7 @@ conversation root 下的路径：
 
 ```json
 {
-  "schemaVersion": "deepcode.agent.protocol.v3",
+  "schemaVersion": "deepcode.agent.protocol.v4",
   "proposalId": "proposal-context-request",
   "kind": "resourceRequest",
   "source": "llm",
@@ -196,10 +196,10 @@ conversation root 下的路径：
 - 最终回答和 review 总结跟随用户语言，默认中文。
 - `resourceRequest.items[]` 必须包含 `manifestEntryId` 或 `path` 二选一。存在多个 conversation root 时，`path` 应搭配 `rootId`。
 - `path` 只由 Session 在显式附件、项目默认工作目录或已证明的 conversation roots 内解析，然后提交 Kernel `ResourceResolve`；LLM 自行生成的任意本地绝对路径无效。
-- `actionBundle.actions[].toolId` 使用 Kernel catalog id，如 `fs.write`、`fs.patch`、`fs.delete`、`web.search`、`web.fetch`。
+- `actionBundle.actions[].toolId` 使用 Kernel catalog id，如 `fs.write`、`fs.edit`、`fs.delete`、`web.search`、`web.fetch`。
 - 文件操作必须使用 `fs.*` catalog id；`workspace` 只表示已授权的 scope/root 概念，不再是工具命名空间。
-- 写入草案通过 top-level `codeBlocks` 表达，action 通过 `sourceBlockId` 引用。
-- v3 parser 保持 fail-closed；解析失败只允许 Session 中的一次受控 LLM repair。Kernel 只验证结构化 proposal，不组装 prompt，也不 repair 模型输出。
+- 写入草案通过 top-level `contentBlocks` 表达，action 通过 `contentBlockId` 引用。
+- v4 parser 保持 fail-closed；解析失败只允许 Session 中的一次受控 LLM repair。Kernel 只验证结构化 proposal，不组装 prompt，也不 repair 模型输出。
 
 ## Kernel 能力
 
@@ -207,13 +207,13 @@ conversation root 下的路径：
 
 | 能力域 | Tool ids | 当前状态 |
 | --- | --- | --- |
-| 文件与搜索 | `fs.list`、`fs.read`、`fs.diff`、`code.search` | 可执行只读 / 搜索工具 |
-| 文件修改 | `fs.write`、`fs.patch`、`fs.delete` | 只能通过 Kernel proposal review、权限门禁和 audit 执行 |
+| 文件与搜索 | `fs.read`、`fs.list`、`fs.glob`、`code.grep`、`fs.diff` | 可执行只读 / 搜索工具 |
+| 文件修改 | `fs.create`、`fs.write`、`fs.edit`、`fs.rename`、`fs.delete` | 只能通过 Kernel proposal review、权限门禁和 audit 执行 |
+| 文档读取 | `document.read` | 可执行 PDF 文本提取，并受 Kernel 文件大小、页数和输出上限约束 |
 | 联网证据 | `web.search`、`web.fetch` | 受门禁控制的只读外部证据 |
 | Git | `git.status`、`git.diff`、`git.stage`、`git.unstage`、`git.commit` | V1 正式 Git 范围，写操作受门禁控制 |
 | Git 预留 | `git.push` | reserved / blocked，不是当前可执行能力 |
-| 进程 | `shell.propose` | preview-only 命令说明 / 提案能力 |
-| 进程预留 | `process.exec` | blocked / permission preview，不是当前可执行能力 |
+| 进程预留 | `process.exec` | 已注册但 blocked；当前版本不存在命令执行路径 |
 | 浏览器预留 | `browser.open`、`browser.reload`、`browser.snapshot`、`browser.inspect`、`browser.click`、`browser.type`、`browser.scroll` | 已注册但 blocked / reserved |
 | Provider 预留 | `provider.call` | 已注册但 blocked / reserved；provider transport 仍归 daemon 承载 |
 
