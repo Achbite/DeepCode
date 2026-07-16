@@ -1,8 +1,8 @@
 use crate::{
-    ConfigSnapshotRef, DriverRequest, HostStatus, KernelErrorEnvelope, KernelSnapshot,
-    KernelStateContract, LlmProviderDiagnostic, MessageRole, PermissionDecisionKind,
-    PermissionRequestEnvelope, ProposalEnvelope, RequestId, RunId, RunStatus, SessionId,
-    StageRunId, StageStatus, TurnId, WorkflowDecision,
+    AuditQueryResult, ConfigSnapshotRef, DriverRequest, HostInspectionResult, HostStatus,
+    KernelErrorEnvelope, KernelSnapshot, KernelStateContract, LlmProviderDiagnostic, MessageRole,
+    PermissionDecisionKind, PermissionRequestEnvelope, PlanAuthorizationReview, ProposalEnvelope,
+    RequestId, ReviewFacts, RunId, RunStatus, RuntimeLifecycleState, SessionId, TurnId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -26,6 +26,11 @@ pub enum KernelEvent {
     SnapshotReady {
         request_id: RequestId,
         snapshot: KernelSnapshot,
+    },
+    #[serde(rename = "host.inspection_completed")]
+    HostInspectionCompleted {
+        request_id: RequestId,
+        result: HostInspectionResult,
     },
     #[serde(rename = "state.entered")]
     StateEntered {
@@ -60,6 +65,25 @@ pub enum KernelEvent {
         report: Value,
         sequence: Option<u64>,
     },
+    #[serde(rename = "plan_authorization.reviewed")]
+    PlanAuthorizationReviewed {
+        request_id: Option<RequestId>,
+        run_id: RunId,
+        session_id: Option<SessionId>,
+        plan_id: String,
+        review: PlanAuthorizationReview,
+        sequence: Option<u64>,
+    },
+    #[serde(rename = "plan_authorization.decision_recorded")]
+    PlanAuthorizationDecisionRecorded {
+        request_id: Option<RequestId>,
+        run_id: RunId,
+        session_id: Option<SessionId>,
+        authorization_contract_id: String,
+        decision: String,
+        lease_id: Option<String>,
+        sequence: Option<u64>,
+    },
     #[serde(rename = "proposal.rejected")]
     ProposalRejected {
         request_id: Option<RequestId>,
@@ -76,15 +100,6 @@ pub enum KernelEvent {
         run_id: Option<RunId>,
         session_id: Option<SessionId>,
         packet: Value,
-        sequence: Option<u64>,
-    },
-    #[serde(rename = "artifact.registered")]
-    ArtifactRegistered {
-        request_id: Option<RequestId>,
-        run_id: RunId,
-        session_id: Option<SessionId>,
-        artifact: Value,
-        evidence_ref: String,
         sequence: Option<u64>,
     },
     #[serde(rename = "draft.open")]
@@ -186,12 +201,20 @@ pub enum KernelEvent {
         reason: String,
         sequence: Option<u64>,
     },
+    #[serde(rename = "batch.review_ready")]
+    BatchReviewReady {
+        request_id: Option<RequestId>,
+        run_id: RunId,
+        session_id: Option<SessionId>,
+        contract_id: String,
+        sequence: Option<u64>,
+    },
     #[serde(rename = "review.facts_produced")]
     ReviewFactsProduced {
         request_id: Option<RequestId>,
         run_id: RunId,
         session_id: Option<SessionId>,
-        facts: Value,
+        facts: ReviewFacts,
         sequence: Option<u64>,
     },
     #[serde(rename = "review_gate.evaluated")]
@@ -210,14 +233,13 @@ pub enum KernelEvent {
         summary: Option<String>,
         sequence: Option<u64>,
     },
-    #[serde(rename = "stage.changed")]
-    StageChanged {
-        run_id: Option<RunId>,
+    #[serde(rename = "runtime.lifecycle_changed")]
+    RuntimeLifecycleChanged {
+        request_id: Option<RequestId>,
+        run_id: RunId,
         session_id: Option<SessionId>,
-        turn_id: Option<TurnId>,
-        stage_run_id: Option<StageRunId>,
-        phase: String,
-        status: StageStatus,
+        previous_state: Option<RuntimeLifecycleState>,
+        current_state: RuntimeLifecycleState,
         reason: Option<String>,
         sequence: Option<u64>,
     },
@@ -297,28 +319,12 @@ pub enum KernelEvent {
         snapshot_ref: ConfigSnapshotRef,
         sequence: Option<u64>,
     },
-    #[serde(rename = "workflow.checkpointed")]
-    WorkflowCheckpointed {
+    #[serde(rename = "runtime.resumed")]
+    RuntimeResumed {
         run_id: RunId,
         session_id: Option<SessionId>,
         checkpoint_id: String,
-        phase: String,
-        sequence: Option<u64>,
-    },
-    #[serde(rename = "workflow.resumed")]
-    WorkflowResumed {
-        run_id: RunId,
-        session_id: Option<SessionId>,
-        checkpoint_id: String,
-        phase: String,
-        sequence: Option<u64>,
-    },
-    #[serde(rename = "workflow.decision_made")]
-    WorkflowDecisionMade {
-        request_id: Option<RequestId>,
-        run_id: RunId,
-        session_id: Option<SessionId>,
-        decision: WorkflowDecision,
+        lifecycle_state: RuntimeLifecycleState,
         sequence: Option<u64>,
     },
     #[serde(rename = "skill.result")]
@@ -353,57 +359,6 @@ pub enum KernelEvent {
         risk_report: Value,
         sequence: Option<u64>,
     },
-    #[serde(rename = "tempArtifact.created")]
-    TempArtifactCreated {
-        run_id: RunId,
-        session_id: Option<SessionId>,
-        path: String,
-        sequence: Option<u64>,
-    },
-    #[serde(rename = "tempArtifact.cleaned")]
-    TempArtifactCleaned {
-        run_id: RunId,
-        session_id: Option<SessionId>,
-        path: String,
-        sequence: Option<u64>,
-    },
-    #[serde(rename = "tempArtifact.lease_granted")]
-    TempArtifactLeaseGranted {
-        run_id: RunId,
-        session_id: Option<SessionId>,
-        lease_id: String,
-        artifact_id: String,
-        scope: String,
-        required: bool,
-        sequence: Option<u64>,
-    },
-    #[serde(rename = "tempArtifact.lease_released")]
-    TempArtifactLeaseReleased {
-        run_id: RunId,
-        session_id: Option<SessionId>,
-        lease_id: String,
-        artifact_id: String,
-        cleanup_ok: bool,
-        sequence: Option<u64>,
-    },
-    #[serde(rename = "tempArtifact.lease_promoted")]
-    TempArtifactLeasePromoted {
-        run_id: RunId,
-        session_id: Option<SessionId>,
-        lease_id: String,
-        artifact_id: String,
-        from_scope: String,
-        to_scope: String,
-        sequence: Option<u64>,
-    },
-    #[serde(rename = "tempCleanup.failed")]
-    TempCleanupFailed {
-        run_id: RunId,
-        session_id: Option<SessionId>,
-        path: String,
-        error: KernelErrorEnvelope,
-        sequence: Option<u64>,
-    },
     #[serde(rename = "audit.verify_started")]
     AuditVerifyStarted {
         request_id: Option<RequestId>,
@@ -415,6 +370,12 @@ pub enum KernelEvent {
         request_id: Option<RequestId>,
         ok: bool,
         report: Value,
+        sequence: Option<u64>,
+    },
+    #[serde(rename = "audit.query_completed")]
+    AuditQueryCompleted {
+        request_id: Option<RequestId>,
+        result: AuditQueryResult,
         sequence: Option<u64>,
     },
     #[serde(rename = "audit.degraded_entered")]

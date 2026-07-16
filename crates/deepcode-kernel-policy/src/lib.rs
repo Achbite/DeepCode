@@ -3,8 +3,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
+mod environment;
 pub mod workspace_boundary;
 
+pub use environment::{
+    ExecutionEnvironmentDecision, ExecutionEnvironmentPolicy, HostShellOverride,
+    ShellRuntimePreference,
+};
 pub use workspace_boundary::WorkspaceBoundary;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -17,27 +22,27 @@ impl Capability {
     }
 
     pub fn workspace_read() -> Self {
-        Self::new("fs.read")
+        Self::new("workspace.read")
     }
 
     pub fn workspace_preview_diff() -> Self {
-        Self::new("fs.diff")
+        Self::new("workspace.read")
     }
 
     pub fn workspace_write() -> Self {
-        Self::new("fs.write")
+        Self::new("workspace.write")
     }
 
     pub fn workspace_create() -> Self {
-        Self::new("fs.write")
+        Self::new("workspace.write")
     }
 
     pub fn workspace_delete() -> Self {
-        Self::new("fs.delete")
+        Self::new("workspace.write")
     }
 
     pub fn workspace_rename() -> Self {
-        Self::new("fs.write")
+        Self::new("workspace.write")
     }
 
     pub fn workspace_list() -> Self {
@@ -45,7 +50,7 @@ impl Capability {
     }
 
     pub fn workspace_search() -> Self {
-        Self::new("code.search")
+        Self::new("code.grep")
     }
 
     pub fn git_read() -> Self {
@@ -58,10 +63,6 @@ impl Capability {
 
     pub fn git_push() -> Self {
         Self::new("git.push")
-    }
-
-    pub fn process_propose() -> Self {
-        Self::new("process.propose")
     }
 
     pub fn process_exec() -> Self {
@@ -346,85 +347,6 @@ impl Default for PermissionImpact {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum ShellRuntimePreference {
-    LinuxDefault,
-    Wsl,
-    PowerShell,
-    Cmd,
-    Bash,
-    Zsh,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HostShellOverride {
-    pub shell: ShellRuntimePreference,
-    pub reason: Option<String>,
-    pub acknowledged_risk: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ExecutionEnvironmentPolicy {
-    pub prefer_docker: bool,
-    pub default_shell: ShellRuntimePreference,
-    pub allow_host_shell_override: bool,
-    pub host_shell_override: Option<HostShellOverride>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ExecutionEnvironmentDecision {
-    pub shell: ShellRuntimePreference,
-    pub prefer_docker: bool,
-    pub requires_wsl_install: bool,
-    pub message_key: Option<String>,
-    pub host_override_recorded: bool,
-}
-
-impl ExecutionEnvironmentPolicy {
-    pub fn linux_default() -> Self {
-        Self {
-            prefer_docker: true,
-            default_shell: ShellRuntimePreference::LinuxDefault,
-            allow_host_shell_override: true,
-            host_shell_override: None,
-        }
-    }
-
-    pub fn windows_default() -> Self {
-        Self {
-            prefer_docker: true,
-            default_shell: ShellRuntimePreference::Wsl,
-            allow_host_shell_override: true,
-            host_shell_override: None,
-        }
-    }
-
-    pub fn decide_windows_shell(&self, wsl_available: bool) -> ExecutionEnvironmentDecision {
-        if let Some(host_override) = &self.host_shell_override {
-            return ExecutionEnvironmentDecision {
-                shell: host_override.shell.clone(),
-                prefer_docker: self.prefer_docker,
-                requires_wsl_install: false,
-                message_key: Some("execution.hostShellOverride".to_string()),
-                host_override_recorded: true,
-            };
-        }
-
-        ExecutionEnvironmentDecision {
-            shell: ShellRuntimePreference::Wsl,
-            prefer_docker: self.prefer_docker,
-            requires_wsl_install: !wsl_available,
-            message_key: (!wsl_available)
-                .then(|| "execution.windows.wslInstallRequired".to_string()),
-            host_override_recorded: false,
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PolicyGrant {
@@ -528,14 +450,6 @@ impl PolicyProfile {
                 reason: Some("builtin git read capability".to_string()),
             })
             .expect("kernel grant");
-        profile
-            .grant(PolicyGrant {
-                capability: Capability::process_propose(),
-                decision: PolicyDecisionKind::Allow,
-                source: PolicySourceTrust::Kernel,
-                reason: Some("shell proposal is dry-run".to_string()),
-            })
-            .expect("kernel grant");
         for capability in [
             Capability::workspace_write(),
             Capability::process_exec(),
@@ -583,18 +497,6 @@ impl PolicyProfile {
                     decision: PolicyDecisionKind::Allow,
                     source: PolicySourceTrust::Kernel,
                     reason: Some("trusted profile full ordinary workspace access".to_string()),
-                })
-                .expect("kernel grant");
-        }
-        for capability in [Capability::workspace_delete()] {
-            profile
-                .grant(PolicyGrant {
-                    capability,
-                    decision: PolicyDecisionKind::Ask,
-                    source: PolicySourceTrust::Kernel,
-                    reason: Some(
-                        "create/delete are isolated higher-risk workspace capabilities".to_string(),
-                    ),
                 })
                 .expect("kernel grant");
         }
@@ -856,438 +758,4 @@ fn is_deepcode_config_asset(path: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::path::PathBuf;
-
-    fn request(capability: Capability, risk_level: RiskLevel) -> PermissionRequest {
-        PermissionRequest {
-            id: "perm-1".to_string(),
-            run_id: Some("run-1".to_string()),
-            capability,
-            risk_level,
-            summary: "permission".to_string(),
-            args_preview: serde_json::json!({}),
-            skill_id: None,
-            effects: Vec::new(),
-            source_trust: None,
-            resource_scope: Some(ResourceScope::workspace_file("src/main.rs")),
-            impact: PermissionImpact::default(),
-        }
-    }
-
-    #[test]
-    fn developer_profile_allows_read_and_asks_write() {
-        let profile = PolicyProfile::developer_defaults();
-        let gate = DefaultPermissionGate;
-
-        let read = gate
-            .evaluate(
-                &profile,
-                &request(Capability::workspace_read(), RiskLevel::Low),
-            )
-            .unwrap();
-        assert_eq!(read.decision, PolicyDecisionKind::Allow);
-        assert!(read.request.is_none());
-
-        let write = gate
-            .evaluate(
-                &profile,
-                &request(Capability::workspace_write(), RiskLevel::High),
-            )
-            .unwrap();
-        assert_eq!(write.decision, PolicyDecisionKind::Ask);
-        assert!(write.request.is_some());
-    }
-
-    #[test]
-    fn missing_capability_denies_by_default() {
-        let profile = PolicyProfile::developer_defaults();
-        let gate = DefaultPermissionGate;
-        let decision = gate
-            .evaluate(
-                &profile,
-                &request(Capability::network_egress(), RiskLevel::High),
-            )
-            .unwrap();
-        assert_eq!(decision.decision, PolicyDecisionKind::Deny);
-    }
-
-    #[test]
-    fn workspace_source_cannot_self_grant_allow() {
-        let mut profile = PolicyProfile::developer_defaults();
-        let error = profile
-            .grant(PolicyGrant {
-                capability: Capability::process_exec(),
-                decision: PolicyDecisionKind::Allow,
-                source: PolicySourceTrust::Workspace,
-                reason: Some("workspace requested shell".to_string()),
-            })
-            .unwrap_err();
-
-        assert!(matches!(error, KernelError::PermissionDenied(_)));
-    }
-
-    #[test]
-    fn autonomy_profiles_have_expected_permission_matrix() {
-        let gate = DefaultPermissionGate;
-
-        let safe = PolicyProfile::safe_defaults();
-        let safe_write = gate
-            .evaluate(
-                &safe,
-                &request(Capability::workspace_write(), RiskLevel::High),
-            )
-            .unwrap();
-        assert_eq!(safe_write.decision, PolicyDecisionKind::Ask);
-
-        let trusted = PolicyProfile::trusted_workspace_defaults();
-        let trusted_write = gate
-            .evaluate(
-                &trusted,
-                &request(Capability::workspace_write(), RiskLevel::High),
-            )
-            .unwrap();
-        assert_eq!(trusted_write.decision, PolicyDecisionKind::Allow);
-
-        let trusted_create = gate
-            .evaluate(
-                &trusted,
-                &request(Capability::workspace_create(), RiskLevel::High),
-            )
-            .unwrap();
-        assert_eq!(trusted_create.decision, PolicyDecisionKind::Allow);
-
-        let trusted_delete = gate
-            .evaluate(
-                &trusted,
-                &request(Capability::workspace_delete(), RiskLevel::High),
-            )
-            .unwrap();
-        assert_eq!(trusted_delete.decision, PolicyDecisionKind::Ask);
-
-        let expert = PolicyProfile::expert_defaults();
-        let expert_shell = gate
-            .evaluate(
-                &expert,
-                &request(Capability::process_exec(), RiskLevel::High),
-            )
-            .unwrap();
-        assert_eq!(expert_shell.decision, PolicyDecisionKind::Ask);
-
-        let maintainer = PolicyProfile::maintainer_defaults();
-        let kernel_modify = gate
-            .evaluate(
-                &maintainer,
-                &PermissionRequest {
-                    resource_scope: Some(ResourceScope {
-                        kind: ResourceScopeKind::Kernel,
-                        path: None,
-                        managed_by_kernel: true,
-                    }),
-                    ..request(Capability::kernel_modify(), RiskLevel::Critical)
-                },
-            )
-            .unwrap();
-        assert_eq!(kernel_modify.decision, PolicyDecisionKind::Ask);
-    }
-
-    #[test]
-    fn trusted_workspace_full_access_does_not_cover_deepcode_config_assets() {
-        let gate = DefaultPermissionGate;
-        let profile = PolicyProfile::trusted_workspace_defaults();
-        let decision = gate
-            .evaluate(
-                &profile,
-                &PermissionRequest {
-                    resource_scope: Some(ResourceScope::workspace_file(
-                        ".deepcode/ruler/project-rules.md",
-                    )),
-                    ..request(Capability::workspace_write(), RiskLevel::High)
-                },
-            )
-            .unwrap();
-
-        assert_eq!(decision.decision, PolicyDecisionKind::Deny);
-        assert!(decision
-            .reason
-            .as_deref()
-            .unwrap_or_default()
-            .contains(".deepcode"));
-    }
-
-    #[test]
-    fn temporary_grant_is_run_capability_and_resource_scoped() {
-        let gate = DefaultPermissionGate;
-        let mut profile = PolicyProfile::safe_defaults();
-        profile
-            .grant_temporary(TemporaryGrant {
-                id: "grant-1".to_string(),
-                run_id: "run-allowed".to_string(),
-                capability: Capability::workspace_write(),
-                resource_scope: ResourceScope::workspace_file("src/main.rs"),
-                decision: PolicyDecisionKind::Allow,
-                expires_after_sequence: Some(20),
-                reason: Some("user accepted temporary write".to_string()),
-            })
-            .unwrap();
-
-        let allowed = gate
-            .evaluate(
-                &profile,
-                &PermissionRequest {
-                    run_id: Some("run-allowed".to_string()),
-                    resource_scope: Some(ResourceScope::workspace_file("src/main.rs")),
-                    ..request(Capability::workspace_write(), RiskLevel::High)
-                },
-            )
-            .unwrap();
-        assert_eq!(allowed.decision, PolicyDecisionKind::Allow);
-
-        let different_run = gate
-            .evaluate(
-                &profile,
-                &PermissionRequest {
-                    run_id: Some("run-other".to_string()),
-                    resource_scope: Some(ResourceScope::workspace_file("src/main.rs")),
-                    ..request(Capability::workspace_write(), RiskLevel::High)
-                },
-            )
-            .unwrap();
-        assert_eq!(different_run.decision, PolicyDecisionKind::Ask);
-
-        let different_resource = gate
-            .evaluate(
-                &profile,
-                &PermissionRequest {
-                    run_id: Some("run-allowed".to_string()),
-                    resource_scope: Some(ResourceScope::workspace_file("src/lib.rs")),
-                    ..request(Capability::workspace_write(), RiskLevel::High)
-                },
-            )
-            .unwrap();
-        assert_eq!(different_resource.decision, PolicyDecisionKind::Ask);
-    }
-
-    #[test]
-    fn hard_floor_denies_before_temporary_grant() {
-        let gate = DefaultPermissionGate;
-        let mut profile = PolicyProfile::maintainer_defaults();
-        profile
-            .grant_temporary(TemporaryGrant {
-                id: "grant-delete".to_string(),
-                run_id: "run-1".to_string(),
-                capability: Capability::workspace_delete(),
-                resource_scope: ResourceScope::workspace_file("src"),
-                decision: PolicyDecisionKind::Allow,
-                expires_after_sequence: None,
-                reason: Some("user allowed cleanup".to_string()),
-            })
-            .unwrap();
-
-        let decision = gate
-            .evaluate(
-                &profile,
-                &PermissionRequest {
-                    resource_scope: Some(ResourceScope::workspace_file("src")),
-                    impact: PermissionImpact {
-                        effect_surface: EffectSurface::SystemPath,
-                        batch_size: BatchSize::Unbounded,
-                        persistence: Persistence::Persistent,
-                        outside_workspace: OutsideWorkspace::Forbidden,
-                        hard_floor: None,
-                    },
-                    ..request(Capability::workspace_delete(), RiskLevel::Critical)
-                },
-            )
-            .unwrap();
-
-        assert_eq!(decision.decision, PolicyDecisionKind::Deny);
-        assert!(decision
-            .reason
-            .as_deref()
-            .unwrap_or_default()
-            .contains("hard floor"));
-    }
-
-    #[test]
-    fn outside_workspace_write_requires_matching_temporary_grant() {
-        let gate = DefaultPermissionGate;
-        let mut profile = PolicyProfile::trusted_workspace_defaults();
-        let decision = gate
-            .evaluate(
-                &profile,
-                &PermissionRequest {
-                    resource_scope: Some(ResourceScope::external_file("/tmp/research.md")),
-                    impact: PermissionImpact {
-                        effect_surface: EffectSurface::ExternalReadOnly,
-                        outside_workspace: OutsideWorkspace::ReadOnlyReference,
-                        ..PermissionImpact::default()
-                    },
-                    ..request(Capability::workspace_write(), RiskLevel::Critical)
-                },
-            )
-            .unwrap();
-
-        assert_eq!(decision.decision, PolicyDecisionKind::Deny);
-
-        profile
-            .grant_temporary(TemporaryGrant {
-                id: "grant-external-write".to_string(),
-                run_id: "run-1".to_string(),
-                capability: Capability::workspace_write(),
-                resource_scope: ResourceScope::external_file("/tmp/research.md"),
-                decision: PolicyDecisionKind::Allow,
-                expires_after_sequence: None,
-                reason: Some("user accepted outside workspace file operation".to_string()),
-            })
-            .unwrap();
-
-        let allowed = gate
-            .evaluate(
-                &profile,
-                &PermissionRequest {
-                    resource_scope: Some(ResourceScope::external_file("/tmp/research.md")),
-                    impact: PermissionImpact {
-                        effect_surface: EffectSurface::ExternalReadOnly,
-                        outside_workspace: OutsideWorkspace::ReadOnlyReference,
-                        ..PermissionImpact::default()
-                    },
-                    ..request(Capability::workspace_write(), RiskLevel::Critical)
-                },
-            )
-            .unwrap();
-        assert_eq!(allowed.decision, PolicyDecisionKind::Allow);
-
-        let sibling = gate
-            .evaluate(
-                &profile,
-                &PermissionRequest {
-                    resource_scope: Some(ResourceScope::external_file("/tmp/sibling.md")),
-                    impact: PermissionImpact {
-                        effect_surface: EffectSurface::ExternalReadOnly,
-                        outside_workspace: OutsideWorkspace::ReadOnlyReference,
-                        ..PermissionImpact::default()
-                    },
-                    ..request(Capability::workspace_write(), RiskLevel::Critical)
-                },
-            )
-            .unwrap();
-        assert_eq!(sibling.decision, PolicyDecisionKind::Deny);
-    }
-
-    #[test]
-    fn kernel_modify_requires_maintainer_autonomy_floor() {
-        let gate = DefaultPermissionGate;
-        let trusted = PolicyProfile::trusted_workspace_defaults();
-        let denied = gate
-            .evaluate(
-                &trusted,
-                &PermissionRequest {
-                    resource_scope: Some(ResourceScope {
-                        kind: ResourceScopeKind::Kernel,
-                        path: None,
-                        managed_by_kernel: true,
-                    }),
-                    impact: PermissionImpact {
-                        effect_surface: EffectSurface::Kernel,
-                        persistence: Persistence::Persistent,
-                        ..PermissionImpact::default()
-                    },
-                    ..request(Capability::kernel_modify(), RiskLevel::Critical)
-                },
-            )
-            .unwrap();
-        assert_eq!(denied.decision, PolicyDecisionKind::Deny);
-
-        let maintainer = PolicyProfile::maintainer_defaults();
-        let ask = gate
-            .evaluate(
-                &maintainer,
-                &PermissionRequest {
-                    resource_scope: Some(ResourceScope {
-                        kind: ResourceScopeKind::Kernel,
-                        path: None,
-                        managed_by_kernel: true,
-                    }),
-                    impact: PermissionImpact {
-                        effect_surface: EffectSurface::Kernel,
-                        persistence: Persistence::Persistent,
-                        ..PermissionImpact::default()
-                    },
-                    ..request(Capability::kernel_modify(), RiskLevel::Critical)
-                },
-            )
-            .unwrap();
-        assert_eq!(ask.decision, PolicyDecisionKind::Ask);
-    }
-
-    #[test]
-    fn windows_shell_policy_defaults_to_wsl_and_respects_override() {
-        let policy = ExecutionEnvironmentPolicy::windows_default();
-        let missing_wsl = policy.decide_windows_shell(false);
-        assert_eq!(missing_wsl.shell, ShellRuntimePreference::Wsl);
-        assert!(missing_wsl.requires_wsl_install);
-        assert_eq!(
-            missing_wsl.message_key.as_deref(),
-            Some("execution.windows.wslInstallRequired")
-        );
-
-        let policy = ExecutionEnvironmentPolicy {
-            host_shell_override: Some(HostShellOverride {
-                shell: ShellRuntimePreference::PowerShell,
-                reason: Some("user explicitly requested Windows shell".to_string()),
-                acknowledged_risk: true,
-            }),
-            ..ExecutionEnvironmentPolicy::windows_default()
-        };
-        let override_decision = policy.decide_windows_shell(false);
-        assert_eq!(override_decision.shell, ShellRuntimePreference::PowerShell);
-        assert!(override_decision.host_override_recorded);
-        assert!(!override_decision.requires_wsl_install);
-    }
-
-    #[test]
-    fn docker_policy_is_default_recommendation_not_hard_requirement() {
-        let policy = ExecutionEnvironmentPolicy {
-            prefer_docker: false,
-            host_shell_override: Some(HostShellOverride {
-                shell: ShellRuntimePreference::Cmd,
-                reason: Some("user disabled Docker".to_string()),
-                acknowledged_risk: true,
-            }),
-            ..ExecutionEnvironmentPolicy::windows_default()
-        };
-        let decision = policy.decide_windows_shell(true);
-
-        assert!(!decision.prefer_docker);
-        assert_eq!(decision.shell, ShellRuntimePreference::Cmd);
-        assert!(decision.host_override_recorded);
-    }
-
-    #[test]
-    fn workspace_boundary_rejects_escaped_paths() {
-        let boundary = WorkspaceBoundary::new("/workspace");
-        for path in ["/etc/passwd", "../secret.txt", "C:/Users/test/file.txt"] {
-            assert!(
-                boundary.resolve(path).is_err(),
-                "{path} must not resolve through the workspace boundary"
-            );
-        }
-        assert_eq!(
-            boundary.resolve("src/main.rs").unwrap(),
-            PathBuf::from("/workspace").join("src/main.rs")
-        );
-    }
-
-    #[test]
-    fn workspace_boundary_blocks_protected_config_asset_mutation() {
-        assert!(WorkspaceBoundary::assert_mutable_config_asset("src/lib.rs").is_ok());
-        assert!(
-            WorkspaceBoundary::assert_mutable_config_asset(".deepcode/policy/rules.json").is_err()
-        );
-        assert!(
-            WorkspaceBoundary::assert_mutable_config_asset(".deepcode\\skills\\demo.json").is_err()
-        );
-    }
-}
+mod tests;

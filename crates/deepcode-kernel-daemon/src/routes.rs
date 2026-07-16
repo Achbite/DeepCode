@@ -22,6 +22,18 @@ pub(crate) fn build_app(state: AppState) -> Router {
                 .layer(DefaultBodyLimit::max(LARGE_JSON_BODY_LIMIT_BYTES)),
         )
         .route(
+            "/api/session-store/:session_id/wire-ledger",
+            get(session_store_wire_ledger_get)
+                .post(session_store_wire_ledger_append)
+                .layer(DefaultBodyLimit::max(LARGE_JSON_BODY_LIMIT_BYTES)),
+        )
+        .route(
+            "/api/session-store/:session_id/cache-telemetry",
+            get(session_store_cache_telemetry_get)
+                .post(session_store_cache_telemetry_append)
+                .layer(DefaultBodyLimit::max(LARGE_JSON_BODY_LIMIT_BYTES)),
+        )
+        .route(
             "/api/session-store/:session_id/archive",
             get(session_store_archive_get),
         )
@@ -45,9 +57,8 @@ pub(crate) fn build_app(state: AppState) -> Router {
         )
         .route("/api/fs/initial-locations", get(fs_initial_locations))
         .route("/api/fs/browse", get(fs_browse))
+        .route("/api/host/inspect", post(host_inspect))
         .route("/api/skills/scan-mount", post(skill_mount_scan))
-        .route("/api/files/tree", get(file_tree))
-        .route("/api/files/read", get(file_read))
         .route(
             "/api/user-settings",
             get(user_settings_get).patch(user_settings_patch),
@@ -65,9 +76,6 @@ pub(crate) fn build_app(state: AppState) -> Router {
             "/api/llm/chat/stream",
             post(llm_chat_stream).layer(DefaultBodyLimit::max(LARGE_JSON_BODY_LIMIT_BYTES)),
         )
-        .route("/api/code/search", post(code_search))
-        .route("/api/git/status", get(git_status))
-        .route("/api/git/diff", get(git_diff))
         .route("/api/runtime/shell", get(runtime_shell))
         .route("/api/terminal/capabilities", get(terminal_capabilities))
         .route(
@@ -98,6 +106,20 @@ pub(crate) fn build_app(state: AppState) -> Router {
         .route(
             "/api/agent/sessions",
             get(agent_sessions_list).post(agent_session_create),
+        )
+        .route(
+            "/api/agent/projects",
+            get(agent_projects_list).post(agent_project_create),
+        )
+        .route(
+            "/api/agent/projects/:project_id",
+            get(agent_project_get)
+                .patch(agent_project_update)
+                .delete(agent_project_delete),
+        )
+        .route(
+            "/api/agent/projects/:project_id/rebind",
+            post(agent_project_rebind),
         )
         .route("/api/agent/sessions/current", get(agent_session_current))
         .route(
@@ -172,7 +194,7 @@ pub(crate) fn build_app(state: AppState) -> Router {
             "/api/browser/panel-snapshot/attach",
             post(browser_attach_snapshot),
         )
-        .route("/api/*path", any(api_not_implemented));
+        .route("/api/*path", any(api_route_not_found));
     if let Some(client_dist) = client_dist_dir() {
         let index_path = client_dist.join("index.html");
         app = app.fallback_service(

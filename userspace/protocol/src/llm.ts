@@ -158,9 +158,13 @@ export interface LlmChatResult {
   chunks: LlmChatChunk[];
   assistantMessage?: LlmChatMessage;
   usage?: Record<string, unknown>;
+  providerProfileId?: string;
+  provider?: string;
+  model?: string;
 }
 
 export type LlmChatStreamEventType =
+  | 'provider_metadata'
   | 'provider_delta'
   | 'provider_reasoning_delta'
   | 'provider_tool_call_delta'
@@ -173,6 +177,9 @@ export interface LlmChatStreamEvent {
   chunk?: LlmChatChunk;
   error?: string;
   usage?: Record<string, unknown>;
+  providerProfileId?: string;
+  provider?: string;
+  model?: string;
   rawProvider?: unknown;
 }
 

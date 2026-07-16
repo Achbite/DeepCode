@@ -7,8 +7,8 @@
   "kind": "directHostScript",
   "entrypoint": {
     "kind": "script",
-    "command": "python3",
-    "args": ["transform.py"],
+    "program": "python3",
+    "argv": ["transform.py"],
     "scriptPath": "transform.py"
   },
   "requestedCapabilities": ["fs.read"],

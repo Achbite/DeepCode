@@ -19,6 +19,8 @@ pub(crate) struct HostPaths {
     pub(crate) llm_profiles_path: PathBuf,
     pub(crate) llm_secrets_path: PathBuf,
     pub(crate) workflow_config_path: PathBuf,
+    pub(crate) projects_path: PathBuf,
+    pub(crate) sessions_index_path: PathBuf,
     pub(crate) sessions_dir: PathBuf,
     pub(crate) conversation_archives_dir: PathBuf,
     pub(crate) memory_archives_dir: PathBuf,
@@ -30,6 +32,7 @@ pub(crate) struct GuiState {
     pub(crate) user_settings: Value,
     pub(crate) llm_profiles: Value,
     pub(crate) workflow_config: Value,
+    pub(crate) projects: Vec<Value>,
     pub(crate) sessions: Vec<Value>,
     pub(crate) current_session_id: Option<String>,
     pub(crate) current_session_ids_by_scope: HashMap<String, String>,
@@ -93,6 +96,7 @@ impl GuiState {
             read_json_file(&paths.llm_profiles_path).unwrap_or_else(default_llm_profiles);
         let workflow_config =
             read_json_file(&paths.workflow_config_path).unwrap_or_else(default_workflow_config);
+        let projects = restore_agent_projects(&paths.projects_path);
         let sessions = restore_session_index(&paths);
         let current_session_id = sessions
             .iter()
@@ -105,6 +109,7 @@ impl GuiState {
             user_settings,
             llm_profiles,
             workflow_config,
+            projects,
             sessions,
             current_session_id,
             current_session_ids_by_scope,
@@ -134,6 +139,8 @@ impl HostPaths {
             llm_profiles_path: settings_dir.join("llm-profiles.json"),
             llm_secrets_path: secrets_dir.join("llm-secrets.json"),
             workflow_config_path: settings_dir.join("agent-workflow-config.json"),
+            projects_path: root.join("projects.json"),
+            sessions_index_path: root.join("agent-sessions.json"),
             sessions_dir: root.join("sessions"),
             conversation_archives_dir: root.join("conversation-archives"),
             memory_archives_dir: root.join("memory").join("projects"),

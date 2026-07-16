@@ -5,6 +5,8 @@ use serde_json::Value;
 #[serde(rename_all = "camelCase")]
 pub struct TemporaryGrantEnvelope {
     pub id: String,
+    pub contract_id: String,
+    pub operation_ids: Vec<String>,
     pub capability: String,
     pub resource_kind: String,
     pub resource_path: Option<String>,
@@ -37,4 +39,34 @@ pub struct PermissionRequestEnvelope {
     pub risk_level: String,
     pub summary: String,
     pub args_preview: Value,
+}
+
+pub const PENDING_OPERATION_CHECKPOINT_SCHEMA_VERSION: &str =
+    "deepcode.kernel.pending-operation-checkpoint.v1";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingOperationCheckpointItem {
+    pub operation_id: String,
+    pub work_unit_id: String,
+    pub tool_call_id: String,
+    pub tool_id: String,
+    pub args_hash: String,
+    #[serde(default)]
+    pub read_set: Vec<String>,
+    #[serde(default)]
+    pub write_set: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingOperationCheckpoint {
+    pub schema_version: String,
+    pub permission_id: String,
+    pub permission_bundle_id: Option<String>,
+    pub contract_id: String,
+    pub contract_hash: String,
+    pub request_id: String,
+    pub plan_id: String,
+    pub items: Vec<PendingOperationCheckpointItem>,
 }

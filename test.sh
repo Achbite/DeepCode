@@ -69,6 +69,8 @@ check_static_contracts() {
   for script in \
     test.sh \
     build.sh \
+    scripts/branch-flow.sh \
+    scripts/test-branch-flow.sh \
     scripts/check-architecture.sh \
     scripts/cargo-with-fallback.sh \
     scripts/macos-package-service.sh \
@@ -77,6 +79,7 @@ check_static_contracts() {
     bash -n "$script"
   done
   bash ./scripts/check-architecture.sh
+  bash ./scripts/test-branch-flow.sh
 }
 
 host_static_only_gate() {
