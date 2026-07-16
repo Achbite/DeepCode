@@ -1,7 +1,7 @@
 /**
  * 文件相关共享 DTO
  *
- * 用于 /api/files/* 路由的请求与响应类型；前后端复用此定义。
+ * 用于 typed Host inspection 投影的文件响应类型；前后端复用此定义。
  *
  * 工作区模型：所有文件 API 必须指明 folderId，落点是当前活动工作区下的某个
  * WorkspaceFolder。folderId 可省略；省略时由后端选择第一个 folder。
@@ -19,23 +19,7 @@ export interface FileTreeNode {
   children?: FileTreeNode[];
 }
 
-/** GET /api/files/tree 查询参数 */
-export interface FileTreeQuery {
-  /** 目标 WorkspaceFolder 的 id；省略时使用当前工作区 folders[0] */
-  folderId?: string;
-  /** 起始相对路径，默认为 folder 根 */
-  path?: string;
-}
-
-/** GET /api/files/read 查询参数 */
-export interface FileReadQuery {
-  /** 目标 WorkspaceFolder 的 id；省略时使用当前工作区 folders[0] */
-  folderId?: string;
-  /** 文件相对 folder 根的 POSIX 路径 */
-  path: string;
-}
-
-/** GET /api/files/read 成功响应 data 字段 */
+/** Host inspection read 成功响应的 output 字段 */
 export interface FileReadResult {
   /** 所属 WorkspaceFolder 的 id；用于前端 Tab 与 folder 绑定 */
   folderId: string;

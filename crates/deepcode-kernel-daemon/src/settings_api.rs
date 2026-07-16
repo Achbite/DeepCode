@@ -28,7 +28,13 @@ pub(crate) async fn user_settings_patch(
     match atomic_write_json(&gui.paths.settings_path, &gui.user_settings) {
         Ok(()) => {
             let store_path = gui.paths.settings_path.to_string_lossy().to_string();
+            let (tool_config, secret_provider) = runtime_tool_configuration(&gui);
             drop(gui);
+            state
+                .runtime
+                .lock()
+                .expect("kernel runtime lock")
+                .configure_tool_runtime(tool_config, Arc::new(secret_provider));
             let config_audit = record_config_modified_audit(
                 &state,
                 "userSettings",
@@ -126,7 +132,13 @@ pub(crate) async fn llm_profiles_patch(
             }
             let store_path = gui.paths.llm_profiles_path.to_string_lossy().to_string();
             let output = gui.llm_profiles.clone();
+            let (tool_config, secret_provider) = runtime_tool_configuration(&gui);
             drop(gui);
+            state
+                .runtime
+                .lock()
+                .expect("kernel runtime lock")
+                .configure_tool_runtime(tool_config, Arc::new(secret_provider));
             let config_audit = record_config_modified_audit(
                 &state,
                 "llmProfiles",
@@ -274,7 +286,16 @@ pub(crate) async fn llm_chat(
         request_envelope["responseFormat"] = response_format.clone();
     }
     match call_llm_profile(&profile, request_envelope).await {
-        Ok(output) => ApiResponse::ok(llm_output_payload(output)),
+        Ok(output) => {
+            let mut payload = llm_output_payload(output);
+            payload["providerProfileId"] = json!(profile.id);
+            payload["provider"] = json!(profile
+                .provider_flavor
+                .as_deref()
+                .unwrap_or(profile.kind.as_str()));
+            payload["model"] = json!(profile.model);
+            ApiResponse::ok(payload)
+        }
         Err(error) => Json(ApiResponse {
             ok: false,
             data: Some(json!({ "providerError": error })),
@@ -375,20 +396,26 @@ pub(crate) fn default_user_settings() -> Value {
         "terminal.integrated.defaultProfile.windows": "wsl",
         "terminal.integrated.prewarm": "afterStartup",
         "terminal.integrated.spawnTimeoutMs": 8000,
+    });
+    merge_object(
+        &mut settings,
+        &json!({
         "agent.defaultMode": "plan",
         "agent.defaultWorkflow": "planFirst",
         "agent.requirementConfirmationMode": "auto",
         "agent.reviewContinuationMode": "auto",
-        "agent.permissions.allowFileRead": true,
-        "agent.permissions.allowFileWrite": true,
-        "agent.permissions.allowCodeSearch": true,
-        "agent.permissions.allowShellPropose": true,
-        "agent.permissions.allowShellExec": true,
-        "agent.permissions.processExec": "ask",
-        "agent.permissions.networkEgress": "ask",
+        "agent.permissions.workspaceRead": "allow",
+        "agent.permissions.autonomyMode": "strict",
+        "agent.permissions.workspaceWrite": "ask",
         "agent.permissions.gitWrite": "ask",
-        "agent.permissions.browserControl": "ask",
+        "agent.permissions.webRead": "allow",
+        "agent.permissions.privateWebRead": "ask",
+        "agent.permissions.processExec": "deny",
+        "agent.permissions.browserControl": "deny",
         "agent.permissions.providerEgress": "ask",
+        "agent.web.search.endpointTemplate": "",
+        "agent.web.search.authHeaderName": "Authorization",
+        "agent.web.search.authSecretRef": "",
         "agent.shell.autoExecuteCommands": false,
         "skills.pythonPath": "python",
         "skills.autoLoad": true,
@@ -397,12 +424,12 @@ pub(crate) fn default_user_settings() -> Value {
         "mcp.servers": "[]",
         "ruler.enabled": true,
         "ruler.rules": "[{\"id\":\"default-safety\",\"name\":\"Default Safety Boundary\",\"source\":\"system\",\"priority\":100,\"path\":\"<builtin>/default-safety.md\",\"content\":\"Default to plan mode. Read before write. Show diff before saving files. Never run destructive commands without explicit approval.\",\"enabled\":true}]"
-    });
+        }),
+    );
     merge_object(
         &mut settings,
         &json!({
             "agent.memory.projectMode": "confirm",
-            "agent.permissions.gitPush": "ask",
             "agent.git.commitMessageMode": "generate",
             "agent.integrations.github.enabled": false,
             "agent.integrations.github.repoUrl": "",
