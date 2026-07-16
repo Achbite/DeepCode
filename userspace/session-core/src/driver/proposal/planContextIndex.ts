@@ -1,6 +1,6 @@
 import type { AgentEvent } from '@deepcode/protocol';
 import type { ProposalEnvelope } from '../../protocol/types.js';
-import type { AcceptedImplementationPlanExecutionRoot } from '../../accepted-plan/types.js';
+import type { AcceptedTaskPlanExecutionRoot } from '../../accepted-plan/types.js';
 import type { InteractionOverlayContext } from '../pipelines/interactionOverlayCodec.js';
 
 export interface PlanContext {
@@ -10,19 +10,22 @@ export interface PlanContext {
   proposalId?: string;
   userPlan: string;
   actionBundle: Record<string, unknown>;
-  codeBlocks: unknown[];
-  commandBlocks: unknown[];
+  contentBlocks: unknown[];
   expectedValidation: string;
   reviewGuide: string;
   planReviewReport?: Record<string, unknown>;
-  implementationPlan?: Record<string, unknown>;
+  planAuthorizationReview?: Record<string, unknown>;
+  planHash?: string;
+  authorizationContractId?: string;
+  authorizationContractHash?: string;
+  taskPlan?: Record<string, unknown>;
   interactionOverlay?: InteractionOverlayContext;
-  executionRoot?: AcceptedImplementationPlanExecutionRoot;
+  executionRoot?: AcceptedTaskPlanExecutionRoot;
 }
 
 export interface PlanContextIndexPorts {
   interactionOverlayFromPayload(payload: Record<string, unknown>): InteractionOverlayContext | undefined;
-  executionRootFromPayload(payload: Record<string, unknown>): AcceptedImplementationPlanExecutionRoot | undefined;
+  executionRootFromPayload(payload: Record<string, unknown>): AcceptedTaskPlanExecutionRoot | undefined;
 }
 
 export class PlanContextIndex {
@@ -55,19 +58,22 @@ export class PlanContextIndex {
   }
 
   contextFromEvent(event: AgentEvent, payload: Record<string, unknown>): PlanContext | null {
-    const implementationPlan = objectRecord(payload.taskPlan) ?? objectRecord(payload.implementationPlan) ?? undefined;
-    const actionBundle = objectRecord(payload.actionBundle) ?? (implementationPlan ? {
-      id: stringValue(payload.planId) ?? stringValue(implementationPlan.id) ?? stringValue(payload.proposalId),
+    const taskPlan = objectRecord(payload.taskPlan) ?? undefined;
+    const actionBundle = objectRecord(payload.actionBundle) ?? (taskPlan ? {
+      id: stringValue(payload.planId) ?? stringValue(taskPlan.id) ?? stringValue(payload.proposalId),
       version: '1',
       actions: [],
     } : undefined);
     if (!actionBundle) return null;
     const planId = stringValue(payload.planId)
       ?? stringValue(actionBundle.id)
-      ?? stringValue(implementationPlan?.id)
+      ?? stringValue(taskPlan?.id)
       ?? stringValue(payload.proposalId);
     const runId = stringValue(payload.runId);
     if (!planId || !runId) return null;
+    const planAuthorizationReview = objectRecord(payload.planAuthorizationReview);
+    const authorizationContract = objectRecord(payload.authorizationContract)
+      ?? objectRecord(planAuthorizationReview?.authorizationContract);
     return {
       sessionId: event.sessionId,
       runId,
@@ -75,12 +81,15 @@ export class PlanContextIndex {
       proposalId: stringValue(payload.proposalId),
       userPlan: stringValue(payload.content) ?? stringValue(payload.summary) ?? 'Agent plan',
       actionBundle: actionBundle as unknown as Record<string, unknown>,
-      codeBlocks: Array.isArray(payload.codeBlocks) ? payload.codeBlocks : [],
-      commandBlocks: Array.isArray(payload.commandBlocks) ? payload.commandBlocks : [],
+      contentBlocks: Array.isArray(payload.contentBlocks) ? payload.contentBlocks : [],
       expectedValidation: stringValue(payload.expectedValidation) ?? '',
       reviewGuide: stringValue(payload.reviewGuide) ?? '',
       planReviewReport: objectRecord(payload.planReviewReport) ?? undefined,
-      implementationPlan,
+      planAuthorizationReview,
+      planHash: stringValue(payload.planHash) ?? stringValue(authorizationContract?.planHash),
+      authorizationContractId: stringValue(authorizationContract?.id),
+      authorizationContractHash: stringValue(authorizationContract?.contractHash),
+      taskPlan,
       interactionOverlay: this.ports.interactionOverlayFromPayload(payload),
       executionRoot: this.ports.executionRootFromPayload(payload),
     };
@@ -88,7 +97,7 @@ export class PlanContextIndex {
 
   proposalEnvelope(plan: PlanContext): ProposalEnvelope {
     return {
-      schemaVersion: 'deepcode.agent.protocol.v3',
+      schemaVersion: 'deepcode.agent.protocol.v4',
       proposalId: plan.proposalId ?? plan.planId,
       runId: plan.runId,
       sessionId: plan.sessionId,
@@ -98,8 +107,7 @@ export class PlanContextIndex {
       payload: {
         userPlan: plan.userPlan,
         actionBundle: plan.actionBundle,
-        codeBlocks: plan.codeBlocks,
-        commandBlocks: plan.commandBlocks,
+        contentBlocks: plan.contentBlocks,
         expectedValidation: plan.expectedValidation,
         reviewGuide: plan.reviewGuide,
       },
@@ -113,8 +121,11 @@ export class PlanContextIndex {
     if (plan.proposalId) aliases.add(plan.proposalId);
     const bundleId = stringValue(plan.actionBundle.id);
     if (bundleId) aliases.add(bundleId);
-    const reportPlanId = stringValue(plan.planReviewReport?.planId);
-    if (reportPlanId) aliases.add(reportPlanId);
+    const reportProposalId = stringValue(plan.planReviewReport?.proposalId);
+    if (reportProposalId) aliases.add(reportProposalId);
+    const contract = objectRecord(plan.planReviewReport?.executionContract);
+    const contractProposalId = stringValue(contract?.proposalId);
+    if (contractProposalId) aliases.add(contractProposalId);
     return aliases;
   }
 

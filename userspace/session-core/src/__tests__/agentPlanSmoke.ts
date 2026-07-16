@@ -33,6 +33,7 @@ import {
   findActiveInteraction,
   findLatestPendingPermission,
   normalizeDecisionEffect,
+  planInteractionAwaitsDecision,
   parseProposalEnvelope,
   SessionDriver,
   SessionDriverLoop,
@@ -43,9 +44,10 @@ import {
   type ResourceRequestDraft,
   type TranscriptEntry,
 } from '../index.js';
-import { AcceptedPlanAdmission, AcceptedPlanScopeMatcher, AcceptedTaskRegistry, type AcceptedImplementationPlanContext } from '../accepted-plan/index.js';
+import { AcceptedPlanAdmission, AcceptedTaskRegistry, type AcceptedTaskPlanContext } from '../accepted-plan/index.js';
 import { AgentRunReactor } from '../driver/agentRunReactor.js';
 import { ContextFrameBuilder } from '../driver/context/contextFrameBuilder.js';
+import { createSessionTurnAuthorityEvent } from '../driver/context/userAuthorityFrame.js';
 import { ProviderTurnCycle } from '../driver/pipelines/providerTurnCycle.js';
 import { routeProposalKind } from '../driver/proposal/proposalRouter.js';
 import {
@@ -57,14 +59,8 @@ import { providerVisibleSchemaDigest, renderProviderTurnContractLayer } from '..
 import { AcceptedPlanResourceResumeCoordinator, ActionBundleAdmissionResourceFollowupCoordinator, GeneratedArtifactEvidenceIndex, PathIdentity, ProviderTurnContextCoordinator, ResourceEvidenceIndex, ResourceOrchestrator, ResourceRequestLoop, ResourceRequestProposalHandler, ResourceRequestRepairCoordinator, buildProviderTurnSnapshot } from '../driver/context/index.js';
 import {
   AcceptedActionBundlePlanExecutor,
-  AcceptedImplementationPlanContextBuilder,
+  AcceptedTaskPlanContextBuilder,
   AcceptedPlanBatchPreflight,
-  AcceptedPlanOperationTargetResolver,
-  AcceptedPlanScopeCoverage,
-  AcceptedPlanScopeDecisionCoordinator,
-  AcceptedPlanScopeDecisionOverlay,
-  AcceptedPlanScopeRepairCoordinator,
-  AcceptedPlanScopeResourceFollowupCoordinator,
   ActionBundleAdmissionRepairCoordinator,
   AcceptedPlanExecutor,
   AcceptedPlanReadOnlyTaskExecutor,
@@ -111,42 +107,45 @@ import {
 } from './smokeHelpers.js';
 import {
   absoluteTargetWriteProposal,
-  acceptedImplementationPlanCardEvent,
-  commaSeparatedTargetsAcceptedImplementationPlanCardEvent,
-  deleteAcceptedImplementationPlanCardEvent,
+  acceptedTaskPlanCardEvent,
+  applyKernelPlanAuthorizationFixture,
+  commaSeparatedTargetsAcceptedTaskPlanCardEvent,
+  deleteAcceptedTaskPlanCardEvent,
   deleteActionBundleProposal,
-  directoryDeleteAcceptedImplementationPlanCardEvent,
+  directoryDeleteAcceptedTaskPlanCardEvent,
   fakeKernel,
   fakeLlm,
-  generatedArtifactAcceptedImplementationPlanCardEvent,
+  generatedArtifactAcceptedTaskPlanCardEvent,
   genericActionBundle,
   genericDecisionRequestProposal,
   genericDirectoryResourceEvent,
   genericPatchProposal,
   genericProposal,
+  genericKernelContextProjectionEvent,
+  genericMissingResourceEvent,
+  genericResolvedResourceEvent,
   genericSessionResult,
   genericTaskPlanProposal,
   genericToolCatalogSnapshot,
   genericWriteProposal,
   jsonLlmResponse,
   localizedGenericWriteProposal,
-  manyCodeBlockWriteProposal,
+  manyContentBlockWriteProposal,
   manyDeleteActionsProposal,
-  multiDeleteAcceptedImplementationPlanCardEvent,
-  multiTargetAcceptedImplementationPlanCardEvent,
+  multiDeleteAcceptedTaskPlanCardEvent,
+  multiTargetAcceptedTaskPlanCardEvent,
   multiWriteActionBundle,
   multiWriteProposal,
-  oversizedGenericWriteProposal,
   planKernel,
-  processExecAcceptedImplementationPlanCardEvent,
+  processExecAcceptedTaskPlanCardEvent,
   processExecProposal,
   proposalReviewReport,
   providerFacingWriteProposalWithoutMachineIds,
   randomMultiWriteProposal,
-  readOnlyAcceptedImplementationPlanCardEvent,
+  readOnlyAcceptedTaskPlanCardEvent,
   relativeTargetWriteProposal,
   singleTargetWriteProposal,
-  tripleTargetAcceptedImplementationPlanCardEvent,
+  tripleTargetAcceptedTaskPlanCardEvent,
   userMessageWithDirectoryAttachmentEvent,
 } from './smokeFixtures.js';
 import {
@@ -155,10 +154,12 @@ import {
 } from './smokeStaticSyntaxReviewTests.js';
 import {
   assertNativeToolExposurePolicySuppressesPlanningReadToolsAfterEvidence,
+  assertKernelToolCatalogSummaryIsAuthoritative,
   assertNativeToolHandlerPortsFactoryBuildsPorts,
   assertNativeToolProgressEventBuilderBuildsAssistantProgress,
   assertNativeToolProjectionBuilderBuildsDeltas,
   assertNativeToolProviderLoopAdmitsSemanticProposalWithoutNestedResume,
+  assertNativeToolProviderLoopReturnsArtifactBudgetFailureToPlanning,
   assertNativeToolProviderLoopRetriesMalformedArgumentsInSameProfile,
   assertNativeToolProviderLoopRetriesInvalidSemanticDirectiveInSameProfile,
   assertNativeToolRepairCoordinatorBuildsRepairContracts,
@@ -172,11 +173,13 @@ import {
   assertAcceptedPlanContinuationDefaultsResourceResume,
   assertDecisionContinuationInputKeepsDecisionResumeInSameLoop,
   assertHookObserverProducesTraceOnly,
-  assertProviderTurnContextCoordinatorFiltersUnscopedGrantsToCurrentTask,
+  assertProviderTurnContextCoordinatorScopesCurrentTaskIntent,
   assertProviderTurnContextCoordinatorNarrowsPlanningAllowedKinds,
   assertProviderTurnContextCoordinatorPassesTaskLocalCompactRecords,
+  assertProviderTurnContextCoordinatorRejectsMissingDependencyFacts,
   assertProviderTurnContextCoordinatorScopesAcceptedExecutionCatalog,
   assertProviderTurnContextCoordinatorUsesFreshAssembly,
+  assertTaskDependencyFactsRequireTerminalKernelEvidence,
   assertProviderTurnContractFrameOrder,
   assertProviderTurnSnapshotRecordsContextAdmissionShape,
   assertRequirementConfirmationRecordsModelContextBundle,
@@ -193,6 +196,7 @@ import {
   assertDeepSeekCacheStrategyDoesNotInjectRequestParameter,
   assertPromptEnvelope,
   assertProviderCacheTelemetryNormalizesBigModelUsage,
+  assertProviderCacheTelemetryNormalizesDeepSeekUsage,
   assertProviderTraceArchiveCompactsStreamingChunks,
   assertResourcePromptBlocksStabilize,
   assertSessionMemoryDocument,
@@ -201,6 +205,18 @@ import {
   assertSessionDriverLoopTerminalAnswerGuidanceRevision,
   assertSessionDriverLoopTerminalGuidanceRevisionFallback,
 } from './smokeTerminalGuidanceTests.js';
+import {
+  assertArtifactDraftLeaseEnforcesBoundsAndRestores,
+  assertArtifactDraftBudgetReplanClearsAcceptedExecution,
+  assertArtifactDraftPreciseEditMatches,
+  assertKernelEnvelopeRecoveryUsesLatestMatchingRun,
+  assertPromptLedgerReusesPrefixAndAppendsWithinEpoch,
+  assertPromptLedgerRotatesAcceptedTaskScope,
+  assertProviderCacheHistoryRestoresBySemanticProfile,
+  assertInternalFailureProjectsFailedTerminalState,
+  assertUserAuthorityFramePreservesExplicitMessages,
+  assertWorkspaceBootstrapAndResourceDeltaStayIncremental,
+} from './smokeAuthorityLedgerTests.js';
 
 function returnedSession(
   control: SessionLoopControlResult,
@@ -229,14 +245,47 @@ function semanticToolLlmResponse(
   };
 }
 
+function completedKernelToolFact(input: {
+  runId: string;
+  sessionId: string;
+  workUnitId: string;
+  toolCallId: string;
+  toolName: string;
+  path: string;
+}): Record<string, unknown> {
+  return {
+    kind: 'tool.completed',
+    runId: input.runId,
+    sessionId: input.sessionId,
+    toolCallId: input.toolCallId,
+    toolName: input.toolName,
+    ok: true,
+    output: {
+      path: input.path,
+      contentHash: `hash-${input.toolCallId}`,
+      sizeBytes: input.path.length,
+      kernelContext: { workUnitId: input.workUnitId },
+    },
+  };
+}
+
 async function main(): Promise<void> {
-  assertV3Parser();
+  assertKernelEnvelopeRecoveryUsesLatestMatchingRun();
+  assertUserAuthorityFramePreservesExplicitMessages();
+  assertPromptLedgerReusesPrefixAndAppendsWithinEpoch();
+  assertPromptLedgerRotatesAcceptedTaskScope();
+  assertTaskDependencyFactsRequireTerminalKernelEvidence();
+  assertWorkspaceBootstrapAndResourceDeltaStayIncremental();
+  assertInternalFailureProjectsFailedTerminalState();
+  assertArtifactDraftLeaseEnforcesBoundsAndRestores();
+  await assertArtifactDraftBudgetReplanClearsAcceptedExecution();
+  assertArtifactDraftPreciseEditMatches();
+  assertV4Parser();
   assertLegacyProviderShapesAreRejected();
   assertActionBundleProtocolFields();
   assertProtocolGateCanonicalizesBareRepair();
   assertActionBundleActionInspectorReadsActionShape();
-  await assertActionProposalSubmitterRoutesAcceptedTaskOutcomeInternally();
-  assertProposalSemanticValidatorRejectsRootScopeTaskTargets();
+  assertProposalSemanticValidatorLeavesPathSafetyToKernel();
   assertPathIdentityNormalizesWorkspacePaths();
   assertNativeToolProgressEventBuilderBuildsAssistantProgress();
   assertNativeToolProjectionBuilderBuildsDeltas();
@@ -244,7 +293,9 @@ async function main(): Promise<void> {
   assertNativeToolResourceRecorderRecordsPackets();
   assertNativeToolResumeMessageBuilderAppendsToolMessages();
   assertNativeToolExposurePolicySuppressesPlanningReadToolsAfterEvidence();
+  assertKernelToolCatalogSummaryIsAuthoritative();
   await assertNativeToolProviderLoopAdmitsSemanticProposalWithoutNestedResume();
+  await assertNativeToolProviderLoopReturnsArtifactBudgetFailureToPlanning();
   await assertNativeToolProviderLoopRetriesMalformedArgumentsInSameProfile();
   await assertNativeToolProviderLoopRetriesInvalidSemanticDirectiveInSameProfile();
   await assertNativeToolHandlerPortsFactoryBuildsPorts();
@@ -265,7 +316,8 @@ async function main(): Promise<void> {
   await assertProviderTurnContextCoordinatorUsesFreshAssembly();
   await assertProviderTurnContextCoordinatorNarrowsPlanningAllowedKinds();
   await assertProviderTurnContextCoordinatorScopesAcceptedExecutionCatalog();
-  await assertProviderTurnContextCoordinatorFiltersUnscopedGrantsToCurrentTask();
+  await assertProviderTurnContextCoordinatorRejectsMissingDependencyFacts();
+  await assertProviderTurnContextCoordinatorScopesCurrentTaskIntent();
   await assertRequirementConfirmationRecordsModelContextBundle();
   await assertHookObserverProducesTraceOnly();
   await assertProviderPipelineUsesProviderTurnContract();
@@ -291,15 +343,10 @@ async function main(): Promise<void> {
   assertResourceEvidenceIndexQueriesPackets();
   assertGeneratedArtifactEvidenceIndexBuildsRunLocalPackets();
   assertImplementationBatchContextBuilderExtractsConcreteContinuations();
-  assertRepairLoopBuildsAcceptedPlanScopeRevisionRequest();
+  assertRepairLoopBuildsPlanRevisionRequest();
   assertCompletedWorkUnitFactIndexMatchesActionAndTarget();
   assertActionBatchFailureIndexSummarizesKernelFailures();
-  assertAcceptedPlanBatchPreflightAuditsDeleteActions();
-  assertAcceptedPlanScopeCoverageMatchesStructuredScopes();
-  assertAcceptedPlanScopeDecisionOverlayExpandsCurrentTask();
-  await assertAcceptedPlanScopeDecisionCoordinatorBuildsWaitingEvents();
-  await assertAcceptedPlanScopeDecisionCoordinatorBuildsOutOfScopeIntervention();
-  assertAcceptedPlanOperationTargetResolverFindsExactGrant();
+  assertAcceptedPlanBatchPreflightProjectsAuditOnly();
   assertAcceptedPlanExecutorBuildsExecutionBatch();
   await assertAcceptedActionBundlePlanExecutorSubmitsBatchAndReviews();
   assertKernelEventStatusIndexReadsStructuredEvents();
@@ -329,16 +376,17 @@ async function main(): Promise<void> {
   assertPlanReviewGrantProjectorBuildsExecutionReadModels();
   assertProposalRouterPlansPureRoutes();
   await assertProviderTurnCycleReturnsRoutedProposal();
-  assertAcceptedPlanTargetParserExtractsStructuredTargets();
-  assertAcceptedPlanScopeMatcherNormalizesProposalTargets();
-  assertAcceptedPlanAdmissionUsesCurrentTaskTargetsForPathlessTools();
-  assertAcceptedImplementationPlanContextBuilderBuildsRuntimeContext();
+  assertAcceptedPlanTargetParserUsesCanonicalTarget();
+  assertAcceptedPlanAdmissionChecksProtocolShapeOnly();
+  assertAcceptedTaskPlanContextBuilderBuildsRuntimeContext();
   assertRunStateMachineTaskLedger();
   assertSessionDriverRuntimeAccessors();
-  assertAcceptedTaskRegistryUsesExactOperationGrants();
+  assertAcceptedTaskRegistryUsesTaskIntentOnly();
   assertResourcePromptBlocksStabilize();
   assertSessionMemoryDocument();
   assertDeepSeekCacheStrategyDoesNotInjectRequestParameter();
+  assertProviderCacheTelemetryNormalizesDeepSeekUsage();
+  assertProviderCacheHistoryRestoresBySemanticProfile();
   await assertProviderCacheTelemetryNormalizesBigModelUsage();
   await assertProviderTraceArchiveCompactsStreamingChunks();
   await assertProviderPartFramesEnterKernelDraftLedger();
@@ -348,7 +396,7 @@ async function main(): Promise<void> {
   assertNarrativeTimelineProjection();
   assertNarrativeTimelineProjectionResolvesAcceptedPlanInteractions();
   assertTimelineProjectionWithLiveOverlay();
-  assertImplementationPlanTaskProjectionProgress();
+  assertTaskPlanTaskProjectionProgress();
   assertSessionDriverSkeleton();
   await assertSessionDriverLoop();
   await assertSessionDriverLoopTerminalAnswerGuidanceRevision();
@@ -358,8 +406,9 @@ async function main(): Promise<void> {
   await assertSessionDriverLoopRejectsOutsidePath();
   await assertSessionDriverLoopUsesRecentAttachmentRoot();
   await assertSessionDriverLoopReadOnlyRequestsContinueWithoutBudgetDecision();
-  await assertSessionDriverLoopOldResourceBudgetDecisionStillResumes();
+  await assertSessionDriverLoopOldResourceBudgetDecisionFailsClosed();
   await assertSessionDriverLoopProjectsDecisionRequest();
+  await assertSessionDriverLoopStopsBeforeProviderWhenProjectRootIsUnavailable();
   await assertSessionDriverLoopRequirementConfirmationCarriesExecutionRoot();
   await assertSessionDriverLoopRequirementChoiceEntersResumePrompt();
   await assertSessionDriverLoopRequirementFinishWithAnswerClosesWithoutProviderLoop();
@@ -368,22 +417,25 @@ async function main(): Promise<void> {
   await assertSessionDriverLoopPlanRevisionReturnsToPlanning();
   await assertSessionDriverLoopPlanCardAcceptDoesNotNoopWithoutPlanReview();
   await assertSessionDriverLoopPlanCardAcceptExecutesReviewedDeletePlan();
-  await assertSessionDriverLoopAcceptedPlanExecutesReviewedDeleteWithoutTaskTargets();
+  await assertSessionDriverLoopAcceptedPlanExecutesDeleteWithinKernelAuthorizedTargets();
+  await assertSessionDriverLoopUsesExactKernelOperationsForMixedDelete();
+  await assertSessionDriverLoopRejectsMissingExactKernelOperationsBeforeProvider();
   await assertSessionDriverLoopAcceptedExecutionExceptionClosesRun();
   await assertSessionDriverLoopAcceptedExecutionKernelErrorClosesRun();
   await assertSessionDriverLoopAcceptedDecisionRecoversUnconsumedExecution();
-  await assertSessionDriverLoopAcceptedScopeRejectsDirectoryDeleteFromResourceEvidence();
+  await assertSessionDriverLoopDelegatesDirectoryDeleteAdmissionToKernel();
   await assertSessionDriverLoopAcceptedScopeExecutesReviewedDirectoryDelete();
-  await assertSessionDriverLoopAcceptedImplementationPlanAutoExecutesBatch();
-  await assertSessionDriverLoopAcceptedImplementationPlanContinuesUntilTasksComplete();
-  await assertSessionDriverLoopAcceptedImplementationPlanResumesAfterDecisionRequest();
-  await assertSessionDriverLoopAcceptedImplementationPlanReadsGeneratedArtifactEvidence();
-  await assertSessionDriverLoopAcceptedImplementationPlanResumesFromResourceCursor();
-  await assertSessionDriverLoopAcceptedImplementationPlanChainsResourceResumeRequests();
+  await assertSessionDriverLoopAcceptedTaskPlanAutoExecutesBatch();
+  await assertSessionDriverLoopAcceptedTaskPlanContinuesUntilTasksComplete();
+  await assertSessionDriverLoopAcceptedTaskPlanResumesAfterDecisionRequest();
+  await assertSessionDriverLoopAcceptedTaskPlanReadsGeneratedArtifactEvidence();
+  await assertSessionDriverLoopAcceptedTaskPlanResumesFromResourceCursor();
+  await assertSessionDriverLoopAcceptedTaskPlanChainsResourceResumeRequests();
   await assertSessionDriverLoopAcceptedReadOnlyResourceValidationCompletesWithoutProviderLoop();
-  await assertSessionDriverLoopAcceptedImplementationPlanAllowsPlannedProcessExecPermissionGate();
-  await assertSessionDriverLoopAcceptedDecisionGroupsWorkspaceWriteGrants();
-  await assertSessionDriverLoopAcceptedDecisionGrantsOutsideWorkspaceFileTargets();
+  await assertSessionDriverLoopAcceptedTaskPlanRejectsBlockedProcessExec();
+  await assertSessionDriverLoopAcceptedTaskDiagnosticFailsRun();
+  await assertSessionDriverLoopAcceptedDecisionSubmitsMultiWriteBatch();
+  await assertSessionDriverLoopAcceptedDecisionPreservesKernelAuthorizedTarget();
   assertWorkflowStagePermissionProjectsPendingDecision();
   await assertSessionDriverLoopReviewRevisionReturnsToPlanning();
   await assertSessionDriverLoopReviewRevisionContinuesWhenAuditRunInactive();
@@ -397,146 +449,76 @@ async function main(): Promise<void> {
   await assertSessionDriverLoopStaleRequirementDecisionNoopsAfterReviewAccept();
 }
 
+function turnAuthorityFixture(
+  sessionId: string,
+  runId: string,
+  content: string,
+  tag: string
+): AgentEvent[] {
+  const messageId = `user-message-${tag}`;
+  return [
+    {
+      id: messageId,
+      sessionId,
+      ts: '2026-01-01T00:00:00.000Z',
+      kind: 'user_msg',
+      payload: { content },
+    },
+    createSessionTurnAuthorityEvent({
+      sessionId,
+      runId,
+      turnId: `turn-${tag}`,
+      taskId: `task-${tag}`,
+      messages: [{ messageId, content }],
+      relation: 'newTask',
+      boundAtHookRef: 'run.initialized',
+      outputLanguage: 'en-US',
+      eventId: `authority-${tag}`,
+      timestamp: '2026-01-01T00:00:00.000Z',
+    }),
+  ];
+}
+
 function assertActionBundleActionInspectorReadsActionShape(): void {
   const token = randomSmokeToken('action-inspector');
-  const workspacePath = `scope-${token}/target-${randomSmokeToken('file')}.txt`;
   const argsPath = `args-${token}/target-${randomSmokeToken('args')}.txt`;
   const inspector = new ActionBundleActionInspector();
 
   assertEqual(
-    inspector.actionEffectiveCapability({ toolId: 'git.status' }),
-    'git.read',
-    'action inspector maps git read tool ids'
+    inspector.actionToolId({ toolId: 'git.status' }),
+    'git.status',
+    'action inspector keeps canonical git tool ids'
   );
   assertEqual(
-    inspector.actionEffectiveCapability({ toolId: 'git.commit' }),
-    'git.write',
-    'action inspector maps git write tool ids'
+    inspector.actionToolId({ toolId: 'git.commit' }),
+    'git.commit',
+    'action inspector keeps canonical git mutation tool ids'
   );
   assertEqual(
-    inspector.actionEffectiveCapability({ toolId: 'web.search' }),
-    'network.egress',
-    'action inspector maps network tool ids'
+    inspector.actionToolId({ toolId: 'web.search' }),
+    'web.search',
+    'action inspector keeps canonical web tool ids'
   );
   assertEqual(
-    inspector.actionEffectiveCapability({ toolId: 'browser.open' }),
-    'browser.control',
-    'action inspector maps browser tool ids'
-  );
-  assertEqual(
-    inspector.actionEffectiveCapability({ capability: 'fs.write', toolId: 'fs.delete' }),
-    'fs.write',
-    'action inspector prefers explicit capability'
-  );
-  assertEqual(
-    inspector.actionFileTargetPath({ targetRef: { path: workspacePath }, targetPath: `ignored-${token}` }),
-    workspacePath,
-    'action inspector prefers targetRef path'
-  );
-  assertEqual(
-    inspector.actionFileTargetPath({ resourceScope: [workspacePath], args: { path: argsPath } }),
-    workspacePath,
-    'action inspector reads first resource scope before args path'
+    inspector.actionToolId({ toolId: 'browser.open' }),
+    'browser.open',
+    'action inspector keeps blocked canonical tool ids'
   );
   assertEqual(
     inspector.actionFileTargetPath({ args: { path: argsPath } }),
     argsPath,
     'action inspector reads args path'
   );
-  assertEqual(
-    inspector.deleteActionTargetResourceKind({ args: { targetKind: 'dir' } }),
-    'directory',
-    'action inspector normalizes directory target kind'
-  );
-  assertEqual(
-    inspector.deleteActionRecursive({ args: { recursive: true } }),
-    true,
-    'action inspector reads recursive flag from args'
-  );
-  assertEqual(
-    inspector.deleteActionRecursive({ args: { recursive: 'true' } }),
-    true,
-    'action inspector accepts string recursive flag from compatibility input'
-  );
-  assertEqual(
-    inspector.fileTargetRefFromPath(`/tmp/${token}`).kind,
-    'absolutePath',
-    'action inspector marks absolute target refs'
-  );
-  assertEqual(
-    inspector.fileTargetRefFromPath(workspacePath).kind,
-    'workspaceRelative',
-    'action inspector marks workspace relative target refs'
-  );
 }
 
-async function assertActionProposalSubmitterRoutesAcceptedTaskOutcomeInternally(): Promise<void> {
-  const token = randomSmokeToken('task-outcome-submit');
-  const sessionId = `session-${token}`;
-  const runId = `run-${token}`;
-  const fallback = genericSessionResult(sessionId);
-  let acceptedSubmitCalls = 0;
-  const submitter = new ActionProposalSubmitter<any, any>({
-    now: () => '2026-01-01T00:00:00.000Z',
-    createId: (prefix) => `${prefix}-${token}`,
-    append: async () => fallback,
-    readActionBundle: () => undefined,
-    submitAcceptedPlanActionProposal: async () => {
-      acceptedSubmitCalls += 1;
-      return fallback;
-    },
-    finalDiagnosticEvent: (eventSessionId, content, ts, id) => ({
-      id,
-      sessionId: eventSessionId,
-      ts,
-      kind: 'assistant_msg',
-      payload: { content },
-    }),
-    diagnostic: (code, fallbackMessage, params) => ({ code, fallback: fallbackMessage, params }),
-  });
-  await submitter.submit(
-    { profileId: `profile-${token}` },
-    {
-      sessionId,
-      runId,
-      resourcePackets: [],
-      acceptedImplementationPlan: { planId: `plan-${token}` },
-      planReviewRepairAttempted: false,
-    },
-    {} as PromptEnvelope,
-    {
-      schemaVersion: 'deepcode.agent.protocol.v3',
-      proposalId: `proposal-${token}`,
-      runId,
-      sessionId,
-      source: 'llm',
-      kind: 'taskOutcome',
-      payload: {
-        version: '1',
-        id: `outcome-${token}`,
-        taskId: `task-${token}`,
-        status: 'modelJudgedSufficient',
-        reason: `Current task is already satisfied ${token}.`,
-      },
-      referencedResourcePacketRefs: [],
-      referencedEvidenceRefs: [],
-    } as ProposalEnvelope,
-    fallback
-  );
-  assertEqual(acceptedSubmitCalls, 1, 'accepted taskOutcome is routed to the accepted-plan submitter');
-}
-
-function assertProposalSemanticValidatorRejectsRootScopeTaskTargets(): void {
+function assertProposalSemanticValidatorLeavesPathSafetyToKernel(): void {
   const token = randomSmokeToken('root-task-target');
   const inspector = new ActionBundleActionInspector();
   const validator = new ProposalSemanticValidator({
-    maxActionBundleTotalCodeBytes: 128 * 1024,
-    sideEffectCapabilities: new Set(['fs.write', 'fs.patch', 'fs.delete']),
+    sideEffectToolIds: new Set(['fs.write', 'fs.edit', 'fs.delete']),
     readActionBundle: () => undefined,
-    actionEffectiveCapability: (action) => inspector.actionEffectiveCapability(action),
+    actionToolId: (action) => inspector.actionToolId(action),
     actionFileTargetPath: (action) => inspector.actionFileTargetPath(action),
-    deleteActionTargetResourceKind: (action) => inspector.deleteActionTargetResourceKind(action),
-    deleteActionRecursive: (action) => inspector.deleteActionRecursive(action),
   });
   const rootPlan = {
     kind: 'taskPlan',
@@ -546,53 +528,34 @@ function assertProposalSemanticValidatorRejectsRootScopeTaskTargets(): void {
       tasks: [{
         taskId: `task-${token}`,
         title: `Task ${token}`,
-        capability: 'fs.delete',
+        toolId: 'fs.delete',
         target: ['workspace root'],
+        args: {},
+        dependencies: [],
         acceptanceCriteria: [`accepted-${token}`],
         failureCriteria: [`failed-${token}`],
       }],
     },
   } as ProposalEnvelope;
-  assertThrows(
-    () => validator.validateProposalSemantics(rootPlan),
-    'target must not use workspace root'
-  );
-  const missingCapabilityPlan = {
+  validator.validateProposalSemantics(rootPlan);
+  const missingToolPlan = {
     kind: 'taskPlan',
     payload: {
-      title: `Missing capability plan ${token}`,
-      summary: `Missing capability summary ${token}`,
+      title: `Missing tool plan ${token}`,
+      summary: `Missing tool summary ${token}`,
       tasks: [{
-        taskId: `missing-capability-task-${token}`,
-        title: `Missing capability task ${token}`,
+        taskId: `missing-tool-task-${token}`,
+        title: `Missing tool task ${token}`,
         target: [`dir-${token}/file.txt`],
+        dependencies: [],
         acceptanceCriteria: [`accepted-${token}`],
         failureCriteria: [`failed-${token}`],
       }],
     },
   } as ProposalEnvelope;
   assertThrows(
-    () => validator.validateProposalSemantics(missingCapabilityPlan),
-    'capability must be a non-empty Kernel capability'
-  );
-  const unsupportedCapabilityPlan = {
-    kind: 'taskPlan',
-    payload: {
-      title: `Unsupported capability plan ${token}`,
-      summary: `Unsupported capability summary ${token}`,
-      tasks: [{
-        taskId: `unsupported-capability-task-${token}`,
-        title: `Unsupported capability task ${token}`,
-        capability: `custom.${token}`,
-        target: [`dir-${token}/file.txt`],
-        acceptanceCriteria: [`accepted-${token}`],
-        failureCriteria: [`failed-${token}`],
-      }],
-    },
-  } as ProposalEnvelope;
-  assertThrows(
-    () => validator.validateProposalSemantics(unsupportedCapabilityPlan),
-    'capability is not supported in taskPlan'
+    () => validator.validateProposalSemantics(missingToolPlan),
+    'toolId must be a non-empty Kernel catalog tool ID'
   );
   const concretePlan = {
     kind: 'taskPlan',
@@ -602,8 +565,10 @@ function assertProposalSemanticValidatorRejectsRootScopeTaskTargets(): void {
       tasks: [{
         taskId: `concrete-task-${token}`,
         title: `Concrete task ${token}`,
-        capability: 'fs.write',
+        toolId: 'fs.write',
         target: [`dir-${token}/file.txt`],
+        args: {},
+        dependencies: [],
         acceptanceCriteria: [`accepted-${token}`],
         failureCriteria: [`failed-${token}`],
       }],
@@ -665,7 +630,7 @@ function assertPathIdentityNormalizesWorkspacePaths(): void {
 function assertProposalSemanticValidatorCanonicalizesAndDefaults(): void {
   const token = randomSmokeToken('proposal-semantic');
   const target = `targets/${token}.txt`;
-  const blockId = `block-${token}`;
+  const blockId = "block-" + token;
   const actionFileTargetPath = (action: Record<string, unknown>): string | undefined => {
     if (typeof action.targetPath === 'string' && action.targetPath.trim()) return action.targetPath.trim();
     const args = typeof action.args === 'object' && action.args && !Array.isArray(action.args)
@@ -674,20 +639,13 @@ function assertProposalSemanticValidatorCanonicalizesAndDefaults(): void {
     return typeof args?.path === 'string' && args.path.trim() ? args.path.trim() : undefined;
   };
   const validator = new ProposalSemanticValidator({
-    maxActionBundleTotalCodeBytes: 64 * 1024,
-    sideEffectCapabilities: new Set(['fs.write', 'fs.patch', 'fs.delete']),
+    sideEffectToolIds: new Set(['fs.write', 'fs.edit', 'fs.delete']),
     readActionBundle: (proposal) => (proposal.payload as Record<string, any>).actionBundle as ActionBundleDraft,
-    actionEffectiveCapability: (action) => typeof action.capability === 'string'
-      ? action.capability
-      : typeof action.toolId === 'string'
-        ? action.toolId
-        : '',
+    actionToolId: (action) => typeof action.toolId === 'string' ? action.toolId : '',
     actionFileTargetPath,
-    deleteActionTargetResourceKind: (action) => typeof action.targetKind === 'string' ? action.targetKind : undefined,
-    deleteActionRecursive: (action) => action.recursive === true,
   });
   const proposal = {
-    schemaVersion: 'deepcode.agent.protocol.v3',
+    schemaVersion: 'deepcode.agent.protocol.v4',
     proposalId: `proposal-${token}`,
     runId: `run-${token}`,
     sessionId: `session-${token}`,
@@ -700,24 +658,20 @@ function assertProposalSemanticValidatorCanonicalizesAndDefaults(): void {
         id: `bundle-${token}`,
         goal: `Goal ${token}`,
         actions: [{
-          id: `action-${token}`,
-          title: `Write ${token}`,
-          capability: 'fs.write',
-          kind: 'write',
-          targetPath: target,
-          resourceScope: [target],
+          actionId: `action-${token}`,
+          toolId: 'fs.write',
+          args: { path: target, contentBlockId: blockId },
+          description: `Write ${token}`,
         }],
       },
-      codeBlocks: [{
-        id: blockId,
+      contentBlocks: [{
+        blockId,
         targetPath: target,
-        content: `content-${token}`,
+        operation: 'overwrite',
+        contentLines: [`content-${token}`],
       }],
     },
   } as ProposalEnvelope;
-  validator.canonicalizeWriteActionSourceBlockRefs(proposal);
-  const action = (proposal.payload as Record<string, any>).actionBundle.actions[0];
-  assertEqual(action.sourceBlockId, blockId, 'proposal semantic validator canonicalizes write sourceBlockId');
   validator.validateProposalSemantics(proposal, { allowBriefActionBundleUserPlan: true });
   const bundle = (proposal.payload as Record<string, any>).actionBundle;
   assertEqual(bundle.validationExpectations[0].messageKey, 'session.driver.defaultValidation.targets', 'proposal semantic validator adds validation expectation key');
@@ -735,46 +689,28 @@ function assertProposalSemanticValidatorCanonicalizesAndDefaults(): void {
         id: `patch-bundle-${token}`,
         goal: `Patch goal ${token}`,
         actions: [{
-          id: `patch-action-${token}`,
-          title: `Patch ${token}`,
-          capability: 'fs.patch',
-          kind: 'patch',
-          targetPath: patchTarget,
-          resourceScope: [patchTarget],
+          actionId: `patch-action-${token}`,
+          toolId: 'fs.edit',
+          args: {
+            path: patchTarget,
+            replacementBlockId: patchBlockId,
+            patchSpec: { match: { kind: 'exactBlock', text: `old-${token}` } },
+          },
+          description: `Patch ${token}`,
         }],
       },
-      codeBlocks: [{
-        id: patchBlockId,
+      contentBlocks: [{
+        blockId: patchBlockId,
         targetPath: patchTarget,
-        content: [
-          `--- a/${patchTarget}`,
-          `+++ b/${patchTarget}`,
-          '@@ -1,2 +1,2 @@',
-          ` keep-${token}`,
-          `-old-${token}`,
-          `+new-${token}`,
-        ].join('\n'),
+        operation: 'patch',
+        contentLines: [`new-${token}`],
       }],
     },
   } as ProposalEnvelope;
-  validator.canonicalizeWriteActionSourceBlockRefs(patchProposal);
-  const patchAction = (patchProposal.payload as Record<string, any>).actionBundle.actions[0];
-  const patchBlock = (patchProposal.payload as Record<string, any>).codeBlocks[0];
-  assertEqual(patchAction.replacementBlockId, patchBlockId, 'proposal semantic validator canonicalizes patch replacementBlockId');
-  assertEqual(
-    patchAction.patchSpec.match.text,
-    [`keep-${token}`, `old-${token}`].join('\n'),
-    'proposal semantic validator converts unified diff old hunk to exact patch match'
-  );
-  assertEqual(
-    patchBlock.content,
-    [`keep-${token}`, `new-${token}`].join('\n'),
-    'proposal semantic validator converts unified diff new hunk to replacement block content'
-  );
   validator.validateProposalSemantics(patchProposal, { allowBriefActionBundleUserPlan: true });
 
   const validTaskPlan = {
-    schemaVersion: 'deepcode.agent.protocol.v3',
+    schemaVersion: 'deepcode.agent.protocol.v4',
     proposalId: `task-plan-${token}`,
     runId: `run-${token}`,
     sessionId: `session-${token}`,
@@ -788,8 +724,10 @@ function assertProposalSemanticValidatorCanonicalizesAndDefaults(): void {
       tasks: [{
         taskId: `task-${token}`,
         title: `Task ${token}`,
-        capability: 'fs.write',
+        toolId: 'fs.write',
         target: [target],
+        args: {},
+        dependencies: [],
         acceptanceCriteria: [`Acceptance ${token}`],
         failureCriteria: [`Failure ${token}`],
       }],
@@ -806,8 +744,10 @@ function assertProposalSemanticValidatorCanonicalizesAndDefaults(): void {
       tasks: [{
         taskId: `task-missing-target-${token}`,
         title: `Task missing target ${token}`,
-        capability: 'fs.write',
+        toolId: 'fs.write',
         target: [],
+        args: {},
+        dependencies: [],
         acceptanceCriteria: [`Acceptance ${token}`],
         failureCriteria: [`Failure ${token}`],
       }],
@@ -822,8 +762,10 @@ function assertProposalSemanticValidatorCanonicalizesAndDefaults(): void {
       tasks: [{
         taskId: `task-missing-acceptance-${token}`,
         title: `Task missing acceptance ${token}`,
-        capability: 'fs.write',
+        toolId: 'fs.write',
         target: [target],
+        args: {},
+        dependencies: [],
         acceptanceCriteria: [],
         failureCriteria: [`Failure ${token}`],
       }],
@@ -838,8 +780,10 @@ function assertProposalSemanticValidatorCanonicalizesAndDefaults(): void {
       tasks: [{
         taskId: `task-missing-failure-${token}`,
         title: `Task missing failure ${token}`,
-        capability: 'fs.write',
+        toolId: 'fs.write',
         target: [target],
+        args: {},
+        dependencies: [],
         acceptanceCriteria: [`Acceptance ${token}`],
         failureCriteria: [],
       }],
@@ -855,7 +799,7 @@ async function assertProviderPipelineUsesProviderTurnContract(): Promise<void> {
   const prompt = buildPromptEnvelope({
     workflowState: `workflow-${token}`,
     allowedProposals: ['answer'],
-    capabilityCatalogSummary: `capability-${token}`,
+    toolCatalogSummary: `capability-${token}`,
     providerProfileSystemContract: planningProfile.systemContract,
     userRequest: requestText,
   });
@@ -965,11 +909,14 @@ function assertProviderJsonModeCoordinator(): void {
   assertEqual(String(injected[0]?.content ?? '').includes('valid JSON object'), true, 'json mode instruction is explicit');
   const audit = coordinator.audit(messages, { type: 'json_object' });
   assertEqual(audit?.injectedJsonInstruction, true, 'json mode audit records injected instruction');
-  const alreadyJson = coordinator.ensureMessages(
+  const userMentionsJson = coordinator.ensureMessages(
     [{ role: 'user', content: 'Return JSON only.' }],
     { type: 'json_object' }
   );
-  assertEqual(alreadyJson.length, 1, 'provider json mode coordinator does not duplicate existing json instruction');
+  assertEqual(userMentionsJson.length, 2, 'provider json mode coordinator does not treat user text as a protocol control flag');
+  const alreadyInjected = coordinator.ensureMessages(injected, { type: 'json_object' });
+  assertEqual(alreadyInjected.length, 2, 'provider json mode coordinator does not duplicate its own exact system instruction');
+  assertEqual(coordinator.audit(injected, { type: 'json_object' })?.injectedJsonInstruction, false, 'json mode audit recognizes structured Session injection');
   assertEqual(coordinator.ensureMessages(messages, undefined), messages, 'provider json mode coordinator ignores non-json mode');
 }
 
@@ -1476,16 +1423,19 @@ function assertUserGuidanceQueueBuildsResumeAndConsumedEvents(): void {
     sessionId,
     events,
     runId,
+    taskId: `task-${token}`,
     stage: 'provider_resume',
+    outputLanguage: 'en-US',
     summary: `summary-${token}`,
     now: () => '2026-01-01T00:00:00.200Z',
     createId: (prefix) => `${prefix}-${token}`,
   });
   assertEqual(resume.guidance.length, 1, 'user guidance queue filters to current run guidance');
   assertEqual(resume.guidance[0]?.id, guidanceId, 'user guidance queue preserves guidance id');
-  assert(String(resume.messages[0]?.content ?? '').includes(`Apply generic guidance ${token}`), 'user guidance queue builds provider resume message');
-  assertEqual(resume.events.length, 1, 'user guidance queue emits one consumed event');
-  const consumedPayload = resume.events[0]?.payload as Record<string, unknown>;
+  assert(String(resume.messages[1]?.content ?? '').includes(`Apply generic guidance ${token}`), 'user guidance queue preserves the explicit provider resume message');
+  assertEqual(resume.events.length, 2, 'user guidance queue emits authority and consumed events');
+  assertEqual(resume.events[0]?.kind, 'session_turn_authority', 'user guidance queue binds queued messages to one turn');
+  const consumedPayload = resume.events[1]?.payload as Record<string, unknown>;
   assertEqual(consumedPayload?.status, 'consumed', 'user guidance queue marks guidance consumed');
   assertEqual(consumedPayload?.summary, `summary-${token}`, 'user guidance queue uses caller-provided summary');
   assertEqual(consumedPayload?.appliedAtProviderStage, 'provider_resume', 'user guidance queue records provider stage');
@@ -1557,6 +1507,7 @@ async function assertPermissionDecisionHandlerAcceptsAndRequestsReviewFacts(): P
   const workUnitId = `work-unit-${token}`;
   const session: AgentSession = {
     id: sessionId,
+    projectId: `project-${token}`,
     mode: 'plan',
     createdAt: `ts-${token}`,
     updatedAt: `ts-${token}`,
@@ -1572,7 +1523,7 @@ async function assertPermissionDecisionHandlerAcceptsAndRequestsReviewFacts(): P
       proposalId: `proposal-${token}`,
       content: `plan-${token}`,
       actionBundle: { id: `bundle-${token}`, actions: [] },
-      codeBlocks: [],
+      contentBlocks: [],
       commandBlocks: [],
       expectedValidation: `validation-${token}`,
       reviewGuide: `review-${token}`,
@@ -1722,7 +1673,7 @@ async function assertRequirementDecisionHandlerRejectsActiveRequirement(): Promi
     },
     activeDriverInteraction: () => ({ kind: 'requirement', runId, requirementId }),
     executionRootFromDecision: () => undefined,
-    buildAcceptedImplementationPlan: () => {
+    buildAcceptedTaskPlan: () => {
       throw new Error('requirement reject must not build accepted implementation context');
     },
     recoverAcceptedPlanFromOverlay: () => undefined,
@@ -1750,20 +1701,11 @@ async function assertRequirementDecisionHandlerRejectsActiveRequirement(): Promi
       executionRootFromPayload: () => undefined,
     }),
     acceptedPlanLedger: new AcceptedPlanTaskLedgerCoordinator(),
-    acceptedPlanScopeDecisionOverlay: {
-      apply: () => {
-        throw new Error('requirement reject must not apply scope overlay');
-      },
-      resumeGuidance: () => {
-        throw new Error('requirement reject must not build scope guidance');
-      },
-    } as any,
     executionPrompt: {
       executionRequest: () => {
         throw new Error('requirement reject must not resume accepted-plan execution');
       },
     } as any,
-    repairLoop: new RepairLoop(),
   });
 
   const control = await handler.resolve({
@@ -1878,7 +1820,7 @@ function assertUserInputPipelineFindsRequirementInteractions(): void {
   assertEqual(pipeline.requirementOriginalRequest(fallbackConfirmation), requestText, 'user input pipeline recovers original request directly');
   const proposalRecord = pipeline.requirementRecordFromProposal({
     proposal: {
-      schemaVersion: 'deepcode.agent.protocol.v3',
+      schemaVersion: 'deepcode.agent.protocol.v4',
       kind: 'decisionRequest',
       runId,
       sessionId: `session-${token}`,
@@ -1963,16 +1905,6 @@ function assertUserInputPipelineFindsRequirementInteractions(): void {
     } as AgentEvent),
     true,
     'user input pipeline recognizes resource budget confirmations'
-  );
-  assertEqual(
-    pipeline.isAcceptedPlanScopeConfirmation({
-      kind: 'requirement_confirmation',
-      payload: {
-        decisionRequest: { decisionScope: 'acceptedPlanBatchOutOfScope' },
-      },
-    } as AgentEvent),
-    true,
-    'user input pipeline recognizes accepted-plan scope confirmations'
   );
   assertEqual(
     pipeline.isAcceptedPlanExecutionConfirmation({
@@ -2201,6 +2133,14 @@ function assertResourceManifestBuilderSeedsWorkspaceRootEntries(): void {
   const projectRoot = `/tmp/${token}/${randomSmokeToken('project')}`;
   const project = builder.build({
     sessionId: `session-${token}`,
+    projectId: `project-${token}`,
+    projectKind: 'folder',
+    projectRootStatus: 'ready',
+    workspaceBinding: {
+      workspaceId: `workspace-${token}`,
+      workspaceHash: `hash-${token}`,
+      openPath: projectRoot,
+    },
     projectWorkingDirectory: {
       rootId: `root-${token}`,
       label: `Project ${token}`,
@@ -2213,9 +2153,88 @@ function assertResourceManifestBuilderSeedsWorkspaceRootEntries(): void {
   assertEqual(project.manifest.entries.length, 1, 'project working directory becomes an initial manifest entry');
   assertEqual(project.manifest.entries[0]?.id, `root-${token}`, 'project working directory manifest entry preserves root id');
   assertEqual(project.manifest.entries[0]?.kind, 'directory', 'project working directory manifest entry is a directory');
-  assertEqual(project.manifest.entries[0]?.resourceRef, projectRoot, 'project working directory manifest entry preserves resource ref');
+  assertEqual(project.manifest.entries[0]?.resourceRef, '.', 'project working directory manifest entry is root-relative');
+  assertEqual(project.manifest.entries[0]?.rootId, `root-${token}`, 'project working directory manifest entry binds the relative root');
   assertEqual(project.manifest.entries[0]?.readPolicy, 'autoRead', 'project working directory manifest entry is auto-read');
   assertEqual(project.conversationRoots[0]?.rootId, `root-${token}`, 'project working directory remains a conversation root');
+  assertEqual(project.conversationRoots[0]?.source, 'projectWorkingDirectory', 'project binding owns the primary root identity');
+  assertEqual(project.manifest.projectId, `project-${token}`, 'project id is preserved in the resource manifest');
+  assertEqual(project.manifest.projectRootStatus, 'ready', 'project root status is preserved in the resource manifest');
+  assert(
+    project.manifest.workspaceScopeKey.includes(`hash-${token}`),
+    'project workspace binding contributes to the cache scope key'
+  );
+  const reboundProject = builder.build({
+    sessionId: `session-${token}`,
+    projectId: `project-${token}`,
+    projectKind: 'folder',
+    projectRootStatus: 'ready',
+    workspaceBinding: {
+      workspaceId: `workspace-${token}`,
+      workspaceHash: `hash-rebound-${token}`,
+      openPath: `/tmp/${token}/${randomSmokeToken('rebound')}`,
+    },
+  }, `manifest-rebound-${token}`);
+  assert(
+    reboundProject.manifest.workspaceScopeKey !== project.manifest.workspaceScopeKey,
+    'project rebind changes the workspace cache scope and starts a new prompt epoch'
+  );
+
+  const temporaryRoot = `/tmp/${token}/${randomSmokeToken('temporary')}`;
+  const projectWithTemporaryAttachment = builder.build({
+    sessionId: `session-priority-${token}`,
+    projectId: `project-priority-${token}`,
+    projectKind: 'folder',
+    projectRootStatus: 'ready',
+    workspaceBinding: { workspaceHash: `priority-hash-${token}`, openPath: projectRoot },
+    projectWorkingDirectory: {
+      rootId: `root-priority-${token}`,
+      label: `Project ${token}`,
+      displayPath: projectRoot,
+      absolutePath: projectRoot,
+      source: 'projectWorkingDirectory',
+    },
+    attachments: [{
+      kind: 'directory',
+      path: temporaryRoot,
+      absolutePath: temporaryRoot,
+      source: 'userSelected',
+      scope: 'message',
+    }],
+    acceptedTaskPlan: {
+      executionRoot: {
+        ref: temporaryRoot,
+        attachment: {
+          kind: 'directory',
+          path: temporaryRoot,
+          absolutePath: temporaryRoot,
+          source: 'userSelected',
+          scope: 'session',
+        },
+      },
+    },
+  }, `manifest-priority-${token}`);
+  assertEqual(
+    projectWithTemporaryAttachment.conversationRoots.find((root) => root.primary)?.absolutePath,
+    projectRoot,
+    'project root remains primary over accepted-task and attachment roots'
+  );
+  assertEqual(
+    builder.kernelRunAttachments({
+      sessionId: `session-priority-${token}`,
+      projectWorkingDirectory: projectWithTemporaryAttachment.conversationRoots[0] as any,
+      workspaceBinding: { openPath: projectRoot },
+      attachments: [{
+        kind: 'file',
+        path: `${temporaryRoot}/note.txt`,
+        absolutePath: `${temporaryRoot}/note.txt`,
+        source: 'userSelected',
+        scope: 'message',
+      }],
+    }).some((attachment) => attachment.absolutePath === projectRoot),
+    false,
+    'project root is carried by workspaceBinding instead of a synthetic attachment'
+  );
 
   const editorRoot = `/tmp/${token}/${randomSmokeToken('editor')}`;
   const editor = builder.build({
@@ -2225,7 +2244,12 @@ function assertResourceManifestBuilderSeedsWorkspaceRootEntries(): void {
 
   assertEqual(editor.manifest.entries.length, 1, 'editor workspace binding becomes an initial manifest entry');
   assertEqual(editor.manifest.entries[0]?.kind, 'directory', 'editor workspace manifest entry is a directory');
-  assertEqual(editor.manifest.entries[0]?.resourceRef, editorRoot, 'editor workspace manifest entry preserves open path');
+  assertEqual(editor.manifest.entries[0]?.resourceRef, '.', 'editor workspace manifest entry is root-relative');
+  assertEqual(
+    editor.manifest.entries[0]?.rootId,
+    editor.manifest.entries[0]?.id,
+    'editor workspace manifest entry binds its relative root'
+  );
   assertEqual(editor.conversationRoots[0]?.source, 'workspaceBinding', 'editor workspace remains a conversation root');
 
   const deduped = builder.build({
@@ -2306,7 +2330,7 @@ async function assertSessionDriverLoopPreResolvesProjectWorkspaceRoot(): Promise
       callOrder.push('llm');
       llmCalls += 1;
       return jsonLlmResponse({
-        schemaVersion: 'deepcode.agent.protocol.v3',
+        schemaVersion: 'deepcode.agent.protocol.v4',
         kind: 'answer',
         outputLanguage: 'en-US',
         answer: { format: 'markdown', content: `Generic workspace root evidence was available for ${token}.` },
@@ -2330,7 +2354,12 @@ async function assertSessionDriverLoopPreResolvesProjectWorkspaceRoot(): Promise
 
   assertEqual(resourceResolveManifests.length, 1, 'project workspace root is resolved during run initialization');
   assertEqual(resourceResolveManifests[0]?.entries?.[0]?.kind, 'directory', 'initial resource resolve reads a directory root');
-  assertEqual(resourceResolveManifests[0]?.entries?.[0]?.resourceRef, workspaceRoot, 'initial resource resolve uses the project workspace root');
+  assertEqual(resourceResolveManifests[0]?.entries?.[0]?.resourceRef, '.', 'initial resource resolve uses the relative project root');
+  assertEqual(
+    resourceResolveManifests[0]?.entries?.[0]?.rootId,
+    `root-${token}`,
+    'initial resource resolve binds the project root id'
+  );
   assert(
     callOrder.indexOf('kernel:resourceResolve') > callOrder.indexOf('kernel:runCreate') &&
     callOrder.indexOf('kernel:resourceResolve') < callOrder.indexOf('llm'),
@@ -2394,7 +2423,7 @@ async function assertSessionDriverLoopSuppressesPlanningNativeReadToolsAfterInit
       assertEqual(Array.isArray(request.tools), true, 'planning provider request carries an explicit tools list');
       assertEqual(request.tools?.length ?? -1, 0, 'planning provider hides native read tools after initial ResourceEvidence');
       return jsonLlmResponse({
-        schemaVersion: 'deepcode.agent.protocol.v3',
+        schemaVersion: 'deepcode.agent.protocol.v4',
         kind: 'answer',
         outputLanguage: 'en-US',
         answer: { format: 'markdown', content: `Generic planning used existing evidence for ${token}.` },
@@ -2517,7 +2546,7 @@ async function assertAcceptedPlanResourceResumeCoordinatorBuildsProviderTurn(): 
       resourcePackets: state.resourcePackets,
       acceptedContext: {},
       currentTaskContext: state.currentTaskContext,
-      completedTaskCount: state.acceptedImplementationPlan?.completedTaskIds.length,
+      completedTaskCount: state.acceptedTaskPlan?.completedTaskIds.length,
     }),
     createId: (prefix) => `${prefix}-${token}`,
     parseError: (error) => error instanceof Error
@@ -2558,18 +2587,18 @@ async function assertAcceptedPlanResourceResumeCoordinatorBuildsProviderTurn(): 
     sessionId,
     runId,
     userRequest: `request-${token}`,
-    acceptedImplementationPlan: {
+    acceptedTaskPlan: {
       planId: `plan-${token}`,
       runId,
-      tasks: [{ taskId: `task-${token}`, targets: [], dependencies: [], conflictKeys: [] }],
-      capabilities: [],
+      tasks: [{ taskId: `task-${token}`, targets: [], dependencies: [], planningArgs: {}, conflictKeys: [] }],
+      authorizationOperations: [],
+      toolIds: [],
       targetScopes: [],
-      exactOperationGrants: [],
-      accessScopes: [],
       batchIndex: 1,
       completedTaskIds: [],
+      dependencyFacts: [],
       rawPlan: {},
-    } as AcceptedImplementationPlanContext,
+    } as AcceptedTaskPlanContext,
     taskExecutionCursor: {
       cursorId: `cursor-${token}`,
       planId: `plan-${token}`,
@@ -2583,7 +2612,7 @@ async function assertAcceptedPlanResourceResumeCoordinatorBuildsProviderTurn(): 
       goal: `goal-${token}`,
       taskId: `task-${token}`,
       targets: [`target-${token}.txt`],
-      capabilities: ['fs.read'],
+      toolIds: ['fs.read'],
       taskOrder: [`task-${token}`],
       pendingTaskIds: [`task-${token}`],
       dependsOn: [],
@@ -2600,7 +2629,7 @@ async function assertAcceptedPlanResourceResumeCoordinatorBuildsProviderTurn(): 
     prompt,
     userRequest: state.userRequest,
     requestProposal: {
-      schemaVersion: 'deepcode.agent.protocol.v3',
+      schemaVersion: 'deepcode.agent.protocol.v4',
       proposalId: `proposal-${token}`,
       runId,
       sessionId,
@@ -2622,7 +2651,7 @@ async function assertAcceptedPlanResourceResumeCoordinatorBuildsProviderTurn(): 
         'resource resume coordinator keeps NextActionInstruction explicit'
       );
       return JSON.stringify({
-        schemaVersion: 'deepcode.agent.protocol.v3',
+        schemaVersion: 'deepcode.agent.protocol.v4',
         kind: 'diagnostic',
         proposalId: `diagnostic-${token}`,
         diagnostic: {
@@ -2638,7 +2667,7 @@ async function assertAcceptedPlanResourceResumeCoordinatorBuildsProviderTurn(): 
   assertEqual(observedMessages[0]?.role, 'system', 'resource resume coordinator sends stable prefix as system message');
   const resumeUserPrompt = observedMessages.find((message) => message.role === 'user')?.content ?? '';
   assert(
-    resumeUserPrompt.includes('Return exactly one Agent Protocol v3 proposal: actionBundle, resourceRequest, decisionRequest, taskOutcome, diagnostic.'),
+    resumeUserPrompt.includes('Return exactly one Agent Protocol v4 proposal: actionBundle, resourceRequest, decisionRequest, taskOutcome, diagnostic.'),
     'resource resume prompt aligns provider-visible allowed kinds with driver parsing'
   );
   assert(
@@ -2650,11 +2679,11 @@ async function assertAcceptedPlanResourceResumeCoordinatorBuildsProviderTurn(): 
     'resource resume prompt delegates schema details to ProviderTurnContract'
   );
   assert(
-    resumeUserPrompt.includes('Carrier fields by kind: actionBundle uses userPlanMarkdown/codeBlocks/actionBundle; resourceRequest uses resourceRequest; taskOutcome uses taskOutcome; decisionRequest uses decisionRequest; diagnostic uses diagnostic.'),
+    resumeUserPrompt.includes('Carrier fields by kind: actionBundle uses userPlanMarkdown/contentBlocks/actionBundle; resourceRequest uses resourceRequest; taskOutcome uses taskOutcome; decisionRequest uses decisionRequest; diagnostic uses diagnostic.'),
     'resource resume prompt keeps only compact carrier guidance'
   );
   assert(
-    !resumeUserPrompt.includes('fs.write actions must use args={path,sourceBlockId}'),
+    !resumeUserPrompt.includes('fs.write actions must use args={path,contentBlockId}'),
     'resource resume prompt does not duplicate full actionBundle protocol details'
   );
   assert(
@@ -2731,31 +2760,44 @@ async function assertResourceRequestProposalHandlerContinuesThroughRunEngine(): 
     conversationRoots: [],
     resourcePackets: [],
     generatedArtifactEvidence: new Map(),
-    acceptedImplementationPlan: {
+    acceptedTaskPlan: {
       planId: `plan-${token}`,
       runId,
       tasks: [{
         taskId,
         targets: [targetPath],
-        capability: 'fs.write',
-        semanticOperation: 'createFile',
+        toolId: 'fs.write',
         dependencies: [],
+        planningArgs: {},
         conflictKeys: [],
       }],
-      capabilities: ['fs.write'],
+      authorizationOperations: [{
+        operationId: `plan-op-${taskId}-1`,
+        sourceTaskId: taskId,
+        toolId: 'fs.write',
+        operationKind: 'write',
+        contentMode: 'contentBlock',
+        targets: [targetPath],
+        dependsOn: [],
+        fixedArgs: {},
+        argsTemplate: { path: targetPath, contentBlockId: 'executionTime' },
+        targetResourceKind: 'file',
+        recursive: false,
+        internal: false,
+      }],
+      toolIds: ['fs.write'],
       targetScopes: [targetPath],
-      exactOperationGrants: [],
-      accessScopes: [],
       batchIndex: 1,
       completedTaskIds: [],
+      dependencyFacts: [],
       rawPlan: {},
-    } as AcceptedImplementationPlanContext,
+    } as AcceptedTaskPlanContext,
     taskExecutionCursor: { currentTaskId: taskId },
     currentTaskContext: {
       taskId,
       goal: `Task already satisfied ${token}`,
       targets: [targetPath],
-      capabilities: ['fs.write'],
+      toolIds: ['fs.write'],
     },
     resourceRequestRepairAttempted: false,
     resourceRequestProgressByTask: new Map(),
@@ -2779,7 +2821,9 @@ async function assertResourceRequestProposalHandlerContinuesThroughRunEngine(): 
       availableRoots: [],
     }),
     finalDiagnosticEvent: () => ({} as AgentEvent),
+    internalFailureEvents: () => [],
     resourceResolutionDiagnostic: () => ({ code: 'unexpected', fallback: 'unexpected' }),
+    completeResourceSemanticExchange: async () => undefined,
     refreshTaskRuntimeState: () => undefined,
     acceptedPlanResourceResumeEvent: () => ({
       id: `resume-${token}`,
@@ -2799,7 +2843,7 @@ async function assertResourceRequestProposalHandlerContinuesThroughRunEngine(): 
       runId,
       sessionId,
       raw: JSON.stringify({
-        schemaVersion: 'deepcode.agent.protocol.v3',
+        schemaVersion: 'deepcode.agent.protocol.v4',
         kind: 'resourceRequest',
         outputLanguage: 'en-US',
         resourceRequest: {
@@ -2825,7 +2869,7 @@ async function assertResourceRequestProposalHandlerContinuesThroughRunEngine(): 
       runId,
       sessionId,
       raw: JSON.stringify({
-        schemaVersion: 'deepcode.agent.protocol.v3',
+        schemaVersion: 'deepcode.agent.protocol.v4',
         kind: 'resourceRequest',
         outputLanguage: 'en-US',
         resourceRequest: {
@@ -2849,7 +2893,7 @@ async function assertResourceRequestProposalHandlerContinuesThroughRunEngine(): 
       runId,
       sessionId,
       raw: JSON.stringify({
-        schemaVersion: 'deepcode.agent.protocol.v3',
+        schemaVersion: 'deepcode.agent.protocol.v4',
         kind: 'resourceRequest',
         outputLanguage: 'en-US',
         resourceRequest: {
@@ -2870,25 +2914,39 @@ async function assertAcceptedPlanReadOnlyTaskExecutorContinuesThroughRunEngine()
   const sessionId = `session-${token}`;
   const runId = `run-${token}`;
   const taskId = `task-${token}`;
-  const acceptedPlan: AcceptedImplementationPlanContext = {
+  const acceptedPlan: AcceptedTaskPlanContext = {
     planId: `plan-${token}`,
     runId,
     tasks: [{
       taskId,
       title: `Task ${token}`,
       targets: [`target-${token}.txt`],
-      capability: 'fs.read',
+      toolId: 'fs.read',
       acceptanceCriteria: [],
       failureCriteria: [],
       dependencies: [],
+      planningArgs: {},
       conflictKeys: [],
     }],
-    capabilities: ['fs.read'],
+    authorizationOperations: [{
+      operationId: `plan-op-${taskId}-1`,
+      sourceTaskId: taskId,
+      toolId: 'fs.read',
+      operationKind: 'read',
+      contentMode: 'none',
+      targets: [`target-${token}.txt`],
+      dependsOn: [],
+      fixedArgs: {},
+      argsTemplate: { path: `target-${token}.txt` },
+      targetResourceKind: 'file',
+      recursive: false,
+      internal: false,
+    }],
+    toolIds: ['fs.read'],
     targetScopes: [`target-${token}.txt`],
-    exactOperationGrants: [],
-    accessScopes: [],
     batchIndex: 1,
     completedTaskIds: [],
+    dependencyFacts: [],
     rawPlan: {},
   };
   const packet: ResourcePacket = {
@@ -2964,7 +3022,7 @@ async function assertAcceptedPlanReadOnlyTaskExecutorContinuesThroughRunEngine()
     {
       sessionId,
       runId,
-      acceptedImplementationPlan: acceptedPlan,
+      acceptedTaskPlan: acceptedPlan,
       manifest: {
         id: `manifest-${token}`,
         workspaceScopeKey: 'workspace',
@@ -2974,21 +3032,26 @@ async function assertAcceptedPlanReadOnlyTaskExecutorContinuesThroughRunEngine()
       },
       conversationRoots: [],
       taskExecutionCursor: { currentTaskId: taskId },
-      currentTaskContext: { taskId, targets: [`target-${token}.txt`], capabilities: ['fs.read'] },
+      currentTaskContext: { taskId, targets: [`target-${token}.txt`], toolIds: ['fs.read'] },
     },
     smokePromptEnvelope(`stable-${token}`),
     parseProposalEnvelope({
       runId,
       sessionId,
       raw: JSON.stringify({
-        schemaVersion: 'deepcode.agent.protocol.v3',
+        schemaVersion: 'deepcode.agent.protocol.v4',
         kind: 'actionBundle',
         outputLanguage: 'en-US',
         actionBundle: {
           version: '1',
           id: `bundle-${token}`,
           goal: `goal-${token}`,
-          actions: [{ actionId: `read-${token}`, toolId: 'fs.read', args: { path: `target-${token}.txt` } }],
+          actions: [{
+            actionId: `read-${token}`,
+            toolId: 'fs.read',
+            args: { path: `target-${token}.txt` },
+            description: `Read target ${token}`,
+          }],
         },
       }),
     }),
@@ -3042,7 +3105,7 @@ async function assertResourceRequestRepairCoordinatorRepairsProposal(): Promise<
     state,
     prompt,
     proposal: {
-      schemaVersion: 'deepcode.agent.protocol.v3',
+      schemaVersion: 'deepcode.agent.protocol.v4',
       proposalId: `proposal-${token}`,
       runId,
       sessionId,
@@ -3062,7 +3125,7 @@ async function assertResourceRequestRepairCoordinatorRepairsProposal(): Promise<
       observedStage = stage;
       observedMessages = messages;
       return JSON.stringify({
-        schemaVersion: 'deepcode.agent.protocol.v3',
+        schemaVersion: 'deepcode.agent.protocol.v4',
         kind: 'diagnostic',
         proposalId: `diagnostic-${token}`,
         diagnostic: {
@@ -3137,7 +3200,7 @@ async function assertActionBundleAdmissionRepairCoordinatorRepairsProposal(): Pr
     state,
     prompt,
     proposal: {
-      schemaVersion: 'deepcode.agent.protocol.v3',
+      schemaVersion: 'deepcode.agent.protocol.v4',
       proposalId: `proposal-${token}`,
       runId,
       sessionId,
@@ -3156,7 +3219,7 @@ async function assertActionBundleAdmissionRepairCoordinatorRepairsProposal(): Pr
       observedStage = stage;
       observedMessages = messages;
       return JSON.stringify({
-        schemaVersion: 'deepcode.agent.protocol.v3',
+        schemaVersion: 'deepcode.agent.protocol.v4',
         kind: 'diagnostic',
         proposalId: `diagnostic-${token}`,
         diagnostic: {
@@ -3262,7 +3325,7 @@ async function assertActionBundleAdmissionResourceFollowupCoordinatorHandlesReso
   const resume = await coordinator.handle({
     state,
     proposal: {
-      schemaVersion: 'deepcode.agent.protocol.v3',
+      schemaVersion: 'deepcode.agent.protocol.v4',
       proposalId: `proposal-${token}`,
       runId,
       sessionId,
@@ -3322,7 +3385,7 @@ async function assertActionBundleAdmissionResourceFollowupCoordinatorHandlesReso
   const failed = await failureCoordinator.handle({
     state,
     proposal: {
-      schemaVersion: 'deepcode.agent.protocol.v3',
+      schemaVersion: 'deepcode.agent.protocol.v4',
       proposalId: `failed-${token}`,
       runId,
       sessionId,
@@ -3380,7 +3443,7 @@ function assertResourceEvidenceIndexQueriesPackets(): void {
 function assertGeneratedArtifactEvidenceIndexBuildsRunLocalPackets(): void {
   const token = randomSmokeToken('generated-evidence');
   const targetPath = `generated-${token}/artifact-${randomSmokeToken('file')}.txt`;
-  const sourceBlockId = `block-${token}`;
+  const contentBlockId = `block-${token}`;
   const actionId = `action-${token}`;
   const content = `content-${randomSmokeToken('content')}`;
   const index = new GeneratedArtifactEvidenceIndex({
@@ -3389,8 +3452,10 @@ function assertGeneratedArtifactEvidenceIndexBuildsRunLocalPackets(): void {
     batchActionRecords: (batch) => Array.isArray((batch as Record<string, unknown>).actions)
       ? (batch as Record<string, unknown>).actions as Record<string, unknown>[]
       : [],
-    actionEffectiveCapability: (action) => typeof action.capability === 'string' ? action.capability : '',
-    actionFileTargetPath: (action) => typeof action.targetPath === 'string' ? action.targetPath : undefined,
+    actionToolId: (action) => typeof action.toolId === 'string' ? action.toolId : '',
+    actionFileTargetPath: (action) => typeof (action.args as Record<string, unknown> | undefined)?.path === 'string'
+      ? (action.args as Record<string, unknown>).path as string
+      : undefined,
     completedWorkUnitFacts: () => ({ actionIds: new Set([actionId]), targets: new Set([targetPath]) }),
     completedActionMatches: (candidateActionId, candidateTargetPath, completed) =>
       Boolean(candidateActionId && completed.actionIds.has(candidateActionId)) ||
@@ -3416,9 +3481,9 @@ function assertGeneratedArtifactEvidenceIndexBuildsRunLocalPackets(): void {
   const generatedPacket = index.packetFromSuccessfulBatch(
     state,
     {
-      codeBlocks: [
+      contentBlocks: [
         {
-          id: sourceBlockId,
+          blockId: contentBlockId,
           targetPath,
           contentLines: [content],
         },
@@ -3426,9 +3491,9 @@ function assertGeneratedArtifactEvidenceIndexBuildsRunLocalPackets(): void {
       actions: [
         {
           actionId,
-          capability: 'fs.write',
-          targetPath,
-          sourceBlockId,
+          toolId: 'fs.write',
+          args: { path: targetPath, contentBlockId },
+          description: `write ${targetPath}`,
         },
       ],
     },
@@ -3483,12 +3548,14 @@ function assertImplementationBatchContextBuilderExtractsConcreteContinuations():
         actionBundle: {
           continuationExpectations: [
             {
-              title: `continue-${token}`,
-              resourceScope: [targetPath],
+              id: `continue-${token}`,
+              description: `continue-${token}`,
+              target: [targetPath],
             },
             {
-              title: `skip-${token}`,
-              resourceScope: ['*.tmp'],
+              id: `skip-${token}`,
+              description: `skip-${token}`,
+              target: ['*.tmp'],
             },
           ],
         },
@@ -3519,35 +3586,9 @@ function assertImplementationBatchContextBuilderExtractsConcreteContinuations():
   );
 }
 
-function assertRepairLoopBuildsAcceptedPlanScopeRevisionRequest(): void {
+function assertRepairLoopBuildsPlanRevisionRequest(): void {
   const token = randomSmokeToken('repair-loop');
   const repairLoop = new RepairLoop();
-  const request = repairLoop.acceptedPlanScopeRevisionRequest({
-    confirmation: {
-      id: `confirmation-${token}`,
-      sessionId: `session-${token}`,
-      kind: 'requirement_confirmation',
-      ts: '2026-01-01T00:00:00.000Z',
-      payload: {
-        decisionRequest: {
-          acceptedPlanId: `plan-${token}`,
-          reason: `Reason ${token}`,
-        },
-      },
-    },
-    plan: {
-      planId: `plan-${token}`,
-      implementationPlan: {
-        title: `Title ${token}`,
-        summary: `Summary ${token}`,
-      },
-    },
-    guidance: `Guidance ${token}`,
-  });
-  assert(request.includes(`Guidance ${token}`), 'repair loop accepted-plan scope revision keeps guidance');
-  assert(request.includes(`Title ${token}`), 'repair loop accepted-plan scope revision keeps plan title');
-  assert(request.includes(`Reason ${token}`), 'repair loop accepted-plan scope revision keeps decision request context');
-
   const revisionRequest = repairLoop.planRevisionRequest({
     plan: {
       userPlan: `Plan body ${token}`,
@@ -3559,14 +3600,6 @@ function assertRepairLoopBuildsAcceptedPlanScopeRevisionRequest(): void {
   assert(revisionRequest.includes(`Plan body ${token}`), 'repair loop plan revision request keeps previous plan');
   assert(revisionRequest.includes(`report-${token}`), 'repair loop plan revision request keeps review report context');
   assert(revisionRequest.includes('Do not return actionBundle'), 'repair loop plan revision request keeps execution boundary');
-
-  const followupRequest = repairLoop.actionBundleAdmissionResourceFollowupRequest({
-    runId: `run-${token}`,
-    reasons: [`Reason ${token}`],
-  });
-  assert(followupRequest.includes(`run-${token}`), 'repair loop admission followup keeps run id');
-  assert(followupRequest.includes(`Reason ${token}`), 'repair loop admission followup keeps rejection reasons');
-  assert(followupRequest.includes('args.targetKind="directory"'), 'repair loop admission followup keeps directory target instruction');
 }
 
 function assertCompletedWorkUnitFactIndexMatchesActionAndTarget(): void {
@@ -3607,13 +3640,15 @@ function assertActionBatchFailureIndexSummarizesKernelFailures(): void {
   const targetPath = `scope-${token}/target-${randomSmokeToken('file')}.txt`;
   const index = new ActionBatchFailureIndex();
   const batch = {
-    actions: [
-      {
-        actionId,
-        toolId: 'fs.delete',
-        args: { path: targetPath },
-      },
-    ],
+    actionBundle: {
+      actions: [
+        {
+          actionId,
+          toolId: 'fs.delete',
+          args: { path: targetPath },
+        },
+      ],
+    },
   };
   const failures = index.details([
     {
@@ -3629,7 +3664,11 @@ function assertActionBatchFailureIndexSummarizesKernelFailures(): void {
       workUnitId,
       error: {
         code: `kernel-${token}`,
-        message: `fs.write target path is empty for ${targetPath}`,
+        message: `structured failure ${token}`,
+        args: {
+          stage: 'admission',
+          details: { classification: `classification-${token}` },
+        },
       },
     },
   ], batch);
@@ -3638,7 +3677,7 @@ function assertActionBatchFailureIndexSummarizesKernelFailures(): void {
   if (!detail) throw new Error('action batch failure index missing detail');
   assertEqual(detail.workUnitId, workUnitId, 'action batch failure index preserves work unit id');
   assertEqual(detail.actionId, actionId, 'action batch failure index preserves action id');
-  assertEqual(detail.code, 'kernel_delete_compile_mismatch', 'action batch failure index classifies delete compile mismatch');
+  assertEqual(detail.code, `classification-${token}`, 'action batch failure index consumes the Kernel typed classification');
   assertEqual(detail.kernelCode, `kernel-${token}`, 'action batch failure index preserves kernel code');
   assert(detail.writeSet.includes(targetPath), 'action batch failure index preserves write set');
   const summary = index.summary(detail);
@@ -3647,7 +3686,7 @@ function assertActionBatchFailureIndexSummarizesKernelFailures(): void {
   assert(summary.includes(targetPath), 'action batch failure summary includes write target');
 }
 
-function assertAcceptedPlanBatchPreflightAuditsDeleteActions(): void {
+function assertAcceptedPlanBatchPreflightProjectsAuditOnly(): void {
   const token = randomSmokeToken('batch-preflight');
   const targetPath = `dir-${token}`;
   const preflight = new AcceptedPlanBatchPreflight({
@@ -3659,35 +3698,15 @@ function assertAcceptedPlanBatchPreflightAuditsDeleteActions(): void {
         ? record.actions.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object' && !Array.isArray(item))
         : [];
     },
-    actionEffectiveCapability: (action) => typeof action.capability === 'string' && action.capability.trim()
-      ? action.capability.trim()
-      : typeof action.toolId === 'string'
-        ? action.toolId
-        : '',
-    actionFileTargetPath: (action) => {
-      const args = action.args && typeof action.args === 'object' && !Array.isArray(action.args)
-        ? action.args as Record<string, unknown>
-        : {};
-      return typeof action.targetPath === 'string'
-        ? action.targetPath
-        : typeof args.path === 'string'
-          ? args.path
-          : undefined;
-    },
-    deleteActionTargetResourceKind: (action) =>
-      action.targetKind === 'directory' || action.targetResourceKind === 'directory' ? 'directory' : undefined,
-    deleteActionRecursive: (action) => action.recursive === true,
-    normalizePlanScope: (value) => value.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+/g, '/').trim(),
-    containsDirectoryPath: (_packets, path) => path === targetPath,
   });
   const batch = {
     actions: [
       {
-        id: `delete-${token}`,
+        actionId: `delete-${token}`,
         toolId: 'fs.delete',
-        capability: 'fs.delete',
-        targetPath: `./${targetPath}/`,
-        resourceScope: [`./${targetPath}/`],
+        args: { path: `./${targetPath}/` },
+        description: 'Delete a directory target',
+        dependsOn: [],
       },
     ],
   };
@@ -3696,1012 +3715,181 @@ function assertAcceptedPlanBatchPreflightAuditsDeleteActions(): void {
   const actions = Array.isArray(audit.actions) ? audit.actions : [];
   const action = actions[0] as Record<string, unknown> | undefined;
   assertEqual(action?.targetPath, `./${targetPath}/`, 'accepted plan batch preflight preserves raw target path');
-  const reasons = preflight.deleteReasons(batch, []);
-  assert(
-    reasons.some((reason) => reason.includes(`fs.delete target ${targetPath} is a directory`)),
-    'accepted plan batch preflight detects directory delete without target kind'
-  );
+  assertEqual('deleteReasons' in preflight, false, 'Session preflight exposes no local delete permission or safety gate');
 }
 
-function assertAcceptedPlanScopeCoverageMatchesStructuredScopes(): void {
-  const token = randomSmokeToken('scope-coverage');
-  const taskDir = `task-${token}`;
-  const exactPath = `exact-${token}.txt`;
-  const accessDir = `access-${token}`;
-  const coverage = new AcceptedPlanScopeCoverage({
-    taskTargets: (task) => Array.isArray(task.targets)
-      ? task.targets.filter((item): item is string => typeof item === 'string')
-      : [],
-  });
-  const accepted: AcceptedImplementationPlanContext = {
-    planId: `plan-${token}`,
-    runId: `run-${token}`,
-    tasks: [
-      {
-        taskId: `task-${token}`,
-        title: `Task ${token}`,
-        capability: 'fs.delete',
-        targets: [`${taskDir}/item-${token}.txt`],
-        dependencies: [],
-        conflictKeys: [],
-      },
-    ],
-    capabilities: ['fs.delete', 'fs.write'],
-    targetScopes: [`${accessDir}/`],
-    exactOperationGrants: [
-      {
-        operation: 'delete',
-        targetPath: exactPath,
-        targetResourceKind: 'file',
-        capability: 'fs.delete',
-        source: 'implementationPlan',
-      },
-    ],
-    accessScopes: [
-      {
-        scopeKind: 'workspacePath',
-        path: `${accessDir}/`,
-        capabilities: ['fs.write'],
-        operations: ['write'],
-        source: 'implementationPlan',
-      },
-    ],
-    batchIndex: 1,
-    completedTaskIds: [],
-    rawPlan: {},
-  };
-  assert(
-    coverage.scopeCoveredForCapability(`${taskDir}/item-${token}.txt`, 'fs.delete', accepted),
-    'accepted plan scope coverage matches delete task target'
-  );
-  assert(
-    coverage.scopeCoveredForCapability(exactPath, 'fs.delete', accepted),
-    'accepted plan scope coverage matches exact delete grant'
-  );
-  assert(
-    coverage.scopeCoveredForCapability(`${accessDir}/nested-${token}.txt`, 'fs.write', accepted),
-    'accepted plan scope coverage matches write access scope'
-  );
-  assert(
-    !coverage.scopeCoveredForCapability(`outside-${token}.txt`, 'fs.delete', accepted),
-    'accepted plan scope coverage rejects unrelated delete target'
-  );
-  assert(
-    coverage.exactGrantCapabilityMatches(accepted.exactOperationGrants[0], 'fs.delete'),
-    'accepted plan scope coverage matches exact grant capability'
-  );
-}
-
-function assertAcceptedPlanScopeDecisionOverlayExpandsCurrentTask(): void {
-  const token = randomSmokeToken('scope-overlay');
-  const targetDir = `overlay-${token}`;
+function assertAcceptedPlanAdmissionChecksProtocolShapeOnly(): void {
+  const token = randomSmokeToken('accepted-admission');
   const taskId = `task-${token}`;
-  const overlay = new AcceptedPlanScopeDecisionOverlay({
-    planAcceptedAutoGrantCapability: (capability) => capability === 'fs.delete',
-    concreteDirectoryOperationTarget: (value) => value.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, ''),
-    concreteFileOperationTarget: (value) => value.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, ''),
-    normalizeAcceptedPlanExactOperationGrants: (grants) => grants,
-    normalizeTargetForExecutionRoot: (value) => value.replace(/\\/g, '/').replace(/^\.\//, ''),
-  });
-  const accepted: AcceptedImplementationPlanContext = {
-    planId: `plan-${token}`,
-    runId: `run-${token}`,
-    tasks: [
-      {
-        taskId,
-        title: `Task ${token}`,
-        capability: 'fs.delete',
-        targets: [],
-        dependencies: [],
-        conflictKeys: [],
-      },
-    ],
-    capabilities: ['fs.delete'],
-    targetScopes: [],
-    exactOperationGrants: [],
-    accessScopes: [],
-    batchIndex: 1,
-    completedTaskIds: [],
-    rawPlan: {},
-  };
-  const next = overlay.apply(accepted, {
-    kind: 'expandCurrentTaskScope',
-    taskId,
-    targetPath: `./${targetDir}/`,
-    targetResourceKind: 'directory',
-    recursive: true,
-  });
-  assertEqual(next.tasks[0]?.targets[0], targetDir, 'scope decision overlay adds target to current task');
-  assertEqual(next.targetScopes[0], targetDir, 'scope decision overlay adds target scope');
-  assertEqual(next.exactOperationGrants[0]?.targetPath, targetDir, 'scope decision overlay adds exact grant');
-  assertEqual(next.exactOperationGrants[0]?.targetResourceKind, 'directory', 'scope decision overlay preserves directory target kind');
-  assert(
-    overlay.resumeGuidance({ kind: 'continueCurrentTask', taskId }).includes('current accepted task'),
-    'scope decision overlay resume guidance stays on current task'
-  );
-}
-
-async function assertAcceptedPlanScopeRepairCoordinatorRepairsProposal(): Promise<void> {
-  const token = randomSmokeToken('scope-repair');
-  const sessionId = `session-${token}`;
-  const runId = `run-${token}`;
-  const repairBuilder = new ProviderRepairMessageBuilder();
-  const coordinator = new AcceptedPlanScopeRepairCoordinator({
-    repairMessageBuilder: repairBuilder,
-    contextFrameBuilder: new ContextFrameBuilder(),
-    repairState: (state) => ({
-      runId: state.runId,
-      userRequest: state.userRequest,
-      conversationRoots: [],
-      resourcePackets: [],
-      implementationBatch: {},
-      acceptedContext: {
-        planId: `plan-${token}`,
-        currentTask: `task-${token}`,
-      },
-    }),
-    createId: (prefix) => `${prefix}-${token}`,
-    parseError: (error) => error instanceof Error
-      ? { code: 'error', message: error.message }
-      : { code: 'error', message: String(error) },
-    createError: (code, message) => Object.assign(new Error(message), { code }),
-    parseRepairedProposal: ({ raw, state, allowedKinds }) => {
-      assert(
-        allowedKinds.includes('actionBundle') && allowedKinds.includes('resourceRequest') && allowedKinds.includes('decisionRequest'),
-        'accepted plan scope repair coordinator preserves scope repair allowed kinds'
-      );
-      return parseProposalEnvelope({
-        raw,
-        runId: state.runId,
-        sessionId: state.sessionId,
-        source: 'llm',
-      });
-    },
-  });
-  const prompt = smokePromptEnvelope(`stable-${token}`);
-  const state = {
-    sessionId,
-    runId,
-    userRequest: `request-${token}`,
-  };
-  let observedStage = '';
-  let observedMessages: LlmChatRequest['messages'] = [];
-  const proposal = await coordinator.repair({
-    state,
-    prompt,
-    proposal: {
-      schemaVersion: 'deepcode.agent.protocol.v3',
-      proposalId: `proposal-${token}`,
-      runId,
-      sessionId,
-      source: 'llm',
-      kind: 'actionBundle',
-      payload: {
-        actionBundle: {
-          version: '1',
-          id: `bundle-${token}`,
-          actions: [],
-        },
-      },
-    } as ProposalEnvelope,
-    validation: {
-      ok: false,
-      reasons: [`scope-${token}`],
-    },
-    runRepair: async (stage, messages) => {
-      observedStage = stage;
-      observedMessages = messages;
-      return JSON.stringify({
-        schemaVersion: 'deepcode.agent.protocol.v3',
-        kind: 'diagnostic',
-        proposalId: `diagnostic-${token}`,
-        diagnostic: {
-          summary: `summary-${token}`,
-        },
-      });
-    },
-  });
-  assertEqual(observedStage, 'accepted_plan_scope_repair', 'accepted plan scope repair coordinator uses stable repair stage');
-  assertEqual(observedMessages[0]?.role, 'system', 'accepted plan scope repair coordinator sends system repair contract');
-  const scopeRepairPrompt = observedMessages.find((message) => message.role === 'user')?.content ?? '';
-  assert(
-    scopeRepairPrompt.includes('ProviderTurnContract:') && scopeRepairPrompt.includes('"turnMode": "scopeIntervention"'),
-    'accepted plan scope repair coordinator renders side-call ProviderTurnContract'
-  );
-  assertEqual(
-    (state as { modelContextBundle?: { providerTurnContract?: { turnMode?: string } } }).modelContextBundle?.providerTurnContract?.turnMode,
-    'scopeIntervention',
-    'accepted plan scope repair coordinator stores ModelContextBundle on state'
-  );
-  assertEqual(proposal.kind, 'diagnostic', 'accepted plan scope repair coordinator parses repaired proposal');
-}
-
-async function assertAcceptedPlanScopeDecisionCoordinatorBuildsWaitingEvents(): Promise<void> {
-  const token = randomSmokeToken('scope-decision');
-  const sessionId = `session-${token}`;
-  const runId = `run-${token}`;
-  const requirementId = `requirement-${token}`;
-  const state = {
-    sessionId,
-    runId,
-    phase: 'executing_accepted_plan' as const,
-  };
-  const proposal = {
-    schemaVersion: 'deepcode.agent.protocol.v3',
-    proposalId: `proposal-${token}`,
-    runId,
-    sessionId,
-    source: 'llm',
-    kind: 'decisionRequest',
-    payload: {
-      question: `question-${token}`,
-      options: [
-        { id: `option-a-${token}`, label: `option-a-${token}` },
-        { id: `option-b-${token}`, label: `option-b-${token}` },
-      ],
-    },
-  } as ProposalEnvelope;
-  let observedOverlayParentPhase = '';
-  let appendedSessionId = '';
-  let appendedEvents: AgentEvent[] = [];
-  const coordinator = new AcceptedPlanScopeDecisionCoordinator<typeof state>({
-    now: () => `ts-${token}`,
-    createId: (prefix) => `${prefix}-${token}`,
-    visibleLanguageForRequest: () => 'en-US',
-    requirementPipeline: {
-      requirementRecordFromProposal: ({ runId: nextRunId, proposal: nextProposal, userRequest }) => {
-        assertEqual(nextRunId, runId, 'scope decision coordinator passes run state');
-        assertEqual(nextProposal.proposalId, proposal.proposalId, 'scope decision coordinator passes proposal');
-        assertEqual(userRequest, `request-${token}`, 'scope decision coordinator passes user request');
-        return {
-          requirementId,
-          sessionId,
-          initialUserRequest: userRequest,
-          status: 'probing',
-          createdAt: `ts-${token}`,
-          updatedAt: `ts-${token}`,
-        };
-      },
-    },
-    interactionOverlayCodec: {
-      toPayload: (overlay) => {
-        observedOverlayParentPhase = overlay.parentPhase;
-        return {
-          interactionOverlay: true,
-          parentRunId: overlay.parentRunId,
-          parentPhase: overlay.parentPhase,
-          interactionRunId: overlay.interactionRunId,
-          interactionId: overlay.interactionId,
-          sourceInteractionId: overlay.sourceInteractionId,
-        };
-      },
-    },
-    requirementProjection: {
-      confirmationEvent: ({ sessionId: nextSessionId, requirement, interactionOverlayPayload }) => ({
-        id: `confirmation-${token}`,
-        sessionId: nextSessionId,
-        ts: `ts-${token}`,
-        kind: 'requirement_confirmation',
-        payload: {
-          requirementId: requirement.requirementId,
-          ...interactionOverlayPayload,
-        },
-      }),
-    },
-    progressProjection: {
-      sessionRunStateEvent: ({ sessionId: nextSessionId, phase, decisionOwner, interactionOverlay }) => ({
-        id: `run-state-${token}`,
-        sessionId: nextSessionId,
-        ts: `ts-${token}`,
-        kind: 'session_run_state',
-        payload: {
-          phase,
-          requirementId: decisionOwner.requirementId,
-          parentPhase: interactionOverlay?.parentPhase,
-        },
-      }),
-    },
-    append: async (nextSessionId, events) => {
-      appendedSessionId = nextSessionId;
-      appendedEvents = events;
-      return {
-        session: {
-          id: nextSessionId,
-          mode: 'plan',
-          createdAt: `ts-${token}`,
-          updatedAt: `ts-${token}`,
-        },
-        events,
-      };
-    },
-  });
-
-  const result = await coordinator.waitForDecision({
-    state,
-    proposal,
-    request: {
-      content: `request-${token}`,
-      attachments: [],
-    },
-  });
-
-  assertEqual(state.phase, 'waiting_permission', 'scope decision coordinator moves state to waiting permission');
-  assertEqual(observedOverlayParentPhase, 'executing_accepted_plan', 'scope decision coordinator keeps execution parent phase');
-  assertEqual(appendedSessionId, sessionId, 'scope decision coordinator appends to current session');
-  assertEqual(appendedEvents.length, 2, 'scope decision coordinator appends confirmation and run-state events');
-  assertEqual(appendedEvents[0]?.kind, 'requirement_confirmation', 'scope decision coordinator appends confirmation first');
-  assertEqual(appendedEvents[1]?.kind, 'session_run_state', 'scope decision coordinator appends run-state second');
-  assertEqual(result.events.length, 2, 'scope decision coordinator returns append result');
-}
-
-async function assertAcceptedPlanScopeDecisionCoordinatorBuildsOutOfScopeIntervention(): Promise<void> {
-  const token = randomSmokeToken('scope-out-of-scope');
-  const sessionId = `session-${token}`;
-  const runId = `run-${token}`;
-  const taskId = `task-${token}`;
-  const targetPath = `target-${token}`;
-  const state = {
-    sessionId,
-    runId,
-    phase: 'executing_accepted_plan' as const,
-  };
-  const sourceProposal = {
-    schemaVersion: 'deepcode.agent.protocol.v3',
-    proposalId: `proposal-${token}`,
-    runId,
-    sessionId,
-    source: 'llm',
-    kind: 'actionBundle',
-    payload: {
-      actionBundle: {
-        version: '1',
-        id: `batch-${token}`,
-        goal: `goal-${token}`,
-        actions: [],
-      },
-    },
-  } as ProposalEnvelope;
-  let observedDecisionPayload: Record<string, unknown> | undefined;
-  const coordinator = new AcceptedPlanScopeDecisionCoordinator<typeof state>({
-    now: () => `ts-${token}`,
-    createId: (prefix) => `${prefix}-${token}`,
-    visibleLanguageForRequest: () => 'en-US',
-    requirementPipeline: {
-      requirementRecordFromProposal: ({ proposal }) => {
-        assertEqual(proposal.kind, 'decisionRequest', 'out-of-scope intervention creates decision request proposal');
-        observedDecisionPayload = proposal.payload as Record<string, unknown>;
-        return {
-          requirementId: `requirement-${token}`,
-          sessionId,
-          initialUserRequest: `request-${token}`,
-          status: 'probing',
-          createdAt: `ts-${token}`,
-          updatedAt: `ts-${token}`,
-        };
-      },
-    },
-    interactionOverlayCodec: {
-      toPayload: (overlay) => ({ parentPhase: overlay.parentPhase }),
-    },
-    requirementProjection: {
-      confirmationEvent: ({ sessionId: nextSessionId, requirement }) => ({
-        id: `confirmation-${token}`,
-        sessionId: nextSessionId,
-        ts: `ts-${token}`,
-        kind: 'requirement_confirmation',
-        payload: { requirementId: requirement.requirementId },
-      }),
-    },
-    progressProjection: {
-      sessionRunStateEvent: ({ sessionId: nextSessionId, phase }) => ({
-        id: `run-state-${token}`,
-        sessionId: nextSessionId,
-        ts: `ts-${token}`,
-        kind: 'session_run_state',
-        payload: { phase },
-      }),
-    },
-    append: async (nextSessionId, events) => ({
-      session: {
-        id: nextSessionId,
-        mode: 'plan',
-        createdAt: `ts-${token}`,
-        updatedAt: `ts-${token}`,
-      },
-      events,
-    }),
-  });
-
-  await coordinator.waitForOutOfScopeDecision({
-    state,
-    proposal: sourceProposal,
-    validation: {
-      ok: false,
-      reasons: [`reason-${token}`],
-      issues: [{
-        code: 'targetOutOfScope',
-        message: `message-${token}`,
-        targetPath: `${targetPath}/`,
-        targetResourceKind: 'directory',
-        recursive: true,
-      }],
-    },
-    request: {
-      content: `request-${token}`,
-      attachments: [],
-    },
-    intervention: {
-      userRequest: `request-${token}`,
-      acceptedPlan: {
-        planId: `plan-${token}`,
-        runId,
-        tasks: [{
-          taskId,
-          title: `title-${token}`,
-          capability: 'fs.delete',
-          targets: [],
-          dependencies: [],
-          conflictKeys: [],
-        }],
-        capabilities: ['fs.delete'],
-        targetScopes: [],
-        exactOperationGrants: [],
-        accessScopes: [],
-        batchIndex: 1,
-        completedTaskIds: [],
-        rawPlan: {},
-      },
-      currentTaskId: taskId,
-    },
-  });
-
-  const options = observedDecisionPayload?.options as Array<{
-    labelKey?: string;
-    descriptionKey?: string;
-    messageArgs?: Record<string, string>;
-    effect?: { kind?: string; targetPath?: string; recursive?: boolean };
-  }> | undefined;
-  const expansionOption = options?.find((option) => option.effect?.kind === 'expandCurrentTaskScope');
-  const expansion = expansionOption?.effect;
-  assertEqual(state.phase, 'waiting_permission', 'out-of-scope intervention waits for permission');
-  assertEqual(expansion?.targetPath, targetPath, 'out-of-scope intervention normalizes target path');
-  assertEqual(expansion?.recursive, true, 'out-of-scope intervention preserves directory recursion');
-  assertEqual(expansionOption?.labelKey, 'session.driver.acceptedPlanScope.option.expand.label', 'out-of-scope intervention exposes option label i18n key');
-  assertEqual(expansionOption?.descriptionKey, 'session.driver.acceptedPlanScope.option.expand.description', 'out-of-scope intervention exposes option description i18n key');
-  assertEqual(expansionOption?.messageArgs?.targetPath, targetPath, 'out-of-scope intervention exposes target path as i18n arg');
-}
-
-async function assertAcceptedPlanScopeResourceFollowupCoordinatorHandlesResourceRequests(): Promise<void> {
-  const token = randomSmokeToken('scope-followup');
-  const sessionId = `session-${token}`;
-  const runId = `run-${token}`;
-  const manifest: ResourceManifest = {
-    id: `manifest-${token}`,
-    workspaceScopeKey: `workspace-${token}`,
-    entries: [],
-    budget: { maxEntries: 16, maxBytes: 4096 },
-    defaultDenyPatterns: [],
-  };
-  const request: ResourceRequestDraft = {
-    version: '1',
-    id: `request-${token}`,
-    reason: `reason-${token}`,
-    items: [{ id: `item-${token}`, path: `generated-${token}.txt`, reason: `item-reason-${token}` }],
-  };
-  const packet = {
-    id: `packet-${token}`,
-    workspaceScopeKey: `workspace-${token}`,
-    requestId: `request-${token}`,
-    items: [],
-  } as ResourcePacket;
-  const initialResult = { events: [{ id: `initial-${token}` }] } as AgentSessionResult;
-  const appendedResult = { events: [{ id: `appended-${token}` }] } as AgentSessionResult;
-  const state = {
-    sessionId,
-    runId,
-    workspaceScopeKey: `workspace-${token}`,
-    manifest,
-    conversationRoots: [],
-    resourcePackets: [],
-    generatedArtifactEvidence: new Map(),
-  };
-  const acceptedPlan = { id: `accepted-${token}` };
-  const proposal = {
-    schemaVersion: 'deepcode.agent.protocol.v3',
-    proposalId: `proposal-${token}`,
-    runId,
-    sessionId,
-    source: 'llm',
-    kind: 'actionBundle',
-    payload: {},
-  } as ProposalEnvelope;
-  let followupGuidance = '';
-  const coordinator = new AcceptedPlanScopeResourceFollowupCoordinator<typeof state, typeof acceptedPlan>({
-    generatedEvidence: {
-      packetForRequest: () => ({ packet, remaining: { version: '1', id: `remaining-${token}`, reason: `remaining-${token}`, items: [] } }),
-    },
-    resolver: {
-      resolve: () => ({ manifest: { ...manifest, id: `subset-${token}` }, unresolved: [], ambiguous: [], availableRoots: [] }),
-    },
-    resourceLoop: {
-      resolutionDiagnostic: () => ({ fallback: `diagnostic-${token}` }),
-    },
-    orchestrator: {
-      recordAndAppend: async (_state, nextPacket, eventIdPrefix) => {
-        assertEqual(nextPacket.id, packet.id, 'scope follow-up records generated packet');
-        assertEqual(eventIdPrefix, 'accepted-plan-repair-generated-resource-context', 'scope follow-up uses stable generated resource event prefix');
-        return { result: appendedResult };
-      },
-      resolveRecordAndAppend: async () => {
-        throw new Error('generated scope follow-up should not resolve an empty remaining manifest');
-      },
-    },
-    createId: (prefix) => `${prefix}-${token}`,
-    appendFailure: async () => {
-      throw new Error('generated scope follow-up should not append a failure');
-    },
-    followupRequest: ({ guidance }) => {
-      followupGuidance = guidance;
-      return `followup-${token}`;
-    },
-  });
-  const resume = await coordinator.handle({
-    state,
-    acceptedPlan,
-    proposal,
-    request,
-    result: initialResult,
-  });
-  assertEqual(resume.kind, 'resume', 'scope follow-up resumes after generated evidence');
-  if (resume.kind === 'resume') {
-    assertEqual(resume.result, appendedResult, 'scope follow-up returns latest appended result');
-    assertEqual(resume.content, `followup-${token}`, 'scope follow-up returns follow-up content');
-  }
-  assert(followupGuidance.includes('same accepted taskPlan cursor'), 'scope follow-up includes execution resume guidance');
-
-  let failureDetail = '';
-  const failureResult = { events: [{ id: `failure-${token}` }] } as AgentSessionResult;
-  const failureCoordinator = new AcceptedPlanScopeResourceFollowupCoordinator<typeof state, typeof acceptedPlan>({
-    generatedEvidence: {
-      packetForRequest: () => ({ remaining: request }),
-    },
-    resolver: {
-      resolve: () => ({ manifest: { ...manifest, id: `empty-${token}` }, unresolved: [`missing-${token}`], ambiguous: [], availableRoots: [] }),
-    },
-    resourceLoop: {
-      resolutionDiagnostic: () => ({ fallback: `missing-${token}` }),
-    },
-    orchestrator: {
-      recordAndAppend: async () => {
-        throw new Error('unresolved scope follow-up should not record packets');
-      },
-      resolveRecordAndAppend: async () => {
-        throw new Error('unresolved scope follow-up should not resolve packets');
-      },
-    },
-    createId: (prefix) => `${prefix}-${token}`,
-    appendFailure: async ({ detail }) => {
-      failureDetail = detail;
-      return failureResult;
-    },
-    followupRequest: () => `unused-${token}`,
-  });
-  const failed = await failureCoordinator.handle({
-    state,
-    acceptedPlan,
-    proposal,
-    request,
-    result: initialResult,
-  });
-  assertEqual(failed.kind, 'failed', 'scope follow-up fails when resource request remains unresolved');
-  assertEqual(failureDetail, `missing-${token}`, 'scope follow-up failure passes resource diagnostic detail');
-}
-
-function assertAcceptedPlanOperationTargetResolverFindsExactGrant(): void {
-  const token = randomSmokeToken('operation-target');
-  const directoryTarget = `dir-${token}`;
-  const fileTarget = `file-${token}.txt`;
-  const resolver = new AcceptedPlanOperationTargetResolver({
-    normalizeTargetScope: (value) => value.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, ''),
-    normalizePlanScope: (value) => value.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, ''),
-    concreteDirectoryOperationTarget: (value) => value && !value.includes('*') ? value : undefined,
-    concreteFileOperationTarget: (value) => value && !value.endsWith('/') && !value.includes('*') ? value : undefined,
-    exactGrantCapabilityMatches: (grant, capability) =>
-      grant.capability === capability || (capability === 'fs.delete' && grant.operation === 'delete'),
-    actionEffectiveCapability: (action) => typeof action.capability === 'string'
-      ? action.capability
-      : typeof action.toolId === 'string'
-        ? action.toolId
-        : '',
-    actionFileTargetPath: (action) => typeof action.targetPath === 'string' ? action.targetPath : undefined,
-  });
-  const accepted: AcceptedImplementationPlanContext = {
-    planId: `plan-${token}`,
-    runId: `run-${token}`,
-    tasks: [],
-    capabilities: ['fs.delete', 'fs.write'],
-    targetScopes: [],
-    exactOperationGrants: [
-      {
-        operation: 'delete',
-        targetPath: directoryTarget,
-        targetResourceKind: 'directory',
-        capability: 'fs.delete',
-        source: 'implementationPlan',
-      },
-    ],
-    accessScopes: [],
-    batchIndex: 1,
-    completedTaskIds: [],
-    rawPlan: {},
-  };
-  const action = {
-    toolId: 'fs.delete',
-    targetPath: `./${directoryTarget}/`,
-  };
-  const grant = resolver.exactGrantForAction(action, accepted);
-  assertEqual(grant?.targetPath, directoryTarget, 'operation target resolver finds exact grant');
-  assertEqual(
-    resolver.concreteDeleteTarget(action.targetPath, accepted, grant),
-    directoryTarget,
-    'operation target resolver preserves directory delete target'
-  );
-  assertEqual(
-    resolver.concreteFileTarget(`./${fileTarget}`, accepted),
-    fileTarget,
-    'operation target resolver normalizes file target'
-  );
-}
-
-function assertAcceptedPlanExecutorBuildsExecutionBatch(): void {
-  const token = randomSmokeToken('executor');
-  const target = `generated-${token}.txt`;
-  const blockId = `block-${token}`;
-  const normalize = (value: string): string => value.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, '');
-  const actionInspector = new ActionBundleActionInspector();
-  const scopeMatcher = new AcceptedPlanScopeMatcher();
-  const scopeCoverage = new AcceptedPlanScopeCoverage({
-    taskTargets: (record) => Array.isArray(record.targets)
-      ? record.targets.filter((item): item is string => typeof item === 'string')
-      : [],
-  });
-  const resolver = new AcceptedPlanOperationTargetResolver({
-    normalizeTargetScope: normalize,
-    normalizePlanScope: normalize,
-    concreteDirectoryOperationTarget: (value) => value && !value.includes('*') ? normalize(value) : undefined,
-    concreteFileOperationTarget: (value) => value && !value.endsWith('/') && !value.includes('*') ? normalize(value) : undefined,
-    exactGrantCapabilityMatches: (grant, capability) => grant.capability === capability,
-    actionEffectiveCapability: (action) => actionInspector.actionEffectiveCapability(action),
-    actionFileTargetPath: (action) => actionInspector.actionFileTargetPath(action),
-  });
-  const executor = new AcceptedPlanExecutor({
-    readActionBundle: (proposal) => (proposal.payload as Record<string, any>).actionBundle as ActionBundleDraft,
-    operationTargetResolver: resolver,
-    actionFileTargetPath: (action) => actionInspector.actionFileTargetPath(action),
-    fileTargetRefFromPath: (path) => ({ path }),
-    deleteActionTargetResourceKind: (action) => actionInspector.deleteActionTargetResourceKind(action),
-    deleteActionRecursive: (action) => actionInspector.deleteActionRecursive(action),
-    containsDirectoryPath: () => false,
-    kernelExecutionContractId: (report) => typeof report?.contractId === 'string' ? report.contractId : undefined,
-    proposalTargetScopes: (proposal, accepted) =>
-      scopeMatcher.proposalTargetScopes(proposal, accepted).map((scope) => scope.normalized),
-    actionTargetScopes: (action, proposal, accepted) =>
-      scopeMatcher.actionTargetScopes(action, proposal)
-        .map((scope) => scopeMatcher.normalizeTargetScope(scope, accepted))
-        .filter(Boolean),
-    scopeCoveredForCapability: (scope, capability, accepted) =>
-      scopeCoverage.scopeCoveredForCapability(scope, capability, accepted),
-    resourceEvidenceIndex: new ResourceEvidenceIndex({ normalizeTarget: normalize }),
-  });
-  const acceptedPlan: AcceptedImplementationPlanContext = {
+  const accepted: AcceptedTaskPlanContext = {
     planId: `plan-${token}`,
     runId: `run-${token}`,
     tasks: [{
-      taskId: `task-${token}`,
-      title: 'Generic write task',
-      targets: [target],
-      capability: 'fs.write',
+      taskId,
+      toolId: `tool-${token}`,
+      targets: [`target-${token}`],
       dependencies: [],
+      planningArgs: {},
       conflictKeys: [],
     }],
-    capabilities: ['fs.write'],
-    targetScopes: [target],
-    exactOperationGrants: [{
-      operation: 'write',
-      targetPath: target,
-      targetResourceKind: 'file',
-      capability: 'fs.write',
-      source: 'implementationPlan',
-    }],
-    accessScopes: [],
+    authorizationOperations: [],
+    toolIds: [`tool-${token}`],
+    targetScopes: [`target-${token}`],
     batchIndex: 1,
     completedTaskIds: [],
-    rawPlan: { id: `plan-${token}` },
+    dependencyFacts: [],
+    rawPlan: {},
   };
-  const sessionId = `session-${token}`;
-  const proposal = {
-    schemaVersion: 'deepcode.agent.protocol.v3',
+  const admission = new AcceptedPlanAdmission();
+  const structurallyValid = admission.validate(accepted, {
+    schemaVersion: 'deepcode.agent.protocol.v4',
     proposalId: `proposal-${token}`,
-    runId: acceptedPlan.runId,
-    sessionId,
+    runId: accepted.runId,
+    sessionId: `session-${token}`,
     source: 'llm',
     kind: 'actionBundle',
     payload: {
-      userPlan: 'Generic accepted execution batch.',
       actionBundle: {
-        version: '1',
-        id: `bundle-${token}`,
-        goal: 'Generic accepted execution batch',
-        accessScopes: [{ path: target }, { path: `${target}/*` }],
         actions: [{
           actionId: `action-${token}`,
-          capability: 'fs.write',
-          kind: 'write',
-          targetPath: `./${target}`,
-          sourceBlockId: blockId,
-          accessScopes: [{ path: target }, { path: '../outside' }],
+          toolId: `unregistered-${token}`,
+          args: { path: `../candidate-${token}` },
         }],
       },
-      codeBlocks: [{
-        id: blockId,
-        targetPath: `./${target}`,
-        content: 'generic content',
-      }],
-      commandBlocks: [],
+    },
+    referencedResourcePacketRefs: [],
+    referencedEvidenceRefs: [],
+  } as ProposalEnvelope);
+  assertEqual(structurallyValid.ok, true, 'Session admission does not decide tool legality, path scope, or permission risk');
+
+  const malformed = admission.validate(accepted, {
+    schemaVersion: 'deepcode.agent.protocol.v4',
+    proposalId: `malformed-${token}`,
+    runId: accepted.runId,
+    sessionId: `session-${token}`,
+    source: 'llm',
+    kind: 'actionBundle',
+    payload: {
+      actionBundle: {
+        actions: [{ actionId: `action-${token}`, toolId: `tool-${token}` }],
+      },
+    },
+    referencedResourcePacketRefs: [],
+    referencedEvidenceRefs: [],
+  } as ProposalEnvelope);
+  assertEqual(malformed.ok, false, 'Session admission rejects malformed protocol structure');
+  assertEqual(malformed.issues?.[0]?.code, 'protocolShapeInvalid', 'Session admission reports only protocol-shape failure');
+}
+
+function assertAcceptedTaskRegistryUsesTaskIntentOnly(): void {
+  const token = randomSmokeToken('task-registry-intent');
+  const currentTaskId = `current-${token}`;
+  const currentTarget = `target-${token}`;
+  const accepted: AcceptedTaskPlanContext = {
+    planId: `plan-${token}`,
+    planHash: `plan-hash-${token}`,
+    authorizationContractId: `authorization-${token}`,
+    authorizationContractHash: `authorization-hash-${token}`,
+    runId: `run-${token}`,
+    tasks: [
+      { taskId: `completed-${token}`, toolId: 'fs.read', targets: [`completed-${token}`], dependencies: [], planningArgs: {}, conflictKeys: [] },
+      { taskId: `sufficient-${token}`, toolId: 'fs.list', targets: [`sufficient-${token}`], dependencies: [], planningArgs: {}, conflictKeys: [] },
+      { taskId: currentTaskId, toolId: `tool-${token}`, targets: [currentTarget], dependencies: [], planningArgs: {}, conflictKeys: [] },
+    ],
+    authorizationOperations: [],
+    toolIds: ['fs.read', 'fs.list', `tool-${token}`],
+    targetScopes: [currentTarget],
+    batchIndex: 1,
+    completedTaskIds: [`completed-${token}`],
+    modelJudgedSufficientTaskIds: [`sufficient-${token}`],
+    dependencyFacts: [],
+    rawPlan: {},
+  };
+  const registry = new AcceptedTaskRegistry(accepted);
+  const cursor = registry.cursor([]);
+  const context = registry.currentTaskContext(cursor);
+  assertEqual(cursor?.currentTaskId, currentTaskId, 'task registry advances using task completion state');
+  assertEqual(context?.targets[0], currentTarget, 'task registry exposes the accepted task target intent');
+  assertEqual(context?.toolIds[0], `tool-${token}`, 'task registry exposes the accepted task tool intent without grants');
+  assertEqual('accessScopes' in accepted, false, 'task registry input carries no Session permission scope');
+}
+
+
+function assertAcceptedPlanExecutorBuildsExecutionBatch(): void {
+  const token = randomSmokeToken("executor-v4");
+  const target = "generated-" + token + ".txt";
+  const blockId = "block-" + token;
+  const executor = new AcceptedPlanExecutor({
+    readActionBundle: (proposal) => (proposal.payload as Record<string, any>).actionBundle as ActionBundleDraft,
+    kernelExecutionContractId: (report) => typeof report?.contractId === "string" ? report.contractId : undefined,
+    kernelExecutionContractHash: (report) => typeof report?.contractHash === "string" ? report.contractHash : undefined,
+  });
+  const acceptedPlan: AcceptedTaskPlanContext = {
+    planId: "plan-" + token,
+    runId: "run-" + token,
+    tasks: [{ taskId: "task-" + token, title: "Write", targets: [target], toolId: "fs.write", dependencies: [], planningArgs: {}, conflictKeys: [] }],
+    authorizationOperations: [{
+      operationId: "plan-op-task-" + token + "-1",
+      sourceTaskId: "task-" + token,
+      toolId: "fs.write",
+      operationKind: "write",
+      contentMode: "contentBlock",
+      targets: [target],
+      dependsOn: [],
+      fixedArgs: {},
+      argsTemplate: { path: target, contentBlockId: "executionTime" },
+      targetResourceKind: "file",
+      recursive: false,
+      internal: false,
+    }],
+    toolIds: ["fs.write"],
+    targetScopes: [target],
+    batchIndex: 1,
+    completedTaskIds: [],
+    dependencyFacts: [],
+    rawPlan: { id: "plan-" + token },
+  };
+  const proposal = {
+    schemaVersion: "deepcode.agent.protocol.v4",
+    proposalId: "proposal-" + token,
+    runId: acceptedPlan.runId,
+    sessionId: "session-" + token,
+    source: "llm",
+    kind: "actionBundle",
+    payload: {
+      userPlan: "Generic accepted execution batch.",
+      actionBundle: {
+        id: "bundle-" + token,
+        goal: "Write generic output",
+        actions: [{
+          actionId: "action-" + token,
+          toolId: "fs.write",
+          args: { path: "./" + target, contentBlockId: blockId },
+          description: "Write generic output",
+          dependsOn: [],
+        }],
+      },
+      contentBlocks: [{ blockId, targetPath: "./" + target, operation: "overwrite", contentLines: ["generic content"] }],
     },
     referencedResourcePacketRefs: [],
     referencedEvidenceRefs: [],
   } as ProposalEnvelope;
   const plan = executor.executionContext({
-    sessionId,
+    sessionId: "session-" + token,
     runId: acceptedPlan.runId,
     acceptedPlan,
     proposal,
-    planReviewReport: { contractId: `contract-${token}` },
+    planReviewReport: { contractId: "contract-" + token, contractHash: "hash-" + token },
   });
-  assertEqual(plan.planId, acceptedPlan.planId, 'accepted plan executor builds execution context with accepted plan id');
   const normalized = executor.normalizeKernelBatch({ planId: acceptedPlan.planId, plan, acceptedPlan });
-  assertEqual(normalized.ok, true, 'accepted plan executor normalizes executable kernel batch');
-  if (!normalized.ok) throw new Error(normalized.reasons.join('; '));
+  assertEqual(normalized.ok, true, "accepted plan executor normalizes canonical v4 batch");
+  if (!normalized.ok) throw new Error(normalized.reasons.join("; "));
   const action = (normalized.batch.actionBundle.actions as Array<Record<string, any>>)[0];
-  const block = normalized.batch.codeBlocks[0] as Record<string, any>;
-  assertEqual(action.targetPath, target, 'accepted plan executor normalizes action target path');
-  assertEqual(action.resourceScope[0], target, 'accepted plan executor fills action resource scope');
-  assertEqual(action.targetRef.path, target, 'accepted plan executor fills targetRef path');
-  assertEqual(block.targetPath, target, 'accepted plan executor normalizes codeBlock target path');
-  assertEqual(normalized.batch.contractId, `contract-${token}`, 'accepted plan executor preserves kernel contract id');
-  const directoryTarget = `accepted-dir-${token}`;
-  const deleteAcceptedPlan: AcceptedImplementationPlanContext = {
-    planId: `delete-plan-${token}`,
-    runId: `delete-run-${token}`,
-    tasks: [{
-      taskId: `delete-task-${token}`,
-      title: 'Generic directory delete task',
-      targets: [directoryTarget],
-      capability: 'fs.delete',
-      dependencies: [],
-      conflictKeys: [],
-    }],
-    capabilities: ['fs.delete'],
-    targetScopes: [directoryTarget],
-    exactOperationGrants: [{
-      operation: 'delete',
-      targetPath: directoryTarget,
-      targetResourceKind: 'directory',
-      capability: 'fs.delete',
-      source: 'implementationPlan',
-      recursive: true,
-    }],
-    accessScopes: [],
-    batchIndex: 1,
-    completedTaskIds: [],
-    rawPlan: { id: `delete-plan-${token}` },
-  };
-  const deleteProposal = {
-    ...proposal,
-    proposalId: `delete-proposal-${token}`,
-    runId: deleteAcceptedPlan.runId,
-    payload: {
-      userPlan: 'Generic accepted directory delete batch.',
-      actionBundle: {
-        version: '1',
-        id: `delete-bundle-${token}`,
-        goal: 'Delete one accepted directory target.',
-        actions: [{
-          actionId: `delete-action-${token}`,
-          toolId: 'fs.delete',
-          args: { path: `./${directoryTarget}/` },
-        }],
-      },
-      codeBlocks: [],
-      commandBlocks: [],
-    },
-  } as ProposalEnvelope;
-  const deletePlan = executor.executionContext({
-    sessionId,
-    runId: deleteAcceptedPlan.runId,
-    acceptedPlan: deleteAcceptedPlan,
-    proposal: deleteProposal,
-    planReviewReport: { contractId: `delete-contract-${token}` },
-  });
-  const normalizedDelete = executor.normalizeKernelBatch({
-    planId: deleteAcceptedPlan.planId,
-    plan: deletePlan,
-    acceptedPlan: deleteAcceptedPlan,
-  });
-  assertEqual(normalizedDelete.ok, true, 'accepted plan executor normalizes toolId-only directory delete batch');
-  if (!normalizedDelete.ok) throw new Error(normalizedDelete.reasons.join('; '));
-  const deleteAction = (normalizedDelete.batch.actionBundle.actions as Array<Record<string, any>>)[0];
-  assertEqual(deleteAction.targetPath, directoryTarget, 'accepted plan executor normalizes directory delete action target');
-  assertEqual(deleteAction.targetKind, 'directory', 'accepted plan executor sets top-level directory target kind from grant');
-  assertEqual(deleteAction.recursive, true, 'accepted plan executor sets top-level recursive delete intent');
-  assertEqual(deleteAction.args?.targetKind, 'directory', 'accepted plan executor sets args directory target kind');
-  assertEqual(deleteAction.args?.recursive, true, 'accepted plan executor sets args recursive delete intent');
-  const processAcceptedPlan: AcceptedImplementationPlanContext = {
-    planId: `process-plan-${token}`,
-    runId: `process-run-${token}`,
-    tasks: [{
-      taskId: `process-task-${token}`,
-      title: 'Run accepted command task',
-      targets: [`script-${token}.sh`],
-      capability: 'process.exec',
-      dependencies: [],
-      conflictKeys: [],
-    }],
-    capabilities: ['process.exec'],
-    targetScopes: [`script-${token}.sh`],
-    exactOperationGrants: [],
-    accessScopes: [],
-    batchIndex: 1,
-    completedTaskIds: [],
-    rawPlan: { id: `process-plan-${token}` },
-  };
-  const processProposal = {
-    ...proposal,
-    proposalId: `process-proposal-${token}`,
-    runId: processAcceptedPlan.runId,
-    payload: {
-      userPlan: 'Generic accepted process batch.',
-      actionBundle: {
-        version: '1',
-        id: `process-bundle-${token}`,
-        goal: 'Run one accepted command.',
-        actions: [{
-          actionId: `process-action-${token}`,
-          toolId: 'process.exec',
-          args: { argv: ['bash', `script-${token}.sh`], cwd: '.', timeoutMs: 120000 },
-        }],
-      },
-      codeBlocks: [],
-      commandBlocks: [],
-    },
-  } as ProposalEnvelope;
-  const processPlan = executor.executionContext({
-    sessionId,
-    runId: processAcceptedPlan.runId,
-    acceptedPlan: processAcceptedPlan,
-    proposal: processProposal,
-    planReviewReport: { contractId: `process-contract-${token}` },
-  });
-  const normalizedProcess = executor.normalizeKernelBatch({
-    planId: processAcceptedPlan.planId,
-    plan: processPlan,
-    acceptedPlan: processAcceptedPlan,
-  });
-  assertEqual(normalizedProcess.ok, true, 'accepted plan executor normalizes typed process.exec args');
-  if (!normalizedProcess.ok) throw new Error(normalizedProcess.reasons.join('; '));
-  const processAction = (normalizedProcess.batch.actionBundle.actions as Array<Record<string, any>>)[0];
-  assertEqual(processAction.kind, 'command', 'accepted plan executor sets process action kind');
-  assertEqual(processAction.argv[0], 'bash', 'accepted plan executor promotes args.argv to Kernel action argv');
-  assertEqual(processAction.argv[1], `script-${token}.sh`, 'accepted plan executor preserves command argv target');
-  assertEqual(processAction.cwd, '.', 'accepted plan executor promotes args.cwd to Kernel action cwd');
-  assertEqual(processAction.timeoutMs, 120000, 'accepted plan executor promotes args.timeoutMs to Kernel action timeout');
-  const canonicalized = executor.canonicalizeAccessScopes(acceptedPlan, proposal);
-  assertEqual(canonicalized.changed, true, 'accepted plan executor removes unsafe access scopes');
-  assertEqual(canonicalized.actionTargets.includes(target), true, 'accepted plan executor preserves proposal action targets');
-  assertEqual(canonicalized.removedAccessScopes.length, 2, 'accepted plan executor reports removed access scopes');
-  const canonicalPayload = canonicalized.proposal.payload as Record<string, any>;
-  assertEqual(canonicalPayload.actionBundle.accessScopes.length, 1, 'accepted plan executor keeps valid top-level access scope');
-  assertEqual(canonicalPayload.actionBundle.actions[0].accessScopes.length, 1, 'accepted plan executor keeps valid action access scope');
-  const patchText = `line-${randomSmokeToken('patch')}`;
-  const patchProposal = {
-    ...proposal,
-    proposalId: `patch-proposal-${token}`,
-    payload: {
-      ...(proposal.payload as Record<string, unknown>),
-      actionBundle: {
-        version: '1',
-        id: `patch-bundle-${token}`,
-        goal: 'Generic accepted patch batch',
-        actions: [{
-          actionId: `patch-action-${token}`,
-          capability: 'fs.patch',
-          kind: 'patch',
-          targetPath: target,
-          replacementBlockId: blockId,
-          patchSpec: {
-            match: {
-              kind: 'exactBlock',
-              text: patchText,
-            },
-          },
-        }],
-      },
-      codeBlocks: [{
-        id: blockId,
-        targetPath: target,
-        operation: 'patch',
-        content: `replacement-${token}`,
-      }],
-    },
-  } as ProposalEnvelope;
-  const unrelatedPacket = createResourcePacket({
-    packetId: `packet-unrelated-${token}`,
-    manifest: {
-      id: `manifest-unrelated-${token}`,
-      workspaceScopeKey: `workspace-${token}`,
-      entries: [{
-        id: `entry-unrelated-${token}`,
-        kind: 'file',
-        label: `File unrelated-${token}`,
-        resourceRef: `unrelated-${token}.txt`,
-        readPolicy: 'autoRead',
-        reason: 'Unrelated evidence.',
-      }],
-      budget: { maxEntries: 4, maxBytes: 4096 },
-      defaultDenyPatterns: [],
-    },
-    request: {
-      id: `request-unrelated-${token}`,
-      items: [{ id: `item-unrelated-${token}`, manifestEntryId: `entry-unrelated-${token}`, reason: 'Read unrelated evidence.' }],
-    },
-    kernelEvidence: {
-      [`entry-unrelated-${token}`]: {
-        contentKind: 'fileText',
-        promptContent: `unrelated-${token}`,
-        evidenceRefs: [`evidence-unrelated-${token}`],
-      },
-    },
-  });
-  const missingFreshness = executor.fileOperationFreshnessValidationReasons(acceptedPlan, patchProposal, [unrelatedPacket]);
-  assertEqual(missingFreshness.length, 1, 'accepted plan executor reports missing patch freshness evidence');
-  assert(
-    missingFreshness[0]?.includes(target),
-    'accepted plan executor includes normalized target in freshness reason'
-  );
-  const matchingPacket = createResourcePacket({
-    packetId: `packet-matching-${token}`,
-    manifest: {
-      id: `manifest-matching-${token}`,
-      workspaceScopeKey: `workspace-${token}`,
-      entries: [{
-        id: `entry-matching-${token}`,
-        kind: 'file',
-        label: `File ${target}`,
-        resourceRef: target,
-        readPolicy: 'autoRead',
-        reason: 'Matching evidence.',
-      }],
-      budget: { maxEntries: 4, maxBytes: 4096 },
-      defaultDenyPatterns: [],
-    },
-    request: {
-      id: `request-matching-${token}`,
-      items: [{ id: `item-matching-${token}`, manifestEntryId: `entry-matching-${token}`, reason: 'Read matching evidence.' }],
-    },
-    kernelEvidence: {
-      [`entry-matching-${token}`]: {
-        contentKind: 'fileText',
-        promptContent: `prefix\n${patchText}\nsuffix`,
-        evidenceRefs: [`evidence-matching-${token}`],
-      },
-    },
-  });
-  assertEqual(
-    executor.fileOperationFreshnessValidationReasons(acceptedPlan, patchProposal, [matchingPacket]).length,
-    0,
-    'accepted plan executor accepts patch when current evidence contains exact block'
-  );
+  assertEqual(action.args.path, "./" + target, "accepted plan executor preserves Kernel-bound typed args without local path policy");
+  assertEqual(action.contentBlockId, undefined, "accepted plan executor does not reintroduce top-level content block aliases");
+  assertEqual((normalized.batch.contentBlocks[0] as any).targetPath, "./" + target, "accepted plan executor preserves canonical content block target");
+  assertEqual(normalized.batch.contractId, "contract-" + token, "accepted plan executor preserves Kernel contract id");
+  assertEqual(normalized.batch.contractHash, "hash-" + token, "accepted plan executor preserves Kernel contract hash");
 }
 
 async function assertAcceptedActionBundlePlanExecutorSubmitsBatchAndReviews(): Promise<void> {
@@ -4782,7 +3970,7 @@ async function assertAcceptedActionBundlePlanExecutorSubmitsBatchAndReviews(): P
       return { session: { ...session, eventCount: store.length }, events: [...store] };
     },
     kernelExecutionContractId: () => `contract-${token}`,
-    temporaryGrantsForPlan: () => [],
+    kernelExecutionContractHash: () => `contract-hash-${token}`,
     recentResourcePackets: () => [],
     sessionRunStateEvent: (input) => ({
       id: `run-state-${token}`,
@@ -4798,7 +3986,6 @@ async function assertAcceptedActionBundlePlanExecutorSubmitsBatchAndReviews(): P
       kind: 'workflow_stage',
       payload: { stage: 'accepted_plan.action_batch_preflight', batch },
     } as AgentEvent),
-    planActionBundlePreflightFailureEvents: () => [],
     planActionBundleExecutionFailureEvents: () => [],
     planActionBundleExecutionExceptionEvents: () => [],
     acceptedPlanBatchCheckpointEvent: () => {
@@ -4807,9 +3994,8 @@ async function assertAcceptedActionBundlePlanExecutorSubmitsBatchAndReviews(): P
     acceptedPlanTaskSavepointEvent: () => {
       throw new Error('overlay savepoint is not expected for non-overlay execution');
     },
-    deletePreflightReasons: () => [],
     planProposal: () => ({
-      schemaVersion: 'deepcode.agent.protocol.v3',
+      schemaVersion: 'deepcode.agent.protocol.v4',
       proposalId: `proposal-${token}`,
       runId,
       sessionId,
@@ -4848,7 +4034,7 @@ async function assertAcceptedActionBundlePlanExecutorSubmitsBatchAndReviews(): P
         args: { path: `target-${token}.txt`, content: token },
       }],
     },
-    codeBlocks: [],
+    contentBlocks: [],
     commandBlocks: [],
     planReviewReport: {},
   } as any;
@@ -4863,8 +4049,8 @@ async function assertAcceptedActionBundlePlanExecutorSubmitsBatchAndReviews(): P
     { session, events: [...store] }
   );
 
-  assertEqual(commands[0], 'userDecisionSubmit', 'accepted action executor submits user decision first');
-  assertEqual(commands[1], 'actionBatchSubmit', 'accepted action executor submits action batch after decision');
+  assertEqual(commands.length, 1, 'accepted action executor does not request a second execution decision');
+  assertEqual(commands[0], 'actionBatchSubmit', 'accepted action executor submits the plan-authorized action batch directly');
   assertEqual(control.kind, 'assembleReview', 'accepted action executor returns Review assembly control');
   if (control.kind !== 'assembleReview') throw new Error('accepted action executor must request Review assembly');
   const reviewHandoffEvents = control.request.currentKernelEvents;
@@ -4902,9 +4088,9 @@ function assertKernelEventStatusIndexReadsStructuredEvents(): void {
       request: { id: permissionId },
     },
     {
-      kind: 'stage.changed',
+      kind: 'work_unit.blocked',
       runId,
-      phase: 'blocked',
+      workUnitId,
     },
   ];
   assert(index.workUnitIds(events).includes(workUnitId), 'kernel event status index reads work unit ids');
@@ -4934,8 +4120,7 @@ function assertKernelEventStatusIndexReadsStructuredEvents(): void {
         request: { id: `permission-${token}` },
       },
       {
-        kind: 'stage.changed',
-        phase: 'review',
+        kind: 'batch.review_ready',
       },
     ]),
     false,
@@ -5015,7 +4200,7 @@ async function assertAcceptedPlanReviewHandoffCoordinatorBuildsReviewState(): Pr
     planId,
     userPlan: `user-plan-${token}`,
     actionBundle: { id: `bundle-${token}` },
-    codeBlocks: [],
+    contentBlocks: [],
     commandBlocks: [],
     expectedValidation: `validation-${token}`,
     reviewGuide: `guide-${token}`,
@@ -5129,7 +4314,7 @@ function assertReviewAssemblerFormatsReviewFacts(): void {
   const assembler = new ReviewAssembler({
     completedWorkUnitFacts: () => ({ actionIds: new Set(), targets: new Set() }),
     batchActionRecords: () => [],
-    actionEffectiveCapability: () => '',
+    actionToolId: () => '',
     actionFileTargetPath: () => undefined,
     normalizeAcceptedPlanTargetScope: (target) => target,
     comparablePath: (value) => value,
@@ -5203,7 +4388,7 @@ function assertReviewAssemblerFindsWaitingReviewContext(): void {
   const assembler = new ReviewAssembler({
     completedWorkUnitFacts: () => ({ actionIds: new Set(), targets: new Set() }),
     batchActionRecords: () => [],
-    actionEffectiveCapability: () => '',
+    actionToolId: () => '',
     actionFileTargetPath: () => undefined,
     normalizeAcceptedPlanTargetScope: (target) => target,
     comparablePath: (value) => value,
@@ -5419,7 +4604,7 @@ async function assertReviewDecisionHandlerAcceptsTerminalReview(): Promise<void>
     reviewAssembler: new ReviewAssembler({
       completedWorkUnitFacts: () => ({ actionIds: new Set(), targets: new Set() }),
       batchActionRecords: () => [],
-      actionEffectiveCapability: () => '',
+      actionToolId: () => '',
       actionFileTargetPath: () => undefined,
       normalizeAcceptedPlanTargetScope: (target) => target,
       comparablePath: (value) => value,
@@ -5513,7 +4698,7 @@ async function assertReviewDecisionHandlerCompletesTerminalReviewWhenKernelRunIs
     reviewAssembler: new ReviewAssembler({
       completedWorkUnitFacts: () => ({ actionIds: new Set(), targets: new Set() }),
       batchActionRecords: () => [],
-      actionEffectiveCapability: () => '',
+      actionToolId: () => '',
       actionFileTargetPath: () => undefined,
       normalizeAcceptedPlanTargetScope: (target) => target,
       comparablePath: (value) => value,
@@ -5593,7 +4778,7 @@ async function assertPlanDecisionHandlerRejectsActivePlan(): Promise<void> {
       confirmable: true,
       content: `Plan ${token}`,
       actionBundle: { id: planId, version: '1', actions: [] },
-      codeBlocks: [],
+      contentBlocks: [],
       commandBlocks: [],
       expectedValidation: '',
       reviewGuide: '',
@@ -5608,6 +4793,28 @@ async function assertPlanDecisionHandlerRejectsActivePlan(): Promise<void> {
       store.push(...events);
       return { session: { ...session, eventCount: store.length }, events: [...store] };
     },
+    kernel: async (request) => ({
+      ok: true,
+      events: [{
+        kind: 'plan_authorization.decision_recorded',
+        requestId: (request.command as Record<string, unknown>).requestId as string,
+        runId,
+        sessionId,
+        authorizationContractId: `authorization-${token}`,
+        decision: 'reject',
+      }],
+    }),
+    appendProjectedKernelEvents: async () => ({
+      session: { ...session, eventCount: store.length },
+      events: [...store],
+    }),
+    diagnosticEvent: (_nextSessionId, content) => ({
+      id: `diagnostic-${token}`,
+      sessionId,
+      ts: `ts-${token}`,
+      kind: 'error',
+      payload: { content },
+    }),
     executeAcceptedActionBundlePlan: async () => {
       executed += 1;
       return {
@@ -5617,7 +4824,7 @@ async function assertPlanDecisionHandlerRejectsActivePlan(): Promise<void> {
     },
     activeDriverInteraction: () => ({ kind: 'plan', runId, planId }),
     executionRootFromDecision: () => undefined,
-    buildAcceptedImplementationPlan: () => {
+    buildAcceptedTaskPlan: () => {
       throw new Error('rejecting a plan must not build accepted implementation context');
     },
     recoverAcceptedPlanFromOverlay: () => undefined,
@@ -5630,7 +4837,6 @@ async function assertPlanDecisionHandlerRejectsActivePlan(): Promise<void> {
     planProjection: new PlanProjectionBuilder({
       readActionBundle: () => undefined,
       requiredFileOperationsFromReport: () => [],
-      requiredAccessScopesFromReport: () => [],
       permissionBundlesFromReport: () => [],
       gateInterventionsFromReport: () => [],
       planReviewFacts: () => [],
@@ -5684,7 +4890,6 @@ function assertProjectionBuildersKeepKernelAndReviewReadModels(): void {
   const actionId = `action-${token}`;
   const kernelProjection = new KernelEventProjectionBuilder({
     requiredFileOperationsFromReport: () => [],
-    requiredAccessScopesFromReport: () => [],
     permissionBundlesFromReport: () => [],
     gateInterventionsFromReport: () => [],
     planReviewFacts: () => [],
@@ -5834,7 +5039,7 @@ function assertProjectionBuildersKeepKernelAndReviewReadModels(): void {
       runId,
       planId: `plan-${token}`,
       userPlan: `plan-${token}`,
-      implementationPlan: { id: `implementation-${token}` },
+      taskPlan: { id: `implementation-${token}` },
       actionBundle: {
         reviewExpectations: [],
         continuationExpectations: [{ targetPath }],
@@ -5918,7 +5123,7 @@ function assertProjectionBuildersKeepKernelAndReviewReadModels(): void {
       runId,
       planId: `plan-${token}`,
       userPlan: `plan-${token}`,
-      implementationPlan: { id: `implementation-${token}` },
+      taskPlan: { id: `implementation-${token}` },
       actionBundle: { reviewExpectations: [], continuationExpectations: [] },
     },
     kernelEvents: [],
@@ -5949,7 +5154,7 @@ function assertProjectionBuildersKeepKernelAndReviewReadModels(): void {
       runId,
       planId: `plan-${token}`,
       userPlan: `plan-${token}`,
-      implementationPlan: { id: `implementation-${token}` },
+      taskPlan: { id: `implementation-${token}` },
       actionBundle: { reviewExpectations: [], continuationExpectations: [] },
     },
     kernelEvents: [],
@@ -5964,13 +5169,14 @@ function assertProjectionBuildersKeepKernelAndReviewReadModels(): void {
   const planProjection = new PlanProjectionBuilder({
     readActionBundle: (proposal) => (proposal.payload as any).actionBundle,
     requiredFileOperationsFromReport: () => [{ operation: 'delete', targetPath, capability: 'fs.delete' }],
-    requiredAccessScopesFromReport: () => [],
     permissionBundlesFromReport: () => [{
       id: `bundle-${token}`,
       capability: 'fs.delete',
       resourceKind: 'workspaceFile',
       targets: [targetPath],
       operationIds: [actionId],
+      toolIds: ['fs.delete'],
+      permissionMode: 'ask',
       riskLevel: 'medium',
       summary: `delete ${targetPath}`,
     }],
@@ -5998,7 +5204,7 @@ function assertProjectionBuildersKeepKernelAndReviewReadModels(): void {
   const actionBundlePlan = planProjection.actionBundlePlanCardEvent({
     state: planState,
     proposal: {
-      schemaVersion: 'deepcode.agent.protocol.v3',
+      schemaVersion: 'deepcode.agent.protocol.v4',
       proposalId: `proposal-${token}`,
       runId,
       source: 'llm',
@@ -6017,7 +5223,37 @@ function assertProjectionBuildersKeepKernelAndReviewReadModels(): void {
       referencedResourcePacketRefs: [],
       referencedEvidenceRefs: [],
     },
-    report: { status: 'awaitingTemporaryGrant', kernelGeneratedPermissionSummary: `Kernel summary ${token}` },
+    report: {
+      proposalId: `proposal-${token}`,
+      status: 'awaitingUserApproval',
+      requiredPermissions: ['workspace.write'],
+      diagnostics: [],
+      executionContract: {
+        id: `contract-${token}`,
+        proposalId: `proposal-${token}`,
+        status: 'awaitingUserApproval',
+        catalogVersion: 'deepcode.kernel.tools.v3',
+        catalogHash: `catalog-${token}`,
+        operationSetHash: `operations-${token}`,
+        contractHash: `contract-hash-${token}`,
+        operations: [{
+          id: `delete-${token}`,
+          title: `Delete ${targetPath}`,
+          toolId: 'fs.delete',
+          args: { path: targetPath, targetKind: 'file', recursive: false },
+          argsHash: `args-${token}`,
+          readSet: [],
+          writeSet: [targetPath],
+          conflictKeys: [targetPath],
+          executionMode: 'execute',
+          cleanup: { leasePolicy: 'contract', failurePolicy: 'blockReviewAcceptance' },
+        }],
+        permissionBundles: [],
+        interventions: [],
+        cleanupPolicy: 'cleanupContractPerOperation',
+        expiresAfter: 'reviewGateOrRunTerminal',
+      },
+    },
     ts: new Date(0).toISOString(),
     id: `plan-card-${token}`,
   });
@@ -6028,14 +5264,14 @@ function assertProjectionBuildersKeepKernelAndReviewReadModels(): void {
   assertEqual(actionPayload.readablePlan.schemaVersion, 'deepcode.session.readable-plan.v1', 'plan projection carries structured readable plan');
   assert(JSON.stringify(actionPayload.readablePlan.sections).includes(targetPath), 'plan projection renders operation target in structured plan sections');
 
-  const implementationPlan = planProjection.implementationPlanCardEvent({
+  const taskPlan = planProjection.taskPlanCardEvent({
     state: planState,
     proposal: {
-      schemaVersion: 'deepcode.agent.protocol.v3',
+      schemaVersion: 'deepcode.agent.protocol.v4',
       proposalId: `implementation-${token}`,
       runId,
       source: 'llm',
-      kind: 'implementationPlan',
+      kind: 'taskPlan',
       payload: {
         version: '1',
         id: `implementation-${token}`,
@@ -6045,8 +5281,8 @@ function assertProjectionBuildersKeepKernelAndReviewReadModels(): void {
           taskId: `task-${token}`,
           title: `Task ${token}`,
           target: [targetPath],
-          scope: `Scope ${token}`,
-          capability: 'fs.write',
+          toolId: 'fs.write',
+          args: {},
           acceptanceCriteria: [`Accept ${token}`],
           failureCriteria: [`Fail ${token}`],
           dependencies: [`dependency-${token}`],
@@ -6057,17 +5293,56 @@ function assertProjectionBuildersKeepKernelAndReviewReadModels(): void {
       referencedResourcePacketRefs: [],
       referencedEvidenceRefs: [],
     },
+    authorizationReview: {
+      planId: `implementation-${token}`,
+      status: 'confirmable',
+      diagnostics: [],
+      authorizationContract: {
+        id: `authorization-${token}`,
+        planId: `implementation-${token}`,
+        planHash: `plan-hash-${token}`,
+        status: 'confirmable',
+        catalogVersion: 'deepcode.kernel.tools.v3',
+        catalogHash: `catalog-${token}`,
+        operationSetHash: `operation-set-${token}`,
+        contractHash: `authorization-hash-${token}`,
+        operations: [{
+          id: `authorization-operation-${token}`,
+          sourceTaskId: `task-${token}`,
+          toolId: 'fs.write',
+          operationKind: 'write',
+          contentMode: 'contentBlock',
+          targets: [targetPath],
+          fixedArgs: {},
+          argsTemplate: { path: targetPath },
+          readSet: [],
+          writeSet: [targetPath],
+          conflictKeys: [targetPath],
+          dependsOn: [],
+          executionMode: 'execute',
+          internal: false,
+        }],
+        permissionBundles: [],
+        interventions: [],
+        cleanupPolicy: 'planGrantLease',
+        expiresAfter: 'reviewGateOrRunTerminal',
+      },
+    },
     ts: new Date(0).toISOString(),
     id: `implementation-card-${token}`,
   });
-  const implementationPayload = implementationPlan.payload as any;
+  const implementationPayload = taskPlan.payload as any;
   assertEqual(implementationPayload.confirmable, true, 'plan projection keeps implementation plan confirmable');
   assertEqual(implementationPayload.content, undefined, 'implementation plan projection does not emit markdown fallback content');
   assert(JSON.stringify(implementationPayload.readablePlan.sections).includes(targetPath), 'plan projection renders implementation plan target in structured sections');
-  const implementationPayloadText = JSON.stringify(implementationPayload);
-  assert(!implementationPayloadText.includes('dependencies'), 'plan projection does not expose legacy dependencies field');
-  assert(!implementationPayloadText.includes('dependsOn'), 'plan projection does not expose legacy dependsOn field');
-  assert(!implementationPayloadText.includes('dependencyDepth'), 'plan projection does not expose legacy dependencyDepth field');
+  const projectedTaskText = JSON.stringify(implementationPayload.taskPlan.tasks[0]);
+  assertEqual(
+    implementationPayload.taskPlan.tasks[0].dependencies[0],
+    `dependency-${token}`,
+    'plan projection preserves canonical task dependencies'
+  );
+  assert(!projectedTaskText.includes('dependsOn'), 'plan projection does not expose legacy dependsOn field');
+  assert(!projectedTaskText.includes('dependencyDepth'), 'plan projection does not expose legacy dependencyDepth field');
 
   const decisionEvent = planProjection.planReviewDecisionEvent({
     sessionId: `session-${token}`,
@@ -6112,7 +5387,6 @@ async function assertAgentRunReactorCoordinatesPorts(): Promise<void> {
   const deltas: ProjectionDelta[] = [];
   const kernelProjection = new KernelEventProjectionBuilder({
     requiredFileOperationsFromReport: () => [],
-    requiredAccessScopesFromReport: () => [],
     permissionBundlesFromReport: () => [],
     gateInterventionsFromReport: () => [],
     planReviewFacts: () => [],
@@ -6228,7 +5502,12 @@ function assertDriverActivityBuilderCreatesReadModels(): void {
   const builder = new DriverActivityBuilder({
     providerStageSummary: (stage, part, language) => `${stage}:${part}:${language}`,
     visibleLanguageForRequest: () => 'en-US',
-    actionFileTargetPath: (action) => typeof action.targetPath === 'string' ? action.targetPath : undefined,
+    actionFileTargetPath: (action) => {
+      const args = action.args && typeof action.args === 'object' && !Array.isArray(action.args)
+        ? action.args as Record<string, unknown>
+        : undefined;
+      return typeof args?.path === 'string' ? args.path : undefined;
+    },
   });
   const generic = builder.conversationActivity({
     activityId: `activity-${token}`,
@@ -6253,12 +5532,14 @@ function assertDriverActivityBuilderCreatesReadModels(): void {
   });
   assertEqual(provider.summary, `stage-${token}:request:en-US`, 'driver activity builder uses provider stage summary port');
   const batch = {
-    actions: [{
-      id: `action-${token}`,
-      actionId: `action-${token}`,
-      targetPath,
-      resourceScope: [targetPath],
-    }],
+    actionBundle: {
+      actions: [{
+        actionId: `action-${token}`,
+        toolId: 'fs.write',
+        args: { path: targetPath },
+        description: `Write ${token}`,
+      }],
+    },
   };
   const acceptedActivity = builder.acceptedPlanBatchActivity({
     accepted: {
@@ -6267,22 +5548,22 @@ function assertDriverActivityBuilderCreatesReadModels(): void {
       title: 'Accepted activity plan',
       summary: 'Accepted activity plan summary',
       tasks: [],
-      capabilities: [],
+      authorizationOperations: [],
+      toolIds: [],
       targetScopes: [],
-      exactOperationGrants: [],
-      accessScopes: [],
       batchIndex: 2,
       completedTaskIds: [],
+      dependencyFacts: [],
       rawPlan: {},
-    } as AcceptedImplementationPlanContext,
+    } as AcceptedTaskPlanContext,
     batch,
     status: 'running',
   });
   assertEqual(acceptedActivity.targets?.[0], targetPath, 'driver activity builder extracts batch target path');
   assertEqual(acceptedActivity.itemCount, 1, 'driver activity builder counts batch actions');
-  assertEqual(builder.batchActionRecords({ actionBundle: batch }).length, 1, 'driver activity builder reads nested action bundles');
+  assertEqual(builder.batchActionRecords(batch).length, 1, 'driver activity builder reads canonical action bundles');
   const proposal = {
-    schemaVersion: 'deepcode.agent.protocol.v3',
+    schemaVersion: 'deepcode.agent.protocol.v4',
     proposalId: `proposal-${token}`,
     runId,
     sessionId: `session-${token}`,
@@ -6293,12 +5574,11 @@ function assertDriverActivityBuilderCreatesReadModels(): void {
         id: `bundle-${token}`,
         version: '1',
         goal: `Goal ${token}`,
-        actions: batch.actions,
+        actions: batch.actionBundle.actions,
         validationExpectations: [],
         reviewExpectations: [],
       },
-      codeBlocks: [],
-      commandBlocks: [],
+      contentBlocks: [],
     },
     referencedResourcePacketRefs: [],
     referencedEvidenceRefs: [],
@@ -6314,7 +5594,7 @@ function assertAssistantProjectionBuilderCreatesConversationEvents(): void {
     guidanceRevisionTransitionMessage: (language) => `transition-${language}-${token}`,
   });
   const proposal: ProposalEnvelope = {
-    schemaVersion: 'deepcode.agent.protocol.v3',
+    schemaVersion: 'deepcode.agent.protocol.v4',
     proposalId: `proposal-${token}`,
     runId: `run-${token}`,
     source: 'llm',
@@ -6406,11 +5686,19 @@ function assertSessionProgressProjectionBuilderCreatesRunAndCheckpointEvents(): 
     hasFailureOrBlocker: (events) => events.some((event) => (event as any).kind === 'work_unit.failed'),
     auditAcceptedPlanBatch: (batch) => ({
       actions: Array.isArray((batch as any).actions)
-        ? (batch as any).actions
+        ? (batch as any).actions.map((action: any) => ({
+            actionId: action.actionId,
+            toolId: action.toolId,
+            targetPath: action.args?.path,
+          }))
         : [{ actionId: `action-${token}`, targetPath }],
     }),
     actionBundleAdmissionBatch: () => ({
-      actions: [{ actionId: `admission-action-${token}`, resourceScope: [targetPath] }],
+      actions: [{
+        actionId: `admission-action-${token}`,
+        toolId: 'fs.write',
+        args: { path: targetPath, contentBlockId: `block-${token}` },
+      }],
     }),
     acceptedPlanTaskLedger: (accepted) => buildTaskLedgerSnapshot({
       planId: accepted.planId,
@@ -6419,7 +5707,7 @@ function assertSessionProgressProjectionBuilderCreatesRunAndCheckpointEvents(): 
         taskId: task.taskId,
         title: task.title ?? task.taskId,
         targets: task.targets,
-        capability: task.capability,
+        toolId: task.toolId,
       })),
       completedTaskIds: accepted.completedTaskIds,
     }),
@@ -6499,23 +5787,24 @@ function assertSessionProgressProjectionBuilderCreatesRunAndCheckpointEvents(): 
   assertEqual((cache?.payload as any).finalUserPromptHash, `final-user-${token}`, 'session progress projection preserves final user prompt hash');
   assertEqual((cache?.payload as any).finalUserPromptCharLength, 2048, 'session progress projection preserves final user prompt length');
 
-  const accepted: AcceptedImplementationPlanContext = {
+  const accepted: AcceptedTaskPlanContext = {
     planId: `plan-${token}`,
     runId: `run-${token}`,
     tasks: [{
       taskId,
       title: `Task ${token}`,
-      capability: 'fs.write',
+      toolId: 'fs.write',
       targets: [targetPath],
       dependencies: [],
+      planningArgs: {},
       conflictKeys: [],
     }],
-    capabilities: ['fs.write'],
+    authorizationOperations: [],
+    toolIds: ['fs.write'],
     targetScopes: [targetPath],
-    exactOperationGrants: [],
-    accessScopes: [],
     batchIndex: 1,
     completedTaskIds: [],
+    dependencyFacts: [],
     rawPlan: {},
   };
   const checkpoint = builder.acceptedPlanBatchCheckpointEvent(
@@ -6523,7 +5812,7 @@ function assertSessionProgressProjectionBuilderCreatesRunAndCheckpointEvents(): 
     `run-${token}`,
     accepted,
     {
-      schemaVersion: 'deepcode.agent.protocol.v3',
+      schemaVersion: 'deepcode.agent.protocol.v4',
       proposalId: `proposal-${token}`,
       runId: `run-${token}`,
       source: 'llm',
@@ -6567,7 +5856,7 @@ function assertSessionProgressProjectionBuilderCreatesRunAndCheckpointEvents(): 
       taskTitle: `Task ${token}`,
       goal: `Goal ${token}`,
       targets: [targetPath],
-      capabilities: ['fs.write'],
+      toolIds: ['fs.write'],
       taskOrder: [taskId],
       pendingTaskIds: [taskId],
       dependsOn: [],
@@ -6623,7 +5912,7 @@ function assertSessionProgressProjectionBuilderCreatesRunAndCheckpointEvents(): 
       taskTitle: `Task ${token}`,
       goal: `Goal ${token}`,
       targets: [targetPath],
-      capabilities: ['fs.write'],
+      toolIds: ['fs.write'],
       taskOrder: [taskId],
       pendingTaskIds: [taskId],
       dependsOn: [],
@@ -6636,38 +5925,6 @@ function assertSessionProgressProjectionBuilderCreatesRunAndCheckpointEvents(): 
   assertEqual((savepoint.payload as any).stage, 'accepted_plan.task_savepoint', 'session progress projection creates task savepoint events');
   assertEqual((savepoint.payload as any).messageKey, 'session.driver.acceptedPlanTaskSavepointComplete', 'session progress projection marks completed savepoint with i18n key');
   assertEqual((savepoint.payload as any).acceptedPlanPromptFrame.taskLedger.completedTaskIds[0], taskId, 'session progress projection stores accepted-plan prompt frame');
-
-  const canonicalized = builder.acceptedPlanAccessScopesCanonicalizedEvent(
-    `session-${token}`,
-    `run-${token}`,
-    accepted,
-    {
-      proposal: {
-        schemaVersion: 'deepcode.agent.protocol.v3',
-        proposalId: `proposal-canonical-${token}`,
-        runId: `run-${token}`,
-        source: 'llm',
-        kind: 'actionBundle',
-        payload: {},
-        referencedResourcePacketRefs: [],
-        referencedEvidenceRefs: [],
-      },
-      changed: true,
-      removedAccessScopes: [{
-        index: 0,
-        reason: `reason-${token}`,
-        source: `source-${token}`,
-        path: targetPath,
-        scopeKind: 'file',
-        scope: { path: targetPath },
-      }],
-      actionTargets: [targetPath, targetPath],
-    },
-    '2026-01-01T00:00:01.875Z',
-    `access-scope-${token}`
-  );
-  assertEqual((canonicalized.payload as any).stage, 'accepted_plan.access_scope_canonicalized', 'session progress projection creates access scope canonicalization events');
-  assertEqual((canonicalized.payload as any).actionTargets.length, 1, 'session progress projection canonicalizes duplicate action targets');
 
   const preflight = builder.acceptedPlanActionBatchPreflightEvent(
     `session-${token}`,
@@ -6683,12 +5940,22 @@ function assertSessionProgressProjectionBuilderCreatesRunAndCheckpointEvents(): 
     `session-${token}`,
     `run-${token}`,
     {
-      schemaVersion: 'deepcode.agent.protocol.v3',
+      schemaVersion: 'deepcode.agent.protocol.v4',
       proposalId: `proposal-repair-${token}`,
       runId: `run-${token}`,
       source: 'llm',
       kind: 'actionBundle',
-      payload: {},
+      payload: {
+        actionBundle: {
+          actions: [{
+            actionId: `repair-action-${token}`,
+            toolId: 'fs.write',
+            args: { path: targetPath, contentBlockId: `block-${token}` },
+            description: `Update ${targetPath}`,
+            dependsOn: [],
+          }],
+        },
+      },
       referencedResourcePacketRefs: [],
       referencedEvidenceRefs: [],
     },
@@ -6732,7 +5999,7 @@ function assertSessionFailureProjectionBuilderCreatesFailureEvents(): void {
     `session-${token}`,
     `run-${token}`,
     {
-      schemaVersion: 'deepcode.agent.protocol.v3',
+      schemaVersion: 'deepcode.agent.protocol.v4',
       proposalId: `proposal-${token}`,
       runId: `run-${token}`,
       source: 'llm',
@@ -6756,12 +6023,12 @@ function assertSessionFailureProjectionBuilderCreatesFailureEvents(): void {
       planId: `plan-${token}`,
       runId: `run-${token}`,
       tasks: [],
-      capabilities: [],
+      authorizationOperations: [],
+      toolIds: [],
       targetScopes: [],
-      exactOperationGrants: [],
-      accessScopes: [],
       batchIndex: 3,
       completedTaskIds: [],
+      dependencyFacts: [],
       rawPlan: {},
     },
     [],
@@ -6780,12 +6047,12 @@ function assertSessionFailureProjectionBuilderCreatesFailureEvents(): void {
       planId: `plan-${token}`,
       runId: `run-${token}`,
       tasks: [],
-      capabilities: [],
+      authorizationOperations: [],
+      toolIds: [],
       targetScopes: [],
-      exactOperationGrants: [],
-      accessScopes: [],
       batchIndex: 1,
       completedTaskIds: [],
+      dependencyFacts: [],
       rawPlan: {},
     },
     [`reason-${token}`],
@@ -6799,14 +6066,19 @@ function assertPlanReviewReportAnalyzerKeepsReviewSemantics(): void {
   const token = randomSmokeToken('plan-review-analyzer');
   const targetPath = `target-${token}.txt`;
   const analyzer = new PlanReviewReportAnalyzer({
-    requiredFileOperationsFromReport: () => [{ operation: 'write', targetPath, capability: 'fs.write' }],
+    requiredFileOperationsFromReport: () => [{ operation: 'write', targetPath, toolId: 'fs.write' }],
   });
   const reviewed = analyzer.findReport([{
     kind: 'proposal.reviewed',
     report: {
-      status: 'needsRevision',
-      findings: [{ code: 'completion_evidence_required', message: `evidence-${token}` }],
-      kernelGeneratedPermissionSummary: `summary-${token}`,
+      proposalId: `proposal-${token}`,
+      status: 'denied',
+      requiredPermissions: [],
+      diagnostics: [`evidence-${token}`],
+      executionContract: {
+        permissionBundles: [],
+        interventions: [],
+      },
     },
   }]);
   assert(Boolean(reviewed), 'plan review analyzer finds proposal.reviewed report');
@@ -6814,139 +6086,128 @@ function assertPlanReviewReportAnalyzerKeepsReviewSemantics(): void {
   assert(analyzer.diagnosticSummary(reviewed as Record<string, unknown>).includes(`evidence-${token}`), 'plan review analyzer keeps diagnostic messages');
   const facts = analyzer.facts(reviewed);
   assert(facts.some((fact) => fact.includes(targetPath)), 'plan review analyzer includes required file operation facts');
-  assertEqual(analyzer.statusAwaitingUser('awaitingTemporaryGrant'), true, 'plan review analyzer keeps awaiting-user status semantics');
   assertEqual(
-    analyzer.planCardAwaitingDecision({ planId: `plan-${token}`, status: 'pending' }),
-    true,
-    'plan review analyzer detects waiting plan cards'
-  );
-  assertEqual(
-    analyzer.planCardAwaitingDecision({ planId: `plan-${token}`, status: 'accepted' }),
+    planInteractionAwaitsDecision({ planId: `plan-${token}`, status: 'pending' }),
     false,
-    'plan review analyzer rejects accepted plan cards'
+    'plan interaction rejects cards that are not explicitly confirmable'
   );
   assertEqual(
-    analyzer.planReviewEventAwaitingDecision({ planId: `plan-${token}`, status: 'awaitingUserApproval' }),
+    planInteractionAwaitsDecision({
+      planId: `task-plan-${token}`,
+      status: 'confirmable',
+      confirmable: true,
+      taskPlan: { id: `task-plan-${token}` },
+    }),
     true,
-    'plan review analyzer detects waiting plan review events'
+    'plan interaction preserves an explicit Kernel-authorized task-plan decision'
   );
   assertEqual(
-    analyzer.planReviewEventAwaitingDecision({ planId: `plan-${token}`, confirmable: false, status: 'pending' }),
+    planInteractionAwaitsDecision({ planId: `plan-${token}`, status: 'accepted', confirmable: false }),
     false,
-    'plan review analyzer respects non-confirmable plan review events'
+    'plan interaction rejects resolved plan cards'
+  );
+  assertEqual(
+    planInteractionAwaitsDecision({ planId: `plan-${token}`, status: 'awaitingUserApproval', confirmable: true }),
+    true,
+    'plan interaction detects explicit waiting plan review events'
+  );
+  assertEqual(
+    planInteractionAwaitsDecision({ planId: `plan-${token}`, confirmable: false, status: 'pending' }),
+    false,
+    'plan interaction respects non-confirmable plan review events'
   );
   assertEqual(
     analyzer.acceptedPlanNeedsRepair({
-      status: 'needsRevision',
-      deniedReasons: [`access scope must not be the workspace root ${token}`],
+      status: 'denied',
+      diagnostics: [`access scope must not be the workspace root ${token}`],
     }),
     true,
     'plan review analyzer keeps accepted-plan access-scope repair semantics'
   );
-  assertEqual(analyzer.denied({ status: 'interfaceOnly' }), true, 'plan review analyzer preserves denied status semantics');
+  assertEqual(analyzer.denied({ status: 'denied' }), true, 'plan review analyzer preserves denied status semantics');
 }
 
 function assertPlanReviewGrantProjectorBuildsExecutionReadModels(): void {
   const token = randomSmokeToken('plan-review-grants');
   const fileTarget = `dir-${token}/file-${token}.txt`;
   const directoryTarget = `dir-${token}/`;
-  const mixedDirectory = `CaseDir-${randomSmokeToken('dir')}`;
-  const mixedFileTarget = `${mixedDirectory}/MiXeD-${randomSmokeToken('file')}.TXT`;
-  const mixedRoot = `/tmp/Root-${randomSmokeToken('root')}`;
-  const mixedAbsoluteTarget = `${mixedRoot}/${mixedFileTarget}`;
   const projector = new PlanReviewGrantProjector();
   const report = {
-    permissionGaps: ['fs.write', 'fs.delete'],
-    requiredFileOperations: [
-      {
-        operation: 'write',
-        capability: 'fs.write',
-        targetPath: fileTarget,
-        actionId: `write-${token}`,
-      },
-      {
-        operation: 'delete',
-        capability: 'fs.delete',
-        targetPath: directoryTarget,
-        targetResourceKind: 'directory',
-        recursive: true,
-        actionId: `delete-${token}`,
-      },
-    ],
-    requiredAccessScopes: [{
-      scopeKind: 'workspaceModule',
-      path: `module-${token}`,
-      capabilities: ['fs.write'],
-    }],
+    proposalId: `proposal-${token}`,
+    status: 'awaitingUserApproval',
+    requiredPermissions: ['workspace.write'],
+    diagnostics: [],
     executionContract: {
       id: `contract-${token}`,
+      proposalId: `proposal-${token}`,
+      status: 'awaitingUserApproval',
+      catalogVersion: 'deepcode.kernel.tools.v3',
+      catalogHash: `catalog-${token}`,
+      operationSetHash: `operations-${token}`,
+      contractHash: `contract-hash-${token}`,
+      operations: [{
+        id: `write-${token}`,
+        title: `Write ${fileTarget}`,
+        toolId: 'fs.write',
+        args: { path: fileTarget },
+        argsHash: `write-args-${token}`,
+        readSet: [],
+        writeSet: [fileTarget],
+        conflictKeys: [fileTarget],
+        executionMode: 'execute',
+        cleanup: {},
+      }, {
+        id: `delete-${token}`,
+        title: `Delete ${directoryTarget}`,
+        toolId: 'fs.delete',
+        args: { path: directoryTarget, targetKind: 'directory', recursive: true },
+        argsHash: `delete-args-${token}`,
+        readSet: [],
+        writeSet: [directoryTarget],
+        conflictKeys: [directoryTarget],
+        executionMode: 'execute',
+        cleanup: {},
+      }],
       permissionBundles: [{
         id: `bundle-${token}`,
-        capability: 'fs.patch',
-        resourceKind: 'workspaceFile',
-        resourcePath: fileTarget,
-        targets: [fileTarget],
+        capability: 'workspace.write',
+        permissionMode: 'ask',
+        risk: 'high',
+        resourceKind: 'workspacePath',
+        operationIds: [`write-${token}`, `delete-${token}`],
+        toolIds: ['fs.write', 'fs.delete'],
+        targets: [fileTarget, directoryTarget],
+        expiresAfter: 'reviewGateOrRunTerminal',
       }],
       interventions: [{
         id: `intervention-${token}`,
         interventionKind: 'permission',
         status: 'pending',
+        permissionBundleId: `bundle-${token}`,
         summary: `summary-${token}`,
-        options: [`option-${token}`],
+        affectedOperationIds: [`write-${token}`, `delete-${token}`],
       }],
+      cleanupPolicy: 'cleanupContractPerOperation',
+      expiresAfter: 'reviewGateOrRunTerminal',
     },
   };
 
   const operations = projector.requiredFileOperationsFromReport(report);
   assertEqual(operations.length, 2, 'grant projector keeps required file operations');
   assertEqual(operations[1]?.targetResourceKind, 'directory', 'grant projector preserves directory targets');
-  assertEqual(operations[1]?.targetPath, directoryTarget.replace(/\/+$/, ''), 'grant projector normalizes directory target trailing slash');
-  const exactGrants = projector.exactOperationGrantsFromPlanReviewReport(report);
-  assert(exactGrants.some((grant) => grant.targetPath === fileTarget), 'grant projector builds exact file grants from plan review');
-  assert(exactGrants.some((grant) => grant.targetResourceKind === 'directory'), 'grant projector builds exact directory grants');
-  const accessScopes = projector.requiredAccessScopesFromReport(report);
-  assertEqual(accessScopes[0]?.path, `module-${token}`, 'grant projector keeps required access scope path');
+  assertEqual(operations[1]?.targetPath, directoryTarget, 'grant projector preserves the Kernel-authored directory target exactly');
   const bundles = projector.permissionBundlesFromReport(report);
   assertEqual(bundles[0]?.id, `bundle-${token}`, 'grant projector reads execution contract permission bundles');
+  assertEqual(bundles[0]?.targets[0], fileTarget, 'grant projector does not recompute Kernel permission targets');
+  assertEqual(bundles[0]?.riskLevel, 'high', 'grant projector preserves Kernel risk classification');
   const interventions = projector.gateInterventionsFromReport(report);
   assertEqual(interventions[0]?.id, `intervention-${token}`, 'grant projector reads execution contract interventions');
-  const temporaryGrants = projector.temporaryGrantsForPlan({ planId: `plan-${token}`, planReviewReport: report });
-  assert(temporaryGrants.some((grant) => (grant as any).capability === 'fs.write'), 'grant projector creates file operation temporary grants');
-  assert(temporaryGrants.some((grant) => (grant as any).resourceKind === 'workspaceDirectory'), 'grant projector creates directory temporary grants');
-  assertEqual(
-    projector.concreteFileOperationTarget(`./${fileTarget}`),
-    fileTarget,
-    'grant projector normalizes concrete file operation targets'
-  );
-  const mixedCaseGrants = projector.exactOperationGrantsFromImplementationPlan({
-    tasks: [{
-      taskId: `task-${token}`,
-      capability: 'fs.write',
-      fileOperations: [{
-        operation: 'write',
-        capability: 'fs.write',
-        targetPath: mixedAbsoluteTarget,
-      }],
-    }],
-  }, {
-    ref: mixedRoot,
-    source: 'recentAttachment',
-    attachment: {
-      kind: 'directory',
-      path: mixedRoot,
-      absolutePath: mixedRoot,
-      source: 'userSelected',
-      scope: 'message',
-    },
-  });
-  assertEqual(
-    mixedCaseGrants[0]?.targetPath,
-    mixedFileTarget,
-    'grant projector preserves target path casing when stripping execution root'
-  );
+  assertEqual(interventions[0]?.permissionBundleId, `bundle-${token}`, 'grant projector preserves Kernel gate ownership');
+  assertEqual(projector.kernelExecutionContractId(report), `contract-${token}`, 'grant projector preserves Kernel contract identity');
+  assertEqual(projector.kernelExecutionContractHash(report), `contract-hash-${token}`, 'grant projector preserves Kernel contract hash');
 }
 
-function assertAcceptedPlanTargetParserExtractsStructuredTargets(): void {
+function assertAcceptedPlanTargetParserUsesCanonicalTarget(): void {
   const token = randomSmokeToken('target-parser');
   const first = `src-${token}/first-${token}.txt`;
   const second = `src-${token}/second-${token}.txt`;
@@ -6960,316 +6221,42 @@ function assertAcceptedPlanTargetParserExtractsStructuredTargets(): void {
     }],
   });
   assert(targets.includes(first), 'target parser normalizes direct task target');
-  assert(targets.includes(second), 'target parser expands comma-separated target list');
-  assert(targets.includes(third), 'target parser keeps every comma-separated target');
-  assert(
+  assertEqual(targets.includes(second), false, 'target parser ignores removed targets compatibility input');
+  assertEqual(targets.includes(third), false, 'target parser does not expand removed target-list aliases');
+  assertEqual(
     targets.includes(`generated-${token}/artifact-${token}.txt`),
-    'target parser extracts file operation target refs'
+    false,
+    'target parser ignores removed file-operation compatibility input'
   );
 }
 
-function assertAcceptedPlanScopeMatcherNormalizesProposalTargets(): void {
-  const token = randomSmokeToken('proposal-scope');
-  const rootRef = `/${randomSmokeToken('root')}`;
-  const actionTarget = `dir-${token}/action-${token}.txt`;
-  const blockTarget = `dir-${token}/block-${token}.txt`;
-  const index = new AcceptedPlanScopeMatcher();
-  const accepted: AcceptedImplementationPlanContext = {
-    planId: `plan-${token}`,
-    runId: `run-${token}`,
-    tasks: [],
-    capabilities: [],
-    targetScopes: [],
-    exactOperationGrants: [],
-    accessScopes: [],
-    executionRoot: {
-      attachment: {
-        kind: 'directory',
-        path: rootRef,
-        source: 'userSelected',
-        scope: 'session',
-      },
-      ref: rootRef,
-      source: 'workspaceBinding',
-    },
-    batchIndex: 1,
-    completedTaskIds: [],
-    rawPlan: {},
-  };
-  const proposal = {
-    schemaVersion: 'deepcode.agent.protocol.v3',
-    kind: 'actionBundle',
-    outputLanguage: 'en-US',
-    payload: {
-      codeBlocks: [{
-        id: `block-${token}`,
-        path: blockTarget,
-      }],
-      actionBundle: {
-        actions: [
-          {
-            actionId: `action-${token}`,
-            toolId: 'fs.write',
-            targetPath: `${rootRef}/${actionTarget}`,
-          },
-          {
-            actionId: `block-action-${token}`,
-            toolId: 'fs.write',
-            sourceBlockId: `block-${token}`,
-          },
-        ],
-      },
-    },
-  } as unknown as ProposalEnvelope;
-  const targets = index.proposalTargetScopes(proposal, accepted);
-  assert(targets.some((target) => target.raw === `${rootRef}/${actionTarget}` && target.normalized === actionTarget), 'scope matcher relativizes execution-root absolute targets');
-  assert(targets.some((target) => target.raw === blockTarget && target.normalized === blockTarget), 'scope matcher extracts code block target paths');
-  assertEqual(
-    index.normalizeTargetForExecutionRoot(`${rootRef}/${actionTarget}`, accepted.executionRoot),
-    actionTarget,
-    'scope matcher normalizes execution-root paths'
-  );
-  const absoluteAccepted = {
-    ...accepted,
-    capabilities: ['fs.write'],
-    targetScopes: [`${rootRef}/${actionTarget}`],
-  };
-  assertEqual(
-    index.scopeCovered(actionTarget, 'fs.write', absoluteAccepted),
-    true,
-    'scope matcher treats execution-root absolute and workspace-relative targets as one identity'
-  );
-  assertEqual(
-    index.actionTargetScopes({
-      id: `block-action-${token}`,
-      title: `block action ${token}`,
-      toolId: 'fs.write',
-      capability: 'fs.write',
-      resourceScope: [],
-      canParallelize: false,
-      conflictKeys: [],
-      sourceBlockId: `block-${token}`,
-    }, proposal).includes(blockTarget),
-    true,
-    'scope matcher resolves action sourceBlockId targets'
-  );
-}
 
-function assertAcceptedPlanAdmissionUsesCurrentTaskTargetsForPathlessTools(): void {
-  const token = randomSmokeToken('pathless-tool');
-  const targets = [
-    `scripts/${token}-build.sh`,
-    `scripts/${token}-run.sh`,
-  ];
-  const accepted: AcceptedImplementationPlanContext = {
-    planId: `plan-${token}`,
-    runId: `run-${token}`,
-    tasks: [{
-      taskId: `task-${token}`,
-      title: 'Run accepted script command',
-      targets,
-      capability: 'process.exec',
-      acceptanceCriteria: ['Kernel permission gate receives the command.'],
-      failureCriteria: ['Session must not request provider-only scope fields.'],
-      dependencies: [],
-      conflictKeys: [],
-    }],
-    capabilities: ['process.exec'],
-    targetScopes: targets,
-    exactOperationGrants: [],
-    accessScopes: [],
-    batchIndex: 1,
-    completedTaskIds: [],
-    rawPlan: { id: `plan-${token}` },
-  };
-  const matcher = new AcceptedPlanScopeMatcher();
-  const admission = new AcceptedPlanAdmission({
-    scopeMatcher: matcher,
-    fileOperationFreshnessReasons: () => [],
-  });
-  const processProposal = {
-    schemaVersion: 'deepcode.agent.protocol.v3',
-    proposalId: `proposal-${token}`,
-    runId: accepted.runId,
-    sessionId: `session-${token}`,
-    source: 'llm',
-    kind: 'actionBundle',
-    payload: {
-      actionBundle: {
-        version: '1',
-        id: `bundle-${token}`,
-        goal: 'Run the accepted pathless command.',
-        actions: [{
-          id: `exec-${token}`,
-          actionId: `exec-${token}`,
-          title: 'Run accepted script command',
-          toolId: 'process.exec',
-          capability: 'process.exec',
-          args: { argv: ['bash', targets[0]] },
-          resourceScope: [],
-        }],
-      },
-      codeBlocks: [],
-    },
-    referencedResourcePacketRefs: [],
-    referencedEvidenceRefs: [],
-  } as ProposalEnvelope;
-  const processResult = admission.validate(accepted, processProposal);
-  assertEqual(
-    processResult.ok,
-    true,
-    'accepted-plan admission derives pathless process.exec scope from current task targets'
-  );
-
-  const descriptiveTarget = `run verification ${token}`;
-  const cursorAccepted: AcceptedImplementationPlanContext = {
-    ...accepted,
-    tasks: [
-      {
-        taskId: `done-${token}`,
-        title: 'Completed task',
-        targets: [`src/${token}.cpp`],
-        capability: 'fs.write',
-        acceptanceCriteria: [],
-        failureCriteria: [],
-        dependencies: [],
-        conflictKeys: [],
-      },
-      {
-        taskId: `exec-task-${token}`,
-        title: 'Run accepted verification',
-        targets: [descriptiveTarget],
-        capability: 'process.exec',
-        acceptanceCriteria: [],
-        failureCriteria: [],
-        dependencies: [],
-        conflictKeys: [],
-      },
-    ],
-    capabilities: ['fs.write', 'process.exec'],
-    targetScopes: [`src/${token}.cpp`, descriptiveTarget],
-    completedTaskIds: [],
-    batchIndex: 2,
-  };
-  const cursorResult = admission.validate(cursorAccepted, processProposal);
-  assertEqual(
-    cursorResult.ok,
-    true,
-    'accepted-plan admission uses batch cursor for pathless current-task scope'
-  );
-
-  const outOfScopeProposal = {
-    ...processProposal,
-    proposalId: `outside-proposal-${token}`,
-    payload: {
-      actionBundle: {
-        version: '1',
-        id: `outside-bundle-${token}`,
-        goal: 'Run an out-of-scope path.',
-        actions: [{
-          id: `outside-${token}`,
-          actionId: `outside-${token}`,
-          title: 'Run out-of-scope command',
-          toolId: 'process.exec',
-          capability: 'process.exec',
-          args: {
-            path: `outside/${token}.sh`,
-            argv: ['bash', `outside/${token}.sh`],
-          },
-          resourceScope: [],
-        }],
-      },
-      codeBlocks: [],
-    },
-  } as ProposalEnvelope;
-  const outOfScopeResult = admission.validate(accepted, outOfScopeProposal);
-  assertEqual(
-    outOfScopeResult.issues?.some((issue) => issue.code === 'targetOutOfScope'),
-    true,
-    'accepted-plan admission still rejects explicit out-of-scope process targets'
-  );
-
-  const writeProposal = {
-    ...processProposal,
-    proposalId: `write-proposal-${token}`,
-    payload: {
-      actionBundle: {
-        version: '1',
-        id: `write-bundle-${token}`,
-        goal: 'Write without a provider target.',
-        actions: [{
-          id: `write-${token}`,
-          actionId: `write-${token}`,
-          title: 'Write without target',
-          toolId: 'fs.write',
-          capability: 'fs.write',
-          args: { sourceBlockId: `block-${token}` },
-          resourceScope: [],
-          sourceBlockId: `block-${token}`,
-        }],
-      },
-      codeBlocks: [{
-        id: `block-${token}`,
-        content: 'generic content',
-      }],
-    },
-  } as ProposalEnvelope;
-  const writeResult = admission.validate(accepted, writeProposal);
-  assertEqual(
-    writeResult.issues?.some((issue) => issue.code === 'missingTarget'),
-    true,
-    'accepted-plan admission still requires provider targets for path-scoped file writes'
-  );
-}
-
-function assertAcceptedImplementationPlanContextBuilderBuildsRuntimeContext(): void {
+function assertAcceptedTaskPlanContextBuilderBuildsRuntimeContext(): void {
   const token = randomSmokeToken('accepted-context');
   const fileTarget = `src-${token}/file-${token}.txt`;
-  const moduleTarget = `module-${token}`;
-  const projector = new PlanReviewGrantProjector();
   const targetParser = new AcceptedPlanTargetParser();
-  const builder = new AcceptedImplementationPlanContextBuilder({
+  const builder = new AcceptedTaskPlanContextBuilder({
     normalizePlanScope: (value) => value.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+/g, '/').trim(),
     uniqueStrings: (values) => [...new Set(values.filter((item): item is string => Boolean(item)))],
     acceptedPlanTaskTargets: (record) => targetParser.taskTargets(record),
-    exactOperationGrantsFromImplementationPlan: (plan, executionRoot) =>
-      projector.exactOperationGrantsFromImplementationPlan(plan, executionRoot),
-    exactOperationGrantsFromPlanReviewReport: (report, executionRoot) =>
-      projector.exactOperationGrantsFromPlanReviewReport(report, executionRoot),
-    accessScopesFromImplementationPlan: (plan) => projector.accessScopesFromImplementationPlan(plan),
-    requiredAccessScopesFromReport: (report) => projector.requiredAccessScopesFromReport(report),
   });
   const accepted = builder.build({
     plan: {
       planId: `plan-${token}`,
+      planHash: `plan-hash-${token}`,
+      authorizationContractId: `authorization-${token}`,
+      authorizationContractHash: `authorization-hash-${token}`,
       runId: `run-${token}`,
-      implementationPlan: {
+      taskPlan: {
         title: `Title ${token}`,
         summary: `Summary ${token}`,
         tasks: [{
           taskId: `task-${token}`,
           title: `Task ${token}`,
-          capability: 'fs.write',
-          targets: [fileTarget],
-          role: 'sourceCode',
-        }],
-        fileOperations: [{
-          operation: 'write',
-          capability: 'fs.write',
-          targetPath: fileTarget,
-          sourceTaskId: `task-${token}`,
-        }],
-        accessScopes: [{
-          scopeKind: 'workspaceModule',
-          path: moduleTarget,
-          capabilities: ['fs.patch'],
-        }],
-      },
-      planReviewReport: {
-        requiredFileOperations: [{
-          operation: 'write',
-          capability: 'fs.write',
-          targetPath: fileTarget,
+          toolId: 'fs.write',
+          target: [fileTarget],
+          args: {},
+          batchKind: 'sourceCode',
         }],
       },
     },
@@ -7277,45 +6264,23 @@ function assertAcceptedImplementationPlanContextBuilderBuildsRuntimeContext(): v
   });
   assertEqual(accepted.planId, `plan-${token}`, 'accepted context builder keeps plan id');
   assertEqual(accepted.tasks[0]?.taskId, `task-${token}`, 'accepted context builder builds task contexts');
-  assert(accepted.capabilities.includes('fs.write'), 'accepted context builder includes task capabilities');
+  assert(accepted.toolIds.includes('fs.write'), 'accepted context builder includes task toolIds');
   assert(accepted.targetScopes.includes(fileTarget), 'accepted context builder includes task target scopes');
-  assert(accepted.exactOperationGrants.some((grant) => grant.targetPath === fileTarget), 'accepted context builder includes exact operation grants');
-  assert(accepted.accessScopes.some((scope) => scope.path === moduleTarget), 'accepted context builder includes access scopes');
+  assertEqual(accepted.planHash, `plan-hash-${token}`, 'accepted context builder keeps the user-confirmed plan hash');
+  assertEqual(accepted.authorizationContractId, `authorization-${token}`, 'accepted context builder keeps Kernel authorization identity');
+  assertEqual(accepted.authorizationContractHash, `authorization-hash-${token}`, 'accepted context builder keeps Kernel authorization hash');
+  assertEqual('accessScopes' in accepted, false, 'accepted context has no Session-owned permission scopes');
+  assertEqual('exactOperationGrants' in accepted, false, 'accepted context has no Session-owned exact grants');
   assertEqual(accepted.interventionLevel, 'medium', 'accepted context builder keeps intervention level');
 }
 
 function assertProtocolGateCanonicalizesBareRepair(): void {
   const token = randomSmokeToken('protocol-gate');
   const gate = new ProtocolGate({
-    canonicalizeWriteActionSourceBlockRefs: () => undefined,
     ensureReviewableExpectations: () => undefined,
     validateProposalSemantics: () => undefined,
   });
-  const plan = gate.parseAndValidateRepairedProposal({
-    raw: [
-      '```json',
-      JSON.stringify({
-        title: `Plan ${token}`,
-        summary: `Summary ${token}`,
-        tasks: [
-          {
-            taskId: `task-${token}`,
-            title: `Task ${token}`,
-            target: [`target-${token}.txt`],
-            acceptanceCriteria: [`accepted-${token}`],
-          },
-        ],
-      }),
-      '```',
-    ].join('\n'),
-    runId: `run-${token}`,
-    sessionId: `session-${token}`,
-    source: 'llm',
-    allowedKinds: ['taskPlan'],
-  });
-  assertEqual(plan.kind, 'taskPlan', 'protocol gate canonicalizes bare task plan repair');
-  assertEqual(plan.runId, `run-${token}`, 'protocol gate fills repaired run id');
-  const wrongVersionPlan = gate.parseAndValidateRepairedProposal({
+  assertThrows(() => gate.parseAndValidateRepairedProposal({
     raw: {
       schemaVersion: '1.0',
       kind: 'taskPlan',
@@ -7326,8 +6291,11 @@ function assertProtocolGateCanonicalizesBareRepair(): void {
           {
             taskId: `version-task-${token}`,
             title: `Version task ${token}`,
+            toolId: 'fs.read',
             target: [`version-target-${token}.txt`],
+            args: {},
             acceptanceCriteria: [`version-accepted-${token}`],
+            failureCriteria: [`version-failed-${token}`],
           },
         ],
       },
@@ -7336,34 +6304,25 @@ function assertProtocolGateCanonicalizesBareRepair(): void {
     sessionId: `session-version-${token}`,
     source: 'llm',
     allowedKinds: ['taskPlan'],
-  });
-  assertEqual(wrongVersionPlan.kind, 'taskPlan', 'protocol gate canonicalizes wrong repaired schema version');
-  assertThrows(
-    () => gate.parseAndValidateRepairedProposal({
-      raw: {
-        schemaVersion: '1.0',
-        kind: 'taskPlan',
-      },
-      runId: `run-version-missing-${token}`,
-      source: 'llm',
-      allowedKinds: ['taskPlan'],
-    }),
-    'Agent Protocol v3.taskPlan.tasks must be a non-empty array'
-  );
+  }), 'schemaVersion must be deepcode.agent.protocol.v4');
   const decision = gate.parseAndValidateRepairedProposal({
     raw: {
-      question: `Question ${token}?`,
-      options: [
-        { id: `first-${token}`, label: `First ${token}` },
-        { id: `second-${token}`, label: `Second ${token}` },
-      ],
-      allowsFreeform: true,
+      schemaVersion: 'deepcode.agent.protocol.v4',
+      kind: 'decisionRequest',
+      decisionRequest: {
+        question: `Question ${token}?`,
+        options: [
+          { id: `first-${token}`, label: `First ${token}`, description: `First choice ${token}`, recommended: true },
+          { id: `second-${token}`, label: `Second ${token}`, description: `Second choice ${token}` },
+        ],
+        allowsFreeform: true,
+      },
     },
     runId: `run-decision-${token}`,
     source: 'llm',
     allowedKinds: ['decisionRequest'],
   });
-  assertEqual(decision.kind, 'decisionRequest', 'protocol gate infers bare decision request shape');
+  assertEqual(decision.kind, 'decisionRequest', 'protocol gate accepts canonical repaired decision request');
   assertEqual(
     gate.repairAllowedKinds({ acceptedPlanActive: true, errorCode: `error-${token}` }).includes('taskPlan'),
     false,
@@ -7446,6 +6405,55 @@ async function assertSessionDriverLoopProjectsDecisionRequest(): Promise<void> {
   assertEqual(result.events.some((event) => event.kind === 'plan_card'), false, 'decisionRequest does not generate a plan before user decision');
 }
 
+async function assertSessionDriverLoopStopsBeforeProviderWhenProjectRootIsUnavailable(): Promise<void> {
+  const token = randomSmokeToken('project-root-unavailable');
+  const sessionId = `session-${token}`;
+  const events: AgentEvent[] = [];
+  const session: AgentSession = {
+    id: sessionId,
+    projectId: `project-${token}`,
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  let kernelCalls = 0;
+  let llmCalls = 0;
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => {
+      kernelCalls += 1;
+      return fakeKernel(request);
+    },
+    llmChat: async (): Promise<ApiResponse<LlmChatResult>> => {
+      llmCalls += 1;
+      return semanticToolLlmResponse('session.submit_answer', {
+        content: `Unexpected provider response for ${token}.`,
+      }, `answer-${token}`);
+    },
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + 1}`,
+  });
+
+  const result = await loop.runUserTurn({
+    sessionId,
+    content: `Inspect the unavailable project ${token}.`,
+    projectId: `project-${token}`,
+    projectKind: 'folder',
+    projectRootStatus: 'unavailable',
+  });
+
+  assertEqual(kernelCalls, 0, 'unavailable project root stops before Kernel run creation');
+  assertEqual(llmCalls, 0, 'unavailable project root stops before provider invocation');
+  const diagnostic = result.events.find((event) =>
+    event.kind === 'assistant_msg'
+    && (event.payload as any)?.diagnosticCode === 'project_root_unavailable'
+  );
+  assertEqual(Boolean(diagnostic), true, 'unavailable project root emits a structured diagnostic');
+}
+
 async function assertSessionDriverLoopRequirementConfirmationCarriesExecutionRoot(): Promise<void> {
   const token = randomSmokeToken('requirement-root');
   const sessionId = `session-${token}`;
@@ -7473,7 +6481,7 @@ async function assertSessionDriverLoopRequirementConfirmationCarriesExecutionRoo
       if (command.kind === 'runCreate') {
         runCreateCount += 1;
         runCreateAttachments = command.input?.attachments ?? [];
-        runCreateWorkspaceBinding = command.input?.workspaceBinding;
+        runCreateWorkspaceBinding = command.workspaceBinding;
         runCreateProjectWorkingDirectory = command.input?.projectWorkingDirectory;
         return fakeKernel(request);
       }
@@ -7503,6 +6511,7 @@ async function assertSessionDriverLoopRequirementConfirmationCarriesExecutionRoo
   const first = await loop.runUserTurn({
     sessionId,
     content: 'Confirm a generic project-scoped decision before continuing.',
+    workspaceBinding: { openPath: root },
     projectWorkingDirectory: {
       rootId: `root-${token}`,
       kind: 'directory',
@@ -7511,6 +6520,9 @@ async function assertSessionDriverLoopRequirementConfirmationCarriesExecutionRoo
       absolutePath: root,
       source: 'projectWorkingDirectory',
     } as any,
+    projectId: `project-${token}`,
+    projectKind: 'folder',
+    projectRootStatus: 'ready',
     requirementConfirmationMode: 'always',
   });
   const confirmation = first.events.find((event) => event.kind === 'requirement_confirmation');
@@ -7526,14 +6538,23 @@ async function assertSessionDriverLoopRequirementConfirmationCarriesExecutionRoo
     runId: typeof confirmationPayload?.runId === 'string' ? confirmationPayload.runId : undefined,
     targetId: typeof confirmationPayload?.requirementId === 'string' ? confirmationPayload.requirementId : undefined,
     existingEvents: first.events,
-    workspaceBinding: { openPath: `/workspace/${randomSmokeToken('conflicting-root')}` },
+    workspaceBinding: { openPath: root },
+    projectWorkingDirectory: {
+      rootId: `root-${token}`,
+      kind: 'directory',
+      label: 'Generic project',
+      displayPath: root,
+      absolutePath: root,
+      source: 'projectWorkingDirectory',
+    } as any,
+    projectId: `project-${token}`,
+    projectKind: 'folder',
+    projectRootStatus: 'ready',
   });
 
-  assertEqual(runCreateAttachments.length, 1, 'requirement continuation recovers one execution root attachment');
+  assertEqual(runCreateAttachments.length, 0, 'project root is not mirrored as a Kernel attachment');
   assertEqual(runCreateCount, 1, 'requirement decision resumes the original run without creating another Kernel run');
-  assertEqual(runCreateAttachments[0]?.absolutePath, root, 'requirement continuation execution root wins over decision-time workspace binding');
-  assertEqual(runCreateAttachments[0]?.rootId, `root-${token}`, 'requirement continuation preserves execution root id');
-  assertEqual(runCreateWorkspaceBinding, undefined, 'requirement continuation does not carry decision-time workspace binding when execution root is known');
+  assertEqual(runCreateWorkspaceBinding?.openPath, root, 'project workspace binding is the Kernel run root');
   assertEqual(runCreateProjectWorkingDirectory, undefined, 'requirement continuation does not carry decision-time project working directory when execution root is known');
   assert(
     JSON.stringify(llmRequests.at(-1)?.messages ?? []).includes(root),
@@ -7542,7 +6563,29 @@ async function assertSessionDriverLoopRequirementConfirmationCarriesExecutionRoo
 }
 
 async function assertSessionDriverLoopRequirementChoiceEntersResumePrompt(): Promise<void> {
-  const events: AgentEvent[] = [{
+  const initialRequest = 'Create a generic user intervention test.';
+  const initialMessage: AgentEvent = {
+    id: 'requirement-choice-user-message',
+    sessionId: 'session-requirement-choice',
+    ts: '2026-01-01T00:00:00.000Z',
+    kind: 'user_msg',
+    payload: { content: initialRequest },
+  };
+  const events: AgentEvent[] = [
+    initialMessage,
+    createSessionTurnAuthorityEvent({
+      sessionId: 'session-requirement-choice',
+      runId: 'run-requirement-choice',
+      turnId: 'turn-requirement-choice',
+      taskId: 'task-requirement-choice',
+      messages: [{ messageId: initialMessage.id, content: initialRequest }],
+      relation: 'newTask',
+      boundAtHookRef: 'run.initialized',
+      outputLanguage: 'en-US',
+      eventId: 'authority-requirement-choice',
+      timestamp: '2026-01-01T00:00:00.000Z',
+    }),
+    {
     id: 'requirement-choice-waiting',
     sessionId: 'session-requirement-choice',
     ts: '2026-01-01T00:00:00.000Z',
@@ -7551,7 +6594,7 @@ async function assertSessionDriverLoopRequirementChoiceEntersResumePrompt(): Pro
       title: 'Requirement confirmation',
       summary: 'Choose a generic test branch.',
       content: 'Choose a generic test branch.',
-      originalUserRequest: 'Create a generic user intervention test.',
+      originalUserRequest: initialRequest,
       runId: 'run-requirement-choice',
       requirementId: 'requirement-choice',
       status: 'waitingUserConfirmation',
@@ -7566,7 +6609,8 @@ async function assertSessionDriverLoopRequirementChoiceEntersResumePrompt(): Pro
         allowsFreeform: true,
       },
     },
-  }];
+    },
+  ];
   const session: AgentSession = {
     id: 'session-requirement-choice',
     mode: 'plan',
@@ -7582,11 +6626,8 @@ async function assertSessionDriverLoopRequirementChoiceEntersResumePrompt(): Pro
     kernelCommand: async (request): Promise<KernelReply> => fakeKernel(request),
     llmChat: async (request): Promise<ApiResponse<LlmChatResult>> => {
       llmRequests.push(request);
-      return jsonLlmResponse({
-        schemaVersion: 'deepcode.agent.protocol.v3',
-        kind: 'answer',
-        outputLanguage: 'en-US',
-        answer: { format: 'markdown', content: 'Generic choice was received.' },
+      return semanticToolLlmResponse('session.submit_answer', {
+        content: 'Generic choice was received.',
       });
     },
     now: () => '2026-01-01T00:00:00.000Z',
@@ -7609,11 +6650,11 @@ async function assertSessionDriverLoopRequirementChoiceEntersResumePrompt(): Pro
 
   assertEqual(llmRequests.length, 1, 'accepted requirement choice resumes provider once');
   const promptText = llmRequests.flatMap((request) => request.messages.map((message) => message.content)).join('\n');
-  assert(promptText.includes('The user has resolved the previous decisionRequest'), 'resume prompt states that the user already selected an option in English');
+  assert(promptText.includes('The user has already resolved the previous decisionRequest'), 'resume prompt states that the user already selected an option in English');
   assert(promptText.includes('Alpha branch'), 'resume prompt includes the selected option label');
-  assert(promptText.includes('Do not repeat the same decisionRequest'), 'resume prompt guards against repeating the same decision request');
+  assert(promptText.includes('Do not repeat that intervention'), 'resume prompt guards against repeating the same decision request');
   assert(!/[\u3400-\u9FFF]/.test(promptText), 'resume prompt does not inject CJK system instructions for an English user request');
-  assert(promptText.includes('current user request language'), 'resume prompt constrains user-visible output language separately from English system instructions');
+  assert(promptText.includes('current user input language'), 'resume prompt constrains user-visible output language separately from English system instructions');
   assert(
     promptText.includes('kind: ConfirmedDecision') || promptText.includes('"kind": "ConfirmedDecision"'),
     'resume prompt contains a formal confirmed decision frame'
@@ -7624,7 +6665,29 @@ async function assertSessionDriverLoopRequirementChoiceEntersResumePrompt(): Pro
 
 async function assertSessionDriverLoopRequirementFinishWithAnswerClosesWithoutProviderLoop(): Promise<void> {
   const suffix = randomSmokeToken('finish');
-  const events: AgentEvent[] = [{
+  const initialRequest = 'Handle a generic accepted-plan checkpoint.';
+  const initialMessage: AgentEvent = {
+    id: `user-message-${suffix}`,
+    sessionId: `session-${suffix}`,
+    ts: '2026-01-01T00:00:00.000Z',
+    kind: 'user_msg',
+    payload: { content: initialRequest },
+  };
+  const events: AgentEvent[] = [
+    initialMessage,
+    createSessionTurnAuthorityEvent({
+      sessionId: `session-${suffix}`,
+      runId: `run-${suffix}`,
+      turnId: `turn-${suffix}`,
+      taskId: `task-${suffix}`,
+      messages: [{ messageId: initialMessage.id, content: initialRequest }],
+      relation: 'newTask',
+      boundAtHookRef: 'run.initialized',
+      outputLanguage: 'en-US',
+      eventId: `authority-${suffix}`,
+      timestamp: '2026-01-01T00:00:00.000Z',
+    }),
+    {
     id: `requirement-${suffix}`,
     sessionId: `session-${suffix}`,
     ts: '2026-01-01T00:00:00.000Z',
@@ -7633,7 +6696,7 @@ async function assertSessionDriverLoopRequirementFinishWithAnswerClosesWithoutPr
       title: 'Requirement confirmation',
       summary: 'Choose a generic continuation.',
       content: 'Choose a generic continuation.',
-      originalUserRequest: 'Handle a generic accepted-plan checkpoint.',
+      originalUserRequest: initialRequest,
       runId: `run-${suffix}`,
       requirementId: `requirement-${suffix}`,
       status: 'waitingUserConfirmation',
@@ -7659,7 +6722,8 @@ async function assertSessionDriverLoopRequirementFinishWithAnswerClosesWithoutPr
         allowsFreeform: true,
       },
     },
-  }];
+    },
+  ];
   const session: AgentSession = {
     id: `session-${suffix}`,
     mode: 'plan',
@@ -7676,7 +6740,7 @@ async function assertSessionDriverLoopRequirementFinishWithAnswerClosesWithoutPr
     llmChat: async (): Promise<ApiResponse<LlmChatResult>> => {
       llmCalls += 1;
       return jsonLlmResponse({
-        schemaVersion: 'deepcode.agent.protocol.v3',
+        schemaVersion: 'deepcode.agent.protocol.v4',
         kind: 'answer',
         outputLanguage: 'en-US',
         answer: { format: 'markdown', content: 'This should not be needed for finishWithAnswer.' },
@@ -7737,8 +6801,10 @@ async function assertSessionDriverLoopProjectsTaskPlanBeforeComplete(): Promise<
         tasks: [{
           taskId: 'task-generic-write',
           title: 'Prepare generic workspace output',
-          operation: 'replaceFile',
-          targets: ['generic-output.txt'],
+          toolId: 'fs.write',
+          target: ['generic-output.txt'],
+          args: {},
+          dependencies: [],
           acceptanceCriteria: ['Kernel facts show the accepted target was updated after execution.'],
           failureCriteria: ['Stop if implementation needs targets outside the accepted task plan.'],
         }],
@@ -7752,14 +6818,21 @@ async function assertSessionDriverLoopProjectsTaskPlanBeforeComplete(): Promise<
 
   const result = await loop.runUserTurn({
     sessionId: 'session-task-plan',
-    content: 'Create a generic multi-file workspace change.',
+    content: 'Update the attached generic workspace file.',
+    attachments: [{
+      kind: 'file',
+      path: 'generic-output.txt',
+      absolutePath: '/tmp/generic-output.txt',
+      source: 'userSelected',
+      scope: 'message',
+    }],
   });
   const planCard = result.events.find((event) => event.kind === 'plan_card');
   const payload = planCard?.payload as Record<string, any> | undefined;
   assertEqual(llmCalls, 1, 'taskPlan is produced by provider once');
   assertEqual(proposalSubmits, 0, 'taskPlan does not submit executable Kernel ProposalSubmit before user confirmation');
   assertEqual(Boolean(payload?.taskPlan), true, 'taskPlan projects to a confirmable plan card');
-  assertEqual(Array.isArray(payload?.codeBlocks) && payload.codeBlocks.length === 0, true, 'taskPlan plan card carries no source code');
+  assertEqual(Array.isArray(payload?.contentBlocks) && payload.contentBlocks.length === 0, true, 'taskPlan plan card carries no source code');
   assertEqual(Boolean(payload?.actionBundle?.actions?.length), false, 'taskPlan plan card carries no executable actions');
 }
 
@@ -7768,7 +6841,22 @@ function assertLegacyProviderShapesAreRejected(): void {
     runId: 'run-generic-plan',
     sessionId: 'session-generic-plan',
     raw: JSON.stringify({
-      schemaVersion: 'deepcode.agent.protocol.v3',
+      schemaVersion: 'deepcode.agent.protocol.v4',
+      answer: { format: 'markdown', content: 'Kind inference is not allowed.' },
+    }),
+  }), 'Agent Protocol v4.kind');
+
+  assertThrows(() => parseProposalEnvelope({
+    runId: 'run-generic-plan',
+    sessionId: 'session-generic-plan',
+    raw: '```json\n{"schemaVersion":"deepcode.agent.protocol.v4","kind":"answer","answer":{"format":"markdown","content":"fenced"}}\n```',
+  }), 'must be valid JSON');
+
+  assertThrows(() => parseProposalEnvelope({
+    runId: 'run-generic-plan',
+    sessionId: 'session-generic-plan',
+    raw: JSON.stringify({
+      schemaVersion: 'deepcode.agent.protocol.v4',
       kind: 'implementationPlan',
       outputLanguage: 'en-US',
       implementationPlan: {
@@ -7785,11 +6873,11 @@ function assertLegacyProviderShapesAreRejected(): void {
     runId: 'run-generic-plan',
     sessionId: 'session-generic-plan',
     raw: JSON.stringify({
-      schemaVersion: 'deepcode.agent.protocol.v3',
+      schemaVersion: 'deepcode.agent.protocol.v4',
       kind: 'actionBundle',
       outputLanguage: 'en-US',
       userPlanMarkdown: '# Plan\n\n## Summary\nGeneric plan.',
-      codeBlocks: [],
+      contentBlocks: [],
       actionBundle: {
         version: '1',
         id: 'bundle-legacy-capability',
@@ -7810,11 +6898,11 @@ function assertLegacyProviderShapesAreRejected(): void {
     runId: 'run-generic-plan',
     sessionId: 'session-generic-plan',
     raw: JSON.stringify({
-      schemaVersion: 'deepcode.agent.protocol.v3',
+      schemaVersion: 'deepcode.agent.protocol.v4',
       kind: 'actionBundle',
       outputLanguage: 'en-US',
       userPlanMarkdown: '# Plan\n\n## Summary\nGeneric plan.',
-      codeBlocks: [{
+      contentBlocks: [{
         blockId: 'block-generic',
         targetPath: 'generic/output.txt',
         content: 'line 1\nline 2',
@@ -7826,14 +6914,31 @@ function assertLegacyProviderShapesAreRejected(): void {
         actions: [{
           actionId: 'write-generic',
           toolId: 'fs.write',
-          args: { path: 'generic/output.txt', sourceBlockId: 'block-generic' },
+          args: { path: 'generic/output.txt', contentBlockId: 'block-generic' },
           description: 'Canonical action.',
         }],
         validationExpectations: [{ id: 'validation-generic', description: 'Kernel records the proposed validation.' }],
         reviewExpectations: [{ id: 'review-generic', description: 'User reviews the scoped change.' }],
       },
     }),
-  }), 'must use contentLines');
+  }), 'content is not provider-facing');
+
+  const legacyUserPlan = genericWriteProposal(false);
+  legacyUserPlan.userPlan = legacyUserPlan.userPlanMarkdown;
+  delete legacyUserPlan.userPlanMarkdown;
+  assertThrows(() => parseProposalEnvelope({
+    runId: 'run-generic-plan',
+    sessionId: 'session-generic-plan',
+    raw: JSON.stringify(legacyUserPlan),
+  }), 'userPlan is not provider-facing');
+
+  const stringContentLines = genericWriteProposal(false);
+  (stringContentLines.contentBlocks as any[])[0].contentLines = 'line one\nline two';
+  assertThrows(() => parseProposalEnvelope({
+    runId: 'run-generic-plan',
+    sessionId: 'session-generic-plan',
+    raw: JSON.stringify(stringContentLines),
+  }), 'contentLines must be non-empty');
 
   const taskPlan = parseProposalEnvelope({
     runId: 'run-generic-plan',
@@ -7846,55 +6951,59 @@ function assertLegacyProviderShapesAreRejected(): void {
   assertEqual(Boolean(taskPlanPayload.actionBundle), false, 'taskPlan does not carry executable actionBundle');
 
   const invalidTaskPlan = genericTaskPlanProposal();
-  (invalidTaskPlan.taskPlan as any).codeBlocks = [{ blockId: 'block-generic', contentLines: ['x'] }];
+  (invalidTaskPlan.taskPlan as any).contentBlocks = [{ blockId: 'block-generic', contentLines: ['x'] }];
   assertThrows(() => parseProposalEnvelope({
     runId: 'run-generic-plan',
     sessionId: 'session-generic-plan',
     raw: JSON.stringify(invalidTaskPlan),
-  }), 'codeBlocks is not allowed');
+  }), 'contentBlocks is not allowed');
+
+  assertThrows(() => parseProposalEnvelope({
+    runId: 'run-generic-plan',
+    sessionId: 'session-generic-plan',
+    raw: JSON.stringify({
+      schemaVersion: 'deepcode.agent.protocol.v4',
+      kind: 'resourceRequest',
+      resourceRequest: {
+        id: 'legacy-resource-type',
+        reason: 'Legacy resource item shape.',
+        items: [{ id: 'legacy-item', resourceType: 'file', path: 'generic.txt', reason: 'Read generic text.' }],
+      },
+    }),
+  }), 'resourceType is not accepted');
 }
 
-function assertV3Parser(): void {
+function assertV4Parser(): void {
   const answer = parseProposalEnvelope({
     runId: 'run-generic',
     sessionId: 'session-generic',
     raw: JSON.stringify({
-      schemaVersion: 'deepcode.agent.protocol.v3',
+      schemaVersion: 'deepcode.agent.protocol.v4',
       kind: 'answer',
       narration: 'This narration is ignored for final answer rendering.',
       outputLanguage: 'en-US',
       answer: { format: 'markdown', content: 'Generic answer.' },
     }),
   });
-  assertEqual(answer.kind, 'answer', 'v3 answer parses');
-  assertEqual(answer.runId, 'run-generic', 'v3 parser binds run id');
-  assertEqual(answer.narration, 'This narration is ignored for final answer rendering.', 'v3 parser preserves optional narration');
+  assertEqual(answer.kind, 'answer', 'v4 answer parses');
+  assertEqual(answer.runId, 'run-generic', 'v4 parser binds run id');
+  assertEqual(answer.narration, 'This narration is ignored for final answer rendering.', 'v4 parser preserves optional narration');
 
-  const taskOutcome = parseProposalEnvelope({
+  assertThrows(() => parseProposalEnvelope({
     runId: 'run-generic',
     sessionId: 'session-generic',
     raw: JSON.stringify({
-      schemaVersion: 'deepcode.agent.protocol.v3',
+      schemaVersion: 'deepcode.agent.protocol.v4',
       kind: 'taskOutcome',
-      outputLanguage: 'en-US',
-      taskOutcome: {
-        version: '1',
-        id: 'task-outcome-generic',
-        taskId: 'task-generic',
-        status: 'modelJudgedSufficient',
-        reason: 'The visible task state is already sufficient for the current accepted task.',
-        evidenceRefs: ['evidence-generic'],
-      },
+      taskOutcome: { reason: 'Legacy task outcome.' },
     }),
-  });
-  assertEqual(taskOutcome.kind, 'taskOutcome', 'v3 taskOutcome parses');
-  assertEqual((taskOutcome.payload as Record<string, any>).status, 'modelJudgedSufficient', 'taskOutcome preserves model judged sufficient status');
+  }), 'unsupported');
 
   const resourceRequest = parseProposalEnvelope({
     runId: 'run-generic',
     sessionId: 'session-generic',
     raw: JSON.stringify({
-      schemaVersion: 'deepcode.agent.protocol.v3',
+      schemaVersion: 'deepcode.agent.protocol.v4',
       kind: 'resourceRequest',
       outputLanguage: 'en-US',
       resourceRequest: {
@@ -7905,15 +7014,15 @@ function assertV3Parser(): void {
       },
     }),
   });
-  assertEqual(resourceRequest.kind, 'resourceRequest', 'v3 resourceRequest path item parses');
+  assertEqual(resourceRequest.kind, 'resourceRequest', 'v4 resourceRequest path item parses');
   const resourcePayload = resourceRequest.payload as any;
-  assertEqual(resourcePayload.items[0].path, 'src/generic.txt', 'v3 resourceRequest keeps root-relative path');
+  assertEqual(resourcePayload.items[0].path, 'src/generic.txt', 'v4 resourceRequest keeps root-relative path');
 
   const rootResourceRequest = parseProposalEnvelope({
     runId: 'run-generic',
     sessionId: 'session-generic',
     raw: JSON.stringify({
-      schemaVersion: 'deepcode.agent.protocol.v3',
+      schemaVersion: 'deepcode.agent.protocol.v4',
       kind: 'resourceRequest',
       outputLanguage: 'en-US',
       resourceRequest: {
@@ -7925,14 +7034,14 @@ function assertV3Parser(): void {
     }),
   });
   const rootPayload = rootResourceRequest.payload as any;
-  assertEqual(rootPayload.items[0].manifestEntryId, 'root-generic', 'v3 resourceRequest rootId plus empty path canonicalizes to root manifest entry');
-  assertEqual(rootPayload.items[0].path, undefined, 'v3 resourceRequest root path canonicalization omits empty path');
+  assertEqual(rootPayload.items[0].manifestEntryId, 'root-generic', 'v4 resourceRequest rootId plus empty path canonicalizes to root manifest entry');
+  assertEqual(rootPayload.items[0].path, undefined, 'v4 resourceRequest root path canonicalization omits empty path');
 
-  const aliasResourceRequest = parseProposalEnvelope({
+  assertThrows(() => parseProposalEnvelope({
     runId: 'run-generic',
     sessionId: 'session-generic',
     raw: JSON.stringify({
-      schemaVersion: 'deepcode.agent.protocol.v3',
+      schemaVersion: 'deepcode.agent.protocol.v4',
       kind: 'resourceRequest',
       outputLanguage: 'en-US',
       resourceRequest: {
@@ -7942,16 +7051,13 @@ function assertV3Parser(): void {
         resources: [{ id: 'alias-item', resourceType: 'file', rootId: 'root-generic', path: 'src/alias.txt', reason: 'Read alias source.' }],
       },
     }),
-  });
-  const aliasPayload = aliasResourceRequest.payload as any;
-  assertEqual(aliasPayload.items[0].path, 'src/alias.txt', 'v3 resourceRequest resources[] alias canonicalizes to items[]');
-  assertEqual(aliasPayload.items[0].kind, 'file', 'v3 resourceRequest resourceType alias canonicalizes to kind');
+  }), 'items must be an array');
 
   const rangedResourceRequest = parseProposalEnvelope({
     runId: 'run-generic',
     sessionId: 'session-generic',
     raw: JSON.stringify({
-      schemaVersion: 'deepcode.agent.protocol.v3',
+      schemaVersion: 'deepcode.agent.protocol.v4',
       kind: 'resourceRequest',
       outputLanguage: 'en-US',
       resourceRequest: {
@@ -7963,14 +7069,14 @@ function assertV3Parser(): void {
     }),
   });
   const rangedPayload = rangedResourceRequest.payload as any;
-  assertEqual(rangedPayload.items[0].offsetBytes, 12000, 'v3 resourceRequest preserves offsetBytes');
-  assertEqual(rangedPayload.items[0].limitBytes, 6000, 'v3 resourceRequest preserves limitBytes');
+  assertEqual(rangedPayload.items[0].offsetBytes, 12000, 'v4 resourceRequest preserves offsetBytes');
+  assertEqual(rangedPayload.items[0].limitBytes, 6000, 'v4 resourceRequest preserves limitBytes');
 
   const searchResourceRequest = parseProposalEnvelope({
     runId: 'run-generic',
     sessionId: 'session-generic',
     raw: JSON.stringify({
-      schemaVersion: 'deepcode.agent.protocol.v3',
+      schemaVersion: 'deepcode.agent.protocol.v4',
       kind: 'resourceRequest',
       outputLanguage: 'en-US',
       resourceRequest: {
@@ -7991,46 +7097,71 @@ function assertV3Parser(): void {
     }),
   });
   const searchPayload = searchResourceRequest.payload as any;
-  assertEqual(searchPayload.items[0].kind, 'search', 'v3 resourceRequest search item parses');
-  assertEqual(searchPayload.items[0].query, 'generic anchor', 'v3 resourceRequest preserves search query');
-  assertEqual(searchPayload.items[0].include[0], 'src/', 'v3 resourceRequest preserves include filter');
-  assertEqual(searchPayload.items[0].contextLines, 2, 'v3 resourceRequest preserves contextLines');
-  assertEqual(searchPayload.items[0].maxResults, 25, 'v3 resourceRequest preserves maxResults');
+  assertEqual(searchPayload.items[0].kind, 'search', 'v4 resourceRequest search item parses');
+  assertEqual(searchPayload.items[0].query, 'generic anchor', 'v4 resourceRequest preserves search query');
+  assertEqual(searchPayload.items[0].include[0], 'src/', 'v4 resourceRequest preserves include filter');
+  assertEqual(searchPayload.items[0].contextLines, 2, 'v4 resourceRequest preserves contextLines');
+  assertEqual(searchPayload.items[0].maxResults, 25, 'v4 resourceRequest preserves maxResults');
 
-  const shorthandDecisionRequest = parseProposalEnvelope({
+  const decisionRequest = parseProposalEnvelope({
     runId: 'run-generic',
     sessionId: 'session-generic',
     raw: JSON.stringify({
-      schemaVersion: 'deepcode.agent.protocol.v3',
+      schemaVersion: 'deepcode.agent.protocol.v4',
       kind: 'decisionRequest',
       outputLanguage: 'en-US',
-      reason: 'Need user choice for a generic boundary.',
-      options: [
-        {
-          id: 'retry',
-          label: 'Retry',
-          labelKey: 'session.driver.acceptedPlanScope.option.regenerate.label',
-          description: 'Retry with the current accepted scope.',
-          descriptionKey: 'session.driver.acceptedPlanScope.option.regenerate.description',
-          messageArgs: { targetPath: `target-${randomSmokeToken('decision-option')}` },
-        },
-        { id: 'revise', label: 'Revise', description: 'Ask the user to revise the scope.' },
-      ],
+      decisionRequest: {
+        id: 'decision-generic-boundary',
+        question: 'Need user choice for a generic boundary.',
+        options: [
+          {
+            id: 'retry',
+            label: 'Retry',
+            description: 'Retry with the current accepted scope.',
+          },
+          { id: 'revise', label: 'Revise', description: 'Ask the user to revise the scope.' },
+        ],
+      },
     }),
   });
-  const decisionPayload = shorthandDecisionRequest.payload as any;
-  assertEqual(decisionPayload.question, 'Need user choice for a generic boundary.', 'v3 decisionRequest shorthand is canonicalized to a question');
-  assertEqual(decisionPayload.options.length, 2, 'v3 decisionRequest shorthand preserves valid options');
-  assertEqual(decisionPayload.options[0].labelKey, 'session.driver.acceptedPlanScope.option.regenerate.label', 'v3 decisionRequest preserves option label i18n key');
-  assertEqual(decisionPayload.options[0].descriptionKey, 'session.driver.acceptedPlanScope.option.regenerate.description', 'v3 decisionRequest preserves option description i18n key');
-  assert(typeof decisionPayload.options[0].messageArgs?.targetPath === 'string', 'v3 decisionRequest preserves string option i18n args');
+  const decisionPayload = decisionRequest.payload as any;
+  assertEqual(decisionPayload.question, 'Need user choice for a generic boundary.', 'v4 decisionRequest preserves the canonical question');
+  assertEqual(decisionPayload.options.length, 2, 'v4 decisionRequest preserves valid options');
+  assertEqual(decisionPayload.options[0].recommended, true, 'v4 decisionRequest deterministically recommends the first option by default');
+
+  for (const forbiddenOptionField of ['labelKey', 'descriptionKey', 'messageArgs', 'effect']) {
+    assertThrows(() => parseProposalEnvelope({
+      runId: 'run-generic',
+      raw: JSON.stringify({
+        schemaVersion: 'deepcode.agent.protocol.v4',
+        kind: 'decisionRequest',
+        decisionRequest: {
+          id: `decision-internal-${forbiddenOptionField}`,
+          question: 'Provider options must use the canonical public fields.',
+          options: [
+            {
+              id: 'first',
+              label: 'First',
+              description: 'First public option.',
+              [forbiddenOptionField]: forbiddenOptionField === 'effect'
+                ? { kind: 'continueWithAction' }
+                : forbiddenOptionField === 'messageArgs'
+                  ? { value: 'internal' }
+                  : 'internal.key',
+            },
+            { id: 'second', label: 'Second', description: 'Second public option.' },
+          ],
+        },
+      }),
+    }), `${forbiddenOptionField} is Session-internal`);
+  }
 
   assertThrows(() => parseProposalEnvelope({
     runId: 'run-generic',
     raw: JSON.stringify({
-      schemaVersion: 'deepcode.agent.protocol.v3',
+      schemaVersion: 'deepcode.agent.protocol.v4',
       kind: 'decisionRequest',
-      reason: 'Missing options should fail closed.',
+      decisionRequest: { id: 'decision-missing-options', question: 'Missing options should fail closed.' },
     }),
   }), 'options must include 2-3 options');
 
@@ -8041,12 +7172,12 @@ function assertV3Parser(): void {
       kind: 'answer',
       answer: { format: 'markdown', content: 'legacy' },
     }),
-  }), 'deepcode.agent.protocol.v3');
+  }), 'deepcode.agent.protocol.v4');
 
   assertThrows(() => parseProposalEnvelope({
     runId: 'run-generic',
     raw: JSON.stringify({
-      schemaVersion: 'deepcode.agent.protocol.v3',
+      schemaVersion: 'deepcode.agent.protocol.v4',
       kind: 'resourceRequest',
       resourceRequest: {
         version: '1',
@@ -8059,7 +7190,7 @@ function assertV3Parser(): void {
   assertThrows(() => parseProposalEnvelope({
     runId: 'run-generic',
     raw: JSON.stringify({
-      schemaVersion: 'deepcode.agent.protocol.v3',
+      schemaVersion: 'deepcode.agent.protocol.v4',
       kind: 'resourceRequest',
       resourceRequest: {
         version: '1',
@@ -8072,7 +7203,7 @@ function assertV3Parser(): void {
   assertThrows(() => parseProposalEnvelope({
     runId: 'run-generic',
     raw: JSON.stringify({
-      schemaVersion: 'deepcode.agent.protocol.v3',
+      schemaVersion: 'deepcode.agent.protocol.v4',
       kind: 'reviewSummary',
       reviewSummary: { status: 'accepted', content: 'not provider output' },
     }),
@@ -8080,258 +7211,58 @@ function assertV3Parser(): void {
 }
 
 function assertActionBundleProtocolFields(): void {
-  const bundle = genericActionBundle();
-  assertEqual(bundle.actions.some((action) => action.capability === 'fs.write'), true, 'actionBundle carries fs.write capability');
-  assertEqual(bundle.validationExpectations.length > 0, true, 'actionBundle carries validation expectations');
-  assertEqual(bundle.reviewExpectations.length > 0, true, 'actionBundle carries review expectations');
-
   const proposal = parseProposalEnvelope({
-    runId: 'run-normalize',
-    sessionId: 'session-normalize',
-    raw: JSON.stringify(providerFacingWriteProposalWithoutMachineIds()),
-  });
-  const payload = proposal.payload as any;
-  assertEqual(payload.actionBundle.id, 'proposal-run-normalize-actionBundle-action-bundle', 'Session parser fills actionBundle id deterministically');
-  assertEqual(payload.codeBlocks[0].id, 'generic-block', 'Session parser maps blockId to codeBlock id');
-  assertEqual(payload.codeBlocks[0].path, 'generic-output.txt', 'Session parser maps targetPath to codeBlock path');
-  assertEqual(payload.actionBundle.actions[0].id, 'write-generic-output', 'Session parser maps actionId to action id');
-  assertEqual(payload.actionBundle.actions[0].title, 'Write generic output', 'Session parser maps description to action title');
-  assertEqual(payload.actionBundle.actions[0].canParallelize, false, 'Session parser fills canParallelize default');
-  assertEqual(payload.actionBundle.actions[0].conflictKeys[0], 'generic-output.txt', 'Session parser derives conflict key from resource scope');
-
-  const token = randomSmokeToken('goal');
-  const missingGoalRaw = providerFacingWriteProposalWithoutMachineIds() as any;
-  missingGoalRaw.userPlanMarkdown = `Write random accepted target ${token}.`;
-  delete missingGoalRaw.userPlan;
-  delete missingGoalRaw.actionBundle.goal;
-  missingGoalRaw.codeBlocks[0].targetPath = `${token}.txt`;
-  missingGoalRaw.actionBundle.actions[0].args = { path: `${token}.txt`, sourceBlockId: 'generic-block' };
-  const missingGoalProposal = parseProposalEnvelope({
-    runId: `run-${token}`,
-    sessionId: `session-${token}`,
-    raw: missingGoalRaw,
-  });
-  const missingGoalBundle = (missingGoalProposal.payload as any).actionBundle;
-  assertEqual(
-    missingGoalBundle.goal,
-    `Write random accepted target ${token}.`,
-    'Session parser derives missing actionBundle.goal from top-level userPlanMarkdown'
-  );
-
-  const targetHintToken = randomSmokeToken('block-target');
-  const targetHintPath = `targets/${targetHintToken}.txt`;
-  const targetHintBlockId = `block-${targetHintToken}`;
-  const targetHintRaw = providerFacingWriteProposalWithoutMachineIds() as any;
-  targetHintRaw.codeBlocks[0] = {
-    blockId: targetHintBlockId,
-    language: 'text',
-    contentLines: [`content-${targetHintToken}`],
-  };
-  targetHintRaw.actionBundle.actions[0].args = { path: targetHintPath, sourceBlockId: targetHintBlockId };
-  const targetHintProposal = parseProposalEnvelope({
-    runId: `run-${targetHintToken}`,
-    sessionId: `session-${targetHintToken}`,
-    raw: targetHintRaw,
-  });
-  assertEqual(
-    (targetHintProposal.payload as any).codeBlocks[0].targetPath,
-    targetHintPath,
-    'Session parser infers missing codeBlock targetPath from the matching fs.write action block reference'
-  );
-
-  const contentLinesStringToken = randomSmokeToken('content-lines-string');
-  const contentLinesStringRaw = providerFacingWriteProposalWithoutMachineIds() as any;
-  contentLinesStringRaw.codeBlocks[0] = {
-    blockId: `block-${contentLinesStringToken}`,
-    targetPath: `targets/${contentLinesStringToken}.txt`,
-    language: 'text',
-    contentLines: `line-a-${contentLinesStringToken}\nline-b-${contentLinesStringToken}`,
-  };
-  contentLinesStringRaw.actionBundle.actions[0].args = {
-    path: `targets/${contentLinesStringToken}.txt`,
-    sourceBlockId: `block-${contentLinesStringToken}`,
-  };
-  const contentLinesStringProposal = parseProposalEnvelope({
-    runId: `run-${contentLinesStringToken}`,
-    sessionId: `session-${contentLinesStringToken}`,
-    raw: contentLinesStringRaw,
-  });
-  assertEqual(
-    (contentLinesStringProposal.payload as any).codeBlocks[0].content,
-    `line-a-${contentLinesStringToken}\nline-b-${contentLinesStringToken}`,
-    'Session parser canonicalizes contentLines string into provider code block content'
-  );
-  assertEqual(
-    (contentLinesStringProposal.payload as any).codeBlocks[0].contentLines.length,
-    2,
-    'Session parser splits contentLines string into line array'
-  );
-
-  const missingKindToken = randomSmokeToken('missing-kind');
-  const missingKindRaw = providerFacingWriteProposalWithoutMachineIds() as any;
-  delete missingKindRaw.kind;
-  missingKindRaw.actionBundle.id = `bundle-${missingKindToken}`;
-  const missingKindProposal = parseProposalEnvelope({
-    runId: `run-${missingKindToken}`,
-    sessionId: `session-${missingKindToken}`,
-    raw: missingKindRaw,
-  });
-  assertEqual(
-    missingKindProposal.kind,
-    'actionBundle',
-    'Session parser infers a missing envelope kind from a unique top-level proposal payload'
-  );
-
-  const ambiguousMissingKindRaw = providerFacingWriteProposalWithoutMachineIds() as any;
-  delete ambiguousMissingKindRaw.kind;
-  ambiguousMissingKindRaw.resourceRequest = {
-    items: [{ id: `item-${missingKindToken}`, path: `targets/${missingKindToken}.txt`, reason: 'Read generic target.' }],
-  };
-  assertThrows(() => parseProposalEnvelope({
-    runId: `run-ambiguous-${missingKindToken}`,
-    raw: ambiguousMissingKindRaw,
-  }), 'Agent Protocol v3.kind must be a non-empty string');
-
-  const missingToolActionRaw = providerFacingWriteProposalWithoutMachineIds() as any;
-  missingToolActionRaw.actionBundle = {
-    ...missingToolActionRaw.actionBundle,
-    actions: [{ actionId: 'missing-tool-action', description: 'Missing executable tool id.', args: { path: 'generic-output.txt' } }],
-  };
-  assertThrows(() => parseProposalEnvelope({
-    runId: 'run-action-missing-tool',
-    raw: missingToolActionRaw,
-  }), 'actions[0].toolId must be a non-empty Kernel catalog toolId');
-
-  const continuationStringRaw = providerFacingWriteProposalWithoutMachineIds() as any;
-  continuationStringRaw.actionBundle = {
-    ...continuationStringRaw.actionBundle,
-    continuationExpectations: ['Continue with the next generic accepted slice.'],
-  };
-  const continuationStringProposal = parseProposalEnvelope({
-    runId: 'run-continuation-string',
-    sessionId: 'session-continuation-string',
-    raw: continuationStringRaw,
-  });
-  assertEqual(
-    ((continuationStringProposal.payload as any).actionBundle.continuationExpectations[0] as any).description,
-    'Continue with the next generic accepted slice.',
-    'string continuationExpectation is canonicalized to non-executable object form'
-  );
-
-  const continuationObjectRaw = providerFacingWriteProposalWithoutMachineIds() as any;
-  continuationObjectRaw.actionBundle = {
-    ...continuationObjectRaw.actionBundle,
-    continuationExpectations: [{ id: 'next-generic-slice', description: 'Continue with another generic target.', target: ['generic-next.txt'] }],
-  };
-  const continuationObjectProposal = parseProposalEnvelope({
-    runId: 'run-continuation-object',
-    sessionId: 'session-continuation-object',
-    raw: continuationObjectRaw,
-  });
-  const continuationObject = ((continuationObjectProposal.payload as any).actionBundle.continuationExpectations[0] as any);
-  assertEqual(continuationObject.description, 'Continue with another generic target.', 'object continuationExpectation does not require toolId');
-  assertEqual(continuationObject.resourceScope[0], 'generic-next.txt', 'object continuationExpectation keeps target as review-only scope hint');
-
-  const wrappedRaw = providerFacingWriteProposalWithoutMachineIds() as any;
-  assertThrows(() => parseProposalEnvelope({
-    runId: 'run-actionbundle-payload-wrapper',
-    sessionId: 'session-actionbundle-payload-wrapper',
+    runId: "run-v4",
+    sessionId: "session-v4",
     raw: {
-      schemaVersion: 'deepcode.agent.protocol.v3',
-      kind: 'actionBundle',
-      outputLanguage: 'en-US',
-      narration: 'Prepare a generic write batch.',
-      payload: {
-        userPlanMarkdown: wrappedRaw.userPlan,
-        codeBlocks: wrappedRaw.codeBlocks,
-        commandBlocks: wrappedRaw.commandBlocks ?? [],
-        actionBundle: wrappedRaw.actionBundle,
-        expectedValidation: wrappedRaw.expectedValidation,
-        reviewGuide: wrappedRaw.reviewGuide,
+      schemaVersion: "deepcode.agent.protocol.v4",
+      proposalId: "proposal-v4",
+      kind: "actionBundle",
+      userPlanMarkdown: "# Plan\n\n## Summary\nWrite one file.",
+      contentBlocks: [{
+        blockId: "content-1",
+        targetPath: "generic-output.txt",
+        operation: "overwrite",
+        contentLines: ["line one", "line two"],
+      }],
+      actionBundle: {
+        id: "bundle-v4",
+        goal: "Write one file.",
+        actions: [{
+          actionId: "write-1",
+          toolId: "fs.write",
+          args: { path: "generic-output.txt", contentBlockId: "content-1" },
+          description: "Write generic output",
+          dependsOn: [],
+        }],
+        validationExpectations: [{ id: "validation-1", description: "Kernel records write facts." }],
+        reviewExpectations: [{ id: "review-1", description: "Review the write fact." }],
       },
     },
-  }), 'top-level field');
-
-  const compatibilityRaw = providerFacingWriteProposalWithoutMachineIds() as any;
-  compatibilityRaw.actionBundle = {
-    ...compatibilityRaw.actionBundle,
-    validationExpectations: 'Kernel records a generic validation fact.',
-    reviewExpectations: ['User reviews the generic action scope.'],
-  };
-  const compatibilityProposal = parseProposalEnvelope({
-    runId: 'run-expectation-compat',
-    sessionId: 'session-expectation-compat',
-    raw: compatibilityRaw,
   });
-  const compatibilityBundle = (compatibilityProposal.payload as any).actionBundle;
-  assertEqual(
-    compatibilityBundle.validationExpectations[0].description,
-    'Kernel records a generic validation fact.',
-    'string validationExpectation is canonicalized to object form'
-  );
-  assertEqual(
-    compatibilityBundle.reviewExpectations[0].description,
-    'User reviews the generic action scope.',
-    'string[] reviewExpectations are canonicalized to object form'
-  );
+  const payload = proposal.payload as any;
+  assertEqual(payload.actionBundle.id, "bundle-v4", "v4 preserves explicit actionBundle id");
+  assertEqual(payload.contentBlocks[0].blockId, "content-1", "v4 preserves canonical blockId");
+  assertEqual(payload.actionBundle.actions[0].actionId, "write-1", "v4 preserves canonical actionId");
+  assertEqual(payload.actionBundle.actions[0].toolId, "fs.write", "v4 preserves canonical toolId");
+  assertEqual(payload.actionBundle.actions[0].args.path, "generic-output.txt", "v4 preserves typed args");
 
-  const emptyExpectationRaw = providerFacingWriteProposalWithoutMachineIds() as any;
-  emptyExpectationRaw.actionBundle = {
-    ...emptyExpectationRaw.actionBundle,
-    validationExpectations: [''],
-  };
-  const emptyExpectationProposal = parseProposalEnvelope({
-    runId: 'run-empty-expectation',
-    raw: emptyExpectationRaw,
-  });
-  assertEqual(
-    ((emptyExpectationProposal.payload as any).actionBundle.validationExpectations ?? []).length,
-    0,
-    'empty validationExpectation notes are ignored so Session can derive defaults'
-  );
-
-  const missingDescriptionRaw = providerFacingWriteProposalWithoutMachineIds() as any;
-  missingDescriptionRaw.actionBundle = {
-    ...missingDescriptionRaw.actionBundle,
-    reviewExpectations: [{ id: 'review-without-description' }],
-  };
-  const missingDescriptionProposal = parseProposalEnvelope({
-    runId: 'run-missing-expectation-description',
-    raw: missingDescriptionRaw,
-  });
-  assertEqual(
-    ((missingDescriptionProposal.payload as any).actionBundle.reviewExpectations ?? []).length,
-    0,
-    'expectation objects without descriptions are ignored so Session can derive defaults'
-  );
-
-  const emptyContinuationRaw = providerFacingWriteProposalWithoutMachineIds() as any;
-  emptyContinuationRaw.actionBundle = {
-    ...emptyContinuationRaw.actionBundle,
-    continuationExpectations: [''],
-  };
-  assertThrows(() => parseProposalEnvelope({
-    runId: 'run-empty-continuation',
-    raw: emptyContinuationRaw,
-  }), 'continuationExpectations[0] string value must be non-empty');
-
-  const missingContinuationDescriptionRaw = providerFacingWriteProposalWithoutMachineIds() as any;
-  missingContinuationDescriptionRaw.actionBundle = {
-    ...missingContinuationDescriptionRaw.actionBundle,
-    continuationExpectations: [{ id: 'continuation-without-description' }],
-  };
-  assertThrows(() => parseProposalEnvelope({
-    runId: 'run-missing-continuation-description',
-    raw: missingContinuationDescriptionRaw,
-  }), 'continuationExpectations[0].description must be a non-empty string');
+  const missingId = JSON.parse(JSON.stringify({
+    schemaVersion: "deepcode.agent.protocol.v4",
+    kind: "actionBundle",
+    userPlanMarkdown: "Plan",
+    contentBlocks: [],
+    actionBundle: { actions: [], validationExpectations: [], reviewExpectations: [] },
+  }));
+  assertThrows(() => parseProposalEnvelope({ runId: "run-v4", raw: missingId }), "actionBundle.id");
 }
 
 function assertProviderRepairMessageBuilderAvoidsDuplicateActionBundleReference(): void {
   const token = randomSmokeToken('repair-reference');
   const prompt = buildPromptEnvelope({
     workflowState: `accepted-${token}`,
-    allowedProposals: ['actionBundle', 'resourceRequest', 'decisionRequest', 'taskOutcome', 'diagnostic'],
-    capabilityCatalogSummary: `currentTaskCapabilities=fs.write`,
+    allowedProposals: ['actionBundle', 'resourceRequest', 'decisionRequest', 'diagnostic'],
+    toolCatalogSummary: `currentTaskToolIds=fs.write`,
     userRequest: `Repair accepted task ${token}`,
   });
   const messages = new ProviderRepairMessageBuilder().repairMessages(prompt, {
@@ -8353,7 +7284,7 @@ function assertProviderRepairMessageBuilderAvoidsDuplicateActionBundleReference(
       taskTitle: `Task ${token}`,
       goal: `Handle target ${token}`,
       targets: [`target-${token}.txt`],
-      capabilities: ['fs.write'],
+      toolIds: ['fs.write'],
     },
     completedTaskCount: 0,
   }, '{invalid}', {
@@ -8384,7 +7315,7 @@ function assertProviderRepairMessageBuilderAvoidsDuplicateActionBundleReference(
       taskTitle: `Task ${token}`,
       goal: `Handle target ${token}`,
       targets: [`target-${token}.txt`],
-      capabilities: ['fs.write'],
+      toolIds: ['fs.write'],
     },
     completedTaskCount: 0,
   }, 'Payload budget exceeded.', '{invalid}')
@@ -8397,7 +7328,7 @@ function assertProviderRepairMessageBuilderAvoidsDuplicateActionBundleReference(
   assert(compactionRepair.includes('<ProviderTurnContract schemaVersion="deepcode.session.provider-turn-contract.v1">'), 'compaction repair includes ProviderTurnContract');
   assert(joined.includes('Use the ProviderTurnContract above as the schema authority.'), 'repair prompt names ProviderTurnContract as schema authority');
   assert(compactionRepair.includes('Use the ProviderTurnContract above as the schema authority.'), 'compaction repair names ProviderTurnContract as schema authority');
-  assert(joined.includes('Carrier fields by kind: actionBundle uses top-level userPlanMarkdown, codeBlocks, and actionBundle'), 'repair prompt keeps compact actionBundle carrier guidance');
+  assert(joined.includes('Carrier fields by kind: actionBundle uses top-level userPlanMarkdown, contentBlocks, and actionBundle'), 'repair prompt keeps compact actionBundle carrier guidance');
   assert(!joined.includes('Minimal actionBundle skeleton'), 'repair prompt does not re-inject an actionBundle skeleton');
   const validationLine = 'actionBundle.validationExpectations[] are optional reviewable validation notes shaped';
   assertEqual(joined.split(validationLine).length - 1, 0, 'repair quick reference does not duplicate actionBundle validation schema lines');
@@ -8408,7 +7339,7 @@ function assertProviderRepairMessageBuilderKeepsTaskPlanRepairShape(): void {
   const prompt = buildPromptEnvelope({
     workflowState: `plan-${token}`,
     allowedProposals: ['answer', 'resourceRequest', 'decisionRequest', 'taskPlan', 'diagnostic'],
-    capabilityCatalogSummary: 'fs.read',
+    toolCatalogSummary: 'fs.read',
     userRequest: `Plan generic workspace work ${token}`,
   });
   const messages = new ProviderRepairMessageBuilder().repairMessages(prompt, {
@@ -8416,7 +7347,7 @@ function assertProviderRepairMessageBuilderKeepsTaskPlanRepairShape(): void {
     userRequest: `Plan generic workspace work ${token}`,
     conversationRoots: [],
     resourcePackets: [],
-  }, '{"schemaVersion":"deepcode.agent.protocol.v3"}', {
+  }, '{"schemaVersion":"deepcode.agent.protocol.v4"}', {
     code: 'invalid_task_plan',
     message: 'taskPlan.tasks[0].acceptanceCriteria must include at least one reviewable criterion.',
   });
@@ -8427,7 +7358,7 @@ function assertProviderRepairMessageBuilderKeepsTaskPlanRepairShape(): void {
   assert(joined.includes('Minimal taskPlan skeleton'), 'taskPlan repair prompt includes a minimal valid taskPlan skeleton');
   assert(joined.includes('acceptanceCriteria'), 'taskPlan repair prompt requires task acceptance criteria');
   assert(joined.includes('failureCriteria'), 'taskPlan repair prompt requires task failure criteria');
-  assert(joined.includes('Use fs.write/fs.patch/fs.delete for workspace file-system changes'), 'taskPlan repair prompt routes file-system changes to fs capabilities');
+  assert(joined.includes('Use fs.write/fs.edit/fs.delete for workspace file-system changes'), 'taskPlan repair prompt routes file-system changes to fs toolIds');
   assert(joined.includes('do not use process.exec for mkdir/rm/cp/sed/cat-redirection'), 'taskPlan repair prompt avoids shell wrappers for workspace file mutations');
   assert(joined.includes('parent directories may be implied by planned concrete file writes'), 'taskPlan repair prompt avoids standalone directory creation tasks');
 }
@@ -8438,7 +7369,7 @@ function assertProviderRepairMessageBuilderScopesNativeRepairReferences(): void 
   const prompt = buildPromptEnvelope({
     workflowState: `repair-${token}`,
     allowedProposals: ['resourceRequest', 'decisionRequest', 'taskPlan', 'diagnostic'],
-    capabilityCatalogSummary: 'none',
+    toolCatalogSummary: 'none',
     userRequest: `Repair native tool call ${token}`,
   });
   const state = {
@@ -8456,7 +7387,6 @@ function assertProviderRepairMessageBuilderScopesNativeRepairReferences(): void 
         template: { toolId: 'fs.write', args: { path: `target-${token}.txt` } },
       }],
       pendingTasks: [{ taskId: `later-${token}`, title: rawAcceptedPlanMarker }],
-      accessScopes: [{ path: rawAcceptedPlanMarker }],
       rawPlan: { summary: rawAcceptedPlanMarker },
     },
     currentTaskContext: {
@@ -8464,7 +7394,7 @@ function assertProviderRepairMessageBuilderScopesNativeRepairReferences(): void 
       taskTitle: `Task ${token}`,
       goal: `Handle target ${token}`,
       targets: [`target-${token}.txt`],
-      capabilities: ['fs.write'],
+      toolIds: ['fs.write'],
     },
     completedTaskCount: 0,
   };
@@ -8498,13 +7428,6 @@ function assertProviderRepairMessageBuilderScopesNativeRepairReferences(): void 
       repeatCount: 2,
     },
   }], false).map((message) => typeof message.content === 'string' ? message.content : JSON.stringify(message.content)).join('\n');
-  const scopeRepair = builder.acceptedPlanScopeRepairMessages(prompt, state, {
-    proposalId: `proposal-${token}`,
-    kind: 'actionBundle',
-    payload: { actionBundle: { actions: [] } },
-  } as ProposalEnvelope, [`target outside accepted scope ${token}`])
-    .map((message) => typeof message.content === 'string' ? message.content : JSON.stringify(message.content))
-    .join('\n');
   const planReviewRepair = builder.planReviewRepairMessages(prompt, state, {
     proposalId: `proposal-review-${token}`,
     kind: 'actionBundle',
@@ -8517,16 +7440,8 @@ function assertProviderRepairMessageBuilderScopesNativeRepairReferences(): void 
   assertEqual(duplicateBeforeAccepted.split(shapeLine).length - 1, 0, 'pre-plan duplicate native read repair does not expose actionBundle shape');
   assert(!beforeAccepted.includes('No executable tool intent templates are visible'), 'pre-plan native repair omits redundant non-executable tool template prose');
   assert(beforeAccepted.includes('[ToolIntentTemplates]\n\n- none\n\n[/ToolIntentTemplates]'), 'pre-plan native repair leaves tool intent templates empty');
-  assert(!beforeAccepted.includes('ToolIntentTemplates or currentTaskCapabilities'), 'pre-plan native repair does not mention action tool intent selection');
-  assertEqual(scopeRepair.split(shapeLine).length - 1, 0, 'accepted-plan scope repair relies on current task contract instead of full actionBundle shape');
+  assert(!beforeAccepted.includes('ToolIntentTemplates or currentTaskToolIds'), 'pre-plan native repair does not mention action tool intent selection');
   assertEqual(planReviewRepair.split(shapeLine).length - 1, 0, 'plan review repair relies on Kernel report and provider turn contract instead of full actionBundle shape');
-  assert(scopeRepair.includes('ProviderTurnContract'), 'scope repair still includes provider turn contract');
-  assert(scopeRepair.includes('requiredSchemaVersion=deepcode.agent.protocol.v3'), 'scope repair contract carries the Agent Protocol schema version');
-  assert(scopeRepair.includes('current task action templates in ProviderTurnContract'), 'scope repair keeps actionBundle repair tool intent guidance');
-  assert(scopeRepair.includes('currentTaskActionTemplates'), 'scope repair still exposes current task action templates');
-  assert(!scopeRepair.includes('Minimal patch shape'), 'scope repair avoids embedding full actionBundle skeletons outside ProviderTurnContract guidance');
-  assert(!scopeRepair.includes('DecisionRequest minimal shape'), 'scope repair avoids embedding full decisionRequest skeletons outside ProviderTurnContract guidance');
-  assert(!scopeRepair.includes(rawAcceptedPlanMarker), 'scope repair does not expose raw accepted plan context fields');
   assert(planReviewRepair.includes('ProviderTurnContract'), 'plan review repair still includes provider turn contract');
   assert(!planReviewRepair.includes(rawAcceptedPlanMarker), 'plan review repair does not expose raw accepted plan context fields');
 }
@@ -8544,7 +7459,7 @@ function assertRunStateMachineTaskLedger(): void {
       taskId,
       title: `Generic batch ${index + 1}`,
       targets: [targets[index]],
-      capability: 'fs.write',
+      toolId: 'fs.write',
     })),
     completedTaskIds: [taskIds[0], taskIds[1]],
   });
@@ -8565,7 +7480,7 @@ function assertRunStateMachineTaskLedger(): void {
   assertEqual(frame.cachePolicy.projectMemoryRefresh, 'afterReviewOrRunCompletion', 'project memory does not refresh during active execution');
   assert(frame.stableFrameHash.length > 0, 'accepted plan prompt frame records a stable hash');
 
-  const acceptedPlan: AcceptedImplementationPlanContext = {
+  const acceptedPlan: AcceptedTaskPlanContext = {
     planId,
     runId,
     title: 'Generic ordered plan',
@@ -8574,16 +7489,17 @@ function assertRunStateMachineTaskLedger(): void {
       taskId,
       title: `Generic batch ${index + 1}`,
       targets: [targets[index]],
-      capability: 'fs.write',
+      toolId: 'fs.write',
       dependencies: [],
+      planningArgs: {},
       conflictKeys: [],
     })),
-    capabilities: [],
+    authorizationOperations: [],
+    toolIds: [],
     targetScopes: [],
-    exactOperationGrants: [],
-    accessScopes: [],
     batchIndex: 3,
     completedTaskIds: [taskIds[0], taskIds[1]],
+    dependencyFacts: [],
     rawPlan: {},
   };
   const workUnitId = `work-${suffix}`;
@@ -8592,7 +7508,7 @@ function assertRunStateMachineTaskLedger(): void {
     actionBatchHasFailureOrBlocker: () => false,
   });
   const proposal = {
-    schemaVersion: 'deepcode.agent.protocol.v3',
+    schemaVersion: 'deepcode.agent.protocol.v4',
     proposalId: `proposal-${suffix}`,
     runId,
     sessionId: `session-${suffix}`,
@@ -8606,7 +7522,7 @@ function assertRunStateMachineTaskLedger(): void {
         actions: [{
           actionId: `action-${suffix}`,
           toolId: 'fs.write',
-          targetPath: targets[2],
+          args: { path: targets[2], contentBlockId: `block-${suffix}` },
         }],
         validationExpectations: [],
         reviewExpectations: [],
@@ -8656,7 +7572,7 @@ function assertRunStateMachineTaskLedger(): void {
   assertEqual(coordinator.complete(recoverEffect.nextAcceptedPlan), true, 'task ledger checkpoint effect restores completed state');
   assertEqual(coordinator.complete(restored), true, 'task ledger coordinator restores completed checkpoint state');
   const runtimeState: AcceptedPlanTaskRuntimeState = {
-    acceptedImplementationPlan: acceptedPlan,
+    acceptedTaskPlan: acceptedPlan,
     resourcePackets: [],
     taskExecutionCursor: undefined,
     currentTaskContext: undefined,
@@ -8672,7 +7588,7 @@ function assertRunStateMachineTaskLedger(): void {
   assertEqual(runtimeInput.acceptedPlan, acceptedPlan, 'accepted-plan runtime accessor reads accepted plan authority');
   assertEqual(runtimeInput.resourcePackets, runtimeState.resourcePackets, 'accepted-plan runtime accessor reads resource packets');
   const accessorTargetState: AcceptedPlanTaskRuntimeState = {
-    acceptedImplementationPlan: acceptedPlan,
+    acceptedTaskPlan: acceptedPlan,
     resourcePackets: [],
   };
   new AcceptedPlanTaskRuntimeAccessor(accessorTargetState).apply(coordinator.runtimeSnapshot(runtimeInput));
@@ -8685,7 +7601,7 @@ function assertSessionDriverRuntimeAccessors(): void {
   const prompt = buildPromptEnvelope({
     workflowState: `workflow-${suffix}`,
     allowedProposals: ['answer'],
-    capabilityCatalogSummary: `capability-${suffix}`,
+    toolCatalogSummary: `capability-${suffix}`,
     userRequest: `request-${suffix}`,
   });
   const contract: DriverProviderTurnFrame = {
@@ -8725,7 +7641,7 @@ function assertSessionDriverRuntimeAccessors(): void {
   const assembledRuntimeContext = assembleContext({
     workflowState: `workflow-runtime-${suffix}`,
     allowedProposals: ['answer'],
-    capabilityCatalogSummary: `capability-runtime-${suffix}`,
+    toolCatalogSummary: `capability-runtime-${suffix}`,
     userRequest: `request-runtime-${suffix}`,
     memoryDocument: buildSessionMemoryDocument([]),
     initialContext: {
@@ -8758,7 +7674,6 @@ function assertSessionDriverRuntimeAccessors(): void {
     resourceRequestRepairAttempted: false,
     actionBundleAdmissionRepairAttempted: false,
     planReviewRepairAttempted: false,
-    acceptedPlanScopeRepairAttempted: false,
     terminalGuidanceRevisionAttempted: false,
   };
   const repairRuntime = new SessionDriverRepairRuntimeAccessor(repairState);
@@ -8766,8 +7681,6 @@ function assertSessionDriverRuntimeAccessors(): void {
   repairRuntime.markAttempted('planReviewRepairAttempted');
   assertEqual(repairState.planReviewRepairAttempted, true, 'repair runtime accessor writes repair flag');
   assertEqual(repairRuntime.attempted('planReviewRepairAttempted'), true, 'repair runtime accessor reads active repair flag');
-  repairRuntime.markAttempted('acceptedPlanScopeRepairAttempted');
-  assertEqual(repairRuntime.attempted('acceptedPlanScopeRepairAttempted'), true, 'repair runtime accessor covers accepted-plan scope repair flag');
 
   const activeTurnState: { activeTurn?: ActiveTurnState } = {};
   const activeTurnRuntime = new SessionDriverActiveTurnRuntimeAccessor(activeTurnState);
@@ -8788,66 +7701,6 @@ function assertSessionDriverRuntimeAccessors(): void {
   assertEqual(nativeToolRuntime.duplicateRepairAttempted(), true, 'native tool runtime accessor reads active duplicate repair guard');
 }
 
-function assertAcceptedTaskRegistryUsesExactOperationGrants(): void {
-  const suffix = randomSmokeToken('grant-frame');
-  const firstTaskId = `task-${suffix}-first`;
-  const sufficientTaskId = `task-${suffix}-sufficient`;
-  const taskId = `task-${suffix}-current`;
-  const targetPath = `Case-${suffix}/Generated-${randomSmokeToken('file')}.TXT`;
-  const acceptedPlan: AcceptedImplementationPlanContext = {
-    planId: `plan-${suffix}`,
-    runId: `run-${suffix}`,
-    title: 'Grant-backed task',
-    summary: 'Task targets are intentionally empty; exact grants carry executable scope.',
-    tasks: [
-      {
-        taskId: firstTaskId,
-        title: 'Completed setup',
-        targets: [],
-        dependencies: [],
-        conflictKeys: [],
-      },
-      {
-        taskId: sufficientTaskId,
-        title: 'Already sufficient setup',
-        targets: [],
-        dependencies: [],
-        conflictKeys: [],
-      },
-      {
-        taskId,
-        title: 'Write grant-backed file',
-        targets: [],
-        acceptanceCriteria: ['Kernel records the grant-backed write fact.'],
-        failureCriteria: ['Stop if the grant-backed write leaves the reviewed scope.'],
-        dependencies: [],
-        conflictKeys: [],
-      },
-    ],
-    capabilities: [],
-    targetScopes: [],
-    exactOperationGrants: [{
-      operation: 'write',
-      targetPath,
-      targetResourceKind: 'file',
-      capability: 'fs.write',
-      sourceTaskId: taskId,
-      source: 'kernelPlanReview',
-    }],
-    accessScopes: [],
-    batchIndex: 1,
-    completedTaskIds: [firstTaskId],
-    modelJudgedSufficientTaskIds: [sufficientTaskId],
-    rawPlan: {},
-  };
-  const registry = new AcceptedTaskRegistry(acceptedPlan);
-  const context = registry.currentTaskContext(registry.cursor([]));
-  assertEqual(context?.taskId, taskId, 'current task context skips completed and model-sufficient tasks');
-  assertEqual(context?.targets.includes(targetPath), true, 'current task context includes exact operation grant target when task targets are empty');
-  assertEqual(context?.capabilities.includes('fs.write'), true, 'current task context includes exact operation grant capability');
-  assertEqual(context?.acceptanceCriteria?.[0], 'Kernel records the grant-backed write fact.', 'current task context keeps accepted task acceptance criteria');
-  assertEqual(context?.failureCriteria?.[0], 'Stop if the grant-backed write leaves the reviewed scope.', 'current task context keeps accepted task failure criteria');
-}
 
 function assertPlanContextIndexBuildsPlanReadModels(): void {
   const suffix = randomSmokeToken('plan-context');
@@ -8884,7 +7737,7 @@ function assertPlanContextIndexBuildsPlanReadModels(): void {
         version: '1',
         actions: [{ actionId: `action-${suffix}`, targetPath }],
       },
-      codeBlocks: [],
+      contentBlocks: [],
       commandBlocks: [],
       expectedValidation: `Validate ${suffix}`,
       reviewGuide: `Review ${suffix}`,
@@ -8922,7 +7775,7 @@ function assertPlanContextIndexBuildsPlanReadModels(): void {
 function assertProposalRouterPlansPureRoutes(): void {
   const suffix = randomSmokeToken('proposal-route');
   const proposal = (kind: string) => ({
-    schemaVersion: 'deepcode.agent.protocol.v3',
+    schemaVersion: 'deepcode.agent.protocol.v4',
     proposalId: `proposal-${suffix}-${kind}`,
     runId: `run-${suffix}`,
     sessionId: `session-${suffix}`,
@@ -8936,10 +7789,9 @@ function assertProposalRouterPlansPureRoutes(): void {
   assertEqual(routeProposalKind(proposal('decisionRequest')).kind, 'decisionRequest', 'proposal router routes decision requests without side effects');
   assertEqual(routeProposalKind(proposal('diagnostic')).kind, 'diagnostic', 'proposal router routes diagnostics without side effects');
   assertEqual(routeProposalKind(proposal('taskPlan')).kind, 'plan', 'proposal router routes task plans to plan handling');
-  assertEqual(routeProposalKind(proposal('implementationPlan')).kind, 'plan', 'proposal router routes implementation plans to plan handling');
   assertEqual(routeProposalKind(proposal('resourceRequest')).kind, 'resourceRequest', 'proposal router routes resource requests without side effects');
   assertEqual(routeProposalKind(proposal('actionBundle')).kind, 'action', 'proposal router routes action bundles to action handling');
-  assertEqual(routeProposalKind(proposal('taskOutcome')).kind, 'action', 'proposal router routes task outcomes to action handling');
+  assertEqual(routeProposalKind(proposal('taskOutcome')).kind, 'nonExecutable', 'proposal router rejects removed task outcome proposals');
   assertEqual(routeProposalKind(proposal('unknown-kind')).kind, 'nonExecutable', 'proposal router closes unknown proposal kinds as non-executable');
 }
 
@@ -8956,7 +7808,7 @@ async function assertProviderTurnCycleReturnsRoutedProposal(): Promise<void> {
     events: [],
   };
   const proposal = {
-    schemaVersion: 'deepcode.agent.protocol.v3',
+    schemaVersion: 'deepcode.agent.protocol.v4',
     proposalId: `proposal-${suffix}`,
     runId: `run-${suffix}`,
     sessionId: `session-${suffix}`,
@@ -9211,7 +8063,7 @@ function assertProjectionResolvesPlanAfterSourceReview(): void {
     id: `event-${suffix}-target-plan`,
     payload: {
       ...(planCard.payload as Record<string, unknown>),
-      implementationPlan: {
+      taskPlan: {
         tasks: [{
           taskId: 'task-target-only-generic',
           title: 'Write target-only generic artifact',
@@ -9554,7 +8406,7 @@ function assertRequirementProjectionBuilderCreatesDecisionEvents(): void {
       updatedAt: '2026-01-01T00:00:00.000Z',
     },
     proposal: {
-      schemaVersion: 'deepcode.agent.protocol.v3',
+      schemaVersion: 'deepcode.agent.protocol.v4',
       kind: 'decisionRequest',
       runId,
       sessionId: `session-${suffix}`,
@@ -9585,13 +8437,13 @@ function assertSettingsCatalogBoundaries(): void {
   const workspaceKeys = new Set(workspaceOverridableSettingsIndex().map((entry) => entry.key));
   const agentConfigurableKeys = new Set(agentConfigurableSettingsIndex().map((entry) => entry.key));
 
-  assertEqual(sharedAgentKeys.has('agent.permissions.gitPush'), true, 'Git push policy is a shared Agent setting');
+  assertEqual(sharedAgentKeys.has('agent.permissions.gitWrite'), true, 'Git write policy is a shared Agent setting');
   assertEqual(sharedAgentKeys.has('agent.memory.projectMode'), true, 'Project memory mode is a shared Agent setting');
-  assertEqual(agentConfigurableKeys.has('agent.permissions.gitPush'), true, 'Agent can request shared Agent setting changes through audited config flow');
+  assertEqual(agentConfigurableKeys.has('agent.permissions.gitWrite'), true, 'Agent can request shared Agent setting changes through audited config flow');
   assertEqual(guiPreferenceKeys.has('gui.colorTheme'), true, 'GUI preferences use the gui namespace');
   assertEqual(guiPreferenceKeys.has('workbench.colorTheme'), false, 'GUI preference index does not include editor workbench theme');
   assertEqual(editorPreferenceKeys.has('gui.colorTheme'), false, 'Editor preference index does not include GUI theme');
-  assertEqual(workspaceKeys.has('agent.permissions.gitPush'), false, 'workspace overrides cannot change Agent security gates');
+  assertEqual(workspaceKeys.has('agent.permissions.gitWrite'), false, 'workspace overrides cannot change Agent security gates');
   assertEqual(workspaceKeys.has('agent.memory.projectMode'), true, 'workspace overrides can control project-scoped memory promotion mode');
   assertEqual(workspaceKeys.has('ruler.rules'), true, 'workspace overrides may provide project-level Ruler additions');
 }
@@ -9655,7 +8507,7 @@ async function assertProviderPartFramesEnterKernelDraftLedger(): Promise<void> {
       };
       await onEvent({ type: 'provider_delta', chunk });
       return jsonLlmResponse({
-        schemaVersion: 'deepcode.agent.protocol.v3',
+        schemaVersion: 'deepcode.agent.protocol.v4',
         kind: 'answer',
         outputLanguage: 'en-US',
         answer: { format: 'markdown', content: 'Generic final answer after draft frame.' },
@@ -9678,23 +8530,61 @@ async function assertProviderPartFramesEnterKernelDraftLedger(): Promise<void> {
   assertEqual(draftFrames[0].targetPath, 'src/generated.txt', 'draft frame target path is preserved for Kernel audit');
   assertEqual(deltas.some((delta) => (delta as any).type === 'part_delta'), true, 'Session emits volatile part delta');
   assertEqual(deltas.some((delta) => (delta as any).type === 'draft_delta'), true, 'Session emits Kernel draft ledger delta');
-  assertEqual(result.events.some((event) => event.kind === 'assistant_msg' && (event.payload as any).channel === 'final'), true, 'final answer still commits through the ordinary parser path');
+  assertEqual(
+    result.events.some((event) => event.kind === 'assistant_msg' && (event.payload as any).channel === 'final'),
+    false,
+    'A JSON answer without the required Session semantic directive does not enter the v4 final path'
+  );
+  assertEqual(
+    result.events.some((event) => event.kind === 'session_run_state' && (event.payload as any).status === 'failed'),
+    true,
+    'Missing semantic directive produces an observable failed terminal state'
+  );
 }
 
 async function assertAcceptedPlanStreamingDraftsAndJsonProgress(): Promise<void> {
   const token = randomSmokeToken('accepted-stream');
+  const sessionId = `session-${token}`;
+  const runId = `run-${token}`;
+  const userMessageId = `user-${token}`;
+  const userContent = `Execute accepted stream ${token}`;
   const targetPath = `${token}.txt`;
-  const events = [acceptedImplementationPlanCardEvent(`session-${token}`, `run-${token}`)];
-  const planPayload = events[0].payload as any;
-  planPayload.implementationPlan.tasks[0].target = [targetPath];
-  planPayload.implementationPlan.tasks[0].fileOperations = [{
+  const events: AgentEvent[] = [
+    {
+      id: userMessageId,
+      sessionId,
+      ts: '2026-01-01T00:00:00.000Z',
+      kind: 'user_msg',
+      payload: { content: userContent },
+    },
+    createSessionTurnAuthorityEvent({
+      sessionId,
+      runId,
+      turnId: `turn-${token}`,
+      taskId: `task-authority-${token}`,
+      messages: [{ messageId: userMessageId, content: userContent }],
+      relation: 'newTask',
+      boundAtHookRef: 'smoke.accepted-stream',
+      outputLanguage: 'en-US',
+      eventId: `authority-${token}`,
+      timestamp: '2026-01-01T00:00:00.001Z',
+    }),
+    genericKernelContextProjectionEvent(sessionId, runId),
+    acceptedTaskPlanCardEvent(sessionId, runId),
+  ];
+  const planPayload = events.find((event) => event.kind === 'plan_card')?.payload as any;
+  planPayload.taskPlan.tasks[0].target = [targetPath];
+  planPayload.taskPlan.tasks[0].fileOperations = [{
     operation: 'write',
     capability: 'fs.write',
     targetPath,
     reason: 'Random accepted-plan streaming smoke target.',
   }];
+  const planEvent = events.find((event) => event.kind === 'plan_card');
+  if (!planEvent) throw new Error('Accepted-plan streaming smoke requires a plan card');
+  applyKernelPlanAuthorizationFixture(planEvent);
   const session: AgentSession = {
-    id: `session-${token}`,
+    id: sessionId,
     mode: 'plan',
     createdAt: '2026-01-01T00:00:00.000Z',
     updatedAt: '2026-01-01T00:00:00.000Z',
@@ -9702,8 +8592,9 @@ async function assertAcceptedPlanStreamingDraftsAndJsonProgress(): Promise<void>
   const deltas: unknown[] = [];
   const draftFrames: unknown[] = [];
   let actionBatchSubmits = 0;
+  let providerCalls = 0;
   const proposal = randomMultiWriteProposal([targetPath], { briefUserPlan: true });
-  const artifactContentLines = ((proposal as any).codeBlocks?.[0]?.contentLines ?? []) as string[];
+  const artifactContentLines = ((proposal as any).contentBlocks?.[0]?.contentLines ?? []) as string[];
   const frame = {
     schemaVersion: 'deepcode.agent.stream.part.v1',
     partKind: 'codeBlockChunk',
@@ -9749,7 +8640,6 @@ async function assertAcceptedPlanStreamingDraftsAndJsonProgress(): Promise<void>
           ],
         };
       }
-      if (command.kind === 'permissionGrantTemporary') return { ok: true, events: [] };
       if (command.kind === 'actionBatchSubmit') {
         actionBatchSubmits += 1;
         return {
@@ -9774,20 +8664,23 @@ async function assertAcceptedPlanStreamingDraftsAndJsonProgress(): Promise<void>
       throw new Error('accepted-plan streaming smoke should use llmChatStream');
     },
     llmChatStream: async (_request, onEvent): Promise<ApiResponse<LlmChatResult>> => {
-      await onEvent({
-        type: 'provider_reasoning_delta',
-        chunk: {
-          type: 'reasoning_delta',
-          content: `${randomSmokeToken('hidden-reasoning')} `.repeat(240),
-        },
-      });
-      await onEvent({
-        type: 'provider_delta',
-        chunk: {
-          type: 'delta',
-          content: `<deepcode-part>${JSON.stringify(frame)}</deepcode-part>`,
-        },
-      });
+      providerCalls += 1;
+      if (providerCalls === 1) {
+        await onEvent({
+          type: 'provider_reasoning_delta',
+          chunk: {
+            type: 'reasoning_delta',
+            content: `${randomSmokeToken('hidden-reasoning')} `.repeat(240),
+          },
+        });
+        await onEvent({
+          type: 'provider_delta',
+          chunk: {
+            type: 'delta',
+            content: `<deepcode-part>${JSON.stringify(frame)}</deepcode-part>`,
+          },
+        });
+      }
       return {
         ok: true,
         data: {
@@ -9796,16 +8689,17 @@ async function assertAcceptedPlanStreamingDraftsAndJsonProgress(): Promise<void>
             role: 'assistant',
             content: '',
             toolCalls: [{
-              id: `semantic-artifact-${token}`,
-              name: 'session.submit_task_artifacts',
-              arguments: {
-                taskId: 'task-generic-write',
-                summary: `Write ${targetPath}`,
-                artifacts: [{
-                  slotId: 'slot-task-generic-write-1',
+              id: `semantic-artifact-${providerCalls}-${token}`,
+              name: providerCalls === 1
+                ? 'session.append_artifact_chunk'
+                : 'session.finalize_task_artifacts',
+              arguments: providerCalls === 1
+                ? {
+                  slotId: 'slot-task-generic-write-plan-op-task-generic-write-1',
                   contentLines: artifactContentLines,
-                }],
-              },
+                  finalChunk: true,
+                }
+                : { summary: `Write ${targetPath}` },
             }],
           },
         },
@@ -9835,8 +8729,19 @@ async function assertAcceptedPlanStreamingDraftsAndJsonProgress(): Promise<void>
     },
   });
 
-  assertEqual(draftFrames.length, 1, 'accepted-plan stream part enters Kernel draft ledger once');
-  assertEqual(actionBatchSubmits, 1, 'accepted-plan streaming final actionBundle still reaches Kernel');
+  assertEqual(
+    draftFrames.length,
+    3,
+    `accepted-plan stream preview, artifact chunk, and finalize frames enter Kernel draft ledger; providerCalls=${providerCalls}; events=${JSON.stringify(events.map((event) => ({ kind: event.kind, payload: event.payload })) )}`
+  );
+  assertEqual((draftFrames[0] as any).partKind, 'codeBlockChunk', 'accepted-plan stream preview remains a non-authoritative trace frame');
+  assertEqual((draftFrames[1] as any).partKind, 'artifactChunk', 'accepted-plan artifact content is recorded as a logical Session-owned chunk');
+  assertEqual((draftFrames[2] as any).partKind, 'batchDone', 'accepted-plan artifact draft records one terminal finalize frame');
+  assertEqual(
+    actionBatchSubmits,
+    1,
+    `accepted-plan streaming final actionBundle still reaches Kernel; events=${JSON.stringify(events.map((event) => ({ kind: event.kind, payload: event.payload })))}`
+  );
   assertEqual(
     deltas.some((delta: any) => delta.type === 'part_delta' && delta.targetPath === targetPath),
     true,
@@ -9884,7 +8789,7 @@ async function assertProviderLifecycleStatusDoesNotEnterReasoningBody(): Promise
           role: 'assistant',
           reasoningContent: reasoningText,
           content: JSON.stringify({
-            schemaVersion: 'deepcode.agent.protocol.v3',
+            schemaVersion: 'deepcode.agent.protocol.v4',
             kind: 'answer',
             outputLanguage: 'en-US',
             answer: { format: 'markdown', content: `answer-${token}` },
@@ -9907,8 +8812,12 @@ async function assertProviderLifecycleStatusDoesNotEnterReasoningBody(): Promise
   const reasoningEvents = result.events.filter((event) =>
     event.kind === 'assistant_msg' && (event.payload as any)?.channel === 'reasoning'
   );
-  assertEqual(reasoningEvents.length, 1, 'only real provider reasoning is committed as reasoning');
-  assertEqual((reasoningEvents[0].payload as any).content, reasoningText, 'provider reasoning content is preserved');
+  assertEqual(reasoningEvents.length, 2, 'initial and repair provider reasoning are both committed as reasoning');
+  assertEqual(
+    reasoningEvents.every((event) => (event.payload as any).content === reasoningText),
+    true,
+    'provider reasoning content is preserved across the bounded repair'
+  );
   assertEqual((reasoningEvents[0].payload as any).visibility, 'conversation', 'provider reasoning remains visible to the user');
   assertEqual(
     result.events.some((event) =>
@@ -10222,7 +9131,7 @@ function assertNarrativeTimelineProjectionResolvesAcceptedPlanInteractions(): vo
         summary: 'Create a generic artifact.',
         status: 'pending',
         confirmable: true,
-        implementationPlan: {
+        taskPlan: {
           summary: 'Create a generic artifact.',
           tasks: [{
             taskId: 'task-write-generic-artifact',
@@ -10550,8 +9459,8 @@ function assertTimelineProjectionWithLiveOverlay(): void {
         ts: '2026-01-01T00:00:03.000Z',
         kind: 'workflow_stage',
         payload: {
-          stage: 'stage.changed',
-          kernelEvent: { kind: 'stage.changed' },
+          stage: 'state.changed',
+          kernelEvent: { kind: 'state.changed' },
         },
       },
       {
@@ -10691,7 +9600,7 @@ function assertTimelineProjectionWithLiveOverlay(): void {
   assertEqual(actionBlocks[1]?.activity?.actionIds?.[0], 'action-b', 'the next action keeps an independent activity card');
 }
 
-function assertImplementationPlanTaskProjectionProgress(): void {
+function assertTaskPlanTaskProjectionProgress(): void {
   const planEvent: AgentEvent = {
     id: 'event-plan-progress',
     sessionId: 'session-task-projection',
@@ -10702,7 +9611,7 @@ function assertImplementationPlanTaskProjectionProgress(): void {
       planId: 'plan-task-projection',
       title: 'Generic implementation plan',
       summary: 'Review generic implementation tasks.',
-      implementationPlan: {
+      taskPlan: {
         id: 'plan-task-projection',
         tasks: [
           {
@@ -10824,7 +9733,7 @@ function assertImplementationPlanTaskProjectionProgress(): void {
           planId: 'plan-directory-projection',
           title: 'Directory cleanup plan',
           summary: 'Review generic directory cleanup tasks.',
-          implementationPlan: {
+          taskPlan: {
             id: 'plan-directory-projection',
             tasks: [
               {
@@ -10984,7 +9893,7 @@ function assertSessionDriverSkeleton(): void {
       stateKind: 'driverRequest',
       allowedInputs: ['proposalSubmit'],
       allowedProposals: ['actionBundle'],
-      proposalSchemaRefs: ['deepcode.agent.protocol.v3'],
+      proposalSchemaRefs: ['deepcode.agent.protocol.v4'],
       capabilityProjection: ['fs.write'],
     },
   });
@@ -11030,11 +9939,15 @@ async function assertSessionDriverLoop(): Promise<void> {
 }
 
 async function assertSessionDriverLoopPathResourceRequest(): Promise<void> {
+  const token = randomSmokeToken('path-resource');
+  const sessionId = `session-${token}`;
+  const workspaceRoot = `/tmp/${token}/${randomSmokeToken('root')}`;
+  const requestedPath = `${randomSmokeToken('directory')}/${randomSmokeToken('file')}.txt`;
   const events: AgentEvent[] = [];
   const resourceResolveManifests: Array<Record<string, any>> = [];
   let llmCalls = 0;
   const session: AgentSession = {
-    id: 'session-path',
+    id: sessionId,
     mode: 'plan',
     createdAt: '2026-01-01T00:00:00.000Z',
     updatedAt: '2026-01-01T00:00:00.000Z',
@@ -11054,8 +9967,8 @@ async function assertSessionDriverLoopPathResourceRequest(): Promise<void> {
           ok: true,
           events: [{
             kind: 'resource.packet_produced',
-            runId: 'run-generic',
-            sessionId: 'session-path',
+            runId: `run-${token}`,
+            sessionId,
             packet: {
               id: `packet-${resourceResolveManifests.length}`,
               requestId: command.requestId,
@@ -11075,14 +9988,14 @@ async function assertSessionDriverLoopPathResourceRequest(): Promise<void> {
           }],
         };
       }
-      return { ok: true, events: [] };
+      return fakeKernel(request);
     },
     llmChat: async (): Promise<ApiResponse<LlmChatResult>> => {
       llmCalls += 1;
       if (llmCalls === 1) {
         return semanticToolLlmResponse('session.request_resources', {
           reason: 'Need a generic file from the attached directory.',
-          requests: [{ kind: 'fileText', path: 'src/main.txt', reason: 'Read generic project source.' }],
+          requests: [{ kind: 'fileText', path: requestedPath, reason: 'Read the selected source file.' }],
         }, 'need-generic-file');
       }
       return semanticToolLlmResponse('session.submit_answer', {
@@ -11094,12 +10007,12 @@ async function assertSessionDriverLoopPathResourceRequest(): Promise<void> {
   });
 
   const result = await loop.runUserTurn({
-    sessionId: 'session-path',
+    sessionId,
     content: 'Analyze the attached directory.',
     attachments: [{
       kind: 'directory',
-      path: 'generic-project',
-      absolutePath: '/tmp/generic-project',
+      path: `root-${token}`,
+      absolutePath: workspaceRoot,
       source: 'userSelected',
       scope: 'message',
     }],
@@ -11108,7 +10021,12 @@ async function assertSessionDriverLoopPathResourceRequest(): Promise<void> {
   assert(resourceResolveManifests.length >= 2, 'path resourceRequest triggers a second Kernel ResourceResolve');
   const secondEntry = resourceResolveManifests[1].entries[0];
   assertEqual(secondEntry.kind, 'resource', 'path resourceRequest is synthesized as a Kernel-resolved resource');
-  assertEqual(secondEntry.resourceRef, '/tmp/generic-project/src/main.txt', 'path resourceRequest stays under the attached directory');
+  assertEqual(secondEntry.resourceRef, requestedPath, 'path resourceRequest remains relative to the selected root');
+  assertEqual(
+    secondEntry.rootId,
+    resourceResolveManifests[0].entries[0].rootId,
+    'path resourceRequest preserves the selected root identity'
+  );
 }
 
 async function assertSessionDriverLoopSearchResourceRequest(): Promise<void> {
@@ -11291,18 +10209,22 @@ async function assertSessionDriverLoopRejectsOutsidePath(): Promise<void> {
 }
 
 async function assertSessionDriverLoopUsesRecentAttachmentRoot(): Promise<void> {
+  const token = randomSmokeToken('recent-root');
+  const sessionId = `session-${token}`;
+  const previousRoot = `/tmp/${token}/${randomSmokeToken('root')}`;
+  const requestedPath = `${randomSmokeToken('overview')}.txt`;
   const events: AgentEvent[] = [];
   const existingEvents: AgentEvent[] = [{
-    id: 'previous-user',
-    sessionId: 'session-recent',
+    id: `previous-user-${token}`,
+    sessionId,
     ts: '2026-01-01T00:00:00.000Z',
     kind: 'user_msg',
     payload: {
       content: 'Analyze the attached directory.',
       attachments: [{
         kind: 'directory',
-        path: 'previous-generic-project',
-        absolutePath: '/tmp/previous-generic-project',
+        path: `root-${token}`,
+        absolutePath: previousRoot,
         source: 'userSelected',
         scope: 'message',
       }],
@@ -11311,7 +10233,7 @@ async function assertSessionDriverLoopUsesRecentAttachmentRoot(): Promise<void> 
   const resourceResolveManifests: Array<Record<string, any>> = [];
   let llmCalls = 0;
   const session: AgentSession = {
-    id: 'session-recent',
+    id: sessionId,
     mode: 'plan',
     createdAt: '2026-01-01T00:00:00.000Z',
     updatedAt: '2026-01-01T00:00:00.000Z',
@@ -11331,8 +10253,8 @@ async function assertSessionDriverLoopUsesRecentAttachmentRoot(): Promise<void> 
           ok: true,
           events: [{
             kind: 'resource.packet_produced',
-            runId: 'run-generic',
-            sessionId: 'session-recent',
+            runId: `run-${token}`,
+            sessionId,
             packet: {
               id: `packet-recent-${resourceResolveManifests.length}`,
               requestId: command.requestId,
@@ -11358,7 +10280,7 @@ async function assertSessionDriverLoopUsesRecentAttachmentRoot(): Promise<void> 
       if (llmCalls === 1) {
         return semanticToolLlmResponse('session.request_resources', {
           reason: 'Need a file from the recent attached directory.',
-          requests: [{ kind: 'fileText', path: 'README.txt', reason: 'Read generic overview.' }],
+          requests: [{ kind: 'fileText', path: requestedPath, reason: 'Read the selected overview.' }],
         }, 'recent-path-request');
       }
       return semanticToolLlmResponse('session.submit_answer', {
@@ -11370,14 +10292,18 @@ async function assertSessionDriverLoopUsesRecentAttachmentRoot(): Promise<void> 
   });
 
   const result = await loop.runUserTurn({
-    sessionId: 'session-recent',
+    sessionId,
     content: 'Read the overview from that project.',
     attachments: [],
     existingEvents,
   });
   assertEqual(result.events.some((event) => event.kind === 'assistant_msg'), true, 'recent root path request reaches final answer');
   assertEqual(resourceResolveManifests.length, 1, 'recent attachment root is not auto-read before the model requests a path');
-  assertEqual(resourceResolveManifests[0].entries[0].resourceRef, '/tmp/previous-generic-project/README.txt', 'recent root resolves path under the previous attachment');
+  assertEqual(resourceResolveManifests[0].entries[0].resourceRef, requestedPath, 'recent root keeps the requested path relative');
+  assert(
+    typeof resourceResolveManifests[0].entries[0].rootId === 'string',
+    'recent root request keeps the selected root identity'
+  );
 }
 
 async function assertSessionDriverLoopReadOnlyRequestsContinueWithoutBudgetDecision(): Promise<void> {
@@ -11440,7 +10366,7 @@ async function assertSessionDriverLoopReadOnlyRequestsContinueWithoutBudgetDecis
   );
 }
 
-async function assertSessionDriverLoopOldResourceBudgetDecisionStillResumes(): Promise<void> {
+async function assertSessionDriverLoopOldResourceBudgetDecisionFailsClosed(): Promise<void> {
   const events: AgentEvent[] = [];
   const resourceResolveManifests: Array<Record<string, any>> = [];
   let llmCalls = 0;
@@ -11504,9 +10430,20 @@ async function assertSessionDriverLoopOldResourceBudgetDecisionStillResumes(): P
     targetId: 'resource-budget-run-budget-legacy',
     existingEvents: [oldBudgetConfirmation],
   });
-  assertEqual(llmCalls, 1, 'legacy budget approval resumes by calling the provider once');
-  assertEqual(next.events.some((event) => event.kind === 'trace/requirement_decision_noop'), false, 'legacy budget confirmation is still recognized as active');
-  assertEqual(next.events.some((event) => event.kind === 'assistant_msg' && (event.payload as any)?.channel === 'final'), true, 'legacy budget approval continues to final answer');
+  assertEqual(llmCalls, 0, 'legacy in-progress interaction without turn authority does not call the provider');
+  assertEqual(
+    next.events.some((event) =>
+      event.kind === 'error' &&
+      JSON.stringify(event.payload).includes('session_turn_authority_unavailable')
+    ),
+    true,
+    'legacy in-progress interaction without turn authority fails closed with a structured diagnostic'
+  );
+  assertEqual(
+    next.events.some((event) => event.kind === 'assistant_msg' && (event.payload as any)?.channel === 'final'),
+    false,
+    'legacy in-progress interaction does not fabricate a final answer'
+  );
 }
 
 function resourceBudgetKernel(
@@ -11600,7 +10537,7 @@ async function assertSessionDriverLoopAdmitsSemanticTaskPlanWithoutKernelAction(
           ],
         };
       }
-      return { ok: true, events: [] };
+      return fakeKernel(request);
     },
     llmChat: async (): Promise<ApiResponse<LlmChatResult>> => {
       llmCalls += 1;
@@ -11610,8 +10547,10 @@ async function assertSessionDriverLoopAdmitsSemanticTaskPlanWithoutKernelAction(
         tasks: [{
           taskId: 'task-generic-scaffold',
           title: 'Prepare generic workspace artifact',
-          operation: 'replaceFile',
+          toolId: 'fs.write',
           targets: ['generic-output.txt'],
+          args: {},
+          dependencies: [],
           acceptanceCriteria: ['Kernel facts record the confirmed artifact operation.'],
           failureCriteria: ['Stop if the target leaves the confirmed task scope.'],
         }],
@@ -11637,9 +10576,13 @@ async function assertSessionDriverLoopAdmitsSemanticTaskPlanWithoutKernelAction(
   assertEqual(submittedPlans.length, 0, 'planning does not compile or submit Kernel actions before user confirmation');
   const planCards = result.events.filter((event) => event.kind === 'plan_card');
   const planReviews = result.events.filter((event) => event.kind === 'plan_review');
-  assertEqual(planCards.length, 1, 'semantic task plan renders one interactive plan card');
+  assertEqual(
+    planCards.length,
+    1,
+    `semantic task plan renders one interactive plan card; events=${JSON.stringify(result.events.map((event) => ({ kind: event.kind, payload: event.payload })))}`
+  );
   assertEqual((planCards[0]?.payload as any)?.decisionOwner?.kind, 'plan', 'plan card owns the plan decision');
-  assertEqual((planCards[0]?.payload as any)?.status, 'pending', 'plan card waits for user confirmation');
+  assertEqual((planCards[0]?.payload as any)?.status, 'confirmable', 'Kernel-authorized plan card waits for user confirmation');
   assertEqual(planReviews.length, 0, 'planning does not create a Kernel action review event');
   assertEqual(
     result.events.some((event) =>
@@ -11649,6 +10592,26 @@ async function assertSessionDriverLoopAdmitsSemanticTaskPlanWithoutKernelAction(
     ),
     true,
     'waiting plan review is exposed as an explicit session run state'
+  );
+  const timeline = buildNarrativeTimelineProjection({
+    sessionId: result.session.id,
+    events: result.events,
+    generatedAt: '2026-01-01T00:00:00.000Z',
+  });
+  assertEqual(
+    timeline.interactionProjection?.pending?.kind,
+    'plan',
+    'Kernel-authorized confirmable plan remains available as the pending user decision'
+  );
+  assertEqual(
+    timeline.turns.flatMap((turn) => turn.blocks).find((block) => block.narrativeKind === 'plan')?.status,
+    'waiting',
+    'Kernel-authorized confirmable plan remains waiting in the canonical timeline'
+  );
+  assertEqual(
+    timeline.turns.find((turn) => turn.blocks.some((block) => block.narrativeKind === 'plan'))?.status,
+    'blocked',
+    'the containing turn remains paused at the external plan decision boundary'
   );
   const providerReasoningEvent = result.events.find((event) =>
     event.kind === 'assistant_msg' &&
@@ -11681,7 +10644,7 @@ async function assertSessionDriverLoopRepairsInvalidSourceBlock(): Promise<void>
       llmCalls += 1;
       const proposal = genericWriteProposal(false);
       if (llmCalls === 1) {
-        (proposal.actionBundle as any).actions[0].sourceBlockId = 'missing-code-block';
+        (proposal.actionBundle as any).actions[0].contentBlockId = 'missing-code-block';
       }
       return jsonLlmResponse(proposal);
     },
@@ -11694,14 +10657,14 @@ async function assertSessionDriverLoopRepairsInvalidSourceBlock(): Promise<void>
     content: 'Create a generic scaffold.',
     requirementConfirmationMode: 'off',
   });
-  assertEqual(llmCalls, 2, 'invalid sourceBlockId triggers one protocol repair');
+  assertEqual(llmCalls, 2, 'invalid contentBlockId triggers one protocol repair');
   assertEqual(submittedPlans.length, 1, 'only repaired actionBundle reaches Kernel');
   assertEqual(
-    submittedPlans[0].payload?.actionBundle?.actions?.[0]?.sourceBlockId,
+    submittedPlans[0].payload?.actionBundle?.actions?.[0]?.contentBlockId,
     'generic-block',
-    'repaired actionBundle sourceBlockId matches a code block'
+    'repaired actionBundle contentBlockId matches a code block'
   );
-  assertEqual(result.events.some((event) => event.kind === 'plan_card'), true, 'repaired sourceBlockId plan renders a plan card');
+  assertEqual(result.events.some((event) => event.kind === 'plan_card'), true, 'repaired contentBlockId plan renders a plan card');
 }
 
 async function assertSessionDriverLoopCanonicalizesMissingSourceBlockId(): Promise<void> {
@@ -11723,7 +10686,7 @@ async function assertSessionDriverLoopCanonicalizesMissingSourceBlockId(): Promi
     llmChat: async (): Promise<ApiResponse<LlmChatResult>> => {
       llmCalls += 1;
       const proposal = genericWriteProposal(false);
-      delete (proposal.actionBundle as any).actions[0].args.sourceBlockId;
+      delete (proposal.actionBundle as any).actions[0].args.contentBlockId;
       return jsonLlmResponse(proposal);
     },
     now: () => '2026-01-01T00:00:00.000Z',
@@ -11735,15 +10698,15 @@ async function assertSessionDriverLoopCanonicalizesMissingSourceBlockId(): Promi
     content: 'Create a generic file from the provided code block.',
     requirementConfirmationMode: 'off',
   });
-  assertEqual(llmCalls, 1, 'missing sourceBlockId with a unique targetPath match is canonicalized without provider repair');
+  assertEqual(llmCalls, 1, 'missing contentBlockId with a unique targetPath match is canonicalized without provider repair');
   assertEqual(submittedPlans.length, 1, 'canonicalized actionBundle reaches Kernel PlanReview once');
   const action = submittedPlans[0].payload?.actionBundle?.actions?.[0] ?? {};
-  assertEqual(action.sourceBlockId, 'generic-block', 'canonicalized action exposes sourceBlockId for existing Session checks');
-  assertEqual(action.args?.sourceBlockId, 'generic-block', 'canonicalized action writes args.sourceBlockId for Kernel execution');
+  assertEqual(action.contentBlockId, 'generic-block', 'canonicalized action exposes contentBlockId for existing Session checks');
+  assertEqual(action.args?.contentBlockId, 'generic-block', 'canonicalized action writes args.contentBlockId for Kernel execution');
   assertEqual(
     submittedPlans[0].parserDiagnostics?.canonicalizations?.[0]?.kind,
-    'fs_write_sourceBlockId_canonicalized',
-    'canonicalization telemetry records the safe sourceBlockId repair'
+    'fs_write_contentBlockId_canonicalized',
+    'canonicalization telemetry records the safe contentBlockId repair'
   );
   assertEqual(result.events.some((event) => event.kind === 'plan_card'), true, 'canonicalized write renders a plan card');
 }
@@ -11770,11 +10733,11 @@ async function assertSessionDriverLoopRepairsAmbiguousSourceBlockId(): Promise<v
       if (llmCalls > 1) repairRequests.push(request);
       if (llmCalls === 1) {
         const proposal = genericWriteProposal(false);
-        proposal.codeBlocks = [
+        proposal.contentBlocks = [
           { blockId: 'generic-block-a', targetPath: 'generic-output.txt', contentLines: ['generic content a'] },
           { blockId: 'generic-block-b', targetPath: 'generic-output.txt', contentLines: ['generic content b'] },
         ];
-        delete (proposal.actionBundle as any).actions[0].args.sourceBlockId;
+        delete (proposal.actionBundle as any).actions[0].args.contentBlockId;
         return jsonLlmResponse(proposal);
       }
       return jsonLlmResponse(genericWriteProposal(false));
@@ -11788,13 +10751,13 @@ async function assertSessionDriverLoopRepairsAmbiguousSourceBlockId(): Promise<v
     content: 'Create a generic file from one of several candidate blocks.',
     requirementConfirmationMode: 'off',
   });
-  assertEqual(llmCalls, 2, 'ambiguous missing sourceBlockId triggers one protocol repair');
-  assertEqual(repairRequests.length, 1, 'ambiguous sourceBlockId repair asks provider once');
+  assertEqual(llmCalls, 2, 'ambiguous missing contentBlockId triggers one protocol repair');
+  assertEqual(repairRequests.length, 1, 'ambiguous contentBlockId repair asks provider once');
   assert(
-    repairRequests[0].messages.some((message) => message.content.includes('args.sourceBlockId')),
-    'repair prompt explains the fs.write args.sourceBlockId requirement'
+    repairRequests[0].messages.some((message) => message.content.includes('args.contentBlockId')),
+    'repair prompt explains the fs.write args.contentBlockId requirement'
   );
-  assertEqual(submittedPlans.length, 1, 'only repaired ambiguous sourceBlockId proposal reaches Kernel');
+  assertEqual(submittedPlans.length, 1, 'only repaired ambiguous contentBlockId proposal reaches Kernel');
   assertEqual(result.events.some((event) => event.kind === 'plan_card'), true, 'repaired ambiguous write renders a plan card');
 }
 
@@ -11820,7 +10783,7 @@ async function assertSessionDriverLoopRepairsEmptyDirectoryPlaceholderWrite(): P
       if (llmCalls > 1) repairRequests.push(request);
       if (llmCalls === 1) {
         const proposal = genericWriteProposal(false);
-        proposal.codeBlocks = [{
+        proposal.contentBlocks = [{
           blockId: 'generic-placeholder-block',
           targetPath: 'generic-dir/.gitkeep',
           operation: 'create',
@@ -11829,7 +10792,7 @@ async function assertSessionDriverLoopRepairsEmptyDirectoryPlaceholderWrite(): P
         }];
         (proposal.actionBundle as any).actions[0].args = {
           path: 'generic-dir/.gitkeep',
-          sourceBlockId: 'generic-placeholder-block',
+          contentBlockId: 'generic-placeholder-block',
         };
         return jsonLlmResponse(proposal);
       }
@@ -11896,7 +10859,7 @@ async function assertSessionDriverLoopAllowsManyNoCodeActionsWithoutBatchRepair(
   assertEqual(result.events.some((event) => event.kind === 'plan_card'), true, 'many delete action plan renders a Kernel-reviewed plan card');
 }
 
-async function assertSessionDriverLoopAllowsManyCodeBlocksWithoutBatchRepair(): Promise<void> {
+async function assertSessionDriverLoopAllowsManyContentBlocksWithoutBatchRepair(): Promise<void> {
   const events: AgentEvent[] = [];
   const submittedPlans: Array<Record<string, any>> = [];
   const repairRequests: LlmChatRequest[] = [];
@@ -11916,7 +10879,7 @@ async function assertSessionDriverLoopAllowsManyCodeBlocksWithoutBatchRepair(): 
     llmChat: async (request): Promise<ApiResponse<LlmChatResult>> => {
       llmCalls += 1;
       if (llmCalls > 1) repairRequests.push(request);
-      return jsonLlmResponse(manyCodeBlockWriteProposal());
+      return jsonLlmResponse(manyContentBlockWriteProposal());
     },
     now: () => '2026-01-01T00:00:00.000Z',
     createId: (prefix) => `${prefix}-${events.length + submittedPlans.length + repairRequests.length + 1}`,
@@ -11927,51 +10890,11 @@ async function assertSessionDriverLoopAllowsManyCodeBlocksWithoutBatchRepair(): 
     content: 'Create several generic files in one reviewed batch.',
     requirementConfirmationMode: 'off',
   });
-  assertEqual(llmCalls, 1, 'many codeBlocks under payload budget do not trigger repair');
-  assertEqual(repairRequests.length, 0, 'many codeBlocks do not ask the provider to shrink by count');
-  assertEqual(submittedPlans.length, 1, 'many codeBlocks reach Kernel PlanReview once');
-  assertEqual(submittedPlans[0].payload?.codeBlocks?.length, 7, 'all codeBlocks remain in the Kernel-reviewed proposal');
+  assertEqual(llmCalls, 1, 'many contentBlocks under payload budget do not trigger repair');
+  assertEqual(repairRequests.length, 0, 'many contentBlocks do not ask the provider to shrink by count');
+  assertEqual(submittedPlans.length, 1, 'many contentBlocks reach Kernel PlanReview once');
+  assertEqual(submittedPlans[0].payload?.contentBlocks?.length, 7, 'all contentBlocks remain in the Kernel-reviewed proposal');
   assertEqual(result.events.some((event) => event.kind === 'plan_card'), true, 'many codeBlock plan renders a plan card');
-}
-
-async function assertSessionDriverLoopRepairsOversizedActionBundle(): Promise<void> {
-  const events: AgentEvent[] = [];
-  const submittedPlans: Array<Record<string, any>> = [];
-  const repairRequests: LlmChatRequest[] = [];
-  let llmCalls = 0;
-  const session: AgentSession = {
-    id: 'session-budget-repair',
-    mode: 'plan',
-    createdAt: '2026-01-01T00:00:00.000Z',
-    updatedAt: '2026-01-01T00:00:00.000Z',
-  };
-  const loop = new SessionDriverLoop({
-    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
-      events.push(...nextEvents);
-      return { session: { ...session, eventCount: events.length }, events: [...events] };
-    },
-    kernelCommand: async (request): Promise<KernelReply> => planKernel(request, 'session-budget-repair', submittedPlans),
-    llmChat: async (request): Promise<ApiResponse<LlmChatResult>> => {
-      llmCalls += 1;
-      if (llmCalls > 1) repairRequests.push(request);
-      const bundle = llmCalls === 1 ? oversizedGenericWriteProposal() : genericWriteProposal(false);
-      return jsonLlmResponse(bundle);
-    },
-    now: () => '2026-01-01T00:00:00.000Z',
-    createId: (prefix) => `${prefix}-${events.length + submittedPlans.length + repairRequests.length + 1}`,
-  });
-
-  const result = await loop.runUserTurn({
-    sessionId: 'session-budget-repair',
-    content: 'Create a generic workspace change in reviewable batches.',
-    requirementConfirmationMode: 'off',
-  });
-  assertEqual(llmCalls, 2, 'oversized actionBundle triggers one implementation batch repair');
-  assert(repairRequests.some((request) => request.messages.some((message) => message.content.includes('module, file section, class, function'))), 'repair prompt requests semantic payload splitting');
-  assertEqual(submittedPlans.length, 1, 'repaired oversized actionBundle reaches Kernel plan review once');
-  assertEqual(result.events.some((event) => event.kind === 'plan_card'), true, 'repaired oversized plan renders a plan card');
-  const planCard = result.events.find((event) => event.kind === 'plan_card');
-  assertEqual(Boolean((planCard?.payload as any)?.implementationBatch), true, 'plan card carries implementation batch context');
 }
 
 async function assertSessionDriverLoopRepairsEmptyActionBundleResponse(): Promise<void> {
@@ -12040,7 +10963,7 @@ async function assertSessionDriverLoopRepairsEmptyActionBundleResponse(): Promis
   assertEqual(
     result.events.some((event) =>
       event.kind === 'workflow_stage' &&
-      String((event.payload as any)?.summary ?? '').includes('Agent Protocol v3 修复')
+      String((event.payload as any)?.summary ?? '').includes('Agent Protocol v4 修复')
     ),
     false,
     'empty response retry should not enter protocol repair when retry succeeds'
@@ -12095,7 +11018,7 @@ async function assertSessionDriverLoopCanonicalizesSchemaVersionOnlyProposal(): 
   assertEqual(
     result.events.some((event) =>
       event.kind === 'workflow_stage' &&
-      String((event.payload as any)?.summary ?? '').includes('Agent Protocol v3 repair')
+      String((event.payload as any)?.summary ?? '').includes('Agent Protocol v4 repair')
     ),
     false,
     'schemaVersion-only proposal does not project a protocol repair stage'
@@ -12226,7 +11149,18 @@ async function assertSessionDriverLoopAcceptsLocalizedStructuredPlan(): Promise<
 
 async function assertSessionDriverLoopPlanRevisionReturnsToPlanning(): Promise<void> {
   const token = randomSmokeToken('plan-revision');
-  const events = [acceptedImplementationPlanCardEvent('session-plan-revision', 'run-plan-revision')];
+  const revisedTarget = `scope-${token}/target.txt`;
+  const events = [
+    ...turnAuthorityFixture(
+      'session-plan-revision',
+      'run-plan-revision',
+      'Prepare a generic plan that can be revised before execution.',
+      `plan-revision-${token}`
+    ),
+    genericKernelContextProjectionEvent('session-plan-revision', 'run-plan-revision'),
+    genericResolvedResourceEvent('session-plan-revision', 'run-plan-revision', revisedTarget),
+    acceptedTaskPlanCardEvent('session-plan-revision', 'run-plan-revision'),
+  ];
   const session: AgentSession = {
     id: 'session-plan-revision',
     mode: 'plan',
@@ -12253,8 +11187,10 @@ async function assertSessionDriverLoopPlanRevisionReturnsToPlanning(): Promise<v
         tasks: [{
           taskId: `task-${token}`,
           title: `Revise target ${token}`,
-          operation: 'replaceFile',
-          targets: [`scope-${token}/target.txt`],
+          toolId: 'fs.read',
+          target: [revisedTarget],
+          args: {},
+          dependencies: [],
           acceptanceCriteria: [`Acceptance ${token}`],
           failureCriteria: [`Failure ${token}`],
         }],
@@ -12294,7 +11230,9 @@ async function assertSessionDriverLoopPlanRevisionReturnsToPlanning(): Promise<v
   assertEqual(actionBatchSubmits, 0, 'plan revise does not execute the old plan');
   const promptText = llmRequests.flatMap((request) => request.messages.map((message) => message.content)).join('\n');
   assert(promptText.includes('reply-only planning exercise'), 'plan revision guidance enters the next PromptEnvelope');
-  assert(promptText.includes('Do not execute work'), 'plan revision prompt keeps the revised plan non-executable');
+  const planningToolNames = (llmRequests[0]?.tools ?? []).map((tool) => tool.name);
+  assert(planningToolNames.includes('session.submit_plan'), 'plan revision exposes the planning directive');
+  assert(!planningToolNames.includes('session.append_artifact_chunk'), 'plan revision does not expose execution artifact tools');
 }
 
 function assertWorkflowStagePermissionProjectsPendingDecision(): void {
@@ -12325,7 +11263,17 @@ function assertWorkflowStagePermissionProjectsPendingDecision(): void {
 
 async function assertSessionDriverLoopReviewRevisionReturnsToPlanning(): Promise<void> {
   const token = randomSmokeToken('review-revision-plan');
-  const events: AgentEvent[] = [{
+  const revisedTarget = `scope-${token}/revision.txt`;
+  const events: AgentEvent[] = [
+    ...turnAuthorityFixture(
+      'session-review-revision',
+      'run-review-source',
+      'Create a generic batch and review its result.',
+      `review-revision-${token}`
+    ),
+    genericKernelContextProjectionEvent('session-review-revision', 'run-review-source'),
+    genericResolvedResourceEvent('session-review-revision', 'run-review-source', revisedTarget),
+    {
     id: 'review-waiting-generic',
     sessionId: 'session-review-revision',
     ts: '2026-01-01T00:00:00.000Z',
@@ -12379,8 +11327,10 @@ async function assertSessionDriverLoopReviewRevisionReturnsToPlanning(): Promise
         tasks: [{
           taskId: `task-${token}`,
           title: `Apply review revision ${token}`,
-          operation: 'replaceFile',
-          targets: [`scope-${token}/revision.txt`],
+          toolId: 'fs.write',
+          targets: [revisedTarget],
+          args: {},
+          dependencies: [],
           acceptanceCriteria: [`Acceptance ${token}`],
           failureCriteria: [`Failure ${token}`],
         }],
@@ -12408,7 +11358,7 @@ async function assertSessionDriverLoopReviewRevisionReturnsToPlanning(): Promise
   assertEqual(runCreates, 0, 'Review revision resumes the original run without Kernel runCreate');
   const promptText = llmRequests.flatMap((request) => request.messages.map((message) => message.content)).join('\n');
   assert(promptText.includes('Add a generic script and document how to run it.'), 'review guidance enters the next PromptEnvelope');
-  assert(!promptText.includes('ProjectMemoryIndexDigest'), 'empty project memory metadata is omitted from the provider prompt');
+  assert(promptText.includes('ProjectMemoryIndexDigest'), 'pending project memory candidates expose governance metadata');
   assert(!promptText.includes('ProjectMemoryRecall'), 'empty project memory recall is omitted from the provider prompt');
   assert(promptText.includes('SessionMemoryCompact'), 'structured session memory compact summary is included');
   assert(!promptText.includes('content=Review fact'), 'raw review facts are not promoted into ProjectMemory prompt content');
@@ -12416,7 +11366,17 @@ async function assertSessionDriverLoopReviewRevisionReturnsToPlanning(): Promise
 
 async function assertSessionDriverLoopReviewRevisionContinuesWhenAuditRunInactive(): Promise<void> {
   const token = randomSmokeToken('inactive-review-revision');
-  const events: AgentEvent[] = [{
+  const revisedTarget = `scope-${token}/revision.txt`;
+  const events: AgentEvent[] = [
+    ...turnAuthorityFixture(
+      'session-review-revision-inactive-audit',
+      'run-review-inactive-audit',
+      'Create a generic batch and review its result.',
+      `inactive-review-revision-${token}`
+    ),
+    genericKernelContextProjectionEvent('session-review-revision-inactive-audit', 'run-review-inactive-audit'),
+    genericResolvedResourceEvent('session-review-revision-inactive-audit', 'run-review-inactive-audit', revisedTarget),
+    {
     id: 'review-waiting-inactive-audit',
     sessionId: 'session-review-revision-inactive-audit',
     ts: '2026-01-01T00:00:00.000Z',
@@ -12472,8 +11432,10 @@ async function assertSessionDriverLoopReviewRevisionContinuesWhenAuditRunInactiv
         tasks: [{
           taskId: `task-${token}`,
           title: `Apply inactive review revision ${token}`,
-          operation: 'replaceFile',
-          targets: [`scope-${token}/revision.txt`],
+          toolId: 'fs.write',
+          targets: [revisedTarget],
+          args: {},
+          dependencies: [],
           acceptanceCriteria: [`Acceptance ${token}`],
           failureCriteria: [`Failure ${token}`],
         }],
@@ -12508,7 +11470,7 @@ async function assertSessionDriverLoopReviewRevisionContinuesWhenAuditRunInactiv
   assertEqual(llmRequests.length, 1, 'review revise calls provider once after best-effort audit failure');
 }
 
-async function assertSessionDriverLoopAcceptedDecisionGroupsWorkspaceWriteGrants(): Promise<void> {
+async function assertSessionDriverLoopAcceptedDecisionSubmitsMultiWriteBatch(): Promise<void> {
   const actionBundle = multiWriteActionBundle();
   const events: AgentEvent[] = [
     {
@@ -12522,7 +11484,7 @@ async function assertSessionDriverLoopAcceptedDecisionGroupsWorkspaceWriteGrants
         proposalId: 'proposal-multi-write',
         content: '# Plan\n\n## Summary\nWrite multiple generic files.',
         actionBundle,
-        codeBlocks: [
+        contentBlocks: [
           { id: 'code-one', blockId: 'code-one', targetPath: 'generic-one.txt', content: 'one', contentLines: ['one'] },
           { id: 'code-two', blockId: 'code-two', targetPath: 'generic-two.txt', content: 'two', contentLines: ['two'] },
         ],
@@ -12536,7 +11498,7 @@ async function assertSessionDriverLoopAcceptedDecisionGroupsWorkspaceWriteGrants
       ts: '2026-01-01T00:00:00.001Z',
       kind: 'plan_review',
       payload: {
-        status: 'awaitingTemporaryGrant',
+        status: 'awaitingUserApproval',
         runId: 'run-plan-grant-group',
         planId: 'bundle-multi-write',
         confirmable: true,
@@ -12550,7 +11512,7 @@ async function assertSessionDriverLoopAcceptedDecisionGroupsWorkspaceWriteGrants
     createdAt: '2026-01-01T00:00:00.000Z',
     updatedAt: '2026-01-01T00:00:00.000Z',
   };
-  const temporaryGrants: Array<Record<string, any>> = [];
+  let actionBatchSubmits = 0;
   const loop = new SessionDriverLoop({
     appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
       events.push(...nextEvents);
@@ -12559,16 +11521,15 @@ async function assertSessionDriverLoopAcceptedDecisionGroupsWorkspaceWriteGrants
     kernelCommand: async (request): Promise<KernelReply> => {
       const command = request.command as Record<string, any>;
       if (command.kind === 'userDecisionSubmit') return { ok: true, events: [] };
-      if (command.kind === 'permissionGrantTemporary') {
-        temporaryGrants.push(command.grant);
+      if (command.kind === 'actionBatchSubmit') {
+        actionBatchSubmits += 1;
         return { ok: true, events: [] };
       }
-      if (command.kind === 'actionBatchSubmit') return { ok: true, events: [] };
       return fakeKernel(request);
     },
     llmChat: async (): Promise<ApiResponse<LlmChatResult>> => jsonLlmResponse(genericWriteProposal(false)),
     now: () => '2026-01-01T00:00:00.000Z',
-    createId: (prefix) => `${prefix}-${events.length + temporaryGrants.length + 1}`,
+    createId: (prefix) => `${prefix}-${events.length + actionBatchSubmits + 1}`,
   });
 
   await loop.resolveDecision({
@@ -12580,40 +11541,26 @@ async function assertSessionDriverLoopAcceptedDecisionGroupsWorkspaceWriteGrants
     existingEvents: events,
   });
 
-  assertEqual(temporaryGrants.length, 2, 'multiple fs.write actions receive file-scoped temporary grants');
-  assertEqual(
-    temporaryGrants.map((grant) => grant.resourcePath).sort().join(','),
-    'generic-one.txt,generic-two.txt',
-    'temporary grants are scoped to Kernel-reviewed file operations'
-  );
-  assertEqual(temporaryGrants.every((grant) => grant.capability === 'fs.write'), true, 'all grants keep the reviewed capability');
-  assertEqual(
-    temporaryGrants.every((grant) => (grant.permissionBundle as any)?.groupedBy === 'fileOperation'),
-    true,
-    'temporary grants record file operation grouping metadata'
-  );
+  assertEqual(actionBatchSubmits, 1, 'multiple fs.write actions submit one plan-authorized action batch');
 }
 
-async function assertSessionDriverLoopAcceptedDecisionGrantsOutsideWorkspaceFileTargets(): Promise<void> {
-  const externalTarget = `/tmp/deepcode-external-${Date.now()}-target.txt`;
+async function assertSessionDriverLoopAcceptedDecisionPreservesKernelAuthorizedTarget(): Promise<void> {
+  const authorizedTarget = `${randomSmokeToken('authorized-target')}.txt`;
   const actionBundle: Record<string, any> = {
     version: '1',
     id: 'bundle-external-write',
-    goal: 'Write a reviewed outside-workspace file.',
+    goal: 'Write a Kernel-authorized file.',
     actions: [
       {
-        id: 'write-external',
-        title: 'Write external file',
-        kind: 'write',
-        capability: 'fs.write',
-        targetPath: externalTarget,
-        resourceScope: [externalTarget],
-        sourceBlockId: 'code-external',
-        permissionLabels: ['fs.write'],
+        actionId: 'write-external',
+        toolId: 'fs.write',
+        args: { path: authorizedTarget, contentBlockId: 'code-external' },
+        description: 'Write authorized file',
+        dependsOn: [],
       },
     ],
-    validationExpectations: [{ id: 'validation', description: 'Kernel records the reviewed outside file write.' }],
-    reviewExpectations: [{ id: 'review', description: 'User reviews the outside file operation.' }],
+    validationExpectations: [{ id: 'validation', description: 'Kernel records the authorized file write.' }],
+    reviewExpectations: [{ id: 'review', description: 'User reviews the authorized file operation.' }],
   };
   const report = proposalReviewReport(actionBundle);
   const events: AgentEvent[] = [
@@ -12626,10 +11573,10 @@ async function assertSessionDriverLoopAcceptedDecisionGrantsOutsideWorkspaceFile
         runId: 'run-plan-grant-external',
         planId: 'bundle-external-write',
         proposalId: 'proposal-external-write',
-        content: '# Plan\n\n## Summary\nWrite one outside-workspace file after Kernel review.',
+        content: '# Plan\n\n## Summary\nWrite one Kernel-authorized file.',
         actionBundle,
-        codeBlocks: [
-          { id: 'code-external', targetPath: externalTarget, content: 'outside' },
+        contentBlocks: [
+          { blockId: 'code-external', targetPath: authorizedTarget, operation: 'overwrite', contentLines: ['authorized'] },
         ],
         commandBlocks: [],
         planReviewReport: report,
@@ -12641,7 +11588,7 @@ async function assertSessionDriverLoopAcceptedDecisionGrantsOutsideWorkspaceFile
       ts: '2026-01-01T00:00:00.001Z',
       kind: 'plan_review',
       payload: {
-        status: 'awaitingTemporaryGrant',
+        status: 'awaitingUserApproval',
         runId: 'run-plan-grant-external',
         planId: 'bundle-external-write',
         confirmable: true,
@@ -12655,7 +11602,6 @@ async function assertSessionDriverLoopAcceptedDecisionGrantsOutsideWorkspaceFile
     createdAt: '2026-01-01T00:00:00.000Z',
     updatedAt: '2026-01-01T00:00:00.000Z',
   };
-  const temporaryGrants: Array<Record<string, any>> = [];
   const submittedBatches: Array<Record<string, any>> = [];
   const loop = new SessionDriverLoop({
     appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
@@ -12665,10 +11611,6 @@ async function assertSessionDriverLoopAcceptedDecisionGrantsOutsideWorkspaceFile
     kernelCommand: async (request): Promise<KernelReply> => {
       const command = request.command as Record<string, any>;
       if (command.kind === 'userDecisionSubmit') return { ok: true, events: [] };
-      if (command.kind === 'permissionGrantTemporary') {
-        temporaryGrants.push(command.grant);
-        return { ok: true, events: [] };
-      }
       if (command.kind === 'actionBatchSubmit') {
         submittedBatches.push(command.batch);
         return { ok: true, events: [] };
@@ -12677,7 +11619,7 @@ async function assertSessionDriverLoopAcceptedDecisionGrantsOutsideWorkspaceFile
     },
     llmChat: async (): Promise<ApiResponse<LlmChatResult>> => jsonLlmResponse(genericWriteProposal(false)),
     now: () => '2026-01-01T00:00:00.000Z',
-    createId: (prefix) => `${prefix}-${events.length + temporaryGrants.length + submittedBatches.length + 1}`,
+    createId: (prefix) => `${prefix}-${events.length + submittedBatches.length + 1}`,
   });
 
   await loop.resolveDecision({
@@ -12689,12 +11631,9 @@ async function assertSessionDriverLoopAcceptedDecisionGrantsOutsideWorkspaceFile
     existingEvents: events,
   });
 
-  assertEqual(temporaryGrants.length, 1, 'outside-workspace file operation receives one scoped temporary grant');
-  assertEqual(temporaryGrants[0]?.resourceKind, 'externalFile', 'outside-workspace grant uses externalFile resource kind');
-  assertEqual(temporaryGrants[0]?.resourcePath, externalTarget, 'outside-workspace grant preserves absolute file target');
-  assertEqual(submittedBatches.length, 1, 'reviewed outside-workspace batch is submitted after grant');
+  assertEqual(submittedBatches.length, 1, 'Kernel-authorized batch is submitted without a second Session decision');
   const submittedAction = submittedBatches[0]?.actionBundle?.actions?.[0];
-  assertEqual(submittedAction?.targetPath, externalTarget, 'submitted action preserves absolute file target for Kernel resolver');
+  assertEqual(submittedAction?.args?.path, authorizedTarget, 'submitted action preserves the Kernel-authorized target');
 }
 
 async function assertSessionDriverLoopPlanCardAcceptDoesNotNoopWithoutPlanReview(): Promise<void> {
@@ -12713,7 +11652,7 @@ async function assertSessionDriverLoopPlanCardAcceptDoesNotNoopWithoutPlanReview
         summary: 'Review a generic workspace plan.',
         content: '# Plan\n\n## Summary\nReview a generic workspace plan.',
         actionBundle,
-        codeBlocks: [{ id: 'code-generic', targetPath: 'generic/output.txt', content: 'generic output' }],
+        contentBlocks: [{ id: 'code-generic', targetPath: 'generic/output.txt', content: 'generic output' }],
         commandBlocks: [],
       },
     },
@@ -12726,7 +11665,6 @@ async function assertSessionDriverLoopPlanCardAcceptDoesNotNoopWithoutPlanReview
   };
   let userDecisionSubmits = 0;
   let actionBatchSubmits = 0;
-  let temporaryGrants = 0;
   const loop = new SessionDriverLoop({
     appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
       events.push(...nextEvents);
@@ -12740,10 +11678,6 @@ async function assertSessionDriverLoopPlanCardAcceptDoesNotNoopWithoutPlanReview
       }
       if (command.kind === 'actionBatchSubmit') {
         actionBatchSubmits += 1;
-        return { ok: true, events: [] };
-      }
-      if (command.kind === 'permissionGrantTemporary') {
-        temporaryGrants += 1;
         return { ok: true, events: [] };
       }
       return fakeKernel(request);
@@ -12762,11 +11696,13 @@ async function assertSessionDriverLoopPlanCardAcceptDoesNotNoopWithoutPlanReview
     existingEvents: events,
   });
 
-  assertEqual(result.events.some((event) => event.kind === 'trace/plan_accept_noop'), false, 'plan_card-only accept does not become a stale noop');
-  assertEqual(result.events.some((event) => event.kind === 'plan_review' && (event.payload as any).status === 'accepted'), true, 'plan_card-only accept records one accepted plan review');
-  assertEqual(userDecisionSubmits, 1, 'plan_card-only accept submits one user decision to Kernel');
-  assertEqual(temporaryGrants, 0, 'plan_card-only accept without Kernel file operation review does not receive broad workspace grant');
-  assertEqual(actionBatchSubmits, 1, 'plan_card-only accept submits the accepted action batch');
+  assertEqual(userDecisionSubmits, 0, 'plan_card-only history is not submitted as Kernel execution truth');
+  assertEqual(actionBatchSubmits, 0, 'plan_card-only history cannot execute without a Kernel contract');
+  assertEqual(
+    result.events.some((event) => event.kind === 'error' || event.kind === 'trace/plan_accept_noop'),
+    true,
+    'missing Kernel contract closes through a structured diagnostic or no-op trace'
+  );
 }
 
 async function assertSessionDriverLoopPlanCardAcceptExecutesReviewedDeletePlan(): Promise<void> {
@@ -12787,12 +11723,11 @@ async function assertSessionDriverLoopPlanCardAcceptExecutesReviewedDeletePlan()
         summary: 'Delete one generic reviewed file.',
         content: '# Plan\n\n## Summary\nDelete one generic reviewed file.',
         actionBundle,
-        codeBlocks: [],
+        contentBlocks: [],
         commandBlocks: [],
         confirmable: true,
-        status: 'awaitingTemporaryGrant',
+        status: 'awaitingUserApproval',
         planReviewReport: report,
-        requiredFileOperations: report.requiredFileOperations,
       },
     },
     {
@@ -12801,12 +11736,11 @@ async function assertSessionDriverLoopPlanCardAcceptExecutesReviewedDeletePlan()
       ts: '2026-01-01T00:00:00.001Z',
       kind: 'plan_review',
       payload: {
-        status: 'awaitingTemporaryGrant',
+        status: 'awaitingUserApproval',
         runId: 'run-reviewed-delete-plan',
         planId: 'bundle-generic-delete',
         confirmable: true,
         report,
-        requiredFileOperations: report.requiredFileOperations,
       },
     },
   ];
@@ -12816,8 +11750,6 @@ async function assertSessionDriverLoopPlanCardAcceptExecutesReviewedDeletePlan()
     createdAt: '2026-01-01T00:00:00.000Z',
     updatedAt: '2026-01-01T00:00:00.000Z',
   };
-  const temporaryGrants: Array<Record<string, any>> = [];
-  let userDecisionSubmits = 0;
   let actionBatchSubmits = 0;
   const loop = new SessionDriverLoop({
     appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
@@ -12826,14 +11758,6 @@ async function assertSessionDriverLoopPlanCardAcceptExecutesReviewedDeletePlan()
     },
     kernelCommand: async (request): Promise<KernelReply> => {
       const command = request.command as Record<string, any>;
-      if (command.kind === 'userDecisionSubmit') {
-        userDecisionSubmits += 1;
-        return { ok: true, events: [] };
-      }
-      if (command.kind === 'permissionGrantTemporary') {
-        temporaryGrants.push(command.grant);
-        return { ok: true, events: [] };
-      }
       if (command.kind === 'actionBatchSubmit') {
         actionBatchSubmits += 1;
         return {
@@ -12847,7 +11771,7 @@ async function assertSessionDriverLoopPlanCardAcceptExecutesReviewedDeletePlan()
               workUnitId: 'work-unit-reviewed-delete',
               output: { path: 'generic-obsolete.txt' },
             },
-            { kind: 'stage.changed', runId: command.runId, sessionId: session.id, phase: 'review' },
+            { kind: 'batch.review_ready', runId: command.runId, sessionId: session.id },
           ],
         };
       }
@@ -12856,7 +11780,7 @@ async function assertSessionDriverLoopPlanCardAcceptExecutesReviewedDeletePlan()
     },
     llmChat: async (): Promise<ApiResponse<LlmChatResult>> => jsonLlmResponse(genericWriteProposal(false)),
     now: () => '2026-01-01T00:00:00.000Z',
-    createId: (prefix) => `${prefix}-${events.length + userDecisionSubmits + actionBatchSubmits + temporaryGrants.length + 1}`,
+    createId: (prefix) => `${prefix}-${events.length + actionBatchSubmits + 1}`,
   });
 
   const result = await loop.resolveDecision({
@@ -12868,10 +11792,6 @@ async function assertSessionDriverLoopPlanCardAcceptExecutesReviewedDeletePlan()
     existingEvents: events,
   });
 
-  assertEqual(userDecisionSubmits, 1, 'reviewed fs.delete plan submits user decision to Kernel');
-  assertEqual(temporaryGrants.length, 1, 'reviewed fs.delete plan receives one path-scoped grant');
-  assertEqual(temporaryGrants[0]?.capability, 'fs.delete', 'reviewed delete grant keeps fs.delete capability');
-  assertEqual(temporaryGrants[0]?.resourcePath, 'generic-obsolete.txt', 'reviewed delete grant is scoped to the reviewed file');
   assertEqual(actionBatchSubmits, 1, 'reviewed fs.delete plan submits accepted action batch');
   assertEqual(
     result.events.some((event) => event.kind === 'workflow_stage' && (event.payload as any)?.stage === 'accepted_plan.action_batch_preflight'),
@@ -12885,19 +11805,24 @@ async function assertSessionDriverLoopPlanCardAcceptExecutesReviewedDeletePlan()
   );
 }
 
-async function assertSessionDriverLoopAcceptedPlanExecutesReviewedDeleteWithoutTaskTargets(): Promise<void> {
+async function assertSessionDriverLoopAcceptedPlanExecutesDeleteWithinKernelAuthorizedTargets(): Promise<void> {
   const proposal = deleteActionBundleProposal('generic-obsolete.txt') as any;
   const actionBundle = proposal.actionBundle as Record<string, any>;
   const report = proposalReviewReport(actionBundle);
-  const planCard = deleteAcceptedImplementationPlanCardEvent('session-reviewed-delete-no-targets', 'run-reviewed-delete-no-targets');
+  const planCard = deleteAcceptedTaskPlanCardEvent('session-reviewed-delete-no-targets', 'run-reviewed-delete-no-targets');
   const planPayload = planCard.payload as any;
-  planPayload.planId = 'impl-reviewed-delete-no-targets';
-  planPayload.implementationPlan.id = 'impl-reviewed-delete-no-targets';
-  planPayload.implementationPlan.tasks[0].target = [];
-  delete planPayload.implementationPlan.tasks[0].fileOperations;
   planPayload.planReviewReport = report;
-  planPayload.requiredFileOperations = report.requiredFileOperations;
-  const events: AgentEvent[] = [planCard];
+  const events: AgentEvent[] = [
+    ...turnAuthorityFixture(
+      'session-reviewed-delete-no-targets',
+      'run-reviewed-delete-no-targets',
+      'Delete the accepted generic obsolete target.',
+      'reviewed-delete-no-targets'
+    ),
+    genericKernelContextProjectionEvent('session-reviewed-delete-no-targets', 'run-reviewed-delete-no-targets'),
+    genericResolvedResourceEvent('session-reviewed-delete-no-targets', 'run-reviewed-delete-no-targets', 'generic-obsolete.txt'),
+    planCard,
+  ];
   const session: AgentSession = {
     id: 'session-reviewed-delete-no-targets',
     mode: 'plan',
@@ -12907,8 +11832,7 @@ async function assertSessionDriverLoopAcceptedPlanExecutesReviewedDeleteWithoutT
   let llmCalls = 0;
   let proposalSubmits = 0;
   let actionBatchSubmits = 0;
-  let deterministicProposal: any;
-  const temporaryGrants: Array<Record<string, any>> = [];
+  let submittedProposal: any;
   const loop = new SessionDriverLoop({
     appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
       events.push(...nextEvents);
@@ -12918,7 +11842,7 @@ async function assertSessionDriverLoopAcceptedPlanExecutesReviewedDeleteWithoutT
       const command = request.command as Record<string, any>;
       if (command.kind === 'proposalSubmit') {
         proposalSubmits += 1;
-        deterministicProposal = command.proposal;
+        submittedProposal = command.proposal;
         return {
           ok: true,
           events: [
@@ -12934,10 +11858,6 @@ async function assertSessionDriverLoopAcceptedPlanExecutesReviewedDeleteWithoutT
         };
       }
       if (command.kind === 'userDecisionSubmit') return { ok: true, events: [] };
-      if (command.kind === 'permissionGrantTemporary') {
-        temporaryGrants.push(command.grant);
-        return { ok: true, events: [] };
-      }
       if (command.kind === 'actionBatchSubmit') {
         actionBatchSubmits += 1;
         return {
@@ -12951,7 +11871,7 @@ async function assertSessionDriverLoopAcceptedPlanExecutesReviewedDeleteWithoutT
               workUnitId: 'work-unit-reviewed-delete-no-targets',
               output: { path: 'generic-obsolete.txt' },
             },
-            { kind: 'stage.changed', runId: command.runId, sessionId: session.id, phase: 'review' },
+            { kind: 'batch.review_ready', runId: command.runId, sessionId: session.id },
           ],
         };
       }
@@ -12971,21 +11891,24 @@ async function assertSessionDriverLoopAcceptedPlanExecutesReviewedDeleteWithoutT
     kind: 'plan',
     decision: 'accept',
     runId: 'run-reviewed-delete-no-targets',
-    targetId: 'impl-reviewed-delete-no-targets',
+    targetId: 'impl-generic-delete',
     existingEvents: events,
   });
 
-  assertEqual(llmCalls, 0, 'reviewed exact delete grant uses the deterministic current-task compiler');
-  assertEqual(proposalSubmits, 1, 'deterministic delete still submits the compiled internal batch contract to Kernel PlanReview');
-  const deterministicActions = deterministicProposal?.payload?.actionBundle?.actions ?? [];
-  assertEqual(deterministicActions.length, 1, 'deterministic delete compiles one action for the exact current-task grant');
-  assertEqual(deterministicActions[0]?.targetPath, 'generic-obsolete.txt', 'deterministic delete exposes the canonical Kernel targetPath');
-  assertEqual(deterministicActions[0]?.resourceScope?.[0], 'generic-obsolete.txt', 'deterministic delete exposes the canonical Kernel resourceScope');
-  assertEqual(deterministicActions[0]?.targetRef?.path, 'generic-obsolete.txt', 'deterministic delete preserves the structured target reference');
-  assertEqual(actionBatchSubmits, 1, 'reviewed delete exact grant submits actionBatch even when implementationPlan task targets are empty');
-  assertEqual(temporaryGrants.length, 1, 'reviewed delete exact grant receives one temporary grant');
-  assertEqual(temporaryGrants[0]?.resourcePath, 'generic-obsolete.txt', 'reviewed delete exact grant keeps the file-scoped grant target');
-  assertEqual(result.events.some((event) => event.kind === 'requirement_confirmation'), false, 'reviewed delete exact grant does not ask for user intervention');
+  assertEqual(llmCalls, 0, 'content-free delete intent can be compiled from the accepted task without another provider turn');
+  assertEqual(proposalSubmits, 1, 'compiled delete intent is submitted to Kernel PlanReview once');
+  const submittedActions = submittedProposal?.payload?.actionBundle?.actions ?? [];
+  assertEqual(submittedActions.length, 1, 'Complete submits one delete action within the Kernel-authorized task target');
+  assertEqual(submittedActions[0]?.args?.path, 'generic-obsolete.txt', 'delete action exposes canonical Kernel args.path');
+  assertEqual(submittedActions[0]?.targetPath, undefined, 'delete action does not reintroduce a top-level path alias');
+  assertEqual(submittedActions[0]?.targetRef, undefined, 'delete action does not duplicate the canonical args path into targetRef');
+  assertEqual(
+    submittedProposal?.payload?.authorizationContractId,
+    'plan-authorization-impl-generic-delete',
+    'Session binds the compiled task intent to the accepted Kernel authorization contract without deciding permission'
+  );
+  assertEqual(actionBatchSubmits, 1, 'Kernel-reviewed delete action reaches ActionBatch once');
+  assertEqual(result.events.some((event) => event.kind === 'requirement_confirmation'), false, 'in-contract delete does not create a Session permission intervention');
   assertEqual(
     result.events.some((event) => event.kind === 'session_run_state' && (event.payload as any)?.status === 'failed'),
     false,
@@ -12996,13 +11919,13 @@ async function assertSessionDriverLoopAcceptedPlanExecutesReviewedDeleteWithoutT
 async function assertSessionDriverLoopAcceptedPlanDeleteUsesCurrentTaskTargetsWhenCapabilityIsDisplayOnly(): Promise<void> {
   const token = randomSmokeToken('display-delete');
   const targetPath = `${token}.tmp`;
-  const events = [acceptedImplementationPlanCardEvent(`session-${token}`, `run-${token}`)];
+  const events = [acceptedTaskPlanCardEvent(`session-${token}`, `run-${token}`)];
   const planPayload = events[0].payload as any;
   planPayload.planId = `impl-${token}`;
-  planPayload.implementationPlan.id = `impl-${token}`;
-  planPayload.implementationPlan.title = 'Generic display capability delete plan';
-  planPayload.implementationPlan.summary = 'Delete one current task target with a display-only operation label.';
-  planPayload.implementationPlan.tasks = [{
+  planPayload.taskPlan.id = `impl-${token}`;
+  planPayload.taskPlan.title = 'Generic display capability delete plan';
+  planPayload.taskPlan.summary = 'Delete one current task target with a display-only operation label.';
+  planPayload.taskPlan.tasks = [{
     taskId: `task-${token}`,
     title: 'Remove current target',
     target: [targetPath],
@@ -13049,7 +11972,6 @@ async function assertSessionDriverLoopAcceptedPlanDeleteUsesCurrentTaskTargetsWh
         };
       }
       if (command.kind === 'userDecisionSubmit') return { ok: true, events: [] };
-      if (command.kind === 'permissionGrantTemporary') return { ok: true, events: [] };
       if (command.kind === 'actionBatchSubmit') {
         actionBatchSubmits += 1;
         return {
@@ -13063,7 +11985,7 @@ async function assertSessionDriverLoopAcceptedPlanDeleteUsesCurrentTaskTargetsWh
               workUnitId: `work-unit-${token}`,
               output: { path: targetPath },
             },
-            { kind: 'stage.changed', runId: command.runId, sessionId: session.id, phase: 'review' },
+            { kind: 'batch.review_ready', runId: command.runId, sessionId: session.id },
           ],
         };
       }
@@ -13121,10 +12043,10 @@ async function assertSessionDriverLoopAcceptedExecutionExceptionClosesRun(): Pro
         proposalId: 'proposal-preflight-failure',
         content: '# Plan\n\n## Summary\nDelete one reviewed file.',
         actionBundle,
-        codeBlocks: [],
+        contentBlocks: [],
         commandBlocks: [],
         confirmable: true,
-        status: 'awaitingTemporaryGrant',
+        status: 'awaitingUserApproval',
         planReviewReport: report,
       },
     },
@@ -13152,7 +12074,7 @@ async function assertSessionDriverLoopAcceptedExecutionExceptionClosesRun(): Pro
     },
     kernelCommand: async (request): Promise<KernelReply> => {
       const command = request.command as Record<string, any>;
-      if (command.kind === 'userDecisionSubmit' || command.kind === 'permissionGrantTemporary' || command.kind === 'actionBatchSubmit') {
+      if (command.kind === 'userDecisionSubmit' || command.kind === 'actionBatchSubmit') {
         kernelCalls += 1;
       }
       return fakeKernel(request);
@@ -13201,12 +12123,11 @@ async function assertSessionDriverLoopAcceptedExecutionKernelErrorClosesRun(): P
         proposalId: 'proposal-kernel-error',
         content: '# Plan\n\n## Summary\nDelete one reviewed file.',
         actionBundle,
-        codeBlocks: [],
+        contentBlocks: [],
         commandBlocks: [],
         confirmable: true,
-        status: 'awaitingTemporaryGrant',
+        status: 'awaitingUserApproval',
         planReviewReport: report,
-        requiredFileOperations: report.requiredFileOperations,
       },
     },
   ];
@@ -13225,7 +12146,6 @@ async function assertSessionDriverLoopAcceptedExecutionKernelErrorClosesRun(): P
     kernelCommand: async (request): Promise<KernelReply> => {
       const command = request.command as Record<string, any>;
       if (command.kind === 'userDecisionSubmit') return { ok: true, events: [] };
-      if (command.kind === 'permissionGrantTemporary') return { ok: true, events: [] };
       if (command.kind === 'actionBatchSubmit') {
         actionBatchSubmits += 1;
         return {
@@ -13284,10 +12204,10 @@ async function assertSessionDriverLoopAcceptedDecisionRecoversUnconsumedExecutio
         proposalId: 'proposal-unconsumed-accepted',
         content: '# Plan\n\n## Summary\nDelete one reviewed file.',
         actionBundle,
-        codeBlocks: [],
+        contentBlocks: [],
         commandBlocks: [],
         confirmable: true,
-        status: 'awaitingTemporaryGrant',
+        status: 'awaitingUserApproval',
         planReviewReport: report,
       },
     },
@@ -13333,7 +12253,6 @@ async function assertSessionDriverLoopAcceptedDecisionRecoversUnconsumedExecutio
     kernelCommand: async (request): Promise<KernelReply> => {
       const command = request.command as Record<string, any>;
       if (command.kind === 'userDecisionSubmit') return { ok: true, events: [] };
-      if (command.kind === 'permissionGrantTemporary') return { ok: true, events: [] };
       if (command.kind === 'actionBatchSubmit') {
         actionBatchSubmits += 1;
         return { ok: true, events: [{ kind: 'action_batch.accepted', runId: command.runId, sessionId: session.id, batch: { planId: command.batch?.planId } }] };
@@ -13423,9 +12342,6 @@ async function assertSessionDriverLoopRequirementAcceptedActionBundleWaitsForExp
         userDecisionSubmits += 1;
         return { ok: true, events: [] };
       }
-      if (command.kind === 'permissionGrantTemporary') {
-        return { ok: true, events: [] };
-      }
       if (command.kind === 'actionBatchSubmit') {
         actionBatchSubmits += 1;
         return {
@@ -13450,7 +12366,7 @@ async function assertSessionDriverLoopRequirementAcceptedActionBundleWaitsForExp
               workUnitId: 'work-unit-generic-auto-plan',
               result: { ok: true },
             },
-            { kind: 'stage.changed', runId: command.runId, sessionId: session.id, phase: 'review' },
+            { kind: 'batch.review_ready', runId: command.runId, sessionId: session.id },
           ],
         };
       }
@@ -13500,125 +12416,7 @@ async function assertSessionDriverLoopRequirementAcceptedActionBundleWaitsForExp
   );
 }
 
-async function assertSessionDriverLoopActionBundleAdmissionRepairsDirectoryDeleteBeforePlanCard(): Promise<void> {
-  const events: AgentEvent[] = [genericDirectoryResourceEvent('session-admission-repair', 'generic-dir', ['generic-dir/inside.txt'])];
-  const session: AgentSession = {
-    id: 'session-admission-repair',
-    mode: 'plan',
-    createdAt: '2026-01-01T00:00:00.000Z',
-    updatedAt: '2026-01-01T00:00:00.000Z',
-  };
-  let llmCalls = 0;
-  let proposalSubmits = 0;
-  const llmRequests: LlmChatRequest[] = [];
-  const submittedPlans: Array<Record<string, any>> = [];
-  const loop = new SessionDriverLoop({
-    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
-      events.push(...nextEvents);
-      return { session: { ...session, eventCount: events.length }, events: [...events] };
-    },
-    kernelCommand: async (request): Promise<KernelReply> => {
-      const command = request.command as Record<string, any>;
-      if (command.kind === 'proposalSubmit') proposalSubmits += 1;
-      return planKernel(request, session.id, submittedPlans);
-    },
-    llmChat: async (request): Promise<ApiResponse<LlmChatResult>> => {
-      llmRequests.push(request);
-      llmCalls += 1;
-      if (llmCalls === 1) return jsonLlmResponse(deleteActionBundleProposal('generic-dir'));
-      return jsonLlmResponse(deleteActionBundleProposal('generic-dir/inside.txt'));
-    },
-    now: () => '2026-01-01T00:00:00.000Z',
-    createId: (prefix) => `${prefix}-${events.length + llmCalls + proposalSubmits + 1}`,
-  });
-
-  const result = await loop.runUserTurn({
-    sessionId: session.id,
-    content: 'Delete the generic cleanup targets listed in the attached workspace evidence.',
-    existingEvents: events,
-    appendUserMessage: false,
-    resumeResourcePackets: true,
-  });
-
-  const planCards = result.events.filter((event) => event.kind === 'plan_card');
-  assertEqual(llmCalls, 2, 'directory delete admission repair calls provider once for a corrected file-level plan');
-  const repairPromptText = llmRequests[1]?.messages.map((message) => message.content).join('\n') ?? '';
-  assert(repairPromptText.includes('Session admission reasons:'), 'admission repair prompt includes structured admission reasons');
-  assert(repairPromptText.includes('directory deletion must explicitly set targetKind="directory"'), 'admission repair prompt uses English delete directory reason');
-  assert(!/[\u3400-\u9FFF]/.test(repairPromptText), 'admission repair prompt does not inject CJK system instructions for an English user request');
-  assertEqual(proposalSubmits, 1, 'only the repaired file-level actionBundle enters Kernel PlanReview');
-  assertEqual(planCards.length, 1, 'only the repaired actionBundle becomes a confirmable plan card');
-  assertEqual(
-    planCards.some((event) => (event.payload as any).actionBundle?.actions?.[0]?.targetPath === 'generic-dir/inside.txt'),
-    true,
-    'confirmable plan card contains a concrete file-level delete target'
-  );
-  assertEqual(
-    submittedPlans.some((plan) => plan.payload?.actionBundle?.actions?.[0]?.targetPath === 'generic-dir'),
-    false,
-    'directory delete target is not submitted to Kernel PlanReview'
-  );
-  assertEqual(
-    result.events.some((event) => event.kind === 'workflow_stage' && (event.payload as any).stage === 'action_bundle_admission.repairing'),
-    true,
-    'admission repair emits a reusable workflow_stage projection'
-  );
-}
-
-async function assertSessionDriverLoopActionBundleAdmissionRejectsRepeatedDirectoryDelete(): Promise<void> {
-  const events: AgentEvent[] = [genericDirectoryResourceEvent('session-admission-reject', 'generic-dir', ['generic-dir/inside.txt'])];
-  const session: AgentSession = {
-    id: 'session-admission-reject',
-    mode: 'plan',
-    createdAt: '2026-01-01T00:00:00.000Z',
-    updatedAt: '2026-01-01T00:00:00.000Z',
-  };
-  let llmCalls = 0;
-  let proposalSubmits = 0;
-  const submittedPlans: Array<Record<string, any>> = [];
-  const loop = new SessionDriverLoop({
-    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
-      events.push(...nextEvents);
-      return { session: { ...session, eventCount: events.length }, events: [...events] };
-    },
-    kernelCommand: async (request): Promise<KernelReply> => {
-      const command = request.command as Record<string, any>;
-      if (command.kind === 'proposalSubmit') proposalSubmits += 1;
-      return planKernel(request, session.id, submittedPlans);
-    },
-    llmChat: async (): Promise<ApiResponse<LlmChatResult>> => {
-      llmCalls += 1;
-      return jsonLlmResponse(deleteActionBundleProposal('generic-dir'));
-    },
-    now: () => '2026-01-01T00:00:00.000Z',
-    createId: (prefix) => `${prefix}-${events.length + llmCalls + proposalSubmits + 1}`,
-  });
-
-  const result = await loop.runUserTurn({
-    sessionId: session.id,
-    content: 'Delete the generic cleanup targets listed in the attached workspace evidence.',
-    existingEvents: events,
-    appendUserMessage: false,
-    resumeResourcePackets: true,
-  });
-
-  assertEqual(llmCalls, 2, 'repeated invalid directory delete receives only one admission repair attempt');
-  assertEqual(proposalSubmits, 0, 'repeated invalid directory delete never enters Kernel PlanReview');
-  assertEqual(result.events.some((event) => event.kind === 'plan_card'), false, 'repeated invalid directory delete does not produce a confirmable plan card');
-  assertEqual(
-    result.events.some((event) => event.kind === 'error' && (event.payload as any).code === 'action_bundle_admission_failed'),
-    true,
-    'repeated invalid directory delete produces a structured admission diagnostic'
-  );
-  assertEqual(
-    result.events.some((event) => event.kind === 'session_run_state' && (event.payload as any).status === 'failed'),
-    true,
-    'repeated invalid directory delete closes the run with failed lifecycle'
-  );
-  assertEqual(submittedPlans.length, 0, 'no invalid plan is submitted through the Kernel test port');
-}
-
-async function assertSessionDriverLoopAcceptedScopeRejectsDirectoryDeleteFromResourceEvidence(): Promise<void> {
+async function assertSessionDriverLoopDelegatesDirectoryDeleteAdmissionToKernel(): Promise<void> {
   const deleteProposal = deleteActionBundleProposal('generic-dir');
   const actionBundle = deleteProposal.actionBundle as Record<string, any>;
   const events: AgentEvent[] = [
@@ -13662,7 +12460,7 @@ async function assertSessionDriverLoopAcceptedScopeRejectsDirectoryDeleteFromRes
         summary: 'Delete a generic target after review.',
         content: '# Plan\n\n## Summary\nDelete a generic target after review.',
         actionBundle,
-        codeBlocks: [],
+        contentBlocks: [],
         commandBlocks: [],
         planReviewReport: proposalReviewReport(actionBundle),
         confirmable: true,
@@ -13702,26 +12500,29 @@ async function assertSessionDriverLoopAcceptedScopeRejectsDirectoryDeleteFromRes
     existingEvents: events,
   });
 
-  assertEqual(userDecisionSubmits, 0, 'directory delete preflight does not submit the plan decision to Kernel');
-  assertEqual(actionBatchSubmits, 0, 'directory delete preflight does not submit an action batch');
+  assertEqual(userDecisionSubmits, 0, 'Session does not invent a second permission decision for directory evidence');
+  assertEqual(actionBatchSubmits, 1, 'Session submits typed directory delete args so Kernel owns target and recursive admission');
   assertEqual(
     result.events.some((event) => event.kind === 'error' && (event.payload as any).code === 'accepted_plan_action_batch_preflight_failed'),
-    true,
-    'directory delete preflight produces a structured diagnostic'
+    false,
+    'Session does not emit a local directory-delete permission or path diagnostic'
   );
   assertEqual(
     result.events.some((event) => event.kind === 'session_run_state' && (event.payload as any).status === 'failed'),
-    true,
-    'directory delete preflight closes the run with failed lifecycle'
+    false,
+    'Session does not fail the run before Kernel admission'
   );
 }
 
 async function assertSessionDriverLoopAcceptedScopeExecutesReviewedDirectoryDelete(): Promise<void> {
   const deleteProposal = deleteActionBundleProposal('generic-dir/') as any;
   const actionBundle = deleteProposal.actionBundle as Record<string, any>;
-  actionBundle.actions[0].targetKind = 'directory';
-  actionBundle.actions[0].targetResourceKind = 'directory';
-  actionBundle.actions[0].recursive = true;
+  actionBundle.actions[0].args = {
+    ...actionBundle.actions[0].args,
+    path: 'generic-dir',
+    targetKind: 'directory',
+    recursive: true,
+  };
   const planReviewReport = proposalReviewReport(actionBundle);
   const events: AgentEvent[] = [
     genericDirectoryResourceEvent('session-delete-directory-reviewed', 'generic-dir', ['generic-dir/inside.txt']),
@@ -13738,10 +12539,9 @@ async function assertSessionDriverLoopAcceptedScopeExecutesReviewedDirectoryDele
         summary: 'Delete a generic directory after review.',
         content: '# Plan\n\n## Summary\nDelete a generic directory after review.',
         actionBundle,
-        codeBlocks: [],
+        contentBlocks: [],
         commandBlocks: [],
         planReviewReport,
-        requiredFileOperations: planReviewReport.requiredFileOperations,
         confirmable: true,
       },
     },
@@ -13752,9 +12552,7 @@ async function assertSessionDriverLoopAcceptedScopeExecutesReviewedDirectoryDele
     createdAt: '2026-01-01T00:00:00.000Z',
     updatedAt: '2026-01-01T00:00:00.000Z',
   };
-  let userDecisionSubmits = 0;
   let actionBatchSubmits = 0;
-  const temporaryGrants: Array<Record<string, any>> = [];
   const loop = new SessionDriverLoop({
     appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
       events.push(...nextEvents);
@@ -13762,14 +12560,6 @@ async function assertSessionDriverLoopAcceptedScopeExecutesReviewedDirectoryDele
     },
     kernelCommand: async (request): Promise<KernelReply> => {
       const command = request.command as Record<string, any>;
-      if (command.kind === 'userDecisionSubmit') {
-        userDecisionSubmits += 1;
-        return { ok: true, events: [] };
-      }
-      if (command.kind === 'permissionGrantTemporary') {
-        temporaryGrants.push(command.grant);
-        return { ok: true, events: [] };
-      }
       if (command.kind === 'actionBatchSubmit') {
         actionBatchSubmits += 1;
         return {
@@ -13790,7 +12580,7 @@ async function assertSessionDriverLoopAcceptedScopeExecutesReviewedDirectoryDele
     },
     llmChat: async (): Promise<ApiResponse<LlmChatResult>> => jsonLlmResponse(genericWriteProposal(false)),
     now: () => '2026-01-01T00:00:00.000Z',
-    createId: (prefix) => `${prefix}-${events.length + userDecisionSubmits + actionBatchSubmits + temporaryGrants.length + 1}`,
+    createId: (prefix) => `${prefix}-${events.length + actionBatchSubmits + 1}`,
   });
 
   const result = await loop.resolveDecision({
@@ -13802,15 +12592,7 @@ async function assertSessionDriverLoopAcceptedScopeExecutesReviewedDirectoryDele
     existingEvents: events,
   });
 
-  assertEqual(userDecisionSubmits, 1, 'reviewed directory delete submits the plan decision');
   assertEqual(actionBatchSubmits, 1, 'reviewed directory delete submits an action batch');
-  assertEqual(temporaryGrants.length, 1, 'reviewed directory delete receives one scoped temporary grant');
-  assertEqual(temporaryGrants[0]?.resourceKind, 'workspaceDirectory', 'reviewed directory delete uses a directory scoped grant');
-  assertEqual(
-    String(temporaryGrants[0]?.resourcePath ?? '').replace(/\/+$/, ''),
-    'generic-dir',
-    'reviewed directory delete grant is scoped to the confirmed directory despite trailing slash spelling'
-  );
   assertEqual(
     result.events.some((event) => event.kind === 'error' && (event.payload as any).code === 'accepted_plan_action_batch_preflight_failed'),
     false,
@@ -13818,20 +12600,18 @@ async function assertSessionDriverLoopAcceptedScopeExecutesReviewedDirectoryDele
   );
 }
 
-async function assertSessionDriverLoopAcceptedImplementationPlanAutoExecutesBatch(): Promise<void> {
+async function assertSessionDriverLoopAcceptedTaskPlanAutoExecutesBatch(): Promise<void> {
   const token = randomSmokeToken('accepted-exec-original');
   const originalRequest = `T60_FULL_ORIGINAL_REQUEST_${token}_SHOULD_NOT_BE_REEXPANDED`;
   const events: AgentEvent[] = [
-    {
-      id: `event-${token}-user`,
-      sessionId: 'session-accepted-plan-auto',
-      ts: '2026-01-01T00:00:00.000Z',
-      kind: 'user_msg',
-      payload: {
-        content: originalRequest,
-      },
-    },
-    acceptedImplementationPlanCardEvent('session-accepted-plan-auto', 'run-accepted-plan-auto'),
+    ...turnAuthorityFixture(
+      'session-accepted-plan-auto',
+      'run-accepted-plan-auto',
+      originalRequest,
+      `accepted-plan-auto-${token}`
+    ),
+    genericKernelContextProjectionEvent('session-accepted-plan-auto', 'run-accepted-plan-auto'),
+    acceptedTaskPlanCardEvent('session-accepted-plan-auto', 'run-accepted-plan-auto'),
   ];
   const session: AgentSession = {
     id: 'session-accepted-plan-auto',
@@ -13841,7 +12621,6 @@ async function assertSessionDriverLoopAcceptedImplementationPlanAutoExecutesBatc
   };
   let proposalSubmits = 0;
   let actionBatchSubmits = 0;
-  let temporaryGrants = 0;
   const llmRequests: LlmChatRequest[] = [];
   const loop = new SessionDriverLoop({
     appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
@@ -13853,27 +12632,23 @@ async function assertSessionDriverLoopAcceptedImplementationPlanAutoExecutesBatc
       if (command.kind === 'proposalSubmit') {
         proposalSubmits += 1;
         assertEqual(
-          command.proposal?.payload?.codeBlocks?.[0]?.content,
+          command.proposal?.payload?.contentBlocks?.[0]?.contentLines?.join('\n'),
           `generic output ${token}`,
-          'artifact compiler submits canonical codeBlock content to Kernel PlanReview'
+          'artifact compiler submits canonical contentLines to Kernel PlanReview'
         );
         return {
           ok: true,
           events: [
-            { kind: 'proposal.accepted', runId: 'run-generic', sessionId: session.id, proposal: command.proposal },
+            { kind: 'proposal.accepted', runId: command.runId, sessionId: session.id, proposal: command.proposal },
             {
               kind: 'proposal.reviewed',
-              runId: 'run-generic',
+              runId: command.runId,
               sessionId: session.id,
               proposalId: command.proposal?.proposalId,
               report: proposalReviewReport(command.proposal?.payload?.actionBundle ?? {}),
             },
           ],
         };
-      }
-      if (command.kind === 'permissionGrantTemporary') {
-        temporaryGrants += 1;
-        return { ok: true, events: [] };
       }
       if (command.kind === 'actionBatchSubmit') {
         actionBatchSubmits += 1;
@@ -13882,24 +12657,24 @@ async function assertSessionDriverLoopAcceptedImplementationPlanAutoExecutesBatc
           events: [
             {
               kind: 'action_batch.accepted',
-              runId: 'run-generic',
+              runId: command.runId,
               sessionId: session.id,
               batch: { planId: command.batch?.planId },
             },
             {
               kind: 'work_unit.queued',
-              runId: 'run-generic',
+              runId: command.runId,
               sessionId: session.id,
               workUnit: { id: 'work-unit-generic', actionId: 'write-generic-output', status: 'queued', writeSet: ['generic-output.txt'] },
             },
             {
               kind: 'work_unit.completed',
-              runId: 'run-generic',
+              runId: command.runId,
               sessionId: session.id,
               workUnitId: 'work-unit-generic',
               output: { path: 'generic-output.txt' },
             },
-            { kind: 'stage.changed', runId: 'run-generic', sessionId: session.id, phase: 'review' },
+            { kind: 'batch.review_ready', runId: command.runId, sessionId: session.id },
           ],
         };
       }
@@ -13910,17 +12685,18 @@ async function assertSessionDriverLoopAcceptedImplementationPlanAutoExecutesBatc
     },
     llmChat: async (request): Promise<ApiResponse<LlmChatResult>> => {
       llmRequests.push(request);
-      return semanticToolLlmResponse('session.submit_task_artifacts', {
-        taskId: 'task-generic-write',
-        summary: `Generated current task artifact ${token}`,
-        artifacts: [{
-          slotId: 'slot-task-generic-write-1',
+      return llmRequests.length === 1
+        ? semanticToolLlmResponse('session.append_artifact_chunk', {
+          slotId: 'slot-task-generic-write-plan-op-task-generic-write-1',
           contentLines: [`generic output ${token}`],
-        }],
-      });
+          finalChunk: true,
+        })
+        : semanticToolLlmResponse('session.finalize_task_artifacts', {
+          summary: `Generated current task artifact ${token}`,
+        });
     },
     now: () => '2026-01-01T00:00:00.000Z',
-    createId: (prefix) => `${prefix}-${events.length + proposalSubmits + actionBatchSubmits + temporaryGrants + 1}`,
+    createId: (prefix) => `${prefix}-${events.length + proposalSubmits + actionBatchSubmits + 1}`,
   });
 
   const result = await loop.resolveDecision({
@@ -13933,23 +12709,29 @@ async function assertSessionDriverLoopAcceptedImplementationPlanAutoExecutesBatc
     interventionLevel: 'medium',
   });
 
-  assertEqual(proposalSubmits, 1, 'accepted implementationPlan still submits actionBundle to Kernel PlanReview for audit');
-  assertEqual(actionBatchSubmits, 1, 'accepted implementationPlan auto-submits in-scope actionBundle to Kernel execution');
-  assertEqual(temporaryGrants, 1, 'accepted implementationPlan grants scoped workspace write permission for in-scope batch');
-  assertEqual(llmRequests.length, 1, 'accepted implementationPlan execution calls provider once');
+  assertEqual(proposalSubmits, 1, 'accepted taskPlan still submits actionBundle to Kernel PlanReview for audit');
+  assertEqual(actionBatchSubmits, 1, 'accepted taskPlan auto-submits in-scope actionBundle to Kernel execution');
+  assertEqual(llmRequests.length, 2, 'accepted taskPlan execution appends one chunk and finalizes it in a second provider turn');
   const promptText = llmRequests.flatMap((request) => request.messages.map((message) => message.content)).join('\n');
+  assertEqual(
+    llmRequests[0]?.messages.filter((message) => message.role === 'user' && message.content === originalRequest).length,
+    1,
+    'accepted execution preserves the exact authoritative root user message once in PromptLedger'
+  );
   assert(promptText.includes('Session semantic profile: execution-v1'), 'accepted execution uses the stable execution provider profile');
-  assert(promptText.includes('slot-task-generic-write-1'), 'accepted execution exposes the current task IntentSlot id');
+  assert(
+    promptText.includes('slot-task-generic-write-plan-op-task-generic-write-1'),
+    'accepted execution exposes the current Kernel-authorized IntentSlot id'
+  );
   assert(promptText.includes('Kernel records the generic output write fact.'), 'accepted execution exposes current task acceptance criteria');
   assert(promptText.includes('Stop if the write leaves the accepted target scope.'), 'accepted execution exposes current task failure criteria');
-  assert(!promptText.includes(originalRequest), 'accepted execution does not re-expand the original user request');
+  assert(promptText.includes(originalRequest), 'accepted execution retains the original user request as authoritative PromptLedger content');
   assert(!promptText.includes('Accepted execution contract context'), 'accepted execution does not send raw contract JSON');
   assert(!promptText.includes('taskOrder='), 'accepted execution does not expose taskOrder in provider text');
   assert(!promptText.includes('pendingTasks='), 'accepted execution does not expose pending task ids in provider text');
   assert(!promptText.includes('dependsOn'), 'accepted execution does not expose provider dependency fields');
-  assert(!promptText.includes('dependencies'), 'accepted execution does not expose raw dependency fields');
   assert(!promptText.includes('dependencyDepth'), 'accepted execution does not expose dependency depth');
-  assertEqual(result.events.filter((event) => event.kind === 'plan_card').length, 1, 'accepted implementationPlan execution does not create a second confirmable plan card');
+  assertEqual(result.events.filter((event) => event.kind === 'plan_card').length, 1, 'accepted taskPlan execution does not create a second confirmable plan card');
   assertEqual(
     result.events.some((event) =>
       event.kind === 'session_run_state' &&
@@ -13957,12 +12739,12 @@ async function assertSessionDriverLoopAcceptedImplementationPlanAutoExecutesBatc
       (event.payload as any)?.reason === 'accepted_plan_execution'
     ),
     true,
-    'accepted implementationPlan execution records running session state'
+    'accepted taskPlan execution records running session state'
   );
 }
 
-async function assertSessionDriverLoopAcceptedImplementationPlanNormalizesWriteBatchForKernel(): Promise<void> {
-  const events = [acceptedImplementationPlanCardEvent('session-accepted-plan-normalize', 'run-accepted-plan-normalize')];
+async function assertSessionDriverLoopAcceptedTaskPlanNormalizesWriteBatchForKernel(): Promise<void> {
+  const events = [acceptedTaskPlanCardEvent('session-accepted-plan-normalize', 'run-accepted-plan-normalize')];
   const session: AgentSession = {
     id: 'session-accepted-plan-normalize',
     mode: 'plan',
@@ -13992,7 +12774,6 @@ async function assertSessionDriverLoopAcceptedImplementationPlanNormalizesWriteB
           ],
         };
       }
-      if (command.kind === 'permissionGrantTemporary') return { ok: true, events: [] };
       if (command.kind === 'actionBatchSubmit') {
         submittedBatch = command.batch;
         return {
@@ -14012,7 +12793,7 @@ async function assertSessionDriverLoopAcceptedImplementationPlanNormalizesWriteB
               workUnitId: 'work-unit-generic',
               output: { path: 'generic-output.txt' },
             },
-            { kind: 'stage.changed', runId: 'run-generic', sessionId: session.id, phase: 'review' },
+            { kind: 'batch.review_ready', runId: 'run-generic', sessionId: session.id },
           ],
         };
       }
@@ -14033,9 +12814,9 @@ async function assertSessionDriverLoopAcceptedImplementationPlanNormalizesWriteB
     existingEvents: events,
   });
 
-  assert(Boolean(submittedBatch), 'accepted implementationPlan submits a normalized action batch');
+  assert(Boolean(submittedBatch), 'accepted taskPlan submits a normalized action batch');
   const action = submittedBatch.actionBundle.actions[0];
-  const block = submittedBatch.codeBlocks[0];
+  const block = submittedBatch.contentBlocks[0];
   assertEqual(action.kind, 'write', 'fs.write action keeps explicit write kind before Kernel submit');
   assertEqual(action.targetPath, 'generic-output.txt', 'fs.write action has explicit targetPath before Kernel submit');
   assertEqual(action.resourceScope[0], 'generic-output.txt', 'fs.write action keeps concrete resourceScope before Kernel submit');
@@ -14045,14 +12826,14 @@ async function assertSessionDriverLoopAcceptedImplementationPlanNormalizesWriteB
   assertEqual(block.targetPath, 'generic-output.txt', 'codeBlock carries targetPath before Kernel submit');
 }
 
-async function assertSessionDriverLoopAcceptedImplementationPlanPrefersTargetPathOverRootResourceScope(): Promise<void> {
-  const events = [acceptedImplementationPlanCardEvent('session-root-scope-targetpath', 'run-root-scope-targetpath')];
+async function assertSessionDriverLoopAcceptedTaskPlanPrefersTargetPathOverRootResourceScope(): Promise<void> {
+  const events = [acceptedTaskPlanCardEvent('session-root-scope-targetpath', 'run-root-scope-targetpath')];
   const planPayload = events[0].payload as any;
   planPayload.planId = 'impl-root-file-write';
-  planPayload.implementationPlan.id = 'impl-root-file-write';
-  planPayload.implementationPlan.title = 'Generic root file write plan';
-  planPayload.implementationPlan.summary = 'Create one generic root-level workspace file.';
-  planPayload.implementationPlan.tasks = [{
+  planPayload.taskPlan.id = 'impl-root-file-write';
+  planPayload.taskPlan.title = 'Generic root file write plan';
+  planPayload.taskPlan.summary = 'Create one generic root-level workspace file.';
+  planPayload.taskPlan.tasks = [{
     taskId: 'task-root-file-write',
     title: 'Create root-level script',
     target: ['root-output.sh'],
@@ -14109,7 +12890,6 @@ async function assertSessionDriverLoopAcceptedImplementationPlanPrefersTargetPat
         };
       }
       if (command.kind === 'userDecisionSubmit') return { ok: true, events: [] };
-      if (command.kind === 'permissionGrantTemporary') return { ok: true, events: [] };
       if (command.kind === 'actionBatchSubmit') {
         actionBatchSubmits += 1;
         return {
@@ -14129,7 +12909,7 @@ async function assertSessionDriverLoopAcceptedImplementationPlanPrefersTargetPat
               workUnitId: 'work-unit-root-output',
               output: { path: 'root-output.sh' },
             },
-            { kind: 'stage.changed', runId: command.runId, sessionId: session.id, phase: 'review' },
+            { kind: 'batch.review_ready', runId: command.runId, sessionId: session.id },
           ],
         };
       }
@@ -14140,7 +12920,7 @@ async function assertSessionDriverLoopAcceptedImplementationPlanPrefersTargetPat
       llmCalls += 1;
       if (llmCalls > 1) repairRequests.push(request);
       const proposal = genericWriteProposal(false);
-      proposal.codeBlocks = [{
+      proposal.contentBlocks = [{
         blockId: 'root-output-block',
         targetPath: 'root-output.sh',
         language: 'bash',
@@ -14152,7 +12932,7 @@ async function assertSessionDriverLoopAcceptedImplementationPlanPrefersTargetPat
       (proposal.actionBundle as any).actions = [{
         actionId: 'write-root-output',
         toolId: 'fs.write',
-        args: { path: 'root-output.sh', sourceBlockId: 'root-output-block' },
+        args: { path: 'root-output.sh', contentBlockId: 'root-output-block' },
         description: 'Write root output',
       }];
       return jsonLlmResponse(proposal);
@@ -14175,8 +12955,8 @@ async function assertSessionDriverLoopAcceptedImplementationPlanPrefersTargetPat
   assertEqual(repairRequests.length, 0, 'root resourceScope does not trigger accepted-plan scope repair when targetPath is concrete');
 }
 
-async function assertSessionDriverLoopAcceptedImplementationPlanRepairsPlanReviewRootAccessScope(): Promise<void> {
-  const events = [acceptedImplementationPlanCardEvent('session-planreview-root-scope-repair', 'run-planreview-root-scope-repair')];
+async function assertSessionDriverLoopAcceptedTaskPlanRepairsPlanReviewRootAccessScope(): Promise<void> {
+  const events = [acceptedTaskPlanCardEvent('session-planreview-root-scope-repair', 'run-planreview-root-scope-repair')];
   const session: AgentSession = {
     id: 'session-planreview-root-scope-repair',
     mode: 'plan',
@@ -14198,6 +12978,7 @@ async function assertSessionDriverLoopAcceptedImplementationPlanRepairsPlanRevie
         proposalSubmits += 1;
         const actionBundle = command.proposal?.payload?.actionBundle ?? {};
         if (proposalSubmits === 1) {
+          const deniedReport = proposalReviewReport(actionBundle);
           return {
             ok: true,
             events: [
@@ -14208,11 +12989,13 @@ async function assertSessionDriverLoopAcceptedImplementationPlanRepairsPlanRevie
                 sessionId: session.id,
                 proposalId: command.proposal?.proposalId,
                 report: {
-                  ...proposalReviewReport(actionBundle),
-                  status: 'needsRevision',
-                  blockedReasons: ['actionBundle access scope . (workspaceModule) access scope must not be the workspace root'],
-                  findings: [{ code: 'access_scope_root', message: 'access scope must not be the workspace root' }],
-                  kernelGeneratedPermissionSummary: 'Kernel preflight: status=needsRevision; root access scope rejected.',
+                  ...deniedReport,
+                  status: 'denied',
+                  diagnostics: ['actionBundle access scope . (workspaceModule) access scope must not be the workspace root'],
+                  executionContract: {
+                    ...deniedReport.executionContract,
+                    status: 'denied',
+                  },
                 },
               },
             ],
@@ -14232,7 +13015,6 @@ async function assertSessionDriverLoopAcceptedImplementationPlanRepairsPlanRevie
           ],
         };
       }
-      if (command.kind === 'permissionGrantTemporary') return { ok: true, events: [] };
       if (command.kind === 'actionBatchSubmit') {
         actionBatchSubmits += 1;
         return {
@@ -14247,7 +13029,7 @@ async function assertSessionDriverLoopAcceptedImplementationPlanRepairsPlanRevie
               actionId: 'write-generic-output',
               output: { path: 'generic-output.txt' },
             },
-            { kind: 'stage.changed', runId: command.runId, sessionId: session.id, phase: 'review' },
+            { kind: 'batch.review_ready', runId: command.runId, sessionId: session.id },
           ],
         };
       }
@@ -14272,7 +13054,7 @@ async function assertSessionDriverLoopAcceptedImplementationPlanRepairsPlanRevie
     existingEvents: events,
   });
 
-  assertEqual(proposalSubmits, 2, 'Kernel needsRevision triggers one automatic ProposalReview repair');
+  assertEqual(proposalSubmits, 2, 'Kernel denied diagnostic triggers one automatic ProposalReview repair');
   assertEqual(actionBatchSubmits, 1, 'repaired accepted-plan batch continues to actionBatchSubmit');
   assertEqual(repairRequests.length, 1, 'Session asks provider for one controlled PlanReview repair');
   assertEqual(result.events.some((event) => event.kind === 'requirement_confirmation'), false, 'repairable ProposalReview issue does not trigger user intervention');
@@ -14283,11 +13065,11 @@ async function assertSessionDriverLoopAcceptedImplementationPlanRepairsPlanRevie
   );
 }
 
-async function assertSessionDriverLoopAcceptedImplementationPlanPreservesExecutionRoot(): Promise<void> {
+async function assertSessionDriverLoopAcceptedTaskPlanPreservesExecutionRoot(): Promise<void> {
   const root = '/workspace/generic-project';
   const events: AgentEvent[] = [
     userMessageWithDirectoryAttachmentEvent('session-accepted-plan-root', root),
-    acceptedImplementationPlanCardEvent('session-accepted-plan-root', 'run-accepted-plan-root'),
+    acceptedTaskPlanCardEvent('session-accepted-plan-root', 'run-accepted-plan-root'),
   ];
   const session: AgentSession = {
     id: 'session-accepted-plan-root',
@@ -14323,7 +13105,6 @@ async function assertSessionDriverLoopAcceptedImplementationPlanPreservesExecuti
           ],
         };
       }
-      if (command.kind === 'permissionGrantTemporary') return { ok: true, events: [] };
       if (command.kind === 'actionBatchSubmit') return { ok: true, events: [] };
       return fakeKernel(request);
     },
@@ -14352,18 +13133,18 @@ async function assertSessionDriverLoopAcceptedImplementationPlanPreservesExecuti
     } as any,
   });
 
-  assertEqual(runCreateCount, 0, 'accepted implementationPlan continuation resumes without creating another Kernel run');
+  assertEqual(runCreateCount, 0, 'accepted taskPlan continuation resumes without creating another Kernel run');
   assert(
     JSON.stringify(llmRequests.at(-1)?.messages ?? []).includes(root),
-    'accepted implementationPlan continuation preserves the primary root in provider context'
+    'accepted taskPlan continuation preserves the primary root in provider context'
   );
 }
 
-async function assertSessionDriverLoopAcceptedImplementationPlanUsesPlanCardExecutionRoot(): Promise<void> {
+async function assertSessionDriverLoopAcceptedTaskPlanUsesPlanCardExecutionRoot(): Promise<void> {
   const token = randomSmokeToken('plan-root');
   const root = `/workspace/${token}`;
   const sessionId = `session-${token}`;
-  const plan = acceptedImplementationPlanCardEvent(sessionId, `run-${token}`);
+  const plan = acceptedTaskPlanCardEvent(sessionId, `run-${token}`);
   (plan.payload as any).executionRoot = {
     ref: root,
     source: 'recentAttachment',
@@ -14411,7 +13192,6 @@ async function assertSessionDriverLoopAcceptedImplementationPlanUsesPlanCardExec
           ],
         };
       }
-      if (command.kind === 'permissionGrantTemporary') return { ok: true, events: [] };
       if (command.kind === 'actionBatchSubmit') return { ok: true, events: [] };
       return fakeKernel(request);
     },
@@ -14438,7 +13218,7 @@ async function assertSessionDriverLoopAcceptedImplementationPlanUsesPlanCardExec
   assert(promptText.includes(root), 'plan-card execution root wins over decision-time workspace binding');
 }
 
-async function assertSessionDriverLoopAcceptedImplementationPlanRecoversExecutionRootFromResourcePacket(): Promise<void> {
+async function assertSessionDriverLoopAcceptedTaskPlanRecoversExecutionRootFromResourcePacket(): Promise<void> {
   const token = randomSmokeToken('resource-root');
   const root = `/workspace/${token}`;
   const sessionId = `session-${token}`;
@@ -14468,7 +13248,7 @@ async function assertSessionDriverLoopAcceptedImplementationPlanRecoversExecutio
         },
       },
     },
-    acceptedImplementationPlanCardEvent(sessionId, `run-${token}`),
+    acceptedTaskPlanCardEvent(sessionId, `run-${token}`),
   ];
   const session: AgentSession = {
     id: sessionId,
@@ -14504,7 +13284,6 @@ async function assertSessionDriverLoopAcceptedImplementationPlanRecoversExecutio
           ],
         };
       }
-      if (command.kind === 'permissionGrantTemporary') return { ok: true, events: [] };
       if (command.kind === 'actionBatchSubmit') return { ok: true, events: [] };
       return fakeKernel(request);
     },
@@ -14531,8 +13310,8 @@ async function assertSessionDriverLoopAcceptedImplementationPlanRecoversExecutio
   assert(promptText.includes(root), 'ResourcePacket directory fact becomes the accepted execution root context');
 }
 
-async function assertSessionDriverLoopAcceptedImplementationPlanAutoExecutesMultiTargetBatch(): Promise<void> {
-  const events = [multiTargetAcceptedImplementationPlanCardEvent('session-accepted-plan-multi', 'run-accepted-plan-multi')];
+async function assertSessionDriverLoopAcceptedTaskPlanAutoExecutesMultiTargetBatch(): Promise<void> {
+  const events = [multiTargetAcceptedTaskPlanCardEvent('session-accepted-plan-multi', 'run-accepted-plan-multi')];
   const session: AgentSession = {
     id: 'session-accepted-plan-multi',
     mode: 'plan',
@@ -14563,9 +13342,6 @@ async function assertSessionDriverLoopAcceptedImplementationPlanAutoExecutesMult
             },
           ],
         };
-      }
-      if (command.kind === 'permissionGrantTemporary') {
-        return { ok: true, events: [] };
       }
       if (command.kind === 'actionBatchSubmit') {
         actionBatchSubmits += 1;
@@ -14619,8 +13395,8 @@ async function assertSessionDriverLoopAcceptedImplementationPlanAutoExecutesMult
     existingEvents: events,
   });
 
-  assertEqual(proposalSubmits, 1, 'multi-target accepted implementationPlan batch still reaches Kernel PlanReview');
-  assertEqual(actionBatchSubmits, 1, 'multi-target accepted implementationPlan batch is auto-executed');
+  assertEqual(proposalSubmits, 1, 'multi-target accepted taskPlan batch still reaches Kernel PlanReview');
+  assertEqual(actionBatchSubmits, 1, 'multi-target accepted taskPlan batch is auto-executed');
   assertEqual(result.events.some((event) => event.kind === 'requirement_confirmation'), false, 'multi-target in-scope batch does not become a user intervention');
   assertEqual(
     result.events.some((event) =>
@@ -14634,11 +13410,11 @@ async function assertSessionDriverLoopAcceptedImplementationPlanAutoExecutesMult
   );
 }
 
-async function assertSessionDriverLoopAcceptedImplementationPlanSplitsCommaSeparatedTargets(): Promise<void> {
+async function assertSessionDriverLoopAcceptedTaskPlanSplitsCommaSeparatedTargets(): Promise<void> {
   const paths = Array.from({ length: 6 }, () => `${randomSmokeToken('dir')}/${randomSmokeToken('file')}.txt`);
   const sessionId = `session-${randomSmokeToken('comma')}`;
   const runId = `run-${randomSmokeToken('comma')}`;
-  const events = [commaSeparatedTargetsAcceptedImplementationPlanCardEvent(sessionId, runId, paths)];
+  const events = [commaSeparatedTargetsAcceptedTaskPlanCardEvent(sessionId, runId, paths)];
   const session: AgentSession = {
     id: sessionId,
     mode: 'plan',
@@ -14670,9 +13446,6 @@ async function assertSessionDriverLoopAcceptedImplementationPlanSplitsCommaSepar
             },
           ],
         };
-      }
-      if (command.kind === 'permissionGrantTemporary') {
-        return { ok: true, events: [] };
       }
       if (command.kind === 'actionBatchSubmit') {
         actionBatchSubmits += 1;
@@ -14733,11 +13506,11 @@ async function assertSessionDriverLoopAcceptedImplementationPlanSplitsCommaSepar
   );
 }
 
-async function assertSessionDriverLoopAcceptedImplementationPlanAllowsBriefExecutionBatchPlan(): Promise<void> {
+async function assertSessionDriverLoopAcceptedTaskPlanAllowsBriefExecutionBatchPlan(): Promise<void> {
   const path = `${randomSmokeToken('single')}/${randomSmokeToken('target')}.txt`;
   const sessionId = `session-${randomSmokeToken('brief')}`;
   const runId = `run-${randomSmokeToken('brief')}`;
-  const events = [commaSeparatedTargetsAcceptedImplementationPlanCardEvent(sessionId, runId, [path])];
+  const events = [commaSeparatedTargetsAcceptedTaskPlanCardEvent(sessionId, runId, [path])];
   const session: AgentSession = {
     id: sessionId,
     mode: 'plan',
@@ -14769,7 +13542,6 @@ async function assertSessionDriverLoopAcceptedImplementationPlanAllowsBriefExecu
           ],
         };
       }
-      if (command.kind === 'permissionGrantTemporary') return { ok: true, events: [] };
       if (command.kind === 'actionBatchSubmit') {
         actionBatchSubmits += 1;
         return {
@@ -14818,8 +13590,8 @@ async function assertSessionDriverLoopAcceptedImplementationPlanAllowsBriefExecu
   );
 }
 
-async function assertSessionDriverLoopAcceptedImplementationPlanKeepsContinuationNonExecutable(): Promise<void> {
-  const events = [acceptedImplementationPlanCardEvent('session-accepted-plan-continuation', 'run-accepted-plan-continuation')];
+async function assertSessionDriverLoopAcceptedTaskPlanKeepsContinuationNonExecutable(): Promise<void> {
+  const events = [acceptedTaskPlanCardEvent('session-accepted-plan-continuation', 'run-accepted-plan-continuation')];
   const session: AgentSession = {
     id: 'session-accepted-plan-continuation',
     mode: 'plan',
@@ -14853,7 +13625,6 @@ async function assertSessionDriverLoopAcceptedImplementationPlanKeepsContinuatio
           ],
         };
       }
-      if (command.kind === 'permissionGrantTemporary') return { ok: true, events: [] };
       if (command.kind === 'actionBatchSubmit') {
         actionBatchSubmits += 1;
         const actionBundle = command.batch?.actionBundle as Record<string, any> | undefined;
@@ -14892,7 +13663,7 @@ async function assertSessionDriverLoopAcceptedImplementationPlanKeepsContinuatio
         actions: [{
           actionId: 'write-continuation-current',
           toolId: 'fs.write',
-          args: { path: 'generic-output.txt', sourceBlockId: 'code-continuation-current' },
+          args: { path: 'generic-output.txt', contentBlockId: 'code-continuation-current' },
           description: 'Write current generic output.',
         }],
         continuationExpectations: ['Continue with another generic target after review.'],
@@ -14918,8 +13689,8 @@ async function assertSessionDriverLoopAcceptedImplementationPlanKeepsContinuatio
   assertEqual(submittedContinuationCount, 1, 'continuation smoke preserves one non-executable continuation note');
 }
 
-async function assertSessionDriverLoopAcceptedImplementationPlanAutoExecutesDeleteAction(): Promise<void> {
-  const events = [deleteAcceptedImplementationPlanCardEvent('session-accepted-plan-delete', 'run-accepted-plan-delete')];
+async function assertSessionDriverLoopAcceptedTaskPlanAutoExecutesDeleteAction(): Promise<void> {
+  const events = [deleteAcceptedTaskPlanCardEvent('session-accepted-plan-delete', 'run-accepted-plan-delete')];
   const session: AgentSession = {
     id: 'session-accepted-plan-delete',
     mode: 'plan',
@@ -14955,7 +13726,6 @@ async function assertSessionDriverLoopAcceptedImplementationPlanAutoExecutesDele
           ],
         };
       }
-      if (command.kind === 'permissionGrantTemporary') return { ok: true, events: [] };
       if (command.kind === 'actionBatchSubmit') {
         actionBatchSubmits += 1;
         submittedBatch = command.batch;
@@ -15006,8 +13776,8 @@ async function assertSessionDriverLoopAcceptedImplementationPlanAutoExecutesDele
     existingEvents: events,
   });
 
-  assertEqual(proposalSubmits, 1, 'delete-only accepted implementationPlan batch still reaches Kernel PlanReview');
-  assertEqual(actionBatchSubmits, 1, 'delete-only accepted implementationPlan batch is auto-executed without codeBlocks');
+  assertEqual(proposalSubmits, 1, 'delete-only accepted taskPlan batch still reaches Kernel PlanReview');
+  assertEqual(actionBatchSubmits, 1, 'delete-only accepted taskPlan batch is auto-executed without contentBlocks');
   assertEqual(result.events.some((event) => event.kind === 'requirement_confirmation'), false, 'in-scope delete action does not become a user intervention');
   assertEqual(result.events.filter((event) => event.kind === 'plan_card').length, 1, 'delete action does not create a second confirmable plan card');
   assert(
@@ -15027,7 +13797,7 @@ async function assertSessionDriverLoopAcceptedImplementationPlanAutoExecutesDele
   assertEqual(
     result.events.some((event) =>
       event.kind === 'workflow_stage' &&
-      String((event.payload as any)?.content ?? (event.payload as any)?.summary ?? '').includes('Agent Protocol v3 修复')
+      String((event.payload as any)?.content ?? (event.payload as any)?.summary ?? '').includes('Agent Protocol v4 修复')
     ),
     false,
     'clear delete actionBundle does not enter LLM protocol repair only to expand display markdown'
@@ -15045,16 +13815,26 @@ async function assertSessionDriverLoopAcceptedImplementationPlanAutoExecutesDele
   assert(Boolean(preflight), 'delete preflight trace is archived before Kernel actionBatchSubmit');
 }
 
-async function assertSessionDriverLoopAcceptedImplementationPlanCanonicalizesMultiDeleteBriefPlan(): Promise<void> {
+async function assertSessionDriverLoopUsesExactKernelOperationsForMixedDelete(): Promise<void> {
   const token = randomSmokeToken('multi-delete');
   const targets = [
-    `${token}-one.tmp`,
+    `${token}-tree`,
     `${token}-two.tmp`,
     `${token}-three.bin`,
   ];
   const sessionId = `session-${token}`;
   const runId = `run-${token}`;
-  const events = [multiDeleteAcceptedImplementationPlanCardEvent(sessionId, runId, token, targets)];
+  const events = [
+    ...turnAuthorityFixture(sessionId, runId, `Delete the accepted targets for ${token}.`, `mixed-delete-${token}`),
+    genericKernelContextProjectionEvent(sessionId, runId),
+    multiDeleteAcceptedTaskPlanCardEvent(
+      sessionId,
+      runId,
+      token,
+      targets,
+      ['directory', 'file', 'file']
+    ),
+  ];
   const session: AgentSession = {
     id: sessionId,
     mode: 'plan',
@@ -15063,8 +13843,6 @@ async function assertSessionDriverLoopAcceptedImplementationPlanCanonicalizesMul
   };
   let proposalSubmits = 0;
   let actionBatchSubmits = 0;
-  let llmCalls = 0;
-  let submittedProposal: Record<string, any> | undefined;
   let submittedBatch: Record<string, any> | undefined;
   const loop = new SessionDriverLoop({
     appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
@@ -15075,7 +13853,6 @@ async function assertSessionDriverLoopAcceptedImplementationPlanCanonicalizesMul
       const command = request.command as Record<string, any>;
       if (command.kind === 'proposalSubmit') {
         proposalSubmits += 1;
-        submittedProposal = command.proposal;
         return {
           ok: true,
           events: [
@@ -15090,53 +13867,37 @@ async function assertSessionDriverLoopAcceptedImplementationPlanCanonicalizesMul
           ],
         };
       }
-      if (command.kind === 'permissionGrantTemporary') return { ok: true, events: [] };
       if (command.kind === 'actionBatchSubmit') {
         actionBatchSubmits += 1;
         submittedBatch = command.batch;
         return {
           ok: true,
-          events: targets.flatMap((target, index) => [
-            {
-              kind: 'work_unit.queued',
-              runId,
-              sessionId,
-              workUnit: { id: `work-unit-${index}`, actionId: `delete-${index}`, status: 'queued', writeSet: [target] },
-            },
-            {
-              kind: 'work_unit.completed',
-              runId,
-              sessionId,
-              workUnitId: `work-unit-${index}`,
-              output: { path: target },
-            },
-          ]),
+          events: [
+            { kind: 'action_batch.accepted', runId, sessionId, batch: { planId: command.batch?.planId } },
+            ...targets.flatMap((target, index) => [
+              {
+                kind: 'work_unit.queued',
+                runId,
+                sessionId,
+                workUnit: { id: `work-unit-${index}`, actionId: `delete-${index}`, status: 'queued', writeSet: [target] },
+              },
+              {
+                kind: 'work_unit.completed',
+                runId,
+                sessionId,
+                workUnitId: `work-unit-${index}`,
+                output: { path: target },
+              },
+            ]),
+            { kind: 'batch.review_ready', runId, sessionId },
+          ],
         };
       }
       if (command.kind === 'reviewFactsGet') return { ok: true, events: [] };
       return fakeKernel(request);
     },
     llmChat: async (): Promise<ApiResponse<LlmChatResult>> => {
-      llmCalls += 1;
-      return jsonLlmResponse({
-        schemaVersion: 'deepcode.agent.protocol.v3',
-        kind: 'actionBundle',
-        outputLanguage: 'en-US',
-        userPlan: 'Delete the accepted cleanup targets.',
-        codeBlocks: [],
-        actionBundle: {
-          version: '1',
-          id: `bundle-${token}`,
-          actions: targets.map((target, index) => ({
-            actionId: `delete-${index}`,
-            toolId: 'fs.delete',
-            args: { path: target },
-            description: `Delete accepted target ${index + 1}.`,
-          })),
-          validationExpectations: [],
-          reviewExpectations: [],
-        },
-      });
+      throw new Error('content-free mixed delete must compile from exact Kernel authorization operations');
     },
     now: () => '2026-01-01T00:00:00.000Z',
     createId: (prefix) => `${prefix}-${events.length + proposalSubmits + actionBatchSubmits + 1}`,
@@ -15151,142 +13912,49 @@ async function assertSessionDriverLoopAcceptedImplementationPlanCanonicalizesMul
     existingEvents: events,
   });
 
-  assertEqual(llmCalls, 1, 'brief multi-delete batch does not trigger provider protocol repair');
-  assertEqual(proposalSubmits, 1, 'canonicalized multi-delete proposal reaches Kernel PlanReview once');
-  assertEqual(actionBatchSubmits, 1, 'canonicalized multi-delete batch reaches Kernel action execution once');
-  assertEqual((submittedBatch?.actionBundle?.actions ?? []).length, targets.length, 'submitted batch preserves every delete action');
-  assert(
-    String((submittedProposal?.payload as any)?.userPlan ?? '').includes('## Key Changes'),
-    'Session expands brief multi-delete actionBundle userPlan before Kernel proposalSubmit'
-  );
   assertEqual(
-    (((submittedProposal?.payload as any)?.actionBundle?.validationExpectations ?? []) as unknown[]).length > 0,
-    true,
-    'Session adds default validation expectations for brief multi-delete actionBundle'
+    proposalSubmits,
+    1,
+    `exact mixed-delete proposal reaches Kernel PlanReview once; events=${JSON.stringify(result.events.map((event) => ({ kind: event.kind, payload: event.payload })))}`
   );
-  assertEqual(
-    (((submittedProposal?.payload as any)?.actionBundle?.reviewExpectations ?? []) as unknown[]).length > 0,
-    true,
-    'Session adds default review expectations for brief multi-delete actionBundle'
-  );
+  assertEqual(actionBatchSubmits, 1, 'exact mixed-delete batch reaches Kernel execution once');
+  const actions = submittedBatch?.actionBundle?.actions ?? [];
+  assertEqual(actions.length, targets.length, 'submitted batch preserves one action per Kernel authorization operation');
+  assertEqual(actions[0]?.args?.path, targets[0], 'directory delete keeps the exact Kernel target');
+  assertEqual(actions[0]?.args?.targetKind, 'directory', 'directory delete keeps Kernel targetKind');
+  assertEqual(actions[0]?.args?.recursive, true, 'directory delete keeps Kernel recursive semantics');
+  assertEqual(actions[1]?.args?.targetKind, 'file', 'first file delete keeps Kernel targetKind');
+  assertEqual(actions[1]?.args?.recursive, false, 'first file delete keeps Kernel recursive semantics');
+  assertEqual(actions[2]?.args?.targetKind, 'file', 'second file delete keeps Kernel targetKind');
+  assertEqual(actions[2]?.args?.recursive, false, 'second file delete keeps Kernel recursive semantics');
   assertEqual(
     result.events.some((event) =>
       event.kind === 'workflow_stage' &&
-      String((event.payload as any)?.content ?? (event.payload as any)?.summary ?? '').includes('Agent Protocol v3 修复')
+      String((event.payload as any)?.content ?? (event.payload as any)?.summary ?? '').includes('Agent Protocol v4 修复')
     ),
     false,
-    'clear multi-delete actionBundle does not enter LLM protocol repair only to expand display markdown'
+    'exact mixed-delete operations do not enter LLM protocol repair'
   );
 }
 
-async function assertSessionDriverLoopAcceptedImplementationPlanUsesDirectoryDeleteTemplate(): Promise<void> {
-  const token = randomSmokeToken('dir-template');
-  const dirPath = `${token}/`;
-  const childNames = [`${randomSmokeToken('child')}.txt`, `${randomSmokeToken('child')}.hpp`];
+async function assertSessionDriverLoopRejectsMissingExactKernelOperationsBeforeProvider(): Promise<void> {
+  const token = randomSmokeToken('missing-exact-operations');
   const sessionId = `session-${token}`;
   const runId = `run-${token}`;
-  const events = [directoryDeleteAcceptedImplementationPlanCardEvent(sessionId, runId, dirPath, childNames)];
-  const session: AgentSession = {
-    id: sessionId,
-    mode: 'plan',
-    createdAt: '2026-01-01T00:00:00.000Z',
-    updatedAt: '2026-01-01T00:00:00.000Z',
-  };
-  let proposalSubmits = 0;
-  let actionBatchSubmits = 0;
-  let providerPrompt = '';
-  let submittedDeleteAction: Record<string, any> | undefined;
-  const loop = new SessionDriverLoop({
-    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
-      events.push(...nextEvents);
-      return { session: { ...session, eventCount: events.length }, events: [...events] };
-    },
-    kernelCommand: async (request): Promise<KernelReply> => {
-      const command = request.command as Record<string, any>;
-      if (command.kind === 'proposalSubmit') {
-        proposalSubmits += 1;
-        return {
-          ok: true,
-          events: [
-            { kind: 'proposal.accepted', runId, sessionId, proposal: command.proposal },
-            {
-              kind: 'proposal.reviewed',
-              runId,
-              sessionId,
-              proposalId: command.proposal?.proposalId,
-              report: proposalReviewReport(command.proposal?.payload?.actionBundle ?? {}),
-            },
-          ],
-        };
-      }
-      if (command.kind === 'permissionGrantTemporary') return { ok: true, events: [] };
-      if (command.kind === 'actionBatchSubmit') {
-        actionBatchSubmits += 1;
-        submittedDeleteAction = command.batch?.actionBundle?.actions?.[0];
-        return {
-          ok: true,
-          events: [
-            { kind: 'action_batch.accepted', runId, sessionId, batch: { planId: command.batch?.planId } },
-            {
-              kind: 'work_unit.completed',
-              runId,
-              sessionId,
-              workUnitId: 'work-unit-directory-delete',
-              actionId: submittedDeleteAction?.actionId,
-              output: { path: dirPath.replace(/\/+$/, '') },
-            },
-          ],
-        };
-      }
-      if (command.kind === 'reviewFactsGet') return { ok: true, events: [] };
-      return fakeKernel(request);
-    },
-    llmChat: async (request): Promise<ApiResponse<LlmChatResult>> => {
-      providerPrompt = request.messages.map((message) => message.content).join('\n');
-      const proposal = deleteActionBundleProposal(dirPath.replace(/\/+$/, '')) as any;
-      proposal.actionBundle.actions[0].args.targetKind = 'directory';
-      proposal.actionBundle.actions[0].args.recursive = true;
-      return jsonLlmResponse(proposal);
-    },
-    now: () => '2026-01-01T00:00:00.000Z',
-    createId: (prefix) => `${prefix}-${events.length + proposalSubmits + actionBatchSubmits + 1}`,
-  });
-
-  const result = await loop.resolveDecision({
+  const planEvent = multiDeleteAcceptedTaskPlanCardEvent(
     sessionId,
-    kind: 'plan',
-    decision: 'accept',
     runId,
-    targetId: `impl-${dirPath.replace(/[^A-Za-z0-9_.-]+/g, '-')}`,
-    existingEvents: events,
-  });
-
-  assertEqual(proposalSubmits, 1, 'directory delete template batch reaches Kernel PlanReview');
-  assertEqual(actionBatchSubmits, 1, 'directory delete template batch executes without returning to Plan');
-  assertEqual(result.events.some((event) => event.kind === 'requirement_confirmation'), false, 'directory delete template stays inside accepted scope');
-  assert(providerPrompt.includes('currentTaskActionTemplates'), 'accepted execution prompt exposes current task action templates');
-  assert(!providerPrompt.includes('New target/tool needs must return decisionRequest'), 'accepted execution prompt does not make scope expansion an LLM preflight decision');
-  assert(!providerPrompt.includes('If scope must expand, output decisionRequest'), 'accepted execution prompt leaves scope interrupts to Session and Kernel');
-  assert(providerPrompt.includes('Session and Kernel validate'), 'accepted execution prompt explains deterministic scope validation ownership');
-  assert(providerPrompt.includes('"targetKind": "directory"'), 'directory delete action template exposes directory target kind');
-  assert(providerPrompt.includes('"recursive": true'), 'directory delete action template exposes recursive delete intent');
-  for (const childName of childNames) {
-    assert(!providerPrompt.includes(`"${childName}"`), 'child filenames from human target annotation are not exposed as accepted targets');
-  }
-  assertEqual(submittedDeleteAction?.args?.targetKind, 'directory', 'submitted delete action keeps directory targetKind');
-  assertEqual(submittedDeleteAction?.args?.recursive, true, 'submitted delete action keeps recursive=true');
-}
-
-async function assertSessionDriverLoopAcceptedImplementationPlanInfersDirectoryDeleteFromResourceEvidence(): Promise<void> {
-  const token = randomSmokeToken('dir-resource-evidence');
-  const dirPath = `${token}/`;
-  const childNames = [`${randomSmokeToken('child')}.txt`, `${randomSmokeToken('child')}.md`];
-  const sessionId = `session-${token}`;
-  const runId = `run-${token}`;
-  const normalizedDir = dirPath.replace(/\/+$/, '');
+    token,
+    [`${token}-one`, `${token}-two`],
+    ['directory', 'file']
+  );
+  const payload = planEvent.payload as Record<string, any>;
+  payload.authorizationContract.operations = [];
+  payload.planAuthorizationReview.authorizationContract.operations = [];
   const events = [
-    genericDirectoryResourceEvent(sessionId, normalizedDir, childNames.map((childName) => `${normalizedDir}/${childName}`)),
-    directoryDeleteAcceptedImplementationPlanCardEvent(sessionId, runId, dirPath, childNames),
+    ...turnAuthorityFixture(sessionId, runId, `Delete the accepted targets for ${token}.`, `missing-operations-${token}`),
+    genericKernelContextProjectionEvent(sessionId, runId),
+    planEvent,
   ];
   const session: AgentSession = {
     id: sessionId,
@@ -15294,9 +13962,9 @@ async function assertSessionDriverLoopAcceptedImplementationPlanInfersDirectoryD
     createdAt: '2026-01-01T00:00:00.000Z',
     updatedAt: '2026-01-01T00:00:00.000Z',
   };
+  let providerCalls = 0;
   let proposalSubmits = 0;
   let actionBatchSubmits = 0;
-  let submittedDeleteAction: Record<string, any> | undefined;
   const loop = new SessionDriverLoop({
     appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
       events.push(...nextEvents);
@@ -15304,52 +13972,16 @@ async function assertSessionDriverLoopAcceptedImplementationPlanInfersDirectoryD
     },
     kernelCommand: async (request): Promise<KernelReply> => {
       const command = request.command as Record<string, any>;
-      if (command.kind === 'proposalSubmit') {
-        proposalSubmits += 1;
-        return {
-          ok: true,
-          events: [
-            { kind: 'proposal.accepted', runId, sessionId, proposal: command.proposal },
-            {
-              kind: 'proposal.reviewed',
-              runId,
-              sessionId,
-              proposalId: command.proposal?.proposalId,
-              report: proposalReviewReport(command.proposal?.payload?.actionBundle ?? {}),
-            },
-          ],
-        };
-      }
-      if (command.kind === 'permissionGrantTemporary') return { ok: true, events: [] };
-      if (command.kind === 'actionBatchSubmit') {
-        actionBatchSubmits += 1;
-        submittedDeleteAction = command.batch?.actionBundle?.actions?.[0];
-        return {
-          ok: true,
-          events: [
-            { kind: 'action_batch.accepted', runId, sessionId, batch: { planId: command.batch?.planId } },
-            {
-              kind: 'work_unit.completed',
-              runId,
-              sessionId,
-              workUnitId: 'work-unit-directory-delete-recursive-intent',
-              actionId: submittedDeleteAction?.actionId,
-              output: { path: dirPath.replace(/\/+$/, ''), kind: 'directory', recursive: true },
-            },
-          ],
-        };
-      }
-      if (command.kind === 'reviewFactsGet') return { ok: true, events: [] };
+      if (command.kind === 'proposalSubmit') proposalSubmits += 1;
+      if (command.kind === 'actionBatchSubmit') actionBatchSubmits += 1;
       return fakeKernel(request);
     },
     llmChat: async (): Promise<ApiResponse<LlmChatResult>> => {
-      const proposal = deleteActionBundleProposal(normalizedDir) as any;
-      proposal.actionBundle.actions[0].args.targetKind = 'file';
-      proposal.actionBundle.actions[0].args.recursive = false;
-      return jsonLlmResponse(proposal);
+      providerCalls += 1;
+      return jsonLlmResponse(deleteActionBundleProposal(`${token}-one`));
     },
     now: () => '2026-01-01T00:00:00.000Z',
-    createId: (prefix) => `${prefix}-${events.length + proposalSubmits + actionBatchSubmits + 1}`,
+    createId: (prefix) => `${prefix}-${events.length + 1}`,
   });
 
   const result = await loop.resolveDecision({
@@ -15357,72 +13989,25 @@ async function assertSessionDriverLoopAcceptedImplementationPlanInfersDirectoryD
     kind: 'plan',
     decision: 'accept',
     runId,
-    targetId: `impl-${dirPath.replace(/[^A-Za-z0-9_.-]+/g, '-')}`,
+    targetId: `impl-${token}`,
     existingEvents: events,
   });
 
-  assertEqual(proposalSubmits, 1, 'directory delete target with ResourceEvidence reaches Kernel PlanReview');
-  assertEqual(actionBatchSubmits, 1, 'directory delete target with ResourceEvidence executes after Session canonicalization');
+  assertEqual(providerCalls, 0, 'missing exact Kernel operations fail before a Provider call');
+  assertEqual(proposalSubmits, 0, 'missing exact Kernel operations fail before proposalSubmit');
+  assertEqual(actionBatchSubmits, 0, 'missing exact Kernel operations fail before actionBatchSubmit');
   assertEqual(
-    result.events.some((event) => event.kind === 'error' && (event.payload as any).code === 'accepted_plan_action_batch_preflight_failed'),
-    false,
-    'directory delete target with ResourceEvidence overrides stale file delete args before preflight'
-  );
-  assertEqual(submittedDeleteAction?.targetKind, 'directory', 'directory ResourceEvidence sets top-level directory targetKind');
-  assertEqual(submittedDeleteAction?.targetResourceKind, 'directory', 'directory ResourceEvidence sets top-level directory targetResourceKind');
-  assertEqual(submittedDeleteAction?.recursive, true, 'directory ResourceEvidence sets top-level recursive=true');
-  assertEqual(submittedDeleteAction?.args?.targetKind, 'directory', 'directory ResourceEvidence sets args directory targetKind');
-  assertEqual(submittedDeleteAction?.args?.recursive, true, 'directory ResourceEvidence sets args recursive=true');
-}
-
-async function assertSessionDriverLoopAcceptedImplementationRejectsDeleteRootTarget(): Promise<void> {
-  const events = [deleteAcceptedImplementationPlanCardEvent('session-accepted-plan-delete-root', 'run-accepted-plan-delete-root')];
-  const session: AgentSession = {
-    id: 'session-accepted-plan-delete-root',
-    mode: 'plan',
-    createdAt: '2026-01-01T00:00:00.000Z',
-    updatedAt: '2026-01-01T00:00:00.000Z',
-  };
-  let actionBatchSubmits = 0;
-  const loop = new SessionDriverLoop({
-    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
-      events.push(...nextEvents);
-      return { session: { ...session, eventCount: events.length }, events: [...events] };
-    },
-    kernelCommand: async (request): Promise<KernelReply> => {
-      const command = request.command as Record<string, any>;
-      if (command.kind === 'actionBatchSubmit') {
-        actionBatchSubmits += 1;
-        return { ok: true, events: [] };
-      }
-      if (command.kind === 'proposalSubmit') return { ok: true, events: [] };
-      return fakeKernel(request);
-    },
-    llmChat: async (): Promise<ApiResponse<LlmChatResult>> => jsonLlmResponse(deleteActionBundleProposal('.')),
-    now: () => '2026-01-01T00:00:00.000Z',
-    createId: (prefix) => `${prefix}-${events.length + actionBatchSubmits + 1}`,
-  });
-
-  const result = await loop.resolveDecision({
-    sessionId: session.id,
-    kind: 'plan',
-    decision: 'accept',
-    runId: 'run-accepted-plan-delete-root',
-    targetId: 'impl-generic-delete',
-    existingEvents: events,
-  });
-
-  assertEqual(actionBatchSubmits, 0, 'delete root target is rejected before Kernel actionBatchSubmit');
-  assert(
     result.events.some((event) =>
-      String((event.payload as any)?.content ?? (event.payload as any)?.summary ?? '').includes('fs.delete target cannot be empty or the workspace root')
+      event.kind === 'error' &&
+      (event.payload as any)?.code === 'accepted_plan_authorization_contract_incompatible'
     ),
-    'delete root rejection explains that the target cannot be the workspace root'
+    true,
+    'missing exact Kernel operations produce a structured incompatibility error'
   );
 }
 
-async function assertSessionDriverLoopAcceptedImplementationPlanClassifiesDeleteCompileMismatch(): Promise<void> {
-  const events = [deleteAcceptedImplementationPlanCardEvent('session-accepted-plan-delete-mismatch', 'run-accepted-plan-delete-mismatch')];
+async function assertSessionDriverLoopAcceptedTaskPlanClassifiesDeleteCompileMismatch(): Promise<void> {
+  const events = [deleteAcceptedTaskPlanCardEvent('session-accepted-plan-delete-mismatch', 'run-accepted-plan-delete-mismatch')];
   const session: AgentSession = {
     id: 'session-accepted-plan-delete-mismatch',
     mode: 'plan',
@@ -15453,7 +14038,6 @@ async function assertSessionDriverLoopAcceptedImplementationPlanClassifiesDelete
           ],
         };
       }
-      if (command.kind === 'permissionGrantTemporary') return { ok: true, events: [] };
       if (command.kind === 'actionBatchSubmit') {
         actionBatchSubmits += 1;
         return {
@@ -15479,7 +14063,7 @@ async function assertSessionDriverLoopAcceptedImplementationPlanClassifiesDelete
               workUnitId: 'work-unit-delete-mismatch',
               error: { code: 'invalid_command', message: 'invalid command: fs.write target path is empty' },
             },
-            { kind: 'stage.changed', runId: 'run-generic', sessionId: session.id, phase: 'review' },
+            { kind: 'batch.review_ready', runId: 'run-generic', sessionId: session.id },
           ],
         };
       }
@@ -15535,18 +14119,18 @@ async function assertSessionDriverLoopAcceptedImplementationPlanClassifiesDelete
   );
 }
 
-async function assertSessionDriverLoopAcceptedImplementationPlanClassifiesPatchEvidenceMismatch(): Promise<void> {
+async function assertSessionDriverLoopAcceptedTaskPlanClassifiesPatchEvidenceMismatch(): Promise<void> {
   const token = randomSmokeToken('patch-mismatch');
   const targetPath = `${token}.txt`;
   const oldText = `old-${randomSmokeToken('text')}`;
   const replacementText = `new-${randomSmokeToken('text')}`;
-  const events = [acceptedImplementationPlanCardEvent(`session-${token}`, `run-${token}`)];
+  const events = [acceptedTaskPlanCardEvent(`session-${token}`, `run-${token}`)];
   const planPayload = events[0].payload as any;
-  planPayload.implementationPlan.tasks[0].target = [targetPath];
-  planPayload.implementationPlan.tasks[0].capability = 'fs.patch';
-  planPayload.implementationPlan.tasks[0].fileOperations = [{
+  planPayload.taskPlan.tasks[0].target = [targetPath];
+  planPayload.taskPlan.tasks[0].capability = 'fs.edit';
+  planPayload.taskPlan.tasks[0].fileOperations = [{
     operation: 'patch',
-    capability: 'fs.patch',
+    capability: 'fs.edit',
     targetPath,
     reason: 'Random accepted-plan patch mismatch smoke target.',
   }];
@@ -15583,7 +14167,7 @@ async function assertSessionDriverLoopAcceptedImplementationPlanClassifiesPatchE
   let llmCalls = 0;
   let actionBatchSubmits = 0;
   const patchProposal = (): Record<string, unknown> => ({
-    schemaVersion: 'deepcode.agent.protocol.v3',
+    schemaVersion: 'deepcode.agent.protocol.v4',
     kind: 'actionBundle',
     outputLanguage: 'en-US',
     userPlan: [
@@ -15601,7 +14185,7 @@ async function assertSessionDriverLoopAcceptedImplementationPlanClassifiesPatchE
       '## Assumptions',
       '- The target path remains inside the accepted implementation plan.',
     ].join('\n'),
-    codeBlocks: [{
+    contentBlocks: [{
       blockId: `block-${token}`,
       targetPath,
       contentLines: [replacementText],
@@ -15612,7 +14196,7 @@ async function assertSessionDriverLoopAcceptedImplementationPlanClassifiesPatchE
       goal: 'Patch one random accepted target file.',
       actions: [{
         actionId: `patch-${token}`,
-        toolId: 'fs.patch',
+        toolId: 'fs.edit',
         args: {
           path: targetPath,
           replacementBlockId: `block-${token}`,
@@ -15676,7 +14260,6 @@ async function assertSessionDriverLoopAcceptedImplementationPlanClassifiesPatchE
           ],
         };
       }
-      if (command.kind === 'permissionGrantTemporary') return { ok: true, events: [] };
       if (command.kind === 'actionBatchSubmit') {
         actionBatchSubmits += 1;
         return {
@@ -15697,7 +14280,7 @@ async function assertSessionDriverLoopAcceptedImplementationPlanClassifiesPatchE
               writeSet: [targetPath],
               error: { code: 'invalid_patch', message: 'patch match did not occur in target file' },
             },
-            { kind: 'stage.changed', runId: `run-${token}`, sessionId: session.id, phase: 'review' },
+            { kind: 'batch.review_ready', runId: `run-${token}`, sessionId: session.id },
           ],
         };
       }
@@ -15742,8 +14325,17 @@ async function assertSessionDriverLoopAcceptedImplementationPlanClassifiesPatchE
   );
 }
 
-async function assertSessionDriverLoopAcceptedImplementationPlanAllowsPlannedProcessExecPermissionGate(): Promise<void> {
-  const events = [processExecAcceptedImplementationPlanCardEvent('session-accepted-plan-exec', 'run-accepted-plan-exec')];
+async function assertSessionDriverLoopAcceptedTaskPlanRejectsBlockedProcessExec(): Promise<void> {
+  const events = [
+    ...turnAuthorityFixture(
+      'session-accepted-plan-exec',
+      'run-accepted-plan-exec',
+      'Execute the accepted process task under Kernel policy.',
+      'accepted-plan-exec'
+    ),
+    genericKernelContextProjectionEvent('session-accepted-plan-exec', 'run-accepted-plan-exec'),
+    processExecAcceptedTaskPlanCardEvent('session-accepted-plan-exec', 'run-accepted-plan-exec'),
+  ];
   const session: AgentSession = {
     id: 'session-accepted-plan-exec',
     mode: 'plan',
@@ -15752,6 +14344,7 @@ async function assertSessionDriverLoopAcceptedImplementationPlanAllowsPlannedPro
   };
   let proposalSubmits = 0;
   let actionBatchSubmits = 0;
+  let providerCalls = 0;
   const loop = new SessionDriverLoop({
     appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
       events.push(...nextEvents);
@@ -15794,14 +14387,13 @@ async function assertSessionDriverLoopAcceptedImplementationPlanAllowsPlannedPro
       }
       return fakeKernel(request);
     },
-    llmChat: async (): Promise<ApiResponse<LlmChatResult>> => semanticToolLlmResponse('session.submit_task_artifacts', {
-      taskId: 'task-generic-exec',
-      summary: 'Run the accepted validation command.',
-      artifacts: [{
-        slotId: 'slot-task-generic-exec-1',
-        argv: ['bash', 'scripts/validate.sh'],
-      }],
-    }),
+    llmChat: async (): Promise<ApiResponse<LlmChatResult>> => {
+      providerCalls += 1;
+      return semanticToolLlmResponse('session.report_diagnostic', {
+        code: 'unexpected_provider_call',
+        summary: 'A blocked Kernel tool must be rejected before the Provider is called.',
+      });
+    },
     now: () => '2026-01-01T00:00:00.000Z',
     createId: (prefix) => `${prefix}-${events.length + proposalSubmits + actionBatchSubmits + 1}`,
   });
@@ -15815,22 +14407,113 @@ async function assertSessionDriverLoopAcceptedImplementationPlanAllowsPlannedPro
     existingEvents: events,
   });
 
-  assertEqual(proposalSubmits, 1, 'planned process.exec batch reaches Kernel PlanReview');
-  assertEqual(actionBatchSubmits, 1, 'planned process.exec batch reaches Kernel execution path');
-  assertEqual(result.events.some((event) => event.kind === 'requirement_confirmation'), false, 'planned process.exec is not converted into a Session requirement');
+  assertEqual(providerCalls, 0, 'blocked process.exec is rejected before accepted-task Provider execution');
+  assertEqual(proposalSubmits, 0, 'blocked process.exec does not reach Kernel ProposalSubmit');
+  assertEqual(actionBatchSubmits, 0, 'blocked process.exec does not reach Kernel execution');
+  assertEqual(
+    result.events.some((event) =>
+      event.kind === 'error' &&
+      (event.payload as any)?.code === 'accepted_task_tool_unavailable'
+    ),
+    true,
+    `blocked process.exec closes the accepted task with its structured Session diagnostic code; events=${result.events.map((event) => `${event.kind}:${JSON.stringify(event.payload)}`).join('|')}`
+  );
   assertEqual(
     result.events.some((event) =>
       event.kind === 'session_run_state' &&
-      (event.payload as any)?.status === 'waiting' &&
-      (event.payload as any)?.reason === 'permission'
+      (event.payload as any)?.status === 'failed'
     ),
     true,
-    'planned process.exec waits at Kernel PermissionGate'
+    'blocked process.exec marks the current run failed'
   );
 }
 
-async function assertSessionDriverLoopAcceptedImplementationPlanContinuesUntilTasksComplete(): Promise<void> {
-  const events = [multiTargetAcceptedImplementationPlanCardEvent('session-accepted-plan-continue', 'run-accepted-plan-continue')];
+async function assertSessionDriverLoopAcceptedTaskDiagnosticFailsRun(): Promise<void> {
+  const token = randomSmokeToken('accepted-task-diagnostic');
+  const sessionId = `session-${token}`;
+  const runId = `run-${token}`;
+  const events = [
+    ...turnAuthorityFixture(sessionId, runId, `Execute the accepted task for ${token}.`, `diagnostic-${token}`),
+    genericKernelContextProjectionEvent(sessionId, runId),
+    acceptedTaskPlanCardEvent(sessionId, runId),
+  ];
+  const session: AgentSession = {
+    id: sessionId,
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  let providerCalls = 0;
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request) => fakeKernel(request),
+    llmChat: async (): Promise<ApiResponse<LlmChatResult>> => {
+      providerCalls += 1;
+      return semanticToolLlmResponse('session.report_diagnostic', {
+        severity: 'info',
+        summary: `The current accepted task cannot continue for ${token}.`,
+      });
+    },
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${token}-${events.length + providerCalls + 1}`,
+  });
+
+  const result = await loop.resolveDecision({
+    sessionId,
+    kind: 'plan',
+    decision: 'accept',
+    runId,
+    targetId: 'impl-generic-auto',
+    existingEvents: events,
+  });
+
+  assertEqual(providerCalls, 1, 'accepted task diagnostic is handled by one Provider turn');
+  assertEqual(
+    result.events.some((event) =>
+      event.kind === 'workflow_stage' &&
+      (event.payload as any)?.stage === 'accepted_plan.task_failed'
+    ),
+    true,
+    'accepted task diagnostic records a failed task stage regardless of display severity'
+  );
+  assertEqual(
+    result.events.filter((event) =>
+      event.kind === 'error' &&
+      (event.payload as any)?.code === 'accepted_task_diagnostic'
+    ).length,
+    1,
+    'accepted task diagnostic produces one structured error projection'
+  );
+  assertEqual(
+    result.events.some((event) =>
+      event.kind === 'session_run_state' &&
+      (event.payload as any)?.status === 'failed' &&
+      (event.payload as any)?.reason === 'task_diagnostic'
+    ),
+    true,
+    'accepted task diagnostic terminates the run as failed'
+  );
+  assertEqual(
+    result.events.some((event) => event.kind === 'review_summary'),
+    false,
+    'accepted task diagnostic never enters Review'
+  );
+}
+
+async function assertSessionDriverLoopAcceptedTaskPlanContinuesUntilTasksComplete(): Promise<void> {
+  const events = [
+    ...turnAuthorityFixture(
+      'session-accepted-plan-continue',
+      'run-accepted-plan-continue',
+      'Create both accepted generic artifacts.',
+      'accepted-plan-continue'
+    ),
+    genericKernelContextProjectionEvent('session-accepted-plan-continue', 'run-accepted-plan-continue'),
+    multiTargetAcceptedTaskPlanCardEvent('session-accepted-plan-continue', 'run-accepted-plan-continue'),
+  ];
   const session: AgentSession = {
     id: 'session-accepted-plan-continue',
     mode: 'plan',
@@ -15840,12 +14523,12 @@ async function assertSessionDriverLoopAcceptedImplementationPlanContinuesUntilTa
   const directives = [
     {
       taskId: 'task-generic-one',
-      slotId: 'slot-task-generic-one-1',
+      slotId: 'slot-task-generic-one-plan-op-task-generic-one-1',
       content: 'generic one',
     },
     {
       taskId: 'task-generic-two',
-      slotId: 'slot-task-generic-two-1',
+      slotId: 'slot-task-generic-two-plan-op-task-generic-two-1',
       content: 'generic two',
     },
   ];
@@ -15864,10 +14547,10 @@ async function assertSessionDriverLoopAcceptedImplementationPlanContinuesUntilTa
         return {
           ok: true,
           events: [
-            { kind: 'proposal.accepted', runId: 'run-generic', sessionId: session.id, proposal: command.proposal },
+            { kind: 'proposal.accepted', runId: command.runId, sessionId: session.id, proposal: command.proposal },
             {
               kind: 'proposal.reviewed',
-              runId: 'run-generic',
+              runId: command.runId,
               sessionId: session.id,
               proposalId: command.proposal?.proposalId,
               report: proposalReviewReport(command.proposal?.payload?.actionBundle ?? {}),
@@ -15875,27 +14558,35 @@ async function assertSessionDriverLoopAcceptedImplementationPlanContinuesUntilTa
           ],
         };
       }
-      if (command.kind === 'permissionGrantTemporary') return { ok: true, events: [] };
       if (command.kind === 'actionBatchSubmit') {
         actionBatchSubmits += 1;
         const action = command.batch?.actionBundle?.actions?.[0] ?? {};
         const actionId = action.id ?? action.actionId ?? `write-generic-${actionBatchSubmits}`;
-        const path = action.targetPath ?? action.resourceScope?.[0] ?? `generic-${actionBatchSubmits}.txt`;
+        const path = action.args?.path ?? `generic-${actionBatchSubmits}.txt`;
+        const workUnitId = `work-unit-${actionBatchSubmits}`;
         return {
           ok: true,
           events: [
-            { kind: 'action_batch.accepted', runId: 'run-generic', sessionId: session.id, batch: { planId: command.batch?.planId } },
+            { kind: 'action_batch.accepted', runId: command.runId, sessionId: session.id, batch: { planId: command.batch?.planId } },
             {
               kind: 'work_unit.queued',
-              runId: 'run-generic',
+              runId: command.runId,
               sessionId: session.id,
-              workUnit: { id: `work-unit-${actionBatchSubmits}`, actionId, status: 'queued', writeSet: [path] },
+              workUnit: { id: workUnitId, actionId, status: 'queued', writeSet: [path] },
             },
+            completedKernelToolFact({
+              runId: String(command.runId),
+              sessionId: session.id,
+              workUnitId,
+              toolCallId: `tool-call-${actionBatchSubmits}`,
+              toolName: String(action.toolId ?? 'fs.write'),
+              path,
+            }),
             {
               kind: 'work_unit.completed',
-              runId: 'run-generic',
+              runId: command.runId,
               sessionId: session.id,
-              workUnitId: `work-unit-${actionBatchSubmits}`,
+              workUnitId,
               output: { path },
             },
           ],
@@ -15905,16 +14596,18 @@ async function assertSessionDriverLoopAcceptedImplementationPlanContinuesUntilTa
       return fakeKernel(request);
     },
     llmChat: async (): Promise<ApiResponse<LlmChatResult>> => {
-      const directive = directives[Math.min(llmCalls, directives.length - 1)];
+      const directive = directives[Math.min(Math.floor(llmCalls / 2), directives.length - 1)];
+      const appendChunk = llmCalls % 2 === 0;
       llmCalls += 1;
-      return semanticToolLlmResponse('session.submit_task_artifacts', {
-        taskId: directive.taskId,
-        summary: `Generate ${directive.taskId}`,
-        artifacts: [{
+      return appendChunk
+        ? semanticToolLlmResponse('session.append_artifact_chunk', {
           slotId: directive.slotId,
           contentLines: [directive.content],
-        }],
-      });
+          finalChunk: true,
+        })
+        : semanticToolLlmResponse('session.finalize_task_artifacts', {
+          summary: `Generate ${directive.taskId}`,
+        });
     },
     now: () => '2026-01-01T00:00:00.000Z',
     createId: (prefix) => `${prefix}-${events.length + llmCalls + actionBatchSubmits + 1}`,
@@ -15929,10 +14622,10 @@ async function assertSessionDriverLoopAcceptedImplementationPlanContinuesUntilTa
     existingEvents: events,
   });
 
-  assertEqual(llmCalls, 2, 'accepted implementationPlan automatically requests the second provider batch');
-  assertEqual(actionBatchSubmits, 2, 'accepted implementationPlan executes both in-scope batches');
-  assertEqual(runCreates, 0, 'accepted implementationPlan resumes the existing run without Kernel runCreate');
-  assertEqual(result.events.filter((event) => event.kind === 'review_summary' && (event.payload as any)?.status === 'waitingUserReview').length, 1, 'accepted implementationPlan produces only one terminal review');
+  assertEqual(llmCalls, 4, 'accepted taskPlan appends and finalizes artifacts for both task batches');
+  assertEqual(actionBatchSubmits, 2, 'accepted taskPlan executes both in-scope batches');
+  assertEqual(runCreates, 0, 'accepted taskPlan resumes the existing run without Kernel runCreate');
+  assertEqual(result.events.filter((event) => event.kind === 'review_summary' && (event.payload as any)?.status === 'waitingUserReview').length, 1, 'accepted taskPlan produces only one terminal review');
   const terminalReview = result.events.find((event) => event.kind === 'review_summary' && (event.payload as any)?.status === 'waitingUserReview');
   const terminalReviewPayload = terminalReview?.payload as any;
   const terminalChangedFiles = Array.isArray(terminalReviewPayload?.readableReview?.changedFiles)
@@ -15963,11 +14656,15 @@ async function assertSessionDriverLoopAcceptedImplementationPlanContinuesUntilTa
   );
 }
 
-async function assertSessionDriverLoopAcceptedImplementationPlanResumesAfterDecisionRequest(): Promise<void> {
+async function assertSessionDriverLoopAcceptedTaskPlanResumesAfterDecisionRequest(): Promise<void> {
   const token = `resume-${Math.random().toString(36).slice(2, 10)}`;
   const sessionId = `session-${token}`;
   const runId = `run-${token}`;
-  const events = [tripleTargetAcceptedImplementationPlanCardEvent(sessionId, runId, token)];
+  const events = [
+    ...turnAuthorityFixture(sessionId, runId, `Create the accepted artifacts for ${token}.`, `decision-resume-${token}`),
+    genericKernelContextProjectionEvent(sessionId, runId),
+    tripleTargetAcceptedTaskPlanCardEvent(sessionId, runId, token),
+  ];
   const session: AgentSession = {
     id: sessionId,
     mode: 'plan',
@@ -15981,12 +14678,16 @@ async function assertSessionDriverLoopAcceptedImplementationPlanResumesAfterDeci
   ];
   const directives = [
     {
-      name: 'session.submit_task_artifacts',
+      name: 'session.append_artifact_chunk',
       args: {
-        taskId: `task-${token}-one`,
-        summary: `Generate first artifact ${token}`,
-        artifacts: [{ slotId: `slot-task-${token}-one-1`, contentLines: [`content-${token}-one`] }],
+        slotId: `slot-task-${token}-one-plan-op-task-${token}-one-1`,
+        contentLines: [`content-${token}-one`],
+        finalChunk: true,
       },
+    },
+    {
+      name: 'session.finalize_task_artifacts',
+      args: { summary: `Generate first artifact ${token}` },
     },
     {
       name: 'session.request_decision',
@@ -16001,20 +14702,28 @@ async function assertSessionDriverLoopAcceptedImplementationPlanResumesAfterDeci
       },
     },
     {
-      name: 'session.submit_task_artifacts',
+      name: 'session.append_artifact_chunk',
       args: {
-        taskId: `task-${token}-two`,
-        summary: `Generate second artifact ${token}`,
-        artifacts: [{ slotId: `slot-task-${token}-two-1`, contentLines: [`content-${token}-two`] }],
+        slotId: `slot-task-${token}-two-plan-op-task-${token}-two-1`,
+        contentLines: [`content-${token}-two`],
+        finalChunk: true,
       },
     },
     {
-      name: 'session.submit_task_artifacts',
+      name: 'session.finalize_task_artifacts',
+      args: { summary: `Generate second artifact ${token}` },
+    },
+    {
+      name: 'session.append_artifact_chunk',
       args: {
-        taskId: `task-${token}-three`,
-        summary: `Generate third artifact ${token}`,
-        artifacts: [{ slotId: `slot-task-${token}-three-1`, contentLines: [`content-${token}-three`] }],
+        slotId: `slot-task-${token}-three-plan-op-task-${token}-three-1`,
+        contentLines: [`content-${token}-three`],
+        finalChunk: true,
       },
+    },
+    {
+      name: 'session.finalize_task_artifacts',
+      args: { summary: `Generate third artifact ${token}` },
     },
   ];
   let llmCalls = 0;
@@ -16041,12 +14750,12 @@ async function assertSessionDriverLoopAcceptedImplementationPlanResumesAfterDeci
           ],
         };
       }
-      if (command.kind === 'permissionGrantTemporary') return { ok: true, events: [] };
       if (command.kind === 'actionBatchSubmit') {
         actionBatchSubmits += 1;
         const action = command.batch?.actionBundle?.actions?.[0] ?? {};
         const actionId = action.id ?? action.actionId ?? `write-${token}-${actionBatchSubmits}`;
         const path = action.targetPath ?? action.args?.path ?? action.resourceScope?.[0] ?? `generic-${token}-${actionBatchSubmits}.txt`;
+        const workUnitId = `work-unit-${token}-${actionBatchSubmits}`;
         return {
           ok: true,
           events: [
@@ -16055,13 +14764,21 @@ async function assertSessionDriverLoopAcceptedImplementationPlanResumesAfterDeci
               kind: 'work_unit.queued',
               runId,
               sessionId,
-              workUnit: { id: `work-unit-${token}-${actionBatchSubmits}`, actionId, status: 'queued', writeSet: [path] },
+              workUnit: { id: workUnitId, actionId, status: 'queued', writeSet: [path] },
             },
+            completedKernelToolFact({
+              runId,
+              sessionId,
+              workUnitId,
+              toolCallId: `tool-call-${token}-${actionBatchSubmits}`,
+              toolName: String(action.toolId ?? 'fs.write'),
+              path,
+            }),
             {
               kind: 'work_unit.completed',
               runId,
               sessionId,
-              workUnitId: `work-unit-${token}-${actionBatchSubmits}`,
+              workUnitId,
               output: { path },
             },
           ],
@@ -16090,7 +14807,7 @@ async function assertSessionDriverLoopAcceptedImplementationPlanResumesAfterDeci
 
   const confirmation = waitingDecision.events.find((event) => event.kind === 'requirement_confirmation');
   const confirmationPayload = confirmation?.payload as Record<string, any> | undefined;
-  assertEqual(Boolean(confirmation), true, 'accepted implementationPlan can pause at a normal decisionRequest');
+  assertEqual(Boolean(confirmation), true, 'accepted taskPlan can pause at a normal decisionRequest');
   assertEqual(confirmationPayload?.acceptedPlanId, `impl-${token}`, 'decision overlay keeps the parent accepted plan id');
   assertEqual(confirmationPayload?.acceptedCurrentTaskId, `task-${token}-two`, 'decision overlay keeps the current accepted task cursor');
   assertEqual(actionBatchSubmits, 1, 'first accepted task executes before the decision request');
@@ -16110,7 +14827,7 @@ async function assertSessionDriverLoopAcceptedImplementationPlanResumesAfterDeci
     existingEvents: waitingDecision.events,
   });
 
-  assertEqual(llmCalls, 4, 'accepted plan resumes provider after decision and continues remaining tasks');
+  assertEqual(llmCalls, 7, 'accepted plan resumes provider after decision and finalizes both remaining task drafts');
   assertEqual(actionBatchSubmits, 3, 'accepted plan executes all queued tasks after decision');
   assertEqual(
     final.events.filter((event) => event.kind === 'review_summary' && (event.payload as any)?.status === 'waitingUserReview').length,
@@ -16129,8 +14846,28 @@ async function assertSessionDriverLoopAcceptedImplementationPlanResumesAfterDeci
   );
 }
 
-async function assertSessionDriverLoopAcceptedImplementationPlanReadsGeneratedArtifactEvidence(): Promise<void> {
-  const events = [generatedArtifactAcceptedImplementationPlanCardEvent('session-generated-artifact-evidence', 'run-generated-artifact-evidence')];
+async function assertSessionDriverLoopAcceptedTaskPlanReadsGeneratedArtifactEvidence(): Promise<void> {
+  const acceptedPlanEvent = generatedArtifactAcceptedTaskPlanCardEvent(
+    'session-generated-artifact-evidence',
+    'run-generated-artifact-evidence'
+  );
+  const acceptedPlanPayload = acceptedPlanEvent.payload as any;
+  acceptedPlanPayload.taskPlan.tasks[1].title = 'Verify generated input is already sufficient';
+  acceptedPlanPayload.taskPlan.tasks[1].target = ['generic-generated/input.txt'];
+  acceptedPlanPayload.taskPlan.tasks[1].acceptanceCriteria = [
+    'Fresh generated input evidence proves the dependent task needs no additional mutation.',
+  ];
+  applyKernelPlanAuthorizationFixture(acceptedPlanEvent);
+  const events = [
+    ...turnAuthorityFixture(
+      'session-generated-artifact-evidence',
+      'run-generated-artifact-evidence',
+      'Create and then verify the accepted generated artifact.',
+      'generated-artifact-evidence'
+    ),
+    genericKernelContextProjectionEvent('session-generated-artifact-evidence', 'run-generated-artifact-evidence'),
+    acceptedPlanEvent,
+  ];
   const session: AgentSession = {
     id: 'session-generated-artifact-evidence',
     mode: 'plan',
@@ -16139,12 +14876,16 @@ async function assertSessionDriverLoopAcceptedImplementationPlanReadsGeneratedAr
   };
   const directives = [
     {
-      name: 'session.submit_task_artifacts',
+      name: 'session.append_artifact_chunk',
       args: {
-        taskId: 'task-generated-input',
-        summary: 'Generate the accepted input artifact.',
-        artifacts: [{ slotId: 'slot-task-generated-input-1', contentLines: ['generated input'] }],
+        slotId: 'slot-task-generated-input-plan-op-task-generated-input-1',
+        contentLines: ['generated input'],
+        finalChunk: true,
       },
+    },
+    {
+      name: 'session.finalize_task_artifacts',
+      args: { summary: 'Generate the accepted input artifact.' },
     },
     {
       name: 'session.request_resources',
@@ -16158,11 +14899,16 @@ async function assertSessionDriverLoopAcceptedImplementationPlanReadsGeneratedAr
       },
     },
     {
-      name: 'session.submit_task_artifacts',
+      name: 'session.submit_task_outcome',
       args: {
-        taskId: 'task-generated-output',
-        summary: 'Generate the accepted output artifact.',
-        artifacts: [{ slotId: 'slot-task-generated-output-1', contentLines: ['generated output'] }],
+        outcome: 'alreadySatisfied',
+        summary: 'Fresh generated input evidence already satisfies the dependent accepted task.',
+        evidenceRefs: ['generated-generic-generated/input.txt'],
+        acceptanceResults: [{
+          criterionIndex: 1,
+          status: 'satisfied',
+          evidenceRefs: ['generated-generic-generated/input.txt'],
+        }],
       },
     },
   ];
@@ -16191,7 +14937,6 @@ async function assertSessionDriverLoopAcceptedImplementationPlanReadsGeneratedAr
           ],
         };
       }
-      if (command.kind === 'permissionGrantTemporary') return { ok: true, events: [] };
       if (command.kind === 'resourceResolve') {
         resourceResolveCalls += 1;
         return { ok: true, events: [] };
@@ -16200,7 +14945,8 @@ async function assertSessionDriverLoopAcceptedImplementationPlanReadsGeneratedAr
         actionBatchSubmits += 1;
         const action = command.batch?.actionBundle?.actions?.[0] ?? {};
         const actionId = action.id ?? action.actionId ?? `write-generated-${actionBatchSubmits}`;
-        const path = action.targetPath ?? action.resourceScope?.[0] ?? `generic-generated/${actionBatchSubmits}.txt`;
+        const path = action.args?.path ?? action.targetPath ?? action.resourceScope?.[0] ?? `generic-generated/${actionBatchSubmits}.txt`;
+        const workUnitId = `work-unit-generated-${actionBatchSubmits}`;
         return {
           ok: true,
           events: [
@@ -16209,13 +14955,21 @@ async function assertSessionDriverLoopAcceptedImplementationPlanReadsGeneratedAr
               kind: 'work_unit.queued',
               runId: 'run-generic',
               sessionId: session.id,
-              workUnit: { id: `work-unit-generated-${actionBatchSubmits}`, actionId, status: 'queued', writeSet: [path] },
+              workUnit: { id: workUnitId, actionId, status: 'queued', writeSet: [path] },
             },
+            completedKernelToolFact({
+              runId: 'run-generic',
+              sessionId: session.id,
+              workUnitId,
+              toolCallId: `tool-call-generated-${actionBatchSubmits}`,
+              toolName: String(action.toolId ?? 'fs.write'),
+              path,
+            }),
             {
               kind: 'work_unit.completed',
               runId: 'run-generic',
               sessionId: session.id,
-              workUnitId: `work-unit-generated-${actionBatchSubmits}`,
+              workUnitId,
               actionId,
               output: { actionId, path },
             },
@@ -16243,8 +14997,8 @@ async function assertSessionDriverLoopAcceptedImplementationPlanReadsGeneratedAr
     existingEvents: events,
   });
 
-  assertEqual(llmCalls, 3, 'provider resumes after generated artifact resourceRequest');
-  assertEqual(actionBatchSubmits, 2, 'generated artifact evidence allows the dependent batch to execute');
+  assertEqual(llmCalls, 4, 'provider resumes after generated artifact resourceRequest and closes the dependent task with one structured outcome');
+  assertEqual(actionBatchSubmits, 1, 'alreadySatisfied does not fabricate a second Kernel mutation batch');
   assertEqual(resourceResolveCalls, 0, 'generated artifact resourceRequest is satisfied without stale Kernel ResourceResolve');
   assertEqual(
     result.events.some((event) =>
@@ -16262,10 +15016,37 @@ async function assertSessionDriverLoopAcceptedImplementationPlanReadsGeneratedAr
     true,
     'generated file content is projected as run-local generated artifact evidence'
   );
+  assertEqual(
+    result.events.some((event) =>
+      event.kind === 'workflow_stage' &&
+      (event.payload as any)?.stage === 'accepted_plan.batch_checkpoint' &&
+      (event.payload as any)?.source === 'modelTaskOutcome' &&
+      (event.payload as any)?.taskId === 'task-generated-output'
+    ),
+    true,
+    'fresh generated evidence records a modelJudgedSufficient task checkpoint'
+  );
+  assertEqual(
+    result.events.filter((event) =>
+      event.kind === 'review_summary' &&
+      (event.payload as any)?.status === 'waitingUserReview'
+    ).length,
+    1,
+    'the final task outcome transitions directly to one Review without another Provider turn'
+  );
 }
 
-async function assertSessionDriverLoopAcceptedImplementationPlanResumesFromResourceCursor(): Promise<void> {
-  const events = [acceptedImplementationPlanCardEvent('session-accepted-plan-resource-resume', 'run-accepted-plan-resource-resume')];
+async function assertSessionDriverLoopAcceptedTaskPlanResumesFromResourceCursor(): Promise<void> {
+  const events = [
+    ...turnAuthorityFixture(
+      'session-accepted-plan-resource-resume',
+      'run-accepted-plan-resource-resume',
+      'Complete the accepted task after reading its required evidence.',
+      'resource-resume'
+    ),
+    genericKernelContextProjectionEvent('session-accepted-plan-resource-resume', 'run-accepted-plan-resource-resume'),
+    acceptedTaskPlanCardEvent('session-accepted-plan-resource-resume', 'run-accepted-plan-resource-resume'),
+  ];
   const session: AgentSession = {
     id: 'session-accepted-plan-resource-resume',
     mode: 'plan',
@@ -16300,7 +15081,6 @@ async function assertSessionDriverLoopAcceptedImplementationPlanResumesFromResou
           ],
         };
       }
-      if (command.kind === 'permissionGrantTemporary') return { ok: true, events: [] };
       if (command.kind === 'resourceResolve') {
         resourceResolveCalls += 1;
         return fakeKernel(request);
@@ -16338,8 +15118,8 @@ async function assertSessionDriverLoopAcceptedImplementationPlanResumesFromResou
     },
     llmChat: async (request): Promise<ApiResponse<LlmChatResult>> => {
       llmCalls += 1;
-      const userMessage = request.messages.find((message) => message.role === 'user')?.content ?? '';
-      providerPrompts.push(userMessage);
+      const requestText = request.messages.map((message) => message.content).join('\n');
+      providerPrompts.push(requestText);
       providerSystems.push(request.messages.find((message) => message.role === 'system')?.content ?? '');
       providerToolShapes.push(JSON.stringify((request.tools ?? []).map((tool) => tool.name)));
       if (llmCalls === 1) {
@@ -16352,13 +15132,17 @@ async function assertSessionDriverLoopAcceptedImplementationPlanResumesFromResou
           }],
         });
       }
-      assert(userMessage.includes('slot-task-generic-write-1'), 'resource resume keeps the same current task IntentSlot');
-      assert(userMessage.includes('ResourceEvidence'), 'resource resume appends ResourceEvidence to the same ContextAdmission shape');
-      return semanticToolLlmResponse('session.submit_task_artifacts', {
-        taskId: 'task-generic-write',
-        summary: 'Generate the accepted artifact after reading current evidence.',
-        artifacts: [{ slotId: 'slot-task-generic-write-1', contentLines: ['generic output after evidence'] }],
-      });
+      assert(requestText.includes('slot-task-generic-write-plan-op-task-generic-write-1'), 'resource resume keeps the same current Kernel-authorized IntentSlot');
+      assert(requestText.includes('ResourceEvidence'), 'resource resume appends ResourceEvidence to the same ContextAdmission shape');
+      return llmCalls === 2
+        ? semanticToolLlmResponse('session.append_artifact_chunk', {
+          slotId: 'slot-task-generic-write-plan-op-task-generic-write-1',
+          contentLines: ['generic output after evidence'],
+          finalChunk: true,
+        })
+        : semanticToolLlmResponse('session.finalize_task_artifacts', {
+          summary: 'Generate the accepted artifact after reading current evidence.',
+        });
     },
     now: () => '2026-01-01T00:00:00.000Z',
     createId: (prefix) => `${prefix}-${events.length + llmCalls + actionBatchSubmits + resourceResolveCalls + 1}`,
@@ -16380,9 +15164,9 @@ async function assertSessionDriverLoopAcceptedImplementationPlanResumesFromResou
     },
   });
 
-  assertEqual(llmCalls, 2, 'accepted-plan resourceRequest resumes through one compact provider call');
-  assertEqual(providerSystems[0], providerSystems[1], 'resource resume keeps the same execution profile system contract');
-  assertEqual(providerToolShapes[0], providerToolShapes[1], 'resource resume keeps the execution semantic tool schema and order stable');
+  assertEqual(llmCalls, 3, 'accepted-plan resourceRequest resumes through bounded append and finalize calls');
+  assertEqual(providerSystems.every((value) => value === providerSystems[0]), true, 'resource resume keeps the same execution profile system contract');
+  assertEqual(providerToolShapes.every((value) => value === providerToolShapes[0]), true, 'resource resume keeps the execution semantic tool schema and order stable');
   assertEqual(actionBatchSubmits, 1, 'compact resource resume actionBundle is submitted to Kernel');
   assertEqual(resourceResolveCalls >= 1, true, 'resource resume resolves current evidence through Kernel ResourceResolve');
   assertEqual(
@@ -16402,14 +15186,18 @@ async function assertSessionDriverLoopAcceptedImplementationPlanResumesFromResou
     true,
     'accepted-plan execution writes a task savepoint after the resumed batch'
   );
-  assert(providerPrompts[0] && providerPrompts[0].includes('slot-task-generic-write-1'), 'first call starts with the same current task IntentSlot');
+  assert(providerPrompts[0] && providerPrompts[0].includes('slot-task-generic-write-plan-op-task-generic-write-1'), 'first call starts with the same current Kernel-authorized IntentSlot');
 }
 
-async function assertSessionDriverLoopAcceptedImplementationPlanChainsResourceResumeRequests(): Promise<void> {
+async function assertSessionDriverLoopAcceptedTaskPlanChainsResourceResumeRequests(): Promise<void> {
   const token = randomSmokeToken('resource-chain');
   const sessionId = `session-${token}`;
   const runId = `run-${token}`;
-  const events = [acceptedImplementationPlanCardEvent(sessionId, runId)];
+  const events = [
+    ...turnAuthorityFixture(sessionId, runId, `Resolve the accepted task evidence for ${token}.`, `resource-chain-${token}`),
+    genericKernelContextProjectionEvent(sessionId, runId),
+    acceptedTaskPlanCardEvent(sessionId, runId),
+  ];
   const session: AgentSession = {
     id: sessionId,
     mode: 'plan',
@@ -16446,7 +15234,6 @@ async function assertSessionDriverLoopAcceptedImplementationPlanChainsResourceRe
           ],
         };
       }
-      if (command.kind === 'permissionGrantTemporary') return { ok: true, events: [] };
       if (command.kind === 'resourceResolve') {
         resourceResolveCalls += 1;
         return fakeKernel(request);
@@ -16473,11 +15260,11 @@ async function assertSessionDriverLoopAcceptedImplementationPlanChainsResourceRe
     },
     llmChat: async (request): Promise<ApiResponse<LlmChatResult>> => {
       llmCalls += 1;
-      const userMessage = request.messages.find((message) => message.role === 'user')?.content ?? '';
-      providerPrompts.push(userMessage);
+      const requestText = request.messages.map((message) => message.content).join('\n');
+      providerPrompts.push(requestText);
       if (llmCalls === 1 || llmCalls === 2) {
         if (llmCalls === 2) {
-          assert(userMessage.includes(evidencePaths[0]), 'second call appends the first resolved evidence path');
+          assert(requestText.includes(evidencePaths[0]), 'second call appends the first resolved evidence path');
         }
         return semanticToolLlmResponse('session.request_resources', {
           reason: `Read additional generic evidence ${llmCalls}.`,
@@ -16488,13 +15275,17 @@ async function assertSessionDriverLoopAcceptedImplementationPlanChainsResourceRe
           }],
         });
       }
-      assert(userMessage.includes(evidencePaths[0]), 'third call retains the first resolved evidence path');
-      assert(userMessage.includes(evidencePaths[1]), 'third call appends the second resolved evidence path');
-      return semanticToolLlmResponse('session.submit_task_artifacts', {
-        taskId: 'task-generic-write',
-        summary: `Generate artifact after chained evidence ${token}`,
-        artifacts: [{ slotId: 'slot-task-generic-write-1', contentLines: [`content-${token}`] }],
-      });
+      assert(requestText.includes(evidencePaths[0]), 'artifact calls retain the first resolved evidence path');
+      assert(requestText.includes(evidencePaths[1]), 'artifact calls retain the second resolved evidence path');
+      return llmCalls === 3
+        ? semanticToolLlmResponse('session.append_artifact_chunk', {
+          slotId: 'slot-task-generic-write-plan-op-task-generic-write-1',
+          contentLines: [`content-${token}`],
+          finalChunk: true,
+        })
+        : semanticToolLlmResponse('session.finalize_task_artifacts', {
+          summary: `Generate artifact after chained evidence ${token}`,
+        });
     },
     now: () => '2026-01-01T00:00:00.000Z',
     createId: (prefix) => `${prefix}-${events.length + llmCalls + actionBatchSubmits + resourceResolveCalls + 1}`,
@@ -16516,9 +15307,25 @@ async function assertSessionDriverLoopAcceptedImplementationPlanChainsResourceRe
     },
   });
 
-  assertEqual(llmCalls, 3, 'chained resource resume requests terminate with the resumed action');
+  const terminalSummary = result.events.slice(-8).map((event) => ({
+    kind: event.kind,
+    stage: (event.payload as any)?.stage,
+    code: (event.payload as any)?.code,
+    status: (event.payload as any)?.status,
+    message: event.kind === 'error' ? (event.payload as any)?.message : undefined,
+  }));
+  assertEqual(
+    llmCalls,
+    4,
+    `chained resource resume requests terminate with bounded append and finalize calls; events=${JSON.stringify(terminalSummary)}`
+  );
   assertEqual(actionBatchSubmits, 1, 'chained resource resume actionBundle is submitted once');
   assertEqual(resourceResolveCalls, 2, 'each chained resourceRequest resolves through Kernel ResourceResolve');
+  assertEqual(
+    (providerPrompts[1]?.match(/ProviderTurnContract:/g) ?? []).length,
+    1,
+    `resource resume reuses the existing workflow contract instead of appending a duplicate contract; contracts=${JSON.stringify((providerPrompts[1] ?? '').split('ProviderTurnContract:').slice(1).map((value) => value.slice(0, 700)))}`
+  );
   assertEqual(
     result.events.filter((event) =>
       event.kind === 'workflow_stage' &&
@@ -16527,7 +15334,7 @@ async function assertSessionDriverLoopAcceptedImplementationPlanChainsResourceRe
     2,
     'each chained resource resume writes a cursor projection'
   );
-  assert(providerPrompts[0] && providerPrompts[0].includes('slot-task-generic-write-1'), 'first call starts with the current task IntentSlot');
+  assert(providerPrompts[0] && providerPrompts[0].includes('slot-task-generic-write-plan-op-task-generic-write-1'), 'first call starts with the current Kernel-authorized IntentSlot');
 }
 
 async function assertSessionDriverLoopAcceptedReadOnlyResourceValidationCompletesWithoutProviderLoop(): Promise<void> {
@@ -16535,7 +15342,11 @@ async function assertSessionDriverLoopAcceptedReadOnlyResourceValidationComplete
   const targets = Array.from({ length: 5 }, () => `${randomSmokeToken('scope')}/${randomSmokeToken('target')}.txt`);
   const sessionId = `session-${token}`;
   const runId = `run-${token}`;
-  const events = [readOnlyAcceptedImplementationPlanCardEvent(sessionId, runId, token, targets)];
+  const events = [
+    ...turnAuthorityFixture(sessionId, runId, `Validate the accepted read-only targets for ${token}.`, `readonly-${token}`),
+    genericKernelContextProjectionEvent(sessionId, runId),
+    readOnlyAcceptedTaskPlanCardEvent(sessionId, runId, token, targets),
+  ];
   const session: AgentSession = {
     id: sessionId,
     mode: 'plan',
@@ -16544,7 +15355,6 @@ async function assertSessionDriverLoopAcceptedReadOnlyResourceValidationComplete
   };
   let llmCalls = 0;
   let actionBatchSubmits = 0;
-  let permissionGrants = 0;
   let reviewFactsRequests = 0;
   let resourceResolveCalls = 0;
   const loop = new SessionDriverLoop({
@@ -16591,10 +15401,6 @@ async function assertSessionDriverLoopAcceptedReadOnlyResourceValidationComplete
         actionBatchSubmits += 1;
         return fakeKernel(request);
       }
-      if (command.kind === 'permissionGrantTemporary') {
-        permissionGrants += 1;
-        return { ok: true, events: [] };
-      }
       if (command.kind === 'reviewFactsGet') {
         reviewFactsRequests += 1;
         return { ok: true, events: [] };
@@ -16636,7 +15442,6 @@ async function assertSessionDriverLoopAcceptedReadOnlyResourceValidationComplete
   assertEqual(llmCalls, 1, 'read-only validation completes without provider resume loop');
   assertEqual(resourceResolveCalls, 1, 'read-only validation resolves one focused ResourcePacket');
   assertEqual(actionBatchSubmits, 0, 'read-only validation does not submit actionBatch');
-  assertEqual(permissionGrants, 0, 'read-only validation does not request temporary grants');
   assertEqual(reviewFactsRequests, 1, 'read-only validation enters final review facts collection');
   assertEqual(
     result.events.some((event) =>
@@ -16673,9 +15478,12 @@ async function assertSessionDriverLoopAcceptedReadOnlyActionBundleCompletesThrou
   const targets = [...fileTargets, directoryTarget];
   const sessionId = `session-${token}`;
   const runId = `run-${token}`;
-  const events = [readOnlyAcceptedImplementationPlanCardEvent(sessionId, runId, token, targets)];
-  const planPayload = events[0].payload as any;
-  planPayload.implementationPlan.tasks[0].capability = 'fs.list';
+  const events = [
+    genericKernelContextProjectionEvent(sessionId, runId),
+    readOnlyAcceptedTaskPlanCardEvent(sessionId, runId, token, targets),
+  ];
+  const planPayload = events.find((event) => event.kind === 'plan_card')?.payload as any;
+  planPayload.taskPlan.tasks[0].toolId = 'fs.list';
   const session: AgentSession = {
     id: sessionId,
     mode: 'plan',
@@ -16684,7 +15492,6 @@ async function assertSessionDriverLoopAcceptedReadOnlyActionBundleCompletesThrou
   };
   let llmCalls = 0;
   let actionBatchSubmits = 0;
-  let permissionGrants = 0;
   let reviewFactsRequests = 0;
   let resourceResolveCalls = 0;
   const loop = new SessionDriverLoop({
@@ -16729,10 +15536,6 @@ async function assertSessionDriverLoopAcceptedReadOnlyActionBundleCompletesThrou
         actionBatchSubmits += 1;
         return fakeKernel(request);
       }
-      if (command.kind === 'permissionGrantTemporary') {
-        permissionGrants += 1;
-        return { ok: true, events: [] };
-      }
       if (command.kind === 'reviewFactsGet') {
         reviewFactsRequests += 1;
         return { ok: true, events: [] };
@@ -16743,7 +15546,7 @@ async function assertSessionDriverLoopAcceptedReadOnlyActionBundleCompletesThrou
       llmCalls += 1;
       assertEqual(llmCalls, 1, 'read-only actionBundle should not make a second provider call after ResourcePacket coverage');
       return jsonLlmResponse({
-        schemaVersion: 'deepcode.agent.protocol.v3',
+        schemaVersion: 'deepcode.agent.protocol.v4',
         kind: 'actionBundle',
         outputLanguage: 'en-US',
         userPlanMarkdown: 'Resolve current directory evidence for the accepted read-only task.',
@@ -16784,7 +15587,6 @@ async function assertSessionDriverLoopAcceptedReadOnlyActionBundleCompletesThrou
   assertEqual(llmCalls, 1, 'read-only actionBundle completes without provider retry');
   assertEqual(resourceResolveCalls, 1, 'read-only actionBundle resolves one focused ResourcePacket');
   assertEqual(actionBatchSubmits, 0, 'read-only actionBundle does not submit Kernel actionBatch');
-  assertEqual(permissionGrants, 0, 'read-only actionBundle does not request temporary grants');
   assertEqual(reviewFactsRequests, 1, 'read-only actionBundle reaches final review facts collection');
   assertEqual(
     result.events.some((event) => event.kind === 'requirement_confirmation'),
@@ -16811,11 +15613,11 @@ async function assertSessionDriverLoopAcceptedReadOnlyActionBundleCompletesThrou
   );
 }
 
-async function assertSessionDriverLoopAcceptedImplementationPlanAllowsAbsoluteAttachmentChildTarget(): Promise<void> {
+async function assertSessionDriverLoopAcceptedTaskPlanAllowsAbsoluteAttachmentChildTarget(): Promise<void> {
   const root = '/workspace/generic-project';
   const events: AgentEvent[] = [
     userMessageWithDirectoryAttachmentEvent('session-accepted-plan-absolute-child', root),
-    acceptedImplementationPlanCardEvent('session-accepted-plan-absolute-child', 'run-accepted-plan-absolute-child'),
+    acceptedTaskPlanCardEvent('session-accepted-plan-absolute-child', 'run-accepted-plan-absolute-child'),
   ];
   const session: AgentSession = {
     id: 'session-accepted-plan-absolute-child',
@@ -16846,7 +15648,6 @@ async function assertSessionDriverLoopAcceptedImplementationPlanAllowsAbsoluteAt
           ],
         };
       }
-      if (command.kind === 'permissionGrantTemporary') return { ok: true, events: [] };
       if (command.kind === 'actionBatchSubmit') {
         actionBatchSubmits += 1;
         return { ok: true, events: [] };
@@ -16883,7 +15684,7 @@ async function assertSessionDriverLoopAcceptedImplementationRejectsAttachmentRoo
   const root = '/workspace/generic-project';
   const events: AgentEvent[] = [
     userMessageWithDirectoryAttachmentEvent('session-accepted-plan-root-target', root),
-    acceptedImplementationPlanCardEvent('session-accepted-plan-root-target', 'run-accepted-plan-root-target'),
+    acceptedTaskPlanCardEvent('session-accepted-plan-root-target', 'run-accepted-plan-root-target'),
   ];
   const session: AgentSession = {
     id: 'session-accepted-plan-root-target',
@@ -16936,8 +15737,8 @@ async function assertSessionDriverLoopAcceptedImplementationRejectsAttachmentRoo
   );
 }
 
-async function assertSessionDriverLoopAcceptedImplementationPlanProjectsWorkUnitFailureReason(): Promise<void> {
-  const events = [acceptedImplementationPlanCardEvent('session-accepted-plan-failure', 'run-accepted-plan-failure')];
+async function assertSessionDriverLoopAcceptedTaskPlanProjectsWorkUnitFailureReason(): Promise<void> {
+  const events = [acceptedTaskPlanCardEvent('session-accepted-plan-failure', 'run-accepted-plan-failure')];
   const session: AgentSession = {
     id: 'session-accepted-plan-failure',
     mode: 'plan',
@@ -16967,7 +15768,6 @@ async function assertSessionDriverLoopAcceptedImplementationPlanProjectsWorkUnit
           ],
         };
       }
-      if (command.kind === 'permissionGrantTemporary') return { ok: true, events: [] };
       if (command.kind === 'actionBatchSubmit') {
         return {
           ok: true,
@@ -16993,7 +15793,7 @@ async function assertSessionDriverLoopAcceptedImplementationPlanProjectsWorkUnit
               writeSet: ['generic-output.txt'],
               error: { code: 'invalid_path', message: 'fs.write target is outside workspace binding' },
             },
-            { kind: 'stage.changed', runId: 'run-generic', sessionId: session.id, phase: 'review' },
+            { kind: 'batch.review_ready', runId: 'run-generic', sessionId: session.id },
           ],
         };
       }
@@ -17047,7 +15847,7 @@ async function assertSessionDriverLoopAcceptedImplementationPlanProjectsWorkUnit
 }
 
 async function assertSessionDriverLoopAcceptedImplementationRejectsOutOfScopeBatch(): Promise<void> {
-  const events = [acceptedImplementationPlanCardEvent('session-accepted-plan-oos', 'run-accepted-plan-oos')];
+  const events = [acceptedTaskPlanCardEvent('session-accepted-plan-oos', 'run-accepted-plan-oos')];
   const session: AgentSession = {
     id: 'session-accepted-plan-oos',
     mode: 'plan',
@@ -17058,8 +15858,8 @@ async function assertSessionDriverLoopAcceptedImplementationRejectsOutOfScopeBat
   let actionBatchSubmits = 0;
   let llmCalls = 0;
   const outOfScopeProposal = genericWriteProposal(false);
-  (outOfScopeProposal.codeBlocks as any[])[0].targetPath = 'outside-output.txt';
-  (outOfScopeProposal.actionBundle as any).actions[0].args = { path: 'outside-output.txt', sourceBlockId: 'generic-block' };
+  (outOfScopeProposal.contentBlocks as any[])[0].targetPath = 'outside-output.txt';
+  (outOfScopeProposal.actionBundle as any).actions[0].args = { path: 'outside-output.txt', contentBlockId: 'generic-block' };
   const loop = new SessionDriverLoop({
     appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
       events.push(...nextEvents);
@@ -17084,7 +15884,6 @@ async function assertSessionDriverLoopAcceptedImplementationRejectsOutOfScopeBat
           ],
         };
       }
-      if (command.kind === 'permissionGrantTemporary') return { ok: true, events: [] };
       if (command.kind === 'actionBatchSubmit') {
         actionBatchSubmits += 1;
         return {
@@ -17099,7 +15898,7 @@ async function assertSessionDriverLoopAcceptedImplementationRejectsOutOfScopeBat
               actionId: 'write-generic-output',
               output: { path: 'generic-output.txt' },
             },
-            { kind: 'stage.changed', runId: command.runId, sessionId: session.id, phase: 'review' },
+            { kind: 'batch.review_ready', runId: command.runId, sessionId: session.id },
           ],
         };
       }
@@ -17124,8 +15923,8 @@ async function assertSessionDriverLoopAcceptedImplementationRejectsOutOfScopeBat
     interventionLevel: 'medium',
   });
 
-  assertEqual(proposalSubmits, 0, 'out-of-scope accepted implementationPlan batch does not reach Kernel PlanReview');
-  assertEqual(actionBatchSubmits, 0, 'out-of-scope accepted implementationPlan batch is not executed');
+  assertEqual(proposalSubmits, 0, 'out-of-scope accepted taskPlan batch does not reach Kernel PlanReview');
+  assertEqual(actionBatchSubmits, 0, 'out-of-scope accepted taskPlan batch is not executed');
   assertEqual(result.events.filter((event) => event.kind === 'plan_card').length, 1, 'out-of-scope batch does not create another plan card');
   assertEqual(result.events.some((event) => event.kind === 'requirement_confirmation'), true, 'out-of-scope batch becomes one user intervention request');
   const confirmation = result.events.find((event) => event.kind === 'requirement_confirmation');
@@ -17183,7 +15982,7 @@ async function assertSessionDriverLoopAcceptedScopeRepairDecisionWaitsForPermiss
   const token = randomSmokeToken('scope-decision');
   const sessionId = `session-${token}`;
   const runId = `run-${token}`;
-  const events = [acceptedImplementationPlanCardEvent(sessionId, runId)];
+  const events = [acceptedTaskPlanCardEvent(sessionId, runId)];
   const session: AgentSession = {
     id: sessionId,
     mode: 'plan',
@@ -17195,8 +15994,8 @@ async function assertSessionDriverLoopAcceptedScopeRepairDecisionWaitsForPermiss
   let actionBatchSubmits = 0;
   const llmPromptTexts: string[] = [];
   const outOfScopeProposal = genericWriteProposal(false);
-  (outOfScopeProposal.codeBlocks as any[])[0].targetPath = `${token}-outside.txt`;
-  (outOfScopeProposal.actionBundle as any).actions[0].args = { path: `${token}-outside.txt`, sourceBlockId: 'generic-block' };
+  (outOfScopeProposal.contentBlocks as any[])[0].targetPath = `${token}-outside.txt`;
+  (outOfScopeProposal.actionBundle as any).actions[0].args = { path: `${token}-outside.txt`, contentBlockId: 'generic-block' };
   const loop = new SessionDriverLoop({
     appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
       events.push(...nextEvents);
@@ -17262,7 +16061,7 @@ async function assertSessionDriverLoopAcceptedScopeAcceptUsesDefaultOptionEffect
   const token = randomSmokeToken('scope-default');
   const sessionId = `session-${token}`;
   const runId = `run-${token}`;
-  const events = [acceptedImplementationPlanCardEvent(sessionId, runId)];
+  const events = [acceptedTaskPlanCardEvent(sessionId, runId)];
   const session: AgentSession = {
     id: sessionId,
     mode: 'plan',
@@ -17274,8 +16073,8 @@ async function assertSessionDriverLoopAcceptedScopeAcceptUsesDefaultOptionEffect
   let actionBatchSubmits = 0;
   const expandedTarget = `${token}-outside.txt`;
   const outOfScopeProposal = genericWriteProposal(false);
-  (outOfScopeProposal.codeBlocks as any[])[0].targetPath = expandedTarget;
-  (outOfScopeProposal.actionBundle as any).actions[0].args = { path: expandedTarget, sourceBlockId: 'generic-block' };
+  (outOfScopeProposal.contentBlocks as any[])[0].targetPath = expandedTarget;
+  (outOfScopeProposal.actionBundle as any).actions[0].args = { path: expandedTarget, contentBlockId: 'generic-block' };
   const loop = new SessionDriverLoop({
     appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
       events.push(...nextEvents);
@@ -17299,7 +16098,6 @@ async function assertSessionDriverLoopAcceptedScopeAcceptUsesDefaultOptionEffect
           ],
         };
       }
-      if (command.kind === 'permissionGrantTemporary') return { ok: true, events: [] };
       if (command.kind === 'actionBatchSubmit') {
         actionBatchSubmits += 1;
         return {
@@ -17314,7 +16112,7 @@ async function assertSessionDriverLoopAcceptedScopeAcceptUsesDefaultOptionEffect
               actionId: 'write-generic-output',
               output: { path: expandedTarget },
             },
-            { kind: 'stage.changed', runId: command.runId, sessionId, phase: 'review' },
+            { kind: 'batch.review_ready', runId: command.runId, sessionId },
           ],
         };
       }
@@ -17366,7 +16164,7 @@ async function assertSessionDriverLoopAcceptedScopeRepairInvalidDecisionFallsBac
   const token = randomSmokeToken('scope-fallback');
   const sessionId = `session-${token}`;
   const runId = `run-${token}`;
-  const events = [acceptedImplementationPlanCardEvent(sessionId, runId)];
+  const events = [acceptedTaskPlanCardEvent(sessionId, runId)];
   const session: AgentSession = {
     id: sessionId,
     mode: 'plan',
@@ -17377,10 +16175,10 @@ async function assertSessionDriverLoopAcceptedScopeRepairInvalidDecisionFallsBac
   let proposalSubmits = 0;
   let actionBatchSubmits = 0;
   const outOfScopeProposal = genericWriteProposal(false);
-  (outOfScopeProposal.codeBlocks as any[])[0].targetPath = `${token}-outside.txt`;
-  (outOfScopeProposal.actionBundle as any).actions[0].args = { path: `${token}-outside.txt`, sourceBlockId: 'generic-block' };
+  (outOfScopeProposal.contentBlocks as any[])[0].targetPath = `${token}-outside.txt`;
+  (outOfScopeProposal.actionBundle as any).actions[0].args = { path: `${token}-outside.txt`, contentBlockId: 'generic-block' };
   const invalidDecisionRequest = {
-    schemaVersion: 'deepcode.agent.protocol.v3',
+    schemaVersion: 'deepcode.agent.protocol.v4',
     kind: 'decisionRequest',
     outputLanguage: 'en-US',
     decisionRequest: {
@@ -17452,11 +16250,11 @@ async function assertSessionDriverLoopAcceptedScopeRepairInvalidDecisionFallsBac
 }
 
 async function assertSessionDriverLoopAcceptedPlanPatchRequestsSearchEvidence(): Promise<void> {
-  const planEvent = acceptedImplementationPlanCardEvent('session-accepted-plan-patch-evidence', 'run-accepted-plan-patch-evidence');
+  const planEvent = acceptedTaskPlanCardEvent('session-accepted-plan-patch-evidence', 'run-accepted-plan-patch-evidence');
   const planPayload = planEvent.payload as any;
   planPayload.planId = 'impl-generic-patch';
-  planPayload.implementationPlan.id = 'impl-generic-patch';
-  planPayload.implementationPlan.tasks = [{
+  planPayload.taskPlan.id = 'impl-generic-patch';
+  planPayload.taskPlan.tasks = [{
     taskId: 'task-generic-patch',
     title: 'Patch generic file',
     target: ['generic-patch.txt'],
@@ -17539,7 +16337,6 @@ async function assertSessionDriverLoopAcceptedPlanPatchRequestsSearchEvidence():
           ],
         };
       }
-      if (command.kind === 'permissionGrantTemporary') return { ok: true, events: [] };
       if (command.kind === 'actionBatchSubmit') {
         actionBatchSubmits += 1;
         return {
@@ -17559,7 +16356,7 @@ async function assertSessionDriverLoopAcceptedPlanPatchRequestsSearchEvidence():
               workUnitId: 'work-unit-generic-patch',
               output: { path: 'generic-patch.txt' },
             },
-            { kind: 'stage.changed', runId: 'run-generic', sessionId: session.id, phase: 'review' },
+            { kind: 'batch.review_ready', runId: 'run-generic', sessionId: session.id },
           ],
         };
       }
@@ -17571,7 +16368,7 @@ async function assertSessionDriverLoopAcceptedPlanPatchRequestsSearchEvidence():
       if (llmCalls === 1) return jsonLlmResponse(genericPatchProposal());
       if (llmCalls === 2) {
         return jsonLlmResponse({
-          schemaVersion: 'deepcode.agent.protocol.v3',
+          schemaVersion: 'deepcode.agent.protocol.v4',
           kind: 'resourceRequest',
           outputLanguage: 'en-US',
           resourceRequest: {
@@ -17622,7 +16419,17 @@ async function assertSessionDriverLoopAcceptedPlanPatchRequestsSearchEvidence():
 
 async function assertSessionDriverLoopReviewAcceptAutoGeneratesNextPlan(): Promise<void> {
   const token = randomSmokeToken('review-continuation-plan');
-  const events: AgentEvent[] = [{
+  const continuationTarget = `scope-${token}/follow-up.sh`;
+  const events: AgentEvent[] = [
+    ...turnAuthorityFixture(
+      'session-review-accept',
+      'run-review-accept',
+      'Create a generic batch with a possible reviewed continuation.',
+      `review-accept-${token}`
+    ),
+    genericKernelContextProjectionEvent('session-review-accept', 'run-review-accept'),
+    genericMissingResourceEvent('session-review-accept', 'run-review-accept', continuationTarget),
+    {
     id: 'review-waiting-accept-generic',
     sessionId: 'session-review-accept',
     ts: '2026-01-01T00:00:00.000Z',
@@ -17673,8 +16480,10 @@ async function assertSessionDriverLoopReviewAcceptAutoGeneratesNextPlan(): Promi
         tasks: [{
           taskId: `task-${token}`,
           title: `Implement continuation ${token}`,
-          operation: 'createFile',
-          targets: [`scope-${token}/follow-up.sh`],
+          toolId: 'fs.create',
+          targets: [continuationTarget],
+          args: {},
+          dependencies: [],
           acceptanceCriteria: [`Acceptance ${token}`],
           failureCriteria: [`Failure ${token}`],
         }],
@@ -17719,7 +16528,14 @@ async function assertSessionDriverLoopReviewAcceptAutoGeneratesNextPlan(): Promi
 }
 
 async function assertSessionDriverLoopReviewAcceptWithoutContinuationCompletesRun(): Promise<void> {
-  const events: AgentEvent[] = [{
+  const events: AgentEvent[] = [
+    ...turnAuthorityFixture(
+      'session-review-terminal',
+      'run-review-terminal',
+      'Create a generic batch and close it after review.',
+      'review-terminal'
+    ),
+    {
     id: 'review-waiting-terminal-generic',
     sessionId: 'session-review-terminal',
     ts: '2026-01-01T00:00:00.000Z',
@@ -17737,7 +16553,8 @@ async function assertSessionDriverLoopReviewAcceptWithoutContinuationCompletesRu
       channel: 'review',
       visibility: 'conversation',
     },
-  }];
+    },
+  ];
   const session: AgentSession = {
     id: 'session-review-terminal',
     mode: 'plan',
@@ -17784,7 +16601,14 @@ async function assertSessionDriverLoopReviewAcceptWithoutContinuationCompletesRu
 }
 
 async function assertSessionDriverLoopReviewAcceptOffStopsAtCurrentBatch(): Promise<void> {
-  const events: AgentEvent[] = [{
+  const events: AgentEvent[] = [
+    ...turnAuthorityFixture(
+      'session-review-accept-off',
+      'run-review-accept-off',
+      'Create a generic batch and stop at the current review.',
+      'review-accept-off'
+    ),
+    {
     id: 'review-waiting-accept-off-generic',
     sessionId: 'session-review-accept-off',
     ts: '2026-01-01T00:00:00.000Z',
@@ -17808,7 +16632,8 @@ async function assertSessionDriverLoopReviewAcceptOffStopsAtCurrentBatch(): Prom
       channel: 'review',
       visibility: 'conversation',
     },
-  }];
+    },
+  ];
   const session: AgentSession = {
     id: 'session-review-accept-off',
     mode: 'plan',
@@ -17863,7 +16688,14 @@ async function assertSessionDriverLoopReviewAcceptOffStopsAtCurrentBatch(): Prom
 }
 
 async function assertSessionDriverLoopRequirementRejectCancelsRun(): Promise<void> {
-  const events: AgentEvent[] = [{
+  const events: AgentEvent[] = [
+    ...turnAuthorityFixture(
+      'session-requirement-reject',
+      'run-requirement-reject',
+      'Create a generic workspace change.',
+      'requirement-reject'
+    ),
+    {
     id: 'requirement-waiting-generic',
     sessionId: 'session-requirement-reject',
     ts: '2026-01-01T00:00:00.000Z',
@@ -17878,7 +16710,8 @@ async function assertSessionDriverLoopRequirementRejectCancelsRun(): Promise<voi
       status: 'waitingUserConfirmation',
       confirmable: true,
     },
-  }];
+    },
+  ];
   const session: AgentSession = {
     id: 'session-requirement-reject',
     mode: 'plan',
@@ -17915,7 +16748,15 @@ async function assertSessionDriverLoopRequirementRejectCancelsRun(): Promise<voi
 }
 
 async function assertSessionDriverLoopRejectedDecisionCancelsRun(): Promise<void> {
-  const events = [acceptedImplementationPlanCardEvent('session-plan-reject', 'run-plan-reject')];
+  const events = [
+    ...turnAuthorityFixture(
+      'session-plan-reject',
+      'run-plan-reject',
+      'Prepare a generic plan that may be rejected.',
+      'plan-reject'
+    ),
+    acceptedTaskPlanCardEvent('session-plan-reject', 'run-plan-reject'),
+  ];
   const session: AgentSession = {
     id: 'session-plan-reject',
     mode: 'plan',
@@ -17953,7 +16794,14 @@ async function assertSessionDriverLoopRejectedDecisionCancelsRun(): Promise<void
 }
 
 async function assertSessionDriverLoopReviewRejectCancelsRun(): Promise<void> {
-  const events: AgentEvent[] = [{
+  const events: AgentEvent[] = [
+    ...turnAuthorityFixture(
+      'session-review-reject',
+      'run-review-reject',
+      'Create a generic batch that may be rejected during review.',
+      'review-reject'
+    ),
+    {
     id: 'review-waiting-reject-generic',
     sessionId: 'session-review-reject',
     ts: '2026-01-01T00:00:00.000Z',
@@ -17971,7 +16819,8 @@ async function assertSessionDriverLoopReviewRejectCancelsRun(): Promise<void> {
       channel: 'review',
       visibility: 'conversation',
     },
-  }];
+    },
+  ];
   const session: AgentSession = {
     id: 'session-review-reject',
     mode: 'plan',
@@ -18019,7 +16868,14 @@ async function assertSessionDriverLoopReviewRejectCancelsRun(): Promise<void> {
 }
 
 async function assertSessionDriverLoopPermissionRejectCancelsRun(): Promise<void> {
-  const events: AgentEvent[] = [{
+  const events: AgentEvent[] = [
+    ...turnAuthorityFixture(
+      'session-permission-reject',
+      'run-permission-reject',
+      'Execute a generic gated operation.',
+      'permission-reject'
+    ),
+    {
     id: 'permission-request-generic',
     sessionId: 'session-permission-reject',
     ts: '2026-01-01T00:00:00.000Z',
@@ -18031,7 +16887,8 @@ async function assertSessionDriverLoopPermissionRejectCancelsRun(): Promise<void
       status: 'pending',
       summary: 'A generic permission request is pending.',
     },
-  }];
+    },
+  ];
   const session: AgentSession = {
     id: 'session-permission-reject',
     mode: 'plan',
@@ -18085,6 +16942,12 @@ async function assertSessionDriverLoopPermissionRejectCancelsRun(): Promise<void
 
 async function assertSessionDriverLoopStaleRequirementDecisionNoopsAfterReviewAccept(): Promise<void> {
   const events: AgentEvent[] = [
+    ...turnAuthorityFixture(
+      'session-stale-interaction',
+      'run-current-review',
+      'Create a generic batch and handle only its current review.',
+      'stale-interaction'
+    ),
     {
       id: 'old-requirement-generic',
       sessionId: 'session-stale-interaction',
@@ -18237,7 +17100,7 @@ async function assertSessionDriverLoopNativeReadToolStreamsThroughResourceResolv
       const toolMessage = request.messages.find((message) => message.role === 'tool');
       assert(Boolean(toolMessage?.content.includes('resolved generic content')), 'provider resume receives Kernel resource tool result');
       return jsonLlmResponse({
-        schemaVersion: 'deepcode.agent.protocol.v3',
+        schemaVersion: 'deepcode.agent.protocol.v4',
         kind: 'answer',
         outputLanguage: 'en-US',
         answer: {
@@ -18308,7 +17171,7 @@ async function assertSessionDriverLoopNativeReadToolStreamFailureFallsBackToNonS
       assert(Boolean(toolMessage?.content.includes('resolved generic content')), 'non-stream fallback receives Kernel resource tool result');
       assertEqual(request.stream, false, 'non-stream fallback disables streaming on the retry request');
       return jsonLlmResponse({
-        schemaVersion: 'deepcode.agent.protocol.v3',
+        schemaVersion: 'deepcode.agent.protocol.v4',
         kind: 'answer',
         outputLanguage: 'en-US',
         answer: {
@@ -18433,7 +17296,7 @@ async function assertSessionDriverLoopNativeReadToolLoopHasNoFourRoundLimit(): P
       const toolMessages = request.messages.filter((message) => message.role === 'tool');
       assertEqual(toolMessages.length >= 6, true, 'provider resume receives all prior Kernel resource tool results');
       return jsonLlmResponse({
-        schemaVersion: 'deepcode.agent.protocol.v3',
+        schemaVersion: 'deepcode.agent.protocol.v4',
         kind: 'answer',
         outputLanguage: 'zh-CN',
         answer: {
@@ -18541,7 +17404,7 @@ async function assertSessionDriverLoopNativeReadToolDuplicateLoopRepairsToPropos
       );
       if (!duplicateRepairPrompt) {
         return jsonLlmResponse({
-          schemaVersion: 'deepcode.agent.protocol.v3',
+          schemaVersion: 'deepcode.agent.protocol.v4',
           kind: 'answer',
           outputLanguage: 'en-US',
           answer: {
@@ -18552,7 +17415,7 @@ async function assertSessionDriverLoopNativeReadToolDuplicateLoopRepairsToPropos
       }
       assert(duplicateRepairPrompt, 'duplicate read repair prompt includes duplicate target facts');
       return jsonLlmResponse({
-        schemaVersion: 'deepcode.agent.protocol.v3',
+        schemaVersion: 'deepcode.agent.protocol.v4',
         kind: 'answer',
         outputLanguage: 'en-US',
         answer: {
@@ -18646,7 +17509,7 @@ async function assertSessionDriverLoopNativeReadToolDuplicateProposalWinsOverToo
           assistantMessage: {
             role: 'assistant',
             content: JSON.stringify({
-              schemaVersion: 'deepcode.agent.protocol.v3',
+              schemaVersion: 'deepcode.agent.protocol.v4',
               kind: 'answer',
               outputLanguage: 'en-US',
               answer: {
@@ -18684,7 +17547,7 @@ async function assertSessionDriverLoopNativeReadToolDuplicateProposalWinsOverToo
   );
 }
 
-async function assertSessionDriverLoopNativeWriteToolTriggersImplementationPlanRepair(): Promise<void> {
+async function assertSessionDriverLoopNativeWriteToolTriggersTaskPlanRepair(): Promise<void> {
   const events: AgentEvent[] = [];
   const submittedPlans: Array<Record<string, any>> = [];
   const streamRequests: LlmChatRequest[] = [];
@@ -18753,12 +17616,12 @@ async function assertSessionDriverLoopNativeWriteToolTriggersImplementationPlanR
   const planCard = result.events.find((event) => event.kind === 'plan_card');
   const payload = planCard?.payload as any;
   assertEqual(Boolean(payload?.taskPlan), true, 'native write repair produces a taskPlan card');
-  assertEqual(Array.isArray(payload?.codeBlocks) && payload.codeBlocks.length === 0, true, 'taskPlan repair does not carry codeBlocks');
+  assertEqual(Array.isArray(payload?.contentBlocks) && payload.contentBlocks.length === 0, true, 'taskPlan repair does not carry contentBlocks');
   assertEqual(result.events.some((event) => event.kind === 'tool_result'), false, 'native write is not executed as an immediate tool result');
 }
 
 async function assertSessionDriverLoopAcceptedPlanNativeWriteToolUsesProposalOnlyRepair(): Promise<void> {
-  const events = [acceptedImplementationPlanCardEvent('session-accepted-plan-native-write-tool', 'run-accepted-plan-native-write-tool')];
+  const events = [acceptedTaskPlanCardEvent('session-accepted-plan-native-write-tool', 'run-accepted-plan-native-write-tool')];
   const deltas: unknown[] = [];
   const streamRequests: LlmChatRequest[] = [];
   const session: AgentSession = {
@@ -18792,7 +17655,6 @@ async function assertSessionDriverLoopAcceptedPlanNativeWriteToolUsesProposalOnl
           ],
         };
       }
-      if (command.kind === 'permissionGrantTemporary') return { ok: true, events: [] };
       if (command.kind === 'actionBatchSubmit') {
         actionBatchSubmits += 1;
         return {

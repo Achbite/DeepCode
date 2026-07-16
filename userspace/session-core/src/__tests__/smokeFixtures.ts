@@ -25,7 +25,7 @@ export function genericSessionResult(sessionId: string): AgentSessionResult {
 
 export function genericProposal(id: string, kind: string): ProposalEnvelope {
   return {
-    schemaVersion: 'deepcode.agent.protocol.v3',
+    schemaVersion: 'deepcode.agent.protocol.v4',
     proposalId: `proposal-${id}`,
     runId: `run-${id}`,
     sessionId: `session-${id}`,
@@ -39,10 +39,10 @@ export function genericProposal(id: string, kind: string): ProposalEnvelope {
 
 export function genericWriteProposal(missingEvidence: boolean): Record<string, unknown> {
   return {
-    schemaVersion: 'deepcode.agent.protocol.v3',
+    schemaVersion: 'deepcode.agent.protocol.v4',
     kind: 'actionBundle',
     outputLanguage: 'en-US',
-    userPlan: [
+    userPlanMarkdown: [
       '# Plan',
       '',
       '## Summary',
@@ -53,7 +53,7 @@ export function genericWriteProposal(missingEvidence: boolean): Record<string, u
       '- Keep this batch intentionally small so Kernel facts and user review can inspect the exact file scope.',
       '',
       '## Interfaces',
-      '- Use fs.write with sourceBlockId to connect the planned action to the generated code block.',
+      '- Use fs.write with contentBlockId to connect the planned action to the generated code block.',
       '- Do not invoke shell, git, browser, network, or any unsupported capability in this batch.',
       '',
       '## Test Plan',
@@ -64,9 +64,10 @@ export function genericWriteProposal(missingEvidence: boolean): Record<string, u
       '- The target path is inside the authorized workspace or conversation root.',
       '- Follow-up batches, if any, require review before continuation.',
     ].join('\n'),
-    codeBlocks: [{
+    contentBlocks: [{
       blockId: 'generic-block',
       targetPath: 'generic-output.txt',
+      operation: 'overwrite',
       contentLines: ['generic content'],
     }],
     actionBundle: {
@@ -76,7 +77,7 @@ export function genericWriteProposal(missingEvidence: boolean): Record<string, u
       actions: [{
         actionId: 'write-generic-output',
         toolId: 'fs.write',
-        args: { path: 'generic-output.txt', sourceBlockId: 'generic-block' },
+        args: { path: 'generic-output.txt', contentBlockId: 'generic-block' },
         description: 'Write generic output.',
       }],
       continuationExpectations: [],
@@ -87,14 +88,12 @@ export function genericWriteProposal(missingEvidence: boolean): Record<string, u
         ? []
         : [{ id: 'generic-review', description: 'User reviews the generic output and write scope.' }],
     },
-    expectedValidation: 'Kernel records write facts for the generic output.',
-    reviewGuide: 'Review the generic output path and content before approval.',
   };
 }
 
 export function genericTaskPlanProposal(): Record<string, unknown> {
   return {
-    schemaVersion: 'deepcode.agent.protocol.v3',
+    schemaVersion: 'deepcode.agent.protocol.v4',
     kind: 'taskPlan',
     outputLanguage: 'en-US',
     taskPlan: {
@@ -107,7 +106,8 @@ export function genericTaskPlanProposal(): Record<string, unknown> {
           taskId: 'task-generic-write',
           title: 'Prepare generic workspace output',
           target: ['generic-output.txt'],
-          capability: 'fs.write',
+          toolId: 'fs.create',
+          args: {},
           dependencies: [],
           conflictKeys: ['generic-output.txt'],
           acceptanceCriteria: ['Kernel facts show the accepted target was updated after Complete stage.'],
@@ -122,21 +122,22 @@ export function genericTaskPlanProposal(): Record<string, unknown> {
 
 export function absoluteTargetWriteProposal(targetPath: string): Record<string, unknown> {
   const proposal = genericWriteProposal(false);
-  proposal.codeBlocks = [{
+  proposal.contentBlocks = [{
     blockId: 'generic-block',
     targetPath,
+    operation: 'overwrite',
     contentLines: ['generic content'],
   }];
-  (proposal.actionBundle as any).actions[0].args = { path: targetPath, sourceBlockId: 'generic-block' };
+  (proposal.actionBundle as any).actions[0].args = { path: targetPath, contentBlockId: 'generic-block' };
   return proposal;
 }
 
 export function genericPatchProposal(): Record<string, unknown> {
   return {
-    schemaVersion: 'deepcode.agent.protocol.v3',
+    schemaVersion: 'deepcode.agent.protocol.v4',
     kind: 'actionBundle',
     outputLanguage: 'en-US',
-    userPlan: [
+    userPlanMarkdown: [
       '# Plan',
       '',
       '## Summary',
@@ -158,7 +159,7 @@ export function genericPatchProposal(): Record<string, unknown> {
       '- The target file is within the already accepted implementation plan scope.',
       '- The exact match block is present in the latest ResourcePacket evidence.',
     ].join('\n'),
-    codeBlocks: [{
+    contentBlocks: [{
       blockId: 'generic-patch-replacement',
       targetPath: 'generic-patch.txt',
       operation: 'replaceBlock',
@@ -170,7 +171,7 @@ export function genericPatchProposal(): Record<string, unknown> {
       goal: 'Patch a generic file with exact evidence.',
       actions: [{
         actionId: 'patch-generic-output',
-        toolId: 'fs.patch',
+        toolId: 'fs.edit',
         args: {
           path: 'generic-patch.txt',
           replacementBlockId: 'generic-patch-replacement',
@@ -187,28 +188,27 @@ export function genericPatchProposal(): Record<string, unknown> {
       validationExpectations: [{ id: 'generic-patch-evidence', description: 'Kernel records the patch fact for the generic file.' }],
       reviewExpectations: [{ id: 'generic-patch-review', description: 'User reviews the generic patch scope.' }],
     },
-    expectedValidation: 'Kernel records patch facts for the generic file.',
-    reviewGuide: 'Review the generic patch target and replacement before approval.',
   };
 }
 
 export function relativeTargetWriteProposal(targetPath: string, blockId: string, actionId: string): Record<string, unknown> {
   const proposal = genericWriteProposal(false);
-  proposal.codeBlocks = [{
+  proposal.contentBlocks = [{
     blockId,
     targetPath,
+    operation: 'overwrite',
     contentLines: [`content for ${targetPath}`],
   }];
   (proposal.actionBundle as any).id = `bundle-${actionId}`;
   (proposal.actionBundle as any).actions[0].actionId = actionId;
   (proposal.actionBundle as any).actions[0].description = `Write ${targetPath}`;
-  (proposal.actionBundle as any).actions[0].args = { path: targetPath, sourceBlockId: blockId };
+  (proposal.actionBundle as any).actions[0].args = { path: targetPath, contentBlockId: blockId };
   return proposal;
 }
 
 export function genericDecisionRequestProposal(id: string): Record<string, unknown> {
   return {
-    schemaVersion: 'deepcode.agent.protocol.v3',
+    schemaVersion: 'deepcode.agent.protocol.v4',
     kind: 'decisionRequest',
     outputLanguage: 'en-US',
     decisionRequest: {
@@ -263,10 +263,10 @@ export function genericDirectoryResourceEvent(sessionId: string, directoryPath: 
 
 export function deleteActionBundleProposal(targetPath: string): Record<string, unknown> {
   return {
-    schemaVersion: 'deepcode.agent.protocol.v3',
+    schemaVersion: 'deepcode.agent.protocol.v4',
     kind: 'actionBundle',
     outputLanguage: 'en-US',
-    userPlan: [
+    userPlanMarkdown: [
       '# Plan',
       '',
       '## Summary',
@@ -276,7 +276,7 @@ export function deleteActionBundleProposal(targetPath: string): Record<string, u
       '- Submit one fs.delete action with a concrete relative target.',
       '',
       '## Interfaces',
-      '- Use fs.delete directly; do not attach codeBlocks or sourceBlockId.',
+      '- Use fs.delete directly; do not attach contentBlocks or contentBlockId.',
       '',
       '## Test Plan',
       '- Kernel should record a delete work unit fact for the target.',
@@ -284,7 +284,7 @@ export function deleteActionBundleProposal(targetPath: string): Record<string, u
       '## Assumptions',
       '- The delete target is inside the accepted workspace scope.',
     ].join('\n'),
-    codeBlocks: [],
+    contentBlocks: [],
     actionBundle: {
       version: '1',
       id: 'bundle-generic-delete',
@@ -299,8 +299,6 @@ export function deleteActionBundleProposal(targetPath: string): Record<string, u
       validationExpectations: [{ id: 'generic-delete-evidence', description: 'Kernel records the delete fact for the generic obsolete file.' }],
       reviewExpectations: [{ id: 'generic-delete-review', description: 'User reviews the deleted target and Kernel facts.' }],
     },
-    expectedValidation: 'Kernel records delete facts for the generic obsolete file.',
-    reviewGuide: 'Review the generic delete target before approval.',
   };
 }
 
@@ -331,7 +329,7 @@ export function localizedGenericWriteProposal(): Record<string, unknown> {
     '- 保持本批次足够小，方便用户检查路径、内容和权限范围。',
     '',
     '## 接口与影响面',
-    '- 使用 fs.write 与 sourceBlockId 连接计划动作和代码块。',
+    '- 使用 fs.write 与 contentBlockId 连接计划动作和代码块。',
     '- 不调用命令、Git、网络、浏览器或其他外部能力。',
     '',
     '## 验证计划',
@@ -345,28 +343,18 @@ export function localizedGenericWriteProposal(): Record<string, unknown> {
   return proposal;
 }
 
-export function oversizedGenericWriteProposal(): Record<string, unknown> {
+export function manyContentBlockWriteProposal(): Record<string, unknown> {
   const proposal = genericWriteProposal(false);
-  proposal.codeBlocks = [{
-    blockId: 'generic-oversized-block',
-    targetPath: 'generic-oversized-output.txt',
-    contentLines: ['x'.repeat(385 * 1024)],
-  }];
-  (proposal.actionBundle as any).actions[0].args = { path: 'generic-oversized-output.txt', sourceBlockId: 'generic-oversized-block' };
-  return proposal;
-}
-
-export function manyCodeBlockWriteProposal(): Record<string, unknown> {
-  const proposal = genericWriteProposal(false);
-  proposal.codeBlocks = Array.from({ length: 7 }, (_item, index) => ({
+  proposal.contentBlocks = Array.from({ length: 7 }, (_item, index) => ({
     blockId: `generic-block-${index}`,
     targetPath: `generic-output-${index}.txt`,
+    operation: 'overwrite',
     contentLines: [`generic content ${index}`],
   }));
   (proposal.actionBundle as any).actions = Array.from({ length: 7 }, (_item, index) => ({
     actionId: `write-generic-output-${index}`,
     toolId: 'fs.write',
-    args: { path: `generic-output-${index}.txt`, sourceBlockId: `generic-block-${index}` },
+    args: { path: `generic-output-${index}.txt`, contentBlockId: `generic-block-${index}` },
     description: `Write generic output ${index}.`,
   }));
   return proposal;
@@ -375,7 +363,7 @@ export function manyCodeBlockWriteProposal(): Record<string, unknown> {
 export function providerFacingWriteProposalWithoutMachineIds(): Record<string, unknown> {
   const proposal = genericWriteProposal(false);
   delete (proposal.actionBundle as any).id;
-  proposal.codeBlocks = [{
+  proposal.contentBlocks = [{
     blockId: 'generic-block',
     targetPath: 'generic-output.txt',
     language: 'text',
@@ -386,7 +374,7 @@ export function providerFacingWriteProposalWithoutMachineIds(): Record<string, u
     actionId: 'write-generic-output',
     description: 'Write generic output',
     toolId: 'fs.write',
-    args: { path: 'generic-output.txt', sourceBlockId: 'generic-block' },
+    args: { path: 'generic-output.txt', contentBlockId: 'generic-block' },
     dependsOn: [],
   }];
   return proposal;
@@ -451,29 +439,98 @@ export function planKernel(
       ],
     };
   }
-  return { ok: true, events: [] };
+  return fakeKernel(request);
 }
 
-export function proposalReviewReport(actionBundle: Record<string, any>, attachmentRoot?: string): Record<string, any> {
+export function proposalReviewReport(actionBundle: Record<string, any>, _attachmentRoot?: string): Record<string, any> {
   const actions = Array.isArray(actionBundle.actions) ? actionBundle.actions : [];
-  const capabilities = [...new Set(actions.map((action) => actionCapability(action)).filter(Boolean))].sort();
-  const permissionGaps = capabilities.filter((capability) => capability !== 'fs.read' && capability !== 'git.read');
-  const requiredFileOperations = requiredFileOperationsFromActionBundle(actionBundle, attachmentRoot);
-  const requiredAccessScopes = requiredAccessScopesFromActionBundle(actionBundle);
+  const contractId = `contract-${actionBundle.id ?? 'bundle-generic'}`;
+  const permissionGroups = new Map<string, Record<string, any>[]>();
+  for (const action of actions) {
+    const toolId = typeof action?.toolId === 'string' ? action.toolId : '';
+    const capability = testKernelCapabilityForToolId(toolId);
+    if (!capability || testKernelPermissionModeForToolId(toolId) === 'allow') continue;
+    const group = permissionGroups.get(capability) ?? [];
+    group.push(action);
+    permissionGroups.set(capability, group);
+  }
+  const permissionBundles = [...permissionGroups.entries()].map(([capability, groupedActions], index) => {
+    const toolIds = [...new Set(groupedActions.map((action) => action.toolId).filter(Boolean))];
+    const operationIds = groupedActions.map((action) => action.actionId).filter(Boolean);
+    const targets = groupedActions.flatMap((action) => {
+      const args = action && typeof action.args === 'object' && !Array.isArray(action.args) ? action.args : {};
+      return [args.path, args.destinationPath, args.url].filter((value): value is string => typeof value === 'string' && Boolean(value));
+    });
+    return {
+      id: `permission-${actionBundle.id ?? 'bundle-generic'}-${index + 1}`,
+      capability,
+      permissionMode: 'ask',
+      risk: toolIds.some((toolId) => ['fs.delete', 'fs.rename', 'git.push', 'process.exec'].includes(toolId)) ? 'high' : 'medium',
+      resourceKind: capability === 'workspace.write' ? 'workspacePath' : capability,
+      operationIds,
+      toolIds,
+      targets,
+      expiresAfter: 'reviewGateOrRunTerminal',
+    };
+  });
+  const status = permissionBundles.length ? 'awaitingUserApproval' : 'autoAccepted';
   return {
-    planId: actionBundle.id ?? 'bundle-generic',
-    status: 'awaitingUserApproval',
-    requiredCapabilities: capabilities,
-    requiredPermissions: permissionGaps.map((capability) => `temporaryGrant:${capability}`),
-    permissionGaps,
-    requiredFileOperations,
-    requiredAccessScopes,
-    hardFloorHits: [],
-    deniedReasons: [],
-    blockedReasons: [],
-    findings: [],
-    kernelGeneratedPermissionSummary: `Kernel preflight: status=awaitingUserApproval; capabilities=${capabilities.join(',')}; permissionGaps=${permissionGaps.length ? permissionGaps.join(',') : 'none'}; hardFloor=none.`,
+    proposalId: actionBundle.id ?? 'bundle-generic',
+    status,
+    requiredPermissions: permissionBundles.map((bundle) => bundle.capability),
+    diagnostics: [],
+    executionContract: {
+      id: contractId,
+      proposalId: actionBundle.id ?? 'bundle-generic',
+      status,
+      catalogVersion: 'deepcode.kernel.tools.v3',
+      catalogHash: 'test-catalog-hash',
+      operationSetHash: 'test-operation-set-hash',
+      contractHash: `hash-${contractId}`,
+      operations: actions.map((action) => ({
+        id: action.actionId,
+        title: action.description ?? action.actionId,
+        toolId: action.toolId,
+        args: action.args ?? {},
+        argsHash: `hash-${action.actionId}`,
+        readSet: [],
+        writeSet: typeof action.args?.path === 'string' ? [action.args.path] : [],
+        conflictKeys: typeof action.args?.path === 'string' ? [action.args.path] : [],
+        executionMode: 'execute',
+        cleanup: { leasePolicy: 'contract', failurePolicy: 'blockReviewAcceptance' },
+      })),
+      permissionBundles,
+      interventions: permissionBundles.map((bundle) => ({
+        id: `gate-${bundle.id}`,
+        interventionKind: 'permission',
+        status: 'pending',
+        permissionBundleId: bundle.id,
+        affectedOperationIds: bundle.operationIds,
+        summary: 'Kernel permission gate.',
+      })),
+      cleanupPolicy: 'cleanupContractPerOperation',
+      expiresAfter: 'reviewGateOrRunTerminal',
+    },
   };
+}
+
+function testKernelCapabilityForToolId(toolId: string): string | undefined {
+  if (['fs.read', 'fs.list', 'fs.glob', 'fs.diff', 'code.grep', 'document.read'].includes(toolId)) return 'workspace.read';
+  if (['fs.create', 'fs.write', 'fs.edit', 'fs.rename', 'fs.delete'].includes(toolId)) return 'workspace.write';
+  if (['git.status', 'git.diff'].includes(toolId)) return 'git.read';
+  if (['git.stage', 'git.unstage', 'git.commit'].includes(toolId)) return 'git.write';
+  if (toolId === 'git.push') return 'git.push';
+  if (['web.search', 'web.fetch'].includes(toolId)) return 'network.egress';
+  if (toolId === 'process.exec') return 'process.exec';
+  if (toolId.startsWith('browser.')) return 'browser.control';
+  if (toolId === 'provider.call') return 'provider.egress';
+  return undefined;
+}
+
+function testKernelPermissionModeForToolId(toolId: string): 'allow' | 'ask' {
+  return ['fs.read', 'fs.list', 'fs.glob', 'fs.diff', 'code.grep', 'document.read', 'git.status', 'git.diff'].includes(toolId)
+    ? 'allow'
+    : 'ask';
 }
 
 export function requiredAccessScopesFromActionBundle(actionBundle: Record<string, any>): Array<Record<string, any>> {
@@ -490,14 +547,14 @@ export function requiredAccessScopesFromActionBundle(actionBundle: Record<string
     if (!path || path === '.' || path.includes('*') || path.startsWith('../') || path.includes('/../')) continue;
     const capability = typeof item.capability === 'string'
       ? item.capability
-      : Array.isArray(item.capabilities) && typeof item.capabilities[0] === 'string'
-        ? item.capabilities[0]
+      : Array.isArray(item.toolIds) && typeof item.toolIds[0] === 'string'
+        ? item.toolIds[0]
         : 'fs.write';
     scopes.push({
       scopeKind: typeof item.scopeKind === 'string' ? item.scopeKind : 'workspaceModule',
       path,
       capability,
-      operations: Array.isArray(item.operations) ? item.operations : (capability === 'fs.patch' ? ['patch'] : ['create', 'write']),
+      operations: Array.isArray(item.operations) ? item.operations : (capability === 'fs.edit' ? ['patch'] : ['create', 'write']),
       reason: typeof item.reason === 'string' ? item.reason : 'generic access scope',
       dependencyDepth: typeof item.dependencyDepth === 'number' ? item.dependencyDepth : 0,
       outsideWorkspace: false,
@@ -566,7 +623,7 @@ export function fileOperationForAction(action: Record<string, any>, capability: 
   if (kind === 'rename') return 'rename';
   if (['write', 'patch', 'replaceBlock', 'insertBefore', 'insertAfter'].includes(kind)) return 'write';
   if (capability === 'fs.write') return 'write';
-  if (capability === 'fs.patch') return 'write';
+  if (capability === 'fs.edit') return 'write';
   if (capability === 'fs.delete') return 'delete';
   return undefined;
 }
@@ -602,27 +659,16 @@ export function genericActionBundle(): ActionBundleDraft {
     goal: 'Perform a generic workspace update after review.',
     actions: [
       {
-        id: 'read-generic',
-        title: 'Read generic resource',
+        actionId: 'read-generic',
         toolId: 'fs.read',
         args: { path: 'generic/input.txt' },
-        kind: 'read',
-        capability: 'fs.read',
-        resourceScope: ['generic/input.txt'],
-        canParallelize: true,
-        conflictKeys: [],
+        description: 'Read generic resource',
       },
       {
-        id: 'write-generic',
-        title: 'Write generic resource',
+        actionId: 'write-generic',
         toolId: 'fs.write',
-        args: { path: 'generic/output.txt', sourceBlockId: 'code-generic' },
-        kind: 'write',
-        capability: 'fs.write',
-        resourceScope: ['generic/output.txt'],
-        canParallelize: false,
-        conflictKeys: ['generic/output.txt'],
-        sourceBlockId: 'code-generic',
+        args: { path: 'generic/output.txt', contentBlockId: 'code-generic' },
+        description: 'Write generic resource',
       },
     ],
     validationExpectations: [{ id: 'validation-generic', description: 'Kernel records the proposed validation.' }],
@@ -630,8 +676,8 @@ export function genericActionBundle(): ActionBundleDraft {
   };
 }
 
-export function acceptedImplementationPlanCardEvent(sessionId: string, runId: string): AgentEvent {
-  return {
+export function acceptedTaskPlanCardEvent(sessionId: string, runId: string): AgentEvent {
+  const event: AgentEvent = {
     id: `event-${runId}-implementation-plan`,
     sessionId,
     ts: '2026-01-01T00:00:00.000Z',
@@ -639,11 +685,12 @@ export function acceptedImplementationPlanCardEvent(sessionId: string, runId: st
     payload: {
       runId,
       planId: 'impl-generic-auto',
+      planHash: 'plan-hash-impl-generic-auto',
       title: 'Generic implementation plan',
       summary: 'Implement a generic workspace file update.',
       status: 'pending',
       confirmable: true,
-      implementationPlan: {
+      taskPlan: {
         version: '1',
         id: 'impl-generic-auto',
         title: 'Generic implementation plan',
@@ -655,7 +702,8 @@ export function acceptedImplementationPlanCardEvent(sessionId: string, runId: st
             target: ['generic-output.txt'],
             scope: 'Write a generic output file.',
             dependencies: [],
-            capability: 'fs.write',
+            toolId: 'fs.write',
+            args: {},
             acceptanceCriteria: ['Kernel records the generic output write fact.'],
             failureCriteria: ['Stop if the write leaves the accepted target scope.'],
           },
@@ -671,32 +719,224 @@ export function acceptedImplementationPlanCardEvent(sessionId: string, runId: st
         validationExpectations: [],
         reviewExpectations: [],
       },
-      codeBlocks: [],
+      contentBlocks: [],
       commandBlocks: [],
+    },
+  };
+  return applyKernelPlanAuthorizationFixture(event);
+}
+
+export function applyKernelPlanAuthorizationFixture(event: AgentEvent): AgentEvent {
+  const payload = event.payload as Record<string, any>;
+  const taskPlan = payload.taskPlan as Record<string, any> | undefined;
+  const planId = String(payload.planId ?? taskPlan?.id ?? 'plan-generic');
+  const planHash = `plan-hash-${planId}`;
+  const tasks = Array.isArray(taskPlan?.tasks) ? taskPlan.tasks as Array<Record<string, any>> : [];
+  const catalogTools = ((genericToolCatalogSnapshot().tools as Array<Record<string, any>> | undefined) ?? []);
+  const operations = tasks.flatMap((task, taskIndex) => {
+    const toolId = String(task.toolId ?? task.fileOperations?.[0]?.toolId ?? task.fileOperations?.[0]?.capability ?? '').trim();
+    const targets = Array.isArray(task.target)
+      ? task.target.map((target: unknown) => String(target).trim()).filter(Boolean)
+      : [];
+    if (!toolId || targets.length === 0) return [];
+    const contract = catalogTools.find((tool) => tool.toolId === toolId);
+    const operationKind = String(contract?.operationKind ?? '').trim();
+    const contentMode = String(contract?.usageConstraints?.contentMode ?? 'none').trim();
+    const targetKinds = Array.isArray(task.targetResourceKinds)
+      ? task.targetResourceKinds.map((value: unknown) => String(value).trim())
+      : [];
+    const sourceTaskId = String(task.taskId ?? `task-${taskIndex + 1}`);
+    const fixedArgs = task.args && typeof task.args === 'object' && !Array.isArray(task.args)
+      ? { ...task.args }
+      : {};
+    const mutating = ['fs.create', 'fs.write', 'fs.edit', 'fs.rename', 'fs.delete'].includes(toolId);
+    return targets.map((target: string, targetIndex: number) => {
+      const targetResourceKind = targetKinds[targetIndex] || (toolId === 'fs.delete' ? 'file' : undefined);
+      const argsTemplate: Record<string, unknown> = { path: target };
+      if (contentMode === 'contentBlock') argsTemplate.contentBlockId = 'executionTime';
+      if (contentMode === 'replacementBlock') argsTemplate.replacementBlockId = 'executionTime';
+      if (toolId === 'fs.delete' && targetResourceKind) {
+        argsTemplate.targetKind = targetResourceKind;
+        argsTemplate.recursive = targetResourceKind === 'directory';
+      }
+      return {
+        id: `plan-op-${sourceTaskId}-${targetIndex + 1}`,
+        sourceTaskId,
+        toolId,
+        operationKind,
+        contentMode,
+        targets: [target],
+        dependsOn: Array.isArray(task.dependencies) ? [...task.dependencies] : [],
+        fixedArgs,
+        argsTemplate,
+        targetKind: targetResourceKind,
+        recursive: targetResourceKind === 'directory',
+        readSet: mutating ? [] : [target],
+        writeSet: mutating ? [target] : [],
+        conflictKeys: [`workspace:${target}`],
+        executionMode: 'execute',
+        internal: false,
+      };
+    });
+  });
+  const writeOperations = operations.filter((operation) => operation.writeSet.length > 0);
+  const permissionBundles = writeOperations.length > 0 ? [{
+    id: `permission-bundle-${planId}`,
+    capability: 'workspace.write',
+    permissionMode: 'ask',
+    risk: 'medium',
+    resourceKind: 'workspace',
+    operationIds: writeOperations.map((operation) => operation.id),
+    toolIds: [...new Set(writeOperations.map((operation) => operation.toolId))],
+    targets: [...new Set(writeOperations.flatMap((operation) => operation.targets))],
+    expiresAfter: 'reviewGateReplanCancelOrRunTerminal',
+  }] : [];
+  const authorizationContract = {
+    id: `plan-authorization-${planId}`,
+    planId,
+    planHash,
+    status: 'confirmable',
+    catalogVersion: 'deepcode.kernel.tools.v3',
+    catalogHash: 'test-tool-catalog',
+    operationSetHash: `operation-set-${planId}`,
+    contractHash: `plan-authorization-hash-${planId}`,
+    operations,
+    permissionBundles,
+    interventions: [],
+    cleanupPolicy: 'kernelPlanGrantLease',
+    expiresAfter: 'reviewGateReplanCancelOrRunTerminal',
+  };
+  payload.planId = planId;
+  payload.planHash = planHash;
+  payload.authorizationContract = authorizationContract;
+  payload.planAuthorizationReview = {
+    planId,
+    status: 'confirmable',
+    diagnostics: [],
+    authorizationContract,
+  };
+  return event;
+}
+
+export function genericKernelContextProjectionEvent(sessionId: string, runId: string): AgentEvent {
+  return {
+    id: `event-${runId}-kernel-context`,
+    sessionId,
+    ts: '2026-01-01T00:00:00.000Z',
+    kind: 'workflow_stage',
+    payload: {
+      runId,
+      kernelEvent: {
+        kind: 'state.entered',
+        runId,
+        sessionId,
+        stateContract: {
+          runId,
+          sessionId,
+          stateId: 'needProposal',
+          stateKind: 'driverRequest',
+          allowedInputs: ['proposalSubmit', 'resourceResolve'],
+          allowedProposals: ['answer', 'resourceRequest', 'decisionRequest', 'taskPlan', 'actionBundle', 'diagnostic'],
+          proposalSchemaRefs: ['deepcode.agent.protocol.v4'],
+          capabilityProjection: ['fs.read', 'fs.list', 'fs.write'],
+          toolCatalogSnapshot: genericToolCatalogSnapshot(),
+          draftAdmissionPolicy: { maxTotalUtf8Bytes: 384 * 1024 },
+        },
+      },
     },
   };
 }
 
-export function readOnlyAcceptedImplementationPlanCardEvent(
+export function genericResolvedResourceEvent(
+  sessionId: string,
+  runId: string,
+  path: string,
+  kind: 'file' | 'directory' = 'file'
+): AgentEvent {
+  return {
+    id: `event-${runId}-resource-${randomSmokeToken('resource')}`,
+    sessionId,
+    ts: '2026-01-01T00:00:00.000Z',
+    kind: 'tool_result',
+    payload: {
+      runId,
+      toolName: 'kernel.resourceResolve',
+      status: 'ok',
+      output: {
+        id: `packet-${randomSmokeToken('packet')}`,
+        workspaceScopeKey: `workspace-${randomSmokeToken('scope')}`,
+        requestId: `request-${randomSmokeToken('request')}`,
+        items: [{
+          requestItemId: `item-${randomSmokeToken('item')}`,
+          manifestEntryId: `entry-${randomSmokeToken('entry')}`,
+          readPolicy: 'autoRead',
+          status: 'resolved',
+          path,
+          resolvedKind: kind,
+          contentKind: kind === 'directory' ? 'directoryTree' : 'fileText',
+          promptContent: kind === 'directory' ? `${path}/` : `resolved content for ${path}`,
+          rangeComplete: true,
+          evidenceRefs: ['genericResourceEvidence'],
+        }],
+      },
+    },
+  };
+}
+
+export function genericMissingResourceEvent(
+  sessionId: string,
+  runId: string,
+  path: string
+): AgentEvent {
+  return {
+    id: `event-${runId}-missing-resource-${randomSmokeToken('resource')}`,
+    sessionId,
+    ts: '2026-01-01T00:00:00.000Z',
+    kind: 'tool_result',
+    payload: {
+      runId,
+      toolName: 'kernel.resourceResolve',
+      status: 'ok',
+      output: {
+        id: `packet-${randomSmokeToken('packet')}`,
+        workspaceScopeKey: `workspace-${randomSmokeToken('scope')}`,
+        requestId: `request-${randomSmokeToken('request')}`,
+        items: [{
+          requestItemId: `item-${randomSmokeToken('item')}`,
+          manifestEntryId: `entry-${randomSmokeToken('entry')}`,
+          readPolicy: 'autoRead',
+          status: 'error',
+          reason: 'not_found',
+          path,
+          rangeComplete: true,
+          evidenceRefs: ['genericMissingResourceEvidence'],
+        }],
+      },
+    },
+  };
+}
+
+export function readOnlyAcceptedTaskPlanCardEvent(
   sessionId: string,
   runId: string,
   token: string,
   targets: string[]
 ): AgentEvent {
-  const event = acceptedImplementationPlanCardEvent(sessionId, runId);
+  const event = acceptedTaskPlanCardEvent(sessionId, runId);
   const payload = event.payload as any;
   payload.planId = `impl-${token}`;
-  payload.implementationPlan.id = `impl-${token}`;
-  payload.implementationPlan.title = 'Random read-only validation plan';
-  payload.implementationPlan.summary = 'Resolve current evidence for accepted read-only targets.';
-  payload.implementationPlan.tasks = [
+  payload.taskPlan.id = `impl-${token}`;
+  payload.taskPlan.title = 'Random read-only validation plan';
+  payload.taskPlan.summary = 'Resolve current evidence for accepted read-only targets.';
+  payload.taskPlan.tasks = [
     {
       taskId: `task-${token}-read`,
       title: 'Validate random accepted targets',
       target: targets,
       scope: 'Resolve current read-only evidence for the accepted targets.',
       dependencies: [],
-      capability: 'fs.read',
+      toolId: 'fs.read',
+      args: {},
       acceptanceCriteria: ['ResourcePacket covers every accepted target.'],
       failureCriteria: ['Stop if current evidence cannot cover each target.'],
     },
@@ -709,24 +949,25 @@ export function readOnlyAcceptedImplementationPlanCardEvent(
     validationExpectations: [{ id: `validation-${token}`, description: 'Resource evidence covers all accepted targets.' }],
     reviewExpectations: [{ id: `review-${token}`, description: 'User reviews the read-only validation checkpoint.' }],
   };
-  return event;
+  return applyKernelPlanAuthorizationFixture(event);
 }
 
-export function generatedArtifactAcceptedImplementationPlanCardEvent(sessionId: string, runId: string): AgentEvent {
-  const event = acceptedImplementationPlanCardEvent(sessionId, runId);
+export function generatedArtifactAcceptedTaskPlanCardEvent(sessionId: string, runId: string): AgentEvent {
+  const event = acceptedTaskPlanCardEvent(sessionId, runId);
   const payload = event.payload as any;
   payload.planId = 'impl-generated-artifact';
-  payload.implementationPlan.id = 'impl-generated-artifact';
-  payload.implementationPlan.title = 'Generic generated artifact implementation plan';
-  payload.implementationPlan.summary = 'Write one file, then read it as current evidence for a dependent write.';
-  payload.implementationPlan.tasks = [
+  payload.taskPlan.id = 'impl-generated-artifact';
+  payload.taskPlan.title = 'Generic generated artifact implementation plan';
+  payload.taskPlan.summary = 'Write one file, then read it as current evidence for a dependent write.';
+  payload.taskPlan.tasks = [
     {
       taskId: 'task-generated-input',
       title: 'Write generated input',
       target: ['generic-generated/input.txt'],
       scope: 'Create a generic input artifact inside the accepted workspace scope.',
       dependencies: [],
-      capability: 'fs.write',
+      toolId: 'fs.write',
+      args: {},
       acceptanceCriteria: ['Kernel records the generated input write fact.'],
       failureCriteria: ['Stop if the write leaves the accepted target scope.'],
     },
@@ -736,12 +977,13 @@ export function generatedArtifactAcceptedImplementationPlanCardEvent(sessionId: 
       target: ['generic-generated/output.txt'],
       scope: 'Read the generated input evidence, then create a dependent output artifact.',
       dependencies: ['task-generated-input'],
-      capability: 'fs.write',
+      toolId: 'fs.write',
+      args: {},
       acceptanceCriteria: ['Kernel records the generated output write fact.'],
       failureCriteria: ['Stop if the generated input evidence cannot be resolved.'],
     },
   ];
-  return event;
+  return applyKernelPlanAuthorizationFixture(event);
 }
 
 export function userMessageWithDirectoryAttachmentEvent(sessionId: string, root: string): AgentEvent {
@@ -763,19 +1005,20 @@ export function userMessageWithDirectoryAttachmentEvent(sessionId: string, root:
   };
 }
 
-export function multiTargetAcceptedImplementationPlanCardEvent(sessionId: string, runId: string): AgentEvent {
-  const event = acceptedImplementationPlanCardEvent(sessionId, runId);
+export function multiTargetAcceptedTaskPlanCardEvent(sessionId: string, runId: string): AgentEvent {
+  const event = acceptedTaskPlanCardEvent(sessionId, runId);
   const payload = event.payload as any;
   payload.planId = 'impl-generic-multi';
-  payload.implementationPlan.id = 'impl-generic-multi';
-  payload.implementationPlan.tasks = [
+  payload.taskPlan.id = 'impl-generic-multi';
+  payload.taskPlan.tasks = [
     {
       taskId: 'task-generic-one',
       title: 'Write generic file one',
       target: ['generic-one.txt'],
       scope: 'Write the first generic file.',
       dependencies: [],
-      capability: 'fs.write',
+      toolId: 'fs.write',
+      args: {},
       acceptanceCriteria: ['Kernel records the first generic write fact.'],
       failureCriteria: ['Stop if the first write leaves the accepted target scope.'],
     },
@@ -785,29 +1028,31 @@ export function multiTargetAcceptedImplementationPlanCardEvent(sessionId: string
       target: ['generic-two.txt'],
       scope: 'Write the second generic file.',
       dependencies: ['task-generic-one'],
-      capability: 'fs.write',
+      toolId: 'fs.write',
+      args: {},
       acceptanceCriteria: ['Kernel records the second generic write fact.'],
       failureCriteria: ['Stop if the second write leaves the accepted target scope.'],
     },
   ];
-  return event;
+  return applyKernelPlanAuthorizationFixture(event);
 }
 
-export function tripleTargetAcceptedImplementationPlanCardEvent(sessionId: string, runId: string, token: string): AgentEvent {
-  const event = acceptedImplementationPlanCardEvent(sessionId, runId);
+export function tripleTargetAcceptedTaskPlanCardEvent(sessionId: string, runId: string, token: string): AgentEvent {
+  const event = acceptedTaskPlanCardEvent(sessionId, runId);
   const payload = event.payload as any;
   payload.planId = `impl-${token}`;
-  payload.implementationPlan.id = `impl-${token}`;
-  payload.implementationPlan.title = 'Generic ordered implementation plan';
-  payload.implementationPlan.summary = 'Write three generic targets in accepted task order.';
-  payload.implementationPlan.tasks = [
+  payload.taskPlan.id = `impl-${token}`;
+  payload.taskPlan.title = 'Generic ordered implementation plan';
+  payload.taskPlan.summary = 'Write three generic targets in accepted task order.';
+  payload.taskPlan.tasks = [
     {
       taskId: `task-${token}-one`,
       title: 'Write first generic target',
       target: [`generic-${token}-one.txt`],
       scope: 'Write the first accepted generic target.',
       dependencies: [],
-      capability: 'fs.write',
+      toolId: 'fs.write',
+      args: {},
       acceptanceCriteria: ['Kernel records the first generic write fact.'],
       failureCriteria: ['Stop if the first write leaves the accepted target scope.'],
     },
@@ -817,7 +1062,8 @@ export function tripleTargetAcceptedImplementationPlanCardEvent(sessionId: strin
       target: [`generic-${token}-two.txt`],
       scope: 'Write the second accepted generic target.',
       dependencies: [`task-${token}-one`],
-      capability: 'fs.write',
+      toolId: 'fs.write',
+      args: {},
       acceptanceCriteria: ['Kernel records the second generic write fact.'],
       failureCriteria: ['Stop if the second write leaves the accepted target scope.'],
     },
@@ -827,132 +1073,140 @@ export function tripleTargetAcceptedImplementationPlanCardEvent(sessionId: strin
       target: [`generic-${token}-three.txt`],
       scope: 'Write the third accepted generic target.',
       dependencies: [`task-${token}-two`],
-      capability: 'fs.write',
+      toolId: 'fs.write',
+      args: {},
       acceptanceCriteria: ['Kernel records the third generic write fact.'],
       failureCriteria: ['Stop if the third write leaves the accepted target scope.'],
     },
   ];
-  return event;
+  return applyKernelPlanAuthorizationFixture(event);
 }
 
-export function commaSeparatedTargetsAcceptedImplementationPlanCardEvent(sessionId: string, runId: string, paths: string[]): AgentEvent {
-  const event = acceptedImplementationPlanCardEvent(sessionId, runId);
+export function commaSeparatedTargetsAcceptedTaskPlanCardEvent(sessionId: string, runId: string, paths: string[]): AgentEvent {
+  const event = acceptedTaskPlanCardEvent(sessionId, runId);
   const payload = event.payload as any;
   payload.planId = 'impl-random-comma';
-  payload.implementationPlan.id = 'impl-random-comma';
-  payload.implementationPlan.title = 'Random multi-target implementation plan';
-  payload.implementationPlan.summary = 'Write all accepted random targets as one reviewed execution batch.';
-  payload.implementationPlan.tasks = [
+  payload.taskPlan.id = 'impl-random-comma';
+  payload.taskPlan.title = 'Random multi-target implementation plan';
+  payload.taskPlan.summary = 'Write all accepted random targets as one reviewed execution batch.';
+  payload.taskPlan.tasks = [
     {
       taskId: 'task-random-comma-targets',
       title: 'Write random accepted targets',
       target: [paths.join(', ')],
       scope: 'The task target field intentionally carries several concrete file targets in one path-list string.',
       dependencies: [],
-      capability: 'fs.write',
+      toolId: 'fs.write',
+      args: {},
       acceptanceCriteria: ['Kernel records write work unit facts for every accepted target.'],
       failureCriteria: ['Stop if any action leaves the accepted target scope.'],
     },
   ];
-  return event;
+  return applyKernelPlanAuthorizationFixture(event);
 }
 
-export function independentMultiTargetAcceptedImplementationPlanCardEvent(sessionId: string, runId: string): AgentEvent {
-  const event = multiTargetAcceptedImplementationPlanCardEvent(sessionId, runId);
+export function independentMultiTargetAcceptedTaskPlanCardEvent(sessionId: string, runId: string): AgentEvent {
+  const event = multiTargetAcceptedTaskPlanCardEvent(sessionId, runId);
   const payload = event.payload as any;
   payload.planId = 'impl-generic-independent';
-  payload.implementationPlan.id = 'impl-generic-independent';
-  for (const task of payload.implementationPlan.tasks ?? []) {
+  payload.taskPlan.id = 'impl-generic-independent';
+  for (const task of payload.taskPlan.tasks ?? []) {
     task.dependencies = [];
   }
-  return event;
+  return applyKernelPlanAuthorizationFixture(event);
 }
 
-export function deleteAcceptedImplementationPlanCardEvent(sessionId: string, runId: string): AgentEvent {
-  const event = acceptedImplementationPlanCardEvent(sessionId, runId);
+export function deleteAcceptedTaskPlanCardEvent(sessionId: string, runId: string): AgentEvent {
+  const event = acceptedTaskPlanCardEvent(sessionId, runId);
   const payload = event.payload as any;
   payload.planId = 'impl-generic-delete';
-  payload.implementationPlan.id = 'impl-generic-delete';
-  payload.implementationPlan.title = 'Generic delete implementation plan';
-  payload.implementationPlan.summary = 'Remove one generic obsolete workspace file.';
-  payload.implementationPlan.tasks = [
+  payload.taskPlan.id = 'impl-generic-delete';
+  payload.taskPlan.title = 'Generic delete implementation plan';
+  payload.taskPlan.summary = 'Remove one generic obsolete workspace file.';
+  payload.taskPlan.tasks = [
     {
       taskId: 'task-generic-delete',
       title: 'Delete generic obsolete file',
       target: ['generic-obsolete.txt'],
       scope: 'Delete a generic obsolete file inside the accepted workspace scope.',
       dependencies: [],
-      capability: 'fs.delete',
+      toolId: 'fs.delete',
+      args: {},
       acceptanceCriteria: ['Kernel records the delete work unit fact for the generic obsolete file.'],
       failureCriteria: ['Stop if the delete target is empty, root, absolute, or outside the accepted target scope.'],
     },
   ];
-  return event;
+  return applyKernelPlanAuthorizationFixture(event);
 }
 
-export function multiDeleteAcceptedImplementationPlanCardEvent(
+export function multiDeleteAcceptedTaskPlanCardEvent(
   sessionId: string,
   runId: string,
   token: string,
-  targets: string[]
+  targets: string[],
+  targetResourceKinds?: Array<'file' | 'directory'>
 ): AgentEvent {
-  const event = acceptedImplementationPlanCardEvent(sessionId, runId);
+  const event = acceptedTaskPlanCardEvent(sessionId, runId);
   const payload = event.payload as any;
   payload.planId = `impl-${token}`;
-  payload.implementationPlan.id = `impl-${token}`;
-  payload.implementationPlan.title = 'Generic multi-delete implementation plan';
-  payload.implementationPlan.summary = 'Remove several accepted cleanup targets in one current task batch.';
-  payload.implementationPlan.tasks = [
+  payload.taskPlan.id = `impl-${token}`;
+  payload.taskPlan.title = 'Generic multi-delete implementation plan';
+  payload.taskPlan.summary = 'Remove several accepted cleanup targets in one current task batch.';
+  payload.taskPlan.tasks = [
     {
       taskId: `task-${token}`,
       title: 'Delete accepted cleanup targets',
       target: targets,
+      targetResourceKinds,
       scope: 'Delete only the accepted cleanup targets listed by this task.',
       dependencies: [],
-      capability: 'fs.delete',
+      toolId: 'fs.delete',
+      args: {},
       acceptanceCriteria: ['Kernel records delete work unit facts for every accepted cleanup target.'],
       failureCriteria: ['Stop if any delete action leaves the accepted target scope.'],
     },
   ];
-  return event;
+  return applyKernelPlanAuthorizationFixture(event);
 }
 
-export function directoryDeleteAcceptedImplementationPlanCardEvent(
+export function directoryDeleteAcceptedTaskPlanCardEvent(
   sessionId: string,
   runId: string,
   dirPath: string,
   childNames: string[]
 ): AgentEvent {
-  const event = acceptedImplementationPlanCardEvent(sessionId, runId);
+  const event = acceptedTaskPlanCardEvent(sessionId, runId);
   const payload = event.payload as any;
   const planId = `impl-${dirPath.replace(/[^A-Za-z0-9_.-]+/g, '-')}`;
   payload.planId = planId;
-  payload.implementationPlan.id = planId;
-  payload.implementationPlan.title = 'Generic directory delete implementation plan';
-  payload.implementationPlan.summary = 'Remove one accepted directory as a single current-task delete.';
-  payload.implementationPlan.tasks = [
+  payload.taskPlan.id = planId;
+  payload.taskPlan.title = 'Generic directory delete implementation plan';
+  payload.taskPlan.summary = 'Remove one accepted directory as a single current-task delete.';
+  payload.taskPlan.tasks = [
     {
       taskId: `task-${dirPath.replace(/[^A-Za-z0-9_.-]+/g, '-')}`,
       title: 'Delete accepted directory target',
-      target: [`${dirPath} (${childNames.join(', ')})`],
-      scope: 'The task target field intentionally combines one directory path with human-readable child examples.',
+      target: [dirPath],
+      targetResourceKinds: ['directory'],
+      scope: `Delete the accepted directory target; observed children: ${childNames.join(', ')}.`,
       dependencies: [],
-      capability: 'fs.delete',
+      toolId: 'fs.delete',
+      args: {},
       acceptanceCriteria: ['Kernel records a directory delete work unit fact for the accepted target.'],
       failureCriteria: ['Stop if the delete target leaves the accepted directory target scope.'],
     },
   ];
-  return event;
+  return applyKernelPlanAuthorizationFixture(event);
 }
 
 export function singleTargetWriteProposal(targetPath: string, contentSuffix: string): Record<string, unknown> {
   const blockId = `code-${contentSuffix}`;
   const actionId = `write-${contentSuffix}`;
   return {
-    schemaVersion: 'deepcode.agent.protocol.v3',
+    schemaVersion: 'deepcode.agent.protocol.v4',
     kind: 'actionBundle',
     outputLanguage: 'en-US',
-    userPlan: [
+    userPlanMarkdown: [
       '# Generic task slice',
       '',
       '## Summary',
@@ -968,10 +1222,10 @@ export function singleTargetWriteProposal(targetPath: string, contentSuffix: str
       '- Parent Session should merge this fragment with sibling independent fragments before submitting.',
       '',
       '## Assumptions',
-      '- The target belongs to the accepted implementationPlan file scope.',
+      '- The target belongs to the accepted taskPlan file scope.',
     ].join('\n'),
-    codeBlocks: [
-      { blockId, targetPath, contentLines: [`generic ${contentSuffix}`] },
+    contentBlocks: [
+      { blockId, targetPath, operation: 'overwrite', contentLines: [`generic ${contentSuffix}`] },
     ],
     actionBundle: {
       version: '1',
@@ -980,19 +1234,17 @@ export function singleTargetWriteProposal(targetPath: string, contentSuffix: str
       actions: [{
         actionId,
         toolId: 'fs.write',
-        args: { path: targetPath, sourceBlockId: blockId },
+        args: { path: targetPath, contentBlockId: blockId },
         description: `Write ${targetPath}`,
       }],
       validationExpectations: [{ id: `validation-${contentSuffix}`, description: `Kernel records ${targetPath}.` }],
       reviewExpectations: [{ id: `review-${contentSuffix}`, description: `Review ${targetPath}.` }],
     },
-    expectedValidation: `Kernel records ${targetPath}.`,
-    reviewGuide: `Review ${targetPath}.`,
   };
 }
 export function genericDiagnosticProposal(summary: string): Record<string, unknown> {
   return {
-    schemaVersion: 'deepcode.agent.protocol.v3',
+    schemaVersion: 'deepcode.agent.protocol.v4',
     kind: 'diagnostic',
     outputLanguage: 'en-US',
     diagnostic: {
@@ -1004,31 +1256,32 @@ export function genericDiagnosticProposal(summary: string): Record<string, unkno
   };
 }
 
-export function processExecAcceptedImplementationPlanCardEvent(sessionId: string, runId: string): AgentEvent {
-  const event = acceptedImplementationPlanCardEvent(sessionId, runId);
+export function processExecAcceptedTaskPlanCardEvent(sessionId: string, runId: string): AgentEvent {
+  const event = acceptedTaskPlanCardEvent(sessionId, runId);
   const payload = event.payload as any;
   payload.planId = 'impl-generic-exec';
-  payload.implementationPlan.id = 'impl-generic-exec';
-  payload.implementationPlan.tasks = [
+  payload.taskPlan.id = 'impl-generic-exec';
+  payload.taskPlan.tasks = [
     {
       taskId: 'task-generic-exec',
       title: 'Run generic validation',
       target: ['scripts/validate.sh'],
       scope: 'Run a generic validation command described by the accepted plan.',
       dependencies: [],
-      capability: 'process.exec',
+      toolId: 'process.exec',
+      args: {},
       acceptanceCriteria: ['Kernel permission gate owns the process execution decision.'],
       failureCriteria: ['Stop if Session asks for a new technical plan instead of using Kernel PermissionGate.'],
     },
   ];
-  return event;
+  return applyKernelPlanAuthorizationFixture(event);
 }
 
 export function multiWriteProposal(): Record<string, unknown> {
   const proposal = genericWriteProposal(false);
-  proposal.codeBlocks = [
-    { id: 'code-one', targetPath: 'generic-one.txt', content: 'one' },
-    { id: 'code-two', targetPath: 'generic-two.txt', content: 'two' },
+  proposal.contentBlocks = [
+    { blockId: 'code-one', targetPath: 'generic-one.txt', operation: 'overwrite', contentLines: ['one'] },
+    { blockId: 'code-two', targetPath: 'generic-two.txt', operation: 'overwrite', contentLines: ['two'] },
   ];
   proposal.actionBundle = multiWriteActionBundle();
   return proposal;
@@ -1037,10 +1290,10 @@ export function multiWriteProposal(): Record<string, unknown> {
 export function randomMultiWriteProposal(paths: string[], options?: { briefUserPlan?: boolean }): Record<string, unknown> {
   const token = randomSmokeToken('bundle');
   return {
-    schemaVersion: 'deepcode.agent.protocol.v3',
+    schemaVersion: 'deepcode.agent.protocol.v4',
     kind: 'actionBundle',
     outputLanguage: 'en-US',
-    userPlan: options?.briefUserPlan
+    userPlanMarkdown: options?.briefUserPlan
       ? `## Batch\n\nWrite ${paths.length} accepted target file(s).`
       : [
         '# Random multi-target batch',
@@ -1060,9 +1313,10 @@ export function randomMultiWriteProposal(paths: string[], options?: { briefUserP
         '## Assumptions',
         '- The accepted implementation plan already declared the target paths.',
       ].join('\n'),
-    codeBlocks: paths.map((path, index) => ({
+    contentBlocks: paths.map((path, index) => ({
       blockId: `code-${token}-${index}`,
       targetPath: path,
+      operation: 'overwrite',
       contentLines: [`content ${randomSmokeToken('content')}`],
     })),
     actionBundle: {
@@ -1072,16 +1326,12 @@ export function randomMultiWriteProposal(paths: string[], options?: { briefUserP
       actions: paths.map((path, index) => ({
         actionId: `write-${token}-${index}`,
         toolId: 'fs.write',
-        args: { path, sourceBlockId: `code-${token}-${index}` },
+        args: { path, contentBlockId: `code-${token}-${index}` },
         description: `Write ${path}`,
-        canParallelize: false,
-        conflictKeys: [path],
       })),
       validationExpectations: [{ id: `validation-${token}`, description: 'Kernel records write work unit facts for all target paths.' }],
       reviewExpectations: [{ id: `review-${token}`, description: 'User reviews the generated target files and Kernel facts.' }],
     },
-    expectedValidation: 'Kernel records write facts for all target paths.',
-    reviewGuide: 'Review the generated files and Kernel facts.',
   };
 }
 
@@ -1094,18 +1344,14 @@ export function multiWriteActionBundle(): Record<string, any> {
       {
         actionId: 'write-generic-one',
         toolId: 'fs.write',
-        args: { path: 'generic-one.txt', sourceBlockId: 'code-one' },
+        args: { path: 'generic-one.txt', contentBlockId: 'code-one' },
         description: 'Write generic file one.',
-        canParallelize: false,
-        conflictKeys: ['generic-one.txt'],
       },
       {
         actionId: 'write-generic-two',
         toolId: 'fs.write',
-        args: { path: 'generic-two.txt', sourceBlockId: 'code-two' },
+        args: { path: 'generic-two.txt', contentBlockId: 'code-two' },
         description: 'Write generic file two.',
-        canParallelize: false,
-        conflictKeys: ['generic-two.txt'],
       },
     ],
     validationExpectations: [{ id: 'validation-multi', description: 'Kernel records file write facts.' }],
@@ -1115,10 +1361,10 @@ export function multiWriteActionBundle(): Record<string, any> {
 
 export function processExecProposal(): Record<string, unknown> {
   return {
-    schemaVersion: 'deepcode.agent.protocol.v3',
+    schemaVersion: 'deepcode.agent.protocol.v4',
     kind: 'actionBundle',
     outputLanguage: 'en-US',
-    userPlan: [
+    userPlanMarkdown: [
       '# Plan',
       '',
       '## Summary',
@@ -1157,8 +1403,6 @@ export function processExecProposal(): Record<string, unknown> {
       validationExpectations: [{ id: 'validation-exec', description: 'Kernel records permission or command facts for the generic validation.' }],
       reviewExpectations: [{ id: 'review-exec', description: 'User can inspect Kernel permission and command facts.' }],
     },
-    expectedValidation: 'Kernel records permission or command facts for the generic validation.',
-    reviewGuide: 'Review Kernel permission and command facts.',
   };
 }
 
@@ -1166,50 +1410,149 @@ export function fakeKernel(request: KernelCommandEnvelope): KernelReply {
   const command = request.command as Record<string, any>;
   if (command.kind === 'runCreate') {
     const toolCatalogSnapshot = genericToolCatalogSnapshot();
+    const runId = command.runId ?? 'run-generic';
+    const sessionId = command.sessionId ?? 'session-generic';
     return {
       ok: true,
       events: [
         {
           kind: 'state.entered',
-          runId: 'run-generic',
-          sessionId: 'session-generic',
+          runId,
+          sessionId,
           stateContract: {
-            runId: 'run-generic',
+            runId,
             stateId: 'needProposal',
             stateKind: 'driverRequest',
             allowedInputs: ['proposalSubmit', 'resourceResolve'],
             allowedProposals: ['answer', 'resourceRequest', 'actionBundle'],
-            proposalSchemaRefs: ['deepcode.agent.protocol.v3'],
+            proposalSchemaRefs: ['deepcode.agent.protocol.v4'],
             capabilityProjection: ['fs.read', 'fs.write'],
             toolCatalogSnapshot,
+            draftAdmissionPolicy: { maxTotalUtf8Bytes: 384 * 1024 },
           },
         },
         {
           kind: 'driver.request_produced',
-          runId: 'run-generic',
-          sessionId: 'session-generic',
+          runId,
+          sessionId,
           driverRequest: {
             id: 'driver-generic',
-            runId: 'run-generic',
-            sessionId: 'session-generic',
+            runId,
+            sessionId,
             kind: 'needProposal',
             reason: 'Need a v3 proposal.',
             stateContract: {
-              runId: 'run-generic',
+              runId,
               stateId: 'needProposal',
               stateKind: 'driverRequest',
               allowedInputs: ['proposalSubmit', 'resourceResolve'],
               allowedProposals: ['answer', 'resourceRequest', 'actionBundle'],
-              proposalSchemaRefs: ['deepcode.agent.protocol.v3'],
+              proposalSchemaRefs: ['deepcode.agent.protocol.v4'],
               capabilityProjection: ['fs.read', 'fs.write'],
               toolCatalogSnapshot,
+              draftAdmissionPolicy: { maxTotalUtf8Bytes: 384 * 1024 },
             },
           },
         },
       ],
     };
   }
+  if (command.kind === 'planAuthorizationSubmit') {
+    const intent = command.intent as Record<string, any>;
+    const tasks = Array.isArray(intent?.tasks) ? intent.tasks as Array<Record<string, any>> : [];
+    const toolCatalogSnapshot = genericToolCatalogSnapshot();
+    const catalogTools = Array.isArray(toolCatalogSnapshot.tools)
+      ? toolCatalogSnapshot.tools as Array<Record<string, any>>
+      : [];
+    const operations = tasks.flatMap((task, taskIndex) => {
+      const toolId = String(task.toolId ?? '').trim();
+      const targets = Array.isArray(task.targets)
+        ? task.targets.map((target: unknown) => String(target).trim()).filter(Boolean)
+        : [];
+      if (!toolId || targets.length === 0) return [];
+      const contract = catalogTools.find((tool) => tool.toolId === toolId);
+      const operationKind = String(contract?.operationKind ?? '').trim();
+      const contentMode = String(contract?.usageConstraints?.contentMode ?? 'none').trim();
+      const sourceTaskId = String(task.taskId ?? `task-${taskIndex + 1}`);
+      const fixedArgs = task.args && typeof task.args === 'object' && !Array.isArray(task.args)
+        ? { ...task.args }
+        : {};
+      const mutating = ['fs.create', 'fs.write', 'fs.edit', 'fs.rename', 'fs.delete'].includes(toolId);
+      return targets.map((target: string, targetIndex: number) => {
+        const targetResourceKind = toolId === 'fs.delete' ? 'file' : undefined;
+        const argsTemplate: Record<string, unknown> = { path: target };
+        if (contentMode === 'contentBlock') argsTemplate.contentBlockId = 'executionTime';
+        if (contentMode === 'replacementBlock') argsTemplate.replacementBlockId = 'executionTime';
+        if (targetResourceKind) {
+          argsTemplate.targetKind = targetResourceKind;
+          argsTemplate.recursive = false;
+        }
+        return {
+          id: `plan-op-${sourceTaskId}-${targetIndex + 1}`,
+          sourceTaskId,
+          toolId,
+          operationKind,
+          contentMode,
+          targets: [target],
+          dependsOn: Array.isArray(task.dependencies) ? [...task.dependencies] : [],
+          fixedArgs,
+          argsTemplate,
+          targetKind: targetResourceKind,
+          recursive: false,
+          readSet: mutating ? [] : [target],
+          writeSet: mutating ? [target] : [],
+          conflictKeys: [`workspace:${target}`],
+          executionMode: 'execute',
+          internal: false,
+        };
+      });
+    });
+    const writeOperations = operations.filter((operation) => operation.writeSet.length > 0);
+    const permissionBundles = writeOperations.length > 0 ? [{
+      id: `permission-bundle-${intent.planId}`,
+      capability: 'workspace.write',
+      permissionMode: 'ask',
+      risk: 'medium',
+      resourceKind: 'workspace',
+      operationIds: writeOperations.map((operation) => operation.id),
+      toolIds: [...new Set(writeOperations.map((operation) => operation.toolId))],
+      targets: [...new Set(writeOperations.flatMap((operation) => operation.targets))],
+      expiresAfter: 'reviewGateReplanCancelOrRunTerminal',
+    }] : [];
+    const authorizationContract = {
+      id: `plan-authorization-${intent.planId}`,
+      planId: intent.planId,
+      planHash: intent.planHash,
+      status: 'confirmable',
+      workspaceBindingHash: intent.workspaceBindingHash,
+      catalogVersion: intent.catalogVersion,
+      catalogHash: intent.catalogHash,
+      operationSetHash: `operation-set-${intent.planId}`,
+      contractHash: `plan-authorization-hash-${intent.planId}`,
+      operations,
+      permissionBundles,
+      interventions: [],
+      cleanupPolicy: 'kernelPlanGrantLease',
+      expiresAfter: 'reviewGateReplanCancelOrRunTerminal',
+    };
+    return {
+      ok: true,
+      events: [{
+        kind: 'plan_authorization.reviewed',
+        runId: command.runId,
+        sessionId: command.sessionId,
+        planId: intent.planId,
+        review: {
+          planId: intent.planId,
+          status: 'confirmable',
+          diagnostics: [],
+          authorizationContract,
+        },
+      }],
+    };
+  }
   if (command.kind === 'resourceResolve') {
+    const entry = command.request.manifest.entries[0] ?? {};
     return {
       ok: true,
       events: [
@@ -1218,12 +1561,14 @@ export function fakeKernel(request: KernelCommandEnvelope): KernelReply {
           runId: 'run-generic',
           sessionId: 'session-generic',
           packet: {
-            id: 'packet-generic',
+            id: `packet-${command.requestId ?? 'generic'}`,
             requestId: command.requestId,
             items: [
               {
                 requestItemId: 'item-generic',
-                manifestEntryId: command.request.manifest.entries[0].id,
+                manifestEntryId: entry.id,
+                rootId: entry.rootId,
+                path: entry.path ?? entry.resourceRef,
                 status: 'resolved',
                 readPolicy: 'explicit-manifest-readonly',
                 sourceKind: 'file',
@@ -1237,6 +1582,23 @@ export function fakeKernel(request: KernelCommandEnvelope): KernelReply {
       ],
     };
   }
+  if (command.kind === 'planAuthorizationDecisionSubmit') {
+    return {
+      ok: true,
+      events: [{
+        kind: 'plan_authorization.decision_recorded',
+        runId: command.runId,
+        sessionId: command.sessionId,
+        authorizationContractId: command.decision?.authorizationContractId,
+        planId: command.decision?.planId,
+        decisionId: command.decision?.decisionId,
+        decision: command.decision?.decision,
+        leaseId: command.decision?.decision === 'accept'
+          ? `plan-grant-lease-${command.decision?.planId ?? 'generic'}`
+          : undefined,
+      }],
+    };
+  }
   return { ok: true, events: [] };
 }
 
@@ -1247,8 +1609,15 @@ export function genericToolCatalogSnapshot(): Record<string, unknown> {
     permissionMode: 'allow',
     pathScopePolicy: 'workspace',
     executionMode: 'execute',
+    planTargetMode: 'perTarget',
     needsWorkspace: true,
     readOnly: true,
+    usageConstraints: {
+      targetExistence: 'any',
+      targetKinds: [],
+      contentMode: 'none',
+      directoryRecursiveRequired: false,
+    },
   };
   return {
     catalogVersion: 'test-v1',
@@ -1259,6 +1628,12 @@ export function genericToolCatalogSnapshot(): Record<string, unknown> {
         toolId: 'fs.read',
         capability: 'fs.read',
         operationKind: 'read',
+        usageConstraints: {
+          targetExistence: 'mustExist',
+          targetKinds: ['file'],
+          contentMode: 'none',
+          directoryRecursiveRequired: false,
+        },
         providerSchema: {
           type: 'object',
           properties: { path: { type: 'string' } },
@@ -1270,9 +1645,34 @@ export function genericToolCatalogSnapshot(): Record<string, unknown> {
         toolId: 'fs.list',
         capability: 'fs.read',
         operationKind: 'list',
+        usageConstraints: {
+          targetExistence: 'mustExist',
+          targetKinds: ['directory'],
+          contentMode: 'none',
+          directoryRecursiveRequired: false,
+        },
         providerSchema: {
           type: 'object',
           properties: { path: { type: 'string' } },
+        },
+      },
+      {
+        ...base,
+        toolId: 'fs.create',
+        capability: 'fs.write',
+        operationKind: 'create',
+        permissionMode: 'ask',
+        readOnly: false,
+        usageConstraints: {
+          targetExistence: 'mustNotExist',
+          targetKinds: ['file'],
+          contentMode: 'contentBlock',
+          directoryRecursiveRequired: false,
+        },
+        providerSchema: {
+          type: 'object',
+          properties: { path: { type: 'string' }, contentBlockId: { type: 'string' } },
+          required: ['path', 'contentBlockId'],
         },
       },
       {
@@ -1282,10 +1682,87 @@ export function genericToolCatalogSnapshot(): Record<string, unknown> {
         operationKind: 'write',
         permissionMode: 'ask',
         readOnly: false,
+        usageConstraints: {
+          targetExistence: 'mustExist',
+          targetKinds: ['file'],
+          contentMode: 'contentBlock',
+          directoryRecursiveRequired: false,
+        },
         providerSchema: {
           type: 'object',
-          properties: { path: { type: 'string' }, sourceBlockId: { type: 'string' } },
-          required: ['path', 'sourceBlockId'],
+          properties: { path: { type: 'string' }, contentBlockId: { type: 'string' } },
+          required: ['path', 'contentBlockId'],
+        },
+      },
+      {
+        ...base,
+        toolId: 'fs.edit',
+        capability: 'fs.write',
+        operationKind: 'edit',
+        permissionMode: 'ask',
+        readOnly: false,
+        usageConstraints: {
+          targetExistence: 'mustExist',
+          targetKinds: ['file'],
+          contentMode: 'replacementBlock',
+          directoryRecursiveRequired: false,
+        },
+        providerSchema: {
+          type: 'object',
+          properties: {
+            path: { type: 'string' },
+            replacementBlockId: { type: 'string' },
+            patchSpec: { type: 'object' },
+          },
+          required: ['path', 'replacementBlockId', 'patchSpec'],
+        },
+      },
+      {
+        ...base,
+        toolId: 'fs.delete',
+        capability: 'fs.write',
+        operationKind: 'delete',
+        permissionMode: 'ask',
+        risk: 'high',
+        readOnly: false,
+        usageConstraints: {
+          targetExistence: 'mustExist',
+          targetKinds: ['file', 'directory'],
+          contentMode: 'none',
+          directoryRecursiveRequired: true,
+        },
+        providerSchema: {
+          type: 'object',
+          properties: {
+            path: { type: 'string' },
+            targetKind: { type: 'string', enum: ['file', 'directory'] },
+            recursive: { type: 'boolean' },
+          },
+          required: ['path'],
+        },
+      },
+      {
+        ...base,
+        toolId: 'process.exec',
+        capability: 'process.exec',
+        family: 'process',
+        operationKind: 'exec',
+        executionMode: 'blocked',
+        permissionMode: 'deny',
+        pathScopePolicy: 'none',
+        needsWorkspace: false,
+        readOnly: false,
+        risk: 'high',
+        usageConstraints: {
+          targetExistence: 'any',
+          targetKinds: [],
+          contentMode: 'none',
+          directoryRecursiveRequired: false,
+        },
+        providerSchema: {
+          type: 'object',
+          properties: { argv: { type: 'array', items: { type: 'string' } } },
+          required: ['argv'],
         },
       },
     ],
@@ -1299,12 +1776,14 @@ export function fakeLlm(_request: LlmChatRequest): ApiResponse<LlmChatResult> {
       chunks: [{ type: 'done' }],
       assistantMessage: {
         role: 'assistant',
-        content: JSON.stringify({
-          schemaVersion: 'deepcode.agent.protocol.v3',
-          kind: 'answer',
-          outputLanguage: 'en-US',
-          answer: { format: 'markdown', content: 'The attached generic resource was resolved through Kernel ResourceResolve.' },
-        }),
+        content: '',
+        toolCalls: [{
+          id: 'generic-submit-answer',
+          name: 'session.submit_answer',
+          arguments: {
+            content: 'The attached generic resource was resolved through Kernel ResourceResolve.',
+          },
+        }],
       },
     },
   };

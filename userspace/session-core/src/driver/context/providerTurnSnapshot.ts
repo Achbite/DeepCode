@@ -54,7 +54,7 @@ export function buildProviderTurnSnapshot(contract: DriverProviderTurnFrame): Pr
     systemHash: stableHash(systemContent),
     toolSchemaHash: profile.toolSchemaHash,
     responseFormatHash: profile.responseFormatHash,
-    messageShapeHash: stableHash('system,user'),
+    messageShapeHash: stableHash(providerMessageShape(contract)),
     stablePrefixHash,
     dynamicSuffixHash,
     stablePrefixCharLength: contract.prompt.stablePrefix.length,
@@ -97,6 +97,29 @@ export function buildProviderTurnSnapshot(contract: DriverProviderTurnFrame): Pr
     resourceRetentionCounts: { ...(contextAssembly?.resourceRetentionCounts ?? {}) },
     cacheClasses: cacheClasses(contract.prompt.segments),
   };
+}
+
+function providerMessageShape(contract: DriverProviderTurnFrame): string {
+  const messages = contract.providerMessages?.length
+    ? contract.providerMessages
+    : [
+        { role: 'system' as const, content: contract.prompt.stablePrefix },
+        { role: 'user' as const, content: contract.prompt.dynamicSuffix },
+      ];
+  const toolNamesByCallId = new Map<string, string>();
+  return JSON.stringify(messages.map((message) => {
+    const toolCalls = (message.toolCalls ?? []).map((call) => {
+      toolNamesByCallId.set(call.id, call.name);
+      return call.name;
+    });
+    return {
+      role: message.role,
+      semanticTools: toolCalls,
+      toolResultFor: message.toolCallId
+        ? toolNamesByCallId.get(message.toolCallId) ?? 'unknownSemanticTool'
+        : undefined,
+    };
+  }));
 }
 
 function snapshotTaskLocalFoldPlan(

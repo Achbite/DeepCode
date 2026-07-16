@@ -11,11 +11,10 @@ import type {
   AgentTimelineTokenUsageProjection,
   AgentTimelineTokenUsageRequest,
   AgentTimelineTokenUsageTotals,
-  KernelPlanReviewReport,
+  KernelProposalReviewReport,
   PermissionRequest,
   ProjectionDelta,
 } from '@deepcode/protocol';
-import type { AgentPlanParts } from './protocol/types.js';
 import type { ResourcePacket, ResourceRequest } from './context/types.js';
 import type { ReviewPacket } from './review/types.js';
 import { isInternalOrchestrationStage, isMainTimelineActivityShape } from './timelineFilter.js';
@@ -25,6 +24,7 @@ import {
   findActiveInteraction,
   type InteractionLedgerActiveInteraction,
 } from './run-state/interactionLedger.js';
+import { planInteractionAwaitsDecision } from './run-state/planInteractionState.js';
 
 export interface PendingPermissionProjection {
   request: PermissionRequest;
@@ -126,8 +126,7 @@ export interface ConversationProjectionInput {
   userRequest?: string;
   resourceRequests?: ResourceRequest[];
   resourcePackets?: ResourcePacket[];
-  agentPlan?: AgentPlanParts;
-  kernelPlanReview?: KernelPlanReviewReport;
+  kernelProposalReview?: KernelProposalReviewReport;
   permissions?: ConversationPermissionFact[];
   execution?: ConversationExecutionFact[];
   repairs?: ConversationRepairFact[];
@@ -255,7 +254,7 @@ export function buildNarrativeTimelineProjection(input: NarrativeTimelineProject
   const rawEventRefs = input.events.map(eventRefForAgentEvent);
   const blockIdsByEventId = timelineBlockIdsByEventId(turns);
   const implementationTaskItems = input.events.flatMap((event, index) =>
-    implementationPlanTaskProjectionItems(input.events, event, index, blockIdsByEventId.get(event.id))
+    taskPlanTaskProjectionItems(input.events, event, index, blockIdsByEventId.get(event.id))
   );
   const activeInteraction = findActiveInteraction({
     events: input.events,
@@ -413,11 +412,11 @@ function operationFromLiveToolName(toolName: string | undefined): string | undef
     fs__list: 'list',
     'fs.diff': 'diff',
     fs__diff: 'diff',
-    'code.search': 'search',
+    'code.grep': 'search',
     code__search: 'search',
     'fs.write': 'write',
     fs__write: 'write',
-    'fs.patch': 'patch',
+    'fs.edit': 'patch',
     fs__patch: 'patch',
     'fs.delete': 'delete',
     fs__delete: 'delete',
@@ -835,19 +834,19 @@ function turnContainsLiveEvent(turn: AgentTimelineResult['turns'][number], liveE
   return turn.blocks.some((block) => block.events.some((event) => liveEventIds.has(event.id)));
 }
 
-function implementationPlanTaskProjectionItems(
+function taskPlanTaskProjectionItems(
   events: AgentEvent[],
   event: AgentEvent,
   eventIndex: number,
   projectedBlockId?: string
 ): NonNullable<AgentTimelineResult['taskProjection']>['items'] {
   if (event.kind !== 'plan_card' || !isRecordPayload(event.payload)) return [];
-  const implementationPlan = event.payload.implementationPlan;
-  if (!isRecordPayload(implementationPlan)) return [];
-  const tasks = Array.isArray(implementationPlan.tasks) ? implementationPlan.tasks : [];
+  const taskPlan = event.payload.taskPlan;
+  if (!isRecordPayload(taskPlan)) return [];
+  const tasks = Array.isArray(taskPlan.tasks) ? taskPlan.tasks : [];
   const planRunId = stringField(event.payload, 'runId');
   const planId = stringField(event.payload, 'planId');
-  const lifecycle = implementationPlanLifecycle(events, event, eventIndex);
+  const lifecycle = taskPlanLifecycle(events, event, eventIndex);
   const taskLedger = latestAcceptedPlanTaskLedger(events.slice(eventIndex + 1), planRunId, planId);
   return tasks.flatMap((item, index) => {
     if (!isRecordPayload(item)) return [];
@@ -870,7 +869,7 @@ function implementationPlanTaskProjectionItems(
     return [{
       id: `implementation-plan-${event.id || eventIndex}-${taskId}`,
       title,
-      summary: summary || stringField(implementationPlan, 'summary') || '',
+      summary: summary || stringField(taskPlan, 'summary') || '',
       status: mergeImplementationTaskStatus(ledgerStatus, factStatus),
       blockId: projectedBlockId ?? `plan-${event.id || eventIndex}`,
       narrativeKind: 'plan' as const,
@@ -931,7 +930,7 @@ function mergeImplementationTaskStatus(
   return ledgerStatus;
 }
 
-interface ImplementationPlanLifecycle {
+interface TaskPlanLifecycle {
   accepted: boolean;
   needsRevision: boolean;
   rejected: boolean;
@@ -943,15 +942,15 @@ interface ImplementationPlanLifecycle {
   failedIds: string[];
 }
 
-function implementationPlanLifecycle(
+function taskPlanLifecycle(
   events: AgentEvent[],
   planEvent: AgentEvent,
   planEventIndex: number
-): ImplementationPlanLifecycle {
+): TaskPlanLifecycle {
   const planPayload = isRecordPayload(planEvent.payload) ? planEvent.payload : {};
   const planRunId = stringField(planPayload, 'runId');
   const planId = stringField(planPayload, 'planId');
-  const lifecycle: ImplementationPlanLifecycle = {
+  const lifecycle: TaskPlanLifecycle = {
     accepted: false,
     needsRevision: false,
     rejected: false,
@@ -997,7 +996,7 @@ function implementationPlanLifecycle(
 }
 
 function implementationTaskStatus(
-  lifecycle: ImplementationPlanLifecycle,
+  lifecycle: TaskPlanLifecycle,
   targets: string[],
   taskId: string
 ): AgentTimelineStatus {
@@ -1820,11 +1819,8 @@ function planInteractionResolved(event: AgentEvent, events: AgentEvent[]): boole
 }
 
 function planEventAwaitingDecision(event: AgentEvent, events: AgentEvent[]): boolean {
-  const awaiting = event.kind === 'plan_card'
-    ? planCardEventAwaitingDecision(event)
-    : event.kind === 'plan_review'
-      ? planReviewEventAwaitingDecision(event)
-      : false;
+  const awaiting = (event.kind === 'plan_card' || event.kind === 'plan_review') &&
+    planInteractionAwaitsDecision(isRecordPayload(event.payload) ? event.payload : {});
   return awaiting && !planInteractionResolved(event, events);
 }
 
@@ -1944,15 +1940,6 @@ function reviewEventBody(event: AgentEvent): string {
     if (typeof value === 'string') return value;
   }
   return '';
-}
-
-function trimReviewFooter(markdown: string): string {
-  const lines = markdown.split(/\r?\n/);
-  const footerStart = lines.findIndex((line) =>
-    /^#{2,6}\s*(后续意图|后续决策|决策边界)\s*$/.test(line.trim())
-  );
-  const visibleLines = footerStart >= 0 ? lines.slice(0, footerStart) : lines;
-  return visibleLines.join('\n').trim();
 }
 
 function narrativeDefaultCollapsed(kind: AgentTimelineNarrativeKind, status: AgentTimelineStatus): boolean {
@@ -2130,27 +2117,6 @@ function annotateBlocksWithPhase(
 }
 
 
-function planCardEventAwaitingDecision(event: AgentEvent): boolean {
-  const payload = isRecordPayload(event.payload) ? event.payload : {};
-  if (payload.confirmable === false) return false;
-  const status = stringField(payload, 'status');
-  if (!status) return true;
-  return planReviewStatusAwaitingUser(status);
-}
-
-function planReviewEventAwaitingDecision(event: AgentEvent): boolean {
-  const payload = isRecordPayload(event.payload) ? event.payload : {};
-  if (payload.confirmable === false) return false;
-  return planReviewStatusAwaitingUser(stringField(payload, 'status'));
-}
-
-function planReviewStatusAwaitingUser(status?: string): boolean {
-  return status === undefined ||
-    status === 'awaitingUserApproval' ||
-    status === 'awaitingTemporaryGrant' ||
-    status === 'pending';
-}
-
 function isRecordPayload(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
@@ -2233,37 +2199,27 @@ export function buildConversationProjection(input: ConversationProjectionInput):
     );
   }
 
-  if (input.agentPlan) {
-    cards.push(
-      conversationCard(input, createdAt, {
-        kind: 'plan_summary',
-        title: 'Plan',
-        summary: firstLine(input.agentPlan.userPlan),
-        facts: [
-          `任务数：${input.agentPlan.actionBundle.actions.length}`,
-          `验证候选：${input.agentPlan.expectedValidation.expectations.length}`,
-          `Review 建议：${input.agentPlan.reviewGuide.expectations.length}`,
-        ],
-      })
-    );
-  }
-
-  if (input.kernelPlanReview || input.agentPlan) {
-    const report = input.kernelPlanReview;
+  if (input.kernelProposalReview) {
+    const report = input.kernelProposalReview;
+    const permissionBundles = report?.executionContract.permissionBundles ?? [];
+    const interventions = report?.executionContract.interventions ?? [];
+    const reportSummary = interventions[0]?.summary
+      ?? report?.diagnostics[0]
+      ?? (report ? `Kernel execution contract status=${report.status}.` : undefined);
     cards.push(
       conversationCard(input, createdAt, {
         kind: 'check_review',
         title: '计划确认',
         summary:
-          report?.kernelGeneratedPermissionSummary ??
-          '等待 Kernel PlanReview 和用户计划确认；权限只作为预览，真实授权在执行前触发。',
+          reportSummary ??
+          '等待 Kernel ProposalReview 和用户计划确认；权限只作为预览，真实授权在执行前触发。',
         status: report?.status,
         facts: report
           ? [
               `状态：${report.status}`,
-              `所需能力：${report.requiredCapabilities.join(', ') || '无'}`,
-              `权限缺口：${(report.permissionGaps ?? []).join(', ') || '无'}`,
-              `拒绝原因：${(report.deniedReasons ?? report.blockedReasons).join(', ') || '无'}`,
+              `所需权限：${report.requiredPermissions.join(', ') || '无'}`,
+              `权限组：${permissionBundles.map((bundle) => bundle.capability).join(', ') || '无'}`,
+              `门禁介入：${interventions.map((item) => item.summary).join(', ') || '无'}`,
             ]
           : ['用户尚未确认计划，不能生成 ApprovedTaskQueue。'],
       })
@@ -2426,13 +2382,6 @@ function reasonSummary(
     title: '为什么这样做？',
     summary: summary.trim(),
   };
-}
-
-function firstLine(value: string): string {
-  return value
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .find((line) => line.length > 0) ?? '';
 }
 
 function orderConversationCards(

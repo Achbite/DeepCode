@@ -13,12 +13,10 @@ import {
   normalizeDecisionEffect,
 } from '../../run-state/index.js';
 import type {
-  AcceptedImplementationPlanContext,
-  AcceptedImplementationPlanExecutionRoot,
+  AcceptedTaskPlanContext,
+  AcceptedTaskPlanExecutionRoot,
   AcceptedPlanTaskLedgerCoordinator,
-  AcceptedPlanScopeDecisionOverlay,
   ExecutionPromptCoordinator,
-  RepairLoop,
 } from '../execution/index.js';
 import type { InteractionOverlayCodec, InteractionOverlayContext, SessionTurnPhase } from '../pipelines/interactionOverlayCodec.js';
 import type { RequirementOptionEffect, UserInputPipeline } from '../pipelines/userInputPipeline.js';
@@ -33,7 +31,7 @@ import {
   returnSessionResult,
   type SessionLoopControlResult,
 } from '../runContinuation.js';
-import type { InterventionLevel, RequirementConfirmationMode, ReviewContinuationMode } from '../types.js';
+import type { AutonomyMode, InterventionLevel, RequirementConfirmationMode, ReviewContinuationMode } from '../types.js';
 
 export type RequirementDecisionHandlerDecision = 'accept' | 'reject' | 'revise';
 export type RequirementDecisionHandlerContinuationMode = ReviewContinuationMode;
@@ -50,10 +48,14 @@ export interface RequirementDecisionHandlerInput {
   existingEvents?: AgentEvent[];
   workspaceBinding?: AgentWorkspaceBinding;
   projectWorkingDirectory?: ProjectWorkingDirectory;
+  projectId?: string;
+  projectKind?: 'folder' | 'blank';
+  projectRootStatus?: 'ready' | 'unbound' | 'unavailable';
   profileId?: string;
   workflow?: string;
   reviewContinuationMode?: RequirementDecisionHandlerContinuationMode;
   interventionLevel?: RequirementDecisionHandlerInterventionLevel;
+  autonomyMode?: AutonomyMode;
   projectMemoryMode?: ProjectMemoryMode;
   interactionOverlay?: InteractionOverlayContext;
 }
@@ -65,7 +67,7 @@ export type RequirementDriverInteractionRef =
 
 export interface RequirementRecoveredAcceptedPlanContext {
   plan: PlanContext;
-  acceptedPlan: AcceptedImplementationPlanContext;
+  acceptedPlan: AcceptedTaskPlanContext;
 }
 
 export interface RequirementDecisionHandlerPorts {
@@ -73,12 +75,12 @@ export interface RequirementDecisionHandlerPorts {
   createId(prefix: string): string;
   append(sessionId: string, events: AgentEvent[]): Promise<AgentSessionResult>;
   activeDriverInteraction(events: AgentEvent[]): RequirementDriverInteractionRef | null;
-  executionRootFromDecision(input: RequirementDecisionHandlerInput, events: AgentEvent[]): AcceptedImplementationPlanExecutionRoot | undefined;
-  buildAcceptedImplementationPlan(input: {
+  executionRootFromDecision(input: RequirementDecisionHandlerInput, events: AgentEvent[]): AcceptedTaskPlanExecutionRoot | undefined;
+  buildAcceptedTaskPlan(input: {
     plan: PlanContext;
     interventionLevel?: RequirementDecisionHandlerInterventionLevel;
-    executionRoot?: AcceptedImplementationPlanExecutionRoot;
-  }): AcceptedImplementationPlanContext;
+    executionRoot?: AcceptedTaskPlanExecutionRoot;
+  }): AcceptedTaskPlanContext;
   recoverAcceptedPlanFromOverlay(
     input: RequirementDecisionHandlerInput,
     events: AgentEvent[],
@@ -92,9 +94,7 @@ export interface RequirementDecisionHandlerPorts {
   progressProjection: SessionProgressProjectionBuilder;
   planIndex: PlanContextIndex;
   acceptedPlanLedger: AcceptedPlanTaskLedgerCoordinator;
-  acceptedPlanScopeDecisionOverlay: AcceptedPlanScopeDecisionOverlay;
   executionPrompt: ExecutionPromptCoordinator<PlanContext>;
-  repairLoop: RepairLoop;
 }
 
 export class RequirementDecisionHandler {
@@ -129,15 +129,6 @@ export class RequirementDecisionHandler {
     }
     if (this.ports.userInputPipeline.isResourceBudgetConfirmation(confirmation)) {
       return this.resolveResourceBudgetDecision(input, confirmation, interactionOverlay, result);
-    }
-    if (this.ports.userInputPipeline.isAcceptedPlanScopeConfirmation(confirmation)) {
-      return normalizeRequirementControl(await this.resolveAcceptedPlanScopeDecision(
-        input,
-        confirmation,
-        decisionEvent,
-        interactionOverlay,
-        result
-      ));
     }
     if (this.ports.userInputPipeline.isAcceptedPlanExecutionConfirmation(confirmation)) {
       return normalizeRequirementControl(await this.resolveAcceptedPlanExecutionDecision(
@@ -251,76 +242,6 @@ export class RequirementDecisionHandler {
     };
   }
 
-  private async resolveAcceptedPlanScopeDecision(
-    input: RequirementDecisionHandlerInput,
-    confirmation: AgentEvent,
-    decisionEvent: AgentEvent,
-    interactionOverlay: InteractionOverlayContext | undefined,
-    current: AgentSessionResult
-  ): Promise<AgentSessionResult | SessionLoopControlResult> {
-    const confirmationPayload = objectRecord(confirmation.payload) ?? {};
-    const decisionRequest = objectRecord(confirmationPayload.decisionRequest) ?? {};
-    const runId = stringValue(confirmationPayload.runId) ?? input.runId;
-    const planId = stringValue(decisionRequest.acceptedPlanId);
-    const selectedOptionId = this.ports.userInputPipeline.selectedRequirementDecisionOptionId(decisionEvent);
-    const plan = (runId ? this.ports.planIndex.findPlanCard(current.events, runId, planId) : null)
-      ?? this.ports.planIndex.findPlanCard(current.events, undefined, planId)
-      ?? (runId ? this.ports.planIndex.latestExecutablePlan(current.events, runId) : null);
-
-    if (input.decision === 'revise' || selectedOptionId === 'revise-plan') {
-      const attachments = this.ports.userInputPipeline.requirementAttachments(confirmation);
-      return {
-        kind: 'resume',
-        input: decisionContinuationInput(input, {
-          content: this.ports.repairLoop.acceptedPlanScopeRevisionRequest({ confirmation, plan, guidance: input.guidance }),
-          attachments,
-          existingEvents: current.events,
-          reviewContinuationMode: input.reviewContinuationMode,
-          resumeResourcePackets: true,
-          interactionOverlay,
-          ...continuationRootOverride(attachments),
-        }),
-      };
-    }
-
-    if (!plan || !plan.implementationPlan) {
-      return this.ports.append(input.sessionId, [
-        this.ports.assistantProjection.finalDiagnosticEvent(
-          input.sessionId,
-          'Accepted-plan scope decision could not recover the original implementationPlan; Session will not start a detached requirement flow.',
-          this.ports.now(),
-          this.ports.createId('accepted-plan-scope-decision-missing-plan')
-        ),
-      ]) ?? current;
-    }
-
-    const executionRoot = plan.executionRoot ?? this.ports.executionRootFromDecision(input, current.events);
-    const acceptedPlan = this.ports.acceptedPlanLedger.recoverLatestCheckpoint({
-      acceptedPlan: this.ports.buildAcceptedImplementationPlan({ plan, interventionLevel: input.interventionLevel, executionRoot }),
-      events: current.events,
-    }).nextAcceptedPlan;
-    const selectedEffect = this.ports.userInputPipeline.selectedRequirementDecisionOptionEffect(decisionEvent)
-      ?? (input.decision === 'accept' ? this.ports.userInputPipeline.defaultRequirementDecisionOptionEffect(confirmation) : undefined);
-    const nextAcceptedPlan = this.ports.acceptedPlanScopeDecisionOverlay.apply(acceptedPlan, selectedEffect);
-    const attachments = nextAcceptedPlan.executionRoot ? [nextAcceptedPlan.executionRoot.attachment] : this.ports.userInputPipeline.requirementAttachments(confirmation);
-    const guidance = input.guidance?.trim()
-      ? `User guidance for the accepted-plan scope intervention (verbatim):\n${input.guidance.trim()}`
-      : this.ports.acceptedPlanScopeDecisionOverlay.resumeGuidance(selectedEffect);
-    return {
-      kind: 'resume',
-      input: decisionContinuationInput(input, {
-        content: this.ports.executionPrompt.executionRequest(plan, nextAcceptedPlan, guidance),
-        attachments,
-        existingEvents: current.events,
-        reviewContinuationMode: input.reviewContinuationMode,
-        resumeResourcePackets: true,
-        acceptedImplementationPlan: nextAcceptedPlan,
-        interactionOverlay,
-        ...continuationRootOverride(attachments),
-      }),
-    };
-  }
-
   private async resolveAcceptedPlanExecutionDecision(
     input: RequirementDecisionHandlerInput,
     confirmation: AgentEvent,
@@ -333,7 +254,7 @@ export class RequirementDecisionHandler {
       return this.ports.append(input.sessionId, [
         this.ports.assistantProjection.finalDiagnosticEvent(
           input.sessionId,
-          'Accepted-plan interaction decision could not recover the parent implementationPlan; Session will not start a detached requirement flow.',
+          'Accepted-plan interaction decision could not recover the parent taskPlan; Session will not start a detached requirement flow.',
           this.ports.now(),
           this.ports.createId('accepted-plan-interaction-missing-plan')
         ),
@@ -357,7 +278,7 @@ export class RequirementDecisionHandler {
           existingEvents: current.events,
           reviewContinuationMode: input.reviewContinuationMode,
           resumeResourcePackets: true,
-          acceptedImplementationPlan: acceptedContext.acceptedPlan,
+          acceptedTaskPlan: acceptedContext.acceptedPlan,
           interactionOverlay,
           ...continuationRootOverride(attachments),
         }),
@@ -375,6 +296,9 @@ export class RequirementDecisionHandler {
         existingEvents: current.events,
         workspaceBinding: continuationWorkspaceBinding(input, attachments),
         projectWorkingDirectory: continuationProjectWorkingDirectory(input, attachments),
+        projectId: input.projectId,
+        projectKind: input.projectKind,
+        projectRootStatus: input.projectRootStatus,
         profileId: input.profileId,
         workflow: input.workflow,
         appendUserMessage: false,
@@ -383,7 +307,7 @@ export class RequirementDecisionHandler {
         interventionLevel: input.interventionLevel,
         projectMemoryMode: input.projectMemoryMode,
         resumeResourcePackets: true,
-        acceptedImplementationPlan: acceptedContext.acceptedPlan,
+        acceptedTaskPlan: acceptedContext.acceptedPlan,
         interactionOverlay,
       },
     };
@@ -594,7 +518,7 @@ export class RequirementDecisionHandler {
         attachments,
         existingEvents: result.events,
         confirmedRequirement: this.ports.userInputPipeline.requirementRecordFromEvent(confirmation, 'confirmed'),
-        acceptedImplementationPlan: nextAccepted,
+        acceptedTaskPlan: nextAccepted,
         interactionOverlay,
         ...continuationRootOverride(attachments),
       }),
@@ -605,12 +529,12 @@ export class RequirementDecisionHandler {
     events: AgentEvent[],
     runId: string,
     planId: string | undefined
-  ): AcceptedImplementationPlanContext | undefined {
+  ): AcceptedTaskPlanContext | undefined {
     const plan = (runId ? this.ports.planIndex.findPlanCard(events, runId, planId) : null)
       ?? this.ports.planIndex.findPlanCard(events, undefined, planId)
       ?? (runId ? this.ports.planIndex.latestExecutablePlan(events, runId) : null);
-    if (!plan || !plan.implementationPlan) return undefined;
-    const base = this.ports.buildAcceptedImplementationPlan({ plan, interventionLevel: undefined, executionRoot: plan.executionRoot });
+    if (!plan || !plan.taskPlan) return undefined;
+    const base = this.ports.buildAcceptedTaskPlan({ plan, interventionLevel: undefined, executionRoot: plan.executionRoot });
     return this.ports.acceptedPlanLedger.recoverLatestCheckpoint({
       acceptedPlan: base,
       events,
@@ -636,6 +560,9 @@ export class RequirementDecisionHandler {
         workspaceBinding: continuationWorkspaceBinding(input, attachments),
         projectMemoryMode: input.projectMemoryMode,
         projectWorkingDirectory: continuationProjectWorkingDirectory(input, attachments),
+        projectId: input.projectId,
+        projectKind: input.projectKind,
+        projectRootStatus: input.projectRootStatus,
         profileId: input.profileId,
         workflow: input.workflow,
         appendUserMessage: false,

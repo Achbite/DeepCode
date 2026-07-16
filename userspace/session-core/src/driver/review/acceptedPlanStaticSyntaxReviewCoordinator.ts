@@ -3,7 +3,7 @@ import type { ResourcePacket } from '../../context/types.js';
 import type { PromptEnvelope } from '../../prompt/types.js';
 import type { ContextFrameBuilder, GeneratedArtifactEvidence } from '../context/index.js';
 import { prepareProviderSideCallMessagesContextAdmission } from '../context/index.js';
-import type { AcceptedImplementationPlanContext } from '../execution/index.js';
+import type { AcceptedTaskPlanContext } from '../execution/index.js';
 import type { SessionDriverProviderRuntimeState } from '../runFrame.js';
 import type { ReviewAssembler } from './reviewAssembler.js';
 import type { NativeToolCallProposal } from '../../provider/providerStreamParts.js';
@@ -23,7 +23,7 @@ export interface AcceptedPlanStaticSyntaxReviewInput<TState extends AcceptedPlan
   profileId?: string;
   state: TState;
   prompt: PromptEnvelope;
-  accepted: AcceptedImplementationPlanContext;
+  accepted: AcceptedTaskPlanContext;
   batch: Record<string, unknown>;
   batchEvents: unknown[];
 }

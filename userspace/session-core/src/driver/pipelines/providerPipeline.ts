@@ -75,6 +75,7 @@ export class ProviderPipeline {
   ) {}
 
   messages(contract: DriverProviderTurnFrame): LlmChatRequest['messages'] {
+    if (contract.providerMessages?.length) return contract.providerMessages;
     // ContextAdmission owns the complete provider system prefix and its physical cache shape.
     return [
       { role: 'system', content: contract.prompt.stablePrefix },
@@ -119,11 +120,15 @@ export class ProviderPipeline {
     contract: DriverProviderTurnFrame
   ): LlmChatRequest['messages'] {
     if (!messages.length) return this.messages(contract);
-    const lastIndex = messages.length - 1;
-    const lastMessage = messages[lastIndex];
-    if (lastMessage?.role === 'user' && typeof lastMessage.content === 'string' && lastMessage.content.includes('ProviderTurnContract:')) {
+    if (messages.some((message) => (
+      message.role === 'user'
+      && typeof message.content === 'string'
+      && message.content.includes('ProviderTurnContract:')
+    ))) {
       return messages;
     }
+    const lastIndex = messages.length - 1;
+    const lastMessage = messages[lastIndex];
     if (lastMessage?.role !== 'user' || typeof lastMessage.content !== 'string') {
       return [
         ...messages,

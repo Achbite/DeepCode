@@ -1,4 +1,4 @@
-import type { AgentEvent } from '@deepcode/protocol';
+import type { AgentEvent, KernelPlanAuthorizationReview } from '@deepcode/protocol';
 import type { ActionBundleDraft, ProposalEnvelope } from '../../protocol/types.js';
 import type { ConversationResourceRoot } from '../../context/types.js';
 import {
@@ -25,7 +25,6 @@ export interface PlanProjectionState {
 export interface PlanProjectionBuilderPorts {
   readActionBundle(proposal: ProposalEnvelope): ActionBundleDraft | undefined;
   requiredFileOperationsFromReport(report: Record<string, unknown> | undefined): unknown[];
-  requiredAccessScopesFromReport(report: Record<string, unknown> | undefined): unknown[];
   permissionBundlesFromReport(report: Record<string, unknown> | undefined): PlanProjectionPermissionBundle[];
   gateInterventionsFromReport(report: Record<string, unknown> | undefined): PlanProjectionGateIntervention[];
   planReviewFacts(report: Record<string, unknown> | undefined): string[];
@@ -40,6 +39,8 @@ export interface PlanProjectionPermissionBundle {
   resourcePath?: string;
   targets: string[];
   operationIds: string[];
+  toolIds: string[];
+  permissionMode: string;
   riskLevel: string;
   summary: string;
   expiresAfter?: string;
@@ -58,7 +59,7 @@ export interface PlanProjectionGateIntervention {
 interface KernelExecutionOperationProjection {
   operation: string;
   targetPath: string;
-  capability: string;
+  toolId: string;
 }
 
 export class PlanProjectionBuilder {
@@ -164,11 +165,9 @@ export class PlanProjectionBuilder {
         ...overlayPayload,
         executionRoot: AcceptedPlanExecutionRootResolver.toPayload(executionRoot),
         actionBundle,
-        codeBlocks: Array.isArray(payload.codeBlocks) ? payload.codeBlocks : [],
-        commandBlocks: Array.isArray(payload.commandBlocks) ? payload.commandBlocks : [],
+        contentBlocks: Array.isArray(payload.contentBlocks) ? payload.contentBlocks : [],
         planReviewReport: report,
         requiredFileOperations: this.ports.requiredFileOperationsFromReport(report),
-        requiredAccessScopes: this.ports.requiredAccessScopesFromReport(report),
         executionContract: objectRecord(report?.executionContract) ?? undefined,
         permissionBundles: this.ports.permissionBundlesFromReport(report),
         interventions: this.ports.gateInterventionsFromReport(report),
@@ -179,19 +178,20 @@ export class PlanProjectionBuilder {
     };
   }
 
-  implementationPlanCardEvent(input: {
+  taskPlanCardEvent(input: {
     state: PlanProjectionState;
     proposal: ProposalEnvelope;
+    authorizationReview: KernelPlanAuthorizationReview;
     ts: string;
     id: string;
   }): AgentEvent {
-    const { state, proposal, ts, id } = input;
-    const implementationPlan = sanitizePlanProjectionPayload(objectRecord(proposal.payload) ?? {});
-    const planId = stringValue(implementationPlan.id) ?? proposal.proposalId;
-    const summary = stringValue(implementationPlan.summary)
-      ?? stringValue(implementationPlan.title)
+    const { state, proposal, authorizationReview, ts, id } = input;
+    const taskPlan = sanitizePlanProjectionPayload(objectRecord(proposal.payload) ?? {});
+    const planId = stringValue(taskPlan.id) ?? proposal.proposalId;
+    const summary = stringValue(taskPlan.summary)
+      ?? stringValue(taskPlan.title)
       ?? 'Implementation plan';
-    const readablePlan = readableImplementationPlan(implementationPlan, summary, {
+    const readablePlan = readableAuthorizedTaskPlan(taskPlan, authorizationReview, summary, {
       runId: proposal.runId,
       planId,
       proposalId: proposal.proposalId,
@@ -210,7 +210,7 @@ export class PlanProjectionBuilder {
         runId: proposal.runId,
         planId,
         proposalId: proposal.proposalId,
-        status: 'pending',
+        status: authorizationReview.status,
         confirmable: true,
         decisionOwner: {
           kind: 'plan',
@@ -222,9 +222,13 @@ export class PlanProjectionBuilder {
         implementationBatch: state.implementationBatch,
         ...overlayPayload,
         executionRoot: AcceptedPlanExecutionRootResolver.toPayload(executionRoot),
-        taskPlan: implementationPlan,
-        implementationPlan,
-        requiredAccessScopes: accessScopesFromImplementationPlan(implementationPlan),
+        taskPlan,
+        planHash: authorizationReview.authorizationContract.planHash,
+        contractHash: authorizationReview.authorizationContract.contractHash,
+        planAuthorizationReview: authorizationReview,
+        authorizationContract: authorizationReview.authorizationContract,
+        permissionBundles: authorizationReview.authorizationContract.permissionBundles,
+        interventions: authorizationReview.authorizationContract.interventions,
         actionBundle: {
           version: '1',
           id: planId,
@@ -234,8 +238,7 @@ export class PlanProjectionBuilder {
           validationExpectations: [],
           reviewExpectations: [],
         },
-        codeBlocks: [],
-        commandBlocks: [],
+        contentBlocks: [],
         channel: 'action',
         visibility: 'conversation',
         presentation: 'body',
@@ -249,17 +252,14 @@ export class PlanProjectionBuilder {
     sourceRefs: Record<string, string>
   ): ReadablePlanProjection {
     const status = stringValue(report?.status) ?? 'pending';
-    const kernelSummary = stringValue(report?.kernelGeneratedPermissionSummary)
-      ?? `Kernel gate status=${status}.`;
     const contract = objectRecord(report?.executionContract);
     const operations = this.kernelExecutionOperationsFromReport(report);
     const bundles = this.ports.permissionBundlesFromReport(report);
     const interventions = this.ports.gateInterventionsFromReport(report);
-    const diagnostics = [
-      ...stringArrayValue(contract?.diagnostics),
-      ...stringArrayValue(report?.blockedReasons),
-      ...stringArrayValue(report?.deniedReasons),
-    ];
+    const diagnostics = stringArrayValue(report?.diagnostics);
+    const kernelSummary = interventions[0]?.summary
+      ?? diagnostics[0]
+      ?? `Kernel gate status=${status}.`;
     return {
       schemaVersion: 'deepcode.session.readable-plan.v1',
       titleKey: 'session.projection.plan.title',
@@ -292,7 +292,7 @@ export class PlanProjectionBuilder {
             messageArgs: {
               operation: operation.operation,
               targetPath: operation.targetPath,
-              capability: operation.capability,
+              capability: operation.toolId,
             },
             targetRefs: [operation.targetPath],
             metadata: operation as unknown as Record<string, unknown>,
@@ -347,25 +347,78 @@ export class PlanProjectionBuilder {
     const fromContract = operations.flatMap((item): KernelExecutionOperationProjection[] => {
       const record = objectRecord(item);
       if (!record) return [];
-      const operation = stringValue(record.operation);
-      const targetPath = stringValue(record.targetPath);
-      const capability = stringValue(record.capability);
-      return operation && targetPath && capability ? [{ operation, targetPath, capability }] : [];
+      const toolId = stringValue(record.toolId);
+      const args = objectRecord(record.args);
+      const targetPath = stringValue(args?.path) ?? stringValue(args?.url) ?? stringValue(args?.query) ?? '.';
+      return toolId ? [{ operation: toolId, targetPath, toolId }] : [];
     });
-    return fromContract.length
-      ? fromContract
-      : this.ports.requiredFileOperationsFromReport(report).flatMap((item): KernelExecutionOperationProjection[] => {
-        const record = objectRecord(item);
-        if (!record) return [];
-        const operation = stringValue(record.operation);
-        const targetPath = stringValue(record.targetPath);
-        const capability = stringValue(record.capability);
-        return operation && targetPath && capability ? [{ operation, targetPath, capability }] : [];
-      });
+    return fromContract;
   }
 }
 
-function readableImplementationPlan(
+function readableAuthorizedTaskPlan(
+  plan: Record<string, unknown>,
+  review: KernelPlanAuthorizationReview,
+  fallbackSummary: string,
+  sourceRefs: Record<string, string>
+): ReadablePlanProjection {
+  const readable = readableTaskPlan(plan, fallbackSummary, sourceRefs);
+  const contract = review.authorizationContract;
+  readable.sections.splice(Math.max(0, readable.sections.length - 1), 0,
+    {
+      sectionId: 'kernelAuthorizationOperations',
+      titleKey: 'session.projection.plan.section.operations',
+      emptyMessageKey: 'session.projection.plan.empty.operations',
+      items: contract.operations.map((operation) => projectionItem(operation.id, 'operation', {
+        messageKey: 'session.projection.plan.operation',
+        messageArgs: {
+          operation: operation.toolId,
+          targetPath: operation.targets.join(', ') || '.',
+          capability: operation.toolId,
+        },
+        targetRefs: operation.targets,
+        metadata: operation as unknown as Record<string, unknown>,
+      })),
+    },
+    {
+      sectionId: 'kernelAuthorizationPermissions',
+      titleKey: 'session.projection.plan.section.permissionBundles',
+      emptyMessageKey: 'session.projection.plan.empty.permissionBundles',
+      items: contract.permissionBundles.map((bundle) => projectionItem(bundle.id, 'permission', {
+        messageKey: 'session.projection.plan.permissionBundle',
+        messageArgs: {
+          capability: bundle.capability,
+          resourceKind: bundle.resourceKind,
+          riskLevel: bundle.risk,
+          targets: bundle.targets.join(', '),
+        },
+        targetRefs: bundle.targets,
+        metadata: bundle as unknown as Record<string, unknown>,
+      })),
+    },
+    {
+      sectionId: 'kernelAuthorizationInterventions',
+      titleKey: 'session.projection.plan.section.interventions',
+      emptyMessageKey: 'session.projection.plan.empty.interventions',
+      items: contract.interventions.map((intervention) => projectionItem(intervention.id, 'decision', {
+        text: intervention.summary,
+        status: intervention.status,
+        metadata: intervention as unknown as Record<string, unknown>,
+      })),
+    },
+    {
+      sectionId: 'kernelAuthorizationDiagnostics',
+      titleKey: 'session.projection.plan.section.diagnostics',
+      emptyMessageKey: 'session.projection.plan.empty.diagnostics',
+      items: review.diagnostics.map((diagnostic, index) => projectionItem(`plan-auth-diagnostic-${index + 1}`, 'diagnostic', {
+        text: diagnostic,
+      })),
+    }
+  );
+  return readable;
+}
+
+function readableTaskPlan(
   plan: Record<string, unknown>,
   fallbackSummary: string,
   sourceRefs: Record<string, string>
@@ -446,7 +499,6 @@ function sanitizePlanProjectionPayload(plan: Record<string, unknown>): Record<st
 
 function sanitizePlanTaskProjectionMetadata(record: Record<string, unknown>): Record<string, unknown> {
   const result = { ...record };
-  delete result.dependencies;
   delete result.dependsOn;
   delete result.dependencyDepth;
   return result;
@@ -461,10 +513,7 @@ function projectionItem(
 }
 
 function planReviewStatusAwaitingUser(status: string | undefined): boolean {
-  return status === 'awaitingUserApproval' ||
-    status === 'awaitingTemporaryGrant' ||
-    status === 'pending' ||
-    status === undefined;
+  return status === 'awaitingUserApproval' || status === undefined;
 }
 
 function defaultPlanReviewDecisionSummary(
@@ -483,11 +532,6 @@ function defaultPlanReviewDecisionSummary(
     : status === 'rejected'
       ? 'The user ignored the plan; this run has been cancelled.'
       : 'The user requested plan changes.';
-}
-
-function accessScopesFromImplementationPlan(plan: Record<string, unknown> | undefined): unknown[] {
-  const accessScopes = Array.isArray(plan?.accessScopes) ? plan.accessScopes : [];
-  return accessScopes.filter((item) => Boolean(item) && typeof item === 'object' && !Array.isArray(item));
 }
 
 function objectRecord(value: unknown): Record<string, unknown> | undefined {

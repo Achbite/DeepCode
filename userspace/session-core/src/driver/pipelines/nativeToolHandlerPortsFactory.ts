@@ -2,8 +2,8 @@ import type {
   AgentEvent,
   ProjectionDelta,
 } from '@deepcode/protocol';
-import type { ProposalEnvelope } from '../../protocol/types.js';
 import type {
+  NativeToolSemanticHandlingResult,
   NativeToolTurnHandlerPorts,
   NativeToolTurnHandlerState,
   NativeToolTurnResult,
@@ -32,12 +32,17 @@ export interface NativeToolHandlerPortsFactoryDependencies<
   event(sessionId: string, kind: AgentEvent['kind'], payload: unknown): AgentEvent;
   append(sessionId: string, events: AgentEvent[]): Promise<unknown>;
   emitProjectionDelta(state: TState, delta: ProjectionDelta): Promise<void>;
+  recordSemanticExchange?(
+    state: TState,
+    toolCall: NativeToolCallProposal,
+    result: NativeToolSemanticHandlingResult
+  ): Promise<void>;
 }
 
 export interface NativeToolHandlerPortsFactoryInput<
   TState extends NativeToolTurnHandlerState,
 > {
-  semanticProposal(state: TState, toolCall: NativeToolCallProposal): ProposalEnvelope | null;
+  semanticDirective(state: TState, toolCall: NativeToolCallProposal): Promise<NativeToolSemanticHandlingResult | null>;
 }
 
 export class NativeToolHandlerPortsFactory<
@@ -69,7 +74,9 @@ export class NativeToolHandlerPortsFactory<
           resourcePacketCount,
         }));
       },
-      semanticProposal: (state, toolCall) => input.semanticProposal(state, toolCall),
+      semanticDirective: (state, toolCall) => input.semanticDirective(state, toolCall),
+      recordSemanticExchange: (state, toolCall, result) =>
+        this.dependencies.recordSemanticExchange?.(state, toolCall, result) ?? Promise.resolve(),
     };
   }
 }

@@ -24,7 +24,7 @@ import type {
 } from '../../context/types.js';
 import type { RequirementRecord } from '../../requirement/types.js';
 import type {
-  AcceptedImplementationPlanContext,
+  AcceptedTaskPlanContext,
   ImplementationBatchContext,
   TaskExecutionCursor,
   CurrentTaskContext,
@@ -36,6 +36,34 @@ import type {
 import type { DriverRequestRef, KernelStateContractRef } from '../types.js';
 import type { InteractionOverlayContext, SessionTurnPhase } from './interactionOverlayCodec.js';
 import type { DriverProviderTurnFrame, SessionDriverTaskResourceProgress } from '../runFrame.js';
+import { latestEventRunId, recoverKernelContext } from '../context/kernelEnvelopeReader.js';
+import {
+  buildUserAuthorityFrame,
+  createSessionTurnAuthorityEvent,
+  latestExplicitUserContent,
+  latestSessionTurnAuthority,
+  UserAuthorityFrameError,
+  type UserAuthorityFrame,
+} from '../context/userAuthorityFrame.js';
+import {
+  visibleLanguageForRequest,
+  type VisibleLanguage,
+} from '../runtimeSupport.js';
+import { findActiveInteraction } from '../../run-state/index.js';
+import {
+  emptyPromptLedgerState,
+  PromptLedgerCompatibilityError,
+  restoreProviderRequestCacheHistory,
+  restorePromptLedger,
+  type PromptLedgerState,
+  type PromptLedgerWireRecord,
+  type ProviderRequestCacheHistoryEntry,
+} from '../../prompt/promptLedger.js';
+import { ArtifactDraftLease } from '../execution/artifactDraftLedger.js';
+import type { AcceptedTaskReplanReason } from '../execution/artifactDraftReplanCoordinator.js';
+import type { AutonomyMode } from '../../sessionModes.js';
+import type { NativeToolCallProposal } from '../../provider/providerStreamParts.js';
+import { PermissionPipeline } from './permissionPipeline.js';
 
 export interface RunLifecycleInput {
   sessionId: string;
@@ -44,28 +72,41 @@ export interface RunLifecycleInput {
   existingEvents?: AgentEvent[];
   workspaceBinding?: AgentWorkspaceBinding;
   projectWorkingDirectory?: ProjectWorkingDirectory;
+  projectId?: string;
+  projectKind?: 'folder' | 'blank';
+  projectRootStatus?: 'ready' | 'unbound' | 'unavailable';
   profileId?: string;
   workflow?: string;
   appendUserMessage?: boolean;
   confirmedRequirement?: RequirementRecord;
   projectMemoryMode?: ProjectMemoryMode;
   resumeResourcePackets?: boolean;
-  acceptedImplementationPlan?: AcceptedImplementationPlanContext;
+  acceptedTaskPlan?: AcceptedTaskPlanContext;
   interactionOverlay?: InteractionOverlayContext;
+  autonomyMode?: AutonomyMode;
 }
 
 export interface RunLifecycleState {
   sessionId: string;
   runId: string;
   userRequest: string;
+  userAuthorityFrame: UserAuthorityFrame;
+  promptLedger: PromptLedgerState;
+  artifactDraftLease?: ArtifactDraftLease;
+  artifactChunkRepairAttempts?: Record<string, number>;
+  semanticDirectiveRepairAttempts?: Record<string, number>;
+  pendingSemanticToolCalls?: Record<string, NativeToolCallProposal>;
+  providerRequestCacheHistory?: Record<string, ProviderRequestCacheHistoryEntry>;
   phase: SessionTurnPhase;
   workspaceScopeKey: string;
+  workspaceBinding?: AgentWorkspaceBinding;
   stateContract?: KernelStateContractRef;
   driverRequest?: DriverRequestRef;
   manifest: ResourceManifest;
   conversationRoots: ConversationResourceRoot[];
   initialContext: InitialContextPacket;
   resourcePackets: ResourcePacket[];
+  resourceEvidenceRevision: number;
   generatedArtifactEvidence: Map<string, unknown>;
   resourceRequestProgressByTask: Map<string, SessionDriverTaskResourceProgress>;
   memoryDocument: SessionMemoryDocument;
@@ -79,11 +120,10 @@ export interface RunLifecycleState {
   acceptedPlanPromptFrame?: AcceptedPlanPromptFrame;
   providerTurnFrame?: DriverProviderTurnFrame;
   implementationBatch: ImplementationBatchContext;
-  acceptedImplementationPlan?: AcceptedImplementationPlanContext;
+  acceptedTaskPlan?: AcceptedTaskPlanContext;
   resourceRequestRepairAttempted: boolean;
   actionBundleAdmissionRepairAttempted: boolean;
   planReviewRepairAttempted: boolean;
-  acceptedPlanScopeRepairAttempted: boolean;
   terminalGuidanceRevisionAttempted: boolean;
   nativeToolReadLedger: Map<string, unknown>;
   nativeToolDuplicateRepairAttempted: boolean;
@@ -91,11 +131,14 @@ export interface RunLifecycleState {
   nativeToolResumeRound?: number;
   semanticDirectiveRepairAttempted?: boolean;
   semanticDirectiveErrorSummary?: string;
+  taskPlanReplanReason?: AcceptedTaskReplanReason;
   interactionOverlay?: InteractionOverlayContext;
 }
 
 export interface RunLifecyclePipelinePorts<State extends RunLifecycleState> {
   createId(prefix: string): string;
+  now(): string;
+  createError(code: string, message: string): Error;
   append(sessionId: string, events: AgentEvent[]): Promise<AgentSessionResult>;
   kernel(request: KernelCommandEnvelope): Promise<KernelReply>;
   appendProjectedKernelEvents(sessionId: string, reply: KernelReply): Promise<AgentSessionResult>;
@@ -114,7 +157,7 @@ export interface RunLifecyclePipelinePorts<State extends RunLifecycleState> {
   recentResourcePackets(events: AgentEvent[]): ResourcePacket[];
   generatedArtifactEvidenceFromPackets(packets: ResourcePacket[]): Map<string, unknown>;
   initialTaskRuntime(input: {
-    acceptedPlan?: AcceptedImplementationPlanContext;
+    acceptedPlan?: AcceptedTaskPlanContext;
     resourcePackets: ResourcePacket[];
     lastSavepointId?: string;
   }): {
@@ -126,9 +169,10 @@ export interface RunLifecyclePipelinePorts<State extends RunLifecycleState> {
   lastSavepointId(events: AgentEvent[]): string | undefined;
   implementationBatchHints(
     context: ImplementationBatchContext,
-    acceptedPlan?: AcceptedImplementationPlanContext
+    acceptedPlan?: AcceptedTaskPlanContext
   ): string[];
   resolveInitialResources(state: State): Promise<AgentSessionResult>;
+  loadWireLedger?(sessionId: string): Promise<PromptLedgerWireRecord[]>;
 }
 
 export interface RunLifecycleResult<State extends RunLifecycleState> {
@@ -141,15 +185,14 @@ export class RunLifecyclePipeline<State extends RunLifecycleState> {
 
   async initialize(input: RunLifecycleInput): Promise<RunLifecycleResult<State>> {
     const sessionId = input.sessionId;
-    let lastResult = input.appendUserMessage === false
-      ? await this.ports.append(sessionId, [])
-      : await this.ports.append(sessionId, [
-        this.ports.userMessageEvent({
+    const userMessage = input.appendUserMessage === false
+      ? undefined
+      : this.ports.userMessageEvent({
           sessionId,
           content: input.content,
           attachments: input.attachments ?? [],
-        }),
-      ]);
+        });
+    let lastResult = await this.ports.append(sessionId, userMessage ? [userMessage] : []);
 
     const kernelAttachments = this.ports.kernelRunAttachments(input);
     const runReply = await this.ports.kernel({
@@ -163,7 +206,6 @@ export class RunLifecyclePipeline<State extends RunLifecycleState> {
         },
         workspaceBinding: input.workspaceBinding,
         profileRef: input.profileId ? { id: input.profileId, kind: 'llm' } : undefined,
-        workflowRef: input.workflow ? { id: input.workflow } : undefined,
         runOverrides: undefined,
       },
     });
@@ -171,6 +213,36 @@ export class RunLifecyclePipeline<State extends RunLifecycleState> {
 
     const events = input.existingEvents ?? [];
     const runId = firstString(runReply.events, 'runId') ?? this.ports.createId('run');
+    if (userMessage) {
+      const previousAuthority = latestSessionTurnAuthority(events);
+      const pendingInteraction = pendingInteractionKind(events);
+      if (pendingInteraction && !previousAuthority) {
+        throw this.ports.createError(
+          'session_turn_authority_unavailable',
+          'The pending interaction belongs to a legacy in-progress session without a persisted turn authority binding.'
+        );
+      }
+      const relation = pendingInteraction ? 'interactionContinuation' : 'newTask';
+      const taskId = relation === 'interactionContinuation'
+        ? previousAuthority!.taskId
+        : this.ports.createId('session-task');
+      const outputLanguage = relation === 'interactionContinuation'
+        ? persistedOutputLanguage(previousAuthority?.outputLanguage, input.content)
+        : visibleLanguageForRequest(input.content);
+      lastResult = await this.ports.append(sessionId, [createSessionTurnAuthorityEvent({
+        sessionId,
+        runId,
+        turnId: this.ports.createId('session-turn'),
+        taskId,
+        messages: [{ messageId: userMessage.id, content: input.content }],
+        relation,
+        boundAtHookRef: pendingInteraction ? `interaction.${pendingInteraction}.input` : 'run.initialized',
+        outputLanguage,
+        previousTaskId: relation === 'newTask' ? previousAuthority?.taskId : undefined,
+        eventId: this.ports.createId('session-turn-authority'),
+        timestamp: this.ports.now(),
+      })]);
+    }
     return this.hydrate({
       input,
       lastResult,
@@ -186,16 +258,17 @@ export class RunLifecyclePipeline<State extends RunLifecycleState> {
   async resume(input: RunLifecycleInput): Promise<RunLifecycleResult<State>> {
     const lastResult = await this.ports.append(input.sessionId, []);
     const events = input.existingEvents?.length ? input.existingEvents : lastResult.events;
-    const runId = input.acceptedImplementationPlan?.runId
-      ?? latestRunId(events)
+    const runId = input.acceptedTaskPlan?.runId
+      ?? latestEventRunId(events, input.sessionId)
       ?? this.ports.createId('run-resume');
+    const recovered = recoverKernelContext(events, runId, input.sessionId);
     return this.hydrate({
       input,
       lastResult,
       events,
       runId,
-      stateContract: findStateContract(events.map((event) => event.payload)),
-      driverRequest: findDriverRequest(events.map((event) => event.payload)),
+      stateContract: recovered.stateContract,
+      driverRequest: recovered.driverRequest,
       restoreResourcePackets: true,
       resolveInitialResources: false,
     });
@@ -214,30 +287,78 @@ export class RunLifecyclePipeline<State extends RunLifecycleState> {
     const { input, events, runId } = options;
     const sessionId = input.sessionId;
     let lastResult = options.lastResult;
+    const authorityEvents = mergeEvents(events, lastResult.events ?? []);
+    let userAuthorityFrame: UserAuthorityFrame;
+    try {
+      userAuthorityFrame = buildUserAuthorityFrame(authorityEvents, {
+        messageId: this.ports.createId('user-authority-fallback'),
+        content: input.content,
+      }, visibleLanguageForRequest, input.autonomyMode ?? 'strict', {
+        runId,
+        requirePersistedAuthority: true,
+      });
+    } catch (error) {
+      if (error instanceof UserAuthorityFrameError) {
+        throw this.ports.createError(error.code, error.message);
+      }
+      throw error;
+    }
+    const wireLedgerRecords = this.ports.loadWireLedger
+      ? await this.ports.loadWireLedger(sessionId)
+      : [];
+    let promptLedger: PromptLedgerState;
+    try {
+      promptLedger = wireLedgerRecords.length
+        ? restorePromptLedger(wireLedgerRecords)
+        : emptyPromptLedgerState();
+    } catch (error) {
+      if (error instanceof PromptLedgerCompatibilityError) {
+        throw this.ports.createError(error.code, error.message);
+      }
+      throw error;
+    }
+    const providerRequestCacheHistory = restoreProviderRequestCacheHistory(wireLedgerRecords);
     const manifestBuild = this.ports.buildManifest(input, this.ports.createId('resource-manifest'));
-    const acceptedImplementationPlan = input.acceptedImplementationPlan;
+    const taskPlanReplanReason = input.acceptedTaskPlan
+      ? recoverArtifactBudgetReplanReason(authorityEvents, runId, input.acceptedTaskPlan.planId)
+      : undefined;
+    const acceptedTaskPlan = taskPlanReplanReason ? undefined : input.acceptedTaskPlan;
     const implementationBatch = this.ports.buildImplementationBatch(events);
-    if (acceptedImplementationPlan) {
-      implementationBatch.batchIndex = acceptedImplementationPlan.batchIndex;
+    if (acceptedTaskPlan) {
+      implementationBatch.batchIndex = acceptedTaskPlan.batchIndex;
     }
     const restoredResourcePackets = options.restoreResourcePackets
       ? this.ports.recentResourcePackets(events)
       : [];
     const taskLocalCompactRecords = collectTaskLocalCompactRecords(events, {
       limit: 8,
-      planId: acceptedImplementationPlan?.planId,
+      planId: acceptedTaskPlan?.planId,
     });
     const initialTaskRuntime = this.ports.initialTaskRuntime({
-      acceptedPlan: acceptedImplementationPlan,
+      acceptedPlan: acceptedTaskPlan,
       resourcePackets: restoredResourcePackets,
       lastSavepointId: this.ports.lastSavepointId(events),
     });
     const state = {
       sessionId,
       runId,
-      userRequest: input.content,
+      userRequest: latestExplicitUserContent(userAuthorityFrame),
+      userAuthorityFrame,
+      promptLedger,
+      artifactDraftLease: ArtifactDraftLease.restore({
+        events: authorityEvents,
+        runId,
+        sessionId,
+        acceptedPlan: acceptedTaskPlan,
+        maxTotalUtf8Bytes: draftPolicyBytes(options.stateContract),
+        createId: (prefix) => this.ports.createId(prefix),
+      }),
+      artifactChunkRepairAttempts: {},
+      semanticDirectiveRepairAttempts: {},
+      pendingSemanticToolCalls: {},
       phase: 'context_reading',
       workspaceScopeKey: manifestBuild.manifest.workspaceScopeKey,
+      workspaceBinding: input.workspaceBinding,
       stateContract: options.stateContract,
       driverRequest: options.driverRequest,
       manifest: manifestBuild.manifest,
@@ -248,23 +369,23 @@ export class RunLifecyclePipeline<State extends RunLifecycleState> {
         manifest: manifestBuild.manifest,
       },
       resourcePackets: [...restoredResourcePackets],
+      resourceEvidenceRevision: restoredResourcePackets.length,
       generatedArtifactEvidence: this.ports.generatedArtifactEvidenceFromPackets(restoredResourcePackets),
       resourceRequestProgressByTask: new Map<string, SessionDriverTaskResourceProgress>(),
-      memoryDocument: this.ports.buildMemoryDocument(events, {
+      memoryDocument: this.ports.buildMemoryDocument(authorityEvents, {
         projectMemoryMode: input.projectMemoryMode,
       }),
-      memoryHints: this.ports.implementationBatchHints(implementationBatch, acceptedImplementationPlan),
+      memoryHints: this.ports.implementationBatchHints(implementationBatch, acceptedTaskPlan),
       taskLocalCompactRecords,
       taskExecutionCursor: initialTaskRuntime.taskExecutionCursor,
       currentTaskContext: initialTaskRuntime.currentTaskContext,
       taskLedger: initialTaskRuntime.taskLedger,
       acceptedPlanPromptFrame: initialTaskRuntime.acceptedPlanPromptFrame,
       implementationBatch,
-      acceptedImplementationPlan,
+      acceptedTaskPlan,
       resourceRequestRepairAttempted: false,
       actionBundleAdmissionRepairAttempted: false,
       planReviewRepairAttempted: false,
-      acceptedPlanScopeRepairAttempted: false,
       terminalGuidanceRevisionAttempted: false,
       nativeToolReadLedger: new Map<string, unknown>(),
       nativeToolDuplicateRepairAttempted: false,
@@ -272,6 +393,8 @@ export class RunLifecyclePipeline<State extends RunLifecycleState> {
       nativeToolResumeRound: 0,
       semanticDirectiveRepairAttempted: false,
       semanticDirectiveErrorSummary: undefined,
+      taskPlanReplanReason,
+      providerRequestCacheHistory,
       interactionOverlay: input.interactionOverlay,
     } as State;
 
@@ -283,31 +406,29 @@ export class RunLifecyclePipeline<State extends RunLifecycleState> {
   }
 }
 
-function latestRunId(events: AgentEvent[]): string | undefined {
-  for (const event of [...events].reverse()) {
-    const payload = objectRecord(event.payload);
-    const runId = stringValue(payload?.runId) ?? stringValue(objectRecord(payload?.decisionOwner)?.runId);
-    if (runId) return runId;
-  }
-  return undefined;
+function pendingInteractionKind(events: readonly AgentEvent[]): 'permission' | 'review' | 'plan' | 'requirement' | undefined {
+  const pendingPermission = new PermissionPipeline().findPendingPermissionContext([...events]);
+  if (pendingPermission) return 'permission';
+  return findActiveInteraction({ events })?.kind;
+}
+
+function persistedOutputLanguage(value: string | undefined, fallback: string): VisibleLanguage {
+  return value === 'zh-CN' || value === 'en-US'
+    ? value
+    : visibleLanguageForRequest(fallback);
+}
+
+function draftPolicyBytes(stateContract: KernelStateContractRef | undefined): number | undefined {
+  const value = stateContract?.draftAdmissionPolicy?.maxTotalUtf8Bytes;
+  return Number.isSafeInteger(value) && Number(value) > 0 ? Number(value) : undefined;
 }
 
 function findStateContract(events: unknown[] | undefined): KernelStateContractRef | undefined {
-  for (const event of events ?? []) {
-    const record = objectRecord(event);
-    const contract = objectRecord(record?.stateContract);
-    if (contract) return contract as unknown as KernelStateContractRef;
-  }
-  return undefined;
+  return recoverKernelContext(events ?? []).stateContract;
 }
 
 function findDriverRequest(events: unknown[] | undefined): DriverRequestRef | undefined {
-  for (const event of events ?? []) {
-    const record = objectRecord(event);
-    const driverRequest = objectRecord(record?.driverRequest);
-    if (driverRequest) return driverRequest as unknown as DriverRequestRef;
-  }
-  return undefined;
+  return recoverKernelContext(events ?? []).driverRequest;
 }
 
 function firstString(events: unknown[] | undefined, key: string): string | undefined {
@@ -327,4 +448,40 @@ function objectRecord(value: unknown): Record<string, unknown> | undefined {
 
 function stringValue(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+export function recoverArtifactBudgetReplanReason(
+  events: readonly AgentEvent[],
+  runId: string,
+  acceptedPlanId: string
+): AcceptedTaskReplanReason | undefined {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (event?.kind !== 'workflow_stage') continue;
+    const payload = objectRecord(event.payload);
+    if (stringValue(payload?.stage) !== 'accepted_plan.replan_required') continue;
+    if (stringValue(payload?.code) !== 'artifact_draft_budget_exceeded') continue;
+    if (stringValue(payload?.runId) !== runId) continue;
+    if (stringValue(payload?.previousPlanId) !== acceptedPlanId) continue;
+    const message = stringValue(payload?.message);
+    if (!message) continue;
+    return {
+      code: 'artifact_draft_budget_exceeded',
+      message,
+      previousPlanId: acceptedPlanId,
+      previousTaskId: stringValue(payload?.previousTaskId),
+    };
+  }
+  return undefined;
+}
+
+function mergeEvents(primary: readonly AgentEvent[], secondary: readonly AgentEvent[]): AgentEvent[] {
+  const merged: AgentEvent[] = [];
+  const seen = new Set<string>();
+  for (const event of [...primary, ...secondary]) {
+    if (seen.has(event.id)) continue;
+    seen.add(event.id);
+    merged.push(event);
+  }
+  return merged;
 }

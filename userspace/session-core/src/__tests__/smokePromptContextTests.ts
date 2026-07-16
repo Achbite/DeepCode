@@ -21,6 +21,11 @@ import {
   type TranscriptEntry,
 } from '../index.js';
 import { ContextFrameBuilder } from '../driver/context/contextFrameBuilder.js';
+import { providerTelemetryFromUsage } from '../cache/telemetry.js';
+import {
+  providerRequestCacheTopology,
+  type ProviderTurnRunnerState,
+} from '../driver/pipelines/providerTurnRunner.js';
 import { VISIBLE_REASONING_MAX_CHARS } from '../driver/projection/index.js';
 import { AcceptedPlanResourceResumePromptBuilder } from '../prompt/AcceptedPlanResourceResumePromptBuilder.js';
 import { ProviderRepairMessageBuilder } from '../prompt/ProviderRepairMessageBuilder.js';
@@ -92,7 +97,7 @@ export function assertPromptEnvelope(): void {
   const prompt = buildPromptEnvelope({
     workflowState: 'needProposal',
     allowedProposals: ['answer', 'resourceRequest', 'taskPlan', 'actionBundle'],
-    capabilityCatalogSummary: 'fs.read\nfs.write',
+    toolCatalogSummary: 'fs.read\nfs.write',
     memoryHints: ['Recent user turn: generic request attachments=file:generic/file.txt'],
     userRequest: 'Analyze the attached resource.',
     initialContext,
@@ -101,11 +106,13 @@ export function assertPromptEnvelope(): void {
   });
   assert(prompt.stablePrefix.includes('Use exactly one registered Session semantic tool'), 'stable prompt requires one Session semantic directive');
   assert(!prompt.dynamicSuffix.includes('provider-native Session semantic tools'), 'dynamic prompt does not repeat the registered semantic tool profile');
-  assert(!prompt.stablePrefix.includes('deepcode.agent.protocol.v3'), 'stable prompt no longer teaches the legacy JSON proposal envelope');
-  assert(!prompt.stablePrefix.includes('toolId'), 'stable prompt does not expose internal Kernel tool identifiers');
+  assert(!prompt.stablePrefix.includes('deepcode.agent.protocol.v4'), 'stable prompt no longer teaches the legacy JSON proposal envelope');
+  assert(prompt.stablePrefix.includes('every task toolId must exactly match'), 'stable prompt forbids guessed planning tool ids');
+  assert(prompt.stablePrefix.includes('latest authoritative user input'), 'stable prompt binds user-visible prose to the current user input language');
   assert(!prompt.stablePrefix.includes('fs.write'), 'stable prompt does not expose Kernel file write ids');
-  assert(!prompt.stablePrefix.includes('fs.patch'), 'stable prompt does not expose Kernel patch ids');
+  assert(!prompt.stablePrefix.includes('fs.edit'), 'stable prompt does not expose Kernel patch ids');
   assert(!prompt.stablePrefix.includes('fs.delete'), 'stable prompt does not expose Kernel delete ids');
+  assert(prompt.dynamicSuffix.includes('fs.read\nfs.write'), 'dynamic prompt includes the current Kernel tool catalog summary');
   assert(prompt.dynamicSuffix.includes('manifestEntry id=attachment-0-generic-file'), 'prompt exposes manifest entry ids');
   assert(prompt.dynamicSuffix.includes('Conversation roots'), 'prompt exposes conversation roots');
   assert(prompt.dynamicSuffix.includes('generic content'), 'prompt includes ResourcePacket content');
@@ -146,7 +153,7 @@ export function assertContextAssemblerCachePlan(): void {
   const base = assembleContext({
     workflowState: 'needProposal',
     allowedProposals: ['answer', 'resourceRequest'],
-    capabilityCatalogSummary: 'fs.read',
+    toolCatalogSummary: 'fs.read',
     userRequest: 'Summarize the reusable context.',
     memoryDocument,
     initialContext: {
@@ -169,7 +176,7 @@ export function assertContextAssemblerCachePlan(): void {
   const followUp = assembleContext({
     workflowState: 'needProposal',
     allowedProposals: ['answer', 'resourceRequest'],
-    capabilityCatalogSummary: 'fs.read',
+    toolCatalogSummary: 'fs.read',
     userRequest: 'Answer a follow-up from the same reusable context.',
     memoryDocument,
     initialContext: {
@@ -185,8 +192,8 @@ export function assertContextAssemblerCachePlan(): void {
   });
   const proposalModeChange = assembleContext({
     workflowState: 'needProposal',
-    allowedProposals: ['actionBundle', 'resourceRequest', 'decisionRequest', 'taskOutcome', 'diagnostic'],
-    capabilityCatalogSummary: 'fs.read',
+    allowedProposals: ['actionBundle', 'resourceRequest', 'decisionRequest', 'diagnostic'],
+    toolCatalogSummary: 'fs.read',
     userRequest: 'Answer a follow-up from the same reusable context.',
     memoryDocument,
     initialContext: {
@@ -215,7 +222,8 @@ export function assertContextAssemblerCachePlan(): void {
   assert(base.cachePlan.dynamicSuffixHash !== proposalModeChange.cachePlan.dynamicSuffixHash, 'allowed proposal changes stay in dynamic suffix');
   assert(base.cachePlan.cacheHash !== followUp.cachePlan.cacheHash, 'overall cache hash changes with the dynamic suffix');
   assert(!base.prompt.stablePrefix.includes('Summarize the reusable context.'), 'stable prefix excludes current user request');
-  assert(base.prompt.dynamicSuffix.includes('Summarize the reusable context.'), 'dynamic suffix carries current user request');
+  assert(!base.prompt.dynamicSuffix.includes('Summarize the reusable context.'), 'system context does not duplicate the exact user request carried by PromptLedger');
+  assert(base.prompt.dynamicSuffix.includes('exact authoritative text is supplied in PromptLedger user messages'), 'dynamic context identifies PromptLedger as the user-text authority');
   assert(base.prompt.dynamicSuffix.includes('Prefer a concise continuation'), 'user guidance enters the dynamic suffix');
   assertEqual(base.contextAssembly.userGuidanceCount, 1, 'context assembly records provider-checkpoint user guidance count');
   assertEqual(base.contextAssembly.consumedUserGuidanceIds[0], 'guidance-generic', 'context assembly records consumed user guidance ids');
@@ -347,7 +355,7 @@ export function assertContextAssemblerCachePlan(): void {
   const toolCatalogSegment = base.contextAssembly.segments.find((segment) => segment.name === 'toolCatalogSummary');
   assertEqual(toolCatalogSegment?.cacheClass, 'turnDynamic', 'tool catalog digest follows current allowed proposal state');
   assertEqual(toolCatalogSegment?.stablePrefix, false, 'tool catalog digest stays outside the stable prefix');
-  assert(!base.prompt.dynamicLayerNames.includes('toolCatalogSummary'), 'registered provider tools replace the dynamic text catalog digest');
+  assert(base.prompt.dynamicLayerNames.includes('toolCatalogSummary'), 'current Kernel catalog digest is provider-visible dynamic context');
   assertEqual(
     base.contextAssembly.segments.some((segment) => segment.cacheClass === 'reusableResource' && segment.name === 'reusableResourceContext'),
     true,
@@ -432,7 +440,7 @@ export function assertResourcePromptBlocksStabilize(): void {
   const first = assembleContext({
     workflowState: 'needProposal',
     allowedProposals: ['answer', 'resourceRequest'],
-    capabilityCatalogSummary: 'fs.read',
+    toolCatalogSummary: 'fs.read',
     userRequest: 'Analyze alpha.',
     initialContext,
     resourcePackets: [alphaPacket],
@@ -442,7 +450,7 @@ export function assertResourcePromptBlocksStabilize(): void {
   const second = assembleContext({
     workflowState: 'needProposal',
     allowedProposals: ['answer', 'resourceRequest'],
-    capabilityCatalogSummary: 'fs.read',
+    toolCatalogSummary: 'fs.read',
     userRequest: 'Analyze beta with prior alpha context.',
     initialContext,
     resourcePackets: [alphaPacket, betaPacket],
@@ -508,7 +516,7 @@ export function assertResourcePromptBlocksStabilize(): void {
   const overBudget = assembleContext({
     workflowState: 'needProposal',
     allowedProposals: ['answer', 'resourceRequest'],
-    capabilityCatalogSummary: 'fs.read',
+    toolCatalogSummary: 'fs.read',
     userRequest: 'Analyze budgeted resource context.',
     initialContext: largeInitialContext,
     resourcePackets: largePackets,
@@ -584,7 +592,7 @@ export function assertResourcePromptBlocksStabilize(): void {
   const directoryPrompt = buildPromptEnvelope({
     workflowState: 'needProposal',
     allowedProposals: ['answer', 'resourceRequest', 'taskPlan'],
-    capabilityCatalogSummary: 'fs.read',
+    toolCatalogSummary: 'fs.read',
     userRequest: 'Plan with a generic directory inventory.',
     initialContext: {
       id: 'initial-directory-inventory',
@@ -596,7 +604,7 @@ export function assertResourcePromptBlocksStabilize(): void {
   const directoryContract = renderProviderTurnContractLayer({
     workflowState: 'needProposal',
     allowedProposals: ['answer', 'resourceRequest', 'taskPlan'],
-    capabilityCatalogSummary: 'fs.read',
+    toolCatalogSummary: 'fs.read',
     userRequest: 'Plan with a generic directory inventory.',
     initialContext: {
       id: 'initial-directory-inventory',
@@ -698,6 +706,25 @@ export function assertSessionMemoryDocument(): void {
       payload: {
         content: 'Analyze a generic attachment.',
         attachments: [{ kind: 'directory', path: 'generic-attachment', scope: 'message' }],
+      },
+    },
+    {
+      id: 'memory-turn-authority',
+      sessionId: 'session-memory',
+      ts: '2026-01-01T00:00:00.100Z',
+      kind: 'session_turn_authority',
+      payload: {
+        schemaVersion: 'deepcode.session.turn-authority.v1',
+        sessionId: 'session-memory',
+        runId: 'run-memory',
+        turnId: 'turn-memory',
+        taskId: 'task-memory',
+        sourceMessageIds: ['memory-user'],
+        sourceMessageHashes: ['hash-memory-user'],
+        relation: 'newTask',
+        boundAtHookRef: 'smoke.memory',
+        outputLanguage: 'en-US',
+        authorityHash: 'hash-memory-authority',
       },
     },
     {
@@ -870,6 +897,42 @@ export function assertDeepSeekCacheStrategyDoesNotInjectRequestParameter(): void
   assertEqual(Object.prototype.hasOwnProperty.call(anthropic.requestBody, 'cache_control'), false, 'Anthropic request body does not include cache_control');
 }
 
+export function assertProviderCacheTelemetryNormalizesDeepSeekUsage(): void {
+  const telemetry = providerTelemetryFromUsage({
+    provider: 'deepseek',
+    usage: {
+      prompt_tokens: 1200,
+      completion_tokens: 80,
+      total_tokens: 1280,
+      prompt_cache_hit_tokens: 900,
+      prompt_cache_miss_tokens: 300,
+    },
+  });
+  assertEqual(telemetry.promptCacheHitTokens, 900, 'DeepSeek prompt_cache_hit_tokens maps to cache hit tokens');
+  assertEqual(telemetry.promptCacheMissTokens, 300, 'DeepSeek prompt_cache_miss_tokens maps to cache miss tokens');
+  assertEqual(telemetry.promptTokens, 1200, 'DeepSeek prompt token usage remains available for diagnostics');
+  assertEqual(telemetry.totalTokens, 1280, 'DeepSeek total token usage remains available for diagnostics');
+
+  const token = randomSmokeToken('cache-segment-id');
+  const segmentId = `segment:${token}:toolCatalogSummary`;
+  const topology = providerRequestCacheTopology({
+    sessionId: `session-${token}`,
+    runId: `run-${token}`,
+    userRequest: `request-${token}`,
+    contextAssembly: {
+      segments: [{ id: segmentId, contentHash: `fnv1a32:${token}` }],
+    },
+    providerTurnFrame: {
+      snapshot: { semanticProfileId: `profile-${token}` },
+    },
+  } as unknown as ProviderTurnRunnerState, [{ role: 'user', content: `request-${token}` }], {});
+  assertEqual(
+    (topology.changedSegmentIds as string[])[0],
+    segmentId,
+    'cache topology preserves the complete segment id before its content hash'
+  );
+}
+
 function cacheStrategyResult(provider: string, model: string): ReturnType<typeof applyProviderCacheStrategy> {
   return applyProviderCacheStrategy({
     provider,
@@ -911,7 +974,7 @@ export async function assertProviderCacheTelemetryNormalizesBigModelUsage(): Pro
         assistantMessage: {
           role: 'assistant',
           content: JSON.stringify({
-            schemaVersion: 'deepcode.agent.protocol.v3',
+            schemaVersion: 'deepcode.agent.protocol.v4',
             kind: 'answer',
             outputLanguage: 'en-US',
             answer: { format: 'markdown', content: 'Generic answer.' },
@@ -982,7 +1045,7 @@ export async function assertProviderTraceArchiveCompactsStreamingChunks(): Promi
           role: 'assistant',
           reasoningContent: 'generic reasoning '.repeat(1000),
           content: JSON.stringify({
-            schemaVersion: 'deepcode.agent.protocol.v3',
+            schemaVersion: 'deepcode.agent.protocol.v4',
             kind: 'answer',
             outputLanguage: 'en-US',
             answer: { format: 'markdown', content: 'Generic compact trace answer.' },
@@ -1075,7 +1138,7 @@ export function assertAcceptedPlanResourceResumePromptUsesPromptContent(): void 
         taskId: `task-${token}`,
         goal: `Use ${resourceRef}.`,
         targets: [resourceRef],
-        capabilities: ['fs.write'],
+        toolIds: ['fs.write'],
       },
       completedTaskCount: 0,
     },
@@ -1092,7 +1155,7 @@ export function assertAcceptedPlanResourceResumePromptUsesPromptContent(): void 
     currentTask: {
       goal: `Use ${resourceRef}.`,
       targets: [resourceRef],
-      capabilities: ['fs.write'],
+      toolIds: ['fs.write'],
       evidenceNeeds: ['current file text'],
     },
     requestProposal: {

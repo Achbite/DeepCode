@@ -55,7 +55,7 @@ export interface RequirementConfirmationCoordinatorPorts<
   now(): string;
   createId(prefix: string): string;
   assembleContext(input: ContextAssemblyInput): ContextAssemblyResult;
-  capabilityCatalogSummary(state: State): string;
+  toolCatalogSummary(state: State): string;
   collectUserGuidanceEvents(events: AgentEvent[], runId: string): UserGuidanceEvent[];
   buildProviderTurnContract(input: {
     contractId: string;
@@ -114,7 +114,7 @@ export class RequirementConfirmationCoordinator<
       contextAssemblyId: this.ports.createId('context-assembly'),
       workflowState: 'needDecisionRequest',
       allowedProposals: ['decisionRequest'],
-      capabilityCatalogSummary: this.ports.capabilityCatalogSummary(state),
+      toolCatalogSummary: this.ports.toolCatalogSummary(state),
       memoryDocument: state.memoryDocument,
       projectMemoryMode: input.projectMemoryMode,
       extraMemoryHints: state.memoryHints,

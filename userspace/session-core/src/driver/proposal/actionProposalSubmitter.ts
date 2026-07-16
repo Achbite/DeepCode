@@ -15,7 +15,7 @@ export interface ActionProposalSubmitterInput {
 
 export interface ActionProposalSubmitterState {
   sessionId: string;
-  acceptedImplementationPlan?: unknown;
+  acceptedTaskPlan?: unknown;
 }
 
 export interface ActionProposalSubmitterDiagnostic {
@@ -61,8 +61,8 @@ export class ActionProposalSubmitter<
     proposal: ProposalEnvelope,
     fallback: AgentSessionResult
   ): Promise<ProposalRouterResult> {
-    const executable = proposal.kind === 'taskOutcome' || Boolean(this.ports.readActionBundle(proposal));
-    if (state.acceptedImplementationPlan && executable) {
+    const executable = Boolean(this.ports.readActionBundle(proposal));
+    if (state.acceptedTaskPlan && executable) {
       return normalizeProposalRouterResult(
         await this.ports.submitAcceptedPlanActionProposal(input, state, prompt, proposal, fallback)
       );

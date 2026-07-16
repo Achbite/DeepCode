@@ -2,22 +2,26 @@ import type { AgentContextAttachment, AgentEvent, AgentSessionResult, AgentWorks
 import type { ProjectMemoryMode } from '../context/index.js';
 import type { ProjectWorkingDirectory } from '../context/types.js';
 import type { RequirementRecord } from '../requirement/types.js';
-import type { AcceptedImplementationPlanContext } from './execution/index.js';
+import type { AcceptedTaskPlanContext } from './execution/index.js';
 import type { InteractionOverlayContext } from './pipelines/interactionOverlayCodec.js';
 import type {
   AcceptedPlanReviewHandoffPlan,
   AcceptedPlanReviewHandoffRunInput,
 } from './review/acceptedPlanReviewHandoffCoordinator.js';
-import type { InterventionLevel, ReviewContinuationMode } from './types.js';
+import type { AutonomyMode, InterventionLevel, ReviewContinuationMode } from './types.js';
 
 export interface DecisionContinuationSource {
   sessionId: string;
   workspaceBinding?: AgentWorkspaceBinding;
   projectWorkingDirectory?: ProjectWorkingDirectory;
+  projectId?: string;
+  projectKind?: 'folder' | 'blank';
+  projectRootStatus?: 'ready' | 'unbound' | 'unavailable';
   profileId?: string;
   workflow?: string;
   reviewContinuationMode?: ReviewContinuationMode;
   interventionLevel?: InterventionLevel;
+  autonomyMode?: AutonomyMode;
   projectMemoryMode?: ProjectMemoryMode;
   interactionOverlay?: InteractionOverlayContext;
 }
@@ -29,6 +33,9 @@ export interface SessionLoopResumeInput {
   existingEvents?: AgentEvent[];
   workspaceBinding?: AgentWorkspaceBinding;
   projectWorkingDirectory?: ProjectWorkingDirectory;
+  projectId?: string;
+  projectKind?: 'folder' | 'blank';
+  projectRootStatus?: 'ready' | 'unbound' | 'unavailable';
   profileId?: string;
   workflow?: string;
   appendUserMessage: false;
@@ -36,9 +43,10 @@ export interface SessionLoopResumeInput {
   requirementConfirmationMode: 'off' | 'always';
   reviewContinuationMode?: ReviewContinuationMode;
   interventionLevel?: InterventionLevel;
+  autonomyMode?: AutonomyMode;
   projectMemoryMode?: ProjectMemoryMode;
   resumeResourcePackets?: boolean;
-  acceptedImplementationPlan?: AcceptedImplementationPlanContext;
+  acceptedTaskPlan?: AcceptedTaskPlanContext;
   interactionOverlay?: InteractionOverlayContext;
 }
 
@@ -63,12 +71,12 @@ export interface DecisionContinuationOverride {
   reviewContinuationMode?: ReviewContinuationMode;
   resumeResourcePackets?: boolean;
   confirmedRequirement?: RequirementRecord;
-  acceptedImplementationPlan?: AcceptedImplementationPlanContext;
+  acceptedTaskPlan?: AcceptedTaskPlanContext;
   interactionOverlay?: InteractionOverlayContext;
 }
 
 export interface AcceptedPlanContinuationOverride extends DecisionContinuationOverride {
-  acceptedImplementationPlan: AcceptedImplementationPlanContext;
+  acceptedTaskPlan: AcceptedTaskPlanContext;
 }
 
 export type DecisionContinuationInput<Extra extends object = Record<string, never>> = {
@@ -78,16 +86,20 @@ export type DecisionContinuationInput<Extra extends object = Record<string, neve
   existingEvents?: AgentEvent[];
   workspaceBinding?: AgentWorkspaceBinding;
   projectWorkingDirectory?: ProjectWorkingDirectory;
+  projectId?: string;
+  projectKind?: 'folder' | 'blank';
+  projectRootStatus?: 'ready' | 'unbound' | 'unavailable';
   profileId?: string;
   workflow?: string;
   appendUserMessage: false;
   requirementConfirmationMode: 'off';
   reviewContinuationMode?: ReviewContinuationMode;
   interventionLevel?: InterventionLevel;
+  autonomyMode?: AutonomyMode;
   projectMemoryMode?: ProjectMemoryMode;
   resumeResourcePackets?: boolean;
   confirmedRequirement?: RequirementRecord;
-  acceptedImplementationPlan?: AcceptedImplementationPlanContext;
+  acceptedTaskPlan?: AcceptedTaskPlanContext;
   interactionOverlay?: InteractionOverlayContext;
 } & Extra;
 
@@ -104,7 +116,7 @@ export function decisionContinuationInput<Extra extends object = Record<string, 
     reviewContinuationMode,
     resumeResourcePackets,
     confirmedRequirement,
-    acceptedImplementationPlan,
+    acceptedTaskPlan,
     interactionOverlay,
     ...extra
   } = override;
@@ -118,16 +130,20 @@ export function decisionContinuationInput<Extra extends object = Record<string, 
     existingEvents,
     workspaceBinding: hasWorkspaceBindingOverride ? workspaceBinding : source.workspaceBinding,
     projectWorkingDirectory: hasProjectWorkingDirectoryOverride ? projectWorkingDirectory : source.projectWorkingDirectory,
+    projectId: source.projectId,
+    projectKind: source.projectKind,
+    projectRootStatus: source.projectRootStatus,
     profileId: source.profileId,
     workflow: source.workflow,
     appendUserMessage: false,
     requirementConfirmationMode: 'off',
     reviewContinuationMode: reviewContinuationMode ?? source.reviewContinuationMode,
     interventionLevel: source.interventionLevel,
+    autonomyMode: source.autonomyMode,
     projectMemoryMode: source.projectMemoryMode,
     resumeResourcePackets,
     confirmedRequirement,
-    acceptedImplementationPlan,
+    acceptedTaskPlan,
     interactionOverlay: interactionOverlay ?? source.interactionOverlay,
   } as DecisionContinuationInput<Extra>;
 }

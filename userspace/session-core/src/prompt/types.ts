@@ -57,7 +57,7 @@ export interface PromptSegment {
 export interface PromptEnvelopeBuilderInput {
   workflowState: string;
   allowedProposals: string[];
-  capabilityCatalogSummary: string;
+  toolCatalogSummary: string;
   builtinSystemPromptVersion?: string;
   providerProfileSystemContract?: string;
   compiledRuler?: CompiledRuler;

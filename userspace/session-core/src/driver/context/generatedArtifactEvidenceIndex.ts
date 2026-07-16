@@ -11,7 +11,7 @@ export interface GeneratedArtifactEvidence {
   content: string;
   contentHash: string;
   manifestEntryId: string;
-  sourceBlockId?: string;
+  contentBlockId?: string;
   actionId?: string;
   workUnitId?: string;
 }
@@ -25,13 +25,8 @@ export interface GeneratedArtifactEvidenceIndexPorts {
   normalizeRelativePath(value: string | undefined): string | undefined;
   comparablePath(value: string): string;
   batchActionRecords(batch: unknown): Record<string, unknown>[];
-  actionEffectiveCapability(action: { capability?: unknown; toolId?: unknown }): string;
-  actionFileTargetPath(action: {
-    targetRef?: unknown;
-    targetPath?: unknown;
-    resourceScope?: unknown;
-    args?: unknown;
-  }): string | undefined;
+  actionToolId(action: { toolId?: unknown }): string;
+  actionFileTargetPath(action: { args?: unknown }): string | undefined;
   completedWorkUnitFacts(events: unknown[]): CompletedWorkUnitFacts;
   completedActionMatches(actionId: string | undefined, targetPath: string, completed: CompletedWorkUnitFacts): boolean;
   codeBlockContent(block: Record<string, unknown>): string | undefined;
@@ -82,25 +77,24 @@ export class GeneratedArtifactEvidenceIndex {
   ): ResourcePacket | undefined {
     const completed = this.ports.completedWorkUnitFacts(events);
     if (completed.actionIds.size === 0 && completed.targets.size === 0) return undefined;
-    const codeBlocks = Array.isArray(batch.codeBlocks) ? batch.codeBlocks : [];
-    const codeBlockById = new Map<string, Record<string, unknown>>();
-    for (const block of codeBlocks) {
+    const contentBlocks = Array.isArray(batch.contentBlocks) ? batch.contentBlocks : [];
+    const contentBlockById = new Map<string, Record<string, unknown>>();
+    for (const block of contentBlocks) {
       const record = objectRecord(block);
-      const id = stringValue(record?.id) ?? stringValue(record?.blockId);
-      if (record && id) codeBlockById.set(id, record);
+      const id = stringValue(record?.blockId);
+      if (record && id) contentBlockById.set(id, record);
     }
     const items: ResourcePacketItem[] = [];
     for (const action of this.ports.batchActionRecords(batch)) {
-      const capability = this.ports.actionEffectiveCapability(action);
+      const capability = this.ports.actionToolId(action);
       if (capability !== 'fs.write' && capability !== 'fs.create') continue;
-      const actionId = stringValue(action.actionId) ?? stringValue(action.id);
-      const args = objectRecord(action.args) ?? objectRecord(action.toolArgs);
-      const sourceBlockId = stringValue(action.sourceBlockId) ?? stringValue(args?.sourceBlockId);
-      const block = sourceBlockId ? codeBlockById.get(sourceBlockId) : undefined;
+      const actionId = stringValue(action.actionId);
+      const args = objectRecord(action.args);
+      const contentBlockId = stringValue(args?.contentBlockId);
+      const block = contentBlockId ? contentBlockById.get(contentBlockId) : undefined;
       const targetPath = this.ports.normalizeRelativePath(
         this.ports.actionFileTargetPath(action) ??
-        stringValue(block?.targetPath) ??
-        stringValue(block?.path)
+        stringValue(block?.targetPath)
       );
       if (!targetPath || targetPath === '.') continue;
       if (!this.ports.completedActionMatches(actionId, targetPath, completed)) continue;
@@ -114,7 +108,7 @@ export class GeneratedArtifactEvidenceIndex {
         content,
         contentHash,
         manifestEntryId,
-        sourceBlockId,
+        contentBlockId,
         actionId,
       });
       items.push({

@@ -57,7 +57,7 @@ export class ProviderEmptyProposalRetry {
         : [
           'The previous provider turn returned no JSON proposal.',
           'Use the already supplied user request, confirmed decisions, ResourcePacket/tool facts, and current task context.',
-          'Return exactly one valid Agent Protocol v3 JSON proposal now.',
+          'Return exactly one valid Agent Protocol v4 JSON proposal now.',
           'Do not explain the empty response. Do not restate protocol rules. Do not claim execution facts, permissions, validation, or task completion.',
         ].join('\n'),
     };

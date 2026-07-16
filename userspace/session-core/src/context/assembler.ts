@@ -69,6 +69,9 @@ export interface ContextAssemblyResourceBlockRecord {
   blockKey: string;
   displayRef: string;
   manifestEntryId: string;
+  rootId?: string;
+  path?: string;
+  listedPaths?: string[];
   retention: ResourcePromptBlock['retention'];
   status: ResourcePromptBlock['status'];
   readPolicy: ResourcePromptBlock['readPolicy'];
@@ -285,7 +288,7 @@ export interface ContextAssemblyRecord {
 export interface ContextAssemblyInput {
   workflowState: string;
   allowedProposals: string[];
-  capabilityCatalogSummary: string;
+  toolCatalogSummary: string;
   userRequest: string;
   existingEvents?: AgentEvent[];
   initialContext?: InitialContextPacket;
@@ -339,7 +342,7 @@ export function assembleContext(input: ContextAssemblyInput): ContextAssemblyRes
   const promptInput: PromptEnvelopeBuilderInput = {
     workflowState: input.workflowState,
     allowedProposals: input.allowedProposals,
-    capabilityCatalogSummary: input.capabilityCatalogSummary,
+    toolCatalogSummary: input.toolCatalogSummary,
     projectMemoryHints: renderProjectMemoryHints(memoryDocument),
     projectMemoryRecallHints: renderProjectMemoryRecallHints(memoryDocument),
     sessionMemoryHints: [
@@ -446,7 +449,7 @@ export function assembleContext(input: ContextAssemblyInput): ContextAssemblyRes
     dynamicSuffixHash: canonical.dynamicSuffixHash,
     cacheHash: canonical.cacheHash,
     auditHash: canonical.auditHash,
-    catalogHash: stableHash(input.capabilityCatalogSummary || 'none'),
+    catalogHash: stableHash(input.toolCatalogSummary || 'none'),
     stateContractHash: stableHash([
       input.workflowState,
       ...input.allowedProposals,
@@ -832,6 +835,9 @@ function contextAssemblyResourceBlock(block: ResourcePromptBlock): ContextAssemb
     blockKey: block.blockKey,
     displayRef: block.displayRef,
     manifestEntryId: block.manifestEntryId,
+    rootId: block.rootId,
+    path: block.path,
+    listedPaths: block.listedPaths ? [...block.listedPaths] : undefined,
     retention: block.retention,
     status: block.status,
     readPolicy: block.readPolicy,

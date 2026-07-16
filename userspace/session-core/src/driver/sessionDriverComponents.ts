@@ -1,18 +1,14 @@
 import type { PromptEnvelope } from '../prompt/types.js';
 import {
   buildReviewFactsContext,
+  planInteractionAwaitsDecision,
   type TaskLedgerSnapshot,
 } from '../run-state/index.js';
 import {
-  AcceptedImplementationPlanContextBuilder,
-  AcceptedPlanAdmission,
+  AcceptedTaskPlanContextBuilder,
   AcceptedPlanBatchPreflight,
   AcceptedPlanExecutionRootResolver,
   AcceptedPlanExecutor,
-  AcceptedPlanOperationTargetResolver,
-  AcceptedPlanScopeCoverage,
-  AcceptedPlanScopeDecisionOverlay,
-  AcceptedPlanScopeMatcher,
   AcceptedPlanTargetParser,
   AcceptedPlanTaskLedgerCoordinator,
   ActionBatchFailureIndex,
@@ -21,7 +17,7 @@ import {
   ImplementationBatchContextBuilder,
   KernelEventStatusIndex,
   RepairLoop,
-  type AcceptedImplementationPlanContext,
+  type AcceptedTaskPlanContext,
 } from './execution/index.js';
 import {
   ActionBundleActionInspector,
@@ -80,7 +76,6 @@ import { clip, objectRecord, stringValue, visibleLanguageForRequest } from './ru
 
 const MAX_DERIVED_MANIFEST_ENTRIES = 240;
 const RESOURCE_MANIFEST_MAX_BYTES = 512 * 1024;
-export const MAX_ACTION_BUNDLE_TOTAL_CODE_BYTES = 384 * 1024;
 
 export const providerPipeline = new ProviderPipeline();
 export const providerJsonModeCoordinator = new ProviderJsonModeCoordinator();
@@ -109,8 +104,8 @@ export const planContextIndex = new PlanContextIndex({
   executionRootFromPayload: (payload) => AcceptedPlanExecutionRootResolver.fromPayload(payload),
 });
 export const planInteractionIndex = new PlanInteractionIndex<SessionPlanContext>({
-  planCardAwaitingDecision: (payload) => planReviewReportAnalyzer.planCardAwaitingDecision(payload),
-  planReviewEventAwaitingDecision: (payload) => planReviewReportAnalyzer.planReviewEventAwaitingDecision(payload),
+  planCardAwaitingDecision: planInteractionAwaitsDecision,
+  planReviewEventAwaitingDecision: planInteractionAwaitsDecision,
   planContextFromEvent: (event, payload) => planContextIndex.contextFromEvent(event, payload),
   findPlanCard: (events, runId, planId) => planContextIndex.findPlanCard(events, runId, planId),
   planAlreadyResolved: (events, plan) => planContextIndex.alreadyResolved(events, plan),
@@ -121,13 +116,12 @@ export const driverInteractionIndex = new DriverInteractionIndex({
   latestActiveRequirementInteraction: (events) => userInputPipeline.findLatestActiveRequirementInteraction(events),
   findPlanCard: (events, runId, planId) => planContextIndex.findPlanCard(events, runId, planId),
   executionRootFromDecision: (input, events) => AcceptedPlanExecutionRootResolver.fromDecision(input, events),
-  buildAcceptedPlan: (input) => acceptedImplementationPlanContextBuilder().build(input),
+  buildAcceptedPlan: (input) => acceptedTaskPlanContextBuilder().build(input),
   recoverLatestCheckpoint: (input) => acceptedPlanTaskLedger().recoverLatestCheckpoint(input),
   recordTaskCompletion: (input) => acceptedPlanTaskLedger().recordTaskCompletion(input),
 });
 export const kernelEventProjectionBuilder = new KernelEventProjectionBuilder({
   requiredFileOperationsFromReport: (report) => planReviewGrantProjector.requiredFileOperationsFromReport(report),
-  requiredAccessScopesFromReport: (report) => planReviewGrantProjector.requiredAccessScopesFromReport(report),
   permissionBundlesFromReport: (report) => planReviewGrantProjector.permissionBundlesFromReport(report),
   gateInterventionsFromReport: (report) => planReviewGrantProjector.gateInterventionsFromReport(report),
   planReviewFacts: (report) => planReviewReportAnalyzer.facts(report),
@@ -135,7 +129,6 @@ export const kernelEventProjectionBuilder = new KernelEventProjectionBuilder({
 export const planProjectionBuilder = new PlanProjectionBuilder({
   readActionBundle: (proposal) => driverActivityBuilder.readActionBundle(proposal),
   requiredFileOperationsFromReport: (report) => planReviewGrantProjector.requiredFileOperationsFromReport(report),
-  requiredAccessScopesFromReport: (report) => planReviewGrantProjector.requiredAccessScopesFromReport(report),
   permissionBundlesFromReport: (report) => planReviewGrantProjector.permissionBundlesFromReport(report),
   gateInterventionsFromReport: (report) => planReviewGrantProjector.gateInterventionsFromReport(report),
   planReviewFacts: (report) => planReviewReportAnalyzer.facts(report),
@@ -163,13 +156,13 @@ export const sessionFailureProjectionBuilder = new SessionFailureProjectionBuild
   actionBatchFailureSummary: (failure) => actionBatchFailureIndex.summary(failure),
   sessionRunStateEvent: (input) => sessionProgressProjectionBuilder.sessionRunStateEvent(input),
 });
-export const reviewProjectionBuilder = new ReviewProjectionBuilder<SessionPlanContext, AcceptedImplementationPlanContext, TaskLedgerSnapshot>({
+export const reviewProjectionBuilder = new ReviewProjectionBuilder<SessionPlanContext, AcceptedTaskPlanContext, TaskLedgerSnapshot>({
   reviewFactLines: (kernelEvents) => reviewAssembler().reviewFactLines(kernelEvents),
   staticSyntaxReviewFactLines: (kernelEvents) => reviewAssembler().staticSyntaxReviewFactLines(kernelEvents),
   findReviewFacts: (kernelEvents) => reviewAssembler().findReviewFacts(kernelEvents),
   concreteContinuationExpectations: (value) => implementationBatchContextBuilder().concreteContinuationExpectations(value),
-  acceptedPlanContext: (plan) => plan.implementationPlan
-    ? acceptedImplementationPlanContextBuilder().build({ plan, interventionLevel: undefined, executionRoot: plan.executionRoot })
+  acceptedPlanContext: (plan) => plan.taskPlan
+    ? acceptedTaskPlanContextBuilder().build({ plan, interventionLevel: undefined, executionRoot: plan.executionRoot })
     : undefined,
   acceptedPlanBatchCompletedTaskIds: (acceptedPlan, plan, kernelEvents) =>
     acceptedPlanTaskLedger().recordKernelBatchProgress({ acceptedPlan, proposal: planContextIndex.proposalEnvelope(plan), kernelEvents }).completedTaskIds,
@@ -184,36 +177,8 @@ export const pathIdentity = new PathIdentity();
 export const providerContextSupport = new ProviderContextSupport({
   acceptedContext: (acceptedPlan) => executionPromptCoordinator().sanitizedContext(acceptedPlan),
 });
-export const acceptedPlanScopeMatcher = new AcceptedPlanScopeMatcher();
-export const acceptedPlanScopeCoverage = new AcceptedPlanScopeCoverage({
-  taskTargets: (task) => acceptedPlanTargetParser.taskTargets(task),
-});
-export const acceptedPlanOperationTargetResolver = new AcceptedPlanOperationTargetResolver({
-  normalizeTargetScope: (value, accepted) => acceptedPlanScopeMatcher.normalizeTargetScope(value, accepted),
-  normalizePlanScope: (value) => pathIdentity.normalizePlanScope(value),
-  concreteDirectoryOperationTarget: (value) => planReviewGrantProjector.concreteDirectoryOperationTarget(value),
-  concreteFileOperationTarget: (value) => planReviewGrantProjector.concreteFileOperationTarget(value),
-  exactGrantCapabilityMatches: (grant, capability) => acceptedPlanScopeCoverage.exactGrantCapabilityMatches(grant, capability),
-  actionEffectiveCapability: (action) => actionBundleActionInspector.actionEffectiveCapability(action),
-  actionFileTargetPath: (action) => actionBundleActionInspector.actionFileTargetPath(action),
-});
-export const acceptedPlanScopeDecisionOverlay = new AcceptedPlanScopeDecisionOverlay({
-  planAcceptedAutoGrantCapability: (capability) => planReviewGrantProjector.planAcceptedAutoGrantCapability(capability),
-  concreteDirectoryOperationTarget: (value) => planReviewGrantProjector.concreteDirectoryOperationTarget(value),
-  concreteFileOperationTarget: (value) => planReviewGrantProjector.concreteFileOperationTarget(value),
-  normalizeAcceptedPlanExactOperationGrants: (grants, executionRoot) =>
-    planReviewGrantProjector.normalizeAcceptedPlanExactOperationGrants(grants, executionRoot),
-  normalizeTargetForExecutionRoot: (value, executionRoot) =>
-    acceptedPlanScopeMatcher.normalizeTargetForExecutionRoot(value, executionRoot),
-});
 export const acceptedPlanBatchPreflight = new AcceptedPlanBatchPreflight({
   batchActionRecords: (batch) => driverActivityBuilder.batchActionRecords(batch),
-  actionEffectiveCapability: (action) => actionBundleActionInspector.actionEffectiveCapability(action),
-  actionFileTargetPath: (action) => actionBundleActionInspector.actionFileTargetPath(action),
-  deleteActionTargetResourceKind: (action) => actionBundleActionInspector.deleteActionTargetResourceKind(action),
-  deleteActionRecursive: (action) => actionBundleActionInspector.deleteActionRecursive(action),
-  normalizePlanScope: (value) => pathIdentity.normalizePlanScope(value),
-  containsDirectoryPath: (resourcePackets, path) => resourceRequestLoop.containsDirectoryPath(resourcePackets, path),
 });
 export const completedWorkUnitFactIndex = new CompletedWorkUnitFactIndex({
   kernelEventTargets: (record) => kernelEventProjectionBuilder.kernelEventTargets(record),
@@ -225,22 +190,8 @@ export const nativeToolExposurePolicy = new NativeToolExposurePolicy();
 export const nativeToolTurnHandler = new NativeToolTurnHandler();
 export const acceptedPlanExecutor = new AcceptedPlanExecutor({
   readActionBundle: (proposal) => driverActivityBuilder.readActionBundle(proposal),
-  operationTargetResolver: acceptedPlanOperationTargetResolver,
-  actionFileTargetPath: (action) => actionBundleActionInspector.actionFileTargetPath(action),
-  fileTargetRefFromPath: (path) => actionBundleActionInspector.fileTargetRefFromPath(path),
-  deleteActionTargetResourceKind: (action) => actionBundleActionInspector.deleteActionTargetResourceKind(action),
-  deleteActionRecursive: (action) => actionBundleActionInspector.deleteActionRecursive(action),
-  containsDirectoryPath: (resourcePackets, path) => resourceRequestLoop.containsDirectoryPath(resourcePackets, path),
   kernelExecutionContractId: (report) => planReviewGrantProjector.kernelExecutionContractId(report),
-  proposalTargetScopes: (proposal, accepted) =>
-    acceptedPlanScopeMatcher.proposalTargetScopes(proposal, accepted).map((target) => target.normalized),
-  actionTargetScopes: (action, proposal, accepted) =>
-    acceptedPlanScopeMatcher.actionTargetScopes(action, proposal)
-      .map((target) => acceptedPlanScopeMatcher.normalizeTargetScope(target, accepted))
-      .filter(Boolean),
-  scopeCoveredForCapability: (scope, capability, accepted) =>
-    acceptedPlanScopeCoverage.scopeCoveredForCapability(scope, capability, accepted),
-  resourceEvidenceIndex: resourceEvidenceIndex(),
+  kernelExecutionContractHash: (report) => planReviewGrantProjector.kernelExecutionContractHash(report),
 });
 export const contextFrameBuilder = new ContextFrameBuilder();
 export const resourceRequestLoop = new ResourceRequestLoop({
@@ -260,9 +211,9 @@ export const nativeToolProviderLoop = new NativeToolProviderLoop<SessionDriverLo
 export const PROVIDER_REASONING_FLUSH_CHARS = 768;
 export const PROVIDER_REASONING_FLUSH_MS = 120;
 export { VISIBLE_REASONING_MAX_CHARS };
-export const SIDE_EFFECT_CAPABILITIES = new Set([
+export const SIDE_EFFECT_TOOL_IDS = new Set([
   'fs.write',
-  'fs.patch',
+  'fs.edit',
   'fs.delete',
   'fs.rename',
   'process.exec',
@@ -274,7 +225,7 @@ export const SIDE_EFFECT_CAPABILITIES = new Set([
   'provider.egress',
 ]);
 export const providerTurnPolicy = new ProviderTurnPolicy({
-  sideEffectCapabilities: SIDE_EFFECT_CAPABILITIES,
+  sideEffectToolIds: SIDE_EFFECT_TOOL_IDS,
 });
 export const driverFailureMessageCatalog = new DriverFailureMessageCatalog();
 export const driverParseErrorCatalog = new DriverParseErrorCatalog();
@@ -304,7 +255,7 @@ export function generatedArtifactEvidenceIndex(): GeneratedArtifactEvidenceIndex
     normalizeRelativePath: (value) => pathIdentity.normalizeRelativePath(value),
     comparablePath: (value) => pathIdentity.comparablePath(value),
     batchActionRecords: (batch) => driverActivityBuilder.batchActionRecords(batch),
-    actionEffectiveCapability: (action) => actionBundleActionInspector.actionEffectiveCapability(action),
+    actionToolId: (action) => actionBundleActionInspector.actionToolId(action),
     actionFileTargetPath: (action) => actionBundleActionInspector.actionFileTargetPath(action),
     completedWorkUnitFacts: (events) => completedWorkUnitFactIndex.completedWorkUnitFacts(events),
     completedActionMatches: (actionId, targetPath, completed) =>
@@ -317,29 +268,18 @@ export function generatedArtifactEvidenceIndex(): GeneratedArtifactEvidenceIndex
 
 export function implementationBatchContextBuilder(): ImplementationBatchContextBuilder {
   return new ImplementationBatchContextBuilder({
-    concreteFileOperationTarget: (value) => planReviewGrantProjector.concreteFileOperationTarget(value),
+    concreteFileOperationTarget: (value) => {
+      const normalized = pathIdentity.normalizePlanScope(value);
+      return normalized && normalized !== '.' ? normalized : undefined;
+    },
   });
 }
 
-export function acceptedImplementationPlanContextBuilder(): AcceptedImplementationPlanContextBuilder {
-  return new AcceptedImplementationPlanContextBuilder({
+export function acceptedTaskPlanContextBuilder(): AcceptedTaskPlanContextBuilder {
+  return new AcceptedTaskPlanContextBuilder({
     normalizePlanScope: (value) => pathIdentity.normalizePlanScope(value),
     uniqueStrings: (values) => driverActivityBuilder.uniqueStrings(values),
     acceptedPlanTaskTargets: (record) => acceptedPlanTargetParser.taskTargets(record),
-    exactOperationGrantsFromImplementationPlan: (plan, executionRoot) =>
-      planReviewGrantProjector.exactOperationGrantsFromImplementationPlan(plan, executionRoot),
-    exactOperationGrantsFromPlanReviewReport: (report, executionRoot) =>
-      planReviewGrantProjector.exactOperationGrantsFromPlanReviewReport(report, executionRoot),
-    accessScopesFromImplementationPlan: (plan) => planReviewGrantProjector.accessScopesFromImplementationPlan(plan),
-    requiredAccessScopesFromReport: (report) => planReviewGrantProjector.requiredAccessScopesFromReport(report),
-  });
-}
-
-export function acceptedPlanAdmission(): AcceptedPlanAdmission {
-  return new AcceptedPlanAdmission({
-    scopeMatcher: new AcceptedPlanScopeMatcher(),
-    fileOperationFreshnessReasons: (accepted, proposal, resourcePackets) =>
-      acceptedPlanExecutor.fileOperationFreshnessValidationReasons(accepted, proposal, resourcePackets),
   });
 }
 
@@ -354,10 +294,9 @@ export function reviewAssembler(): ReviewAssembler {
   return new ReviewAssembler({
     completedWorkUnitFacts: (events) => completedWorkUnitFactIndex.completedWorkUnitFacts(events),
     batchActionRecords: (batch) => driverActivityBuilder.batchActionRecords(batch),
-    actionEffectiveCapability: (action) => actionBundleActionInspector.actionEffectiveCapability(action),
+    actionToolId: (action) => actionBundleActionInspector.actionToolId(action),
     actionFileTargetPath: (action) => actionBundleActionInspector.actionFileTargetPath(action),
-    normalizeAcceptedPlanTargetScope: (value, accepted) =>
-      acceptedPlanScopeMatcher.normalizeTargetScope(value, accepted),
+    normalizeAcceptedPlanTargetScope: (value) => pathIdentity.normalizePlanScope(value),
     comparablePath: (value) => pathIdentity.comparablePath(value),
     resourceTextForTarget: (packets, target) => resourceEvidenceIndex().textForTarget(packets, target),
   });
@@ -370,7 +309,6 @@ export function reviewDecisionProjection(): ReviewDecisionProjectionBuilder {
 export function protocolGate(): ProtocolGate {
   const validator = proposalSemanticValidator();
   return new ProtocolGate({
-    canonicalizeWriteActionSourceBlockRefs: (proposal) => validator.canonicalizeWriteActionSourceBlockRefs(proposal),
     ensureReviewableExpectations: (proposal) => executionPromptCoordinator().ensureReviewableExpectations(proposal),
     validateProposalSemantics: (proposal, options) => validator.validateProposalSemantics(proposal, options),
   });
@@ -378,25 +316,21 @@ export function protocolGate(): ProtocolGate {
 
 export function proposalSemanticValidator(): ProposalSemanticValidator {
   return new ProposalSemanticValidator({
-    maxActionBundleTotalCodeBytes: MAX_ACTION_BUNDLE_TOTAL_CODE_BYTES,
-    sideEffectCapabilities: SIDE_EFFECT_CAPABILITIES,
+    sideEffectToolIds: SIDE_EFFECT_TOOL_IDS,
     readActionBundle: (proposal) => driverActivityBuilder.readActionBundle(proposal),
-    actionEffectiveCapability: (action) => actionBundleActionInspector.actionEffectiveCapability(action),
+    actionToolId: (action) => actionBundleActionInspector.actionToolId(action),
     actionFileTargetPath: (action) => actionBundleActionInspector.actionFileTargetPath(action),
-    deleteActionTargetResourceKind: (action) => actionBundleActionInspector.deleteActionTargetResourceKind(action),
-    deleteActionRecursive: (action) => actionBundleActionInspector.deleteActionRecursive(action),
   });
 }
 
 export function executionPromptCoordinator(): ExecutionPromptCoordinator<SessionPlanContext> {
   const validator = proposalSemanticValidator();
   return new ExecutionPromptCoordinator<SessionPlanContext>({
-    maxActionBundleTotalCodeBytes: MAX_ACTION_BUNDLE_TOTAL_CODE_BYTES,
-    sideEffectCapabilities: SIDE_EFFECT_CAPABILITIES,
+    sideEffectToolIds: SIDE_EFFECT_TOOL_IDS,
     objectRecord,
     stringValue,
     planId: (plan) => plan.planId,
-    actionEffectiveCapability: (action) => actionBundleActionInspector.actionEffectiveCapability(action),
+    actionToolId: (action) => actionBundleActionInspector.actionToolId(action),
     isDetailedUserPlanMarkdown: (userPlan) => validator.isDetailedUserPlanMarkdown(userPlan),
     defaultActionBundleUserPlanMarkdown: (input) => validator.defaultActionBundleUserPlanMarkdown(input),
     expectationsHaveDescription: (value) => validator.expectationsHaveDescription(value),

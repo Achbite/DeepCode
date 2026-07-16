@@ -1,5 +1,6 @@
 import type { TranscriptEntry, TranscriptStore } from './transcript.js';
 import type { SessionMemorySnapshot } from './context/memory.js';
+import type { PromptLedgerWireRecord } from './prompt/promptLedger.js';
 
 export class SessionStorageClient {
   constructor(private readonly baseUrl = '') {}
@@ -43,6 +44,44 @@ export class SessionStorageClient {
       throw new Error(value.message ?? value.error ?? 'persist memory archive failed');
     }
   }
+
+  async listWireLedger(sessionId: string): Promise<PromptLedgerWireRecord[]> {
+    const response = await fetch(`${this.baseUrl}/api/session-store/${encodeURIComponent(sessionId)}/wire-ledger`);
+    if (!response.ok) throw new Error(`list wire ledger failed: HTTP ${response.status}`);
+    const value = await response.json();
+    assertSessionStoreResponse(value, 'list wire ledger failed');
+    return (value.data?.entries ?? []) as PromptLedgerWireRecord[];
+  }
+
+  async appendWireLedger(sessionId: string, entries: PromptLedgerWireRecord[]): Promise<void> {
+    if (entries.length === 0) return;
+    const response = await fetch(`${this.baseUrl}/api/session-store/${encodeURIComponent(sessionId)}/wire-ledger`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ entries }),
+    });
+    if (!response.ok) throw new Error(`append wire ledger failed: HTTP ${response.status}`);
+    assertSessionStoreResponse(await response.json(), 'append wire ledger failed');
+  }
+
+  async appendCacheTelemetry(sessionId: string, entry: Record<string, unknown>): Promise<void> {
+    const response = await fetch(`${this.baseUrl}/api/session-store/${encodeURIComponent(sessionId)}/cache-telemetry`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ entry }),
+    });
+    if (!response.ok) throw new Error(`append cache telemetry failed: HTTP ${response.status}`);
+    assertSessionStoreResponse(await response.json(), 'append cache telemetry failed');
+  }
+}
+
+function assertSessionStoreResponse(value: unknown, fallback: string): void {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return;
+  const response = value as Record<string, unknown>;
+  if (response.ok !== false) return;
+  const detail = [response.error, response.message]
+    .find((item): item is string => typeof item === 'string' && item.trim().length > 0);
+  throw new Error(detail ? `${fallback}: ${detail}` : fallback);
 }
 
 export class HttpTranscriptStore implements TranscriptStore {

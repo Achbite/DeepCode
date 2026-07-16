@@ -1,4 +1,4 @@
-import type { KernelPlanReviewReport } from '@deepcode/protocol';
+import type { KernelProposalReviewReport } from '@deepcode/protocol';
 import type { ActionBundleDraft, ValidationExpectationDraft } from '../protocol/types.js';
 
 export type ReviewPacketStatus = 'selfChecked' | 'waitingUserReview' | 'accepted' | 'revisionRequested';
@@ -32,7 +32,7 @@ export interface ReviewSelfCheckInput {
   userRequest: string;
   userPlan?: string;
   actionBundle?: ActionBundleDraft;
-  kernelPlanReview?: KernelPlanReviewReport;
+  kernelProposalReview?: KernelProposalReviewReport;
   permissionDecisions: ReviewPermissionDecision[];
   toolResults: ReviewToolResult[];
   validationCandidates: ValidationExpectationDraft[];

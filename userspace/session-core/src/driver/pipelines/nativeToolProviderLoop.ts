@@ -9,6 +9,7 @@ import type {
   NativeToolTurnHandlerPorts,
   NativeToolTurnHandlerState,
   NativeToolTurnResult,
+  NativeToolHandlingResult,
 } from '../../provider/NativeToolTurnHandler.js';
 import type { NativeToolCallProposal } from '../../provider/providerStreamParts.js';
 import type {
@@ -17,6 +18,7 @@ import type {
 } from './providerPipeline.js';
 import type { DriverProviderTurnFrame } from '../runFrame.js';
 import { SessionSemanticDirectiveError } from '../../provider/SessionSemanticToolAdapter.js';
+import type { AcceptedTaskReplanReason } from '../execution/artifactDraftReplanCoordinator.js';
 
 export interface NativeToolProviderPipelineLike<
   TState extends NativeToolTurnHandlerState,
@@ -33,6 +35,10 @@ export interface NativeToolProviderResumeSignal {
 export interface NativeToolProviderLoopState extends NativeToolTurnHandlerState {
   semanticDirectiveRepairAttempted?: boolean;
   semanticDirectiveErrorSummary?: string;
+  artifactChunkRepairAttempts?: Record<string, number>;
+  semanticDirectiveRepairAttempts?: Record<string, number>;
+  resourceEvidenceRevision?: number;
+  taskPlanReplanReason?: AcceptedTaskReplanReason;
 }
 
 export interface NativeToolProviderTurnHandlerLike<
@@ -40,7 +46,7 @@ export interface NativeToolProviderTurnHandlerLike<
   TPrompt,
   TTurn extends NativeToolTurnResult,
 > {
-  handle(input: NativeToolTurnHandlerInput<TState, TPrompt, TTurn>): Promise<{ kind: 'proposal'; proposal: ProposalEnvelope }>;
+  handle(input: NativeToolTurnHandlerInput<TState, TPrompt, TTurn>): Promise<NativeToolHandlingResult>;
 }
 
 export interface NativeToolProviderLoopDependencies<
@@ -72,6 +78,8 @@ export interface NativeToolProviderLoopInput<
   ): Promise<TTurn>;
   isEmptyResponseError(error: unknown): boolean;
   semanticDirectiveError(error: unknown): { code: string; message: string } | undefined;
+  onArtifactDraftBudgetExceeded(state: TState, error: SessionSemanticDirectiveError): Promise<void>;
+  createError?(code: string, message: string): Error;
 }
 
 export class NativeToolProviderLoop<
@@ -99,19 +107,26 @@ export class NativeToolProviderLoop<
     } catch (error) {
       const directiveError = input.semanticDirectiveError(error);
       if (!directiveError) throw error;
-      return this.scheduleSameProfileRetry(input.state, [
+      return this.scheduleSameProfileRetry(input, [
         `code=${directiveError.code}`,
         `fieldErrors=${directiveError.message}`,
-      ]);
+      ], directiveError.code, directiveError.code);
     }
     const toolCalls = effectiveTurn.toolCalls as NativeToolCallProposal[];
     const registeredNames = new Set(input.providerTools.map((tool) => tool.name));
     const unregistered = toolCalls.find((toolCall) => !registeredNames.has(toolCall.name));
     if (unregistered) {
-      throw new Error(`Provider emitted unregistered Session semantic tool ${unregistered.name}.`);
+      return this.scheduleSameProfileRetry(input, [
+        'code=native_tool_arguments_invalid',
+        `tool=${unregistered.name}`,
+        'fieldErrors=Provider emitted an unregistered Session semantic tool.',
+      ], `semantic:unregistered:${unregistered.name}:evidence-${input.state.resourceEvidenceRevision ?? 0}`, 'native_tool_arguments_invalid');
     }
     if (toolCalls.length === 0) {
-      throw new Error('Provider did not emit a required Session semantic directive.');
+      return this.scheduleSameProfileRetry(input, [
+        'code=native_tool_arguments_invalid',
+        'fieldErrors=Provider did not emit a required Session semantic directive.',
+      ], `semantic:missing:evidence-${input.state.resourceEvidenceRevision ?? 0}`, 'native_tool_arguments_invalid');
     }
 
     try {
@@ -124,26 +139,56 @@ export class NativeToolProviderLoop<
       });
       input.state.semanticDirectiveRepairAttempted = false;
       input.state.semanticDirectiveErrorSummary = undefined;
-      return handled.proposal;
+      if (handled.kind === 'proposal' && handled.proposal.kind === 'taskPlan') {
+        input.state.taskPlanReplanReason = undefined;
+      }
+      const successfulRepairKey = semanticRepairKey(toolCalls[0], input.state.resourceEvidenceRevision ?? 0);
+      if (successfulRepairKey) {
+        if (isArtifactDirective(toolCalls[0]?.name)) {
+          clearArtifactRepairAttempts(
+            input.state.artifactChunkRepairAttempts,
+            toolCalls[0],
+            input.state.resourceEvidenceRevision ?? 0
+          );
+        } else {
+          delete input.state.semanticDirectiveRepairAttempts?.[successfulRepairKey];
+        }
+      }
+      return handled.kind === 'proposal' ? handled.proposal : { kind: 'providerResume' };
     } catch (error) {
       if (!(error instanceof SessionSemanticDirectiveError)) throw error;
-      return this.scheduleSameProfileRetry(input.state, [
+      if (error.causeCode === 'artifact_draft_budget_exceeded') {
+        await input.onArtifactDraftBudgetExceeded(input.state, error);
+        return { kind: 'providerResume' };
+      }
+      return this.scheduleSameProfileRetry(input, [
         `code=${error.code}`,
+        `causeCode=${error.causeCode}`,
         `tool=${error.toolName}`,
         `callId=${error.callId}`,
         `argumentsHash=${error.argumentsHash}`,
         `fieldErrors=${error.message}`,
-      ]);
+      ], repairKeyForError(error, input.state.resourceEvidenceRevision ?? 0), error.code);
     }
   }
 
   private scheduleSameProfileRetry(
-    state: TState,
-    details: string[]
+    input: NativeToolProviderLoopInput<TState, TPrompt, TTurn>,
+    details: string[],
+    repairKey: string,
+    errorCode: string
   ): NativeToolProviderResumeSignal {
-    if (state.semanticDirectiveRepairAttempted) {
-      throw new Error(`Session semantic directive remained invalid after one same-profile retry: ${details.join('; ')}`);
+    const state = input.state;
+    const artifact = isArtifactRepairKey(repairKey);
+    const attemptsByKey = artifact
+      ? (state.artifactChunkRepairAttempts ??= {})
+      : (state.semanticDirectiveRepairAttempts ??= {});
+    const attempts = attemptsByKey[repairKey] ?? 0;
+    if (attempts >= 1) {
+      const message = `Session semantic directive remained invalid after one same-profile retry: ${details.join('; ')}`;
+      throw input.createError?.(errorCode, message) ?? new Error(`${errorCode}: ${message}`);
     }
+    attemptsByKey[repairKey] = attempts + 1;
     state.semanticDirectiveRepairAttempted = true;
     state.semanticDirectiveErrorSummary = [
       ...details,
@@ -151,4 +196,45 @@ export class NativeToolProviderLoop<
     ].join('; ');
     return { kind: 'providerResume' };
   }
+}
+
+function semanticRepairKey(toolCall: NativeToolCallProposal | undefined, evidenceRevision: number): string | undefined {
+  if (!toolCall) return undefined;
+  const slotId = typeof toolCall.arguments.slotId === 'string' && toolCall.arguments.slotId.trim()
+    ? toolCall.arguments.slotId.trim()
+    : undefined;
+  return isArtifactDirective(toolCall.name)
+    ? `artifact:${toolCall.name}:${slotId ?? 'finalize'}:evidence-${evidenceRevision}`
+    : `semantic:${toolCall.name}:evidence-${evidenceRevision}`;
+}
+
+function repairKeyForError(error: SessionSemanticDirectiveError, evidenceRevision: number): string {
+  if (isArtifactDirective(error.toolName)) {
+    return `artifact:${error.repairKey}:${error.causeCode}:evidence-${evidenceRevision}`;
+  }
+  return `semantic:${error.toolName}:${error.causeCode}:evidence-${evidenceRevision}`;
+}
+
+function clearArtifactRepairAttempts(
+  attempts: Record<string, number> | undefined,
+  toolCall: NativeToolCallProposal,
+  evidenceRevision: number
+): void {
+  if (!attempts) return;
+  const slotId = typeof toolCall.arguments.slotId === 'string' && toolCall.arguments.slotId.trim()
+    ? toolCall.arguments.slotId.trim()
+    : 'finalize';
+  const prefix = `artifact:${toolCall.name}:${slotId}:`;
+  const suffix = `:evidence-${evidenceRevision}`;
+  for (const key of Object.keys(attempts)) {
+    if (key.startsWith(prefix) && key.endsWith(suffix)) delete attempts[key];
+  }
+}
+
+function isArtifactDirective(toolName: string | undefined): boolean {
+  return toolName === 'session.append_artifact_chunk' || toolName === 'session.finalize_task_artifacts';
+}
+
+function isArtifactRepairKey(repairKey: string): boolean {
+  return repairKey.startsWith('artifact:');
 }

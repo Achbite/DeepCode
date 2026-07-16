@@ -6,7 +6,7 @@ export interface RepairProviderTurnContractCurrentTask {
   taskTitle?: string;
   goal?: string;
   targets?: string[];
-  capabilities?: string[];
+  toolIds?: string[];
 }
 
 export interface RepairProviderTurnContractInput {
@@ -51,7 +51,7 @@ export class RepairProviderTurnContractBuilder {
         content: [
           `Allowed proposal kinds for this call: ${input.allowedKinds.join(', ') || 'none'}.`,
           input.requiredKind ? `Required proposal kind: ${input.requiredKind}.` : 'No required proposal kind; choose the narrowest valid allowed kind.',
-          'Do not return taskPlan or implementationPlan during accepted task execution repair.',
+          'Do not return taskPlan during accepted task execution repair.',
         ].filter(Boolean),
       },
     ];
@@ -67,7 +67,7 @@ export class RepairProviderTurnContractBuilder {
           `title=${oneLineText(input.currentTaskContext?.taskTitle ?? stringValue(currentTask?.title) ?? '', 240) || 'none'}`,
           `objective=${oneLineText(input.currentTaskContext?.goal ?? stringValue(currentTask?.objective) ?? '', 500) || 'none'}`,
           `targets=${input.currentTaskContext?.targets?.join(', ') || stringArrayValue(currentTask?.targets).join(', ') || 'none'}`,
-          `capabilities=${input.currentTaskContext?.capabilities?.join(', ') || stringValue(currentTask?.capability) || 'none'}`,
+          `toolIds=${input.currentTaskContext?.toolIds?.join(', ') || stringValue(currentTask?.toolId) || 'none'}`,
           `completedTaskCount=${input.completedTaskCount ?? 0}`,
           `currentTaskOperations=${operations}`,
           `currentTaskActionTemplates=${templates}`,
@@ -112,12 +112,12 @@ function repairNextActionInstructionLines(input: {
 }): string[] {
   const allowsActionBundle = input.allowedKinds.includes('actionBundle');
   const forbidden = allowsActionBundle
-    ? 'taskPlan | implementationPlan | reviewSummary'
-    : 'actionBundle | implementationPlan | reviewSummary';
+    ? 'taskPlan | reviewSummary'
+    : 'actionBundle | taskPlan | reviewSummary';
   const nextAction = allowsActionBundle
     ? [
       'If executable work remains in current scope, output actionBundle.',
-      'If the current task is already sufficiently satisfied and no Kernel action is needed, output taskOutcome when allowed.',
+      'If no valid executable operation remains for the current task, output diagnostic with the blocking reason.',
       'If evidence is missing, output focused resourceRequest.',
       'If a concrete operation exceeds accepted scope, Session and Kernel will interrupt for user approval after proposal validation.',
     ].join(' ')
@@ -126,9 +126,9 @@ function repairNextActionInstructionLines(input: {
     `state=${input.turnMode}`,
     `allowedOutputs=${input.allowedKinds.join(' | ') || 'none'}`,
     input.requiredKind ? `requiredOutput=${input.requiredKind}` : '',
-    'requiredSchemaVersion=deepcode.agent.protocol.v3',
+    'requiredSchemaVersion=deepcode.agent.protocol.v4',
     `forbiddenOutputs=${forbidden}`,
-    'Return exactly one valid Agent Protocol v3 JSON object. No prose, markdown fences, or protocol explanation.',
+    'Return exactly one valid Agent Protocol v4 JSON object. No prose, markdown fences, or protocol explanation.',
     nextAction,
   ].filter(Boolean);
 }
@@ -150,10 +150,10 @@ function repairToolIntentTemplates(
     ];
   }
   const targets = input.currentTaskContext?.targets ?? [];
-  const capabilities = input.currentTaskContext?.capabilities ?? [];
+  const toolIds = input.currentTaskContext?.toolIds ?? [];
   return [
     `currentTaskTargets=${targets.length ? targets.join(', ') : 'none'}`,
-    `currentTaskCapabilities=${capabilities.length ? capabilities.join(', ') : 'none'}`,
+    `currentTaskToolIds=${toolIds.length ? toolIds.join(', ') : 'none'}`,
     'Do not infer additional targets from the original user request, memory, or invalid proposal.',
   ];
 }

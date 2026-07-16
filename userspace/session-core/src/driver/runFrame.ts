@@ -1,4 +1,4 @@
-import type { LlmChatRequest, LlmChatResult } from '@deepcode/protocol';
+import type { AgentWorkspaceBinding, LlmChatRequest, LlmChatResult } from '@deepcode/protocol';
 import type {
   ContextAssemblyRecord,
   ContextAssemblyTaskLocalCompactRecord,
@@ -12,7 +12,7 @@ import type {
   ResourcePacket,
 } from '../context/types.js';
 import type {
-  AcceptedImplementationPlanContext,
+  AcceptedTaskPlanContext,
   CurrentTaskContext,
   ImplementationBatchContext,
   TaskExecutionCursor,
@@ -28,6 +28,14 @@ import type { GeneratedArtifactEvidence } from './context/index.js';
 import type { HookResult } from './hooks/hookResult.js';
 import type { InteractionOverlayContext, SessionTurnPhase } from './pipelines/interactionOverlayCodec.js';
 import type { DriverRequestRef, KernelStateContractRef } from './types.js';
+import type { UserAuthorityFrame } from './context/userAuthorityFrame.js';
+import type {
+  PromptLedgerState,
+  ProviderRequestCacheHistoryEntry,
+} from '../prompt/promptLedger.js';
+import type { ArtifactDraftLease } from './execution/artifactDraftLedger.js';
+import type { AcceptedTaskReplanReason } from './execution/artifactDraftReplanCoordinator.js';
+import type { PendingAcceptedTaskOutcomeReview } from './execution/acceptedTaskOutcomeCoordinator.js';
 
 export interface RunFrame {
   readonly sessionId: string;
@@ -244,6 +252,11 @@ export interface DriverProviderTurnFrame {
   readonly contextAssembly?: ContextAssemblyRecord;
   readonly snapshot?: ProviderTurnSnapshot;
   readonly hookTrace?: readonly HookResult[];
+  readonly providerMessages?: LlmChatRequest['messages'];
+  readonly promptLedgerEpochId?: string;
+  readonly promptLedgerEpochScopeKey?: string;
+  readonly promptLedgerTaskTemplateHash?: string;
+  readonly promptLedgerCacheShapeReason?: string;
 }
 
 export interface ModelContextBundle {
@@ -258,17 +271,20 @@ export interface SessionDriverIdentityState {
   sessionId: string;
   runId: string;
   userRequest: string;
+  userAuthorityFrame: UserAuthorityFrame;
   phase: SessionTurnPhase;
 }
 
 export interface SessionDriverResourceState {
   workspaceScopeKey: string;
+  workspaceBinding?: AgentWorkspaceBinding;
   stateContract?: KernelStateContractRef;
   driverRequest?: DriverRequestRef;
   manifest: ResourceManifest;
   conversationRoots: ConversationResourceRoot[];
   initialContext: InitialContextPacket;
   resourcePackets: ResourcePacket[];
+  resourceEvidenceRevision: number;
   generatedArtifactEvidence: Map<string, GeneratedArtifactEvidence>;
   resourceRequestProgressByTask: Map<string, SessionDriverTaskResourceProgress>;
 }
@@ -293,14 +309,14 @@ export interface SessionDriverAcceptedPlanState {
   taskLedger?: TaskLedgerSnapshot;
   acceptedPlanPromptFrame?: AcceptedPlanPromptFrame;
   implementationBatch: ImplementationBatchContext;
-  acceptedImplementationPlan?: AcceptedImplementationPlanContext;
+  acceptedTaskPlan?: AcceptedTaskPlanContext;
+  pendingAcceptedTaskOutcomeReview?: PendingAcceptedTaskOutcomeReview;
 }
 
 export interface SessionDriverRepairState {
   resourceRequestRepairAttempted: boolean;
   actionBundleAdmissionRepairAttempted: boolean;
   planReviewRepairAttempted: boolean;
-  acceptedPlanScopeRepairAttempted: boolean;
   terminalGuidanceRevisionAttempted: boolean;
 }
 
@@ -313,16 +329,14 @@ export interface SessionDriverProviderState {
   nativeToolResumeRound?: number;
   semanticDirectiveRepairAttempted?: boolean;
   semanticDirectiveErrorSummary?: string;
+  taskPlanReplanReason?: AcceptedTaskReplanReason;
   providerRequestCacheHistory?: Record<string, ProviderRequestCacheHistoryEntry>;
   activeTurn?: ActiveTurnState;
-}
-
-export interface ProviderRequestCacheHistoryEntry {
-  readonly requestText: string;
-  readonly segments: Array<{
-    readonly id: string;
-    readonly contentHash: string;
-  }>;
+  promptLedger: PromptLedgerState;
+  artifactDraftLease?: ArtifactDraftLease;
+  artifactChunkRepairAttempts?: Record<string, number>;
+  semanticDirectiveRepairAttempts?: Record<string, number>;
+  pendingSemanticToolCalls?: Record<string, NativeToolCallProposal>;
 }
 
 export interface SessionDriverProviderRuntimeState {
@@ -447,6 +461,7 @@ export interface ActiveTurnState {
     receivedChars: number;
     lastEmittedChars: number;
   }>;
+  submittedPartFrames?: Record<string, true>;
 }
 
 export interface LlmTurnResult {

@@ -239,7 +239,7 @@ export class AssistantProjectionBuilder {
       ? this.englishDecisionEffectAnswer(input)
       : this.chineseDecisionEffectAnswer(input);
     return {
-      schemaVersion: 'deepcode.agent.protocol.v3',
+      schemaVersion: 'deepcode.agent.protocol.v4',
       proposalId: input.proposalId,
       runId: input.runId,
       sessionId: input.sessionId,

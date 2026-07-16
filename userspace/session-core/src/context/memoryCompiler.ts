@@ -33,6 +33,13 @@ interface MemoryCandidate {
   projectMemoryMode?: ProjectMemoryMode;
 }
 
+interface UserMessageAuthorityBinding {
+  readonly taskId: string;
+  readonly turnId: string;
+  readonly contentHash: string;
+  readonly current: boolean;
+}
+
 export function compileSessionMemoryDocument(
   events: AgentEvent[],
   options: { projectMemoryMode?: ProjectMemoryMode } = {}
@@ -159,23 +166,40 @@ export function renderMemoryItemLine(item: MemoryItemV4): string {
 
 function compileMemoryCandidates(events: AgentEvent[]): MemoryCandidate[] {
   const candidates: MemoryCandidate[] = [];
+  const userAuthority = userMessageAuthorityIndex(events);
   for (const event of events.slice(-160)) {
     const record = objectRecord(event.payload);
     if (!record) continue;
-    if (event.kind === 'user_msg') {
-      const content = stringValue(record.content);
+    if (event.kind === 'user_msg' || event.kind === 'user_guidance') {
+      if (event.kind === 'user_guidance' && stringValue(record.status) === 'consumed') continue;
+      const messageId = event.kind === 'user_guidance'
+        ? stringValue(record.guidanceId) ?? event.id
+        : event.id;
+      const content = stringContent(record.content) ?? stringContent(record.guidance);
+      const authority = userAuthority.get(messageId);
       const attachments = arrayRecords(record.attachments)
         .map((item) => `${String(item.kind ?? 'resource')}:${String(item.path ?? item.absolutePath ?? '')}`)
         .filter((item) => item.trim().length > 0);
-      if (content) {
+      if (content?.trim()) {
+        const intent = authority?.current
+          ? `Current user request: ${clip(content, 320)}`
+          : [
+              'Historical task input:',
+              authority ? `task=${authority.taskId}` : 'task=unbound',
+              authority ? `turn=${authority.turnId}` : 'turn=unbound',
+              `message=${messageId}`,
+              `contentHash=${authority?.contentHash ?? memoryHash(content)}`,
+            ].join(' ');
         candidates.push({
           lane: 'session',
           scope: 'session',
           kind: 'intent',
           authority: 'summary',
-          content: `Current user request: ${clip(content, 320)}`,
+          content: intent,
           event,
-          compression: compressionFor(content, 320),
+          compression: authority?.current
+            ? compressionFor(content, 320)
+            : { mode: 'handleOnly', reason: 'historical user text remains in WireLedger' },
         });
       }
       for (const attachment of attachments.slice(0, 8)) {
@@ -483,8 +507,36 @@ function applyProjectCandidateGovernance(
 function isAutoPromotableProjectCandidate(candidate: MemoryCandidate, riskClass: MemoryRiskClass): boolean {
   if (riskClass !== 'low') return false;
   if (candidate.authority === 'kernelFact' || candidate.kind === 'fact') return false;
-  if (candidate.content.match(/\b(delete|permission|grant|git push|network|secret|token|external path)\b/i)) return false;
   return candidate.kind === 'resource' || candidate.kind === 'habit' || candidate.kind === 'risk';
+}
+
+function userMessageAuthorityIndex(events: readonly AgentEvent[]): Map<string, UserMessageAuthorityBinding> {
+  const authorityEvents = events.flatMap((event) => {
+    if (event.kind !== 'session_turn_authority') return [];
+    const payload = objectRecord(event.payload);
+    const taskId = stringValue(payload?.taskId);
+    const turnId = stringValue(payload?.turnId);
+    const messageIds = stringArray(payload?.sourceMessageIds);
+    const messageHashes = stringArray(payload?.sourceMessageHashes);
+    if (!taskId || !turnId || messageIds.length === 0 || messageIds.length !== messageHashes.length) return [];
+    return [{ taskId, turnId, messageIds, messageHashes }];
+  });
+  const latestTurnId = authorityEvents.at(-1)?.turnId;
+  const index = new Map<string, UserMessageAuthorityBinding>();
+  for (const authority of authorityEvents) {
+    for (let position = 0; position < authority.messageIds.length; position += 1) {
+      const messageId = authority.messageIds[position];
+      const contentHash = authority.messageHashes[position];
+      if (!messageId || !contentHash) continue;
+      index.set(messageId, {
+        taskId: authority.taskId,
+        turnId: authority.turnId,
+        contentHash,
+        current: authority.turnId === latestTurnId,
+      });
+    }
+  }
+  return index;
 }
 
 function riskClassForCandidate(candidate: MemoryCandidate): MemoryRiskClass {
@@ -600,6 +652,16 @@ function arrayRecords(value: unknown): Record<string, unknown>[] {
 
 function stringValue(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function stringContent(value: unknown): string | undefined {
+  return typeof value === 'string' ? value : undefined;
+}
+
+function stringArray(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+    : [];
 }
 
 function clip(value: string, maxChars: number): string {

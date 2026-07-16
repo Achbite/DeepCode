@@ -6,12 +6,12 @@ import {
   AcceptedActionBundlePlanExecutor,
   AcceptedPlanActionProposalSubmitter,
   AcceptedPlanExecutionRootResolver,
-  AcceptedPlanScopeDecisionCoordinator,
   AcceptedPlanReadOnlyTaskExecutor,
+  AcceptedTaskOutcomeCoordinator,
+  AcceptedTaskOutcomeError,
   ReviewFactsAggregator,
   assertKernelReplyOk as assertExecutionKernelReplyOk,
-  type AcceptedImplementationPlanContext,
-  type AcceptedPlanBatchValidationResult,
+  type AcceptedTaskPlanContext,
   type CurrentTaskContext,
   type TaskExecutionCursor,
 } from './execution/index.js';
@@ -40,7 +40,12 @@ import {
   ProviderTurnContextCoordinator,
   ResourceOrchestrator,
   ResourceRequestProposalHandler,
+  buildResourceDelta,
 } from './context/index.js';
+import {
+  buildUserAuthorityFrame,
+  latestExplicitUserContent,
+} from './context/userAuthorityFrame.js';
 import {
   AcceptedPlanReviewHandoffCoordinator,
   AcceptedPlanStaticSyntaxReviewCoordinator,
@@ -57,16 +62,27 @@ import {
 } from './proposal/index.js';
 import type { LlmTurnResult, SessionDriverLoopRunState } from './runFrame.js';
 import { ProviderProfileRegistry } from '../provider/ProviderProfileRegistry.js';
-import { SessionSemanticToolAdapter } from '../provider/SessionSemanticToolAdapter.js';
+import {
+  SessionSemanticDirectiveError,
+  SessionSemanticToolAdapter,
+  type SessionSemanticDirective,
+} from '../provider/SessionSemanticToolAdapter.js';
+import { ArtifactDraftCoordinator } from './execution/artifactDraftCoordinator.js';
+import { ArtifactDraftError } from './execution/artifactDraftLedger.js';
+import { ArtifactDraftReplanCoordinator } from './execution/artifactDraftReplanCoordinator.js';
+import type { NativeToolCallProposal } from '../provider/providerStreamParts.js';
+import {
+  appendPromptLedgerCurrentTurn,
+  appendPromptLedgerSemanticExchange,
+  promptLedgerWireSemanticExchange,
+} from '../prompt/promptLedger.js';
 import { RunEngine } from './runEngine.js';
 import { diag, isEmptyResponseError, objectRecord, SessionDriverLoopError, stringValue, visibleLanguageForRequest } from './runtimeSupport.js';
 import { AgentRunReactor } from './agentRunReactor.js';
 import {
-  acceptedImplementationPlanContextBuilder,
-  acceptedPlanAdmission,
+  acceptedTaskPlanContextBuilder,
   acceptedPlanBatchPreflight,
   acceptedPlanExecutor,
-  acceptedPlanScopeDecisionOverlay,
   acceptedPlanTaskLedger,
   assistantProjectionBuilder,
   contextFrameBuilder,
@@ -135,7 +151,6 @@ export class SessionDriverLoop {
   private readonly acceptedActionBundlePlanExecutor: AcceptedActionBundlePlanExecutor;
   private readonly acceptedPlanActionProposalSubmitter: AcceptedPlanActionProposalSubmitter<SessionDriverLoopInput, SessionDriverLoopRunState>;
   private readonly acceptedPlanReadOnlyTaskExecutor: AcceptedPlanReadOnlyTaskExecutor<SessionDriverLoopInput, SessionDriverLoopRunState>;
-  private readonly acceptedPlanScopeDecisionCoordinator: AcceptedPlanScopeDecisionCoordinator<SessionDriverLoopRunState>;
   private readonly acceptedPlanReviewHandoffCoordinator: AcceptedPlanReviewHandoffCoordinator<SessionPlanContext>;
   private readonly acceptedPlanStaticSyntaxReviewCoordinator: AcceptedPlanStaticSyntaxReviewCoordinator<SessionDriverLoopRunState>;
   private readonly decisionResolver: DecisionResolver;
@@ -163,6 +178,9 @@ export class SessionDriverLoop {
   private readonly runEngine: RunEngine<SessionDriverLoopInput, SessionDriverLoopRunState>;
   private readonly runLifecyclePipeline: RunLifecyclePipeline<SessionDriverLoopRunState>;
   private readonly providerTurnRunner: ProviderTurnRunner<SessionDriverLoopRunState>;
+  private readonly artifactDraftCoordinator: ArtifactDraftCoordinator<SessionDriverLoopRunState>;
+  private readonly artifactDraftReplanCoordinator: ArtifactDraftReplanCoordinator<SessionDriverLoopRunState>;
+  private readonly acceptedTaskOutcomeCoordinator: AcceptedTaskOutcomeCoordinator<SessionDriverLoopRunState>;
 
   constructor(private readonly ports: SessionDriverLoopPorts) {
     this.agentRunReactor = new AgentRunReactor<SessionDriverLoopRunState>({
@@ -181,13 +199,11 @@ export class SessionDriverLoop {
       observeKernel: async (request) => kernelEventStatusIndex.observe(await this.ports.kernelCommand(request)),
       appendProjectedKernelEvents: (sessionId, reply) => this.agentRunReactor.appendProjectedKernelEvents(sessionId, reply),
       kernelExecutionContractId: (report) => planReviewGrantProjector.kernelExecutionContractId(report),
-      temporaryGrantsForPlan: (plan) => planReviewGrantProjector.temporaryGrantsForPlan(plan),
+      kernelExecutionContractHash: (report) => planReviewGrantProjector.kernelExecutionContractHash(report),
       recentResourcePackets: (events) => resourceRequestLoop.recentPackets(events),
       sessionRunStateEvent: (input) => sessionProgressProjectionBuilder.sessionRunStateEvent(input as Parameters<typeof sessionProgressProjectionBuilder.sessionRunStateEvent>[0]),
       acceptedPlanActionBatchPreflightEvent: (sessionId, plan, batch, ts, id) =>
         sessionProgressProjectionBuilder.acceptedPlanActionBatchPreflightEvent(sessionId, plan, batch, ts, id),
-      planActionBundlePreflightFailureEvents: (sessionId, plan, reasons, ts, id) =>
-        sessionFailureProjectionBuilder.planActionBundlePreflightFailureEvents(sessionId, plan, reasons, ts, id),
       planActionBundleExecutionFailureEvents: (sessionId, plan, batchEvents, batch, ts, id) =>
         sessionFailureProjectionBuilder.planActionBundleExecutionFailureEvents(sessionId, plan, batchEvents, batch, ts, id),
       planActionBundleExecutionExceptionEvents: (sessionId, plan, message, code, ts, id) =>
@@ -207,7 +223,6 @@ export class SessionDriverLoop {
           ts,
           id
         ),
-      deletePreflightReasons: (batch, resourcePackets) => acceptedPlanBatchPreflight.deleteReasons(batch, resourcePackets),
       planProposal: (plan) => planContextIndex.proposalEnvelope(plan),
       recordKernelBatchProgress: (input) => acceptedPlanTaskLedger().recordKernelBatchProgress(input),
       runtimeSnapshot: (input) => acceptedPlanTaskLedger().runtimeSnapshot(input),
@@ -286,23 +301,6 @@ export class SessionDriverLoop {
       readActionBundle: (proposal) => driverActivityBuilder.readActionBundle(proposal),
       tryCompleteReadOnlyActionBundle: (handlerInput, state, prompt, proposal, fallback) =>
         this.acceptedPlanReadOnlyTaskExecutor.tryCompleteActionBundle(handlerInput, state, prompt, proposal, fallback),
-      assessActionProposal: (assessmentInput) => acceptedPlanExecutor.assessActionProposal(assessmentInput as unknown as Parameters<typeof acceptedPlanExecutor.assessActionProposal>[0]),
-      admission: () => acceptedPlanAdmission(),
-      appendScopeIntervention: (handlerInput, state, proposal, validation) =>
-        this.acceptedPlanScopeDecisionCoordinator.waitForOutOfScopeDecision({
-          state,
-          proposal,
-          validation: validation as AcceptedPlanBatchValidationResult,
-          request: {
-            content: handlerInput.content,
-            attachments: handlerInput.attachments ?? [],
-          },
-          intervention: {
-            userRequest: state.userRequest,
-            acceptedPlan: state.acceptedImplementationPlan,
-            currentTaskId: state.currentTaskContext?.taskId,
-          },
-        }),
       appendDiagnostic: (state, code, fallback, params, idPrefix) => this.agentRunReactor.append(state.sessionId, [
         assistantProjectionBuilder.finalDiagnosticEvent(
           state.sessionId,
@@ -313,24 +311,11 @@ export class SessionDriverLoop {
       ]),
       sessionRunStateEvent: (eventInput) =>
         sessionProgressProjectionBuilder.sessionRunStateEvent(eventInput as Parameters<typeof sessionProgressProjectionBuilder.sessionRunStateEvent>[0]),
-      accessScopesCanonicalizedEvent: (sessionId, runId, accepted, canonicalization, ts, id) =>
-        sessionProgressProjectionBuilder.acceptedPlanAccessScopesCanonicalizedEvent(
-          sessionId,
-          runId,
-          accepted,
-          canonicalization as Parameters<typeof sessionProgressProjectionBuilder.acceptedPlanAccessScopesCanonicalizedEvent>[3],
-          ts,
-          id
-        ),
       findReviewReport: (events) => planReviewReportAnalyzer.findReport(events),
       appendTrace: (state, stage, payload) => providerTraceRecorder.append(state, stage, payload, this.ports),
-      acceptedPlanNeedsRepair: (report) => planReviewReportAnalyzer.acceptedPlanNeedsRepair(report),
       denied: (report) => planReviewReportAnalyzer.denied(report),
       diagnosticSummary: (report) => planReviewReportAnalyzer.diagnosticSummary(report),
-      nonAcceptedPermissionGaps: (report, accepted) =>
-        planReviewGrantProjector.nonAcceptedPermissionGaps(report, accepted.capabilities),
       executionContext: (contextInput) => acceptedPlanExecutor.executionContext(contextInput as Parameters<typeof acceptedPlanExecutor.executionContext>[0]),
-      temporaryGrantsForPlan: (plan) => planReviewGrantProjector.temporaryGrantsForPlan(plan),
       normalizeKernelBatch: (normalizeInput) => acceptedPlanExecutor.normalizeKernelBatch(normalizeInput as Parameters<typeof acceptedPlanExecutor.normalizeKernelBatch>[0]),
       normalizationFailureEvents: (sessionId, runId, accepted, reasons, ts, id) =>
         sessionFailureProjectionBuilder.acceptedPlanNormalizationFailureEvents(sessionId, runId, accepted, reasons, ts, id),
@@ -338,7 +323,6 @@ export class SessionDriverLoop {
         sessionFailureProjectionBuilder.planActionBundleExecutionExceptionEvents(sessionId, planRef, message, code, ts, id),
       executionFailureEvents: (sessionId, runId, accepted, batchEvents, batch, ts, id) =>
         sessionFailureProjectionBuilder.acceptedPlanExecutionFailureEvents(sessionId, runId, accepted, batchEvents, batch, ts, id),
-      deletePreflightReasons: (batch, resourcePackets) => acceptedPlanBatchPreflight.deleteReasons(batch, resourcePackets as ResourcePacket[]),
       preflightAudit: (batch) => acceptedPlanBatchPreflight.audit(batch),
       acceptedPlanBatchActivitySummary: (batch) => driverActivityBuilder.acceptedPlanBatchActivitySummary(batch),
       acceptedPlanBatchActivity: (activityInput) => driverActivityBuilder.acceptedPlanBatchActivity(activityInput as Parameters<typeof driverActivityBuilder.acceptedPlanBatchActivity>[0]),
@@ -380,16 +364,6 @@ export class SessionDriverLoop {
         ),
       executionRequest: (plan, acceptedPlan) => executionPromptCoordinator().executionRequest(plan, acceptedPlan),
       staticSyntaxReview: (reviewInput) => this.acceptedPlanStaticSyntaxReviewCoordinator.run(reviewInput),
-    });
-    this.acceptedPlanScopeDecisionCoordinator = new AcceptedPlanScopeDecisionCoordinator<SessionDriverLoopRunState>({
-      now: () => this.agentRunReactor.ts(),
-      createId: (prefix) => this.agentRunReactor.id(prefix),
-      visibleLanguageForRequest,
-      requirementPipeline: userInputPipeline,
-      interactionOverlayCodec,
-      requirementProjection: requirementProjectionBuilder,
-      progressProjection: sessionProgressProjectionBuilder,
-      append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
     });
     this.acceptedPlanReviewHandoffCoordinator = new AcceptedPlanReviewHandoffCoordinator<SessionPlanContext>({
       now: () => this.agentRunReactor.ts(),
@@ -435,13 +409,18 @@ export class SessionDriverLoop {
       now: () => this.agentRunReactor.ts(),
       createId: (prefix) => this.agentRunReactor.id(prefix),
       append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
+      kernel: (request) => this.agentRunReactor.kernel(request),
+      appendProjectedKernelEvents: (sessionId, reply) =>
+        this.agentRunReactor.appendProjectedKernelEvents(sessionId, reply),
+      diagnosticEvent: (sessionId, content, ts, id) =>
+        assistantProjectionBuilder.finalDiagnosticEvent(sessionId, content, ts, id),
       executeAcceptedActionBundlePlan: (handlerInput, plan, initialResult, acceptedOverlay) =>
         this.acceptedActionBundlePlanExecutor.execute(handlerInput, plan, initialResult, acceptedOverlay),
       activeDriverInteraction: (events) => driverInteractionIndex.active(events),
       executionRootFromDecision: (handlerInput, events) =>
         AcceptedPlanExecutionRootResolver.fromDecision(handlerInput, events),
-      buildAcceptedImplementationPlan: ({ plan, interventionLevel, executionRoot }) =>
-        acceptedImplementationPlanContextBuilder().build({ plan, interventionLevel, executionRoot }),
+      buildAcceptedTaskPlan: ({ plan, interventionLevel, executionRoot }) =>
+        acceptedTaskPlanContextBuilder().build({ plan, interventionLevel, executionRoot }),
       recoverAcceptedPlanFromOverlay: (handlerInput, events, overlay) =>
         driverInteractionIndex.recoverAcceptedPlanFromOverlay(handlerInput, events, overlay),
       planRevisionRequest: (request) => repairLoop.planRevisionRequest(request),
@@ -457,8 +436,8 @@ export class SessionDriverLoop {
       activeDriverInteraction: (events) => driverInteractionIndex.active(events),
       executionRootFromDecision: (handlerInput, events) =>
         AcceptedPlanExecutionRootResolver.fromDecision(handlerInput, events),
-      buildAcceptedImplementationPlan: ({ plan, interventionLevel, executionRoot }) =>
-        acceptedImplementationPlanContextBuilder().build({ plan, interventionLevel, executionRoot }),
+      buildAcceptedTaskPlan: ({ plan, interventionLevel, executionRoot }) =>
+        acceptedTaskPlanContextBuilder().build({ plan, interventionLevel, executionRoot }),
       recoverAcceptedPlanFromOverlay: (handlerInput, events, overlay) =>
         driverInteractionIndex.recoverAcceptedPlanFromOverlay(handlerInput, events, overlay),
       visibleLanguageForRequest,
@@ -469,9 +448,7 @@ export class SessionDriverLoop {
       progressProjection: sessionProgressProjectionBuilder,
       planIndex: planContextIndex,
       acceptedPlanLedger: acceptedPlanTaskLedger(),
-      acceptedPlanScopeDecisionOverlay,
       executionPrompt: executionPromptCoordinator(),
-      repairLoop,
     });
     this.reviewDecisionHandler = new ReviewDecisionHandler({
       now: () => this.agentRunReactor.ts(),
@@ -518,8 +495,13 @@ export class SessionDriverLoop {
       now: () => this.agentRunReactor.ts(),
       createId: (prefix) => this.agentRunReactor.id(prefix),
       append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
-      implementationPlanCardEvent: (planInput) =>
-        planProjectionBuilder.implementationPlanCardEvent(planInput),
+      kernel: (request) => this.agentRunReactor.kernel(request),
+      appendProjectedKernelEvents: (sessionId, reply) =>
+        this.agentRunReactor.appendProjectedKernelEvents(sessionId, reply),
+      taskPlanCardEvent: (planInput) =>
+        planProjectionBuilder.taskPlanCardEvent(planInput),
+      diagnosticEvent: (sessionId, content, ts, id) =>
+        assistantProjectionBuilder.finalDiagnosticEvent(sessionId, content, ts, id),
       sessionRunStateEvent: (runStateInput) =>
         sessionProgressProjectionBuilder.sessionRunStateEvent(runStateInput),
     });
@@ -533,6 +515,8 @@ export class SessionDriverLoop {
         assistantProjectionBuilder.answerEvent(answerSessionId, proposal, ts, id),
       finalDiagnosticEvent: (diagnosticSessionId, summary, ts, id) =>
         assistantProjectionBuilder.finalDiagnosticEvent(diagnosticSessionId, summary, ts, id),
+      acceptedTaskDiagnosticFailureEvents: (failureInput) =>
+        sessionFailureProjectionBuilder.acceptedTaskDiagnosticFailureEvents(failureInput),
     });
     this.proposalRouter = new ProposalRouter();
     this.proposalRouteExecutor = new ProposalRouteExecutor<SessionDriverLoopInput, SessionDriverLoopRunState>({
@@ -560,7 +544,7 @@ export class SessionDriverLoop {
       now: () => this.agentRunReactor.ts(),
       createId: (prefix) => this.agentRunReactor.id(prefix),
       assembleContext: (contextInput) => assembleContext(contextInput),
-      capabilityCatalogSummary: () => '',
+      toolCatalogSummary: (state) => nativeToolCoordinator.toolCatalogSummary(state),
       collectUserGuidanceEvents: (events, runId) => collectUserGuidanceEvents(events, runId),
       buildProviderTurnContract: (contractInput) =>
         contextFrameBuilder.buildSessionProviderTurnContract(contractInput),
@@ -603,7 +587,7 @@ export class SessionDriverLoop {
       diagnosticEvent: (sessionId, message, ts, id) =>
         assistantProjectionBuilder.guidanceRevisionDiagnosticEvent(sessionId, message, ts, id),
       assembleContext: (contextInput) => assembleContext(contextInput),
-      capabilityCatalogSummary: () => '',
+      toolCatalogSummary: (state) => nativeToolCoordinator.toolCatalogSummary(state),
       implementationBatchHints: (state) => providerContextSupport.implementationBatchHints(state.implementationBatch),
       appendConsumedGuidanceEvents: (guidanceInput) =>
         userGuidanceQueue.appendConsumed({
@@ -636,6 +620,8 @@ export class SessionDriverLoop {
     });
     this.runLifecyclePipeline = new RunLifecyclePipeline<SessionDriverLoopRunState>({
       createId: (prefix) => this.agentRunReactor.id(prefix),
+      now: () => this.agentRunReactor.ts(),
+      createError: (code, message) => new SessionDriverLoopError(code, message),
       append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
       kernel: (request) => this.agentRunReactor.kernel(request),
       appendProjectedKernelEvents: (sessionId, reply) => this.agentRunReactor.appendProjectedKernelEvents(sessionId, reply),
@@ -663,6 +649,7 @@ export class SessionDriverLoop {
           'resource-context'
         )
       ).result,
+      loadWireLedger: this.ports.loadWireLedger,
     });
     this.resourceRequestProposalHandler = new ResourceRequestProposalHandler<SessionDriverLoopInput, SessionDriverLoopRunState>({
       now: () => this.agentRunReactor.ts(),
@@ -678,13 +665,44 @@ export class SessionDriverLoop {
         resourceRequestResolver().resolve(manifest, request, roots),
       finalDiagnosticEvent: (sessionId, content, ts, id) =>
         assistantProjectionBuilder.finalDiagnosticEvent(sessionId, content, ts, id),
+      internalFailureEvents: (state, stage, code, message, id) =>
+        sessionFailureProjectionBuilder.internalFailureEvents({
+          sessionId: state.sessionId,
+          runId: state.runId,
+          stage,
+          code,
+          message,
+          reason: 'driver_failure',
+          ts: this.agentRunReactor.ts(),
+          id,
+        }),
       resourceResolutionDiagnostic: (resolution) => resourceRequestLoop.resolutionDiagnostic(resolution),
+      completeResourceSemanticExchange: async (state, proposal, packets, issues = []) => {
+        const toolCall = state.pendingSemanticToolCalls?.[proposal.proposalId];
+        if (!toolCall) return;
+        const request = objectRecord(proposal.payload);
+        const delta = buildResourceDelta({
+          requestId: stringValue(request?.id) ?? proposal.proposalId,
+          workspaceScopeKey: state.workspaceScopeKey,
+          packets,
+          roots: state.conversationRoots,
+        });
+        if (issues.length) {
+          delta.items.push(...issues.map((issue) => ({
+            requestItemId: issue.requestItemId,
+            status: 'error' as const,
+            reason: issue.reason,
+          })));
+        }
+        await this.appendSemanticExchange(state, toolCall, delta);
+        delete state.pendingSemanticToolCalls?.[proposal.proposalId];
+      },
       refreshTaskRuntimeState: (state) => acceptedPlanTaskLedger().refreshRuntimeState(state),
       acceptedPlanResourceResumeEvent: (state, packet, ts, id) =>
         sessionProgressProjectionBuilder.acceptedPlanResourceResumeEvent(
           state.sessionId,
           state.runId,
-          state.acceptedImplementationPlan!,
+          state.acceptedTaskPlan!,
           state.taskExecutionCursor,
           state.currentTaskContext,
           packet,
@@ -705,12 +723,55 @@ export class SessionDriverLoop {
         assistantProjectionBuilder.finalDiagnosticEvent(sessionId, content, ts, id),
       diagnostic: (code, fallback, params) => diag(code, fallback, params),
     });
+    this.artifactDraftCoordinator = new ArtifactDraftCoordinator<SessionDriverLoopRunState>({
+      createId: (prefix) => this.agentRunReactor.id(prefix),
+      kernel: (request) => this.agentRunReactor.kernel(request),
+      appendProjectedKernelEvents: (sessionId, reply) =>
+        this.agentRunReactor.appendProjectedKernelEvents(sessionId, reply),
+      compileArtifacts: (input) => this.semanticToolAdapter.compileArtifacts(input),
+      createError: (code, message) => new SessionDriverLoopError(code, message),
+    });
+    this.artifactDraftReplanCoordinator = new ArtifactDraftReplanCoordinator<SessionDriverLoopRunState>({
+      discard: (state, reason) => this.artifactDraftCoordinator.discard(state, reason),
+    });
+    this.acceptedTaskOutcomeCoordinator = new AcceptedTaskOutcomeCoordinator<SessionDriverLoopRunState>({
+      now: () => this.agentRunReactor.ts(),
+      createId: (prefix) => this.agentRunReactor.id(prefix),
+      append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
+      recordModelTaskOutcome: (outcomeInput) => acceptedPlanTaskLedger().recordModelTaskOutcome(outcomeInput),
+      refreshRuntimeState: (state) => acceptedPlanTaskLedger().refreshRuntimeState(state),
+      complete: (accepted) => acceptedPlanTaskLedger().complete(accepted),
+      taskOutcomeCheckpointEvent: (eventInput) =>
+        sessionProgressProjectionBuilder.acceptedPlanTaskOutcomeCheckpointEvent(eventInput),
+      taskSavepointEvent: (sessionId, runId, accepted, nextAccepted, progress, kernelEvents, cursor, context, ts, id, contextCompactRecord) =>
+        sessionProgressProjectionBuilder.acceptedPlanTaskSavepointEvent(
+          sessionId,
+          runId,
+          accepted,
+          nextAccepted,
+          progress,
+          kernelEvents,
+          cursor,
+          context,
+          ts,
+          id,
+          contextCompactRecord
+        ),
+    });
     this.nativeToolHandlerPortsFactory = new NativeToolHandlerPortsFactory({
       progressEventBuilder: nativeToolProgressEventBuilder,
       projectionBuilder: nativeToolProjectionBuilder,
       event: (sessionId, kind, payload) => this.agentRunReactor.event(sessionId, kind, payload),
       append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
       emitProjectionDelta: (state, delta) => this.agentRunReactor.emitProjectionDelta(state, delta),
+      recordSemanticExchange: async (state, toolCall, result) => {
+        if (result.kind === 'proposal' && result.proposal.kind === 'resourceRequest') {
+          state.pendingSemanticToolCalls ??= {};
+          state.pendingSemanticToolCalls[result.proposal.proposalId] = toolCall;
+          return;
+        }
+        await this.appendSemanticExchange(state, toolCall, result.toolResult);
+      },
     });
     this.nativeToolProviderCoordinator = new NativeToolProviderCoordinator<SessionDriverLoopRunState, LlmTurnResult>({
       providerLoop: nativeToolProviderLoop,
@@ -720,8 +781,35 @@ export class SessionDriverLoop {
           state,
           [...this.providerProfileRegistry.profileForFrame(state.providerTurnFrame).tools]
         ),
-      semanticProposal: (state, toolCall) =>
-        this.semanticToolAdapter.proposal(state, toolCall),
+      semanticDirective: async (state, toolCall) => {
+        const directive: SessionSemanticDirective | null = this.semanticToolAdapter.directive(state, toolCall);
+        if (!directive) return null;
+        try {
+          if (directive.kind === 'taskOutcome') {
+            return await this.acceptedTaskOutcomeCoordinator.handle({ state, directive });
+          }
+          return await this.artifactDraftCoordinator.handle({
+            state,
+            callId: toolCall.callId,
+            directive,
+          });
+        } catch (error) {
+          if (error instanceof SessionSemanticDirectiveError) throw error;
+          if (
+            error instanceof ArtifactDraftError
+            || error instanceof AcceptedTaskOutcomeError
+            || error instanceof SessionDriverLoopError
+          ) {
+            throw new SessionSemanticDirectiveError(
+              toolCall.name,
+              toolCall.callId,
+              toolCall.arguments,
+              error
+            );
+          }
+          throw error;
+        }
+      },
       runTurn: (profileId, state, stage, messages, options) =>
         this.providerRuntimeBridge.llmTurn(profileId, state, stage, messages, options),
       isEmptyResponseError,
@@ -729,6 +817,32 @@ export class SessionDriverLoop {
         error instanceof SessionDriverLoopError && error.code === 'native_tool_arguments_invalid'
           ? { code: error.code, message: error.message }
           : undefined,
+      onArtifactDraftBudgetExceeded: async (state, error) => {
+        const reason = await this.artifactDraftReplanCoordinator.replan(state, error.message);
+        const content = state.userAuthorityFrame.outputLanguage === 'zh-CN'
+          ? '当前任务的产物总量超过 Kernel 草稿预算，Session 已保留审计事实并返回 Plan 阶段重新拆分任务。'
+          : 'The current task exceeded the Kernel artifact budget. Session preserved the audit facts and returned to Plan for task-level replanning.';
+        await this.agentRunReactor.append(state.sessionId, [
+          this.agentRunReactor.event(state.sessionId, 'workflow_stage', {
+            stage: 'accepted_plan.replan_required',
+            status: 'needsReplan',
+            code: reason.code,
+            runId: state.runId,
+            previousPlanId: reason.previousPlanId,
+            previousTaskId: reason.previousTaskId,
+            message: reason.message,
+            channel: 'progress',
+            visibility: 'conversation',
+          }),
+          assistantProjectionBuilder.thinkingEvent(
+            state.sessionId,
+            content,
+            this.agentRunReactor.ts(),
+            this.agentRunReactor.id(reason.code)
+          ),
+        ]);
+      },
+      createError: (code, message) => new SessionDriverLoopError(code, message),
     });
     this.providerStreamRuntime = new ProviderStreamRuntime<SessionDriverLoopRunState>({
       reasoningFlushChars: PROVIDER_REASONING_FLUSH_CHARS,
@@ -778,12 +892,37 @@ export class SessionDriverLoop {
           sessionId: state.sessionId,
           events: current.events,
           runId: state.runId,
+          taskId: state.userAuthorityFrame.turnAuthority.taskId,
           stage,
+          outputLanguage: state.userAuthorityFrame.outputLanguage,
+          promptEpochId: state.providerTurnFrame?.promptLedgerEpochId,
           summary: providerStreamCoordinator.userGuidanceConsumedSummary(language),
           now: () => this.agentRunReactor.ts(),
           createId: (prefix) => this.agentRunReactor.id(prefix),
         });
-        if (resume.events.length) await this.agentRunReactor.append(state.sessionId, resume.events);
+        if (resume.events.length) {
+          const appended = await this.agentRunReactor.append(state.sessionId, resume.events);
+          state.userAuthorityFrame = buildUserAuthorityFrame(
+            appended.events,
+            {
+              messageId: state.userAuthorityFrame.rootMessage.messageId,
+              content: state.userAuthorityFrame.rootMessage.content,
+              timestamp: state.userAuthorityFrame.rootMessage.timestamp,
+            },
+            visibleLanguageForRequest,
+            state.userAuthorityFrame.autonomyMode,
+            { runId: state.runId, requirePersistedAuthority: true }
+          );
+          state.userRequest = latestExplicitUserContent(state.userAuthorityFrame);
+          if (state.promptLedger && state.providerTurnFrame?.promptLedgerEpochId) {
+            appendPromptLedgerCurrentTurn({
+              state: state.promptLedger,
+              epochId: state.providerTurnFrame.promptLedgerEpochId,
+              authority: state.userAuthorityFrame,
+              createId: (prefix) => this.agentRunReactor.id(prefix),
+            });
+          }
+        }
         return resume.messages;
       },
       createError: (code, message) => new SessionDriverLoopError(code, message),
@@ -804,10 +943,10 @@ export class SessionDriverLoop {
       assembleContext: (contextInput) => assembleContext(contextInput),
       allowedProposals: (kernelAllowed, state) =>
         providerTurnPolicy.allowedProposals(kernelAllowed, state),
-      capabilityCatalogSummary: () => '',
+      toolCatalogSummary: (state) => nativeToolCoordinator.toolCatalogSummary(state),
       memoryHints: (state) => [
         ...acceptedPlanTaskLedger().memoryHints(state.currentTaskContext),
-        ...providerContextSupport.implementationBatchHints(state.implementationBatch, state.acceptedImplementationPlan),
+        ...providerContextSupport.implementationBatchHints(state.implementationBatch, state.acceptedTaskPlan),
       ],
       collectUserGuidanceEvents: (events, runId) => collectUserGuidanceEvents(events, runId),
       appendConsumedGuidance: (guidanceInput) =>
@@ -827,9 +966,33 @@ export class SessionDriverLoop {
       buildProviderTurnContract: (contractInput) =>
         contextFrameBuilder.buildSessionProviderTurnContract(contractInput),
       runHook: (hookInput) => hookRuntime.run(hookInput),
+      createError: (code, message) => new SessionDriverLoopError(code, message),
     });
     this.providerTurnCycle = new ProviderTurnCycle<SessionDriverLoopInput, SessionDriverLoopRunState>({
       refreshRuntimeState: (state) => acceptedPlanTaskLedger().refreshRuntimeState(state),
+      takePendingReview: (state) => {
+        const pending = state.pendingAcceptedTaskOutcomeReview;
+        const accepted = state.acceptedTaskPlan;
+        if (!pending || !accepted) return undefined;
+        state.pendingAcceptedTaskOutcomeReview = undefined;
+        const plan = acceptedPlanExecutor.modelTaskOutcomeReviewContext({
+          sessionId: state.sessionId,
+          runId: state.runId,
+          acceptedPlan: accepted,
+          taskId: pending.taskId,
+          summary: pending.summary,
+          evidenceRefs: pending.evidenceRefs,
+        });
+        return {
+          sessionId: state.sessionId,
+          runId: state.runId,
+          planId: accepted.planId,
+          plan,
+          result: pending.result,
+          currentKernelEvents: [],
+          requestIdPrefix: 'accepted-plan-task-outcome-review-facts-get',
+        };
+      },
       prepareProviderContext: (handlerInput, state, lastResult) =>
         this.providerTurnContextCoordinator.prepare(state, {
           contextAssemblyId: this.agentRunReactor.id('context-assembly'),
@@ -847,24 +1010,39 @@ export class SessionDriverLoop {
       admitDirective: (proposal) => this.proposalRouter.route(proposal),
       appendDriverFailure: async (state, error) => {
         if (!(error instanceof SessionDriverLoopError)) return null;
-        return this.agentRunReactor.append(state.sessionId, [
-          assistantProjectionBuilder.finalDiagnosticEvent(
-            state.sessionId,
-            driverFailureMessageCatalog.driverFailure(error.code, error.message),
-            this.agentRunReactor.ts(),
-            this.agentRunReactor.id(error.code)
-          ),
-        ]);
+        await this.artifactDraftCoordinator.discard(
+          state,
+          `Session stopped the current artifact draft after ${error.code}.`
+        ).catch(() => undefined);
+        const diagnostic = driverFailureMessageCatalog.driverFailure(error.code, error.message);
+        return this.agentRunReactor.append(state.sessionId, sessionFailureProjectionBuilder.internalFailureEvents({
+          sessionId: state.sessionId,
+          runId: state.runId,
+          stage: 'driver',
+          code: diagnostic.code,
+          message: diagnostic.fallback,
+          reason: 'driver_failure',
+          ts: this.agentRunReactor.ts(),
+          id: this.agentRunReactor.id(error.code),
+        }));
       },
-      appendProviderFailure: (state, error) =>
-        this.agentRunReactor.append(state.sessionId, [
-          assistantProjectionBuilder.finalDiagnosticEvent(
-            state.sessionId,
-            driverFailureMessageCatalog.providerFailure(error),
-            this.agentRunReactor.ts(),
-            this.agentRunReactor.id('provider_call_failed')
-          ),
-        ]),
+      appendProviderFailure: async (state, error) => {
+        await this.artifactDraftCoordinator.discard(
+          state,
+          'Session stopped the current artifact draft after a Provider failure.'
+        ).catch(() => undefined);
+        const diagnostic = driverFailureMessageCatalog.providerFailure(error);
+        return this.agentRunReactor.append(state.sessionId, sessionFailureProjectionBuilder.internalFailureEvents({
+          sessionId: state.sessionId,
+          runId: state.runId,
+          stage: 'provider',
+          code: diagnostic.code,
+          message: diagnostic.fallback,
+          reason: 'provider_failure',
+          ts: this.agentRunReactor.ts(),
+          id: this.agentRunReactor.id('provider-call-failed'),
+        }));
+      },
     });
     this.runEngine = new RunEngine<SessionDriverLoopInput, SessionDriverLoopRunState>({
       initialize: (runInput) => this.runLifecyclePipeline.initialize(runInput),
@@ -895,14 +1073,16 @@ export class SessionDriverLoop {
           ]);
         } catch (error) {
           const message = error instanceof SessionDriverLoopError ? error.message : String(error);
-          return this.agentRunReactor.append(runInput.sessionId, [
-            assistantProjectionBuilder.finalDiagnosticEvent(
-              runInput.sessionId,
-              diag('requirementConfirmationFailed', message, { message }),
-              this.agentRunReactor.ts(),
-              this.agentRunReactor.id('requirement-confirmation-failed')
-            ),
-          ]);
+          return this.agentRunReactor.append(runInput.sessionId, sessionFailureProjectionBuilder.internalFailureEvents({
+            sessionId: runInput.sessionId,
+            runId: state.runId,
+            stage: 'requirement_confirmation',
+            code: 'requirement_confirmation_failed',
+            message,
+            reason: 'driver_failure',
+            ts: this.agentRunReactor.ts(),
+            id: this.agentRunReactor.id('requirement-confirmation-failed'),
+          }));
         }
       },
       runProviderTurn: (cycleInput) => this.providerTurnCycle.run(cycleInput),
@@ -921,6 +1101,45 @@ export class SessionDriverLoop {
     return this.runLoopInput(input);
   }
 
+  private async appendSemanticExchange(
+    state: SessionDriverLoopRunState,
+    toolCall: NativeToolCallProposal,
+    result: unknown
+  ): Promise<void> {
+    const profileId = this.providerProfileRegistry.profileForFrame(state.providerTurnFrame).id;
+    const protocolToolCall = {
+      id: toolCall.callId,
+      name: toolCall.name,
+      arguments: toolCall.arguments,
+    };
+    const epochId = state.providerTurnFrame?.promptLedgerEpochId;
+    if (!epochId) {
+      if (!state.acceptedTaskPlan) return;
+      throw new SessionDriverLoopError(
+        'session_task_prompt_epoch_incompatible',
+        'Session semantic exchange has no active task-scoped PromptLedger epoch.'
+      );
+    }
+    const epoch = appendPromptLedgerSemanticExchange({
+      state: state.promptLedger,
+      epochId,
+      toolCall: protocolToolCall,
+      result,
+      createId: (prefix) => this.agentRunReactor.id(prefix),
+    });
+    if (!epoch || !this.ports.appendWireLedger) return;
+    await this.ports.appendWireLedger(state.sessionId, promptLedgerWireSemanticExchange({
+      sessionId: state.sessionId,
+      runId: state.runId,
+      profileId,
+      epoch,
+      toolCall: protocolToolCall,
+      result,
+      timestamp: this.agentRunReactor.ts(),
+      createId: (prefix) => this.agentRunReactor.id(prefix),
+    }));
+  }
+
   private async resumeRun(input: SessionDriverLoopInput): Promise<AgentSessionResult> {
     return this.runLoopInput(input, 'resumeRun');
   }
@@ -929,20 +1148,61 @@ export class SessionDriverLoop {
     input: SessionDriverLoopInput,
     mode: 'userTurn' | 'resumeRun' = 'userTurn'
   ): Promise<AgentSessionResult> {
+    if (
+      input.projectId
+      && input.projectKind === 'folder'
+      && (
+        input.projectRootStatus === 'unavailable'
+        || !input.workspaceBinding?.openPath
+        || !(input.projectWorkingDirectory?.absolutePath ?? input.projectWorkingDirectory?.displayPath)
+      )
+    ) {
+      const events = input.appendUserMessage === false
+        ? []
+        : [this.agentRunReactor.event(input.sessionId, 'user_msg', {
+          content: input.content,
+          attachments: input.attachments ?? [],
+          channel: 'user',
+          visibility: 'conversation',
+        })];
+      events.push(assistantProjectionBuilder.finalDiagnosticEvent(
+        input.sessionId,
+        {
+          code: 'project_root_unavailable',
+          fallback: 'The project directory is unavailable. Rebind the project directory before using this project session.',
+          params: { projectId: input.projectId },
+        },
+        this.agentRunReactor.ts(),
+        this.agentRunReactor.id('project-root-unavailable')
+      ));
+      return this.agentRunReactor.append(input.sessionId, events);
+    }
     try {
       return mode === 'resumeRun'
         ? await this.runEngine.resume(input)
         : await this.runEngine.run(input);
     } catch (error) {
       const message = error instanceof SessionDriverLoopError ? error.message : String(error);
-      return this.agentRunReactor.append(input.sessionId, [
-        assistantProjectionBuilder.finalDiagnosticEvent(
-          input.sessionId,
-          diag('runEngineFailed', `Session RunEngine failed: ${message}`, { message }),
-          this.agentRunReactor.ts(),
-          this.agentRunReactor.id('run-engine-failed')
-        ),
-      ]);
+      const runId = input.existingEvents ? latestRunIdForFailure(input.existingEvents) : undefined;
+      return this.agentRunReactor.append(input.sessionId, sessionFailureProjectionBuilder.internalFailureEvents({
+        sessionId: input.sessionId,
+        runId: runId ?? 'run-unavailable',
+        stage: 'run_engine',
+        code: error instanceof SessionDriverLoopError ? error.code : 'run_engine_failed',
+        message: `Session RunEngine failed: ${message}`,
+        reason: 'driver_failure',
+        ts: this.agentRunReactor.ts(),
+        id: this.agentRunReactor.id('run-engine-failed'),
+      }));
     }
   }
+}
+
+function latestRunIdForFailure(events: AgentEvent[]): string | undefined {
+  for (const event of [...events].reverse()) {
+    const payload = objectRecord(event.payload);
+    const runId = stringValue(payload?.runId);
+    if (runId) return runId;
+  }
+  return undefined;
 }

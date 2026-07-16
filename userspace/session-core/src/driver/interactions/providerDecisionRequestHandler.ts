@@ -21,7 +21,7 @@ export interface ProviderDecisionRequestState {
   runId: string;
   phase: SessionTurnPhase;
   interactionOverlay?: InteractionOverlayContext;
-  acceptedImplementationPlan?: {
+  acceptedTaskPlan?: {
     planId?: string;
     runId?: string;
     completedTaskIds?: string[];
@@ -94,10 +94,10 @@ export class ProviderDecisionRequestHandler<
       interactionRunId: state.runId,
       interactionId: requirement.requirementId,
       sourceInteractionId: requirement.requirementId,
-      acceptedPlanId: state.acceptedImplementationPlan?.planId,
-      acceptedPlanRunId: state.acceptedImplementationPlan?.runId,
+      acceptedPlanId: state.acceptedTaskPlan?.planId,
+      acceptedPlanRunId: state.acceptedTaskPlan?.runId,
       acceptedCurrentTaskId: state.currentTaskContext?.taskId,
-      acceptedCompletedTaskIds: state.acceptedImplementationPlan?.completedTaskIds,
+      acceptedCompletedTaskIds: state.acceptedTaskPlan?.completedTaskIds,
     };
     const confirmation = this.ports.confirmationEvent({
       sessionId: state.sessionId,

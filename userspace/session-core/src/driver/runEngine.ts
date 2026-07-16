@@ -100,6 +100,15 @@ export class RunEngine<Input, State extends RunEngineState> {
         if (cycle.kind === 'failed') {
           return this.terminal(cycle.result);
         }
+        if (cycle.kind === 'reviewRequired') {
+          pendingReview = {
+            kind: 'reviewAssemblyRequired',
+            request: cycle.request,
+            directive: { kind: 'providerResume' },
+          };
+          command = { kind: 'assembleReview' };
+          continue;
+        }
         pendingDirective = {
           kind: 'providerDirectiveReady',
           prompt: cycle.prompt,

@@ -7,13 +7,10 @@ import {
 } from '../../protocol/types.js';
 
 export interface ProposalSemanticValidatorPorts {
-  maxActionBundleTotalCodeBytes: number;
-  sideEffectCapabilities: Set<string>;
+  sideEffectToolIds: Set<string>;
   readActionBundle(proposal: ProposalEnvelope): ActionBundleDraft | undefined;
-  actionEffectiveCapability(action: { capability?: unknown; toolId?: unknown }): string;
+  actionToolId(action: { toolId?: unknown }): string;
   actionFileTargetPath(action: Record<string, unknown>): string | undefined;
-  deleteActionTargetResourceKind(action: Record<string, unknown>): string | undefined;
-  deleteActionRecursive(action: Record<string, unknown>): boolean;
 }
 
 export class ProposalSemanticValidator {
@@ -57,11 +54,7 @@ export class ProposalSemanticValidator {
   }
 
   isDetailedUserPlanMarkdown(userPlan: string | undefined): boolean {
-    if (!userPlan || userPlan.trim().length < 240) return false;
-    const lines = userPlan.split(/\r?\n/);
-    const headings = lines.filter((line) => /^#{1,3}\s+\S/.test(line.trim()));
-    const listItems = lines.filter((line) => /^\s*[-*+]\s+\S/.test(line));
-    return headings.length >= 4 && listItems.length >= 3;
+    return Boolean(userPlan?.trim());
   }
 
   defaultActionBundleUserPlanMarkdown(input: {
@@ -72,16 +65,16 @@ export class ProposalSemanticValidator {
   }): string {
     const targets = input.actions.map((action) => this.ports.actionFileTargetPath(action)).filter((target): target is string => Boolean(target));
     const actionLines = input.actions.map((action, index) => {
-      const capability = this.ports.actionEffectiveCapability(action) || 'side-effect';
+      const toolId = this.ports.actionToolId(action) || 'side-effect';
       const target = this.ports.actionFileTargetPath(action) ?? `action-${index + 1}`;
-      const description = stringValue(action.description) ?? stringValue(action.title) ?? capability;
-      return { capability, target, description };
+      const description = stringValue(action.description) ?? toolId;
+      return { toolId, target, description };
     });
     const targetList = targets.length
       ? targets.slice(0, 12).map((target) => `- ${target}`)
       : ['- Kernel facts will identify the affected workspace targets.'];
     const changeList = actionLines.length
-      ? actionLines.slice(0, 12).map((action) => `- ${action.capability}: ${action.target} - ${action.description}`)
+      ? actionLines.slice(0, 12).map((action) => `- ${action.toolId}: ${action.target} - ${action.description}`)
       : ['- Submit the current accepted-task side-effect batch to Kernel review.'];
     const summary = input.goal ?? input.existingUserPlan ?? 'Execute the current accepted-task action bundle.';
     if ((input.outputLanguage ?? '').toLowerCase().startsWith('zh')) {
@@ -128,151 +121,10 @@ export class ProposalSemanticValidator {
     ].join('\n');
   }
 
-  canonicalizeWriteActionSourceBlockRefs(proposal: ProposalEnvelope): void {
-    if (proposal.kind !== 'actionBundle') return;
-    const payload = objectRecord(proposal.payload);
-    const bundle = objectRecord(payload?.actionBundle);
-    const codeBlocks = Array.isArray(payload?.codeBlocks) ? payload.codeBlocks : [];
-    const actions = Array.isArray(bundle?.actions) ? bundle.actions : [];
-    if (!payload || !bundle || !codeBlocks.length || !actions.length) return;
-
-    const blocks = codeBlocks.flatMap((block) => {
-      const record = objectRecord(block);
-      const id = stringValue(record?.id) ?? stringValue(record?.blockId);
-      const targetPath = stringValue(record?.targetPath) ?? stringValue(record?.path);
-      if (!record || !id || !targetPath) return [];
-      return [{ id, targetPath: normalizePlanScope(targetPath), record }];
-    });
-    if (!blocks.length) return;
-
-    const fixes: Array<Record<string, unknown>> = [];
-    for (const [index, action] of actions.entries()) {
-      const record = objectRecord(action);
-      if (!record) continue;
-      const capability = this.ports.actionEffectiveCapability(record);
-      if (capability !== 'fs.write') continue;
-      const args = objectRecord(record.args) ?? objectRecord(record.toolArgs);
-      const existingSource = stringValue(record.sourceBlockId) ?? stringValue(args?.sourceBlockId);
-      if (existingSource) continue;
-      const actionKind = stringValue(record.kind);
-      if (['patch', 'replaceBlock', 'insertBefore', 'insertAfter'].includes(actionKind ?? '')) continue;
-      const targetPath = this.ports.actionFileTargetPath(record);
-      if (!targetPath) continue;
-      const normalizedTarget = normalizePlanScope(targetPath);
-      const matches = blocks.filter((block) => block.targetPath === normalizedTarget);
-      if (matches.length !== 1) continue;
-
-      const nextArgs = { ...(args ?? {}) };
-      nextArgs.sourceBlockId = matches[0].id;
-      record.args = nextArgs;
-      record.toolArgs = nextArgs;
-      record.sourceBlockId = matches[0].id;
-      fixes.push({
-        kind: 'fs_write_sourceBlockId_canonicalized',
-        actionIndex: index,
-        actionId: stringValue(record.actionId) ?? stringValue(record.id),
-        path: normalizedTarget,
-        sourceBlockId: matches[0].id,
-        reason: 'unique_codeBlock_targetPath_match',
-      });
-    }
-
-    for (const [index, action] of actions.entries()) {
-      const record = objectRecord(action);
-      if (!record) continue;
-      const capability = this.ports.actionEffectiveCapability(record);
-      const actionKind = stringValue(record.kind);
-      const patchLike = capability === 'fs.patch' || ['patch', 'replaceBlock', 'insertBefore', 'insertAfter'].includes(actionKind ?? '');
-      if (!patchLike) continue;
-      const args = objectRecord(record.args) ?? objectRecord(record.toolArgs);
-      const nextArgs = { ...(args ?? {}) };
-      const targetPath = this.ports.actionFileTargetPath(record);
-      const normalizedTarget = targetPath ? normalizePlanScope(targetPath) : '';
-      const explicitBlockId = stringValue(record.replacementBlockId)
-        ?? stringValue(nextArgs.replacementBlockId)
-        ?? stringValue(record.sourceBlockId)
-        ?? stringValue(nextArgs.sourceBlockId);
-      let block = explicitBlockId ? blocks.find((item) => item.id === explicitBlockId) : undefined;
-      if (!block && normalizedTarget) {
-        const matches = blocks.filter((item) => item.targetPath === normalizedTarget);
-        if (matches.length === 1) block = matches[0];
-      }
-
-      let changed = false;
-      const argsPatchSpec = objectRecord(nextArgs.patchSpec);
-      const recordPatchSpec = objectRecord(record.patchSpec);
-      let patchSpec = recordPatchSpec ?? argsPatchSpec;
-      if (!patchSpec) {
-        const diffText = stringValue(record.patchSpec)
-          ?? stringValue(nextArgs.patchSpec)
-          ?? blockText(block?.record);
-        const parsed = diffText ? parseSingleHunkUnifiedDiff(diffText) : undefined;
-        if (parsed) {
-          patchSpec = {
-            match: {
-              kind: 'exactBlock',
-              text: parsed.matchText,
-            },
-          };
-          if (block) {
-            block.record.content = parsed.replacementText;
-            block.record.contentLines = parsed.replacementText.split('\n');
-            block.record.operation = stringValue(block.record.operation) ?? 'patch';
-          }
-          changed = true;
-        }
-      }
-      if (patchSpec && !recordPatchSpec) {
-        record.patchSpec = patchSpec;
-        changed = true;
-      }
-      if (patchSpec && !argsPatchSpec) {
-        nextArgs.patchSpec = patchSpec;
-        changed = true;
-      }
-      if (block) {
-        const replacementBlockId = stringValue(record.replacementBlockId) ?? stringValue(nextArgs.replacementBlockId);
-        const sourceBlockId = stringValue(record.sourceBlockId) ?? stringValue(nextArgs.sourceBlockId);
-        if (!replacementBlockId && !sourceBlockId) {
-          record.replacementBlockId = block.id;
-          nextArgs.replacementBlockId = block.id;
-          changed = true;
-        } else if (!stringValue(record.replacementBlockId) && replacementBlockId) {
-          record.replacementBlockId = replacementBlockId;
-          changed = true;
-        } else if (!stringValue(record.sourceBlockId) && sourceBlockId) {
-          record.sourceBlockId = sourceBlockId;
-          changed = true;
-        }
-      }
-      if (!changed) continue;
-      record.args = nextArgs;
-      record.toolArgs = nextArgs;
-      fixes.push({
-        kind: 'fs_patch_shape_canonicalized',
-        actionIndex: index,
-        actionId: stringValue(record.actionId) ?? stringValue(record.id),
-        path: normalizedTarget,
-        replacementBlockId: stringValue(record.replacementBlockId),
-        reason: 'structured_patch_shape',
-      });
-    }
-
-    if (!fixes.length) return;
-    const diagnostics = objectRecord(proposal.parserDiagnostics);
-    proposal.parserDiagnostics = {
-      ...(diagnostics ?? {}),
-      canonicalizations: [
-        ...(Array.isArray(diagnostics?.canonicalizations) ? diagnostics.canonicalizations : []),
-        ...fixes,
-      ],
-    };
-  }
-
   validateProposalSemantics(proposal: ProposalEnvelope, options?: {
     allowBriefActionBundleUserPlan?: boolean;
   }): void {
-    if (proposal.kind === 'taskPlan' || proposal.kind === 'implementationPlan') {
+    if (proposal.kind === 'taskPlan') {
       this.validateTaskPlanSemantics(proposal);
       return;
     }
@@ -280,112 +132,90 @@ export class ProposalSemanticValidator {
     const payload = objectRecord(proposal.payload) ?? {};
     const bundle = this.ports.readActionBundle(proposal);
     if (!bundle) {
-      throw new AgentPlanParseError('invalid_action_bundle', 'Agent Protocol v3.actionBundle must include an actionBundle object.');
+      throw new AgentPlanParseError('invalid_action_bundle', 'Agent Protocol v4.actionBundle must include an actionBundle object.');
     }
     if (typeof bundle.id !== 'string' || !bundle.id.trim()) {
-      throw new AgentPlanParseError('invalid_action_bundle', 'Agent Protocol v3.actionBundle.id must be a non-empty string.');
+      throw new AgentPlanParseError('invalid_action_bundle', 'Agent Protocol v4.actionBundle.id must be a non-empty string.');
     }
     if (bundle.version !== '1') {
-      throw new AgentPlanParseError('invalid_action_bundle', 'Agent Protocol v3.actionBundle.version must be "1".');
+      throw new AgentPlanParseError('invalid_action_bundle', 'Agent Protocol v4.actionBundle.version must be "1".');
     }
     if (typeof bundle.goal !== 'string' || !bundle.goal.trim()) {
-      throw new AgentPlanParseError('invalid_action_bundle', 'Agent Protocol v3.actionBundle.goal must be a non-empty string.');
+      throw new AgentPlanParseError('invalid_action_bundle', 'Agent Protocol v4.actionBundle.goal must be a non-empty string.');
     }
     if (!Array.isArray(bundle.actions) || bundle.actions.length === 0) {
-      throw new AgentPlanParseError('invalid_action_bundle', 'Agent Protocol v3.actionBundle.actions must not be empty.');
+      throw new AgentPlanParseError('invalid_action_bundle', 'Agent Protocol v4.actionBundle.actions must not be empty.');
     }
-    const codeBlocks = Array.isArray(payload.codeBlocks) ? payload.codeBlocks : [];
-    const codeBlockIds = new Set<string>();
-    let totalCodeBytes = 0;
-    for (const [index, block] of codeBlocks.entries()) {
+    const contentBlocks = Array.isArray(payload.contentBlocks) ? payload.contentBlocks : [];
+    const contentBlockIds = new Set<string>();
+    for (const [index, block] of contentBlocks.entries()) {
       const record = objectRecord(block);
-      const blockId = typeof record?.id === 'string' ? record.id.trim() : '';
+      const blockId = stringValue(record?.blockId) ?? '';
       if (!blockId) {
-        throw new AgentPlanParseError('invalid_action_bundle', `codeBlocks[${index}].id must be a non-empty string.`);
+        throw new AgentPlanParseError('invalid_action_bundle', `contentBlocks[${index}].blockId must be a non-empty string.`);
       }
-      codeBlockIds.add(blockId);
-      const content = typeof record?.content === 'string' ? record.content : '';
+      contentBlockIds.add(blockId);
+      const contentLines = Array.isArray(record?.contentLines)
+        ? record.contentLines.filter((line): line is string => typeof line === 'string')
+        : [];
+      const content = contentLines.join('\n');
       const size = utf8Bytes(content);
-      totalCodeBytes += size;
       const operation = typeof record?.operation === 'string' ? record.operation : '';
       const allowEmptyContent = record?.allowEmptyContent === true;
       if (size === 0 && !(allowEmptyContent && ['createEmpty', 'patch', 'replaceBlock', 'insertBefore', 'insertAfter'].includes(operation))) {
         throw new AgentPlanParseError(
           'invalid_action_bundle',
-          `codeBlocks[${index}].content must be non-empty. Empty content is allowed only with operation="createEmpty" for an explicit empty file or with patch/replace/insert operations; do not use empty .gitkeep or placeholder writes to create directories.`
+          `contentBlocks[${index}].contentLines must be non-empty. Empty content is allowed only with operation="createEmpty" and allowEmptyContent=true.`
         );
       }
     }
-    if (totalCodeBytes > this.ports.maxActionBundleTotalCodeBytes) {
-      throw new AgentPlanParseError(
-        'action_bundle_budget_exceeded',
-        `codeBlocks total content is ${totalCodeBytes} bytes; reorganize the implementation by module, file section, class, or function so this actionBundle stays within the ${this.ports.maxActionBundleTotalCodeBytes} byte payload budget without reducing the accepted plan scope.`
-      );
-    }
     for (const [index, action] of bundle.actions.entries()) {
-      if (typeof action.id !== 'string' || !action.id.trim()) {
-        throw new AgentPlanParseError('invalid_action_bundle', `actionBundle.actions[${index}].id must be a non-empty string.`);
+      const toolId = action.toolId.trim();
+      if (!action.actionId.trim() || !toolId || !objectRecord(action.args)) {
+        throw new AgentPlanParseError('invalid_action_bundle', `actionBundle.actions[${index}] requires actionId, toolId, and typed args.`);
       }
-      if (typeof action.title !== 'string' || !action.title.trim()) {
-        throw new AgentPlanParseError('invalid_action_bundle', `actionBundle.actions[${index}].title must be a non-empty string.`);
-      }
-      if (typeof action.capability !== 'string' || !action.capability.trim()) {
-        throw new AgentPlanParseError('invalid_action_bundle', `actionBundle.actions[${index}].capability must be a non-empty string.`);
-      }
-      if (!Array.isArray(action.resourceScope)) {
-        throw new AgentPlanParseError('invalid_action_bundle', `actionBundle.actions[${index}].resourceScope must be an array.`);
-      }
-      const actionKind = typeof action.kind === 'string' ? action.kind : '';
-      const effectiveActionKind = actionKind || (action.capability === 'fs.patch' ? 'patch' : '');
-      const isPatchAction = ['patch', 'replaceBlock', 'insertBefore', 'insertAfter'].includes(effectiveActionKind);
-      const replacementBlockId = typeof action.replacementBlockId === 'string'
-        ? action.replacementBlockId.trim()
-        : '';
-      if (action.capability === 'fs.delete') {
-        const deleteTargetError = this.deleteActionTargetError(action);
-        if (deleteTargetError) {
-          throw new AgentPlanParseError('invalid_action_bundle', `actionBundle.actions[${index}] ${deleteTargetError}`);
-        }
-        if (action.sourceBlockId?.trim() || replacementBlockId) {
-          throw new AgentPlanParseError('invalid_action_bundle', `actionBundle.actions[${index}] fs.delete must not reference codeBlocks/sourceBlockId.`);
+      const args = action.args;
+      const contentBlockId = stringValue(args.contentBlockId);
+      const replacementBlockId = stringValue(args.replacementBlockId);
+      if (toolId === 'fs.delete') {
+        if (contentBlockId || replacementBlockId) {
+          throw new AgentPlanParseError('invalid_action_bundle', `actionBundle.actions[${index}] fs.delete must not reference content blocks.`);
         }
       }
-      if (action.capability === 'fs.write' && !isPatchAction && !action.sourceBlockId?.trim()) {
-        throw new AgentPlanParseError('invalid_action_bundle', `actionBundle.actions[${index}] ${action.capability} must include sourceBlockId.`);
+      if ((toolId === 'fs.create' || toolId === 'fs.write') && !contentBlockId) {
+        throw new AgentPlanParseError('invalid_action_bundle', `actionBundle.actions[${index}] ${toolId} must include args.contentBlockId.`);
       }
-      if (isPatchAction && !(replacementBlockId || action.sourceBlockId?.trim())) {
-        throw new AgentPlanParseError('invalid_action_bundle', `actionBundle.actions[${index}] patch action must include replacementBlockId or sourceBlockId.`);
+      if (toolId === 'fs.edit' && !replacementBlockId) {
+        throw new AgentPlanParseError('invalid_action_bundle', `actionBundle.actions[${index}] fs.edit must include args.replacementBlockId.`);
       }
-      if (isPatchAction) {
+      if (toolId === 'fs.edit') {
         const patchSpecError = this.patchActionSpecError(action);
         if (patchSpecError) {
           throw new AgentPlanParseError('invalid_action_bundle', `actionBundle.actions[${index}] ${patchSpecError}`);
         }
       }
-      if (action.sourceBlockId && !codeBlockIds.has(action.sourceBlockId)) {
+      if (contentBlockId && !contentBlockIds.has(contentBlockId)) {
         throw new AgentPlanParseError(
           'invalid_action_bundle',
-          `actionBundle.actions[${index}].sourceBlockId "${action.sourceBlockId}" does not match any codeBlocks[].id.`
+          `actionBundle.actions[${index}].args.contentBlockId "${contentBlockId}" does not match any contentBlocks[].blockId.`
         );
       }
-      if (replacementBlockId && !codeBlockIds.has(replacementBlockId)) {
+      if (replacementBlockId && !contentBlockIds.has(replacementBlockId)) {
         throw new AgentPlanParseError(
           'invalid_action_bundle',
-          `actionBundle.actions[${index}].replacementBlockId "${replacementBlockId}" does not match any codeBlocks[].id.`
+          `actionBundle.actions[${index}].args.replacementBlockId "${replacementBlockId}" does not match any contentBlocks[].blockId.`
         );
       }
     }
-    const sideEffectful = bundle.actions.some((action) => this.ports.sideEffectCapabilities.has(action.capability));
+    const sideEffectful = bundle.actions.some((action) => this.ports.sideEffectToolIds.has(action.toolId));
     if (!sideEffectful) return;
-    for (const [index, block] of codeBlocks.entries()) {
+    for (const [index, block] of contentBlocks.entries()) {
       const record = objectRecord(block);
-      const hasPath = typeof record?.path === 'string' && record.path.trim();
-      const hasTargetPath = typeof record?.targetPath === 'string' && record.targetPath.trim();
-      if (!hasPath && !hasTargetPath) {
-        throw new AgentPlanParseError('invalid_action_bundle', `codeBlocks[${index}] must include path or targetPath.`);
+      if (!stringValue(record?.targetPath)) {
+        throw new AgentPlanParseError('invalid_action_bundle', `contentBlocks[${index}].targetPath must be a non-empty string.`);
       }
-      if (typeof record?.content !== 'string') {
-        throw new AgentPlanParseError('invalid_action_bundle', `codeBlocks[${index}].content must be a string.`);
+      if (!Array.isArray(record?.contentLines)) {
+        throw new AgentPlanParseError('invalid_action_bundle', `contentBlocks[${index}].contentLines must be an array.`);
       }
     }
     let userPlan = typeof payload.userPlan === 'string' ? payload.userPlan.trim() : '';
@@ -395,14 +225,11 @@ export class ProposalSemanticValidator {
           goal: bundle.goal,
           actions: bundle.actions as unknown as Record<string, unknown>[],
           existingUserPlan: userPlan,
-          outputLanguage: stringValue(payload.outputLanguage)
-            ?? stringValue((proposal as unknown as Record<string, unknown>).outputLanguage),
+          outputLanguage: stringValue(payload.outputLanguage),
         });
         payload.userPlan = generatedUserPlan;
-        payload.userPlanMarkdown = generatedUserPlan;
         userPlan = generatedUserPlan.trim();
       }
-      this.validateDetailedUserPlan(userPlan);
     }
     const validationExpectations = Array.isArray(bundle.validationExpectations) ? bundle.validationExpectations : [];
     const reviewExpectations = Array.isArray(bundle.reviewExpectations) ? bundle.reviewExpectations : [];
@@ -417,24 +244,27 @@ export class ProposalSemanticValidator {
   private validateTaskPlanSemantics(proposal: ProposalEnvelope): void {
     const plan = objectRecord(proposal.payload) ?? {};
     const tasks = Array.isArray(plan.tasks) ? plan.tasks : [];
+    const taskPositions = new Map<string, number>();
+    for (const [index, item] of tasks.entries()) {
+      const taskId = stringValue((objectRecord(item) ?? {}).taskId);
+      if (!taskId) {
+        throw new AgentPlanParseError('invalid_task_plan', `taskPlan.tasks[${index}].taskId must be non-empty.`);
+      }
+      if (taskPositions.has(taskId)) {
+        throw new AgentPlanParseError('invalid_task_plan', `taskPlan taskId ${taskId} must be unique.`);
+      }
+      taskPositions.set(taskId, index);
+    }
     for (const [index, item] of tasks.entries()) {
       const record = objectRecord(item) ?? {};
-      const targets = [
-        ...stringArrayValue(record.target),
-        ...stringArrayValue(record.targets),
-      ];
+      const taskId = stringValue(record.taskId)!;
+      const targets = stringArrayValue(record.target);
       if (!targets.length) {
         throw new AgentPlanParseError('invalid_task_plan', `taskPlan.tasks[${index}].target must include at least one concrete target.`);
       }
-      if (targets.some((target) => isRootScopeTarget(target))) {
-        throw new AgentPlanParseError('invalid_task_plan', `taskPlan.tasks[${index}].target must not use workspace root, project root, ".", "/", or other root-scope aliases; list concrete file or directory targets instead.`);
-      }
-      const capability = stringValue(record.capability);
-      if (!capability) {
-        throw new AgentPlanParseError('invalid_task_plan', `taskPlan.tasks[${index}].capability must be a non-empty Kernel capability such as fs.write, fs.patch, fs.delete, process.exec, git.read, git.write, network.egress, or browser.control.`);
-      }
-      if (!TASK_PLAN_CAPABILITIES.has(capability)) {
-        throw new AgentPlanParseError('invalid_task_plan', `taskPlan.tasks[${index}].capability is not supported in taskPlan: ${capability}.`);
+      const toolId = stringValue(record.toolId);
+      if (!toolId) {
+        throw new AgentPlanParseError('invalid_task_plan', `taskPlan.tasks[${index}].toolId must be a non-empty Kernel catalog tool ID.`);
       }
       if (!stringArrayValue(record.acceptanceCriteria).length) {
         throw new AgentPlanParseError('invalid_task_plan', `taskPlan.tasks[${index}].acceptanceCriteria must include at least one reviewable criterion.`);
@@ -442,38 +272,29 @@ export class ProposalSemanticValidator {
       if (!stringArrayValue(record.failureCriteria).length) {
         throw new AgentPlanParseError('invalid_task_plan', `taskPlan.tasks[${index}].failureCriteria must include at least one stop or replan criterion.`);
       }
-    }
-  }
-
-  private deleteActionTargetError(action: ActionBundleDraft['actions'][number]): string | undefined {
-    const target = this.ports.actionFileTargetPath(action as unknown as Record<string, unknown>);
-    if (!target) {
-      return 'fs.delete must include a concrete targetPath or resourceScope[0].';
-    }
-    const normalized = normalizeSlashes(target);
-    if (!normalized || normalized === '.' || normalized === './') {
-      return 'fs.delete target cannot be empty or the workspace root.';
-    }
-    if (normalized === '..' || normalized.startsWith('../') || normalized.includes('/../')) {
-      return 'fs.delete target cannot escape the primary workspace root.';
-    }
-    if (normalized.includes('*')) {
-      return 'fs.delete target must name concrete files; wildcard cleanup is not allowed.';
-    }
-    if (this.ports.deleteActionTargetResourceKind(action as unknown as Record<string, unknown>) === 'directory') {
-      if (!this.ports.deleteActionRecursive(action as unknown as Record<string, unknown>) && normalized.endsWith('/')) {
-        return 'fs.delete directory target with trailing slash must set recursive=true or use the normalized directory path.';
+      if (!Array.isArray(record.dependencies)) {
+        throw new AgentPlanParseError('invalid_task_plan', `taskPlan.tasks[${index}].dependencies must be an explicit string array.`);
       }
-      return undefined;
+      for (const dependency of stringArrayValue(record.dependencies)) {
+        const dependencyIndex = taskPositions.get(dependency);
+        if (dependencyIndex === undefined) {
+          throw new AgentPlanParseError(
+            'invalid_task_plan',
+            `taskPlan task ${taskId} references unknown dependency ${dependency}.`
+          );
+        }
+        if (dependencyIndex >= index) {
+          throw new AgentPlanParseError(
+            'invalid_task_plan',
+            `taskPlan task ${taskId} dependency ${dependency} must reference an earlier task.`
+          );
+        }
+      }
     }
-    if (normalized.endsWith('/')) {
-      return 'fs.delete directory target must set targetKind="directory" and recursive=true when deleting a directory tree.';
-    }
-    return undefined;
   }
 
   private patchActionSpecError(action: ActionBundleDraft['actions'][number]): string | undefined {
-    const patchSpec = objectRecord(action.patchSpec);
+    const patchSpec = objectRecord(action.args.patchSpec);
     if (!patchSpec) {
       return 'patch action must include patchSpec.';
     }
@@ -492,42 +313,7 @@ export class ProposalSemanticValidator {
     return undefined;
   }
 
-  private validateDetailedUserPlan(userPlan: string): void {
-    if (userPlan.length < 240) {
-      throw new AgentPlanParseError(
-        'action_bundle_plan_required',
-        'Side-effect actionBundle must include a detailed Markdown userPlan, not a one-line summary.'
-      );
-    }
-    const headings = userPlan
-      .split(/\r?\n/)
-      .filter((line) => /^#{1,3}\s+\S/.test(line.trim()));
-    const listItems = userPlan
-      .split(/\r?\n/)
-      .filter((line) => /^\s*[-*+]\s+\S/.test(line));
-    if (headings.length < 4 || listItems.length < 3) {
-      throw new AgentPlanParseError(
-        'action_bundle_plan_required',
-        'Side-effect actionBundle.userPlan must use structured Markdown with multiple headings and concrete reviewable items; localized headings are accepted.'
-      );
-    }
-  }
 }
-
-const TASK_PLAN_CAPABILITIES = new Set([
-  'fs.read',
-  'fs.write',
-  'fs.patch',
-  'fs.delete',
-  'fs.rename',
-  'process.exec',
-  'git.read',
-  'git.write',
-  'git.push',
-  'network.egress',
-  'browser.control',
-  'provider.egress',
-]);
 
 function objectRecord(value: unknown): Record<string, unknown> | undefined {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
@@ -544,76 +330,6 @@ function stringArrayValue(value: unknown): string[] {
     return value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0).map((item) => item.trim());
   }
   return typeof value === 'string' && value.trim() ? [value.trim()] : [];
-}
-
-function blockText(block: Record<string, unknown> | undefined): string | undefined {
-  if (!block) return undefined;
-  const content = stringValue(block.content);
-  if (content) return content;
-  const lines = Array.isArray(block.contentLines)
-    ? block.contentLines.map((line) => typeof line === 'string' ? line : undefined)
-    : [];
-  return lines.every((line): line is string => line !== undefined) && lines.length
-    ? lines.join('\n')
-    : undefined;
-}
-
-function parseSingleHunkUnifiedDiff(value: string): { matchText: string; replacementText: string } | undefined {
-  const oldLines: string[] = [];
-  const newLines: string[] = [];
-  let changed = false;
-  for (const line of value.split(/\r?\n/)) {
-    if (!line || line.startsWith('---') || line.startsWith('+++') || line.startsWith('@@')) continue;
-    if (line.startsWith('-')) {
-      oldLines.push(line.slice(1));
-      changed = true;
-      continue;
-    }
-    if (line.startsWith('+')) {
-      newLines.push(line.slice(1));
-      changed = true;
-      continue;
-    }
-    if (line.startsWith(' ')) {
-      oldLines.push(line.slice(1));
-      newLines.push(line.slice(1));
-      continue;
-    }
-    oldLines.push(line);
-    newLines.push(line);
-  }
-  if (!changed || !oldLines.length || !newLines.length) return undefined;
-  return {
-    matchText: oldLines.join('\n'),
-    replacementText: newLines.join('\n'),
-  };
-}
-
-function normalizePlanScope(value: string): string {
-  return value
-    .replace(/\\/g, '/')
-    .replace(/^\.\//, '')
-    .replace(/\/+/g, '/')
-    .trim();
-}
-
-function normalizeSlashes(value: string): string {
-  return value.trim().replace(/\\/g, '/').replace(/\/+/g, '/');
-}
-
-function isRootScopeTarget(value: string): boolean {
-  const normalized = normalizeSlashes(value)
-    .replace(/\/+$/, '')
-    .toLowerCase();
-  return normalized === '' ||
-    normalized === '.' ||
-    normalized === './' ||
-    normalized === '/' ||
-    normalized === 'root' ||
-    normalized === 'workspace root' ||
-    normalized === 'project root' ||
-    normalized === 'repository root' ||
-    normalized === 'repo root';
 }
 
 function utf8Bytes(value: string): number {

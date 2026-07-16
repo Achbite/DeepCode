@@ -83,7 +83,7 @@ export interface TerminalGuidanceRevisionCoordinatorPorts<
   ): AgentEvent;
   diagnosticEvent(sessionId: string, message: string, ts: string, id: string): AgentEvent;
   assembleContext(input: ContextAssemblyInput): ContextAssemblyResult;
-  capabilityCatalogSummary(state: State): string;
+  toolCatalogSummary(state: State): string;
   implementationBatchHints(state: State): string[];
   appendConsumedGuidanceEvents(input: {
     sessionId: string;
@@ -136,7 +136,7 @@ export class TerminalGuidanceRevisionCoordinator<
       contextAssemblyId: this.ports.createId('context-assembly-guidance-revision'),
       workflowState: 'guidanceRevision',
       allowedProposals: ['answer'],
-      capabilityCatalogSummary: this.ports.capabilityCatalogSummary(state),
+      toolCatalogSummary: this.ports.toolCatalogSummary(state),
       memoryDocument: state.memoryDocument,
       projectMemoryMode: input.projectMemoryMode,
       extraMemoryHints: this.ports.implementationBatchHints(state),

@@ -21,7 +21,10 @@ export interface ResourceManifestBuilderInput {
   existingEvents?: AgentEvent[];
   workspaceBinding?: AgentWorkspaceBinding;
   projectWorkingDirectory?: ProjectWorkingDirectory;
-  acceptedImplementationPlan?: {
+  projectId?: string;
+  projectKind?: 'folder' | 'blank';
+  projectRootStatus?: 'ready' | 'unbound' | 'unavailable';
+  acceptedTaskPlan?: {
     executionRoot?: {
       ref: string;
       attachment: AgentContextAttachment;
@@ -56,6 +59,7 @@ export class ResourceManifestBuilder {
       if (attachment.kind !== 'file' && attachment.kind !== 'directory') return;
       const resourceRef = attachment.absolutePath ?? attachment.path;
       if (!resourceRef) return;
+      const resourceId = attachment.resourceId ?? externalResourceId(attachment, this.ports.comparablePath(resourceRef));
       const refKey = this.ports.comparablePath(resourceRef);
       if (!addToManifest && seenRootRefs.has(refKey)) return;
       if (addToManifest && seenEntryRefs.has(refKey) && seenRootRefs.has(refKey)) return;
@@ -63,9 +67,11 @@ export class ResourceManifestBuilder {
         id: this.manifestEntryId(attachment, index, source),
         kind: attachment.kind,
         label: `${attachment.kind === 'directory' ? 'Directory' : 'File'} ${attachment.path || resourceRef}`,
-        resourceRef,
+        resourceRef: '.',
         readPolicy: 'autoRead',
         reason,
+        rootId: attachment.kind === 'directory' ? this.manifestEntryId(attachment, index, source) : undefined,
+        resourceId,
       };
       if (addToManifest && !seenEntryRefs.has(refKey)) {
         seenEntryRefs.add(refKey);
@@ -79,30 +85,12 @@ export class ResourceManifestBuilder {
           label: entry.label,
           displayPath: attachment.path || resourceRef,
           absolutePath: attachment.absolutePath ?? (this.ports.isAbsolutePath(resourceRef) ? resourceRef : undefined),
+          resourceId,
           source,
           primary: this.ports.comparablePath(resourceRef) === primaryRootRef,
         });
       }
     };
-
-    (input.attachments ?? []).forEach((attachment, index) => {
-      addAttachment(
-        attachment,
-        index,
-        attachment.scope === 'session' ? 'sessionAttachment' : 'currentAttachment',
-        'Explicit user attachment for the current user turn.'
-      );
-    });
-
-    this.recentAttachmentFacts(input.existingEvents ?? []).forEach((attachment, index) => {
-      addAttachment(
-        attachment,
-        index,
-        'recentAttachment',
-        'Recent explicit user attachment selected from session projection.',
-        false
-      );
-    });
 
     if (input.projectWorkingDirectory?.absolutePath || input.projectWorkingDirectory?.displayPath) {
       const workingDirectory = input.projectWorkingDirectory;
@@ -117,9 +105,16 @@ export class ResourceManifestBuilder {
           id: rootId,
           kind: 'directory',
           label,
-          resourceRef,
+          resourceRef: '.',
           readPolicy: 'autoRead',
           reason: 'Project working directory for the current turn.',
+          rootId,
+          contextUse: 'workspaceBootstrap',
+          directoryOptions: {
+            maxDepth: 1,
+            maxEntries: 200,
+            includeContent: false,
+          },
         });
       }
       if (!seenRootRefs.has(refKey)) {
@@ -146,9 +141,16 @@ export class ResourceManifestBuilder {
           id: rootId,
           kind: 'directory',
           label,
-          resourceRef,
+          resourceRef: '.',
           readPolicy: 'autoRead',
           reason: 'Editor workspace binding for the current turn.',
+          rootId,
+          contextUse: 'workspaceBootstrap',
+          directoryOptions: {
+            maxDepth: 1,
+            maxEntries: 200,
+            includeContent: false,
+          },
         });
       }
       if (!seenRootRefs.has(refKey)) {
@@ -165,6 +167,25 @@ export class ResourceManifestBuilder {
       }
     }
 
+    (input.attachments ?? []).forEach((attachment, index) => {
+      addAttachment(
+        attachment,
+        index,
+        attachment.scope === 'session' ? 'sessionAttachment' : 'currentAttachment',
+        'Explicit user attachment for the current user turn.'
+      );
+    });
+
+    this.recentAttachmentFacts(input.existingEvents ?? []).forEach((attachment, index) => {
+      addAttachment(
+        attachment,
+        index,
+        'recentAttachment',
+        'Recent explicit user attachment selected from session projection.',
+        false
+      );
+    });
+
     const workspaceScopeKey = [
       input.workspaceBinding?.workspaceId,
       input.workspaceBinding?.workspaceHash,
@@ -176,6 +197,10 @@ export class ResourceManifestBuilder {
         id,
         workspaceScopeKey,
         workspaceId: input.workspaceBinding?.workspaceId,
+        workspaceBindingHash: input.workspaceBinding?.workspaceHash,
+        projectId: input.projectId,
+        projectKind: input.projectKind,
+        projectRootStatus: input.projectRootStatus,
         entries,
         budget: {
           maxEntries: Math.max(this.ports.maxDerivedManifestEntries, entries.length),
@@ -188,23 +213,17 @@ export class ResourceManifestBuilder {
   }
 
   kernelRunAttachments(input: ResourceManifestBuilderInput): AgentContextAttachment[] {
-    if (input.acceptedImplementationPlan?.executionRoot) {
-      return this.uniqueAttachments([input.acceptedImplementationPlan.executionRoot.attachment]);
+    const attachments: AgentContextAttachment[] = [];
+    if (input.acceptedTaskPlan?.executionRoot) {
+      const executionRoot = input.acceptedTaskPlan.executionRoot;
+      const projectRoot = input.projectWorkingDirectory?.absolutePath ?? input.projectWorkingDirectory?.displayPath;
+      if (!input.projectId || !projectRoot || this.ports.comparablePath(executionRoot.ref) !== this.ports.comparablePath(projectRoot)) {
+        attachments.push(executionRoot.attachment);
+      }
     }
-    const attachments = this.uniqueAttachments(input.attachments ?? []);
-    if (input.projectWorkingDirectory?.absolutePath || input.projectWorkingDirectory?.displayPath) {
-      const workingDirectory = input.projectWorkingDirectory;
-      attachments.push({
-        kind: 'directory',
-        path: workingDirectory.displayPath,
-        absolutePath: workingDirectory.absolutePath,
-        source: 'userSelected',
-        scope: 'session',
-        rootId: workingDirectory.rootId,
-      } as AgentContextAttachment);
-    }
+    attachments.push(...this.uniqueAttachments(input.attachments ?? []));
     const directoryAttachments = attachments.filter((attachment) => attachment.kind === 'directory');
-    if (directoryAttachments.length === 0) {
+    if (directoryAttachments.length === 0 && !input.projectWorkingDirectory) {
       const recentDirectories = this.uniqueAttachments(this.recentAttachmentFacts(input.existingEvents ?? []))
         .filter((attachment) => attachment.kind === 'directory');
       if (recentDirectories.length === 1) {
@@ -214,21 +233,30 @@ export class ResourceManifestBuilder {
         });
       }
     }
-    return this.uniqueAttachments(attachments);
+    return this.uniqueAttachments(attachments).map((attachment) => {
+      const ref = attachment.absolutePath ?? attachment.path;
+      return {
+        ...attachment,
+        resourceId: attachment.resourceId ?? externalResourceId(attachment, this.ports.comparablePath(ref)),
+      };
+    });
   }
 
   primaryConversationRootRef(input: ResourceManifestBuilderInput): string | undefined {
-    if (input.acceptedImplementationPlan?.executionRoot?.ref) {
-      return this.ports.comparablePath(input.acceptedImplementationPlan.executionRoot.ref);
+    if (input.projectWorkingDirectory?.absolutePath || input.projectWorkingDirectory?.displayPath) {
+      return this.ports.comparablePath(input.projectWorkingDirectory.absolutePath ?? input.projectWorkingDirectory.displayPath);
+    }
+    if (input.workspaceBinding?.openPath) {
+      return this.ports.comparablePath(input.workspaceBinding.openPath);
+    }
+    if (input.acceptedTaskPlan?.executionRoot?.ref) {
+      return this.ports.comparablePath(input.acceptedTaskPlan.executionRoot.ref);
     }
     const currentDirectories = (input.attachments ?? [])
       .filter((attachment) => attachment.kind === 'directory')
       .map((attachment) => attachment.absolutePath ?? attachment.path)
       .filter((value): value is string => Boolean(value && value.trim()));
     if (currentDirectories.length === 1) return this.ports.comparablePath(currentDirectories[0]);
-    if (input.projectWorkingDirectory?.absolutePath || input.projectWorkingDirectory?.displayPath) {
-      return this.ports.comparablePath(input.projectWorkingDirectory.absolutePath ?? input.projectWorkingDirectory.displayPath);
-    }
     const recentDirectories = this.recentAttachmentFacts(input.existingEvents ?? [])
       .filter((attachment) => attachment.kind === 'directory')
       .map((attachment) => attachment.absolutePath ?? attachment.path)
@@ -290,4 +318,14 @@ function objectRecord(value: unknown): Record<string, unknown> | undefined {
 
 function sanitizeId(value: string): string {
   return value.replace(/[^a-zA-Z0-9._/-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 128) || 'resource';
+}
+
+function externalResourceId(attachment: AgentContextAttachment, comparableRef: string): string {
+  let hash = 0x811c9dc5;
+  const input = `${attachment.kind}:${comparableRef}`;
+  for (let index = 0; index < input.length; index += 1) {
+    hash ^= input.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return `external-resource-${hash.toString(16).padStart(8, '0')}`;
 }

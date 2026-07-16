@@ -66,9 +66,7 @@ export class KernelEventStatusIndex {
   hasFailureOrBlocker(events: unknown[]): boolean {
     return events.some((event) => {
       const record = objectRecord(event);
-      return record?.kind === 'work_unit.failed' ||
-        record?.kind === 'work_unit.blocked' ||
-        (record?.kind === 'stage.changed' && ['blocked', 'failed'].includes(stringValue(record.phase) ?? ''));
+      return record?.kind === 'work_unit.failed' || record?.kind === 'work_unit.blocked';
     });
   }
 
@@ -80,10 +78,7 @@ export class KernelEventStatusIndex {
     if (this.hasPermissionRequest(events)) {
       return false;
     }
-    if (events.some((event) => {
-      const record = objectRecord(event);
-      return record?.kind === 'stage.changed' && stringValue(record.phase) === 'review';
-    })) {
+    if (events.some((event) => objectRecord(event)?.kind === 'batch.review_ready')) {
       return true;
     }
     const queued = new Set<string>();

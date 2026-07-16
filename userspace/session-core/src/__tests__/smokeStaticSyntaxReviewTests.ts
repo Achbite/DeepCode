@@ -1,5 +1,5 @@
 import type { LlmChatRequest, ProjectionDelta } from '@deepcode/protocol';
-import type { AcceptedImplementationPlanContext } from '../driver/execution/index.js';
+import type { AcceptedTaskPlanContext } from '../driver/execution/index.js';
 import { ContextFrameBuilder } from '../driver/context/contextFrameBuilder.js';
 import {
   AcceptedPlanStaticSyntaxReviewCoordinator,
@@ -86,7 +86,7 @@ export async function assertAcceptedPlanStaticSyntaxReviewCoordinatorBuildsEvent
     profileId: `profile-${token}`,
     state,
     prompt: smokePromptEnvelope(`stable-${token}`),
-    accepted: { planId } as unknown as AcceptedImplementationPlanContext,
+    accepted: { planId } as unknown as AcceptedTaskPlanContext,
     batch: {},
     batchEvents: [],
   });
@@ -158,7 +158,7 @@ export async function assertAcceptedPlanStaticSyntaxReviewCoordinatorTimesOut():
   const events = await coordinator.run({
     state,
     prompt: smokePromptEnvelope(`stable-${token}`),
-    accepted: { planId } as unknown as AcceptedImplementationPlanContext,
+    accepted: { planId } as unknown as AcceptedTaskPlanContext,
     batch: {},
     batchEvents: [],
   });

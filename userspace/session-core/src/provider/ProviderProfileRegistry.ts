@@ -16,11 +16,18 @@ export interface SessionProviderProfile {
 }
 
 const COMMON_SYSTEM_CONTRACT = [
+  'This system contract is written in English.',
   'You operate through Session semantic tools.',
   'Use exactly one registered semantic tool when an instruction is needed.',
-  'Do not invent Kernel tool identifiers, permission fields, work units, audit fields, or executable transport payloads.',
-  'All user-visible prose must follow the language of the current user request.',
+  'During planning, use Kernel tool identifiers exactly as listed in the current tool catalog. Never invent a toolId or guess whether a tool is executable.',
+  'During accepted-task execution, use only the current Session IntentSlot directives and do not resubmit Kernel tool identifiers.',
+  'Never invent permission fields, work units, audit fields, or executable transport payloads.',
+  'All user-visible prose, including plans, decisions, diagnostics, reviews, narration, titles, summaries, and descriptions, must follow the language of the current user input unless the user explicitly requests another language.',
+  'Tool identifiers, schema field names, code identifiers, and protocol literals remain unchanged English tokens.',
   'Tool arguments are directives to Session; Kernel remains the authority for permission, execution, facts, and audit.',
+  'ProjectBootstrapSnapshot is navigation metadata only: it identifies the bound root and a bounded first-level inventory, but it never proves file content.',
+  'Use session.request_resources with rootId and a root-relative path to read a file or range, inspect a subdirectory, or search text. Never guess absolute paths, file content, existence, or tool availability.',
+  'A Session tool result contains only the newly resolved ResourceDelta for that call. Reuse prior results already present in this conversation instead of requesting the same evidence again.',
 ].join('\n');
 
 const PLANNING_TOOLS = Object.freeze([
@@ -38,7 +45,7 @@ const PLANNING_TOOLS = Object.freeze([
     },
   }),
   semanticTool('session.request_decision', 'Ask the user for one blocking choice that prevents a valid plan or current task directive.', decisionSchema()),
-  semanticTool('session.submit_plan', 'Submit an ordered, reviewable task queue. Tasks are not a dependency graph.', planSchema()),
+  semanticTool('session.submit_plan', 'Submit an ordered, reviewable task queue with explicit dependencies on earlier tasks.', planSchema()),
   semanticTool('session.submit_answer', 'Return a final answer when no implementation plan or project operation is required.', answerSchema()),
   semanticTool('session.report_diagnostic', 'Report a terminal diagnostic when the request cannot continue.', diagnosticSchema()),
 ]);
@@ -58,8 +65,9 @@ const EXECUTION_TOOLS = Object.freeze([
     },
   }),
   semanticTool('session.request_decision', 'Ask the user for one material choice that blocks the current accepted task.', decisionSchema()),
-  semanticTool('session.submit_task_artifacts', 'Submit generated content for the current IntentSlot values. Do not submit paths or Kernel tool identifiers.', artifactSchema()),
-  semanticTool('session.complete_current_task', 'Mark the current task as already sufficient without creating Kernel change facts.', taskOutcomeSchema()),
+  semanticTool('session.submit_task_outcome', 'Mark the current accepted task as already satisfied only when fresh task-scoped evidence proves every acceptance criterion. This records a Session outcome, not a Kernel execution fact.', taskOutcomeSchema()),
+  semanticTool('session.append_artifact_chunk', 'Append one logically coherent content block to one current IntentSlot. A small file may use one call; larger content may be split by class, function, or configuration section. Session owns draft identity, ordering, hashes, and total-budget admission.', artifactChunkSchema()),
+  semanticTool('session.finalize_task_artifacts', 'Finalize the current artifact draft after every current IntentSlot has a final chunk.', artifactFinalizeSchema()),
   semanticTool('session.report_diagnostic', 'Report a terminal diagnostic for the current accepted task.', diagnosticSchema()),
 ]);
 
@@ -83,7 +91,7 @@ export class ProviderProfileRegistry {
   profileForFrame(frame: DriverProviderTurnFrame | undefined): SessionProviderProfile {
     if (
       frame?.turnMode === 'protocolRepair' &&
-      frame.allowedKinds.some((kind) => kind === 'actionBundle' || kind === 'taskOutcome')
+      frame.allowedKinds.some((kind) => kind === 'actionBundle')
     ) {
       return this.profile('execution-v1');
     }
@@ -156,6 +164,7 @@ function resourceIntentSchema(): object {
     required: ['kind', 'reason'],
     properties: {
       kind: { type: 'string', enum: ['fileText', 'directoryTree', 'search', 'range'] },
+      rootId: nonEmptyString(),
       targetRef: nonEmptyString(),
       path: nonEmptyString(),
       query: nonEmptyString(),
@@ -213,15 +222,14 @@ function planSchema(): object {
         items: {
           type: 'object',
           additionalProperties: false,
-          required: ['taskId', 'title', 'operation', 'targets', 'acceptanceCriteria', 'failureCriteria'],
+          required: ['taskId', 'title', 'toolId', 'target', 'dependencies', 'args', 'acceptanceCriteria', 'failureCriteria'],
           properties: {
             taskId: nonEmptyString(),
             title: nonEmptyString(),
-            operation: {
-              type: 'string',
-              enum: ['createFile', 'replaceFile', 'patchFile', 'deletePath', 'runProcess', 'inspectResource', 'verifyResult'],
-            },
-            targets: stringArray(),
+            toolId: nonEmptyString(),
+            target: stringArray(),
+            dependencies: stringArray(),
+            args: { type: 'object' },
             acceptanceCriteria: stringArray(),
             failureCriteria: stringArray(),
           },
@@ -256,30 +264,32 @@ function diagnosticSchema(): object {
   };
 }
 
-function artifactSchema(): object {
+function artifactChunkSchema(): object {
   return {
     type: 'object',
     additionalProperties: false,
-    required: ['summary', 'artifacts'],
+    required: ['slotId', 'contentLines', 'finalChunk'],
     properties: {
-      summary: nonEmptyString(),
-      narration: nonEmptyString(),
-      artifacts: {
+      slotId: nonEmptyString(),
+      contentLines: {
         type: 'array',
         minItems: 1,
-        items: {
-          type: 'object',
-          additionalProperties: false,
-          required: ['slotId'],
-          properties: {
-            slotId: nonEmptyString(),
-            contentLines: stringArray(),
-            matchText: nonEmptyString(),
-            replacementLines: stringArray(),
-            argv: stringArray(),
-            cwd: nonEmptyString(),
-            timeoutMs: { type: 'integer', minimum: 1 },
-          },
+        items: { type: 'string' },
+      },
+      finalChunk: { type: 'boolean' },
+      editMatch: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['kind'],
+        properties: {
+          kind: { type: 'string', enum: ['exactBlock', 'contextBlock', 'lineRange'] },
+          targetLines: stringLinesSchema(),
+          beforeLines: stringLinesSchema(),
+          afterLines: stringLinesSchema(),
+          startLine: { type: 'integer', minimum: 1 },
+          endLine: { type: 'integer', minimum: 1 },
+          expectedFileHash: nonEmptyString(),
+          expectedBeforeLines: stringLinesSchema(),
         },
       },
     },
@@ -290,10 +300,50 @@ function taskOutcomeSchema(): object {
   return {
     type: 'object',
     additionalProperties: false,
-    required: ['reason'],
+    required: ['outcome', 'summary', 'evidenceRefs', 'acceptanceResults'],
     properties: {
-      reason: nonEmptyString(),
-      evidenceRefs: stringArray(),
+      outcome: { type: 'string', enum: ['alreadySatisfied'] },
+      summary: nonEmptyString(),
+      evidenceRefs: {
+        type: 'array',
+        minItems: 1,
+        items: nonEmptyString(),
+      },
+      acceptanceResults: {
+        type: 'array',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['criterionIndex', 'status', 'evidenceRefs'],
+          properties: {
+            criterionIndex: { type: 'integer', minimum: 1 },
+            status: { type: 'string', enum: ['satisfied'] },
+            evidenceRefs: {
+              type: 'array',
+              minItems: 1,
+              items: nonEmptyString(),
+            },
+          },
+        },
+      },
+    },
+  };
+}
+
+function stringLinesSchema(): object {
+  return {
+    type: 'array',
+    items: { type: 'string' },
+  };
+}
+
+function artifactFinalizeSchema(): object {
+  return {
+    type: 'object',
+    additionalProperties: false,
+    required: ['summary'],
+    properties: {
+      summary: nonEmptyString(),
       narration: nonEmptyString(),
     },
   };

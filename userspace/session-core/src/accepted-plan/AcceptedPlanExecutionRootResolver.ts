@@ -7,7 +7,7 @@ import type {
   ConversationResourceRoot,
   ProjectWorkingDirectory,
 } from '../context/types.js';
-import type { AcceptedImplementationPlanExecutionRoot } from './types.js';
+import type { AcceptedTaskPlanExecutionRoot } from './types.js';
 
 export interface AcceptedPlanExecutionRootDecisionInput {
   projectWorkingDirectory?: ProjectWorkingDirectory;
@@ -22,7 +22,7 @@ export class AcceptedPlanExecutionRootResolver {
   static fromDecision(
     input: AcceptedPlanExecutionRootDecisionInput,
     events: AgentEvent[]
-  ): AcceptedImplementationPlanExecutionRoot | undefined {
+  ): AcceptedTaskPlanExecutionRoot | undefined {
     const projectRoot = input.projectWorkingDirectory?.absolutePath ?? input.projectWorkingDirectory?.displayPath;
     if (projectRoot) {
       return {
@@ -63,7 +63,7 @@ export class AcceptedPlanExecutionRootResolver {
 
   static fromState(
     state: AcceptedPlanExecutionRootState
-  ): AcceptedImplementationPlanExecutionRoot | undefined {
+  ): AcceptedTaskPlanExecutionRoot | undefined {
     const root = state.conversationRoots.find((item) => item.primary) ?? state.conversationRoots[0];
     if (!root) return undefined;
     const ref = root.absolutePath ?? root.displayPath;
@@ -84,7 +84,7 @@ export class AcceptedPlanExecutionRootResolver {
   }
 
   static toPayload(
-    root: AcceptedImplementationPlanExecutionRoot | undefined
+    root: AcceptedTaskPlanExecutionRoot | undefined
   ): Record<string, unknown> | undefined {
     if (!root) return undefined;
     return {
@@ -96,7 +96,7 @@ export class AcceptedPlanExecutionRootResolver {
 
   static fromPayload(
     payload: Record<string, unknown>
-  ): AcceptedImplementationPlanExecutionRoot | undefined {
+  ): AcceptedTaskPlanExecutionRoot | undefined {
     const root = objectRecord(payload.executionRoot);
     const attachmentRecord = objectRecord(root?.attachment);
     const ref = stringValue(root?.ref)
@@ -129,7 +129,7 @@ export class AcceptedPlanExecutionRootResolver {
     return executionRoot ? [executionRoot.attachment] : [];
   }
 
-  static fromResourcePackets(events: AgentEvent[]): AcceptedImplementationPlanExecutionRoot | undefined {
+  static fromResourcePackets(events: AgentEvent[]): AcceptedTaskPlanExecutionRoot | undefined {
     const candidates = events
       .filter((event) => event.kind === 'tool_result')
       .flatMap((event) => {
@@ -160,7 +160,7 @@ export class AcceptedPlanExecutionRootResolver {
     return undefined;
   }
 
-  private static fromRecentDirectoryAttachments(events: AgentEvent[]): AcceptedImplementationPlanExecutionRoot | undefined {
+  private static fromRecentDirectoryAttachments(events: AgentEvent[]): AcceptedTaskPlanExecutionRoot | undefined {
     const attachments: AgentContextAttachment[] = [];
     for (const event of [...events].reverse()) {
       if (attachments.length >= 16) break;
@@ -192,7 +192,7 @@ export class AcceptedPlanExecutionRootResolver {
     };
   }
 
-  private static source(value: string | undefined): AcceptedImplementationPlanExecutionRoot['source'] {
+  private static source(value: string | undefined): AcceptedTaskPlanExecutionRoot['source'] {
     if (value === 'projectWorkingDirectory') return 'projectWorkingDirectory';
     if (value === 'workspaceBinding') return 'workspaceBinding';
     return 'recentAttachment';

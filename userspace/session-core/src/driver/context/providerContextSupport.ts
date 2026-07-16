@@ -1,6 +1,6 @@
 import type { ProviderRepairMessageState } from '../../prompt/ProviderRepairMessageBuilder.js';
 import type {
-  AcceptedImplementationPlanContext,
+  AcceptedTaskPlanContext,
   CurrentTaskContext,
   ImplementationBatchContext,
 } from '../execution/index.js';
@@ -11,12 +11,12 @@ export interface ProviderContextSupportState {
   conversationRoots: unknown[];
   resourcePackets: unknown[];
   implementationBatch?: ImplementationBatchContext;
-  acceptedImplementationPlan?: AcceptedImplementationPlanContext;
+  acceptedTaskPlan?: AcceptedTaskPlanContext;
   currentTaskContext?: CurrentTaskContext;
 }
 
 export interface ProviderContextSupportPorts {
-  acceptedContext(acceptedPlan: AcceptedImplementationPlanContext | undefined): Record<string, unknown> | undefined;
+  acceptedContext(acceptedPlan: AcceptedTaskPlanContext | undefined): Record<string, unknown> | undefined;
 }
 
 export class ProviderContextSupport {
@@ -24,18 +24,22 @@ export class ProviderContextSupport {
 
   implementationBatchHints(
     context: ImplementationBatchContext,
-    acceptedPlan?: AcceptedImplementationPlanContext
+    acceptedPlan?: AcceptedTaskPlanContext
   ): string[] {
     const hints = [
       `ImplementationBatchStatus: nextBatchIndex=${context.batchIndex}`,
     ];
     if (acceptedPlan) {
-      const currentTask = acceptedPlan.tasks.find((task) => !acceptedPlan.completedTaskIds.includes(task.taskId));
+      const settled = new Set([
+        ...acceptedPlan.completedTaskIds,
+        ...(acceptedPlan.modelJudgedSufficientTaskIds ?? []),
+      ]);
+      const currentTask = acceptedPlan.tasks.find((task) => !settled.has(task.taskId));
       const currentTaskOperations = this.currentTaskOperations(acceptedPlan);
       hints.push(
-        `AcceptedTaskCursor: planId=${acceptedPlan.planId}; currentTask=${currentTask?.taskId ?? 'complete'}; completedTasks=${acceptedPlan.completedTaskIds.length}/${acceptedPlan.tasks.length}`,
+        `AcceptedTaskCursor: planId=${acceptedPlan.planId}; currentTask=${currentTask?.taskId ?? 'complete'}; completedTasks=${settled.size}/${acceptedPlan.tasks.length}`,
         currentTask
-          ? `CurrentAcceptedTask: taskId=${currentTask.taskId}; targets=${currentTask.targets.length ? currentTask.targets.join(', ') : 'none'}; capability=${currentTask.capability ?? 'none'}`
+          ? `CurrentAcceptedTask: taskId=${currentTask.taskId}; targets=${currentTask.targets.length ? currentTask.targets.join(', ') : 'none'}; toolId=${currentTask.toolId ?? 'none'}`
           : 'CurrentAcceptedTask: complete-or-unavailable',
         Array.isArray(currentTaskOperations) && currentTaskOperations.length
           ? `Accepted current task operations: ${JSON.stringify(currentTaskOperations)}.`
@@ -61,21 +65,21 @@ export class ProviderContextSupport {
       conversationRoots: state.conversationRoots,
       resourcePackets: state.resourcePackets,
       implementationBatch: state.implementationBatch,
-      acceptedContext: this.ports.acceptedContext(state.acceptedImplementationPlan),
+      acceptedContext: this.ports.acceptedContext(state.acceptedTaskPlan),
       currentTaskContext: state.currentTaskContext
         ? {
           taskId: state.currentTaskContext.taskId,
           taskTitle: state.currentTaskContext.taskTitle,
           goal: state.currentTaskContext.goal,
           targets: state.currentTaskContext.targets,
-          capabilities: state.currentTaskContext.capabilities,
+          toolIds: state.currentTaskContext.toolIds,
         }
         : undefined,
-      completedTaskCount: state.acceptedImplementationPlan?.completedTaskIds.length ?? 0,
+      completedTaskCount: state.acceptedTaskPlan?.completedTaskIds.length ?? 0,
     };
   }
 
-  private currentTaskOperations(acceptedPlan: AcceptedImplementationPlanContext): unknown[] | undefined {
+  private currentTaskOperations(acceptedPlan: AcceptedTaskPlanContext): unknown[] | undefined {
     const operations = this.ports.acceptedContext(acceptedPlan)?.currentTaskOperations;
     return Array.isArray(operations) ? operations : undefined;
   }
