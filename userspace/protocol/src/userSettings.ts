@@ -74,6 +74,7 @@ export const DEFAULT_USER_SETTINGS: UserSettings = {
   'agent.permissions.autonomyMode': 'strict',
   'agent.permissions.workspaceWrite': 'ask',
   'agent.permissions.gitWrite': 'ask',
+  'agent.permissions.gitPush': 'ask',
   'agent.permissions.webRead': 'allow',
   'agent.permissions.privateWebRead': 'ask',
   'agent.permissions.processExec': 'deny',
