@@ -470,6 +470,7 @@
     "deepcodeGui.project.namePrompt": "项目名称",
     "deepcodeGui.project.newChat": "新建对话",
     "deepcodeGui.project.rename": "重命名项目",
+    "deepcodeGui.project.rebind": "重新绑定目录",
     "deepcodeGui.project.delete": "删除项目",
     "deepcodeGui.agent.subtitle": "DeepCode Agent",
     "deepcodeGui.session.actions": "会话操作",
@@ -1009,8 +1010,8 @@
     "diagnostic.modelDiagnostic": "{summary}",
     "diagnostic.resourceResolveRepairFailed": "模型请求的资源无法在附件或项目目录中定位，且 repair 失败：{message}",
     "diagnostic.resourceResolveFailed": "模型请求的资源无法在当前附件或项目目录中定位，Session 已拒绝该请求。\n无法定位：{unresolved}\n存在多个候选根目录：{ambiguous}\n可用项目/附件根目录：\n{roots}\n请重新指定明确附件、rootId 或相对路径。",
-    "diagnostic.acceptedPlanScopeRecoveryFailed": "已确认计划的 scope 决策无法恢复原始 implementationPlan；Session 不会启动独立需求流程。",
-    "diagnostic.acceptedPlanInteractionRecoveryFailed": "已确认计划的交互决策无法恢复父 implementationPlan；Session 不会启动独立需求流程。",
+    "diagnostic.acceptedPlanScopeRecoveryFailed": "已确认计划的 scope 决策无法恢复原始任务计划；Session 不会启动独立需求流程。",
+    "diagnostic.acceptedPlanInteractionRecoveryFailed": "已确认计划的交互决策无法恢复父任务计划；Session 不会启动独立需求流程。",
     "diagnostic.actionBundleAdmissionDiagnostic": "{summary}",
     "diagnostic.planProposalReviewedMissing": "Kernel 未返回 actionBundle 的 proposal.reviewed 事件，Session 不会展示可确认计划。",
     "diagnostic.planRevisionRepairFailed": "计划需要修订，但模型 repair 失败：{message}",
@@ -1209,25 +1210,13 @@
         "auto": "自动低风险候选"
       }
     },
-    "agent.permissions.allowFileRead": {
-      "label": "允许读取文件",
-      "description": "允许 Agent 工具读取工作区文件。"
+    "agent.permissions.workspaceRead": {
+      "label": "工作区读取",
+      "description": "工作区只读工具的权限策略。"
     },
-    "agent.permissions.allowFileWrite": {
-      "label": "允许请求写入文件",
-      "description": "允许 Agent 工具请求写入文件。写入仍需要审批。"
-    },
-    "agent.permissions.allowCodeSearch": {
-      "label": "允许代码搜索",
-      "description": "允许 Agent 工具在工作区搜索代码。"
-    },
-    "agent.permissions.allowShellPropose": {
-      "label": "允许提出命令",
-      "description": "允许 Agent 提出 shell 命令，但不执行。"
-    },
-    "agent.permissions.allowShellExec": {
-      "label": "允许请求执行命令",
-      "description": "允许 Agent 按权限策略请求或执行 shell 命令。"
+    "agent.permissions.workspaceWrite": {
+      "label": "工作区写入",
+      "description": "工作区变更工具的权限策略。"
     },
     "agent.permissions.processExec": {
       "label": "进程执行",
@@ -1238,9 +1227,9 @@
         "allow": "允许"
       }
     },
-    "agent.permissions.networkEgress": {
-      "label": "网络访问",
-      "description": "外部网络或 Web 证据请求的权限策略。",
+    "agent.permissions.webRead": {
+      "label": "公网只读访问",
+      "description": "公网只读 Web 证据的权限策略。",
       "options": {
         "deny": "拒绝",
         "ask": "询问",
@@ -1256,14 +1245,26 @@
         "allow": "允许"
       }
     },
-    "agent.permissions.gitPush": {
-      "label": "Git Push",
-      "description": "Git push 的权限策略；默认不自动推送。",
+    "agent.permissions.privateWebRead": {
+      "label": "私网只读访问",
+      "description": "私网只读 Web 证据的权限策略。",
       "options": {
         "deny": "拒绝",
         "ask": "询问",
         "allow": "允许"
       }
+    },
+    "agent.web.search.endpointTemplate": {
+      "label": "Web 搜索端点模板",
+      "description": "包含 {query} 和可选 {limit} 的 HTTP 端点模板。"
+    },
+    "agent.web.search.authHeaderName": {
+      "label": "Web 搜索认证头",
+      "description": "与搜索 SecretRef 一起使用的请求头名称。"
+    },
+    "agent.web.search.authSecretRef": {
+      "label": "Web 搜索认证 Secret",
+      "description": "配置搜索端点使用的 Secret 引用。"
     },
     "agent.git.commitMessageMode": {
       "label": "Commit 信息生成",

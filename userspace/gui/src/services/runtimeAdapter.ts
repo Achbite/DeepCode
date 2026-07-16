@@ -9,6 +9,8 @@ import type {
   AgentFeedbackRequest,
   AgentFeedbackResult,
   AgentMode,
+  AgentProjectListResult,
+  AgentProjectResult,
   AgentSessionListResult,
   AgentSessionResult,
   AgentTraceEvent,
@@ -18,8 +20,9 @@ import type {
   AttachPanelSnapshotResult,
   BrowsePathResult,
   BrowserRuntimeStatusResult,
-  CodeSearchInput,
-  CodeSearchResult,
+  CodeGrepInput,
+  CodeGrepResult,
+  CreateAgentProjectRequest,
   CreateAgentSessionRequest,
   CreateTerminalSessionRequest,
   FileReadResult,
@@ -43,6 +46,7 @@ import type {
   PatchUserSettingsResult,
   PatchWorkspaceSettingsResult,
   RenameAgentSessionRequest,
+  RebindAgentProjectRequest,
   ResolveAgentPermissionRequest,
   ResolveAgentPlanRequest,
   ResolveAgentReviewRequest,
@@ -58,6 +62,8 @@ import type {
   TerminalSession,
   TerminalSessionsResult,
   TerminalWarmupStatus,
+  UpdateAgentProjectRequest,
+  UpdateAgentSessionRequest,
   WorkspaceState,
 } from '@deepcode/protocol';
 import { buildSessionMemorySnapshot, type SessionMemorySnapshot } from '@deepcode/session-core';
@@ -372,7 +378,7 @@ export function probeLlmProfile(
   return api.probeLlmProfile(request);
 }
 
-export function codeSearch(request: CodeSearchInput): Promise<ApiResponse<CodeSearchResult>> {
+export function codeSearch(request: CodeGrepInput): Promise<ApiResponse<CodeGrepResult>> {
   return api.codeSearch(request);
 }
 
@@ -405,6 +411,43 @@ export function renameAgentSession(
   request: RenameAgentSessionRequest
 ): Promise<ApiResponse<AgentSessionResult>> {
   return api.renameAgentSession(sessionId, request);
+}
+
+export function updateAgentSession(
+  sessionId: string,
+  request: UpdateAgentSessionRequest
+): Promise<ApiResponse<AgentSessionResult>> {
+  return api.updateAgentSession(sessionId, request);
+}
+
+export function listAgentProjects(): Promise<ApiResponse<AgentProjectListResult>> {
+  return api.listAgentProjects();
+}
+
+export function createAgentProject(
+  request: CreateAgentProjectRequest
+): Promise<ApiResponse<AgentProjectResult>> {
+  return api.createAgentProject(request);
+}
+
+export function updateAgentProject(
+  projectId: string,
+  request: UpdateAgentProjectRequest
+): Promise<ApiResponse<AgentProjectResult>> {
+  return api.updateAgentProject(projectId, request);
+}
+
+export function rebindAgentProject(
+  projectId: string,
+  request: RebindAgentProjectRequest
+): Promise<ApiResponse<AgentProjectResult>> {
+  return api.rebindAgentProject(projectId, request);
+}
+
+export function deleteAgentProject(
+  projectId: string
+): Promise<ApiResponse<AgentProjectListResult>> {
+  return api.deleteAgentProject(projectId);
 }
 
 export function archiveAgentSession(

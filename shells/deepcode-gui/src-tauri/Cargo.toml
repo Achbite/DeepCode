@@ -5,7 +5,7 @@ name = "deepcode-gui-tauri-shell"
 version = "0.5.24"
 edition = "2021"
 license = "MIT"
-rust-version = "1.77"
+rust-version = "1.84"
 
 [[bin]]
 name = "DeepCode-GUI"

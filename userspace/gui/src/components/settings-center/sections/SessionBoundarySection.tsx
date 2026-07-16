@@ -7,7 +7,7 @@ const SESSION_BOUNDARY_ITEMS = [
     id: 'protocol-contract',
     kind: 'session',
     priority: 0,
-    title: 'Agent Protocol v3 Contract',
+    title: 'Agent Protocol v4 Contract',
     detail: 'Session parser and PromptEnvelopeBuilder own provider-facing protocol examples.',
   },
   {
