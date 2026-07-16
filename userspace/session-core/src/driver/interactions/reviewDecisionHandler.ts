@@ -16,7 +16,7 @@ import {
   returnSessionResult,
   type SessionLoopControlResult,
 } from '../runContinuation.js';
-import type { InterventionLevel, ReviewContinuationMode } from '../types.js';
+import type { AutonomyMode, InterventionLevel, ReviewContinuationMode } from '../types.js';
 
 export type ReviewDecisionHandlerDecision = 'accept' | 'reject' | 'revise';
 export type ReviewDecisionHandlerContinuationMode = ReviewContinuationMode;
@@ -30,10 +30,14 @@ export interface ReviewDecisionHandlerInput {
   existingEvents?: AgentEvent[];
   workspaceBinding?: AgentWorkspaceBinding;
   projectWorkingDirectory?: ProjectWorkingDirectory;
+  projectId?: string;
+  projectKind?: 'folder' | 'blank';
+  projectRootStatus?: 'ready' | 'unbound' | 'unavailable';
   profileId?: string;
   workflow?: string;
   reviewContinuationMode?: ReviewDecisionHandlerContinuationMode;
   interventionLevel?: ReviewDecisionHandlerInterventionLevel;
+  autonomyMode?: AutonomyMode;
   projectMemoryMode?: ProjectMemoryMode;
 }
 

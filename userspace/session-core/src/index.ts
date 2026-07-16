@@ -1,7 +1,6 @@
 export * from './protocol/index.js';
 export * from './cache/index.js';
 export * from './cadence/index.js';
-export * from './confirmation/index.js';
 export * from './context/index.js';
 export * from './controller.js';
 export * from './driver/index.js';
@@ -14,7 +13,6 @@ export * from './review/index.js';
 export * from './run-state/index.js';
 export * from './sidechain.js';
 export * from './storageClient.js';
-export * from './task-queue/index.js';
 export * from './timelineFilter.js';
 export * from './timelineDelta.js';
 export * from './transcript.js';

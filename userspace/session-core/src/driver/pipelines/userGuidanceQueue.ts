@@ -2,14 +2,20 @@ import type {
   AgentEvent,
   AgentSessionResult,
   LlmChatRequest,
+  SessionTurnAuthorityPayload,
 } from '@deepcode/protocol';
 import type { UserGuidanceEvent } from '../../context/index.js';
+import { createSessionTurnAuthorityEvent } from '../context/userAuthorityFrame.js';
+import type { VisibleLanguage } from '../runtimeSupport.js';
 
 export interface UserGuidanceQueueProviderResumeInput {
   sessionId: string;
   events: AgentEvent[];
   runId: string;
+  taskId: string;
   stage: string;
+  outputLanguage: VisibleLanguage;
+  promptEpochId?: string;
   summary: string;
   now(): string;
   createId(prefix: string): string;
@@ -64,13 +70,15 @@ export class UserGuidanceQueue {
       if (runId && eventRunId && eventRunId !== runId) continue;
       const guidanceId = stringValue(payload.guidanceId) ?? event.id;
       if (consumedIds.has(guidanceId) || seen.has(guidanceId)) continue;
-      const content = stringValue(payload.content) ?? stringValue(payload.guidance) ?? stringValue(payload.summary);
-      if (!content) continue;
+      const content = stringContent(payload.content)
+        ?? stringContent(payload.guidance)
+        ?? stringContent(payload.summary);
+      if (!content?.trim()) continue;
       seen.add(guidanceId);
       collected.push({
         id: guidanceId,
         ts: event.ts,
-        content: clip(content, 600),
+        content,
         source: 'user',
         checkpointKind: 'nextProviderCall',
       });
@@ -83,25 +91,51 @@ export class UserGuidanceQueue {
     if (guidance.length === 0) {
       return { guidance, events: [], messages: [] };
     }
+    const authorityEvent = createSessionTurnAuthorityEvent({
+      sessionId: input.sessionId,
+      runId: input.runId,
+      turnId: input.createId('session-turn'),
+      taskId: input.taskId,
+      messages: guidance.map((item) => ({ messageId: item.id, content: item.content })),
+      relation: 'interactionContinuation',
+      boundAtHookRef: `provider.${input.stage}`,
+      outputLanguage: input.outputLanguage,
+      promptEpochId: input.promptEpochId,
+      eventId: input.createId('session-turn-authority'),
+      timestamp: input.now(),
+    });
+    const authority = authorityEvent.payload as SessionTurnAuthorityPayload;
     return {
       guidance,
-      events: this.consumedEvents({
-        sessionId: input.sessionId,
-        events: input.events,
-        consumedIds: guidance.map((item) => item.id),
-        runId: input.runId,
-        appliedAtProviderStage: input.stage,
-        summary: input.summary,
-        now: input.now,
-        createId: input.createId,
-      }),
-      messages: [{
-        role: 'user',
-        content: [
-          'User guidance received before the provider resume. Apply it to the next response or tool decision without starting a parallel run:',
-          ...guidance.map((item) => `- ${item.id}: ${clip(item.content, 1200)}`),
-        ].join('\n'),
-      }],
+      events: [
+        authorityEvent,
+        ...this.consumedEvents({
+          sessionId: input.sessionId,
+          events: input.events,
+          consumedIds: guidance.map((item) => item.id),
+          runId: input.runId,
+          appliedAtProviderStage: input.stage,
+          summary: input.summary,
+          now: input.now,
+          createId: input.createId,
+        }),
+      ],
+      messages: [
+        {
+          role: 'user',
+          content: JSON.stringify({
+            kind: 'CurrentTurnAuthority',
+            turnId: authority.turnId,
+            taskId: authority.taskId,
+            relation: authority.relation,
+            sourceMessageIds: authority.sourceMessageIds,
+            sourceMessageHashes: authority.sourceMessageHashes,
+            outputLanguage: authority.outputLanguage,
+            authorityHash: authority.authorityHash,
+          }),
+        },
+        ...guidance.map((item) => ({ role: 'user' as const, content: item.content })),
+      ],
     };
   }
 
@@ -178,6 +212,6 @@ function stringValue(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
 }
 
-function clip(value: string, max: number): string {
-  return value.length > max ? `${value.slice(0, max)}...` : value;
+function stringContent(value: unknown): string | undefined {
+  return typeof value === 'string' ? value : undefined;
 }

@@ -11,6 +11,7 @@ import { ProviderPartFrameParser, type ProviderToolCallBuffer } from '../../prov
 import type { ProviderStreamCoordinator, ProviderStreamVisibleLanguage } from './providerStreamCoordinator.js';
 import { SessionDriverActiveTurnRuntimeAccessor } from '../runFrame.js';
 import { VISIBLE_REASONING_MAX_CHARS, projectVisibleReasoning } from '../projection/index.js';
+import { stableHash } from '../../cache/canonicalizer.js';
 
 export interface ProviderStreamRuntimeActiveTurn {
   turnId: string;
@@ -18,6 +19,7 @@ export interface ProviderStreamRuntimeActiveTurn {
   stage: string;
   providerJsonStreamProgress?: Record<string, { receivedChars: number; lastEmittedChars: number }>;
   partFrameParser?: ProviderPartFrameParser;
+  submittedPartFrames?: Record<string, true>;
 }
 
 export interface ProviderStreamRuntimeState {
@@ -309,6 +311,13 @@ export class ProviderStreamRuntime<TState extends ProviderStreamRuntimeState> {
       draftId: frame.draftId,
       targetPath: frame.targetPath,
     };
+    const activeTurn = new SessionDriverActiveTurnRuntimeAccessor(state).ensure(
+      stage,
+      (prefix) => this.dependencies.createId(prefix)
+    );
+    activeTurn.submittedPartFrames ??= {};
+    const frameKey = `${enrichedFrame.frameId ?? enrichedFrame.draftId}:${stableHash(JSON.stringify(enrichedFrame))}`;
+    if (activeTurn.submittedPartFrames[frameKey]) return;
     await this.dependencies.emitProjectionDelta(state, {
       type: 'part_delta',
       stage,
@@ -351,6 +360,7 @@ export class ProviderStreamRuntime<TState extends ProviderStreamRuntimeState> {
       });
       return;
     }
+    activeTurn.submittedPartFrames[frameKey] = true;
     for (const event of reply.events) {
       const record = objectRecord(event);
       await this.dependencies.emitProjectionDelta(state, {

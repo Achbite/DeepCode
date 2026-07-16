@@ -24,7 +24,7 @@ export function selectDynamicWorkflow(input: DynamicWorkflowInput): DynamicWorkf
   if (!input.hasKernelPlanReview) {
     microPhases.unshift('requirementProbe');
     projectionCardKinds.push('check_review');
-    notes.push('plan must remain draft until Kernel PlanReview and user plan confirmation');
+    notes.push('plan must remain draft until Kernel ProposalReview and user plan confirmation');
   } else {
     microPhases.push('planReview');
     projectionCardKinds.push('check_review');

@@ -112,7 +112,7 @@ function run(): void {
     sessionId,
     runId,
     turnId,
-    stage: 'stage.changed',
+    stage: 'state.changed',
     status: 'completed',
     source: 'session',
   };
@@ -148,7 +148,7 @@ function run(): void {
   const planCard = event(sessionId, `plan-card-${token}`, 'plan_card', {
     runId,
     planId,
-    status: 'pending',
+    status: 'confirmable',
     confirmable: true,
     summary: `plan-summary-${token}`,
   }, 3);

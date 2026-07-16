@@ -15,12 +15,11 @@ import {
   type ProjectMemoryMode,
 } from '../../context/index.js';
 import type { ProjectWorkingDirectory } from '../../context/types.js';
-import type { AcceptedImplementationPlanContext, AcceptedPlanBatchProgress } from '../../accepted-plan/types.js';
+import type { AcceptedTaskPlanContext, AcceptedPlanBatchProgress } from '../../accepted-plan/types.js';
 import type { ProposalEnvelope } from '../../protocol/types.js';
 import type { PromptEnvelope } from '../../prompt/types.js';
 import type { InteractionOverlayContext } from '../pipelines/interactionOverlayCodec.js';
 import type { ProposalRouterResult } from '../proposal/proposalRouter.js';
-import { SessionDriverRepairRuntimeAccessor } from '../runFrame.js';
 import { kernelReplyErrorMessage } from './kernelReplyGuard.js';
 import type { KernelReplyObservation } from './kernelEventStatusIndex.js';
 
@@ -42,7 +41,7 @@ export interface AcceptedPlanActionProposalResumeInput extends AcceptedPlanActio
   appendUserMessage: false;
   requirementConfirmationMode: 'off';
   resumeResourcePackets?: boolean;
-  acceptedImplementationPlan?: AcceptedImplementationPlanContext;
+  acceptedTaskPlan?: AcceptedTaskPlanContext;
   interactionOverlay?: InteractionOverlayContext;
 }
 
@@ -51,7 +50,7 @@ export interface AcceptedPlanActionProposalState {
   runId: string;
   userRequest: string;
   phase: string;
-  acceptedImplementationPlan?: AcceptedImplementationPlanContext;
+  acceptedTaskPlan?: AcceptedTaskPlanContext;
   resourcePackets: unknown[];
   generatedArtifactEvidence: unknown;
   taskExecutionCursor?: unknown;
@@ -60,8 +59,6 @@ export interface AcceptedPlanActionProposalState {
   };
   contextAssembly?: ContextAssemblyRecord;
   taskLocalCompactRecords?: ContextAssemblyTaskLocalCompactRecord[];
-  acceptedPlanScopeRepairAttempted?: boolean;
-  planReviewRepairAttempted?: boolean;
 }
 
 export interface AcceptedPlanActionProposalSubmitterPorts<
@@ -84,45 +81,25 @@ export interface AcceptedPlanActionProposalSubmitterPorts<
     proposal: ProposalEnvelope,
     fallback: AgentSessionResult
   ): Promise<AgentSessionResult | ProposalRouterResult | null>;
-  assessActionProposal(input: Record<string, unknown>): { kind: string; [key: string]: unknown };
-  admission(): unknown;
-  appendScopeIntervention(
-    input: Input,
-    state: State,
-    proposal: ProposalEnvelope,
-    validation: unknown
-  ): Promise<AgentSessionResult>;
   appendDiagnostic(state: State, code: string, fallback: string, params: Record<string, string | number> | undefined, idPrefix: string): Promise<AgentSessionResult | undefined>;
   sessionRunStateEvent(input: Record<string, unknown>): AgentEvent;
-  accessScopesCanonicalizedEvent(
-    sessionId: string,
-    runId: string,
-    accepted: AcceptedImplementationPlanContext,
-    canonicalization: unknown,
-    ts: string,
-    id: string
-  ): AgentEvent;
   findReviewReport(events: unknown[]): Record<string, unknown> | undefined;
   appendTrace(state: State, stage: string, payload: unknown): Promise<void>;
-  acceptedPlanNeedsRepair(report: Record<string, unknown>): boolean;
   denied(report: Record<string, unknown>): boolean;
   diagnosticSummary(report: Record<string, unknown>): string;
-  nonAcceptedPermissionGaps(report: Record<string, unknown>, accepted: AcceptedImplementationPlanContext): string[];
   executionContext(input: Record<string, unknown>): any;
-  temporaryGrantsForPlan(plan: any): unknown[];
   normalizeKernelBatch(input: Record<string, unknown>): { ok: true; batch: Record<string, unknown> } | { ok: false; reasons: string[] };
-  normalizationFailureEvents(sessionId: string, runId: string, accepted: AcceptedImplementationPlanContext, reasons: string[], ts: string, id: string): AgentEvent[];
+  normalizationFailureEvents(sessionId: string, runId: string, accepted: AcceptedTaskPlanContext, reasons: string[], ts: string, id: string): AgentEvent[];
   executionExceptionEvents(sessionId: string, planRef: { runId: string; planId: string }, message: string, code: string, ts: string, id: string): AgentEvent[];
   executionFailureEvents(
     sessionId: string,
     runId: string,
-    accepted: AcceptedImplementationPlanContext,
+    accepted: AcceptedTaskPlanContext,
     batchEvents: unknown[],
     batch: Record<string, unknown>,
     ts: string,
     id: string
   ): AgentEvent[];
-  deletePreflightReasons(batch: Record<string, unknown>, resourcePackets: unknown[]): string[];
   preflightAudit(batch: Record<string, unknown>): unknown;
   acceptedPlanBatchActivitySummary(batch: Record<string, unknown>): string;
   acceptedPlanBatchActivity(input: Record<string, unknown>): unknown;
@@ -130,27 +107,27 @@ export interface AcceptedPlanActionProposalSubmitterPorts<
   indexGeneratedPacket(index: unknown, packet: unknown): void;
   recordGeneratedPacket(state: State, packet: unknown, stage: string): Promise<{ result?: AgentSessionResult }>;
   recordKernelBatchProgress(input: {
-    acceptedPlan: AcceptedImplementationPlanContext;
+    acceptedPlan: AcceptedTaskPlanContext;
     proposal: ProposalEnvelope;
     kernelEvents: unknown[];
   }): {
     progress: AcceptedPlanBatchProgress;
     completedTaskIds: string[];
-    nextAcceptedPlan: AcceptedImplementationPlanContext;
+    nextAcceptedPlan: AcceptedTaskPlanContext;
   };
   recordModelTaskOutcome(input: {
-    acceptedPlan: AcceptedImplementationPlanContext;
+    acceptedPlan: AcceptedTaskPlanContext;
     taskId: string;
   }): {
     taskId: string;
-    nextAcceptedPlan: AcceptedImplementationPlanContext;
+    nextAcceptedPlan: AcceptedTaskPlanContext;
   };
   refreshRuntimeState(state: State): void;
-  complete(accepted: AcceptedImplementationPlanContext): boolean;
+  complete(accepted: AcceptedTaskPlanContext): boolean;
   batchCheckpointEvent(
     sessionId: string,
     runId: string,
-    accepted: AcceptedImplementationPlanContext,
+    accepted: AcceptedTaskPlanContext,
     proposal: ProposalEnvelope,
     kernelEvents: unknown[],
     progress: unknown,
@@ -161,8 +138,8 @@ export interface AcceptedPlanActionProposalSubmitterPorts<
   taskSavepointEvent(
     sessionId: string,
     runId: string,
-    accepted: AcceptedImplementationPlanContext,
-    nextAccepted: AcceptedImplementationPlanContext,
+    accepted: AcceptedTaskPlanContext,
+    nextAccepted: AcceptedTaskPlanContext,
     progress: unknown,
     kernelEvents: unknown[],
     cursor: unknown,
@@ -171,12 +148,12 @@ export interface AcceptedPlanActionProposalSubmitterPorts<
     id: string,
     contextCompactRecord?: ContextAssemblyTaskLocalCompactRecord
   ): AgentEvent;
-  executionRequest(plan: any, acceptedPlan: AcceptedImplementationPlanContext): string;
+  executionRequest(plan: any, acceptedPlan: AcceptedTaskPlanContext): string;
   staticSyntaxReview(input: {
     profileId?: string;
     state: State;
     prompt: PromptEnvelope;
-    accepted: AcceptedImplementationPlanContext;
+    accepted: AcceptedTaskPlanContext;
     batch: Record<string, unknown>;
     batchEvents: unknown[];
   }): Promise<AgentEvent[]>;
@@ -195,10 +172,7 @@ export class AcceptedPlanActionProposalSubmitter<
     proposal: ProposalEnvelope,
     fallback: AgentSessionResult
   ): Promise<AgentSessionResult | ProposalRouterResult> {
-    const accepted = state.acceptedImplementationPlan;
-    if (proposal.kind === 'taskOutcome') {
-      return this.submitTaskOutcome(input, state, prompt, proposal, fallback);
-    }
+    const accepted = state.acceptedTaskPlan;
     const actionBundle = this.ports.readActionBundle(proposal);
     if (!accepted || !actionBundle) return fallback;
 
@@ -211,40 +185,29 @@ export class AcceptedPlanActionProposalSubmitter<
     );
     if (readOnlyActionResult) return readOnlyActionResult;
 
-    const repairRuntime = new SessionDriverRepairRuntimeAccessor(state);
-    const assessment = this.ports.assessActionProposal({
-      accepted,
-      proposal,
-      actionBundle,
-      resourcePackets: state.resourcePackets,
-      scopeRepairAttempted: repairRuntime.attempted('acceptedPlanScopeRepairAttempted'),
-      admission: this.ports.admission(),
-    });
-    if (assessment.kind === 'missingActionBundle') return fallback;
-    if (assessment.kind === 'deterministicScopeIntervention') {
-      return this.ports.appendScopeIntervention(input, state, proposal, assessment.validation);
+    if (
+      !accepted.authorizationContractId
+      || !accepted.authorizationContractHash
+      || !accepted.planHash
+    ) {
+      const appended = await this.ports.appendDiagnostic(
+        state,
+        'acceptedPlanAuthorizationUnavailable',
+        'The accepted taskPlan is missing its Kernel plan authorization binding; Session will not submit a detached execution proposal.',
+        undefined,
+        'accepted-plan-authorization-unavailable'
+      );
+      return appended ?? fallback;
     }
-    if (assessment.kind === 'scopeRepair') {
-      repairRuntime.markAttempted('acceptedPlanScopeRepairAttempted');
-      return this.ports.appendScopeIntervention(input, state, proposal, assessment.validation);
-    }
-
-    const scopeCanonicalization = assessment.scopeCanonicalization as { changed: boolean; proposal: ProposalEnvelope };
-    const executionProposal = scopeCanonicalization.proposal;
+    const executionProposal: ProposalEnvelope = {
+      ...proposal,
+      payload: {
+        ...(objectRecord(proposal.payload) ?? {}),
+        authorizationContractId: accepted.authorizationContractId,
+      },
+    };
     state.phase = 'executing_accepted_plan';
     let result = fallback;
-    if (scopeCanonicalization.changed) {
-      result = await this.ports.append(state.sessionId, [
-        this.ports.accessScopesCanonicalizedEvent(
-          state.sessionId,
-          state.runId,
-          accepted,
-          scopeCanonicalization,
-          this.ports.now(),
-          this.ports.createId('accepted-plan-access-scopes-canonicalized')
-        ),
-      ]) ?? result;
-    }
     result = await this.ports.append(state.sessionId, [
       this.ports.sessionRunStateEvent({
         sessionId: state.sessionId,
@@ -289,14 +252,6 @@ export class AcceptedPlanActionProposalSubmitter<
       );
       return appended ?? result;
     }
-    if (this.ports.acceptedPlanNeedsRepair(reviewReport) && !repairRuntime.attempted('planReviewRepairAttempted')) {
-      repairRuntime.markAttempted('planReviewRepairAttempted');
-      return this.ports.appendScopeIntervention(input, state, executionProposal, {
-        ok: false,
-        reasons: [`Kernel PlanReview requires revising the current batch: ${this.ports.diagnosticSummary(reviewReport)}`],
-      });
-    }
-
     result = await this.ports.appendProjectedKernelEvents(state.sessionId, proposalReply) ?? result;
     if (this.ports.denied(reviewReport)) {
       const reasons = this.ports.diagnosticSummary(reviewReport);
@@ -309,21 +264,6 @@ export class AcceptedPlanActionProposalSubmitter<
       );
       return appended ?? result;
     }
-    if (reviewReport.status === 'needsRevision') {
-      return this.ports.appendScopeIntervention(input, state, executionProposal, {
-        ok: false,
-        reasons: [`Kernel PlanReview requires revising the current batch: ${this.ports.diagnosticSummary(reviewReport)}`],
-      });
-    }
-
-    const autoGrantBlockers = this.ports.nonAcceptedPermissionGaps(reviewReport, accepted);
-    if (autoGrantBlockers.length) {
-      return this.ports.appendScopeIntervention(input, state, executionProposal, {
-        ok: false,
-        reasons: autoGrantBlockers.map((capability) => `The current batch requires additional permission ${capability}, which is outside the accepted taskPlan automatic execution scope.`),
-      });
-    }
-
     const plan = this.ports.executionContext({
       sessionId: state.sessionId,
       runId: state.runId,
@@ -331,22 +271,6 @@ export class AcceptedPlanActionProposalSubmitter<
       proposal: executionProposal,
       planReviewReport: reviewReport,
     });
-    const grantEvents: unknown[] = [];
-    for (const grant of this.ports.temporaryGrantsForPlan(plan)) {
-      const grantReply = await this.ports.kernel({
-        command: {
-          kind: 'permissionGrantTemporary',
-          requestId: this.ports.createId('accepted-plan-temp-grant'),
-          runId: state.runId,
-          grant,
-        },
-      });
-      grantEvents.push(...(grantReply.events ?? []));
-    }
-    if (grantEvents.length) {
-      result = await this.ports.appendProjectedKernelEvents(state.sessionId, { ok: true, events: grantEvents }) ?? result;
-    }
-
     const normalizedBatch = this.ports.normalizeKernelBatch({
       planId: accepted.planId,
       plan,
@@ -364,15 +288,15 @@ export class AcceptedPlanActionProposalSubmitter<
       ))) ?? result;
     }
     const batch = normalizedBatch.batch;
-    const deletePreflightReasons = this.ports.deletePreflightReasons(batch, state.resourcePackets);
-    if (deletePreflightReasons.length) {
-      return (await this.ports.append(state.sessionId, this.ports.normalizationFailureEvents(
+    const contractId = stringValue(batch.contractId);
+    if (!contractId) {
+      return (await this.ports.append(state.sessionId, this.ports.executionExceptionEvents(
         state.sessionId,
-        state.runId,
-        accepted,
-        deletePreflightReasons,
+        { runId: state.runId, planId: accepted.planId },
+        'Kernel proposal review did not produce an execution contract for the accepted task batch.',
+        'missing_execution_contract',
         this.ports.now(),
-        this.ports.createId('accepted-plan-delete-preflight-failed')
+        this.ports.createId('accepted-plan-execution-contract-missing')
       ))) ?? result;
     }
     await this.ports.appendTrace(state, 'accepted_plan.action_batch_preflight', {
@@ -476,7 +400,7 @@ export class AcceptedPlanActionProposalSubmitter<
     const ledgerEffect = this.ports.recordKernelBatchProgress({ acceptedPlan: accepted, proposal: executionProposal, kernelEvents: batchReply.events ?? [] });
     const batchProgress = ledgerEffect.progress;
     const nextAccepted = ledgerEffect.nextAcceptedPlan;
-    state.acceptedImplementationPlan = nextAccepted;
+    state.acceptedTaskPlan = nextAccepted;
     this.ports.refreshRuntimeState(state);
     const savepointId = this.ports.createId('accepted-plan-task-savepoint');
     const contextCompactRecord = buildTaskLocalCompactRecord({
@@ -495,7 +419,7 @@ export class AcceptedPlanActionProposalSubmitter<
       this.ports.batchCheckpointEvent(
         state.sessionId,
         state.runId,
-        accepted,
+        nextAccepted,
         executionProposal,
         batchReply.events ?? [],
         batchProgress,
@@ -551,164 +475,14 @@ export class AcceptedPlanActionProposalSubmitter<
     };
   }
 
-  private async submitTaskOutcome(
-    input: Input,
-    state: State,
-    prompt: PromptEnvelope,
-    proposal: ProposalEnvelope,
-    fallback: AgentSessionResult
-  ): Promise<AgentSessionResult | ProposalRouterResult> {
-    void prompt;
-    const accepted = state.acceptedImplementationPlan;
-    const payload = objectRecord(proposal.payload);
-    const currentTaskId = stringValue(state.currentTaskContext?.taskId);
-    const taskId = stringValue(payload?.taskId) ?? currentTaskId;
-    const status = stringValue(payload?.status) ?? 'modelJudgedSufficient';
-    const reason = stringValue(payload?.reason) ?? stringValue(payload?.summary);
-    if (!accepted || !payload || !taskId || !currentTaskId) {
-      const appended = await this.ports.appendDiagnostic(
-        state,
-        'invalidTaskOutcome',
-        'taskOutcome can only be used while an accepted task cursor is active.',
-        undefined,
-        'task-outcome-invalid-state'
-      );
-      return appended ?? fallback;
-    }
-    if (taskId !== currentTaskId) {
-      const appended = await this.ports.appendDiagnostic(
-        state,
-        'taskOutcomeTaskMismatch',
-        'taskOutcome.taskId must match the current accepted task cursor.',
-        { taskId, currentTaskId },
-        'task-outcome-task-mismatch'
-      );
-      return appended ?? fallback;
-    }
-    if (status !== 'modelJudgedSufficient') {
-      const appended = await this.ports.appendDiagnostic(
-        state,
-        'unsupportedTaskOutcomeStatus',
-        'Only taskOutcome.status="modelJudgedSufficient" advances the accepted task cursor; use diagnostic for blocked or failed tasks.',
-        { status },
-        'task-outcome-unsupported-status'
-      );
-      return appended ?? fallback;
-    }
-    if (!reason) {
-      const appended = await this.ports.appendDiagnostic(
-        state,
-        'taskOutcomeMissingReason',
-        'taskOutcome.reason is required so the task cursor can be audited without creating Kernel facts.',
-        undefined,
-        'task-outcome-missing-reason'
-      );
-      return appended ?? fallback;
-    }
-
-    const ledgerEffect = this.ports.recordModelTaskOutcome({ acceptedPlan: accepted, taskId });
-    const nextAccepted = ledgerEffect.nextAcceptedPlan;
-    state.acceptedImplementationPlan = nextAccepted;
-    this.ports.refreshRuntimeState(state);
-    const modelJudgedSufficientTaskIds = nextAccepted.modelJudgedSufficientTaskIds ?? [];
-    const settled = new Set([
-      ...nextAccepted.completedTaskIds,
-      ...modelJudgedSufficientTaskIds,
-    ]);
-    const progress: AcceptedPlanBatchProgress = {
-      actionIds: [],
-      targetPaths: currentTaskTargets(state),
-      workUnitIds: [],
-      newlyCompletedTaskIds: [],
-      completedTaskIds: nextAccepted.completedTaskIds,
-      newlyModelJudgedSufficientTaskIds: [taskId],
-      modelJudgedSufficientTaskIds,
-      remainingTaskIds: nextAccepted.tasks
-        .map((task) => task.taskId)
-        .filter((id) => !settled.has(id)),
-    };
-    const savepointId = this.ports.createId('accepted-plan-task-savepoint');
-    const contextCompactRecord = buildTaskLocalCompactRecord({
-      contextAssembly: state.contextAssembly,
-      source: 'modelTaskOutcome',
-      status: 'modelJudgedSufficient',
-      planId: accepted.planId,
-      runId: state.runId,
-      taskId,
-    });
-    state.taskLocalCompactRecords = appendTaskLocalCompactRecord(
-      state.taskLocalCompactRecords,
-      contextCompactRecord
-    );
-    const checkpointResult = await this.ports.append(state.sessionId, [
-      this.ports.batchCheckpointEvent(
-        state.sessionId,
-        state.runId,
-        accepted,
-        proposal,
-        [],
-        progress,
-        this.ports.now(),
-        this.ports.createId('accepted-plan-task-outcome-checkpoint'),
-        contextCompactRecord
-      ),
-      this.ports.taskSavepointEvent(
-        state.sessionId,
-        state.runId,
-        accepted,
-        nextAccepted,
-        progress,
-        [],
-        state.taskExecutionCursor,
-        state.currentTaskContext,
-        this.ports.now(),
-        savepointId,
-        contextCompactRecord
-      ),
-    ]) ?? fallback;
-    if (state.taskExecutionCursor) {
-      (state.taskExecutionCursor as { lastSavepointId?: string }).lastSavepointId = savepointId;
-    }
-
-    if (!this.ports.complete(nextAccepted)) {
-      return { kind: 'continue', lastResult: checkpointResult };
-    }
-
-    const plan = this.ports.executionContext({
-      sessionId: state.sessionId,
-      runId: state.runId,
-      acceptedPlan: nextAccepted,
-      proposal,
-      taskOutcome: payload,
-    });
-    return {
-      kind: 'assembleReview',
-      request: {
-        sessionId: state.sessionId,
-        runId: state.runId,
-        planId: nextAccepted.planId,
-        plan,
-        result: checkpointResult,
-        currentKernelEvents: [],
-        requestIdPrefix: 'accepted-plan-task-outcome-review-facts-get',
-      },
-    };
-  }
-}
-
-function objectRecord(value: unknown): Record<string, unknown> | undefined {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
-  return value as Record<string, unknown>;
 }
 
 function stringValue(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
 }
 
-function currentTaskTargets(state: AcceptedPlanActionProposalState): string[] {
-  const record = objectRecord(state.currentTaskContext);
-  const targets = record?.targets;
-  return Array.isArray(targets)
-    ? targets.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
-    : [];
+function objectRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
 }

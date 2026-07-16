@@ -20,6 +20,7 @@ import type { SessionDecisionResolverInput } from './driver/types.js';
 import { CanonicalTimelineProjector } from './timelineDelta.js';
 import { SessionStorageClient } from './storageClient.js';
 import type { ProjectWorkingDirectory } from './context/types.js';
+import { planInteractionAwaitsDecision } from './run-state/planInteractionState.js';
 
 declare const process: {
   argv: string[];
@@ -40,12 +41,17 @@ interface HostBridgeRequest {
   prompt?: string;
   attachments?: AgentContextAttachment[];
   workspacePath?: string;
+  workspaceBinding?: AgentWorkspaceBinding;
   noWorkspace?: boolean;
+  projectId?: string;
+  projectKind?: 'folder' | 'blank';
+  projectRootStatus?: 'ready' | 'unbound' | 'unavailable';
   profileId?: string;
   workflow?: 'planFirst' | 'actOnRequest';
   requirementConfirmationMode?: 'off' | 'auto' | 'always';
   reviewContinuationMode?: 'auto' | 'ask' | 'off';
   interventionLevel?: 'low' | 'medium' | 'high';
+  autonomyMode?: 'strict' | 'trustedWorkspace' | 'maximum';
   projectMemoryMode?: 'confirm' | 'auto';
   title?: string;
   decisionKind?: SessionDecisionResolverInput['kind'];
@@ -87,8 +93,8 @@ async function runAsk(request: HostBridgeRequest): Promise<HostBridgeResult> {
   if (!content) throw new Error('prompt is required');
 
   const apiBase = normalizeApiBase(request.apiBase);
-  const binding = request.noWorkspace ? undefined : workspaceBindingFromPath(request.workspacePath);
-  const projectWorkingDirectory = request.noWorkspace ? undefined : projectWorkingDirectoryFromPath(request.workspacePath);
+  const binding = request.noWorkspace ? undefined : request.workspaceBinding ?? workspaceBindingFromPath(request.workspacePath);
+  const projectWorkingDirectory = request.noWorkspace ? undefined : projectWorkingDirectoryFromBinding(binding, request.workspacePath);
   const scope = binding ? { workspaceId: binding.workspaceId, workspaceHash: binding.workspaceHash } : {};
   const sessionResult = request.sessionId
     ? await activateSession(apiBase, request.sessionId)
@@ -110,11 +116,15 @@ async function runAsk(request: HostBridgeRequest): Promise<HostBridgeResult> {
     existingEvents,
     workspaceBinding: binding,
     projectWorkingDirectory,
+    projectId: request.projectId,
+    projectKind: request.projectKind,
+    projectRootStatus: request.projectRootStatus,
     profileId: request.profileId,
     workflow: request.workflow,
     requirementConfirmationMode: request.requirementConfirmationMode,
     reviewContinuationMode: request.reviewContinuationMode,
     interventionLevel: request.interventionLevel,
+    autonomyMode: request.autonomyMode,
   });
   await persistMemoryArchive(apiBase, result.session.id, result.events ?? [], binding, result.session, request.projectMemoryMode);
   const timeline = projection.buildTimeline(result.events ?? []);
@@ -138,8 +148,8 @@ async function resolveDecision(request: HostBridgeRequest): Promise<HostBridgeRe
 
   const apiBase = normalizeApiBase(request.apiBase);
   const current = await getAgentSession(apiBase, request.sessionId);
-  const binding = request.noWorkspace ? undefined : workspaceBindingFromPath(request.workspacePath);
-  const projectWorkingDirectory = request.noWorkspace ? undefined : projectWorkingDirectoryFromPath(request.workspacePath);
+  const binding = request.noWorkspace ? undefined : request.workspaceBinding ?? workspaceBindingFromPath(request.workspacePath);
+  const projectWorkingDirectory = request.noWorkspace ? undefined : projectWorkingDirectoryFromBinding(binding, request.workspacePath);
   const projection = createProjectionPublishingDriver(
     apiBase,
     request.hostRunId,
@@ -157,10 +167,14 @@ async function resolveDecision(request: HostBridgeRequest): Promise<HostBridgeRe
     existingEvents: current.events,
     workspaceBinding: binding,
     projectWorkingDirectory,
+    projectId: request.projectId,
+    projectKind: request.projectKind,
+    projectRootStatus: request.projectRootStatus,
     profileId: request.profileId,
     workflow: request.workflow,
     reviewContinuationMode: request.reviewContinuationMode,
     interventionLevel: request.interventionLevel,
+    autonomyMode: request.autonomyMode,
     projectMemoryMode: request.projectMemoryMode,
   });
   await persistMemoryArchive(apiBase, result.session.id, result.events ?? [], binding, result.session, request.projectMemoryMode);
@@ -237,6 +251,9 @@ function createProjectionPublishingDriver(
         }
       : undefined,
     appendTranscript: (sessionId, entry) => transcriptClient.appendTranscript(sessionId, entry),
+    loadWireLedger: (sessionId) => transcriptClient.listWireLedger(sessionId),
+    appendWireLedger: (sessionId, entries) => transcriptClient.appendWireLedger(sessionId, entries),
+    appendCacheTelemetry: (sessionId, entry) => transcriptClient.appendCacheTelemetry(sessionId, entry),
     appendEvents: async (sessionId, events) => {
       const nextEvents = [...committedEvents, ...events];
       const projectionCommit = projector.commit(nextEvents);
@@ -343,6 +360,9 @@ async function llmChatStream(
 
     const chunks: LlmChatResult['chunks'] = [];
     let usage: Record<string, unknown> | undefined;
+    let providerProfileId: string | undefined;
+    let provider: string | undefined;
+    let model: string | undefined;
     let errorMessage: string | undefined;
     const parser = new SseClientParser();
     const decoder = new TextDecoder();
@@ -350,6 +370,9 @@ async function llmChatStream(
       if (event.chunk) chunks.push(event.chunk);
       if (event.usage) usage = event.usage;
       if (event.chunk?.usage) usage = event.chunk.usage;
+      providerProfileId = event.providerProfileId ?? providerProfileId;
+      provider = event.provider ?? provider;
+      model = event.model ?? model;
       if (event.type === 'provider_error') {
         const eventMessage = (event as LlmChatStreamEvent & { message?: string }).message;
         errorMessage = event.error ?? eventMessage ?? event.chunk?.error ?? 'Provider stream error.';
@@ -383,7 +406,7 @@ async function llmChatStream(
     }
     return {
       ok: true,
-      data: buildStreamResult(chunks, usage),
+      data: buildStreamResult(chunks, usage, { providerProfileId, provider, model }),
     };
   } catch (error) {
     return {
@@ -470,7 +493,8 @@ function parseSseClientEvent(raw: string): LlmChatStreamEvent | null {
 
 function buildStreamResult(
   chunks: LlmChatResult['chunks'],
-  usage: Record<string, unknown> | undefined
+  usage: Record<string, unknown> | undefined,
+  metadata: Pick<LlmChatResult, 'providerProfileId' | 'provider' | 'model'>
 ): LlmChatResult {
   const content = chunks
     .filter((chunk) => chunk.type === 'delta' && typeof chunk.content === 'string')
@@ -484,6 +508,7 @@ function buildStreamResult(
   return {
     chunks,
     usage,
+    ...metadata,
     assistantMessage: {
       role: 'assistant',
       content,
@@ -543,12 +568,15 @@ function workspaceBindingFromPath(path: string | undefined): AgentWorkspaceBindi
   };
 }
 
-function projectWorkingDirectoryFromPath(path: string | undefined): ProjectWorkingDirectory | undefined {
-  const normalized = normalizePath(path);
+function projectWorkingDirectoryFromBinding(
+  binding: AgentWorkspaceBinding | undefined,
+  fallbackPath: string | undefined
+): ProjectWorkingDirectory | undefined {
+  const normalized = normalizePath(binding?.openPath ?? fallbackPath);
   if (!normalized) return undefined;
   return {
-    rootId: `terminal-root-${simpleWorkspaceHash(normalized)}`,
-    label: `Terminal workspace ${normalized}`,
+    rootId: binding?.activeFolderId ?? `project-root-${binding?.workspaceHash ?? simpleWorkspaceHash(normalized)}`,
+    label: `Project workspace ${normalized}`,
     displayPath: normalized,
     absolutePath: normalized,
     source: 'projectWorkingDirectory',
@@ -682,7 +710,7 @@ function inferHostRunLifecycle(
       };
     }
 
-    if (kind === 'plan_card' && planCardAwaitingDecision(payload)) {
+    if (kind === 'plan_card' && planInteractionAwaitsDecision(payload)) {
       if (waitingOwnerWasConsumed(kind, payload, consumedOwners)) {
         continue;
       }
@@ -868,15 +896,6 @@ function addStrings(target: Set<string>, ...values: Array<string | undefined>): 
 
 function hasAny(target: Set<string>, ...values: Array<string | undefined>): boolean {
   return values.some((value) => Boolean(value && target.has(value)));
-}
-
-function planCardAwaitingDecision(payload: Record<string, unknown>): boolean {
-  if (payload.confirmable === false) return false;
-  const status = stringField(payload, 'status');
-  if (!status) return true;
-  return status === 'awaitingUserApproval' ||
-    status === 'awaitingTemporaryGrant' ||
-    status === 'pending';
 }
 
 function objectRecord(value: unknown): Record<string, unknown> | undefined {

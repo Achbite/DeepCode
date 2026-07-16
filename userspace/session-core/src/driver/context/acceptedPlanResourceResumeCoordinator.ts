@@ -4,7 +4,7 @@ import type {
 } from '@deepcode/protocol';
 import type { ProposalEnvelope } from '../../protocol/types.js';
 import type {
-  AcceptedImplementationPlanContext,
+  AcceptedTaskPlanContext,
   CurrentTaskContext,
   TaskExecutionCursor,
 } from '../../accepted-plan/types.js';
@@ -27,7 +27,7 @@ export interface AcceptedPlanResourceResumeCoordinatorState {
   sessionId: string;
   runId: string;
   userRequest: string;
-  acceptedImplementationPlan?: AcceptedImplementationPlanContext;
+  acceptedTaskPlan?: AcceptedTaskPlanContext;
   taskExecutionCursor?: TaskExecutionCursor;
   currentTaskContext?: CurrentTaskContext;
   contextAssembly?: ContextAssemblyRecord;
@@ -102,7 +102,7 @@ export class AcceptedPlanResourceResumeCoordinator<
       const parseError = this.input.parseError(error);
       await this.input.appendRepairNotice(
         runInput.state,
-        `Accepted-plan resource resume output requires Agent Protocol v3 repair: ${parseError.message}`
+        `Accepted-plan resource resume output requires Agent Protocol v4 repair: ${parseError.message}`
       );
       const repairedRaw = await runInput.runRepair(
         'accepted_plan_resource_resume_repair',
@@ -135,7 +135,7 @@ export class AcceptedPlanResourceResumeCoordinator<
   } {
     const dynamicContent = this.input.promptBuilder.render({
       repairState: this.input.repairState(runInput.state),
-      acceptedPlan: runInput.state.acceptedImplementationPlan,
+      acceptedPlan: runInput.state.acceptedTaskPlan,
       cursor: runInput.state.taskExecutionCursor,
       currentTask: runInput.state.currentTaskContext,
       requestProposal: runInput.requestProposal,

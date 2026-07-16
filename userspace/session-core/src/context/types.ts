@@ -28,6 +28,15 @@ export interface ResourceManifestEntry {
   include?: string[];
   contextLines?: number;
   maxResults?: number;
+  rootId?: string;
+  resourceId?: string;
+  contextUse?: 'workspaceBootstrap' | 'resourceEvidence' | 'admissionMetadata';
+  readMode?: 'content' | 'metadataOnly';
+  directoryOptions?: {
+    maxDepth: number;
+    maxEntries: number;
+    includeContent: boolean;
+  };
 }
 
 export interface ResourceManifestBudget {
@@ -39,6 +48,10 @@ export interface ResourceManifest {
   id: string;
   workspaceScopeKey: string;
   workspaceId?: string;
+  workspaceBindingHash?: string;
+  projectId?: string;
+  projectKind?: 'folder' | 'blank';
+  projectRootStatus?: 'ready' | 'unbound' | 'unavailable';
   entries: ResourceManifestEntry[];
   budget: ResourceManifestBudget;
   defaultDenyPatterns: string[];
@@ -49,6 +62,7 @@ export interface ProjectWorkingDirectory {
   label: string;
   displayPath: string;
   absolutePath?: string;
+  resourceId?: string;
   source: 'currentAttachment' | 'projectWorkingDirectory' | 'recentAttachment' | 'sessionAttachment' | 'workspaceBinding';
   primary?: boolean;
 }
@@ -97,18 +111,25 @@ export interface ResourcePacketItem {
   status: 'provided' | 'resolved' | 'skipped' | 'needsUserApproval' | 'denied' | 'error';
   path?: string;
   absolutePath?: string;
-  contentKind?: 'directoryTree' | 'fileText' | 'fileSkipped' | 'searchResults' | 'summary' | 'text' | 'json';
+  contentKind?: 'directoryTree' | 'fileText' | 'fileSkipped' | 'searchResults' | 'metadata' | 'summary' | 'text' | 'json';
+  rootId?: string;
+  resolvedKind?: 'file' | 'directory' | 'other';
+  reason?: string;
+  message?: string;
   contentSummary?: string;
   promptContent?: string;
   query?: string;
   include?: string[];
   matches?: Array<Record<string, unknown>>;
+  nodes?: Array<Record<string, unknown>>;
   truncated?: boolean;
   originalBytes?: number;
   returnedMatches?: number;
+  returnedCount?: number;
   offsetBytes?: number;
   limitBytes?: number;
   returnedBytes?: number;
+  contentHash?: string;
   rangeComplete?: boolean;
   denialReason?: string;
   skipReason?: string;
@@ -125,6 +146,51 @@ export interface ResourcePacket {
   items: ResourcePacketItem[];
 }
 
+export interface ProjectBootstrapEntry {
+  path: string;
+  kind: 'file' | 'directory' | 'other';
+  sizeBytes?: number;
+  readable?: boolean;
+  classification?: string;
+}
+
+export interface ProjectBootstrapSnapshot {
+  schemaVersion: 'deepcode.session.project-bootstrap.v1';
+  cwd: string;
+  rootId: string;
+  workspaceScopeKey: string;
+  workspaceBindingHash?: string;
+  rootStatus: 'ready' | 'unbound' | 'unavailable';
+  entries: ProjectBootstrapEntry[];
+  returnedCount: number;
+  truncated: boolean;
+  listingHash: string;
+}
+
+export interface ResourceDeltaItem {
+  requestItemId: string;
+  rootId?: string;
+  path?: string;
+  status: ResourcePacketItem['status'];
+  contentKind?: ResourcePacketItem['contentKind'];
+  hash?: string;
+  sizeBytes?: number;
+  truncated?: boolean;
+  content?: string;
+  summary?: string;
+  matches?: Array<Record<string, unknown>>;
+  nodes?: Array<Record<string, unknown>>;
+  reason?: string;
+}
+
+export interface ResourceDelta {
+  schemaVersion: 'deepcode.session.resource-delta.v1';
+  requestId: string;
+  rootId?: string;
+  workspaceScopeKey: string;
+  items: ResourceDeltaItem[];
+}
+
 export type ResourceBlockRetention = 'full' | 'summary' | 'handleOnly' | 'denied' | 'error';
 
 export interface ResourcePromptBlock {
@@ -132,6 +198,9 @@ export interface ResourcePromptBlock {
   workspaceScopeKey: string;
   manifestEntryId: string;
   displayRef: string;
+  rootId?: string;
+  path?: string;
+  listedPaths?: string[];
   contentHash: string;
   retention: ResourceBlockRetention;
   status: ResourcePacketItem['status'];

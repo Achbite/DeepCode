@@ -7,13 +7,13 @@ import {
   type TaskLedgerSnapshot,
 } from '../run-state/index.js';
 import type {
-  AcceptedImplementationPlanContext,
+  AcceptedTaskPlanContext,
   CurrentTaskContext,
   TaskExecutionCursor,
 } from './types.js';
 
 export class AcceptedTaskRegistry {
-  constructor(private readonly acceptedPlan: AcceptedImplementationPlanContext | undefined) {}
+  constructor(private readonly acceptedPlan: AcceptedTaskPlanContext | undefined) {}
 
   ledger(
     failedTaskId?: string,
@@ -38,7 +38,7 @@ export class AcceptedTaskRegistry {
         taskId: task.taskId,
         title: task.title,
         targets: task.targets,
-        capability: task.capability,
+        toolId: task.toolId,
       })),
       completedTaskIds: acceptedPlan.completedTaskIds,
       modelJudgedSufficientTaskIds: acceptedPlan.modelJudgedSufficientTaskIds ?? [],
@@ -68,8 +68,7 @@ export class AcceptedTaskRegistry {
     const ledger = this.ledger();
     const modelJudgedSufficient = new Set(acceptedPlan.modelJudgedSufficientTaskIds ?? []);
     const settledTasks = new Set([...acceptedPlan.completedTaskIds, ...modelJudgedSufficient]);
-    const currentTask = acceptedPlan.tasks.find((task) => !settledTasks.has(task.taskId))
-      ?? acceptedPlan.tasks[Math.max(0, acceptedPlan.batchIndex - 1)];
+    const currentTask = acceptedPlan.tasks.find((task) => !settledTasks.has(task.taskId));
     const lastResourcePacketIds = resourcePackets
       .map((packet) => packet.id)
       .filter((id): id is string => typeof id === 'string' && id.trim().length > 0)
@@ -99,17 +98,9 @@ export class AcceptedTaskRegistry {
     if (!acceptedPlan || !cursor) return undefined;
     const task = acceptedPlan.tasks.find((item) => item.taskId === cursor.currentTaskId)
       ?? acceptedPlan.tasks.find((item) => !cursor.completedTaskIds.includes(item.taskId));
-    const currentTaskGrants = acceptedPlan.exactOperationGrants.filter((grant) =>
-      !grant.sourceTaskId || !task?.taskId || grant.sourceTaskId === task.taskId
-    );
-    const targets = [...new Set([
-      ...(task?.targets ?? []),
-      ...currentTaskGrants.map((grant) => grant.targetPath),
-    ].map(normalizeTaskContextPath).filter(Boolean))];
-    const capabilities = [...new Set([
-      task?.capability,
-      ...currentTaskGrants.map((grant) => grant.capability),
-    ].filter((item): item is string => Boolean(item && item.trim())))];
+    if (!task) return undefined;
+    const targets = [...new Set((task?.targets ?? []).map(normalizeTaskContextPath).filter(Boolean))];
+    const toolIds = [task?.toolId].filter((item): item is string => Boolean(item && item.trim()));
     const goalParts = [
       acceptedPlan.title ?? acceptedPlan.summary ?? acceptedPlan.planId,
       task ? `task=${task.taskId}${task.title ? ` ${task.title}` : ''}` : '',
@@ -121,19 +112,19 @@ export class AcceptedTaskRegistry {
       nodeId: undefined,
       taskTitle: task?.title,
       targets,
-      capabilities,
+      toolIds,
       acceptanceCriteria: task?.acceptanceCriteria ?? [],
       failureCriteria: task?.failureCriteria ?? [],
       taskOrder: cursor.taskOrder,
       pendingTaskIds: cursor.pendingTaskIds,
-      dependsOn: [],
+      dependsOn: task?.dependencies ?? [],
       evidenceNeeds: [],
       completedTaskIds: cursor.completedTaskIds,
       modelJudgedSufficientTaskIds: cursor.modelJudgedSufficientTaskIds,
     };
   }
 
-  withCompleted(completedTaskIds: string[]): AcceptedImplementationPlanContext | undefined {
+  withCompleted(completedTaskIds: string[]): AcceptedTaskPlanContext | undefined {
     const acceptedPlan = this.acceptedPlan;
     if (!acceptedPlan) return undefined;
     const completed = new Set(completedTaskIds);
@@ -148,7 +139,7 @@ export class AcceptedTaskRegistry {
     };
   }
 
-  withModelJudgedSufficient(taskId: string): AcceptedImplementationPlanContext | undefined {
+  withModelJudgedSufficient(taskId: string): AcceptedTaskPlanContext | undefined {
     const acceptedPlan = this.acceptedPlan;
     if (!acceptedPlan) return undefined;
     const completed = new Set(acceptedPlan.completedTaskIds);

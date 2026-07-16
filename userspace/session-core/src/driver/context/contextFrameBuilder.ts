@@ -310,11 +310,12 @@ export class ContextFrameBuilder {
         'Use exactly one registered execution semantic tool.',
         'Use TaskFrame and IntentSlot values as the complete current-task boundary; do not import unrelated targets from the original user request, plan summary, memory, or later tasks.',
         'If every current IntentSlot has evidenceRequirement=none, submit the current artifacts directly; do not read the target or parent directory merely to confirm that the operation may begin.',
-        'If generated content is needed and evidence is sufficient, call session.submit_task_artifacts with slot ids and content only.',
+        'If generated content is needed and evidence is sufficient, append one logically coherent file or code section through session.append_artifact_chunk. Small files may use one call; larger files may use multiple class, function, script, or configuration-section calls. Do not count lines or bytes. Call session.finalize_task_artifacts only after all current slots are complete.',
+        'If fresh task-scoped evidence proves every acceptance criterion is already satisfied, use session.submit_task_outcome instead of emitting empty artifacts or a diagnostic.',
         'If evidence is missing, call session.request_resources with a focused resource intent.',
         'If AccessIndex currentTaskEvidence reports covered=true for the current target, use that evidence instead of repeating the same resourceRequest; request only a different range/search when exact missing content would change the action.',
         'Session and Kernel handle execution scope and permission interrupts; do not submit permission fields.',
-        'If the current task is already sufficiently satisfied and no Kernel action is needed, call session.complete_current_task.',
+        'If neither a valid current-task action nor a fresh-evidence task outcome applies, call session.request_decision for a recoverable user choice or session.report_diagnostic for a terminal failure.',
         'Keep visible reasoning/progress action-oriented: state the current action or task outcome, not protocol, tool, permission, or evidence-policy deliberation.',
       ].join(' ');
     }

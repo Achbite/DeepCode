@@ -1,31 +1,7 @@
-export type ActionKind =
-  | 'read'
-  | 'list'
-  | 'search'
-  | 'diff'
-  | 'create'
-  | 'write'
-  | 'patch'
-  | 'replaceBlock'
-  | 'insertBefore'
-  | 'insertAfter'
-  | 'delete'
-  | 'rename'
-  | 'command'
-  | 'validation'
-  | 'review'
-  | 'repair'
-  | 'status'
-  | 'stage'
-  | 'unstage'
-  | 'commit'
-  | 'push';
-
-export interface CodeBlockDraft {
-  id: string;
-  path: string;
-  content: string;
-  contentLines?: string[];
+export interface ContentBlockDraft {
+  blockId: string;
+  targetPath: string;
+  contentLines: string[];
   language?: string;
   operation?:
     | 'create'
@@ -38,72 +14,14 @@ export interface CodeBlockDraft {
     | 'delete'
     | 'rename';
   allowEmptyContent?: boolean;
-  permissionLabels?: string[];
 }
 
 export interface PlannedActionDraft {
-  id: string;
-  title: string;
-  actionId?: string;
+  actionId: string;
   toolId: string;
-  args?: Record<string, unknown>;
-  capability: string;
-  kind?: ActionKind;
-  targetRef?: {
-    kind: 'workspaceRelative' | 'rootRelative' | 'absolutePath' | string;
-    path: string;
-    rootId?: string;
-  };
-  resourceScope: string[];
-  canParallelize: boolean;
-  conflictKeys: string[];
-  purpose?: string;
-  sourceBlockId?: string;
-  replacementBlockId?: string;
-  targetPath?: string;
-  targetKind?: 'file' | 'directory' | string;
-  recursive?: boolean;
-  patchSpec?: Record<string, unknown>;
-  toolArgs?: Record<string, unknown>;
-  permissionLabels?: string[];
+  args: Record<string, unknown>;
+  description: string;
   dependsOn?: string[];
-  accessScopes?: AccessScopeDraft[];
-}
-
-export interface FileOperationDraft {
-  operation: 'write' | 'create' | 'patch' | 'delete' | 'rename' | string;
-  capability: string;
-  targetRef?: {
-    kind: 'workspaceRelative' | 'rootRelative' | 'absolutePath' | string;
-    path: string;
-    rootId?: string;
-  };
-  targetPath?: string;
-  targetKind?: 'file' | 'directory' | string;
-  recursive?: boolean;
-  reason?: string;
-}
-
-export interface AccessScopeDraft {
-  scopeKind: 'workspaceModule' | 'oneHopDependency' | string;
-  path: string;
-  capability?: string;
-  capabilities?: string[];
-  operations?: string[];
-  reason?: string;
-  dependencyDepth?: number;
-  sourceTaskId?: string;
-}
-
-export interface CommandBlockDraft {
-  commandId: string;
-  capability: 'process.exec';
-  cwd?: string;
-  argv: string[];
-  timeoutMs?: number;
-  envPolicy?: 'inheritSafe' | 'explicitOnly' | 'empty';
-  expectedOutput?: string;
-  permissionLabels?: string[];
 }
 
 export interface ValidationExpectationDraft {
@@ -125,35 +43,15 @@ export interface ContinuationExpectationDraft {
   dependsOn?: string[];
 }
 
-export interface RepairPolicyDraft {
-  maxRounds: number;
-  allowedFiles: string[];
-  forbidNewFilesAfterApproval: boolean;
-  forbidNewPermissionsAfterApproval: boolean;
-}
-
 export interface ActionBundleDraft {
   version: '1';
   id: string;
   goal: string;
   requirementId?: string;
   actions: PlannedActionDraft[];
-  commandBlocks?: CommandBlockDraft[];
   continuationExpectations?: ContinuationExpectationDraft[];
   validationExpectations: ValidationExpectationDraft[];
   reviewExpectations: ReviewExpectationDraft[];
-  repairPolicy?: RepairPolicyDraft;
-  accessScopes?: AccessScopeDraft[];
-}
-
-export interface ExpectedValidation {
-  content: string;
-  expectations: ValidationExpectationDraft[];
-}
-
-export interface ReviewGuide {
-  content: string;
-  expectations: ReviewExpectationDraft[];
 }
 
 export interface ResourceRequestDraftItem {
@@ -232,63 +130,28 @@ export interface DiagnosticDraft {
   details?: string;
 }
 
-export interface ImplementationPlanTaskDraft {
+export interface TaskPlanTaskDraft {
   taskId: string;
   title: string;
   target: string[];
-  scope: string;
   dependencies: string[];
+  args: Record<string, unknown>;
   conflictKeys?: string[];
   batchKind?: 'sourceCode' | 'infra' | 'script' | 'test' | 'docs' | 'config' | 'review' | string;
-  role?: 'sourceCode' | 'infra' | 'script' | 'test' | 'docs' | 'config' | 'review';
-  capability: string;
-  fileOperations?: FileOperationDraft[];
-  accessScopes?: AccessScopeDraft[];
+  toolId: string;
   acceptanceCriteria: string[];
   failureCriteria: string[];
 }
 
-export interface ImplementationPlanDraft {
+export interface TaskPlanDraft {
   version: '1';
   id: string;
   title: string;
   summary: string;
-  tasks: ImplementationPlanTaskDraft[];
+  tasks: TaskPlanTaskDraft[];
   risks: string[];
   reviewCheckpoints: string[];
 }
-
-export interface TaskOutcomeDraft {
-  version: '1';
-  id: string;
-  taskId?: string;
-  status: 'modelJudgedSufficient' | 'blocked' | 'failed';
-  reason: string;
-  evidenceRefs: string[];
-}
-
-export interface AgentPlanParts {
-  userPlan: string;
-  actionBundle: ActionBundleDraft;
-  codeBlocks: CodeBlockDraft[];
-  expectedValidation: ExpectedValidation;
-  reviewGuide: ReviewGuide;
-}
-
-export type AgentPlanOutput =
-  | {
-      kind: 'answer';
-      answer: AnswerDraft;
-    }
-  | {
-      kind: 'actionPlan';
-      parts: AgentPlanParts;
-    }
-  | {
-      kind: 'resourceRequest';
-      userPlan?: string;
-      resourceRequest: ResourceRequestDraft;
-    };
 
 export interface AgentPlanParseFailure {
   code: string;
@@ -302,13 +165,11 @@ export type ProposalEnvelopeKind =
   | 'resourceRequest'
   | 'decisionRequest'
   | 'taskPlan'
-  | 'implementationPlan'
   | 'actionBundle'
-  | 'taskOutcome'
   | 'diagnostic';
 
 export interface ProposalEnvelope {
-  schemaVersion: 'deepcode.agent.protocol.v3';
+  schemaVersion: 'deepcode.agent.protocol.v4';
   proposalId: string;
   runId: string;
   sessionId?: string;

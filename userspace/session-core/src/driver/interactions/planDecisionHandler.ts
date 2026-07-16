@@ -2,17 +2,19 @@ import type {
   AgentEvent,
   AgentSessionResult,
   AgentWorkspaceBinding,
+  KernelCommandEnvelope,
+  KernelReply,
 } from '@deepcode/protocol';
 import type { ProjectMemoryMode } from '../../context/index.js';
 import type { ProjectWorkingDirectory } from '../../context/types.js';
 import type {
-  AcceptedImplementationPlanContext,
-  AcceptedImplementationPlanExecutionRoot,
+  AcceptedTaskPlanContext,
+  AcceptedTaskPlanExecutionRoot,
 } from '../execution/index.js';
 import type { InteractionOverlayContext, SessionTurnPhase } from '../pipelines/interactionOverlayCodec.js';
 import type { PlanContext, PlanContextIndex } from '../proposal/planContextIndex.js';
 import type { PlanProjectionBuilder } from '../projection/planProjectionBuilder.js';
-import type { InterventionLevel, ReviewContinuationMode } from '../types.js';
+import type { AutonomyMode, InterventionLevel, ReviewContinuationMode } from '../types.js';
 import {
   decisionContinuationInput,
   returnSessionResult,
@@ -32,17 +34,21 @@ export interface PlanDecisionHandlerInput {
   existingEvents?: AgentEvent[];
   workspaceBinding?: AgentWorkspaceBinding;
   projectWorkingDirectory?: ProjectWorkingDirectory;
+  projectId?: string;
+  projectKind?: 'folder' | 'blank';
+  projectRootStatus?: 'ready' | 'unbound' | 'unavailable';
   profileId?: string;
   workflow?: string;
   reviewContinuationMode?: PlanDecisionHandlerContinuationMode;
   interventionLevel?: PlanDecisionHandlerInterventionLevel;
+  autonomyMode?: AutonomyMode;
   projectMemoryMode?: ProjectMemoryMode;
   interactionOverlay?: InteractionOverlayContext;
 }
 
 export interface RecoveredAcceptedPlanContext {
   plan: PlanContext;
-  acceptedPlan: AcceptedImplementationPlanContext;
+  acceptedPlan: AcceptedTaskPlanContext;
 }
 
 export type DriverInteractionRef =
@@ -66,6 +72,9 @@ export interface PlanDecisionHandlerPorts {
   now(): string;
   createId(prefix: string): string;
   append(sessionId: string, events: AgentEvent[]): Promise<AgentSessionResult>;
+  kernel(request: KernelCommandEnvelope): Promise<KernelReply>;
+  appendProjectedKernelEvents(sessionId: string, reply: KernelReply): Promise<AgentSessionResult | undefined>;
+  diagnosticEvent(sessionId: string, content: string, ts: string, id: string): AgentEvent;
   executeAcceptedActionBundlePlan(
     input: PlanDecisionHandlerInput,
     plan: PlanContext,
@@ -73,19 +82,19 @@ export interface PlanDecisionHandlerPorts {
     acceptedOverlay?: RecoveredAcceptedPlanContext
   ): Promise<SessionLoopControlResult>;
   activeDriverInteraction(events: AgentEvent[]): DriverInteractionRef | null;
-  executionRootFromDecision(input: PlanDecisionHandlerInput, events: AgentEvent[]): AcceptedImplementationPlanExecutionRoot | undefined;
-  buildAcceptedImplementationPlan(input: {
+  executionRootFromDecision(input: PlanDecisionHandlerInput, events: AgentEvent[]): AcceptedTaskPlanExecutionRoot | undefined;
+  buildAcceptedTaskPlan(input: {
     plan: PlanContext;
     interventionLevel?: PlanDecisionHandlerInterventionLevel;
-    executionRoot?: AcceptedImplementationPlanExecutionRoot;
-  }): AcceptedImplementationPlanContext;
+    executionRoot?: AcceptedTaskPlanExecutionRoot;
+  }): AcceptedTaskPlanContext;
   recoverAcceptedPlanFromOverlay(
     input: PlanDecisionHandlerInput,
     events: AgentEvent[],
     overlay: InteractionOverlayContext | undefined
   ): RecoveredAcceptedPlanContext | undefined;
   planRevisionRequest(input: { plan: PlanContext; guidance?: string }): string;
-  executionRequest(plan: PlanContext, acceptedPlan: AcceptedImplementationPlanContext, guidance?: string): string;
+  executionRequest(plan: PlanContext, acceptedPlan: AcceptedTaskPlanContext, guidance?: string): string;
   planIndex: PlanContextIndex;
   planProjection: PlanProjectionBuilder;
   progressProjection: {
@@ -147,7 +156,17 @@ export class PlanDecisionHandler {
     input: PlanDecisionHandlerInput,
     plan: PlanContext
   ): Promise<PlanDecisionRunEffect> {
-    let result = await this.ports.append(input.sessionId, [
+    let result: AgentSessionResult | undefined;
+    if (plan.taskPlan) {
+      result = await this.recordPlanAuthorizationDecision(input, plan, 'accept');
+      if (!result) {
+        return {
+          kind: 'planDecisionNoop',
+          control: returnSessionResult(await this.appendAuthorizationFailure(input, plan)),
+        };
+      }
+    }
+    result = await this.ports.append(input.sessionId, [
       this.ports.planProjection.planReviewDecisionEvent({
         sessionId: input.sessionId,
         plan,
@@ -156,9 +175,9 @@ export class PlanDecisionHandler {
         id: this.ports.createId('plan-accepted'),
       }),
     ]);
-    if (plan.implementationPlan) {
+    if (plan.taskPlan) {
       const executionRoot = plan.executionRoot ?? this.ports.executionRootFromDecision(input, result.events);
-      const acceptedPlan = this.ports.buildAcceptedImplementationPlan({
+      const acceptedPlan = this.ports.buildAcceptedTaskPlan({
         plan,
         interventionLevel: input.interventionLevel,
         executionRoot,
@@ -173,7 +192,7 @@ export class PlanDecisionHandler {
             existingEvents: result.events,
             reviewContinuationMode: input.reviewContinuationMode,
             resumeResourcePackets: true,
-            acceptedImplementationPlan: acceptedPlan,
+            acceptedTaskPlan: acceptedPlan,
             interactionOverlay: plan.interactionOverlay ?? input.interactionOverlay,
           }),
         },
@@ -218,7 +237,17 @@ export class PlanDecisionHandler {
     plan: PlanContext
   ): Promise<PlanDecisionRunEffect> {
     const status = input.decision === 'revise' ? 'needsRevision' : 'rejected';
-    let result = await this.ports.append(input.sessionId, [
+    let result: AgentSessionResult | undefined;
+    if (plan.taskPlan) {
+      result = await this.recordPlanAuthorizationDecision(input, plan, 'reject');
+      if (!result) {
+        return {
+          kind: 'planDecisionNoop',
+          control: returnSessionResult(await this.appendAuthorizationFailure(input, plan)),
+        };
+      }
+    }
+    result = await this.ports.append(input.sessionId, [
       this.ports.planProjection.planReviewDecisionEvent({
         sessionId: input.sessionId,
         plan,
@@ -265,5 +294,47 @@ export class PlanDecisionHandler {
       ]) ?? result;
     }
     return { kind: 'planRejected', control: returnSessionResult(result) };
+  }
+
+  private async recordPlanAuthorizationDecision(
+    input: PlanDecisionHandlerInput,
+    plan: PlanContext,
+    decision: 'accept' | 'reject'
+  ): Promise<AgentSessionResult | undefined> {
+    if (!plan.authorizationContractId || !plan.authorizationContractHash || !plan.planHash) {
+      return undefined;
+    }
+    const reply = await this.ports.kernel({
+      command: {
+        kind: 'planAuthorizationDecisionSubmit',
+        requestId: this.ports.createId('plan-authorization-decision'),
+        runId: plan.runId,
+        sessionId: input.sessionId,
+        decision: {
+          decisionId: this.ports.createId('plan-authorization-user-decision'),
+          authorizationContractId: plan.authorizationContractId,
+          planId: plan.planId,
+          planHash: plan.planHash,
+          contractHash: plan.authorizationContractHash,
+          decision,
+        },
+      },
+    });
+    const result = await this.ports.appendProjectedKernelEvents(input.sessionId, reply);
+    return reply.ok ? result : undefined;
+  }
+
+  private appendAuthorizationFailure(
+    input: PlanDecisionHandlerInput,
+    plan: PlanContext
+  ): Promise<AgentSessionResult> {
+    return this.ports.append(input.sessionId, [
+      this.ports.diagnosticEvent(
+        input.sessionId,
+        'Kernel plan authorization decision failed or the plan authorization contract is unavailable; execution was not started.',
+        this.ports.now(),
+        this.ports.createId('plan-authorization-decision-failed')
+      ),
+    ]);
   }
 }

@@ -10,9 +10,15 @@ import {
   createResourcePacket,
   type ResourceManifest,
 } from '../index.js';
-import type { AcceptedImplementationPlanContext } from '../accepted-plan/index.js';
+import {
+  dependencyFactsForTask,
+  taskDependencyFactsFromKernelEvents,
+  type AcceptedTaskPlanContext,
+} from '../accepted-plan/index.js';
 import { ContextFrameBuilder } from '../driver/context/contextFrameBuilder.js';
+import { buildUserAuthorityFrame } from '../driver/context/userAuthorityFrame.js';
 import { renderProviderTurnUserPrompt } from '../driver/context/providerTurnPromptRenderer.js';
+import { emptyPromptLedgerState } from '../prompt/promptLedger.js';
 import {
   buildProviderTurnSnapshot,
   ProviderTurnContextCoordinator,
@@ -45,7 +51,7 @@ export function assertProviderTurnContractFrameOrder(): void {
     prompt: buildPromptEnvelope({
       workflowState: 'acceptedTaskExecution',
       allowedProposals: ['actionBundle', 'resourceRequest', 'decisionRequest', 'diagnostic'],
-      capabilityCatalogSummary: 'fs.read\nfs.write',
+      toolCatalogSummary: 'fs.read\nfs.write',
       userRequest: 'Create generic files under the current task.',
     }),
     userRequest: 'Create generic files under the current task.',
@@ -84,7 +90,7 @@ export function assertProviderTurnContractFrameOrder(): void {
     prompt: buildPromptEnvelope({
       workflowState: 'needProposal',
       allowedProposals: ['answer', 'resourceRequest', 'taskPlan'],
-      capabilityCatalogSummary: 'fs.read',
+      toolCatalogSummary: 'fs.read',
       userRequest: 'Analyze a generic workspace.',
     }),
     userRequest: 'Analyze a generic workspace.',
@@ -106,6 +112,67 @@ export function assertProviderTurnContractFrameOrder(): void {
   assert(
     String(planningContract.nextActionInstruction.summary ?? '').includes('Keep visible reasoning/progress action-oriented'),
     'planning provider turn keeps visible reasoning action oriented'
+  );
+}
+
+export function assertTaskDependencyFactsRequireTerminalKernelEvidence(): void {
+  const token = randomSmokeToken('dependency-fact');
+  const taskId = `task-${token}`;
+  const workUnitId = `work-${token}`;
+  const path = `artifact-${token}`;
+  const facts = taskDependencyFactsFromKernelEvents(taskId, [
+    {
+      payload: {
+        kernelEvent: {
+          kind: 'work_unit.completed',
+          workUnitId,
+        },
+      },
+    },
+    {
+      payload: {
+        kernelEvent: {
+          kind: 'tool.completed',
+          ok: true,
+          toolCallId: `call-${token}`,
+          toolName: 'fs.create',
+          output: {
+            path,
+            contentHash: `hash-${token}`,
+            sizeBytes: 17,
+            mode: 0o755,
+            executable: true,
+            kernelContext: { workUnitId },
+          },
+        },
+      },
+    },
+    {
+      kind: 'tool.completed',
+      ok: true,
+      toolCallId: `unpaired-${token}`,
+      toolName: 'fs.create',
+      output: {
+        path: `unpaired-${token}`,
+        kernelContext: { workUnitId: `missing-${token}` },
+      },
+    },
+  ]);
+
+  assertEqual(facts.length, 1, 'dependency facts require paired ToolCompleted and WorkUnitCompleted facts');
+  assertEqual(facts[0]?.taskId, taskId, 'dependency fact binds to the completed accepted task');
+  assertEqual(facts[0]?.path, path, 'dependency fact preserves the Kernel-observed target');
+  assertEqual(facts[0]?.mode, 0o755, 'dependency fact preserves the Kernel-observed file mode');
+  assertEqual(facts[0]?.executable, true, 'dependency fact preserves executable state');
+  assertEqual(
+    dependencyFactsForTask(facts, [taskId]).length,
+    1,
+    'declared dependency receives its compact Kernel fact'
+  );
+  assertEqual(
+    dependencyFactsForTask(facts, [`other-${token}`]).length,
+    0,
+    'unrelated tasks do not inherit dependency facts'
   );
 }
 
@@ -178,19 +245,19 @@ export function assertAcceptedPlanContinuationDefaultsResourceResume(): void {
     planId: `plan-${token}`,
     tasks: [],
     completedTaskIds: [],
-  } as unknown as AcceptedImplementationPlanContext;
+  } as unknown as AcceptedTaskPlanContext;
   const input = acceptedPlanContinuationInput({
     sessionId: `session-${token}`,
     reviewContinuationMode: 'auto',
   }, {
     content: `continue accepted plan ${token}`,
     existingEvents: [],
-    acceptedImplementationPlan: acceptedPlan,
+    acceptedTaskPlan: acceptedPlan,
   });
   assertEqual(input.appendUserMessage, false, 'accepted-plan continuation does not append a new user message');
   assertEqual(input.requirementConfirmationMode, 'off', 'accepted-plan continuation does not re-enter requirement confirmation');
   assertEqual(input.resumeResourcePackets, true, 'accepted-plan continuation defaults resource packet resume on');
-  assertEqual(input.acceptedImplementationPlan, acceptedPlan, 'accepted-plan continuation carries accepted plan authority');
+  assertEqual(input.acceptedTaskPlan, acceptedPlan, 'accepted-plan continuation carries accepted plan authority');
 }
 
 export async function assertRunEngineContinuationUsesSameLifecycle(): Promise<void> {
@@ -525,6 +592,7 @@ export function assertProviderTurnSnapshotRecordsContextAdmissionShape(): void {
       [`dir-${token}`]: {
         contentKind: 'directoryTree',
         promptContent: `dir-${token}/\n  child-${token}.txt`,
+        nodes: [{ path: `dir-${token}/child-${token}.txt`, type: 'file' }],
         evidenceRefs: [`dir-evidence-${token}`],
       },
     },
@@ -532,7 +600,7 @@ export function assertProviderTurnSnapshotRecordsContextAdmissionShape(): void {
   const prompt = buildPromptEnvelope({
     workflowState: `workflow-${token}`,
     allowedProposals: ['actionBundle', 'resourceRequest'],
-    capabilityCatalogSummary: `capability-${token}`,
+    toolCatalogSummary: `capability-${token}`,
     userRequest: `request-${token}`,
     resourcePromptContext: buildResourcePromptContext({
       initialContext,
@@ -544,7 +612,7 @@ export function assertProviderTurnSnapshotRecordsContextAdmissionShape(): void {
     contextAssemblyId: `assembly-${token}`,
     workflowState: `workflow-${token}`,
     allowedProposals: ['actionBundle', 'resourceRequest'],
-    capabilityCatalogSummary: `capability-${token}`,
+    toolCatalogSummary: `capability-${token}`,
     userRequest: `request-${token}`,
     initialContext,
     resourcePackets: [resourcePacket],
@@ -564,7 +632,7 @@ export function assertProviderTurnSnapshotRecordsContextAdmissionShape(): void {
       taskTitle: `Task ${token}`,
       goal: `Handle target ${token}`,
       targets: [`file-${token}.txt`, `dir-${token}/child-${token}.txt`],
-      capabilities: ['fs.write'],
+      toolIds: ['fs.write'],
       taskOrder: [`task-${token}`],
       pendingTaskIds: [`task-${token}`],
       dependsOn: [],
@@ -649,15 +717,15 @@ export function assertProviderTurnSnapshotRecordsContextAdmissionShape(): void {
   );
   assertEqual(
     snapshot.frames.some((frame) => frame.kind === 'DynamicDialogue' && frame.dynamicSummaryOverlapCharLength > 0),
-    true,
-    'provider turn snapshot detects dynamic overlap for current user request frame'
+    false,
+    'provider turn snapshot confirms the exact user request is not duplicated in the system dynamic suffix'
   );
   assertEqual(snapshot.resourceBlocks.length > 0, true, 'provider turn snapshot records resource block metadata');
   assertEqual(snapshot.providerTurnContractHash.length > 0, true, 'provider turn snapshot records provider contract hash');
   assertEqual(typeof snapshot.dynamicFrameOverlapCharLength, 'number', 'provider turn snapshot records aggregate dynamic frame overlap length');
   assertEqual(typeof snapshot.dynamicFrameOverlapRatio, 'number', 'provider turn snapshot records aggregate dynamic frame overlap ratio');
   assertEqual(snapshot.dynamicDialogueSummaryCharLength > 0, true, 'provider turn snapshot records dynamic dialogue summary length');
-  assertEqual(snapshot.dynamicDialogueDynamicSuffixOccurrences, 1, 'provider turn snapshot counts dynamic dialogue text in dynamic suffix');
+  assertEqual(snapshot.dynamicDialogueDynamicSuffixOccurrences, 0, 'provider turn snapshot keeps dynamic dialogue text outside the system dynamic suffix');
   assertEqual(snapshot.dynamicDialogueFrameTextOccurrences >= 1, true, 'provider turn snapshot counts dynamic dialogue text in provider contract frames');
   assertEqual(snapshot.finalUserPromptHash.length > 0, true, 'provider turn snapshot records final user prompt hash');
   assertEqual(snapshot.finalUserPromptCharLength > snapshot.dynamicSuffixCharLength, true, 'provider turn snapshot records rendered contract appended to dynamic prompt');
@@ -670,8 +738,8 @@ export function assertProviderTurnSnapshotRecordsContextAdmissionShape(): void {
   const finalUserPrompt = renderProviderTurnUserPrompt(contract.prompt.dynamicSuffix, contract);
   assertEqual(
     exactTextOccurrences(finalUserPrompt, `request-${token}`),
-    1,
-    'provider user prompt renders DynamicDialogue text once and references it from the contract'
+    0,
+    'provider contract prompt references PromptLedger instead of duplicating the exact user message'
   );
   assert(
     finalUserPrompt.includes('"dynamicContentIncludedOnce": true'),
@@ -692,8 +760,8 @@ export function assertTaskLocalCompactRecordFlowsThroughCheckpoints(): void {
   const token = randomSmokeToken('task-compact');
   const context = assembleContext({
     workflowState: 'acceptedTaskExecution',
-    allowedProposals: ['actionBundle', 'resourceRequest', 'taskOutcome', 'diagnostic'],
-    capabilityCatalogSummary: 'fs.write',
+    allowedProposals: ['actionBundle', 'resourceRequest', 'diagnostic'],
+    toolCatalogSummary: 'fs.write',
     userRequest: `accepted task ${token}`,
     currentTaskGoal: `write generic target ${token}`,
     currentTaskContext: {
@@ -739,7 +807,7 @@ export function assertTaskLocalCompactRecordFlowsThroughCheckpoints(): void {
   assertEqual(limited.length, 2, 'task-local compact record append evicts records beyond the limit');
   assertEqual(limited.some((record) => record.compactHash === compactVariant.compactHash), false, 'task-local compact record append evicts the oldest record');
 
-  const accepted: AcceptedImplementationPlanContext = {
+  const accepted: AcceptedTaskPlanContext = {
     planId: `plan-${token}`,
     runId: `run-${token}`,
     title: `Plan ${token}`,
@@ -747,16 +815,17 @@ export function assertTaskLocalCompactRecordFlowsThroughCheckpoints(): void {
       taskId: `task-${token}`,
       title: `Task ${token}`,
       targets: [`generated/${token}.txt`],
-      capability: 'fs.write',
+      toolId: 'fs.write',
       dependencies: [],
+      planningArgs: {},
       conflictKeys: [],
     }],
-    capabilities: ['fs.write'],
+    authorizationOperations: [],
+    toolIds: ['fs.write'],
     targetScopes: [`generated/${token}.txt`],
-    exactOperationGrants: [],
-    accessScopes: [],
     batchIndex: 0,
     completedTaskIds: [],
+    dependencyFacts: [],
     rawPlan: {},
   };
   const builder = new SessionProgressProjectionBuilder({
@@ -771,7 +840,7 @@ export function assertTaskLocalCompactRecordFlowsThroughCheckpoints(): void {
         taskId: task.taskId,
         title: task.title,
         targets: task.targets,
-        capability: task.capability,
+        toolId: task.toolId,
       })),
       completedTaskIds: plan.completedTaskIds,
       modelJudgedSufficientTaskIds: plan.modelJudgedSufficientTaskIds ?? [],
@@ -817,7 +886,7 @@ export function assertTaskLocalCompactRecordFlowsThroughCheckpoints(): void {
       goal: `write generic target ${token}`,
       taskId: `task-${token}`,
       targets: [`generated/${token}.txt`],
-      capabilities: ['fs.write'],
+      toolIds: ['fs.write'],
       taskOrder: [`task-${token}`],
       pendingTaskIds: [],
       dependsOn: [],
@@ -888,8 +957,8 @@ export function assertTaskLocalCompactRecordFlowsThroughCheckpoints(): void {
   const decisionMarker = `preserve user decision marker ${token}`;
   const nextAssembly = assembleContext({
     workflowState: 'acceptedTaskExecution',
-    allowedProposals: ['actionBundle', 'resourceRequest', 'taskOutcome', 'diagnostic'],
-    capabilityCatalogSummary: 'fs.write',
+    allowedProposals: ['actionBundle', 'resourceRequest', 'diagnostic'],
+    toolCatalogSummary: 'fs.write',
     userRequest: `next accepted task ${token}`,
     existingEvents: [
       {
@@ -931,7 +1000,7 @@ export function assertTaskLocalCompactRecordFlowsThroughCheckpoints(): void {
     contractId: `contract-${token}`,
     sessionId: `session-${token}`,
     runId: `run-${token}`,
-    allowedKinds: ['actionBundle', 'resourceRequest', 'taskOutcome', 'diagnostic'],
+    allowedKinds: ['actionBundle', 'resourceRequest', 'diagnostic'],
     prompt: nextAssembly.prompt,
     contextAssembly: nextAssembly.contextAssembly,
     userRequest: `next accepted task ${token}`,
@@ -941,7 +1010,7 @@ export function assertTaskLocalCompactRecordFlowsThroughCheckpoints(): void {
       taskTitle: `Next task ${token}`,
       goal: `continue generic target ${token}`,
       targets: [`generated/next-${token}.txt`],
-      capabilities: ['fs.write'],
+      toolIds: ['fs.write'],
       taskOrder: [`next-task-${token}`],
       pendingTaskIds: [`next-task-${token}`],
       dependsOn: [],
@@ -1008,8 +1077,8 @@ export function assertTaskLocalCompactRecordFlowsThroughCheckpoints(): void {
   });
   const foldedAssembly = assembleContext({
     workflowState: 'acceptedTaskExecution',
-    allowedProposals: ['actionBundle', 'resourceRequest', 'taskOutcome', 'diagnostic'],
-    capabilityCatalogSummary: 'fs.write',
+    allowedProposals: ['actionBundle', 'resourceRequest', 'diagnostic'],
+    toolCatalogSummary: 'fs.write',
     userRequest: `folded next task ${token}`,
     initialContext: {
       id: `fold-context-${token}`,
@@ -1031,8 +1100,8 @@ export function assertTaskLocalCompactRecordFlowsThroughCheckpoints(): void {
   const workspaceRoot = `/workspace-${token}`;
   const absoluteTargetAssembly = assembleContext({
     workflowState: 'acceptedTaskExecution',
-    allowedProposals: ['actionBundle', 'resourceRequest', 'taskOutcome', 'diagnostic'],
-    capabilityCatalogSummary: 'fs.write',
+    allowedProposals: ['actionBundle', 'resourceRequest', 'diagnostic'],
+    toolCatalogSummary: 'fs.write',
     userRequest: `absolute target ${token}`,
     initialContext: {
       id: `absolute-target-context-${token}`,
@@ -1062,8 +1131,8 @@ export function assertTaskLocalCompactRecordFlowsThroughCheckpoints(): void {
 
   const requestedDependencyAssembly = assembleContext({
     workflowState: 'acceptedTaskExecution',
-    allowedProposals: ['actionBundle', 'resourceRequest', 'taskOutcome', 'diagnostic'],
-    capabilityCatalogSummary: 'fs.write',
+    allowedProposals: ['actionBundle', 'resourceRequest', 'diagnostic'],
+    toolCatalogSummary: 'fs.write',
     userRequest: `requested dependency ${token}`,
     initialContext: {
       id: `requested-dependency-context-${token}`,
@@ -1083,8 +1152,8 @@ export function assertTaskLocalCompactRecordFlowsThroughCheckpoints(): void {
 
   const noTargetAssembly = assembleContext({
     workflowState: 'acceptedTaskExecution',
-    allowedProposals: ['actionBundle', 'resourceRequest', 'taskOutcome', 'diagnostic'],
-    capabilityCatalogSummary: 'fs.write',
+    allowedProposals: ['actionBundle', 'resourceRequest', 'diagnostic'],
+    toolCatalogSummary: 'fs.write',
     userRequest: `no explicit target ${token}`,
     initialContext: {
       id: `no-target-context-${token}`,
@@ -1105,8 +1174,8 @@ export async function assertProviderTurnContextCoordinatorPassesTaskLocalCompact
   const token = randomSmokeToken('provider-context-compact');
   const previous = assembleContext({
     workflowState: 'acceptedTaskExecution',
-    allowedProposals: ['actionBundle', 'resourceRequest', 'taskOutcome', 'diagnostic'],
-    capabilityCatalogSummary: 'fs.write',
+    allowedProposals: ['actionBundle', 'resourceRequest', 'diagnostic'],
+    toolCatalogSummary: 'fs.write',
     userRequest: `previous task ${token}`,
     currentTaskGoal: `write previous target ${token}`,
     currentTaskContext: {
@@ -1136,7 +1205,7 @@ export async function assertProviderTurnContextCoordinatorPassesTaskLocalCompact
       });
     },
     allowedProposals: (allowed) => allowed,
-    capabilityCatalogSummary: () => `capability-${token}`,
+    toolCatalogSummary: () => `capability-${token}`,
     memoryHints: () => [],
     collectUserGuidanceEvents: () => [],
     appendConsumedGuidance: async ({ result }) => result,
@@ -1163,20 +1232,52 @@ export async function assertProviderTurnContextCoordinatorPassesTaskLocalCompact
     sessionId: `session-${token}`,
     runId: `run-${token}`,
     userRequest: `original request ${token}`,
+    ...providerAuthorityState(token, `original request ${token}`),
     stateContract: {
       stateId: `state-${token}`,
-      allowedProposals: ['resourceRequest', 'actionBundle', 'taskOutcome', 'diagnostic'],
+      allowedProposals: ['resourceRequest', 'actionBundle', 'diagnostic'],
+      toolCatalogSnapshot: genericToolCatalogSnapshot() as any,
     },
-    acceptedImplementationPlan: {
+    acceptedTaskPlan: {
       planId: `plan-${token}`,
       runId: `run-${token}`,
-      tasks: [],
+      tasks: [{
+        taskId: `next-task-${token}`,
+        title: `Next task ${token}`,
+        toolId: 'fs.read',
+        targets: [`generated/next-${token}.txt`],
+        dependencies: [],
+        planningArgs: {},
+        conflictKeys: [],
+      }],
+      authorizationOperations: [{
+        operationId: `read-operation-${token}`,
+        sourceTaskId: `next-task-${token}`,
+        toolId: 'fs.read',
+        operationKind: 'read',
+        contentMode: 'none',
+        targets: [`generated/next-${token}.txt`],
+        dependsOn: [],
+        argsTemplate: { path: `generated/next-${token}.txt` },
+        internal: false,
+      }],
+      toolIds: ['fs.read'],
+      targetScopes: [`generated/next-${token}.txt`],
+      batchIndex: 1,
+      completedTaskIds: [],
+      rawPlan: {},
     },
     currentTaskContext: {
       taskId: `next-task-${token}`,
       taskTitle: `Next task ${token}`,
       goal: `continue generic target ${token}`,
       targets: [`generated/next-${token}.txt`],
+      toolIds: ['fs.read'],
+      taskOrder: [`next-task-${token}`],
+      pendingTaskIds: [`next-task-${token}`],
+      dependsOn: [],
+      evidenceNeeds: [],
+      completedTaskIds: [],
     },
     taskLocalCompactRecords: [compact],
     memoryDocument: buildSessionMemoryDocument([]),
@@ -1201,14 +1302,14 @@ export async function assertProviderTurnContextCoordinatorUsesFreshAssembly(): P
     contextAssemblyId: `stale-${token}`,
     workflowState: `workflow-stale-${token}`,
     allowedProposals: ['answer'],
-    capabilityCatalogSummary: `capability-stale-${token}`,
+    toolCatalogSummary: `capability-stale-${token}`,
     userRequest: `stale request ${token}`,
   });
   const fresh = assembleContext({
     contextAssemblyId: `fresh-${token}`,
     workflowState: `workflow-fresh-${token}`,
     allowedProposals: ['answer'],
-    capabilityCatalogSummary: `capability-fresh-${token}`,
+    toolCatalogSummary: `capability-fresh-${token}`,
     userRequest: `fresh request ${token}`,
   });
   let contractAssemblyId: string | undefined;
@@ -1217,7 +1318,7 @@ export async function assertProviderTurnContextCoordinatorUsesFreshAssembly(): P
     createId: (prefix) => `${prefix}-${token}`,
     assembleContext: () => fresh,
     allowedProposals: (allowed) => allowed,
-    capabilityCatalogSummary: () => `capability-${token}`,
+    toolCatalogSummary: () => `capability-${token}`,
     memoryHints: () => [],
     collectUserGuidanceEvents: () => [],
     appendConsumedGuidance: async ({ result }) => result,
@@ -1246,6 +1347,7 @@ export async function assertProviderTurnContextCoordinatorUsesFreshAssembly(): P
     sessionId: `session-${token}`,
     runId: `run-${token}`,
     userRequest: `original request ${token}`,
+    ...providerAuthorityState(token, `original request ${token}`),
     stateContract: {
       stateId: `state-${token}`,
       allowedProposals: ['answer'],
@@ -1271,19 +1373,21 @@ export async function assertProviderTurnContextCoordinatorUsesFreshAssembly(): P
 export async function assertProviderTurnContextCoordinatorNarrowsPlanningAllowedKinds(): Promise<void> {
   const token = randomSmokeToken('provider-context-allowed');
   let assembledAllowed: string[] = [];
+  let assembledCatalog = '';
   let contractAllowed: string[] = [];
   const coordinator = new ProviderTurnContextCoordinator<any>({
     now: () => '2026-01-01T00:00:00.000Z',
     createId: (prefix) => `${prefix}-${token}`,
     assembleContext: (input) => {
       assembledAllowed = [...input.allowedProposals];
+      assembledCatalog = input.toolCatalogSummary;
       return assembleContext({
         ...input,
         contextAssemblyId: `assembly-${token}`,
       });
     },
     allowedProposals: (allowed) => allowed,
-    capabilityCatalogSummary: () => `capability-${token}`,
+    toolCatalogSummary: () => `capability-${token}`,
     memoryHints: () => [],
     collectUserGuidanceEvents: () => [],
     appendConsumedGuidance: async ({ result }) => result,
@@ -1312,9 +1416,10 @@ export async function assertProviderTurnContextCoordinatorNarrowsPlanningAllowed
     sessionId: `session-${token}`,
     runId: `run-${token}`,
     userRequest: `request ${token}`,
+    ...providerAuthorityState(token, `request ${token}`),
     stateContract: {
       stateId: `state-${token}`,
-      allowedProposals: ['answer', 'resourceRequest', 'decisionRequest', 'taskPlan', 'actionBundle', 'taskOutcome', 'diagnostic'],
+      allowedProposals: ['answer', 'resourceRequest', 'decisionRequest', 'taskPlan', 'actionBundle', 'diagnostic'],
     },
     memoryDocument: buildSessionMemoryDocument([]),
     resourcePackets: [],
@@ -1332,6 +1437,7 @@ export async function assertProviderTurnContextCoordinatorNarrowsPlanningAllowed
   assertEqual(contractAllowed.includes('actionBundle'), false, 'planning provider contract does not expose actionBundle');
   assertEqual(result.allowedProposals.includes('actionBundle'), false, 'planning result allowed proposals are provider-visible only');
   assertEqual(result.modelContextBundle.providerTurnContract.allowedKinds.includes('taskPlan'), true, 'planning still allows taskPlan');
+  assertEqual(assembledCatalog, `capability-${token}`, 'planning ContextAdmission receives the current Kernel tool catalog summary');
 }
 
 export async function assertProviderTurnContextCoordinatorScopesAcceptedExecutionCatalog(): Promise<void> {
@@ -1366,14 +1472,14 @@ export async function assertProviderTurnContextCoordinatorScopesAcceptedExecutio
     now: () => '2026-01-01T00:00:00.000Z',
     createId: (prefix) => `${prefix}-${token}`,
     assembleContext: (input) => {
-      assemblyCapabilitySummary = input.capabilityCatalogSummary;
+      assemblyCapabilitySummary = input.toolCatalogSummary;
       return assembleContext({
         ...input,
         contextAssemblyId: `assembly-${token}`,
       });
     },
     allowedProposals: (allowed) => allowed,
-    capabilityCatalogSummary: () => fullCatalogMarker,
+    toolCatalogSummary: () => fullCatalogMarker,
     memoryHints: () => [],
     collectUserGuidanceEvents: () => [],
     appendConsumedGuidance: async ({ result }) => result,
@@ -1399,16 +1505,17 @@ export async function assertProviderTurnContextCoordinatorScopesAcceptedExecutio
     sessionId: `session-${token}`,
     runId: `run-${token}`,
     userRequest: `request ${token}`,
+    ...providerAuthorityState(token, `request ${token}`),
     stateContract: {
       stateId: `state-${token}`,
-      allowedProposals: ['answer', 'resourceRequest', 'decisionRequest', 'taskPlan', 'implementationPlan', 'actionBundle', 'taskOutcome', 'diagnostic'],
+      allowedProposals: ['answer', 'resourceRequest', 'decisionRequest', 'taskPlan', 'taskPlan', 'actionBundle', 'diagnostic'],
       toolCatalogSnapshot: scopedCatalog,
     },
     memoryDocument: buildSessionMemoryDocument([]),
     resourcePackets: [],
     conversationRoots: [],
     generatedArtifactEvidence: new Map(),
-    acceptedImplementationPlan: {
+    acceptedTaskPlan: {
       planId: `plan-${token}`,
       runId: `run-${token}`,
       title: `Plan ${token}`,
@@ -1416,24 +1523,31 @@ export async function assertProviderTurnContextCoordinatorScopesAcceptedExecutio
       tasks: [{
         taskId: `task-${token}`,
         title: `Task ${token}`,
-        capability: 'fs.write',
+        toolId: 'fs.write',
         targets: [`target-${token}.txt`],
         dependencies: [],
+        planningArgs: {},
         conflictKeys: [],
       }],
-      capabilities: ['fs.write'],
-      targetScopes: [`target-${token}.txt`],
-      exactOperationGrants: [{
-        operation: 'write',
-        targetPath: `target-${token}.txt`,
-        targetResourceKind: 'file',
-        capability: 'fs.write',
+      authorizationOperations: [{
+        operationId: `plan-op-task-${token}-1`,
         sourceTaskId: `task-${token}`,
-        source: 'kernelPlanReview',
+        toolId: 'fs.write',
+        operationKind: 'write',
+        contentMode: 'contentBlock',
+        targets: [`target-${token}.txt`],
+        dependsOn: [],
+        fixedArgs: {},
+        argsTemplate: { path: `target-${token}.txt`, contentBlockId: 'executionTime' },
+        targetResourceKind: 'file',
+        recursive: false,
+        internal: false,
       }],
-      accessScopes: [],
+      toolIds: ['fs.write'],
+      targetScopes: [`target-${token}.txt`],
       batchIndex: 1,
       completedTaskIds: [],
+      dependencyFacts: [],
       rawPlan: {},
     },
     currentTaskContext: {
@@ -1441,7 +1555,7 @@ export async function assertProviderTurnContextCoordinatorScopesAcceptedExecutio
       taskTitle: `Task ${token}`,
       goal: `Handle ${token}`,
       targets: [`target-${token}.txt`],
-      capabilities: ['fs.write', 'process.exec'],
+      toolIds: ['fs.write'],
     },
   }, {
     contextAssemblyId: `requested-${token}`,
@@ -1451,22 +1565,33 @@ export async function assertProviderTurnContextCoordinatorScopesAcceptedExecutio
   });
   const dynamicPrompt = result.modelContextBundle.prompt.dynamicSuffix;
   const renderedContract = JSON.stringify(result.modelContextBundle.providerTurnContract);
-  const expectedExecutionKinds = ['actionBundle', 'resourceRequest', 'decisionRequest', 'taskOutcome', 'diagnostic'];
+  const expectedExecutionKinds = ['actionBundle', 'resourceRequest', 'decisionRequest', 'diagnostic'];
 
   assertEqual(result.allowedProposals.join(','), expectedExecutionKinds.join(','), 'accepted execution exposes only execution proposal kinds');
   assertEqual(result.modelContextBundle.providerTurnContract.allowedKinds.join(','), expectedExecutionKinds.join(','), 'accepted execution provider contract ignores stale planning and answer kinds');
   assert(result.modelContextBundle.prompt.stablePrefix.includes('Session semantic profile: execution-v1'), 'accepted execution selects the stable execution semantic profile');
+  assert(result.modelContextBundle.prompt.stablePrefix.includes('ProtectedStablePrefix begins here.'), 'accepted execution preserves the ContextAdmission stable contract in the provider system message');
+  assertEqual(
+    result.modelContextBundle.contextAssembly?.providerCacheAttribution.cacheEligiblePrefixCharLength,
+    result.modelContextBundle.prompt.stablePrefix.length,
+    'ContextAdmission cache attribution measures the physical provider system prefix'
+  );
+  assert(result.modelContextBundle.contextAssembly?.segments.some((segment) => segment.name === 'providerProfileContract'), 'ContextAdmission records the provider profile as a stable segment');
   assert(!dynamicPrompt.includes('Execution uses provider-native Session semantic tools'), 'accepted execution dynamic prompt does not repeat the semantic tool profile');
   assertEqual(dynamicPrompt.includes('session.submit_answer'), false, 'accepted execution prompt does not expose planning answer tools');
   assertEqual(assemblyCapabilitySummary.includes(fullCatalogMarker), false, 'accepted execution does not pass the full capability catalog into ContextAdmission');
   assert(assemblyCapabilitySummary.includes('Accepted execution Session directive summary.'), 'accepted execution passes a scoped Session directive summary');
-  assert(assemblyCapabilitySummary.includes(`slotId=slot-task-${token}-1`), 'scoped summary records the current IntentSlot');
+  assert(
+    assemblyCapabilitySummary.includes(`slotId=slot-task-${token}-plan-op-task-${token}-1`),
+    'scoped summary records the current Kernel-authorized IntentSlot'
+  );
   assert(assemblyCapabilitySummary.includes(`targetRef=target-${token}.txt`), 'scoped summary records current slot target ownership');
-  assertEqual(assemblyCapabilitySummary.includes('toolId='), false, 'scoped summary does not expose internal tool ids');
+  assert(assemblyCapabilitySummary.includes('toolId=fs.write'), 'scoped summary exposes the current task Kernel tool contract');
+  assertEqual(assemblyCapabilitySummary.includes('toolId=process.exec'), false, 'scoped summary excludes tools that are not assigned to the current task');
   assertEqual(dynamicPrompt.includes(fullCatalogMarker), false, 'accepted execution dynamic prompt does not expose full capability catalog');
   assertEqual(renderedContract.includes(fullCatalogMarker), false, 'accepted execution provider contract does not expose full capability catalog');
   assertEqual(renderedContract.includes('browser.click'), false, 'accepted execution provider contract does not enumerate unrelated Kernel catalog tool ids');
-  assertEqual(renderedContract.includes('"toolId"'), false, 'accepted execution provider contract does not expose Kernel tool ids');
+  assert(renderedContract.includes('toolId=fs.write'), 'accepted execution provider contract identifies the admitted current-task tool');
   assert(
     renderedContract.includes('IntentSlot'),
     'accepted execution contract exposes current IntentSlot metadata'
@@ -1474,8 +1599,134 @@ export async function assertProviderTurnContextCoordinatorScopesAcceptedExecutio
   assert(dynamicPrompt.includes('Current accepted task IntentSlot scope:'), 'accepted execution workflow state labels IntentSlot scope');
 }
 
-export async function assertProviderTurnContextCoordinatorFiltersUnscopedGrantsToCurrentTask(): Promise<void> {
-  const token = randomSmokeToken('provider-context-current-task-grants');
+export async function assertProviderTurnContextCoordinatorRejectsMissingDependencyFacts(): Promise<void> {
+  const token = randomSmokeToken('provider-context-missing-dependency-facts');
+  const dependencyTaskId = `dependency-${token}`;
+  const currentTaskId = `current-${token}`;
+  let assembled = false;
+  const coordinator = new ProviderTurnContextCoordinator<any>({
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${token}`,
+    assembleContext: (input) => {
+      assembled = true;
+      return assembleContext({
+        ...input,
+        contextAssemblyId: `assembly-${token}`,
+      });
+    },
+    allowedProposals: (allowed) => allowed,
+    toolCatalogSummary: () => `catalog-${token}`,
+    memoryHints: () => [],
+    collectUserGuidanceEvents: () => [],
+    appendConsumedGuidance: async ({ result }) => result,
+    buildProviderTurnContract: (input) => new ContextFrameBuilder().buildSessionProviderTurnContract({
+      contractId: input.contractId,
+      sessionId: input.sessionId,
+      runId: input.runId,
+      allowedKinds: input.allowedKinds,
+      prompt: input.prompt,
+      contextAssembly: input.contextAssembly,
+      userRequest: input.userRequest,
+      confirmedDecisionSummary: input.confirmedDecisionSummary,
+      acceptedPlanActive: input.acceptedPlanActive,
+      currentTaskContext: input.currentTaskContext,
+      resourcePackets: input.resourcePackets,
+      generatedArtifactCount: input.generatedArtifactCount,
+      toolIntentTemplates: input.toolIntentTemplates,
+      nextActionInstruction: input.nextActionInstruction,
+    }),
+  });
+
+  let failure = '';
+  try {
+    await coordinator.prepare({
+      sessionId: `session-${token}`,
+      runId: `run-${token}`,
+      userRequest: `request ${token}`,
+      ...providerAuthorityState(token, `request ${token}`),
+      stateContract: {
+        stateId: `state-${token}`,
+        allowedProposals: ['resourceRequest', 'actionBundle', 'diagnostic'],
+        toolCatalogSnapshot: genericToolCatalogSnapshot() as any,
+      },
+      memoryDocument: buildSessionMemoryDocument([]),
+      resourcePackets: [],
+      conversationRoots: [],
+      generatedArtifactEvidence: new Map(),
+      acceptedTaskPlan: {
+        planId: `plan-${token}`,
+        runId: `run-${token}`,
+        title: `Plan ${token}`,
+        summary: `Summary ${token}`,
+        tasks: [
+          {
+            taskId: dependencyTaskId,
+            title: `Dependency ${token}`,
+            toolId: 'fs.create',
+            targets: [`dependency-${token}.txt`],
+            dependencies: [],
+            planningArgs: {},
+            conflictKeys: [],
+          },
+          {
+            taskId: currentTaskId,
+            title: `Current ${token}`,
+            toolId: 'fs.write',
+            targets: [`current-${token}.txt`],
+            dependencies: [dependencyTaskId],
+            planningArgs: {},
+            conflictKeys: [],
+          },
+        ],
+        authorizationOperations: [{
+          operationId: `plan-op-${currentTaskId}-1`,
+          sourceTaskId: currentTaskId,
+          toolId: 'fs.write',
+          operationKind: 'write',
+          contentMode: 'contentBlock',
+          targets: [`current-${token}.txt`],
+          dependsOn: [],
+          fixedArgs: {},
+          argsTemplate: { path: `current-${token}.txt`, contentBlockId: 'executionTime' },
+          targetResourceKind: 'file',
+          recursive: false,
+          internal: false,
+        }],
+        toolIds: ['fs.create', 'fs.write'],
+        targetScopes: [`dependency-${token}.txt`, `current-${token}.txt`],
+        completedTaskIds: [dependencyTaskId],
+        dependencyFacts: [],
+        batchIndex: 2,
+        rawPlan: {},
+      },
+      currentTaskContext: {
+        taskId: currentTaskId,
+        taskTitle: `Current ${token}`,
+        goal: `Use declared dependency ${token}`,
+        targets: [`current-${token}.txt`],
+        toolIds: ['fs.write'],
+        dependsOn: [dependencyTaskId],
+        completedTaskIds: [dependencyTaskId],
+      },
+    }, {
+      contextAssemblyId: `requested-${token}`,
+      contractId: `contract-${token}`,
+      inputContent: `input ${token}`,
+      lastResult: genericSessionResult(`session-${token}`),
+    });
+  } catch (error) {
+    failure = error instanceof Error ? error.message : String(error);
+  }
+
+  assert(
+    failure.includes('accepted_task_dependency_facts_unavailable'),
+    'accepted execution fails closed when a declared dependency has no terminal Kernel facts'
+  );
+  assertEqual(assembled, false, 'missing dependency facts fail before context assembly and Provider invocation');
+}
+
+export async function assertProviderTurnContextCoordinatorScopesCurrentTaskIntent(): Promise<void> {
+  const token = randomSmokeToken('provider-context-current-task-intent');
   const currentTarget = `Current-${randomSmokeToken('file')}/CaseFile-${randomSmokeToken('target')}.TXT`;
   const futureTarget = `future-${randomSmokeToken('file')}.txt`;
   let assemblyCapabilitySummary = '';
@@ -1483,14 +1734,14 @@ export async function assertProviderTurnContextCoordinatorFiltersUnscopedGrantsT
     now: () => '2026-01-01T00:00:00.000Z',
     createId: (prefix) => `${prefix}-${token}`,
     assembleContext: (input) => {
-      assemblyCapabilitySummary = input.capabilityCatalogSummary;
+      assemblyCapabilitySummary = input.toolCatalogSummary;
       return assembleContext({
         ...input,
         contextAssemblyId: `assembly-${token}`,
       });
     },
     allowedProposals: (allowed) => allowed,
-    capabilityCatalogSummary: () => `full-catalog-${token}`,
+    toolCatalogSummary: () => `full-catalog-${token}`,
     memoryHints: () => [],
     collectUserGuidanceEvents: () => [],
     appendConsumedGuidance: async ({ result }) => result,
@@ -1516,42 +1767,59 @@ export async function assertProviderTurnContextCoordinatorFiltersUnscopedGrantsT
     sessionId: `session-${token}`,
     runId: `run-${token}`,
     userRequest: `request ${token}`,
+    ...providerAuthorityState(token, `request ${token}`),
     stateContract: {
       stateId: `state-${token}`,
-      allowedProposals: ['resourceRequest', 'actionBundle', 'taskOutcome', 'diagnostic'],
+      allowedProposals: ['resourceRequest', 'actionBundle', 'diagnostic'],
       toolCatalogSnapshot: genericToolCatalogSnapshot() as any,
     },
     memoryDocument: buildSessionMemoryDocument([]),
     resourcePackets: [],
     conversationRoots: [],
     generatedArtifactEvidence: new Map(),
-    acceptedImplementationPlan: {
+    acceptedTaskPlan: {
       planId: `plan-${token}`,
       runId: `run-${token}`,
       title: `Plan ${token}`,
       summary: `Summary ${token}`,
       tasks: [
-        { taskId: `task-current-${token}`, targets: [currentTarget], dependencies: [], conflictKeys: [] },
-        { taskId: `task-future-${token}`, targets: [futureTarget], dependencies: [], conflictKeys: [] },
+        { taskId: `task-current-${token}`, toolId: 'fs.write', targets: [currentTarget], dependencies: [], planningArgs: {}, conflictKeys: [] },
+        { taskId: `task-future-${token}`, toolId: 'fs.write', targets: [futureTarget], dependencies: [], planningArgs: {}, conflictKeys: [] },
       ],
-      capabilities: ['fs.write'],
+      authorizationOperations: [
+        {
+          operationId: `plan-op-task-current-${token}-1`,
+          sourceTaskId: `task-current-${token}`,
+          toolId: 'fs.write',
+          operationKind: 'write',
+          contentMode: 'contentBlock',
+          targets: [currentTarget],
+          dependsOn: [],
+          fixedArgs: {},
+          argsTemplate: { path: currentTarget, contentBlockId: 'executionTime' },
+          targetResourceKind: 'file',
+          recursive: false,
+          internal: false,
+        },
+        {
+          operationId: `plan-op-task-future-${token}-1`,
+          sourceTaskId: `task-future-${token}`,
+          toolId: 'fs.write',
+          operationKind: 'write',
+          contentMode: 'contentBlock',
+          targets: [futureTarget],
+          dependsOn: [],
+          fixedArgs: {},
+          argsTemplate: { path: futureTarget, contentBlockId: 'executionTime' },
+          targetResourceKind: 'file',
+          recursive: false,
+          internal: false,
+        },
+      ],
+      toolIds: ['fs.write'],
       targetScopes: [currentTarget, futureTarget],
       completedTaskIds: [],
-      exactOperationGrants: [
-        {
-          operation: 'fs.write',
-          capability: 'fs.write',
-          targetPath: currentTarget,
-          source: 'kernelPlanReview',
-        },
-        {
-          operation: 'fs.write',
-          capability: 'fs.write',
-          targetPath: futureTarget,
-          source: 'kernelPlanReview',
-        },
-      ],
-      accessScopes: [],
+      dependencyFacts: [],
       batchIndex: 1,
       rawPlan: {},
     },
@@ -1560,7 +1828,7 @@ export async function assertProviderTurnContextCoordinatorFiltersUnscopedGrantsT
       taskTitle: `Current task ${token}`,
       goal: `Write only current target ${token}`,
       targets: [currentTarget],
-      capabilities: ['fs.write'],
+      toolIds: ['fs.write'],
     },
   }, {
     contextAssemblyId: `requested-${token}`,
@@ -1571,11 +1839,11 @@ export async function assertProviderTurnContextCoordinatorFiltersUnscopedGrantsT
 
   const contract = result.modelContextBundle.providerTurnContract;
   const renderedContract = JSON.stringify(contract);
-  assert(assemblyCapabilitySummary.includes(`targetRef=${currentTarget}`), 'current task scoped grant remains visible as an IntentSlot');
-  assertEqual(assemblyCapabilitySummary.includes(futureTarget), false, 'future task unscoped grant is hidden from current task summary');
+  assert(assemblyCapabilitySummary.includes(`targetRef=${currentTarget}`), 'current task target intent remains visible as an IntentSlot');
+  assertEqual(assemblyCapabilitySummary.includes(futureTarget), false, 'future task intent is hidden from current task summary');
   assert(renderedContract.includes(currentTarget), 'provider contract keeps the current target template');
   assertEqual(renderedContract.includes(futureTarget), false, 'provider contract does not expose future task target templates');
-  assertEqual(contract.toolIntentTemplates.length, 1, 'only current task matching unscoped grant becomes an IntentSlot');
+  assertEqual(contract.toolIntentTemplates.length, 1, 'only the current task intent becomes an IntentSlot');
   assertEqual(
     contract.toolIntentTemplates[0]?.targets[0],
     currentTarget,
@@ -1599,7 +1867,7 @@ export async function assertRequirementConfirmationRecordsModelContextBundle(): 
     now: () => '2026-01-01T00:00:00.000Z',
     createId: (prefix) => `${prefix}-${token}`,
     assembleContext: (input) => assembleContext(input),
-    capabilityCatalogSummary: () => `catalog-${token}`,
+    toolCatalogSummary: () => `catalog-${token}`,
     collectUserGuidanceEvents: () => [],
     buildProviderTurnContract: (input) =>
       new ContextFrameBuilder().buildSessionProviderTurnContract(input),
@@ -1702,4 +1970,21 @@ export async function assertHookObserverProducesTraceOnly(): Promise<void> {
   assertEqual(results.length, 1, 'observer hook runs at providerCall.before');
   assertEqual(results[0]?.status, 'ok', 'observer hook returns trace result');
   assertEqual(results[0]?.status === 'ok' && results[0].effects?.[0]?.kind, 'appendTrace', 'observer hook effect is trace-only');
+}
+
+function providerAuthorityState(token: string, content: string) {
+  return {
+    userAuthorityFrame: buildUserAuthorityFrame([{
+      id: `user-${token}`,
+      sessionId: `session-${token}`,
+      ts: '2026-01-01T00:00:00.000Z',
+      kind: 'user_msg',
+      payload: { content },
+    }], {
+      messageId: `fallback-${token}`,
+      content,
+      timestamp: '2026-01-01T00:00:00.000Z',
+    }, () => 'en-US'),
+    promptLedger: emptyPromptLedgerState(),
+  };
 }

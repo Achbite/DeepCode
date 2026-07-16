@@ -119,7 +119,7 @@ export class NativeToolRepairRunner {
       return {
         kind: 'failed',
         code: 'native_tool_duplicate_repair_failed',
-        message: `Provider repeated read-only native tools and duplicate-loop repair did not return a valid Agent Protocol v3 proposal: ${input.repairErrorMessage(error)}`,
+        message: `Provider repeated read-only native tools and duplicate-loop repair did not return a valid Agent Protocol v4 proposal: ${input.repairErrorMessage(error)}`,
       };
     }
   }

@@ -1,20 +1,22 @@
 export interface ProviderTurnPolicyState {
-  acceptedImplementationPlan?: unknown;
-  currentTaskContext?: unknown;
+  acceptedTaskPlan?: {
+    toolIds?: string[];
+  };
+  currentTaskContext?: {
+    toolIds?: string[];
+  };
   stateContract?: {
     allowedProposals?: string[];
-    capabilityProjection?: string[];
   };
   driverRequest?: {
     stateContract?: {
       allowedProposals?: string[];
-      capabilityProjection?: string[];
     };
   };
 }
 
 export interface ProviderTurnPolicyOptions {
-  sideEffectCapabilities: ReadonlySet<string>;
+  sideEffectToolIds: ReadonlySet<string>;
 }
 
 export class ProviderTurnPolicy {
@@ -22,10 +24,9 @@ export class ProviderTurnPolicy {
 
   allowedProposals(kernelAllowed: string[], state: ProviderTurnPolicyState): string[] {
     const merged = new Set(kernelAllowed);
-    if (state.acceptedImplementationPlan) {
+    if (state.acceptedTaskPlan) {
       merged.delete('taskPlan');
-      merged.delete('implementationPlan');
-      for (const kind of ['actionBundle', 'resourceRequest', 'decisionRequest', 'taskOutcome', 'diagnostic']) merged.add(kind);
+      for (const kind of ['actionBundle', 'resourceRequest', 'decisionRequest', 'diagnostic']) merged.add(kind);
     } else {
       merged.add('taskPlan');
     }
@@ -33,10 +34,10 @@ export class ProviderTurnPolicy {
   }
 
   shouldAttemptActionBundleCompactionRepair(state: ProviderTurnPolicyState): boolean {
-    if (!state.acceptedImplementationPlan && !state.currentTaskContext) return false;
+    if (!state.acceptedTaskPlan && !state.currentTaskContext) return false;
     const allowed = state.stateContract?.allowedProposals ?? state.driverRequest?.stateContract?.allowedProposals ?? [];
     if (allowed.length && !allowed.includes('actionBundle')) return false;
-    const capabilities = state.stateContract?.capabilityProjection ?? state.driverRequest?.stateContract?.capabilityProjection ?? [];
-    return capabilities.some((capability) => this.options.sideEffectCapabilities.has(capability));
+    const toolIds = state.currentTaskContext?.toolIds ?? state.acceptedTaskPlan?.toolIds ?? [];
+    return toolIds.some((toolId) => this.options.sideEffectToolIds.has(toolId));
   }
 }

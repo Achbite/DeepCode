@@ -88,9 +88,9 @@ export function routeProposalKind(proposal: ProposalEnvelope): LoopDirective {
   if (proposal.kind === 'answer') return { kind: 'answer', proposal };
   if (proposal.kind === 'decisionRequest') return { kind: 'decisionRequest', proposal };
   if (proposal.kind === 'diagnostic') return { kind: 'diagnostic', proposal };
-  if (proposal.kind === 'taskPlan' || proposal.kind === 'implementationPlan') return { kind: 'plan', proposal };
+  if (proposal.kind === 'taskPlan') return { kind: 'plan', proposal };
   if (proposal.kind === 'resourceRequest') return { kind: 'resourceRequest', proposal };
-  if (proposal.kind === 'actionBundle' || proposal.kind === 'taskOutcome') return { kind: 'action', proposal };
+  if (proposal.kind === 'actionBundle') return { kind: 'action', proposal };
   return { kind: 'nonExecutable', proposal };
 }
 

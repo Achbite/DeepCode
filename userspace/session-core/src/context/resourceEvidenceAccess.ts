@@ -1,5 +1,8 @@
 export interface ResourceEvidenceAccessBlock {
   displayRef: string;
+  rootId?: string;
+  path?: string;
+  listedPaths?: string[];
   contentKind?: string;
   status: string;
   retention: string;
@@ -116,14 +119,16 @@ function compactOneLine(value: string, max: number): string {
 }
 
 function resourceBlockMatchesTarget(block: ResourceEvidenceAccessBlock, target: string): boolean {
-  const ref = normalizeResourceRef(block.displayRef);
   const normalizedTarget = normalizeResourceRef(target);
-  if (!ref || !normalizedTarget) return false;
-  if (ref === normalizedTarget || ref.endsWith(`/${normalizedTarget}`) || normalizedTarget.endsWith(`/${ref}`)) {
-    return true;
-  }
-  if (block.contentKind !== 'directoryTree') return false;
-  return directoryInventoryMentionsTarget(block, ref, normalizedTarget);
+  if (!normalizedTarget) return false;
+  const structuredRefs = [block.path, block.displayRef, ...(block.listedPaths ?? [])]
+    .map((value) => normalizeResourceRef(value ?? ''))
+    .filter(Boolean);
+  return structuredRefs.some((ref) => (
+    ref === normalizedTarget
+    || ref.endsWith(`/${normalizedTarget}`)
+    || normalizedTarget.endsWith(`/${ref}`)
+  ));
 }
 
 function normalizeResourceRef(value: string): string {
@@ -139,28 +144,4 @@ function normalizeResourceRef(value: string): string {
 
 function uniqueSorted(values: string[]): string[] {
   return [...new Set(values.filter(Boolean))].sort();
-}
-
-function directoryInventoryMentionsTarget(
-  block: ResourceEvidenceAccessBlock,
-  normalizedRef: string,
-  normalizedTarget: string
-): boolean {
-  const inventory = normalizeInventoryText(block.summary ?? block.preview ?? '');
-  if (!inventory) return false;
-  const candidates = [normalizedTarget];
-  if (normalizedTarget.startsWith(`${normalizedRef}/`)) {
-    candidates.push(normalizedTarget.slice(normalizedRef.length + 1));
-  }
-  return uniqueSorted(candidates).some((candidate) => inventoryContainsPath(inventory, candidate));
-}
-
-function normalizeInventoryText(value: string): string {
-  return value.trim().replace(/\\/g, '/').replace(/\/+/g, '/');
-}
-
-function inventoryContainsPath(inventory: string, normalizedPath: string): boolean {
-  if (!normalizedPath) return false;
-  const escaped = normalizedPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  return new RegExp(`(^|[^A-Za-z0-9._/-])${escaped}($|[^A-Za-z0-9._/-])`).test(inventory);
 }

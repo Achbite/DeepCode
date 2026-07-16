@@ -3,6 +3,10 @@ import type { ProposalEnvelope } from '../../protocol/types.js';
 import type { PromptEnvelope } from '../../prompt/types.js';
 import type { LoopDirective } from '../proposal/proposalRouter.js';
 import type { NativeToolProviderResumeSignal } from './nativeToolProviderLoop.js';
+import type {
+  AcceptedPlanReviewHandoffPlan,
+  AcceptedPlanReviewHandoffRunInput,
+} from '../review/acceptedPlanReviewHandoffCoordinator.js';
 
 export interface ProviderTurnCycleState {
   sessionId: string;
@@ -23,6 +27,10 @@ export interface ProviderTurnCyclePorts<Input, State extends ProviderTurnCycleSt
     prompt: PromptEnvelope
   ): Promise<ProposalEnvelope | NativeToolProviderResumeSignal>;
   deterministicProposal?(state: State): ProposalEnvelope | undefined;
+  takePendingReview?(
+    state: State,
+    lastResult: AgentSessionResult
+  ): AcceptedPlanReviewHandoffRunInput<AcceptedPlanReviewHandoffPlan> | undefined;
   admitDirective(proposal: ProposalEnvelope): LoopDirective;
   appendDriverFailure(state: State, error: unknown): Promise<AgentSessionResult | null | undefined>;
   appendProviderFailure(state: State, error: unknown): Promise<AgentSessionResult>;
@@ -30,6 +38,10 @@ export interface ProviderTurnCyclePorts<Input, State extends ProviderTurnCycleSt
 
 export type ProviderTurnCycleResult =
   | { kind: 'failed'; result: AgentSessionResult }
+  | {
+    kind: 'reviewRequired';
+    request: AcceptedPlanReviewHandoffRunInput<AcceptedPlanReviewHandoffPlan>;
+  }
   | {
     kind: 'directiveReady';
     prompt: PromptEnvelope;
@@ -48,7 +60,16 @@ export class ProviderTurnCycle<Input, State extends ProviderTurnCycleState> {
   }): Promise<ProviderTurnCycleResult> {
     const { state } = input;
     this.ports.refreshRuntimeState(state);
-    const providerContext = await this.ports.prepareProviderContext(input.input, state, input.lastResult);
+    const pendingReview = this.ports.takePendingReview?.(state, input.lastResult);
+    if (pendingReview) return { kind: 'reviewRequired', request: pendingReview };
+    let providerContext: ProviderTurnCycleContextResult;
+    try {
+      providerContext = await this.ports.prepareProviderContext(input.input, state, input.lastResult);
+    } catch (error) {
+      const driverFailure = await this.ports.appendDriverFailure(state, error);
+      if (driverFailure) return { kind: 'failed', result: driverFailure };
+      throw error;
+    }
     const prompt = providerContext.prompt;
     const deterministic = this.ports.deterministicProposal?.(state);
     if (deterministic) {

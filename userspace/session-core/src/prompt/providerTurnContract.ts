@@ -89,7 +89,7 @@ export function providerVisibleSchemaDigest(input: PromptEnvelopeBuilderInput): 
   if (executionLikeTurn) {
     return [
       'Execution uses provider-native Session semantic tools.',
-      'Use exactly one of: session.request_resources, session.request_decision, session.submit_task_artifacts, session.complete_current_task, session.report_diagnostic.',
+      'Use exactly one of: session.request_resources, session.request_decision, session.submit_task_outcome, session.append_artifact_chunk, session.finalize_task_artifacts, session.report_diagnostic.',
       'For generated content, submit only current IntentSlot ids and artifact content. Session compiles the directive into an internal Kernel command.',
       'Do not output Kernel tool identifiers, actionBundle transport fields, permission fields, WorkUnit fields, or audit fields.',
     ].join('\n');
@@ -97,8 +97,9 @@ export function providerVisibleSchemaDigest(input: PromptEnvelopeBuilderInput): 
   return [
     'Planning uses provider-native Session semantic tools.',
     'Use exactly one of: session.request_resources, session.request_decision, session.submit_plan, session.submit_answer, session.report_diagnostic.',
-    'A submitted plan is an ordered task queue, not a dependency graph.',
-    'Do not output Kernel tool identifiers, permission fields, WorkUnit fields, or audit fields.',
+    'A submitted plan is an ordered task queue. Each task must list only earlier task IDs in dependencies, using [] when it has none.',
+    'Every submitted task toolId must exactly match a provider-visible entry in the current Kernel tool catalog.',
+    'Do not invent tool identifiers or output permission fields, WorkUnit fields, or audit fields.',
   ].join('\n');
 }
 
@@ -109,9 +110,11 @@ export function providerVisibleWorkflowState(input: PromptEnvelopeBuilderInput):
     `Provider turn mode: ${mode}.`,
   ];
   if (mode === 'acceptedTaskExecution') {
-    lines.push(`Current accepted task IntentSlot scope:\n${input.capabilityCatalogSummary || 'none'}`);
+    lines.push(`Current accepted task IntentSlot scope:\n${input.toolCatalogSummary || 'none'}`);
   } else {
-    lines.push('Use the registered planning semantic tools. Kernel execution contracts are not provider-visible.');
+    lines.push(`Current Kernel tool catalog for planning:\n${input.toolCatalogSummary || 'Kernel tool catalog unavailable. Do not invent toolIds; use session.report_diagnostic.'}`);
+    lines.push('Each taskPlan task must include canonical args matching planningArgsSchema; use an empty object when no planning arguments are defined.');
+    lines.push('Use the registered planning semantic tools. Kernel execution contracts are not provider-visible until the plan is admitted.');
   }
   return lines.join('\n');
 }
@@ -119,12 +122,12 @@ export function providerVisibleWorkflowState(input: PromptEnvelopeBuilderInput):
 function narrowAllowedKinds(allowedKinds: string[], turnMode: ProviderTurnMode): string[] {
   const unique = [...new Set(allowedKinds)];
   if (turnMode === 'acceptedTaskExecution' || turnMode === 'resourceResume' || turnMode === 'scopeIntervention') {
-    return unique.filter((kind) => kind !== 'taskPlan' && kind !== 'implementationPlan' && kind !== 'reviewSummary');
+    return unique.filter((kind) => kind !== 'taskPlan' && kind !== 'reviewSummary');
   }
   if (turnMode === 'protocolRepair') {
-    return unique.filter((kind) => kind !== 'implementationPlan' && kind !== 'reviewSummary');
+    return unique.filter((kind) => kind !== 'reviewSummary');
   }
-  return unique.filter((kind) => kind !== 'implementationPlan' && kind !== 'reviewSummary');
+  return unique.filter((kind) => kind !== 'reviewSummary');
 }
 
 function defaultRepairPolicy(turnMode: ProviderTurnMode): ProviderRepairPolicy {
@@ -141,7 +144,7 @@ function toolIntentTemplates(input: PromptEnvelopeBuilderInput, turnMode: Provid
   const targets = stringArray(record?.targets);
   const lines = [
     `currentTaskTargets=${targets.length ? targets.join(', ') : 'none'}`,
-    'Use only IntentSlot ids supplied by Session for artifact submission. Do not submit target paths or Kernel operations.',
+    'Use only IntentSlot ids supplied by Session for artifact submission. If no registered directive applies, report a diagnostic. Do not submit target paths or Kernel operations.',
   ];
   return lines;
 }

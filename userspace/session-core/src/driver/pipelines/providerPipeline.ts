@@ -5,7 +5,6 @@ import {
   ProviderEmptyProposalRetry,
   type ProviderEmptyProposalRetryOptions,
 } from '../../provider/ProviderEmptyProposalRetry.js';
-import { ProviderProfileRegistry } from '../../provider/ProviderProfileRegistry.js';
 
 export { ProviderJsonModeCoordinator } from './providerJsonModeCoordinator.js';
 export {
@@ -72,13 +71,14 @@ export interface ProviderPipelineRunTurnInput<TState, TTurn extends ProviderPipe
 
 export class ProviderPipeline {
   constructor(
-    private readonly emptyProposalRetry = new ProviderEmptyProposalRetry(),
-    private readonly profiles = new ProviderProfileRegistry()
+    private readonly emptyProposalRetry = new ProviderEmptyProposalRetry()
   ) {}
 
   messages(contract: DriverProviderTurnFrame): LlmChatRequest['messages'] {
+    if (contract.providerMessages?.length) return contract.providerMessages;
+    // ContextAdmission owns the complete provider system prefix and its physical cache shape.
     return [
-      { role: 'system', content: this.profiles.profileForFrame(contract).systemContract },
+      { role: 'system', content: contract.prompt.stablePrefix },
       { role: 'user', content: this.renderUserPrompt(contract.prompt.dynamicSuffix, contract) },
     ];
   }
@@ -120,11 +120,15 @@ export class ProviderPipeline {
     contract: DriverProviderTurnFrame
   ): LlmChatRequest['messages'] {
     if (!messages.length) return this.messages(contract);
-    const lastIndex = messages.length - 1;
-    const lastMessage = messages[lastIndex];
-    if (lastMessage?.role === 'user' && typeof lastMessage.content === 'string' && lastMessage.content.includes('ProviderTurnContract:')) {
+    if (messages.some((message) => (
+      message.role === 'user'
+      && typeof message.content === 'string'
+      && message.content.includes('ProviderTurnContract:')
+    ))) {
       return messages;
     }
+    const lastIndex = messages.length - 1;
+    const lastMessage = messages[lastIndex];
     if (lastMessage?.role !== 'user' || typeof lastMessage.content !== 'string') {
       return [
         ...messages,

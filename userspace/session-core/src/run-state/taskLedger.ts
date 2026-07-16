@@ -11,7 +11,7 @@ export interface TaskLedgerTaskInput {
   taskId: string;
   title?: string;
   targets?: string[];
-  capability?: string;
+  toolId?: string;
 }
 
 export interface TaskLedgerInput {
@@ -30,7 +30,7 @@ export interface TaskLedgerEntry {
   taskId: string;
   title?: string;
   targets: string[];
-  capability?: string;
+  toolId?: string;
   status: TaskLedgerStatus;
 }
 
@@ -74,7 +74,7 @@ export function buildTaskLedgerSnapshot(input: TaskLedgerInput): TaskLedgerSnaps
       taskId: task.taskId,
       title: task.title,
       targets: [...new Set(task.targets ?? [])],
-      capability: task.capability,
+      toolId: task.toolId,
       status,
     };
   });
