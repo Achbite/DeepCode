@@ -470,6 +470,7 @@
     "deepcodeGui.project.namePrompt": "Project name",
     "deepcodeGui.project.newChat": "New chat",
     "deepcodeGui.project.rename": "Rename project",
+    "deepcodeGui.project.rebind": "Rebind directory",
     "deepcodeGui.project.delete": "Delete project",
     "deepcodeGui.agent.subtitle": "DeepCode Agent",
     "deepcodeGui.session.actions": "Session actions",
@@ -1009,8 +1010,8 @@
     "diagnostic.modelDiagnostic": "{summary}",
     "diagnostic.resourceResolveRepairFailed": "The requested resources could not be located in attachments or project directory, and repair failed: {message}",
     "diagnostic.resourceResolveFailed": "The requested resources could not be located in the current attachments or project directory; Session rejected the request.\nUnresolved: {unresolved}\nMultiple candidate roots: {ambiguous}\nAvailable project/attachment roots:\n{roots}\nPlease specify an explicit attachment, rootId, or relative path.",
-    "diagnostic.acceptedPlanScopeRecoveryFailed": "Accepted-plan scope decision could not recover the original implementationPlan; Session will not start a detached requirement flow.",
-    "diagnostic.acceptedPlanInteractionRecoveryFailed": "Accepted-plan interaction decision could not recover the parent implementationPlan; Session will not start a detached requirement flow.",
+    "diagnostic.acceptedPlanScopeRecoveryFailed": "Accepted-plan scope decision could not recover the original task plan; Session will not start a detached requirement flow.",
+    "diagnostic.acceptedPlanInteractionRecoveryFailed": "Accepted-plan interaction decision could not recover the parent task plan; Session will not start a detached requirement flow.",
     "diagnostic.actionBundleAdmissionDiagnostic": "{summary}",
     "diagnostic.planProposalReviewedMissing": "Kernel did not return a proposal.reviewed event for the actionBundle; Session will not display a confirmable plan.",
     "diagnostic.planRevisionRepairFailed": "The plan needs revision, but model repair failed: {message}",
@@ -1209,25 +1210,13 @@
         "auto": "Auto Low-risk Candidates"
       }
     },
-    "agent.permissions.allowFileRead": {
-      "label": "Allow File Read",
-      "description": "Allow Agent tools to read workspace files."
+    "agent.permissions.workspaceRead": {
+      "label": "Workspace Read",
+      "description": "Permission policy for workspace read tools."
     },
-    "agent.permissions.allowFileWrite": {
-      "label": "Allow File Write",
-      "description": "Allow Agent tools to request file writes. Writes still require approval."
-    },
-    "agent.permissions.allowCodeSearch": {
-      "label": "Allow Code Search",
-      "description": "Allow Agent tools to search code in the workspace."
-    },
-    "agent.permissions.allowShellPropose": {
-      "label": "Allow Shell Proposals",
-      "description": "Allow Agent to propose shell commands without executing them."
-    },
-    "agent.permissions.allowShellExec": {
-      "label": "Allow Shell Execution Requests",
-      "description": "Allow Agent to request or execute shell commands through the Agent permission policy."
+    "agent.permissions.workspaceWrite": {
+      "label": "Workspace Write",
+      "description": "Permission policy for workspace mutations."
     },
     "agent.permissions.processExec": {
       "label": "Process Execution",
@@ -1238,9 +1227,9 @@
         "allow": "Allow"
       }
     },
-    "agent.permissions.networkEgress": {
-      "label": "Network Egress",
-      "description": "Permission policy for outbound network or web evidence requests.",
+    "agent.permissions.webRead": {
+      "label": "Public Web Read",
+      "description": "Permission policy for public read-only web evidence.",
       "options": {
         "deny": "Deny",
         "ask": "Ask",
@@ -1256,14 +1245,26 @@
         "allow": "Allow"
       }
     },
-    "agent.permissions.gitPush": {
-      "label": "Git Push",
-      "description": "Permission policy for Git push. Push is not automatic by default.",
+    "agent.permissions.privateWebRead": {
+      "label": "Private Web Read",
+      "description": "Permission policy for private-network read-only web evidence.",
       "options": {
         "deny": "Deny",
         "ask": "Ask",
         "allow": "Allow"
       }
+    },
+    "agent.web.search.endpointTemplate": {
+      "label": "Web Search Endpoint Template",
+      "description": "HTTP endpoint template containing {query} and optional {limit}."
+    },
+    "agent.web.search.authHeaderName": {
+      "label": "Web Search Auth Header",
+      "description": "Header name used with the configured search SecretRef."
+    },
+    "agent.web.search.authSecretRef": {
+      "label": "Web Search Auth Secret",
+      "description": "Secret reference used for the configured search endpoint."
     },
     "agent.git.commitMessageMode": {
       "label": "Commit Message Mode",

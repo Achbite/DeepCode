@@ -87,6 +87,7 @@ interface QueuedAgentMessage {
 
 interface CreateAgentSessionOptions {
   reuseEmpty?: boolean;
+  projectId?: string;
 }
 
 interface AgentSessionState {
@@ -531,11 +532,14 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     }
     const settings = useSettingsStore.getState().effectiveSettings;
     const initialMode = settingMode(settings['agent.defaultMode']);
-    const result = await createAgentSession({ initialMode, ...currentWorkspaceScope() });
+    const result = await createAgentSession({
+      initialMode,
+      ...(options.projectId ? { projectId: options.projectId } : currentWorkspaceScope()),
+    });
     if (result.ok && result.data) {
       set({
         session: result.data.session,
-        workspaceScopeKey: currentWorkspaceScopeKey(),
+        workspaceScopeKey: result.data.session.workspaceScopeKey ?? currentWorkspaceScopeKey(),
         sessions: [result.data.session, ...get().sessions.filter((item) => item.id !== result.data!.session.id)],
         currentSessionId: result.data.session.id,
         events: result.data.events,
@@ -859,7 +863,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         op: 'ask',
         content: trimmed,
         attachments,
-        workspacePath: currentWorkspacePath(),
+        workspacePath: session.projectId ? undefined : currentWorkspacePath(),
         workflow: get().workflow,
         profileId: get().profileId,
         requirementConfirmationMode: settingRequirementConfirmationMode(
@@ -1016,7 +1020,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         decision: 'accept',
         runId: permissionRequestRunId(request),
         targetId: request.id,
-        workspacePath: currentWorkspacePath(),
+        workspacePath: session.projectId ? undefined : currentWorkspacePath(),
         workflow: get().workflow,
         profileId: get().profileId,
         interventionLevel: settingInterventionLevel(
@@ -1089,7 +1093,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         decision: 'reject',
         runId: permissionRequestRunId(request),
         targetId: request.id,
-        workspacePath: currentWorkspacePath(),
+        workspacePath: session.projectId ? undefined : currentWorkspacePath(),
         workflow: get().workflow,
         profileId: get().profileId,
         interventionLevel: settingInterventionLevel(
@@ -1165,7 +1169,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         guidance,
         runId,
         targetId: requirementId,
-        workspacePath: currentWorkspacePath(),
+        workspacePath: session.projectId ? undefined : currentWorkspacePath(),
         workflow: get().workflow,
         profileId: get().profileId,
         interventionLevel: settingInterventionLevel(
@@ -1243,7 +1247,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         guidance,
         runId,
         targetId: planId,
-        workspacePath: currentWorkspacePath(),
+        workspacePath: session.projectId ? undefined : currentWorkspacePath(),
         workflow: get().workflow,
         profileId: get().profileId,
         interventionLevel: settingInterventionLevel(
@@ -1320,7 +1324,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         decision,
         guidance,
         runId,
-        workspacePath: currentWorkspacePath(),
+        workspacePath: session.projectId ? undefined : currentWorkspacePath(),
         workflow: get().workflow,
         profileId: get().profileId,
         reviewContinuationMode: settingReviewContinuationMode(

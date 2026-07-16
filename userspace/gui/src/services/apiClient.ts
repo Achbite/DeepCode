@@ -23,13 +23,19 @@ import type {
   PatchLlmProfilesRequest,
   LlmProbeRequest,
   LlmProbeResult,
-  CodeSearchInput,
-  CodeSearchResult,
+  CodeGrepInput,
+  CodeGrepResult,
   AgentMode,
+  AgentProjectListResult,
+  AgentProjectResult,
   AgentSessionListResult,
+  CreateAgentProjectRequest,
   CreateAgentSessionRequest,
   ListAgentSessionsRequest,
   RenameAgentSessionRequest,
+  RebindAgentProjectRequest,
+  UpdateAgentProjectRequest,
+  UpdateAgentSessionRequest,
   ArchiveAgentSessionRequest,
   AgentSessionResult,
   AgentTimelineResult,
@@ -59,6 +65,8 @@ import type {
   SetBrowserInspectModeRequest,
   PanelSnapshotResult,
   AttachPanelSnapshotResult,
+  KernelHostInspectionQuery,
+  KernelHostInspectionResult,
 } from '@deepcode/protocol';
 import { activeT } from '../i18n';
 import { getKernelApiBase } from './hostTarget';
@@ -470,20 +478,35 @@ function buildQuery(params: Record<string, string | undefined>): string {
   return segments.length === 0 ? '' : `?${segments.join('&')}`;
 }
 
+async function inspectHost<T>(query: KernelHostInspectionQuery): Promise<ApiResponse<T>> {
+  const response = await sendJson<KernelHostInspectionResult>(
+    `${API_BASE}/host/inspect`,
+    'POST',
+    query
+  );
+  return {
+    ...response,
+    data: response.data?.output as T | undefined,
+  };
+}
+
 export function getFileTree(
   folderId?: string,
   relativePath?: string
 ): Promise<ApiResponse<FileTreeNode[]>> {
-  const qs = buildQuery({ folderId, path: relativePath });
-  return getJson<FileTreeNode[]>(`${API_BASE}/files/tree${qs}`);
+  return inspectHost<FileTreeNode[]>({
+    kind: 'list',
+    folderId,
+    path: relativePath || '.',
+    depth: 2,
+  });
 }
 
 export function readFile(
   filePath: string,
   folderId?: string
 ): Promise<ApiResponse<FileReadResult>> {
-  const qs = buildQuery({ folderId, path: filePath });
-  return getJson<FileReadResult>(`${API_BASE}/files/read${qs}`);
+  return inspectHost<FileReadResult>({ kind: 'read', folderId, path: filePath });
 }
 
 // ---- 用户设置（阶段 4 / S4-4）----
@@ -529,13 +552,18 @@ export function probeLlmProfile(
 }
 
 export function codeSearch(
-  request: CodeSearchInput
-): Promise<ApiResponse<CodeSearchResult>> {
-  return sendJson<CodeSearchResult>(
-    `${API_BASE}/code/search`,
-    'POST',
-    request
-  );
+  request: CodeGrepInput
+): Promise<ApiResponse<CodeGrepResult>> {
+  return inspectHost<CodeGrepResult>({
+    kind: 'grep',
+    query: request.query,
+    path: request.path || '.',
+    include: request.include ?? [],
+    exclude: request.exclude ?? [],
+    strategy: request.strategy ?? 'literal',
+    contextLines: request.contextLines ?? 0,
+    maxResults: request.maxResults ?? 200,
+  });
 }
 
 export function createAgentSession(
@@ -552,9 +580,11 @@ export function listAgentSessions(
   request: ListAgentSessionsRequest = {}
 ): Promise<ApiResponse<AgentSessionListResult>> {
   const qs = buildQuery({
+    projectId: request.projectId,
     workspaceId: request.workspaceId,
     workspaceHash: request.workspaceHash,
     includeArchived: request.includeArchived ? 'true' : undefined,
+    includeAllScopes: request.includeAllScopes ? 'true' : undefined,
   });
   return getJson<AgentSessionListResult>(`${API_BASE}/agent/sessions${qs}`);
 }
@@ -563,6 +593,7 @@ export function getCurrentAgentSession(
   request: ListAgentSessionsRequest = {}
 ): Promise<ApiResponse<AgentSessionResult | null>> {
   const qs = buildQuery({
+    projectId: request.projectId,
     workspaceId: request.workspaceId,
     workspaceHash: request.workspaceHash,
   });
@@ -587,6 +618,59 @@ export function renameAgentSession(
     `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}`,
     'PATCH',
     request
+  );
+}
+
+export function updateAgentSession(
+  sessionId: string,
+  request: UpdateAgentSessionRequest
+): Promise<ApiResponse<AgentSessionResult>> {
+  return sendJson<AgentSessionResult>(
+    `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}`,
+    'PATCH',
+    request
+  );
+}
+
+export function listAgentProjects(): Promise<ApiResponse<AgentProjectListResult>> {
+  return getJson<AgentProjectListResult>(`${API_BASE}/agent/projects`);
+}
+
+export function createAgentProject(
+  request: CreateAgentProjectRequest
+): Promise<ApiResponse<AgentProjectResult>> {
+  return sendJson<AgentProjectResult>(`${API_BASE}/agent/projects`, 'POST', request);
+}
+
+export function updateAgentProject(
+  projectId: string,
+  request: UpdateAgentProjectRequest
+): Promise<ApiResponse<AgentProjectResult>> {
+  return sendJson<AgentProjectResult>(
+    `${API_BASE}/agent/projects/${encodeURIComponent(projectId)}`,
+    'PATCH',
+    request
+  );
+}
+
+export function rebindAgentProject(
+  projectId: string,
+  request: RebindAgentProjectRequest
+): Promise<ApiResponse<AgentProjectResult>> {
+  return sendJson<AgentProjectResult>(
+    `${API_BASE}/agent/projects/${encodeURIComponent(projectId)}/rebind`,
+    'POST',
+    request
+  );
+}
+
+export function deleteAgentProject(
+  projectId: string
+): Promise<ApiResponse<AgentProjectListResult>> {
+  return sendJson<AgentProjectListResult>(
+    `${API_BASE}/agent/projects/${encodeURIComponent(projectId)}`,
+    'DELETE',
+    {}
   );
 }
 
@@ -944,15 +1028,11 @@ export interface GitDiffResult {
 }
 
 export function getGitStatus(): Promise<ApiResponse<GitStatusResult>> {
-  return getJson<GitStatusResult>(`${API_BASE}/git/status`);
+  return inspectHost<GitStatusResult>({ kind: 'gitStatus' });
 }
 
 export function getGitDiff(path?: string, staged?: boolean): Promise<ApiResponse<GitDiffResult>> {
-  const qs = buildQuery({
-    path,
-    staged: staged === undefined ? undefined : String(staged),
-  });
-  return getJson<GitDiffResult>(`${API_BASE}/git/diff${qs}`);
+  return inspectHost<GitDiffResult>({ kind: 'gitDiff', path, staged: staged ?? false });
 }
 
 export function getBrowserRuntimeStatus(): Promise<ApiResponse<BrowserRuntimeStatusResult>> {

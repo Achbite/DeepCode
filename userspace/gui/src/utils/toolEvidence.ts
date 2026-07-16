@@ -120,7 +120,7 @@ function mergeActivityStatus(prev: ToolEvidenceStatus, next: ToolEvidenceStatus)
 
 function activityItemKind(toolName: string | undefined): ToolEvidenceItemKind {
   if (!toolName) return 'file';
-  if (toolName === 'code.search') return 'search';
+  if (toolName === 'code.grep') return 'search';
   if (toolName === 'fs.list') return 'directory';
   if (toolName === 'process.exec') return 'command';
   return 'file';
@@ -151,7 +151,7 @@ function activityActionLabel(
     return t(language, 'agent.toolEvidence.action.write');
   }
   if (toolName === 'fs.delete') return t(language, 'agent.toolEvidence.action.delete');
-  if (toolName === 'code.search') return t(language, 'agent.toolEvidence.action.search');
+  if (toolName === 'code.grep') return t(language, 'agent.toolEvidence.action.search');
   if (toolName === 'fs.list') return t(language, 'agent.toolEvidence.action.list');
   if (toolName === 'fs.read') return t(language, 'agent.toolEvidence.action.read');
   return t(language, 'agent.toolEvidence.action.tool');
@@ -479,12 +479,12 @@ function normalizeOperation(value: string | undefined): string | undefined {
   if (!value) return undefined;
   const operations: Record<string, string> = {
     'fs.write': 'write',
-    'fs.patch': 'patch',
+    'fs.edit': 'patch',
     'fs.delete': 'delete',
     'fs.read': 'read',
     'fs.list': 'list',
     'fs.diff': 'diff',
-    'code.search': 'search',
+    'code.grep': 'search',
     'process.exec': 'exec',
     write: 'write',
     create: 'create',
