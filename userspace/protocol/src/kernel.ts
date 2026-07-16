@@ -593,6 +593,52 @@ export interface KernelProposalReviewReport {
   executionContract: KernelExecutionContract;
 }
 
+export type KernelPlanReviewStatus =
+  | KernelProposalReviewStatus
+  | 'awaitingTemporaryGrant'
+  | 'needsRevision'
+  | 'interfaceOnly';
+
+export interface KernelFileTargetRef {
+  kind: 'workspaceRelative' | 'rootRelative' | 'absolutePath' | string;
+  path: string;
+  rootId?: string;
+}
+
+export interface KernelRequiredFileOperation {
+  operation: 'write' | 'create' | 'delete' | 'rename' | string;
+  targetPath: string;
+  toolId?: string;
+  capability: string;
+  actionId?: string;
+  targetRef?: KernelFileTargetRef;
+  targetKind?: 'workspaceRelative' | 'rootRelative' | 'absolutePath' | string;
+  outsideWorkspace?: boolean;
+}
+
+/**
+ * Compatibility projection for Session data that carries the earlier
+ * plan-review fields. Protocol v4 runtime events use
+ * KernelProposalReviewReport instead.
+ */
+export interface KernelPlanReviewReport {
+  [key: string]: unknown;
+  planId: string;
+  status: KernelPlanReviewStatus;
+  requiredCapabilities: string[];
+  requiredPermissions: string[];
+  permissionGaps?: string[];
+  requiredFileOperations?: KernelRequiredFileOperation[];
+  permissionBundles?: KernelPermissionBundle[];
+  interventions?: KernelGateInterventionRequired[];
+  executionContract?: KernelExecutionContract | Record<string, unknown>;
+  hardFloorHits: string[];
+  deniedReasons?: string[];
+  blockedReasons: string[];
+  findings: unknown[];
+  kernelGeneratedPermissionSummary?: string;
+}
+
 export type KernelSkillTrustMode = 'declarative' | 'brokeredScript' | 'directHostScript';
 
 export interface KernelSkillTrustRecord {
