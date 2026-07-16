@@ -14,7 +14,7 @@ pub fn scan_skill_manifest(
         findings.push(SkillRiskFinding::new(
             RiskFindingKind::DirectHostDisabled,
             RiskLevel::Critical,
-            "DirectHostScript is reserved for a later high-risk extension and is disabled in v1.",
+            "DirectHostScript is not enabled by the active Kernel skill runtime.",
             None,
         ));
     }
@@ -187,8 +187,8 @@ mod tests {
             kind: SkillManifestKind::BrokeredScript,
             entrypoint: SkillEntrypoint {
                 kind: SkillEntrypointKind::Script,
-                command: Some("python3".to_string()),
-                args: vec!["skill.py".to_string()],
+                program: Some("python3".to_string()),
+                argv: vec!["skill.py".to_string()],
                 script_path: Some("skill.py".to_string()),
             },
             requested_capabilities: vec![Capability::workspace_read()],

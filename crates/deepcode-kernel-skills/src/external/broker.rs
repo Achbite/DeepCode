@@ -132,7 +132,7 @@ pub fn capability_for_broker_method(method: &str) -> Option<Capability> {
     match method {
         "kernel.fs.read" => Some(Capability::workspace_read()),
         "kernel.fs.write" => Some(Capability::workspace_write()),
-        "kernel.code.search" => Some(Capability::workspace_search()),
+        "kernel.code.grep" => Some(Capability::workspace_search()),
         "kernel.network.fetch" => Some(Capability::network_egress()),
         "kernel.secret.read" => Some(Capability::secret_read()),
         "kernel.context.attach" => Some(Capability::workspace_read()),
@@ -162,11 +162,9 @@ pub fn brokered_script_process_invocation(
             "brokered script skill requires a script or external process entrypoint".to_string(),
         ));
     }
-    let command = manifest.entrypoint.command.clone().ok_or_else(|| {
-        KernelError::InvalidCommand("brokered script entrypoint command is required".to_string())
+    let program = manifest.entrypoint.program.clone().ok_or_else(|| {
+        KernelError::InvalidCommand("brokered script entrypoint program is required".to_string())
     })?;
-    let mut process_command = vec![command];
-    process_command.extend(manifest.entrypoint.args.clone());
     let skill_root = skill_root.to_string_lossy().replace('\\', "/");
     Ok(ProcessInvocation {
         invocation_id: invocation_id.into(),
@@ -174,7 +172,8 @@ pub fn brokered_script_process_invocation(
         session_id,
         skill_id: Some(manifest.skill_id.clone()),
         connector_id: None,
-        command: process_command,
+        program,
+        argv: manifest.entrypoint.argv.clone(),
         cwd: Some(skill_root.clone()),
         env,
         stdin_payload,
@@ -332,7 +331,7 @@ mod tests {
         assert!(decision.authorized);
         let audit = decision.audit_projection();
         assert_eq!(audit["method"], "kernel.fs.read");
-        assert_eq!(audit["capability"], "fs.read");
+        assert_eq!(audit["capability"], "workspace.read");
         assert!(audit.get("arguments").is_none());
     }
 
@@ -365,8 +364,8 @@ mod tests {
             kind: crate::SkillManifestKind::BrokeredScript,
             entrypoint: crate::SkillEntrypoint {
                 kind: SkillEntrypointKind::Script,
-                command: Some("python3".to_string()),
-                args: vec!["skill.py".to_string()],
+                program: Some("python3".to_string()),
+                argv: vec!["skill.py".to_string()],
                 script_path: Some("skill.py".to_string()),
             },
             requested_capabilities: vec![Capability::workspace_read()],
@@ -410,7 +409,8 @@ mod tests {
         .unwrap();
         assert_eq!(invocation.run_id.as_deref(), Some("run-1"));
         assert_eq!(invocation.session_id.as_deref(), Some("session-1"));
-        assert_eq!(invocation.command, vec!["python3", "skill.py"]);
+        assert_eq!(invocation.program, "python3");
+        assert_eq!(invocation.argv, vec!["skill.py"]);
         assert_eq!(invocation.policy.network_policy, NetworkPolicy::Deny);
     }
 }

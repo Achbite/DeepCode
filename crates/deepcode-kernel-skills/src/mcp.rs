@@ -44,7 +44,9 @@ pub struct McpServerIdentity {
 #[serde(rename_all = "camelCase")]
 pub struct McpTransportDeclaration {
     pub kind: String,
-    pub command: Option<String>,
+    pub program: Option<String>,
+    #[serde(default)]
+    pub argv: Vec<String>,
     pub endpoint: Option<String>,
 }
 
@@ -217,22 +219,18 @@ pub fn mcp_tool_process_invocation(
     }
     if manifest.transport.kind != "stdio" && manifest.transport.kind != "process" {
         return Err(KernelError::PermissionDenied(format!(
-            "MCP transport {} is descriptor-only or unsupported by the stage 13 process adapter",
+            "MCP transport {} is descriptor-only or unsupported by the active process adapter",
             manifest.transport.kind
         )));
     }
-    let command = manifest
+    let program = manifest
         .transport
-        .command
+        .program
         .as_deref()
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| {
-            KernelError::InvalidCommand("MCP process transport command is required".to_string())
+            KernelError::InvalidCommand("MCP process transport program is required".to_string())
         })?;
-    let command = command
-        .split_whitespace()
-        .map(str::to_string)
-        .collect::<Vec<_>>();
     let stdin_payload = mcp_stdio_tool_call_payload(projection, input)?;
     Ok(ProcessInvocation {
         invocation_id: invocation_id.into(),
@@ -240,7 +238,8 @@ pub fn mcp_tool_process_invocation(
         session_id,
         skill_id: Some(projection.internal_skill_id.clone()),
         connector_id: Some(projection.connector_id.clone()),
-        command,
+        program: program.to_string(),
+        argv: manifest.transport.argv.clone(),
         cwd: None,
         env: Vec::new(),
         stdin_payload: Some(stdin_payload),
@@ -593,7 +592,8 @@ mod tests {
             },
             transport: McpTransportDeclaration {
                 kind: "descriptorOnly".to_string(),
-                command: None,
+                program: None,
+                argv: Vec::new(),
                 endpoint: None,
             },
             auth: McpAuthDeclaration {
@@ -634,7 +634,8 @@ mod tests {
             },
             transport: McpTransportDeclaration {
                 kind: "stdio".to_string(),
-                command: Some("python3 fixture_server.py".to_string()),
+                program: Some("python3".to_string()),
+                argv: vec!["fixture_server.py".to_string()],
                 endpoint: None,
             },
             auth: McpAuthDeclaration {
@@ -660,7 +661,8 @@ mod tests {
             serde_json::json!({ "query": "DeepCode" }),
         )
         .unwrap();
-        assert_eq!(invocation.command, vec!["python3", "fixture_server.py"]);
+        assert_eq!(invocation.program, "python3");
+        assert_eq!(invocation.argv, vec!["fixture_server.py"]);
         assert_eq!(invocation.run_id.as_deref(), Some("run-1"));
         assert_eq!(invocation.session_id.as_deref(), Some("session-1"));
         assert_eq!(invocation.connector_id.as_deref(), Some("mcp.github"));

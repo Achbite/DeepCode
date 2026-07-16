@@ -48,7 +48,7 @@ fn external_descriptor_is_trusted(
     else {
         return false;
     };
-    if !record.trust_mode.is_v1_runtime_enabled() {
+    if !record.trust_mode.is_runtime_enabled() {
         return false;
     }
     capabilities_cover(
@@ -66,8 +66,9 @@ fn capabilities_cover(available: &[Capability], required: &[Capability]) -> bool
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{builtin, SkillExecutorKind, SkillTrustMode};
+    use crate::{skill_descriptor_from_template, SkillExecutorKind, SkillTrustMode};
     use deepcode_kernel_policy::{CapabilityEffect, RiskLevel};
+    use deepcode_kernel_tools::KernelToolRegistry;
 
     fn external_descriptor(id: &str, capability: Capability) -> SkillDescriptor {
         SkillDescriptor {
@@ -82,7 +83,7 @@ mod tests {
             risk_level: RiskLevel::High,
             effects: vec![CapabilityEffect::UsesNetwork],
             source: SkillSource::ExternalProcess {
-                command: "python3 skill.py".to_string(),
+                program: "python3".to_string(),
             },
             executor_kind: SkillExecutorKind::ExternalProcess,
             model_visible: true,
@@ -125,23 +126,11 @@ mod tests {
     #[test]
     fn builtins_follow_model_visible_flag() {
         let descriptors = vec![
-            builtin(
-                "fs.read",
-                "skill.fs.read.description",
-                Capability::workspace_read(),
-                RiskLevel::Low,
-                vec![CapabilityEffect::ReadsWorkspace],
-                vec!["plan"],
-                true,
+            skill_descriptor_from_template(
+                KernelToolRegistry::default().template("fs.read").unwrap(),
             ),
-            builtin(
-                "fs.delete",
-                "skill.fs.delete.description",
-                Capability::workspace_delete(),
-                RiskLevel::Critical,
-                vec![CapabilityEffect::DeletesWorkspace],
-                vec!["complete"],
-                true,
+            skill_descriptor_from_template(
+                KernelToolRegistry::default().template("fs.delete").unwrap(),
             ),
         ];
 

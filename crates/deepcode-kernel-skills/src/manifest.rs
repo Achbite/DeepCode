@@ -41,7 +41,7 @@ pub struct SkillManifest {
 
 impl SkillManifest {
     pub fn v1_runtime_enabled(&self) -> bool {
-        self.requested_trust_mode.is_v1_runtime_enabled()
+        self.requested_trust_mode.is_runtime_enabled()
     }
 
     pub fn requires_approval(&self) -> bool {
@@ -95,8 +95,8 @@ impl Default for SkillManifestKind {
 #[serde(rename_all = "camelCase")]
 pub struct SkillEntrypoint {
     pub kind: SkillEntrypointKind,
-    pub command: Option<String>,
-    pub args: Vec<String>,
+    pub program: Option<String>,
+    pub argv: Vec<String>,
     pub script_path: Option<String>,
 }
 
@@ -210,8 +210,8 @@ mod tests {
             kind: SkillManifestKind::BrokeredScript,
             entrypoint: SkillEntrypoint {
                 kind: SkillEntrypointKind::Script,
-                command: Some("python3".to_string()),
-                args: vec!["skill.py".to_string()],
+                program: Some("python3".to_string()),
+                argv: vec!["skill.py".to_string()],
                 script_path: Some("skill.py".to_string()),
             },
             requested_capabilities: vec![Capability::workspace_read()],

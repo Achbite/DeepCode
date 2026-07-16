@@ -53,9 +53,10 @@ fn draft_ledger_events_round_trip() {
             "draftId": "draft-generic",
             "status": "draft.chunk",
             "frame": {
-                "schemaVersion": "deepcode.agent.stream.part.v1",
-                "partKind": "codeBlockChunk",
-                "targetPath": "src/generated.txt"
+                "schemaVersion": "deepcode.agent.artifact-draft.v1",
+                "partKind": "artifactChunk",
+                "slotId": "slot-generic",
+                "contentLines": ["generic content"]
             }
         }),
         sequence: Some(9),
@@ -63,31 +64,29 @@ fn draft_ledger_events_round_trip() {
 
     let encoded = serde_json::to_value(&event).expect("serialize draft event");
     assert_eq!(encoded["kind"], "draft.chunk");
-    assert_eq!(encoded["draft"]["frame"]["partKind"], "codeBlockChunk");
+    assert_eq!(encoded["draft"]["frame"]["partKind"], "artifactChunk");
 
     let decoded: KernelEvent = serde_json::from_value(encoded).expect("deserialize draft event");
     assert_eq!(decoded, event);
 }
 
 #[test]
-fn driver_loop_v3_events_round_trip() {
+fn driver_loop_events_round_trip() {
     let contract = KernelStateContract {
         run_id: RunId("run-1".to_string()),
-        workflow_ref: Some(WorkflowRef {
-            id: "builtin.plan-first".to_string(),
-            version: None,
-            hash: None,
-        }),
-        state_id: "plan".to_string(),
+        state_id: "ready".to_string(),
         state_kind: "driverRequest".to_string(),
         allowed_inputs: vec!["proposalSubmit".to_string()],
         allowed_proposals: vec!["answer".to_string()],
-        proposal_schema_refs: vec!["deepcode.agent.protocol.v3".to_string()],
+        proposal_schema_refs: vec!["deepcode.agent.protocol.v4".to_string()],
         required_user_decision: None,
         capability_projection: vec!["fs.read".to_string()],
         tool_catalog_ref: Some("catalog-v1".to_string()),
         tool_catalog_hash: Some("hash-catalog".to_string()),
         tool_catalog_snapshot: None,
+        draft_admission_policy: DraftAdmissionPolicy {
+            max_total_utf8_bytes: 384 * 1024,
+        },
         transition_predicates: vec![],
         fail_closed_rules: vec![],
     };
@@ -102,7 +101,7 @@ fn driver_loop_v3_events_round_trip() {
     assert_eq!(encoded["kind"], "state.entered");
     assert_eq!(
         encoded["stateContract"]["proposalSchemaRefs"][0],
-        "deepcode.agent.protocol.v3"
+        "deepcode.agent.protocol.v4"
     );
     let decoded: KernelEvent = serde_json::from_value(encoded).expect("deserialize state event");
     assert_eq!(decoded, event);
@@ -169,35 +168,98 @@ fn llm_provider_error_event_round_trips_with_raw_response_diagnostic() {
 }
 
 #[test]
-fn plan_command_and_checkpoint_event_round_trip() {
-    let command = KernelCommand::PermissionGrantTemporary {
-        request_id: RequestId("req-grant".to_string()),
-        run_id: RunId("run-1".to_string()),
-        grant: TemporaryGrantEnvelope {
-            id: "grant-1".to_string(),
-            capability: "fs.write".to_string(),
-            resource_kind: "workspaceFile".to_string(),
-            resource_path: Some("src/main.rs".to_string()),
-            expires_after_sequence: Some(10),
-            reason: Some("approved test grant".to_string()),
-        },
-    };
-    let encoded = serde_json::to_value(&command).expect("serialize command");
-    assert_eq!(encoded["kind"], "permissionGrantTemporary");
-    assert_eq!(encoded["grant"]["resourceKind"], "workspaceFile");
-    let decoded: KernelCommand = serde_json::from_value(encoded).expect("deserialize command");
-    assert_eq!(decoded, command);
-
-    let event = KernelEvent::WorkflowCheckpointed {
+fn runtime_lifecycle_event_round_trip() {
+    let event = KernelEvent::RuntimeLifecycleChanged {
+        request_id: Some(RequestId("request-1".to_string())),
         run_id: RunId("run-1".to_string()),
         session_id: Some(SessionId("session-1".to_string())),
-        checkpoint_id: "checkpoint-1".to_string(),
-        phase: "plan".to_string(),
+        previous_state: Some(RuntimeLifecycleState::Created),
+        current_state: RuntimeLifecycleState::Ready,
+        reason: Some("runInitialized".to_string()),
         sequence: Some(4),
     };
     let encoded = serde_json::to_value(&event).expect("serialize event");
-    assert_eq!(encoded["kind"], "workflow.checkpointed");
-    assert_eq!(encoded["checkpointId"], "checkpoint-1");
+    assert_eq!(encoded["kind"], "runtime.lifecycle_changed");
+    assert_eq!(encoded["currentState"], "ready");
     let decoded: KernelEvent = serde_json::from_value(encoded).expect("deserialize event");
     assert_eq!(decoded, event);
+}
+
+#[test]
+fn plan_authorization_events_round_trip_with_kernel_contract_and_lease_identity() {
+    let contract = KernelPlanAuthorizationContract {
+        id: "authorization-1".to_string(),
+        plan_id: "plan-1".to_string(),
+        plan_hash: "plan-hash-1".to_string(),
+        status: PlanAuthorizationStatus::Confirmable,
+        workspace_binding_hash: Some("workspace-hash-1".to_string()),
+        catalog_version: "deepcode.kernel.tools.v3".to_string(),
+        catalog_hash: "catalog-hash-1".to_string(),
+        operation_set_hash: "operation-set-hash-1".to_string(),
+        contract_hash: "contract-hash-1".to_string(),
+        operations: vec![KernelPlanAuthorizationOperation {
+            id: "operation-1".to_string(),
+            source_task_id: "task-1".to_string(),
+            tool_id: "fs.create".to_string(),
+            operation_kind: "create".to_string(),
+            content_mode: "contentBlock".to_string(),
+            targets: vec!["nested/output.txt".to_string()],
+            depends_on: Vec::new(),
+            fixed_args: serde_json::json!({"executable": false}),
+            args_template: serde_json::json!({
+                "path": "nested/output.txt",
+                "contentBlockId": "executionTime"
+            }),
+            target_kind: Some("file".to_string()),
+            recursive: None,
+            read_set: Vec::new(),
+            write_set: vec!["nested/output.txt".to_string()],
+            conflict_keys: vec!["nested/output.txt".to_string()],
+            execution_mode: "execute".to_string(),
+            internal: false,
+            parent_operation_id: None,
+        }],
+        permission_bundles: Vec::new(),
+        interventions: Vec::new(),
+        cleanup_policy: "kernelPlanGrantLease".to_string(),
+        expires_after: "reviewGateReplanCancelOrRunTerminal".to_string(),
+    };
+    let reviewed = KernelEvent::PlanAuthorizationReviewed {
+        request_id: Some(RequestId("req-plan-authorization".to_string())),
+        run_id: RunId("run-1".to_string()),
+        session_id: Some(SessionId("session-1".to_string())),
+        plan_id: "plan-1".to_string(),
+        review: PlanAuthorizationReview {
+            plan_id: "plan-1".to_string(),
+            status: PlanAuthorizationStatus::Confirmable,
+            diagnostics: Vec::new(),
+            authorization_contract: contract,
+        },
+        sequence: Some(10),
+    };
+    let encoded = serde_json::to_value(&reviewed).expect("serialize plan authorization review");
+    assert_eq!(encoded["kind"], "plan_authorization.reviewed");
+    assert_eq!(
+        encoded["review"]["authorizationContract"]["id"],
+        "authorization-1"
+    );
+    let decoded: KernelEvent =
+        serde_json::from_value(encoded).expect("deserialize plan authorization review");
+    assert_eq!(decoded, reviewed);
+
+    let recorded = KernelEvent::PlanAuthorizationDecisionRecorded {
+        request_id: Some(RequestId("req-plan-decision".to_string())),
+        run_id: RunId("run-1".to_string()),
+        session_id: Some(SessionId("session-1".to_string())),
+        authorization_contract_id: "authorization-1".to_string(),
+        decision: "accept".to_string(),
+        lease_id: Some("plan-grant-lease-authorization-1".to_string()),
+        sequence: Some(11),
+    };
+    let encoded = serde_json::to_value(&recorded).expect("serialize plan authorization decision");
+    assert_eq!(encoded["kind"], "plan_authorization.decision_recorded");
+    assert_eq!(encoded["leaseId"], "plan-grant-lease-authorization-1");
+    let decoded: KernelEvent =
+        serde_json::from_value(encoded).expect("deserialize plan authorization decision");
+    assert_eq!(decoded, recorded);
 }

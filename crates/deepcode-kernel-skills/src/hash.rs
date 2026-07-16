@@ -14,24 +14,18 @@ pub fn hash_skill_revision(manifest: &SkillManifest, files: &[(&str, &[u8])]) ->
     let manifest_bytes =
         serde_json::to_vec(manifest).expect("SkillManifest serialization should be infallible");
     hasher.update(b"manifest\0");
-    hasher.update(&(manifest_bytes.len() as u64).to_be_bytes());
+    hasher.update((manifest_bytes.len() as u64).to_be_bytes());
     hasher.update(manifest_bytes);
 
     let mut sorted = files.to_vec();
     sorted.sort_by(|left, right| left.0.cmp(right.0));
     for (path, bytes) in sorted {
         hasher.update(b"file\0");
-        hasher.update(&(path.len() as u64).to_be_bytes());
+        hasher.update((path.len() as u64).to_be_bytes());
         hasher.update(path.as_bytes());
-        hasher.update(&(bytes.len() as u64).to_be_bytes());
+        hasher.update((bytes.len() as u64).to_be_bytes());
         hasher.update(bytes);
     }
-    format!("sha256:{}", hex_lower(&hasher.finalize()))
-}
-
-pub fn hash_bytes(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
     format!("sha256:{}", hex_lower(&hasher.finalize()))
 }
 
@@ -63,8 +57,8 @@ mod tests {
             kind: SkillManifestKind::BrokeredScript,
             entrypoint: SkillEntrypoint {
                 kind: SkillEntrypointKind::Script,
-                command: Some("python3".to_string()),
-                args: vec!["skill.py".to_string()],
+                program: Some("python3".to_string()),
+                argv: vec!["skill.py".to_string()],
                 script_path: Some("skill.py".to_string()),
             },
             requested_capabilities: Vec::new(),
