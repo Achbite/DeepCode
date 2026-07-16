@@ -18,6 +18,7 @@ import type {
   ResourcePacket,
 } from '../../context/types.js';
 import type { RequirementRecord } from '../../requirement/types.js';
+import { ProviderProfileRegistry } from '../../provider/ProviderProfileRegistry.js';
 import type { ContextFrameBuilder } from '../context/index.js';
 import { prepareProviderSideCallMessagesContextAdmission } from '../context/index.js';
 import type { DriverProviderTurnFrame } from '../runFrame.js';
@@ -26,6 +27,8 @@ import {
   SessionDriverRepairRuntimeAccessor,
   type SessionDriverProviderRuntimeState,
 } from '../runFrame.js';
+
+const providerProfiles = new ProviderProfileRegistry();
 
 export interface TerminalGuidanceRevisionInput {
   content: string;
@@ -80,7 +83,7 @@ export interface TerminalGuidanceRevisionCoordinatorPorts<
   ): AgentEvent;
   diagnosticEvent(sessionId: string, message: string, ts: string, id: string): AgentEvent;
   assembleContext(input: ContextAssemblyInput): ContextAssemblyResult;
-  capabilityCatalogSummary(state: State): string;
+  toolCatalogSummary(state: State): string;
   implementationBatchHints(state: State): string[];
   appendConsumedGuidanceEvents(input: {
     sessionId: string;
@@ -133,11 +136,12 @@ export class TerminalGuidanceRevisionCoordinator<
       contextAssemblyId: this.ports.createId('context-assembly-guidance-revision'),
       workflowState: 'guidanceRevision',
       allowedProposals: ['answer'],
-      capabilityCatalogSummary: this.ports.capabilityCatalogSummary(state),
+      toolCatalogSummary: this.ports.toolCatalogSummary(state),
       memoryDocument: state.memoryDocument,
       projectMemoryMode: input.projectMemoryMode,
       extraMemoryHints: this.ports.implementationBatchHints(state),
       interventionLevel: input.interventionLevel,
+      providerProfileSystemContract: providerProfiles.profile('review-v1').systemContract,
       userOverlay: this.ports.overlay({
         originalRequest: input.content,
         draftAnswer,

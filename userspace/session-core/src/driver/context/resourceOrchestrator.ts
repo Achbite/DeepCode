@@ -15,6 +15,7 @@ export interface ResourceOrchestratorState {
   runId: string;
   manifest: ResourceManifest;
   resourcePackets: ResourcePacket[];
+  resourceEvidenceRevision?: number;
 }
 
 export interface ResourceOrchestratorRuntime {
@@ -90,6 +91,7 @@ export class ResourceOrchestrator<State extends ResourceOrchestratorState = Reso
     options: ResourcePacketRecordOptions = {}
   ): void {
     state.resourcePackets.push(packet);
+    state.resourceEvidenceRevision = (state.resourceEvidenceRevision ?? 0) + 1;
     if (options.discoverManifestEntries) {
       this.input.resourceRequestLoop.addDiscoveredManifestEntries(state.manifest, packet);
     }

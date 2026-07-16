@@ -20,7 +20,69 @@ import {
 } from '../driver/pipelines/index.js';
 import { assert, assertEqual, randomSmokeToken } from './smokeHelpers.js';
 import { ProviderProfileRegistry } from '../provider/ProviderProfileRegistry.js';
-import { SessionSemanticToolAdapter } from '../provider/SessionSemanticToolAdapter.js';
+import {
+  SessionSemanticDirectiveError,
+  SessionSemanticToolAdapter,
+} from '../provider/SessionSemanticToolAdapter.js';
+import { NativeToolCoordinator } from '../provider/NativeToolCoordinator.js';
+import { genericToolCatalogSnapshot } from './smokeFixtures.js';
+
+export function assertKernelToolCatalogSummaryIsAuthoritative(): void {
+  const token = randomSmokeToken('kernel-tool-catalog');
+  const snapshot = genericToolCatalogSnapshot() as any;
+  snapshot.tools.push({
+    ...snapshot.tools[0],
+    toolId: 'process.exec',
+    capability: 'process.exec',
+    family: 'process',
+    operationKind: 'exec',
+    executionMode: 'blocked',
+    providerVisible: false,
+    permissionMode: 'deny',
+    risk: 'high',
+    providerSchema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['argv'],
+      properties: { argv: { type: 'array', items: { type: 'string' } } },
+    },
+    permissionSummary: `blocked-${token}`,
+    hardDenyRules: [`deny-${token}`],
+  });
+  snapshot.tools.push({
+    ...snapshot.tools[0],
+    toolId: `internal.${token}`,
+    providerVisible: false,
+  });
+  const coordinator = new NativeToolCoordinator();
+  const state = {
+    stateContract: { toolCatalogSnapshot: snapshot },
+    manifest: {
+      id: `manifest-${token}`,
+      workspaceScopeKey: `scope-${token}`,
+      entries: [],
+      budget: { maxEntries: 1, maxBytes: 1 },
+      defaultDenyPatterns: [],
+    },
+    conversationRoots: [],
+  };
+  const summary = coordinator.toolCatalogSummary(state);
+  assert(summary.includes('toolId=fs.write'), 'catalog summary includes executable provider-visible Kernel tools');
+  assert(summary.includes('targetExistence='), 'planning catalog summary includes concise Kernel usage constraints');
+  assertEqual(summary.includes('typedArgs={'), false, 'planning catalog summary does not resend full typed args schemas');
+  assert(summary.includes('toolId=process.exec'), 'catalog summary includes blocked provider-visible Kernel tools');
+  assert(summary.includes('executionMode=blocked (not executable in this catalog version)'), 'catalog summary makes blocked tools unambiguously non-executable');
+  assert(summary.includes('providerCallable=false'), 'catalog summary tells the model that blocked tools are not callable');
+  assert(summary.includes(`hardDenyRules=deny-${token}`), 'catalog summary includes Kernel hard-deny rules');
+  assertEqual(summary.includes(`internal.${token}`), false, 'catalog summary excludes Kernel-internal tools');
+
+  const unavailable = coordinator.toolCatalogSummary({
+    ...state,
+    stateContract: {},
+  });
+  assert(unavailable.includes('KernelToolCatalog unavailable.'), 'missing catalog fails closed with an explicit diagnostic instruction');
+  assert(unavailable.includes('Do not invent toolIds'), 'missing catalog never falls back to capability guesses');
+}
 
 export function assertNativeToolRepairCoordinatorBuildsRepairContracts(): void {
   const token = randomSmokeToken('native-repair');
@@ -407,7 +469,7 @@ export function assertNativeToolExposurePolicySuppressesPlanningReadToolsAfterEv
   );
   assertEqual(
     policy.providerTools({
-      acceptedImplementationPlan: { id: `plan-${token}` },
+      acceptedTaskPlan: { id: `plan-${token}` },
       providerTurnFrame: { ...planningFrame, turnMode: 'acceptedTaskExecution' },
       resourcePackets: [{ id: `packet-${token}` } as ResourcePacket],
     }, tools).length,
@@ -425,23 +487,54 @@ export function assertNativeToolExposurePolicySuppressesPlanningReadToolsAfterEv
     'provider-facing profile exposes only Session semantic tools'
   );
   assert(
-    [...planning.tools, ...execution.tools].every((tool) => !['fs.write', 'fs.patch', 'fs.delete'].includes(tool.name)),
+    [...planning.tools, ...execution.tools].every((tool) => !['fs.write', 'fs.edit', 'fs.delete'].includes(tool.name)),
     'provider-facing profile does not expose Kernel file tool ids'
   );
+  assert(planning.systemContract.includes('This system contract is written in English.'), 'provider system contract declares English as the protocol language');
+  assert(planning.systemContract.includes('must follow the language of the current user input'), 'provider system contract binds visible output to the current user input language');
+  assert(planning.systemContract.includes('Never invent a toolId'), 'provider system contract forbids guessed Kernel tools');
   assertEqual(
     profiles.profile('planning-v1').toolSchemaHash,
     planning.toolSchemaHash,
     'planning profile tool schema hash is stable'
   );
-  const artifactTool = execution.tools.find((tool) => tool.name === 'session.submit_task_artifacts');
-  const outcomeTool = execution.tools.find((tool) => tool.name === 'session.complete_current_task');
+  const artifactTool = execution.tools.find((tool) => tool.name === 'session.append_artifact_chunk');
   assertEqual(Boolean((artifactTool?.inputSchema as any)?.properties?.taskId), false, 'artifact semantic tool binds the current task in Session instead of asking the provider for taskId');
-  assertEqual(Boolean((outcomeTool?.inputSchema as any)?.properties?.taskId), false, 'task outcome semantic tool binds the current task in Session instead of asking the provider for taskId');
+  assertEqual(
+    Boolean((artifactTool?.inputSchema as any)?.properties?.contentLines?.maxItems),
+    false,
+    'artifact semantic tool does not ask the provider to count fixed-size transport frames'
+  );
+  assertEqual(
+    Boolean((artifactTool?.inputSchema as any)?.properties?.editMatch),
+    true,
+    'artifact semantic tool exposes the precise-edit match contract for patch slots'
+  );
+  assertEqual(execution.systemContract.includes('32 lines'), false, 'execution prompt does not expose the removed line-count limit');
+  assertEqual(execution.systemContract.includes('4096 bytes'), false, 'execution prompt does not expose the removed byte-count limit');
+  assertEqual(
+    execution.tools.some((tool) => tool.name === 'session.complete_current_task'),
+    false,
+    'removed task-outcome semantic tools are absent from the execution profile'
+  );
 
   const adapter = new SessionSemanticToolAdapter(profiles);
-  const planProposal = adapter.proposal({
+  const planTarget = `scope-${token}/target.txt`;
+  const planDirective = adapter.directive({
     sessionId: `session-${token}`,
     runId: `run-${token}`,
+    stateContract: { toolCatalogSnapshot: genericToolCatalogSnapshot() as any },
+    resourcePackets: [{
+      id: `packet-${token}`,
+      items: [{
+        requestItemId: `item-${token}`,
+        manifestEntryId: `entry-${token}`,
+        status: 'resolved',
+        contentKind: 'fileText',
+        resolvedKind: 'file',
+        path: planTarget,
+      }],
+    }] as any,
     providerTurnFrame: { turnMode: 'planning' } as any,
   }, {
     callId: `plan-call-${token}`,
@@ -453,15 +546,57 @@ export function assertNativeToolExposurePolicySuppressesPlanningReadToolsAfterEv
       tasks: [{
         taskId: `task-${token}`,
         title: `task-title-${token}`,
-        operation: 'replaceFile',
-        targets: [`scope-${token}/target.txt`],
+        toolId: 'fs.write',
+        target: [planTarget],
+        args: {},
+        dependencies: [],
         acceptanceCriteria: [`accept-${token}`],
         failureCriteria: [`fail-${token}`],
       }],
     },
   });
+  const planProposal = planDirective?.kind === 'proposal' ? planDirective.proposal : undefined;
   assertEqual(planProposal?.kind, 'taskPlan', 'planning semantic tool admits a taskPlan proposal');
-  assertEqual((planProposal?.payload as any).tasks[0].capability, 'fs.write', 'Session maps semantic plan operation to its internal capability');
+  assertEqual((planProposal?.payload as any).tasks[0].toolId, 'fs.write', 'Session preserves the canonical task tool ID');
+
+  const unboundDirective = adapter.directive({
+    sessionId: `session-unbound-${token}`,
+    runId: `run-unbound-${token}`,
+    manifest: {
+      id: `manifest-unbound-${token}`,
+      projectId: `project-unbound-${token}`,
+      projectKind: 'blank',
+      projectRootStatus: 'unbound',
+      workspaceScopeKey: `scope-unbound-${token}`,
+      entries: [],
+      budget: { maxEntries: 8, maxBytes: 4096 },
+      defaultDenyPatterns: [],
+    },
+    stateContract: { toolCatalogSnapshot: genericToolCatalogSnapshot() as any },
+    providerTurnFrame: { turnMode: 'planning' } as any,
+    userAuthorityFrame: { outputLanguage: 'zh-CN' },
+  }, {
+    callId: `unbound-plan-call-${token}`,
+    index: 0,
+    name: 'session.submit_plan',
+    arguments: {
+      title: `title-unbound-${token}`,
+      summary: `summary-unbound-${token}`,
+      tasks: [{
+        taskId: `task-unbound-${token}`,
+        title: `task-title-unbound-${token}`,
+        toolId: 'fs.create',
+        target: [`target-${token}.txt`],
+        args: {},
+        dependencies: [],
+        acceptanceCriteria: [`accept-unbound-${token}`],
+        failureCriteria: [`fail-unbound-${token}`],
+      }],
+    },
+  });
+  const unboundProposal = unboundDirective?.kind === 'proposal' ? unboundDirective.proposal : undefined;
+  assertEqual(unboundProposal?.kind, 'taskPlan', 'Session semantic admission preserves a structurally valid task plan without judging workspace permission');
+  assertEqual((unboundProposal?.payload as any)?.tasks[0]?.toolId, 'fs.create', 'Session forwards canonical tool intent for Kernel authorization');
 
   const deleteTarget = `scope-${token}/obsolete`;
   const deletePlan = {
@@ -470,65 +605,42 @@ export function assertNativeToolExposurePolicySuppressesPlanningReadToolsAfterEv
     tasks: [{
       taskId: `delete-task-${token}`,
       title: `delete-title-${token}`,
-      capability: 'fs.delete',
+      toolId: 'fs.delete',
       targets: [deleteTarget],
       dependencies: [],
+      planningArgs: {},
       conflictKeys: [],
     }],
-    capabilities: ['fs.delete'],
-    targetScopes: [deleteTarget],
-    exactOperationGrants: [{
-      operation: 'delete',
-      targetPath: deleteTarget,
-      targetResourceKind: 'directory',
-      recursive: true,
-      capability: 'fs.delete',
+    authorizationOperations: [{
+      operationId: `plan-op-delete-task-${token}-1`,
       sourceTaskId: `delete-task-${token}`,
-      source: 'kernelPlanReview',
+      toolId: 'fs.delete',
+      operationKind: 'delete',
+      contentMode: 'none',
+      targets: [deleteTarget],
+      dependsOn: [],
+      fixedArgs: {},
+      argsTemplate: { path: deleteTarget, targetKind: 'file', recursive: false },
+      targetResourceKind: 'file',
+      recursive: false,
+      internal: false,
     }],
-    accessScopes: [],
+    toolIds: ['fs.delete'],
+    targetScopes: [deleteTarget],
     batchIndex: 1,
     completedTaskIds: [],
+    dependencyFacts: [],
     rawPlan: {},
   } as any;
   const deterministic = adapter.deterministicCurrentTask({
     sessionId: `session-${token}`,
     runId: `run-${token}`,
-    acceptedImplementationPlan: deletePlan,
+    acceptedTaskPlan: deletePlan,
     providerTurnFrame: { turnMode: 'acceptedTaskExecution' } as any,
   });
-  assertEqual(deterministic?.kind, 'actionBundle', 'exact accepted delete task compiles without a provider payload');
+  assertEqual(deterministic?.kind, 'actionBundle', 'accepted delete task intent compiles without a provider payload');
   assertEqual((deterministic?.payload as any).actionBundle.actions[0].args.path, deleteTarget, 'deterministic delete keeps the accepted normalized target');
-
-  const unscopedGrant = {
-    ...deletePlan.exactOperationGrants[0],
-    sourceTaskId: undefined,
-  };
-  const singleUntargeted = adapter.deterministicCurrentTask({
-    sessionId: `session-single-${token}`,
-    runId: `run-single-${token}`,
-    acceptedImplementationPlan: {
-      ...deletePlan,
-      tasks: [{ ...deletePlan.tasks[0], targets: [] }],
-      exactOperationGrants: [unscopedGrant],
-    },
-    providerTurnFrame: { turnMode: 'acceptedTaskExecution' } as any,
-  });
-  assertEqual(singleUntargeted?.kind, 'actionBundle', 'one incomplete untargeted task can consume its unambiguous exact operation grant');
-  const ambiguousUntargeted = adapter.deterministicCurrentTask({
-    sessionId: `session-ambiguous-${token}`,
-    runId: `run-ambiguous-${token}`,
-    acceptedImplementationPlan: {
-      ...deletePlan,
-      tasks: [
-        { ...deletePlan.tasks[0], taskId: `delete-a-${token}`, targets: [] },
-        { ...deletePlan.tasks[0], taskId: `delete-b-${token}`, targets: [] },
-      ],
-      exactOperationGrants: [unscopedGrant],
-    },
-    providerTurnFrame: { turnMode: 'acceptedTaskExecution' } as any,
-  });
-  assertEqual(ambiguousUntargeted, undefined, 'multiple untargeted tasks do not guess ownership of an unscoped exact operation grant');
+  assertEqual((deterministic?.payload as any).actionBundle.actions[0].args.targetKind, 'file', 'deterministic delete preserves Kernel target metadata');
 
   const writeTarget = `scope-${token}/generated.txt`;
   const writeTaskId = `write-task-${token}`;
@@ -538,67 +650,85 @@ export function assertNativeToolExposurePolicySuppressesPlanningReadToolsAfterEv
     tasks: [{
       taskId: writeTaskId,
       title: `write-title-${token}`,
-      capability: 'fs.write',
-      semanticOperation: 'createFile',
+      toolId: 'fs.create',
       targets: [writeTarget],
       dependencies: [],
+      planningArgs: { executable: false },
       conflictKeys: [],
     }],
-    capabilities: ['fs.write'],
-    targetScopes: [writeTarget],
-    exactOperationGrants: [{
-      operation: 'write',
-      targetPath: writeTarget,
-      targetResourceKind: 'file',
-      capability: 'fs.write',
+    authorizationOperations: [{
+      operationId: `plan-op-${writeTaskId}-1`,
       sourceTaskId: writeTaskId,
-      source: 'kernelPlanReview',
+      toolId: 'fs.create',
+      operationKind: 'create',
+      contentMode: 'contentBlock',
+      targets: [writeTarget],
+      dependsOn: [],
+      fixedArgs: { executable: false },
+      argsTemplate: { path: writeTarget, contentBlockId: 'executionTime' },
+      targetResourceKind: 'file',
+      recursive: false,
+      internal: false,
     }],
+    toolIds: ['fs.create'],
+    targetScopes: [writeTarget],
   } as any;
-  const artifact = adapter.proposal({
+  const artifactChunk = adapter.directive({
     sessionId: `session-${token}`,
     runId: `run-${token}`,
-    acceptedImplementationPlan: writePlan,
+    acceptedTaskPlan: writePlan,
     providerTurnFrame: { turnMode: 'acceptedTaskExecution', allowedKinds: ['actionBundle'] } as any,
   }, {
     callId: `artifact-call-${token}`,
     index: 0,
-    name: 'session.submit_task_artifacts',
+    name: 'session.append_artifact_chunk',
     arguments: {
-      summary: `artifact-summary-${token}`,
-      artifacts: [{
-        slotId: `slot-${writeTaskId}-1`,
-        contentLines: [`content-${token}`],
-      }],
+      slotId: `slot-${writeTaskId}-plan-op-${writeTaskId}-1`,
+      contentLines: [`content-${token}`],
+      finalChunk: true,
     },
   });
-  assertEqual((artifact?.payload as any).actionBundle.actions[0].toolId, 'fs.write', 'Session compiles artifact slots into the internal Kernel action DTO');
+  assertEqual(artifactChunk?.kind, 'artifactChunk', 'execution semantic tool emits a bounded artifact chunk directive');
+  const artifact = adapter.compileArtifacts({
+    state: {
+      sessionId: `session-${token}`,
+      runId: `run-${token}`,
+      acceptedTaskPlan: writePlan,
+      providerTurnFrame: { turnMode: 'acceptedTaskExecution', allowedKinds: ['actionBundle'] } as any,
+    },
+    callId: `artifact-call-${token}`,
+    directive: {
+      summary: `artifact-summary-${token}`,
+      artifacts: [{ slotId: `slot-${writeTaskId}-plan-op-${writeTaskId}-1`, contentLines: [`content-${token}`] }],
+    },
+  });
+  assertEqual((artifact?.payload as any).actionBundle.actions[0].toolId, 'fs.create', 'Session preserves create-only semantics in the canonical Kernel action DTO');
   assertEqual(
-    (artifact?.payload as any).actionBundle.actions[0].sourceBlockId,
-    (artifact?.payload as any).actionBundle.actions[0].args.sourceBlockId,
-    'compiled write action keeps Session validation and Kernel command block references aligned'
+    (artifact?.payload as any).actionBundle.actions[0].args.contentBlockId,
+    (artifact?.payload as any).contentBlocks[0].blockId,
+    'compiled write action references the canonical content block through typed args'
   );
-  assertEqual((artifact?.payload as any).codeBlocks[0].targetPath, writeTarget, 'artifact compilation keeps target ownership in Session');
-  assertEqual((artifact?.payload as any).codeBlocks[0].operation, 'create', 'accepted createFile intent is not downgraded to overwrite by a generic fs.write grant');
-  const outcome = adapter.proposal({
+  assertEqual((artifact?.payload as any).contentBlocks[0].targetPath, writeTarget, 'artifact compilation keeps target ownership in Session');
+  assertEqual((artifact?.payload as any).contentBlocks[0].operation, 'create', 'accepted createFile intent is not downgraded to overwrite by a generic fs.write grant');
+  const removedOutcome = adapter.directive({
     sessionId: `session-${token}`,
     runId: `run-${token}`,
-    acceptedImplementationPlan: writePlan,
-    providerTurnFrame: { turnMode: 'acceptedTaskExecution', allowedKinds: ['taskOutcome'] } as any,
+    acceptedTaskPlan: writePlan,
+    providerTurnFrame: { turnMode: 'acceptedTaskExecution', allowedKinds: ['diagnostic'] } as any,
   }, {
     callId: `outcome-call-${token}`,
     index: 0,
     name: 'session.complete_current_task',
     arguments: { reason: `sufficient-${token}` },
   });
-  assertEqual((outcome?.payload as any).taskId, writeTaskId, 'Session binds task outcomes to the active accepted task');
+  assertEqual(removedOutcome, null, 'removed task outcome semantic tools are not admitted by the v4 execution profile');
 }
 
 export async function assertNativeToolProviderLoopAdmitsSemanticProposalWithoutNestedResume(): Promise<void> {
   const token = randomSmokeToken('native-loop');
   const toolName = `tool-${token}`;
   const proposal = {
-    schemaVersion: 'deepcode.agent.protocol.v3',
+    schemaVersion: 'deepcode.agent.protocol.v4',
     proposalId: `proposal-${token}`,
     runId: `run-${token}`,
     sessionId: `session-${token}`,
@@ -651,6 +781,9 @@ export async function assertNativeToolProviderLoopAdmitsSemanticProposalWithoutN
     },
     isEmptyResponseError: () => false,
     semanticDirectiveError: () => undefined,
+    onArtifactDraftBudgetExceeded: async () => {
+      throw new Error('Unexpected artifact budget callback in proposal admission smoke.');
+    },
   });
   assertEqual((result as ProposalEnvelope).proposalId, proposal.proposalId, 'semantic callback returns the admitted proposal directly');
   assertEqual(stages.join(','), 'provider_call', 'semantic callback does not create a nested provider tool resume stage');
@@ -700,9 +833,9 @@ export async function assertNativeToolProviderLoopRetriesInvalidSemanticDirectiv
     },
     turnHandler: {
       handle: async ({ state, turn }: any) => {
-        const proposal = adapter.proposal(state, turn.toolCalls[0]);
-        if (!proposal) throw new Error('Expected a registered Session semantic directive.');
-        return { kind: 'proposal', proposal };
+        const directive = adapter.directive(state, turn.toolCalls[0]);
+        if (!directive || directive.kind !== 'proposal') throw new Error('Expected a registered Session semantic proposal directive.');
+        return { kind: 'proposal', proposal: directive.proposal };
       },
     },
   });
@@ -734,6 +867,9 @@ export async function assertNativeToolProviderLoopRetriesInvalidSemanticDirectiv
     },
     isEmptyResponseError: () => false,
     semanticDirectiveError: () => undefined,
+    onArtifactDraftBudgetExceeded: async () => {
+      throw new Error('Unexpected artifact budget callback in semantic retry smoke.');
+    },
   };
 
   const retry = await loop.run(input);
@@ -749,7 +885,7 @@ export async function assertNativeToolProviderLoopRetriesInvalidSemanticDirectiv
 export async function assertNativeToolProviderLoopRetriesMalformedArgumentsInSameProfile(): Promise<void> {
   const token = randomSmokeToken('semantic-json-retry');
   const proposal = {
-    schemaVersion: 'deepcode.agent.protocol.v3',
+    schemaVersion: 'deepcode.agent.protocol.v4',
     proposalId: `proposal-${token}`,
     runId: `run-${token}`,
     sessionId: `session-${token}`,
@@ -809,6 +945,9 @@ export async function assertNativeToolProviderLoopRetriesMalformedArgumentsInSam
         ? { code: record.code, message: record.message ?? '' }
         : undefined;
     },
+    onArtifactDraftBudgetExceeded: async () => {
+      throw new Error('Unexpected artifact budget callback in malformed argument retry smoke.');
+    },
   };
 
   const retry = await loop.run(input);
@@ -819,6 +958,70 @@ export async function assertNativeToolProviderLoopRetriesMalformedArgumentsInSam
   assertEqual(calls, 2, 'malformed argument repair performs exactly one additional provider turn');
 }
 
+export async function assertNativeToolProviderLoopReturnsArtifactBudgetFailureToPlanning(): Promise<void> {
+  const token = randomSmokeToken('artifact-budget-replan');
+  const call = {
+    callId: `call-${token}`,
+    index: 0,
+    name: 'session.append_artifact_chunk',
+    arguments: {
+      slotId: `slot-${token}`,
+      contentLines: [`content-${token}`],
+      finalChunk: true,
+    },
+  };
+  const loop = new NativeToolProviderLoop<any, string, any>({
+    providerPipeline: {
+      messages: () => [
+        { role: 'system', content: `system-${token}` },
+        { role: 'user', content: `user-${token}` },
+      ],
+      runWithNativeTools: async () => ({
+        content: '',
+        reasoning: '',
+        toolCalls: [call],
+      }),
+    },
+    turnHandler: {
+      handle: async () => {
+        const cause = Object.assign(new Error(`budget-${token}`), {
+          code: 'artifact_draft_budget_exceeded',
+        });
+        throw new SessionSemanticDirectiveError(call.name, call.callId, call.arguments, cause);
+      },
+    },
+  });
+  const state: any = {
+    sessionId: `session-${token}`,
+    runId: `run-${token}`,
+    userRequest: `request-${token}`,
+  };
+  let replanCalls = 0;
+  const result = await loop.run({
+    state,
+    prompt: `prompt-${token}`,
+    contract: {} as any,
+    providerTools: [{ name: call.name } as any],
+    handlerPorts: {} as any,
+    runTurn: async () => {
+      throw new Error('Artifact budget replan smoke uses the fake provider pipeline.');
+    },
+    isEmptyResponseError: () => false,
+    semanticDirectiveError: () => undefined,
+    onArtifactDraftBudgetExceeded: async (_state, error) => {
+      replanCalls += 1;
+      _state.taskPlanReplanReason = {
+        code: 'artifact_draft_budget_exceeded',
+        message: error.message,
+      };
+    },
+  });
+  assertEqual((result as any).kind, 'providerResume', 'artifact budget exhaustion resumes through the planning loop');
+  assertEqual(replanCalls, 1, 'artifact budget exhaustion invokes the deterministic task-level replan transition once');
+  assertEqual(state.semanticDirectiveRepairAttempted, undefined, 'artifact budget exhaustion does not consume a chunk repair attempt');
+  assertEqual(state.taskPlanReplanReason?.code, 'artifact_draft_budget_exceeded', 'planning receives the structured Kernel budget reason');
+}
+
 export async function assertNativeToolHandlerPortsFactoryBuildsPorts(): Promise<void> {
   const token = randomSmokeToken('semantic-ports');
   const sessionId = `session-${token}`;
@@ -826,7 +1029,7 @@ export async function assertNativeToolHandlerPortsFactoryBuildsPorts(): Promise<
   const events: AgentEvent[] = [];
   const deltas: ProjectionDelta[] = [];
   const proposal = {
-    schemaVersion: 'deepcode.agent.protocol.v3',
+    schemaVersion: 'deepcode.agent.protocol.v4',
     proposalId: `proposal-${token}`,
     runId,
     sessionId,
@@ -856,7 +1059,7 @@ export async function assertNativeToolHandlerPortsFactoryBuildsPorts(): Promise<
     },
   });
   const ports = factory.create({
-    semanticProposal: () => proposal,
+    semanticDirective: async () => ({ kind: 'proposal', proposal, toolResult: { status: 'accepted' } }),
   });
   const state = {
     sessionId,
@@ -866,7 +1069,7 @@ export async function assertNativeToolHandlerPortsFactoryBuildsPorts(): Promise<
   };
   await ports.appendAssistantProgress(state, `progress-${token}`);
   await ports.emitCheckpoint(state, 0, 1);
-  const admitted = ports.semanticProposal(state, {
+  const admitted = await ports.semanticDirective(state, {
     callId: `call-${token}`,
     index: 0,
     name: 'session.submit_answer',
@@ -876,7 +1079,7 @@ export async function assertNativeToolHandlerPortsFactoryBuildsPorts(): Promise<
   assertEqual(events.length, 1, 'semantic handler ports append provider narration once');
   assertEqual((events[0]?.payload as any)?.content, `progress-${token}`, 'semantic handler ports preserve provider narration');
   assertEqual(deltas.length, 1, 'semantic handler ports emit one provider checkpoint');
-  assertEqual(admitted?.proposalId, proposal.proposalId, 'semantic handler ports admit the Session directive without Kernel tool callbacks');
+  assertEqual(admitted?.kind === 'proposal' ? admitted.proposal.proposalId : undefined, proposal.proposalId, 'semantic handler ports admit the Session directive without Kernel tool callbacks');
 }
 
 export async function assertProposalOnlyProviderRunnerRepairsToolViolation(): Promise<void> {

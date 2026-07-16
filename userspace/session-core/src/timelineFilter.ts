@@ -15,7 +15,6 @@ const INTERNAL_ORCHESTRATION_STAGES = new Set<string>([
   'needProposal',
   'autonomy.transitioned',
   'message.appended',
-  'stage.changed',
   'review.facts_produced',
   'review_gate.evaluated',
 ]);
@@ -27,9 +26,9 @@ const REDUNDANT_PRE_TOOL_EXECUTION = new Set<string>([
   'fs.read',
   'fs.list',
   'fs.diff',
-  'code.search',
+  'code.grep',
   'fs.write',
-  'fs.patch',
+  'fs.edit',
   'fs.delete',
 ]);
 

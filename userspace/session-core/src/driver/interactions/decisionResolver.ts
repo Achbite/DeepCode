@@ -10,7 +10,7 @@ import type { PermissionDecisionHandler } from './permissionDecisionHandler.js';
 import type { PlanDecisionHandler } from './planDecisionHandler.js';
 import type { RequirementDecisionHandler } from './requirementDecisionHandler.js';
 import type { ReviewDecisionHandler } from './reviewDecisionHandler.js';
-import type { InterventionLevel, ReviewContinuationMode } from '../types.js';
+import type { AutonomyMode, InterventionLevel, ReviewContinuationMode } from '../types.js';
 import type {
   SessionLoopControlResult,
   SessionLoopResumeInput,
@@ -35,10 +35,14 @@ export interface DecisionResolverInput {
   existingEvents?: AgentEvent[];
   workspaceBinding?: AgentWorkspaceBinding;
   projectWorkingDirectory?: ProjectWorkingDirectory;
+  projectId?: string;
+  projectKind?: 'folder' | 'blank';
+  projectRootStatus?: 'ready' | 'unbound' | 'unavailable';
   profileId?: string;
   workflow?: string;
   reviewContinuationMode?: DecisionResolverReviewContinuationMode;
   interventionLevel?: DecisionResolverInterventionLevel;
+  autonomyMode?: AutonomyMode;
   projectMemoryMode?: ProjectMemoryMode;
   interactionOverlay?: InteractionOverlayContext;
 }
@@ -102,10 +106,14 @@ export class DecisionResolver {
         existingEvents: input.existingEvents,
         workspaceBinding: input.workspaceBinding,
         projectWorkingDirectory: input.projectWorkingDirectory,
+        projectId: input.projectId,
+        projectKind: input.projectKind,
+        projectRootStatus: input.projectRootStatus,
         profileId: input.profileId,
         workflow: input.workflow,
         reviewContinuationMode: input.reviewContinuationMode,
         interventionLevel: input.interventionLevel,
+        autonomyMode: input.autonomyMode,
         projectMemoryMode: input.projectMemoryMode,
         interactionOverlay: input.interactionOverlay,
       }));
@@ -121,10 +129,14 @@ export class DecisionResolver {
         existingEvents: input.existingEvents,
         workspaceBinding: input.workspaceBinding,
         projectWorkingDirectory: input.projectWorkingDirectory,
+        projectId: input.projectId,
+        projectKind: input.projectKind,
+        projectRootStatus: input.projectRootStatus,
         profileId: input.profileId,
         workflow: input.workflow,
         reviewContinuationMode: input.reviewContinuationMode,
         interventionLevel: input.interventionLevel,
+        autonomyMode: input.autonomyMode,
         projectMemoryMode: input.projectMemoryMode,
         interactionOverlay: input.interactionOverlay,
       }));
@@ -149,10 +161,14 @@ export class DecisionResolver {
         existingEvents: input.existingEvents,
         workspaceBinding: input.workspaceBinding,
         projectWorkingDirectory: input.projectWorkingDirectory,
+        projectId: input.projectId,
+        projectKind: input.projectKind,
+        projectRootStatus: input.projectRootStatus,
         profileId: input.profileId,
         workflow: input.workflow,
         reviewContinuationMode: input.reviewContinuationMode,
         interventionLevel: input.interventionLevel,
+        autonomyMode: input.autonomyMode,
         projectMemoryMode: input.projectMemoryMode,
       }));
       return { kind: 'decisionRouted', decisionKind: 'review', result };

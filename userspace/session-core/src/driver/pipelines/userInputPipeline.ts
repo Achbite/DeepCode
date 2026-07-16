@@ -263,10 +263,10 @@ export class UserInputPipeline {
       this.requirementDecisionResumeRequest(confirmation, decisionEvent, decision, guidance),
       '',
       'Accepted-plan continuation rule:',
-      '- This decision belongs to the current accepted implementationPlan execution checkpoint.',
+      '- This decision belongs to the current accepted taskPlan execution checkpoint.',
       '- Continue the same accepted taskPlan and current task cursor.',
       '- Do not create a new standalone plan or final Review unless all accepted tasks are complete.',
-      '- If returning actionBundle, keep targets and capabilities inside the accepted plan scope.',
+      '- If returning actionBundle, keep targets and toolIds inside the accepted plan scope.',
     ].join('\n');
   }
 
@@ -278,12 +278,6 @@ export class UserInputPipeline {
     const payload = objectRecord(event.payload);
     const requirementId = stringValue(payload?.requirementId);
     return Boolean(requirementId?.startsWith(`${RESOURCE_BUDGET_REQUIREMENT_PREFIX}-`));
-  }
-
-  isAcceptedPlanScopeConfirmation(event: AgentEvent): boolean {
-    const payload = objectRecord(event.payload);
-    const decisionRequest = objectRecord(payload?.decisionRequest);
-    return stringValue(decisionRequest?.decisionScope) === 'acceptedPlanBatchOutOfScope';
   }
 
   isAcceptedPlanExecutionConfirmation(event: AgentEvent): boolean {

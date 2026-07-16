@@ -224,7 +224,7 @@ export class ActionBundleAdmissionCoordinator<
         }),
       ]) ?? result;
     }
-    if (repaired.kind === 'taskPlan' || repaired.kind === 'implementationPlan') {
+    if (repaired.kind === 'taskPlan') {
       return this.ports.append(state.sessionId, [
         this.ports.finalDiagnosticEvent(
           state.sessionId,

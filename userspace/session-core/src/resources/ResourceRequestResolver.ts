@@ -121,8 +121,11 @@ export class ResourceRequestResolver {
   ): SynthesizedManifestEntryResult {
     const resolved = this.resolvePath(requestedPath, rootId, roots);
     if (resolved.kind !== 'resolved') return resolved;
-    const resourceRef = joinFsPath(resolved.root.absolutePath ?? resolved.root.displayPath, resolved.relativePath);
-    const existing = manifest.entries.find((entry) => comparablePath(entry.resourceRef) === comparablePath(resourceRef));
+    const resourceRef = resolved.relativePath || '.';
+    const existing = manifest.entries.find((entry) => (
+      entry.rootId === resolved.root.rootId
+      && comparablePath(entry.resourceRef) === comparablePath(resourceRef)
+    ));
     if (existing) return { kind: 'entry', entry: existing };
     const entry: ResourceManifestEntry = {
       id: `path-${sanitizeId(resolved.root.rootId)}-${sanitizeId(resolved.relativePath || itemId)}`,
@@ -131,6 +134,9 @@ export class ResourceRequestResolver {
       resourceRef,
       readPolicy: 'autoRead',
       reason: reason || `Requested path under conversation root ${resolved.root.rootId}.`,
+      rootId: resolved.root.rootId,
+      resourceId: resolved.root.resourceId,
+      contextUse: 'resourceEvidence',
     };
     return { kind: 'entry', entry };
   }
@@ -150,15 +156,22 @@ export class ResourceRequestResolver {
   ): ResourceManifestEntry {
     const offsetBytes = normalizedNonNegativeInteger(item.offsetBytes);
     const limitBytes = normalizedPositiveInteger(item.limitBytes);
-    if (typeof offsetBytes !== 'number' && typeof limitBytes !== 'number') return entry;
+    const focusedEntry: ResourceManifestEntry = {
+      ...entry,
+      id: `${entry.id}:request:${sanitizeId(item.id)}`,
+      contextUse: 'resourceEvidence',
+      readMode: 'content',
+      directoryOptions: undefined,
+    };
+    if (typeof offsetBytes !== 'number' && typeof limitBytes !== 'number') return focusedEntry;
     const rangeId = [
-      entry.id,
+      focusedEntry.id,
       'range',
       typeof offsetBytes === 'number' ? offsetBytes : 0,
       typeof limitBytes === 'number' ? limitBytes : 'default',
     ].join(':');
     return {
-      ...entry,
+      ...focusedEntry,
       id: rangeId,
       ...(typeof offsetBytes === 'number' ? { offsetBytes } : {}),
       ...(typeof limitBytes === 'number' ? { limitBytes } : {}),
@@ -175,8 +188,11 @@ export class ResourceRequestResolver {
     if (exact) return exact;
     const resolved = this.resolvePath(requestedPath, undefined, roots);
     if (resolved.kind !== 'resolved') return undefined;
-    const ref = joinFsPath(resolved.root.absolutePath ?? resolved.root.displayPath, resolved.relativePath);
-    return manifest.entries.find((entry) => comparablePath(entry.resourceRef) === comparablePath(ref));
+    const ref = resolved.relativePath || '.';
+    return manifest.entries.find((entry) => (
+      entry.rootId === resolved.root.rootId
+      && comparablePath(entry.resourceRef) === comparablePath(ref)
+    ));
   }
 
   private synthesizeEntryForSearch(
@@ -190,7 +206,7 @@ export class ResourceRequestResolver {
     const include = stringArrayValue(item.include);
     const contextLines = normalizedNonNegativeInteger(item.contextLines);
     const maxResults = normalizedPositiveInteger(item.maxResults);
-    const resourceRef = root.root.absolutePath ?? root.root.displayPath;
+    const resourceRef = '.';
     return {
       kind: 'entry',
       entry: {
@@ -200,6 +216,9 @@ export class ResourceRequestResolver {
         resourceRef,
         readPolicy: 'autoRead',
         reason: item.reason || `Search under conversation root ${root.root.rootId}.`,
+        rootId: root.root.rootId,
+        resourceId: root.root.resourceId,
+        contextUse: 'resourceEvidence',
         query,
         ...(include.length ? { include } : {}),
         ...(typeof contextLines === 'number' ? { contextLines } : {}),
@@ -355,12 +374,6 @@ function rootPriority(root: ConversationResourceRoot): number {
   if (root.source === 'projectWorkingDirectory') return 2;
   if (root.source === 'recentAttachment') return 3;
   return 4;
-}
-
-function joinFsPath(root: string, child: string): string {
-  const cleanRoot = root.replace(/\/+$/g, '');
-  const cleanChild = child.replace(/^\/+/g, '');
-  return `${cleanRoot}/${cleanChild}`;
 }
 
 function sanitizeId(value: string): string {

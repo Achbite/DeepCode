@@ -13,7 +13,7 @@ import type {
   ProjectionDelta,
 } from '@deepcode/protocol';
 import type { ProjectWorkingDirectory } from '../context/types.js';
-import type { AcceptedImplementationPlanContext } from './execution/index.js';
+import type { AcceptedTaskPlanContext } from './execution/index.js';
 import type { InteractionOverlayContext } from './pipelines/interactionOverlayCodec.js';
 import type { ProposalEnvelope } from '../protocol/types.js';
 import type { PromptEnvelope } from '../prompt/types.js';
@@ -21,13 +21,16 @@ import type { ProjectMemoryMode } from '../context/index.js';
 import type { RequirementRecord } from '../requirement/types.js';
 import type {
   InterventionLevel,
+  AutonomyMode,
   RequirementConfirmationMode,
   ReviewContinuationMode,
 } from '../sessionModes.js';
 import type { TranscriptEntry } from '../transcript.js';
+import type { PromptLedgerWireRecord } from '../prompt/promptLedger.js';
 
 export type {
   InterventionLevel,
+  AutonomyMode,
   RequirementConfirmationMode,
   ReviewContinuationMode,
 } from '../sessionModes.js';
@@ -52,6 +55,9 @@ export interface KernelStateContractRef {
   toolCatalogRef?: string;
   toolCatalogHash?: string;
   toolCatalogSnapshot?: KernelToolCatalogSnapshot;
+  draftAdmissionPolicy?: {
+    maxTotalUtf8Bytes: number;
+  };
 }
 
 export interface DriverRequestRef {
@@ -86,6 +92,9 @@ export interface SessionDriverInput extends SessionUserTurn {
 export interface SessionDriverLoopPorts {
   appendEvents(sessionId: string, events: AgentEvent[]): Promise<AgentSessionResult>;
   appendTranscript?: (sessionId: string, entry: TranscriptEntry) => Promise<void>;
+  loadWireLedger?: (sessionId: string) => Promise<PromptLedgerWireRecord[]>;
+  appendWireLedger?: (sessionId: string, entries: PromptLedgerWireRecord[]) => Promise<void>;
+  appendCacheTelemetry?: (sessionId: string, entry: Record<string, unknown>) => Promise<void>;
   kernelCommand(request: KernelCommandEnvelope): Promise<KernelReply>;
   llmChat(request: LlmChatRequest): Promise<ApiResponse<LlmChatResult>>;
   llmChatStream?: (
@@ -104,6 +113,9 @@ export interface SessionDriverLoopInput {
   existingEvents?: AgentEvent[];
   workspaceBinding?: AgentWorkspaceBinding;
   projectWorkingDirectory?: ProjectWorkingDirectory;
+  projectId?: string;
+  projectKind?: 'folder' | 'blank';
+  projectRootStatus?: 'ready' | 'unbound' | 'unavailable';
   profileId?: string;
   workflow?: string;
   appendUserMessage?: boolean;
@@ -111,9 +123,10 @@ export interface SessionDriverLoopInput {
   requirementConfirmationMode?: RequirementConfirmationMode;
   reviewContinuationMode?: ReviewContinuationMode;
   interventionLevel?: InterventionLevel;
+  autonomyMode?: AutonomyMode;
   projectMemoryMode?: ProjectMemoryMode;
   resumeResourcePackets?: boolean;
-  acceptedImplementationPlan?: AcceptedImplementationPlanContext;
+  acceptedTaskPlan?: AcceptedTaskPlanContext;
   interactionOverlay?: InteractionOverlayContext;
 }
 
@@ -127,10 +140,14 @@ export interface SessionDecisionResolverInput {
   existingEvents?: AgentEvent[];
   workspaceBinding?: AgentWorkspaceBinding;
   projectWorkingDirectory?: ProjectWorkingDirectory;
+  projectId?: string;
+  projectKind?: 'folder' | 'blank';
+  projectRootStatus?: 'ready' | 'unbound' | 'unavailable';
   profileId?: string;
   workflow?: string;
   reviewContinuationMode?: ReviewContinuationMode;
   interventionLevel?: InterventionLevel;
+  autonomyMode?: AutonomyMode;
   projectMemoryMode?: ProjectMemoryMode;
   interactionOverlay?: InteractionOverlayContext;
 }

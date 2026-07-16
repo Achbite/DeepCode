@@ -1,6 +1,6 @@
 import type { LlmChatRequest } from '@deepcode/protocol';
 import { stableHash } from '../../cache/canonicalizer.js';
-import type { AcceptedImplementationPlanContext } from '../../accepted-plan/types.js';
+import type { AcceptedTaskPlanContext } from '../../accepted-plan/types.js';
 import type { ResourcePacket } from '../../context/types.js';
 import type { PromptEnvelope } from '../../prompt/types.js';
 
@@ -9,7 +9,7 @@ export interface ReviewGeneratedArtifactEvidence {
   content: string;
   contentHash: string;
   manifestEntryId: string;
-  sourceBlockId?: string;
+  contentBlockId?: string;
   actionId?: string;
   workUnitId?: string;
 }
@@ -27,9 +27,9 @@ export interface StaticSyntaxReviewPacket {
 export interface StaticSyntaxReviewAssemblerPorts {
   completedWorkUnitFacts(events: unknown[]): { actionIds: Set<string>; targets: Set<string> };
   batchActionRecords(batch: unknown): Record<string, unknown>[];
-  actionEffectiveCapability(action: { capability?: unknown; toolId?: unknown }): string;
-  actionFileTargetPath(action: { targetRef?: unknown; targetPath?: unknown; resourceScope?: unknown; args?: unknown }): string | undefined;
-  normalizeAcceptedPlanTargetScope(target: string, accepted: AcceptedImplementationPlanContext): string;
+  actionToolId(action: { toolId?: unknown }): string;
+  actionFileTargetPath(action: { args?: unknown }): string | undefined;
+  normalizeAcceptedPlanTargetScope(target: string, accepted: AcceptedTaskPlanContext): string;
   comparablePath(value: string): string;
   resourceTextForTarget(packets: ResourcePacket[], target: string): string | undefined;
 }
@@ -69,7 +69,7 @@ export class ReviewAssembler {
   constructor(private readonly ports: StaticSyntaxReviewAssemblerPorts) {}
 
   staticSyntaxReviewPacket(input: {
-    accepted: AcceptedImplementationPlanContext;
+    accepted: AcceptedTaskPlanContext;
     batch: Record<string, unknown>;
     batchEvents: unknown[];
     generatedArtifactEvidence: Map<string, ReviewGeneratedArtifactEvidence>;
@@ -79,14 +79,14 @@ export class ReviewAssembler {
     const completed = this.ports.completedWorkUnitFacts(batchEvents);
     const targetPaths = new Set<string>();
     for (const action of this.ports.batchActionRecords(batch)) {
-      const capability = this.ports.actionEffectiveCapability(action);
-      if (capability !== 'fs.write' && capability !== 'fs.patch') continue;
+      const capability = this.ports.actionToolId(action);
+      if (capability !== 'fs.write' && capability !== 'fs.edit') continue;
       const actionId = stringValue(action.actionId) ?? stringValue(action.id);
       if (actionId && completed.actionIds.size && !completed.actionIds.has(actionId)) continue;
       const target = this.ports.actionFileTargetPath(action);
       if (target) targetPaths.add(this.ports.normalizeAcceptedPlanTargetScope(target, accepted));
     }
-    for (const block of recordArray(batch.codeBlocks)) {
+    for (const block of recordArray(batch.contentBlocks)) {
       const target = stringValue(block.targetPath) ?? stringValue(block.path);
       if (target) targetPaths.add(this.ports.normalizeAcceptedPlanTargetScope(target, accepted));
     }
@@ -112,7 +112,7 @@ export class ReviewAssembler {
   staticSyntaxReviewMessages(input: {
     prompt: PromptEnvelope;
     runId: string;
-    accepted: AcceptedImplementationPlanContext;
+    accepted: AcceptedTaskPlanContext;
     packet: StaticSyntaxReviewPacket;
   }): LlmChatRequest['messages'] {
     const { prompt, runId, accepted, packet } = input;
@@ -349,11 +349,11 @@ export class ReviewAssembler {
       [
         'Next proposal requirements:',
         '- If more edits require existing-code facts, request focused evidence first with resourceRequest kind="search" or file/range.',
-        '- Then output a new detailed Agent Protocol v3 actionBundle.',
-        '- actionBundle.actions must use actionId, toolId, args, and description. fs.write uses args.path/sourceBlockId; fs.patch uses args.path/replacementBlockId/patchSpec; fs.delete uses args.path/targetKind/recursive.',
-        '- codeBlocks must use contentLines. Do not output commandBlocks, capability, permissionLabels, accessScopes, resourceScope, or large codeBlocks.content fields.',
+        '- Then output a new detailed Agent Protocol v4 actionBundle.',
+        '- actionBundle.actions must use actionId, toolId, args, and description, following the Kernel catalog and the exact current-task action templates.',
+        '- contentBlocks must use contentLines, and every action must use canonical toolId plus typed args.',
         '- patch must include args.patchSpec.match.kind="exactBlock" and exact text from current ResourcePacket evidence.',
-        '- fs.delete must use a concrete relative args.path. Confirmed directory delete must also set args.targetKind="directory" and args.recursive=true. Do not use codeBlocks/sourceBlockId, empty writes, fs.write as delete, wildcards, or workspace root.',
+        '- Do not infer target type, recursion, permission, risk, or path scope; Kernel authorization and action templates are authoritative.',
         '- The new Plan must wait for user confirmation. Do not assume execution already happened.',
       ].join('\n'),
     ].filter(Boolean).join('\n\n');
@@ -373,11 +373,11 @@ export class ReviewAssembler {
       [
         'Next proposal requirements:',
         '- If more edits require existing-code facts, request focused evidence first with resourceRequest kind="search" or file/range, such as build scripts, entry source files, headers, tests, or container configuration.',
-        '- Then output a new detailed Agent Protocol v3 actionBundle.',
-        '- actionBundle.actions must use actionId, toolId, args, and description. fs.write uses args.path/sourceBlockId; fs.patch uses args.path/replacementBlockId/patchSpec; fs.delete uses args.path/targetKind/recursive.',
-        '- codeBlocks must use contentLines. Do not output commandBlocks, capability, permissionLabels, accessScopes, resourceScope, or large codeBlocks.content fields.',
+        '- Then output a new detailed Agent Protocol v4 actionBundle.',
+        '- actionBundle.actions must use actionId, toolId, args, and description, following the Kernel catalog and the exact current-task action templates.',
+        '- contentBlocks must use contentLines, and every action must use canonical toolId plus typed args.',
         '- patch must include args.patchSpec.match.kind="exactBlock" and exact text from current ResourcePacket evidence.',
-        '- fs.delete must use a concrete relative args.path. Confirmed directory delete must also set args.targetKind="directory" and args.recursive=true. Do not use codeBlocks/sourceBlockId, empty writes, fs.write as delete, wildcards, or workspace root.',
+        '- Do not infer target type, recursion, permission, risk, or path scope; Kernel authorization and action templates are authoritative.',
         '- The new Plan waits for user confirmation. Do not assume execution already happened.',
       ].join('\n'),
     ].filter(Boolean).join('\n\n');

@@ -1,5 +1,6 @@
 import type { ProposalEnvelope } from '../../protocol/types.js';
-import type { AcceptedImplementationPlanContext } from '../../accepted-plan/types.js';
+import type { KernelArtifactEditMatch } from '@deepcode/protocol';
+import type { AcceptedTaskPlanContext } from '../../accepted-plan/types.js';
 import { IntentSlotRegistry, type IntentSlot } from './intentSlot.js';
 
 export interface TaskArtifactDirective {
@@ -11,7 +12,7 @@ export interface TaskArtifactDirective {
 export interface TaskArtifactInput {
   readonly slotId: string;
   readonly contentLines?: readonly string[];
-  readonly matchText?: string;
+  readonly editMatch?: KernelArtifactEditMatch;
   readonly replacementLines?: readonly string[];
   readonly argv?: readonly string[];
   readonly cwd?: string;
@@ -25,24 +26,24 @@ export class OperationIntentCompiler {
     sessionId: string;
     runId: string;
     callId: string;
-    acceptedPlan: AcceptedImplementationPlanContext | undefined;
+    acceptedPlan: AcceptedTaskPlanContext | undefined;
     directive: TaskArtifactDirective;
   }): ProposalEnvelope {
     const slots = this.slots.currentTaskSlots(input.acceptedPlan);
     const currentTaskId = slots[0]?.taskId;
     if (!currentTaskId) throw new Error('Task artifact directive has no active accepted task.');
     const slotIndex = new Map(slots.map((slot) => [slot.slotId, slot]));
-    const codeBlocks: Record<string, unknown>[] = [];
+    const contentBlocks: Record<string, unknown>[] = [];
     const actions: Record<string, unknown>[] = [];
     for (const artifact of input.directive.artifacts) {
       const slot = slotIndex.get(artifact.slotId);
       if (!slot) throw new Error(`Task artifact directive references unknown IntentSlot ${artifact.slotId}.`);
-      this.compileSlot(slot, artifact, codeBlocks, actions);
+      this.compileSlot(slot, artifact, contentBlocks, actions);
     }
     if (!actions.length) throw new Error('Task artifact directive did not compile any current-task operations.');
     return proposal(input, input.directive.narration, {
       userPlan: input.directive.summary,
-      codeBlocks,
+      contentBlocks,
       actionBundle: {
         version: '1',
         id: `${input.callId}-action-bundle`,
@@ -57,30 +58,22 @@ export class OperationIntentCompiler {
   compileDeterministicDelete(input: {
     sessionId: string;
     runId: string;
-    acceptedPlan: AcceptedImplementationPlanContext | undefined;
+    acceptedPlan: AcceptedTaskPlanContext | undefined;
   }): ProposalEnvelope | undefined {
     const slots = this.slots.deterministicDeleteSlots(input.acceptedPlan);
     if (!slots.length) return undefined;
     const callId = `deterministic-${slots[0].taskId}`;
     const actions = slots.map((slot, index) => {
       const actionId = `${callId}-${index + 1}`;
-      const recursive = slot.targetResourceKind === 'directory' || slot.recursive === true;
       return {
-        ...fileActionContract(actionId, 'fs.delete', slot.targetRef),
-        targetKind: slot.targetResourceKind ?? 'file',
-        targetResourceKind: slot.targetResourceKind ?? 'file',
-        recursive,
-        args: {
-          path: slot.targetRef,
-          targetKind: slot.targetResourceKind ?? 'file',
-          recursive,
-        },
+        ...fileActionContract(actionId, 'fs.delete'),
+        args: deleteArgs(slot),
         description: `Apply the confirmed delete operation for IntentSlot ${slot.slotId}.`,
       };
     });
     return proposal({ ...input, callId }, undefined, {
       userPlan: 'Apply the exact delete operations already confirmed for the current task.',
-      codeBlocks: [],
+      contentBlocks: [],
       actionBundle: {
         version: '1',
         id: `${callId}-action-bundle`,
@@ -95,7 +88,7 @@ export class OperationIntentCompiler {
   private compileSlot(
     slot: IntentSlot,
     artifact: TaskArtifactInput,
-    codeBlocks: Record<string, unknown>[],
+    contentBlocks: Record<string, unknown>[],
     actions: Record<string, unknown>[]
   ): void {
     const actionId = `action-${slot.slotId}`;
@@ -103,58 +96,48 @@ export class OperationIntentCompiler {
       const contentLines = cleanLines(artifact.contentLines);
       if (!contentLines) throw new Error(`IntentSlot ${slot.slotId} requires full artifact content.`);
       const blockId = `block-${slot.slotId}`;
-      codeBlocks.push({
+      contentBlocks.push({
         blockId,
         targetPath: slot.targetRef,
         operation: slot.operation === 'createFile' ? 'create' : 'overwrite',
-        content: contentLines.join('\n'),
         contentLines,
       });
+      const toolId = slot.operation === 'createFile' ? 'fs.create' : 'fs.write';
       actions.push({
-        ...fileActionContract(actionId, 'fs.write', slot.targetRef),
-        sourceBlockId: blockId,
-        args: { path: slot.targetRef, sourceBlockId: blockId },
+        ...fileActionContract(actionId, toolId),
+        args: { ...slot.fixedArgs, path: slot.targetRef, contentBlockId: blockId },
         description: `Apply generated content for IntentSlot ${slot.slotId}.`,
       });
       return;
     }
     if (slot.operation === 'patchFile') {
       const replacementLines = cleanLines(artifact.replacementLines);
-      const matchText = stringValue(artifact.matchText);
-      if (!replacementLines || !matchText) throw new Error(`IntentSlot ${slot.slotId} requires exact match text and replacement content.`);
+      if (!replacementLines || !artifact.editMatch) {
+        throw new Error(`IntentSlot ${slot.slotId} requires editMatch and replacement content.`);
+      }
       const blockId = `block-${slot.slotId}`;
-      codeBlocks.push({
+      contentBlocks.push({
         blockId,
         targetPath: slot.targetRef,
         operation: 'replaceBlock',
-        content: replacementLines.join('\n'),
         contentLines: replacementLines,
       });
       actions.push({
-        ...fileActionContract(actionId, 'fs.patch', slot.targetRef),
-        replacementBlockId: blockId,
-        patchSpec: { match: { kind: 'exactBlock', text: matchText } },
+        ...fileActionContract(actionId, 'fs.edit'),
         args: {
+          ...slot.fixedArgs,
           path: slot.targetRef,
           replacementBlockId: blockId,
-          patchSpec: { match: { kind: 'exactBlock', text: matchText } },
+          patchSpec: { match: editMatchToKernel(artifact.editMatch) },
         },
         description: `Apply the exact patch for IntentSlot ${slot.slotId}.`,
       });
       return;
     }
     if (slot.operation === 'deletePath') {
-      const recursive = slot.targetResourceKind === 'directory' || slot.recursive === true;
       actions.push({
-        ...fileActionContract(actionId, 'fs.delete', slot.targetRef),
-        targetKind: slot.targetResourceKind ?? 'file',
-        targetResourceKind: slot.targetResourceKind ?? 'file',
-        recursive,
-        args: {
-          path: slot.targetRef,
-          targetKind: slot.targetResourceKind ?? 'file',
-          recursive,
-        },
+        ...fileActionContract(actionId, 'fs.delete'),
+        args: deleteArgs(slot),
         description: `Apply the confirmed delete for IntentSlot ${slot.slotId}.`,
       });
       return;
@@ -163,25 +146,57 @@ export class OperationIntentCompiler {
       const argv = cleanLines(artifact.argv);
       if (!argv) throw new Error(`IntentSlot ${slot.slotId} requires argv.`);
       actions.push({
-        id: actionId,
-        title: `Run process for ${slot.slotId}`,
         actionId,
         toolId: 'process.exec',
-        capability: 'process.exec',
-        resourceScope: [],
-        canParallelize: false,
-        conflictKeys: [`process:${slot.slotId}`],
         args: {
           argv,
           cwd: stringValue(artifact.cwd) ?? '.',
           timeoutMs: positiveInteger(artifact.timeoutMs) ?? 120000,
         },
         description: `Run the confirmed process for IntentSlot ${slot.slotId}.`,
+        dependsOn: [],
       });
       return;
     }
     throw new Error(`IntentSlot ${slot.slotId} operation ${slot.operation} is not artifact-compilable.`);
   }
+}
+
+function deleteArgs(slot: IntentSlot): Record<string, unknown> {
+  if (!slot.targetResourceKind) {
+    throw new Error(
+      `accepted_plan_authorization_contract_incompatible: delete IntentSlot ${slot.slotId} has no Kernel target kind.`
+    );
+  }
+  return {
+    ...slot.fixedArgs,
+    path: slot.targetRef,
+    targetKind: slot.targetResourceKind,
+    recursive: slot.recursive === true,
+  };
+}
+
+function editMatchToKernel(editMatch: KernelArtifactEditMatch): Record<string, unknown> {
+  if (editMatch.kind === 'exactBlock') {
+    return { kind: editMatch.kind, text: editMatch.targetLines.join('\n') };
+  }
+  if (editMatch.kind === 'contextBlock') {
+    return {
+      kind: editMatch.kind,
+      before: editMatch.beforeLines.length ? `${editMatch.beforeLines.join('\n')}\n` : '',
+      target: editMatch.targetLines.join('\n'),
+      after: editMatch.afterLines.length ? `\n${editMatch.afterLines.join('\n')}` : '',
+    };
+  }
+  return {
+    kind: editMatch.kind,
+    startLine: editMatch.startLine,
+    endLine: editMatch.endLine,
+    ...(editMatch.expectedFileHash ? { expectedFileHash: editMatch.expectedFileHash } : {}),
+    ...(editMatch.expectedBeforeText || editMatch.expectedBeforeLines
+      ? { expectedBeforeBlock: editMatch.expectedBeforeText ?? editMatch.expectedBeforeLines?.join('\n') }
+      : {}),
+  };
 }
 
 function proposal(
@@ -190,7 +205,7 @@ function proposal(
   payload: unknown
 ): ProposalEnvelope {
   return {
-    schemaVersion: 'deepcode.agent.protocol.v3',
+    schemaVersion: 'deepcode.agent.protocol.v4',
     proposalId: `proposal-${input.callId}`,
     runId: input.runId,
     sessionId: input.sessionId,
@@ -216,24 +231,10 @@ function positiveInteger(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isInteger(value) && value > 0 ? value : undefined;
 }
 
-function fileActionContract(actionId: string, capability: string, targetPath: string): Record<string, unknown> {
+function fileActionContract(actionId: string, toolId: string): Record<string, unknown> {
   return {
-    id: actionId,
-    title: `${capability} ${targetPath}`,
     actionId,
-    toolId: capability,
-    capability,
-    targetRef: {
-      kind: isAbsolutePath(targetPath) ? 'absolutePath' : 'workspaceRelative',
-      path: targetPath,
-    },
-    targetPath,
-    resourceScope: [targetPath],
-    canParallelize: false,
-    conflictKeys: [`path:${targetPath}`],
+    toolId,
+    dependsOn: [],
   };
-}
-
-function isAbsolutePath(value: string): boolean {
-  return value.startsWith('/') || /^[a-zA-Z]:[\\/]/.test(value);
 }

@@ -6,7 +6,6 @@ import type {
 
 export interface KernelEventProjectionBuilderPorts {
   requiredFileOperationsFromReport(report: Record<string, unknown> | undefined): unknown[];
-  requiredAccessScopesFromReport(report: Record<string, unknown> | undefined): unknown[];
   permissionBundlesFromReport(report: Record<string, unknown> | undefined): unknown[];
   gateInterventionsFromReport(report: Record<string, unknown> | undefined): unknown[];
   planReviewFacts(report: Record<string, unknown> | undefined): string[];
@@ -34,10 +33,16 @@ export class KernelEventProjectionBuilder {
     if (kind === 'proposal.reviewed') {
       const report = objectRecord(record.report) ?? {};
       const status = typeof report.status === 'string' ? report.status : 'awaitingUserApproval';
-      const planId = typeof report.planId === 'string' ? report.planId : 'agent-plan';
-      const summary = typeof report.kernelGeneratedPermissionSummary === 'string' && report.kernelGeneratedPermissionSummary.trim()
-        ? report.kernelGeneratedPermissionSummary
-        : 'Kernel PlanReview 已完成，请确认是否同意计划。';
+      const contract = objectRecord(report.executionContract) ?? {};
+      const interventions = Array.isArray(contract.interventions) ? contract.interventions : [];
+      const firstIntervention = objectRecord(interventions[0]);
+      const diagnostics = Array.isArray(report.diagnostics)
+        ? report.diagnostics.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+        : [];
+      const planId = stringValue(report.proposalId) ?? stringValue(contract.proposalId) ?? 'agent-plan';
+      const summary = stringValue(firstIntervention?.summary)
+        ?? diagnostics[0]
+        ?? `Kernel execution contract status=${status}.`;
       return {
         id,
         sessionId,
@@ -52,12 +57,10 @@ export class KernelEventProjectionBuilder {
           confirmable: false,
           auditOnly: true,
           requiredPermissions: Array.isArray(report.requiredPermissions) ? report.requiredPermissions : [],
-          permissionGaps: Array.isArray(report.permissionGaps) ? report.permissionGaps : [],
           requiredFileOperations: this.ports.requiredFileOperationsFromReport(report),
-          requiredAccessScopes: this.ports.requiredAccessScopesFromReport(report),
           permissionBundles: this.ports.permissionBundlesFromReport(report),
           interventions: this.ports.gateInterventionsFromReport(report),
-          executionContract: objectRecord(report.executionContract) ?? undefined,
+          executionContract: contract,
           facts: this.ports.planReviewFacts(report),
           channel: 'trace',
           visibility: 'debug',
@@ -501,12 +504,12 @@ function normalizeOperation(value: string | undefined): string | undefined {
   const normalized = value.trim();
   const operations: Record<string, string> = {
     'fs.write': 'write',
-    'fs.patch': 'patch',
+    'fs.edit': 'patch',
     'fs.delete': 'delete',
     'fs.read': 'read',
     'fs.list': 'list',
     'fs.diff': 'diff',
-    'code.search': 'search',
+    'code.grep': 'search',
     'process.exec': 'exec',
     write: 'write',
     create: 'create',

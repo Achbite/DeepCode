@@ -32,9 +32,9 @@ export class ImplementationBatchContextBuilder {
       const continuations = this.concreteContinuationExpectations(actionBundle?.continuationExpectations);
       for (const continuation of continuations) {
         const record = objectRecord(continuation);
-        const title = typeof record?.title === 'string' ? record.title.trim() : '';
-        const scope = Array.isArray(record?.resourceScope)
-          ? record.resourceScope.filter((item): item is string => typeof item === 'string' && item.trim().length > 0).join(', ')
+        const title = typeof record?.description === 'string' ? record.description.trim() : '';
+        const scope = Array.isArray(record?.target)
+          ? record.target.filter((item): item is string => typeof item === 'string' && item.trim().length > 0).join(', ')
           : '';
         const text = [title, scope ? `scope=${scope}` : ''].filter(Boolean).join(' ');
         if (text) continuationSummaries.push(clip(text, 240));
@@ -55,10 +55,7 @@ export class ImplementationBatchContextBuilder {
   private continuationHasConcreteScope(item: unknown): boolean {
     const record = objectRecord(item);
     if (!record) return false;
-    const scopes = [
-      ...stringArrayValue(record.targetPath),
-      ...stringArrayValue(record.resourceScope),
-    ];
+    const scopes = stringArrayValue(record.target);
     return scopes.some((scope) => Boolean(this.ports.concreteFileOperationTarget(scope)));
   }
 }

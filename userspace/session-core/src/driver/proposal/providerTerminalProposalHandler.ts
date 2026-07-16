@@ -3,6 +3,10 @@ import type { ProposalEnvelope } from '../../protocol/types.js';
 
 export interface ProviderTerminalProposalState {
   sessionId: string;
+  runId: string;
+  phase: string;
+  acceptedTaskPlan?: { planId: string };
+  currentTaskContext?: { taskId?: string };
 }
 
 export interface ProviderTerminalProposalHandlerPorts<Input, State extends ProviderTerminalProposalState> {
@@ -12,6 +16,16 @@ export interface ProviderTerminalProposalHandlerPorts<Input, State extends Provi
   reviseAnswer(input: Input, state: State, proposal: ProposalEnvelope): Promise<AgentSessionResult | null>;
   answerEvent(sessionId: string, proposal: ProposalEnvelope, ts: string, id: string): AgentEvent;
   finalDiagnosticEvent(sessionId: string, summary: string, ts: string, id: string): AgentEvent;
+  acceptedTaskDiagnosticFailureEvents(input: {
+    sessionId: string;
+    runId: string;
+    planId: string;
+    taskId: string;
+    severity: string;
+    message: string;
+    ts: string;
+    id: string;
+  }): AgentEvent[];
 }
 
 export class ProviderTerminalProposalHandler<Input, State extends ProviderTerminalProposalState> {
@@ -31,6 +45,22 @@ export class ProviderTerminalProposalHandler<Input, State extends ProviderTermin
   }
 
   handleDiagnostic(state: State, proposal: ProposalEnvelope): Promise<AgentSessionResult> {
+    const taskId = state.currentTaskContext?.taskId;
+    const planId = state.acceptedTaskPlan?.planId;
+    if (taskId && planId) {
+      state.phase = 'failed';
+      const payload = objectRecord(proposal.payload) ?? {};
+      return this.ports.append(state.sessionId, this.ports.acceptedTaskDiagnosticFailureEvents({
+        sessionId: state.sessionId,
+        runId: state.runId,
+        planId,
+        taskId,
+        severity: stringValue(payload.severity) ?? 'error',
+        message: diagnosticSummary(proposal),
+        ts: this.ports.now(),
+        id: this.ports.createId('accepted-task-diagnostic-failed'),
+      }));
+    }
     return this.ports.append(state.sessionId, [
       this.ports.finalDiagnosticEvent(
         state.sessionId,

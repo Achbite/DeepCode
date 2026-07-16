@@ -5,7 +5,6 @@ import type {
   ToolCall,
   ToolDefinition,
 } from '@deepcode/protocol';
-import { listDefaultAgentTools } from '@deepcode/protocol';
 import { stableHash } from '../cache/canonicalizer.js';
 import type {
   ConversationResourceRoot,
@@ -34,7 +33,6 @@ export interface NativeToolReadLedgerEntry {
 
 interface NativeToolStateContract {
   allowedProposals?: string[];
-  capabilityProjection?: string[];
   toolCatalogSnapshot?: KernelToolCatalogSnapshot;
 }
 
@@ -127,26 +125,49 @@ export class NativeToolCoordinator {
     };
   }
 
-  capabilityCatalogSummary(state: NativeToolCoordinatorState): string {
+  toolCatalogSummary(state: NativeToolCoordinatorState): string {
     const snapshot = this.toolCatalogSnapshot(state);
     if (snapshot?.tools?.length) {
       const lines = snapshot.tools
+        .filter((tool) => tool.providerVisible !== false || tool.executionMode !== 'execute')
         .slice()
         .sort((left, right) => left.toolId.localeCompare(right.toolId))
         .map((tool) => {
           const kind = tool.operationKind ? ` kind=${tool.operationKind}` : '';
-          return `- ${tool.toolId}: capability=${tool.capability}${kind} risk=${tool.risk} permission=${tool.permissionMode} pathScope=${tool.pathScopePolicy}`;
+          const executionSummary = tool.executionMode === 'execute'
+            ? 'executable after Kernel admission and gate evaluation'
+            : 'not executable in this catalog version';
+          const providerCallable = tool.providerVisible !== false && tool.executionMode === 'execute';
+          return [
+            `- toolId=${tool.toolId}${kind}`,
+            `executionMode=${tool.executionMode} (${executionSummary})`,
+            `providerCallable=${providerCallable}`,
+            `permissionMode=${tool.permissionMode}`,
+            `risk=${tool.risk}`,
+            `pathScope=${tool.pathScopePolicy}`,
+            `targetExistence=${tool.usageConstraints.targetExistence}`,
+            `targetKinds=${tool.usageConstraints.targetKinds?.join(',') || 'any'}`,
+            `contentMode=${tool.usageConstraints.contentMode}`,
+            `planningArgsSchema=${JSON.stringify(tool.planningSchema ?? {})}`,
+            tool.usageConstraints.directoryRecursiveRequired ? 'directoryRecursiveRequired=true' : '',
+            tool.permissionSummary ? `permissionSummary=${oneLine(tool.permissionSummary)}` : '',
+            tool.hardDenyRules?.length ? `hardDenyRules=${tool.hardDenyRules.map(oneLine).join(' | ')}` : '',
+          ].filter(Boolean).join('; ');
         });
       return [
         `KernelToolCatalog ${snapshot.catalogVersion} hash=${snapshot.catalogHash}`,
         ...lines,
-        'Use Kernel capabilities in actionBundle. Executor tool names are runtime facts, not permission grants.',
+        'Planning rule: use only toolIds listed above. Never infer aliases or availability from memory.',
+        'Every taskPlan task must include args. Use {} when planningArgsSchema has no properties.',
+        'providerCallable=false or executionMode=blocked/previewOnly means the tool is known but unavailable for executable actions.',
+        'Kernel derives capability, risk, permission, resource sets, and execution facts from the selected tool contract and typed args.',
       ].join('\n');
     }
-    const capabilities = state.stateContract?.capabilityProjection
-      ?? state.driverRequest?.stateContract?.capabilityProjection
-      ?? [];
-    return capabilities.join('\n');
+    return [
+      'KernelToolCatalog unavailable.',
+      'Do not invent toolIds or infer tools from capability names, memory, examples, or prior sessions.',
+      'Use the registered Session diagnostic directive to report that planning cannot safely continue.',
+    ].join('\n');
   }
 
   providerTools(state: NativeToolCoordinatorState): ToolDefinition[] {
@@ -291,7 +312,7 @@ export class NativeToolCoordinator {
   private catalogProviderTools(state: NativeToolCoordinatorState, names: Set<string>): ToolDefinition[] {
     const snapshot = this.toolCatalogSnapshot(state);
     if (!snapshot?.tools?.length) {
-      return listDefaultAgentTools('askBeforeWrite').filter((tool) => names.has(tool.name));
+      return [];
     }
     return snapshot.tools
       .filter((tool) => names.has(tool.toolId))
@@ -321,6 +342,10 @@ export class NativeToolCoordinator {
       catalogHash: snapshot.catalogHash,
     };
   }
+}
+
+function oneLine(value: string): string {
+  return value.replace(/\s+/g, ' ').trim();
 }
 
 function stringValue(value: unknown): string | undefined {

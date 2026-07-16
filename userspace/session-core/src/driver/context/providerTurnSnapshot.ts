@@ -4,7 +4,6 @@ import type {
   ContextAssemblyDynamicAppendLogEntry,
   ContextAssemblyTaskLocalFoldPlan,
   ContextAssemblyResourceBlockRecord,
-  ContextAssemblySegmentRecord,
 } from '../../context/index.js';
 import type {
   DriverProviderTurnFrame,
@@ -16,6 +15,7 @@ import type {
   ProviderTurnSnapshotResourceBlock,
   ProviderTurnSnapshotSegment,
 } from '../runFrame.js';
+import type { PromptSegment } from '../../prompt/types.js';
 import { buildProviderTurnContractPayload, renderProviderTurnUserPrompt } from './providerTurnPromptRenderer.js';
 
 export function buildProviderTurnSnapshot(contract: DriverProviderTurnFrame): ProviderTurnSnapshot {
@@ -54,7 +54,7 @@ export function buildProviderTurnSnapshot(contract: DriverProviderTurnFrame): Pr
     systemHash: stableHash(systemContent),
     toolSchemaHash: profile.toolSchemaHash,
     responseFormatHash: profile.responseFormatHash,
-    messageShapeHash: stableHash('system,user'),
+    messageShapeHash: stableHash(providerMessageShape(contract)),
     stablePrefixHash,
     dynamicSuffixHash,
     stablePrefixCharLength: contract.prompt.stablePrefix.length,
@@ -75,8 +75,8 @@ export function buildProviderTurnSnapshot(contract: DriverProviderTurnFrame): Pr
     currentTaskEvidenceFullTextCount,
     currentTaskEvidenceTargets,
     currentTaskEvidenceMatchedRefs,
-    segmentOrder: contextAssembly?.segmentOrder ? [...contextAssembly.segmentOrder] : [],
-    segments: contextAssembly?.segments.map(snapshotSegment) ?? [],
+    segmentOrder: contract.prompt.segments.map((segment) => segment.id),
+    segments: contract.prompt.segments.map(snapshotPromptSegment),
     dynamicAppendLog: contextAssembly?.dynamicAppendLog.map(snapshotDynamicAppendLogEntry) ?? [],
     dynamicAppendLogHash: contextAssembly?.dynamicAppendLogHash,
     dynamicAppendLogCharLength: contextAssembly?.dynamicAppendLogCharLength ?? 0,
@@ -95,8 +95,31 @@ export function buildProviderTurnSnapshot(contract: DriverProviderTurnFrame): Pr
     frames,
     resourceBlocks: contextAssembly?.resourceBlocks.map(snapshotResourceBlock) ?? [],
     resourceRetentionCounts: { ...(contextAssembly?.resourceRetentionCounts ?? {}) },
-    cacheClasses: cacheClasses(contextAssembly?.segments ?? []),
+    cacheClasses: cacheClasses(contract.prompt.segments),
   };
+}
+
+function providerMessageShape(contract: DriverProviderTurnFrame): string {
+  const messages = contract.providerMessages?.length
+    ? contract.providerMessages
+    : [
+        { role: 'system' as const, content: contract.prompt.stablePrefix },
+        { role: 'user' as const, content: contract.prompt.dynamicSuffix },
+      ];
+  const toolNamesByCallId = new Map<string, string>();
+  return JSON.stringify(messages.map((message) => {
+    const toolCalls = (message.toolCalls ?? []).map((call) => {
+      toolNamesByCallId.set(call.id, call.name);
+      return call.name;
+    });
+    return {
+      role: message.role,
+      semanticTools: toolCalls,
+      toolResultFor: message.toolCallId
+        ? toolNamesByCallId.get(message.toolCallId) ?? 'unknownSemanticTool'
+        : undefined,
+    };
+  }));
 }
 
 function snapshotTaskLocalFoldPlan(
@@ -125,15 +148,15 @@ function snapshotTaskLocalFoldPlan(
   };
 }
 
-function snapshotSegment(segment: ContextAssemblySegmentRecord): ProviderTurnSnapshotSegment {
+function snapshotPromptSegment(segment: PromptSegment): ProviderTurnSnapshotSegment {
   return {
     id: segment.id,
     name: segment.name,
     cacheClass: segment.cacheClass,
-    stablePrefix: segment.stablePrefix,
+    stablePrefix: segment.stable,
     auditOnly: segment.auditOnly,
-    contentHash: segment.contentHash,
-    charLength: segment.charLength,
+    contentHash: stableHash(segment.content),
+    charLength: segment.content.length,
   };
 }
 
@@ -247,7 +270,7 @@ function snapshotResourceBlock(block: ContextAssemblyResourceBlockRecord, index:
   };
 }
 
-function cacheClasses(segments: readonly ContextAssemblySegmentRecord[]): Record<string, number> {
+function cacheClasses(segments: readonly PromptSegment[]): Record<string, number> {
   return segments.reduce<Record<string, number>>((counts, segment) => {
     counts[segment.cacheClass] = (counts[segment.cacheClass] ?? 0) + 1;
     return counts;

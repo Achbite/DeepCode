@@ -1,13 +1,13 @@
 import type { AgentConversationActivity } from '@deepcode/protocol';
 import type { ActionBundleDraft, ProposalEnvelope } from '../../protocol/types.js';
-import type { AcceptedImplementationPlanContext } from '../execution/index.js';
+import type { AcceptedTaskPlanContext } from '../execution/index.js';
 
 export type DriverActivityLanguage = 'zh-CN' | 'en-US';
 
 export interface DriverActivityBuilderPorts {
   providerStageSummary(stage: string, part: 'request' | 'response', language: DriverActivityLanguage): string;
   visibleLanguageForRequest(userRequest: string): DriverActivityLanguage;
-  actionFileTargetPath(action: { targetRef?: unknown; targetPath?: unknown; resourceScope?: unknown; args?: unknown }): string | undefined;
+  actionFileTargetPath(action: { args?: unknown }): string | undefined;
 }
 
 export class DriverActivityBuilder {
@@ -44,7 +44,7 @@ export class DriverActivityBuilder {
   }
 
   acceptedPlanBatchActivity(input: {
-    accepted: AcceptedImplementationPlanContext;
+    accepted: AcceptedTaskPlanContext;
     batch: unknown;
     status: 'running' | 'completed';
   }): AgentConversationActivity {
@@ -59,7 +59,7 @@ export class DriverActivityBuilder {
       runId: input.accepted.runId,
       planId: input.accepted.planId,
       targets: actions.flatMap((action) => this.actionTargetCandidates(action)),
-      actionIds: actions.flatMap((action) => stringValue(action.actionId) ?? stringValue(action.id) ?? []),
+      actionIds: actions.flatMap((action) => stringValue(action.actionId) ?? []),
       itemCount: actions.length,
     });
   }
@@ -73,11 +73,7 @@ export class DriverActivityBuilder {
   batchActionRecords(batch: unknown): Record<string, unknown>[] {
     const record = objectRecord(batch);
     const nested = objectRecord(record?.actionBundle);
-    const actions = Array.isArray(record?.actions)
-      ? record.actions
-      : Array.isArray(nested?.actions)
-        ? nested.actions
-        : [];
+    const actions = Array.isArray(nested?.actions) ? nested.actions : [];
     return actions.flatMap((item) => objectRecord(item) ? [objectRecord(item) as Record<string, unknown>] : []);
   }
 
@@ -96,16 +92,13 @@ export class DriverActivityBuilder {
     return {
       planId: stringValue(actionBundle.id) ?? proposal.proposalId,
       actionBundle,
-      codeBlocks: Array.isArray(payload.codeBlocks) ? payload.codeBlocks : [],
-      commandBlocks: Array.isArray(payload.commandBlocks) ? payload.commandBlocks : [],
+      contentBlocks: Array.isArray(payload.contentBlocks) ? payload.contentBlocks : [],
     };
   }
 
   private actionTargetCandidates(action: Record<string, unknown>): string[] {
     return uniqueStrings([
       this.ports.actionFileTargetPath(action),
-      stringValue(action.targetPath),
-      ...stringArrayValue(action.resourceScope),
     ]);
   }
 }

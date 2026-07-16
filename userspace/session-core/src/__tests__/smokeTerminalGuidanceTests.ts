@@ -89,7 +89,14 @@ export async function assertSessionDriverLoopTerminalAnswerGuidanceRevision(): P
   );
   assertEqual(llmCalls, 2, 'terminal queued guidance triggers one guidance revision provider call');
   assertEqual(finalMessages.length, 1, 'draft answer is replaced by a single final answer');
-  assert(String((finalMessages[0]?.payload as any)?.content ?? '').includes('evaluation dashboard'), 'final answer applies queued guidance');
+  const finalContent = String((finalMessages[0]?.payload as any)?.content ?? '');
+  const guidanceDiagnostics = result.events
+    .filter((event) => event.kind === 'error')
+    .map((event) => String((event.payload as any)?.message ?? (event.payload as any)?.content ?? ''));
+  assert(
+    finalContent.includes('evaluation dashboard'),
+    `final answer applies queued guidance; final=${JSON.stringify(finalContent)} diagnostics=${JSON.stringify(guidanceDiagnostics)}`
+  );
   assertEqual(Boolean((finalMessages[0]?.payload as any)?.guidanceRevision), true, 'final answer records guidance revision metadata');
   assertEqual(
     Array.isArray((finalMessages[0]?.payload as any)?.appliedGuidanceIds) &&
@@ -185,7 +192,7 @@ export async function assertSessionDriverLoopTerminalGuidanceRevisionFallback():
   const finalMessages = result.events.filter((event) =>
     event.kind === 'assistant_msg' && (event.payload as any)?.channel === 'final'
   );
-  assertEqual(llmCalls, 2, 'terminal guidance fallback attempts one revision call');
+  assertEqual(llmCalls, 3, 'terminal guidance fallback attempts one revision call and one bounded semantic repair');
   assertEqual(finalMessages.length, 1, 'fallback path still produces one final answer');
   assertEqual(String((finalMessages[0]?.payload as any)?.content ?? ''), 'Initial fallback answer.', 'fallback final answer uses initial draft');
   assertEqual(Boolean((finalMessages[0]?.payload as any)?.guidanceRevisionFailed), true, 'fallback final answer records guidance revision failure');

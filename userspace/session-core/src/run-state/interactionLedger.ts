@@ -1,4 +1,5 @@
 import type { AgentEvent, PermissionRequest } from '@deepcode/protocol';
+import { planInteractionAwaitsDecision } from './planInteractionState.js';
 
 export type InteractionLedgerOptionEffect =
   | { kind: 'continueWithAction' }
@@ -117,9 +118,7 @@ function findLatestActivePlan(
     if (!payload) continue;
     const runId = stringField(payload, 'runId');
     const planId = stringField(payload, 'planId');
-    const waiting = event.kind === 'plan_card'
-      ? planCardAwaitingDecision(payload)
-      : planReviewAwaitingDecision(payload);
+    const waiting = planInteractionAwaitsDecision(payload);
     const planKey = planDecisionKey(runId, planId);
     if (
       !waiting ||
@@ -341,25 +340,6 @@ function optionEffect(value: unknown): InteractionLedgerOptionEffect | undefined
     default:
       return undefined;
   }
-}
-
-function planCardAwaitingDecision(payload: Record<string, unknown>): boolean {
-  if (payload.confirmable === false) return false;
-  const status = stringField(payload, 'status');
-  if (!status) return true;
-  return planReviewStatusAwaitingUser(status);
-}
-
-function planReviewAwaitingDecision(payload: Record<string, unknown>): boolean {
-  if (payload.confirmable === false) return false;
-  return planReviewStatusAwaitingUser(stringField(payload, 'status'));
-}
-
-function planReviewStatusAwaitingUser(status?: string): boolean {
-  return status === undefined ||
-    status === 'awaitingUserApproval' ||
-    status === 'awaitingTemporaryGrant' ||
-    status === 'pending';
 }
 
 function isTerminalStatus(status?: string): boolean {

@@ -1,7 +1,7 @@
 import type { AgentEvent } from '@deepcode/protocol';
 import type {
-  AcceptedImplementationPlanContext,
-  AcceptedImplementationPlanExecutionRoot,
+  AcceptedTaskPlanContext,
+  AcceptedTaskPlanExecutionRoot,
 } from '../execution/index.js';
 import type { AcceptedPlanExecutionRootDecisionInput } from '../../accepted-plan/AcceptedPlanExecutionRootResolver.js';
 import type { InteractionOverlayContext } from '../pipelines/interactionOverlayCodec.js';
@@ -18,7 +18,7 @@ export interface DriverInteractionIndexDecisionInput extends AcceptedPlanExecuti
 
 export interface DriverInteractionRecoveredAcceptedPlanContext {
   plan: PlanContext;
-  acceptedPlan: AcceptedImplementationPlanContext;
+  acceptedPlan: AcceptedTaskPlanContext;
 }
 
 export interface DriverInteractionIndexPorts {
@@ -29,20 +29,20 @@ export interface DriverInteractionIndexPorts {
   executionRootFromDecision(
     input: DriverInteractionIndexDecisionInput,
     events: AgentEvent[]
-  ): AcceptedImplementationPlanExecutionRoot | undefined;
+  ): AcceptedTaskPlanExecutionRoot | undefined;
   buildAcceptedPlan(input: {
     plan: PlanContext;
     interventionLevel?: 'low' | 'medium' | 'high';
-    executionRoot?: AcceptedImplementationPlanExecutionRoot;
-  }): AcceptedImplementationPlanContext;
+    executionRoot?: AcceptedTaskPlanExecutionRoot;
+  }): AcceptedTaskPlanContext;
   recoverLatestCheckpoint(input: {
-    acceptedPlan: AcceptedImplementationPlanContext;
+    acceptedPlan: AcceptedTaskPlanContext;
     events: AgentEvent[];
-  }): { nextAcceptedPlan: AcceptedImplementationPlanContext };
+  }): { nextAcceptedPlan: AcceptedTaskPlanContext };
   recordTaskCompletion(input: {
-    acceptedPlan: AcceptedImplementationPlanContext;
+    acceptedPlan: AcceptedTaskPlanContext;
     completedTaskIds: string[];
-  }): { nextAcceptedPlan: AcceptedImplementationPlanContext };
+  }): { nextAcceptedPlan: AcceptedTaskPlanContext };
 }
 
 export class DriverInteractionIndex {
@@ -63,7 +63,7 @@ export class DriverInteractionIndex {
     if (!planId) return undefined;
     const plan = (overlay.acceptedPlanRunId ? this.ports.findPlanCard(events, overlay.acceptedPlanRunId, planId) : undefined)
       ?? this.ports.findPlanCard(events, undefined, planId);
-    if (!plan?.implementationPlan) return undefined;
+    if (!plan?.taskPlan) return undefined;
     const executionRoot = plan.executionRoot ?? this.ports.executionRootFromDecision(input, events);
     let acceptedPlan = this.ports.recoverLatestCheckpoint({
       acceptedPlan: this.ports.buildAcceptedPlan({ plan, interventionLevel: input.interventionLevel, executionRoot }),

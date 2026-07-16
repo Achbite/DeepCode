@@ -8,6 +8,7 @@ import type {
   ProjectionDelta,
 } from '@deepcode/protocol';
 import type { ContextAssemblyRecord, PromptCachePlan } from '../../context/index.js';
+import type { UserAuthorityFrame } from '../context/userAuthorityFrame.js';
 import type { DriverProviderTurnFrame } from '../runFrame.js';
 import type { ProviderTraceRecorderPorts } from './providerTraceRecorder.js';
 import type { ProviderJsonModeCoordinator } from './providerJsonModeCoordinator.js';
@@ -17,12 +18,21 @@ import type { ProviderTraceRecorder } from './providerTraceRecorder.js';
 import type { HookInput, HookResult } from '../hooks/index.js';
 import { buildProviderTurnSnapshot } from '../context/providerTurnSnapshot.js';
 import { ProviderToolCallBuffer, stripProviderPartFrames, type NativeToolCallProposal } from '../../provider/providerStreamParts.js';
+import {
+  promptLedgerEpoch,
+  promptLedgerWireRequest,
+  type PromptLedgerState,
+  type PromptLedgerWireRecord,
+  type ProviderRequestCacheHistoryEntry,
+} from '../../prompt/promptLedger.js';
 
 export interface ProviderTurnRunnerState extends ProviderStreamRuntimeState {
   cachePlan?: PromptCachePlan;
   contextAssembly?: ContextAssemblyRecord;
   providerTurnFrame?: DriverProviderTurnFrame;
-  providerRequestCacheHistory?: Record<string, { requestText: string; segmentIds: string[] }>;
+  providerRequestCacheHistory?: Record<string, ProviderRequestCacheHistoryEntry>;
+  promptLedger?: PromptLedgerState;
+  userAuthorityFrame?: UserAuthorityFrame;
 }
 
 export interface ProviderTurnResult {
@@ -39,6 +49,8 @@ export interface ProviderTurnRunnerPorts extends ProviderTraceRecorderPorts {
     onEvent: (event: LlmChatStreamEvent) => void | Promise<void>
   ) => Promise<ApiResponse<LlmChatResult>>;
   appendEvents(sessionId: string, events: AgentEvent[]): Promise<unknown>;
+  appendWireLedger?: (sessionId: string, entries: PromptLedgerWireRecord[]) => Promise<void>;
+  appendCacheTelemetry?: (sessionId: string, entry: Record<string, unknown>) => Promise<void>;
 }
 
 export interface ProviderTurnRunnerDependencies<TState extends ProviderTurnRunnerState> {
@@ -67,6 +79,8 @@ export interface ProviderTurnRunnerDependencies<TState extends ProviderTurnRunne
     finalUserPromptHash?: string;
     finalUserPromptCharLength?: number;
     cacheHash?: string;
+    promptLedgerEpochScopeKey?: string;
+    promptLedgerTaskTemplateHash?: string;
     ts: string;
     id: string;
   }): AgentEvent | null | undefined;
@@ -133,6 +147,29 @@ export class ProviderTurnRunner<TState extends ProviderTurnRunnerState> {
         },
       },
     };
+    const providerRequestId = this.dependencies.createId(`provider-request-${stage}`);
+    if (state.promptLedger && state.providerTurnFrame?.promptLedgerEpochId) {
+      const epoch = promptLedgerEpoch(state.promptLedger, state.providerTurnFrame.promptLedgerEpochId);
+      if (epoch) {
+        await ports.appendWireLedger?.(state.sessionId, [promptLedgerWireRequest({
+          recordId: providerRequestId,
+          sessionId: state.sessionId,
+          runId: state.runId,
+          profileId: input.profileId ?? epoch.profileId,
+          semanticProfileId: state.providerTurnFrame.snapshot?.semanticProfileId,
+          epoch,
+          messages: jsonModeMessages,
+          timestamp: this.dependencies.now(),
+          schemaHash: state.providerTurnFrame.snapshot?.toolSchemaHash,
+          responseFormatHash: state.providerTurnFrame.snapshot?.responseFormatHash,
+          turnAuthority: state.userAuthorityFrame?.turnAuthority,
+          promptSegmentDigests: state.contextAssembly?.segments.map((segment) => ({
+            id: segment.id,
+            contentHash: segment.contentHash,
+          })),
+        })]).catch(() => undefined);
+      }
+    }
     const toolCallBuffer = this.dependencies.createToolCallBuffer();
     const reasoningBuffer = this.dependencies.streamRuntime.createReasoningBuffer();
     let result = ports.llmChatStream
@@ -172,9 +209,9 @@ export class ProviderTurnRunner<TState extends ProviderTurnRunnerState> {
     const usage = objectRecord(result.data.usage);
     const cacheEvent = this.dependencies.cacheTelemetryEvent({
       sessionId: state.sessionId,
-      profileId: input.profileId,
-      provider: state.contextAssembly?.provider,
-      model: state.contextAssembly?.model,
+      profileId: result.data.providerProfileId ?? input.profileId,
+      provider: result.data.provider ?? state.contextAssembly?.provider,
+      model: result.data.model ?? state.contextAssembly?.model,
       stage,
       usage,
       promptSegmentDigests: [
@@ -188,24 +225,51 @@ export class ProviderTurnRunner<TState extends ProviderTurnRunnerState> {
           charLength: segment.charLength,
         })) ?? []),
         {
-        id: 'provider-request-topology',
-        name: 'providerRequestTopology',
-        cacheClass: 'providerRequest',
-        stablePrefix: false,
-        auditOnly: true,
-        ...cacheTopology,
+          id: 'provider-request-topology',
+          name: 'providerRequestTopology',
+          cacheClass: 'providerRequest',
+          stablePrefix: false,
+          auditOnly: true,
+          ...cacheTopology,
         },
       ],
-      stablePrefixHash: state.contextAssembly?.stablePrefixHash,
-      dynamicSuffixHash: state.contextAssembly?.dynamicSuffixHash,
+      // Request telemetry hashes the rendered provider frame, not the provider-scoped assembly cache key.
+      stablePrefixHash: state.providerTurnFrame?.snapshot?.stablePrefixHash,
+      dynamicSuffixHash: state.providerTurnFrame?.snapshot?.dynamicSuffixHash,
       finalUserPromptHash: state.providerTurnFrame?.snapshot?.finalUserPromptHash,
       finalUserPromptCharLength: state.providerTurnFrame?.snapshot?.finalUserPromptCharLength,
       cacheHash: state.contextAssembly?.cacheHash,
+      promptLedgerEpochScopeKey: state.providerTurnFrame?.promptLedgerEpochScopeKey,
+      promptLedgerTaskTemplateHash: state.providerTurnFrame?.promptLedgerTaskTemplateHash,
       ts: this.dependencies.now(),
       id: this.dependencies.createId(`cache-${stage}`),
     });
     if (cacheEvent) {
       await ports.appendEvents(state.sessionId, [cacheEvent]);
+      await ports.appendCacheTelemetry?.(state.sessionId, {
+        schemaVersion: 'deepcode.session.cache-telemetry.v1',
+        recordId: cacheEvent.id,
+        requestId: providerRequestId,
+        sessionId: state.sessionId,
+        runId: state.runId,
+        providerProfileId: result.data.providerProfileId ?? input.profileId,
+        provider: result.data.provider ?? state.contextAssembly?.provider,
+        model: result.data.model ?? state.contextAssembly?.model,
+        stage,
+        timestamp: cacheEvent.ts,
+        rawUsage: usage,
+        normalizedUsage: objectRecord(cacheEvent.payload)?.normalizedUsage,
+        promptSegmentDigests: objectRecord(cacheEvent.payload)?.promptSegmentDigests,
+        cacheShape: cacheTopology,
+        cacheShapeReason: state.providerTurnFrame?.promptLedgerCacheShapeReason,
+        promptLedgerEpochId: state.providerTurnFrame?.promptLedgerEpochId,
+        promptLedgerEpochScopeKey: state.providerTurnFrame?.promptLedgerEpochScopeKey,
+        promptLedgerTaskTemplateHash: state.providerTurnFrame?.promptLedgerTaskTemplateHash,
+        turnId: state.userAuthorityFrame?.turnAuthority.turnId,
+        taskId: state.userAuthorityFrame?.turnAuthority.taskId,
+        sourceMessageHashes: state.userAuthorityFrame?.turnAuthority.sourceMessageHashes,
+        authorityHash: state.userAuthorityFrame?.turnAuthority.authorityHash,
+      }).catch(() => undefined);
     }
     await this.dependencies.traceRecorder.append(state, `${stage}.response`, result.data, ports);
     const reasoning = collectReasoning(result.data);
@@ -290,27 +354,38 @@ function objectRecord(value: unknown): Record<string, unknown> | undefined {
     : undefined;
 }
 
-function providerRequestCacheTopology(
+export function providerRequestCacheTopology(
   state: ProviderTurnRunnerState,
   messages: LlmChatRequest['messages'],
   options: Pick<LlmChatRequest, 'responseFormat' | 'tools'>
 ): Record<string, unknown> {
   const profileId = state.providerTurnFrame?.snapshot?.semanticProfileId ?? 'unknown';
-  const requestText = JSON.stringify({
-    messages: messages.map((message) => ({ role: message.role, content: message.content })),
-    tools: options.tools?.map((tool) => ({ name: tool.name, inputSchema: tool.inputSchema })) ?? [],
-    responseFormat: options.responseFormat ?? null,
-  });
-  const currentSegments = state.contextAssembly?.segments.map((segment) => `${segment.id}:${segment.contentHash}`) ?? [];
+  const requestText = providerRequestText(messages, options);
+  const currentSegments = (
+    state.providerTurnFrame?.snapshot?.segments
+    ?? state.contextAssembly?.segments
+    ?? []
+  ).map((segment) => ({
+    id: segment.id,
+    contentHash: segment.contentHash,
+  }));
   const history = state.providerRequestCacheHistory ?? {};
   const previous = history[profileId];
-  const longestCommonPrefixCharLength = previous
-    ? commonPrefixLength(previous.requestText, requestText)
+  const previousRequestText = previous?.requestText
+    ?? comparablePreviousRequestText(previous, state, options);
+  const longestCommonPrefixCharLength = previousRequestText
+    ? commonPrefixLength(previousRequestText, requestText)
     : 0;
   const changedSegmentIds = previous
-    ? changedSegments(previous.segmentIds, currentSegments)
-    : currentSegments.map((entry) => entry.split(':', 1)[0]);
-  history[profileId] = { requestText, segmentIds: currentSegments };
+    ? changedSegments(previous.segments, currentSegments)
+    : currentSegments.map((segment) => segment.id);
+  history[profileId] = {
+    requestText,
+    messages: messages.map((message) => JSON.parse(JSON.stringify(message)) as LlmChatRequest['messages'][number]),
+    toolSchemaHash: state.providerTurnFrame?.snapshot?.toolSchemaHash,
+    responseFormatHash: state.providerTurnFrame?.snapshot?.responseFormatHash,
+    segments: currentSegments,
+  };
   state.providerRequestCacheHistory = history;
   return {
     semanticProfileId: profileId,
@@ -320,11 +395,39 @@ function providerRequestCacheTopology(
     messageShapeHash: state.providerTurnFrame?.snapshot?.messageShapeHash,
     requestCharLength: requestText.length,
     longestCommonPrefixCharLength,
-    longestCommonPrefixRatio: previous && requestText.length > 0
+    longestCommonPrefixRatio: previousRequestText && requestText.length > 0
       ? longestCommonPrefixCharLength / requestText.length
       : 0,
     changedSegmentIds,
   };
+}
+
+function providerRequestText(
+  messages: LlmChatRequest['messages'],
+  options: Pick<LlmChatRequest, 'responseFormat' | 'tools'>
+): string {
+  return JSON.stringify({
+    messages: messages.map((message) => ({
+      role: message.role,
+      content: message.content,
+      toolCalls: message.toolCalls ?? [],
+      toolCallId: message.toolCallId,
+    })),
+    tools: options.tools?.map((tool) => ({ name: tool.name, inputSchema: tool.inputSchema })) ?? [],
+    responseFormat: options.responseFormat ?? null,
+  });
+}
+
+function comparablePreviousRequestText(
+  previous: ProviderRequestCacheHistoryEntry | undefined,
+  state: ProviderTurnRunnerState,
+  options: Pick<LlmChatRequest, 'responseFormat' | 'tools'>
+): string | undefined {
+  if (!previous?.messages?.length) return undefined;
+  const snapshot = state.providerTurnFrame?.snapshot;
+  if (previous.toolSchemaHash && previous.toolSchemaHash !== snapshot?.toolSchemaHash) return undefined;
+  if (previous.responseFormatHash && previous.responseFormatHash !== snapshot?.responseFormatHash) return undefined;
+  return providerRequestText(previous.messages, options);
 }
 
 function commonPrefixLength(left: string, right: string): number {
@@ -334,15 +437,12 @@ function commonPrefixLength(left: string, right: string): number {
   return index;
 }
 
-function changedSegments(previous: string[], current: string[]): string[] {
-  const previousIndex = new Map(previous.map((entry) => {
-    const separator = entry.lastIndexOf(':');
-    return [entry.slice(0, separator), entry.slice(separator + 1)] as const;
-  }));
-  const currentIndex = new Map(current.map((entry) => {
-    const separator = entry.lastIndexOf(':');
-    return [entry.slice(0, separator), entry.slice(separator + 1)] as const;
-  }));
+function changedSegments(
+  previous: Array<{ id: string; contentHash: string }>,
+  current: Array<{ id: string; contentHash: string }>
+): string[] {
+  const previousIndex = new Map(previous.map((entry) => [entry.id, entry.contentHash] as const));
+  const currentIndex = new Map(current.map((entry) => [entry.id, entry.contentHash] as const));
   return [...new Set([...previousIndex.keys(), ...currentIndex.keys()])]
     .filter((id) => previousIndex.get(id) !== currentIndex.get(id))
     .sort();

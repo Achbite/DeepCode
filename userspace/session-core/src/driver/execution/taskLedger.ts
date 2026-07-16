@@ -1,11 +1,11 @@
 import type { AgentEvent } from '@deepcode/protocol';
 import type { ProposalEnvelope } from '../../protocol/types.js';
 import { AcceptedPlanProgressAggregator } from '../../accepted-plan/AcceptedPlanProgressAggregator.js';
-import { AcceptedPlanScopeMatcher } from '../../accepted-plan/AcceptedPlanScopeMatcher.js';
 import { AcceptedTaskRegistry } from '../../accepted-plan/AcceptedTaskRegistry.js';
+import { taskDependencyFactsFromKernelEvents } from '../../accepted-plan/TaskDependencyFacts.js';
 import type {
   AcceptedPlanBatchProgress,
-  AcceptedImplementationPlanContext,
+  AcceptedTaskPlanContext,
   CurrentTaskContext,
   TaskExecutionCursor,
 } from '../../accepted-plan/types.js';
@@ -23,7 +23,7 @@ export interface AcceptedPlanTaskRuntimeSnapshot {
 }
 
 export interface AcceptedPlanTaskRuntimeState {
-  acceptedImplementationPlan?: AcceptedImplementationPlanContext;
+  acceptedTaskPlan?: AcceptedTaskPlanContext;
   resourcePackets: ResourcePacket[];
   taskExecutionCursor?: TaskExecutionCursor;
   currentTaskContext?: CurrentTaskContext;
@@ -36,12 +36,12 @@ export class AcceptedPlanTaskRuntimeAccessor {
   constructor(private readonly state: AcceptedPlanTaskRuntimeState) {}
 
   snapshotInput(): {
-    acceptedPlan?: AcceptedImplementationPlanContext;
+    acceptedPlan?: AcceptedTaskPlanContext;
     resourcePackets: ResourcePacket[];
     lastSavepointId?: string;
   } {
     return {
-      acceptedPlan: this.state.acceptedImplementationPlan,
+      acceptedPlan: this.state.acceptedTaskPlan,
       resourcePackets: this.state.resourcePackets,
       lastSavepointId: this.state.taskExecutionCursor?.lastSavepointId,
     };
@@ -63,23 +63,23 @@ export interface AcceptedPlanTaskLedgerCoordinatorPorts {
 export type AcceptedPlanLedgerCommand =
   | {
     kind: 'recordKernelBatchProgress';
-    acceptedPlan: AcceptedImplementationPlanContext;
+    acceptedPlan: AcceptedTaskPlanContext;
     proposal: ProposalEnvelope;
     kernelEvents: unknown[];
   }
   | {
     kind: 'recordModelTaskOutcome';
-    acceptedPlan: AcceptedImplementationPlanContext;
+    acceptedPlan: AcceptedTaskPlanContext;
     taskId: string;
   }
   | {
     kind: 'recordTaskCompletion';
-    acceptedPlan: AcceptedImplementationPlanContext;
+    acceptedPlan: AcceptedTaskPlanContext;
     completedTaskIds: string[];
   }
   | {
     kind: 'recoverLatestCheckpoint';
-    acceptedPlan: AcceptedImplementationPlanContext;
+    acceptedPlan: AcceptedTaskPlanContext;
     events: AgentEvent[];
   };
 
@@ -88,21 +88,21 @@ export type AcceptedPlanLedgerEffect =
     kind: 'kernelBatchProgressRecorded';
     progress: AcceptedPlanBatchProgress;
     completedTaskIds: string[];
-    nextAcceptedPlan: AcceptedImplementationPlanContext;
+    nextAcceptedPlan: AcceptedTaskPlanContext;
   }
   | {
     kind: 'modelTaskOutcomeRecorded';
     taskId: string;
-    nextAcceptedPlan: AcceptedImplementationPlanContext;
+    nextAcceptedPlan: AcceptedTaskPlanContext;
   }
   | {
     kind: 'taskCompletionRecorded';
     completedTaskIds: string[];
-    nextAcceptedPlan: AcceptedImplementationPlanContext;
+    nextAcceptedPlan: AcceptedTaskPlanContext;
   }
   | {
     kind: 'latestCheckpointRecovered';
-    nextAcceptedPlan: AcceptedImplementationPlanContext;
+    nextAcceptedPlan: AcceptedTaskPlanContext;
   };
 
 export class AcceptedPlanTaskLedgerCoordinator {
@@ -116,11 +116,18 @@ export class AcceptedPlanTaskLedgerCoordinator {
         proposal: command.proposal,
         kernelEvents: command.kernelEvents,
       });
+      const newDependencyFacts = progress.newlyCompletedTaskIds.flatMap((taskId) =>
+        taskDependencyFactsFromKernelEvents(taskId, command.kernelEvents)
+      );
       return {
         kind: 'kernelBatchProgressRecorded',
         progress,
         completedTaskIds: progress.completedTaskIds,
-        nextAcceptedPlan: this.afterBatch(command.acceptedPlan, progress.completedTaskIds),
+        nextAcceptedPlan: this.afterBatch(
+          command.acceptedPlan,
+          progress.completedTaskIds,
+          newDependencyFacts
+        ),
       };
     }
     if (command.kind === 'recordModelTaskOutcome') {
@@ -144,7 +151,7 @@ export class AcceptedPlanTaskLedgerCoordinator {
   }
 
   recordKernelBatchProgress(input: {
-    acceptedPlan: AcceptedImplementationPlanContext;
+    acceptedPlan: AcceptedTaskPlanContext;
     proposal: ProposalEnvelope;
     kernelEvents: unknown[];
   }): Extract<AcceptedPlanLedgerEffect, { kind: 'kernelBatchProgressRecorded' }> {
@@ -159,7 +166,7 @@ export class AcceptedPlanTaskLedgerCoordinator {
   }
 
   recordModelTaskOutcome(input: {
-    acceptedPlan: AcceptedImplementationPlanContext;
+    acceptedPlan: AcceptedTaskPlanContext;
     taskId: string;
   }): Extract<AcceptedPlanLedgerEffect, { kind: 'modelTaskOutcomeRecorded' }> {
     const effect = this.execute({
@@ -173,7 +180,7 @@ export class AcceptedPlanTaskLedgerCoordinator {
   }
 
   recordTaskCompletion(input: {
-    acceptedPlan: AcceptedImplementationPlanContext;
+    acceptedPlan: AcceptedTaskPlanContext;
     completedTaskIds: string[];
   }): Extract<AcceptedPlanLedgerEffect, { kind: 'taskCompletionRecorded' }> {
     const effect = this.execute({
@@ -187,7 +194,7 @@ export class AcceptedPlanTaskLedgerCoordinator {
   }
 
   recoverLatestCheckpoint(input: {
-    acceptedPlan: AcceptedImplementationPlanContext;
+    acceptedPlan: AcceptedTaskPlanContext;
     events: AgentEvent[];
   }): Extract<AcceptedPlanLedgerEffect, { kind: 'latestCheckpointRecovered' }> {
     const effect = this.execute({
@@ -201,7 +208,7 @@ export class AcceptedPlanTaskLedgerCoordinator {
   }
 
   runtimeSnapshot(input: {
-    acceptedPlan?: AcceptedImplementationPlanContext;
+    acceptedPlan?: AcceptedTaskPlanContext;
     resourcePackets: ResourcePacket[];
     lastSavepointId?: string;
   }): AcceptedPlanTaskRuntimeSnapshot {
@@ -226,7 +233,7 @@ export class AcceptedPlanTaskLedgerCoordinator {
   }
 
   ledger(
-    acceptedPlan: AcceptedImplementationPlanContext | undefined,
+    acceptedPlan: AcceptedTaskPlanContext | undefined,
     failedTaskId?: string,
     skippedTaskIds: string[] = [],
     acceptedIncompleteTaskIds: string[] = []
@@ -239,14 +246,14 @@ export class AcceptedPlanTaskLedgerCoordinator {
   }
 
   promptFrame(
-    acceptedPlan: AcceptedImplementationPlanContext | undefined,
+    acceptedPlan: AcceptedTaskPlanContext | undefined,
     taskLedger: TaskLedgerSnapshot | undefined
   ): AcceptedPlanPromptFrame | undefined {
     return new AcceptedTaskRegistry(acceptedPlan).promptFrame(taskLedger);
   }
 
   cursor(
-    acceptedPlan: AcceptedImplementationPlanContext | undefined,
+    acceptedPlan: AcceptedTaskPlanContext | undefined,
     resourcePackets: ResourcePacket[],
     lastSavepointId?: string
   ): TaskExecutionCursor | undefined {
@@ -254,7 +261,7 @@ export class AcceptedPlanTaskLedgerCoordinator {
   }
 
   currentTaskContext(
-    acceptedPlan: AcceptedImplementationPlanContext | undefined,
+    acceptedPlan: AcceptedTaskPlanContext | undefined,
     cursor: TaskExecutionCursor | undefined
   ): CurrentTaskContext | undefined {
     return new AcceptedTaskRegistry(acceptedPlan).currentTaskContext(cursor);
@@ -265,19 +272,19 @@ export class AcceptedPlanTaskLedgerCoordinator {
     return [
       'CurrentTaskGoal:',
       context.goal,
-      `CurrentTaskContext: taskId=${context.taskId ?? 'none'}; targets=${context.targets.join(', ') || 'none'}; capabilities=${context.capabilities.join(', ') || 'none'}; completedTasks=${context.completedTaskIds.length}.`,
+      `CurrentTaskContext: taskId=${context.taskId ?? 'none'}; targets=${context.targets.join(', ') || 'none'}; toolIds=${context.toolIds.join(', ') || 'none'}; completedTasks=${context.completedTaskIds.length}.`,
     ];
   }
 
   withCompleted(
-    acceptedPlan: AcceptedImplementationPlanContext | undefined,
+    acceptedPlan: AcceptedTaskPlanContext | undefined,
     completedTaskIds: string[]
-  ): AcceptedImplementationPlanContext | undefined {
+  ): AcceptedTaskPlanContext | undefined {
     return new AcceptedTaskRegistry(acceptedPlan).withCompleted(completedTaskIds);
   }
 
   batchProgress(input: {
-    acceptedPlan: AcceptedImplementationPlanContext;
+    acceptedPlan: AcceptedTaskPlanContext;
     proposal: ProposalEnvelope;
     kernelEvents: unknown[];
   }): AcceptedPlanBatchProgress {
@@ -285,30 +292,35 @@ export class AcceptedPlanTaskLedgerCoordinator {
       throw new Error('AcceptedPlanTaskLedgerCoordinator batchProgress requires kernel event ports.');
     }
     return new AcceptedPlanProgressAggregator({
-      scopeMatcher: new AcceptedPlanScopeMatcher(),
       workUnitIdsFromKernelEvents: this.ports.workUnitIdsFromKernelEvents,
       actionBatchHasFailureOrBlocker: this.ports.actionBatchHasFailureOrBlocker,
     }).progress(input.acceptedPlan, input.proposal, input.kernelEvents);
   }
 
   afterBatch(
-    acceptedPlan: AcceptedImplementationPlanContext,
-    completedTaskIds: string[]
-  ): AcceptedImplementationPlanContext {
-    return this.withCompleted(acceptedPlan, completedTaskIds) ?? acceptedPlan;
+    acceptedPlan: AcceptedTaskPlanContext,
+    completedTaskIds: string[],
+    dependencyFacts: AcceptedTaskPlanContext['dependencyFacts'] = []
+  ): AcceptedTaskPlanContext {
+    const completed = this.withCompleted(acceptedPlan, completedTaskIds) ?? acceptedPlan;
+    const facts = new Map(
+      [...(acceptedPlan.dependencyFacts ?? []), ...dependencyFacts]
+        .map((fact) => [fact.factRef, fact] as const)
+    );
+    return { ...completed, dependencyFacts: [...facts.values()] };
   }
 
   afterTaskOutcome(
-    acceptedPlan: AcceptedImplementationPlanContext,
+    acceptedPlan: AcceptedTaskPlanContext,
     taskId: string
-  ): AcceptedImplementationPlanContext {
+  ): AcceptedTaskPlanContext {
     return new AcceptedTaskRegistry(acceptedPlan).withModelJudgedSufficient(taskId) ?? acceptedPlan;
   }
 
   withLatestCheckpoint(
-    acceptedPlan: AcceptedImplementationPlanContext,
+    acceptedPlan: AcceptedTaskPlanContext,
     events: AgentEvent[]
-  ): AcceptedImplementationPlanContext {
+  ): AcceptedTaskPlanContext {
     for (const event of [...events].reverse()) {
       if (event.kind !== 'workflow_stage') continue;
       const payload = objectRecord(event.payload);
@@ -317,8 +329,11 @@ export class AcceptedPlanTaskLedgerCoordinator {
       if (stringValue(payload.runId) !== acceptedPlan.runId || stringValue(payload.planId) !== acceptedPlan.planId) continue;
       const completedTaskIds = stringArrayValue(payload.completedTaskIds);
       const modelJudgedSufficientTaskIds = stringArrayValue(payload.modelJudgedSufficientTaskIds);
+      const dependencyFacts = taskDependencyFactArray(payload.dependencyFacts);
       let nextAccepted = acceptedPlan;
-      if (completedTaskIds.length) nextAccepted = this.afterBatch(nextAccepted, completedTaskIds);
+      if (completedTaskIds.length) {
+        nextAccepted = this.afterBatch(nextAccepted, completedTaskIds, dependencyFacts);
+      }
       for (const taskId of modelJudgedSufficientTaskIds) {
         nextAccepted = this.afterTaskOutcome(nextAccepted, taskId);
       }
@@ -327,7 +342,7 @@ export class AcceptedPlanTaskLedgerCoordinator {
     return acceptedPlan;
   }
 
-  complete(acceptedPlan: AcceptedImplementationPlanContext): boolean {
+  complete(acceptedPlan: AcceptedTaskPlanContext): boolean {
     return new AcceptedTaskRegistry(acceptedPlan).complete();
   }
 
@@ -340,6 +355,33 @@ export class AcceptedPlanTaskLedgerCoordinator {
     }
     return undefined;
   }
+}
+
+function taskDependencyFactArray(value: unknown): AcceptedTaskPlanContext['dependencyFacts'] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => {
+    const record = objectRecord(item);
+    const taskId = stringValue(record?.taskId);
+    const factRef = stringValue(record?.factRef);
+    const toolCallId = stringValue(record?.toolCallId);
+    const workUnitId = stringValue(record?.workUnitId);
+    const toolId = stringValue(record?.toolId);
+    const path = stringValue(record?.path);
+    if (!taskId || !factRef || !toolCallId || !workUnitId || !toolId || !path) return [];
+    return [{
+      taskId,
+      factRef,
+      toolCallId,
+      workUnitId,
+      toolId,
+      path,
+      operation: stringValue(record?.operation),
+      contentHash: stringValue(record?.contentHash),
+      sizeBytes: integerValue(record?.sizeBytes),
+      mode: integerValue(record?.mode),
+      executable: typeof record?.executable === 'boolean' ? record.executable : undefined,
+    }];
+  });
 }
 
 function objectRecord(value: unknown): Record<string, unknown> | undefined {
@@ -360,4 +402,8 @@ function stringArrayValue(value: unknown): string[] {
   return value
     .map((item) => stringValue(item))
     .filter((item): item is string => Boolean(item));
+}
+
+function integerValue(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0 ? value : undefined;
 }

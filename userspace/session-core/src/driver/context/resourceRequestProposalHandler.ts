@@ -10,7 +10,7 @@ import type {
 } from '../../context/types.js';
 import type { PromptEnvelope } from '../../prompt/types.js';
 import type { ResourceRequestResolution } from '../../resources/ResourceRequestResolver.js';
-import type { AcceptedImplementationPlanContext } from '../../accepted-plan/types.js';
+import type { AcceptedTaskPlanContext } from '../../accepted-plan/types.js';
 import { IntentSlotRegistry } from '../execution/intentSlot.js';
 import type { SessionDriverTaskResourceProgress } from '../runFrame.js';
 import type { AssistantDiagnosticInfo } from '../projection/assistantProjectionBuilder.js';
@@ -30,11 +30,16 @@ export interface ResourceRequestProposalHandlerState {
   resourcePackets: ResourcePacket[];
   generatedArtifactEvidence: Map<string, unknown>;
   resourceRequestProgressByTask?: Map<string, SessionDriverTaskResourceProgress>;
-  acceptedImplementationPlan?: AcceptedImplementationPlanContext;
+  acceptedTaskPlan?: AcceptedTaskPlanContext;
   taskExecutionCursor?: unknown;
   currentTaskContext?: unknown;
   resourceRequestRepairAttempted: boolean;
   semanticDirectiveErrorSummary?: string;
+}
+
+export interface ResourceResolutionIssue {
+  requestItemId: string;
+  reason: string;
 }
 
 export interface GeneratedResourcePacketResult {
@@ -77,7 +82,20 @@ export interface ResourceRequestProposalHandlerPorts<
     ts: string,
     id: string
   ): AgentEvent;
+  internalFailureEvents(
+    state: State,
+    stage: string,
+    code: string,
+    message: string,
+    id: string
+  ): AgentEvent[];
   resourceResolutionDiagnostic(resolution: ResourceRequestResolution): AssistantDiagnosticInfo;
+  completeResourceSemanticExchange(
+    state: State,
+    proposal: ProposalEnvelope,
+    packets: readonly ResourcePacket[],
+    issues?: readonly ResourceResolutionIssue[]
+  ): Promise<void>;
   refreshTaskRuntimeState(state: State): void;
   acceptedPlanResourceResumeEvent(state: State, packet: ResourcePacket, ts: string, id: string): AgentEvent;
   tryCompleteResourceTask(
@@ -112,28 +130,28 @@ export class ResourceRequestProposalHandler<
   ): Promise<ResourceRequestProposalHandlerResult> {
     const { input, state, proposal } = handlerInput;
     let lastResult = handlerInput.lastResult;
-    const taskId = this.intentSlots.currentTaskId(state.acceptedImplementationPlan);
+    const taskId = this.intentSlots.currentTaskId(state.acceptedTaskPlan);
     const request = proposal.payload as ResourceRequestDraft;
     const requestSignature = resourceRequestSignature(request);
+    const resolvedPackets: ResourcePacket[] = [];
     const progressByTask = state.resourceRequestProgressByTask ?? new Map<string, SessionDriverTaskResourceProgress>();
     state.resourceRequestProgressByTask = progressByTask;
     const taskProgress = taskId ? taskResourceProgress(progressByTask, taskId) : undefined;
     if (taskId && taskProgress?.signatures.includes(requestSignature)) {
       if (taskProgress.noProgressCount >= 1) {
+        await this.ports.completeResourceSemanticExchange(state, proposal, resolvedPackets, [{
+          requestItemId: request.id,
+          reason: 'session_resource_no_progress',
+        }]);
         return {
           kind: 'return',
-          result: await this.ports.append(state.sessionId, [
-            this.ports.finalDiagnosticEvent(
-              state.sessionId,
-              {
-                code: 'resourceRequestNoProgress',
-                fallback: 'The provider repeated an already resolved resource request for the current task after one controlled redirect.',
-                params: { taskId, noProgressCount: taskProgress.noProgressCount },
-              },
-              this.ports.now(),
-              this.ports.createId('resource-no-progress')
-            ),
-          ]),
+          result: await this.ports.append(state.sessionId, this.ports.internalFailureEvents(
+            state,
+            'resource_resolution',
+            'session_resource_no_progress',
+            `The provider repeated an already resolved resource request for task ${taskId} after one controlled redirect.`,
+            this.ports.createId('resource-no-progress')
+          )),
         };
       }
       taskProgress.noProgressCount += 1;
@@ -143,6 +161,10 @@ export class ResourceRequestProposalHandler<
         `resolvedPacketIds=${taskProgress.packetIds.join(' | ') || 'none'}`,
         'requiredAction=Use the already resolved ResourceEvidence and choose a non-resource current-task directive, or request a genuinely different target/range/search that adds evidence.',
       ].join('; ');
+      await this.ports.completeResourceSemanticExchange(state, proposal, resolvedPackets, [{
+        requestItemId: request.id,
+        reason: 'session_resource_no_progress',
+      }]);
       return { kind: 'continue', lastResult };
     }
     const generated = this.ports.generatedPacketForRequest(
@@ -151,6 +173,7 @@ export class ResourceRequestProposalHandler<
       this.ports.createId('generated-artifact-resource')
     );
     if (generated.packet) {
+      resolvedPackets.push(generated.packet);
       lastResult = (await this.ports.recordAndAppend(
         state,
         generated.packet,
@@ -158,6 +181,7 @@ export class ResourceRequestProposalHandler<
       )).result;
       if (!generated.remaining.items.length) {
         if (taskProgress && generated.packet) recordTaskResourceProgress(taskProgress, requestSignature, generated.packet.id);
+        await this.ports.completeResourceSemanticExchange(state, proposal, resolvedPackets);
         return { kind: 'continue', lastResult };
       }
     }
@@ -167,6 +191,31 @@ export class ResourceRequestProposalHandler<
       generated.remaining,
       state.conversationRoots
     );
+    if (
+      !subset.manifest.entries.length
+      && state.manifest.projectId
+      && state.manifest.projectRootStatus === 'unbound'
+    ) {
+      await this.ports.completeResourceSemanticExchange(state, proposal, resolvedPackets, [{
+        requestItemId: request.id,
+        reason: 'project_root_required',
+      }]);
+      return {
+        kind: 'return',
+        result: await this.ports.append(state.sessionId, [
+          this.ports.finalDiagnosticEvent(
+            state.sessionId,
+            {
+              code: 'project_root_required',
+              fallback: 'This project is not bound to a directory. Bind a project directory before requesting files or workspace actions.',
+              params: { projectId: state.manifest.projectId },
+            },
+            this.ports.now(),
+            this.ports.createId('project-root-required')
+          ),
+        ]),
+      };
+    }
     const repairRuntime = new SessionDriverRepairRuntimeAccessor(state);
     if (!subset.manifest.entries.length && !repairRuntime.attempted('resourceRequestRepairAttempted')) {
       repairRuntime.markAttempted('resourceRequestRepairAttempted');
@@ -177,20 +226,27 @@ export class ResourceRequestProposalHandler<
         `availableRootCount=${subset.availableRoots.length}`,
         'requiredAction=Call session.request_resources with one focused target under an available root, or choose another registered semantic directive.',
       ].join('; ');
+      await this.ports.completeResourceSemanticExchange(state, proposal, resolvedPackets, [
+        ...subset.unresolved.map((reason, index) => ({ requestItemId: `unresolved-${index + 1}`, reason })),
+        ...subset.ambiguous.map((reason, index) => ({ requestItemId: `ambiguous-${index + 1}`, reason })),
+      ]);
       return { kind: 'continue', lastResult };
     }
 
     if (!subset.manifest.entries.length) {
+      await this.ports.completeResourceSemanticExchange(state, proposal, resolvedPackets, [
+        ...subset.unresolved.map((reason, index) => ({ requestItemId: `unresolved-${index + 1}`, reason })),
+        ...subset.ambiguous.map((reason, index) => ({ requestItemId: `ambiguous-${index + 1}`, reason })),
+      ]);
       return {
         kind: 'return',
-        result: await this.ports.append(state.sessionId, [
-          this.ports.finalDiagnosticEvent(
-            state.sessionId,
-            this.ports.resourceResolutionDiagnostic(subset),
-            this.ports.now(),
-            this.ports.createId('resource-invalid')
-          ),
-        ]),
+        result: await this.ports.append(state.sessionId, this.ports.internalFailureEvents(
+          state,
+          'resource_resolution',
+          'resource_request_invalid',
+          this.ports.resourceResolutionDiagnostic(subset).fallback,
+          this.ports.createId('resource-invalid')
+        )),
       };
     }
 
@@ -200,9 +256,11 @@ export class ResourceRequestProposalHandler<
       'resource-context'
     );
     const packet = resourceAppend.packet;
+    resolvedPackets.push(packet);
+    await this.ports.completeResourceSemanticExchange(state, proposal, resolvedPackets);
     if (taskProgress) recordTaskResourceProgress(taskProgress, requestSignature, packet.id);
     lastResult = resourceAppend.result;
-    if (state.acceptedImplementationPlan) {
+    if (state.acceptedTaskPlan) {
       this.ports.refreshTaskRuntimeState(state);
       const resumeEvent = this.ports.acceptedPlanResourceResumeEvent(
         state,

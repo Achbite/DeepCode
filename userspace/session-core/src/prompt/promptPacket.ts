@@ -281,8 +281,8 @@ function nextActionInstructionFrame(input: PromptEnvelopeBuilderInput): PromptPa
         'Continue the current accepted task. Do not re-plan unless a user decision explicitly requests replan/revisePlan.',
         'Use TaskFrame and IntentSlot values as the complete current task boundary. Do not add unrelated targets from the original user request, plan summary, memory, or later tasks.',
         'If every current IntentSlot has evidenceRequirement=none, submit the current artifacts directly; do not read the target or parent directory merely to confirm that a create or process operation may begin.',
-        'If generated content is needed and evidence is sufficient, call session.submit_task_artifacts with slot ids and content only. If evidence is missing, call session.request_resources.',
-        'If the current task is already sufficiently satisfied and no Kernel action is needed, call session.complete_current_task. Do not invent empty artifacts just to advance the task.',
+        'If generated content is needed and evidence is sufficient, append one logical file, class, function, script, or configuration section through session.append_artifact_chunk. Small files may be submitted in one call; do not mechanically count or split lines. Finalize only after all current slots are complete. If evidence is missing, call session.request_resources.',
+        'If fresh task-scoped evidence proves every acceptance criterion, call session.submit_task_outcome. Otherwise use request_decision for a recoverable choice or report_diagnostic for a terminal failure. Do not invent empty artifacts or an unregistered completion tool.',
       ]
       : genericContent,
   };

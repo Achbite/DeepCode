@@ -58,6 +58,9 @@ export function buildResourcePromptContext(input: BuildResourcePromptContextInpu
     for (let itemIndex = 0; itemIndex < packet.items.length; itemIndex += 1) {
       const item = packet.items[itemIndex]!;
       const entry = manifestEntries.get(item.manifestEntryId);
+      if (entry?.contextUse === 'workspaceBootstrap' || entry?.contextUse === 'admissionMetadata') {
+        continue;
+      }
       const content = item.promptContent ?? item.contentSummary ?? '';
       const contentHash = stableHash(content);
       const displayRef = resourceDisplayRef(item, entry);
@@ -94,6 +97,9 @@ export function buildResourcePromptContext(input: BuildResourcePromptContextInpu
       workspaceScopeKey: packet.workspaceScopeKey,
       manifestEntryId: item.manifestEntryId,
       displayRef,
+      rootId: item.rootId,
+      path: item.path,
+      listedPaths: structuredListedPaths(item),
       contentHash,
       retention,
       status: item.status,
@@ -137,6 +143,35 @@ export function buildResourcePromptContext(input: BuildResourcePromptContextInpu
     deniedBlockCount: resourceBlocks.filter((block) => block.retention === 'denied').length,
     errorBlockCount: resourceBlocks.filter((block) => block.retention === 'error').length,
   };
+}
+
+function structuredListedPaths(item: ResourcePacketItem): string[] | undefined {
+  const paths = new Set<string>();
+  const pending = Array.isArray(item.nodes) ? [...item.nodes] : [];
+  while (pending.length) {
+    const node = pending.shift();
+    if (!node) continue;
+    const path = typeof node.path === 'string'
+      ? node.path
+      : typeof node.relativePath === 'string'
+        ? node.relativePath
+        : undefined;
+    if (path?.trim()) paths.add(path.trim());
+    if (Array.isArray(node.children)) {
+      pending.push(...node.children.filter((child): child is Record<string, unknown> => (
+        Boolean(child) && typeof child === 'object' && !Array.isArray(child)
+      )));
+    }
+  }
+  for (const match of item.matches ?? []) {
+    const path = typeof match.path === 'string'
+      ? match.path
+      : typeof match.relativePath === 'string'
+        ? match.relativePath
+        : undefined;
+    if (path?.trim()) paths.add(path.trim());
+  }
+  return paths.size ? [...paths].sort() : undefined;
 }
 
 function selectFullTextResourceBlockKeys(

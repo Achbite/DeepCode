@@ -12,6 +12,7 @@ export interface PromptSystemLayer {
     | 'agentInterventionContract'
     | 'resourceEvidencePolicyContract'
     | 'memoryAndTaskContextContract'
+    | 'providerProfileContract'
     | 'toolCatalogSummary'
     | 'rulerContext'
     | 'authoritativeDocExcerpts'
@@ -56,8 +57,9 @@ export interface PromptSegment {
 export interface PromptEnvelopeBuilderInput {
   workflowState: string;
   allowedProposals: string[];
-  capabilityCatalogSummary: string;
+  toolCatalogSummary: string;
   builtinSystemPromptVersion?: string;
+  providerProfileSystemContract?: string;
   compiledRuler?: CompiledRuler;
   memoryHints?: string[];
   stableMemoryHints?: string[];

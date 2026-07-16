@@ -19,6 +19,9 @@ import type { PromptEnvelope } from '../../prompt/types.js';
 import type { DriverProviderTurnFrame } from '../runFrame.js';
 import { SessionDriverProviderRuntimeAccessor } from '../runFrame.js';
 import { buildProviderTurnSnapshot } from '../context/providerTurnSnapshot.js';
+import { ProviderProfileRegistry } from '../../provider/ProviderProfileRegistry.js';
+
+const providerProfiles = new ProviderProfileRegistry();
 
 export interface RequirementConfirmationInput {
   sessionId: string;
@@ -52,7 +55,7 @@ export interface RequirementConfirmationCoordinatorPorts<
   now(): string;
   createId(prefix: string): string;
   assembleContext(input: ContextAssemblyInput): ContextAssemblyResult;
-  capabilityCatalogSummary(state: State): string;
+  toolCatalogSummary(state: State): string;
   collectUserGuidanceEvents(events: AgentEvent[], runId: string): UserGuidanceEvent[];
   buildProviderTurnContract(input: {
     contractId: string;
@@ -111,11 +114,12 @@ export class RequirementConfirmationCoordinator<
       contextAssemblyId: this.ports.createId('context-assembly'),
       workflowState: 'needDecisionRequest',
       allowedProposals: ['decisionRequest'],
-      capabilityCatalogSummary: this.ports.capabilityCatalogSummary(state),
+      toolCatalogSummary: this.ports.toolCatalogSummary(state),
       memoryDocument: state.memoryDocument,
       projectMemoryMode: input.projectMemoryMode,
       extraMemoryHints: state.memoryHints,
       interventionLevel: input.interventionLevel,
+      providerProfileSystemContract: providerProfiles.profile('planning-v1').systemContract,
       userGuidance: this.ports.collectUserGuidanceEvents(input.existingEvents ?? [], state.runId),
       userOverlay: [
         'Before proposing side-effect work, request user intervention only if a concrete decision is needed.',

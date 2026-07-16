@@ -17,7 +17,7 @@ export interface ReviewProjectionSummaryPlan extends ReviewProjectionPlan {
   sessionId: string;
   runId: string;
   planId: string;
-  implementationPlan?: unknown;
+  taskPlan?: unknown;
   executionRoot?: unknown;
 }
 
@@ -132,7 +132,7 @@ export class ReviewProjectionBuilder<
       toolResults,
     };
     const readableReviewBase = this.readableSummary(input.kernelEvents, reviewFacts);
-    const acceptedPlanForReview = input.plan.implementationPlan
+    const acceptedPlanForReview = input.plan.taskPlan
       ? ports.acceptedPlanContext(input.plan)
       : undefined;
     // Review task status is a checkpoint projection; prefer the latest ledger facts over the stale accepted-plan snapshot.
@@ -537,13 +537,15 @@ function reviewFailureDetail(
     ?? stringValue(error?.message)
     ?? stringValue(record?.reason)
     ?? stringValue(output?.message);
-  const normalized = (reason ?? '').toLowerCase();
-  const classification = normalized.includes('patch match did not occur')
-    ? 'patch_stale_or_mismatched_evidence'
-    : stringValue(record?.classification)
-      ?? stringValue(output?.classification)
-      ?? stringValue(record?.code)
-      ?? stringValue(error?.code);
+  const details = objectRecord(objectRecord(error?.args)?.details)
+    ?? objectRecord(record?.details)
+    ?? objectRecord(output?.details);
+  const classification = stringValue(record?.classification)
+    ?? stringValue(output?.classification)
+    ?? stringValue(error?.classification)
+    ?? stringValue(details?.classification)
+    ?? stringValue(record?.code)
+    ?? stringValue(error?.code);
   return { classification, reason };
 }
 
@@ -558,7 +560,7 @@ function reviewOperation(record?: Record<string, unknown> | null, toolName?: str
 function operationFromToolName(toolName?: string): string {
   if (!toolName) return 'modify';
   if (toolName === 'fs.write') return 'write';
-  if (toolName === 'fs.patch') return 'patch';
+  if (toolName === 'fs.edit') return 'patch';
   if (toolName === 'fs.delete') return 'delete';
   if (toolName === 'fs.rename') return 'rename';
   if (toolName.startsWith('fs.')) return toolName.slice(3);

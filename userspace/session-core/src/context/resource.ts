@@ -7,6 +7,8 @@ type KernelResourceEvidence = {
   truncated?: boolean;
   originalBytes?: number;
   evidenceRefs?: string[];
+  nodes?: Array<Record<string, unknown>>;
+  matches?: Array<Record<string, unknown>>;
 };
 
 export function createResourcePacket(input: {
@@ -67,6 +69,8 @@ function resourcePacketItem(
       truncated: evidence?.truncated,
       originalBytes: evidence?.originalBytes,
       evidenceRefs: evidence?.evidenceRefs ?? [],
+      nodes: evidence?.nodes,
+      matches: evidence?.matches,
       sourceKind: evidence ? 'kernelResource' : 'manifestOnly',
     };
   }

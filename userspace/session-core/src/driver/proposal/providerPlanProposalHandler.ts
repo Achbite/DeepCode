@@ -1,26 +1,44 @@
-import type { AgentEvent, AgentSessionResult } from '@deepcode/protocol';
+import type {
+  AgentEvent,
+  AgentSessionResult,
+  AgentWorkspaceBinding,
+  KernelCommandEnvelope,
+  KernelPlanAuthorizationReview,
+  KernelReply,
+  KernelToolCatalogSnapshot,
+  KernelTaskIntentEnvelope,
+} from '@deepcode/protocol';
+import { canonicalJson, stableHash } from '../../cache/canonicalizer.js';
 import type { ProposalEnvelope } from '../../protocol/types.js';
 import type { PlanProjectionState } from '../projection/planProjectionBuilder.js';
 
 export interface ProviderPlanProposalState extends PlanProjectionState {
   runId: string;
   phase: string;
+  workspaceBinding?: AgentWorkspaceBinding;
+  stateContract?: { toolCatalogSnapshot?: KernelToolCatalogSnapshot };
+  driverRequest?: { stateContract?: { toolCatalogSnapshot?: KernelToolCatalogSnapshot } };
 }
 
 export interface ProviderPlanProposalHandlerPorts<State extends ProviderPlanProposalState> {
   now(): string;
   createId(prefix: string): string;
   append(sessionId: string, events: AgentEvent[]): Promise<AgentSessionResult>;
-  implementationPlanCardEvent(input: {
+  kernel(request: KernelCommandEnvelope): Promise<KernelReply>;
+  appendProjectedKernelEvents(sessionId: string, reply: KernelReply): Promise<AgentSessionResult | undefined>;
+  taskPlanCardEvent(input: {
     state: State;
     proposal: ProposalEnvelope;
+    authorizationReview: KernelPlanAuthorizationReview;
     ts: string;
     id: string;
   }): AgentEvent;
+  diagnosticEvent(sessionId: string, content: string, ts: string, id: string): AgentEvent;
   sessionRunStateEvent(input: {
     sessionId: string;
     runId: string;
-    phase: 'waiting_plan_review';
+    phase: 'waiting_plan_review' | 'failed';
+    status?: 'waiting' | 'failed';
     reason: 'plan_review';
     decisionOwner: {
       kind: 'plan';
@@ -36,13 +54,48 @@ export interface ProviderPlanProposalHandlerPorts<State extends ProviderPlanProp
 export class ProviderPlanProposalHandler<State extends ProviderPlanProposalState> {
   constructor(private readonly ports: ProviderPlanProposalHandlerPorts<State>) {}
 
-  handle(state: State, proposal: ProposalEnvelope): Promise<AgentSessionResult> {
+  async handle(state: State, proposal: ProposalEnvelope): Promise<AgentSessionResult> {
     const planId = planIdFromProposal(proposal);
+    const catalog = state.stateContract?.toolCatalogSnapshot
+      ?? state.driverRequest?.stateContract?.toolCatalogSnapshot;
+    if (!catalog) {
+      return this.failPlanAuthorization(
+        state,
+        planId,
+        'Kernel ToolCatalog snapshot is unavailable; Session cannot submit a plan intent without inventing tool authority.'
+      );
+    }
+    const intent = taskIntentEnvelope(state, proposal, planId, catalog);
+    const reply = await this.ports.kernel({
+      command: {
+        kind: 'planAuthorizationSubmit',
+        requestId: this.ports.createId('plan-authorization-submit'),
+        runId: state.runId,
+        sessionId: state.sessionId,
+        intent,
+      },
+    });
+    let result = await this.ports.appendProjectedKernelEvents(state.sessionId, reply);
+    const review = planAuthorizationReview(reply.events, planId);
+    if (!reply.ok || !review) {
+      return this.failPlanAuthorization(
+        state,
+        planId,
+        reply.error?.message ?? 'Kernel did not return PlanAuthorizationReviewed.',
+        result
+      );
+    }
+    if (review.status !== 'confirmable') {
+      const diagnostics = review.diagnostics.join('; ')
+        || `Kernel plan authorization status=${review.status}.`;
+      return this.failPlanAuthorization(state, planId, diagnostics, result);
+    }
     state.phase = 'waiting_plan_review';
     return this.ports.append(state.sessionId, [
-      this.ports.implementationPlanCardEvent({
+      this.ports.taskPlanCardEvent({
         state,
         proposal,
+        authorizationReview: review,
         ts: this.ports.now(),
         id: this.ports.createId('task-plan'),
       }),
@@ -60,8 +113,96 @@ export class ProviderPlanProposalHandler<State extends ProviderPlanProposalState
         ts: this.ports.now(),
         id: this.ports.createId('session-run-waiting-plan'),
       }),
-    ]);
+    ]) ?? result!;
   }
+
+  private async failPlanAuthorization(
+    state: State,
+    planId: string,
+    message: string,
+    current?: AgentSessionResult
+  ): Promise<AgentSessionResult> {
+    state.phase = 'failed';
+    return this.ports.append(state.sessionId, [
+      this.ports.diagnosticEvent(
+        state.sessionId,
+        `Kernel plan authorization failed: ${message}`,
+        this.ports.now(),
+        this.ports.createId('plan-authorization-failed')
+      ),
+      this.ports.sessionRunStateEvent({
+        sessionId: state.sessionId,
+        runId: state.runId,
+        phase: 'failed',
+        status: 'failed',
+        reason: 'plan_review',
+        decisionOwner: {
+          kind: 'plan',
+          runId: state.runId,
+          targetId: planId,
+          planId,
+        },
+        ts: this.ports.now(),
+        id: this.ports.createId('session-run-plan-authorization-failed'),
+      }),
+    ]) ?? current!;
+  }
+}
+
+function taskIntentEnvelope<State extends ProviderPlanProposalState>(
+  state: State,
+  proposal: ProposalEnvelope,
+  planId: string,
+  catalog: KernelToolCatalogSnapshot
+): KernelTaskIntentEnvelope {
+  const payload = objectRecord(proposal.payload) ?? {};
+  const tasks = Array.isArray(payload.tasks) ? payload.tasks : [];
+  return {
+    schemaVersion: 'deepcode.kernel.task-intent.v2',
+    planId,
+    planHash: stableHash(canonicalJson(payload)),
+    runId: state.runId,
+    sessionId: state.sessionId,
+    workspaceBindingHash: workspaceBindingHash(state.workspaceBinding),
+    catalogVersion: catalog.catalogVersion,
+    catalogHash: catalog.catalogHash,
+    tasks: tasks.flatMap((value, index) => {
+      const task = objectRecord(value);
+      if (!task) return [];
+      const args = objectRecord(task.args);
+      if (!args) {
+        throw new Error(`taskPlan.tasks[${index}].args must be a canonical object.`);
+      }
+      return [{
+        taskId: stringValue(task.taskId) ?? stringValue(task.id) ?? `task-${index + 1}`,
+        toolId: stringValue(task.toolId) ?? '',
+        targets: stringArray(task.target),
+        dependsOn: stringArray(task.dependencies),
+        args,
+      }];
+    }),
+  };
+}
+
+function planAuthorizationReview(
+  events: unknown[],
+  planId: string
+): KernelPlanAuthorizationReview | undefined {
+  for (const value of events) {
+    const event = objectRecord(value);
+    if (event?.kind !== 'plan_authorization.reviewed') continue;
+    if (stringValue(event.planId) !== planId) continue;
+    const review = objectRecord(event.review);
+    const contract = objectRecord(review?.authorizationContract);
+    const status = stringValue(review?.status);
+    if (!review || !contract || !status) return undefined;
+    return review as unknown as KernelPlanAuthorizationReview;
+  }
+  return undefined;
+}
+
+function workspaceBindingHash(binding: AgentWorkspaceBinding | undefined): string | undefined {
+  return binding?.workspaceHash ?? binding?.folderHash ?? binding?.workspaceId;
 }
 
 function planIdFromProposal(proposal: ProposalEnvelope): string {
@@ -76,4 +217,12 @@ function objectRecord(value: unknown): Record<string, unknown> | undefined {
 
 function stringValue(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value : undefined;
+}
+
+function stringArray(value: unknown): string[] {
+  if (typeof value === 'string' && value.trim()) return [value.trim()];
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+    .map((item) => item.trim());
 }

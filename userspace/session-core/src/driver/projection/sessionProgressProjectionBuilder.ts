@@ -3,8 +3,7 @@ import type { ProposalEnvelope } from '../../protocol/types.js';
 import type { ContextAssemblyTaskLocalCompactRecord } from '../../context/index.js';
 import type { ResourcePacket } from '../../context/types.js';
 import type {
-  AcceptedImplementationPlanContext,
-  AcceptedPlanAccessScopeCanonicalizationResult,
+  AcceptedTaskPlanContext,
   AcceptedPlanBatchProgress,
   AcceptedPlanReadOnlyResourceCompletion,
   CurrentTaskContext,
@@ -12,9 +11,10 @@ import type {
 } from '../execution/index.js';
 import type { InteractionOverlayContext, SessionTurnPhase } from '../pipelines/index.js';
 import { buildTaskLedgerSnapshot, type AcceptedPlanPromptFrame, type TaskLedgerSnapshot } from '../../run-state/index.js';
+import { providerTelemetryFromUsage } from '../../cache/telemetry.js';
 
 export interface DecisionOwnerRef {
-  kind: 'requirement' | 'plan' | 'review' | 'permission';
+  kind: 'requirement' | 'plan' | 'review' | 'permission' | 'session';
   runId: string;
   targetId?: string;
   planId?: string;
@@ -31,16 +31,19 @@ export type SessionRunStateReason =
   | 'permission'
   | 'review'
   | 'accepted_plan_execution'
-  | 'work_unit_failed';
+  | 'task_diagnostic'
+  | 'work_unit_failed'
+  | 'driver_failure'
+  | 'provider_failure';
 
 export interface SessionProgressProjectionBuilderPorts {
   interactionOverlayPayload(overlay: InteractionOverlayContext | undefined): Record<string, unknown>;
   hasFailureOrBlocker(kernelEvents: unknown[]): boolean;
   auditAcceptedPlanBatch(batch: Record<string, unknown>): Record<string, unknown>;
   actionBundleAdmissionBatch(proposal: ProposalEnvelope): Record<string, unknown>;
-  acceptedPlanTaskLedger(accepted: AcceptedImplementationPlanContext): TaskLedgerSnapshot | undefined;
+  acceptedPlanTaskLedger(accepted: AcceptedTaskPlanContext): TaskLedgerSnapshot | undefined;
   acceptedPlanPromptFrame(
-    accepted: AcceptedImplementationPlanContext,
+    accepted: AcceptedTaskPlanContext,
     taskLedger: TaskLedgerSnapshot | undefined
   ): AcceptedPlanPromptFrame | undefined;
 }
@@ -86,10 +89,15 @@ export class SessionProgressProjectionBuilder {
     finalUserPromptHash?: string;
     finalUserPromptCharLength?: number;
     cacheHash?: string;
+    promptLedgerEpochScopeKey?: string;
+    promptLedgerTaskTemplateHash?: string;
     ts: string;
     id: string;
   }): AgentEvent | null {
-    const normalized = normalizeProviderUsage(input.usage);
+    const normalized = providerTelemetryFromUsage({
+      provider: input.provider ?? 'unknown',
+      usage: input.usage,
+    });
     if (
       normalized.promptCacheHitTokens === undefined &&
       normalized.promptCacheMissTokens === undefined &&
@@ -108,7 +116,7 @@ export class SessionProgressProjectionBuilder {
       ts: input.ts,
       kind: 'cache_telemetry',
       payload: {
-        provider: input.profileId ?? input.provider ?? 'unknown',
+        provider: input.provider ?? 'unknown',
         providerProfileId: input.profileId,
         model: input.model,
         stage: input.stage,
@@ -126,6 +134,8 @@ export class SessionProgressProjectionBuilder {
         finalUserPromptHash: input.finalUserPromptHash,
         finalUserPromptCharLength: input.finalUserPromptCharLength,
         cacheHash: input.cacheHash,
+        promptLedgerEpochScopeKey: input.promptLedgerEpochScopeKey,
+        promptLedgerTaskTemplateHash: input.promptLedgerTaskTemplateHash,
         cacheAffectsCorrectness: false,
       },
     };
@@ -174,7 +184,7 @@ export class SessionProgressProjectionBuilder {
   requirementDrivenTaskCheckpointEvent(
     sessionId: string,
     runId: string,
-    accepted: AcceptedImplementationPlanContext,
+    accepted: AcceptedTaskPlanContext,
     newlyCompletedTaskIds: string[],
     completedTaskIds: string[],
     remainingTaskIds: string[],
@@ -237,7 +247,7 @@ export class SessionProgressProjectionBuilder {
   acceptedPlanBatchCheckpointEvent(
     sessionId: string,
     runId: string,
-    accepted: AcceptedImplementationPlanContext,
+    accepted: AcceptedTaskPlanContext,
     proposal: ProposalEnvelope,
     kernelEvents: unknown[],
     progress: AcceptedPlanBatchProgress,
@@ -254,7 +264,10 @@ export class SessionProgressProjectionBuilder {
       completedTaskIds: progress.completedTaskIds,
       modelJudgedSufficientTaskIds: progress.modelJudgedSufficientTaskIds ?? accepted.modelJudgedSufficientTaskIds ?? [],
       failedTaskId: failedOrBlocked
-        ? accepted.tasks.find((task) => !progress.completedTaskIds.includes(task.taskId))?.taskId
+        ? accepted.tasks.find((task) => (
+          !progress.completedTaskIds.includes(task.taskId)
+          && !(progress.modelJudgedSufficientTaskIds ?? accepted.modelJudgedSufficientTaskIds ?? []).includes(task.taskId)
+        ))?.taskId
         : undefined,
     });
     const summary = failedOrBlocked
@@ -280,6 +293,7 @@ export class SessionProgressProjectionBuilder {
         workUnitIds: progress.workUnitIds,
         newlyCompletedTaskIds: progress.newlyCompletedTaskIds,
         completedTaskIds: progress.completedTaskIds,
+        dependencyFacts: accepted.dependencyFacts,
         newlyModelJudgedSufficientTaskIds: progress.newlyModelJudgedSufficientTaskIds ?? [],
         modelJudgedSufficientTaskIds: progress.modelJudgedSufficientTaskIds ?? accepted.modelJudgedSufficientTaskIds ?? [],
         remainingTaskIds: progress.remainingTaskIds,
@@ -310,7 +324,7 @@ export class SessionProgressProjectionBuilder {
   acceptedPlanResourceValidationCheckpointEvent(
     sessionId: string,
     runId: string,
-    accepted: AcceptedImplementationPlanContext,
+    accepted: AcceptedTaskPlanContext,
     packet: ResourcePacket,
     completion: AcceptedPlanReadOnlyResourceCompletion,
     ts: string,
@@ -459,7 +473,7 @@ export class SessionProgressProjectionBuilder {
   acceptedPlanResourceResumeEvent(
     sessionId: string,
     runId: string,
-    accepted: AcceptedImplementationPlanContext,
+    accepted: AcceptedTaskPlanContext,
     cursor: TaskExecutionCursor | undefined,
     context: CurrentTaskContext | undefined,
     packet: ResourcePacket,
@@ -507,8 +521,8 @@ export class SessionProgressProjectionBuilder {
   acceptedPlanTaskSavepointEvent(
     sessionId: string,
     runId: string,
-    accepted: AcceptedImplementationPlanContext,
-    nextAccepted: AcceptedImplementationPlanContext,
+    accepted: AcceptedTaskPlanContext,
+    nextAccepted: AcceptedTaskPlanContext,
     progress: AcceptedPlanBatchProgress,
     kernelEvents: unknown[],
     cursor: TaskExecutionCursor | undefined,
@@ -546,6 +560,7 @@ export class SessionProgressProjectionBuilder {
         completedTaskIds: progress.completedTaskIds,
         newlyCompletedTaskIds: progress.newlyCompletedTaskIds,
         modelJudgedSufficientTaskIds: progress.modelJudgedSufficientTaskIds ?? nextAccepted.modelJudgedSufficientTaskIds ?? [],
+        dependencyFacts: nextAccepted.dependencyFacts,
         newlyModelJudgedSufficientTaskIds: progress.newlyModelJudgedSufficientTaskIds ?? [],
         remainingTaskIds: progress.remainingTaskIds,
         taskLedger: ledger,
@@ -575,32 +590,67 @@ export class SessionProgressProjectionBuilder {
     };
   }
 
-  acceptedPlanAccessScopesCanonicalizedEvent(
-    sessionId: string,
-    runId: string,
-    accepted: AcceptedImplementationPlanContext,
-    canonicalization: AcceptedPlanAccessScopeCanonicalizationResult,
-    ts: string,
-    id: string
-  ): AgentEvent {
+  acceptedPlanTaskOutcomeCheckpointEvent(input: {
+    sessionId: string;
+    runId: string;
+    accepted: AcceptedTaskPlanContext;
+    nextAccepted: AcceptedTaskPlanContext;
+    taskId: string;
+    summary: string;
+    evidenceRefs: string[];
+    acceptanceResults: Array<{
+      criterionIndex: number;
+      status: 'satisfied';
+      evidenceRefs: string[];
+    }>;
+    evidenceRevision: number;
+    progress: AcceptedPlanBatchProgress;
+    contextCompactRecord?: ContextAssemblyTaskLocalCompactRecord;
+    ts: string;
+    id: string;
+  }): AgentEvent {
+    const taskLedger = this.ports.acceptedPlanTaskLedger(input.nextAccepted);
     return {
-      id,
-      sessionId,
-      ts,
+      id: input.id,
+      sessionId: input.sessionId,
+      ts: input.ts,
       kind: 'workflow_stage',
       payload: {
-        title: 'Accepted plan access scope canonicalized',
-        summary: 'Session removed invalid execution-batch accessScopes before Kernel PlanReview.',
-        stage: 'accepted_plan.access_scope_canonicalized',
-        status: 'completed',
-        runId,
-        planId: accepted.planId,
-        removedAccessScopes: canonicalization.removedAccessScopes,
-        actionTargets: [...new Set(canonicalization.actionTargets.filter(Boolean))],
-        reason: 'invalid_execution_scope',
+        stage: 'accepted_plan.batch_checkpoint',
+        source: 'modelTaskOutcome',
+        status: input.progress.remainingTaskIds.length ? 'running' : 'completed',
+        summary: input.summary,
+        runId: input.runId,
+        planId: input.accepted.planId,
+        taskId: input.taskId,
+        outcome: 'alreadySatisfied',
+        modelJudgedSufficient: true,
+        evidenceRefs: input.evidenceRefs,
+        evidenceRevision: input.evidenceRevision,
+        acceptanceResults: input.acceptanceResults,
+        newlyCompletedTaskIds: [],
+        completedTaskIds: input.progress.completedTaskIds,
+        modelJudgedSufficientTaskIds: input.progress.modelJudgedSufficientTaskIds ?? [],
+        newlyModelJudgedSufficientTaskIds: input.progress.newlyModelJudgedSufficientTaskIds ?? [],
+        remainingTaskIds: input.progress.remainingTaskIds,
+        taskLedger,
+        taskOrder: taskLedger?.taskOrder ?? [],
+        nextPendingTaskIds: taskLedger?.pendingTaskIds ?? [],
+        contextCompactRecord: input.contextCompactRecord,
         channel: 'progress',
-        visibility: 'debug',
+        visibility: 'conversation',
         presentation: 'collapsible',
+        activity: conversationActivity({
+          activityId: input.id,
+          kind: input.progress.remainingTaskIds.length ? 'editBatchQueued' : 'reviewCheckpoint',
+          status: 'completed',
+          title: 'Accepted task outcome',
+          summary: input.summary,
+          source: 'session',
+          runId: input.runId,
+          planId: input.accepted.planId,
+          targets: input.accepted.tasks.find((task) => task.taskId === input.taskId)?.targets,
+        }),
       },
     };
   }
@@ -622,7 +672,7 @@ export class SessionProgressProjectionBuilder {
     return { key: 'session.runState.planReview' };
   }
 
-  private taskRecords(accepted: AcceptedImplementationPlanContext): Array<{
+  private taskRecords(accepted: AcceptedTaskPlanContext): Array<{
     taskId: string;
     title: string;
     targets: string[];
@@ -632,7 +682,7 @@ export class SessionProgressProjectionBuilder {
       taskId: task.taskId,
       title: task.title ?? task.taskId,
       targets: task.targets,
-      capability: task.capability,
+      toolId: task.toolId,
     }));
   }
 }
@@ -646,7 +696,7 @@ function actionTargetsFromAudit(audit: Record<string, unknown>): string[] {
   return audit.actions.flatMap((item) => {
     const record = objectRecord(item);
     if (!record) return [];
-    return stringArrayValue(record.resourceScope).concat(stringValue(record.targetPath) ?? []);
+    return stringValue(record.targetPath) ?? [];
   });
 }
 
@@ -657,50 +707,4 @@ function objectRecord(value: unknown): Record<string, unknown> | undefined {
 
 function stringValue(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim().length > 0 ? value : undefined;
-}
-
-function stringArrayValue(value: unknown): string[] {
-  return Array.isArray(value)
-    ? value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
-    : [];
-}
-
-function normalizeProviderUsage(usage: Record<string, unknown> | undefined): Record<string, number | undefined> {
-  const promptTokens = numberValue(usage?.prompt_tokens) ?? numberValue(usage?.input_tokens);
-  const completionTokens = numberValue(usage?.completion_tokens) ?? numberValue(usage?.output_tokens);
-  const totalTokens = numberValue(usage?.total_tokens)
-    ?? (promptTokens !== undefined && completionTokens !== undefined ? promptTokens + completionTokens : undefined);
-  const cachedTokens = numberValue(usage?.cached_tokens)
-    ?? numberAtPath(usage, ['prompt_tokens_details', 'cached_tokens'])
-    ?? numberAtPath(usage, ['input_tokens_details', 'cached_tokens']);
-  const promptCacheHitTokens = numberValue(usage?.prompt_cache_hit_tokens)
-    ?? numberValue(usage?.cache_read_input_tokens)
-    ?? cachedTokens;
-  const promptCacheMissTokens = numberValue(usage?.prompt_cache_miss_tokens)
-    ?? numberValue(usage?.cache_creation_input_tokens)
-    ?? (promptTokens !== undefined && promptCacheHitTokens !== undefined
-      ? Math.max(0, promptTokens - promptCacheHitTokens)
-      : undefined);
-  return {
-    promptCacheHitTokens,
-    promptCacheMissTokens,
-    cachedTokens,
-    promptTokens,
-    completionTokens,
-    totalTokens,
-  };
-}
-
-function numberAtPath(value: unknown, path: string[]): number | undefined {
-  let current: unknown = value;
-  for (const key of path) {
-    const record = objectRecord(current);
-    if (!record) return undefined;
-    current = record[key];
-  }
-  return numberValue(current);
-}
-
-function numberValue(value: unknown): number | undefined {
-  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
 }

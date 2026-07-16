@@ -1,6 +1,6 @@
 import type { AgentConversationActivity, AgentEvent } from '@deepcode/protocol';
 import type { ProposalEnvelope } from '../../protocol/types.js';
-import type { AcceptedImplementationPlanContext, ActionBatchFailureDetail } from '../execution/index.js';
+import type { AcceptedTaskPlanContext, ActionBatchFailureDetail } from '../execution/index.js';
 import type { InteractionOverlayContext, SessionTurnPhase } from '../pipelines/index.js';
 import type { DecisionOwnerRef, SessionRunStateReason, SessionRunStateStatus } from './sessionProgressProjectionBuilder.js';
 
@@ -28,6 +28,107 @@ export interface SessionFailureProjectionBuilderPorts {
 
 export class SessionFailureProjectionBuilder {
   constructor(private readonly ports: SessionFailureProjectionBuilderPorts) {}
+
+  internalFailureEvents(input: {
+    sessionId: string;
+    runId: string;
+    stage: string;
+    code: string;
+    message: string;
+    reason: 'driver_failure' | 'provider_failure';
+    ts: string;
+    id: string;
+  }): AgentEvent[] {
+    const diagnosticRef = `${input.id}-diagnostic`;
+    return [
+      this.errorEvent({
+        id: diagnosticRef,
+        sessionId: input.sessionId,
+        ts: input.ts,
+        message: input.message,
+        messageKey: 'session.driver.internalFailure',
+        code: input.code,
+        runId: input.runId,
+        title: `Session ${input.stage} failed`,
+        errorMessage: input.message,
+      }),
+      this.ports.sessionRunStateEvent({
+        sessionId: input.sessionId,
+        runId: input.runId,
+        phase: 'failed',
+        status: 'failed',
+        reason: input.reason,
+        decisionOwner: {
+          kind: 'session',
+          runId: input.runId,
+          targetId: diagnosticRef,
+        },
+        ts: input.ts,
+        id: input.id,
+      }),
+    ];
+  }
+
+  acceptedTaskDiagnosticFailureEvents(input: {
+    sessionId: string;
+    runId: string;
+    planId: string;
+    taskId: string;
+    severity: string;
+    message: string;
+    ts: string;
+    id: string;
+  }): AgentEvent[] {
+    const diagnosticId = `${input.id}-diagnostic`;
+    return [
+      {
+        id: `${input.id}-task`,
+        sessionId: input.sessionId,
+        ts: input.ts,
+        kind: 'workflow_stage',
+        payload: {
+          stage: 'accepted_plan.task_failed',
+          status: 'failed',
+          code: 'accepted_task_diagnostic',
+          severity: input.severity,
+          summary: input.message,
+          runId: input.runId,
+          planId: input.planId,
+          taskId: input.taskId,
+          channel: 'progress',
+          visibility: 'conversation',
+          presentation: 'collapsible',
+        },
+      },
+      this.errorEvent({
+        id: diagnosticId,
+        sessionId: input.sessionId,
+        ts: input.ts,
+        message: input.message,
+        messageKey: 'session.driver.acceptedTaskDiagnostic',
+        code: 'accepted_task_diagnostic',
+        runId: input.runId,
+        planId: input.planId,
+        title: 'Accepted task diagnostic',
+        errorMessage: input.message,
+      }),
+      this.ports.sessionRunStateEvent({
+        sessionId: input.sessionId,
+        runId: input.runId,
+        phase: 'failed',
+        status: 'failed',
+        reason: 'task_diagnostic',
+        decisionOwner: {
+          kind: 'plan',
+          runId: input.runId,
+          targetId: input.taskId,
+          planId: input.planId,
+        },
+        ts: input.ts,
+        id: input.id,
+      }),
+    ];
+  }
 
   actionBundleAdmissionFailureEvents(
     sessionId: string,
@@ -140,7 +241,7 @@ export class SessionFailureProjectionBuilder {
   acceptedPlanNormalizationFailureEvents(
     sessionId: string,
     runId: string,
-    accepted: AcceptedImplementationPlanContext,
+    accepted: AcceptedTaskPlanContext,
     reasons: string[],
     ts: string,
     id: string
@@ -166,7 +267,7 @@ export class SessionFailureProjectionBuilder {
   acceptedPlanExecutionFailureEvents(
     sessionId: string,
     runId: string,
-    accepted: AcceptedImplementationPlanContext,
+    accepted: AcceptedTaskPlanContext,
     kernelEvents: unknown[],
     batch: Record<string, unknown> | undefined,
     ts: string,
@@ -202,6 +303,7 @@ export class SessionFailureProjectionBuilder {
         messageKey: input.messageKey,
         messageArgs: { reasonCount: input.reasons?.length ?? 0 },
         code: input.code,
+        diagnosticRef: input.id,
         runId: input.runId,
         planId: input.planId,
         reasons: input.reasons,

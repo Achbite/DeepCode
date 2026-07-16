@@ -3,7 +3,7 @@ import type { ResourcePacket } from '../../context/types.js';
 import type { DriverProviderTurnFrame } from '../runFrame.js';
 
 export interface NativeToolExposurePolicyState {
-  acceptedImplementationPlan?: unknown;
+  acceptedTaskPlan?: unknown;
   providerTurnFrame?: DriverProviderTurnFrame;
   resourcePackets?: ResourcePacket[];
 }

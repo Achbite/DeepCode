@@ -51,5 +51,5 @@ reply parsing, removes duplicated projection assembly, or prevents provider
 prompt/repair entry points from drifting apart.
 
 Provider behavior quality issues, such as repeated reads or weak plan task
-shape, belong to ProviderTurnContract or PlanContract work. Do not solve those
+shape, belong to ProviderTurnContract or Session task-plan contract work. Do not solve those
 by adding test-specific branches to the loop.

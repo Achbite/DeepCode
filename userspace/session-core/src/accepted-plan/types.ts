@@ -22,7 +22,7 @@ export interface CurrentTaskContext {
   nodeId?: string;
   taskTitle?: string;
   targets: string[];
-  capabilities: string[];
+  toolIds: string[];
   acceptanceCriteria?: string[];
   failureCriteria?: string[];
   taskOrder: string[];
@@ -33,66 +33,72 @@ export interface CurrentTaskContext {
   modelJudgedSufficientTaskIds?: string[];
 }
 
-export interface AcceptedImplementationPlanTaskContext {
+export interface AcceptedTaskPlanTaskContext {
   taskId: string;
   title?: string;
-  capability?: string;
-  semanticOperation?: string;
+  toolId?: string;
   targets: string[];
   acceptanceCriteria?: string[];
   failureCriteria?: string[];
   dependencies: string[];
+  planningArgs: Record<string, unknown>;
   conflictKeys: string[];
   batchKind?: ExecutionSliceRole;
-  role?: ExecutionSliceRole;
 }
 
-export interface AcceptedImplementationPlanExecutionRoot {
+export interface TaskDependencyFactRecord {
+  taskId: string;
+  factRef: string;
+  toolCallId: string;
+  workUnitId: string;
+  toolId: string;
+  path: string;
+  operation?: string;
+  contentHash?: string;
+  sizeBytes?: number;
+  mode?: number;
+  executable?: boolean;
+}
+
+export interface AcceptedPlanAuthorizationOperation {
+  operationId: string;
+  sourceTaskId: string;
+  toolId: string;
+  operationKind: string;
+  contentMode: string;
+  targets: string[];
+  dependsOn: string[];
+  fixedArgs: Record<string, unknown>;
+  argsTemplate: Record<string, unknown>;
+  targetResourceKind?: 'file' | 'directory';
+  recursive?: boolean;
+  internal: boolean;
+}
+
+export interface AcceptedTaskPlanExecutionRoot {
   attachment: AgentContextAttachment;
   ref: string;
   source: 'projectWorkingDirectory' | 'workspaceBinding' | 'recentAttachment';
 }
 
-export interface AcceptedPlanAccessScope {
-  scopeKind: string;
-  path: string;
-  capabilities: string[];
-  operations: string[];
-  reason?: string;
-  dependencyDepth?: number;
-  sourceTaskId?: string;
-  outsideWorkspace?: boolean;
-  source: 'kernelPlanReview' | 'implementationPlan';
-}
-
-export interface AcceptedPlanExactOperationGrant {
-  operation: string;
-  targetPath: string;
-  targetRefPath?: string;
-  targetResourceKind?: 'file' | 'directory';
-  recursive?: boolean;
-  capability: string;
-  actionId?: string;
-  sourceTaskId?: string;
-  outsideWorkspace?: boolean;
-  source: 'kernelPlanReview' | 'implementationPlan';
-}
-
-export interface AcceptedImplementationPlanContext {
+export interface AcceptedTaskPlanContext {
   planId: string;
+  planHash?: string;
+  authorizationContractId?: string;
+  authorizationContractHash?: string;
   runId: string;
   title?: string;
   summary?: string;
-  tasks: AcceptedImplementationPlanTaskContext[];
-  capabilities: string[];
+  tasks: AcceptedTaskPlanTaskContext[];
+  authorizationOperations: AcceptedPlanAuthorizationOperation[];
+  toolIds: string[];
   targetScopes: string[];
-  exactOperationGrants: AcceptedPlanExactOperationGrant[];
-  accessScopes: AcceptedPlanAccessScope[];
-  executionRoot?: AcceptedImplementationPlanExecutionRoot;
+  executionRoot?: AcceptedTaskPlanExecutionRoot;
   interventionLevel?: AcceptedPlanInterventionLevel;
   batchIndex: number;
   completedTaskIds: string[];
   modelJudgedSufficientTaskIds?: string[];
+  dependencyFacts: TaskDependencyFactRecord[];
   rawPlan: Record<string, unknown>;
 }
 
@@ -121,12 +127,9 @@ export interface AcceptedPlanBatchValidationResult {
 export interface AcceptedPlanBatchValidationIssue {
   code:
     | 'missingActionBundle'
-    | 'invalidTargetPath'
-    | 'capabilityRequiresDecision'
-    | 'capabilityOutOfScope'
-    | 'missingTarget'
-    | 'targetOutOfScope'
-    | 'freshEvidenceMissing';
+    | 'taskBindingMismatch'
+    | 'draftBindingMismatch'
+    | 'protocolShapeInvalid';
   message: string;
   targetPath?: string;
   capability?: string;
