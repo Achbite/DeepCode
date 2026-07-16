@@ -28,16 +28,6 @@ pub enum RunStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub enum StageStatus {
-    Pending,
-    Running,
-    Completed,
-    Blocked,
-    Failed,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub enum MessageRole {
     User,
     Agent,

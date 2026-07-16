@@ -29,6 +29,13 @@ pub enum KernelError {
     PendingPermissionUnavailable(String),
     #[error("permission denied: {0}")]
     PermissionDenied(String),
+    #[error("{message}")]
+    Structured {
+        code: &'static str,
+        stage: &'static str,
+        message: String,
+        details: Value,
+    },
     #[error("kernel error: {0}")]
     Other(String),
 }
@@ -46,13 +53,21 @@ impl From<&KernelError> for KernelErrorEnvelope {
             KernelError::AttachmentAccessDenied(_) => "attachment_access_denied",
             KernelError::PendingPermissionUnavailable(_) => "pending_permission_unavailable",
             KernelError::PermissionDenied(_) => "permission_denied",
+            KernelError::Structured { code, .. } => code,
             KernelError::Other(_) => "kernel_error",
+        };
+        let args = match value {
+            KernelError::Structured { stage, details, .. } => Some(serde_json::json!({
+                "stage": stage,
+                "details": details,
+            })),
+            _ => None,
         };
         Self {
             code: code.to_string(),
             message: value.to_string(),
             message_key: None,
-            args: None,
+            args,
         }
     }
 }

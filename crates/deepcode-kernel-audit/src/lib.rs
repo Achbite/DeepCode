@@ -211,16 +211,16 @@ impl AuditChain {
             .map(|entry| entry.entry_hash.clone())
             .unwrap_or_else(|| zero_hash().to_string());
         let body_hash = hash_hex(&canonical_bytes(&body.redacted_payload)?);
-        let entry_hash = entry_hash(
-            &self.segment_id,
+        let entry_hash = entry_hash(&AuditEntryHashInput {
+            segment_id: &self.segment_id,
             sequence,
             timestamp_ms,
-            &body,
-            &prev_hash,
-            &body_hash,
-            self.signer.key_id(),
-            SignatureAlg::LocalSha256V1,
-        )?;
+            body: &body,
+            prev_hash: &prev_hash,
+            body_hash: &body_hash,
+            key_id: self.signer.key_id(),
+            signature_alg: SignatureAlg::LocalSha256V1,
+        })?;
         let signature = self.signer.sign(&entry_hash);
         let entry = SignedAuditEntryV1 {
             schema_version: 1,
@@ -324,16 +324,16 @@ impl AuditVerifier {
                 request_id: entry.request_id.clone(),
                 redacted_payload: entry.body_redacted.clone(),
             };
-            let expected_entry_hash = entry_hash(
-                &entry.segment_id,
-                entry.sequence,
-                entry.timestamp_ms,
-                &body,
-                &entry.prev_hash,
-                &entry.body_hash,
-                &entry.key_id,
-                entry.signature_alg.clone(),
-            )?;
+            let expected_entry_hash = entry_hash(&AuditEntryHashInput {
+                segment_id: &entry.segment_id,
+                sequence: entry.sequence,
+                timestamp_ms: entry.timestamp_ms,
+                body: &body,
+                prev_hash: &entry.prev_hash,
+                body_hash: &entry.body_hash,
+                key_id: &entry.key_id,
+                signature_alg: entry.signature_alg.clone(),
+            })?;
             if entry.entry_hash != expected_entry_hash {
                 return verify_error(format!("entry_hash mismatch at {}", entry.sequence));
             }
@@ -392,31 +392,33 @@ fn canonical_value(value: &Value) -> AuditResult<Value> {
     }
 }
 
-fn entry_hash(
-    segment_id: &str,
+struct AuditEntryHashInput<'a> {
+    segment_id: &'a str,
     sequence: u64,
     timestamp_ms: i64,
-    body: &AuditBody,
-    prev_hash: &str,
-    body_hash: &str,
-    key_id: &str,
+    body: &'a AuditBody,
+    prev_hash: &'a str,
+    body_hash: &'a str,
+    key_id: &'a str,
     signature_alg: SignatureAlg,
-) -> AuditResult<String> {
+}
+
+fn entry_hash(input: &AuditEntryHashInput<'_>) -> AuditResult<String> {
     let value = serde_json::json!({
         "schema_version": 1,
-        "segment_id": segment_id,
-        "sequence": sequence,
-        "timestamp_ms": timestamp_ms,
-        "actor": &body.actor,
-        "category": &body.category,
-        "event_type": &body.event_type,
-        "session_id": &body.session_id,
-        "run_id": &body.run_id,
-        "request_id": &body.request_id,
-        "prev_hash": prev_hash,
-        "body_hash": body_hash,
-        "key_id": key_id,
-        "signature_alg": &signature_alg,
+        "segment_id": input.segment_id,
+        "sequence": input.sequence,
+        "timestamp_ms": input.timestamp_ms,
+        "actor": &input.body.actor,
+        "category": &input.body.category,
+        "event_type": &input.body.event_type,
+        "session_id": &input.body.session_id,
+        "run_id": &input.body.run_id,
+        "request_id": &input.body.request_id,
+        "prev_hash": input.prev_hash,
+        "body_hash": input.body_hash,
+        "key_id": input.key_id,
+        "signature_alg": &input.signature_alg,
     });
     Ok(hash_hex(&canonical_bytes(&value)?))
 }

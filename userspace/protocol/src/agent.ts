@@ -342,6 +342,7 @@ export interface PatchAgentWorkflowConfigRequest {
 export type AgentEventKind =
   | 'user_msg'
   | 'user_guidance'
+  | 'session_turn_authority'
   | 'assistant_msg'
   | 'cache_telemetry'
   | 'requirement_confirmation'
@@ -406,6 +407,8 @@ export interface AgentSession {
   title?: string;
   mode: AgentMode;
   profileId?: string;
+  projectId?: string;
+  workspaceBinding?: AgentWorkspaceBinding;
   workspaceId?: string;
   workspaceHash?: string;
   workspaceScopeKey?: string;
@@ -421,6 +424,7 @@ export interface AgentContextAttachment {
   kind: 'file' | 'directory' | 'panelSnapshot';
   path: string;
   absolutePath?: string;
+  resourceId?: string;
   folderId?: string;
   source: 'mention' | 'contextMenu' | 'browser' | 'userSelected';
   scope: 'message' | 'session';
@@ -439,6 +443,19 @@ export interface AgentWorkspaceBinding {
   openPath?: string;
   activeFolderId?: string;
   folderHash?: string;
+}
+
+export type AgentProjectKind = 'folder' | 'blank';
+export type AgentProjectRootStatus = 'ready' | 'unbound' | 'unavailable';
+
+export interface AgentProject {
+  id: string;
+  title: string;
+  kind: AgentProjectKind;
+  workspaceBinding?: AgentWorkspaceBinding;
+  rootStatus: AgentProjectRootStatus;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface PermissionRequest {
@@ -468,6 +485,24 @@ export interface AgentEvent {
   kind: AgentEventKind;
   payload: unknown;
   display?: AgentEventDisplayHint;
+}
+
+export type SessionTurnAuthorityRelation = 'newTask' | 'interactionContinuation';
+
+export interface SessionTurnAuthorityPayload {
+  schemaVersion: 'deepcode.session.turn-authority.v1';
+  sessionId: string;
+  runId: string;
+  turnId: string;
+  taskId: string;
+  sourceMessageIds: string[];
+  sourceMessageHashes: string[];
+  relation: SessionTurnAuthorityRelation;
+  boundAtHookRef: string;
+  outputLanguage: string;
+  promptEpochId?: string;
+  previousTaskId?: string;
+  authorityHash: string;
 }
 
 export type AgentTimelineBlockKind =
@@ -843,15 +878,18 @@ export interface CreateAgentSessionRequest {
   initialMode?: AgentMode;
   mode?: AgentMode;
   profileId?: string;
+  projectId?: string;
   workspaceId?: string;
   workspaceHash?: string;
   title?: string;
 }
 
 export interface ListAgentSessionsRequest {
+  projectId?: string;
   workspaceId?: string;
   workspaceHash?: string;
   includeArchived?: boolean;
+  includeAllScopes?: boolean;
 }
 
 export interface AgentSessionListResult {
@@ -862,6 +900,32 @@ export interface AgentSessionListResult {
 
 export interface RenameAgentSessionRequest {
   title: string;
+}
+
+export interface UpdateAgentSessionRequest {
+  title?: string;
+  projectId?: string | null;
+}
+
+export interface AgentProjectListResult {
+  projects: AgentProject[];
+}
+
+export interface CreateAgentProjectRequest {
+  title?: string;
+  rootPath?: string;
+}
+
+export interface UpdateAgentProjectRequest {
+  title: string;
+}
+
+export interface RebindAgentProjectRequest {
+  rootPath: string;
+}
+
+export interface AgentProjectResult {
+  project: AgentProject;
 }
 
 export interface ArchiveAgentSessionRequest {

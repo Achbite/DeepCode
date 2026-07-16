@@ -44,14 +44,12 @@ fn packaged_build_info() -> Option<Value> {
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|path| path.parent().map(PathBuf::from))?;
-    for path in [
+    [
         exe_dir.join("build-info.json"),
         exe_dir.join("..").join("build-info.json"),
-    ] {
-        let value = read_json_file(&path)?;
-        return Some(value);
-    }
-    None
+    ]
+    .into_iter()
+    .find_map(|path| read_json_file(&path))
 }
 
 pub(crate) async fn kernel_commands(
@@ -167,12 +165,15 @@ pub(crate) async fn kernel_events_stream(
         .into_response()
 }
 
-pub(crate) async fn api_not_implemented(
+pub(crate) async fn api_route_not_found(
     method: Method,
     Path(path): Path<String>,
-) -> Json<ApiResponse> {
-    ApiResponse::error(
-        "not_implemented",
-        format!("{} /api/{} is not implemented", method, path),
+) -> impl IntoResponse {
+    (
+        StatusCode::NOT_FOUND,
+        ApiResponse::error(
+            "api_route_not_found",
+            format!("{method} /api/{path} does not match a registered API route"),
+        ),
     )
 }

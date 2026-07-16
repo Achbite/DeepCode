@@ -1,7 +1,8 @@
 use crate::{
-    KernelEvent, PermissionDecisionKind, ProfileRef, ProposalEnvelope, RequestId,
-    ResourceResolveRequest, RunId, SessionId, TemporaryGrantEnvelope, UserDecisionSubmit,
-    UserInput, WorkflowRef, WorkspaceBinding,
+    ArtifactDraftLedgerFrame, AuditQueryFilter, HostInspectionQuery, PermissionDecisionKind,
+    PlanAuthorizationDecisionSubmit, ProfileRef, ProposalEnvelope, RequestId,
+    ResourceResolveRequest, RunId, SessionId, TaskIntentEnvelope, UserDecisionSubmit, UserInput,
+    WorkspaceBinding,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -20,20 +21,12 @@ pub enum KernelCommand {
         request_id: RequestId,
         session_id: Option<SessionId>,
     },
-    ConfigGet {
-        request_id: RequestId,
-    },
-    ConfigPatch {
-        request_id: RequestId,
-        patch: Value,
-    },
     RunCreate {
         request_id: RequestId,
         session_id: Option<SessionId>,
         input: UserInput,
         workspace_binding: Option<WorkspaceBinding>,
         profile_ref: Option<ProfileRef>,
-        workflow_ref: Option<WorkflowRef>,
         run_overrides: Option<Value>,
     },
     StateContractGet {
@@ -47,6 +40,18 @@ pub enum KernelCommand {
         session_id: Option<SessionId>,
         proposal: ProposalEnvelope,
     },
+    PlanAuthorizationSubmit {
+        request_id: RequestId,
+        run_id: RunId,
+        session_id: Option<SessionId>,
+        intent: TaskIntentEnvelope,
+    },
+    PlanAuthorizationDecisionSubmit {
+        request_id: RequestId,
+        run_id: RunId,
+        session_id: Option<SessionId>,
+        decision: PlanAuthorizationDecisionSubmit,
+    },
     UserDecisionSubmit {
         request_id: RequestId,
         run_id: RunId,
@@ -59,17 +64,11 @@ pub enum KernelCommand {
         session_id: Option<SessionId>,
         request: ResourceResolveRequest,
     },
-    ArtifactRegister {
-        request_id: RequestId,
-        run_id: RunId,
-        session_id: Option<SessionId>,
-        artifact: Value,
-    },
     DraftLedgerSubmit {
         request_id: RequestId,
         run_id: RunId,
         session_id: Option<SessionId>,
-        frame: Value,
+        frame: ArtifactDraftLedgerFrame,
     },
     ActionBatchSubmit {
         request_id: RequestId,
@@ -96,6 +95,10 @@ pub enum KernelCommand {
         request_id: RequestId,
         session_id: SessionId,
     },
+    WorkspaceBindingResolve {
+        request_id: RequestId,
+        path: String,
+    },
     WorkspaceOpen {
         request_id: RequestId,
         path: String,
@@ -105,23 +108,10 @@ pub enum KernelCommand {
     },
     HostResourceQuery {
         request_id: RequestId,
-        query: Value,
+        query: HostInspectionQuery,
     },
     SkillDiscover {
         request_id: RequestId,
-    },
-    SkillInvoke {
-        request_id: RequestId,
-        run_id: Option<RunId>,
-        session_id: Option<SessionId>,
-        skill_id: String,
-        input: Value,
-    },
-    WorkflowObserve {
-        request_id: RequestId,
-        run_id: RunId,
-        session_id: Option<SessionId>,
-        event: Box<KernelEvent>,
     },
     PermissionResolve {
         request_id: RequestId,
@@ -145,12 +135,6 @@ pub enum KernelCommand {
     },
     AuditQuery {
         request_id: RequestId,
-        filter: Value,
-        projection: Option<String>,
-    },
-    PermissionGrantTemporary {
-        request_id: RequestId,
-        run_id: RunId,
-        grant: TemporaryGrantEnvelope,
+        filter: AuditQueryFilter,
     },
 }

@@ -42,8 +42,11 @@ impl SkillExecutorRegistry {
     }
 
     pub fn register(&mut self, executor: Box<dyn SkillExecutor>) {
-        self.executors
-            .insert(executor.descriptor().id.clone(), executor);
+        let tool_id = executor.descriptor().id;
+        assert!(
+            self.executors.insert(tool_id.clone(), executor).is_none(),
+            "duplicate executor binding for canonical tool {tool_id}"
+        );
     }
 
     pub fn invoke(
@@ -53,7 +56,7 @@ impl SkillExecutorRegistry {
     ) -> KernelResult<SkillResult> {
         if context.trust_mode == SkillTrustMode::DirectHostScript {
             return Err(KernelError::PermissionDenied(
-                "direct host script skills are a reserved high-risk extension and are disabled in v1"
+                "direct host script skills are not enabled by the active Kernel skill runtime"
                     .to_string(),
             ));
         }

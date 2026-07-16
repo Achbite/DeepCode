@@ -16,7 +16,6 @@ impl DeepCodeKernelRuntime {
                 input,
                 workspace_binding,
                 profile_ref,
-                workflow_ref,
                 run_overrides,
             } => self.run_create(
                 request_id,
@@ -24,7 +23,6 @@ impl DeepCodeKernelRuntime {
                 input,
                 workspace_binding,
                 profile_ref,
-                workflow_ref,
                 run_overrides,
             ),
             KernelCommand::StateContractGet {
@@ -38,6 +36,18 @@ impl DeepCodeKernelRuntime {
                 session_id,
                 proposal,
             } => self.proposal_submit(request_id, run_id, session_id, proposal),
+            KernelCommand::PlanAuthorizationSubmit {
+                request_id,
+                run_id,
+                session_id,
+                intent,
+            } => self.plan_authorization_submit(request_id, run_id, session_id, intent),
+            KernelCommand::PlanAuthorizationDecisionSubmit {
+                request_id,
+                run_id,
+                session_id,
+                decision,
+            } => self.plan_authorization_decision_submit(request_id, run_id, session_id, decision),
             KernelCommand::UserDecisionSubmit {
                 request_id,
                 run_id,
@@ -50,18 +60,19 @@ impl DeepCodeKernelRuntime {
                 session_id,
                 request,
             } => self.resource_resolve(request_id, run_id, session_id, request),
-            KernelCommand::ArtifactRegister {
-                request_id,
-                run_id,
-                session_id,
-                artifact,
-            } => self.artifact_register(request_id, run_id, session_id, artifact),
             KernelCommand::DraftLedgerSubmit {
                 request_id,
                 run_id,
                 session_id,
                 frame,
-            } => self.draft_ledger_submit(request_id, run_id, session_id, frame),
+            } => self.draft_ledger_submit(
+                request_id,
+                run_id,
+                session_id,
+                serde_json::to_value(frame).map_err(|error| {
+                    KernelError::InvalidCommand(format!("encode artifact draft frame: {error}"))
+                })?,
+            ),
             KernelCommand::ActionBatchSubmit {
                 request_id,
                 run_id,
@@ -83,19 +94,14 @@ impl DeepCodeKernelRuntime {
                 request_id,
                 session_id,
             } => self.snapshot_get(request_id, session_id),
-            KernelCommand::ConfigGet { request_id } => {
-                self.not_implemented(request_id, "config.get")
-            }
-            KernelCommand::ConfigPatch { request_id, .. } => {
-                self.not_implemented(request_id, "config.patch")
-            }
-            KernelCommand::RunCancel { request_id, .. } => {
-                self.not_implemented(request_id, "run.cancel")
-            }
+            KernelCommand::RunCancel { request_id, run_id } => self.run_cancel(request_id, run_id),
             KernelCommand::RunResume {
                 request_id,
                 session_id,
             } => self.run_resume(request_id, session_id),
+            KernelCommand::WorkspaceBindingResolve { request_id, path } => {
+                self.workspace_binding_resolve(request_id, path)
+            }
             KernelCommand::WorkspaceOpen { request_id, path } => {
                 self.workspace_open(request_id, path)
             }
@@ -104,19 +110,6 @@ impl DeepCodeKernelRuntime {
                 self.host_resource_query(request_id, query)
             }
             KernelCommand::SkillDiscover { request_id } => self.skill_discover(request_id),
-            KernelCommand::SkillInvoke {
-                request_id,
-                run_id,
-                session_id,
-                skill_id,
-                input,
-            } => self.skill_invoke(request_id, run_id, session_id, skill_id, input),
-            KernelCommand::WorkflowObserve {
-                request_id,
-                run_id,
-                session_id,
-                event,
-            } => self.workflow_observe(request_id, run_id, session_id, *event),
             KernelCommand::PermissionResolve {
                 request_id,
                 permission_id,
@@ -141,14 +134,9 @@ impl DeepCodeKernelRuntime {
             KernelCommand::AuditVerify { request_id, scope } => {
                 self.audit_verify(request_id, scope)
             }
-            KernelCommand::AuditQuery { request_id, .. } => {
-                self.not_implemented(request_id, "audit.query")
+            KernelCommand::AuditQuery { request_id, filter } => {
+                self.audit_query(request_id, filter)
             }
-            KernelCommand::PermissionGrantTemporary {
-                request_id,
-                run_id,
-                grant,
-            } => self.permission_grant_temporary(request_id, run_id, grant),
         }
     }
 }

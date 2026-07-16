@@ -1,4 +1,7 @@
-use crate::{ConfigSnapshotRef, PermissionRequestEnvelope, RunId, SessionId, WorkspaceBinding};
+use crate::{
+    ConfigSnapshotRef, PermissionRequestEnvelope, RunId, RuntimeLifecycleState, SessionId,
+    WorkspaceBinding,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -8,7 +11,7 @@ pub struct KernelSnapshot {
     pub run_id: Option<RunId>,
     pub workspace_binding: Option<WorkspaceBinding>,
     pub config_ref: Option<ConfigSnapshotRef>,
-    pub workflow_phase: Option<String>,
+    pub lifecycle_state: Option<RuntimeLifecycleState>,
     pub pending_stage: Option<String>,
     pub events: Vec<KernelEventSummary>,
     pub pending_permission: Option<PermissionRequestEnvelope>,

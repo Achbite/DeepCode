@@ -16,7 +16,7 @@ fn kernel_snapshot_is_recoverable_without_gui_state() {
             snapshot_id: "cfg-1".to_string(),
             hash: Some("cfg-hash".to_string()),
         }),
-        workflow_phase: Some("plan".to_string()),
+        lifecycle_state: Some(RuntimeLifecycleState::Ready),
         pending_stage: None,
         events: vec![KernelEventSummary {
             id: Some("evt-1".to_string()),

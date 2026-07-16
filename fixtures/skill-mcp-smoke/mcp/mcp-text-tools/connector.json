@@ -22,7 +22,7 @@
       "id": "text.template",
       "title": "Text template",
       "kind": "resource",
-      "requiredCapabilities": ["fs.read"]
+      "requiredCapabilities": ["workspace.read"]
     }
   ],
   "prompts": [

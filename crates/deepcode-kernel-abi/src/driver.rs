@@ -1,12 +1,17 @@
-use crate::{RunId, SessionId, WorkflowRef};
+use crate::{RunId, SessionId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DraftAdmissionPolicy {
+    pub max_total_utf8_bytes: u64,
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KernelStateContract {
     pub run_id: RunId,
-    pub workflow_ref: Option<WorkflowRef>,
     pub state_id: String,
     pub state_kind: String,
     pub allowed_inputs: Vec<String>,
@@ -19,6 +24,7 @@ pub struct KernelStateContract {
     pub tool_catalog_hash: Option<String>,
     #[serde(default)]
     pub tool_catalog_snapshot: Option<Value>,
+    pub draft_admission_policy: DraftAdmissionPolicy,
     pub transition_predicates: Vec<String>,
     pub fail_closed_rules: Vec<String>,
 }
@@ -97,4 +103,20 @@ pub struct UserDecisionSubmit {
 #[serde(rename_all = "camelCase")]
 pub struct ResourceResolveRequest {
     pub manifest: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalResourceLease {
+    pub resource_id: String,
+    pub root_id: String,
+    pub canonical_path: String,
+    pub target_kind: ExternalResourceKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ExternalResourceKind {
+    File,
+    Directory,
 }

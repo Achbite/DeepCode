@@ -1,9 +1,32 @@
 use super::*;
-use deepcode_kernel_skills::file_content::{
-    lightweight_file_classification, read_text_file_for_llm,
-};
+use deepcode_kernel_tools::file_content::lightweight_file_classification;
 
 impl DeepCodeKernelRuntime {
+    pub(crate) fn workspace_binding_resolve(
+        &self,
+        request_id: RequestId,
+        path: String,
+    ) -> KernelResult<Vec<KernelEvent>> {
+        let requested = PathBuf::from(path.trim());
+        if !requested.is_dir() {
+            return Err(KernelError::InvalidCommand(format!(
+                "workspace binding path is not a directory: {}",
+                requested.display()
+            )));
+        }
+        let resolved = resolve_workspace_root(&path).map_err(KernelError::InvalidCommand)?;
+        preflight_workspace_root_readable(&resolved.root)?;
+        let binding = workspace_binding_from_root(&resolved.root);
+        self.workspace_result(
+            request_id,
+            "workspace.binding.resolve",
+            Ok(serde_json::json!({
+                "workspaceBinding": binding,
+                "rootStatus": "ready"
+            })),
+        )
+    }
+
     pub(crate) fn workspace_open(
         &mut self,
         request_id: RequestId,
@@ -60,119 +83,70 @@ impl DeepCodeKernelRuntime {
     pub(crate) fn host_resource_query(
         &self,
         request_id: RequestId,
-        query: Value,
+        query: HostInspectionQuery,
     ) -> KernelResult<Vec<KernelEvent>> {
-        let query_kind = query
-            .get("kind")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| {
-                KernelError::InvalidCommand("host resource query requires kind".to_string())
-            })?;
-        let output = match query_kind {
-            "browse" => host_browse_output(&query),
-            "list" => self.host_list_output(&query),
-            "read" => self.host_read_output(&query),
-            "search" => self.host_search_output(&query),
-            other => Err(KernelError::InvalidCommand(format!(
-                "unsupported host resource query kind {other}"
-            ))),
-        }?;
-        Ok(vec![KernelEvent::ResourcePacketProduced {
-            request_id: Some(request_id),
-            run_id: None,
-            session_id: None,
-            packet: serde_json::json!({
-                "source": "hostProjection",
-                "queryKind": query_kind,
-                "output": output
-            }),
-            sequence: None,
-        }])
-    }
-
-    pub(crate) fn workspace_read(
-        &self,
-        request_id: RequestId,
-        folder_id: Option<String>,
-        path: String,
-    ) -> KernelResult<Vec<KernelEvent>> {
-        let result = (|| {
-            let _workspace = self.current_workspace()?;
-            validate_folder_id(folder_id.as_deref())?;
-            let target = self.resolve_workspace_path(&path)?;
-            if !target.is_file() {
-                return Err(KernelError::InvalidCommand(format!("{path} is not a file")));
+        let query_kind = query.kind().to_string();
+        let output = match query {
+            HostInspectionQuery::Browse { path } => host_browse_output(path.as_deref()),
+            HostInspectionQuery::List {
+                folder_id,
+                path,
+                depth,
+            } => {
+                validate_folder_id(folder_id.as_deref())?;
+                self.execute_host_projection_tool(
+                    "fs.list",
+                    serde_json::json!({
+                        "path": path,
+                        "depth": depth,
+                        "includeHidden": false
+                    }),
+                )
             }
-            let read = read_text_file_for_llm(&target).map_err(|skip| {
-                KernelError::InvalidCommand(format!(
-                    "unsupported_file_content: {} ({})",
-                    skip.message, skip.reason
-                ))
-            })?;
-            let content = read.content;
-            let size_bytes = content.len();
-            Ok(serde_json::json!({
-                "folderId": "wf-0",
-                "path": normalize_relative_path(&path),
-                "content": content,
-                "sizeBytes": size_bytes,
-                "binary": false,
-                "fileClassification": read.classification
-            }))
-        })();
-        self.workspace_result(request_id, "fs.read", result)
-    }
-
-    pub(crate) fn workspace_search(
-        &self,
-        request_id: RequestId,
-        folder_id: Option<String>,
-        query: String,
-        include: Option<Vec<String>>,
-        context_lines: Option<u32>,
-        max_results: Option<u32>,
-        is_regex: bool,
-    ) -> KernelResult<Vec<KernelEvent>> {
-        let result = (|| {
-            let workspace = self.current_workspace()?;
-            validate_folder_id(folder_id.as_deref())?;
-            if is_regex {
-                return Err(KernelError::NotImplemented("code.search.regex"));
+            HostInspectionQuery::Read { folder_id, path } => {
+                validate_folder_id(folder_id.as_deref())?;
+                self.execute_host_projection_tool("fs.read", serde_json::json!({ "path": path }))
             }
-            if query.trim().is_empty() {
-                return Err(KernelError::InvalidCommand(
-                    "search query is required".to_string(),
-                ));
-            }
-            let includes = include.unwrap_or_default();
-            let context_lines = context_lines.unwrap_or(0);
-            let max_results = max_results.unwrap_or(WORKSPACE_SEARCH_DEFAULT_MAX_RESULTS as u32);
-            let result = search_workspace_with_options(
-                &workspace.root,
-                &query,
-                &includes,
+            HostInspectionQuery::Grep {
+                folder_id,
+                query,
+                path,
+                include,
+                exclude,
+                strategy,
                 context_lines,
                 max_results,
-            )?;
-            let returned_matches = result.matches.len();
-            Ok(serde_json::json!({
-                "folderId": "wf-0",
-                "query": query,
-                "include": includes,
-                "contextLines": result.context_lines,
-                "maxResults": result.max_results,
-                "returnedMatches": returned_matches,
-                "truncated": result.truncated,
-                "visitedFiles": result.visited_files,
-                "skippedFiles": result.skipped_files,
-                "skippedBinaryFiles": result.skipped_binary_files,
-                "skippedExecutableFiles": result.skipped_executable_files,
-                "matches": result.matches
-            }))
-        })();
-        self.workspace_result(request_id, "code.search", result)
+            } => {
+                validate_folder_id(folder_id.as_deref())?;
+                self.execute_host_projection_tool(
+                    "code.grep",
+                    serde_json::json!({
+                        "query": query,
+                        "path": path,
+                        "include": include,
+                        "exclude": exclude,
+                        "strategy": strategy,
+                        "contextLines": context_lines,
+                        "maxResults": max_results
+                    }),
+                )
+            }
+            HostInspectionQuery::GitStatus => {
+                self.execute_host_projection_tool("git.status", serde_json::json!({}))
+            }
+            HostInspectionQuery::GitDiff { path, staged } => self.execute_host_projection_tool(
+                "git.diff",
+                serde_json::json!({ "path": path, "staged": staged }),
+            ),
+        }?;
+        Ok(vec![KernelEvent::HostInspectionCompleted {
+            request_id,
+            result: HostInspectionResult {
+                source: "hostProjection".to_string(),
+                query_kind,
+                output,
+            },
+        }])
     }
 
     pub(crate) fn current_workspace(&self) -> KernelResult<&RuntimeWorkspace> {
@@ -180,127 +154,6 @@ impl DeepCodeKernelRuntime {
             .current_workspace
             .as_ref()
             .ok_or(KernelError::MissingWorkspaceBinding)
-    }
-
-    pub(crate) fn resolve_workspace_path(&self, relative_path: &str) -> KernelResult<PathBuf> {
-        let workspace = self.current_workspace()?;
-        WorkspaceBoundary::new(&workspace.root).resolve(relative_path)
-    }
-
-    fn host_list_output(&self, query: &Value) -> KernelResult<Value> {
-        let workspace = self.current_workspace()?;
-        validate_folder_id(query.get("folderId").and_then(Value::as_str))?;
-        let path = query
-            .get("path")
-            .and_then(Value::as_str)
-            .unwrap_or(".")
-            .trim();
-        let depth = query
-            .get("depth")
-            .and_then(Value::as_u64)
-            .map(|value| value.min(8) as u32)
-            .unwrap_or(2);
-        let target = self.resolve_workspace_path(if path.is_empty() { "." } else { path })?;
-        if !target.is_dir() {
-            return Err(KernelError::InvalidCommand(format!(
-                "{} is not a directory",
-                target.display()
-            )));
-        }
-        Ok(serde_json::json!({
-            "nodes": list_nodes(&target, &workspace.root, depth)?
-        }))
-    }
-
-    fn host_read_output(&self, query: &Value) -> KernelResult<Value> {
-        validate_folder_id(query.get("folderId").and_then(Value::as_str))?;
-        let path = query
-            .get("path")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| KernelError::InvalidCommand("host read requires path".to_string()))?;
-        let target = self.resolve_workspace_path(path)?;
-        if !target.is_file() {
-            return Err(KernelError::InvalidCommand(format!("{path} is not a file")));
-        }
-        let read = read_text_file_for_llm(&target).map_err(|skip| {
-            KernelError::InvalidCommand(format!(
-                "unsupported_file_content: {} ({})",
-                skip.message, skip.reason
-            ))
-        })?;
-        let content = read.content;
-        let size_bytes = content.len();
-        Ok(serde_json::json!({
-            "folderId": "wf-0",
-            "path": normalize_relative_path(path),
-            "content": content,
-            "sizeBytes": size_bytes,
-            "binary": false,
-            "fileClassification": read.classification
-        }))
-    }
-
-    fn host_search_output(&self, query: &Value) -> KernelResult<Value> {
-        let workspace = self.current_workspace()?;
-        validate_folder_id(query.get("folderId").and_then(Value::as_str))?;
-        let search = query
-            .get("query")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| KernelError::InvalidCommand("host search requires query".to_string()))?;
-        let includes = query
-            .get("include")
-            .and_then(Value::as_array)
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        let context_lines = query
-            .get("contextLines")
-            .and_then(Value::as_u64)
-            .map(|value| value as u32)
-            .unwrap_or(0);
-        let max_results = query
-            .get("maxResults")
-            .and_then(Value::as_u64)
-            .map(|value| value as u32)
-            .unwrap_or(WORKSPACE_SEARCH_DEFAULT_MAX_RESULTS as u32);
-        let is_regex = query
-            .get("isRegex")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        if is_regex {
-            return Err(KernelError::NotImplemented("code.search.regex"));
-        }
-        let result = search_workspace_with_options(
-            &workspace.root,
-            search,
-            &includes,
-            context_lines,
-            max_results,
-        )?;
-        let returned_matches = result.matches.len();
-        Ok(serde_json::json!({
-            "folderId": "wf-0",
-            "query": search,
-            "include": includes,
-            "contextLines": result.context_lines,
-            "maxResults": result.max_results,
-            "returnedMatches": returned_matches,
-            "truncated": result.truncated,
-            "visitedFiles": result.visited_files,
-            "skippedFiles": result.skipped_files,
-            "skippedBinaryFiles": result.skipped_binary_files,
-            "skippedExecutableFiles": result.skipped_executable_files,
-            "matches": result.matches
-        }))
     }
 
     pub(crate) fn workspace_result(
@@ -323,10 +176,8 @@ impl DeepCodeKernelRuntime {
     }
 }
 
-fn host_browse_output(query: &Value) -> KernelResult<Value> {
-    let path = query
-        .get("path")
-        .and_then(Value::as_str)
+fn host_browse_output(path: Option<&str>) -> KernelResult<Value> {
+    let path = path
         .map(PathBuf::from)
         .or_else(host_home_dir)
         .unwrap_or_else(|| PathBuf::from("/"));
@@ -461,6 +312,18 @@ pub(crate) fn workspace_json(workspace: &RuntimeWorkspace) -> Value {
     })
 }
 
+pub(crate) fn workspace_binding_from_root(root: &Path) -> WorkspaceBinding {
+    let canonical = root.to_string_lossy().to_string();
+    let digest = deepcode_kernel_tools::hash_bytes(canonical.as_bytes());
+    WorkspaceBinding {
+        workspace_id: Some(format!("workspace-{}", &digest[..16])),
+        workspace_hash: Some(digest.clone()),
+        open_path: Some(canonical),
+        active_folder_id: Some("wf-0".to_string()),
+        folder_hash: Some(digest),
+    }
+}
+
 pub(crate) fn unsupported_workspace_fields(value: &Value) -> Vec<Value> {
     let Some(object) = value.as_object() else {
         return Vec::new();
@@ -499,16 +362,7 @@ pub(crate) fn validate_folder_id(folder_id: Option<&str>) -> KernelResult<()> {
     Ok(())
 }
 
-pub(crate) fn normalize_relative_path(path: &str) -> String {
-    let normalized = path.replace('\\', "/");
-    if normalized.is_empty() {
-        ".".to_string()
-    } else {
-        normalized
-    }
-}
-
-fn preflight_workspace_root_readable(root: &Path) -> KernelResult<()> {
+pub(crate) fn preflight_workspace_root_readable(root: &Path) -> KernelResult<()> {
     list_nodes(root, root, 1).map(|_| ()).map_err(|error| {
         KernelError::WorkspaceRootUnreadable(format!(
             "{} cannot be listed for read-only workspace access: {error}",
@@ -517,17 +371,53 @@ fn preflight_workspace_root_readable(root: &Path) -> KernelResult<()> {
     })
 }
 
+pub(crate) struct DirectoryListing {
+    pub(crate) nodes: Vec<Value>,
+    pub(crate) returned_count: usize,
+    pub(crate) truncated: bool,
+}
+
 pub(crate) fn list_nodes(path: &Path, root: &Path, depth: u32) -> KernelResult<Vec<Value>> {
+    Ok(list_nodes_bounded(path, root, depth, 200)?.nodes)
+}
+
+pub(crate) fn list_nodes_bounded(
+    path: &Path,
+    root: &Path,
+    depth: u32,
+    max_entries: usize,
+) -> KernelResult<DirectoryListing> {
+    let mut remaining = max_entries.max(1);
+    let mut truncated = false;
+    let nodes = collect_nodes_bounded(path, root, depth, &mut remaining, &mut truncated)?;
+    Ok(DirectoryListing {
+        returned_count: max_entries.max(1) - remaining,
+        nodes,
+        truncated,
+    })
+}
+
+fn collect_nodes_bounded(
+    path: &Path,
+    root: &Path,
+    depth: u32,
+    remaining: &mut usize,
+    truncated: &mut bool,
+) -> KernelResult<Vec<Value>> {
     let mut entries = fs::read_dir(path)
         .map_err(|error| KernelError::Other(format!("list {}: {error}", path.display())))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| KernelError::Other(format!("list {}: {error}", path.display())))?;
     entries.sort_by(compare_dir_entries);
 
-    entries
-        .into_iter()
-        .take(200)
-        .map(|entry| {
+    let mut nodes = Vec::new();
+    for entry in entries {
+        if *remaining == 0 {
+            *truncated = true;
+            break;
+        }
+        *remaining -= 1;
+        let node = (|| {
             let entry_path = entry.path();
             let file_type = entry.file_type().map_err(|error| {
                 KernelError::Other(format!("stat {}: {error}", entry_path.display()))
@@ -538,7 +428,13 @@ pub(crate) fn list_nodes(path: &Path, root: &Path, depth: u32) -> KernelResult<V
                 .to_string_lossy()
                 .replace('\\', "/");
             let children = if file_type.is_dir() && depth > 1 && !skip_directory(&entry_path) {
-                Some(list_nodes(&entry_path, root, depth - 1)?)
+                Some(collect_nodes_bounded(
+                    &entry_path,
+                    root,
+                    depth - 1,
+                    remaining,
+                    truncated,
+                )?)
             } else if file_type.is_dir() {
                 Some(Vec::new())
             } else {
@@ -559,8 +455,10 @@ pub(crate) fn list_nodes(path: &Path, root: &Path, depth: u32) -> KernelResult<V
                         .unwrap_or(Value::Null);
             }
             Ok(node)
-        })
-        .collect()
+        })()?;
+        nodes.push(node);
+    }
+    Ok(nodes)
 }
 
 pub(crate) fn compare_dir_entries(left: &fs::DirEntry, right: &fs::DirEntry) -> Ordering {
@@ -588,147 +486,6 @@ pub(crate) fn compare_dir_entries(left: &fs::DirEntry, right: &fs::DirEntry) -> 
             right_name.to_lowercase(),
             right_name,
         ))
-}
-
-pub(crate) const WORKSPACE_SEARCH_DEFAULT_MAX_RESULTS: usize = 200;
-const WORKSPACE_SEARCH_MAX_RESULTS: usize = 500;
-const WORKSPACE_SEARCH_MAX_VISITED_FILES: usize = 500;
-const WORKSPACE_SEARCH_MAX_CONTEXT_LINES: usize = 5;
-
-pub(crate) struct CodeSearchResult {
-    pub(crate) matches: Vec<Value>,
-    pub(crate) truncated: bool,
-    pub(crate) visited_files: usize,
-    pub(crate) context_lines: usize,
-    pub(crate) max_results: usize,
-    pub(crate) skipped_files: usize,
-    pub(crate) skipped_binary_files: usize,
-    pub(crate) skipped_executable_files: usize,
-}
-
-pub(crate) fn search_workspace_with_options(
-    root: &Path,
-    query: &str,
-    includes: &[String],
-    context_lines: u32,
-    max_results: u32,
-) -> KernelResult<CodeSearchResult> {
-    let mut matches = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    let mut visited_files = 0_usize;
-    let mut skipped_files = 0_usize;
-    let mut skipped_binary_files = 0_usize;
-    let mut skipped_executable_files = 0_usize;
-    let context_lines = (context_lines as usize).min(WORKSPACE_SEARCH_MAX_CONTEXT_LINES);
-    let max_results = (max_results as usize).clamp(1, WORKSPACE_SEARCH_MAX_RESULTS);
-    let mut truncated = false;
-
-    while let Some(path) = stack.pop() {
-        if skip_directory(&path) {
-            continue;
-        }
-        let entries = fs::read_dir(&path)
-            .map_err(|error| KernelError::Other(format!("search {}: {error}", path.display())))?;
-        for entry in entries {
-            let entry =
-                entry.map_err(|error| KernelError::Other(format!("search entry: {error}")))?;
-            let entry_path = entry.path();
-            let file_type = entry.file_type().map_err(|error| {
-                KernelError::Other(format!("stat {}: {error}", entry_path.display()))
-            })?;
-            if file_type.is_dir() {
-                stack.push(entry_path);
-                continue;
-            }
-            if !file_type.is_file() {
-                continue;
-            }
-            let relative = entry_path
-                .strip_prefix(root)
-                .unwrap_or(&entry_path)
-                .to_string_lossy()
-                .replace('\\', "/");
-            if !includes.is_empty() && !includes.iter().any(|pattern| relative.contains(pattern)) {
-                continue;
-            }
-            visited_files += 1;
-            if visited_files > WORKSPACE_SEARCH_MAX_VISITED_FILES {
-                truncated = true;
-                break;
-            }
-            let content = match read_text_file_for_llm(&entry_path) {
-                Ok(read) => read.content,
-                Err(skip) => {
-                    skipped_files += 1;
-                    if skip.classification.binary {
-                        skipped_binary_files += 1;
-                    }
-                    if skip.classification.executable {
-                        skipped_executable_files += 1;
-                    }
-                    continue;
-                }
-            };
-            let lines = content.lines().collect::<Vec<_>>();
-            for (index, line) in lines.iter().enumerate() {
-                if line.contains(query) {
-                    let mut item = serde_json::json!({
-                        "path": relative,
-                        "line": index + 1,
-                        "preview": line
-                    });
-                    if context_lines > 0 {
-                        if let Some(record) = item.as_object_mut() {
-                            let before_start = index.saturating_sub(context_lines);
-                            let before = (before_start..index)
-                                .map(|line_index| {
-                                    serde_json::json!({
-                                        "line": line_index + 1,
-                                        "text": lines[line_index]
-                                    })
-                                })
-                                .collect::<Vec<_>>();
-                            let after_end = (index + 1 + context_lines).min(lines.len());
-                            let after = (index + 1..after_end)
-                                .map(|line_index| {
-                                    serde_json::json!({
-                                        "line": line_index + 1,
-                                        "text": lines[line_index]
-                                    })
-                                })
-                                .collect::<Vec<_>>();
-                            record.insert("before".to_string(), Value::Array(before));
-                            record.insert("after".to_string(), Value::Array(after));
-                        }
-                    }
-                    matches.push(item);
-                    if matches.len() >= max_results {
-                        truncated = true;
-                        return Ok(CodeSearchResult {
-                            matches,
-                            truncated,
-                            visited_files,
-                            context_lines,
-                            max_results,
-                            skipped_files,
-                            skipped_binary_files,
-                            skipped_executable_files,
-                        });
-                    }
-                }
-            }
-        }
-    }
-    Ok(CodeSearchResult {
-        matches,
-        truncated,
-        visited_files,
-        context_lines,
-        max_results,
-        skipped_files,
-        skipped_binary_files,
-        skipped_executable_files,
-    })
 }
 
 pub(crate) fn skip_directory(path: &Path) -> bool {

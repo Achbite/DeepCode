@@ -10,21 +10,7 @@ pub(crate) struct OpenWorkspaceRequest {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct FileQuery {
-    pub(crate) folder_id: Option<String>,
     pub(crate) path: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct SearchRequest {
-    pub(crate) folder_id: Option<String>,
-    pub(crate) query: String,
-    pub(crate) include: Option<Vec<String>>,
-    pub(crate) exclude: Option<Vec<String>>,
-    pub(crate) strategy: Option<String>,
-    pub(crate) context_lines: Option<u32>,
-    pub(crate) max_results: Option<u32>,
-    pub(crate) is_regex: Option<bool>,
 }
 
 pub(crate) async fn workspace_current(State(state): State<AppState>) -> Json<ApiResponse> {
@@ -199,10 +185,7 @@ pub(crate) async fn fs_browse(
         &state.runtime,
         KernelCommand::HostResourceQuery {
             request_id: rid("host-browse"),
-            query: json!({
-                "kind": "browse",
-                "path": query.path
-            }),
+            query: HostInspectionQuery::Browse { path: query.path },
         },
     ) {
         Ok(output) => ApiResponse::ok(output),
@@ -210,80 +193,38 @@ pub(crate) async fn fs_browse(
     }
 }
 
-pub(crate) async fn file_tree(
+pub(crate) async fn host_inspect(
     State(state): State<AppState>,
-    Query(query): Query<FileQuery>,
+    Json(query): Json<HostInspectionQuery>,
 ) -> Json<ApiResponse> {
-    match dispatch_workspace(
-        &state.runtime,
-        KernelCommand::HostResourceQuery {
-            request_id: rid("workspace-list"),
-            query: json!({
-                "kind": "list",
-                "path": query.path.unwrap_or_else(|| ".".to_string()),
-                "folderId": query.folder_id,
-                "depth": 2
-            }),
-        },
-    ) {
-        Ok(output) => {
-            let nodes = output
-                .get("nodes")
-                .cloned()
-                .unwrap_or_else(|| Value::Array(Vec::new()));
-            ApiResponse::ok(nodes)
+    match dispatch_host_inspection(&state.runtime, query) {
+        Ok(result) => ApiResponse::ok(json!(result)),
+        Err(error) => ApiResponse::error(error.code, error.message),
+    }
+}
+
+fn dispatch_host_inspection(
+    runtime: &SharedRuntime,
+    query: HostInspectionQuery,
+) -> Result<HostInspectionResult, KernelErrorEnvelope> {
+    let mut runtime = runtime.lock().expect("kernel runtime lock");
+    let events = runtime
+        .dispatch(KernelCommand::HostResourceQuery {
+            request_id: rid("host-inspection"),
+            query,
+        })
+        .map_err(|error| KernelErrorEnvelope::from(&error))?;
+    for event in events {
+        if let KernelEvent::HostInspectionCompleted { result, .. } = event {
+            return Ok(result);
         }
-        Err(error) => ApiResponse::error(error.code, error.message),
     }
-}
-
-pub(crate) async fn file_read(
-    State(state): State<AppState>,
-    Query(query): Query<FileQuery>,
-) -> Json<ApiResponse> {
-    let Some(path) = query.path else {
-        return ApiResponse::error("invalid_request", "path is required");
-    };
-    match dispatch_workspace(
-        &state.runtime,
-        KernelCommand::HostResourceQuery {
-            request_id: rid("workspace-read"),
-            query: json!({
-                "kind": "read",
-                "path": path,
-                "folderId": query.folder_id
-            }),
-        },
-    ) {
-        Ok(output) => ApiResponse::ok(output),
-        Err(error) => ApiResponse::error(error.code, error.message),
-    }
-}
-
-pub(crate) async fn code_search(
-    State(state): State<AppState>,
-    Json(body): Json<SearchRequest>,
-) -> Json<ApiResponse> {
-    match dispatch_workspace(
-        &state.runtime,
-        KernelCommand::HostResourceQuery {
-            request_id: rid("workspace-search"),
-            query: json!({
-                "kind": "search",
-                "query": body.query,
-                "include": body.include,
-                "exclude": body.exclude,
-                "strategy": body.strategy.unwrap_or_else(|| "literal".to_string()),
-                "contextLines": body.context_lines,
-                "maxResults": body.max_results,
-                "isRegex": body.is_regex.unwrap_or(false),
-                "folderId": body.folder_id
-            }),
-        },
-    ) {
-        Ok(output) => ApiResponse::ok(output),
-        Err(error) => ApiResponse::error(error.code, error.message),
-    }
+    Err(KernelErrorEnvelope {
+        code: "unexpected_event".to_string(),
+        message: "expected typed host inspection result".to_string(),
+        message_key: None,
+        args: None,
+    })
 }
 
 pub(crate) fn dispatch_workspace(
@@ -306,11 +247,7 @@ pub(crate) fn dispatch_workspace(
                 error: Some(error),
                 ..
             } => return Err(error),
-            KernelEvent::ResourcePacketProduced { packet, .. } => {
-                if packet.get("source").and_then(Value::as_str) == Some("hostProjection") {
-                    return Ok(packet.get("output").cloned().unwrap_or(Value::Null));
-                }
-            }
+            KernelEvent::HostInspectionCompleted { result, .. } => return Ok(result.output),
             _ => {}
         }
     }

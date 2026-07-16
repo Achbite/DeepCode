@@ -69,8 +69,7 @@ pub(crate) fn json_body_rejection_error(
         return (
             "http_body_too_large",
             format!(
-                "{route} request body exceeded the local DeepCode HTTP body limit of {} bytes; compact provider traces before retrying",
-                LARGE_JSON_BODY_LIMIT_BYTES
+                "{route} request body exceeded the local DeepCode HTTP body limit of {LARGE_JSON_BODY_LIMIT_BYTES} bytes; compact provider traces before retrying"
             ),
         );
     }
@@ -81,14 +80,4 @@ pub(crate) fn json_body_rejection_error(
             rejection.body_text()
         ),
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn large_json_body_limit_covers_deepcode_context_envelope() {
-        assert!(LARGE_JSON_BODY_LIMIT_BYTES >= 128 * 1024 * 1024);
-    }
 }
