@@ -115,6 +115,14 @@ to publish a mixed product set if source files change during the build. If
 `protocolVersion`, or `toolCatalogVersion`, quit the running app, run
 `make package-macos-clean`, and reopen it.
 
+## Git Branch And PR Workflow
+
+`main` and `dev-main` are permanent protected branches and are updated only by
+pull-request merge commits. Kernel, Session, UI, fix, hotfix, and approved
+release work uses short-lived task branches. See
+[docs/git-branch-flow.md](docs/git-branch-flow.md) for the guarded command-line
+workflow, PR routes, shared hooks, audit, and post-merge cleanup rules.
+
 ## Current Status
 
 - The Kernel daemon exposes `/api/health`, conversation archives, tool catalog, permission audit, workspace, Git, and internal browser APIs.
