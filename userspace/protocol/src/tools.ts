@@ -170,6 +170,13 @@ export interface CodeGrepInput {
   maxResults?: number;
 }
 
+export interface CodeSearchInput {
+  query: string;
+  isRegex?: boolean;
+  include?: string[];
+  folderId?: string;
+}
+
 export interface WebSearchInput {
   query: string;
   limit?: number;
@@ -228,4 +235,10 @@ export interface CodeGrepMatch {
 
 export interface CodeGrepResult {
   matches: CodeGrepMatch[];
+}
+
+export type CodeSearchMatch = CodeGrepMatch;
+
+export interface CodeSearchResult {
+  matches: CodeSearchMatch[];
 }
