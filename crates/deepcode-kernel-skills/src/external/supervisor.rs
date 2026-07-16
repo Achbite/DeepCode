@@ -17,7 +17,8 @@ pub struct ProcessInvocation {
     pub session_id: Option<String>,
     pub skill_id: Option<String>,
     pub connector_id: Option<String>,
-    pub command: Vec<String>,
+    pub program: String,
+    pub argv: Vec<String>,
     pub cwd: Option<String>,
     pub env: Vec<(String, String)>,
     pub stdin_payload: Option<String>,
@@ -197,18 +198,18 @@ impl ProcessSupervisor {
     }
 
     fn invoke_inner(&self, invocation: ProcessInvocation) -> KernelResult<ProcessExecutionResult> {
-        if invocation.command.is_empty() {
+        if invocation.program.trim().is_empty() {
             return Ok(rejected_result(
                 invocation,
                 ProcessLifecycleEventKind::Rejected,
-                "process invocation command is required".to_string(),
+                "process invocation program is required".to_string(),
             ));
         }
         validate_env(&invocation)?;
         let cwd = resolve_cwd(&invocation.policy.cwd_scope, invocation.cwd.as_deref())?;
 
-        let mut command = Command::new(&invocation.command[0]);
-        command.args(invocation.command.iter().skip(1));
+        let mut command = Command::new(&invocation.program);
+        command.args(&invocation.argv);
         command.env_clear();
         for (key, value) in &invocation.env {
             command.env(key, value);
@@ -227,7 +228,7 @@ impl ProcessSupervisor {
         let mut child = command.spawn().map_err(|error| {
             KernelError::Other(format!(
                 "spawn supervised process {}: {error}",
-                invocation.command[0]
+                invocation.program
             ))
         })?;
 
@@ -313,8 +314,8 @@ impl ProcessSupervisor {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExternalProcessSkillSpec {
-    pub command: String,
-    pub args: Vec<String>,
+    pub program: String,
+    pub argv: Vec<String>,
     pub cwd: Option<String>,
     pub env_allowlist: Vec<String>,
     pub timeout_ms: u64,
@@ -323,10 +324,11 @@ pub struct ExternalProcessSkillSpec {
 }
 
 impl ExternalProcessSkillSpec {
-    pub fn python_inline(code: impl Into<String>) -> Self {
+    #[cfg(test)]
+    pub(crate) fn test_python_inline(code: impl Into<String>) -> Self {
         Self {
-            command: "python3".to_string(),
-            args: vec!["-c".to_string(), code.into()],
+            program: "python3".to_string(),
+            argv: vec!["-c".to_string(), code.into()],
             cwd: None,
             env_allowlist: Vec::new(),
             timeout_ms: 3_000,
@@ -368,9 +370,7 @@ impl ExternalProcessSkillRuntime {
 
 impl SkillRuntime for ExternalProcessSkillRuntime {
     fn invoke(&self, invocation: SkillInvocation) -> KernelResult<SkillResult> {
-        let mut command = Vec::with_capacity(1 + self.spec.args.len());
-        command.push(self.spec.command.clone());
-        command.extend(self.spec.args.clone());
+        let mut argv = self.spec.argv.clone();
         if let Some(extra_args) = invocation
             .input
             .get("args")
@@ -382,7 +382,7 @@ impl SkillRuntime for ExternalProcessSkillRuntime {
                         "external process skill args must be strings".to_string(),
                     )
                 })?;
-                command.push(value.to_string());
+                argv.push(value.to_string());
             }
         }
         let stdin_payload = invocation
@@ -402,7 +402,8 @@ impl SkillRuntime for ExternalProcessSkillRuntime {
             session_id: invocation.session_id.clone(),
             skill_id: Some(invocation.skill_id),
             connector_id: None,
-            command,
+            program: self.spec.program.clone(),
+            argv,
             cwd: self.spec.cwd.clone(),
             env,
             stdin_payload,
@@ -436,7 +437,7 @@ fn invocation_breaker_key(invocation: &ProcessInvocation) -> String {
         .as_ref()
         .or(invocation.connector_id.as_ref())
         .cloned()
-        .unwrap_or_else(|| invocation.command.first().cloned().unwrap_or_default())
+        .unwrap_or_else(|| invocation.program.clone())
 }
 
 fn validate_env(invocation: &ProcessInvocation) -> KernelResult<()> {
@@ -571,7 +572,8 @@ mod tests {
             session_id: Some("session-1".to_string()),
             skill_id: Some("fixture.text.transform".to_string()),
             connector_id: None,
-            command: vec!["python3".to_string(), "-c".to_string(), code.to_string()],
+            program: "python3".to_string(),
+            argv: vec!["-c".to_string(), code.to_string()],
             cwd: None,
             env: Vec::new(),
             stdin_payload: None,
@@ -668,9 +670,9 @@ mod tests {
 
     #[test]
     fn external_process_skill_runtime_uses_supervisor() {
-        let runtime = ExternalProcessSkillRuntime::new(ExternalProcessSkillSpec::python_inline(
-            "print('skill-ok')",
-        ));
+        let runtime = ExternalProcessSkillRuntime::new(
+            ExternalProcessSkillSpec::test_python_inline("print('skill-ok')"),
+        );
         let result = runtime
             .invoke(SkillInvocation {
                 id: "invoke-python".to_string(),
@@ -689,9 +691,10 @@ mod tests {
 
     #[test]
     fn external_process_skill_accepts_stdin_payload() {
-        let runtime = ExternalProcessSkillRuntime::new(ExternalProcessSkillSpec::python_inline(
-            "import json,sys; payload=json.load(sys.stdin); print(payload['text'].upper())",
-        ));
+        let runtime =
+            ExternalProcessSkillRuntime::new(ExternalProcessSkillSpec::test_python_inline(
+                "import json,sys; payload=json.load(sys.stdin); print(payload['text'].upper())",
+            ));
         let result = runtime
             .invoke(SkillInvocation {
                 id: "invoke-stdin".to_string(),

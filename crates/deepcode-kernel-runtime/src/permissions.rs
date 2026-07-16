@@ -1,268 +1,9 @@
 use super::*;
 use crate::action_batch::explicit_attachment_root;
 
+mod recovery;
+
 impl DeepCodeKernelRuntime {
-    pub(crate) fn pending_permission_for_run(
-        &self,
-        run_id: &str,
-    ) -> KernelResult<Option<deepcode_kernel_abi::PermissionRequestEnvelope>> {
-        if let Some((permission_id, pending)) = self
-            .state
-            .pending_tools
-            .iter()
-            .find(|(_, pending)| pending.run_id == run_id)
-        {
-            return Ok(Some(permission_envelope_from_pending(
-                permission_id,
-                pending,
-            )));
-        }
-        let events = self.ledger.list_by_run(run_id)?;
-        let resolved = events
-            .iter()
-            .filter(|event| event.kind == "permission.resolved")
-            .filter_map(|event| event.payload.get("permissionId").and_then(Value::as_str))
-            .collect::<std::collections::BTreeSet<_>>();
-        let pending = events
-            .iter()
-            .rev()
-            .find(|event| {
-                event.kind == "permission.requested"
-                    && event
-                        .payload
-                        .get("permissionId")
-                        .and_then(Value::as_str)
-                        .map(|id| !resolved.contains(id))
-                        .unwrap_or(false)
-            })
-            .and_then(|event| {
-                let permission_id = event.payload.get("permissionId")?.as_str()?;
-                Some(deepcode_kernel_abi::PermissionRequestEnvelope {
-                    id: permission_id.to_string(),
-                    permission_bundle_id: event
-                        .payload
-                        .get("permissionBundleId")
-                        .and_then(Value::as_str)
-                        .map(str::to_string),
-                    contract_id: event
-                        .payload
-                        .get("contractId")
-                        .and_then(Value::as_str)
-                        .map(str::to_string),
-                    affected_operation_ids: event
-                        .payload
-                        .get("affectedOperationIds")
-                        .and_then(Value::as_array)
-                        .into_iter()
-                        .flatten()
-                        .filter_map(Value::as_str)
-                        .map(str::to_string)
-                        .collect(),
-                    work_unit_ids: event
-                        .payload
-                        .get("workUnitIds")
-                        .and_then(Value::as_array)
-                        .into_iter()
-                        .flatten()
-                        .filter_map(Value::as_str)
-                        .map(str::to_string)
-                        .collect(),
-                    tool_id: event
-                        .payload
-                        .get("toolName")
-                        .and_then(Value::as_str)
-                        .map(str::to_string),
-                    capability: event
-                        .payload
-                        .get("capability")
-                        .and_then(Value::as_str)
-                        .unwrap_or_else(|| {
-                            event
-                                .payload
-                                .get("toolName")
-                                .and_then(Value::as_str)
-                                .map(capability_for_tool)
-                                .unwrap_or("fs.write")
-                        })
-                        .to_string(),
-                    risk_level: event
-                        .payload
-                        .get("riskLevel")
-                        .and_then(Value::as_str)
-                        .unwrap_or_else(|| {
-                            event
-                                .payload
-                                .get("toolName")
-                                .and_then(Value::as_str)
-                                .map(risk_for_tool)
-                                .unwrap_or("high")
-                        })
-                        .to_string(),
-                    summary: event
-                        .payload
-                        .get("summary")
-                        .and_then(Value::as_str)
-                        .unwrap_or("Permission requested by Kernel.")
-                        .to_string(),
-                    args_preview: event
-                        .payload
-                        .get("argsPreview")
-                        .cloned()
-                        .unwrap_or(Value::Null),
-                })
-            });
-        Ok(pending)
-    }
-
-    pub(crate) fn ensure_permission_restored(&mut self, permission_id: &str) -> KernelResult<()> {
-        if self.state.pending_tools.contains_key(permission_id) {
-            return Ok(());
-        }
-        let events = self.ledger.list_all()?;
-        let already_resolved = events.iter().any(|event| {
-            event.kind == "permission.resolved"
-                && event.payload.get("permissionId").and_then(Value::as_str) == Some(permission_id)
-        });
-        if already_resolved {
-            return Ok(());
-        }
-        let Some(requested) = events.iter().rev().find(|event| {
-            event.kind == "permission.requested"
-                && event.payload.get("permissionId").and_then(Value::as_str) == Some(permission_id)
-        }) else {
-            return Ok(());
-        };
-        let Some(run_id) = requested.run_id.clone() else {
-            return Ok(());
-        };
-        let Some(session_id) = requested.session_id.clone() else {
-            return Ok(());
-        };
-        self.ensure_session_restored(&session_id)?;
-        if let Some((restored_id, pending)) = self.pending_tool_from_ledger(&run_id)? {
-            if restored_id == permission_id {
-                self.state.pending_tools.insert(restored_id, pending);
-            }
-        }
-        Ok(())
-    }
-
-    pub(crate) fn pending_tool_from_ledger(
-        &self,
-        run_id: &str,
-    ) -> KernelResult<Option<(String, PendingKernelTool)>> {
-        let events = self.ledger.list_by_run(run_id)?;
-        let resolved = events
-            .iter()
-            .filter(|event| event.kind == "permission.resolved")
-            .filter_map(|event| event.payload.get("permissionId").and_then(Value::as_str))
-            .collect::<std::collections::BTreeSet<_>>();
-        let pending = events
-            .iter()
-            .rev()
-            .find(|event| {
-                event.kind == "permission.requested"
-                    && event
-                        .payload
-                        .get("permissionId")
-                        .and_then(Value::as_str)
-                        .map(|id| !resolved.contains(id))
-                        .unwrap_or(false)
-            })
-            .and_then(|event| {
-                let permission_id = event.payload.get("permissionId")?.as_str()?.to_string();
-                let session_id = event.session_id.clone()?;
-                let tool_name = event.payload.get("toolName")?.as_str()?.to_string();
-                let arguments = event
-                    .payload
-                    .get("arguments")
-                    .cloned()
-                    .or_else(|| event.payload.get("args").cloned())?;
-                Some((
-                    permission_id,
-                    PendingKernelTool {
-                        run_id: run_id.to_string(),
-                        session_id,
-                        tool_name,
-                        arguments,
-                        permission_bundle_id: event
-                            .payload
-                            .get("permissionBundleId")
-                            .and_then(Value::as_str)
-                            .map(str::to_string),
-                        contract_id: event
-                            .payload
-                            .get("contractId")
-                            .and_then(Value::as_str)
-                            .map(str::to_string),
-                        affected_operation_ids: event
-                            .payload
-                            .get("affectedOperationIds")
-                            .and_then(Value::as_array)
-                            .into_iter()
-                            .flatten()
-                            .filter_map(Value::as_str)
-                            .map(str::to_string)
-                            .collect(),
-                        work_unit_ids: event
-                            .payload
-                            .get("workUnitIds")
-                            .and_then(Value::as_array)
-                            .into_iter()
-                            .flatten()
-                            .filter_map(Value::as_str)
-                            .map(str::to_string)
-                            .collect(),
-                        request_id: event
-                            .payload
-                            .get("requestId")
-                            .and_then(Value::as_str)
-                            .map(str::to_string),
-                        work_unit_id: event
-                            .payload
-                            .get("workUnitId")
-                            .and_then(Value::as_str)
-                            .map(str::to_string),
-                        action_id: event
-                            .payload
-                            .get("actionId")
-                            .and_then(Value::as_str)
-                            .map(str::to_string),
-                        plan_id: event
-                            .payload
-                            .get("planId")
-                            .and_then(Value::as_str)
-                            .map(str::to_string),
-                        operation_kind: event
-                            .payload
-                            .get("operationKind")
-                            .and_then(Value::as_str)
-                            .map(str::to_string),
-                        read_set: event
-                            .payload
-                            .get("readSet")
-                            .and_then(Value::as_array)
-                            .into_iter()
-                            .flatten()
-                            .filter_map(Value::as_str)
-                            .map(str::to_string)
-                            .collect(),
-                        write_set: event
-                            .payload
-                            .get("writeSet")
-                            .and_then(Value::as_array)
-                            .into_iter()
-                            .flatten()
-                            .filter_map(Value::as_str)
-                            .map(str::to_string)
-                            .collect(),
-                        group_items: Vec::new(),
-                    },
-                ))
-            });
-        Ok(pending)
-    }
-
     pub(crate) fn permission_resolve(
         &mut self,
         request_id: RequestId,
@@ -281,12 +22,7 @@ impl DeepCodeKernelRuntime {
             })?;
         let session_id = pending.session_id.clone();
         let run_id = pending.run_id.clone();
-        let phase = self
-            .state
-            .records_by_session
-            .get(&session_id)
-            .map(|record| record.phase.as_str().to_string())
-            .ok_or_else(|| KernelError::InvalidCommand("missing run record".to_string()))?;
+        self.record_by_run(&run_id)?;
         let resolved_sequence = self.ledger.next_sequence(&run_id)?;
         let resolved_event = KernelEvent::PermissionResolved {
             run_id: Some(RunId(run_id.clone())),
@@ -296,18 +32,6 @@ impl DeepCodeKernelRuntime {
             reason: None,
             sequence: Some(resolved_sequence),
         };
-
-        {
-            let record = self
-                .state
-                .records_by_session
-                .get_mut(&session_id)
-                .ok_or_else(|| KernelError::InvalidCommand("missing run record".to_string()))?;
-            let resolved_phase = record.phase.as_str().to_string();
-            record
-                .decision_state
-                .apply_event(&resolved_event, &resolved_phase);
-        }
 
         let group_item_context = pending
             .group_items
@@ -350,7 +74,59 @@ impl DeepCodeKernelRuntime {
             }),
         )?;
 
+        if decision == deepcode_kernel_abi::PermissionDecisionKind::Accept {
+            let mut targets = pending
+                .group_items
+                .iter()
+                .flat_map(|item| item.read_set.iter().chain(item.write_set.iter()))
+                .chain(pending.read_set.iter().chain(pending.write_set.iter()))
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .map(Some)
+                .collect::<Vec<_>>();
+            if targets.is_empty() {
+                targets.push(None);
+            }
+            let operation_ids = if pending.affected_operation_ids.is_empty() {
+                pending.action_id.iter().cloned().collect::<Vec<_>>()
+            } else {
+                pending.affected_operation_ids.clone()
+            };
+            let contract_id = pending
+                .contract_id
+                .clone()
+                .unwrap_or_else(|| format!("runtime-permission-{permission_id}"));
+            let capability = capability_for_tool(&pending.tool_name)?.to_string();
+            let grants = targets
+                .into_iter()
+                .enumerate()
+                .map(|(index, resource_path)| TemporaryGrantEnvelope {
+                    id: format!("{permission_id}-{index}"),
+                    contract_id: contract_id.clone(),
+                    operation_ids: operation_ids.clone(),
+                    capability: capability.clone(),
+                    resource_kind: "runtimePermission".to_string(),
+                    resource_path,
+                    expires_after_sequence: None,
+                    reason: Some("Kernel runtime permission accepted by user".to_string()),
+                })
+                .collect::<Vec<_>>();
+            self.register_temporary_grants(&run_id, &session_id, grants)?;
+        }
+
         let mut events = vec![resolved_event];
+        if decision == deepcode_kernel_abi::PermissionDecisionKind::Accept {
+            if let Some(event) = self.transition_runtime_lifecycle(
+                Some(request_id.clone()),
+                &run_id,
+                &session_id,
+                RuntimeLifecycleState::Executing,
+                "permissionAccepted",
+            )? {
+                events.push(event);
+            }
+        }
         let group_items = pending_group_items(&permission_id, &pending);
         if group_items.iter().any(|item| item.work_unit_id.is_some()) {
             match decision {
@@ -447,7 +223,13 @@ impl DeepCodeKernelRuntime {
                 }
             }
             if !self.has_pending_permission_for_run(&run_id) {
-                events.push(self.enter_phase_event(&run_id, &session_id, WorkflowPhase::Review)?);
+                self.append_batch_review_ready_events(
+                    &mut events,
+                    &request_id,
+                    &run_id,
+                    &session_id,
+                    pending.contract_id.as_deref().unwrap_or_default(),
+                )?;
             }
             return Ok(events);
         }
@@ -463,100 +245,16 @@ impl DeepCodeKernelRuntime {
             events.push(completed);
         }
 
-        let workflow_decision = {
-            let record = self
-                .state
-                .records_by_session
-                .get(&session_id)
-                .ok_or_else(|| KernelError::InvalidCommand("missing run record".to_string()))?;
-            record.decision_state.decide(&phase)
-        };
-        let workflow_sequence = self.ledger.next_sequence(&run_id)?;
-        self.append_ledger(
+        if let Some(event) = self.transition_runtime_lifecycle(
+            Some(request_id),
             &run_id,
             &session_id,
-            "workflow.decision_made",
-            workflow_sequence,
-            serde_json::json!({
-                "summary": workflow_decision.summary,
-                "observedKind": "permission.resolved",
-                "observedSequence": resolved_sequence,
-                "decision": workflow_decision
-            }),
-        )?;
-
-        events.push(KernelEvent::WorkflowDecisionMade {
-            request_id: Some(request_id),
-            run_id: RunId(run_id),
-            session_id: Some(SessionId(session_id)),
-            decision: workflow_decision.clone(),
-            sequence: Some(workflow_sequence),
-        });
+            RuntimeLifecycleState::Ready,
+            "permissionResolvedWithoutWorkUnit",
+        )? {
+            events.push(event);
+        }
         Ok(events)
-    }
-
-    pub(crate) fn permission_grant_temporary(
-        &mut self,
-        _request_id: RequestId,
-        run_id: RunId,
-        grant: deepcode_kernel_abi::TemporaryGrantEnvelope,
-    ) -> KernelResult<Vec<KernelEvent>> {
-        let record = self.record_by_run(&run_id.0)?;
-        let record_run_id = record.run_id.clone();
-        let session_id = record.session_id.clone();
-        self.state
-            .temporary_grants_by_run
-            .entry(run_id.0.clone())
-            .or_default()
-            .push(grant.clone());
-        let sequence = self.ledger.next_sequence(&run_id.0)?;
-        self.append_ledger(
-            &run_id.0,
-            &session_id,
-            "temporaryGrant.created",
-            sequence,
-            serde_json::json!({
-                "summary": "Temporary permission grant recorded.",
-                "grant": grant
-            }),
-        )?;
-        let autonomy_sequence = self.ledger.next_sequence(&run_id.0)?;
-        self.append_ledger(
-            &run_id.0,
-            &session_id,
-            "autonomy.transitioned",
-            autonomy_sequence,
-            serde_json::json!({
-                "summary": "Temporary grant changed the effective capability set for this run.",
-                "fromLevel": autonomy_level_name(&self.policy_profile.autonomy_level),
-                "toLevel": autonomy_level_name(&self.policy_profile.autonomy_level),
-                "capabilitySet": [&grant.capability]
-            }),
-        )?;
-        Ok(vec![
-            KernelEvent::MessageAppended {
-                run_id: Some(run_id),
-                session_id: Some(SessionId(session_id.clone())),
-                turn_id: None,
-                role: deepcode_kernel_abi::MessageRole::System,
-                channel: Some("policy".to_string()),
-                content: None,
-                message_key: Some("permission.temporaryGrant.created".to_string()),
-                args: None,
-                sequence: Some(sequence),
-            },
-            KernelEvent::AutonomyTransitioned {
-                run_id: Some(RunId(record_run_id)),
-                session_id: Some(SessionId(session_id)),
-                from_level: Some(
-                    autonomy_level_name(&self.policy_profile.autonomy_level).to_string(),
-                ),
-                to_level: autonomy_level_name(&self.policy_profile.autonomy_level).to_string(),
-                capability_set: vec![grant.capability],
-                reason: Some("temporary grant recorded".to_string()),
-                sequence: Some(autonomy_sequence),
-            },
-        ])
     }
 
     pub(crate) fn effective_permission_action_for_tool(
@@ -565,7 +263,14 @@ impl DeepCodeKernelRuntime {
         tool_name: &str,
         arguments: &Value,
     ) -> KernelResult<PermissionAction> {
-        let base = permission_action_for_kernel_tool(tool_name);
+        let base =
+            web_permission_mode_for_tool_args(&self.tool_runtime_config, tool_name, arguments)
+                .map(|mode| match mode {
+                    ToolPermissionMode::Allow => PermissionAction::Allow,
+                    ToolPermissionMode::Ask => PermissionAction::Ask,
+                    ToolPermissionMode::Deny => PermissionAction::Deny,
+                })
+                .unwrap_or_else(|| permission_action_for_kernel_tool(tool_name));
         if base != PermissionAction::Ask {
             return Ok(base);
         }
@@ -588,10 +293,8 @@ impl DeepCodeKernelRuntime {
         tool_name: &str,
         arguments: &Value,
     ) -> KernelResult<bool> {
-        let Some(grants) = self.state.temporary_grants_by_run.get(run_id) else {
-            return Ok(false);
-        };
-        let capability = capability_for_tool(tool_name);
+        let grants = self.active_temporary_grants(run_id);
+        let capability = capability_for_tool(tool_name)?;
         let next_sequence = self.ledger.next_sequence(run_id).unwrap_or(u64::MAX);
         Ok(grants.iter().any(|grant| {
             if grant.capability != capability {
@@ -608,7 +311,7 @@ impl DeepCodeKernelRuntime {
                 grant.resource_kind.as_str(),
                 "workspaceModule" | "workspaceDependency"
             ) {
-                if !matches!(capability, "fs.write" | "fs.patch") {
+                if !matches!(capability, "fs.write" | "fs.edit") {
                     return false;
                 }
                 return grant
@@ -642,13 +345,7 @@ impl DeepCodeKernelRuntime {
     ) -> KernelResult<bool> {
         if !matches!(
             tool_name,
-            "fs.write"
-                | "fs.patch"
-                | "fs.delete"
-                | "fs.read"
-                | "fs.list"
-                | "code.search"
-                | "fs.diff"
+            "fs.write" | "fs.edit" | "fs.delete" | "fs.read" | "fs.list" | "code.grep" | "fs.diff"
         ) {
             return Ok(false);
         }
@@ -712,14 +409,6 @@ impl DeepCodeKernelRuntime {
         }
         let record = self.record_by_run(run_id)?;
         let mut roots = Vec::new();
-        if let Some(root) = self
-            .state
-            .current_workspace
-            .as_ref()
-            .map(|workspace| workspace.root.clone())
-        {
-            roots.push(root);
-        }
         if let Some(open_path) = record.workspace_binding.open_path.as_ref() {
             roots.push(PathBuf::from(open_path));
         }
@@ -740,13 +429,13 @@ impl DeepCodeKernelRuntime {
 pub(crate) fn permission_envelope_from_pending(
     permission_id: &str,
     pending: &PendingKernelTool,
-) -> deepcode_kernel_abi::PermissionRequestEnvelope {
+) -> KernelResult<deepcode_kernel_abi::PermissionRequestEnvelope> {
     let grouped_work_unit_ids = pending
         .group_items
         .iter()
         .filter_map(|item| item.work_unit_id.clone())
         .collect::<Vec<_>>();
-    deepcode_kernel_abi::PermissionRequestEnvelope {
+    Ok(deepcode_kernel_abi::PermissionRequestEnvelope {
         id: permission_id.to_string(),
         permission_bundle_id: pending.permission_bundle_id.clone(),
         contract_id: pending.contract_id.clone(),
@@ -761,11 +450,11 @@ pub(crate) fn permission_envelope_from_pending(
             pending.work_unit_ids.clone()
         },
         tool_id: Some(pending.tool_name.clone()),
-        capability: capability_for_tool(&pending.tool_name).to_string(),
-        risk_level: risk_for_tool(&pending.tool_name).to_string(),
+        capability: capability_for_tool(&pending.tool_name)?.to_string(),
+        risk_level: risk_for_tool(&pending.tool_name)?.to_string(),
         summary: format!("Allow {} to access workspace resources?", pending.tool_name),
         args_preview: redact_tool_arguments(&pending.tool_name, &pending.arguments),
-    }
+    })
 }
 
 fn pending_group_items(
@@ -790,6 +479,24 @@ fn pending_group_items(
 }
 
 fn argument_resource_matches(tool_name: &str, arguments: &Value, path: &str) -> bool {
+    if let Some(expected) = path.strip_prefix("network:") {
+        return arguments
+            .get("url")
+            .or_else(|| arguments.get("query"))
+            .and_then(Value::as_str)
+            == Some(expected);
+    }
+    if let Some(expected) = path.strip_prefix("git:") {
+        if matches!(expected, "workspace" | "index") {
+            return tool_name.starts_with("git.");
+        }
+        return arguments
+            .get("paths")
+            .and_then(Value::as_array)
+            .map(|items| items.iter().any(|item| item.as_str() == Some(expected)))
+            .unwrap_or(false)
+            || arguments.get("path").and_then(Value::as_str) == Some(expected);
+    }
     let direct = arguments
         .get("path")
         .or_else(|| arguments.get("url"))

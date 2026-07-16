@@ -1,6 +1,5 @@
-use deepcode_kernel_abi::{ConfigSnapshotRef, TemporaryGrantEnvelope, WorkspaceBinding};
-use deepcode_kernel_ledger::{ChangeOperation, KernelResourceRegistry, ValidationResult};
-use deepcode_kernel_workflow::{RunDecisionState, WorkflowPhase};
+use deepcode_kernel_abi::{ConfigSnapshotRef, KernelPlanAuthorizationContract, WorkspaceBinding};
+use deepcode_kernel_ledger::{ChangeOperation, KernelResourceManager, ValidationResult};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -12,14 +11,33 @@ pub(crate) struct RuntimeState {
     pub(crate) current_workspace: Option<RuntimeWorkspace>,
     pub(crate) records_by_session: BTreeMap<String, RuntimeRunRecord>,
     pub(crate) pending_tools: BTreeMap<String, PendingKernelTool>,
-    pub(crate) draft_ledger_keys: BTreeSet<String>,
+    pub(crate) artifact_drafts: BTreeMap<String, ArtifactDraftRuntimeRecord>,
+    pub(crate) terminal_artifact_draft_keys: BTreeSet<String>,
     pub(crate) execution_contracts_by_run: BTreeMap<String, BTreeMap<String, Value>>,
-    pub(crate) temporary_grants_by_run: BTreeMap<String, Vec<TemporaryGrantEnvelope>>,
+    pub(crate) plan_authorization_contracts_by_run:
+        BTreeMap<String, BTreeMap<String, KernelPlanAuthorizationContract>>,
     pub(crate) change_operations_by_run: BTreeMap<String, Vec<ChangeOperation>>,
     pub(crate) validations_by_run: BTreeMap<String, Vec<ValidationResult>>,
     pub(crate) skill_trust_records: Vec<SkillTrustRecord>,
     pub(crate) mcp_risk_acknowledgments: Vec<Value>,
-    pub(crate) resource_registry: KernelResourceRegistry,
+    pub(crate) resource_manager: KernelResourceManager,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ArtifactDraftRuntimeRecord {
+    pub(crate) run_id: String,
+    pub(crate) session_id: String,
+    pub(crate) task_id: String,
+    pub(crate) draft_id: String,
+    pub(crate) next_sequence: u64,
+    pub(crate) expected_slot_ids: BTreeSet<String>,
+    pub(crate) completed_slot_ids: BTreeSet<String>,
+    pub(crate) frame_ids: BTreeSet<String>,
+    pub(crate) content_bytes_by_slot: BTreeMap<String, u64>,
+    pub(crate) chunk_counts_by_slot: BTreeMap<String, u64>,
+    pub(crate) edit_match_hashes_by_slot: BTreeMap<String, String>,
+    pub(crate) total_content_bytes: u64,
+    pub(crate) terminal: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -49,8 +67,20 @@ pub(crate) struct RuntimeRunRecord {
     pub(crate) attachments: Vec<Value>,
     pub(crate) workspace_binding: WorkspaceBinding,
     pub(crate) config_ref: ConfigSnapshotRef,
-    pub(crate) phase: WorkflowPhase,
-    pub(crate) decision_state: RunDecisionState,
+    pub(crate) lifecycle_state: RuntimeLifecycleState,
+}
+
+impl RuntimeRunRecord {
+    pub(crate) fn has_workspace_execution_context(&self) -> bool {
+        self.workspace_binding
+            .open_path
+            .as_deref()
+            .is_some_and(|path| PathBuf::from(path).is_dir())
+            || self
+                .attachments
+                .iter()
+                .any(|attachment| normalized_explicit_attachment_grant(attachment).is_some())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -110,9 +140,7 @@ impl DeepCodeKernelRuntime {
             run_id: record.as_ref().map(|value| RunId(value.run_id.clone())),
             workspace_binding: record.as_ref().map(|value| value.workspace_binding.clone()),
             config_ref: record.as_ref().map(|value| value.config_ref.clone()),
-            workflow_phase: record
-                .as_ref()
-                .map(|value| value.phase.as_str().to_string()),
+            lifecycle_state: record.as_ref().map(|value| value.lifecycle_state),
             pending_stage: None,
             events: events
                 .iter()
@@ -157,7 +185,7 @@ impl DeepCodeKernelRuntime {
             .list_all()?
             .into_iter()
             .filter_map(|event| event.session_id)
-            .last();
+            .next_back();
         latest_session
             .as_deref()
             .map(|session_id| self.runtime_record_from_session_ledger(session_id))
@@ -172,7 +200,7 @@ impl DeepCodeKernelRuntime {
         let Some(run_id) = events
             .iter()
             .filter_map(|event| event.run_id.clone())
-            .last()
+            .next_back()
         else {
             return Ok(None);
         };
@@ -180,21 +208,16 @@ impl DeepCodeKernelRuntime {
         let Some(started) = run_events.iter().find(|event| event.kind == "run.started") else {
             return Ok(None);
         };
-        let phase = run_events
+        let lifecycle_state = run_events
             .iter()
             .rev()
             .find_map(|event| {
-                if matches!(
-                    event.kind.as_str(),
-                    "workflow.checkpointed" | "workflow.resumed" | "stage.changed"
-                ) {
-                    event.payload.get("phase").and_then(Value::as_str)
-                } else {
-                    None
-                }
+                (event.kind == "runtime.lifecycle_changed")
+                    .then(|| event.payload.get("currentState").and_then(Value::as_str))
+                    .flatten()
             })
-            .and_then(workflow_phase_from_str)
-            .unwrap_or(WorkflowPhase::Plan);
+            .and_then(RuntimeLifecycleState::from_wire)
+            .unwrap_or(RuntimeLifecycleState::Ready);
         let workspace_binding = serde_json::from_value(
             started
                 .payload
@@ -231,8 +254,7 @@ impl DeepCodeKernelRuntime {
                 .unwrap_or_default(),
             workspace_binding,
             config_ref,
-            phase,
-            decision_state: RunDecisionState::default(),
+            lifecycle_state,
         }))
     }
 
@@ -249,6 +271,8 @@ impl DeepCodeKernelRuntime {
             .state
             .next_run_index
             .max(run_index_from_id(&record.run_id).unwrap_or(0));
+        self.restore_run_resources_from_ledger(&record.run_id)?;
+        self.restore_plan_authorization_from_ledger(&record.run_id)?;
         if let Some((permission_id, pending)) = self.pending_tool_from_ledger(&record.run_id)? {
             self.state.pending_tools.insert(permission_id, pending);
         }
@@ -388,14 +412,6 @@ impl DeepCodeKernelRuntime {
             .ok_or_else(|| KernelError::InvalidCommand("no active run".to_string()))
     }
 
-    pub(crate) fn not_implemented(
-        &self,
-        _request_id: RequestId,
-        operation: &'static str,
-    ) -> KernelResult<Vec<KernelEvent>> {
-        Err(KernelError::NotImplemented(operation))
-    }
-
     pub(crate) fn snapshot_get(
         &self,
         request_id: RequestId,
@@ -411,7 +427,6 @@ impl DeepCodeKernelRuntime {
         &self,
         run_id: &str,
         profile_id: Option<String>,
-        workflow_id: Option<String>,
         run_overrides: Option<Value>,
     ) -> KernelResult<deepcode_kernel_abi::ConfigSnapshot> {
         let mut layers = vec![ConfigLayer {
@@ -427,7 +442,6 @@ impl DeepCodeKernelRuntime {
             domain: None,
             values: serde_json::json!({
                 "run": { "id": run_id },
-                "workflow": { "default": workflow_id.unwrap_or_else(|| "plan-first".to_string()) },
                 "policy": { "profile": profile_id.unwrap_or_else(|| self.policy_profile.id.clone()) }
             }),
         }];
@@ -459,7 +473,7 @@ impl DeepCodeKernelRuntime {
     }
 }
 
-fn normalized_explicit_attachment_grant(attachment: &Value) -> Option<Value> {
+pub(crate) fn normalized_explicit_attachment_grant(attachment: &Value) -> Option<Value> {
     let source = attachment
         .get("source")
         .and_then(Value::as_str)

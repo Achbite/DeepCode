@@ -54,24 +54,27 @@ pub(crate) fn dispatch_skill(
     let events = runtime
         .dispatch(command)
         .map_err(|error| KernelErrorEnvelope::from(&error))?;
-    match events.into_iter().next() {
-        Some(KernelEvent::SkillResult {
-            ok: true,
-            output: Some(output),
-            ..
-        }) => Ok(output),
-        Some(KernelEvent::SkillResult {
-            ok: false,
-            error: Some(error),
-            ..
-        }) => Err(error),
-        other => Err(KernelErrorEnvelope {
-            code: "unexpected_event".to_string(),
-            message: format!("expected skill result, got {other:?}"),
-            message_key: None,
-            args: None,
-        }),
+    for event in events {
+        match event {
+            KernelEvent::SkillResult {
+                ok: true,
+                output: Some(output),
+                ..
+            } => return Ok(output),
+            KernelEvent::SkillResult {
+                ok: false,
+                error: Some(error),
+                ..
+            } => return Err(error),
+            _ => {}
+        }
     }
+    Err(KernelErrorEnvelope {
+        code: "unexpected_event".to_string(),
+        message: "expected terminal skill result".to_string(),
+        message_key: None,
+        args: None,
+    })
 }
 
 pub(crate) fn kernel_events_to_agent_events(
@@ -137,7 +140,7 @@ pub(crate) fn kernel_event_to_agent_events(session_id: &str, event: &KernelEvent
                     "kind": channel.as_deref().unwrap_or("progress"),
                     "channel": channel.as_deref().unwrap_or("progress"),
                     "visibility": "conversation",
-                    "label": if channel.as_deref() == Some("final") { "Agent" } else { "Agent" },
+                    "label": "Agent",
                     "kernelEvent": event
                 }),
                 &now_text(),
@@ -346,6 +349,22 @@ pub(crate) fn kernel_event_to_agent_events(session_id: &str, event: &KernelEvent
             }),
             &now_text(),
         )],
+        KernelEvent::BatchReviewReady { contract_id, .. } => vec![agent_event(
+            session_id,
+            "workflow_stage",
+            json!({
+                "stage": "batch_review_ready",
+                "phase": "review",
+                "status": "completed",
+                "summary": "Kernel WorkUnits reached terminal state; ReviewFacts are ready.",
+                "contractId": contract_id,
+                "channel": "task",
+                "visibility": "conversation",
+                "presentation": "stageSummary",
+                "kernelEvent": event
+            }),
+            &now_text(),
+        )],
         KernelEvent::ReviewFactsProduced { facts, .. } => vec![agent_event(
             session_id,
             "workflow_stage",
@@ -378,19 +397,40 @@ pub(crate) fn kernel_event_to_agent_events(session_id: &str, event: &KernelEvent
             }),
             &now_text(),
         )],
-        KernelEvent::StageChanged {
-            phase,
-            status,
+        KernelEvent::RuntimeLifecycleChanged {
+            previous_state,
+            current_state,
             reason,
             ..
         } => vec![agent_event(
             session_id,
-            "workflow_stage",
+            "runtime_state",
             json!({
-                "stage": phase,
-                "phase": phase,
-                "status": stage_status_for_gui(status),
-                "summary": reason.clone().unwrap_or_else(|| format!("Kernel workflow stage {phase} {:?}.", status)),
+                "stage": current_state.as_str(),
+                "lifecycleState": current_state,
+                "previousLifecycleState": previous_state,
+                "status": runtime_lifecycle_status(*current_state),
+                "summary": reason.clone().unwrap_or_else(|| format!("Kernel runtime entered {}.", current_state.as_str())),
+                "channel": "task",
+                "visibility": "task",
+                "presentation": "stageSummary",
+                "kernelEvent": event
+            }),
+            &now_text(),
+        )],
+        KernelEvent::RuntimeResumed {
+            lifecycle_state,
+            checkpoint_id,
+            ..
+        } => vec![agent_event(
+            session_id,
+            "runtime_state",
+            json!({
+                "stage": "runtime_resumed",
+                "lifecycleState": lifecycle_state,
+                "checkpointId": checkpoint_id,
+                "status": runtime_lifecycle_status(*lifecycle_state),
+                "summary": "Kernel runtime resumed from persisted facts.",
                 "channel": "task",
                 "visibility": "task",
                 "presentation": "stageSummary",
@@ -463,7 +503,7 @@ pub(crate) fn kernel_event_to_agent_events(session_id: &str, event: &KernelEvent
             "permission_request",
             json!({
                 "id": request.id,
-                "toolName": tool_name_for_capability(&request.capability),
+                "toolName": request.tool_id.as_deref().unwrap_or("kernel.permission"),
                 "capability": request.capability,
                 "riskLevel": request.risk_level,
                 "summary": request.summary,
@@ -490,6 +530,49 @@ pub(crate) fn kernel_event_to_agent_events(session_id: &str, event: &KernelEvent
             }),
             &now_text(),
         )],
+        KernelEvent::PlanAuthorizationReviewed {
+            plan_id, review, ..
+        } => vec![agent_event(
+            session_id,
+            "workflow_stage",
+            json!({
+                "stage": "plan_authorization.reviewed",
+                "status": "completed",
+                "summary": "Kernel compiled the task intent into a plan authorization contract.",
+                "runId": event_run_id(event),
+                "planId": plan_id,
+                "review": review,
+                "authorizationContract": review.authorization_contract,
+                "channel": "trace",
+                "visibility": "debug",
+                "presentation": "collapsible",
+                "kernelEvent": event
+            }),
+            &now_text(),
+        )],
+        KernelEvent::PlanAuthorizationDecisionRecorded {
+            authorization_contract_id,
+            decision,
+            lease_id,
+            ..
+        } => vec![agent_event(
+            session_id,
+            "workflow_stage",
+            json!({
+                "stage": "plan_authorization.decision_recorded",
+                "status": "completed",
+                "summary": "Kernel recorded the explicit user decision for the plan authorization contract.",
+                "runId": event_run_id(event),
+                "authorizationContractId": authorization_contract_id,
+                "decision": decision,
+                "leaseId": lease_id,
+                "channel": "trace",
+                "visibility": "debug",
+                "presentation": "collapsible",
+                "kernelEvent": event
+            }),
+            &now_text(),
+        )],
         KernelEvent::ProposalReviewed {
             proposal_id,
             report,
@@ -511,7 +594,7 @@ pub(crate) fn kernel_event_to_agent_events(session_id: &str, event: &KernelEvent
                     "summary": report
                         .get("kernelGeneratedPermissionSummary")
                         .and_then(Value::as_str)
-                        .unwrap_or("Kernel PlanReview 已完成，请确认是否同意计划。"),
+                        .unwrap_or("Kernel ProposalReview 已完成，请确认是否同意计划。"),
                     "status": status,
                     "runId": event_run_id(event),
                     "planId": report.get("planId").and_then(Value::as_str).unwrap_or("agent-plan"),
@@ -523,7 +606,7 @@ pub(crate) fn kernel_event_to_agent_events(session_id: &str, event: &KernelEvent
                     "requiredAccessScopes": report.get("requiredAccessScopes").cloned().unwrap_or_else(|| json!([])),
                     "permissionBundles": report.get("permissionBundles").cloned().unwrap_or_else(|| json!([])),
                     "interventions": report.get("interventions").cloned().unwrap_or_else(|| json!([])),
-                    "executionContract": report.get("executionContract").cloned().unwrap_or_else(|| json!(null)),
+                    "executionContract": report.get("executionContract").cloned().unwrap_or(Value::Null),
                     "report": report,
                     "facts": plan_review_facts(report),
                     "channel": "progress",
@@ -533,57 +616,6 @@ pub(crate) fn kernel_event_to_agent_events(session_id: &str, event: &KernelEvent
                 }),
                 &now_text(),
             )]
-        }
-        KernelEvent::WorkflowDecisionMade { decision, .. } => {
-            let phase_text = decision
-                .phase
-                .clone()
-                .unwrap_or_else(|| "workflow".to_string());
-            let action_text = format!("{:?}", decision.action).to_lowercase();
-            let summary_text = decision
-                .summary
-                .clone()
-                .unwrap_or_else(|| format!("Workflow decision: {action_text}"));
-            let details_text = if decision.pending_steps.is_empty() {
-                None
-            } else {
-                Some(decision.pending_steps.join("\n"))
-            };
-            let mut payload = json!({
-                "stage": phase_text,
-                "phase": phase_text,
-                "status": action_text,
-                "summary": summary_text,
-                "channel": "task",
-                "visibility": "task",
-                "presentation": "stageSummary",
-                "decision": decision,
-                "kernelEvent": event
-            });
-            if let Some(details) = details_text {
-                payload["details"] = json!(details);
-            }
-            let mut result = vec![agent_event(
-                session_id,
-                "workflow_decision",
-                payload,
-                &now_text(),
-            )];
-            if decision.fail_closed
-                || matches!(
-                    decision.action,
-                    deepcode_kernel_abi::WorkflowDecisionAction::Blocked
-                )
-            {
-                result.push(assistant_final_event(
-                    session_id,
-                    decision
-                        .summary
-                        .as_deref()
-                        .unwrap_or("Kernel 工作流已阻塞，未满足完成条件。"),
-                ));
-            }
-            result
         }
         KernelEvent::Error { error, .. } => vec![agent_event(
             session_id,
@@ -597,94 +629,19 @@ pub(crate) fn kernel_event_to_agent_events(session_id: &str, event: &KernelEvent
             }),
             &now_text(),
         )],
-        // 临时文件生命周期事件投影为 GUI 可见的工具结果条目，确保 fs.write/fs.delete 后产生的
-        // TempArtifactCreated / TempArtifactCleaned 在用户消息流中可见或可折叠查看，
-        // 避免"工作流是否真的执行完"对用户不可信。
-        KernelEvent::TempArtifactCreated { path, .. } => vec![agent_event(
-            session_id,
-            "tool_result",
-            json!({
-                "callId": format!("tempArtifact.created:{path}"),
-                "toolName": "tempArtifact.created",
-                "ok": true,
-                "status": "ok",
-                "output": {
-                    "path": path,
-                },
-                "channel": "tool",
-                "visibility": "conversation",
-                "kernelEvent": event
-            }),
-            &now_text(),
-        )],
-        KernelEvent::TempArtifactCleaned { path, .. } => vec![agent_event(
-            session_id,
-            "tool_result",
-            json!({
-                "callId": format!("tempArtifact.cleaned:{path}"),
-                "toolName": "tempArtifact.cleaned",
-                "ok": true,
-                "status": "ok",
-                "output": {
-                    "path": path,
-                },
-                "channel": "tool",
-                "visibility": "conversation",
-                "kernelEvent": event
-            }),
-            &now_text(),
-        )],
-        KernelEvent::TempCleanupFailed { path, error, .. } => vec![agent_event(
-            session_id,
-            "tool_result",
-            json!({
-                "callId": format!("tempArtifact.cleanup_failed:{path}"),
-                "toolName": "tempArtifact.cleanup_failed",
-                "ok": false,
-                "status": "error",
-                "error": error.message,
-                "code": error.code,
-                "output": {
-                    "path": path,
-                },
-                "channel": "tool",
-                "visibility": "conversation",
-                "kernelEvent": event
-            }),
-            &now_text(),
-        )],
-        // (workflow_decision 静默丢弃) 类问题复发。GUI 是否展示这些事件由阶段 15 收口决定，
-        KernelEvent::AutonomyTransitioned { .. }
-        | KernelEvent::TempArtifactLeaseGranted { .. }
-        | KernelEvent::TempArtifactLeaseReleased { .. }
-        | KernelEvent::TempArtifactLeasePromoted { .. } => Vec::new(),
+        KernelEvent::AutonomyTransitioned { .. } => Vec::new(),
         _ => Vec::new(),
     }
 }
 
-pub(crate) fn stage_status_for_gui(status: &deepcode_kernel_abi::StageStatus) -> &'static str {
-    match status {
-        deepcode_kernel_abi::StageStatus::Pending => "updated",
-        deepcode_kernel_abi::StageStatus::Running => "started",
-        deepcode_kernel_abi::StageStatus::Completed => "completed",
-        deepcode_kernel_abi::StageStatus::Blocked | deepcode_kernel_abi::StageStatus::Failed => {
-            "error"
-        }
-    }
-}
-
-pub(crate) fn tool_name_for_capability(capability: &str) -> &str {
-    match capability {
-        "cap.fs.write" => "fs.write",
-        "cap.fs.patch" => "fs.patch",
-        "cap.fs.delete" => "fs.delete",
-        "process.exec" => "process.exec",
-        "network.egress" => "web.fetch",
-        "git.write" => "git.commit",
-        "git.push" => "git.push",
-        "browser.control" => "browser.snapshot",
-        "cap.skill.executeExternal" => "skill.invoke",
-        _ => capability,
+fn runtime_lifecycle_status(state: deepcode_kernel_abi::RuntimeLifecycleState) -> &'static str {
+    match state {
+        deepcode_kernel_abi::RuntimeLifecycleState::Created
+        | deepcode_kernel_abi::RuntimeLifecycleState::Ready => "updated",
+        deepcode_kernel_abi::RuntimeLifecycleState::Executing => "started",
+        deepcode_kernel_abi::RuntimeLifecycleState::AwaitingPermission => "blocked",
+        deepcode_kernel_abi::RuntimeLifecycleState::ReviewReady => "completed",
+        deepcode_kernel_abi::RuntimeLifecycleState::Terminal => "completed",
     }
 }
 
@@ -781,20 +738,6 @@ fn event_run_id(event: &KernelEvent) -> Option<String> {
                 .map(str::to_string),
             _ => None,
         })
-}
-
-pub(crate) fn assistant_final_event(session_id: &str, content: &str) -> Value {
-    agent_event(
-        session_id,
-        "assistant_msg",
-        json!({
-            "content": content,
-            "channel": "final",
-            "visibility": "conversation",
-            "label": "Agent"
-        }),
-        &now_text(),
-    )
 }
 
 pub(crate) fn agent_event(session_id: &str, kind: &str, payload: Value, ts: &str) -> Value {

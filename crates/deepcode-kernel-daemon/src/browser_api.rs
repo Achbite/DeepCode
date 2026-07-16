@@ -63,7 +63,7 @@ pub(crate) async fn browser_attach_snapshot(State(state): State<AppState>) -> Js
     ApiResponse::ok(json!({
         "attached": true,
         "snapshot": gui.browser.snapshot,
-        "message": "Panel snapshot attachment is recorded by Host compatibility layer."
+        "message": "Panel snapshot attachment is recorded as Host projection metadata."
     }))
 }
 

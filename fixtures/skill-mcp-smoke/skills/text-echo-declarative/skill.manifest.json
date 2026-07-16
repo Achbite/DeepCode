@@ -7,8 +7,8 @@
   "kind": "text",
   "entrypoint": {
     "kind": "declarative",
-    "command": null,
-    "args": [],
+    "program": null,
+    "argv": [],
     "scriptPath": null
   },
   "requestedCapabilities": [],

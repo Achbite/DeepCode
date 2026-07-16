@@ -1,14 +1,15 @@
 use deepcode_kernel_abi::{KernelError, KernelResult};
 use deepcode_kernel_policy::{Capability, CapabilityEffect, RiskLevel};
+use deepcode_kernel_tools::{
+    KernelToolTemplate, OperationExecutionMode, ToolFamily, ToolRiskLevel,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
-pub mod builtin;
 pub mod catalog;
 pub mod executor;
 pub mod external;
-pub mod file_content;
 pub mod hash;
 pub mod manifest;
 pub mod mcp;
@@ -56,7 +57,7 @@ pub use trust_record::{SkillTrustMode, SkillTrustRecord};
 pub enum SkillSource {
     Builtin,
     LocalPack { pack_id: String },
-    ExternalProcess { command: String },
+    ExternalProcess { program: String },
     ExternalConnector { connector_id: String },
 }
 
@@ -141,218 +142,6 @@ impl InMemorySkillRegistry {
         }
     }
 
-    pub fn with_builtin_tools() -> Self {
-        Self::new(vec![
-            builtin(
-                "fs.read",
-                "skill.fs.read.description",
-                Capability::workspace_read(),
-                RiskLevel::Low,
-                vec![CapabilityEffect::ReadsWorkspace],
-                vec!["plan", "check", "complete", "review"],
-                true,
-            ),
-            builtin(
-                "fs.list",
-                "skill.fs.list.description",
-                Capability::workspace_list(),
-                RiskLevel::Low,
-                vec![CapabilityEffect::ReadsWorkspace],
-                vec!["plan", "check", "complete", "review"],
-                true,
-            ),
-            builtin(
-                "fs.diff",
-                "skill.fs.diff.description",
-                Capability::workspace_preview_diff(),
-                RiskLevel::Low,
-                vec![CapabilityEffect::ReadsWorkspace],
-                vec!["plan", "check", "complete", "review"],
-                true,
-            ),
-            builtin(
-                "code.search",
-                "skill.code.search.description",
-                Capability::workspace_search(),
-                RiskLevel::Low,
-                vec![CapabilityEffect::ReadsWorkspace],
-                vec!["plan", "check", "complete", "review"],
-                true,
-            ),
-            builtin(
-                "shell.propose",
-                "skill.shell.propose.description",
-                Capability::process_propose(),
-                RiskLevel::Medium,
-                vec![CapabilityEffect::RunsProcess],
-                vec!["plan", "complete"],
-                true,
-            ),
-            builtin(
-                "fs.write",
-                "skill.fs.write.description",
-                Capability::workspace_write(),
-                RiskLevel::High,
-                vec![CapabilityEffect::WritesWorkspace],
-                vec!["complete"],
-                true,
-            ),
-            builtin(
-                "fs.patch",
-                "skill.fs.patch.description",
-                Capability::workspace_write(),
-                RiskLevel::High,
-                vec![CapabilityEffect::WritesWorkspace],
-                vec!["complete"],
-                true,
-            ),
-            builtin(
-                "fs.delete",
-                "skill.fs.delete.description",
-                Capability::workspace_delete(),
-                RiskLevel::Critical,
-                vec![CapabilityEffect::DeletesWorkspace],
-                vec!["complete"],
-                true,
-            ),
-            builtin(
-                "web.search",
-                "skill.web.search.description",
-                Capability::network_egress(),
-                RiskLevel::High,
-                vec![CapabilityEffect::UsesNetwork],
-                vec!["complete"],
-                true,
-            ),
-            builtin(
-                "web.fetch",
-                "skill.web.fetch.description",
-                Capability::network_egress(),
-                RiskLevel::High,
-                vec![CapabilityEffect::UsesNetwork],
-                vec!["complete"],
-                true,
-            ),
-            builtin(
-                "git.status",
-                "skill.git.status.description",
-                Capability::git_read(),
-                RiskLevel::Low,
-                vec![CapabilityEffect::ReadsGit],
-                vec!["plan", "check", "complete", "review"],
-                true,
-            ),
-            builtin(
-                "git.diff",
-                "skill.git.diff.description",
-                Capability::git_read(),
-                RiskLevel::Low,
-                vec![CapabilityEffect::ReadsGit],
-                vec!["plan", "check", "complete", "review"],
-                true,
-            ),
-            builtin(
-                "git.stage",
-                "skill.git.stage.description",
-                Capability::git_write(),
-                RiskLevel::High,
-                vec![CapabilityEffect::ModifiesGit],
-                vec!["complete"],
-                true,
-            ),
-            builtin(
-                "git.unstage",
-                "skill.git.unstage.description",
-                Capability::git_write(),
-                RiskLevel::High,
-                vec![CapabilityEffect::ModifiesGit],
-                vec!["complete"],
-                true,
-            ),
-            builtin(
-                "git.commit",
-                "skill.git.commit.description",
-                Capability::git_write(),
-                RiskLevel::High,
-                vec![CapabilityEffect::ModifiesGit],
-                vec!["complete"],
-                true,
-            ),
-            builtin(
-                "git.push",
-                "skill.git.push.description",
-                Capability::git_push(),
-                RiskLevel::Critical,
-                vec![CapabilityEffect::PushesGit],
-                vec!["complete"],
-                false,
-            ),
-            builtin(
-                "browser.open",
-                "skill.browser.open.description",
-                Capability::browser_control(),
-                RiskLevel::High,
-                vec![CapabilityEffect::ControlsBrowser],
-                vec!["complete"],
-                true,
-            ),
-            builtin(
-                "browser.reload",
-                "skill.browser.reload.description",
-                Capability::browser_control(),
-                RiskLevel::High,
-                vec![CapabilityEffect::ControlsBrowser],
-                vec!["complete"],
-                true,
-            ),
-            builtin(
-                "browser.snapshot",
-                "skill.browser.snapshot.description",
-                Capability::browser_control(),
-                RiskLevel::High,
-                vec![CapabilityEffect::ControlsBrowser],
-                vec!["complete"],
-                true,
-            ),
-            builtin(
-                "browser.inspect",
-                "skill.browser.inspect.description",
-                Capability::browser_control(),
-                RiskLevel::High,
-                vec![CapabilityEffect::ControlsBrowser],
-                vec!["complete"],
-                true,
-            ),
-            builtin(
-                "browser.click",
-                "skill.browser.click.description",
-                Capability::browser_control(),
-                RiskLevel::High,
-                vec![CapabilityEffect::ControlsBrowser],
-                vec!["complete"],
-                true,
-            ),
-            builtin(
-                "browser.type",
-                "skill.browser.type.description",
-                Capability::browser_control(),
-                RiskLevel::High,
-                vec![CapabilityEffect::ControlsBrowser],
-                vec!["complete"],
-                true,
-            ),
-            builtin(
-                "browser.scroll",
-                "skill.browser.scroll.description",
-                Capability::browser_control(),
-                RiskLevel::High,
-                vec![CapabilityEffect::ControlsBrowser],
-                vec!["complete"],
-                true,
-            ),
-        ])
-    }
-
     pub fn len(&self) -> usize {
         self.descriptors.len()
     }
@@ -388,24 +177,47 @@ impl SkillRuntime for InMemorySkillRegistry {
     }
 }
 
-pub(crate) fn builtin(
-    id: &str,
-    description_key: &str,
-    capability: Capability,
-    risk_level: RiskLevel,
-    effects: Vec<CapabilityEffect>,
-    allowed_phases: Vec<&str>,
-    model_visible: bool,
-) -> SkillDescriptor {
+pub fn skill_descriptor_from_template(template: KernelToolTemplate) -> SkillDescriptor {
+    let risk_level = match template.permission.risk {
+        ToolRiskLevel::Low => RiskLevel::Low,
+        ToolRiskLevel::Medium => RiskLevel::Medium,
+        ToolRiskLevel::High => RiskLevel::High,
+        ToolRiskLevel::Critical => RiskLevel::Critical,
+    };
+    let effects = match template.family {
+        ToolFamily::Workspace | ToolFamily::Document if template.resource.read_only => {
+            vec![CapabilityEffect::ReadsWorkspace]
+        }
+        ToolFamily::Workspace if template.tool_id == "fs.delete" => {
+            vec![CapabilityEffect::DeletesWorkspace]
+        }
+        ToolFamily::Workspace => vec![CapabilityEffect::WritesWorkspace],
+        ToolFamily::Git if template.resource.read_only => vec![CapabilityEffect::ReadsGit],
+        ToolFamily::Git if template.tool_id == "git.push" => vec![CapabilityEffect::PushesGit],
+        ToolFamily::Git => vec![CapabilityEffect::ModifiesGit],
+        ToolFamily::Process => vec![CapabilityEffect::RunsProcess],
+        ToolFamily::Network | ToolFamily::Provider => vec![CapabilityEffect::UsesNetwork],
+        ToolFamily::Browser => vec![CapabilityEffect::ControlsBrowser],
+        ToolFamily::Document => vec![CapabilityEffect::ReadsWorkspace],
+    };
+    let model_visible = template.execution.execution_mode != OperationExecutionMode::Blocked
+        && template.tool_id != "fs.ensure_directory";
     SkillDescriptor {
-        id: id.to_string(),
+        id: template.tool_id.to_string(),
         version: "1".to_string(),
-        title_key: Some(format!("skill.{id}.title")),
-        description_key: Some(description_key.to_string()),
-        input_schema: serde_json::json!({ "type": "object" }),
+        title_key: Some(format!("skill.{}.title", template.tool_id)),
+        description_key: Some(format!("skill.{}.description", template.tool_id)),
+        input_schema: template.input.schema,
         output_schema: serde_json::json!({ "type": "object" }),
-        required_capabilities: vec![capability],
-        allowed_phases: allowed_phases.into_iter().map(str::to_string).collect(),
+        required_capabilities: vec![Capability::new(template.permission.capability)],
+        allowed_phases: if template.resource.read_only {
+            vec!["plan", "check", "complete", "review"]
+        } else {
+            vec!["complete"]
+        }
+        .into_iter()
+        .map(str::to_string)
+        .collect(),
         risk_level,
         effects,
         source: SkillSource::Builtin,
@@ -419,69 +231,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn builtin_catalog_contains_expected_tools() {
-        let registry = InMemorySkillRegistry::with_builtin_tools();
-        assert!(registry.len() >= 23);
-        let removed_shell_exec_id = ["shell", "exec"].join(".");
-        assert!(registry.get(&removed_shell_exec_id).unwrap().is_none());
-        assert!(registry.get("process.exec").unwrap().is_none());
-        let write = registry.get("fs.write").unwrap().unwrap();
-        assert_eq!(write.risk_level, RiskLevel::High);
-        assert_eq!(
-            write.primary_capability(),
-            Some(Capability::workspace_write())
-        );
-        assert!(write.model_visible);
-
-        let patch = registry.get("fs.patch").unwrap().unwrap();
-        assert_eq!(
-            patch.primary_capability(),
-            Some(Capability::workspace_write())
-        );
-        assert!(patch.effects.contains(&CapabilityEffect::WritesWorkspace));
-
-        let delete = registry.get("fs.delete").unwrap().unwrap();
-        assert_eq!(delete.risk_level, RiskLevel::Critical);
-        assert_eq!(
-            delete.primary_capability(),
-            Some(Capability::workspace_delete())
-        );
-        assert!(delete.model_visible);
-        assert!(delete.effects.contains(&CapabilityEffect::DeletesWorkspace));
-
-        let web_fetch = registry.get("web.fetch").unwrap().unwrap();
-        assert_eq!(
-            web_fetch.primary_capability(),
-            Some(Capability::network_egress())
-        );
-        assert!(web_fetch.effects.contains(&CapabilityEffect::UsesNetwork));
-
-        let git_status = registry.get("git.status").unwrap().unwrap();
-        assert_eq!(
-            git_status.primary_capability(),
-            Some(Capability::git_read())
-        );
-        assert!(git_status.effects.contains(&CapabilityEffect::ReadsGit));
-
-        let git_push = registry.get("git.push").unwrap().unwrap();
-        assert_eq!(git_push.risk_level, RiskLevel::Critical);
-        assert_eq!(git_push.primary_capability(), Some(Capability::git_push()));
-        assert!(!git_push.model_visible);
-        assert!(git_push.effects.contains(&CapabilityEffect::PushesGit));
-
-        let browser_click = registry.get("browser.click").unwrap().unwrap();
-        assert_eq!(
-            browser_click.primary_capability(),
-            Some(Capability::browser_control())
-        );
-        assert!(browser_click
-            .effects
-            .contains(&CapabilityEffect::ControlsBrowser));
-    }
-
-    #[test]
     fn unknown_skill_fails_closed() {
-        let registry = InMemorySkillRegistry::with_builtin_tools();
+        let registry = InMemorySkillRegistry::default();
         let error = registry
             .invoke(SkillInvocation {
                 id: "invoke-1".to_string(),
@@ -533,9 +284,9 @@ mod tests {
 
     #[test]
     fn external_process_skill_runs_python_under_kernel_control() {
-        let runtime = ExternalProcessSkillRuntime::new(ExternalProcessSkillSpec::python_inline(
-            "print('skill-ok')",
-        ));
+        let runtime = ExternalProcessSkillRuntime::new(
+            ExternalProcessSkillSpec::test_python_inline("print('skill-ok')"),
+        );
 
         let result = runtime
             .invoke(SkillInvocation {
@@ -555,8 +306,9 @@ mod tests {
 
     #[test]
     fn external_process_skill_times_out_and_reports_exit_context() {
-        let mut spec =
-            ExternalProcessSkillSpec::python_inline("import time; time.sleep(3); print('late')");
+        let mut spec = ExternalProcessSkillSpec::test_python_inline(
+            "import time; time.sleep(3); print('late')",
+        );
         spec.timeout_ms = 50;
         let runtime = ExternalProcessSkillRuntime::new(spec);
 
@@ -578,7 +330,7 @@ mod tests {
 
     #[test]
     fn external_process_skill_applies_output_limits() {
-        let mut spec = ExternalProcessSkillSpec::python_inline("print('abcdef')");
+        let mut spec = ExternalProcessSkillSpec::test_python_inline("print('abcdef')");
         spec.stdout_limit_bytes = 3;
         let runtime = ExternalProcessSkillRuntime::new(spec);
 
@@ -603,14 +355,10 @@ mod tests {
 
     impl SkillExecutor for EchoExecutor {
         fn descriptor(&self) -> SkillDescriptor {
-            builtin(
-                "test.echo",
-                "skill.test.echo.description",
-                Capability::workspace_read(),
-                RiskLevel::Low,
-                vec![CapabilityEffect::ReadsWorkspace],
-                vec!["complete"],
-                false,
+            skill_descriptor_from_template(
+                deepcode_kernel_tools::KernelToolRegistry::default()
+                    .template("fs.read")
+                    .unwrap(),
             )
         }
 
@@ -639,7 +387,7 @@ mod tests {
                     id: "invoke-direct".to_string(),
                     run_id: Some("run-1".to_string()),
                     session_id: Some("session-1".to_string()),
-                    skill_id: "test.echo".to_string(),
+                    skill_id: "fs.read".to_string(),
                     phase: Some("complete".to_string()),
                     input: serde_json::json!({}),
                 },

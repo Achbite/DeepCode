@@ -98,7 +98,7 @@ configure_product() {
 parse_requested_products
 configure_product "${REQUESTED_PRODUCTS[0]}"
 CARGO_TARGET_ROOT="${DEEPCODE_MACOS_CARGO_TARGET_DIR:-$ROOT_DIR/target/macos-arm64}"
-RUST_TOOLCHAIN="${DEEPCODE_MACOS_RUST_TOOLCHAIN:-1.88.0}"
+RUST_TOOLCHAIN="${DEEPCODE_MACOS_RUST_TOOLCHAIN:-1.84.0}"
 NODE_MAJOR="${DEEPCODE_MACOS_NODE_MAJOR:-22}"
 NODE_HOME="${DEEPCODE_MACOS_NODE_HOME:-$HOME/.local/deepcode-node}"
 PNPM_VERSION="${DEEPCODE_MACOS_PNPM_VERSION:-9.15.9}"
@@ -815,11 +815,21 @@ prepare_portable_config_root() {
   "terminal.integrated.spawnTimeoutMs": 8000,
   "agent.defaultMode": "plan",
   "agent.defaultWorkflow": "planFirst",
-  "agent.permissions.allowFileRead": true,
-  "agent.permissions.allowFileWrite": true,
-  "agent.permissions.allowCodeSearch": true,
-  "agent.permissions.allowShellPropose": true,
-  "agent.permissions.allowShellExec": true,
+  "agent.requirementConfirmationMode": "auto",
+  "agent.reviewContinuationMode": "auto",
+  "agent.interventionLevel": "medium",
+  "agent.memory.projectMode": "confirm",
+  "agent.permissions.workspaceRead": "allow",
+  "agent.permissions.workspaceWrite": "ask",
+  "agent.permissions.gitWrite": "ask",
+  "agent.permissions.webRead": "allow",
+  "agent.permissions.privateWebRead": "ask",
+  "agent.permissions.processExec": "deny",
+  "agent.permissions.browserControl": "deny",
+  "agent.permissions.providerEgress": "ask",
+  "agent.web.search.endpointTemplate": "",
+  "agent.web.search.authHeaderName": "Authorization",
+  "agent.web.search.authSecretRef": "",
   "agent.shell.autoExecuteCommands": false,
   "skills.pythonPath": "python",
   "skills.autoLoad": true,
@@ -1206,8 +1216,8 @@ write_build_info() {
   "sourceDirty": $SOURCE_DIRTY,
   "sourceStatusHash": "$SOURCE_STATUS_HASH",
   "sourceFingerprint": "$SOURCE_FINGERPRINT",
-  "protocolVersion": "deepcode.agent.protocol.v3",
-  "toolCatalogVersion": "deepcode.tool_catalog.session-v3.v1",
+  "protocolVersion": "deepcode.agent.protocol.v4",
+  "toolCatalogVersion": "deepcode.kernel.tools.v3",
   "product": "$product"
 }
 JSON
@@ -1314,8 +1324,8 @@ verify_packaged_kernel_markers() {
 
   strings_file="$(mktemp "${TMPDIR:-/tmp}/deepcode-kernel-strings.XXXXXX")"
   strings "$kernel_bin" >"$strings_file"
-  grep -Fq 'deepcode.agent.protocol.v3' "$strings_file" || { rm -f "$strings_file"; fail "$kernel_bin is missing deepcode.agent.protocol.v3 marker"; }
-  grep -Fq 'deepcode.tool_catalog.session-v3.v1' "$strings_file" || { rm -f "$strings_file"; fail "$kernel_bin is missing tool catalog version marker"; }
+  grep -Fq 'deepcode.agent.protocol.v4' "$strings_file" || { rm -f "$strings_file"; fail "$kernel_bin is missing deepcode.agent.protocol.v4 marker"; }
+  grep -Fq 'deepcode.kernel.tools.v3' "$strings_file" || { rm -f "$strings_file"; fail "$kernel_bin is missing deepcode.kernel.tools.v3 marker"; }
   grep -Fq 'web.search' "$strings_file" || { rm -f "$strings_file"; fail "$kernel_bin tool catalog is missing web.search"; }
   grep -Fq 'git.status' "$strings_file" || { rm -f "$strings_file"; fail "$kernel_bin tool catalog is missing git.status"; }
   grep -Fq 'browser.snapshot' "$strings_file" || { rm -f "$strings_file"; fail "$kernel_bin tool catalog is missing browser.snapshot"; }

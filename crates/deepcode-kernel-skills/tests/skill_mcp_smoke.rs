@@ -152,7 +152,7 @@ fn brokered_text_skill_fixture_hash_scanner_and_catalog_are_stable() {
     let descriptor = descriptor_from_manifest(
         &manifest,
         SkillSource::ExternalProcess {
-            command: "python3 transform.py".to_string(),
+            program: "python3".to_string(),
         },
     );
     assert!(model_visible_skill_descriptors(
@@ -316,7 +316,8 @@ fn acknowledged_mcp_stdio_fixture_round_trips_tool_call() {
         },
         transport: McpTransportDeclaration {
             kind: "stdio".to_string(),
-            command: Some(format!("python3 {}", server.to_string_lossy())),
+            program: Some("python3".to_string()),
+            argv: vec![server.to_string_lossy().to_string()],
             endpoint: None,
         },
         auth: McpAuthDeclaration {

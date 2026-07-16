@@ -1,5 +1,31 @@
 import type { AgentMode, AgentWorkspaceBinding } from './agent.js';
 
+export type IsolationLevel = 'none' | 'supervised' | 'osSandbox';
+export type SandboxSupportState = 'unavailable' | 'contractOnly' | 'experimental' | 'enforced';
+export type IsolationFallbackPolicy = 'deny';
+
+export interface IsolationContract {
+  minimumLevel: IsolationLevel;
+  supportState: SandboxSupportState;
+  backendRequirement?: string;
+  profileRef?: string;
+  fallback: IsolationFallbackPolicy;
+  outputTrust: string;
+}
+
+export interface SandboxCapabilitySnapshot {
+  schemaVersion: string;
+  backend: string;
+  supportState: SandboxSupportState;
+  executablePathRef?: string;
+  backendVersion?: string;
+  platform: string;
+  features: string[];
+  probeStatus: string;
+  probeDiagnostics: string[];
+  observedAt: string;
+}
+
 export interface ToolDefinition {
   name: string;
   description: string;
@@ -8,11 +34,12 @@ export interface ToolDefinition {
   needsApproval: boolean;
   allowedModes: AgentMode[];
   capability?: string;
-  family?: 'workspace' | 'git' | 'process' | 'network' | 'browser' | 'provider' | string;
+  family?: 'workspace' | 'document' | 'git' | 'process' | 'network' | 'browser' | 'provider' | string;
   operationKind?: string;
   permissionMode?: 'allow' | 'ask' | 'deny' | string;
   pathScopePolicy?: string;
   executionMode?: 'execute' | 'previewOnly' | 'blocked' | string;
+  isolation?: IsolationContract;
   readOnly?: boolean;
   catalogVersion?: string;
   catalogHash?: string;
@@ -21,19 +48,32 @@ export interface ToolDefinition {
 export interface KernelToolCatalogTool {
   toolId: string;
   capability: string;
-  family: 'workspace' | 'git' | 'process' | 'network' | 'browser' | 'provider' | string;
+  family: 'workspace' | 'document' | 'git' | 'process' | 'network' | 'browser' | 'provider' | string;
   operationKind?: string;
   providerSchema: object;
+  planningSchema: object;
   providerVisible?: boolean;
   forbiddenFields?: string[];
   risk: 'low' | 'medium' | 'high' | 'critical' | string;
   permissionMode: 'allow' | 'ask' | 'deny' | string;
   permissionSummary?: string;
   pathScopePolicy: string;
+  planTargetMode: 'perTarget' | 'sourceDestination' | 'aggregate';
   executionMode: 'execute' | 'previewOnly' | 'blocked' | string;
+  isolation: IsolationContract;
   hardDenyRules?: string[];
   needsWorkspace: boolean;
   readOnly: boolean;
+  usageConstraints: ToolUsageConstraints;
+}
+
+export interface ToolUsageConstraints {
+  targetExistence: 'any' | 'mustExist' | 'mustNotExist' | string;
+  sourceExistence?: 'mustExist' | 'mustNotExist' | string;
+  destinationExistence?: 'mustExist' | 'mustNotExist' | string;
+  targetKinds?: Array<'file' | 'directory' | string>;
+  contentMode: 'none' | 'contentBlock' | 'replacementBlock' | string;
+  directoryRecursiveRequired?: boolean;
 }
 
 export interface KernelToolCatalogSnapshot {
@@ -77,31 +117,57 @@ export interface ListToolsResult {
 
 export interface FsReadInput {
   path: string;
-  folderId?: string;
+  startLine?: number;
+  endLine?: number;
 }
 
-export interface FsWriteInput {
+export interface FsContentInput {
   path: string;
-  content: string;
-  folderId?: string;
+  contentBlockId: string;
 }
 
 export interface FsDeleteInput {
   path: string;
-  folderId?: string;
-  reason?: string;
+  targetKind?: 'file' | 'directory';
+  recursive?: boolean;
 }
 
 export interface FsListInput {
   path: string;
-  folderId?: string;
   depth?: number;
+  includeHidden?: boolean;
 }
 
 export interface FsDiffInput {
   path: string;
-  newContent: string;
-  folderId?: string;
+  contentBlockId: string;
+}
+
+export interface FsGlobInput {
+  pattern: string;
+  path?: string;
+  maxResults?: number;
+}
+
+export interface FsEditInput {
+  path: string;
+  replacementBlockId: string;
+  patchSpec: Record<string, unknown>;
+}
+
+export interface FsRenameInput {
+  path: string;
+  destinationPath: string;
+}
+
+export interface CodeGrepInput {
+  query: string;
+  path?: string;
+  strategy?: 'literal' | 'regex';
+  include?: string[];
+  exclude?: string[];
+  contextLines?: number;
+  maxResults?: number;
 }
 
 export interface CodeSearchInput {
@@ -109,18 +175,6 @@ export interface CodeSearchInput {
   isRegex?: boolean;
   include?: string[];
   folderId?: string;
-}
-
-export interface ShellProposeInput {
-  command: string;
-  reason?: string;
-}
-
-export interface ShellExecInput {
-  command: string;
-  cwd?: string;
-  timeoutMs?: number;
-  reason?: string;
 }
 
 export interface WebSearchInput {
@@ -171,26 +225,19 @@ export interface BrowserScrollInput {
   deltaY?: number;
 }
 
-export interface ShellExecResult {
-  command: string;
-  cwd: string;
-  executed: boolean;
-  exitCode: number | null;
-  stdout: string;
-  stderr: string;
-  durationMs: number;
-  truncated: boolean;
-  tempSessionId: string;
-  cleanupStatus: 'terminated' | 'alreadyExited' | 'failed';
-}
-
-export interface CodeSearchMatch {
+export interface CodeGrepMatch {
   folderId: string;
   path: string;
   line: number;
   column: number;
   preview: string;
 }
+
+export interface CodeGrepResult {
+  matches: CodeGrepMatch[];
+}
+
+export type CodeSearchMatch = CodeGrepMatch;
 
 export interface CodeSearchResult {
   matches: CodeSearchMatch[];

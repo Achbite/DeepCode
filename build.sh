@@ -711,16 +711,16 @@ stage_hash() {
           | grep -Ev '(^|/)(dist|dist-deepcode-gui|node_modules)/' || true
         ;;
       kernel)
-        tracked_files Cargo.toml Cargo.lock crates/deepcode-kernel-abi crates/deepcode-kernel-core \
+        tracked_files Cargo.toml Cargo.lock crates/deepcode-kernel-abi \
           crates/deepcode-kernel-runtime crates/deepcode-kernel-policy crates/deepcode-kernel-ledger \
-          crates/deepcode-kernel-config crates/deepcode-kernel-workflow \
+          crates/deepcode-kernel-config \
           crates/deepcode-kernel-context crates/deepcode-kernel-skills crates/deepcode-kernel-audit \
           crates/deepcode-kernel-client crates/deepcode-kernel-daemon shells/cli shells/tui
         ;;
       daemon)
-        tracked_files Cargo.toml Cargo.lock crates/deepcode-kernel-abi crates/deepcode-kernel-core \
+        tracked_files Cargo.toml Cargo.lock crates/deepcode-kernel-abi \
           crates/deepcode-kernel-runtime crates/deepcode-kernel-policy crates/deepcode-kernel-ledger \
-          crates/deepcode-kernel-config crates/deepcode-kernel-workflow \
+          crates/deepcode-kernel-config \
           crates/deepcode-kernel-context crates/deepcode-kernel-skills crates/deepcode-kernel-audit \
           crates/deepcode-kernel-daemon
         ;;
