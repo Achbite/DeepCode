@@ -2,8 +2,9 @@ use super::plan_authorization_support::*;
 use super::*;
 use crate::action_batch::{workspace_relative_read_path, workspace_relative_write_path};
 use deepcode_kernel_abi::{
-    KernelPlanAuthorizationOperation, KernelPlanGateIntervention, KernelPlanPermissionBundle,
-    TASK_INTENT_SCHEMA_VERSION,
+    ContractCleanupPolicy, ContractExpiry, KernelGateInterventionKind,
+    KernelGateInterventionStatus, KernelPlanAuthorizationOperation, KernelPlanGateIntervention,
+    KernelPlanPermissionBundle, ToolTargetKind, TASK_INTENT_SCHEMA_VERSION,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -13,7 +14,7 @@ impl DeepCodeKernelRuntime {
         run_id: &str,
         session_id: &str,
         proposal: &ProposalEnvelope,
-        report: &mut ProposalReviewReportV3,
+        report: &mut KernelProposalReviewReport,
     ) -> KernelResult<()> {
         let Some(authorization_contract_id) = proposal
             .payload
@@ -23,12 +24,12 @@ impl DeepCodeKernelRuntime {
             .filter(|value| !value.is_empty())
             .map(str::to_string)
         else {
-            report.status = "denied".to_string();
-            report.execution_contract.status = "denied".to_string();
+            report.status = KernelExecutionContractStatus::Denied;
+            report.execution_contract.status = KernelExecutionContractStatus::Denied;
             report.execution_contract.permission_bundles.clear();
             report.execution_contract.interventions.clear();
-            report.execution_contract.cleanup_policy = "none".to_string();
-            report.execution_contract.expires_after = "immediate".to_string();
+            report.execution_contract.cleanup_policy = ContractCleanupPolicy::None;
+            report.execution_contract.expires_after = ContractExpiry::Immediate;
             report.diagnostics.push(
                 "actionBundle requires an accepted Kernel plan authorization contract".to_string(),
             );
@@ -43,8 +44,8 @@ impl DeepCodeKernelRuntime {
             .and_then(|contracts| contracts.get(&authorization_contract_id))
             .cloned()
         else {
-            report.status = "denied".to_string();
-            report.execution_contract.status = "denied".to_string();
+            report.status = KernelExecutionContractStatus::Denied;
+            report.execution_contract.status = KernelExecutionContractStatus::Denied;
             report.diagnostics.push(format!(
                 "plan authorization contract {authorization_contract_id} is unavailable"
             ));
@@ -52,8 +53,8 @@ impl DeepCodeKernelRuntime {
         };
         let lease_active = self.plan_grant_lease_active(run_id, &authorization_contract_id);
         if contract.status != PlanAuthorizationStatus::Accepted || !lease_active {
-            report.status = "denied".to_string();
-            report.execution_contract.status = "denied".to_string();
+            report.status = KernelExecutionContractStatus::Denied;
+            report.execution_contract.status = KernelExecutionContractStatus::Denied;
             report.diagnostics.push(format!(
                 "plan authorization contract {authorization_contract_id} is not accepted or its lease is inactive"
             ));
@@ -79,11 +80,11 @@ impl DeepCodeKernelRuntime {
             return Ok(());
         }
 
-        report.status = "authorizedByPlan".to_string();
+        report.status = KernelExecutionContractStatus::AuthorizedByPlan;
         report.required_permissions.clear();
-        report.execution_contract.status = "authorizedByPlan".to_string();
+        report.execution_contract.status = KernelExecutionContractStatus::AuthorizedByPlan;
         for intervention in &mut report.execution_contract.interventions {
-            intervention.status = "satisfiedByPlanAuthorization".to_string();
+            intervention.status = KernelGateInterventionStatus::SatisfiedByPlanAuthorization;
         }
         report.execution_contract.contract_hash =
             execution_contract_hash(&report.execution_contract);
@@ -206,7 +207,7 @@ impl DeepCodeKernelRuntime {
             run_id,
             session_id: Some(SessionId(session_id_text)),
             authorization_contract_id: decision.authorization_contract_id,
-            decision: decision_name.to_string(),
+            decision: decision.decision,
             lease_id: lease.map(|value| value.id),
             sequence: Some(sequence),
         }])
@@ -217,7 +218,7 @@ impl DeepCodeKernelRuntime {
         record: &RuntimeRunRecord,
         intent: &TaskIntentEnvelope,
     ) -> KernelResult<PlanAuthorizationReview> {
-        let snapshot = KernelToolRegistry::default().snapshot();
+        let snapshot = self.tool_registry.snapshot();
         if intent.schema_version != TASK_INTENT_SCHEMA_VERSION {
             return Err(KernelError::InvalidCommand(format!(
                 "TaskIntentEnvelope schemaVersion must be {TASK_INTENT_SCHEMA_VERSION}"
@@ -259,7 +260,6 @@ impl DeepCodeKernelRuntime {
             ));
         }
 
-        let registry = KernelToolRegistry::default();
         let tool_tasks = intent
             .tasks
             .iter()
@@ -271,7 +271,7 @@ impl DeepCodeKernelRuntime {
                 args: task.args.clone(),
             })
             .collect::<Vec<_>>();
-        let draft = derive_plan_authorization(&registry, &tool_tasks);
+        let draft = derive_plan_authorization(self.tool_registry, &tool_tasks);
         self.finalize_plan_authorization(record, intent, draft)
     }
 
@@ -281,7 +281,6 @@ impl DeepCodeKernelRuntime {
         intent: &TaskIntentEnvelope,
         draft: PlanAuthorizationDraft,
     ) -> KernelResult<PlanAuthorizationReview> {
-        let registry = KernelToolRegistry::default();
         let mut diagnostics = draft
             .diagnostics
             .iter()
@@ -291,8 +290,12 @@ impl DeepCodeKernelRuntime {
         let mut operations = Vec::new();
         let planned_target_kinds = self.planned_target_kinds(record, &draft.operations);
         for operation in draft.operations {
-            match self.normalize_plan_operation(record, &registry, operation, &planned_target_kinds)
-            {
+            match self.normalize_plan_operation(
+                record,
+                self.tool_registry,
+                operation,
+                &planned_target_kinds,
+            ) {
                 Ok(operation) => operations.push(operation),
                 Err(error) => diagnostics.push(error.to_string()),
             }
@@ -336,8 +339,8 @@ impl DeepCodeKernelRuntime {
                 Some(KernelPlanPermissionBundle {
                     id: bundle.id,
                     capability: bundle.capability,
-                    permission_mode: bundle.permission_mode.as_str().to_string(),
-                    risk: bundle.risk.as_str().to_string(),
+                    permission_mode: bundle.permission_mode,
+                    risk: bundle.risk,
                     resource_kind: bundle.resource_kind,
                     operation_ids,
                     tool_ids: bundle.tool_ids,
@@ -348,20 +351,20 @@ impl DeepCodeKernelRuntime {
             .collect::<Vec<_>>();
         let interventions = permission_bundles
             .iter()
-            .filter(|bundle| bundle.permission_mode != "allow")
+            .filter(|bundle| bundle.permission_mode != ToolPermissionMode::Allow)
             .map(|bundle| KernelPlanGateIntervention {
                 id: format!("plan-gate-{}", bundle.id),
-                intervention_kind: if bundle.permission_mode == "deny" {
-                    "policy".to_string()
+                intervention_kind: if bundle.permission_mode == ToolPermissionMode::Deny {
+                    KernelGateInterventionKind::Policy
                 } else {
-                    "permission".to_string()
+                    KernelGateInterventionKind::Permission
                 },
-                status: "pending".to_string(),
+                status: KernelGateInterventionStatus::Pending,
                 permission_bundle_id: Some(bundle.id.clone()),
                 affected_operation_ids: bundle.operation_ids.clone(),
                 summary: format!(
                     "Kernel plan gate requires {} for {} operation(s).",
-                    bundle.permission_mode,
+                    bundle.permission_mode.as_str(),
                     bundle.operation_ids.len()
                 ),
             })
@@ -412,8 +415,8 @@ impl DeepCodeKernelRuntime {
             operations,
             permission_bundles,
             interventions,
-            cleanup_policy: "kernelPlanGrantLease".to_string(),
-            expires_after: "reviewGateReplanCancelOrRunTerminal".to_string(),
+            cleanup_policy: ContractCleanupPolicy::PlanGrantLease,
+            expires_after: ContractExpiry::ReviewGateReplanCancelOrRunTerminal,
         };
         Ok(PlanAuthorizationReview {
             plan_id: intent.plan_id.clone(),
@@ -428,11 +431,13 @@ impl DeepCodeKernelRuntime {
         record: &RuntimeRunRecord,
         registry: &KernelToolRegistry,
         operation: PlanAuthorizationOperationDraft,
-        planned_target_kinds: &BTreeMap<String, String>,
+        planned_target_kinds: &BTreeMap<String, ToolTargetKind>,
     ) -> KernelResult<KernelPlanAuthorizationOperation> {
-        let template = registry.template(&operation.tool_id).ok_or_else(|| {
+        let registration = registry.get(&operation.tool_id).ok_or_else(|| {
             KernelError::InvalidCommand(format!("toolId {} is not registered", operation.tool_id))
         })?;
+        let template = &registration.contract;
+        let operation_kind = registration.operation_kind();
         match template.resource.plan_target_mode {
             PlanTargetMode::PerTarget if operation.targets.len() != 1 => {
                 return Err(KernelError::InvalidCommand(format!(
@@ -471,7 +476,7 @@ impl DeepCodeKernelRuntime {
                 let metadata = absolute
                     .as_ref()
                     .and_then(|path| fs::symlink_metadata(path).ok());
-                if operation.tool_id == "fs.rename" {
+                if operation_kind == ToolOperationKind::FsRename {
                     validate_rename_plan_target(
                         &path,
                         target_index,
@@ -488,22 +493,24 @@ impl DeepCodeKernelRuntime {
                         planned_target_kinds.contains_key(&normalized_scope(&path)),
                     )?;
                 }
-                if operation.tool_id == "fs.delete" {
+                if operation_kind == ToolOperationKind::FsDelete {
                     let kind = metadata
                         .as_ref()
-                        .map(|value| if value.is_dir() { "directory" } else { "file" })
-                        .or_else(|| {
-                            planned_target_kinds
-                                .get(&normalized_scope(&path))
-                                .map(String::as_str)
+                        .map(|value| {
+                            if value.is_dir() {
+                                ToolTargetKind::Directory
+                            } else {
+                                ToolTargetKind::File
+                            }
                         })
+                        .or_else(|| planned_target_kinds.get(&normalized_scope(&path)).copied())
                         .ok_or_else(|| {
                             KernelError::InvalidCommand(format!(
                                 "fs.delete target does not exist: {path}"
                             ))
                         })?;
-                    target_kind = Some(kind.to_string());
-                    recursive = Some(kind == "directory");
+                    target_kind = Some(kind);
+                    recursive = Some(kind == ToolTargetKind::Directory);
                 }
                 normalized_targets.push(path);
             }
@@ -515,7 +522,7 @@ impl DeepCodeKernelRuntime {
             if let Some(path) = normalized_targets.first() {
                 object.insert("path".to_string(), Value::String(path.clone()));
             }
-            if operation.tool_id == "fs.rename" {
+            if operation_kind == ToolOperationKind::FsRename {
                 if let Some(destination) = normalized_targets.get(1) {
                     object.insert(
                         "destinationPath".to_string(),
@@ -524,7 +531,10 @@ impl DeepCodeKernelRuntime {
                 }
             }
             if let Some(kind) = target_kind.as_ref() {
-                object.insert("targetKind".to_string(), Value::String(kind.clone()));
+                object.insert(
+                    "targetKind".to_string(),
+                    Value::String(kind.wire_name().to_string()),
+                );
             }
             if let Some(recursive) = recursive {
                 object.insert("recursive".to_string(), Value::Bool(recursive));
@@ -548,8 +558,8 @@ impl DeepCodeKernelRuntime {
             id: operation.id,
             source_task_id: operation.source_task_id,
             tool_id: operation.tool_id,
-            operation_kind: template.operation_kind.unwrap_or("unknown").to_string(),
-            content_mode: template.usage_constraints.content_mode.to_string(),
+            operation_kind: template.operation_kind,
+            content_mode: template.usage_constraints.content_mode,
             targets: normalized_targets,
             depends_on: operation.depends_on,
             fixed_args: operation.fixed_args,
@@ -559,7 +569,7 @@ impl DeepCodeKernelRuntime {
             read_set,
             write_set,
             conflict_keys,
-            execution_mode: execution_mode_name(operation.execution_mode).to_string(),
+            execution_mode: operation.execution_mode,
             internal: operation.internal,
             parent_operation_id: operation.parent_operation_id,
         })
@@ -569,12 +579,16 @@ impl DeepCodeKernelRuntime {
         &self,
         record: &RuntimeRunRecord,
         operations: &[PlanAuthorizationOperationDraft],
-    ) -> BTreeMap<String, String> {
+    ) -> BTreeMap<String, ToolTargetKind> {
         let mut kinds = BTreeMap::new();
         for operation in operations {
-            let kind = match operation.tool_id.as_str() {
-                "fs.create" => Some("file"),
-                "fs.ensure_directory" => Some("directory"),
+            let kind = match self
+                .tool_registry
+                .get(&operation.tool_id)
+                .map(KernelToolRegistration::operation_kind)
+            {
+                Some(ToolOperationKind::FsCreate) => Some(ToolTargetKind::File),
+                Some(ToolOperationKind::FsEnsureDirectory) => Some(ToolTargetKind::Directory),
                 _ => None,
             };
             let Some(kind) = kind else {
@@ -582,20 +596,20 @@ impl DeepCodeKernelRuntime {
             };
             for target in &operation.targets {
                 if let Ok(normalized) = workspace_relative_write_path(self, record, target) {
-                    kinds.insert(
-                        normalized_scope(&normalized.relative_path),
-                        kind.to_string(),
-                    );
+                    kinds.insert(normalized_scope(&normalized.relative_path), kind);
                 }
             }
         }
 
         for _ in 0..operations.len() {
             let mut changed = false;
-            for operation in operations
-                .iter()
-                .filter(|operation| operation.tool_id == "fs.rename")
-            {
+            for operation in operations.iter().filter(|operation| {
+                self.tool_registry
+                    .get(&operation.tool_id)
+                    .is_some_and(|registration| {
+                        registration.operation_kind() == ToolOperationKind::FsRename
+                    })
+            }) {
                 let (Some(source), Some(destination)) =
                     (operation.targets.first(), operation.targets.get(1))
                 else {
@@ -614,9 +628,9 @@ impl DeepCodeKernelRuntime {
                     .and_then(|root| fs::symlink_metadata(root.join(&source.relative_path)).ok())
                     .map(|metadata| {
                         if metadata.is_dir() {
-                            "directory".to_string()
+                            ToolTargetKind::Directory
                         } else {
-                            "file".to_string()
+                            ToolTargetKind::File
                         }
                     })
                     .or_else(|| kinds.get(&source_scope).cloned());

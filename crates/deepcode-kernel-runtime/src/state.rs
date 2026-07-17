@@ -1,5 +1,9 @@
-use deepcode_kernel_abi::{ConfigSnapshotRef, KernelPlanAuthorizationContract, WorkspaceBinding};
-use deepcode_kernel_ledger::{ChangeOperation, KernelResourceManager, ValidationResult};
+use deepcode_kernel_abi::{
+    ConfigSnapshotRef, HostMcpRiskDecisionRecord, KernelExecutionContract,
+    KernelPlanAuthorizationContract, WorkspaceBinding,
+};
+use deepcode_kernel_ledger::KernelResourceManager;
+use deepcode_kernel_tools::ToolOperationKind;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -13,13 +17,12 @@ pub(crate) struct RuntimeState {
     pub(crate) pending_tools: BTreeMap<String, PendingKernelTool>,
     pub(crate) artifact_drafts: BTreeMap<String, ArtifactDraftRuntimeRecord>,
     pub(crate) terminal_artifact_draft_keys: BTreeSet<String>,
-    pub(crate) execution_contracts_by_run: BTreeMap<String, BTreeMap<String, Value>>,
+    pub(crate) execution_contracts_by_run:
+        BTreeMap<String, BTreeMap<String, KernelExecutionContract>>,
     pub(crate) plan_authorization_contracts_by_run:
         BTreeMap<String, BTreeMap<String, KernelPlanAuthorizationContract>>,
-    pub(crate) change_operations_by_run: BTreeMap<String, Vec<ChangeOperation>>,
-    pub(crate) validations_by_run: BTreeMap<String, Vec<ValidationResult>>,
     pub(crate) skill_trust_records: Vec<SkillTrustRecord>,
-    pub(crate) mcp_risk_acknowledgments: Vec<Value>,
+    pub(crate) mcp_risk_acknowledgments: Vec<HostMcpRiskDecisionRecord>,
     pub(crate) resource_manager: KernelResourceManager,
 }
 
@@ -44,20 +47,14 @@ pub(crate) struct ArtifactDraftRuntimeRecord {
 pub(crate) struct RuntimeWorkspace {
     pub(crate) id: String,
     pub(crate) name: String,
-    pub(crate) source: WorkspaceSource,
+    pub(crate) source: HostWorkspaceSourceKind,
     pub(crate) source_path: Option<PathBuf>,
     pub(crate) root: PathBuf,
     pub(crate) original_folder_path: String,
     pub(crate) folder_is_absolute: bool,
     pub(crate) settings: Value,
-    pub(crate) unsupported_fields: Vec<Value>,
+    pub(crate) unsupported_fields: Vec<HostUnsupportedWorkspaceField>,
     pub(crate) opened_at: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WorkspaceSource {
-    Directory,
-    CodeWorkspace,
 }
 
 #[derive(Debug, Clone)]
@@ -97,7 +94,7 @@ pub(crate) struct PendingKernelTool {
     pub(crate) work_unit_id: Option<String>,
     pub(crate) action_id: Option<String>,
     pub(crate) plan_id: Option<String>,
-    pub(crate) operation_kind: Option<String>,
+    pub(crate) operation_kind: ToolOperationKind,
     pub(crate) read_set: Vec<String>,
     pub(crate) write_set: Vec<String>,
     pub(crate) group_items: Vec<PendingKernelToolItem>,
@@ -112,7 +109,7 @@ pub(crate) struct PendingKernelToolItem {
     pub(crate) work_unit_id: Option<String>,
     pub(crate) action_id: Option<String>,
     pub(crate) plan_id: Option<String>,
-    pub(crate) operation_kind: Option<String>,
+    pub(crate) operation_kind: ToolOperationKind,
     pub(crate) read_set: Vec<String>,
     pub(crate) write_set: Vec<String>,
 }
@@ -276,38 +273,9 @@ impl DeepCodeKernelRuntime {
         if let Some((permission_id, pending)) = self.pending_tool_from_ledger(&record.run_id)? {
             self.state.pending_tools.insert(permission_id, pending);
         }
-        if self.state.current_workspace.is_none() {
-            if let Some(open_path) = record.workspace_binding.open_path.as_deref() {
-                self.restore_workspace_from_open_path(open_path)?;
-            }
-        }
         self.state
             .records_by_session
             .insert(session_id.to_string(), record);
-        Ok(())
-    }
-
-    pub(crate) fn restore_workspace_from_open_path(&mut self, open_path: &str) -> KernelResult<()> {
-        let resolved = resolve_workspace_root(open_path).map_err(KernelError::InvalidCommand)?;
-        self.state.next_workspace_index += 1;
-        let workspace_id = format!("workspace-{}", self.state.next_workspace_index);
-        self.state.current_workspace = Some(RuntimeWorkspace {
-            id: workspace_id,
-            name: resolved
-                .root
-                .file_name()
-                .and_then(OsStr::to_str)
-                .unwrap_or("workspace")
-                .to_string(),
-            source: resolved.source,
-            source_path: resolved.source_path,
-            root: resolved.root,
-            original_folder_path: open_path.to_string(),
-            folder_is_absolute: true,
-            settings: Value::Object(Default::default()),
-            unsupported_fields: Vec::new(),
-            opened_at: now_millis().to_string(),
-        });
         Ok(())
     }
 
@@ -328,6 +296,10 @@ impl DeepCodeKernelRuntime {
             payload,
             created_at: None,
         })
+    }
+
+    pub(crate) fn append_ledger_batch(&self, events: Vec<LedgerEvent>) -> KernelResult<()> {
+        self.ledger.append_batch(events)
     }
 
     pub(crate) fn record_by_run(&self, run_id: &str) -> KernelResult<RuntimeRunRecord> {

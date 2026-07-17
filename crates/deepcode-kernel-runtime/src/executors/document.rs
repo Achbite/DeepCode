@@ -3,16 +3,12 @@ use std::fmt::Write as _;
 
 pub(super) struct DocumentReadExecutor;
 
-impl SkillExecutor for DocumentReadExecutor {
-    fn descriptor(&self) -> SkillDescriptor {
-        descriptor("document.read")
-    }
-
+impl KernelToolExecutor for DocumentReadExecutor {
     fn invoke(
         &self,
-        invocation: SkillInvocation,
-        context: SkillExecutionContext,
-    ) -> KernelResult<SkillResult> {
+        invocation: KernelToolInvocation,
+        context: KernelToolExecutionContext,
+    ) -> KernelResult<KernelToolExecutionResult> {
         const MAX_PDF_BYTES: u64 = 16 * 1024 * 1024;
         const MAX_PDF_PAGES: usize = 50;
         const MAX_OUTPUT_BYTES: usize = 128 * 1024;

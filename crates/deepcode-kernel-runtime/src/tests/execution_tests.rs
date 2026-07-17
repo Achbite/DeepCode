@@ -130,7 +130,10 @@ fn accepted_write_contract_executes_and_enters_review() {
             request_id: RequestId("review-gate-write".to_string()),
             run_id: RunId("run-1".to_string()),
             session_id: Some(SessionId("session-1".to_string())),
-            decision: serde_json::json!({ "decision": "accept" }),
+            decision: ReviewGateDecision {
+                decision: ReviewGateDecisionKind::Accept,
+                guidance: None,
+            },
         })
         .expect("review gate accepts completed write facts");
     assert!(runtime
@@ -212,6 +215,98 @@ fn permission_resolution_resumes_the_same_pending_work_unit() {
 }
 
 #[test]
+fn permission_resolution_persistence_failure_keeps_checkpoint_and_grants_uncommitted() {
+    let suffix = TEMP_INDEX.fetch_add(1, Ordering::SeqCst);
+    let workspace = TestWorkspace(std::env::temp_dir().join(format!(
+        "deepcode-runtime-permission-atomic-{}-{suffix}",
+        std::process::id()
+    )));
+    fs::create_dir_all(&workspace.0).expect("create permission atomic workspace");
+    fs::write(workspace.join("input.txt"), "before\n").expect("write permission atomic input");
+    let fail_permission_resolution = Arc::new(AtomicBool::new(false));
+    let ledger = PermissionResolutionFailingLedger {
+        inner: InMemoryEventLedger::new(),
+        fail_permission_resolution: Arc::clone(&fail_permission_resolution),
+    };
+    let mut runtime = DeepCodeKernelRuntime::with_ledger(Box::new(ledger));
+    runtime
+        .dispatch(KernelCommand::HostWorkspaceOpen {
+            request_id: RequestId(format!("permission-atomic-workspace-{suffix}")),
+            path: workspace.to_string_lossy().to_string(),
+        })
+        .expect("permission atomic workspace opens");
+    runtime
+        .dispatch(KernelCommand::RunCreate {
+            request_id: RequestId(format!("permission-atomic-run-{suffix}")),
+            session_id: Some(SessionId("session-1".to_string())),
+            input: UserInput {
+                text: "Verify atomic permission resolution persistence.".to_string(),
+                attachments: Vec::new(),
+            },
+            workspace_binding: Some(workspace_binding_from_root(&workspace)),
+            profile_ref: None,
+            run_overrides: None,
+        })
+        .expect("permission atomic run creates");
+    let payload = action_bundle(
+        serde_json::json!([{
+            "actionId": "write-permission-atomic",
+            "toolId": "fs.write",
+            "args": { "path": "input.txt", "contentBlockId": "content-permission-atomic" },
+            "description": "Overwrite after atomic permission persistence",
+            "dependsOn": []
+        }]),
+        serde_json::json!([{
+            "blockId": "content-permission-atomic",
+            "targetPath": "input.txt",
+            "operation": "overwrite",
+            "contentLines": ["after"]
+        }]),
+    );
+    let report = submit_proposal(&mut runtime, payload.clone());
+    runtime
+        .release_batch_resources("run-1", "session-1", "testPermissionReset")
+        .expect("release plan batch grants before runtime permission gate");
+    let waiting = execute_contract(&mut runtime, &payload, &report);
+    let permission_id = waiting
+        .iter()
+        .find_map(|event| match event {
+            KernelEvent::PermissionRequested { request, .. } => Some(request.id.clone()),
+            _ => None,
+        })
+        .expect("runtime permission is requested");
+
+    fail_permission_resolution.store(true, Ordering::SeqCst);
+    runtime
+        .dispatch(KernelCommand::PermissionResolve {
+            request_id: RequestId(format!("permission-atomic-fail-{suffix}")),
+            permission_id: permission_id.clone(),
+            decision: PermissionDecisionKind::Accept,
+        })
+        .expect_err("permission resolution persistence failure must fail closed");
+    assert!(runtime.state.pending_tools.contains_key(&permission_id));
+    assert!(runtime.active_temporary_grants("run-1").is_empty());
+    assert_eq!(
+        fs::read_to_string(workspace.join("input.txt")).expect("read unchanged permission input"),
+        "before\n"
+    );
+
+    fail_permission_resolution.store(false, Ordering::SeqCst);
+    let resumed = runtime
+        .dispatch(KernelCommand::PermissionResolve {
+            request_id: RequestId(format!("permission-atomic-retry-{suffix}")),
+            permission_id,
+            decision: PermissionDecisionKind::Accept,
+        })
+        .expect("permission resolution retries from the preserved checkpoint");
+    assert!(terminal_tool(&resumed, "fs.write", true));
+    assert_eq!(
+        fs::read_to_string(workspace.join("input.txt")).expect("read resumed permission input"),
+        "after"
+    );
+}
+
+#[test]
 fn permission_resolution_restores_pending_write_from_contract_and_draft_ledger() {
     let suffix = TEMP_INDEX.fetch_add(1, Ordering::SeqCst);
     let workspace = TestWorkspace(std::env::temp_dir().join(format!(
@@ -223,7 +318,7 @@ fn permission_resolution_restores_pending_write_from_contract_and_draft_ledger()
     let ledger_path = workspace.join("kernel-events.jsonl");
     let mut runtime = DeepCodeKernelRuntime::with_ndjson_ledger(&ledger_path);
     runtime
-        .dispatch(KernelCommand::WorkspaceOpen {
+        .dispatch(KernelCommand::HostWorkspaceOpen {
             request_id: RequestId("recovery-workspace-open".to_string()),
             path: workspace.to_string_lossy().to_string(),
         })
@@ -312,7 +407,7 @@ fn permission_resolution_fails_closed_when_draft_content_cannot_be_restored() {
     let ledger_path = workspace.join("kernel-events.jsonl");
     let mut runtime = DeepCodeKernelRuntime::with_ndjson_ledger(&ledger_path);
     runtime
-        .dispatch(KernelCommand::WorkspaceOpen {
+        .dispatch(KernelCommand::HostWorkspaceOpen {
             request_id: RequestId("missing-draft-workspace-open".to_string()),
             path: workspace.to_string_lossy().to_string(),
         })
@@ -439,7 +534,7 @@ fn permission_bundle_groups_operations_and_resumes_every_work_unit() {
     assert_eq!(
         resumed
             .iter()
-            .filter(|event| matches!(event, KernelEvent::ToolCompleted { tool_name, ok: true, .. } if tool_name == "fs.write"))
+            .filter(|event| matches!(event, KernelEvent::ToolCompleted { fact, .. } if fact.tool_id == "fs.write" && fact.ok))
             .count(),
         2
     );
@@ -527,7 +622,7 @@ fn rejected_permission_bundle_blocks_only_affected_work_units() {
     );
     assert!(!rejected
         .iter()
-        .any(|event| matches!(event, KernelEvent::ToolCompleted { ok: true, .. })));
+        .any(|event| matches!(event, KernelEvent::ToolCompleted { fact, .. } if fact.ok)));
     assert!(rejected
         .iter()
         .any(|event| matches!(event, KernelEvent::BatchReviewReady { .. })));

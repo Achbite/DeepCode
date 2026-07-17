@@ -1,7 +1,8 @@
 use super::*;
+use deepcode_kernel_abi::KernelActionProposal;
 
 pub(super) struct ProposalReviewOutcome {
-    pub(super) report: ProposalReviewReportV3,
+    pub(super) report: KernelProposalReviewReport,
     pub(super) network_targets: Vec<NetworkTargetReview>,
 }
 
@@ -12,6 +13,7 @@ pub(super) struct NetworkTargetReview {
 
 pub(super) fn proposal_action_bundle_review_report(
     proposal: &ProposalEnvelope,
+    registry: &KernelToolRegistry,
     tool_config: &crate::executors::KernelExecutorConfig,
     workspace_execution_context_available: bool,
 ) -> ProposalReviewOutcome {
@@ -20,6 +22,7 @@ pub(super) fn proposal_action_bundle_review_report(
         return ProposalReviewOutcome {
             report: denied_proposal_report(
                 proposal,
+                registry,
                 format!(
                 "artifact_draft_budget_exceeded: actionBundle content uses {content_bytes} bytes; maximum is {ARTIFACT_DRAFT_MAX_TOTAL_UTF8_BYTES}"
             ),
@@ -27,12 +30,26 @@ pub(super) fn proposal_action_bundle_review_report(
             network_targets: Vec::new(),
         };
     }
-    let compiler = OperationCompiler::default();
-    let operations = match compiler.compile_batch(&proposal.payload) {
+    let action_proposal =
+        match serde_json::from_value::<KernelActionProposal>(proposal.payload.clone()) {
+            Ok(action_proposal) => action_proposal,
+            Err(error) => {
+                return ProposalReviewOutcome {
+                    report: denied_proposal_report(
+                        proposal,
+                        registry,
+                        format!("invalid canonical action proposal: {error}"),
+                    ),
+                    network_targets: Vec::new(),
+                };
+            }
+        };
+    let compiler = OperationCompiler::new(registry);
+    let operations = match compiler.compile_proposal(&action_proposal) {
         Ok(operations) => operations,
         Err(error) => {
             return ProposalReviewOutcome {
-                report: denied_proposal_report(proposal, error.to_string()),
+                report: denied_proposal_report(proposal, registry, error.to_string()),
                 network_targets: Vec::new(),
             };
         }
@@ -43,12 +60,20 @@ pub(super) fn proposal_action_bundle_review_report(
         let PlannedOperationKind::Network(network) = &operation.operation else {
             continue;
         };
-        let target_url = network_target_url(tool_config, network);
+        let target_url = match network_target_url(tool_config, network) {
+            Ok(target_url) => target_url,
+            Err(error) => {
+                return ProposalReviewOutcome {
+                    report: denied_proposal_report(proposal, registry, error.to_string()),
+                    network_targets: Vec::new(),
+                };
+            }
+        };
         let target = match crate::network_policy::review_http_target(&target_url) {
             Ok(target) => target,
             Err(error) => {
                 return ProposalReviewOutcome {
-                    report: denied_proposal_report(proposal, error.to_string()),
+                    report: denied_proposal_report(proposal, registry, error.to_string()),
                     network_targets: Vec::new(),
                 };
             }
@@ -68,31 +93,30 @@ pub(super) fn proposal_action_bundle_review_report(
     }
     let report = match compiler.review_action_bundle_with_permission_modes(
         &proposal.proposal_id,
-        &proposal.payload,
+        &action_proposal,
         &permission_modes,
     ) {
         Ok(mut report) => {
-            let registry = KernelToolRegistry::default();
             let requires_workspace = report
                 .execution_contract
                 .operations
                 .iter()
                 .any(|operation| registry.needs_workspace(&operation.tool_id).unwrap_or(true));
             if requires_workspace && !workspace_execution_context_available {
-                report.status = "denied".to_string();
+                report.status = KernelExecutionContractStatus::Denied;
                 report.diagnostics.push(
                     "workspace_binding_required: workspace tools require a run-bound workspace or an explicit user attachment"
                         .to_string(),
                 );
-                report.execution_contract.status = "denied".to_string();
+                report.execution_contract.status = KernelExecutionContractStatus::Denied;
                 report.execution_contract.permission_bundles.clear();
                 report.execution_contract.interventions.clear();
-                report.execution_contract.cleanup_policy = "none".to_string();
-                report.execution_contract.expires_after = "immediate".to_string();
+                report.execution_contract.cleanup_policy = ContractCleanupPolicy::None;
+                report.execution_contract.expires_after = ContractExpiry::Immediate;
             }
             report
         }
-        Err(error) => denied_proposal_report(proposal, error.to_string()),
+        Err(error) => denied_proposal_report(proposal, registry, error.to_string()),
     };
     ProposalReviewOutcome {
         report,
@@ -103,15 +127,18 @@ pub(super) fn proposal_action_bundle_review_report(
 fn network_target_url(
     config: &crate::executors::KernelExecutorConfig,
     operation: &deepcode_kernel_tools::NetworkOperation,
-) -> String {
+) -> KernelResult<String> {
     match operation.kind {
         deepcode_kernel_tools::NetworkOperationKind::Fetch => {
-            operation.url.clone().unwrap_or_default()
+            Ok(operation.url.clone().unwrap_or_default())
         }
-        deepcode_kernel_tools::NetworkOperationKind::Search => config
-            .web_search_endpoint_template
-            .replace("{query}", "kernel-review")
-            .replace("{limit}", "1"),
+        deepcode_kernel_tools::NetworkOperationKind::Search => {
+            crate::executors::web::web_search_target_url(
+                config,
+                operation.query.as_deref().unwrap_or_default(),
+                operation.limit.unwrap_or(5),
+            )
+        }
     }
 }
 
@@ -135,49 +162,56 @@ fn action_bundle_content_bytes(payload: &Value) -> u64 {
 
 fn denied_proposal_report(
     proposal: &ProposalEnvelope,
+    registry: &KernelToolRegistry,
     diagnostic: String,
-) -> ProposalReviewReportV3 {
-    ProposalReviewReportV3 {
+) -> KernelProposalReviewReport {
+    KernelProposalReviewReport {
         proposal_id: proposal.proposal_id.clone(),
-        status: "denied".to_string(),
+        status: KernelExecutionContractStatus::Denied,
         required_permissions: Vec::new(),
         diagnostics: vec![diagnostic],
-        execution_contract: deepcode_kernel_tools::KernelExecutionContractV3 {
+        execution_contract: deepcode_kernel_tools::KernelExecutionContract {
             id: format!("contract-rejected-{}", proposal.proposal_id),
             proposal_id: proposal.proposal_id.clone(),
             authorization_contract_id: None,
-            status: "denied".to_string(),
+            status: KernelExecutionContractStatus::Denied,
             catalog_version: deepcode_kernel_tools::TOOL_REGISTRY_VERSION.to_string(),
-            catalog_hash: KernelToolRegistry::default().snapshot().catalog_hash,
+            catalog_hash: registry.snapshot().catalog_hash,
             operation_set_hash: String::new(),
             contract_hash: String::new(),
             operations: Vec::new(),
             permission_bundles: Vec::new(),
             interventions: Vec::new(),
-            cleanup_policy: "none".to_string(),
-            expires_after: "immediate".to_string(),
+            cleanup_policy: ContractCleanupPolicy::None,
+            expires_after: ContractExpiry::Immediate,
         },
     }
 }
 
 pub(crate) fn web_permission_mode_for_tool_args(
     config: &crate::executors::KernelExecutorConfig,
-    tool_name: &str,
+    operation_kind: ToolOperationKind,
     arguments: &Value,
 ) -> Option<ToolPermissionMode> {
-    let target = match tool_name {
-        "web.fetch" => arguments
-            .get("url")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        "web.search" => Some(
-            config
-                .web_search_endpoint_template
-                .replace("{query}", "kernel-review")
-                .replace("{limit}", "1"),
-        ),
-        _ => return None,
-    };
+    let target =
+        match operation_kind {
+            ToolOperationKind::WebFetch => arguments
+                .get("url")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            ToolOperationKind::WebSearch => arguments
+                .get("query")
+                .and_then(Value::as_str)
+                .and_then(|query| {
+                    crate::executors::web::web_search_target_url(
+                        config,
+                        query,
+                        arguments.get("limit").and_then(Value::as_u64).unwrap_or(5),
+                    )
+                    .ok()
+                }),
+            _ => return None,
+        };
     Some(
         target
             .as_deref()

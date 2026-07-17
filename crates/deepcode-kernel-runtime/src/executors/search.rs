@@ -3,16 +3,12 @@ use super::*;
 pub(super) struct FsGlobExecutor;
 pub(super) struct CodeGrepExecutor;
 
-impl SkillExecutor for FsGlobExecutor {
-    fn descriptor(&self) -> SkillDescriptor {
-        descriptor("fs.glob")
-    }
-
+impl KernelToolExecutor for FsGlobExecutor {
     fn invoke(
         &self,
-        invocation: SkillInvocation,
-        context: SkillExecutionContext,
-    ) -> KernelResult<SkillResult> {
+        invocation: KernelToolInvocation,
+        context: KernelToolExecutionContext,
+    ) -> KernelResult<KernelToolExecutionResult> {
         let root = workspace_root(&context)?;
         let relative = get_string(&invocation.input, "path").unwrap_or_else(|| ".".to_string());
         let target = resolve_workspace_read_path(&root, &relative)?;
@@ -53,16 +49,12 @@ impl SkillExecutor for FsGlobExecutor {
     }
 }
 
-impl SkillExecutor for CodeGrepExecutor {
-    fn descriptor(&self) -> SkillDescriptor {
-        descriptor("code.grep")
-    }
-
+impl KernelToolExecutor for CodeGrepExecutor {
     fn invoke(
         &self,
-        invocation: SkillInvocation,
-        context: SkillExecutionContext,
-    ) -> KernelResult<SkillResult> {
+        invocation: KernelToolInvocation,
+        context: KernelToolExecutionContext,
+    ) -> KernelResult<KernelToolExecutionResult> {
         let root = workspace_root(&context)?;
         let query = get_string(&invocation.input, "query").unwrap_or_default();
         if query.trim().is_empty() {

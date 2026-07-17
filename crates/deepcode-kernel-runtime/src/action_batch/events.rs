@@ -59,7 +59,7 @@ impl DeepCodeKernelRuntime {
         request_id: &RequestId,
         run_id: &str,
         session_id: &str,
-        work_unit: Value,
+        work_unit: WorkUnitDescriptor,
     ) -> KernelResult<KernelEvent> {
         let sequence = self.ledger.next_sequence(run_id)?;
         self.append_ledger(

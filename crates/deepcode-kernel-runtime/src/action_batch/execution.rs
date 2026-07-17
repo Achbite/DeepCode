@@ -5,13 +5,14 @@ use super::preflight::prepare_action_batch;
 use super::summary::*;
 use super::targets::*;
 use super::*;
+use deepcode_kernel_abi::KernelActionBatch;
 impl DeepCodeKernelRuntime {
     pub(crate) fn action_batch_submit(
         &mut self,
         request_id: RequestId,
         run_id: RunId,
         session_id: Option<SessionId>,
-        batch: Value,
+        batch: KernelActionBatch,
     ) -> KernelResult<Vec<KernelEvent>> {
         let run_id_text = run_id.0.clone();
         let record = self.record_by_run(&run_id_text)?.clone();
@@ -48,22 +49,12 @@ impl DeepCodeKernelRuntime {
             events.push(event);
         }
 
-        let compiler = OperationCompiler::default();
-        let plan_id = batch
-            .get("planId")
-            .or_else(|| {
-                compiler
-                    .action_bundle_value(&batch)
-                    .and_then(|bundle| bundle.get("id"))
-            })
-            .and_then(Value::as_str)
-            .unwrap_or("action-batch")
-            .to_string();
-        let contract_id = batch_contract_id(&batch);
+        let plan_id = batch.plan_id.clone();
+        let contract_id = Some(batch.contract_id.clone());
         let mut has_pending_permission = false;
         let mut permission_group_ids = std::collections::BTreeMap::<String, String>::new();
 
-        let operations = match compiler.compile_batch(&batch) {
+        let operations = match OperationCompiler::new(self.tool_registry).compile_batch(&batch) {
             Ok(operations) => operations,
             Err(OperationCompileError::EmptyActions) => {
                 let work_unit_id = format!("work-unit-{}-empty", safe_work_unit_segment(&plan_id));
@@ -129,6 +120,7 @@ impl DeepCodeKernelRuntime {
         }
 
         if let Err(error) = validate_operations_against_execution_contract(
+            self.tool_registry,
             &self.state,
             &run_id_text,
             &batch,
@@ -237,40 +229,26 @@ impl DeepCodeKernelRuntime {
             let prepared = prepared_operations
                 .remove(&action_id)
                 .expect("preflight prepares every scheduled operation");
-            let can_request_blocked_permission = prepared.can_request_blocked_permission;
             let mut compiled = prepared.compiled;
-            let compiled_tool = compiled.as_ref().map(compiled_tool_summary);
-            let mut work_unit = serde_json::json!({
-                "id": &work_unit_id,
-                "planId": &plan_id,
-                "actionId": &action_id,
-                "title": &operation.title,
-                "capability": capability,
-                "kind": kind,
-                "targetRef": &operation.target_ref,
-                "readSet": &operation.read_set,
-                "writeSet": &operation.write_set,
-                "conflictKeys": &operation.conflict_keys,
-                "executionMode": operation.execution_mode,
-                "status": "queued"
-            });
-            if matches!(
-                &operation.operation,
-                PlannedOperationKind::Workspace(workspace)
-                    if workspace.kind == WorkspaceOperationKind::Delete
-            ) {
-                if let Some(object) = work_unit.as_object_mut() {
-                    object.insert(
-                        "deleteSet".to_string(),
-                        serde_json::json!(&operation.write_set),
-                    );
-                }
-            }
-            if let Some(compiled_tool) = compiled_tool {
-                if let Some(object) = work_unit.as_object_mut() {
-                    object.insert("compiledTool".to_string(), compiled_tool);
-                }
-            }
+            let compiled_tool = compiled
+                .as_ref()
+                .map(|compiled| compiled_tool_summary(operation.operation_kind, compiled));
+            let work_unit = WorkUnitDescriptor {
+                id: work_unit_id.clone(),
+                plan_id: plan_id.clone(),
+                action_id: action_id.clone(),
+                title: operation.title.clone(),
+                tool_id: operation.tool_id.clone(),
+                operation_kind: operation.operation_kind,
+                capability: capability.to_string(),
+                target_ref: operation.target_ref.clone(),
+                read_set: operation.read_set.clone(),
+                write_set: operation.write_set.clone(),
+                conflict_keys: operation.conflict_keys.clone(),
+                execution_mode: operation.execution_mode,
+                status: WorkUnitStatus::Queued,
+                compiled_tool,
+            };
             events.push(self.work_unit_queued_event(
                 &request_id,
                 &run_id_text,
@@ -278,9 +256,7 @@ impl DeepCodeKernelRuntime {
                 work_unit,
             )?);
 
-            if operation.execution_mode != OperationExecutionMode::Execute
-                && !can_request_blocked_permission
-            {
+            if operation.execution_mode != OperationExecutionMode::Execute {
                 events.push(self.work_unit_blocked_event(
                     &request_id,
                     &run_id_text,
@@ -348,9 +324,15 @@ impl DeepCodeKernelRuntime {
                     run_id: Some(RunId(run_id_text.clone())),
                     session_id: Some(SessionId(session_id_text.clone())),
                     turn_id: None,
-                    tool_call_id: tool_call_id.clone(),
-                    tool_name: compiled.tool_name.clone(),
-                    args_preview: redact_tool_arguments(&compiled.tool_name, &compiled.arguments),
+                    fact: ToolRequestFact {
+                        tool_call_id: tool_call_id.clone(),
+                        tool_id: compiled.tool_name.clone(),
+                        operation_kind: operation.operation_kind,
+                        args_preview: redact_tool_arguments(
+                            operation.operation_kind,
+                            &compiled.arguments,
+                        ),
+                    },
                     sequence: Some(request_sequence),
                 };
                 self.append_ledger(
@@ -362,7 +344,10 @@ impl DeepCodeKernelRuntime {
                         "summary": format!("Tool requested: {}", compiled.tool_name),
                         "toolCallId": &tool_call_id,
                         "toolName": &compiled.tool_name,
-                        "argsPreview": redact_tool_arguments(&compiled.tool_name, &compiled.arguments)
+                        "argsPreview": redact_tool_arguments(
+                            operation.operation_kind,
+                            &compiled.arguments
+                        )
                     }),
                 )?;
                 events.push(requested);
@@ -370,6 +355,7 @@ impl DeepCodeKernelRuntime {
                 let permission_id = tool_call_id.clone();
                 let permission_bundle_id = contract_id.as_deref().and_then(|contract_id| {
                     permission_bundle_id_for_operation(
+                        self.tool_registry,
                         &self.state,
                         &run_id_text,
                         contract_id,
@@ -419,7 +405,7 @@ impl DeepCodeKernelRuntime {
                     work_unit_id: Some(work_unit_id.clone()),
                     action_id: Some(action_id.clone()),
                     plan_id: Some(plan_id.clone()),
-                    operation_kind: Some(kind.to_string()),
+                    operation_kind: operation.operation_kind,
                     read_set: operation.read_set.clone(),
                     write_set: operation.write_set.clone(),
                 };
@@ -452,36 +438,42 @@ impl DeepCodeKernelRuntime {
                         work_unit_id: Some(work_unit_id.clone()),
                         action_id: Some(action_id.clone()),
                         plan_id: Some(plan_id.clone()),
-                        operation_kind: Some(kind.to_string()),
+                        operation_kind: operation.operation_kind,
                         read_set: operation.read_set.clone(),
                         write_set: operation.write_set.clone(),
                         group_items: vec![pending_item],
                     },
                 );
                 let permission_sequence = self.ledger.next_sequence(&run_id_text)?;
-                let tool_capability = capability_for_tool(&compiled.tool_name)?;
-                let tool_risk = risk_for_tool(&compiled.tool_name)?;
+                let tool_capability = self.capability_for_tool(&compiled.tool_name)?;
+                let tool_risk = self.risk_for_tool(&compiled.tool_name)?;
+                let permission_request = deepcode_kernel_abi::PermissionRequestEnvelope {
+                    id: permission_id.clone(),
+                    request_kind: permission_request_kind(
+                        &self.state,
+                        &run_id_text,
+                        contract_id.as_deref(),
+                    ),
+                    permission_bundle_id: permission_bundle_id.clone(),
+                    contract_id: contract_id.clone(),
+                    affected_operation_ids: affected_operation_ids.clone(),
+                    work_unit_ids: work_unit_ids.clone(),
+                    tool_id: Some(compiled.tool_name.clone()),
+                    capability: tool_capability.to_string(),
+                    risk_level: tool_risk,
+                    summary: format!(
+                        "Allow {} to access workspace resources?",
+                        compiled.tool_name
+                    ),
+                    args_preview: redact_tool_arguments(
+                        operation.operation_kind,
+                        &compiled.arguments,
+                    ),
+                };
                 let permission = KernelEvent::PermissionRequested {
                     run_id: Some(RunId(run_id_text.clone())),
                     session_id: SessionId(session_id_text.clone()),
-                    request: deepcode_kernel_abi::PermissionRequestEnvelope {
-                        id: permission_id.clone(),
-                        permission_bundle_id: permission_bundle_id.clone(),
-                        contract_id: contract_id.clone(),
-                        affected_operation_ids: affected_operation_ids.clone(),
-                        work_unit_ids: work_unit_ids.clone(),
-                        tool_id: Some(compiled.tool_name.clone()),
-                        capability: tool_capability.to_string(),
-                        risk_level: tool_risk.to_string(),
-                        summary: format!(
-                            "Allow {} to access workspace resources?",
-                            compiled.tool_name
-                        ),
-                        args_preview: redact_tool_arguments(
-                            &compiled.tool_name,
-                            &compiled.arguments,
-                        ),
-                    },
+                    request: permission_request.clone(),
                     sequence: Some(permission_sequence),
                 };
                 self.append_ledger(
@@ -489,32 +481,15 @@ impl DeepCodeKernelRuntime {
                     &session_id_text,
                     "permission.requested",
                     permission_sequence,
-                    serde_json::json!({
-                        "summary": format!("Permission requested for {}.", compiled.tool_name),
-                        "permissionId": &permission_id,
-                        "toolCallId": &tool_call_id,
-                        "toolName": &compiled.tool_name,
-                        "capability": tool_capability,
-                        "riskLevel": tool_risk,
-                        "permissionBundleId": permission_bundle_id,
-                        "contractId": contract_id,
-                        "affectedOperationIds": affected_operation_ids,
-                        "workUnitIds": work_unit_ids,
-                        "requestId": &request_id.0,
-                        "workUnitId": &work_unit_id,
-                        "actionId": &action_id,
-                        "planId": &plan_id,
-                        "operationKind": kind,
-                        "readSet": &operation.read_set,
-                        "writeSet": &operation.write_set,
-                        "argsPreview": redact_tool_arguments(&compiled.tool_name, &compiled.arguments),
-                        "checkpoint": checkpoint,
-                        "argumentsRef": {
-                            "storage": "runtime.pendingTools",
-                            "permissionId": &permission_id,
-                            "redaction": "raw arguments are kept in memory only and are not persisted to permission ledger"
-                        }
-                    }),
+                    serde_json::to_value(deepcode_kernel_abi::PermissionRequestedFact {
+                        request: permission_request,
+                        checkpoint,
+                    })
+                    .map_err(|error| {
+                        KernelError::InvalidCommand(format!(
+                            "encode permission request fact: {error}"
+                        ))
+                    })?,
                 )?;
                 events.push(permission);
                 if let Some(event) = self.transition_runtime_lifecycle(
@@ -535,17 +510,19 @@ impl DeepCodeKernelRuntime {
                 &session_id_text,
                 tool_call_id,
                 compiled.tool_name,
+                operation.operation_kind,
                 compiled.arguments,
             )?;
-            let tool_ok = matches!(&tool_event, KernelEvent::ToolCompleted { ok: true, .. });
+            let tool_ok = matches!(
+                &tool_event,
+                KernelEvent::ToolCompleted { fact, .. } if fact.ok
+            );
             let tool_error = match &tool_event {
-                KernelEvent::ToolCompleted {
-                    error: Some(error), ..
-                } => Some(error.clone()),
+                KernelEvent::ToolCompleted { fact, .. } => fact.error.clone(),
                 _ => None,
             };
             let tool_output = match &tool_event {
-                KernelEvent::ToolCompleted { output, .. } => output.clone(),
+                KernelEvent::ToolCompleted { fact, .. } => fact.output.clone(),
                 _ => None,
             };
             events.push(tool_event);

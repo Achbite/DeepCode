@@ -1,4 +1,7 @@
 use super::*;
+use deepcode_kernel_abi::{
+    ReviewGateDecision, ReviewGateDecisionKind, ReviewGateEvaluation, ReviewGateStatus,
+};
 
 impl DeepCodeKernelRuntime {
     pub(crate) fn review_facts_get(
@@ -37,7 +40,7 @@ impl DeepCodeKernelRuntime {
         request_id: RequestId,
         run_id: RunId,
         session_id: Option<SessionId>,
-        decision: Value,
+        decision: ReviewGateDecision,
     ) -> KernelResult<Vec<KernelEvent>> {
         let record = self.record_by_run(&run_id.0)?.clone();
         let session_id_text = session_id
@@ -47,41 +50,49 @@ impl DeepCodeKernelRuntime {
         let failed_count = facts.failed_work_units.len();
         let blocked_count = facts.blocked_work_units.len();
         let cleanup_failure_count = facts.cleanup_failures.len();
-        let decision_kind = decision
-            .get("decision")
-            .and_then(Value::as_str)
-            .unwrap_or("needsUserReview");
-        let status = match decision_kind {
-            "accept" if failed_count == 0 && blocked_count == 0 && cleanup_failure_count == 0 => {
-                "accepted"
+        let status = match decision.decision {
+            ReviewGateDecisionKind::Accept
+                if failed_count == 0 && blocked_count == 0 && cleanup_failure_count == 0 =>
+            {
+                ReviewGateStatus::Accepted
             }
-            "accept" | "revise" => "needsReplan",
-            "reject" => "aborted",
-            _ => "needsUserReview",
+            ReviewGateDecisionKind::Accept | ReviewGateDecisionKind::Revise => {
+                ReviewGateStatus::NeedsReplan
+            }
+            ReviewGateDecisionKind::Reject => ReviewGateStatus::Aborted,
         };
         let summary = match status {
-            "accepted" => "ReviewGate accepted Kernel facts and user review decision.",
-            "needsReplan" => "ReviewGate requires replan before completion.",
-            "aborted" => "ReviewGate aborted by user decision.",
-            _ => "ReviewGate still needs user review.",
+            ReviewGateStatus::Accepted => {
+                "ReviewGate accepted Kernel facts and user review decision."
+            }
+            ReviewGateStatus::NeedsReplan => "ReviewGate requires replan before completion.",
+            ReviewGateStatus::Aborted => "ReviewGate aborted by user decision.",
         };
-        let cleanup =
-            self.release_run_resources(&run_id.0, &session_id_text, "reviewGateEvaluated")?;
-        let result = serde_json::json!({
-            "id": format!("review-{}", run_id.0),
-            "runId": run_id.0,
-            "status": status,
-            "decision": decision,
-            "failedWorkUnitCount": failed_count,
-            "blockedWorkUnitCount": blocked_count,
-            "cleanupFailureCount": cleanup_failure_count,
-            "revokedTemporaryGrantCount": cleanup.revoked_grant_count,
-            "releasedResourceCount": cleanup.released_resource_count,
-            "removedTempFileCount": cleanup.removed_temp_file_count,
-            "cleanupFailures": &cleanup.failures,
-            "summary": summary,
-            "factsRef": facts.facts_ref
-        });
+        let cleanup = match status {
+            ReviewGateStatus::Accepted | ReviewGateStatus::Aborted => {
+                self.release_run_resources(&run_id.0, &session_id_text, "reviewGateEvaluated")?
+            }
+            ReviewGateStatus::NeedsReplan => self.release_plan_authorization_resources(
+                &run_id.0,
+                &session_id_text,
+                "reviewGateNeedsReplan",
+            )?,
+        };
+        let result = ReviewGateEvaluation {
+            id: format!("review-{}", run_id.0),
+            run_id: run_id.0.clone(),
+            status,
+            decision,
+            failed_work_unit_count: failed_count,
+            blocked_work_unit_count: blocked_count,
+            cleanup_failure_count,
+            revoked_temporary_grant_count: cleanup.revoked_grant_count,
+            released_resource_count: cleanup.released_resource_count,
+            removed_temp_file_count: cleanup.removed_temp_file_count,
+            cleanup_failures: cleanup.failures.clone(),
+            summary: summary.to_string(),
+            facts_ref: facts.facts_ref,
+        };
         let sequence = self.ledger.next_sequence(&run_id.0)?;
         self.append_ledger(
             &run_id.0,
@@ -104,20 +115,19 @@ impl DeepCodeKernelRuntime {
             sequence: Some(sequence),
         }];
         let next_state = match status {
-            "accepted" | "aborted" => Some(RuntimeLifecycleState::Terminal),
-            "needsReplan" => Some(RuntimeLifecycleState::Ready),
-            _ => None,
-        };
-        if let Some(next_state) = next_state {
-            if let Some(event) = self.transition_runtime_lifecycle(
-                None,
-                &run_id.0,
-                &session_id_text,
-                next_state,
-                format!("reviewGate:{status}"),
-            )? {
-                events.push(event);
+            ReviewGateStatus::Accepted | ReviewGateStatus::Aborted => {
+                RuntimeLifecycleState::Terminal
             }
+            ReviewGateStatus::NeedsReplan => RuntimeLifecycleState::Ready,
+        };
+        if let Some(event) = self.transition_runtime_lifecycle(
+            None,
+            &run_id.0,
+            &session_id_text,
+            next_state,
+            format!("reviewGate:{}", status.as_str()),
+        )? {
+            events.push(event);
         }
         Ok(events)
     }

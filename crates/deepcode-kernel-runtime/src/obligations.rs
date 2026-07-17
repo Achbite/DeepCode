@@ -2,15 +2,14 @@ use super::*;
 
 impl DeepCodeKernelRuntime {
     pub(crate) fn record_change_operation_for_tool(
-        &mut self,
+        &self,
         run_id: &str,
         session_id: &str,
         tool_call_id: &str,
         tool_name: &str,
         arguments: &Value,
     ) -> KernelResult<()> {
-        let registry = KernelToolRegistry::default();
-        let template = registry.template(tool_name).ok_or_else(|| {
+        let template = self.tool_registry.contract(tool_name).ok_or_else(|| {
             KernelError::InvalidCommand(format!(
                 "tool.completed references unregistered tool {tool_name}"
             ))
@@ -24,16 +23,10 @@ impl DeepCodeKernelRuntime {
         let operation = ChangeOperation {
             id: format!("change-{run_id}-{tool_call_id}"),
             work_unit_id: Some(tool_call_id.to_string()),
-            kind: kind.to_string(),
+            kind: kind.wire_name().to_string(),
             file_path: path,
             diff: None,
         };
-        self.state
-            .change_operations_by_run
-            .entry(run_id.to_string())
-            .or_default()
-            .push(operation.clone());
-
         let operation_sequence = self.ledger.next_sequence(run_id)?;
         self.append_ledger(
             run_id,
@@ -47,11 +40,31 @@ impl DeepCodeKernelRuntime {
         )?;
 
         let operations = self
-            .state
-            .change_operations_by_run
-            .get(run_id)
-            .cloned()
-            .unwrap_or_default();
+            .ledger
+            .list_by_run(run_id)?
+            .into_iter()
+            .filter(|event| event.kind == "change.operation_recorded")
+            .map(|event| {
+                event
+                    .payload
+                    .get("operation")
+                    .cloned()
+                    .ok_or_else(|| {
+                        KernelError::InvalidCommand(format!(
+                            "change operation fact at sequence {:?} is missing operation",
+                            event.sequence
+                        ))
+                    })
+                    .and_then(|value| {
+                        serde_json::from_value(value).map_err(|error| {
+                            KernelError::InvalidCommand(format!(
+                                "decode change operation fact at sequence {:?}: {error}",
+                                event.sequence
+                            ))
+                        })
+                    })
+            })
+            .collect::<KernelResult<Vec<ChangeOperation>>>()?;
         let change_set =
             ChangeSet::from_operations(format!("changeset-{run_id}"), run_id, operations);
         let change_set_sequence = self.ledger.next_sequence(run_id)?;
@@ -68,15 +81,14 @@ impl DeepCodeKernelRuntime {
     }
 
     pub(crate) fn record_validation_for_tool(
-        &mut self,
+        &self,
         run_id: &str,
         session_id: &str,
         tool_call_id: &str,
         tool_name: &str,
         output: &Value,
     ) -> KernelResult<()> {
-        let registry = KernelToolRegistry::default();
-        let template = registry.template(tool_name).ok_or_else(|| {
+        let template = self.tool_registry.contract(tool_name).ok_or_else(|| {
             KernelError::InvalidCommand(format!(
                 "tool.completed references unregistered tool {tool_name}"
             ))
@@ -103,11 +115,6 @@ impl DeepCodeKernelRuntime {
             },
             evidence_refs: vec![format!("tool.completed:{tool_call_id}")],
         };
-        self.state
-            .validations_by_run
-            .entry(run_id.to_string())
-            .or_default()
-            .push(validation.clone());
         let sequence = self.ledger.next_sequence(run_id)?;
         self.append_ledger(
             run_id,

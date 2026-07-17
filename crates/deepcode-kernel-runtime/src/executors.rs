@@ -1,16 +1,14 @@
 use deepcode_kernel_abi::{KernelError, KernelResult};
 use deepcode_kernel_policy::WorkspaceBoundary;
-use deepcode_kernel_skills::{
-    skill_descriptor_from_template, SkillDescriptor, SkillExecutionContext, SkillExecutor,
-    SkillInvocation, SkillResult,
-};
 use deepcode_kernel_tools::file_content::{
     lightweight_file_classification, read_text_file_for_llm,
 };
-use deepcode_kernel_tools::KernelToolRegistry;
+use deepcode_kernel_tools::{KernelExecutorBinding, KernelToolRegistry};
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::Read;
@@ -56,47 +54,139 @@ impl SecretProvider for EmptySecretProvider {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KernelToolInvocation {
+    pub id: String,
+    pub tool_id: String,
+    pub input: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KernelToolExecutionContext {
+    pub workspace_root: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KernelToolExecutionResult {
+    pub invocation_id: String,
+    pub output: Value,
+}
+
+pub trait KernelToolExecutor: Send + Sync {
+    fn invoke(
+        &self,
+        invocation: KernelToolInvocation,
+        context: KernelToolExecutionContext,
+    ) -> KernelResult<KernelToolExecutionResult>;
+}
+
+#[derive(Default)]
+pub struct KernelExecutorRegistry {
+    executors: BTreeMap<&'static str, Box<dyn KernelToolExecutor>>,
+}
+
+impl KernelExecutorRegistry {
+    pub fn from_executors(executors: Vec<(&'static str, Box<dyn KernelToolExecutor>)>) -> Self {
+        let mut registry = Self::default();
+        for (tool_id, executor) in executors {
+            assert!(
+                registry.executors.insert(tool_id, executor).is_none(),
+                "duplicate executor binding for canonical tool {tool_id}"
+            );
+        }
+        registry
+    }
+
+    pub fn invoke(
+        &self,
+        tool_id: &str,
+        invocation: KernelToolInvocation,
+        context: KernelToolExecutionContext,
+    ) -> KernelResult<KernelToolExecutionResult> {
+        if invocation.tool_id != tool_id {
+            return Err(KernelError::InvalidCommand(format!(
+                "executor lookup for {tool_id} does not match invocation tool {}",
+                invocation.tool_id
+            )));
+        }
+        let executor = self.executors.get(tool_id).ok_or_else(|| {
+            KernelError::PermissionDenied(format!(
+                "Kernel tool {tool_id} has no executable binding"
+            ))
+        })?;
+        executor.invoke(invocation, context)
+    }
+
+    pub fn tool_ids(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.executors.keys().copied()
+    }
+}
+
 pub fn builtin_executors(
+    registry: &KernelToolRegistry,
     config: KernelExecutorConfig,
     secret_provider: Arc<dyn SecretProvider>,
-) -> Vec<Box<dyn SkillExecutor>> {
-    let executors: Vec<Box<dyn SkillExecutor>> = vec![
-        Box::new(FsListExecutor),
-        Box::new(FsGlobExecutor),
-        Box::new(FsReadExecutor),
-        Box::new(FsDiffExecutor),
-        Box::new(FsCreateExecutor),
-        Box::new(FsWriteExecutor),
-        Box::new(FsEditExecutor),
-        Box::new(FsRenameExecutor),
-        Box::new(FsDeleteExecutor),
-        Box::new(FsEnsureDirectoryExecutor),
-        Box::new(DocumentReadExecutor),
-        Box::new(CodeGrepExecutor),
-        Box::new(WebSearchExecutor {
-            config: config.clone(),
-            secret_provider,
-        }),
-        Box::new(WebFetchExecutor),
-        Box::new(GitStatusExecutor),
-        Box::new(GitDiffExecutor),
-        Box::new(GitStageExecutor),
-        Box::new(GitUnstageExecutor),
-        Box::new(GitCommitExecutor),
-    ];
-    assert_executor_bindings_match_tool_registry(&executors);
+) -> Vec<(&'static str, Box<dyn KernelToolExecutor>)> {
+    let executors = registry
+        .registrations()
+        .filter_map(|registration| {
+            registration.executor_binding.map(|binding| {
+                (
+                    registration.tool_id(),
+                    executor_for_binding(binding, config.clone(), Arc::clone(&secret_provider)),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    assert_executor_bindings_match_tool_registry(registry, &executors);
     executors
 }
 
-fn assert_executor_bindings_match_tool_registry(executors: &[Box<dyn SkillExecutor>]) {
+fn executor_for_binding(
+    binding: KernelExecutorBinding,
+    config: KernelExecutorConfig,
+    secret_provider: Arc<dyn SecretProvider>,
+) -> Box<dyn KernelToolExecutor> {
+    match binding {
+        KernelExecutorBinding::FsRead => Box::new(FsReadExecutor),
+        KernelExecutorBinding::FsList => Box::new(FsListExecutor),
+        KernelExecutorBinding::FsGlob => Box::new(FsGlobExecutor),
+        KernelExecutorBinding::FsDiff => Box::new(FsDiffExecutor),
+        KernelExecutorBinding::FsCreate => Box::new(FsCreateExecutor),
+        KernelExecutorBinding::FsWrite => Box::new(FsWriteExecutor),
+        KernelExecutorBinding::FsEdit => Box::new(FsEditExecutor),
+        KernelExecutorBinding::FsRename => Box::new(FsRenameExecutor),
+        KernelExecutorBinding::FsDelete => Box::new(FsDeleteExecutor),
+        KernelExecutorBinding::FsEnsureDirectory => Box::new(FsEnsureDirectoryExecutor),
+        KernelExecutorBinding::CodeGrep => Box::new(CodeGrepExecutor),
+        KernelExecutorBinding::DocumentRead => Box::new(DocumentReadExecutor),
+        KernelExecutorBinding::GitStatus => Box::new(GitStatusExecutor),
+        KernelExecutorBinding::GitDiff => Box::new(GitDiffExecutor),
+        KernelExecutorBinding::GitStage => Box::new(GitStageExecutor),
+        KernelExecutorBinding::GitUnstage => Box::new(GitUnstageExecutor),
+        KernelExecutorBinding::GitCommit => Box::new(GitCommitExecutor),
+        KernelExecutorBinding::WebSearch => Box::new(WebSearchExecutor {
+            config,
+            secret_provider,
+        }),
+        KernelExecutorBinding::WebFetch => Box::new(WebFetchExecutor),
+    }
+}
+
+fn assert_executor_bindings_match_tool_registry(
+    registry: &KernelToolRegistry,
+    executors: &[(&'static str, Box<dyn KernelToolExecutor>)],
+) {
     let binding_ids = executors
         .iter()
-        .map(|executor| executor.descriptor().id)
+        .map(|(tool_id, _)| *tool_id)
         .collect::<Vec<_>>();
-    for template in KernelToolRegistry::default().templates() {
+    for template in registry.contracts() {
         let binding_count = binding_ids
             .iter()
-            .filter(|tool_id| tool_id.as_str() == template.tool_id)
+            .filter(|tool_id| **tool_id == template.tool_id)
             .count();
         let expected = usize::from(
             template.execution.execution_mode
@@ -110,7 +200,7 @@ fn assert_executor_bindings_match_tool_registry(executors: &[Box<dyn SkillExecut
     }
     for tool_id in binding_ids {
         assert!(
-            KernelToolRegistry::default().get(&tool_id).is_some(),
+            registry.get(tool_id).is_some(),
             "runtime executor {tool_id} has no canonical ToolRegistration"
         );
     }
@@ -121,7 +211,7 @@ mod document;
 mod filesystem;
 mod git;
 mod search;
-mod web;
+pub(crate) mod web;
 
 use document::*;
 use filesystem::*;
@@ -130,19 +220,10 @@ pub(crate) use search::{grep_workspace_with_options, CodeGrepOptions};
 use search::{skip_directory, CodeGrepExecutor, FsGlobExecutor};
 use web::*;
 
-fn descriptor(id: &str) -> SkillDescriptor {
-    let template = KernelToolRegistry::default()
-        .template(id)
-        .unwrap_or_else(|| panic!("builtin executor {id} is missing KernelToolTemplate"));
-    skill_descriptor_from_template(template)
-}
-
-fn ok(invocation_id: String, output: Value) -> SkillResult {
-    SkillResult {
+fn ok(invocation_id: String, output: Value) -> KernelToolExecutionResult {
+    KernelToolExecutionResult {
         invocation_id,
-        ok: true,
         output,
-        error: None,
     }
 }
 
@@ -439,7 +520,7 @@ impl Drop for TemporaryPathGuard {
     }
 }
 
-fn workspace_root(context: &SkillExecutionContext) -> KernelResult<PathBuf> {
+fn workspace_root(context: &KernelToolExecutionContext) -> KernelResult<PathBuf> {
     context
         .workspace_root
         .as_ref()
@@ -656,7 +737,7 @@ fn list_nodes(
             "id": relative,
             "name": entry.file_name().to_string_lossy(),
             "path": relative,
-            "kind": kind,
+            "type": kind,
             "sizeBytes": metadata.len()
         });
         if metadata.is_file() {

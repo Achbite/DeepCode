@@ -15,21 +15,18 @@ impl DeepCodeKernelRuntime {
         &self,
         record: &RuntimeRunRecord,
     ) -> KernelStateContract {
-        let tool_catalog_snapshot = kernel_tool_catalog_snapshot();
+        let tool_catalog_snapshot = kernel_tool_catalog_snapshot_ref();
         let capability_projection = tool_catalog_snapshot
             .tools
             .iter()
             .map(|tool| tool.tool_id.to_string())
             .collect();
         KernelStateContract {
+            kernel_abi_version: KERNEL_ABI_VERSION.to_string(),
             run_id: RunId(record.run_id.clone()),
             state_id: record.lifecycle_state.as_str().to_string(),
             state_kind: "driverRequest".to_string(),
-            allowed_inputs: vec![
-                "proposalSubmit".to_string(),
-                "userDecisionSubmit".to_string(),
-                "resourceResolve".to_string(),
-            ],
+            allowed_inputs: vec!["proposalSubmit".to_string(), "resourceResolve".to_string()],
             allowed_proposals: vec![
                 "answer".to_string(),
                 "resourceRequest".to_string(),
@@ -42,9 +39,7 @@ impl DeepCodeKernelRuntime {
             capability_projection,
             tool_catalog_ref: Some(TOOL_CATALOG_VERSION.to_string()),
             tool_catalog_hash: Some(tool_catalog_snapshot.catalog_hash.clone()),
-            tool_catalog_snapshot: Some(
-                serde_json::to_value(&tool_catalog_snapshot).unwrap_or(Value::Null),
-            ),
+            tool_catalog_snapshot: Some(tool_catalog_snapshot),
             draft_admission_policy: DraftAdmissionPolicy {
                 max_total_utf8_bytes: ARTIFACT_DRAFT_MAX_TOTAL_UTF8_BYTES,
             },

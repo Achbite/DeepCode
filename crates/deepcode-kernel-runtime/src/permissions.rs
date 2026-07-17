@@ -14,7 +14,8 @@ impl DeepCodeKernelRuntime {
         let pending = self
             .state
             .pending_tools
-            .remove(&permission_id)
+            .get(&permission_id)
+            .cloned()
             .ok_or_else(|| {
                 KernelError::PendingPermissionUnavailable(format!(
                     "permission {permission_id} has no live pending tool arguments; the request may have expired or the Kernel process may have restarted"
@@ -23,58 +24,38 @@ impl DeepCodeKernelRuntime {
         let session_id = pending.session_id.clone();
         let run_id = pending.run_id.clone();
         self.record_by_run(&run_id)?;
-        let resolved_sequence = self.ledger.next_sequence(&run_id)?;
-        let resolved_event = KernelEvent::PermissionResolved {
-            run_id: Some(RunId(run_id.clone())),
-            session_id: Some(SessionId(session_id.clone())),
+        let group_items = pending
+            .group_items
+            .iter()
+            .map(|item| deepcode_kernel_abi::PermissionWorkUnitContextItem {
+                action_id: item.action_id.clone(),
+                plan_id: item.plan_id.clone(),
+                work_unit_id: item.work_unit_id.clone(),
+                tool_id: item.tool_name.clone(),
+                operation_kind: item.operation_kind,
+                read_set: item.read_set.clone(),
+                write_set: item.write_set.clone(),
+            })
+            .collect::<Vec<_>>();
+        let work_unit_context = deepcode_kernel_abi::PermissionWorkUnitContext {
+            action_id: pending.action_id.clone(),
+            plan_id: pending.plan_id.clone(),
+            permission_bundle_id: pending.permission_bundle_id.clone(),
+            contract_id: pending.contract_id.clone(),
+            affected_operation_ids: pending.affected_operation_ids.clone(),
+            work_unit_ids: pending.work_unit_ids.clone(),
+            group_items,
+            operation_kind: pending.operation_kind,
+            read_set: pending.read_set.clone(),
+            write_set: pending.write_set.clone(),
+        };
+        let resolution_fact = deepcode_kernel_abi::PermissionResolutionFact {
             permission_id: permission_id.clone(),
             decision: decision.clone(),
             reason: None,
-            sequence: Some(resolved_sequence),
+            work_unit_context,
         };
-
-        let group_item_context = pending
-            .group_items
-            .iter()
-            .map(|item| {
-                serde_json::json!({
-                    "actionId": item.action_id.as_deref(),
-                    "planId": item.plan_id.as_deref(),
-                    "workUnitId": item.work_unit_id.as_deref(),
-                    "toolName": &item.tool_name,
-                    "operationKind": item.operation_kind.as_deref(),
-                    "readSet": &item.read_set,
-                    "writeSet": &item.write_set
-                })
-            })
-            .collect::<Vec<_>>();
-        let work_unit_context = serde_json::json!({
-            "actionId": pending.action_id.as_deref(),
-            "planId": pending.plan_id.as_deref(),
-            "permissionBundleId": pending.permission_bundle_id.as_deref(),
-            "contractId": pending.contract_id.as_deref(),
-            "affectedOperationIds": &pending.affected_operation_ids,
-            "workUnitIds": &pending.work_unit_ids,
-            "groupItemCount": pending.group_items.len(),
-            "groupItems": group_item_context,
-            "operationKind": pending.operation_kind.as_deref(),
-            "readSet": &pending.read_set,
-            "writeSet": &pending.write_set
-        });
-        self.append_ledger(
-            &run_id,
-            &session_id,
-            "permission.resolved",
-            resolved_sequence,
-            serde_json::json!({
-                "summary": "Permission resolved by Kernel command.",
-                "permissionId": &permission_id,
-                "decision": &decision,
-                "workUnitContext": work_unit_context
-            }),
-        )?;
-
-        if decision == deepcode_kernel_abi::PermissionDecisionKind::Accept {
+        let grants = if decision == deepcode_kernel_abi::PermissionDecisionKind::Accept {
             let mut targets = pending
                 .group_items
                 .iter()
@@ -97,8 +78,8 @@ impl DeepCodeKernelRuntime {
                 .contract_id
                 .clone()
                 .unwrap_or_else(|| format!("runtime-permission-{permission_id}"));
-            let capability = capability_for_tool(&pending.tool_name)?.to_string();
-            let grants = targets
+            let capability = self.capability_for_tool(&pending.tool_name)?.to_string();
+            targets
                 .into_iter()
                 .enumerate()
                 .map(|(index, resource_path)| TemporaryGrantEnvelope {
@@ -106,14 +87,54 @@ impl DeepCodeKernelRuntime {
                     contract_id: contract_id.clone(),
                     operation_ids: operation_ids.clone(),
                     capability: capability.clone(),
-                    resource_kind: "runtimePermission".to_string(),
+                    resource_kind: deepcode_kernel_abi::PermissionResourceKind::RuntimePermission,
                     resource_path,
                     expires_after_sequence: None,
                     reason: Some("Kernel runtime permission accepted by user".to_string()),
                 })
-                .collect::<Vec<_>>();
-            self.register_temporary_grants(&run_id, &session_id, grants)?;
-        }
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+
+        let resolved_sequence = if grants.is_empty() {
+            let sequence = self.ledger.next_sequence(&run_id)?;
+            self.append_ledger(
+                &run_id,
+                &session_id,
+                "permission.resolved",
+                sequence,
+                serde_json::to_value(&resolution_fact).map_err(|error| {
+                    KernelError::InvalidCommand(format!(
+                        "encode permission resolution fact: {error}"
+                    ))
+                })?,
+            )?;
+            sequence
+        } else {
+            self.record_permission_resolution_with_grants(
+                &run_id,
+                &session_id,
+                &grants,
+                &resolution_fact,
+            )?
+        };
+        self.state
+            .pending_tools
+            .remove(&permission_id)
+            .ok_or_else(|| {
+                KernelError::PendingPermissionUnavailable(format!(
+                    "permission {permission_id} was consumed while its resolution was being recorded"
+                ))
+            })?;
+        let resolved_event = KernelEvent::PermissionResolved {
+            run_id: Some(RunId(run_id.clone())),
+            session_id: Some(SessionId(session_id.clone())),
+            permission_id: permission_id.clone(),
+            decision: decision.clone(),
+            reason: None,
+            sequence: Some(resolved_sequence),
+        };
 
         let mut events = vec![resolved_event];
         if decision == deepcode_kernel_abi::PermissionDecisionKind::Accept {
@@ -159,9 +180,10 @@ impl DeepCodeKernelRuntime {
                             .as_ref()
                             .map(|value| RequestId(value.clone()))
                             .unwrap_or_else(|| request_id.clone());
-                        if KernelToolRegistry::default()
+                        if self
+                            .tool_registry
                             .get(&item.tool_name)
-                            .map(|descriptor| descriptor.execution_mode)
+                            .map(KernelToolRegistration::execution_mode)
                             == Some(OperationExecutionMode::Blocked)
                         {
                             events.push(self.work_unit_blocked_event(
@@ -178,18 +200,19 @@ impl DeepCodeKernelRuntime {
                             &session_id,
                             item.tool_call_id.clone(),
                             item.tool_name.clone(),
+                            item.operation_kind,
                             item.arguments.clone(),
                         )?;
-                        let tool_ok =
-                            matches!(&tool_event, KernelEvent::ToolCompleted { ok: true, .. });
+                        let tool_ok = matches!(
+                            &tool_event,
+                            KernelEvent::ToolCompleted { fact, .. } if fact.ok
+                        );
                         let tool_error = match &tool_event {
-                            KernelEvent::ToolCompleted {
-                                error: Some(error), ..
-                            } => Some(error.clone()),
+                            KernelEvent::ToolCompleted { fact, .. } => fact.error.clone(),
                             _ => None,
                         };
                         let tool_output = match &tool_event {
-                            KernelEvent::ToolCompleted { output, .. } => output.clone(),
+                            KernelEvent::ToolCompleted { fact, .. } => fact.output.clone(),
                             _ => None,
                         };
                         events.push(tool_event);
@@ -240,6 +263,7 @@ impl DeepCodeKernelRuntime {
                 &session_id,
                 permission_id,
                 pending.tool_name,
+                pending.operation_kind,
                 pending.arguments,
             )?;
             events.push(completed);
@@ -263,14 +287,21 @@ impl DeepCodeKernelRuntime {
         tool_name: &str,
         arguments: &Value,
     ) -> KernelResult<PermissionAction> {
+        let operation_kind = self
+            .tool_registry
+            .get(tool_name)
+            .map(KernelToolRegistration::operation_kind)
+            .ok_or_else(|| {
+                KernelError::InvalidCommand(format!("unknown Kernel tool {tool_name}"))
+            })?;
         let base =
-            web_permission_mode_for_tool_args(&self.tool_runtime_config, tool_name, arguments)
+            web_permission_mode_for_tool_args(&self.tool_runtime_config, operation_kind, arguments)
                 .map(|mode| match mode {
                     ToolPermissionMode::Allow => PermissionAction::Allow,
                     ToolPermissionMode::Ask => PermissionAction::Ask,
                     ToolPermissionMode::Deny => PermissionAction::Deny,
                 })
-                .unwrap_or_else(|| permission_action_for_kernel_tool(tool_name));
+                .unwrap_or_else(|| self.permission_action_for_kernel_tool(tool_name));
         if base != PermissionAction::Ask {
             return Ok(base);
         }
@@ -294,7 +325,11 @@ impl DeepCodeKernelRuntime {
         arguments: &Value,
     ) -> KernelResult<bool> {
         let grants = self.active_temporary_grants(run_id);
-        let capability = capability_for_tool(tool_name)?;
+        let registration = self.tool_registry.get(tool_name).ok_or_else(|| {
+            KernelError::InvalidCommand(format!("unregistered Kernel tool: {tool_name}"))
+        })?;
+        let capability = registration.capability();
+        let operation_kind = registration.operation_kind();
         let next_sequence = self.ledger.next_sequence(run_id).unwrap_or(u64::MAX);
         Ok(grants.iter().any(|grant| {
             if grant.capability != capability {
@@ -307,27 +342,11 @@ impl DeepCodeKernelRuntime {
             {
                 return false;
             }
-            if matches!(
-                grant.resource_kind.as_str(),
-                "workspaceModule" | "workspaceDependency"
-            ) {
-                if !matches!(capability, "fs.write" | "fs.edit") {
-                    return false;
-                }
-                return grant
-                    .resource_path
-                    .as_deref()
-                    .map(|path| {
-                        self.grant_scope_contains_argument(run_id, tool_name, arguments, path)
-                            .unwrap_or(false)
-                    })
-                    .unwrap_or(false);
-            }
             grant
                 .resource_path
                 .as_deref()
                 .map(|path| {
-                    argument_resource_matches(tool_name, arguments, path)
+                    argument_resource_matches(operation_kind, arguments, path)
                         || self
                             .grant_scope_contains_argument(run_id, tool_name, arguments, path)
                             .unwrap_or(false)
@@ -343,9 +362,22 @@ impl DeepCodeKernelRuntime {
         arguments: &Value,
         grant_path: &str,
     ) -> KernelResult<bool> {
+        let operation_kind = self
+            .tool_registry
+            .get(tool_name)
+            .map(KernelToolRegistration::operation_kind)
+            .ok_or_else(|| {
+                KernelError::InvalidCommand(format!("unregistered Kernel tool: {tool_name}"))
+            })?;
         if !matches!(
-            tool_name,
-            "fs.write" | "fs.edit" | "fs.delete" | "fs.read" | "fs.list" | "code.grep" | "fs.diff"
+            operation_kind,
+            ToolOperationKind::FsWrite
+                | ToolOperationKind::FsEdit
+                | ToolOperationKind::FsDelete
+                | ToolOperationKind::FsRead
+                | ToolOperationKind::FsList
+                | ToolOperationKind::CodeGrep
+                | ToolOperationKind::FsDiff
         ) {
             return Ok(false);
         }
@@ -427,6 +459,7 @@ impl DeepCodeKernelRuntime {
 }
 
 pub(crate) fn permission_envelope_from_pending(
+    runtime: &DeepCodeKernelRuntime,
     permission_id: &str,
     pending: &PendingKernelTool,
 ) -> KernelResult<deepcode_kernel_abi::PermissionRequestEnvelope> {
@@ -437,6 +470,7 @@ pub(crate) fn permission_envelope_from_pending(
         .collect::<Vec<_>>();
     Ok(deepcode_kernel_abi::PermissionRequestEnvelope {
         id: permission_id.to_string(),
+        request_kind: deepcode_kernel_abi::PermissionRequestKind::RuntimePermission,
         permission_bundle_id: pending.permission_bundle_id.clone(),
         contract_id: pending.contract_id.clone(),
         affected_operation_ids: pending.affected_operation_ids.clone(),
@@ -450,10 +484,10 @@ pub(crate) fn permission_envelope_from_pending(
             pending.work_unit_ids.clone()
         },
         tool_id: Some(pending.tool_name.clone()),
-        capability: capability_for_tool(&pending.tool_name)?.to_string(),
-        risk_level: risk_for_tool(&pending.tool_name)?.to_string(),
+        capability: runtime.capability_for_tool(&pending.tool_name)?.to_string(),
+        risk_level: runtime.risk_for_tool(&pending.tool_name)?,
         summary: format!("Allow {} to access workspace resources?", pending.tool_name),
-        args_preview: redact_tool_arguments(&pending.tool_name, &pending.arguments),
+        args_preview: redact_tool_arguments(pending.operation_kind, &pending.arguments),
     })
 }
 
@@ -472,13 +506,17 @@ fn pending_group_items(
         work_unit_id: pending.work_unit_id.clone(),
         action_id: pending.action_id.clone(),
         plan_id: pending.plan_id.clone(),
-        operation_kind: pending.operation_kind.clone(),
+        operation_kind: pending.operation_kind,
         read_set: pending.read_set.clone(),
         write_set: pending.write_set.clone(),
     }]
 }
 
-fn argument_resource_matches(tool_name: &str, arguments: &Value, path: &str) -> bool {
+fn argument_resource_matches(
+    operation_kind: ToolOperationKind,
+    arguments: &Value,
+    path: &str,
+) -> bool {
     if let Some(expected) = path.strip_prefix("network:") {
         return arguments
             .get("url")
@@ -488,7 +526,15 @@ fn argument_resource_matches(tool_name: &str, arguments: &Value, path: &str) -> 
     }
     if let Some(expected) = path.strip_prefix("git:") {
         if matches!(expected, "workspace" | "index") {
-            return tool_name.starts_with("git.");
+            return matches!(
+                operation_kind,
+                ToolOperationKind::GitStatus
+                    | ToolOperationKind::GitDiff
+                    | ToolOperationKind::GitStage
+                    | ToolOperationKind::GitUnstage
+                    | ToolOperationKind::GitCommit
+                    | ToolOperationKind::GitPush
+            );
         }
         return arguments
             .get("paths")
@@ -506,7 +552,10 @@ fn argument_resource_matches(tool_name: &str, arguments: &Value, path: &str) -> 
     if direct {
         return true;
     }
-    if matches!(tool_name, "git.stage" | "git.unstage") {
+    if matches!(
+        operation_kind,
+        ToolOperationKind::GitStage | ToolOperationKind::GitUnstage
+    ) {
         return arguments
             .get("paths")
             .and_then(Value::as_array)
@@ -516,12 +565,20 @@ fn argument_resource_matches(tool_name: &str, arguments: &Value, path: &str) -> 
     false
 }
 
-fn unscoped_grant_allows_arguments(resource_kind: &str, arguments: &Value) -> bool {
+fn unscoped_grant_allows_arguments(
+    resource_kind: &deepcode_kernel_abi::PermissionResourceKind,
+    arguments: &Value,
+) -> bool {
     match resource_kind {
-        "workspace" | "workspaceFile" => !argument_uses_external_absolute_file(arguments),
-        "workspaceModule" | "workspaceDependency" | "workspaceDirectory" => false,
-        "externalFile" | "externalDirectory" => false,
-        _ => true,
+        deepcode_kernel_abi::PermissionResourceKind::WorkspacePath => {
+            !argument_uses_external_absolute_file(arguments)
+        }
+        deepcode_kernel_abi::PermissionResourceKind::GitWorkspace
+        | deepcode_kernel_abi::PermissionResourceKind::Process
+        | deepcode_kernel_abi::PermissionResourceKind::NetworkTarget
+        | deepcode_kernel_abi::PermissionResourceKind::BrowserState
+        | deepcode_kernel_abi::PermissionResourceKind::ProviderProfile
+        | deepcode_kernel_abi::PermissionResourceKind::RuntimePermission => true,
     }
 }
 

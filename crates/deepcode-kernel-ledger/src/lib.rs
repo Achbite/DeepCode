@@ -1,4 +1,9 @@
 use deepcode_kernel_abi::{KernelError, KernelResult};
+pub use deepcode_kernel_abi::{
+    KernelResource, KernelResourceCleanupPolicy, KernelResourceIdentity, KernelResourceKind,
+    KernelResourceMetadata, KernelResourceOwner, KernelResourceOwnerKind,
+    KernelResourceReleaseResult, KernelResourceScope, KernelResourceState,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -25,6 +30,7 @@ pub struct LedgerEvent {
 
 pub trait EventLedger: Send + Sync {
     fn append(&self, event: LedgerEvent) -> KernelResult<()>;
+    fn append_batch(&self, events: Vec<LedgerEvent>) -> KernelResult<()>;
     fn list_all(&self) -> KernelResult<Vec<LedgerEvent>>;
     fn list_by_run(&self, run_id: &str) -> KernelResult<Vec<LedgerEvent>>;
     fn list_by_session(&self, session_id: &str) -> KernelResult<Vec<LedgerEvent>>;
@@ -62,6 +68,11 @@ impl InMemoryEventLedger {
 impl EventLedger for InMemoryEventLedger {
     fn append(&self, event: LedgerEvent) -> KernelResult<()> {
         self.events.lock().expect("ledger lock").push(event);
+        Ok(())
+    }
+
+    fn append_batch(&self, events: Vec<LedgerEvent>) -> KernelResult<()> {
+        self.events.lock().expect("ledger lock").extend(events);
         Ok(())
     }
 
@@ -143,6 +154,32 @@ impl EventLedger for NdjsonEventLedger {
             .map_err(|error| KernelError::Other(format!("encode ledger event failed: {error}")))?;
         writeln!(file, "{encoded}")
             .map_err(|error| KernelError::Other(format!("write ledger event failed: {error}")))
+    }
+
+    fn append_batch(&self, events: Vec<LedgerEvent>) -> KernelResult<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
+                KernelError::Other(format!("create ledger directory failed: {error}"))
+            })?;
+        }
+        let mut encoded = Vec::new();
+        for event in events {
+            serde_json::to_writer(&mut encoded, &event).map_err(|error| {
+                KernelError::Other(format!("encode ledger event failed: {error}"))
+            })?;
+            encoded.push(b'\n');
+        }
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .map_err(|error| KernelError::Other(format!("open ledger append failed: {error}")))?;
+        file.write_all(&encoded).map_err(|error| {
+            KernelError::Other(format!("write ledger event batch failed: {error}"))
+        })
     }
 
     fn list_all(&self) -> KernelResult<Vec<LedgerEvent>> {
@@ -234,188 +271,6 @@ pub struct ValidationResult {
     pub evidence_refs: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum KernelResourceKind {
-    PermissionGrant,
-    WorkspaceReadLease,
-    ExternalResourceLease,
-    TerminalSession,
-    TempArtifact,
-    Artifact,
-    RedirectOutput,
-    CacheFile,
-    ProcessHandle,
-    GitHandle,
-    BrowserHandle,
-    NetworkHandle,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum KernelResourceOwnerKind {
-    UserSession,
-    AgentRun,
-    KernelInternal,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct KernelResourceOwner {
-    pub kind: KernelResourceOwnerKind,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub run_id: Option<String>,
-}
-
-impl KernelResourceOwner {
-    pub fn user_session(session_id: impl Into<String>) -> Self {
-        Self {
-            kind: KernelResourceOwnerKind::UserSession,
-            session_id: Some(session_id.into()),
-            run_id: None,
-        }
-    }
-
-    pub fn agent_run(session_id: Option<impl Into<String>>, run_id: impl Into<String>) -> Self {
-        Self {
-            kind: KernelResourceOwnerKind::AgentRun,
-            session_id: session_id.map(Into::into),
-            run_id: Some(run_id.into()),
-        }
-    }
-
-    pub fn kernel_internal(run_id: Option<impl Into<String>>) -> Self {
-        Self {
-            kind: KernelResourceOwnerKind::KernelInternal,
-            session_id: None,
-            run_id: run_id.map(Into::into),
-        }
-    }
-
-    fn matches(&self, other: &Self) -> bool {
-        self.kind == other.kind
-            && optional_match(self.session_id.as_deref(), other.session_id.as_deref())
-            && optional_match(self.run_id.as_deref(), other.run_id.as_deref())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum KernelResourceScope {
-    Run,
-    Session,
-    Persistent,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum KernelResourceState {
-    Active,
-    Released,
-    Orphaned,
-    Denied,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum KernelResourceCleanupPolicy {
-    OnBatchReviewReady,
-    OnRunEnd,
-    OnSessionEnd,
-    OnRuntimeDrop,
-    Manual,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct KernelResource {
-    pub resource_id: String,
-    pub logical_key: String,
-    pub idempotency_key: String,
-    pub kind: KernelResourceKind,
-    pub owner: KernelResourceOwner,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub run_id: Option<String>,
-    pub scope: KernelResourceScope,
-    pub state: KernelResourceState,
-    pub cleanup_policy: KernelResourceCleanupPolicy,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub created_at: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub released_at: Option<String>,
-    #[serde(default)]
-    pub metadata: Value,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct KernelResourceIdentity {
-    pub resource_id: String,
-    pub logical_key: String,
-    pub idempotency_key: String,
-}
-
-impl KernelResourceIdentity {
-    pub fn new(
-        resource_id: impl Into<String>,
-        logical_key: impl Into<String>,
-        idempotency_key: impl Into<String>,
-    ) -> Self {
-        Self {
-            resource_id: resource_id.into(),
-            logical_key: logical_key.into(),
-            idempotency_key: idempotency_key.into(),
-        }
-    }
-}
-
-impl KernelResource {
-    pub fn active(
-        identity: KernelResourceIdentity,
-        kind: KernelResourceKind,
-        owner: KernelResourceOwner,
-        scope: KernelResourceScope,
-        cleanup_policy: KernelResourceCleanupPolicy,
-        metadata: Value,
-    ) -> Self {
-        let session_id = owner.session_id.clone();
-        let run_id = owner.run_id.clone();
-        Self {
-            resource_id: identity.resource_id,
-            logical_key: identity.logical_key,
-            idempotency_key: identity.idempotency_key,
-            kind,
-            owner,
-            session_id,
-            run_id,
-            scope,
-            state: KernelResourceState::Active,
-            cleanup_policy,
-            created_at: None,
-            released_at: None,
-            metadata,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct KernelResourceReleaseResult {
-    pub resource_id: String,
-    pub released: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
-fn optional_match(actual: Option<&str>, expected: Option<&str>) -> bool {
-    expected
-        .map(|expected| Some(expected) == actual)
-        .unwrap_or(true)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -442,6 +297,50 @@ mod tests {
         std::env::temp_dir().join(format!("deepcode-{label}-{nonce}"))
     }
 
+    fn temp_artifact_metadata(path: &str) -> KernelResourceMetadata {
+        KernelResourceMetadata::TempArtifact {
+            path: path.to_string(),
+            absolute_path: None,
+            source_tool: "test.tool".to_string(),
+            tool_call_id: format!("call-{path}"),
+        }
+    }
+
+    fn terminal_metadata(terminal_id: &str) -> KernelResourceMetadata {
+        KernelResourceMetadata::TerminalSession {
+            terminal_id: terminal_id.to_string(),
+            cwd: ".".to_string(),
+            shell_kind: "test".to_string(),
+        }
+    }
+
+    fn external_metadata(path: &str) -> KernelResourceMetadata {
+        KernelResourceMetadata::ExternalResourceLease {
+            lease: deepcode_kernel_abi::ExternalResourceLease {
+                resource_id: format!("external-{path}"),
+                root_id: format!("root-{path}"),
+                canonical_path: path.to_string(),
+                target_kind: deepcode_kernel_abi::ExternalResourceKind::File,
+            },
+        }
+    }
+
+    fn permission_metadata(target: &str) -> KernelResourceMetadata {
+        KernelResourceMetadata::TemporaryPermissionGrant {
+            grant_kind: deepcode_kernel_abi::TemporaryPermissionGrantKind::PlanExecution,
+            grant: deepcode_kernel_abi::TemporaryGrantEnvelope {
+                id: format!("grant-{target}"),
+                contract_id: "contract-test".to_string(),
+                operation_ids: Vec::new(),
+                capability: "workspace.write".to_string(),
+                resource_kind: deepcode_kernel_abi::PermissionResourceKind::WorkspacePath,
+                resource_path: Some(target.to_string()),
+                expires_after_sequence: None,
+                reason: None,
+            },
+        }
+    }
+
     #[test]
     fn kernel_resource_registry_releases_only_matching_run_owner() {
         let registry = KernelResourceManager::new();
@@ -458,7 +357,7 @@ mod tests {
                     run_owner.clone(),
                     KernelResourceScope::Run,
                     KernelResourceCleanupPolicy::OnRunEnd,
-                    serde_json::json!({ "path": "tmp.txt" }),
+                    temp_artifact_metadata("tmp.txt"),
                 )],
                 |_| Ok(()),
             )
@@ -475,7 +374,7 @@ mod tests {
                     KernelResourceOwner::user_session("session-1"),
                     KernelResourceScope::Session,
                     KernelResourceCleanupPolicy::OnSessionEnd,
-                    serde_json::json!({ "terminalId": "term-1" }),
+                    terminal_metadata("term-1"),
                 )],
                 |_| Ok(()),
             )
@@ -511,7 +410,7 @@ mod tests {
             KernelResourceOwner::agent_run(Some("session-1"), "run-1"),
             KernelResourceScope::Run,
             KernelResourceCleanupPolicy::OnRunEnd,
-            serde_json::json!({ "path": "input.txt" }),
+            external_metadata("input.txt"),
         );
         registry
             .acquire_batch(vec![resource.clone()], |_| Ok(()))
@@ -533,7 +432,7 @@ mod tests {
             KernelResourceOwner::agent_run(Some("session-1"), "run-1"),
             KernelResourceScope::Run,
             KernelResourceCleanupPolicy::OnRunEnd,
-            serde_json::json!({ "path": "input.txt" }),
+            external_metadata("input.txt"),
         );
         registry
             .acquire_batch(vec![resource.clone()], |_| Ok(()))
@@ -566,7 +465,7 @@ mod tests {
             KernelResourceOwner::agent_run(Some("session-1"), "run-1"),
             KernelResourceScope::Run,
             KernelResourceCleanupPolicy::OnBatchReviewReady,
-            serde_json::json!({ "target": "first" }),
+            permission_metadata("first"),
         );
         registry.acquire_batch(vec![original], |_| Ok(())).unwrap();
         let conflicting = KernelResource::active(
@@ -579,7 +478,7 @@ mod tests {
             KernelResourceOwner::agent_run(Some("session-1"), "run-1"),
             KernelResourceScope::Run,
             KernelResourceCleanupPolicy::OnBatchReviewReady,
-            serde_json::json!({ "target": "second" }),
+            permission_metadata("second"),
         );
 
         let error = registry
@@ -606,7 +505,7 @@ mod tests {
             KernelResourceOwner::agent_run(Some("session-1"), "run-1"),
             KernelResourceScope::Run,
             KernelResourceCleanupPolicy::OnBatchReviewReady,
-            serde_json::json!({ "target": "first" }),
+            permission_metadata("first"),
         );
         let second = KernelResource::active(
             KernelResourceIdentity::new(
@@ -618,7 +517,7 @@ mod tests {
             KernelResourceOwner::agent_run(Some("session-1"), "run-1"),
             KernelResourceScope::Run,
             KernelResourceCleanupPolicy::OnBatchReviewReady,
-            serde_json::json!({ "target": "second" }),
+            permission_metadata("second"),
         );
         let error = registry
             .acquire_batch(vec![first, second], |_| {
@@ -642,7 +541,7 @@ mod tests {
             KernelResourceOwner::agent_run(Some("session-1"), "run-1"),
             KernelResourceScope::Run,
             KernelResourceCleanupPolicy::OnBatchReviewReady,
-            serde_json::json!({ "target": "existing.txt" }),
+            permission_metadata("existing.txt"),
         );
         registry.acquire_batch(vec![existing], |_| Ok(())).unwrap();
         let new_resource = KernelResource::active(
@@ -651,7 +550,7 @@ mod tests {
             KernelResourceOwner::agent_run(Some("session-1"), "run-1"),
             KernelResourceScope::Run,
             KernelResourceCleanupPolicy::OnBatchReviewReady,
-            serde_json::json!({ "target": "new.txt" }),
+            permission_metadata("new.txt"),
         );
         let conflicting = KernelResource::active(
             KernelResourceIdentity::new(
@@ -663,7 +562,7 @@ mod tests {
             KernelResourceOwner::agent_run(Some("session-1"), "run-1"),
             KernelResourceScope::Run,
             KernelResourceCleanupPolicy::OnBatchReviewReady,
-            serde_json::json!({ "target": "different.txt" }),
+            permission_metadata("different.txt"),
         );
         let persisted = std::cell::Cell::new(false);
 
@@ -696,7 +595,7 @@ mod tests {
             KernelResourceOwner::agent_run(Some("session-1"), "run-1"),
             KernelResourceScope::Run,
             KernelResourceCleanupPolicy::OnBatchReviewReady,
-            serde_json::json!({ "target": "relative.txt" }),
+            permission_metadata("relative.txt"),
         );
         registry.acquire_batch(vec![resource], |_| Ok(())).unwrap();
 
@@ -726,7 +625,7 @@ mod tests {
             KernelResourceOwner::agent_run(Some("session-1"), "run-1"),
             KernelResourceScope::Run,
             KernelResourceCleanupPolicy::OnRunEnd,
-            serde_json::json!({ "path": "input.txt" }),
+            external_metadata("input.txt"),
         );
         resource.created_at = Some("100".to_string());
         registry

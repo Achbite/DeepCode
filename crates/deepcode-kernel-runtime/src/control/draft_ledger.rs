@@ -1,52 +1,58 @@
 use super::*;
+use deepcode_kernel_abi::{
+    ArtifactDraftLedgerFrame, ArtifactDraftPartKind, ArtifactEditMatch,
+    ARTIFACT_DRAFT_SCHEMA_VERSION,
+};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub(super) struct ArtifactDraftAdmission {
     pub(super) draft_id: String,
-    pub(super) part_kind: String,
+    pub(super) draft_key: String,
+    pub(super) part_kind: ArtifactDraftPartKind,
     pub(super) opened: bool,
     pub(super) terminal: bool,
+    pub(super) record: ArtifactDraftRuntimeRecord,
 }
 
 pub(super) fn admit_artifact_draft_frame(
-    state: &mut RuntimeState,
+    state: &RuntimeState,
     command_run_id: &str,
     command_session_id: &str,
-    frame: &Value,
+    frame: &ArtifactDraftLedgerFrame,
 ) -> KernelResult<ArtifactDraftAdmission> {
-    if require_string(frame, "schemaVersion")? != "deepcode.agent.artifact-draft.v1" {
+    let base = frame.base();
+    if base.schema_version != ARTIFACT_DRAFT_SCHEMA_VERSION {
         return Err(invalid(
             "artifact draft frame has an unsupported schemaVersion",
         ));
     }
-    let frame_run_id = require_string(frame, "runId")?;
-    if frame_run_id != command_run_id {
+    require_text(&base.run_id, "runId")?;
+    require_text(&base.session_id, "sessionId")?;
+    require_text(&base.draft_id, "draftId")?;
+    require_text(&base.frame_id, "frameId")?;
+    require_text(&base.task_id, "taskId")?;
+    require_text(&base.content_hash, "contentHash")?;
+    if base.run_id != command_run_id {
         return Err(invalid(
             "artifact draft frame runId does not match the command run",
         ));
     }
-    let frame_session_id = require_string(frame, "sessionId")?;
-    if frame_session_id != command_session_id {
+    if base.session_id != command_session_id {
         return Err(invalid(
             "artifact draft frame sessionId does not match the command session",
         ));
     }
-    let draft_id = require_string(frame, "draftId")?.to_string();
-    let frame_id = require_string(frame, "frameId")?.to_string();
-    let task_id = require_string(frame, "taskId")?.to_string();
-    let part_kind = require_string(frame, "partKind")?.to_string();
-    let sequence = frame
-        .get("sequence")
-        .and_then(Value::as_u64)
-        .filter(|value| *value > 0)
-        .ok_or_else(|| invalid("artifact draft frame requires a positive sequence"))?;
-    let expected_slot_ids = string_set(frame, "expectedSlotIds")?;
+    if base.sequence == 0 {
+        return Err(invalid("artifact draft frame requires a positive sequence"));
+    }
+    let expected_slot_ids = string_set(&base.expected_slot_ids, "expectedSlotIds")?;
     if expected_slot_ids.is_empty() {
         return Err(invalid(
             "artifact draft frame expectedSlotIds must not be empty",
         ));
     }
-    let draft_key = format!("{command_run_id}:{draft_id}");
+
+    let draft_key = format!("{command_run_id}:{}", base.draft_id);
     if state.terminal_artifact_draft_keys.contains(&draft_key) {
         return Err(invalid("artifact draft is already terminal"));
     }
@@ -58,8 +64,8 @@ pub(super) fn admit_artifact_draft_frame(
         .unwrap_or_else(|| ArtifactDraftRuntimeRecord {
             run_id: command_run_id.to_string(),
             session_id: command_session_id.to_string(),
-            task_id: task_id.clone(),
-            draft_id: draft_id.clone(),
+            task_id: base.task_id.clone(),
+            draft_id: base.draft_id.clone(),
             next_sequence: 1,
             expected_slot_ids: expected_slot_ids.clone(),
             completed_slot_ids: BTreeSet::new(),
@@ -72,8 +78,8 @@ pub(super) fn admit_artifact_draft_frame(
         });
     if record.run_id != command_run_id
         || record.session_id != command_session_id
-        || record.task_id != task_id
-        || record.draft_id != draft_id
+        || record.task_id != base.task_id
+        || record.draft_id != base.draft_id
     {
         return Err(invalid(
             "artifact draft binding changed after draft creation",
@@ -87,66 +93,80 @@ pub(super) fn admit_artifact_draft_frame(
             "artifact draft expectedSlotIds changed after draft creation",
         ));
     }
-    if sequence != record.next_sequence {
+    if base.sequence != record.next_sequence {
         return Err(invalid(format!(
-            "artifact draft sequence must be {}; received {sequence}",
-            record.next_sequence
+            "artifact draft sequence must be {}; received {}",
+            record.next_sequence, base.sequence
         )));
     }
-    if !record.frame_ids.insert(frame_id) {
+    if !record.frame_ids.insert(base.frame_id.clone()) {
         return Err(invalid("artifact draft frameId was already recorded"));
     }
 
-    match part_kind.as_str() {
-        "artifactChunk" => admit_chunk(&mut record, frame)?,
-        "batchDone" => admit_batch_done(&mut record, frame)?,
-        "diagnostic" => admit_diagnostic(&mut record, frame)?,
-        other => {
-            return Err(invalid(format!(
-                "unsupported artifact draft part kind: {other}"
-            )))
+    match frame {
+        ArtifactDraftLedgerFrame::ArtifactChunk {
+            slot_id,
+            content_lines,
+            final_chunk,
+            edit_match,
+            ..
+        } => admit_chunk(
+            &mut record,
+            base,
+            slot_id,
+            content_lines,
+            *final_chunk,
+            edit_match.as_ref(),
+        )?,
+        ArtifactDraftLedgerFrame::BatchDone { metadata, .. } => {
+            admit_batch_done(&mut record, base, &metadata.summary)?
+        }
+        ArtifactDraftLedgerFrame::Diagnostic { metadata, .. } => {
+            admit_diagnostic(&mut record, base, &metadata.reason)?
         }
     }
     record.next_sequence += 1;
     let terminal = record.terminal;
-    state.artifact_drafts.insert(draft_key, record);
     Ok(ArtifactDraftAdmission {
-        draft_id,
-        part_kind,
+        draft_id: base.draft_id.clone(),
+        draft_key,
+        part_kind: frame.part_kind(),
         opened,
         terminal,
+        record,
     })
 }
 
-fn admit_chunk(record: &mut ArtifactDraftRuntimeRecord, frame: &Value) -> KernelResult<()> {
-    let slot_id = require_string(frame, "slotId")?;
+fn admit_chunk(
+    record: &mut ArtifactDraftRuntimeRecord,
+    base: &deepcode_kernel_abi::ArtifactDraftFrameBase,
+    slot_id: &str,
+    content_lines: &[String],
+    final_chunk: bool,
+    edit_match: Option<&ArtifactEditMatch>,
+) -> KernelResult<()> {
+    require_text(slot_id, "slotId")?;
     if !record.expected_slot_ids.contains(slot_id) {
         return Err(invalid("artifact chunk references an unknown slotId"));
     }
     if record.completed_slot_ids.contains(slot_id) {
         return Err(invalid("artifact chunk targets an already completed slot"));
     }
-    let lines = frame
-        .get("contentLines")
-        .and_then(Value::as_array)
-        .ok_or_else(|| invalid("artifact chunk contentLines must be an array"))?;
-    if lines.is_empty() || lines.iter().any(|line| !line.is_string()) {
+    if content_lines.is_empty() {
         return Err(invalid(
             "artifact chunk contentLines must contain at least one string",
         ));
     }
-    let serialized = serde_json::to_string(lines)
+    let serialized = serde_json::to_string(content_lines)
         .map_err(|error| invalid(format!("artifact chunk serialization failed: {error}")))?;
-    let edit_match = frame.get("editMatch");
     let hash_payload = artifact_chunk_hash_payload(&serialized, edit_match)?;
-    require_hash(frame, fnv1a64_hex(&hash_payload))?;
+    require_hash(base, fnv1a64_hex(&hash_payload))?;
     if let Some(edit_match) = edit_match {
         if record.edit_match_hashes_by_slot.contains_key(slot_id) {
             return Err(invalid(
                 "artifact editMatch is only allowed on the first chunk for a slot",
             ));
         }
-        validate_edit_match(edit_match)?;
         record.edit_match_hashes_by_slot.insert(
             slot_id.to_string(),
             fnv1a64_hex(&canonical_edit_match(edit_match)?),
@@ -162,7 +182,8 @@ fn admit_chunk(record: &mut ArtifactDraftRuntimeRecord, frame: &Value) -> Kernel
         .get(slot_id)
         .copied()
         .unwrap_or(0);
-    let added_bytes = content_lines_utf8_bytes(lines)? + if previous_chunks > 0 { 1 } else { 0 };
+    let added_bytes =
+        content_lines_utf8_bytes(content_lines) + if previous_chunks > 0 { 1 } else { 0 };
     let next_total = record.total_content_bytes.saturating_add(added_bytes);
     if next_total > ARTIFACT_DRAFT_MAX_TOTAL_UTF8_BYTES {
         return Err(KernelError::InvalidCommand(format!(
@@ -177,25 +198,22 @@ fn admit_chunk(record: &mut ArtifactDraftRuntimeRecord, frame: &Value) -> Kernel
         .chunk_counts_by_slot
         .insert(slot_id.to_string(), previous_chunks.saturating_add(1));
     record.total_content_bytes = next_total;
-    if frame.get("finalChunk").and_then(Value::as_bool) == Some(true) {
+    if final_chunk {
         record.completed_slot_ids.insert(slot_id.to_string());
     }
     Ok(())
 }
 
-fn content_lines_utf8_bytes(lines: &[Value]) -> KernelResult<u64> {
-    let text_bytes = lines.iter().try_fold(0u64, |total, line| {
-        let value = line
-            .as_str()
-            .ok_or_else(|| invalid("artifact chunk contentLines contains a non-string value"))?;
-        Ok::<u64, KernelError>(total.saturating_add(value.len() as u64))
-    })?;
-    Ok(text_bytes.saturating_add(lines.len().saturating_sub(1) as u64))
+fn content_lines_utf8_bytes(lines: &[String]) -> u64 {
+    let text_bytes = lines
+        .iter()
+        .fold(0u64, |total, line| total.saturating_add(line.len() as u64));
+    text_bytes.saturating_add(lines.len().saturating_sub(1) as u64)
 }
 
 fn artifact_chunk_hash_payload(
     serialized_lines: &str,
-    edit_match: Option<&Value>,
+    edit_match: Option<&ArtifactEditMatch>,
 ) -> KernelResult<String> {
     let Some(edit_match) = edit_match else {
         return Ok(serialized_lines.to_string());
@@ -206,47 +224,47 @@ fn artifact_chunk_hash_payload(
     ))
 }
 
-fn canonical_edit_match(edit_match: &Value) -> KernelResult<String> {
-    let kind = require_string(edit_match, "kind")?;
-    match kind {
-        "exactBlock" => Ok(format!(
+fn canonical_edit_match(edit_match: &ArtifactEditMatch) -> KernelResult<String> {
+    match edit_match {
+        ArtifactEditMatch::ExactBlock { target_lines } => Ok(format!(
             "exactBlock\0{}",
-            serialized_string_array(edit_match, "targetLines", false)?
+            serialized_lines(target_lines, "targetLines", false)?
         )),
-        "contextBlock" => Ok(format!(
+        ArtifactEditMatch::ContextBlock {
+            before_lines,
+            target_lines,
+            after_lines,
+        } => Ok(format!(
             "contextBlock\0{}\0{}\0{}",
-            serialized_string_array(edit_match, "beforeLines", true)?,
-            serialized_string_array(edit_match, "targetLines", false)?,
-            serialized_string_array(edit_match, "afterLines", true)?
+            serialized_lines(before_lines, "beforeLines", true)?,
+            serialized_lines(target_lines, "targetLines", false)?,
+            serialized_lines(after_lines, "afterLines", true)?
         )),
-        "lineRange" => {
-            let start_line = positive_u64(edit_match, "startLine")?;
-            let end_line = positive_u64(edit_match, "endLine")?;
-            if end_line < start_line {
+        ArtifactEditMatch::LineRange {
+            start_line,
+            end_line,
+            expected_file_hash,
+            expected_before_lines,
+            expected_before_text,
+        } => {
+            if *start_line == 0 || end_line < start_line {
                 return Err(invalid(
-                    "artifact lineRange endLine must be greater than or equal to startLine",
+                    "artifact lineRange requires a positive startLine <= endLine",
                 ));
             }
-            let expected_hash = edit_match
-                .get("expectedFileHash")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let expected_lines = edit_match
-                .get("expectedBeforeLines")
-                .map(|_| serialized_string_array(edit_match, "expectedBeforeLines", false))
+            let expected_hash = expected_file_hash.as_deref().unwrap_or_default();
+            let expected_lines = expected_before_lines
+                .as_ref()
+                .map(|lines| serialized_lines(lines, "expectedBeforeLines", false))
                 .transpose()?
                 .unwrap_or_else(|| "[]".to_string());
-            let expected_text = serde_json::to_string(
-                edit_match
-                    .get("expectedBeforeText")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default(),
-            )
-            .map_err(|error| {
-                invalid(format!(
-                    "artifact editMatch expectedBeforeText serialization failed: {error}"
-                ))
-            })?;
+            let expected_text =
+                serde_json::to_string(expected_before_text.as_deref().unwrap_or_default())
+                    .map_err(|error| {
+                        invalid(format!(
+                            "artifact editMatch expectedBeforeText serialization failed: {error}"
+                        ))
+                    })?;
             if expected_hash.is_empty() && expected_lines == "[]" {
                 return Err(invalid(
                     "artifact lineRange requires expectedFileHash or expectedBeforeLines",
@@ -256,47 +274,27 @@ fn canonical_edit_match(edit_match: &Value) -> KernelResult<String> {
                 "lineRange\0{start_line}\0{end_line}\0{expected_hash}\0{expected_lines}\0{expected_text}"
             ))
         }
-        other => Err(invalid(format!(
-            "unsupported artifact editMatch kind: {other}"
-        ))),
     }
 }
 
-fn validate_edit_match(edit_match: &Value) -> KernelResult<()> {
-    canonical_edit_match(edit_match).map(|_| ())
-}
-
-fn serialized_string_array(value: &Value, field: &str, allow_empty: bool) -> KernelResult<String> {
-    let items = value
-        .get(field)
-        .and_then(Value::as_array)
-        .ok_or_else(|| invalid(format!("artifact editMatch missing {field}")))?;
-    if (!allow_empty && items.is_empty()) || items.iter().any(|item| !item.is_string()) {
+fn serialized_lines(lines: &[String], field: &str, allow_empty: bool) -> KernelResult<String> {
+    if !allow_empty && lines.is_empty() {
         return Err(invalid(format!(
-            "artifact editMatch {field} must be {}string array",
-            if allow_empty { "a " } else { "a non-empty " }
+            "artifact editMatch {field} must be a non-empty string array"
         )));
     }
-    serde_json::to_string(items).map_err(|error| {
+    serde_json::to_string(lines).map_err(|error| {
         invalid(format!(
             "artifact editMatch {field} serialization failed: {error}"
         ))
     })
 }
 
-fn positive_u64(value: &Value, field: &str) -> KernelResult<u64> {
-    value
-        .get(field)
-        .and_then(Value::as_u64)
-        .filter(|value| *value > 0)
-        .ok_or_else(|| {
-            invalid(format!(
-                "artifact editMatch {field} must be a positive integer"
-            ))
-        })
-}
-
-fn admit_batch_done(record: &mut ArtifactDraftRuntimeRecord, frame: &Value) -> KernelResult<()> {
+fn admit_batch_done(
+    record: &mut ArtifactDraftRuntimeRecord,
+    base: &deepcode_kernel_abi::ArtifactDraftFrameBase,
+    summary: &str,
+) -> KernelResult<()> {
     if record.completed_slot_ids != record.expected_slot_ids {
         let incomplete = record
             .expected_slot_ids
@@ -308,30 +306,28 @@ fn admit_batch_done(record: &mut ArtifactDraftRuntimeRecord, frame: &Value) -> K
             incomplete.join(", ")
         )));
     }
-    let summary = frame
-        .get("metadata")
-        .and_then(|value| value.get("summary"))
-        .and_then(Value::as_str)
-        .ok_or_else(|| invalid("artifact batchDone requires metadata.summary"))?;
-    require_hash(frame, fnv1a64_hex(summary))?;
+    require_text(summary, "metadata.summary")?;
+    require_hash(base, fnv1a64_hex(summary))?;
     record.terminal = true;
     Ok(())
 }
 
-fn admit_diagnostic(record: &mut ArtifactDraftRuntimeRecord, frame: &Value) -> KernelResult<()> {
-    let reason = frame
-        .get("metadata")
-        .and_then(|value| value.get("reason"))
-        .and_then(Value::as_str)
-        .ok_or_else(|| invalid("artifact diagnostic requires metadata.reason"))?;
-    require_hash(frame, fnv1a64_hex(reason))?;
+fn admit_diagnostic(
+    record: &mut ArtifactDraftRuntimeRecord,
+    base: &deepcode_kernel_abi::ArtifactDraftFrameBase,
+    reason: &str,
+) -> KernelResult<()> {
+    require_text(reason, "metadata.reason")?;
+    require_hash(base, fnv1a64_hex(reason))?;
     record.terminal = true;
     Ok(())
 }
 
-fn require_hash(frame: &Value, expected: String) -> KernelResult<()> {
-    let actual = require_string(frame, "contentHash")?;
-    if actual != expected {
+fn require_hash(
+    base: &deepcode_kernel_abi::ArtifactDraftFrameBase,
+    expected: String,
+) -> KernelResult<()> {
+    if base.content_hash != expected {
         return Err(invalid(
             "artifact draft contentHash does not match frame content",
         ));
@@ -339,26 +335,23 @@ fn require_hash(frame: &Value, expected: String) -> KernelResult<()> {
     Ok(())
 }
 
-fn require_string<'a>(value: &'a Value, field: &str) -> KernelResult<&'a str> {
-    value
-        .get(field)
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| invalid(format!("artifact draft frame missing {field}")))
+fn require_text<'a>(value: &'a str, field: &str) -> KernelResult<&'a str> {
+    if value.trim().is_empty() {
+        return Err(invalid(format!("artifact draft frame missing {field}")));
+    }
+    Ok(value)
 }
 
-fn string_set(value: &Value, field: &str) -> KernelResult<BTreeSet<String>> {
-    let values = value
-        .get(field)
-        .and_then(Value::as_array)
-        .ok_or_else(|| invalid(format!("artifact draft frame missing {field}")))?;
+fn string_set(values: &[String], field: &str) -> KernelResult<BTreeSet<String>> {
     values
         .iter()
-        .map(|item| {
-            item.as_str()
-                .filter(|item| !item.trim().is_empty())
-                .map(ToOwned::to_owned)
-                .ok_or_else(|| invalid(format!("artifact draft {field} contains an invalid value")))
+        .map(|value| {
+            if value.trim().is_empty() {
+                return Err(invalid(format!(
+                    "artifact draft {field} contains an invalid value"
+                )));
+            }
+            Ok(value.clone())
         })
         .collect()
 }

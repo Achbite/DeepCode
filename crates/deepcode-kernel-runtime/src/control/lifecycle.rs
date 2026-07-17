@@ -89,26 +89,7 @@ impl DeepCodeKernelRuntime {
             snapshot_id: config_snapshot.snapshot_id.clone(),
             hash: config_snapshot.hash.clone(),
         };
-        let mut sequence = 0_u64;
-
-        sequence += 1;
-        self.append_ledger(
-            &run_id,
-            &session_id,
-            "run.started",
-            sequence,
-            serde_json::json!({
-                "summary": "Kernel driver run created.",
-                "inputText": &input.text,
-                "attachmentCount": attachments.len(),
-                "workspaceBinding": &workspace_binding,
-                "configRef": &config_ref,
-                "profileRef": &profile_ref,
-                "policyProfile": &self.policy_profile.id,
-                "driverLoop": "session"
-            }),
-        )?;
-
+        let mut run_resources = Vec::new();
         if let Some(open_path) = workspace_binding.open_path.as_deref() {
             let resource_id =
                 resource_instance_id("workspace-read-lease", &[run_id.as_str(), open_path]);
@@ -122,29 +103,13 @@ impl DeepCodeKernelRuntime {
                 KernelResourceOwner::agent_run(Some(session_id.clone()), run_id.clone()),
                 KernelResourceScope::Run,
                 KernelResourceCleanupPolicy::OnRunEnd,
-                serde_json::json!({
-                    "workspaceId": workspace_binding.workspace_id,
-                    "workspaceHash": workspace_binding.workspace_hash,
-                    "openPath": open_path,
-                    "access": "read",
-                    "managedBy": "kernel.resourceManager"
-                }),
+                KernelResourceMetadata::WorkspaceReadLease {
+                    workspace_id: workspace_binding.workspace_id.clone(),
+                    workspace_hash: workspace_binding.workspace_hash.clone(),
+                    open_path: open_path.to_string(),
+                },
             );
-            sequence += 1;
-            self.state
-                .resource_manager
-                .acquire_batch(vec![resource], |acquired| {
-                    self.append_ledger(
-                        &run_id,
-                        &session_id,
-                        "resource.acquired_batch",
-                        sequence,
-                        serde_json::json!({
-                            "summary": "Kernel registered the run-bound workspace read lease.",
-                            "resources": acquired,
-                        }),
-                    )
-                })?;
+            run_resources.push(resource);
         }
 
         for attachment in &attachments {
@@ -180,67 +145,131 @@ impl DeepCodeKernelRuntime {
                 KernelResourceOwner::agent_run(Some(session_id.clone()), run_id.clone()),
                 KernelResourceScope::Run,
                 KernelResourceCleanupPolicy::OnRunEnd,
-                serde_json::to_value(&lease).map_err(|error| {
-                    KernelError::Other(format!("serialize external resource lease: {error}"))
-                })?,
+                KernelResourceMetadata::ExternalResourceLease {
+                    lease: lease.clone(),
+                },
             );
-            sequence += 1;
-            self.state
-                .resource_manager
-                .acquire_batch(vec![resource], |acquired| {
-                    self.append_ledger(
-                        &run_id,
-                        &session_id,
-                        "resource.acquired_batch",
-                        sequence,
-                        serde_json::json!({
-                            "summary": "Kernel registered an external resource read lease.",
-                            "resources": acquired,
-                            "externalResourceId": resource_id,
-                            "targetKind": lease.target_kind
-                        }),
-                    )
-                })?;
+            run_resources.push(resource);
         }
-
-        sequence += 1;
-        self.append_ledger(
-            &run_id,
-            &session_id,
-            "config.snapshot.attached",
-            sequence,
-            serde_json::json!({
-                "summary": "Config snapshot attached.",
-                "snapshotRef": &config_ref,
-                "sources": &config_snapshot.source_refs
-            }),
-        )?;
-
-        sequence += 1;
-        self.state.records_by_session.insert(
-            session_id.clone(),
-            RuntimeRunRecord {
-                session_id: session_id.clone(),
-                run_id: run_id.clone(),
-                attachments,
-                workspace_binding,
-                config_ref,
-                lifecycle_state: RuntimeLifecycleState::Ready,
-            },
+        let record = RuntimeRunRecord {
+            session_id: session_id.clone(),
+            run_id: run_id.clone(),
+            attachments: attachments.clone(),
+            workspace_binding: workspace_binding.clone(),
+            config_ref: config_ref.clone(),
+            lifecycle_state: RuntimeLifecycleState::Ready,
+        };
+        let contract = self.state_contract_for_record(&record);
+        let driver_request = self.driver_request_for_contract(
+            &contract,
+            Some(SessionId(session_id.clone())),
+            DriverRequestKind::NeedProposal,
+            "Session should assemble context and submit a Protocol v4 proposal.",
         );
+        let run_started_sequence = self.ledger.next_sequence(&run_id)?;
+        let resource_sequence = (!run_resources.is_empty()).then_some(run_started_sequence + 1);
+        let config_sequence = resource_sequence
+            .map(|sequence| sequence + 1)
+            .unwrap_or(run_started_sequence + 1);
+        let lifecycle_sequence = config_sequence + 1;
+        let state_sequence = lifecycle_sequence + 1;
+        let driver_sequence = state_sequence + 1;
+        self.state
+            .resource_manager
+            .acquire_batch(run_resources, |acquired| {
+                let mut events = Vec::with_capacity(6);
+                events.push(LedgerEvent {
+                    id: format!("evt-{run_id}-{run_started_sequence}"),
+                    run_id: Some(run_id.clone()),
+                    session_id: Some(session_id.clone()),
+                    kind: "run.started".to_string(),
+                    sequence: Some(run_started_sequence),
+                    payload: serde_json::json!({
+                        "summary": "Kernel driver run created.",
+                        "inputText": &input.text,
+                        "attachmentCount": attachments.len(),
+                        "attachments": &attachments,
+                        "workspaceBinding": &workspace_binding,
+                        "configRef": &config_ref,
+                        "profileRef": &profile_ref,
+                        "policyProfile": &self.policy_profile.id,
+                        "driverLoop": "session"
+                    }),
+                    created_at: None,
+                });
+                if let Some(sequence) = resource_sequence {
+                    events.push(LedgerEvent {
+                        id: format!("evt-{run_id}-{sequence}"),
+                        run_id: Some(run_id.clone()),
+                        session_id: Some(session_id.clone()),
+                        kind: "resource.acquired_batch".to_string(),
+                        sequence: Some(sequence),
+                        payload: serde_json::json!({
+                            "summary": "Kernel registered run-bound workspace and external resource leases.",
+                            "resources": acquired,
+                        }),
+                        created_at: None,
+                    });
+                }
+                events.extend([
+                    LedgerEvent {
+                        id: format!("evt-{run_id}-{config_sequence}"),
+                        run_id: Some(run_id.clone()),
+                        session_id: Some(session_id.clone()),
+                        kind: "config.snapshot.attached".to_string(),
+                        sequence: Some(config_sequence),
+                        payload: serde_json::json!({
+                            "summary": "Config snapshot attached.",
+                            "snapshotRef": &config_ref,
+                            "sources": &config_snapshot.source_refs
+                        }),
+                        created_at: None,
+                    },
+                    LedgerEvent {
+                        id: format!("evt-{run_id}-{lifecycle_sequence}"),
+                        run_id: Some(run_id.clone()),
+                        session_id: Some(session_id.clone()),
+                        kind: "runtime.lifecycle_changed".to_string(),
+                        sequence: Some(lifecycle_sequence),
+                        payload: serde_json::json!({
+                            "summary": "Kernel runtime initialized and is ready for Session input.",
+                            "previousState": RuntimeLifecycleState::Created,
+                            "currentState": RuntimeLifecycleState::Ready,
+                            "reason": "runInitialized"
+                        }),
+                        created_at: None,
+                    },
+                    LedgerEvent {
+                        id: format!("evt-{run_id}-{state_sequence}"),
+                        run_id: Some(run_id.clone()),
+                        session_id: Some(session_id.clone()),
+                        kind: "state.entered".to_string(),
+                        sequence: Some(state_sequence),
+                        payload: serde_json::json!({
+                            "summary": "Kernel state contract produced.",
+                            "stateContract": &contract
+                        }),
+                        created_at: None,
+                    },
+                    LedgerEvent {
+                        id: format!("evt-{run_id}-{driver_sequence}"),
+                        run_id: Some(run_id.clone()),
+                        session_id: Some(session_id.clone()),
+                        kind: "driver.request_produced".to_string(),
+                        sequence: Some(driver_sequence),
+                        payload: serde_json::json!({
+                            "summary": "DriverRequest produced for Session DriverLoop.",
+                            "driverRequest": &driver_request
+                        }),
+                        created_at: None,
+                    },
+                ]);
+                self.append_ledger_batch(events)
+            })?;
+        self.state
+            .records_by_session
+            .insert(session_id.clone(), record);
 
-        self.append_ledger(
-            &run_id,
-            &session_id,
-            "runtime.lifecycle_changed",
-            sequence,
-            serde_json::json!({
-                "summary": "Kernel runtime initialized and is ready for Session input.",
-                "previousState": RuntimeLifecycleState::Created,
-                "currentState": RuntimeLifecycleState::Ready,
-                "reason": "runInitialized"
-            }),
-        )?;
         let lifecycle_event = KernelEvent::RuntimeLifecycleChanged {
             request_id: Some(request_id.clone()),
             run_id: RunId(run_id.clone()),
@@ -248,53 +277,21 @@ impl DeepCodeKernelRuntime {
             previous_state: Some(RuntimeLifecycleState::Created),
             current_state: RuntimeLifecycleState::Ready,
             reason: Some("runInitialized".to_string()),
-            sequence: Some(sequence),
+            sequence: Some(lifecycle_sequence),
         };
-
-        let record = self.record_by_run(&run_id)?;
-        let contract = self.state_contract_for_record(&record);
-        sequence += 1;
-        self.append_ledger(
-            &run_id,
-            &session_id,
-            "state.entered",
-            sequence,
-            serde_json::json!({
-                "summary": "Kernel state contract produced.",
-                "stateContract": &contract
-            }),
-        )?;
         let state_event = KernelEvent::StateEntered {
             request_id: Some(request_id.clone()),
             run_id: RunId(run_id.clone()),
             session_id: Some(SessionId(session_id.clone())),
             state_contract: contract.clone(),
-            sequence: Some(sequence),
+            sequence: Some(state_sequence),
         };
-
-        let driver_request = self.driver_request_for_contract(
-            &contract,
-            Some(SessionId(session_id.clone())),
-            DriverRequestKind::NeedProposal,
-            "Session should assemble context and submit a Protocol v4 proposal.",
-        );
-        sequence += 1;
-        self.append_ledger(
-            &run_id,
-            &session_id,
-            "driver.request_produced",
-            sequence,
-            serde_json::json!({
-                "summary": "DriverRequest produced for Session DriverLoop.",
-                "driverRequest": &driver_request
-            }),
-        )?;
         let driver_event = KernelEvent::DriverRequestProduced {
             request_id: Some(request_id),
             run_id: RunId(run_id),
             session_id: Some(SessionId(session_id)),
             driver_request,
-            sequence: Some(sequence),
+            sequence: Some(driver_sequence),
         };
 
         Ok(vec![lifecycle_event, state_event, driver_event])

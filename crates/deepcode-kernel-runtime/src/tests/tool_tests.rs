@@ -1,4 +1,5 @@
 use super::*;
+use deepcode_kernel_abi::{ResourcePacketContentKind, ResourcePacketResolvedKind};
 
 #[test]
 fn edit_rename_and_delete_use_distinct_canonical_tools() {
@@ -179,8 +180,10 @@ fn blocked_tools_never_produce_success_facts() {
             }]),
             serde_json::json!([]),
         );
-        assert!(OperationCompiler::default()
-            .compile_batch(&payload)
+        let proposal = serde_json::from_value::<KernelActionProposal>(payload)
+            .expect("blocked tool proposal uses canonical action fields");
+        assert!(OperationCompiler::new(&registry)
+            .compile_proposal(&proposal)
             .is_err());
     }
 }
@@ -195,7 +198,7 @@ fn web_permission_policy_distinguishes_public_and_private_targets() {
     assert_eq!(
         web_permission_mode_for_tool_args(
             &config,
-            "web.fetch",
+            ToolOperationKind::WebFetch,
             &serde_json::json!({ "url": "http://93.184.216.34/evidence" }),
         ),
         Some(ToolPermissionMode::Allow)
@@ -203,7 +206,7 @@ fn web_permission_policy_distinguishes_public_and_private_targets() {
     assert_eq!(
         web_permission_mode_for_tool_args(
             &config,
-            "web.fetch",
+            ToolOperationKind::WebFetch,
             &serde_json::json!({ "url": "http://127.0.0.1/evidence" }),
         ),
         Some(ToolPermissionMode::Ask)
@@ -271,7 +274,7 @@ fn resource_resolve_skips_binary_content() {
     let events = runtime
         .dispatch(KernelCommand::ResourceResolve {
             request_id: RequestId("resource-resolve".to_string()),
-            run_id: Some(RunId("run-1".to_string())),
+            run_id: RunId("run-1".to_string()),
             session_id: Some(SessionId("session-1".to_string())),
             request: ResourceResolveRequest {
                 manifest: serde_json::json!({
@@ -291,8 +294,11 @@ fn resource_resolve_skips_binary_content() {
             _ => None,
         })
         .expect("resource packet");
-    assert_eq!(packet["items"][0]["contentKind"], "fileSkipped");
-    assert!(packet["items"][0].get("content").is_none());
+    assert_eq!(
+        packet.items[0].content_kind,
+        Some(ResourcePacketContentKind::FileSkipped)
+    );
+    assert!(packet.items[0].content.is_none());
 }
 
 #[test]
@@ -316,7 +322,7 @@ fn resource_resolve_supports_bounded_inventory_and_metadata_only_reads() {
     let events = runtime
         .dispatch(KernelCommand::ResourceResolve {
             request_id: RequestId(format!("resource-options-{token}")),
-            run_id: Some(RunId("run-1".to_string())),
+            run_id: RunId("run-1".to_string()),
             session_id: Some(SessionId("session-1".to_string())),
             request: ResourceResolveRequest {
                 manifest: serde_json::json!({
@@ -361,27 +367,36 @@ fn resource_resolve_supports_bounded_inventory_and_metadata_only_reads() {
         })
         .expect("resource packet");
 
-    assert_eq!(packet["workspaceScopeKey"], format!("scope-{token}"));
-    let inventory = &packet["items"][0];
-    assert_eq!(inventory["contentKind"], "directoryTree");
-    assert_eq!(inventory["returnedCount"], 20);
-    assert_eq!(inventory["truncated"], true);
-    assert_eq!(inventory["directoryDepth"], 1);
-    assert!(inventory["nodes"]
-        .as_array()
-        .expect("inventory nodes")
+    assert_eq!(packet.workspace_scope_key, format!("scope-{token}"));
+    let inventory = &packet.items[0];
+    assert_eq!(
+        inventory.content_kind,
+        Some(ResourcePacketContentKind::DirectoryTree)
+    );
+    assert_eq!(inventory.returned_count, Some(20));
+    assert_eq!(inventory.truncated, Some(true));
+    assert_eq!(inventory.directory_depth, Some(1));
+    assert!(inventory
+        .nodes
         .iter()
-        .all(|node| node.get("content").is_none()));
+        .all(|node| node.name.is_some() && node.path.is_some()));
 
-    let metadata = &packet["items"][1];
-    assert_eq!(metadata["contentKind"], "metadata");
-    assert_eq!(metadata["resolvedKind"], "file");
-    assert!(metadata.get("content").is_none());
-    assert!(metadata["metadataHash"]
-        .as_str()
+    let metadata = &packet.items[1];
+    assert_eq!(
+        metadata.content_kind,
+        Some(ResourcePacketContentKind::Metadata)
+    );
+    assert_eq!(
+        metadata.resolved_kind,
+        Some(ResourcePacketResolvedKind::File)
+    );
+    assert!(metadata.content.is_none());
+    assert!(metadata
+        .metadata_hash
+        .as_deref()
         .is_some_and(|value| value.starts_with("sha256:")));
 
-    let missing = &packet["items"][2];
-    assert_eq!(missing["status"], "error");
-    assert_eq!(missing["reason"], "not_found");
+    let missing = &packet.items[2];
+    assert_eq!(missing.status, ResourcePacketStatus::NotFound);
+    assert_eq!(missing.reason.as_deref(), Some("not_found"));
 }

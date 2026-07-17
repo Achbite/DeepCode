@@ -1,135 +1,184 @@
 use super::*;
 
 impl DeepCodeKernelRuntime {
-    pub(crate) fn skill_discover(&self, request_id: RequestId) -> KernelResult<Vec<KernelEvent>> {
-        let descriptors = self.skills.list()?;
-        let effective_capabilities = self
-            .policy_profile
-            .grants
-            .values()
-            .filter(|grant| grant.decision != PolicyDecisionKind::Deny)
-            .map(|grant| grant.capability.clone())
-            .collect::<Vec<_>>();
-        let descriptors = model_visible_skill_descriptors(
-            &descriptors,
-            &self.state.skill_trust_records,
-            &effective_capabilities,
-        );
-        Ok(vec![KernelEvent::SkillResult {
+    pub(crate) fn host_skill_discover(
+        &self,
+        request_id: RequestId,
+    ) -> KernelResult<Vec<KernelEvent>> {
+        let skills = self
+            .user_skill_registry
+            .list()?
+            .into_iter()
+            .map(host_skill_descriptor)
+            .collect();
+        Ok(vec![KernelEvent::HostSkillsDiscovered {
             request_id,
-            skill_id: None,
-            ok: true,
-            output: Some(serde_json::json!({ "skills": descriptors })),
-            error: None,
-            sequence: None,
+            result: HostSkillCatalogResult {
+                source: HostResultSource::HostManagement,
+                skills,
+            },
         }])
     }
 
-    pub(crate) fn skill_trust_approve(
+    pub(crate) fn host_skill_trust_decision_submit(
         &mut self,
         request_id: RequestId,
         skill_id: String,
-        decision: Value,
+        decision: HostSkillTrustDecisionSubmit,
     ) -> KernelResult<Vec<KernelEvent>> {
-        let approval = SkillTrustApprovalDecision::from_value(decision)?;
-        if matches!(approval.decision.as_deref(), Some("reject" | "deny")) {
-            return Ok(vec![KernelEvent::SkillResult {
-                request_id,
-                skill_id: Some(skill_id),
-                ok: true,
-                output: Some(serde_json::json!({ "decision": "rejected" })),
-                error: None,
-                sequence: None,
-            }]);
-        }
-        if approval.trust_mode == SkillTrustMode::DirectHostScript {
-            return Err(KernelError::PermissionDenied(
-                "DirectHostScript is not enabled by the active Kernel skill runtime".to_string(),
-            ));
+        let trust_mode = match decision.trust_mode {
+            HostSkillTrustMode::Declarative => SkillTrustMode::Declarative,
+            HostSkillTrustMode::BrokeredScript => SkillTrustMode::BrokeredScript,
+        };
+        let approved_capabilities = decision
+            .approved_capabilities
+            .iter()
+            .map(deepcode_kernel_policy::Capability::new)
+            .collect::<Vec<_>>();
+
+        if decision.decision == HostSkillTrustDecisionKind::Accept {
+            let record = SkillTrustRecord {
+                skill_id: skill_id.clone(),
+                revision_hash: decision.revision_hash.clone(),
+                approved_capabilities: approved_capabilities.clone(),
+                approved_at: decision.approved_at.clone(),
+                approved_by: decision.approved_by.clone(),
+                trust_mode,
+                ledger_event_ref: None,
+                expires_at: decision.expires_at.clone(),
+            };
+            self.state
+                .skill_trust_records
+                .retain(|existing| existing.skill_id != skill_id);
+            self.state.skill_trust_records.push(record);
         }
 
-        let record = SkillTrustRecord {
+        let record = HostSkillTrustDecisionRecord {
             skill_id: skill_id.clone(),
-            revision_hash: approval.revision_hash,
-            approved_capabilities: approval.approved_capabilities,
-            approved_at: approval.approved_at,
-            approved_by: approval.approved_by,
-            trust_mode: approval.trust_mode,
-            ledger_event_ref: None,
-            expires_at: approval.expires_at,
+            decision: decision.decision,
+            trust_mode: decision.trust_mode,
+            revision_hash: decision.revision_hash,
+            approved_capabilities: decision.approved_capabilities,
+            approved_at: decision.approved_at,
+            approved_by: decision.approved_by,
+            expires_at: decision.expires_at,
         };
-        self.state
-            .skill_trust_records
-            .retain(|existing| existing.skill_id != skill_id);
-        self.state.skill_trust_records.push(record.clone());
         let sequence = self.ledger.list_all()?.len() as u64 + 1;
         self.ledger.append(LedgerEvent {
-            id: format!("evt-skill-trust-{sequence}"),
+            id: format!("evt-host-skill-trust-{sequence}"),
             run_id: None,
             session_id: None,
-            kind: "skill.trust_granted".to_string(),
+            kind: "host.skill_trust_decision_recorded".to_string(),
             sequence: Some(sequence),
             payload: serde_json::json!({
-                "summary": format!("Skill trust granted: {skill_id}"),
-                "skillId": skill_id,
-                "trustRecord": &record
+                "summary": format!("Host skill trust decision recorded: {skill_id}"),
+                "record": &record
             }),
             created_at: None,
         })?;
-        Ok(vec![KernelEvent::SkillTrustGranted {
-            request_id: Some(request_id),
-            skill_id: record.skill_id.clone(),
-            trust_record: serde_json::to_value(record).unwrap_or(Value::Null),
+        Ok(vec![KernelEvent::HostSkillTrustDecisionRecorded {
+            request_id,
+            record,
             sequence: Some(sequence),
         }])
     }
 }
-#[derive(Debug)]
-struct SkillTrustApprovalDecision {
-    decision: Option<String>,
-    trust_mode: SkillTrustMode,
-    revision_hash: Option<String>,
-    approved_capabilities: Vec<deepcode_kernel_policy::Capability>,
-    approved_at: Option<String>,
-    approved_by: Option<String>,
-    expires_at: Option<String>,
+
+fn host_skill_descriptor(descriptor: SkillDescriptor) -> HostSkillDescriptor {
+    HostSkillDescriptor {
+        id: descriptor.id,
+        version: descriptor.version,
+        title_key: descriptor.title_key,
+        description_key: descriptor.description_key,
+        input_schema: descriptor.input_schema,
+        output_schema: descriptor.output_schema,
+        required_capabilities: descriptor
+            .required_capabilities
+            .into_iter()
+            .map(|capability| capability.0)
+            .collect(),
+        allowed_phases: descriptor.allowed_phases,
+        risk_level: host_skill_risk_level(descriptor.risk_level),
+        effects: descriptor
+            .effects
+            .into_iter()
+            .map(host_skill_effect)
+            .collect(),
+        source: host_skill_source(descriptor.source),
+        adapter_kind: host_skill_adapter_kind(descriptor.adapter_kind),
+        activation_status: host_skill_activation_status(descriptor.activation_status),
+        requested_model_visible: descriptor.requested_model_visible,
+    }
 }
 
-impl SkillTrustApprovalDecision {
-    fn from_value(value: Value) -> KernelResult<Self> {
-        let decision = value
-            .get("decision")
-            .and_then(Value::as_str)
-            .map(|value| value.to_ascii_lowercase());
-        let trust_mode = value
-            .get("trustMode")
-            .cloned()
-            .map(serde_json::from_value)
-            .transpose()
-            .map_err(|error| {
-                KernelError::InvalidCommand(format!("invalid skill trust mode: {error}"))
-            })?
-            .unwrap_or(SkillTrustMode::BrokeredScript);
-        let approved_capabilities = value
-            .get("approvedCapabilities")
-            .and_then(Value::as_array)
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(deepcode_kernel_policy::Capability::new)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        Ok(Self {
-            decision,
-            trust_mode,
-            revision_hash: get_string(&value, "revisionHash")
-                .or_else(|| get_string(&value, "scriptHash")),
-            approved_capabilities,
-            approved_at: get_string(&value, "approvedAt"),
-            approved_by: get_string(&value, "approvedBy"),
-            expires_at: get_string(&value, "expiresAt"),
-        })
+fn host_skill_risk_level(level: deepcode_kernel_policy::RiskLevel) -> HostSkillRiskLevel {
+    match level {
+        deepcode_kernel_policy::RiskLevel::Low => HostSkillRiskLevel::Low,
+        deepcode_kernel_policy::RiskLevel::Medium => HostSkillRiskLevel::Medium,
+        deepcode_kernel_policy::RiskLevel::High => HostSkillRiskLevel::High,
+        deepcode_kernel_policy::RiskLevel::Critical => HostSkillRiskLevel::Critical,
+    }
+}
+
+fn host_skill_effect(effect: deepcode_kernel_policy::CapabilityEffect) -> HostSkillEffect {
+    match effect {
+        deepcode_kernel_policy::CapabilityEffect::ReadsWorkspace => HostSkillEffect::ReadsWorkspace,
+        deepcode_kernel_policy::CapabilityEffect::WritesWorkspace => {
+            HostSkillEffect::WritesWorkspace
+        }
+        deepcode_kernel_policy::CapabilityEffect::CreatesWorkspace => {
+            HostSkillEffect::CreatesWorkspace
+        }
+        deepcode_kernel_policy::CapabilityEffect::DeletesWorkspace => {
+            HostSkillEffect::DeletesWorkspace
+        }
+        deepcode_kernel_policy::CapabilityEffect::ReadsGit => HostSkillEffect::ReadsGit,
+        deepcode_kernel_policy::CapabilityEffect::RunsProcess => HostSkillEffect::RunsProcess,
+        deepcode_kernel_policy::CapabilityEffect::UsesNetwork => HostSkillEffect::UsesNetwork,
+        deepcode_kernel_policy::CapabilityEffect::ReadsSecret => HostSkillEffect::ReadsSecret,
+        deepcode_kernel_policy::CapabilityEffect::ModifiesGit => HostSkillEffect::ModifiesGit,
+        deepcode_kernel_policy::CapabilityEffect::PushesGit => HostSkillEffect::PushesGit,
+        deepcode_kernel_policy::CapabilityEffect::ControlsBrowser => {
+            HostSkillEffect::ControlsBrowser
+        }
+        deepcode_kernel_policy::CapabilityEffect::ModifiesKernel => HostSkillEffect::ModifiesKernel,
+        deepcode_kernel_policy::CapabilityEffect::ModifiesConfig => HostSkillEffect::ModifiesConfig,
+    }
+}
+
+fn host_skill_source(source: deepcode_kernel_skills::SkillSource) -> HostSkillSource {
+    match source {
+        deepcode_kernel_skills::SkillSource::LocalPack { pack_id } => {
+            HostSkillSource::LocalPack { pack_id }
+        }
+        deepcode_kernel_skills::SkillSource::ExternalProcess { program, argv } => {
+            HostSkillSource::ExternalProcess { program, argv }
+        }
+        deepcode_kernel_skills::SkillSource::ExternalConnector { connector_id } => {
+            HostSkillSource::ExternalConnector { connector_id }
+        }
+    }
+}
+
+fn host_skill_adapter_kind(kind: deepcode_kernel_skills::SkillAdapterKind) -> HostSkillAdapterKind {
+    match kind {
+        deepcode_kernel_skills::SkillAdapterKind::Declarative => HostSkillAdapterKind::Declarative,
+        deepcode_kernel_skills::SkillAdapterKind::ExternalProcess => {
+            HostSkillAdapterKind::ExternalProcess
+        }
+        deepcode_kernel_skills::SkillAdapterKind::Mcp => HostSkillAdapterKind::Mcp,
+    }
+}
+
+fn host_skill_activation_status(
+    status: deepcode_kernel_skills::SkillActivationStatus,
+) -> HostSkillActivationStatus {
+    match status {
+        deepcode_kernel_skills::SkillActivationStatus::Dormant => {
+            HostSkillActivationStatus::Dormant
+        }
+        deepcode_kernel_skills::SkillActivationStatus::Registered => {
+            HostSkillActivationStatus::Registered
+        }
     }
 }
