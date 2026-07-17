@@ -1,4 +1,4 @@
-import type { AgentEvent } from '@deepcode/protocol';
+import { decodeKernelEventV1, type AgentEvent } from '@deepcode/protocol';
 import type {
   MemoryCompressionMode,
   MemoryCandidateCreatedBy,
@@ -413,12 +413,12 @@ function compileWorkflowStageCandidates(
     });
   }
 
-  const kernelEvent = objectRecord(record.kernelEvent);
-  if (!kernelEvent) return;
-  const kind = stringValue(kernelEvent.kind);
-  if (kind === 'tool.completed') {
-    const ok = kernelEvent.ok === true;
-    const output = objectRecord(kernelEvent.output);
+  if (!objectRecord(record.kernelEvent)) return;
+  const kernelEvent = decodeKernelEventV1(event);
+  const kind = kernelEvent.kind;
+  if (kernelEvent.kind === 'tool.completed') {
+    const ok = kernelEvent.fact.ok;
+    const output = objectRecord(kernelEvent.fact.output);
     const path = stringValue(output?.path) ?? stringValue(output?.absolutePath);
     const actionId = stringValue(output?.actionId);
     candidates.push({
@@ -426,17 +426,17 @@ function compileWorkflowStageCandidates(
       scope: 'session',
       kind: 'fact',
       authority: 'kernelFact',
-      content: `Tool fact: ${stringValue(kernelEvent.toolName) ?? 'tool'} status=${ok ? 'ok' : 'error'}${path ? ` path=${clip(path, 220)}` : ''}${actionId ? ` action=${actionId}` : ''}`,
+      content: `Tool fact: ${kernelEvent.fact.toolId} status=${ok ? 'ok' : 'error'}${path ? ` path=${clip(path, 220)}` : ''}${actionId ? ` action=${actionId}` : ''}`,
       event,
       path,
-      ledgerRefs: [stringValue(kernelEvent.toolCallId) ?? event.id],
+      ledgerRefs: [kernelEvent.fact.toolCallId],
     });
     return;
   }
   if (kind === 'work_unit.completed' || kind === 'work_unit.failed' || kind === 'work_unit.blocked') {
-    const output = objectRecord(kernelEvent.output);
+    const output = 'output' in kernelEvent ? objectRecord(kernelEvent.output) : undefined;
     const path = stringValue(output?.path) ?? stringValue(output?.absolutePath);
-    const workUnitId = stringValue(kernelEvent.workUnitId);
+    const workUnitId = 'workUnitId' in kernelEvent ? kernelEvent.workUnitId : undefined;
     candidates.push({
       lane: 'evidence',
       scope: 'session',
@@ -565,7 +565,7 @@ function semanticKeyForCandidate(candidate: MemoryCandidate): string {
 
 function compactContinuation(record: Record<string, unknown>): string | null {
   const title = stringValue(record.title) ?? stringValue(record.description);
-  const operation = stringValue(record.operation) ?? stringValue(record.capability);
+  const operation = stringValue(record.operation);
   const path = stringValue(record.targetPath) ?? stringValue(record.path);
   const text = [title, operation ? `operation=${operation}` : '', path ? `path=${path}` : ''].filter(Boolean).join(' ');
   return text || null;

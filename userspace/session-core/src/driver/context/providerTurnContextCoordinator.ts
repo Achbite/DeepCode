@@ -553,7 +553,7 @@ export class ProviderTurnContextCoordinator<State extends ProviderTurnContextSta
       );
     }
     const artifactOperations = currentOperations.filter((operation) =>
-      ['create', 'write', 'patch', 'delete', 'rename', 'exec'].includes(operation.operationKind)
+      ['fsCreate', 'fsWrite', 'fsEdit', 'fsDelete', 'fsRename', 'processExec'].includes(operation.operationKind)
     );
     const slots = this.intentSlots.currentTaskSlots(acceptedPlan);
     if (artifactOperations.length > 0 && slots.length !== artifactOperations.length) {

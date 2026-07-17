@@ -219,7 +219,7 @@ function resourceBlockMatchesCurrentTask(
 
 function resourceBlockFullTextEligible(item: ResourcePacketItem, content: string): boolean {
   if (item.status === 'denied' || item.status === 'needsUserApproval') return false;
-  if (item.status === 'error' || item.status === 'skipped') return false;
+  if (item.status === 'error' || item.status === 'notFound' || item.status === 'skipped') return false;
   if (!content.trim()) return false;
   if (item.contentKind === 'directoryTree' || item.contentKind === 'searchResults') return false;
   return !item.truncated && content.length <= FULL_TEXT_CHAR_LIMIT;
@@ -228,6 +228,7 @@ function resourceBlockFullTextEligible(item: ResourcePacketItem, content: string
 function chooseRetention(item: ResourcePacketItem, content: string, keepFullText: boolean): ResourceBlockRetention {
   if (item.status === 'denied' || item.status === 'needsUserApproval') return 'denied';
   if (item.status === 'error') return 'error';
+  if (item.status === 'notFound') return 'handleOnly';
   if (item.status === 'skipped') return 'handleOnly';
   if (!content.trim()) return 'handleOnly';
   if (item.contentKind === 'directoryTree' || item.contentKind === 'searchResults') return 'summary';

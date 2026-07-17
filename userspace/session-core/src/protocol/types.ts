@@ -27,7 +27,6 @@ export interface PlannedActionDraft {
 export interface ValidationExpectationDraft {
   id: string;
   description: string;
-  command?: string;
 }
 
 export interface ReviewExpectationDraft {

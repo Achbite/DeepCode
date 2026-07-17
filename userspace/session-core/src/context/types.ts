@@ -108,7 +108,7 @@ export interface ResourcePacketItem {
   requestItemId: string;
   manifestEntryId: string;
   readPolicy: ResourceReadPolicy;
-  status: 'provided' | 'resolved' | 'skipped' | 'needsUserApproval' | 'denied' | 'error';
+  status: 'provided' | 'resolved' | 'notFound' | 'skipped' | 'needsUserApproval' | 'denied' | 'error';
   path?: string;
   absolutePath?: string;
   contentKind?: 'directoryTree' | 'fileText' | 'fileSkipped' | 'searchResults' | 'metadata' | 'summary' | 'text' | 'json';

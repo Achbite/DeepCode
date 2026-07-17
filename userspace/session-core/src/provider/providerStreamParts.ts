@@ -157,7 +157,7 @@ function parseProviderPartFrame(raw: string): AgentStreamPartFrame | null {
     runId: stringValue(record.runId),
     targetPath: stringValue(record.targetPath),
     language: stringValue(record.language),
-    capability: stringValue(record.capability),
+    toolId: stringValue(record.toolId),
     blockId: stringValue(record.blockId),
     actionId: stringValue(record.actionId),
     sequence: typeof record.sequence === 'number' ? record.sequence : undefined,
