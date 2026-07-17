@@ -1,5 +1,4 @@
 use super::*;
-use deepcode_kernel_skills::SkillExecutorRegistry;
 use deepcode_kernel_tools::OperationExecutionMode;
 
 struct TempWorkspace(PathBuf);
@@ -25,12 +24,8 @@ impl Drop for TempWorkspace {
     }
 }
 
-fn context(root: &Path) -> SkillExecutionContext {
-    SkillExecutionContext {
-        run_id: Some("run-test".to_string()),
-        session_id: Some("session-test".to_string()),
-        trust_mode: deepcode_kernel_skills::SkillTrustMode::Declarative,
-        approved_capabilities: Vec::new(),
+fn context(root: &Path) -> KernelToolExecutionContext {
+    KernelToolExecutionContext {
         workspace_root: Some(root.to_string_lossy().to_string()),
     }
 }
@@ -131,35 +126,59 @@ fn atomic_create_sets_executable_mode_and_atomic_write_preserves_it() {
 
 #[test]
 fn blocked_tools_have_no_runtime_executor_binding() {
-    let registry = SkillExecutorRegistry::from_executors(builtin_executors(
+    let tool_registry = KernelToolRegistry::default();
+    let registry = KernelExecutorRegistry::from_executors(builtin_executors(
+        &tool_registry,
         KernelExecutorConfig::default(),
         Arc::new(EmptySecretProvider),
     ));
     let error = registry
         .invoke(
-            SkillInvocation {
+            "browser.open",
+            KernelToolInvocation {
                 id: "blocked-browser".to_string(),
-                run_id: None,
-                session_id: None,
-                skill_id: "browser.open".to_string(),
-                phase: Some("complete".to_string()),
+                tool_id: "browser.open".to_string(),
                 input: serde_json::json!({ "url": "https://example.invalid" }),
             },
             context(Path::new(".")),
         )
         .expect_err("blocked tools must not have executable bindings");
-    assert!(format!("{error}").contains("unknown skill"));
+    assert!(format!("{error}").contains("no executable binding"));
+}
+
+#[test]
+fn executor_registry_rejects_invocation_identity_mismatch() {
+    let tool_registry = KernelToolRegistry::default();
+    let registry = KernelExecutorRegistry::from_executors(builtin_executors(
+        &tool_registry,
+        KernelExecutorConfig::default(),
+        Arc::new(EmptySecretProvider),
+    ));
+    let error = registry
+        .invoke(
+            "fs.read",
+            KernelToolInvocation {
+                id: "mismatched-invocation".to_string(),
+                tool_id: "fs.list".to_string(),
+                input: serde_json::json!({ "path": "." }),
+            },
+            context(Path::new(".")),
+        )
+        .expect_err("executor lookup and invocation identity must match");
+    assert!(format!("{error}").contains("does not match invocation tool"));
 }
 
 #[test]
 fn executable_tool_contracts_have_exactly_one_runtime_binding() {
+    let registry = KernelToolRegistry::default();
     let executors = builtin_executors(
+        &registry,
         KernelExecutorConfig::default(),
         Arc::new(EmptySecretProvider),
     );
     let binding_ids = executors
         .iter()
-        .map(|executor| executor.descriptor().id)
+        .map(|(tool_id, _)| (*tool_id).to_string())
         .collect::<Vec<_>>();
     let unique_binding_ids = binding_ids
         .iter()
@@ -167,7 +186,7 @@ fn executable_tool_contracts_have_exactly_one_runtime_binding() {
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(binding_ids.len(), unique_binding_ids.len());
 
-    for template in KernelToolRegistry::default().templates() {
+    for template in registry.contracts() {
         let binding_count = binding_ids
             .iter()
             .filter(|tool_id| tool_id.as_str() == template.tool_id)
@@ -240,12 +259,9 @@ fn controlled_http_backend_returns_untrusted_evidence() {
         secret_provider: Arc::new(EmptySecretProvider),
     }
     .invoke(
-        SkillInvocation {
+        KernelToolInvocation {
             id: "web-search-test".to_string(),
-            run_id: None,
-            session_id: None,
-            skill_id: "web.search".to_string(),
-            phase: Some("complete".to_string()),
+            tool_id: "web.search".to_string(),
             input: serde_json::json!({
                 "query": "generic",
                 "limit": 1,
@@ -264,12 +280,9 @@ fn controlled_http_backend_returns_untrusted_evidence() {
     let (fetch_url, fetch_server) = endpoint("temporary evidence", "text/plain");
     let fetch = WebFetchExecutor
         .invoke(
-            SkillInvocation {
+            KernelToolInvocation {
                 id: "web-fetch-test".to_string(),
-                run_id: None,
-                session_id: None,
-                skill_id: "web.fetch".to_string(),
-                phase: Some("complete".to_string()),
+                tool_id: "web.fetch".to_string(),
                 input: serde_json::json!({
                     "url": fetch_url,
                     "kernelReviewedTarget": crate::network_policy::review_http_target(&fetch_url)
@@ -306,12 +319,9 @@ async fn controlled_http_backend_is_safe_inside_tokio_runtime() {
 
     let result = WebFetchExecutor
         .invoke(
-            SkillInvocation {
+            KernelToolInvocation {
                 id: "web-fetch-runtime-test".to_string(),
-                run_id: None,
-                session_id: None,
-                skill_id: "web.fetch".to_string(),
-                phase: Some("complete".to_string()),
+                tool_id: "web.fetch".to_string(),
                 input: serde_json::json!({
                     "url": format!("http://{address}"),
                     "kernelReviewedTarget": crate::network_policy::review_http_target(
@@ -343,12 +353,9 @@ fn supervised_git_backend_reports_real_repository_status() {
 
     let result = GitStatusExecutor
         .invoke(
-            SkillInvocation {
+            KernelToolInvocation {
                 id: "git-status-test".to_string(),
-                run_id: Some("run-test".to_string()),
-                session_id: Some("session-test".to_string()),
-                skill_id: "git.status".to_string(),
-                phase: Some("complete".to_string()),
+                tool_id: "git.status".to_string(),
                 input: serde_json::json!({}),
             },
             context(&workspace.0),
@@ -378,12 +385,9 @@ fn supervised_git_backend_runs_v1_write_workflow() {
 
     let diff = GitDiffExecutor
         .invoke(
-            SkillInvocation {
+            KernelToolInvocation {
                 id: "git-diff-test".to_string(),
-                run_id: None,
-                session_id: None,
-                skill_id: "git.diff".to_string(),
-                phase: Some("complete".to_string()),
+                tool_id: "git.diff".to_string(),
                 input: serde_json::json!({ "path": "tracked.txt" }),
             },
             context.clone(),
@@ -395,12 +399,9 @@ fn supervised_git_backend_runs_v1_write_workflow() {
 
     GitStageExecutor
         .invoke(
-            SkillInvocation {
+            KernelToolInvocation {
                 id: "git-stage-test".to_string(),
-                run_id: None,
-                session_id: None,
-                skill_id: "git.stage".to_string(),
-                phase: Some("complete".to_string()),
+                tool_id: "git.stage".to_string(),
                 input: serde_json::json!({ "paths": ["tracked.txt"] }),
             },
             context.clone(),
@@ -408,12 +409,9 @@ fn supervised_git_backend_runs_v1_write_workflow() {
         .expect("git stage succeeds");
     GitUnstageExecutor
         .invoke(
-            SkillInvocation {
+            KernelToolInvocation {
                 id: "git-unstage-test".to_string(),
-                run_id: None,
-                session_id: None,
-                skill_id: "git.unstage".to_string(),
-                phase: Some("complete".to_string()),
+                tool_id: "git.unstage".to_string(),
                 input: serde_json::json!({ "paths": ["tracked.txt"] }),
             },
             context.clone(),
@@ -421,12 +419,9 @@ fn supervised_git_backend_runs_v1_write_workflow() {
         .expect("git unstage succeeds");
     GitStageExecutor
         .invoke(
-            SkillInvocation {
+            KernelToolInvocation {
                 id: "git-restage-test".to_string(),
-                run_id: None,
-                session_id: None,
-                skill_id: "git.stage".to_string(),
-                phase: Some("complete".to_string()),
+                tool_id: "git.stage".to_string(),
                 input: serde_json::json!({ "paths": ["tracked.txt"] }),
             },
             context.clone(),
@@ -434,12 +429,9 @@ fn supervised_git_backend_runs_v1_write_workflow() {
         .expect("git restage succeeds");
     let commit = GitCommitExecutor
         .invoke(
-            SkillInvocation {
+            KernelToolInvocation {
                 id: "git-commit-test".to_string(),
-                run_id: None,
-                session_id: None,
-                skill_id: "git.commit".to_string(),
-                phase: Some("complete".to_string()),
+                tool_id: "git.commit".to_string(),
                 input: serde_json::json!({ "message": "update tracked content" }),
             },
             context,
@@ -458,12 +450,9 @@ fn document_read_extracts_text_from_generated_pdf() {
     fs::write(&path, minimal_pdf("Kernel document fact")).unwrap();
     let result = DocumentReadExecutor
         .invoke(
-            SkillInvocation {
+            KernelToolInvocation {
                 id: "document-read-test".to_string(),
-                run_id: Some("run-test".to_string()),
-                session_id: Some("session-test".to_string()),
-                skill_id: "document.read".to_string(),
-                phase: Some("complete".to_string()),
+                tool_id: "document.read".to_string(),
                 input: serde_json::json!({ "path": "sample.pdf", "startPage": 1, "endPage": 1 }),
             },
             context(&workspace.0),

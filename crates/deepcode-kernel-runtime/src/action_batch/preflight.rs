@@ -7,7 +7,6 @@ use std::path::{Path, PathBuf};
 
 pub(super) struct PreparedOperation {
     pub(super) compiled: Option<CompiledWorkspaceAction>,
-    pub(super) can_request_blocked_permission: bool,
 }
 
 pub(super) struct BatchPreflightFailure {
@@ -21,24 +20,11 @@ pub(super) fn prepare_action_batch<'a>(
     operations: impl IntoIterator<Item = &'a PlannedOperation>,
     contract_id: Option<&str>,
 ) -> Result<BTreeMap<String, PreparedOperation>, BatchPreflightFailure> {
-    let registry = KernelToolRegistry::default();
     let operations = operations.into_iter().collect::<Vec<_>>();
     let mut prepared = BTreeMap::new();
 
     for operation in &operations {
-        let can_request_blocked_permission = operation
-            .tool_id(&registry)
-            .and_then(|tool_id| registry.get(tool_id))
-            .map(|descriptor| {
-                descriptor.permission_mode == ToolPermissionMode::Ask
-                    && descriptor.execution_mode == OperationExecutionMode::Blocked
-                    && descriptor.risk == deepcode_kernel_tools::ToolRiskLevel::Critical
-                    && descriptor.capability == operation.capability
-            })
-            .unwrap_or(false);
-        let should_compile = operation.execution_mode == OperationExecutionMode::Execute
-            || can_request_blocked_permission;
-        let compiled = if should_compile {
+        let compiled = if operation.execution_mode == OperationExecutionMode::Execute {
             Some(
                 compile_operation(runtime, record, operation, contract_id)
                     .and_then(|compiled| validate_compiled_operation(operation, compiled))
@@ -50,13 +36,7 @@ pub(super) fn prepare_action_batch<'a>(
         } else {
             None
         };
-        prepared.insert(
-            operation.id.clone(),
-            PreparedOperation {
-                compiled,
-                can_request_blocked_permission,
-            },
-        );
+        prepared.insert(operation.id.clone(), PreparedOperation { compiled });
     }
 
     let mut mutation_state = MutationPreflightState::default();
@@ -67,13 +47,13 @@ pub(super) fn prepare_action_batch<'a>(
         else {
             continue;
         };
-        if is_workspace_mutation(&compiled.tool_name) {
-            validate_mutation(compiled, &mut mutation_state).map_err(|error| {
-                BatchPreflightFailure {
+        if operation.operation_kind.is_workspace_mutation() {
+            validate_mutation(operation.operation_kind, compiled, &mut mutation_state).map_err(
+                |error| BatchPreflightFailure {
                     operation_id: operation.id.clone(),
                     error,
-                }
-            })?;
+                },
+            )?;
             match runtime
                 .effective_permission_action_for_tool(
                     &record.run_id,
@@ -101,14 +81,8 @@ pub(super) fn prepare_action_batch<'a>(
     Ok(prepared)
 }
 
-fn is_workspace_mutation(tool_name: &str) -> bool {
-    matches!(
-        tool_name,
-        "fs.create" | "fs.write" | "fs.edit" | "fs.rename" | "fs.delete" | "fs.ensure_directory"
-    )
-}
-
 fn validate_mutation(
+    operation_kind: ToolOperationKind,
     compiled: &CompiledWorkspaceAction,
     state: &mut MutationPreflightState,
 ) -> KernelResult<()> {
@@ -128,8 +102,8 @@ fn validate_mutation(
     let target = WorkspaceBoundary::new(root).resolve_mutation(path)?;
     let target_state = state.resolve(&target)?;
 
-    match compiled.tool_name.as_str() {
-        "fs.create" => {
+    match operation_kind {
+        ToolOperationKind::FsCreate => {
             if target_state != MutationTargetState::Absent {
                 return Err(KernelError::InvalidCommand(format!(
                     "fs.create target already exists: {path}"
@@ -138,7 +112,7 @@ fn validate_mutation(
             state.validate_parent_directory(path, &target, "fs.create")?;
             state.set(target, MutationTargetState::File);
         }
-        "fs.write" | "fs.edit" => {
+        ToolOperationKind::FsWrite | ToolOperationKind::FsEdit => {
             if target_state != MutationTargetState::File {
                 return Err(KernelError::InvalidCommand(format!(
                     "{} requires a file target: {path}",
@@ -146,7 +120,7 @@ fn validate_mutation(
                 )));
             }
         }
-        "fs.rename" => {
+        ToolOperationKind::FsRename => {
             if target_state == MutationTargetState::Absent {
                 return Err(KernelError::InvalidCommand(format!(
                     "fs.rename source does not exist: {path}"
@@ -164,7 +138,7 @@ fn validate_mutation(
             state.set(target, MutationTargetState::Absent);
             state.set(destination_path, target_state);
         }
-        "fs.delete" => {
+        ToolOperationKind::FsDelete => {
             let actual_kind = match target_state {
                 MutationTargetState::File => "file",
                 MutationTargetState::Directory => "directory",
@@ -193,7 +167,7 @@ fn validate_mutation(
             }
             state.set(target, MutationTargetState::Absent);
         }
-        "fs.ensure_directory" => {
+        ToolOperationKind::FsEnsureDirectory => {
             if target_state == MutationTargetState::File {
                 return Err(KernelError::InvalidCommand(format!(
                     "fs.ensure_directory target exists and is not a directory: {path}"
@@ -201,7 +175,12 @@ fn validate_mutation(
             }
             state.set(target, MutationTargetState::Directory);
         }
-        _ => {}
+        _ => {
+            return Err(KernelError::InvalidCommand(format!(
+                "{} is not a workspace mutation",
+                compiled.tool_name
+            )));
+        }
     }
     Ok(())
 }

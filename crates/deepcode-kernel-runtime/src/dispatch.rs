@@ -48,12 +48,6 @@ impl DeepCodeKernelRuntime {
                 session_id,
                 decision,
             } => self.plan_authorization_decision_submit(request_id, run_id, session_id, decision),
-            KernelCommand::UserDecisionSubmit {
-                request_id,
-                run_id,
-                session_id,
-                decision,
-            } => self.user_decision_submit(request_id, run_id, session_id, decision),
             KernelCommand::ResourceResolve {
                 request_id,
                 run_id,
@@ -65,14 +59,7 @@ impl DeepCodeKernelRuntime {
                 run_id,
                 session_id,
                 frame,
-            } => self.draft_ledger_submit(
-                request_id,
-                run_id,
-                session_id,
-                serde_json::to_value(frame).map_err(|error| {
-                    KernelError::InvalidCommand(format!("encode artifact draft frame: {error}"))
-                })?,
-            ),
+            } => self.draft_ledger_submit(request_id, run_id, session_id, frame),
             KernelCommand::ActionBatchSubmit {
                 request_id,
                 run_id,
@@ -99,38 +86,39 @@ impl DeepCodeKernelRuntime {
                 request_id,
                 session_id,
             } => self.run_resume(request_id, session_id),
-            KernelCommand::WorkspaceBindingResolve { request_id, path } => {
-                self.workspace_binding_resolve(request_id, path)
+            KernelCommand::HostWorkspaceBindingResolve { request_id, path } => {
+                self.host_workspace_binding_resolve(request_id, path)
             }
-            KernelCommand::WorkspaceOpen { request_id, path } => {
-                self.workspace_open(request_id, path)
+            KernelCommand::HostWorkspaceOpen { request_id, path } => {
+                self.host_workspace_open(request_id, path)
             }
-            KernelCommand::WorkspaceCurrent { request_id } => self.workspace_current(request_id),
+            KernelCommand::HostWorkspaceCurrent { request_id } => {
+                self.host_workspace_current(request_id)
+            }
+            KernelCommand::HostWorkspaceSave {
+                request_id,
+                file_name,
+            } => self.host_workspace_save(request_id, file_name),
             KernelCommand::HostResourceQuery { request_id, query } => {
                 self.host_resource_query(request_id, query)
             }
-            KernelCommand::SkillDiscover { request_id } => self.skill_discover(request_id),
+            KernelCommand::HostSkillDiscover { request_id } => self.host_skill_discover(request_id),
             KernelCommand::PermissionResolve {
                 request_id,
                 permission_id,
                 decision,
             } => self.permission_resolve(request_id, permission_id, decision),
-            KernelCommand::SkillTrustApprove {
+            KernelCommand::HostSkillTrustDecisionSubmit {
                 request_id,
                 skill_id,
                 decision,
-            } => self.skill_trust_approve(request_id, skill_id, decision),
-            KernelCommand::McpRiskAcknowledgmentSubmit {
+            } => self.host_skill_trust_decision_submit(request_id, skill_id, decision),
+            KernelCommand::HostMcpRiskDecisionSubmit {
                 request_id,
                 connector_id,
                 binding_id,
-                acknowledgment,
-            } => self.mcp_risk_acknowledgment_submit(
-                request_id,
-                connector_id,
-                binding_id,
-                acknowledgment,
-            ),
+                decision,
+            } => self.host_mcp_risk_decision_submit(request_id, connector_id, binding_id, decision),
             KernelCommand::AuditVerify { request_id, scope } => {
                 self.audit_verify(request_id, scope)
             }

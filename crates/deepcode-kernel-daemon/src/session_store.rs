@@ -76,6 +76,7 @@ pub(crate) fn restore_session_index(paths: &HostPaths) -> Vec<Value> {
                 None,
             );
             if let Some(object) = restored.as_object_mut() {
+                object.remove("kernelAbiVersion");
                 object.remove("agentProtocolVersion");
                 object.remove("toolCatalogVersion");
             }

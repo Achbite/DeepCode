@@ -1,4 +1,5 @@
 use super::*;
+use std::cell::Cell;
 use std::collections::BTreeMap;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -261,20 +262,9 @@ impl DeepCodeKernelRuntime {
                 owner,
                 KernelResourceScope::Run,
                 KernelResourceCleanupPolicy::OnRunEnd,
-                serde_json::json!({
-                    "leaseId": lease.id,
-                    "authorizationContractId": lease.authorization_contract_id,
-                    "planId": lease.plan_id,
-                    "planHash": lease.plan_hash,
-                    "contractHash": lease.contract_hash,
-                    "workspaceBindingHash": lease.workspace_binding_hash,
-                    "catalogVersion": lease.catalog_version,
-                    "permissionBundleIds": lease.permission_bundle_ids,
-                    "operationIds": lease.operation_ids,
-                    "leaseKind": "planAuthorization",
-                    "lease": &lease,
-                    "managedBy": "kernel.resourceManager",
-                }),
+                KernelResourceMetadata::PlanAuthorizationGrant {
+                    lease: lease.clone(),
+                },
             )],
         )?;
         Ok(lease)
@@ -286,35 +276,7 @@ impl DeepCodeKernelRuntime {
         session_id: &str,
         grants: Vec<TemporaryGrantEnvelope>,
     ) -> KernelResult<usize> {
-        let owner =
-            KernelResourceOwner::agent_run(Some(session_id.to_string()), run_id.to_string());
-        let resources = grants
-            .iter()
-            .map(|grant| {
-                let resource_id = permission_grant_resource_id(run_id, grant);
-                let resource_path = grant.resource_path.as_deref().unwrap_or("*");
-                KernelResource::active(
-                    KernelResourceIdentity::new(
-                        resource_id,
-                        format!("permission:{run_id}:{}:{}", grant.capability, resource_path),
-                        format!("permission:{run_id}:{}", grant.id),
-                    ),
-                    KernelResourceKind::PermissionGrant,
-                    owner.clone(),
-                    KernelResourceScope::Run,
-                    KernelResourceCleanupPolicy::OnBatchReviewReady,
-                    serde_json::json!({
-                        "leaseKind": if grant.resource_kind == "runtimePermission" {
-                            "runtimePermission"
-                        } else {
-                            "planExecution"
-                        },
-                        "grant": grant,
-                        "managedBy": "kernel.resourceManager"
-                    }),
-                )
-            })
-            .collect::<Vec<_>>();
+        let resources = temporary_grant_resources(run_id, session_id, &grants);
         let count = grants.len();
         self.acquire_resource_batch(
             run_id,
@@ -323,6 +285,53 @@ impl DeepCodeKernelRuntime {
             resources,
         )?;
         Ok(count)
+    }
+
+    pub(crate) fn record_permission_resolution_with_grants(
+        &self,
+        run_id: &str,
+        session_id: &str,
+        grants: &[TemporaryGrantEnvelope],
+        resolution_fact: &PermissionResolutionFact,
+    ) -> KernelResult<u64> {
+        let resources = temporary_grant_resources(run_id, session_id, grants);
+        let first_sequence = self.ledger.next_sequence(run_id)?;
+        let resolution_sequence = Cell::new(first_sequence);
+        let resolution_payload = serde_json::to_value(resolution_fact).map_err(|error| {
+            KernelError::InvalidCommand(format!("encode permission resolution fact: {error}"))
+        })?;
+        self.state
+            .resource_manager
+            .acquire_batch(resources, |acquired| {
+                let mut events = Vec::with_capacity(2);
+                if !acquired.is_empty() {
+                    events.push(LedgerEvent {
+                        id: format!("evt-{run_id}-{first_sequence}"),
+                        run_id: Some(run_id.to_string()),
+                        session_id: Some(session_id.to_string()),
+                        kind: "resource.acquired_batch".to_string(),
+                        sequence: Some(first_sequence),
+                        payload: serde_json::json!({
+                            "summary": "Kernel registered runtime permission grant leases.",
+                            "resources": acquired,
+                        }),
+                        created_at: None,
+                    });
+                    resolution_sequence.set(first_sequence + 1);
+                }
+                let sequence = resolution_sequence.get();
+                events.push(LedgerEvent {
+                    id: format!("evt-{run_id}-{sequence}"),
+                    run_id: Some(run_id.to_string()),
+                    session_id: Some(session_id.to_string()),
+                    kind: "permission.resolved".to_string(),
+                    sequence: Some(sequence),
+                    payload: resolution_payload,
+                    created_at: None,
+                });
+                self.append_ledger_batch(events)
+            })?;
+        Ok(resolution_sequence.get())
     }
 
     pub(crate) fn acquire_resource_batch(
@@ -336,6 +345,9 @@ impl DeepCodeKernelRuntime {
         self.state
             .resource_manager
             .acquire_batch(resources, |acquired| {
+                if acquired.is_empty() {
+                    return Ok(());
+                }
                 self.append_ledger(
                     run_id,
                     session_id,
@@ -361,14 +373,11 @@ impl DeepCodeKernelRuntime {
             .into_iter()
             .filter(|resource| resource.kind == KernelResourceKind::PermissionGrant)
             .any(|resource| {
-                resource.metadata.get("leaseKind").and_then(Value::as_str)
-                    == Some("planAuthorization")
-                    && resource
-                        .metadata
-                        .get("lease")
-                        .and_then(|lease| lease.get("authorizationContractId"))
-                        .and_then(Value::as_str)
-                        == Some(authorization_contract_id)
+                matches!(
+                    resource.metadata,
+                    KernelResourceMetadata::PlanAuthorizationGrant { lease }
+                        if lease.authorization_contract_id == authorization_contract_id
+                )
             })
     }
 
@@ -379,18 +388,9 @@ impl DeepCodeKernelRuntime {
             .active_by_owner(&owner)
             .into_iter()
             .filter(|resource| resource.kind == KernelResourceKind::PermissionGrant)
-            .filter(|resource| {
-                matches!(
-                    resource.metadata.get("leaseKind").and_then(Value::as_str),
-                    Some("planExecution" | "runtimePermission")
-                )
-            })
-            .filter_map(|resource| {
-                resource
-                    .metadata
-                    .get("grant")
-                    .cloned()
-                    .and_then(|value| serde_json::from_value(value).ok())
+            .filter_map(|resource| match resource.metadata {
+                KernelResourceMetadata::TemporaryPermissionGrant { grant, .. } => Some(grant),
+                _ => None,
             })
             .collect()
     }
@@ -426,6 +426,32 @@ impl DeepCodeKernelRuntime {
         )
     }
 
+    pub(crate) fn release_plan_authorization_resources(
+        &mut self,
+        run_id: &str,
+        session_id: &str,
+        reason: &str,
+    ) -> KernelResult<RunResourceCleanupSummary> {
+        self.state
+            .plan_authorization_contracts_by_run
+            .remove(run_id);
+        let owner =
+            KernelResourceOwner::agent_run(Some(session_id.to_string()), run_id.to_string());
+        let resources = self
+            .state
+            .resource_manager
+            .active_by_owner(&owner)
+            .into_iter()
+            .filter(|resource| {
+                matches!(
+                    &resource.metadata,
+                    KernelResourceMetadata::PlanAuthorizationGrant { .. }
+                )
+            })
+            .collect();
+        self.release_selected_resources(run_id, session_id, resources, reason)
+    }
+
     fn release_resources_by_policy(
         &mut self,
         run_id: &str,
@@ -433,7 +459,6 @@ impl DeepCodeKernelRuntime {
         policies: &[KernelResourceCleanupPolicy],
         reason: &str,
     ) -> KernelResult<RunResourceCleanupSummary> {
-        let mut summary = RunResourceCleanupSummary::default();
         if policies.contains(&KernelResourceCleanupPolicy::OnRunEnd) {
             self.state
                 .plan_authorization_contracts_by_run
@@ -449,6 +474,18 @@ impl DeepCodeKernelRuntime {
             .into_iter()
             .filter(|resource| policies.contains(&resource.cleanup_policy))
             .collect::<Vec<_>>();
+
+        self.release_selected_resources(run_id, session_id, resources, reason)
+    }
+
+    fn release_selected_resources(
+        &mut self,
+        run_id: &str,
+        session_id: &str,
+        resources: Vec<KernelResource>,
+        reason: &str,
+    ) -> KernelResult<RunResourceCleanupSummary> {
+        let mut summary = RunResourceCleanupSummary::default();
 
         for resource in resources {
             if resource.kind == KernelResourceKind::PermissionGrant {
@@ -517,24 +554,54 @@ impl DeepCodeKernelRuntime {
     }
 }
 
-fn remove_registered_temp_file(resource: &KernelResource) -> KernelResult<bool> {
-    if resource.metadata.get("temporary").and_then(Value::as_bool) != Some(true) {
+fn temporary_grant_resources(
+    run_id: &str,
+    session_id: &str,
+    grants: &[TemporaryGrantEnvelope],
+) -> Vec<KernelResource> {
+    let owner = KernelResourceOwner::agent_run(Some(session_id.to_string()), run_id.to_string());
+    grants
+        .iter()
+        .map(|grant| {
+            let resource_id = permission_grant_resource_id(run_id, grant);
+            let resource_path = grant.resource_path.as_deref().unwrap_or("*");
+            KernelResource::active(
+                KernelResourceIdentity::new(
+                    resource_id,
+                    format!("permission:{run_id}:{}:{}", grant.capability, resource_path),
+                    format!("permission:{run_id}:{}", grant.id),
+                ),
+                KernelResourceKind::PermissionGrant,
+                owner.clone(),
+                KernelResourceScope::Run,
+                KernelResourceCleanupPolicy::OnBatchReviewReady,
+                KernelResourceMetadata::TemporaryPermissionGrant {
+                    grant_kind: if grant.resource_kind == PermissionResourceKind::RuntimePermission
+                    {
+                        TemporaryPermissionGrantKind::RuntimePermission
+                    } else {
+                        TemporaryPermissionGrantKind::PlanExecution
+                    },
+                    grant: grant.clone(),
+                },
+            )
+        })
+        .collect()
+}
+
+pub(crate) fn remove_registered_temp_file(resource: &KernelResource) -> KernelResult<bool> {
+    let KernelResourceMetadata::TempArtifact { absolute_path, .. } = &resource.metadata else {
         return Err(KernelError::PermissionDenied(format!(
-            "resource {} is not marked as a managed temporary file",
+            "resource {} is not a managed temporary artifact",
             resource.resource_id
         )));
-    }
-    let path = resource
-        .metadata
-        .get("absolutePath")
-        .and_then(Value::as_str)
-        .map(PathBuf::from)
-        .ok_or_else(|| {
-            KernelError::InvalidCommand(format!(
-                "temporary resource {} has no absolutePath",
-                resource.resource_id
-            ))
-        })?;
+    };
+    let path = absolute_path.as_deref().map(PathBuf::from).ok_or_else(|| {
+        KernelError::InvalidCommand(format!(
+            "temporary resource {} has no absolutePath",
+            resource.resource_id
+        ))
+    })?;
     match fs::symlink_metadata(&path) {
         Ok(metadata) if metadata.file_type().is_file() || metadata.file_type().is_symlink() => {
             fs::remove_file(&path).map_err(|error| {

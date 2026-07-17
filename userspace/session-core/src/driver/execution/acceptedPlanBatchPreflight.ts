@@ -5,7 +5,7 @@ export interface AcceptedPlanBatchPreflightPorts {
 export class AcceptedPlanBatchPreflight {
   constructor(private readonly ports: AcceptedPlanBatchPreflightPorts) {}
 
-  audit(batch: Record<string, unknown>): Record<string, unknown> {
+  audit(batch: unknown): Record<string, unknown> {
     return {
       actionCount: this.ports.batchActionRecords(batch).length,
       actions: this.ports.batchActionRecords(batch).map((action) => {

@@ -70,6 +70,58 @@ pub enum ArtifactDraftLedgerFrame {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ArtifactDraftPartKind {
+    ArtifactChunk,
+    BatchDone,
+    Diagnostic,
+}
+
+impl ArtifactDraftLedgerFrame {
+    pub fn base(&self) -> &ArtifactDraftFrameBase {
+        match self {
+            Self::ArtifactChunk { base, .. }
+            | Self::BatchDone { base, .. }
+            | Self::Diagnostic { base, .. } => base,
+        }
+    }
+
+    pub const fn part_kind(&self) -> ArtifactDraftPartKind {
+        match self {
+            Self::ArtifactChunk { .. } => ArtifactDraftPartKind::ArtifactChunk,
+            Self::BatchDone { .. } => ArtifactDraftPartKind::BatchDone,
+            Self::Diagnostic { .. } => ArtifactDraftPartKind::Diagnostic,
+        }
+    }
+
+    pub fn base_mut(&mut self) -> &mut ArtifactDraftFrameBase {
+        match self {
+            Self::ArtifactChunk { base, .. }
+            | Self::BatchDone { base, .. }
+            | Self::Diagnostic { base, .. } => base,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ArtifactDraftStatus {
+    Open,
+    Chunk,
+    BatchCompleted,
+    Discarded,
+    Committed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtifactDraftEvent {
+    pub draft_id: String,
+    pub status: ArtifactDraftStatus,
+    pub frame: ArtifactDraftLedgerFrame,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ArtifactDraftBatchMetadata {

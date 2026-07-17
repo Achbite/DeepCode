@@ -93,7 +93,7 @@ fn operation_depends_on(
 
 pub(super) fn authorized_operation_matches(
     contract: &KernelPlanAuthorizationContract,
-    operation: &deepcode_kernel_tools::KernelExecutionOperationV3,
+    operation: &deepcode_kernel_tools::KernelExecutionOperation,
 ) -> bool {
     let actual_targets = operation
         .read_set
@@ -119,18 +119,19 @@ pub(super) fn authorized_operation_matches(
         if !fixed_authorization_args_match(&authorized.fixed_args, &operation.args) {
             return false;
         }
-        if authorized.tool_id == "fs.delete" {
-            let actual_target_kind = operation
-                .args
-                .get("targetKind")
-                .and_then(Value::as_str)
-                .unwrap_or("file");
+        if operation.operation_kind == ToolOperationKind::FsDelete {
+            let actual_target_kind = match operation.args.get("targetKind").and_then(Value::as_str)
+            {
+                Some("directory") => ToolTargetKind::Directory,
+                Some("file") | None => ToolTargetKind::File,
+                Some(_) => return false,
+            };
             let actual_recursive = operation
                 .args
                 .get("recursive")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            return authorized.target_kind.as_deref() == Some(actual_target_kind)
+            return authorized.target_kind == Some(actual_target_kind)
                 && authorized.recursive.unwrap_or(false) == actual_recursive;
         }
         true
@@ -150,7 +151,7 @@ fn fixed_authorization_args_match(fixed_args: &Value, actual: &Value) -> bool {
 }
 
 pub(super) fn exact_grants_from_execution_contract(
-    contract: &deepcode_kernel_tools::KernelExecutionContractV3,
+    contract: &deepcode_kernel_tools::KernelExecutionContract,
     authorization_contract_id: &str,
 ) -> Vec<TemporaryGrantEnvelope> {
     contract
@@ -177,7 +178,7 @@ pub(super) fn exact_grants_from_execution_contract(
                     contract_id: contract.id.clone(),
                     operation_ids: bundle.operation_ids.clone(),
                     capability: bundle.capability.clone(),
-                    resource_kind: bundle.resource_kind.clone(),
+                    resource_kind: bundle.resource_kind,
                     resource_path,
                     expires_after_sequence: None,
                     reason: Some(format!(
@@ -191,7 +192,7 @@ pub(super) fn exact_grants_from_execution_contract(
 }
 
 pub(super) fn execution_contract_hash(
-    contract: &deepcode_kernel_tools::KernelExecutionContractV3,
+    contract: &deepcode_kernel_tools::KernelExecutionContract,
 ) -> String {
     let mut payload = contract.clone();
     payload.contract_hash.clear();
@@ -266,23 +267,28 @@ pub(super) fn validate_plan_target(
         )));
     }
     match constraints.target_existence {
-        "mustExist" if metadata.is_none() && !planned_to_exist => Err(KernelError::InvalidCommand(
-            format!("{tool_id} target does not exist: {path}"),
-        )),
-        "mustNotExist" if metadata.is_some() => Err(KernelError::InvalidCommand(format!(
-            "{tool_id} target already exists: {path}"
-        ))),
+        deepcode_kernel_tools::TargetExistence::MustExist
+            if metadata.is_none() && !planned_to_exist =>
+        {
+            Err(KernelError::InvalidCommand(format!(
+                "{tool_id} target does not exist: {path}"
+            )))
+        }
+        deepcode_kernel_tools::TargetExistence::MustNotExist if metadata.is_some() => Err(
+            KernelError::InvalidCommand(format!("{tool_id} target already exists: {path}")),
+        ),
         _ => {
             if let Some(metadata) = metadata {
                 let kind = if metadata.is_dir() {
-                    "directory"
+                    deepcode_kernel_tools::ToolTargetKind::Directory
                 } else {
-                    "file"
+                    deepcode_kernel_tools::ToolTargetKind::File
                 };
                 if !constraints.target_kinds.is_empty() && !constraints.target_kinds.contains(&kind)
                 {
                     return Err(KernelError::InvalidCommand(format!(
-                        "{tool_id} target kind {kind} is not allowed for {path}"
+                        "{tool_id} target kind {} is not allowed for {path}",
+                        kind.wire_name()
                     )));
                 }
             }
@@ -298,10 +304,18 @@ pub(super) fn validate_rename_plan_target(
     constraints: &deepcode_kernel_tools::ToolUsageConstraints,
 ) -> KernelResult<()> {
     match target_index {
-        0 if constraints.source_existence == Some("mustExist") && metadata.is_none() => Err(
-            KernelError::InvalidCommand(format!("fs.rename source does not exist: {path}")),
-        ),
-        1 if constraints.destination_existence == Some("mustNotExist") && metadata.is_some() => {
+        0 if constraints.source_existence
+            == Some(deepcode_kernel_tools::TargetExistence::MustExist)
+            && metadata.is_none() =>
+        {
+            Err(KernelError::InvalidCommand(format!(
+                "fs.rename source does not exist: {path}"
+            )))
+        }
+        1 if constraints.destination_existence
+            == Some(deepcode_kernel_tools::TargetExistence::MustNotExist)
+            && metadata.is_some() =>
+        {
             Err(KernelError::InvalidCommand(format!(
                 "fs.rename destination already exists: {path}"
             )))
@@ -324,13 +338,14 @@ fn validate_target_kind(
         return Ok(());
     };
     let kind = if metadata.is_dir() {
-        "directory"
+        deepcode_kernel_tools::ToolTargetKind::Directory
     } else {
-        "file"
+        deepcode_kernel_tools::ToolTargetKind::File
     };
     if !constraints.target_kinds.is_empty() && !constraints.target_kinds.contains(&kind) {
         return Err(KernelError::InvalidCommand(format!(
-            "{tool_id} target kind {kind} is not allowed for {path}"
+            "{tool_id} target kind {} is not allowed for {path}",
+            kind.wire_name()
         )));
     }
     Ok(())
@@ -352,14 +367,6 @@ pub(super) fn replace_operation_targets(
                 .unwrap_or_else(|| value.clone())
         })
         .collect()
-}
-
-pub(super) fn execution_mode_name(mode: OperationExecutionMode) -> &'static str {
-    match mode {
-        OperationExecutionMode::Execute => "execute",
-        OperationExecutionMode::PreviewOnly => "previewOnly",
-        OperationExecutionMode::Blocked => "blocked",
-    }
 }
 
 pub(super) fn compact_hash(value: &str) -> String {

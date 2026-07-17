@@ -11,7 +11,7 @@ export interface SessionFailurePlanContext {
 }
 
 export interface SessionFailureProjectionBuilderPorts {
-  actionBatchFailureDetails(kernelEvents: unknown[], batch?: Record<string, unknown>): ActionBatchFailureDetail[];
+  actionBatchFailureDetails(kernelEvents: unknown[], batch?: unknown): ActionBatchFailureDetail[];
   actionBatchFailureSummary(failure: ActionBatchFailureDetail): string;
   sessionRunStateEvent(input: {
     sessionId: string;
@@ -227,7 +227,7 @@ export class SessionFailureProjectionBuilder {
     sessionId: string,
     plan: SessionFailurePlanContext,
     kernelEvents: unknown[],
-    batch: Record<string, unknown>,
+    batch: unknown,
     ts: string,
     id: string
   ): AgentEvent[] {
@@ -269,7 +269,7 @@ export class SessionFailureProjectionBuilder {
     runId: string,
     accepted: AcceptedTaskPlanContext,
     kernelEvents: unknown[],
-    batch: Record<string, unknown> | undefined,
+    batch: unknown,
     ts: string,
     id: string
   ): AgentEvent[] {

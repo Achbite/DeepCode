@@ -1,19 +1,20 @@
-import type {
-  AgentContextAttachment,
-  AgentEvent,
-  AgentConversationActivity,
-  AgentEventChannel,
-  AgentTimelineBlock,
-  AgentTimelineBlockKind,
-  AgentTimelineNarrativeKind,
-  AgentTimelineResult,
-  AgentTimelineStatus,
-  AgentTimelineTokenUsageProjection,
-  AgentTimelineTokenUsageRequest,
-  AgentTimelineTokenUsageTotals,
-  KernelProposalReviewReport,
-  PermissionRequest,
-  ProjectionDelta,
+import {
+  decodeKernelEventV1,
+  type AgentContextAttachment,
+  type AgentEvent,
+  type AgentConversationActivity,
+  type AgentEventChannel,
+  type AgentTimelineBlock,
+  type AgentTimelineBlockKind,
+  type AgentTimelineNarrativeKind,
+  type AgentTimelineResult,
+  type AgentTimelineStatus,
+  type AgentTimelineTokenUsageProjection,
+  type AgentTimelineTokenUsageRequest,
+  type AgentTimelineTokenUsageTotals,
+  type KernelProposalReviewReport,
+  type PermissionRequest,
+  type ProjectionDelta,
 } from '@deepcode/protocol';
 import type { ResourcePacket, ResourceRequest } from './context/types.js';
 import type { ReviewPacket } from './review/types.js';
@@ -671,8 +672,7 @@ function isProjectionTimelineHiddenEvent(event: AgentEvent): boolean {
   if (event.kind === 'workflow_stage' || event.kind === 'workflow_decision') {
     const payload = isRecordPayload(event.payload) ? event.payload : {};
     const stage = stringField(payload, 'stage');
-    const kernelEvent = isRecordPayload(payload.kernelEvent) ? payload.kernelEvent : undefined;
-    const kernelEventKind = kernelEvent ? stringField(kernelEvent, 'kind') : undefined;
+    const kernelEventKind = kernelEventFromPayload(payload)?.kind;
     if (isInternalOrchestrationStage({ stage, kernelEventKind })) return true;
     if (!activity) return true;
   }
@@ -1043,8 +1043,7 @@ interface ImplementationFact {
 
 function implementationFactFromEvent(event: AgentEvent): ImplementationFact | null {
   const payload = isRecordPayload(event.payload) ? event.payload : {};
-  const kernelEvent = isRecordPayload(payload.kernelEvent) ? payload.kernelEvent : undefined;
-  const kind = stringField(kernelEvent ?? {}, 'kind') ?? stringField(payload, 'stage');
+  const kind = kernelEventFromPayload(payload)?.kind ?? stringField(payload, 'stage');
   const status = implementationFactStatus(kind, stringField(payload, 'status'));
   if (!status) return null;
   return {
@@ -1085,10 +1084,18 @@ function eventPathCandidates(payload: Record<string, unknown>): string[] {
     }
   };
   collect(payload);
-  const kernelEvent = isRecordPayload(payload.kernelEvent) ? payload.kernelEvent : undefined;
-  collect(kernelEvent);
-  if (kernelEvent) collect(kernelEvent.output);
-  if (kernelEvent) collect(kernelEvent.workUnit);
+  collect(payload.activity);
+  const kernelEvent = kernelEventFromPayload(payload);
+  const kernelRecord = kernelEvent as unknown as Record<string, unknown> | undefined;
+  collect(kernelRecord);
+  if (kernelEvent?.kind === 'tool.completed') {
+    collect(kernelEvent.fact.output);
+  } else if (kernelEvent?.kind === 'tool.requested') {
+    collect(kernelEvent.fact.argsPreview);
+  } else if (kernelRecord && 'output' in kernelRecord) {
+    collect(kernelRecord.output);
+  }
+  if (kernelEvent?.kind === 'work_unit.queued') collect(kernelEvent.workUnit);
   const output = isRecordPayload(payload.output) ? payload.output : undefined;
   collect(output);
   const workUnit = isRecordPayload(payload.workUnit) ? payload.workUnit : undefined;
@@ -1106,9 +1113,14 @@ function eventIdCandidates(payload: Record<string, unknown>): string[] {
     }
   };
   collect(payload);
-  const kernelEvent = isRecordPayload(payload.kernelEvent) ? payload.kernelEvent : undefined;
-  collect(kernelEvent);
-  if (kernelEvent) collect(kernelEvent.workUnit);
+  collect(payload.activity);
+  const kernelEvent = kernelEventFromPayload(payload);
+  const kernelRecord = kernelEvent as unknown as Record<string, unknown> | undefined;
+  collect(kernelRecord);
+  if (kernelEvent?.kind === 'tool.completed' || kernelEvent?.kind === 'tool.requested') {
+    collect(kernelEvent.fact);
+  }
+  if (kernelEvent?.kind === 'work_unit.queued') collect(kernelEvent.workUnit);
   const workUnit = isRecordPayload(payload.workUnit) ? payload.workUnit : undefined;
   collect(workUnit);
   return candidates;
@@ -1436,8 +1448,8 @@ function isAgentContextAttachment(value: unknown): value is AgentContextAttachme
   if (!isRecordPayload(value)) return false;
   return typeof value.path === 'string' &&
     (value.scope === 'session' || value.scope === 'message') &&
-    (value.kind === 'file' || value.kind === 'directory' || value.kind === 'panelSnapshot') &&
-    (value.source === 'mention' || value.source === 'contextMenu' || value.source === 'browser' || value.source === 'userSelected');
+    (value.kind === 'file' || value.kind === 'directory') &&
+    (value.source === 'mention' || value.source === 'contextMenu' || value.source === 'userSelected');
 }
 
 function narrativeStructuredProjection(
@@ -1696,8 +1708,7 @@ function narrativeEventStatus(event: AgentEvent): string | undefined {
 }
 
 function kernelEventTimelineStatus(payload: Record<string, unknown>): AgentTimelineStatus | 'consumed' | undefined {
-  const kernelEvent = isRecordPayload(payload.kernelEvent) ? payload.kernelEvent : undefined;
-  const kind = kernelEvent ? stringField(kernelEvent, 'kind') : undefined;
+  const kind = kernelEventFromPayload(payload)?.kind;
   if (!kind) return undefined;
   if (
     kind === 'review_gate.evaluated' ||
@@ -1706,9 +1717,9 @@ function kernelEventTimelineStatus(payload: Record<string, unknown>): AgentTimel
     kind === 'tool.completed' ||
     kind === 'permission.resolved'
   ) return 'completed';
-  if (kind === 'work_unit.failed' || kind === 'tool.failed') return 'failed';
+  if (kind === 'work_unit.failed') return 'failed';
   if (kind === 'work_unit.blocked') return 'blocked';
-  if (kind === 'work_unit.started' || kind === 'work_unit.queued' || kind === 'tool.started') return 'running';
+  if (kind === 'work_unit.started' || kind === 'work_unit.queued' || kind === 'tool.requested') return 'running';
   return undefined;
 }
 
@@ -2434,13 +2445,9 @@ function permissionResultId(event: AgentEvent): string | undefined {
         ? payload.id
         : undefined;
   }
-  const payload = event.payload && typeof event.payload === 'object' && !Array.isArray(event.payload)
-    ? event.payload as Record<string, unknown>
-    : undefined;
-  const kernelEvent = payload?.kernelEvent && typeof payload.kernelEvent === 'object' && !Array.isArray(payload.kernelEvent)
-    ? payload.kernelEvent as Record<string, unknown>
-    : undefined;
-  return kernelEvent?.kind === 'permission.resolved' && typeof kernelEvent.permissionId === 'string'
+  const payload = isRecordPayload(event.payload) ? event.payload : undefined;
+  const kernelEvent = payload ? kernelEventFromPayload(payload) : undefined;
+  return kernelEvent?.kind === 'permission.resolved'
     ? kernelEvent.permissionId
     : undefined;
 }
@@ -2449,39 +2456,27 @@ function permissionRequestFromKernelWorkflowStage(event: AgentEvent): Permission
   const payload = event.payload && typeof event.payload === 'object' && !Array.isArray(event.payload)
     ? event.payload as Record<string, unknown>
     : undefined;
-  const kernelEvent = payload?.kernelEvent && typeof payload.kernelEvent === 'object' && !Array.isArray(payload.kernelEvent)
-    ? payload.kernelEvent as Record<string, unknown>
-    : undefined;
-  if (kernelEvent?.kind !== 'permission.requested') return null;
-  const request = kernelEvent.request && typeof kernelEvent.request === 'object' && !Array.isArray(kernelEvent.request)
-    ? kernelEvent.request as Record<string, unknown>
-    : {};
-  const id = typeof request.id === 'string'
-    ? request.id
-    : typeof kernelEvent.permissionId === 'string'
-      ? kernelEvent.permissionId
-      : typeof kernelEvent.toolCallId === 'string'
-        ? kernelEvent.toolCallId
-        : undefined;
-  if (!id) return null;
-  const capability = typeof request.capability === 'string'
-    ? request.capability
-    : typeof kernelEvent.capability === 'string'
-      ? kernelEvent.capability
-      : 'fs.write';
+  if (!payload?.kernelEvent) return null;
+  const kernelEvent = decodeKernelEventV1(event);
+  if (kernelEvent.kind !== 'permission.requested') return null;
+  const request = kernelEvent.request;
   return {
-    id,
-    toolName: typeof kernelEvent.toolName === 'string' ? kernelEvent.toolName : capability,
-    riskLevel: request.riskLevel === 'low' || request.riskLevel === 'medium' || request.riskLevel === 'high' || request.riskLevel === 'critical'
-      ? request.riskLevel
-      : 'medium',
-    summary: typeof request.summary === 'string'
-      ? request.summary
-      : typeof kernelEvent.summary === 'string'
-        ? kernelEvent.summary
-        : `Permission requested for ${capability}.`,
-    argumentsPreview: request.argsPreview ?? kernelEvent.argsPreview ?? null,
-    ...(typeof kernelEvent.runId === 'string' ? { runId: kernelEvent.runId } : {}),
-    ...(typeof kernelEvent.planId === 'string' ? { planId: kernelEvent.planId } : {}),
+    id: request.id,
+    requestKind: request.requestKind,
+    permissionBundleId: request.permissionBundleId,
+    contractId: request.contractId,
+    affectedOperationIds: request.affectedOperationIds,
+    workUnitIds: request.workUnitIds,
+    toolId: request.toolId,
+    toolName: request.toolId ?? request.capability,
+    riskLevel: request.riskLevel,
+    summary: request.summary,
+    argumentsPreview: request.argsPreview,
+    ...(kernelEvent.runId ? { runId: kernelEvent.runId } : {}),
   } as PermissionRequest;
+}
+
+function kernelEventFromPayload(payload: Record<string, unknown>) {
+  if (!isRecordPayload(payload.kernelEvent)) return undefined;
+  return decodeKernelEventV1({ payload });
 }

@@ -1,26 +1,27 @@
 import { stableHash } from '../cache/canonicalizer.js';
 import type { TaskDependencyFactRecord } from './types.js';
+import { decodeKernelEventV1, isKernelEventKindV1, type KernelEventV1 } from '@deepcode/protocol';
 
 export function taskDependencyFactsFromKernelEvents(
   taskId: string,
   kernelEvents: readonly unknown[]
 ): TaskDependencyFactRecord[] {
-  const records = kernelEvents.flatMap(recognizedKernelRecords);
+  const records = kernelEvents.flatMap(kernelEventsFromValue);
   const completedWorkUnits = new Set(
     records
-      .filter((record) => eventKind(record) === 'work_unit.completed')
-      .map((record) => stringValue(record.workUnitId))
+      .filter((record): record is Extract<KernelEventV1, { kind: 'work_unit.completed' }> => record.kind === 'work_unit.completed')
+      .map((record) => record.workUnitId)
       .filter((value): value is string => Boolean(value))
   );
   const facts: TaskDependencyFactRecord[] = [];
   for (const record of records) {
-    if (eventKind(record) !== 'tool.completed' || record.ok !== true) continue;
-    const output = objectRecord(record.output);
+    if (record.kind !== 'tool.completed' || record.fact.ok !== true) continue;
+    const output = objectRecord(record.fact.output);
     const kernelContext = objectRecord(output?.kernelContext);
     const workUnitId = stringValue(kernelContext?.workUnitId);
     if (!output || !workUnitId || !completedWorkUnits.has(workUnitId)) continue;
-    const toolCallId = stringValue(record.toolCallId);
-    const toolId = stringValue(record.toolName);
+    const toolCallId = record.fact.toolCallId;
+    const toolId = record.fact.toolId;
     const path = stringValue(output.path) ?? stringValue(output.normalizedTargetPath);
     if (!toolCallId || !toolId || !path) continue;
     const contentHash = stringValue(output.contentHash)
@@ -60,31 +61,23 @@ export function dependencyFactsForTask(
   return facts.filter((fact) => dependencies.has(fact.taskId));
 }
 
-function recognizedKernelRecords(value: unknown): Record<string, unknown>[] {
+function kernelEventsFromValue(value: unknown): KernelEventV1[] {
+  if (!hasKernelEventCandidate(value)) return [];
+  try {
+    return [decodeKernelEventV1(value)];
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`kernel_abi_event_invalid: ${message}`);
+  }
+}
+
+function hasKernelEventCandidate(value: unknown): boolean {
   const root = objectRecord(value);
-  if (!root) return [];
+  if (!root) return false;
   const payload = objectRecord(root.payload);
-  return uniqueRecords([
-    root,
-    payload,
-    objectRecord(root.kernelEvent),
-    objectRecord(payload?.kernelEvent),
-  ]);
-}
-
-function eventKind(record: Record<string, unknown>): string | undefined {
-  return stringValue(record.kind) ?? stringValue(record.eventKind);
-}
-
-function uniqueRecords(
-  records: Array<Record<string, unknown> | undefined>
-): Record<string, unknown>[] {
-  const seen = new Set<Record<string, unknown>>();
-  return records.filter((record): record is Record<string, unknown> => {
-    if (!record || seen.has(record)) return false;
-    seen.add(record);
-    return true;
-  });
+  if (objectRecord(payload?.kernelEvent)) return true;
+  const kind = stringValue(root.kind);
+  return isKernelEventKindV1(kind);
 }
 
 function deduplicateFacts(facts: TaskDependencyFactRecord[]): TaskDependencyFactRecord[] {

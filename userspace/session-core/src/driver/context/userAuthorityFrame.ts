@@ -106,7 +106,7 @@ export function buildUserAuthorityFrame(
   fallback: { messageId: string; content: string; timestamp?: string },
   visibleLanguageForRequest: (content: string) => VisibleLanguage,
   autonomyMode: AutonomyMode = 'strict',
-  options: { runId?: string; requirePersistedAuthority?: boolean } = {}
+  options: { runId?: string } = {}
 ): UserAuthorityFrame {
   const explicitMessages = collectExplicitUserMessages(events);
   const fallbackMessage = authorityMessage({
@@ -117,17 +117,13 @@ export function buildUserAuthorityFrame(
   });
   const effectiveMessages = explicitMessages.length ? explicitMessages : [fallbackMessage];
   const persisted = latestSessionTurnAuthority(events, options.runId);
-  if (!persisted && options.requirePersistedAuthority) {
+  if (!persisted) {
     throw new UserAuthorityFrameError(
       'session_turn_authority_unavailable',
       `Session run ${options.runId ?? 'unknown'} has no persisted CurrentTurnAuthority binding.`
     );
   }
-  const turnAuthority = persisted ?? syntheticAuthority(
-    effectiveMessages.at(-1) ?? fallbackMessage,
-    options.runId,
-    visibleLanguageForRequest
-  );
+  const turnAuthority = persisted;
   const currentMessages = resolveCurrentMessages(effectiveMessages, turnAuthority);
   if (currentMessages.length !== turnAuthority.sourceMessageIds.length) {
     throw new UserAuthorityFrameError(
@@ -246,28 +242,6 @@ function sessionTurnAuthorityPayload(value: unknown): SessionTurnAuthorityPayloa
   };
   if (stableHash(JSON.stringify(core)) !== authorityHash) return undefined;
   return { ...core, authorityHash };
-}
-
-function syntheticAuthority(
-  message: UserAuthorityMessage,
-  runId: string | undefined,
-  visibleLanguageForRequest: (content: string) => VisibleLanguage
-): SessionTurnAuthorityPayload {
-  const core = {
-    schemaVersion: 'deepcode.session.turn-authority.v1' as const,
-    sessionId: 'session-unbound',
-    runId: runId ?? 'run-unbound',
-    turnId: 'turn-unbound',
-    taskId: 'task-unbound',
-    sourceMessageIds: [message.messageId],
-    sourceMessageHashes: [message.contentHash],
-    relation: 'newTask' as const,
-    boundAtHookRef: 'legacy-fallback',
-    outputLanguage: visibleLanguageForRequest(message.content),
-    promptEpochId: undefined,
-    previousTaskId: undefined,
-  };
-  return { ...core, authorityHash: stableHash(JSON.stringify(core)) };
 }
 
 function authorityMessage(input: Omit<UserAuthorityMessage, 'contentHash'>): UserAuthorityMessage {

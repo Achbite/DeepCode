@@ -109,8 +109,8 @@ impl KernelResourceManager {
             new_resources.push(candidate);
         }
 
+        persist(&new_resources)?;
         if !new_resources.is_empty() {
-            persist(&new_resources)?;
             for resource in &new_resources {
                 state.resource_ids_by_idempotency_key.insert(
                     resource.idempotency_key.clone(),

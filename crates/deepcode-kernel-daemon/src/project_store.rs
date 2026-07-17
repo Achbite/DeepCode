@@ -199,9 +199,9 @@ pub(crate) fn resolve_project_binding(
     runtime: &SharedRuntime,
     root_path: &str,
 ) -> Result<Value, KernelErrorEnvelope> {
-    let output = dispatch_workspace(
+    let result = dispatch_workspace_result(
         runtime,
-        KernelCommand::WorkspaceBindingResolve {
+        KernelCommand::HostWorkspaceBindingResolve {
             request_id: rid(&format!("project-binding-{}", now_millis())),
             path: root_path.to_string(),
         },
@@ -212,16 +212,20 @@ pub(crate) fn resolve_project_binding(
         message_key: None,
         args: None,
     })?;
-    output
-        .get("workspaceBinding")
-        .filter(|binding| binding.is_object())
-        .cloned()
-        .ok_or_else(|| KernelErrorEnvelope {
+    let HostWorkspaceOutput::BindingResolved(output) = result.output else {
+        return Err(KernelErrorEnvelope {
             code: "project_root_unavailable".to_string(),
             message: "Kernel did not return a workspace binding".to_string(),
             message_key: None,
             args: None,
-        })
+        });
+    };
+    serde_json::to_value(output.workspace_binding).map_err(|error| KernelErrorEnvelope {
+        code: "project_workspace_binding_encoding_failed".to_string(),
+        message: error.to_string(),
+        message_key: None,
+        args: None,
+    })
 }
 
 pub(crate) fn set_project_root_status(state: &AppState, project_id: &str, status: &str) {
@@ -407,7 +411,6 @@ mod tests {
                 session_projection_cache: HashMap::new(),
                 session_timeline_cache: HashMap::new(),
                 trace_events: HashMap::new(),
-                browser: BrowserState::default(),
             })),
             terminal_runtime: Arc::new(Mutex::new(crate::terminal_api::TerminalRuntime::new())),
             kernel_events: Arc::new(Mutex::new(Vec::new())),

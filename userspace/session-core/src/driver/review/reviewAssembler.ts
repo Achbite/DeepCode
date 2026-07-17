@@ -1,4 +1,4 @@
-import type { LlmChatRequest } from '@deepcode/protocol';
+import { decodeKernelEventV1, type LlmChatRequest } from '@deepcode/protocol';
 import { stableHash } from '../../cache/canonicalizer.js';
 import type { AcceptedTaskPlanContext } from '../../accepted-plan/types.js';
 import type { ResourcePacket } from '../../context/types.js';
@@ -6,7 +6,7 @@ import type { PromptEnvelope } from '../../prompt/types.js';
 
 export interface ReviewGeneratedArtifactEvidence {
   targetPath: string;
-  content: string;
+  content?: string;
   contentHash: string;
   manifestEntryId: string;
   contentBlockId?: string;
@@ -70,7 +70,7 @@ export class ReviewAssembler {
 
   staticSyntaxReviewPacket(input: {
     accepted: AcceptedTaskPlanContext;
-    batch: Record<string, unknown>;
+    batch: unknown;
     batchEvents: unknown[];
     generatedArtifactEvidence: Map<string, ReviewGeneratedArtifactEvidence>;
     resourcePackets: ResourcePacket[];
@@ -86,7 +86,8 @@ export class ReviewAssembler {
       const target = this.ports.actionFileTargetPath(action);
       if (target) targetPaths.add(this.ports.normalizeAcceptedPlanTargetScope(target, accepted));
     }
-    for (const block of recordArray(batch.contentBlocks)) {
+    const batchRecord = objectRecord(batch);
+    for (const block of recordArray(batchRecord?.contentBlocks)) {
       const target = stringValue(block.targetPath) ?? stringValue(block.path);
       if (target) targetPaths.add(this.ports.normalizeAcceptedPlanTargetScope(target, accepted));
     }
@@ -207,29 +208,30 @@ export class ReviewAssembler {
         const error = objectRecord(record?.error);
         const status = record?.ok === true ? 'ok' : 'error';
         const detail = stringValue(error?.message) ?? (record?.output ? clipJson(record.output, 180) : 'no output');
-        lines.push(`- \`${stringValue(record?.toolName) ?? 'tool'}\` ${status}：${detail}`);
+        lines.push(`- \`${stringValue(record?.toolId) ?? 'tool'}\` ${status}：${detail}`);
       }
       return lines;
     }
     return kernelEvents.flatMap((event) => {
-      const record = objectRecord(event);
-      if (!record) return [];
-      const kind = stringValue(record.kind);
-      if (kind === 'work_unit.completed') {
-        return [`- \`${stringValue(record.workUnitId) ?? 'work-unit'}\` completed${record.output ? `：${clipJson(record.output, 180)}` : ''}`];
+      let decoded;
+      try {
+        decoded = decodeKernelEventV1(event);
+      } catch {
+        return [];
       }
-      if (kind === 'work_unit.failed') {
-        const error = objectRecord(record.error);
-        return [`- \`${stringValue(record.workUnitId) ?? 'work-unit'}\` failed：${stringValue(error?.message) ?? 'unknown error'}`];
+      if (decoded.kind === 'work_unit.completed') {
+        return [`- \`${decoded.workUnitId}\` completed${decoded.output ? `：${clipJson(decoded.output, 180)}` : ''}`];
       }
-      if (kind === 'work_unit.blocked') {
-        return [`- \`${stringValue(record.workUnitId) ?? 'work-unit'}\` blocked：${stringValue(record.reason) ?? 'blocked'}`];
+      if (decoded.kind === 'work_unit.failed') {
+        return [`- \`${decoded.workUnitId}\` failed：${decoded.error.message}`];
       }
-      if (kind === 'tool.completed') {
-        const error = objectRecord(record.error);
-        const status = record.ok === true ? 'ok' : 'error';
-        const detail = stringValue(error?.message) ?? (record.output ? clipJson(record.output, 180) : 'no output');
-        return [`- \`${stringValue(record.toolName) ?? 'tool'}\` ${status}：${detail}`];
+      if (decoded.kind === 'work_unit.blocked') {
+        return [`- \`${decoded.workUnitId}\` blocked：${decoded.reason}`];
+      }
+      if (decoded.kind === 'tool.completed') {
+        const status = decoded.fact.ok ? 'ok' : 'error';
+        const detail = decoded.fact.error?.message ?? (decoded.fact.output ? clipJson(decoded.fact.output, 180) : 'no output');
+        return [`- \`${decoded.fact.toolId}\` ${status}：${detail}`];
       }
       return [];
     });
@@ -237,9 +239,9 @@ export class ReviewAssembler {
 
   findReviewFacts(kernelEvents: unknown[]): Record<string, unknown> | undefined {
     for (const event of [...kernelEvents].reverse()) {
-      const record = objectRecord(event);
-      if (record?.kind !== 'review.facts_produced') continue;
-      return objectRecord(record.facts) ?? undefined;
+      const decoded = decodeKernelEventV1(event);
+      if (decoded.kind !== 'review.facts_produced') continue;
+      return objectRecord(decoded.facts) ?? undefined;
     }
     return undefined;
   }

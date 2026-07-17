@@ -1,4 +1,8 @@
-use crate::{RunId, SessionId};
+use crate::{
+    IsolationContract, OperationExecutionMode, PathScopePolicy, PlanTargetMode, PlanTargetSource,
+    RunId, SessionId, TargetExistence, ToolContentMode, ToolFamily, ToolOperationKind,
+    ToolPermissionMode, ToolRiskLevel, ToolTargetKind,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -10,7 +14,52 @@ pub struct DraftAdmissionPolicy {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct KernelToolUsageConstraintsRef {
+    pub target_existence: TargetExistence,
+    pub source_existence: Option<TargetExistence>,
+    pub destination_existence: Option<TargetExistence>,
+    pub target_kinds: Vec<ToolTargetKind>,
+    pub content_mode: ToolContentMode,
+    pub directory_recursive_required: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KernelToolCatalogEntryRef {
+    pub tool_id: String,
+    pub capability: String,
+    pub family: ToolFamily,
+    pub operation_kind: ToolOperationKind,
+    pub provider_schema: Value,
+    pub planning_schema: Value,
+    pub provider_visible: bool,
+    pub forbidden_fields: Vec<String>,
+    pub risk: ToolRiskLevel,
+    pub permission_mode: ToolPermissionMode,
+    pub permission_summary: String,
+    pub path_scope_policy: PathScopePolicy,
+    pub plan_target_mode: PlanTargetMode,
+    pub plan_target_source: PlanTargetSource,
+    pub execution_mode: OperationExecutionMode,
+    pub isolation: IsolationContract,
+    pub hard_deny_rules: Vec<String>,
+    pub needs_workspace: bool,
+    pub read_only: bool,
+    pub usage_constraints: KernelToolUsageConstraintsRef,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KernelToolCatalogSnapshotRef {
+    pub catalog_version: String,
+    pub catalog_hash: String,
+    pub tools: Vec<KernelToolCatalogEntryRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct KernelStateContract {
+    pub kernel_abi_version: String,
     pub run_id: RunId,
     pub state_id: String,
     pub state_kind: String,
@@ -23,7 +72,7 @@ pub struct KernelStateContract {
     #[serde(default)]
     pub tool_catalog_hash: Option<String>,
     #[serde(default)]
-    pub tool_catalog_snapshot: Option<Value>,
+    pub tool_catalog_snapshot: Option<KernelToolCatalogSnapshotRef>,
     pub draft_admission_policy: DraftAdmissionPolicy,
     pub transition_predicates: Vec<String>,
     pub fail_closed_rules: Vec<String>,
@@ -32,17 +81,7 @@ pub struct KernelStateContract {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum DriverRequestKind {
-    NeedRequirementDraft,
-    NeedRequirementDecision,
-    NeedResourcePacket,
     NeedProposal,
-    NeedUserPlanDecision,
-    NeedUserPermissionDecision,
-    NeedRepairProposal,
-    NeedReviewPacket,
-    NeedUserReviewDecision,
-    WaitKernelExecution,
-    Terminal,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -88,15 +127,6 @@ pub struct ProposalEnvelope {
     pub referenced_resource_packet_refs: Vec<String>,
     pub referenced_evidence_refs: Vec<String>,
     pub parser_diagnostics: Option<Value>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UserDecisionSubmit {
-    pub decision_id: String,
-    pub decision_kind: String,
-    pub target_id: Option<String>,
-    pub payload: Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

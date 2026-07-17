@@ -15,11 +15,9 @@ export interface DefaultActionBundleUserPlanMarkdownInput {
 }
 
 export interface ExecutionPromptCoordinatorPorts<TPlan> {
-  sideEffectToolIds: ReadonlySet<string>;
   objectRecord(value: unknown): Record<string, unknown> | undefined;
   stringValue(value: unknown): string | undefined;
   planId(plan: TPlan): string;
-  actionToolId(action: { toolId?: unknown }): string;
   isDetailedUserPlanMarkdown(userPlan: string | undefined): boolean;
   defaultActionBundleUserPlanMarkdown(input: DefaultActionBundleUserPlanMarkdownInput): string;
   expectationsHaveDescription(value: unknown): boolean;
@@ -40,8 +38,6 @@ export class ExecutionPromptCoordinator<TPlan> {
     const actions = Array.isArray(bundle.actions)
       ? bundle.actions.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object' && !Array.isArray(item))
       : [];
-    const sideEffectful = actions.some((action) => this.ports.sideEffectToolIds.has(this.ports.actionToolId(action)));
-    if (!sideEffectful) return;
     if (!Array.isArray(payload.contentBlocks)) {
       payload.contentBlocks = [];
     }

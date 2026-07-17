@@ -1,8 +1,9 @@
 use super::*;
 use deepcode_kernel_abi::{
-    PendingOperationCheckpoint, PENDING_OPERATION_CHECKPOINT_SCHEMA_VERSION,
+    PendingOperationCheckpoint, PermissionRequestedFact, PermissionResolutionFact,
+    PENDING_OPERATION_CHECKPOINT_SCHEMA_VERSION,
 };
-use deepcode_kernel_tools::{KernelExecutionContractV3, KernelExecutionOperationV3};
+use deepcode_kernel_tools::{KernelExecutionContract, KernelExecutionOperation};
 
 impl DeepCodeKernelRuntime {
     pub(crate) fn pending_permission_for_run(
@@ -16,90 +17,24 @@ impl DeepCodeKernelRuntime {
             .find(|(_, pending)| pending.run_id == run_id)
         {
             return Ok(Some(permission_envelope_from_pending(
+                self,
                 permission_id,
                 pending,
             )?));
         }
         let events = self.ledger.list_by_run(run_id)?;
-        let resolved = events
-            .iter()
-            .filter(|event| event.kind == "permission.resolved")
-            .filter_map(|event| event.payload.get("permissionId").and_then(Value::as_str))
-            .collect::<std::collections::BTreeSet<_>>();
-        let Some(event) = events.iter().rev().find(|event| {
-            event.kind == "permission.requested"
-                && event
-                    .payload
-                    .get("permissionId")
-                    .and_then(Value::as_str)
-                    .map(|id| !resolved.contains(id))
-                    .unwrap_or(false)
-        }) else {
+        let resolved = resolved_permission_ids(&events)?;
+        let Some((_, fact)) = latest_pending_permission_fact(&events, &resolved)? else {
             return Ok(None);
         };
-        let required = |field: &str| {
-            event
-                .payload
-                .get(field)
-                .and_then(Value::as_str)
-                .filter(|value| !value.trim().is_empty())
-                .ok_or_else(|| {
-                    KernelError::PendingPermissionUnavailable(format!(
-                        "pending permission ledger event is missing {field}"
-                    ))
-                })
-        };
-        let permission_id = required("permissionId")?;
-        let tool_name = required("toolName")?;
-        let capability = required("capability")?;
-        let risk_level = required("riskLevel")?;
-        capability_for_tool(tool_name)?;
-        risk_for_tool(tool_name)?;
-        Ok(Some(deepcode_kernel_abi::PermissionRequestEnvelope {
-            id: permission_id.to_string(),
-            permission_bundle_id: event
-                .payload
-                .get("permissionBundleId")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            contract_id: event
-                .payload
-                .get("contractId")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            affected_operation_ids: event
-                .payload
-                .get("affectedOperationIds")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect(),
-            work_unit_ids: event
-                .payload
-                .get("workUnitIds")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect(),
-            tool_id: Some(tool_name.to_string()),
-            capability: capability.to_string(),
-            risk_level: risk_level.to_string(),
-            summary: event
-                .payload
-                .get("summary")
-                .and_then(Value::as_str)
-                .unwrap_or("Permission requested by Kernel.")
-                .to_string(),
-            args_preview: event
-                .payload
-                .get("argsPreview")
-                .cloned()
-                .unwrap_or(Value::Null),
-        }))
+        let tool_id = fact.request.tool_id.as_deref().ok_or_else(|| {
+            KernelError::PendingPermissionUnavailable(
+                "pending permission fact has no toolId".to_string(),
+            )
+        })?;
+        self.capability_for_tool(tool_id)?;
+        self.risk_for_tool(tool_id)?;
+        Ok(Some(fact.request))
     }
 
     pub(crate) fn ensure_permission_restored(&mut self, permission_id: &str) -> KernelResult<()> {
@@ -107,17 +42,19 @@ impl DeepCodeKernelRuntime {
             return Ok(());
         }
         let events = self.ledger.list_all()?;
-        let already_resolved = events.iter().any(|event| {
-            event.kind == "permission.resolved"
-                && event.payload.get("permissionId").and_then(Value::as_str) == Some(permission_id)
-        });
+        let already_resolved = resolved_permission_ids(&events)?.contains(permission_id);
         if already_resolved {
             return Ok(());
         }
-        let Some(requested) = events.iter().rev().find(|event| {
-            event.kind == "permission.requested"
-                && event.payload.get("permissionId").and_then(Value::as_str) == Some(permission_id)
-        }) else {
+        let requested = events
+            .iter()
+            .rev()
+            .filter(|event| event.kind == "permission.requested")
+            .map(|event| Ok((event, decode_permission_request(event)?)))
+            .collect::<KernelResult<Vec<_>>>()?
+            .into_iter()
+            .find(|(_, fact)| fact.request.id == permission_id);
+        let Some((requested, _)) = requested else {
             return Ok(());
         };
         let Some(run_id) = requested.run_id.clone() else {
@@ -140,35 +77,12 @@ impl DeepCodeKernelRuntime {
         run_id: &str,
     ) -> KernelResult<Option<(String, PendingKernelTool)>> {
         let events = self.ledger.list_by_run(run_id)?;
-        let resolved = events
-            .iter()
-            .filter(|event| event.kind == "permission.resolved")
-            .filter_map(|event| event.payload.get("permissionId").and_then(Value::as_str))
-            .collect::<std::collections::BTreeSet<_>>();
-        let Some(requested) = events.iter().rev().find(|event| {
-            event.kind == "permission.requested"
-                && event
-                    .payload
-                    .get("permissionId")
-                    .and_then(Value::as_str)
-                    .map(|id| !resolved.contains(id))
-                    .unwrap_or(false)
-        }) else {
+        let resolved = resolved_permission_ids(&events)?;
+        let Some((requested, requested_fact)) = latest_pending_permission_fact(&events, &resolved)?
+        else {
             return Ok(None);
         };
-        let checkpoint: PendingOperationCheckpoint =
-            serde_json::from_value(requested.payload.get("checkpoint").cloned().ok_or_else(
-                || {
-                    KernelError::PendingPermissionUnavailable(
-                        "pending permission has no typed operation checkpoint".to_string(),
-                    )
-                },
-            )?)
-            .map_err(|error| {
-                KernelError::PendingPermissionUnavailable(format!(
-                    "decode pending operation checkpoint: {error}"
-                ))
-            })?;
+        let checkpoint: PendingOperationCheckpoint = requested_fact.checkpoint;
         if checkpoint.schema_version != PENDING_OPERATION_CHECKPOINT_SCHEMA_VERSION {
             return Err(KernelError::PendingPermissionUnavailable(format!(
                 "unsupported pending operation checkpoint schema {}",
@@ -210,7 +124,7 @@ impl DeepCodeKernelRuntime {
                 &checkpoint.plan_id,
                 &checkpoint_item.work_unit_id,
                 &checkpoint_item.operation_id,
-                operation_kind_for_tool(&operation.tool_id),
+                operation.operation_kind.wire_name(),
             );
             group_items.push(PendingKernelToolItem {
                 tool_call_id: checkpoint_item.tool_call_id.clone(),
@@ -220,7 +134,7 @@ impl DeepCodeKernelRuntime {
                 work_unit_id: Some(checkpoint_item.work_unit_id.clone()),
                 action_id: Some(checkpoint_item.operation_id.clone()),
                 plan_id: Some(checkpoint.plan_id.clone()),
-                operation_kind: Some(operation_kind_for_tool(&operation.tool_id).to_string()),
+                operation_kind: operation.operation_kind,
                 read_set: operation.read_set.clone(),
                 write_set: operation.write_set.clone(),
             });
@@ -257,7 +171,7 @@ impl DeepCodeKernelRuntime {
                 work_unit_id: first.work_unit_id.clone(),
                 action_id: first.action_id.clone(),
                 plan_id: first.plan_id.clone(),
-                operation_kind: first.operation_kind.clone(),
+                operation_kind: first.operation_kind,
                 read_set: first.read_set.clone(),
                 write_set: first.write_set.clone(),
                 group_items,
@@ -266,10 +180,53 @@ impl DeepCodeKernelRuntime {
     }
 }
 
+fn resolved_permission_ids(
+    events: &[LedgerEvent],
+) -> KernelResult<std::collections::BTreeSet<String>> {
+    events
+        .iter()
+        .filter(|event| event.kind == "permission.resolved")
+        .map(|event| {
+            serde_json::from_value::<PermissionResolutionFact>(event.payload.clone())
+                .map(|fact| fact.permission_id)
+                .map_err(|error| {
+                    KernelError::PendingPermissionUnavailable(format!(
+                        "decode permission resolution fact: {error}"
+                    ))
+                })
+        })
+        .collect()
+}
+
+fn latest_pending_permission_fact<'a>(
+    events: &'a [LedgerEvent],
+    resolved: &std::collections::BTreeSet<String>,
+) -> KernelResult<Option<(&'a LedgerEvent, PermissionRequestedFact)>> {
+    for event in events
+        .iter()
+        .rev()
+        .filter(|event| event.kind == "permission.requested")
+    {
+        let fact = decode_permission_request(event)?;
+        if !resolved.contains(&fact.request.id) {
+            return Ok(Some((event, fact)));
+        }
+    }
+    Ok(None)
+}
+
+fn decode_permission_request(event: &LedgerEvent) -> KernelResult<PermissionRequestedFact> {
+    serde_json::from_value(event.payload.clone()).map_err(|error| {
+        KernelError::PendingPermissionUnavailable(format!(
+            "decode permission request fact: {error}"
+        ))
+    })
+}
+
 fn execution_contract_from_ledger(
     events: &[LedgerEvent],
     contract_id: &str,
-) -> KernelResult<KernelExecutionContractV3> {
+) -> KernelResult<KernelExecutionContract> {
     events
         .iter()
         .rev()
@@ -299,7 +256,7 @@ fn execution_contract_from_ledger(
 fn restore_operation_arguments(
     events: &[LedgerEvent],
     contract_id: &str,
-    operation: &KernelExecutionOperationV3,
+    operation: &KernelExecutionOperation,
 ) -> KernelResult<Value> {
     let mut arguments = operation.args.clone();
     if let Some(block_id) = operation.args.get("contentBlockId").and_then(Value::as_str) {
@@ -326,7 +283,10 @@ fn restore_operation_arguments(
             object.insert("replacement".to_string(), Value::String(replacement));
         }
     }
-    if operation.tool_id == "web.search" || operation.tool_id == "web.fetch" {
+    if matches!(
+        operation.operation_kind,
+        ToolOperationKind::WebSearch | ToolOperationKind::WebFetch
+    ) {
         let reviewed_target = events
             .iter()
             .rev()
@@ -404,27 +364,4 @@ fn restore_artifact_block(
     Err(KernelError::PendingPermissionUnavailable(format!(
         "DraftLedger content is unavailable for execution block {block_id}"
     )))
-}
-
-fn operation_kind_for_tool(tool_id: &str) -> &'static str {
-    match tool_id {
-        "fs.read" => "read",
-        "fs.list" => "list",
-        "fs.glob" => "glob",
-        "code.grep" => "search",
-        "fs.diff" => "diff",
-        "fs.create" => "create",
-        "fs.write" => "write",
-        "fs.edit" => "edit",
-        "fs.rename" => "rename",
-        "fs.delete" => "delete",
-        "fs.ensure_directory" => "ensureDirectory",
-        "document.read" => "documentRead",
-        tool if tool.starts_with("git.") => "git",
-        tool if tool.starts_with("web.") => "network",
-        "process.exec" => "exec",
-        tool if tool.starts_with("browser.") => "browser",
-        "provider.call" => "provider",
-        _ => "tool",
-    }
 }

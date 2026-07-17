@@ -13,8 +13,6 @@ pub struct KernelErrorEnvelope {
 
 #[derive(Debug, Error)]
 pub enum KernelError {
-    #[error("not implemented: {0}")]
-    NotImplemented(&'static str),
     #[error("invalid command: {0}")]
     InvalidCommand(String),
     #[error("workspace binding is required")]
@@ -45,7 +43,6 @@ pub type KernelResult<T> = Result<T, KernelError>;
 impl From<&KernelError> for KernelErrorEnvelope {
     fn from(value: &KernelError) -> Self {
         let code = match value {
-            KernelError::NotImplemented(_) => "not_implemented",
             KernelError::InvalidCommand(_) => "invalid_command",
             KernelError::MissingWorkspaceBinding => "workspace_binding_required",
             KernelError::WorkspaceAccessDenied(_) => "workspace_access_denied",

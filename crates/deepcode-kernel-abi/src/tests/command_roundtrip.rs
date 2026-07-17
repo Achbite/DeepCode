@@ -79,7 +79,7 @@ fn driver_loop_commands_round_trip() {
 
     let command = KernelCommand::ResourceResolve {
         request_id: RequestId("req-resource".to_string()),
-        run_id: Some(RunId("run-1".to_string())),
+        run_id: RunId("run-1".to_string()),
         session_id: Some(SessionId("session-1".to_string())),
         request: ResourceResolveRequest {
             manifest: serde_json::json!({
@@ -93,23 +93,6 @@ fn driver_loop_commands_round_trip() {
     assert_eq!(encoded["request"]["manifest"]["id"], "manifest-1");
     let decoded: KernelCommand =
         serde_json::from_value(encoded).expect("deserialize resource resolve");
-    assert_eq!(decoded, command);
-
-    let command = KernelCommand::UserDecisionSubmit {
-        request_id: RequestId("req-decision".to_string()),
-        run_id: RunId("run-1".to_string()),
-        session_id: Some(SessionId("session-1".to_string())),
-        decision: UserDecisionSubmit {
-            decision_id: "decision-1".to_string(),
-            decision_kind: "accepted".to_string(),
-            target_id: Some(proposal.proposal_id),
-            payload: serde_json::json!({}),
-        },
-    };
-    let encoded = serde_json::to_value(&command).expect("serialize user decision");
-    assert_eq!(encoded["kind"], "userDecisionSubmit");
-    let decoded: KernelCommand =
-        serde_json::from_value(encoded).expect("deserialize user decision");
     assert_eq!(decoded, command);
 
     let command = KernelCommand::DraftLedgerSubmit {
@@ -144,12 +127,12 @@ fn driver_loop_commands_round_trip() {
 
 #[test]
 fn host_resource_and_execution_contract_decision_round_trip() {
-    let binding_command = KernelCommand::WorkspaceBindingResolve {
+    let binding_command = KernelCommand::HostWorkspaceBindingResolve {
         request_id: RequestId("req-binding".to_string()),
         path: "workspace-root".to_string(),
     };
     let encoded = serde_json::to_value(&binding_command).expect("serialize binding resolve");
-    assert_eq!(encoded["kind"], "workspaceBindingResolve");
+    assert_eq!(encoded["kind"], "hostWorkspaceBindingResolve");
     assert_eq!(encoded["path"], "workspace-root");
     let decoded: KernelCommand =
         serde_json::from_value(encoded).expect("deserialize binding resolve");

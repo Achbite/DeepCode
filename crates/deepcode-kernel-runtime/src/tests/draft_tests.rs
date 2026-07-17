@@ -1,4 +1,5 @@
 use super::*;
+use deepcode_kernel_abi::ArtifactEditMatch;
 
 #[test]
 fn artifact_draft_ledger_validates_sequence_hash_and_terminal_state() {
@@ -38,7 +39,7 @@ fn artifact_draft_ledger_validates_sequence_hash_and_terminal_state() {
         &["second"],
         true,
     );
-    bad_hash["contentHash"] = Value::String("fnv1a64:0000000000000000".to_string());
+    bad_hash.base_mut().content_hash = "fnv1a64:0000000000000000".to_string();
     let hash_error = submit_artifact_draft(&mut runtime, "draft-bad-hash", bad_hash)
         .expect_err("mismatched hash fails");
     assert!(hash_error
@@ -168,11 +169,15 @@ fn artifact_draft_edit_match_hash_vectors_match_session_protocol() {
         vec!["replacement".to_string()],
         true,
     );
-    exact["editMatch"] = serde_json::json!({
-        "kind": "exactBlock",
-        "targetLines": ["beta"]
-    });
-    exact["contentHash"] = Value::String("fnv1a64:6cc00e4f2c73ebd1".to_string());
+    if let ArtifactDraftLedgerFrame::ArtifactChunk {
+        base, edit_match, ..
+    } = &mut exact
+    {
+        *edit_match = Some(ArtifactEditMatch::ExactBlock {
+            target_lines: vec!["beta".to_string()],
+        });
+        base.content_hash = "fnv1a64:6cc00e4f2c73ebd1".to_string();
+    }
     submit_artifact_draft(&mut runtime, "draft-edit-exact", exact)
         .expect("exact editMatch hash matches the Session protocol vector");
 
@@ -183,14 +188,19 @@ fn artifact_draft_edit_match_hash_vectors_match_session_protocol() {
         vec!["replacement".to_string()],
         true,
     );
-    line_range["editMatch"] = serde_json::json!({
-        "kind": "lineRange",
-        "startLine": 2,
-        "endLine": 2,
-        "expectedBeforeLines": ["beta"],
-        "expectedBeforeText": "beta\n"
-    });
-    line_range["contentHash"] = Value::String("fnv1a64:d21b3d8f9280a0fa".to_string());
+    if let ArtifactDraftLedgerFrame::ArtifactChunk {
+        base, edit_match, ..
+    } = &mut line_range
+    {
+        *edit_match = Some(ArtifactEditMatch::LineRange {
+            start_line: 2,
+            end_line: 2,
+            expected_file_hash: None,
+            expected_before_lines: Some(vec!["beta".to_string()]),
+            expected_before_text: Some("beta\n".to_string()),
+        });
+        base.content_hash = "fnv1a64:d21b3d8f9280a0fa".to_string();
+    }
     submit_artifact_draft(&mut runtime, "draft-edit-line", line_range)
         .expect("line-range editMatch hash matches the Session protocol vector");
 }

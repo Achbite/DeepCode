@@ -25,32 +25,8 @@ impl Capability {
         Self::new("workspace.read")
     }
 
-    pub fn workspace_preview_diff() -> Self {
-        Self::new("workspace.read")
-    }
-
     pub fn workspace_write() -> Self {
         Self::new("workspace.write")
-    }
-
-    pub fn workspace_create() -> Self {
-        Self::new("workspace.write")
-    }
-
-    pub fn workspace_delete() -> Self {
-        Self::new("workspace.write")
-    }
-
-    pub fn workspace_rename() -> Self {
-        Self::new("workspace.write")
-    }
-
-    pub fn workspace_list() -> Self {
-        Self::new("fs.list")
-    }
-
-    pub fn workspace_search() -> Self {
-        Self::new("code.grep")
     }
 
     pub fn git_read() -> Self {
@@ -208,15 +184,6 @@ impl ResourceScope {
         }
     }
 
-    pub fn matches_request(&self, request: &ResourceScope) -> bool {
-        self.kind == request.kind
-            && self
-                .path
-                .as_deref()
-                .map(|path| request.path.as_deref() == Some(path))
-                .unwrap_or(true)
-    }
-
     pub fn is_workspace_config_asset(&self) -> bool {
         self.kind == ResourceScopeKind::WorkspaceConfigAsset
             || self
@@ -267,18 +234,6 @@ impl RiskBudget {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct TemporaryGrant {
-    pub id: String,
-    pub run_id: String,
-    pub capability: Capability,
-    pub resource_scope: ResourceScope,
-    pub decision: PolicyDecisionKind,
-    pub expires_after_sequence: Option<u64>,
-    pub reason: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub enum EffectSurface {
     Workspace,
     DeepcodeConfig,
@@ -319,7 +274,7 @@ pub enum OutsideWorkspace {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum HardFloor {
-    RecursiveSystemDelete,
+    UnboundedSystemMutation,
     OutsideWorkspaceWrite,
     SecretExposure,
     KernelModifyWithoutMaintainer,
@@ -365,7 +320,6 @@ pub struct PolicyProfile {
     pub grants: BTreeMap<String, PolicyGrant>,
     pub rules: Vec<Value>,
     pub risk_budget: RiskBudget,
-    pub temporary_grants: Vec<TemporaryGrant>,
     pub execution_environment: ExecutionEnvironmentPolicy,
 }
 
@@ -378,7 +332,6 @@ impl PolicyProfile {
             grants: BTreeMap::new(),
             rules: Vec::new(),
             risk_budget: RiskBudget::developer(),
-            temporary_grants: Vec::new(),
             execution_environment: ExecutionEnvironmentPolicy::linux_default(),
         }
     }
@@ -387,13 +340,7 @@ impl PolicyProfile {
         let mut profile = Self::new("safe", PolicyDecisionKind::Deny);
         profile.autonomy_level = AutonomyLevel::Safe;
         profile.risk_budget = RiskBudget::safe();
-        for capability in [
-            Capability::workspace_read(),
-            Capability::workspace_list(),
-            Capability::workspace_search(),
-            Capability::workspace_preview_diff(),
-            Capability::git_read(),
-        ] {
+        for capability in [Capability::workspace_read(), Capability::git_read()] {
             profile
                 .grant(PolicyGrant {
                     capability,
@@ -405,8 +352,6 @@ impl PolicyProfile {
         }
         for capability in [
             Capability::workspace_write(),
-            Capability::workspace_create(),
-            Capability::workspace_delete(),
             Capability::process_exec(),
             Capability::git_write(),
             Capability::git_push(),
@@ -432,14 +377,6 @@ impl PolicyProfile {
                 decision: PolicyDecisionKind::Allow,
                 source: PolicySourceTrust::Kernel,
                 reason: Some("builtin read capability".to_string()),
-            })
-            .expect("kernel grant");
-        profile
-            .grant(PolicyGrant {
-                capability: Capability::workspace_preview_diff(),
-                decision: PolicyDecisionKind::Allow,
-                source: PolicySourceTrust::Kernel,
-                reason: Some("builtin diff preview capability".to_string()),
             })
             .expect("kernel grant");
         profile
@@ -484,11 +421,7 @@ impl PolicyProfile {
         profile.autonomy_level = AutonomyLevel::Trusted;
         for capability in [
             Capability::workspace_read(),
-            Capability::workspace_list(),
-            Capability::workspace_search(),
-            Capability::workspace_preview_diff(),
             Capability::workspace_write(),
-            Capability::workspace_rename(),
             Capability::git_read(),
         ] {
             profile
@@ -543,19 +476,6 @@ impl PolicyProfile {
             ));
         }
         self.grants.insert(grant.capability.0.clone(), grant);
-        Ok(())
-    }
-
-    pub fn grant_temporary(&mut self, grant: TemporaryGrant) -> KernelResult<()> {
-        if grant.decision == PolicyDecisionKind::Allow
-            && grant.resource_scope.kind == ResourceScopeKind::Kernel
-            && self.autonomy_level != AutonomyLevel::MaintainerRoot
-        {
-            return Err(KernelError::PermissionDenied(
-                "kernel.modify temporary grants require maintainer/root autonomy".to_string(),
-            ));
-        }
-        self.temporary_grants.push(grant);
         Ok(())
     }
 }
@@ -640,21 +560,6 @@ impl PermissionGate for DefaultPermissionGate {
             });
         }
 
-        if let Some(temporary) = matching_temporary_grant(profile, request) {
-            return Ok(PolicyDecision {
-                request: if temporary.decision == PolicyDecisionKind::Ask {
-                    Some(request.clone())
-                } else {
-                    None
-                },
-                decision: temporary.decision.clone(),
-                reason: temporary
-                    .reason
-                    .clone()
-                    .or_else(|| Some(format!("temporary grant {}", temporary.id))),
-            });
-        }
-
         if let Some(hard_floor) = hard_floor {
             return Ok(PolicyDecision {
                 decision: PolicyDecisionKind::Deny,
@@ -710,36 +615,18 @@ fn detect_hard_floor(profile: &PolicyProfile, request: &PermissionRequest) -> Op
         return Some(HardFloor::OutsideWorkspaceWrite);
     }
 
-    if request.capability == Capability::workspace_delete()
+    if request.capability == Capability::workspace_write()
         && (request.impact.effect_surface == EffectSurface::SystemPath
             || request.impact.batch_size == BatchSize::Unbounded)
     {
-        return Some(HardFloor::RecursiveSystemDelete);
+        return Some(HardFloor::UnboundedSystemMutation);
     }
 
     None
 }
 
-fn matching_temporary_grant<'a>(
-    profile: &'a PolicyProfile,
-    request: &PermissionRequest,
-) -> Option<&'a TemporaryGrant> {
-    profile.temporary_grants.iter().find(|grant| {
-        request.run_id.as_deref() == Some(grant.run_id.as_str())
-            && request.capability == grant.capability
-            && request
-                .resource_scope
-                .as_ref()
-                .map(|scope| grant.resource_scope.matches_request(scope))
-                .unwrap_or(false)
-    })
-}
-
 fn is_workspace_file_mutation(capability: &Capability) -> bool {
     capability == &Capability::workspace_write()
-        || capability == &Capability::workspace_create()
-        || capability == &Capability::workspace_delete()
-        || capability == &Capability::workspace_rename()
 }
 
 fn resource_is_protected_config_asset(request: &PermissionRequest) -> bool {

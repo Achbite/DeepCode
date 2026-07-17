@@ -25,6 +25,7 @@ export interface HealthStatus {
   version?: string;
   timestamp?: string;
   buildCommit?: string;
+  kernelAbiVersion?: string;
   protocolVersion?: string;
   toolCatalogVersion?: string;
   toolCatalogCount?: number;

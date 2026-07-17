@@ -65,6 +65,7 @@ impl DeepCodeKernelRuntime {
         if proposal.kind == ProposalEnvelopeKind::ActionBundle {
             let outcome = proposal_action_bundle_review_report(
                 &proposal,
+                self.tool_registry,
                 &self.tool_runtime_config,
                 record.has_workspace_execution_context(),
             );
@@ -75,7 +76,6 @@ impl DeepCodeKernelRuntime {
                 &proposal,
                 &mut report,
             )?;
-            let report_value = serde_json::to_value(&report).unwrap_or(serde_json::Value::Null);
             for review in outcome.network_targets {
                 let target_sequence = self.ledger.next_sequence(&run_id.0)?;
                 self.append_ledger(
@@ -92,21 +92,14 @@ impl DeepCodeKernelRuntime {
                     }),
                 )?;
             }
-            if let Some(contract) = report_value
-                .get("executionContract")
-                .and_then(serde_json::Value::as_object)
-            {
-                if let Some(contract_id) = contract.get("id").and_then(serde_json::Value::as_str) {
-                    self.state
-                        .execution_contracts_by_run
-                        .entry(run_id.0.clone())
-                        .or_default()
-                        .insert(
-                            contract_id.to_string(),
-                            serde_json::Value::Object(contract.clone()),
-                        );
-                }
-            }
+            self.state
+                .execution_contracts_by_run
+                .entry(run_id.0.clone())
+                .or_default()
+                .insert(
+                    report.execution_contract.id.clone(),
+                    report.execution_contract.clone(),
+                );
             let report_session_id = events
                 .iter()
                 .find_map(|event| {
@@ -127,7 +120,7 @@ impl DeepCodeKernelRuntime {
                     "summary": format!("Kernel reviewed {} normalized operation(s).", report.execution_contract.operations.len()),
                     "proposalId": &proposal.proposal_id,
                     "status": report.status,
-                    "report": &report_value
+                    "report": &report
                 }),
             )?;
             events.push(KernelEvent::ProposalReviewed {
@@ -135,61 +128,12 @@ impl DeepCodeKernelRuntime {
                 run_id,
                 session_id: Some(SessionId(report_session_id)),
                 proposal_id: proposal.proposal_id,
-                report: report_value,
+                report,
                 sequence: Some(review_sequence),
             });
         }
 
         Ok(events)
-    }
-
-    pub(crate) fn user_decision_submit(
-        &mut self,
-        request_id: RequestId,
-        run_id: RunId,
-        session_id: Option<SessionId>,
-        decision: UserDecisionSubmit,
-    ) -> KernelResult<Vec<KernelEvent>> {
-        let record = self.record_by_run(&run_id.0)?;
-        let session_id = session_id
-            .map(|value| value.0)
-            .unwrap_or_else(|| record.session_id.clone());
-        let sequence = self.ledger.next_sequence(&run_id.0)?;
-        self.append_ledger(
-            &run_id.0,
-            &session_id,
-            "user_decision.submitted",
-            sequence,
-            serde_json::json!({
-                "summary": "User decision recorded for DriverLoop.",
-                "decision": &decision
-            }),
-        )?;
-        let contract = self.state_contract_for_record(&record);
-        let driver_request = self.driver_request_for_contract(
-            &contract,
-            Some(SessionId(session_id.clone())),
-            DriverRequestKind::NeedProposal,
-            "Session should continue after the recorded user decision.",
-        );
-        let driver_sequence = self.ledger.next_sequence(&run_id.0)?;
-        self.append_ledger(
-            &run_id.0,
-            &session_id,
-            "driver.request_produced",
-            driver_sequence,
-            serde_json::json!({
-                "summary": "DriverRequest produced after user decision.",
-                "driverRequest": &driver_request
-            }),
-        )?;
-        Ok(vec![KernelEvent::DriverRequestProduced {
-            request_id: Some(request_id),
-            run_id,
-            session_id: Some(SessionId(session_id)),
-            driver_request,
-            sequence: Some(driver_sequence),
-        }])
     }
 
     pub(crate) fn run_cancel(

@@ -22,6 +22,7 @@ from typing import Any, Iterator
 
 PROTOCOL_VERSION = "deepcode.agent.protocol.v4"
 CATALOG_VERSION = "deepcode.kernel.tools.v3"
+KERNEL_ABI_VERSION = "deepcode.kernel.abi.v1"
 DRAFT_SCHEMA_VERSION = "deepcode.agent.artifact-draft.v1"
 TASK_INTENT_SCHEMA_VERSION = "deepcode.kernel.task-intent.v2"
 
@@ -38,6 +39,11 @@ def parse_args() -> argparse.Namespace:
         "--cli-bin",
         type=pathlib.Path,
         default=root / "target/debug/deepcode-cli",
+    )
+    parser.add_argument(
+        "--tui-bin",
+        type=pathlib.Path,
+        default=root / "target/debug/deepcode-tui",
     )
     parser.add_argument(
         "--cases",
@@ -86,6 +92,7 @@ def kernel_command(api: str, command: dict[str, Any]) -> dict[str, Any]:
     reply = request_json(f"{api}/api/kernel/commands", {"command": command})
     if not reply.get("ok"):
         raise RuntimeError(f"Kernel command failed: {reply.get('error')}")
+    assert_canonical_kernel_events(reply)
     return reply
 
 
@@ -98,6 +105,45 @@ def event(reply: dict[str, Any], kind: str) -> dict[str, Any]:
 
 def events(reply: dict[str, Any], kind: str) -> list[dict[str, Any]]:
     return [item for item in reply.get("events", []) if item.get("kind") == kind]
+
+
+def assert_canonical_kernel_events(reply: dict[str, Any]) -> None:
+    for item in reply.get("events", []):
+        kind = item.get("kind")
+        if kind == "tool.completed":
+            legacy_fields = {
+                "toolCallId",
+                "toolName",
+                "toolId",
+                "operationKind",
+                "ok",
+                "output",
+                "error",
+            }.intersection(item)
+            if legacy_fields:
+                raise RuntimeError(
+                    f"tool.completed contains legacy flat fields {sorted(legacy_fields)}: {item}"
+                )
+            fact = item.get("fact")
+            required = {
+                "toolCallId",
+                "toolId",
+                "operationKind",
+                "ok",
+                "output",
+                "error",
+            }
+            if not isinstance(fact, dict) or not required.issubset(fact):
+                raise RuntimeError(f"tool.completed is not a canonical ABI v1 fact: {item}")
+        elif kind == "permission.requested":
+            request = item.get("request")
+            if not isinstance(request, dict) or request.get("requestKind") not in {
+                "runtimePermission",
+                "scopeExpansion",
+            }:
+                raise RuntimeError(
+                    f"permission.requested is missing its canonical requestKind: {item}"
+                )
 
 
 class EvidenceHandler(http.server.BaseHTTPRequestHandler):
@@ -277,11 +323,14 @@ def run_create(
 def verify_health(api: str) -> dict[str, Any]:
     health = request_json(f"{api}/api/health")
     data = health.get("data", health)
+    if data.get("kernelAbiVersion") != KERNEL_ABI_VERSION:
+        raise RuntimeError(f"unexpected Kernel ABI: {data}")
     if data.get("protocolVersion") != PROTOCOL_VERSION:
         raise RuntimeError(f"unexpected Agent Protocol: {data}")
     if data.get("toolCatalogVersion") != CATALOG_VERSION:
         raise RuntimeError(f"unexpected Tool Catalog: {data}")
     return {
+        "kernelAbiVersion": data.get("kernelAbiVersion"),
         "protocolVersion": data.get("protocolVersion"),
         "toolCatalogVersion": data.get("toolCatalogVersion"),
         "toolCatalogHash": data.get("toolCatalogHash"),
@@ -328,6 +377,41 @@ def verify_cli_matrix(
         "total": result.get("total"),
         "passed": result.get("passed"),
         "coveragePassed": result.get("coveragePassed"),
+    }
+
+
+def verify_tui_smoke(
+    tui_bin: pathlib.Path,
+    api: str,
+    workspace: pathlib.Path,
+) -> dict[str, Any]:
+    completed = subprocess.run(
+        [
+            str(tui_bin),
+            "--smoke",
+            "--api",
+            api,
+            "--no-auto-start-kernel",
+            "--workspace",
+            str(workspace),
+        ],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"TUI daemon smoke failed: {completed.stderr.strip()}\n{completed.stdout}"
+        )
+    if "DeepCode TUI" not in completed.stdout or "不可用" in completed.stdout:
+        raise RuntimeError(f"TUI smoke did not render a connected host shell: {completed.stdout}")
+    if str(workspace) not in completed.stdout:
+        raise RuntimeError(f"TUI smoke lost its workspace binding: {completed.stdout}")
+    return {
+        "connected": True,
+        "workspaceBound": True,
+        "outputBytes": len(completed.stdout.encode("utf-8")),
     }
 
 
@@ -408,7 +492,7 @@ def verify_host_bridge(api: str, workspace: pathlib.Path) -> dict[str, Any]:
     kernel_command(
         api,
         {
-            "kind": "workspaceOpen",
+            "kind": "hostWorkspaceOpen",
             "requestId": random_id("workspace-open"),
             "path": str(workspace),
         },
@@ -429,6 +513,8 @@ def verify_host_bridge(api: str, workspace: pathlib.Path) -> dict[str, Any]:
     result = inspection["result"]
     if result.get("source") != "hostProjection":
         raise RuntimeError(f"Host query has unexpected source: {result}")
+    if result.get("output", {}).get("kind") != "read":
+        raise RuntimeError(f"Host query has unexpected typed output: {result}")
     if events(reply, "tool.completed"):
         raise RuntimeError("Host projection query emitted Agent ToolCompleted facts")
 
@@ -452,7 +538,57 @@ def verify_host_bridge(api: str, workspace: pathlib.Path) -> dict[str, Any]:
         raise RuntimeError("Retired Host file-read route is still live")
     return {
         "source": transport_result.get("source"),
-        "queryKind": transport_result.get("queryKind"),
+        "outputKind": transport_result.get("output", {}).get("kind"),
+    }
+
+
+def verify_mixed_resource_packet(
+    api: str,
+    workspace: pathlib.Path,
+) -> dict[str, Any]:
+    existing = workspace / f"{random_id('resource-present')}.txt"
+    missing = workspace / f"{random_id('resource-missing')}.txt"
+    existing.write_text("resource fact\n", encoding="utf-8")
+    session_id = random_id("resource-session")
+    run_id, _ = run_create(api, workspace, session_id)
+    reply = kernel_command(
+        api,
+        {
+            "kind": "resourceResolve",
+            "requestId": random_id("resource-resolve"),
+            "runId": run_id,
+            "sessionId": session_id,
+            "request": {
+                "manifest": {
+                    "id": random_id("manifest"),
+                    "workspaceScopeKey": random_id("scope"),
+                    "entries": [
+                        {
+                            "id": random_id("entry-present"),
+                            "kind": "file",
+                            "path": existing.name,
+                        },
+                        {
+                            "id": random_id("entry-missing"),
+                            "kind": "file",
+                            "path": missing.name,
+                        },
+                    ],
+                }
+            },
+        },
+    )
+    packet = event(reply, "resource.packet_produced")["packet"]
+    statuses = [item.get("status") for item in packet.get("items", [])]
+    if statuses != ["resolved", "notFound"]:
+        raise RuntimeError(f"Mixed ResourcePacket lost per-item status: {packet}")
+    if packet["items"][0].get("content") != "resource fact\n":
+        raise RuntimeError(f"Resolved ResourcePacket item lost its content: {packet}")
+    if packet["items"][1].get("content") is not None:
+        raise RuntimeError(f"notFound ResourcePacket item carried content: {packet}")
+    return {
+        "commandOk": True,
+        "statuses": statuses,
     }
 
 
@@ -744,6 +880,7 @@ def submit_tool_actions(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     bundle_id = random_id("bundle")
     action_bundle = {
+        "version": "1",
         "id": bundle_id,
         "goal": "Verify an exact multi-operation Kernel execution contract.",
         "actions": actions,
@@ -877,7 +1014,14 @@ def verify_mixed_delete_and_atomic_preflight(
     if events(completed, "permission.requested"):
         raise RuntimeError(f"Mixed delete requested permission after Plan acceptance: {completed}")
     tool_events = events(completed, "tool.completed")
-    if len([item for item in tool_events if item.get("toolName") == "fs.delete" and item.get("ok")]) != 3:
+    if len(
+        [
+            item
+            for item in tool_events
+            if item.get("fact", {}).get("toolId") == "fs.delete"
+            and item.get("fact", {}).get("ok") is True
+        ]
+    ) != 3:
         raise RuntimeError(f"Mixed delete did not complete every exact operation: {completed}")
     if any((workspace / target).exists() for target in targets):
         raise RuntimeError("Mixed delete left an accepted target behind")
@@ -1072,6 +1216,7 @@ def verify_restart_permission_resume(
         }
     ]
     action_bundle = {
+        "version": "1",
         "id": bundle_id,
         "goal": "Verify durable permission resume.",
         "actions": [
@@ -1136,7 +1281,14 @@ def verify_restart_permission_resume(
             },
         },
     )
-    permission = event(waiting, "permission.requested")["request"]
+    permission_events = events(waiting, "permission.requested")
+    if len(permission_events) != 1:
+        raise RuntimeError(
+            f"Scope expansion emitted {len(permission_events)} permission requests: {waiting}"
+        )
+    permission = permission_events[0]["request"]
+    if permission.get("requestKind") != "scopeExpansion":
+        raise RuntimeError(f"Scope expansion has the wrong request kind: {permission}")
     daemon.stop()
     daemon.start()
     resumed = kernel_command(
@@ -1148,9 +1300,12 @@ def verify_restart_permission_resume(
             "decision": "accept",
         },
     )
+    if events(resumed, "permission.requested"):
+        raise RuntimeError(f"Permission resume requested the same grant again: {resumed}")
     completed = events(resumed, "tool.completed")
     if not any(
-        item.get("toolName") == "fs.write" and item.get("ok") is True
+        item.get("fact", {}).get("toolId") == "fs.write"
+        and item.get("fact", {}).get("ok") is True
         for item in completed
     ):
         raise RuntimeError(f"Permission resume did not complete fs.write: {resumed}")
@@ -1170,6 +1325,8 @@ def verify_restart_permission_resume(
         raise RuntimeError(f"Resumed batch did not become review ready: {review_facts}")
     return {
         "permissionId": permission["id"],
+        "requestKind": permission["requestKind"],
+        "duplicateRequestsAfterResolve": 0,
         "toolCompleted": True,
         "batchReviewReady": True,
     }
@@ -1208,7 +1365,7 @@ def verify_provider(
 
 def main() -> int:
     args = parse_args()
-    for path in (args.daemon_bin, args.cli_bin, args.cases):
+    for path in (args.daemon_bin, args.cli_bin, args.tui_bin, args.cases):
         if not path.exists():
             raise SystemExit(f"required verification input does not exist: {path}")
     with tempfile.TemporaryDirectory(prefix="deepcode-kernel-cli-") as temporary:
@@ -1231,6 +1388,9 @@ def main() -> int:
                         args.cases.resolve(),
                         endpoint,
                     ),
+                    "tuiSmoke": verify_tui_smoke(
+                        args.tui_bin.resolve(), daemon.api, workspace
+                    ),
                     "symlinkBoundary": verify_symlink_boundary(
                         args.cli_bin.resolve(),
                         daemon.api,
@@ -1238,6 +1398,9 @@ def main() -> int:
                         external_root,
                     ),
                     "hostBridge": verify_host_bridge(daemon.api, workspace),
+                    "mixedResourcePacket": verify_mixed_resource_packet(
+                        daemon.api, workspace
+                    ),
                     "externalResourceLease": verify_external_resource_lease(
                         daemon.api, workspace, external_root
                     ),

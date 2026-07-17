@@ -16,7 +16,7 @@ pub(crate) struct FileQuery {
 pub(crate) async fn workspace_current(State(state): State<AppState>) -> Json<ApiResponse> {
     match dispatch_workspace(
         &state.runtime,
-        KernelCommand::WorkspaceCurrent {
+        KernelCommand::HostWorkspaceCurrent {
             request_id: rid("workspace-current"),
         },
     ) {
@@ -39,7 +39,7 @@ pub(crate) async fn workspace_open(
 ) -> Json<ApiResponse> {
     match dispatch_workspace(
         &state.runtime,
-        KernelCommand::WorkspaceOpen {
+        KernelCommand::HostWorkspaceOpen {
             request_id: rid("workspace-open"),
             path: body.path,
         },
@@ -53,68 +53,19 @@ pub(crate) async fn workspace_save_file(
     State(state): State<AppState>,
     Json(body): Json<Value>,
 ) -> Json<ApiResponse> {
-    let Ok(current) = current_workspace_json(&state.runtime) else {
-        return ApiResponse::error("no_workspace", "current workspace is missing");
-    };
-    let Some(workspace) = current.get("current").filter(|value| !value.is_null()) else {
-        return ApiResponse::error("no_workspace", "current workspace is missing");
-    };
-    let default_file_name = workspace
-        .get("name")
-        .and_then(Value::as_str)
-        .map(workspace_file_name_from_label)
-        .unwrap_or_else(|| "DeepCode.code-workspace".to_string());
-    let file_name = match normalize_workspace_file_name(
-        body.get("fileName")
-            .and_then(Value::as_str)
-            .unwrap_or(&default_file_name),
-    ) {
-        Ok(file_name) => file_name,
-        Err(message) => return ApiResponse::error("invalid_workspace_file_name", message),
-    };
-    let folder_path = workspace
-        .get("folders")
-        .and_then(Value::as_array)
-        .and_then(|folders| folders.first())
-        .and_then(|folder| folder.get("absolutePath"))
-        .or_else(|| {
-            workspace
-                .get("folders")
-                .and_then(Value::as_array)
-                .and_then(|folders| folders.first())
-                .and_then(|folder| folder.get("path"))
-        })
-        .and_then(Value::as_str)
-        .map(PathBuf::from);
-    let Some(folder_path) = folder_path else {
-        return ApiResponse::error("no_workspace_folder", "current workspace folder is missing");
-    };
-    let workspace_file_path = folder_path.join(&file_name);
-    let overwritten = workspace_file_path.exists();
-    let content = json!({
-        "folders": [{ "path": "." }],
-        "settings": workspace.get("settings").cloned().unwrap_or_else(|| json!({}))
-    });
-    if let Err(error) = atomic_write_json(&workspace_file_path, &content) {
-        return ApiResponse::error("write_workspace_file_failed", error);
-    }
-    let reopened = match dispatch_workspace(
+    match dispatch_workspace(
         &state.runtime,
-        KernelCommand::WorkspaceOpen {
-            request_id: rid("workspace-save-open"),
-            path: workspace_file_path.to_string_lossy().to_string(),
+        KernelCommand::HostWorkspaceSave {
+            request_id: rid("workspace-save"),
+            file_name: body
+                .get("fileName")
+                .and_then(Value::as_str)
+                .map(str::to_string),
         },
     ) {
-        Ok(output) => output,
-        Err(error) => return ApiResponse::error(error.code, error.message),
-    };
-    let workspace = reopened.get("workspace").cloned().unwrap_or(Value::Null);
-    ApiResponse::ok(json!({
-        "workspaceFilePath": workspace_file_path.to_string_lossy(),
-        "workspace": workspace,
-        "created": !overwritten,
-        "overwritten": overwritten
-    }))
+        Ok(output) => ApiResponse::ok(output),
+        Err(error) => ApiResponse::error(error.code, error.message),
+    }
 }
 
 pub(crate) async fn workspace_patch_settings(
@@ -147,22 +98,12 @@ pub(crate) async fn fs_initial_locations(State(state): State<AppState>) -> Json<
             "kind": "drive"
         }));
     }
-    if let Ok(current) = current_workspace_json(&state.runtime) {
+    if let Ok(current) = current_workspace(&state.runtime) {
         if let Some(path) = current
-            .get("current")
-            .and_then(|workspace| workspace.get("folders"))
-            .and_then(Value::as_array)
-            .and_then(|folders| folders.first())
-            .and_then(|folder| folder.get("absolutePath"))
-            .or_else(|| {
-                current
-                    .get("current")
-                    .and_then(|workspace| workspace.get("folders"))
-                    .and_then(Value::as_array)
-                    .and_then(|folders| folders.first())
-                    .and_then(|folder| folder.get("path"))
-            })
-            .and_then(Value::as_str)
+            .current
+            .as_ref()
+            .and_then(|workspace| workspace.folders.first())
+            .map(|folder| folder.absolute_path.as_str())
         {
             locations.push(json!({
                 "label": "Current Workspace",
@@ -181,14 +122,15 @@ pub(crate) async fn fs_browse(
     State(state): State<AppState>,
     Query(query): Query<FileQuery>,
 ) -> Json<ApiResponse> {
-    match dispatch_workspace(
+    match dispatch_host_inspection(
         &state.runtime,
-        KernelCommand::HostResourceQuery {
-            request_id: rid("host-browse"),
-            query: HostInspectionQuery::Browse { path: query.path },
-        },
+        HostInspectionQuery::Browse { path: query.path },
     ) {
-        Ok(output) => ApiResponse::ok(output),
+        Ok(HostInspectionResult {
+            output: HostInspectionOutput::Browse(output),
+            ..
+        }) => ApiResponse::ok(json!(output)),
+        Ok(_) => ApiResponse::error("unexpected_event", "expected browse host inspection result"),
         Err(error) => ApiResponse::error(error.code, error.message),
     }
 }
@@ -231,24 +173,21 @@ pub(crate) fn dispatch_workspace(
     runtime: &SharedRuntime,
     command: KernelCommand,
 ) -> Result<Value, KernelErrorEnvelope> {
+    let result = dispatch_workspace_result(runtime, command)?;
+    host_workspace_payload(result.output)
+}
+
+pub(crate) fn dispatch_workspace_result(
+    runtime: &SharedRuntime,
+    command: KernelCommand,
+) -> Result<HostWorkspaceResult, KernelErrorEnvelope> {
     let mut runtime = runtime.lock().expect("kernel runtime lock");
     let events = runtime
         .dispatch(command)
         .map_err(|error| KernelErrorEnvelope::from(&error))?;
     for event in events {
-        match event {
-            KernelEvent::ToolCompleted {
-                ok: true,
-                output: Some(output),
-                ..
-            } => return Ok(output),
-            KernelEvent::ToolCompleted {
-                ok: false,
-                error: Some(error),
-                ..
-            } => return Err(error),
-            KernelEvent::HostInspectionCompleted { result, .. } => return Ok(result.output),
-            _ => {}
+        if let KernelEvent::HostWorkspaceCompleted { result, .. } = event {
+            return Ok(result);
         }
     }
     Err(KernelErrorEnvelope {
@@ -259,13 +198,40 @@ pub(crate) fn dispatch_workspace(
     })
 }
 
-pub(crate) fn current_workspace_json(
+fn host_workspace_payload(output: HostWorkspaceOutput) -> Result<Value, KernelErrorEnvelope> {
+    match output {
+        HostWorkspaceOutput::BindingResolved(value) => encode_host_payload(value),
+        HostWorkspaceOutput::Opened(value) => encode_host_payload(value),
+        HostWorkspaceOutput::Current(value) => encode_host_payload(value),
+        HostWorkspaceOutput::Saved(value) => encode_host_payload(value),
+    }
+}
+
+fn encode_host_payload<T: serde::Serialize>(value: T) -> Result<Value, KernelErrorEnvelope> {
+    serde_json::to_value(value).map_err(|error| KernelErrorEnvelope {
+        code: "host_projection_encoding_failed".to_string(),
+        message: error.to_string(),
+        message_key: None,
+        args: None,
+    })
+}
+
+pub(crate) fn current_workspace(
     runtime: &SharedRuntime,
-) -> Result<Value, KernelErrorEnvelope> {
-    dispatch_workspace(
+) -> Result<HostWorkspaceCurrent, KernelErrorEnvelope> {
+    let result = dispatch_workspace_result(
         runtime,
-        KernelCommand::WorkspaceCurrent {
+        KernelCommand::HostWorkspaceCurrent {
             request_id: rid("workspace-current"),
         },
-    )
+    )?;
+    match result.output {
+        HostWorkspaceOutput::Current(current) => Ok(current),
+        _ => Err(KernelErrorEnvelope {
+            code: "unexpected_event".to_string(),
+            message: "expected current workspace result".to_string(),
+            message_key: None,
+            args: None,
+        }),
+    }
 }

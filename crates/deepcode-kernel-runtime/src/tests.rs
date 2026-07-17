@@ -1,10 +1,93 @@
 use super::*;
-use deepcode_kernel_abi::{PermissionDecisionKind, ProposalEnvelopeSource, TaskIntentTask};
+use deepcode_kernel_abi::{
+    ArtifactDraftBatchMetadata, ArtifactDraftFrameBase, ArtifactDraftLedgerFrame,
+    KernelActionBatch, KernelActionProposal, PermissionDecisionKind, ProposalEnvelopeSource,
+    ReviewGateDecision, ReviewGateDecisionKind, TaskIntentTask, ARTIFACT_DRAFT_SCHEMA_VERSION,
+};
 use std::collections::HashMap;
 use std::ops::Deref;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 
 static TEMP_INDEX: AtomicU64 = AtomicU64::new(0);
+
+struct PermissionResolutionFailingLedger {
+    inner: InMemoryEventLedger,
+    fail_permission_resolution: Arc<AtomicBool>,
+}
+
+struct EventKindFailingLedger {
+    inner: InMemoryEventLedger,
+    fail_kind: String,
+    enabled: Arc<AtomicBool>,
+}
+
+impl EventLedger for EventKindFailingLedger {
+    fn append(&self, event: LedgerEvent) -> KernelResult<()> {
+        if self.enabled.load(Ordering::SeqCst) && event.kind == self.fail_kind {
+            return Err(KernelError::Other(format!(
+                "injected {} persistence failure",
+                self.fail_kind
+            )));
+        }
+        self.inner.append(event)
+    }
+
+    fn append_batch(&self, events: Vec<LedgerEvent>) -> KernelResult<()> {
+        if self.enabled.load(Ordering::SeqCst)
+            && events.iter().any(|event| event.kind == self.fail_kind)
+        {
+            return Err(KernelError::Other(format!(
+                "injected {} persistence failure",
+                self.fail_kind
+            )));
+        }
+        self.inner.append_batch(events)
+    }
+
+    fn list_all(&self) -> KernelResult<Vec<LedgerEvent>> {
+        self.inner.list_all()
+    }
+
+    fn list_by_run(&self, run_id: &str) -> KernelResult<Vec<LedgerEvent>> {
+        self.inner.list_by_run(run_id)
+    }
+
+    fn list_by_session(&self, session_id: &str) -> KernelResult<Vec<LedgerEvent>> {
+        self.inner.list_by_session(session_id)
+    }
+}
+
+impl EventLedger for PermissionResolutionFailingLedger {
+    fn append(&self, event: LedgerEvent) -> KernelResult<()> {
+        self.inner.append(event)
+    }
+
+    fn append_batch(&self, events: Vec<LedgerEvent>) -> KernelResult<()> {
+        if self.fail_permission_resolution.load(Ordering::SeqCst)
+            && events
+                .iter()
+                .any(|event| event.kind == "permission.resolved")
+        {
+            return Err(KernelError::Other(
+                "injected permission resolution persistence failure".to_string(),
+            ));
+        }
+        self.inner.append_batch(events)
+    }
+
+    fn list_all(&self) -> KernelResult<Vec<LedgerEvent>> {
+        self.inner.list_all()
+    }
+
+    fn list_by_run(&self, run_id: &str) -> KernelResult<Vec<LedgerEvent>> {
+        self.inner.list_by_run(run_id)
+    }
+
+    fn list_by_session(&self, session_id: &str) -> KernelResult<Vec<LedgerEvent>> {
+        self.inner.list_by_session(session_id)
+    }
+}
 
 struct TestWorkspace(PathBuf);
 
@@ -35,7 +118,7 @@ fn runtime_with_workspace() -> (DeepCodeKernelRuntime, TestWorkspace) {
 
     let mut runtime = DeepCodeKernelRuntime::new();
     runtime
-        .dispatch(KernelCommand::WorkspaceOpen {
+        .dispatch(KernelCommand::HostWorkspaceOpen {
             request_id: RequestId("workspace-open".to_string()),
             path: path.to_string_lossy().to_string(),
         })
@@ -61,11 +144,18 @@ fn action_bundle(actions: Value, content_blocks: Value) -> Value {
         "userPlanMarkdown": "# Plan\n\n## Summary\nExercise canonical Kernel tools.",
         "contentBlocks": content_blocks,
         "actionBundle": {
+            "version": "deepcode.agent.protocol.v4",
             "id": "bundle-1",
             "goal": "Exercise canonical Kernel tools.",
             "actions": actions,
-            "validationExpectations": ["Kernel emits terminal tool facts."],
-            "reviewExpectations": ["Review facts reflect actual terminal results."]
+            "validationExpectations": [{
+                "id": "validation-terminal-facts",
+                "description": "Kernel emits terminal tool facts."
+            }],
+            "reviewExpectations": [{
+                "id": "review-terminal-facts",
+                "description": "Review facts reflect actual terminal results."
+            }]
         }
     })
 }
@@ -93,7 +183,9 @@ fn submit_proposal_raw(runtime: &mut DeepCodeKernelRuntime, payload: Value) -> V
     events
         .into_iter()
         .find_map(|event| match event {
-            KernelEvent::ProposalReviewed { report, .. } => Some(report),
+            KernelEvent::ProposalReviewed { report, .. } => {
+                Some(serde_json::to_value(report).expect("serialize typed proposal report"))
+            }
             _ => None,
         })
         .expect("proposal review report")
@@ -262,17 +354,26 @@ fn execute_contract(
     payload: &Value,
     report: &Value,
 ) -> Vec<KernelEvent> {
-    let mut batch = payload.clone();
-    let object = batch.as_object_mut().expect("batch object");
-    object.insert("planId".to_string(), Value::String("bundle-1".to_string()));
-    object.insert(
-        "contractId".to_string(),
-        report["executionContract"]["id"].clone(),
-    );
-    object.insert(
-        "contractHash".to_string(),
-        report["executionContract"]["contractHash"].clone(),
-    );
+    let batch = KernelActionBatch {
+        plan_id: "bundle-1".to_string(),
+        contract_id: report["executionContract"]["id"]
+            .as_str()
+            .expect("execution contract id")
+            .to_string(),
+        contract_hash: report["executionContract"]["contractHash"]
+            .as_str()
+            .expect("execution contract hash")
+            .to_string(),
+        action_bundle: serde_json::from_value(payload["actionBundle"].clone())
+            .expect("canonical action bundle"),
+        content_blocks: serde_json::from_value(
+            payload
+                .get("contentBlocks")
+                .cloned()
+                .unwrap_or_else(|| Value::Array(Vec::new())),
+        )
+        .expect("canonical content blocks"),
+    };
     runtime
         .dispatch(KernelCommand::ActionBatchSubmit {
             request_id: RequestId("batch-submit".to_string()),
@@ -287,8 +388,8 @@ fn terminal_tool(events: &[KernelEvent], tool_id: &str, ok: bool) -> bool {
     events.iter().any(|event| {
         matches!(
             event,
-            KernelEvent::ToolCompleted { tool_name, ok: actual, .. }
-                if tool_name == tool_id && *actual == ok
+            KernelEvent::ToolCompleted { fact, .. }
+                if fact.tool_id == tool_id && fact.ok == ok
         )
     })
 }
@@ -299,27 +400,19 @@ fn artifact_draft_chunk(
     sequence: u64,
     lines: &[&str],
     final_chunk: bool,
-) -> Value {
+) -> ArtifactDraftLedgerFrame {
     let content_lines = lines
         .iter()
-        .map(|line| Value::String((*line).to_string()))
+        .map(|line| (*line).to_string())
         .collect::<Vec<_>>();
     let serialized = serde_json::to_string(&content_lines).expect("serialize draft chunk");
-    serde_json::json!({
-        "schemaVersion": "deepcode.agent.artifact-draft.v1",
-        "partKind": "artifactChunk",
-        "draftId": draft_id,
-        "frameId": frame_id,
-        "runId": "run-1",
-        "sessionId": "session-1",
-        "taskId": "task-draft",
-        "slotId": "slot-draft-1",
-        "sequence": sequence,
-        "contentLines": content_lines,
-        "finalChunk": final_chunk,
-        "contentHash": test_fnv1a64(&serialized),
-        "expectedSlotIds": ["slot-draft-1"]
-    })
+    ArtifactDraftLedgerFrame::ArtifactChunk {
+        base: artifact_draft_base(draft_id, frame_id, sequence, test_fnv1a64(&serialized)),
+        slot_id: "slot-draft-1".to_string(),
+        content_lines,
+        final_chunk,
+        edit_match: None,
+    }
 }
 
 fn artifact_draft_chunk_owned(
@@ -328,52 +421,60 @@ fn artifact_draft_chunk_owned(
     sequence: u64,
     lines: Vec<String>,
     final_chunk: bool,
-) -> Value {
-    let content_lines = lines.into_iter().map(Value::String).collect::<Vec<_>>();
-    let serialized = serde_json::to_string(&content_lines).expect("serialize draft chunk");
-    serde_json::json!({
-        "schemaVersion": "deepcode.agent.artifact-draft.v1",
-        "partKind": "artifactChunk",
-        "draftId": draft_id,
-        "frameId": frame_id,
-        "runId": "run-1",
-        "sessionId": "session-1",
-        "taskId": "task-draft",
-        "slotId": "slot-draft-1",
-        "sequence": sequence,
-        "contentLines": content_lines,
-        "finalChunk": final_chunk,
-        "contentHash": test_fnv1a64(&serialized),
-        "expectedSlotIds": ["slot-draft-1"]
-    })
+) -> ArtifactDraftLedgerFrame {
+    let serialized = serde_json::to_string(&lines).expect("serialize draft chunk");
+    ArtifactDraftLedgerFrame::ArtifactChunk {
+        base: artifact_draft_base(draft_id, frame_id, sequence, test_fnv1a64(&serialized)),
+        slot_id: "slot-draft-1".to_string(),
+        content_lines: lines,
+        final_chunk,
+        edit_match: None,
+    }
 }
 
-fn artifact_draft_done(draft_id: &str, frame_id: &str, sequence: u64, summary: &str) -> Value {
-    serde_json::json!({
-        "schemaVersion": "deepcode.agent.artifact-draft.v1",
-        "partKind": "batchDone",
-        "draftId": draft_id,
-        "frameId": frame_id,
-        "runId": "run-1",
-        "sessionId": "session-1",
-        "taskId": "task-draft",
-        "sequence": sequence,
-        "contentHash": test_fnv1a64(summary),
-        "expectedSlotIds": ["slot-draft-1"],
-        "metadata": { "summary": summary }
-    })
+fn artifact_draft_done(
+    draft_id: &str,
+    frame_id: &str,
+    sequence: u64,
+    summary: &str,
+) -> ArtifactDraftLedgerFrame {
+    ArtifactDraftLedgerFrame::BatchDone {
+        base: artifact_draft_base(draft_id, frame_id, sequence, test_fnv1a64(summary)),
+        metadata: ArtifactDraftBatchMetadata {
+            summary: summary.to_string(),
+        },
+    }
+}
+
+fn artifact_draft_base(
+    draft_id: &str,
+    frame_id: &str,
+    sequence: u64,
+    content_hash: String,
+) -> ArtifactDraftFrameBase {
+    ArtifactDraftFrameBase {
+        schema_version: ARTIFACT_DRAFT_SCHEMA_VERSION.to_string(),
+        draft_id: draft_id.to_string(),
+        frame_id: frame_id.to_string(),
+        run_id: "run-1".to_string(),
+        session_id: "session-1".to_string(),
+        task_id: "task-draft".to_string(),
+        sequence,
+        content_hash,
+        expected_slot_ids: vec!["slot-draft-1".to_string()],
+    }
 }
 
 fn submit_artifact_draft(
     runtime: &mut DeepCodeKernelRuntime,
     request_id: &str,
-    frame: Value,
+    frame: ArtifactDraftLedgerFrame,
 ) -> KernelResult<Vec<KernelEvent>> {
     runtime.dispatch(KernelCommand::DraftLedgerSubmit {
         request_id: RequestId(request_id.to_string()),
         run_id: RunId("run-1".to_string()),
         session_id: Some(SessionId("session-1".to_string())),
-        frame: serde_json::from_value(frame).expect("typed artifact draft frame"),
+        frame,
     })
 }
 

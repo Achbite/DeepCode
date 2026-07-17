@@ -4,6 +4,8 @@ import type {
   AgentSessionResult,
   AgentWorkspaceBinding,
   KernelCommandEnvelope,
+  KernelActionBatchV1,
+  KernelProposalEnvelopeV1,
   KernelReply,
   ProjectionDelta,
 } from '@deepcode/protocol';
@@ -74,13 +76,6 @@ export interface AcceptedPlanActionProposalSubmitterPorts<
   emitProjectionDelta(state: State, delta: ProjectionDelta): Promise<void>;
   emitKernelActivityDeltas(state: State, events: unknown[], stage: string): Promise<void>;
   readActionBundle(proposal: ProposalEnvelope): unknown | undefined;
-  tryCompleteReadOnlyActionBundle(
-    input: Input,
-    state: State,
-    prompt: PromptEnvelope,
-    proposal: ProposalEnvelope,
-    fallback: AgentSessionResult
-  ): Promise<AgentSessionResult | ProposalRouterResult | null>;
   appendDiagnostic(state: State, code: string, fallback: string, params: Record<string, string | number> | undefined, idPrefix: string): Promise<AgentSessionResult | undefined>;
   sessionRunStateEvent(input: Record<string, unknown>): AgentEvent;
   findReviewReport(events: unknown[]): Record<string, unknown> | undefined;
@@ -88,7 +83,7 @@ export interface AcceptedPlanActionProposalSubmitterPorts<
   denied(report: Record<string, unknown>): boolean;
   diagnosticSummary(report: Record<string, unknown>): string;
   executionContext(input: Record<string, unknown>): any;
-  normalizeKernelBatch(input: Record<string, unknown>): { ok: true; batch: Record<string, unknown> } | { ok: false; reasons: string[] };
+  normalizeKernelBatch(input: Record<string, unknown>): { ok: true; batch: KernelActionBatchV1 } | { ok: false; reasons: string[] };
   normalizationFailureEvents(sessionId: string, runId: string, accepted: AcceptedTaskPlanContext, reasons: string[], ts: string, id: string): AgentEvent[];
   executionExceptionEvents(sessionId: string, planRef: { runId: string; planId: string }, message: string, code: string, ts: string, id: string): AgentEvent[];
   executionFailureEvents(
@@ -96,14 +91,14 @@ export interface AcceptedPlanActionProposalSubmitterPorts<
     runId: string,
     accepted: AcceptedTaskPlanContext,
     batchEvents: unknown[],
-    batch: Record<string, unknown>,
+    batch: KernelActionBatchV1,
     ts: string,
     id: string
   ): AgentEvent[];
-  preflightAudit(batch: Record<string, unknown>): unknown;
-  acceptedPlanBatchActivitySummary(batch: Record<string, unknown>): string;
-  acceptedPlanBatchActivity(input: Record<string, unknown>): unknown;
-  generatedPacketFromSuccessfulBatch(state: State, batch: Record<string, unknown>, events: unknown[], id: string): unknown | undefined;
+  preflightAudit(batch: KernelActionBatchV1): unknown;
+  acceptedPlanBatchActivitySummary(batch: KernelActionBatchV1): string;
+  acceptedPlanBatchActivity(input: { accepted: AcceptedTaskPlanContext; batch: KernelActionBatchV1; status: 'running' | 'completed' }): unknown;
+  generatedPacketFromSuccessfulBatch(state: State, batch: KernelActionBatchV1, events: unknown[], id: string): unknown | undefined;
   indexGeneratedPacket(index: unknown, packet: unknown): void;
   recordGeneratedPacket(state: State, packet: unknown, stage: string): Promise<{ result?: AgentSessionResult }>;
   recordKernelBatchProgress(input: {
@@ -154,7 +149,7 @@ export interface AcceptedPlanActionProposalSubmitterPorts<
     state: State;
     prompt: PromptEnvelope;
     accepted: AcceptedTaskPlanContext;
-    batch: Record<string, unknown>;
+    batch: KernelActionBatchV1;
     batchEvents: unknown[];
   }): Promise<AgentEvent[]>;
 }
@@ -175,15 +170,6 @@ export class AcceptedPlanActionProposalSubmitter<
     const accepted = state.acceptedTaskPlan;
     const actionBundle = this.ports.readActionBundle(proposal);
     if (!accepted || !actionBundle) return fallback;
-
-    const readOnlyActionResult = await this.ports.tryCompleteReadOnlyActionBundle(
-      input,
-      state,
-      prompt,
-      proposal,
-      fallback
-    );
-    if (readOnlyActionResult) return readOnlyActionResult;
 
     if (
       !accepted.authorizationContractId
@@ -232,7 +218,7 @@ export class AcceptedPlanActionProposalSubmitter<
         requestId: this.ports.createId('proposal-submit-accepted-plan'),
         runId: state.runId,
         sessionId: state.sessionId,
-        proposal: executionProposal,
+        proposal: kernelProposal(executionProposal),
       },
     });
     const reviewReport = this.ports.findReviewReport(proposalReply.events);
@@ -317,9 +303,7 @@ export class AcceptedPlanActionProposalSubmitter<
         visibility: 'task',
         planId: accepted.planId,
         batchIndex: accepted.batchIndex,
-        actionCount: Array.isArray((batch as Record<string, unknown>).actions)
-          ? ((batch as Record<string, unknown>).actions as unknown[]).length
-          : undefined,
+        actionCount: batch.actionBundle.actions.length,
       },
     } as ProjectionDelta);
 
@@ -475,6 +459,24 @@ export class AcceptedPlanActionProposalSubmitter<
     };
   }
 
+}
+
+function kernelProposal(proposal: ProposalEnvelope): KernelProposalEnvelopeV1 {
+  if (proposal.kind !== 'actionBundle') {
+    throw new Error(`kernel_abi_event_invalid: expected actionBundle proposal, received ${proposal.kind}.`);
+  }
+  return {
+    schemaVersion: proposal.schemaVersion,
+    proposalId: proposal.proposalId,
+    runId: proposal.runId,
+    ...(proposal.sessionId ? { sessionId: proposal.sessionId } : {}),
+    source: proposal.source,
+    kind: proposal.kind,
+    payload: proposal.payload,
+    referencedResourcePacketRefs: proposal.referencedResourcePacketRefs,
+    referencedEvidenceRefs: proposal.referencedEvidenceRefs,
+    ...(proposal.parserDiagnostics !== undefined ? { parserDiagnostics: proposal.parserDiagnostics } : {}),
+  };
 }
 
 function stringValue(value: unknown): string | undefined {

@@ -121,7 +121,7 @@ export function assertUserAuthorityFramePreservesExplicitMessages(): void {
     { messageId: `fallback-${token}`, content: 'fallback must not replace explicit messages' },
     (content) => /[\u3400-\u9fff]/u.test(content) ? 'zh-CN' : 'en-US',
     'trustedWorkspace',
-    { runId: `run-${token}`, requirePersistedAuthority: true }
+    { runId: `run-${token}` }
   );
 
   assertEqual(frame.rootMessage.content, '请保留这条原始请求。', 'User authority keeps the first explicit user message as root');
@@ -164,7 +164,7 @@ export function assertPromptLedgerReusesPrefixAndAppendsWithinEpoch(): void {
     { messageId: `fallback-${token}`, content: `Fallback ${token}` },
     () => 'en-US',
     'strict',
-    { runId: `run-${token}`, requirePersistedAuthority: true }
+    { runId: `run-${token}` }
   );
   const first = preparePromptLedger({
     state,
@@ -354,7 +354,7 @@ export function assertPromptLedgerRotatesAcceptedTaskScope(): void {
     { messageId: `fallback-${token}`, content: `Fallback ${token}` },
     () => 'en-US',
     'strict',
-    { runId: `run-${token}`, requirePersistedAuthority: true }
+    { runId: `run-${token}` }
   );
   const first = preparePromptLedger({
     state,
@@ -976,7 +976,7 @@ function acceptedCreatePlan(runId: string, token: string): AcceptedTaskPlanConte
       operationId: `plan-op-${taskId}-1`,
       sourceTaskId: taskId,
       toolId: 'fs.create',
-      operationKind: 'create',
+      operationKind: 'fsCreate',
       contentMode: 'contentBlock',
       targets: [targetPath],
       dependsOn: [],
@@ -1013,7 +1013,7 @@ function acceptedPatchPlan(runId: string, token: string, targetPath: string): Ac
       operationId: `plan-op-${taskId}-1`,
       sourceTaskId: taskId,
       toolId: 'fs.edit',
-      operationKind: 'patch',
+      operationKind: 'fsEdit',
       contentMode: 'replacementBlock',
       targets: [targetPath],
       dependsOn: [],

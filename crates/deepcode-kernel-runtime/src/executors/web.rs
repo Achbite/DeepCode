@@ -1,21 +1,45 @@
 use super::*;
 
+pub(crate) fn web_search_target_url(
+    config: &KernelExecutorConfig,
+    query: &str,
+    limit: u64,
+) -> KernelResult<String> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Err(KernelError::InvalidCommand(
+            "web.search query is required".to_string(),
+        ));
+    }
+    let endpoint = (!config.web_search_endpoint_template.trim().is_empty())
+        .then_some(config.web_search_endpoint_template.as_str())
+        .ok_or_else(|| {
+            KernelError::InvalidCommand(
+                "web.search endpoint template is not configured".to_string(),
+            )
+        })?;
+    if !endpoint.contains("{query}") {
+        return Err(KernelError::InvalidCommand(
+            "web.search endpoint template requires {query}".to_string(),
+        ));
+    }
+    Ok(endpoint
+        .replace("{query}", &percent_encode(query))
+        .replace("{limit}", &limit.clamp(1, 10).to_string()))
+}
+
 pub(super) struct WebSearchExecutor {
     pub(super) config: KernelExecutorConfig,
     pub(super) secret_provider: Arc<dyn SecretProvider>,
 }
 pub(super) struct WebFetchExecutor;
 
-impl SkillExecutor for WebSearchExecutor {
-    fn descriptor(&self) -> SkillDescriptor {
-        descriptor("web.search")
-    }
-
+impl KernelToolExecutor for WebSearchExecutor {
     fn invoke(
         &self,
-        invocation: SkillInvocation,
-        _context: SkillExecutionContext,
-    ) -> KernelResult<SkillResult> {
+        invocation: KernelToolInvocation,
+        _context: KernelToolExecutionContext,
+    ) -> KernelResult<KernelToolExecutionResult> {
         let query = get_string(&invocation.input, "query").unwrap_or_default();
         if query.trim().is_empty() {
             return Err(KernelError::InvalidCommand(
@@ -28,21 +52,7 @@ impl SkillExecutor for WebSearchExecutor {
             .and_then(Value::as_u64)
             .unwrap_or(5)
             .clamp(1, 10) as usize;
-        let endpoint = (!self.config.web_search_endpoint_template.trim().is_empty())
-            .then_some(self.config.web_search_endpoint_template.as_str())
-            .ok_or_else(|| {
-                KernelError::InvalidCommand(
-                    "web.search endpoint template is not configured".to_string(),
-                )
-            })?;
-        if !endpoint.contains("{query}") {
-            return Err(KernelError::InvalidCommand(
-                "web.search endpoint template requires {query}".to_string(),
-            ));
-        }
-        let url = endpoint
-            .replace("{query}", &percent_encode(&query))
-            .replace("{limit}", &limit.to_string());
+        let url = web_search_target_url(&self.config, &query, limit as u64)?;
         validate_http_url(&url)?;
         let reviewed_target = reviewed_target(&invocation.input)?;
         let auth_value = (!self.config.web_search_auth_secret_ref.trim().is_empty())
@@ -81,16 +91,12 @@ impl SkillExecutor for WebSearchExecutor {
     }
 }
 
-impl SkillExecutor for WebFetchExecutor {
-    fn descriptor(&self) -> SkillDescriptor {
-        descriptor("web.fetch")
-    }
-
+impl KernelToolExecutor for WebFetchExecutor {
     fn invoke(
         &self,
-        invocation: SkillInvocation,
-        _context: SkillExecutionContext,
-    ) -> KernelResult<SkillResult> {
+        invocation: KernelToolInvocation,
+        _context: KernelToolExecutionContext,
+    ) -> KernelResult<KernelToolExecutionResult> {
         let url = get_string(&invocation.input, "url").unwrap_or_default();
         validate_http_url(&url)?;
         let reviewed_target = reviewed_target(&invocation.input)?;

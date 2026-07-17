@@ -1,116 +1,51 @@
 use crate::catalog::fnv1a64_hex;
 use crate::{
-    CleanupContract, KernelToolRegistry, OperationCompileError, OperationCompiler,
-    OperationExecutionMode, PlannedOperation, PlannedOperationKind, ToolFamily, ToolPermissionMode,
-    ToolRiskLevel,
+    KernelToolRegistry, OperationCompileError, OperationCompiler, PermissionBundleKey,
+    PlannedOperation, PlannedOperationKind, ToolPermissionMode,
 };
-use serde::{Deserialize, Serialize};
+use deepcode_kernel_abi::{
+    CleanupContract, CleanupFailurePolicy, CleanupLeasePolicy, ContractCleanupPolicy,
+    ContractExpiry, KernelActionProposal, KernelExecutionContract, KernelExecutionContractStatus,
+    KernelExecutionOperation, KernelGateIntervention, KernelGateInterventionKind,
+    KernelGateInterventionStatus, KernelPermissionBundle, KernelProposalReviewReport,
+};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct KernelExecutionOperationV3 {
-    pub id: String,
-    pub title: String,
-    pub tool_id: String,
-    pub args: Value,
-    pub args_hash: String,
-    pub read_set: Vec<String>,
-    pub write_set: Vec<String>,
-    pub conflict_keys: Vec<String>,
-    pub execution_mode: OperationExecutionMode,
-    pub cleanup: CleanupContract,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PermissionBundleV3 {
-    pub id: String,
-    pub capability: String,
-    pub permission_mode: ToolPermissionMode,
-    pub risk: ToolRiskLevel,
-    pub resource_kind: String,
-    pub operation_ids: Vec<String>,
-    pub tool_ids: Vec<String>,
-    pub targets: Vec<String>,
-    pub expires_after: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct GateInterventionV3 {
-    pub id: String,
-    pub intervention_kind: String,
-    pub status: String,
-    pub permission_bundle_id: Option<String>,
-    pub affected_operation_ids: Vec<String>,
-    pub summary: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct KernelExecutionContractV3 {
-    pub id: String,
-    pub proposal_id: String,
-    #[serde(default)]
-    pub authorization_contract_id: Option<String>,
-    pub status: String,
-    pub catalog_version: String,
-    pub catalog_hash: String,
-    pub operation_set_hash: String,
-    pub contract_hash: String,
-    pub operations: Vec<KernelExecutionOperationV3>,
-    pub permission_bundles: Vec<PermissionBundleV3>,
-    pub interventions: Vec<GateInterventionV3>,
-    pub cleanup_policy: String,
-    pub expires_after: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ProposalReviewReportV3 {
-    pub proposal_id: String,
-    pub status: String,
-    pub required_permissions: Vec<String>,
-    pub diagnostics: Vec<String>,
-    pub execution_contract: KernelExecutionContractV3,
-}
-
-impl OperationCompiler {
+impl OperationCompiler<'_> {
     pub fn review_action_bundle(
         &self,
         proposal_id: &str,
-        payload: &Value,
-    ) -> Result<ProposalReviewReportV3, OperationCompileError> {
-        self.review_action_bundle_with_permission_modes(proposal_id, payload, &BTreeMap::new())
+        proposal: &KernelActionProposal,
+    ) -> Result<KernelProposalReviewReport, OperationCompileError> {
+        self.review_action_bundle_with_permission_modes(proposal_id, proposal, &BTreeMap::new())
     }
 
     pub fn review_action_bundle_with_permission_modes(
         &self,
         proposal_id: &str,
-        payload: &Value,
+        proposal: &KernelActionProposal,
         permission_modes: &BTreeMap<String, ToolPermissionMode>,
-    ) -> Result<ProposalReviewReportV3, OperationCompileError> {
-        let operations = self.compile_batch(payload)?;
+    ) -> Result<KernelProposalReviewReport, OperationCompileError> {
+        let operations = self.compile_proposal(proposal)?;
         let snapshot = self.registry().snapshot();
         let execution_operations = operations
             .iter()
-            .map(|operation| execution_operation_v3(self.registry(), operation))
+            .map(|operation| execution_operation(self.registry(), operation))
             .collect::<Result<Vec<_>, _>>()?;
         let permission_bundles =
-            permission_bundles_v3(self.registry(), &operations, permission_modes)?;
+            permission_bundles(self.registry(), &operations, permission_modes)?;
         let interventions = permission_bundles
             .iter()
             .filter(|bundle| bundle.permission_mode != ToolPermissionMode::Allow)
-            .map(|bundle| GateInterventionV3 {
+            .map(|bundle| KernelGateIntervention {
                 id: format!("gate-{}", bundle.id),
                 intervention_kind: if bundle.permission_mode == ToolPermissionMode::Deny {
-                    "policy".to_string()
+                    KernelGateInterventionKind::Policy
                 } else {
-                    "permission".to_string()
+                    KernelGateInterventionKind::Permission
                 },
-                status: "pending".to_string(),
+                status: KernelGateInterventionStatus::Pending,
                 permission_bundle_id: Some(bundle.id.clone()),
                 affected_operation_ids: bundle.operation_ids.clone(),
                 summary: format!(
@@ -134,9 +69,9 @@ impl OperationCompiler {
         let contract_hash =
             fnv1a64_hex(&serde_json::to_string(&contract_hash_payload).unwrap_or_default());
         let status = if interventions.is_empty() {
-            "autoAccepted"
+            KernelExecutionContractStatus::AutoAccepted
         } else {
-            "awaitingUserApproval"
+            KernelExecutionContractStatus::AwaitingUserApproval
         };
         let required_permissions = permission_bundles
             .iter()
@@ -145,16 +80,16 @@ impl OperationCompiler {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
-        Ok(ProposalReviewReportV3 {
+        Ok(KernelProposalReviewReport {
             proposal_id: proposal_id.to_string(),
-            status: status.to_string(),
+            status,
             required_permissions,
             diagnostics: Vec::new(),
-            execution_contract: KernelExecutionContractV3 {
+            execution_contract: KernelExecutionContract {
                 id: contract_id,
                 proposal_id: proposal_id.to_string(),
                 authorization_contract_id: None,
-                status: status.to_string(),
+                status,
                 catalog_version: snapshot.catalog_version.to_string(),
                 catalog_hash: snapshot.catalog_hash,
                 operation_set_hash,
@@ -162,27 +97,22 @@ impl OperationCompiler {
                 operations: execution_operations,
                 permission_bundles,
                 interventions,
-                cleanup_policy: "cleanupContractPerOperation".to_string(),
-                expires_after: "reviewGateOrRunTerminal".to_string(),
+                cleanup_policy: ContractCleanupPolicy::PerOperationCleanupContract,
+                expires_after: ContractExpiry::ReviewGateOrRunTerminal,
             },
         })
     }
 }
 
-fn execution_operation_v3(
+fn execution_operation(
     registry: &KernelToolRegistry,
     operation: &PlannedOperation,
-) -> Result<KernelExecutionOperationV3, OperationCompileError> {
-    let tool_id = operation
-        .tool_id(registry)
-        .ok_or_else(|| OperationCompileError::UnsupportedToolId {
-            tool_id: operation.capability.clone(),
-        })?
-        .to_string();
+) -> Result<KernelExecutionOperation, OperationCompileError> {
+    let tool_id = operation.tool_id.clone();
     let args = normalized_args_for_operation(operation);
     let args_hash = fnv1a64_hex(&serde_json::to_string(&args).unwrap_or_default());
     let mut cleanup = registry
-        .template(&tool_id)
+        .contract(&tool_id)
         .ok_or_else(|| OperationCompileError::UnsupportedToolId {
             tool_id: tool_id.clone(),
         })?
@@ -192,18 +122,19 @@ fn execution_operation_v3(
         PlannedOperationKind::Workspace(workspace) if workspace.temporary
     ) {
         cleanup = CleanupContract {
-            lease_policy: "batchTemporaryFile".to_string(),
+            lease_policy: CleanupLeasePolicy::BatchTemporaryFile,
             terminate_process_tree: false,
             remove_scratch: true,
             revoke_broker_grant: false,
             deadline_ms: 5_000,
-            failure_policy: "blockReviewAcceptance".to_string(),
+            failure_policy: CleanupFailurePolicy::BlockReviewAcceptance,
         };
     }
-    Ok(KernelExecutionOperationV3 {
+    Ok(KernelExecutionOperation {
         id: operation.id.clone(),
         title: operation.title.clone(),
         tool_id,
+        operation_kind: operation.operation_kind,
         args,
         args_hash,
         read_set: operation.read_set.clone(),
@@ -214,21 +145,17 @@ fn execution_operation_v3(
     })
 }
 
-fn permission_bundles_v3(
+fn permission_bundles(
     registry: &KernelToolRegistry,
     operations: &[PlannedOperation],
     permission_modes: &BTreeMap<String, ToolPermissionMode>,
-) -> Result<Vec<PermissionBundleV3>, OperationCompileError> {
-    let mut grouped = BTreeMap::<String, PermissionBundleV3>::new();
+) -> Result<Vec<KernelPermissionBundle>, OperationCompileError> {
+    let mut grouped = BTreeMap::<String, KernelPermissionBundle>::new();
     for operation in operations {
-        let tool_id = operation.tool_id(registry).ok_or_else(|| {
-            OperationCompileError::UnsupportedToolId {
-                tool_id: operation.capability.clone(),
-            }
-        })?;
+        let tool_id = operation.tool_id.as_str();
         let template =
             registry
-                .template(tool_id)
+                .contract(tool_id)
                 .ok_or_else(|| OperationCompileError::UnsupportedToolId {
                     tool_id: tool_id.to_string(),
                 })?;
@@ -236,25 +163,24 @@ fn permission_bundles_v3(
             .get(&operation.id)
             .copied()
             .unwrap_or(template.permission.mode);
-        let key = if template.permission.bundle_key == "none" {
-            format!("allow-{tool_id}")
-        } else {
-            template.permission.bundle_key.to_string()
+        let key = match template.permission.bundle_key {
+            PermissionBundleKey::None => format!("allow-{tool_id}"),
+            key => key.wire_name().to_string(),
         };
         let bundle = grouped
             .entry(key.clone())
-            .or_insert_with(|| PermissionBundleV3 {
+            .or_insert_with(|| KernelPermissionBundle {
                 id: format!("permission-{key}"),
                 capability: template.permission.capability.to_string(),
                 permission_mode,
                 risk: template.permission.risk,
-                resource_kind: permission_resource_kind(template.family).to_string(),
+                resource_kind: template.family.permission_resource_kind(),
                 operation_ids: Vec::new(),
                 tool_ids: Vec::new(),
                 targets: Vec::new(),
-                expires_after: template.permission.grant_lifetime.to_string(),
+                expires_after: template.permission.grant_lifetime,
             });
-        bundle.permission_mode = stricter_permission_mode(bundle.permission_mode, permission_mode);
+        bundle.permission_mode = bundle.permission_mode.stricter(permission_mode);
         bundle.operation_ids.push(operation.id.clone());
         if !bundle.tool_ids.iter().any(|value| value == tool_id) {
             bundle.tool_ids.push(tool_id.to_string());
@@ -266,29 +192,6 @@ fn permission_bundles_v3(
         }
     }
     Ok(grouped.into_values().collect())
-}
-
-fn stricter_permission_mode(
-    left: ToolPermissionMode,
-    right: ToolPermissionMode,
-) -> ToolPermissionMode {
-    use ToolPermissionMode::{Allow, Ask, Deny};
-    match (left, right) {
-        (Deny, _) | (_, Deny) => Deny,
-        (Ask, _) | (_, Ask) => Ask,
-        (Allow, Allow) => Allow,
-    }
-}
-
-fn permission_resource_kind(family: ToolFamily) -> &'static str {
-    match family {
-        ToolFamily::Workspace | ToolFamily::Document => "workspacePath",
-        ToolFamily::Git => "gitWorkspace",
-        ToolFamily::Process => "process",
-        ToolFamily::Network => "networkTarget",
-        ToolFamily::Browser => "browserState",
-        ToolFamily::Provider => "providerProfile",
-    }
 }
 
 pub(crate) fn normalized_args_for_operation(operation: &PlannedOperation) -> Value {

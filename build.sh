@@ -14,11 +14,9 @@
 #   bash ./build.sh --stage macos-package-service # macOS host: start package worker
 #   bash ./build.sh --stage package-macos # macOS host/Docker request: build complete macOS app set
 #   bash ./build.sh --stage package-macos-deepcode-gui # macOS host: build DeepCode-GUI.app package
-#   bash ./build.sh --stage macos-deepcode-gui # compat alias for package-macos-deepcode-gui
 #   bash ./build.sh --stage daemon   # Linux/Windows Rust Kernel daemon
 #   bash ./build.sh --stage cli      # Linux/Windows CLI Host shell
 #   bash ./build.sh --stage tui      # Linux/Windows TUI Host shell
-#   bash ./build.sh --stage kernel   # 兼容入口：daemon + cli + tui
 #   bash ./build.sh --stage tauri    # Windows DeepCode.exe Tauri thin shell
 #   bash ./build.sh --stage deepcode-gui-tauri # Windows DeepCode-GUI.exe Tauri shell
 #   bash ./build.sh --stage package  # 复制已有构建产物到 bin/
@@ -125,7 +123,7 @@ mkdir -p "$CARGO_TARGET_DIR" "$TMPDIR"
 usage() {
   cat <<'USAGE'
 Usage:
-  ./build.sh [--stage all|gui|deepcode-gui|deepcode-gui-tauri|macos-package-service|package-macos|package-macos-deepcode-gui|macos-deepcode-gui|daemon|cli|tui|kernel|tauri|package|verify-package-runtime]...
+  ./build.sh [--stage all|gui|deepcode-gui|deepcode-gui-tauri|macos-package-service|package-macos|package-macos-deepcode-gui|daemon|cli|tui|tauri|package|verify-package-runtime]...
   ./build.sh --stage macos-package-service
   ./build.sh --full
   ./build.sh --stage package-macos --clean-cache
@@ -178,7 +176,6 @@ Environment:
                                       Timeout for macOS package service requests.
   DEEPCODE_MACOS_PRODUCTS=DeepCode-GUI,DeepCode
                                       Comma/space separated macOS app set for package-macos.
-  DEEPCODE_MACOS_PRODUCT=DeepCode-GUI Compatibility alias for a single macOS product.
   --clean-cache                     Clean macOS package build artifacts without deleting config/sessions/archives/kernel data.
   --no-kill-running                 Do not stop processes occupying the target macOS .app bundle before packaging.
 USAGE
@@ -291,14 +288,6 @@ enable_stage() {
       ;;
     package-macos-deepcode-gui)
       run_package_macos_deepcode_gui=1
-      ;;
-    macos-deepcode-gui)
-      run_package_macos_deepcode_gui=1
-      ;;
-    kernel)
-      run_daemon=1
-      run_cli=1
-      run_tui=1
       ;;
     daemon)
       run_daemon=1
@@ -414,23 +403,12 @@ add_macos_product() {
 
 resolve_macos_products() {
   resolved_macos_products=()
-  local raw="${DEEPCODE_MACOS_PRODUCTS:-}"
-  if [ -z "$raw" ]; then
-    raw="${DEEPCODE_MACOS_PRODUCT:-DeepCode-GUI,DeepCode}"
-  fi
+  local raw="${DEEPCODE_MACOS_PRODUCTS:-DeepCode-GUI,DeepCode}"
   raw="${raw//,/ }"
 
   local product
   for product in $raw; do
-    case "$product" in
-      all|complete|both)
-        add_macos_product "DeepCode-GUI"
-        add_macos_product "DeepCode"
-        ;;
-      *)
-        add_macos_product "$product"
-        ;;
-    esac
+    add_macos_product "$product"
   done
   if [ "${#resolved_macos_products[@]}" -eq 0 ]; then
     echo "==[build][error]== empty macOS product list" >&2

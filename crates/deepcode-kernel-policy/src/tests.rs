@@ -114,21 +114,21 @@ fn autonomy_profiles_have_expected_permission_matrix() {
         .unwrap();
     assert_eq!(trusted_write.decision, PolicyDecisionKind::Allow);
 
-    let trusted_create = gate
+    let trusted_repeated_write = gate
         .evaluate(
             &trusted,
-            &request(Capability::workspace_create(), RiskLevel::High),
+            &request(Capability::workspace_write(), RiskLevel::High),
         )
         .unwrap();
-    assert_eq!(trusted_create.decision, PolicyDecisionKind::Allow);
+    assert_eq!(trusted_repeated_write.decision, PolicyDecisionKind::Allow);
 
-    let trusted_delete = gate
+    let trusted_critical_write = gate
         .evaluate(
             &trusted,
-            &request(Capability::workspace_delete(), RiskLevel::High),
+            &request(Capability::workspace_write(), RiskLevel::Critical),
         )
         .unwrap();
-    assert_eq!(trusted_delete.decision, PolicyDecisionKind::Allow);
+    assert_eq!(trusted_critical_write.decision, PolicyDecisionKind::Allow);
 
     let expert = PolicyProfile::expert_defaults();
     let expert_shell = gate
@@ -181,73 +181,9 @@ fn trusted_workspace_full_access_does_not_cover_deepcode_config_assets() {
 }
 
 #[test]
-fn temporary_grant_is_run_capability_and_resource_scoped() {
+fn hard_floor_denies_even_for_maintainer_profile() {
     let gate = DefaultPermissionGate;
-    let mut profile = PolicyProfile::safe_defaults();
-    profile
-        .grant_temporary(TemporaryGrant {
-            id: "grant-1".to_string(),
-            run_id: "run-allowed".to_string(),
-            capability: Capability::workspace_write(),
-            resource_scope: ResourceScope::workspace_file("src/main.rs"),
-            decision: PolicyDecisionKind::Allow,
-            expires_after_sequence: Some(20),
-            reason: Some("user accepted temporary write".to_string()),
-        })
-        .unwrap();
-
-    let allowed = gate
-        .evaluate(
-            &profile,
-            &PermissionRequest {
-                run_id: Some("run-allowed".to_string()),
-                resource_scope: Some(ResourceScope::workspace_file("src/main.rs")),
-                ..request(Capability::workspace_write(), RiskLevel::High)
-            },
-        )
-        .unwrap();
-    assert_eq!(allowed.decision, PolicyDecisionKind::Allow);
-
-    let different_run = gate
-        .evaluate(
-            &profile,
-            &PermissionRequest {
-                run_id: Some("run-other".to_string()),
-                resource_scope: Some(ResourceScope::workspace_file("src/main.rs")),
-                ..request(Capability::workspace_write(), RiskLevel::High)
-            },
-        )
-        .unwrap();
-    assert_eq!(different_run.decision, PolicyDecisionKind::Ask);
-
-    let different_resource = gate
-        .evaluate(
-            &profile,
-            &PermissionRequest {
-                run_id: Some("run-allowed".to_string()),
-                resource_scope: Some(ResourceScope::workspace_file("src/lib.rs")),
-                ..request(Capability::workspace_write(), RiskLevel::High)
-            },
-        )
-        .unwrap();
-    assert_eq!(different_resource.decision, PolicyDecisionKind::Ask);
-}
-
-#[test]
-fn hard_floor_denies_before_temporary_grant() {
-    let gate = DefaultPermissionGate;
-    let mut profile = PolicyProfile::maintainer_defaults();
-    profile
-        .grant_temporary(TemporaryGrant {
-            id: "grant-delete".to_string(),
-            run_id: "run-1".to_string(),
-            capability: Capability::workspace_delete(),
-            resource_scope: ResourceScope::workspace_file("src"),
-            decision: PolicyDecisionKind::Allow,
-            expires_after_sequence: None,
-            reason: Some("user allowed cleanup".to_string()),
-        })
-        .unwrap();
+    let profile = PolicyProfile::maintainer_defaults();
 
     let decision = gate
         .evaluate(
@@ -261,7 +197,7 @@ fn hard_floor_denies_before_temporary_grant() {
                     outside_workspace: OutsideWorkspace::Forbidden,
                     hard_floor: None,
                 },
-                ..request(Capability::workspace_delete(), RiskLevel::Critical)
+                ..request(Capability::workspace_write(), RiskLevel::Critical)
             },
         )
         .unwrap();
@@ -275,9 +211,9 @@ fn hard_floor_denies_before_temporary_grant() {
 }
 
 #[test]
-fn outside_workspace_write_requires_matching_temporary_grant() {
+fn outside_workspace_write_is_a_kernel_hard_floor() {
     let gate = DefaultPermissionGate;
-    let mut profile = PolicyProfile::trusted_workspace_defaults();
+    let profile = PolicyProfile::trusted_workspace_defaults();
     let decision = gate
         .evaluate(
             &profile,
@@ -294,50 +230,6 @@ fn outside_workspace_write_requires_matching_temporary_grant() {
         .unwrap();
 
     assert_eq!(decision.decision, PolicyDecisionKind::Deny);
-
-    profile
-        .grant_temporary(TemporaryGrant {
-            id: "grant-external-write".to_string(),
-            run_id: "run-1".to_string(),
-            capability: Capability::workspace_write(),
-            resource_scope: ResourceScope::external_file("/tmp/research.md"),
-            decision: PolicyDecisionKind::Allow,
-            expires_after_sequence: None,
-            reason: Some("user accepted outside workspace file operation".to_string()),
-        })
-        .unwrap();
-
-    let allowed = gate
-        .evaluate(
-            &profile,
-            &PermissionRequest {
-                resource_scope: Some(ResourceScope::external_file("/tmp/research.md")),
-                impact: PermissionImpact {
-                    effect_surface: EffectSurface::ExternalReadOnly,
-                    outside_workspace: OutsideWorkspace::ReadOnlyReference,
-                    ..PermissionImpact::default()
-                },
-                ..request(Capability::workspace_write(), RiskLevel::Critical)
-            },
-        )
-        .unwrap();
-    assert_eq!(allowed.decision, PolicyDecisionKind::Allow);
-
-    let sibling = gate
-        .evaluate(
-            &profile,
-            &PermissionRequest {
-                resource_scope: Some(ResourceScope::external_file("/tmp/sibling.md")),
-                impact: PermissionImpact {
-                    effect_surface: EffectSurface::ExternalReadOnly,
-                    outside_workspace: OutsideWorkspace::ReadOnlyReference,
-                    ..PermissionImpact::default()
-                },
-                ..request(Capability::workspace_write(), RiskLevel::Critical)
-            },
-        )
-        .unwrap();
-    assert_eq!(sibling.decision, PolicyDecisionKind::Deny);
 }
 
 #[test]

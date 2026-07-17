@@ -17,6 +17,20 @@ export interface FileTreeNode {
   type: 'file' | 'directory';
   /** 子节点；仅 type=directory 且未被惰性折叠时存在 */
   children?: FileTreeNode[];
+  /** 可选字节数与 Kernel 文件内容分类。 */
+  sizeBytes?: number;
+  fileClassification?: FileContentClassification;
+}
+
+export interface FileContentClassification {
+  kind: string;
+  readableText: boolean;
+  binary: boolean;
+  executable: boolean;
+  sizeBytes: number;
+  extension?: string;
+  magic?: string;
+  reason?: string;
 }
 
 /** Host inspection read 成功响应的 output 字段 */
@@ -30,4 +44,9 @@ export interface FileReadResult {
   sizeBytes: number;
   /** 文件是否被认定为二进制；二进制文件 content 为空 */
   binary: boolean;
+  fileSizeBytes: number;
+  startLine: number;
+  endLine: number;
+  contentHash: string;
+  fileClassification: FileContentClassification;
 }

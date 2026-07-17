@@ -1,11 +1,21 @@
 use crate::{
     BrowserOperation, BrowserOperationKind, ContentBlock, FileTargetRef, GitOperationKind,
-    KernelToolRegistry, NetworkOperation, NetworkOperationKind, OperationCompileError,
-    OperationExecutionMode, PlannedOperation, PlannedOperationKind, ProcessOperation,
-    ProviderOperation, WorkspaceOperation, WorkspaceOperationKind,
+    KernelToolRegistration, KernelToolRegistry, NetworkOperation, NetworkOperationKind,
+    OperationCompileError, OperationExecutionMode, PlannedOperation, PlannedOperationKind,
+    ProcessOperation, ProviderOperation, ToolOperationKind, WorkspaceOperation,
+    WorkspaceOperationKind,
 };
 use serde_json::Value;
 use std::collections::BTreeSet;
+
+pub(crate) struct OperationMetadata {
+    pub(crate) id: String,
+    pub(crate) title: String,
+    pub(crate) tool_id: String,
+    pub(crate) operation_kind: ToolOperationKind,
+    pub(crate) capability: String,
+    pub(crate) permission_labels: Vec<String>,
+}
 
 pub(crate) fn get_string(value: &Value, keys: &[&str]) -> Option<String> {
     keys.iter()
@@ -37,23 +47,25 @@ pub(crate) fn strings_from_array(items: &[Value]) -> Vec<String> {
         .collect()
 }
 
-pub(crate) fn workspace_kind_for_tool(
-    tool_id: &str,
+pub(crate) fn workspace_kind_for_operation(
+    operation_kind: ToolOperationKind,
 ) -> Result<WorkspaceOperationKind, OperationCompileError> {
-    match tool_id {
-        "fs.read" => Ok(WorkspaceOperationKind::Read),
-        "fs.list" => Ok(WorkspaceOperationKind::List),
-        "fs.glob" => Ok(WorkspaceOperationKind::Glob),
-        "code.grep" => Ok(WorkspaceOperationKind::Search),
-        "fs.diff" => Ok(WorkspaceOperationKind::Diff),
-        "fs.create" => Ok(WorkspaceOperationKind::Create),
-        "fs.write" => Ok(WorkspaceOperationKind::Write),
-        "fs.edit" => Ok(WorkspaceOperationKind::Patch),
-        "fs.rename" => Ok(WorkspaceOperationKind::Rename),
-        "fs.delete" => Ok(WorkspaceOperationKind::Delete),
-        "document.read" => Ok(WorkspaceOperationKind::DocumentRead),
-        other => Err(OperationCompileError::UnsupportedToolId {
-            tool_id: other.to_string(),
+    match operation_kind {
+        ToolOperationKind::FsRead => Ok(WorkspaceOperationKind::Read),
+        ToolOperationKind::FsList => Ok(WorkspaceOperationKind::List),
+        ToolOperationKind::FsGlob => Ok(WorkspaceOperationKind::Glob),
+        ToolOperationKind::CodeGrep => Ok(WorkspaceOperationKind::Search),
+        ToolOperationKind::FsDiff => Ok(WorkspaceOperationKind::Diff),
+        ToolOperationKind::FsCreate => Ok(WorkspaceOperationKind::Create),
+        ToolOperationKind::FsWrite => Ok(WorkspaceOperationKind::Write),
+        ToolOperationKind::FsEdit => Ok(WorkspaceOperationKind::Patch),
+        ToolOperationKind::FsRename => Ok(WorkspaceOperationKind::Rename),
+        ToolOperationKind::FsDelete => Ok(WorkspaceOperationKind::Delete),
+        ToolOperationKind::DocumentRead => Ok(WorkspaceOperationKind::DocumentRead),
+        ToolOperationKind::FsEnsureDirectory => Ok(WorkspaceOperationKind::EnsureDirectory),
+        other => Err(OperationCompileError::UnsupportedKind {
+            tool_id: other.wire_name().to_string(),
+            kind: other.wire_name().to_string(),
         }),
     }
 }
@@ -62,16 +74,19 @@ pub(crate) fn block_allows_empty_content(block: &ContentBlock) -> bool {
     block.allow_empty_content && block.operation.as_deref() == Some("createEmpty")
 }
 
-pub(crate) fn git_kind_for_tool(tool_id: &str) -> Result<GitOperationKind, OperationCompileError> {
-    match tool_id {
-        "git.status" => Ok(GitOperationKind::Status),
-        "git.diff" => Ok(GitOperationKind::Diff),
-        "git.stage" => Ok(GitOperationKind::Stage),
-        "git.unstage" => Ok(GitOperationKind::Unstage),
-        "git.commit" => Ok(GitOperationKind::Commit),
-        "git.push" => Ok(GitOperationKind::Push),
-        other => Err(OperationCompileError::UnsupportedToolId {
-            tool_id: other.to_string(),
+pub(crate) fn git_kind_for_operation(
+    operation_kind: ToolOperationKind,
+) -> Result<GitOperationKind, OperationCompileError> {
+    match operation_kind {
+        ToolOperationKind::GitStatus => Ok(GitOperationKind::Status),
+        ToolOperationKind::GitDiff => Ok(GitOperationKind::Diff),
+        ToolOperationKind::GitStage => Ok(GitOperationKind::Stage),
+        ToolOperationKind::GitUnstage => Ok(GitOperationKind::Unstage),
+        ToolOperationKind::GitCommit => Ok(GitOperationKind::Commit),
+        ToolOperationKind::GitPush => Ok(GitOperationKind::Push),
+        other => Err(OperationCompileError::UnsupportedKind {
+            tool_id: other.wire_name().to_string(),
+            kind: other.wire_name().to_string(),
         }),
     }
 }
@@ -79,21 +94,11 @@ pub(crate) fn git_kind_for_tool(tool_id: &str) -> Result<GitOperationKind, Opera
 pub(crate) fn operation_execution_mode(
     registry: &KernelToolRegistry,
     tool_id: &str,
-    kind: WorkspaceOperationKind,
+    _kind: WorkspaceOperationKind,
 ) -> Result<OperationExecutionMode, OperationCompileError> {
-    let registered_tool_id = registry.tool_for_workspace_kind(kind).ok_or_else(|| {
-        OperationCompileError::UnsupportedToolId {
-            tool_id: tool_id.to_string(),
-        }
-    })?;
-    if registered_tool_id != tool_id {
-        return Err(OperationCompileError::UnsupportedToolId {
-            tool_id: tool_id.to_string(),
-        });
-    }
     registry
-        .get(registered_tool_id)
-        .map(|descriptor| descriptor.execution_mode)
+        .get(tool_id)
+        .map(KernelToolRegistration::execution_mode)
         .ok_or_else(|| OperationCompileError::UnsupportedToolId {
             tool_id: tool_id.to_string(),
         })
@@ -118,14 +123,16 @@ pub(crate) fn internal_ensure_directory_operation(
     PlannedOperation {
         id,
         title: format!("Ensure parent directory {path}"),
+        tool_id: "fs.ensure_directory".to_string(),
+        operation_kind: ToolOperationKind::FsEnsureDirectory,
         depends_on: Vec::new(),
-        capability: descriptor.capability.to_string(),
+        capability: descriptor.capability().to_string(),
         permission_labels: Vec::new(),
         target_ref: Some(FileTargetRef::from_path(path.clone())),
         read_set: Vec::new(),
         write_set: vec![path.clone()],
         conflict_keys: vec![path.clone()],
-        execution_mode: descriptor.execution_mode,
+        execution_mode: descriptor.execution_mode(),
         operation: PlannedOperationKind::Workspace(Box::new(WorkspaceOperation {
             kind: WorkspaceOperationKind::EnsureDirectory,
             target_path: Some(path),
@@ -158,14 +165,17 @@ pub(crate) fn internal_ensure_directory_operation(
 
 pub(crate) fn external_process_operation(
     registry: &KernelToolRegistry,
-    action: &Value,
-    id: String,
-    title: String,
-    tool_id: String,
-    capability: String,
-    permission_labels: Vec<String>,
+    args: &Value,
+    metadata: OperationMetadata,
 ) -> PlannedOperation {
-    let args = action.get("args").unwrap_or(&Value::Null);
+    let OperationMetadata {
+        id,
+        title,
+        tool_id,
+        operation_kind,
+        capability,
+        permission_labels,
+    } = metadata;
     let argv = args
         .get("argv")
         .and_then(Value::as_array)
@@ -174,6 +184,8 @@ pub(crate) fn external_process_operation(
     PlannedOperation {
         id,
         title,
+        tool_id: tool_id.clone(),
+        operation_kind,
         depends_on: Vec::new(),
         capability,
         permission_labels,
@@ -193,17 +205,21 @@ pub(crate) fn external_process_operation(
 
 pub(crate) fn external_network_operation(
     registry: &KernelToolRegistry,
-    action: &Value,
-    id: String,
-    title: String,
-    tool_id: String,
-    capability: String,
-    permission_labels: Vec<String>,
+    args: &Value,
+    metadata: OperationMetadata,
 ) -> PlannedOperation {
-    let args = action.get("args").unwrap_or(&Value::Null);
-    let kind = match tool_id.as_str() {
-        "web.fetch" => NetworkOperationKind::Fetch,
-        _ => NetworkOperationKind::Search,
+    let OperationMetadata {
+        id,
+        title,
+        tool_id,
+        operation_kind,
+        capability,
+        permission_labels,
+    } = metadata;
+    let kind = match operation_kind {
+        ToolOperationKind::WebFetch => NetworkOperationKind::Fetch,
+        ToolOperationKind::WebSearch => NetworkOperationKind::Search,
+        _ => unreachable!("network builder requires a network operation kind"),
     };
     let target = match kind {
         NetworkOperationKind::Fetch => get_string(args, &["url"]),
@@ -216,6 +232,8 @@ pub(crate) fn external_network_operation(
     PlannedOperation {
         id,
         title,
+        tool_id: tool_id.clone(),
+        operation_kind,
         depends_on: Vec::new(),
         capability,
         permission_labels,
@@ -236,26 +254,32 @@ pub(crate) fn external_network_operation(
 
 pub(crate) fn external_browser_operation(
     registry: &KernelToolRegistry,
-    action: &Value,
-    id: String,
-    title: String,
-    tool_id: String,
-    capability: String,
-    permission_labels: Vec<String>,
+    args: &Value,
+    metadata: OperationMetadata,
 ) -> PlannedOperation {
-    let args = action.get("args").unwrap_or(&Value::Null);
-    let kind = match tool_id.as_str() {
-        "browser.reload" => BrowserOperationKind::Reload,
-        "browser.snapshot" => BrowserOperationKind::Snapshot,
-        "browser.inspect" => BrowserOperationKind::Inspect,
-        "browser.click" => BrowserOperationKind::Click,
-        "browser.type" => BrowserOperationKind::Type,
-        "browser.scroll" => BrowserOperationKind::Scroll,
-        _ => BrowserOperationKind::Open,
+    let OperationMetadata {
+        id,
+        title,
+        tool_id,
+        operation_kind,
+        capability,
+        permission_labels,
+    } = metadata;
+    let kind = match operation_kind {
+        ToolOperationKind::BrowserOpen => BrowserOperationKind::Open,
+        ToolOperationKind::BrowserReload => BrowserOperationKind::Reload,
+        ToolOperationKind::BrowserSnapshot => BrowserOperationKind::Snapshot,
+        ToolOperationKind::BrowserInspect => BrowserOperationKind::Inspect,
+        ToolOperationKind::BrowserClick => BrowserOperationKind::Click,
+        ToolOperationKind::BrowserType => BrowserOperationKind::Type,
+        ToolOperationKind::BrowserScroll => BrowserOperationKind::Scroll,
+        _ => unreachable!("browser builder requires a browser operation kind"),
     };
     PlannedOperation {
         id,
         title,
+        tool_id: tool_id.clone(),
+        operation_kind,
         depends_on: Vec::new(),
         capability,
         permission_labels,
@@ -277,17 +301,22 @@ pub(crate) fn external_browser_operation(
 
 pub(crate) fn external_provider_operation(
     registry: &KernelToolRegistry,
-    action: &Value,
-    id: String,
-    title: String,
-    tool_id: String,
-    capability: String,
-    permission_labels: Vec<String>,
+    args: &Value,
+    metadata: OperationMetadata,
 ) -> PlannedOperation {
-    let args = action.get("args").unwrap_or(&Value::Null);
+    let OperationMetadata {
+        id,
+        title,
+        tool_id,
+        operation_kind,
+        capability,
+        permission_labels,
+    } = metadata;
     PlannedOperation {
         id,
         title,
+        tool_id: tool_id.clone(),
+        operation_kind,
         depends_on: Vec::new(),
         capability,
         permission_labels,
@@ -309,6 +338,6 @@ pub(crate) fn execution_mode_for_tool(
 ) -> OperationExecutionMode {
     registry
         .get(tool_id)
-        .map(|descriptor| descriptor.execution_mode)
+        .map(KernelToolRegistration::execution_mode)
         .unwrap_or(OperationExecutionMode::Blocked)
 }

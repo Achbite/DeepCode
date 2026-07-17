@@ -1,11 +1,28 @@
 use super::*;
+use deepcode_kernel_abi::KernelActionBatch;
 use serde_json::Value;
 
-fn action_batch(actions: Value, content_blocks: Value) -> Value {
-    serde_json::json!({
-        "actionBundle": { "id": "test-bundle", "actions": actions },
+fn action_batch(actions: Value, content_blocks: Value) -> KernelActionBatch {
+    serde_json::from_value(serde_json::json!({
+        "planId": "test-plan",
+        "contractId": "test-contract",
+        "contractHash": "test-contract-hash",
+        "actionBundle": {
+            "version": "deepcode.agent.protocol.v4",
+            "id": "test-bundle",
+            "goal": "exercise canonical tool compilation",
+            "actions": actions
+        },
         "contentBlocks": content_blocks
-    })
+    }))
+    .expect("test action batch uses the canonical ABI")
+}
+
+fn compile_test_batch(
+    batch: &KernelActionBatch,
+) -> Result<Vec<PlannedOperation>, OperationCompileError> {
+    let registry = KernelToolRegistry::default();
+    OperationCompiler::new(&registry).compile_batch(batch)
 }
 
 #[test]
@@ -43,24 +60,41 @@ fn registry_covers_core_tool_families() {
 fn every_registration_owns_one_complete_tool_contract() {
     let registry = KernelToolRegistry::default();
     let snapshot = registry.snapshot();
-    assert_eq!(registry.all().count(), snapshot.tools.len());
+    assert_eq!(registry.registrations().count(), snapshot.tools.len());
 
-    for descriptor in registry.all() {
+    for registration in registry.registrations() {
         let template = registry
-            .template(descriptor.tool_id)
-            .unwrap_or_else(|| panic!("{} template exists", descriptor.tool_id));
-        assert_eq!(template.tool_id, descriptor.tool_id);
-        assert_eq!(template.family, descriptor.family);
-        assert_eq!(template.permission.capability, descriptor.capability);
-        assert_eq!(template.permission.risk, descriptor.risk);
-        assert_eq!(template.permission.mode, descriptor.permission_mode);
-        assert_eq!(template.execution.executor_ref, descriptor.executor_ref);
-        assert_eq!(template.execution.execution_mode, descriptor.execution_mode);
+            .contract(registration.tool_id())
+            .unwrap_or_else(|| panic!("{} template exists", registration.tool_id()));
+        assert_eq!(&template, &registration.contract);
         assert!(template.input.schema.is_object());
         assert!(snapshot
             .tools
             .iter()
-            .any(|tool| tool.tool_id == descriptor.tool_id));
+            .any(|tool| tool.tool_id == registration.tool_id()));
+        assert_eq!(
+            registry
+                .get_by_operation_kind(registration.operation_kind())
+                .map(KernelToolRegistration::tool_id),
+            Some(registration.tool_id())
+        );
+        match registration.execution_mode() {
+            OperationExecutionMode::Execute => {
+                assert!(registration.executor_binding.is_some())
+            }
+            OperationExecutionMode::PreviewOnly | OperationExecutionMode::Blocked => {
+                assert!(registration.executor_binding.is_none())
+            }
+        }
+        let snapshot_entry = snapshot
+            .tools
+            .iter()
+            .find(|tool| tool.tool_id == registration.tool_id())
+            .expect("registration appears in the catalog snapshot");
+        assert_eq!(
+            snapshot_entry.plan_target_source,
+            template.resource.plan_target_source
+        );
     }
 }
 
@@ -75,8 +109,11 @@ fn registry_snapshot_exposes_canonical_delete_tool() {
         .find(|tool| tool.tool_id == "fs.delete")
         .expect("fs.delete tool descriptor is present");
     assert_eq!(delete.capability, "workspace.write");
-    assert_eq!(delete.operation_kind, Some("delete"));
-    assert_eq!(delete.path_scope_policy, "workspace-path-scoped-grant");
+    assert_eq!(delete.operation_kind, ToolOperationKind::FsDelete);
+    assert_eq!(
+        delete.path_scope_policy,
+        PathScopePolicy::WorkspacePathScopedGrant
+    );
     assert_eq!(delete.plan_target_mode, PlanTargetMode::PerTarget);
     assert_eq!(delete.provider_schema["required"][0], "path");
     assert!(delete.provider_schema["properties"]
@@ -308,7 +345,7 @@ fn internal_tools_cannot_be_requested_as_agent_operations() {
         serde_json::json!([]),
     );
     assert!(matches!(
-        OperationCompiler::default().compile_batch(&batch),
+        compile_test_batch(&batch),
         Err(OperationCompileError::UnsupportedToolId { tool_id })
             if tool_id == "fs.ensure_directory"
     ));
@@ -343,13 +380,16 @@ fn registry_git_v1_formal_tools_execute_only_through_commit() {
         "git.unstage",
         "git.commit",
     ] {
-        let descriptor = registry
+        let registration = registry
             .get(tool_id)
             .unwrap_or_else(|| panic!("{tool_id} descriptor exists"));
-        assert_eq!(descriptor.execution_mode, OperationExecutionMode::Execute);
+        assert_eq!(
+            registration.execution_mode(),
+            OperationExecutionMode::Execute
+        );
     }
     assert_eq!(
-        registry.get("git.push").unwrap().execution_mode,
+        registry.get("git.push").unwrap().execution_mode(),
         OperationExecutionMode::Blocked
     );
 }
@@ -368,10 +408,13 @@ fn registry_keeps_external_control_tools_blocked() {
         "browser.scroll",
         "provider.call",
     ] {
-        let descriptor = registry
+        let registration = registry
             .get(tool_id)
             .unwrap_or_else(|| panic!("{tool_id} descriptor exists"));
-        assert_eq!(descriptor.execution_mode, OperationExecutionMode::Blocked);
+        assert_eq!(
+            registration.execution_mode(),
+            OperationExecutionMode::Blocked
+        );
     }
 }
 
@@ -379,7 +422,7 @@ fn registry_keeps_external_control_tools_blocked() {
 fn process_exec_declares_os_sandbox_without_becoming_executable() {
     let registry = KernelToolRegistry::default();
     let template = registry
-        .template("process.exec")
+        .contract("process.exec")
         .expect("process.exec template exists");
 
     assert_eq!(
@@ -402,10 +445,16 @@ fn process_exec_declares_os_sandbox_without_becoming_executable() {
         template.execution.isolation.fallback,
         IsolationFallbackPolicy::Deny
     );
-    assert_eq!(template.cleanup.lease_policy, "sandboxLease");
+    assert_eq!(
+        template.cleanup.lease_policy,
+        CleanupLeasePolicy::SandboxLease
+    );
     assert!(template.cleanup.terminate_process_tree);
     assert!(template.cleanup.remove_scratch);
-    assert_eq!(template.cleanup.failure_policy, "blockReviewAcceptance");
+    assert_eq!(
+        template.cleanup.failure_policy,
+        CleanupFailurePolicy::BlockReviewAcceptance
+    );
 }
 
 #[test]
@@ -440,7 +489,6 @@ fn catalog_snapshot_exposes_isolation_contract_as_metadata() {
 
 #[test]
 fn compiler_requires_write_content_block() {
-    let compiler = OperationCompiler::default();
     let batch = action_batch(
         serde_json::json!([{
             "actionId": "write-1",
@@ -452,7 +500,7 @@ fn compiler_requires_write_content_block() {
         serde_json::json!([]),
     );
     assert!(matches!(
-        compiler.compile_batch(&batch),
+        compile_test_batch(&batch),
         Err(OperationCompileError::InvalidInput(
             ToolInputValidationError::MissingField { field, .. }
         )) if field == "contentBlockId"
@@ -461,7 +509,6 @@ fn compiler_requires_write_content_block() {
 
 #[test]
 fn compiler_builds_workspace_write_operation() {
-    let compiler = OperationCompiler::default();
     let batch = action_batch(
         serde_json::json!([{
             "actionId": "write-1",
@@ -480,7 +527,7 @@ fn compiler_builds_workspace_write_operation() {
             "contentLines": ["fn main() {}"]
         }]),
     );
-    let operations = compiler.compile_batch(&batch).unwrap();
+    let operations = compile_test_batch(&batch).unwrap();
     assert_eq!(operations.len(), 1);
     assert_eq!(operations[0].write_set, vec!["src/lib.rs"]);
     assert!(matches!(
@@ -492,7 +539,6 @@ fn compiler_builds_workspace_write_operation() {
 
 #[test]
 fn compiler_builds_workspace_delete_operation_without_code_block() {
-    let compiler = OperationCompiler::default();
     let batch = action_batch(
         serde_json::json!([{
             "actionId": "delete-1",
@@ -507,7 +553,7 @@ fn compiler_builds_workspace_delete_operation_without_code_block() {
         }]),
         serde_json::json!([]),
     );
-    let operations = compiler.compile_batch(&batch).unwrap();
+    let operations = compile_test_batch(&batch).unwrap();
     assert_eq!(operations.len(), 1);
     assert_eq!(operations[0].write_set, vec!["generated/obsolete.txt"]);
     assert!(matches!(
@@ -519,7 +565,6 @@ fn compiler_builds_workspace_delete_operation_without_code_block() {
 
 #[test]
 fn compiler_preserves_workspace_directory_delete_metadata() {
-    let compiler = OperationCompiler::default();
     let batch = action_batch(
         serde_json::json!([{
             "actionId": "delete-directory",
@@ -534,7 +579,7 @@ fn compiler_preserves_workspace_directory_delete_metadata() {
         }]),
         serde_json::json!([]),
     );
-    let operations = compiler.compile_batch(&batch).unwrap();
+    let operations = compile_test_batch(&batch).unwrap();
     assert_eq!(operations.len(), 1);
     match &operations[0].operation {
         PlannedOperationKind::Workspace(operation) => {
@@ -548,7 +593,6 @@ fn compiler_preserves_workspace_directory_delete_metadata() {
 
 #[test]
 fn compiler_builds_workspace_create_operation_with_parent_dependency() {
-    let compiler = OperationCompiler::default();
     let batch = action_batch(
         serde_json::json!([{
             "actionId": "create-1",
@@ -567,7 +611,7 @@ fn compiler_builds_workspace_create_operation_with_parent_dependency() {
             "contentLines": ["new"]
         }]),
     );
-    let operations = compiler.compile_batch(&batch).unwrap();
+    let operations = compile_test_batch(&batch).unwrap();
     assert_eq!(operations.len(), 2);
     assert!(matches!(
         &operations[0].operation,
@@ -584,7 +628,6 @@ fn compiler_builds_workspace_create_operation_with_parent_dependency() {
 
 #[test]
 fn compiler_rejects_workspace_delete_without_target() {
-    let compiler = OperationCompiler::default();
     let batch = action_batch(
         serde_json::json!([{
             "actionId": "delete-1",
@@ -596,7 +639,7 @@ fn compiler_rejects_workspace_delete_without_target() {
         serde_json::json!([]),
     );
     assert!(matches!(
-        compiler.compile_batch(&batch),
+        compile_test_batch(&batch),
         Err(OperationCompileError::InvalidInput(
             ToolInputValidationError::MissingField { field, .. }
         )) if field == "path"
@@ -605,7 +648,6 @@ fn compiler_rejects_workspace_delete_without_target() {
 
 #[test]
 fn compiler_rejects_workspace_delete_root_target() {
-    let compiler = OperationCompiler::default();
     let batch = action_batch(
         serde_json::json!([{
             "actionId": "delete-1",
@@ -617,14 +659,13 @@ fn compiler_rejects_workspace_delete_root_target() {
         serde_json::json!([]),
     );
     assert!(matches!(
-        compiler.compile_batch(&batch),
+        compile_test_batch(&batch),
         Err(OperationCompileError::DeleteWorkspaceRoot { .. })
     ));
 }
 
 #[test]
 fn compiler_rejects_empty_write_content_by_default() {
-    let compiler = OperationCompiler::default();
     let batch = action_batch(
         serde_json::json!([{
             "actionId": "write-1",
@@ -641,7 +682,7 @@ fn compiler_rejects_empty_write_content_by_default() {
         }]),
     );
     assert!(matches!(
-        compiler.compile_batch(&batch),
+        compile_test_batch(&batch),
         Err(OperationCompileError::InvalidInput(
             ToolInputValidationError::EmptyContentBlock { .. }
         ))
@@ -650,7 +691,6 @@ fn compiler_rejects_empty_write_content_by_default() {
 
 #[test]
 fn compiler_preserves_empty_lines_inside_non_empty_content() {
-    let compiler = OperationCompiler::default();
     let batch = action_batch(
         serde_json::json!([{
             "actionId": "write-logical-block",
@@ -666,9 +706,7 @@ fn compiler_preserves_empty_lines_inside_non_empty_content() {
             "contentLines": ["first", "", "third"]
         }]),
     );
-    let operations = compiler
-        .compile_batch(&batch)
-        .expect("blank lines are valid text content");
+    let operations = compile_test_batch(&batch).expect("blank lines are valid text content");
     assert!(matches!(
         &operations[0].operation,
         PlannedOperationKind::Workspace(operation)
@@ -679,29 +717,31 @@ fn compiler_preserves_empty_lines_inside_non_empty_content() {
 
 #[test]
 fn compiler_rejects_noncanonical_action_fields() {
-    let compiler = OperationCompiler::default();
-    let batch = action_batch(
-        serde_json::json!([{
-            "actionId": "delete-1",
-            "toolId": "fs.delete",
-            "capability": "workspace.write",
-            "args": { "path": "obsolete.txt" },
-            "description": "Delete file",
-            "dependsOn": []
-        }]),
-        serde_json::json!([]),
-    );
-    assert!(matches!(
-        compiler.compile_batch(&batch),
-        Err(OperationCompileError::InvalidInput(
-            ToolInputValidationError::UnknownField { field, .. }
-        )) if field == "capability"
-    ));
+    let result = serde_json::from_value::<KernelActionBatch>(serde_json::json!({
+        "planId": "test-plan",
+        "contractId": "test-contract",
+        "contractHash": "test-contract-hash",
+        "actionBundle": {
+            "version": "deepcode.agent.protocol.v4",
+            "id": "test-bundle",
+            "goal": "reject noncanonical action fields",
+            "actions": [{
+                "actionId": "delete-1",
+                "toolId": "fs.delete",
+                "capability": "workspace.write",
+                "args": { "path": "obsolete.txt" },
+                "description": "Delete file",
+                "dependsOn": []
+            }]
+        },
+        "contentBlocks": []
+    }));
+    let error = result.expect_err("provider cannot declare capability");
+    assert!(error.to_string().contains("unknown field `capability`"));
 }
 
 #[test]
 fn compiler_rejects_args_outside_the_tool_contract() {
-    let compiler = OperationCompiler::default();
     let batch = action_batch(
         serde_json::json!([{
             "actionId": "delete-1",
@@ -716,7 +756,7 @@ fn compiler_rejects_args_outside_the_tool_contract() {
         serde_json::json!([]),
     );
     assert!(matches!(
-        compiler.compile_batch(&batch),
+        compile_test_batch(&batch),
         Err(OperationCompileError::InvalidInput(
             ToolInputValidationError::UnknownField { field, .. }
         )) if field == "targetResourceKind"
@@ -725,7 +765,6 @@ fn compiler_rejects_args_outside_the_tool_contract() {
 
 #[test]
 fn compiler_rejects_content_block_target_mismatch() {
-    let compiler = OperationCompiler::default();
     let batch = action_batch(
         serde_json::json!([{
             "actionId": "write-1",
@@ -742,14 +781,13 @@ fn compiler_rejects_content_block_target_mismatch() {
         }]),
     );
     assert!(matches!(
-        compiler.compile_batch(&batch),
+        compile_test_batch(&batch),
         Err(OperationCompileError::ContentBlockTargetMismatch { .. })
     ));
 }
 
 #[test]
 fn compiler_rejects_content_block_operation_mismatch() {
-    let compiler = OperationCompiler::default();
     let batch = action_batch(
         serde_json::json!([{
             "actionId": "write-1",
@@ -766,14 +804,13 @@ fn compiler_rejects_content_block_operation_mismatch() {
         }]),
     );
     assert!(matches!(
-        compiler.compile_batch(&batch),
+        compile_test_batch(&batch),
         Err(OperationCompileError::ContentBlockOperationMismatch { .. })
     ));
 }
 
 #[test]
 fn compiler_allows_explicit_empty_file_creation() {
-    let compiler = OperationCompiler::default();
     let batch = action_batch(
         serde_json::json!([{
             "actionId": "create-empty",
@@ -790,7 +827,7 @@ fn compiler_allows_explicit_empty_file_creation() {
             "allowEmptyContent": true
         }]),
     );
-    let operations = compiler.compile_batch(&batch).unwrap();
+    let operations = compile_test_batch(&batch).unwrap();
     assert!(matches!(
         &operations[0].operation,
         PlannedOperationKind::Workspace(operation)
@@ -801,7 +838,6 @@ fn compiler_allows_explicit_empty_file_creation() {
 
 #[test]
 fn compiler_builds_workspace_patch_operation() {
-    let compiler = OperationCompiler::default();
     let batch = action_batch(
         serde_json::json!([{
             "actionId": "patch-1",
@@ -823,7 +859,7 @@ fn compiler_builds_workspace_patch_operation() {
             "contentLines": ["new()"]
         }]),
     );
-    let operations = compiler.compile_batch(&batch).unwrap();
+    let operations = compile_test_batch(&batch).unwrap();
     assert!(matches!(
         &operations[0].operation,
         PlannedOperationKind::Workspace(operation)
@@ -837,6 +873,8 @@ fn graph_groups_reads_and_serial_writes() {
         PlannedOperation {
             id: "read".to_string(),
             title: "Read".to_string(),
+            tool_id: "fs.read".to_string(),
+            operation_kind: ToolOperationKind::FsRead,
             depends_on: Vec::new(),
             capability: "fs.read".to_string(),
             permission_labels: Vec::new(),
@@ -876,6 +914,8 @@ fn graph_groups_reads_and_serial_writes() {
         PlannedOperation {
             id: "write".to_string(),
             title: "Write".to_string(),
+            tool_id: "fs.write".to_string(),
+            operation_kind: ToolOperationKind::FsWrite,
             depends_on: Vec::new(),
             capability: "fs.write".to_string(),
             permission_labels: Vec::new(),

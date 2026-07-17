@@ -17,7 +17,6 @@ import type {
   ApiResponse,
   AppendAgentEventsRequest,
   ArchiveAgentSessionRequest,
-  AttachPanelSnapshotResult,
   BrowsePathResult,
   BrowserRuntimeStatusResult,
   CodeGrepInput,
@@ -30,6 +29,8 @@ import type {
   GetAgentEventSnapshotResult,
   GetAgentWorkflowConfigResult,
   GetUserSettingsResult,
+  GitDiffResult,
+  GitStatusResult,
   HealthStatus,
   InitialLocations,
   ListAgentSessionsRequest,
@@ -39,7 +40,6 @@ import type {
   LlmProfilesResult,
   OpenBrowserPreviewRequest,
   OpenWorkspaceResult,
-  PanelSnapshotResult,
   PatchAgentWorkflowConfigRequest,
   PatchLlmProfilesRequest,
   PatchUserSettingsRequest,
@@ -54,7 +54,7 @@ import type {
   SaveWorkspaceFileResult,
   SetBrowserInspectModeRequest,
   ShellEnvironmentStatus,
-  SkillReferenceResult,
+  KernelHostSkillCatalogResult,
   TerminalCapability,
   TerminalEventsResult,
   TerminalInputRequest,
@@ -665,18 +665,18 @@ export function listAgentTools(mode?: AgentMode): Promise<ApiResponse<ListToolsR
   return api.listAgentTools(mode);
 }
 
-export function getAgentSkills(): Promise<ApiResponse<SkillReferenceResult>> {
-  return api.getAgentSkills();
+export function getHostSkills(): Promise<ApiResponse<KernelHostSkillCatalogResult>> {
+  return api.getHostSkills();
 }
 
-export function getGitStatus(): Promise<ApiResponse<api.GitStatusResult>> {
+export function getGitStatus(): Promise<ApiResponse<GitStatusResult>> {
   return api.getGitStatus();
 }
 
 export function getGitDiff(
   path?: string,
   staged?: boolean
-): Promise<ApiResponse<api.GitDiffResult>> {
+): Promise<ApiResponse<GitDiffResult>> {
   return api.getGitDiff(path, staged);
 }
 
@@ -698,12 +698,4 @@ export function setBrowserInspectMode(
   request: SetBrowserInspectModeRequest
 ): Promise<ApiResponse<BrowserRuntimeStatusResult>> {
   return api.setBrowserInspectMode(request);
-}
-
-export function getSelectedPanelSnapshot(): Promise<ApiResponse<PanelSnapshotResult>> {
-  return api.getSelectedPanelSnapshot();
-}
-
-export function attachPanelSnapshotToAgent(): Promise<ApiResponse<AttachPanelSnapshotResult>> {
-  return api.attachPanelSnapshotToAgent();
 }

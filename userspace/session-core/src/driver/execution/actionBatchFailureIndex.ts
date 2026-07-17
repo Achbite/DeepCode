@@ -10,7 +10,7 @@ export interface ActionBatchFailureDetail {
 }
 
 export class ActionBatchFailureIndex {
-  details(kernelEvents: unknown[], _batch?: Record<string, unknown>): ActionBatchFailureDetail[] {
+  details(kernelEvents: unknown[], _batch?: unknown): ActionBatchFailureDetail[] {
     const workUnits = new Map<string, { actionId?: string; writeSet: string[] }>();
     const details: ActionBatchFailureDetail[] = [];
     for (const event of kernelEvents) {

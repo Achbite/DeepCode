@@ -332,50 +332,7 @@ export class ProviderStreamRuntime<TState extends ProviderStreamRuntimeState> {
       payload: enrichedFrame,
     });
 
-    const reply = await this.dependencies.kernelCommand({
-      requestId: this.dependencies.createId('draft-ledger-submit'),
-      command: {
-        kind: 'draftLedgerSubmit',
-        requestId: this.dependencies.createId('draft-ledger'),
-        runId: state.runId,
-        sessionId: state.sessionId,
-        frame: {
-          ...enrichedFrame,
-          runId: enrichedFrame.runId ?? state.runId,
-        },
-      },
-    });
-    if (!reply.ok) {
-      await this.dependencies.emitProjectionDelta(state, {
-        type: 'error',
-        stage,
-        status: 'failed',
-        channel: 'draft',
-        source: 'kernel',
-        itemId: enrichedFrame.frameId ?? enrichedFrame.draftId,
-        draftId: enrichedFrame.draftId,
-        targetPath: enrichedFrame.targetPath,
-        summary: reply.error?.message ?? 'Kernel draft ledger rejected provider stream part.',
-        payload: reply.error,
-      });
-      return;
-    }
     activeTurn.submittedPartFrames[frameKey] = true;
-    for (const event of reply.events) {
-      const record = objectRecord(event);
-      await this.dependencies.emitProjectionDelta(state, {
-        type: 'draft_delta',
-        stage,
-        status: 'streaming',
-        channel: 'draft',
-        source: 'kernel',
-        itemId: stringValue(record?.draftId) ?? enrichedFrame.draftId,
-        draftId: stringValue(record?.draftId) ?? enrichedFrame.draftId,
-        targetPath: enrichedFrame.targetPath,
-        summary: stringValue(record?.summary) ?? stringValue(objectRecord(record?.draft)?.summary),
-        payload: event,
-      });
-    }
   }
 }
 

@@ -33,53 +33,93 @@ fn proposal_review_and_skill_trust_round_trip() {
         run_id: RunId("run-1".to_string()),
         session_id: Some(SessionId("session-1".to_string())),
         proposal_id: "proposal-1".to_string(),
-        report: serde_json::json!({ "status": "accepted" }),
+        report: KernelProposalReviewReport {
+            proposal_id: "proposal-1".to_string(),
+            status: KernelExecutionContractStatus::AutoAccepted,
+            required_permissions: Vec::new(),
+            diagnostics: Vec::new(),
+            execution_contract: KernelExecutionContract {
+                id: "contract-1".to_string(),
+                proposal_id: "proposal-1".to_string(),
+                authorization_contract_id: None,
+                status: KernelExecutionContractStatus::AutoAccepted,
+                catalog_version: "deepcode.kernel.tools.v3".to_string(),
+                catalog_hash: "fnv1a64:test".to_string(),
+                operation_set_hash: "fnv1a64:operations".to_string(),
+                contract_hash: "fnv1a64:contract".to_string(),
+                operations: Vec::new(),
+                permission_bundles: Vec::new(),
+                interventions: Vec::new(),
+                cleanup_policy: ContractCleanupPolicy::PerOperationCleanupContract,
+                expires_after: ContractExpiry::ReviewGateOrRunTerminal,
+            },
+        },
         sequence: Some(9),
     };
     let encoded = serde_json::to_value(&event).expect("serialize proposal review event");
     assert_eq!(encoded["kind"], "proposal.reviewed");
-    assert_eq!(encoded["report"]["status"], "accepted");
+    assert_eq!(encoded["report"]["status"], "autoAccepted");
     let decoded: KernelEvent =
         serde_json::from_value(encoded).expect("deserialize proposal review event");
     assert_eq!(decoded, event);
 
-    let event = KernelEvent::SkillTrustRequested {
-        request_id: Some(RequestId("req-skill-trust".to_string())),
-        skill_id: "skill.py".to_string(),
-        hash: Some("sha256:abc".to_string()),
-        request: serde_json::json!({ "trustMode": "brokeredScript" }),
+    let event = KernelEvent::HostSkillTrustDecisionRecorded {
+        request_id: RequestId("req-skill-trust".to_string()),
+        record: HostSkillTrustDecisionRecord {
+            skill_id: "skill.py".to_string(),
+            decision: HostSkillTrustDecisionKind::Accept,
+            trust_mode: HostSkillTrustMode::BrokeredScript,
+            revision_hash: Some("sha256:abc".to_string()),
+            approved_capabilities: vec!["workspace.read".to_string()],
+            approved_at: None,
+            approved_by: None,
+            expires_at: None,
+        },
         sequence: Some(10),
     };
     let encoded = serde_json::to_value(&event).expect("serialize skill trust event");
-    assert_eq!(encoded["kind"], "skill.trust_requested");
-    assert_eq!(encoded["hash"], "sha256:abc");
+    assert_eq!(encoded["kind"], "host.skill_trust_decision_recorded");
+    assert_eq!(encoded["record"]["revisionHash"], "sha256:abc");
     let decoded: KernelEvent =
         serde_json::from_value(encoded).expect("deserialize skill trust event");
     assert_eq!(decoded, event);
 
-    let command = KernelCommand::McpRiskAcknowledgmentSubmit {
+    let command = KernelCommand::HostMcpRiskDecisionSubmit {
         request_id: RequestId("req-mcp-risk".to_string()),
         connector_id: "mcp-text-tools".to_string(),
         binding_id: Some("text.uppercase".to_string()),
-        acknowledgment: serde_json::json!({ "decision": "acknowledge" }),
+        decision: HostMcpRiskDecisionSubmit {
+            decision: HostMcpRiskDecisionKind::Acknowledge,
+            revision_hash: Some("sha256:def".to_string()),
+            acknowledged_by: None,
+            acknowledged_at: None,
+            risk_level: HostSkillRiskLevel::Medium,
+        },
     };
     let encoded = serde_json::to_value(&command).expect("serialize mcp risk command");
-    assert_eq!(encoded["kind"], "mcpRiskAcknowledgmentSubmit");
+    assert_eq!(encoded["kind"], "hostMcpRiskDecisionSubmit");
     assert_eq!(encoded["connectorId"], "mcp-text-tools");
     let decoded: KernelCommand =
         serde_json::from_value(encoded).expect("deserialize mcp risk command");
     assert_eq!(decoded, command);
 
-    let event = KernelEvent::McpRiskAcknowledgmentRequired {
-        request_id: Some(RequestId("req-mcp-risk".to_string())),
-        connector_id: "mcp-text-tools".to_string(),
-        binding_id: Some("text.uppercase".to_string()),
-        risk_report: serde_json::json!({ "riskLevel": "medium" }),
+    let event = KernelEvent::HostMcpRiskDecisionRecorded {
+        request_id: RequestId("req-mcp-risk".to_string()),
+        record: HostMcpRiskDecisionRecord {
+            connector_id: "mcp-text-tools".to_string(),
+            binding_id: Some("text.uppercase".to_string()),
+            decision: HostMcpRiskDecisionKind::Acknowledge,
+            revision_hash: Some("sha256:def".to_string()),
+            acknowledged_by: None,
+            acknowledged_at: None,
+            risk_level: HostSkillRiskLevel::Medium,
+            permission_granted: false,
+        },
         sequence: Some(11),
     };
     let encoded = serde_json::to_value(&event).expect("serialize mcp risk event");
-    assert_eq!(encoded["kind"], "mcp.risk_acknowledgment_required");
-    assert_eq!(encoded["riskReport"]["riskLevel"], "medium");
+    assert_eq!(encoded["kind"], "host.mcp_risk_decision_recorded");
+    assert_eq!(encoded["record"]["riskLevel"], "medium");
     let decoded: KernelEvent = serde_json::from_value(encoded).expect("deserialize mcp risk event");
     assert_eq!(decoded, event);
 }

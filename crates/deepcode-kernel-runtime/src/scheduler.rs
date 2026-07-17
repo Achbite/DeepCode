@@ -69,13 +69,16 @@ impl<'a> SerialWorkUnitScheduler<'a> {
 mod tests {
     use super::*;
     use deepcode_kernel_tools::{
-        OperationExecutionMode, PlannedOperationKind, WorkspaceOperation, WorkspaceOperationKind,
+        OperationExecutionMode, PlannedOperationKind, ToolOperationKind, WorkspaceOperation,
+        WorkspaceOperationKind,
     };
 
     fn operation(id: &str, depends_on: &[&str]) -> PlannedOperation {
         PlannedOperation {
             id: id.to_string(),
             title: id.to_string(),
+            tool_id: "fs.read".to_string(),
+            operation_kind: ToolOperationKind::FsRead,
             depends_on: depends_on.iter().map(|value| value.to_string()).collect(),
             capability: "workspace.read".to_string(),
             permission_labels: Vec::new(),

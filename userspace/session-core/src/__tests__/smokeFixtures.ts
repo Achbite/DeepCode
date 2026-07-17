@@ -3,7 +3,15 @@ import type {
   AgentSessionResult,
   ApiResponse,
   KernelCommandEnvelope,
+  KernelEventV1,
+  KernelPermissionRequestEnvelope,
+  KernelPlanAuthorizationContract,
+  KernelProposalReviewReport,
   KernelReply,
+  KernelResourcePacket,
+  KernelReviewFacts,
+  KernelToolOperationKind,
+  KernelWorkUnitDescriptor,
   LlmChatRequest,
   LlmChatResult,
 } from '@deepcode/protocol';
@@ -399,11 +407,16 @@ export function planKernel(
   sessionId: string,
   submittedPlans: Array<Record<string, any>>
 ): KernelReply {
-  const command = request.command as Record<string, any>;
+  const command = request.command;
   if (command.kind === 'runCreate') return fakeKernel(request);
   if (command.kind === 'proposalSubmit') {
     submittedPlans.push(command.proposal);
-    const actionBundle = command.proposal?.payload?.actionBundle ?? {};
+    const proposalPayload = command.proposal.payload && typeof command.proposal.payload === 'object' && !Array.isArray(command.proposal.payload)
+      ? command.proposal.payload as Record<string, unknown>
+      : {};
+    const actionBundle = proposalPayload.actionBundle && typeof proposalPayload.actionBundle === 'object' && !Array.isArray(proposalPayload.actionBundle)
+      ? proposalPayload.actionBundle as Record<string, any>
+      : {};
     return {
       ok: true,
       events: [
@@ -424,6 +437,12 @@ export function planKernel(
     };
   }
   if (command.kind === 'reviewGateEvaluate') {
+    const decision = command.decision?.decision;
+    const status = decision === 'revise'
+      ? 'needsReplan'
+      : decision === 'reject'
+        ? 'aborted'
+        : 'accepted';
     return {
       ok: true,
       events: [
@@ -432,8 +451,8 @@ export function planKernel(
           runId: command.runId ?? 'run-generic',
           sessionId: command.sessionId ?? sessionId,
           result: {
-            status: 'accepted',
-            summary: 'ReviewGate accepted Kernel facts and user review decision.',
+            status,
+            summary: `ReviewGate evaluated the ${decision ?? 'accept'} decision as ${status}.`,
           },
         },
       ],
@@ -442,7 +461,7 @@ export function planKernel(
   return fakeKernel(request);
 }
 
-export function proposalReviewReport(actionBundle: Record<string, any>, _attachmentRoot?: string): Record<string, any> {
+export function proposalReviewReport(actionBundle: Record<string, any>, _attachmentRoot?: string): KernelProposalReviewReport {
   const actions = Array.isArray(actionBundle.actions) ? actionBundle.actions : [];
   const contractId = `contract-${actionBundle.id ?? 'bundle-generic'}`;
   const permissionGroups = new Map<string, Record<string, any>[]>();
@@ -454,7 +473,7 @@ export function proposalReviewReport(actionBundle: Record<string, any>, _attachm
     group.push(action);
     permissionGroups.set(capability, group);
   }
-  const permissionBundles = [...permissionGroups.entries()].map(([capability, groupedActions], index) => {
+  const permissionBundles: KernelProposalReviewReport['executionContract']['permissionBundles'] = [...permissionGroups.entries()].map(([capability, groupedActions], index) => {
     const toolIds = [...new Set(groupedActions.map((action) => action.toolId).filter(Boolean))];
     const operationIds = groupedActions.map((action) => action.actionId).filter(Boolean);
     const targets = groupedActions.flatMap((action) => {
@@ -464,9 +483,9 @@ export function proposalReviewReport(actionBundle: Record<string, any>, _attachm
     return {
       id: `permission-${actionBundle.id ?? 'bundle-generic'}-${index + 1}`,
       capability,
-      permissionMode: 'ask',
-      risk: toolIds.some((toolId) => ['fs.delete', 'fs.rename', 'git.push', 'process.exec'].includes(toolId)) ? 'high' : 'medium',
-      resourceKind: capability === 'workspace.write' ? 'workspacePath' : capability,
+      permissionMode: 'ask' as const,
+      risk: toolIds.some((toolId) => ['fs.delete', 'fs.rename', 'git.push', 'process.exec'].includes(toolId)) ? 'high' as const : 'medium' as const,
+      resourceKind: testKernelPermissionResourceKind(capability),
       operationIds,
       toolIds,
       targets,
@@ -491,13 +510,21 @@ export function proposalReviewReport(actionBundle: Record<string, any>, _attachm
         id: action.actionId,
         title: action.description ?? action.actionId,
         toolId: action.toolId,
+        operationKind: testKernelOperationKindForToolId(action.toolId),
         args: action.args ?? {},
         argsHash: `hash-${action.actionId}`,
         readSet: [],
         writeSet: typeof action.args?.path === 'string' ? [action.args.path] : [],
         conflictKeys: typeof action.args?.path === 'string' ? [action.args.path] : [],
         executionMode: 'execute',
-        cleanup: { leasePolicy: 'contract', failurePolicy: 'blockReviewAcceptance' },
+        cleanup: {
+          leasePolicy: 'none',
+          terminateProcessTree: false,
+          removeScratch: false,
+          revokeBrokerGrant: false,
+          deadlineMs: 0,
+          failurePolicy: 'blockReviewAcceptance',
+        },
       })),
       permissionBundles,
       interventions: permissionBundles.map((bundle) => ({
@@ -508,10 +535,39 @@ export function proposalReviewReport(actionBundle: Record<string, any>, _attachm
         affectedOperationIds: bundle.operationIds,
         summary: 'Kernel permission gate.',
       })),
-      cleanupPolicy: 'cleanupContractPerOperation',
+      cleanupPolicy: 'perOperationCleanupContract',
       expiresAfter: 'reviewGateOrRunTerminal',
     },
   };
+}
+
+function testKernelOperationKindForToolId(toolId: string): KernelProposalReviewReport['executionContract']['operations'][number]['operationKind'] {
+  const operationKinds: Record<string, KernelProposalReviewReport['executionContract']['operations'][number]['operationKind']> = {
+    'fs.read': 'fsRead',
+    'fs.list': 'fsList',
+    'fs.glob': 'fsGlob',
+    'code.grep': 'codeGrep',
+    'fs.diff': 'fsDiff',
+    'fs.create': 'fsCreate',
+    'fs.write': 'fsWrite',
+    'fs.edit': 'fsEdit',
+    'fs.rename': 'fsRename',
+    'fs.delete': 'fsDelete',
+    'document.read': 'documentRead',
+    'git.status': 'gitStatus',
+    'git.diff': 'gitDiff',
+    'git.stage': 'gitStage',
+    'git.unstage': 'gitUnstage',
+    'git.commit': 'gitCommit',
+    'git.push': 'gitPush',
+    'web.search': 'webSearch',
+    'web.fetch': 'webFetch',
+    'process.exec': 'processExec',
+    'provider.call': 'providerCall',
+  };
+  const operationKind = operationKinds[toolId];
+  if (!operationKind) throw new Error(`Test ToolContract is missing operationKind for ${toolId}.`);
+  return operationKind;
 }
 
 function testKernelCapabilityForToolId(toolId: string): string | undefined {
@@ -531,6 +587,18 @@ function testKernelPermissionModeForToolId(toolId: string): 'allow' | 'ask' {
   return ['fs.read', 'fs.list', 'fs.glob', 'fs.diff', 'code.grep', 'document.read', 'git.status', 'git.diff'].includes(toolId)
     ? 'allow'
     : 'ask';
+}
+
+function testKernelPermissionResourceKind(
+  capability: string
+): KernelProposalReviewReport['executionContract']['permissionBundles'][number]['resourceKind'] {
+  if (capability === 'workspace.write' || capability === 'workspace.read') return 'workspacePath';
+  if (capability === 'git.read' || capability === 'git.write' || capability === 'git.push') return 'gitWorkspace';
+  if (capability === 'process.exec') return 'process';
+  if (capability === 'network.egress') return 'networkTarget';
+  if (capability === 'browser.control') return 'browserState';
+  if (capability === 'provider.egress') return 'providerProfile';
+  return 'runtimePermission';
 }
 
 export function requiredAccessScopesFromActionBundle(actionBundle: Record<string, any>): Array<Record<string, any>> {
@@ -1407,10 +1475,10 @@ export function processExecProposal(): Record<string, unknown> {
 }
 
 export function fakeKernel(request: KernelCommandEnvelope): KernelReply {
-  const command = request.command as Record<string, any>;
+  const command = request.command;
   if (command.kind === 'runCreate') {
     const toolCatalogSnapshot = genericToolCatalogSnapshot();
-    const runId = command.runId ?? 'run-generic';
+    const runId = 'run-generic';
     const sessionId = command.sessionId ?? 'session-generic';
     return {
       ok: true,
@@ -1464,22 +1532,24 @@ export function fakeKernel(request: KernelCommandEnvelope): KernelReply {
     const catalogTools = Array.isArray(toolCatalogSnapshot.tools)
       ? toolCatalogSnapshot.tools as Array<Record<string, any>>
       : [];
-    const operations = tasks.flatMap((task, taskIndex) => {
+    const operations: KernelPlanAuthorizationContract['operations'] = tasks.flatMap((task, taskIndex) => {
       const toolId = String(task.toolId ?? '').trim();
       const targets = Array.isArray(task.targets)
         ? task.targets.map((target: unknown) => String(target).trim()).filter(Boolean)
         : [];
       if (!toolId || targets.length === 0) return [];
       const contract = catalogTools.find((tool) => tool.toolId === toolId);
-      const operationKind = String(contract?.operationKind ?? '').trim();
-      const contentMode = String(contract?.usageConstraints?.contentMode ?? 'none').trim();
+      const operationKind = testKernelOperationKindForToolId(toolId);
+      const contentMode = contract?.usageConstraints && typeof contract.usageConstraints === 'object' && !Array.isArray(contract.usageConstraints)
+        ? String((contract.usageConstraints as Record<string, unknown>).contentMode ?? 'none') as KernelPlanAuthorizationContract['operations'][number]['contentMode']
+        : 'none';
       const sourceTaskId = String(task.taskId ?? `task-${taskIndex + 1}`);
       const fixedArgs = task.args && typeof task.args === 'object' && !Array.isArray(task.args)
         ? { ...task.args }
         : {};
       const mutating = ['fs.create', 'fs.write', 'fs.edit', 'fs.rename', 'fs.delete'].includes(toolId);
       return targets.map((target: string, targetIndex: number) => {
-        const targetResourceKind = toolId === 'fs.delete' ? 'file' : undefined;
+        const targetResourceKind = toolId === 'fs.delete' ? 'file' as const : undefined;
         const argsTemplate: Record<string, unknown> = { path: target };
         if (contentMode === 'contentBlock') argsTemplate.contentBlockId = 'executionTime';
         if (contentMode === 'replacementBlock') argsTemplate.replacementBlockId = 'executionTime';
@@ -1502,24 +1572,24 @@ export function fakeKernel(request: KernelCommandEnvelope): KernelReply {
           readSet: mutating ? [] : [target],
           writeSet: mutating ? [target] : [],
           conflictKeys: [`workspace:${target}`],
-          executionMode: 'execute',
+          executionMode: 'execute' as const,
           internal: false,
         };
       });
     });
     const writeOperations = operations.filter((operation) => operation.writeSet.length > 0);
-    const permissionBundles = writeOperations.length > 0 ? [{
+    const permissionBundles: KernelPlanAuthorizationContract['permissionBundles'] = writeOperations.length > 0 ? [{
       id: `permission-bundle-${intent.planId}`,
       capability: 'workspace.write',
       permissionMode: 'ask',
       risk: 'medium',
-      resourceKind: 'workspace',
+      resourceKind: 'workspacePath',
       operationIds: writeOperations.map((operation) => operation.id),
       toolIds: [...new Set(writeOperations.map((operation) => operation.toolId))],
       targets: [...new Set(writeOperations.flatMap((operation) => operation.targets))],
       expiresAfter: 'reviewGateReplanCancelOrRunTerminal',
     }] : [];
-    const authorizationContract = {
+    const authorizationContract: KernelPlanAuthorizationContract = {
       id: `plan-authorization-${intent.planId}`,
       planId: intent.planId,
       planHash: intent.planHash,
@@ -1532,7 +1602,7 @@ export function fakeKernel(request: KernelCommandEnvelope): KernelReply {
       operations,
       permissionBundles,
       interventions: [],
-      cleanupPolicy: 'kernelPlanGrantLease',
+      cleanupPolicy: 'planGrantLease',
       expiresAfter: 'reviewGateReplanCancelOrRunTerminal',
     };
     return {
@@ -1552,7 +1622,9 @@ export function fakeKernel(request: KernelCommandEnvelope): KernelReply {
     };
   }
   if (command.kind === 'resourceResolve') {
-    const entry = command.request.manifest.entries[0] ?? {};
+    const manifest = recordValue(command.request.manifest);
+    const entries = Array.isArray(manifest?.entries) ? manifest.entries : [];
+    const entry = recordValue(entries[0]) ?? {};
     return {
       ok: true,
       events: [
@@ -1563,6 +1635,10 @@ export function fakeKernel(request: KernelCommandEnvelope): KernelReply {
           packet: {
             id: `packet-${command.requestId ?? 'generic'}`,
             requestId: command.requestId,
+            workspaceScopeKey: 'workspace-scope-generic',
+            manifestId: String(manifest?.id ?? 'manifest-generic'),
+            evidenceRefs: ['evidence-generic'],
+            summary: 'Resolved one generic test resource.',
             items: [
               {
                 requestItemId: 'item-generic',
@@ -1590,8 +1666,6 @@ export function fakeKernel(request: KernelCommandEnvelope): KernelReply {
         runId: command.runId,
         sessionId: command.sessionId,
         authorizationContractId: command.decision?.authorizationContractId,
-        planId: command.decision?.planId,
-        decisionId: command.decision?.decisionId,
         decision: command.decision?.decision,
         leaseId: command.decision?.decision === 'accept'
           ? `plan-grant-lease-${command.decision?.planId ?? 'generic'}`
@@ -1627,7 +1701,7 @@ export function genericToolCatalogSnapshot(): Record<string, unknown> {
         ...base,
         toolId: 'fs.read',
         capability: 'fs.read',
-        operationKind: 'read',
+        operationKind: 'fsRead',
         usageConstraints: {
           targetExistence: 'mustExist',
           targetKinds: ['file'],
@@ -1644,7 +1718,7 @@ export function genericToolCatalogSnapshot(): Record<string, unknown> {
         ...base,
         toolId: 'fs.list',
         capability: 'fs.read',
-        operationKind: 'list',
+        operationKind: 'fsList',
         usageConstraints: {
           targetExistence: 'mustExist',
           targetKinds: ['directory'],
@@ -1660,7 +1734,7 @@ export function genericToolCatalogSnapshot(): Record<string, unknown> {
         ...base,
         toolId: 'fs.create',
         capability: 'fs.write',
-        operationKind: 'create',
+        operationKind: 'fsCreate',
         permissionMode: 'ask',
         readOnly: false,
         usageConstraints: {
@@ -1679,7 +1753,7 @@ export function genericToolCatalogSnapshot(): Record<string, unknown> {
         ...base,
         toolId: 'fs.write',
         capability: 'fs.write',
-        operationKind: 'write',
+        operationKind: 'fsWrite',
         permissionMode: 'ask',
         readOnly: false,
         usageConstraints: {
@@ -1698,7 +1772,7 @@ export function genericToolCatalogSnapshot(): Record<string, unknown> {
         ...base,
         toolId: 'fs.edit',
         capability: 'fs.write',
-        operationKind: 'edit',
+        operationKind: 'fsEdit',
         permissionMode: 'ask',
         readOnly: false,
         usageConstraints: {
@@ -1721,7 +1795,7 @@ export function genericToolCatalogSnapshot(): Record<string, unknown> {
         ...base,
         toolId: 'fs.delete',
         capability: 'fs.write',
-        operationKind: 'delete',
+        operationKind: 'fsDelete',
         permissionMode: 'ask',
         risk: 'high',
         readOnly: false,
@@ -1746,7 +1820,7 @@ export function genericToolCatalogSnapshot(): Record<string, unknown> {
         toolId: 'process.exec',
         capability: 'process.exec',
         family: 'process',
-        operationKind: 'exec',
+        operationKind: 'processExec',
         executionMode: 'blocked',
         permissionMode: 'deny',
         pathScopePolicy: 'none',
@@ -1787,4 +1861,155 @@ export function fakeLlm(_request: LlmChatRequest): ApiResponse<LlmChatResult> {
       },
     },
   };
+}
+
+function recordValue(value: unknown): Record<string, any> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, any>
+    : undefined;
+}
+
+export interface KernelTestWorkUnitInput {
+  runId: string;
+  workUnitId: string;
+  actionId: string;
+  toolId?: string;
+  operationKind?: KernelToolOperationKind;
+  planId?: string;
+  readSet?: string[];
+  writeSet?: string[];
+  status?: KernelWorkUnitDescriptor['status'];
+}
+
+export function kernelTestWorkUnit(input: KernelTestWorkUnitInput): KernelWorkUnitDescriptor {
+  const toolId = input.toolId ?? 'fs.create';
+  return {
+    id: input.workUnitId,
+    planId: input.planId ?? `plan-${input.runId}`,
+    actionId: input.actionId,
+    title: input.actionId,
+    toolId,
+    operationKind: input.operationKind ?? operationKindForTestTool(toolId),
+    capability: toolId.startsWith('git.') ? 'git.write' : 'fs.write',
+    readSet: input.readSet ?? [],
+    writeSet: input.writeSet ?? [],
+    conflictKeys: [...(input.writeSet ?? [])],
+    executionMode: 'execute',
+    status: input.status ?? 'queued',
+  };
+}
+
+export function kernelTestWorkUnitQueued(input: KernelTestWorkUnitInput): KernelEventV1 {
+  return {
+    kind: 'work_unit.queued',
+    runId: input.runId,
+    workUnit: kernelTestWorkUnit({ ...input, status: 'queued' }),
+  };
+}
+
+export function kernelTestWorkUnitStarted(runId: string, workUnitId: string): KernelEventV1 {
+  return { kind: 'work_unit.started', runId, workUnitId };
+}
+
+export function kernelTestWorkUnitCompleted(runId: string, workUnitId: string, output?: unknown): KernelEventV1 {
+  return { kind: 'work_unit.completed', runId, workUnitId, ...(output === undefined ? {} : { output }) };
+}
+
+export function kernelTestWorkUnitFailed(
+  runId: string,
+  workUnitId: string,
+  code: string,
+  message: string,
+): KernelEventV1 {
+  return {
+    kind: 'work_unit.failed',
+    runId,
+    workUnitId,
+    error: { code, message },
+  };
+}
+
+export function kernelTestBatchReviewReady(runId: string, contractId = `contract-${runId}`): KernelEventV1 {
+  return { kind: 'batch.review_ready', runId, contractId };
+}
+
+export function kernelTestPermissionRequest(
+  id: string,
+  overrides: Partial<KernelPermissionRequestEnvelope> = {},
+): KernelPermissionRequestEnvelope {
+  return {
+    id,
+    requestKind: 'runtimePermission',
+    affectedOperationIds: [],
+    workUnitIds: [],
+    capability: 'fs.write',
+    riskLevel: 'medium',
+    summary: 'Kernel test permission request.',
+    argsPreview: {},
+    ...overrides,
+  };
+}
+
+export function kernelTestResourcePacket(
+  id: string,
+  requestId: string,
+  items: KernelResourcePacket['items'],
+  workspaceScopeKey = 'workspace-smoke',
+): KernelResourcePacket {
+  return {
+    id,
+    requestId,
+    workspaceScopeKey,
+    manifestId: `manifest-${requestId}`,
+    items,
+    evidenceRefs: items.flatMap((item) => item.evidenceRefs ?? []),
+    summary: `Resolved ${items.length} resource item(s).`,
+  };
+}
+
+export function kernelTestReviewFacts(runId: string, factsRef = `facts-${runId}`): KernelReviewFacts {
+  return {
+    factsRef,
+    runId,
+    eventCount: 0,
+    workUnits: [],
+    queuedWorkUnits: [],
+    startedWorkUnits: [],
+    completedWorkUnits: [],
+    failedWorkUnits: [],
+    blockedWorkUnits: [],
+    awaitingPermissions: [],
+    toolResults: [],
+    gitFacts: [],
+    writtenFiles: [],
+    createdFiles: [],
+    deletedFiles: [],
+    renamedFiles: [],
+    patchChangedRanges: [],
+    generatedArtifacts: [],
+    resourceEvents: [],
+    cleanupFailures: [],
+    pathNormalizationDiagnostics: [],
+    batchReviewReady: true,
+  };
+}
+
+function operationKindForTestTool(toolId: string): KernelToolOperationKind {
+  const operationKinds: Record<string, KernelToolOperationKind> = {
+    'fs.read': 'fsRead',
+    'fs.list': 'fsList',
+    'fs.glob': 'fsGlob',
+    'fs.diff': 'fsDiff',
+    'fs.create': 'fsCreate',
+    'fs.write': 'fsWrite',
+    'fs.edit': 'fsEdit',
+    'fs.rename': 'fsRename',
+    'fs.delete': 'fsDelete',
+    'code.grep': 'codeGrep',
+  };
+  const operationKind = operationKinds[toolId];
+  if (!operationKind) {
+    throw new Error(`Unsupported test toolId: ${toolId}`);
+  }
+  return operationKind;
 }

@@ -58,7 +58,7 @@ pub(crate) fn build_app(state: AppState) -> Router {
         .route("/api/fs/initial-locations", get(fs_initial_locations))
         .route("/api/fs/browse", get(fs_browse))
         .route("/api/host/inspect", post(host_inspect))
-        .route("/api/skills/scan-mount", post(skill_mount_scan))
+        .route("/api/host/skills/scan-mount", post(skill_mount_scan))
         .route(
             "/api/user-settings",
             get(user_settings_get).patch(user_settings_patch),
@@ -184,16 +184,11 @@ pub(crate) fn build_app(state: AppState) -> Router {
             get(agent_workflow_config_get).patch(agent_workflow_config_patch),
         )
         .route("/api/agent/tools", get(agent_tools))
-        .route("/api/agent/skills", get(agent_tools))
+        .route("/api/host/skills", get(host_skills))
         .route("/api/browser/runtime-status", get(browser_status))
         .route("/api/browser/open", post(browser_open))
         .route("/api/browser/reload", post(browser_reload))
         .route("/api/browser/inspect-mode", post(browser_inspect_mode))
-        .route("/api/browser/panel-snapshot", get(browser_panel_snapshot))
-        .route(
-            "/api/browser/panel-snapshot/attach",
-            post(browser_attach_snapshot),
-        )
         .route("/api/*path", any(api_route_not_found));
     if let Some(client_dist) = client_dist_dir() {
         let index_path = client_dist.join("index.html");

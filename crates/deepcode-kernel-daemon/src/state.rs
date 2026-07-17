@@ -39,7 +39,6 @@ pub(crate) struct GuiState {
     pub(crate) session_projection_cache: HashMap<String, Vec<Value>>,
     pub(crate) session_timeline_cache: HashMap<String, Value>,
     pub(crate) trace_events: HashMap<String, Vec<Value>>,
-    pub(crate) browser: BrowserState,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -76,17 +75,6 @@ impl AgentRunState {
     }
 }
 
-#[derive(Debug)]
-pub(crate) struct BrowserState {
-    pub(crate) current_url: Option<String>,
-    pub(crate) inspect_state: String,
-    pub(crate) snapshot: Option<Value>,
-    pub(crate) attached: bool,
-    pub(crate) last_action: Option<String>,
-    pub(crate) last_action_at: Option<String>,
-    pub(crate) last_action_result: Option<String>,
-}
-
 impl GuiState {
     pub(crate) fn new() -> Self {
         let paths = HostPaths::new();
@@ -116,7 +104,6 @@ impl GuiState {
             session_projection_cache: HashMap::new(),
             session_timeline_cache: HashMap::new(),
             trace_events: HashMap::new(),
-            browser: BrowserState::default(),
         }
     }
 }
@@ -144,20 +131,6 @@ impl HostPaths {
             sessions_dir: root.join("sessions"),
             conversation_archives_dir: root.join("conversation-archives"),
             memory_archives_dir: root.join("memory").join("projects"),
-        }
-    }
-}
-
-impl Default for BrowserState {
-    fn default() -> Self {
-        Self {
-            current_url: None,
-            inspect_state: "off".to_string(),
-            snapshot: None,
-            attached: false,
-            last_action: None,
-            last_action_at: None,
-            last_action_result: None,
         }
     }
 }

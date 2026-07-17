@@ -4,7 +4,6 @@ use deepcode_kernel_abi::{
     PendingOperationCheckpoint, PendingOperationCheckpointItem,
     PENDING_OPERATION_CHECKPOINT_SCHEMA_VERSION,
 };
-use deepcode_kernel_tools::KernelExecutionContractV3;
 
 pub(super) struct PendingCheckpointRequest<'a> {
     pub(super) run_id: &'a str,
@@ -29,7 +28,7 @@ pub(super) fn pending_operation_checkpoint(
                 "permission checkpoint requires an accepted execution contract".to_string(),
             )
         })?;
-    let contract_value = state
+    let contract = state
         .execution_contracts_by_run
         .get(request.run_id)
         .and_then(|contracts| contracts.get(contract_id))
@@ -37,12 +36,6 @@ pub(super) fn pending_operation_checkpoint(
         .ok_or_else(|| {
             KernelError::InvalidCommand(format!(
                 "execution contract {contract_id} is unavailable for permission checkpoint"
-            ))
-        })?;
-    let contract: KernelExecutionContractV3 =
-        serde_json::from_value(contract_value).map_err(|error| {
-            KernelError::InvalidCommand(format!(
-                "decode execution contract {contract_id} for permission checkpoint: {error}"
             ))
         })?;
     let items = request

@@ -62,7 +62,7 @@ function normalizeScanItem(item: unknown): SkillScanItem | null {
     envAllowlist: Array.isArray(raw.envAllowlist) ? raw.envAllowlist.map(String) : [],
     modelVisible: raw.modelVisible === true,
     requiresApproval: raw.requiresApproval === true,
-    v1RuntimeEnabled: raw.v1RuntimeEnabled !== false,
+    activationStatus: raw.activationStatus === 'registered' ? 'registered' : 'dormant',
     riskLevel: String(raw.riskLevel || 'low'),
   };
 }
@@ -574,9 +574,9 @@ const SkillRuntimeSection: React.FC = () => {
                         <span>{skill.manifestStatus}</span>
                         <span>{skill.workspaceAccess}</span>
                         <span>
-                          {skill.v1RuntimeEnabled
-                            ? t(language, 'settings.skill.v1Enabled')
-                            : t(language, 'settings.skill.v1Disabled')}
+                          {skill.activationStatus === 'registered'
+                            ? t(language, 'settings.skill.registered')
+                            : t(language, 'settings.skill.dormant')}
                         </span>
                         <span>
                           {skill.requiresApproval

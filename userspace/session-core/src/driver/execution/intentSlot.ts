@@ -11,6 +11,7 @@ export type IntentSlotOperation =
 export interface IntentSlot {
   readonly slotId: string;
   readonly taskId: string;
+  readonly toolId: string;
   readonly operation: IntentSlotOperation;
   readonly targetRef: string;
   readonly targetResourceKind?: 'file' | 'directory';
@@ -36,6 +37,7 @@ export class IntentSlotRegistry {
       .filter((operation) => operation.sourceTaskId === task.taskId && !operation.internal)
       .map((operation) => ({
         operationId: operation.operationId,
+        toolId: operation.toolId,
         operation: semanticOperation(operation.operationKind),
         targetRef: stringValue(operation.argsTemplate.path),
         targetResourceKind: operation.targetResourceKind,
@@ -57,6 +59,7 @@ export class IntentSlotRegistry {
       return [{
         slotId: `slot-${task.taskId}-${candidate.operationId}`,
         taskId: task.taskId,
+        toolId: candidate.toolId,
         operation: candidate.operation,
         targetRef,
         targetResourceKind: candidate.targetResourceKind,
@@ -85,12 +88,12 @@ export class IntentSlotRegistry {
 }
 
 function semanticOperation(operation: string | undefined): IntentSlotOperation | undefined {
-  if (operation === 'create') return 'createFile';
-  if (operation === 'write') return 'replaceFile';
-  if (operation === 'patch') return 'patchFile';
-  if (operation === 'delete') return 'deletePath';
-  if (operation === 'rename') return 'renamePath';
-  if (operation === 'exec') return 'runProcess';
+  if (operation === 'fsCreate') return 'createFile';
+  if (operation === 'fsWrite') return 'replaceFile';
+  if (operation === 'fsEdit') return 'patchFile';
+  if (operation === 'fsDelete') return 'deletePath';
+  if (operation === 'fsRename') return 'renamePath';
+  if (operation === 'processExec') return 'runProcess';
   return undefined;
 }
 

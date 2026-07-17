@@ -9,17 +9,7 @@ pub(super) struct ResourceResolutionScope {
 
 pub(super) fn driver_request_kind_name(kind: &DriverRequestKind) -> &'static str {
     match kind {
-        DriverRequestKind::NeedRequirementDraft => "need-requirement-draft",
-        DriverRequestKind::NeedRequirementDecision => "need-requirement-decision",
-        DriverRequestKind::NeedResourcePacket => "need-resource-packet",
         DriverRequestKind::NeedProposal => "need-proposal",
-        DriverRequestKind::NeedUserPlanDecision => "need-user-plan-decision",
-        DriverRequestKind::NeedUserPermissionDecision => "need-user-permission-decision",
-        DriverRequestKind::NeedRepairProposal => "need-repair-proposal",
-        DriverRequestKind::NeedReviewPacket => "need-review-packet",
-        DriverRequestKind::NeedUserReviewDecision => "need-user-review-decision",
-        DriverRequestKind::WaitKernelExecution => "wait-kernel-execution",
-        DriverRequestKind::Terminal => "terminal",
     }
 }
 
@@ -41,7 +31,7 @@ pub(super) fn resource_packet_from_manifest(
     request_id: &RequestId,
     manifest: &Value,
     scope: &ResourceResolutionScope,
-) -> Value {
+) -> ResourcePacket {
     let manifest_id = manifest
         .get("id")
         .and_then(Value::as_str)
@@ -59,25 +49,70 @@ pub(super) fn resource_packet_from_manifest(
     let items = entries
         .iter()
         .enumerate()
-        .map(|(index, entry)| resolve_resource_manifest_entry(request_id, index, entry, scope))
+        .map(|(index, entry)| {
+            let item = resolve_resource_manifest_entry(request_id, index, entry, scope);
+            serde_json::from_value(item).unwrap_or_else(|error| ResourcePacketItem {
+                request_item_id: format!("item-{index}"),
+                manifest_entry_id: format!("entry-{index}"),
+                status: ResourcePacketStatus::Error,
+                read_policy: "explicit-manifest-readonly".to_string(),
+                source_kind: "resource".to_string(),
+                resolved_kind: None,
+                path: None,
+                absolute_path: None,
+                content_kind: None,
+                root_id: None,
+                content: None,
+                prompt_content: None,
+                content_hash: None,
+                metadata_hash: None,
+                size_bytes: None,
+                original_bytes: None,
+                offset_bytes: None,
+                limit_bytes: None,
+                returned_bytes: None,
+                returned_count: None,
+                returned_matches: None,
+                directory_depth: None,
+                context_lines: None,
+                max_results: None,
+                visited_files: None,
+                skipped_files: None,
+                skipped_binary_files: None,
+                skipped_executable_files: None,
+                truncated: None,
+                range_complete: None,
+                query: None,
+                strategy: None,
+                include: Vec::new(),
+                exclude: Vec::new(),
+                nodes: Vec::new(),
+                matches: Vec::new(),
+                file_classification: None,
+                content_summary: None,
+                evidence_ref: None,
+                evidence_refs: Vec::new(),
+                reason: Some("resource_packet_encoding_failed".to_string()),
+                message: Some(error.to_string()),
+                skip_reason: None,
+                skip_message: None,
+            })
+        })
         .collect::<Vec<_>>();
     let evidence_refs = items
         .iter()
-        .filter_map(|item| {
-            item.get("evidenceRef")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
+        .filter_map(|item| item.evidence_ref.clone())
         .collect::<Vec<_>>();
-    serde_json::json!({
-        "id": format!("resource-packet-{}", request_id.0),
-        "requestId": request_id.0,
-        "workspaceScopeKey": workspace_scope_key,
-        "manifestId": manifest_id,
-        "items": items,
-        "evidenceRefs": evidence_refs,
-        "summary": "Kernel ResourceResolve produced a ResourcePacket from explicit manifest entries."
-    })
+    ResourcePacket {
+        id: format!("resource-packet-{}", request_id.0),
+        request_id: request_id.0.clone(),
+        workspace_scope_key: workspace_scope_key.to_string(),
+        manifest_id: manifest_id.to_string(),
+        items,
+        evidence_refs,
+        summary: "Kernel ResourceResolve produced a ResourcePacket from explicit manifest entries."
+            .to_string(),
+    }
 }
 
 pub(super) fn resolve_resource_manifest_entry(
@@ -113,11 +148,10 @@ pub(super) fn resolve_resource_manifest_entry(
     let metadata = match fs::metadata(&path) {
         Ok(metadata) => metadata,
         Err(error) => {
-            return resource_packet_error_item(
+            return resource_packet_not_found_item(
                 &request_item_id,
                 &manifest_entry_id,
                 source_kind,
-                "not_found",
                 &format!("stat {}: {error}", path.display()),
             );
         }
@@ -659,6 +693,24 @@ pub(super) fn resource_packet_error_item(
         "readPolicy": "explicit-manifest-readonly",
         "sourceKind": source_kind,
         "reason": reason,
+        "message": message,
+        "evidenceRefs": []
+    })
+}
+
+pub(super) fn resource_packet_not_found_item(
+    request_item_id: &str,
+    manifest_entry_id: &str,
+    source_kind: &str,
+    message: &str,
+) -> Value {
+    serde_json::json!({
+        "requestItemId": request_item_id,
+        "manifestEntryId": manifest_entry_id,
+        "status": "notFound",
+        "readPolicy": "explicit-manifest-readonly",
+        "sourceKind": source_kind,
+        "reason": "not_found",
         "message": message,
         "evidenceRefs": []
     })

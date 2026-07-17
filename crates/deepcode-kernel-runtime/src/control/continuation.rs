@@ -1,4 +1,5 @@
 use super::*;
+use deepcode_kernel_abi::{ArtifactDraftLedgerFrame, ArtifactDraftPartKind, ArtifactDraftStatus};
 
 impl DeepCodeKernelRuntime {
     pub(crate) fn run_resume(
@@ -50,7 +51,7 @@ impl DeepCodeKernelRuntime {
         request_id: RequestId,
         run_id: RunId,
         session_id: Option<SessionId>,
-        frame: Value,
+        frame: ArtifactDraftLedgerFrame,
     ) -> KernelResult<Vec<KernelEvent>> {
         let session_id = session_id
             .map(|value| value.0)
@@ -70,67 +71,93 @@ impl DeepCodeKernelRuntime {
         request_id: RequestId,
         run_id: RunId,
         session_id: String,
-        frame: Value,
+        frame: ArtifactDraftLedgerFrame,
     ) -> KernelResult<Vec<KernelEvent>> {
-        let admission =
-            admit_artifact_draft_frame(&mut self.state, &run_id.0, &session_id, &frame)?;
+        let admission = admit_artifact_draft_frame(&self.state, &run_id.0, &session_id, &frame)?;
         let mut events = Vec::new();
+        let mut ledger_events = Vec::new();
+        let first_sequence = self.ledger.next_sequence(&run_id.0)?;
+        let frame_sequence = if admission.opened {
+            first_sequence + 1
+        } else {
+            first_sequence
+        };
         if admission.opened {
-            let sequence = self.ledger.next_sequence(&run_id.0)?;
-            let draft = draft_payload(&admission.draft_id, "draft.open", &frame);
-            self.append_ledger(
-                &run_id.0,
-                &session_id,
-                "draft.open",
-                sequence,
-                draft.clone(),
-            )?;
+            let draft = draft_payload(&admission.draft_id, ArtifactDraftStatus::Open, &frame);
+            ledger_events.push(LedgerEvent {
+                id: format!("evt-{}-{first_sequence}", run_id.0),
+                run_id: Some(run_id.0.clone()),
+                session_id: Some(session_id.clone()),
+                kind: "draft.open".to_string(),
+                sequence: Some(first_sequence),
+                payload: serde_json::to_value(&draft).map_err(|error| {
+                    KernelError::InvalidCommand(format!("encode typed draft event: {error}"))
+                })?,
+                created_at: None,
+            });
             events.push(KernelEvent::DraftOpen {
                 request_id: Some(request_id.clone()),
                 run_id: run_id.clone(),
                 session_id: Some(SessionId(session_id.clone())),
                 draft,
-                sequence: Some(sequence),
+                sequence: Some(first_sequence),
             });
         }
-        let (event_kind, status) = match admission.part_kind.as_str() {
-            "artifactChunk" => ("draft.chunk", "draft.chunk"),
-            "batchDone" => ("draft.batch_completed", "draft.batch_completed"),
-            "diagnostic" => ("draft.discarded", "draft.discarded"),
-            _ => unreachable!("artifact draft admission validates partKind"),
+        let (event_kind, status) = match admission.part_kind {
+            ArtifactDraftPartKind::ArtifactChunk => ("draft.chunk", ArtifactDraftStatus::Chunk),
+            ArtifactDraftPartKind::BatchDone => {
+                ("draft.batch_completed", ArtifactDraftStatus::BatchCompleted)
+            }
+            ArtifactDraftPartKind::Diagnostic => {
+                ("draft.discarded", ArtifactDraftStatus::Discarded)
+            }
         };
-        let sequence = self.ledger.next_sequence(&run_id.0)?;
         let draft = draft_payload(&admission.draft_id, status, &frame);
-        let event = match admission.part_kind.as_str() {
-            "artifactChunk" => KernelEvent::DraftChunk {
+        let event = match admission.part_kind {
+            ArtifactDraftPartKind::ArtifactChunk => KernelEvent::DraftChunk {
                 request_id: Some(request_id),
                 run_id: run_id.clone(),
                 session_id: Some(SessionId(session_id.clone())),
                 draft: draft.clone(),
-                sequence: Some(sequence),
+                sequence: Some(frame_sequence),
             },
-            "batchDone" => KernelEvent::DraftBatchCompleted {
+            ArtifactDraftPartKind::BatchDone => KernelEvent::DraftBatchCompleted {
                 request_id: Some(request_id),
                 run_id: run_id.clone(),
                 session_id: Some(SessionId(session_id.clone())),
                 draft: draft.clone(),
-                sequence: Some(sequence),
+                sequence: Some(frame_sequence),
             },
-            "diagnostic" => KernelEvent::DraftDiscarded {
+            ArtifactDraftPartKind::Diagnostic => KernelEvent::DraftDiscarded {
                 request_id: Some(request_id),
                 run_id: run_id.clone(),
                 session_id: Some(SessionId(session_id.clone())),
                 draft: draft.clone(),
-                sequence: Some(sequence),
+                sequence: Some(frame_sequence),
             },
-            _ => unreachable!("artifact draft admission validates partKind"),
         };
-        self.append_ledger(&run_id.0, &session_id, event_kind, sequence, draft)?;
+        ledger_events.push(LedgerEvent {
+            id: format!("evt-{}-{frame_sequence}", run_id.0),
+            run_id: Some(run_id.0.clone()),
+            session_id: Some(session_id.clone()),
+            kind: event_kind.to_string(),
+            sequence: Some(frame_sequence),
+            payload: serde_json::to_value(&draft).map_err(|error| {
+                KernelError::InvalidCommand(format!("encode typed draft event: {error}"))
+            })?,
+            created_at: None,
+        });
+        self.append_ledger_batch(ledger_events)?;
         events.push(event);
         if admission.terminal {
-            let draft_key = format!("{}:{}", run_id.0, admission.draft_id);
-            self.state.artifact_drafts.remove(&draft_key);
-            self.state.terminal_artifact_draft_keys.insert(draft_key);
+            self.state.artifact_drafts.remove(&admission.draft_key);
+            self.state
+                .terminal_artifact_draft_keys
+                .insert(admission.draft_key);
+        } else {
+            self.state
+                .artifact_drafts
+                .insert(admission.draft_key, admission.record);
         }
         Ok(events)
     }
@@ -154,7 +181,6 @@ impl DeepCodeKernelRuntime {
                 current_state.as_str()
             )));
         }
-        self.record_by_run_mut(run_id)?.lifecycle_state = current_state;
         let reason = reason.into();
         let sequence = self.ledger.next_sequence(run_id)?;
         self.append_ledger(
@@ -169,6 +195,7 @@ impl DeepCodeKernelRuntime {
                 "reason": reason
             }),
         )?;
+        self.record_by_run_mut(run_id)?.lifecycle_state = current_state;
         Ok(Some(KernelEvent::RuntimeLifecycleChanged {
             request_id,
             run_id: RunId(run_id.to_string()),

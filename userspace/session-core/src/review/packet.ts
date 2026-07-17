@@ -55,7 +55,6 @@ function validationResultsFromCandidates(input: BuildReviewPacketInput): ReviewV
   return input.selfCheckInput.validationCandidates.map((candidate) => ({
     id: candidate.id,
     description: candidate.description,
-    command: candidate.command,
     status: 'pending',
   }));
 }

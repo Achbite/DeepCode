@@ -25,6 +25,84 @@ fn run_create_produces_state_contract_and_driver_request() {
 }
 
 #[test]
+fn run_initialization_persistence_failure_installs_no_record_or_resource_lease() {
+    let enabled = Arc::new(AtomicBool::new(true));
+    let ledger = EventKindFailingLedger {
+        inner: InMemoryEventLedger::new(),
+        fail_kind: "run.started".to_string(),
+        enabled,
+    };
+    let path = std::env::temp_dir().join(format!(
+        "deepcode-run-init-atomic-{}-{}",
+        std::process::id(),
+        TEMP_INDEX.fetch_add(1, Ordering::SeqCst)
+    ));
+    fs::create_dir_all(&path).expect("create run initialization workspace");
+    let workspace = TestWorkspace(path);
+    let mut runtime = DeepCodeKernelRuntime::with_ledger(Box::new(ledger));
+
+    runtime
+        .dispatch(KernelCommand::RunCreate {
+            request_id: RequestId("run-init-persistence-failure".to_string()),
+            session_id: Some(SessionId("session-init-failure".to_string())),
+            input: UserInput {
+                text: "Initialize a run with a bound workspace.".to_string(),
+                attachments: Vec::new(),
+            },
+            workspace_binding: Some(workspace_binding_from_root(&workspace)),
+            profile_ref: None,
+            run_overrides: None,
+        })
+        .expect_err("run initialization persistence failure must fail closed");
+
+    assert!(runtime.state.records_by_session.is_empty());
+    assert!(runtime.state.resource_manager.list().is_empty());
+}
+
+#[test]
+fn lifecycle_persistence_failure_does_not_mutate_live_runtime_state() {
+    let enabled = Arc::new(AtomicBool::new(false));
+    let ledger = EventKindFailingLedger {
+        inner: InMemoryEventLedger::new(),
+        fail_kind: "runtime.lifecycle_changed".to_string(),
+        enabled: Arc::clone(&enabled),
+    };
+    let mut runtime = DeepCodeKernelRuntime::with_ledger(Box::new(ledger));
+    runtime
+        .dispatch(KernelCommand::RunCreate {
+            request_id: RequestId("lifecycle-atomic-run".to_string()),
+            session_id: Some(SessionId("session-lifecycle-atomic".to_string())),
+            input: UserInput {
+                text: "Initialize a lifecycle persistence check.".to_string(),
+                attachments: Vec::new(),
+            },
+            workspace_binding: None,
+            profile_ref: None,
+            run_overrides: None,
+        })
+        .expect("run creates before lifecycle failure is enabled");
+    enabled.store(true, Ordering::SeqCst);
+
+    runtime
+        .transition_runtime_lifecycle(
+            None,
+            "run-1",
+            "session-lifecycle-atomic",
+            RuntimeLifecycleState::Executing,
+            "testPersistenceFailure",
+        )
+        .expect_err("lifecycle persistence failure must fail closed");
+
+    assert_eq!(
+        runtime
+            .record_by_run("run-1")
+            .expect("run remains available")
+            .lifecycle_state,
+        RuntimeLifecycleState::Ready
+    );
+}
+
+#[test]
 fn workspace_binding_resolve_is_host_only_and_does_not_replace_current_workspace() {
     let path = std::env::temp_dir().join(format!(
         "deepcode-binding-resolve-{}-{}",
@@ -35,7 +113,7 @@ fn workspace_binding_resolve_is_host_only_and_does_not_replace_current_workspace
     let workspace = TestWorkspace(path.clone());
     let mut runtime = DeepCodeKernelRuntime::new();
     let events = runtime
-        .dispatch(KernelCommand::WorkspaceBindingResolve {
+        .dispatch(KernelCommand::HostWorkspaceBindingResolve {
             request_id: RequestId("binding-resolve".to_string()),
             path: path.to_string_lossy().to_string(),
         })
@@ -43,18 +121,20 @@ fn workspace_binding_resolve_is_host_only_and_does_not_replace_current_workspace
     let output = events
         .into_iter()
         .find_map(|event| match event {
-            KernelEvent::ToolCompleted {
-                tool_name,
-                ok: true,
-                output,
+            KernelEvent::HostWorkspaceCompleted {
+                result:
+                    HostWorkspaceResult {
+                        output: HostWorkspaceOutput::BindingResolved(output),
+                        ..
+                    },
                 ..
-            } if tool_name == "workspace.binding.resolve" => output,
+            } => Some(output),
             _ => None,
         })
         .expect("binding output");
-    assert_eq!(output["rootStatus"], "ready");
+    assert_eq!(output.root_status, HostWorkspaceRootStatus::Ready);
     assert_eq!(
-        output["workspaceBinding"]["openPath"].as_str(),
+        output.workspace_binding.open_path.as_deref(),
         Some(workspace.to_string_lossy().as_ref())
     );
     assert!(runtime.state.current_workspace.is_none());
@@ -70,7 +150,7 @@ fn workspace_binding_resolve_rejects_regular_files() {
     fs::write(&path, "text").expect("write binding candidate");
     let mut runtime = DeepCodeKernelRuntime::new();
     let error = runtime
-        .dispatch(KernelCommand::WorkspaceBindingResolve {
+        .dispatch(KernelCommand::HostWorkspaceBindingResolve {
             request_id: RequestId("binding-file".to_string()),
             path: path.to_string_lossy().to_string(),
         })
@@ -99,7 +179,7 @@ fn resource_resolve_uses_each_run_binding_instead_of_global_workspace() {
     let _second = TestWorkspace(second_path.clone());
     let mut runtime = DeepCodeKernelRuntime::new();
     runtime
-        .dispatch(KernelCommand::WorkspaceOpen {
+        .dispatch(KernelCommand::HostWorkspaceOpen {
             request_id: RequestId("global-workspace".to_string()),
             path: second_path.to_string_lossy().to_string(),
         })
@@ -127,7 +207,7 @@ fn resource_resolve_uses_each_run_binding_instead_of_global_workspace() {
         let events = runtime
             .dispatch(KernelCommand::ResourceResolve {
                 request_id: RequestId(format!("resolve-{run_id}")),
-                run_id: Some(RunId(run_id.to_string())),
+                run_id: RunId(run_id.to_string()),
                 session_id: Some(SessionId(session_id.to_string())),
                 request: ResourceResolveRequest {
                     manifest: serde_json::json!({
@@ -143,7 +223,7 @@ fn resource_resolve_uses_each_run_binding_instead_of_global_workspace() {
                 _ => None,
             })
             .expect("resource packet");
-        assert_eq!(packet["items"][0]["content"].as_str(), Some(expected));
+        assert_eq!(packet.items[0].content.as_deref(), Some(expected));
     }
 }
 
@@ -158,7 +238,7 @@ fn agent_action_does_not_fall_back_to_host_current_workspace() {
     let workspace = TestWorkspace(path.clone());
     let mut runtime = DeepCodeKernelRuntime::new();
     runtime
-        .dispatch(KernelCommand::WorkspaceOpen {
+        .dispatch(KernelCommand::HostWorkspaceOpen {
             request_id: RequestId("host-workspace-open".to_string()),
             path: path.to_string_lossy().to_string(),
         })

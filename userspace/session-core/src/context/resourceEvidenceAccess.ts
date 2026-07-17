@@ -92,6 +92,9 @@ export function resourceEvidenceReuseInstruction(block: ResourceEvidenceAccessBl
   if (block.status === 'error') {
     return 'previous read failed; request a different focused segment only if it adds evidence';
   }
+  if (block.status === 'notFound') {
+    return 'the Kernel confirmed that this resource does not exist at the recorded workspace revision';
+  }
   if (block.contentKind === 'directoryTree' && (block.retention === 'full' || block.retention === 'summary')) {
     return 'directory inventory is available for existence checks and plan targets; request file text only when exact content is required';
   }

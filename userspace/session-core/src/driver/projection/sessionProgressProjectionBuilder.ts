@@ -39,7 +39,7 @@ export type SessionRunStateReason =
 export interface SessionProgressProjectionBuilderPorts {
   interactionOverlayPayload(overlay: InteractionOverlayContext | undefined): Record<string, unknown>;
   hasFailureOrBlocker(kernelEvents: unknown[]): boolean;
-  auditAcceptedPlanBatch(batch: Record<string, unknown>): Record<string, unknown>;
+  auditAcceptedPlanBatch(batch: unknown): Record<string, unknown>;
   actionBundleAdmissionBatch(proposal: ProposalEnvelope): Record<string, unknown>;
   acceptedPlanTaskLedger(accepted: AcceptedTaskPlanContext): TaskLedgerSnapshot | undefined;
   acceptedPlanPromptFrame(
@@ -387,7 +387,7 @@ export class SessionProgressProjectionBuilder {
   acceptedPlanActionBatchPreflightEvent(
     sessionId: string,
     plan: { runId: string; planId: string },
-    batch: Record<string, unknown>,
+    batch: unknown,
     ts: string,
     id: string
   ): AgentEvent {

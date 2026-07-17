@@ -23,7 +23,7 @@ if git -C "$ROOT_DIR" diff --quiet --ignore-submodules -- 2>/dev/null \
 else
   SOURCE_DIRTY=1
 fi
-REQUESTED_PRODUCTS_RAW="${DEEPCODE_MACOS_PRODUCTS:-${DEEPCODE_MACOS_PRODUCT:-DeepCode}}"
+REQUESTED_PRODUCTS_RAW="${DEEPCODE_MACOS_PRODUCTS:-DeepCode}"
 declare -a REQUESTED_PRODUCTS=()
 PRODUCT=""
 APP_NAME=""
@@ -126,8 +126,6 @@ Usage:
 Environment:
   DEEPCODE_MACOS_PRODUCTS=DeepCode-GUI,DeepCode
                                 Build one ordered product-set transaction.
-  DEEPCODE_MACOS_PRODUCT=DeepCode|DeepCode-GUI
-                                Compatibility alias for a single product.
   DEEPCODE_MACOS_CLEAN=1        Clean macOS package build artifacts before rebuilding.
   DEEPCODE_MACOS_REFRESH_GUI_DIST=1
                                 Ensure GUI dist through one incremental Docker build. Defaults to 1 for package builds.

@@ -1,5 +1,4 @@
 use crate::prelude::*;
-use crate::*;
 
 pub(crate) fn kernel_ledger_path() -> Option<PathBuf> {
     if std::env::var("DEEPCODE_LEDGER_BACKEND")
@@ -105,69 +104,6 @@ pub(crate) fn home_dir() -> Option<PathBuf> {
         .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
 }
 
-pub(crate) fn normalize_workspace_file_name(name: &str) -> Result<String, String> {
-    let trimmed = name.trim();
-    if trimmed.is_empty() {
-        return Err("workspace file name is required".to_string());
-    }
-    if trimmed.contains('/') || trimmed.contains('\\') || trimmed == "." || trimmed == ".." {
-        return Err("workspace file name must not contain path separators".to_string());
-    }
-    let mut file_name = trimmed.to_string();
-    if !file_name.ends_with(".code-workspace") {
-        file_name.push_str(".code-workspace");
-    }
-    Ok(file_name)
-}
-
-pub(crate) fn workspace_file_name_from_label(label: &str) -> String {
-    let sanitized = label
-        .chars()
-        .map(|ch| {
-            if matches!(ch, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') {
-                '-'
-            } else {
-                ch
-            }
-        })
-        .collect::<String>();
-    normalize_workspace_file_name(&sanitized)
-        .unwrap_or_else(|_| "DeepCode.code-workspace".to_string())
-}
-
-pub(crate) fn sorted_dir_entries(path: &FsPath) -> std::io::Result<Vec<fs::DirEntry>> {
-    let mut entries = fs::read_dir(path)?.collect::<Result<Vec<_>, _>>()?;
-    entries.sort_by(compare_dir_entries);
-    Ok(entries)
-}
-
-pub(crate) fn compare_dir_entries(left: &fs::DirEntry, right: &fs::DirEntry) -> Ordering {
-    let left_name = left.file_name().to_string_lossy().to_string();
-    let right_name = right.file_name().to_string_lossy().to_string();
-    let left_is_dir = left.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
-    let right_is_dir = right.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
-    (
-        if left_is_dir { 0_u8 } else { 1_u8 },
-        if left_name.starts_with('.') {
-            1_u8
-        } else {
-            0_u8
-        },
-        left_name.to_lowercase(),
-        left_name,
-    )
-        .cmp(&(
-            if right_is_dir { 0_u8 } else { 1_u8 },
-            if right_name.starts_with('.') {
-                1_u8
-            } else {
-                0_u8
-            },
-            right_name.to_lowercase(),
-            right_name,
-        ))
-}
-
 pub(crate) fn read_json_file(path: &PathBuf) -> Option<Value> {
     let content = fs::read_to_string(path).ok()?;
     serde_json::from_str(&content).ok()
@@ -209,12 +145,6 @@ pub(crate) fn now_millis() -> u128 {
 
 pub(crate) fn now_text() -> String {
     now_millis().to_string()
-}
-
-pub(crate) fn update_browser_action(browser: &mut BrowserState, action: &str, result: &str) {
-    browser.last_action = Some(action.to_string());
-    browser.last_action_at = Some(now_text());
-    browser.last_action_result = Some(result.to_string());
 }
 
 pub(crate) fn rid(value: &str) -> RequestId {

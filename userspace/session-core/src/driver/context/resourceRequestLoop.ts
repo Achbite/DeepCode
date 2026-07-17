@@ -113,6 +113,7 @@ export class ResourceRequestLoop {
 
   packetEvent(sessionId: string, packet: ResourcePacket, ts: string, id: string): AgentEvent {
     const activity = this.packetActivity(packet, id);
+    const failed = resourcePacketFailed(packet);
     return {
       id,
       sessionId,
@@ -120,8 +121,8 @@ export class ResourceRequestLoop {
       kind: 'tool_result',
       payload: {
         toolName: 'kernel.resourceResolve',
-        status: packet.items.some((item) => item.status === 'error' || item.status === 'denied') ? 'error' : 'ok',
-        summary: `Kernel resolved ${packet.items.length} resource item(s).`,
+        status: failed ? 'error' : 'ok',
+        summary: resourcePacketSummary(packet),
         output: packet,
         channel: 'tool',
         visibility: 'conversation',
@@ -132,14 +133,14 @@ export class ResourceRequestLoop {
   }
 
   packetActivity(packet: ResourcePacket, activityId: string, runId?: string): AgentConversationActivity {
-    const failed = packet.items.some((item) => item.status === 'error' || item.status === 'denied');
+    const failed = resourcePacketFailed(packet);
     const search = packet.items.some((item) => item.contentKind === 'searchResults');
     return conversationActivity({
       activityId,
       kind: search ? 'resourceSearch' : 'resourceRead',
       status: failed ? 'failed' : 'completed',
       title: search ? 'Search results resolved' : 'Resource context resolved',
-      summary: `Kernel resolved ${packet.items.length} resource item(s).`,
+      summary: resourcePacketSummary(packet),
       source: 'kernel',
       runId,
       targets: packet.items.flatMap((item) => [
@@ -193,7 +194,7 @@ function resourcePacketFromRecord(packet: Record<string, unknown>, fallbackId: s
 }
 
 function resourcePacketItemFromKernel(item: Record<string, unknown>): ResourcePacketItem {
-  const status = item.status === 'resolved' || item.status === 'provided' || item.status === 'skipped'
+  const status = item.status === 'resolved' || item.status === 'provided' || item.status === 'notFound' || item.status === 'skipped'
     ? item.status
     : item.status === 'denied'
       ? 'denied'
@@ -235,6 +236,17 @@ function resourcePacketItemFromKernel(item: Record<string, unknown>): ResourcePa
       : [],
     sourceKind: 'kernelResource',
   };
+}
+
+function resourcePacketFailed(packet: ResourcePacket): boolean {
+  return packet.items.length > 0 && packet.items.every((item) => item.status === 'error' || item.status === 'denied');
+}
+
+function resourcePacketSummary(packet: ResourcePacket): string {
+  const counts = new Map<ResourcePacketItem['status'], number>();
+  for (const item of packet.items) counts.set(item.status, (counts.get(item.status) ?? 0) + 1);
+  const detail = [...counts.entries()].map(([status, count]) => `${status}=${count}`).join(', ');
+  return `Kernel resolved ${packet.items.length} resource item(s)${detail ? ` (${detail})` : ''}.`;
 }
 
 function conversationActivity(input: AgentConversationActivity): AgentConversationActivity {

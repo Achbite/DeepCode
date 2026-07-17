@@ -34,51 +34,47 @@ pub(crate) async fn agent_workflow_config_patch(
     }
 }
 
-pub(crate) async fn agent_tools(State(state): State<AppState>) -> Json<ApiResponse> {
+pub(crate) async fn agent_tools() -> Json<ApiResponse> {
     let tool_catalog_snapshot = deepcode_kernel_runtime::kernel_tool_catalog_snapshot();
-    match dispatch_skill(
+    let tools = tool_catalog_snapshot
+        .tools
+        .iter()
+        .map(|tool| {
+            json!({
+                "name": tool.tool_id,
+                "description": format!("Kernel tool {} ({})", tool.tool_id, tool.capability),
+                "inputSchema": &tool.provider_schema,
+                "riskLevel": tool.risk.as_str(),
+                "needsApproval": tool.permission_mode.as_str() != "allow",
+                "allowedModes": ["readOnly", "plan", "askBeforeWrite"],
+                "capability": tool.capability,
+                "family": tool.family,
+                "operationKind": tool.operation_kind,
+                "permissionMode": tool.permission_mode,
+                "pathScopePolicy": tool.path_scope_policy,
+                "executionMode": tool.execution_mode,
+                "readOnly": tool.read_only,
+                "catalogVersion": tool_catalog_snapshot.catalog_version,
+                "catalogHash": &tool_catalog_snapshot.catalog_hash
+            })
+        })
+        .collect::<Vec<_>>();
+    ApiResponse::ok(json!({
+        "tools": tools,
+        "catalogVersion": deepcode_kernel_runtime::TOOL_CATALOG_VERSION,
+        "catalogHash": &tool_catalog_snapshot.catalog_hash,
+        "toolCatalog": tool_catalog_snapshot
+    }))
+}
+
+pub(crate) async fn host_skills(State(state): State<AppState>) -> Json<ApiResponse> {
+    match dispatch_host_skill_catalog(
         &state.runtime,
-        KernelCommand::SkillDiscover {
+        KernelCommand::HostSkillDiscover {
             request_id: rid("skill-discover"),
         },
     ) {
-        Ok(output) => {
-            let skills = output
-                .get("skills")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            let tools = tool_catalog_snapshot
-                .tools
-                .iter()
-                .map(|tool| {
-                    json!({
-                        "name": tool.tool_id,
-                        "description": format!("Kernel tool {} ({})", tool.tool_id, tool.capability),
-                        "inputSchema": &tool.provider_schema,
-                        "riskLevel": tool.risk.as_str(),
-                        "needsApproval": tool.permission_mode.as_str() != "allow",
-                        "allowedModes": ["readOnly", "plan", "askBeforeWrite"],
-                        "capability": tool.capability,
-                        "family": tool.family,
-                        "operationKind": tool.operation_kind,
-                        "permissionMode": tool.permission_mode,
-                        "pathScopePolicy": tool.path_scope_policy,
-                        "executionMode": tool.execution_mode,
-                        "readOnly": tool.read_only,
-                        "catalogVersion": tool_catalog_snapshot.catalog_version,
-                        "catalogHash": &tool_catalog_snapshot.catalog_hash
-                    })
-                })
-                .collect::<Vec<_>>();
-            ApiResponse::ok(json!({
-                "skills": skills,
-                "tools": tools,
-                "catalogVersion": deepcode_kernel_runtime::TOOL_CATALOG_VERSION,
-                "catalogHash": &tool_catalog_snapshot.catalog_hash,
-                "toolCatalog": tool_catalog_snapshot
-            }))
-        }
+        Ok(result) => ApiResponse::ok(json!(result)),
         Err(error) => ApiResponse::error(error.code, error.message),
     }
 }
@@ -95,6 +91,7 @@ pub(crate) fn create_agent_session_value(
     let workspace_scope_key = scope_key_from_parts(workspace_id, workspace_hash);
     json!({
         "id": id,
+        "kernelAbiVersion": deepcode_kernel_runtime::KERNEL_ABI_VERSION,
         "agentProtocolVersion": deepcode_kernel_runtime::AGENT_PROTOCOL_VERSION,
         "toolCatalogVersion": deepcode_kernel_runtime::TOOL_CATALOG_VERSION,
         "title": title,
@@ -111,8 +108,10 @@ pub(crate) fn create_agent_session_value(
 }
 
 pub(crate) fn session_schema_is_compatible(session: &Value) -> bool {
-    session.get("agentProtocolVersion").and_then(Value::as_str)
-        == Some(deepcode_kernel_runtime::AGENT_PROTOCOL_VERSION)
+    session.get("kernelAbiVersion").and_then(Value::as_str)
+        == Some(deepcode_kernel_runtime::KERNEL_ABI_VERSION)
+        && session.get("agentProtocolVersion").and_then(Value::as_str)
+            == Some(deepcode_kernel_runtime::AGENT_PROTOCOL_VERSION)
         && session.get("toolCatalogVersion").and_then(Value::as_str)
             == Some(deepcode_kernel_runtime::TOOL_CATALOG_VERSION)
 }
@@ -121,7 +120,8 @@ pub(crate) fn incompatible_session_response() -> Json<ApiResponse> {
     ApiResponse::error(
         "session_schema_incompatible",
         format!(
-            "session schema is incompatible: expected agentProtocolVersion={} and toolCatalogVersion={}",
+            "session schema is incompatible: expected kernelAbiVersion={}, agentProtocolVersion={} and toolCatalogVersion={}",
+            deepcode_kernel_runtime::KERNEL_ABI_VERSION,
             deepcode_kernel_runtime::AGENT_PROTOCOL_VERSION,
             deepcode_kernel_runtime::TOOL_CATALOG_VERSION
         ),

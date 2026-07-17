@@ -145,7 +145,8 @@ export const assistantProjectionBuilder = new AssistantProjectionBuilder({
 });
 export const sessionProgressProjectionBuilder = new SessionProgressProjectionBuilder({
   interactionOverlayPayload: (overlay) => interactionOverlayCodec.toPayload(overlay),
-  hasFailureOrBlocker: (kernelEvents) => kernelEventStatusIndex.hasFailureOrBlocker(kernelEvents),
+  hasFailureOrBlocker: (kernelEvents) =>
+    kernelEventStatusIndex.hasFailureOrBlocker(kernelEventStatusIndex.decodeEvents(kernelEvents)),
   auditAcceptedPlanBatch: (batch) => acceptedPlanBatchPreflight.audit(batch),
   actionBundleAdmissionBatch: (proposal) => driverActivityBuilder.proposalActionBundleAdmissionBatch(proposal),
   acceptedPlanTaskLedger: (accepted) => acceptedPlanTaskLedger().ledger(accepted),
@@ -211,22 +212,7 @@ export const nativeToolProviderLoop = new NativeToolProviderLoop<SessionDriverLo
 export const PROVIDER_REASONING_FLUSH_CHARS = 768;
 export const PROVIDER_REASONING_FLUSH_MS = 120;
 export { VISIBLE_REASONING_MAX_CHARS };
-export const SIDE_EFFECT_TOOL_IDS = new Set([
-  'fs.write',
-  'fs.edit',
-  'fs.delete',
-  'fs.rename',
-  'process.exec',
-  'network.egress',
-  'git.write',
-  'git.push',
-  'config.modify',
-  'browser.control',
-  'provider.egress',
-]);
-export const providerTurnPolicy = new ProviderTurnPolicy({
-  sideEffectToolIds: SIDE_EFFECT_TOOL_IDS,
-});
+export const providerTurnPolicy = new ProviderTurnPolicy();
 export const driverFailureMessageCatalog = new DriverFailureMessageCatalog();
 export const driverParseErrorCatalog = new DriverParseErrorCatalog();
 
@@ -254,15 +240,6 @@ export function generatedArtifactEvidenceIndex(): GeneratedArtifactEvidenceIndex
   return new GeneratedArtifactEvidenceIndex({
     normalizeRelativePath: (value) => pathIdentity.normalizeRelativePath(value),
     comparablePath: (value) => pathIdentity.comparablePath(value),
-    batchActionRecords: (batch) => driverActivityBuilder.batchActionRecords(batch),
-    actionToolId: (action) => actionBundleActionInspector.actionToolId(action),
-    actionFileTargetPath: (action) => actionBundleActionInspector.actionFileTargetPath(action),
-    completedWorkUnitFacts: (events) => completedWorkUnitFactIndex.completedWorkUnitFacts(events),
-    completedActionMatches: (actionId, targetPath, completed) =>
-      completedWorkUnitFactIndex.completedActionMatches(actionId, targetPath, completed),
-    codeBlockContent: (block) => completedWorkUnitFactIndex.codeBlockContent(block),
-    resolveRelativePath: (value, rootId, roots) =>
-      resourceRequestResolver().resolveRelativePath(value, rootId, roots),
   });
 }
 
@@ -285,8 +262,10 @@ export function acceptedTaskPlanContextBuilder(): AcceptedTaskPlanContextBuilder
 
 export function acceptedPlanTaskLedger(): AcceptedPlanTaskLedgerCoordinator {
   return new AcceptedPlanTaskLedgerCoordinator({
-    workUnitIdsFromKernelEvents: (events) => kernelEventStatusIndex.workUnitIds(events),
-    actionBatchHasFailureOrBlocker: (events) => kernelEventStatusIndex.hasFailureOrBlocker(events),
+    workUnitIdsFromKernelEvents: (events) =>
+      kernelEventStatusIndex.workUnitIds(kernelEventStatusIndex.decodeEvents(events)),
+    actionBatchHasFailureOrBlocker: (events) =>
+      kernelEventStatusIndex.hasFailureOrBlocker(kernelEventStatusIndex.decodeEvents(events)),
   });
 }
 
@@ -316,7 +295,6 @@ export function protocolGate(): ProtocolGate {
 
 export function proposalSemanticValidator(): ProposalSemanticValidator {
   return new ProposalSemanticValidator({
-    sideEffectToolIds: SIDE_EFFECT_TOOL_IDS,
     readActionBundle: (proposal) => driverActivityBuilder.readActionBundle(proposal),
     actionToolId: (action) => actionBundleActionInspector.actionToolId(action),
     actionFileTargetPath: (action) => actionBundleActionInspector.actionFileTargetPath(action),
@@ -326,11 +304,9 @@ export function proposalSemanticValidator(): ProposalSemanticValidator {
 export function executionPromptCoordinator(): ExecutionPromptCoordinator<SessionPlanContext> {
   const validator = proposalSemanticValidator();
   return new ExecutionPromptCoordinator<SessionPlanContext>({
-    sideEffectToolIds: SIDE_EFFECT_TOOL_IDS,
     objectRecord,
     stringValue,
     planId: (plan) => plan.planId,
-    actionToolId: (action) => actionBundleActionInspector.actionToolId(action),
     isDetailedUserPlanMarkdown: (userPlan) => validator.isDetailedUserPlanMarkdown(userPlan),
     defaultActionBundleUserPlanMarkdown: (input) => validator.defaultActionBundleUserPlanMarkdown(input),
     expectationsHaveDescription: (value) => validator.expectationsHaveDescription(value),

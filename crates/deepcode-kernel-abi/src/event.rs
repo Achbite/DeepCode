@@ -1,8 +1,12 @@
 use crate::{
-    AuditQueryResult, ConfigSnapshotRef, DriverRequest, HostInspectionResult, HostStatus,
-    KernelErrorEnvelope, KernelSnapshot, KernelStateContract, LlmProviderDiagnostic, MessageRole,
-    PermissionDecisionKind, PermissionRequestEnvelope, PlanAuthorizationReview, ProposalEnvelope,
-    RequestId, ReviewFacts, RunId, RunStatus, RuntimeLifecycleState, SessionId, TurnId,
+    ArtifactDraftEvent, AuditQueryResult, ConfigSnapshotRef, DriverRequest, HostInspectionResult,
+    HostMcpRiskDecisionRecord, HostSkillCatalogResult, HostSkillTrustDecisionRecord, HostStatus,
+    HostWorkspaceResult, KernelActionBatchSummary, KernelErrorEnvelope, KernelProposalReviewReport,
+    KernelSnapshot, KernelStateContract, LlmProviderDiagnostic, MessageRole,
+    PermissionDecisionKind, PermissionRequestEnvelope, PlanAuthorizationDecisionKind,
+    PlanAuthorizationReview, ProposalEnvelope, RequestId, ResourcePacket, ReviewFacts,
+    ReviewGateEvaluation, RunId, RunStatus, RuntimeLifecycleState, SessionId, ToolCompletionFact,
+    ToolRequestFact, TurnId, WorkUnitDescriptor,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -31,6 +35,11 @@ pub enum KernelEvent {
     HostInspectionCompleted {
         request_id: RequestId,
         result: HostInspectionResult,
+    },
+    #[serde(rename = "host.workspace_completed")]
+    HostWorkspaceCompleted {
+        request_id: RequestId,
+        result: HostWorkspaceResult,
     },
     #[serde(rename = "state.entered")]
     StateEntered {
@@ -62,7 +71,7 @@ pub enum KernelEvent {
         run_id: RunId,
         session_id: Option<SessionId>,
         proposal_id: String,
-        report: Value,
+        report: KernelProposalReviewReport,
         sequence: Option<u64>,
     },
     #[serde(rename = "plan_authorization.reviewed")]
@@ -80,7 +89,7 @@ pub enum KernelEvent {
         run_id: RunId,
         session_id: Option<SessionId>,
         authorization_contract_id: String,
-        decision: String,
+        decision: PlanAuthorizationDecisionKind,
         lease_id: Option<String>,
         sequence: Option<u64>,
     },
@@ -99,7 +108,7 @@ pub enum KernelEvent {
         request_id: Option<RequestId>,
         run_id: Option<RunId>,
         session_id: Option<SessionId>,
-        packet: Value,
+        packet: ResourcePacket,
         sequence: Option<u64>,
     },
     #[serde(rename = "draft.open")]
@@ -107,7 +116,7 @@ pub enum KernelEvent {
         request_id: Option<RequestId>,
         run_id: RunId,
         session_id: Option<SessionId>,
-        draft: Value,
+        draft: ArtifactDraftEvent,
         sequence: Option<u64>,
     },
     #[serde(rename = "draft.chunk")]
@@ -115,7 +124,7 @@ pub enum KernelEvent {
         request_id: Option<RequestId>,
         run_id: RunId,
         session_id: Option<SessionId>,
-        draft: Value,
+        draft: ArtifactDraftEvent,
         sequence: Option<u64>,
     },
     #[serde(rename = "draft.file_completed")]
@@ -123,7 +132,7 @@ pub enum KernelEvent {
         request_id: Option<RequestId>,
         run_id: RunId,
         session_id: Option<SessionId>,
-        draft: Value,
+        draft: ArtifactDraftEvent,
         sequence: Option<u64>,
     },
     #[serde(rename = "draft.batch_completed")]
@@ -131,7 +140,7 @@ pub enum KernelEvent {
         request_id: Option<RequestId>,
         run_id: RunId,
         session_id: Option<SessionId>,
-        draft: Value,
+        draft: ArtifactDraftEvent,
         sequence: Option<u64>,
     },
     #[serde(rename = "draft.discarded")]
@@ -139,7 +148,7 @@ pub enum KernelEvent {
         request_id: Option<RequestId>,
         run_id: RunId,
         session_id: Option<SessionId>,
-        draft: Value,
+        draft: ArtifactDraftEvent,
         sequence: Option<u64>,
     },
     #[serde(rename = "draft.committed")]
@@ -147,7 +156,7 @@ pub enum KernelEvent {
         request_id: Option<RequestId>,
         run_id: RunId,
         session_id: Option<SessionId>,
-        draft: Value,
+        draft: ArtifactDraftEvent,
         sequence: Option<u64>,
     },
     #[serde(rename = "action_batch.accepted")]
@@ -155,7 +164,7 @@ pub enum KernelEvent {
         request_id: Option<RequestId>,
         run_id: RunId,
         session_id: Option<SessionId>,
-        batch: Value,
+        batch: KernelActionBatchSummary,
         sequence: Option<u64>,
     },
     #[serde(rename = "work_unit.queued")]
@@ -163,7 +172,7 @@ pub enum KernelEvent {
         request_id: Option<RequestId>,
         run_id: RunId,
         session_id: Option<SessionId>,
-        work_unit: Value,
+        work_unit: WorkUnitDescriptor,
         sequence: Option<u64>,
     },
     #[serde(rename = "work_unit.started")]
@@ -222,7 +231,7 @@ pub enum KernelEvent {
         request_id: Option<RequestId>,
         run_id: RunId,
         session_id: Option<SessionId>,
-        result: Value,
+        result: ReviewGateEvaluation,
         sequence: Option<u64>,
     },
     #[serde(rename = "run.completed")]
@@ -269,9 +278,7 @@ pub enum KernelEvent {
         run_id: Option<RunId>,
         session_id: Option<SessionId>,
         turn_id: Option<TurnId>,
-        tool_call_id: String,
-        tool_name: String,
-        args_preview: Value,
+        fact: ToolRequestFact,
         sequence: Option<u64>,
     },
     #[serde(rename = "tool.completed")]
@@ -279,11 +286,7 @@ pub enum KernelEvent {
         run_id: Option<RunId>,
         session_id: Option<SessionId>,
         turn_id: Option<TurnId>,
-        tool_call_id: String,
-        tool_name: String,
-        ok: bool,
-        output: Option<Value>,
-        error: Option<KernelErrorEnvelope>,
+        fact: ToolCompletionFact,
         sequence: Option<u64>,
     },
     #[serde(rename = "permission.requested")]
@@ -327,36 +330,21 @@ pub enum KernelEvent {
         lifecycle_state: RuntimeLifecycleState,
         sequence: Option<u64>,
     },
-    #[serde(rename = "skill.result")]
-    SkillResult {
+    #[serde(rename = "host.skills_discovered")]
+    HostSkillsDiscovered {
         request_id: RequestId,
-        skill_id: Option<String>,
-        ok: bool,
-        output: Option<Value>,
-        error: Option<KernelErrorEnvelope>,
+        result: HostSkillCatalogResult,
+    },
+    #[serde(rename = "host.skill_trust_decision_recorded")]
+    HostSkillTrustDecisionRecorded {
+        request_id: RequestId,
+        record: HostSkillTrustDecisionRecord,
         sequence: Option<u64>,
     },
-    #[serde(rename = "skill.trust_requested")]
-    SkillTrustRequested {
-        request_id: Option<RequestId>,
-        skill_id: String,
-        hash: Option<String>,
-        request: Value,
-        sequence: Option<u64>,
-    },
-    #[serde(rename = "skill.trust_granted")]
-    SkillTrustGranted {
-        request_id: Option<RequestId>,
-        skill_id: String,
-        trust_record: Value,
-        sequence: Option<u64>,
-    },
-    #[serde(rename = "mcp.risk_acknowledgment_required")]
-    McpRiskAcknowledgmentRequired {
-        request_id: Option<RequestId>,
-        connector_id: String,
-        binding_id: Option<String>,
-        risk_report: Value,
+    #[serde(rename = "host.mcp_risk_decision_recorded")]
+    HostMcpRiskDecisionRecorded {
+        request_id: RequestId,
+        record: HostMcpRiskDecisionRecord,
         sequence: Option<u64>,
     },
     #[serde(rename = "audit.verify_started")]
@@ -406,4 +394,112 @@ pub enum KernelEvent {
         message_key: Option<String>,
         args: Option<Value>,
     },
+}
+
+impl KernelEvent {
+    pub fn session_id(&self) -> Option<&SessionId> {
+        match self {
+            Self::StateEntered { session_id, .. }
+            | Self::DriverRequestProduced { session_id, .. }
+            | Self::ProposalAccepted { session_id, .. }
+            | Self::ProposalReviewed { session_id, .. }
+            | Self::PlanAuthorizationReviewed { session_id, .. }
+            | Self::PlanAuthorizationDecisionRecorded { session_id, .. }
+            | Self::ProposalRejected { session_id, .. }
+            | Self::ResourcePacketProduced { session_id, .. }
+            | Self::DraftOpen { session_id, .. }
+            | Self::DraftChunk { session_id, .. }
+            | Self::DraftFileCompleted { session_id, .. }
+            | Self::DraftBatchCompleted { session_id, .. }
+            | Self::DraftDiscarded { session_id, .. }
+            | Self::DraftCommitted { session_id, .. }
+            | Self::ActionBatchAccepted { session_id, .. }
+            | Self::WorkUnitQueued { session_id, .. }
+            | Self::WorkUnitStarted { session_id, .. }
+            | Self::WorkUnitCompleted { session_id, .. }
+            | Self::WorkUnitFailed { session_id, .. }
+            | Self::WorkUnitBlocked { session_id, .. }
+            | Self::BatchReviewReady { session_id, .. }
+            | Self::ReviewFactsProduced { session_id, .. }
+            | Self::ReviewGateEvaluated { session_id, .. }
+            | Self::RunCompleted { session_id, .. }
+            | Self::RuntimeLifecycleChanged { session_id, .. }
+            | Self::MessageAppended { session_id, .. }
+            | Self::LlmProviderError { session_id, .. }
+            | Self::ToolRequested { session_id, .. }
+            | Self::ToolCompleted { session_id, .. }
+            | Self::PermissionResolved { session_id, .. }
+            | Self::AutonomyTransitioned { session_id, .. }
+            | Self::ConfigSnapshotAttached { session_id, .. }
+            | Self::RuntimeResumed { session_id, .. }
+            | Self::Error { session_id, .. } => session_id.as_ref(),
+            Self::PermissionRequested { session_id, .. } => Some(session_id),
+            Self::HostStatus { .. }
+            | Self::SnapshotReady { .. }
+            | Self::HostInspectionCompleted { .. }
+            | Self::HostWorkspaceCompleted { .. }
+            | Self::HostSkillsDiscovered { .. }
+            | Self::HostSkillTrustDecisionRecorded { .. }
+            | Self::HostMcpRiskDecisionRecorded { .. }
+            | Self::AuditVerifyStarted { .. }
+            | Self::AuditVerifyCompleted { .. }
+            | Self::AuditQueryCompleted { .. }
+            | Self::AuditDegradedEntered { .. }
+            | Self::AuditDegradedExited { .. }
+            | Self::AuditSegmentRotated { .. } => None,
+        }
+    }
+
+    pub fn run_id(&self) -> Option<&RunId> {
+        match self {
+            Self::ResourcePacketProduced { run_id, .. }
+            | Self::MessageAppended { run_id, .. }
+            | Self::ToolRequested { run_id, .. }
+            | Self::ToolCompleted { run_id, .. }
+            | Self::PermissionRequested { run_id, .. }
+            | Self::PermissionResolved { run_id, .. }
+            | Self::AutonomyTransitioned { run_id, .. }
+            | Self::ConfigSnapshotAttached { run_id, .. }
+            | Self::Error { run_id, .. } => run_id.as_ref(),
+            Self::StateEntered { run_id, .. }
+            | Self::DriverRequestProduced { run_id, .. }
+            | Self::ProposalAccepted { run_id, .. }
+            | Self::ProposalReviewed { run_id, .. }
+            | Self::PlanAuthorizationReviewed { run_id, .. }
+            | Self::PlanAuthorizationDecisionRecorded { run_id, .. }
+            | Self::ProposalRejected { run_id, .. }
+            | Self::DraftOpen { run_id, .. }
+            | Self::DraftChunk { run_id, .. }
+            | Self::DraftFileCompleted { run_id, .. }
+            | Self::DraftBatchCompleted { run_id, .. }
+            | Self::DraftDiscarded { run_id, .. }
+            | Self::DraftCommitted { run_id, .. }
+            | Self::ActionBatchAccepted { run_id, .. }
+            | Self::WorkUnitQueued { run_id, .. }
+            | Self::WorkUnitStarted { run_id, .. }
+            | Self::WorkUnitCompleted { run_id, .. }
+            | Self::WorkUnitFailed { run_id, .. }
+            | Self::WorkUnitBlocked { run_id, .. }
+            | Self::BatchReviewReady { run_id, .. }
+            | Self::ReviewFactsProduced { run_id, .. }
+            | Self::ReviewGateEvaluated { run_id, .. }
+            | Self::RunCompleted { run_id, .. }
+            | Self::RuntimeLifecycleChanged { run_id, .. }
+            | Self::LlmProviderError { run_id, .. }
+            | Self::RuntimeResumed { run_id, .. } => Some(run_id),
+            Self::HostStatus { .. }
+            | Self::SnapshotReady { .. }
+            | Self::HostInspectionCompleted { .. }
+            | Self::HostWorkspaceCompleted { .. }
+            | Self::HostSkillsDiscovered { .. }
+            | Self::HostSkillTrustDecisionRecorded { .. }
+            | Self::HostMcpRiskDecisionRecorded { .. }
+            | Self::AuditVerifyStarted { .. }
+            | Self::AuditVerifyCompleted { .. }
+            | Self::AuditQueryCompleted { .. }
+            | Self::AuditDegradedEntered { .. }
+            | Self::AuditDegradedExited { .. }
+            | Self::AuditSegmentRotated { .. } => None,
+        }
+    }
 }

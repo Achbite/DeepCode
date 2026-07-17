@@ -597,7 +597,7 @@ function acceptedRepairContextSummary(state: ProviderRepairMessageState): Record
     : stringArrayValue(currentTask?.targets ?? currentTask?.target);
   const currentTaskToolIds = state.currentTaskContext?.toolIds.length
     ? state.currentTaskContext.toolIds
-    : stringArrayValue(currentTask?.toolIds ?? currentTask?.capability);
+    : stringArrayValue(currentTask?.toolIds);
   return {
     authority: 'confirmed current accepted task',
     originalUserRequest: 'source reference only',

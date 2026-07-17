@@ -6,16 +6,12 @@ pub(super) struct GitStageExecutor;
 pub(super) struct GitUnstageExecutor;
 pub(super) struct GitCommitExecutor;
 
-impl SkillExecutor for GitStatusExecutor {
-    fn descriptor(&self) -> SkillDescriptor {
-        descriptor("git.status")
-    }
-
+impl KernelToolExecutor for GitStatusExecutor {
     fn invoke(
         &self,
-        invocation: SkillInvocation,
-        context: SkillExecutionContext,
-    ) -> KernelResult<SkillResult> {
+        invocation: KernelToolInvocation,
+        context: KernelToolExecutionContext,
+    ) -> KernelResult<KernelToolExecutionResult> {
         let root = workspace_root(&context)?;
         let output = git_output(&root, &["status", "--porcelain=v1", "-uall"])?;
         Ok(ok(
@@ -29,16 +25,12 @@ impl SkillExecutor for GitStatusExecutor {
     }
 }
 
-impl SkillExecutor for GitDiffExecutor {
-    fn descriptor(&self) -> SkillDescriptor {
-        descriptor("git.diff")
-    }
-
+impl KernelToolExecutor for GitDiffExecutor {
     fn invoke(
         &self,
-        invocation: SkillInvocation,
-        context: SkillExecutionContext,
-    ) -> KernelResult<SkillResult> {
+        invocation: KernelToolInvocation,
+        context: KernelToolExecutionContext,
+    ) -> KernelResult<KernelToolExecutionResult> {
         let root = workspace_root(&context)?;
         let staged = invocation
             .input
@@ -73,16 +65,12 @@ impl SkillExecutor for GitDiffExecutor {
     }
 }
 
-impl SkillExecutor for GitStageExecutor {
-    fn descriptor(&self) -> SkillDescriptor {
-        descriptor("git.stage")
-    }
-
+impl KernelToolExecutor for GitStageExecutor {
     fn invoke(
         &self,
-        invocation: SkillInvocation,
-        context: SkillExecutionContext,
-    ) -> KernelResult<SkillResult> {
+        invocation: KernelToolInvocation,
+        context: KernelToolExecutionContext,
+    ) -> KernelResult<KernelToolExecutionResult> {
         let root = workspace_root(&context)?;
         let paths = git_paths(&invocation.input)?;
         let mut args = vec!["add", "--"];
@@ -92,16 +80,12 @@ impl SkillExecutor for GitStageExecutor {
     }
 }
 
-impl SkillExecutor for GitUnstageExecutor {
-    fn descriptor(&self) -> SkillDescriptor {
-        descriptor("git.unstage")
-    }
-
+impl KernelToolExecutor for GitUnstageExecutor {
     fn invoke(
         &self,
-        invocation: SkillInvocation,
-        context: SkillExecutionContext,
-    ) -> KernelResult<SkillResult> {
+        invocation: KernelToolInvocation,
+        context: KernelToolExecutionContext,
+    ) -> KernelResult<KernelToolExecutionResult> {
         let root = workspace_root(&context)?;
         let paths = git_paths(&invocation.input)?;
         let mut args = vec!["restore", "--staged", "--"];
@@ -111,16 +95,12 @@ impl SkillExecutor for GitUnstageExecutor {
     }
 }
 
-impl SkillExecutor for GitCommitExecutor {
-    fn descriptor(&self) -> SkillDescriptor {
-        descriptor("git.commit")
-    }
-
+impl KernelToolExecutor for GitCommitExecutor {
     fn invoke(
         &self,
-        invocation: SkillInvocation,
-        context: SkillExecutionContext,
-    ) -> KernelResult<SkillResult> {
+        invocation: KernelToolInvocation,
+        context: KernelToolExecutionContext,
+    ) -> KernelResult<KernelToolExecutionResult> {
         let root = workspace_root(&context)?;
         let message = get_string(&invocation.input, "message").unwrap_or_default();
         if message.trim().is_empty() {

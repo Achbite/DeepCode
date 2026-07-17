@@ -34,52 +34,55 @@ fn parses_tools_run_with_explicit_mutation_approval() {
 
 #[test]
 fn tool_verification_coverage_is_derived_from_the_catalog() {
-    let catalog = json!({
-        "tools": [
-            {
-                "toolId": "read.tool",
-                "executionMode": "execute",
-                "providerVisible": true
-            },
-            {
-                "toolId": "internal.tool",
-                "executionMode": "execute",
-                "providerVisible": false
-            },
-            {
-                "toolId": "blocked.tool",
-                "executionMode": "blocked",
-                "providerVisible": false
+    let snapshot = deepcode_kernel_tools::KernelToolRegistry::default().snapshot();
+    let catalog = serde_json::to_value(&snapshot).expect("serialize canonical tool catalog");
+    let mut coverage = BTreeMap::new();
+    for tool in &snapshot.tools {
+        let outcomes = match (tool.execution_mode, tool.provider_visible) {
+            (deepcode_kernel_tools::OperationExecutionMode::Blocked, _) => {
+                BTreeSet::from(["blocked".to_string()])
             }
-        ]
-    });
-    let coverage = BTreeMap::from([
-        (
-            "read.tool".to_string(),
-            BTreeSet::from(["success".to_string(), "failure".to_string()]),
-        ),
-        (
-            "blocked.tool".to_string(),
-            BTreeSet::from(["blocked".to_string()]),
-        ),
-    ]);
+            (deepcode_kernel_tools::OperationExecutionMode::Execute, true) => {
+                BTreeSet::from(["success".to_string(), "failure".to_string()])
+            }
+            _ => BTreeSet::new(),
+        };
+        coverage.insert(tool.tool_id.clone(), outcomes);
+    }
 
     assert!(verify_catalog_case_coverage(&catalog, &coverage)
         .expect("coverage can be derived")
         .is_empty());
 
-    let incomplete = BTreeMap::from([(
-        "read.tool".to_string(),
-        BTreeSet::from(["success".to_string()]),
-    )]);
+    let executable_id = snapshot
+        .tools
+        .iter()
+        .find(|tool| {
+            tool.execution_mode == deepcode_kernel_tools::OperationExecutionMode::Execute
+                && tool.provider_visible
+        })
+        .map(|tool| tool.tool_id.clone())
+        .expect("catalog has a provider-visible executable tool");
+    let blocked_id = snapshot
+        .tools
+        .iter()
+        .find(|tool| tool.execution_mode == deepcode_kernel_tools::OperationExecutionMode::Blocked)
+        .map(|tool| tool.tool_id.clone())
+        .expect("catalog has a blocked tool");
+    let mut incomplete = coverage;
+    incomplete
+        .get_mut(&executable_id)
+        .expect("executable coverage exists")
+        .remove("failure");
+    incomplete.remove(&blocked_id);
     let errors = verify_catalog_case_coverage(&catalog, &incomplete)
         .expect("incomplete coverage is reported");
     assert!(errors
         .iter()
-        .any(|error| error.contains("read.tool requires a failure")));
+        .any(|error| error.contains(&format!("{executable_id} requires a failure"))));
     assert!(errors
         .iter()
-        .any(|error| error.contains("blocked.tool requires a blocked")));
+        .any(|error| error.contains(&format!("{blocked_id} requires a blocked"))));
 }
 
 #[test]

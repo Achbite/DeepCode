@@ -342,6 +342,7 @@ fn refresh_conversation_archive(
     )?;
     let manifest = json!({
         "schemaVersion": "conversation-archive.v1",
+        "kernelAbiVersion": deepcode_kernel_runtime::KERNEL_ABI_VERSION,
         "agentProtocolVersion": deepcode_kernel_runtime::AGENT_PROTOCOL_VERSION,
         "toolCatalogVersion": deepcode_kernel_runtime::TOOL_CATALOG_VERSION,
         "sessionId": session_id,
@@ -393,6 +394,7 @@ fn refresh_session_chronological_archive(
     )?;
     let manifest = json!({
         "schemaVersion": "conversation-archive.v1",
+        "kernelAbiVersion": deepcode_kernel_runtime::KERNEL_ABI_VERSION,
         "agentProtocolVersion": deepcode_kernel_runtime::AGENT_PROTOCOL_VERSION,
         "toolCatalogVersion": deepcode_kernel_runtime::TOOL_CATALOG_VERSION,
         "sessionId": session_id,

@@ -98,12 +98,6 @@ export interface ResourceRequestProposalHandlerPorts<
   ): Promise<void>;
   refreshTaskRuntimeState(state: State): void;
   acceptedPlanResourceResumeEvent(state: State, packet: ResourcePacket, ts: string, id: string): AgentEvent;
-  tryCompleteResourceTask(
-    input: Input,
-    state: State,
-    packet: ResourcePacket,
-    fallback: AgentSessionResult
-  ): Promise<AgentSessionResult | ProposalRouterResult | null>;
 }
 
 export interface ResourceRequestProposalHandlerInput<
@@ -128,7 +122,7 @@ export class ResourceRequestProposalHandler<
   async handle(
     handlerInput: ResourceRequestProposalHandlerInput<Input, State>
   ): Promise<ResourceRequestProposalHandlerResult> {
-    const { input, state, proposal } = handlerInput;
+    const { state, proposal } = handlerInput;
     let lastResult = handlerInput.lastResult;
     const taskId = this.intentSlots.currentTaskId(state.acceptedTaskPlan);
     const request = proposal.payload as ResourceRequestDraft;
@@ -269,15 +263,6 @@ export class ResourceRequestProposalHandler<
         this.ports.createId('accepted-plan-resource-resume')
       );
       lastResult = await this.ports.append(state.sessionId, [resumeEvent]) ?? lastResult;
-      const readOnlyCompletion = await this.ports.tryCompleteResourceTask(
-        input,
-        state,
-        packet,
-        lastResult
-      );
-      if (readOnlyCompletion) {
-        return normalizeProposalRouterResult(readOnlyCompletion);
-      }
       return { kind: 'continue', lastResult };
     }
     return { kind: 'continue', lastResult };

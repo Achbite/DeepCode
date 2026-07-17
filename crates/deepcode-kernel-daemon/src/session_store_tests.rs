@@ -546,7 +546,6 @@ fn append_session_projection_hydrates_restored_history_before_append() {
             session_projection_cache: HashMap::new(),
             session_timeline_cache: HashMap::new(),
             trace_events: HashMap::new(),
-            browser: BrowserState::default(),
         })),
         terminal_runtime: Arc::new(Mutex::new(crate::terminal_api::TerminalRuntime::new())),
         kernel_events: Arc::new(Mutex::new(Vec::new())),

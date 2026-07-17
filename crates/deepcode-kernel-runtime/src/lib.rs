@@ -1,14 +1,30 @@
 use deepcode_kernel_abi::{
-    AuditEventFact, AuditQueryFilter, AuditQueryResult, ConfigSnapshotRef, DraftAdmissionPolicy,
-    DriverRequest, DriverRequestKind, ExternalResourceKind, ExternalResourceLease,
-    HostInspectionQuery, HostInspectionResult, HostStatus, KernelCommand, KernelError,
-    KernelErrorEnvelope, KernelEvent, KernelEventSummary, KernelPlanAuthorizationContract,
-    KernelResult, KernelSnapshot, KernelStateContract, PlanAuthorizationDecisionKind,
-    PlanAuthorizationDecisionSubmit, PlanAuthorizationReview, PlanAuthorizationStatus,
-    PlanGrantLease, ProfileRef, ProposalEnvelope, ProposalEnvelopeKind, RequestId,
-    ResourceResolveRequest, ReviewFacts, RunId, RunStatus, RuntimeLifecycleState, SessionId,
-    TaskIntentEnvelope, TemporaryGrantEnvelope, ToolFactEnvelope, UserDecisionSubmit, UserInput,
-    WorkUnitFact, WorkspaceBinding,
+    ArtifactOrigin, AuditEventFact, AuditQueryFilter, AuditQueryResult, CleanupFailureFact,
+    CompiledToolSummary, ConfigSnapshotRef, ContractCleanupPolicy, ContractExpiry,
+    DraftAdmissionPolicy, DriverRequest, DriverRequestKind, ExternalResourceKind,
+    ExternalResourceLease, FileChangeFact, FileChangeKind, GeneratedArtifactFact, HostBrowseEntry,
+    HostBrowseResult, HostFileTreeNodeKind, HostInspectionOutput, HostInspectionQuery,
+    HostInspectionResult, HostMcpRiskDecisionRecord, HostMcpRiskDecisionSubmit, HostResultSource,
+    HostSkillActivationStatus, HostSkillAdapterKind, HostSkillCatalogResult, HostSkillDescriptor,
+    HostSkillEffect, HostSkillRiskLevel, HostSkillSource, HostSkillTrustDecisionKind,
+    HostSkillTrustDecisionRecord, HostSkillTrustDecisionSubmit, HostSkillTrustMode, HostStatus,
+    HostUnsupportedWorkspaceField, HostWorkspaceBindingResolved, HostWorkspaceCurrent,
+    HostWorkspaceFolder, HostWorkspaceOpened, HostWorkspaceOutput, HostWorkspaceResult,
+    HostWorkspaceRootStatus, HostWorkspaceSaved, HostWorkspaceSourceKind, HostWorkspaceSpec,
+    KernelCommand, KernelError, KernelErrorEnvelope, KernelEvent, KernelEventSummary,
+    KernelExecutionContract, KernelFactSource, KernelPlanAuthorizationContract, KernelResource,
+    KernelResourceCleanupPolicy, KernelResourceIdentity, KernelResourceKind,
+    KernelResourceMetadata, KernelResourceOwner, KernelResourceScope, KernelResult, KernelSnapshot,
+    KernelStateContract, KernelToolCatalogEntryRef, KernelToolCatalogSnapshotRef,
+    KernelToolUsageConstraintsRef, PathNormalizationDiagnostic, PathNormalizationFact,
+    PermissionRequestedFact, PermissionResolutionFact, PermissionResourceKind,
+    PlanAuthorizationDecisionKind, PlanAuthorizationDecisionSubmit, PlanAuthorizationReview,
+    PlanAuthorizationStatus, PlanGrantLease, ProfileRef, ProposalEnvelope, ProposalEnvelopeKind,
+    RequestId, ResourceLifecycleFact, ResourceLifecycleKind, ResourcePacket, ResourcePacketItem,
+    ResourcePacketStatus, ResourceResolveRequest, ReviewFacts, RunId, RunStatus,
+    RuntimeLifecycleState, SessionId, TaskIntentEnvelope, TemporaryGrantEnvelope,
+    TemporaryPermissionGrantKind, ToolCompletionFact, ToolFactEnvelope, ToolRequestFact,
+    ToolTargetKind, UserInput, WorkUnitDescriptor, WorkUnitFact, WorkUnitStatus, WorkspaceBinding,
 };
 use deepcode_kernel_audit::{
     AuditKeyMaterial, AuditRuntimeMode, AuditVerifier, LocalAuditSigner, SignedAuditEntryV1,
@@ -18,28 +34,28 @@ use deepcode_kernel_config::{
     ConfigTrustLevel, DefaultConfigResolver,
 };
 use deepcode_kernel_ledger::{
-    ChangeOperation, ChangeSet, EventLedger, InMemoryEventLedger, KernelResource,
-    KernelResourceCleanupPolicy, KernelResourceIdentity, KernelResourceKind, KernelResourceOwner,
-    KernelResourceScope, LedgerEvent, NdjsonEventLedger, ValidationKind, ValidationResult,
+    ChangeOperation, ChangeSet, EventLedger, InMemoryEventLedger, LedgerEvent, NdjsonEventLedger,
+    ValidationKind, ValidationResult,
 };
-use deepcode_kernel_policy::{PolicyDecisionKind, PolicyProfile, WorkspaceBoundary};
+use deepcode_kernel_policy::{PolicyProfile, WorkspaceBoundary};
 use deepcode_kernel_skills::{
-    model_visible_skill_descriptors, InMemorySkillRegistry, SkillExecutionContext,
-    SkillExecutorRegistry, SkillInvocation, SkillRegistry, SkillTrustMode, SkillTrustRecord,
+    InMemoryUserSkillRegistry, SkillDescriptor, SkillTrustMode, SkillTrustRecord, UserSkillRegistry,
 };
 use deepcode_kernel_tools::{
-    derive_plan_authorization, GitOperation, GitOperationKind, KernelToolCatalogSnapshot,
+    derive_plan_authorization, GitOperation, GitOperationKind, KernelExecutionContractStatus,
+    KernelProposalReviewReport, KernelToolCatalogSnapshot, KernelToolRegistration,
     KernelToolRegistry, OperationCompileError, OperationCompiler, OperationExecutionMode,
     PlanAuthorizationDraft, PlanAuthorizationOperationDraft, PlanTargetMode, PlanTaskIntent,
-    PlannedOperation, PlannedOperationKind, ProposalReviewReportV3, ToolFactCategory, ToolFamily,
-    ToolPermissionMode, WorkspaceOperation, WorkspaceOperationKind,
+    PlannedOperation, PlannedOperationKind, ToolChangeKind, ToolFactCategory, ToolFamily,
+    ToolOperationKind, ToolPermissionMode, WorkspaceOperation, WorkspaceOperationKind,
 };
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::cmp::Ordering;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub mod action_batch;
@@ -63,13 +79,66 @@ pub(crate) use workspace::*;
 
 pub const AGENT_PROTOCOL_VERSION: &str = "deepcode.agent.protocol.v4";
 pub const TOOL_CATALOG_VERSION: &str = deepcode_kernel_tools::TOOL_REGISTRY_VERSION;
+pub const KERNEL_ABI_VERSION: &str = deepcode_kernel_abi::KERNEL_ABI_VERSION;
+
+static KERNEL_TOOL_REGISTRY: OnceLock<KernelToolRegistry> = OnceLock::new();
+static KERNEL_TOOL_CATALOG: OnceLock<KernelToolCatalogSnapshot> = OnceLock::new();
+
+fn kernel_tool_registry() -> &'static KernelToolRegistry {
+    KERNEL_TOOL_REGISTRY.get_or_init(KernelToolRegistry::new)
+}
 
 pub fn kernel_visible_tool_catalog_count() -> usize {
-    KernelToolRegistry::default().all().count()
+    kernel_tool_registry().registrations().count()
 }
 
 pub fn kernel_tool_catalog_snapshot() -> KernelToolCatalogSnapshot {
-    KernelToolRegistry::default().snapshot()
+    KERNEL_TOOL_CATALOG
+        .get_or_init(|| kernel_tool_registry().snapshot())
+        .clone()
+}
+
+pub fn kernel_tool_catalog_snapshot_ref() -> KernelToolCatalogSnapshotRef {
+    let snapshot = kernel_tool_catalog_snapshot();
+    KernelToolCatalogSnapshotRef {
+        catalog_version: snapshot.catalog_version.to_string(),
+        catalog_hash: snapshot.catalog_hash,
+        tools: snapshot
+            .tools
+            .into_iter()
+            .map(|tool| KernelToolCatalogEntryRef {
+                tool_id: tool.tool_id.to_string(),
+                capability: tool.capability.to_string(),
+                family: tool.family,
+                operation_kind: tool.operation_kind,
+                provider_schema: tool.provider_schema,
+                planning_schema: tool.planning_schema,
+                provider_visible: tool.provider_visible,
+                forbidden_fields: tool.forbidden_fields,
+                risk: tool.risk,
+                permission_mode: tool.permission_mode,
+                permission_summary: tool.permission_summary,
+                path_scope_policy: tool.path_scope_policy,
+                plan_target_mode: tool.plan_target_mode,
+                plan_target_source: tool.plan_target_source,
+                execution_mode: tool.execution_mode,
+                isolation: tool.isolation,
+                hard_deny_rules: tool.hard_deny_rules,
+                needs_workspace: tool.needs_workspace,
+                read_only: tool.read_only,
+                usage_constraints: KernelToolUsageConstraintsRef {
+                    target_existence: tool.usage_constraints.target_existence,
+                    source_existence: tool.usage_constraints.source_existence,
+                    destination_existence: tool.usage_constraints.destination_existence,
+                    target_kinds: tool.usage_constraints.target_kinds,
+                    content_mode: tool.usage_constraints.content_mode,
+                    directory_recursive_required: tool
+                        .usage_constraints
+                        .directory_recursive_required,
+                },
+            })
+            .collect(),
+    }
 }
 
 pub fn kernel_tool_catalog_hash() -> String {
@@ -79,8 +148,9 @@ pub fn kernel_tool_catalog_hash() -> String {
 pub struct DeepCodeKernelRuntime {
     config_resolver: DefaultConfigResolver,
     policy_profile: PolicyProfile,
-    skills: InMemorySkillRegistry,
-    tool_executors: SkillExecutorRegistry,
+    user_skill_registry: InMemoryUserSkillRegistry,
+    tool_registry: &'static KernelToolRegistry,
+    tool_executors: executors::KernelExecutorRegistry,
     tool_runtime_config: executors::KernelExecutorConfig,
     ledger: Box<dyn EventLedger>,
     state: RuntimeState,
@@ -106,14 +176,19 @@ impl DeepCodeKernelRuntime {
             next_run_index,
             ..RuntimeState::default()
         };
+        let tool_registry = kernel_tool_registry();
+        let tool_executors =
+            executors::KernelExecutorRegistry::from_executors(executors::builtin_executors(
+                tool_registry,
+                executors::KernelExecutorConfig::default(),
+                Arc::new(executors::EmptySecretProvider),
+            ));
         Self {
             config_resolver: DefaultConfigResolver,
             policy_profile: PolicyProfile::developer_defaults(),
-            skills: InMemorySkillRegistry::default(),
-            tool_executors: SkillExecutorRegistry::from_executors(executors::builtin_executors(
-                executors::KernelExecutorConfig::default(),
-                Arc::new(executors::EmptySecretProvider),
-            )),
+            user_skill_registry: InMemoryUserSkillRegistry::default(),
+            tool_registry,
+            tool_executors,
             tool_runtime_config: executors::KernelExecutorConfig::default(),
             ledger,
             state,
@@ -134,10 +209,9 @@ impl DeepCodeKernelRuntime {
         secret_provider: Arc<dyn executors::SecretProvider>,
     ) {
         self.tool_runtime_config = config.clone();
-        self.tool_executors = SkillExecutorRegistry::from_executors(executors::builtin_executors(
-            config,
-            secret_provider,
-        ));
+        self.tool_executors = executors::KernelExecutorRegistry::from_executors(
+            executors::builtin_executors(self.tool_registry, config, secret_provider),
+        );
     }
 }
 

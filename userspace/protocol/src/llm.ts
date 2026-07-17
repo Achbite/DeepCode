@@ -138,7 +138,7 @@ export interface AgentStreamPartFrame {
   runId?: string;
   targetPath?: string;
   language?: string;
-  capability?: string;
+  toolId?: string;
   blockId?: string;
   actionId?: string;
   sequence?: number;

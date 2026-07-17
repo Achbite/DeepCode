@@ -5,13 +5,14 @@ pub(crate) use axum::response::{IntoResponse, Response};
 pub(crate) use axum::routing::{any, get, patch, post};
 pub(crate) use axum::{Json, Router};
 pub(crate) use deepcode_kernel_abi::{
-    HostInspectionQuery, HostInspectionResult, KernelCommand, KernelErrorEnvelope, KernelEvent,
-    KernelSnapshot, RequestId,
+    HostCapability, HostCapabilityUnavailable, HostCapabilityUnavailableReason,
+    HostInspectionOutput, HostInspectionQuery, HostInspectionResult, HostSkillCatalogResult,
+    HostWorkspaceCurrent, HostWorkspaceOutput, HostWorkspaceResult, KernelCommand,
+    KernelCommandEnvelope, KernelErrorEnvelope, KernelEvent, KernelReply, RequestId,
 };
 pub(crate) use deepcode_kernel_runtime::DeepCodeKernelRuntime;
 pub(crate) use serde::{Deserialize, Serialize};
 pub(crate) use serde_json::{json, Value};
-pub(crate) use std::cmp::Ordering;
 pub(crate) use std::collections::HashMap;
 pub(crate) use std::fs;
 pub(crate) use std::io::{self, BufRead, Read, Write};

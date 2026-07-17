@@ -103,6 +103,66 @@ fn accepted_plan_create_executable_is_hashed_authorized_and_created_as_0755() {
 }
 
 #[test]
+fn uncommitted_temporary_create_rolls_back_its_lease_without_touching_user_files() {
+    let (runtime, workspace) = runtime_with_workspace();
+    let suffix = TEMP_INDEX.fetch_add(1, Ordering::SeqCst);
+    let missing_target = format!("missing-parent-{suffix}/temporary-{suffix}.txt");
+    let event = runtime
+        .execute_bound_tool(
+            "run-1",
+            "session-1",
+            format!("temp-create-{suffix}"),
+            "fs.create".to_string(),
+            ToolOperationKind::FsCreate,
+            serde_json::json!({
+                "path": &missing_target,
+                "content": "temporary",
+                "temporary": true,
+                "executable": false,
+            }),
+        )
+        .expect("failed tool execution still produces a typed completion fact");
+    assert!(matches!(
+        event,
+        KernelEvent::ToolCompleted { fact, .. } if !fact.ok
+    ));
+    assert!(!workspace.join(&missing_target).exists());
+    assert!(runtime
+        .state
+        .resource_manager
+        .list()
+        .iter()
+        .filter(|resource| resource.kind == KernelResourceKind::TempArtifact)
+        .all(|resource| resource.state == deepcode_kernel_ledger::KernelResourceState::Released));
+
+    let user_file = workspace.join("input.txt");
+    let original = fs::read_to_string(&user_file).expect("read user file before guarded write");
+    let write_event = runtime
+        .execute_bound_tool(
+            "run-1",
+            "session-1",
+            format!("temp-write-{suffix}"),
+            "fs.write".to_string(),
+            ToolOperationKind::FsWrite,
+            serde_json::json!({
+                "path": "input.txt",
+                "content": "must not be written",
+                "temporary": true,
+            }),
+        )
+        .expect("unleased temporary write produces a typed completion fact");
+    assert!(matches!(
+        write_event,
+        KernelEvent::ToolCompleted { fact, .. }
+            if !fact.ok && fact.error.as_ref().is_some_and(|error| error.code == "temporary_resource_unavailable")
+    ));
+    assert_eq!(
+        fs::read_to_string(user_file).expect("read user file after guarded write"),
+        original
+    );
+}
+
+#[test]
 fn accepted_plan_authorization_executes_without_repeated_permission_and_releases_lease() {
     let (mut runtime, workspace) = runtime_with_workspace();
     let suffix = TEMP_INDEX.fetch_add(1, Ordering::SeqCst);
@@ -229,7 +289,10 @@ fn accepted_plan_authorization_executes_without_repeated_permission_and_releases
             request_id: RequestId(format!("plan-review-gate-{suffix}")),
             run_id: RunId("run-1".to_string()),
             session_id: Some(SessionId("session-1".to_string())),
-            decision: serde_json::json!({ "decision": "accept" }),
+            decision: ReviewGateDecision {
+                decision: ReviewGateDecisionKind::Accept,
+                guidance: None,
+            },
         })
         .expect("review gate releases plan authorization resources");
     assert!(!runtime.plan_grant_lease_active("run-1", &authorization_contract_id));
@@ -330,6 +393,74 @@ fn sequential_tasks_reuse_plan_permission_bundle_without_resource_identity_colli
 }
 
 #[test]
+fn review_replan_releases_plan_grant_but_keeps_run_workspace_lease() {
+    let (mut runtime, _workspace) = runtime_with_workspace();
+    let suffix = TEMP_INDEX.fetch_add(1, Ordering::SeqCst);
+    let plan_id = format!("plan-replan-{suffix}");
+    let review = review_plan_tasks(
+        &mut runtime,
+        &plan_id,
+        vec![TaskIntentTask {
+            task_id: format!("task-replan-{suffix}"),
+            tool_id: "fs.create".to_string(),
+            targets: vec![format!("replan-{suffix}.txt")],
+            depends_on: Vec::new(),
+            args: serde_json::json!({}),
+        }],
+    );
+    let authorization_contract_id = review.authorization_contract.id.clone();
+    accept_plan_review(&mut runtime, &plan_id, &review);
+    assert!(runtime.plan_grant_lease_active("run-1", &authorization_contract_id));
+    assert!(runtime
+        .state
+        .resource_manager
+        .list()
+        .iter()
+        .any(|resource| {
+            resource.state == deepcode_kernel_ledger::KernelResourceState::Active
+                && matches!(
+                    &resource.metadata,
+                    KernelResourceMetadata::WorkspaceReadLease { .. }
+                )
+        }));
+
+    let events = runtime
+        .dispatch(KernelCommand::ReviewGateEvaluate {
+            request_id: RequestId(format!("review-replan-{suffix}")),
+            run_id: RunId("run-1".to_string()),
+            session_id: Some(SessionId("session-1".to_string())),
+            decision: ReviewGateDecision {
+                decision: ReviewGateDecisionKind::Revise,
+                guidance: None,
+            },
+        })
+        .expect("review revision returns the run to ready state");
+
+    assert!(events.iter().any(|event| matches!(
+        event,
+        KernelEvent::ReviewGateEvaluated { result, .. }
+            if result.status == deepcode_kernel_abi::ReviewGateStatus::NeedsReplan
+    )));
+    assert!(!runtime.plan_grant_lease_active("run-1", &authorization_contract_id));
+    assert!(!runtime
+        .state
+        .plan_authorization_contracts_by_run
+        .contains_key("run-1"));
+    assert!(runtime
+        .state
+        .resource_manager
+        .list()
+        .iter()
+        .any(|resource| {
+            resource.state == deepcode_kernel_ledger::KernelResourceState::Active
+                && matches!(
+                    &resource.metadata,
+                    KernelResourceMetadata::WorkspaceReadLease { .. }
+                )
+        }));
+}
+
+#[test]
 fn accepted_plan_and_resource_leases_restore_from_ledger_before_next_task() {
     let suffix = TEMP_INDEX.fetch_add(1, Ordering::SeqCst);
     let workspace = TestWorkspace(std::env::temp_dir().join(format!(
@@ -340,7 +471,7 @@ fn accepted_plan_and_resource_leases_restore_from_ledger_before_next_task() {
     let ledger_path = workspace.join("kernel-events.jsonl");
     let mut runtime = DeepCodeKernelRuntime::with_ndjson_ledger(&ledger_path);
     runtime
-        .dispatch(KernelCommand::WorkspaceOpen {
+        .dispatch(KernelCommand::HostWorkspaceOpen {
             request_id: RequestId(format!("resource-restore-open-{suffix}")),
             path: workspace.to_string_lossy().to_string(),
         })
@@ -379,6 +510,10 @@ fn accepted_plan_and_resource_leases_restore_from_ledger_before_next_task() {
     restored
         .ensure_session_restored("session-1")
         .expect("resources and authorization restore from ledger");
+    assert!(
+        restored.state.current_workspace.is_none(),
+        "restoring an Agent Run must not mutate Host workspace state"
+    );
     assert!(restored.plan_grant_lease_active("run-1", &authorization_contract_id));
     assert_eq!(
         restored.state.plan_authorization_contracts_by_run["run-1"][&authorization_contract_id]
@@ -522,7 +657,7 @@ fn mixed_delete_plan_expands_exact_targets_and_executes_under_one_plan_grant() {
     assert_eq!(operations.len(), 3);
     assert_eq!(operations[0].id, format!("plan-op-{task_id}-1"));
     assert_eq!(operations[0].targets, [directory_target.clone()]);
-    assert_eq!(operations[0].target_kind.as_deref(), Some("directory"));
+    assert_eq!(operations[0].target_kind, Some(ToolTargetKind::Directory));
     assert_eq!(operations[0].recursive, Some(true));
     for (index, target) in [first_file.clone(), second_file.clone()]
         .into_iter()
@@ -530,7 +665,7 @@ fn mixed_delete_plan_expands_exact_targets_and_executes_under_one_plan_grant() {
     {
         let operation = &operations[index + 1];
         assert_eq!(operation.targets, [target]);
-        assert_eq!(operation.target_kind.as_deref(), Some("file"));
+        assert_eq!(operation.target_kind, Some(ToolTargetKind::File));
         assert_eq!(operation.recursive, Some(false));
     }
     assert_eq!(review.authorization_contract.permission_bundles.len(), 1);
@@ -589,11 +724,8 @@ fn mixed_delete_plan_expands_exact_targets_and_executes_under_one_plan_grant() {
             .iter()
             .filter(|event| matches!(
                 event,
-                KernelEvent::ToolCompleted {
-                    tool_name,
-                    ok: true,
-                    ..
-                } if tool_name == "fs.delete"
+                KernelEvent::ToolCompleted { fact, .. }
+                    if fact.tool_id == "fs.delete" && fact.ok
             ))
             .count(),
         3
@@ -960,13 +1092,14 @@ fn batch_review_ready_releases_permission_leases_and_removes_only_temporary_file
         })
         .expect("typed review facts");
     assert!(review.cleanup_failures.is_empty());
-    assert!(review.resource_events.iter().any(|event| {
-        event.get("kind").and_then(Value::as_str) == Some("resource.acquired_batch")
-    }));
     assert!(review
         .resource_events
         .iter()
-        .any(|event| { event.get("kind").and_then(Value::as_str) == Some("resource.released") }));
+        .any(|event| { event.kind == ResourceLifecycleKind::AcquiredBatch }));
+    assert!(review
+        .resource_events
+        .iter()
+        .any(|event| event.kind == ResourceLifecycleKind::Released));
 }
 
 fn authorize_plan_targets(

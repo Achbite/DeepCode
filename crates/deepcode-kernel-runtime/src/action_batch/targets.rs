@@ -302,11 +302,10 @@ pub(super) fn push_attachment_prefix(prefixes: &mut Vec<String>, value: &str) ->
     }
     match normalize_write_relative_path(value) {
         Ok(normalized) => push_normalized_prefix(prefixes, &normalized),
-        Err(KernelError::InvalidCommand(message))
-            if message.starts_with("Kernel mutation target must be relative:") =>
-        {
-            Ok(())
-        }
+        Err(KernelError::Structured {
+            code: "mutation_target_absolute",
+            ..
+        }) => Ok(()),
         Err(error) => Err(error),
     }
 }
@@ -396,9 +395,7 @@ pub(super) fn normalize_write_relative_path(raw_path: &str) -> KernelResult<Stri
     }
     let path = Path::new(&normalized);
     if path.is_absolute() {
-        return Err(KernelError::InvalidCommand(format!(
-            "Kernel mutation target must be relative: {raw_path}"
-        )));
+        return Err(absolute_mutation_target(raw_path));
     }
 
     let mut parts = Vec::new();
@@ -417,9 +414,7 @@ pub(super) fn normalize_write_relative_path(raw_path: &str) -> KernelResult<Stri
                 )));
             }
             std::path::Component::RootDir | std::path::Component::Prefix(_) => {
-                return Err(KernelError::InvalidCommand(format!(
-                    "Kernel mutation target must be relative: {raw_path}"
-                )));
+                return Err(absolute_mutation_target(raw_path));
             }
         }
     }
@@ -432,6 +427,15 @@ pub(super) fn normalize_write_relative_path(raw_path: &str) -> KernelResult<Stri
         });
     }
     Ok(parts.join("/"))
+}
+
+fn absolute_mutation_target(raw_path: &str) -> KernelError {
+    KernelError::Structured {
+        code: "mutation_target_absolute",
+        stage: "admission",
+        message: format!("Kernel mutation target must be relative: {raw_path}"),
+        details: serde_json::json!({ "classification": "invalid_mutation_target" }),
+    }
 }
 
 pub(crate) fn explicit_attachment_root(attachment: &Value) -> Option<PathBuf> {

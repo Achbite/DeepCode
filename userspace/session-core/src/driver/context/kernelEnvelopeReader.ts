@@ -1,4 +1,4 @@
-import type { AgentEvent, KernelToolCatalogSnapshot } from '@deepcode/protocol';
+import { decodeKernelEventV1, type AgentEvent, type KernelToolCatalogSnapshot } from '@deepcode/protocol';
 import type { DriverRequestRef, KernelStateContractRef } from '../types.js';
 
 export interface RecoveredKernelContext {
@@ -63,27 +63,16 @@ function recognizedKernelRecords(value: unknown): Record<string, unknown>[] {
   const root = objectRecord(value);
   if (!root) return [];
   const payload = objectRecord(root.payload);
-  const rootKernelEvent = objectRecord(root.kernelEvent);
-  const payloadKernelEvent = objectRecord(payload?.kernelEvent);
-  return uniqueRecords([
-    root,
-    payload,
-    rootKernelEvent,
-    payloadKernelEvent,
-  ]);
-}
-
-function uniqueRecords(
-  records: Array<Record<string, unknown> | undefined>
-): Record<string, unknown>[] {
-  const seen = new Set<Record<string, unknown>>();
-  const result: Record<string, unknown>[] = [];
-  for (const record of records) {
-    if (!record || seen.has(record)) continue;
-    seen.add(record);
-    result.push(record);
+  const directKind = stringValue(root.kind);
+  const candidate = objectRecord(payload?.kernelEvent)
+    || (directKind?.includes('.') ? root : undefined)
+    || (directKind === 'error' && objectRecord(root.error) ? root : undefined);
+  if (!candidate) return [];
+  try {
+    return [decodeKernelEventV1(value) as unknown as Record<string, unknown>];
+  } catch (error) {
+    throw new Error(`kernel_abi_event_invalid: ${error instanceof Error ? error.message : String(error)}`);
   }
-  return result;
 }
 
 function driverRequestFromRecord(value: unknown): DriverRequestRef | undefined {

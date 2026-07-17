@@ -302,7 +302,7 @@ fn scoped_session_list_and_current_are_workspace_owned() {
 }
 
 #[test]
-fn session_schema_requires_protocol_v4_and_tool_catalog_v3() {
+fn session_schema_requires_kernel_abi_v1_protocol_v4_and_tool_catalog_v3() {
     let current = create_agent_session_value(
         "session-schema-current",
         "2026-07-12T00:00:00Z",
@@ -314,6 +314,13 @@ fn session_schema_requires_protocol_v4_and_tool_catalog_v3() {
     );
     assert!(session_schema_is_compatible(&current));
 
+    let mut missing_abi = current.clone();
+    missing_abi
+        .as_object_mut()
+        .unwrap()
+        .remove("kernelAbiVersion");
+    assert!(!session_schema_is_compatible(&missing_abi));
+
     let mut missing = current.clone();
     missing
         .as_object_mut()
@@ -322,6 +329,9 @@ fn session_schema_requires_protocol_v4_and_tool_catalog_v3() {
     assert!(!session_schema_is_compatible(&missing));
 
     let mut old = current;
+    old["kernelAbiVersion"] = json!("deepcode.kernel.abi.v0");
+    assert!(!session_schema_is_compatible(&old));
+    old["kernelAbiVersion"] = json!(deepcode_kernel_runtime::KERNEL_ABI_VERSION);
     old["agentProtocolVersion"] = json!("deepcode.agent.protocol.v3");
     assert!(!session_schema_is_compatible(&old));
 }

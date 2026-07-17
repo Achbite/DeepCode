@@ -7,7 +7,6 @@ import {
 } from '../../protocol/types.js';
 
 export interface ProposalSemanticValidatorPorts {
-  sideEffectToolIds: Set<string>;
   readActionBundle(proposal: ProposalEnvelope): ActionBundleDraft | undefined;
   actionToolId(action: { toolId?: unknown }): string;
   actionFileTargetPath(action: Record<string, unknown>): string | undefined;
@@ -177,23 +176,6 @@ export class ProposalSemanticValidator {
       const args = action.args;
       const contentBlockId = stringValue(args.contentBlockId);
       const replacementBlockId = stringValue(args.replacementBlockId);
-      if (toolId === 'fs.delete') {
-        if (contentBlockId || replacementBlockId) {
-          throw new AgentPlanParseError('invalid_action_bundle', `actionBundle.actions[${index}] fs.delete must not reference content blocks.`);
-        }
-      }
-      if ((toolId === 'fs.create' || toolId === 'fs.write') && !contentBlockId) {
-        throw new AgentPlanParseError('invalid_action_bundle', `actionBundle.actions[${index}] ${toolId} must include args.contentBlockId.`);
-      }
-      if (toolId === 'fs.edit' && !replacementBlockId) {
-        throw new AgentPlanParseError('invalid_action_bundle', `actionBundle.actions[${index}] fs.edit must include args.replacementBlockId.`);
-      }
-      if (toolId === 'fs.edit') {
-        const patchSpecError = this.patchActionSpecError(action);
-        if (patchSpecError) {
-          throw new AgentPlanParseError('invalid_action_bundle', `actionBundle.actions[${index}] ${patchSpecError}`);
-        }
-      }
       if (contentBlockId && !contentBlockIds.has(contentBlockId)) {
         throw new AgentPlanParseError(
           'invalid_action_bundle',
@@ -207,8 +189,6 @@ export class ProposalSemanticValidator {
         );
       }
     }
-    const sideEffectful = bundle.actions.some((action) => this.ports.sideEffectToolIds.has(action.toolId));
-    if (!sideEffectful) return;
     for (const [index, block] of contentBlocks.entries()) {
       const record = objectRecord(block);
       if (!stringValue(record?.targetPath)) {
@@ -291,26 +271,6 @@ export class ProposalSemanticValidator {
         }
       }
     }
-  }
-
-  private patchActionSpecError(action: ActionBundleDraft['actions'][number]): string | undefined {
-    const patchSpec = objectRecord(action.args.patchSpec);
-    if (!patchSpec) {
-      return 'patch action must include patchSpec.';
-    }
-    const match = objectRecord(patchSpec.match);
-    if (!match) {
-      return 'patch action must include patchSpec.match.';
-    }
-    const matchKind = stringValue(match.kind);
-    if (matchKind !== 'exactBlock') {
-      return 'patchSpec.match.kind must be "exactBlock".';
-    }
-    const text = stringValue(match.text);
-    if (!text) {
-      return 'patchSpec.match.text must be a non-empty exact block from current ResourcePacket evidence.';
-    }
-    return undefined;
   }
 
 }

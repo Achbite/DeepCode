@@ -1,4 +1,6 @@
-use deepcode_kernel_abi::{KernelCommand, KernelEvent, RequestId};
+use deepcode_kernel_abi::{
+    KernelCommand, KernelCommandEnvelope, KernelEvent, KernelReply, RequestId,
+};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fs::{File, OpenOptions};
@@ -92,25 +94,33 @@ impl HttpKernelClient {
         &self.config.base_url
     }
 
-    pub async fn kernel_command(&self, command: Value) -> KernelClientResult<Value> {
-        let value = self
+    pub async fn kernel_command(&self, command: KernelCommand) -> KernelClientResult<KernelReply> {
+        self.kernel_command_envelope(KernelCommandEnvelope::new(command))
+            .await
+    }
+
+    pub async fn kernel_command_envelope(
+        &self,
+        envelope: KernelCommandEnvelope,
+    ) -> KernelClientResult<KernelReply> {
+        let reply = self
             .http
             .post(self.url("/api/kernel/commands"))
-            .json(&json!({ "command": command }))
+            .json(&envelope)
             .send()
             .await?
             .error_for_status()?
-            .json::<Value>()
+            .json::<KernelReply>()
             .await?;
-        if value.get("ok").and_then(Value::as_bool) == Some(false) {
-            let message = value
-                .get("error")
-                .and_then(|error| error.get("message"))
-                .and_then(Value::as_str)
+        if !reply.ok {
+            let message = reply
+                .error
+                .as_ref()
+                .map(|error| error.message.as_str())
                 .unwrap_or("Kernel command failed");
-            return Err(KernelClientError::Api(message.to_string()));
+            return Err(KernelClientError::Api(message.to_owned()));
         }
-        Ok(value)
+        Ok(reply)
     }
 
     pub async fn health(&self) -> KernelClientResult<DaemonStatus> {
@@ -437,10 +447,10 @@ impl HttpKernelClient {
                 .unwrap_or_default()
                 .as_nanos()
         ));
-        let command = serde_json::to_value(KernelCommand::AuditVerify {
+        let command = KernelCommand::AuditVerify {
             request_id,
             scope: json!({ "kind": "all" }),
-        })?;
+        };
         decode_audit_verify(self.kernel_command(command).await?)
     }
 
@@ -487,15 +497,9 @@ fn decode_api_data<T: DeserializeOwned>(value: Value) -> KernelClientResult<T> {
     Ok(serde_json::from_value(api_data(value)?)?)
 }
 
-fn decode_audit_verify(value: Value) -> KernelClientResult<AuditVerifyResult> {
-    let events = value
-        .get("events")
-        .and_then(Value::as_array)
-        .ok_or(KernelClientError::MissingField("events"))?;
-    for event in events {
-        let Ok(KernelEvent::AuditVerifyCompleted { ok, report, .. }) =
-            serde_json::from_value::<KernelEvent>(event.clone())
-        else {
+fn decode_audit_verify(reply: KernelReply) -> KernelClientResult<AuditVerifyResult> {
+    for event in reply.events {
+        let KernelEvent::AuditVerifyCompleted { ok, report, .. } = event else {
             continue;
         };
         let message = report
@@ -533,17 +537,20 @@ mod tests {
 
     #[test]
     fn decodes_real_audit_verify_event() {
-        let result = decode_audit_verify(json!({
-            "events": [{
-                "kind": "audit.verify_completed",
-                "requestId": "req-audit",
-                "ok": true,
-                "report": {
+        let result = decode_audit_verify(KernelReply {
+            ok: true,
+            events: vec![KernelEvent::AuditVerifyCompleted {
+                request_id: Some(RequestId("req-audit".to_string())),
+                ok: true,
+                report: json!({
                     "degraded": true,
                     "message": "audit chain verified"
-                }
-            }]
-        }))
+                }),
+                sequence: None,
+            }],
+            snapshot: None,
+            error: None,
+        })
         .expect("decode audit verification result");
 
         assert_eq!(result.status, "verified");

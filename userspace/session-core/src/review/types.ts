@@ -24,7 +24,6 @@ export interface ReviewValidationFact {
   id: string;
   description: string;
   status: 'pending' | 'passed' | 'failed' | 'skipped';
-  command?: string;
   evidenceRef?: string;
 }
 

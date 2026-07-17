@@ -10,16 +10,12 @@ pub(super) struct FsRenameExecutor;
 pub(super) struct FsDeleteExecutor;
 pub(super) struct FsEnsureDirectoryExecutor;
 
-impl SkillExecutor for FsListExecutor {
-    fn descriptor(&self) -> SkillDescriptor {
-        descriptor("fs.list")
-    }
-
+impl KernelToolExecutor for FsListExecutor {
     fn invoke(
         &self,
-        invocation: SkillInvocation,
-        context: SkillExecutionContext,
-    ) -> KernelResult<SkillResult> {
+        invocation: KernelToolInvocation,
+        context: KernelToolExecutionContext,
+    ) -> KernelResult<KernelToolExecutionResult> {
         let root = workspace_root(&context)?;
         let relative = get_string(&invocation.input, "path").unwrap_or_else(|| ".".to_string());
         let target = resolve_workspace_read_path(&root, &relative)?;
@@ -45,16 +41,12 @@ impl SkillExecutor for FsListExecutor {
     }
 }
 
-impl SkillExecutor for FsReadExecutor {
-    fn descriptor(&self) -> SkillDescriptor {
-        descriptor("fs.read")
-    }
-
+impl KernelToolExecutor for FsReadExecutor {
     fn invoke(
         &self,
-        invocation: SkillInvocation,
-        context: SkillExecutionContext,
-    ) -> KernelResult<SkillResult> {
+        invocation: KernelToolInvocation,
+        context: KernelToolExecutionContext,
+    ) -> KernelResult<KernelToolExecutionResult> {
         let root = workspace_root(&context)?;
         let path = get_string(&invocation.input, "path").unwrap_or_default();
         let target = resolve_workspace_read_path(&root, &path)?;
@@ -109,16 +101,12 @@ impl SkillExecutor for FsReadExecutor {
     }
 }
 
-impl SkillExecutor for FsCreateExecutor {
-    fn descriptor(&self) -> SkillDescriptor {
-        descriptor("fs.create")
-    }
-
+impl KernelToolExecutor for FsCreateExecutor {
     fn invoke(
         &self,
-        invocation: SkillInvocation,
-        context: SkillExecutionContext,
-    ) -> KernelResult<SkillResult> {
+        invocation: KernelToolInvocation,
+        context: KernelToolExecutionContext,
+    ) -> KernelResult<KernelToolExecutionResult> {
         let root = workspace_root(&context)?;
         let path = get_string(&invocation.input, "path").unwrap_or_default();
         WorkspaceBoundary::assert_mutable_config_asset(&path)?;
@@ -160,16 +148,12 @@ impl SkillExecutor for FsCreateExecutor {
     }
 }
 
-impl SkillExecutor for FsWriteExecutor {
-    fn descriptor(&self) -> SkillDescriptor {
-        descriptor("fs.write")
-    }
-
+impl KernelToolExecutor for FsWriteExecutor {
     fn invoke(
         &self,
-        invocation: SkillInvocation,
-        context: SkillExecutionContext,
-    ) -> KernelResult<SkillResult> {
+        invocation: KernelToolInvocation,
+        context: KernelToolExecutionContext,
+    ) -> KernelResult<KernelToolExecutionResult> {
         let root = workspace_root(&context)?;
         let path = get_string(&invocation.input, "path").unwrap_or_default();
         WorkspaceBoundary::assert_mutable_config_asset(&path)?;
@@ -197,16 +181,12 @@ impl SkillExecutor for FsWriteExecutor {
     }
 }
 
-impl SkillExecutor for FsEditExecutor {
-    fn descriptor(&self) -> SkillDescriptor {
-        descriptor("fs.edit")
-    }
-
+impl KernelToolExecutor for FsEditExecutor {
     fn invoke(
         &self,
-        invocation: SkillInvocation,
-        context: SkillExecutionContext,
-    ) -> KernelResult<SkillResult> {
+        invocation: KernelToolInvocation,
+        context: KernelToolExecutionContext,
+    ) -> KernelResult<KernelToolExecutionResult> {
         let root = workspace_root(&context)?;
         let path = get_string(&invocation.input, "path").unwrap_or_default();
         WorkspaceBoundary::assert_mutable_config_asset(&path)?;
@@ -249,16 +229,12 @@ impl SkillExecutor for FsEditExecutor {
     }
 }
 
-impl SkillExecutor for FsRenameExecutor {
-    fn descriptor(&self) -> SkillDescriptor {
-        descriptor("fs.rename")
-    }
-
+impl KernelToolExecutor for FsRenameExecutor {
     fn invoke(
         &self,
-        invocation: SkillInvocation,
-        context: SkillExecutionContext,
-    ) -> KernelResult<SkillResult> {
+        invocation: KernelToolInvocation,
+        context: KernelToolExecutionContext,
+    ) -> KernelResult<KernelToolExecutionResult> {
         let root = workspace_root(&context)?;
         let path = required_string(&invocation.input, "path")?;
         let destination = required_string(&invocation.input, "destinationPath")?;
@@ -300,16 +276,12 @@ impl SkillExecutor for FsRenameExecutor {
     }
 }
 
-impl SkillExecutor for FsDeleteExecutor {
-    fn descriptor(&self) -> SkillDescriptor {
-        descriptor("fs.delete")
-    }
-
+impl KernelToolExecutor for FsDeleteExecutor {
     fn invoke(
         &self,
-        invocation: SkillInvocation,
-        context: SkillExecutionContext,
-    ) -> KernelResult<SkillResult> {
+        invocation: KernelToolInvocation,
+        context: KernelToolExecutionContext,
+    ) -> KernelResult<KernelToolExecutionResult> {
         let root = workspace_root(&context)?;
         let path = get_string(&invocation.input, "path").unwrap_or_default();
         let target_kind =
@@ -368,16 +340,12 @@ impl SkillExecutor for FsDeleteExecutor {
     }
 }
 
-impl SkillExecutor for FsEnsureDirectoryExecutor {
-    fn descriptor(&self) -> SkillDescriptor {
-        descriptor("fs.ensure_directory")
-    }
-
+impl KernelToolExecutor for FsEnsureDirectoryExecutor {
     fn invoke(
         &self,
-        invocation: SkillInvocation,
-        context: SkillExecutionContext,
-    ) -> KernelResult<SkillResult> {
+        invocation: KernelToolInvocation,
+        context: KernelToolExecutionContext,
+    ) -> KernelResult<KernelToolExecutionResult> {
         let root = workspace_root(&context)?;
         let path = required_string(&invocation.input, "path")?;
         WorkspaceBoundary::assert_mutable_config_asset(&path)?;
@@ -399,16 +367,12 @@ impl SkillExecutor for FsEnsureDirectoryExecutor {
     }
 }
 
-impl SkillExecutor for FsDiffExecutor {
-    fn descriptor(&self) -> SkillDescriptor {
-        descriptor("fs.diff")
-    }
-
+impl KernelToolExecutor for FsDiffExecutor {
     fn invoke(
         &self,
-        invocation: SkillInvocation,
-        context: SkillExecutionContext,
-    ) -> KernelResult<SkillResult> {
+        invocation: KernelToolInvocation,
+        context: KernelToolExecutionContext,
+    ) -> KernelResult<KernelToolExecutionResult> {
         let root = workspace_root(&context)?;
         let path = get_string(&invocation.input, "path").unwrap_or_default();
         let target = resolve_workspace_read_path(&root, &path)?;

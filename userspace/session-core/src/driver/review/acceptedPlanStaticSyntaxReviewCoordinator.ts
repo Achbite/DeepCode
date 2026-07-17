@@ -24,7 +24,7 @@ export interface AcceptedPlanStaticSyntaxReviewInput<TState extends AcceptedPlan
   state: TState;
   prompt: PromptEnvelope;
   accepted: AcceptedTaskPlanContext;
-  batch: Record<string, unknown>;
+  batch: unknown;
   batchEvents: unknown[];
 }
 

@@ -4,13 +4,70 @@ export type IsolationLevel = 'none' | 'supervised' | 'osSandbox';
 export type SandboxSupportState = 'unavailable' | 'contractOnly' | 'experimental' | 'enforced';
 export type IsolationFallbackPolicy = 'deny';
 
+export type KernelToolFamily =
+  | 'workspace'
+  | 'document'
+  | 'git'
+  | 'process'
+  | 'network'
+  | 'browser'
+  | 'provider';
+export type KernelToolRiskLevel = 'low' | 'medium' | 'high' | 'critical';
+export type KernelToolPermissionMode = 'allow' | 'ask' | 'deny';
+export type KernelToolExecutionMode = 'execute' | 'previewOnly' | 'blocked';
+export type KernelPathScopePolicy = 'none' | 'workspaceReadScope' | 'workspacePathScopedGrant';
+export type KernelPlanTargetMode = 'perTarget' | 'sourceDestination' | 'aggregate';
+export type KernelPlanTargetSource =
+  | 'none'
+  | 'path'
+  | 'pathOrCurrentDirectory'
+  | 'sourceDestination'
+  | 'gitWorkspace'
+  | 'gitIndex'
+  | 'gitRemote'
+  | 'networkUrl'
+  | 'networkQuery';
+export type KernelTargetExistence = 'any' | 'mustExist' | 'mustNotExist';
+export type KernelToolTargetKind = 'file' | 'directory';
+export type KernelToolContentMode = 'none' | 'contentBlock' | 'replacementBlock';
+export type KernelToolOperationKind =
+  | 'fsRead'
+  | 'fsList'
+  | 'fsGlob'
+  | 'fsDiff'
+  | 'fsCreate'
+  | 'fsWrite'
+  | 'fsEdit'
+  | 'fsRename'
+  | 'fsDelete'
+  | 'fsEnsureDirectory'
+  | 'codeGrep'
+  | 'documentRead'
+  | 'gitStatus'
+  | 'gitDiff'
+  | 'gitStage'
+  | 'gitUnstage'
+  | 'gitCommit'
+  | 'gitPush'
+  | 'processExec'
+  | 'webSearch'
+  | 'webFetch'
+  | 'browserOpen'
+  | 'browserReload'
+  | 'browserSnapshot'
+  | 'browserInspect'
+  | 'browserClick'
+  | 'browserType'
+  | 'browserScroll'
+  | 'providerCall';
+
 export interface IsolationContract {
   minimumLevel: IsolationLevel;
   supportState: SandboxSupportState;
   backendRequirement?: string;
   profileRef?: string;
   fallback: IsolationFallbackPolicy;
-  outputTrust: string;
+  outputTrust: 'toolFact' | 'untrustedEvidence';
 }
 
 export interface SandboxCapabilitySnapshot {
@@ -48,18 +105,19 @@ export interface ToolDefinition {
 export interface KernelToolCatalogTool {
   toolId: string;
   capability: string;
-  family: 'workspace' | 'document' | 'git' | 'process' | 'network' | 'browser' | 'provider' | string;
-  operationKind?: string;
+  family: KernelToolFamily;
+  operationKind: KernelToolOperationKind;
   providerSchema: object;
   planningSchema: object;
   providerVisible?: boolean;
   forbiddenFields?: string[];
-  risk: 'low' | 'medium' | 'high' | 'critical' | string;
-  permissionMode: 'allow' | 'ask' | 'deny' | string;
+  risk: KernelToolRiskLevel;
+  permissionMode: KernelToolPermissionMode;
   permissionSummary?: string;
-  pathScopePolicy: string;
-  planTargetMode: 'perTarget' | 'sourceDestination' | 'aggregate';
-  executionMode: 'execute' | 'previewOnly' | 'blocked' | string;
+  pathScopePolicy: KernelPathScopePolicy;
+  planTargetMode: KernelPlanTargetMode;
+  planTargetSource: KernelPlanTargetSource;
+  executionMode: KernelToolExecutionMode;
   isolation: IsolationContract;
   hardDenyRules?: string[];
   needsWorkspace: boolean;
@@ -68,11 +126,11 @@ export interface KernelToolCatalogTool {
 }
 
 export interface ToolUsageConstraints {
-  targetExistence: 'any' | 'mustExist' | 'mustNotExist' | string;
-  sourceExistence?: 'mustExist' | 'mustNotExist' | string;
-  destinationExistence?: 'mustExist' | 'mustNotExist' | string;
-  targetKinds?: Array<'file' | 'directory' | string>;
-  contentMode: 'none' | 'contentBlock' | 'replacementBlock' | string;
+  targetExistence: KernelTargetExistence;
+  sourceExistence?: KernelTargetExistence;
+  destinationExistence?: KernelTargetExistence;
+  targetKinds?: KernelToolTargetKind[];
+  contentMode: KernelToolContentMode;
   directoryRecursiveRequired?: boolean;
 }
 
@@ -109,10 +167,9 @@ export interface PermissionEvaluationRequest {
 
 export interface ListToolsResult {
   tools: ToolDefinition[];
-  catalogVersion?: string;
-  catalogHash?: string;
-  toolCatalog?: KernelToolCatalogSnapshot;
-  skills?: unknown[];
+  catalogVersion: string;
+  catalogHash: string;
+  toolCatalog: KernelToolCatalogSnapshot;
 }
 
 export interface FsReadInput {
@@ -170,13 +227,6 @@ export interface CodeGrepInput {
   maxResults?: number;
 }
 
-export interface CodeSearchInput {
-  query: string;
-  isRegex?: boolean;
-  include?: string[];
-  folderId?: string;
-}
-
 export interface WebSearchInput {
   query: string;
   limit?: number;
@@ -226,19 +276,49 @@ export interface BrowserScrollInput {
 }
 
 export interface CodeGrepMatch {
-  folderId: string;
   path: string;
   line: number;
-  column: number;
   preview: string;
+  before?: Array<{ line: number; text: string }>;
+  after?: Array<{ line: number; text: string }>;
 }
 
 export interface CodeGrepResult {
+  folderId: string;
+  query: string;
+  path: string;
+  strategy: 'literal' | 'regex';
+  include: string[];
+  exclude: string[];
+  contextLines: number;
+  maxResults: number;
+  returnedMatches: number;
+  truncated: boolean;
+  visitedFiles: number;
+  skippedFiles: number;
+  skippedBinaryFiles: number;
+  skippedExecutableFiles: number;
   matches: CodeGrepMatch[];
 }
 
-export type CodeSearchMatch = CodeGrepMatch;
+export interface GitChangeItem {
+  path: string;
+  index: string;
+  worktree: string;
+  group: 'staged' | 'changed' | 'untracked' | string;
+  raw: string;
+}
 
-export interface CodeSearchResult {
-  matches: CodeSearchMatch[];
+export interface GitStatusResult {
+  root: string;
+  changes: GitChangeItem[];
+  raw: string;
+}
+
+export interface GitDiffResult {
+  root: string;
+  path?: string | null;
+  staged: boolean;
+  diff: string;
+  truncated: boolean;
 }
