@@ -119,28 +119,6 @@ export class PermissionDecisionHandler<
       ]));
     }
 
-    if (input.decision === 'reject') {
-      const runId = pending.runId ?? input.runId ?? this.ports.kernelStatus.runId(decisionReply.events ?? []) ?? 'run-unknown';
-      return returnSessionResult((await this.ports.append(input.sessionId, [
-        this.ports.progressProjection.sessionRunStateEvent({
-          sessionId: input.sessionId,
-          runId,
-          phase: 'cancelled',
-          status: 'cancelled',
-          reason: 'permission',
-          decisionOwner: {
-            kind: 'permission',
-            runId,
-            targetId: pending.id,
-            permissionId: pending.id,
-            planId: pending.planId,
-          },
-          ts: this.ports.now(),
-          id: this.ports.createId('session-run-cancelled-permission'),
-        }),
-      ])) ?? result);
-    }
-
     if (observed.kind === 'permissionInterrupted') {
         const runId = pending.runId ?? input.runId ?? this.ports.kernelStatus.runId(decisionReply.events ?? []) ?? 'run-unknown';
         const permissionId = observed.permissionId;
@@ -155,7 +133,7 @@ export class PermissionDecisionHandler<
               runId,
               targetId: permissionId,
               permissionId,
-              planId: pending.planId,
+              planId: undefined,
             },
             ts: this.ports.now(),
             id: this.ports.createId('session-run-waiting-permission'),
@@ -168,9 +146,8 @@ export class PermissionDecisionHandler<
 
     const runId = pending.runId ?? input.runId ?? this.ports.kernelStatus.runId(decisionReply.events ?? []);
     if (!runId) return returnSessionResult(result);
-    const plan = this.ports.planIndex.findPlanCard(result.events, runId, pending.planId);
+    const plan = this.ports.planIndex.findPlanCard(result.events, runId);
     if (!plan) return returnSessionResult(result);
-
     return {
       kind: 'assembleReview',
       request: {

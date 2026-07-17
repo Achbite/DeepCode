@@ -66,7 +66,7 @@ export class OperationIntentCompiler {
     const actions = slots.map((slot, index) => {
       const actionId = `${callId}-${index + 1}`;
       return {
-        ...fileActionContract(actionId, 'fs.delete'),
+        ...fileActionContract(actionId, slot.toolId),
         args: deleteArgs(slot),
         description: `Apply the confirmed delete operation for IntentSlot ${slot.slotId}.`,
       };
@@ -102,9 +102,8 @@ export class OperationIntentCompiler {
         operation: slot.operation === 'createFile' ? 'create' : 'overwrite',
         contentLines,
       });
-      const toolId = slot.operation === 'createFile' ? 'fs.create' : 'fs.write';
       actions.push({
-        ...fileActionContract(actionId, toolId),
+        ...fileActionContract(actionId, slot.toolId),
         args: { ...slot.fixedArgs, path: slot.targetRef, contentBlockId: blockId },
         description: `Apply generated content for IntentSlot ${slot.slotId}.`,
       });
@@ -123,7 +122,7 @@ export class OperationIntentCompiler {
         contentLines: replacementLines,
       });
       actions.push({
-        ...fileActionContract(actionId, 'fs.edit'),
+        ...fileActionContract(actionId, slot.toolId),
         args: {
           ...slot.fixedArgs,
           path: slot.targetRef,
@@ -136,7 +135,7 @@ export class OperationIntentCompiler {
     }
     if (slot.operation === 'deletePath') {
       actions.push({
-        ...fileActionContract(actionId, 'fs.delete'),
+        ...fileActionContract(actionId, slot.toolId),
         args: deleteArgs(slot),
         description: `Apply the confirmed delete for IntentSlot ${slot.slotId}.`,
       });
@@ -147,7 +146,7 @@ export class OperationIntentCompiler {
       if (!argv) throw new Error(`IntentSlot ${slot.slotId} requires argv.`);
       actions.push({
         actionId,
-        toolId: 'process.exec',
+        toolId: slot.toolId,
         args: {
           argv,
           cwd: stringValue(artifact.cwd) ?? '.',

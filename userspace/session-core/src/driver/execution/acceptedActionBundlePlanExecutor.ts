@@ -3,6 +3,7 @@ import type {
   AgentSessionResult,
   AgentWorkspaceBinding,
   KernelCommandEnvelope,
+  KernelActionBatchV1,
   KernelReply,
 } from '@deepcode/protocol';
 import type { ProjectMemoryMode } from '../../context/index.js';
@@ -57,7 +58,7 @@ export interface AcceptedActionBundlePlanExecutorPorts {
   acceptedPlanActionBatchPreflightEvent(
     sessionId: string,
     plan: PlanContext,
-    batch: Record<string, unknown>,
+    batch: KernelActionBatchV1,
     ts: string,
     id: string
   ): AgentEvent;
@@ -65,7 +66,7 @@ export interface AcceptedActionBundlePlanExecutorPorts {
     sessionId: string,
     plan: PlanContext,
     batchEvents: unknown[],
-    batch: Record<string, unknown>,
+    batch: KernelActionBatchV1,
     ts: string,
     id: string
   ): AgentEvent[];
@@ -150,13 +151,15 @@ export class AcceptedActionBundlePlanExecutor {
         }),
       ]) ?? result;
 
-      const batch: Record<string, unknown> = {
+      const batchCandidate: unknown = {
         planId: plan.planId,
         contractId: this.ports.kernelExecutionContractId(plan.planReviewReport),
         contractHash: this.ports.kernelExecutionContractHash(plan.planReviewReport),
         actionBundle: plan.actionBundle,
         contentBlocks: plan.contentBlocks,
       };
+      assertKernelActionBatch(batchCandidate);
+      const batch = batchCandidate;
       result = await this.ports.append(input.sessionId, [
         this.ports.acceptedPlanActionBatchPreflightEvent(
           input.sessionId,
@@ -318,6 +321,25 @@ export class AcceptedActionBundlePlanExecutor {
         this.ports.createId('accepted-action-plan-execution-failed')
       )) ?? result);
     }
+  }
+}
+
+function assertKernelActionBatch(value: unknown): asserts value is KernelActionBatchV1 {
+  const batch = objectRecord(value);
+  const bundle = objectRecord(batch?.actionBundle);
+  if (
+    !stringValue(batch?.planId)
+    || !stringValue(batch?.contractId)
+    || !stringValue(batch?.contractHash)
+    || !stringValue(bundle?.id)
+    || !stringValue(bundle?.goal)
+    || !Array.isArray(bundle?.actions)
+    || !Array.isArray(batch?.contentBlocks)
+  ) {
+    throw new AcceptedActionBundlePlanExecutionError(
+      'kernel_action_batch_invalid',
+      'Accepted action plan could not form a canonical KernelActionBatchV1.'
+    );
   }
 }
 

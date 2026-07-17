@@ -1,30 +1,34 @@
-import type { KernelReply } from '@deepcode/protocol';
+import {
+  decodeKernelEventV1,
+  type KernelEventV1,
+  type KernelReply,
+} from '@deepcode/protocol';
 
 export type KernelReplyObservation =
   | {
     kind: 'factsObserved';
     reply: KernelReply;
-    events: unknown[];
+    events: KernelEventV1[];
     readyForReview: boolean;
     hasFailureOrBlocker: boolean;
   }
   | {
     kind: 'permissionInterrupted';
     reply: KernelReply;
-    events: unknown[];
+    events: KernelEventV1[];
     permissionId?: string;
   }
   | {
     kind: 'commandFailed';
     reply: KernelReply;
-    events: unknown[];
+    events: KernelEventV1[];
     code: string;
     message: string;
   };
 
 export class KernelEventStatusIndex {
   observe(reply: KernelReply): KernelReplyObservation {
-    const events = reply.events ?? [];
+    const events = this.decodeEvents(reply.events ?? []);
     if (this.hasPermissionRequest(events)) {
       return {
         kind: 'permissionInterrupted',
@@ -51,83 +55,53 @@ export class KernelEventStatusIndex {
     };
   }
 
-  workUnitIds(events: unknown[]): string[] {
+  decodeEvents(events: readonly unknown[]): KernelEventV1[] {
+    return events.map((event) => decodeKernelEventV1(event));
+  }
+
+  workUnitIds(events: KernelEventV1[]): string[] {
     const ids = new Set<string>();
     for (const event of events) {
-      const record = objectRecord(event);
-      if (!record) continue;
-      const workUnit = objectRecord(record.workUnit);
-      const id = stringValue(record.workUnitId) ?? stringValue(workUnit?.id);
+      const workUnit = event.kind === 'work_unit.queued' ? event.workUnit : undefined;
+      const id = 'workUnitId' in event ? event.workUnitId : workUnit?.id;
       if (id) ids.add(id);
     }
     return [...ids];
   }
 
-  hasFailureOrBlocker(events: unknown[]): boolean {
-    return events.some((event) => {
-      const record = objectRecord(event);
-      return record?.kind === 'work_unit.failed' || record?.kind === 'work_unit.blocked';
-    });
+  hasFailureOrBlocker(events: KernelEventV1[]): boolean {
+    return events.some((event) => event.kind === 'work_unit.failed' || event.kind === 'work_unit.blocked');
   }
 
-  hasPermissionRequest(events: unknown[]): boolean {
-    return events.some((event) => objectRecord(event)?.kind === 'permission.requested');
+  hasPermissionRequest(events: KernelEventV1[]): boolean {
+    return events.some((event) => event.kind === 'permission.requested');
   }
 
-  actionBatchReadyForReview(events: unknown[]): boolean {
-    if (this.hasPermissionRequest(events)) {
-      return false;
-    }
-    if (events.some((event) => objectRecord(event)?.kind === 'batch.review_ready')) {
-      return true;
-    }
-    const queued = new Set<string>();
-    const terminal = new Set<string>();
-    for (const event of events) {
-      const record = objectRecord(event);
-      if (record?.kind === 'work_unit.queued') {
-        const workUnit = objectRecord(record.workUnit);
-        const id = stringValue(workUnit?.id);
-        if (id) queued.add(id);
-      } else if (
-        record?.kind === 'work_unit.completed' ||
-        record?.kind === 'work_unit.failed' ||
-        record?.kind === 'work_unit.blocked'
-      ) {
-        const id = stringValue(record.workUnitId);
-        if (id) terminal.add(id);
-      }
-    }
-    return queued.size > 0 && [...queued].every((id) => terminal.has(id));
+  actionBatchReadyForReview(events: KernelEventV1[]): boolean {
+    return !this.hasPermissionRequest(events)
+      && events.some((event) => event.kind === 'batch.review_ready');
   }
 
-  reviewGateStatus(events: unknown[] | undefined): string | undefined {
+  reviewGateStatus(events: KernelEventV1[] | undefined): string | undefined {
     for (const event of [...(events ?? [])].reverse()) {
-      const record = objectRecord(event);
-      if (stringValue(record?.kind) !== 'review_gate.evaluated') continue;
-      const result = objectRecord(record?.result);
+      if (event.kind !== 'review_gate.evaluated') continue;
+      const result = objectRecord(event.result);
       const status = stringValue(result?.status);
       if (status) return status;
     }
     return undefined;
   }
 
-  permissionId(events: unknown[]): string | undefined {
+  permissionId(events: KernelEventV1[]): string | undefined {
     for (const event of events) {
-      const record = objectRecord(event);
-      if (record?.kind !== 'permission.requested') continue;
-      const request = objectRecord(record.request);
-      const id = stringValue(request?.id) ?? stringValue(record.permissionId) ?? stringValue(record.toolCallId);
-      if (id) return id;
+      if (event.kind === 'permission.requested') return event.request.id;
     }
     return undefined;
   }
 
-  runId(events: unknown[]): string | undefined {
+  runId(events: KernelEventV1[]): string | undefined {
     for (const event of events) {
-      const record = objectRecord(event);
-      const runId = stringValue(record?.runId);
-      if (runId) return runId;
+      if (event.runId) return event.runId;
     }
     return undefined;
   }

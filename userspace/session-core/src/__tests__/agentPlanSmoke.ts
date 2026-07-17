@@ -4,6 +4,7 @@ import type {
   AgentSessionResult,
   ApiResponse,
   KernelCommandEnvelope,
+  KernelEventV1,
   KernelReply,
   LlmChatRequest,
   LlmChatResult,
@@ -63,7 +64,6 @@ import {
   AcceptedPlanBatchPreflight,
   ActionBundleAdmissionRepairCoordinator,
   AcceptedPlanExecutor,
-  AcceptedPlanReadOnlyTaskExecutor,
   AcceptedPlanTargetParser,
   AcceptedPlanTaskLedgerCoordinator,
   AcceptedPlanTaskRuntimeAccessor,
@@ -129,6 +129,15 @@ import {
   genericToolCatalogSnapshot,
   genericWriteProposal,
   jsonLlmResponse,
+  kernelTestBatchReviewReady,
+  kernelTestPermissionRequest,
+  kernelTestResourcePacket,
+  kernelTestReviewFacts,
+  kernelTestWorkUnit,
+  kernelTestWorkUnitCompleted,
+  kernelTestWorkUnitFailed,
+  kernelTestWorkUnitQueued,
+  kernelTestWorkUnitStarted,
   localizedGenericWriteProposal,
   manyContentBlockWriteProposal,
   manyDeleteActionsProposal,
@@ -250,21 +259,26 @@ function completedKernelToolFact(input: {
   sessionId: string;
   workUnitId: string;
   toolCallId: string;
-  toolName: string;
+  toolId: string;
   path: string;
-}): Record<string, unknown> {
+  content?: string;
+}): KernelEventV1 {
   return {
     kind: 'tool.completed',
     runId: input.runId,
     sessionId: input.sessionId,
-    toolCallId: input.toolCallId,
-    toolName: input.toolName,
-    ok: true,
-    output: {
-      path: input.path,
-      contentHash: `hash-${input.toolCallId}`,
-      sizeBytes: input.path.length,
-      kernelContext: { workUnitId: input.workUnitId },
+    fact: {
+      toolCallId: input.toolCallId,
+      toolId: input.toolId,
+      operationKind: input.toolId === 'fs.create' ? 'fsCreate' : 'fsWrite',
+      ok: true,
+      output: {
+        path: input.path,
+        contentHash: `hash-${input.toolCallId}`,
+        sizeBytes: new TextEncoder().encode(input.content ?? input.path).length,
+        kernelContext: { workUnitId: input.workUnitId },
+      },
+      error: null,
     },
   };
 }
@@ -339,7 +353,6 @@ async function main(): Promise<void> {
   await assertSessionDriverLoopSuppressesPlanningNativeReadToolsAfterInitialEvidence();
   await assertResourceOrchestratorResolvesAndRecordsPackets();
   await assertResourceRequestProposalHandlerContinuesThroughRunEngine();
-  await assertAcceptedPlanReadOnlyTaskExecutorContinuesThroughRunEngine();
   assertResourceEvidenceIndexQueriesPackets();
   assertGeneratedArtifactEvidenceIndexBuildsRunLocalPackets();
   assertImplementationBatchContextBuilderExtractsConcreteContinuations();
@@ -357,7 +370,7 @@ async function main(): Promise<void> {
   assertReviewAssemblerFindsWaitingReviewContext();
   assertReviewDecisionProjectionUsesI18nKeys();
   await assertReviewDecisionHandlerAcceptsTerminalReview();
-  await assertReviewDecisionHandlerCompletesTerminalReviewWhenKernelRunIsInactive();
+  await assertReviewDecisionHandlerKeepsTerminalReviewOpenWhenKernelRunIsInactive();
   await assertPlanDecisionHandlerRejectsActivePlan();
   assertProjectionBuildersKeepKernelAndReviewReadModels();
   await assertAgentRunReactorCoordinatesPorts();
@@ -431,21 +444,21 @@ async function main(): Promise<void> {
   await assertSessionDriverLoopAcceptedTaskPlanReadsGeneratedArtifactEvidence();
   await assertSessionDriverLoopAcceptedTaskPlanResumesFromResourceCursor();
   await assertSessionDriverLoopAcceptedTaskPlanChainsResourceResumeRequests();
-  await assertSessionDriverLoopAcceptedReadOnlyResourceValidationCompletesWithoutProviderLoop();
+  await assertSessionDriverLoopAcceptedReadOnlyResourceValidationUsesStructuredOutcome();
   await assertSessionDriverLoopAcceptedTaskPlanRejectsBlockedProcessExec();
   await assertSessionDriverLoopAcceptedTaskDiagnosticFailsRun();
   await assertSessionDriverLoopAcceptedDecisionSubmitsMultiWriteBatch();
   await assertSessionDriverLoopAcceptedDecisionPreservesKernelAuthorizedTarget();
   assertWorkflowStagePermissionProjectsPendingDecision();
   await assertSessionDriverLoopReviewRevisionReturnsToPlanning();
-  await assertSessionDriverLoopReviewRevisionContinuesWhenAuditRunInactive();
+  await assertSessionDriverLoopReviewRevisionStopsWhenGateRunIsInactive();
   await assertSessionDriverLoopReviewAcceptAutoGeneratesNextPlan();
   await assertSessionDriverLoopReviewAcceptWithoutContinuationCompletesRun();
   await assertSessionDriverLoopReviewAcceptOffStopsAtCurrentBatch();
   await assertSessionDriverLoopRequirementRejectCancelsRun();
   await assertSessionDriverLoopRejectedDecisionCancelsRun();
   await assertSessionDriverLoopReviewRejectCancelsRun();
-  await assertSessionDriverLoopPermissionRejectCancelsRun();
+  await assertSessionDriverLoopPermissionRejectUsesKernelFacts();
   await assertSessionDriverLoopStaleRequirementDecisionNoopsAfterReviewAccept();
 }
 
@@ -515,7 +528,6 @@ function assertProposalSemanticValidatorLeavesPathSafetyToKernel(): void {
   const token = randomSmokeToken('root-task-target');
   const inspector = new ActionBundleActionInspector();
   const validator = new ProposalSemanticValidator({
-    sideEffectToolIds: new Set(['fs.write', 'fs.edit', 'fs.delete']),
     readActionBundle: () => undefined,
     actionToolId: (action) => inspector.actionToolId(action),
     actionFileTargetPath: (action) => inspector.actionFileTargetPath(action),
@@ -639,7 +651,6 @@ function assertProposalSemanticValidatorCanonicalizesAndDefaults(): void {
     return typeof args?.path === 'string' && args.path.trim() ? args.path.trim() : undefined;
   };
   const validator = new ProposalSemanticValidator({
-    sideEffectToolIds: new Set(['fs.write', 'fs.edit', 'fs.delete']),
     readActionBundle: (proposal) => (proposal.payload as Record<string, any>).actionBundle as ActionBundleDraft,
     actionToolId: (action) => typeof action.toolId === 'string' ? action.toolId : '',
     actionFileTargetPath,
@@ -983,16 +994,7 @@ async function assertProviderStreamRuntimeHandlesStreamEvents(): Promise<void> {
     },
     kernelCommand: async (request) => {
       kernelRequests.push(request);
-      return {
-        ok: true,
-        events: [
-          {
-            kind: 'draft_ledger.accepted',
-            draftId: `draft-${token}`,
-            summary: `draft accepted ${token}`,
-          },
-        ],
-      } as KernelReply;
+      return { ok: true, events: [] };
     },
     createId: (prefix) => `${prefix}-${token}`,
   });
@@ -1147,10 +1149,11 @@ async function assertProviderStreamRuntimeHandlesStreamEvents(): Promise<void> {
     deltas.some((delta) => delta.type === 'part_delta' && delta.itemId === `frame-${token}`),
     'provider stream runtime emits provider part deltas'
   );
-  assertEqual(kernelRequests.length, 1, 'provider stream runtime submits part frames to Kernel draft ledger');
-  assert(
+  assertEqual(kernelRequests.length, 0, 'provider stream runtime keeps transport stream frames inside Session');
+  assertEqual(
     deltas.some((delta) => delta.type === 'draft_delta' && delta.itemId === `draft-${token}`),
-    'provider stream runtime emits draft ledger response deltas'
+    false,
+    'provider stream runtime does not misroute transport frames into the Kernel artifact DraftLedger'
   );
   assert(
     deltas.some((delta) => delta.type === 'error' && delta.summary === `err-${token}`),
@@ -1482,15 +1485,24 @@ function assertPermissionPipelineFindsPendingPermission(): void {
         kernelEvent: {
           kind: 'permission.requested',
           runId,
-          planId,
-          request: { id: pendingId },
+          request: {
+            id: pendingId,
+            requestKind: 'scopeExpansion',
+            contractId: `contract-${planId}`,
+            affectedOperationIds: [`operation-${token}`],
+            workUnitIds: [`work-unit-${token}`],
+            capability: 'workspace.write',
+            riskLevel: 'medium',
+            summary: `permission-${token}`,
+            argsPreview: {},
+          },
         },
       },
     },
   ] as AgentEvent[];
   const pending = pipeline.findPendingPermissionContext(events);
   assertEqual(pending?.id, pendingId, 'permission pipeline finds latest unresolved permission request');
-  assertEqual(pending?.planId, planId, 'permission pipeline preserves plan id');
+  assertEqual(pending?.contractId, `contract-${planId}`, 'permission pipeline preserves the Kernel contract id');
   assertEqual(
     pipeline.findPendingPermissionContext(events, resolvedId),
     null,
@@ -1527,6 +1539,7 @@ async function assertPermissionDecisionHandlerAcceptsAndRequestsReviewFacts(): P
       commandBlocks: [],
       expectedValidation: `validation-${token}`,
       reviewGuide: `review-${token}`,
+      authorizationContract: { id: `contract-${planId}` },
     },
   } as unknown as AgentEvent;
   const permissionEvent = {
@@ -1538,23 +1551,48 @@ async function assertPermissionDecisionHandlerAcceptsAndRequestsReviewFacts(): P
       kernelEvent: {
         kind: 'permission.requested',
         runId,
-        planId,
-        request: { id: permissionId },
+        request: {
+          id: permissionId,
+          requestKind: 'scopeExpansion',
+          contractId: `contract-${planId}`,
+          affectedOperationIds: [`operation-${token}`],
+          workUnitIds: [workUnitId],
+          capability: 'workspace.write',
+          riskLevel: 'medium',
+          summary: `permission-${token}`,
+          argsPreview: {},
+        },
       },
     },
   } as unknown as AgentEvent;
-  const decisionEvents = [
+  const decisionEvents: KernelEventV1[] = [
     {
       kind: 'work_unit.queued',
       runId,
-      planId,
-      workUnit: { id: workUnitId },
+      workUnit: {
+        id: workUnitId,
+        planId,
+        actionId: `action-${token}`,
+        title: `action-${token}`,
+        toolId: 'fs.create',
+        operationKind: 'fsCreate',
+        capability: 'workspace.write',
+        readSet: [],
+        writeSet: [`target-${token}`],
+        conflictKeys: [`workspace:target-${token}`],
+        executionMode: 'execute',
+        status: 'queued',
+      },
     },
     {
       kind: 'work_unit.completed',
       runId,
-      planId,
       workUnitId,
+    },
+    {
+      kind: 'batch.review_ready',
+      runId,
+      contractId: `contract-${planId}`,
     },
   ];
   const planIndex = new PlanContextIndex({
@@ -1572,7 +1610,7 @@ async function assertPermissionDecisionHandlerAcceptsAndRequestsReviewFacts(): P
       if (command.kind === 'permissionResolve') {
         assertEqual(command.permissionId, permissionId, 'permission handler resolves the pending permission');
         assertEqual(command.decision, 'accept', 'permission handler forwards accept decision');
-        return new KernelEventStatusIndex().observe({ ok: true, events: decisionEvents });
+        return new KernelEventStatusIndex().observe({ ok: true, events: [...decisionEvents] });
       }
       throw new Error(`unexpected kernel command ${command.kind}`);
     },
@@ -1626,7 +1664,7 @@ async function assertPermissionDecisionHandlerAcceptsAndRequestsReviewFacts(): P
   if (control.kind !== 'assembleReview') throw new Error('permission completion must request Review assembly');
   assertEqual(control.request.runId, runId, 'permission Review assembly keeps the original run');
   assertEqual(control.request.planId, planId, 'permission Review assembly keeps the original plan');
-  assertEqual(control.request.currentKernelEvents.length, 2, 'permission Review assembly carries resumed command facts');
+  assertEqual(control.request.currentKernelEvents.length, 3, 'permission Review assembly carries Kernel review readiness');
 }
 
 async function assertRequirementDecisionHandlerRejectsActiveRequirement(): Promise<void> {
@@ -2037,7 +2075,7 @@ async function assertResourceRequestLoopBuildsPacketEvents(): Promise<void> {
     {
       createId: (prefix) => `${prefix}-${token}`,
       kernelCommand: async (request): Promise<KernelReply> => {
-        const command = request.command as Record<string, unknown>;
+        const command = request.command;
         assertEqual(command.kind, 'resourceResolve', 'resource request loop submits ResourceResolve command');
         if (command.kind !== 'resourceResolve') throw new Error('expected resourceResolve command');
         assertEqual(command.requestId, `resource-resolve-${token}`, 'resource request loop uses injected id source');
@@ -2046,17 +2084,34 @@ async function assertResourceRequestLoopBuildsPacketEvents(): Promise<void> {
           ok: true,
           events: [
             {
+              kind: 'resource.packet_produced',
+              runId: `run-${token}`,
               packet: {
                 id: `resolved-packet-${token}`,
                 workspaceScopeKey: `workspace-${token}`,
                 requestId: `resolved-request-${token}`,
+                manifestId: manifest.id,
+                evidenceRefs: [`evidence-${token}`],
+                summary: `resolved-${token}`,
                 items: [
                   {
                     requestItemId: `resolved-item-${token}`,
                     manifestEntryId: `resolved-entry-${token}`,
                     status: 'provided',
+                    readPolicy: 'autoRead',
+                    sourceKind: 'file',
                     contentKind: 'text',
                     content: `resolved-content-${token}`,
+                  },
+                  {
+                    requestItemId: `missing-item-${token}`,
+                    manifestEntryId: `missing-entry-${token}`,
+                    status: 'notFound',
+                    readPolicy: 'autoRead',
+                    sourceKind: 'file',
+                    contentKind: 'metadata',
+                    path: `missing-${token}.txt`,
+                    reason: 'not_found',
                   },
                 ],
               },
@@ -2067,6 +2122,8 @@ async function assertResourceRequestLoopBuildsPacketEvents(): Promise<void> {
     }
   );
   assertEqual(resolved?.id, `resolved-packet-${token}`, 'resource request loop resolves packet from kernel reply');
+  assertEqual(resolved?.items.length, 2, 'mixed resolved and notFound resource facts remain in one usable packet');
+  assertEqual(resolved?.items[1]?.status, 'notFound', 'missing resource is preserved as a normal notFound fact');
 
   const diagnostic = loop.resolutionDiagnostic({
     manifest,
@@ -2308,6 +2365,9 @@ async function assertSessionDriverLoopPreResolvesProjectWorkspaceRoot(): Promise
               id: `packet-${token}`,
               workspaceScopeKey: manifest.workspaceScopeKey,
               requestId: command.requestId,
+              manifestId: manifest.id,
+              evidenceRefs: [`evidence-${token}`],
+              summary: `workspace-bootstrap-${token}`,
               items: [{
                 requestItemId: `item-${token}`,
                 manifestEntryId: entry.id,
@@ -2400,6 +2460,9 @@ async function assertSessionDriverLoopSuppressesPlanningNativeReadToolsAfterInit
               id: `packet-${token}`,
               workspaceScopeKey: manifest.workspaceScopeKey,
               requestId: command.requestId,
+              manifestId: manifest.id,
+              evidenceRefs: [`evidence-${token}`],
+              summary: `workspace-bootstrap-${token}`,
               items: [{
                 requestItemId: `item-${token}`,
                 manifestEntryId: entry.id,
@@ -2489,10 +2552,15 @@ async function assertResourceOrchestratorResolvesAndRecordsPackets(): Promise<vo
               id: `packet-${token}`,
               workspaceScopeKey: `workspace-${token}`,
               requestId: `request-${token}`,
+              manifestId: manifest.id,
+              evidenceRefs: [`evidence-${token}`],
+              summary: `directory-${token}`,
               items: [{
                 requestItemId: `item-${token}`,
                 manifestEntryId: `entry-${token}`,
                 status: 'resolved',
+                readPolicy: 'autoRead',
+                sourceKind: 'directory',
                 contentKind: 'directoryTree',
                 absolutePath: `/tmp/root-${token}`,
                 nodes: [{ path: childFile, type: 'file' }],
@@ -2775,7 +2843,7 @@ async function assertResourceRequestProposalHandlerContinuesThroughRunEngine(): 
         operationId: `plan-op-${taskId}-1`,
         sourceTaskId: taskId,
         toolId: 'fs.write',
-        operationKind: 'write',
+        operationKind: 'fsWrite',
         contentMode: 'contentBlock',
         targets: [targetPath],
         dependsOn: [],
@@ -2832,7 +2900,6 @@ async function assertResourceRequestProposalHandlerContinuesThroughRunEngine(): 
       ts: '2026-01-01T00:00:00.000Z',
       payload: { stage: 'accepted_plan.resource_resume', runId },
     } as AgentEvent),
-    tryCompleteResourceTask: async () => null,
   });
 
   const result = await handler.handle({
@@ -2907,158 +2974,6 @@ async function assertResourceRequestProposalHandlerContinuesThroughRunEngine(): 
   });
   assertEqual(terminated.kind, 'return', 'duplicate resource loop terminates after one controlled redirect');
   assertEqual(resolveCalls, 1, 'resource no-progress termination does not issue another Kernel resource command');
-}
-
-async function assertAcceptedPlanReadOnlyTaskExecutorContinuesThroughRunEngine(): Promise<void> {
-  const token = randomSmokeToken('readonly-task-outcome');
-  const sessionId = `session-${token}`;
-  const runId = `run-${token}`;
-  const taskId = `task-${token}`;
-  const acceptedPlan: AcceptedTaskPlanContext = {
-    planId: `plan-${token}`,
-    runId,
-    tasks: [{
-      taskId,
-      title: `Task ${token}`,
-      targets: [`target-${token}.txt`],
-      toolId: 'fs.read',
-      acceptanceCriteria: [],
-      failureCriteria: [],
-      dependencies: [],
-      planningArgs: {},
-      conflictKeys: [],
-    }],
-    authorizationOperations: [{
-      operationId: `plan-op-${taskId}-1`,
-      sourceTaskId: taskId,
-      toolId: 'fs.read',
-      operationKind: 'read',
-      contentMode: 'none',
-      targets: [`target-${token}.txt`],
-      dependsOn: [],
-      fixedArgs: {},
-      argsTemplate: { path: `target-${token}.txt` },
-      targetResourceKind: 'file',
-      recursive: false,
-      internal: false,
-    }],
-    toolIds: ['fs.read'],
-    targetScopes: [`target-${token}.txt`],
-    batchIndex: 1,
-    completedTaskIds: [],
-    dependencyFacts: [],
-    rawPlan: {},
-  };
-  const packet: ResourcePacket = {
-    id: `packet-${token}`,
-    requestId: `request-${token}`,
-    workspaceScopeKey: 'workspace',
-    items: [{
-      requestItemId: `item-${token}`,
-      manifestEntryId: `entry-${token}`,
-      readPolicy: 'autoRead',
-      status: 'resolved',
-      contentKind: 'fileText',
-      path: `target-${token}.txt`,
-      contentSummary: `content-${token}`,
-    }],
-  };
-  const fallback = genericSessionResult(sessionId);
-  const executor = new AcceptedPlanReadOnlyTaskExecutor<any, any>({
-    now: () => '2026-01-01T00:00:00.000Z',
-    createId: (prefix) => `${prefix}-${token}`,
-    append: async (_sessionId, events) => ({
-      session: { id: sessionId, mode: 'plan', createdAt: '', updatedAt: '', eventCount: events.length },
-      events,
-    }),
-    readActionBundle: (proposal) => ((proposal as ProposalEnvelope).payload as Record<string, any>)?.actionBundle,
-    refreshRuntimeState: () => undefined,
-    readOnlyResourceCompletion: () => ({ ok: false }),
-    recordTaskCompletion: ({ acceptedPlan }) => ({ completedTaskIds: [], nextAcceptedPlan: acceptedPlan }),
-    complete: () => false,
-    resourceValidationCheckpointEvent: () => ({
-      id: `checkpoint-${token}`,
-      kind: 'workflow_stage',
-      sessionId,
-      ts: '2026-01-01T00:00:00.000Z',
-      payload: { stage: 'checkpoint', runId },
-    } as AgentEvent),
-    executionRequest: () => `resume-${token}`,
-    readOnlyReviewContext: () => ({ sessionId, runId, planId: acceptedPlan.planId } as any),
-    currentTaskIsReadOnlyResourceValidation: () => true,
-    resourceRequestFromReadOnlyActionBundle: () => ({
-      version: '1',
-      id: `resource-request-${token}`,
-      reason: `reason-${token}`,
-      items: [{ id: `item-${token}`, kind: 'file', path: `target-${token}.txt`, reason: `reason-${token}` }],
-    }),
-    resolveResourceRequest: () => ({
-      manifest: {
-        id: `manifest-${token}`,
-        workspaceScopeKey: 'workspace',
-        entries: [{ id: `entry-${token}`, kind: 'file', label: `target-${token}.txt`, resourceRef: `target-${token}.txt`, readPolicy: 'autoRead', reason: `reason-${token}` }],
-        budget: { maxEntries: 10, maxBytes: 1024 },
-        defaultDenyPatterns: [],
-      },
-    }),
-    resolveAndRecord: async () => packet,
-    packetEvent: () => ({
-      id: `packet-event-${token}`,
-      kind: 'tool_result',
-      sessionId,
-      ts: '2026-01-01T00:00:00.000Z',
-      payload: { toolName: 'kernel.resourceResolve', status: 'ok', output: packet },
-    } as AgentEvent),
-    resourceResumeEvent: () => ({
-      id: `resume-event-${token}`,
-      kind: 'workflow_stage',
-      sessionId,
-      ts: '2026-01-01T00:00:00.000Z',
-      payload: { stage: 'accepted_plan.resource_resume', runId },
-    } as AgentEvent),
-  });
-  const result = await executor.tryCompleteActionBundle(
-    { sessionId, content: `request-${token}` },
-    {
-      sessionId,
-      runId,
-      acceptedTaskPlan: acceptedPlan,
-      manifest: {
-        id: `manifest-${token}`,
-        workspaceScopeKey: 'workspace',
-        entries: [],
-        budget: { maxEntries: 10, maxBytes: 1024 },
-        defaultDenyPatterns: [],
-      },
-      conversationRoots: [],
-      taskExecutionCursor: { currentTaskId: taskId },
-      currentTaskContext: { taskId, targets: [`target-${token}.txt`], toolIds: ['fs.read'] },
-    },
-    smokePromptEnvelope(`stable-${token}`),
-    parseProposalEnvelope({
-      runId,
-      sessionId,
-      raw: JSON.stringify({
-        schemaVersion: 'deepcode.agent.protocol.v4',
-        kind: 'actionBundle',
-        outputLanguage: 'en-US',
-        actionBundle: {
-          version: '1',
-          id: `bundle-${token}`,
-          goal: `goal-${token}`,
-          actions: [{
-            actionId: `read-${token}`,
-            toolId: 'fs.read',
-            args: { path: `target-${token}.txt` },
-            description: `Read target ${token}`,
-          }],
-        },
-      }),
-    }),
-    fallback
-  );
-  assertEqual((result as any)?.kind, 'continue', 'read-only resource fallback returns control to RunEngine');
-  assertEqual(Boolean((result as any)?.lastResult), true, 'read-only RunEngine continuation retains the appended ResourcePacket result');
 }
 
 async function assertResourceRequestRepairCoordinatorRepairsProposal(): Promise<void> {
@@ -3443,25 +3358,12 @@ function assertResourceEvidenceIndexQueriesPackets(): void {
 function assertGeneratedArtifactEvidenceIndexBuildsRunLocalPackets(): void {
   const token = randomSmokeToken('generated-evidence');
   const targetPath = `generated-${token}/artifact-${randomSmokeToken('file')}.txt`;
-  const contentBlockId = `block-${token}`;
   const actionId = `action-${token}`;
   const content = `content-${randomSmokeToken('content')}`;
+  const toolCallId = `call-${token}`;
   const index = new GeneratedArtifactEvidenceIndex({
     normalizeRelativePath: (value) => value?.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/g, ''),
     comparablePath: (value) => value.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/g, ''),
-    batchActionRecords: (batch) => Array.isArray((batch as Record<string, unknown>).actions)
-      ? (batch as Record<string, unknown>).actions as Record<string, unknown>[]
-      : [],
-    actionToolId: (action) => typeof action.toolId === 'string' ? action.toolId : '',
-    actionFileTargetPath: (action) => typeof (action.args as Record<string, unknown> | undefined)?.path === 'string'
-      ? (action.args as Record<string, unknown>).path as string
-      : undefined,
-    completedWorkUnitFacts: () => ({ actionIds: new Set([actionId]), targets: new Set([targetPath]) }),
-    completedActionMatches: (candidateActionId, candidateTargetPath, completed) =>
-      Boolean(candidateActionId && completed.actionIds.has(candidateActionId)) ||
-      completed.targets.has(candidateTargetPath),
-    codeBlockContent: (block) => Array.isArray(block.contentLines) ? block.contentLines.join('\n') : undefined,
-    resolveRelativePath: (value) => value.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/g, ''),
   });
   const state = {
     workspaceScopeKey: `workspace-${token}`,
@@ -3480,31 +3382,25 @@ function assertGeneratedArtifactEvidenceIndexBuildsRunLocalPackets(): void {
   };
   const generatedPacket = index.packetFromSuccessfulBatch(
     state,
-    {
-      contentBlocks: [
-        {
-          blockId: contentBlockId,
-          targetPath,
-          contentLines: [content],
-        },
-      ],
-      actions: [
-        {
-          actionId,
-          toolId: 'fs.write',
-          args: { path: targetPath, contentBlockId },
-          description: `write ${targetPath}`,
-        },
-      ],
-    },
-    [{ kind: 'work_unit.completed', actionId, output: { path: targetPath } }],
+    {},
+    [completedKernelToolFact({
+      runId: `run-${token}`,
+      sessionId: `session-${token}`,
+      workUnitId: `work-${token}`,
+      toolCallId,
+      toolId: 'fs.write',
+      path: targetPath,
+      content,
+    })],
     `packet-${token}`
   );
-  assertEqual(generatedPacket?.items[0]?.path, targetPath, 'generated artifact index emits packet target path');
+  assertEqual(generatedPacket, undefined, 'generated artifact facts do not synthesize a Session resource packet');
+  const generatedEvidence = state.generatedArtifactEvidence.get(targetPath);
+  assertEqual(generatedEvidence?.targetPath, targetPath, 'generated artifact index records Kernel target path');
   assertEqual(
-    generatedPacket?.items[0]?.promptContent,
-    content,
-    'generated artifact index keeps generated file content as run-local evidence'
+    generatedEvidence?.toolCallId,
+    toolCallId,
+    'generated artifact index records the Kernel tool fact reference'
   );
   assert(
     state.generatedArtifactEvidence.has(targetPath),
@@ -3527,8 +3423,31 @@ function assertGeneratedArtifactEvidenceIndexBuildsRunLocalPackets(): void {
     },
     `replay-${token}`
   );
-  assertEqual(replay.remaining.items.length, 0, 'generated artifact index satisfies matching resource request');
-  assertEqual(replay.packet?.items[0]?.promptContent, content, 'generated artifact replay packet contains prompt content');
+  assertEqual(replay.remaining.items.length, 1, 'generated artifact requests continue through Kernel ResourceResolve');
+  assertEqual(replay.packet, undefined, 'Session does not synthesize generated artifact content');
+
+  index.indexPacket(state.generatedArtifactEvidence, {
+    id: `resolved-${token}`,
+    workspaceScopeKey: state.workspaceScopeKey,
+    requestId: `request-${token}`,
+    items: [
+      {
+        requestItemId: `item-${token}`,
+        manifestEntryId: `entry-${token}`,
+        readPolicy: 'autoRead',
+        status: 'resolved',
+        contentKind: 'fileText',
+        path: targetPath,
+        promptContent: content,
+        contentHash: `hash-${toolCallId}`,
+      },
+    ],
+  } as ResourcePacket);
+  assertEqual(
+    state.generatedArtifactEvidence.get(targetPath)?.content,
+    content,
+    'Kernel ResourcePacket content enriches the generated artifact fact reference'
+  );
 }
 
 function assertImplementationBatchContextBuilderExtractsConcreteContinuations(): void {
@@ -3619,8 +3538,8 @@ function assertCompletedWorkUnitFactIndexMatchesActionAndTarget(): void {
   const completed = index.completedWorkUnitFacts([
     {
       kind: 'work_unit.completed',
-      workUnit: { actionId },
-      output: { targetPath: `./${targetPath}` },
+      workUnitId: `work-unit-${token}`,
+      output: { actionId, targetPath: `./${targetPath}` },
     },
   ]);
   assertEqual(completed.actionIds.has(actionId), true, 'completed work unit index records action id');
@@ -3920,41 +3839,33 @@ async function assertAcceptedActionBundlePlanExecutorSubmitsBatchAndReviews(): P
       return { session: { ...session, eventCount: store.length }, events: [...store] };
     },
     kernel: async (request) => {
-      const kind = (request.command as Record<string, unknown>).kind;
+      const kind = request.command.kind;
       assertEqual(typeof kind, 'string', 'accepted action executor submits structured kernel commands');
       commands.push(kind as string);
       if (kind === 'actionBatchSubmit') {
         return {
           ok: true,
-          events: [{
-            kind: 'work_unit.completed',
-            runId,
-            planId,
-            workUnitId: `work-unit-${token}`,
-          }],
+          events: [kernelTestWorkUnitCompleted(runId, `work-unit-${token}`)],
         };
       }
-      return { ok: true, events: [{ kind: `${kind}.ok`, runId, planId }] };
+      return { ok: true, events: [] };
     },
     observeKernel: async (request) => {
-      const kind = (request.command as Record<string, unknown>).kind;
+      const kind = request.command.kind;
       assertEqual(kind, 'actionBatchSubmit', 'accepted action executor observes only action batch replies');
       commands.push(String(kind));
       return new KernelEventStatusIndex().observe({
         ok: true,
         events: [
-          {
-            kind: 'work_unit.queued',
+          kernelTestWorkUnitQueued({
             runId,
-            planId,
-            workUnit: { id: `work-unit-${token}` },
-          },
-          {
-            kind: 'work_unit.completed',
-            runId,
-            planId,
             workUnitId: `work-unit-${token}`,
-          },
+            actionId: `action-${token}`,
+            planId,
+            writeSet: [`target-${token}.txt`],
+          }),
+          kernelTestWorkUnitCompleted(runId, `work-unit-${token}`),
+          kernelTestBatchReviewReady(runId),
         ],
       });
     },
@@ -4027,12 +3938,19 @@ async function assertAcceptedActionBundlePlanExecutorSubmitsBatchAndReviews(): P
     runId,
     planId,
     actionBundle: {
+      version: '1',
       id: `bundle-${token}`,
+      goal: `Write target-${token}.txt`,
       actions: [{
         actionId: `action-${token}`,
         toolId: 'fs.write',
         args: { path: `target-${token}.txt`, content: token },
+        description: `Write target-${token}.txt`,
+        dependsOn: [],
       }],
+      continuationExpectations: [],
+      validationExpectations: [],
+      reviewExpectations: [],
     },
     contentBlocks: [],
     commandBlocks: [],
@@ -4054,7 +3972,7 @@ async function assertAcceptedActionBundlePlanExecutorSubmitsBatchAndReviews(): P
   assertEqual(control.kind, 'assembleReview', 'accepted action executor returns Review assembly control');
   if (control.kind !== 'assembleReview') throw new Error('accepted action executor must request Review assembly');
   const reviewHandoffEvents = control.request.currentKernelEvents;
-  assertEqual(reviewHandoffEvents.length, 2, 'accepted action executor passes batch events to Review assembly');
+  assertEqual(reviewHandoffEvents.length, 3, 'accepted action executor passes Kernel review readiness to Review assembly');
   const completedFact = reviewHandoffEvents.find((event) =>
     (event as Record<string, unknown>).kind === 'work_unit.completed'
   ) as Record<string, unknown> | undefined;
@@ -4076,21 +3994,19 @@ function assertKernelEventStatusIndexReadsStructuredEvents(): void {
   const permissionId = `permission-${token}`;
   const runId = `run-${token}`;
   const index = new KernelEventStatusIndex();
-  const events = [
-    {
-      kind: 'work_unit.queued',
-      runId,
-      workUnit: { id: workUnitId },
-    },
+  const events: KernelEventV1[] = [
+    kernelTestWorkUnitQueued({ runId, workUnitId, actionId: `action-${token}` }),
     {
       kind: 'permission.requested',
       runId,
-      request: { id: permissionId },
+      sessionId: `session-${token}`,
+      request: kernelTestPermissionRequest(permissionId, { workUnitIds: [workUnitId] }),
     },
     {
       kind: 'work_unit.blocked',
       runId,
       workUnitId,
+      reason: `blocked-${token}`,
     },
   ];
   assert(index.workUnitIds(events).includes(workUnitId), 'kernel event status index reads work unit ids');
@@ -4101,27 +4017,30 @@ function assertKernelEventStatusIndexReadsStructuredEvents(): void {
   const queuedWorkUnitId = `queued-${token}`;
   assertEqual(
     index.actionBatchReadyForReview([
-      {
-        kind: 'work_unit.queued',
-        workUnit: { id: queuedWorkUnitId },
-      },
-      {
-        kind: 'work_unit.completed',
-        workUnitId: queuedWorkUnitId,
-      },
+      kernelTestWorkUnitQueued({ runId, workUnitId: queuedWorkUnitId, actionId: `action-${token}` }),
+      kernelTestWorkUnitCompleted(runId, queuedWorkUnitId),
+    ]),
+    false,
+    'kernel event status index does not infer review readiness from terminal work units'
+  );
+  assertEqual(
+    index.actionBatchReadyForReview([
+      kernelTestWorkUnitQueued({ runId, workUnitId: queuedWorkUnitId, actionId: `action-${token}` }),
+      kernelTestWorkUnitCompleted(runId, queuedWorkUnitId),
+      kernelTestBatchReviewReady(runId),
     ]),
     true,
-    'kernel event status index detects review-ready completed batches'
+    'kernel event status index accepts explicit Kernel batch review readiness'
   );
   assertEqual(
     index.actionBatchReadyForReview([
       {
         kind: 'permission.requested',
-        request: { id: `permission-${token}` },
+        runId,
+        sessionId: `session-${token}`,
+        request: kernelTestPermissionRequest(`permission-${token}`),
       },
-      {
-        kind: 'batch.review_ready',
-      },
+      kernelTestBatchReviewReady(runId),
     ]),
     false,
     'kernel event status index keeps permission requests out of review-ready batches'
@@ -4130,6 +4049,7 @@ function assertKernelEventStatusIndexReadsStructuredEvents(): void {
     index.reviewGateStatus([
       {
         kind: 'review_gate.evaluated',
+        runId,
         result: { status: `status-${token}` },
       },
     ]),
@@ -4138,7 +4058,12 @@ function assertKernelEventStatusIndexReadsStructuredEvents(): void {
   );
   const permissionObservation = index.observe({
     ok: true,
-    events: [{ kind: 'permission.requested', request: { id: permissionId } }],
+    events: [{
+      kind: 'permission.requested',
+      runId,
+      sessionId: `session-${token}`,
+      request: kernelTestPermissionRequest(permissionId),
+    }],
   });
   assertEqual(permissionObservation.kind, 'permissionInterrupted', 'Kernel reply reducer classifies permission interrupts');
   const failureObservation = index.observe({
@@ -4150,8 +4075,9 @@ function assertKernelEventStatusIndexReadsStructuredEvents(): void {
   const factsObservation = index.observe({
     ok: true,
     events: [
-      { kind: 'work_unit.queued', workUnit: { id: queuedWorkUnitId } },
-      { kind: 'work_unit.completed', workUnitId: queuedWorkUnitId },
+      kernelTestWorkUnitQueued({ runId, workUnitId: queuedWorkUnitId, actionId: `action-${token}` }),
+      kernelTestWorkUnitCompleted(runId, queuedWorkUnitId),
+      kernelTestBatchReviewReady(runId),
     ],
   });
   assertEqual(factsObservation.kind, 'factsObserved', 'Kernel reply reducer classifies completed facts');
@@ -4182,17 +4108,11 @@ async function assertAcceptedPlanReviewHandoffCoordinatorBuildsReviewState(): Pr
     payload: {},
   } as AgentEvent;
   const initialResult: AgentSessionResult = { session, events: [seedEvent] };
-  const completedEvent = {
-    kind: 'work_unit.completed',
-    runId,
-    planId,
-    workUnitId: `work-${token}`,
-  };
-  const factsEvent = {
+  const completedEvent = kernelTestWorkUnitCompleted(runId, `work-${token}`);
+  const factsEvent: KernelEventV1 = {
     kind: 'review.facts_produced',
     runId,
-    planId,
-    factsId: `facts-${token}`,
+    facts: kernelTestReviewFacts(runId, `facts-${token}`),
   };
   const plan = {
     sessionId,
@@ -4332,7 +4252,7 @@ function assertReviewAssemblerFormatsReviewFacts(): void {
         ],
         toolResults: [
           {
-            toolName: `tool-${token}`,
+            toolId: `tool-${token}`,
             ok: true,
             output: { targetPath: `path-${token}.txt` },
           },
@@ -4561,29 +4481,19 @@ async function assertReviewDecisionHandlerAcceptsTerminalReview(): Promise<void>
     now: () => `ts-${token}`,
     createId: (prefix) => `${prefix}-${kernelCommands.length}-${store.length}-${token}`,
     kernel: async (request): Promise<KernelReply> => {
-      const command = request.command as Record<string, unknown>;
+      const command = request.command;
       kernelCommands.push(String(command.kind));
-      if (command.kind === 'userDecisionSubmit') {
-        return {
-          ok: true,
-          events: [{ kind: 'review.decision_recorded', runId, reviewId }],
-        };
-      }
       if (command.kind === 'reviewGateEvaluate') {
         return {
           ok: true,
           events: [{
             kind: 'review_gate.evaluated',
             runId,
-            reviewId,
             result: { status: 'accepted' },
           }],
         };
       }
       throw new Error(`unexpected review handler kernel command ${String(command.kind)}`);
-    },
-    kernelAudit: async () => {
-      throw new Error('terminal review accept must not use revision audit');
     },
     appendProjectedKernelEvents: async (nextSessionId, reply) => {
       assertEqual(nextSessionId, sessionId, 'review handler projects kernel events to current session');
@@ -4637,7 +4547,7 @@ async function assertReviewDecisionHandlerAcceptsTerminalReview(): Promise<void>
     existingEvents: [...store],
   });
 
-  assertEqual(kernelCommands.join(','), 'userDecisionSubmit,reviewGateEvaluate', 'review handler submits user decision then evaluates ReviewGate');
+  assertEqual(kernelCommands.join(','), 'reviewGateEvaluate', 'review handler submits only the typed ReviewGate decision');
   const result = returnedSession(control, 'terminal review accept returns a completed decision result');
   assertEqual(result.events.some((event) => event.kind === 'review_summary' && (event.payload as any)?.status === 'accepted'), true, 'review handler records accepted review');
   const completed = result.events.find((event) => event.kind === 'session_run_state' && (event.payload as any)?.status === 'completed');
@@ -4648,7 +4558,7 @@ async function assertReviewDecisionHandlerAcceptsTerminalReview(): Promise<void>
   assertEqual(owner?.reviewId, reviewId, 'review handler completed state keeps review owner');
 }
 
-async function assertReviewDecisionHandlerCompletesTerminalReviewWhenKernelRunIsInactive(): Promise<void> {
+async function assertReviewDecisionHandlerKeepsTerminalReviewOpenWhenKernelRunIsInactive(): Promise<void> {
   const token = randomSmokeToken('review-handler-inactive-run');
   const sessionId = `session-${token}`;
   const runId = `run-${token}`;
@@ -4680,12 +4590,10 @@ async function assertReviewDecisionHandlerCompletesTerminalReviewWhenKernelRunIs
     now: () => `ts-${token}`,
     createId: (prefix) => `${prefix}-${kernelCommands.length}-${store.length}-${token}`,
     kernel: async (request): Promise<KernelReply> => {
-      const command = request.command as Record<string, unknown>;
+      const command = request.command;
       kernelCommands.push(String(command.kind));
-      throw new Error(`invalid command: run ${String(command.runId)} is not active`);
-    },
-    kernelAudit: async () => {
-      throw new Error('terminal review accept must not use revision audit');
+      const commandRunId = 'runId' in command ? command.runId : 'unknown';
+      throw new Error(`invalid command: run ${String(commandRunId)} is not active`);
     },
     appendProjectedKernelEvents: async () => {
       throw new Error('inactive terminal review must not project rejected Kernel events');
@@ -4731,8 +4639,8 @@ async function assertReviewDecisionHandlerCompletesTerminalReviewWhenKernelRunIs
     existingEvents: [...store],
   });
 
-  assertEqual(kernelCommands.join(','), 'userDecisionSubmit,reviewGateEvaluate', 'inactive review handler still attempts terminal Kernel audit and gate');
-  const result = returnedSession(control, 'inactive terminal review accept returns a completed decision result');
+  assertEqual(kernelCommands.join(','), 'reviewGateEvaluate', 'inactive review handler attempts only the typed ReviewGate decision');
+  const result = returnedSession(control, 'inactive terminal review accept returns a non-terminal decision result');
   assertEqual(
     result.events.some((event) => event.kind === 'review_summary' && (event.payload as any)?.status === 'accepted'),
     true,
@@ -4740,17 +4648,15 @@ async function assertReviewDecisionHandlerCompletesTerminalReviewWhenKernelRunIs
   );
   assertEqual(
     result.events.filter((event) => event.kind === 'trace/review_accept_noop').length,
-    2,
-    'inactive terminal review accept records audit and gate noop traces'
+    1,
+    'inactive terminal review accept records one gate-unavailable trace'
   );
   const completed = result.events.find((event) =>
     event.kind === 'session_run_state' &&
     (event.payload as any)?.status === 'completed' &&
     (event.payload as any)?.reason === 'review'
   );
-  assert(Boolean(completed), 'inactive terminal review accept still closes the review run');
-  const owner = (completed?.payload as Record<string, unknown> | undefined)?.decisionOwner as Record<string, unknown> | undefined;
-  assertEqual(owner?.reviewId, reviewId, 'inactive terminal review completed state keeps review owner');
+  assertEqual(Boolean(completed), false, 'inactive terminal review cannot be inferred as completed by Session');
 }
 
 async function assertPlanDecisionHandlerRejectsActivePlan(): Promise<void> {
@@ -4797,7 +4703,7 @@ async function assertPlanDecisionHandlerRejectsActivePlan(): Promise<void> {
       ok: true,
       events: [{
         kind: 'plan_authorization.decision_recorded',
-        requestId: (request.command as Record<string, unknown>).requestId as string,
+        requestId: request.command.requestId,
         runId,
         sessionId,
         authorizationContractId: `authorization-${token}`,
@@ -4897,15 +4803,31 @@ function assertProjectionBuildersKeepKernelAndReviewReadModels(): void {
   const queued = {
     kind: 'work_unit.queued',
     runId,
-    actionId,
     workUnit: {
       id: workUnitId,
+      planId: `plan-${token}`,
       actionId,
-      kind: 'delete',
+      title: `Delete ${targetPath}`,
+      toolId: 'fs.delete',
+      operationKind: 'fsDelete',
+      capability: 'workspace.write',
+      targetRef: {
+        kind: 'workspaceRelative',
+        path: targetPath,
+      },
+      readSet: [],
       compiledTool: {
-        toolName: 'fs.delete',
+        toolId: 'fs.delete',
+        operationKind: 'fsDelete',
+        path: targetPath,
+        targetKind: 'file',
+        recursive: false,
+        argsPreview: { path: targetPath },
       },
       writeSet: [targetPath],
+      conflictKeys: [`workspace:${targetPath}`],
+      executionMode: 'execute',
+      status: 'queued',
     },
   };
   const completedWithoutAction = {
@@ -4924,7 +4846,11 @@ function assertProjectionBuildersKeepKernelAndReviewReadModels(): void {
     targetPath,
     'kernel projection preserves completed work unit targets'
   );
-  assertEqual(enriched.actionId, actionId, 'kernel projection enriches the completed activity identity from queued facts');
+  assertEqual(
+    (enriched.projectionWorkUnit as Record<string, unknown> | undefined)?.actionId,
+    actionId,
+    'kernel projection associates completed activity identity with the typed queued descriptor'
+  );
   const activity = kernelProjection.kernelEventActivity(enriched, `activity-${token}`, runId);
   assertEqual(activity?.kind, 'editFileCompleted', 'kernel projection builds completed edit activity');
   assertEqual(activity?.targets?.[0], targetPath, 'kernel projection carries activity target');
@@ -4961,7 +4887,6 @@ function assertProjectionBuildersKeepKernelAndReviewReadModels(): void {
       kind: 'work_unit.started',
       runId,
       workUnitId,
-      writeSet: [targetPath],
     }, facts),
     ts: new Date(1).toISOString(),
     id: `event-started-${token}`,
@@ -5310,7 +5235,7 @@ function assertProjectionBuildersKeepKernelAndReviewReadModels(): void {
           id: `authorization-operation-${token}`,
           sourceTaskId: `task-${token}`,
           toolId: 'fs.write',
-          operationKind: 'write',
+          operationKind: 'fsWrite',
           contentMode: 'contentBlock',
           targets: [targetPath],
           fixedArgs: {},
@@ -5401,20 +5326,10 @@ async function assertAgentRunReactorCoordinatesPorts(): Promise<void> {
   });
   let kernelReply: KernelReply = {
     ok: true,
-    events: [{
-      kind: 'work_unit.queued',
-      runId,
-      actionId,
-      workUnit: {
-        id: workUnitId,
-        actionId,
-        writeSet: [targetPath],
-      },
-    }, {
-      kind: 'work_unit.completed',
-      runId,
-      workUnitId,
-    }],
+    events: [
+      kernelTestWorkUnitQueued({ runId, workUnitId, actionId, writeSet: [targetPath] }),
+      kernelTestWorkUnitCompleted(runId, workUnitId),
+    ],
   };
   const reactor = new AgentRunReactor({
     ports: {
@@ -6585,6 +6500,7 @@ async function assertSessionDriverLoopRequirementChoiceEntersResumePrompt(): Pro
       eventId: 'authority-requirement-choice',
       timestamp: '2026-01-01T00:00:00.000Z',
     }),
+    genericKernelContextProjectionEvent('session-requirement-choice', 'run-requirement-choice'),
     {
     id: 'requirement-choice-waiting',
     sessionId: 'session-requirement-choice',
@@ -8464,7 +8380,7 @@ async function assertProviderPartFramesEnterKernelDraftLedger(): Promise<void> {
     draftId: 'draft-generic',
     frameId: 'frame-generic-1',
     targetPath: 'src/generated.txt',
-    capability: 'fs.write',
+    toolId: 'fs.write',
     sequence: 1,
     chunk: 'generic draft content\n',
   };
@@ -8526,10 +8442,9 @@ async function assertProviderPartFramesEnterKernelDraftLedger(): Promise<void> {
     requirementConfirmationMode: 'off',
   });
 
-  assertEqual(draftFrames.length, 1, 'closed provider part frame is submitted to Kernel draft ledger once');
-  assertEqual(draftFrames[0].targetPath, 'src/generated.txt', 'draft frame target path is preserved for Kernel audit');
+  assertEqual(draftFrames.length, 0, 'provider stream part frames remain volatile Session projection data');
   assertEqual(deltas.some((delta) => (delta as any).type === 'part_delta'), true, 'Session emits volatile part delta');
-  assertEqual(deltas.some((delta) => (delta as any).type === 'draft_delta'), true, 'Session emits Kernel draft ledger delta');
+  assertEqual(deltas.some((delta) => (delta as any).type === 'draft_delta'), false, 'volatile provider frames do not fabricate Kernel draft facts');
   assertEqual(
     result.events.some((event) => event.kind === 'assistant_msg' && (event.payload as any).channel === 'final'),
     false,
@@ -8619,9 +8534,7 @@ async function assertAcceptedPlanStreamingDraftsAndJsonProgress(): Promise<void>
             kind: 'draft.chunk',
             runId: command.runId,
             sessionId: command.sessionId,
-            draftId: command.frame?.draftId,
             draft: { draftId: command.frame?.draftId, status: 'draft.chunk' },
-            summary: 'Random accepted-plan draft chunk.',
           }],
         };
       }
@@ -8646,14 +8559,11 @@ async function assertAcceptedPlanStreamingDraftsAndJsonProgress(): Promise<void>
           ok: true,
           events: [
             { kind: 'action_batch.accepted', runId: `run-${token}`, sessionId: session.id, batch: { planId: command.batch?.planId } },
-            {
-              kind: 'work_unit.completed',
-              runId: `run-${token}`,
-              sessionId: session.id,
-              workUnitId: `work-unit-${token}`,
-              actionId: (command.batch?.actionBundle?.actions?.[0] ?? {}).actionId,
-              output: { path: targetPath, actionId: (command.batch?.actionBundle?.actions?.[0] ?? {}).actionId },
-            },
+            kernelTestWorkUnitCompleted(
+              `run-${token}`,
+              `work-unit-${token}`,
+              { path: targetPath, actionId: (command.batch?.actionBundle?.actions?.[0] ?? {}).actionId },
+            ),
           ],
         };
       }
@@ -8731,12 +8641,11 @@ async function assertAcceptedPlanStreamingDraftsAndJsonProgress(): Promise<void>
 
   assertEqual(
     draftFrames.length,
-    3,
-    `accepted-plan stream preview, artifact chunk, and finalize frames enter Kernel draft ledger; providerCalls=${providerCalls}; events=${JSON.stringify(events.map((event) => ({ kind: event.kind, payload: event.payload })) )}`
+    2,
+    `only accepted artifact chunk and finalize frames enter Kernel draft ledger; providerCalls=${providerCalls}; events=${JSON.stringify(events.map((event) => ({ kind: event.kind, payload: event.payload })) )}`
   );
-  assertEqual((draftFrames[0] as any).partKind, 'codeBlockChunk', 'accepted-plan stream preview remains a non-authoritative trace frame');
-  assertEqual((draftFrames[1] as any).partKind, 'artifactChunk', 'accepted-plan artifact content is recorded as a logical Session-owned chunk');
-  assertEqual((draftFrames[2] as any).partKind, 'batchDone', 'accepted-plan artifact draft records one terminal finalize frame');
+  assertEqual((draftFrames[0] as any).partKind, 'artifactChunk', 'accepted-plan artifact content is recorded as a logical Session-owned chunk');
+  assertEqual((draftFrames[1] as any).partKind, 'batchDone', 'accepted-plan artifact draft records one terminal finalize frame');
   assertEqual(
     actionBatchSubmits,
     1,
@@ -8749,8 +8658,8 @@ async function assertAcceptedPlanStreamingDraftsAndJsonProgress(): Promise<void>
   );
   assertEqual(
     deltas.some((delta: any) => delta.type === 'draft_delta'),
-    true,
-    'accepted-plan stream emits draft_delta before final actionBundle'
+    false,
+    'accepted-plan artifact ledger facts remain authoritative Kernel events rather than volatile draft deltas'
   );
   assertEqual(
     deltas.some((delta: any) => delta.type === 'assistant_delta'),
@@ -9459,8 +9368,13 @@ function assertTimelineProjectionWithLiveOverlay(): void {
         ts: '2026-01-01T00:00:03.000Z',
         kind: 'workflow_stage',
         payload: {
-          stage: 'state.changed',
-          kernelEvent: { kind: 'state.changed' },
+          stage: 'runtime.lifecycle_changed',
+          kernelEvent: {
+            kind: 'runtime.lifecycle_changed',
+            runId: 'run-live-overlay',
+            previousState: 'ready',
+            currentState: 'executing',
+          },
         },
       },
       {
@@ -9470,7 +9384,11 @@ function assertTimelineProjectionWithLiveOverlay(): void {
         kind: 'workflow_stage',
         payload: {
           stage: 'review.facts_produced',
-          kernelEvent: { kind: 'review.facts_produced' },
+          kernelEvent: {
+            kind: 'review.facts_produced',
+            runId: 'run-live-overlay',
+            facts: kernelTestReviewFacts('run-live-overlay'),
+          },
         },
       },
     ],
@@ -9695,6 +9613,7 @@ function assertTaskPlanTaskProjectionProgress(): void {
           stage: 'work_unit.completed',
           kernelEvent: {
             kind: 'work_unit.completed',
+            workUnitId: 'work-unit-task-projection-alpha',
             output: { path: 'src/generic-module.ts' },
           },
         },
@@ -9706,9 +9625,13 @@ function assertTaskPlanTaskProjectionProgress(): void {
         kind: 'workflow_stage',
         payload: {
           stage: 'work_unit.started',
+          activity: {
+            targets: ['src/generic-validation.ts'],
+            workUnitIds: ['work-unit-task-projection-beta'],
+          },
           kernelEvent: {
             kind: 'work_unit.started',
-            output: { path: 'src/generic-validation.ts' },
+            workUnitId: 'work-unit-task-projection-beta',
           },
         },
       },
@@ -9869,6 +9792,7 @@ function assertTaskPlanTaskProjectionProgress(): void {
           stage: 'work_unit.completed',
           kernelEvent: {
             kind: 'work_unit.completed',
+            workUnitId: 'work-unit-stale-ledger-alpha',
             output: { path: 'src/generic-module.ts' },
           },
         },
@@ -9969,10 +9893,10 @@ async function assertSessionDriverLoopPathResourceRequest(): Promise<void> {
             kind: 'resource.packet_produced',
             runId: `run-${token}`,
             sessionId,
-            packet: {
-              id: `packet-${resourceResolveManifests.length}`,
-              requestId: command.requestId,
-              items: [{
+            packet: kernelTestResourcePacket(
+              `packet-${resourceResolveManifests.length}`,
+              command.requestId,
+              [{
                 requestItemId: 'item-generic',
                 manifestEntryId: entry.id,
                 status: 'resolved',
@@ -9984,7 +9908,7 @@ async function assertSessionDriverLoopPathResourceRequest(): Promise<void> {
                 content: entry.kind === 'directory' ? undefined : 'generic resolved file content',
                 evidenceRefs: ['evidence-path'],
               }],
-            },
+            ),
           }],
         };
       }
@@ -10054,10 +9978,10 @@ async function assertSessionDriverLoopSearchResourceRequest(): Promise<void> {
           ok: true,
           events: [{
             kind: 'resource.packet_produced',
-            packet: {
-              id: `packet-${resourceResolveManifests.length}`,
-              requestId: command.requestId,
-              items: [{
+            packet: kernelTestResourcePacket(
+              `packet-${resourceResolveManifests.length}`,
+              command.requestId,
+              [{
                 requestItemId: 'search-item',
                 manifestEntryId: entry.id ?? 'search-entry',
                 status: 'resolved',
@@ -10080,7 +10004,7 @@ async function assertSessionDriverLoopSearchResourceRequest(): Promise<void> {
                 nodes: entry.kind === 'search' ? undefined : [{ type: 'file', path: 'src/generic.txt' }],
                 evidenceRefs: ['evidence-search'],
               }],
-            },
+            ),
           }],
         };
       }
@@ -10157,10 +10081,10 @@ async function assertSessionDriverLoopRejectsOutsidePath(): Promise<void> {
             kind: 'resource.packet_produced',
             runId: 'run-generic',
             sessionId: 'session-outside',
-            packet: {
-              id: `packet-outside-${resourceResolveManifests.length}`,
-              requestId: command.requestId,
-              items: [{
+            packet: kernelTestResourcePacket(
+              `packet-outside-${resourceResolveManifests.length}`,
+              command.requestId,
+              [{
                 requestItemId: 'item-generic',
                 manifestEntryId: entry.id,
                 status: 'resolved',
@@ -10171,7 +10095,7 @@ async function assertSessionDriverLoopRejectsOutsidePath(): Promise<void> {
                 nodes: [],
                 evidenceRefs: ['evidence-outside'],
               }],
-            },
+            ),
           }],
         };
       }
@@ -10255,10 +10179,10 @@ async function assertSessionDriverLoopUsesRecentAttachmentRoot(): Promise<void> 
             kind: 'resource.packet_produced',
             runId: `run-${token}`,
             sessionId,
-            packet: {
-              id: `packet-recent-${resourceResolveManifests.length}`,
-              requestId: command.requestId,
-              items: [{
+            packet: kernelTestResourcePacket(
+              `packet-recent-${resourceResolveManifests.length}`,
+              command.requestId,
+              [{
                 requestItemId: 'item-generic',
                 manifestEntryId: entry.id,
                 status: 'resolved',
@@ -10269,7 +10193,7 @@ async function assertSessionDriverLoopUsesRecentAttachmentRoot(): Promise<void> 
                 content: 'recent generic content',
                 evidenceRefs: ['evidence-recent'],
               }],
-            },
+            ),
           }],
         };
       }
@@ -10468,10 +10392,10 @@ function resourceBudgetKernel(
         kind: 'resource.packet_produced',
         runId: 'run-generic',
         sessionId,
-        packet: {
-          id: `packet-budget-${resourceResolveManifests.length}`,
-          requestId: command.requestId,
-          items: [{
+        packet: kernelTestResourcePacket(
+          `packet-budget-${resourceResolveManifests.length}`,
+          command.requestId,
+          [{
             requestItemId: 'item-generic',
             manifestEntryId: entry.id,
             status: 'resolved',
@@ -10486,7 +10410,7 @@ function resourceBudgetKernel(
             originalBytes: entry.kind !== 'directory' ? 24000 : undefined,
             evidenceRefs: ['evidence-budget'],
           }],
-        },
+        ),
       }],
     };
   }
@@ -11246,14 +11170,14 @@ function assertWorkflowStagePermissionProjectsPendingDecision(): void {
         kernelEvent: {
           kind: 'permission.requested',
           runId: 'run-permission',
-          planId: 'plan-permission',
-          request: {
-            id: 'permission-generic',
+          sessionId: 'session-permission',
+          request: kernelTestPermissionRequest('permission-generic', {
+            contractId: 'contract-permission',
             capability: 'fs.write',
             riskLevel: 'medium',
             summary: 'Allow a generic write operation?',
             argsPreview: { path: 'generic-output.txt' },
-          },
+          }),
         },
       },
     },
@@ -11316,7 +11240,7 @@ async function assertSessionDriverLoopReviewRevisionReturnsToPlanning(): Promise
       return { session: { ...session, eventCount: events.length }, events: [...events] };
     },
     kernelCommand: async (request): Promise<KernelReply> => {
-      if ((request.command as Record<string, unknown>).kind === 'runCreate') runCreates += 1;
+      if (request.command.kind === 'runCreate') runCreates += 1;
       return planKernel(request, 'session-review-revision', submittedPlans);
     },
     llmChat: async (request): Promise<ApiResponse<LlmChatResult>> => {
@@ -11364,7 +11288,7 @@ async function assertSessionDriverLoopReviewRevisionReturnsToPlanning(): Promise
   assert(!promptText.includes('content=Review fact'), 'raw review facts are not promoted into ProjectMemory prompt content');
 }
 
-async function assertSessionDriverLoopReviewRevisionContinuesWhenAuditRunInactive(): Promise<void> {
+async function assertSessionDriverLoopReviewRevisionStopsWhenGateRunIsInactive(): Promise<void> {
   const token = randomSmokeToken('inactive-review-revision');
   const revisedTarget = `scope-${token}/revision.txt`;
   const events: AgentEvent[] = [
@@ -11403,7 +11327,6 @@ async function assertSessionDriverLoopReviewRevisionContinuesWhenAuditRunInactiv
   };
   const submittedPlans: Array<Record<string, any>> = [];
   const llmRequests: LlmChatRequest[] = [];
-  let userDecisionSubmits = 0;
   const loop = new SessionDriverLoop({
     appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
       events.push(...nextEvents);
@@ -11411,8 +11334,7 @@ async function assertSessionDriverLoopReviewRevisionContinuesWhenAuditRunInactiv
     },
     kernelCommand: async (request): Promise<KernelReply> => {
       const command = request.command as Record<string, any>;
-      if (command.kind === 'userDecisionSubmit') {
-        userDecisionSubmits += 1;
+      if (command.kind === 'reviewGateEvaluate') {
         return {
           ok: false,
           events: [],
@@ -11444,7 +11366,7 @@ async function assertSessionDriverLoopReviewRevisionContinuesWhenAuditRunInactiv
       });
     },
     now: () => '2026-01-01T00:00:00.000Z',
-    createId: (prefix) => `${prefix}-${events.length + submittedPlans.length + llmRequests.length + userDecisionSubmits + 1}`,
+    createId: (prefix) => `${prefix}-${events.length + submittedPlans.length + llmRequests.length + 1}`,
   });
 
   const result = await loop.resolveDecision({
@@ -11456,18 +11378,17 @@ async function assertSessionDriverLoopReviewRevisionContinuesWhenAuditRunInactiv
     existingEvents: events,
   });
 
-  assertEqual(userDecisionSubmits, 1, 'review revise still attempts one Kernel audit decision');
   assertEqual(
     result.events.some((event) =>
       event.kind === 'trace/review_accept_noop' &&
       (event.payload as any)?.errorCode === 'run_not_active'
     ),
     true,
-    'inactive review audit is recorded as a Session trace'
+    'inactive ReviewGate is recorded as a Session trace'
   );
-  assertEqual(result.events.some((event) => event.kind === 'plan_card'), true, 'review revise continues to a new planning turn after audit failure');
+  assertEqual(result.events.some((event) => event.kind === 'plan_card'), false, 'review revise cannot continue when Kernel did not accept needsReplan');
   assertEqual(submittedPlans.length, 0, 'review revise projects the semantic task plan before Kernel execution admission');
-  assertEqual(llmRequests.length, 1, 'review revise calls provider once after best-effort audit failure');
+  assertEqual(llmRequests.length, 0, 'review revise does not call Provider after ReviewGate failure');
 }
 
 async function assertSessionDriverLoopAcceptedDecisionSubmitsMultiWriteBatch(): Promise<void> {
@@ -11520,7 +11441,6 @@ async function assertSessionDriverLoopAcceptedDecisionSubmitsMultiWriteBatch(): 
     },
     kernelCommand: async (request): Promise<KernelReply> => {
       const command = request.command as Record<string, any>;
-      if (command.kind === 'userDecisionSubmit') return { ok: true, events: [] };
       if (command.kind === 'actionBatchSubmit') {
         actionBatchSubmits += 1;
         return { ok: true, events: [] };
@@ -11610,7 +11530,6 @@ async function assertSessionDriverLoopAcceptedDecisionPreservesKernelAuthorizedT
     },
     kernelCommand: async (request): Promise<KernelReply> => {
       const command = request.command as Record<string, any>;
-      if (command.kind === 'userDecisionSubmit') return { ok: true, events: [] };
       if (command.kind === 'actionBatchSubmit') {
         submittedBatches.push(command.batch);
         return { ok: true, events: [] };
@@ -11663,7 +11582,6 @@ async function assertSessionDriverLoopPlanCardAcceptDoesNotNoopWithoutPlanReview
     createdAt: '2026-01-01T00:00:00.000Z',
     updatedAt: '2026-01-01T00:00:00.000Z',
   };
-  let userDecisionSubmits = 0;
   let actionBatchSubmits = 0;
   const loop = new SessionDriverLoop({
     appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
@@ -11672,10 +11590,6 @@ async function assertSessionDriverLoopPlanCardAcceptDoesNotNoopWithoutPlanReview
     },
     kernelCommand: async (request): Promise<KernelReply> => {
       const command = request.command as Record<string, any>;
-      if (command.kind === 'userDecisionSubmit') {
-        userDecisionSubmits += 1;
-        return { ok: true, events: [] };
-      }
       if (command.kind === 'actionBatchSubmit') {
         actionBatchSubmits += 1;
         return { ok: true, events: [] };
@@ -11684,7 +11598,7 @@ async function assertSessionDriverLoopPlanCardAcceptDoesNotNoopWithoutPlanReview
     },
     llmChat: async (): Promise<ApiResponse<LlmChatResult>> => jsonLlmResponse(genericWriteProposal(false)),
     now: () => '2026-01-01T00:00:00.000Z',
-    createId: (prefix) => `${prefix}-${events.length + userDecisionSubmits + actionBatchSubmits + 1}`,
+    createId: (prefix) => `${prefix}-${events.length + actionBatchSubmits + 1}`,
   });
 
   const result = await loop.resolveDecision({
@@ -11696,7 +11610,6 @@ async function assertSessionDriverLoopPlanCardAcceptDoesNotNoopWithoutPlanReview
     existingEvents: events,
   });
 
-  assertEqual(userDecisionSubmits, 0, 'plan_card-only history is not submitted as Kernel execution truth');
   assertEqual(actionBatchSubmits, 0, 'plan_card-only history cannot execute without a Kernel contract');
   assertEqual(
     result.events.some((event) => event.kind === 'error' || event.kind === 'trace/plan_accept_noop'),
@@ -11771,7 +11684,7 @@ async function assertSessionDriverLoopPlanCardAcceptExecutesReviewedDeletePlan()
               workUnitId: 'work-unit-reviewed-delete',
               output: { path: 'generic-obsolete.txt' },
             },
-            { kind: 'batch.review_ready', runId: command.runId, sessionId: session.id },
+            kernelTestBatchReviewReady(command.runId),
           ],
         };
       }
@@ -11857,7 +11770,6 @@ async function assertSessionDriverLoopAcceptedPlanExecutesDeleteWithinKernelAuth
           ],
         };
       }
-      if (command.kind === 'userDecisionSubmit') return { ok: true, events: [] };
       if (command.kind === 'actionBatchSubmit') {
         actionBatchSubmits += 1;
         return {
@@ -11871,7 +11783,7 @@ async function assertSessionDriverLoopAcceptedPlanExecutesDeleteWithinKernelAuth
               workUnitId: 'work-unit-reviewed-delete-no-targets',
               output: { path: 'generic-obsolete.txt' },
             },
-            { kind: 'batch.review_ready', runId: command.runId, sessionId: session.id },
+            kernelTestBatchReviewReady(command.runId),
           ],
         };
       }
@@ -11971,7 +11883,6 @@ async function assertSessionDriverLoopAcceptedPlanDeleteUsesCurrentTaskTargetsWh
           ],
         };
       }
-      if (command.kind === 'userDecisionSubmit') return { ok: true, events: [] };
       if (command.kind === 'actionBatchSubmit') {
         actionBatchSubmits += 1;
         return {
@@ -11985,7 +11896,7 @@ async function assertSessionDriverLoopAcceptedPlanDeleteUsesCurrentTaskTargetsWh
               workUnitId: `work-unit-${token}`,
               output: { path: targetPath },
             },
-            { kind: 'batch.review_ready', runId: command.runId, sessionId: session.id },
+            kernelTestBatchReviewReady(command.runId),
           ],
         };
       }
@@ -12074,7 +11985,7 @@ async function assertSessionDriverLoopAcceptedExecutionExceptionClosesRun(): Pro
     },
     kernelCommand: async (request): Promise<KernelReply> => {
       const command = request.command as Record<string, any>;
-      if (command.kind === 'userDecisionSubmit' || command.kind === 'actionBatchSubmit') {
+      if (command.kind === 'actionBatchSubmit') {
         kernelCalls += 1;
       }
       return fakeKernel(request);
@@ -12094,7 +12005,7 @@ async function assertSessionDriverLoopAcceptedExecutionExceptionClosesRun(): Pro
   });
 
   assertEqual(preflightAppendFailed, true, 'preflight append failure was exercised');
-  assertEqual(kernelCalls, 0, 'preflight failure stops before Kernel user decision, grant, or actionBatch');
+  assertEqual(kernelCalls, 0, 'preflight failure stops before Kernel actionBatch submission');
   assertEqual(
     result.events.some((event) => event.kind === 'error' && (event.payload as any)?.code === 'accepted_plan_execution_failed'),
     true,
@@ -12145,7 +12056,6 @@ async function assertSessionDriverLoopAcceptedExecutionKernelErrorClosesRun(): P
     },
     kernelCommand: async (request): Promise<KernelReply> => {
       const command = request.command as Record<string, any>;
-      if (command.kind === 'userDecisionSubmit') return { ok: true, events: [] };
       if (command.kind === 'actionBatchSubmit') {
         actionBatchSubmits += 1;
         return {
@@ -12252,7 +12162,6 @@ async function assertSessionDriverLoopAcceptedDecisionRecoversUnconsumedExecutio
     },
     kernelCommand: async (request): Promise<KernelReply> => {
       const command = request.command as Record<string, any>;
-      if (command.kind === 'userDecisionSubmit') return { ok: true, events: [] };
       if (command.kind === 'actionBatchSubmit') {
         actionBatchSubmits += 1;
         return { ok: true, events: [{ kind: 'action_batch.accepted', runId: command.runId, sessionId: session.id, batch: { planId: command.batch?.planId } }] };
@@ -12310,7 +12219,6 @@ async function assertSessionDriverLoopRequirementAcceptedActionBundleWaitsForExp
     updatedAt: '2026-01-01T00:00:00.000Z',
   };
   let proposalSubmits = 0;
-  let userDecisionSubmits = 0;
   let actionBatchSubmits = 0;
   let reviewFactsRequests = 0;
   const loop = new SessionDriverLoop({
@@ -12338,10 +12246,6 @@ async function assertSessionDriverLoopRequirementAcceptedActionBundleWaitsForExp
           ],
         };
       }
-      if (command.kind === 'userDecisionSubmit') {
-        userDecisionSubmits += 1;
-        return { ok: true, events: [] };
-      }
       if (command.kind === 'actionBatchSubmit') {
         actionBatchSubmits += 1;
         return {
@@ -12351,22 +12255,17 @@ async function assertSessionDriverLoopRequirementAcceptedActionBundleWaitsForExp
               kind: 'action_batch.accepted',
               runId: command.runId,
               sessionId: session.id,
-              actionCount: 1,
+              batch: { actionCount: 1 },
             },
-            {
-              kind: 'work_unit.queued',
+            kernelTestWorkUnitQueued({
               runId: command.runId,
-              sessionId: session.id,
-              workUnit: { id: 'work-unit-generic-auto-plan', actionId: 'write-generic-output', writeSet: ['generic-output.txt'] },
-            },
-            {
-              kind: 'work_unit.completed',
-              runId: command.runId,
-              sessionId: session.id,
               workUnitId: 'work-unit-generic-auto-plan',
-              result: { ok: true },
-            },
-            { kind: 'batch.review_ready', runId: command.runId, sessionId: session.id },
+              actionId: 'write-generic-output',
+              toolId: 'fs.write',
+              writeSet: ['generic-output.txt'],
+            }),
+            kernelTestWorkUnitCompleted(command.runId, 'work-unit-generic-auto-plan', { ok: true }),
+            kernelTestBatchReviewReady(command.runId),
           ],
         };
       }
@@ -12378,7 +12277,7 @@ async function assertSessionDriverLoopRequirementAcceptedActionBundleWaitsForExp
     },
     llmChat: async (): Promise<ApiResponse<LlmChatResult>> => jsonLlmResponse(genericWriteProposal(false)),
     now: () => '2026-01-01T00:00:00.000Z',
-    createId: (prefix) => `${prefix}-${events.length + proposalSubmits + userDecisionSubmits + actionBatchSubmits + reviewFactsRequests + 1}`,
+    createId: (prefix) => `${prefix}-${events.length + proposalSubmits + actionBatchSubmits + reviewFactsRequests + 1}`,
   });
 
   const result = await loop.resolveDecision({
@@ -12391,7 +12290,6 @@ async function assertSessionDriverLoopRequirementAcceptedActionBundleWaitsForExp
   });
 
   assertEqual(proposalSubmits, 1, 'requirement accept generates one actionBundle plan through provider');
-  assertEqual(userDecisionSubmits, 0, 'requirement accept does not submit a Kernel plan decision');
   assertEqual(actionBatchSubmits, 0, 'requirement accept does not continue into actionBatchSubmit');
   assertEqual(reviewFactsRequests, 0, 'requirement accept does not reach review facts before explicit plan confirmation');
   assertEqual(result.events.some((event) => event.kind === 'trace/plan_accept_noop'), false, 'requirement accept generates a fresh plan instead of a stale noop');
@@ -12473,7 +12371,6 @@ async function assertSessionDriverLoopDelegatesDirectoryDeleteAdmissionToKernel(
     createdAt: '2026-01-01T00:00:00.000Z',
     updatedAt: '2026-01-01T00:00:00.000Z',
   };
-  let userDecisionSubmits = 0;
   let actionBatchSubmits = 0;
   const loop = new SessionDriverLoop({
     appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
@@ -12482,13 +12379,12 @@ async function assertSessionDriverLoopDelegatesDirectoryDeleteAdmissionToKernel(
     },
     kernelCommand: async (request): Promise<KernelReply> => {
       const command = request.command as Record<string, any>;
-      if (command.kind === 'userDecisionSubmit') userDecisionSubmits += 1;
       if (command.kind === 'actionBatchSubmit') actionBatchSubmits += 1;
       return { ok: true, events: [] };
     },
     llmChat: async (): Promise<ApiResponse<LlmChatResult>> => jsonLlmResponse(genericWriteProposal(false)),
     now: () => '2026-01-01T00:00:00.000Z',
-    createId: (prefix) => `${prefix}-${events.length + userDecisionSubmits + actionBatchSubmits + 1}`,
+    createId: (prefix) => `${prefix}-${events.length + actionBatchSubmits + 1}`,
   });
 
   const result = await loop.resolveDecision({
@@ -12500,7 +12396,6 @@ async function assertSessionDriverLoopDelegatesDirectoryDeleteAdmissionToKernel(
     existingEvents: events,
   });
 
-  assertEqual(userDecisionSubmits, 0, 'Session does not invent a second permission decision for directory evidence');
   assertEqual(actionBatchSubmits, 1, 'Session submits typed directory delete args so Kernel owns target and recursive admission');
   assertEqual(
     result.events.some((event) => event.kind === 'error' && (event.payload as any).code === 'accepted_plan_action_batch_preflight_failed'),
@@ -12661,12 +12556,13 @@ async function assertSessionDriverLoopAcceptedTaskPlanAutoExecutesBatch(): Promi
               sessionId: session.id,
               batch: { planId: command.batch?.planId },
             },
-            {
-              kind: 'work_unit.queued',
+            kernelTestWorkUnitQueued({
               runId: command.runId,
-              sessionId: session.id,
-              workUnit: { id: 'work-unit-generic', actionId: 'write-generic-output', status: 'queued', writeSet: ['generic-output.txt'] },
-            },
+              workUnitId: 'work-unit-generic',
+              actionId: 'write-generic-output',
+              toolId: 'fs.write',
+              writeSet: ['generic-output.txt'],
+            }),
             {
               kind: 'work_unit.completed',
               runId: command.runId,
@@ -12674,7 +12570,7 @@ async function assertSessionDriverLoopAcceptedTaskPlanAutoExecutesBatch(): Promi
               workUnitId: 'work-unit-generic',
               output: { path: 'generic-output.txt' },
             },
-            { kind: 'batch.review_ready', runId: command.runId, sessionId: session.id },
+            kernelTestBatchReviewReady(command.runId),
           ],
         };
       }
@@ -12780,12 +12676,13 @@ async function assertSessionDriverLoopAcceptedTaskPlanNormalizesWriteBatchForKer
           ok: true,
           events: [
             { kind: 'action_batch.accepted', runId: 'run-generic', sessionId: session.id, batch: { planId: command.batch?.planId } },
-            {
-              kind: 'work_unit.queued',
+            kernelTestWorkUnitQueued({
               runId: 'run-generic',
-              sessionId: session.id,
-              workUnit: { id: 'work-unit-generic', actionId: 'write-generic-output', status: 'queued', writeSet: ['generic-output.txt'] },
-            },
+              workUnitId: 'work-unit-generic',
+              actionId: 'write-generic-output',
+              toolId: 'fs.write',
+              writeSet: ['generic-output.txt'],
+            }),
             {
               kind: 'work_unit.completed',
               runId: 'run-generic',
@@ -12793,7 +12690,7 @@ async function assertSessionDriverLoopAcceptedTaskPlanNormalizesWriteBatchForKer
               workUnitId: 'work-unit-generic',
               output: { path: 'generic-output.txt' },
             },
-            { kind: 'batch.review_ready', runId: 'run-generic', sessionId: session.id },
+            kernelTestBatchReviewReady('run-generic'),
           ],
         };
       }
@@ -12889,19 +12786,19 @@ async function assertSessionDriverLoopAcceptedTaskPlanPrefersTargetPathOverRootR
           ],
         };
       }
-      if (command.kind === 'userDecisionSubmit') return { ok: true, events: [] };
       if (command.kind === 'actionBatchSubmit') {
         actionBatchSubmits += 1;
         return {
           ok: true,
           events: [
             { kind: 'action_batch.accepted', runId: command.runId, sessionId: session.id, batch: { planId: command.batch?.planId } },
-            {
-              kind: 'work_unit.queued',
+            kernelTestWorkUnitQueued({
               runId: command.runId,
-              sessionId: session.id,
-              workUnit: { id: 'work-unit-root-output', actionId: 'write-root-output', status: 'queued', writeSet: ['root-output.sh'] },
-            },
+              workUnitId: 'work-unit-root-output',
+              actionId: 'write-root-output',
+              toolId: 'fs.write',
+              writeSet: ['root-output.sh'],
+            }),
             {
               kind: 'work_unit.completed',
               runId: command.runId,
@@ -12909,7 +12806,7 @@ async function assertSessionDriverLoopAcceptedTaskPlanPrefersTargetPathOverRootR
               workUnitId: 'work-unit-root-output',
               output: { path: 'root-output.sh' },
             },
-            { kind: 'batch.review_ready', runId: command.runId, sessionId: session.id },
+            kernelTestBatchReviewReady(command.runId),
           ],
         };
       }
@@ -13021,15 +12918,8 @@ async function assertSessionDriverLoopAcceptedTaskPlanRepairsPlanReviewRootAcces
           ok: true,
           events: [
             { kind: 'action_batch.accepted', runId: command.runId, sessionId: session.id, batch: { planId: command.batch?.planId } },
-            {
-              kind: 'work_unit.completed',
-              runId: command.runId,
-              sessionId: session.id,
-              workUnitId: 'work-unit-generic',
-              actionId: 'write-generic-output',
-              output: { path: 'generic-output.txt' },
-            },
-            { kind: 'batch.review_ready', runId: command.runId, sessionId: session.id },
+            kernelTestWorkUnitCompleted(command.runId, 'work-unit-generic', { path: 'generic-output.txt' }),
+            kernelTestBatchReviewReady(command.runId),
           ],
         };
       }
@@ -13349,12 +13239,13 @@ async function assertSessionDriverLoopAcceptedTaskPlanAutoExecutesMultiTargetBat
           ok: true,
           events: [
             { kind: 'action_batch.accepted', runId: 'run-generic', sessionId: session.id, batch: { planId: command.batch?.planId } },
-            {
-              kind: 'work_unit.queued',
+            kernelTestWorkUnitQueued({
               runId: 'run-generic',
-              sessionId: session.id,
-              workUnit: { id: 'work-unit-one', actionId: 'write-generic-one', status: 'queued', writeSet: ['generic-one.txt'] },
-            },
+              workUnitId: 'work-unit-one',
+              actionId: 'write-generic-one',
+              toolId: 'fs.write',
+              writeSet: ['generic-one.txt'],
+            }),
             {
               kind: 'work_unit.completed',
               runId: 'run-generic',
@@ -13362,12 +13253,13 @@ async function assertSessionDriverLoopAcceptedTaskPlanAutoExecutesMultiTargetBat
               workUnitId: 'work-unit-one',
               output: { path: 'generic-one.txt' },
             },
-            {
-              kind: 'work_unit.queued',
+            kernelTestWorkUnitQueued({
               runId: 'run-generic',
-              sessionId: session.id,
-              workUnit: { id: 'work-unit-two', actionId: 'write-generic-two', status: 'queued', writeSet: ['generic-two.txt'] },
-            },
+              workUnitId: 'work-unit-two',
+              actionId: 'write-generic-two',
+              toolId: 'fs.write',
+              writeSet: ['generic-two.txt'],
+            }),
             {
               kind: 'work_unit.completed',
               runId: 'run-generic',
@@ -13455,20 +13347,15 @@ async function assertSessionDriverLoopAcceptedTaskPlanSplitsCommaSeparatedTarget
           ok: true,
           events: [
             { kind: 'action_batch.accepted', runId, sessionId, batch: { planId: command.batch?.planId } },
-            ...submittedPaths.flatMap((path, index) => [
-              {
-                kind: 'work_unit.queued',
+            ...submittedPaths.flatMap((path, index): KernelEventV1[] => [
+              kernelTestWorkUnitQueued({
                 runId,
-                sessionId,
-                workUnit: { id: `work-unit-${index}`, actionId: actions[index]?.actionId, status: 'queued', writeSet: [path] },
-              },
-              {
-                kind: 'work_unit.completed',
-                runId,
-                sessionId,
                 workUnitId: `work-unit-${index}`,
-                output: { path },
-              },
+                actionId: String(actions[index]?.actionId ?? `action-${index}`),
+                toolId: 'fs.write',
+                writeSet: [path],
+              }),
+              kernelTestWorkUnitCompleted(runId, `work-unit-${index}`, { path }),
             ]),
           ],
         };
@@ -13548,12 +13435,13 @@ async function assertSessionDriverLoopAcceptedTaskPlanAllowsBriefExecutionBatchP
           ok: true,
           events: [
             { kind: 'action_batch.accepted', runId, sessionId, batch: { planId: command.batch?.planId } },
-            {
-              kind: 'work_unit.queued',
+            kernelTestWorkUnitQueued({
               runId,
-              sessionId,
-              workUnit: { id: 'work-unit-brief', actionId: 'write-brief', status: 'queued', writeSet: [path] },
-            },
+              workUnitId: 'work-unit-brief',
+              actionId: 'write-brief',
+              toolId: 'fs.write',
+              writeSet: [path],
+            }),
             {
               kind: 'work_unit.completed',
               runId,
@@ -13636,20 +13524,14 @@ async function assertSessionDriverLoopAcceptedTaskPlanKeepsContinuationNonExecut
           ok: true,
           events: [
             { kind: 'action_batch.accepted', runId: 'run-generic', sessionId: session.id, batch: { planId: command.batch?.planId } },
-            {
-              kind: 'work_unit.queued',
+            kernelTestWorkUnitQueued({
               runId: 'run-generic',
-              sessionId: session.id,
-              workUnit: { id: 'work-unit-resource-resume', actionId: 'write-generic-output', status: 'queued', writeSet: ['generic-output.txt'] },
-            },
-            {
-              kind: 'work_unit.completed',
-              runId: 'run-generic',
-              sessionId: session.id,
-              workUnitId: 'work-unit-continuation-current',
-              actionId: 'write-continuation-current',
-              output: { path: 'generic-output.txt' },
-            },
+              workUnitId: 'work-unit-resource-resume',
+              actionId: 'write-generic-output',
+              toolId: 'fs.write',
+              writeSet: ['generic-output.txt'],
+            }),
+            kernelTestWorkUnitCompleted('run-generic', 'work-unit-continuation-current', { path: 'generic-output.txt' }),
           ],
         };
       }
@@ -13733,12 +13615,13 @@ async function assertSessionDriverLoopAcceptedTaskPlanAutoExecutesDeleteAction()
           ok: true,
           events: [
             { kind: 'action_batch.accepted', runId: 'run-generic', sessionId: session.id, batch: { planId: command.batch?.planId } },
-            {
-              kind: 'work_unit.queued',
+            kernelTestWorkUnitQueued({
               runId: 'run-generic',
-              sessionId: session.id,
-              workUnit: { id: 'work-unit-delete', actionId: 'delete-generic-obsolete', status: 'queued', writeSet: ['generic-obsolete.txt'] },
-            },
+              workUnitId: 'work-unit-delete',
+              actionId: 'delete-generic-obsolete',
+              toolId: 'fs.delete',
+              writeSet: ['generic-obsolete.txt'],
+            }),
             {
               kind: 'work_unit.completed',
               runId: 'run-generic',
@@ -13874,22 +13757,17 @@ async function assertSessionDriverLoopUsesExactKernelOperationsForMixedDelete():
           ok: true,
           events: [
             { kind: 'action_batch.accepted', runId, sessionId, batch: { planId: command.batch?.planId } },
-            ...targets.flatMap((target, index) => [
-              {
-                kind: 'work_unit.queued',
+            ...targets.flatMap((target, index): KernelEventV1[] => [
+              kernelTestWorkUnitQueued({
                 runId,
-                sessionId,
-                workUnit: { id: `work-unit-${index}`, actionId: `delete-${index}`, status: 'queued', writeSet: [target] },
-              },
-              {
-                kind: 'work_unit.completed',
-                runId,
-                sessionId,
                 workUnitId: `work-unit-${index}`,
-                output: { path: target },
-              },
+                actionId: `delete-${index}`,
+                toolId: 'fs.delete',
+                writeSet: [target],
+              }),
+              kernelTestWorkUnitCompleted(runId, `work-unit-${index}`, { path: target }),
             ]),
-            { kind: 'batch.review_ready', runId, sessionId },
+            kernelTestBatchReviewReady(runId),
           ],
         };
       }
@@ -14044,26 +13922,21 @@ async function assertSessionDriverLoopAcceptedTaskPlanClassifiesDeleteCompileMis
           ok: true,
           events: [
             { kind: 'action_batch.accepted', runId: 'run-generic', sessionId: session.id, batch: { planId: command.batch?.planId } },
-            {
-              kind: 'work_unit.queued',
+            kernelTestWorkUnitQueued({
               runId: 'run-generic',
-              sessionId: session.id,
-              workUnit: { id: 'work-unit-delete-mismatch', actionId: 'delete-generic-obsolete', status: 'queued', writeSet: ['generic-obsolete.txt'] },
-            },
-            {
-              kind: 'work_unit.started',
-              runId: 'run-generic',
-              sessionId: session.id,
               workUnitId: 'work-unit-delete-mismatch',
-            },
-            {
-              kind: 'work_unit.failed',
-              runId: 'run-generic',
-              sessionId: session.id,
-              workUnitId: 'work-unit-delete-mismatch',
-              error: { code: 'invalid_command', message: 'invalid command: fs.write target path is empty' },
-            },
-            { kind: 'batch.review_ready', runId: 'run-generic', sessionId: session.id },
+              actionId: 'delete-generic-obsolete',
+              toolId: 'fs.delete',
+              writeSet: ['generic-obsolete.txt'],
+            }),
+            kernelTestWorkUnitStarted('run-generic', 'work-unit-delete-mismatch'),
+            kernelTestWorkUnitFailed(
+              'run-generic',
+              'work-unit-delete-mismatch',
+              'invalid_command',
+              'invalid command: fs.write target path is empty',
+            ),
+            kernelTestBatchReviewReady('run-generic'),
           ],
         };
       }
@@ -14225,10 +14098,10 @@ async function assertSessionDriverLoopAcceptedTaskPlanClassifiesPatchEvidenceMis
             kind: 'resource.packet_produced',
             runId: `run-${token}`,
             sessionId: session.id,
-            packet: {
-              id: `packet-${token}`,
-              requestId: command.requestId,
-              items: [{
+            packet: kernelTestResourcePacket(
+              `packet-${token}`,
+              command.requestId,
+              [{
                 requestItemId: `item-${token}`,
                 manifestEntryId: entry.id,
                 status: 'resolved',
@@ -14241,7 +14114,7 @@ async function assertSessionDriverLoopAcceptedTaskPlanClassifiesPatchEvidenceMis
                 contentSummary: oldText,
                 evidenceRefs: [`evidence-${token}`],
               }],
-            },
+            ),
           }],
         };
       }
@@ -14265,22 +14138,20 @@ async function assertSessionDriverLoopAcceptedTaskPlanClassifiesPatchEvidenceMis
         return {
           ok: true,
           events: [
-            {
-              kind: 'work_unit.queued',
+            kernelTestWorkUnitQueued({
               runId: `run-${token}`,
-              sessionId: session.id,
-              workUnit: { id: `work-unit-${token}`, actionId: `patch-${token}`, status: 'queued', writeSet: [targetPath] },
-            },
-            {
-              kind: 'work_unit.failed',
-              runId: `run-${token}`,
-              sessionId: session.id,
               workUnitId: `work-unit-${token}`,
               actionId: `patch-${token}`,
+              toolId: 'fs.edit',
               writeSet: [targetPath],
-              error: { code: 'invalid_patch', message: 'patch match did not occur in target file' },
-            },
-            { kind: 'batch.review_ready', runId: `run-${token}`, sessionId: session.id },
+            }),
+            kernelTestWorkUnitFailed(
+              `run-${token}`,
+              `work-unit-${token}`,
+              'invalid_patch',
+              'patch match did not occur in target file',
+            ),
+            kernelTestBatchReviewReady(`run-${token}`),
           ],
         };
       }
@@ -14376,12 +14247,12 @@ async function assertSessionDriverLoopAcceptedTaskPlanRejectsBlockedProcessExec(
             kind: 'permission.requested',
             runId: 'run-generic',
             sessionId: session.id,
-            permissionId: 'permission-exec-generic',
-            request: {
-              id: 'permission-exec-generic',
+            request: kernelTestPermissionRequest('permission-exec-generic', {
               capability: 'process.exec',
+              toolId: 'process.exec',
+              riskLevel: 'high',
               summary: 'Run a generic validation command.',
-            },
+            }),
           }],
         };
       }
@@ -14568,19 +14439,21 @@ async function assertSessionDriverLoopAcceptedTaskPlanContinuesUntilTasksComplet
           ok: true,
           events: [
             { kind: 'action_batch.accepted', runId: command.runId, sessionId: session.id, batch: { planId: command.batch?.planId } },
-            {
-              kind: 'work_unit.queued',
+            kernelTestWorkUnitQueued({
               runId: command.runId,
-              sessionId: session.id,
-              workUnit: { id: workUnitId, actionId, status: 'queued', writeSet: [path] },
-            },
+              workUnitId,
+              actionId,
+              toolId: String(action.toolId ?? 'fs.write'),
+              writeSet: [path],
+            }),
             completedKernelToolFact({
               runId: String(command.runId),
               sessionId: session.id,
               workUnitId,
               toolCallId: `tool-call-${actionBatchSubmits}`,
-              toolName: String(action.toolId ?? 'fs.write'),
+              toolId: String(action.toolId ?? 'fs.write'),
               path,
+              content: (command.batch?.contentBlocks?.[0]?.contentLines ?? []).join('\n'),
             }),
             {
               kind: 'work_unit.completed',
@@ -14589,6 +14462,7 @@ async function assertSessionDriverLoopAcceptedTaskPlanContinuesUntilTasksComplet
               workUnitId,
               output: { path },
             },
+            kernelTestBatchReviewReady(String(command.runId)),
           ],
         };
       }
@@ -14760,19 +14634,21 @@ async function assertSessionDriverLoopAcceptedTaskPlanResumesAfterDecisionReques
           ok: true,
           events: [
             { kind: 'action_batch.accepted', runId, sessionId, batch: { planId: command.batch?.planId } },
-            {
-              kind: 'work_unit.queued',
+            kernelTestWorkUnitQueued({
               runId,
-              sessionId,
-              workUnit: { id: workUnitId, actionId, status: 'queued', writeSet: [path] },
-            },
+              workUnitId,
+              actionId,
+              toolId: String(action.toolId ?? 'fs.write'),
+              writeSet: [path],
+            }),
             completedKernelToolFact({
               runId,
               sessionId,
               workUnitId,
               toolCallId: `tool-call-${token}-${actionBatchSubmits}`,
-              toolName: String(action.toolId ?? 'fs.write'),
+              toolId: String(action.toolId ?? 'fs.write'),
               path,
+              content: (command.batch?.contentBlocks?.[0]?.contentLines ?? []).join('\n'),
             }),
             {
               kind: 'work_unit.completed',
@@ -14781,6 +14657,7 @@ async function assertSessionDriverLoopAcceptedTaskPlanResumesAfterDecisionReques
               workUnitId,
               output: { path },
             },
+            kernelTestBatchReviewReady(runId),
           ],
         };
       }
@@ -14847,6 +14724,8 @@ async function assertSessionDriverLoopAcceptedTaskPlanResumesAfterDecisionReques
 }
 
 async function assertSessionDriverLoopAcceptedTaskPlanReadsGeneratedArtifactEvidence(): Promise<void> {
+  const workspaceRootId = `root-${randomSmokeToken('generated-artifact')}`;
+  const workspacePath = `/tmp/${randomSmokeToken('generated-artifact-workspace')}`;
   const acceptedPlanEvent = generatedArtifactAcceptedTaskPlanCardEvent(
     'session-generated-artifact-evidence',
     'run-generated-artifact-evidence'
@@ -14939,7 +14818,32 @@ async function assertSessionDriverLoopAcceptedTaskPlanReadsGeneratedArtifactEvid
       }
       if (command.kind === 'resourceResolve') {
         resourceResolveCalls += 1;
-        return { ok: true, events: [] };
+        return {
+          ok: true,
+          events: [{
+            kind: 'resource.packet_produced',
+            runId: command.runId,
+            sessionId: session.id,
+            packet: kernelTestResourcePacket(
+              `packet-generated-${resourceResolveCalls}`,
+              String(command.requestId),
+              [{
+                requestItemId: `item-generated-${resourceResolveCalls}`,
+                manifestEntryId: 'generated-generic-generated/input.txt',
+                readPolicy: 'autoRead',
+                sourceKind: 'workspace',
+                status: 'resolved',
+                resolvedKind: 'file',
+                contentKind: 'fileText',
+                path: 'generic-generated/input.txt',
+                promptContent: 'generated input',
+                contentHash: 'hash-generated-input',
+                evidenceRefs: ['generated-generic-generated/input.txt'],
+              }],
+              `session:${session.id}:${workspaceRootId}`
+            ),
+          }],
+        };
       }
       if (command.kind === 'actionBatchSubmit') {
         actionBatchSubmits += 1;
@@ -14951,28 +14855,24 @@ async function assertSessionDriverLoopAcceptedTaskPlanReadsGeneratedArtifactEvid
           ok: true,
           events: [
             { kind: 'action_batch.accepted', runId: 'run-generic', sessionId: session.id, batch: { planId: command.batch?.planId } },
-            {
-              kind: 'work_unit.queued',
+            kernelTestWorkUnitQueued({
               runId: 'run-generic',
-              sessionId: session.id,
-              workUnit: { id: workUnitId, actionId, status: 'queued', writeSet: [path] },
-            },
+              workUnitId,
+              actionId,
+              toolId: String(action.toolId ?? 'fs.write'),
+              writeSet: [path],
+            }),
             completedKernelToolFact({
               runId: 'run-generic',
               sessionId: session.id,
               workUnitId,
               toolCallId: `tool-call-generated-${actionBatchSubmits}`,
-              toolName: String(action.toolId ?? 'fs.write'),
+              toolId: String(action.toolId ?? 'fs.write'),
               path,
+              content: (command.batch?.contentBlocks?.[0]?.contentLines ?? []).join('\n'),
             }),
-            {
-              kind: 'work_unit.completed',
-              runId: 'run-generic',
-              sessionId: session.id,
-              workUnitId,
-              actionId,
-              output: { actionId, path },
-            },
+            kernelTestWorkUnitCompleted('run-generic', workUnitId, { actionId, path }),
+            kernelTestBatchReviewReady('run-generic'),
           ],
         };
       }
@@ -14995,11 +14895,18 @@ async function assertSessionDriverLoopAcceptedTaskPlanReadsGeneratedArtifactEvid
     runId: 'run-generated-artifact-evidence',
     targetId: 'impl-generated-artifact',
     existingEvents: events,
+    projectWorkingDirectory: {
+      rootId: workspaceRootId,
+      label: 'Generated artifact workspace',
+      displayPath: workspacePath,
+      absolutePath: workspacePath,
+      source: 'projectWorkingDirectory',
+    },
   });
 
   assertEqual(llmCalls, 4, 'provider resumes after generated artifact resourceRequest and closes the dependent task with one structured outcome');
   assertEqual(actionBatchSubmits, 1, 'alreadySatisfied does not fabricate a second Kernel mutation batch');
-  assertEqual(resourceResolveCalls, 0, 'generated artifact resourceRequest is satisfied without stale Kernel ResourceResolve');
+  assertEqual(resourceResolveCalls, 1, 'generated artifact content is read through Kernel ResourceResolve');
   assertEqual(
     result.events.some((event) =>
       event.kind === 'tool_result' &&
@@ -15007,14 +14914,12 @@ async function assertSessionDriverLoopAcceptedTaskPlanReadsGeneratedArtifactEvid
       Array.isArray((event.payload as any)?.output?.items) &&
       (event.payload as any).output.items.some((item: any) =>
         item.path === 'generic-generated/input.txt' &&
-        Array.isArray(item.evidenceRefs) &&
-        item.evidenceRefs.includes('generatedArtifactEvidence') &&
         typeof item.promptContent === 'string' &&
         item.promptContent.includes('generated input')
       )
     ),
     true,
-    'generated file content is projected as run-local generated artifact evidence'
+    'Kernel ResourcePacket content is projected for the generated artifact request'
   );
   assertEqual(
     result.events.some((event) =>
@@ -15091,25 +14996,15 @@ async function assertSessionDriverLoopAcceptedTaskPlanResumesFromResourceCursor(
           ok: true,
           events: [
             { kind: 'action_batch.accepted', runId: 'run-generic', sessionId: session.id, batch: { planId: command.batch?.planId } },
-            {
-              kind: 'work_unit.queued',
+            kernelTestWorkUnitQueued({
               runId: 'run-generic',
-              sessionId: session.id,
-              workUnit: {
-                id: 'work-unit-resource-resume',
-                actionId: 'write-generic-output',
-                status: 'queued',
-                writeSet: ['generic-output.txt'],
-              },
-            },
-            {
-              kind: 'work_unit.completed',
-              runId: 'run-generic',
-              sessionId: session.id,
               workUnitId: 'work-unit-resource-resume',
               actionId: 'write-generic-output',
-              output: { path: 'generic-output.txt' },
-            },
+              toolId: 'fs.write',
+              writeSet: ['generic-output.txt'],
+            }),
+            kernelTestWorkUnitCompleted('run-generic', 'work-unit-resource-resume', { path: 'generic-output.txt' }),
+            kernelTestBatchReviewReady('run-generic'),
           ],
         };
       }
@@ -15244,14 +15139,7 @@ async function assertSessionDriverLoopAcceptedTaskPlanChainsResourceResumeReques
           ok: true,
           events: [
             { kind: 'action_batch.accepted', runId: 'run-generic', sessionId: session.id, batch: { planId: command.batch?.planId } },
-            {
-              kind: 'work_unit.completed',
-              runId: 'run-generic',
-              sessionId: session.id,
-              workUnitId: `work-unit-${token}`,
-              actionId: 'write-generic-output',
-              output: { path: 'generic-output.txt' },
-            },
+            kernelTestWorkUnitCompleted('run-generic', `work-unit-${token}`, { path: 'generic-output.txt' }),
           ],
         };
       }
@@ -15337,7 +15225,7 @@ async function assertSessionDriverLoopAcceptedTaskPlanChainsResourceResumeReques
   assert(providerPrompts[0] && providerPrompts[0].includes('slot-task-generic-write-plan-op-task-generic-write-1'), 'first call starts with the current Kernel-authorized IntentSlot');
 }
 
-async function assertSessionDriverLoopAcceptedReadOnlyResourceValidationCompletesWithoutProviderLoop(): Promise<void> {
+async function assertSessionDriverLoopAcceptedReadOnlyResourceValidationUsesStructuredOutcome(): Promise<void> {
   const token = randomSmokeToken('readonly');
   const targets = Array.from({ length: 5 }, () => `${randomSmokeToken('scope')}/${randomSmokeToken('target')}.txt`);
   const sessionId = `session-${token}`;
@@ -15375,11 +15263,10 @@ async function assertSessionDriverLoopAcceptedReadOnlyResourceValidationComplete
             kind: 'resource.packet_produced',
             runId,
             sessionId,
-            packet: {
-              id: `packet-${token}-${resourceResolveCalls}`,
-              workspaceScopeKey: command.request?.manifest?.workspaceScopeKey ?? `workspace-${token}`,
-              requestId: command.requestId,
-              items: entries.map((entry: any, index: number) => {
+            packet: kernelTestResourcePacket(
+              `packet-${token}-${resourceResolveCalls}`,
+              command.requestId,
+              entries.map((entry: any, index: number) => {
                 const target = targets[index] ?? String(entry.resourceRef ?? entry.id ?? `fallback-${index}`);
                 return {
                   requestItemId: `item-${token}-${index}`,
@@ -15393,7 +15280,8 @@ async function assertSessionDriverLoopAcceptedReadOnlyResourceValidationComplete
                   evidenceRefs: [`evidence-${token}-${index}`],
                 };
               }),
-            },
+              command.request?.manifest?.workspaceScopeKey ?? `workspace-${token}`,
+            ),
           }],
         };
       }
@@ -15409,14 +15297,26 @@ async function assertSessionDriverLoopAcceptedReadOnlyResourceValidationComplete
     },
     llmChat: async (): Promise<ApiResponse<LlmChatResult>> => {
       llmCalls += 1;
-      assertEqual(llmCalls, 1, 'read-only validation should not make a second provider call after ResourcePacket coverage');
-      return semanticToolLlmResponse('session.request_resources', {
-        reason: 'Read current evidence for the accepted validation task.',
-        requests: targets.map((target) => ({
-          kind: 'fileText',
-          path: target,
-          reason: 'Resolve read-only validation evidence.',
-        })),
+      if (llmCalls === 1) {
+        return semanticToolLlmResponse('session.request_resources', {
+          reason: 'Read current evidence for the accepted validation task.',
+          requests: targets.map((target) => ({
+            kind: 'fileText',
+            path: target,
+            reason: 'Resolve read-only validation evidence.',
+          })),
+        });
+      }
+      const evidenceRefs = [`packet-${token}-1`];
+      return semanticToolLlmResponse('session.submit_task_outcome', {
+        outcome: 'alreadySatisfied',
+        summary: 'Fresh Kernel resource evidence satisfies the accepted read-only validation task.',
+        evidenceRefs,
+        acceptanceResults: [{
+          criterionIndex: 1,
+          status: 'satisfied',
+          evidenceRefs,
+        }],
       });
     },
     now: () => '2026-01-01T00:00:00.000Z',
@@ -15439,19 +15339,18 @@ async function assertSessionDriverLoopAcceptedReadOnlyResourceValidationComplete
     },
   });
 
-  assertEqual(llmCalls, 1, 'read-only validation completes without provider resume loop');
+  assertEqual(llmCalls, 2, 'resource evidence resumes the provider once for a structured task outcome');
   assertEqual(resourceResolveCalls, 1, 'read-only validation resolves one focused ResourcePacket');
-  assertEqual(actionBatchSubmits, 0, 'read-only validation does not submit actionBatch');
+  assertEqual(actionBatchSubmits, 0, 'already-satisfied read-only validation does not fabricate a Kernel execution batch');
   assertEqual(reviewFactsRequests, 1, 'read-only validation enters final review facts collection');
   assertEqual(
     result.events.some((event) =>
       event.kind === 'workflow_stage' &&
       (event.payload as any)?.stage === 'accepted_plan.batch_checkpoint' &&
-      (event.payload as any)?.source === 'resourceValidation' &&
-      (event.payload as any)?.validatedTaskId === `task-${token}-read`
+      (event.payload as any)?.source === 'modelTaskOutcome'
     ),
     true,
-    'read-only validation writes an accepted-plan checkpoint'
+    'read-only validation records a structured model outcome without Kernel completion facts'
   );
   assertEqual(
     result.events.some((event) =>
@@ -15468,148 +15367,6 @@ async function assertSessionDriverLoopAcceptedReadOnlyResourceValidationComplete
     ),
     true,
     'read-only validation leaves the run waiting for review'
-  );
-}
-
-async function assertSessionDriverLoopAcceptedReadOnlyActionBundleCompletesThroughResourceResolve(): Promise<void> {
-  const token = randomSmokeToken('readonly-action');
-  const fileTargets = Array.from({ length: 3 }, () => `${randomSmokeToken('keep')}.${randomSmokeToken('ext')}`);
-  const directoryTarget = `${randomSmokeToken('dir')}/`;
-  const targets = [...fileTargets, directoryTarget];
-  const sessionId = `session-${token}`;
-  const runId = `run-${token}`;
-  const events = [
-    genericKernelContextProjectionEvent(sessionId, runId),
-    readOnlyAcceptedTaskPlanCardEvent(sessionId, runId, token, targets),
-  ];
-  const planPayload = events.find((event) => event.kind === 'plan_card')?.payload as any;
-  planPayload.taskPlan.tasks[0].toolId = 'fs.list';
-  const session: AgentSession = {
-    id: sessionId,
-    mode: 'plan',
-    createdAt: '2026-01-01T00:00:00.000Z',
-    updatedAt: '2026-01-01T00:00:00.000Z',
-  };
-  let llmCalls = 0;
-  let actionBatchSubmits = 0;
-  let reviewFactsRequests = 0;
-  let resourceResolveCalls = 0;
-  const loop = new SessionDriverLoop({
-    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
-      events.push(...nextEvents);
-      return { session: { ...session, eventCount: events.length }, events: [...events] };
-    },
-    kernelCommand: async (request): Promise<KernelReply> => {
-      const command = request.command as Record<string, any>;
-      if (command.kind === 'resourceResolve') {
-        resourceResolveCalls += 1;
-        return {
-          ok: true,
-          events: [{
-            kind: 'resource.packet_produced',
-            runId,
-            sessionId,
-            packet: {
-              id: `packet-${token}-${resourceResolveCalls}`,
-              workspaceScopeKey: command.request?.manifest?.workspaceScopeKey ?? `workspace-${token}`,
-              requestId: command.requestId,
-              items: [{
-                requestItemId: `item-${token}-root`,
-                manifestEntryId: String(command.request?.manifest?.entries?.[0]?.id ?? `root-${token}`),
-                readPolicy: 'explicit-manifest-readonly',
-                status: 'resolved',
-                path: '.',
-                absolutePath: `/tmp/${token}`,
-                contentKind: 'directoryTree',
-                contentSummary: 'Directory tree resolved for generic read-only validation.',
-                nodes: targets.map((target) => ({
-                  type: target.endsWith('/') ? 'directory' : 'file',
-                  path: target.replace(/\/+$/g, ''),
-                })),
-                evidenceRefs: [`evidence-${token}-root`],
-              }],
-            },
-          }],
-        };
-      }
-      if (command.kind === 'actionBatchSubmit') {
-        actionBatchSubmits += 1;
-        return fakeKernel(request);
-      }
-      if (command.kind === 'reviewFactsGet') {
-        reviewFactsRequests += 1;
-        return { ok: true, events: [] };
-      }
-      return fakeKernel(request);
-    },
-    llmChat: async (): Promise<ApiResponse<LlmChatResult>> => {
-      llmCalls += 1;
-      assertEqual(llmCalls, 1, 'read-only actionBundle should not make a second provider call after ResourcePacket coverage');
-      return jsonLlmResponse({
-        schemaVersion: 'deepcode.agent.protocol.v4',
-        kind: 'actionBundle',
-        outputLanguage: 'en-US',
-        userPlanMarkdown: 'Resolve current directory evidence for the accepted read-only task.',
-        actionBundle: {
-          version: '1',
-          id: `batch-${token}`,
-          goal: 'Resolve current directory evidence.',
-          actions: [{
-            actionId: `list-${token}`,
-            toolId: 'fs.list',
-            args: { path: '' },
-          }],
-          validationExpectations: [{ id: `validation-${token}`, description: 'Directory listing covers accepted targets.' }],
-          reviewExpectations: [{ id: `review-${token}`, description: 'Review ResourcePacket evidence.' }],
-        },
-      });
-    },
-    now: () => '2026-01-01T00:00:00.000Z',
-    createId: (prefix) => `${prefix}-${events.length + llmCalls + resourceResolveCalls + reviewFactsRequests + 1}`,
-  });
-
-  const result = await loop.resolveDecision({
-    sessionId,
-    kind: 'plan',
-    decision: 'accept',
-    runId,
-    targetId: `impl-${token}`,
-    existingEvents: events,
-    projectWorkingDirectory: {
-      rootId: `root-${token}`,
-      label: 'Random workspace',
-      displayPath: `/tmp/${token}`,
-      absolutePath: `/tmp/${token}`,
-      source: 'projectWorkingDirectory',
-    },
-  });
-
-  assertEqual(llmCalls, 1, 'read-only actionBundle completes without provider retry');
-  assertEqual(resourceResolveCalls, 1, 'read-only actionBundle resolves one focused ResourcePacket');
-  assertEqual(actionBatchSubmits, 0, 'read-only actionBundle does not submit Kernel actionBatch');
-  assertEqual(reviewFactsRequests, 1, 'read-only actionBundle reaches final review facts collection');
-  assertEqual(
-    result.events.some((event) => event.kind === 'requirement_confirmation'),
-    false,
-    'read-only actionBundle does not ask for permission intervention'
-  );
-  assertEqual(
-    result.events.some((event) =>
-      event.kind === 'workflow_stage' &&
-      (event.payload as any)?.stage === 'accepted_plan.batch_checkpoint' &&
-      (event.payload as any)?.source === 'resourceValidation' &&
-      (event.payload as any)?.validatedTaskId === `task-${token}-read`
-    ),
-    true,
-    'read-only actionBundle writes an accepted-plan resource validation checkpoint'
-  );
-  assertEqual(
-    result.events.some((event) =>
-      event.kind === 'session_run_state' &&
-      (event.payload as any)?.phase === 'waiting_review'
-    ),
-    true,
-    'read-only actionBundle leaves the run waiting for review'
   );
 }
 
@@ -15772,28 +15529,21 @@ async function assertSessionDriverLoopAcceptedTaskPlanProjectsWorkUnitFailureRea
         return {
           ok: true,
           events: [
-            {
-              kind: 'work_unit.queued',
+            kernelTestWorkUnitQueued({
               runId: 'run-generic',
-              sessionId: session.id,
-              workUnit: { id: 'work-unit-generic', actionId: 'write-generic-output', status: 'queued', writeSet: ['generic-output.txt'] },
-            },
-            {
-              kind: 'work_unit.started',
-              runId: 'run-generic',
-              sessionId: session.id,
-              workUnit: { id: 'work-unit-generic', actionId: 'write-generic-output', status: 'running', writeSet: ['generic-output.txt'] },
-            },
-            {
-              kind: 'work_unit.failed',
-              runId: 'run-generic',
-              sessionId: session.id,
               workUnitId: 'work-unit-generic',
               actionId: 'write-generic-output',
+              toolId: 'fs.write',
               writeSet: ['generic-output.txt'],
-              error: { code: 'invalid_path', message: 'fs.write target is outside workspace binding' },
-            },
-            { kind: 'batch.review_ready', runId: 'run-generic', sessionId: session.id },
+            }),
+            kernelTestWorkUnitStarted('run-generic', 'work-unit-generic'),
+            kernelTestWorkUnitFailed(
+              'run-generic',
+              'work-unit-generic',
+              'invalid_path',
+              'fs.write target is outside workspace binding',
+            ),
+            kernelTestBatchReviewReady('run-generic'),
           ],
         };
       }
@@ -15890,15 +15640,8 @@ async function assertSessionDriverLoopAcceptedImplementationRejectsOutOfScopeBat
           ok: true,
           events: [
             { kind: 'action_batch.accepted', runId: command.runId, sessionId: session.id, batch: { planId: command.batch?.planId } },
-            {
-              kind: 'work_unit.completed',
-              runId: command.runId,
-              sessionId: session.id,
-              workUnitId: 'work-unit-generic',
-              actionId: 'write-generic-output',
-              output: { path: 'generic-output.txt' },
-            },
-            { kind: 'batch.review_ready', runId: command.runId, sessionId: session.id },
+            kernelTestWorkUnitCompleted(command.runId, 'work-unit-generic', { path: 'generic-output.txt' }),
+            kernelTestBatchReviewReady(command.runId),
           ],
         };
       }
@@ -16104,15 +15847,8 @@ async function assertSessionDriverLoopAcceptedScopeAcceptUsesDefaultOptionEffect
           ok: true,
           events: [
             { kind: 'action_batch.accepted', runId: command.runId, sessionId, batch: { planId: command.batch?.planId } },
-            {
-              kind: 'work_unit.completed',
-              runId: command.runId,
-              sessionId,
-              workUnitId: `work-unit-${token}`,
-              actionId: 'write-generic-output',
-              output: { path: expandedTarget },
-            },
-            { kind: 'batch.review_ready', runId: command.runId, sessionId },
+            kernelTestWorkUnitCompleted(command.runId, `work-unit-${token}`, { path: expandedTarget }),
+            kernelTestBatchReviewReady(command.runId),
           ],
         };
       }
@@ -16293,10 +16029,10 @@ async function assertSessionDriverLoopAcceptedPlanPatchRequestsSearchEvidence():
           ok: true,
           events: [{
             kind: 'resource.packet_produced',
-            packet: {
-              id: `packet-generic-${resourceSearchRequests}`,
-              requestId: command.requestId,
-              items: [{
+            packet: kernelTestResourcePacket(
+              `packet-generic-${resourceSearchRequests}`,
+              command.requestId,
+              [{
                 requestItemId: 'search-item',
                 manifestEntryId: entry.id ?? 'search-entry',
                 status: 'resolved',
@@ -16317,7 +16053,7 @@ async function assertSessionDriverLoopAcceptedPlanPatchRequestsSearchEvidence():
                 nodes: entry.kind === 'search' ? undefined : [{ type: 'file', path: 'generic-patch.txt' }],
                 evidenceRefs: ['evidence-generic-patch'],
               }],
-            },
+            ),
           }],
         };
       }
@@ -16343,12 +16079,13 @@ async function assertSessionDriverLoopAcceptedPlanPatchRequestsSearchEvidence():
           ok: true,
           events: [
             { kind: 'action_batch.accepted', runId: 'run-generic', sessionId: session.id, batch: { planId: command.batch?.planId } },
-            {
-              kind: 'work_unit.queued',
+            kernelTestWorkUnitQueued({
               runId: 'run-generic',
-              sessionId: session.id,
-              workUnit: { id: 'work-unit-generic-patch', actionId: 'patch-generic-output', status: 'queued', writeSet: ['generic-patch.txt'] },
-            },
+              workUnitId: 'work-unit-generic-patch',
+              actionId: 'patch-generic-output',
+              toolId: 'fs.edit',
+              writeSet: ['generic-patch.txt'],
+            }),
             {
               kind: 'work_unit.completed',
               runId: 'run-generic',
@@ -16356,7 +16093,7 @@ async function assertSessionDriverLoopAcceptedPlanPatchRequestsSearchEvidence():
               workUnitId: 'work-unit-generic-patch',
               output: { path: 'generic-patch.txt' },
             },
-            { kind: 'batch.review_ready', runId: 'run-generic', sessionId: session.id },
+            kernelTestBatchReviewReady('run-generic'),
           ],
         };
       }
@@ -16469,7 +16206,7 @@ async function assertSessionDriverLoopReviewAcceptAutoGeneratesNextPlan(): Promi
       return { session: { ...session, eventCount: events.length }, events: [...events] };
     },
     kernelCommand: async (request): Promise<KernelReply> => {
-      if ((request.command as Record<string, unknown>).kind === 'runCreate') runCreates += 1;
+      if (request.command.kind === 'runCreate') runCreates += 1;
       return planKernel(request, 'session-review-accept', submittedPlans);
     },
     llmChat: async (request): Promise<ApiResponse<LlmChatResult>> => {
@@ -16827,7 +16564,7 @@ async function assertSessionDriverLoopReviewRejectCancelsRun(): Promise<void> {
     createdAt: '2026-01-01T00:00:00.000Z',
     updatedAt: '2026-01-01T00:00:00.000Z',
   };
-  let userDecisionSubmits = 0;
+  let reviewGateEvaluations = 0;
   let llmCalls = 0;
   const loop = new SessionDriverLoop({
     appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
@@ -16836,12 +16573,17 @@ async function assertSessionDriverLoopReviewRejectCancelsRun(): Promise<void> {
     },
     kernelCommand: async (request): Promise<KernelReply> => {
       const command = request.command as Record<string, any>;
-      if (command.kind === 'userDecisionSubmit') {
-        userDecisionSubmits += 1;
-        assertEqual(command.decision?.payload?.decision, 'reject', 'review ignore sends a reject user decision to Kernel audit');
-        assertEqual(command.decision?.payload?.continuationRequested, false, 'review reject does not request continuation');
-        assertEqual(command.decision?.payload?.revisionRequested, false, 'review reject does not request revision');
-        return { ok: true, events: [] };
+      if (command.kind === 'reviewGateEvaluate') {
+        reviewGateEvaluations += 1;
+        assertEqual(command.decision?.decision, 'reject', 'review reject submits a typed reject decision to Kernel ReviewGate');
+        return {
+          ok: true,
+          events: [{
+            kind: 'review_gate.evaluated',
+            runId: command.runId,
+            result: { status: 'aborted' },
+          }],
+        };
       }
       return fakeKernel(request);
     },
@@ -16850,7 +16592,7 @@ async function assertSessionDriverLoopReviewRejectCancelsRun(): Promise<void> {
       return jsonLlmResponse(genericWriteProposal(false));
     },
     now: () => '2026-01-01T00:00:00.000Z',
-    createId: (prefix) => `${prefix}-${events.length + userDecisionSubmits + llmCalls + 1}`,
+    createId: (prefix) => `${prefix}-${events.length + reviewGateEvaluations + llmCalls + 1}`,
   });
 
   const result = await loop.resolveDecision({
@@ -16863,11 +16605,27 @@ async function assertSessionDriverLoopReviewRejectCancelsRun(): Promise<void> {
 
   assertEqual(result.events.some((event) => event.kind === 'review_summary' && (event.payload as any)?.status === 'rejected'), true, 'review reject records a rejected review decision');
   assertCancelledRunState(result.events, 'review', 'run-review-reject', 'review-generic-reject');
-  assertEqual(userDecisionSubmits, 1, 'review reject records exactly one Kernel user decision');
+  assertEqual(reviewGateEvaluations, 1, 'review reject records exactly one Kernel ReviewGate decision');
   assertEqual(llmCalls, 0, 'review reject does not call the provider for revision or continuation');
 }
 
-async function assertSessionDriverLoopPermissionRejectCancelsRun(): Promise<void> {
+async function assertSessionDriverLoopPermissionRejectUsesKernelFacts(): Promise<void> {
+  const planEvent = {
+    id: 'plan-permission-reject',
+    sessionId: 'session-permission-reject',
+    ts: '2026-01-01T00:00:00.000Z',
+    kind: 'plan_card',
+    payload: {
+      runId: 'run-permission-reject',
+      planId: 'plan-permission-reject',
+      proposalId: 'proposal-permission-reject',
+      content: 'Review the Kernel-authorized operation.',
+      actionBundle: { id: 'bundle-permission-reject', actions: [] },
+      contentBlocks: [],
+      commandBlocks: [],
+      authorizationContract: { id: 'contract-permission-reject' },
+    },
+  } as unknown as AgentEvent;
   const events: AgentEvent[] = [
     ...turnAuthorityFixture(
       'session-permission-reject',
@@ -16875,6 +16633,7 @@ async function assertSessionDriverLoopPermissionRejectCancelsRun(): Promise<void
       'Execute a generic gated operation.',
       'permission-reject'
     ),
+    planEvent,
     {
     id: 'permission-request-generic',
     sessionId: 'session-permission-reject',
@@ -16909,16 +16668,37 @@ async function assertSessionDriverLoopPermissionRejectCancelsRun(): Promise<void
         assertEqual(command.decision, 'reject', 'permission ignore sends a reject decision to Kernel');
         return {
           ok: true,
+          events: [
+            {
+              kind: 'permission.resolved',
+              permissionId: 'permission-generic-reject',
+              runId: 'run-permission-reject',
+              sessionId: session.id,
+              decision: 'reject',
+            },
+            {
+              kind: 'work_unit.blocked',
+              runId: 'run-permission-reject',
+              sessionId: session.id,
+              workUnitId: 'work-unit-permission-reject',
+              reason: 'permission rejected by user',
+            },
+            kernelTestBatchReviewReady('run-permission-reject', 'contract-permission-reject'),
+          ],
+        };
+      }
+      if (command.kind === 'reviewFactsGet') {
+        reviewFactsRequests += 1;
+        return {
+          ok: true,
           events: [{
-            kind: 'permission.resolved',
-            permissionId: 'permission-generic-reject',
+            kind: 'review.facts_produced',
             runId: 'run-permission-reject',
             sessionId: session.id,
-            decision: 'reject',
+            facts: kernelTestReviewFacts('run-permission-reject'),
           }],
         };
       }
-      if (command.kind === 'reviewFactsGet') reviewFactsRequests += 1;
       return fakeKernel(request);
     },
     llmChat: async (): Promise<ApiResponse<LlmChatResult>> => jsonLlmResponse(genericWriteProposal(false)),
@@ -16935,9 +16715,18 @@ async function assertSessionDriverLoopPermissionRejectCancelsRun(): Promise<void
     existingEvents: events,
   });
 
-  assertCancelledRunState(result.events, 'permission', 'run-permission-reject', 'permission-generic-reject');
+  assertEqual(
+    result.events.some((event) => event.kind === 'session_run_state' && (event.payload as any)?.status === 'cancelled'),
+    false,
+    'Session does not infer cancellation from a rejected Kernel permission'
+  );
+  assertEqual(
+    result.events.some((event) => event.kind === 'review_summary' && (event.payload as any)?.status === 'waitingUserReview'),
+    true,
+    'Kernel blocked facts continue into Review'
+  );
   assertEqual(permissionResolves, 1, 'permission reject resolves exactly one Kernel permission request');
-  assertEqual(reviewFactsRequests, 0, 'permission reject does not continue into review facts');
+  assertEqual(reviewFactsRequests, 1, 'permission reject requests Kernel ReviewFacts after review readiness');
 }
 
 async function assertSessionDriverLoopStaleRequirementDecisionNoopsAfterReviewAccept(): Promise<void> {

@@ -1,7 +1,6 @@
 export * from './acceptedTaskPlanContextBuilder.js';
 export * from './acceptedActionBundlePlanExecutor.js';
 export * from './acceptedPlanActionProposalSubmitter.js';
-export * from './acceptedPlanReadOnlyTaskExecutor.js';
 export * from './acceptedPlanBatchPreflight.js';
 export * from './acceptedPlanTargetParser.js';
 export * from './acceptedTaskOutcomeCoordinator.js';

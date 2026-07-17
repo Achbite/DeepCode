@@ -436,7 +436,7 @@ function readableTaskPlan(
       targets,
       acceptance: stringArrayValue(record.acceptanceCriteria),
       failure: stringArrayValue(record.failureCriteria),
-      intentKind: stringValue(record.capability),
+      intentKind: stringValue(record.toolId),
       metadata: sanitizePlanTaskProjectionMetadata(record),
     }];
   });

@@ -219,7 +219,7 @@ export class RunLifecyclePipeline<State extends RunLifecycleState> {
       if (pendingInteraction && !previousAuthority) {
         throw this.ports.createError(
           'session_turn_authority_unavailable',
-          'The pending interaction belongs to a legacy in-progress session without a persisted turn authority binding.'
+          'The pending interaction belongs to an incompatible in-progress session without a persisted turn authority binding.'
         );
       }
       const relation = pendingInteraction ? 'interactionContinuation' : 'newTask';
@@ -293,10 +293,7 @@ export class RunLifecyclePipeline<State extends RunLifecycleState> {
       userAuthorityFrame = buildUserAuthorityFrame(authorityEvents, {
         messageId: this.ports.createId('user-authority-fallback'),
         content: input.content,
-      }, visibleLanguageForRequest, input.autonomyMode ?? 'strict', {
-        runId,
-        requirePersistedAuthority: true,
-      });
+      }, visibleLanguageForRequest, input.autonomyMode ?? 'strict', { runId });
     } catch (error) {
       if (error instanceof UserAuthorityFrameError) {
         throw this.ports.createError(error.code, error.message);

@@ -1,4 +1,4 @@
-import type { AgentEvent } from '@deepcode/protocol';
+import { decodeKernelEventV1, type AgentEvent } from '@deepcode/protocol';
 import type {
   ReadableProjectionItem,
   ReadableProjectionSection,
@@ -98,6 +98,7 @@ export class ReviewProjectionBuilder<
     id: string;
   }): AgentEvent {
     const ports = this.requirePorts();
+    const decodedKernelEvents = input.kernelEvents.map((event) => decodeKernelEventV1(event));
     const facts = [
       ...ports.reviewFactLines(input.kernelEvents),
       ...ports.staticSyntaxReviewFactLines(input.kernelEvents),
@@ -109,19 +110,19 @@ export class ReviewProjectionBuilder<
     const gitReview = gitReviewForProjection(rawGitReview, executionRoot);
     const completed = Math.max(
       reviewFacts ? arrayLength(reviewFacts.completedWorkUnits) : 0,
-      input.kernelEvents.filter((event) => objectRecord(event)?.kind === 'work_unit.completed').length
+      decodedKernelEvents.filter((event) => event.kind === 'work_unit.completed').length
     );
     const failed = Math.max(
       reviewFacts ? arrayLength(reviewFacts.failedWorkUnits) : 0,
-      input.kernelEvents.filter((event) => objectRecord(event)?.kind === 'work_unit.failed').length
+      decodedKernelEvents.filter((event) => event.kind === 'work_unit.failed').length
     );
     const blocked = Math.max(
       reviewFacts ? arrayLength(reviewFacts.blockedWorkUnits) : 0,
-      input.kernelEvents.filter((event) => objectRecord(event)?.kind === 'work_unit.blocked').length
+      decodedKernelEvents.filter((event) => event.kind === 'work_unit.blocked').length
     );
     const toolResults = Math.max(
       reviewFacts ? arrayLength(reviewFacts.toolResults) : 0,
-      input.kernelEvents.filter((event) => objectRecord(event)?.kind === 'tool.completed').length
+      decodedKernelEvents.filter((event) => event.kind === 'tool.completed').length
     );
     const continuations = ports.concreteContinuationExpectations(input.plan.actionBundle.continuationExpectations);
     const summaryKey = failed || blocked ? 'review.summary.needsAttention' : 'review.summary.waitingUserReview';
@@ -131,7 +132,7 @@ export class ReviewProjectionBuilder<
       workUnitsBlocked: blocked,
       toolResults,
     };
-    const readableReviewBase = this.readableSummary(input.kernelEvents, reviewFacts);
+    const readableReviewBase = this.readableSummary(decodedKernelEvents, reviewFacts);
     const acceptedPlanForReview = input.plan.taskPlan
       ? ports.acceptedPlanContext(input.plan)
       : undefined;
@@ -350,13 +351,12 @@ export class ReviewProjectionBuilder<
     for (const item of toolResults) addReviewToolFile(changedFiles, auditRefs, item);
 
     for (const event of kernelEvents) {
-      const record = objectRecord(event);
-      if (!record) continue;
-      const kind = stringValue(record.kind);
-      if (kind === 'work_unit.completed') addReviewWorkUnitFile(changedFiles, auditRefs, record, 'completed');
-      if (kind === 'work_unit.failed') addReviewWorkUnitFile(changedFiles, auditRefs, record, 'failed');
-      if (kind === 'work_unit.blocked') addReviewWorkUnitFile(changedFiles, auditRefs, record, 'blocked');
-      if (kind === 'tool.completed') addReviewToolFile(changedFiles, auditRefs, record);
+      const decoded = decodeKernelEventV1(event);
+      const record = decoded as unknown as Record<string, unknown>;
+      if (decoded.kind === 'work_unit.completed') addReviewWorkUnitFile(changedFiles, auditRefs, record, 'completed');
+      if (decoded.kind === 'work_unit.failed') addReviewWorkUnitFile(changedFiles, auditRefs, record, 'failed');
+      if (decoded.kind === 'work_unit.blocked') addReviewWorkUnitFile(changedFiles, auditRefs, record, 'blocked');
+      if (decoded.kind === 'tool.completed') addReviewToolFile(changedFiles, auditRefs, decoded.fact);
     }
 
     const files = [...changedFiles.values()];
@@ -488,9 +488,9 @@ function addReviewToolFile(
   const output = objectRecord(record.output);
   const path = reviewDisplayPath(output) ?? reviewDisplayPath(record);
   if (!path) return;
-  const toolName = stringValue(record.toolName) ?? stringValue(output?.toolName);
+  const toolName = stringValue(record.toolId);
   const actionId = stringValue(output?.actionId) ?? stringValue(record.actionId);
-  const toolFactId = stringValue(record.toolCallId) ?? stringValue(record.factId);
+  const toolFactId = stringValue(record.toolCallId);
   const operation = reviewOperation(output ?? record, toolName);
   const status = record.ok === false ? 'failed' : 'completed';
   const key = `${path}:${operation}:${toolFactId ?? actionId ?? status}`;
@@ -552,7 +552,7 @@ function reviewFailureDetail(
 function reviewOperation(record?: Record<string, unknown> | null, toolName?: string): string {
   if (!record) return operationFromToolName(toolName);
   return stringValue(record.operation)
-    ?? operationFromToolName(stringValue(record.toolName) ?? toolName)
+    ?? operationFromToolName(stringValue(record.toolId) ?? toolName)
     ?? stringValue(record.kind)
     ?? 'modify';
 }
@@ -660,7 +660,7 @@ function reviewExpectationItems(plan: ReviewProjectionPlan): ReadableProjectionI
   const expectations = Array.isArray(plan.actionBundle.reviewExpectations) ? plan.actionBundle.reviewExpectations : [];
   for (const [index, item] of expectations.entries()) {
     const record = objectRecord(item);
-    const text = stringValue(record?.description) ?? stringValue(record?.summary) ?? stringValue(record?.command);
+    const text = stringValue(record?.description) ?? stringValue(record?.summary);
     if (text?.trim()) items.push(projectionItem(`review-expectation-${index + 1}`, 'fact', { text: text.trim(), metadata: record }));
   }
   return items;

@@ -16,7 +16,10 @@ import {
   type AcceptedTaskPlanContext,
 } from '../accepted-plan/index.js';
 import { ContextFrameBuilder } from '../driver/context/contextFrameBuilder.js';
-import { buildUserAuthorityFrame } from '../driver/context/userAuthorityFrame.js';
+import {
+  buildUserAuthorityFrame,
+  createSessionTurnAuthorityEvent,
+} from '../driver/context/userAuthorityFrame.js';
 import { renderProviderTurnUserPrompt } from '../driver/context/providerTurnPromptRenderer.js';
 import { emptyPromptLedgerState } from '../prompt/promptLedger.js';
 import {
@@ -118,6 +121,7 @@ export function assertProviderTurnContractFrameOrder(): void {
 export function assertTaskDependencyFactsRequireTerminalKernelEvidence(): void {
   const token = randomSmokeToken('dependency-fact');
   const taskId = `task-${token}`;
+  const runId = `run-${token}`;
   const workUnitId = `work-${token}`;
   const path = `artifact-${token}`;
   const facts = taskDependencyFactsFromKernelEvents(taskId, [
@@ -125,6 +129,7 @@ export function assertTaskDependencyFactsRequireTerminalKernelEvidence(): void {
       payload: {
         kernelEvent: {
           kind: 'work_unit.completed',
+          runId,
           workUnitId,
         },
       },
@@ -133,28 +138,38 @@ export function assertTaskDependencyFactsRequireTerminalKernelEvidence(): void {
       payload: {
         kernelEvent: {
           kind: 'tool.completed',
-          ok: true,
-          toolCallId: `call-${token}`,
-          toolName: 'fs.create',
-          output: {
-            path,
-            contentHash: `hash-${token}`,
-            sizeBytes: 17,
-            mode: 0o755,
-            executable: true,
-            kernelContext: { workUnitId },
+          runId,
+          fact: {
+            ok: true,
+            toolCallId: `call-${token}`,
+            toolId: 'fs.create',
+            operationKind: 'fsCreate',
+            output: {
+              path,
+              contentHash: `hash-${token}`,
+              sizeBytes: 17,
+              mode: 0o755,
+              executable: true,
+              kernelContext: { workUnitId },
+            },
+            error: null,
           },
         },
       },
     },
     {
       kind: 'tool.completed',
-      ok: true,
-      toolCallId: `unpaired-${token}`,
-      toolName: 'fs.create',
-      output: {
-        path: `unpaired-${token}`,
-        kernelContext: { workUnitId: `missing-${token}` },
+      runId,
+      fact: {
+        ok: true,
+        toolCallId: `unpaired-${token}`,
+        toolId: 'fs.create',
+        operationKind: 'fsCreate',
+        output: {
+          path: `unpaired-${token}`,
+          kernelContext: { workUnitId: `missing-${token}` },
+        },
+        error: null,
       },
     },
   ]);
@@ -174,6 +189,21 @@ export function assertTaskDependencyFactsRequireTerminalKernelEvidence(): void {
     0,
     'unrelated tasks do not inherit dependency facts'
   );
+
+  let legacyRejected = false;
+  try {
+    taskDependencyFactsFromKernelEvents(taskId, [{
+      kind: 'tool.completed',
+      runId,
+      ok: true,
+      toolCallId: `legacy-${token}`,
+      toolName: 'fs.create',
+      output: { path },
+    }]);
+  } catch (error) {
+    legacyRejected = String(error).includes('kernel_abi_event_invalid');
+  }
+  assertEqual(legacyRejected, true, 'legacy flat tool.completed is rejected by the ABI v1 fact bridge');
 }
 
 export function assertDecisionContinuationInputKeepsDecisionResumeInSameLoop(): void {
@@ -1254,7 +1284,7 @@ export async function assertProviderTurnContextCoordinatorPassesTaskLocalCompact
         operationId: `read-operation-${token}`,
         sourceTaskId: `next-task-${token}`,
         toolId: 'fs.read',
-        operationKind: 'read',
+        operationKind: 'fsRead',
         contentMode: 'none',
         targets: [`generated/next-${token}.txt`],
         dependsOn: [],
@@ -1459,7 +1489,7 @@ export async function assertProviderTurnContextCoordinatorScopesAcceptedExecutio
         executionMode: 'blocked',
         needsWorkspace: false,
         readOnly: false,
-        operationKind: 'exec',
+        operationKind: 'processExec',
         providerSchema: {
           type: 'object',
           properties: { argv: { type: 'array', items: { type: 'string' } } },
@@ -1533,7 +1563,7 @@ export async function assertProviderTurnContextCoordinatorScopesAcceptedExecutio
         operationId: `plan-op-task-${token}-1`,
         sourceTaskId: `task-${token}`,
         toolId: 'fs.write',
-        operationKind: 'write',
+        operationKind: 'fsWrite',
         contentMode: 'contentBlock',
         targets: [`target-${token}.txt`],
         dependsOn: [],
@@ -1682,7 +1712,7 @@ export async function assertProviderTurnContextCoordinatorRejectsMissingDependen
           operationId: `plan-op-${currentTaskId}-1`,
           sourceTaskId: currentTaskId,
           toolId: 'fs.write',
-          operationKind: 'write',
+          operationKind: 'fsWrite',
           contentMode: 'contentBlock',
           targets: [`current-${token}.txt`],
           dependsOn: [],
@@ -1791,7 +1821,7 @@ export async function assertProviderTurnContextCoordinatorScopesCurrentTaskInten
           operationId: `plan-op-task-current-${token}-1`,
           sourceTaskId: `task-current-${token}`,
           toolId: 'fs.write',
-          operationKind: 'write',
+          operationKind: 'fsWrite',
           contentMode: 'contentBlock',
           targets: [currentTarget],
           dependsOn: [],
@@ -1805,7 +1835,7 @@ export async function assertProviderTurnContextCoordinatorScopesCurrentTaskInten
           operationId: `plan-op-task-future-${token}-1`,
           sourceTaskId: `task-future-${token}`,
           toolId: 'fs.write',
-          operationKind: 'write',
+          operationKind: 'fsWrite',
           contentMode: 'contentBlock',
           targets: [futureTarget],
           dependsOn: [],
@@ -1973,18 +2003,32 @@ export async function assertHookObserverProducesTraceOnly(): Promise<void> {
 }
 
 function providerAuthorityState(token: string, content: string) {
+  const sessionId = `session-${token}`;
+  const runId = `run-${token}`;
+  const messageId = `user-${token}`;
   return {
     userAuthorityFrame: buildUserAuthorityFrame([{
-      id: `user-${token}`,
-      sessionId: `session-${token}`,
+      id: messageId,
+      sessionId,
       ts: '2026-01-01T00:00:00.000Z',
       kind: 'user_msg',
       payload: { content },
-    }], {
+    }, createSessionTurnAuthorityEvent({
+      sessionId,
+      runId,
+      turnId: `turn-${token}`,
+      taskId: `task-${token}`,
+      messages: [{ messageId, content }],
+      relation: 'newTask',
+      boundAtHookRef: 'smoke.provider-context',
+      outputLanguage: 'en-US',
+      eventId: `authority-${token}`,
+      timestamp: '2026-01-01T00:00:00.001Z',
+    })], {
       messageId: `fallback-${token}`,
       content,
       timestamp: '2026-01-01T00:00:00.000Z',
-    }, () => 'en-US'),
+    }, () => 'en-US', 'strict', { runId }),
     promptLedger: emptyPromptLedgerState(),
   };
 }

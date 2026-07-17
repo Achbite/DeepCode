@@ -1,9 +1,10 @@
-import type { AgentEvent } from '@deepcode/protocol';
+import { decodeKernelEventV1, type AgentEvent } from '@deepcode/protocol';
 
 export interface PendingPermissionContext {
   id: string;
   runId?: string;
-  planId?: string;
+  contractId?: string;
+  requestKind?: 'runtimePermission' | 'scopeExpansion';
 }
 
 export class PermissionPipeline {
@@ -32,10 +33,11 @@ export class PermissionPipeline {
       return id ? { id, runId: stringValue(payload?.runId) } : null;
     }
     const payload = objectRecord(event.payload);
-    const kernelEvent = objectRecord(payload?.kernelEvent);
-    if (kernelEvent?.kind === 'permission.resolved') {
-      const id = stringValue(kernelEvent.permissionId);
-      return id ? { id, runId: stringValue(kernelEvent.runId) } : null;
+    if (payload?.kernelEvent) {
+      const kernelEvent = decodeKernelEventV1(event);
+      if (kernelEvent.kind === 'permission.resolved') {
+        return { id: kernelEvent.permissionId, runId: kernelEvent.runId };
+      }
     }
     return null;
   }
@@ -47,20 +49,25 @@ export class PermissionPipeline {
       return id ? {
         id,
         runId: stringValue(payload?.runId),
-        planId: stringValue(payload?.planId),
+        contractId: stringValue(payload?.contractId),
+        requestKind: permissionRequestKind(payload?.requestKind),
       } : null;
     }
     const payload = objectRecord(event.payload);
-    const kernelEvent = objectRecord(payload?.kernelEvent);
-    if (kernelEvent?.kind !== 'permission.requested') return null;
-    const request = objectRecord(kernelEvent.request);
-    const id = stringValue(request?.id) ?? stringValue(kernelEvent.permissionId) ?? stringValue(kernelEvent.toolCallId);
-    return id ? {
-      id,
-      runId: stringValue(kernelEvent.runId),
-      planId: stringValue(kernelEvent.planId),
-    } : null;
+    if (!payload?.kernelEvent) return null;
+    const kernelEvent = decodeKernelEventV1(event);
+    if (kernelEvent.kind !== 'permission.requested') return null;
+    return {
+      id: kernelEvent.request.id,
+      runId: kernelEvent.runId,
+      contractId: kernelEvent.request.contractId,
+      requestKind: kernelEvent.request.requestKind,
+    };
   }
+}
+
+function permissionRequestKind(value: unknown): PendingPermissionContext['requestKind'] {
+  return value === 'runtimePermission' || value === 'scopeExpansion' ? value : undefined;
 }
 
 function objectRecord(value: unknown): Record<string, unknown> | undefined {

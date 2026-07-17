@@ -6,7 +6,6 @@ import {
   AcceptedActionBundlePlanExecutor,
   AcceptedPlanActionProposalSubmitter,
   AcceptedPlanExecutionRootResolver,
-  AcceptedPlanReadOnlyTaskExecutor,
   AcceptedTaskOutcomeCoordinator,
   AcceptedTaskOutcomeError,
   ReviewFactsAggregator,
@@ -150,7 +149,6 @@ export class SessionDriverLoop {
   private readonly agentRunReactor: AgentRunReactor<SessionDriverLoopRunState>;
   private readonly acceptedActionBundlePlanExecutor: AcceptedActionBundlePlanExecutor;
   private readonly acceptedPlanActionProposalSubmitter: AcceptedPlanActionProposalSubmitter<SessionDriverLoopInput, SessionDriverLoopRunState>;
-  private readonly acceptedPlanReadOnlyTaskExecutor: AcceptedPlanReadOnlyTaskExecutor<SessionDriverLoopInput, SessionDriverLoopRunState>;
   private readonly acceptedPlanReviewHandoffCoordinator: AcceptedPlanReviewHandoffCoordinator<SessionPlanContext>;
   private readonly acceptedPlanStaticSyntaxReviewCoordinator: AcceptedPlanStaticSyntaxReviewCoordinator<SessionDriverLoopRunState>;
   private readonly decisionResolver: DecisionResolver;
@@ -229,66 +227,6 @@ export class SessionDriverLoop {
       acceptedPlanComplete: (accepted) => acceptedPlanTaskLedger().complete(accepted),
       executionRequest: (plan, acceptedPlan) => executionPromptCoordinator().executionRequest(plan, acceptedPlan),
     });
-    this.acceptedPlanReadOnlyTaskExecutor = new AcceptedPlanReadOnlyTaskExecutor<SessionDriverLoopInput, SessionDriverLoopRunState>({
-      now: () => this.agentRunReactor.ts(),
-      createId: (prefix) => this.agentRunReactor.id(prefix),
-      append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
-      readActionBundle: (proposal) => driverActivityBuilder.readActionBundle(proposal),
-      refreshRuntimeState: (state) => acceptedPlanTaskLedger().refreshRuntimeState(state),
-      readOnlyResourceCompletion: (accepted, cursor, current, packet) =>
-        acceptedPlanExecutor.readOnlyResourceCompletion(
-          accepted,
-          cursor as TaskExecutionCursor | undefined,
-          current as CurrentTaskContext | undefined,
-          packet
-        ),
-      recordTaskCompletion: (completionInput) => acceptedPlanTaskLedger().recordTaskCompletion(completionInput),
-      complete: (accepted) => acceptedPlanTaskLedger().complete(accepted),
-      resourceValidationCheckpointEvent: (sessionId, runId, accepted, packet, completion, ts, id, contextCompactRecord) =>
-        sessionProgressProjectionBuilder.acceptedPlanResourceValidationCheckpointEvent(
-          sessionId,
-          runId,
-          accepted,
-          packet,
-          completion,
-          ts,
-          id,
-          contextCompactRecord
-        ),
-      executionRequest: (plan, acceptedPlan) =>
-        executionPromptCoordinator().executionRequest(
-          plan as unknown as Parameters<ReturnType<typeof executionPromptCoordinator>['executionRequest']>[0],
-          acceptedPlan
-        ),
-      readOnlyReviewContext: (reviewInput) => acceptedPlanExecutor.readOnlyReviewContext(reviewInput),
-      currentTaskIsReadOnlyResourceValidation: (accepted, cursor, current) =>
-        acceptedPlanExecutor.currentTaskIsReadOnlyResourceValidation(
-          accepted,
-          cursor as TaskExecutionCursor | undefined,
-          current as CurrentTaskContext | undefined
-        ),
-      resourceRequestFromReadOnlyActionBundle: (actionBundle, current, requestId) =>
-        acceptedPlanExecutor.resourceRequestFromReadOnlyActionBundle(
-          actionBundle as Parameters<typeof acceptedPlanExecutor.resourceRequestFromReadOnlyActionBundle>[0],
-          current as CurrentTaskContext | undefined,
-          requestId
-        ),
-      resolveResourceRequest: (manifest, request, roots) =>
-        resourceRequestResolver().resolve(manifest, request, roots),
-      resolveAndRecord: (state, manifest) => this.resourceOrchestrator.resolveAndRecord(state, manifest),
-      packetEvent: (state, packet, stage) => this.resourceOrchestrator.packetEvent(state, packet, stage),
-      resourceResumeEvent: (sessionId, runId, accepted, cursor, current, packet, ts, id) =>
-        sessionProgressProjectionBuilder.acceptedPlanResourceResumeEvent(
-          sessionId,
-          runId,
-          accepted,
-          cursor as TaskExecutionCursor | undefined,
-          current as CurrentTaskContext | undefined,
-          packet,
-          ts,
-          id
-        ),
-    });
     this.acceptedPlanActionProposalSubmitter = new AcceptedPlanActionProposalSubmitter<SessionDriverLoopInput, SessionDriverLoopRunState>({
       now: () => this.agentRunReactor.ts(),
       createId: (prefix) => this.agentRunReactor.id(prefix),
@@ -299,8 +237,6 @@ export class SessionDriverLoop {
       emitProjectionDelta: (state, delta) => this.agentRunReactor.emitProjectionDelta(state, delta),
       emitKernelActivityDeltas: (state, events, stage) => this.agentRunReactor.emitKernelActivityDeltas(state, events, stage),
       readActionBundle: (proposal) => driverActivityBuilder.readActionBundle(proposal),
-      tryCompleteReadOnlyActionBundle: (handlerInput, state, prompt, proposal, fallback) =>
-        this.acceptedPlanReadOnlyTaskExecutor.tryCompleteActionBundle(handlerInput, state, prompt, proposal, fallback),
       appendDiagnostic: (state, code, fallback, params, idPrefix) => this.agentRunReactor.append(state.sessionId, [
         assistantProjectionBuilder.finalDiagnosticEvent(
           state.sessionId,
@@ -454,7 +390,6 @@ export class SessionDriverLoop {
       now: () => this.agentRunReactor.ts(),
       createId: (prefix) => this.agentRunReactor.id(prefix),
       kernel: (request) => this.agentRunReactor.kernel(request),
-      kernelAudit: (request) => this.ports.kernelCommand(request),
       appendProjectedKernelEvents: (sessionId, reply) => this.agentRunReactor.appendProjectedKernelEvents(sessionId, reply),
       append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
       reviewAssembler: reviewAssembler(),
@@ -709,8 +644,6 @@ export class SessionDriverLoop {
           ts,
           id
         ),
-      tryCompleteResourceTask: (input, state, packet, fallback) =>
-        this.acceptedPlanReadOnlyTaskExecutor.tryCompleteResourceTask(input, state, packet, fallback),
     });
     this.actionProposalSubmitter = new ActionProposalSubmitter<SessionDriverLoopInput, SessionDriverLoopRunState>({
       now: () => this.agentRunReactor.ts(),
@@ -911,7 +844,7 @@ export class SessionDriverLoop {
             },
             visibleLanguageForRequest,
             state.userAuthorityFrame.autonomyMode,
-            { runId: state.runId, requirePersistedAuthority: true }
+            { runId: state.runId }
           );
           state.userRequest = latestExplicitUserContent(state.userAuthorityFrame);
           if (state.promptLedger && state.providerTurnFrame?.promptLedgerEpochId) {

@@ -1,3 +1,5 @@
+import { decodeKernelEventV1 } from '@deepcode/protocol';
+
 export interface CompletedWorkUnitFacts {
   actionIds: Set<string>;
   targets: Set<string>;
@@ -16,13 +18,11 @@ export class CompletedWorkUnitFactIndex {
     const actionIds = new Set<string>();
     const targets = new Set<string>();
     for (const event of events) {
-      const record = objectRecord(event);
-      if (record?.kind !== 'work_unit.completed') continue;
-      const workUnit = objectRecord(record.workUnit);
-      const output = objectRecord(record.output);
+      const decoded = decodeKernelEventV1(event);
+      if (decoded.kind !== 'work_unit.completed') continue;
+      const record = decoded as unknown as Record<string, unknown>;
+      const output = objectRecord(decoded.output);
       for (const value of [
-        stringValue(record.actionId),
-        stringValue(workUnit?.actionId),
         stringValue(output?.actionId),
       ]) {
         if (value) actionIds.add(value);

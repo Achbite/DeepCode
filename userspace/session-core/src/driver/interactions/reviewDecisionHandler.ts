@@ -58,7 +58,6 @@ export interface ReviewDecisionHandlerPorts {
   now(): string;
   createId(prefix: string): string;
   kernel(request: KernelCommandEnvelope): Promise<KernelReply>;
-  kernelAudit(request: KernelCommandEnvelope): Promise<KernelReply>;
   appendProjectedKernelEvents(sessionId: string, reply: KernelReply): Promise<AgentSessionResult>;
   append(sessionId: string, events: AgentEvent[]): Promise<AgentSessionResult>;
   reviewAssembler: ReviewAssembler;
@@ -151,30 +150,17 @@ export class ReviewDecisionHandler {
         id: this.ports.createId('review-rejected'),
       }),
     ]);
-    const decisionReply = await this.ports.kernel({
-      command: {
-        kind: 'userDecisionSubmit',
-        requestId: this.ports.createId('user-decision-review'),
-        runId: review.runId,
-        sessionId: input.sessionId,
-        decision: {
-          decisionId: this.ports.createId('decision-review'),
-          decisionKind: 'review',
-          targetId: review.reviewId,
-          payload: {
-            decision: input.decision,
-            guidance: input.guidance,
-            continuationRequested: false,
-            revisionRequested: false,
-            ignored: true,
-          },
-        },
-      },
-    });
-    result = await this.ports.appendProjectedKernelEvents(input.sessionId, decisionReply);
-    result = await this.ports.append(input.sessionId, [
-      this.reviewRunStateEvent(input.sessionId, review, 'cancelled', 'cancelled', 'session-run-cancelled-review'),
-    ]) ?? result;
+    const gate = await this.appendTerminalReviewGate(
+      input,
+      result,
+      this.reviewGateRequest(input, review, 'reject')
+    );
+    result = gate.result;
+    if (gate.status === 'aborted') {
+      result = await this.ports.append(input.sessionId, [
+        this.reviewRunStateEvent(input.sessionId, review, 'cancelled', 'cancelled', 'session-run-cancelled-review'),
+      ]) ?? result;
+    }
     return { kind: 'reviewRejected', control: returnSessionResult(result) };
   }
 
@@ -193,7 +179,15 @@ export class ReviewDecisionHandler {
         id: this.ports.createId('review-revise'),
       }),
     ]);
-    result = await this.recordRevisionAudit(input, review) ?? result;
+    const gate = await this.appendTerminalReviewGate(
+      input,
+      result,
+      this.reviewGateRequest(input, review, 'revise')
+    );
+    result = gate.result;
+    if (gate.status !== 'needsReplan') {
+      return { kind: 'reviewRevisionRequested', control: returnSessionResult(result) };
+    }
     return {
       kind: 'reviewRevisionRequested',
       control: {
@@ -225,43 +219,12 @@ export class ReviewDecisionHandler {
       id: this.ports.createId('review-accepted'),
     });
     let result = await this.ports.append(input.sessionId, [accepted]);
-    const decisionRequest: KernelCommandEnvelope = {
-      command: {
-        kind: 'userDecisionSubmit',
-        requestId: this.ports.createId('user-decision-review'),
-        runId: review.runId,
-        sessionId: input.sessionId,
-        decision: {
-          decisionId: this.ports.createId('decision-review'),
-          decisionKind: 'review',
-          targetId: review.reviewId,
-          payload: {
-            decision: input.decision,
-            guidance: input.guidance,
-            continuationRequested: false,
-            continuationRecorded: review.continuations.length > 0,
-          },
-        },
-      },
-    };
-    const gateRequest: KernelCommandEnvelope = {
-      command: {
-        kind: 'reviewGateEvaluate',
-        requestId: this.ports.createId('review-gate-evaluate'),
-        runId: review.runId,
-        sessionId: input.sessionId,
-        decision: {
-          decision: input.decision,
-          guidance: input.guidance,
-        },
-      },
-    };
+    const gateRequest = this.reviewGateRequest(input, review, 'accept');
 
     if (closesCurrentReview) {
-      result = await this.appendTerminalReviewKernelAudit(input, result, decisionRequest);
       const gate = await this.appendTerminalReviewGate(input, result, gateRequest);
       result = gate.result;
-      if (gate.status === 'accepted' || gate.status === 'unavailable') {
+      if (gate.status === 'accepted') {
         result = await this.ports.append(input.sessionId, [
           this.reviewRunStateEvent(input.sessionId, review, 'completed', 'completed', 'session-run-completed-review'),
         ]) ?? result;
@@ -269,10 +232,11 @@ export class ReviewDecisionHandler {
       return { kind: 'reviewAccepted', control: returnSessionResult(result) };
     }
 
-    const decisionReply = await this.ports.kernel(decisionRequest);
-    result = await this.ports.appendProjectedKernelEvents(input.sessionId, decisionReply);
-    const gateReply = await this.ports.kernel(gateRequest);
-    result = await this.ports.appendProjectedKernelEvents(input.sessionId, gateReply) ?? result;
+    const gate = await this.appendTerminalReviewGate(input, result, gateRequest);
+    result = gate.result;
+    if (gate.status !== 'accepted') {
+      return { kind: 'reviewAccepted', control: returnSessionResult(result) };
+    }
 
     if (continuationMode === 'ask') {
       result = await this.ports.append(input.sessionId, [
@@ -300,41 +264,48 @@ export class ReviewDecisionHandler {
     };
   }
 
-  private async appendTerminalReviewKernelAudit(
-    input: ReviewDecisionHandlerInput,
-    fallback: AgentSessionResult,
-    request: KernelCommandEnvelope
-  ): Promise<AgentSessionResult> {
-    try {
-      const reply = await this.ports.kernel(request);
-      return await this.ports.appendProjectedKernelEvents(input.sessionId, reply) ?? fallback;
-    } catch {
-      return this.appendTerminalKernelNoop(
-        input,
-        'reviewDecisionAuditUnavailable',
-        'Kernel did not accept the terminal Review decision audit; Session keeps the accepted Review decision.'
-      );
-    }
-  }
-
   private async appendTerminalReviewGate(
     input: ReviewDecisionHandlerInput,
     fallback: AgentSessionResult,
     request: KernelCommandEnvelope
-  ): Promise<{ result: AgentSessionResult; status: 'accepted' | 'rejected' | 'unavailable' }> {
+  ): Promise<{ result: AgentSessionResult; status: 'accepted' | 'needsReplan' | 'aborted' | 'unavailable' }> {
     try {
       const reply = await this.ports.kernel(request);
       const result = await this.ports.appendProjectedKernelEvents(input.sessionId, reply) ?? fallback;
+      if (!reply.ok) {
+        return {
+          result: await this.appendTerminalKernelNoop(
+            input,
+            'reviewGateUnavailable',
+            'Kernel rejected ReviewGate evaluation; Session keeps the run open and does not infer a terminal result.',
+            reply.error?.code
+          ),
+          status: 'unavailable',
+        };
+      }
+      const status = normalizeReviewGateStatus(this.ports.kernelStatus.reviewGateStatus(reply.events));
+      if (status === 'unavailable') {
+        return {
+          result: await this.appendTerminalKernelNoop(
+            input,
+            'reviewGateResultUnavailable',
+            'Kernel returned no typed ReviewGate result; Session keeps the run open and does not infer a terminal result.',
+            'kernel_review_gate_result_unavailable'
+          ),
+          status,
+        };
+      }
       return {
         result,
-        status: this.ports.kernelStatus.reviewGateStatus(reply.events) === 'accepted' ? 'accepted' : 'rejected',
+        status,
       };
-    } catch {
+    } catch (error) {
       return {
         result: await this.appendTerminalKernelNoop(
           input,
           'reviewGateUnavailable',
-          'Kernel did not accept terminal ReviewGate evaluation; Session closes the terminal Review from the user decision.'
+          'Kernel did not accept ReviewGate evaluation; Session keeps the run open and does not infer a terminal result.',
+          structuredErrorCode(error)
         ),
         status: 'unavailable',
       };
@@ -344,7 +315,8 @@ export class ReviewDecisionHandler {
   private appendTerminalKernelNoop(
     input: ReviewDecisionHandlerInput,
     messageKey: string,
-    summary: string
+    summary: string,
+    errorCode?: string
   ): Promise<AgentSessionResult> {
     return this.ports.append(input.sessionId, [
       this.ports.progressProjection.traceEvent({
@@ -358,69 +330,26 @@ export class ReviewDecisionHandler {
           messageArgs: {},
           runId: input.runId,
           decision: input.decision,
+          errorCode,
         },
       }),
     ]);
   }
 
-  private async recordRevisionAudit(
+  private reviewGateRequest(
     input: ReviewDecisionHandlerInput,
-    review: NonNullable<ReturnType<ReviewAssembler['findWaitingReview']>>
-  ): Promise<AgentSessionResult> {
-    const request: KernelCommandEnvelope = {
+    review: NonNullable<ReturnType<ReviewAssembler['findWaitingReview']>>,
+    decision: ReviewDecisionHandlerDecision
+  ): KernelCommandEnvelope {
+    return {
       command: {
-        kind: 'userDecisionSubmit',
-        requestId: this.ports.createId('user-decision-review'),
+        kind: 'reviewGateEvaluate',
+        requestId: this.ports.createId('review-gate-evaluate'),
         runId: review.runId,
         sessionId: input.sessionId,
-        decision: {
-          decisionId: this.ports.createId('decision-review'),
-          decisionKind: 'review',
-          targetId: review.reviewId,
-          payload: {
-            decision: input.decision,
-            guidance: input.guidance,
-            continuationRequested: true,
-            revisionRequested: true,
-          },
-        },
+        decision: { decision, guidance: input.guidance },
       },
     };
-    try {
-      const reply = await this.ports.kernelAudit(request);
-      if (reply.ok) {
-        return this.ports.appendProjectedKernelEvents(input.sessionId, reply);
-      }
-      return this.appendAuditNoop(input, reply.error?.code, reply.error?.message);
-    } catch (error) {
-      return this.appendAuditNoop(
-        input,
-        'kernel_audit_failed',
-        error instanceof Error ? error.message : String(error)
-      );
-    }
-  }
-
-  private appendAuditNoop(
-    input: ReviewDecisionHandlerInput,
-    errorCode?: string,
-    errorMessage?: string
-  ): Promise<AgentSessionResult> {
-    return this.ports.append(input.sessionId, [
-      this.ports.progressProjection.traceEvent({
-        sessionId: input.sessionId,
-        kind: 'trace/review_accept_noop',
-        summary: 'Kernel did not accept the Review revision audit; Session will continue the revision flow from user guidance.',
-        ts: this.ports.now(),
-        id: this.ports.createId('kernel-audit-noop'),
-        extra: {
-          messageKey: 'session.driver.reviewDecision.auditFailed',
-          messageArgs: {},
-          errorCode: errorCode ?? 'kernel_audit_failed',
-          errorMessage: errorMessage ?? 'Kernel audit command failed.',
-        },
-      }),
-    ]);
   }
 
   private reviewRunStateEvent(
@@ -447,4 +376,19 @@ export class ReviewDecisionHandler {
       id: this.ports.createId(idPrefix),
     });
   }
+}
+
+function normalizeReviewGateStatus(
+  value: string | undefined
+): 'accepted' | 'needsReplan' | 'aborted' | 'unavailable' {
+  if (value === 'accepted' || value === 'needsReplan' || value === 'aborted') {
+    return value;
+  }
+  return 'unavailable';
+}
+
+function structuredErrorCode(error: unknown): string | undefined {
+  if (!error || typeof error !== 'object' || !('code' in error)) return undefined;
+  const code = (error as { code?: unknown }).code;
+  return typeof code === 'string' && code.trim() ? code.trim() : undefined;
 }
