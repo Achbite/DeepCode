@@ -3,7 +3,7 @@ import React from 'react';
 /**
  * DiffView：把一段 unified diff 文本渲染为面向人类可读的内联差异视图。
  *
- * 设计取舍（对标 Kun message-timeline-cards 的 DiffView + codex diff_render）：
+ * 设计取舍：
  *   - 仅做"文本 -> 行分类 -> 着色渲染"的纯展示，不解析语义、不调用 Kernel、不裁决。
  *   - 行类型：meta（文件头/index）、hunk（@@ 段）、added（+）、removed（-）、context（普通）。
  *   - 大体量 diff 用 contentVisibility 让浏览器跳过视口外渲染，缓解长输出卡顿。

@@ -34,9 +34,6 @@ function attachmentLabel(attachment: AgentContextAttachment, language: UiLanguag
   if (attachment.kind === 'directory') {
     return `${t(language, 'agent.composer.dir')} ${attachment.path || '.'}`;
   }
-  if (attachment.kind === 'panelSnapshot') {
-    return `${t(language, 'agent.composer.panel')} ${attachment.path || 'snapshot'}`;
-  }
   return `${t(language, 'agent.composer.file')} ${attachment.path || '.'}`;
 }
 

@@ -25,6 +25,8 @@ import type {
   LlmProbeResult,
   CodeGrepInput,
   CodeGrepResult,
+  GitStatusResult,
+  GitDiffResult,
   AgentMode,
   AgentProjectListResult,
   AgentProjectResult,
@@ -59,12 +61,10 @@ import type {
   CreateTerminalSessionRequest,
   TerminalInputRequest,
   TerminalResizeRequest,
-  SkillReferenceResult,
+  KernelHostSkillCatalogResult,
   BrowserRuntimeStatusResult,
   OpenBrowserPreviewRequest,
   SetBrowserInspectModeRequest,
-  PanelSnapshotResult,
-  AttachPanelSnapshotResult,
   KernelHostInspectionQuery,
   KernelHostInspectionResult,
 } from '@deepcode/protocol';
@@ -198,7 +198,7 @@ export interface SkillScanItem {
   envAllowlist: string[];
   modelVisible: boolean;
   requiresApproval: boolean;
-  v1RuntimeEnabled: boolean;
+  activationStatus: 'dormant' | 'registered';
   riskLevel: 'low' | 'medium' | 'high' | string;
 }
 
@@ -460,7 +460,7 @@ export function scanSkillMount(
   path: string
 ): Promise<ApiResponse<SkillMountScanResult>> {
   return sendJson<SkillMountScanResult>(
-    `${API_BASE}/skills/scan-mount`,
+    `${API_BASE}/host/skills/scan-mount`,
     'POST',
     { path }
   );
@@ -484,10 +484,16 @@ async function inspectHost<T>(query: KernelHostInspectionQuery): Promise<ApiResp
     'POST',
     query
   );
-  return {
-    ...response,
-    data: response.data?.output as T | undefined,
-  };
+  const output = response.data?.output;
+  if (!output) return { ...response, data: undefined };
+  if (output.kind !== query.kind) {
+    return {
+      ok: false,
+      error: 'host_inspection_contract_mismatch',
+      message: `Host inspection returned ${output.kind} for ${query.kind}.`,
+    };
+  }
+  return { ...response, data: output.data as T };
 }
 
 export function getFileTree(
@@ -1002,29 +1008,8 @@ export function getTerminalEvents(
   return getJson<TerminalEventsResult>(`${API_BASE}/terminal/events${qs}`);
 }
 
-export function getAgentSkills(): Promise<ApiResponse<SkillReferenceResult>> {
-  return getJson<SkillReferenceResult>(`${API_BASE}/agent/skills`);
-}
-
-export interface GitChangeItem {
-  path: string;
-  index: string;
-  worktree: string;
-  group: 'staged' | 'changed' | 'untracked' | string;
-  raw: string;
-}
-
-export interface GitStatusResult {
-  root: string;
-  changes: GitChangeItem[];
-  raw: string;
-}
-
-export interface GitDiffResult {
-  root: string;
-  path?: string | null;
-  staged: boolean;
-  diff: string;
+export function getHostSkills(): Promise<ApiResponse<KernelHostSkillCatalogResult>> {
+  return getJson<KernelHostSkillCatalogResult>(`${API_BASE}/host/skills`);
 }
 
 export function getGitStatus(): Promise<ApiResponse<GitStatusResult>> {
@@ -1059,18 +1044,6 @@ export function setBrowserInspectMode(
   );
 }
 
-export function getSelectedPanelSnapshot(): Promise<ApiResponse<PanelSnapshotResult>> {
-  return getJson<PanelSnapshotResult>(`${API_BASE}/browser/panel-snapshot`);
-}
-
-export function attachPanelSnapshotToAgent(): Promise<ApiResponse<AttachPanelSnapshotResult>> {
-  return sendJson<AttachPanelSnapshotResult>(
-    `${API_BASE}/browser/panel-snapshot/attach`,
-    'POST',
-    {}
-  );
-}
-
 // 重新导出共享 DTO
 export type {
   FileTreeNode,
@@ -1085,5 +1058,4 @@ export type {
   TerminalWarmupStatus,
   ShellEnvironmentStatus,
   BrowserRuntimeStatusResult,
-  PanelSnapshotResult,
 };

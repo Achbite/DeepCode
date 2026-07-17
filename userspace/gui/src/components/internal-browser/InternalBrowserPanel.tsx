@@ -5,17 +5,13 @@ import type {
   BrowserRuntimeCapability,
   BrowserInspectState,
   BrowserRuntimeStatusResult,
-  PanelSemanticSnapshot,
 } from '@deepcode/protocol';
 import {
-  attachPanelSnapshotToAgent,
   getBrowserRuntimeStatus,
-  getSelectedPanelSnapshot,
   openBrowserPreview,
   reloadBrowserPreview,
   setBrowserInspectMode,
 } from '../../services/runtimeAdapter';
-import PanelSnapshotCard from './PanelSnapshotCard';
 import { useSettingsStore } from '../../state/settingsStore';
 import { normalizeUiLanguage, t, type UiLanguage } from '../../i18n';
 
@@ -25,8 +21,6 @@ const CAPABILITY_ORDER: BrowserRuntimeCapability[] = [
   'openTargetRecording',
   'reloadRecording',
   'inspectModeRecording',
-  'domCapture',
-  'agentAttachment',
 ];
 
 type BrowserAction =
@@ -34,9 +28,7 @@ type BrowserAction =
   | 'status'
   | 'open'
   | 'reload'
-  | 'inspect'
-  | 'snapshot'
-  | 'attach';
+  | 'inspect';
 
 function statusMessage(
   runtime: BrowserRuntimeStatusResult | null,
@@ -60,26 +52,15 @@ const InternalBrowserPanel: React.FC = () => {
   );
   const [url, setUrl] = useState(DEFAULT_PREVIEW_URL);
   const [runtime, setRuntime] = useState<BrowserRuntimeStatusResult | null>(null);
-  const [snapshot, setSnapshot] = useState<PanelSemanticSnapshot | null>(null);
   const [message, setMessage] = useState(t(language, 'browser.message.reserved'));
   const [activeAction, setActiveAction] = useState<BrowserAction>('idle');
-  const [attached, setAttached] = useState(false);
 
   const applyRuntime = (
     data: BrowserRuntimeStatusResult,
     nextMessage?: string
   ) => {
     setRuntime(data);
-    setSnapshot(data.snapshot ?? null);
-    setAttached(data.diagnostics?.attached ?? false);
     setMessage(nextMessage ?? statusMessage(data, language));
-  };
-
-  const refreshRuntime = async (nextMessage?: string) => {
-    const response = await getBrowserRuntimeStatus();
-    if (response.ok && response.data) {
-      applyRuntime(response.data, nextMessage);
-    }
   };
 
   const runAction = async (
@@ -174,46 +155,6 @@ const InternalBrowserPanel: React.FC = () => {
             ? t(language, 'browser.stopInspect')
             : t(language, 'browser.inspect')}
         </button>
-        <button
-          type="button"
-          disabled={busy}
-          onClick={() =>
-            runAction('snapshot', async () => {
-              const response = await getSelectedPanelSnapshot();
-              if (response.ok && response.data) {
-                setSnapshot(response.data.snapshot);
-                setAttached(false);
-                await refreshRuntime(
-                  response.data.message ?? t(language, 'browser.message.snapshotUnavailable')
-                );
-              } else {
-                setMessage(response.message ?? t(language, 'browser.message.snapshotCaptureUnavailable'));
-              }
-            })
-          }
-        >
-          {t(language, 'browser.snapshot')}
-        </button>
-        <button
-          type="button"
-          disabled={busy}
-          onClick={() =>
-            runAction('attach', async () => {
-              const response = await attachPanelSnapshotToAgent();
-              if (response.ok && response.data) {
-                setSnapshot(response.data.snapshot);
-                setAttached(response.data.attached);
-                await refreshRuntime(
-                  response.data.message ?? t(language, 'browser.message.attachmentReserved')
-                );
-              } else {
-                setMessage(response.message ?? t(language, 'browser.message.attachUnavailable'));
-              }
-            })
-          }
-        >
-          {t(language, 'browser.attachSnapshot')}
-        </button>
       </div>
 
       <div className="internal-browser-panel__body">
@@ -279,22 +220,8 @@ const InternalBrowserPanel: React.FC = () => {
                 <dt>{t(language, 'browser.lastActionResult')}</dt>
                 <dd>{translatedValue(language, 'browser.actionResult', runtime?.diagnostics?.lastActionResult)}</dd>
               </div>
-              <div>
-                <dt>{t(language, 'browser.hasSnapshot')}</dt>
-                <dd>{runtime?.diagnostics?.hasSnapshot ? t(language, 'browser.yes') : t(language, 'browser.no')}</dd>
-              </div>
-              <div>
-                <dt>{t(language, 'browser.snapshotAttached')}</dt>
-                <dd>{runtime?.diagnostics?.attached ? t(language, 'browser.yes') : t(language, 'browser.no')}</dd>
-              </div>
             </dl>
           </section>
-          <PanelSnapshotCard
-            snapshot={snapshot}
-            message={message}
-            attached={attached}
-            language={language}
-          />
         </aside>
       </div>
     </div>

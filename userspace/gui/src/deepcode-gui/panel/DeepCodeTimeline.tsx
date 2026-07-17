@@ -1777,7 +1777,6 @@ function blockAttachments(block: AgentTimelineBlock): AgentContextAttachment[] {
 
 function attachmentKindLabel(attachment: AgentContextAttachment, language: UiLanguage): string {
   if (attachment.kind === 'directory') return t(language, 'agent.composer.dir');
-  if (attachment.kind === 'panelSnapshot') return t(language, 'agent.composer.panel');
   return t(language, 'agent.composer.file');
 }
 
