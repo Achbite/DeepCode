@@ -1,16 +1,10 @@
-import type { PanelSemanticSnapshot } from './browser.js';
-
+import type { KernelEventV1 } from './kernelAbiV1.js';
 export type AgentMode = 'readOnly' | 'plan' | 'askBeforeWrite';
 export type AgentWorkflowMode = 'planFirst' | 'actOnRequest';
 export type AgentWorkflowStage = 'plan' | 'check' | 'complete' | 'review';
 export type AgentWorkflowPhase = AgentWorkflowStage | 'awaitingApproval' | 'done' | 'aborted';
 export type AgentRunStatus = 'idle' | 'running' | 'waiting' | 'succeeded' | 'failed' | 'aborted';
 export type AgentRiskLevel = 'low' | 'medium' | 'high';
-export type AgentWorkUnitScopeKind = 'file' | 'range' | 'docSection' | 'symbol';
-export type AgentWorkUnitStatus = 'queued' | 'running' | 'waitingReview' | 'completed' | 'blocked' | 'cancelled';
-export type AgentChangeOperationKind = 'write' | 'edit' | 'delete' | 'rename' | 'shellGeneratedChange';
-export type AgentValidationKind = 'test' | 'lint' | 'typecheck' | 'format' | 'policy' | 'secretScan' | 'manualReview';
-export type AgentReviewGateStatus = 'accepted' | 'needsReplan' | 'needsUserReview' | 'aborted';
 export type AgentTraceEventKind =
   | 'turn.started'
   | 'turn.completed'
@@ -248,87 +242,6 @@ export interface AckAgentEventResult {
   eventId: string;
 }
 
-export interface AgentWorkUnitScope {
-  kind: AgentWorkUnitScopeKind;
-  path: string;
-  startLine?: number;
-  endLine?: number;
-  symbolName?: string;
-}
-
-export interface AgentWorkUnit {
-  id: string;
-  runId: string;
-  title: string;
-  status: AgentWorkUnitStatus;
-  scope: AgentWorkUnitScope;
-  owner?: string;
-  planStepId?: string;
-  dependsOn?: string[];
-  createdAt: string;
-  updatedAt: string;
-}
-
-export interface AgentWorkQueueSnapshot {
-  runId: string;
-  units: AgentWorkUnit[];
-  activeOwners: Record<string, string>;
-  blockedUnits: AgentWorkUnit[];
-  updatedAt: string;
-}
-
-export interface AgentChangeOperation {
-  id: string;
-  toolCallId?: string;
-  workUnitId?: string;
-  kind: AgentChangeOperationKind;
-  filePath: string;
-  beforeHash?: string;
-  afterHash?: string;
-  diff?: string;
-}
-
-export interface AgentChangeSet {
-  id: string;
-  runId: string;
-  baseSha?: string;
-  operations: AgentChangeOperation[];
-  touchedFiles: string[];
-  diffSummary: string;
-  diffStats: {
-    filesChanged: number;
-    additions: number;
-    deletions: number;
-  };
-  createdAt: string;
-  updatedAt: string;
-}
-
-export interface AgentValidationResult {
-  id: string;
-  runId: string;
-  kind: AgentValidationKind;
-  command?: string;
-  exitCode?: number;
-  passed: boolean;
-  summary: string;
-  evidenceRefs: string[];
-  createdAt: string;
-}
-
-export interface AgentReviewGateResult {
-  id: string;
-  runId: string;
-  status: AgentReviewGateStatus;
-  summary: string;
-  satisfiedCriteria: string[];
-  missingCriteria: string[];
-  evidenceRefs: string[];
-  changeSetId?: string;
-  validationResultIds: string[];
-  createdAt: string;
-}
-
 export interface GetAgentWorkflowConfigResult {
   config: AgentWorkflowConfig;
   storePath?: string;
@@ -421,14 +334,13 @@ export interface AgentSession {
 }
 
 export interface AgentContextAttachment {
-  kind: 'file' | 'directory' | 'panelSnapshot';
+  kind: 'file' | 'directory';
   path: string;
   absolutePath?: string;
   resourceId?: string;
   folderId?: string;
-  source: 'mention' | 'contextMenu' | 'browser' | 'userSelected';
+  source: 'mention' | 'contextMenu' | 'userSelected';
   scope: 'message' | 'session';
-  snapshot?: PanelSemanticSnapshot;
 }
 
 export interface AgentContextSnapshot {
@@ -460,6 +372,7 @@ export interface AgentProject {
 
 export interface PermissionRequest {
   id: string;
+  requestKind?: 'runtimePermission' | 'scopeExpansion';
   permissionBundleId?: string;
   contractId?: string;
   affectedOperationIds?: string[];
@@ -871,7 +784,7 @@ export interface WorkflowPayloadFields {
   visibility?: AgentEventVisibility;
   presentation?: AgentEventPresentation;
   decision?: unknown;
-  kernelEvent?: unknown;
+  kernelEvent?: KernelEventV1;
 }
 
 export interface CreateAgentSessionRequest {

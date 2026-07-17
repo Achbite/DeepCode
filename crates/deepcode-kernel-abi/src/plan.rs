@@ -1,4 +1,8 @@
-use crate::{RunId, SessionId};
+use crate::{
+    ContractCleanupPolicy, ContractExpiry, KernelGateInterventionKind,
+    KernelGateInterventionStatus, OperationExecutionMode, PermissionResourceKind, RunId, SessionId,
+    ToolContentMode, ToolOperationKind, ToolPermissionMode, ToolRiskLevel, ToolTargetKind,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -47,19 +51,19 @@ pub struct KernelPlanAuthorizationOperation {
     pub id: String,
     pub source_task_id: String,
     pub tool_id: String,
-    pub operation_kind: String,
-    pub content_mode: String,
+    pub operation_kind: ToolOperationKind,
+    pub content_mode: ToolContentMode,
     pub targets: Vec<String>,
     #[serde(default)]
     pub depends_on: Vec<String>,
     pub fixed_args: Value,
     pub args_template: Value,
-    pub target_kind: Option<String>,
+    pub target_kind: Option<ToolTargetKind>,
     pub recursive: Option<bool>,
     pub read_set: Vec<String>,
     pub write_set: Vec<String>,
     pub conflict_keys: Vec<String>,
-    pub execution_mode: String,
+    pub execution_mode: OperationExecutionMode,
     pub internal: bool,
     pub parent_operation_id: Option<String>,
 }
@@ -69,21 +73,21 @@ pub struct KernelPlanAuthorizationOperation {
 pub struct KernelPlanPermissionBundle {
     pub id: String,
     pub capability: String,
-    pub permission_mode: String,
-    pub risk: String,
-    pub resource_kind: String,
+    pub permission_mode: ToolPermissionMode,
+    pub risk: ToolRiskLevel,
+    pub resource_kind: PermissionResourceKind,
     pub operation_ids: Vec<String>,
     pub tool_ids: Vec<String>,
     pub targets: Vec<String>,
-    pub expires_after: String,
+    pub expires_after: ContractExpiry,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KernelPlanGateIntervention {
     pub id: String,
-    pub intervention_kind: String,
-    pub status: String,
+    pub intervention_kind: KernelGateInterventionKind,
+    pub status: KernelGateInterventionStatus,
     pub permission_bundle_id: Option<String>,
     pub affected_operation_ids: Vec<String>,
     pub summary: String,
@@ -104,8 +108,8 @@ pub struct KernelPlanAuthorizationContract {
     pub operations: Vec<KernelPlanAuthorizationOperation>,
     pub permission_bundles: Vec<KernelPlanPermissionBundle>,
     pub interventions: Vec<KernelPlanGateIntervention>,
-    pub cleanup_policy: String,
-    pub expires_after: String,
+    pub cleanup_policy: ContractCleanupPolicy,
+    pub expires_after: ContractExpiry,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

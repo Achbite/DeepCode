@@ -9,7 +9,6 @@ mod graph;
 mod input_validation;
 mod operation_builders;
 mod operation_model;
-mod registration_contracts;
 mod registrations;
 mod review;
 mod sandbox;
@@ -18,13 +17,23 @@ pub use admission::*;
 pub use authorization::*;
 pub use catalog::*;
 pub use contracts::*;
+pub use deepcode_kernel_abi::{
+    CleanupContract, CleanupFailurePolicy, CleanupLeasePolicy, ContractCleanupPolicy,
+    ContractExpiry, FileTargetRef, FileTargetRefKind, IsolationContract, IsolationFallbackPolicy,
+    IsolationLevel, KernelExecutionContract, KernelExecutionContractStatus,
+    KernelExecutionOperation, KernelGateIntervention, KernelGateInterventionKind,
+    KernelGateInterventionStatus, KernelPermissionBundle, KernelProposalReviewReport,
+    OperationExecutionMode, PathScopePolicy, PermissionResourceKind, PlanTargetMode,
+    PlanTargetSource, SandboxSupportState, TargetExistence, ToolChangeKind, ToolContentMode,
+    ToolFactCategory, ToolFactKind, ToolFamily, ToolOperationKind, ToolOutputTrust,
+    ToolPermissionMode, ToolRiskLevel, ToolTargetKind, ToolValidationKind,
+};
 pub use graph::*;
 pub use input_validation::ToolInputValidationError;
 pub use operation_model::*;
-pub use review::*;
+pub use registrations::KernelToolRegistration;
 pub use sandbox::{
-    CandidateSandboxSpec, CleanupContract, IsolationContract, IsolationFallbackPolicy,
-    IsolationLevel, SandboxCapabilitySnapshot, SandboxSupportState, SealedSandboxPlan,
+    CandidateSandboxSpec, SandboxCapabilitySnapshot, SealedSandboxPlan,
     SANDBOX_CAPABILITY_SCHEMA_VERSION, SANDBOX_SPEC_SCHEMA_VERSION,
 };
 

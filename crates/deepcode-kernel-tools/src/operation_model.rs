@@ -1,4 +1,4 @@
-use crate::{KernelToolRegistry, OperationExecutionMode};
+use crate::{FileTargetRef, OperationExecutionMode, ToolOperationKind};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -7,6 +7,8 @@ use serde_json::Value;
 pub struct PlannedOperation {
     pub id: String,
     pub title: String,
+    pub tool_id: String,
+    pub operation_kind: ToolOperationKind,
     #[serde(default)]
     pub depends_on: Vec<String>,
     pub capability: String,
@@ -20,85 +22,7 @@ pub struct PlannedOperation {
     pub operation: PlannedOperationKind,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct FileTargetRef {
-    pub kind: FileTargetRefKind,
-    pub path: String,
-    #[serde(default)]
-    pub root_id: Option<String>,
-}
-
-impl FileTargetRef {
-    pub fn from_path(path: impl Into<String>) -> Self {
-        let path = path.into();
-        let kind = if std::path::Path::new(&path).is_absolute() {
-            FileTargetRefKind::AbsolutePath
-        } else {
-            FileTargetRefKind::WorkspaceRelative
-        };
-        Self {
-            kind,
-            path,
-            root_id: None,
-        }
-    }
-
-    pub fn raw_path(&self) -> String {
-        match self.kind {
-            FileTargetRefKind::WorkspaceRelative | FileTargetRefKind::AbsolutePath => {
-                self.path.clone()
-            }
-            FileTargetRefKind::RootRelative => self
-                .root_id
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(|root_id| {
-                    if self.path.trim().is_empty() {
-                        root_id.to_string()
-                    } else {
-                        format!("{}/{}", root_id.trim_end_matches('/'), self.path)
-                    }
-                })
-                .unwrap_or_else(|| self.path.clone()),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum FileTargetRefKind {
-    WorkspaceRelative,
-    RootRelative,
-    AbsolutePath,
-}
-
 impl PlannedOperation {
-    pub fn tool_id(&self, registry: &KernelToolRegistry) -> Option<&'static str> {
-        match &self.operation {
-            PlannedOperationKind::Workspace(operation) => {
-                registry.tool_for_workspace_kind(operation.kind)
-            }
-            PlannedOperationKind::Git(operation) => registry.tool_for_git_kind(operation.kind),
-            PlannedOperationKind::Process(_) => Some("process.exec"),
-            PlannedOperationKind::Network(operation) => match operation.kind {
-                NetworkOperationKind::Search => Some("web.search"),
-                NetworkOperationKind::Fetch => Some("web.fetch"),
-            },
-            PlannedOperationKind::Browser(operation) => match operation.kind {
-                BrowserOperationKind::Open => Some("browser.open"),
-                BrowserOperationKind::Reload => Some("browser.reload"),
-                BrowserOperationKind::Snapshot => Some("browser.snapshot"),
-                BrowserOperationKind::Inspect => Some("browser.inspect"),
-                BrowserOperationKind::Click => Some("browser.click"),
-                BrowserOperationKind::Type => Some("browser.type"),
-                BrowserOperationKind::Scroll => Some("browser.scroll"),
-            },
-            PlannedOperationKind::Provider(_) => Some("provider.call"),
-        }
-    }
-
     pub fn is_write_like(&self) -> bool {
         if !self.write_set.is_empty() {
             return true;

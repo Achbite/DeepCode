@@ -1,25 +1,7 @@
 use crate::{ContentBlock, KernelToolRegistry};
+use deepcode_kernel_abi::{KernelAction, KernelContentBlock};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
-
-const ACTION_FIELDS: &[&str] = &["actionId", "toolId", "args", "description", "dependsOn"];
-const CONTENT_BLOCK_FIELDS: &[&str] = &[
-    "blockId",
-    "targetPath",
-    "language",
-    "operation",
-    "contentLines",
-    "allowEmptyContent",
-];
-const CONTENT_BLOCK_OPERATIONS: &[&str] = &[
-    "create",
-    "createEmpty",
-    "overwrite",
-    "patch",
-    "replaceBlock",
-    "insertBefore",
-    "insertAfter",
-];
 
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum ToolInputValidationError {
@@ -45,8 +27,6 @@ pub enum ToolInputValidationError {
     InvalidEnumValue { path: String },
     #[error("contentBlocks contains duplicate blockId {block_id}")]
     DuplicateContentBlock { block_id: String },
-    #[error("contentBlocks[{index}].operation is unsupported: {operation}")]
-    UnsupportedContentOperation { index: usize, operation: String },
     #[error(
         "contentBlocks[{index}].contentLines may be empty only when operation=createEmpty and allowEmptyContent=true"
     )]
@@ -55,38 +35,33 @@ pub enum ToolInputValidationError {
 
 pub(crate) fn validate_action(
     registry: &KernelToolRegistry,
-    action: &Value,
+    action: &KernelAction,
     index: usize,
 ) -> Result<(), ToolInputValidationError> {
     let path = format!("actionBundle.actions[{index}]");
-    let record = action
-        .as_object()
-        .ok_or_else(|| ToolInputValidationError::ExpectedObject { path: path.clone() })?;
-    reject_unknown_fields(record.keys().map(String::as_str), ACTION_FIELDS, &path)?;
-    require_non_empty_string(record.get("actionId"), &format!("{path}.actionId"))?;
-    let tool_id = require_non_empty_string(record.get("toolId"), &format!("{path}.toolId"))?;
-    require_non_empty_string(record.get("description"), &format!("{path}.description"))?;
-    if let Some(depends_on) = record.get("dependsOn") {
-        validate_string_array(depends_on, &format!("{path}.dependsOn"))?;
+    validate_non_empty_text(&action.action_id, &format!("{path}.actionId"))?;
+    validate_non_empty_text(&action.tool_id, &format!("{path}.toolId"))?;
+    validate_non_empty_text(&action.description, &format!("{path}.description"))?;
+    for (dependency_index, dependency) in action.depends_on.iter().enumerate() {
+        validate_non_empty_text(dependency, &format!("{path}.dependsOn[{dependency_index}]"))?;
     }
-    let args = record
-        .get("args")
-        .ok_or_else(|| ToolInputValidationError::MissingField {
-            path: path.clone(),
-            field: "args".to_string(),
-        })?;
-    let template =
-        registry
-            .template(tool_id)
-            .ok_or_else(|| ToolInputValidationError::InvalidEnumValue {
-                path: format!("{path}.toolId"),
+    let template = registry.contract(&action.tool_id).ok_or_else(|| {
+        ToolInputValidationError::InvalidEnumValue {
+            path: format!("{path}.toolId"),
+        }
+    })?;
+    validate_schema(
+        &action.args,
+        &template.input.schema,
+        &format!("{path}.args"),
+    )?;
+    let args_record =
+        action
+            .args
+            .as_object()
+            .ok_or_else(|| ToolInputValidationError::ExpectedObject {
+                path: format!("{path}.args"),
             })?;
-    validate_schema(args, &template.input.schema, &format!("{path}.args"))?;
-    let args_record = args
-        .as_object()
-        .ok_or_else(|| ToolInputValidationError::ExpectedObject {
-            path: format!("{path}.args"),
-        })?;
     for field in &template.input.forbidden_fields {
         if args_record.contains_key(field) {
             return Err(ToolInputValidationError::UnknownField {
@@ -99,88 +74,48 @@ pub(crate) fn validate_action(
 }
 
 pub(crate) fn validate_content_blocks(
-    batch: &Value,
+    blocks: &[KernelContentBlock],
 ) -> Result<BTreeMap<String, ContentBlock>, ToolInputValidationError> {
-    let Some(raw_blocks) = batch.get("contentBlocks") else {
-        return Ok(BTreeMap::new());
-    };
-    let blocks = raw_blocks
-        .as_array()
-        .ok_or_else(|| ToolInputValidationError::ExpectedArray {
-            path: "contentBlocks".to_string(),
-        })?;
     let mut output = BTreeMap::new();
-    for (index, value) in blocks.iter().enumerate() {
+    for (index, block) in blocks.iter().enumerate() {
         let path = format!("contentBlocks[{index}]");
-        let record = value
-            .as_object()
-            .ok_or_else(|| ToolInputValidationError::ExpectedObject { path: path.clone() })?;
-        reject_unknown_fields(
-            record.keys().map(String::as_str),
-            CONTENT_BLOCK_FIELDS,
-            &path,
-        )?;
-        let block_id = require_non_empty_string(record.get("blockId"), &format!("{path}.blockId"))?
-            .to_string();
-        let target_path =
-            require_non_empty_string(record.get("targetPath"), &format!("{path}.targetPath"))?
-                .to_string();
-        let operation =
-            require_non_empty_string(record.get("operation"), &format!("{path}.operation"))?
-                .to_string();
-        if !CONTENT_BLOCK_OPERATIONS.contains(&operation.as_str()) {
-            return Err(ToolInputValidationError::UnsupportedContentOperation { index, operation });
+        validate_non_empty_text(&block.block_id, &format!("{path}.blockId"))?;
+        validate_non_empty_text(&block.target_path, &format!("{path}.targetPath"))?;
+        if let Some(language) = &block.language {
+            validate_non_empty_text(language, &format!("{path}.language"))?;
         }
-        let content_lines =
-            record
-                .get("contentLines")
-                .ok_or_else(|| ToolInputValidationError::MissingField {
-                    path: path.clone(),
-                    field: "contentLines".to_string(),
-                })?;
-        validate_string_array_allow_empty(content_lines, &format!("{path}.contentLines"))?;
-        let content = content_lines
-            .as_array()
-            .expect("validated contentLines array")
-            .iter()
-            .map(|line| line.as_str().expect("validated content line"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let allow_empty_content = match record.get("allowEmptyContent") {
-            Some(value) => {
-                value
-                    .as_bool()
-                    .ok_or_else(|| ToolInputValidationError::ExpectedBoolean {
-                        path: format!("{path}.allowEmptyContent"),
-                    })?
-            }
-            None => false,
-        };
-        if content.is_empty() && !(operation == "createEmpty" && allow_empty_content) {
+        let operation = block.operation.as_str();
+        let content = block.content_lines.join("\n");
+        if content.is_empty() && !(operation == "createEmpty" && block.allow_empty_content) {
             return Err(ToolInputValidationError::EmptyContentBlock { index });
         }
-        let language = match record.get("language") {
-            Some(value) => Some(
-                require_non_empty_string(Some(value), &format!("{path}.language"))?.to_string(),
-            ),
-            None => None,
-        };
-        if output.contains_key(&block_id) {
-            return Err(ToolInputValidationError::DuplicateContentBlock { block_id });
+        if output.contains_key(&block.block_id) {
+            return Err(ToolInputValidationError::DuplicateContentBlock {
+                block_id: block.block_id.clone(),
+            });
         }
         output.insert(
-            block_id.clone(),
+            block.block_id.clone(),
             ContentBlock {
-                id: block_id,
-                target_path: Some(target_path),
-                language,
-                operation: Some(operation),
+                id: block.block_id.clone(),
+                target_path: Some(block.target_path.clone()),
+                language: block.language.clone(),
+                operation: Some(operation.to_string()),
                 content: Some(content),
-                allow_empty_content,
+                allow_empty_content: block.allow_empty_content,
             },
         );
     }
     Ok(output)
+}
+
+fn validate_non_empty_text(value: &str, path: &str) -> Result<(), ToolInputValidationError> {
+    if value.trim().is_empty() {
+        return Err(ToolInputValidationError::ExpectedString {
+            path: path.to_string(),
+        });
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_schema(
@@ -290,37 +225,6 @@ fn validate_minimum(
             path: path.to_string(),
             minimum: minimum.to_string(),
         });
-    }
-    Ok(())
-}
-
-fn validate_string_array(value: &Value, path: &str) -> Result<(), ToolInputValidationError> {
-    let items = value
-        .as_array()
-        .ok_or_else(|| ToolInputValidationError::ExpectedArray {
-            path: path.to_string(),
-        })?;
-    for (index, item) in items.iter().enumerate() {
-        require_non_empty_string(Some(item), &format!("{path}[{index}]"))?;
-    }
-    Ok(())
-}
-
-fn validate_string_array_allow_empty(
-    value: &Value,
-    path: &str,
-) -> Result<(), ToolInputValidationError> {
-    let items = value
-        .as_array()
-        .ok_or_else(|| ToolInputValidationError::ExpectedArray {
-            path: path.to_string(),
-        })?;
-    for (index, item) in items.iter().enumerate() {
-        if !item.is_string() {
-            return Err(ToolInputValidationError::ExpectedString {
-                path: format!("{path}[{index}]"),
-            });
-        }
     }
     Ok(())
 }

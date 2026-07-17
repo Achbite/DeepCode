@@ -8,8 +8,6 @@ export type BrowserRuntimeAction =
   | 'open'
   | 'reload'
   | 'inspect'
-  | 'snapshot'
-  | 'attach'
   | 'click'
   | 'type'
   | 'scroll';
@@ -18,37 +16,11 @@ export type BrowserRuntimeCapability =
   | 'status'
   | 'openTargetRecording'
   | 'reloadRecording'
-  | 'inspectModeRecording'
-  | 'domCapture'
-  | 'agentAttachment';
+  | 'inspectModeRecording';
 
 export type BrowserCapabilityState = 'available' | 'reserved';
 
 export type BrowserActionResult = 'ok' | 'reserved' | 'unavailable';
-
-export interface BrowserBoundingRect {
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-}
-
-export interface PanelSemanticSnapshot {
-  id: string;
-  url: string;
-  capturedAt: string;
-  selector: string;
-  panelKind?: string;
-  panelTitle?: string;
-  boundingRect?: BrowserBoundingRect;
-  textContent?: string;
-  aria?: Record<string, string>;
-  classNames?: string[];
-  styleTokens?: Record<string, string>;
-  domOutline?: string;
-  sourceHints?: string[];
-  relatedFiles?: string[];
-}
 
 export type BrowserRuntimeCapabilities = Record<
   BrowserRuntimeCapability,
@@ -59,8 +31,6 @@ export interface BrowserRuntimeDiagnostics {
   currentUrl?: string | null;
   runtimeStatus: BrowserRuntimeStatus;
   inspectState: BrowserInspectState;
-  hasSnapshot: boolean;
-  attached: boolean;
   lastAction?: BrowserRuntimeAction | null;
   lastActionAt?: string | null;
   lastActionResult?: BrowserActionResult | null;
@@ -71,7 +41,6 @@ export interface BrowserRuntimeStatusResult {
   inspectState: BrowserInspectState;
   currentUrl?: string | null;
   message?: string;
-  snapshot?: PanelSemanticSnapshot | null;
   lastAction?: BrowserRuntimeAction | null;
   lastActionAt?: string | null;
   capabilities?: BrowserRuntimeCapabilities;
@@ -84,15 +53,4 @@ export interface OpenBrowserPreviewRequest {
 
 export interface SetBrowserInspectModeRequest {
   inspectState: BrowserInspectState;
-}
-
-export interface PanelSnapshotResult {
-  snapshot: PanelSemanticSnapshot | null;
-  message?: string;
-}
-
-export interface AttachPanelSnapshotResult {
-  attached: boolean;
-  snapshot: PanelSemanticSnapshot | null;
-  message?: string;
 }

@@ -1,6 +1,7 @@
 use crate::{
-    input_validation::validate_schema, KernelToolRegistry, OperationExecutionMode, PlanTargetMode,
-    ToolFamily, ToolPermissionMode, ToolRiskLevel,
+    input_validation::validate_schema, ContractExpiry, KernelToolRegistry, OperationExecutionMode,
+    PermissionBundleKey, PermissionResourceKind, PlanTargetMode, ToolOperationKind,
+    ToolPermissionMode, ToolRiskLevel,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -41,11 +42,11 @@ pub struct PlanAuthorizationPermissionBundleDraft {
     pub capability: String,
     pub permission_mode: ToolPermissionMode,
     pub risk: ToolRiskLevel,
-    pub resource_kind: String,
+    pub resource_kind: PermissionResourceKind,
     pub operation_ids: Vec<String>,
     pub tool_ids: Vec<String>,
     pub targets: Vec<String>,
-    pub expires_after: String,
+    pub expires_after: ContractExpiry,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,7 +133,7 @@ pub fn derive_plan_authorization(
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
-        let Some(template) = registry.template(&task.tool_id) else {
+        let Some(registration) = registry.get(&task.tool_id) else {
             diagnostics.push(PlanAuthorizationDiagnostic {
                 hard_deny: true,
                 message: format!(
@@ -142,6 +143,8 @@ pub fn derive_plan_authorization(
             });
             continue;
         };
+        let template = &registration.contract;
+        let operation_kind = registration.operation_kind();
         if let Err(error) = validate_schema(
             &task.args,
             &template.input.planning_schema,
@@ -154,7 +157,7 @@ pub fn derive_plan_authorization(
             continue;
         }
         if let Some(diagnostic) =
-            platform_plan_args_diagnostic(&task.tool_id, &task.args, std::env::consts::OS)
+            platform_plan_args_diagnostic(operation_kind, &task.args, std::env::consts::OS)
         {
             diagnostics.push(diagnostic);
             continue;
@@ -178,7 +181,7 @@ pub fn derive_plan_authorization(
             continue;
         }
         if task.targets.is_empty()
-            && target_is_required(&task.tool_id, template.resource.needs_workspace)
+            && target_is_required(operation_kind, template.resource.needs_workspace)
         {
             diagnostics.push(PlanAuthorizationDiagnostic {
                 hard_deny: false,
@@ -189,7 +192,7 @@ pub fn derive_plan_authorization(
             });
             continue;
         }
-        if task.tool_id == "fs.rename" && task.targets.len() != 2 {
+        if operation_kind == ToolOperationKind::FsRename && task.targets.len() != 2 {
             diagnostics.push(PlanAuthorizationDiagnostic {
                 hard_deny: false,
                 message: format!(
@@ -204,7 +207,7 @@ pub fn derive_plan_authorization(
         let mut emitted_operation_ids = Vec::new();
         for (operation_id, targets) in task_operations {
             let mut operation_dependencies = dependency_operation_ids.clone();
-            if task.tool_id == "fs.create" {
+            if operation_kind == ToolOperationKind::FsCreate {
                 for target in &targets {
                     let Some(parent) = normalized_parent(target) else {
                         continue;
@@ -269,12 +272,12 @@ pub fn derive_plan_authorization(
 }
 
 fn platform_plan_args_diagnostic(
-    tool_id: &str,
+    operation_kind: ToolOperationKind,
     args: &Value,
     platform: &str,
 ) -> Option<PlanAuthorizationDiagnostic> {
     (platform == "windows"
-        && tool_id == "fs.create"
+        && operation_kind == ToolOperationKind::FsCreate
         && args
             .get("executable")
             .and_then(Value::as_bool)
@@ -334,18 +337,20 @@ fn operation_draft(
         internal,
         parent_operation_id,
     } = input;
-    let template = registry
-        .template(tool_id)
+    let registration = registry
+        .get(tool_id)
         .expect("plan authorization operations use registered tools");
-    let read_set = if template.resource.read_set_source != "none" {
+    let template = &registration.contract;
+    let operation_kind = registration.operation_kind();
+    let read_set = if template.resource.read_set_source.contributes_resources() {
         targets.clone()
     } else {
         Vec::new()
     };
-    let write_set = if template.resource.write_set_source == "none" {
-        Vec::new()
-    } else {
+    let write_set = if template.resource.write_set_source.contributes_resources() {
         targets.clone()
+    } else {
+        Vec::new()
     };
     let conflict_keys = read_set
         .iter()
@@ -359,8 +364,8 @@ fn operation_draft(
         source_task_id,
         tool_id: tool_id.to_string(),
         depends_on,
-        fixed_args: canonical_plan_args(tool_id, &plan_args),
-        args_template: args_template(tool_id, &targets, &plan_args),
+        fixed_args: canonical_plan_args(operation_kind, &plan_args),
+        args_template: args_template(operation_kind, &targets, &plan_args),
         targets,
         read_set,
         write_set,
@@ -371,8 +376,8 @@ fn operation_draft(
     }
 }
 
-fn canonical_plan_args(tool_id: &str, plan_args: &Value) -> Value {
-    if tool_id == "fs.create" {
+fn canonical_plan_args(operation_kind: ToolOperationKind, plan_args: &Value) -> Value {
+    if operation_kind == ToolOperationKind::FsCreate {
         return serde_json::json!({
             "executable": plan_args
                 .get("executable")
@@ -389,13 +394,12 @@ fn permission_bundles(
 ) -> Vec<PlanAuthorizationPermissionBundleDraft> {
     let mut grouped = BTreeMap::<String, PlanAuthorizationPermissionBundleDraft>::new();
     for operation in operations {
-        let Some(template) = registry.template(&operation.tool_id) else {
+        let Some(template) = registry.contract(&operation.tool_id) else {
             continue;
         };
-        let key = if template.permission.bundle_key == "none" {
-            format!("allow-{}", operation.tool_id)
-        } else {
-            template.permission.bundle_key.to_string()
+        let key = match template.permission.bundle_key {
+            PermissionBundleKey::None => format!("allow-{}", operation.tool_id),
+            key => key.wire_name().to_string(),
         };
         let bundle =
             grouped
@@ -405,15 +409,14 @@ fn permission_bundles(
                     capability: template.permission.capability.to_string(),
                     permission_mode: template.permission.mode,
                     risk: template.permission.risk,
-                    resource_kind: permission_resource_kind(template.family).to_string(),
+                    resource_kind: template.family.permission_resource_kind(),
                     operation_ids: Vec::new(),
                     tool_ids: Vec::new(),
                     targets: Vec::new(),
-                    expires_after: "planReviewOrRunTerminal".to_string(),
+                    expires_after: ContractExpiry::PlanReviewOrRunTerminal,
                 });
-        bundle.permission_mode =
-            stricter_permission_mode(bundle.permission_mode, template.permission.mode);
-        bundle.risk = higher_risk(bundle.risk, template.permission.risk);
+        bundle.permission_mode = bundle.permission_mode.stricter(template.permission.mode);
+        bundle.risk = bundle.risk.max(template.permission.risk);
         bundle.operation_ids.push(operation.id.clone());
         if !bundle.tool_ids.contains(&operation.tool_id) {
             bundle.tool_ids.push(operation.tool_id.clone());
@@ -427,10 +430,14 @@ fn permission_bundles(
     grouped.into_values().collect()
 }
 
-fn args_template(tool_id: &str, targets: &[String], plan_args: &Value) -> Value {
+fn args_template(
+    operation_kind: ToolOperationKind,
+    targets: &[String],
+    plan_args: &Value,
+) -> Value {
     let path = targets.first().cloned();
-    match tool_id {
-        "fs.create" => serde_json::json!({
+    match operation_kind {
+        ToolOperationKind::FsCreate => serde_json::json!({
             "path": path,
             "contentBlockId": "executionTime",
             "executable": plan_args
@@ -438,25 +445,25 @@ fn args_template(tool_id: &str, targets: &[String], plan_args: &Value) -> Value 
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
         }),
-        "fs.write" => serde_json::json!({
+        ToolOperationKind::FsWrite => serde_json::json!({
             "path": path,
             "contentBlockId": "executionTime",
         }),
-        "fs.edit" => serde_json::json!({
+        ToolOperationKind::FsEdit => serde_json::json!({
             "path": path,
             "replacementBlockId": "executionTime",
             "patchSpec": "executionTime",
         }),
-        "fs.rename" => serde_json::json!({
+        ToolOperationKind::FsRename => serde_json::json!({
             "path": targets.first(),
             "destinationPath": targets.get(1),
         }),
-        "fs.delete" => serde_json::json!({
+        ToolOperationKind::FsDelete => serde_json::json!({
             "path": path,
             "targetKind": "kernelResolved",
             "recursive": "kernelResolved",
         }),
-        "fs.ensure_directory" => serde_json::json!({
+        ToolOperationKind::FsEnsureDirectory => serde_json::json!({
             "path": path,
             "targetKind": "directory",
         }),
@@ -464,8 +471,12 @@ fn args_template(tool_id: &str, targets: &[String], plan_args: &Value) -> Value 
     }
 }
 
-fn target_is_required(tool_id: &str, needs_workspace: bool) -> bool {
-    needs_workspace && !matches!(tool_id, "git.status" | "git.diff")
+fn target_is_required(operation_kind: ToolOperationKind, needs_workspace: bool) -> bool {
+    needs_workspace
+        && !matches!(
+            operation_kind,
+            ToolOperationKind::GitStatus | ToolOperationKind::GitDiff
+        )
 }
 
 fn normalized_parent(target: &str) -> Option<String> {
@@ -485,45 +496,6 @@ fn stable_segment(value: &str) -> String {
         .collect()
 }
 
-fn permission_resource_kind(family: ToolFamily) -> &'static str {
-    match family {
-        ToolFamily::Workspace | ToolFamily::Document => "workspacePath",
-        ToolFamily::Git => "gitWorkspace",
-        ToolFamily::Process => "process",
-        ToolFamily::Network => "networkTarget",
-        ToolFamily::Browser => "browserState",
-        ToolFamily::Provider => "providerProfile",
-    }
-}
-
-fn stricter_permission_mode(
-    left: ToolPermissionMode,
-    right: ToolPermissionMode,
-) -> ToolPermissionMode {
-    use ToolPermissionMode::{Allow, Ask, Deny};
-    match (left, right) {
-        (Deny, _) | (_, Deny) => Deny,
-        (Ask, _) | (_, Ask) => Ask,
-        (Allow, Allow) => Allow,
-    }
-}
-
-fn higher_risk(left: ToolRiskLevel, right: ToolRiskLevel) -> ToolRiskLevel {
-    fn rank(value: ToolRiskLevel) -> u8 {
-        match value {
-            ToolRiskLevel::Low => 0,
-            ToolRiskLevel::Medium => 1,
-            ToolRiskLevel::High => 2,
-            ToolRiskLevel::Critical => 3,
-        }
-    }
-    if rank(left) >= rank(right) {
-        left
-    } else {
-        right
-    }
-}
-
 #[cfg(test)]
 mod platform_tests {
     use super::*;
@@ -531,7 +503,7 @@ mod platform_tests {
     #[test]
     fn native_windows_rejects_executable_create_during_plan_admission() {
         let diagnostic = platform_plan_args_diagnostic(
-            "fs.create",
+            ToolOperationKind::FsCreate,
             &serde_json::json!({ "executable": true }),
             "windows",
         )
@@ -540,7 +512,7 @@ mod platform_tests {
             .message
             .starts_with("unsupported_file_attribute:"));
         assert!(platform_plan_args_diagnostic(
-            "fs.create",
+            ToolOperationKind::FsCreate,
             &serde_json::json!({ "executable": false }),
             "windows",
         )

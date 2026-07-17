@@ -5,6 +5,7 @@ mod draft;
 mod driver;
 mod error;
 mod event;
+mod execution;
 mod facts;
 mod host;
 mod ids;
@@ -13,9 +14,15 @@ mod llm;
 mod permissions;
 mod plan;
 mod refs;
+mod resource;
+mod resource_packet;
 mod run;
 mod snapshot;
+mod tool;
+mod wire;
 mod workspace;
+
+pub const KERNEL_ABI_VERSION: &str = "deepcode.kernel.abi.v1";
 
 pub use command::*;
 pub use config::*;
@@ -23,6 +30,7 @@ pub use draft::*;
 pub use driver::*;
 pub use error::*;
 pub use event::*;
+pub use execution::*;
 pub use facts::*;
 pub use host::*;
 pub use ids::*;
@@ -31,8 +39,12 @@ pub use llm::*;
 pub use permissions::*;
 pub use plan::*;
 pub use refs::*;
+pub use resource::*;
+pub use resource_packet::*;
 pub use run::*;
 pub use snapshot::*;
+pub use tool::*;
+pub use wire::*;
 pub use workspace::*;
 
 #[cfg(test)]

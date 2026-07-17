@@ -6,18 +6,21 @@ fn syscall_result_events_are_locale_neutral() {
         run_id: None,
         session_id: None,
         turn_id: None,
-        tool_call_id: "req-list".to_string(),
-        tool_name: "fs.list".to_string(),
-        ok: true,
-        output: Some(serde_json::json!({ "nodes": [] })),
-        error: None,
+        fact: ToolCompletionFact {
+            tool_call_id: "req-list".to_string(),
+            tool_id: "fs.list".to_string(),
+            operation_kind: ToolOperationKind::FsList,
+            ok: true,
+            output: Some(serde_json::json!({ "nodes": [] })),
+            error: None,
+        },
         sequence: Some(1),
     };
 
     let encoded = serde_json::to_value(&event).expect("serialize tool result");
     assert_eq!(encoded["kind"], "tool.completed");
-    assert_eq!(encoded["toolName"], "fs.list");
-    assert_eq!(encoded["ok"], true);
+    assert_eq!(encoded["fact"]["toolId"], "fs.list");
+    assert_eq!(encoded["fact"]["ok"], true);
 }
 
 #[test]
@@ -49,16 +52,27 @@ fn draft_ledger_events_round_trip() {
         request_id: Some(RequestId("req-draft".to_string())),
         run_id: RunId("run-1".to_string()),
         session_id: Some(SessionId("session-1".to_string())),
-        draft: serde_json::json!({
-            "draftId": "draft-generic",
-            "status": "draft.chunk",
-            "frame": {
-                "schemaVersion": "deepcode.agent.artifact-draft.v1",
-                "partKind": "artifactChunk",
-                "slotId": "slot-generic",
-                "contentLines": ["generic content"]
-            }
-        }),
+        draft: ArtifactDraftEvent {
+            draft_id: "draft-generic".to_string(),
+            status: ArtifactDraftStatus::Chunk,
+            frame: ArtifactDraftLedgerFrame::ArtifactChunk {
+                base: ArtifactDraftFrameBase {
+                    schema_version: ARTIFACT_DRAFT_SCHEMA_VERSION.to_string(),
+                    draft_id: "draft-generic".to_string(),
+                    frame_id: "frame-generic".to_string(),
+                    run_id: "run-1".to_string(),
+                    session_id: "session-1".to_string(),
+                    task_id: "task-generic".to_string(),
+                    sequence: 1,
+                    content_hash: "fnv1a64:0000000000000000".to_string(),
+                    expected_slot_ids: vec!["slot-generic".to_string()],
+                },
+                slot_id: "slot-generic".to_string(),
+                content_lines: vec!["generic content".to_string()],
+                final_chunk: true,
+                edit_match: None,
+            },
+        },
         sequence: Some(9),
     };
 
@@ -73,6 +87,7 @@ fn draft_ledger_events_round_trip() {
 #[test]
 fn driver_loop_events_round_trip() {
     let contract = KernelStateContract {
+        kernel_abi_version: KERNEL_ABI_VERSION.to_string(),
         run_id: RunId("run-1".to_string()),
         state_id: "ready".to_string(),
         state_kind: "driverRequest".to_string(),
@@ -201,8 +216,8 @@ fn plan_authorization_events_round_trip_with_kernel_contract_and_lease_identity(
             id: "operation-1".to_string(),
             source_task_id: "task-1".to_string(),
             tool_id: "fs.create".to_string(),
-            operation_kind: "create".to_string(),
-            content_mode: "contentBlock".to_string(),
+            operation_kind: ToolOperationKind::FsCreate,
+            content_mode: ToolContentMode::ContentBlock,
             targets: vec!["nested/output.txt".to_string()],
             depends_on: Vec::new(),
             fixed_args: serde_json::json!({"executable": false}),
@@ -210,19 +225,19 @@ fn plan_authorization_events_round_trip_with_kernel_contract_and_lease_identity(
                 "path": "nested/output.txt",
                 "contentBlockId": "executionTime"
             }),
-            target_kind: Some("file".to_string()),
+            target_kind: Some(ToolTargetKind::File),
             recursive: None,
             read_set: Vec::new(),
             write_set: vec!["nested/output.txt".to_string()],
             conflict_keys: vec!["nested/output.txt".to_string()],
-            execution_mode: "execute".to_string(),
+            execution_mode: OperationExecutionMode::Execute,
             internal: false,
             parent_operation_id: None,
         }],
         permission_bundles: Vec::new(),
         interventions: Vec::new(),
-        cleanup_policy: "kernelPlanGrantLease".to_string(),
-        expires_after: "reviewGateReplanCancelOrRunTerminal".to_string(),
+        cleanup_policy: ContractCleanupPolicy::PlanGrantLease,
+        expires_after: ContractExpiry::ReviewGateReplanCancelOrRunTerminal,
     };
     let reviewed = KernelEvent::PlanAuthorizationReviewed {
         request_id: Some(RequestId("req-plan-authorization".to_string())),
@@ -252,7 +267,7 @@ fn plan_authorization_events_round_trip_with_kernel_contract_and_lease_identity(
         run_id: RunId("run-1".to_string()),
         session_id: Some(SessionId("session-1".to_string())),
         authorization_contract_id: "authorization-1".to_string(),
-        decision: "accept".to_string(),
+        decision: PlanAuthorizationDecisionKind::Accept,
         lease_id: Some("plan-grant-lease-authorization-1".to_string()),
         sequence: Some(11),
     };

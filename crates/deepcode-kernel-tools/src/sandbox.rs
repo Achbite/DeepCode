@@ -1,52 +1,8 @@
+use crate::SandboxSupportState;
 use serde::{Deserialize, Serialize};
 
 pub const SANDBOX_CAPABILITY_SCHEMA_VERSION: &str = "deepcode.kernel.sandbox-capability.v1";
 pub const SANDBOX_SPEC_SCHEMA_VERSION: &str = "deepcode.kernel.sandbox-spec.v1";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum IsolationLevel {
-    None,
-    Supervised,
-    OsSandbox,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum SandboxSupportState {
-    Unavailable,
-    ContractOnly,
-    Experimental,
-    Enforced,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum IsolationFallbackPolicy {
-    Deny,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct IsolationContract {
-    pub minimum_level: IsolationLevel,
-    pub support_state: SandboxSupportState,
-    pub backend_requirement: Option<String>,
-    pub profile_ref: Option<String>,
-    pub fallback: IsolationFallbackPolicy,
-    pub output_trust: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CleanupContract {
-    pub lease_policy: String,
-    pub terminate_process_tree: bool,
-    pub remove_scratch: bool,
-    pub revoke_broker_grant: bool,
-    pub deadline_ms: u64,
-    pub failure_policy: String,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

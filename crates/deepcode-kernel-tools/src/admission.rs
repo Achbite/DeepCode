@@ -3,9 +3,12 @@ use crate::input_validation::{validate_action, validate_content_blocks};
 use crate::operation_builders::*;
 use crate::review::normalized_args_for_operation;
 use crate::{
-    ContentBlock, FileTargetRef, GitOperation, GitOperationKind, KernelToolRegistry,
-    OperationExecutionMode, PlannedOperation, PlannedOperationKind, ToolInputValidationError,
-    WorkspaceOperation, WorkspaceOperationKind,
+    ContentBlock, FileTargetRef, GitOperation, GitOperationKind, KernelToolRegistration,
+    KernelToolRegistry, OperationExecutionMode, PlannedOperation, PlannedOperationKind,
+    ToolInputValidationError, ToolOperationKind, WorkspaceOperation, WorkspaceOperationKind,
+};
+use deepcode_kernel_abi::{
+    KernelAction, KernelActionBatch, KernelActionBundle, KernelActionProposal, KernelContentBlock,
 };
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -16,10 +19,6 @@ pub enum OperationCompileError {
     InvalidInput(#[from] ToolInputValidationError),
     #[error("action bundle has no actions")]
     EmptyActions,
-    #[error("action at index {index} is missing actionId")]
-    MissingActionId { index: usize },
-    #[error("action {action_id} is missing toolId")]
-    MissingToolId { action_id: String },
     #[error("action {action_id} requires a content block reference")]
     MissingSourceBlock { action_id: String },
     #[error("contentBlock {content_block_id} was not provided for action {action_id}")]
@@ -60,71 +59,61 @@ pub enum OperationCompileError {
     MissingSearchQuery { action_id: String },
     #[error("fs.glob action {action_id} requires pattern")]
     MissingGlobPattern { action_id: String },
-    #[error("action {action_id} requires typed args")]
-    MissingArgs { action_id: String },
     #[error("unsupported toolId {tool_id}")]
     UnsupportedToolId { tool_id: String },
     #[error("unsupported operation kind {kind} for toolId {tool_id}")]
     UnsupportedKind { tool_id: String, kind: String },
 }
 
-pub struct OperationCompiler {
-    registry: KernelToolRegistry,
+pub struct OperationCompiler<'a> {
+    registry: &'a KernelToolRegistry,
 }
 
-struct WorkspaceActionMetadata {
-    id: String,
-    title: String,
-    tool_id: String,
-    capability: String,
-    permission_labels: Vec<String>,
-}
-
-impl Default for OperationCompiler {
-    fn default() -> Self {
-        Self::new(KernelToolRegistry::default())
-    }
-}
-
-impl OperationCompiler {
-    pub fn new(registry: KernelToolRegistry) -> Self {
+impl<'a> OperationCompiler<'a> {
+    pub fn new(registry: &'a KernelToolRegistry) -> Self {
         Self { registry }
     }
 
     pub fn registry(&self) -> &KernelToolRegistry {
-        &self.registry
+        self.registry
     }
 
     pub fn normalized_args(&self, operation: &PlannedOperation) -> Value {
         normalized_args_for_operation(operation)
     }
 
-    pub fn action_bundle_value<'a>(&self, batch: &'a Value) -> Option<&'a Value> {
-        batch.get("actionBundle")
-    }
-
     pub fn collect_content_blocks(
         &self,
-        batch: &Value,
+        blocks: &[KernelContentBlock],
     ) -> Result<BTreeMap<String, ContentBlock>, OperationCompileError> {
-        Ok(validate_content_blocks(batch)?)
+        Ok(validate_content_blocks(blocks)?)
     }
 
     pub fn compile_batch(
         &self,
-        batch: &Value,
+        batch: &KernelActionBatch,
     ) -> Result<Vec<PlannedOperation>, OperationCompileError> {
-        let action_bundle = self.action_bundle_value(batch);
-        let actions = action_bundle
-            .and_then(|bundle| bundle.get("actions"))
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        if actions.is_empty() {
+        self.compile_payload(&batch.action_bundle, &batch.content_blocks)
+    }
+
+    pub fn compile_proposal(
+        &self,
+        proposal: &KernelActionProposal,
+    ) -> Result<Vec<PlannedOperation>, OperationCompileError> {
+        self.compile_payload(&proposal.action_bundle, &proposal.content_blocks)
+    }
+
+    fn compile_payload(
+        &self,
+        action_bundle: &KernelActionBundle,
+        content_blocks: &[KernelContentBlock],
+    ) -> Result<Vec<PlannedOperation>, OperationCompileError> {
+        if action_bundle.actions.is_empty() {
             return Err(OperationCompileError::EmptyActions);
         }
-        let content_blocks = self.collect_content_blocks(batch)?;
-        let operations = actions
+        let content_blocks = self.collect_content_blocks(content_blocks)?;
+        let operations = action_bundle
+            .actions
             .iter()
             .enumerate()
             .map(|(index, action)| self.compile_action(action, &content_blocks, index))
@@ -162,7 +151,7 @@ impl OperationCompiler {
                     .any(|item: &PlannedOperation| item.id == ensure_id)
                 {
                     expanded.push(internal_ensure_directory_operation(
-                        &self.registry,
+                        self.registry,
                         ensure_id.clone(),
                         parent,
                     ));
@@ -178,17 +167,12 @@ impl OperationCompiler {
 
     pub fn compile_action(
         &self,
-        action: &Value,
+        action: &KernelAction,
         content_blocks: &BTreeMap<String, ContentBlock>,
         index: usize,
     ) -> Result<PlannedOperation, OperationCompileError> {
-        let id = get_string(action, &["actionId"])
-            .ok_or(OperationCompileError::MissingActionId { index })?;
-        let tool_id = get_string(action, &["toolId"]).ok_or_else(|| {
-            OperationCompileError::MissingToolId {
-                action_id: id.clone(),
-            }
-        })?;
+        let id = action.action_id.trim().to_string();
+        let tool_id = action.tool_id.trim().to_string();
         let descriptor = self.registry.get(&tool_id).ok_or_else(|| {
             OperationCompileError::UnsupportedToolId {
                 tool_id: tool_id.clone(),
@@ -196,74 +180,72 @@ impl OperationCompiler {
         })?;
         if !self
             .registry
-            .template(&tool_id)
+            .contract(&tool_id)
             .is_some_and(|template| template.provider_visible)
         {
             return Err(OperationCompileError::UnsupportedToolId { tool_id });
         }
-        validate_action(&self.registry, action, index)?;
-        let capability = descriptor.capability.to_string();
-        let title = get_string(action, &["description"])
-            .expect("canonical action validation requires description");
+        validate_action(self.registry, action, index)?;
+        let capability = descriptor.capability().to_string();
+        let operation_kind = descriptor.operation_kind();
+        let title = action.description.trim().to_string();
         let permission_labels = Vec::new();
-        let depends_on = get_string_array(action, "dependsOn").unwrap_or_default();
-        let mut operation = match tool_id.as_str() {
-            "fs.read" | "fs.list" | "fs.glob" | "fs.diff" | "code.grep" | "fs.create"
-            | "fs.write" | "fs.edit" | "fs.rename" | "fs.delete" | "document.read" => self
-                .compile_workspace_action(
-                    action,
-                    content_blocks,
-                    WorkspaceActionMetadata {
-                        id,
-                        title,
-                        tool_id,
-                        capability,
-                        permission_labels,
-                    },
-                ),
-            "git.status" | "git.diff" | "git.stage" | "git.unstage" | "git.commit" | "git.push" => {
-                self.compile_git_action(action, id, title, &tool_id, capability, permission_labels)
+        let depends_on = action.depends_on.clone();
+        let metadata = OperationMetadata {
+            id,
+            title,
+            tool_id,
+            operation_kind,
+            capability,
+            permission_labels,
+        };
+        let mut operation = match operation_kind {
+            ToolOperationKind::FsRead
+            | ToolOperationKind::FsList
+            | ToolOperationKind::FsGlob
+            | ToolOperationKind::FsDiff
+            | ToolOperationKind::CodeGrep
+            | ToolOperationKind::FsCreate
+            | ToolOperationKind::FsWrite
+            | ToolOperationKind::FsEdit
+            | ToolOperationKind::FsRename
+            | ToolOperationKind::FsDelete
+            | ToolOperationKind::DocumentRead => {
+                self.compile_workspace_action(&action.args, content_blocks, metadata)
             }
-            "process.exec" => Ok(external_process_operation(
-                &self.registry,
-                action,
-                id,
-                title,
-                tool_id,
-                capability,
-                permission_labels,
+            ToolOperationKind::GitStatus
+            | ToolOperationKind::GitDiff
+            | ToolOperationKind::GitStage
+            | ToolOperationKind::GitUnstage
+            | ToolOperationKind::GitCommit
+            | ToolOperationKind::GitPush => self.compile_git_action(&action.args, metadata),
+            ToolOperationKind::ProcessExec => Ok(external_process_operation(
+                self.registry,
+                &action.args,
+                metadata,
             )),
-            "web.search" | "web.fetch" => Ok(external_network_operation(
-                &self.registry,
-                action,
-                id,
-                title,
-                tool_id,
-                capability,
-                permission_labels,
+            ToolOperationKind::WebSearch | ToolOperationKind::WebFetch => Ok(
+                external_network_operation(self.registry, &action.args, metadata),
+            ),
+            ToolOperationKind::BrowserOpen
+            | ToolOperationKind::BrowserReload
+            | ToolOperationKind::BrowserSnapshot
+            | ToolOperationKind::BrowserInspect
+            | ToolOperationKind::BrowserClick
+            | ToolOperationKind::BrowserType
+            | ToolOperationKind::BrowserScroll => Ok(external_browser_operation(
+                self.registry,
+                &action.args,
+                metadata,
             )),
-            "browser.open" | "browser.reload" | "browser.snapshot" | "browser.inspect"
-            | "browser.click" | "browser.type" | "browser.scroll" => {
-                Ok(external_browser_operation(
-                    &self.registry,
-                    action,
-                    id,
-                    title,
-                    tool_id,
-                    capability,
-                    permission_labels,
-                ))
-            }
-            "provider.call" => Ok(external_provider_operation(
-                &self.registry,
-                action,
-                id,
-                title,
-                tool_id,
-                capability,
-                permission_labels,
+            ToolOperationKind::ProviderCall => Ok(external_provider_operation(
+                self.registry,
+                &action.args,
+                metadata,
             )),
-            _ => Err(OperationCompileError::UnsupportedToolId { tool_id }),
+            ToolOperationKind::FsEnsureDirectory => Err(OperationCompileError::UnsupportedToolId {
+                tool_id: metadata.tool_id,
+            }),
         }?;
         operation.depends_on = depends_on;
         Ok(operation)
@@ -271,23 +253,19 @@ impl OperationCompiler {
 
     fn compile_workspace_action(
         &self,
-        action: &Value,
+        args: &Value,
         content_blocks: &BTreeMap<String, ContentBlock>,
-        metadata: WorkspaceActionMetadata,
+        metadata: OperationMetadata,
     ) -> Result<PlannedOperation, OperationCompileError> {
-        let WorkspaceActionMetadata {
+        let OperationMetadata {
             id,
             title,
             tool_id,
+            operation_kind,
             capability,
             permission_labels,
         } = metadata;
-        let kind = workspace_kind_for_tool(&tool_id)?;
-        let args = action
-            .get("args")
-            .ok_or_else(|| OperationCompileError::MissingArgs {
-                action_id: id.clone(),
-            })?;
+        let kind = workspace_kind_for_operation(operation_kind)?;
         let target_kind = get_string(args, &["targetKind"]);
         let recursive = get_bool(args, "recursive");
         let mut target_path = get_string(args, &["path"]);
@@ -332,7 +310,7 @@ impl OperationCompiler {
                     content_block_id: block_id.clone(),
                 });
             }
-            validate_content_block_binding(&tool_id, &id, args, block)?;
+            validate_content_block_binding(operation_kind, &tool_id, &id, args, block)?;
             content = Some(block_content);
             allow_empty_content = block_allows_empty_content(block);
             target_path = target_path.or_else(|| block.target_path.clone());
@@ -442,11 +420,13 @@ impl OperationCompiler {
             }
         }
         let conflict_keys = conflict_keys_for_action(&read_set, &write_set);
-        let execution_mode = operation_execution_mode(&self.registry, &tool_id, kind)?;
+        let execution_mode = operation_execution_mode(self.registry, &tool_id, kind)?;
 
         Ok(PlannedOperation {
             id,
             title,
+            tool_id,
+            operation_kind,
             depends_on: Vec::new(),
             capability,
             permission_labels,
@@ -496,15 +476,18 @@ impl OperationCompiler {
 
     fn compile_git_action(
         &self,
-        action: &Value,
-        id: String,
-        title: String,
-        tool_id: &str,
-        capability: String,
-        permission_labels: Vec<String>,
+        args: &Value,
+        metadata: OperationMetadata,
     ) -> Result<PlannedOperation, OperationCompileError> {
-        let kind = git_kind_for_tool(tool_id)?;
-        let args = action.get("args").unwrap_or(&Value::Null);
+        let OperationMetadata {
+            id,
+            title,
+            tool_id,
+            operation_kind,
+            capability,
+            permission_labels,
+        } = metadata;
+        let kind = git_kind_for_operation(operation_kind)?;
         let mut paths = get_string_array(args, "paths").unwrap_or_default();
         if paths.is_empty() {
             if let Some(path) = get_string(args, &["path"]) {
@@ -542,13 +525,14 @@ impl OperationCompiler {
         let conflict_keys = conflict_keys_for_action(&read_set, &write_set);
         let execution_mode = self
             .registry
-            .tool_for_git_kind(kind)
-            .and_then(|tool_id| self.registry.get(tool_id))
-            .map(|descriptor| descriptor.execution_mode)
+            .get(&tool_id)
+            .map(KernelToolRegistration::execution_mode)
             .unwrap_or(OperationExecutionMode::Blocked);
         Ok(PlannedOperation {
             id,
             title,
+            tool_id,
+            operation_kind,
             depends_on: Vec::new(),
             capability,
             permission_labels,
@@ -570,6 +554,7 @@ impl OperationCompiler {
 }
 
 fn validate_content_block_binding(
+    operation_kind: ToolOperationKind,
     tool_id: &str,
     action_id: &str,
     args: &Value,
@@ -589,14 +574,14 @@ fn validate_content_block_binding(
     }
 
     let operation = block.operation.as_deref().unwrap_or_default();
-    let valid = match tool_id {
-        "fs.create" => matches!(operation, "create" | "createEmpty"),
-        "fs.write" => operation == "overwrite",
-        "fs.edit" => matches!(
+    let valid = match operation_kind {
+        ToolOperationKind::FsCreate => matches!(operation, "create" | "createEmpty"),
+        ToolOperationKind::FsWrite => operation == "overwrite",
+        ToolOperationKind::FsEdit => matches!(
             operation,
             "patch" | "replaceBlock" | "insertBefore" | "insertAfter"
         ),
-        "fs.diff" => true,
+        ToolOperationKind::FsDiff => true,
         _ => false,
     };
     if !valid {

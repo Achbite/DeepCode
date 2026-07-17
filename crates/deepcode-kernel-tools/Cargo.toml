@@ -8,6 +8,7 @@ authors.workspace = true
 description = "DeepCode kernel tool registry, operation compiler, and work-unit graph metadata."
 
 [dependencies]
+deepcode-kernel-abi = { path = "../deepcode-kernel-abi" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
