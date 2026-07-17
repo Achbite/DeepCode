@@ -2,7 +2,10 @@ use crate::prelude::*;
 use crate::*;
 
 pub(crate) async fn health(State(state): State<AppState>) -> Json<ApiResponse> {
-    let workspace = current_workspace_json(&state.runtime).unwrap_or(Value::Null);
+    let workspace = current_workspace(&state.runtime)
+        .ok()
+        .and_then(|workspace| serde_json::to_value(workspace).ok())
+        .unwrap_or(Value::Null);
     let tool_catalog_snapshot = deepcode_kernel_runtime::kernel_tool_catalog_snapshot();
     let build_info = packaged_build_info().unwrap_or(Value::Null);
     ApiResponse::ok(json!({
@@ -11,6 +14,7 @@ pub(crate) async fn health(State(state): State<AppState>) -> Json<ApiResponse> {
         "kernel": "ready",
         "buildCommit": build_commit(),
         "buildInfo": build_info,
+        "kernelAbiVersion": deepcode_kernel_runtime::KERNEL_ABI_VERSION,
         "protocolVersion": deepcode_kernel_runtime::AGENT_PROTOCOL_VERSION,
         "toolCatalogVersion": deepcode_kernel_runtime::TOOL_CATALOG_VERSION,
         "toolCatalogCount": deepcode_kernel_runtime::kernel_visible_tool_catalog_count(),

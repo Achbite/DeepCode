@@ -2,7 +2,7 @@ use crate::prelude::*;
 use crate::*;
 use deepcode_kernel_ledger::{
     KernelResource, KernelResourceCleanupPolicy, KernelResourceIdentity, KernelResourceKind,
-    KernelResourceManager, KernelResourceOwner, KernelResourceScope,
+    KernelResourceManager, KernelResourceMetadata, KernelResourceOwner, KernelResourceScope,
 };
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use std::collections::BTreeMap;
@@ -208,12 +208,11 @@ impl TerminalRuntime {
                     owner,
                     KernelResourceScope::Session,
                     KernelResourceCleanupPolicy::OnSessionEnd,
-                    serde_json::json!({
-                        "terminalId": &id,
-                        "cwd": session.cwd.to_string_lossy(),
-                        "shellKind": &session.shell_kind,
-                        "managedBy": "deepcode-kernel-terminal-runtime"
-                    }),
+                    KernelResourceMetadata::TerminalSession {
+                        terminal_id: id.clone(),
+                        cwd: session.cwd.to_string_lossy().to_string(),
+                        shell_kind: session.shell_kind.clone(),
+                    },
                 )],
                 |_| Ok(()),
             )
@@ -662,9 +661,11 @@ mod tests {
             .list()
             .into_iter()
             .find(|resource| {
-                resource.metadata.get("terminalId").and_then(Value::as_str)
-                    == Some(session_id.as_str())
-                    && resource.state == deepcode_kernel_ledger::KernelResourceState::Active
+                matches!(
+                    &resource.metadata,
+                    KernelResourceMetadata::TerminalSession { terminal_id, .. }
+                        if terminal_id == &session_id
+                ) && resource.state == deepcode_kernel_ledger::KernelResourceState::Active
             })
             .expect("terminal resource");
         assert_eq!(resource.kind, KernelResourceKind::TerminalSession);
@@ -706,8 +707,11 @@ mod tests {
             .expect("delete terminal session");
         assert!(runtime.sessions_json().is_empty());
         assert!(runtime.resources.list().into_iter().all(|resource| {
-            resource.metadata.get("terminalId").and_then(Value::as_str) != Some(session_id.as_str())
-                || resource.state == deepcode_kernel_ledger::KernelResourceState::Released
+            !matches!(
+                &resource.metadata,
+                KernelResourceMetadata::TerminalSession { terminal_id, .. }
+                    if terminal_id == &session_id
+            ) || resource.state == deepcode_kernel_ledger::KernelResourceState::Released
         }));
     }
 }

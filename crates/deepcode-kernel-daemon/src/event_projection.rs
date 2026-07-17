@@ -17,61 +17,29 @@ pub(crate) fn record_kernel_events(state: &AppState, events: &[KernelEvent]) {
 }
 
 pub(crate) fn kernel_command_session_id(command: &KernelCommand) -> Option<String> {
-    serde_json::to_value(command)
-        .ok()
-        .and_then(|value| value.get("sessionId").cloned())
-        .and_then(|value| match value {
-            Value::String(value) => Some(value),
-            Value::Object(map) => map
-                .get("0")
-                .or_else(|| map.get("value"))
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            _ => None,
-        })
+    command.session_id().map(|session_id| session_id.0.clone())
 }
 
 pub(crate) fn kernel_event_session_id(event: &KernelEvent) -> Option<String> {
-    serde_json::to_value(event)
-        .ok()
-        .and_then(|value| value.get("sessionId").cloned())
-        .and_then(|value| match value {
-            Value::String(value) => Some(value),
-            Value::Object(map) => map
-                .get("0")
-                .or_else(|| map.get("value"))
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            _ => None,
-        })
+    event.session_id().map(|session_id| session_id.0.clone())
 }
 
-pub(crate) fn dispatch_skill(
+pub(crate) fn dispatch_host_skill_catalog(
     runtime: &SharedRuntime,
     command: KernelCommand,
-) -> Result<Value, KernelErrorEnvelope> {
+) -> Result<HostSkillCatalogResult, KernelErrorEnvelope> {
     let mut runtime = runtime.lock().expect("kernel runtime lock");
     let events = runtime
         .dispatch(command)
         .map_err(|error| KernelErrorEnvelope::from(&error))?;
     for event in events {
-        match event {
-            KernelEvent::SkillResult {
-                ok: true,
-                output: Some(output),
-                ..
-            } => return Ok(output),
-            KernelEvent::SkillResult {
-                ok: false,
-                error: Some(error),
-                ..
-            } => return Err(error),
-            _ => {}
+        if let KernelEvent::HostSkillsDiscovered { result, .. } = event {
+            return Ok(result);
         }
     }
     Err(KernelErrorEnvelope {
         code: "unexpected_event".to_string(),
-        message: "expected terminal skill result".to_string(),
+        message: "expected host skill catalog result".to_string(),
         message_key: None,
         args: None,
     })
@@ -234,7 +202,7 @@ pub(crate) fn kernel_event_to_agent_events(session_id: &str, event: &KernelEvent
                 "stage": "resource_resolve",
                 "phase": "resource",
                 "status": "packet_produced",
-                "summary": packet.get("summary").and_then(Value::as_str).unwrap_or("ResourcePacket produced."),
+                "summary": packet.summary,
                 "channel": "task",
                 "visibility": "task",
                 "kernelEvent": event
@@ -264,7 +232,7 @@ pub(crate) fn kernel_event_to_agent_events(session_id: &str, event: &KernelEvent
                 "stage": "work_unit",
                 "phase": "execution",
                 "status": "queued",
-                "summary": work_unit.get("title").and_then(Value::as_str).unwrap_or("Work unit queued."),
+                "summary": work_unit.title,
                 "workUnit": work_unit,
                 "channel": "task",
                 "visibility": "conversation",
@@ -387,8 +355,8 @@ pub(crate) fn kernel_event_to_agent_events(session_id: &str, event: &KernelEvent
             json!({
                 "stage": "review_gate",
                 "phase": "review",
-                "status": result.get("status").and_then(Value::as_str).unwrap_or("needsUserReview"),
-                "summary": result.get("summary").and_then(Value::as_str).unwrap_or("Kernel ReviewGate evaluated."),
+                "status": result.status.as_str(),
+                "summary": &result.summary,
                 "result": result,
                 "channel": "task",
                 "visibility": "conversation",
@@ -455,43 +423,33 @@ pub(crate) fn kernel_event_to_agent_events(session_id: &str, event: &KernelEvent
             }),
             &now_text(),
         )],
-        KernelEvent::ToolRequested {
-            tool_call_id,
-            tool_name,
-            args_preview,
-            ..
-        } => vec![agent_event(
+        KernelEvent::ToolRequested { fact, .. } => vec![agent_event(
             session_id,
             "tool_call",
             json!({
-                "id": tool_call_id,
-                "name": tool_name,
-                "toolName": tool_name,
-                "arguments": args_preview,
+                "id": fact.tool_call_id,
+                "name": fact.tool_id,
+                "toolId": fact.tool_id,
+                "operationKind": fact.operation_kind,
+                "arguments": fact.args_preview,
                 "channel": "tool",
                 "visibility": "conversation",
                 "kernelEvent": event
             }),
             &now_text(),
         )],
-        KernelEvent::ToolCompleted {
-            tool_call_id,
-            tool_name,
-            ok,
-            output,
-            error,
-            ..
-        } => vec![agent_event(
+        KernelEvent::ToolCompleted { fact, .. } => vec![agent_event(
             session_id,
             "tool_result",
             json!({
-                "callId": tool_call_id,
-                "toolName": tool_name,
-                "ok": ok,
-                "status": if *ok { "ok" } else { "error" },
-                "output": output,
-                "error": error.as_ref().map(|value| value.message.clone()),
-                "code": error.as_ref().map(|value| value.code.clone()),
+                "callId": fact.tool_call_id,
+                "toolId": fact.tool_id,
+                "operationKind": fact.operation_kind,
+                "ok": fact.ok,
+                "status": if fact.ok { "ok" } else { "error" },
+                "output": fact.output,
+                "error": fact.error.as_ref().map(|value| value.message.clone()),
+                "code": fact.error.as_ref().map(|value| value.code.clone()),
                 "channel": "tool",
                 "visibility": "conversation",
                 "kernelEvent": event
@@ -578,35 +536,24 @@ pub(crate) fn kernel_event_to_agent_events(session_id: &str, event: &KernelEvent
             report,
             ..
         } => {
-            let status = report
-                .get("status")
-                .and_then(Value::as_str)
-                .unwrap_or("awaitingUserApproval");
-            let confirmable = matches!(
-                status,
-                "autoAccepted" | "awaitingUserApproval" | "awaitingTemporaryGrant" | "pending"
-            );
+            let status = report.status.as_str();
+            let confirmable =
+                report.status != deepcode_kernel_abi::KernelExecutionContractStatus::Denied;
             vec![agent_event(
                 session_id,
                 "plan_review",
                 json!({
                     "title": "Check / 计划确认",
-                    "summary": report
-                        .get("kernelGeneratedPermissionSummary")
-                        .and_then(Value::as_str)
-                        .unwrap_or("Kernel ProposalReview 已完成，请确认是否同意计划。"),
+                    "summary": "Kernel ProposalReview 已完成，请确认是否同意执行合约。",
                     "status": status,
                     "runId": event_run_id(event),
-                    "planId": report.get("planId").and_then(Value::as_str).unwrap_or("agent-plan"),
+                    "planId": proposal_id,
                     "proposalId": proposal_id,
                     "confirmable": confirmable,
-                    "requiredPermissions": report.get("requiredPermissions").cloned().unwrap_or_else(|| json!([])),
-                    "permissionGaps": report.get("permissionGaps").cloned().unwrap_or_else(|| json!([])),
-                    "requiredFileOperations": report.get("requiredFileOperations").cloned().unwrap_or_else(|| json!([])),
-                    "requiredAccessScopes": report.get("requiredAccessScopes").cloned().unwrap_or_else(|| json!([])),
-                    "permissionBundles": report.get("permissionBundles").cloned().unwrap_or_else(|| json!([])),
-                    "interventions": report.get("interventions").cloned().unwrap_or_else(|| json!([])),
-                    "executionContract": report.get("executionContract").cloned().unwrap_or(Value::Null),
+                    "requiredPermissions": &report.required_permissions,
+                    "permissionBundles": &report.execution_contract.permission_bundles,
+                    "interventions": &report.execution_contract.interventions,
+                    "executionContract": &report.execution_contract,
                     "report": report,
                     "facts": plan_review_facts(report),
                     "channel": "progress",
@@ -645,60 +592,17 @@ fn runtime_lifecycle_status(state: deepcode_kernel_abi::RuntimeLifecycleState) -
     }
 }
 
-fn plan_review_facts(report: &Value) -> Vec<String> {
+fn plan_review_facts(report: &deepcode_kernel_abi::KernelProposalReviewReport) -> Vec<String> {
     vec![
-        format!(
-            "状态：{}",
-            report
-                .get("status")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown")
-        ),
-        format!(
-            "所需能力：{}",
-            report_array_text(report, "requiredCapabilities")
-        ),
-        format!("权限缺口：{}", report_array_text(report, "permissionGaps")),
-        format!("文件操作范围：{}", required_file_operations_text(report)),
-        format!("拒绝原因：{}", report_array_text(report, "deniedReasons")),
+        format!("状态：{}", report.status.as_str()),
+        format!("所需权限：{}", join_or_none(&report.required_permissions)),
+        format!("操作数量：{}", report.execution_contract.operations.len()),
+        format!("诊断：{}", join_or_none(&report.diagnostics)),
         "用户确认的是 Kernel 执行合约；权限缺口由 Kernel permission bundle / gate intervention 驱动。".to_string(),
     ]
 }
 
-fn required_file_operations_text(report: &Value) -> String {
-    let Some(items) = report
-        .get("requiredFileOperations")
-        .and_then(Value::as_array)
-    else {
-        return "none".to_string();
-    };
-    let values = items
-        .iter()
-        .filter_map(|item| {
-            let operation = item.get("operation").and_then(Value::as_str)?;
-            let target_path = item.get("targetPath").and_then(Value::as_str)?;
-            let capability = item.get("capability").and_then(Value::as_str).unwrap_or("");
-            let target_kind = item
-                .get("targetKind")
-                .and_then(Value::as_str)
-                .filter(|value| !value.is_empty());
-            let outside_workspace = item
-                .get("outsideWorkspace")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            let suffix = match (target_kind, outside_workspace) {
-                (Some(kind), true) => format!(",{kind},outsideWorkspace"),
-                (Some(kind), false) => format!(",{kind}"),
-                (None, true) => ",outsideWorkspace".to_string(),
-                (None, false) => String::new(),
-            };
-            Some(if capability.is_empty() {
-                format!("{operation}:{target_path}{suffix}")
-            } else {
-                format!("{operation}:{target_path}({capability}{suffix})")
-            })
-        })
-        .collect::<Vec<_>>();
+fn join_or_none(values: &[String]) -> String {
     if values.is_empty() {
         "none".to_string()
     } else {
@@ -706,38 +610,8 @@ fn required_file_operations_text(report: &Value) -> String {
     }
 }
 
-fn report_array_text(report: &Value, key: &str) -> String {
-    report
-        .get(key)
-        .and_then(Value::as_array)
-        .map(|items| {
-            let values = items
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect::<Vec<_>>();
-            if values.is_empty() {
-                "无".to_string()
-            } else {
-                values.join(", ")
-            }
-        })
-        .unwrap_or_else(|| "无".to_string())
-}
-
 fn event_run_id(event: &KernelEvent) -> Option<String> {
-    serde_json::to_value(event)
-        .ok()
-        .and_then(|value| value.get("runId").cloned())
-        .and_then(|value| match value {
-            Value::String(value) => Some(value),
-            Value::Object(map) => map
-                .get("0")
-                .or_else(|| map.get("value"))
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            _ => None,
-        })
+    event.run_id().map(|run_id| run_id.0.clone())
 }
 
 pub(crate) fn agent_event(session_id: &str, kind: &str, payload: Value, ts: &str) -> Value {

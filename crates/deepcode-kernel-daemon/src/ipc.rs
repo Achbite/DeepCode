@@ -3,24 +3,6 @@ use crate::*;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct KernelCommandEnvelope {
-    pub(crate) request_id: Option<String>,
-    pub(crate) command: KernelCommand,
-    pub(crate) idempotency_key: Option<String>,
-    pub(crate) expected_snapshot_seq: Option<u64>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct KernelReply {
-    pub(crate) ok: bool,
-    pub(crate) events: Vec<KernelEvent>,
-    pub(crate) snapshot: Option<KernelSnapshot>,
-    pub(crate) error: Option<KernelErrorEnvelope>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub(crate) struct KernelSnapshotQuery {
     pub(crate) session_id: Option<String>,
 }

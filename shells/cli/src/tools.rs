@@ -1,4 +1,6 @@
 use crate::*;
+use deepcode_kernel_abi::*;
+use deepcode_kernel_tools::{KernelToolCatalogSnapshot, OperationExecutionMode};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) async fn run_kernel_tool_contract(
@@ -10,11 +12,13 @@ pub(crate) async fn run_kernel_tool_contract(
 ) -> Result<(), String> {
     let input = read_json_object(Path::new(args_file))?;
     let args = input.get("args").cloned().unwrap_or_else(|| input.clone());
-    let content_blocks = input
-        .get("contentBlocks")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+    let content_blocks = decode_content_blocks(
+        input
+            .get("contentBlocks")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
+    )?;
     let result = execute_kernel_tool_contract(
         client,
         tool_id,
@@ -113,11 +117,12 @@ pub(crate) async fn verify_kernel_tool_contracts(
             .get("args")
             .cloned()
             .unwrap_or_else(|| serde_json::json!({}));
-        let content_blocks = case
-            .get("contentBlocks")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
+        let content_blocks = decode_content_blocks(
+            case.get("contentBlocks")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+        )?;
         let case_result = execute_kernel_tool_contract(
             client,
             tool_id,
@@ -176,33 +181,16 @@ pub(crate) fn verify_catalog_case_coverage(
     catalog: &Value,
     coverage: &BTreeMap<String, BTreeSet<String>>,
 ) -> Result<Vec<String>, String> {
-    let tools = catalog
-        .get("tools")
-        .and_then(Value::as_array)
-        .ok_or_else(|| "Kernel ToolCatalog snapshot is missing tools".to_string())?;
+    let catalog: KernelToolCatalogSnapshot = serde_json::from_value(catalog.clone())
+        .map_err(|error| format!("decode Kernel ToolCatalog snapshot: {error}"))?;
     let mut errors = Vec::new();
-    for tool in tools {
-        let tool_id = tool
-            .get("toolId")
-            .and_then(Value::as_str)
-            .ok_or_else(|| "Kernel ToolCatalog entry is missing toolId".to_string())?;
-        let execution_mode = tool
-            .get("executionMode")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                format!("Kernel ToolCatalog entry {tool_id} is missing executionMode")
-            })?;
-        let provider_visible = tool
-            .get("providerVisible")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let observed = coverage.get(tool_id);
-        let required = if execution_mode == "blocked" {
-            &["blocked"][..]
-        } else if execution_mode == "execute" && provider_visible {
-            &["success", "failure"][..]
-        } else {
-            &[][..]
+    for tool in catalog.tools {
+        let tool_id = tool.tool_id;
+        let observed = coverage.get(&tool_id);
+        let required = match (tool.execution_mode, tool.provider_visible) {
+            (OperationExecutionMode::Blocked, _) => &["blocked"][..],
+            (OperationExecutionMode::Execute, true) => &["success", "failure"][..],
+            _ => &[][..],
         };
         for outcome in required {
             if !observed.is_some_and(|items| items.contains(*outcome)) {
@@ -218,7 +206,7 @@ async fn execute_kernel_tool_contract(
     tool_id: &str,
     workspace: &Path,
     args: Value,
-    content_blocks: Vec<Value>,
+    content_blocks: Vec<KernelContentBlock>,
     approve_contract: bool,
 ) -> Result<Value, String> {
     let workspace = workspace
@@ -228,94 +216,97 @@ async fn execute_kernel_tool_contract(
         return Err("tool workspace must be a directory".to_string());
     }
     let suffix = unique_cli_id();
-    let session_id = format!("cli-tools-session-{suffix}");
-    let request_id = format!("cli-tools-run-{suffix}");
+    let session_id = SessionId(format!("cli-tools-session-{suffix}"));
     let run_reply = client
-        .kernel_command(serde_json::json!({
-            "kind": "runCreate",
-            "requestId": request_id,
-            "sessionId": session_id,
-            "input": { "text": format!("CLI verification for {tool_id}"), "attachments": [] },
-            "workspaceBinding": {
-                "workspaceId": format!("cli-workspace-{suffix}"),
-                "workspaceHash": null,
-                "openPath": workspace,
-                "activeFolderId": null,
-                "folderHash": null
+        .kernel_command(KernelCommand::RunCreate {
+            request_id: RequestId(format!("cli-tools-run-{suffix}")),
+            session_id: Some(session_id.clone()),
+            input: UserInput {
+                text: format!("CLI verification for {tool_id}"),
+                attachments: Vec::new(),
             },
-            "profileRef": null,
-            "runOverrides": null
-        }))
+            workspace_binding: Some(WorkspaceBinding {
+                workspace_id: Some(format!("cli-workspace-{suffix}")),
+                workspace_hash: None,
+                open_path: Some(workspace.to_string_lossy().into_owned()),
+                active_folder_id: None,
+                folder_hash: None,
+            }),
+            profile_ref: None,
+            run_overrides: None,
+        })
         .await
         .map_err(|error| format!("RunCreate failed: {error}"))?;
-    let run_id = event_string(&run_reply, "state.entered", "runId")
-        .ok_or_else(|| "RunCreate did not return state.entered runId".to_string())?;
-    let state_contract = event_value(&run_reply, "state.entered", "stateContract")
+    let (run_id, state_contract) = run_reply
+        .events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            KernelEvent::StateEntered {
+                run_id,
+                state_contract,
+                ..
+            } => Some((run_id.clone(), state_contract.clone())),
+            _ => None,
+        })
         .ok_or_else(|| "RunCreate did not return a Kernel state contract".to_string())?;
     let tool_catalog = state_contract
-        .get("toolCatalogSnapshot")
+        .tool_catalog_snapshot
         .ok_or_else(|| "Kernel state contract is missing ToolCatalog snapshot".to_string())?;
-    let catalog_version = tool_catalog
-        .get("catalogVersion")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "Kernel ToolCatalog snapshot is missing catalogVersion".to_string())?;
-    let catalog_hash = tool_catalog
-        .get("catalogHash")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "Kernel ToolCatalog snapshot is missing catalogHash".to_string())?;
+    let catalog_version = tool_catalog.catalog_version.clone();
+    let catalog_hash = tool_catalog.catalog_hash.clone();
     let tool_snapshot = tool_catalog
-        .get("tools")
-        .and_then(Value::as_array)
-        .and_then(|tools| {
-            tools
-                .iter()
-                .find(|tool| tool.get("toolId").and_then(Value::as_str) == Some(tool_id))
-        })
+        .tools
+        .iter()
+        .find(|tool| tool.tool_id == tool_id)
         .ok_or_else(|| format!("Kernel ToolCatalog does not register {tool_id}"))?;
-    let execution_mode = tool_snapshot
-        .get("executionMode")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown");
+    let execution_mode = tool_snapshot.execution_mode;
     let action_id = format!("action-{suffix}");
     let bundle_id = format!("bundle-{suffix}");
     let proposal_id = format!("proposal-{suffix}");
     let plan_id = format!("plan-{suffix}");
     let plan_hash = format!("cli-plan-{suffix}");
     let task_id = format!("task-{suffix}");
-    let plan_targets = plan_targets_for_tool(tool_id, &args);
+    let plan_targets = tool_snapshot.plan_target_source.derive(&args);
     let planning_args = planning_args_from_catalog(tool_snapshot, &args)?;
     let plan_reply = client
-        .kernel_command(serde_json::json!({
-            "kind": "planAuthorizationSubmit",
-            "requestId": format!("cli-tools-plan-{suffix}"),
-            "runId": run_id,
-            "sessionId": session_id,
-            "intent": {
-                "schemaVersion": "deepcode.kernel.task-intent.v2",
-                "planId": plan_id,
-                "planHash": plan_hash,
-                "runId": run_id,
-                "sessionId": session_id,
-                "workspaceBindingHash": null,
-                "catalogVersion": catalog_version,
-                "catalogHash": catalog_hash,
-                "tasks": [{
-                    "taskId": task_id,
-                    "toolId": tool_id,
-                    "targets": plan_targets,
-                    "dependsOn": [],
-                    "args": planning_args
-                }]
-            }
-        }))
+        .kernel_command(KernelCommand::PlanAuthorizationSubmit {
+            request_id: RequestId(format!("cli-tools-plan-{suffix}")),
+            run_id: run_id.clone(),
+            session_id: Some(session_id.clone()),
+            intent: TaskIntentEnvelope {
+                schema_version: TASK_INTENT_SCHEMA_VERSION.to_string(),
+                plan_id: plan_id.clone(),
+                plan_hash: plan_hash.clone(),
+                run_id: run_id.clone(),
+                session_id: Some(session_id.clone()),
+                workspace_binding_hash: None,
+                catalog_version,
+                catalog_hash,
+                tasks: vec![TaskIntentTask {
+                    task_id,
+                    tool_id: tool_id.to_string(),
+                    targets: plan_targets,
+                    depends_on: Vec::new(),
+                    args: planning_args,
+                }],
+            },
+        })
         .await
         .map_err(|error| format!("PlanAuthorizationSubmit failed: {error}"))?;
-    let authorization_review = event_value(&plan_reply, "plan_authorization.reviewed", "review")
+    let authorization_review = plan_reply
+        .events
+        .into_iter()
+        .rev()
+        .find_map(|event| match event {
+            KernelEvent::PlanAuthorizationReviewed { review, .. } => Some(review),
+            _ => None,
+        })
         .ok_or_else(|| {
             "PlanAuthorizationSubmit did not return plan_authorization.reviewed".to_string()
         })?;
-    if authorization_review.get("status").and_then(Value::as_str) != Some("confirmable") {
-        if execution_mode == "blocked" {
+    if authorization_review.status != PlanAuthorizationStatus::Confirmable {
+        if execution_mode == OperationExecutionMode::Blocked {
             return Ok(serde_json::json!({
                 "outcome": "blocked",
                 "toolId": tool_id,
@@ -324,114 +315,97 @@ async fn execute_kernel_tool_contract(
             }));
         }
         return Err(format!(
-            "Kernel could not form a confirmable plan authorization: {authorization_review}"
+            "Kernel could not form a confirmable plan authorization: {authorization_review:?}"
         ));
     }
-    let authorization_contract = authorization_review
-        .get("authorizationContract")
-        .ok_or_else(|| "plan authorization review is missing its contract".to_string())?;
-    let authorization_contract_id = authorization_contract
-        .get("id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "plan authorization contract is missing id".to_string())?;
-    let authorization_contract_hash = authorization_contract
-        .get("contractHash")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "plan authorization contract is missing contractHash".to_string())?;
+    let authorization_contract = authorization_review.authorization_contract.clone();
+    let authorization_contract_id = authorization_contract.id.clone();
+    let authorization_contract_hash = authorization_contract.contract_hash.clone();
     let mutation = authorization_contract
-        .get("operations")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .any(|operation| {
-            operation
-                .get("writeSet")
-                .and_then(Value::as_array)
-                .is_some_and(|items| !items.is_empty())
-        });
+        .operations
+        .iter()
+        .any(|operation| !operation.write_set.is_empty());
     if mutation && !approve_contract {
         return Err(format!(
-            "mutation plan authorization requires --approve-contract: {authorization_contract}"
+            "mutation plan authorization requires --approve-contract: {authorization_contract:?}"
         ));
     }
     client
-        .kernel_command(serde_json::json!({
-            "kind": "planAuthorizationDecisionSubmit",
-            "requestId": format!("cli-tools-plan-decision-{suffix}"),
-            "runId": run_id,
-            "sessionId": session_id,
-            "decision": {
-                "decisionId": format!("plan-decision-{suffix}"),
-                "authorizationContractId": authorization_contract_id,
-                "planId": plan_id,
-                "planHash": plan_hash,
-                "contractHash": authorization_contract_hash,
-                "decision": "accept"
-            }
-        }))
+        .kernel_command(KernelCommand::PlanAuthorizationDecisionSubmit {
+            request_id: RequestId(format!("cli-tools-plan-decision-{suffix}")),
+            run_id: run_id.clone(),
+            session_id: Some(session_id.clone()),
+            decision: PlanAuthorizationDecisionSubmit {
+                decision_id: format!("plan-decision-{suffix}"),
+                authorization_contract_id: authorization_contract_id.clone(),
+                plan_id: plan_id.clone(),
+                plan_hash: plan_hash.clone(),
+                contract_hash: authorization_contract_hash,
+                decision: PlanAuthorizationDecisionKind::Accept,
+            },
+        })
         .await
         .map_err(|error| format!("PlanAuthorizationDecisionSubmit failed: {error}"))?;
-    let action_bundle = serde_json::json!({
-        "id": bundle_id,
-        "goal": format!("Execute {tool_id} through the Kernel contract path."),
-        "actions": [{
-            "actionId": action_id,
-            "toolId": tool_id,
-            "args": args,
-            "description": format!("Run {tool_id} through CLI verification."),
-            "dependsOn": []
+    let action_bundle = KernelActionBundle {
+        version: "1".to_string(),
+        id: bundle_id.clone(),
+        goal: format!("Execute {tool_id} through the Kernel contract path."),
+        requirement_id: None,
+        actions: vec![KernelAction {
+            action_id,
+            tool_id: tool_id.to_string(),
+            args,
+            description: format!("Run {tool_id} through CLI verification."),
+            depends_on: Vec::new(),
         }],
-        "validationExpectations": [{
-            "id": format!("validation-{suffix}"),
-            "description": "Kernel records the terminal WorkUnit and ToolCompleted fact."
+        continuation_expectations: Vec::new(),
+        validation_expectations: vec![KernelValidationExpectation {
+            id: format!("validation-{suffix}"),
+            description: "Kernel records the terminal WorkUnit and ToolCompleted fact.".to_string(),
         }],
-        "reviewExpectations": [{
-            "id": format!("review-{suffix}"),
-            "description": "ReviewFacts reports the actual Kernel tool result."
-        }]
-    });
+        review_expectations: vec![KernelReviewExpectation {
+            id: format!("review-{suffix}"),
+            description: "ReviewFacts reports the actual Kernel tool result.".to_string(),
+        }],
+    };
+    let proposal_payload = serde_json::to_value(KernelActionProposal {
+        action_bundle: action_bundle.clone(),
+        content_blocks: content_blocks.clone(),
+        authorization_contract_id: Some(authorization_contract_id.clone()),
+    })
+    .map_err(|error| format!("encode typed action proposal: {error}"))?;
     let proposal_reply = client
-        .kernel_command(serde_json::json!({
-            "kind": "proposalSubmit",
-            "requestId": format!("cli-tools-proposal-{suffix}"),
-            "runId": run_id,
-            "sessionId": session_id,
-            "proposal": {
-                "schemaVersion": "deepcode.agent.protocol.v4",
-                "proposalId": proposal_id,
-                "runId": run_id,
-                "sessionId": session_id,
-                "source": "system",
-                "kind": "actionBundle",
-                "payload": {
-                    "userPlanMarkdown": format!("Execute `{tool_id}` through the Kernel execution contract."),
-                    "contentBlocks": content_blocks,
-                    "actionBundle": action_bundle,
-                    "authorizationContractId": authorization_contract_id
-                },
-                "referencedResourcePacketRefs": [],
-                "referencedEvidenceRefs": [],
-                "parserDiagnostics": null
-            }
-        }))
+        .kernel_command(KernelCommand::ProposalSubmit {
+            request_id: RequestId(format!("cli-tools-proposal-{suffix}")),
+            run_id: run_id.clone(),
+            session_id: Some(session_id.clone()),
+            proposal: ProposalEnvelope {
+                schema_version: "deepcode.agent.protocol.v4".to_string(),
+                proposal_id,
+                run_id: run_id.clone(),
+                session_id: Some(session_id.clone()),
+                source: ProposalEnvelopeSource::System,
+                kind: ProposalEnvelopeKind::ActionBundle,
+                payload: proposal_payload,
+                referenced_resource_packet_refs: Vec::new(),
+                referenced_evidence_refs: Vec::new(),
+                parser_diagnostics: None,
+            },
+        })
         .await
         .map_err(|error| format!("ProposalSubmit failed: {error}"))?;
-    let report = event_value(&proposal_reply, "proposal.reviewed", "report")
+    let report = proposal_reply
+        .events
+        .into_iter()
+        .rev()
+        .find_map(|event| match event {
+            KernelEvent::ProposalReviewed { report, .. } => Some(report),
+            _ => None,
+        })
         .ok_or_else(|| "ProposalSubmit did not return proposal.reviewed report".to_string())?;
-    let contract = report
-        .get("executionContract")
-        .cloned()
-        .ok_or_else(|| "proposal review is missing executionContract".to_string())?;
-    let contract_id = contract
-        .get("id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "execution contract is missing id".to_string())?;
-    let contract_status = contract
-        .get("status")
-        .and_then(Value::as_str)
-        .unwrap_or("denied");
-    if contract_status == "denied" {
-        if execution_mode == "blocked" {
+    let contract = report.execution_contract.clone();
+    if contract.status == KernelExecutionContractStatus::Denied {
+        if execution_mode == OperationExecutionMode::Blocked {
             return Ok(serde_json::json!({
                 "outcome": "blocked",
                 "toolId": tool_id,
@@ -439,80 +413,72 @@ async fn execute_kernel_tool_contract(
                 "proposalReview": report
             }));
         }
-        return Err(format!("Kernel denied execution contract: {report}"));
+        return Err(format!("Kernel denied execution contract: {report:?}"));
     }
-    if contract_status != "authorizedByPlan" {
+    if contract.status != KernelExecutionContractStatus::AuthorizedByPlan {
         return Err(format!(
-            "execution contract was not authorized by the accepted plan: {report}"
+            "execution contract was not authorized by the accepted plan: {report:?}"
         ));
     }
-    let contract_hash = contract
-        .get("contractHash")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "execution contract is missing contractHash".to_string())?;
     let batch_reply = client
-        .kernel_command(serde_json::json!({
-            "kind": "actionBatchSubmit",
-            "requestId": format!("cli-tools-batch-{suffix}"),
-            "runId": run_id,
-            "sessionId": session_id,
-            "batch": {
-                "planId": bundle_id,
-                "contractId": contract_id,
-                "contractHash": contract_hash,
-                "contentBlocks": content_blocks,
-                "actionBundle": action_bundle
-            }
-        }))
+        .kernel_command(KernelCommand::ActionBatchSubmit {
+            request_id: RequestId(format!("cli-tools-batch-{suffix}")),
+            run_id: run_id.clone(),
+            session_id: Some(session_id.clone()),
+            batch: KernelActionBatch {
+                plan_id: bundle_id,
+                contract_id: contract.id.clone(),
+                contract_hash: contract.contract_hash.clone(),
+                action_bundle,
+                content_blocks,
+            },
+        })
         .await
         .map_err(|error| format!("ActionBatchSubmit failed: {error}"))?;
-    if has_event(&batch_reply, "permission.requested") {
+    if batch_reply
+        .events
+        .iter()
+        .any(|event| matches!(event, KernelEvent::PermissionRequested { .. }))
+    {
         return Err(format!(
-            "Kernel requested additional permission after contract acceptance: {batch_reply}"
+            "Kernel requested additional permission after contract acceptance: {:?}",
+            batch_reply.events
         ));
     }
     let facts_reply = client
-        .kernel_command(serde_json::json!({
-            "kind": "reviewFactsGet",
-            "requestId": format!("cli-tools-review-{suffix}"),
-            "runId": run_id,
-            "sessionId": session_id
-        }))
+        .kernel_command(KernelCommand::ReviewFactsGet {
+            request_id: RequestId(format!("cli-tools-review-{suffix}")),
+            run_id: run_id.clone(),
+            session_id: Some(session_id),
+        })
         .await
         .map_err(|error| format!("ReviewFactsGet failed: {error}"))?;
-    let facts = event_value(&facts_reply, "review.facts_produced", "facts")
+    let facts = facts_reply
+        .events
+        .into_iter()
+        .rev()
+        .find_map(|event| match event {
+            KernelEvent::ReviewFactsProduced { facts, .. } => Some(facts),
+            _ => None,
+        })
         .ok_or_else(|| "ReviewFactsGet did not return review.facts_produced".to_string())?;
-    let failed = facts
-        .get("failedWorkUnits")
-        .and_then(Value::as_array)
-        .is_some_and(|items| !items.is_empty());
-    let blocked = facts
-        .get("blockedWorkUnits")
-        .and_then(Value::as_array)
-        .is_some_and(|items| !items.is_empty());
-    let review_ready = facts
-        .get("batchReviewReady")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let failed = !facts.failed_work_units.is_empty();
+    let blocked = !facts.blocked_work_units.is_empty();
+    let review_ready = facts.batch_review_ready;
     let completed_tool = facts
-        .get("toolResults")
-        .and_then(Value::as_array)
-        .is_some_and(|items| {
-            items.iter().any(|item| {
-                item.get("toolId").and_then(Value::as_str) == Some(tool_id)
-                    && item.get("ok").and_then(Value::as_bool) == Some(true)
-            })
-        });
+        .tool_results
+        .iter()
+        .any(|item| item.tool_id == tool_id && item.ok);
     if failed || blocked || !review_ready || !completed_tool {
         return Err(format!(
-            "Kernel tool did not complete successfully: {facts}"
+            "Kernel tool did not complete successfully: {facts:?}"
         ));
     }
     Ok(serde_json::json!({
         "outcome": "success",
-        "runId": run_id,
+        "runId": run_id.0,
         "contract": contract,
-        "batchEvents": batch_reply.get("events").cloned().unwrap_or(Value::Null),
+        "batchEvents": batch_reply.events,
         "reviewFacts": facts
     }))
 }
@@ -623,40 +589,13 @@ fn clipped_verify_error(error: &str) -> String {
     clipped
 }
 
-fn plan_targets_for_tool(tool_id: &str, args: &Value) -> Vec<String> {
-    let path = args.get("path").and_then(Value::as_str).map(str::to_string);
-    match tool_id {
-        "fs.rename" => [
-            path,
-            args.get("destinationPath")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-        ]
-        .into_iter()
-        .flatten()
-        .collect(),
-        "fs.glob" | "code.grep" => vec![path.unwrap_or_else(|| ".".to_string())],
-        tool if tool.starts_with("fs.") || tool == "document.read" => path.into_iter().collect(),
-        "git.status" | "git.diff" => git_targets(args, "workspace"),
-        "git.stage" | "git.unstage" | "git.commit" | "git.push" => git_targets(args, "index"),
-        "web.fetch" => args
-            .get("url")
-            .and_then(Value::as_str)
-            .map(|value| vec![format!("network:{value}")])
-            .unwrap_or_default(),
-        "web.search" => args
-            .get("query")
-            .and_then(Value::as_str)
-            .map(|value| vec![format!("network:{value}")])
-            .unwrap_or_default(),
-        _ => Vec::new(),
-    }
-}
-
-fn planning_args_from_catalog(tool: &Value, args: &Value) -> Result<Value, String> {
+fn planning_args_from_catalog(
+    tool: &KernelToolCatalogEntryRef,
+    args: &Value,
+) -> Result<Value, String> {
     let schema = tool
-        .get("planningSchema")
-        .and_then(Value::as_object)
+        .planning_schema
+        .as_object()
         .ok_or_else(|| "Kernel ToolCatalog entry is missing planningSchema".to_string())?;
     let properties = schema
         .get("properties")
@@ -674,24 +613,9 @@ fn planning_args_from_catalog(tool: &Value, args: &Value) -> Result<Value, Strin
     Ok(Value::Object(planning_args))
 }
 
-fn git_targets(args: &Value, fallback: &str) -> Vec<String> {
-    let mut paths = args
-        .get("paths")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .map(|path| format!("git:{path}"))
-        .collect::<Vec<_>>();
-    if paths.is_empty() {
-        if let Some(path) = args.get("path").and_then(Value::as_str) {
-            paths.push(format!("git:{path}"));
-        }
-    }
-    if paths.is_empty() {
-        paths.push(format!("git:{fallback}"));
-    }
-    paths
+fn decode_content_blocks(values: Vec<Value>) -> Result<Vec<KernelContentBlock>, String> {
+    serde_json::from_value(Value::Array(values))
+        .map_err(|error| format!("decode typed content blocks: {error}"))
 }
 
 fn read_json_object(path: &Path) -> Result<Value, String> {
@@ -703,34 +627,6 @@ fn read_json_object(path: &Path) -> Result<Value, String> {
         return Err(format!("JSON {} must contain an object", path.display()));
     }
     Ok(value)
-}
-
-fn event_value(reply: &Value, kind: &str, field: &str) -> Option<Value> {
-    reply
-        .get("events")
-        .and_then(Value::as_array)?
-        .iter()
-        .rev()
-        .find(|event| event.get("kind").and_then(Value::as_str) == Some(kind))?
-        .get(field)
-        .cloned()
-}
-
-fn event_string(reply: &Value, kind: &str, field: &str) -> Option<String> {
-    event_value(reply, kind, field)?
-        .as_str()
-        .map(str::to_string)
-}
-
-fn has_event(reply: &Value, kind: &str) -> bool {
-    reply
-        .get("events")
-        .and_then(Value::as_array)
-        .is_some_and(|events| {
-            events
-                .iter()
-                .any(|event| event.get("kind").and_then(Value::as_str) == Some(kind))
-        })
 }
 
 pub(crate) fn unique_cli_id() -> String {
