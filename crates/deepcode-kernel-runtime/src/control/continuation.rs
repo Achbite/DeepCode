@@ -8,16 +8,62 @@ impl DeepCodeKernelRuntime {
         session_id: SessionId,
     ) -> KernelResult<Vec<KernelEvent>> {
         self.ensure_session_restored(&session_id.0)?;
-        let record = self
+        let initial_record = self
             .state
             .records_by_session
             .get(&session_id.0)
+            .cloned()
             .ok_or_else(|| {
                 KernelError::InvalidCommand(format!(
                     "session {} has no resumable run",
                     session_id.0
                 ))
             })?;
+        let mut events = Vec::new();
+        if initial_record.lifecycle_state == RuntimeLifecycleState::Terminating
+            && matches!(
+                self.state.cleanup_state_by_run.get(&initial_record.run_id),
+                Some(
+                    KernelCleanupState::Pending
+                        | KernelCleanupState::Failed
+                        | KernelCleanupState::Completed
+                )
+            )
+        {
+            events.extend(
+                self.run_cleanup_retry(request_id.clone(), RunId(initial_record.run_id.clone()))?,
+            );
+        } else if initial_record.lifecycle_state == RuntimeLifecycleState::Terminating {
+            return Err(KernelError::Structured {
+                code: "run_recovery_schema_invalid",
+                stage: "run.resume",
+                message: "terminating run has no recoverable cleanup state".to_string(),
+                details: serde_json::json!({
+                    "runId": initial_record.run_id,
+                    "sessionId": initial_record.session_id,
+                }),
+            });
+        }
+        let record = self
+            .state
+            .records_by_session
+            .get(&session_id.0)
+            .cloned()
+            .ok_or_else(|| KernelError::Structured {
+                code: "run_recovery_schema_invalid",
+                stage: "run.resume",
+                message: "resumed session lost its runtime record".to_string(),
+                details: serde_json::json!({ "sessionId": session_id.0 }),
+            })?;
+        if record.lifecycle_state == RuntimeLifecycleState::Terminal {
+            events.push(KernelEvent::SnapshotReady {
+                request_id,
+                snapshot: self.snapshot(Some(&record.session_id)),
+            });
+            return Ok(events);
+        }
+        events
+            .extend(self.recover_indeterminate_tool_attempts(&record.run_id, &record.session_id)?);
         let next_sequence = self.ledger.next_sequence(&record.run_id)?;
         let checkpoint_id = format!("runtime-checkpoint-{}-resume", record.run_id);
         self.append_ledger(
@@ -31,7 +77,7 @@ impl DeepCodeKernelRuntime {
                 "lifecycleState": record.lifecycle_state
             }),
         )?;
-        Ok(vec![
+        events.extend([
             KernelEvent::RuntimeResumed {
                 run_id: RunId(record.run_id.clone()),
                 session_id: Some(SessionId(record.session_id.clone())),
@@ -43,7 +89,117 @@ impl DeepCodeKernelRuntime {
                 request_id,
                 snapshot: self.snapshot(Some(&record.session_id)),
             },
-        ])
+        ]);
+        Ok(events)
+    }
+
+    pub(crate) fn restore_artifact_drafts_from_ledger(&mut self, run_id: &str) -> KernelResult<()> {
+        if self
+            .state
+            .artifact_drafts
+            .values()
+            .any(|draft| draft.run_id == run_id)
+            || self
+                .state
+                .terminal_artifact_draft_keys
+                .iter()
+                .any(|key| key.starts_with(&format!("{run_id}:")))
+        {
+            return Err(draft_recovery_error(
+                run_id,
+                "draft cache is already populated before ledger replay",
+            ));
+        }
+        let events = self.ledger.list_by_run(run_id)?;
+        let mut opened = std::collections::BTreeSet::new();
+        let mut replayed = std::collections::BTreeSet::new();
+        let mut previous_sequence = None;
+        for event in events.iter().filter(|event| {
+            matches!(
+                event.kind.as_str(),
+                "draft.open" | "draft.chunk" | "draft.batch_completed" | "draft.discarded"
+            )
+        }) {
+            let sequence = event.sequence.ok_or_else(|| {
+                draft_recovery_error(run_id, format!("{} event is missing sequence", event.kind))
+            })?;
+            if previous_sequence.is_some_and(|previous| sequence <= previous) {
+                return Err(draft_recovery_error(
+                    run_id,
+                    "draft ledger sequence is not strictly increasing",
+                ));
+            }
+            previous_sequence = Some(sequence);
+            let fact: deepcode_kernel_abi::ArtifactDraftEvent =
+                serde_json::from_value(event.payload.clone()).map_err(|error| {
+                    draft_recovery_error(run_id, format!("decode {} event: {error}", event.kind))
+                })?;
+            let base = fact.frame.base();
+            if fact.draft_id != base.draft_id
+                || base.run_id != run_id
+                || event.session_id.as_deref() != Some(base.session_id.as_str())
+            {
+                return Err(draft_recovery_error(
+                    run_id,
+                    "draft event binding does not match its ledger envelope",
+                ));
+            }
+            if event.kind == "draft.open" {
+                if fact.status != ArtifactDraftStatus::Open || !opened.insert(fact.draft_id.clone())
+                {
+                    return Err(draft_recovery_error(
+                        run_id,
+                        "draft open event is duplicated or has an invalid status",
+                    ));
+                }
+                continue;
+            }
+            let shape_matches = matches!(
+                (&event.kind[..], fact.status, fact.frame.part_kind()),
+                (
+                    "draft.chunk",
+                    ArtifactDraftStatus::Chunk,
+                    ArtifactDraftPartKind::ArtifactChunk
+                ) | (
+                    "draft.batch_completed",
+                    ArtifactDraftStatus::BatchCompleted,
+                    ArtifactDraftPartKind::BatchDone
+                ) | (
+                    "draft.discarded",
+                    ArtifactDraftStatus::Discarded,
+                    ArtifactDraftPartKind::Diagnostic
+                )
+            );
+            if !shape_matches || !opened.contains(&fact.draft_id) {
+                return Err(draft_recovery_error(
+                    run_id,
+                    "draft event has no matching open event or uses the wrong frame kind",
+                ));
+            }
+            let admission =
+                admit_artifact_draft_frame(&self.state, run_id, &base.session_id, &fact.frame)
+                    .map_err(|error| {
+                        draft_recovery_error(run_id, format!("replay draft frame: {error}"))
+                    })?;
+            replayed.insert(fact.draft_id);
+            if admission.terminal {
+                self.state.artifact_drafts.remove(&admission.draft_key);
+                self.state
+                    .terminal_artifact_draft_keys
+                    .insert(admission.draft_key);
+            } else {
+                self.state
+                    .artifact_drafts
+                    .insert(admission.draft_key, admission.record);
+            }
+        }
+        if opened != replayed {
+            return Err(draft_recovery_error(
+                run_id,
+                "draft open event has no persisted frame",
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn draft_ledger_submit(
@@ -208,22 +364,32 @@ impl DeepCodeKernelRuntime {
     }
 }
 
+fn draft_recovery_error(run_id: &str, message: impl Into<String>) -> KernelError {
+    KernelError::Structured {
+        code: "run_recovery_schema_invalid",
+        stage: "draft.restore",
+        message: message.into(),
+        details: serde_json::json!({ "runId": run_id }),
+    }
+}
+
 fn runtime_transition_allowed(
     previous: RuntimeLifecycleState,
     current: RuntimeLifecycleState,
 ) -> bool {
     use RuntimeLifecycleState::{
-        AwaitingPermission, Created, Executing, Ready, ReviewReady, Terminal,
+        AwaitingPermission, Created, Executing, Ready, ReviewReady, Terminal, Terminating,
     };
     matches!(
         (previous, current),
         (Created, Ready | Terminal)
-            | (Ready, Executing | Terminal)
-            | (Executing, AwaitingPermission | ReviewReady | Terminal)
+            | (Ready, Executing | Terminating | Terminal)
+            | (Executing, AwaitingPermission | Terminating | Terminal)
             | (
                 AwaitingPermission,
-                Ready | Executing | ReviewReady | Terminal
+                Ready | Executing | Terminating | Terminal
             )
-            | (ReviewReady, Ready | Executing | Terminal)
+            | (ReviewReady, Ready | Executing | Terminating | Terminal)
+            | (Terminating, Ready | ReviewReady | Terminal)
     )
 }

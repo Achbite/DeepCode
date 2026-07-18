@@ -9,7 +9,27 @@ impl DeepCodeKernelRuntime {
         session_id: &str,
         contract_id: &str,
     ) -> KernelResult<()> {
-        events.push(self.batch_review_ready_event(request_id, run_id, session_id, contract_id)?);
+        if let Some(event) = self.transition_runtime_lifecycle(
+            Some(request_id.clone()),
+            run_id,
+            session_id,
+            RuntimeLifecycleState::Terminating,
+            "batchCleanupStarted",
+        )? {
+            events.push(event);
+        }
+        let cleanup = self.release_batch_resources(run_id, session_id, "batchReviewReady")?;
+        events.extend(cleanup.events.clone());
+        if !cleanup.failures.is_empty() {
+            return Ok(());
+        }
+        events.push(self.batch_review_ready_event(
+            request_id,
+            run_id,
+            session_id,
+            contract_id,
+            &cleanup,
+        )?);
         if let Some(event) = self.transition_runtime_lifecycle(
             Some(request_id.clone()),
             run_id,
@@ -19,6 +39,7 @@ impl DeepCodeKernelRuntime {
         )? {
             events.push(event);
         }
+        self.state.cleanup_checkpoints_by_run.remove(run_id);
         Ok(())
     }
 
@@ -28,8 +49,8 @@ impl DeepCodeKernelRuntime {
         run_id: &str,
         session_id: &str,
         contract_id: &str,
+        cleanup: &crate::resources::RunResourceCleanupSummary,
     ) -> KernelResult<KernelEvent> {
-        let cleanup = self.release_batch_resources(run_id, session_id, "batchReviewReady")?;
         let sequence = self.ledger.next_sequence(run_id)?;
         self.append_ledger(
             run_id,
@@ -45,6 +66,7 @@ impl DeepCodeKernelRuntime {
                 "cleanupFailures": cleanup.failures
             }),
         )?;
+        self.state.batch_checkpoints_by_run.remove(run_id);
         Ok(KernelEvent::BatchReviewReady {
             request_id: Some(request_id.clone()),
             run_id: RunId(run_id.to_string()),

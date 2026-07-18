@@ -5,6 +5,47 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolExecutionAttemptFact {
+    pub attempt_id: String,
+    pub tool_call_id: String,
+    pub tool_id: String,
+    pub operation_kind: ToolOperationKind,
+    pub args_hash: String,
+    pub contract_id: String,
+    pub work_unit_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ToolEffectOutcome {
+    None,
+    Observed,
+    Indeterminate,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolEffectReceipt {
+    pub attempt_id: String,
+    pub outcome: ToolEffectOutcome,
+    #[serde(default)]
+    pub affected_resources: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation: Option<Value>,
+    #[serde(default)]
+    pub cleanup_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolOutcomeIndeterminateFact {
+    pub attempt: ToolExecutionAttemptFact,
+    pub receipt: ToolEffectReceipt,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum KernelFactSource {
@@ -178,6 +219,7 @@ pub struct ReviewFacts {
     pub generated_artifacts: Vec<GeneratedArtifactFact>,
     pub resource_events: Vec<ResourceLifecycleFact>,
     pub cleanup_failures: Vec<CleanupFailureFact>,
+    pub indeterminate_tool_outcomes: Vec<ToolOutcomeIndeterminateFact>,
     pub path_normalization_diagnostics: Vec<PathNormalizationDiagnostic>,
     pub batch_review_ready: bool,
 }

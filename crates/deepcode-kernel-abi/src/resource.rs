@@ -1,4 +1,7 @@
-use crate::{ExternalResourceLease, PlanGrantLease, TemporaryGrantEnvelope};
+use crate::{
+    ExternalResourceLease, PlanGrantLease, ReviewGateDecision, RunStatus, RuntimeLifecycleState,
+    TemporaryGrantEnvelope,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,13 +79,45 @@ pub enum KernelResourceScope {
     Persistent,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum KernelResourceState {
     Active,
+    CleanupPending,
+    CleanupFailed,
     Released,
-    Orphaned,
-    Denied,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum KernelCleanupState {
+    Idle,
+    Pending,
+    Failed,
+    Completed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum KernelCleanupScope {
+    Batch,
+    Plan,
+    Run,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KernelCleanupCheckpoint {
+    pub run_id: String,
+    pub scope: KernelCleanupScope,
+    pub trigger: String,
+    pub resource_ids: Vec<String>,
+    pub intended_lifecycle: RuntimeLifecycleState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intended_run_status: Option<RunStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_decision: Option<ReviewGateDecision>,
+    pub attempt: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -214,6 +249,21 @@ impl KernelResource {
 pub struct KernelResourceReleaseResult {
     pub resource_id: String,
     pub released: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KernelResourceCleanupStateFact {
+    pub run_id: String,
+    pub scope: KernelCleanupScope,
+    pub state: KernelCleanupState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_state: Option<KernelResourceState>,
+    pub attempt: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }

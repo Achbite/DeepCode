@@ -588,6 +588,7 @@ fn runtime_lifecycle_status(state: deepcode_kernel_abi::RuntimeLifecycleState) -
         deepcode_kernel_abi::RuntimeLifecycleState::Executing => "started",
         deepcode_kernel_abi::RuntimeLifecycleState::AwaitingPermission => "blocked",
         deepcode_kernel_abi::RuntimeLifecycleState::ReviewReady => "completed",
+        deepcode_kernel_abi::RuntimeLifecycleState::Terminating => "started",
         deepcode_kernel_abi::RuntimeLifecycleState::Terminal => "completed",
     }
 }

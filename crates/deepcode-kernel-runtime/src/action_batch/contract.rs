@@ -141,51 +141,20 @@ fn awaiting_contract_has_active_plan_lease(
 }
 
 pub(super) fn permission_bundle_id_for_operation(
-    registry: &KernelToolRegistry,
     state: &RuntimeState,
     run_id: &str,
     contract_id: &str,
     operation_id: &str,
-    tool_name: &str,
 ) -> Option<String> {
     let contract = state
         .execution_contracts_by_run
         .get(run_id)
         .and_then(|contracts| contracts.get(contract_id))?;
-    let capability = registry.capability_for_tool(tool_name)?;
     contract
         .permission_bundles
         .iter()
-        .find(|bundle| {
-            let matches_operation = bundle.operation_ids.iter().any(|item| item == operation_id);
-            let matches_capability = bundle.capability == capability;
-            matches_operation || matches_capability
-        })
+        .find(|bundle| bundle.operation_ids.iter().any(|item| item == operation_id))
         .map(|bundle| bundle.id.clone())
-}
-
-pub(super) fn permission_bundle_operation_ids(
-    state: &RuntimeState,
-    run_id: &str,
-    contract_id: Option<&str>,
-    bundle_id: &str,
-) -> Option<Vec<String>> {
-    let contract_id = contract_id?;
-    let contract = state
-        .execution_contracts_by_run
-        .get(run_id)
-        .and_then(|contracts| contracts.get(contract_id))?;
-    let ids = contract
-        .permission_bundles
-        .iter()
-        .find(|bundle| bundle.id == bundle_id)?
-        .operation_ids
-        .clone();
-    if ids.is_empty() {
-        None
-    } else {
-        Some(ids)
-    }
 }
 
 pub(super) fn permission_request_kind(

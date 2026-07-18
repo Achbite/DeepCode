@@ -366,6 +366,7 @@ pub(super) fn path_normalization_json(path: &NormalizedWorkspacePath) -> Value {
 pub(crate) fn attach_kernel_context_to_arguments(
     arguments: &mut Value,
     plan_id: &str,
+    contract_id: &str,
     work_unit_id: &str,
     action_id: &str,
     operation_kind: &str,
@@ -375,6 +376,7 @@ pub(crate) fn attach_kernel_context_to_arguments(
             "kernelContext".to_string(),
             serde_json::json!({
                 "planId": plan_id,
+                "contractId": contract_id,
                 "workUnitId": work_unit_id,
                 "actionId": action_id,
                 "operationKind": operation_kind

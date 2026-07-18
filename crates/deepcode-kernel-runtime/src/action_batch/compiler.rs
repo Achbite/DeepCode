@@ -2,8 +2,9 @@ use super::*;
 
 use super::targets::*;
 
+#[derive(Debug, Clone)]
 pub(super) struct CompiledWorkspaceAction {
-    pub(super) tool_name: String,
+    pub(super) tool_id: String,
     pub(super) arguments: Value,
     pub(super) workspace_root: Option<PathBuf>,
 }
@@ -53,13 +54,13 @@ pub(super) fn validate_compiled_operation(
     operation: &PlannedOperation,
     compiled: CompiledWorkspaceAction,
 ) -> KernelResult<CompiledWorkspaceAction> {
-    if compiled.tool_name != operation.tool_id {
+    if compiled.tool_id != operation.tool_id {
         return Err(KernelError::InvalidCommand(format!(
             "compiled operation mismatch: action {} kind {} expected {} but got {}",
             operation.id,
             operation_kind_name(operation),
             operation.tool_id,
-            compiled.tool_name
+            compiled.tool_id
         )));
     }
     if let PlannedOperationKind::Workspace(workspace) = &operation.operation {
@@ -131,7 +132,7 @@ pub(super) fn compiled_tool_summary(
     compiled: &CompiledWorkspaceAction,
 ) -> CompiledToolSummary {
     CompiledToolSummary {
-        tool_id: compiled.tool_name.clone(),
+        tool_id: compiled.tool_id.clone(),
         operation_kind,
         path: compiled
             .arguments
@@ -226,7 +227,7 @@ pub(super) fn compile_git_operation(
     let workspace_root = git_workspace_root(runtime, record);
     match git.kind {
         GitOperationKind::Status => Ok(CompiledWorkspaceAction {
-            tool_name: operation.tool_id.clone(),
+            tool_id: operation.tool_id.clone(),
             arguments: serde_json::json!({}),
             workspace_root,
         }),
@@ -236,18 +237,18 @@ pub(super) fn compile_git_operation(
                 arguments["path"] = Value::String(git_relative_path(runtime, record, path)?);
             }
             Ok(CompiledWorkspaceAction {
-                tool_name: operation.tool_id.clone(),
+                tool_id: operation.tool_id.clone(),
                 arguments,
                 workspace_root,
             })
         }
         GitOperationKind::Stage => Ok(CompiledWorkspaceAction {
-            tool_name: operation.tool_id.clone(),
+            tool_id: operation.tool_id.clone(),
             arguments: git_paths_arguments_from_operation(runtime, record, operation, git)?,
             workspace_root,
         }),
         GitOperationKind::Unstage => Ok(CompiledWorkspaceAction {
-            tool_name: operation.tool_id.clone(),
+            tool_id: operation.tool_id.clone(),
             arguments: git_paths_arguments_from_operation(runtime, record, operation, git)?,
             workspace_root,
         }),
@@ -263,7 +264,7 @@ pub(super) fn compile_git_operation(
                     )
                 })?;
             Ok(CompiledWorkspaceAction {
-                tool_name: operation.tool_id.clone(),
+                tool_id: operation.tool_id.clone(),
                 arguments: serde_json::json!({ "message": message }),
                 workspace_root,
             })
@@ -285,7 +286,7 @@ pub(super) fn compile_git_operation(
                 arguments["branch"] = Value::String(branch.to_string());
             }
             Ok(CompiledWorkspaceAction {
-                tool_name: operation.tool_id.clone(),
+                tool_id: operation.tool_id.clone(),
                 arguments,
                 workspace_root,
             })
@@ -336,7 +337,7 @@ pub(super) fn workspace_write_from_operation(
         }
     }
     Ok(CompiledWorkspaceAction {
-        tool_name: operation.tool_id.clone(),
+        tool_id: operation.tool_id.clone(),
         arguments: serde_json::json!({
             "path": normalized.relative_path,
             "content": content,
@@ -385,7 +386,7 @@ pub(super) fn workspace_patch_from_operation(
     })?;
     let normalized = workspace_relative_write_path(runtime, record, raw_path)?;
     Ok(CompiledWorkspaceAction {
-        tool_name: operation.tool_id.clone(),
+        tool_id: operation.tool_id.clone(),
         arguments: serde_json::json!({
             "path": normalized.relative_path,
             "patchSpec": patch_spec,
@@ -435,7 +436,7 @@ pub(super) fn workspace_path_tool_operation(
         arguments["includeHidden"] = Value::Bool(true);
     }
     Ok(CompiledWorkspaceAction {
-        tool_name: operation.tool_id.clone(),
+        tool_id: operation.tool_id.clone(),
         arguments,
         workspace_root: normalized.workspace_root,
     })
@@ -458,7 +459,7 @@ pub(super) fn workspace_glob_tool_operation(
     let raw_path = workspace.target_path.as_deref().unwrap_or(".");
     let normalized = workspace_relative_read_path(runtime, record, raw_path)?;
     Ok(CompiledWorkspaceAction {
-        tool_name: operation.tool_id.clone(),
+        tool_id: operation.tool_id.clone(),
         arguments: serde_json::json!({
             "path": normalized.relative_path,
             "pattern": pattern,
@@ -497,7 +498,7 @@ pub(super) fn workspace_rename_tool_operation(
     let source = workspace_relative_write_path(runtime, record, source)?;
     let destination = workspace_relative_write_path(runtime, record, destination)?;
     Ok(CompiledWorkspaceAction {
-        tool_name: operation.tool_id.clone(),
+        tool_id: operation.tool_id.clone(),
         arguments: serde_json::json!({
             "path": source.relative_path,
             "destinationPath": destination.relative_path,
@@ -561,7 +562,7 @@ pub(super) fn workspace_delete_tool_operation(
     }
     let recursive = workspace.recursive;
     let action = CompiledWorkspaceAction {
-        tool_name: operation.tool_id.clone(),
+        tool_id: operation.tool_id.clone(),
         arguments: serde_json::json!({
             "path": normalized.relative_path,
             "targetKind": target_kind,
@@ -605,7 +606,7 @@ pub(super) fn workspace_search_tool_operation(
     let raw_path = workspace.target_path.as_deref().unwrap_or(".");
     let normalized = workspace_relative_read_path(runtime, record, raw_path)?;
     Ok(CompiledWorkspaceAction {
-        tool_name: operation.tool_id.clone(),
+        tool_id: operation.tool_id.clone(),
         arguments: serde_json::json!({
             "path": normalized.relative_path,
             "query": query,
@@ -645,7 +646,7 @@ pub(super) fn compile_network_operation(
                     ))
                 })?;
             Ok(CompiledWorkspaceAction {
-                tool_name: operation.tool_id.clone(),
+                tool_id: operation.tool_id.clone(),
                 arguments: serde_json::json!({
                     "query": query,
                     "limit": network.limit,
@@ -667,7 +668,7 @@ pub(super) fn compile_network_operation(
                     ))
                 })?;
             Ok(CompiledWorkspaceAction {
-                tool_name: operation.tool_id.clone(),
+                tool_id: operation.tool_id.clone(),
                 arguments: serde_json::json!({
                     "url": url,
                     "maxBytes": network.max_bytes,

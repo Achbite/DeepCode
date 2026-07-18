@@ -45,6 +45,7 @@ pub enum KernelGateInterventionStatus {
 pub struct KernelExecutionOperation {
     pub id: String,
     pub title: String,
+    pub depends_on: Vec<String>,
     pub tool_id: String,
     pub operation_kind: ToolOperationKind,
     pub args: Value,
@@ -275,6 +276,7 @@ pub enum ReviewGateStatus {
     Accepted,
     NeedsReplan,
     Aborted,
+    CleanupFailed,
 }
 
 impl ReviewGateStatus {
@@ -283,6 +285,7 @@ impl ReviewGateStatus {
             Self::Accepted => "accepted",
             Self::NeedsReplan => "needsReplan",
             Self::Aborted => "aborted",
+            Self::CleanupFailed => "cleanupFailed",
         }
     }
 }

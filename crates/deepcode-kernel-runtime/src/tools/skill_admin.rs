@@ -26,33 +26,6 @@ impl DeepCodeKernelRuntime {
         skill_id: String,
         decision: HostSkillTrustDecisionSubmit,
     ) -> KernelResult<Vec<KernelEvent>> {
-        let trust_mode = match decision.trust_mode {
-            HostSkillTrustMode::Declarative => SkillTrustMode::Declarative,
-            HostSkillTrustMode::BrokeredScript => SkillTrustMode::BrokeredScript,
-        };
-        let approved_capabilities = decision
-            .approved_capabilities
-            .iter()
-            .map(deepcode_kernel_policy::Capability::new)
-            .collect::<Vec<_>>();
-
-        if decision.decision == HostSkillTrustDecisionKind::Accept {
-            let record = SkillTrustRecord {
-                skill_id: skill_id.clone(),
-                revision_hash: decision.revision_hash.clone(),
-                approved_capabilities: approved_capabilities.clone(),
-                approved_at: decision.approved_at.clone(),
-                approved_by: decision.approved_by.clone(),
-                trust_mode,
-                ledger_event_ref: None,
-                expires_at: decision.expires_at.clone(),
-            };
-            self.state
-                .skill_trust_records
-                .retain(|existing| existing.skill_id != skill_id);
-            self.state.skill_trust_records.push(record);
-        }
-
         let record = HostSkillTrustDecisionRecord {
             skill_id: skill_id.clone(),
             decision: decision.decision,

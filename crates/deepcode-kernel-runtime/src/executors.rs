@@ -1,4 +1,4 @@
-use deepcode_kernel_abi::{KernelError, KernelResult};
+use deepcode_kernel_abi::{KernelError, KernelResult, ToolEffectOutcome, ToolEffectReceipt};
 use deepcode_kernel_policy::WorkspaceBoundary;
 use deepcode_kernel_tools::file_content::{
     lightweight_file_classification, read_text_file_for_llm,
@@ -72,6 +72,7 @@ pub struct KernelToolExecutionContext {
 pub struct KernelToolExecutionResult {
     pub invocation_id: String,
     pub output: Value,
+    pub effect_receipt: ToolEffectReceipt,
 }
 
 pub trait KernelToolExecutor: Send + Sync {
@@ -221,9 +222,33 @@ use search::{skip_directory, CodeGrepExecutor, FsGlobExecutor};
 use web::*;
 
 fn ok(invocation_id: String, output: Value) -> KernelToolExecutionResult {
+    let mut affected_resources = ["path", "absolutePath", "from", "to", "destinationPath"]
+        .into_iter()
+        .filter_map(|field| {
+            output
+                .get(field)
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect::<Vec<_>>();
+    affected_resources.sort();
+    affected_resources.dedup();
+    let validation = output.get("validation").cloned();
+    let outcome = if affected_resources.is_empty() && validation.is_none() {
+        ToolEffectOutcome::None
+    } else {
+        ToolEffectOutcome::Observed
+    };
     KernelToolExecutionResult {
-        invocation_id,
+        invocation_id: invocation_id.clone(),
         output,
+        effect_receipt: ToolEffectReceipt {
+            attempt_id: invocation_id,
+            outcome,
+            affected_resources,
+            validation,
+            cleanup_refs: Vec::new(),
+        },
     }
 }
 

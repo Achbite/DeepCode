@@ -1,9 +1,10 @@
 use crate::prelude::*;
 use crate::*;
-use deepcode_kernel_ledger::{
+use deepcode_kernel_abi::{
     KernelResource, KernelResourceCleanupPolicy, KernelResourceIdentity, KernelResourceKind,
-    KernelResourceManager, KernelResourceMetadata, KernelResourceOwner, KernelResourceScope,
+    KernelResourceMetadata, KernelResourceOwner, KernelResourceScope,
 };
+use deepcode_kernel_runtime::resources::KernelResourceManager;
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use std::collections::BTreeMap;
 use std::thread;
@@ -665,13 +666,13 @@ mod tests {
                     &resource.metadata,
                     KernelResourceMetadata::TerminalSession { terminal_id, .. }
                         if terminal_id == &session_id
-                ) && resource.state == deepcode_kernel_ledger::KernelResourceState::Active
+                ) && resource.state == deepcode_kernel_abi::KernelResourceState::Active
             })
             .expect("terminal resource");
         assert_eq!(resource.kind, KernelResourceKind::TerminalSession);
         assert_eq!(
             resource.owner.kind,
-            deepcode_kernel_ledger::KernelResourceOwnerKind::UserSession
+            deepcode_kernel_abi::KernelResourceOwnerKind::UserSession
         );
 
         runtime
@@ -711,7 +712,7 @@ mod tests {
                 &resource.metadata,
                 KernelResourceMetadata::TerminalSession { terminal_id, .. }
                     if terminal_id == &session_id
-            ) || resource.state == deepcode_kernel_ledger::KernelResourceState::Released
+            ) || resource.state == deepcode_kernel_abi::KernelResourceState::Released
         }));
     }
 }

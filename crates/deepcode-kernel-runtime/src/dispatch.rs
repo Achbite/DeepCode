@@ -86,6 +86,9 @@ impl DeepCodeKernelRuntime {
                 request_id,
                 session_id,
             } => self.run_resume(request_id, session_id),
+            KernelCommand::RunCleanupRetry { request_id, run_id } => {
+                self.run_cleanup_retry(request_id, run_id)
+            }
             KernelCommand::HostWorkspaceBindingResolve { request_id, path } => {
                 self.host_workspace_binding_resolve(request_id, path)
             }

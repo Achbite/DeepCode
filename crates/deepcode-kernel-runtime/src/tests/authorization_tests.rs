@@ -119,13 +119,16 @@ fn uncommitted_temporary_create_rolls_back_its_lease_without_touching_user_files
                 "content": "temporary",
                 "temporary": true,
                 "executable": false,
+                "kernelContext": {
+                    "contractId": format!("contract-temp-create-{suffix}"),
+                    "workUnitId": format!("work-unit-temp-create-{suffix}"),
+                },
             }),
         )
         .expect("failed tool execution still produces a typed completion fact");
-    assert!(matches!(
-        event,
-        KernelEvent::ToolCompleted { fact, .. } if !fact.ok
-    ));
+    assert!(event
+        .iter()
+        .any(|event| matches!(event, KernelEvent::ToolCompleted { fact, .. } if !fact.ok)));
     assert!(!workspace.join(&missing_target).exists());
     assert!(runtime
         .state
@@ -133,11 +136,11 @@ fn uncommitted_temporary_create_rolls_back_its_lease_without_touching_user_files
         .list()
         .iter()
         .filter(|resource| resource.kind == KernelResourceKind::TempArtifact)
-        .all(|resource| resource.state == deepcode_kernel_ledger::KernelResourceState::Released));
+        .all(|resource| resource.state == KernelResourceState::Released));
 
     let user_file = workspace.join("input.txt");
     let original = fs::read_to_string(&user_file).expect("read user file before guarded write");
-    let write_event = runtime
+    let write_error = runtime
         .execute_bound_tool(
             "run-1",
             "session-1",
@@ -148,14 +151,17 @@ fn uncommitted_temporary_create_rolls_back_its_lease_without_touching_user_files
                 "path": "input.txt",
                 "content": "must not be written",
                 "temporary": true,
+                "kernelContext": {
+                    "contractId": format!("contract-temp-write-{suffix}"),
+                    "workUnitId": format!("work-unit-temp-write-{suffix}"),
+                },
             }),
         )
-        .expect("unleased temporary write produces a typed completion fact");
-    assert!(matches!(
-        write_event,
-        KernelEvent::ToolCompleted { fact, .. }
-            if !fact.ok && fact.error.as_ref().is_some_and(|error| error.code == "temporary_resource_unavailable")
-    ));
+        .expect_err("unleased temporary write must fail before executor invocation");
+    assert_eq!(
+        KernelErrorEnvelope::from(&write_error).code,
+        "temporary_resource_unavailable"
+    );
     assert_eq!(
         fs::read_to_string(user_file).expect("read user file after guarded write"),
         original
@@ -382,7 +388,7 @@ fn sequential_tasks_reuse_plan_permission_bundle_without_resource_identity_colli
         .filter(|resource| {
             resource.kind == KernelResourceKind::PermissionGrant
                 && resource.cleanup_policy == KernelResourceCleanupPolicy::OnBatchReviewReady
-                && resource.state == deepcode_kernel_ledger::KernelResourceState::Released
+                && resource.state == KernelResourceState::Released
         })
         .collect::<Vec<_>>();
     assert_eq!(released_batch_grants.len(), 2);
@@ -417,7 +423,7 @@ fn review_replan_releases_plan_grant_but_keeps_run_workspace_lease() {
         .list()
         .iter()
         .any(|resource| {
-            resource.state == deepcode_kernel_ledger::KernelResourceState::Active
+            resource.state == KernelResourceState::Active
                 && matches!(
                     &resource.metadata,
                     KernelResourceMetadata::WorkspaceReadLease { .. }
@@ -452,7 +458,7 @@ fn review_replan_releases_plan_grant_but_keeps_run_workspace_lease() {
         .list()
         .iter()
         .any(|resource| {
-            resource.state == deepcode_kernel_ledger::KernelResourceState::Active
+            resource.state == KernelResourceState::Active
                 && matches!(
                     &resource.metadata,
                     KernelResourceMetadata::WorkspaceReadLease { .. }
@@ -1100,6 +1106,110 @@ fn batch_review_ready_releases_permission_leases_and_removes_only_temporary_file
         .resource_events
         .iter()
         .any(|event| event.kind == ResourceLifecycleKind::Released));
+}
+
+#[test]
+fn cleanup_failure_keeps_run_terminating_and_resume_emits_final_review_state() {
+    let (mut runtime, workspace) = runtime_with_workspace();
+    let suffix = TEMP_INDEX.fetch_add(1, Ordering::SeqCst);
+    let temporary_directory = workspace.join(format!("cleanup-directory-{suffix}"));
+    fs::create_dir_all(&temporary_directory).expect("create cleanup failure target");
+    let resource_id = format!("cleanup-resource-{suffix}");
+    runtime
+        .acquire_resource_batch(
+            "run-1",
+            "session-1",
+            "Register a cleanup retry test resource.",
+            vec![KernelResource::active(
+                KernelResourceIdentity::new(
+                    resource_id.clone(),
+                    format!("cleanup:{suffix}"),
+                    format!("cleanup:run-1:{suffix}"),
+                ),
+                KernelResourceKind::TempArtifact,
+                KernelResourceOwner::agent_run(Some("session-1"), "run-1"),
+                KernelResourceScope::Run,
+                KernelResourceCleanupPolicy::OnRunEnd,
+                KernelResourceMetadata::TempArtifact {
+                    path: format!("cleanup-directory-{suffix}"),
+                    absolute_path: Some(temporary_directory.to_string_lossy().to_string()),
+                    source_tool: "fs.create".to_string(),
+                    tool_call_id: format!("cleanup-call-{suffix}"),
+                },
+            )],
+        )
+        .expect("register cleanup retry resource");
+    runtime
+        .transition_runtime_lifecycle(
+            Some(RequestId(format!("cleanup-start-{suffix}"))),
+            "run-1",
+            "session-1",
+            RuntimeLifecycleState::Terminating,
+            "testCleanupStarted",
+        )
+        .expect("enter terminating state");
+    let cleanup = runtime
+        .release_run_resources_with_intent(
+            "run-1",
+            "session-1",
+            "testReviewCleanup",
+            Some(RunStatus::Completed),
+            Some(ReviewGateDecision {
+                decision: ReviewGateDecisionKind::Accept,
+                guidance: None,
+            }),
+        )
+        .expect("cleanup failure is recorded");
+    assert_eq!(cleanup.failures.len(), 1);
+    assert_eq!(
+        runtime.record_by_run("run-1").unwrap().lifecycle_state,
+        RuntimeLifecycleState::Terminating
+    );
+    assert_eq!(
+        runtime.state.cleanup_state_by_run.get("run-1"),
+        Some(&KernelCleanupState::Failed)
+    );
+
+    fs::remove_dir(&temporary_directory).expect("remove cleanup blocker");
+    let retried = runtime
+        .dispatch(KernelCommand::RunResume {
+            request_id: RequestId(format!("cleanup-retry-{suffix}")),
+            session_id: SessionId("session-1".to_string()),
+        })
+        .expect("resume retries cleanup");
+
+    assert!(retried.iter().any(|event| matches!(
+        event,
+        KernelEvent::ReviewGateEvaluated { result, .. }
+            if result.status == deepcode_kernel_abi::ReviewGateStatus::Accepted
+    )));
+    assert!(retried.iter().any(|event| matches!(
+        event,
+        KernelEvent::RunCompleted {
+            status: RunStatus::Completed,
+            ..
+        }
+    )));
+    assert!(!retried
+        .iter()
+        .any(|event| matches!(event, KernelEvent::RuntimeResumed { .. })));
+    assert_eq!(
+        runtime.record_by_run("run-1").unwrap().lifecycle_state,
+        RuntimeLifecycleState::Terminal
+    );
+    assert_eq!(
+        runtime
+            .state
+            .resource_manager
+            .get(&resource_id)
+            .unwrap()
+            .state,
+        KernelResourceState::Released
+    );
+    assert!(!runtime
+        .state
+        .cleanup_checkpoints_by_run
+        .contains_key("run-1"));
 }
 
 fn authorize_plan_targets(
