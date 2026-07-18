@@ -14,6 +14,8 @@ import {
   warmupTerminalRuntime,
 } from '../services/runtimeAdapter';
 import './deepcodeGui.css';
+import './styles/deepcodeDesignTokens.css';
+import './styles/deepcodeShell.css';
 
 const DeepCodeWorkbenchLayout = lazy(() => import('./layout/DeepCodeWorkbenchLayout'));
 

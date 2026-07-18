@@ -1,6 +1,5 @@
 import React, { Suspense, lazy, useEffect, useMemo, useRef, useState } from 'react';
 import type {
-  AgentProject,
   AgentSession,
   AgentTimelineResult,
   BrowseEntry,
@@ -8,7 +7,6 @@ import type {
   InitialLocation,
 } from '@deepcode/protocol';
 import type { SessionMemorySnapshot } from '@deepcode/session-core';
-import WindowControls from '../../components/window-controls/WindowControls';
 import { normalizeUiLanguage, t, type UiLanguage } from '../../i18n';
 import {
   browsePath,
@@ -28,7 +26,20 @@ import { useAgentSessionStore } from '../../state/agentSessionStore';
 import { deriveTokenUsageStats, formatPercent, formatTokenCount } from '../../utils/tokenUsageStats';
 import { latestPlanTaskItemsFromProjection, timelineOrEmpty } from '../../utils/uiTimelineProjection';
 import AgentMemoryViewer from '../../components/agent-memory/AgentMemoryViewer';
-import DeepCodeAgentPanel from '../panel/DeepCodeAgentPanel';
+import DeepCodeConversationShell from './DeepCodeConversationShell';
+import DeepCodeSidebar, {
+  DeepCodeSidebarIcon,
+  deriveProjectArchiveGroups,
+} from './DeepCodeSidebar';
+import DeepCodeTaskPanel from './DeepCodeTaskPanel';
+import type { DeepCodeTaskItem } from './DeepCodeTaskPanel';
+import DeepCodeTitlebar from './DeepCodeTitlebar';
+import type { DeepCodeCacheHitSummary } from './DeepCodeTitlebar';
+import {
+  displaySessionTitle,
+  shouldShowSidebarSession,
+  statusLabel,
+} from './DeepCodeShellText';
 import '../../components/workspace-open-dialog/workspaceOpenDialog.css';
 
 interface DeepCodeWorkbenchLayoutProps {
@@ -45,28 +56,7 @@ const WorkspaceOpenDialog = lazy(() => import('../../components/workspace-open-d
 const CodeWorkspaceChoiceDialog = lazy(() => import('../../components/code-workspace-choice-dialog/CodeWorkspaceChoiceDialog'));
 const SettingsCenter = lazy(() => import('../../components/settings-center/SettingsCenter'));
 
-interface DeepCodeTaskItem {
-  id: string;
-  title: string;
-  summary: string;
-  status: string;
-}
-
-interface DeepCodeCacheHitSummary {
-  label: string;
-  title: string;
-}
-
-type DeepCodeSidebarIconName = 'compose' | 'folder' | 'folderPlus' | 'plus' | 'settings';
-
-interface DeepCodeProjectArchiveGroup {
-  key: string;
-  title: string;
-  sessions: AgentSession[];
-  projectId?: string;
-}
-
-type DeepCodeGuiProject = AgentProject;
+type DeepCodeGuiProject = import('@deepcode/protocol').AgentProject;
 
 interface DeepCodeSessionContextMenu {
   session: AgentSession;
@@ -110,75 +100,9 @@ interface PendingProjectSession {
   sessionId: string;
 }
 
-const DeepCodeSidebarIcon: React.FC<{ name: DeepCodeSidebarIconName; className?: string }> = ({
-  name,
-  className,
-}) => {
-  const common = {
-    className,
-    width: 18,
-    height: 18,
-    viewBox: '0 0 24 24',
-    fill: 'none',
-    stroke: 'currentColor',
-    strokeWidth: 1.9,
-    strokeLinecap: 'round' as const,
-    strokeLinejoin: 'round' as const,
-    'aria-hidden': true,
-  };
-
-  if (name === 'compose') {
-    return (
-      <svg {...common}>
-        <path d="M12 20h9" />
-        <path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z" />
-      </svg>
-    );
-  }
-
-  if (name === 'folder') {
-    return (
-      <svg {...common}>
-        <path d="M3 6.8A2.8 2.8 0 0 1 5.8 4h4.1l2 2H18a3 3 0 0 1 3 3v7.2A2.8 2.8 0 0 1 18.2 19H5.8A2.8 2.8 0 0 1 3 16.2V6.8z" />
-      </svg>
-    );
-  }
-
-  if (name === 'folderPlus') {
-    return (
-      <svg {...common}>
-        <path d="M3 6.8A2.8 2.8 0 0 1 5.8 4h4.1l2 2H18a3 3 0 0 1 3 3v7.2A2.8 2.8 0 0 1 18.2 19H5.8A2.8 2.8 0 0 1 3 16.2V6.8z" />
-        <path d="M16 11v5" />
-        <path d="M13.5 13.5h5" />
-      </svg>
-    );
-  }
-
-  if (name === 'plus') {
-    return (
-      <svg {...common}>
-        <path d="M12 5v14" />
-        <path d="M5 12h14" />
-      </svg>
-    );
-  }
-
-  return (
-    <svg {...common}>
-      <path d="M12 8.2a3.8 3.8 0 1 0 0 7.6 3.8 3.8 0 0 0 0-7.6z" />
-      <path d="M4.9 14.2a7.8 7.8 0 0 1 0-4.4l-1.7-1.3 2-3.4 2.1.9a8 8 0 0 1 3.8-2.2L11.4 1h4l.3 2.8A8 8 0 0 1 19.5 6l2.1-.9 2 3.4-1.7 1.3a7.8 7.8 0 0 1 0 4.4l1.7 1.3-2 3.4-2.1-.9a8 8 0 0 1-3.8 2.2l-.3 2.8h-4l-.3-2.8A8 8 0 0 1 7.3 18l-2.1.9-2-3.4 1.7-1.3z" />
-    </svg>
-  );
-};
-
 function basename(path?: string | null): string {
   if (!path) return '';
   return path.split(/[\\/]/).filter(Boolean).pop() ?? path;
-}
-
-function statusLabel(language: UiLanguage, value: string): string {
-  const translated = t(language, `deepcodeGui.status.${value}`);
-  return translated.startsWith('deepcodeGui.status.') ? value : translated;
 }
 
 async function copyText(text: string): Promise<void> {
@@ -194,41 +118,6 @@ async function copyText(text: string): Promise<void> {
   textarea.select();
   document.execCommand('copy');
   document.body.removeChild(textarea);
-}
-
-function displaySessionTitle(language: UiLanguage, title?: string): string {
-  const value = title?.trim();
-  if (!value || value === 'New Agent Session' || value === '新 Agent 会话') {
-    return t(language, 'agent.session.newTitle');
-  }
-  return value;
-}
-
-function hasCustomSessionTitle(title?: string): boolean {
-  const value = title?.trim();
-  return Boolean(value && value !== 'New Agent Session' && value !== '新 Agent 会话');
-}
-
-function shouldShowSidebarSession(session: AgentSession): boolean {
-  return (session.eventCount ?? 0) > 0 || hasCustomSessionTitle(session.title);
-}
-
-function deriveProjectArchiveGroups(
-  sessions: AgentSession[],
-  projects: DeepCodeGuiProject[]
-): DeepCodeProjectArchiveGroup[] {
-  return projects.map((project) => {
-    const projectSessions = sessions
-      .filter((session) => session.projectId === project.id)
-      .filter(shouldShowSidebarSession)
-      .sort((a, b) => (b.updatedAt || b.createdAt).localeCompare(a.updatedAt || a.createdAt));
-    return {
-      key: project.id,
-      title: project.title,
-      sessions: projectSessions,
-      projectId: project.id,
-    };
-  });
 }
 
 interface DeepCodeProjectFolderDialogProps {
@@ -1057,252 +946,61 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
 
   return (
     <div className="deepcode-gui-workbench">
-      <header className="deepcode-gui-titlebar" data-tauri-drag-region>
-        <div className="deepcode-gui-titlebar__brand">
-          <span className="deepcode-gui-titlebar__mark">DC</span>
-          <span>DeepCode-GUI</span>
-        </div>
-        <div className="deepcode-gui-titlebar__status">
-          {cacheHitSummary && (
-            <span className="deepcode-gui-status-pill deepcode-gui-status-pill--cache" title={cacheHitSummary.title}>
-              {cacheHitSummary.label}
-            </span>
-          )}
-          {apiStatus !== 'connected' && onRetryKernelStart && (
-            <button
-              type="button"
-              className="deepcode-gui-status-pill deepcode-gui-status-pill--button"
-              title={kernelStartMessage ?? undefined}
-              disabled={kernelStartBusy}
-              onClick={() => void onRetryKernelStart()}
-            >
-              {kernelStartBusy
-                ? t(language, 'deepcodeGui.statusAction.starting')
-                : t(language, 'deepcodeGui.statusAction.retry')}
-            </button>
-          )}
-          <span className={`deepcode-gui-status-pill deepcode-gui-status-pill--${apiStatus}`}>API {statusLabel(language, apiStatus)}</span>
-        </div>
-        <WindowControls language={language} />
-      </header>
+      <DeepCodeTitlebar
+        language={language}
+        apiStatus={apiStatus}
+        cacheHitSummary={cacheHitSummary}
+        kernelStartBusy={kernelStartBusy}
+        kernelStartMessage={kernelStartMessage}
+        onRetryKernelStart={onRetryKernelStart}
+      />
 
       <div className={`deepcode-gui-shell ${isHome ? 'deepcode-gui-shell--home' : ''}`}>
-        <aside className="deepcode-gui-left-rail">
-          <div className="deepcode-gui-sidebar-actions">
-            <button
-              type="button"
-              className="deepcode-gui-sidebar-action deepcode-gui-sidebar-action--primary"
-              onClick={() => void runSidebarAction('create:normal:primary', () => handleCreateSession(null))}
-              disabled={sidebarPendingAction === 'create:normal:primary'}
-            >
-              <DeepCodeSidebarIcon name="compose" className="deepcode-gui-sidebar-icon" />
-              <span>{t(language, 'deepcodeGui.nav.newChat')}</span>
-            </button>
-          </div>
+        <DeepCodeSidebar
+          language={language}
+          projectArchiveGroups={projectArchiveGroups}
+          projectRecords={projectRecords}
+          visibleSessions={visibleSessions}
+          collapsedProjectIds={collapsedProjectIdSet}
+          activeProjectId={activeProjectId}
+          draftTargetProjectId={draftTargetProjectId}
+          highlightedSessionId={highlightedSessionId}
+          pendingAction={sidebarPendingAction}
+          projectCreateMenuOpen={Boolean(projectCreateMenu)}
+          onCreatePrimarySession={() => {
+            void runSidebarAction('create:normal:primary', () => handleCreateSession(null));
+          }}
+          onOpenProjectCreateMenu={openProjectCreateMenu}
+          onToggleProject={toggleProjectExpanded}
+          onCreateProjectSession={(projectId, actionKey) => {
+            void runSidebarAction(actionKey, () => handleCreateSession(projectId));
+          }}
+          onActivateSession={(session, projectId, actionKey) => {
+            void runSidebarAction(actionKey, async () => {
+              pendingProjectSendRef.current = null;
+              setActiveProjectId(projectId);
+              setDraftTargetProjectId(null);
+              await activateSession(session.id);
+            });
+          }}
+          onOpenProjectContextMenu={openProjectContextMenu}
+          onOpenSessionContextMenu={openSessionContextMenu}
+          onCreateUnboundSession={() => {
+            void runSidebarAction('create:normal:nested', () => handleCreateSession(null));
+          }}
+          onOpenSettings={() => setSettingsOpen(true)}
+        />
 
-          <section className="deepcode-gui-sidebar-section">
-            <div className="deepcode-gui-sidebar-section__heading deepcode-gui-sidebar-section__heading--project">
-              <div className="deepcode-gui-sidebar-section__label">{t(language, 'deepcodeGui.sidebar.project')}</div>
-              <button
-                type="button"
-                className="deepcode-gui-sidebar-text-action"
-                onClick={openProjectCreateMenu}
-                aria-haspopup="menu"
-                aria-expanded={Boolean(projectCreateMenu)}
-              >
-                {t(language, 'deepcodeGui.project.new')}
-              </button>
-            </div>
-            {projectArchiveGroups.length === 0 ? (
-              <div className="deepcode-gui-sidebar-empty">{t(language, 'deepcodeGui.project.empty')}</div>
-            ) : (
-              <div className="deepcode-gui-project-archive-list">
-                {projectArchiveGroups.slice(0, 6).map((group, groupIndex) => {
-                  const projectRecord = group.projectId
-                    ? projectRecords.find((project) => project.id === group.projectId) ?? null
-                    : null;
-                  const projectCollapsed = Boolean(
-                    group.projectId && collapsedProjectIdSet.has(group.projectId)
-                  );
-                  const projectIsCurrent = Boolean(
-                    group.projectId
-                    && (group.projectId === activeProjectId || group.projectId === draftTargetProjectId)
-                  );
-                  const projectCreateActionKey = group.projectId ? `create:project:${group.projectId}` : '';
-                  return (
-                    <div
-                      key={group.key}
-                      className={`deepcode-gui-project-archive-group${projectIsCurrent ? ' deepcode-gui-project-archive-group--current' : ''}`}
-                    >
-                      <div
-                        className="deepcode-gui-project-archive-group__title"
-                        onContextMenu={(event) => {
-                          if (projectRecord) openProjectContextMenu(event, projectRecord);
-                        }}
-                      >
-                      <button
-                        type="button"
-                        className="deepcode-gui-project-archive-group__select"
-                        onClick={() => group.projectId && toggleProjectExpanded(group.projectId)}
-                        onContextMenu={(event) => {
-                          if (projectRecord) openProjectContextMenu(event, projectRecord);
-                        }}
-                        disabled={!group.projectId}
-                        aria-expanded={!projectCollapsed}
-                        title={projectRecord?.workspaceBinding?.openPath ?? group.title}
-                      >
-                        <DeepCodeSidebarIcon name="folder" className="deepcode-gui-sidebar-icon" />
-                        <span>{group.title}</span>
-                      </button>
-                      {group.projectId && (
-                        <div className="deepcode-gui-project-archive-group__actions" aria-hidden={false}>
-                          <button
-                            type="button"
-                            className="deepcode-gui-project-archive-group__compose"
-                            onClick={(event) => {
-                              event.stopPropagation();
-                              if (!group.projectId) return;
-                              void runSidebarAction(projectCreateActionKey, () => handleCreateSession(group.projectId));
-                            }}
-                            disabled={Boolean(projectCreateActionKey && sidebarPendingAction === projectCreateActionKey)}
-                            aria-label={t(language, 'deepcodeGui.project.newChat')}
-                            title={t(language, 'deepcodeGui.project.newChat')}
-                          >
-                            <DeepCodeSidebarIcon name="compose" />
-                          </button>
-                        </div>
-                      )}
-                      </div>
-                      {!projectCollapsed && (
-                        <div className="deepcode-gui-project-archive-group__sessions">
-                          {group.sessions.slice(0, 4).map((item, itemIndex) => {
-                            const shortcutIndex = groupIndex + itemIndex + 1;
-                            const activateActionKey = `activate:project:${item.id}`;
-                            return (
-                              <button
-                                key={item.id}
-                                type="button"
-                                className={item.id === highlightedSessionId ? 'active' : ''}
-                                onClick={() => {
-                                  void runSidebarAction(activateActionKey, async () => {
-                                    pendingProjectSendRef.current = null;
-                                    setActiveProjectId(group.projectId ?? null);
-                                    setDraftTargetProjectId(null);
-                                    await activateSession(item.id);
-                                  });
-                                }}
-                                onContextMenu={(event) => openSessionContextMenu(event, item)}
-                                disabled={sidebarPendingAction === activateActionKey}
-                                title={item.title || item.id}
-                              >
-                                <span>{displaySessionTitle(language, item.title)}</span>
-                                {shortcutIndex <= 9 && (
-                                  <kbd>⌘{shortcutIndex}</kbd>
-                                )}
-                              </button>
-                            );
-                          })}
-                        </div>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-            )}
+        <DeepCodeConversationShell
+          language={language}
+          timeline={liveTimelineProjection}
+          forceHome={projectDraftActive}
+          projectTitle={draftProject?.title ?? activeProject?.title ?? null}
+          onBeforeSend={prepareProjectDraftSession}
+          onAfterSend={commitDraftProjectSession}
+        />
 
-            <div className="deepcode-gui-sidebar-section__heading">
-              <div className="deepcode-gui-sidebar-section__label deepcode-gui-sidebar-section__label--nested">
-                {t(language, 'deepcodeGui.sidebar.chats')}
-              </div>
-              <button
-                type="button"
-                className="deepcode-gui-sidebar-new-chat"
-                onClick={() => void runSidebarAction('create:normal:nested', () => handleCreateSession(null))}
-                disabled={sidebarPendingAction === 'create:normal:nested'}
-                aria-label={t(language, 'deepcodeGui.nav.newChat')}
-                title={t(language, 'deepcodeGui.nav.newChat')}
-              >
-                <DeepCodeSidebarIcon name="compose" />
-              </button>
-            </div>
-            {visibleSessions.length > 0 && (
-              <div className="deepcode-gui-session-list">
-                {visibleSessions.slice(0, 8).map((item) => (
-                  (() => {
-                    const activateActionKey = `activate:chat:${item.id}`;
-                    return (
-                      <button
-                        key={item.id}
-                        type="button"
-                        className={item.id === highlightedSessionId ? 'active' : ''}
-                        onClick={() => {
-                          void runSidebarAction(activateActionKey, async () => {
-                            pendingProjectSendRef.current = null;
-                            setActiveProjectId(null);
-                            setDraftTargetProjectId(null);
-                            await activateSession(item.id);
-                          });
-                        }}
-                        onContextMenu={(event) => openSessionContextMenu(event, item)}
-                        disabled={sidebarPendingAction === activateActionKey}
-                        title={item.title || item.id}
-                      >
-                        <span>{displaySessionTitle(language, item.title)}</span>
-                      </button>
-                    );
-                  })()
-                ))}
-              </div>
-            )}
-          </section>
-
-          <div className="deepcode-gui-sidebar-spacer" />
-          <button
-            type="button"
-            className="deepcode-gui-sidebar-settings"
-            onClick={() => setSettingsOpen(true)}
-          >
-            <span className="deepcode-gui-sidebar-settings__icon">
-              <DeepCodeSidebarIcon name="settings" />
-            </span>
-            <span>{t(language, 'settings.title')}</span>
-          </button>
-        </aside>
-
-        <main className="deepcode-gui-session-main">
-          <DeepCodeAgentPanel
-            language={language}
-            timeline={liveTimelineProjection}
-            forceHome={projectDraftActive}
-            homeProjectTitle={draftProject?.title ?? activeProject?.title ?? null}
-            suppressPendingDecision={projectDraftActive}
-            onBeforeSend={prepareProjectDraftSession}
-            onAfterSend={commitDraftProjectSession}
-          />
-        </main>
-
-        <aside className="deepcode-gui-context-panel">
-          <section className="deepcode-gui-task-list-card">
-            <div className="deepcode-gui-task-list-card__title">{t(language, 'deepcodeGui.tasks.title')}</div>
-            {taskItems.length === 0 ? (
-              <div className="deepcode-gui-task-list-card__empty">{t(language, 'deepcodeGui.tasks.empty')}</div>
-            ) : (
-              <div className="deepcode-gui-task-list">
-                {taskItems.map((item) => (
-                  <div key={item.id} className={`deepcode-gui-task-item deepcode-gui-task-item--${item.status}`}>
-                    <span className="deepcode-gui-task-item__dot" />
-                    <div>
-                      <div className="deepcode-gui-task-item__title">{item.title}</div>
-                      <div className="deepcode-gui-task-item__summary">{item.summary}</div>
-                    </div>
-                    <strong>{statusLabel(language, item.status)}</strong>
-                  </div>
-                ))}
-              </div>
-            )}
-          </section>
-
-        </aside>
+        <DeepCodeTaskPanel language={language} items={taskItems} />
       </div>
 
       {projectCreateMenu && (

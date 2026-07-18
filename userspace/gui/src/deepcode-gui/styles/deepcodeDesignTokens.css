@@ -1,0 +1,86 @@
+:root[data-product='deepcode-gui'] {
+  color-scheme: light;
+  --dc-background: #f4f4f6;
+  --dc-sidebar: #f0f0f2;
+  --dc-surface: #ffffff;
+  --dc-surface-subtle: #f7f7f8;
+  --dc-surface-raised: #ffffff;
+  --dc-surface-hover: #ececef;
+  --dc-surface-active: #e5e5e9;
+  --dc-border: rgba(0, 0, 0, 0.07);
+  --dc-border-strong: rgba(0, 0, 0, 0.13);
+  --dc-foreground: #1c1c1e;
+  --dc-foreground-strong: #0f0f10;
+  --dc-muted: #636366;
+  --dc-faint: #8e8e93;
+  --dc-accent: #007aff;
+  --dc-accent-soft: rgba(0, 122, 255, 0.1);
+  --dc-accent-border: rgba(0, 122, 255, 0.23);
+  --dc-success: #16845b;
+  --dc-warning: #a66308;
+  --dc-danger: #d13c36;
+  --dc-font-ui: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Segoe UI", sans-serif;
+  --dc-font-mono: ui-monospace, "SFMono-Regular", Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  --dc-font-micro: 11px;
+  --dc-font-caption: 12px;
+  --dc-font-label: 13px;
+  --dc-font-body: 14px;
+  --dc-font-body-large: 15px;
+  --dc-font-title: 16px;
+  --dc-line-tight: 1.35;
+  --dc-line-compact: 1.45;
+  --dc-line-body: 1.6;
+  --dc-line-reading: 1.7;
+  --dc-weight-regular: 400;
+  --dc-weight-medium: 560;
+  --dc-weight-semibold: 650;
+  --dc-weight-bold: 700;
+  --dc-radius-outer: 16px;
+  --dc-radius-inner: 12px;
+  --dc-radius-control: 8px;
+  --dc-shadow-small:
+    3px 5px 12px -8px rgba(15, 15, 16, 0.22),
+    1px 2px 5px -4px rgba(15, 15, 16, 0.12);
+  --dc-shadow-panel:
+    8px 13px 28px -13px rgba(15, 15, 16, 0.28),
+    2px 5px 12px -7px rgba(15, 15, 16, 0.15),
+    inset 1px 1px 0 rgba(255, 255, 255, 0.72);
+}
+
+:root[data-product='deepcode-gui'][data-theme='deepcode-gui-dark'] {
+  color-scheme: dark;
+  --dc-background: #09090b;
+  --dc-sidebar: #111114;
+  --dc-surface: #18181b;
+  --dc-surface-subtle: #202024;
+  --dc-surface-raised: #242429;
+  --dc-surface-hover: #2a2a30;
+  --dc-surface-active: #303036;
+  --dc-border: rgba(255, 255, 255, 0.065);
+  --dc-border-strong: rgba(255, 255, 255, 0.13);
+  --dc-foreground: #f4f4f5;
+  --dc-foreground-strong: #ffffff;
+  --dc-muted: #a1a1aa;
+  --dc-faint: #71717a;
+  --dc-accent: #0a84ff;
+  --dc-accent-soft: rgba(10, 132, 255, 0.14);
+  --dc-accent-border: rgba(10, 132, 255, 0.3);
+  --dc-success: #34d399;
+  --dc-warning: #f0b85a;
+  --dc-danger: #ff716b;
+  --dc-shadow-small:
+    4px 6px 14px -8px rgba(0, 0, 0, 0.55),
+    1px 2px 6px -4px rgba(0, 0, 0, 0.38);
+  --dc-shadow-panel:
+    10px 15px 32px -14px rgba(0, 0, 0, 0.65),
+    2px 5px 13px -7px rgba(0, 0, 0, 0.42),
+    inset 1px 1px 0 rgba(255, 255, 255, 0.08);
+}
+
+:root[data-product='deepcode-gui'] body {
+  background: var(--dc-background);
+  color: var(--dc-foreground);
+  font-family: var(--dc-font-ui);
+  font-size: var(--dc-font-body-large);
+  letter-spacing: 0;
+}
