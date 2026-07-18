@@ -132,6 +132,7 @@ import {
   kernelTestBatchReviewReady,
   kernelTestPermissionRequest,
   kernelTestResourcePacket,
+  kernelTestReviewGateEvaluation,
   kernelTestReviewFacts,
   kernelTestWorkUnit,
   kernelTestWorkUnitCompleted,
@@ -4050,10 +4051,10 @@ function assertKernelEventStatusIndexReadsStructuredEvents(): void {
       {
         kind: 'review_gate.evaluated',
         runId,
-        result: { status: `status-${token}` },
+        result: kernelTestReviewGateEvaluation(runId, 'cleanupFailed'),
       },
     ]),
-    `status-${token}`,
+    'cleanupFailed',
     'kernel event status index reads review gate status'
   );
   const permissionObservation = index.observe({
@@ -4489,7 +4490,7 @@ async function assertReviewDecisionHandlerAcceptsTerminalReview(): Promise<void>
           events: [{
             kind: 'review_gate.evaluated',
             runId,
-            result: { status: 'accepted' },
+            result: kernelTestReviewGateEvaluation(runId, 'accepted'),
           }],
         };
       }
@@ -16581,7 +16582,7 @@ async function assertSessionDriverLoopReviewRejectCancelsRun(): Promise<void> {
           events: [{
             kind: 'review_gate.evaluated',
             runId: command.runId,
-            result: { status: 'aborted' },
+            result: kernelTestReviewGateEvaluation(command.runId, 'aborted'),
           }],
         };
       }

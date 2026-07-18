@@ -558,6 +558,29 @@ export type KernelResourceKind =
   | 'browserHandle'
   | 'networkHandle';
 
+export type KernelResourceState =
+  | 'active'
+  | 'cleanupPending'
+  | 'cleanupFailed'
+  | 'released';
+
+export type KernelCleanupState = 'idle' | 'pending' | 'failed' | 'completed';
+export type KernelCleanupScope = 'batch' | 'plan' | 'run';
+
+export interface KernelCleanupCheckpoint {
+  runId: string;
+  scope: KernelCleanupScope;
+  trigger: string;
+  resourceIds: string[];
+  intendedLifecycle: KernelRuntimeLifecycleState;
+  intendedRunStatus?: 'running' | 'completed' | 'failed' | 'cancelled';
+  reviewDecision?: {
+    decision: 'accept' | 'revise' | 'reject';
+    guidance?: string;
+  };
+  attempt: number;
+}
+
 export interface KernelTemporaryGrantEnvelope {
   id: string;
   contractId: string;
@@ -599,11 +622,21 @@ export interface KernelResource {
   sessionId?: string;
   runId?: string;
   scope: 'run' | 'session' | 'persistent';
-  state: 'active' | 'released' | 'orphaned' | 'denied';
+  state: KernelResourceState;
   cleanupPolicy: 'onBatchReviewReady' | 'onRunEnd' | 'onSessionEnd' | 'onRuntimeDrop' | 'manual';
   createdAt?: string;
   releasedAt?: string;
   metadata: KernelResourceMetadata;
+}
+
+export interface KernelResourceCleanupStateFact {
+  runId: string;
+  scope: KernelCleanupScope;
+  state: KernelCleanupState;
+  resourceId?: string;
+  resourceState?: KernelResourceState;
+  attempt: number;
+  error?: string;
 }
 
 export interface KernelResourceLifecycleFact {
@@ -631,6 +664,32 @@ export interface KernelPathNormalizationDiagnostic {
   normalization: KernelPathNormalizationFact;
 }
 
+export interface KernelToolExecutionAttemptFact {
+  attemptId: string;
+  toolCallId: string;
+  toolId: string;
+  operationKind: KernelToolOperationKind;
+  argsHash: string;
+  contractId: string;
+  workUnitId: string;
+}
+
+export type KernelToolEffectOutcome = 'none' | 'observed' | 'indeterminate';
+
+export interface KernelToolEffectReceipt {
+  attemptId: string;
+  outcome: KernelToolEffectOutcome;
+  affectedResources: string[];
+  validation?: unknown;
+  cleanupRefs: string[];
+}
+
+export interface KernelToolOutcomeIndeterminateFact {
+  attempt: KernelToolExecutionAttemptFact;
+  receipt: KernelToolEffectReceipt;
+  reason: string;
+}
+
 export interface KernelReviewFacts {
   factsRef: string;
   runId: string;
@@ -652,6 +711,7 @@ export interface KernelReviewFacts {
   generatedArtifacts: KernelGeneratedArtifactFact[];
   resourceEvents: KernelResourceLifecycleFact[];
   cleanupFailures: KernelCleanupFailureFact[];
+  indeterminateToolOutcomes: KernelToolOutcomeIndeterminateFact[];
   pathNormalizationDiagnostics: KernelPathNormalizationDiagnostic[];
   batchReviewReady: boolean;
 }
@@ -720,6 +780,7 @@ export interface KernelGateInterventionRequired {
 export interface KernelExecutionOperation {
   id: string;
   title: string;
+  dependsOn: string[];
   toolId: string;
   operationKind: KernelToolOperationKind;
   args: Record<string, unknown>;
@@ -900,7 +961,33 @@ export type KernelRuntimeLifecycleState =
   | 'executing'
   | 'awaitingPermission'
   | 'reviewReady'
+  | 'terminating'
   | 'terminal';
+
+export type KernelReviewGateStatus =
+  | 'accepted'
+  | 'needsReplan'
+  | 'aborted'
+  | 'cleanupFailed';
+
+export interface KernelReviewGateEvaluation {
+  id: string;
+  runId: string;
+  status: KernelReviewGateStatus;
+  decision: {
+    decision: 'accept' | 'revise' | 'reject';
+    guidance?: string;
+  };
+  failedWorkUnitCount: number;
+  blockedWorkUnitCount: number;
+  cleanupFailureCount: number;
+  revokedTemporaryGrantCount: number;
+  releasedResourceCount: number;
+  removedTempFileCount: number;
+  cleanupFailures: string[];
+  summary: string;
+  factsRef: string;
+}
 
 export type KernelRuntimeLifecycleEvent =
   | {

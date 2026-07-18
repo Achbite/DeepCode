@@ -10,9 +10,14 @@ import type {
   KernelPlanAuthorizationDecision,
   KernelPlanAuthorizationReview,
   KernelProposalReviewReport,
+  KernelResourceCleanupStateFact,
   KernelResourcePacket,
+  KernelReviewGateEvaluation,
   KernelReviewFacts,
   KernelRuntimeLifecycleState,
+  KernelToolEffectReceipt,
+  KernelToolExecutionAttemptFact,
+  KernelToolOutcomeIndeterminateFact,
   KernelWorkUnitDescriptor,
 } from './kernel.js';
 import type { KernelToolOperationKind } from './tools.js';
@@ -105,6 +110,7 @@ export type KernelCommandV1 =
   | (KernelCommandBaseV1 & { kind: 'reviewGateEvaluate'; runId: string; sessionId?: string; decision: { decision: 'accept' | 'revise' | 'reject'; guidance?: string } })
   | (KernelCommandBaseV1 & { kind: 'runCancel'; runId: string })
   | (KernelCommandBaseV1 & { kind: 'runResume'; sessionId: string })
+  | (KernelCommandBaseV1 & { kind: 'runCleanupRetry'; runId: string })
   | (KernelCommandBaseV1 & { kind: 'hostWorkspaceBindingResolve'; path: string })
   | (KernelCommandBaseV1 & { kind: 'hostWorkspaceOpen'; path: string })
   | (KernelCommandBaseV1 & { kind: 'hostWorkspaceCurrent' })
@@ -162,12 +168,16 @@ export type KernelEventV1 =
   | (KernelEventBaseV1 & { kind: 'work_unit.blocked'; runId: string; workUnitId: string; reason: string })
   | (KernelEventBaseV1 & { kind: 'batch.review_ready'; runId: string; contractId: string })
   | (KernelEventBaseV1 & { kind: 'review.facts_produced'; runId: string; facts: KernelReviewFacts })
-  | (KernelEventBaseV1 & { kind: 'review_gate.evaluated'; runId: string; result: Record<string, unknown> })
+  | (KernelEventBaseV1 & { kind: 'review_gate.evaluated'; runId: string; result: KernelReviewGateEvaluation })
   | (KernelEventBaseV1 & { kind: 'run.completed'; runId: string; status: 'running' | 'completed' | 'failed' | 'cancelled'; summary?: string })
   | (KernelEventBaseV1 & { kind: 'runtime.lifecycle_changed'; runId: string; previousState?: KernelRuntimeLifecycleState; currentState: KernelRuntimeLifecycleState; reason?: string })
+  | (KernelEventBaseV1 & { kind: 'resource.cleanup_state_changed'; runId: string; fact: KernelResourceCleanupStateFact })
   | (KernelEventBaseV1 & { kind: 'message.appended'; turnId?: string; role: 'user' | 'agent' | 'system' | 'tool'; channel?: string; content?: string; messageKey?: string; args?: unknown })
   | (KernelEventBaseV1 & { kind: 'llm.provider_error'; runId: string; phase: string; llmCallId: string; diagnostic: Record<string, unknown> })
   | (KernelEventBaseV1 & { kind: 'tool.requested'; turnId?: string; fact: KernelToolRequestFact })
+  | (KernelEventBaseV1 & { kind: 'tool.execution_attempted'; runId: string; fact: KernelToolExecutionAttemptFact })
+  | (KernelEventBaseV1 & { kind: 'tool.effect_observed'; runId: string; fact: KernelToolEffectReceipt })
+  | (KernelEventBaseV1 & { kind: 'tool.outcome_indeterminate'; runId: string; fact: KernelToolOutcomeIndeterminateFact })
   | (KernelEventBaseV1 & { kind: 'tool.completed'; turnId?: string; fact: KernelToolCompletionFact })
   | (KernelEventBaseV1 & { kind: 'permission.requested'; sessionId: string; request: KernelPermissionRequestEnvelope })
   | (KernelEventBaseV1 & { kind: 'permission.resolved'; permissionId: string; decision: 'accept' | 'reject'; reason?: string })
@@ -202,8 +212,9 @@ const KERNEL_EVENT_KINDS = new Set<KernelEventV1['kind']>([
   'draft.batch_completed', 'draft.discarded', 'draft.committed', 'action_batch.accepted',
   'work_unit.queued', 'work_unit.started', 'work_unit.completed', 'work_unit.failed',
   'work_unit.blocked', 'batch.review_ready', 'review.facts_produced', 'review_gate.evaluated',
-  'run.completed', 'runtime.lifecycle_changed', 'message.appended', 'llm.provider_error',
-  'tool.requested', 'tool.completed', 'permission.requested', 'permission.resolved',
+  'run.completed', 'runtime.lifecycle_changed', 'resource.cleanup_state_changed', 'message.appended',
+  'llm.provider_error', 'tool.requested', 'tool.execution_attempted', 'tool.effect_observed',
+  'tool.outcome_indeterminate', 'tool.completed', 'permission.requested', 'permission.resolved',
   'autonomy.transitioned', 'config.snapshot.attached', 'runtime.resumed', 'host.skills_discovered',
   'host.skill_trust_decision_recorded', 'host.mcp_risk_decision_recorded', 'audit.verify_started',
   'audit.verify_completed', 'audit.query_completed', 'audit.degraded_entered',
@@ -236,6 +247,24 @@ function validateCriticalEventShape(event: Record<string, unknown>): void {
     if (!fact || !nonEmptyString(fact.toolCallId) || !nonEmptyString(fact.toolId) || !nonEmptyString(fact.operationKind)) {
       throw new KernelAbiEventDecodeError('tool.requested must contain a typed KernelToolRequestFact.');
     }
+  } else if (event.kind === 'tool.execution_attempted') {
+    const fact = objectRecord(event.fact);
+    if (!fact || !nonEmptyString(fact.attemptId) || !nonEmptyString(fact.toolCallId) || !nonEmptyString(fact.toolId) || !nonEmptyString(fact.operationKind) || !nonEmptyString(fact.argsHash) || !nonEmptyString(fact.contractId) || !nonEmptyString(fact.workUnitId)) {
+      throw new KernelAbiEventDecodeError('tool.execution_attempted must contain a typed KernelToolExecutionAttemptFact.');
+    }
+  } else if (event.kind === 'tool.effect_observed') {
+    validateToolEffectReceipt(event.fact, 'tool.effect_observed');
+  } else if (event.kind === 'tool.outcome_indeterminate') {
+    const fact = objectRecord(event.fact);
+    if (!fact || !objectRecord(fact.attempt) || !nonEmptyString(fact.reason)) {
+      throw new KernelAbiEventDecodeError('tool.outcome_indeterminate must contain a typed KernelToolOutcomeIndeterminateFact.');
+    }
+    validateToolEffectReceipt(fact.receipt, 'tool.outcome_indeterminate');
+  } else if (event.kind === 'resource.cleanup_state_changed') {
+    const fact = objectRecord(event.fact);
+    if (!fact || !nonEmptyString(fact.runId) || !['batch', 'plan', 'run'].includes(String(fact.scope)) || !['idle', 'pending', 'failed', 'completed'].includes(String(fact.state)) || typeof fact.attempt !== 'number') {
+      throw new KernelAbiEventDecodeError('resource.cleanup_state_changed must contain a typed KernelResourceCleanupStateFact.');
+    }
   } else if (event.kind === 'permission.requested') {
     const request = objectRecord(event.request);
     if (!request || !nonEmptyString(request.id) || !['runtimePermission', 'scopeExpansion'].includes(String(request.requestKind)) || !nonEmptyString(request.capability) || !nonEmptyString(request.riskLevel)) {
@@ -251,6 +280,13 @@ function validateCriticalEventShape(event: Record<string, unknown>): void {
     if (!nonEmptyString(event.workUnitId) && !nonEmptyString(descriptor?.id)) {
       throw new KernelAbiEventDecodeError(`${event.kind} must identify its WorkUnit.`);
     }
+  }
+}
+
+function validateToolEffectReceipt(value: unknown, eventKind: string): void {
+  const fact = objectRecord(value);
+  if (!fact || !nonEmptyString(fact.attemptId) || !['none', 'observed', 'indeterminate'].includes(String(fact.outcome)) || !Array.isArray(fact.affectedResources) || !Array.isArray(fact.cleanupRefs)) {
+    throw new KernelAbiEventDecodeError(`${eventKind} must contain a typed KernelToolEffectReceipt.`);
   }
 }
 
