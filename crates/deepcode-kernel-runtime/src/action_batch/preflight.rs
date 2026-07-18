@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[derive(Debug, Clone)]
 pub(super) struct PreparedOperation {
     pub(super) compiled: Option<CompiledWorkspaceAction>,
 }
@@ -57,7 +58,7 @@ pub(super) fn prepare_action_batch<'a>(
             match runtime
                 .effective_permission_action_for_tool(
                     &record.run_id,
-                    &compiled.tool_name,
+                    &compiled.tool_id,
                     &compiled.arguments,
                 )
                 .map_err(|error| BatchPreflightFailure {
@@ -70,7 +71,7 @@ pub(super) fn prepare_action_batch<'a>(
                         operation_id: operation.id.clone(),
                         error: KernelError::PermissionDenied(format!(
                             "{} mutation is denied by Kernel policy",
-                            compiled.tool_name
+                            compiled.tool_id
                         )),
                     });
                 }
@@ -89,7 +90,7 @@ fn validate_mutation(
     let root = compiled.workspace_root.as_ref().ok_or_else(|| {
         KernelError::InvalidCommand(format!(
             "{} mutation requires a run-bound workspace root",
-            compiled.tool_name
+            compiled.tool_id
         ))
     })?;
     if !root.is_dir() {
@@ -98,7 +99,7 @@ fn validate_mutation(
             root.display()
         )));
     }
-    let path = required_argument(&compiled.arguments, "path", &compiled.tool_name)?;
+    let path = required_argument(&compiled.arguments, "path", &compiled.tool_id)?;
     let target = WorkspaceBoundary::new(root).resolve_mutation(path)?;
     let target_state = state.resolve(&target)?;
 
@@ -116,7 +117,7 @@ fn validate_mutation(
             if target_state != MutationTargetState::File {
                 return Err(KernelError::InvalidCommand(format!(
                     "{} requires a file target: {path}",
-                    compiled.tool_name
+                    compiled.tool_id
                 )));
             }
         }
@@ -127,7 +128,7 @@ fn validate_mutation(
                 )));
             }
             let destination =
-                required_argument(&compiled.arguments, "destinationPath", &compiled.tool_name)?;
+                required_argument(&compiled.arguments, "destinationPath", &compiled.tool_id)?;
             let destination_path = WorkspaceBoundary::new(root).resolve_mutation(destination)?;
             if state.resolve(&destination_path)? != MutationTargetState::Absent {
                 return Err(KernelError::InvalidCommand(format!(
@@ -149,7 +150,7 @@ fn validate_mutation(
                 }
             };
             let target_kind =
-                required_argument(&compiled.arguments, "targetKind", &compiled.tool_name)?;
+                required_argument(&compiled.arguments, "targetKind", &compiled.tool_id)?;
             if target_kind != actual_kind {
                 return Err(KernelError::PermissionDenied(format!(
                     "fs.delete targetKind={target_kind} does not match {actual_kind} target: {path}"
@@ -178,7 +179,7 @@ fn validate_mutation(
         _ => {
             return Err(KernelError::InvalidCommand(format!(
                 "{} is not a workspace mutation",
-                compiled.tool_name
+                compiled.tool_id
             )));
         }
     }
@@ -188,14 +189,14 @@ fn validate_mutation(
 fn required_argument<'a>(
     arguments: &'a Value,
     field: &str,
-    tool_name: &str,
+    tool_id: &str,
 ) -> KernelResult<&'a str> {
     arguments
         .get(field)
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| KernelError::InvalidCommand(format!("{tool_name} requires args.{field}")))
+        .ok_or_else(|| KernelError::InvalidCommand(format!("{tool_id} requires args.{field}")))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -246,18 +247,16 @@ impl MutationPreflightState {
         &mut self,
         relative_path: &str,
         target: &Path,
-        tool_name: &str,
+        tool_id: &str,
     ) -> KernelResult<()> {
         let parent = target.parent().ok_or_else(|| {
-            KernelError::InvalidCommand(format!(
-                "{tool_name} target has no parent: {relative_path}"
-            ))
+            KernelError::InvalidCommand(format!("{tool_id} target has no parent: {relative_path}"))
         })?;
         if self.resolve(parent)? == MutationTargetState::Directory {
             return Ok(());
         }
         Err(KernelError::InvalidCommand(format!(
-            "{tool_name} parent directory does not exist: {}",
+            "{tool_id} parent directory does not exist: {}",
             parent.display()
         )))
     }

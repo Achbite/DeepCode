@@ -18,7 +18,6 @@ impl DeepCodeKernelRuntime {
             risk_level: decision.risk_level,
             permission_granted: false,
         };
-        self.state.mcp_risk_acknowledgments.push(record.clone());
         let sequence = self.ledger.list_all()?.len() as u64 + 1;
         self.ledger.append(LedgerEvent {
             id: format!("evt-host-mcp-risk-decision-{sequence}"),

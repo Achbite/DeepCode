@@ -6,24 +6,26 @@ use deepcode_kernel_abi::{
     HostBrowseResult, HostFileTreeNodeKind, HostInspectionOutput, HostInspectionQuery,
     HostInspectionResult, HostMcpRiskDecisionRecord, HostMcpRiskDecisionSubmit, HostResultSource,
     HostSkillActivationStatus, HostSkillAdapterKind, HostSkillCatalogResult, HostSkillDescriptor,
-    HostSkillEffect, HostSkillRiskLevel, HostSkillSource, HostSkillTrustDecisionKind,
-    HostSkillTrustDecisionRecord, HostSkillTrustDecisionSubmit, HostSkillTrustMode, HostStatus,
-    HostUnsupportedWorkspaceField, HostWorkspaceBindingResolved, HostWorkspaceCurrent,
-    HostWorkspaceFolder, HostWorkspaceOpened, HostWorkspaceOutput, HostWorkspaceResult,
-    HostWorkspaceRootStatus, HostWorkspaceSaved, HostWorkspaceSourceKind, HostWorkspaceSpec,
-    KernelCommand, KernelError, KernelErrorEnvelope, KernelEvent, KernelEventSummary,
-    KernelExecutionContract, KernelFactSource, KernelPlanAuthorizationContract, KernelResource,
-    KernelResourceCleanupPolicy, KernelResourceIdentity, KernelResourceKind,
-    KernelResourceMetadata, KernelResourceOwner, KernelResourceScope, KernelResult, KernelSnapshot,
-    KernelStateContract, KernelToolCatalogEntryRef, KernelToolCatalogSnapshotRef,
+    HostSkillEffect, HostSkillRiskLevel, HostSkillSource, HostSkillTrustDecisionRecord,
+    HostSkillTrustDecisionSubmit, HostStatus, HostUnsupportedWorkspaceField,
+    HostWorkspaceBindingResolved, HostWorkspaceCurrent, HostWorkspaceFolder, HostWorkspaceOpened,
+    HostWorkspaceOutput, HostWorkspaceResult, HostWorkspaceRootStatus, HostWorkspaceSaved,
+    HostWorkspaceSourceKind, HostWorkspaceSpec, KernelCleanupCheckpoint, KernelCleanupScope,
+    KernelCleanupState, KernelCommand, KernelError, KernelErrorEnvelope, KernelEvent,
+    KernelEventSummary, KernelExecutionContract, KernelFactSource, KernelPlanAuthorizationContract,
+    KernelResource, KernelResourceCleanupPolicy, KernelResourceCleanupStateFact,
+    KernelResourceIdentity, KernelResourceKind, KernelResourceMetadata, KernelResourceOwner,
+    KernelResourceReleaseResult, KernelResourceScope, KernelResourceState, KernelResult,
+    KernelSnapshot, KernelStateContract, KernelToolCatalogEntryRef, KernelToolCatalogSnapshotRef,
     KernelToolUsageConstraintsRef, PathNormalizationDiagnostic, PathNormalizationFact,
     PermissionRequestedFact, PermissionResolutionFact, PermissionResourceKind,
     PlanAuthorizationDecisionKind, PlanAuthorizationDecisionSubmit, PlanAuthorizationReview,
     PlanAuthorizationStatus, PlanGrantLease, ProfileRef, ProposalEnvelope, ProposalEnvelopeKind,
     RequestId, ResourceLifecycleFact, ResourceLifecycleKind, ResourcePacket, ResourcePacketItem,
-    ResourcePacketStatus, ResourceResolveRequest, ReviewFacts, RunId, RunStatus,
-    RuntimeLifecycleState, SessionId, TaskIntentEnvelope, TemporaryGrantEnvelope,
-    TemporaryPermissionGrantKind, ToolCompletionFact, ToolFactEnvelope, ToolRequestFact,
+    ResourcePacketStatus, ResourceResolveRequest, ReviewFacts, ReviewGateDecision, RunId,
+    RunStatus, RuntimeLifecycleState, SessionId, TaskIntentEnvelope, TemporaryGrantEnvelope,
+    TemporaryPermissionGrantKind, ToolCompletionFact, ToolEffectOutcome, ToolEffectReceipt,
+    ToolExecutionAttemptFact, ToolFactEnvelope, ToolOutcomeIndeterminateFact, ToolRequestFact,
     ToolTargetKind, UserInput, WorkUnitDescriptor, WorkUnitFact, WorkUnitStatus, WorkspaceBinding,
 };
 use deepcode_kernel_audit::{
@@ -38,9 +40,7 @@ use deepcode_kernel_ledger::{
     ValidationKind, ValidationResult,
 };
 use deepcode_kernel_policy::{PolicyProfile, WorkspaceBoundary};
-use deepcode_kernel_skills::{
-    InMemoryUserSkillRegistry, SkillDescriptor, SkillTrustMode, SkillTrustRecord, UserSkillRegistry,
-};
+use deepcode_kernel_skills::{InMemoryUserSkillRegistry, SkillDescriptor, UserSkillRegistry};
 use deepcode_kernel_tools::{
     derive_plan_authorization, GitOperation, GitOperationKind, KernelExecutionContractStatus,
     KernelProposalReviewReport, KernelToolCatalogSnapshot, KernelToolRegistration,

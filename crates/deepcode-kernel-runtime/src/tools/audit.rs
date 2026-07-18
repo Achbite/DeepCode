@@ -78,7 +78,6 @@ impl DeepCodeKernelRuntime {
                     })
                     && filter.tool_id.as_ref().is_none_or(|tool_id| {
                         value_contains_string(&event.payload, "toolId", tool_id)
-                            || value_contains_string(&event.payload, "toolName", tool_id)
                     })
             })
             .collect::<Vec<_>>();

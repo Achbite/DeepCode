@@ -133,6 +133,7 @@ fn execution_operation(
     Ok(KernelExecutionOperation {
         id: operation.id.clone(),
         title: operation.title.clone(),
+        depends_on: operation.depends_on.clone(),
         tool_id,
         operation_kind: operation.operation_kind,
         args,

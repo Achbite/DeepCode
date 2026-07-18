@@ -8,6 +8,7 @@ pub enum RuntimeLifecycleState {
     Executing,
     AwaitingPermission,
     ReviewReady,
+    Terminating,
     Terminal,
 }
 
@@ -19,6 +20,7 @@ impl RuntimeLifecycleState {
             Self::Executing => "executing",
             Self::AwaitingPermission => "awaitingPermission",
             Self::ReviewReady => "reviewReady",
+            Self::Terminating => "terminating",
             Self::Terminal => "terminal",
         }
     }
@@ -34,6 +36,7 @@ impl RuntimeLifecycleState {
             "executing" => Some(Self::Executing),
             "awaitingPermission" => Some(Self::AwaitingPermission),
             "reviewReady" => Some(Self::ReviewReady),
+            "terminating" => Some(Self::Terminating),
             "terminal" => Some(Self::Terminal),
             _ => None,
         }

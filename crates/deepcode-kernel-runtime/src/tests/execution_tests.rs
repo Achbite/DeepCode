@@ -91,6 +91,25 @@ fn accepted_write_contract_executes_and_enters_review() {
     let report = submit_proposal(&mut runtime, payload.clone());
     let events = execute_contract(&mut runtime, &payload, &report);
     assert!(terminal_tool(&events, "fs.write", true));
+    let attempt_index = events
+        .iter()
+        .position(|event| matches!(event, KernelEvent::ToolExecutionAttempted { .. }))
+        .expect("tool attempt fact");
+    let effect_index = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                KernelEvent::ToolEffectObserved { fact, .. }
+                    if fact.outcome == deepcode_kernel_abi::ToolEffectOutcome::Observed
+            )
+        })
+        .expect("tool effect fact");
+    let completion_index = events
+        .iter()
+        .position(|event| matches!(event, KernelEvent::ToolCompleted { .. }))
+        .expect("tool completion fact");
+    assert!(attempt_index < effect_index && effect_index < completion_index);
     assert!(events
         .iter()
         .any(|event| matches!(event, KernelEvent::WorkUnitCompleted { .. })));
@@ -142,9 +161,7 @@ fn accepted_write_contract_executes_and_enters_review() {
         .list()
         .into_iter()
         .filter(|resource| resource.kind == KernelResourceKind::WorkspaceReadLease)
-        .all(|resource| {
-            resource.state == deepcode_kernel_ledger::KernelResourceState::Released
-        }));
+        .all(|resource| { resource.state == KernelResourceState::Released }));
 }
 
 #[test]
@@ -211,7 +228,7 @@ fn permission_resolution_resumes_the_same_pending_work_unit() {
             resource.kind == KernelResourceKind::PermissionGrant
                 && resource.cleanup_policy == KernelResourceCleanupPolicy::OnBatchReviewReady
         })
-        .all(|resource| resource.state == deepcode_kernel_ledger::KernelResourceState::Released));
+        .all(|resource| resource.state == KernelResourceState::Released));
 }
 
 #[test]
@@ -555,6 +572,92 @@ fn permission_bundle_groups_operations_and_resumes_every_work_unit() {
     assert_eq!(
         fs::read_to_string(workspace.join("nested/child.txt")).unwrap(),
         "second"
+    );
+}
+
+#[test]
+fn multiple_permission_bundles_wait_for_all_decisions_and_run_independent_operations() {
+    let (mut runtime, workspace) = runtime_with_workspace();
+    let suffix = TEMP_INDEX.fetch_add(1, Ordering::SeqCst);
+    let payload = action_bundle(
+        serde_json::json!([
+            {
+                "actionId": format!("write-{suffix}"),
+                "toolId": "fs.write",
+                "args": { "path": "input.txt", "contentBlockId": format!("content-{suffix}") },
+                "description": "Write an independent workspace target",
+                "dependsOn": []
+            },
+            {
+                "actionId": format!("fetch-{suffix}"),
+                "toolId": "web.fetch",
+                "args": { "url": format!("http://127.0.0.1:{}/evidence", 31000 + (suffix % 1000)) },
+                "description": "Fetch independent private evidence",
+                "dependsOn": []
+            }
+        ]),
+        serde_json::json!([{
+            "blockId": format!("content-{suffix}"),
+            "targetPath": "input.txt",
+            "operation": "overwrite",
+            "contentLines": ["permission groups resolved"]
+        }]),
+    );
+    let report = submit_proposal(&mut runtime, payload.clone());
+    runtime
+        .release_batch_resources("run-1", "session-1", "testPermissionReset")
+        .unwrap();
+
+    let waiting = execute_contract(&mut runtime, &payload, &report);
+    let requests = waiting
+        .iter()
+        .filter_map(|event| match event {
+            KernelEvent::PermissionRequested { request, .. } => Some(request.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(requests.len(), 2);
+    assert!(!waiting
+        .iter()
+        .any(|event| matches!(event, KernelEvent::WorkUnitStarted { .. })));
+    let write_permission = requests
+        .iter()
+        .find(|request| request.tool_id.as_deref() == Some("fs.write"))
+        .expect("workspace permission request");
+    let web_permission = requests
+        .iter()
+        .find(|request| request.tool_id.as_deref() == Some("web.fetch"))
+        .expect("private web permission request");
+
+    let first_decision = runtime
+        .dispatch(KernelCommand::PermissionResolve {
+            request_id: RequestId(format!("accept-write-{suffix}")),
+            permission_id: write_permission.id.clone(),
+            decision: PermissionDecisionKind::Accept,
+        })
+        .expect("record first permission decision");
+    assert!(!first_decision
+        .iter()
+        .any(|event| matches!(event, KernelEvent::WorkUnitStarted { .. })));
+
+    let resumed = runtime
+        .dispatch(KernelCommand::PermissionResolve {
+            request_id: RequestId(format!("reject-web-{suffix}")),
+            permission_id: web_permission.id.clone(),
+            decision: PermissionDecisionKind::Reject,
+        })
+        .expect("last permission decision resumes the batch");
+    assert!(terminal_tool(&resumed, "fs.write", true));
+    assert!(resumed.iter().any(|event| matches!(
+        event,
+        KernelEvent::WorkUnitBlocked { reason, .. } if reason == "permission rejected by user"
+    )));
+    assert!(resumed
+        .iter()
+        .any(|event| matches!(event, KernelEvent::BatchReviewReady { .. })));
+    assert_eq!(
+        fs::read_to_string(workspace.join("input.txt")).unwrap(),
+        "permission groups resolved"
     );
 }
 

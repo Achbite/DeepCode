@@ -9,6 +9,7 @@ import type {
   KernelProposalReviewReport,
   KernelReply,
   KernelResourcePacket,
+  KernelReviewGateEvaluation,
   KernelReviewFacts,
   KernelToolOperationKind,
   KernelWorkUnitDescriptor,
@@ -28,6 +29,32 @@ export function genericSessionResult(sessionId: string): AgentSessionResult {
       eventCount: 0,
     },
     events: [],
+  };
+}
+
+export function kernelTestReviewGateEvaluation(
+  runId: string,
+  status: KernelReviewGateEvaluation['status'],
+): KernelReviewGateEvaluation {
+  const decision = status === 'needsReplan'
+    ? 'revise'
+    : status === 'aborted'
+      ? 'reject'
+      : 'accept';
+  return {
+    id: `review-gate-${runId}`,
+    runId,
+    status,
+    decision: { decision },
+    failedWorkUnitCount: 0,
+    blockedWorkUnitCount: 0,
+    cleanupFailureCount: status === 'cleanupFailed' ? 1 : 0,
+    revokedTemporaryGrantCount: 0,
+    releasedResourceCount: 0,
+    removedTempFileCount: 0,
+    cleanupFailures: status === 'cleanupFailed' ? ['cleanup failed'] : [],
+    summary: `Kernel ReviewGate status: ${status}.`,
+    factsRef: `facts-${runId}`,
   };
 }
 
@@ -450,10 +477,7 @@ export function planKernel(
           kind: 'review_gate.evaluated',
           runId: command.runId ?? 'run-generic',
           sessionId: command.sessionId ?? sessionId,
-          result: {
-            status,
-            summary: `ReviewGate evaluated the ${decision ?? 'accept'} decision as ${status}.`,
-          },
+          result: kernelTestReviewGateEvaluation(command.runId ?? 'run-generic', status),
         },
       ],
     };
@@ -509,6 +533,7 @@ export function proposalReviewReport(actionBundle: Record<string, any>, _attachm
       operations: actions.map((action) => ({
         id: action.actionId,
         title: action.description ?? action.actionId,
+        dependsOn: Array.isArray(action.dependsOn) ? action.dependsOn : [],
         toolId: action.toolId,
         operationKind: testKernelOperationKindForToolId(action.toolId),
         args: action.args ?? {},
@@ -1989,6 +2014,7 @@ export function kernelTestReviewFacts(runId: string, factsRef = `facts-${runId}`
     generatedArtifacts: [],
     resourceEvents: [],
     cleanupFailures: [],
+    indeterminateToolOutcomes: [],
     pathNormalizationDiagnostics: [],
     batchReviewReady: true,
   };

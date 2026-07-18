@@ -90,6 +90,10 @@ pub enum KernelCommand {
         request_id: RequestId,
         session_id: SessionId,
     },
+    RunCleanupRetry {
+        request_id: RequestId,
+        run_id: RunId,
+    },
     HostWorkspaceBindingResolve {
         request_id: RequestId,
         path: String,
@@ -155,6 +159,7 @@ impl KernelCommand {
             Self::RunResume { session_id, .. } => Some(session_id),
             Self::HealthCheck { .. }
             | Self::RunCancel { .. }
+            | Self::RunCleanupRetry { .. }
             | Self::HostWorkspaceBindingResolve { .. }
             | Self::HostWorkspaceOpen { .. }
             | Self::HostWorkspaceCurrent { .. }
@@ -180,6 +185,7 @@ impl KernelCommand {
             | Self::ReviewFactsGet { run_id, .. }
             | Self::ReviewGateEvaluate { run_id, .. }
             | Self::RunCancel { run_id, .. }
+            | Self::RunCleanupRetry { run_id, .. }
             | Self::ResourceResolve { run_id, .. } => Some(run_id),
             Self::HealthCheck { .. }
             | Self::SnapshotGet { .. }

@@ -2,11 +2,12 @@ use crate::{
     ArtifactDraftEvent, AuditQueryResult, ConfigSnapshotRef, DriverRequest, HostInspectionResult,
     HostMcpRiskDecisionRecord, HostSkillCatalogResult, HostSkillTrustDecisionRecord, HostStatus,
     HostWorkspaceResult, KernelActionBatchSummary, KernelErrorEnvelope, KernelProposalReviewReport,
-    KernelSnapshot, KernelStateContract, LlmProviderDiagnostic, MessageRole,
-    PermissionDecisionKind, PermissionRequestEnvelope, PlanAuthorizationDecisionKind,
+    KernelResourceCleanupStateFact, KernelSnapshot, KernelStateContract, LlmProviderDiagnostic,
+    MessageRole, PermissionDecisionKind, PermissionRequestEnvelope, PlanAuthorizationDecisionKind,
     PlanAuthorizationReview, ProposalEnvelope, RequestId, ResourcePacket, ReviewFacts,
     ReviewGateEvaluation, RunId, RunStatus, RuntimeLifecycleState, SessionId, ToolCompletionFact,
-    ToolRequestFact, TurnId, WorkUnitDescriptor,
+    ToolEffectReceipt, ToolExecutionAttemptFact, ToolOutcomeIndeterminateFact, ToolRequestFact,
+    TurnId, WorkUnitDescriptor,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -252,6 +253,14 @@ pub enum KernelEvent {
         reason: Option<String>,
         sequence: Option<u64>,
     },
+    #[serde(rename = "resource.cleanup_state_changed")]
+    ResourceCleanupStateChanged {
+        request_id: Option<RequestId>,
+        run_id: RunId,
+        session_id: Option<SessionId>,
+        fact: KernelResourceCleanupStateFact,
+        sequence: Option<u64>,
+    },
     #[serde(rename = "message.appended")]
     MessageAppended {
         run_id: Option<RunId>,
@@ -279,6 +288,27 @@ pub enum KernelEvent {
         session_id: Option<SessionId>,
         turn_id: Option<TurnId>,
         fact: ToolRequestFact,
+        sequence: Option<u64>,
+    },
+    #[serde(rename = "tool.execution_attempted")]
+    ToolExecutionAttempted {
+        run_id: RunId,
+        session_id: Option<SessionId>,
+        fact: ToolExecutionAttemptFact,
+        sequence: Option<u64>,
+    },
+    #[serde(rename = "tool.effect_observed")]
+    ToolEffectObserved {
+        run_id: RunId,
+        session_id: Option<SessionId>,
+        fact: ToolEffectReceipt,
+        sequence: Option<u64>,
+    },
+    #[serde(rename = "tool.outcome_indeterminate")]
+    ToolOutcomeIndeterminate {
+        run_id: RunId,
+        session_id: Option<SessionId>,
+        fact: ToolOutcomeIndeterminateFact,
         sequence: Option<u64>,
     },
     #[serde(rename = "tool.completed")]
@@ -424,9 +454,13 @@ impl KernelEvent {
             | Self::ReviewGateEvaluated { session_id, .. }
             | Self::RunCompleted { session_id, .. }
             | Self::RuntimeLifecycleChanged { session_id, .. }
+            | Self::ResourceCleanupStateChanged { session_id, .. }
             | Self::MessageAppended { session_id, .. }
             | Self::LlmProviderError { session_id, .. }
             | Self::ToolRequested { session_id, .. }
+            | Self::ToolExecutionAttempted { session_id, .. }
+            | Self::ToolEffectObserved { session_id, .. }
+            | Self::ToolOutcomeIndeterminate { session_id, .. }
             | Self::ToolCompleted { session_id, .. }
             | Self::PermissionResolved { session_id, .. }
             | Self::AutonomyTransitioned { session_id, .. }
@@ -485,8 +519,12 @@ impl KernelEvent {
             | Self::ReviewGateEvaluated { run_id, .. }
             | Self::RunCompleted { run_id, .. }
             | Self::RuntimeLifecycleChanged { run_id, .. }
+            | Self::ResourceCleanupStateChanged { run_id, .. }
             | Self::LlmProviderError { run_id, .. }
             | Self::RuntimeResumed { run_id, .. } => Some(run_id),
+            Self::ToolExecutionAttempted { run_id, .. }
+            | Self::ToolEffectObserved { run_id, .. }
+            | Self::ToolOutcomeIndeterminate { run_id, .. } => Some(run_id),
             Self::HostStatus { .. }
             | Self::SnapshotReady { .. }
             | Self::HostInspectionCompleted { .. }

@@ -868,7 +868,7 @@ fn compiler_builds_workspace_patch_operation() {
 }
 
 #[test]
-fn graph_groups_reads_and_serial_writes() {
+fn graph_projects_all_operations_into_the_serial_scheduler_group() {
     let operations = vec![
         PlannedOperation {
             id: "read".to_string(),
@@ -954,6 +954,7 @@ fn graph_groups_reads_and_serial_writes() {
         },
     ];
     let graph = WorkUnitGraph::from_operations(&operations);
-    assert_eq!(graph.concurrency_groups[0].mode, "parallel");
-    assert_eq!(graph.concurrency_groups[1].mode, "serial");
+    assert_eq!(graph.concurrency_groups.len(), 1);
+    assert_eq!(graph.concurrency_groups[0].mode, "serial");
+    assert!(graph.nodes.iter().all(|node| !node.can_run_concurrently));
 }

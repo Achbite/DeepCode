@@ -1,8 +1,7 @@
+use crate::resources::KernelResourceManager;
 use deepcode_kernel_abi::{
-    ConfigSnapshotRef, HostMcpRiskDecisionRecord, KernelExecutionContract,
-    KernelPlanAuthorizationContract, WorkspaceBinding,
+    ConfigSnapshotRef, KernelExecutionContract, KernelPlanAuthorizationContract, WorkspaceBinding,
 };
-use deepcode_kernel_ledger::KernelResourceManager;
 use deepcode_kernel_tools::ToolOperationKind;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -15,15 +14,53 @@ pub(crate) struct RuntimeState {
     pub(crate) current_workspace: Option<RuntimeWorkspace>,
     pub(crate) records_by_session: BTreeMap<String, RuntimeRunRecord>,
     pub(crate) pending_tools: BTreeMap<String, PendingKernelTool>,
+    pub(crate) batch_checkpoints_by_run: BTreeMap<String, BatchRuntimeCheckpoint>,
+    pub(crate) cleanup_checkpoints_by_run:
+        BTreeMap<String, deepcode_kernel_abi::KernelCleanupCheckpoint>,
+    pub(crate) cleanup_state_by_run: BTreeMap<String, deepcode_kernel_abi::KernelCleanupState>,
     pub(crate) artifact_drafts: BTreeMap<String, ArtifactDraftRuntimeRecord>,
     pub(crate) terminal_artifact_draft_keys: BTreeSet<String>,
     pub(crate) execution_contracts_by_run:
         BTreeMap<String, BTreeMap<String, KernelExecutionContract>>,
     pub(crate) plan_authorization_contracts_by_run:
         BTreeMap<String, BTreeMap<String, KernelPlanAuthorizationContract>>,
-    pub(crate) skill_trust_records: Vec<SkillTrustRecord>,
-    pub(crate) mcp_risk_acknowledgments: Vec<HostMcpRiskDecisionRecord>,
     pub(crate) resource_manager: KernelResourceManager,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BatchOperationState {
+    AwaitingPermission,
+    Ready,
+    Started,
+    Completed,
+    Failed,
+    Blocked,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BatchOperationRuntime {
+    pub(crate) operation_id: String,
+    pub(crate) depends_on: Vec<String>,
+    pub(crate) work_unit_id: String,
+    pub(crate) tool_call_id: String,
+    pub(crate) tool_id: String,
+    pub(crate) operation_kind: ToolOperationKind,
+    pub(crate) arguments: Value,
+    pub(crate) read_set: Vec<String>,
+    pub(crate) write_set: Vec<String>,
+    pub(crate) state: BatchOperationState,
+    pub(crate) permission_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BatchRuntimeCheckpoint {
+    pub(crate) request_id: String,
+    pub(crate) session_id: String,
+    pub(crate) plan_id: String,
+    pub(crate) contract_id: String,
+    pub(crate) operations: Vec<BatchOperationRuntime>,
+    pub(crate) permission_decisions: BTreeMap<String, deepcode_kernel_abi::PermissionDecisionKind>,
+    pub(crate) scheduler_revision: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -84,13 +121,12 @@ impl RuntimeRunRecord {
 pub(crate) struct PendingKernelTool {
     pub(crate) run_id: String,
     pub(crate) session_id: String,
-    pub(crate) tool_name: String,
+    pub(crate) tool_id: String,
     pub(crate) arguments: Value,
     pub(crate) permission_bundle_id: Option<String>,
     pub(crate) contract_id: Option<String>,
     pub(crate) affected_operation_ids: Vec<String>,
     pub(crate) work_unit_ids: Vec<String>,
-    pub(crate) request_id: Option<String>,
     pub(crate) work_unit_id: Option<String>,
     pub(crate) action_id: Option<String>,
     pub(crate) plan_id: Option<String>,
@@ -103,9 +139,8 @@ pub(crate) struct PendingKernelTool {
 #[derive(Debug, Clone)]
 pub(crate) struct PendingKernelToolItem {
     pub(crate) tool_call_id: String,
-    pub(crate) tool_name: String,
+    pub(crate) tool_id: String,
     pub(crate) arguments: Value,
-    pub(crate) request_id: Option<String>,
     pub(crate) work_unit_id: Option<String>,
     pub(crate) action_id: Option<String>,
     pub(crate) plan_id: Option<String>,
@@ -170,23 +205,6 @@ impl DeepCodeKernelRuntime {
             .or_else(|| {
                 session_id.and_then(|id| self.runtime_record_from_session_ledger(id).ok().flatten())
             })
-            .or_else(|| self.state.records_by_session.values().last().cloned())
-            .or_else(|| self.runtime_record_from_latest_ledger().ok().flatten())
-    }
-
-    pub(crate) fn runtime_record_from_latest_ledger(
-        &self,
-    ) -> KernelResult<Option<RuntimeRunRecord>> {
-        let latest_session = self
-            .ledger
-            .list_all()?
-            .into_iter()
-            .filter_map(|event| event.session_id)
-            .next_back();
-        latest_session
-            .as_deref()
-            .map(|session_id| self.runtime_record_from_session_ledger(session_id))
-            .unwrap_or(Ok(None))
     }
 
     pub(crate) fn runtime_record_from_session_ledger(
@@ -202,10 +220,16 @@ impl DeepCodeKernelRuntime {
             return Ok(None);
         };
         let run_events = self.ledger.list_by_run(&run_id)?;
-        let Some(started) = run_events.iter().find(|event| event.kind == "run.started") else {
-            return Ok(None);
-        };
-        let lifecycle_state = run_events
+        let started = run_events
+            .iter()
+            .find(|event| event.kind == "run.started")
+            .ok_or_else(|| KernelError::Structured {
+                code: "run_recovery_schema_invalid",
+                stage: "run.restore",
+                message: "run ledger is missing run.started".to_string(),
+                details: serde_json::json!({ "runId": run_id, "sessionId": session_id }),
+            })?;
+        let lifecycle_value = run_events
             .iter()
             .rev()
             .find_map(|event| {
@@ -213,33 +237,58 @@ impl DeepCodeKernelRuntime {
                     .then(|| event.payload.get("currentState").and_then(Value::as_str))
                     .flatten()
             })
-            .and_then(RuntimeLifecycleState::from_wire)
-            .unwrap_or(RuntimeLifecycleState::Ready);
+            .ok_or_else(|| KernelError::Structured {
+                code: "run_recovery_schema_invalid",
+                stage: "run.restore",
+                message: "run ledger is missing runtime lifecycle state".to_string(),
+                details: serde_json::json!({ "runId": run_id, "sessionId": session_id }),
+            })?;
+        let lifecycle_state =
+            RuntimeLifecycleState::from_wire(lifecycle_value).ok_or_else(|| {
+                KernelError::Structured {
+                    code: "run_recovery_schema_invalid",
+                    stage: "run.restore",
+                    message: "run ledger contains an unknown runtime lifecycle state".to_string(),
+                    details: serde_json::json!({
+                        "runId": run_id,
+                        "sessionId": session_id,
+                        "lifecycleState": lifecycle_value,
+                    }),
+                }
+            })?;
         let workspace_binding = serde_json::from_value(
             started
                 .payload
                 .get("workspaceBinding")
                 .cloned()
-                .unwrap_or(Value::Null),
+                .ok_or_else(|| KernelError::Structured {
+                    code: "run_recovery_schema_invalid",
+                    stage: "run.restore",
+                    message: "run.started is missing workspaceBinding".to_string(),
+                    details: serde_json::json!({ "runId": run_id, "sessionId": session_id }),
+                })?,
         )
-        .unwrap_or(WorkspaceBinding {
-            workspace_id: None,
-            workspace_hash: None,
-            open_path: None,
-            active_folder_id: None,
-            folder_hash: None,
-        });
-        let config_ref = serde_json::from_value(
-            started
-                .payload
-                .get("configRef")
-                .cloned()
-                .unwrap_or(Value::Null),
-        )
-        .unwrap_or(ConfigSnapshotRef {
-            snapshot_id: format!("restored-config-{run_id}"),
-            hash: None,
-        });
+        .map_err(|error| KernelError::Structured {
+            code: "run_recovery_schema_invalid",
+            stage: "run.restore",
+            message: format!("decode workspaceBinding: {error}"),
+            details: serde_json::json!({ "runId": run_id, "sessionId": session_id }),
+        })?;
+        let config_ref =
+            serde_json::from_value(started.payload.get("configRef").cloned().ok_or_else(|| {
+                KernelError::Structured {
+                    code: "run_recovery_schema_invalid",
+                    stage: "run.restore",
+                    message: "run.started is missing configRef".to_string(),
+                    details: serde_json::json!({ "runId": run_id, "sessionId": session_id }),
+                }
+            })?)
+            .map_err(|error| KernelError::Structured {
+                code: "run_recovery_schema_invalid",
+                stage: "run.restore",
+                message: format!("decode configRef: {error}"),
+                details: serde_json::json!({ "runId": run_id, "sessionId": session_id }),
+            })?;
         Ok(Some(RuntimeRunRecord {
             session_id: session_id.to_string(),
             run_id,
@@ -269,8 +318,45 @@ impl DeepCodeKernelRuntime {
             .next_run_index
             .max(run_index_from_id(&record.run_id).unwrap_or(0));
         self.restore_run_resources_from_ledger(&record.run_id)?;
+
+        if record.lifecycle_state == RuntimeLifecycleState::Terminal {
+            let owner = KernelResourceOwner::agent_run(None::<String>, record.run_id.clone());
+            let active_resources = self.state.resource_manager.active_by_owner(&owner);
+            if !active_resources.is_empty() {
+                return Err(KernelError::Structured {
+                    code: "run_recovery_schema_invalid",
+                    stage: "run.restore",
+                    message: "terminal run still owns active resources".to_string(),
+                    details: serde_json::json!({
+                        "runId": record.run_id,
+                        "sessionId": record.session_id,
+                        "resourceIds": active_resources
+                            .iter()
+                            .map(|resource| resource.resource_id.clone())
+                            .collect::<Vec<_>>(),
+                    }),
+                });
+            }
+            self.state.cleanup_checkpoints_by_run.remove(&record.run_id);
+            self.state
+                .records_by_session
+                .insert(session_id.to_string(), record);
+            return Ok(());
+        }
+
+        if record.lifecycle_state != RuntimeLifecycleState::Terminating
+            && matches!(
+                self.state.cleanup_state_by_run.get(&record.run_id),
+                Some(KernelCleanupState::Completed)
+            )
+        {
+            self.state.cleanup_checkpoints_by_run.remove(&record.run_id);
+        }
         self.restore_plan_authorization_from_ledger(&record.run_id)?;
-        if let Some((permission_id, pending)) = self.pending_tool_from_ledger(&record.run_id)? {
+        self.restore_execution_contracts_from_ledger(&record.run_id)?;
+        self.restore_batch_checkpoint_from_ledger(&record.run_id)?;
+        self.restore_artifact_drafts_from_ledger(&record.run_id)?;
+        for (permission_id, pending) in self.pending_tools_from_ledger(&record.run_id)? {
             self.state.pending_tools.insert(permission_id, pending);
         }
         self.state
@@ -322,38 +408,6 @@ impl DeepCodeKernelRuntime {
             .ok_or_else(|| KernelError::InvalidCommand(format!("run {run_id} is not active")))
     }
 
-    pub fn grant_explicit_attachments_for_run(
-        &mut self,
-        run_id: &str,
-        attachments: &[Value],
-    ) -> KernelResult<usize> {
-        let grants = attachments
-            .iter()
-            .filter_map(normalized_explicit_attachment_grant)
-            .collect::<Vec<_>>();
-        if grants.is_empty() {
-            return Ok(0);
-        }
-
-        let record = self.record_by_run_mut(run_id)?;
-        let mut existing = record
-            .attachments
-            .iter()
-            .filter_map(explicit_attachment_grant_key)
-            .collect::<BTreeSet<_>>();
-        let mut added = 0_usize;
-        for grant in grants {
-            let Some(key) = explicit_attachment_grant_key(&grant) else {
-                continue;
-            };
-            if existing.insert(key) {
-                record.attachments.push(grant);
-                added += 1;
-            }
-        }
-        Ok(added)
-    }
-
     pub(crate) fn resolve_run_session(
         &self,
         run_id: Option<RunId>,
@@ -376,12 +430,12 @@ impl DeepCodeKernelRuntime {
                 })?;
             return Ok((record.run_id.clone(), session_id.0));
         }
-        self.state
-            .records_by_session
-            .iter()
-            .next_back()
-            .map(|(session_id, record)| (record.run_id.clone(), session_id.clone()))
-            .ok_or_else(|| KernelError::InvalidCommand("no active run".to_string()))
+        Err(KernelError::Structured {
+            code: "run_identity_required",
+            stage: "run.resolve",
+            message: "Kernel command requires runId or sessionId".to_string(),
+            details: serde_json::json!({}),
+        })
     }
 
     pub(crate) fn snapshot_get(
@@ -483,13 +537,6 @@ pub(crate) fn normalized_explicit_attachment_grant(attachment: &Value) -> Option
         Value::String(canonical_path.to_string_lossy().to_string()),
     );
     Some(grant)
-}
-
-fn explicit_attachment_grant_key(attachment: &Value) -> Option<String> {
-    let source = attachment.get("source").and_then(Value::as_str)?;
-    let kind = attachment.get("kind").and_then(Value::as_str)?;
-    let absolute_path = attachment.get("absolutePath").and_then(Value::as_str)?;
-    Some(format!("{source}\u{1f}{kind}\u{1f}{absolute_path}"))
 }
 
 pub(crate) fn run_index_from_id(run_id: &str) -> Option<u64> {

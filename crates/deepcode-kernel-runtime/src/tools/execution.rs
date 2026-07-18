@@ -43,68 +43,240 @@ impl Drop for PendingTempArtifactGuard<'_> {
 }
 
 impl DeepCodeKernelRuntime {
+    pub(crate) fn recover_indeterminate_tool_attempts(
+        &self,
+        run_id: &str,
+        session_id: &str,
+    ) -> KernelResult<Vec<KernelEvent>> {
+        let ledger_events = self.ledger.list_by_run(run_id)?;
+        let completed = ledger_events
+            .iter()
+            .filter(|event| event.kind == "tool.completed")
+            .map(|event| {
+                serde_json::from_value::<ToolCompletionFact>(event.payload.clone())
+                    .map(|fact| fact.tool_call_id)
+                    .map_err(|error| KernelError::Structured {
+                        code: "run_recovery_schema_invalid",
+                        stage: "tool.recover",
+                        message: format!("decode tool completion: {error}"),
+                        details: serde_json::json!({ "runId": run_id }),
+                    })
+            })
+            .collect::<KernelResult<std::collections::BTreeSet<_>>>()?;
+        let indeterminate = ledger_events
+            .iter()
+            .filter(|event| event.kind == "tool.outcome_indeterminate")
+            .map(|event| {
+                serde_json::from_value::<ToolOutcomeIndeterminateFact>(event.payload.clone())
+                    .map(|fact| fact.attempt.attempt_id)
+                    .map_err(|error| KernelError::Structured {
+                        code: "run_recovery_schema_invalid",
+                        stage: "tool.recover",
+                        message: format!("decode indeterminate tool outcome: {error}"),
+                        details: serde_json::json!({ "runId": run_id }),
+                    })
+            })
+            .collect::<KernelResult<std::collections::BTreeSet<_>>>()?;
+        let mut events = Vec::new();
+        for event in ledger_events
+            .iter()
+            .filter(|event| event.kind == "tool.execution_attempted")
+        {
+            let attempt: ToolExecutionAttemptFact = serde_json::from_value(event.payload.clone())
+                .map_err(|error| KernelError::Structured {
+                code: "run_recovery_schema_invalid",
+                stage: "tool.recover",
+                message: format!("decode tool execution attempt: {error}"),
+                details: serde_json::json!({ "runId": run_id }),
+            })?;
+            if completed.contains(&attempt.tool_call_id)
+                || indeterminate.contains(&attempt.attempt_id)
+            {
+                continue;
+            }
+            let fact = ToolOutcomeIndeterminateFact {
+                receipt: ToolEffectReceipt {
+                    attempt_id: attempt.attempt_id.clone(),
+                    outcome: ToolEffectOutcome::Indeterminate,
+                    affected_resources: Vec::new(),
+                    validation: None,
+                    cleanup_refs: Vec::new(),
+                },
+                attempt,
+                reason: "Kernel recovered an execution attempt without a persisted terminal fact"
+                    .to_string(),
+            };
+            let sequence = self.ledger.next_sequence(run_id)?;
+            self.append_ledger(
+                run_id,
+                session_id,
+                "tool.outcome_indeterminate",
+                sequence,
+                serde_json::to_value(&fact).map_err(|error| {
+                    KernelError::InvalidCommand(format!(
+                        "encode recovered indeterminate outcome: {error}"
+                    ))
+                })?,
+            )?;
+            events.push(KernelEvent::ToolOutcomeIndeterminate {
+                run_id: RunId(run_id.to_string()),
+                session_id: Some(SessionId(session_id.to_string())),
+                fact,
+                sequence: Some(sequence),
+            });
+        }
+        Ok(events)
+    }
+
     pub(crate) fn execute_bound_tool(
         &self,
         run_id: &str,
         session_id: &str,
         tool_call_id: String,
-        tool_name: String,
+        tool_id: String,
         operation_kind: ToolOperationKind,
         arguments: Value,
-    ) -> KernelResult<KernelEvent> {
+    ) -> KernelResult<Vec<KernelEvent>> {
         let registered_kind = self
             .tool_registry
-            .get(&tool_name)
+            .get(&tool_id)
             .map(KernelToolRegistration::operation_kind)
-            .ok_or_else(|| {
-                KernelError::InvalidCommand(format!("unknown Kernel tool {tool_name}"))
-            })?;
+            .ok_or_else(|| KernelError::InvalidCommand(format!("unknown Kernel tool {tool_id}")))?;
         if registered_kind != operation_kind {
             return Err(KernelError::InvalidCommand(format!(
-                "Kernel tool {tool_name} operation kind mismatch: expected {}, got {}",
+                "Kernel tool {tool_id} operation kind mismatch: expected {}, got {}",
                 registered_kind.wire_name(),
                 operation_kind.wire_name()
             )));
         }
-        let (mut pending_temp, mut result) = match self
-            .register_managed_temp_resource_before_execution(
-                run_id,
-                session_id,
-                &tool_call_id,
-                &tool_name,
-                operation_kind,
-                &arguments,
-            ) {
-            Ok(pending_temp) => {
-                let result = self
-                    .execute_kernel_tool(run_id, &tool_name, &arguments)
-                    .and_then(|mut output| {
-                        self.attach_workspace_tool_diagnostics(
-                            run_id,
-                            operation_kind,
-                            &arguments,
-                            &mut output,
-                        )?;
+        let kernel_context = arguments
+            .get("kernelContext")
+            .and_then(Value::as_object)
+            .ok_or_else(|| KernelError::Structured {
+                code: "tool_execution_context_missing",
+                stage: "tool.execute.admission",
+                message: "Kernel tool execution requires accepted contract context".to_string(),
+                details: serde_json::json!({ "runId": run_id, "toolId": tool_id }),
+            })?;
+        let contract_id = kernel_context
+            .get("contractId")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| KernelError::Structured {
+                code: "tool_execution_context_missing",
+                stage: "tool.execute.admission",
+                message: "Kernel tool execution context is missing contractId".to_string(),
+                details: serde_json::json!({ "runId": run_id, "toolId": tool_id }),
+            })?;
+        let work_unit_id = kernel_context
+            .get("workUnitId")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| KernelError::Structured {
+                code: "tool_execution_context_missing",
+                stage: "tool.execute.admission",
+                message: "Kernel tool execution context is missing workUnitId".to_string(),
+                details: serde_json::json!({ "runId": run_id, "toolId": tool_id }),
+            })?;
+        let mut pending_temp = self.register_managed_temp_resource_before_execution(
+            run_id,
+            session_id,
+            &tool_call_id,
+            &tool_id,
+            operation_kind,
+            &arguments,
+        )?;
+        let attempt_sequence = self.ledger.next_sequence(run_id)?;
+        let attempt = ToolExecutionAttemptFact {
+            attempt_id: format!("attempt-{run_id}-{tool_call_id}-{attempt_sequence}"),
+            tool_call_id: tool_call_id.clone(),
+            tool_id: tool_id.clone(),
+            operation_kind,
+            args_hash: deepcode_kernel_tools::fnv1a64_hex(
+                &serde_json::to_string(&arguments).unwrap_or_default(),
+            ),
+            contract_id: contract_id.to_string(),
+            work_unit_id: work_unit_id.to_string(),
+        };
+        self.append_ledger(
+            run_id,
+            session_id,
+            "tool.execution_attempted",
+            attempt_sequence,
+            serde_json::to_value(&attempt).map_err(|error| {
+                KernelError::InvalidCommand(format!("encode tool attempt fact: {error}"))
+            })?,
+        )?;
+        let mut events = vec![KernelEvent::ToolExecutionAttempted {
+            run_id: RunId(run_id.to_string()),
+            session_id: Some(SessionId(session_id.to_string())),
+            fact: attempt.clone(),
+            sequence: Some(attempt_sequence),
+        }];
+
+        let execution = self.execute_kernel_tool(run_id, &tool_id, &attempt.attempt_id, &arguments);
+        let mut result = match execution {
+            Ok(mut result) => {
+                let post_process = self
+                    .attach_workspace_tool_diagnostics(
+                        run_id,
+                        operation_kind,
+                        &arguments,
+                        &mut result.output,
+                    )
+                    .and_then(|()| {
                         attach_agent_generated_artifact_metadata(
                             run_id,
                             session_id,
                             &tool_call_id,
                             operation_kind,
                             &arguments,
-                            &mut output,
+                            &mut result.output,
                         );
                         self.record_kernel_resource_effects(ToolResourceEffect {
                             run_id,
                             session_id,
                             operation_kind,
                             arguments: &arguments,
-                        })?;
-                        Ok(output)
+                        })
                     });
-                (pending_temp, result)
+                if let Err(error) = post_process {
+                    if let Some(guard) = pending_temp.take() {
+                        guard.commit();
+                    }
+                    let mut receipt = result.effect_receipt;
+                    receipt.outcome = ToolEffectOutcome::Indeterminate;
+                    let fact = ToolOutcomeIndeterminateFact {
+                        attempt,
+                        receipt,
+                        reason: error.to_string(),
+                    };
+                    let sequence = self.ledger.next_sequence(run_id)?;
+                    self.append_ledger(
+                        run_id,
+                        session_id,
+                        "tool.outcome_indeterminate",
+                        sequence,
+                        serde_json::to_value(&fact).map_err(|encode_error| {
+                            KernelError::InvalidCommand(format!(
+                                "encode indeterminate tool outcome: {encode_error}"
+                            ))
+                        })?,
+                    )?;
+                    events.push(KernelEvent::ToolOutcomeIndeterminate {
+                        run_id: RunId(run_id.to_string()),
+                        session_id: Some(SessionId(session_id.to_string())),
+                        fact,
+                        sequence: Some(sequence),
+                    });
+                    return Ok(events);
+                }
+                result.effect_receipt.validation = result.output.get("validation").cloned();
+                Ok(result)
             }
-            Err(error) => (None, Err(error)),
+            Err(error) => Err(error),
         };
+
         if result.is_ok() {
             if let Some(guard) = pending_temp.take() {
                 guard.commit();
@@ -123,7 +295,7 @@ impl DeepCodeKernelRuntime {
                             "tool execution failed and its managed temporary resource could not be cleaned: {cleanup_error}"
                         ),
                         details: serde_json::json!({
-                            "toolId": tool_name,
+                            "toolId": tool_id,
                             "toolCallId": tool_call_id,
                             "resourceId": guard.resource_id,
                             "executionError": original_error,
@@ -133,41 +305,108 @@ impl DeepCodeKernelRuntime {
             }
         }
         let sequence = self.ledger.next_sequence(run_id)?;
+        let effect_receipt = result
+            .as_ref()
+            .map(|result| result.effect_receipt.clone())
+            .unwrap_or_else(|_| ToolEffectReceipt {
+                attempt_id: attempt.attempt_id.clone(),
+                outcome: ToolEffectOutcome::None,
+                affected_resources: Vec::new(),
+                validation: None,
+                cleanup_refs: Vec::new(),
+            });
         let completion_fact = ToolCompletionFact {
             tool_call_id: tool_call_id.clone(),
-            tool_id: tool_name.clone(),
+            tool_id: tool_id.clone(),
             operation_kind,
             ok: result.is_ok(),
-            output: result.as_ref().ok().cloned(),
+            output: result.as_ref().ok().map(|result| result.output.clone()),
             error: result.as_ref().err().map(Into::into),
         };
-        let event = KernelEvent::ToolCompleted {
+        let completion_event = KernelEvent::ToolCompleted {
             run_id: Some(RunId(run_id.to_string())),
             session_id: Some(SessionId(session_id.to_string())),
             turn_id: None,
             fact: completion_fact.clone(),
-            sequence: Some(sequence),
+            sequence: Some(sequence + 1),
         };
-        self.append_ledger(
-            run_id,
-            session_id,
-            "tool.completed",
-            sequence,
-            serde_json::to_value(&completion_fact).map_err(|error| {
-                KernelError::InvalidCommand(format!("encode tool completion fact: {error}"))
-            })?,
-        )?;
-        if let Ok(output) = result.as_ref() {
-            self.record_change_operation_for_tool(
+        let mut ledger_events = vec![
+            LedgerEvent {
+                id: format!("evt-{run_id}-{sequence}"),
+                run_id: Some(run_id.to_string()),
+                session_id: Some(session_id.to_string()),
+                kind: "tool.effect_observed".to_string(),
+                sequence: Some(sequence),
+                payload: serde_json::to_value(&effect_receipt).map_err(|error| {
+                    KernelError::InvalidCommand(format!("encode tool effect receipt: {error}"))
+                })?,
+                created_at: None,
+            },
+            LedgerEvent {
+                id: format!("evt-{run_id}-{}", sequence + 1),
+                run_id: Some(run_id.to_string()),
+                session_id: Some(session_id.to_string()),
+                kind: "tool.completed".to_string(),
+                sequence: Some(sequence + 1),
+                payload: serde_json::to_value(&completion_fact).map_err(|error| {
+                    KernelError::InvalidCommand(format!("encode tool completion fact: {error}"))
+                })?,
+                created_at: None,
+            },
+        ];
+        if let Ok(result) = result.as_ref() {
+            ledger_events.extend(self.tool_obligation_ledger_events(
                 run_id,
                 session_id,
                 &tool_call_id,
-                &tool_name,
+                &tool_id,
                 &arguments,
-            )?;
-            self.record_validation_for_tool(run_id, session_id, &tool_call_id, &tool_name, output)?;
+                &result.output,
+                sequence + 2,
+            )?);
         }
-        Ok(event)
+        if let Err(error) = self.append_ledger_batch(ledger_events) {
+            if result.is_ok() {
+                let fact = ToolOutcomeIndeterminateFact {
+                    attempt,
+                    receipt: ToolEffectReceipt {
+                        outcome: ToolEffectOutcome::Indeterminate,
+                        ..effect_receipt
+                    },
+                    reason: format!("tool effect fact persistence failed: {error}"),
+                };
+                let recovery_sequence = self.ledger.next_sequence(run_id)?;
+                self.append_ledger(
+                    run_id,
+                    session_id,
+                    "tool.outcome_indeterminate",
+                    recovery_sequence,
+                    serde_json::to_value(&fact).map_err(|encode_error| {
+                        KernelError::InvalidCommand(format!(
+                            "encode indeterminate tool outcome: {encode_error}"
+                        ))
+                    })?,
+                )?;
+                events.push(KernelEvent::ToolOutcomeIndeterminate {
+                    run_id: RunId(run_id.to_string()),
+                    session_id: Some(SessionId(session_id.to_string())),
+                    fact,
+                    sequence: Some(recovery_sequence),
+                });
+                return Ok(events);
+            }
+            return Err(error);
+        }
+        events.extend([
+            KernelEvent::ToolEffectObserved {
+                run_id: RunId(run_id.to_string()),
+                session_id: Some(SessionId(session_id.to_string())),
+                fact: effect_receipt,
+                sequence: Some(sequence),
+            },
+            completion_event,
+        ]);
+        Ok(events)
     }
 
     fn register_managed_temp_resource_before_execution(
@@ -175,7 +414,7 @@ impl DeepCodeKernelRuntime {
         run_id: &str,
         session_id: &str,
         tool_call_id: &str,
-        tool_name: &str,
+        tool_id: &str,
         operation_kind: ToolOperationKind,
         arguments: &Value,
     ) -> KernelResult<Option<PendingTempArtifactGuard<'_>>> {
@@ -206,7 +445,7 @@ impl DeepCodeKernelRuntime {
                     message: "fs.write temporary=true requires an active temporary artifact lease"
                         .to_string(),
                     details: serde_json::json!({
-                        "toolId": tool_name,
+                        "toolId": tool_id,
                         "path": path,
                         "runId": run_id,
                     }),
@@ -218,7 +457,7 @@ impl DeepCodeKernelRuntime {
             return Ok(None);
         }
         let absolute_path = self
-            .tool_workspace_root(run_id, tool_name, arguments)?
+            .tool_workspace_root(run_id, tool_id, arguments)?
             .map(PathBuf::from)
             .ok_or_else(|| {
                 KernelError::InvalidCommand(
@@ -244,7 +483,7 @@ impl DeepCodeKernelRuntime {
                 KernelResourceMetadata::TempArtifact {
                     path: path.to_string(),
                     absolute_path: Some(absolute_path.to_string_lossy().into_owned()),
-                    source_tool: tool_name.to_string(),
+                    source_tool: tool_id.to_string(),
                     tool_call_id: tool_call_id.to_string(),
                 },
             )],
@@ -359,20 +598,20 @@ impl DeepCodeKernelRuntime {
     pub(crate) fn execute_kernel_tool(
         &self,
         run_id: &str,
-        tool_name: &str,
+        tool_id: &str,
+        invocation_id: &str,
         arguments: &Value,
-    ) -> KernelResult<Value> {
-        let workspace_root = self.tool_workspace_root(run_id, tool_name, arguments)?;
-        let result = self.tool_executors.invoke(
-            tool_name,
+    ) -> KernelResult<executors::KernelToolExecutionResult> {
+        let workspace_root = self.tool_workspace_root(run_id, tool_id, arguments)?;
+        self.tool_executors.invoke(
+            tool_id,
             executors::KernelToolInvocation {
-                id: format!("tool-{tool_name}"),
-                tool_id: tool_name.to_string(),
+                id: invocation_id.to_string(),
+                tool_id: tool_id.to_string(),
                 input: arguments.clone(),
             },
             executors::KernelToolExecutionContext { workspace_root },
-        )?;
-        Ok(result.output)
+        )
     }
 
     pub(crate) fn execute_host_projection_operation(
@@ -416,7 +655,7 @@ impl DeepCodeKernelRuntime {
     fn tool_workspace_root(
         &self,
         run_id: &str,
-        tool_name: &str,
+        tool_id: &str,
         arguments: &Value,
     ) -> KernelResult<Option<String>> {
         if let Some(root) = arguments
@@ -425,11 +664,7 @@ impl DeepCodeKernelRuntime {
             .map(str::trim)
             .filter(|value| !value.is_empty())
         {
-            if !self
-                .tool_registry
-                .needs_workspace(tool_name)
-                .unwrap_or(true)
-            {
+            if !self.tool_registry.needs_workspace(tool_id).unwrap_or(true) {
                 return Err(KernelError::PermissionDenied(
                     "kernelExecutionRoot is only allowed for Kernel-compiled workspace tools"
                         .to_string(),
@@ -454,7 +689,7 @@ impl DeepCodeKernelRuntime {
             .map(str::trim)
             .filter(|value| !value.is_empty())
         {
-            self.validate_attachment_tool_root(run_id, tool_name, root, arguments)?;
+            self.validate_attachment_tool_root(run_id, tool_id, root, arguments)?;
             return Ok(Some(root.to_string()));
         }
         Ok(self
@@ -467,12 +702,12 @@ impl DeepCodeKernelRuntime {
     fn validate_attachment_tool_root(
         &self,
         run_id: &str,
-        tool_name: &str,
+        tool_id: &str,
         root: &str,
         arguments: &Value,
     ) -> KernelResult<()> {
-        let template = self.tool_registry.contract(tool_name).ok_or_else(|| {
-            KernelError::PermissionDenied(format!("unknown Kernel tool {tool_name}"))
+        let template = self.tool_registry.contract(tool_id).ok_or_else(|| {
+            KernelError::PermissionDenied(format!("unknown Kernel tool {tool_id}"))
         })?;
         if !template.resource.needs_workspace || !template.resource.read_only {
             return Err(KernelError::PermissionDenied(

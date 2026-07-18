@@ -142,21 +142,37 @@ impl DeepCodeKernelRuntime {
         run_id: RunId,
     ) -> KernelResult<Vec<KernelEvent>> {
         let record = self.record_by_run(&run_id.0)?.clone();
-        self.state
-            .pending_tools
-            .retain(|_, pending| pending.run_id != run_id.0);
-        let cancelled_draft_keys = self
-            .state
-            .artifact_drafts
-            .iter()
-            .filter_map(|(key, draft)| (draft.run_id == run_id.0).then_some(key.clone()))
-            .collect::<Vec<_>>();
-        for key in cancelled_draft_keys {
-            self.state.artifact_drafts.remove(&key);
-            self.state.terminal_artifact_draft_keys.insert(key);
-        }
-        let cleanup = self.release_run_resources(&run_id.0, &record.session_id, "runCancelled")?;
         let mut events = Vec::new();
+        if let Some(event) = self.transition_runtime_lifecycle(
+            Some(request_id.clone()),
+            &run_id.0,
+            &record.session_id,
+            RuntimeLifecycleState::Terminating,
+            "runCancellationCleanupStarted",
+        )? {
+            events.push(event);
+        }
+        events.extend(self.reject_pending_permissions_for_run(
+            &run_id.0,
+            &record.session_id,
+            "Run cancellation rejected the pending permission request.",
+        )?);
+        events.extend(self.discard_run_artifact_drafts(
+            &request_id,
+            &run_id.0,
+            &record.session_id,
+        )?);
+        let cleanup = self.release_run_resources_with_intent(
+            &run_id.0,
+            &record.session_id,
+            "runCancelled",
+            Some(RunStatus::Cancelled),
+            None,
+        )?;
+        events.extend(cleanup.events.clone());
+        if !cleanup.failures.is_empty() {
+            return Ok(events);
+        }
         if let Some(event) = self.transition_runtime_lifecycle(
             Some(request_id.clone()),
             &run_id.0,
@@ -183,12 +199,83 @@ impl DeepCodeKernelRuntime {
             }),
         )?;
         events.push(KernelEvent::RunCompleted {
-            run_id,
+            run_id: run_id.clone(),
             session_id: Some(SessionId(record.session_id)),
             status: RunStatus::Cancelled,
             summary: Some("Run cancelled by user decision.".to_string()),
             sequence: Some(sequence),
         });
+        self.state.cleanup_checkpoints_by_run.remove(&run_id.0);
         Ok(events)
+    }
+
+    fn discard_run_artifact_drafts(
+        &mut self,
+        request_id: &RequestId,
+        run_id: &str,
+        session_id: &str,
+    ) -> KernelResult<Vec<KernelEvent>> {
+        let drafts = self
+            .state
+            .artifact_drafts
+            .iter()
+            .filter(|(_, draft)| draft.run_id == run_id)
+            .map(|(key, draft)| (key.clone(), draft.clone()))
+            .collect::<Vec<_>>();
+        if drafts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let reason = "Run cancellation discarded the active artifact draft.";
+        let first_sequence = self.ledger.next_sequence(run_id)?;
+        let mut ledger_events = Vec::with_capacity(drafts.len());
+        let mut kernel_events = Vec::with_capacity(drafts.len());
+        for (index, (_, draft)) in drafts.iter().enumerate() {
+            let sequence = first_sequence + index as u64;
+            let frame = deepcode_kernel_abi::ArtifactDraftLedgerFrame::Diagnostic {
+                base: deepcode_kernel_abi::ArtifactDraftFrameBase {
+                    schema_version: deepcode_kernel_abi::ARTIFACT_DRAFT_SCHEMA_VERSION.to_string(),
+                    draft_id: draft.draft_id.clone(),
+                    frame_id: format!("kernel-cancel-{}-{}", draft.draft_id, draft.next_sequence),
+                    run_id: run_id.to_string(),
+                    session_id: session_id.to_string(),
+                    task_id: draft.task_id.clone(),
+                    sequence: draft.next_sequence,
+                    content_hash: deepcode_kernel_tools::fnv1a64_hex(reason),
+                    expected_slot_ids: draft.expected_slot_ids.iter().cloned().collect(),
+                },
+                metadata: deepcode_kernel_abi::ArtifactDraftDiagnosticMetadata {
+                    reason: reason.to_string(),
+                },
+            };
+            let fact = deepcode_kernel_abi::ArtifactDraftEvent {
+                draft_id: draft.draft_id.clone(),
+                status: deepcode_kernel_abi::ArtifactDraftStatus::Discarded,
+                frame,
+            };
+            ledger_events.push(LedgerEvent {
+                id: format!("evt-{run_id}-{sequence}"),
+                run_id: Some(run_id.to_string()),
+                session_id: Some(session_id.to_string()),
+                kind: "draft.discarded".to_string(),
+                sequence: Some(sequence),
+                payload: serde_json::to_value(&fact).map_err(|error| {
+                    KernelError::InvalidCommand(format!("encode cancelled artifact draft: {error}"))
+                })?,
+                created_at: None,
+            });
+            kernel_events.push(KernelEvent::DraftDiscarded {
+                request_id: Some(request_id.clone()),
+                run_id: RunId(run_id.to_string()),
+                session_id: Some(SessionId(session_id.to_string())),
+                draft: fact,
+                sequence: Some(sequence),
+            });
+        }
+        self.append_ledger_batch(ledger_events)?;
+        for (key, _) in drafts {
+            self.state.artifact_drafts.remove(&key);
+            self.state.terminal_artifact_draft_keys.insert(key);
+        }
+        Ok(kernel_events)
     }
 }

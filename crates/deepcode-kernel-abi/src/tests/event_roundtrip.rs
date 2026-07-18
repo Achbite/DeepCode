@@ -189,15 +189,88 @@ fn runtime_lifecycle_event_round_trip() {
         run_id: RunId("run-1".to_string()),
         session_id: Some(SessionId("session-1".to_string())),
         previous_state: Some(RuntimeLifecycleState::Created),
-        current_state: RuntimeLifecycleState::Ready,
-        reason: Some("runInitialized".to_string()),
+        current_state: RuntimeLifecycleState::Terminating,
+        reason: Some("cleanupStarted".to_string()),
         sequence: Some(4),
     };
     let encoded = serde_json::to_value(&event).expect("serialize event");
     assert_eq!(encoded["kind"], "runtime.lifecycle_changed");
-    assert_eq!(encoded["currentState"], "ready");
+    assert_eq!(encoded["currentState"], "terminating");
     let decoded: KernelEvent = serde_json::from_value(encoded).expect("deserialize event");
     assert_eq!(decoded, event);
+}
+
+#[test]
+fn cleanup_and_tool_effect_events_round_trip_as_typed_facts() {
+    let cleanup = KernelEvent::ResourceCleanupStateChanged {
+        request_id: Some(RequestId("req-cleanup".to_string())),
+        run_id: RunId("run-1".to_string()),
+        session_id: Some(SessionId("session-1".to_string())),
+        fact: KernelResourceCleanupStateFact {
+            run_id: "run-1".to_string(),
+            scope: KernelCleanupScope::Run,
+            state: KernelCleanupState::Failed,
+            resource_id: Some("resource-1".to_string()),
+            resource_state: Some(KernelResourceState::CleanupFailed),
+            attempt: 1,
+            error: Some("cleanup failed".to_string()),
+        },
+        sequence: Some(4),
+    };
+    let encoded = serde_json::to_value(&cleanup).expect("serialize cleanup fact");
+    assert_eq!(encoded["kind"], "resource.cleanup_state_changed");
+    assert_eq!(encoded["fact"]["resourceState"], "cleanupFailed");
+    assert_eq!(
+        serde_json::from_value::<KernelEvent>(encoded).expect("deserialize cleanup fact"),
+        cleanup
+    );
+
+    let attempt = ToolExecutionAttemptFact {
+        attempt_id: "attempt-1".to_string(),
+        tool_call_id: "call-1".to_string(),
+        tool_id: "fs.write".to_string(),
+        operation_kind: ToolOperationKind::FsWrite,
+        args_hash: "sha256:args".to_string(),
+        contract_id: "contract-1".to_string(),
+        work_unit_id: "work-unit-1".to_string(),
+    };
+    let receipt = ToolEffectReceipt {
+        attempt_id: attempt.attempt_id.clone(),
+        outcome: ToolEffectOutcome::Indeterminate,
+        affected_resources: vec!["output.txt".to_string()],
+        validation: None,
+        cleanup_refs: Vec::new(),
+    };
+    let events = [
+        KernelEvent::ToolExecutionAttempted {
+            run_id: RunId("run-1".to_string()),
+            session_id: Some(SessionId("session-1".to_string())),
+            fact: attempt.clone(),
+            sequence: Some(5),
+        },
+        KernelEvent::ToolEffectObserved {
+            run_id: RunId("run-1".to_string()),
+            session_id: Some(SessionId("session-1".to_string())),
+            fact: receipt.clone(),
+            sequence: Some(6),
+        },
+        KernelEvent::ToolOutcomeIndeterminate {
+            run_id: RunId("run-1".to_string()),
+            session_id: Some(SessionId("session-1".to_string())),
+            fact: ToolOutcomeIndeterminateFact {
+                attempt,
+                receipt,
+                reason: "effect persistence failed".to_string(),
+            },
+            sequence: Some(7),
+        },
+    ];
+    for event in events {
+        let encoded = serde_json::to_value(&event).expect("serialize tool effect event");
+        let decoded: KernelEvent =
+            serde_json::from_value(encoded).expect("deserialize tool effect event");
+        assert_eq!(decoded, event);
+    }
 }
 
 #[test]

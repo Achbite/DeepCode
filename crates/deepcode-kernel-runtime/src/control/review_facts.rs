@@ -32,6 +32,7 @@ pub(super) fn ledger_review_facts_for_run(
     let mut generated_artifacts = Vec::new();
     let mut resource_events = Vec::new();
     let mut cleanup_failures = Vec::new();
+    let mut indeterminate_tool_outcomes = Vec::new();
     let mut path_normalization_diagnostics = Vec::new();
     let mut batch_review_ready = false;
 
@@ -114,6 +115,9 @@ pub(super) fn ledger_review_facts_for_run(
                 }
                 tool_results.push(fact);
             }
+            "tool.outcome_indeterminate" => {
+                indeterminate_tool_outcomes.push(decode_fact(event, "indeterminate tool outcome")?);
+            }
             _ => {}
         }
     }
@@ -139,6 +143,7 @@ pub(super) fn ledger_review_facts_for_run(
         generated_artifacts,
         resource_events,
         cleanup_failures,
+        indeterminate_tool_outcomes,
         path_normalization_diagnostics,
         batch_review_ready,
     })

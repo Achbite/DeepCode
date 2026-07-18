@@ -258,9 +258,9 @@ fn run_cancel_and_typed_audit_query_return_structured_events() {
         .filter(|resource| resource.kind == KernelResourceKind::WorkspaceReadLease)
         .collect::<Vec<_>>();
     assert!(!workspace_read_leases.is_empty());
-    assert!(workspace_read_leases.iter().all(|resource| {
-        resource.state == deepcode_kernel_ledger::KernelResourceState::Released
-    }));
+    assert!(workspace_read_leases
+        .iter()
+        .all(|resource| { resource.state == KernelResourceState::Released }));
 }
 
 #[test]

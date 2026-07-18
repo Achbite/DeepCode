@@ -50,37 +50,22 @@ impl WorkUnitGraph {
             nodes.push(WorkUnitGraphNode {
                 id: node_id,
                 operation_id: operation.id.clone(),
-                can_run_concurrently: !operation.is_write_like(),
+                can_run_concurrently: false,
                 read_set: operation.read_set.clone(),
                 write_set: operation.write_set.clone(),
                 conflict_keys: operation.conflict_keys.clone(),
             });
         }
 
-        let mut read_validation = Vec::new();
-        let mut serial_mutation = Vec::new();
-        for node in &nodes {
-            if node.can_run_concurrently {
-                read_validation.push(node.id.clone());
-            } else {
-                serial_mutation.push(node.id.clone());
-            }
-        }
-        let mut concurrency_groups = Vec::new();
-        if !read_validation.is_empty() {
-            concurrency_groups.push(WorkUnitConcurrencyGroup {
-                id: "read-validation".to_string(),
-                mode: "parallel".to_string(),
-                node_ids: read_validation,
-            });
-        }
-        if !serial_mutation.is_empty() {
-            concurrency_groups.push(WorkUnitConcurrencyGroup {
-                id: "mutation-serial".to_string(),
+        let concurrency_groups = if nodes.is_empty() {
+            Vec::new()
+        } else {
+            vec![WorkUnitConcurrencyGroup {
+                id: "scheduler-serial".to_string(),
                 mode: "serial".to_string(),
-                node_ids: serial_mutation,
-            });
-        }
+                node_ids: nodes.iter().map(|node| node.id.clone()).collect(),
+            }]
+        };
         Self {
             nodes,
             edges,

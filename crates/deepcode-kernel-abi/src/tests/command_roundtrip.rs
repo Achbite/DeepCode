@@ -14,6 +14,20 @@ fn kernel_command_round_trips_as_tagged_json() {
 }
 
 #[test]
+fn cleanup_retry_command_round_trips_without_becoming_an_agent_tool() {
+    let command = KernelCommand::RunCleanupRetry {
+        request_id: RequestId("req-cleanup-retry".to_string()),
+        run_id: RunId("run-cleanup".to_string()),
+    };
+    let encoded = serde_json::to_value(&command).expect("serialize cleanup retry");
+    assert_eq!(encoded["kind"], "runCleanupRetry");
+    assert_eq!(encoded["runId"], "run-cleanup");
+    let decoded: KernelCommand =
+        serde_json::from_value(encoded).expect("deserialize cleanup retry");
+    assert_eq!(decoded, command);
+}
+
+#[test]
 fn run_create_carries_workspace_binding_and_profile_ref() {
     let command = KernelCommand::RunCreate {
         request_id: RequestId("req-run".to_string()),

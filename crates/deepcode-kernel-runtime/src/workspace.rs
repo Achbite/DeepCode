@@ -315,13 +315,24 @@ fn host_browse_output(path: Option<&str>) -> KernelResult<HostBrowseResult> {
     let path = path
         .map(PathBuf::from)
         .or_else(host_home_dir)
-        .unwrap_or_else(|| PathBuf::from("/"));
+        .ok_or_else(|| {
+            KernelError::Other(
+                "host browse requires an explicit path when no home directory is available"
+                    .to_string(),
+            )
+        })?;
     let target = if path.is_dir() {
         path
     } else {
         path.parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/"))
+            .ok_or_else(|| {
+                KernelError::Other(format!(
+                    "host browse target {} is not a directory and has no parent directory",
+                    path.display()
+                ))
+            })?
     };
     let mut entries = fs::read_dir(&target)
         .map_err(|error| KernelError::Other(format!("browse {}: {error}", target.display())))?
