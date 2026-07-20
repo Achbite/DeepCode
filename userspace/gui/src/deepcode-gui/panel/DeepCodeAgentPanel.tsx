@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import type { AgentTimelineResult } from '@deepcode/protocol';
+import { createWorkspaceScopeKey } from '@deepcode/session-core';
 import { getLlmProfiles } from '../../services/runtimeAdapter';
 import { useAgentSessionStore } from '../../state/agentSessionStore';
 import { useWorkspaceStore } from '../../state/workspaceStore';
@@ -61,7 +62,7 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
   const resolveRequirement = useAgentSessionStore((s) => s.resolveRequirement);
   const resolvePlan = useAgentSessionStore((s) => s.resolvePlan);
   const resolveReview = useAgentSessionStore((s) => s.resolveReview);
-  const workspaceRevision = useWorkspaceStore((s) => s.treeRevision);
+  const workspaceScopeKey = useWorkspaceStore((s) => createWorkspaceScopeKey(s.current));
   const [timelineTypewriterBlockIds, setTimelineTypewriterBlockIds] = useState<string[]>([]);
   const [revealedPendingDecisionKey, setRevealedPendingDecisionKey] = useState<string | null>(null);
   const [followLatestSignal, setFollowLatestSignal] = useState(0);
@@ -69,8 +70,6 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
   const sessionRunning = Boolean(session?.id && runningSessionIds.includes(session.id));
 
   useEffect(() => {
-    void loadOrCreate();
-    void refreshSessions();
     const loadProfiles = () => getLlmProfiles().then((result) => {
       if (result.ok && result.data) {
         setProfileId(profileId ?? result.data.defaultProfileId);
@@ -79,12 +78,12 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
     void loadProfiles();
     window.addEventListener('deepcode:llm-profiles-updated', loadProfiles);
     return () => window.removeEventListener('deepcode:llm-profiles-updated', loadProfiles);
-  }, [loadOrCreate, profileId, refreshSessions, setProfileId]);
+  }, [profileId, setProfileId]);
 
   useEffect(() => {
     void loadOrCreate();
     void refreshSessions();
-  }, [loadOrCreate, refreshSessions, workspaceRevision]);
+  }, [loadOrCreate, refreshSessions, workspaceScopeKey]);
 
   const activeSessionTitle = displaySessionTitle(language, session?.title);
   const hasTimelineTurns = timeline.turns.length > 0;

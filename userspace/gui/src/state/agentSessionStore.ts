@@ -94,7 +94,7 @@ interface AgentSessionState {
   session: AgentSession | null;
   sessions: AgentSession[];
   currentSessionId?: string;
-  workspaceScopeKey?: string;
+  localWorkspaceScopeKey?: string;
   events: AgentEvent[];
   timeline: AgentTimelineResult | null;
   traceEvents: AgentTraceEvent[];
@@ -389,6 +389,7 @@ async function startAndWaitAgentRun(
     if (event.event === 'delta' && isRecord(data)) {
       const delta = data.delta;
       if (isRecord(delta)) {
+        if (delta.sessionId !== sessionId || delta.runId !== result.run.runId) return;
         const deltaSeq = typeof delta.deltaSeq === 'number' ? delta.deltaSeq : 0;
         if (deltaSeq > 0 && deltaSeq <= lastDeltaSeq) return;
         if (deltaSeq > 0) lastDeltaSeq = deltaSeq;
@@ -426,11 +427,26 @@ async function startAndWaitAgentRun(
   }
 }
 
+function waitForAgentSessionLoad(): Promise<void> {
+  if (!useAgentSessionStore.getState().loading) return Promise.resolve();
+  return new Promise((resolve) => {
+    let unsubscribe: (() => void) | undefined;
+    const finish = () => {
+      unsubscribe?.();
+      resolve();
+    };
+    unsubscribe = useAgentSessionStore.subscribe((state) => {
+      if (!state.loading) finish();
+    });
+    if (!useAgentSessionStore.getState().loading) finish();
+  });
+}
+
 export const useAgentSessionStore = create<Store>((set, get) => ({
   session: null,
   sessions: [],
   currentSessionId: undefined,
-  workspaceScopeKey: undefined,
+  localWorkspaceScopeKey: undefined,
   events: [],
   timeline: null,
   traceEvents: [],
@@ -452,8 +468,14 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
 
   loadOrCreate: async () => {
     const nextScopeKey = currentWorkspaceScopeKey();
-    if (get().session && get().workspaceScopeKey === nextScopeKey) return;
-    if (get().loading) return;
+    if (get().session && get().localWorkspaceScopeKey === nextScopeKey) return;
+    if (get().loading) {
+      await waitForAgentSessionLoad();
+      if (!get().session || get().localWorkspaceScopeKey !== currentWorkspaceScopeKey()) {
+        await get().loadOrCreate();
+      }
+      return;
+    }
     set({ loading: true, errorMessage: null });
     try {
       const settings = useSettingsStore.getState().effectiveSettings;
@@ -474,7 +496,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         const timelineResult = await getAgentTimeline(current.data.session.id);
         set({
           session: current.data.session,
-          workspaceScopeKey: nextScopeKey,
+          localWorkspaceScopeKey: nextScopeKey,
           events: current.data.events,
           timeline: timelineResult.ok && timelineResult.data
             ? timelineAsReplay(timelineResult.data)
@@ -490,7 +512,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       if (created.ok && created.data) {
         set({
           session: created.data.session,
-          workspaceScopeKey: nextScopeKey,
+          localWorkspaceScopeKey: nextScopeKey,
           sessions: [created.data.session, ...get().sessions.filter((item) => item.id !== created.data!.session.id)],
           currentSessionId: created.data.session.id,
           events: created.data.events,
@@ -526,7 +548,11 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
 
   createNewSession: async (options = {}) => {
     const currentSession = get().session;
-    if (options.reuseEmpty !== false && isEmptyAgentSession(currentSession)) {
+    if (
+      options.reuseEmpty !== false &&
+      isEmptyAgentSession(currentSession) &&
+      get().localWorkspaceScopeKey === currentWorkspaceScopeKey()
+    ) {
       set({ errorMessage: null });
       return currentSession ?? null;
     }
@@ -539,7 +565,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     if (result.ok && result.data) {
       set({
         session: result.data.session,
-        workspaceScopeKey: result.data.session.workspaceScopeKey ?? currentWorkspaceScopeKey(),
+        localWorkspaceScopeKey: currentWorkspaceScopeKey(),
         sessions: [result.data.session, ...get().sessions.filter((item) => item.id !== result.data!.session.id)],
         currentSessionId: result.data.session.id,
         events: result.data.events,
@@ -570,7 +596,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         const timelineResult = await getAgentTimeline(result.data.session.id);
         set({
           session: result.data.session,
-          workspaceScopeKey: currentWorkspaceScopeKey(),
+          localWorkspaceScopeKey: currentWorkspaceScopeKey(),
           currentSessionId: result.data.session.id,
           events: result.data.events,
           timeline: timelineResult.ok && timelineResult.data
@@ -754,7 +780,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
   sendMessage: async (content, attachmentsOverride) => {
     const trimmed = content.trim();
     if (!trimmed) return;
-    await get().loadOrCreate();
+    if (!get().session) await get().loadOrCreate();
     const session = get().session;
     if (!session) return;
 

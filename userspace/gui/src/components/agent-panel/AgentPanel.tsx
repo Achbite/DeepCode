@@ -1,4 +1,5 @@
 import React, { useEffect } from 'react';
+import { createWorkspaceScopeKey } from '@deepcode/session-core';
 import { getLlmProfiles } from '../../services/runtimeAdapter';
 import { useAgentSessionStore } from '../../state/agentSessionStore';
 import { useSettingsStore } from '../../state/settingsStore';
@@ -43,7 +44,7 @@ const AgentPanel: React.FC = () => {
   const resolveRequirement = useAgentSessionStore((s) => s.resolveRequirement);
   const resolvePlan = useAgentSessionStore((s) => s.resolvePlan);
   const resolveReview = useAgentSessionStore((s) => s.resolveReview);
-  const workspaceRevision = useWorkspaceStore((s) => s.treeRevision);
+  const workspaceScopeKey = useWorkspaceStore((s) => createWorkspaceScopeKey(s.current));
   const language = normalizeUiLanguage(
     useSettingsStore((s) => s.effectiveSettings['workbench.language'])
   );
@@ -62,8 +63,6 @@ const AgentPanel: React.FC = () => {
   const agentBusy = loading || activeSessionRunning || pendingDecisionResolving;
 
   useEffect(() => {
-    void loadOrCreate();
-    void refreshSessions();
     const loadProfiles = () => getLlmProfiles().then((result) => {
       if (result.ok && result.data) {
         setProfileId(profileId ?? result.data.defaultProfileId);
@@ -75,12 +74,12 @@ const AgentPanel: React.FC = () => {
     };
     window.addEventListener('deepcode:llm-profiles-updated', onProfilesUpdated);
     return () => window.removeEventListener('deepcode:llm-profiles-updated', onProfilesUpdated);
-  }, [loadOrCreate, profileId, refreshSessions, setProfileId]);
+  }, [profileId, setProfileId]);
 
   useEffect(() => {
     void loadOrCreate();
     void refreshSessions();
-  }, [loadOrCreate, refreshSessions, workspaceRevision]);
+  }, [loadOrCreate, refreshSessions, workspaceScopeKey]);
 
   return (
     <div className="agent-panel-shell">
