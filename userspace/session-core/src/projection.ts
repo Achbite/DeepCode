@@ -254,6 +254,7 @@ export function buildNarrativeTimelineProjection(input: NarrativeTimelineProject
     annotateBlocksWithPhase(turns, input.events, acceptedReviewIndex);
   }
   resolveTimelineInteractionBlocks(turns, input.events);
+  applyTurnAuthorityStates(turns, input.events);
   stabilizeNarrativeBlockIds(turns);
 
   const rawEventRefs = Array.from(new Set(
@@ -1532,6 +1533,64 @@ function finalizeNarrativeTurn(turn: AgentTimelineResult['turns'][number]): Agen
       ? [...turn.blocks].reverse().flatMap((block) => [...block.events].reverse()).find((event) => event.ts)?.ts
       : turn.completedAt,
   };
+}
+
+function applyTurnAuthorityStates(
+  turns: AgentTimelineResult['turns'],
+  events: AgentEvent[]
+): void {
+  const authorities = events.flatMap((event, index) => {
+    if (event.kind !== 'session_turn_authority' || !isRecordPayload(event.payload)) return [];
+    const runId = stringField(event.payload, 'runId');
+    const sourceMessageIds = stringArrayField(event.payload, 'sourceMessageIds');
+    if (!runId || sourceMessageIds.length === 0) return [];
+    return [{ index, runId, sourceMessageIds: new Set(sourceMessageIds) }];
+  });
+  if (authorities.length === 0) return;
+
+  for (let turnIndex = 0; turnIndex < turns.length; turnIndex += 1) {
+    const turn = turns[turnIndex];
+    if (turn.status !== 'completed') continue;
+    const sourceMessageIds = new Set(turn.blocks.flatMap((block) => block.events.flatMap((event) => {
+      if (event.kind !== 'user_msg') return [];
+      const payload = isRecordPayload(event.payload) ? event.payload : {};
+      return [event.id, stringField(payload, 'sourceEventId')].filter((value): value is string => Boolean(value));
+    })));
+    if (sourceMessageIds.size === 0) continue;
+    const authority = [...authorities].reverse().find((candidate) =>
+      [...sourceMessageIds].some((messageId) => candidate.sourceMessageIds.has(messageId))
+    );
+    if (!authority) continue;
+    const hasFinalAssistant = turn.blocks.some((block) => block.narrativeKind === 'assistantText');
+    const latestRunState = [...events.slice(authority.index)].reverse().find((event) => {
+      if (event.kind !== 'session_run_state' || !isRecordPayload(event.payload)) return false;
+      return stringField(event.payload, 'runId') === authority.runId;
+    });
+    const runStatus = latestRunState ? narrativeEventStatus(latestRunState) : undefined;
+    if (runStatus === 'failed') {
+      turns[turnIndex] = {
+        ...turn,
+        status: 'failed',
+        completedAt: latestRunState?.ts ?? turn.completedAt,
+      };
+      continue;
+    }
+    if (runStatus === 'completed' || runStatus === 'cancelled') continue;
+    if (runStatus === 'waiting' && latestRunState && !runStateInteractionResolved(latestRunState, events)) {
+      turns[turnIndex] = {
+        ...turn,
+        status: 'blocked',
+        completedAt: undefined,
+      };
+      continue;
+    }
+    if (!runStatus && hasFinalAssistant) continue;
+    turns[turnIndex] = {
+      ...turn,
+      status: 'running',
+      completedAt: undefined,
+    };
+  }
 }
 
 function stabilizeNarrativeBlockIds(turns: AgentTimelineResult['turns']): void {

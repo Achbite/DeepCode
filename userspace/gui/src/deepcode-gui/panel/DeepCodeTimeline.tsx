@@ -663,8 +663,12 @@ const TurnCard: React.FC<{
   onPlanResolve?: DeepCodeTimelineProps['onPlanResolve'];
 }> = ({ turn, language, playbackVisibleBlockIds, typewriterBlockIds, collapseCompletedThinking, onLiveContentChange, onTypewriterComplete, onPlanResolve }) => {
   const startedAtLabel = formatTurnTime(turn.startedAt);
-  const blocks = turn.blocks.filter((block) => isVisibleTimelineBlock(block) && playbackVisibleBlockIds.has(block.id));
+  const visibleBlocks = turn.blocks.filter(isVisibleTimelineBlock);
+  const blocks = visibleBlocks.filter((block) => playbackVisibleBlockIds.has(block.id));
   if (blocks.length === 0) return null;
+  const actionsReady = (turn.status === 'completed' || turn.status === 'failed') &&
+    blocks.length === visibleBlocks.length &&
+    visibleBlocks.every((block) => !typewriterBlockIds.has(block.id));
 
   return (
     <section className={`deepcode-gui-turn deepcode-gui-turn--${turn.status}`}>
@@ -686,24 +690,23 @@ const TurnCard: React.FC<{
             onPlanResolve={onPlanResolve}
           />
         ))}
-        <TurnActionBar turn={turn} blocks={blocks} language={language} />
+        {actionsReady && <TurnActionBar blocks={blocks} language={language} />}
       </div>
     </section>
   );
 };
 
 const TurnActionBar: React.FC<{
-  turn: AgentTimelineTurn;
   blocks: AgentTimelineBlock[];
   language: UiLanguage;
-}> = ({ turn, blocks, language }) => {
+}> = ({ blocks, language }) => {
   const [status, setStatus] = useState<'idle' | 'copied' | 'rated' | 'error'>('idle');
   const feedbackEvent = feedbackTargetEvent(blocks);
 
   if (!hasVisibleTurnContent(blocks)) return null;
 
   const copyTurn = async () => {
-    const text = turnCopyText(turn, blocks, language);
+    const text = turnCopyText(blocks, language);
     try {
       await copyText(text);
       setStatus('copied');
@@ -1662,14 +1665,11 @@ function feedbackTargetEvent(blocks: AgentTimelineBlock[]): AgentTimelineBlock['
 }
 
 function turnCopyText(
-  turn: AgentTimelineTurn,
   blocks: AgentTimelineBlock[],
   language: UiLanguage
 ): string {
-  const parts = [
-    `${t(language, 'deepcodeGui.sidebar.chats')} ${turn.id}`,
-    ...blocks.flatMap((block) => blockCopyText(block, language)),
-  ].filter((part) => part.trim().length > 0);
+  const parts = blocks.flatMap((block) => blockCopyText(block, language))
+    .filter((part) => part.trim().length > 0);
   return parts.join('\n\n');
 }
 

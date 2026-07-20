@@ -46,7 +46,7 @@ import {
   submitAgentRunGuidance,
   updateAgentSession,
 } from '../services/runtimeAdapter';
-import type { AgentRunResult, StartAgentRunRequest } from '../services/apiClient';
+import type { AgentRunResult, AgentRunStreamEvent, StartAgentRunRequest } from '../services/apiClient';
 import { useSettingsStore } from './settingsStore';
 import { activeT } from '../i18n';
 import { useWorkspaceStore } from './workspaceStore';
@@ -266,6 +266,13 @@ async function refreshCanonicalTimeline(
   const incomingTimeline = result.data;
   let nextTimeline: AgentTimelineResult | null = null;
   useAgentSessionStore.setState((state) => {
+    if (
+      preservePlayback &&
+      state.timeline &&
+      (incomingTimeline.revision ?? 0) <= (state.timeline.revision ?? 0)
+    ) {
+      return state;
+    }
     nextTimeline = preservePlayback
       ? reconcileTimelineSnapshot(state.timeline, incomingTimeline)
       : timelineAsReplay(incomingTimeline);
@@ -387,44 +394,79 @@ async function startAndWaitAgentRun(
     throw new Error(started.message ?? started.error ?? 'Shared session run start failed');
   }
   let result = started.data;
-  activeAgentRunIds.set(sessionId, result.run.runId);
-  projectionDeliveryDiagnostics.begin(sessionId, result.run.runId);
+  const runId = result.run.runId;
+  activeAgentRunIds.set(sessionId, runId);
+  projectionDeliveryDiagnostics.begin(sessionId, runId);
+  handlers.onEvents?.(result.events);
   const controller = new AbortController();
   let lastDeltaSeq = 0;
+  let lastEventCount = result.events.length;
   let terminalStreamObserved = false;
+  let stopStream = false;
   let resolveTerminalStreamEvent: (() => void) | undefined;
   const terminalStreamEvent = new Promise<void>((resolve) => {
     resolveTerminalStreamEvent = resolve;
   });
-  const streamDone = streamAgentRun(sessionId, result.run.runId, (event) => {
+  const streamEventMatchesRun = (data: Record<string, unknown>) =>
+    data.sessionId === sessionId && data.runId === runId;
+  const updateEventCursor = (data: Record<string, unknown>, eventCount: number) => {
+    lastEventCount = typeof data.eventCount === 'number'
+      ? Math.max(lastEventCount, data.eventCount)
+      : lastEventCount + eventCount;
+  };
+  const handleStreamEvent = (event: AgentRunStreamEvent) => {
     const data = event.data;
-    if (event.event === 'delta' && isRecord(data)) {
+    if (!isRecord(data) || !streamEventMatchesRun(data)) return;
+    if (event.event === 'delta') {
       const delta = data.delta;
-      if (isRecord(delta)) {
-        if (delta.sessionId !== sessionId || delta.runId !== result.run.runId) return;
-        const deltaSeq = typeof delta.deltaSeq === 'number' ? delta.deltaSeq : 0;
-        if (isAgentTimelineDelta(delta)) {
-          projectionDeliveryDiagnostics.recordDelta(
-            'gui.sse_delta_received',
-            delta,
-            deltaSeq > 0 && deltaSeq <= lastDeltaSeq ? 'ignored' : 'accepted'
-          );
-        }
-        if (deltaSeq > 0 && deltaSeq <= lastDeltaSeq) return;
-        if (deltaSeq > 0) lastDeltaSeq = deltaSeq;
-        if (isAgentTimelineDelta(delta)) handlers.onDelta?.(delta);
-      }
+      if (!isRecord(delta) || !isAgentTimelineDelta(delta)) return;
+      if (delta.sessionId !== sessionId || delta.runId !== runId) return;
+      const deltaSeq = typeof delta.deltaSeq === 'number' ? delta.deltaSeq : 0;
+      projectionDeliveryDiagnostics.recordDelta(
+        'gui.sse_delta_received',
+        delta,
+        deltaSeq > 0 && deltaSeq <= lastDeltaSeq ? 'ignored' : 'accepted'
+      );
+      if (deltaSeq > 0 && deltaSeq <= lastDeltaSeq) return;
+      if (deltaSeq > 0) lastDeltaSeq = deltaSeq;
+      handlers.onDelta?.(delta);
+      return;
     }
-    if (event.event === 'events' && isRecord(data) && Array.isArray(data.events)) {
-      handlers.onEvents?.(data.events.filter(isRecord) as unknown as AgentEvent[]);
+    if ((event.event === 'events' || event.event === 'terminal') && Array.isArray(data.events)) {
+      const events = data.events.filter(isRecord) as unknown as AgentEvent[];
+      updateEventCursor(data, events.length);
+      handlers.onEvents?.(events);
     }
-    if (event.event === 'terminal' && isRecord(data) && Array.isArray(data.events)) {
-      handlers.onEvents?.(data.events.filter(isRecord) as unknown as AgentEvent[]);
+    if (event.event === 'terminal') {
       terminalStreamObserved = true;
-      projectionDeliveryDiagnostics.markTerminal(sessionId, result.run.runId);
       resolveTerminalStreamEvent?.();
     }
-  }, { sinceEventCount: result.events.length }, controller.signal).catch(() => undefined);
+  };
+  const retryDelays = [100, 250, 500, 1000] as const;
+  const streamDone = (async () => {
+    let retryIndex = 0;
+    while (!stopStream && !controller.signal.aborted && !terminalStreamObserved) {
+      const beforeDeltaSeq = lastDeltaSeq;
+      const beforeEventCount = lastEventCount;
+      try {
+        await streamAgentRun(
+          sessionId,
+          runId,
+          handleStreamEvent,
+          { sinceEventCount: lastEventCount, sinceDeltaSeq: lastDeltaSeq },
+          controller.signal
+        );
+      } catch {
+        if (stopStream || controller.signal.aborted) break;
+      }
+      if (stopStream || controller.signal.aborted || terminalStreamObserved) break;
+      const progressed = lastDeltaSeq > beforeDeltaSeq || lastEventCount > beforeEventCount;
+      if (progressed) retryIndex = 0;
+      const retryDelay = retryDelays[Math.min(retryIndex, retryDelays.length - 1)];
+      retryIndex = Math.min(retryIndex + 1, retryDelays.length - 1);
+      await sleep(retryDelay);
+    }
+  })();
   try {
     while (!isTerminalRunStatus(result.run.status)) {
       if (!terminalStreamObserved) {
@@ -436,13 +478,21 @@ async function startAndWaitAgentRun(
       }
       result = current.data;
     }
-    projectionDeliveryDiagnostics.markTerminal(sessionId, result.run.runId);
+    handlers.onEvents?.(result.events);
+    lastEventCount = Math.max(lastEventCount, result.events.length);
+    if (!terminalStreamObserved) {
+      await Promise.race([terminalStreamEvent, sleep(1500)]);
+    }
+    if (!terminalStreamObserved) {
+      await refreshCanonicalTimeline(sessionId, true);
+    }
+    projectionDeliveryDiagnostics.markTerminal(sessionId, runId);
     return result;
   } finally {
-    await Promise.race([streamDone, terminalStreamEvent, sleep(1000)]);
+    stopStream = true;
     controller.abort();
     await streamDone;
-    if (activeAgentRunIds.get(sessionId) === result.run.runId) {
+    if (activeAgentRunIds.get(sessionId) === runId) {
       activeAgentRunIds.delete(sessionId);
     }
   }

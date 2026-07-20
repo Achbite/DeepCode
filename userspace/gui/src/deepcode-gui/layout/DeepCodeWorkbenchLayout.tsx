@@ -376,8 +376,6 @@ function dedupeTaskItems(items: DeepCodeTaskItem[]): DeepCodeTaskItem[] {
 
 function deriveTaskItems(
   projection: AgentTimelineResult,
-  language: UiLanguage,
-  loading: boolean,
   fallbackItems: DeepCodeTaskItem[] = []
 ): DeepCodeTaskItem[] {
   const projectedItems = latestPlanTaskItemsFromProjection(projection);
@@ -395,17 +393,6 @@ function deriveTaskItems(
 
   if (fallbackItems.length > 0) {
     return fallbackItems;
-  }
-
-  if (loading) {
-    return [
-      {
-        id: 'runtime-preparing',
-        title: t(language, 'deepcodeGui.tasks.running'),
-        summary: t(language, 'deepcodeGui.tasks.runningSummary'),
-        status: 'running',
-      },
-    ];
   }
 
   return [];
@@ -550,18 +537,16 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
       : [];
     const items = deriveTaskItems(
       liveTimelineProjection,
-      language,
-      !projectDraftActive && Boolean(activeSession?.id && runningSessionIds.includes(activeSession.id)),
       fallbackItems
     );
-    if (items.length > 0 && items.some((item) => item.id !== 'runtime-preparing')) {
+    if (items.length > 0) {
       lastPlanTaskItemsRef.current = { sessionId: taskSessionId, items };
     }
     if (items.length === 0 && lastPlanTaskItemsRef.current.sessionId !== taskSessionId) {
       lastPlanTaskItemsRef.current = { sessionId: taskSessionId, items: [] };
     }
     return items;
-  }, [activeSession?.id, liveTimelineProjection, language, projectDraftActive, runningSessionIds]);
+  }, [activeSession?.id, liveTimelineProjection, projectDraftActive]);
   const cacheHitSummary = useMemo(
     () => deriveCacheHitSummary(language, liveTimelineProjection.tokenUsageProjection),
     [language, liveTimelineProjection.tokenUsageProjection]
