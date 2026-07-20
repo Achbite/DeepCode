@@ -64,7 +64,8 @@ The macOS product set defaults to `DeepCode-GUI,DeepCode`. Both products share
 one frontend preparation, Cargo dependency check, Darwin runtime build, source
 fingerprint, and publish boundary. Unchanged frontend and Rust stages reuse
 their input-keyed caches; `--clean-cache` is the explicit cache invalidation
-path. Override the product set only for targeted rebuilds:
+path. A targeted request is allowed, but if another app already exists in the
+shared package root the transaction automatically includes and refreshes it:
 
 ```bash
 DEEPCODE_MACOS_PRODUCTS=DeepCode bash ./build.sh --stage package-macos
@@ -109,8 +110,10 @@ bin/macos-arm64/
 The current macOS package is a local runnable package. It does not include DMG packaging, Developer ID signing, or notarization. The script creates a package-local writable config root and writes `build-info.json` for `/api/health` diagnostics.
 
 The package transaction writes and validates both the current commit and a
-content fingerprint, stages every requested app before publishing, and refuses
-to publish a mixed product set if source files change during the build. If
+content fingerprint, stages every app in the closed product set before
+publishing, and refuses to publish a mixed product set if source files change
+during the build. It also verifies that the shared Kernel and every published
+app sidecar have identical hashes and build metadata. If
 `/api/health` does not include `buildCommit`, `sourceFingerprint`,
 `protocolVersion`, or `toolCatalogVersion`, quit the running app, run
 `make package-macos-clean`, and reopen it.

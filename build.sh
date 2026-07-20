@@ -13,7 +13,7 @@
 #   bash ./build.sh --stage deepcode-gui # pnpm + DeepCode-GUI dist
 #   bash ./build.sh --stage macos-package-service # macOS host: start package worker
 #   bash ./build.sh --stage package-macos # macOS host/Docker request: build complete macOS app set
-#   bash ./build.sh --stage package-macos-deepcode-gui # macOS host: build DeepCode-GUI.app package
+#   bash ./build.sh --stage package-macos-deepcode-gui # macOS host: refresh DeepCode-GUI.app and existing sibling apps
 #   bash ./build.sh --stage daemon   # Linux/Windows Rust Kernel daemon
 #   bash ./build.sh --stage cli      # Linux/Windows CLI Host shell
 #   bash ./build.sh --stage tui      # Linux/Windows TUI Host shell
@@ -410,10 +410,22 @@ resolve_macos_products() {
   for product in $raw; do
     add_macos_product "$product"
   done
+  add_published_macos_products
   if [ "${#resolved_macos_products[@]}" -eq 0 ]; then
     echo "==[build][error]== empty macOS product list" >&2
     exit 2
   fi
+}
+
+add_published_macos_products() {
+  [ ! -d "$BIN_ROOT/macos-arm64/DeepCode-GUI.app" ] || add_macos_product "DeepCode-GUI"
+  [ ! -d "$BIN_ROOT/macos-arm64/DeepCode.app" ] || add_macos_product "DeepCode"
+}
+
+resolve_deepcode_gui_products() {
+  resolved_macos_products=()
+  add_macos_product "DeepCode-GUI"
+  add_published_macos_products
 }
 
 start_macos_package_service_from_host() {
@@ -540,10 +552,11 @@ if [ "$host_macos_stage_count" -gt 0 ]; then
       run_macos_package_products_from_host "${resolved_macos_products[@]}"
     fi
   else
+    resolve_deepcode_gui_products
     if is_docker_environment; then
-      submit_macos_package_request 1 "DeepCode-GUI"
+      submit_macos_package_request 1 "${resolved_macos_products[@]}"
     else
-      run_macos_package_products_from_host "DeepCode-GUI"
+      run_macos_package_products_from_host "${resolved_macos_products[@]}"
     fi
   fi
   exit 0
@@ -1099,6 +1112,57 @@ verify_frontend_package_assets() {
   echo "==[build][verify-package-runtime]== ok $label production assets"
 }
 
+runtime_sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{ print $1 }'
+  else
+    shasum -a 256 "$1" | awk '{ print $1 }'
+  fi
+}
+
+build_info_string_field() {
+  local path="$1"
+  local field="$2"
+  awk -F '"' -v key="\"$field\"" 'index($0, key) > 0 { print $4; exit }' "$path"
+}
+
+verify_macos_app_identity() {
+  local app_dir="$1"
+  local product="$2"
+  local root_kernel="$BIN_ROOT/macos-arm64/deepcode-kernel"
+  local root_build_info="$BIN_ROOT/macos-arm64/build-info.json"
+  local app_kernel="$app_dir/Contents/MacOS/deepcode-kernel"
+  local app_build_info="$app_dir/Contents/MacOS/build-info.json"
+  local field root_value app_value
+  local failed=0
+
+  [ -x "$root_kernel" ] || return 1
+  [ -f "$root_build_info" ] || return 1
+  [ -x "$app_kernel" ] || return 1
+  verify_runtime_file "$app_build_info" "macOS $product bundled build-info" || return 1
+  if [ "$(runtime_sha256 "$root_kernel")" != "$(runtime_sha256 "$app_kernel")" ]; then
+    echo "==[build][verify-package-runtime][error]== macOS shared kernel and $product bundled kernel differ" >&2
+    failed=1
+  fi
+  for field in buildCommit sourceFingerprint protocolVersion toolCatalogVersion; do
+    root_value="$(build_info_string_field "$root_build_info" "$field")"
+    app_value="$(build_info_string_field "$app_build_info" "$field")"
+    if [ -z "$root_value" ] || [ "$root_value" != "$app_value" ]; then
+      echo "==[build][verify-package-runtime][error]== $product build-info $field does not match the shared package" >&2
+      failed=1
+    fi
+  done
+  app_value="$(build_info_string_field "$app_build_info" product)"
+  if [ "$app_value" != "$product" ]; then
+    echo "==[build][verify-package-runtime][error]== $product build-info product=$app_value" >&2
+    failed=1
+  fi
+  if [ "$failed" = "0" ]; then
+    echo "==[build][verify-package-runtime]== ok macOS $product release identity"
+  fi
+  return "$failed"
+}
+
 verify_linux_package_runtime() {
   local missing=0
   [ -d "$LINUX_DIR" ] || return 2
@@ -1133,6 +1197,7 @@ verify_macos_package_runtime() {
   [ -d "$macos_dir" ] || return 2
   echo "==[build][verify-package-runtime]== check macos-arm64 package"
   verify_runtime_executable "$macos_dir/deepcode-kernel" "macOS shared kernel" || missing=1
+  verify_runtime_file "$macos_dir/build-info.json" "macOS shared build-info" || missing=1
   verify_runtime_file "$macos_dir/session-core/hostBridge.js" "macOS session bridge" || missing=1
   verify_runtime_file "$macos_dir/node_modules/@deepcode/protocol/dist/index.js" "macOS protocol runtime" || missing=1
   verify_runtime_executable "$macos_dir/node/bin/node" "macOS packaged node" || missing=1
@@ -1142,12 +1207,14 @@ verify_macos_package_runtime() {
     verify_runtime_executable "$macos_dir/DeepCode.app/Contents/MacOS/DeepCode" "macOS DeepCode app shell" || missing=1
     verify_runtime_executable "$macos_dir/DeepCode.app/Contents/MacOS/deepcode-kernel" "macOS DeepCode bundled kernel" || missing=1
     verify_frontend_package_assets "$macos_dir/DeepCode.app/Contents/MacOS/web" "macOS DeepCode bundled web" || missing=1
+    verify_macos_app_identity "$macos_dir/DeepCode.app" "DeepCode" || missing=1
   fi
   if [ -d "$macos_dir/DeepCode-GUI.app" ]; then
     checked_app=1
     verify_runtime_executable "$macos_dir/DeepCode-GUI.app/Contents/MacOS/DeepCode-GUI" "macOS DeepCode-GUI app shell" || missing=1
     verify_runtime_executable "$macos_dir/DeepCode-GUI.app/Contents/MacOS/deepcode-kernel" "macOS DeepCode-GUI bundled kernel" || missing=1
     verify_frontend_package_assets "$macos_dir/DeepCode-GUI.app/Contents/MacOS/web-deepcode-gui" "macOS DeepCode-GUI bundled web" || missing=1
+    verify_macos_app_identity "$macos_dir/DeepCode-GUI.app" "DeepCode-GUI" || missing=1
   fi
   if [ "$checked_app" = "0" ]; then
     echo "==[build][verify-package-runtime][error]== macOS package root exists but no .app bundle was found in $macos_dir" >&2

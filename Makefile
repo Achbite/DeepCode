@@ -9,7 +9,7 @@
 #   make macos-package-service -> 在 macOS 宿主机启动 Docker 可请求的打包服务
 #   make package-macos  -> 生成完整 macOS 发布包：DeepCode.app + DeepCode-GUI.app + CLI/TUI
 #   make package-macos-clean -> 清理打包缓存后重新生成 Darwin GUI/TUI 本机包
-#   make package-macos-deepcode-gui -> 在 macOS 宿主机上生成 bin/macos-arm64/DeepCode-GUI.app
+#   make package-macos-deepcode-gui -> 刷新 DeepCode-GUI.app，并同步刷新共享同一运行时的现有 App
 #
 # 适用环境：Linux / macOS / WSL（必须能直连 Docker daemon）
 # 不支持：Windows 原生 PowerShell 直接调用（请先 wsl 进入 Linux 子系统）
@@ -146,7 +146,7 @@ help:
 	@echo "  make macos-package-service  在 macOS 宿主机启动 Docker 打包请求服务"
 	@echo "  make package-macos  生成完整 macOS 发布包：DeepCode.app + DeepCode-GUI.app + CLI/TUI"
 	@echo "  make package-macos-clean  清理打包缓存后重新生成 macOS 本机包（保留 config/sessions/archives/kernel）"
-	@echo "  make package-macos-deepcode-gui  在 macOS 宿主机上生成 bin/macos-arm64/DeepCode-GUI.app"
+	@echo "  make package-macos-deepcode-gui  刷新 DeepCode-GUI.app，并同步刷新共享同一运行时的现有 App"
 	@echo ""
 	@echo "进入容器后可手动执行："
 	@echo "  bash ./build.sh   编译并输出统一分发目录到 bin/"
