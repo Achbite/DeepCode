@@ -65,6 +65,7 @@ import type {
   UpdateAgentProjectRequest,
   UpdateAgentSessionRequest,
   WorkspaceState,
+  ProjectionDeliveryRecord,
 } from '@deepcode/protocol';
 import { buildSessionMemorySnapshot, type SessionMemorySnapshot } from '@deepcode/session-core';
 
@@ -545,6 +546,14 @@ export function streamAgentRun(
   signal?: AbortSignal
 ): Promise<void> {
   return api.streamAgentRun(sessionId, runId, onEvent, cursor, signal);
+}
+
+export function appendProjectionDelivery(
+  sessionId: string,
+  entries: ProjectionDeliveryRecord[],
+  signal?: AbortSignal
+): Promise<ApiResponse<{ sessionId: string; appended: number }>> {
+  return api.appendProjectionDelivery(sessionId, entries, signal);
 }
 
 export function cancelAgentRunById(

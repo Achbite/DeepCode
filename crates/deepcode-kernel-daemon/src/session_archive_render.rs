@@ -327,6 +327,67 @@ pub(crate) fn conversation_context_assemblies_markdown(
     lines.join("\n").trim_end().to_string()
 }
 
+pub(crate) fn conversation_projection_delivery_markdown(
+    session_id: &str,
+    run_id: &str,
+    entries: &[Value],
+) -> String {
+    let mut sorted = entries.iter().collect::<Vec<_>>();
+    sorted.sort_by_key(|entry| {
+        entry
+            .get("at")
+            .and_then(Value::as_str)
+            .and_then(|value| value.parse::<u128>().ok())
+            .unwrap_or_default()
+    });
+    let mut lines = vec![
+        "# Projection Delivery Timing".to_string(),
+        String::new(),
+        format!("- Session: `{session_id}`"),
+        format!("- Run: `{run_id}`"),
+        format!("- Export generated: `{}`", now_text()),
+        String::new(),
+        "This diagnostic stream records delivery metadata and hashes only. It is not a conversation fact source.".to_string(),
+        String::new(),
+        "| at | stage | op | turn | block | deltaSeq | revision | mode | chars | hash | result |".to_string(),
+        "| --- | --- | --- | --- | --- | ---: | ---: | --- | ---: | --- | --- |".to_string(),
+    ];
+    for entry in sorted {
+        let text = |field: &str| {
+            entry
+                .get(field)
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .replace('|', "\\|")
+        };
+        let number = |field: &str| {
+            entry
+                .get(field)
+                .and_then(Value::as_u64)
+                .map(|value| value.to_string())
+                .unwrap_or_default()
+        };
+        lines.push(format!(
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            text("at"),
+            text("stage"),
+            text("op"),
+            text("turnId"),
+            text("blockId"),
+            number("deltaSeq"),
+            number("revision"),
+            text("deliveryMode"),
+            number("charLength"),
+            text("contentHash"),
+            text("result"),
+        ));
+    }
+    if entries.is_empty() {
+        lines.push("| | No projection delivery records. | | | | | | | | | |".to_string());
+    }
+    lines.join("\n")
+}
+
 fn archive_projection_entry_title(entry: &Value) -> &'static str {
     let payload = entry.get("payload").unwrap_or(&Value::Null);
     if payload.get("traceKind").and_then(Value::as_str).is_some()

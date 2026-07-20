@@ -14,6 +14,7 @@ mod llm_stream_parser;
 mod llm_transport;
 mod prelude;
 mod project_store;
+mod projection_delivery;
 mod routes;
 mod session_archive;
 mod session_archive_render;
@@ -45,6 +46,7 @@ pub(crate) use llm_provider_transport::*;
 pub(crate) use llm_stream_parser::*;
 pub(crate) use llm_transport::*;
 pub(crate) use project_store::*;
+pub(crate) use projection_delivery::*;
 pub(crate) use session_archive::*;
 pub(crate) use session_archive_render::*;
 pub(crate) use session_memory_store::*;
@@ -78,6 +80,7 @@ async fn main() {
         kernel_events: Arc::new(Mutex::new(Vec::new())),
         session_runs: Arc::new(Mutex::new(HashMap::new())),
         session_run_deltas: Arc::new(Mutex::new(HashMap::new())),
+        projection_delivery: Arc::new(Mutex::new(ProjectionDeliveryBufferState::default())),
     };
     if std::env::var("DEEPCODE_DAEMON_IPC_STDIO")
         .map(|value| value == "1")

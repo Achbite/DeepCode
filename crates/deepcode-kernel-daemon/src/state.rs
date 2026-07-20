@@ -9,6 +9,7 @@ pub(crate) struct AppState {
     pub(crate) kernel_events: Arc<Mutex<Vec<KernelEvent>>>,
     pub(crate) session_runs: Arc<Mutex<HashMap<String, AgentRunState>>>,
     pub(crate) session_run_deltas: Arc<Mutex<HashMap<String, Vec<Value>>>>,
+    pub(crate) projection_delivery: Arc<Mutex<ProjectionDeliveryBufferState>>,
 }
 
 pub(crate) type SharedRuntime = Arc<Mutex<DeepCodeKernelRuntime>>;

@@ -12,6 +12,7 @@ import {
   type AgentComposerPendingDecision,
 } from '../../components/agent-panel/pendingDecision';
 import DeepCodeTimeline from './DeepCodeTimeline';
+import { projectionDeliveryDiagnostics } from '../../services/projectionDeliveryDiagnostics';
 
 interface DeepCodeAgentPanelProps {
   language: UiLanguage;
@@ -219,7 +220,10 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
         language={language}
         followLatestSignal={followLatestSignal}
         scrollWatchElement={bottomChromeElement}
-        onTypewriterBlocksChange={setTimelineTypewriterBlockIds}
+        onTypewriterBlocksChange={(blockIds) => {
+          setTimelineTypewriterBlockIds(blockIds);
+          projectionDeliveryDiagnostics.updateAnimatingBlocks(timeline.sessionId, blockIds);
+        }}
         onPlanResolve={(runId, planId, decision, guidance) => {
           requestFollowLatest();
           void resolvePlan(runId, planId, decision, guidance);

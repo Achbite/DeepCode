@@ -12,6 +12,7 @@ import type {
   LlmChatRequest,
   LlmChatResult,
   LlmChatStreamEvent,
+  ProjectionDelta,
   ToolCall,
 } from '@deepcode/protocol';
 import { buildSessionMemorySnapshot } from './context/memory.js';
@@ -21,6 +22,11 @@ import { CanonicalTimelineProjector } from './timelineDelta.js';
 import { SessionStorageClient } from './storageClient.js';
 import type { ProjectWorkingDirectory } from './context/types.js';
 import { planInteractionAwaitsDecision } from './run-state/planInteractionState.js';
+import {
+  ProjectionDeliveryRecorder,
+  projectionDeliveryContentMetadata,
+  projectionDeliveryMetadataForTimelineDelta,
+} from './projectionDelivery.js';
 
 declare const process: {
   argv: string[];
@@ -102,43 +108,53 @@ async function runAsk(request: HostBridgeRequest): Promise<HostBridgeResult> {
 
   const sessionId = sessionResult.session.id;
   const existingEvents = sessionResult.events ?? [];
+  const deliveryRecorder = createProjectionDeliveryRecorder(
+    apiBase,
+    sessionId,
+    request.hostRunId
+  );
   const projection = createProjectionPublishingDriver(
     apiBase,
     request.hostRunId,
     sessionId,
-    existingEvents
-  );
-  const driver = projection.driver;
-  const result = await driver.runUserTurn({
-    sessionId,
-    content,
-    attachments: request.attachments ?? [],
     existingEvents,
-    workspaceBinding: binding,
-    projectWorkingDirectory,
-    projectId: request.projectId,
-    projectKind: request.projectKind,
-    projectRootStatus: request.projectRootStatus,
-    profileId: request.profileId,
-    workflow: request.workflow,
-    requirementConfirmationMode: request.requirementConfirmationMode,
-    reviewContinuationMode: request.reviewContinuationMode,
-    interventionLevel: request.interventionLevel,
-    autonomyMode: request.autonomyMode,
-  });
-  await persistMemoryArchive(apiBase, result.session.id, result.events ?? [], binding, result.session, request.projectMemoryMode);
-  const timeline = projection.buildTimeline(result.events ?? []);
-  const finalText = extractFinalText(timeline);
-  const lifecycle = inferHostRunLifecycle(result.events, finalText);
-  return {
-    ok: true,
-    sessionId: result.session.id,
-    session: result.session,
-    events: result.events,
-    timeline,
-    finalText,
-    ...lifecycle,
-  };
+    deliveryRecorder
+  );
+  try {
+    const driver = projection.driver;
+    const result = await driver.runUserTurn({
+      sessionId,
+      content,
+      attachments: request.attachments ?? [],
+      existingEvents,
+      workspaceBinding: binding,
+      projectWorkingDirectory,
+      projectId: request.projectId,
+      projectKind: request.projectKind,
+      projectRootStatus: request.projectRootStatus,
+      profileId: request.profileId,
+      workflow: request.workflow,
+      requirementConfirmationMode: request.requirementConfirmationMode,
+      reviewContinuationMode: request.reviewContinuationMode,
+      interventionLevel: request.interventionLevel,
+      autonomyMode: request.autonomyMode,
+    });
+    await persistMemoryArchive(apiBase, result.session.id, result.events ?? [], binding, result.session, request.projectMemoryMode);
+    const timeline = projection.buildTimeline(result.events ?? []);
+    const finalText = extractFinalText(timeline);
+    const lifecycle = inferHostRunLifecycle(result.events, finalText);
+    return {
+      ok: true,
+      sessionId: result.session.id,
+      session: result.session,
+      events: result.events,
+      timeline,
+      finalText,
+      ...lifecycle,
+    };
+  } finally {
+    await deliveryRecorder?.close();
+  }
 }
 
 async function resolveDecision(request: HostBridgeRequest): Promise<HostBridgeResult> {
@@ -150,46 +166,56 @@ async function resolveDecision(request: HostBridgeRequest): Promise<HostBridgeRe
   const current = await getAgentSession(apiBase, request.sessionId);
   const binding = request.noWorkspace ? undefined : request.workspaceBinding ?? workspaceBindingFromPath(request.workspacePath);
   const projectWorkingDirectory = request.noWorkspace ? undefined : projectWorkingDirectoryFromBinding(binding, request.workspacePath);
+  const deliveryRecorder = createProjectionDeliveryRecorder(
+    apiBase,
+    request.sessionId,
+    request.hostRunId
+  );
   const projection = createProjectionPublishingDriver(
     apiBase,
     request.hostRunId,
     request.sessionId,
-    current.events
+    current.events,
+    deliveryRecorder
   );
-  const driver = projection.driver;
-  const result = await driver.resolveDecision({
-    sessionId: request.sessionId,
-    kind: request.decisionKind,
-    decision: request.decision,
-    guidance: request.guidance,
-    runId: request.runId,
-    targetId: request.targetId,
-    existingEvents: current.events,
-    workspaceBinding: binding,
-    projectWorkingDirectory,
-    projectId: request.projectId,
-    projectKind: request.projectKind,
-    projectRootStatus: request.projectRootStatus,
-    profileId: request.profileId,
-    workflow: request.workflow,
-    reviewContinuationMode: request.reviewContinuationMode,
-    interventionLevel: request.interventionLevel,
-    autonomyMode: request.autonomyMode,
-    projectMemoryMode: request.projectMemoryMode,
-  });
-  await persistMemoryArchive(apiBase, result.session.id, result.events ?? [], binding, result.session, request.projectMemoryMode);
-  const timeline = projection.buildTimeline(result.events ?? []);
-  const finalText = extractFinalText(timeline);
-  const lifecycle = inferHostRunLifecycle(result.events, finalText);
-  return {
-    ok: true,
-    sessionId: result.session.id,
-    session: result.session,
-    events: result.events,
-    timeline,
-    finalText,
-    ...lifecycle,
-  };
+  try {
+    const driver = projection.driver;
+    const result = await driver.resolveDecision({
+      sessionId: request.sessionId,
+      kind: request.decisionKind,
+      decision: request.decision,
+      guidance: request.guidance,
+      runId: request.runId,
+      targetId: request.targetId,
+      existingEvents: current.events,
+      workspaceBinding: binding,
+      projectWorkingDirectory,
+      projectId: request.projectId,
+      projectKind: request.projectKind,
+      projectRootStatus: request.projectRootStatus,
+      profileId: request.profileId,
+      workflow: request.workflow,
+      reviewContinuationMode: request.reviewContinuationMode,
+      interventionLevel: request.interventionLevel,
+      autonomyMode: request.autonomyMode,
+      projectMemoryMode: request.projectMemoryMode,
+    });
+    await persistMemoryArchive(apiBase, result.session.id, result.events ?? [], binding, result.session, request.projectMemoryMode);
+    const timeline = projection.buildTimeline(result.events ?? []);
+    const finalText = extractFinalText(timeline);
+    const lifecycle = inferHostRunLifecycle(result.events, finalText);
+    return {
+      ok: true,
+      sessionId: result.session.id,
+      session: result.session,
+      events: result.events,
+      timeline,
+      finalText,
+      ...lifecycle,
+    };
+  } finally {
+    await deliveryRecorder?.close();
+  }
 }
 
 async function persistMemoryArchive(
@@ -229,7 +255,8 @@ function createProjectionPublishingDriver(
   apiBase: string,
   hostRunId: string | undefined,
   sessionId: string,
-  initialEvents: AgentEvent[]
+  initialEvents: AgentEvent[],
+  deliveryRecorder?: ProjectionDeliveryRecorder
 ): {
   driver: SessionDriverLoop;
   buildTimeline: (events?: AgentEvent[]) => AgentTimelineResult;
@@ -244,9 +271,16 @@ function createProjectionPublishingDriver(
     llmChatStream: (request, onEvent) => llmChatStream(apiBase, request, onEvent),
     onProjectionDelta: hostRunId
       ? async (delta) => {
+          deliveryRecorder?.record({
+            stage: 'session.provider_delta_received',
+            turnId: delta.turnId,
+            op: delta.type,
+            ...projectionDeliveryContentMetadata(projectionDeltaContent(delta)),
+            result: 'accepted',
+          });
           const timelineDeltas = projector.push(delta);
           for (const timelineDelta of timelineDeltas) {
-            await postProjectionDelta(apiBase, hostRunId, timelineDelta);
+            await publishTimelineDelta(apiBase, hostRunId, timelineDelta, deliveryRecorder);
           }
         }
       : undefined,
@@ -271,7 +305,7 @@ function createProjectionPublishingDriver(
       committedEvents = response.data.events ?? nextEvents;
       if (hostRunId) {
         for (const timelineDelta of projectionCommit.deltas) {
-          await postProjectionDelta(apiBase, hostRunId, timelineDelta);
+          await publishTimelineDelta(apiBase, hostRunId, timelineDelta, deliveryRecorder);
         }
       }
       return response.data;
@@ -418,10 +452,65 @@ async function llmChatStream(
 }
 
 async function postProjectionDelta(apiBase: string, hostRunId: string, delta: AgentTimelineDelta): Promise<void> {
-  await postJson<ApiResponse<unknown>>(
+  const response = await postJson<ApiResponse<unknown>>(
     `${apiBase}/api/agent/sessions/${encodeURIComponent(delta.sessionId)}/runs/${encodeURIComponent(hostRunId)}/deltas`,
     delta
   );
+  if (!response.ok) {
+    throw new Error(response.message ?? response.error ?? 'post projection delta failed');
+  }
+}
+
+function createProjectionDeliveryRecorder(
+  apiBase: string,
+  sessionId: string,
+  hostRunId: string | undefined
+): ProjectionDeliveryRecorder | undefined {
+  if (!hostRunId) return undefined;
+  const client = new SessionStorageClient(apiBase);
+  return new ProjectionDeliveryRecorder(
+    (entries, signal) => client.appendProjectionDelivery(sessionId, entries, signal),
+    { sessionId, runId: hostRunId },
+    {
+      onError: (error) => {
+        process.stderr.write(`projection delivery archive skipped: ${error instanceof Error ? error.message : String(error)}\n`);
+      },
+    }
+  );
+}
+
+async function publishTimelineDelta(
+  apiBase: string,
+  hostRunId: string,
+  delta: AgentTimelineDelta,
+  recorder?: ProjectionDeliveryRecorder
+): Promise<void> {
+  recorder?.record(projectionDeliveryMetadataForTimelineDelta(
+    'session.timeline_delta_projected',
+    delta,
+    'accepted'
+  ));
+  try {
+    await postProjectionDelta(apiBase, hostRunId, delta);
+    recorder?.record(projectionDeliveryMetadataForTimelineDelta(
+      'session.timeline_delta_posted',
+      delta,
+      'sent'
+    ));
+  } catch (error) {
+    recorder?.record(projectionDeliveryMetadataForTimelineDelta(
+      'session.timeline_delta_post_failed',
+      delta,
+      'failed'
+    ));
+    throw error;
+  }
+}
+
+function projectionDeltaContent(delta: ProjectionDelta): string {
+  if (typeof delta.delta === 'string') return delta.delta;
+  if (typeof delta.summary === 'string') return delta.summary;
+  return '';
 }
 
 async function getJson<T>(url: string): Promise<T> {

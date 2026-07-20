@@ -178,7 +178,16 @@ pub(crate) async fn agent_session_run_delta(
     if !run_belongs_to_session(&state, &session_id, &run_id) {
         return ApiResponse::error("agent_run_not_found", "agent run not found");
     }
-    {
+    record_daemon_projection_delivery(
+        &state,
+        &session_id,
+        &run_id,
+        "daemon.timeline_delta_received",
+        Some(&body),
+        "accepted",
+        false,
+    );
+    let normalized_delta = {
         let mut deltas = state
             .session_run_deltas
             .lock()
@@ -196,7 +205,17 @@ pub(crate) async fn agent_session_run_delta(
             let overflow = queue.len() - MAX_RUN_DELTAS;
             queue.drain(0..overflow);
         }
-    }
+        queue.last().cloned().unwrap_or(Value::Null)
+    };
+    record_daemon_projection_delivery(
+        &state,
+        &session_id,
+        &run_id,
+        "daemon.timeline_delta_enqueued",
+        Some(&normalized_delta),
+        "accepted",
+        false,
+    );
     touch_run(&state, &run_id, None);
     run_response(&state, &session_id, &run_id)
 }
@@ -326,6 +345,15 @@ pub(crate) async fn agent_session_run_stream(
                 if seq <= sent_delta_seq {
                     continue;
                 }
+                record_daemon_projection_delivery(
+                    &stream_state,
+                    &session_id,
+                    &run_id,
+                    "daemon.sse_delta_sent",
+                    Some(delta),
+                    "sent",
+                    false,
+                );
                 yield sse_bytes("delta", json!({
                     "sessionId": session_id.clone(),
                     "runId": run_id.clone(),
@@ -350,6 +378,16 @@ pub(crate) async fn agent_session_run_stream(
                 let (terminal_events, terminal_event_count) =
                     terminal_stream_event_tail(&events, sent_event_count);
                 sent_event_count = terminal_event_count;
+                record_daemon_projection_delivery(
+                    &stream_state,
+                    &session_id,
+                    &run_id,
+                    "daemon.sse_terminal_sent",
+                    None,
+                    "sent",
+                    true,
+                );
+                flush_daemon_projection_delivery_terminal(&stream_state, &run_id).await;
                 yield sse_bytes("terminal", json!({
                     "sessionId": session_id.clone(),
                     "runId": run_id.clone(),

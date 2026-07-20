@@ -26,6 +26,71 @@ fn observability_redaction_preserves_cache_counts_and_removes_credentials() {
 }
 
 #[test]
+fn projection_delivery_sanitizer_keeps_only_metadata() {
+    let sanitized = sanitize_projection_delivery_entry(
+        "session-canonical",
+        json!({
+            "schemaVersion": "deepcode.session.projection-delivery.v1",
+            "stage": "gui.reducer_applied",
+            "at": "1784555088972",
+            "sessionId": "session-untrusted",
+            "runId": "run-1",
+            "turnId": "turn-1",
+            "blockId": "block-1",
+            "op": "text.append",
+            "revision": 2,
+            "deltaSeq": 4,
+            "deliveryMode": "live",
+            "charLength": 12,
+            "contentHash": "fnv1a32:12345678",
+            "result": "accepted",
+            "content": "must not be archived",
+            "payload": { "authorization": "Bearer secret" },
+            "rawEventRefs": ["evt-secret"],
+            "absolutePath": "/private/workspace/file.cpp"
+        }),
+    )
+    .expect("projection delivery metadata");
+
+    assert_eq!(sanitized["sessionId"], "session-canonical");
+    assert_eq!(sanitized["runId"], "run-1");
+    assert_eq!(sanitized["deltaSeq"], 4);
+    assert_eq!(sanitized["charLength"], 12);
+    assert!(sanitized.get("content").is_none());
+    assert!(sanitized.get("payload").is_none());
+    assert!(sanitized.get("rawEventRefs").is_none());
+    assert!(sanitized.get("absolutePath").is_none());
+}
+
+#[test]
+fn projection_delivery_sanitizer_rejects_unknown_schema() {
+    let result = sanitize_projection_delivery_entry(
+        "session-1",
+        json!({
+            "schemaVersion": "unknown",
+            "stage": "gui.reducer_applied",
+            "at": "1",
+            "runId": "run-1"
+        }),
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn projection_delivery_sanitizer_rejects_unknown_stage() {
+    let result = sanitize_projection_delivery_entry(
+        "session-1",
+        json!({
+            "schemaVersion": "deepcode.session.projection-delivery.v1",
+            "stage": "provider.secret_payload",
+            "at": "1",
+            "runId": "run-1"
+        }),
+    );
+    assert!(result.is_err());
+}
+
+#[test]
 fn wire_ledger_rejects_reasoning_records_and_strips_nested_reasoning_fields() {
     assert!(is_hidden_reasoning_wire_record(&json!({
         "kind": "hiddenReasoning",
@@ -551,6 +616,7 @@ fn append_session_projection_hydrates_restored_history_before_append() {
         kernel_events: Arc::new(Mutex::new(Vec::new())),
         session_runs: Arc::new(Mutex::new(HashMap::new())),
         session_run_deltas: Arc::new(Mutex::new(HashMap::new())),
+        projection_delivery: Arc::new(Mutex::new(ProjectionDeliveryBufferState::default())),
     };
 
     append_session_projection(&state, session_id, vec![appended_event.clone()]);

@@ -67,6 +67,7 @@ import type {
   SetBrowserInspectModeRequest,
   KernelHostInspectionQuery,
   KernelHostInspectionResult,
+  ProjectionDeliveryRecord,
 } from '@deepcode/protocol';
 import { activeT } from '../i18n';
 import { getKernelApiBase } from './hostTarget';
@@ -804,6 +805,19 @@ export function streamAgentRun(
     `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/runs/${encodeURIComponent(runId)}/stream${qs}`,
     onEvent,
     signal
+  );
+}
+
+export function appendProjectionDelivery(
+  sessionId: string,
+  entries: ProjectionDeliveryRecord[],
+  signal?: AbortSignal
+): Promise<ApiResponse<{ sessionId: string; appended: number }>> {
+  return sendJson<{ sessionId: string; appended: number }>(
+    `${API_BASE}/session-store/${encodeURIComponent(sessionId)}/projection-delivery`,
+    'POST',
+    { entries },
+    { signal }
   );
 }
 

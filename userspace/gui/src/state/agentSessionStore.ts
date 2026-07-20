@@ -50,6 +50,7 @@ import type { AgentRunResult, StartAgentRunRequest } from '../services/apiClient
 import { useSettingsStore } from './settingsStore';
 import { activeT } from '../i18n';
 import { useWorkspaceStore } from './workspaceStore';
+import { projectionDeliveryDiagnostics } from '../services/projectionDeliveryDiagnostics';
 
 interface PendingPermission {
   request: PermissionRequest;
@@ -299,6 +300,15 @@ function streamHandlersForSession(sessionId: string): {
       let timeline = state.timeline;
       for (const delta of deltas) {
         const applied = applyAgentTimelineDelta(timeline, delta);
+        projectionDeliveryDiagnostics.recordDelta(
+          applied.status === 'gap' ? 'gui.reducer_gap' : 'gui.reducer_applied',
+          delta,
+          applied.status === 'applied'
+            ? 'accepted'
+            : applied.status === 'gap'
+              ? 'gap'
+              : 'ignored'
+        );
         if (applied.status === 'gap') {
           needsSnapshot = true;
           break;
@@ -378,6 +388,7 @@ async function startAndWaitAgentRun(
   }
   let result = started.data;
   activeAgentRunIds.set(sessionId, result.run.runId);
+  projectionDeliveryDiagnostics.begin(sessionId, result.run.runId);
   const controller = new AbortController();
   let lastDeltaSeq = 0;
   let terminalStreamObserved = false;
@@ -392,6 +403,13 @@ async function startAndWaitAgentRun(
       if (isRecord(delta)) {
         if (delta.sessionId !== sessionId || delta.runId !== result.run.runId) return;
         const deltaSeq = typeof delta.deltaSeq === 'number' ? delta.deltaSeq : 0;
+        if (isAgentTimelineDelta(delta)) {
+          projectionDeliveryDiagnostics.recordDelta(
+            'gui.sse_delta_received',
+            delta,
+            deltaSeq > 0 && deltaSeq <= lastDeltaSeq ? 'ignored' : 'accepted'
+          );
+        }
         if (deltaSeq > 0 && deltaSeq <= lastDeltaSeq) return;
         if (deltaSeq > 0) lastDeltaSeq = deltaSeq;
         if (isAgentTimelineDelta(delta)) handlers.onDelta?.(delta);
@@ -403,6 +421,7 @@ async function startAndWaitAgentRun(
     if (event.event === 'terminal' && isRecord(data) && Array.isArray(data.events)) {
       handlers.onEvents?.(data.events.filter(isRecord) as unknown as AgentEvent[]);
       terminalStreamObserved = true;
+      projectionDeliveryDiagnostics.markTerminal(sessionId, result.run.runId);
       resolveTerminalStreamEvent?.();
     }
   }, { sinceEventCount: result.events.length }, controller.signal).catch(() => undefined);
@@ -417,6 +436,7 @@ async function startAndWaitAgentRun(
       }
       result = current.data;
     }
+    projectionDeliveryDiagnostics.markTerminal(sessionId, result.run.runId);
     return result;
   } finally {
     await Promise.race([streamDone, terminalStreamEvent, sleep(1000)]);

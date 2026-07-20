@@ -20,6 +20,7 @@ import {
   bufferedTypewriterNextIndex,
   type BufferedTypewriterSpeed,
 } from '../../utils/typewriterBuffer';
+import { projectionDeliveryDiagnostics } from '../../services/projectionDeliveryDiagnostics';
 
 interface DeepCodeTimelineProps {
   timeline: AgentTimelineResult;
@@ -72,6 +73,10 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
   const lastScrollTopRef = useRef(0);
   const lastTouchYRef = useRef<number | null>(null);
   const [showJumpToLatest, setShowJumpToLatest] = useState(false);
+  const deliverySessionIdRef = useRef('');
+  const releasedDeliverySignaturesRef = useRef<Set<string>>(new Set());
+  const renderedDeliverySignaturesRef = useRef<Set<string>>(new Set());
+  const settledDeliverySignaturesRef = useRef<Set<string>>(new Set());
   const scrollSignature = useMemo(
     () => timelineScrollSignature(viewWithActive, loading),
     [viewWithActive, loading]
@@ -136,7 +141,38 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
       next.set(blockId, textLength);
       return next;
     });
-  }, []);
+    const block = flattenTimelineBlocks(viewWithActive).find((candidate) => candidate.id === blockId);
+    if (!block) return;
+    const signature = deliverySignature(block);
+    if (settledDeliverySignaturesRef.current.has(signature)) return;
+    settledDeliverySignaturesRef.current.add(signature);
+    projectionDeliveryDiagnostics.recordBlock('gui.playback_settled', viewWithActive.sessionId, block);
+  }, [viewWithActive]);
+
+  useLayoutEffect(() => {
+    if (deliverySessionIdRef.current !== viewWithActive.sessionId) {
+      deliverySessionIdRef.current = viewWithActive.sessionId;
+      releasedDeliverySignaturesRef.current.clear();
+      renderedDeliverySignaturesRef.current.clear();
+      settledDeliverySignaturesRef.current.clear();
+    }
+    for (const block of flattenTimelineBlocks(viewWithActive)) {
+      if (!isVisibleTimelineBlock(block) || !playbackVisibleBlockIds.has(block.id)) continue;
+      const signature = deliverySignature(block);
+      if (!releasedDeliverySignaturesRef.current.has(signature)) {
+        releasedDeliverySignaturesRef.current.add(signature);
+        projectionDeliveryDiagnostics.recordBlock('gui.playback_released', viewWithActive.sessionId, block);
+      }
+      if (!renderedDeliverySignaturesRef.current.has(signature)) {
+        renderedDeliverySignaturesRef.current.add(signature);
+        projectionDeliveryDiagnostics.recordBlock('gui.render_committed', viewWithActive.sessionId, block);
+      }
+      if (!animatingBlockIds.has(block.id) && !settledDeliverySignaturesRef.current.has(signature)) {
+        settledDeliverySignaturesRef.current.add(signature);
+        projectionDeliveryDiagnostics.recordBlock('gui.playback_settled', viewWithActive.sessionId, block);
+      }
+    }
+  }, [animatingBlockIds, playbackVisibleBlockIds, viewWithActive]);
 
   const setFollowMode = useCallback((mode: TimelineFollowMode) => {
     followModeRef.current = mode;
@@ -378,6 +414,10 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
 
 function flattenTimelineBlocks(view: AgentTimelineResult): AgentTimelineBlock[] {
   return view.turns.flatMap((turn) => turn.blocks);
+}
+
+function deliverySignature(block: AgentTimelineBlock): string {
+  return `${block.id}:${block.revision ?? 0}:${(block.bodyMarkdown ?? block.summary ?? '').length}`;
 }
 
 
