@@ -143,10 +143,11 @@ export class ResourceRequestLoop {
       summary: resourcePacketSummary(packet),
       source: 'kernel',
       runId,
-      targets: packet.items.flatMap((item) => [
-        item.path,
-        item.manifestEntryId,
-      ]).filter((item): item is string => Boolean(item)),
+      targets: Array.from(new Set(
+        packet.items
+          .map((item) => item.path?.trim())
+          .filter((item): item is string => Boolean(item))
+      )),
       itemCount: packet.items.length,
     });
   }

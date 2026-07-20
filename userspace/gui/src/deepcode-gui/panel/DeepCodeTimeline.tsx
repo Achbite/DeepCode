@@ -415,16 +415,11 @@ function visibleActivityTargets(targets: string[]): string[] {
   const visible: string[] = [];
   for (const target of targets) {
     const normalized = target.trim();
-    if (!normalized || isInternalDisplayToken(normalized)) continue;
+    if (!normalized) continue;
     if (visible.includes(normalized)) continue;
     visible.push(normalized);
   }
   return visible;
-}
-
-function isInternalDisplayToken(value: string): boolean {
-  return /^(native-call|attachment|work-unit|resource-request|resource-item|kernel-activity)[_-]/i.test(value) ||
-    /^turn-[a-z_]+-/i.test(value);
 }
 
 function displayToolName(toolName: string): string {

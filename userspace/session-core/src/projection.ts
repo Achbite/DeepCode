@@ -18,7 +18,11 @@ import {
 } from '@deepcode/protocol';
 import type { ResourcePacket, ResourceRequest } from './context/types.js';
 import type { ReviewPacket } from './review/types.js';
-import { isInternalOrchestrationStage, isMainTimelineActivityShape } from './timelineFilter.js';
+import {
+  isExplicitlyHiddenTimelineEvent,
+  isInternalOrchestrationStage,
+  isMainTimelineActivityShape,
+} from './timelineFilter.js';
 import type { TranscriptMessageEntry } from './transcript.js';
 import type { DynamicWorkflowPlan } from './workflow/types.js';
 import {
@@ -188,7 +192,7 @@ export function buildNarrativeTimelineProjection(input: NarrativeTimelineProject
     if (event.kind === 'cache_telemetry') {
       return;
     }
-    if (isDebugTimelineEvent(event)) {
+    if (isExplicitlyHiddenTimelineEvent(event)) {
       return;
     }
     if (isProjectionTimelineHiddenEvent(event)) {
@@ -252,7 +256,9 @@ export function buildNarrativeTimelineProjection(input: NarrativeTimelineProject
   resolveTimelineInteractionBlocks(turns, input.events);
   stabilizeNarrativeBlockIds(turns);
 
-  const rawEventRefs = input.events.map(eventRefForAgentEvent);
+  const rawEventRefs = Array.from(new Set(
+    turns.flatMap((turn) => turn.blocks.flatMap((block) => block.rawEventRefs ?? []))
+  ));
   const blockIdsByEventId = timelineBlockIdsByEventId(turns);
   const implementationTaskItems = input.events.flatMap((event, index) =>
     taskPlanTaskProjectionItems(input.events, event, index, blockIdsByEventId.get(event.id))
@@ -2074,11 +2080,6 @@ function stringValueFromPayload(payload: unknown, key: string): string | undefin
   const value = (payload as Record<string, unknown>)[key];
   if (typeof value === 'boolean') return String(value);
   return typeof value === 'string' && value.trim() ? value : undefined;
-}
-
-function isDebugTimelineEvent(event: AgentEvent): boolean {
-  if (event.kind.startsWith('trace/')) return true;
-  return stringValueFromPayload(event.payload, 'visibility') === 'debug';
 }
 
 // reasoning channel 的 assistant_msg 若正文为空或仅含空代码围栏，则视为空块，不进入时间线。
