@@ -81,9 +81,9 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
   }, [profileId, setProfileId]);
 
   useEffect(() => {
-    void loadOrCreate();
     void refreshSessions();
-  }, [loadOrCreate, refreshSessions, workspaceScopeKey]);
+    if (!forceHome) void loadOrCreate();
+  }, [forceHome, loadOrCreate, refreshSessions, workspaceScopeKey]);
 
   const activeSessionTitle = displaySessionTitle(language, session?.title);
   const hasTimelineTurns = timeline.turns.length > 0;

@@ -677,7 +677,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
     if (!draftTargetProjectId) return true;
     const targetProjectId = draftTargetProjectId;
     pendingProjectSendRef.current = null;
-    const nextSession = await createNewSession({ reuseEmpty: false, projectId: targetProjectId });
+    const nextSession = await createNewSession({ reuseEmpty: true, projectId: targetProjectId });
     if (!nextSession?.id) {
       return false;
     }

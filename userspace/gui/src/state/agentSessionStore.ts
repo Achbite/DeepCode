@@ -44,6 +44,7 @@ import {
   startAgentRun,
   streamAgentRun,
   submitAgentRunGuidance,
+  updateAgentSession,
 } from '../services/runtimeAdapter';
 import type { AgentRunResult, StartAgentRunRequest } from '../services/apiClient';
 import { useSettingsStore } from './settingsStore';
@@ -547,12 +548,33 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
   },
 
   createNewSession: async (options = {}) => {
+    if (get().loading) await waitForAgentSessionLoad();
     const currentSession = get().session;
     if (
       options.reuseEmpty !== false &&
       isEmptyAgentSession(currentSession) &&
       get().localWorkspaceScopeKey === currentWorkspaceScopeKey()
     ) {
+      if (options.projectId && currentSession?.projectId !== options.projectId) {
+        const rebound = await updateAgentSession(currentSession!.id, {
+          projectId: options.projectId,
+        });
+        if (!rebound.ok || !rebound.data) {
+          set({ errorMessage: rebound.message ?? 'Agent session project binding failed' });
+          return null;
+        }
+        set((state) => ({
+          session: rebound.data!.session,
+          sessions: [
+            rebound.data!.session,
+            ...state.sessions.filter((item) => item.id !== rebound.data!.session.id),
+          ],
+          currentSessionId: rebound.data!.session.id,
+          events: rebound.data!.events,
+          errorMessage: null,
+        }));
+        return rebound.data.session;
+      }
       set({ errorMessage: null });
       return currentSession ?? null;
     }
