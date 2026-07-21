@@ -169,7 +169,7 @@
     "settings.search.placeholder": "搜索设置",
     "settings.nav.workspace": "工作区",
     "settings.nav.common": "通用设置",
-    "settings.nav.gui": "GUI 设置",
+    "settings.nav.gui": "外观",
     "settings.nav.agent": "Agent 设置",
     "settings.nav.permissions": "权限",
     "settings.nav.token": "Token 统计",
@@ -184,7 +184,8 @@
     "settings.navGroup.models": "模型与扩展",
     "settings.navGroup.system": "系统",
     "settings.common.title": "通用设置",
-    "settings.gui.title": "GUI 设置",
+    "settings.gui.title": "外观",
+    "settings.gui.appearance": "主题",
     "settings.gui.preferences": "界面偏好",
     "settings.gui.scopeHint": "这些设置只改变 DeepCode-GUI 的呈现，不改变共享 timeline 事实或 Kernel 权限。",
     "settings.agent.title": "Agent 设置",
@@ -1069,8 +1070,8 @@
       }
     },
     "gui.colorTheme": {
-      "label": "DeepCode-GUI 主题",
-      "description": "设置轻量 DeepCode-GUI 壳的主题，不影响编辑器工作台主题。",
+      "label": "主题模式",
+      "description": "选择系统、浅色或深色外观；系统模式会随 macOS 外观实时切换。",
       "options": {
         "system": "跟随系统",
         "light": "明亮",
@@ -1078,13 +1079,29 @@
       }
     },
     "gui.accentColor": {
-      "label": "DeepCode-GUI 强调色",
-      "description": "设置 DeepCode-GUI 交互控件使用的统一强调色。",
+      "label": "强调色",
+      "description": "用于主要操作、活动状态、焦点和流式光标的统一颜色。",
       "options": {
         "blue": "蓝色",
         "purple": "紫色",
         "green": "绿色"
       }
+    },
+    "gui.timelineDensity": {
+      "label": "时间线密度",
+      "description": "调整会话事件、工具活动和 Agent 输出之间的垂直间距。",
+      "options": {
+        "normal": "标准",
+        "compact": "紧凑"
+      }
+    },
+    "gui.typewriterAnimation": {
+      "label": "打字机动画",
+      "description": "渐进显示 Agent 叙述、推理和最终回复。"
+    },
+    "gui.collapseCompletedThinking": {
+      "label": "折叠已完成推理",
+      "description": "运行收束后自动折叠已经完成的推理块。"
     },
     "workbench.styleTokenOverrides": {
       "label": "样式 Token 覆盖",

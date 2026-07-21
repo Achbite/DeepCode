@@ -1,26 +1,126 @@
 :root[data-product='deepcode-gui'] {
+  /* Registered light palette. Applied tokens below are the only rendering surface. */
+  --dc-theme-light-background: #f4f4f6;
+  --dc-theme-light-sidebar: #f0f0f2;
+  --dc-theme-light-surface: #ffffff;
+  --dc-theme-light-surface-subtle: #f7f7f8;
+  --dc-theme-light-surface-raised: #ffffff;
+  --dc-theme-light-surface-hover: #ececef;
+  --dc-theme-light-surface-active: #e5e5e9;
+  --dc-theme-light-border: rgba(0, 0, 0, 0.07);
+  --dc-theme-light-border-strong: rgba(0, 0, 0, 0.13);
+  --dc-theme-light-foreground: #1c1c1e;
+  --dc-theme-light-foreground-strong: #0f0f10;
+  --dc-theme-light-muted: #636366;
+  --dc-theme-light-faint: #8e8e93;
+  --dc-theme-light-success: #16845b;
+  --dc-theme-light-success-soft: rgba(22, 132, 91, 0.1);
+  --dc-theme-light-warning: #a66308;
+  --dc-theme-light-warning-soft: rgba(166, 99, 8, 0.1);
+  --dc-theme-light-danger: #d13c36;
+  --dc-theme-light-danger-soft: rgba(209, 60, 54, 0.1);
+  --dc-theme-light-code-background: #f1f1f3;
+  --dc-theme-light-shadow-small:
+    3px 5px 12px -8px rgba(15, 15, 16, 0.22),
+    1px 2px 5px -4px rgba(15, 15, 16, 0.12);
+  --dc-theme-light-shadow-panel:
+    8px 13px 28px -13px rgba(15, 15, 16, 0.28),
+    2px 5px 12px -7px rgba(15, 15, 16, 0.15),
+    inset 1px 1px 0 rgba(255, 255, 255, 0.72);
+  --dc-theme-light-shadow-inset: inset 0 1px 1px rgba(255, 255, 255, 0.68);
+
+  /* Registered dark palette. */
+  --dc-theme-dark-background: #09090b;
+  --dc-theme-dark-sidebar: #111114;
+  --dc-theme-dark-surface: #18181b;
+  --dc-theme-dark-surface-subtle: #202024;
+  --dc-theme-dark-surface-raised: #242429;
+  --dc-theme-dark-surface-hover: #2a2a30;
+  --dc-theme-dark-surface-active: #303036;
+  --dc-theme-dark-border: rgba(255, 255, 255, 0.065);
+  --dc-theme-dark-border-strong: rgba(255, 255, 255, 0.13);
+  --dc-theme-dark-foreground: #f4f4f5;
+  --dc-theme-dark-foreground-strong: #ffffff;
+  --dc-theme-dark-muted: #a1a1aa;
+  --dc-theme-dark-faint: #71717a;
+  --dc-theme-dark-success: #34d399;
+  --dc-theme-dark-success-soft: rgba(52, 211, 153, 0.12);
+  --dc-theme-dark-warning: #f0b85a;
+  --dc-theme-dark-warning-soft: rgba(240, 184, 90, 0.12);
+  --dc-theme-dark-danger: #ff716b;
+  --dc-theme-dark-danger-soft: rgba(255, 113, 107, 0.12);
+  --dc-theme-dark-code-background: #101013;
+  --dc-theme-dark-shadow-small:
+    4px 6px 14px -8px rgba(0, 0, 0, 0.55),
+    1px 2px 6px -4px rgba(0, 0, 0, 0.38);
+  --dc-theme-dark-shadow-panel:
+    10px 15px 32px -14px rgba(0, 0, 0, 0.65),
+    2px 5px 13px -7px rgba(0, 0, 0, 0.42),
+    inset 1px 1px 0 rgba(255, 255, 255, 0.08);
+  --dc-theme-dark-shadow-inset: inset 0 1px 1px rgba(255, 255, 255, 0.05);
+
+  /* Registered accents for each resolved theme. */
+  --dc-accent-blue-light: #007aff;
+  --dc-accent-blue-light-contrast: #ffffff;
+  --dc-accent-blue-light-soft: rgba(0, 122, 255, 0.1);
+  --dc-accent-blue-light-border: rgba(0, 122, 255, 0.23);
+  --dc-accent-blue-light-focus: rgba(0, 122, 255, 0.42);
+  --dc-accent-blue-dark: #0a84ff;
+  --dc-accent-blue-dark-contrast: #ffffff;
+  --dc-accent-blue-dark-soft: rgba(10, 132, 255, 0.14);
+  --dc-accent-blue-dark-border: rgba(10, 132, 255, 0.3);
+  --dc-accent-blue-dark-focus: rgba(10, 132, 255, 0.52);
+  --dc-accent-purple-light: #6366f1;
+  --dc-accent-purple-light-contrast: #ffffff;
+  --dc-accent-purple-light-soft: rgba(99, 102, 241, 0.1);
+  --dc-accent-purple-light-border: rgba(99, 102, 241, 0.24);
+  --dc-accent-purple-light-focus: rgba(99, 102, 241, 0.42);
+  --dc-accent-purple-dark: #818cf8;
+  --dc-accent-purple-dark-contrast: #17121f;
+  --dc-accent-purple-dark-soft: rgba(129, 140, 248, 0.14);
+  --dc-accent-purple-dark-border: rgba(129, 140, 248, 0.3);
+  --dc-accent-purple-dark-focus: rgba(129, 140, 248, 0.5);
+  --dc-accent-green-light: #10b981;
+  --dc-accent-green-light-contrast: #071b14;
+  --dc-accent-green-light-soft: rgba(16, 185, 129, 0.1);
+  --dc-accent-green-light-border: rgba(16, 185, 129, 0.24);
+  --dc-accent-green-light-focus: rgba(16, 185, 129, 0.42);
+  --dc-accent-green-dark: #34d399;
+  --dc-accent-green-dark-contrast: #071b14;
+  --dc-accent-green-dark-soft: rgba(52, 211, 153, 0.14);
+  --dc-accent-green-dark-border: rgba(52, 211, 153, 0.3);
+  --dc-accent-green-dark-focus: rgba(52, 211, 153, 0.5);
+
   color-scheme: light;
-  --dc-background: #f4f4f6;
-  --dc-sidebar: #f0f0f2;
-  --dc-surface: #ffffff;
-  --dc-surface-subtle: #f7f7f8;
-  --dc-surface-raised: #ffffff;
-  --dc-surface-hover: #ececef;
-  --dc-surface-active: #e5e5e9;
-  --dc-border: rgba(0, 0, 0, 0.07);
-  --dc-border-strong: rgba(0, 0, 0, 0.13);
-  --dc-foreground: #1c1c1e;
-  --dc-foreground-strong: #0f0f10;
-  --dc-muted: #636366;
-  --dc-faint: #8e8e93;
-  --dc-accent: #007aff;
-  --dc-accent-soft: rgba(0, 122, 255, 0.1);
-  --dc-accent-border: rgba(0, 122, 255, 0.23);
-  --dc-accent-contrast: #ffffff;
-  --dc-focus-ring: rgba(0, 122, 255, 0.42);
-  --dc-success: #16845b;
-  --dc-warning: #a66308;
-  --dc-danger: #d13c36;
+  --dc-background: var(--dc-theme-light-background);
+  --dc-sidebar: var(--dc-theme-light-sidebar);
+  --dc-surface: var(--dc-theme-light-surface);
+  --dc-surface-subtle: var(--dc-theme-light-surface-subtle);
+  --dc-surface-raised: var(--dc-theme-light-surface-raised);
+  --dc-surface-hover: var(--dc-theme-light-surface-hover);
+  --dc-surface-active: var(--dc-theme-light-surface-active);
+  --dc-border: var(--dc-theme-light-border);
+  --dc-border-strong: var(--dc-theme-light-border-strong);
+  --dc-foreground: var(--dc-theme-light-foreground);
+  --dc-foreground-strong: var(--dc-theme-light-foreground-strong);
+  --dc-muted: var(--dc-theme-light-muted);
+  --dc-faint: var(--dc-theme-light-faint);
+  --dc-success: var(--dc-theme-light-success);
+  --dc-success-soft: var(--dc-theme-light-success-soft);
+  --dc-warning: var(--dc-theme-light-warning);
+  --dc-warning-soft: var(--dc-theme-light-warning-soft);
+  --dc-danger: var(--dc-theme-light-danger);
+  --dc-danger-soft: var(--dc-theme-light-danger-soft);
+  --dc-code-background: var(--dc-theme-light-code-background);
+  --dc-shadow-small: var(--dc-theme-light-shadow-small);
+  --dc-shadow-panel: var(--dc-theme-light-shadow-panel);
+  --dc-shadow-inset: var(--dc-theme-light-shadow-inset);
+  --dc-accent: var(--dc-accent-blue-light);
+  --dc-accent-soft: var(--dc-accent-blue-light-soft);
+  --dc-accent-border: var(--dc-accent-blue-light-border);
+  --dc-accent-contrast: var(--dc-accent-blue-light-contrast);
+  --dc-focus-ring: var(--dc-accent-blue-light-focus);
+
   --dc-font-ui: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Segoe UI", sans-serif;
   --dc-font-mono: ui-monospace, "SFMono-Regular", Menlo, Monaco, Consolas, "Liberation Mono", monospace;
   --dc-font-micro: 11px;
@@ -40,90 +140,85 @@
   --dc-radius-outer: 16px;
   --dc-radius-inner: 12px;
   --dc-radius-control: 8px;
-  --dc-shadow-small:
-    3px 5px 12px -8px rgba(15, 15, 16, 0.22),
-    1px 2px 5px -4px rgba(15, 15, 16, 0.12);
-  --dc-shadow-panel:
-    8px 13px 28px -13px rgba(15, 15, 16, 0.28),
-    2px 5px 12px -7px rgba(15, 15, 16, 0.15),
-    inset 1px 1px 0 rgba(255, 255, 255, 0.72);
 }
 
 :root[data-product='deepcode-gui'][data-theme='dark'],
 :root[data-product='deepcode-gui'][data-theme='deepcode-gui-dark'] {
   color-scheme: dark;
-  --dc-background: #09090b;
-  --dc-sidebar: #111114;
-  --dc-surface: #18181b;
-  --dc-surface-subtle: #202024;
-  --dc-surface-raised: #242429;
-  --dc-surface-hover: #2a2a30;
-  --dc-surface-active: #303036;
-  --dc-border: rgba(255, 255, 255, 0.065);
-  --dc-border-strong: rgba(255, 255, 255, 0.13);
-  --dc-foreground: #f4f4f5;
-  --dc-foreground-strong: #ffffff;
-  --dc-muted: #a1a1aa;
-  --dc-faint: #71717a;
-  --dc-accent: #0a84ff;
-  --dc-accent-soft: rgba(10, 132, 255, 0.14);
-  --dc-accent-border: rgba(10, 132, 255, 0.3);
-  --dc-accent-contrast: #ffffff;
-  --dc-focus-ring: rgba(10, 132, 255, 0.52);
-  --dc-success: #34d399;
-  --dc-warning: #f0b85a;
-  --dc-danger: #ff716b;
-  --dc-shadow-small:
-    4px 6px 14px -8px rgba(0, 0, 0, 0.55),
-    1px 2px 6px -4px rgba(0, 0, 0, 0.38);
-  --dc-shadow-panel:
-    10px 15px 32px -14px rgba(0, 0, 0, 0.65),
-    2px 5px 13px -7px rgba(0, 0, 0, 0.42),
-    inset 1px 1px 0 rgba(255, 255, 255, 0.08);
+  --dc-background: var(--dc-theme-dark-background);
+  --dc-sidebar: var(--dc-theme-dark-sidebar);
+  --dc-surface: var(--dc-theme-dark-surface);
+  --dc-surface-subtle: var(--dc-theme-dark-surface-subtle);
+  --dc-surface-raised: var(--dc-theme-dark-surface-raised);
+  --dc-surface-hover: var(--dc-theme-dark-surface-hover);
+  --dc-surface-active: var(--dc-theme-dark-surface-active);
+  --dc-border: var(--dc-theme-dark-border);
+  --dc-border-strong: var(--dc-theme-dark-border-strong);
+  --dc-foreground: var(--dc-theme-dark-foreground);
+  --dc-foreground-strong: var(--dc-theme-dark-foreground-strong);
+  --dc-muted: var(--dc-theme-dark-muted);
+  --dc-faint: var(--dc-theme-dark-faint);
+  --dc-success: var(--dc-theme-dark-success);
+  --dc-success-soft: var(--dc-theme-dark-success-soft);
+  --dc-warning: var(--dc-theme-dark-warning);
+  --dc-warning-soft: var(--dc-theme-dark-warning-soft);
+  --dc-danger: var(--dc-theme-dark-danger);
+  --dc-danger-soft: var(--dc-theme-dark-danger-soft);
+  --dc-code-background: var(--dc-theme-dark-code-background);
+  --dc-shadow-small: var(--dc-theme-dark-shadow-small);
+  --dc-shadow-panel: var(--dc-theme-dark-shadow-panel);
+  --dc-shadow-inset: var(--dc-theme-dark-shadow-inset);
 }
 
 :root[data-product='deepcode-gui'][data-accent='blue'] {
-  --dc-accent: #007aff;
-  --dc-accent-soft: rgba(0, 122, 255, 0.1);
-  --dc-accent-border: rgba(0, 122, 255, 0.23);
-  --dc-focus-ring: rgba(0, 122, 255, 0.42);
+  --dc-accent: var(--dc-accent-blue-light);
+  --dc-accent-soft: var(--dc-accent-blue-light-soft);
+  --dc-accent-border: var(--dc-accent-blue-light-border);
+  --dc-accent-contrast: var(--dc-accent-blue-light-contrast);
+  --dc-focus-ring: var(--dc-accent-blue-light-focus);
 }
 
-:root[data-product='deepcode-gui'][data-theme='dark'][data-accent='blue'] {
-  --dc-accent: #0a84ff;
-  --dc-accent-soft: rgba(10, 132, 255, 0.14);
-  --dc-accent-border: rgba(10, 132, 255, 0.3);
-  --dc-focus-ring: rgba(10, 132, 255, 0.52);
+:root[data-product='deepcode-gui'][data-theme='dark'][data-accent='blue'],
+:root[data-product='deepcode-gui'][data-theme='deepcode-gui-dark'][data-accent='blue'] {
+  --dc-accent: var(--dc-accent-blue-dark);
+  --dc-accent-soft: var(--dc-accent-blue-dark-soft);
+  --dc-accent-border: var(--dc-accent-blue-dark-border);
+  --dc-accent-contrast: var(--dc-accent-blue-dark-contrast);
+  --dc-focus-ring: var(--dc-accent-blue-dark-focus);
 }
 
 :root[data-product='deepcode-gui'][data-accent='purple'] {
-  --dc-accent: #7c3aed;
-  --dc-accent-soft: rgba(124, 58, 237, 0.11);
-  --dc-accent-border: rgba(124, 58, 237, 0.25);
-  --dc-focus-ring: rgba(124, 58, 237, 0.42);
+  --dc-accent: var(--dc-accent-purple-light);
+  --dc-accent-soft: var(--dc-accent-purple-light-soft);
+  --dc-accent-border: var(--dc-accent-purple-light-border);
+  --dc-accent-contrast: var(--dc-accent-purple-light-contrast);
+  --dc-focus-ring: var(--dc-accent-purple-light-focus);
 }
 
-:root[data-product='deepcode-gui'][data-theme='dark'][data-accent='purple'] {
-  --dc-accent: #a78bfa;
-  --dc-accent-soft: rgba(167, 139, 250, 0.15);
-  --dc-accent-border: rgba(167, 139, 250, 0.31);
-  --dc-accent-contrast: #17121f;
-  --dc-focus-ring: rgba(167, 139, 250, 0.54);
+:root[data-product='deepcode-gui'][data-theme='dark'][data-accent='purple'],
+:root[data-product='deepcode-gui'][data-theme='deepcode-gui-dark'][data-accent='purple'] {
+  --dc-accent: var(--dc-accent-purple-dark);
+  --dc-accent-soft: var(--dc-accent-purple-dark-soft);
+  --dc-accent-border: var(--dc-accent-purple-dark-border);
+  --dc-accent-contrast: var(--dc-accent-purple-dark-contrast);
+  --dc-focus-ring: var(--dc-accent-purple-dark-focus);
 }
 
 :root[data-product='deepcode-gui'][data-accent='green'] {
-  --dc-accent: #16845b;
-  --dc-accent-soft: rgba(22, 132, 91, 0.11);
-  --dc-accent-border: rgba(22, 132, 91, 0.26);
-  --dc-focus-ring: rgba(22, 132, 91, 0.42);
+  --dc-accent: var(--dc-accent-green-light);
+  --dc-accent-soft: var(--dc-accent-green-light-soft);
+  --dc-accent-border: var(--dc-accent-green-light-border);
+  --dc-accent-contrast: var(--dc-accent-green-light-contrast);
+  --dc-focus-ring: var(--dc-accent-green-light-focus);
 }
 
-:root[data-product='deepcode-gui'][data-theme='dark'][data-accent='green'] {
-  --dc-accent: #34d399;
-  --dc-accent-soft: rgba(52, 211, 153, 0.15);
-  --dc-accent-border: rgba(52, 211, 153, 0.31);
-  --dc-accent-contrast: #071b14;
-  --dc-focus-ring: rgba(52, 211, 153, 0.5);
+:root[data-product='deepcode-gui'][data-theme='dark'][data-accent='green'],
+:root[data-product='deepcode-gui'][data-theme='deepcode-gui-dark'][data-accent='green'] {
+  --dc-accent: var(--dc-accent-green-dark);
+  --dc-accent-soft: var(--dc-accent-green-dark-soft);
+  --dc-accent-border: var(--dc-accent-green-dark-border);
+  --dc-accent-contrast: var(--dc-accent-green-dark-contrast);
+  --dc-focus-ring: var(--dc-accent-green-dark-focus);
 }
 
 :root[data-product='deepcode-gui'] body {

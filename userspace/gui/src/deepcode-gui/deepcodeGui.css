@@ -1472,6 +1472,17 @@ button {
 
 .agent-composer__footer-left {
   min-width: 0;
+  display: flex;
+  align-items: center;
+}
+
+.agent-composer__footer-right {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-left: auto;
 }
 
 .agent-composer__attach-wrap {

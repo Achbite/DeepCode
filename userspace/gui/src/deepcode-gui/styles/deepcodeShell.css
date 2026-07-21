@@ -430,6 +430,39 @@
   --danger: var(--dc-danger);
 }
 
+:root[data-product='deepcode-gui'] .deepcode-gui-workbench {
+  --canvas: var(--dc-background);
+  --line: var(--dc-border);
+  --line-soft: var(--dc-border);
+  --line-strong: var(--dc-border-strong);
+  --panel: var(--dc-surface);
+  --panel-soft: var(--dc-surface-subtle);
+  --panel-raised: var(--dc-surface-raised);
+  --text: var(--dc-foreground);
+  --muted: var(--dc-muted);
+  --faint: var(--dc-faint);
+  --accent: var(--dc-accent);
+  --accent-soft: var(--dc-accent-soft);
+  --ok: var(--dc-success);
+  --warn: var(--dc-warning);
+  --danger: var(--dc-danger);
+  --bg-app: var(--dc-background);
+  --bg-panel: var(--dc-surface);
+  --bg-surface: var(--dc-surface-subtle);
+  --text-main: var(--dc-foreground);
+  --text-strong: var(--dc-foreground-strong);
+  --text-muted: var(--dc-muted);
+  --radius-sm: calc(var(--dc-radius-control) / 2);
+  --radius-md: var(--dc-radius-control);
+  --radius-lg: var(--dc-radius-inner);
+  --shadow-sm: var(--dc-shadow-small);
+  --shadow-md: var(--dc-shadow-panel);
+  --shadow-inset: var(--dc-shadow-inset);
+  --terminal-bg: var(--dc-code-background);
+  background: var(--dc-background);
+  color: var(--dc-foreground);
+}
+
 :root[data-product='deepcode-gui'] body {
   background: var(--dc-background);
   color: var(--dc-foreground);
@@ -513,8 +546,9 @@
 }
 
 .deepcode-session-model__selector select {
-  width: min(330px, 30vw);
-  min-width: 148px;
+  width: auto;
+  min-width: 124px;
+  max-width: min(190px, 24vw);
   height: 28px;
   overflow: hidden;
   border: 1px solid var(--dc-border);
@@ -584,7 +618,7 @@
 
 @media (max-width: 760px) {
   .deepcode-session-model__selector select {
-    width: min(230px, 46vw);
-    min-width: 112px;
+    min-width: 104px;
+    max-width: min(150px, 36vw);
   }
 }

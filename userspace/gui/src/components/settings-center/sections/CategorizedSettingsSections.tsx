@@ -8,6 +8,7 @@ import {
   useSettingsStore,
   type SettingDefinition,
 } from '../../../state/settingsStore';
+import GuiAppearanceSettings from '../GuiAppearanceSettings';
 import SettingsField from '../SettingsField';
 
 interface RuntimeProps {
@@ -25,10 +26,13 @@ interface PlaceholderProps {
   integration: 'github' | 'skill' | 'mcp';
 }
 
-const GUI_SETTING_KEYS = [
-  'workbench.language',
+const GUI_APPEARANCE_SETTING_KEYS = [
   'gui.colorTheme',
   'gui.accentColor',
+] as const;
+
+const GUI_INTERFACE_SETTING_KEYS = [
+  'workbench.language',
   'gui.timelineDensity',
   'gui.typewriterAnimation',
   'gui.collapseCompletedThinking',
@@ -171,34 +175,48 @@ export const GuiSettingsSection: React.FC<RuntimeProps> = ({
   const language = normalizeUiLanguage(effectiveSettings['workbench.language']);
   const errorMessage = useSettingsStore((state) => state.errorMessage);
   const storePath = useSettingsStore((state) => state.storePath);
-  const definitions = useMemo(
-    () => definitionsForKeys(GUI_SETTING_KEYS, language, query),
+  const appearanceDefinitions = useMemo(
+    () => definitionsForKeys(GUI_APPEARANCE_SETTING_KEYS, language, query),
     [language, query]
   );
+  const interfaceDefinitions = useMemo(
+    () => definitionsForKeys(GUI_INTERFACE_SETTING_KEYS, language, query),
+    [language, query]
+  );
+  const hasSearchMatch = appearanceDefinitions.length > 0 || interfaceDefinitions.length > 0;
 
   return (
     <div>
       <h2 className="settings-title">{t(language, 'settings.gui.title')}</h2>
-      <div className="settings-card">
-        <h3 className="settings-card__title">{t(language, 'settings.runtime.title')}</h3>
-        <table className="settings-kv">
-          <tbody>
-            <tr><td>{t(language, 'settings.runtime.product')}</td><td>DeepCode</td></tr>
-            <tr><td>{t(language, 'settings.runtime.serverVersion')}</td><td>{serverVersion ?? '-'}</td></tr>
-            <tr><td>{t(language, 'settings.runtime.apiStatus')}</td><td>{apiStatus}</td></tr>
-            <tr><td>{t(language, 'settings.runtime.wsStatus')}</td><td>{wsStatus}</td></tr>
-            <tr><td>{t(language, 'settings.runtime.userSettingsFile')}</td><td>{storePath ?? t(language, 'settings.runtime.notLoaded')}</td></tr>
-          </tbody>
-        </table>
-        {errorMessage && <div className="settings-error">{errorMessage}</div>}
-      </div>
-      <SettingsCard
-        title={t(language, 'settings.gui.preferences')}
-        definitions={definitions}
-        language={language}
-        emptyText={t(language, 'settings.noSearchMatch')}
-        hint={t(language, 'settings.gui.scopeHint')}
-      />
+      <GuiAppearanceSettings definitions={appearanceDefinitions} language={language} />
+      {interfaceDefinitions.length > 0 && (
+        <SettingsCard
+          title={t(language, 'settings.gui.preferences')}
+          definitions={interfaceDefinitions}
+          language={language}
+          emptyText={t(language, 'settings.noSearchMatch')}
+        />
+      )}
+      {query.trim() && !hasSearchMatch && (
+        <div className="settings-card">
+          <div className="settings-card__body">{t(language, 'settings.noSearchMatch')}</div>
+        </div>
+      )}
+      {!query.trim() && (
+        <div className="settings-card settings-runtime-card">
+          <h3 className="settings-card__title">{t(language, 'settings.runtime.title')}</h3>
+          <table className="settings-kv">
+            <tbody>
+              <tr><td>{t(language, 'settings.runtime.product')}</td><td>DeepCode</td></tr>
+              <tr><td>{t(language, 'settings.runtime.serverVersion')}</td><td>{serverVersion ?? '-'}</td></tr>
+              <tr><td>{t(language, 'settings.runtime.apiStatus')}</td><td>{apiStatus}</td></tr>
+              <tr><td>{t(language, 'settings.runtime.wsStatus')}</td><td>{wsStatus}</td></tr>
+              <tr><td>{t(language, 'settings.runtime.userSettingsFile')}</td><td>{storePath ?? t(language, 'settings.runtime.notLoaded')}</td></tr>
+            </tbody>
+          </table>
+          {errorMessage && <div className="settings-error">{errorMessage}</div>}
+        </div>
+      )}
     </div>
   );
 };

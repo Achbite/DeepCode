@@ -839,19 +839,21 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
               +
             </button>
           </div>
-          {footerControls}
         </div>
-        <button
-          className={loading ? 'agent-composer__send-button--stop' : undefined}
-          onClick={loading ? onStop : send}
-          disabled={sendDisabled}
-          type="button"
-          title={loading
-            ? t(language, 'agent.composer.stopTitle')
-            : sendBlockedTitle ?? t(language, 'agent.composer.sendTitle')}
-        >
-          {sendLabel}
-        </button>
+        <div className="agent-composer__footer-right">
+          {footerControls}
+          <button
+            className={loading ? 'agent-composer__send-button--stop' : undefined}
+            onClick={loading ? onStop : send}
+            disabled={sendDisabled}
+            type="button"
+            title={loading
+              ? t(language, 'agent.composer.stopTitle')
+              : sendBlockedTitle ?? t(language, 'agent.composer.sendTitle')}
+          >
+            {sendLabel}
+          </button>
+        </div>
       </div>}
       <UserAttachmentDialog
         visible={attachmentDialogOpen}

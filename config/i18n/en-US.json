@@ -169,7 +169,7 @@
     "settings.search.placeholder": "Search settings",
     "settings.nav.workspace": "Workspace",
     "settings.nav.common": "Common Settings",
-    "settings.nav.gui": "GUI Settings",
+    "settings.nav.gui": "Appearance",
     "settings.nav.agent": "Agent Settings",
     "settings.nav.permissions": "Permissions",
     "settings.nav.token": "Token Stats",
@@ -184,7 +184,8 @@
     "settings.navGroup.models": "Models and Extensions",
     "settings.navGroup.system": "System",
     "settings.common.title": "Common Settings",
-    "settings.gui.title": "GUI Settings",
+    "settings.gui.title": "Appearance",
+    "settings.gui.appearance": "Theme",
     "settings.gui.preferences": "Interface Preferences",
     "settings.gui.scopeHint": "These settings affect only DeepCode-GUI presentation, not shared timeline facts or Kernel permissions.",
     "settings.agent.title": "Agent Settings",
@@ -1069,8 +1070,8 @@
       }
     },
     "gui.colorTheme": {
-      "label": "DeepCode-GUI Theme",
-      "description": "Set the lightweight DeepCode-GUI shell theme without changing the editor workbench theme.",
+      "label": "Theme mode",
+      "description": "Choose system, light, or dark appearance. System mode follows macOS appearance changes.",
       "options": {
         "system": "System",
         "light": "Light",
@@ -1078,13 +1079,29 @@
       }
     },
     "gui.accentColor": {
-      "label": "DeepCode-GUI Accent Color",
-      "description": "Set the shared accent color used by DeepCode-GUI interactive controls.",
+      "label": "Accent color",
+      "description": "The shared color used for primary actions, active states, focus, and streaming cursors.",
       "options": {
         "blue": "Blue",
         "purple": "Purple",
         "green": "Green"
       }
+    },
+    "gui.timelineDensity": {
+      "label": "Timeline density",
+      "description": "Adjust vertical spacing between session events, tool activity, and Agent output.",
+      "options": {
+        "normal": "Standard",
+        "compact": "Compact"
+      }
+    },
+    "gui.typewriterAnimation": {
+      "label": "Typewriter animation",
+      "description": "Reveal Agent narration, reasoning, and final answers progressively."
+    },
+    "gui.collapseCompletedThinking": {
+      "label": "Collapse completed reasoning",
+      "description": "Automatically collapse completed reasoning blocks after a run settles."
     },
     "workbench.styleTokenOverrides": {
       "label": "Style Token Overrides",

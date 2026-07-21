@@ -16,6 +16,10 @@ import {
   patchUserSettings,
   patchWorkspaceSettings,
 } from '../services/runtimeAdapter';
+import {
+  normalizeGuiAccentColor,
+  normalizeGuiThemePreference,
+} from '../theme/deepcodeGuiTheme';
 
 export type SettingSource = 'default' | 'user' | 'workspace';
 
@@ -610,12 +614,10 @@ function getDefaultValue(key: string): UserSettingValue {
 function normalizeSettingValue(key: string, value: unknown): UserSettingValue {
   const defaultValue = getDefaultValue(key);
   if (key === 'gui.colorTheme') {
-    if (value === 'deepcode-gui-light') return 'light';
-    if (value === 'deepcode-gui-dark') return 'dark';
-    return value === 'system' || value === 'dark' ? value : 'light';
+    return normalizeGuiThemePreference(value);
   }
   if (key === 'gui.accentColor') {
-    return value === 'purple' || value === 'green' ? value : 'blue';
+    return normalizeGuiAccentColor(value);
   }
   if (typeof defaultValue === 'boolean') return Boolean(value);
   if (typeof defaultValue === 'number') {

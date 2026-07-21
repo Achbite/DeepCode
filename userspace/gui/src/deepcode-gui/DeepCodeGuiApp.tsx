@@ -5,6 +5,11 @@ import { useSettingsStore } from '../state/settingsStore';
 import { useWorkspaceStore } from '../state/workspaceStore';
 import { normalizeUiLanguage, setActiveUiLanguage, t } from '../i18n';
 import {
+  normalizeGuiAccentColor,
+  normalizeGuiThemePreference,
+  resolveGuiTheme,
+} from '../theme/deepcodeGuiTheme';
+import {
   APP_CLOSE_REQUEST_EVENT,
   closeAppWindow,
   getHealth,
@@ -44,20 +49,6 @@ function isEditableTarget(target: EventTarget | null): boolean {
 }
 
 const EMPTY_WORKSPACE_SETTINGS: Record<string, unknown> = {};
-
-type GuiThemePreference = 'system' | 'light' | 'dark';
-type GuiAccentColor = 'blue' | 'purple' | 'green';
-
-function normalizeGuiThemePreference(value: unknown): GuiThemePreference {
-  if (value === 'system') return 'system';
-  if (value === 'dark' || value === 'deepcode-gui-dark') return 'dark';
-  return 'light';
-}
-
-function normalizeGuiAccentColor(value: unknown): GuiAccentColor {
-  if (value === 'purple' || value === 'green') return value;
-  return 'blue';
-}
 
 const BootFallback: React.FC<{ language: ReturnType<typeof normalizeUiLanguage> }> = ({ language }) => (
   <div className="deepcode-gui-boot-shell">
@@ -164,9 +155,7 @@ const DeepCodeGuiApp: React.FC = () => {
     const media = window.matchMedia('(prefers-color-scheme: dark)');
     const applyTheme = () => {
       document.documentElement.dataset.themePreference = preference;
-      document.documentElement.dataset.theme = preference === 'system'
-        ? (media.matches ? 'dark' : 'light')
-        : preference;
+      document.documentElement.dataset.theme = resolveGuiTheme(preference, media.matches);
     };
     applyTheme();
     if (preference !== 'system') return;

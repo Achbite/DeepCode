@@ -18,13 +18,8 @@ interface ProfilesUpdatedDetail {
   profileMigrations?: AgentSessionProfileMigration[];
 }
 
-function profileProvider(profile: LlmProviderProfile): string {
-  return profile.providerFlavor ?? profile.kind;
-}
-
-function profileLabel(profile: LlmProviderProfile, language: UiLanguage): string {
-  const effort = profile.reasoningEffort ?? t(language, 'agent.profile.reasoningDefault');
-  return `${profile.name} · ${profileProvider(profile)}/${profile.model} · ${effort}`;
+function profileLabel(profile: LlmProviderProfile): string {
+  return profile.name;
 }
 
 const SessionModelSelector: React.FC<SessionModelSelectorProps> = ({
@@ -116,11 +111,19 @@ const SessionModelSelector: React.FC<SessionModelSelectorProps> = ({
         : profiles.length === 0
           ? t(language, 'agent.profile.unavailable')
           : selectedProfile
-            ? profileLabel(selectedProfile, language)
+            ? profileLabel(selectedProfile)
             : t(language, 'agent.profile.selector');
 
   return (
     <div className="deepcode-session-model">
+      <span
+        className="deepcode-session-model__context"
+        aria-label={t(language, 'agent.profile.contextPlaceholder')}
+        aria-disabled="true"
+        title={t(language, 'agent.profile.contextUnavailable')}
+      >
+        --%
+      </span>
       <label className="deepcode-session-model__selector" title={selectorTitle}>
         <span className="deepcode-session-model__label">{t(language, 'agent.profile.selector')}</span>
         <select
@@ -140,19 +143,11 @@ const SessionModelSelector: React.FC<SessionModelSelectorProps> = ({
           )}
           {profiles.map((profile) => (
             <option key={profile.id} value={profile.id}>
-              {profileLabel(profile, language)}
+              {profileLabel(profile)}
             </option>
           ))}
         </select>
       </label>
-      <span
-        className="deepcode-session-model__context"
-        aria-label={t(language, 'agent.profile.contextPlaceholder')}
-        aria-disabled="true"
-        title={t(language, 'agent.profile.contextUnavailable')}
-      >
-        --%
-      </span>
       {migrationNotice && (
         <span className="deepcode-session-model__notice" role="status">
           {migrationNotice}
