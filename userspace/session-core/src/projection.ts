@@ -918,7 +918,7 @@ function userInputBubbleContent(event: AgentEvent): string | undefined {
   if (event.kind === 'review_summary') {
     const status = stringField(event.payload, 'status');
     if (status !== 'accepted' && status !== 'rejected' && status !== 'needsRevision') return undefined;
-    if (status === 'accepted') return 'Review accepted';
+    if (status === 'accepted') return undefined;
     return firstPayloadText(event.payload, ['guidance', 'content', 'summary', 'message']);
   }
   return undefined;
@@ -926,9 +926,6 @@ function userInputBubbleContent(event: AgentEvent): string | undefined {
 
 function userInputBubbleContentKey(event: AgentEvent): string | undefined {
   if (!isRecordPayload(event.payload)) return undefined;
-  if (event.kind === 'review_summary' && stringField(event.payload, 'status') === 'accepted') {
-    return 'review.decision.accepted.userBubble';
-  }
   return stringField(event.payload, 'contentKey') ??
     stringField(event.payload, 'messageKey') ??
     stringField(event.payload, 'summaryKey');
@@ -1553,6 +1550,11 @@ function canGroupNarrativeEvent(
   // Each provider call is a distinct reasoning item. Streaming chunks for one
   // call are already coalesced before they enter the narrative projection.
   if (nextNarrativeKind === 'thinking') return false;
+  if (nextNarrativeKind === 'review') {
+    const lastReviewKey = reviewNarrativeGroupKey(last.events);
+    const nextReviewKey = reviewNarrativeGroupKey([event]);
+    return Boolean(lastReviewKey && nextReviewKey && lastReviewKey === nextReviewKey);
+  }
   if (nextNarrativeKind !== 'operationEvidence') return false;
 
   const lastActivityKey = narrativeActivityGroupKey(last.events);
@@ -1561,6 +1563,16 @@ function canGroupNarrativeEvent(
     return Boolean(lastActivityKey && nextActivityKey && lastActivityKey === nextActivityKey);
   }
   return narrativeStageGroupKey(last.events[last.events.length - 1]) === narrativeStageGroupKey(event);
+}
+
+function reviewNarrativeGroupKey(events: AgentEvent[]): string | undefined {
+  for (const event of events) {
+    if (event.kind !== 'review_summary' || !isRecordPayload(event.payload)) continue;
+    const runId = stringField(event.payload, 'runId');
+    const reviewId = stringField(event.payload, 'reviewId') ?? stringField(event.payload, 'sourcePlanId');
+    if (runId && reviewId) return `${runId}:${reviewId}`;
+  }
+  return undefined;
 }
 
 function narrativeActivityGroupKey(events: AgentEvent[]): string | undefined {
