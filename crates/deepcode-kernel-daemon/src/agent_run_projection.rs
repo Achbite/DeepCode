@@ -164,6 +164,20 @@ pub(crate) fn set_run_terminal(
     true
 }
 
+pub(crate) fn request_run_cancellation(state: &AppState, run_id: &str) -> bool {
+    let mut runs = state.session_runs.lock().expect("session run state lock");
+    let Some(run) = runs.get_mut(run_id) else {
+        return false;
+    };
+    if run_status_terminal(&run.status) || run.status == "cancelling" {
+        return false;
+    }
+    run.status = "cancelling".to_string();
+    run.updated_at = now_text();
+    run.message = Some("Run cancellation requested by user.".to_string());
+    true
+}
+
 pub(crate) fn touch_run(state: &AppState, run_id: &str, message: Option<String>) -> bool {
     let mut runs = state.session_runs.lock().expect("session run state lock");
     let Some(run) = runs.get_mut(run_id) else {
@@ -246,7 +260,7 @@ pub(crate) fn sse_bytes(
 pub(crate) fn run_cancelled(state: &AppState, run_id: &str) -> bool {
     let runs = state.session_runs.lock().expect("session run state lock");
     runs.get(run_id)
-        .map(|run| run.status == "cancelled")
+        .map(|run| run.status == "cancelling" || run.status == "cancelled")
         .unwrap_or(false)
 }
 

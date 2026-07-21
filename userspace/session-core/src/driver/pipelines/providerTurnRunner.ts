@@ -189,6 +189,17 @@ export class ProviderTurnRunner<TState extends ProviderTurnRunnerState> {
       : await ports.llmChat(request);
     await this.dependencies.streamRuntime.flushReasoningBuffer(state, stage, reasoningBuffer);
     if (ports.llmChatStream && (!result.ok || !result.data)) {
+      if (result.error === 'session_run_cancelled') {
+        await this.dependencies.streamRuntime.discardCurrentSemanticDrafts(
+          state,
+          stage,
+          'semantic_draft_cancelled'
+        );
+        throw this.dependencies.createError(
+          'session_run_cancelled',
+          result.message ?? 'Session run cancelled by user.'
+        );
+      }
       await this.dependencies.streamRuntime.discardCurrentSemanticDrafts(
         state,
         stage,

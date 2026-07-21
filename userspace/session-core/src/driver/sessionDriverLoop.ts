@@ -978,6 +978,24 @@ export class SessionDriverLoop {
           state,
           `Session stopped the current artifact draft after ${error.code}.`
         ).catch(() => undefined);
+        if (error.code === 'session_run_cancelled') {
+          takeProviderCommitEvents(state);
+          return this.agentRunReactor.append(state.sessionId, [
+            sessionProgressProjectionBuilder.sessionRunStateEvent({
+              sessionId: state.sessionId,
+              runId: state.runId,
+              phase: 'cancelled',
+              status: 'cancelled',
+              reason: 'session',
+              decisionOwner: {
+                kind: 'session',
+                runId: state.runId,
+              },
+              ts: this.agentRunReactor.ts(),
+              id: this.agentRunReactor.id('session-run-cancelled'),
+            }),
+          ]);
+        }
         const diagnostic = driverFailureMessageCatalog.driverFailure(error.code, error.message);
         return this.agentRunReactor.append(state.sessionId, [
           ...takeProviderCommitEvents(state),

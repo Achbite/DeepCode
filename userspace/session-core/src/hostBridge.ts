@@ -83,6 +83,13 @@ interface HostBridgeResult {
 }
 
 const MEMORY_ARCHIVE_PERSIST_TIMEOUT_MS = 2_000;
+const HOST_RUN_CANCELLATION_POLL_MS = 50;
+
+interface HostRunCancellationContext {
+  apiBase: string;
+  sessionId: string;
+  hostRunId: string;
+}
 
 async function main(): Promise<void> {
   const raw = await readStdin();
@@ -267,8 +274,17 @@ function createProjectionPublishingDriver(
   const buildTimeline = (): AgentTimelineResult => projector.snapshot();
   const driver = new SessionDriverLoop({
     kernelCommand: (request) => kernelCommand(apiBase, request),
-    llmChat: (request) => llmChat(apiBase, request),
-    llmChatStream: (request, onEvent) => llmChatStream(apiBase, request, onEvent),
+    llmChat: (request) => llmChat(
+      apiBase,
+      request,
+      hostRunId ? { apiBase, sessionId, hostRunId } : undefined
+    ),
+    llmChatStream: (request, onEvent) => llmChatStream(
+      apiBase,
+      request,
+      onEvent,
+      hostRunId ? { apiBase, sessionId, hostRunId } : undefined
+    ),
     onProjectionDelta: hostRunId
       ? async (delta) => {
           deliveryRecorder?.record({
@@ -372,15 +388,39 @@ async function kernelCommand(apiBase: string, request: KernelCommandEnvelope): P
   return postJson<KernelReply>(`${apiBase}/api/kernel/commands`, request);
 }
 
-async function llmChat(apiBase: string, request: LlmChatRequest): Promise<ApiResponse<LlmChatResult>> {
-  return postJson<ApiResponse<LlmChatResult>>(`${apiBase}/api/llm/chat`, request);
+async function llmChat(
+  apiBase: string,
+  request: LlmChatRequest,
+  cancellation?: HostRunCancellationContext
+): Promise<ApiResponse<LlmChatResult>> {
+  const controller = new AbortController();
+  const monitor = cancellation
+    ? new HostRunCancellationMonitor(cancellation, controller)
+    : undefined;
+  try {
+    return await postJson<ApiResponse<LlmChatResult>>(
+      `${apiBase}/api/llm/chat`,
+      request,
+      controller.signal
+    );
+  } catch (error) {
+    if (monitor?.cancelled) return cancelledLlmResult();
+    throw error;
+  } finally {
+    await monitor?.stop();
+  }
 }
 
 async function llmChatStream(
   apiBase: string,
   request: LlmChatRequest,
-  onEvent: (event: LlmChatStreamEvent) => void | Promise<void>
+  onEvent: (event: LlmChatStreamEvent) => void | Promise<void>,
+  cancellation?: HostRunCancellationContext
 ): Promise<ApiResponse<LlmChatResult>> {
+  const controller = new AbortController();
+  const monitor = cancellation
+    ? new HostRunCancellationMonitor(cancellation, controller)
+    : undefined;
   try {
     const response = await fetch(`${apiBase}/api/llm/chat/stream`, {
       method: 'POST',
@@ -389,6 +429,7 @@ async function llmChatStream(
         accept: 'text/event-stream',
       },
       body: JSON.stringify({ ...request, stream: true }),
+      signal: controller.signal,
     });
     if (!response.ok) {
       return {
@@ -456,12 +497,74 @@ async function llmChatStream(
       data: buildStreamResult(chunks, usage, { providerProfileId, provider, model }),
     };
   } catch (error) {
+    if (monitor?.cancelled) return cancelledLlmResult();
     return {
       ok: false,
       error: error instanceof Error ? error.name : 'Error',
       message: error instanceof Error ? error.message : String(error),
     };
+  } finally {
+    await monitor?.stop();
   }
+}
+
+class HostRunCancellationMonitor {
+  private stopped = false;
+  private cancellationObserved = false;
+  private readonly completion: Promise<void>;
+
+  constructor(
+    private readonly context: HostRunCancellationContext,
+    private readonly controller: AbortController
+  ) {
+    this.completion = this.poll();
+  }
+
+  get cancelled(): boolean {
+    return this.cancellationObserved;
+  }
+
+  async stop(): Promise<void> {
+    this.stopped = true;
+    await this.completion;
+  }
+
+  private async poll(): Promise<void> {
+    while (!this.stopped && !this.controller.signal.aborted) {
+      if (await hostRunCancellationRequested(this.context)) {
+        this.cancellationObserved = true;
+        this.controller.abort();
+        return;
+      }
+      await delay(HOST_RUN_CANCELLATION_POLL_MS);
+    }
+  }
+}
+
+async function hostRunCancellationRequested(
+  context: HostRunCancellationContext
+): Promise<boolean> {
+  try {
+    const response = await getJson<ApiResponse<{ run?: { status?: string } }>>(
+      `${context.apiBase}/api/agent/sessions/${encodeURIComponent(context.sessionId)}/runs/${encodeURIComponent(context.hostRunId)}`
+    );
+    const status = response.data?.run?.status;
+    return status === 'cancelling' || status === 'cancelled';
+  } catch {
+    return false;
+  }
+}
+
+function cancelledLlmResult(): ApiResponse<LlmChatResult> {
+  return {
+    ok: false,
+    error: 'session_run_cancelled',
+    message: 'Session run cancelled by user.',
+  };
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function postProjectionDelta(apiBase: string, hostRunId: string, delta: AgentTimelineDelta): Promise<void> {
@@ -549,11 +652,12 @@ async function getJson<T>(url: string): Promise<T> {
   return await response.json() as T;
 }
 
-async function postJson<T>(url: string, body: unknown): Promise<T> {
+async function postJson<T>(url: string, body: unknown, signal?: AbortSignal): Promise<T> {
   const response = await fetch(url, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body),
+    signal,
   });
   if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
   return await response.json() as T;

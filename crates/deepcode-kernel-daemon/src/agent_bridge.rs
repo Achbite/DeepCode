@@ -376,17 +376,28 @@ fn wait_for_session_bridge_output(
     run_id: &str,
     child: Child,
 ) -> Result<Output, BridgeWorkerStop> {
-    wait_for_child_output(
+    wait_for_child_output_with_cancel_grace(
         child,
         || run_cancelled(state, run_id),
         session_host_bridge_timeout(),
+        session_host_bridge_cancel_grace(),
     )
 }
 
+#[cfg(test)]
 pub(crate) fn wait_for_child_output(
+    child: Child,
+    should_cancel: impl FnMut() -> bool,
+    timeout: Option<Duration>,
+) -> Result<Output, BridgeWorkerStop> {
+    wait_for_child_output_with_cancel_grace(child, should_cancel, timeout, Duration::ZERO)
+}
+
+fn wait_for_child_output_with_cancel_grace(
     mut child: Child,
     mut should_cancel: impl FnMut() -> bool,
     timeout: Option<Duration>,
+    cancel_grace: Duration,
 ) -> Result<Output, BridgeWorkerStop> {
     let Some(mut stdout) = child.stdout.take() else {
         let _ = child.kill();
@@ -417,13 +428,17 @@ pub(crate) fn wait_for_child_output(
             .map_err(|error| format!("failed to read session bridge stderr: {error}"))
     });
     let started_at = Instant::now();
+    let mut cancellation_requested_at: Option<Instant> = None;
     loop {
         if should_cancel() {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = stdout_reader.join();
-            let _ = stderr_reader.join();
-            return Err(BridgeWorkerStop::Cancelled);
+            let cancellation_started = cancellation_requested_at.get_or_insert_with(Instant::now);
+            if cancel_grace.is_zero() || cancellation_started.elapsed() >= cancel_grace {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(BridgeWorkerStop::Cancelled);
+            }
         }
         if let Some(limit) = timeout {
             if started_at.elapsed() >= limit {
@@ -600,6 +615,10 @@ fn session_host_bridge_timeout() -> Option<Duration> {
     } else {
         Some(Duration::from_millis(millis))
     }
+}
+
+fn session_host_bridge_cancel_grace() -> Duration {
+    Duration::from_secs(3)
 }
 
 fn find_session_host_bridge_daemon() -> Option<PathBuf> {
