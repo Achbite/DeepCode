@@ -475,6 +475,20 @@
   color: var(--dc-muted);
 }
 
+:root[data-product='deepcode-gui'] .deepcode-gui-settings-sheet .settings-field__input,
+:root[data-product='deepcode-gui'] .deepcode-gui-settings-sheet .settings-field__select,
+:root[data-product='deepcode-gui'] .deepcode-gui-settings-sheet .settings-search input {
+  border-color: var(--dc-border-strong);
+  background: var(--dc-surface-raised);
+  color: var(--dc-foreground);
+  -webkit-text-fill-color: var(--dc-foreground);
+}
+
+:root[data-product='deepcode-gui'] .deepcode-gui-settings-sheet .settings-field__select option {
+  background: var(--dc-surface-raised);
+  color: var(--dc-foreground);
+}
+
 .deepcode-session-model {
   position: relative;
   min-width: 0;
