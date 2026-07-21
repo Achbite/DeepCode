@@ -25,6 +25,7 @@ import {
   type PromptLedgerWireRecord,
   type ProviderRequestCacheHistoryEntry,
 } from '../../prompt/promptLedger.js';
+import { deferProviderCommitEvents, queueProviderCommitEvents } from './providerCommitBuffer.js';
 
 export interface ProviderTurnRunnerState extends ProviderStreamRuntimeState {
   cachePlan?: PromptCachePlan;
@@ -33,6 +34,8 @@ export interface ProviderTurnRunnerState extends ProviderStreamRuntimeState {
   providerRequestCacheHistory?: Record<string, ProviderRequestCacheHistoryEntry>;
   promptLedger?: PromptLedgerState;
   userAuthorityFrame?: UserAuthorityFrame;
+  pendingProviderCommitEvents?: AgentEvent[];
+  providerCommitDeferred?: boolean;
 }
 
 export interface ProviderTurnResult {
@@ -148,6 +151,7 @@ export class ProviderTurnRunner<TState extends ProviderTurnRunnerState> {
       },
     };
     const providerRequestId = this.dependencies.createId(`provider-request-${stage}`);
+    this.dependencies.streamRuntime.beginProviderCall(state, stage, providerRequestId);
     if (state.promptLedger && state.providerTurnFrame?.promptLedgerEpochId) {
       const epoch = promptLedgerEpoch(state.promptLedger, state.providerTurnFrame.promptLedgerEpochId);
       if (epoch) {
@@ -185,6 +189,11 @@ export class ProviderTurnRunner<TState extends ProviderTurnRunnerState> {
       : await ports.llmChat(request);
     await this.dependencies.streamRuntime.flushReasoningBuffer(state, stage, reasoningBuffer);
     if (ports.llmChatStream && (!result.ok || !result.data)) {
+      await this.dependencies.streamRuntime.discardCurrentSemanticDrafts(
+        state,
+        stage,
+        'semantic_draft_stream_fallback'
+      );
       const fallbackRequest: LlmChatRequest = { ...request, stream: false };
       await this.dependencies.traceRecorder.append(state, `${stage}.stream_fallback.request`, {
         reason: result.message ?? result.error ?? 'streaming provider request failed',
@@ -244,8 +253,8 @@ export class ProviderTurnRunner<TState extends ProviderTurnRunnerState> {
       ts: this.dependencies.now(),
       id: this.dependencies.createId(`cache-${stage}`),
     });
+    const providerCommitEvents: AgentEvent[] = cacheEvent ? [cacheEvent] : [];
     if (cacheEvent) {
-      await ports.appendEvents(state.sessionId, [cacheEvent]);
       await ports.appendCacheTelemetry?.(state.sessionId, {
         schemaVersion: 'deepcode.session.cache-telemetry.v1',
         recordId: cacheEvent.id,
@@ -274,9 +283,9 @@ export class ProviderTurnRunner<TState extends ProviderTurnRunnerState> {
     await this.dependencies.traceRecorder.append(state, `${stage}.response`, result.data, ports);
     const reasoning = collectReasoning(result.data);
     if (reasoning.trim() && this.dependencies.streamCoordinator.exposesReasoningTrace(stage)) {
-      await ports.appendEvents(state.sessionId, [
+      providerCommitEvents.push(
         this.dependencies.reasoningEvent(state.sessionId, reasoning, this.dependencies.now(), this.dependencies.createId(`reasoning-${stage}`)),
-      ]);
+      );
     }
     await this.dependencies.emitProjectionDelta(state, {
       type: 'active_turn',
@@ -298,9 +307,45 @@ export class ProviderTurnRunner<TState extends ProviderTurnRunnerState> {
     } catch (error) {
       const nativeToolError = this.dependencies.nativeToolError(error);
       if (nativeToolError) {
+        if (this.dependencies.streamRuntime.hasCurrentSemanticDraft(state)) {
+          deferProviderCommitEvents(state);
+          queueProviderCommitEvents(state, providerCommitEvents);
+          await this.dependencies.streamRuntime.failSemanticDraft(
+            state,
+            stage,
+            undefined,
+            nativeToolError.code
+          );
+        } else if (providerCommitEvents.length > 0) {
+          await ports.appendEvents(state.sessionId, providerCommitEvents);
+        }
         throw this.dependencies.createError(nativeToolError.code, nativeToolError.message);
       }
+      if (providerCommitEvents.length > 0) await ports.appendEvents(state.sessionId, providerCommitEvents);
       throw error;
+    }
+    const semanticFailure = await this.dependencies.streamRuntime.finalizeSemanticDrafts(
+      state,
+      stage,
+      toolCalls
+    );
+    if (semanticFailure) {
+      deferProviderCommitEvents(state);
+      queueProviderCommitEvents(state, providerCommitEvents);
+      throw this.dependencies.createError(
+        'native_tool_arguments_invalid',
+        `${semanticFailure.failureCode}: ${semanticFailure.message}`
+      );
+    }
+    const deferProviderCommit = this.dependencies.streamRuntime.hasCurrentSemanticDraft(state) &&
+      toolCalls.some((toolCall) => (
+        toolCall.name === 'session.submit_answer' || toolCall.name === 'session.submit_plan'
+      ));
+    if (deferProviderCommit) {
+      deferProviderCommitEvents(state);
+      queueProviderCommitEvents(state, providerCommitEvents);
+    } else if (providerCommitEvents.length > 0) {
+      await ports.appendEvents(state.sessionId, providerCommitEvents);
     }
     if (!content.trim() && toolCalls.length === 0) {
       throw this.dependencies.createError('llm_empty_response', 'LLM provider returned an empty response.');

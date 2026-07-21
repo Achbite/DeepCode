@@ -362,7 +362,7 @@ function readableAuthorizedTaskPlan(
   fallbackSummary: string,
   sourceRefs: Record<string, string>
 ): ReadablePlanProjection {
-  const readable = readableTaskPlan(plan, fallbackSummary, sourceRefs);
+  const readable = readableTaskPlanProjection(plan, fallbackSummary, sourceRefs);
   const contract = review.authorizationContract;
   readable.sections.splice(Math.max(0, readable.sections.length - 1), 0,
     {
@@ -418,7 +418,7 @@ function readableAuthorizedTaskPlan(
   return readable;
 }
 
-function readableTaskPlan(
+export function readableTaskPlanProjection(
   plan: Record<string, unknown>,
   fallbackSummary: string,
   sourceRefs: Record<string, string>
@@ -445,6 +445,7 @@ function readableTaskPlan(
   return {
     schemaVersion: 'deepcode.session.readable-plan.v1',
     titleKey: 'session.projection.plan.title',
+    title: stringValue(plan.title),
     summary: fallbackSummary,
     sourceRefs,
     tasks: readableTasks,
@@ -452,7 +453,9 @@ function readableTaskPlan(
       {
         sectionId: 'summary',
         titleKey: 'session.projection.plan.section.summary',
-        items: [projectionItem('summary', 'text', { text: fallbackSummary })],
+        items: fallbackSummary.trim()
+          ? [projectionItem('summary', 'text', { text: fallbackSummary })]
+          : [],
       },
       {
         sectionId: 'tasks',

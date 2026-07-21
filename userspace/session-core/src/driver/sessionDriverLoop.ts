@@ -35,6 +35,7 @@ import type { InteractionOverlayContext } from './pipelines/interactionOverlayCo
 import { RunLifecyclePipeline } from './pipelines/lifecyclePipeline.js';
 import { ProviderRuntimeBridge } from './pipelines/providerRuntimeBridge.js';
 import { ProviderTurnCycle } from './pipelines/providerTurnCycle.js';
+import { takeProviderCommitEvents } from './pipelines/providerCommitBuffer.js';
 import {
   ProviderTurnContextCoordinator,
   ResourceOrchestrator,
@@ -431,8 +432,8 @@ export class SessionDriverLoop {
       createId: (prefix) => this.agentRunReactor.id(prefix),
       append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
       kernel: (request) => this.agentRunReactor.kernel(request),
-      appendProjectedKernelEvents: (sessionId, reply) =>
-        this.agentRunReactor.appendProjectedKernelEvents(sessionId, reply),
+      projectKernelEvents: (sessionId, reply) =>
+        this.agentRunReactor.projectKernelEvents(sessionId, reply),
       taskPlanCardEvent: (planInput) =>
         planProjectionBuilder.taskPlanCardEvent(planInput),
       diagnosticEvent: (sessionId, content, ts, id) =>
@@ -452,6 +453,8 @@ export class SessionDriverLoop {
         assistantProjectionBuilder.finalDiagnosticEvent(diagnosticSessionId, summary, ts, id),
       acceptedTaskDiagnosticFailureEvents: (failureInput) =>
         sessionFailureProjectionBuilder.acceptedTaskDiagnosticFailureEvents(failureInput),
+      sessionRunStateEvent: (runStateInput) =>
+        sessionProgressProjectionBuilder.sessionRunStateEvent(runStateInput),
     });
     this.proposalRouter = new ProposalRouter();
     this.proposalRouteExecutor = new ProposalRouteExecutor<SessionDriverLoopInput, SessionDriverLoopRunState>({
@@ -521,6 +524,8 @@ export class SessionDriverLoop {
         assistantProjectionBuilder.answerEvent(sessionId, proposal, ts, id, metadata),
       diagnosticEvent: (sessionId, message, ts, id) =>
         assistantProjectionBuilder.guidanceRevisionDiagnosticEvent(sessionId, message, ts, id),
+      sessionRunStateEvent: (runStateInput) =>
+        sessionProgressProjectionBuilder.sessionRunStateEvent(runStateInput),
       assembleContext: (contextInput) => assembleContext(contextInput),
       toolCatalogSummary: (state) => nativeToolCoordinator.toolCatalogSummary(state),
       implementationBatchHints: (state) => providerContextSupport.implementationBatchHints(state.implementationBatch),
@@ -560,6 +565,8 @@ export class SessionDriverLoop {
       append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
       kernel: (request) => this.agentRunReactor.kernel(request),
       appendProjectedKernelEvents: (sessionId, reply) => this.agentRunReactor.appendProjectedKernelEvents(sessionId, reply),
+      sessionRunStateEvent: (runStateInput) =>
+        sessionProgressProjectionBuilder.sessionRunStateEvent(runStateInput),
       userMessageEvent: ({ sessionId, content, attachments }) =>
         this.agentRunReactor.event(sessionId, 'user_msg', {
           content,
@@ -750,6 +757,13 @@ export class SessionDriverLoop {
         error instanceof SessionDriverLoopError && error.code === 'native_tool_arguments_invalid'
           ? { code: error.code, message: error.message }
           : undefined,
+      onSemanticDraftFailure: (state, callId, failureCode) =>
+        this.providerStreamRuntime.failSemanticDraft(
+          state,
+          state.activeTurn?.stage ?? 'provider_call',
+          callId,
+          failureCode
+        ),
       onArtifactDraftBudgetExceeded: async (state, error) => {
         const reason = await this.artifactDraftReplanCoordinator.replan(state, error.message);
         const content = state.userAuthorityFrame.outputLanguage === 'zh-CN'
@@ -780,6 +794,8 @@ export class SessionDriverLoop {
     this.providerStreamRuntime = new ProviderStreamRuntime<SessionDriverLoopRunState>({
       reasoningFlushChars: PROVIDER_REASONING_FLUSH_CHARS,
       reasoningFlushMs: PROVIDER_REASONING_FLUSH_MS,
+      semanticDraftFlushChars: PROVIDER_REASONING_FLUSH_CHARS,
+      semanticDraftFlushMs: PROVIDER_REASONING_FLUSH_MS,
       visibleReasoningMaxChars: VISIBLE_REASONING_MAX_CHARS,
       streamCoordinator: providerStreamCoordinator,
       visibleLanguageForRequest,
@@ -936,6 +952,21 @@ export class SessionDriverLoop {
           confirmedRequirement: handlerInput.confirmedRequirement,
           lastResult,
         }),
+      appendProviderRunningState: (state) => this.agentRunReactor.append(state.sessionId, [
+        sessionProgressProjectionBuilder.sessionRunStateEvent({
+          sessionId: state.sessionId,
+          runId: state.runId,
+          phase: 'provider_proposing',
+          status: 'running',
+          reason: 'session',
+          decisionOwner: {
+            kind: 'session',
+            runId: state.runId,
+          },
+          ts: this.agentRunReactor.ts(),
+          id: this.agentRunReactor.id('session-run-provider-proposing'),
+        }),
+      ]),
       callProviderAndParse: (handlerInput, state, prompt) =>
         this.providerProposalCoordinator.callAndParse(handlerInput, state, prompt),
       deterministicProposal: (state) =>
@@ -948,16 +979,19 @@ export class SessionDriverLoop {
           `Session stopped the current artifact draft after ${error.code}.`
         ).catch(() => undefined);
         const diagnostic = driverFailureMessageCatalog.driverFailure(error.code, error.message);
-        return this.agentRunReactor.append(state.sessionId, sessionFailureProjectionBuilder.internalFailureEvents({
-          sessionId: state.sessionId,
-          runId: state.runId,
-          stage: 'driver',
-          code: diagnostic.code,
-          message: diagnostic.fallback,
-          reason: 'driver_failure',
-          ts: this.agentRunReactor.ts(),
-          id: this.agentRunReactor.id(error.code),
-        }));
+        return this.agentRunReactor.append(state.sessionId, [
+          ...takeProviderCommitEvents(state),
+          ...sessionFailureProjectionBuilder.internalFailureEvents({
+            sessionId: state.sessionId,
+            runId: state.runId,
+            stage: 'driver',
+            code: diagnostic.code,
+            message: diagnostic.fallback,
+            reason: 'driver_failure',
+            ts: this.agentRunReactor.ts(),
+            id: this.agentRunReactor.id(error.code),
+          }),
+        ]);
       },
       appendProviderFailure: async (state, error) => {
         await this.artifactDraftCoordinator.discard(
@@ -965,16 +999,19 @@ export class SessionDriverLoop {
           'Session stopped the current artifact draft after a Provider failure.'
         ).catch(() => undefined);
         const diagnostic = driverFailureMessageCatalog.providerFailure(error);
-        return this.agentRunReactor.append(state.sessionId, sessionFailureProjectionBuilder.internalFailureEvents({
-          sessionId: state.sessionId,
-          runId: state.runId,
-          stage: 'provider',
-          code: diagnostic.code,
-          message: diagnostic.fallback,
-          reason: 'provider_failure',
-          ts: this.agentRunReactor.ts(),
-          id: this.agentRunReactor.id('provider-call-failed'),
-        }));
+        return this.agentRunReactor.append(state.sessionId, [
+          ...takeProviderCommitEvents(state),
+          ...sessionFailureProjectionBuilder.internalFailureEvents({
+            sessionId: state.sessionId,
+            runId: state.runId,
+            stage: 'provider',
+            code: diagnostic.code,
+            message: diagnostic.fallback,
+            reason: 'provider_failure',
+            ts: this.agentRunReactor.ts(),
+            id: this.agentRunReactor.id('provider-call-failed'),
+          }),
+        ]);
       },
     });
     this.runEngine = new RunEngine<SessionDriverLoopInput, SessionDriverLoopRunState>({

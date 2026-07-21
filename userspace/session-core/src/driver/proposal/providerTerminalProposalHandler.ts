@@ -1,7 +1,11 @@
 import type { AgentEvent, AgentSessionResult } from '@deepcode/protocol';
 import type { ProposalEnvelope } from '../../protocol/types.js';
+import {
+  takeProviderCommitEvents,
+  type ProviderCommitBufferState,
+} from '../pipelines/providerCommitBuffer.js';
 
-export interface ProviderTerminalProposalState {
+export interface ProviderTerminalProposalState extends ProviderCommitBufferState {
   sessionId: string;
   runId: string;
   phase: string;
@@ -26,6 +30,19 @@ export interface ProviderTerminalProposalHandlerPorts<Input, State extends Provi
     ts: string;
     id: string;
   }): AgentEvent[];
+  sessionRunStateEvent(input: {
+    sessionId: string;
+    runId: string;
+    phase: 'completed';
+    status: 'completed';
+    reason: 'session';
+    decisionOwner: {
+      kind: 'session';
+      runId: string;
+    };
+    ts: string;
+    id: string;
+  }): AgentEvent;
 }
 
 export class ProviderTerminalProposalHandler<Input, State extends ProviderTerminalProposalState> {
@@ -34,13 +51,28 @@ export class ProviderTerminalProposalHandler<Input, State extends ProviderTermin
   async handleAnswer(input: Input, state: State, proposal: ProposalEnvelope): Promise<AgentSessionResult> {
     const revised = await this.ports.reviseAnswer(input, state, proposal);
     if (revised) return revised;
+    state.phase = 'completed';
     return this.ports.append(state.sessionId, [
+      ...takeProviderCommitEvents(state),
       this.ports.answerEvent(
         state.sessionId,
         proposal,
         this.ports.now(),
         this.ports.createId('answer')
       ),
+      this.ports.sessionRunStateEvent({
+        sessionId: state.sessionId,
+        runId: state.runId,
+        phase: 'completed',
+        status: 'completed',
+        reason: 'session',
+        decisionOwner: {
+          kind: 'session',
+          runId: state.runId,
+        },
+        ts: this.ports.now(),
+        id: this.ports.createId('session-run-completed-answer'),
+      }),
     ]);
   }
 
@@ -50,7 +82,9 @@ export class ProviderTerminalProposalHandler<Input, State extends ProviderTermin
     if (taskId && planId) {
       state.phase = 'failed';
       const payload = objectRecord(proposal.payload) ?? {};
-      return this.ports.append(state.sessionId, this.ports.acceptedTaskDiagnosticFailureEvents({
+      return this.ports.append(state.sessionId, [
+        ...takeProviderCommitEvents(state),
+        ...this.ports.acceptedTaskDiagnosticFailureEvents({
         sessionId: state.sessionId,
         runId: state.runId,
         planId,
@@ -59,9 +93,11 @@ export class ProviderTerminalProposalHandler<Input, State extends ProviderTermin
         message: diagnosticSummary(proposal),
         ts: this.ports.now(),
         id: this.ports.createId('accepted-task-diagnostic-failed'),
-      }));
+        }),
+      ]);
     }
     return this.ports.append(state.sessionId, [
+      ...takeProviderCommitEvents(state),
       this.ports.finalDiagnosticEvent(
         state.sessionId,
         diagnosticSummary(proposal),

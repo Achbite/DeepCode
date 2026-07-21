@@ -27,6 +27,10 @@ import {
   SessionDriverRepairRuntimeAccessor,
   type SessionDriverProviderRuntimeState,
 } from '../runFrame.js';
+import {
+  takeProviderCommitEvents,
+  type ProviderCommitBufferState,
+} from '../pipelines/providerCommitBuffer.js';
 
 const providerProfiles = new ProviderProfileRegistry();
 
@@ -38,9 +42,10 @@ export interface TerminalGuidanceRevisionInput {
   confirmedRequirement?: RequirementRecord;
 }
 
-export interface TerminalGuidanceRevisionState extends SessionDriverProviderRuntimeState {
+export interface TerminalGuidanceRevisionState extends SessionDriverProviderRuntimeState, ProviderCommitBufferState {
   sessionId: string;
   runId: string;
+  phase: string;
   userRequest: string;
   terminalGuidanceRevisionAttempted: boolean;
   memoryDocument: SessionMemoryDocument;
@@ -82,6 +87,19 @@ export interface TerminalGuidanceRevisionCoordinatorPorts<
     metadata?: Record<string, unknown>
   ): AgentEvent;
   diagnosticEvent(sessionId: string, message: string, ts: string, id: string): AgentEvent;
+  sessionRunStateEvent(input: {
+    sessionId: string;
+    runId: string;
+    phase: 'completed';
+    status: 'completed';
+    reason: 'session';
+    decisionOwner: {
+      kind: 'session';
+      runId: string;
+    };
+    ts: string;
+    id: string;
+  }): AgentEvent;
   assembleContext(input: ContextAssemblyInput): ContextAssemblyResult;
   toolCatalogSummary(state: State): string;
   implementationBatchHints(state: State): string[];
@@ -123,6 +141,7 @@ export class TerminalGuidanceRevisionCoordinator<
     if (guidance.length === 0) return null;
 
     result = await this.ports.append(state.sessionId, [
+      ...takeProviderCommitEvents(state),
       this.ports.transitionEvent({
         sessionId: state.sessionId,
         runId: state.runId,
@@ -227,20 +246,21 @@ export class TerminalGuidanceRevisionCoordinator<
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      await this.ports.append(state.sessionId, [
+      state.phase = 'completed';
+      return this.ports.append(state.sessionId, [
+        ...takeProviderCommitEvents(state),
         this.ports.diagnosticEvent(
           state.sessionId,
           `User guidance merge failed; Session fell back to the first answer: ${message}`,
           this.ports.now(),
           this.ports.createId('guidance-revision-failed')
         ),
-      ]);
-      return this.ports.append(state.sessionId, [
         this.ports.answerEvent(state.sessionId, draftAnswer, this.ports.now(), this.ports.createId('answer'), {
           guidanceRevisionFailed: true,
           appliedGuidanceIds: guidance.map((item) => item.id),
           replacesDraftProposalId: draftAnswer.proposalId,
         }),
+        this.completedRunStateEvent(state),
       ]);
     }
 
@@ -250,15 +270,32 @@ export class TerminalGuidanceRevisionCoordinator<
       this.ports.now(),
       this.ports.createId('guidance-revision-narration')
     );
-    if (narration) {
-      result = await this.ports.append(state.sessionId, [narration]);
-    }
+    state.phase = 'completed';
     return this.ports.append(state.sessionId, [
+      ...takeProviderCommitEvents(state),
+      ...(narration ? [narration] : []),
       this.ports.answerEvent(state.sessionId, revised, this.ports.now(), this.ports.createId('answer'), {
         guidanceRevision: true,
         appliedGuidanceIds: guidance.map((item) => item.id),
         replacesDraftProposalId: draftAnswer.proposalId,
       }),
+      this.completedRunStateEvent(state),
     ]);
+  }
+
+  private completedRunStateEvent(state: State): AgentEvent {
+    return this.ports.sessionRunStateEvent({
+      sessionId: state.sessionId,
+      runId: state.runId,
+      phase: 'completed',
+      status: 'completed',
+      reason: 'session',
+      decisionOwner: {
+        kind: 'session',
+        runId: state.runId,
+      },
+      ts: this.ports.now(),
+      id: this.ports.createId('session-run-completed-guidance-revision'),
+    });
   }
 }

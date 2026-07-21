@@ -9,6 +9,11 @@ import type {
   NativeToolTurnResult,
 } from '../../provider/NativeToolTurnHandler.js';
 import type { NativeToolCallProposal } from '../../provider/providerStreamParts.js';
+import {
+  providerCommitEventsDeferred,
+  queueProviderCommitEvents,
+  type ProviderCommitBufferState,
+} from './providerCommitBuffer.js';
 
 export interface NativeToolProgressPayloadBuilderLike {
   assistantProgressPayload(input: { runId: string; content: string }): Record<string, unknown>;
@@ -55,12 +60,18 @@ export class NativeToolHandlerPortsFactory<
   create(input: NativeToolHandlerPortsFactoryInput<TState>): NativeToolTurnHandlerPorts<TState> {
     return {
       appendAssistantProgress: async (state, narration) => {
-        await this.dependencies.append(state.sessionId, [
+        const events = [
           this.dependencies.event(state.sessionId, 'assistant_msg', this.dependencies.progressEventBuilder.assistantProgressPayload({
             runId: state.runId,
             content: narration,
           })),
-        ]);
+        ];
+        const commitState = state as TState & ProviderCommitBufferState;
+        if (providerCommitEventsDeferred(commitState)) {
+          queueProviderCommitEvents(commitState, events);
+          return;
+        }
+        await this.dependencies.append(state.sessionId, events);
       },
       emitCheckpoint: async (state, nativeToolRound, toolCallCount) => {
         const resourcePacketCount = Array.isArray((state as unknown as { resourcePackets?: unknown[] }).resourcePackets)

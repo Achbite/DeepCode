@@ -349,8 +349,8 @@ pub(crate) fn conversation_projection_delivery_markdown(
         String::new(),
         "This diagnostic stream records delivery metadata and hashes only. It is not a conversation fact source.".to_string(),
         String::new(),
-        "| at | stage | op | turn | block | deltaSeq | revision | mode | chars | hash | result |".to_string(),
-        "| --- | --- | --- | --- | --- | ---: | ---: | --- | ---: | --- | --- |".to_string(),
+        "| at | stage | op | turn | item | block | deltaSeq | revision | mode | chars | hash | failure | result |".to_string(),
+        "| --- | --- | --- | --- | --- | --- | ---: | ---: | --- | ---: | --- | --- | --- |".to_string(),
     ];
     for entry in sorted {
         let text = |field: &str| {
@@ -368,22 +368,24 @@ pub(crate) fn conversation_projection_delivery_markdown(
                 .unwrap_or_default()
         };
         lines.push(format!(
-            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
             text("at"),
             text("stage"),
             text("op"),
             text("turnId"),
+            text("itemId"),
             text("blockId"),
             number("deltaSeq"),
             number("revision"),
             text("deliveryMode"),
             number("charLength"),
             text("contentHash"),
+            text("failureCode"),
             text("result"),
         ));
     }
     if entries.is_empty() {
-        lines.push("| | No projection delivery records. | | | | | | | | | |".to_string());
+        lines.push("| | No projection delivery records. | | | | | | | | | | | |".to_string());
     }
     lines.join("\n")
 }

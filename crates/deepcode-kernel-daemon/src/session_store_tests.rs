@@ -36,6 +36,7 @@ fn projection_delivery_sanitizer_keeps_only_metadata() {
             "sessionId": "session-untrusted",
             "runId": "run-1",
             "turnId": "turn-1",
+            "itemId": "semantic-call-1",
             "blockId": "block-1",
             "op": "text.append",
             "revision": 2,
@@ -43,6 +44,7 @@ fn projection_delivery_sanitizer_keeps_only_metadata() {
             "deliveryMode": "live",
             "charLength": 12,
             "contentHash": "fnv1a32:12345678",
+            "failureCode": "semantic_draft_invalid_json",
             "result": "accepted",
             "content": "must not be archived",
             "payload": { "authorization": "Bearer secret" },
@@ -54,6 +56,8 @@ fn projection_delivery_sanitizer_keeps_only_metadata() {
 
     assert_eq!(sanitized["sessionId"], "session-canonical");
     assert_eq!(sanitized["runId"], "run-1");
+    assert_eq!(sanitized["itemId"], "semantic-call-1");
+    assert_eq!(sanitized["failureCode"], "semantic_draft_invalid_json");
     assert_eq!(sanitized["deltaSeq"], 4);
     assert_eq!(sanitized["charLength"], 12);
     assert!(sanitized.get("content").is_none());

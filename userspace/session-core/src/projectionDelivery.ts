@@ -27,6 +27,7 @@ export interface ProjectionDeliveryMetadata {
   sessionId: string;
   runId: string;
   turnId?: string;
+  itemId?: string;
   blockId?: string;
   op?: string;
   revision?: number;
@@ -34,6 +35,7 @@ export interface ProjectionDeliveryMetadata {
   deliveryMode?: ProjectionDeliveryRecord['deliveryMode'];
   charLength?: number;
   contentHash?: string;
+  failureCode?: string;
   result?: ProjectionDeliveryRecord['result'];
   droppedCount?: number;
 }
@@ -139,6 +141,7 @@ export function projectionDeliveryRecord(metadata: ProjectionDeliveryMetadata): 
     sessionId: metadata.sessionId,
     runId: metadata.runId,
     ...(metadata.turnId ? { turnId: metadata.turnId } : {}),
+    ...(metadata.itemId ? { itemId: metadata.itemId } : {}),
     ...(metadata.blockId ? { blockId: metadata.blockId } : {}),
     ...(metadata.op ? { op: metadata.op } : {}),
     ...(metadata.revision !== undefined ? { revision: metadata.revision } : {}),
@@ -146,6 +149,7 @@ export function projectionDeliveryRecord(metadata: ProjectionDeliveryMetadata): 
     ...(metadata.deliveryMode ? { deliveryMode: metadata.deliveryMode } : {}),
     ...(metadata.charLength !== undefined ? { charLength: metadata.charLength } : {}),
     ...(metadata.contentHash ? { contentHash: metadata.contentHash } : {}),
+    ...(metadata.failureCode ? { failureCode: metadata.failureCode } : {}),
     ...(metadata.result ? { result: metadata.result } : {}),
     ...(metadata.droppedCount !== undefined ? { droppedCount: metadata.droppedCount } : {}),
   };
@@ -167,7 +171,7 @@ export function projectionDeliveryMetadataForTimelineDelta(
     op: delta.op,
     revision: delta.revision ?? block?.revision,
     deltaSeq: delta.deltaSeq,
-    deliveryMode: block?.deliveryMode,
+    deliveryMode: delta.op === 'block.started' ? delta.deliveryMode : block?.deliveryMode,
     ...projectionDeliveryContentMetadata(content),
     result,
   };

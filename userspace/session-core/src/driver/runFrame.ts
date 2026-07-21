@@ -1,4 +1,4 @@
-import type { AgentWorkspaceBinding, LlmChatRequest, LlmChatResult } from '@deepcode/protocol';
+import type { AgentEvent, AgentWorkspaceBinding, LlmChatRequest, LlmChatResult } from '@deepcode/protocol';
 import type {
   ContextAssemblyRecord,
   ContextAssemblyTaskLocalCompactRecord,
@@ -24,6 +24,7 @@ import type {
   NativeToolReadLedgerEntry,
   ProviderPartFrameParser,
 } from '../provider/providerStreamParts.js';
+import type { SessionSemanticDraftStreamRecord } from '../provider/SessionSemanticDraftDecoder.js';
 import type { GeneratedArtifactEvidence } from './context/index.js';
 import type { HookResult } from './hooks/hookResult.js';
 import type { InteractionOverlayContext, SessionTurnPhase } from './pipelines/interactionOverlayCodec.js';
@@ -337,6 +338,8 @@ export interface SessionDriverProviderState {
   artifactChunkRepairAttempts?: Record<string, number>;
   semanticDirectiveRepairAttempts?: Record<string, number>;
   pendingSemanticToolCalls?: Record<string, NativeToolCallProposal>;
+  pendingProviderCommitEvents?: AgentEvent[];
+  providerCommitDeferred?: boolean;
 }
 
 export interface SessionDriverProviderRuntimeState {
@@ -462,6 +465,7 @@ export interface ActiveTurnState {
     lastEmittedChars: number;
   }>;
   submittedPartFrames?: Record<string, true>;
+  semanticDrafts?: Record<string, SessionSemanticDraftStreamRecord>;
 }
 
 export interface LlmTurnResult {

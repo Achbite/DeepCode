@@ -150,21 +150,24 @@ pub(crate) async fn agent_session_run_cancel(
         append_session_projection(
             &state,
             &session_id,
-            vec![agent_event(
-                &session_id,
-                "workflow_stage",
-                json!({
-                    "stage": "session_run",
-                    "phase": "cancel",
-                    "status": "cancelled",
-                    "summary": "Run cancelled by user.",
-                    "channel": "task",
-                    "visibility": "task",
-                    "presentation": "stageSummary",
-                    "runId": run_id.clone()
-                }),
-                &now_text(),
-            )],
+            vec![
+                agent_event(
+                    &session_id,
+                    "workflow_stage",
+                    json!({
+                        "stage": "session_run",
+                        "phase": "cancel",
+                        "status": "cancelled",
+                        "summary": "Run cancelled by user.",
+                        "channel": "task",
+                        "visibility": "task",
+                        "presentation": "stageSummary",
+                        "runId": run_id.clone()
+                    }),
+                    &now_text(),
+                ),
+                terminal_session_run_state_event(&session_id, &run_id, "cancelled", "cancelled"),
+            ],
         );
     }
     run_response(&state, &session_id, &run_id)
@@ -431,13 +434,42 @@ pub(crate) async fn agent_session_cancel(
             .collect::<Vec<_>>()
     };
     for run_id in active_runs {
-        let _ = set_run_terminal(
+        let changed = set_run_terminal(
             &state,
             &run_id,
             "cancelled",
             Some("Run cancelled by user.".to_string()),
             None,
         );
+        if changed {
+            append_session_projection(
+                &state,
+                &session_id,
+                vec![
+                    agent_event(
+                        &session_id,
+                        "workflow_stage",
+                        json!({
+                            "stage": "session_run",
+                            "phase": "cancel",
+                            "status": "cancelled",
+                            "summary": "Run cancelled by user.",
+                            "channel": "task",
+                            "visibility": "task",
+                            "presentation": "stageSummary",
+                            "runId": run_id.clone()
+                        }),
+                        &now_text(),
+                    ),
+                    terminal_session_run_state_event(
+                        &session_id,
+                        &run_id,
+                        "cancelled",
+                        "cancelled",
+                    ),
+                ],
+            );
+        }
     }
     let gui = state.gui.lock().expect("gui state lock");
     session_result(&gui, &session_id)

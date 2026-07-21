@@ -29,6 +29,7 @@ export interface ProjectionDeliveryRecord {
   sessionId: string;
   runId: string;
   turnId?: string;
+  itemId?: string;
   blockId?: string;
   op?: AgentTimelineDelta['op'] | string;
   revision?: number;
@@ -36,6 +37,7 @@ export interface ProjectionDeliveryRecord {
   deliveryMode?: AgentTimelineDeliveryMode;
   charLength?: number;
   contentHash?: string;
+  failureCode?: string;
   result?: 'accepted' | 'ignored' | 'gap' | 'failed' | 'sent' | 'settled';
   droppedCount?: number;
 }

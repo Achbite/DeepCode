@@ -83,21 +83,62 @@ pub(crate) fn fail_run_with_event(
     append_session_projection(
         state,
         session_id,
-        vec![agent_event(
-            session_id,
-            "error",
-            json!({
-                "code": code,
-                "message": message,
-                "summary": message,
-                "channel": "error",
-                "visibility": "conversation",
-                "presentation": "body",
-                "runId": run_id
-            }),
-            &now_text(),
-        )],
+        vec![
+            agent_event(
+                session_id,
+                "error",
+                json!({
+                    "code": code,
+                    "message": message,
+                    "summary": message,
+                    "channel": "error",
+                    "visibility": "conversation",
+                    "presentation": "body",
+                    "runId": run_id
+                }),
+                &now_text(),
+            ),
+            terminal_session_run_state_event(session_id, run_id, "failed", "failed"),
+        ],
     );
+}
+
+pub(crate) fn terminal_session_run_state_event(
+    session_id: &str,
+    run_id: &str,
+    phase: &str,
+    status: &str,
+) -> Value {
+    let summary_key = match status {
+        "cancelled" => "session.runState.cancelled",
+        _ => "session.runState.failed",
+    };
+    agent_event(
+        session_id,
+        "session_run_state",
+        json!({
+            "status": status,
+            "phase": phase,
+            "reason": "session",
+            "runId": run_id,
+            "decisionKind": "session",
+            "decisionOwner": {
+                "kind": "session",
+                "runId": run_id
+            },
+            "summary": summary_key,
+            "summaryKey": summary_key,
+            "messageKey": summary_key,
+            "messageArgs": {
+                "reason": "session",
+                "status": status
+            },
+            "channel": "task",
+            "visibility": "debug",
+            "presentation": "stageSummary"
+        }),
+        &now_text(),
+    )
 }
 
 pub(crate) fn set_run_terminal(

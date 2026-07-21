@@ -21,6 +21,7 @@ export interface ProviderTurnCycleContextResult {
 export interface ProviderTurnCyclePorts<Input, State extends ProviderTurnCycleState> {
   refreshRuntimeState(state: State): void;
   prepareProviderContext(input: Input, state: State, lastResult: AgentSessionResult): Promise<ProviderTurnCycleContextResult>;
+  appendProviderRunningState?(state: State): Promise<unknown>;
   callProviderAndParse(
     input: Input,
     state: State,
@@ -81,7 +82,9 @@ export class ProviderTurnCycle<Input, State extends ProviderTurnCycleState> {
         directive: this.ports.admitDirective(deterministic),
       };
     }
+    const enteringProvider = state.phase !== 'provider_proposing';
     state.phase = 'provider_proposing';
+    if (enteringProvider) await this.ports.appendProviderRunningState?.(state);
     let providerStep: ProposalEnvelope | NativeToolProviderResumeSignal;
     try {
       providerStep = await this.ports.callProviderAndParse(input.input, state, prompt);

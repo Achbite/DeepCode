@@ -274,7 +274,9 @@ function createProjectionPublishingDriver(
           deliveryRecorder?.record({
             stage: 'session.provider_delta_received',
             turnId: delta.turnId,
+            itemId: delta.itemId,
             op: delta.type,
+            failureCode: projectionDeltaFailureCode(delta),
             ...projectionDeliveryContentMetadata(projectionDeltaContent(delta)),
             result: 'accepted',
           });
@@ -289,6 +291,17 @@ function createProjectionPublishingDriver(
     appendWireLedger: (sessionId, entries) => transcriptClient.appendWireLedger(sessionId, entries),
     appendCacheTelemetry: (sessionId, entry) => transcriptClient.appendCacheTelemetry(sessionId, entry),
     appendEvents: async (sessionId, events) => {
+      if (events.length === 0) {
+        const response = await postJson<ApiResponse<AgentSessionResult>>(
+          `${apiBase}/api/agent/sessions/${encodeURIComponent(sessionId)}/events`,
+          { events: [] } satisfies AppendAgentEventsRequest
+        );
+        if (!response.ok || !response.data) {
+          throw new Error(response.message ?? response.error ?? 'read current agent events failed');
+        }
+        committedEvents = response.data.events ?? committedEvents;
+        return response.data;
+      }
       const nextEvents = [...committedEvents, ...events];
       const projectionCommit = projector.commit(nextEvents);
       const appendRequest: AppendAgentEventsRequest = {
@@ -508,9 +521,26 @@ async function publishTimelineDelta(
 }
 
 function projectionDeltaContent(delta: ProjectionDelta): string {
+  const payload = objectRecord(delta.payload);
+  if (delta.type === 'semantic_delta' && payload?.schemaVersion === 'deepcode.session.semantic-draft.v1') {
+    const answer = objectRecord(payload.answer);
+    if (typeof answer?.content === 'string') return answer.content;
+    const plan = objectRecord(payload.plan);
+    if (plan) return JSON.stringify(plan);
+  }
   if (typeof delta.delta === 'string') return delta.delta;
   if (typeof delta.summary === 'string') return delta.summary;
   return '';
+}
+
+function projectionDeltaFailureCode(delta: ProjectionDelta): string | undefined {
+  const payload = objectRecord(delta.payload);
+  if (delta.type !== 'semantic_delta' || payload?.schemaVersion !== 'deepcode.session.semantic-draft.v1') {
+    return undefined;
+  }
+  return typeof payload.failureCode === 'string' && payload.failureCode.trim()
+    ? payload.failureCode
+    : undefined;
 }
 
 async function getJson<T>(url: string): Promise<T> {

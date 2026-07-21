@@ -601,10 +601,12 @@ fn sanitize_projection_delivery_entry(session_id: &str, entry: Value) -> Result<
     const REQUIRED_STRING_FIELDS: &[&str] = &["stage", "at", "runId"];
     const OPTIONAL_STRING_FIELDS: &[&str] = &[
         "turnId",
+        "itemId",
         "blockId",
         "op",
         "deliveryMode",
         "contentHash",
+        "failureCode",
         "result",
     ];
     const OPTIONAL_NUMBER_FIELDS: &[&str] = &["revision", "deltaSeq", "charLength", "droppedCount"];

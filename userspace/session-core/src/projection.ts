@@ -15,6 +15,7 @@ import {
   type KernelProposalReviewReport,
   type PermissionRequest,
   type ProjectionDelta,
+  type SessionSemanticDraftPayload,
 } from '@deepcode/protocol';
 import type { ResourcePacket, ResourceRequest } from './context/types.js';
 import type { ReviewPacket } from './review/types.js';
@@ -30,6 +31,7 @@ import {
   type InteractionLedgerActiveInteraction,
 } from './run-state/interactionLedger.js';
 import { planInteractionAwaitsDecision } from './run-state/planInteractionState.js';
+import { readableTaskPlanProjection } from './driver/projection/planProjectionBuilder.js';
 
 export interface PendingPermissionProjection {
   request: PermissionRequest;
@@ -445,6 +447,10 @@ function projectionDeltaToTransientEvent(delta: ProjectionDelta, generatedAt?: s
     activeOverlay: true,
   };
 
+  if (delta.type === 'semantic_delta') {
+    return semanticDraftTransientEvent(delta, id, ts, basePayload);
+  }
+
   const textKind = projectionDeltaTextChannel(delta);
   if (textKind && typeof delta.delta === 'string' && delta.delta.length > 0) {
     if (textKind === 'reasoning') {
@@ -463,7 +469,6 @@ function projectionDeltaToTransientEvent(delta: ProjectionDelta, generatedAt?: s
           visibility: 'conversation',
           reasoningTrace: true,
           activeOverlay: true,
-          activity: delta.activity,
         },
         display: {
           presentation: 'collapsible',
@@ -534,6 +539,181 @@ function projectionDeltaToTransientEvent(delta: ProjectionDelta, generatedAt?: s
   }
 
   return [];
+}
+
+function semanticDraftTransientEvent(
+  delta: ProjectionDelta,
+  id: string,
+  ts: string,
+  basePayload: Record<string, unknown>
+): AgentEvent[] {
+  const draft = sessionSemanticDraftPayload(delta.payload);
+  if (!draft || draft.state === 'discarded') return [];
+  const status = draft.state === 'failed' ? 'failed' : 'running';
+  if (draft.kind === 'answer') {
+    const content = draft.answer?.content ?? '';
+    if (!content) return [];
+    return [{
+      id,
+      sessionId: delta.sessionId,
+      ts,
+      kind: 'assistant_msg',
+      payload: {
+        ...basePayload,
+        content,
+        channel: 'final',
+        visibility: 'conversation',
+        presentation: 'body',
+        proposalId: draft.proposalId,
+        status,
+        semanticDraftState: draft.state,
+        semanticDraftRevision: draft.revision,
+        semanticDraftFailureCode: draft.failureCode,
+      },
+      display: {
+        presentation: 'body',
+        defaultOpen: true,
+      },
+    }];
+  }
+
+  const plan = draft.plan;
+  if (!plan || (!plan.title && !plan.summary && plan.tasks.length === 0)) return [];
+  const summary = plan.title ?? 'Plan';
+  const planId = draft.planId ?? `plan-${draft.callId}`;
+  const readablePlan = readableTaskPlanProjection(
+    plan as unknown as Record<string, unknown>,
+    plan.summary ?? '',
+    {
+      runId: delta.runId ?? 'run',
+      planId,
+      proposalId: draft.proposalId,
+    }
+  );
+  return [{
+    id,
+    sessionId: delta.sessionId,
+    ts,
+    kind: 'plan_card',
+    payload: {
+      ...basePayload,
+      titleKey: 'session.projection.plan.title',
+      summary,
+      readablePlan,
+      runId: delta.runId,
+      planId,
+      proposalId: draft.proposalId,
+      status,
+      confirmable: false,
+      decisionOwner: {
+        kind: 'plan',
+        runId: delta.runId,
+        targetId: planId,
+        planId,
+        source: 'plan_card',
+      },
+      taskPlan: plan,
+      channel: 'action',
+      visibility: 'conversation',
+      presentation: 'body',
+      semanticDraftState: draft.state,
+      semanticDraftRevision: draft.revision,
+      semanticDraftFailureCode: draft.failureCode,
+    },
+    display: {
+      presentation: 'body',
+      defaultOpen: true,
+    },
+  }];
+}
+
+function sessionSemanticDraftPayload(value: unknown): SessionSemanticDraftPayload | undefined {
+  if (!isRecordPayload(value) || value.schemaVersion !== 'deepcode.session.semantic-draft.v1') return undefined;
+  if (value.kind !== 'answer' && value.kind !== 'plan') return undefined;
+  if (value.toolName !== 'session.submit_answer' && value.toolName !== 'session.submit_plan') return undefined;
+  if ((value.kind === 'answer') !== (value.toolName === 'session.submit_answer')) return undefined;
+  if (typeof value.callId !== 'string' || typeof value.proposalId !== 'string') return undefined;
+  if (typeof value.revision !== 'number' || !Number.isSafeInteger(value.revision) || value.revision < 0) return undefined;
+  if (value.state !== 'streaming' && value.state !== 'failed' && value.state !== 'discarded') return undefined;
+  const revision = value.revision;
+  const state: SessionSemanticDraftPayload['state'] = value.state;
+  const common = {
+    schemaVersion: 'deepcode.session.semantic-draft.v1' as const,
+    kind: value.kind,
+    toolName: value.toolName,
+    callId: value.callId,
+    proposalId: value.proposalId,
+    revision,
+    state,
+    ...(typeof value.failureCode === 'string' && value.failureCode.trim()
+      ? { failureCode: value.failureCode }
+      : {}),
+  };
+  if (value.kind === 'answer') {
+    const answer = isRecordPayload(value.answer) ? value.answer : undefined;
+    if (!answer || typeof answer.content !== 'string') return undefined;
+    return {
+      ...common,
+      kind: 'answer',
+      toolName: 'session.submit_answer',
+      answer: { content: answer.content },
+    };
+  }
+
+  const plan = isRecordPayload(value.plan) ? value.plan : undefined;
+  if (!plan || !Array.isArray(plan.tasks)) return undefined;
+  const tasks = plan.tasks.map(sessionSemanticDraftPlanTask);
+  if (tasks.some((task) => !task)) return undefined;
+  const risks = semanticDraftStringArray(plan.risks);
+  const reviewCheckpoints = semanticDraftStringArray(plan.reviewCheckpoints);
+  if (!risks || !reviewCheckpoints) return undefined;
+  if (plan.title !== undefined && typeof plan.title !== 'string') return undefined;
+  if (plan.summary !== undefined && typeof plan.summary !== 'string') return undefined;
+  if (value.planId !== undefined && typeof value.planId !== 'string') return undefined;
+  return {
+    ...common,
+    kind: 'plan',
+    toolName: 'session.submit_plan',
+    ...(typeof value.planId === 'string' ? { planId: value.planId } : {}),
+    plan: {
+      ...(typeof plan.title === 'string' ? { title: plan.title } : {}),
+      ...(typeof plan.summary === 'string' ? { summary: plan.summary } : {}),
+      tasks: tasks as NonNullable<SessionSemanticDraftPayload['plan']>['tasks'],
+      risks,
+      reviewCheckpoints,
+    },
+  };
+}
+
+function sessionSemanticDraftPlanTask(
+  value: unknown
+): NonNullable<SessionSemanticDraftPayload['plan']>['tasks'][number] | undefined {
+  if (!isRecordPayload(value) || !isRecordPayload(value.args)) return undefined;
+  const target = semanticDraftStringArray(value.target);
+  const dependencies = semanticDraftStringArray(value.dependencies);
+  const acceptanceCriteria = semanticDraftStringArray(value.acceptanceCriteria);
+  const failureCriteria = semanticDraftStringArray(value.failureCriteria);
+  if (!target || !dependencies || !acceptanceCriteria || !failureCriteria) return undefined;
+  if (typeof value.taskId !== 'string' || typeof value.title !== 'string' || typeof value.toolId !== 'string') {
+    return undefined;
+  }
+  return {
+    taskId: value.taskId,
+    title: value.title,
+    toolId: value.toolId,
+    target,
+    dependencies,
+    args: value.args,
+    acceptanceCriteria,
+    failureCriteria,
+  };
+}
+
+function semanticDraftStringArray(value: unknown): string[] | undefined {
+  if (!Array.isArray(value) || !value.every((item): item is string => typeof item === 'string')) {
+    return undefined;
+  }
+  return [...value];
 }
 
 function liveOverlayEventId(delta: ProjectionDelta): string {

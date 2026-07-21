@@ -96,6 +96,8 @@ export interface RunLifecycleState {
   artifactChunkRepairAttempts?: Record<string, number>;
   semanticDirectiveRepairAttempts?: Record<string, number>;
   pendingSemanticToolCalls?: Record<string, NativeToolCallProposal>;
+  pendingProviderCommitEvents?: AgentEvent[];
+  providerCommitDeferred?: boolean;
   providerRequestCacheHistory?: Record<string, ProviderRequestCacheHistoryEntry>;
   phase: SessionTurnPhase;
   workspaceScopeKey: string;
@@ -142,6 +144,19 @@ export interface RunLifecyclePipelinePorts<State extends RunLifecycleState> {
   append(sessionId: string, events: AgentEvent[]): Promise<AgentSessionResult>;
   kernel(request: KernelCommandEnvelope): Promise<KernelReply>;
   appendProjectedKernelEvents(sessionId: string, reply: KernelReply): Promise<AgentSessionResult>;
+  sessionRunStateEvent(input: {
+    sessionId: string;
+    runId: string;
+    phase: 'context_reading';
+    status: 'running';
+    reason: 'session';
+    decisionOwner: {
+      kind: 'session';
+      runId: string;
+    };
+    ts: string;
+    id: string;
+  }): AgentEvent;
   userMessageEvent(input: {
     sessionId: string;
     content: string;
@@ -213,6 +228,7 @@ export class RunLifecyclePipeline<State extends RunLifecycleState> {
 
     const events = input.existingEvents ?? [];
     const runId = firstString(runReply.events, 'runId') ?? this.ports.createId('run');
+    const startEvents: AgentEvent[] = [];
     if (userMessage) {
       const previousAuthority = latestSessionTurnAuthority(events);
       const pendingInteraction = pendingInteractionKind(events);
@@ -229,7 +245,7 @@ export class RunLifecyclePipeline<State extends RunLifecycleState> {
       const outputLanguage = relation === 'interactionContinuation'
         ? persistedOutputLanguage(previousAuthority?.outputLanguage, input.content)
         : visibleLanguageForRequest(input.content);
-      lastResult = await this.ports.append(sessionId, [createSessionTurnAuthorityEvent({
+      startEvents.push(createSessionTurnAuthorityEvent({
         sessionId,
         runId,
         turnId: this.ports.createId('session-turn'),
@@ -241,8 +257,22 @@ export class RunLifecyclePipeline<State extends RunLifecycleState> {
         previousTaskId: relation === 'newTask' ? previousAuthority?.taskId : undefined,
         eventId: this.ports.createId('session-turn-authority'),
         timestamp: this.ports.now(),
-      })]);
+      }));
     }
+    startEvents.push(this.ports.sessionRunStateEvent({
+      sessionId,
+      runId,
+      phase: 'context_reading',
+      status: 'running',
+      reason: 'session',
+      decisionOwner: {
+        kind: 'session',
+        runId,
+      },
+      ts: this.ports.now(),
+      id: this.ports.createId('session-run-context-reading'),
+    }));
+    lastResult = await this.ports.append(sessionId, startEvents);
     return this.hydrate({
       input,
       lastResult,
@@ -353,6 +383,8 @@ export class RunLifecyclePipeline<State extends RunLifecycleState> {
       artifactChunkRepairAttempts: {},
       semanticDirectiveRepairAttempts: {},
       pendingSemanticToolCalls: {},
+      pendingProviderCommitEvents: [],
+      providerCommitDeferred: false,
       phase: 'context_reading',
       workspaceScopeKey: manifestBuild.manifest.workspaceScopeKey,
       workspaceBinding: input.workspaceBinding,
@@ -393,7 +425,7 @@ export class RunLifecyclePipeline<State extends RunLifecycleState> {
       taskPlanReplanReason,
       providerRequestCacheHistory,
       interactionOverlay: input.interactionOverlay,
-    } as State;
+    } as unknown as State;
 
     if (state.manifest.entries.length > 0 && options.resolveInitialResources) {
       lastResult = await this.ports.resolveInitialResources(state);
