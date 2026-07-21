@@ -109,6 +109,19 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
     completedTypewriterBlockLengths,
     typewriterBlockLengths
   );
+  const actionBarTurnId = useMemo(() => {
+    if (loading || viewWithActive.interactionProjection?.pending) return undefined;
+    for (const turn of [...viewWithActive.turns].reverse()) {
+      if (turn.status !== 'completed' && turn.status !== 'failed') continue;
+      const visibleBlocks = turn.blocks.filter(isVisibleTimelineBlock);
+      if (!visibleBlocks.some(isActionableAgentOutputBlock)) continue;
+      if (visibleBlocks.some((block) => !playbackVisibleBlockIds.has(block.id) || animatingBlockIds.has(block.id))) {
+        continue;
+      }
+      return turn.id;
+    }
+    return undefined;
+  }, [animatingBlockIds, loading, playbackVisibleBlockIds, viewWithActive]);
   const timelineDensityClass = timelineDensity === 'compact' ? ' deepcode-gui-timeline--compact' : '';
   useEffect(() => {
     setCompletedTypewriterBlockLengths((current) => {
@@ -382,6 +395,7 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
             turn={turn}
             language={language}
             transportPending={loading && turnIndex === viewWithActive.turns.length - 1}
+            showActions={turn.id === actionBarTurnId}
             playbackVisibleBlockIds={playbackVisibleBlockIds}
             typewriterBlockIds={animatingBlockIds}
             collapseCompletedThinking={collapseCompletedThinking}
@@ -657,19 +671,20 @@ const TurnCard: React.FC<{
   turn: AgentTimelineTurn;
   language: UiLanguage;
   transportPending: boolean;
+  showActions: boolean;
   playbackVisibleBlockIds: Set<string>;
   typewriterBlockIds: Set<string>;
   collapseCompletedThinking: boolean;
   onLiveContentChange: () => void;
   onTypewriterComplete: (blockId: string, textLength: number) => void;
   onPlanResolve?: DeepCodeTimelineProps['onPlanResolve'];
-}> = ({ turn, language, transportPending, playbackVisibleBlockIds, typewriterBlockIds, collapseCompletedThinking, onLiveContentChange, onTypewriterComplete, onPlanResolve }) => {
+}> = ({ turn, language, transportPending, showActions, playbackVisibleBlockIds, typewriterBlockIds, collapseCompletedThinking, onLiveContentChange, onTypewriterComplete, onPlanResolve }) => {
   const startedAtLabel = formatTurnTime(turn.startedAt);
   const visibleBlocks = turn.blocks.filter(isVisibleTimelineBlock);
   const blocks = visibleBlocks.filter((block) => playbackVisibleBlockIds.has(block.id));
   if (blocks.length === 0) return null;
-  const actionsReady = !transportPending &&
-    (turn.status === 'completed' || turn.status === 'failed') &&
+  const actionsReady = showActions &&
+    !transportPending &&
     blocks.length === visibleBlocks.length &&
     visibleBlocks.every((block) => !typewriterBlockIds.has(block.id));
 
@@ -710,12 +725,13 @@ const TurnActionBar: React.FC<{
   language: UiLanguage;
 }> = ({ blocks, language }) => {
   const [status, setStatus] = useState<'idle' | 'copied' | 'rated' | 'error'>('idle');
-  const feedbackEvent = feedbackTargetEvent(blocks);
+  const actionBlocks = blocks.filter(isActionableAgentOutputBlock);
+  const feedbackEvent = feedbackTargetEvent(actionBlocks);
 
-  if (!hasVisibleTurnContent(blocks)) return null;
+  if (actionBlocks.length === 0) return null;
 
   const copyTurn = async () => {
-    const text = turnCopyText(blocks, language);
+    const text = turnCopyText(actionBlocks, language);
     try {
       await copyText(text);
       setStatus('copied');
@@ -1675,11 +1691,10 @@ function thinkingMarkdown(block: AgentTimelineBlock): string {
   return (block.bodyMarkdown ?? '').trim();
 }
 
-function hasVisibleTurnContent(blocks: AgentTimelineBlock[]): boolean {
-  return blocks.some((block) => {
-    if (block.kind === 'turnActions') return false;
-    return Boolean((block.bodyMarkdown ?? block.summary ?? '').trim() || block.structuredProjection || block.activity);
-  });
+function isActionableAgentOutputBlock(block: AgentTimelineBlock): boolean {
+  if (block.kind === 'review' || block.narrativeKind === 'review') return true;
+  if (block.narrativeKind) return block.narrativeKind === 'assistantText';
+  return block.kind === 'assistant';
 }
 
 function feedbackTargetEvent(blocks: AgentTimelineBlock[]): AgentTimelineBlock['feedbackRef'] {
