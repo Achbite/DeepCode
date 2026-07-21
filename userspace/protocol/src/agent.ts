@@ -818,6 +818,8 @@ export interface RenameAgentSessionRequest {
 export interface UpdateAgentSessionRequest {
   title?: string;
   projectId?: string | null;
+  /** null resets the session to the current enabled default Profile. */
+  profileId?: string | null;
 }
 
 export interface AgentProjectListResult {

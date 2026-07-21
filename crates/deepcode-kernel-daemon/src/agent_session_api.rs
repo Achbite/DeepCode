@@ -75,6 +75,7 @@ pub(crate) async fn agent_session_create(
     } else {
         body.get("workspaceHash").and_then(Value::as_str)
     };
+    let default_profile_id = preferred_enabled_llm_profile_id(&gui.llm_profiles);
     let mut session = create_agent_session_value(
         &id,
         &now,
@@ -82,7 +83,7 @@ pub(crate) async fn agent_session_create(
             .and_then(Value::as_str)
             .unwrap_or("New Agent Session"),
         mode,
-        body.get("profileId").and_then(Value::as_str),
+        default_profile_id.as_deref(),
         workspace_id,
         workspace_hash,
     );
@@ -145,6 +146,59 @@ pub(crate) async fn agent_session_rename(
     Json(body): Json<Value>,
 ) -> Json<ApiResponse> {
     let mut gui = state.gui.lock().expect("gui state lock");
+    if !has_session(&gui, &session_id) {
+        return ApiResponse::error("agent_session_not_found", "agent session not found");
+    }
+    let requested_profile_id = body
+        .as_object()
+        .filter(|object| object.contains_key("profileId"))
+        .map(|_| body.get("profileId").cloned().unwrap_or(Value::Null));
+    let resolved_profile_id = if let Some(requested_profile_id) = requested_profile_id {
+        let run_locked = state
+            .session_runs
+            .lock()
+            .expect("session run state lock")
+            .values()
+            .any(|run| {
+                run.session_id == session_id
+                    && matches!(run.status.as_str(), "running" | "cancelling")
+            });
+        if run_locked || session_has_pending_interaction(&gui, &session_id) {
+            return ApiResponse::error(
+                "agent_session_profile_locked",
+                "session Profile is locked while a run or user interaction is active",
+            );
+        }
+        let profile_id = if requested_profile_id.is_null() {
+            preferred_enabled_llm_profile_id(&gui.llm_profiles)
+        } else if let Some(profile_id) = requested_profile_id
+            .as_str()
+            .map(str::trim)
+            .filter(|profile_id| !profile_id.is_empty())
+        {
+            if !llm_profile_is_enabled(&gui.llm_profiles, profile_id) {
+                return ApiResponse::error(
+                    "llm_profile_unavailable",
+                    "selected LLM Profile does not exist or is disabled",
+                );
+            }
+            Some(profile_id.to_string())
+        } else {
+            return ApiResponse::error(
+                "invalid_agent_session_profile",
+                "profileId must be a non-empty string or null",
+            );
+        };
+        let Some(profile_id) = profile_id else {
+            return ApiResponse::error(
+                "llm_profile_unavailable",
+                "no enabled LLM Profile is available for this session",
+            );
+        };
+        Some(profile_id)
+    } else {
+        None
+    };
     let requested_project_id = body.get("projectId").cloned();
     let requested_project = requested_project_id
         .as_ref()
@@ -177,6 +231,9 @@ pub(crate) async fn agent_session_rename(
                 apply_project_binding_to_session(session, project);
             }
         }
+        if let Some(profile_id) = resolved_profile_id {
+            session["profileId"] = json!(profile_id);
+        }
         session["updatedAt"] = json!(now_text());
         if let Err(error) = persist_session_index(&gui) {
             return ApiResponse::error("agent_session_persist_failed", error);
@@ -184,6 +241,23 @@ pub(crate) async fn agent_session_rename(
         return session_result(&gui, &session_id);
     }
     ApiResponse::error("agent_session_not_found", "agent session not found")
+}
+
+pub(crate) fn session_has_pending_interaction(gui: &GuiState, session_id: &str) -> bool {
+    let cached = gui.session_timeline_cache.get(session_id).cloned();
+    let timeline = cached.or_else(|| {
+        read_json_file(
+            &gui.paths
+                .sessions_dir
+                .join(safe_path_segment(session_id))
+                .join("timeline.json"),
+        )
+    });
+    timeline
+        .as_ref()
+        .and_then(|timeline| timeline.get("interactionProjection"))
+        .and_then(|projection| projection.get("pending"))
+        .is_some_and(Value::is_object)
 }
 
 pub(crate) async fn agent_session_delete(

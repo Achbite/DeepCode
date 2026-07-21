@@ -88,6 +88,16 @@ pub(crate) async fn run(command: Command) -> Result<(), String> {
             let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
             rename_session(bootstrap.client(), &session_id, &title).await
         }
+        Command::SessionsProfile {
+            api,
+            no_auto_start_kernel,
+            session_id,
+            profile_id,
+        } => {
+            let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
+            print_or_update_session_profile(bootstrap.client(), &session_id, profile_id.as_deref())
+                .await
+        }
         Command::SessionsDelete {
             api,
             no_auto_start_kernel,
@@ -219,6 +229,12 @@ enum Command {
         no_auto_start_kernel: bool,
         session_id: String,
         title: String,
+    },
+    SessionsProfile {
+        api: Option<String>,
+        no_auto_start_kernel: bool,
+        session_id: String,
+        profile_id: Option<String>,
     },
     SessionsDelete {
         api: Option<String>,
@@ -390,6 +406,24 @@ impl Command {
                     no_auto_start_kernel,
                     session_id: session_id.to_string(),
                     title: title.join(" "),
+                })
+            }
+            [sessions, profile, session_id] if sessions == "sessions" && profile == "profile" => {
+                Ok(Command::SessionsProfile {
+                    api,
+                    no_auto_start_kernel,
+                    session_id: session_id.to_string(),
+                    profile_id: None,
+                })
+            }
+            [sessions, profile, session_id, profile_id]
+                if sessions == "sessions" && profile == "profile" =>
+            {
+                Ok(Command::SessionsProfile {
+                    api,
+                    no_auto_start_kernel,
+                    session_id: session_id.to_string(),
+                    profile_id: Some(profile_id.to_string()),
                 })
             }
             [sessions, delete, session_id] if sessions == "sessions" && delete == "delete" => {

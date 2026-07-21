@@ -505,6 +505,32 @@ pub(crate) async fn rename_session(
     Ok(())
 }
 
+pub(crate) async fn print_or_update_session_profile(
+    client: &HttpKernelClient,
+    target_session_id: &str,
+    profile_id: Option<&str>,
+) -> Result<(), String> {
+    let result = if let Some(profile_id) = profile_id {
+        client
+            .update_agent_session_profile(target_session_id, Some(profile_id))
+            .await
+            .map_err(|error| format!("failed to update session Profile: {error}"))?
+    } else {
+        client
+            .get_agent_session(target_session_id)
+            .await
+            .map_err(|error| format!("failed to read session Profile: {error}"))?
+    };
+    let selected = result
+        .session
+        .get("profileId")
+        .and_then(Value::as_str)
+        .unwrap_or("unavailable");
+    println!("session: {target_session_id}");
+    println!("profile: {selected}");
+    Ok(())
+}
+
 pub(crate) async fn delete_or_archive_session(
     client: &HttpKernelClient,
     session_id: &str,

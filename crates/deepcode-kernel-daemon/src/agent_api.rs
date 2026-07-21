@@ -20,7 +20,6 @@ pub(crate) struct AgentSessionRunRequest {
     pub(crate) attachments: Option<Vec<Value>>,
     pub(crate) workspace_path: Option<String>,
     pub(crate) no_workspace: Option<bool>,
-    pub(crate) profile_id: Option<String>,
     pub(crate) workflow: Option<String>,
     pub(crate) requirement_confirmation_mode: Option<String>,
     pub(crate) review_continuation_mode: Option<String>,
@@ -79,11 +78,47 @@ pub(crate) async fn agent_session_run_start(
     }
     let start_event_count = events.len();
     let run_id = format!("session-run-{}", now_millis());
-    let run = AgentRunState::running(run_id.clone(), session_id.clone(), start_event_count);
-    {
+    let (run, session, profile_id) = {
+        let mut gui = state.gui.lock().expect("gui state lock");
+        let llm_profiles = gui.llm_profiles.clone();
+        let Some(stored_session) = session_mut(&mut gui, &session_id) else {
+            return ApiResponse::error("agent_session_not_found", "agent session not found");
+        };
+        let stored_profile_id = stored_session
+            .get("profileId")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let profile_id = stored_profile_id
+            .as_deref()
+            .filter(|profile_id| llm_profile_is_enabled(&llm_profiles, profile_id))
+            .map(str::to_string)
+            .or_else(|| preferred_enabled_llm_profile_id(&llm_profiles));
+        let Some(profile_id) = profile_id else {
+            return ApiResponse::error(
+                "llm_profile_unavailable",
+                "no enabled LLM Profile is available for this session",
+            );
+        };
+        if stored_profile_id.as_deref() != Some(profile_id.as_str()) {
+            stored_session["profileId"] = json!(profile_id.clone());
+            stored_session["updatedAt"] = json!(now_text());
+            if let Err(error) = persist_session_index(&gui) {
+                return ApiResponse::error("agent_session_persist_failed", error);
+            }
+        }
+        let session = session_by_id(&gui, &session_id)
+            .cloned()
+            .unwrap_or_else(|| session.clone());
+        let run = AgentRunState::running(
+            run_id.clone(),
+            session_id.clone(),
+            profile_id.clone(),
+            start_event_count,
+        );
         let mut runs = state.session_runs.lock().expect("session run state lock");
         runs.insert(run_id.clone(), run.clone());
-    }
+        (run, session, profile_id)
+    };
 
     let intervention_level = body
         .intervention_level
@@ -103,6 +138,7 @@ pub(crate) async fn agent_session_run_start(
         &session_id,
         &run_id,
         &body,
+        &profile_id,
         intervention_level,
         project_memory_mode,
         autonomy_mode,

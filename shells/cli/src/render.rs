@@ -540,6 +540,7 @@ Usage:
   DeepCode-CLI sessions new [title]
   DeepCode-CLI sessions resume <session-id>
   DeepCode-CLI sessions rename <session-id> <title>
+  DeepCode-CLI sessions profile <session-id> [profile-id]
   DeepCode-CLI sessions delete <session-id>
   DeepCode-CLI sessions archive <session-id>
   DeepCode-CLI timeline [session-id]

@@ -102,6 +102,7 @@ export interface StartAgentRunRequest {
 export interface AgentRunStatus {
   runId: string;
   sessionId: string;
+  profileId?: string;
   status: 'running' | 'waiting' | 'completed' | 'failed' | 'cancelled' | string;
   startedAt: string;
   updatedAt: string;

@@ -78,6 +78,13 @@ export interface LlmProfilesResult {
   profiles: LlmProviderProfile[];
   defaultProfileId?: string;
   storePath?: string;
+  profileMigrations?: AgentSessionProfileMigration[];
+}
+
+export interface AgentSessionProfileMigration {
+  sessionId: string;
+  fromProfileId?: string;
+  toProfileId: string;
 }
 
 export interface PatchLlmProfilesRequest {
