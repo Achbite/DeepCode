@@ -38,6 +38,7 @@ const SessionModelSelector: React.FC<SessionModelSelectorProps> = ({
   const selectProfile = useAgentSessionStore((state) => state.selectProfile);
   const refreshSessionProfile = useAgentSessionStore((state) => state.refreshSessionProfile);
   const [profiles, setProfiles] = useState<LlmProviderProfile[]>([]);
+  const [defaultProfileId, setDefaultProfileId] = useState<string | undefined>();
   const [loadState, setLoadState] = useState<'loading' | 'ready' | 'error'>('loading');
   const [migrationNotice, setMigrationNotice] = useState<string | null>(null);
 
@@ -47,18 +48,25 @@ const SessionModelSelector: React.FC<SessionModelSelectorProps> = ({
       result = await getLlmProfiles();
     } catch {
       setProfiles([]);
+      setDefaultProfileId(undefined);
       setLoadState('error');
       onAvailabilityChange(false);
       return [];
     }
     if (!result.ok || !result.data) {
       setProfiles([]);
+      setDefaultProfileId(undefined);
       setLoadState('error');
       onAvailabilityChange(false);
       return [];
     }
     const enabledProfiles = result.data.profiles.filter((profile) => profile.enabled);
     setProfiles(enabledProfiles);
+    setDefaultProfileId(
+      enabledProfiles.some((profile) => profile.id === result.data!.defaultProfileId)
+        ? result.data.defaultProfileId
+        : enabledProfiles[0]?.id
+    );
     setLoadState('ready');
     onAvailabilityChange(enabledProfiles.length > 0);
     return enabledProfiles;
@@ -92,7 +100,7 @@ const SessionModelSelector: React.FC<SessionModelSelectorProps> = ({
     return () => window.removeEventListener('deepcode:llm-profiles-updated', onProfilesUpdated);
   }, [language, loadProfiles, refreshSessionProfile, session?.id]);
 
-  const selectedProfileId = session?.profileId ?? '';
+  const selectedProfileId = session?.profileId ?? defaultProfileId ?? '';
   const selectedProfile = useMemo(
     () => profiles.find((profile) => profile.id === selectedProfileId),
     [profiles, selectedProfileId]
