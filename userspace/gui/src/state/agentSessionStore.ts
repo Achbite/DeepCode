@@ -420,7 +420,8 @@ async function startAndWaitAgentRun(
     if (event.event === 'delta') {
       const delta = data.delta;
       if (!isRecord(delta) || !isAgentTimelineDelta(delta)) return;
-      if (delta.sessionId !== sessionId || delta.runId !== runId) return;
+      const deltaHostRunId = typeof delta.hostRunId === 'string' ? delta.hostRunId : null;
+      if (delta.sessionId !== sessionId || deltaHostRunId !== runId) return;
       const deltaSeq = typeof delta.deltaSeq === 'number' ? delta.deltaSeq : 0;
       projectionDeliveryDiagnostics.recordDelta(
         'gui.sse_delta_received',
@@ -448,6 +449,12 @@ async function startAndWaitAgentRun(
     while (!stopStream && !controller.signal.aborted && !terminalStreamObserved) {
       const beforeDeltaSeq = lastDeltaSeq;
       const beforeEventCount = lastEventCount;
+      projectionDeliveryDiagnostics.recordRun(
+        sessionId,
+        runId,
+        'gui.sse_stream_started',
+        'accepted'
+      );
       try {
         await streamAgentRun(
           sessionId,
@@ -456,7 +463,19 @@ async function startAndWaitAgentRun(
           { sinceEventCount: lastEventCount, sinceDeltaSeq: lastDeltaSeq },
           controller.signal
         );
+        projectionDeliveryDiagnostics.recordRun(
+          sessionId,
+          runId,
+          'gui.sse_stream_ended',
+          'accepted'
+        );
       } catch {
+        projectionDeliveryDiagnostics.recordRun(
+          sessionId,
+          runId,
+          'gui.sse_stream_failed',
+          'failed'
+        );
         if (stopStream || controller.signal.aborted) break;
       }
       if (stopStream || controller.signal.aborted || terminalStreamObserved) break;

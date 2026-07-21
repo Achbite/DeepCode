@@ -59,8 +59,25 @@ class GuiProjectionDeliveryDiagnostics {
     const context = this.contextForDelta(delta);
     if (!context) return;
     context.blockIds.add(delta.blockId);
-    this.runKeyByBlock.set(blockKey(delta.sessionId, delta.blockId), runKey(delta.sessionId, delta.runId));
+    this.runKeyByBlock.set(
+      blockKey(delta.sessionId, delta.blockId),
+      runKey(context.sessionId, context.runId)
+    );
     context.recorder.record(projectionDeliveryMetadataForTimelineDelta(stage, delta, result));
+  }
+
+  recordRun(
+    sessionId: string,
+    runId: string,
+    stage: Extract<
+      ProjectionDeliveryStage,
+      'gui.sse_stream_started' | 'gui.sse_stream_ended' | 'gui.sse_stream_failed'
+    >,
+    result: 'accepted' | 'failed'
+  ): void {
+    const context = this.runs.get(runKey(sessionId, runId));
+    if (!context) return;
+    context.recorder.record({ stage, result });
   }
 
   recordBlock(
@@ -118,6 +135,11 @@ class GuiProjectionDeliveryDiagnostics {
   }
 
   private contextForDelta(delta: AgentTimelineDelta): GuiProjectionDeliveryRun | undefined {
+    const hostRunId = (delta as AgentTimelineDelta & { hostRunId?: unknown }).hostRunId;
+    if (typeof hostRunId === 'string') {
+      const hostContext = this.runs.get(runKey(delta.sessionId, hostRunId));
+      if (hostContext) return hostContext;
+    }
     return this.runs.get(runKey(delta.sessionId, delta.runId));
   }
 
