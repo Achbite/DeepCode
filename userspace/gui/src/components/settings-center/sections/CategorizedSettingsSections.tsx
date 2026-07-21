@@ -28,6 +28,7 @@ interface PlaceholderProps {
 const GUI_SETTING_KEYS = [
   'workbench.language',
   'gui.colorTheme',
+  'gui.accentColor',
   'gui.timelineDensity',
   'gui.typewriterAnimation',
   'gui.collapseCompletedThinking',

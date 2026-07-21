@@ -16,6 +16,8 @@
   --dc-accent: #007aff;
   --dc-accent-soft: rgba(0, 122, 255, 0.1);
   --dc-accent-border: rgba(0, 122, 255, 0.23);
+  --dc-accent-contrast: #ffffff;
+  --dc-focus-ring: rgba(0, 122, 255, 0.42);
   --dc-success: #16845b;
   --dc-warning: #a66308;
   --dc-danger: #d13c36;
@@ -47,6 +49,7 @@
     inset 1px 1px 0 rgba(255, 255, 255, 0.72);
 }
 
+:root[data-product='deepcode-gui'][data-theme='dark'],
 :root[data-product='deepcode-gui'][data-theme='deepcode-gui-dark'] {
   color-scheme: dark;
   --dc-background: #09090b;
@@ -65,6 +68,8 @@
   --dc-accent: #0a84ff;
   --dc-accent-soft: rgba(10, 132, 255, 0.14);
   --dc-accent-border: rgba(10, 132, 255, 0.3);
+  --dc-accent-contrast: #ffffff;
+  --dc-focus-ring: rgba(10, 132, 255, 0.52);
   --dc-success: #34d399;
   --dc-warning: #f0b85a;
   --dc-danger: #ff716b;
@@ -77,10 +82,70 @@
     inset 1px 1px 0 rgba(255, 255, 255, 0.08);
 }
 
+:root[data-product='deepcode-gui'][data-accent='blue'] {
+  --dc-accent: #007aff;
+  --dc-accent-soft: rgba(0, 122, 255, 0.1);
+  --dc-accent-border: rgba(0, 122, 255, 0.23);
+  --dc-focus-ring: rgba(0, 122, 255, 0.42);
+}
+
+:root[data-product='deepcode-gui'][data-theme='dark'][data-accent='blue'] {
+  --dc-accent: #0a84ff;
+  --dc-accent-soft: rgba(10, 132, 255, 0.14);
+  --dc-accent-border: rgba(10, 132, 255, 0.3);
+  --dc-focus-ring: rgba(10, 132, 255, 0.52);
+}
+
+:root[data-product='deepcode-gui'][data-accent='purple'] {
+  --dc-accent: #7c3aed;
+  --dc-accent-soft: rgba(124, 58, 237, 0.11);
+  --dc-accent-border: rgba(124, 58, 237, 0.25);
+  --dc-focus-ring: rgba(124, 58, 237, 0.42);
+}
+
+:root[data-product='deepcode-gui'][data-theme='dark'][data-accent='purple'] {
+  --dc-accent: #a78bfa;
+  --dc-accent-soft: rgba(167, 139, 250, 0.15);
+  --dc-accent-border: rgba(167, 139, 250, 0.31);
+  --dc-accent-contrast: #17121f;
+  --dc-focus-ring: rgba(167, 139, 250, 0.54);
+}
+
+:root[data-product='deepcode-gui'][data-accent='green'] {
+  --dc-accent: #16845b;
+  --dc-accent-soft: rgba(22, 132, 91, 0.11);
+  --dc-accent-border: rgba(22, 132, 91, 0.26);
+  --dc-focus-ring: rgba(22, 132, 91, 0.42);
+}
+
+:root[data-product='deepcode-gui'][data-theme='dark'][data-accent='green'] {
+  --dc-accent: #34d399;
+  --dc-accent-soft: rgba(52, 211, 153, 0.15);
+  --dc-accent-border: rgba(52, 211, 153, 0.31);
+  --dc-accent-contrast: #071b14;
+  --dc-focus-ring: rgba(52, 211, 153, 0.5);
+}
+
 :root[data-product='deepcode-gui'] body {
   background: var(--dc-background);
   color: var(--dc-foreground);
   font-family: var(--dc-font-ui);
   font-size: var(--dc-font-body-large);
   letter-spacing: 0;
+}
+
+:root[data-product='deepcode-gui'] :is(button, input, select, textarea, [tabindex]):focus-visible {
+  outline: 2px solid var(--dc-focus-ring);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root[data-product='deepcode-gui'] *,
+  :root[data-product='deepcode-gui'] *::before,
+  :root[data-product='deepcode-gui'] *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
 }

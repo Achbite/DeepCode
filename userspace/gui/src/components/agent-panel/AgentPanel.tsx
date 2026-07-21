@@ -1,6 +1,5 @@
 import React, { useEffect } from 'react';
 import { createWorkspaceScopeKey } from '@deepcode/session-core';
-import { getLlmProfiles } from '../../services/runtimeAdapter';
 import { useAgentSessionStore } from '../../state/agentSessionStore';
 import { useSettingsStore } from '../../state/settingsStore';
 import { useWorkspaceStore } from '../../state/workspaceStore';
@@ -18,9 +17,9 @@ const AgentPanel: React.FC = () => {
   const timeline = useAgentSessionStore((s) => s.timeline);
   const session = useAgentSessionStore((s) => s.session);
   const sessions = useAgentSessionStore((s) => s.sessions);
-  const profileId = useAgentSessionStore((s) => s.profileId);
   const loading = useAgentSessionStore((s) => s.loading);
   const runningSessionIds = useAgentSessionStore((s) => s.runningSessionIds);
+  const cancellingSessionIds = useAgentSessionStore((s) => s.cancellingSessionIds);
   const errorMessage = useAgentSessionStore((s) => s.errorMessage);
   const messageAttachments = useAgentSessionStore((s) => s.messageAttachments);
   const sessionAttachments = useAgentSessionStore((s) => s.sessionAttachments);
@@ -34,7 +33,6 @@ const AgentPanel: React.FC = () => {
   const activateSession = useAgentSessionStore((s) => s.activateSession);
   const renameSession = useAgentSessionStore((s) => s.renameSession);
   const archiveSession = useAgentSessionStore((s) => s.archiveSession);
-  const setProfileId = useAgentSessionStore((s) => s.setProfileId);
   const addAttachment = useAgentSessionStore((s) => s.addAttachment);
   const removeAttachment = useAgentSessionStore((s) => s.removeAttachment);
   const sendMessage = useAgentSessionStore((s) => s.sendMessage);
@@ -48,7 +46,10 @@ const AgentPanel: React.FC = () => {
   const language = normalizeUiLanguage(
     useSettingsStore((s) => s.effectiveSettings['workbench.language'])
   );
-  const activeSessionRunning = Boolean(session?.id && runningSessionIds.includes(session.id));
+  const activeSessionRunning = Boolean(
+    session?.id
+    && (runningSessionIds.includes(session.id) || cancellingSessionIds.includes(session.id))
+  );
   const timelineProjection = timelineOrEmpty(timeline, session?.id);
   const pendingDecision = findPendingComposerDecisionFromProjection({
     timeline: timelineProjection,
@@ -61,20 +62,6 @@ const AgentPanel: React.FC = () => {
   const composerPendingDecision = pendingDecisionResolving || pendingDecision?.kind === 'permission' ? null : pendingDecision;
   const pendingPermissionRequest = pendingDecision?.kind === 'permission' ? pendingDecision.request : null;
   const agentBusy = loading || activeSessionRunning || pendingDecisionResolving;
-
-  useEffect(() => {
-    const loadProfiles = () => getLlmProfiles().then((result) => {
-      if (result.ok && result.data) {
-        setProfileId(profileId ?? result.data.defaultProfileId);
-      }
-    });
-    void loadProfiles();
-    const onProfilesUpdated = () => {
-      void loadProfiles();
-    };
-    window.addEventListener('deepcode:llm-profiles-updated', onProfilesUpdated);
-    return () => window.removeEventListener('deepcode:llm-profiles-updated', onProfilesUpdated);
-  }, [profileId, setProfileId]);
 
   useEffect(() => {
     void loadOrCreate();

@@ -16,6 +16,9 @@ interface AgentComposerProps {
   onStop: () => void;
   onAddAttachment: (attachment: AgentContextAttachment) => void;
   onRemoveAttachment: (path: string, scope: AgentContextAttachment['scope']) => void;
+  footerControls?: React.ReactNode;
+  sendBlocked?: boolean;
+  sendBlockedTitle?: string;
   pendingDecision?: AgentComposerPendingDecision | null;
   onDecisionSubmit?: (guidance?: string, action?: 'accept' | 'revise') => void | Promise<void>;
   onDecisionReject?: () => void | Promise<void>;
@@ -352,6 +355,9 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
   onStop,
   onAddAttachment,
   onRemoveAttachment,
+  footerControls,
+  sendBlocked = false,
+  sendBlockedTitle,
   pendingDecision,
   onDecisionSubmit,
   onDecisionReject,
@@ -428,6 +434,7 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
       void onDecisionSubmit?.(normalized.guidance, normalized.action);
       return;
     }
+    if (sendBlocked) return;
     if (!nextValue.trim()) return;
     setValue('');
     void onSend(nextValue);
@@ -489,7 +496,7 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
     ? false
     : pendingDecision
       ? decisionResolving
-      : !value.trim();
+      : sendBlocked || !value.trim();
   const sendLabel = decisionResolving
     ? t(language, 'agent.composer.decision.resolving')
     : loading
@@ -832,6 +839,7 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
               +
             </button>
           </div>
+          {footerControls}
         </div>
         <button
           className={loading ? 'agent-composer__send-button--stop' : undefined}
@@ -840,7 +848,7 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
           type="button"
           title={loading
             ? t(language, 'agent.composer.stopTitle')
-            : t(language, 'agent.composer.sendTitle')}
+            : sendBlockedTitle ?? t(language, 'agent.composer.sendTitle')}
         >
           {sendLabel}
         </button>

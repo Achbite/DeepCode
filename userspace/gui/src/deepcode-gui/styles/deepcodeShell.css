@@ -11,6 +11,7 @@
   --faint: var(--dc-faint);
   --accent: var(--dc-accent);
   --accent-soft: var(--dc-accent-soft);
+  --accent-contrast: var(--dc-accent-contrast);
   --ok: var(--dc-success);
   --warn: var(--dc-warning);
   --danger: var(--dc-danger);
@@ -20,6 +21,15 @@
   font-family: var(--dc-font-ui);
   font-size: var(--dc-font-body);
   line-height: var(--dc-line-body);
+}
+
+:root[data-product='deepcode-gui'] .settings-nav-item--active,
+:root[data-product='deepcode-gui'] .agent-composer-decision__confirm {
+  color: var(--dc-accent-contrast);
+}
+
+:root[data-product='deepcode-gui'] .agent-attachment-picker button:hover {
+  color: var(--dc-foreground);
 }
 
 .deepcode-gui-titlebar {
@@ -400,5 +410,167 @@
 
   .deepcode-gui-session-main {
     border-left: 0;
+  }
+}
+
+:root[data-product='deepcode-gui'] {
+  --bg-app: var(--dc-background);
+  --bg-panel: var(--dc-surface);
+  --bg-surface: var(--dc-surface-subtle);
+  --text-main: var(--dc-foreground);
+  --text-strong: var(--dc-foreground-strong);
+  --text-muted: var(--dc-muted);
+  --line: var(--dc-border);
+  --line-soft: var(--dc-border);
+  --line-strong: var(--dc-border-strong);
+  --accent: var(--dc-accent);
+  --accent-soft: var(--dc-accent-soft);
+  --ok: var(--dc-success);
+  --warn: var(--dc-warning);
+  --danger: var(--dc-danger);
+}
+
+:root[data-product='deepcode-gui'] body {
+  background: var(--dc-background);
+  color: var(--dc-foreground);
+}
+
+:root[data-product='deepcode-gui'][data-theme='dark'] .deepcode-gui-settings-sheet,
+:root[data-product='deepcode-gui'][data-theme='dark'] .deepcode-gui-memory-sheet {
+  border-color: var(--dc-border-strong);
+  background: var(--dc-surface);
+  box-shadow: var(--dc-shadow-panel);
+}
+
+:root[data-product='deepcode-gui'][data-theme='dark'] .deepcode-gui-settings-sheet__header {
+  border-bottom-color: var(--dc-border);
+}
+
+:root[data-product='deepcode-gui'][data-theme='dark'] .deepcode-gui-settings-sheet__header h2 {
+  color: var(--dc-foreground-strong);
+}
+
+:root[data-product='deepcode-gui'][data-theme='dark'] .deepcode-gui-settings-sheet__header span,
+:root[data-product='deepcode-gui'][data-theme='dark'] .deepcode-gui-git-review__summary {
+  color: var(--dc-muted);
+}
+
+:root[data-product='deepcode-gui'][data-theme='dark'] .deepcode-gui-settings-sheet__header button,
+:root[data-product='deepcode-gui'][data-theme='dark'] .deepcode-gui-settings-sheet__runtime span {
+  border-color: var(--dc-border);
+  background: var(--dc-surface-raised);
+  color: var(--dc-muted);
+}
+
+:root[data-product='deepcode-gui'][data-theme='dark'] .deepcode-gui-settings-sheet__header button:hover {
+  background: var(--dc-surface-hover);
+}
+
+:root[data-product='deepcode-gui'][data-theme='dark'] .deepcode-gui-settings-sheet__runtime,
+:root[data-product='deepcode-gui'][data-theme='dark'] .deepcode-gui-git-review__files code,
+:root[data-product='deepcode-gui'][data-theme='dark'] .deepcode-gui-git-review__files span,
+:root[data-product='deepcode-gui'][data-theme='dark'] .deepcode-gui-git-review__diff pre {
+  border-color: var(--dc-border);
+  background: var(--dc-surface-subtle);
+  color: var(--dc-muted);
+}
+
+.deepcode-session-model {
+  position: relative;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.deepcode-session-model__selector {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+}
+
+.deepcode-session-model__label {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+.deepcode-session-model__selector select {
+  width: min(330px, 30vw);
+  min-width: 148px;
+  height: 28px;
+  overflow: hidden;
+  border: 1px solid var(--dc-border);
+  border-radius: 9px;
+  background: var(--dc-surface-raised);
+  color: var(--dc-foreground);
+  padding: 0 26px 0 9px;
+  font-family: var(--dc-font-ui);
+  font-size: var(--dc-font-caption);
+  text-overflow: ellipsis;
+}
+
+.deepcode-session-model__selector select:hover:not(:disabled) {
+  border-color: var(--dc-accent-border);
+  background: var(--dc-surface-hover);
+}
+
+.deepcode-session-model__selector select:disabled {
+  color: var(--dc-faint);
+  cursor: not-allowed;
+  opacity: 0.72;
+}
+
+.deepcode-session-model__context {
+  width: 30px;
+  height: 30px;
+  flex: 0 0 30px;
+  display: grid;
+  place-items: center;
+  border: 2px solid var(--dc-border-strong);
+  border-radius: 50%;
+  background: var(--dc-surface-subtle);
+  color: var(--dc-faint);
+  font-size: 9px;
+  font-weight: var(--dc-weight-semibold);
+  cursor: help;
+}
+
+.deepcode-session-model__notice {
+  position: absolute;
+  left: 0;
+  bottom: calc(100% + 9px);
+  z-index: 30;
+  width: min(360px, calc(100vw - 40px));
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  border: 1px solid var(--dc-accent-border);
+  border-radius: var(--dc-radius-control);
+  background: var(--dc-surface-raised);
+  color: var(--dc-foreground);
+  box-shadow: var(--dc-shadow-panel);
+  padding: 9px 10px;
+  font-size: var(--dc-font-caption);
+  line-height: var(--dc-line-compact);
+}
+
+.deepcode-session-model__notice button {
+  min-width: 20px;
+  min-height: 20px;
+  margin-left: auto;
+  border: 0;
+  background: transparent;
+  color: var(--dc-muted);
+  padding: 0;
+}
+
+@media (max-width: 760px) {
+  .deepcode-session-model__selector select {
+    width: min(230px, 46vw);
+    min-width: 112px;
   }
 }

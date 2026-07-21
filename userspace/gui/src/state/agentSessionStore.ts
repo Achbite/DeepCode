@@ -104,8 +104,10 @@ interface AgentSessionState {
   workflowConfig: AgentWorkflowConfig | null;
   workflowConfigStorePath?: string;
   profileId?: string;
+  profileSelectionBusy: boolean;
   loading: boolean;
   runningSessionIds: string[];
+  cancellingSessionIds: string[];
   errorMessage: string | null;
   fixedContextAttachments: AgentContextAttachment[];
   messageAttachments: AgentContextAttachment[];
@@ -131,7 +133,8 @@ interface AgentSessionActions {
   patchWorkflowConfig: (config: AgentWorkflowConfig) => Promise<void>;
   setMode: (mode: AgentMode) => void;
   setWorkflow: (workflow: AgentWorkflowMode) => void;
-  setProfileId: (profileId?: string) => void;
+  selectProfile: (profileId: string | null) => Promise<boolean>;
+  refreshSessionProfile: () => Promise<void>;
   setFixedContextAttachments: (attachments: AgentContextAttachment[]) => void;
   addAttachment: (attachment: AgentContextAttachment) => void;
   removeAttachment: (path: string, scope: AgentContextAttachment['scope']) => void;
@@ -540,8 +543,11 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
   mode: 'plan',
   workflow: 'planFirst',
   workflowConfig: null,
+  profileId: undefined,
+  profileSelectionBusy: false,
   loading: false,
   runningSessionIds: [],
+  cancellingSessionIds: [],
   errorMessage: null,
   fixedContextAttachments: [],
   messageAttachments: [],
@@ -856,7 +862,83 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
 
   setMode: (mode) => set({ mode }),
   setWorkflow: (workflow) => set({ workflow }),
-  setProfileId: (profileId) => set({ profileId }),
+  selectProfile: async (profileId) => {
+    const state = get();
+    const session = state.session;
+    if (!session) return false;
+    const locked = state.loading
+      || state.profileSelectionBusy
+      || state.runningSessionIds.includes(session.id)
+      || state.cancellingSessionIds.includes(session.id)
+      || Boolean(state.timeline?.interactionProjection?.pending)
+      || Boolean(
+        state.resolvingPermission
+        || state.resolvingRequirement
+        || state.resolvingPlan
+        || state.resolvingReview
+      );
+    if (locked) {
+      set({ errorMessage: agentSessionMessage('agent.profile.locked') });
+      return false;
+    }
+    set({ profileSelectionBusy: true, errorMessage: null });
+    let result;
+    try {
+      result = await updateAgentSession(session.id, { profileId });
+    } catch (error) {
+      set({
+        profileSelectionBusy: false,
+        errorMessage: error instanceof Error
+          ? error.message
+          : agentSessionMessage('agent.profile.updateFailed'),
+      });
+      return false;
+    }
+    if (!result.ok || !result.data) {
+      set({
+        profileSelectionBusy: false,
+        errorMessage: result.message ?? agentSessionMessage('agent.profile.updateFailed'),
+      });
+      return false;
+    }
+    set((current) => ({
+      session: current.session?.id === session.id ? result.data!.session : current.session,
+      sessions: [
+        result.data!.session,
+        ...current.sessions.filter((item) => item.id !== result.data!.session.id),
+      ],
+      currentSessionId: current.session?.id === session.id
+        ? result.data!.session.id
+        : current.currentSessionId,
+      profileId: current.session?.id === session.id
+        ? result.data!.session.profileId
+        : current.profileId,
+      profileSelectionBusy: false,
+      errorMessage: null,
+    }));
+    return true;
+  },
+  refreshSessionProfile: async () => {
+    const sessionId = get().session?.id;
+    if (!sessionId) return;
+    let result;
+    try {
+      result = await getAgentSession(sessionId);
+    } catch {
+      return;
+    }
+    if (!result.ok || !result.data) return;
+    set((state) => ({
+      session: state.session?.id === sessionId ? result.data!.session : state.session,
+      sessions: [
+        result.data!.session,
+        ...state.sessions.filter((item) => item.id !== result.data!.session.id),
+      ],
+      profileId: state.session?.id === sessionId
+        ? result.data!.session.profileId
+        : state.profileId,
+    }));
+  },
   setFixedContextAttachments: (attachments) => set({
     fixedContextAttachments: mergeContextAttachments(attachments),
   }),
@@ -991,7 +1073,6 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         attachments,
         workspacePath: session.projectId ? undefined : currentWorkspacePath(),
         workflow: get().workflow,
-        profileId: get().profileId,
         requirementConfirmationMode: settingRequirementConfirmationMode(
           useSettingsStore.getState().effectiveSettings['agent.requirementConfirmationMode']
         ),
@@ -1059,9 +1140,11 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
   cancelCurrentRun: async () => {
     const session = get().session;
     if (!session) return;
+    if (get().cancellingSessionIds.includes(session.id)) return;
     const activeRunId = activeAgentRunIds.get(session.id);
     set((state) => ({
       runningSessionIds: removeRunningSessionId(state.runningSessionIds, session.id),
+      cancellingSessionIds: addRunningSessionId(state.cancellingSessionIds, session.id),
       queuedMessages: [],
       pendingPermission: null,
       resolvingPermission: null,
@@ -1071,9 +1154,18 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       errorMessage: null,
     }));
 
-    const result = activeRunId
-      ? await cancelAgentRunById(session.id, activeRunId)
-      : await cancelAgentRun(session.id);
+    let result;
+    try {
+      result = activeRunId
+        ? await cancelAgentRunById(session.id, activeRunId)
+        : await cancelAgentRun(session.id);
+    } catch (error) {
+      set((state) => ({
+        cancellingSessionIds: removeRunningSessionId(state.cancellingSessionIds, session.id),
+        errorMessage: error instanceof Error ? error.message : String(error),
+      }));
+      return;
+    }
     if (result.ok && result.data) {
       activeAgentRunIds.delete(session.id);
       set({
@@ -1086,6 +1178,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         resolvingRequirement: null,
         resolvingPlan: null,
         resolvingReview: null,
+        cancellingSessionIds: removeRunningSessionId(get().cancellingSessionIds, session.id),
         loading: false,
         errorMessage: null,
       });
@@ -1106,6 +1199,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         }),
       ],
       loading: false,
+      cancellingSessionIds: removeRunningSessionId(state.cancellingSessionIds, session.id),
       errorMessage: result.message ?? null,
     }));
   },
@@ -1148,7 +1242,6 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         targetId: request.id,
         workspacePath: session.projectId ? undefined : currentWorkspacePath(),
         workflow: get().workflow,
-        profileId: get().profileId,
         interventionLevel: settingInterventionLevel(
           useSettingsStore.getState().effectiveSettings['agent.interventionLevel']
         ),
@@ -1221,7 +1314,6 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         targetId: request.id,
         workspacePath: session.projectId ? undefined : currentWorkspacePath(),
         workflow: get().workflow,
-        profileId: get().profileId,
         interventionLevel: settingInterventionLevel(
           useSettingsStore.getState().effectiveSettings['agent.interventionLevel']
         ),
@@ -1297,7 +1389,6 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         targetId: requirementId,
         workspacePath: session.projectId ? undefined : currentWorkspacePath(),
         workflow: get().workflow,
-        profileId: get().profileId,
         interventionLevel: settingInterventionLevel(
           useSettingsStore.getState().effectiveSettings['agent.interventionLevel']
         ),
@@ -1375,7 +1466,6 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         targetId: planId,
         workspacePath: session.projectId ? undefined : currentWorkspacePath(),
         workflow: get().workflow,
-        profileId: get().profileId,
         interventionLevel: settingInterventionLevel(
           useSettingsStore.getState().effectiveSettings['agent.interventionLevel']
         ),
@@ -1452,7 +1542,6 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         runId,
         workspacePath: session.projectId ? undefined : currentWorkspacePath(),
         workflow: get().workflow,
-        profileId: get().profileId,
         reviewContinuationMode: settingReviewContinuationMode(
           useSettingsStore.getState().effectiveSettings['agent.reviewContinuationMode']
         ),

@@ -561,7 +561,12 @@ pub(crate) fn default_user_settings() -> Value {
             "agent.integrations.github.repoUrl": "",
             "agent.integrations.github.authSecretRef": "",
             "agent.integrations.github.defaultRemote": "origin",
-            "agent.integrations.github.pushPolicy": "manual"
+            "agent.integrations.github.pushPolicy": "manual",
+            "gui.colorTheme": "light",
+            "gui.accentColor": "blue",
+            "gui.timelineDensity": "normal",
+            "gui.typewriterAnimation": true,
+            "gui.collapseCompletedThinking": true
         }),
     );
     settings["agent.interventionLevel"] = json!("medium");

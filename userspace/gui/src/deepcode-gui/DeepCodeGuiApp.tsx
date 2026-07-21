@@ -45,6 +45,20 @@ function isEditableTarget(target: EventTarget | null): boolean {
 
 const EMPTY_WORKSPACE_SETTINGS: Record<string, unknown> = {};
 
+type GuiThemePreference = 'system' | 'light' | 'dark';
+type GuiAccentColor = 'blue' | 'purple' | 'green';
+
+function normalizeGuiThemePreference(value: unknown): GuiThemePreference {
+  if (value === 'system') return 'system';
+  if (value === 'dark' || value === 'deepcode-gui-dark') return 'dark';
+  return 'light';
+}
+
+function normalizeGuiAccentColor(value: unknown): GuiAccentColor {
+  if (value === 'purple' || value === 'green') return value;
+  return 'blue';
+}
+
 const BootFallback: React.FC<{ language: ReturnType<typeof normalizeUiLanguage> }> = ({ language }) => (
   <div className="deepcode-gui-boot-shell">
     <div className="deepcode-gui-boot-shell__title">DeepCode-GUI</div>
@@ -146,8 +160,23 @@ const DeepCodeGuiApp: React.FC = () => {
   }, [workspaceSettings, syncWorkspaceSettings]);
 
   useEffect(() => {
-    document.documentElement.dataset.theme = String(
-      effectiveSettings['gui.colorTheme'] ?? 'deepcode-gui-light'
+    const preference = normalizeGuiThemePreference(effectiveSettings['gui.colorTheme']);
+    const media = window.matchMedia('(prefers-color-scheme: dark)');
+    const applyTheme = () => {
+      document.documentElement.dataset.themePreference = preference;
+      document.documentElement.dataset.theme = preference === 'system'
+        ? (media.matches ? 'dark' : 'light')
+        : preference;
+    };
+    applyTheme();
+    if (preference !== 'system') return;
+    media.addEventListener('change', applyTheme);
+    return () => media.removeEventListener('change', applyTheme);
+  }, [effectiveSettings]);
+
+  useEffect(() => {
+    document.documentElement.dataset.accent = normalizeGuiAccentColor(
+      effectiveSettings['gui.accentColor']
     );
   }, [effectiveSettings]);
 

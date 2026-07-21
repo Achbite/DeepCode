@@ -633,6 +633,16 @@
     "agent.composer.sendTitle": "Send message",
     "agent.composer.stop": "Stop",
     "agent.composer.send": "Send",
+    "agent.profile.selector": "Model used by this session",
+    "agent.profile.loading": "Loading model profiles",
+    "agent.profile.unavailable": "No enabled model Profile is available, so messages cannot be sent",
+    "agent.profile.loadFailed": "Model Profiles could not be loaded",
+    "agent.profile.locked": "The model cannot be changed while a run or interaction is pending",
+    "agent.profile.updateFailed": "Session model update failed",
+    "agent.profile.contextUnavailable": "No authoritative context usage fact is currently available",
+    "agent.profile.contextPlaceholder": "Context --%",
+    "agent.profile.reasoningDefault": "default reasoning",
+    "agent.profile.migrated": "The previous model Profile is unavailable. This session migrated to {profile}",
     "agent.attachment.folder": "Folder",
     "agent.attachment.file": "File",
     "agent.attachment.noMatches": "No matches",
@@ -1056,6 +1066,24 @@
       "options": {
         "vs-dark": "Dark",
         "vs-light": "Light"
+      }
+    },
+    "gui.colorTheme": {
+      "label": "DeepCode-GUI Theme",
+      "description": "Set the lightweight DeepCode-GUI shell theme without changing the editor workbench theme.",
+      "options": {
+        "system": "System",
+        "light": "Light",
+        "dark": "Dark"
+      }
+    },
+    "gui.accentColor": {
+      "label": "DeepCode-GUI Accent Color",
+      "description": "Set the shared accent color used by DeepCode-GUI interactive controls.",
+      "options": {
+        "blue": "Blue",
+        "purple": "Purple",
+        "green": "Green"
       }
     },
     "workbench.styleTokenOverrides": {

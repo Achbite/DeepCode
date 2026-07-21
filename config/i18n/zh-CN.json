@@ -633,6 +633,16 @@
     "agent.composer.sendTitle": "发送消息",
     "agent.composer.stop": "停止",
     "agent.composer.send": "发送",
+    "agent.profile.selector": "本会话使用的模型",
+    "agent.profile.loading": "正在加载模型配置",
+    "agent.profile.unavailable": "没有已启用的模型 Profile，无法发送消息",
+    "agent.profile.loadFailed": "无法读取模型 Profile",
+    "agent.profile.locked": "当前运行或待确认事项尚未结束，不能切换模型",
+    "agent.profile.updateFailed": "会话模型切换失败",
+    "agent.profile.contextUnavailable": "当前没有权威的上下文占用率事实",
+    "agent.profile.contextPlaceholder": "上下文 --%",
+    "agent.profile.reasoningDefault": "默认推理强度",
+    "agent.profile.migrated": "原模型 Profile 已不可用，本会话已迁移到 {profile}",
     "agent.attachment.folder": "文件夹",
     "agent.attachment.file": "文件",
     "agent.attachment.noMatches": "没有匹配项",
@@ -1056,6 +1066,24 @@
       "options": {
         "vs-dark": "深色",
         "vs-light": "浅色"
+      }
+    },
+    "gui.colorTheme": {
+      "label": "DeepCode-GUI 主题",
+      "description": "设置轻量 DeepCode-GUI 壳的主题，不影响编辑器工作台主题。",
+      "options": {
+        "system": "跟随系统",
+        "light": "明亮",
+        "dark": "暗黑"
+      }
+    },
+    "gui.accentColor": {
+      "label": "DeepCode-GUI 强调色",
+      "description": "设置 DeepCode-GUI 交互控件使用的统一强调色。",
+      "options": {
+        "blue": "蓝色",
+        "purple": "紫色",
+        "green": "绿色"
       }
     },
     "workbench.styleTokenOverrides": {

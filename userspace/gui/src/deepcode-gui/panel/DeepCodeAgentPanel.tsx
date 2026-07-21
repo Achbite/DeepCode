@@ -1,7 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import type { AgentTimelineResult } from '@deepcode/protocol';
 import { createWorkspaceScopeKey } from '@deepcode/session-core';
-import { getLlmProfiles } from '../../services/runtimeAdapter';
 import { useAgentSessionStore } from '../../state/agentSessionStore';
 import { useWorkspaceStore } from '../../state/workspaceStore';
 import { t, type UiLanguage } from '../../i18n';
@@ -12,6 +11,7 @@ import {
   type AgentComposerPendingDecision,
 } from '../../components/agent-panel/pendingDecision';
 import DeepCodeTimeline from './DeepCodeTimeline';
+import SessionModelSelector from './SessionModelSelector';
 import { projectionDeliveryDiagnostics } from '../../services/projectionDeliveryDiagnostics';
 
 interface DeepCodeAgentPanelProps {
@@ -42,8 +42,8 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
   onAfterSend,
 }) => {
   const session = useAgentSessionStore((s) => s.session);
-  const profileId = useAgentSessionStore((s) => s.profileId);
   const runningSessionIds = useAgentSessionStore((s) => s.runningSessionIds);
+  const cancellingSessionIds = useAgentSessionStore((s) => s.cancellingSessionIds);
   const errorMessage = useAgentSessionStore((s) => s.errorMessage);
   const messageAttachments = useAgentSessionStore((s) => s.messageAttachments);
   const sessionAttachments = useAgentSessionStore((s) => s.sessionAttachments);
@@ -53,7 +53,6 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
   const resolvingReview = useAgentSessionStore((s) => s.resolvingReview);
   const loadOrCreate = useAgentSessionStore((s) => s.loadOrCreate);
   const refreshSessions = useAgentSessionStore((s) => s.refreshSessions);
-  const setProfileId = useAgentSessionStore((s) => s.setProfileId);
   const addAttachment = useAgentSessionStore((s) => s.addAttachment);
   const removeAttachment = useAgentSessionStore((s) => s.removeAttachment);
   const sendMessage = useAgentSessionStore((s) => s.sendMessage);
@@ -68,18 +67,11 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
   const [revealedPendingDecisionKey, setRevealedPendingDecisionKey] = useState<string | null>(null);
   const [followLatestSignal, setFollowLatestSignal] = useState(0);
   const [bottomChromeElement, setBottomChromeElement] = useState<HTMLDivElement | null>(null);
-  const sessionRunning = Boolean(session?.id && runningSessionIds.includes(session.id));
-
-  useEffect(() => {
-    const loadProfiles = () => getLlmProfiles().then((result) => {
-      if (result.ok && result.data) {
-        setProfileId(profileId ?? result.data.defaultProfileId);
-      }
-    });
-    void loadProfiles();
-    window.addEventListener('deepcode:llm-profiles-updated', loadProfiles);
-    return () => window.removeEventListener('deepcode:llm-profiles-updated', loadProfiles);
-  }, [profileId, setProfileId]);
+  const [modelAvailable, setModelAvailable] = useState(false);
+  const sessionRunning = Boolean(
+    session?.id
+    && (runningSessionIds.includes(session.id) || cancellingSessionIds.includes(session.id))
+  );
 
   useEffect(() => {
     void refreshSessions();
@@ -127,6 +119,7 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
     && !hasTimelineTurns
   );
   const composerRunning = forceHome ? false : (sessionRunning || pendingDecisionResolving);
+  const profileLocked = sessionRunning || Boolean(timeline.interactionProjection?.pending);
   const homePrompt = homeProjectTitle
     ? t(language, 'deepcodeGui.home.projectPrompt', { project: homeProjectTitle })
     : t(language, 'deepcodeGui.home.prompt');
@@ -148,6 +141,15 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
       onStop={() => void cancelCurrentRun()}
       onAddAttachment={addAttachment}
       onRemoveAttachment={removeAttachment}
+      footerControls={(
+        <SessionModelSelector
+          language={language}
+          locked={profileLocked}
+          onAvailabilityChange={setModelAvailable}
+        />
+      )}
+      sendBlocked={!modelAvailable}
+      sendBlockedTitle={!modelAvailable ? t(language, 'agent.profile.unavailable') : undefined}
       pendingDecision={composerPendingDecision}
       onDecisionSubmit={(guidance, action) => {
         if (!composerPendingDecision) return;

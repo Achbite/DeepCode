@@ -134,8 +134,21 @@ export const SETTING_DEFINITIONS: SettingDefinition[] = [
     group: 'gui',
     control: 'select',
     options: [
-      { label: 'Light', value: 'deepcode-gui-light' },
-      { label: 'Dark', value: 'deepcode-gui-dark' },
+      { label: 'System', value: 'system' },
+      { label: 'Light', value: 'light' },
+      { label: 'Dark', value: 'dark' },
+    ],
+  },
+  {
+    key: 'gui.accentColor',
+    label: 'DeepCode-GUI Accent Color',
+    description: 'Accent color used by interactive controls in the DeepCode-GUI shell.',
+    group: 'gui',
+    control: 'select',
+    options: [
+      { label: 'Blue', value: 'blue' },
+      { label: 'Purple', value: 'purple' },
+      { label: 'Green', value: 'green' },
     ],
   },
   {
@@ -596,6 +609,14 @@ function getDefaultValue(key: string): UserSettingValue {
 
 function normalizeSettingValue(key: string, value: unknown): UserSettingValue {
   const defaultValue = getDefaultValue(key);
+  if (key === 'gui.colorTheme') {
+    if (value === 'deepcode-gui-light') return 'light';
+    if (value === 'deepcode-gui-dark') return 'dark';
+    return value === 'system' || value === 'dark' ? value : 'light';
+  }
+  if (key === 'gui.accentColor') {
+    return value === 'purple' || value === 'green' ? value : 'blue';
+  }
   if (typeof defaultValue === 'boolean') return Boolean(value);
   if (typeof defaultValue === 'number') {
     const n = typeof value === 'number' ? value : Number(value);
@@ -625,9 +646,15 @@ function buildEffectiveSettings(
   overriddenKeys: string[]
 ): Pick<SettingsStateData, 'effectiveSettings' | 'sources'> {
   const normalizedWorkspace = normalizeWorkspaceSettings(workspaceSettings);
+  const normalizedUserSettings = Object.fromEntries(
+    Object.entries(userSettings).map(([key, value]) => [
+      key,
+      KNOWN_SETTING_KEYS.has(key) ? normalizeSettingValue(key, value) : value,
+    ])
+  ) as UserSettings;
   const effectiveSettings: UserSettings = {
     ...DEFAULT_USER_SETTINGS,
-    ...userSettings,
+    ...normalizedUserSettings,
     ...normalizedWorkspace,
   };
   const sources: Record<string, SettingSource> = {};
