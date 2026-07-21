@@ -2195,38 +2195,38 @@ button {
 }
 
 .deepcode-gui-workbench .file-tree {
-  --ft-bg: #ffffff;
-  --ft-bg-2: #fbfaf6;
+  --ft-bg: var(--dc-surface);
+  --ft-bg-2: var(--dc-surface-subtle);
   --ft-fg: var(--text);
   --ft-fg-muted: var(--muted);
-  --ft-fg-strong: #111318;
+  --ft-fg-strong: var(--dc-foreground-strong);
   --ft-border: var(--line);
-  --ft-hover-bg: #f5f3ec;
-  --ft-selected-bg: rgba(37, 99, 235, 0.08);
+  --ft-hover-bg: var(--dc-surface-hover);
+  --ft-selected-bg: var(--dc-accent-soft);
   --ft-accent: var(--accent);
-  background: #ffffff;
+  background: var(--dc-surface);
 }
 
 .deepcode-gui-workbench .file-tree__titlebar,
 .deepcode-gui-workbench .settings-nav,
 .deepcode-gui-workbench .settings-body {
   border-color: var(--line);
-  background: #ffffff;
+  background: var(--dc-surface);
 }
 
 .deepcode-gui-workbench .file-tree__toolbar-btn:hover,
 .deepcode-gui-workbench .file-tree__empty-action,
 .deepcode-gui-workbench .file-tree__row:hover,
 .deepcode-gui-workbench .settings-nav-item:hover {
-  background: #f5f3ec;
-  color: #111318;
+  background: var(--dc-surface-hover);
+  color: var(--dc-foreground-strong);
 }
 
 .deepcode-gui-workbench .file-tree__row--selected,
 .deepcode-gui-workbench .file-tree__row--selected:hover,
 .deepcode-gui-workbench .settings-nav-item--active {
-  background: rgba(37, 99, 235, 0.08);
-  color: #174ea6;
+  background: var(--dc-accent-soft);
+  color: var(--dc-accent);
 }
 
 .deepcode-gui-workbench .file-tree__icon,
@@ -2235,7 +2235,7 @@ button {
 }
 
 .deepcode-gui-workbench .settings-center {
-  background: #ffffff;
+  background: var(--dc-surface);
   color: var(--text);
 }
 
@@ -2248,13 +2248,13 @@ button {
 .deepcode-gui-workbench .settings-card,
 .deepcode-gui-workbench .settings-card__inline-placeholder {
   border-color: var(--line);
-  background: #fbfaf6;
+  background: var(--dc-surface-subtle);
   box-shadow: var(--shadow-sm);
 }
 
 .deepcode-gui-workbench .settings-card__title {
   border-color: var(--line);
-  background: #f5f3ec;
+  background: var(--dc-surface-hover);
 }
 
 .deepcode-gui-workbench .settings-card__body,
