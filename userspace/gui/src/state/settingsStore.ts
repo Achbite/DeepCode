@@ -366,6 +366,18 @@ export const SETTING_DEFINITIONS: SettingDefinition[] = [
     options: permissionPolicyOptions(),
   },
   {
+    key: 'agent.permissions.autonomyMode',
+    label: 'Autonomy Mode',
+    description: 'Session autonomy policy applied before Kernel permission gates.',
+    group: 'agent',
+    control: 'select',
+    options: [
+      { label: 'Strict', value: 'strict' },
+      { label: 'Trusted Workspace', value: 'trustedWorkspace' },
+      { label: 'Maximum', value: 'maximum' },
+    ],
+  },
+  {
     key: 'agent.permissions.workspaceWrite',
     label: 'Workspace Write',
     description: 'Permission policy for workspace mutations.',
