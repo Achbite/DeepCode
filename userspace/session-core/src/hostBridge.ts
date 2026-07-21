@@ -115,6 +115,7 @@ async function runAsk(request: HostBridgeRequest): Promise<HostBridgeResult> {
 
   const sessionId = sessionResult.session.id;
   const existingEvents = sessionResult.events ?? [];
+  const initialTimeline = await getAgentTimeline(apiBase, sessionId);
   const deliveryRecorder = createProjectionDeliveryRecorder(
     apiBase,
     sessionId,
@@ -125,6 +126,7 @@ async function runAsk(request: HostBridgeRequest): Promise<HostBridgeResult> {
     request.hostRunId,
     sessionId,
     existingEvents,
+    initialTimeline,
     deliveryRecorder
   );
   try {
@@ -171,6 +173,7 @@ async function resolveDecision(request: HostBridgeRequest): Promise<HostBridgeRe
 
   const apiBase = normalizeApiBase(request.apiBase);
   const current = await getAgentSession(apiBase, request.sessionId);
+  const initialTimeline = await getAgentTimeline(apiBase, request.sessionId);
   const binding = request.noWorkspace ? undefined : request.workspaceBinding ?? workspaceBindingFromPath(request.workspacePath);
   const projectWorkingDirectory = request.noWorkspace ? undefined : projectWorkingDirectoryFromBinding(binding, request.workspacePath);
   const deliveryRecorder = createProjectionDeliveryRecorder(
@@ -183,6 +186,7 @@ async function resolveDecision(request: HostBridgeRequest): Promise<HostBridgeRe
     request.hostRunId,
     request.sessionId,
     current.events,
+    initialTimeline,
     deliveryRecorder
   );
   try {
@@ -263,6 +267,7 @@ function createProjectionPublishingDriver(
   hostRunId: string | undefined,
   sessionId: string,
   initialEvents: AgentEvent[],
+  initialTimeline?: AgentTimelineResult,
   deliveryRecorder?: ProjectionDeliveryRecorder
 ): {
   driver: SessionDriverLoop;
@@ -270,7 +275,7 @@ function createProjectionPublishingDriver(
 } {
   const transcriptClient = new SessionStorageClient(apiBase);
   let committedEvents = [...initialEvents];
-  const projector = new CanonicalTimelineProjector(sessionId, initialEvents);
+  const projector = new CanonicalTimelineProjector(sessionId, initialEvents, initialTimeline);
   const buildTimeline = (): AgentTimelineResult => projector.snapshot();
   const driver = new SessionDriverLoop({
     kernelCommand: (request) => kernelCommand(apiBase, request),
@@ -380,6 +385,26 @@ async function getAgentSession(apiBase: string, sessionId: string): Promise<Agen
   );
   if (!response.ok || !response.data) {
     throw new Error(response.message ?? response.error ?? `read session failed: ${sessionId}`);
+  }
+  return response.data;
+}
+
+async function getAgentTimeline(
+  apiBase: string,
+  sessionId: string
+): Promise<AgentTimelineResult | undefined> {
+  const response = await getJson<ApiResponse<AgentTimelineResult>>(
+    `${apiBase}/api/agent/sessions/${encodeURIComponent(sessionId)}/timeline`
+  );
+  if (!response.ok || !response.data) {
+    if (response.error === 'agent_timeline_unavailable') return undefined;
+    throw new Error(response.message ?? response.error ?? `read canonical timeline failed: ${sessionId}`);
+  }
+  if (
+    response.data.schemaVersion !== 'deepcode.session.timeline.v1' ||
+    response.data.sessionId !== sessionId
+  ) {
+    throw new Error(`canonical timeline identity mismatch: ${sessionId}`);
   }
   return response.data;
 }

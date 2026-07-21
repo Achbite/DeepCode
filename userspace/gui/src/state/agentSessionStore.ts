@@ -14,7 +14,6 @@ import type {
 } from '@deepcode/protocol';
 import {
   applyAgentTimelineDelta,
-  appendOptimisticUserMessage,
   createWorkspaceBinding,
   createWorkspaceScope,
   createWorkspaceScopeKey,
@@ -269,7 +268,7 @@ async function refreshCanonicalTimeline(
     if (
       preservePlayback &&
       state.timeline &&
-      (incomingTimeline.revision ?? 0) <= (state.timeline.revision ?? 0)
+      (incomingTimeline.revision ?? 0) < (state.timeline.revision ?? 0)
     ) {
       return state;
     }
@@ -502,9 +501,7 @@ async function startAndWaitAgentRun(
     if (!terminalStreamObserved) {
       await Promise.race([terminalStreamEvent, sleep(1500)]);
     }
-    if (!terminalStreamObserved) {
-      await refreshCanonicalTimeline(sessionId, true);
-    }
+    await refreshCanonicalTimeline(sessionId, true);
     projectionDeliveryDiagnostics.markTerminal(sessionId, runId);
     return result;
   } finally {
@@ -896,22 +893,16 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     if (!session) return;
 
     const attachments = readMessageAttachments(get(), attachmentsOverride);
-    const localUserEvent = createLocalEvent(session.id, 'user_msg', {
-      content: trimmed,
-      attachments,
-      pending: true,
-    });
     const activeInteraction = get().timeline?.interactionProjection?.pending ?? null;
     if (activeInteraction) {
       if (activeInteraction.kind === 'permission') {
         set({ errorMessage: 'Permission confirmation is pending. Resolve the permission request before sending new guidance.' });
         return;
       }
-      set((state) => ({
-        timeline: appendOptimisticUserMessage(state.timeline, localUserEvent),
+      set({
         messageAttachments: [],
         errorMessage: null,
-      }));
+      });
       if (activeInteraction.kind === 'requirement') {
         await get().resolveRequirement(
           activeInteraction.runId,
@@ -937,11 +928,10 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         set({ errorMessage: 'No active shared run id is available for guidance. Refresh the session or start a new turn.' });
         return;
       }
-      set((state) => ({
-        timeline: appendOptimisticUserMessage(state.timeline, localUserEvent),
+      set({
         messageAttachments: [],
         errorMessage: null,
-      }));
+      });
       const result = await submitAgentRunGuidance(session.id, activeRunId, {
         guidance: trimmed,
         attachments,
@@ -968,7 +958,6 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     }
 
     set((state) => ({
-      timeline: appendOptimisticUserMessage(state.timeline, localUserEvent),
       messageAttachments: [],
       runningSessionIds: addRunningSessionId(state.runningSessionIds, session.id),
       errorMessage: null,

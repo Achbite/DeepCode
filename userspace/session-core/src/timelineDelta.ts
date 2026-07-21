@@ -29,13 +29,21 @@ export class CanonicalTimelineProjector {
   private activeDeltas: ProjectionDelta[] = [];
   private currentTimeline: AgentTimelineResult;
 
-  constructor(private readonly sessionId: string, initialEvents: AgentEvent[]) {
+  constructor(
+    private readonly sessionId: string,
+    initialEvents: AgentEvent[],
+    initialTimeline?: AgentTimelineResult
+  ) {
     this.committedEvents = [...initialEvents];
-    this.currentTimeline = stampTimeline(
-      buildNarrativeTimelineProjection({ sessionId, events: initialEvents }),
-      undefined,
-      0
-    );
+    this.currentTimeline =
+      initialTimeline?.schemaVersion === 'deepcode.session.timeline.v1' &&
+      initialTimeline.sessionId === sessionId
+        ? initialTimeline
+        : stampTimeline(
+            buildNarrativeTimelineProjection({ sessionId, events: initialEvents }),
+            undefined,
+            0
+          );
   }
 
   push(delta: ProjectionDelta): AgentTimelineDelta[] {
@@ -258,38 +266,6 @@ export function emptyTimeline(sessionId = 'session'): AgentTimelineResult {
     generatedAt: new Date(0).toISOString(),
     turns: [],
     eventCount: 0,
-  };
-}
-
-export function appendOptimisticUserMessage(
-  timeline: AgentTimelineResult | null | undefined,
-  event: AgentEvent
-): AgentTimelineResult {
-  const base = timeline ?? emptyTimeline(event.sessionId);
-  if (event.kind !== 'user_msg' || base.sessionId !== event.sessionId) return base;
-  const projected = buildNarrativeTimelineProjection({
-    sessionId: event.sessionId,
-    events: [event],
-    generatedAt: event.ts,
-  });
-  const projectedTurn = projected.turns[0];
-  if (!projectedTurn) return base;
-  const sequence = base.turns.length;
-  const turn = {
-    ...projectedTurn,
-    sequence,
-    blocks: projectedTurn.blocks.map((block, blockIndex) => ({
-      ...block,
-      sequence: blockIndex,
-      revision: 1,
-      deliveryMode: 'buffered' as const,
-    })),
-  };
-  return {
-    ...base,
-    revision: (base.revision ?? 0) + 1,
-    generatedAt: event.ts,
-    turns: [...base.turns, turn],
   };
 }
 
