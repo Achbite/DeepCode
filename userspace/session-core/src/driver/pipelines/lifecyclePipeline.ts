@@ -225,6 +225,11 @@ export class RunLifecyclePipeline<State extends RunLifecycleState> {
       },
     });
     lastResult = await this.ports.appendProjectedKernelEvents(sessionId, runReply);
+    const reconciledInput = reconcileKernelWorkspaceBinding(
+      input,
+      runReply.snapshot,
+      this.ports.createError
+    );
 
     const events = input.existingEvents ?? [];
     const runId = firstString(runReply.events, 'runId') ?? this.ports.createId('run');
@@ -274,7 +279,7 @@ export class RunLifecyclePipeline<State extends RunLifecycleState> {
     }));
     lastResult = await this.ports.append(sessionId, startEvents);
     return this.hydrate({
-      input,
+      input: reconciledInput,
       lastResult,
       events,
       runId,
@@ -291,9 +296,30 @@ export class RunLifecyclePipeline<State extends RunLifecycleState> {
     const runId = input.acceptedTaskPlan?.runId
       ?? latestEventRunId(events, input.sessionId)
       ?? this.ports.createId('run-resume');
+    let reconciledInput = input;
+    if (input.workspaceBinding) {
+      const snapshotReply = await this.ports.kernel({
+        command: {
+          kind: 'snapshotGet',
+          requestId: this.ports.createId('workspace-binding-snapshot'),
+          sessionId: input.sessionId,
+        },
+      });
+      if (!snapshotReply.ok) {
+        throw this.ports.createError(
+          snapshotReply.error?.code ?? 'kernel_workspace_binding_unavailable',
+          snapshotReply.error?.message ?? 'Kernel workspace binding snapshot is unavailable.'
+        );
+      }
+      reconciledInput = reconcileKernelWorkspaceBinding(
+        input,
+        snapshotReply.snapshot,
+        this.ports.createError
+      );
+    }
     const recovered = recoverKernelContext(events, runId, input.sessionId);
     return this.hydrate({
-      input,
+      input: reconciledInput,
       lastResult,
       events,
       runId,
@@ -477,6 +503,47 @@ function objectRecord(value: unknown): Record<string, unknown> | undefined {
 
 function stringValue(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function reconcileKernelWorkspaceBinding(
+  input: RunLifecycleInput,
+  snapshot: unknown,
+  createError: (code: string, message: string) => Error
+): RunLifecycleInput {
+  const canonical = kernelWorkspaceBinding(snapshot);
+  if (!canonical) return input;
+
+  const requestedPath = comparableWorkspacePath(input.workspaceBinding?.openPath);
+  const canonicalPath = comparableWorkspacePath(canonical.openPath);
+  if (requestedPath && canonicalPath && requestedPath !== canonicalPath) {
+    throw createError(
+      'kernel_workspace_binding_mismatch',
+      'Kernel canonical workspace path does not match the Session run workspace path.'
+    );
+  }
+
+  return {
+    ...input,
+    workspaceBinding: canonical,
+  };
+}
+
+function kernelWorkspaceBinding(snapshot: unknown): AgentWorkspaceBinding | undefined {
+  const binding = objectRecord(objectRecord(snapshot)?.workspaceBinding);
+  if (!binding) return undefined;
+  const canonical: AgentWorkspaceBinding = {
+    workspaceId: stringValue(binding.workspaceId),
+    workspaceHash: stringValue(binding.workspaceHash),
+    openPath: stringValue(binding.openPath),
+    activeFolderId: stringValue(binding.activeFolderId),
+    folderHash: stringValue(binding.folderHash),
+  };
+  return Object.values(canonical).some(Boolean) ? canonical : undefined;
+}
+
+function comparableWorkspacePath(value: string | undefined): string | undefined {
+  const normalized = value?.trim().replace(/\\/g, '/').replace(/\/+$/g, '');
+  return normalized || undefined;
 }
 
 export function recoverArtifactBudgetReplanReason(
