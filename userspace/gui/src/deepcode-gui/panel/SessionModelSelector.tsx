@@ -6,6 +6,7 @@ import type {
 import { t, type UiLanguage } from '../../i18n';
 import { getLlmProfiles } from '../../services/runtimeAdapter';
 import { useAgentSessionStore } from '../../state/agentSessionStore';
+import useAppStatusStore from '../../state/appStatusStore';
 
 interface SessionModelSelectorProps {
   language: UiLanguage;
@@ -32,6 +33,7 @@ const SessionModelSelector: React.FC<SessionModelSelectorProps> = ({
   onAvailabilityChange,
 }) => {
   const session = useAgentSessionStore((state) => state.session);
+  const apiStatus = useAppStatusStore((state) => state.apiStatus);
   const profileSelectionBusy = useAgentSessionStore((state) => state.profileSelectionBusy);
   const selectProfile = useAgentSessionStore((state) => state.selectProfile);
   const refreshSessionProfile = useAgentSessionStore((state) => state.refreshSessionProfile);
@@ -63,9 +65,14 @@ const SessionModelSelector: React.FC<SessionModelSelectorProps> = ({
   }, [onAvailabilityChange]);
 
   useEffect(() => {
+    if (apiStatus !== 'connected') {
+      setLoadState(apiStatus === 'checking' ? 'loading' : 'error');
+      onAvailabilityChange(false);
+      return;
+    }
     setLoadState('loading');
     void loadProfiles();
-  }, [loadProfiles]);
+  }, [apiStatus, loadProfiles, onAvailabilityChange]);
 
   useEffect(() => {
     const onProfilesUpdated = (event: Event) => {
