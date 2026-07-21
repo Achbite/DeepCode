@@ -376,11 +376,12 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
             <div className="deepcode-gui-empty__title">{t(language, 'deepcodeGui.status.ready')}</div>
           </div>
         )}
-        {viewWithActive.turns.map((turn) => (
+        {viewWithActive.turns.map((turn, turnIndex) => (
           <TurnCard
             key={turn.id}
             turn={turn}
             language={language}
+            transportPending={loading && turnIndex === viewWithActive.turns.length - 1}
             playbackVisibleBlockIds={playbackVisibleBlockIds}
             typewriterBlockIds={animatingBlockIds}
             collapseCompletedThinking={collapseCompletedThinking}
@@ -655,18 +656,20 @@ function typewriterSpeedForBlock(block: AgentTimelineBlock): TypewriterSpeed {
 const TurnCard: React.FC<{
   turn: AgentTimelineTurn;
   language: UiLanguage;
+  transportPending: boolean;
   playbackVisibleBlockIds: Set<string>;
   typewriterBlockIds: Set<string>;
   collapseCompletedThinking: boolean;
   onLiveContentChange: () => void;
   onTypewriterComplete: (blockId: string, textLength: number) => void;
   onPlanResolve?: DeepCodeTimelineProps['onPlanResolve'];
-}> = ({ turn, language, playbackVisibleBlockIds, typewriterBlockIds, collapseCompletedThinking, onLiveContentChange, onTypewriterComplete, onPlanResolve }) => {
+}> = ({ turn, language, transportPending, playbackVisibleBlockIds, typewriterBlockIds, collapseCompletedThinking, onLiveContentChange, onTypewriterComplete, onPlanResolve }) => {
   const startedAtLabel = formatTurnTime(turn.startedAt);
   const visibleBlocks = turn.blocks.filter(isVisibleTimelineBlock);
   const blocks = visibleBlocks.filter((block) => playbackVisibleBlockIds.has(block.id));
   if (blocks.length === 0) return null;
-  const actionsReady = (turn.status === 'completed' || turn.status === 'failed') &&
+  const actionsReady = !transportPending &&
+    (turn.status === 'completed' || turn.status === 'failed') &&
     blocks.length === visibleBlocks.length &&
     visibleBlocks.every((block) => !typewriterBlockIds.has(block.id));
 
@@ -685,6 +688,12 @@ const TurnCard: React.FC<{
             language={language}
             animateAssistant={typewriterBlockIds.has(block.id)}
             collapseCompletedThinking={collapseCompletedThinking}
+            interactionsEnabled={
+              !transportPending &&
+              turn.status !== 'running' &&
+              !typewriterBlockIds.has(block.id) &&
+              !actionsReady
+            }
             onLiveContentChange={onLiveContentChange}
             onTypewriterComplete={onTypewriterComplete}
             onPlanResolve={onPlanResolve}
@@ -846,10 +855,11 @@ const TimelineBlock: React.FC<{
   language: UiLanguage;
   animateAssistant?: boolean;
   collapseCompletedThinking?: boolean;
+  interactionsEnabled: boolean;
   onLiveContentChange: () => void;
   onTypewriterComplete: (blockId: string, textLength: number) => void;
   onPlanResolve?: DeepCodeTimelineProps['onPlanResolve'];
-}> = ({ block, language, animateAssistant = false, collapseCompletedThinking = true, onLiveContentChange, onTypewriterComplete, onPlanResolve }) => {
+}> = ({ block, language, animateAssistant = false, collapseCompletedThinking = true, interactionsEnabled, onLiveContentChange, onTypewriterComplete, onPlanResolve }) => {
   if (!isVisibleTimelineBlock(block)) return null;
   const narrativeClass = block.narrativeKind ? ` deepcode-gui-block--narrative-${block.narrativeKind}` : '';
   const densityClass = block.displayHints?.density ? ` deepcode-gui-block--density-${block.displayHints.density}` : '';
@@ -919,6 +929,7 @@ const TimelineBlock: React.FC<{
         block={block}
         language={language}
         animate={animateAssistant}
+        showActions={interactionsEnabled}
         onLiveContentChange={onLiveContentChange}
         onTypewriterComplete={onTypewriterComplete}
         onPlanResolve={onPlanResolve}
@@ -936,6 +947,7 @@ const TimelineBlock: React.FC<{
         block={block}
         language={language}
         animate={animateAssistant}
+        showActions={interactionsEnabled}
         onLiveContentChange={onLiveContentChange}
         onTypewriterComplete={onTypewriterComplete}
       />
@@ -1031,9 +1043,10 @@ const ReviewBlock: React.FC<{
   block: AgentTimelineBlock;
   language: UiLanguage;
   animate: boolean;
+  showActions: boolean;
   onLiveContentChange: () => void;
   onTypewriterComplete: (blockId: string, textLength: number) => void;
-}> = ({ block, language, animate, onLiveContentChange, onTypewriterComplete }) => {
+}> = ({ block, language, animate, showActions, onLiveContentChange, onTypewriterComplete }) => {
   const [copyStatus, setCopyStatus] = useState<'idle' | 'copied' | 'error'>('idle');
   const narrativeClass = block.narrativeKind ? ` deepcode-gui-block--narrative-${block.narrativeKind}` : '';
   const densityClass = block.displayHints?.density ? ` deepcode-gui-block--density-${block.displayHints.density}` : '';
@@ -1055,7 +1068,7 @@ const ReviewBlock: React.FC<{
         <span className="deepcode-gui-block__title">
           {localizedTimelineText(language, block.title || t(language, 'deepcodeGui.tasks.review'))}
         </span>
-        <button
+        {showActions && <button
           type="button"
           className={`deepcode-gui-plan-copy deepcode-gui-plan-copy--${copyStatus}`}
           onMouseDown={(event) => {
@@ -1071,7 +1084,7 @@ const ReviewBlock: React.FC<{
           aria-label={t(language, 'deepcodeGui.review.copyStructured')}
         >
           <DeepCodeTurnActionIcon name="copy" />
-        </button>
+        </button>}
       </summary>
       <div className="deepcode-gui-block__details">
         {hasStructuredProjection(block.structuredProjection, 'review') ? (
@@ -1332,10 +1345,11 @@ const PlanBlock: React.FC<{
   block: AgentTimelineBlock;
   language: UiLanguage;
   animate: boolean;
+  showActions: boolean;
   onLiveContentChange: () => void;
   onTypewriterComplete: (blockId: string, textLength: number) => void;
   onPlanResolve?: DeepCodeTimelineProps['onPlanResolve'];
-}> = ({ block, language, animate, onLiveContentChange, onTypewriterComplete, onPlanResolve }) => {
+}> = ({ block, language, animate, showActions, onLiveContentChange, onTypewriterComplete, onPlanResolve }) => {
   const [copyStatus, setCopyStatus] = useState<'idle' | 'copied' | 'error'>('idle');
   const status = block.status;
   const narrativeClass = block.narrativeKind ? ` deepcode-gui-block--narrative-${block.narrativeKind}` : '';
@@ -1359,7 +1373,7 @@ const PlanBlock: React.FC<{
       <summary>
         <span className={`deepcode-gui-block__status deepcode-gui-block__status--${block.status}`} />
         <span className="deepcode-gui-block__title">{block.title}</span>
-        <button
+        {showActions && planBlockAuthorized(block) && <button
           type="button"
           className={`deepcode-gui-plan-copy deepcode-gui-plan-copy--${copyStatus}`}
           onMouseDown={(event) => {
@@ -1375,7 +1389,7 @@ const PlanBlock: React.FC<{
           aria-label={t(language, 'deepcodeGui.plan.copyStructured')}
         >
           <DeepCodeTurnActionIcon name="copy" />
-        </button>
+        </button>}
       </summary>
       <div className="deepcode-gui-block__details">
         {hasStructuredProjection(block.structuredProjection, 'plan') ? (
@@ -1643,6 +1657,14 @@ function isVisibleTimelineBlock(_block: AgentTimelineBlock): boolean {
 
 function planBlockMarkdown(block: AgentTimelineBlock, language: UiLanguage): string {
   return structuredProjectionText(block.structuredProjection, language);
+}
+
+function planBlockAuthorized(block: AgentTimelineBlock): boolean {
+  return block.events.some((event) => (
+    event.kind === 'plan_card' &&
+    isRecordValue(event.payload) &&
+    event.payload.confirmable === true
+  ));
 }
 
 function reviewBlockMarkdown(block: AgentTimelineBlock, language: UiLanguage = 'zh-CN'): string {
