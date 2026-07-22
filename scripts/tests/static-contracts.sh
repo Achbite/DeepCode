@@ -34,7 +34,9 @@ for script in \
   scripts/macos-package-service.sh \
   scripts/package-macos.sh \
   scripts/tests/static-contracts.sh \
-  scripts/tests/repository-legacy.sh
+  scripts/tests/repository-legacy.sh \
+  scripts/tests/session-legacy-regression.sh \
+  scripts/tests/session-smoke.sh
 do
   bash -n "$script"
 done

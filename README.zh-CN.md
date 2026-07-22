@@ -24,6 +24,18 @@ required profile，宿主机静态检查不会再被报告为完整门禁通过�
 检查时必须显式运行 `bash ./test.sh --profile static`，默认 required profile 应在
 项目容器中执行。
 
+Session smoke 只能通过已注册入口 `bash ./test.sh --profile smoke` 运行。Smoke
+只保留少量具名的 Agent Loop 与选定历史缺陷用例；失败会如实返回，但它属于诊断
+测试，不进入 required profile，并且 receipt 始终为 `authoritative: false`。
+
+原有的大型 Session smoke 与 timeline 检查改由已注册入口
+`bash ./test.sh --profile regression` 承接。该 transitional legacy regression
+保留广泛历史覆盖，供后续提炼稳定 contract 时审计；它不再属于 smoke，不进入
+required profile，receipt 同样始终为 `authoritative: false`。`full` profile 会依次
+运行 required integration、legacy regression 与 focused smoke，用于诊断而不是生成
+权威发布凭据。底层 suite runner 与 package 内部测试命令只是 controller 实现细节，
+不是独立测试入口。
+
 受保护测试、fixture、runner、registry、测试命令和治理文件在合并前还必须通过从
 目标提交物化的测试变更门禁。受保护变更必须同时提供已审阅的 Test Change Request
 和规范化发布复核记录；记录精确绑定分支路由、提交、policy、gate、完整 manifest

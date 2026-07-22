@@ -228,6 +228,10 @@ import {
   assertWorkspaceBootstrapAndResourceDeltaStayIncremental,
 } from './smokeAuthorityLedgerTests.js';
 
+declare const process: {
+  env: Record<string, string | undefined>;
+};
+
 function returnedSession(
   control: SessionLoopControlResult,
   message: string
@@ -285,6 +289,7 @@ function completedKernelToolFact(input: {
 }
 
 async function main(): Promise<void> {
+  assertLegacyRegressionControllerInvocation();
   assertKernelEnvelopeRecoveryUsesLatestMatchingRun();
   assertUserAuthorityFramePreservesExplicitMessages();
   assertPromptLedgerReusesPrefixAndAppendsWithinEpoch();
@@ -17530,6 +17535,17 @@ async function assertSessionDriverLoopAcceptedPlanNativeWriteToolUsesProposalOnl
     false,
     'accepted-plan Complete stage does not use native side-effect tool repair'
   );
+}
+
+function assertLegacyRegressionControllerInvocation(): void {
+  if (
+    process.env.DEEPCODE_TEST_CONTROLLER !== '1' ||
+    process.env.DEEPCODE_TEST_SUITE_ID !== 'session.legacy-regression'
+  ) {
+    throw new Error(
+      'Legacy Session regression is internal; use bash ./test.sh --profile regression.'
+    );
+  }
 }
 
 main().catch((error) => {

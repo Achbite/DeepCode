@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Transitional full-repository runner. Invoke through the repository test.sh.
+# Transitional required repository runner. Invoke through the repository test.sh.
 set -euo pipefail
 
 export PATH="/root/.local/share/pnpm:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
@@ -190,13 +190,11 @@ cargo fmt --check --all
 cargo test --workspace
 pass "Rust workspace"
 
-info "TypeScript and Session"
+info "TypeScript builds"
 pnpm --filter @deepcode/protocol build
 pnpm --filter @deepcode/session-core build
-pnpm --filter @deepcode/session-core smoke
-pnpm --filter @deepcode/session-core smoke:timeline
 pnpm --filter @deepcode/client build
-pass "TypeScript and Session"
+pass "TypeScript builds"
 
 info "Kernel daemon HTTP integration"
 CONFIG_DIR="$(mktemp -d /tmp/deepcode-test-config-XXXXXX)"

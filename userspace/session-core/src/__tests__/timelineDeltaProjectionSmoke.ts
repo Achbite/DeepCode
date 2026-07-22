@@ -5,6 +5,10 @@ import {
 } from '../timelineDelta.js';
 import { assert, assertEqual, randomSmokeToken } from './smokeHelpers.js';
 
+declare const process: {
+  env: Record<string, string | undefined>;
+};
+
 function event(
   sessionId: string,
   id: string,
@@ -33,6 +37,7 @@ function applyAll(
 }
 
 function run(): void {
+  assertLegacyRegressionControllerInvocation();
   const token = randomSmokeToken('timeline');
   const sessionId = `session-${token}`;
   const runId = `run-${token}`;
@@ -272,14 +277,16 @@ function run(): void {
     'completed',
     'the waiting review card settles after the accepted decision'
   );
-  const acceptedReviewUserBlock = reviewBlocks.find((block) =>
-    block.narrativeKind === 'user' && block.events.some((item) => item.id === acceptedReview.id)
+  const settledReviewBlock = reviewBlocks.find((block) => block.narrativeKind === 'review');
+  assert(
+    Boolean(settledReviewBlock?.events.some((item) => item.id === acceptedReview.id)),
+    'accepted review remains a structured fact on the settled review card'
   );
-  assert(Boolean(acceptedReviewUserBlock), 'accepted review decision projects as a user input bubble');
-  assertEqual(
-    (acceptedReviewUserBlock?.events[0]?.payload as Record<string, unknown>)?.contentKey,
-    'review.decision.accepted.userBubble',
-    'accepted review user bubble uses the localized decision label'
+  assert(
+    !reviewBlocks.some((block) =>
+      block.narrativeKind === 'user' && block.events.some((item) => item.id === acceptedReview.id)
+    ),
+    'accepted review does not create a synthetic user turn'
   );
 
   const reasoningOne = event(sessionId, `reasoning-one-${token}`, 'assistant_msg', {
@@ -313,6 +320,17 @@ function run(): void {
     .find((block) => block.narrativeKind === 'diagnostic');
   assert(Boolean(diagnosticBlock), 'structured provider diagnostics use the diagnostic projection');
   assertEqual(diagnosticBlock?.bodyMarkdown, undefined, 'raw diagnostic content is not rendered as assistant text');
+}
+
+function assertLegacyRegressionControllerInvocation(): void {
+  if (
+    process.env.DEEPCODE_TEST_CONTROLLER !== '1' ||
+    process.env.DEEPCODE_TEST_SUITE_ID !== 'session.legacy-regression'
+  ) {
+    throw new Error(
+      'Legacy timeline regression is internal; use bash ./test.sh --profile regression.'
+    );
+  }
 }
 
 run();

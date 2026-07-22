@@ -156,7 +156,14 @@ the repository.
 Run the relevant module checks and the default repository `test.sh` required
 profile in the project Docker environment before this command. The explicit
 host-safe `bash ./test.sh --profile static` profile is useful for early
-feedback, but it is not a substitute for the required profile. `verify-pr`
+feedback, but it is not a substitute for the required profile. The registered
+`bash ./test.sh --profile smoke` profile contains non-authoritative Agent-loop
+and selected historical-defect diagnostics; even a passing smoke receipt
+remains `authoritative: false` and does not replace the required profile. The
+former broad Session smoke and timeline checks are retained under the
+transitional `bash ./test.sh --profile regression` entry. That profile and the
+combined `full` profile are also non-authoritative and do not replace the
+required profile. `verify-pr`
 fetches current remote
 state and rejects an invalid route, moved head, moved target, dirty active head
 worktree, stale target ancestry, missing commits, or diff whitespace errors.

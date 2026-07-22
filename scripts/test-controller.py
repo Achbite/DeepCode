@@ -19,6 +19,27 @@ from typing import Any
 
 SCHEMA_VERSION = 1
 SUITE_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
+TRUSTED_GIT_PATH = "/usr/bin/git"
+UNTRUSTED_GIT_ENVIRONMENT = {
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_CONFIG",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_DIFF_OPTS",
+    "GIT_DIR",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    "GIT_EXEC_PATH",
+    "GIT_EXTERNAL_DIFF",
+    "GIT_GRAFT_FILE",
+    "GIT_INDEX_FILE",
+    "GIT_NAMESPACE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_QUARANTINE_PATH",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_SHALLOW_FILE",
+    "GIT_WORK_TREE",
+}
 
 
 class ControllerError(Exception):
@@ -121,6 +142,8 @@ def validate_registry(data: dict[str, Any], root: Path) -> dict[str, dict[str, A
             require_string(suite.get(field), f"{prefix}.{field}")
         if not isinstance(suite.get("requiredGate"), bool):
             raise ControllerError(f"{prefix}.requiredGate must be a Boolean")
+        if suite["kind"] == "smoke" and suite["requiredGate"]:
+            raise ControllerError(f"{prefix}: smoke suites cannot be requiredGate")
         if not isinstance(suite.get("transitional"), bool):
             raise ControllerError(f"{prefix}.transitional must be a Boolean")
         runner = suite.get("runner")
@@ -216,11 +239,31 @@ def validate_registry(data: dict[str, Any], root: Path) -> dict[str, dict[str, A
     }
     if not required_suite_ids:
         raise ControllerError("registry must contain at least one requiredGate suite")
-    missing_required = required_suite_ids.difference(profiles[default_profile]["suites"])
+    required_profile_suite_ids = set(profiles[default_profile]["suites"])
+    missing_required = required_suite_ids.difference(required_profile_suite_ids)
     if missing_required:
         raise ControllerError(
             "default required profile omits requiredGate suites: "
             + ", ".join(sorted(missing_required))
+        )
+    unexpected_required = required_profile_suite_ids.difference(required_suite_ids)
+    if unexpected_required:
+        raise ControllerError(
+            "default required profile includes non-requiredGate suites: "
+            + ", ".join(sorted(unexpected_required))
+        )
+    if "smoke" not in profiles:
+        raise ControllerError("schemaVersion 1 requires a smoke profile")
+    smoke_suite_ids = {
+        suite_id for suite_id, suite in suites.items() if suite["kind"] == "smoke"
+    }
+    if not smoke_suite_ids:
+        raise ControllerError("registry must contain at least one smoke suite")
+    smoke_profile_suite_ids = set(profiles["smoke"]["suites"])
+    if smoke_profile_suite_ids != smoke_suite_ids:
+        raise ControllerError(
+            "smoke profile must contain every and only smoke suite: "
+            + ", ".join(sorted(smoke_suite_ids))
         )
     return suites
 
@@ -235,14 +278,44 @@ def is_container_environment() -> bool:
     return any(marker in cgroup for marker in ("docker", "containerd", "kubepods"))
 
 
-def git_output(root: Path, *args: str) -> str:
+def trusted_git_environment() -> dict[str, str]:
     environment = os.environ.copy()
+    for name in list(environment):
+        if (
+            name in UNTRUSTED_GIT_ENVIRONMENT
+            or name == "GIT_CONFIG_COUNT"
+            or name.startswith("GIT_CONFIG_KEY_")
+            or name.startswith("GIT_CONFIG_VALUE_")
+            or name.startswith("GIT_TRACE")
+        ):
+            environment.pop(name, None)
+    environment["GIT_CONFIG_GLOBAL"] = os.devnull
+    environment["GIT_CONFIG_NOSYSTEM"] = "1"
+    environment["GIT_NO_REPLACE_OBJECTS"] = "1"
     environment["GIT_OPTIONAL_LOCKS"] = "0"
+    environment["GIT_TERMINAL_PROMPT"] = "0"
+    environment["LC_ALL"] = "C"
+    return environment
+
+
+def trusted_git_command(*args: str) -> list[str]:
+    return [
+        TRUSTED_GIT_PATH,
+        "--no-replace-objects",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.untrackedCache=false",
+        *args,
+    ]
+
+
+def git_output(root: Path, *args: str) -> str:
     try:
         completed = subprocess.run(
-            ["git", *args],
+            trusted_git_command(*args),
             cwd=root,
-            env=environment,
+            env=trusted_git_environment(),
             check=True,
             capture_output=True,
             text=True,
@@ -253,13 +326,11 @@ def git_output(root: Path, *args: str) -> str:
 
 
 def git_bytes(root: Path, *args: str) -> bytes:
-    environment = os.environ.copy()
-    environment["GIT_OPTIONAL_LOCKS"] = "0"
     try:
         completed = subprocess.run(
-            ["git", *args],
+            trusted_git_command(*args),
             cwd=root,
-            env=environment,
+            env=trusted_git_environment(),
             check=True,
             capture_output=True,
         )
@@ -268,14 +339,47 @@ def git_bytes(root: Path, *args: str) -> bytes:
     return completed.stdout
 
 
+def git_blob_at_head(root: Path, head_sha: str, relative: str) -> bytes | None:
+    completed = subprocess.run(
+        trusted_git_command("cat-file", "blob", f"{head_sha}:{relative}"),
+        cwd=root,
+        env=trusted_git_environment(),
+        capture_output=True,
+    )
+    return completed.stdout if completed.returncode == 0 else None
+
+
+def verify_repository_root(root: Path) -> None:
+    observed = Path(git_output(root, "rev-parse", "--show-toplevel")).resolve()
+    expected = root.resolve()
+    if observed != expected:
+        raise ControllerError(
+            f"Git worktree root mismatch: expected {expected}, observed {observed}"
+        )
+
+
 def worktree_fingerprint(root: Path, head_sha: str) -> dict[str, Any]:
     root = root.resolve()
-    tracked_diff = git_bytes(root, "diff", "--binary", head_sha, "--")
+    tracked_diff = git_bytes(
+        root,
+        "diff",
+        "--binary",
+        "--no-ext-diff",
+        "--no-textconv",
+        head_sha,
+        "--",
+    )
+    index_entries_raw = git_bytes(root, "ls-files", "-v", "-z")
+    untrusted_index_entries = [
+        entry for entry in index_entries_raw.split(b"\0")
+        if entry and not entry.startswith(b"H ")
+    ]
     untracked_raw = git_bytes(root, "ls-files", "--others", "--exclude-standard", "-z")
     untracked_paths = sorted(path for path in untracked_raw.split(b"\0") if path)
     digest = hashlib.sha256()
     digest.update(b"head\0" + head_sha.encode("ascii") + b"\0")
     digest.update(b"tracked\0" + tracked_diff + b"\0")
+    digest.update(b"index\0" + index_entries_raw + b"\0")
     for raw_path in untracked_paths:
         relative = raw_path.decode("utf-8", errors="surrogateescape")
         path = (root / relative).resolve(strict=False)
@@ -298,13 +402,20 @@ def worktree_fingerprint(root: Path, head_sha: str) -> dict[str, Any]:
         digest.update(b"\0")
     return {
         "sha256": digest.hexdigest(),
-        "dirty": bool(tracked_diff or untracked_paths),
+        "dirty": bool(tracked_diff or untracked_paths or untrusted_index_entries),
         "trackedDiffSha256": sha256_bytes(tracked_diff),
         "untrackedCount": len(untracked_paths),
+        "indexTrusted": not untrusted_index_entries,
+        "untrustedIndexEntryCount": len(untrusted_index_entries),
     }
 
 
-def selected_asset_manifest(root: Path, suites: list[dict[str, Any]]) -> dict[str, Any]:
+def selected_asset_manifest(
+    root: Path,
+    suites: list[dict[str, Any]],
+    head_sha: str,
+) -> dict[str, Any]:
+    root = root.resolve()
     assets: dict[str, dict[str, Any]] = {}
     suite_definitions: list[dict[str, Any]] = []
     for suite in suites:
@@ -319,9 +430,11 @@ def selected_asset_manifest(root: Path, suites: list[dict[str, Any]]) -> dict[st
             except ValueError as error:
                 raise ControllerError(f"selected asset escapes repository root: {relative}") from error
             raw = path.read_bytes()
+            head_blob = git_blob_at_head(root, head_sha, relative)
             assets[relative] = {
                 "sha256": sha256_bytes(raw),
                 "size": len(raw),
+                "headBound": head_blob == raw,
             }
     canonical_suites = json.dumps(
         suite_definitions,
@@ -331,6 +444,7 @@ def selected_asset_manifest(root: Path, suites: list[dict[str, Any]]) -> dict[st
     ).encode("utf-8")
     return {
         "suiteDefinitionsSha256": sha256_bytes(canonical_suites),
+        "headBound": all(asset["headBound"] for asset in assets.values()),
         "files": {key: assets[key] for key in sorted(assets)},
     }
 
@@ -545,7 +659,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run DeepCode test suites from the repository registry."
     )
-    parser.add_argument("--registry", required=True, help=argparse.SUPPRESS)
     parser.add_argument("--list", action="store_true", help="list registered profiles and suites")
     parser.add_argument("--profile", help="run one registered profile")
     parser.add_argument(
@@ -568,11 +681,9 @@ def main(argv: list[str] | None = None) -> int:
     install_signal_handlers()
     controller_path = Path(__file__).resolve()
     root = controller_path.parent.parent
-    registry_path = Path(args.registry).resolve()
-    try:
-        registry_path.relative_to(root)
-    except ValueError as error:
-        raise ControllerError("registry must be inside the repository root") from error
+    registry_path = root / "tests" / "registry.json"
+    if registry_path.is_symlink() or registry_path.resolve() != registry_path:
+        raise ControllerError("canonical tests/registry.json must be a regular in-tree path")
 
     data, registry_digest = load_registry(registry_path)
     suites = validate_registry(data, root)
@@ -586,12 +697,19 @@ def main(argv: list[str] | None = None) -> int:
     for suite_id in suite_ids:
         check_host_policy(suites[suite_id])
 
+    verify_repository_root(root)
     head_before = git_output(root, "rev-parse", "HEAD")
     worktree_before = worktree_fingerprint(root, head_before)
     asset_manifest_before = selected_asset_manifest(
-        root, [suites[suite_id] for suite_id in suite_ids]
+        root, [suites[suite_id] for suite_id in suite_ids], head_before
     )
     controller_digest = sha256_bytes(controller_path.read_bytes())
+    registry_head_bound = git_blob_at_head(
+        root, head_before, str(registry_path.relative_to(root))
+    ) == registry_path.read_bytes()
+    controller_head_bound = git_blob_at_head(
+        root, head_before, str(controller_path.relative_to(root))
+    ) == controller_path.read_bytes()
     started_at = utc_now()
     run_started = time.monotonic()
     results: list[dict[str, Any]] = []
@@ -609,7 +727,7 @@ def main(argv: list[str] | None = None) -> int:
     head_after = git_output(root, "rev-parse", "HEAD")
     worktree_after = worktree_fingerprint(root, head_after)
     asset_manifest_after = selected_asset_manifest(
-        root, [suites[suite_id] for suite_id in suite_ids]
+        root, [suites[suite_id] for suite_id in suite_ids], head_after
     )
     final_registry_digest = sha256_bytes(registry_path.read_bytes())
     final_controller_digest = sha256_bytes(controller_path.read_bytes())
@@ -622,6 +740,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     if not identity_stable and overall_exit == 0:
         overall_exit = 2
+
+    required_gate_suite_ids = {
+        suite_id for suite_id, suite in suites.items() if suite["requiredGate"]
+    }
+    selected_all_required = (
+        len(suite_ids) == len(required_gate_suite_ids)
+        and set(suite_ids) == required_gate_suite_ids
+    )
 
     receipt = {
         "schemaVersion": 1,
@@ -637,15 +763,24 @@ def main(argv: list[str] | None = None) -> int:
             "stable": worktree_after["sha256"] == worktree_before["sha256"],
             "trackedDiffSha256": worktree_before["trackedDiffSha256"],
             "untrackedCount": worktree_before["untrackedCount"],
+            "indexTrusted": worktree_before["indexTrusted"],
+            "untrustedIndexEntryCount": worktree_before["untrustedIndexEntryCount"],
         },
         "registrySha256": registry_digest,
         "registryStable": final_registry_digest == registry_digest,
+        "registryHeadBound": registry_head_bound,
         "controllerSha256": controller_digest,
         "controllerStable": final_controller_digest == controller_digest,
+        "controllerHeadBound": controller_head_bound,
         "selectedAssets": asset_manifest_before,
         "selectedAssetsStable": asset_manifest_after == asset_manifest_before,
-        "authoritative": overall_exit == 0
+        "authoritative": selected_by == "profile:required"
+        and selected_all_required
+        and overall_exit == 0
         and not worktree_before["dirty"]
+        and registry_head_bound
+        and controller_head_bound
+        and asset_manifest_before["headBound"]
         and identity_stable,
         "startedAt": started_at,
         "finishedAt": utc_now(),

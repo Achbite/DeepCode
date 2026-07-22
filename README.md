@@ -25,6 +25,22 @@ and never reports a host-only static pass as the full gate. On a host, run
 `bash ./test.sh --profile static` explicitly for host-safe checks; run the
 default required profile inside the project container.
 
+Run the registered Session smoke cases only through
+`bash ./test.sh --profile smoke`. Smoke contains a small set of named Agent-loop
+and selected historical-defect checks. It reports real failures but is diagnostic:
+it is excluded from the required profile and always emits
+`authoritative: false`.
+
+The former monolithic Session smoke and timeline checks are registered
+separately as `bash ./test.sh --profile regression`. This transitional legacy
+regression suite preserves broad historical coverage for later contract audit,
+but it is not smoke, is excluded from the required profile, and also always
+emits `authoritative: false`. The `full` profile runs required integration,
+legacy regression, and focused smoke suites for diagnostics; it is not an
+authoritative release receipt. Suite runners and package-level internal test
+commands are controller implementation details and are not supported as
+separate test entrypoints.
+
 Protected test assets, fixtures, runners, registries, commands, and governance
 files also pass the target-materialized test-change gate before merge. A
 protected change requires the reviewed Test Change Request and a canonical

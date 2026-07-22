@@ -10,7 +10,7 @@
   },
   "profiles": {
     "required": {
-      "description": "Current required repository gate. It never degrades to static checks on a host.",
+      "description": "Authoritative repository gate containing every and only requiredGate suite; it never runs smoke checks or degrades to host static checks.",
       "suites": [
         "repository.legacy"
       ]
@@ -21,10 +21,24 @@
         "repository.static"
       ]
     },
-    "full": {
-      "description": "Alias for the current complete transitional repository suite.",
+    "smoke": {
+      "description": "Non-authoritative focused Session agent-loop and selected historical-defect smoke checks.",
       "suites": [
-        "repository.legacy"
+        "session.smoke"
+      ]
+    },
+    "regression": {
+      "description": "Non-authoritative transitional Session regression coverage retained for later contract audit.",
+      "suites": [
+        "session.legacy-regression"
+      ]
+    },
+    "full": {
+      "description": "Non-authoritative run of required integration, transitional Session regression, and focused smoke suites.",
+      "suites": [
+        "repository.legacy",
+        "session.legacy-regression",
+        "session.smoke"
       ]
     }
   },
@@ -62,7 +76,7 @@
     },
     {
       "id": "repository.legacy",
-      "description": "Transitional complete Rust, TypeScript, Session, daemon, Host Web, and IPC suite migrated without relaxing its business assertions.",
+      "description": "Transitional required Rust, TypeScript build, daemon, Host Web, and IPC suite; Session smoke checks are registered separately.",
       "layer": "cross-layer",
       "kind": "integration",
       "owner": "repository",
@@ -89,6 +103,69 @@
       ],
       "contractSources": [
         "scripts/tests/repository-legacy.sh"
+      ]
+    },
+    {
+      "id": "session.legacy-regression",
+      "description": "Non-authoritative legacy Session and timeline regression coverage pending stable-contract extraction.",
+      "layer": "session",
+      "kind": "regression",
+      "owner": "session",
+      "approvalClass": "test-runtime",
+      "requiredGate": false,
+      "transitional": true,
+      "runner": {
+        "type": "shell",
+        "path": "scripts/tests/session-legacy-regression.sh",
+        "args": [],
+        "timeoutSeconds": 1200,
+        "terminateGraceSeconds": 5
+      },
+      "environment": {
+        "container": "optional",
+        "hostPolicy": "allowed"
+      },
+      "resources": [],
+      "contractSources": [
+        "userspace/session-core/package.json",
+        "userspace/session-core/src/__tests__/agentPlanSmoke.ts",
+        "userspace/session-core/src/__tests__/timelineDeltaProjectionSmoke.ts",
+        "userspace/session-core/src/__tests__/smokeAuthorityLedgerTests.ts",
+        "userspace/session-core/src/__tests__/smokeFixtures.ts",
+        "userspace/session-core/src/__tests__/smokeHelpers.ts",
+        "userspace/session-core/src/__tests__/smokeLoopContextTests.ts",
+        "userspace/session-core/src/__tests__/smokeNativeToolPipelineTests.ts",
+        "userspace/session-core/src/__tests__/smokePromptContextTests.ts",
+        "userspace/session-core/src/__tests__/smokeStaticSyntaxReviewTests.ts",
+        "userspace/session-core/src/__tests__/smokeTerminalGuidanceTests.ts"
+      ]
+    },
+    {
+      "id": "session.smoke",
+      "description": "Non-authoritative focused Session agent-loop and selected historical-defect smoke checks.",
+      "layer": "session",
+      "kind": "smoke",
+      "owner": "session",
+      "approvalClass": "test-runtime",
+      "requiredGate": false,
+      "transitional": false,
+      "runner": {
+        "type": "shell",
+        "path": "scripts/tests/session-smoke.sh",
+        "args": [],
+        "timeoutSeconds": 300,
+        "terminateGraceSeconds": 5
+      },
+      "environment": {
+        "container": "optional",
+        "hostPolicy": "allowed"
+      },
+      "resources": [],
+      "contractSources": [
+        "userspace/session-core/package.json",
+        "userspace/session-core/src/__tests__/agentLoopSmoke.ts",
+        "userspace/session-core/src/__tests__/smokeFixtures.ts",
+        "userspace/session-core/src/__tests__/smokeHelpers.ts"
       ]
     }
   ]
