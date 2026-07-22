@@ -19,6 +19,25 @@ struct AppState {
     client: reqwest::Client,
 }
 
+struct OwnedDaemon {
+    child: Option<Child>,
+}
+
+impl OwnedDaemon {
+    fn new(child: Option<Child>) -> Self {
+        Self { child }
+    }
+}
+
+impl Drop for OwnedDaemon {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ApiResponse {
@@ -54,7 +73,7 @@ async fn main() {
         .unwrap_or_else(|| port.saturating_add(1));
 
     let daemon_base_url = format!("http://{daemon_host}:{daemon_port}");
-    let _daemon_child = spawn_daemon_if_requested(&daemon_host, daemon_port);
+    let _daemon = OwnedDaemon::new(spawn_daemon_if_requested(&daemon_host, daemon_port));
 
     let state = AppState {
         daemon_base_url,

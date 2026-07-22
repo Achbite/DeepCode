@@ -1,5 +1,25 @@
 /** Shared visibility rules applied to committed events and live overlay events. */
 
+/**
+ * Explicit event display policy takes precedence over narrative fallback rules.
+ * Hidden facts remain available to archives and audit consumers, but must not
+ * be projected into the user-facing timeline.
+ */
+export function isExplicitlyHiddenTimelineEvent(event: {
+  kind: string;
+  payload?: unknown;
+  display?: { presentation?: string };
+}): boolean {
+  if (event.kind.startsWith('trace/')) return true;
+  const payload = recordValue(event.payload);
+  const visibility = stringValue(payload?.visibility);
+  const payloadPresentation = stringValue(payload?.presentation);
+  return visibility === 'hidden' ||
+    visibility === 'debug' ||
+    payloadPresentation === 'traceOnly' ||
+    event.display?.presentation === 'traceOnly';
+}
+
 // 不应单独成块的纯编排/调度生命周期事件 stage / kernelEvent.kind 集合。
 // 注意：不含 work_unit.* 与 tool.* —— 它们携带文件/命令事实，由工具卡呈现。
 const INTERNAL_ORCHESTRATION_STAGES = new Set<string>([
@@ -75,4 +95,14 @@ export function isMainTimelineActivityShape(activity: { kind: string; toolName?:
   if (isSuppressedActivityKind(activity.kind)) return false;
   if (isRedundantPreToolExecution(activity.kind, activity.toolName)) return false;
   return true;
+}
+
+function recordValue(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function stringValue(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value : undefined;
 }

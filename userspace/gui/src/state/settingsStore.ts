@@ -16,6 +16,10 @@ import {
   patchUserSettings,
   patchWorkspaceSettings,
 } from '../services/runtimeAdapter';
+import {
+  normalizeGuiAccentColor,
+  normalizeGuiThemePreference,
+} from '../theme/deepcodeGuiTheme';
 
 export type SettingSource = 'default' | 'user' | 'workspace';
 
@@ -134,8 +138,21 @@ export const SETTING_DEFINITIONS: SettingDefinition[] = [
     group: 'gui',
     control: 'select',
     options: [
-      { label: 'Light', value: 'deepcode-gui-light' },
-      { label: 'Dark', value: 'deepcode-gui-dark' },
+      { label: 'System', value: 'system' },
+      { label: 'Light', value: 'light' },
+      { label: 'Dark', value: 'dark' },
+    ],
+  },
+  {
+    key: 'gui.accentColor',
+    label: 'DeepCode-GUI Accent Color',
+    description: 'Accent color used by interactive controls in the DeepCode-GUI shell.',
+    group: 'gui',
+    control: 'select',
+    options: [
+      { label: 'Blue', value: 'blue' },
+      { label: 'Purple', value: 'purple' },
+      { label: 'Green', value: 'green' },
     ],
   },
   {
@@ -366,6 +383,18 @@ export const SETTING_DEFINITIONS: SettingDefinition[] = [
     options: permissionPolicyOptions(),
   },
   {
+    key: 'agent.permissions.autonomyMode',
+    label: 'Autonomy Mode',
+    description: 'Session autonomy policy applied before Kernel permission gates.',
+    group: 'agent',
+    control: 'select',
+    options: [
+      { label: 'Strict', value: 'strict' },
+      { label: 'Trusted Workspace', value: 'trustedWorkspace' },
+      { label: 'Maximum', value: 'maximum' },
+    ],
+  },
+  {
     key: 'agent.permissions.workspaceWrite',
     label: 'Workspace Write',
     description: 'Permission policy for workspace mutations.',
@@ -584,6 +613,12 @@ function getDefaultValue(key: string): UserSettingValue {
 
 function normalizeSettingValue(key: string, value: unknown): UserSettingValue {
   const defaultValue = getDefaultValue(key);
+  if (key === 'gui.colorTheme') {
+    return normalizeGuiThemePreference(value);
+  }
+  if (key === 'gui.accentColor') {
+    return normalizeGuiAccentColor(value);
+  }
   if (typeof defaultValue === 'boolean') return Boolean(value);
   if (typeof defaultValue === 'number') {
     const n = typeof value === 'number' ? value : Number(value);
@@ -613,9 +648,15 @@ function buildEffectiveSettings(
   overriddenKeys: string[]
 ): Pick<SettingsStateData, 'effectiveSettings' | 'sources'> {
   const normalizedWorkspace = normalizeWorkspaceSettings(workspaceSettings);
+  const normalizedUserSettings = Object.fromEntries(
+    Object.entries(userSettings).map(([key, value]) => [
+      key,
+      KNOWN_SETTING_KEYS.has(key) ? normalizeSettingValue(key, value) : value,
+    ])
+  ) as UserSettings;
   const effectiveSettings: UserSettings = {
     ...DEFAULT_USER_SETTINGS,
-    ...userSettings,
+    ...normalizedUserSettings,
     ...normalizedWorkspace,
   };
   const sources: Record<string, SettingSource> = {};

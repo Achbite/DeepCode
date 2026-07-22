@@ -78,6 +78,11 @@ export interface NativeToolProviderLoopInput<
   ): Promise<TTurn>;
   isEmptyResponseError(error: unknown): boolean;
   semanticDirectiveError(error: unknown): { code: string; message: string } | undefined;
+  onSemanticDraftFailure?(
+    state: TState,
+    callId: string | undefined,
+    failureCode: string
+  ): Promise<void>;
   onArtifactDraftBudgetExceeded(state: TState, error: SessionSemanticDirectiveError): Promise<void>;
   createError?(code: string, message: string): Error;
 }
@@ -107,6 +112,7 @@ export class NativeToolProviderLoop<
     } catch (error) {
       const directiveError = input.semanticDirectiveError(error);
       if (!directiveError) throw error;
+      await input.onSemanticDraftFailure?.(input.state, undefined, directiveError.code);
       return this.scheduleSameProfileRetry(input, [
         `code=${directiveError.code}`,
         `fieldErrors=${directiveError.message}`,
@@ -116,6 +122,7 @@ export class NativeToolProviderLoop<
     const registeredNames = new Set(input.providerTools.map((tool) => tool.name));
     const unregistered = toolCalls.find((toolCall) => !registeredNames.has(toolCall.name));
     if (unregistered) {
+      await input.onSemanticDraftFailure?.(input.state, unregistered.callId, 'native_tool_arguments_invalid');
       return this.scheduleSameProfileRetry(input, [
         'code=native_tool_arguments_invalid',
         `tool=${unregistered.name}`,
@@ -123,6 +130,7 @@ export class NativeToolProviderLoop<
       ], `semantic:unregistered:${unregistered.name}:evidence-${input.state.resourceEvidenceRevision ?? 0}`, 'native_tool_arguments_invalid');
     }
     if (toolCalls.length === 0) {
+      await input.onSemanticDraftFailure?.(input.state, undefined, 'native_tool_arguments_invalid');
       return this.scheduleSameProfileRetry(input, [
         'code=native_tool_arguments_invalid',
         'fieldErrors=Provider did not emit a required Session semantic directive.',
@@ -156,11 +164,19 @@ export class NativeToolProviderLoop<
       }
       return handled.kind === 'proposal' ? handled.proposal : { kind: 'providerResume' };
     } catch (error) {
-      if (!(error instanceof SessionSemanticDirectiveError)) throw error;
+      if (!(error instanceof SessionSemanticDirectiveError)) {
+        await input.onSemanticDraftFailure?.(
+          input.state,
+          toolCalls[0]?.callId,
+          'session_semantic_directive_invalid'
+        );
+        throw error;
+      }
       if (error.causeCode === 'artifact_draft_budget_exceeded') {
         await input.onArtifactDraftBudgetExceeded(input.state, error);
         return { kind: 'providerResume' };
       }
+      await input.onSemanticDraftFailure?.(input.state, error.callId, error.code);
       return this.scheduleSameProfileRetry(input, [
         `code=${error.code}`,
         `causeCode=${error.causeCode}`,

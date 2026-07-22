@@ -1472,6 +1472,17 @@ button {
 
 .agent-composer__footer-left {
   min-width: 0;
+  display: flex;
+  align-items: center;
+}
+
+.agent-composer__footer-right {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-left: auto;
 }
 
 .agent-composer__attach-wrap {
@@ -2195,38 +2206,38 @@ button {
 }
 
 .deepcode-gui-workbench .file-tree {
-  --ft-bg: #ffffff;
-  --ft-bg-2: #fbfaf6;
+  --ft-bg: var(--dc-surface);
+  --ft-bg-2: var(--dc-surface-subtle);
   --ft-fg: var(--text);
   --ft-fg-muted: var(--muted);
-  --ft-fg-strong: #111318;
+  --ft-fg-strong: var(--dc-foreground-strong);
   --ft-border: var(--line);
-  --ft-hover-bg: #f5f3ec;
-  --ft-selected-bg: rgba(37, 99, 235, 0.08);
+  --ft-hover-bg: var(--dc-surface-hover);
+  --ft-selected-bg: var(--dc-accent-soft);
   --ft-accent: var(--accent);
-  background: #ffffff;
+  background: var(--dc-surface);
 }
 
 .deepcode-gui-workbench .file-tree__titlebar,
 .deepcode-gui-workbench .settings-nav,
 .deepcode-gui-workbench .settings-body {
   border-color: var(--line);
-  background: #ffffff;
+  background: var(--dc-surface);
 }
 
 .deepcode-gui-workbench .file-tree__toolbar-btn:hover,
 .deepcode-gui-workbench .file-tree__empty-action,
 .deepcode-gui-workbench .file-tree__row:hover,
 .deepcode-gui-workbench .settings-nav-item:hover {
-  background: #f5f3ec;
-  color: #111318;
+  background: var(--dc-surface-hover);
+  color: var(--dc-foreground-strong);
 }
 
 .deepcode-gui-workbench .file-tree__row--selected,
 .deepcode-gui-workbench .file-tree__row--selected:hover,
 .deepcode-gui-workbench .settings-nav-item--active {
-  background: rgba(37, 99, 235, 0.08);
-  color: #174ea6;
+  background: var(--dc-accent-soft);
+  color: var(--dc-accent);
 }
 
 .deepcode-gui-workbench .file-tree__icon,
@@ -2235,7 +2246,7 @@ button {
 }
 
 .deepcode-gui-workbench .settings-center {
-  background: #ffffff;
+  background: var(--dc-surface);
   color: var(--text);
 }
 
@@ -2248,13 +2259,13 @@ button {
 .deepcode-gui-workbench .settings-card,
 .deepcode-gui-workbench .settings-card__inline-placeholder {
   border-color: var(--line);
-  background: #fbfaf6;
+  background: var(--dc-surface-subtle);
   box-shadow: var(--shadow-sm);
 }
 
 .deepcode-gui-workbench .settings-card__title {
   border-color: var(--line);
-  background: #f5f3ec;
+  background: var(--dc-surface-hover);
 }
 
 .deepcode-gui-workbench .settings-card__body,
@@ -3077,16 +3088,33 @@ button {
 }
 
 .deepcode-gui-home-panel .agent-composer {
-  width: min(100%, 760px);
+  width: min(82%, 650px);
   margin: 0;
   border-radius: 20px;
-  padding: 12px 14px 10px;
+  padding: 9px 12px 8px;
   box-shadow: 0 18px 38px rgba(32, 33, 36, 0.1);
 }
 
-.deepcode-gui-home-panel .agent-composer:focus-within,
+.deepcode-gui-home-panel .agent-composer__input-wrap textarea {
+  min-height: 46px;
+  max-height: 220px;
+}
+
+.deepcode-gui-home-panel .agent-attachment-chips {
+  margin: -12px -14px 6px;
+  padding: 10px 14px;
+  border-radius: 19px 19px 0 0;
+}
+
+.deepcode-gui-home-panel .agent-composer--input-focused,
 .deepcode-gui-home-panel .agent-composer--expanded {
   width: min(100%, 820px);
+  padding: 12px 14px 10px;
+}
+
+.deepcode-gui-home-panel .agent-composer--input-focused .agent-composer__input-wrap textarea,
+.deepcode-gui-home-panel .agent-composer--expanded .agent-composer__input-wrap textarea {
+  min-height: 78px;
 }
 
 .deepcode-gui-agent-panel__header {
@@ -3580,7 +3608,7 @@ button {
 }
 
 .agent-composer {
-  width: min(calc(100% - 56px), 680px);
+  width: min(calc(100% - 56px), 620px);
   margin: 0 auto 18px;
   gap: 4px;
   padding: 6px 10px;
@@ -3588,17 +3616,17 @@ button {
   border-radius: 8px;
   background: #ffffff;
   box-shadow: 0 10px 26px rgba(32, 33, 36, 0.1);
-  transition: width 160ms ease, padding 160ms ease, box-shadow 160ms ease;
+  transition: width 180ms ease, padding 180ms ease, box-shadow 180ms ease, border-color 180ms ease;
 }
 
-.agent-composer:focus-within,
+.agent-composer--input-focused,
 .agent-composer--expanded {
   width: min(calc(100% - 56px), 820px);
   box-shadow: 0 12px 30px rgba(32, 33, 36, 0.12);
 }
 
 .agent-composer--decision,
-.agent-composer--decision:focus-within,
+.agent-composer--decision.agent-composer--input-focused,
 .agent-composer--decision.agent-composer--expanded {
   width: min(calc(100% - 56px), 820px);
   margin: 0 auto 18px;
@@ -3612,9 +3640,9 @@ button {
 
 .agent-composer textarea,
 .agent-composer__input-wrap textarea {
-  min-height: 34px;
-  height: 34px;
-  max-height: 150px;
+  min-height: 42px;
+  height: 42px;
+  max-height: 180px;
   border: 0;
   border-radius: 10px;
   background: #ffffff;
@@ -3622,7 +3650,97 @@ button {
   padding: 4px 2px;
   color: #202124;
   font-size: 13px;
+  line-height: 1.5;
+  overflow-y: hidden;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  word-break: break-word;
   resize: none;
+}
+
+.agent-composer--input-focused .agent-composer__input-wrap textarea,
+.agent-composer--expanded .agent-composer__input-wrap textarea {
+  min-height: 64px;
+}
+
+.agent-attachment-chips {
+  margin: -6px -10px 4px;
+  padding: 8px 10px 9px;
+  border-bottom: 1px solid #e4e1d9;
+  border-radius: 7px 7px 0 0;
+  background: #f7f7f4;
+}
+
+.agent-chip {
+  width: min(100%, 300px);
+  min-height: 42px;
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr) 20px;
+  align-items: center;
+  gap: 8px;
+  border-color: #dedbd2;
+  border-radius: 10px;
+  background: #ffffff;
+  color: #30343a;
+  padding: 6px 7px;
+  text-align: left;
+}
+
+.agent-chip__icon {
+  width: 22px;
+  height: 22px;
+  display: grid;
+  place-items: center;
+  color: #666b73;
+}
+
+.agent-chip__icon svg {
+  width: 18px;
+  height: 18px;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.45;
+}
+
+.agent-chip__body {
+  min-width: 0;
+  display: grid;
+  gap: 1px;
+}
+
+.agent-chip__path {
+  overflow: hidden;
+  color: inherit;
+  font-size: 12px;
+  font-weight: 560;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-chip__kind {
+  color: #858a92;
+  font-size: 10px;
+  line-height: 1.2;
+}
+
+.agent-chip__remove {
+  width: 20px;
+  height: 20px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  color: #8a8f98;
+  font-size: 15px;
+  font-weight: 420;
+  line-height: 1;
+}
+
+.agent-chip:hover .agent-chip__remove {
+  background: #ecebe7;
+  color: #30343a;
 }
 
 .agent-composer textarea:focus,

@@ -15,10 +15,15 @@ import {
   type KernelProposalReviewReport,
   type PermissionRequest,
   type ProjectionDelta,
+  type SessionSemanticDraftPayload,
 } from '@deepcode/protocol';
 import type { ResourcePacket, ResourceRequest } from './context/types.js';
 import type { ReviewPacket } from './review/types.js';
-import { isInternalOrchestrationStage, isMainTimelineActivityShape } from './timelineFilter.js';
+import {
+  isExplicitlyHiddenTimelineEvent,
+  isInternalOrchestrationStage,
+  isMainTimelineActivityShape,
+} from './timelineFilter.js';
 import type { TranscriptMessageEntry } from './transcript.js';
 import type { DynamicWorkflowPlan } from './workflow/types.js';
 import {
@@ -26,6 +31,7 @@ import {
   type InteractionLedgerActiveInteraction,
 } from './run-state/interactionLedger.js';
 import { planInteractionAwaitsDecision } from './run-state/planInteractionState.js';
+import { readableTaskPlanProjection } from './driver/projection/planProjectionBuilder.js';
 
 export interface PendingPermissionProjection {
   request: PermissionRequest;
@@ -188,7 +194,7 @@ export function buildNarrativeTimelineProjection(input: NarrativeTimelineProject
     if (event.kind === 'cache_telemetry') {
       return;
     }
-    if (isDebugTimelineEvent(event)) {
+    if (isExplicitlyHiddenTimelineEvent(event)) {
       return;
     }
     if (isProjectionTimelineHiddenEvent(event)) {
@@ -250,9 +256,12 @@ export function buildNarrativeTimelineProjection(input: NarrativeTimelineProject
     annotateBlocksWithPhase(turns, input.events, acceptedReviewIndex);
   }
   resolveTimelineInteractionBlocks(turns, input.events);
+  applyTurnAuthorityStates(turns, input.events);
   stabilizeNarrativeBlockIds(turns);
 
-  const rawEventRefs = input.events.map(eventRefForAgentEvent);
+  const rawEventRefs = Array.from(new Set(
+    turns.flatMap((turn) => turn.blocks.flatMap((block) => block.rawEventRefs ?? []))
+  ));
   const blockIdsByEventId = timelineBlockIdsByEventId(turns);
   const implementationTaskItems = input.events.flatMap((event, index) =>
     taskPlanTaskProjectionItems(input.events, event, index, blockIdsByEventId.get(event.id))
@@ -438,6 +447,10 @@ function projectionDeltaToTransientEvent(delta: ProjectionDelta, generatedAt?: s
     activeOverlay: true,
   };
 
+  if (delta.type === 'semantic_delta') {
+    return semanticDraftTransientEvent(delta, id, ts, basePayload);
+  }
+
   const textKind = projectionDeltaTextChannel(delta);
   if (textKind && typeof delta.delta === 'string' && delta.delta.length > 0) {
     if (textKind === 'reasoning') {
@@ -456,7 +469,6 @@ function projectionDeltaToTransientEvent(delta: ProjectionDelta, generatedAt?: s
           visibility: 'conversation',
           reasoningTrace: true,
           activeOverlay: true,
-          activity: delta.activity,
         },
         display: {
           presentation: 'collapsible',
@@ -527,6 +539,181 @@ function projectionDeltaToTransientEvent(delta: ProjectionDelta, generatedAt?: s
   }
 
   return [];
+}
+
+function semanticDraftTransientEvent(
+  delta: ProjectionDelta,
+  id: string,
+  ts: string,
+  basePayload: Record<string, unknown>
+): AgentEvent[] {
+  const draft = sessionSemanticDraftPayload(delta.payload);
+  if (!draft || draft.state === 'discarded') return [];
+  const status = draft.state === 'failed' ? 'failed' : 'running';
+  if (draft.kind === 'answer') {
+    const content = draft.answer?.content ?? '';
+    if (!content) return [];
+    return [{
+      id,
+      sessionId: delta.sessionId,
+      ts,
+      kind: 'assistant_msg',
+      payload: {
+        ...basePayload,
+        content,
+        channel: 'final',
+        visibility: 'conversation',
+        presentation: 'body',
+        proposalId: draft.proposalId,
+        status,
+        semanticDraftState: draft.state,
+        semanticDraftRevision: draft.revision,
+        semanticDraftFailureCode: draft.failureCode,
+      },
+      display: {
+        presentation: 'body',
+        defaultOpen: true,
+      },
+    }];
+  }
+
+  const plan = draft.plan;
+  if (!plan || (!plan.title && !plan.summary && plan.tasks.length === 0)) return [];
+  const summary = plan.title ?? 'Plan';
+  const planId = draft.planId ?? `plan-${draft.callId}`;
+  const readablePlan = readableTaskPlanProjection(
+    plan as unknown as Record<string, unknown>,
+    plan.summary ?? '',
+    {
+      runId: delta.runId ?? 'run',
+      planId,
+      proposalId: draft.proposalId,
+    }
+  );
+  return [{
+    id,
+    sessionId: delta.sessionId,
+    ts,
+    kind: 'plan_card',
+    payload: {
+      ...basePayload,
+      titleKey: 'session.projection.plan.title',
+      summary,
+      readablePlan,
+      runId: delta.runId,
+      planId,
+      proposalId: draft.proposalId,
+      status,
+      confirmable: false,
+      decisionOwner: {
+        kind: 'plan',
+        runId: delta.runId,
+        targetId: planId,
+        planId,
+        source: 'plan_card',
+      },
+      taskPlan: plan,
+      channel: 'action',
+      visibility: 'conversation',
+      presentation: 'body',
+      semanticDraftState: draft.state,
+      semanticDraftRevision: draft.revision,
+      semanticDraftFailureCode: draft.failureCode,
+    },
+    display: {
+      presentation: 'body',
+      defaultOpen: true,
+    },
+  }];
+}
+
+function sessionSemanticDraftPayload(value: unknown): SessionSemanticDraftPayload | undefined {
+  if (!isRecordPayload(value) || value.schemaVersion !== 'deepcode.session.semantic-draft.v1') return undefined;
+  if (value.kind !== 'answer' && value.kind !== 'plan') return undefined;
+  if (value.toolName !== 'session.submit_answer' && value.toolName !== 'session.submit_plan') return undefined;
+  if ((value.kind === 'answer') !== (value.toolName === 'session.submit_answer')) return undefined;
+  if (typeof value.callId !== 'string' || typeof value.proposalId !== 'string') return undefined;
+  if (typeof value.revision !== 'number' || !Number.isSafeInteger(value.revision) || value.revision < 0) return undefined;
+  if (value.state !== 'streaming' && value.state !== 'failed' && value.state !== 'discarded') return undefined;
+  const revision = value.revision;
+  const state: SessionSemanticDraftPayload['state'] = value.state;
+  const common = {
+    schemaVersion: 'deepcode.session.semantic-draft.v1' as const,
+    kind: value.kind,
+    toolName: value.toolName,
+    callId: value.callId,
+    proposalId: value.proposalId,
+    revision,
+    state,
+    ...(typeof value.failureCode === 'string' && value.failureCode.trim()
+      ? { failureCode: value.failureCode }
+      : {}),
+  };
+  if (value.kind === 'answer') {
+    const answer = isRecordPayload(value.answer) ? value.answer : undefined;
+    if (!answer || typeof answer.content !== 'string') return undefined;
+    return {
+      ...common,
+      kind: 'answer',
+      toolName: 'session.submit_answer',
+      answer: { content: answer.content },
+    };
+  }
+
+  const plan = isRecordPayload(value.plan) ? value.plan : undefined;
+  if (!plan || !Array.isArray(plan.tasks)) return undefined;
+  const tasks = plan.tasks.map(sessionSemanticDraftPlanTask);
+  if (tasks.some((task) => !task)) return undefined;
+  const risks = semanticDraftStringArray(plan.risks);
+  const reviewCheckpoints = semanticDraftStringArray(plan.reviewCheckpoints);
+  if (!risks || !reviewCheckpoints) return undefined;
+  if (plan.title !== undefined && typeof plan.title !== 'string') return undefined;
+  if (plan.summary !== undefined && typeof plan.summary !== 'string') return undefined;
+  if (value.planId !== undefined && typeof value.planId !== 'string') return undefined;
+  return {
+    ...common,
+    kind: 'plan',
+    toolName: 'session.submit_plan',
+    ...(typeof value.planId === 'string' ? { planId: value.planId } : {}),
+    plan: {
+      ...(typeof plan.title === 'string' ? { title: plan.title } : {}),
+      ...(typeof plan.summary === 'string' ? { summary: plan.summary } : {}),
+      tasks: tasks as NonNullable<SessionSemanticDraftPayload['plan']>['tasks'],
+      risks,
+      reviewCheckpoints,
+    },
+  };
+}
+
+function sessionSemanticDraftPlanTask(
+  value: unknown
+): NonNullable<SessionSemanticDraftPayload['plan']>['tasks'][number] | undefined {
+  if (!isRecordPayload(value) || !isRecordPayload(value.args)) return undefined;
+  const target = semanticDraftStringArray(value.target);
+  const dependencies = semanticDraftStringArray(value.dependencies);
+  const acceptanceCriteria = semanticDraftStringArray(value.acceptanceCriteria);
+  const failureCriteria = semanticDraftStringArray(value.failureCriteria);
+  if (!target || !dependencies || !acceptanceCriteria || !failureCriteria) return undefined;
+  if (typeof value.taskId !== 'string' || typeof value.title !== 'string' || typeof value.toolId !== 'string') {
+    return undefined;
+  }
+  return {
+    taskId: value.taskId,
+    title: value.title,
+    toolId: value.toolId,
+    target,
+    dependencies,
+    args: value.args,
+    acceptanceCriteria,
+    failureCriteria,
+  };
+}
+
+function semanticDraftStringArray(value: unknown): string[] | undefined {
+  if (!Array.isArray(value) || !value.every((item): item is string => typeof item === 'string')) {
+    return undefined;
+  }
+  return [...value];
 }
 
 function liveOverlayEventId(delta: ProjectionDelta): string {
@@ -731,7 +918,7 @@ function userInputBubbleContent(event: AgentEvent): string | undefined {
   if (event.kind === 'review_summary') {
     const status = stringField(event.payload, 'status');
     if (status !== 'accepted' && status !== 'rejected' && status !== 'needsRevision') return undefined;
-    if (status === 'accepted') return 'Review accepted';
+    if (status === 'accepted') return undefined;
     return firstPayloadText(event.payload, ['guidance', 'content', 'summary', 'message']);
   }
   return undefined;
@@ -739,9 +926,6 @@ function userInputBubbleContent(event: AgentEvent): string | undefined {
 
 function userInputBubbleContentKey(event: AgentEvent): string | undefined {
   if (!isRecordPayload(event.payload)) return undefined;
-  if (event.kind === 'review_summary' && stringField(event.payload, 'status') === 'accepted') {
-    return 'review.decision.accepted.userBubble';
-  }
   return stringField(event.payload, 'contentKey') ??
     stringField(event.payload, 'messageKey') ??
     stringField(event.payload, 'summaryKey');
@@ -1366,6 +1550,11 @@ function canGroupNarrativeEvent(
   // Each provider call is a distinct reasoning item. Streaming chunks for one
   // call are already coalesced before they enter the narrative projection.
   if (nextNarrativeKind === 'thinking') return false;
+  if (nextNarrativeKind === 'review') {
+    const lastReviewKey = reviewNarrativeGroupKey(last.events);
+    const nextReviewKey = reviewNarrativeGroupKey([event]);
+    return Boolean(lastReviewKey && nextReviewKey && lastReviewKey === nextReviewKey);
+  }
   if (nextNarrativeKind !== 'operationEvidence') return false;
 
   const lastActivityKey = narrativeActivityGroupKey(last.events);
@@ -1374,6 +1563,16 @@ function canGroupNarrativeEvent(
     return Boolean(lastActivityKey && nextActivityKey && lastActivityKey === nextActivityKey);
   }
   return narrativeStageGroupKey(last.events[last.events.length - 1]) === narrativeStageGroupKey(event);
+}
+
+function reviewNarrativeGroupKey(events: AgentEvent[]): string | undefined {
+  for (const event of events) {
+    if (event.kind !== 'review_summary' || !isRecordPayload(event.payload)) continue;
+    const runId = stringField(event.payload, 'runId');
+    const reviewId = stringField(event.payload, 'reviewId') ?? stringField(event.payload, 'sourcePlanId');
+    if (runId && reviewId) return `${runId}:${reviewId}`;
+  }
+  return undefined;
 }
 
 function narrativeActivityGroupKey(events: AgentEvent[]): string | undefined {
@@ -1526,6 +1725,64 @@ function finalizeNarrativeTurn(turn: AgentTimelineResult['turns'][number]): Agen
       ? [...turn.blocks].reverse().flatMap((block) => [...block.events].reverse()).find((event) => event.ts)?.ts
       : turn.completedAt,
   };
+}
+
+function applyTurnAuthorityStates(
+  turns: AgentTimelineResult['turns'],
+  events: AgentEvent[]
+): void {
+  const authorities = events.flatMap((event, index) => {
+    if (event.kind !== 'session_turn_authority' || !isRecordPayload(event.payload)) return [];
+    const runId = stringField(event.payload, 'runId');
+    const sourceMessageIds = stringArrayField(event.payload, 'sourceMessageIds');
+    if (!runId || sourceMessageIds.length === 0) return [];
+    return [{ index, runId, sourceMessageIds: new Set(sourceMessageIds) }];
+  });
+  if (authorities.length === 0) return;
+
+  for (let turnIndex = 0; turnIndex < turns.length; turnIndex += 1) {
+    const turn = turns[turnIndex];
+    if (turn.status !== 'completed') continue;
+    const sourceMessageIds = new Set(turn.blocks.flatMap((block) => block.events.flatMap((event) => {
+      if (event.kind !== 'user_msg') return [];
+      const payload = isRecordPayload(event.payload) ? event.payload : {};
+      return [event.id, stringField(payload, 'sourceEventId')].filter((value): value is string => Boolean(value));
+    })));
+    if (sourceMessageIds.size === 0) continue;
+    const authority = [...authorities].reverse().find((candidate) =>
+      [...sourceMessageIds].some((messageId) => candidate.sourceMessageIds.has(messageId))
+    );
+    if (!authority) continue;
+    const hasFinalAssistant = turn.blocks.some((block) => block.narrativeKind === 'assistantText');
+    const latestRunState = [...events.slice(authority.index)].reverse().find((event) => {
+      if (event.kind !== 'session_run_state' || !isRecordPayload(event.payload)) return false;
+      return stringField(event.payload, 'runId') === authority.runId;
+    });
+    const runStatus = latestRunState ? narrativeEventStatus(latestRunState) : undefined;
+    if (runStatus === 'failed') {
+      turns[turnIndex] = {
+        ...turn,
+        status: 'failed',
+        completedAt: latestRunState?.ts ?? turn.completedAt,
+      };
+      continue;
+    }
+    if (runStatus === 'completed' || runStatus === 'cancelled') continue;
+    if (runStatus === 'waiting' && latestRunState && !runStateInteractionResolved(latestRunState, events)) {
+      turns[turnIndex] = {
+        ...turn,
+        status: 'blocked',
+        completedAt: undefined,
+      };
+      continue;
+    }
+    if (!runStatus && hasFinalAssistant) continue;
+    turns[turnIndex] = {
+      ...turn,
+      status: 'running',
+      completedAt: undefined,
+    };
+  }
 }
 
 function stabilizeNarrativeBlockIds(turns: AgentTimelineResult['turns']): void {
@@ -2074,11 +2331,6 @@ function stringValueFromPayload(payload: unknown, key: string): string | undefin
   const value = (payload as Record<string, unknown>)[key];
   if (typeof value === 'boolean') return String(value);
   return typeof value === 'string' && value.trim() ? value : undefined;
-}
-
-function isDebugTimelineEvent(event: AgentEvent): boolean {
-  if (event.kind.startsWith('trace/')) return true;
-  return stringValueFromPayload(event.payload, 'visibility') === 'debug';
 }
 
 // reasoning channel 的 assistant_msg 若正文为空或仅含空代码围栏，则视为空块，不进入时间线。

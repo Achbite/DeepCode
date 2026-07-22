@@ -23,7 +23,7 @@ if git -C "$ROOT_DIR" diff --quiet --ignore-submodules -- 2>/dev/null \
 else
   SOURCE_DIRTY=1
 fi
-REQUESTED_PRODUCTS_RAW="${DEEPCODE_MACOS_PRODUCTS:-DeepCode}"
+REQUESTED_PRODUCTS_RAW="${DEEPCODE_MACOS_PRODUCTS:-DeepCode-GUI,DeepCode}"
 declare -a REQUESTED_PRODUCTS=()
 PRODUCT=""
 APP_NAME=""
@@ -40,25 +40,40 @@ COPY_ROOT_WEB_DIST="0"
 WRITE_TUI_LAUNCHER="0"
 BIN_DIR="$ROOT_DIR/bin/macos-arm64"
 
+add_requested_product() {
+  local product="$1"
+  local existing
+  case "$product" in
+    DeepCode|DeepCode-GUI) ;;
+    *)
+      printf '==[macos-package][error]== unsupported macOS product: %s\n' "$product" >&2
+      exit 2
+      ;;
+  esac
+  for existing in "${REQUESTED_PRODUCTS[@]:-}"; do
+    [ "$existing" != "$product" ] || return 0
+  done
+  REQUESTED_PRODUCTS+=("$product")
+}
+
 parse_requested_products() {
   local raw="${REQUESTED_PRODUCTS_RAW//,/ }"
-  local product existing
+  local product
   for product in $raw; do
-    case "$product" in
-      DeepCode|DeepCode-GUI) ;;
-      *)
-        printf '==[macos-package][error]== unsupported macOS product: %s\n' "$product" >&2
-        exit 2
-        ;;
-    esac
-    for existing in "${REQUESTED_PRODUCTS[@]:-}"; do
-      [ "$existing" != "$product" ] || continue 2
-    done
-    REQUESTED_PRODUCTS+=("$product")
+    add_requested_product "$product"
   done
   if [ "${#REQUESTED_PRODUCTS[@]}" -eq 0 ]; then
     printf '==[macos-package][error]== macOS product set must not be empty\n' >&2
     exit 2
+  fi
+}
+
+expand_requested_products_with_published_apps() {
+  local before_count="${#REQUESTED_PRODUCTS[@]}"
+  [ ! -d "$BIN_DIR/DeepCode-GUI.app" ] || add_requested_product "DeepCode-GUI"
+  [ ! -d "$BIN_DIR/DeepCode.app" ] || add_requested_product "DeepCode"
+  if [ "${#REQUESTED_PRODUCTS[@]}" -ne "$before_count" ]; then
+    printf '==[macos-package]== expand product set to refresh every app sharing %s\n' "$BIN_DIR"
   fi
 }
 
@@ -96,6 +111,7 @@ configure_product() {
 }
 
 parse_requested_products
+expand_requested_products_with_published_apps
 configure_product "${REQUESTED_PRODUCTS[0]}"
 CARGO_TARGET_ROOT="${DEEPCODE_MACOS_CARGO_TARGET_DIR:-$ROOT_DIR/target/macos-arm64}"
 RUST_TOOLCHAIN="${DEEPCODE_MACOS_RUST_TOOLCHAIN:-1.84.0}"
@@ -1293,7 +1309,8 @@ finalize_shared_distribution() {
 verify_packaged_kernel_markers() {
   local kernel_bin="$BIN_DIR/deepcode-kernel"
   local original_product="$PRODUCT"
-  local product app_kernel_bin root_hash app_hash build_info build_info_commit build_info_fingerprint strings_file
+  local product app_kernel_bin root_hash app_hash build_info build_info_commit build_info_fingerprint build_info_product strings_file
+  local checked_app=0
   [ -x "$kernel_bin" ] || fail "missing packaged Kernel binary: $kernel_bin"
   root_hash="$(shasum -a 256 "$kernel_bin" | awk '{print $1}')"
   [ -f "$BIN_DIR/build-info.json" ] || fail "missing root build-info.json"
@@ -1305,8 +1322,10 @@ verify_packaged_kernel_markers() {
     [ "$build_info_fingerprint" = "$SOURCE_FINGERPRINT" ] || fail "$build_info source fingerprint does not match the package transaction"
   done
 
-  for product in "${REQUESTED_PRODUCTS[@]}"; do
+  for product in DeepCode-GUI DeepCode; do
     configure_product "$product"
+    [ -d "$BIN_DIR/$APP_NAME.app" ] || continue
+    checked_app=1
     app_kernel_bin="$BIN_DIR/$APP_NAME.app/Contents/MacOS/deepcode-kernel"
     build_info="$BIN_DIR/$APP_NAME.app/Contents/MacOS/build-info.json"
     [ -x "$app_kernel_bin" ] || fail "missing bundled Kernel binary: $app_kernel_bin"
@@ -1315,9 +1334,12 @@ verify_packaged_kernel_markers() {
     [ -f "$build_info" ] || fail "missing bundled build-info.json: $build_info"
     build_info_commit="$(awk -F '"' '/"buildCommit"/ { print $4; exit }' "$build_info")"
     build_info_fingerprint="$(awk -F '"' '/"sourceFingerprint"/ { print $4; exit }' "$build_info")"
+    build_info_product="$(awk -F '"' '/"product"/ { print $4; exit }' "$build_info")"
     [ "$build_info_commit" = "$BUILD_COMMIT" ] || fail "$build_info buildCommit=$build_info_commit does not match current build commit $BUILD_COMMIT"
     [ "$build_info_fingerprint" = "$SOURCE_FINGERPRINT" ] || fail "$build_info source fingerprint does not match the package transaction"
+    [ "$build_info_product" = "$product" ] || fail "$build_info product=$build_info_product does not match app product $product"
   done
+  [ "$checked_app" = "1" ] || fail "no packaged macOS app was published in $BIN_DIR"
   configure_product "$original_product"
 
   strings_file="$(mktemp "${TMPDIR:-/tmp}/deepcode-kernel-strings.XXXXXX")"

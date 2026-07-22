@@ -246,6 +246,23 @@ impl HttpKernelClient {
         decode_api_data(value)
     }
 
+    pub async fn update_agent_session_profile(
+        &self,
+        session_id: &str,
+        profile_id: Option<&str>,
+    ) -> KernelClientResult<AgentSessionResult> {
+        let value = self
+            .http
+            .patch(self.url(&format!("/api/agent/sessions/{session_id}")))
+            .json(&json!({ "profileId": profile_id }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Value>()
+            .await?;
+        decode_api_data_with_code(value)
+    }
+
     pub async fn archive_agent_session(
         &self,
         session_id: &str,
@@ -324,7 +341,7 @@ impl HttpKernelClient {
             .error_for_status()?
             .json::<Value>()
             .await?;
-        decode_api_data(value)
+        decode_api_data_with_code(value)
     }
 
     pub async fn get_agent_run(
@@ -495,6 +512,21 @@ fn api_data(value: Value) -> KernelClientResult<Value> {
 
 fn decode_api_data<T: DeserializeOwned>(value: Value) -> KernelClientResult<T> {
     Ok(serde_json::from_value(api_data(value)?)?)
+}
+
+fn decode_api_data_with_code<T: DeserializeOwned>(value: Value) -> KernelClientResult<T> {
+    if value.get("ok").and_then(Value::as_bool) == Some(false) {
+        let code = value
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("daemon_error");
+        let message = value
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown daemon error");
+        return Err(KernelClientError::Api(format!("{code}: {message}")));
+    }
+    decode_api_data(value)
 }
 
 fn decode_audit_verify(reply: KernelReply) -> KernelClientResult<AuditVerifyResult> {

@@ -7,6 +7,30 @@ import ContextAttachmentPicker from './ContextAttachmentPicker';
 import UserAttachmentDialog, { type PickedUserAttachment } from './UserAttachmentDialog';
 import type { AgentComposerDecisionOption, AgentComposerPendingDecision } from './pendingDecision';
 
+const COMPOSER_TEXTAREA_MIN_HEIGHT = 34;
+const COMPOSER_TEXTAREA_MAX_HEIGHT = 150;
+
+function cssPixelValue(value: string, fallback: number): number {
+  const parsed = Number.parseFloat(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function resizeComposerTextarea(textarea: HTMLTextAreaElement): void {
+  const computedStyle = window.getComputedStyle(textarea);
+  const minHeight = cssPixelValue(computedStyle.minHeight, COMPOSER_TEXTAREA_MIN_HEIGHT);
+  const maxHeight = Math.max(
+    minHeight,
+    cssPixelValue(computedStyle.maxHeight, COMPOSER_TEXTAREA_MAX_HEIGHT)
+  );
+  textarea.style.height = `${minHeight}px`;
+  const contentHeight = textarea.scrollHeight;
+  textarea.style.height = `${Math.min(
+    Math.max(contentHeight, minHeight),
+    maxHeight
+  )}px`;
+  textarea.style.overflowY = contentHeight > maxHeight ? 'auto' : 'hidden';
+}
+
 interface AgentComposerProps {
   messageAttachments: AgentContextAttachment[];
   sessionAttachments: AgentContextAttachment[];
@@ -16,6 +40,9 @@ interface AgentComposerProps {
   onStop: () => void;
   onAddAttachment: (attachment: AgentContextAttachment) => void;
   onRemoveAttachment: (path: string, scope: AgentContextAttachment['scope']) => void;
+  footerControls?: React.ReactNode;
+  sendBlocked?: boolean;
+  sendBlockedTitle?: string;
   pendingDecision?: AgentComposerPendingDecision | null;
   onDecisionSubmit?: (guidance?: string, action?: 'accept' | 'revise') => void | Promise<void>;
   onDecisionReject?: () => void | Promise<void>;
@@ -35,6 +62,27 @@ function attachmentLabel(attachment: AgentContextAttachment, language: UiLanguag
     return `${t(language, 'agent.composer.dir')} ${attachment.path || '.'}`;
   }
   return `${t(language, 'agent.composer.file')} ${attachment.path || '.'}`;
+}
+
+function attachmentKindLabel(attachment: AgentContextAttachment, language: UiLanguage): string {
+  return t(language, attachment.kind === 'directory' ? 'agent.composer.dir' : 'agent.composer.file');
+}
+
+function AttachmentIcon({ kind }: Pick<AgentContextAttachment, 'kind'>): React.ReactElement {
+  if (kind === 'directory') {
+    return (
+      <svg viewBox="0 0 20 20" aria-hidden="true">
+        <path d="M2.75 5.5h5l1.5 1.75h8v7.25a1.75 1.75 0 0 1-1.75 1.75h-11a1.75 1.75 0 0 1-1.75-1.75v-9Z" />
+        <path d="M2.75 7.25h14.5" />
+      </svg>
+    );
+  }
+  return (
+    <svg viewBox="0 0 20 20" aria-hidden="true">
+      <path d="M5 2.75h6l4 4v10.5H5V2.75Z" />
+      <path d="M11 2.75v4h4M7.75 10h4.5M7.75 13h4.5" />
+    </svg>
+  );
 }
 
 function joinWorkspacePath(root: string, filePath: string): string | null {
@@ -352,11 +400,15 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
   onStop,
   onAddAttachment,
   onRemoveAttachment,
+  footerControls,
+  sendBlocked = false,
+  sendBlockedTitle,
   pendingDecision,
   onDecisionSubmit,
   onDecisionReject,
 }) => {
   const [value, setValue] = useState('');
+  const [inputFocused, setInputFocused] = useState(false);
   const [selectedChoiceId, setSelectedChoiceId] = useState<string | null>(null);
   const [attachmentDialogOpen, setAttachmentDialogOpen] = useState(false);
   const [changesOpen, setChangesOpen] = useState(true);
@@ -428,6 +480,7 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
       void onDecisionSubmit?.(normalized.guidance, normalized.action);
       return;
     }
+    if (sendBlocked) return;
     if (!nextValue.trim()) return;
     setValue('');
     void onSend(nextValue);
@@ -462,8 +515,7 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
   useEffect(() => {
     const textarea = textareaRef.current;
     if (!textarea) return;
-    textarea.style.height = '34px';
-    textarea.style.height = `${Math.min(Math.max(textarea.scrollHeight, 34), 150)}px`;
+    resizeComposerTextarea(textarea);
   }, [value]);
 
   useEffect(() => {
@@ -489,7 +541,7 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
     ? false
     : pendingDecision
       ? decisionResolving
-      : !value.trim();
+      : sendBlocked || !value.trim();
   const sendLabel = decisionResolving
     ? t(language, 'agent.composer.decision.resolving')
     : loading
@@ -590,6 +642,8 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
           ref={textareaRef}
           value={value}
           onChange={(event) => updateValue(event.target.value)}
+          onFocus={() => setInputFocused(true)}
+          onBlur={() => setInputFocused(false)}
           disabled={decisionResolving}
           onKeyDown={handleDecisionShortcut}
           placeholder={pendingDecision ? decisionPlaceholder(pendingDecision, language) : undefined}
@@ -606,7 +660,7 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
   );
 
   return (
-    <div className={`agent-composer${composerExpanded ? ' agent-composer--expanded' : ''}${pendingDecision ? ' agent-composer--decision' : ''}`}>
+    <div className={`agent-composer${inputFocused ? ' agent-composer--input-focused' : ''}${composerExpanded ? ' agent-composer--expanded' : ''}${chips.length > 0 ? ' agent-composer--has-attachments' : ''}${pendingDecision ? ' agent-composer--decision' : ''}`}>
       {decisionText && (
         <div className="agent-composer-decision" onKeyDown={handleDecisionShortcut}>
           <div className="agent-composer-decision__header">
@@ -723,13 +777,21 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
           {chips.map((attachment) => (
             <button
               key={`${attachment.scope}:${attachment.folderId ?? ''}:${attachment.path}`}
-              className={`agent-chip agent-chip--${attachment.scope}`}
-              title={attachment.path || t(language, 'agent.composer.workspaceRoot')}
+              className={`agent-chip agent-chip--${attachment.scope} agent-chip--${attachment.kind}`}
+              title={attachmentLabel(attachment, language)}
               onClick={() => onRemoveAttachment(attachment.path, attachment.scope)}
               type="button"
             >
-              {attachmentLabel(attachment, language)}
-              <span>x</span>
+              <span className="agent-chip__icon">
+                <AttachmentIcon kind={attachment.kind} />
+              </span>
+              <span className="agent-chip__body">
+                <span className="agent-chip__path">
+                  {attachment.path || t(language, 'agent.composer.workspaceRoot')}
+                </span>
+                <span className="agent-chip__kind">{attachmentKindLabel(attachment, language)}</span>
+              </span>
+              <span className="agent-chip__remove" aria-hidden="true">×</span>
             </button>
           ))}
         </div>
@@ -799,6 +861,8 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
             ref={textareaRef}
             value={value}
             onChange={(event) => updateValue(event.target.value)}
+            onFocus={() => setInputFocused(true)}
+            onBlur={() => setInputFocused(false)}
             onKeyDown={(event) => {
               if (event.key === 'Enter' && !event.shiftKey) {
                 if (isImeComposing(event)) return;
@@ -833,17 +897,20 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
             </button>
           </div>
         </div>
-        <button
-          className={loading ? 'agent-composer__send-button--stop' : undefined}
-          onClick={loading ? onStop : send}
-          disabled={sendDisabled}
-          type="button"
-          title={loading
-            ? t(language, 'agent.composer.stopTitle')
-            : t(language, 'agent.composer.sendTitle')}
-        >
-          {sendLabel}
-        </button>
+        <div className="agent-composer__footer-right">
+          {footerControls}
+          <button
+            className={loading ? 'agent-composer__send-button--stop' : undefined}
+            onClick={loading ? onStop : send}
+            disabled={sendDisabled}
+            type="button"
+            title={loading
+              ? t(language, 'agent.composer.stopTitle')
+              : sendBlockedTitle ?? t(language, 'agent.composer.sendTitle')}
+          >
+            {sendLabel}
+          </button>
+        </div>
       </div>}
       <UserAttachmentDialog
         visible={attachmentDialogOpen}

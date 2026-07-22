@@ -20,7 +20,6 @@ pub(crate) struct AgentSessionRunRequest {
     pub(crate) attachments: Option<Vec<Value>>,
     pub(crate) workspace_path: Option<String>,
     pub(crate) no_workspace: Option<bool>,
-    pub(crate) profile_id: Option<String>,
     pub(crate) workflow: Option<String>,
     pub(crate) requirement_confirmation_mode: Option<String>,
     pub(crate) review_continuation_mode: Option<String>,
@@ -79,11 +78,47 @@ pub(crate) async fn agent_session_run_start(
     }
     let start_event_count = events.len();
     let run_id = format!("session-run-{}", now_millis());
-    let run = AgentRunState::running(run_id.clone(), session_id.clone(), start_event_count);
-    {
+    let (run, session, profile_id) = {
+        let mut gui = state.gui.lock().expect("gui state lock");
+        let llm_profiles = gui.llm_profiles.clone();
+        let Some(stored_session) = session_mut(&mut gui, &session_id) else {
+            return ApiResponse::error("agent_session_not_found", "agent session not found");
+        };
+        let stored_profile_id = stored_session
+            .get("profileId")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let profile_id = stored_profile_id
+            .as_deref()
+            .filter(|profile_id| llm_profile_is_enabled(&llm_profiles, profile_id))
+            .map(str::to_string)
+            .or_else(|| preferred_enabled_llm_profile_id(&llm_profiles));
+        let Some(profile_id) = profile_id else {
+            return ApiResponse::error(
+                "llm_profile_unavailable",
+                "no enabled LLM Profile is available for this session",
+            );
+        };
+        if stored_profile_id.as_deref() != Some(profile_id.as_str()) {
+            stored_session["profileId"] = json!(profile_id.clone());
+            stored_session["updatedAt"] = json!(now_text());
+            if let Err(error) = persist_session_index(&gui) {
+                return ApiResponse::error("agent_session_persist_failed", error);
+            }
+        }
+        let session = session_by_id(&gui, &session_id)
+            .cloned()
+            .unwrap_or_else(|| session.clone());
+        let run = AgentRunState::running(
+            run_id.clone(),
+            session_id.clone(),
+            profile_id.clone(),
+            start_event_count,
+        );
         let mut runs = state.session_runs.lock().expect("session run state lock");
         runs.insert(run_id.clone(), run.clone());
-    }
+        (run, session, profile_id)
+    };
 
     let intervention_level = body
         .intervention_level
@@ -103,6 +138,7 @@ pub(crate) async fn agent_session_run_start(
         &session_id,
         &run_id,
         &body,
+        &profile_id,
         intervention_level,
         project_memory_mode,
         autonomy_mode,
@@ -139,34 +175,7 @@ pub(crate) async fn agent_session_run_cancel(
     State(state): State<AppState>,
     Path((session_id, run_id)): Path<(String, String)>,
 ) -> Json<ApiResponse> {
-    let changed = set_run_terminal(
-        &state,
-        &run_id,
-        "cancelled",
-        Some("Run cancelled by user.".to_string()),
-        None,
-    );
-    if changed {
-        append_session_projection(
-            &state,
-            &session_id,
-            vec![agent_event(
-                &session_id,
-                "workflow_stage",
-                json!({
-                    "stage": "session_run",
-                    "phase": "cancel",
-                    "status": "cancelled",
-                    "summary": "Run cancelled by user.",
-                    "channel": "task",
-                    "visibility": "task",
-                    "presentation": "stageSummary",
-                    "runId": run_id.clone()
-                }),
-                &now_text(),
-            )],
-        );
-    }
+    request_run_cancellation(&state, &run_id);
     run_response(&state, &session_id, &run_id)
 }
 
@@ -178,7 +187,16 @@ pub(crate) async fn agent_session_run_delta(
     if !run_belongs_to_session(&state, &session_id, &run_id) {
         return ApiResponse::error("agent_run_not_found", "agent run not found");
     }
-    {
+    record_daemon_projection_delivery(
+        &state,
+        &session_id,
+        &run_id,
+        "daemon.timeline_delta_received",
+        Some(&body),
+        "accepted",
+        false,
+    );
+    let normalized_delta = {
         let mut deltas = state
             .session_run_deltas
             .lock()
@@ -196,7 +214,17 @@ pub(crate) async fn agent_session_run_delta(
             let overflow = queue.len() - MAX_RUN_DELTAS;
             queue.drain(0..overflow);
         }
-    }
+        queue.last().cloned().unwrap_or(Value::Null)
+    };
+    record_daemon_projection_delivery(
+        &state,
+        &session_id,
+        &run_id,
+        "daemon.timeline_delta_enqueued",
+        Some(&normalized_delta),
+        "accepted",
+        false,
+    );
     touch_run(&state, &run_id, None);
     run_response(&state, &session_id, &run_id)
 }
@@ -326,6 +354,15 @@ pub(crate) async fn agent_session_run_stream(
                 if seq <= sent_delta_seq {
                     continue;
                 }
+                record_daemon_projection_delivery(
+                    &stream_state,
+                    &session_id,
+                    &run_id,
+                    "daemon.sse_delta_sent",
+                    Some(delta),
+                    "sent",
+                    false,
+                );
                 yield sse_bytes("delta", json!({
                     "sessionId": session_id.clone(),
                     "runId": run_id.clone(),
@@ -350,6 +387,16 @@ pub(crate) async fn agent_session_run_stream(
                 let (terminal_events, terminal_event_count) =
                     terminal_stream_event_tail(&events, sent_event_count);
                 sent_event_count = terminal_event_count;
+                record_daemon_projection_delivery(
+                    &stream_state,
+                    &session_id,
+                    &run_id,
+                    "daemon.sse_terminal_sent",
+                    None,
+                    "sent",
+                    true,
+                );
+                flush_daemon_projection_delivery_terminal(&stream_state, &run_id).await;
                 yield sse_bytes("terminal", json!({
                     "sessionId": session_id.clone(),
                     "runId": run_id.clone(),
@@ -393,13 +440,7 @@ pub(crate) async fn agent_session_cancel(
             .collect::<Vec<_>>()
     };
     for run_id in active_runs {
-        let _ = set_run_terminal(
-            &state,
-            &run_id,
-            "cancelled",
-            Some("Run cancelled by user.".to_string()),
-            None,
-        );
+        request_run_cancellation(&state, &run_id);
     }
     let gui = state.gui.lock().expect("gui state lock");
     session_result(&gui, &session_id)

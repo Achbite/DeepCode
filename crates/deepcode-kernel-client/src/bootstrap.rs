@@ -127,8 +127,12 @@ impl KernelBootstrapGuard {
 
 impl Drop for KernelBootstrapGuard {
     fn drop(&mut self) {
-        // The daemon outlives one-shot clients; dropping Child detaches without terminating it.
-        let _ = self.child.take();
+        // Only the shell that spawned the daemon owns its lifetime. Connections to an
+        // already-running daemon use the external guard and are never terminated here.
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 

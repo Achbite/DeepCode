@@ -78,6 +78,13 @@ export interface LlmProfilesResult {
   profiles: LlmProviderProfile[];
   defaultProfileId?: string;
   storePath?: string;
+  profileMigrations?: AgentSessionProfileMigration[];
+}
+
+export interface AgentSessionProfileMigration {
+  sessionId: string;
+  fromProfileId?: string;
+  toProfileId: string;
 }
 
 export interface PatchLlmProfilesRequest {
@@ -187,6 +194,7 @@ export type ProjectionDeltaType =
   | 'active_turn'
   | 'assistant_delta'
   | 'reasoning_delta'
+  | 'semantic_delta'
   | 'tool_call_delta'
   | 'part_delta'
   | 'draft_delta'
@@ -195,6 +203,45 @@ export type ProjectionDeltaType =
   | 'stage_delta'
   | 'committed'
   | 'error';
+
+export type SessionSemanticDraftToolName =
+  | 'session.submit_answer'
+  | 'session.submit_plan';
+
+export type SessionSemanticDraftState = 'streaming' | 'failed' | 'discarded';
+
+export interface SessionSemanticDraftPlanTask {
+  taskId: string;
+  title: string;
+  toolId: string;
+  target: string[];
+  dependencies: string[];
+  args: Record<string, unknown>;
+  acceptanceCriteria: string[];
+  failureCriteria: string[];
+}
+
+export interface SessionSemanticDraftPayload {
+  schemaVersion: 'deepcode.session.semantic-draft.v1';
+  kind: 'answer' | 'plan';
+  toolName: SessionSemanticDraftToolName;
+  callId: string;
+  proposalId: string;
+  planId?: string;
+  revision: number;
+  state: SessionSemanticDraftState;
+  failureCode?: string;
+  answer?: {
+    content: string;
+  };
+  plan?: {
+    title?: string;
+    summary?: string;
+    tasks: SessionSemanticDraftPlanTask[];
+    risks: string[];
+    reviewCheckpoints: string[];
+  };
+}
 
 export interface ProjectionDelta {
   type: ProjectionDeltaType;

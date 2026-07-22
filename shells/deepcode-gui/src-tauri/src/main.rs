@@ -55,7 +55,7 @@ impl Drop for KernelProcess {
 }
 
 fn main() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .register_uri_scheme_protocol(APP_ASSET_SCHEME, |_ctx, request| {
             serve_bundled_asset(APP_ASSET_DIR, request)
         })
@@ -85,8 +85,15 @@ fn main() {
             }
             _ => {}
         })
-        .run(tauri::generate_context!())
-        .expect("failed to run DeepCode-GUI Tauri shell");
+        .build(tauri::generate_context!())
+        .expect("failed to build DeepCode-GUI Tauri shell");
+
+    app.run(|app_handle, event| match event {
+        tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => {
+            app_handle.state::<KernelProcess>().terminate();
+        }
+        _ => {}
+    });
 }
 
 #[derive(Clone, Serialize)]

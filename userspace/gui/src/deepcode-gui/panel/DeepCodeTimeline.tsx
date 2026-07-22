@@ -20,6 +20,7 @@ import {
   bufferedTypewriterNextIndex,
   type BufferedTypewriterSpeed,
 } from '../../utils/typewriterBuffer';
+import { projectionDeliveryDiagnostics } from '../../services/projectionDeliveryDiagnostics';
 
 interface DeepCodeTimelineProps {
   timeline: AgentTimelineResult;
@@ -72,6 +73,10 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
   const lastScrollTopRef = useRef(0);
   const lastTouchYRef = useRef<number | null>(null);
   const [showJumpToLatest, setShowJumpToLatest] = useState(false);
+  const deliverySessionIdRef = useRef('');
+  const releasedDeliverySignaturesRef = useRef<Set<string>>(new Set());
+  const renderedDeliverySignaturesRef = useRef<Set<string>>(new Set());
+  const settledDeliverySignaturesRef = useRef<Set<string>>(new Set());
   const scrollSignature = useMemo(
     () => timelineScrollSignature(viewWithActive, loading),
     [viewWithActive, loading]
@@ -104,6 +109,19 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
     completedTypewriterBlockLengths,
     typewriterBlockLengths
   );
+  const actionBarTurnId = useMemo(() => {
+    if (loading || viewWithActive.interactionProjection?.pending) return undefined;
+    for (const turn of [...viewWithActive.turns].reverse()) {
+      if (turn.status !== 'completed' && turn.status !== 'failed') continue;
+      const visibleBlocks = turn.blocks.filter(isVisibleTimelineBlock);
+      if (!visibleBlocks.some(isActionableAgentOutputBlock)) continue;
+      if (visibleBlocks.some((block) => !playbackVisibleBlockIds.has(block.id) || animatingBlockIds.has(block.id))) {
+        continue;
+      }
+      return turn.id;
+    }
+    return undefined;
+  }, [animatingBlockIds, loading, playbackVisibleBlockIds, viewWithActive]);
   const timelineDensityClass = timelineDensity === 'compact' ? ' deepcode-gui-timeline--compact' : '';
   useEffect(() => {
     setCompletedTypewriterBlockLengths((current) => {
@@ -136,7 +154,38 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
       next.set(blockId, textLength);
       return next;
     });
-  }, []);
+    const block = flattenTimelineBlocks(viewWithActive).find((candidate) => candidate.id === blockId);
+    if (!block) return;
+    const signature = deliverySignature(block);
+    if (settledDeliverySignaturesRef.current.has(signature)) return;
+    settledDeliverySignaturesRef.current.add(signature);
+    projectionDeliveryDiagnostics.recordBlock('gui.playback_settled', viewWithActive.sessionId, block);
+  }, [viewWithActive]);
+
+  useLayoutEffect(() => {
+    if (deliverySessionIdRef.current !== viewWithActive.sessionId) {
+      deliverySessionIdRef.current = viewWithActive.sessionId;
+      releasedDeliverySignaturesRef.current.clear();
+      renderedDeliverySignaturesRef.current.clear();
+      settledDeliverySignaturesRef.current.clear();
+    }
+    for (const block of flattenTimelineBlocks(viewWithActive)) {
+      if (!isVisibleTimelineBlock(block) || !playbackVisibleBlockIds.has(block.id)) continue;
+      const signature = deliverySignature(block);
+      if (!releasedDeliverySignaturesRef.current.has(signature)) {
+        releasedDeliverySignaturesRef.current.add(signature);
+        projectionDeliveryDiagnostics.recordBlock('gui.playback_released', viewWithActive.sessionId, block);
+      }
+      if (!renderedDeliverySignaturesRef.current.has(signature)) {
+        renderedDeliverySignaturesRef.current.add(signature);
+        projectionDeliveryDiagnostics.recordBlock('gui.render_committed', viewWithActive.sessionId, block);
+      }
+      if (!animatingBlockIds.has(block.id) && !settledDeliverySignaturesRef.current.has(signature)) {
+        settledDeliverySignaturesRef.current.add(signature);
+        projectionDeliveryDiagnostics.recordBlock('gui.playback_settled', viewWithActive.sessionId, block);
+      }
+    }
+  }, [animatingBlockIds, playbackVisibleBlockIds, viewWithActive]);
 
   const setFollowMode = useCallback((mode: TimelineFollowMode) => {
     followModeRef.current = mode;
@@ -340,11 +389,13 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
             <div className="deepcode-gui-empty__title">{t(language, 'deepcodeGui.status.ready')}</div>
           </div>
         )}
-        {viewWithActive.turns.map((turn) => (
+        {viewWithActive.turns.map((turn, turnIndex) => (
           <TurnCard
             key={turn.id}
             turn={turn}
             language={language}
+            transportPending={loading && turnIndex === viewWithActive.turns.length - 1}
+            showActions={turn.id === actionBarTurnId}
             playbackVisibleBlockIds={playbackVisibleBlockIds}
             typewriterBlockIds={animatingBlockIds}
             collapseCompletedThinking={collapseCompletedThinking}
@@ -378,6 +429,10 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
 
 function flattenTimelineBlocks(view: AgentTimelineResult): AgentTimelineBlock[] {
   return view.turns.flatMap((turn) => turn.blocks);
+}
+
+function deliverySignature(block: AgentTimelineBlock): string {
+  return `${block.id}:${block.revision ?? 0}:${(block.bodyMarkdown ?? block.summary ?? '').length}`;
 }
 
 
@@ -415,16 +470,11 @@ function visibleActivityTargets(targets: string[]): string[] {
   const visible: string[] = [];
   for (const target of targets) {
     const normalized = target.trim();
-    if (!normalized || isInternalDisplayToken(normalized)) continue;
+    if (!normalized) continue;
     if (visible.includes(normalized)) continue;
     visible.push(normalized);
   }
   return visible;
-}
-
-function isInternalDisplayToken(value: string): boolean {
-  return /^(native-call|attachment|work-unit|resource-request|resource-item|kernel-activity)[_-]/i.test(value) ||
-    /^turn-[a-z_]+-/i.test(value);
 }
 
 function displayToolName(toolName: string): string {
@@ -620,16 +670,23 @@ function typewriterSpeedForBlock(block: AgentTimelineBlock): TypewriterSpeed {
 const TurnCard: React.FC<{
   turn: AgentTimelineTurn;
   language: UiLanguage;
+  transportPending: boolean;
+  showActions: boolean;
   playbackVisibleBlockIds: Set<string>;
   typewriterBlockIds: Set<string>;
   collapseCompletedThinking: boolean;
   onLiveContentChange: () => void;
   onTypewriterComplete: (blockId: string, textLength: number) => void;
   onPlanResolve?: DeepCodeTimelineProps['onPlanResolve'];
-}> = ({ turn, language, playbackVisibleBlockIds, typewriterBlockIds, collapseCompletedThinking, onLiveContentChange, onTypewriterComplete, onPlanResolve }) => {
+}> = ({ turn, language, transportPending, showActions, playbackVisibleBlockIds, typewriterBlockIds, collapseCompletedThinking, onLiveContentChange, onTypewriterComplete, onPlanResolve }) => {
   const startedAtLabel = formatTurnTime(turn.startedAt);
-  const blocks = turn.blocks.filter((block) => isVisibleTimelineBlock(block) && playbackVisibleBlockIds.has(block.id));
+  const visibleBlocks = turn.blocks.filter(isVisibleTimelineBlock);
+  const blocks = visibleBlocks.filter((block) => playbackVisibleBlockIds.has(block.id));
   if (blocks.length === 0) return null;
+  const actionsReady = showActions &&
+    !transportPending &&
+    blocks.length === visibleBlocks.length &&
+    visibleBlocks.every((block) => !typewriterBlockIds.has(block.id));
 
   return (
     <section className={`deepcode-gui-turn deepcode-gui-turn--${turn.status}`}>
@@ -646,29 +703,35 @@ const TurnCard: React.FC<{
             language={language}
             animateAssistant={typewriterBlockIds.has(block.id)}
             collapseCompletedThinking={collapseCompletedThinking}
+            interactionsEnabled={
+              !transportPending &&
+              turn.status !== 'running' &&
+              !typewriterBlockIds.has(block.id) &&
+              !actionsReady
+            }
             onLiveContentChange={onLiveContentChange}
             onTypewriterComplete={onTypewriterComplete}
             onPlanResolve={onPlanResolve}
           />
         ))}
-        <TurnActionBar turn={turn} blocks={blocks} language={language} />
+        {actionsReady && <TurnActionBar blocks={blocks} language={language} />}
       </div>
     </section>
   );
 };
 
 const TurnActionBar: React.FC<{
-  turn: AgentTimelineTurn;
   blocks: AgentTimelineBlock[];
   language: UiLanguage;
-}> = ({ turn, blocks, language }) => {
+}> = ({ blocks, language }) => {
   const [status, setStatus] = useState<'idle' | 'copied' | 'rated' | 'error'>('idle');
-  const feedbackEvent = feedbackTargetEvent(blocks);
+  const actionBlocks = blocks.filter(isActionableAgentOutputBlock);
+  const feedbackEvent = feedbackTargetEvent(actionBlocks);
 
-  if (!hasVisibleTurnContent(blocks)) return null;
+  if (actionBlocks.length === 0) return null;
 
   const copyTurn = async () => {
-    const text = turnCopyText(turn, blocks, language);
+    const text = turnCopyText(actionBlocks, language);
     try {
       await copyText(text);
       setStatus('copied');
@@ -808,10 +871,11 @@ const TimelineBlock: React.FC<{
   language: UiLanguage;
   animateAssistant?: boolean;
   collapseCompletedThinking?: boolean;
+  interactionsEnabled: boolean;
   onLiveContentChange: () => void;
   onTypewriterComplete: (blockId: string, textLength: number) => void;
   onPlanResolve?: DeepCodeTimelineProps['onPlanResolve'];
-}> = ({ block, language, animateAssistant = false, collapseCompletedThinking = true, onLiveContentChange, onTypewriterComplete, onPlanResolve }) => {
+}> = ({ block, language, animateAssistant = false, collapseCompletedThinking = true, interactionsEnabled, onLiveContentChange, onTypewriterComplete, onPlanResolve }) => {
   if (!isVisibleTimelineBlock(block)) return null;
   const narrativeClass = block.narrativeKind ? ` deepcode-gui-block--narrative-${block.narrativeKind}` : '';
   const densityClass = block.displayHints?.density ? ` deepcode-gui-block--density-${block.displayHints.density}` : '';
@@ -881,6 +945,7 @@ const TimelineBlock: React.FC<{
         block={block}
         language={language}
         animate={animateAssistant}
+        showActions={interactionsEnabled}
         onLiveContentChange={onLiveContentChange}
         onTypewriterComplete={onTypewriterComplete}
         onPlanResolve={onPlanResolve}
@@ -898,6 +963,7 @@ const TimelineBlock: React.FC<{
         block={block}
         language={language}
         animate={animateAssistant}
+        showActions={interactionsEnabled}
         onLiveContentChange={onLiveContentChange}
         onTypewriterComplete={onTypewriterComplete}
       />
@@ -993,9 +1059,10 @@ const ReviewBlock: React.FC<{
   block: AgentTimelineBlock;
   language: UiLanguage;
   animate: boolean;
+  showActions: boolean;
   onLiveContentChange: () => void;
   onTypewriterComplete: (blockId: string, textLength: number) => void;
-}> = ({ block, language, animate, onLiveContentChange, onTypewriterComplete }) => {
+}> = ({ block, language, animate, showActions, onLiveContentChange, onTypewriterComplete }) => {
   const [copyStatus, setCopyStatus] = useState<'idle' | 'copied' | 'error'>('idle');
   const narrativeClass = block.narrativeKind ? ` deepcode-gui-block--narrative-${block.narrativeKind}` : '';
   const densityClass = block.displayHints?.density ? ` deepcode-gui-block--density-${block.displayHints.density}` : '';
@@ -1017,7 +1084,7 @@ const ReviewBlock: React.FC<{
         <span className="deepcode-gui-block__title">
           {localizedTimelineText(language, block.title || t(language, 'deepcodeGui.tasks.review'))}
         </span>
-        <button
+        {showActions && <button
           type="button"
           className={`deepcode-gui-plan-copy deepcode-gui-plan-copy--${copyStatus}`}
           onMouseDown={(event) => {
@@ -1033,7 +1100,7 @@ const ReviewBlock: React.FC<{
           aria-label={t(language, 'deepcodeGui.review.copyStructured')}
         >
           <DeepCodeTurnActionIcon name="copy" />
-        </button>
+        </button>}
       </summary>
       <div className="deepcode-gui-block__details">
         {hasStructuredProjection(block.structuredProjection, 'review') ? (
@@ -1294,10 +1361,11 @@ const PlanBlock: React.FC<{
   block: AgentTimelineBlock;
   language: UiLanguage;
   animate: boolean;
+  showActions: boolean;
   onLiveContentChange: () => void;
   onTypewriterComplete: (blockId: string, textLength: number) => void;
   onPlanResolve?: DeepCodeTimelineProps['onPlanResolve'];
-}> = ({ block, language, animate, onLiveContentChange, onTypewriterComplete, onPlanResolve }) => {
+}> = ({ block, language, animate, showActions, onLiveContentChange, onTypewriterComplete, onPlanResolve }) => {
   const [copyStatus, setCopyStatus] = useState<'idle' | 'copied' | 'error'>('idle');
   const status = block.status;
   const narrativeClass = block.narrativeKind ? ` deepcode-gui-block--narrative-${block.narrativeKind}` : '';
@@ -1321,7 +1389,7 @@ const PlanBlock: React.FC<{
       <summary>
         <span className={`deepcode-gui-block__status deepcode-gui-block__status--${block.status}`} />
         <span className="deepcode-gui-block__title">{block.title}</span>
-        <button
+        {showActions && planBlockAuthorized(block) && <button
           type="button"
           className={`deepcode-gui-plan-copy deepcode-gui-plan-copy--${copyStatus}`}
           onMouseDown={(event) => {
@@ -1337,7 +1405,7 @@ const PlanBlock: React.FC<{
           aria-label={t(language, 'deepcodeGui.plan.copyStructured')}
         >
           <DeepCodeTurnActionIcon name="copy" />
-        </button>
+        </button>}
       </summary>
       <div className="deepcode-gui-block__details">
         {hasStructuredProjection(block.structuredProjection, 'plan') ? (
@@ -1607,6 +1675,14 @@ function planBlockMarkdown(block: AgentTimelineBlock, language: UiLanguage): str
   return structuredProjectionText(block.structuredProjection, language);
 }
 
+function planBlockAuthorized(block: AgentTimelineBlock): boolean {
+  return block.events.some((event) => (
+    event.kind === 'plan_card' &&
+    isRecordValue(event.payload) &&
+    event.payload.confirmable === true
+  ));
+}
+
 function reviewBlockMarkdown(block: AgentTimelineBlock, language: UiLanguage = 'zh-CN'): string {
   return structuredProjectionText(block.structuredProjection, language) || block.bodyMarkdown || block.summary;
 }
@@ -1615,11 +1691,10 @@ function thinkingMarkdown(block: AgentTimelineBlock): string {
   return (block.bodyMarkdown ?? '').trim();
 }
 
-function hasVisibleTurnContent(blocks: AgentTimelineBlock[]): boolean {
-  return blocks.some((block) => {
-    if (block.kind === 'turnActions') return false;
-    return Boolean((block.bodyMarkdown ?? block.summary ?? '').trim() || block.structuredProjection || block.activity);
-  });
+function isActionableAgentOutputBlock(block: AgentTimelineBlock): boolean {
+  if (block.kind === 'review' || block.narrativeKind === 'review') return true;
+  if (block.narrativeKind) return block.narrativeKind === 'assistantText';
+  return block.kind === 'assistant';
 }
 
 function feedbackTargetEvent(blocks: AgentTimelineBlock[]): AgentTimelineBlock['feedbackRef'] {
@@ -1627,14 +1702,11 @@ function feedbackTargetEvent(blocks: AgentTimelineBlock[]): AgentTimelineBlock['
 }
 
 function turnCopyText(
-  turn: AgentTimelineTurn,
   blocks: AgentTimelineBlock[],
   language: UiLanguage
 ): string {
-  const parts = [
-    `${t(language, 'deepcodeGui.sidebar.chats')} ${turn.id}`,
-    ...blocks.flatMap((block) => blockCopyText(block, language)),
-  ].filter((part) => part.trim().length > 0);
+  const parts = blocks.flatMap((block) => blockCopyText(block, language))
+    .filter((part) => part.trim().length > 0);
   return parts.join('\n\n');
 }
 

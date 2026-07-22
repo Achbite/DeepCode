@@ -185,8 +185,16 @@ export class AgentRunReactor<State extends AgentRunReactorState = AgentRunReacto
   }
 
   async appendProjectedKernelEvents(sessionId: string, reply: KernelReply): Promise<AgentSessionResult> {
+    const events = this.projectKernelEvents(sessionId, reply);
+    if (events.length === 0) {
+      return this.input.ports.appendEvents(sessionId, []);
+    }
+    return this.append(sessionId, events);
+  }
+
+  projectKernelEvents(sessionId: string, reply: KernelReply): AgentEvent[] {
     const workUnitFacts = this.input.kernelProjection.indexKernelWorkUnitFacts(reply.events ?? []);
-    const events = (reply.events ?? []).map((event) => {
+    return (reply.events ?? []).map((event) => {
       const record = objectRecord(event);
       const projected = record ? this.input.kernelProjection.enrichKernelWorkUnitRecord(record, workUnitFacts) : event;
       return this.input.kernelProjection.projectKernelEvent({
@@ -196,10 +204,6 @@ export class AgentRunReactor<State extends AgentRunReactorState = AgentRunReacto
         id: this.id('kernel'),
       });
     });
-    if (events.length === 0) {
-      return this.input.ports.appendEvents(sessionId, []);
-    }
-    return this.append(sessionId, events);
   }
 
   event(sessionId: string, kind: AgentEvent['kind'], payload: unknown): AgentEvent {

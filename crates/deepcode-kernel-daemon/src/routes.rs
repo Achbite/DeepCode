@@ -34,6 +34,12 @@ pub(crate) fn build_app(state: AppState) -> Router {
                 .layer(DefaultBodyLimit::max(LARGE_JSON_BODY_LIMIT_BYTES)),
         )
         .route(
+            "/api/session-store/:session_id/projection-delivery",
+            get(session_store_projection_delivery_get)
+                .post(session_store_projection_delivery_append)
+                .layer(DefaultBodyLimit::max(LARGE_JSON_BODY_LIMIT_BYTES)),
+        )
+        .route(
             "/api/session-store/:session_id/archive",
             get(session_store_archive_get),
         )

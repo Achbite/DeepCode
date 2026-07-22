@@ -45,6 +45,7 @@ export interface ReadablePlanTask {
 export interface ReadablePlanProjection {
   schemaVersion: 'deepcode.session.readable-plan.v1';
   titleKey: string;
+  title?: string;
   summary: string;
   sections: ReadableProjectionSection[];
   tasks: ReadablePlanTask[];

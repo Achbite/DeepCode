@@ -82,6 +82,7 @@ impl StartAgentRunRequest {
 pub struct AgentRunStatus {
     pub run_id: String,
     pub session_id: String,
+    pub profile_id: Option<String>,
     pub status: String,
     pub started_at: String,
     pub updated_at: String,

@@ -309,6 +309,8 @@ fn refresh_conversation_archive(
     ensure_debug_stream_files(archive_dir)?;
     let context_assemblies =
         read_jsonl_file(&archive_dir.join("debug").join("context-assemblies.jsonl"));
+    let projection_delivery =
+        read_jsonl_file(&archive_dir.join("debug").join("projection-delivery.jsonl"));
     let created_at = read_json_file(&archive_dir.join("manifest.json"))
         .and_then(|manifest| {
             manifest
@@ -333,12 +335,17 @@ fn refresh_conversation_archive(
             "generatedAt": now_text(),
             "projection": projection,
             "transcript": transcript,
-            "contextAssemblies": context_assemblies
+            "contextAssemblies": context_assemblies,
+            "projectionDelivery": projection_delivery
         }),
     )?;
     atomic_write_text_file(
         &archive_dir.join("exports").join("context-assemblies.md"),
         &conversation_context_assemblies_markdown(session_id, run_id, &context_assemblies),
+    )?;
+    atomic_write_text_file(
+        &archive_dir.join("exports").join("projection-delivery.md"),
+        &conversation_projection_delivery_markdown(session_id, run_id, &projection_delivery),
     )?;
     let manifest = json!({
         "schemaVersion": "conversation-archive.v1",

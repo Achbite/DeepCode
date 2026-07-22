@@ -60,6 +60,7 @@ async fn main() {
     };
 
     if let Err(error) = result {
+        drop(bootstrap);
         eprintln!("DeepCode-TUI failed: {error}");
         std::process::exit(1);
     }

@@ -1,5 +1,5 @@
 import React, { useEffect } from 'react';
-import { getLlmProfiles } from '../../services/runtimeAdapter';
+import { createWorkspaceScopeKey } from '@deepcode/session-core';
 import { useAgentSessionStore } from '../../state/agentSessionStore';
 import { useSettingsStore } from '../../state/settingsStore';
 import { useWorkspaceStore } from '../../state/workspaceStore';
@@ -17,9 +17,9 @@ const AgentPanel: React.FC = () => {
   const timeline = useAgentSessionStore((s) => s.timeline);
   const session = useAgentSessionStore((s) => s.session);
   const sessions = useAgentSessionStore((s) => s.sessions);
-  const profileId = useAgentSessionStore((s) => s.profileId);
   const loading = useAgentSessionStore((s) => s.loading);
   const runningSessionIds = useAgentSessionStore((s) => s.runningSessionIds);
+  const cancellingSessionIds = useAgentSessionStore((s) => s.cancellingSessionIds);
   const errorMessage = useAgentSessionStore((s) => s.errorMessage);
   const messageAttachments = useAgentSessionStore((s) => s.messageAttachments);
   const sessionAttachments = useAgentSessionStore((s) => s.sessionAttachments);
@@ -33,7 +33,6 @@ const AgentPanel: React.FC = () => {
   const activateSession = useAgentSessionStore((s) => s.activateSession);
   const renameSession = useAgentSessionStore((s) => s.renameSession);
   const archiveSession = useAgentSessionStore((s) => s.archiveSession);
-  const setProfileId = useAgentSessionStore((s) => s.setProfileId);
   const addAttachment = useAgentSessionStore((s) => s.addAttachment);
   const removeAttachment = useAgentSessionStore((s) => s.removeAttachment);
   const sendMessage = useAgentSessionStore((s) => s.sendMessage);
@@ -43,11 +42,14 @@ const AgentPanel: React.FC = () => {
   const resolveRequirement = useAgentSessionStore((s) => s.resolveRequirement);
   const resolvePlan = useAgentSessionStore((s) => s.resolvePlan);
   const resolveReview = useAgentSessionStore((s) => s.resolveReview);
-  const workspaceRevision = useWorkspaceStore((s) => s.treeRevision);
+  const workspaceScopeKey = useWorkspaceStore((s) => createWorkspaceScopeKey(s.current));
   const language = normalizeUiLanguage(
     useSettingsStore((s) => s.effectiveSettings['workbench.language'])
   );
-  const activeSessionRunning = Boolean(session?.id && runningSessionIds.includes(session.id));
+  const activeSessionRunning = Boolean(
+    session?.id
+    && (runningSessionIds.includes(session.id) || cancellingSessionIds.includes(session.id))
+  );
   const timelineProjection = timelineOrEmpty(timeline, session?.id);
   const pendingDecision = findPendingComposerDecisionFromProjection({
     timeline: timelineProjection,
@@ -64,23 +66,7 @@ const AgentPanel: React.FC = () => {
   useEffect(() => {
     void loadOrCreate();
     void refreshSessions();
-    const loadProfiles = () => getLlmProfiles().then((result) => {
-      if (result.ok && result.data) {
-        setProfileId(profileId ?? result.data.defaultProfileId);
-      }
-    });
-    void loadProfiles();
-    const onProfilesUpdated = () => {
-      void loadProfiles();
-    };
-    window.addEventListener('deepcode:llm-profiles-updated', onProfilesUpdated);
-    return () => window.removeEventListener('deepcode:llm-profiles-updated', onProfilesUpdated);
-  }, [loadOrCreate, profileId, refreshSessions, setProfileId]);
-
-  useEffect(() => {
-    void loadOrCreate();
-    void refreshSessions();
-  }, [loadOrCreate, refreshSessions, workspaceRevision]);
+  }, [loadOrCreate, refreshSessions, workspaceScopeKey]);
 
   return (
     <div className="agent-panel-shell">

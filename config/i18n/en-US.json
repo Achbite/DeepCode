@@ -169,15 +169,45 @@
     "settings.search.placeholder": "Search settings",
     "settings.nav.workspace": "Workspace",
     "settings.nav.common": "Common Settings",
-    "settings.nav.gui": "GUI Settings",
+    "settings.nav.gui": "Appearance",
+    "settings.nav.agent": "Agent Settings",
+    "settings.nav.permissions": "Permissions",
     "settings.nav.token": "Token Stats",
     "settings.nav.llm": "LLM Providers",
+    "settings.nav.github": "GitHub",
     "settings.nav.skill": "Skill Runtime",
     "settings.nav.mcp": "MCP Services",
     "settings.nav.sessionBoundary": "Session Boundary",
     "settings.nav.doctor": "Runtime Doctor",
     "settings.nav.ruler": "Ruler Rules",
+    "settings.navGroup.personal": "Personal and Behavior",
+    "settings.navGroup.models": "Models and Extensions",
+    "settings.navGroup.system": "System",
     "settings.common.title": "Common Settings",
+    "settings.gui.title": "Appearance",
+    "settings.gui.appearance": "Theme",
+    "settings.gui.preferences": "Interface Preferences",
+    "settings.gui.scopeHint": "These settings affect only DeepCode-GUI presentation, not shared timeline facts or Kernel permissions.",
+    "settings.agent.title": "Agent Settings",
+    "settings.agent.behavior": "Session Behavior",
+    "settings.agent.scopeHint": "These options influence new-task session policy; Kernel gates still decide every side effect.",
+    "settings.permissions.title": "Permissions",
+    "settings.permissions.boundary": "A setting is not execution authorization. Kernel still checks every side effect at the actual execution boundary.",
+    "settings.permissions.editable": "Session and Web Policies",
+    "settings.permissions.editableHint": "Autonomy and Web read policies are wired to the current runtime configuration.",
+    "settings.permissions.publicWeb": "Public Web Runtime",
+    "settings.permissions.publicWebHint": "Only the real public search endpoint and SecretRef are configured here; plaintext credentials are not stored.",
+    "settings.permissions.kernelOwned": "Kernel-managed Permissions",
+    "settings.permissions.kernelOwnedBadge": "Kernel Gate",
+    "settings.permissions.kernelOwnedHint": "This batch displays persisted values only; these controls are not mapped to editable Kernel execution authorization.",
+    "settings.integration.unavailable": "Not integrated in this batch",
+    "settings.integration.boundary": "This page makes no API calls, saves no settings, and shows no simulated online state.",
+    "settings.integration.github.title": "GitHub",
+    "settings.integration.github.body": "GitHub keeps a navigation placeholder until real authentication and repository contracts are integrated.",
+    "settings.integration.skill.title": "Skill",
+    "settings.integration.skill.body": "Skill management keeps a navigation placeholder and does not rewrite existing runtime facts.",
+    "settings.integration.mcp.title": "MCP",
+    "settings.integration.mcp.body": "MCP management keeps a navigation placeholder until real service state and permission contracts are integrated.",
     "settings.runtime.title": "Runtime Information",
     "settings.runtime.product": "Product",
     "settings.runtime.serverVersion": "Server version",
@@ -604,6 +634,16 @@
     "agent.composer.sendTitle": "Send message",
     "agent.composer.stop": "Stop",
     "agent.composer.send": "Send",
+    "agent.profile.selector": "Model used by this session",
+    "agent.profile.loading": "Loading model profiles",
+    "agent.profile.unavailable": "No enabled model Profile is available, so messages cannot be sent",
+    "agent.profile.loadFailed": "Model Profiles could not be loaded",
+    "agent.profile.locked": "The model cannot be changed while a run or interaction is pending",
+    "agent.profile.updateFailed": "Session model update failed",
+    "agent.profile.contextUnavailable": "No authoritative context usage fact is currently available",
+    "agent.profile.contextPlaceholder": "Context --%",
+    "agent.profile.reasoningDefault": "default reasoning",
+    "agent.profile.migrated": "The previous model Profile is unavailable. This session migrated to {profile}",
     "agent.attachment.folder": "Folder",
     "agent.attachment.file": "File",
     "agent.attachment.noMatches": "No matches",
@@ -1029,6 +1069,40 @@
         "vs-light": "Light"
       }
     },
+    "gui.colorTheme": {
+      "label": "Theme mode",
+      "description": "Choose system, light, or dark appearance. System mode follows macOS appearance changes.",
+      "options": {
+        "system": "System",
+        "light": "Light",
+        "dark": "Dark"
+      }
+    },
+    "gui.accentColor": {
+      "label": "Accent color",
+      "description": "The shared color used for primary actions, active states, focus, and streaming cursors.",
+      "options": {
+        "blue": "Blue",
+        "purple": "Purple",
+        "green": "Green"
+      }
+    },
+    "gui.timelineDensity": {
+      "label": "Timeline density",
+      "description": "Adjust vertical spacing between session events, tool activity, and Agent output.",
+      "options": {
+        "normal": "Standard",
+        "compact": "Compact"
+      }
+    },
+    "gui.typewriterAnimation": {
+      "label": "Typewriter animation",
+      "description": "Reveal Agent narration, reasoning, and final answers progressively."
+    },
+    "gui.collapseCompletedThinking": {
+      "label": "Collapse completed reasoning",
+      "description": "Automatically collapse completed reasoning blocks after a run settles."
+    },
     "workbench.styleTokenOverrides": {
       "label": "Style Token Overrides",
       "description": "Reserved JSON style-token override map for future custom themes."
@@ -1177,6 +1251,15 @@
     "agent.permissions.workspaceRead": {
       "label": "Workspace Read",
       "description": "Permission policy for workspace read tools."
+    },
+    "agent.permissions.autonomyMode": {
+      "label": "Autonomy Mode",
+      "description": "Session autonomy policy applied before Kernel permission gates.",
+      "options": {
+        "strict": "Strict",
+        "trustedWorkspace": "Trusted Workspace",
+        "maximum": "Maximum"
+      }
     },
     "agent.permissions.workspaceWrite": {
       "label": "Workspace Write",

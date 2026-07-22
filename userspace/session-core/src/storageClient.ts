@@ -1,6 +1,7 @@
 import type { TranscriptEntry, TranscriptStore } from './transcript.js';
 import type { SessionMemorySnapshot } from './context/memory.js';
 import type { PromptLedgerWireRecord } from './prompt/promptLedger.js';
+import type { ProjectionDeliveryRecord } from '@deepcode/protocol';
 
 export class SessionStorageClient {
   constructor(private readonly baseUrl = '') {}
@@ -72,6 +73,25 @@ export class SessionStorageClient {
     });
     if (!response.ok) throw new Error(`append cache telemetry failed: HTTP ${response.status}`);
     assertSessionStoreResponse(await response.json(), 'append cache telemetry failed');
+  }
+
+  async appendProjectionDelivery(
+    sessionId: string,
+    entries: ProjectionDeliveryRecord[],
+    signal?: AbortSignal
+  ): Promise<void> {
+    if (entries.length === 0) return;
+    const response = await fetch(
+      `${this.baseUrl}/api/session-store/${encodeURIComponent(sessionId)}/projection-delivery`,
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ entries }),
+        signal,
+      }
+    );
+    if (!response.ok) throw new Error(`append projection delivery failed: HTTP ${response.status}`);
+    assertSessionStoreResponse(await response.json(), 'append projection delivery failed');
   }
 }
 

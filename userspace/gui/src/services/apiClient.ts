@@ -67,6 +67,7 @@ import type {
   SetBrowserInspectModeRequest,
   KernelHostInspectionQuery,
   KernelHostInspectionResult,
+  ProjectionDeliveryRecord,
 } from '@deepcode/protocol';
 import { activeT } from '../i18n';
 import { getKernelApiBase } from './hostTarget';
@@ -101,6 +102,7 @@ export interface StartAgentRunRequest {
 export interface AgentRunStatus {
   runId: string;
   sessionId: string;
+  profileId?: string;
   status: 'running' | 'waiting' | 'completed' | 'failed' | 'cancelled' | string;
   startedAt: string;
   updatedAt: string;
@@ -325,6 +327,76 @@ async function sendJson<T>(
 }
 
 async function streamSse(
+  url: string,
+  onEvent: (event: AgentRunStreamEvent) => void,
+  signal?: AbortSignal
+): Promise<void> {
+  if (typeof EventSource !== 'undefined') {
+    return streamSseWithEventSource(url, onEvent, signal);
+  }
+  return streamSseWithFetch(url, onEvent, signal);
+}
+
+function streamSseWithEventSource(
+  url: string,
+  onEvent: (event: AgentRunStreamEvent) => void,
+  signal?: AbortSignal
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      resolve();
+      return;
+    }
+
+    const source = new EventSource(url);
+    let settled = false;
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      source.close();
+      signal?.removeEventListener('abort', onAbort);
+      if (error) reject(error);
+      else resolve();
+    };
+    const onAbort = () => finish();
+    const handleMessage = (eventName: AgentRunStreamEvent['event'], event: Event) => {
+      const message = event as MessageEvent<string>;
+      if (typeof message.data !== 'string' || !message.data.trim()) {
+        if (eventName === 'error') {
+          finish(new Error(`Agent run event stream disconnected (${endpointLabel(url)})`));
+        }
+        return;
+      }
+      try {
+        onEvent({ event: eventName, data: JSON.parse(message.data) as unknown });
+      } catch {
+        onEvent({
+          event: 'error',
+          data: {
+            code: 'invalid_sse_payload',
+            message: 'Agent run stream returned invalid JSON payload.',
+          },
+        });
+      }
+      if (eventName === 'terminal') finish();
+    };
+
+    const eventNames: AgentRunStreamEvent['event'][] = [
+      'run',
+      'delta',
+      'events',
+      'terminal',
+      'heartbeat',
+      'error',
+    ];
+    for (const eventName of eventNames) {
+      source.addEventListener(eventName, (event) => handleMessage(eventName, event));
+    }
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+async function streamSseWithFetch(
   url: string,
   onEvent: (event: AgentRunStreamEvent) => void,
   signal?: AbortSignal
@@ -804,6 +876,19 @@ export function streamAgentRun(
     `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/runs/${encodeURIComponent(runId)}/stream${qs}`,
     onEvent,
     signal
+  );
+}
+
+export function appendProjectionDelivery(
+  sessionId: string,
+  entries: ProjectionDeliveryRecord[],
+  signal?: AbortSignal
+): Promise<ApiResponse<{ sessionId: string; appended: number }>> {
+  return sendJson<{ sessionId: string; appended: number }>(
+    `${API_BASE}/session-store/${encodeURIComponent(sessionId)}/projection-delivery`,
+    'POST',
+    { entries },
+    { signal }
   );
 }
 

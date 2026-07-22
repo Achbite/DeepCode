@@ -319,23 +319,30 @@ export class ReviewProjectionBuilder<
     const changedFiles = new Map<string, ReadableReviewChangedFile>();
     const auditRefs: string[] = [];
     const generatedArtifacts = Array.isArray(reviewFacts?.generatedArtifacts) ? reviewFacts.generatedArtifacts : [];
-    for (const item of generatedArtifacts) {
+    for (const [index, item] of generatedArtifacts.entries()) {
       const record = objectRecord(item);
       if (!record) continue;
       const path = reviewDisplayPath(record);
       if (!path) continue;
       const operation = reviewOperation(record);
       const actionId = stringValue(record.actionId);
-      const key = `${path}:${operation}:${actionId ?? ''}`;
+      const sourceId = actionId
+        ?? stringValue(record.artifactId)
+        ?? stringValue(record.id)
+        ?? `generated-${index + 1}`;
+      const key = reviewChangedFileKey(path, operation, actionId, 'generated', sourceId);
+      const existing = changedFiles.get(key);
       changedFiles.set(key, {
         path,
         operation,
         status: 'completed',
-        actionId,
+        actionId: actionId ?? existing?.actionId,
+        workUnitId: existing?.workUnitId,
+        toolFactIds: existing?.toolFactIds,
         summary: `${path} operation=${operation}`,
         messageKey: 'review.changedFile',
         messageArgs: { path, operation, status: 'completed' },
-        auditRef: actionId,
+        auditRef: existing?.auditRef ?? actionId,
       });
       if (actionId) auditRefs.push(actionId);
     }
@@ -458,21 +465,31 @@ function addReviewWorkUnitFile(
   const failure = status === 'failed' || status === 'blocked'
     ? reviewFailureDetail(record, output)
     : {};
-  const key = `${path}:${operation}:${workUnitId ?? actionId ?? status}`;
+  const sourceId = workUnitId ?? stringValue(record.id) ?? status;
+  const key = reviewChangedFileKey(path, operation, actionId, 'work-unit', sourceId);
+  const existing = changedFiles.get(key);
+  const effectiveStatus = existing?.workUnitId && isReviewFailureStatus(existing.status) && status === 'completed'
+    ? existing.status
+    : status;
+  const failureReason = failure.reason ?? (isReviewFailureStatus(effectiveStatus) ? existing?.failureReason : undefined);
+  const failureClassification = failure.classification ?? (isReviewFailureStatus(effectiveStatus)
+    ? existing?.failureClassification
+    : undefined);
   changedFiles.set(key, {
     path,
     operation,
-    status,
-    actionId,
-    workUnitId,
-    failureClassification: failure.classification,
-    failureReason: failure.reason,
-    summary: failure.reason
-      ? `${path} operation=${operation} status=${status} reason=${failure.reason}`
-      : `${path} operation=${operation} status=${status}`,
+    status: effectiveStatus,
+    actionId: actionId ?? existing?.actionId,
+    workUnitId: workUnitId ?? existing?.workUnitId,
+    toolFactIds: existing?.toolFactIds,
+    failureClassification,
+    failureReason,
+    summary: failureReason
+      ? `${path} operation=${operation} status=${effectiveStatus} reason=${failureReason}`
+      : `${path} operation=${operation} status=${effectiveStatus}`,
     messageKey: 'review.changedFile',
-    messageArgs: { path, operation, status, reason: failure.reason ?? '' },
-    auditRef: workUnitId ?? actionId,
+    messageArgs: { path, operation, status: effectiveStatus, reason: failureReason ?? '' },
+    auditRef: workUnitId ?? existing?.auditRef ?? actionId,
   });
   if (workUnitId) auditRefs.push(workUnitId);
   if (actionId) auditRefs.push(actionId);
@@ -493,27 +510,50 @@ function addReviewToolFile(
   const toolFactId = stringValue(record.toolCallId);
   const operation = reviewOperation(output ?? record, toolName);
   const status = record.ok === false ? 'failed' : 'completed';
-  const key = `${path}:${operation}:${toolFactId ?? actionId ?? status}`;
+  const sourceId = toolFactId ?? stringValue(record.id) ?? status;
+  const key = reviewChangedFileKey(path, operation, actionId, 'tool', sourceId);
   const existing = changedFiles.get(key);
   const failure = status === 'failed' ? reviewFailureDetail(record, output) : {};
+  const workUnitAuthoritative = Boolean(existing?.workUnitId);
+  const effectiveStatus = workUnitAuthoritative ? existing!.status : status;
+  const failureClassification = workUnitAuthoritative
+    ? existing?.failureClassification
+    : failure.classification ?? existing?.failureClassification;
+  const failureReason = workUnitAuthoritative
+    ? existing?.failureReason
+    : failure.reason ?? existing?.failureReason;
   changedFiles.set(key, {
     path,
     operation,
-    status,
+    status: effectiveStatus,
     actionId: actionId ?? existing?.actionId,
     workUnitId: existing?.workUnitId,
     toolFactIds: [...new Set([...(existing?.toolFactIds ?? []), toolFactId].filter((item): item is string => Boolean(item)))],
-    failureClassification: failure.classification ?? existing?.failureClassification,
-    failureReason: failure.reason ?? existing?.failureReason,
-    summary: failure.reason
-      ? `${path} operation=${operation} status=${status} reason=${failure.reason}`
-      : `${path} operation=${operation} status=${status}`,
+    failureClassification,
+    failureReason,
+    summary: failureReason
+      ? `${path} operation=${operation} status=${effectiveStatus} reason=${failureReason}`
+      : `${path} operation=${operation} status=${effectiveStatus}`,
     messageKey: 'review.changedFile',
-    messageArgs: { path, operation, status, reason: failure.reason ?? existing?.failureReason ?? '' },
-    auditRef: toolFactId ?? actionId,
+    messageArgs: { path, operation, status: effectiveStatus, reason: failureReason ?? '' },
+    auditRef: existing?.auditRef ?? toolFactId ?? actionId,
   });
   if (toolFactId) auditRefs.push(toolFactId);
   if (actionId) auditRefs.push(actionId);
+}
+
+function reviewChangedFileKey(
+  path: string,
+  operation: string,
+  actionId: string | undefined,
+  sourceKind: 'generated' | 'work-unit' | 'tool',
+  sourceId: string
+): string {
+  return JSON.stringify([path, operation, actionId ? `action:${actionId}` : `${sourceKind}:${sourceId}`]);
+}
+
+function isReviewFailureStatus(status: ReadableReviewChangedFile['status']): boolean {
+  return status === 'failed' || status === 'blocked';
 }
 
 function reviewDisplayPath(record?: Record<string, unknown> | null): string | undefined {

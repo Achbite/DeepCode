@@ -61,6 +61,7 @@ fn project_memory_mode_is_forwarded_to_host_bridge() {
         "session-memory-forward",
         "run-memory-forward",
         &body,
+        "profile-memory-forward",
         Some("medium".to_string()),
         normalize_project_memory_mode(body.project_memory_mode.clone(), None),
         "strict".to_string(),

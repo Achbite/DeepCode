@@ -41,6 +41,11 @@ export interface NativeToolProviderCoordinatorDependencies<
   ): Promise<TTurn>;
   isEmptyResponseError(error: unknown): boolean;
   semanticDirectiveError(error: unknown): { code: string; message: string } | undefined;
+  onSemanticDraftFailure?(
+    state: TState,
+    callId: string | undefined,
+    failureCode: string
+  ): Promise<void>;
   onArtifactDraftBudgetExceeded(state: TState, error: SessionSemanticDirectiveError): Promise<void>;
   createError(code: string, message: string): Error;
 }
@@ -74,6 +79,7 @@ export class NativeToolProviderCoordinator<
         this.dependencies.runTurn(profileId, state, stage, messages, options),
       isEmptyResponseError: this.dependencies.isEmptyResponseError,
       semanticDirectiveError: this.dependencies.semanticDirectiveError,
+      onSemanticDraftFailure: this.dependencies.onSemanticDraftFailure,
       onArtifactDraftBudgetExceeded: this.dependencies.onArtifactDraftBudgetExceeded,
       createError: this.dependencies.createError,
     });

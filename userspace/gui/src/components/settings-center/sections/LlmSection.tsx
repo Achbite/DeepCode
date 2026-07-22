@@ -170,7 +170,11 @@ const LlmSection: React.FC = () => {
       setStorePath(result.data.storePath);
       setSecrets({});
       setMessage(t(language, 'settings.llm.saved'));
-      window.dispatchEvent(new CustomEvent('deepcode:llm-profiles-updated'));
+      window.dispatchEvent(new CustomEvent('deepcode:llm-profiles-updated', {
+        detail: {
+          profileMigrations: result.data.profileMigrations ?? [],
+        },
+      }));
     } else {
       setMessage(result.message ?? t(language, 'settings.llm.saveFailed'));
     }

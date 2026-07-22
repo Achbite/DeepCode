@@ -12,6 +12,7 @@ import type {
   LlmChatRequest,
   LlmChatResult,
   LlmChatStreamEvent,
+  ProjectionDelta,
   ToolCall,
 } from '@deepcode/protocol';
 import { buildSessionMemorySnapshot } from './context/memory.js';
@@ -21,6 +22,11 @@ import { CanonicalTimelineProjector } from './timelineDelta.js';
 import { SessionStorageClient } from './storageClient.js';
 import type { ProjectWorkingDirectory } from './context/types.js';
 import { planInteractionAwaitsDecision } from './run-state/planInteractionState.js';
+import {
+  ProjectionDeliveryRecorder,
+  projectionDeliveryContentMetadata,
+  projectionDeliveryMetadataForTimelineDelta,
+} from './projectionDelivery.js';
 
 declare const process: {
   argv: string[];
@@ -77,6 +83,13 @@ interface HostBridgeResult {
 }
 
 const MEMORY_ARCHIVE_PERSIST_TIMEOUT_MS = 2_000;
+const HOST_RUN_CANCELLATION_POLL_MS = 50;
+
+interface HostRunCancellationContext {
+  apiBase: string;
+  sessionId: string;
+  hostRunId: string;
+}
 
 async function main(): Promise<void> {
   const raw = await readStdin();
@@ -102,43 +115,55 @@ async function runAsk(request: HostBridgeRequest): Promise<HostBridgeResult> {
 
   const sessionId = sessionResult.session.id;
   const existingEvents = sessionResult.events ?? [];
+  const initialTimeline = await getAgentTimeline(apiBase, sessionId);
+  const deliveryRecorder = createProjectionDeliveryRecorder(
+    apiBase,
+    sessionId,
+    request.hostRunId
+  );
   const projection = createProjectionPublishingDriver(
     apiBase,
     request.hostRunId,
     sessionId,
-    existingEvents
-  );
-  const driver = projection.driver;
-  const result = await driver.runUserTurn({
-    sessionId,
-    content,
-    attachments: request.attachments ?? [],
     existingEvents,
-    workspaceBinding: binding,
-    projectWorkingDirectory,
-    projectId: request.projectId,
-    projectKind: request.projectKind,
-    projectRootStatus: request.projectRootStatus,
-    profileId: request.profileId,
-    workflow: request.workflow,
-    requirementConfirmationMode: request.requirementConfirmationMode,
-    reviewContinuationMode: request.reviewContinuationMode,
-    interventionLevel: request.interventionLevel,
-    autonomyMode: request.autonomyMode,
-  });
-  await persistMemoryArchive(apiBase, result.session.id, result.events ?? [], binding, result.session, request.projectMemoryMode);
-  const timeline = projection.buildTimeline(result.events ?? []);
-  const finalText = extractFinalText(timeline);
-  const lifecycle = inferHostRunLifecycle(result.events, finalText);
-  return {
-    ok: true,
-    sessionId: result.session.id,
-    session: result.session,
-    events: result.events,
-    timeline,
-    finalText,
-    ...lifecycle,
-  };
+    initialTimeline,
+    deliveryRecorder
+  );
+  try {
+    const driver = projection.driver;
+    const result = await driver.runUserTurn({
+      sessionId,
+      content,
+      attachments: request.attachments ?? [],
+      existingEvents,
+      workspaceBinding: binding,
+      projectWorkingDirectory,
+      projectId: request.projectId,
+      projectKind: request.projectKind,
+      projectRootStatus: request.projectRootStatus,
+      profileId: request.profileId,
+      workflow: request.workflow,
+      requirementConfirmationMode: request.requirementConfirmationMode,
+      reviewContinuationMode: request.reviewContinuationMode,
+      interventionLevel: request.interventionLevel,
+      autonomyMode: request.autonomyMode,
+    });
+    await persistMemoryArchive(apiBase, result.session.id, result.events ?? [], binding, result.session, request.projectMemoryMode);
+    const timeline = projection.buildTimeline(result.events ?? []);
+    const finalText = extractFinalText(timeline);
+    const lifecycle = inferHostRunLifecycle(result.events, finalText);
+    return {
+      ok: true,
+      sessionId: result.session.id,
+      session: result.session,
+      events: result.events,
+      timeline,
+      finalText,
+      ...lifecycle,
+    };
+  } finally {
+    await deliveryRecorder?.close();
+  }
 }
 
 async function resolveDecision(request: HostBridgeRequest): Promise<HostBridgeResult> {
@@ -148,48 +173,60 @@ async function resolveDecision(request: HostBridgeRequest): Promise<HostBridgeRe
 
   const apiBase = normalizeApiBase(request.apiBase);
   const current = await getAgentSession(apiBase, request.sessionId);
+  const initialTimeline = await getAgentTimeline(apiBase, request.sessionId);
   const binding = request.noWorkspace ? undefined : request.workspaceBinding ?? workspaceBindingFromPath(request.workspacePath);
   const projectWorkingDirectory = request.noWorkspace ? undefined : projectWorkingDirectoryFromBinding(binding, request.workspacePath);
+  const deliveryRecorder = createProjectionDeliveryRecorder(
+    apiBase,
+    request.sessionId,
+    request.hostRunId
+  );
   const projection = createProjectionPublishingDriver(
     apiBase,
     request.hostRunId,
     request.sessionId,
-    current.events
+    current.events,
+    initialTimeline,
+    deliveryRecorder
   );
-  const driver = projection.driver;
-  const result = await driver.resolveDecision({
-    sessionId: request.sessionId,
-    kind: request.decisionKind,
-    decision: request.decision,
-    guidance: request.guidance,
-    runId: request.runId,
-    targetId: request.targetId,
-    existingEvents: current.events,
-    workspaceBinding: binding,
-    projectWorkingDirectory,
-    projectId: request.projectId,
-    projectKind: request.projectKind,
-    projectRootStatus: request.projectRootStatus,
-    profileId: request.profileId,
-    workflow: request.workflow,
-    reviewContinuationMode: request.reviewContinuationMode,
-    interventionLevel: request.interventionLevel,
-    autonomyMode: request.autonomyMode,
-    projectMemoryMode: request.projectMemoryMode,
-  });
-  await persistMemoryArchive(apiBase, result.session.id, result.events ?? [], binding, result.session, request.projectMemoryMode);
-  const timeline = projection.buildTimeline(result.events ?? []);
-  const finalText = extractFinalText(timeline);
-  const lifecycle = inferHostRunLifecycle(result.events, finalText);
-  return {
-    ok: true,
-    sessionId: result.session.id,
-    session: result.session,
-    events: result.events,
-    timeline,
-    finalText,
-    ...lifecycle,
-  };
+  try {
+    const driver = projection.driver;
+    const result = await driver.resolveDecision({
+      sessionId: request.sessionId,
+      kind: request.decisionKind,
+      decision: request.decision,
+      guidance: request.guidance,
+      runId: request.runId,
+      targetId: request.targetId,
+      existingEvents: current.events,
+      workspaceBinding: binding,
+      projectWorkingDirectory,
+      projectId: request.projectId,
+      projectKind: request.projectKind,
+      projectRootStatus: request.projectRootStatus,
+      profileId: request.profileId,
+      workflow: request.workflow,
+      reviewContinuationMode: request.reviewContinuationMode,
+      interventionLevel: request.interventionLevel,
+      autonomyMode: request.autonomyMode,
+      projectMemoryMode: request.projectMemoryMode,
+    });
+    await persistMemoryArchive(apiBase, result.session.id, result.events ?? [], binding, result.session, request.projectMemoryMode);
+    const timeline = projection.buildTimeline(result.events ?? []);
+    const finalText = extractFinalText(timeline);
+    const lifecycle = inferHostRunLifecycle(result.events, finalText);
+    return {
+      ok: true,
+      sessionId: result.session.id,
+      session: result.session,
+      events: result.events,
+      timeline,
+      finalText,
+      ...lifecycle,
+    };
+  } finally {
+    await deliveryRecorder?.close();
+  }
 }
 
 async function persistMemoryArchive(
@@ -229,24 +266,44 @@ function createProjectionPublishingDriver(
   apiBase: string,
   hostRunId: string | undefined,
   sessionId: string,
-  initialEvents: AgentEvent[]
+  initialEvents: AgentEvent[],
+  initialTimeline?: AgentTimelineResult,
+  deliveryRecorder?: ProjectionDeliveryRecorder
 ): {
   driver: SessionDriverLoop;
   buildTimeline: (events?: AgentEvent[]) => AgentTimelineResult;
 } {
   const transcriptClient = new SessionStorageClient(apiBase);
   let committedEvents = [...initialEvents];
-  const projector = new CanonicalTimelineProjector(sessionId, initialEvents);
+  const projector = new CanonicalTimelineProjector(sessionId, initialEvents, initialTimeline);
   const buildTimeline = (): AgentTimelineResult => projector.snapshot();
   const driver = new SessionDriverLoop({
     kernelCommand: (request) => kernelCommand(apiBase, request),
-    llmChat: (request) => llmChat(apiBase, request),
-    llmChatStream: (request, onEvent) => llmChatStream(apiBase, request, onEvent),
+    llmChat: (request) => llmChat(
+      apiBase,
+      request,
+      hostRunId ? { apiBase, sessionId, hostRunId } : undefined
+    ),
+    llmChatStream: (request, onEvent) => llmChatStream(
+      apiBase,
+      request,
+      onEvent,
+      hostRunId ? { apiBase, sessionId, hostRunId } : undefined
+    ),
     onProjectionDelta: hostRunId
       ? async (delta) => {
+          deliveryRecorder?.record({
+            stage: 'session.provider_delta_received',
+            turnId: delta.turnId,
+            itemId: delta.itemId,
+            op: delta.type,
+            failureCode: projectionDeltaFailureCode(delta),
+            ...projectionDeliveryContentMetadata(projectionDeltaContent(delta)),
+            result: 'accepted',
+          });
           const timelineDeltas = projector.push(delta);
           for (const timelineDelta of timelineDeltas) {
-            await postProjectionDelta(apiBase, hostRunId, timelineDelta);
+            await publishTimelineDelta(apiBase, hostRunId, timelineDelta, deliveryRecorder);
           }
         }
       : undefined,
@@ -255,6 +312,17 @@ function createProjectionPublishingDriver(
     appendWireLedger: (sessionId, entries) => transcriptClient.appendWireLedger(sessionId, entries),
     appendCacheTelemetry: (sessionId, entry) => transcriptClient.appendCacheTelemetry(sessionId, entry),
     appendEvents: async (sessionId, events) => {
+      if (events.length === 0) {
+        const response = await postJson<ApiResponse<AgentSessionResult>>(
+          `${apiBase}/api/agent/sessions/${encodeURIComponent(sessionId)}/events`,
+          { events: [] } satisfies AppendAgentEventsRequest
+        );
+        if (!response.ok || !response.data) {
+          throw new Error(response.message ?? response.error ?? 'read current agent events failed');
+        }
+        committedEvents = response.data.events ?? committedEvents;
+        return response.data;
+      }
       const nextEvents = [...committedEvents, ...events];
       const projectionCommit = projector.commit(nextEvents);
       const appendRequest: AppendAgentEventsRequest = {
@@ -271,7 +339,7 @@ function createProjectionPublishingDriver(
       committedEvents = response.data.events ?? nextEvents;
       if (hostRunId) {
         for (const timelineDelta of projectionCommit.deltas) {
-          await postProjectionDelta(apiBase, hostRunId, timelineDelta);
+          await publishTimelineDelta(apiBase, hostRunId, timelineDelta, deliveryRecorder);
         }
       }
       return response.data;
@@ -321,19 +389,63 @@ async function getAgentSession(apiBase: string, sessionId: string): Promise<Agen
   return response.data;
 }
 
+async function getAgentTimeline(
+  apiBase: string,
+  sessionId: string
+): Promise<AgentTimelineResult | undefined> {
+  const response = await getJson<ApiResponse<AgentTimelineResult>>(
+    `${apiBase}/api/agent/sessions/${encodeURIComponent(sessionId)}/timeline`
+  );
+  if (!response.ok || !response.data) {
+    if (response.error === 'agent_timeline_unavailable') return undefined;
+    throw new Error(response.message ?? response.error ?? `read canonical timeline failed: ${sessionId}`);
+  }
+  if (
+    response.data.schemaVersion !== 'deepcode.session.timeline.v1' ||
+    response.data.sessionId !== sessionId
+  ) {
+    throw new Error(`canonical timeline identity mismatch: ${sessionId}`);
+  }
+  return response.data;
+}
+
 async function kernelCommand(apiBase: string, request: KernelCommandEnvelope): Promise<KernelReply> {
   return postJson<KernelReply>(`${apiBase}/api/kernel/commands`, request);
 }
 
-async function llmChat(apiBase: string, request: LlmChatRequest): Promise<ApiResponse<LlmChatResult>> {
-  return postJson<ApiResponse<LlmChatResult>>(`${apiBase}/api/llm/chat`, request);
+async function llmChat(
+  apiBase: string,
+  request: LlmChatRequest,
+  cancellation?: HostRunCancellationContext
+): Promise<ApiResponse<LlmChatResult>> {
+  const controller = new AbortController();
+  const monitor = cancellation
+    ? new HostRunCancellationMonitor(cancellation, controller)
+    : undefined;
+  try {
+    return await postJson<ApiResponse<LlmChatResult>>(
+      `${apiBase}/api/llm/chat`,
+      request,
+      controller.signal
+    );
+  } catch (error) {
+    if (monitor?.cancelled) return cancelledLlmResult();
+    throw error;
+  } finally {
+    await monitor?.stop();
+  }
 }
 
 async function llmChatStream(
   apiBase: string,
   request: LlmChatRequest,
-  onEvent: (event: LlmChatStreamEvent) => void | Promise<void>
+  onEvent: (event: LlmChatStreamEvent) => void | Promise<void>,
+  cancellation?: HostRunCancellationContext
 ): Promise<ApiResponse<LlmChatResult>> {
+  const controller = new AbortController();
+  const monitor = cancellation
+    ? new HostRunCancellationMonitor(cancellation, controller)
+    : undefined;
   try {
     const response = await fetch(`${apiBase}/api/llm/chat/stream`, {
       method: 'POST',
@@ -342,6 +454,7 @@ async function llmChatStream(
         accept: 'text/event-stream',
       },
       body: JSON.stringify({ ...request, stream: true }),
+      signal: controller.signal,
     });
     if (!response.ok) {
       return {
@@ -409,19 +522,153 @@ async function llmChatStream(
       data: buildStreamResult(chunks, usage, { providerProfileId, provider, model }),
     };
   } catch (error) {
+    if (monitor?.cancelled) return cancelledLlmResult();
     return {
       ok: false,
       error: error instanceof Error ? error.name : 'Error',
       message: error instanceof Error ? error.message : String(error),
     };
+  } finally {
+    await monitor?.stop();
   }
 }
 
+class HostRunCancellationMonitor {
+  private stopped = false;
+  private cancellationObserved = false;
+  private readonly completion: Promise<void>;
+
+  constructor(
+    private readonly context: HostRunCancellationContext,
+    private readonly controller: AbortController
+  ) {
+    this.completion = this.poll();
+  }
+
+  get cancelled(): boolean {
+    return this.cancellationObserved;
+  }
+
+  async stop(): Promise<void> {
+    this.stopped = true;
+    await this.completion;
+  }
+
+  private async poll(): Promise<void> {
+    while (!this.stopped && !this.controller.signal.aborted) {
+      if (await hostRunCancellationRequested(this.context)) {
+        this.cancellationObserved = true;
+        this.controller.abort();
+        return;
+      }
+      await delay(HOST_RUN_CANCELLATION_POLL_MS);
+    }
+  }
+}
+
+async function hostRunCancellationRequested(
+  context: HostRunCancellationContext
+): Promise<boolean> {
+  try {
+    const response = await getJson<ApiResponse<{ run?: { status?: string } }>>(
+      `${context.apiBase}/api/agent/sessions/${encodeURIComponent(context.sessionId)}/runs/${encodeURIComponent(context.hostRunId)}`
+    );
+    const status = response.data?.run?.status;
+    return status === 'cancelling' || status === 'cancelled';
+  } catch {
+    return false;
+  }
+}
+
+function cancelledLlmResult(): ApiResponse<LlmChatResult> {
+  return {
+    ok: false,
+    error: 'session_run_cancelled',
+    message: 'Session run cancelled by user.',
+  };
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function postProjectionDelta(apiBase: string, hostRunId: string, delta: AgentTimelineDelta): Promise<void> {
-  await postJson<ApiResponse<unknown>>(
+  const response = await postJson<ApiResponse<unknown>>(
     `${apiBase}/api/agent/sessions/${encodeURIComponent(delta.sessionId)}/runs/${encodeURIComponent(hostRunId)}/deltas`,
     delta
   );
+  if (!response.ok) {
+    throw new Error(response.message ?? response.error ?? 'post projection delta failed');
+  }
+}
+
+function createProjectionDeliveryRecorder(
+  apiBase: string,
+  sessionId: string,
+  hostRunId: string | undefined
+): ProjectionDeliveryRecorder | undefined {
+  if (!hostRunId) return undefined;
+  const client = new SessionStorageClient(apiBase);
+  return new ProjectionDeliveryRecorder(
+    (entries, signal) => client.appendProjectionDelivery(sessionId, entries, signal),
+    { sessionId, runId: hostRunId },
+    {
+      onError: (error) => {
+        process.stderr.write(`projection delivery archive skipped: ${error instanceof Error ? error.message : String(error)}\n`);
+      },
+    }
+  );
+}
+
+async function publishTimelineDelta(
+  apiBase: string,
+  hostRunId: string,
+  delta: AgentTimelineDelta,
+  recorder?: ProjectionDeliveryRecorder
+): Promise<void> {
+  recorder?.record(projectionDeliveryMetadataForTimelineDelta(
+    'session.timeline_delta_projected',
+    delta,
+    'accepted'
+  ));
+  try {
+    await postProjectionDelta(apiBase, hostRunId, delta);
+    recorder?.record(projectionDeliveryMetadataForTimelineDelta(
+      'session.timeline_delta_posted',
+      delta,
+      'sent'
+    ));
+  } catch (error) {
+    recorder?.record(projectionDeliveryMetadataForTimelineDelta(
+      'session.timeline_delta_post_failed',
+      delta,
+      'failed'
+    ));
+    throw error;
+  }
+}
+
+function projectionDeltaContent(delta: ProjectionDelta): string {
+  const payload = objectRecord(delta.payload);
+  if (delta.type === 'semantic_delta' && payload?.schemaVersion === 'deepcode.session.semantic-draft.v1') {
+    const answer = objectRecord(payload.answer);
+    if (typeof answer?.content === 'string') return answer.content;
+    const plan = objectRecord(payload.plan);
+    if (plan) return JSON.stringify(plan);
+  }
+  if (typeof delta.delta === 'string') return delta.delta;
+  if (typeof delta.summary === 'string') return delta.summary;
+  return '';
+}
+
+function projectionDeltaFailureCode(delta: ProjectionDelta): string | undefined {
+  const payload = objectRecord(delta.payload);
+  if (delta.type !== 'semantic_delta' || payload?.schemaVersion !== 'deepcode.session.semantic-draft.v1') {
+    return undefined;
+  }
+  return typeof payload.failureCode === 'string' && payload.failureCode.trim()
+    ? payload.failureCode
+    : undefined;
 }
 
 async function getJson<T>(url: string): Promise<T> {
@@ -430,11 +677,12 @@ async function getJson<T>(url: string): Promise<T> {
   return await response.json() as T;
 }
 
-async function postJson<T>(url: string, body: unknown): Promise<T> {
+async function postJson<T>(url: string, body: unknown, signal?: AbortSignal): Promise<T> {
   const response = await fetch(url, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body),
+    signal,
   });
   if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
   return await response.json() as T;

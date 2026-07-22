@@ -222,7 +222,7 @@ fn timeline_kind_title(kind: &str) -> &'static str {
 fn status_label(status: &str) -> &'static str {
     match status {
         "running" => "运行中",
-        "blocked" => "等待确认",
+        "blocked" | "waiting" => "等待确认",
         "failed" => "失败",
         "completed" | "done" => "完成",
         "pending" => "等待中",

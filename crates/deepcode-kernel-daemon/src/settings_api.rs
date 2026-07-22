@@ -73,6 +73,29 @@ pub(crate) async fn llm_profiles_patch(
 ) -> Json<ApiResponse> {
     let mut gui = state.gui.lock().expect("gui state lock");
     let mut profiles = body.get("profiles").cloned().unwrap_or_else(|| json!([]));
+    let Some(profile_items) = profiles.as_array() else {
+        return ApiResponse::error("invalid_llm_profiles", "profiles must be an array");
+    };
+    let mut profile_ids = std::collections::HashSet::new();
+    for profile in profile_items {
+        let Some(profile_id) = profile
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|profile_id| !profile_id.is_empty())
+        else {
+            return ApiResponse::error(
+                "invalid_llm_profile",
+                "every LLM Profile must have a non-empty id",
+            );
+        };
+        if !profile_ids.insert(profile_id.to_string()) {
+            return ApiResponse::error(
+                "duplicate_llm_profile",
+                format!("LLM Profile id `{profile_id}` is duplicated"),
+            );
+        }
+    }
     let secrets = body.get("secrets").cloned().unwrap_or_else(|| json!({}));
     let mut secret_store = read_json_file(&gui.paths.llm_secrets_path).unwrap_or_else(|| json!({}));
     if let (Some(profile_items), Some(secret_items), Some(secret_object)) = (
@@ -104,12 +127,95 @@ pub(crate) async fn llm_profiles_patch(
             );
         }
     }
-    let old_hash = config_value_hash(&gui.llm_profiles);
-    gui.llm_profiles = json!({
+    let requested_default_profile_id = body
+        .get("defaultProfileId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|profile_id| !profile_id.is_empty());
+    let mut next_profiles = json!({
         "profiles": profiles,
-        "defaultProfileId": body.get("defaultProfileId").cloned().unwrap_or(Value::Null),
+        "defaultProfileId": requested_default_profile_id,
         "storePath": gui.paths.llm_profiles_path.to_string_lossy()
     });
+    next_profiles["defaultProfileId"] = preferred_enabled_llm_profile_id(&next_profiles)
+        .map(Value::String)
+        .unwrap_or(Value::Null);
+
+    let mut active_profile_ids = {
+        let runs = state.session_runs.lock().expect("session run state lock");
+        runs.values()
+            .filter(|run| {
+                matches!(run.status.as_str(), "running" | "cancelling")
+                    || (run.status == "waiting"
+                        && session_has_pending_interaction(&gui, &run.session_id))
+            })
+            .filter_map(|run| run.profile_id.clone())
+            .collect::<std::collections::HashSet<_>>()
+    };
+    for session in &gui.sessions {
+        let Some(session_id) = session.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        if !session_has_pending_interaction(&gui, session_id) {
+            continue;
+        }
+        if let Some(profile_id) = session.get("profileId").and_then(Value::as_str) {
+            active_profile_ids.insert(profile_id.to_string());
+        }
+    }
+    for profile_id in &active_profile_ids {
+        let current = profile_value_by_id(&gui.llm_profiles, profile_id);
+        let next = profile_value_by_id(&next_profiles, profile_id);
+        let secret_changed = secrets
+            .get(profile_id)
+            .and_then(Value::as_str)
+            .is_some_and(|secret| !secret.trim().is_empty());
+        if current != next || secret_changed {
+            return ApiResponse::error(
+                "llm_profile_locked",
+                format!(
+                    "LLM Profile `{profile_id}` is locked by an active session run or pending interaction"
+                ),
+            );
+        }
+    }
+
+    let old_hash = config_value_hash(&gui.llm_profiles);
+    gui.llm_profiles = next_profiles;
+    let preferred_profile_id = preferred_enabled_llm_profile_id(&gui.llm_profiles);
+    let mut profile_migrations = Vec::new();
+    if let Some(preferred_profile_id) = preferred_profile_id.as_deref() {
+        let llm_profiles = gui.llm_profiles.clone();
+        for session in &mut gui.sessions {
+            let current_profile_id = session
+                .get("profileId")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            if current_profile_id
+                .as_deref()
+                .is_some_and(|profile_id| llm_profile_is_enabled(&llm_profiles, profile_id))
+            {
+                continue;
+            }
+            let Some(session_id) = session
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            session["profileId"] = json!(preferred_profile_id);
+            session["updatedAt"] = json!(now_text());
+            let mut migration = json!({
+                "sessionId": session_id,
+                "toProfileId": preferred_profile_id
+            });
+            if let Some(current_profile_id) = current_profile_id {
+                migration["fromProfileId"] = json!(current_profile_id);
+            }
+            profile_migrations.push(migration);
+        }
+    }
     if secret_store
         .as_object()
         .map(|object| !object.is_empty())
@@ -121,6 +227,11 @@ pub(crate) async fn llm_profiles_patch(
     }
     match atomic_write_json(&gui.paths.llm_profiles_path, &gui.llm_profiles) {
         Ok(()) => {
+            if !profile_migrations.is_empty() {
+                if let Err(error) = persist_session_index(&gui) {
+                    return ApiResponse::error("agent_session_persist_failed", error);
+                }
+            }
             let new_hash = config_value_hash(&gui.llm_profiles);
             let mut changed_keys = vec!["profiles".to_string(), "defaultProfileId".to_string()];
             if secrets
@@ -151,11 +262,26 @@ pub(crate) async fn llm_profiles_patch(
             let mut output = output;
             if let Some(object) = output.as_object_mut() {
                 object.insert("configAudit".to_string(), config_audit);
+                object.insert(
+                    "profileMigrations".to_string(),
+                    Value::Array(profile_migrations),
+                );
             }
             ApiResponse::ok(output)
         }
         Err(error) => ApiResponse::error("write_llm_profiles_failed", error),
     }
+}
+
+fn profile_value_by_id<'a>(config: &'a Value, profile_id: &str) -> Option<&'a Value> {
+    config
+        .get("profiles")
+        .and_then(Value::as_array)
+        .and_then(|profiles| {
+            profiles
+                .iter()
+                .find(|profile| profile.get("id").and_then(Value::as_str) == Some(profile_id))
+        })
 }
 
 fn record_config_modified_audit(
@@ -435,7 +561,12 @@ pub(crate) fn default_user_settings() -> Value {
             "agent.integrations.github.repoUrl": "",
             "agent.integrations.github.authSecretRef": "",
             "agent.integrations.github.defaultRemote": "origin",
-            "agent.integrations.github.pushPolicy": "manual"
+            "agent.integrations.github.pushPolicy": "manual",
+            "gui.colorTheme": "light",
+            "gui.accentColor": "blue",
+            "gui.timelineDensity": "normal",
+            "gui.typewriterAnimation": true,
+            "gui.collapseCompletedThinking": true
         }),
     );
     settings["agent.interventionLevel"] = json!("medium");

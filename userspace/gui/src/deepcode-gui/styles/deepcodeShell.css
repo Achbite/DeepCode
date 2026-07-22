@@ -1,0 +1,698 @@
+.deepcode-gui-workbench {
+  --canvas: var(--dc-background);
+  --panel: var(--dc-surface);
+  --panel-soft: var(--dc-surface-subtle);
+  --panel-raised: var(--dc-surface-raised);
+  --line: var(--dc-border);
+  --line-soft: var(--dc-border);
+  --line-strong: var(--dc-border-strong);
+  --text: var(--dc-foreground);
+  --muted: var(--dc-muted);
+  --faint: var(--dc-faint);
+  --accent: var(--dc-accent);
+  --accent-soft: var(--dc-accent-soft);
+  --accent-contrast: var(--dc-accent-contrast);
+  --ok: var(--dc-success);
+  --warn: var(--dc-warning);
+  --danger: var(--dc-danger);
+  grid-template-rows: 36px minmax(0, 1fr);
+  background: var(--dc-background);
+  color: var(--dc-foreground);
+  font-family: var(--dc-font-ui);
+  font-size: var(--dc-font-body);
+  line-height: var(--dc-line-body);
+}
+
+:root[data-product='deepcode-gui'] .settings-nav-item--active,
+:root[data-product='deepcode-gui'] .agent-composer-decision__confirm {
+  color: var(--dc-accent-contrast);
+}
+
+:root[data-product='deepcode-gui'] .agent-attachment-picker button:hover {
+  color: var(--dc-foreground);
+}
+
+.deepcode-gui-titlebar {
+  grid-template-columns: minmax(200px, 1fr) auto auto;
+  min-height: 36px;
+  height: 36px;
+  padding: 0 12px;
+  border-bottom: 1px solid var(--dc-border);
+  background: color-mix(in srgb, var(--dc-surface) 91%, transparent);
+  box-shadow: none;
+  backdrop-filter: blur(18px);
+  -webkit-backdrop-filter: blur(18px);
+}
+
+.deepcode-gui-titlebar__brand {
+  gap: 8px;
+  color: var(--dc-foreground-strong);
+  font-size: var(--dc-font-body);
+  font-weight: var(--dc-weight-semibold);
+}
+
+.deepcode-gui-titlebar__mark {
+  width: 21px;
+  height: 21px;
+  border: 1px solid var(--dc-border-strong);
+  border-radius: 6px;
+  background: var(--dc-surface-raised);
+  color: var(--dc-foreground-strong);
+  box-shadow: none;
+  font-size: var(--dc-font-caption);
+  font-weight: var(--dc-weight-bold);
+}
+
+.deepcode-gui-titlebar__status {
+  gap: 7px;
+  color: var(--dc-muted);
+  font-size: var(--dc-font-caption);
+}
+
+.deepcode-gui-status-pill {
+  min-height: 22px;
+  border-color: var(--dc-border);
+  background: var(--dc-surface-subtle);
+  color: var(--dc-muted);
+}
+
+.deepcode-gui-status-pill--connected,
+.deepcode-gui-status-pill--ready {
+  border-color: color-mix(in srgb, var(--dc-success) 28%, transparent);
+  background: color-mix(in srgb, var(--dc-success) 8%, transparent);
+  color: var(--dc-success);
+}
+
+.deepcode-gui-status-pill--cache {
+  border-color: var(--dc-accent-border);
+  background: var(--dc-accent-soft);
+  color: var(--dc-accent);
+}
+
+.deepcode-gui-shell,
+.deepcode-gui-shell--home {
+  grid-template-columns: 244px minmax(560px, 1fr) 296px;
+  grid-template-rows: minmax(0, 1fr);
+  gap: 0;
+  background: var(--dc-surface);
+}
+
+.deepcode-gui-shell--home {
+  grid-template-columns: 244px minmax(0, 1fr);
+}
+
+.deepcode-gui-left-rail {
+  width: 244px;
+  max-width: 244px;
+  gap: 12px;
+  padding: 12px 10px 10px;
+  border-right: 1px solid var(--dc-border);
+  background: var(--dc-sidebar);
+  color: var(--dc-foreground);
+  scrollbar-width: none;
+}
+
+.deepcode-gui-left-rail::-webkit-scrollbar,
+.deepcode-gui-session-list::-webkit-scrollbar,
+.deepcode-gui-context-panel::-webkit-scrollbar {
+  display: none;
+}
+
+.deepcode-gui-sidebar-actions,
+.deepcode-gui-session-list {
+  gap: 2px;
+}
+
+.deepcode-gui-sidebar-action,
+.deepcode-gui-project-archive-group__sessions button,
+.deepcode-gui-session-list button {
+  min-height: 32px;
+  gap: 8px;
+  padding: 0 9px;
+  border: 0;
+  border-radius: var(--dc-radius-control);
+  background: transparent;
+  color: var(--dc-muted);
+  box-shadow: none;
+  font-size: var(--dc-font-body);
+  font-weight: var(--dc-weight-regular);
+  transition:
+    color 150ms ease,
+    background-color 150ms ease,
+    box-shadow 180ms ease,
+    transform 180ms cubic-bezier(0.22, 0.75, 0.2, 1);
+}
+
+.deepcode-gui-sidebar-action--primary {
+  color: var(--dc-foreground);
+  font-weight: var(--dc-weight-medium);
+}
+
+.deepcode-gui-sidebar-action:hover,
+.deepcode-gui-project-archive-group__sessions button:hover,
+.deepcode-gui-session-list button:hover {
+  background: var(--dc-surface-hover);
+  color: var(--dc-foreground);
+}
+
+.deepcode-gui-project-archive-group__sessions button.active,
+.deepcode-gui-session-list button.active {
+  background: var(--dc-surface-raised);
+  color: var(--dc-foreground-strong);
+  box-shadow: var(--dc-shadow-small);
+  font-weight: var(--dc-weight-medium);
+}
+
+.deepcode-gui-sidebar-section {
+  gap: 7px;
+}
+
+.deepcode-gui-sidebar-section__heading {
+  min-height: 26px;
+  margin-top: 8px;
+}
+
+.deepcode-gui-sidebar-section__heading:not(.deepcode-gui-sidebar-section__heading--project) {
+  margin-top: 20px;
+}
+
+.deepcode-gui-sidebar-section__label {
+  padding: 0 6px;
+  color: var(--dc-faint);
+  font-size: var(--dc-font-caption);
+  font-weight: var(--dc-weight-medium);
+}
+
+.deepcode-gui-sidebar-text-action,
+.deepcode-gui-sidebar-new-chat,
+.deepcode-gui-project-archive-group__compose {
+  color: var(--dc-muted);
+}
+
+.deepcode-gui-sidebar-text-action:hover:not(:disabled),
+.deepcode-gui-sidebar-new-chat:hover,
+.deepcode-gui-project-archive-group__compose:hover:not(:disabled) {
+  background: var(--dc-surface-hover);
+  color: var(--dc-foreground);
+}
+
+.deepcode-gui-project-archive-list {
+  gap: 10px;
+}
+
+.deepcode-gui-project-archive-group {
+  gap: 3px;
+}
+
+.deepcode-gui-project-archive-group__title {
+  min-height: 32px;
+  padding: 0 5px 0 7px;
+  border-radius: var(--dc-radius-control);
+}
+
+.deepcode-gui-project-archive-group__title:hover {
+  background: var(--dc-surface-hover);
+}
+
+.deepcode-gui-project-archive-group__select {
+  min-height: 32px;
+  color: var(--dc-foreground);
+  font-size: var(--dc-font-body);
+  font-weight: var(--dc-weight-medium);
+}
+
+.deepcode-gui-project-archive-group__title:hover .deepcode-gui-project-archive-group__select {
+  color: var(--dc-foreground-strong);
+}
+
+.deepcode-gui-project-archive-group__sessions {
+  gap: 2px;
+}
+
+.deepcode-gui-project-archive-group__sessions button {
+  min-height: 31px;
+  padding-left: 26px;
+}
+
+.deepcode-gui-project-archive-group__sessions kbd {
+  min-width: 24px;
+  height: 20px;
+  background: transparent;
+  color: var(--dc-faint);
+  font-size: var(--dc-font-micro);
+}
+
+.deepcode-gui-sidebar-empty,
+.deepcode-gui-sidebar-error {
+  color: var(--dc-faint);
+  font-size: var(--dc-font-caption);
+}
+
+.deepcode-gui-sidebar-settings {
+  min-height: 32px;
+  border-radius: var(--dc-radius-control);
+  color: var(--dc-muted);
+  font-size: var(--dc-font-label);
+}
+
+.deepcode-gui-sidebar-settings:hover {
+  background: var(--dc-surface-hover);
+  color: var(--dc-foreground);
+}
+
+.deepcode-gui-session-main {
+  position: relative;
+  z-index: 1;
+  margin: 0;
+  border: 0;
+  border-left: 1px solid var(--dc-border);
+  border-radius: 0;
+  background: var(--dc-surface);
+  box-shadow:
+    6px 10px 24px -18px rgba(15, 15, 16, 0.24),
+    1px 3px 10px -8px rgba(15, 15, 16, 0.12);
+}
+
+.deepcode-gui-agent-panel,
+.deepcode-gui-agent-panel__header,
+.deepcode-gui-timeline {
+  background: var(--dc-surface);
+}
+
+.deepcode-gui-agent-panel__header {
+  border-radius: 0;
+}
+
+.deepcode-gui-context-panel {
+  position: relative;
+  z-index: 2;
+  display: block;
+  padding: 14px 12px;
+  border: 0;
+  background: var(--dc-surface);
+  overflow: auto;
+  scrollbar-width: none;
+}
+
+.deepcode-gui-context-panel::before {
+  display: none;
+}
+
+.deepcode-gui-task-list-card {
+  gap: 0;
+  padding: 16px;
+  border: 1px solid var(--dc-border);
+  border-radius: 20px;
+  background: var(--dc-surface-raised);
+  box-shadow: var(--dc-shadow-panel);
+}
+
+.deepcode-gui-task-list-card__title {
+  margin: 0 0 9px;
+  color: var(--dc-muted);
+  font-size: var(--dc-font-body);
+  font-weight: var(--dc-weight-semibold);
+}
+
+.deepcode-gui-task-list {
+  gap: 0;
+}
+
+.deepcode-gui-task-item {
+  grid-template-columns: 8px minmax(0, 1fr) auto;
+  gap: 9px;
+  padding: 11px 0;
+  border: 0;
+  border-bottom: 1px solid var(--dc-border);
+  border-radius: 0;
+  background: transparent;
+}
+
+.deepcode-gui-task-item:last-child {
+  border-bottom: 0;
+}
+
+.deepcode-gui-task-item__dot {
+  width: 7px;
+  height: 7px;
+  margin-top: 5px;
+  background: var(--dc-faint);
+}
+
+.deepcode-gui-task-item--running .deepcode-gui-task-item__dot {
+  background: var(--dc-accent);
+  box-shadow: 0 0 0 4px var(--dc-accent-soft);
+}
+
+.deepcode-gui-task-item--waiting .deepcode-gui-task-item__dot {
+  background: var(--dc-warning);
+}
+
+.deepcode-gui-task-item--completed .deepcode-gui-task-item__dot {
+  background: var(--dc-success);
+}
+
+.deepcode-gui-task-item--failed .deepcode-gui-task-item__dot {
+  background: var(--dc-danger);
+}
+
+.deepcode-gui-task-item__title {
+  color: var(--dc-foreground-strong);
+  font-size: var(--dc-font-label);
+  font-weight: var(--dc-weight-semibold);
+  line-height: var(--dc-line-tight);
+}
+
+.deepcode-gui-task-item__summary {
+  margin-top: 3px;
+  color: var(--dc-muted);
+  font-size: var(--dc-font-caption);
+  line-height: var(--dc-line-compact);
+}
+
+.deepcode-gui-task-item strong {
+  color: var(--dc-muted);
+  font-size: var(--dc-font-caption);
+  font-weight: var(--dc-weight-regular);
+}
+
+.deepcode-gui-task-list-card__empty {
+  min-height: 74px;
+  border-color: var(--dc-border);
+  color: var(--dc-faint);
+}
+
+@media (max-width: 1120px) {
+  .deepcode-gui-shell,
+  .deepcode-gui-shell--home {
+    grid-template-columns: 224px minmax(0, 1fr);
+  }
+
+  .deepcode-gui-left-rail {
+    width: 224px;
+    max-width: 224px;
+  }
+
+  .deepcode-gui-context-panel {
+    display: none;
+  }
+}
+
+@media (max-width: 760px) {
+  .deepcode-gui-shell,
+  .deepcode-gui-shell--home {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .deepcode-gui-left-rail {
+    display: none;
+  }
+
+  .deepcode-gui-session-main {
+    border-left: 0;
+  }
+}
+
+:root[data-product='deepcode-gui'] {
+  --bg-app: var(--dc-background);
+  --bg-panel: var(--dc-surface);
+  --bg-surface: var(--dc-surface-subtle);
+  --text-main: var(--dc-foreground);
+  --text-strong: var(--dc-foreground-strong);
+  --text-muted: var(--dc-muted);
+  --line: var(--dc-border);
+  --line-soft: var(--dc-border);
+  --line-strong: var(--dc-border-strong);
+  --accent: var(--dc-accent);
+  --accent-soft: var(--dc-accent-soft);
+  --ok: var(--dc-success);
+  --warn: var(--dc-warning);
+  --danger: var(--dc-danger);
+}
+
+:root[data-product='deepcode-gui'] .deepcode-gui-workbench {
+  --canvas: var(--dc-background);
+  --line: var(--dc-border);
+  --line-soft: var(--dc-border);
+  --line-strong: var(--dc-border-strong);
+  --panel: var(--dc-surface);
+  --panel-soft: var(--dc-surface-subtle);
+  --panel-raised: var(--dc-surface-raised);
+  --text: var(--dc-foreground);
+  --muted: var(--dc-muted);
+  --faint: var(--dc-faint);
+  --accent: var(--dc-accent);
+  --accent-soft: var(--dc-accent-soft);
+  --ok: var(--dc-success);
+  --warn: var(--dc-warning);
+  --danger: var(--dc-danger);
+  --bg-app: var(--dc-background);
+  --bg-panel: var(--dc-surface);
+  --bg-surface: var(--dc-surface-subtle);
+  --text-main: var(--dc-foreground);
+  --text-strong: var(--dc-foreground-strong);
+  --text-muted: var(--dc-muted);
+  --radius-sm: calc(var(--dc-radius-control) / 2);
+  --radius-md: var(--dc-radius-control);
+  --radius-lg: var(--dc-radius-inner);
+  --shadow-sm: var(--dc-shadow-small);
+  --shadow-md: var(--dc-shadow-panel);
+  --shadow-inset: var(--dc-shadow-inset);
+  --terminal-bg: var(--dc-code-background);
+  background: var(--dc-background);
+  color: var(--dc-foreground);
+}
+
+:root[data-product='deepcode-gui'] body {
+  background: var(--dc-background);
+  color: var(--dc-foreground);
+}
+
+:root[data-product='deepcode-gui'][data-theme='dark'] .deepcode-gui-settings-sheet,
+:root[data-product='deepcode-gui'][data-theme='dark'] .deepcode-gui-memory-sheet {
+  border-color: var(--dc-border-strong);
+  background: var(--dc-surface);
+  box-shadow: var(--dc-shadow-panel);
+}
+
+:root[data-product='deepcode-gui'][data-theme='dark'] .deepcode-gui-settings-sheet__header {
+  border-bottom-color: var(--dc-border);
+}
+
+:root[data-product='deepcode-gui'][data-theme='dark'] .deepcode-gui-settings-sheet__header h2 {
+  color: var(--dc-foreground-strong);
+}
+
+:root[data-product='deepcode-gui'][data-theme='dark'] .deepcode-gui-settings-sheet__header span,
+:root[data-product='deepcode-gui'][data-theme='dark'] .deepcode-gui-git-review__summary {
+  color: var(--dc-muted);
+}
+
+:root[data-product='deepcode-gui'][data-theme='dark'] .deepcode-gui-settings-sheet__header button,
+:root[data-product='deepcode-gui'][data-theme='dark'] .deepcode-gui-settings-sheet__runtime span {
+  border-color: var(--dc-border);
+  background: var(--dc-surface-raised);
+  color: var(--dc-muted);
+}
+
+:root[data-product='deepcode-gui'][data-theme='dark'] .deepcode-gui-settings-sheet__header button:hover {
+  background: var(--dc-surface-hover);
+}
+
+:root[data-product='deepcode-gui'][data-theme='dark'] .deepcode-gui-settings-sheet__runtime,
+:root[data-product='deepcode-gui'][data-theme='dark'] .deepcode-gui-git-review__files code,
+:root[data-product='deepcode-gui'][data-theme='dark'] .deepcode-gui-git-review__files span,
+:root[data-product='deepcode-gui'][data-theme='dark'] .deepcode-gui-git-review__diff pre {
+  border-color: var(--dc-border);
+  background: var(--dc-surface-subtle);
+  color: var(--dc-muted);
+}
+
+:root[data-product='deepcode-gui'] .deepcode-gui-settings-sheet .settings-field__input,
+:root[data-product='deepcode-gui'] .deepcode-gui-settings-sheet .settings-field__select,
+:root[data-product='deepcode-gui'] .deepcode-gui-settings-sheet .settings-search input {
+  border-color: var(--dc-border-strong);
+  background: var(--dc-surface-raised);
+  color: var(--dc-foreground);
+  -webkit-text-fill-color: var(--dc-foreground);
+}
+
+:root[data-product='deepcode-gui'] .deepcode-gui-settings-sheet .settings-field__select option {
+  background: var(--dc-surface-raised);
+  color: var(--dc-foreground);
+}
+
+:root[data-product='deepcode-gui'] .agent-composer {
+  border-color: var(--dc-border-strong);
+  background: var(--dc-surface-raised);
+  color: var(--dc-foreground);
+  box-shadow: var(--dc-shadow-small);
+}
+
+:root[data-product='deepcode-gui'] .agent-composer--input-focused {
+  border-color: var(--dc-border-strong);
+  box-shadow: var(--dc-shadow-panel);
+}
+
+:root[data-product='deepcode-gui'] .agent-composer__input-wrap textarea {
+  background: transparent;
+  color: var(--dc-foreground);
+  caret-color: var(--dc-foreground);
+  cursor: text;
+  -webkit-text-fill-color: var(--dc-foreground);
+}
+
+:root[data-product='deepcode-gui'] .agent-composer__input-wrap textarea::placeholder {
+  color: var(--dc-faint);
+  -webkit-text-fill-color: var(--dc-faint);
+}
+
+:root[data-product='deepcode-gui'] .agent-composer__input-wrap textarea:focus,
+:root[data-product='deepcode-gui'] .agent-composer__input-wrap textarea:focus-visible {
+  border-color: transparent;
+  outline: none;
+  box-shadow: none;
+}
+
+:root[data-product='deepcode-gui'] .agent-attachment-chips {
+  border-color: var(--dc-border);
+  background: var(--dc-surface-subtle);
+}
+
+:root[data-product='deepcode-gui'] .agent-chip,
+:root[data-product='deepcode-gui'] .agent-chip--session {
+  border-color: var(--dc-border);
+  background: var(--dc-surface-raised);
+  color: var(--dc-foreground);
+}
+
+:root[data-product='deepcode-gui'] .agent-chip__icon,
+:root[data-product='deepcode-gui'] .agent-chip__kind {
+  color: var(--dc-muted);
+}
+
+:root[data-product='deepcode-gui'] .agent-chip .agent-chip__path {
+  color: var(--dc-foreground);
+}
+
+:root[data-product='deepcode-gui'] .agent-chip__remove {
+  color: var(--dc-muted);
+}
+
+:root[data-product='deepcode-gui'] .agent-chip:hover .agent-chip__remove {
+  background: var(--dc-surface-hover);
+  color: var(--dc-foreground);
+}
+
+:root[data-product='deepcode-gui'] .agent-composer__footer button,
+:root[data-product='deepcode-gui'] .agent-add-file-button {
+  border-color: var(--dc-border);
+  background: var(--dc-surface-raised);
+  color: var(--dc-foreground);
+}
+
+:root[data-product='deepcode-gui'] .agent-composer__footer button:hover:not(:disabled),
+:root[data-product='deepcode-gui'] .agent-add-file-button:hover:not(:disabled) {
+  background: var(--dc-surface-hover);
+}
+
+.deepcode-session-model {
+  position: relative;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.deepcode-session-model__selector {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+}
+
+.deepcode-session-model__label {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+.deepcode-session-model__selector select {
+  width: auto;
+  min-width: 124px;
+  max-width: min(190px, 24vw);
+  height: 28px;
+  overflow: hidden;
+  border: 1px solid var(--dc-border);
+  border-radius: 9px;
+  background: var(--dc-surface-raised);
+  color: var(--dc-foreground);
+  padding: 0 26px 0 9px;
+  font-family: var(--dc-font-ui);
+  font-size: var(--dc-font-caption);
+  text-overflow: ellipsis;
+}
+
+.deepcode-session-model__selector select:hover:not(:disabled) {
+  border-color: var(--dc-accent-border);
+  background: var(--dc-surface-hover);
+}
+
+.deepcode-session-model__selector select:disabled {
+  color: var(--dc-faint);
+  cursor: not-allowed;
+  opacity: 0.72;
+}
+
+.deepcode-session-model__context {
+  width: 30px;
+  height: 30px;
+  flex: 0 0 30px;
+  display: grid;
+  place-items: center;
+  border: 2px solid var(--dc-border-strong);
+  border-radius: 50%;
+  background: var(--dc-surface-subtle);
+  color: var(--dc-faint);
+  font-size: 9px;
+  font-weight: var(--dc-weight-semibold);
+  cursor: help;
+}
+
+.deepcode-session-model__notice {
+  position: absolute;
+  left: 0;
+  bottom: calc(100% + 9px);
+  z-index: 30;
+  width: min(360px, calc(100vw - 40px));
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  border: 1px solid var(--dc-accent-border);
+  border-radius: var(--dc-radius-control);
+  background: var(--dc-surface-raised);
+  color: var(--dc-foreground);
+  box-shadow: var(--dc-shadow-panel);
+  padding: 9px 10px;
+  font-size: var(--dc-font-caption);
+  line-height: var(--dc-line-compact);
+}
+
+.deepcode-session-model__notice button {
+  min-width: 20px;
+  min-height: 20px;
+  margin-left: auto;
+  border: 0;
+  background: transparent;
+  color: var(--dc-muted);
+  padding: 0;
+}
+
+@media (max-width: 760px) {
+  .deepcode-session-model__selector select {
+    min-width: 104px;
+    max-width: min(150px, 36vw);
+  }
+}

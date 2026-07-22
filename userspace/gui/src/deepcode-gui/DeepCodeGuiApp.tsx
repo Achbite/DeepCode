@@ -5,6 +5,11 @@ import { useSettingsStore } from '../state/settingsStore';
 import { useWorkspaceStore } from '../state/workspaceStore';
 import { normalizeUiLanguage, setActiveUiLanguage, t } from '../i18n';
 import {
+  normalizeGuiAccentColor,
+  normalizeGuiThemePreference,
+  resolveGuiTheme,
+} from '../theme/deepcodeGuiTheme';
+import {
   APP_CLOSE_REQUEST_EVENT,
   closeAppWindow,
   getHealth,
@@ -14,6 +19,8 @@ import {
   warmupTerminalRuntime,
 } from '../services/runtimeAdapter';
 import './deepcodeGui.css';
+import './styles/deepcodeDesignTokens.css';
+import './styles/deepcodeShell.css';
 
 const DeepCodeWorkbenchLayout = lazy(() => import('./layout/DeepCodeWorkbenchLayout'));
 
@@ -144,8 +151,21 @@ const DeepCodeGuiApp: React.FC = () => {
   }, [workspaceSettings, syncWorkspaceSettings]);
 
   useEffect(() => {
-    document.documentElement.dataset.theme = String(
-      effectiveSettings['gui.colorTheme'] ?? 'deepcode-gui-light'
+    const preference = normalizeGuiThemePreference(effectiveSettings['gui.colorTheme']);
+    const media = window.matchMedia('(prefers-color-scheme: dark)');
+    const applyTheme = () => {
+      document.documentElement.dataset.themePreference = preference;
+      document.documentElement.dataset.theme = resolveGuiTheme(preference, media.matches);
+    };
+    applyTheme();
+    if (preference !== 'system') return;
+    media.addEventListener('change', applyTheme);
+    return () => media.removeEventListener('change', applyTheme);
+  }, [effectiveSettings]);
+
+  useEffect(() => {
+    document.documentElement.dataset.accent = normalizeGuiAccentColor(
+      effectiveSettings['gui.accentColor']
     );
   }, [effectiveSettings]);
 

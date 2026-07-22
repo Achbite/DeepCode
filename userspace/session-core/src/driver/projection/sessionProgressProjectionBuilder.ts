@@ -26,6 +26,7 @@ export interface DecisionOwnerRef {
 export type SessionRunStateStatus = 'waiting' | 'running' | 'completed' | 'cancelled' | 'failed';
 
 export type SessionRunStateReason =
+  | 'session'
   | 'requirement'
   | 'plan_review'
   | 'permission'

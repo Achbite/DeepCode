@@ -416,6 +416,7 @@ mod tests {
             kernel_events: Arc::new(Mutex::new(Vec::new())),
             session_runs: Arc::new(Mutex::new(HashMap::new())),
             session_run_deltas: Arc::new(Mutex::new(HashMap::new())),
+            projection_delivery: Arc::new(Mutex::new(ProjectionDeliveryBufferState::default())),
         }
     }
 }

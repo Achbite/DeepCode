@@ -11,8 +11,12 @@ import type {
 import { canonicalJson, stableHash } from '../../cache/canonicalizer.js';
 import type { ProposalEnvelope } from '../../protocol/types.js';
 import type { PlanProjectionState } from '../projection/planProjectionBuilder.js';
+import {
+  takeProviderCommitEvents,
+  type ProviderCommitBufferState,
+} from '../pipelines/providerCommitBuffer.js';
 
-export interface ProviderPlanProposalState extends PlanProjectionState {
+export interface ProviderPlanProposalState extends PlanProjectionState, ProviderCommitBufferState {
   runId: string;
   phase: string;
   workspaceBinding?: AgentWorkspaceBinding;
@@ -25,7 +29,7 @@ export interface ProviderPlanProposalHandlerPorts<State extends ProviderPlanProp
   createId(prefix: string): string;
   append(sessionId: string, events: AgentEvent[]): Promise<AgentSessionResult>;
   kernel(request: KernelCommandEnvelope): Promise<KernelReply>;
-  appendProjectedKernelEvents(sessionId: string, reply: KernelReply): Promise<AgentSessionResult | undefined>;
+  projectKernelEvents(sessionId: string, reply: KernelReply): AgentEvent[];
   taskPlanCardEvent(input: {
     state: State;
     proposal: ProposalEnvelope;
@@ -62,7 +66,8 @@ export class ProviderPlanProposalHandler<State extends ProviderPlanProposalState
       return this.failPlanAuthorization(
         state,
         planId,
-        'Kernel ToolCatalog snapshot is unavailable; Session cannot submit a plan intent without inventing tool authority.'
+        'Kernel ToolCatalog snapshot is unavailable; Session cannot submit a plan intent without inventing tool authority.',
+        []
       );
     }
     const intent = taskIntentEnvelope(state, proposal, planId, catalog);
@@ -75,23 +80,25 @@ export class ProviderPlanProposalHandler<State extends ProviderPlanProposalState
         intent,
       },
     });
-    let result = await this.ports.appendProjectedKernelEvents(state.sessionId, reply);
+    const kernelEvents = this.ports.projectKernelEvents(state.sessionId, reply);
     const review = planAuthorizationReview(reply.events, planId);
     if (!reply.ok || !review) {
       return this.failPlanAuthorization(
         state,
         planId,
         reply.error?.message ?? 'Kernel did not return PlanAuthorizationReviewed.',
-        result
+        kernelEvents
       );
     }
     if (review.status !== 'confirmable') {
       const diagnostics = review.diagnostics.join('; ')
         || `Kernel plan authorization status=${review.status}.`;
-      return this.failPlanAuthorization(state, planId, diagnostics, result);
+      return this.failPlanAuthorization(state, planId, diagnostics, kernelEvents);
     }
     state.phase = 'waiting_plan_review';
     return this.ports.append(state.sessionId, [
+      ...takeProviderCommitEvents(state),
+      ...kernelEvents,
       this.ports.taskPlanCardEvent({
         state,
         proposal,
@@ -113,17 +120,19 @@ export class ProviderPlanProposalHandler<State extends ProviderPlanProposalState
         ts: this.ports.now(),
         id: this.ports.createId('session-run-waiting-plan'),
       }),
-    ]) ?? result!;
+    ]);
   }
 
   private async failPlanAuthorization(
     state: State,
     planId: string,
     message: string,
-    current?: AgentSessionResult
+    kernelEvents: AgentEvent[]
   ): Promise<AgentSessionResult> {
     state.phase = 'failed';
     return this.ports.append(state.sessionId, [
+      ...takeProviderCommitEvents(state),
+      ...kernelEvents,
       this.ports.diagnosticEvent(
         state.sessionId,
         `Kernel plan authorization failed: ${message}`,
@@ -145,7 +154,7 @@ export class ProviderPlanProposalHandler<State extends ProviderPlanProposalState
         ts: this.ports.now(),
         id: this.ports.createId('session-run-plan-authorization-failed'),
       }),
-    ]) ?? current!;
+    ]);
   }
 }
 

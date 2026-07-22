@@ -44,6 +44,40 @@ pub(crate) struct LlmChatOutput {
 
 const OPENAI_COMPATIBLE_MAX_OUTPUT_TOKENS_CAP: u32 = 16_384;
 
+pub(crate) fn llm_profile_is_enabled(config: &Value, profile_id: &str) -> bool {
+    config
+        .get("profiles")
+        .and_then(Value::as_array)
+        .and_then(|profiles| {
+            profiles
+                .iter()
+                .find(|profile| profile.get("id").and_then(Value::as_str) == Some(profile_id))
+        })
+        .and_then(|profile| profile.get("enabled"))
+        .and_then(Value::as_bool)
+        == Some(true)
+}
+
+pub(crate) fn preferred_enabled_llm_profile_id(config: &Value) -> Option<String> {
+    let profiles = config.get("profiles").and_then(Value::as_array)?;
+    if let Some(default_id) = config
+        .get("defaultProfileId")
+        .and_then(Value::as_str)
+        .filter(|profile_id| llm_profile_is_enabled(config, profile_id))
+    {
+        return Some(default_id.to_string());
+    }
+    profiles.iter().find_map(|profile| {
+        if profile.get("enabled").and_then(Value::as_bool) != Some(true) {
+            return None;
+        }
+        profile
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    })
+}
+
 pub(crate) fn resolve_llm_profile(
     gui: &GuiState,
     profile_id: Option<&str>,

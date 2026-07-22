@@ -16,6 +16,7 @@ pub(crate) const ARCHIVE_DEBUG_STREAMS: &[&str] = &[
     "llm-provider-errors.jsonl",
     "wire-ledger.jsonl",
     "cache-telemetry.jsonl",
+    "projection-delivery.jsonl",
 ];
 
 #[derive(Default)]
@@ -420,6 +421,41 @@ pub(crate) async fn session_store_cache_telemetry_append(
     session_observability_stream_append(&state, &session_id, body, "cache-telemetry.jsonl", false)
 }
 
+pub(crate) async fn session_store_projection_delivery_get(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+) -> Json<ApiResponse> {
+    session_observability_stream_get(&state, &session_id, "projection-delivery.jsonl")
+}
+
+pub(crate) async fn session_store_projection_delivery_append(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    body: Result<Json<Value>, JsonRejection>,
+) -> Json<ApiResponse> {
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => {
+            return json_body_rejection_response(
+                "/api/session-store/:session_id/projection-delivery",
+                rejection,
+            )
+        }
+    };
+    let entries = body
+        .get("entries")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_else(|| vec![body.get("entry").cloned().unwrap_or(body)]);
+    match append_projection_delivery_entries(&state, &session_id, entries) {
+        Ok(appended) => ApiResponse::ok(json!({
+            "sessionId": session_id,
+            "appended": appended
+        })),
+        Err(error) => ApiResponse::error("write_projection_delivery_failed", error),
+    }
+}
+
 fn session_observability_stream_get(
     state: &AppState,
     session_id: &str,
@@ -499,6 +535,125 @@ fn session_observability_stream_append(
         "entryCount": stored.len(),
         "entries": stored
     }))
+}
+
+pub(crate) fn append_projection_delivery_entries(
+    state: &AppState,
+    session_id: &str,
+    entries: Vec<Value>,
+) -> Result<usize, String> {
+    let sanitized = entries
+        .into_iter()
+        .map(|entry| sanitize_projection_delivery_entry(session_id, entry))
+        .collect::<Result<Vec<_>, _>>()?;
+    if sanitized.is_empty() {
+        return Ok(0);
+    }
+    let (sessions_dir, archive_root, session) = {
+        let gui = state.gui.lock().expect("gui state lock");
+        (
+            gui.paths.sessions_dir.clone(),
+            gui.paths.conversation_archives_dir.clone(),
+            session_metadata(&gui.sessions, session_id),
+        )
+    };
+    append_session_jsonl(
+        &sessions_dir,
+        session_id,
+        "projection-delivery.jsonl",
+        &sanitized,
+    )
+    .map_err(|error| error.to_string())?;
+    append_conversation_archive_entries(
+        &archive_root,
+        session_id,
+        session.as_ref(),
+        "projection-delivery.jsonl",
+        "projection-delivery.jsonl",
+        &sanitized,
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(sanitized.len())
+}
+
+fn sanitize_projection_delivery_entry(session_id: &str, entry: Value) -> Result<Value, String> {
+    const SCHEMA_VERSION: &str = "deepcode.session.projection-delivery.v1";
+    const STAGES: &[&str] = &[
+        "session.provider_delta_received",
+        "session.timeline_delta_projected",
+        "session.timeline_delta_posted",
+        "session.timeline_delta_post_failed",
+        "daemon.timeline_delta_received",
+        "daemon.timeline_delta_enqueued",
+        "daemon.sse_delta_sent",
+        "daemon.sse_terminal_sent",
+        "gui.sse_stream_started",
+        "gui.sse_stream_ended",
+        "gui.sse_stream_failed",
+        "gui.sse_delta_received",
+        "gui.reducer_applied",
+        "gui.reducer_gap",
+        "gui.playback_released",
+        "gui.render_committed",
+        "gui.playback_settled",
+        "diagnostic.dropped",
+    ];
+    const REQUIRED_STRING_FIELDS: &[&str] = &["stage", "at", "runId"];
+    const OPTIONAL_STRING_FIELDS: &[&str] = &[
+        "turnId",
+        "itemId",
+        "blockId",
+        "op",
+        "deliveryMode",
+        "contentHash",
+        "failureCode",
+        "result",
+    ];
+    const OPTIONAL_NUMBER_FIELDS: &[&str] = &["revision", "deltaSeq", "charLength", "droppedCount"];
+
+    let object = entry
+        .as_object()
+        .ok_or_else(|| "projection delivery entry must be an object".to_string())?;
+    if object.get("schemaVersion").and_then(Value::as_str) != Some(SCHEMA_VERSION) {
+        return Err("unsupported projection delivery schemaVersion".to_string());
+    }
+    let mut sanitized = serde_json::Map::new();
+    sanitized.insert(
+        "schemaVersion".to_string(),
+        Value::String(SCHEMA_VERSION.to_string()),
+    );
+    sanitized.insert(
+        "sessionId".to_string(),
+        Value::String(session_id.to_string()),
+    );
+    for field in REQUIRED_STRING_FIELDS {
+        let value = object
+            .get(*field)
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| format!("projection delivery entry requires {field}"))?;
+        sanitized.insert((*field).to_string(), Value::String(value.to_string()));
+    }
+    if !sanitized
+        .get("stage")
+        .and_then(Value::as_str)
+        .is_some_and(|stage| STAGES.contains(&stage))
+    {
+        return Err("unsupported projection delivery stage".to_string());
+    }
+    for field in OPTIONAL_STRING_FIELDS {
+        if let Some(value) = object.get(*field).and_then(Value::as_str) {
+            if !value.trim().is_empty() {
+                sanitized.insert((*field).to_string(), Value::String(value.to_string()));
+            }
+        }
+    }
+    for field in OPTIONAL_NUMBER_FIELDS {
+        if let Some(value) = object.get(*field).and_then(Value::as_u64) {
+            sanitized.insert((*field).to_string(), Value::Number(value.into()));
+        }
+    }
+    Ok(Value::Object(sanitized))
 }
 
 pub(crate) fn append_session_projection(state: &AppState, session_id: &str, events: Vec<Value>) {
