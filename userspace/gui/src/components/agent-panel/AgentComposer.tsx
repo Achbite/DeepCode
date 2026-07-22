@@ -408,6 +408,7 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
   onDecisionReject,
 }) => {
   const [value, setValue] = useState('');
+  const [inputFocused, setInputFocused] = useState(false);
   const [selectedChoiceId, setSelectedChoiceId] = useState<string | null>(null);
   const [attachmentDialogOpen, setAttachmentDialogOpen] = useState(false);
   const [changesOpen, setChangesOpen] = useState(true);
@@ -641,6 +642,8 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
           ref={textareaRef}
           value={value}
           onChange={(event) => updateValue(event.target.value)}
+          onFocus={() => setInputFocused(true)}
+          onBlur={() => setInputFocused(false)}
           disabled={decisionResolving}
           onKeyDown={handleDecisionShortcut}
           placeholder={pendingDecision ? decisionPlaceholder(pendingDecision, language) : undefined}
@@ -657,7 +660,7 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
   );
 
   return (
-    <div className={`agent-composer${composerExpanded ? ' agent-composer--expanded' : ''}${chips.length > 0 ? ' agent-composer--has-attachments' : ''}${pendingDecision ? ' agent-composer--decision' : ''}`}>
+    <div className={`agent-composer${inputFocused ? ' agent-composer--input-focused' : ''}${composerExpanded ? ' agent-composer--expanded' : ''}${chips.length > 0 ? ' agent-composer--has-attachments' : ''}${pendingDecision ? ' agent-composer--decision' : ''}`}>
       {decisionText && (
         <div className="agent-composer-decision" onKeyDown={handleDecisionShortcut}>
           <div className="agent-composer-decision__header">
@@ -858,6 +861,8 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
             ref={textareaRef}
             value={value}
             onChange={(event) => updateValue(event.target.value)}
+            onFocus={() => setInputFocused(true)}
+            onBlur={() => setInputFocused(false)}
             onKeyDown={(event) => {
               if (event.key === 'Enter' && !event.shiftKey) {
                 if (isImeComposing(event)) return;

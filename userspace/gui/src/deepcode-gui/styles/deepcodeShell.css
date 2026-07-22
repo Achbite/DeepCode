@@ -529,7 +529,7 @@
   box-shadow: var(--dc-shadow-small);
 }
 
-:root[data-product='deepcode-gui'] .agent-composer:focus-within {
+:root[data-product='deepcode-gui'] .agent-composer--input-focused {
   border-color: var(--dc-border-strong);
   box-shadow: var(--dc-shadow-panel);
 }

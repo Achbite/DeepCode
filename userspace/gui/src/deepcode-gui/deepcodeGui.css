@@ -3106,13 +3106,13 @@ button {
   border-radius: 19px 19px 0 0;
 }
 
-.deepcode-gui-home-panel .agent-composer:focus-within,
+.deepcode-gui-home-panel .agent-composer--input-focused,
 .deepcode-gui-home-panel .agent-composer--expanded {
   width: min(100%, 820px);
   padding: 12px 14px 10px;
 }
 
-.deepcode-gui-home-panel .agent-composer:focus-within .agent-composer__input-wrap textarea,
+.deepcode-gui-home-panel .agent-composer--input-focused .agent-composer__input-wrap textarea,
 .deepcode-gui-home-panel .agent-composer--expanded .agent-composer__input-wrap textarea {
   min-height: 78px;
 }
@@ -3619,14 +3619,14 @@ button {
   transition: width 180ms ease, padding 180ms ease, box-shadow 180ms ease, border-color 180ms ease;
 }
 
-.agent-composer:focus-within,
+.agent-composer--input-focused,
 .agent-composer--expanded {
   width: min(calc(100% - 56px), 820px);
   box-shadow: 0 12px 30px rgba(32, 33, 36, 0.12);
 }
 
 .agent-composer--decision,
-.agent-composer--decision:focus-within,
+.agent-composer--decision.agent-composer--input-focused,
 .agent-composer--decision.agent-composer--expanded {
   width: min(calc(100% - 56px), 820px);
   margin: 0 auto 18px;
@@ -3658,7 +3658,7 @@ button {
   resize: none;
 }
 
-.agent-composer:focus-within .agent-composer__input-wrap textarea,
+.agent-composer--input-focused .agent-composer__input-wrap textarea,
 .agent-composer--expanded .agent-composer__input-wrap textarea {
   min-height: 64px;
 }
