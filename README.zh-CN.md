@@ -18,12 +18,28 @@ bash ./build.sh
 bash ./test.sh
 ```
 
+`test.sh` 是仓库唯一公开测试入口，通过 `tests/registry.json` 选择已注册的
+suite。使用 `bash ./test.sh --list` 查看 profile 和 suite ID；不带选择参数时执行
+required profile，宿主机静态检查不会再被报告为完整门禁通过。宿主机只需安全静态
+检查时必须显式运行 `bash ./test.sh --profile static`，默认 required profile 应在
+项目容器中执行。
+
+受保护测试、fixture、runner、registry、测试命令和治理文件在合并前还必须通过从
+目标提交物化的测试变更门禁。受保护变更必须同时提供已审阅的 Test Change Request
+和规范化发布复核记录；记录精确绑定分支路由、提交、policy、gate、完整 manifest
+与 TCR。开发会话负责实施和交接证据，用户负责是否继续的裁决，另行指定且保持只读
+的独立发布会话负责复核最终事实，并且只能在用户明确授权后合并或发布。该记录只是
+流程审计数据，不提供身份认证、授权证明或两个会话确实独立的证明。具体见
+`docs/test-change-request.md` 与 `docs/git-branch-flow.md`。首次把门禁引入目标分支仍需
+用户进行一次性 bootstrap 审阅，不提供可复用的 bootstrap 绕过开关。
+
 默认 checkout 继续使用现有的 `deepcode-dev` 容器、共享依赖缓存和宿主机端口
 `31246`。长期复用的 Git worktree 可以把 `.deepcode-worktree.mk.example` 复制为
 `.deepcode-worktree.mk`，设置稳定的 worktree ID 和未占用的宿主机端口，启用本地
 容器隔离。该本地文件不会进入 Git。隔离后的 worktree 共享镜像、Cargo registry
 和 pnpm store，但分别使用独立容器、`target` volume 与 `node_modules` volume。
-运行 `make shell` 前可先用 `make docker-info` 检查最终映射。
+新创建的项目容器固定启用 Docker 最小 init，使超时测试的后代进程被回收而不是成为
+PID 1 下的僵尸进程。运行 `make shell` 前可先用 `make docker-info` 检查最终映射。
 
 默认构建目标是完整的本地分发闭环。在容器内，`bash ./build.sh` 会构建共享
 GUI assets、DeepCode-GUI assets、Linux/Windows Rust 二进制、可选 Linux Tauri

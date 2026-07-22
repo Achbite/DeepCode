@@ -2,6 +2,12 @@
 # DeepCode protected-branch and short-lived task-branch workflow.
 set -euo pipefail
 
+export GIT_NO_REPLACE_OBJECTS=1
+
+git() {
+  /usr/bin/git "$@"
+}
+
 readonly MANAGED_MARKER='managed-by: deepcode-branch-flow'
 
 die() {
@@ -20,10 +26,10 @@ Usage:
   scripts/branch-flow.sh install-hooks
   scripts/branch-flow.sh start <kernel|session|ui|fix|hotfix|release> <slug> [--worktree PATH] [--release-approved]
   scripts/branch-flow.sh prepare-pr --target <dev-main|main> [--json]
-  scripts/branch-flow.sh publish-task --target <dev-main|main> --expected-head SHA --authorized
-  scripts/branch-flow.sh verify-pr --head NAME --target <dev-main|main> --expected-head SHA --expected-target SHA [--json]
+  scripts/branch-flow.sh publish-task --target <dev-main|main> --expected-head SHA --acknowledge-side-effect
+  scripts/branch-flow.sh verify-pr --head NAME --target <dev-main|main> --expected-head SHA --expected-target SHA [--test-change-request FILE --test-release-review FILE] [--json]
   scripts/branch-flow.sh sync-protected
-  scripts/branch-flow.sh finish --branch NAME --target <dev-main|main> --expected-head SHA --authorized
+  scripts/branch-flow.sh finish --branch NAME --target <dev-main|main> --expected-head SHA --acknowledge-side-effect
   scripts/branch-flow.sh check-pr-route HEAD BASE
   scripts/branch-flow.sh self-check
 EOF
@@ -62,6 +68,7 @@ target_for_branch() {
 }
 
 require_repo() {
+  [ -x /usr/bin/git ] || die '/usr/bin/git is required for branch governance'
   git rev-parse --show-toplevel >/dev/null 2>&1 || die 'run this command inside a DeepCode Git worktree'
 }
 
@@ -115,6 +122,56 @@ assert_same_repository() {
     || die "not a Git worktree: $wt"
   [ "$current_common" = "$candidate_common" ] \
     || die "worktree belongs to another Git repository: $wt"
+}
+
+assert_verify_script_matches_target() {
+  local expected_target="$1"
+  local script_source="${BASH_SOURCE[0]}"
+  local current_blob
+  local target_blob
+  [ -f "$script_source" ] \
+    || die 'verify-pr must run from a materialized branch-flow.sh file'
+  current_blob="$(git hash-object --no-filters "$script_source")"
+  target_blob="$(git rev-parse "$expected_target:scripts/branch-flow.sh" 2>/dev/null)" \
+    || die 'verified target does not contain scripts/branch-flow.sh'
+  [ "$current_blob" = "$target_blob" ] || die \
+    'verify-pr script differs from the trusted target; materialize scripts/branch-flow.sh from the expected target commit and run that copy'
+}
+
+run_trusted_test_change_gate() {
+  local target_ref="$1"
+  local target_sha="$2"
+  local head_ref="$3"
+  local head_sha="$4"
+  local test_change_request="$5"
+  local release_review="$6"
+  local root
+  local gate_args
+  root="$(repo_root)"
+  [ -x /usr/bin/python3 ] || die '/usr/bin/python3 is required for the test change gate'
+  git cat-file -e "$target_sha:scripts/test-change-gate.py" 2>/dev/null \
+    || die 'trusted target has no test change gate; bootstrap requires explicit user review'
+
+  gate_args=(
+    verify
+    --repository "$root"
+    --target-ref "$target_ref"
+    --head-ref "$head_ref"
+    --target "$target_sha"
+    --head "$head_sha"
+    --policy-ref "$target_sha"
+    --quiet
+  )
+  if [ -n "$test_change_request" ]; then
+    gate_args+=(--test-change-request "$test_change_request")
+  fi
+  if [ -n "$release_review" ]; then
+    gate_args+=(--test-release-review "$release_review")
+  fi
+  if ! git show "$target_sha:scripts/test-change-gate.py" \
+    | /usr/bin/python3 -I -S - "${gate_args[@]}"; then
+    die 'trusted target test change gate rejected this PR'
+  fi
 }
 
 check_pr_route() {
@@ -370,16 +427,17 @@ publish_task() {
   require_repo
   local target=''
   local expected_head=''
-  local authorized='no'
+  local side_effect_acknowledged='no'
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --target) target="${2:-}"; shift 2 ;;
       --expected-head) expected_head="${2:-}"; shift 2 ;;
-      --authorized) authorized='yes'; shift ;;
+      --acknowledge-side-effect) side_effect_acknowledged='yes'; shift ;;
       *) die "unknown publish-task option: $1" ;;
     esac
   done
-  [ "$authorized" = 'yes' ] || die 'publish-task requires --authorized'
+  [ "$side_effect_acknowledged" = 'yes' ] \
+    || die 'publish-task requires --acknowledge-side-effect; this flag confirms the push side effect and is not authorization proof'
   [ -n "$target" ] && [ -n "$expected_head" ] \
     || die 'publish-task requires --target and --expected-head'
   local head
@@ -388,7 +446,7 @@ publish_task() {
   is_protected_branch "$head" && die "protected branches cannot be published directly: $head"
   actual_head="$(git rev-parse HEAD)"
   [ "$actual_head" = "$expected_head" ] \
-    || die "stale authorization: expected $expected_head, found $actual_head"
+    || die "expected head mismatch: expected $expected_head, found $actual_head"
   prepare_pr --target "$target"
   git push -u origin "HEAD:refs/heads/$head"
   info "published task branch for PR: $head -> $target at $actual_head"
@@ -400,6 +458,8 @@ verify_pr() {
   local target=''
   local expected_head=''
   local expected_target=''
+  local test_change_request=''
+  local test_release_review=''
   local json='no'
   while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -407,6 +467,8 @@ verify_pr() {
       --target) target="${2:-}"; shift 2 ;;
       --expected-head) expected_head="${2:-}"; shift 2 ;;
       --expected-target) expected_target="${2:-}"; shift 2 ;;
+      --test-change-request) test_change_request="${2:-}"; shift 2 ;;
+      --test-release-review) test_release_review="${2:-}"; shift 2 ;;
       --json) json='yes'; shift ;;
       *) die "unknown verify-pr option: $1" ;;
     esac
@@ -439,6 +501,7 @@ verify_pr() {
     || die "PR head moved: expected $expected_head, found $actual_head"
   [ "$actual_target" = "$expected_target" ] \
     || die "PR target moved: expected $expected_target, found $actual_target"
+  assert_verify_script_matches_target "$expected_target"
 
   if git show-ref --verify --quiet "refs/heads/$head"; then
     local_head="$(git rev-parse "$head")"
@@ -457,6 +520,13 @@ verify_pr() {
   behind="${counts%%[[:space:]]*}"
   ahead="${counts##*[[:space:]]}"
   [ "$ahead" -gt 0 ] || die "no commits are available for PR: $head -> $target"
+  run_trusted_test_change_gate \
+    "$target" \
+    "$actual_target" \
+    "$head" \
+    "$actual_head" \
+    "$test_change_request" \
+    "$test_release_review"
 
   if [ "$json" = 'yes' ]; then
     printf '{"verified":true,"head":"%s","headSha":"%s","target":"%s","targetSha":"%s","behind":%s,"ahead":%s}\n' \
@@ -497,17 +567,18 @@ finish_branch() {
   local branch=''
   local target=''
   local expected_head=''
-  local authorized='no'
+  local side_effect_acknowledged='no'
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --branch) branch="${2:-}"; shift 2 ;;
       --target) target="${2:-}"; shift 2 ;;
       --expected-head) expected_head="${2:-}"; shift 2 ;;
-      --authorized) authorized='yes'; shift ;;
+      --acknowledge-side-effect) side_effect_acknowledged='yes'; shift ;;
       *) die "unknown finish option: $1" ;;
     esac
   done
-  [ "$authorized" = 'yes' ] || die 'finish requires --authorized'
+  [ "$side_effect_acknowledged" = 'yes' ] \
+    || die 'finish requires --acknowledge-side-effect; this flag confirms branch cleanup side effects and is not authorization proof'
   [ -n "$branch" ] && [ -n "$target" ] && [ -n "$expected_head" ] \
     || die 'finish requires --branch, --target, and --expected-head'
   assert_target "$target"
@@ -524,12 +595,12 @@ finish_branch() {
   if git show-ref --verify --quiet "refs/heads/$branch"; then
     local_exists='yes'
     [ "$(git rev-parse "$branch")" = "$expected_head" ] \
-      || die "local branch head does not match authorization: $branch"
+      || die "local branch head does not match expected head: $branch"
   fi
   if git show-ref --verify --quiet "refs/remotes/origin/$branch"; then
     remote_exists='yes'
     [ "$(git rev-parse "origin/$branch")" = "$expected_head" ] \
-      || die "remote branch head does not match authorization: origin/$branch"
+      || die "remote branch head does not match expected head: origin/$branch"
   fi
   [ "$local_exists" = 'yes' ] || [ "$remote_exists" = 'yes' ] \
     || die "branch no longer exists: $branch"

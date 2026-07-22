@@ -18,13 +18,35 @@ bash ./build.sh
 bash ./test.sh
 ```
 
+`test.sh` is the only public repository test entrypoint. It selects registered
+suites through `tests/registry.json`; use `bash ./test.sh --list` to inspect the
+available profiles and suite IDs. With no selector it runs the required profile
+and never reports a host-only static pass as the full gate. On a host, run
+`bash ./test.sh --profile static` explicitly for host-safe checks; run the
+default required profile inside the project container.
+
+Protected test assets, fixtures, runners, registries, commands, and governance
+files also pass the target-materialized test-change gate before merge. A
+protected change requires the reviewed Test Change Request and a canonical
+release-review record bound to the exact route, commits, policy, gate, manifest,
+and TCR. The development task prepares the implementation and evidence; the
+user decides whether it may proceed; a separately designated, read-only release
+task rechecks the final facts and only merges or publishes after explicit user
+authorization. The record is procedural audit data: it provides no
+authentication, authorization proof, or proof that the two tasks are
+independent. See `docs/test-change-request.md` and `docs/git-branch-flow.md`.
+The first target that introduces this gate still requires an explicit one-time
+user bootstrap review; there is no reusable bootstrap bypass.
+
 The default checkout keeps the existing `deepcode-dev` container, shared
 dependency caches, and host port `31246`. Persistent Git worktrees can opt into
 local container isolation by copying `.deepcode-worktree.mk.example` to
 `.deepcode-worktree.mk` and assigning a stable worktree ID plus an unused host
 port. The local file is ignored by Git. Isolated worktrees share the image,
 Cargo registry, and pnpm store, but use separate containers, `target` volumes,
-and `node_modules` volumes. Run `make docker-info` before `make shell` to inspect
+and `node_modules` volumes. Newly created project containers start with Docker's
+minimal init process so timed-out test descendants are reaped instead of
+becoming PID 1 zombies. Run `make docker-info` before `make shell` to inspect
 the effective mapping.
 
 The default build target is the complete local distribution flow. Inside the

@@ -1,0 +1,95 @@
+{
+  "schemaVersion": 1,
+  "defaultProfile": "required",
+  "governance": {
+    "testChangesRequireUserApproval": true,
+    "reviewModel": "procedural-release-task",
+    "policyPath": "tests/protected-paths.json",
+    "gatePath": "scripts/test-change-gate.py",
+    "requestTemplatePath": "docs/test-change-request.md"
+  },
+  "profiles": {
+    "required": {
+      "description": "Current required repository gate. It never degrades to static checks on a host.",
+      "suites": [
+        "repository.legacy"
+      ]
+    },
+    "static": {
+      "description": "Explicit host-safe shell, controller, architecture, and branch-flow checks.",
+      "suites": [
+        "repository.static"
+      ]
+    },
+    "full": {
+      "description": "Alias for the current complete transitional repository suite.",
+      "suites": [
+        "repository.legacy"
+      ]
+    }
+  },
+  "suites": [
+    {
+      "id": "repository.static",
+      "description": "Host-safe static repository contracts formerly embedded in test.sh.",
+      "layer": "cross-layer",
+      "kind": "static",
+      "owner": "repository",
+      "approvalClass": "test-runtime",
+      "requiredGate": false,
+      "transitional": false,
+      "runner": {
+        "type": "shell",
+        "path": "scripts/tests/static-contracts.sh",
+        "args": [],
+        "timeoutSeconds": 300,
+        "terminateGraceSeconds": 5
+      },
+      "environment": {
+        "container": "optional",
+        "hostPolicy": "allowed"
+      },
+      "resources": [],
+      "contractSources": [
+        "scripts/tests/controller-contracts.py",
+        "scripts/tests/test-change-gate-contracts.py",
+        "scripts/test-change-gate.py",
+        "scripts/branch-flow.sh",
+        "tests/protected-paths.json",
+        "scripts/check-architecture.sh",
+        "scripts/test-branch-flow.sh"
+      ]
+    },
+    {
+      "id": "repository.legacy",
+      "description": "Transitional complete Rust, TypeScript, Session, daemon, Host Web, and IPC suite migrated without relaxing its business assertions.",
+      "layer": "cross-layer",
+      "kind": "integration",
+      "owner": "repository",
+      "approvalClass": "test-runtime",
+      "requiredGate": true,
+      "transitional": true,
+      "runner": {
+        "type": "shell",
+        "path": "scripts/tests/repository-legacy.sh",
+        "args": [],
+        "timeoutSeconds": 7200,
+        "terminateGraceSeconds": 10
+      },
+      "environment": {
+        "container": "preferred",
+        "hostPolicy": "explicit-opt-in",
+        "hostOptInEnv": "DEEPCODE_ALLOW_HOST_TEST"
+      },
+      "resources": [
+        "kernel-daemon",
+        "host-web-proxy",
+        "temporary-config-directory",
+        "temporary-logs"
+      ],
+      "contractSources": [
+        "scripts/tests/repository-legacy.sh"
+      ]
+    }
+  ]
+}
