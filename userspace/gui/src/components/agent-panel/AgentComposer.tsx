@@ -7,6 +7,30 @@ import ContextAttachmentPicker from './ContextAttachmentPicker';
 import UserAttachmentDialog, { type PickedUserAttachment } from './UserAttachmentDialog';
 import type { AgentComposerDecisionOption, AgentComposerPendingDecision } from './pendingDecision';
 
+const COMPOSER_TEXTAREA_MIN_HEIGHT = 34;
+const COMPOSER_TEXTAREA_MAX_HEIGHT = 150;
+
+function cssPixelValue(value: string, fallback: number): number {
+  const parsed = Number.parseFloat(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function resizeComposerTextarea(textarea: HTMLTextAreaElement): void {
+  const computedStyle = window.getComputedStyle(textarea);
+  const minHeight = cssPixelValue(computedStyle.minHeight, COMPOSER_TEXTAREA_MIN_HEIGHT);
+  const maxHeight = Math.max(
+    minHeight,
+    cssPixelValue(computedStyle.maxHeight, COMPOSER_TEXTAREA_MAX_HEIGHT)
+  );
+  textarea.style.height = `${minHeight}px`;
+  const contentHeight = textarea.scrollHeight;
+  textarea.style.height = `${Math.min(
+    Math.max(contentHeight, minHeight),
+    maxHeight
+  )}px`;
+  textarea.style.overflowY = contentHeight > maxHeight ? 'auto' : 'hidden';
+}
+
 interface AgentComposerProps {
   messageAttachments: AgentContextAttachment[];
   sessionAttachments: AgentContextAttachment[];
@@ -38,6 +62,27 @@ function attachmentLabel(attachment: AgentContextAttachment, language: UiLanguag
     return `${t(language, 'agent.composer.dir')} ${attachment.path || '.'}`;
   }
   return `${t(language, 'agent.composer.file')} ${attachment.path || '.'}`;
+}
+
+function attachmentKindLabel(attachment: AgentContextAttachment, language: UiLanguage): string {
+  return t(language, attachment.kind === 'directory' ? 'agent.composer.dir' : 'agent.composer.file');
+}
+
+function AttachmentIcon({ kind }: Pick<AgentContextAttachment, 'kind'>): React.ReactElement {
+  if (kind === 'directory') {
+    return (
+      <svg viewBox="0 0 20 20" aria-hidden="true">
+        <path d="M2.75 5.5h5l1.5 1.75h8v7.25a1.75 1.75 0 0 1-1.75 1.75h-11a1.75 1.75 0 0 1-1.75-1.75v-9Z" />
+        <path d="M2.75 7.25h14.5" />
+      </svg>
+    );
+  }
+  return (
+    <svg viewBox="0 0 20 20" aria-hidden="true">
+      <path d="M5 2.75h6l4 4v10.5H5V2.75Z" />
+      <path d="M11 2.75v4h4M7.75 10h4.5M7.75 13h4.5" />
+    </svg>
+  );
 }
 
 function joinWorkspacePath(root: string, filePath: string): string | null {
@@ -469,9 +514,24 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
   useEffect(() => {
     const textarea = textareaRef.current;
     if (!textarea) return;
-    textarea.style.height = '34px';
-    textarea.style.height = `${Math.min(Math.max(textarea.scrollHeight, 34), 150)}px`;
+    resizeComposerTextarea(textarea);
   }, [value]);
+
+  useEffect(() => {
+    const textarea = textareaRef.current;
+    const inputWrap = textarea?.closest('.agent-composer__input-wrap');
+    if (!textarea || !inputWrap || typeof ResizeObserver === 'undefined') return;
+
+    let lastWidth = inputWrap.getBoundingClientRect().width;
+    const observer = new ResizeObserver((entries) => {
+      const nextWidth = entries[0]?.contentRect.width ?? inputWrap.getBoundingClientRect().width;
+      if (Math.abs(nextWidth - lastWidth) < 0.5) return;
+      lastWidth = nextWidth;
+      resizeComposerTextarea(textarea);
+    });
+    observer.observe(inputWrap);
+    return () => observer.disconnect();
+  }, [decisionKey]);
 
   useEffect(() => {
     setLastAttachmentDirectory(readLastAttachmentDirectory(activeWorkspaceRoot));
@@ -613,7 +673,7 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
   );
 
   return (
-    <div className={`agent-composer${composerExpanded ? ' agent-composer--expanded' : ''}${pendingDecision ? ' agent-composer--decision' : ''}`}>
+    <div className={`agent-composer${composerExpanded ? ' agent-composer--expanded' : ''}${chips.length > 0 ? ' agent-composer--has-attachments' : ''}${pendingDecision ? ' agent-composer--decision' : ''}`}>
       {decisionText && (
         <div className="agent-composer-decision" onKeyDown={handleDecisionShortcut}>
           <div className="agent-composer-decision__header">
@@ -730,13 +790,21 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
           {chips.map((attachment) => (
             <button
               key={`${attachment.scope}:${attachment.folderId ?? ''}:${attachment.path}`}
-              className={`agent-chip agent-chip--${attachment.scope}`}
-              title={attachment.path || t(language, 'agent.composer.workspaceRoot')}
+              className={`agent-chip agent-chip--${attachment.scope} agent-chip--${attachment.kind}`}
+              title={attachmentLabel(attachment, language)}
               onClick={() => onRemoveAttachment(attachment.path, attachment.scope)}
               type="button"
             >
-              {attachmentLabel(attachment, language)}
-              <span>x</span>
+              <span className="agent-chip__icon">
+                <AttachmentIcon kind={attachment.kind} />
+              </span>
+              <span className="agent-chip__body">
+                <span className="agent-chip__path">
+                  {attachment.path || t(language, 'agent.composer.workspaceRoot')}
+                </span>
+                <span className="agent-chip__kind">{attachmentKindLabel(attachment, language)}</span>
+              </span>
+              <span className="agent-chip__remove" aria-hidden="true">×</span>
             </button>
           ))}
         </div>

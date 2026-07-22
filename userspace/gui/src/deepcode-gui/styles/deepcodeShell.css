@@ -522,6 +522,80 @@
   color: var(--dc-foreground);
 }
 
+:root[data-product='deepcode-gui'] .agent-composer {
+  border-color: var(--dc-border-strong);
+  background: var(--dc-surface-raised);
+  color: var(--dc-foreground);
+  box-shadow: var(--dc-shadow-small);
+}
+
+:root[data-product='deepcode-gui'] .agent-composer:focus-within {
+  border-color: var(--dc-border-strong);
+  box-shadow: var(--dc-shadow-panel);
+}
+
+:root[data-product='deepcode-gui'] .agent-composer__input-wrap textarea {
+  background: transparent;
+  color: var(--dc-foreground);
+  caret-color: var(--dc-foreground);
+  cursor: text;
+  -webkit-text-fill-color: var(--dc-foreground);
+}
+
+:root[data-product='deepcode-gui'] .agent-composer__input-wrap textarea::placeholder {
+  color: var(--dc-faint);
+  -webkit-text-fill-color: var(--dc-faint);
+}
+
+:root[data-product='deepcode-gui'] .agent-composer__input-wrap textarea:focus,
+:root[data-product='deepcode-gui'] .agent-composer__input-wrap textarea:focus-visible {
+  border-color: transparent;
+  outline: none;
+  box-shadow: none;
+}
+
+:root[data-product='deepcode-gui'] .agent-attachment-chips {
+  border-color: var(--dc-border);
+  background: var(--dc-surface-subtle);
+}
+
+:root[data-product='deepcode-gui'] .agent-chip,
+:root[data-product='deepcode-gui'] .agent-chip--session {
+  border-color: var(--dc-border);
+  background: var(--dc-surface-raised);
+  color: var(--dc-foreground);
+}
+
+:root[data-product='deepcode-gui'] .agent-chip__icon,
+:root[data-product='deepcode-gui'] .agent-chip__kind {
+  color: var(--dc-muted);
+}
+
+:root[data-product='deepcode-gui'] .agent-chip .agent-chip__path {
+  color: var(--dc-foreground);
+}
+
+:root[data-product='deepcode-gui'] .agent-chip__remove {
+  color: var(--dc-muted);
+}
+
+:root[data-product='deepcode-gui'] .agent-chip:hover .agent-chip__remove {
+  background: var(--dc-surface-hover);
+  color: var(--dc-foreground);
+}
+
+:root[data-product='deepcode-gui'] .agent-composer__footer button,
+:root[data-product='deepcode-gui'] .agent-add-file-button {
+  border-color: var(--dc-border);
+  background: var(--dc-surface-raised);
+  color: var(--dc-foreground);
+}
+
+:root[data-product='deepcode-gui'] .agent-composer__footer button:hover:not(:disabled),
+:root[data-product='deepcode-gui'] .agent-add-file-button:hover:not(:disabled) {
+  background: var(--dc-surface-hover);
+}
+
 .deepcode-session-model {
   position: relative;
   min-width: 0;
