@@ -18,12 +18,43 @@ bash ./build.sh
 bash ./test.sh
 ```
 
+`test.sh` 是仓库唯一公开测试入口，通过 `tests/registry.json` 选择已注册的
+suite。使用 `bash ./test.sh --list` 查看 profile 和 suite ID；不带选择参数时执行
+required profile，宿主机静态检查不会再被报告为完整门禁通过。宿主机只需安全静态
+检查时必须显式运行 `bash ./test.sh --profile static`，默认 required profile 应在
+项目容器中执行。
+
+Session smoke 只能通过已注册入口 `bash ./test.sh --profile smoke` 运行。Smoke
+按通信、工具 Loop、资源路径和用户授权边界分组。每个 case 都必须在 registry 中
+具名登记对应运行事故与稳定行为，并在运行时与 controller 注入的 case 清单精确
+核对。当前政策最多允许四组、总计五个 case，且每组最多三个 case。扩容上限以及
+新增、删除或改变用例边界都必须取得用户批准的测试变更；过时覆盖应删除或下沉到
+对应 contract 层，不默认扩张 smoke。Smoke 失败会如实返回，但它属于诊断测试，
+不进入 required profile，并且 receipt 始终为 `authoritative: false`。
+
+原有的大型 Session smoke、实现级辅助模块和 timeline 聚合测试已经删除，不再作为
+第二套门禁保留；Git 历史负责归档，smoke 只保留用户可观察的运行链路和选定历史
+缺陷。`full` profile 会依次运行 required integration 与所有已注册 smoke 分组，
+用于诊断而不是生成权威发布凭据。`test.sh` 是唯一受支持且能生成 receipt 的测试
+入口。底层 suite runner 的环境检查用于阻止误调用，但不是对本地仓库所有者的身份
+认证边界。
+
+受保护测试、fixture、runner、registry、测试命令和治理文件在合并前还必须通过从
+目标提交物化的测试变更门禁。受保护变更必须同时提供已审阅的 Test Change Request
+和规范化发布复核记录；记录精确绑定分支路由、提交、policy、gate、完整 manifest
+与 TCR。开发会话负责实施和交接证据，用户负责是否继续的裁决，另行指定且保持只读
+的独立发布会话负责复核最终事实，并且只能在用户明确授权后合并或发布。该记录只是
+流程审计数据，不提供身份认证、授权证明或两个会话确实独立的证明。具体见
+`docs/test-change-request.md` 与 `docs/git-branch-flow.md`。首次把门禁引入目标分支仍需
+用户进行一次性 bootstrap 审阅，不提供可复用的 bootstrap 绕过开关。
+
 默认 checkout 继续使用现有的 `deepcode-dev` 容器、共享依赖缓存和宿主机端口
 `31246`。长期复用的 Git worktree 可以把 `.deepcode-worktree.mk.example` 复制为
 `.deepcode-worktree.mk`，设置稳定的 worktree ID 和未占用的宿主机端口，启用本地
 容器隔离。该本地文件不会进入 Git。隔离后的 worktree 共享镜像、Cargo registry
 和 pnpm store，但分别使用独立容器、`target` volume 与 `node_modules` volume。
-运行 `make shell` 前可先用 `make docker-info` 检查最终映射。
+新创建的项目容器固定启用 Docker 最小 init，使超时测试的后代进程被回收而不是成为
+PID 1 下的僵尸进程。运行 `make shell` 前可先用 `make docker-info` 检查最终映射。
 
 默认构建目标是完整的本地分发闭环。在容器内，`bash ./build.sh` 会构建共享
 GUI assets、DeepCode-GUI assets、Linux/Windows Rust 二进制、可选 Linux Tauri

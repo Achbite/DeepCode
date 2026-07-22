@@ -18,13 +18,57 @@ bash ./build.sh
 bash ./test.sh
 ```
 
+`test.sh` is the only public repository test entrypoint. It selects registered
+suites through `tests/registry.json`; use `bash ./test.sh --list` to inspect the
+available profiles and suite IDs. With no selector it runs the required profile
+and never reports a host-only static pass as the full gate. On a host, run
+`bash ./test.sh --profile static` explicitly for host-safe checks; run the
+default required profile inside the project container.
+
+Run the registered Session smoke cases only through
+`bash ./test.sh --profile smoke`. Smoke is split into communication, tool Loop,
+resource-path, and authorization groups. Every case is named in the registry,
+records the runtime incident and stable behavior it protects, and is checked
+against the controller-provided case list at runtime. The current policy caps
+smoke at four groups, five total cases, and three cases per group. Expanding a
+limit, or adding, deleting, or changing a case, requires a user-approved test
+change; obsolete coverage must be removed or moved to the appropriate contract
+layer instead of growing smoke by default. Smoke reports real failures but is
+diagnostic: it is excluded from the required profile and always emits
+`authoritative: false`.
+
+The former monolithic Session smoke, its implementation-level helper modules,
+and the timeline aggregate have been removed rather than retained as a second
+gate. Git history remains the archive; only user-visible runtime paths and
+selected historical defects belong in smoke. The `full` profile runs required
+integration followed by every registered smoke group for diagnostics and is
+not an authoritative release receipt. `test.sh` is the supported,
+receipt-producing entrypoint. Suite runners are controller implementation
+details; their environment guards prevent accidental direct use but are not an
+authentication boundary against a local repository owner.
+
+Protected test assets, fixtures, runners, registries, commands, and governance
+files also pass the target-materialized test-change gate before merge. A
+protected change requires the reviewed Test Change Request and a canonical
+release-review record bound to the exact route, commits, policy, gate, manifest,
+and TCR. The development task prepares the implementation and evidence; the
+user decides whether it may proceed; a separately designated, read-only release
+task rechecks the final facts and only merges or publishes after explicit user
+authorization. The record is procedural audit data: it provides no
+authentication, authorization proof, or proof that the two tasks are
+independent. See `docs/test-change-request.md` and `docs/git-branch-flow.md`.
+The first target that introduces this gate still requires an explicit one-time
+user bootstrap review; there is no reusable bootstrap bypass.
+
 The default checkout keeps the existing `deepcode-dev` container, shared
 dependency caches, and host port `31246`. Persistent Git worktrees can opt into
 local container isolation by copying `.deepcode-worktree.mk.example` to
 `.deepcode-worktree.mk` and assigning a stable worktree ID plus an unused host
 port. The local file is ignored by Git. Isolated worktrees share the image,
 Cargo registry, and pnpm store, but use separate containers, `target` volumes,
-and `node_modules` volumes. Run `make docker-info` before `make shell` to inspect
+and `node_modules` volumes. Newly created project containers start with Docker's
+minimal init process so timed-out test descendants are reaped instead of
+becoming PID 1 zombies. Run `make docker-info` before `make shell` to inspect
 the effective mapping.
 
 The default build target is the complete local distribution flow. Inside the
