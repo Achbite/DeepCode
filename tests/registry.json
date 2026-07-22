@@ -6,13 +6,20 @@
     "reviewModel": "procedural-release-task",
     "policyPath": "tests/protected-paths.json",
     "gatePath": "scripts/test-change-gate.py",
-    "requestTemplatePath": "docs/test-change-request.md"
+    "requestTemplatePath": "docs/test-change-request.md",
+    "smokePolicy": {
+      "scope": "runtime-path-and-historical-defects",
+      "caseRegistration": "exact-controller-handshake",
+      "maxCasesPerSuite": 3,
+      "maxSuites": 4,
+      "maxTotalCases": 5
+    }
   },
   "profiles": {
     "required": {
-      "description": "Authoritative repository gate containing every and only requiredGate suite; it never runs smoke checks or degrades to host static checks.",
+      "description": "Authoritative repository integration gate containing every and only requiredGate suite; it never runs smoke checks or degrades to host static checks.",
       "suites": [
-        "repository.legacy"
+        "repository.required"
       ]
     },
     "static": {
@@ -22,23 +29,22 @@
       ]
     },
     "smoke": {
-      "description": "Non-authoritative focused Session agent-loop and selected historical-defect smoke checks.",
+      "description": "Non-authoritative Session runtime-path checks grouped by historical failure class.",
       "suites": [
-        "session.smoke"
-      ]
-    },
-    "regression": {
-      "description": "Non-authoritative transitional Session regression coverage retained for later contract audit.",
-      "suites": [
-        "session.legacy-regression"
+        "session.smoke.communication",
+        "session.smoke.tools",
+        "session.smoke.paths",
+        "session.smoke.authorization"
       ]
     },
     "full": {
-      "description": "Non-authoritative run of required integration, transitional Session regression, and focused smoke suites.",
+      "description": "Non-authoritative run of the required integration gate followed by every registered smoke group.",
       "suites": [
-        "repository.legacy",
-        "session.legacy-regression",
-        "session.smoke"
+        "repository.required",
+        "session.smoke.communication",
+        "session.smoke.tools",
+        "session.smoke.paths",
+        "session.smoke.authorization"
       ]
     }
   },
@@ -75,17 +81,17 @@
       ]
     },
     {
-      "id": "repository.legacy",
-      "description": "Transitional required Rust, TypeScript build, daemon, Host Web, and IPC suite; Session smoke checks are registered separately.",
+      "id": "repository.required",
+      "description": "Required Rust, TypeScript build, daemon, Host Web, and IPC integration checks.",
       "layer": "cross-layer",
       "kind": "integration",
       "owner": "repository",
       "approvalClass": "test-runtime",
       "requiredGate": true,
-      "transitional": true,
+      "transitional": false,
       "runner": {
         "type": "shell",
-        "path": "scripts/tests/repository-legacy.sh",
+        "path": "scripts/tests/repository-required.sh",
         "args": [],
         "timeoutSeconds": 7200,
         "terminateGraceSeconds": 10
@@ -102,57 +108,37 @@
         "temporary-logs"
       ],
       "contractSources": [
-        "scripts/tests/repository-legacy.sh"
+        "scripts/tests/repository-required.sh"
       ]
     },
     {
-      "id": "session.legacy-regression",
-      "description": "Non-authoritative legacy Session and timeline regression coverage pending stable-contract extraction.",
-      "layer": "session",
-      "kind": "regression",
-      "owner": "session",
-      "approvalClass": "test-runtime",
-      "requiredGate": false,
-      "transitional": true,
-      "runner": {
-        "type": "shell",
-        "path": "scripts/tests/session-legacy-regression.sh",
-        "args": [],
-        "timeoutSeconds": 1200,
-        "terminateGraceSeconds": 5
-      },
-      "environment": {
-        "container": "optional",
-        "hostPolicy": "allowed"
-      },
-      "resources": [],
-      "contractSources": [
-        "userspace/session-core/package.json",
-        "userspace/session-core/src/__tests__/agentPlanSmoke.ts",
-        "userspace/session-core/src/__tests__/timelineDeltaProjectionSmoke.ts",
-        "userspace/session-core/src/__tests__/smokeAuthorityLedgerTests.ts",
-        "userspace/session-core/src/__tests__/smokeFixtures.ts",
-        "userspace/session-core/src/__tests__/smokeHelpers.ts",
-        "userspace/session-core/src/__tests__/smokeLoopContextTests.ts",
-        "userspace/session-core/src/__tests__/smokeNativeToolPipelineTests.ts",
-        "userspace/session-core/src/__tests__/smokePromptContextTests.ts",
-        "userspace/session-core/src/__tests__/smokeStaticSyntaxReviewTests.ts",
-        "userspace/session-core/src/__tests__/smokeTerminalGuidanceTests.ts"
-      ]
-    },
-    {
-      "id": "session.smoke",
-      "description": "Non-authoritative focused Session agent-loop and selected historical-defect smoke checks.",
+      "id": "session.smoke.communication",
+      "description": "Instruction, final-answer, and resumed-context communication checks.",
       "layer": "session",
       "kind": "smoke",
       "owner": "session",
       "approvalClass": "test-runtime",
       "requiredGate": false,
       "transitional": false,
+      "group": "communication",
+      "cases": [
+        {
+          "id": "communication.answer_roundtrip",
+          "incidentRef": "git:5f8bafd-semantic-provider-loop",
+          "invariant": "The current user instruction reaches the provider and the submitted answer becomes the final Session message.",
+          "sourcePath": "userspace/session-core/src/__tests__/smoke/communicationSmoke.ts"
+        },
+        {
+          "id": "communication.context_survives_tool_resume",
+          "incidentRef": "git:2d0a6be,c476d65-context-admission-resume",
+          "invariant": "The current instruction and Kernel resource fact both reach the resumed provider turn.",
+          "sourcePath": "userspace/session-core/src/__tests__/smoke/communicationSmoke.ts"
+        }
+      ],
       "runner": {
         "type": "shell",
         "path": "scripts/tests/session-smoke.sh",
-        "args": [],
+        "args": ["communication"],
         "timeoutSeconds": 300,
         "terminateGraceSeconds": 5
       },
@@ -162,10 +148,121 @@
       },
       "resources": [],
       "contractSources": [
-        "userspace/session-core/package.json",
-        "userspace/session-core/src/__tests__/agentLoopSmoke.ts",
-        "userspace/session-core/src/__tests__/smokeFixtures.ts",
-        "userspace/session-core/src/__tests__/smokeHelpers.ts"
+        "scripts/tests/session-smoke.sh",
+        "userspace/session-core/src/__tests__/smoke/runner.ts",
+        "userspace/session-core/src/__tests__/smoke/harness.ts",
+        "userspace/session-core/src/__tests__/smoke/communicationSmoke.ts"
+      ]
+    },
+    {
+      "id": "session.smoke.tools",
+      "description": "Semantic resource-tool Loop continuation and convergence check.",
+      "layer": "session",
+      "kind": "smoke",
+      "owner": "session",
+      "approvalClass": "test-runtime",
+      "requiredGate": false,
+      "transitional": false,
+      "group": "tools",
+      "cases": [
+        {
+          "id": "tools.resource_loop_reaches_answer",
+          "incidentRef": "git:5ddd95a-native-tool-loop-limit",
+          "invariant": "Repeated semantic resource requests resume the same Loop until the provider submits an answer.",
+          "sourcePath": "userspace/session-core/src/__tests__/smoke/toolsSmoke.ts"
+        }
+      ],
+      "runner": {
+        "type": "shell",
+        "path": "scripts/tests/session-smoke.sh",
+        "args": ["tools"],
+        "timeoutSeconds": 300,
+        "terminateGraceSeconds": 5
+      },
+      "environment": {
+        "container": "optional",
+        "hostPolicy": "allowed"
+      },
+      "resources": [],
+      "contractSources": [
+        "scripts/tests/session-smoke.sh",
+        "userspace/session-core/src/__tests__/smoke/runner.ts",
+        "userspace/session-core/src/__tests__/smoke/harness.ts",
+        "userspace/session-core/src/__tests__/smoke/toolsSmoke.ts"
+      ]
+    },
+    {
+      "id": "session.smoke.paths",
+      "description": "Selected-root and logical resource-path preservation check.",
+      "layer": "session",
+      "kind": "smoke",
+      "owner": "session",
+      "approvalClass": "test-runtime",
+      "requiredGate": false,
+      "transitional": false,
+      "group": "paths",
+      "cases": [
+        {
+          "id": "paths.resource_request_preserves_target",
+          "incidentRef": "git:895660b-root-resource-path",
+          "invariant": "The requested logical file path crosses ResourceResolve and remains bound to the returned content fact.",
+          "sourcePath": "userspace/session-core/src/__tests__/smoke/pathsSmoke.ts"
+        }
+      ],
+      "runner": {
+        "type": "shell",
+        "path": "scripts/tests/session-smoke.sh",
+        "args": ["paths"],
+        "timeoutSeconds": 300,
+        "terminateGraceSeconds": 5
+      },
+      "environment": {
+        "container": "optional",
+        "hostPolicy": "allowed"
+      },
+      "resources": [],
+      "contractSources": [
+        "scripts/tests/session-smoke.sh",
+        "userspace/session-core/src/__tests__/smoke/runner.ts",
+        "userspace/session-core/src/__tests__/smoke/harness.ts",
+        "userspace/session-core/src/__tests__/smoke/pathsSmoke.ts"
+      ]
+    },
+    {
+      "id": "session.smoke.authorization",
+      "description": "Plan projection stops at the user-acceptance boundary before execution.",
+      "layer": "session",
+      "kind": "smoke",
+      "owner": "session",
+      "approvalClass": "test-runtime",
+      "requiredGate": false,
+      "transitional": false,
+      "group": "authorization",
+      "cases": [
+        {
+          "id": "authorization.plan_waits_for_user",
+          "incidentRef": "git:8af3dbc-review-decision-boundary",
+          "invariant": "A submitted plan produces a reviewable plan card without submitting executable work before user acceptance.",
+          "sourcePath": "userspace/session-core/src/__tests__/smoke/authorizationSmoke.ts"
+        }
+      ],
+      "runner": {
+        "type": "shell",
+        "path": "scripts/tests/session-smoke.sh",
+        "args": ["authorization"],
+        "timeoutSeconds": 300,
+        "terminateGraceSeconds": 5
+      },
+      "environment": {
+        "container": "optional",
+        "hostPolicy": "allowed"
+      },
+      "resources": [],
+      "contractSources": [
+        "scripts/tests/session-smoke.sh",
+        "userspace/session-core/src/__tests__/smoke/runner.ts",
+        "userspace/session-core/src/__tests__/smoke/harness.ts",
+        "userspace/session-core/src/__tests__/smoke/authorizationSmoke.ts"
       ]
     }
   ]

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
 import importlib.util
 import json
@@ -18,6 +19,13 @@ import time
 ROOT = Path(__file__).resolve().parents[2]
 CONTROLLER_PATH = ROOT / "scripts" / "test-controller.py"
 REGISTRY_PATH = ROOT / "tests" / "registry.json"
+SMOKE_SUITE_IDS = [
+    "session.smoke.communication",
+    "session.smoke.tools",
+    "session.smoke.paths",
+    "session.smoke.authorization",
+]
+ALL_SUITE_IDS = ["repository.static", "repository.required", *SMOKE_SUITE_IDS]
 
 
 def load_controller():
@@ -29,21 +37,22 @@ def load_controller():
     return module
 
 
+def run_suite_quiet(controller, suite):
+    with open(os.devnull, "w", encoding="utf-8") as sink:
+        with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+            return controller.run_suite(ROOT, suite, json_mode=False)
+
+
 def assert_registry_and_selection(controller) -> None:
     data, digest = controller.load_registry(REGISTRY_PATH)
     suites = controller.validate_registry(data, ROOT)
     assert len(digest) == 64
     assert data["defaultProfile"] == "required"
-    assert set(suites) == {
-        "repository.static",
-        "repository.legacy",
-        "session.legacy-regression",
-        "session.smoke",
-    }
+    assert set(suites) == set(ALL_SUITE_IDS)
 
     default_args = argparse.Namespace(profile=None, suite=None)
     suite_ids, selected_by = controller.select_suite_ids(data, suites, default_args)
-    assert suite_ids == ["repository.legacy"]
+    assert suite_ids == ["repository.required"]
     assert selected_by == "profile:required"
 
     static_args = argparse.Namespace(profile="static", suite=None)
@@ -53,21 +62,12 @@ def assert_registry_and_selection(controller) -> None:
 
     smoke_args = argparse.Namespace(profile="smoke", suite=None)
     suite_ids, selected_by = controller.select_suite_ids(data, suites, smoke_args)
-    assert suite_ids == ["session.smoke"]
+    assert suite_ids == SMOKE_SUITE_IDS
     assert selected_by == "profile:smoke"
-
-    regression_args = argparse.Namespace(profile="regression", suite=None)
-    suite_ids, selected_by = controller.select_suite_ids(data, suites, regression_args)
-    assert suite_ids == ["session.legacy-regression"]
-    assert selected_by == "profile:regression"
 
     full_args = argparse.Namespace(profile="full", suite=None)
     suite_ids, selected_by = controller.select_suite_ids(data, suites, full_args)
-    assert suite_ids == [
-        "repository.legacy",
-        "session.legacy-regression",
-        "session.smoke",
-    ]
+    assert suite_ids == ["repository.required", *SMOKE_SUITE_IDS]
     assert selected_by == "profile:full"
 
     weakened = copy.deepcopy(data)
@@ -107,7 +107,7 @@ def assert_registry_and_selection(controller) -> None:
         raise AssertionError("requiredGate suite omission was accepted")
 
     mixed = copy.deepcopy(data)
-    mixed["profiles"]["required"]["suites"].append("session.smoke")
+    mixed["profiles"]["required"]["suites"].append(SMOKE_SUITE_IDS[0])
     try:
         controller.validate_registry(mixed, ROOT)
     except controller.ControllerError as error:
@@ -117,10 +117,10 @@ def assert_registry_and_selection(controller) -> None:
 
     authoritative_smoke = copy.deepcopy(data)
     for suite in authoritative_smoke["suites"]:
-        if suite["id"] == "session.smoke":
+        if suite["id"] == SMOKE_SUITE_IDS[0]:
             suite["requiredGate"] = True
             break
-    authoritative_smoke["profiles"]["required"]["suites"].append("session.smoke")
+    authoritative_smoke["profiles"]["required"]["suites"].append(SMOKE_SUITE_IDS[0])
     try:
         controller.validate_registry(authoritative_smoke, ROOT)
     except controller.ControllerError as error:
@@ -129,13 +129,66 @@ def assert_registry_and_selection(controller) -> None:
         raise AssertionError("authoritative smoke suite was accepted")
 
     omitted_smoke = copy.deepcopy(data)
-    omitted_smoke["profiles"]["smoke"]["suites"] = ["session.legacy-regression"]
+    omitted_smoke["profiles"]["smoke"]["suites"] = SMOKE_SUITE_IDS[:-1]
     try:
         controller.validate_registry(omitted_smoke, ROOT)
     except controller.ControllerError as error:
         assert "every and only smoke suite" in str(error)
     else:
         raise AssertionError("smoke profile omission was accepted")
+
+    unregistered_case = copy.deepcopy(data)
+    for suite in unregistered_case["suites"]:
+        if suite["id"] == "session.smoke.communication":
+            suite["cases"].append({
+                "id": "communication.unregistered_growth_1",
+                "incidentRef": "fixture:case-budget",
+                "invariant": "fixture",
+                "sourcePath": "userspace/session-core/src/__tests__/smoke/communicationSmoke.ts",
+            })
+            suite["cases"].append({
+                "id": "communication.unregistered_growth_2",
+                "incidentRef": "fixture:case-budget",
+                "invariant": "fixture",
+                "sourcePath": "userspace/session-core/src/__tests__/smoke/communicationSmoke.ts",
+            })
+            break
+    try:
+        controller.validate_registry(unregistered_case, ROOT)
+    except controller.ControllerError as error:
+        assert "maxCasesPerSuite" in str(error)
+    else:
+        raise AssertionError("smoke suite case budget was not enforced")
+
+    missing_case_source = copy.deepcopy(data)
+    for suite in missing_case_source["suites"]:
+        if suite["id"] == "session.smoke.paths":
+            suite["cases"][0]["sourcePath"] = "README.md"
+            break
+    try:
+        controller.validate_registry(missing_case_source, ROOT)
+    except controller.ControllerError as error:
+        assert "sourcePath must be listed" in str(error)
+    else:
+        raise AssertionError("unbound smoke case source was accepted")
+
+    excess_groups = copy.deepcopy(data)
+    excess_groups["governance"]["smokePolicy"]["maxSuites"] = 3
+    try:
+        controller.validate_registry(excess_groups, ROOT)
+    except controller.ControllerError as error:
+        assert "maxSuites" in str(error)
+    else:
+        raise AssertionError("smoke suite budget was not enforced")
+
+    excess_total_cases = copy.deepcopy(data)
+    excess_total_cases["governance"]["smokePolicy"]["maxTotalCases"] = 4
+    try:
+        controller.validate_registry(excess_total_cases, ROOT)
+    except controller.ControllerError as error:
+        assert "maxTotalCases" in str(error)
+    else:
+        raise AssertionError("total smoke case budget was not enforced")
 
 
 def assert_machine_list(controller) -> None:
@@ -148,12 +201,15 @@ def assert_machine_list(controller) -> None:
     )
     payload = json.loads(completed.stdout)
     assert payload["defaultProfile"] == "required"
-    assert [suite["id"] for suite in payload["suites"]] == [
-        "repository.static",
-        "repository.legacy",
-        "session.legacy-regression",
-        "session.smoke",
+    assert [suite["id"] for suite in payload["suites"]] == ALL_SUITE_IDS
+    smoke_payloads = [suite for suite in payload["suites"] if suite["kind"] == "smoke"]
+    assert [suite["group"] for suite in smoke_payloads] == [
+        "communication",
+        "tools",
+        "paths",
+        "authorization",
     ]
+    assert all(suite["cases"] for suite in smoke_payloads)
 
 
 def assert_registry_override_is_rejected() -> None:
@@ -177,19 +233,19 @@ def assert_internal_runners_are_guarded() -> None:
     environment = os.environ.copy()
     environment.pop("DEEPCODE_TEST_CONTROLLER", None)
     environment.pop("DEEPCODE_TEST_SUITE_ID", None)
-    for runner, profile in (
-        ("session-smoke.sh", "smoke"),
-        ("session-legacy-regression.sh", "regression"),
+    for runner, arguments, expected in (
+        ("session-smoke.sh", ["communication"], "use bash ./test.sh --profile smoke"),
+        ("repository-required.sh", [], "use bash ./test.sh"),
     ):
         completed = subprocess.run(
-            ["bash", str(ROOT / "scripts" / "tests" / runner)],
+            ["bash", str(ROOT / "scripts" / "tests" / runner), *arguments],
             cwd=ROOT,
             env=environment,
             capture_output=True,
             text=True,
         )
         assert completed.returncode == 2
-        assert f"use bash ./test.sh --profile {profile}" in completed.stderr
+        assert expected in completed.stderr
 
 
 def assert_isolated_public_entrypoint() -> None:
@@ -219,7 +275,7 @@ def assert_isolated_public_entrypoint() -> None:
             *,
             kind: str = "static",
         ) -> dict[str, object]:
-            return {
+            suite: dict[str, object] = {
                 "id": suite_id,
                 "description": f"{suite_id} fixture suite.",
                 "layer": "cross-layer",
@@ -239,6 +295,15 @@ def assert_isolated_public_entrypoint() -> None:
                 "resources": [],
                 "contractSources": ["scripts/noop.contract"],
             }
+            if kind == "smoke":
+                suite["group"] = "fixture"
+                suite["cases"] = [{
+                    "id": "fixture.roundtrip",
+                    "incidentRef": "fixture:roundtrip",
+                    "invariant": "The fixture smoke case is registry-bound.",
+                    "sourcePath": "scripts/noop.contract",
+                }]
+            return suite
 
         registry = {
             "schemaVersion": 1,
@@ -249,6 +314,13 @@ def assert_isolated_public_entrypoint() -> None:
                 "policyPath": "tests/protected-paths.json",
                 "gatePath": "scripts/test-change-gate.py",
                 "requestTemplatePath": "docs/test-change-request.md",
+                "smokePolicy": {
+                    "scope": "runtime-path-and-historical-defects",
+                    "caseRegistration": "exact-controller-handshake",
+                    "maxCasesPerSuite": 3,
+                    "maxSuites": 4,
+                    "maxTotalCases": 5,
+                },
             },
             "profiles": {
                 "required": {
@@ -261,26 +333,20 @@ def assert_isolated_public_entrypoint() -> None:
                 },
                 "smoke": {
                     "description": "Smoke fixture profile.",
-                    "suites": ["session.smoke"],
-                },
-                "regression": {
-                    "description": "Regression fixture profile.",
-                    "suites": ["session.legacy-regression"],
+                    "suites": ["session.smoke.fixture"],
                 },
                 "full": {
                     "description": "Full fixture profile.",
                     "suites": [
                         "repository.required",
-                        "session.legacy-regression",
-                        "session.smoke",
+                        "session.smoke.fixture",
                     ],
                 },
             },
             "suites": [
                 fixture_suite("repository.required", True),
                 fixture_suite("repository.static", False),
-                fixture_suite("session.legacy-regression", False, kind="regression"),
-                fixture_suite("session.smoke", False, kind="smoke"),
+                fixture_suite("session.smoke.fixture", False, kind="smoke"),
             ],
         }
         (repo / "tests" / "registry.json").write_text(
@@ -307,8 +373,7 @@ def assert_isolated_public_entrypoint() -> None:
         assert [suite["id"] for suite in payload["suites"]] == [
             "repository.required",
             "repository.static",
-            "session.legacy-regression",
-            "session.smoke",
+            "session.smoke.fixture",
         ]
 
         def run_receipt(*arguments: str) -> dict[str, object]:
@@ -334,7 +399,7 @@ def assert_isolated_public_entrypoint() -> None:
         required_receipt = run_receipt("--profile", "required")
         assert required_receipt["authoritative"] is True
 
-        for profile in ("static", "smoke", "regression", "full"):
+        for profile in ("static", "smoke", "full"):
             optional_receipt = run_receipt("--profile", profile)
             assert optional_receipt["status"] == "passed"
             assert optional_receipt["authoritative"] is False
@@ -366,6 +431,126 @@ def assert_owned_process_group_cleanup(controller) -> None:
     finally:
         if controller.process_group_exists(process.pid):
             controller.terminate_process_group(process, 0)
+
+
+def assert_suite_child_signals_are_unblocked(controller) -> None:
+    with tempfile.TemporaryDirectory(prefix="deepcode-controller-signal-mask.") as directory:
+        runner = Path(directory) / "signal-mask.sh"
+        runner.write_text(
+            """#!/usr/bin/env bash
+set -euo pipefail
+/usr/bin/python3 - <<'PY'
+import signal
+blocked = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+if signal.SIGINT in blocked or signal.SIGTERM in blocked:
+    raise SystemExit(f"runner inherited blocked controller signals: {blocked}")
+PY
+""",
+            encoding="utf-8",
+        )
+        suite = {
+            "id": "fixture.signal-mask",
+            "description": "Child signal mask fixture.",
+            "kind": "static",
+            "runner": {
+                "path": str(runner),
+                "args": [],
+                "timeoutSeconds": 10,
+                "terminateGraceSeconds": 1,
+            },
+            "environment": {"hostPolicy": "allowed"},
+        }
+        result = run_suite_quiet(controller, suite)
+        assert result["status"] == "passed"
+
+
+def assert_runner_environment_rejects_bash_injection(controller) -> None:
+    with tempfile.TemporaryDirectory(prefix="deepcode-controller-runner-env.") as directory:
+        temp_root = Path(directory)
+        actual_marker = temp_root / "runner-executed"
+        bypass_marker = temp_root / "bash-env-sourced"
+        runner = temp_root / "runner.sh"
+        runner.write_text(
+            f"""#!/usr/bin/env bash
+set -euo pipefail
+test -z "${{CARGO_BUILD_RUSTC_WRAPPER:-}}"
+test -z "${{CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER:-}}"
+test -z "${{RUSTC_WRAPPER:-}}"
+test -z "${{RUSTC_WORKSPACE_WRAPPER:-}}"
+test -z "${{CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER:-}}"
+test "${{DEEPCODE_DISABLE_SCCACHE:-}}" = "1"
+test "${{PYTHONDONTWRITEBYTECODE:-}}" = "1"
+printf ran > {actual_marker}
+""",
+            encoding="utf-8",
+        )
+        bash_env = temp_root / "bash-env.sh"
+        bash_env.write_text(
+            f"printf bypass > {bypass_marker}\nexit 0\n",
+            encoding="utf-8",
+        )
+        injected_environment = {
+            "BASH_ENV": str(bash_env),
+            "CARGO_BUILD_RUSTC_WRAPPER": "malicious-wrapper",
+            "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER": "malicious-workspace-wrapper",
+            "RUSTC_WRAPPER": "malicious-wrapper",
+            "RUSTC_WORKSPACE_WRAPPER": "malicious-workspace-wrapper",
+            "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER": "malicious-runner",
+            "DEEPCODE_DISABLE_SCCACHE": "0",
+            "PYTHONDONTWRITEBYTECODE": "0",
+        }
+        previous_environment = {
+            name: os.environ.get(name) for name in injected_environment
+        }
+        os.environ.update(injected_environment)
+        try:
+            suite = {
+                "id": "fixture.runner-environment",
+                "description": "Runner environment fixture.",
+                "kind": "static",
+                "runner": {
+                    "path": str(runner),
+                    "args": [],
+                    "timeoutSeconds": 10,
+                    "terminateGraceSeconds": 1,
+                },
+                "environment": {"hostPolicy": "allowed"},
+            }
+            result = run_suite_quiet(controller, suite)
+        finally:
+            for name, previous_value in previous_environment.items():
+                if previous_value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = previous_value
+        assert result["status"] == "passed"
+        assert actual_marker.is_file()
+        assert not bypass_marker.exists()
+
+
+def assert_timeout_receipt_reports_process_group_reclaim(controller) -> None:
+    with tempfile.TemporaryDirectory(prefix="deepcode-controller-timeout.") as directory:
+        runner = Path(directory) / "timeout.sh"
+        runner.write_text(
+            "#!/usr/bin/env bash\nset -euo pipefail\nsleep 30 &\nwait\n",
+            encoding="utf-8",
+        )
+        suite = {
+            "id": "fixture.timeout",
+            "description": "Timeout process-group fixture.",
+            "kind": "static",
+            "runner": {
+                "path": str(runner),
+                "args": [],
+                "timeoutSeconds": 1,
+                "terminateGraceSeconds": 1,
+            },
+            "environment": {"hostPolicy": "allowed"},
+        }
+        result = run_suite_quiet(controller, suite)
+        assert result["status"] == "timed-out"
+        assert result["exitCode"] == 124
+        assert result["residualProcessGroupReclaimed"] is True
 
 
 def assert_worktree_fingerprint(controller) -> None:
@@ -529,6 +714,9 @@ def main() -> None:
     assert_internal_runners_are_guarded()
     assert_isolated_public_entrypoint()
     assert_owned_process_group_cleanup(controller)
+    assert_suite_child_signals_are_unblocked(controller)
+    assert_runner_environment_rejects_bash_injection(controller)
+    assert_timeout_receipt_reports_process_group_reclaim(controller)
     assert_worktree_fingerprint(controller)
     assert_git_identity_ignores_replace_and_environment(controller)
     print("[PASS] test controller contracts")

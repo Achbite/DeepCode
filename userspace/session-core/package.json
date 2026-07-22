@@ -18,10 +18,8 @@
     "dist"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json",
-    "clean": "rm -rf dist",
-    "test:smoke:internal": "node dist/__tests__/agentLoopSmoke.js",
-    "test:legacy-regression:internal": "node dist/__tests__/agentPlanSmoke.js && node dist/__tests__/timelineDeltaProjectionSmoke.js",
+    "build": "pnpm run clean && tsc -p tsconfig.json",
+    "clean": "rm -rf dist tsconfig.tsbuildinfo",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

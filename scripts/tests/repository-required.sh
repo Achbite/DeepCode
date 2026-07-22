@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Transitional required repository runner. Invoke through the repository test.sh.
+# Required repository integration runner. Invoke through the repository test.sh.
 set -euo pipefail
 
 export PATH="/root/.local/share/pnpm:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
@@ -8,8 +8,9 @@ export CI="${CI:-true}"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_DIR"
 
-if [ "${DEEPCODE_TEST_CONTROLLER:-0}" != "1" ]; then
-  printf '%s\n' "repository-legacy.sh is an internal runner; use ./test.sh" >&2
+if [ "${DEEPCODE_TEST_CONTROLLER:-0}" != "1" ] \
+  || [ "${DEEPCODE_TEST_SUITE_ID:-}" != "repository.required" ]; then
+  printf '%s\n' "repository-required.sh is an internal runner; use bash ./test.sh" >&2
   exit 2
 fi
 
@@ -38,18 +39,14 @@ info() { printf '\033[36m[INFO]\033[0m %s\n' "$*"; }
 
 cleanup() {
   local status="$?"
-  local pid
-  for pid in "$PROXY_PID" "$DAEMON_PID"; do
-    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-      kill "$pid" 2>/dev/null || true
-      sleep 1
-      kill -9 "$pid" 2>/dev/null || true
-    fi
-  done
+  trap - EXIT
+  stop_owned_job "$PROXY_PID"
+  stop_owned_job "$DAEMON_PID"
   [ -n "$CONFIG_DIR" ] && rm -rf "$CONFIG_DIR"
   if [ "$status" -eq 0 ]; then
     [ -n "$DAEMON_LOG" ] && rm -f "$DAEMON_LOG"
     [ -n "$PROXY_LOG" ] && rm -f "$PROXY_LOG"
+    pass "owned runtime resources cleaned up"
   else
     [ -n "$DAEMON_LOG" ] && info "daemon failure log preserved: $DAEMON_LOG"
     [ -n "$PROXY_LOG" ] && info "Host Web failure log preserved: $PROXY_LOG"
@@ -57,6 +54,24 @@ cleanup() {
   return "$status"
 }
 trap cleanup EXIT
+
+stop_owned_job() {
+  local pid="$1"
+  local attempt
+  [ -n "$pid" ] || return 0
+
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -TERM "$pid" 2>/dev/null || true
+    for attempt in 1 2 3 4 5 6 7 8 9 10; do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.1
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -KILL "$pid" 2>/dev/null || true
+    fi
+  fi
+  wait "$pid" 2>/dev/null || true
+}
 
 require_tool() {
   command -v "$1" >/dev/null 2>&1 || fail "$1 is required"
@@ -85,36 +100,18 @@ check_static_contracts() {
   bash ./scripts/test-branch-flow.sh
 }
 
-host_static_only_gate() {
-  info "host static checks"
-  require_tool bash
-  require_tool grep
-  check_static_contracts
-  pass "host static checks passed; run the full suite inside Docker"
-}
-
 if ! is_docker_environment && [ "${DEEPCODE_ALLOW_HOST_TEST:-0}" != "1" ]; then
-  fail "full legacy suite requires a container; select --profile static for host-only checks or set DEEPCODE_ALLOW_HOST_TEST=1 to opt in to full host execution"
+  fail "required integration suite requires a container; select --profile static for host-only checks or set DEEPCODE_ALLOW_HOST_TEST=1 to opt in to full host execution"
 fi
 
-configure_test_sccache() {
-  if [ "${DEEPCODE_DISABLE_SCCACHE:-0}" = "1" ]; then
-    unset RUSTC_WRAPPER
-    return
-  fi
-  if ! command -v sccache >/dev/null 2>&1; then
-    return
-  fi
-
-  export SCCACHE_DIR="${SCCACHE_DIR:-${CARGO_TARGET_DIR:-$ROOT_DIR/target}/.sccache}"
-  mkdir -p "$SCCACHE_DIR"
-  if sccache --start-server >/dev/null 2>&1; then
-    export RUSTC_WRAPPER="${RUSTC_WRAPPER:-sccache}"
-    info "sccache enabled: SCCACHE_DIR=$SCCACHE_DIR"
-  else
-    unset RUSTC_WRAPPER
-    info "sccache startup failed; continuing with rustc"
-  fi
+configure_test_compiler() {
+  unset \
+    CARGO_BUILD_RUSTC_WRAPPER \
+    CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER \
+    RUSTC_WRAPPER \
+    RUSTC_WORKSPACE_WRAPPER
+  export DEEPCODE_DISABLE_SCCACHE=1
+  info "background compiler cache disabled for test-owned process lifecycle"
 }
 
 json_get() {
@@ -182,7 +179,7 @@ for tool in bash cargo node pnpm python3 grep; do
   require_tool "$tool"
 done
 check_static_contracts
-configure_test_sccache
+configure_test_compiler
 pass "preflight checks"
 
 info "Rust workspace"
@@ -321,9 +318,5 @@ else
   info "package runtime verification skipped; set DEEPCODE_VERIFY_PACKAGES=1 to inspect existing artifacts"
 fi
 
-if command -v sccache >/dev/null 2>&1 && [ "${DEEPCODE_DISABLE_SCCACHE:-0}" != "1" ]; then
-  info "sccache stats"
-  sccache --show-stats || true
-fi
-
+cleanup
 pass "DeepCode repository verification passed"

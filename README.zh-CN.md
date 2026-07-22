@@ -25,16 +25,19 @@ required profile，宿主机静态检查不会再被报告为完整门禁通过�
 项目容器中执行。
 
 Session smoke 只能通过已注册入口 `bash ./test.sh --profile smoke` 运行。Smoke
-只保留少量具名的 Agent Loop 与选定历史缺陷用例；失败会如实返回，但它属于诊断
-测试，不进入 required profile，并且 receipt 始终为 `authoritative: false`。
+按通信、工具 Loop、资源路径和用户授权边界分组。每个 case 都必须在 registry 中
+具名登记对应运行事故与稳定行为，并在运行时与 controller 注入的 case 清单精确
+核对。当前政策最多允许四组、总计五个 case，且每组最多三个 case。扩容上限以及
+新增、删除或改变用例边界都必须取得用户批准的测试变更；过时覆盖应删除或下沉到
+对应 contract 层，不默认扩张 smoke。Smoke 失败会如实返回，但它属于诊断测试，
+不进入 required profile，并且 receipt 始终为 `authoritative: false`。
 
-原有的大型 Session smoke 与 timeline 检查改由已注册入口
-`bash ./test.sh --profile regression` 承接。该 transitional legacy regression
-保留广泛历史覆盖，供后续提炼稳定 contract 时审计；它不再属于 smoke，不进入
-required profile，receipt 同样始终为 `authoritative: false`。`full` profile 会依次
-运行 required integration、legacy regression 与 focused smoke，用于诊断而不是生成
-权威发布凭据。底层 suite runner 与 package 内部测试命令只是 controller 实现细节，
-不是独立测试入口。
+原有的大型 Session smoke、实现级辅助模块和 timeline 聚合测试已经删除，不再作为
+第二套门禁保留；Git 历史负责归档，smoke 只保留用户可观察的运行链路和选定历史
+缺陷。`full` profile 会依次运行 required integration 与所有已注册 smoke 分组，
+用于诊断而不是生成权威发布凭据。`test.sh` 是唯一受支持且能生成 receipt 的测试
+入口。底层 suite runner 的环境检查用于阻止误调用，但不是对本地仓库所有者的身份
+认证边界。
 
 受保护测试、fixture、runner、registry、测试命令和治理文件在合并前还必须通过从
 目标提交物化的测试变更门禁。受保护变更必须同时提供已审阅的 Test Change Request

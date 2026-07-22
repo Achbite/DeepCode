@@ -5,8 +5,9 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_DIR"
 
-if [ "${DEEPCODE_TEST_CONTROLLER:-0}" != "1" ]; then
-  printf '%s\n' "static-contracts.sh is an internal runner; use ./test.sh" >&2
+if [ "${DEEPCODE_TEST_CONTROLLER:-0}" != "1" ] \
+  || [ "${DEEPCODE_TEST_SUITE_ID:-}" != "repository.static" ]; then
+  printf '%s\n' "static-contracts.sh is an internal runner; use bash ./test.sh --profile static" >&2
   exit 2
 fi
 
@@ -34,8 +35,7 @@ for script in \
   scripts/macos-package-service.sh \
   scripts/package-macos.sh \
   scripts/tests/static-contracts.sh \
-  scripts/tests/repository-legacy.sh \
-  scripts/tests/session-legacy-regression.sh \
+  scripts/tests/repository-required.sh \
   scripts/tests/session-smoke.sh
 do
   bash -n "$script"

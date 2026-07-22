@@ -158,12 +158,17 @@ profile in the project Docker environment before this command. The explicit
 host-safe `bash ./test.sh --profile static` profile is useful for early
 feedback, but it is not a substitute for the required profile. The registered
 `bash ./test.sh --profile smoke` profile contains non-authoritative Agent-loop
-and selected historical-defect diagnostics; even a passing smoke receipt
-remains `authoritative: false` and does not replace the required profile. The
-former broad Session smoke and timeline checks are retained under the
-transitional `bash ./test.sh --profile regression` entry. That profile and the
-combined `full` profile are also non-authoritative and do not replace the
-required profile. `verify-pr`
+and selected historical-defect diagnostics grouped as communication, tool
+Loop, resource-path, and authorization checks. Every smoke case is registered
+with an incident reference and stable invariant; the controller and runner
+must agree on the exact case list. The current policy permits at most four
+groups, five total cases, and three cases per group. Changing those limits or
+case boundaries requires a user-approved test change; smoke must not become a
+default home for broad regression coverage. Even a passing smoke receipt remains
+`authoritative: false` and does not replace the required profile. The former
+broad Session smoke/timeline aggregate was deleted instead of becoming a
+parallel regression gate. The combined `full` profile is also
+non-authoritative and does not replace the required profile. `verify-pr`
 fetches current remote
 state and rejects an invalid route, moved head, moved target, dirty active head
 worktree, stale target ancestry, missing commits, or diff whitespace errors.

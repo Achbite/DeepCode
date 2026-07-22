@@ -20,6 +20,7 @@ from typing import Any
 SCHEMA_VERSION = 1
 SUITE_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 TRUSTED_GIT_PATH = "/usr/bin/git"
+TRUSTED_BASH_PATH = "/bin/bash"
 UNTRUSTED_GIT_ENVIRONMENT = {
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
     "GIT_CEILING_DIRECTORIES",
@@ -39,6 +40,35 @@ UNTRUSTED_GIT_ENVIRONMENT = {
     "GIT_REPLACE_REF_BASE",
     "GIT_SHALLOW_FILE",
     "GIT_WORK_TREE",
+}
+UNTRUSTED_RUNNER_ENVIRONMENT = {
+    "BASHOPTS",
+    "BASH_ENV",
+    "BASH_XTRACEFD",
+    "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+    "CARGO_BUILD_RUSTC_WRAPPER",
+    "CDPATH",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH",
+    "ENV",
+    "GLOBIGNORE",
+    "LD_LIBRARY_PATH",
+    "LD_PRELOAD",
+    "NODE_OPTIONS",
+    "NODE_PATH",
+    "NPM_CONFIG_SCRIPT_SHELL",
+    "PROMPT_COMMAND",
+    "PYTHONHOME",
+    "PYTHONINSPECT",
+    "PYTHONPATH",
+    "PYTHONSTARTUP",
+    "RUSTC",
+    "RUSTC_WORKSPACE_WRAPPER",
+    "RUSTC_WRAPPER",
+    "RUSTDOC",
+    "RUBYOPT",
+    "SHELLOPTS",
+    "npm_config_script_shell",
 }
 
 
@@ -116,6 +146,34 @@ def validate_registry(data: dict[str, Any], root: Path) -> dict[str, dict[str, A
         raise ControllerError(
             "governance.reviewModel must be 'procedural-release-task'"
         )
+    smoke_policy = governance.get("smokePolicy")
+    if not isinstance(smoke_policy, dict):
+        raise ControllerError("governance.smokePolicy must be an object")
+    max_smoke_cases = require_nonnegative_int(
+        smoke_policy.get("maxCasesPerSuite"),
+        "governance.smokePolicy.maxCasesPerSuite",
+        positive=True,
+    )
+    max_smoke_suites = require_nonnegative_int(
+        smoke_policy.get("maxSuites"),
+        "governance.smokePolicy.maxSuites",
+        positive=True,
+    )
+    max_total_smoke_cases = require_nonnegative_int(
+        smoke_policy.get("maxTotalCases"),
+        "governance.smokePolicy.maxTotalCases",
+        positive=True,
+    )
+    if smoke_policy.get("caseRegistration") != "exact-controller-handshake":
+        raise ControllerError(
+            "governance.smokePolicy.caseRegistration must be "
+            "'exact-controller-handshake'"
+        )
+    if smoke_policy.get("scope") != "runtime-path-and-historical-defects":
+        raise ControllerError(
+            "governance.smokePolicy.scope must be "
+            "'runtime-path-and-historical-defects'"
+        )
     for field in ("policyPath", "gatePath", "requestTemplatePath"):
         relative = require_string(governance.get(field), f"governance.{field}")
         resolved = (root / relative).resolve()
@@ -127,6 +185,7 @@ def validate_registry(data: dict[str, Any], root: Path) -> dict[str, dict[str, A
             raise ControllerError(f"governance.{field} does not exist: {relative}")
 
     suites: dict[str, dict[str, Any]] = {}
+    registered_smoke_case_ids: set[str] = set()
     for index, suite in enumerate(raw_suites):
         prefix = f"suites[{index}]"
         if not isinstance(suite, dict):
@@ -146,6 +205,42 @@ def validate_registry(data: dict[str, Any], root: Path) -> dict[str, dict[str, A
             raise ControllerError(f"{prefix}: smoke suites cannot be requiredGate")
         if not isinstance(suite.get("transitional"), bool):
             raise ControllerError(f"{prefix}.transitional must be a Boolean")
+        if suite["kind"] == "smoke":
+            if suite["transitional"]:
+                raise ControllerError(f"{prefix}: smoke suites cannot be transitional")
+            group = require_string(suite.get("group"), f"{prefix}.group")
+            if suite_id != f"session.smoke.{group}":
+                raise ControllerError(
+                    f"{prefix}.id must be session.smoke.<group> and match {prefix}.group"
+                )
+            cases = suite.get("cases")
+            if not isinstance(cases, list) or not cases:
+                raise ControllerError(f"{prefix}.cases must be a non-empty array")
+            if len(cases) > max_smoke_cases:
+                raise ControllerError(
+                    f"{prefix}.cases exceeds smokePolicy.maxCasesPerSuite={max_smoke_cases}"
+                )
+            suite_case_ids: set[str] = set()
+            for case_index, smoke_case in enumerate(cases):
+                case_prefix = f"{prefix}.cases[{case_index}]"
+                if not isinstance(smoke_case, dict):
+                    raise ControllerError(f"{case_prefix} must be an object")
+                case_id = require_string(smoke_case.get("id"), f"{case_prefix}.id")
+                if not SUITE_ID_PATTERN.fullmatch(case_id):
+                    raise ControllerError(f"{case_prefix}.id has an invalid format: {case_id!r}")
+                if not case_id.startswith(f"{group}."):
+                    raise ControllerError(
+                        f"{case_prefix}.id must start with the smoke group {group}."
+                    )
+                if case_id in suite_case_ids or case_id in registered_smoke_case_ids:
+                    raise ControllerError(f"duplicate smoke case id: {case_id}")
+                suite_case_ids.add(case_id)
+                registered_smoke_case_ids.add(case_id)
+                require_string(smoke_case.get("incidentRef"), f"{case_prefix}.incidentRef")
+                require_string(smoke_case.get("invariant"), f"{case_prefix}.invariant")
+                require_string(smoke_case.get("sourcePath"), f"{case_prefix}.sourcePath")
+        elif "group" in suite or "cases" in suite:
+            raise ControllerError(f"{prefix}: only smoke suites may declare group or cases")
         runner = suite.get("runner")
         if not isinstance(runner, dict):
             raise ControllerError(f"{prefix}.runner must be an object")
@@ -208,6 +303,15 @@ def validate_registry(data: dict[str, Any], root: Path) -> dict[str, dict[str, A
                     f"{prefix}.contractSources[{source_index}] does not exist: {source_path}"
                 )
 
+        if suite["kind"] == "smoke":
+            for case_index, smoke_case in enumerate(suite["cases"]):
+                source_path = smoke_case["sourcePath"]
+                if source_path not in contract_sources:
+                    raise ControllerError(
+                        f"{prefix}.cases[{case_index}].sourcePath must be listed in "
+                        f"{prefix}.contractSources"
+                    )
+
         suites[suite_id] = suite
 
     for profile_id, profile in profiles.items():
@@ -259,6 +363,15 @@ def validate_registry(data: dict[str, Any], root: Path) -> dict[str, dict[str, A
     }
     if not smoke_suite_ids:
         raise ControllerError("registry must contain at least one smoke suite")
+    if len(smoke_suite_ids) > max_smoke_suites:
+        raise ControllerError(
+            f"smoke suite count exceeds smokePolicy.maxSuites={max_smoke_suites}"
+        )
+    if len(registered_smoke_case_ids) > max_total_smoke_cases:
+        raise ControllerError(
+            "smoke case count exceeds "
+            f"smokePolicy.maxTotalCases={max_total_smoke_cases}"
+        )
     smoke_profile_suite_ids = set(profiles["smoke"]["suites"])
     if smoke_profile_suite_ids != smoke_suite_ids:
         raise ControllerError(
@@ -295,6 +408,25 @@ def trusted_git_environment() -> dict[str, str]:
     environment["GIT_OPTIONAL_LOCKS"] = "0"
     environment["GIT_TERMINAL_PROMPT"] = "0"
     environment["LC_ALL"] = "C"
+    return environment
+
+
+def trusted_runner_environment() -> dict[str, str]:
+    environment = os.environ.copy()
+    for name in list(environment):
+        if (
+            name in UNTRUSTED_RUNNER_ENVIRONMENT
+            or name in UNTRUSTED_GIT_ENVIRONMENT
+            or name.startswith("BASH_FUNC_")
+            or name == "GIT_CONFIG_COUNT"
+            or name.startswith("GIT_CONFIG_KEY_")
+            or name.startswith("GIT_CONFIG_VALUE_")
+            or name.startswith("GIT_TRACE")
+            or (name.startswith("CARGO_TARGET_") and name.endswith("_RUNNER"))
+        ):
+            environment.pop(name, None)
+    environment["DEEPCODE_DISABLE_SCCACHE"] = "1"
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
     return environment
 
 
@@ -543,10 +675,18 @@ def run_suite(
     check_host_policy(suite)
     runner = suite["runner"]
     runner_path = (root / runner["path"]).resolve()
-    command = ["bash", str(runner_path), *runner.get("args", [])]
-    environment = os.environ.copy()
+    command = [TRUSTED_BASH_PATH, str(runner_path), *runner.get("args", [])]
+    environment = trusted_runner_environment()
     environment["DEEPCODE_TEST_CONTROLLER"] = "1"
     environment["DEEPCODE_TEST_SUITE_ID"] = suite["id"]
+    environment.pop("DEEPCODE_TEST_CASE_IDS", None)
+    environment.pop("DEEPCODE_TEST_SMOKE_GROUP", None)
+    if suite["kind"] == "smoke":
+        environment["DEEPCODE_TEST_CASE_IDS"] = json.dumps(
+            [smoke_case["id"] for smoke_case in suite["cases"]],
+            separators=(",", ":"),
+        )
+        environment["DEEPCODE_TEST_SMOKE_GROUP"] = suite["group"]
     timeout_seconds = runner["timeoutSeconds"]
     grace_seconds = runner.get("terminateGraceSeconds", 5)
 
@@ -560,6 +700,10 @@ def run_suite(
     try:
         blocked_signals = {signal.SIGINT, signal.SIGTERM}
         previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, blocked_signals)
+
+        def restore_child_signal_mask() -> None:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+
         try:
             process = subprocess.Popen(
                 command,
@@ -569,6 +713,7 @@ def run_suite(
                 stdout=log_stream,
                 stderr=sys.stderr,
                 start_new_session=True,
+                preexec_fn=restore_child_signal_mask,
             )
         finally:
             signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
@@ -576,19 +721,25 @@ def run_suite(
             exit_code = process.wait(timeout=timeout_seconds)
         except subprocess.TimeoutExpired:
             timed_out = True
-            terminate_process_group(process, grace_seconds)
+            residual_group_reclaimed = terminate_process_group(
+                process, grace_seconds
+            )
             exit_code = 124
         except BaseException:
             terminate_process_group(process, grace_seconds)
             raise
     finally:
         if process is not None:
-            residual_group_reclaimed = terminate_process_group(process, grace_seconds)
+            residual_group_reclaimed = (
+                terminate_process_group(process, grace_seconds)
+                or residual_group_reclaimed
+            )
 
     duration_seconds = round(time.monotonic() - started, 3)
     status = "timed-out" if timed_out else ("passed" if exit_code == 0 else "failed")
+    status_label = {"passed": "PASS", "failed": "FAIL", "timed-out": "TIMEOUT"}[status]
     print(
-        f"[{status.upper()}] {suite['id']} ({duration_seconds:.3f}s)",
+        f"[{status_label}] {suite['id']} ({duration_seconds:.3f}s)",
         file=log_stream,
         flush=True,
     )
@@ -626,6 +777,8 @@ def list_payload(
                 "layer": suite.get("layer"),
                 "requiredGate": suite.get("requiredGate", False),
                 "transitional": suite.get("transitional", False),
+                "group": suite.get("group"),
+                "cases": suite.get("cases", []),
                 "hostPolicy": suite.get("environment", {}).get("hostPolicy", "allowed"),
                 "timeoutSeconds": suite["runner"]["timeoutSeconds"],
             }
@@ -653,6 +806,11 @@ def print_list(payload: dict[str, Any], *, json_mode: bool) -> None:
             flags.append("transitional")
         suffix = f" [{', '.join(flags)}]" if flags else ""
         print(f"  {suite['id']}{suffix}: {suite['description']}")
+        if suite["kind"] == "smoke":
+            print(
+                "    cases: "
+                + ", ".join(smoke_case["id"] for smoke_case in suite["cases"])
+            )
 
 
 def build_parser() -> argparse.ArgumentParser:

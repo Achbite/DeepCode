@@ -26,20 +26,26 @@ and never reports a host-only static pass as the full gate. On a host, run
 default required profile inside the project container.
 
 Run the registered Session smoke cases only through
-`bash ./test.sh --profile smoke`. Smoke contains a small set of named Agent-loop
-and selected historical-defect checks. It reports real failures but is diagnostic:
-it is excluded from the required profile and always emits
+`bash ./test.sh --profile smoke`. Smoke is split into communication, tool Loop,
+resource-path, and authorization groups. Every case is named in the registry,
+records the runtime incident and stable behavior it protects, and is checked
+against the controller-provided case list at runtime. The current policy caps
+smoke at four groups, five total cases, and three cases per group. Expanding a
+limit, or adding, deleting, or changing a case, requires a user-approved test
+change; obsolete coverage must be removed or moved to the appropriate contract
+layer instead of growing smoke by default. Smoke reports real failures but is
+diagnostic: it is excluded from the required profile and always emits
 `authoritative: false`.
 
-The former monolithic Session smoke and timeline checks are registered
-separately as `bash ./test.sh --profile regression`. This transitional legacy
-regression suite preserves broad historical coverage for later contract audit,
-but it is not smoke, is excluded from the required profile, and also always
-emits `authoritative: false`. The `full` profile runs required integration,
-legacy regression, and focused smoke suites for diagnostics; it is not an
-authoritative release receipt. Suite runners and package-level internal test
-commands are controller implementation details and are not supported as
-separate test entrypoints.
+The former monolithic Session smoke, its implementation-level helper modules,
+and the timeline aggregate have been removed rather than retained as a second
+gate. Git history remains the archive; only user-visible runtime paths and
+selected historical defects belong in smoke. The `full` profile runs required
+integration followed by every registered smoke group for diagnostics and is
+not an authoritative release receipt. `test.sh` is the supported,
+receipt-producing entrypoint. Suite runners are controller implementation
+details; their environment guards prevent accidental direct use but are not an
+authentication boundary against a local repository owner.
 
 Protected test assets, fixtures, runners, registries, commands, and governance
 files also pass the target-materialized test-change gate before merge. A
