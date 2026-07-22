@@ -518,22 +518,6 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
   }, [value]);
 
   useEffect(() => {
-    const textarea = textareaRef.current;
-    const inputWrap = textarea?.closest('.agent-composer__input-wrap');
-    if (!textarea || !inputWrap || typeof ResizeObserver === 'undefined') return;
-
-    let lastWidth = inputWrap.getBoundingClientRect().width;
-    const observer = new ResizeObserver((entries) => {
-      const nextWidth = entries[0]?.contentRect.width ?? inputWrap.getBoundingClientRect().width;
-      if (Math.abs(nextWidth - lastWidth) < 0.5) return;
-      lastWidth = nextWidth;
-      resizeComposerTextarea(textarea);
-    });
-    observer.observe(inputWrap);
-    return () => observer.disconnect();
-  }, [decisionKey]);
-
-  useEffect(() => {
     setLastAttachmentDirectory(readLastAttachmentDirectory(activeWorkspaceRoot));
   }, [activeWorkspaceRoot]);
 

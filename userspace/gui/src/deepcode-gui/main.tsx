@@ -38,6 +38,10 @@ function renderBootstrapError(reason: unknown): void {
 }
 
 window.addEventListener('error', (event) => {
+  if (!event.error) {
+    console.warn('[DeepCode-GUI browser diagnostic]', event.message);
+    return;
+  }
   console.error('[DeepCode-GUI bootstrap]', event.error ?? event.message);
   renderBootstrapError(event.error ?? event.message);
 });
