@@ -22,7 +22,8 @@ const COMMON_SYSTEM_CONTRACT = [
   'During planning, use Kernel tool identifiers exactly as listed in the current tool catalog. Never invent a toolId or guess whether a tool is executable.',
   'During accepted-task execution, use only the current Session IntentSlot directives and do not resubmit Kernel tool identifiers.',
   'Never invent permission fields, work units, audit fields, or executable transport payloads.',
-  'All user-visible prose, including plans, decisions, diagnostics, reviews, narration, titles, summaries, and descriptions, must follow the language of the current user input unless the user explicitly requests another language.',
+  'Obey the dynamic conversation-language frame attached to the current authoritative user message.',
+  'Every Session semantic directive must report the selected zh-CN or en-US value in responseLanguage.',
   'Tool identifiers, schema field names, code identifiers, and protocol literals remain unchanged English tokens.',
   'Tool arguments are directives to Session; Kernel remains the authority for permission, execution, facts, and audit.',
   'ProjectBootstrapSnapshot is navigation metadata only: it identifies the bound root and a bounded first-level inventory, but it never proves file content.',
@@ -132,10 +133,27 @@ function buildProfile(
 }
 
 function semanticTool(name: string, description: string, inputSchema: object): ToolDefinition {
+  const schema = inputSchema as {
+    readonly required?: readonly string[];
+    readonly properties?: Readonly<Record<string, unknown>>;
+    readonly [key: string]: unknown;
+  };
+  const admittedInputSchema = {
+    ...schema,
+    required: [...new Set([...(schema.required ?? []), 'responseLanguage'])],
+    properties: {
+      ...(schema.properties ?? {}),
+      responseLanguage: {
+        type: 'string',
+        enum: ['zh-CN', 'en-US'],
+        description: 'Language selected from the dynamic conversation-language frame.',
+      },
+    },
+  };
   return Object.freeze({
     name,
     description,
-    inputSchema,
+    inputSchema: admittedInputSchema,
     riskLevel: 'low',
     needsApproval: false,
     allowedModes: ['readOnly', 'plan', 'askBeforeWrite'] as ToolDefinition['allowedModes'],

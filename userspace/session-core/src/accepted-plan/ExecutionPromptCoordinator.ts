@@ -11,7 +11,7 @@ export interface DefaultActionBundleUserPlanMarkdownInput {
   goal?: string;
   actions: Record<string, unknown>[];
   existingUserPlan?: string;
-  outputLanguage?: string;
+  responseLanguage?: string;
 }
 
 export interface ExecutionPromptCoordinatorPorts<TPlan> {
@@ -42,13 +42,12 @@ export class ExecutionPromptCoordinator<TPlan> {
       payload.contentBlocks = [];
     }
     const existingUserPlan = this.ports.stringValue(payload.userPlan);
-    const outputLanguage = this.ports.stringValue(payload.outputLanguage);
     if (!this.ports.isDetailedUserPlanMarkdown(existingUserPlan)) {
       const generatedUserPlan = this.ports.defaultActionBundleUserPlanMarkdown({
         goal: this.ports.stringValue(bundle.goal),
         actions,
         existingUserPlan,
-        outputLanguage,
+        responseLanguage: proposal.responseLanguage,
       });
       payload.userPlan = generatedUserPlan;
     }

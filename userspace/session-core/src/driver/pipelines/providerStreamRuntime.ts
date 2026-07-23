@@ -62,12 +62,13 @@ export interface ProviderStreamRuntimeDependencies<TState extends ProviderStream
   semanticDraftMaxChars?: number;
   visibleReasoningMaxChars?: number;
   streamCoordinator: ProviderStreamCoordinator;
-  visibleLanguageForRequest(userRequest: string): ProviderStreamVisibleLanguage;
+  visibleLanguage(state: TState): ProviderStreamVisibleLanguage;
   providerActivity(input: {
     runId: string;
     userRequest: string;
     stage: string;
     status: 'running' | 'completed';
+    language: ProviderStreamVisibleLanguage;
   }): AgentConversationActivity;
   conversationActivity(input: AgentConversationActivity): AgentConversationActivity;
   emitProjectionDelta(state: TState, delta: Omit<ProjectionDelta, 'sessionId' | 'runId' | 'turnId' | 'seq'>): Promise<void>;
@@ -145,7 +146,7 @@ export class ProviderStreamRuntime<TState extends ProviderStreamRuntimeState> {
       // Preserve the provider's visible order: publish any buffered reasoning
       // before the following structured tool activity receives its sequence.
       await this.flushReasoningBuffer(state, stage, reasoningBuffer);
-      const language = this.dependencies.visibleLanguageForRequest(state.userRequest);
+      const language = this.dependencies.visibleLanguage(state);
       toolCallBuffer.addChunk(chunk);
       const summary = chunk.toolCallDelta?.name
         ? this.dependencies.streamCoordinator.toolCallPreparingSummary(chunk.toolCallDelta.name, language)
@@ -187,7 +188,7 @@ export class ProviderStreamRuntime<TState extends ProviderStreamRuntimeState> {
         status: 'running',
         channel: 'progress',
         source: 'provider',
-        summary: this.dependencies.streamCoordinator.usageSummary(this.dependencies.visibleLanguageForRequest(state.userRequest)),
+        summary: this.dependencies.streamCoordinator.usageSummary(this.dependencies.visibleLanguage(state)),
         payload: event.usage ?? chunk?.usage,
       });
       return;
@@ -237,7 +238,13 @@ export class ProviderStreamRuntime<TState extends ProviderStreamRuntimeState> {
       source: 'provider',
       itemId: buffer.itemId,
       delta: projected.content,
-      activity: this.dependencies.providerActivity({ runId: state.runId, userRequest: state.userRequest, stage, status: 'running' }),
+      activity: this.dependencies.providerActivity({
+        runId: state.runId,
+        userRequest: state.userRequest,
+        stage,
+        status: 'running',
+        language: this.dependencies.visibleLanguage(state),
+      }),
       payload: {
         presentation: 'reasoningTrace',
         streamMode: 'markdownBlocks',
@@ -523,7 +530,7 @@ export class ProviderStreamRuntime<TState extends ProviderStreamRuntimeState> {
       progress.receivedChars - progress.lastEmittedChars >= 1_500;
     if (!shouldEmit) return;
     progress.lastEmittedChars = progress.receivedChars;
-    const language = this.dependencies.visibleLanguageForRequest(state.userRequest);
+    const language = this.dependencies.visibleLanguage(state);
     const summary = this.dependencies.streamCoordinator.jsonProgressSummary(language, progress.receivedChars);
     await this.dependencies.emitProjectionDelta(state, {
       type: 'stage_delta',
@@ -533,7 +540,13 @@ export class ProviderStreamRuntime<TState extends ProviderStreamRuntimeState> {
       source: 'session',
       itemId: `${stage}-provider-json-progress`,
       summary,
-      activity: this.dependencies.providerActivity({ runId: state.runId, userRequest: state.userRequest, stage, status: 'running' }),
+      activity: this.dependencies.providerActivity({
+        runId: state.runId,
+        userRequest: state.userRequest,
+        stage,
+        status: 'running',
+        language,
+      }),
       payload: {
         stage,
         receivedChars: progress.receivedChars,

@@ -3,6 +3,7 @@ import type {
   AgentEvent,
   AgentSessionResult,
   AgentWorkspaceBinding,
+  ConversationLanguage,
 } from '@deepcode/protocol';
 import type { ProjectMemoryMode } from '../../context/index.js';
 import type { ProjectWorkingDirectory } from '../../context/types.js';
@@ -32,12 +33,12 @@ import {
   type SessionLoopControlResult,
 } from '../runContinuation.js';
 import type { AutonomyMode, InterventionLevel, RequirementConfirmationMode, ReviewContinuationMode } from '../types.js';
+import { normalizeHostLanguage } from '../context/conversationLanguagePolicy.js';
 
 export type RequirementDecisionHandlerDecision = 'accept' | 'reject' | 'revise';
 export type RequirementDecisionHandlerContinuationMode = ReviewContinuationMode;
 export type RequirementDecisionHandlerInterventionLevel = InterventionLevel;
 export type RequirementDecisionHandlerConfirmationMode = RequirementConfirmationMode;
-export type RequirementDecisionHandlerVisibleLanguage = 'zh-CN' | 'en-US';
 
 export interface RequirementDecisionHandlerInput {
   sessionId: string;
@@ -58,6 +59,7 @@ export interface RequirementDecisionHandlerInput {
   autonomyMode?: AutonomyMode;
   projectMemoryMode?: ProjectMemoryMode;
   interactionOverlay?: InteractionOverlayContext;
+  hostLanguage?: ConversationLanguage;
 }
 
 export type RequirementDriverInteractionRef =
@@ -86,7 +88,6 @@ export interface RequirementDecisionHandlerPorts {
     events: AgentEvent[],
     overlay: InteractionOverlayContext | undefined
   ): RequirementRecoveredAcceptedPlanContext | undefined;
-  visibleLanguageForRequest(userRequest: string): RequirementDecisionHandlerVisibleLanguage;
   userInputPipeline: UserInputPipeline;
   interactionOverlayCodec: InteractionOverlayCodec;
   requirementProjection: RequirementProjectionBuilder;
@@ -400,7 +401,10 @@ export class RequirementDecisionHandler {
       pendingTasks: taskLedger?.pendingTaskIds.length ?? 0,
       reason,
       guidance: input.guidance,
-      language: this.ports.visibleLanguageForRequest(stringValue(confirmationPayload.originalUserRequest) ?? input.guidance ?? ''),
+      language: input.guidance?.trim()
+        ? normalizeHostLanguage(input.hostLanguage)
+        : conversationLanguage(confirmationPayload.responseLanguage)
+          ?? normalizeHostLanguage(input.hostLanguage),
     });
     return this.ports.append(input.sessionId, [
       this.ports.assistantProjection.answerEvent(input.sessionId, answerProposal, this.ports.now(), this.ports.createId('answer'), {
@@ -573,6 +577,10 @@ export class RequirementDecisionHandler {
       },
     };
   }
+}
+
+function conversationLanguage(value: unknown): ConversationLanguage | undefined {
+  return value === 'zh-CN' || value === 'en-US' ? value : undefined;
 }
 
 function continuationRootOverride(attachments: AgentContextAttachment[]): {

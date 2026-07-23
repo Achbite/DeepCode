@@ -2,6 +2,7 @@ import type {
   AgentEvent,
   AgentSessionResult,
   AgentWorkspaceBinding,
+  ConversationLanguage,
   KernelCommandEnvelope,
   KernelReply,
 } from '@deepcode/protocol';
@@ -39,6 +40,7 @@ export interface ReviewDecisionHandlerInput {
   interventionLevel?: ReviewDecisionHandlerInterventionLevel;
   autonomyMode?: AutonomyMode;
   projectMemoryMode?: ProjectMemoryMode;
+  hostLanguage?: ConversationLanguage;
 }
 
 export interface ReviewDecisionRunCommand {

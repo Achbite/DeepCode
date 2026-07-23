@@ -1,4 +1,10 @@
-import type { AgentContextAttachment, AgentEvent, AgentSessionResult, AgentWorkspaceBinding } from '@deepcode/protocol';
+import type {
+  AgentContextAttachment,
+  AgentEvent,
+  AgentSessionResult,
+  AgentWorkspaceBinding,
+  ConversationLanguage,
+} from '@deepcode/protocol';
 import type { ProjectMemoryMode } from '../context/index.js';
 import type { ProjectWorkingDirectory } from '../context/types.js';
 import type { RequirementRecord } from '../requirement/types.js';
@@ -24,6 +30,7 @@ export interface DecisionContinuationSource {
   autonomyMode?: AutonomyMode;
   projectMemoryMode?: ProjectMemoryMode;
   interactionOverlay?: InteractionOverlayContext;
+  hostLanguage?: ConversationLanguage;
 }
 
 export interface SessionLoopResumeInput {
@@ -48,6 +55,7 @@ export interface SessionLoopResumeInput {
   resumeResourcePackets?: boolean;
   acceptedTaskPlan?: AcceptedTaskPlanContext;
   interactionOverlay?: InteractionOverlayContext;
+  hostLanguage?: ConversationLanguage;
 }
 
 export type SessionLoopControlResult =
@@ -73,6 +81,7 @@ export interface DecisionContinuationOverride {
   confirmedRequirement?: RequirementRecord;
   acceptedTaskPlan?: AcceptedTaskPlanContext;
   interactionOverlay?: InteractionOverlayContext;
+  hostLanguage?: ConversationLanguage;
 }
 
 export interface AcceptedPlanContinuationOverride extends DecisionContinuationOverride {
@@ -101,6 +110,7 @@ export type DecisionContinuationInput<Extra extends object = Record<string, neve
   confirmedRequirement?: RequirementRecord;
   acceptedTaskPlan?: AcceptedTaskPlanContext;
   interactionOverlay?: InteractionOverlayContext;
+  hostLanguage?: ConversationLanguage;
 } & Extra;
 
 export function decisionContinuationInput<Extra extends object = Record<string, never>>(
@@ -118,6 +128,7 @@ export function decisionContinuationInput<Extra extends object = Record<string, 
     confirmedRequirement,
     acceptedTaskPlan,
     interactionOverlay,
+    hostLanguage,
     ...extra
   } = override;
   const hasWorkspaceBindingOverride = hasOwnProperty(override, 'workspaceBinding');
@@ -145,6 +156,7 @@ export function decisionContinuationInput<Extra extends object = Record<string, 
     confirmedRequirement,
     acceptedTaskPlan,
     interactionOverlay: interactionOverlay ?? source.interactionOverlay,
+    hostLanguage: hostLanguage ?? source.hostLanguage,
   } as DecisionContinuationInput<Extra>;
 }
 

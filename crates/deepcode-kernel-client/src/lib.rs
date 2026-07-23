@@ -27,8 +27,9 @@ mod session_bridge;
 pub use bootstrap::{DaemonStatus, KernelBootstrap, KernelBootstrapGuard, KernelBootstrapOptions};
 use session_bridge::run_session_host_bridge;
 pub use session_bridge::{
-    session_host_bridge_hint, session_host_bridge_path, terminal_workspace_scope, AgentRunResult,
-    AgentRunStatus, AgentSessionListResult, AgentSessionResult, CreateAgentSessionRequest,
+    session_host_bridge_hint, session_host_bridge_path, terminal_host_language,
+    terminal_workspace_scope, AgentRunResult, AgentRunStatus, AgentSessionListResult,
+    AgentSessionResult, CreateAgentSessionRequest,
     ListAgentSessionsRequest, SessionHostBridgeRequest, SessionHostBridgeResult,
     StartAgentRunRequest, TerminalWorkspaceScope,
 };
@@ -385,6 +386,7 @@ impl HttpKernelClient {
         run_id: &str,
         guidance: impl Into<String>,
         attachments: Vec<Value>,
+        host_language: Option<String>,
     ) -> KernelClientResult<AgentRunResult> {
         let value = self
             .http
@@ -394,6 +396,7 @@ impl HttpKernelClient {
             .json(&json!({
                 "guidance": guidance.into(),
                 "attachments": attachments,
+                "hostLanguage": host_language,
             }))
             .send()
             .await?

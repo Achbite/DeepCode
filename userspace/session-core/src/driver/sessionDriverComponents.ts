@@ -72,7 +72,7 @@ import { ReviewAssembler, ReviewDecisionProjectionBuilder } from './review/index
 import { DriverFailureMessageCatalog, DriverParseErrorCatalog } from './diagnostics/index.js';
 import { builtinHooks, HookPolicy, HookRegistry, HookRuntime } from './hooks/index.js';
 import type { LlmTurnResult, SessionDriverLoopRunState } from './runFrame.js';
-import { clip, objectRecord, stringValue, visibleLanguageForRequest } from './runtimeSupport.js';
+import { clip, objectRecord, stringValue } from './runtimeSupport.js';
 
 const MAX_DERIVED_MANIFEST_ENTRIES = 240;
 const RESOURCE_MANIFEST_MAX_BYTES = 512 * 1024;
@@ -87,7 +87,6 @@ export const hookRuntime = new HookRuntime(hookRegistry, HookPolicy.observerOnly
 export const actionBundleActionInspector = new ActionBundleActionInspector();
 export const driverActivityBuilder = new DriverActivityBuilder({
   providerStageSummary: (stage, part, language) => providerStreamCoordinator.stageSummary(stage, part, language),
-  visibleLanguageForRequest,
   actionFileTargetPath: (action) => actionBundleActionInspector.actionFileTargetPath(action),
 });
 export const permissionPipeline = new PermissionPipeline();
@@ -133,14 +132,11 @@ export const planProjectionBuilder = new PlanProjectionBuilder({
   gateInterventionsFromReport: (report) => planReviewGrantProjector.gateInterventionsFromReport(report),
   planReviewFacts: (report) => planReviewReportAnalyzer.facts(report),
   interactionOverlayProjection: (overlay) => interactionOverlayCodec.toPayload(overlay as Parameters<typeof interactionOverlayCodec.toPayload>[0]),
-  visibleLanguageForRequest,
 });
 export const requirementProjectionBuilder = new RequirementProjectionBuilder({
-  visibleLanguageForRequest,
   interactionOverlayPayload: (payload) => interactionOverlayCodec.toPayload(interactionOverlayCodec.fromPayload(payload)),
 });
 export const assistantProjectionBuilder = new AssistantProjectionBuilder({
-  visibleLanguageForRequest,
   guidanceRevisionTransitionMessage: (language) => providerStreamCoordinator.guidanceRevisionTransitionMessage(language),
 });
 export const sessionProgressProjectionBuilder = new SessionProgressProjectionBuilder({

@@ -11,7 +11,6 @@ export interface AssistantDiagnosticInfo {
 }
 
 export interface AssistantProjectionBuilderPorts {
-  visibleLanguageForRequest(userRequest: string): AssistantProjectionLanguage;
   guidanceRevisionTransitionMessage(language: AssistantProjectionLanguage): string;
 }
 
@@ -103,7 +102,7 @@ export class AssistantProjectionBuilder {
     sessionId: string,
     runId: string,
     guidanceIds: string[],
-    userRequest: string,
+    language: AssistantProjectionLanguage,
     ts: string,
     id: string
   ): AgentEvent {
@@ -113,7 +112,7 @@ export class AssistantProjectionBuilder {
       ts,
       kind: 'assistant_msg',
       payload: {
-        content: this.ports.guidanceRevisionTransitionMessage(this.ports.visibleLanguageForRequest(userRequest)),
+        content: this.ports.guidanceRevisionTransitionMessage(language),
         channel: 'progress',
         source: 'session',
         visibility: 'conversation',

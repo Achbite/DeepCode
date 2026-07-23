@@ -6,7 +6,6 @@ export type DriverActivityLanguage = 'zh-CN' | 'en-US';
 
 export interface DriverActivityBuilderPorts {
   providerStageSummary(stage: string, part: 'request' | 'response', language: DriverActivityLanguage): string;
-  visibleLanguageForRequest(userRequest: string): DriverActivityLanguage;
   actionFileTargetPath(action: { args?: unknown }): string | undefined;
 }
 
@@ -27,6 +26,7 @@ export class DriverActivityBuilder {
     userRequest: string;
     stage: string;
     status: 'running' | 'completed';
+    language: DriverActivityLanguage;
   }): AgentConversationActivity {
     return this.conversationActivity({
       activityId: `provider-${input.stage}`,
@@ -36,7 +36,7 @@ export class DriverActivityBuilder {
       summary: this.ports.providerStageSummary(
         input.stage,
         input.status === 'running' ? 'request' : 'response',
-        this.ports.visibleLanguageForRequest(input.userRequest)
+        input.language
       ),
       source: 'provider',
       runId: input.runId,

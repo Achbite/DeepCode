@@ -2,6 +2,7 @@ import type {
   AgentEvent,
   AgentSessionResult,
   AgentWorkspaceBinding,
+  ConversationLanguage,
   KernelCommandEnvelope,
   KernelReply,
 } from '@deepcode/protocol';
@@ -44,6 +45,7 @@ export interface PlanDecisionHandlerInput {
   autonomyMode?: AutonomyMode;
   projectMemoryMode?: ProjectMemoryMode;
   interactionOverlay?: InteractionOverlayContext;
+  hostLanguage?: ConversationLanguage;
 }
 
 export interface RecoveredAcceptedPlanContext {

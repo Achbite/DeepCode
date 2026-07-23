@@ -75,6 +75,7 @@ export interface PromptLedgerWireRecord {
   readonly recordId: string;
   readonly parentRequestId?: string;
   readonly attemptKind?: string;
+  readonly languageRevision?: number;
   readonly sessionId: string;
   readonly runId: string;
   readonly profileId: string;
@@ -439,6 +440,7 @@ export function promptLedgerWireRequest(input: {
   recordId: string;
   parentRequestId?: string;
   attemptKind?: string;
+  languageRevision?: number;
   sessionId: string;
   runId: string;
   profileId: string;
@@ -460,6 +462,7 @@ export function promptLedgerWireRequest(input: {
     recordId: input.recordId,
     parentRequestId: input.parentRequestId,
     attemptKind: input.attemptKind,
+    languageRevision: input.languageRevision,
     sessionId: input.sessionId,
     runId: input.runId,
     profileId: input.profileId,
@@ -667,7 +670,8 @@ function appendCurrentTurn(
       relation: authority.turnAuthority.relation,
       sourceMessageIds: authority.turnAuthority.sourceMessageIds,
       sourceMessageHashes: authority.turnAuthority.sourceMessageHashes,
-      outputLanguage: authority.turnAuthority.outputLanguage,
+      languagePolicy: authority.languagePolicy,
+      effectiveLanguage: authority.effectiveLanguage,
       authorityHash: authority.turnAuthority.authorityHash,
     });
     epoch.entries.push({

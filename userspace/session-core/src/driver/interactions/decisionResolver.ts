@@ -2,6 +2,7 @@ import type {
   AgentEvent,
   AgentSessionResult,
   AgentWorkspaceBinding,
+  ConversationLanguage,
 } from '@deepcode/protocol';
 import type { ProjectMemoryMode } from '../../context/index.js';
 import type { ProjectWorkingDirectory } from '../../context/types.js';
@@ -19,6 +20,17 @@ import type {
   AcceptedPlanReviewHandoffPlan,
   AcceptedPlanReviewHandoffRunInput,
 } from '../review/acceptedPlanReviewHandoffCoordinator.js';
+import {
+  createSessionTurnAuthorityEvent,
+  hasLegacySessionTurnAuthority,
+  latestSessionTurnAuthority,
+} from '../context/userAuthorityFrame.js';
+import {
+  createSessionLanguageDecisionEvent,
+  nextConversationLanguageRevision,
+  normalizeHostLanguage,
+  resolveConversationLanguagePolicy,
+} from '../context/conversationLanguagePolicy.js';
 
 export type DecisionResolverKind = 'requirement' | 'plan' | 'review' | 'permission' | 'boundary';
 export type DecisionResolverDecision = 'accept' | 'reject' | 'revise';
@@ -45,6 +57,7 @@ export interface DecisionResolverInput {
   autonomyMode?: AutonomyMode;
   projectMemoryMode?: ProjectMemoryMode;
   interactionOverlay?: InteractionOverlayContext;
+  hostLanguage?: ConversationLanguage;
 }
 
 export interface DecisionResolverDiagnosticInfo {
@@ -76,6 +89,7 @@ export interface DecisionResolverPorts {
   append(sessionId: string, events: AgentEvent[]): Promise<AgentSessionResult>;
   finalDiagnosticEvent(sessionId: string, content: string | DecisionResolverDiagnosticInfo, ts: string, id: string): AgentEvent;
   missingDecisionKindMessage(kind: string): string | DecisionResolverDiagnosticInfo;
+  createError(code: string, message: string): Error;
   resume(input: SessionLoopResumeInput): Promise<AgentSessionResult>;
   assembleReview(
     input: AcceptedPlanReviewHandoffRunInput<AcceptedPlanReviewHandoffPlan>
@@ -95,7 +109,7 @@ export class DecisionResolver {
   }
 
   private async execute(command: DecisionRunCommand): Promise<DecisionRunEffect> {
-    const input = command.input;
+    const input = await this.admitFreeformGuidance(command.input);
     if (input.kind === 'requirement') {
       const result = await this.settle(await this.ports.requirementHandler.resolve({
         sessionId: input.sessionId,
@@ -116,6 +130,7 @@ export class DecisionResolver {
         autonomyMode: input.autonomyMode,
         projectMemoryMode: input.projectMemoryMode,
         interactionOverlay: input.interactionOverlay,
+        hostLanguage: input.hostLanguage,
       }));
       return { kind: 'decisionRouted', decisionKind: 'requirement', result };
     }
@@ -139,6 +154,7 @@ export class DecisionResolver {
         autonomyMode: input.autonomyMode,
         projectMemoryMode: input.projectMemoryMode,
         interactionOverlay: input.interactionOverlay,
+        hostLanguage: input.hostLanguage,
       }));
       return { kind: 'decisionRouted', decisionKind: 'plan', result };
     }
@@ -170,6 +186,7 @@ export class DecisionResolver {
         interventionLevel: input.interventionLevel,
         autonomyMode: input.autonomyMode,
         projectMemoryMode: input.projectMemoryMode,
+        hostLanguage: input.hostLanguage,
       }));
       return { kind: 'decisionRouted', decisionKind: 'review', result };
     }
@@ -188,5 +205,76 @@ export class DecisionResolver {
     if (control.kind === 'return') return Promise.resolve(control.result);
     if (control.kind === 'resume') return this.ports.resume(control.input);
     return this.ports.assembleReview(control.request);
+  }
+
+  private async admitFreeformGuidance(input: DecisionResolverInput): Promise<DecisionResolverInput> {
+    const guidance = input.guidance?.trim();
+    if (!guidance) return input;
+    const current = await this.ports.append(input.sessionId, []);
+    const events = current.events.length ? current.events : input.existingEvents ?? [];
+    const authority = latestSessionTurnAuthority(events, input.runId);
+    if (!authority) {
+      const code = hasLegacySessionTurnAuthority(events, input.runId)
+        ? 'session_language_policy_unavailable'
+        : 'session_turn_authority_unavailable';
+      throw this.ports.createError(
+        code,
+        code === 'session_language_policy_unavailable'
+          ? 'This Session uses turn authority v1 and cannot continue without ConversationLanguagePolicy v1.'
+          : 'A free-text decision requires a persisted CurrentTurnAuthority binding.'
+      );
+    }
+    const messageId = this.ports.createId('decision-guidance-user');
+    const userMessage: AgentEvent = {
+      id: messageId,
+      sessionId: input.sessionId,
+      ts: this.ports.now(),
+      kind: 'user_msg',
+      payload: {
+        content: guidance,
+        source: 'decisionGuidance',
+        decisionKind: input.kind,
+        targetId: input.targetId,
+        targetRunId: input.runId ?? authority.runId,
+        channel: 'user',
+        visibility: 'conversation',
+      },
+    };
+    const turnId = this.ports.createId('session-turn');
+    const authorityEvent = createSessionTurnAuthorityEvent({
+      sessionId: input.sessionId,
+      runId: input.runId ?? authority.runId,
+      turnId,
+      taskId: authority.taskId,
+      messages: [{ messageId, content: guidance }],
+      relation: 'interactionContinuation',
+      boundAtHookRef: `interaction.${input.kind}.decisionGuidance`,
+      languageRevision: nextConversationLanguageRevision(events),
+      hostLanguage: normalizeHostLanguage(input.hostLanguage),
+      promptEpochId: authority.promptEpochId,
+      eventId: this.ports.createId('session-turn-authority'),
+      timestamp: this.ports.now(),
+    });
+    const superseded = resolveConversationLanguagePolicy(events, authority).status === 'pending'
+      ? [createSessionLanguageDecisionEvent({
+          sessionId: authority.sessionId,
+          runId: authority.runId,
+          turnId: authority.turnId,
+          revision: authority.languagePolicy.revision,
+          status: 'superseded',
+          decisionSource: 'supersededByLaterUserInput',
+          eventId: this.ports.createId('session-language-superseded'),
+          timestamp: this.ports.now(),
+        })]
+      : [];
+    const appended = await this.ports.append(input.sessionId, [
+      userMessage,
+      ...superseded,
+      authorityEvent,
+    ]);
+    return {
+      ...input,
+      existingEvents: appended.events,
+    };
   }
 }

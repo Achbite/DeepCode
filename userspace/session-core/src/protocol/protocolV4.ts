@@ -41,12 +41,17 @@ export function parseProposalEnvelope(input: ParseProposalEnvelopeInput): Propos
     sessionId: optionalString(envelope, 'sessionId') ?? input.sessionId,
     source: (optionalString(envelope, 'source') as ProposalEnvelopeSource | undefined) ?? input.source ?? 'llm',
     kind: kind as ProposalEnvelope['kind'],
+    responseLanguage: conversationLanguage(envelope.responseLanguage),
     narration: optionalString(envelope, 'narration'),
     payload: proposalPayload(envelope, kind),
     referencedResourcePacketRefs: optionalStringArray(envelope, 'referencedResourcePacketRefs'),
     referencedEvidenceRefs: optionalStringArray(envelope, 'referencedEvidenceRefs'),
     parserDiagnostics: envelope.parserDiagnostics,
   };
+}
+
+function conversationLanguage(value: unknown): ProposalEnvelope['responseLanguage'] {
+  return value === 'zh-CN' || value === 'en-US' ? value : undefined;
 }
 
 function proposalPayload(envelope: Record<string, unknown>, kind: string): unknown {

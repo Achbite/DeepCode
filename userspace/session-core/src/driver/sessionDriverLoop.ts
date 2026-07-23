@@ -44,8 +44,18 @@ import {
 } from './context/index.js';
 import {
   buildUserAuthorityFrame,
+  createSessionTurnAuthorityEvent,
+  hasLegacySessionTurnAuthority,
   latestExplicitUserContent,
+  latestSessionTurnAuthority,
 } from './context/userAuthorityFrame.js';
+import {
+  createSessionLanguageDecisionEvent,
+  decideConversationLanguageFromProvider,
+  nextConversationLanguageRevision,
+  normalizeHostLanguage,
+  resolveConversationLanguagePolicy,
+} from './context/conversationLanguagePolicy.js';
 import {
   AcceptedPlanReviewHandoffCoordinator,
   AcceptedPlanStaticSyntaxReviewCoordinator,
@@ -77,7 +87,7 @@ import {
   promptLedgerWireSemanticExchange,
 } from '../prompt/promptLedger.js';
 import { RunEngine } from './runEngine.js';
-import { diag, isEmptyResponseError, objectRecord, SessionDriverLoopError, stringValue, visibleLanguageForRequest } from './runtimeSupport.js';
+import { diag, isEmptyResponseError, objectRecord, SessionDriverLoopError, stringValue } from './runtimeSupport.js';
 import { AgentRunReactor } from './agentRunReactor.js';
 import {
   acceptedTaskPlanContextBuilder,
@@ -377,7 +387,6 @@ export class SessionDriverLoop {
         acceptedTaskPlanContextBuilder().build({ plan, interventionLevel, executionRoot }),
       recoverAcceptedPlanFromOverlay: (handlerInput, events, overlay) =>
         driverInteractionIndex.recoverAcceptedPlanFromOverlay(handlerInput, events, overlay),
-      visibleLanguageForRequest,
       userInputPipeline,
       interactionOverlayCodec,
       requirementProjection: requirementProjectionBuilder,
@@ -406,6 +415,7 @@ export class SessionDriverLoop {
         assistantProjectionBuilder.finalDiagnosticEvent(sessionId, content, ts, id),
       missingDecisionKindMessage: (kind) =>
         diag('decisionResolverMissing', `Decision kind "${kind}" is not yet connected to Session DecisionResolver.`, { kind }),
+      createError: (code, message) => new SessionDriverLoopError(code, message),
       resume: (resumeInput) => this.resumeRun(resumeInput),
       assembleReview: (reviewInput) => this.acceptedPlanReviewHandoffCoordinator.handoff(
         reviewInput as AcceptedPlanReviewHandoffRunInput<SessionPlanContext>
@@ -503,12 +513,50 @@ export class SessionDriverLoop {
       createId: (prefix) => this.agentRunReactor.id(prefix),
       append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
       collectQueued: (events, runId) => userGuidanceQueue.collectQueued(events, runId),
+      admitQueuedGuidance: async (state, current) => {
+        const resume = userGuidanceQueue.providerResume({
+          sessionId: state.sessionId,
+          events: current.events,
+          runId: state.runId,
+          taskId: state.userAuthorityFrame.turnAuthority.taskId,
+          stage: 'guidance_revision',
+          defaultHostLanguage: state.userAuthorityFrame.languagePolicy.hostLanguage,
+          promptEpochId: state.providerTurnFrame?.promptLedgerEpochId,
+          summary: providerStreamCoordinator.userGuidanceConsumedSummary(
+            state.userAuthorityFrame.effectiveLanguage
+          ),
+          now: () => this.agentRunReactor.ts(),
+          createId: (prefix) => this.agentRunReactor.id(prefix),
+        });
+        if (!resume.events.length) return current;
+        const appended = await this.agentRunReactor.append(state.sessionId, resume.events);
+        state.userAuthorityFrame = buildUserAuthorityFrame(
+          appended.events,
+          {
+            messageId: state.userAuthorityFrame.rootMessage.messageId,
+            content: state.userAuthorityFrame.rootMessage.content,
+            timestamp: state.userAuthorityFrame.rootMessage.timestamp,
+          },
+          state.userAuthorityFrame.autonomyMode,
+          { runId: state.runId }
+        );
+        state.userRequest = latestExplicitUserContent(state.userAuthorityFrame);
+        if (state.promptLedger && state.providerTurnFrame?.promptLedgerEpochId) {
+          appendPromptLedgerCurrentTurn({
+            state: state.promptLedger,
+            epochId: state.providerTurnFrame.promptLedgerEpochId,
+            authority: state.userAuthorityFrame,
+            createId: (prefix) => this.agentRunReactor.id(prefix),
+          });
+        }
+        return appended;
+      },
       transitionEvent: (transitionInput) =>
         assistantProjectionBuilder.guidanceRevisionTransitionEvent(
           transitionInput.sessionId,
           transitionInput.runId,
           transitionInput.guidanceIds,
-          transitionInput.userRequest,
+          transitionInput.language,
           transitionInput.ts,
           transitionInput.id
         ),
@@ -537,7 +585,7 @@ export class SessionDriverLoop {
           runId: guidanceInput.runId,
           appliedAtProviderStage: guidanceInput.appliedAtProviderStage,
           summary: providerStreamCoordinator.userGuidanceConsumedSummary(
-            visibleLanguageForRequest(guidanceInput.userRequest)
+            guidanceInput.language
           ),
           append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
           now: () => this.agentRunReactor.ts(),
@@ -766,7 +814,7 @@ export class SessionDriverLoop {
         ),
       onArtifactDraftBudgetExceeded: async (state, error) => {
         const reason = await this.artifactDraftReplanCoordinator.replan(state, error.message);
-        const content = state.userAuthorityFrame.outputLanguage === 'zh-CN'
+        const content = state.userAuthorityFrame.effectiveLanguage === 'zh-CN'
           ? '当前任务的产物总量超过 Kernel 草稿预算，Session 已保留审计事实并返回 Plan 阶段重新拆分任务。'
           : 'The current task exceeded the Kernel artifact budget. Session preserved the audit facts and returned to Plan for task-level replanning.';
         await this.agentRunReactor.append(state.sessionId, [
@@ -798,7 +846,7 @@ export class SessionDriverLoop {
       semanticDraftFlushMs: PROVIDER_REASONING_FLUSH_MS,
       visibleReasoningMaxChars: VISIBLE_REASONING_MAX_CHARS,
       streamCoordinator: providerStreamCoordinator,
-      visibleLanguageForRequest,
+      visibleLanguage: (state) => state.userAuthorityFrame.effectiveLanguage,
       providerActivity: (input) => driverActivityBuilder.providerActivity(input),
       conversationActivity: (input) => driverActivityBuilder.conversationActivity(input),
       emitProjectionDelta: (state, delta) => this.agentRunReactor.emitProjectionDelta(state, delta),
@@ -810,7 +858,42 @@ export class SessionDriverLoop {
       streamCoordinator: providerStreamCoordinator,
       streamRuntime: this.providerStreamRuntime,
       traceRecorder: providerTraceRecorder,
-      visibleLanguageForRequest,
+      visibleLanguage: (state) => state.userAuthorityFrame.effectiveLanguage,
+      admitLanguageDecision: async (state, decisionInput) => {
+        const policy = state.userAuthorityFrame.languagePolicy;
+        if (policy.status !== 'pending') return;
+        const decision = decideConversationLanguageFromProvider({
+          hostLanguage: policy.hostLanguage,
+          content: decisionInput.content,
+          toolCalls: decisionInput.toolCalls,
+        });
+        const appended = await this.agentRunReactor.append(state.sessionId, [
+          createSessionLanguageDecisionEvent({
+            sessionId: state.sessionId,
+            runId: state.runId,
+            turnId: state.userAuthorityFrame.turnAuthority.turnId,
+            revision: policy.revision,
+            status: decision.status,
+            responseLanguage: decision.responseLanguage,
+            decisionSource: decision.decisionSource,
+            sourceProviderRequestId: decisionInput.requestId,
+            sourceToolCallId: decision.sourceToolCallId,
+            eventId: this.agentRunReactor.id('session-language-decision'),
+            timestamp: this.agentRunReactor.ts(),
+          }),
+        ]);
+        state.userAuthorityFrame = buildUserAuthorityFrame(
+          appended.events,
+          {
+            messageId: state.userAuthorityFrame.rootMessage.messageId,
+            content: state.userAuthorityFrame.rootMessage.content,
+            timestamp: state.userAuthorityFrame.rootMessage.timestamp,
+          },
+          state.userAuthorityFrame.autonomyMode,
+          { runId: state.runId }
+        );
+        state.userRequest = latestExplicitUserContent(state.userAuthorityFrame);
+      },
       providerActivity: (input) => driverActivityBuilder.providerActivity(input),
       emitProjectionDelta: (state, delta) => this.agentRunReactor.emitProjectionDelta(state, delta),
       cacheTelemetryEvent: (input) => sessionProgressProjectionBuilder.cacheTelemetryEvent(input),
@@ -836,14 +919,14 @@ export class SessionDriverLoop {
       ...this.ports,
       consumeGuidanceMessages: async (state, stage) => {
         const current = await this.agentRunReactor.append(state.sessionId, []);
-        const language = visibleLanguageForRequest(state.userRequest);
+        const language = state.userAuthorityFrame.effectiveLanguage;
         const resume = userGuidanceQueue.providerResume({
           sessionId: state.sessionId,
           events: current.events,
           runId: state.runId,
           taskId: state.userAuthorityFrame.turnAuthority.taskId,
           stage,
-          outputLanguage: state.userAuthorityFrame.outputLanguage,
+          defaultHostLanguage: state.userAuthorityFrame.languagePolicy.hostLanguage,
           promptEpochId: state.providerTurnFrame?.promptLedgerEpochId,
           summary: providerStreamCoordinator.userGuidanceConsumedSummary(language),
           now: () => this.agentRunReactor.ts(),
@@ -858,7 +941,6 @@ export class SessionDriverLoop {
               content: state.userAuthorityFrame.rootMessage.content,
               timestamp: state.userAuthorityFrame.rootMessage.timestamp,
             },
-            visibleLanguageForRequest,
             state.userAuthorityFrame.autonomyMode,
             { runId: state.runId }
           );
@@ -906,7 +988,7 @@ export class SessionDriverLoop {
           runId: guidanceInput.runId,
           appliedAtProviderStage: guidanceInput.appliedAtProviderStage,
           summary: providerStreamCoordinator.userGuidanceConsumedSummary(
-            visibleLanguageForRequest(guidanceInput.userRequest)
+            guidanceInput.language
           ),
           append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
           now: () => this.agentRunReactor.ts(),
@@ -1082,7 +1164,21 @@ export class SessionDriverLoop {
   }
 
   async resolveDecision(input: SessionDecisionResolverInput): Promise<AgentSessionResult> {
-    return this.decisionResolver.resolve(input);
+    try {
+      return await this.decisionResolver.resolve(input);
+    } catch (error) {
+      const message = error instanceof SessionDriverLoopError ? error.message : String(error);
+      return this.agentRunReactor.append(input.sessionId, sessionFailureProjectionBuilder.internalFailureEvents({
+        sessionId: input.sessionId,
+        runId: input.runId ?? latestRunIdForFailure(input.existingEvents ?? []) ?? 'run-unavailable',
+        stage: 'decision_resolver',
+        code: error instanceof SessionDriverLoopError ? error.code : 'decision_resolver_failed',
+        message: `Session decision resolver failed: ${message}`,
+        reason: 'driver_failure',
+        ts: this.agentRunReactor.ts(),
+        id: this.agentRunReactor.id('decision-resolver-failed'),
+      }));
+    }
   }
 
   async runUserTurn(input: SessionDriverLoopInput): Promise<AgentSessionResult> {
@@ -1136,6 +1232,19 @@ export class SessionDriverLoop {
     input: SessionDriverLoopInput,
     mode: 'userTurn' | 'resumeRun' = 'userTurn'
   ): Promise<AgentSessionResult> {
+    const existingEvents = input.existingEvents ?? [];
+    if (hasLegacySessionTurnAuthority(existingEvents) && !latestSessionTurnAuthority(existingEvents)) {
+      return this.agentRunReactor.append(input.sessionId, sessionFailureProjectionBuilder.internalFailureEvents({
+        sessionId: input.sessionId,
+        runId: latestRunIdForFailure(existingEvents) ?? 'run-unavailable',
+        stage: 'run_engine',
+        code: 'session_language_policy_unavailable',
+        message: 'This Session uses turn authority v1 and cannot continue without ConversationLanguagePolicy v1.',
+        reason: 'driver_failure',
+        ts: this.agentRunReactor.ts(),
+        id: this.agentRunReactor.id('session-language-policy-unavailable'),
+      }));
+    }
     if (
       input.projectId
       && input.projectKind === 'folder'
@@ -1145,14 +1254,47 @@ export class SessionDriverLoop {
         || !(input.projectWorkingDirectory?.absolutePath ?? input.projectWorkingDirectory?.displayPath)
       )
     ) {
-      const events = input.appendUserMessage === false
-        ? []
-        : [this.agentRunReactor.event(input.sessionId, 'user_msg', {
+      const userMessage = input.appendUserMessage === false
+        ? undefined
+        : this.agentRunReactor.event(input.sessionId, 'user_msg', {
           content: input.content,
           attachments: input.attachments ?? [],
           channel: 'user',
           visibility: 'conversation',
-        })];
+        });
+      const events = userMessage ? [userMessage] : [];
+      if (userMessage) {
+        const previousAuthority = latestSessionTurnAuthority(existingEvents);
+        if (
+          previousAuthority
+          && resolveConversationLanguagePolicy(existingEvents, previousAuthority).status === 'pending'
+        ) {
+          events.push(createSessionLanguageDecisionEvent({
+            sessionId: previousAuthority.sessionId,
+            runId: previousAuthority.runId,
+            turnId: previousAuthority.turnId,
+            revision: previousAuthority.languagePolicy.revision,
+            status: 'superseded',
+            decisionSource: 'supersededByLaterUserInput',
+            eventId: this.agentRunReactor.id('session-language-superseded'),
+            timestamp: this.agentRunReactor.ts(),
+          }));
+        }
+        events.push(createSessionTurnAuthorityEvent({
+          sessionId: input.sessionId,
+          runId: this.agentRunReactor.id('project-root-unavailable-run'),
+          turnId: this.agentRunReactor.id('session-turn'),
+          taskId: this.agentRunReactor.id('session-task'),
+          messages: [{ messageId: userMessage.id, content: input.content }],
+          relation: 'newTask',
+          boundAtHookRef: 'run.projectRootUnavailable',
+          languageRevision: nextConversationLanguageRevision(existingEvents),
+          hostLanguage: normalizeHostLanguage(input.hostLanguage),
+          previousTaskId: previousAuthority?.taskId,
+          eventId: this.agentRunReactor.id('session-turn-authority'),
+          timestamp: this.agentRunReactor.ts(),
+        }));
+      }
       events.push(assistantProjectionBuilder.finalDiagnosticEvent(
         input.sessionId,
         {

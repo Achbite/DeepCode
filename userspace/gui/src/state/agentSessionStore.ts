@@ -47,7 +47,7 @@ import {
 } from '../services/runtimeAdapter';
 import type { AgentRunResult, AgentRunStreamEvent, StartAgentRunRequest } from '../services/apiClient';
 import { useSettingsStore } from './settingsStore';
-import { activeT } from '../i18n';
+import { activeT, normalizeUiLanguage } from '../i18n';
 import { useWorkspaceStore } from './workspaceStore';
 import { projectionDeliveryDiagnostics } from '../services/projectionDeliveryDiagnostics';
 
@@ -391,7 +391,13 @@ async function startAndWaitAgentRun(
     onEvents?: (events: AgentEvent[]) => void;
   } = {}
 ): Promise<AgentRunResult> {
-  const started = await startAgentRun(sessionId, request);
+  const admittedRequest: StartAgentRunRequest = {
+    ...request,
+    hostLanguage: request.hostLanguage ?? normalizeUiLanguage(
+      useSettingsStore.getState().effectiveSettings['workbench.language']
+    ),
+  };
+  const started = await startAgentRun(sessionId, admittedRequest);
   if (!started.ok || !started.data) {
     throw new Error(started.message ?? started.error ?? 'Shared session run start failed');
   }
@@ -1017,6 +1023,9 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       const result = await submitAgentRunGuidance(session.id, activeRunId, {
         guidance: trimmed,
         attachments,
+        hostLanguage: normalizeUiLanguage(
+          useSettingsStore.getState().effectiveSettings['workbench.language']
+        ),
       });
       if (result.ok && result.data) {
         set({

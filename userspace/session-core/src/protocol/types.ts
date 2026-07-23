@@ -1,3 +1,5 @@
+import type { ConversationLanguage } from '@deepcode/protocol';
+
 export interface ContentBlockDraft {
   blockId: string;
   targetPath: string;
@@ -174,6 +176,7 @@ export interface ProposalEnvelope {
   sessionId?: string;
   source: ProposalEnvelopeSource;
   kind: ProposalEnvelopeKind;
+  responseLanguage?: ConversationLanguage;
   narration?: string;
   payload: unknown;
   referencedResourcePacketRefs: string[];

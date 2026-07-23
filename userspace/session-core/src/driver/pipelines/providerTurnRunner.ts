@@ -32,6 +32,7 @@ import {
   providerAttemptKindForStage,
   type AdmittedProviderRequest,
 } from './admittedProviderRequest.js';
+import { withConversationLanguageFrame } from '../context/conversationLanguagePolicy.js';
 
 export interface ProviderTurnRunnerState extends ProviderStreamRuntimeState {
   cachePlan?: PromptCachePlan;
@@ -67,12 +68,18 @@ export interface ProviderTurnRunnerDependencies<TState extends ProviderTurnRunne
   streamCoordinator: ProviderStreamCoordinator;
   streamRuntime: ProviderStreamRuntime<TState>;
   traceRecorder: ProviderTraceRecorder;
-  visibleLanguageForRequest(userRequest: string): ProviderStreamVisibleLanguage;
+  visibleLanguage(state: TState): ProviderStreamVisibleLanguage;
+  admitLanguageDecision?(state: TState, input: {
+    requestId: string;
+    content: string;
+    toolCalls: readonly NativeToolCallProposal[];
+  }): Promise<void>;
   providerActivity(input: {
     runId: string;
     userRequest: string;
     stage: string;
     status: 'running' | 'completed';
+    language: ProviderStreamVisibleLanguage;
   }): AgentConversationActivity;
   emitProjectionDelta(state: TState, delta: Omit<ProjectionDelta, 'sessionId' | 'runId' | 'turnId' | 'seq'>): Promise<void>;
   cacheTelemetryEvent(input: {
@@ -117,16 +124,25 @@ export class ProviderTurnRunner<TState extends ProviderTurnRunnerState> {
     const options = input.options ?? {};
     const { state, stage, ports } = input;
     const jsonModeMessages = this.dependencies.jsonModeCoordinator.ensureMessages(input.messages, options.responseFormat);
+    const languagePolicy = state.userAuthorityFrame?.languagePolicy;
+    if (!languagePolicy) {
+      throw this.dependencies.createError(
+        'session_language_policy_unavailable',
+        'Provider admission requires a persisted ConversationLanguagePolicy.'
+      );
+    }
+    const admittedMessages = withConversationLanguageFrame(jsonModeMessages, languagePolicy);
     const providerCallHookTrace = await this.runProviderCallHook(state);
     const primaryRequestId = this.dependencies.createId(`provider-request-${stage}`);
     const primaryAdmitted = admitProviderRequest({
       requestId: primaryRequestId,
       attemptKind: providerAttemptKindForStage(stage),
       stage,
+      languageRevision: languagePolicy.revision,
       transportRequest: {
         requestId: primaryRequestId,
         profileId: input.profileId,
-        messages: jsonModeMessages,
+        messages: admittedMessages,
         responseFormat: options.responseFormat,
         tools: options.tools,
         stream: Boolean(ports.llmChatStream),
@@ -141,7 +157,11 @@ export class ProviderTurnRunner<TState extends ProviderTurnRunnerState> {
     const cacheTopology = providerRequestCacheTopology(
       state,
       primaryAdmitted.transportRequest.messages,
-      requestOptions(primaryAdmitted)
+      requestOptions(primaryAdmitted),
+      {
+        requestId: primaryAdmitted.requestId,
+        languageRevision: primaryAdmitted.languageRevision,
+      }
     );
     await this.dependencies.traceRecorder.append(state, `${stage}.request`, {
       admittedRequest: admittedProviderRequestSnapshot(primaryAdmitted),
@@ -166,8 +186,14 @@ export class ProviderTurnRunner<TState extends ProviderTurnRunnerState> {
       status: ports.llmChatStream ? 'streaming' : 'running',
       channel: 'progress',
       source: 'session',
-      summary: this.dependencies.streamCoordinator.stageSummary(stage, 'request', this.dependencies.visibleLanguageForRequest(state.userRequest)),
-      activity: this.dependencies.providerActivity({ runId: state.runId, userRequest: state.userRequest, stage, status: 'running' }),
+      summary: this.dependencies.streamCoordinator.stageSummary(stage, 'request', this.dependencies.visibleLanguage(state)),
+      activity: this.dependencies.providerActivity({
+        runId: state.runId,
+        userRequest: state.userRequest,
+        stage,
+        status: 'running',
+        language: this.dependencies.visibleLanguage(state),
+      }),
     });
     this.dependencies.streamRuntime.beginProviderCall(state, stage, primaryAdmitted.requestId);
     await this.appendWireRequest(state, primaryAdmitted, ports);
@@ -214,6 +240,7 @@ export class ProviderTurnRunner<TState extends ProviderTurnRunnerState> {
         parentRequestId: primaryAdmitted.requestId,
         attemptKind: 'streamFallback',
         stage: `${stage}.streamFallback`,
+        languageRevision: languagePolicy.revision,
         transportRequest: {
           ...primaryAdmitted.transportRequest,
           requestId: fallbackRequestId,
@@ -292,6 +319,7 @@ export class ProviderTurnRunner<TState extends ProviderTurnRunnerState> {
         requestId: effectiveAdmitted.requestId,
         parentRequestId: effectiveAdmitted.parentRequestId,
         attemptKind: effectiveAdmitted.attemptKind,
+        languageRevision: effectiveAdmitted.languageRevision,
         providerPayloadDigest: effectiveAdmitted.providerPayloadDigest,
         transportDigest: effectiveAdmitted.transportDigest,
         sessionId: state.sessionId,
@@ -328,8 +356,14 @@ export class ProviderTurnRunner<TState extends ProviderTurnRunnerState> {
       status: 'completed',
       channel: 'progress',
       source: 'provider',
-      summary: this.dependencies.streamCoordinator.stageSummary(stage, 'response', this.dependencies.visibleLanguageForRequest(state.userRequest)),
-      activity: this.dependencies.providerActivity({ runId: state.runId, userRequest: state.userRequest, stage, status: 'completed' }),
+      summary: this.dependencies.streamCoordinator.stageSummary(stage, 'response', this.dependencies.visibleLanguage(state)),
+      activity: this.dependencies.providerActivity({
+        runId: state.runId,
+        userRequest: state.userRequest,
+        stage,
+        status: 'completed',
+        language: this.dependencies.visibleLanguage(state),
+      }),
     });
     const content = stripProviderPartFrames(result.data.assistantMessage?.content
       ?? result.data.chunks
@@ -359,6 +393,11 @@ export class ProviderTurnRunner<TState extends ProviderTurnRunnerState> {
       if (providerCommitEvents.length > 0) await ports.appendEvents(state.sessionId, providerCommitEvents);
       throw error;
     }
+    await this.dependencies.admitLanguageDecision?.(state, {
+      requestId: effectiveAdmitted.requestId,
+      content,
+      toolCalls,
+    });
     const semanticFailure = await this.dependencies.streamRuntime.finalizeSemanticDrafts(
       state,
       stage,
@@ -431,6 +470,7 @@ export class ProviderTurnRunner<TState extends ProviderTurnRunnerState> {
       recordId: admitted.requestId,
       parentRequestId: admitted.parentRequestId,
       attemptKind: admitted.attemptKind,
+      languageRevision: admitted.languageRevision,
       sessionId: state.sessionId,
       runId: state.runId,
       profileId: admitted.transportRequest.profileId ?? epoch.profileId,
@@ -503,7 +543,8 @@ function isProviderRequestIdentityError(code: string | undefined): boolean {
 export function providerRequestCacheTopology(
   state: ProviderTurnRunnerState,
   messages: LlmChatRequest['messages'],
-  options: Pick<LlmChatRequest, 'responseFormat' | 'tools'>
+  options: Pick<LlmChatRequest, 'responseFormat' | 'tools'>,
+  identity?: { requestId?: string; languageRevision?: number }
 ): Record<string, unknown> {
   const profileId = state.providerTurnFrame?.snapshot?.semanticProfileId ?? 'unknown';
   const requestText = providerRequestText(messages, options);
@@ -534,6 +575,8 @@ export function providerRequestCacheTopology(
   };
   state.providerRequestCacheHistory = history;
   return {
+    requestId: identity?.requestId,
+    languageRevision: identity?.languageRevision,
     semanticProfileId: profileId,
     systemHash: state.providerTurnFrame?.snapshot?.systemHash,
     toolSchemaHash: state.providerTurnFrame?.snapshot?.toolSchemaHash,

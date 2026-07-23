@@ -40,6 +40,7 @@ pub(crate) fn host_bridge_request(
     intervention_level: Option<String>,
     project_memory_mode: String,
     autonomy_mode: String,
+    host_language: String,
     project_context: Option<&Value>,
 ) -> Value {
     let op = body.op.as_deref().unwrap_or_else(|| {
@@ -101,12 +102,40 @@ pub(crate) fn host_bridge_request(
         "interventionLevel": intervention_level,
         "projectMemoryMode": project_memory_mode,
         "autonomyMode": autonomy_mode,
+        "hostLanguage": host_language,
         "decisionKind": body.decision_kind.clone(),
         "decision": body.decision.clone(),
         "guidance": body.guidance.clone(),
         "runId": body.run_id.clone(),
         "targetId": body.target_id.clone()
     })
+}
+
+pub(crate) fn normalize_host_language(
+    request: Option<&str>,
+    setting: Option<String>,
+) -> (String, &'static str) {
+    if matches!(request, Some("zh-CN" | "en-US")) {
+        return (request.unwrap_or("zh-CN").to_string(), "request");
+    }
+    if matches!(setting.as_deref(), Some("zh-CN" | "en-US")) {
+        return (
+            setting.unwrap_or_else(|| "zh-CN".to_string()),
+            if request.is_some() {
+                "daemonSettingAfterInvalidRequest"
+            } else {
+                "daemonSetting"
+            },
+        );
+    }
+    (
+        "zh-CN".to_string(),
+        if request.is_some() {
+            "defaultAfterInvalidRequest"
+        } else {
+            "default"
+        },
+    )
 }
 
 pub(crate) fn authoritative_project_run_context(

@@ -32,6 +32,7 @@ pub(crate) struct AgentSessionRunRequest {
     pub(crate) guidance: Option<String>,
     pub(crate) run_id: Option<String>,
     pub(crate) target_id: Option<String>,
+    pub(crate) host_language: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -134,6 +135,30 @@ pub(crate) async fn agent_session_run_start(
         .clone()
         .or_else(|| user_setting_string(&state, "agent.permissions.autonomyMode"))
         .unwrap_or_else(|| "strict".to_string());
+    let (host_language, host_language_source) = normalize_host_language(
+        body.host_language.as_deref(),
+        user_setting_string(&state, "workbench.language"),
+    );
+    if host_language_source != "request" {
+        append_session_projection(
+            &state,
+            &session_id,
+            vec![agent_event(
+                &session_id,
+                "workflow_stage",
+                json!({
+                    "stage": "session.language.host_fallback",
+                    "status": "completed",
+                    "hostLanguage": host_language.clone(),
+                    "source": host_language_source,
+                    "channel": "progress",
+                    "visibility": "hidden",
+                    "presentation": "traceOnly"
+                }),
+                &now_text(),
+            )],
+        );
+    }
     let request = host_bridge_request(
         &session_id,
         &run_id,
@@ -142,6 +167,7 @@ pub(crate) async fn agent_session_run_start(
         intervention_level,
         project_memory_mode,
         autonomy_mode,
+        host_language,
         project_context.as_ref(),
     );
     let worker_state = state.clone();
@@ -271,6 +297,10 @@ pub(crate) async fn agent_session_run_guidance(
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    let (host_language, host_language_source) = normalize_host_language(
+        body.get("hostLanguage").and_then(Value::as_str),
+        user_setting_string(&state, "workbench.language"),
+    );
     let guidance_id = format!("guidance-{}", now_millis());
     append_session_projection(
         &state,
@@ -288,6 +318,8 @@ pub(crate) async fn agent_session_run_guidance(
                 "targetInteractionKind": "runningRunGuidance",
                 "effectiveCheckpoint": "nextProviderCall",
                 "checkpointKind": "nextProviderCall",
+                "hostLanguage": host_language,
+                "hostLanguageSource": host_language_source,
                 "status": "queued",
                 "summary": "用户补充引导已记录，将在下一次 provider checkpoint 生效。",
                 "channel": "user",

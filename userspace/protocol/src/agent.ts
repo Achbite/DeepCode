@@ -256,6 +256,7 @@ export type AgentEventKind =
   | 'user_msg'
   | 'user_guidance'
   | 'session_turn_authority'
+  | 'session_language_decision'
   | 'assistant_msg'
   | 'cache_telemetry'
   | 'requirement_confirmation'
@@ -402,8 +403,35 @@ export interface AgentEvent {
 
 export type SessionTurnAuthorityRelation = 'newTask' | 'interactionContinuation';
 
+export type ConversationLanguage = 'zh-CN' | 'en-US';
+
+export type ConversationLanguagePolicyStatus =
+  | 'pending'
+  | 'resolved'
+  | 'fallback'
+  | 'superseded';
+
+export type ConversationLanguageDecisionSource =
+  | 'modelSemanticDirective'
+  | 'hostFallbackMissing'
+  | 'hostFallbackInvalid'
+  | 'supersededByLaterUserInput';
+
+export interface ConversationLanguagePolicy {
+  schemaVersion: 'deepcode.session.conversation-language-policy.v1';
+  revision: number;
+  sourceTurnId: string;
+  sourceMessageIds: string[];
+  hostLanguage: ConversationLanguage;
+  status: ConversationLanguagePolicyStatus;
+  language?: ConversationLanguage;
+  decisionSource?: ConversationLanguageDecisionSource;
+  sourceProviderRequestId?: string;
+  sourceToolCallId?: string;
+}
+
 export interface SessionTurnAuthorityPayload {
-  schemaVersion: 'deepcode.session.turn-authority.v1';
+  schemaVersion: 'deepcode.session.turn-authority.v2';
   sessionId: string;
   runId: string;
   turnId: string;
@@ -412,10 +440,24 @@ export interface SessionTurnAuthorityPayload {
   sourceMessageHashes: string[];
   relation: SessionTurnAuthorityRelation;
   boundAtHookRef: string;
-  outputLanguage: string;
+  languagePolicy: ConversationLanguagePolicy;
   promptEpochId?: string;
   previousTaskId?: string;
   authorityHash: string;
+}
+
+export interface SessionLanguageDecisionPayload {
+  schemaVersion: 'deepcode.session.language-decision.v1';
+  sessionId: string;
+  runId: string;
+  turnId: string;
+  revision: number;
+  status: Exclude<ConversationLanguagePolicyStatus, 'pending'>;
+  responseLanguage?: ConversationLanguage;
+  decisionSource: ConversationLanguageDecisionSource;
+  sourceProviderRequestId?: string;
+  sourceToolCallId?: string;
+  decisionHash: string;
 }
 
 export type AgentTimelineBlockKind =

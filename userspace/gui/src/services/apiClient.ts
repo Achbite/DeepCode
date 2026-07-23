@@ -68,6 +68,7 @@ import type {
   KernelHostInspectionQuery,
   KernelHostInspectionResult,
   ProjectionDeliveryRecord,
+  ConversationLanguage,
 } from '@deepcode/protocol';
 import { activeT } from '../i18n';
 import { getKernelApiBase } from './hostTarget';
@@ -97,6 +98,7 @@ export interface StartAgentRunRequest {
   guidance?: string;
   runId?: string;
   targetId?: string;
+  hostLanguage?: ConversationLanguage;
 }
 
 export interface AgentRunStatus {
@@ -906,7 +908,7 @@ export function cancelAgentRunById(
 export function submitAgentRunGuidance(
   sessionId: string,
   runId: string,
-  request: { guidance: string; attachments?: unknown[] }
+  request: { guidance: string; attachments?: unknown[]; hostLanguage?: ConversationLanguage }
 ): Promise<ApiResponse<AgentRunResult>> {
   return sendJson<AgentRunResult>(
     `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/runs/${encodeURIComponent(runId)}/guidance`,

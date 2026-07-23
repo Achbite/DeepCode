@@ -7,6 +7,7 @@ import type {
   AgentWorkspaceBinding,
   AppendAgentEventsRequest,
   ApiResponse,
+  ConversationLanguage,
   KernelCommandEnvelope,
   KernelReply,
   LlmChatRequest,
@@ -65,6 +66,7 @@ interface HostBridgeRequest {
   guidance?: string;
   runId?: string;
   targetId?: string;
+  hostLanguage?: ConversationLanguage;
 }
 
 interface HostBridgeResult {
@@ -147,6 +149,7 @@ async function runAsk(request: HostBridgeRequest): Promise<HostBridgeResult> {
       reviewContinuationMode: request.reviewContinuationMode,
       interventionLevel: request.interventionLevel,
       autonomyMode: request.autonomyMode,
+      hostLanguage: request.hostLanguage,
     });
     await persistMemoryArchive(apiBase, result.session.id, result.events ?? [], binding, result.session, request.projectMemoryMode);
     const timeline = projection.buildTimeline(result.events ?? []);
@@ -210,6 +213,7 @@ async function resolveDecision(request: HostBridgeRequest): Promise<HostBridgeRe
       interventionLevel: request.interventionLevel,
       autonomyMode: request.autonomyMode,
       projectMemoryMode: request.projectMemoryMode,
+      hostLanguage: request.hostLanguage,
     });
     await persistMemoryArchive(apiBase, result.session.id, result.events ?? [], binding, result.session, request.projectMemoryMode);
     const timeline = projection.buildTimeline(result.events ?? []);

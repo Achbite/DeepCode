@@ -420,6 +420,7 @@ impl TuiApp {
             return;
         };
         let mut request = StartAgentRunRequest::ask(prompt.to_string());
+        request.host_language = Some(deepcode_kernel_client::terminal_host_language());
         request.workspace_path = self.workspace_path();
         request.no_workspace = Some(self.host.no_workspace);
         self.start_run_request(RunOperation::Ask, session_id.clone(), request)
@@ -440,7 +441,13 @@ impl TuiApp {
         self.status = format!("API {} · guidance queued", self.client.base_url());
         match self
             .client
-            .submit_agent_run_guidance(&session_id, &run_id, guidance.to_string(), Vec::new())
+            .submit_agent_run_guidance(
+                &session_id,
+                &run_id,
+                guidance.to_string(),
+                Vec::new(),
+                Some(deepcode_kernel_client::terminal_host_language()),
+            )
             .await
         {
             Ok(result) => self.apply_run_snapshot(&result).await,
@@ -534,6 +541,7 @@ impl TuiApp {
             return;
         };
         let mut request = StartAgentRunRequest::resolve_decision(kind, decision);
+        request.host_language = Some(deepcode_kernel_client::terminal_host_language());
         request.run_id = run_id;
         request.target_id = target_id;
         request.guidance = guidance;

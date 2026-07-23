@@ -1,4 +1,4 @@
-import type { AgentEvent } from '@deepcode/protocol';
+import type { AgentEvent, ConversationLanguage } from '@deepcode/protocol';
 import type { ProposalEnvelope } from '../../protocol/types.js';
 import type { AcceptedTaskPlanExecutionRoot } from '../../accepted-plan/types.js';
 import type { InteractionOverlayContext } from '../pipelines/interactionOverlayCodec.js';
@@ -21,6 +21,7 @@ export interface PlanContext {
   taskPlan?: Record<string, unknown>;
   interactionOverlay?: InteractionOverlayContext;
   executionRoot?: AcceptedTaskPlanExecutionRoot;
+  responseLanguage?: ConversationLanguage;
 }
 
 export interface PlanContextIndexPorts {
@@ -92,6 +93,7 @@ export class PlanContextIndex {
       taskPlan,
       interactionOverlay: this.ports.interactionOverlayFromPayload(payload),
       executionRoot: this.ports.executionRootFromPayload(payload),
+      responseLanguage: conversationLanguage(payload.responseLanguage),
     };
   }
 
@@ -103,6 +105,7 @@ export class PlanContextIndex {
       sessionId: plan.sessionId,
       source: 'system',
       kind: 'actionBundle',
+      responseLanguage: plan.responseLanguage,
       narration: plan.userPlan,
       payload: {
         userPlan: plan.userPlan,
@@ -200,6 +203,10 @@ export class PlanContextIndex {
     }
     return false;
   }
+}
+
+function conversationLanguage(value: unknown): ConversationLanguage | undefined {
+  return value === 'zh-CN' || value === 'en-US' ? value : undefined;
 }
 
 function objectRecord(value: unknown): Record<string, unknown> | undefined {

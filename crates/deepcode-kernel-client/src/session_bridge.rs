@@ -56,6 +56,7 @@ pub struct StartAgentRunRequest {
     pub guidance: Option<String>,
     pub run_id: Option<String>,
     pub target_id: Option<String>,
+    pub host_language: Option<String>,
 }
 
 impl StartAgentRunRequest {
@@ -124,6 +125,22 @@ pub fn terminal_workspace_scope(path: Option<&str>) -> Option<TerminalWorkspaceS
     })
 }
 
+pub fn terminal_host_language() -> String {
+    let locale = ["LC_ALL", "LC_MESSAGES", "LANG"]
+        .into_iter()
+        .find_map(|name| {
+            std::env::var(name)
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        });
+    match locale {
+        Some(value) if value.to_ascii_lowercase().starts_with("zh") => "zh-CN".to_string(),
+        Some(_) => "en-US".to_string(),
+        None => "zh-CN".to_string(),
+    }
+}
+
 pub fn session_host_bridge_path() -> Option<PathBuf> {
     find_session_host_bridge()
 }
@@ -156,6 +173,7 @@ pub struct SessionHostBridgeRequest {
     pub guidance: Option<String>,
     pub run_id: Option<String>,
     pub target_id: Option<String>,
+    pub host_language: Option<String>,
 }
 
 impl SessionHostBridgeRequest {
@@ -182,6 +200,7 @@ impl SessionHostBridgeRequest {
             guidance: None,
             run_id: None,
             target_id: None,
+            host_language: None,
         }
     }
 
@@ -208,6 +227,7 @@ impl SessionHostBridgeRequest {
             guidance: None,
             run_id: None,
             target_id: None,
+            host_language: None,
         }
     }
 }

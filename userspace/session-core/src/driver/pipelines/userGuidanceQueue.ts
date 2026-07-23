@@ -1,12 +1,22 @@
 import type {
   AgentEvent,
   AgentSessionResult,
+  ConversationLanguage,
   LlmChatRequest,
   SessionTurnAuthorityPayload,
 } from '@deepcode/protocol';
 import type { UserGuidanceEvent } from '../../context/index.js';
-import { createSessionTurnAuthorityEvent } from '../context/userAuthorityFrame.js';
-import type { VisibleLanguage } from '../runtimeSupport.js';
+import {
+  createSessionTurnAuthorityEvent,
+  latestSessionTurnAuthority,
+} from '../context/userAuthorityFrame.js';
+import {
+  createSessionLanguageDecisionEvent,
+  nextConversationLanguageRevision,
+  normalizeConversationLanguage,
+  normalizeHostLanguage,
+  resolveConversationLanguagePolicy,
+} from '../context/conversationLanguagePolicy.js';
 
 export interface UserGuidanceQueueProviderResumeInput {
   sessionId: string;
@@ -14,7 +24,7 @@ export interface UserGuidanceQueueProviderResumeInput {
   runId: string;
   taskId: string;
   stage: string;
-  outputLanguage: VisibleLanguage;
+  defaultHostLanguage?: ConversationLanguage;
   promptEpochId?: string;
   summary: string;
   now(): string;
@@ -51,7 +61,7 @@ export interface UserGuidanceQueueAppendConsumedInput {
 }
 
 export class UserGuidanceQueue {
-  collectQueued(events: AgentEvent[], runId?: string): UserGuidanceEvent[] {
+  collectQueued(events: AgentEvent[], runId?: string): CollectedUserGuidanceEvent[] {
     const consumedIds = new Set<string>();
     for (const event of events.slice(-120)) {
       if (event.kind !== 'user_guidance') continue;
@@ -60,7 +70,7 @@ export class UserGuidanceQueue {
       consumedIds.add(stringValue(payload.guidanceId) ?? event.id);
     }
 
-    const collected: UserGuidanceEvent[] = [];
+    const collected: CollectedUserGuidanceEvent[] = [];
     const seen = new Set<string>();
     for (const event of events.slice(-80)) {
       if (event.kind !== 'user_guidance') continue;
@@ -81,6 +91,7 @@ export class UserGuidanceQueue {
         content,
         source: 'user',
         checkpointKind: 'nextProviderCall',
+        hostLanguage: normalizeConversationLanguage(payload.hostLanguage),
       });
     }
     return collected.slice(-8);
@@ -91,24 +102,65 @@ export class UserGuidanceQueue {
     if (guidance.length === 0) {
       return { guidance, events: [], messages: [] };
     }
-    const authorityEvent = createSessionTurnAuthorityEvent({
-      sessionId: input.sessionId,
-      runId: input.runId,
-      turnId: input.createId('session-turn'),
-      taskId: input.taskId,
-      messages: guidance.map((item) => ({ messageId: item.id, content: item.content })),
-      relation: 'interactionContinuation',
-      boundAtHookRef: `provider.${input.stage}`,
-      outputLanguage: input.outputLanguage,
-      promptEpochId: input.promptEpochId,
-      eventId: input.createId('session-turn-authority'),
-      timestamp: input.now(),
-    });
-    const authority = authorityEvent.payload as SessionTurnAuthorityPayload;
+    const authorityEvents: AgentEvent[] = [];
+    let revision = nextConversationLanguageRevision(input.events);
+    let authority: SessionTurnAuthorityPayload | undefined;
+    const previousAuthority = latestSessionTurnAuthority(input.events, input.runId);
+    if (
+      previousAuthority
+      && resolveConversationLanguagePolicy(input.events, previousAuthority).status === 'pending'
+    ) {
+      authorityEvents.push(createSessionLanguageDecisionEvent({
+        sessionId: previousAuthority.sessionId,
+        runId: previousAuthority.runId,
+        turnId: previousAuthority.turnId,
+        revision: previousAuthority.languagePolicy.revision,
+        status: 'superseded',
+        decisionSource: 'supersededByLaterUserInput',
+        eventId: input.createId('session-language-superseded'),
+        timestamp: input.now(),
+      }));
+    }
+    for (let index = 0; index < guidance.length; index += 1) {
+      const item = guidance[index] as CollectedUserGuidanceEvent;
+      const turnId = input.createId('session-turn');
+      const authorityEvent = createSessionTurnAuthorityEvent({
+        sessionId: input.sessionId,
+        runId: input.runId,
+        turnId,
+        taskId: input.taskId,
+        messages: [{ messageId: item.id, content: item.content }],
+        relation: 'interactionContinuation',
+        boundAtHookRef: `provider.${input.stage}`,
+        languageRevision: revision,
+        hostLanguage: item.hostLanguage ?? normalizeHostLanguage(input.defaultHostLanguage),
+        promptEpochId: input.promptEpochId,
+        eventId: input.createId('session-turn-authority'),
+        timestamp: input.now(),
+      });
+      authorityEvents.push(authorityEvent);
+      authority = authorityEvent.payload as SessionTurnAuthorityPayload;
+      if (index < guidance.length - 1) {
+        authorityEvents.push(createSessionLanguageDecisionEvent({
+          sessionId: input.sessionId,
+          runId: input.runId,
+          turnId,
+          revision,
+          status: 'superseded',
+          decisionSource: 'supersededByLaterUserInput',
+          eventId: input.createId('session-language-superseded'),
+          timestamp: input.now(),
+        }));
+      }
+      revision += 1;
+    }
+    if (!authority) {
+      return { guidance: [], events: [], messages: [] };
+    }
     return {
       guidance,
       events: [
-        authorityEvent,
+        ...authorityEvents,
         ...this.consumedEvents({
           sessionId: input.sessionId,
           events: input.events,
@@ -130,7 +182,7 @@ export class UserGuidanceQueue {
             relation: authority.relation,
             sourceMessageIds: authority.sourceMessageIds,
             sourceMessageHashes: authority.sourceMessageHashes,
-            outputLanguage: authority.outputLanguage,
+            languagePolicy: authority.languagePolicy,
             authorityHash: authority.authorityHash,
           }),
         },
@@ -200,6 +252,10 @@ export class UserGuidanceQueue {
     });
     return events.length > 0 ? input.append(input.sessionId, events) : input.result;
   }
+}
+
+interface CollectedUserGuidanceEvent extends UserGuidanceEvent {
+  hostLanguage?: ConversationLanguage;
 }
 
 function objectRecord(value: unknown): Record<string, unknown> | undefined {

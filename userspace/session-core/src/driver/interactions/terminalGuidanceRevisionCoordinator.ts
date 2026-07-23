@@ -1,6 +1,7 @@
 import type {
   AgentEvent,
   AgentSessionResult,
+  ConversationLanguage,
 } from '@deepcode/protocol';
 import type { ProposalEnvelope } from '../../protocol/types.js';
 import type {
@@ -55,6 +56,9 @@ export interface TerminalGuidanceRevisionState extends SessionDriverProviderRunt
   cachePlan?: PromptCachePlan;
   contextAssembly?: ContextAssemblyRecord;
   semanticDirectiveErrorSummary?: string;
+  userAuthorityFrame: {
+    effectiveLanguage: ConversationLanguage;
+  };
 }
 
 export interface TerminalGuidanceRevisionCoordinatorPorts<
@@ -69,7 +73,7 @@ export interface TerminalGuidanceRevisionCoordinatorPorts<
     sessionId: string;
     runId: string;
     guidanceIds: string[];
-    userRequest: string;
+    language: ConversationLanguage;
     ts: string;
     id: string;
   }): AgentEvent;
@@ -109,8 +113,10 @@ export interface TerminalGuidanceRevisionCoordinatorPorts<
     contextAssembly?: ContextAssemblyRecord;
     runId: string;
     userRequest: string;
+    language: ConversationLanguage;
     appliedAtProviderStage: string;
   }): Promise<AgentSessionResult>;
+  admitQueuedGuidance(state: State, result: AgentSessionResult): Promise<AgentSessionResult>;
   runRevision(
     input: Input,
     state: State,
@@ -139,6 +145,7 @@ export class TerminalGuidanceRevisionCoordinator<
     let result = await this.ports.append(state.sessionId, []);
     const guidance = this.ports.collectQueued(result.events, state.runId);
     if (guidance.length === 0) return null;
+    result = await this.ports.admitQueuedGuidance(state, result);
 
     result = await this.ports.append(state.sessionId, [
       ...takeProviderCommitEvents(state),
@@ -146,7 +153,7 @@ export class TerminalGuidanceRevisionCoordinator<
         sessionId: state.sessionId,
         runId: state.runId,
         guidanceIds: guidance.map((item) => item.id),
-        userRequest: input.content,
+        language: state.userAuthorityFrame.effectiveLanguage,
         ts: this.ports.now(),
         id: this.ports.createId('guidance-revision-transition'),
       }),
@@ -183,6 +190,7 @@ export class TerminalGuidanceRevisionCoordinator<
       contextAssembly: assembledContext.contextAssembly,
       runId: state.runId,
       userRequest: input.content,
+      language: state.userAuthorityFrame.effectiveLanguage,
       appliedAtProviderStage: 'guidance_revision',
     });
 

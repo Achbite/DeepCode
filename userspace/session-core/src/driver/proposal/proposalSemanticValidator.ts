@@ -60,7 +60,7 @@ export class ProposalSemanticValidator {
     goal?: string;
     actions: Record<string, unknown>[];
     existingUserPlan?: string;
-    outputLanguage?: string;
+    responseLanguage?: string;
   }): string {
     const targets = input.actions.map((action) => this.ports.actionFileTargetPath(action)).filter((target): target is string => Boolean(target));
     const actionLines = input.actions.map((action, index) => {
@@ -76,7 +76,7 @@ export class ProposalSemanticValidator {
       ? actionLines.slice(0, 12).map((action) => `- ${action.toolId}: ${action.target} - ${action.description}`)
       : ['- Submit the current accepted-task side-effect batch to Kernel review.'];
     const summary = input.goal ?? input.existingUserPlan ?? 'Execute the current accepted-task action bundle.';
-    if ((input.outputLanguage ?? '').toLowerCase().startsWith('zh')) {
+    if (input.responseLanguage === 'zh-CN') {
       return [
         '# 执行批次',
         '',
@@ -205,7 +205,7 @@ export class ProposalSemanticValidator {
           goal: bundle.goal,
           actions: bundle.actions as unknown as Record<string, unknown>[],
           existingUserPlan: userPlan,
-          outputLanguage: stringValue(payload.outputLanguage),
+          responseLanguage: proposal.responseLanguage,
         });
         payload.userPlan = generatedUserPlan;
         userPlan = generatedUserPlan.trim();

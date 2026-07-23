@@ -1,4 +1,8 @@
-import type { AgentEvent, KernelPlanAuthorizationReview } from '@deepcode/protocol';
+import type {
+  AgentEvent,
+  ConversationLanguage,
+  KernelPlanAuthorizationReview,
+} from '@deepcode/protocol';
 import type { ActionBundleDraft, ProposalEnvelope } from '../../protocol/types.js';
 import type { ConversationResourceRoot } from '../../context/types.js';
 import {
@@ -29,7 +33,6 @@ export interface PlanProjectionBuilderPorts {
   gateInterventionsFromReport(report: Record<string, unknown> | undefined): PlanProjectionGateIntervention[];
   planReviewFacts(report: Record<string, unknown> | undefined): string[];
   interactionOverlayProjection(overlay: unknown): Record<string, unknown>;
-  visibleLanguageForRequest(userRequest: string): PlanProjectionLanguage;
 }
 
 export interface PlanProjectionPermissionBundle {
@@ -73,6 +76,7 @@ export class PlanProjectionBuilder {
       userPlan?: string;
       planReviewReport?: Record<string, unknown>;
       interactionOverlay?: unknown;
+      responseLanguage?: ConversationLanguage;
     };
     status: 'accepted' | 'rejected' | 'needsRevision';
     summary?: string;
@@ -85,7 +89,7 @@ export class PlanProjectionBuilder {
       : input.status === 'rejected'
         ? 'session.driver.planReviewRejected'
         : 'session.driver.planReviewNeedsRevision';
-    const language = this.ports.visibleLanguageForRequest(input.summary ?? input.plan.userPlan ?? '');
+    const language = input.plan.responseLanguage ?? 'zh-CN';
     const summary = input.summary ?? defaultPlanReviewDecisionSummary(input.status, language);
     return {
       id: input.id,
@@ -152,6 +156,7 @@ export class PlanProjectionBuilder {
         runId: proposal.runId,
         planId,
         proposalId: proposal.proposalId,
+        responseLanguage: proposal.responseLanguage,
         status,
         confirmable,
         decisionOwner: {
@@ -210,6 +215,7 @@ export class PlanProjectionBuilder {
         runId: proposal.runId,
         planId,
         proposalId: proposal.proposalId,
+        responseLanguage: proposal.responseLanguage,
         status: authorizationReview.status,
         confirmable: true,
         decisionOwner: {

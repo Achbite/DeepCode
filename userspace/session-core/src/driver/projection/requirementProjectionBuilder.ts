@@ -17,7 +17,6 @@ export interface RequirementDecisionOption {
 }
 
 export interface RequirementProjectionBuilderPorts {
-  visibleLanguageForRequest(userRequest: string): RequirementDecisionLanguage;
   interactionOverlayPayload(payload: Record<string, unknown>): Record<string, unknown>;
 }
 
@@ -54,7 +53,7 @@ export class RequirementProjectionBuilder {
 
   confirmationEvent(input: RequirementConfirmationEventInput): AgentEvent {
     const decisionRequest = objectRecord(input.proposal.payload);
-    const language = this.ports.visibleLanguageForRequest(input.originalUserRequest);
+    const language = input.proposal.responseLanguage ?? 'zh-CN';
     const content = decisionRequest && this.isDecisionRequestPayload(decisionRequest)
       ? this.renderDecisionRequestMarkdown(decisionRequest, language)
       : this.renderRequirementConfirmationMarkdown(input.requirement);
@@ -76,6 +75,7 @@ export class RequirementProjectionBuilder {
         requirement: input.requirement,
         decisionRequest: input.proposal.payload,
         proposalId: input.proposal.proposalId,
+        responseLanguage: language,
         originalUserRequest: input.originalUserRequest,
         attachments: input.attachments,
         executionRoot: input.executionRootPayload,
@@ -93,7 +93,7 @@ export class RequirementProjectionBuilder {
     const selectedOption = input.decision === 'accept'
       ? this.selectedDecisionOptionFromGuidance(decisionRequest, input.guidance)
       : undefined;
-    const language = this.ports.visibleLanguageForRequest(stringValue(payload.originalUserRequest) ?? '');
+    const language = conversationLanguage(payload.responseLanguage) ?? 'zh-CN';
     const summary = this.decisionSummary(input.decision, selectedOption, language);
     const overlayPayload = this.ports.interactionOverlayPayload(payload);
     return {
@@ -290,6 +290,10 @@ export class RequirementProjectionBuilder {
   private requirementSummary(requirement: RequirementRecord): string {
     return requirement.checklist?.goal || requirement.initialUserRequest;
   }
+}
+
+function conversationLanguage(value: unknown): RequirementDecisionLanguage | undefined {
+  return value === 'zh-CN' || value === 'en-US' ? value : undefined;
 }
 
 function objectRecord(value: unknown): Record<string, unknown> | undefined {

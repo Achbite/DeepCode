@@ -112,6 +112,7 @@ export interface ProviderTurnContextCoordinatorPorts<State extends ProviderTurnC
     runId: string;
     appliedAtProviderStage: string;
     userRequest: string;
+    language: UserAuthorityFrame['effectiveLanguage'];
   }): Promise<AgentSessionResult>;
   buildProviderTurnContract(input: {
     contractId: string;
@@ -198,6 +199,7 @@ export class ProviderTurnContextCoordinator<State extends ProviderTurnContextSta
       runId: state.runId,
       appliedAtProviderStage: 'provider_call',
       userRequest: state.userRequest,
+      language: state.userAuthorityFrame.effectiveLanguage,
     });
     const taskTemplateHash = this.acceptedTaskTemplateHash(state);
     const epochScopeKey = acceptedExecution
@@ -308,7 +310,12 @@ export class ProviderTurnContextCoordinator<State extends ProviderTurnContextSta
     const accepted = objectRecord(state.acceptedTaskPlan);
     return [
       'SessionRequestFrame:',
-      `outputLanguage=${state.userAuthorityFrame.outputLanguage}`,
+      `languageRevision=${state.userAuthorityFrame.languagePolicy.revision}`,
+      `languagePolicyStatus=${state.userAuthorityFrame.languagePolicy.status}`,
+      `hostLanguage=${state.userAuthorityFrame.languagePolicy.hostLanguage}`,
+      state.userAuthorityFrame.languagePolicy.status === 'pending'
+        ? ''
+        : `responseLanguage=${state.userAuthorityFrame.effectiveLanguage}`,
       `autonomyMode=${state.userAuthorityFrame.autonomyMode}`,
       `runId=${state.runId}`,
       requirement ? `requirementId=${requirement.requirementId}; status=${requirement.status}` : '',

@@ -3,6 +3,7 @@ import type {
   AgentEvent,
   AgentSessionResult,
   AgentWorkspaceBinding,
+  ConversationLanguage,
   ApiResponse,
   KernelCommandEnvelope,
   KernelReply,
@@ -128,6 +129,7 @@ export interface SessionDriverLoopInput {
   resumeResourcePackets?: boolean;
   acceptedTaskPlan?: AcceptedTaskPlanContext;
   interactionOverlay?: InteractionOverlayContext;
+  hostLanguage?: ConversationLanguage;
 }
 
 export interface SessionDecisionResolverInput {
@@ -150,4 +152,5 @@ export interface SessionDecisionResolverInput {
   autonomyMode?: AutonomyMode;
   projectMemoryMode?: ProjectMemoryMode;
   interactionOverlay?: InteractionOverlayContext;
+  hostLanguage?: ConversationLanguage;
 }

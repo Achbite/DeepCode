@@ -80,6 +80,7 @@ pub(crate) async fn ask(
 ) -> Result<(), String> {
     let session_id = session_id_for_turn(client, &host, &prompt).await?;
     let mut request = StartAgentRunRequest::ask(prompt);
+    request.host_language = Some(deepcode_kernel_client::terminal_host_language());
     request.workspace_path = workspace_path_for_host(&host);
     request.no_workspace = Some(host.no_workspace);
     let result = start_and_wait_for_run(client, &session_id, request, !plain).await?;
@@ -185,6 +186,7 @@ pub(crate) async fn resolve_session_decision(
         );
     }
     let mut request = StartAgentRunRequest::resolve_decision(kind, decision);
+    request.host_language = Some(deepcode_kernel_client::terminal_host_language());
     request.run_id = resolved_run_id;
     request.target_id = resolved_target_id;
     request.guidance = guidance;

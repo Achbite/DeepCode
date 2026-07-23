@@ -1,11 +1,18 @@
 import type {
   AgentEvent,
+  ConversationLanguage,
+  ConversationLanguagePolicy,
   SessionTurnAuthorityPayload,
   SessionTurnAuthorityRelation,
 } from '@deepcode/protocol';
 import { stableHash } from '../../cache/canonicalizer.js';
 import type { AutonomyMode } from '../../sessionModes.js';
-import type { VisibleLanguage } from '../runtimeSupport.js';
+import {
+  effectiveConversationLanguage,
+  normalizeHostLanguage,
+  pendingConversationLanguagePolicy,
+  resolveConversationLanguagePolicy,
+} from './conversationLanguagePolicy.js';
 
 export interface UserAuthorityMessage {
   readonly messageId: string;
@@ -29,7 +36,8 @@ export interface UserAuthorityFrame {
   readonly currentMessages: readonly UserAuthorityMessage[];
   readonly turnAuthority: SessionTurnAuthorityPayload;
   readonly decisionRefs: readonly UserAuthorityDecisionRef[];
-  readonly outputLanguage: VisibleLanguage;
+  readonly languagePolicy: ConversationLanguagePolicy;
+  readonly effectiveLanguage: ConversationLanguage;
   readonly autonomyMode: AutonomyMode;
 }
 
@@ -41,7 +49,8 @@ export interface CreateSessionTurnAuthorityEventInput {
   readonly messages: readonly Pick<UserAuthorityMessage, 'messageId' | 'content'>[];
   readonly relation: SessionTurnAuthorityRelation;
   readonly boundAtHookRef: string;
-  readonly outputLanguage: VisibleLanguage;
+  readonly languageRevision: number;
+  readonly hostLanguage?: ConversationLanguage;
   readonly promptEpochId?: string;
   readonly previousTaskId?: string;
   readonly eventId: string;
@@ -50,7 +59,10 @@ export interface CreateSessionTurnAuthorityEventInput {
 
 export class UserAuthorityFrameError extends Error {
   constructor(
-    readonly code: 'session_turn_authority_unavailable' | 'session_turn_authority_invalid',
+    readonly code:
+      | 'session_turn_authority_unavailable'
+      | 'session_turn_authority_invalid'
+      | 'session_language_policy_unavailable',
     message: string
   ) {
     super(message);
@@ -65,10 +77,22 @@ export function createSessionTurnAuthorityEvent(input: CreateSessionTurnAuthorit
       'Session turn authority requires at least one explicit user message.'
     );
   }
+  if (!Number.isSafeInteger(input.languageRevision) || input.languageRevision < 1) {
+    throw new UserAuthorityFrameError(
+      'session_turn_authority_invalid',
+      'Session turn authority requires a positive language revision.'
+    );
+  }
   const sourceMessageIds = input.messages.map((message) => message.messageId);
   const sourceMessageHashes = input.messages.map((message) => stableHash(message.content));
+  const languagePolicy = pendingConversationLanguagePolicy({
+    revision: input.languageRevision,
+    sourceTurnId: input.turnId,
+    sourceMessageIds,
+    hostLanguage: normalizeHostLanguage(input.hostLanguage),
+  });
   const authorityCore = {
-    schemaVersion: 'deepcode.session.turn-authority.v1' as const,
+    schemaVersion: 'deepcode.session.turn-authority.v2' as const,
     sessionId: input.sessionId,
     runId: input.runId,
     turnId: input.turnId,
@@ -77,7 +101,7 @@ export function createSessionTurnAuthorityEvent(input: CreateSessionTurnAuthorit
     sourceMessageHashes,
     relation: input.relation,
     boundAtHookRef: input.boundAtHookRef,
-    outputLanguage: input.outputLanguage,
+    languagePolicy,
     promptEpochId: input.promptEpochId,
     previousTaskId: input.previousTaskId,
   };
@@ -104,7 +128,6 @@ export function createSessionTurnAuthorityEvent(input: CreateSessionTurnAuthorit
 export function buildUserAuthorityFrame(
   events: readonly AgentEvent[],
   fallback: { messageId: string; content: string; timestamp?: string },
-  visibleLanguageForRequest: (content: string) => VisibleLanguage,
   autonomyMode: AutonomyMode = 'strict',
   options: { runId?: string } = {}
 ): UserAuthorityFrame {
@@ -118,6 +141,12 @@ export function buildUserAuthorityFrame(
   const effectiveMessages = explicitMessages.length ? explicitMessages : [fallbackMessage];
   const persisted = latestSessionTurnAuthority(events, options.runId);
   if (!persisted) {
+    if (hasLegacySessionTurnAuthority(events, options.runId)) {
+      throw new UserAuthorityFrameError(
+        'session_language_policy_unavailable',
+        `Session run ${options.runId ?? 'unknown'} uses turn authority v1 and cannot continue without ConversationLanguagePolicy v1.`
+      );
+    }
     throw new UserAuthorityFrameError(
       'session_turn_authority_unavailable',
       `Session run ${options.runId ?? 'unknown'} has no persisted CurrentTurnAuthority binding.`
@@ -139,15 +168,15 @@ export function buildUserAuthorityFrame(
       );
     }
   }
-  const outputLanguage = visibleLanguage(turnAuthority.outputLanguage)
-    ?? visibleLanguageForRequest(currentMessages.map((message) => message.content).join('\n\n'));
+  const languagePolicy = resolveConversationLanguagePolicy(events, turnAuthority);
   return {
     rootMessage: effectiveMessages[0] ?? fallbackMessage,
     explicitMessages: effectiveMessages,
     currentMessages,
     turnAuthority,
     decisionRefs: collectDecisionRefs(events),
-    outputLanguage,
+    languagePolicy,
+    effectiveLanguage: effectiveConversationLanguage(languagePolicy),
     autonomyMode,
   };
 }
@@ -169,6 +198,18 @@ export function latestSessionTurnAuthority(
     return payload;
   }
   return undefined;
+}
+
+export function hasLegacySessionTurnAuthority(
+  events: readonly AgentEvent[],
+  runId?: string
+): boolean {
+  return events.some((event) => {
+    if (event.kind !== 'session_turn_authority') return false;
+    const payload = objectRecord(event.payload);
+    return payload?.schemaVersion === 'deepcode.session.turn-authority.v1'
+      && (!runId || stringValue(payload.runId) === runId);
+  });
 }
 
 function collectExplicitUserMessages(events: readonly AgentEvent[]): UserAuthorityMessage[] {
@@ -207,7 +248,7 @@ function resolveCurrentMessages(
 
 function sessionTurnAuthorityPayload(value: unknown): SessionTurnAuthorityPayload | undefined {
   const record = objectRecord(value);
-  if (record?.schemaVersion !== 'deepcode.session.turn-authority.v1') return undefined;
+  if (record?.schemaVersion !== 'deepcode.session.turn-authority.v2') return undefined;
   const sessionId = stringValue(record.sessionId);
   const runId = stringValue(record.runId);
   const turnId = stringValue(record.turnId);
@@ -218,16 +259,18 @@ function sessionTurnAuthorityPayload(value: unknown): SessionTurnAuthorityPayloa
   const sourceMessageIds = stringArray(record.sourceMessageIds);
   const sourceMessageHashes = stringArray(record.sourceMessageHashes);
   const boundAtHookRef = stringValue(record.boundAtHookRef);
-  const outputLanguage = stringValue(record.outputLanguage);
+  const languagePolicy = conversationLanguagePolicy(record.languagePolicy);
   const authorityHash = stringValue(record.authorityHash);
   if (
-    !sessionId || !runId || !turnId || !taskId || !relation || !boundAtHookRef || !outputLanguage || !authorityHash
+    !sessionId || !runId || !turnId || !taskId || !relation || !boundAtHookRef || !languagePolicy || !authorityHash
     || sourceMessageIds.length === 0 || sourceMessageIds.length !== sourceMessageHashes.length
+    || languagePolicy.sourceTurnId !== turnId
+    || !sameStringArray(languagePolicy.sourceMessageIds, sourceMessageIds)
   ) {
     return undefined;
   }
   const core: Omit<SessionTurnAuthorityPayload, 'authorityHash'> = {
-    schemaVersion: 'deepcode.session.turn-authority.v1' as const,
+    schemaVersion: 'deepcode.session.turn-authority.v2' as const,
     sessionId,
     runId,
     turnId,
@@ -236,7 +279,7 @@ function sessionTurnAuthorityPayload(value: unknown): SessionTurnAuthorityPayloa
     sourceMessageHashes,
     relation,
     boundAtHookRef,
-    outputLanguage,
+    languagePolicy,
     promptEpochId: stringValue(record.promptEpochId),
     previousTaskId: stringValue(record.previousTaskId),
   };
@@ -273,10 +316,6 @@ function isDecisionEvent(kind: AgentEvent['kind']): boolean {
     || kind === 'permission_result';
 }
 
-function visibleLanguage(value: string): VisibleLanguage | undefined {
-  return value === 'zh-CN' || value === 'en-US' ? value : undefined;
-}
-
 function objectRecord(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
@@ -295,4 +334,40 @@ function stringArray(value: unknown): string[] {
   return Array.isArray(value)
     ? value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
     : [];
+}
+
+function conversationLanguagePolicy(value: unknown): ConversationLanguagePolicy | undefined {
+  const record = objectRecord(value);
+  if (record?.schemaVersion !== 'deepcode.session.conversation-language-policy.v1') return undefined;
+  const revision = positiveInteger(record.revision);
+  const sourceTurnId = stringValue(record.sourceTurnId);
+  const sourceMessageIds = stringArray(record.sourceMessageIds);
+  const hostLanguage = record.hostLanguage === 'zh-CN' || record.hostLanguage === 'en-US'
+    ? record.hostLanguage
+    : undefined;
+  if (
+    !revision
+    || !sourceTurnId
+    || sourceMessageIds.length === 0
+    || !hostLanguage
+    || record.status !== 'pending'
+  ) {
+    return undefined;
+  }
+  return {
+    schemaVersion: 'deepcode.session.conversation-language-policy.v1',
+    revision,
+    sourceTurnId,
+    sourceMessageIds,
+    hostLanguage,
+    status: 'pending',
+  };
+}
+
+function positiveInteger(value: unknown): number | undefined {
+  return Number.isSafeInteger(value) && Number(value) > 0 ? Number(value) : undefined;
+}
+
+function sameStringArray(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
 }
