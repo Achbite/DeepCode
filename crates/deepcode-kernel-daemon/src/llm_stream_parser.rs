@@ -107,13 +107,30 @@ pub(crate) fn parse_openai_compatible_sse_text(text: &str) -> LlmChatOutput {
     accumulator.output()
 }
 
+#[allow(dead_code)]
 pub(crate) fn openai_stream_events_from_data(
     accumulator: &mut OpenAiCompatibleStreamAccumulator,
     data: &str,
 ) -> Vec<String> {
+    openai_stream_events_from_data_inner(accumulator, data, None)
+}
+
+pub(crate) fn openai_stream_events_from_data_for_request(
+    accumulator: &mut OpenAiCompatibleStreamAccumulator,
+    data: &str,
+    request_id: &str,
+) -> Vec<String> {
+    openai_stream_events_from_data_inner(accumulator, data, Some(request_id))
+}
+
+fn openai_stream_events_from_data_inner(
+    accumulator: &mut OpenAiCompatibleStreamAccumulator,
+    data: &str,
+    request_id: Option<&str>,
+) -> Vec<String> {
     if data.trim() == "[DONE]" {
         accumulator.done_emitted = true;
-        return vec![sse_json_event(
+        return vec![provider_sse_json_event(
             "provider_done",
             json!({
                 "type": "provider_done",
@@ -123,32 +140,35 @@ pub(crate) fn openai_stream_events_from_data(
                 },
                 "usage": accumulator.usage,
             }),
+            request_id,
         )];
     }
     let value = match serde_json::from_str::<Value>(data) {
         Ok(value) => value,
         Err(error) => {
-            return vec![sse_json_event(
+            return vec![provider_sse_json_event(
                 "provider_error",
                 json!({
                     "type": "provider_error",
                     "error": error.to_string(),
                     "rawProvider": data,
                 }),
+                request_id,
             )];
         }
     };
-    openai_stream_events_from_value(accumulator, value)
+    openai_stream_events_from_value(accumulator, value, request_id)
 }
 
 fn openai_stream_events_from_value(
     accumulator: &mut OpenAiCompatibleStreamAccumulator,
     value: Value,
+    request_id: Option<&str>,
 ) -> Vec<String> {
     let mut events = Vec::new();
     if let Some(usage) = value.get("usage").filter(|usage| !usage.is_null()).cloned() {
         accumulator.usage = Some(usage.clone());
-        events.push(sse_json_event(
+        events.push(provider_sse_json_event(
             "provider_usage",
             json!({
                 "type": "provider_usage",
@@ -158,6 +178,7 @@ fn openai_stream_events_from_value(
                     "usage": usage,
                 },
             }),
+            request_id,
         ));
     }
     let choices = value
@@ -179,7 +200,7 @@ fn openai_stream_events_from_value(
             .filter(|value| !value.is_empty())
         {
             accumulator.reasoning.push_str(reasoning);
-            events.push(sse_json_event(
+            events.push(provider_sse_json_event(
                 "provider_reasoning_delta",
                 json!({
                     "type": "provider_reasoning_delta",
@@ -191,6 +212,7 @@ fn openai_stream_events_from_value(
                         "rawProvider": choice.clone(),
                     },
                 }),
+                request_id,
             ));
         }
         if let Some(content) = delta
@@ -199,7 +221,7 @@ fn openai_stream_events_from_value(
             .filter(|value| !value.is_empty())
         {
             accumulator.content.push_str(content);
-            events.push(sse_json_event(
+            events.push(provider_sse_json_event(
                 "provider_delta",
                 json!({
                     "type": "provider_delta",
@@ -211,6 +233,7 @@ fn openai_stream_events_from_value(
                         "rawProvider": choice.clone(),
                     },
                 }),
+                request_id,
             ));
         }
         for tool_call in delta
@@ -246,7 +269,7 @@ fn openai_stream_events_from_value(
             if !arguments_delta.is_empty() {
                 buffer.arguments.push_str(&arguments_delta);
             }
-            events.push(sse_json_event(
+            events.push(provider_sse_json_event(
                 "provider_tool_call_delta",
                 json!({
                     "type": "provider_tool_call_delta",
@@ -264,10 +287,18 @@ fn openai_stream_events_from_value(
                         "rawProvider": tool_call.clone(),
                     },
                 }),
+                request_id,
             ));
         }
     }
     events
+}
+
+fn provider_sse_json_event(event: &str, mut value: Value, request_id: Option<&str>) -> String {
+    if let (Some(request_id), Some(record)) = (request_id, value.as_object_mut()) {
+        record.insert("requestId".to_string(), json!(request_id));
+    }
+    sse_json_event(event, value)
 }
 
 pub(crate) fn sse_json_event(event: &str, value: Value) -> String {

@@ -422,13 +422,16 @@ fn tool_arguments_string(value: Option<&Value>) -> String {
 pub(crate) fn llm_stream_response(
     profile: ResolvedLlmProfile,
     request_envelope: Value,
+    request_id: String,
 ) -> Response {
+    let response_request_id = request_id.clone();
     let stream = async_stream::stream! {
         if profile.kind.as_str() != "openaiCompatible" {
             yield Ok::<Bytes, Infallible>(Bytes::from(sse_json_event(
                 "provider_error",
                 json!({
                     "type": "provider_error",
+                    "requestId": request_id.as_str(),
                     "error": format!("Streaming is only implemented for openaiCompatible profiles, got {}", profile.kind),
                 }),
             )));
@@ -439,6 +442,7 @@ pub(crate) fn llm_stream_response(
             "provider_metadata",
             json!({
                 "type": "provider_metadata",
+                "requestId": request_id.as_str(),
                 "providerProfileId": profile.id,
                 "provider": profile.provider_flavor.as_deref().unwrap_or(profile.kind.as_str()),
                 "model": profile.model,
@@ -465,6 +469,7 @@ pub(crate) fn llm_stream_response(
                 "provider_error",
                 json!({
                     "type": "provider_error",
+                    "requestId": request_id.as_str(),
                     "error": format!("LLM profile `{}` has no API key", profile.name),
                 }),
             )));
@@ -482,7 +487,11 @@ pub(crate) fn llm_stream_response(
             Err(error) => {
                 yield Ok(Bytes::from(sse_json_event(
                     "provider_error",
-                    json!({ "type": "provider_error", "error": error.to_string() }),
+                    json!({
+                        "type": "provider_error",
+                        "requestId": request_id.as_str(),
+                        "error": error.to_string()
+                    }),
                 )));
                 return;
             }
@@ -500,6 +509,7 @@ pub(crate) fn llm_stream_response(
                 "provider_error",
                 json!({
                     "type": "provider_error",
+                    "requestId": request_id.as_str(),
                     "error": format!("LLM provider returned HTTP {}", status.as_u16()),
                     "rawProvider": {
                         "status": status.as_u16(),
@@ -519,7 +529,11 @@ pub(crate) fn llm_stream_response(
                 Ok(Some(chunk)) => {
                     let text = String::from_utf8_lossy(&chunk);
                     for data in parser.push(&text) {
-                        for event in openai_stream_events_from_data(&mut accumulator, &data) {
+                        for event in openai_stream_events_from_data_for_request(
+                            &mut accumulator,
+                            &data,
+                            request_id.as_str(),
+                        ) {
                             yield Ok(Bytes::from(event));
                         }
                     }
@@ -528,14 +542,22 @@ pub(crate) fn llm_stream_response(
                 Err(error) => {
                     yield Ok(Bytes::from(sse_json_event(
                         "provider_error",
-                        json!({ "type": "provider_error", "error": error.to_string() }),
+                        json!({
+                            "type": "provider_error",
+                            "requestId": request_id.as_str(),
+                            "error": error.to_string()
+                        }),
                     )));
                     return;
                 }
             }
         }
         for data in parser.finish() {
-            for event in openai_stream_events_from_data(&mut accumulator, &data) {
+            for event in openai_stream_events_from_data_for_request(
+                &mut accumulator,
+                &data,
+                request_id.as_str(),
+            ) {
                 yield Ok(Bytes::from(event));
             }
         }
@@ -544,6 +566,7 @@ pub(crate) fn llm_stream_response(
                 "provider_done",
                 json!({
                     "type": "provider_done",
+                    "requestId": request_id.as_str(),
                     "chunk": {
                         "type": "done",
                         "usage": accumulator.usage,
@@ -558,7 +581,14 @@ pub(crate) fn llm_stream_response(
         .header(header::CONTENT_TYPE, "text/event-stream; charset=utf-8")
         .header(header::CACHE_CONTROL, "no-cache")
         .body(Body::from_stream(stream))
-        .unwrap_or_else(|_| Response::new(Body::from("event: provider_error\ndata: {\"type\":\"provider_error\",\"error\":\"failed to build stream response\"}\n\n")))
+        .unwrap_or_else(|_| Response::new(Body::from(sse_json_event(
+            "provider_error",
+            json!({
+                "type": "provider_error",
+                "requestId": response_request_id,
+                "error": "failed to build stream response"
+            }),
+        ))))
 }
 
 fn response_format_is_json_object(response_format: Option<&Value>) -> bool {

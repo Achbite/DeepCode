@@ -26,6 +26,12 @@ import {
   type ProviderRequestCacheHistoryEntry,
 } from '../../prompt/promptLedger.js';
 import { deferProviderCommitEvents, queueProviderCommitEvents } from './providerCommitBuffer.js';
+import {
+  admitProviderRequest,
+  admittedProviderRequestSnapshot,
+  providerAttemptKindForStage,
+  type AdmittedProviderRequest,
+} from './admittedProviderRequest.js';
 
 export interface ProviderTurnRunnerState extends ProviderStreamRuntimeState {
   cachePlan?: PromptCachePlan;
@@ -112,11 +118,36 @@ export class ProviderTurnRunner<TState extends ProviderTurnRunnerState> {
     const { state, stage, ports } = input;
     const jsonModeMessages = this.dependencies.jsonModeCoordinator.ensureMessages(input.messages, options.responseFormat);
     const providerCallHookTrace = await this.runProviderCallHook(state);
-    const cacheTopology = providerRequestCacheTopology(state, jsonModeMessages, options);
+    const primaryRequestId = this.dependencies.createId(`provider-request-${stage}`);
+    const primaryAdmitted = admitProviderRequest({
+      requestId: primaryRequestId,
+      attemptKind: providerAttemptKindForStage(stage),
+      stage,
+      transportRequest: {
+        requestId: primaryRequestId,
+        profileId: input.profileId,
+        messages: jsonModeMessages,
+        responseFormat: options.responseFormat,
+        tools: options.tools,
+        stream: Boolean(ports.llmChatStream),
+        providerOptions: {
+          deepcode: {
+            cachePlan: state.cachePlan,
+          },
+        },
+      },
+    });
+    let effectiveAdmitted = primaryAdmitted;
+    const cacheTopology = providerRequestCacheTopology(
+      state,
+      primaryAdmitted.transportRequest.messages,
+      requestOptions(primaryAdmitted)
+    );
     await this.dependencies.traceRecorder.append(state, `${stage}.request`, {
-      profileId: input.profileId,
+      admittedRequest: admittedProviderRequestSnapshot(primaryAdmitted),
+      profileId: primaryAdmitted.transportRequest.profileId,
       semanticProfileId: state.providerTurnFrame?.snapshot?.semanticProfileId,
-      messages: jsonModeMessages,
+      messages: primaryAdmitted.transportRequest.messages,
       cachePlan: state.cachePlan,
       contextAssembly: state.contextAssembly,
       providerTurnSnapshot: state.providerTurnFrame?.snapshot,
@@ -124,8 +155,8 @@ export class ProviderTurnRunner<TState extends ProviderTurnRunnerState> {
         ...(state.providerTurnFrame?.hookTrace ?? []),
         ...providerCallHookTrace,
       ],
-      responseFormat: options.responseFormat,
-      tools: options.tools,
+      responseFormat: primaryAdmitted.transportRequest.responseFormat,
+      tools: primaryAdmitted.transportRequest.tools,
       cacheTopology,
       responseFormatAudit: this.dependencies.jsonModeCoordinator.audit(input.messages, options.responseFormat),
     }, ports);
@@ -138,46 +169,12 @@ export class ProviderTurnRunner<TState extends ProviderTurnRunnerState> {
       summary: this.dependencies.streamCoordinator.stageSummary(stage, 'request', this.dependencies.visibleLanguageForRequest(state.userRequest)),
       activity: this.dependencies.providerActivity({ runId: state.runId, userRequest: state.userRequest, stage, status: 'running' }),
     });
-    const request: LlmChatRequest = {
-      profileId: input.profileId,
-      messages: jsonModeMessages,
-      responseFormat: options.responseFormat,
-      tools: options.tools,
-      stream: Boolean(ports.llmChatStream),
-      providerOptions: {
-        deepcode: {
-          cachePlan: state.cachePlan,
-        },
-      },
-    };
-    const providerRequestId = this.dependencies.createId(`provider-request-${stage}`);
-    this.dependencies.streamRuntime.beginProviderCall(state, stage, providerRequestId);
-    if (state.promptLedger && state.providerTurnFrame?.promptLedgerEpochId) {
-      const epoch = promptLedgerEpoch(state.promptLedger, state.providerTurnFrame.promptLedgerEpochId);
-      if (epoch) {
-        await ports.appendWireLedger?.(state.sessionId, [promptLedgerWireRequest({
-          recordId: providerRequestId,
-          sessionId: state.sessionId,
-          runId: state.runId,
-          profileId: input.profileId ?? epoch.profileId,
-          semanticProfileId: state.providerTurnFrame.snapshot?.semanticProfileId,
-          epoch,
-          messages: jsonModeMessages,
-          timestamp: this.dependencies.now(),
-          schemaHash: state.providerTurnFrame.snapshot?.toolSchemaHash,
-          responseFormatHash: state.providerTurnFrame.snapshot?.responseFormatHash,
-          turnAuthority: state.userAuthorityFrame?.turnAuthority,
-          promptSegmentDigests: state.contextAssembly?.segments.map((segment) => ({
-            id: segment.id,
-            contentHash: segment.contentHash,
-          })),
-        })]).catch(() => undefined);
-      }
-    }
+    this.dependencies.streamRuntime.beginProviderCall(state, stage, primaryAdmitted.requestId);
+    await this.appendWireRequest(state, primaryAdmitted, ports);
     const toolCallBuffer = this.dependencies.createToolCallBuffer();
     const reasoningBuffer = this.dependencies.streamRuntime.createReasoningBuffer();
     let result = ports.llmChatStream
-      ? await ports.llmChatStream(request, async (event) => {
+      ? await ports.llmChatStream(primaryAdmitted.transportRequest, async (event) => {
         await this.dependencies.streamRuntime.handleEvent({
           state,
           stage,
@@ -186,7 +183,7 @@ export class ProviderTurnRunner<TState extends ProviderTurnRunnerState> {
           reasoningBuffer,
         });
       })
-      : await ports.llmChat(request);
+      : await ports.llmChat(primaryAdmitted.transportRequest);
     await this.dependencies.streamRuntime.flushReasoningBuffer(state, stage, reasoningBuffer);
     if (ports.llmChatStream && (!result.ok || !result.data)) {
       if (result.error === 'session_run_cancelled') {
@@ -200,17 +197,39 @@ export class ProviderTurnRunner<TState extends ProviderTurnRunnerState> {
           result.message ?? 'Session run cancelled by user.'
         );
       }
+      if (isProviderRequestIdentityError(result.error)) {
+        throw this.dependencies.createError(
+          result.error ?? 'provider_request_identity_invalid',
+          result.message ?? 'Provider request identity validation failed.'
+        );
+      }
       await this.dependencies.streamRuntime.discardCurrentSemanticDrafts(
         state,
         stage,
         'semantic_draft_stream_fallback'
       );
-      const fallbackRequest: LlmChatRequest = { ...request, stream: false };
+      const fallbackRequestId = this.dependencies.createId(`provider-request-${stage}-stream-fallback`);
+      const fallbackAdmitted = admitProviderRequest({
+        requestId: fallbackRequestId,
+        parentRequestId: primaryAdmitted.requestId,
+        attemptKind: 'streamFallback',
+        stage: `${stage}.streamFallback`,
+        transportRequest: {
+          ...primaryAdmitted.transportRequest,
+          requestId: fallbackRequestId,
+          parentRequestId: primaryAdmitted.requestId,
+          stream: false,
+        },
+      });
+      effectiveAdmitted = fallbackAdmitted;
+      this.dependencies.streamRuntime.beginProviderCall(state, stage, fallbackAdmitted.requestId);
       await this.dependencies.traceRecorder.append(state, `${stage}.stream_fallback.request`, {
         reason: result.message ?? result.error ?? 'streaming provider request failed',
-        request: fallbackRequest,
+        admittedRequest: admittedProviderRequestSnapshot(fallbackAdmitted),
+        request: fallbackAdmitted.transportRequest,
       }, ports);
-      result = await ports.llmChat(fallbackRequest);
+      await this.appendWireRequest(state, fallbackAdmitted, ports);
+      result = await ports.llmChat(fallbackAdmitted.transportRequest);
     }
     if (!result.ok || !result.data) {
       await this.dependencies.emitProjectionDelta(state, {
@@ -226,6 +245,7 @@ export class ProviderTurnRunner<TState extends ProviderTurnRunnerState> {
         result.message ?? result.error ?? 'LLM provider request failed.'
       );
     }
+    ensureProviderResponseIdentity(result.data, effectiveAdmitted, this.dependencies.createError);
     const usage = objectRecord(result.data.usage);
     const cacheEvent = this.dependencies.cacheTelemetryEvent({
       sessionId: state.sessionId,
@@ -269,7 +289,11 @@ export class ProviderTurnRunner<TState extends ProviderTurnRunnerState> {
       await ports.appendCacheTelemetry?.(state.sessionId, {
         schemaVersion: 'deepcode.session.cache-telemetry.v1',
         recordId: cacheEvent.id,
-        requestId: providerRequestId,
+        requestId: effectiveAdmitted.requestId,
+        parentRequestId: effectiveAdmitted.parentRequestId,
+        attemptKind: effectiveAdmitted.attemptKind,
+        providerPayloadDigest: effectiveAdmitted.providerPayloadDigest,
+        transportDigest: effectiveAdmitted.transportDigest,
         sessionId: state.sessionId,
         runId: state.runId,
         providerProfileId: result.data.providerProfileId ?? input.profileId,
@@ -394,6 +418,38 @@ export class ProviderTurnRunner<TState extends ProviderTurnRunnerState> {
     }
     return results;
   }
+
+  private async appendWireRequest(
+    state: TState,
+    admitted: AdmittedProviderRequest,
+    ports: ProviderTurnRunnerPorts
+  ): Promise<void> {
+    if (!state.promptLedger || !state.providerTurnFrame?.promptLedgerEpochId) return;
+    const epoch = promptLedgerEpoch(state.promptLedger, state.providerTurnFrame.promptLedgerEpochId);
+    if (!epoch) return;
+    await ports.appendWireLedger?.(state.sessionId, [promptLedgerWireRequest({
+      recordId: admitted.requestId,
+      parentRequestId: admitted.parentRequestId,
+      attemptKind: admitted.attemptKind,
+      sessionId: state.sessionId,
+      runId: state.runId,
+      profileId: admitted.transportRequest.profileId ?? epoch.profileId,
+      semanticProfileId: state.providerTurnFrame.snapshot?.semanticProfileId,
+      epoch,
+      messages: admitted.transportRequest.messages,
+      timestamp: this.dependencies.now(),
+      schemaHash: state.providerTurnFrame.snapshot?.toolSchemaHash,
+      responseFormatHash: state.providerTurnFrame.snapshot?.responseFormatHash,
+      providerPayloadDigest: admitted.providerPayloadDigest,
+      transportDigest: admitted.transportDigest,
+      stream: admitted.transportRequest.stream === true,
+      turnAuthority: state.userAuthorityFrame?.turnAuthority,
+      promptSegmentDigests: state.contextAssembly?.segments.map((segment) => ({
+        id: segment.id,
+        contentHash: segment.contentHash,
+      })),
+    })]).catch(() => undefined);
+  }
 }
 
 function collectReasoning(result: LlmChatResult): string {
@@ -408,6 +464,40 @@ function objectRecord(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
     : undefined;
+}
+
+function requestOptions(
+  admitted: AdmittedProviderRequest
+): Pick<LlmChatRequest, 'responseFormat' | 'tools'> {
+  return {
+    responseFormat: admitted.transportRequest.responseFormat,
+    tools: admitted.transportRequest.tools,
+  };
+}
+
+function ensureProviderResponseIdentity(
+  result: LlmChatResult,
+  admitted: AdmittedProviderRequest,
+  createError: (code: string, message: string) => Error
+): void {
+  if (!result.requestId?.trim()) {
+    throw createError(
+      'provider_request_identity_missing',
+      `Provider response omitted requestId for ${admitted.requestId}.`
+    );
+  }
+  if (result.requestId !== admitted.requestId) {
+    throw createError(
+      'provider_request_identity_mismatch',
+      `Provider response requestId ${result.requestId} does not match ${admitted.requestId}.`
+    );
+  }
+}
+
+function isProviderRequestIdentityError(code: string | undefined): boolean {
+  return code === 'provider_request_identity_missing'
+    || code === 'provider_request_identity_mismatch'
+    || code === 'provider_request_identity_invalid';
 }
 
 export function providerRequestCacheTopology(

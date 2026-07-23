@@ -476,6 +476,7 @@ async function llmChatStream(
     let providerProfileId: string | undefined;
     let provider: string | undefined;
     let model: string | undefined;
+    let responseRequestId: string | undefined;
     let errorMessage: string | undefined;
     const parser = new SseClientParser();
     const decoder = new TextDecoder();
@@ -486,6 +487,11 @@ async function llmChatStream(
       providerProfileId = event.providerProfileId ?? providerProfileId;
       provider = event.provider ?? provider;
       model = event.model ?? model;
+      if (event.requestId) {
+        responseRequestId = responseRequestId && responseRequestId !== event.requestId
+          ? 'provider-request-identity-conflict'
+          : event.requestId;
+      }
       if (event.type === 'provider_error') {
         const eventMessage = (event as LlmChatStreamEvent & { message?: string }).message;
         errorMessage = event.error ?? eventMessage ?? event.chunk?.error ?? 'Provider stream error.';
@@ -519,7 +525,12 @@ async function llmChatStream(
     }
     return {
       ok: true,
-      data: buildStreamResult(chunks, usage, { providerProfileId, provider, model }),
+      data: buildStreamResult(chunks, usage, {
+        requestId: responseRequestId,
+        providerProfileId,
+        provider,
+        model,
+      }),
     };
   } catch (error) {
     if (monitor?.cancelled) return cancelledLlmResult();
@@ -742,7 +753,7 @@ function parseSseClientEvent(raw: string): LlmChatStreamEvent | null {
 function buildStreamResult(
   chunks: LlmChatResult['chunks'],
   usage: Record<string, unknown> | undefined,
-  metadata: Pick<LlmChatResult, 'providerProfileId' | 'provider' | 'model'>
+  metadata: Pick<LlmChatResult, 'requestId' | 'providerProfileId' | 'provider' | 'model'>
 ): LlmChatResult {
   const content = chunks
     .filter((chunk) => chunk.type === 'delta' && typeof chunk.content === 'string')

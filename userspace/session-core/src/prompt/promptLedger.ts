@@ -73,6 +73,8 @@ export interface PromptLedgerPrepareResult {
 export interface PromptLedgerWireRecord {
   readonly schemaVersion: 'deepcode.session.wire-ledger.v1';
   readonly recordId: string;
+  readonly parentRequestId?: string;
+  readonly attemptKind?: string;
   readonly sessionId: string;
   readonly runId: string;
   readonly profileId: string;
@@ -95,6 +97,9 @@ export interface PromptLedgerWireRecord {
   readonly messageHash?: string;
   readonly schemaHash?: string;
   readonly responseFormatHash?: string;
+  readonly providerPayloadDigest?: string;
+  readonly transportDigest?: string;
+  readonly stream?: boolean;
   readonly promptSegmentDigests?: PromptLedgerSegmentDigest[];
   readonly ledgerEntries?: Array<Pick<PromptLedgerEntry, 'entryId' | 'kind' | 'contentHash' | 'sourceRef'>>;
 }
@@ -432,6 +437,8 @@ export function promptLedgerAuthorityFits(
 
 export function promptLedgerWireRequest(input: {
   recordId: string;
+  parentRequestId?: string;
+  attemptKind?: string;
   sessionId: string;
   runId: string;
   profileId: string;
@@ -441,6 +448,9 @@ export function promptLedgerWireRequest(input: {
   timestamp: string;
   schemaHash?: string;
   responseFormatHash?: string;
+  providerPayloadDigest?: string;
+  transportDigest?: string;
+  stream?: boolean;
   promptSegmentDigests?: PromptLedgerSegmentDigest[];
   turnAuthority?: SessionTurnAuthorityPayload;
 }): PromptLedgerWireRecord {
@@ -448,6 +458,8 @@ export function promptLedgerWireRequest(input: {
   return {
     schemaVersion: 'deepcode.session.wire-ledger.v1',
     recordId: input.recordId,
+    parentRequestId: input.parentRequestId,
+    attemptKind: input.attemptKind,
     sessionId: input.sessionId,
     runId: input.runId,
     profileId: input.profileId,
@@ -468,6 +480,9 @@ export function promptLedgerWireRequest(input: {
     messageHash: stableHash(JSON.stringify(input.messages)),
     schemaHash: input.schemaHash,
     responseFormatHash: input.responseFormatHash,
+    providerPayloadDigest: input.providerPayloadDigest,
+    transportDigest: input.transportDigest,
+    stream: input.stream,
     promptSegmentDigests: input.promptSegmentDigests?.map((segment) => ({ ...segment })),
     ledgerEntries: input.messages.map((message, index) => {
       const entry = projectedEntries[index];

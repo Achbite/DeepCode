@@ -384,6 +384,10 @@ pub(crate) async fn llm_chat(
         Ok(body) => body,
         Err(rejection) => return json_body_rejection_response("/api/llm/chat", rejection),
     };
+    let request_id = match llm_request_id(&body) {
+        Ok(request_id) => request_id,
+        Err(message) => return ApiResponse::error("provider_request_identity_invalid", message),
+    };
     let profile_id = body
         .get("profileId")
         .and_then(Value::as_str)
@@ -420,11 +424,15 @@ pub(crate) async fn llm_chat(
                 .as_deref()
                 .unwrap_or(profile.kind.as_str()));
             payload["model"] = json!(profile.model);
+            payload["requestId"] = json!(request_id);
             ApiResponse::ok(payload)
         }
         Err(error) => Json(ApiResponse {
             ok: false,
-            data: Some(json!({ "providerError": error })),
+            data: Some(json!({
+                "requestId": request_id,
+                "providerError": error
+            })),
             error: Some("llm_chat_failed".to_string()),
             message: Some(error.to_string()),
         }),
@@ -450,6 +458,16 @@ pub(crate) async fn llm_chat_stream(
             }));
         }
     };
+    let request_id = match llm_request_id(&body) {
+        Ok(request_id) => request_id,
+        Err(message) => {
+            return llm_stream_error_response(json!({
+                "type": "provider_error",
+                "error": "provider_request_identity_invalid",
+                "message": message,
+            }));
+        }
+    };
     let profile_id = body
         .get("profileId")
         .and_then(Value::as_str)
@@ -463,6 +481,7 @@ pub(crate) async fn llm_chat_stream(
         Err(error) => {
             return llm_stream_error_response(json!({
                 "type": "provider_error",
+                "requestId": request_id,
                 "error": error,
             }));
         }
@@ -482,7 +501,16 @@ pub(crate) async fn llm_chat_stream(
     {
         request_envelope["responseFormat"] = response_format.clone();
     }
-    llm_stream_response(profile, request_envelope)
+    llm_stream_response(profile, request_envelope, request_id)
+}
+
+fn llm_request_id(body: &Value) -> Result<String, String> {
+    body.get("requestId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "requestId must be a non-empty string".to_string())
 }
 
 fn llm_stream_error_response(data: Value) -> Response {
