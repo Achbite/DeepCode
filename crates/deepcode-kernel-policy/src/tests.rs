@@ -156,6 +156,289 @@ fn autonomy_profiles_have_expected_permission_matrix() {
     assert_eq!(kernel_modify.decision, PolicyDecisionKind::Ask);
 }
 
+fn v2_candidate(
+    autonomy_mode: GrantAutonomyModeV2,
+    operation_kind: deepcode_kernel_abi::ToolOperationKind,
+) -> CapabilityGrantAutoIssueCandidateV2 {
+    use deepcode_kernel_abi::{
+        OperationExecutionMode, TargetExistence, ToolOperationKind, ToolPermissionMode,
+        ToolRiskLevel,
+    };
+
+    let (tool_id, risk, resource_scope, effect_scope) = match operation_kind {
+        ToolOperationKind::FsRead => (
+            "fs.read",
+            ToolRiskLevel::Low,
+            GrantResolvedScopeV2::ExactWorkspace {
+                resources: vec!["resource:file:src/lib.rs".to_string()],
+            },
+            vec!["workspace.read:file".to_string()],
+        ),
+        ToolOperationKind::FsWrite => (
+            "fs.write",
+            ToolRiskLevel::Medium,
+            GrantResolvedScopeV2::ExactWorkspace {
+                resources: vec!["resource:file:src/lib.rs".to_string()],
+            },
+            vec!["workspace.write:file".to_string()],
+        ),
+        ToolOperationKind::FsRename => (
+            "fs.rename",
+            ToolRiskLevel::High,
+            GrantResolvedScopeV2::ExactWorkspace {
+                resources: vec![
+                    "resource:file:src/old.rs".to_string(),
+                    "resource:file:src/new.rs".to_string(),
+                ],
+            },
+            vec!["workspace.rename:no-overwrite".to_string()],
+        ),
+        ToolOperationKind::FsDelete => (
+            "fs.delete",
+            ToolRiskLevel::High,
+            GrantResolvedScopeV2::ExactWorkspace {
+                resources: vec!["resource:file:src/lib.rs".to_string()],
+            },
+            vec!["workspace.delete:file".to_string()],
+        ),
+        ToolOperationKind::GitStage => (
+            "git.stage",
+            ToolRiskLevel::High,
+            GrantResolvedScopeV2::ExactGitWorkspace {
+                resources: vec!["resource:git-index:workspace".to_string()],
+            },
+            vec!["git.index:stage".to_string()],
+        ),
+        ToolOperationKind::GitUnstage => (
+            "git.unstage",
+            ToolRiskLevel::High,
+            GrantResolvedScopeV2::ExactGitWorkspace {
+                resources: vec!["resource:git-index:workspace".to_string()],
+            },
+            vec!["git.index:unstage".to_string()],
+        ),
+        ToolOperationKind::GitCommit => (
+            "git.commit",
+            ToolRiskLevel::High,
+            GrantResolvedScopeV2::ExactGitWorkspace {
+                resources: vec!["resource:git-index:workspace".to_string()],
+            },
+            vec!["git.commit:create".to_string()],
+        ),
+        ToolOperationKind::GitPush => (
+            "git.push",
+            ToolRiskLevel::Critical,
+            GrantResolvedScopeV2::ExactGitWorkspace {
+                resources: vec!["resource:git-remote:origin".to_string()],
+            },
+            vec!["git.remote:push".to_string()],
+        ),
+        ToolOperationKind::ProcessExec => (
+            "process.exec",
+            ToolRiskLevel::High,
+            GrantResolvedScopeV2::Process,
+            vec!["process.execute".to_string()],
+        ),
+        ToolOperationKind::WebFetch => (
+            "web.fetch",
+            ToolRiskLevel::High,
+            GrantResolvedScopeV2::Network,
+            vec!["network.fetch".to_string()],
+        ),
+        ToolOperationKind::BrowserClick => (
+            "browser.click",
+            ToolRiskLevel::High,
+            GrantResolvedScopeV2::Browser,
+            vec!["browser.click".to_string()],
+        ),
+        ToolOperationKind::ProviderCall => (
+            "provider.call",
+            ToolRiskLevel::High,
+            GrantResolvedScopeV2::Provider,
+            vec!["provider.call".to_string()],
+        ),
+        _ => panic!("v2 test candidate does not cover {operation_kind:?}"),
+    };
+
+    CapabilityGrantAutoIssueCandidateV2 {
+        autonomy_mode,
+        tool_id: tool_id.to_string(),
+        operation_kind,
+        permission_mode: ToolPermissionMode::Ask,
+        execution_mode: OperationExecutionMode::Execute,
+        risk,
+        resource_scope,
+        effect_scope,
+        rename_destination_existence: (operation_kind == ToolOperationKind::FsRename)
+            .then_some(TargetExistence::MustNotExist),
+    }
+}
+
+#[test]
+fn v2_strict_auto_issues_only_low_risk_local_grants() {
+    use deepcode_kernel_abi::ToolOperationKind;
+
+    let read = evaluate_capability_grant_auto_issue_v2(&v2_candidate(
+        GrantAutonomyModeV2::Strict,
+        ToolOperationKind::FsRead,
+    ));
+    assert!(read.is_auto_issue());
+    assert_eq!(
+        read.reason,
+        CapabilityGrantAutoIssueReasonV2::LowRiskLocalTool
+    );
+
+    for operation in [ToolOperationKind::FsWrite, ToolOperationKind::FsRename] {
+        let decision = evaluate_capability_grant_auto_issue_v2(&v2_candidate(
+            GrantAutonomyModeV2::Strict,
+            operation,
+        ));
+        assert_eq!(
+            decision.decision,
+            CapabilityGrantAutoIssueDecisionV2::RequireExplicitDecision
+        );
+    }
+}
+
+#[test]
+fn v2_trusted_workspace_requires_exact_bounded_medium_mutation_scope() {
+    use deepcode_kernel_abi::ToolOperationKind;
+
+    let bounded = evaluate_capability_grant_auto_issue_v2(&v2_candidate(
+        GrantAutonomyModeV2::TrustedWorkspace,
+        ToolOperationKind::FsWrite,
+    ));
+    assert!(bounded.is_auto_issue());
+    assert_eq!(
+        bounded.reason,
+        CapabilityGrantAutoIssueReasonV2::BoundedMediumWorkspaceMutation
+    );
+
+    let mut unresolved = v2_candidate(
+        GrantAutonomyModeV2::TrustedWorkspace,
+        ToolOperationKind::FsWrite,
+    );
+    unresolved.resource_scope = GrantResolvedScopeV2::UnresolvedOrUnbounded;
+    let decision = evaluate_capability_grant_auto_issue_v2(&unresolved);
+    assert!(!decision.is_auto_issue());
+    assert_eq!(
+        decision.reason,
+        CapabilityGrantAutoIssueReasonV2::MissingExactResourceOrEffectScope
+    );
+
+    let rename = evaluate_capability_grant_auto_issue_v2(&v2_candidate(
+        GrantAutonomyModeV2::TrustedWorkspace,
+        ToolOperationKind::FsRename,
+    ));
+    assert!(!rename.is_auto_issue());
+}
+
+#[test]
+fn v2_maximum_auto_issues_only_the_three_reversible_high_operations() {
+    use deepcode_kernel_abi::ToolOperationKind;
+
+    for operation in [
+        ToolOperationKind::FsRename,
+        ToolOperationKind::GitStage,
+        ToolOperationKind::GitUnstage,
+    ] {
+        let decision = evaluate_capability_grant_auto_issue_v2(&v2_candidate(
+            GrantAutonomyModeV2::Maximum,
+            operation,
+        ));
+        assert!(decision.is_auto_issue(), "{operation:?}: {decision:?}");
+        assert_eq!(
+            decision.reason,
+            CapabilityGrantAutoIssueReasonV2::MaximumReversibleHighOperation
+        );
+    }
+
+    let mut overwrite = v2_candidate(GrantAutonomyModeV2::Maximum, ToolOperationKind::FsRename);
+    overwrite.rename_destination_existence = Some(deepcode_kernel_abi::TargetExistence::Any);
+    let decision = evaluate_capability_grant_auto_issue_v2(&overwrite);
+    assert!(!decision.is_auto_issue());
+    assert_eq!(
+        decision.reason,
+        CapabilityGrantAutoIssueReasonV2::RenameMayOverwrite
+    );
+}
+
+#[test]
+fn v2_never_auto_issues_excluded_external_or_critical_authority() {
+    use deepcode_kernel_abi::ToolOperationKind;
+
+    for operation in [
+        ToolOperationKind::FsDelete,
+        ToolOperationKind::GitCommit,
+        ToolOperationKind::GitPush,
+        ToolOperationKind::ProcessExec,
+        ToolOperationKind::WebFetch,
+        ToolOperationKind::BrowserClick,
+        ToolOperationKind::ProviderCall,
+    ] {
+        let decision = evaluate_capability_grant_auto_issue_v2(&v2_candidate(
+            GrantAutonomyModeV2::Maximum,
+            operation,
+        ));
+        assert!(!decision.is_auto_issue(), "{operation:?}: {decision:?}");
+    }
+
+    let mut external_low = v2_candidate(GrantAutonomyModeV2::Maximum, ToolOperationKind::FsRead);
+    external_low.resource_scope = GrantResolvedScopeV2::External {
+        resources: vec!["resource:file:/outside/workspace".to_string()],
+    };
+    let decision = evaluate_capability_grant_auto_issue_v2(&external_low);
+    assert!(!decision.is_auto_issue());
+    assert_eq!(
+        decision.reason,
+        CapabilityGrantAutoIssueReasonV2::ExternalOrNonWorkspaceAuthority
+    );
+}
+
+#[test]
+fn v2_contract_mismatch_and_deny_fail_closed() {
+    use deepcode_kernel_abi::{
+        OperationExecutionMode, ToolOperationKind, ToolPermissionMode, ToolRiskLevel,
+    };
+
+    let mut mismatch = v2_candidate(GrantAutonomyModeV2::Maximum, ToolOperationKind::FsRename);
+    mismatch.risk = ToolRiskLevel::Low;
+    let decision = evaluate_capability_grant_auto_issue_v2(&mismatch);
+    assert!(!decision.is_auto_issue());
+    assert_eq!(
+        decision.reason,
+        CapabilityGrantAutoIssueReasonV2::ToolContractMismatch
+    );
+
+    let mut denied = v2_candidate(GrantAutonomyModeV2::Maximum, ToolOperationKind::GitStage);
+    denied.permission_mode = ToolPermissionMode::Deny;
+    let decision = evaluate_capability_grant_auto_issue_v2(&denied);
+    assert!(!decision.is_auto_issue());
+    assert_eq!(
+        decision.reason,
+        CapabilityGrantAutoIssueReasonV2::ToolContractDenied
+    );
+
+    let mut blocked = v2_candidate(GrantAutonomyModeV2::Maximum, ToolOperationKind::GitStage);
+    blocked.execution_mode = OperationExecutionMode::Blocked;
+    let decision = evaluate_capability_grant_auto_issue_v2(&blocked);
+    assert!(!decision.is_auto_issue());
+    assert_eq!(
+        decision.reason,
+        CapabilityGrantAutoIssueReasonV2::ToolContractNotExecutable
+    );
+
+    let mut missing_tool_identity =
+        v2_candidate(GrantAutonomyModeV2::Strict, ToolOperationKind::FsRead);
+    missing_tool_identity.tool_id = " ".to_string();
+    let decision = evaluate_capability_grant_auto_issue_v2(&missing_tool_identity);
+    assert!(!decision.is_auto_issue());
+    assert_eq!(
+        decision.reason,
+        CapabilityGrantAutoIssueReasonV2::ToolContractMismatch
+    );
+}
+
 #[test]
 fn trusted_workspace_full_access_does_not_cover_deepcode_config_assets() {
     let gate = DefaultPermissionGate;

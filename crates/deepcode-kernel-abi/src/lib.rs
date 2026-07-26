@@ -20,6 +20,7 @@ mod run;
 mod snapshot;
 mod tool;
 pub mod v2;
+pub mod v2_command;
 mod wire;
 mod workspace;
 

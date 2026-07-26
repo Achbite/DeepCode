@@ -1,15 +1,19 @@
+use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeSet;
 use std::fmt;
 use thiserror::Error;
 
 use crate::KERNEL_ABI_V2_VERSION;
 
 const MAX_TIMESTAMP_BYTES: usize = 128;
+const MAX_ID_BYTES: usize = 512;
 const MAX_TEXT_BYTES: usize = 16 * 1024;
 const MAX_SCOPE_ITEMS: usize = 256;
 const MAX_CORRELATION_REFS: usize = 64;
 const MAX_RECEIPT_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_FACT_WIRE_BYTES: usize = 2 * 1024 * 1024;
 
 macro_rules! string_id {
     ($name:ident) => {
@@ -27,7 +31,7 @@ macro_rules! string_id {
             }
 
             pub fn validate_as(&self, field: &'static str) -> Result<(), V2ValidationError> {
-                validate_non_empty(field, &self.0)
+                validate_bounded_text(field, &self.0, MAX_ID_BYTES)
             }
         }
 
@@ -41,6 +45,12 @@ macro_rules! string_id {
                     return Err(serde::de::Error::custom(concat!(
                         stringify!($name),
                         " must be non-empty"
+                    )));
+                }
+                if value.len() > MAX_ID_BYTES {
+                    return Err(serde::de::Error::custom(concat!(
+                        stringify!($name),
+                        " exceeds the v2 identity byte limit"
                     )));
                 }
                 Ok(Self(value))
@@ -256,6 +266,7 @@ pub struct GrantFactV2 {
     pub kind: GrantFactKindV2,
     pub grant_id: GrantId,
     pub tool_id: String,
+    pub request_digest: String,
     pub resource_scope: Vec<String>,
     pub effect_scope: Vec<String>,
     pub use_policy: GrantUsePolicyV2,
@@ -270,6 +281,7 @@ pub enum InvocationFactKindV2 {
     Submitted,
     Admitted,
     Rejected,
+    FailedBeforeAttempt,
     AttemptPrepared,
     ExecutionStarted,
     CancellationObserved,
@@ -531,6 +543,7 @@ impl GrantFactV2 {
     fn validate(&self, identity: &CausalIdentityV2) -> Result<(), V2ValidationError> {
         self.grant_id.validate_as("fact.grantId")?;
         validate_bounded_text("fact.toolId", &self.tool_id, MAX_TEXT_BYTES)?;
+        validate_bounded_text("fact.requestDigest", &self.request_digest, MAX_TEXT_BYTES)?;
         validate_non_empty_values("fact.resourceScope", &self.resource_scope, MAX_SCOPE_ITEMS)?;
         validate_non_empty_values("fact.effectScope", &self.effect_scope, MAX_SCOPE_ITEMS)?;
         validate_optional_bounded_text("fact.reason", self.reason.as_deref(), MAX_TEXT_BYTES)?;
@@ -558,6 +571,11 @@ impl GrantFactV2 {
                 require_present(
                     identity.invocation_id.as_ref(),
                     "identity.invocationId",
+                    "grant reservation fact",
+                )?;
+                require_present(
+                    identity.causation_id.as_ref(),
+                    "identity.causationId",
                     "grant reservation fact",
                 )?;
             }
@@ -626,6 +644,7 @@ impl InvocationFactV2 {
         let requires_reservation = matches!(
             self.kind,
             InvocationFactKindV2::Admitted
+                | InvocationFactKindV2::FailedBeforeAttempt
                 | InvocationFactKindV2::AttemptPrepared
                 | InvocationFactKindV2::ExecutionStarted
                 | InvocationFactKindV2::CancellationObserved
@@ -679,6 +698,26 @@ impl InvocationFactV2 {
                 detail: "must be absent before an attempt is prepared",
             });
         }
+        if !matches!(self.kind, InvocationFactKindV2::Submitted) {
+            require_present(
+                identity.causation_id.as_ref(),
+                "identity.causationId",
+                "admission or later invocation fact",
+            )?;
+        }
+        if matches!(
+            self.kind,
+            InvocationFactKindV2::Rejected
+                | InvocationFactKindV2::FailedBeforeAttempt
+                | InvocationFactKindV2::Failed
+                | InvocationFactKindV2::Indeterminate
+        ) {
+            require_present(
+                self.error_code.as_ref(),
+                "fact.errorCode",
+                "failed, rejected, or indeterminate invocation fact",
+            )?;
+        }
         Ok(())
     }
 }
@@ -715,6 +754,11 @@ impl EffectFactV2 {
                 payload_field: "fact.attemptId",
             });
         }
+        require_present(
+            identity.causation_id.as_ref(),
+            "identity.causationId",
+            "effect fact",
+        )?;
         if self.affected_resources.len() > MAX_SCOPE_ITEMS {
             return Err(V2ValidationError::TooManyValues {
                 field: "fact.affectedResources",
@@ -815,6 +859,8 @@ pub enum KernelErrorCodeV2 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum V2WireDecodeError {
+    #[error("v2 wire payload exceeds the maximum of {maximum_bytes} bytes")]
+    PayloadTooLarge { maximum_bytes: usize },
     #[error("invalid JSON: {message}")]
     InvalidJson { message: String },
     #[error("unsupported ABI version `{actual}`; expected `{expected}`")]
@@ -835,9 +881,10 @@ impl V2WireDecodeError {
             | Self::Validation(V2ValidationError::UnsupportedAbiVersion { .. }) => {
                 KernelErrorCodeV2::UnsupportedAbiVersion
             }
-            Self::InvalidJson { .. } | Self::InvalidPayload { .. } | Self::Validation(_) => {
-                KernelErrorCodeV2::InvalidRequest
-            }
+            Self::PayloadTooLarge { .. }
+            | Self::InvalidJson { .. }
+            | Self::InvalidPayload { .. }
+            | Self::Validation(_) => KernelErrorCodeV2::InvalidRequest,
         }
     }
 }
@@ -846,10 +893,12 @@ impl V2WireDecodeError {
 /// legacy payload receives the stable ABI error even when the rest of its
 /// shape is not valid v2.
 pub fn decode_kernel_fact_v2(input: &[u8]) -> Result<KernelFactEnvelopeV2, V2WireDecodeError> {
-    let value: Value =
-        serde_json::from_slice(input).map_err(|error| V2WireDecodeError::InvalidJson {
-            message: error.to_string(),
-        })?;
+    if input.len() > MAX_FACT_WIRE_BYTES {
+        return Err(V2WireDecodeError::PayloadTooLarge {
+            maximum_bytes: MAX_FACT_WIRE_BYTES,
+        });
+    }
+    let value = decode_strict_json(input)?;
     validate_wire_abi_header(&value)?;
     let fact: KernelFactEnvelopeV2 =
         serde_json::from_value(value).map_err(|error| V2WireDecodeError::InvalidPayload {
@@ -894,7 +943,7 @@ pub enum V2ValidationError {
     },
 }
 
-fn validate_wire_abi_header(value: &Value) -> Result<(), V2WireDecodeError> {
+pub(crate) fn validate_wire_abi_header(value: &Value) -> Result<(), V2WireDecodeError> {
     let actual = match value
         .as_object()
         .and_then(|object| object.get("abiVersion"))
@@ -910,6 +959,112 @@ fn validate_wire_abi_header(value: &Value) -> Result<(), V2WireDecodeError> {
         });
     }
     Ok(())
+}
+
+pub(crate) fn decode_strict_json(input: &[u8]) -> Result<Value, V2WireDecodeError> {
+    serde_json::from_slice::<StrictJsonValue>(input)
+        .map(|value| value.0)
+        .map_err(|error| V2WireDecodeError::InvalidJson {
+            message: error.to_string(),
+        })
+}
+
+struct StrictJsonValue(Value);
+
+impl<'de> Deserialize<'de> for StrictJsonValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(StrictJsonVisitor)
+    }
+}
+
+struct StrictJsonVisitor;
+
+impl<'de> Visitor<'de> for StrictJsonVisitor {
+    type Value = StrictJsonValue;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON value without duplicate object keys")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(StrictJsonValue(Value::Bool(value)))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(StrictJsonValue(Value::Number(value.into())))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(StrictJsonValue(Value::Number(value.into())))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        serde_json::Number::from_f64(value)
+            .map(Value::Number)
+            .map(StrictJsonValue)
+            .ok_or_else(|| E::custom("non-finite JSON number"))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        self.visit_string(value.to_owned())
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+        Ok(StrictJsonValue(Value::String(value)))
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(StrictJsonValue(Value::Null))
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(StrictJsonValue(Value::Null))
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        StrictJsonValue::deserialize(deserializer)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::with_capacity(sequence.size_hint().unwrap_or(0).min(MAX_SCOPE_ITEMS));
+        while let Some(value) = sequence.next_element::<StrictJsonValue>()? {
+            values.push(value.0);
+        }
+        Ok(StrictJsonValue(Value::Array(values)))
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut keys = BTreeSet::new();
+        let mut values = serde_json::Map::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if !keys.insert(key.clone()) {
+                return Err(serde::de::Error::custom(format!(
+                    "duplicate JSON object key `{key}`"
+                )));
+            }
+            let value = map.next_value::<StrictJsonValue>()?;
+            values.insert(key, value.0);
+        }
+        Ok(StrictJsonValue(Value::Object(values)))
+    }
 }
 
 fn validate_version(version: &str) -> Result<(), V2ValidationError> {
@@ -992,7 +1147,7 @@ where
     T: AsRef<str>,
 {
     if let Some(value) = value {
-        validate_non_empty(field, value.as_ref())?;
+        validate_bounded_text(field, value.as_ref(), MAX_ID_BYTES)?;
     }
     Ok(())
 }
