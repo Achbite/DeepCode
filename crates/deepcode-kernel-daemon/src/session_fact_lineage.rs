@@ -9,8 +9,7 @@ const PROVIDER_ADMISSION_SCHEMA_V1: &str = "deepcode.session.provider-admission-
 const TURN_AUTHORITY_SCHEMA_V2: &str = "deepcode.session.turn-authority.v2";
 const LANGUAGE_POLICY_SCHEMA_V1: &str = "deepcode.session.conversation-language-policy.v1";
 const SHARED_PROJECTION_SCHEMA_V2: &str = "deepcode.shared-conversation-projection.v2";
-const FINAL_KERNEL_EFFECT_TASK_IDS_STAGING_FIELD: &str =
-    "kernelEffectTaskIdsPendingMaterialization";
+const TURN_KERNEL_EFFECT_TASK_IDS_STAGING_FIELD: &str = "kernelEffectTaskIdsPendingMaterialization";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SessionFactLineageValidationError {
@@ -135,7 +134,7 @@ struct KernelFactRef {
 }
 
 #[derive(Debug, Clone)]
-struct FinalKernelEffectClaim {
+struct TurnKernelEffectClaim {
     task_id: String,
     operation_ids: Vec<String>,
     work_unit_ids: Vec<String>,
@@ -1570,33 +1569,32 @@ fn validate_required_kernel_facts(
     authority: &TurnAuthority,
     refs: &[KernelFactRef],
 ) -> Result<(), SessionFactLineageValidationError> {
-    if event.kind != "assistant_msg"
-        || event
-            .payload
-            .and_then(|payload| text_field(payload, "channel"))
-            != Some("final")
-    {
+    let Some(payload) = event.payload else {
         return Ok(());
-    }
-    let payload = event.payload.ok_or_else(|| {
-        SessionFactLineageValidationError::invalid(
-            Some(&event.id),
-            format!("Final Session fact {} has no payload.", event.id),
-        )
-    })?;
+    };
     if payload
-        .get(FINAL_KERNEL_EFFECT_TASK_IDS_STAGING_FIELD)
+        .get(TURN_KERNEL_EFFECT_TASK_IDS_STAGING_FIELD)
         .is_some()
     {
         return Err(SessionFactLineageValidationError::invalid(
             Some(&event.id),
             format!(
-                "Final Session fact {} contains unmaterialized Kernel effect staging.",
+                "Session fact {} contains unmaterialized Kernel effect staging.",
                 event.id
             ),
         ));
     }
-    let claims = parse_final_kernel_effect_claims(payload, &event.id)?;
+    let final_assistant =
+        event.kind == "assistant_msg" && text_field(payload, "channel") == Some("final");
+    let waiting_review = event.kind == "review_summary"
+        && text_field(payload, "status") == Some("waitingUserReview");
+    let review_evidence = waiting_review
+        && (payload.get("requiresKernelFacts").is_some()
+            || payload.get("kernelEffectClaims").is_some());
+    if !final_assistant && !review_evidence {
+        return Ok(());
+    }
+    let claims = parse_turn_kernel_effect_claims(payload, &event.id)?;
     let Some(value) = payload.get("requiresKernelFacts") else {
         if claims.is_empty() && refs.is_empty() {
             return Ok(());
@@ -1604,7 +1602,7 @@ fn validate_required_kernel_facts(
         return Err(SessionFactLineageValidationError::invalid(
             Some(&event.id),
             format!(
-                "Final Session fact {} has Kernel fact refs or effect claims without requiresKernelFacts.",
+                "Turn execution evidence fact {} has Kernel fact refs or effect claims without requiresKernelFacts.",
                 event.id
             ),
         ));
@@ -1613,7 +1611,7 @@ fn validate_required_kernel_facts(
         SessionFactLineageValidationError::invalid(
             Some(&event.id),
             format!(
-                "Final Session fact {} requiresKernelFacts must be boolean.",
+                "Turn execution evidence fact {} requiresKernelFacts must be boolean.",
                 event.id
             ),
         )
@@ -1622,7 +1620,7 @@ fn validate_required_kernel_facts(
         return Err(SessionFactLineageValidationError::invalid(
             Some(&event.id),
             format!(
-                "Final Session fact {} has Kernel effect claims without requiring Kernel facts.",
+                "Turn execution evidence fact {} has Kernel effect claims without requiring Kernel facts.",
                 event.id
             ),
         ));
@@ -1631,7 +1629,16 @@ fn validate_required_kernel_facts(
         return Err(SessionFactLineageValidationError::invalid(
             Some(&event.id),
             format!(
-                "Final Session fact {} requires exact per-task Kernel effect claims.",
+                "Turn execution evidence fact {} requires exact per-task Kernel effect claims.",
+                event.id
+            ),
+        ));
+    }
+    if review_evidence && !required {
+        return Err(SessionFactLineageValidationError::invalid(
+            Some(&event.id),
+            format!(
+                "Waiting review execution evidence fact {} must require exact Kernel facts.",
                 event.id
             ),
         ));
@@ -1641,7 +1648,7 @@ fn validate_required_kernel_facts(
             return Err(SessionFactLineageValidationError::invalid(
                 Some(&event.id),
                 format!(
-                    "Final Session fact {} has unclaimed Kernel facts.",
+                    "Turn execution evidence fact {} has unclaimed Kernel facts.",
                     event.id
                 ),
             ));
@@ -1649,7 +1656,7 @@ fn validate_required_kernel_facts(
         return Ok(());
     }
 
-    validate_final_effect_claim_checkpoints(
+    validate_turn_effect_claim_checkpoints(
         events,
         incoming_start,
         event_index,
@@ -1678,7 +1685,7 @@ fn validate_required_kernel_facts(
             return Err(SessionFactLineageValidationError::invalid(
                 Some(&event.id),
                 format!(
-                    "Final Session fact {} contains a Kernel ref outside its exact effect claims.",
+                    "Turn execution evidence fact {} contains a Kernel ref outside its exact effect claims.",
                     event.id
                 ),
             ));
@@ -1713,7 +1720,7 @@ fn validate_required_kernel_facts(
             return Err(SessionFactLineageValidationError::invalid(
                 Some(&event.id),
                 format!(
-                    "Final Session fact {} is missing exact Kernel terminal/effect refs for task {}: operations={} workUnits={}.",
+                    "Turn execution evidence fact {} is missing exact Kernel terminal/effect refs for task {}: operations={} workUnits={}.",
                     event.id,
                     claim.task_id,
                     if missing_operations.is_empty() {
@@ -1733,13 +1740,13 @@ fn validate_required_kernel_facts(
     Ok(())
 }
 
-fn validate_final_effect_claim_checkpoints(
+fn validate_turn_effect_claim_checkpoints(
     events: &[EventView<'_>],
     incoming_start: usize,
     event_index: usize,
     event: &EventView<'_>,
     authority: &TurnAuthority,
-    claims: &[FinalKernelEffectClaim],
+    claims: &[TurnKernelEffectClaim],
 ) -> Result<(), SessionFactLineageValidationError> {
     let claimed_task_ids = claims
         .iter()
@@ -1748,7 +1755,7 @@ fn validate_final_effect_claim_checkpoints(
     let mut durable_work_units_by_task: HashMap<String, (String, Vec<String>)> = HashMap::new();
 
     // Only the prefix that was already durable before this append may settle a
-    // final effect claim. A checkpoint placed beside the final answer in the
+    // turn effect claim. A checkpoint placed beside the consuming fact in the
     // same uncommitted batch is not prior durable evidence.
     for (checkpoint_index, checkpoint) in events
         .iter()
@@ -1865,7 +1872,7 @@ fn validate_final_effect_claim_checkpoints(
             return Err(SessionFactLineageValidationError::invalid(
                 Some(&event.id),
                 format!(
-                    "Final Session fact {} has no earlier durable same-authority accepted-plan checkpoint for task {}.",
+                    "Turn execution evidence fact {} has no earlier durable same-authority accepted-plan checkpoint for task {}.",
                     event.id, claim.task_id
                 ),
             ));
@@ -1876,7 +1883,7 @@ fn validate_final_effect_claim_checkpoints(
             return Err(SessionFactLineageValidationError::invalid(
                 Some(&event.id),
                 format!(
-                    "Final Session fact {} work units for task {} do not exactly match checkpoint {}.",
+                    "Turn execution evidence fact {} work units for task {} do not exactly match checkpoint {}.",
                     event.id, claim.task_id, checkpoint_id
                 ),
             ));
@@ -2008,17 +2015,17 @@ fn strict_effect_checkpoint_identities(
     Ok(identities)
 }
 
-fn parse_final_kernel_effect_claims(
+fn parse_turn_kernel_effect_claims(
     payload: &Map<String, Value>,
     event_id: &str,
-) -> Result<Vec<FinalKernelEffectClaim>, SessionFactLineageValidationError> {
+) -> Result<Vec<TurnKernelEffectClaim>, SessionFactLineageValidationError> {
     let Some(value) = payload.get("kernelEffectClaims") else {
         return Ok(Vec::new());
     };
     let values = value.as_array().ok_or_else(|| {
         SessionFactLineageValidationError::invalid(
             Some(event_id),
-            format!("Final Session fact {event_id} kernelEffectClaims must be an array."),
+            format!("Turn execution evidence fact {event_id} kernelEffectClaims must be an array."),
         )
     })?;
     let mut task_ids = HashSet::new();
@@ -2032,7 +2039,7 @@ fn parse_final_kernel_effect_claims(
                 SessionFactLineageValidationError::invalid(
                     Some(event_id),
                     format!(
-                        "Final Session fact {event_id} has an invalid Kernel effect claim at index {index}."
+                        "Turn execution evidence fact {event_id} has an invalid Kernel effect claim at index {index}."
                     ),
                 )
             })?;
@@ -2045,7 +2052,7 @@ fn parse_final_kernel_effect_claims(
                 return Err(SessionFactLineageValidationError::invalid(
                     Some(event_id),
                     format!(
-                        "Final Session fact {event_id} has an empty Kernel effect claim at index {index}."
+                        "Turn execution evidence fact {event_id} has an empty Kernel effect claim at index {index}."
                     ),
                 ));
             }
@@ -2060,11 +2067,11 @@ fn parse_final_kernel_effect_claims(
                 return Err(SessionFactLineageValidationError::invalid(
                     Some(event_id),
                     format!(
-                        "Final Session fact {event_id} has duplicated Kernel effect claim identities."
+                        "Turn execution evidence fact {event_id} has duplicated Kernel effect claim identities."
                     ),
                 ));
             }
-            Ok(FinalKernelEffectClaim {
+            Ok(TurnKernelEffectClaim {
                 task_id,
                 operation_ids: claim_operation_ids,
                 work_unit_ids: claim_work_unit_ids,
@@ -2080,7 +2087,7 @@ fn strict_effect_identity_array(
     let values = value.and_then(Value::as_array).ok_or_else(|| {
         SessionFactLineageValidationError::invalid(
             Some(event_id),
-            format!("Final Session fact {event_id} effect identities must be arrays."),
+            format!("Turn execution evidence fact {event_id} effect identities must be arrays."),
         )
     })?;
     let identities = values
@@ -2092,7 +2099,7 @@ fn strict_effect_identity_array(
                     SessionFactLineageValidationError::invalid(
                         Some(event_id),
                         format!(
-                            "Final Session fact {event_id} effect identities must be non-empty strings."
+                            "Turn execution evidence fact {event_id} effect identities must be non-empty strings."
                         ),
                     )
                 })
@@ -2105,7 +2112,7 @@ fn strict_effect_identity_array(
     {
         return Err(SessionFactLineageValidationError::invalid(
             Some(event_id),
-            format!("Final Session fact {event_id} has duplicated effect identities."),
+            format!("Turn execution evidence fact {event_id} has duplicated effect identities."),
         ));
     }
     Ok(identities)

@@ -709,12 +709,21 @@ fn validate_projected_turn_evidence(timeline: &Value, events: &[Value]) -> Resul
             .and_then(Value::as_str)
             .unwrap_or_default();
         let payload = event.get("payload").and_then(Value::as_object);
-        let relevant = kind == "session_run_state"
-            || kind == "assistant_msg"
-                && payload
-                    .and_then(|payload| payload.get("channel"))
-                    .and_then(Value::as_str)
-                    == Some("final");
+        let final_assistant = kind == "assistant_msg"
+            && payload
+                .and_then(|payload| payload.get("channel"))
+                .and_then(Value::as_str)
+                == Some("final");
+        let waiting_review_evidence = kind == "review_summary"
+            && payload
+                .and_then(|payload| payload.get("status"))
+                .and_then(Value::as_str)
+                == Some("waitingUserReview")
+            && payload.is_some_and(|payload| {
+                payload.get("requiresKernelFacts").is_some()
+                    || payload.get("kernelEffectClaims").is_some()
+            });
+        let relevant = kind == "session_run_state" || final_assistant || waiting_review_evidence;
         if !relevant {
             continue;
         }
@@ -764,16 +773,17 @@ fn validate_projected_turn_evidence(timeline: &Value, events: &[Value]) -> Resul
             continue;
         }
 
-        let expected = expected_execution_evidence_for_final(
+        let expected = expected_execution_evidence_for_fact(
             event,
             event_index,
             authority,
             events,
             &event_indices,
         )?;
-        // The latest exact-authority final fact owns the turn evidence slot.
-        // A final without an explicit evidence decision intentionally clears
-        // any earlier candidate rather than inheriting an obsolete claim.
+        // The latest exact-authority evidence fact owns the turn evidence
+        // slot. A later final without an explicit evidence decision
+        // intentionally clears an earlier review candidate rather than
+        // inheriting an obsolete claim.
         expected_execution_evidence.insert(authority.turn_id.clone(), expected);
     }
 
@@ -861,7 +871,7 @@ fn projected_event_turn_authority<'a>(
     Ok(Some(authority))
 }
 
-fn expected_execution_evidence_for_final(
+fn expected_execution_evidence_for_fact(
     event: &Value,
     event_index: usize,
     authority: &ProjectionTurnAuthority,
@@ -872,7 +882,7 @@ fn expected_execution_evidence_for_final(
     let payload = event
         .get("payload")
         .and_then(Value::as_object)
-        .ok_or_else(|| format!("final Session fact {event_id} has no object payload"))?;
+        .ok_or_else(|| format!("turn execution evidence fact {event_id} has no object payload"))?;
     if payload
         .get("runId")
         .and_then(Value::as_str)
@@ -883,15 +893,26 @@ fn expected_execution_evidence_for_final(
             .is_some_and(|turn_id| turn_id != authority.turn_id)
     {
         return Err(format!(
-            "final Session fact {event_id} does not match its exact turn authority"
+            "turn execution evidence fact {event_id} does not match its exact turn authority"
         ));
     }
     let Some(requires_kernel_facts) = payload.get("requiresKernelFacts") else {
+        if event.get("kind").and_then(Value::as_str) == Some("review_summary") {
+            return Err(format!(
+                "waiting review execution evidence fact {event_id} has no requiresKernelFacts decision"
+            ));
+        }
         return Ok(None);
     };
-    let requires_kernel_facts = requires_kernel_facts
-        .as_bool()
-        .ok_or_else(|| format!("final Session fact {event_id} has invalid requiresKernelFacts"))?;
+    let requires_kernel_facts = requires_kernel_facts.as_bool().ok_or_else(|| {
+        format!("turn execution evidence fact {event_id} has invalid requiresKernelFacts")
+    })?;
+    if event.get("kind").and_then(Value::as_str) == Some("review_summary") && !requires_kernel_facts
+    {
+        return Err(format!(
+            "waiting review execution evidence fact {event_id} must require exact Kernel facts"
+        ));
+    }
     let lineage = payload
         .get("lineage")
         .and_then(Value::as_object)
@@ -900,18 +921,18 @@ fn expected_execution_evidence_for_final(
         .get("kernelFactRefs")
         .and_then(Value::as_array)
         .ok_or_else(|| {
-            format!("final Session fact {event_id} lineage has invalid kernelFactRefs")
+            format!("turn execution evidence fact {event_id} lineage has invalid kernelFactRefs")
         })?;
     let claims = match payload.get("kernelEffectClaims") {
         None => &[][..],
         Some(value) => value.as_array().ok_or_else(|| {
-            format!("final Session fact {event_id} has invalid kernelEffectClaims")
+            format!("turn execution evidence fact {event_id} has invalid kernelEffectClaims")
         })?,
     };
     if !requires_kernel_facts {
         if !claims.is_empty() || !refs.is_empty() {
             return Err(format!(
-                "notRequired final Session fact {event_id} contains Kernel claims or refs"
+                "notRequired turn execution evidence fact {event_id} contains Kernel claims or refs"
             ));
         }
         return Ok(Some(json!({
@@ -924,7 +945,7 @@ fn expected_execution_evidence_for_final(
     let claims = parse_projected_kernel_effect_claims(claims, event_id)?;
     if claims.is_empty() || refs.is_empty() {
         return Err(format!(
-            "kernelFactBacked final Session fact {event_id} requires claims and Kernel refs"
+            "kernelFactBacked turn execution evidence fact {event_id} requires claims and Kernel refs"
         ));
     }
     let refs = parse_projected_kernel_fact_refs(
@@ -971,7 +992,7 @@ fn expected_execution_evidence_for_final(
                 .any(|reference| reference.operation_id.as_ref() == Some(operation_id))
             {
                 return Err(format!(
-                    "final Session fact {event_id} has no exact Kernel ref for operation {operation_id}"
+                    "turn execution evidence fact {event_id} has no exact Kernel ref for operation {operation_id}"
                 ));
             }
         }
@@ -981,13 +1002,13 @@ fn expected_execution_evidence_for_final(
                 .any(|reference| reference.work_unit_id.as_ref() == Some(work_unit_id))
             {
                 return Err(format!(
-                    "final Session fact {event_id} has no exact Kernel ref for work unit {work_unit_id}"
+                    "turn execution evidence fact {event_id} has no exact Kernel ref for work unit {work_unit_id}"
                 ));
             }
         }
         if fact_refs.is_empty() {
             return Err(format!(
-                "final Session fact {event_id} task {} has no exact Kernel fact refs",
+                "turn execution evidence fact {event_id} task {} has no exact Kernel fact refs",
                 claim.task_id
             ));
         }
@@ -1009,7 +1030,7 @@ fn expected_execution_evidence_for_final(
         .any(|reference| !associated_refs.contains(reference.kernel_event_ref.as_str()))
     {
         return Err(format!(
-            "final Session fact {event_id} contains a Kernel ref outside its exact task claims"
+            "turn execution evidence fact {event_id} contains a Kernel ref outside its exact task claims"
         ));
     }
     Ok(Some(json!({

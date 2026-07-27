@@ -4071,7 +4071,7 @@ function applyTurnSettlementAndExecutionEvidence(
     event: AgentEvent;
     turnAuthorityRef: string;
   }>();
-  const finalFactByTurnId = new Map<string, {
+  const executionEvidenceFactByTurnId = new Map<string, {
     event: AgentEvent;
     eventIndex: number;
     turnAuthorityRef: string;
@@ -4094,10 +4094,10 @@ function applyTurnSettlementAndExecutionEvidence(
       });
     }
     if (
-      event.kind === 'assistant_msg'
-      && stringField(payload ?? {}, 'channel') === 'final'
+      isFinalAssistantExecutionEvidenceCandidate(event, payload)
+      || isWaitingReviewExecutionEvidenceCandidate(event, payload)
     ) {
-      finalFactByTurnId.set(turnId, {
+      executionEvidenceFactByTurnId.set(turnId, {
         event,
         eventIndex,
         turnAuthorityRef: lineage.turnAuthorityRef,
@@ -4122,17 +4122,37 @@ function applyTurnSettlementAndExecutionEvidence(
       };
     }
 
-    const finalFact = finalFactByTurnId.get(turn.id);
-    if (!finalFact) continue;
+    const evidenceFact = executionEvidenceFactByTurnId.get(turn.id);
+    if (!evidenceFact) continue;
     const evidence = projectedTurnExecutionEvidence(
       events,
-      finalFact.eventIndex,
-      finalFact.event,
-      finalFact.turnAuthorityRef,
+      evidenceFact.eventIndex,
+      evidenceFact.event,
+      evidenceFact.turnAuthorityRef,
       authorityIndex
     );
     if (evidence) turn.executionEvidence = evidence;
   }
+}
+
+function isFinalAssistantExecutionEvidenceCandidate(
+  event: AgentEvent,
+  payload: Record<string, unknown> | undefined
+): boolean {
+  return event.kind === 'assistant_msg'
+    && stringField(payload ?? {}, 'channel') === 'final';
+}
+
+function isWaitingReviewExecutionEvidenceCandidate(
+  event: AgentEvent,
+  payload: Record<string, unknown> | undefined
+): boolean {
+  return event.kind === 'review_summary'
+    && stringField(payload ?? {}, 'status') === 'waitingUserReview'
+    && (
+      payload?.requiresKernelFacts !== undefined
+      || payload?.kernelEffectClaims !== undefined
+    );
 }
 
 function projectedTurnSettlementStatus(
@@ -4161,10 +4181,25 @@ function projectedTurnExecutionEvidence(
       `session_shared_projection_invalid: execution_evidence_lineage:${event.id}`
     );
   }
-  if (payload.requiresKernelFacts === undefined) return undefined;
+  if (payload.requiresKernelFacts === undefined) {
+    if (event.kind === 'review_summary') {
+      throw new Error(
+        `session_shared_projection_invalid: review_execution_evidence_requirement:${event.id}`
+      );
+    }
+    return undefined;
+  }
   if (typeof payload.requiresKernelFacts !== 'boolean') {
     throw new Error(
       `session_shared_projection_invalid: execution_evidence_requirement:${event.id}`
+    );
+  }
+  if (
+    event.kind === 'review_summary'
+    && payload.requiresKernelFacts !== true
+  ) {
+    throw new Error(
+      `session_shared_projection_invalid: review_execution_evidence_requirement:${event.id}`
     );
   }
 

@@ -40,7 +40,7 @@ import {
   type PendingProviderAdmissionRegistryState,
   type PreparedSessionFactBatch,
 } from './sessionFactLineage.js';
-import { FINAL_KERNEL_EFFECT_TASK_IDS_STAGING_FIELD } from './finalSettlementEvidence.js';
+import { TURN_KERNEL_EFFECT_TASK_IDS_STAGING_FIELD } from './finalSettlementEvidence.js';
 
 type WritableAgentSessionResult = AgentSessionResult & {
   appendWriteability: {
@@ -517,7 +517,7 @@ export class SessionAppendCoordinator
           }
         }
       }
-      event = materializeFinalKernelEffectClaims(
+      event = materializeTurnKernelEffectClaims(
         combined,
         this.result.events.length + offset,
         event,
@@ -704,26 +704,26 @@ function exactAuthorityRefForEvent(
   );
 }
 
-function materializeFinalKernelEffectClaims(
+function materializeTurnKernelEffectClaims(
   events: readonly AgentEvent[],
   eventIndex: number,
   event: AgentEvent,
   authorityRef: string
 ): AgentEvent {
   const payload = objectRecord(event.payload) ?? {};
-  const rawTaskIds = payload[FINAL_KERNEL_EFFECT_TASK_IDS_STAGING_FIELD];
+  const rawTaskIds = payload[TURN_KERNEL_EFFECT_TASK_IDS_STAGING_FIELD];
   if (rawTaskIds === undefined) return event;
-  if (!isFinalAssistantFact(event, payload)) {
+  if (!isTurnExecutionEvidenceStagingTarget(event, payload)) {
     throw new SessionAppendCoordinatorError(
       'session_fact_lineage_invalid',
-      `Session fact ${event.id} uses final Kernel effect staging outside a final assistant fact.`
+      `Session fact ${event.id} uses Kernel effect staging outside a final assistant or waiting review fact.`
     );
   }
   const taskIds = strictIdentityArray(rawTaskIds);
   if (!taskIds) {
     throw new SessionAppendCoordinatorError(
       'session_fact_lineage_invalid',
-      `Final Session fact ${event.id} has invalid pending Kernel-completed task identities.`
+      `Turn execution evidence fact ${event.id} has invalid pending Kernel-completed task identities.`
     );
   }
   const authority = sessionTurnAuthorityEventByRef(
@@ -733,12 +733,12 @@ function materializeFinalKernelEffectClaims(
   if (!authority) {
     throw new SessionAppendCoordinatorError(
       'session_fact_lineage_unavailable',
-      `Final Session fact ${event.id} cannot materialize Kernel effect claims without turn authority.`
+      `Turn execution evidence fact ${event.id} cannot materialize Kernel effect claims without turn authority.`
     );
   }
   if (taskIds.length === 0) {
     const {
-      [FINAL_KERNEL_EFFECT_TASK_IDS_STAGING_FIELD]: _stagingTaskIds,
+      [TURN_KERNEL_EFFECT_TASK_IDS_STAGING_FIELD]: _stagingTaskIds,
       ...persistentPayload
     } = payload;
     return {
@@ -810,11 +810,11 @@ function materializeFinalKernelEffectClaims(
   if (missingTaskIds.length > 0) {
     throw new SessionAppendCoordinatorError(
       'session_kernel_effect_claim_unavailable',
-      `Final Session fact ${event.id} has no exact checkpoint work-unit mapping for tasks ${missingTaskIds.join(',')}.`
+      `Turn execution evidence fact ${event.id} has no exact checkpoint work-unit mapping for tasks ${missingTaskIds.join(',')}.`
     );
   }
   const {
-    [FINAL_KERNEL_EFFECT_TASK_IDS_STAGING_FIELD]: _stagingTaskIds,
+    [TURN_KERNEL_EFFECT_TASK_IDS_STAGING_FIELD]: _stagingTaskIds,
     ...persistentPayload
   } = payload;
   return {
@@ -840,18 +840,20 @@ function requiredKernelFactRefs(
   const payload = objectRecord(event.payload) ?? {};
   const explicitKernelRef = stringValue(payload.kernelFactEventRef);
   const finalAssistant = isFinalAssistantFact(event, payload);
+  const reviewEvidence = isWaitingReviewExecutionEvidenceFact(event, payload);
+  const executionEvidenceFact = finalAssistant || reviewEvidence;
   if (
-    finalAssistant
+    executionEvidenceFact
     && payload.requiresKernelFacts !== undefined
     && typeof payload.requiresKernelFacts !== 'boolean'
   ) {
     throw new SessionAppendCoordinatorError(
       'session_fact_lineage_invalid',
-      `Final Session fact ${event.id} requiresKernelFacts must be boolean.`
+      `Turn execution evidence fact ${event.id} requiresKernelFacts must be boolean.`
     );
   }
-  const effectClaims = finalAssistant
-    ? finalKernelEffectClaims(payload, event.id)
+  const effectClaims = executionEvidenceFact
+    ? turnKernelEffectClaims(payload, event.id)
     : [];
   const authority = sessionTurnAuthorityEventByRef(
     events.slice(0, eventIndex),
@@ -867,13 +869,19 @@ function requiredKernelFactRefs(
     );
   }
   if (
-    finalAssistant
+    executionEvidenceFact
     && payload.requiresKernelFacts === true
     && effectClaims.length === 0
   ) {
     throw new SessionAppendCoordinatorError(
       'session_fact_lineage_invalid',
-      `Final Session fact ${event.id} requires exact per-task Kernel effect claims.`
+      `Turn execution evidence fact ${event.id} requires exact per-task Kernel effect claims.`
+    );
+  }
+  if (reviewEvidence && payload.requiresKernelFacts !== true) {
+    throw new SessionAppendCoordinatorError(
+      'session_fact_lineage_invalid',
+      `Waiting review execution evidence fact ${event.id} must require exact Kernel facts.`
     );
   }
   const candidates = events.slice(0, eventIndex).filter((candidate) => {
@@ -898,10 +906,10 @@ function requiredKernelFactRefs(
       `Session fact ${event.id} references a Kernel fact from another run.`
     );
   }
-  if (finalAssistant && !requiresKernelFacts && refs.length > 0) {
+  if (executionEvidenceFact && !requiresKernelFacts && refs.length > 0) {
     throw new SessionAppendCoordinatorError(
       'session_fact_lineage_invalid',
-      `Final Session fact ${event.id} has unclaimed Kernel facts.`
+      `Turn execution evidence fact ${event.id} has unclaimed Kernel facts.`
     );
   }
   if (effectClaims.length > 0) {
@@ -925,7 +933,7 @@ function requiredKernelFactRefs(
       if (missingOperations.length > 0 || missingWorkUnits.length > 0) {
         throw new SessionAppendCoordinatorError(
           'session_fact_lineage_invalid',
-          `Final Session fact ${event.id} is missing exact Kernel terminal/effect refs for task ${claim.taskId}: operations=${missingOperations.join(',') || 'none'} workUnits=${missingWorkUnits.join(',') || 'none'}.`
+          `Turn execution evidence fact ${event.id} is missing exact Kernel terminal/effect refs for task ${claim.taskId}: operations=${missingOperations.join(',') || 'none'} workUnits=${missingWorkUnits.join(',') || 'none'}.`
         );
       }
     }
@@ -949,21 +957,49 @@ function isFinalAssistantFact(
   return event.kind === 'assistant_msg' && stringValue(payload.channel) === 'final';
 }
 
-interface FinalKernelEffectClaimRecord {
+function isWaitingReviewFact(
+  event: AgentEvent,
+  payload: Record<string, unknown>
+): boolean {
+  return event.kind === 'review_summary'
+    && stringValue(payload.status) === 'waitingUserReview';
+}
+
+function isTurnExecutionEvidenceStagingTarget(
+  event: AgentEvent,
+  payload: Record<string, unknown>
+): boolean {
+  return isFinalAssistantFact(event, payload)
+    || isWaitingReviewFact(event, payload);
+}
+
+function isWaitingReviewExecutionEvidenceFact(
+  event: AgentEvent,
+  payload: Record<string, unknown>
+): boolean {
+  return isWaitingReviewFact(event, payload)
+    && (
+      payload.requiresKernelFacts !== undefined
+      || payload.kernelEffectClaims !== undefined
+      || payload[TURN_KERNEL_EFFECT_TASK_IDS_STAGING_FIELD] !== undefined
+    );
+}
+
+interface TurnKernelEffectClaimRecord {
   readonly taskId: string;
   readonly operationIds: string[];
   readonly workUnitIds: string[];
 }
 
-function finalKernelEffectClaims(
+function turnKernelEffectClaims(
   payload: Record<string, unknown>,
   eventId: string
-): FinalKernelEffectClaimRecord[] {
+): TurnKernelEffectClaimRecord[] {
   if (payload.kernelEffectClaims === undefined) return [];
   if (!Array.isArray(payload.kernelEffectClaims)) {
     throw new SessionAppendCoordinatorError(
       'session_fact_lineage_invalid',
-      `Final Session fact ${eventId} kernelEffectClaims must be an array.`
+      `Turn execution evidence fact ${eventId} kernelEffectClaims must be an array.`
     );
   }
   const taskIds = new Set<string>();
@@ -983,7 +1019,7 @@ function finalKernelEffectClaims(
     ) {
       throw new SessionAppendCoordinatorError(
         'session_fact_lineage_invalid',
-        `Final Session fact ${eventId} has an invalid Kernel effect claim at index ${index}.`
+        `Turn execution evidence fact ${eventId} has an invalid Kernel effect claim at index ${index}.`
       );
     }
     if (
@@ -993,7 +1029,7 @@ function finalKernelEffectClaims(
     ) {
       throw new SessionAppendCoordinatorError(
         'session_fact_lineage_invalid',
-        `Final Session fact ${eventId} has duplicated Kernel effect claim identities.`
+        `Turn execution evidence fact ${eventId} has duplicated Kernel effect claim identities.`
       );
     }
     taskIds.add(taskId);

@@ -7,6 +7,7 @@ import {
   localizedProjectionText,
   type ProjectionLanguageBinding,
 } from './conversationPresentationLanguage.js';
+import { TURN_KERNEL_EFFECT_TASK_IDS_STAGING_FIELD } from '../authority/finalSettlementEvidence.js';
 
 export interface ReviewProjectionPlan {
   userPlan: string;
@@ -152,6 +153,11 @@ export class ReviewProjectionBuilder<
         ports.acceptedPlanBatchCompletedTaskIds(acceptedPlanForReview, input.plan, kernelEvents)
       ))
       : undefined);
+    const kernelCompletedTaskIds = reviewKernelCompletedTaskIds(
+      reviewTaskLedger,
+      input.plan.runId,
+      input.plan.planId
+    );
     const reviewFactsContextInput: ReviewFactsContextInput<TaskLedger> = {
       planId: input.plan.planId,
       runId: input.plan.runId,
@@ -225,6 +231,12 @@ export class ReviewProjectionBuilder<
         gitReview,
         readableReview,
         reviewFactsContext,
+        ...(kernelCompletedTaskIds.length > 0
+          ? {
+              [TURN_KERNEL_EFFECT_TASK_IDS_STAGING_FIELD]:
+                kernelCompletedTaskIds,
+            }
+          : {}),
         changedFiles: readableReview.changedFiles,
         developerDetails: {
           facts,
@@ -751,6 +763,44 @@ function stringValue(value: unknown): string | undefined {
 
 function stringArrayValue(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0) : [];
+}
+
+function reviewKernelCompletedTaskIds(
+  taskLedger: unknown,
+  runId: string,
+  planId: string
+): string[] {
+  const ledger = objectRecord(taskLedger);
+  const value = ledger?.completedTaskIds;
+  if (value === undefined) return [];
+  if (
+    stringValue(ledger?.schemaVersion) !== 'deepcode.session.task-ledger.v1'
+    || stringValue(ledger?.runId) !== runId
+    || stringValue(ledger?.planId) !== planId
+  ) {
+    throw new Error(
+      'session_review_projection_invalid: task ledger does not match the active run and plan.'
+    );
+  }
+  if (!Array.isArray(value)) {
+    throw new Error(
+      'session_review_projection_invalid: task ledger completedTaskIds must be an array.'
+    );
+  }
+  const taskIds = value.map((taskId) =>
+    typeof taskId === 'string' && taskId.trim() === taskId && taskId.length > 0
+      ? taskId
+      : undefined
+  );
+  if (
+    taskIds.some((taskId) => taskId === undefined)
+    || new Set(taskIds).size !== taskIds.length
+  ) {
+    throw new Error(
+      'session_review_projection_invalid: task ledger has invalid Kernel-completed task identities.'
+    );
+  }
+  return taskIds as string[];
 }
 
 function clip(value: string, max: number): string {

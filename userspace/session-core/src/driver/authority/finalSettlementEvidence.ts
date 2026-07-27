@@ -1,6 +1,6 @@
 import type { AcceptedTaskPlanContext } from '../../accepted-plan/types.js';
 
-export const FINAL_KERNEL_EFFECT_TASK_IDS_STAGING_FIELD =
+export const TURN_KERNEL_EFFECT_TASK_IDS_STAGING_FIELD =
   'kernelEffectTaskIdsPendingMaterialization';
 
 export class FinalSettlementEvidenceError extends Error {
@@ -28,5 +28,5 @@ export function finalSettlementEvidenceMetadata(
       'Kernel-completed task identities must be non-empty before final settlement.'
     );
   }
-  return { [FINAL_KERNEL_EFFECT_TASK_IDS_STAGING_FIELD]: completedTaskIds };
+  return { [TURN_KERNEL_EFFECT_TASK_IDS_STAGING_FIELD]: completedTaskIds };
 }
