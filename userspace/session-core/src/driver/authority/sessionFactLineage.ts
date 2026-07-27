@@ -482,13 +482,11 @@ export function validateSessionFactLineage(
   );
   validateConsumerAuthorityIdentity(input.event, authority, languagePolicy);
   validateLineageProducer(input, lineage, authority);
-  validateEarlierRefs(
+  validateExactAuthorityDomainParent(
     input.events,
     input.eventIndex,
-    lineage.domainParentRefs,
-    'domain parent',
-    (event) => sessionFactLineageDisposition(event) === 'persistentDomainFact'
-      && Boolean(sessionFactLineage(event))
+    input.event,
+    lineage
   );
   if (lineage.producer.kind === 'sessionRule') {
     validateEarlierRefs(
@@ -871,6 +869,37 @@ function validateEarlierRefs(
         `Session fact at index ${consumerIndex} has invalid ${label} ref ${ref}.`
       );
     }
+  }
+}
+
+function validateExactAuthorityDomainParent(
+  events: readonly AgentEvent[],
+  consumerIndex: number,
+  consumer: AgentEvent,
+  lineage: SessionFactLineageV1
+): void {
+  let expectedParentId: string | undefined;
+  for (let index = consumerIndex - 1; index >= 0; index -= 1) {
+    const candidate = events[index]!;
+    if (sessionFactLineageDisposition(candidate) !== 'persistentDomainFact') {
+      continue;
+    }
+    const candidateLineage = sessionFactLineage(candidate);
+    if (candidateLineage?.turnAuthorityRef !== lineage.turnAuthorityRef) {
+      continue;
+    }
+    expectedParentId = candidate.id;
+    break;
+  }
+  const exact = expectedParentId
+    ? lineage.domainParentRefs.length === 1
+      && lineage.domainParentRefs[0] === expectedParentId
+    : lineage.domainParentRefs.length === 0;
+  if (!exact) {
+    throw new SessionFactLineageError(
+      'session_fact_lineage_invalid',
+      `Session fact ${consumer.id} must reference the latest earlier same-authority domain fact${expectedParentId ? ` ${expectedParentId}` : ''}.`
+    );
   }
 }
 
