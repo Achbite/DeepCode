@@ -1,5 +1,4 @@
 import type {
-  AgentEvent,
   ProjectionDelta,
 } from '@deepcode/protocol';
 import type {
@@ -9,16 +8,6 @@ import type {
   NativeToolTurnResult,
 } from '../../provider/NativeToolTurnHandler.js';
 import type { NativeToolCallProposal } from '../../provider/providerStreamParts.js';
-import {
-  providerCommitEventsDeferred,
-  queueProviderCommitEvents,
-  type ProviderCommitBufferState,
-} from './providerCommitBuffer.js';
-
-export interface NativeToolProgressPayloadBuilderLike {
-  assistantProgressPayload(input: { runId: string; content: string }): Record<string, unknown>;
-}
-
 export interface NativeToolProjectionBuilderLike {
   checkpointDelta(input: {
     sessionId: string;
@@ -32,15 +21,25 @@ export interface NativeToolProjectionBuilderLike {
 export interface NativeToolHandlerPortsFactoryDependencies<
   TState extends NativeToolTurnHandlerState,
 > {
-  progressEventBuilder: NativeToolProgressPayloadBuilderLike;
   projectionBuilder: NativeToolProjectionBuilderLike;
-  event(sessionId: string, kind: AgentEvent['kind'], payload: unknown): AgentEvent;
-  append(sessionId: string, events: AgentEvent[]): Promise<unknown>;
   emitProjectionDelta(state: TState, delta: ProjectionDelta): Promise<void>;
+  recordSemanticDirectiveAdmission?(
+    state: TState,
+    turn: NativeToolTurnResult,
+    toolCall: NativeToolCallProposal
+  ): Promise<void>;
   recordSemanticExchange?(
     state: TState,
+    turn: NativeToolTurnResult,
     toolCall: NativeToolCallProposal,
     result: NativeToolSemanticHandlingResult
+  ): Promise<void>;
+  recordSemanticDirectiveTerminal?(
+    state: TState,
+    turn: NativeToolTurnResult,
+    toolCall: NativeToolCallProposal,
+    status: 'failed' | 'cancelled' | 'superseded' | 'postEffectPersistenceFailed',
+    error: unknown
   ): Promise<void>;
 }
 
@@ -59,20 +58,6 @@ export class NativeToolHandlerPortsFactory<
 
   create(input: NativeToolHandlerPortsFactoryInput<TState>): NativeToolTurnHandlerPorts<TState> {
     return {
-      appendAssistantProgress: async (state, narration) => {
-        const events = [
-          this.dependencies.event(state.sessionId, 'assistant_msg', this.dependencies.progressEventBuilder.assistantProgressPayload({
-            runId: state.runId,
-            content: narration,
-          })),
-        ];
-        const commitState = state as TState & ProviderCommitBufferState;
-        if (providerCommitEventsDeferred(commitState)) {
-          queueProviderCommitEvents(commitState, events);
-          return;
-        }
-        await this.dependencies.append(state.sessionId, events);
-      },
       emitCheckpoint: async (state, nativeToolRound, toolCallCount) => {
         const resourcePacketCount = Array.isArray((state as unknown as { resourcePackets?: unknown[] }).resourcePackets)
           ? (state as unknown as { resourcePackets: unknown[] }).resourcePackets.length
@@ -85,9 +70,20 @@ export class NativeToolHandlerPortsFactory<
           resourcePacketCount,
         }));
       },
+      recordSemanticDirectiveAdmission: (state, turn, toolCall) =>
+        this.dependencies.recordSemanticDirectiveAdmission?.(state, turn, toolCall)
+          ?? Promise.resolve(),
       semanticDirective: (state, toolCall) => input.semanticDirective(state, toolCall),
-      recordSemanticExchange: (state, toolCall, result) =>
-        this.dependencies.recordSemanticExchange?.(state, toolCall, result) ?? Promise.resolve(),
+      recordSemanticDirectiveTerminal: (state, turn, toolCall, status, error) =>
+        this.dependencies.recordSemanticDirectiveTerminal?.(
+          state,
+          turn,
+          toolCall,
+          status,
+          error
+        ) ?? Promise.resolve(),
+      recordSemanticExchange: (state, turn, toolCall, result) =>
+        this.dependencies.recordSemanticExchange?.(state, turn, toolCall, result) ?? Promise.resolve(),
     };
   }
 }

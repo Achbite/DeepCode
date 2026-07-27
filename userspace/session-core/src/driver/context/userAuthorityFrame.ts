@@ -34,11 +34,26 @@ export interface UserAuthorityFrame {
   readonly rootMessage: UserAuthorityMessage;
   readonly explicitMessages: readonly UserAuthorityMessage[];
   readonly currentMessages: readonly UserAuthorityMessage[];
+  /**
+   * Exact durable event identity for `turnAuthority`.
+   *
+   * The authority payload hash proves the payload material, but it does not
+   * identify which persisted event established the active turn. Session facts
+   * must reference this event id rather than reselecting the latest authority.
+   */
+  readonly turnAuthorityRef: string;
   readonly turnAuthority: SessionTurnAuthorityPayload;
   readonly decisionRefs: readonly UserAuthorityDecisionRef[];
   readonly languagePolicy: ConversationLanguagePolicy;
   readonly effectiveLanguage: ConversationLanguage;
   readonly autonomyMode: AutonomyMode;
+}
+
+export interface SessionTurnAuthorityEventRef {
+  readonly eventId: string;
+  readonly eventIndex: number;
+  readonly event: AgentEvent;
+  readonly payload: SessionTurnAuthorityPayload;
 }
 
 export interface CreateSessionTurnAuthorityEventInput {
@@ -139,7 +154,7 @@ export function buildUserAuthorityFrame(
     sourceKind: 'userMessage',
   });
   const effectiveMessages = explicitMessages.length ? explicitMessages : [fallbackMessage];
-  const persisted = latestSessionTurnAuthority(events, options.runId);
+  const persisted = latestSessionTurnAuthorityEvent(events, options.runId);
   if (!persisted) {
     if (hasLegacySessionTurnAuthority(events, options.runId)) {
       throw new UserAuthorityFrameError(
@@ -152,7 +167,7 @@ export function buildUserAuthorityFrame(
       `Session run ${options.runId ?? 'unknown'} has no persisted CurrentTurnAuthority binding.`
     );
   }
-  const turnAuthority = persisted;
+  const turnAuthority = persisted.payload;
   const currentMessages = resolveCurrentMessages(effectiveMessages, turnAuthority);
   if (currentMessages.length !== turnAuthority.sourceMessageIds.length) {
     throw new UserAuthorityFrameError(
@@ -173,6 +188,7 @@ export function buildUserAuthorityFrame(
     rootMessage: effectiveMessages[0] ?? fallbackMessage,
     explicitMessages: effectiveMessages,
     currentMessages,
+    turnAuthorityRef: persisted.eventId,
     turnAuthority,
     decisionRefs: collectDecisionRefs(events),
     languagePolicy,
@@ -190,14 +206,59 @@ export function latestSessionTurnAuthority(
   events: readonly AgentEvent[],
   runId?: string
 ): SessionTurnAuthorityPayload | undefined {
+  return latestSessionTurnAuthorityEvent(events, runId)?.payload;
+}
+
+export function latestSessionTurnAuthorityEvent(
+  events: readonly AgentEvent[],
+  runId?: string
+): SessionTurnAuthorityEventRef | undefined {
   for (let index = events.length - 1; index >= 0; index -= 1) {
     const event = events[index];
     if (event?.kind !== 'session_turn_authority') continue;
-    const payload = sessionTurnAuthorityPayload(event.payload);
+    const payload = parseSessionTurnAuthorityPayload(event.payload);
     if (!payload || (runId && payload.runId !== runId)) continue;
-    return payload;
+    return {
+      eventId: event.id,
+      eventIndex: index,
+      event,
+      payload,
+    };
   }
   return undefined;
+}
+
+export function sessionTurnAuthorityEventByRef(
+  events: readonly AgentEvent[],
+  eventId: string
+): SessionTurnAuthorityEventRef | undefined {
+  const normalizedRef = eventId.trim();
+  if (!normalizedRef) return undefined;
+  for (let index = 0; index < events.length; index += 1) {
+    const event = events[index];
+    if (event?.id !== normalizedRef || event.kind !== 'session_turn_authority') continue;
+    const payload = parseSessionTurnAuthorityPayload(event.payload);
+    if (!payload) return undefined;
+    return {
+      eventId: event.id,
+      eventIndex: index,
+      event,
+      payload,
+    };
+  }
+  return undefined;
+}
+
+export function sessionTurnAuthorities(
+  events: readonly AgentEvent[],
+  runId?: string
+): SessionTurnAuthorityPayload[] {
+  return events.flatMap((event): SessionTurnAuthorityPayload[] => {
+    if (event.kind !== 'session_turn_authority') return [];
+    const payload = parseSessionTurnAuthorityPayload(event.payload);
+    if (!payload || (runId && payload.runId !== runId)) return [];
+    return [payload];
+  });
 }
 
 export function hasLegacySessionTurnAuthority(
@@ -246,7 +307,9 @@ function resolveCurrentMessages(
   });
 }
 
-function sessionTurnAuthorityPayload(value: unknown): SessionTurnAuthorityPayload | undefined {
+export function parseSessionTurnAuthorityPayload(
+  value: unknown
+): SessionTurnAuthorityPayload | undefined {
   const record = objectRecord(value);
   if (record?.schemaVersion !== 'deepcode.session.turn-authority.v2') return undefined;
   const sessionId = stringValue(record.sessionId);

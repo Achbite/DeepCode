@@ -52,6 +52,7 @@ export interface NativeToolProviderCoordinatorDependencies<
 
 export interface NativeToolProviderCoordinatorInput<TState extends NativeToolProviderCoordinatorState> {
   profileId?: string;
+  stage?: string;
   state: TState;
   prompt: PromptEnvelope;
   contract: DriverProviderTurnFrame;
@@ -68,6 +69,7 @@ export class NativeToolProviderCoordinator<
   ): Promise<ProposalEnvelope | NativeToolProviderResumeSignal> {
     return this.dependencies.providerLoop.run({
       profileId: input.profileId,
+      stage: input.stage,
       state: input.state,
       prompt: input.prompt,
       contract: input.contract,

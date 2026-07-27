@@ -17,8 +17,14 @@ import type {
   ProviderTurnRunnerState,
 } from './providerTurnRunner.js';
 
-export interface ProviderRuntimeBridgePorts<State> extends ProviderTurnRunnerPorts {
-  consumeGuidanceMessages(state: State, stage: string): Promise<LlmChatRequest['messages']>;
+export interface ProviderRuntimeCallControl {
+  readonly abortSignal?: AbortSignal;
+  readonly consumeGuidance?: boolean;
+  readonly stream?: boolean;
+}
+
+export interface ProviderRuntimeBridgePorts<State extends ProviderTurnRunnerState>
+  extends ProviderTurnRunnerPorts<State> {
   createError(code: string, message: string): Error;
 }
 
@@ -41,6 +47,7 @@ export class ProviderRuntimeBridge<
 
   runWithNativeTools(input: {
     profileId?: string;
+    stage?: string;
     state: State;
     prompt: PromptEnvelope;
     contract: DriverProviderTurnFrame;
@@ -68,7 +75,8 @@ export class ProviderRuntimeBridge<
     state: State,
     stage: string,
     messages: LlmChatRequest['messages'],
-    options: Pick<LlmChatRequest, 'responseFormat' | 'tools'> = {}
+    options: Pick<LlmChatRequest, 'responseFormat' | 'tools'> = {},
+    control: ProviderRuntimeCallControl = {}
   ): Promise<Turn> {
     return this.dependencies.providerTurnRunner.run({
       profileId,
@@ -76,11 +84,14 @@ export class ProviderRuntimeBridge<
       stage,
       messages,
       options,
+      abortSignal: control.abortSignal,
+      consumeGuidance: control.consumeGuidance,
+      stream: control.stream,
       ports: this.ports,
     }) as unknown as Promise<Turn>;
   }
 
   consumeGuidanceMessages(state: State, stage: string): Promise<LlmChatRequest['messages']> {
-    return this.ports.consumeGuidanceMessages(state, stage);
+    return this.ports.consumeGuidanceMessages?.(state, stage) ?? Promise.resolve([]);
   }
 }

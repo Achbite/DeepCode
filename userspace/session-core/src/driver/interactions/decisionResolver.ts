@@ -31,6 +31,11 @@ import {
   normalizeHostLanguage,
   resolveConversationLanguagePolicy,
 } from '../context/conversationLanguagePolicy.js';
+import {
+  conversationPresentationLanguageBindingFromEvents,
+  localizedProjectionText,
+  type ProjectionLanguageBinding,
+} from '../projection/index.js';
 
 export type DecisionResolverKind = 'requirement' | 'plan' | 'review' | 'permission' | 'boundary';
 export type DecisionResolverDecision = 'accept' | 'reject' | 'revise';
@@ -39,6 +44,7 @@ export type DecisionResolverInterventionLevel = InterventionLevel;
 
 export interface DecisionResolverInput {
   sessionId: string;
+  hostRunId?: string;
   kind: DecisionResolverKind;
   decision: DecisionResolverDecision;
   guidance?: string;
@@ -58,6 +64,14 @@ export interface DecisionResolverInput {
   projectMemoryMode?: ProjectMemoryMode;
   interactionOverlay?: InteractionOverlayContext;
   hostLanguage?: ConversationLanguage;
+  bootstrapEvents?: AgentEvent[];
+  admittedFreeformAuthority?: {
+    readonly messageId: string;
+    readonly runId: string;
+    readonly turnId: string;
+    readonly revision: number;
+    readonly hostLanguage: ConversationLanguage;
+  };
 }
 
 export interface DecisionResolverDiagnosticInfo {
@@ -87,9 +101,19 @@ export interface DecisionResolverPorts {
   now(): string;
   createId(prefix: string): string;
   append(sessionId: string, events: AgentEvent[]): Promise<AgentSessionResult>;
-  finalDiagnosticEvent(sessionId: string, content: string | DecisionResolverDiagnosticInfo, ts: string, id: string): AgentEvent;
+  finalDiagnosticEvent(
+    sessionId: string,
+    content: string | DecisionResolverDiagnosticInfo,
+    ts: string,
+    id: string,
+    presentationBinding: ProjectionLanguageBinding
+  ): AgentEvent;
   missingDecisionKindMessage(kind: string): string | DecisionResolverDiagnosticInfo;
   createError(code: string, message: string): Error;
+  exactDecisionTarget(
+    input: DecisionResolverInput,
+    events: AgentEvent[]
+  ): { runId: string; targetId: string } | undefined;
   resume(input: SessionLoopResumeInput): Promise<AgentSessionResult>;
   assembleReview(
     input: AcceptedPlanReviewHandoffRunInput<AcceptedPlanReviewHandoffPlan>
@@ -109,10 +133,24 @@ export class DecisionResolver {
   }
 
   private async execute(command: DecisionRunCommand): Promise<DecisionRunEffect> {
-    const input = await this.admitFreeformGuidance(command.input);
+    const current = await this.ports.append(command.input.sessionId, []);
+    if (
+      command.input.kind === 'permission'
+      && command.input.decision === 'revise'
+    ) {
+      throw this.ports.createError(
+        'session_permission_revision_unsupported',
+        'Permission requests only support accept or reject; Session did not admit free-text guidance, create a language revision, or submit a Kernel decision.'
+      );
+    }
+    const input = await this.admitFreeformGuidance({
+      ...command.input,
+      existingEvents: current.events,
+    });
     if (input.kind === 'requirement') {
-      const result = await this.settle(await this.ports.requirementHandler.resolve({
+      const result = await this.settle(input, await this.ports.requirementHandler.resolve({
         sessionId: input.sessionId,
+        hostRunId: input.hostRunId,
         decision: input.decision,
         guidance: input.guidance,
         runId: input.runId,
@@ -131,12 +169,14 @@ export class DecisionResolver {
         projectMemoryMode: input.projectMemoryMode,
         interactionOverlay: input.interactionOverlay,
         hostLanguage: input.hostLanguage,
+        admittedFreeformAuthority: input.admittedFreeformAuthority,
       }));
       return { kind: 'decisionRouted', decisionKind: 'requirement', result };
     }
     if (input.kind === 'plan') {
-      const result = await this.settle(await this.ports.planHandler.resolve({
+      const result = await this.settle(input, await this.ports.planHandler.resolve({
         sessionId: input.sessionId,
+        hostRunId: input.hostRunId,
         decision: input.decision,
         guidance: input.guidance,
         runId: input.runId,
@@ -159,8 +199,9 @@ export class DecisionResolver {
       return { kind: 'decisionRouted', decisionKind: 'plan', result };
     }
     if (input.kind === 'permission') {
-      const result = await this.settle(await this.ports.permissionHandler.resolve({
+      const result = await this.settle(input, await this.ports.permissionHandler.resolve({
         sessionId: input.sessionId,
+        hostRunId: input.hostRunId,
         decision: input.decision,
         runId: input.runId,
         targetId: input.targetId,
@@ -169,11 +210,13 @@ export class DecisionResolver {
       return { kind: 'decisionRouted', decisionKind: 'permission', result };
     }
     if (input.kind === 'review') {
-      const result = await this.settle(await this.ports.reviewHandler.resolve({
+      const result = await this.settle(input, await this.ports.reviewHandler.resolve({
         sessionId: input.sessionId,
+        hostRunId: input.hostRunId,
         decision: input.decision,
         guidance: input.guidance,
         runId: input.runId,
+        targetId: input.targetId,
         existingEvents: input.existingEvents,
         workspaceBinding: input.workspaceBinding,
         projectWorkingDirectory: input.projectWorkingDirectory,
@@ -190,21 +233,124 @@ export class DecisionResolver {
       }));
       return { kind: 'decisionRouted', decisionKind: 'review', result };
     }
+    const unsupportedCurrent = await this.ports.append(input.sessionId, []);
+    await this.settlePendingFreeformAuthority(input, unsupportedCurrent);
+    const presentationBinding = conversationPresentationLanguageBindingFromEvents(
+      input.existingEvents ?? unsupportedCurrent.events,
+      input.runId
+    );
+    const missing = this.ports.missingDecisionKindMessage(input.kind);
+    const diagnostic: DecisionResolverDiagnosticInfo = typeof missing === 'string'
+      ? { code: 'decisionResolverMissing', fallback: missing, params: { kind: input.kind } }
+      : missing;
     const result = await this.ports.append(input.sessionId, [
+      ...(input.bootstrapEvents ?? []),
       this.ports.finalDiagnosticEvent(
         input.sessionId,
-        this.ports.missingDecisionKindMessage(input.kind),
+        {
+          ...diagnostic,
+          fallback: localizedProjectionText(presentationBinding.language, {
+            zh: `决策类型“${input.kind}”尚未接入 Session DecisionResolver。`,
+            en: diagnostic.fallback,
+            neutral: `decision_kind=${input.kind} resolver=unavailable`,
+          }),
+        },
         this.ports.now(),
-        this.ports.createId('decision-unsupported')
+        this.ports.createId('decision-unsupported'),
+        presentationBinding
       ),
     ]);
     return { kind: 'unsupportedDecisionKind', decisionKind: input.kind, result };
   }
 
-  private settle(control: SessionLoopControlResult): Promise<AgentSessionResult> {
-    if (control.kind === 'return') return Promise.resolve(control.result);
+  private async settle(
+    input: DecisionResolverInput,
+    control: SessionLoopControlResult
+  ): Promise<AgentSessionResult> {
+    if (control.kind === 'return') {
+      return this.settlePendingFreeformAuthority(input, control.result);
+    }
     if (control.kind === 'resume') return this.ports.resume(control.input);
-    return this.ports.assembleReview(control.request);
+    if (input.kind === 'permission' && input.admittedFreeformAuthority) {
+      this.validatedFreeformAuthority(
+        input,
+        control.request.result,
+        control.request.runId
+      );
+      return this.ports.assembleReview(control.request);
+    }
+    const settled = await this.settlePendingFreeformAuthority(input, control.request.result);
+    return this.ports.assembleReview({
+      ...control.request,
+      result: settled,
+    });
+  }
+
+  private async settlePendingFreeformAuthority(
+    input: DecisionResolverInput,
+    current: AgentSessionResult
+  ): Promise<AgentSessionResult> {
+    const admitted = input.admittedFreeformAuthority;
+    if (!admitted) return current;
+    const { authority, policy } = this.validatedFreeformAuthority(input, current);
+    if (policy.status !== 'pending') return current;
+    return this.ports.append(input.sessionId, [
+      createSessionLanguageDecisionEvent({
+        sessionId: authority.sessionId,
+        runId: authority.runId,
+        turnId: authority.turnId,
+        revision: authority.languagePolicy.revision,
+        status: 'fallback',
+        responseLanguage: policy.hostLanguage,
+        decisionSource: 'hostFallbackMissing',
+        eventId: this.ports.createId('session-language-fallback'),
+        timestamp: this.ports.now(),
+      }),
+    ]);
+  }
+
+  private validatedFreeformAuthority(
+    input: DecisionResolverInput,
+    current: AgentSessionResult,
+    expectedRunId?: string
+  ): {
+    authority: NonNullable<ReturnType<typeof latestSessionTurnAuthority>>;
+    policy: ReturnType<typeof resolveConversationLanguagePolicy>;
+  } {
+    const admitted = input.admittedFreeformAuthority;
+    if (!admitted) {
+      throw this.ports.createError(
+        'session_turn_authority_invalid',
+        'Free-text decision authority admission is missing.'
+      );
+    }
+    if (expectedRunId && admitted.runId !== expectedRunId) {
+      throw this.ports.createError(
+        'session_turn_authority_invalid',
+        `Free-text permission authority run ${admitted.runId} does not match review run ${expectedRunId}.`
+      );
+    }
+    const authority = latestSessionTurnAuthority(current.events, admitted.runId);
+    if (
+      !authority
+      || authority.turnId !== admitted.turnId
+      || authority.languagePolicy.revision !== admitted.revision
+      || authority.languagePolicy.hostLanguage !== admitted.hostLanguage
+      || !authority.sourceMessageIds.includes(admitted.messageId)
+    ) {
+      throw this.ports.createError(
+        'session_turn_authority_invalid',
+        'Free-text decision authority no longer matches the admitted revision.'
+      );
+    }
+    const policy = resolveConversationLanguagePolicy(current.events, authority);
+    if (policy.status === 'superseded') {
+      throw this.ports.createError(
+        'session_turn_authority_invalid',
+        'Free-text decision authority was superseded before local settlement.'
+      );
+    }
+    return { authority, policy };
   }
 
   private async admitFreeformGuidance(input: DecisionResolverInput): Promise<DecisionResolverInput> {
@@ -212,7 +358,19 @@ export class DecisionResolver {
     if (!guidance) return input;
     const current = await this.ports.append(input.sessionId, []);
     const events = current.events.length ? current.events : input.existingEvents ?? [];
-    const authority = latestSessionTurnAuthority(events, input.runId);
+    const exactTarget = this.ports.exactDecisionTarget(input, events);
+    if (!exactTarget) {
+      throw this.ports.createError(
+        'session_decision_target_invalid',
+        'Free-text decision guidance requires the exact active interaction run and target identity.'
+      );
+    }
+    const admittedInput = {
+      ...input,
+      runId: exactTarget.runId,
+      targetId: exactTarget.targetId,
+    };
+    const authority = latestSessionTurnAuthority(events, exactTarget.runId);
     if (!authority) {
       const code = hasLegacySessionTurnAuthority(events, input.runId)
         ? 'session_language_policy_unavailable'
@@ -233,24 +391,26 @@ export class DecisionResolver {
       payload: {
         content: guidance,
         source: 'decisionGuidance',
-        decisionKind: input.kind,
-        targetId: input.targetId,
-        targetRunId: input.runId ?? authority.runId,
+        decisionKind: admittedInput.kind,
+        targetId: exactTarget.targetId,
+        targetRunId: exactTarget.runId,
         channel: 'user',
         visibility: 'conversation',
       },
     };
     const turnId = this.ports.createId('session-turn');
+    const hostLanguage = normalizeHostLanguage(input.hostLanguage);
+    const revision = nextConversationLanguageRevision(events);
     const authorityEvent = createSessionTurnAuthorityEvent({
       sessionId: input.sessionId,
-      runId: input.runId ?? authority.runId,
+      runId: exactTarget.runId,
       turnId,
       taskId: authority.taskId,
       messages: [{ messageId, content: guidance }],
       relation: 'interactionContinuation',
-      boundAtHookRef: `interaction.${input.kind}.decisionGuidance`,
-      languageRevision: nextConversationLanguageRevision(events),
-      hostLanguage: normalizeHostLanguage(input.hostLanguage),
+      boundAtHookRef: `interaction.${admittedInput.kind}.decisionGuidance`,
+      languageRevision: revision,
+      hostLanguage,
       promptEpochId: authority.promptEpochId,
       eventId: this.ports.createId('session-turn-authority'),
       timestamp: this.ports.now(),
@@ -273,8 +433,15 @@ export class DecisionResolver {
       authorityEvent,
     ]);
     return {
-      ...input,
+      ...admittedInput,
       existingEvents: appended.events,
+      admittedFreeformAuthority: {
+        messageId,
+        runId: exactTarget.runId,
+        turnId,
+        revision,
+        hostLanguage,
+      },
     };
   }
 }

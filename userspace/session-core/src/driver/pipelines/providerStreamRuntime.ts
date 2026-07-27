@@ -24,7 +24,6 @@ import {
 } from '../../provider/SessionSemanticDraftDecoder.js';
 import type { ProviderStreamCoordinator, ProviderStreamVisibleLanguage } from './providerStreamCoordinator.js';
 import { SessionDriverActiveTurnRuntimeAccessor } from '../runFrame.js';
-import { VISIBLE_REASONING_MAX_CHARS, projectVisibleReasoning } from '../projection/index.js';
 import { stableHash } from '../../cache/canonicalizer.js';
 
 export interface ProviderStreamRuntimeActiveTurn {
@@ -45,22 +44,10 @@ export interface ProviderStreamRuntimeState {
   activeTurn?: ProviderStreamRuntimeActiveTurn;
 }
 
-export interface ProviderReasoningDeltaBuffer {
-  pending: string;
-  lastFlushAt: number;
-  itemId?: string;
-  receivedChars: number;
-  visibleCharsEmitted: number;
-  truncated: boolean;
-}
-
 export interface ProviderStreamRuntimeDependencies<TState extends ProviderStreamRuntimeState> {
-  reasoningFlushChars: number;
-  reasoningFlushMs: number;
   semanticDraftFlushChars?: number;
   semanticDraftFlushMs?: number;
   semanticDraftMaxChars?: number;
-  visibleReasoningMaxChars?: number;
   streamCoordinator: ProviderStreamCoordinator;
   visibleLanguage(state: TState): ProviderStreamVisibleLanguage;
   providerActivity(input: {
@@ -96,200 +83,37 @@ export class ProviderStreamRuntime<TState extends ProviderStreamRuntimeState> {
     ));
   }
 
-  createReasoningBuffer(): ProviderReasoningDeltaBuffer {
-    return {
-      pending: '',
-      lastFlushAt: Date.now(),
-      itemId: this.dependencies.createId('reasoning-segment'),
-      receivedChars: 0,
-      visibleCharsEmitted: 0,
-      truncated: false,
-    };
-  }
-
   async handleEvent(input: {
     state: TState;
     stage: string;
     event: LlmChatStreamEvent;
     toolCallBuffer: ProviderToolCallBuffer;
-    reasoningBuffer: ProviderReasoningDeltaBuffer;
   }): Promise<void> {
-    const { state, stage, event, toolCallBuffer, reasoningBuffer } = input;
+    const { state, stage, event, toolCallBuffer } = input;
     const chunk = event.chunk;
     if (event.type === 'provider_delta' && chunk?.content) {
       const frames = this.consumeProviderPartFrames(state, stage, chunk.content);
       for (const frame of frames) {
         await this.submitProviderPartFrame(state, stage, frame);
       }
-      if (this.dependencies.streamCoordinator.exposesAssistantDelta(stage)) {
-        await this.dependencies.emitProjectionDelta(state, {
-          type: 'assistant_delta',
-          stage,
-          status: 'streaming',
-          channel: 'final',
-          source: 'provider',
-          itemId: chunk.callId,
-          delta: chunk.content,
-          payload: chunk.rawProvider,
-        });
-      } else if (this.dependencies.streamCoordinator.emitsJsonProgress(stage)) {
+      if (this.dependencies.streamCoordinator.emitsJsonProgress(stage)) {
         await this.emitProviderJsonStreamProgress(state, stage, chunk.content);
       }
       return;
     }
-    if (event.type === 'provider_reasoning_delta' && chunk?.content) {
-      if (!this.dependencies.streamCoordinator.exposesReasoningTrace(stage)) return;
-      await this.bufferProviderReasoningDelta(state, stage, reasoningBuffer, chunk);
-      return;
-    }
+    if (event.type === 'provider_reasoning_delta') return;
     if (event.type === 'provider_tool_call_delta' && chunk) {
-      // Preserve the provider's visible order: publish any buffered reasoning
-      // before the following structured tool activity receives its sequence.
-      await this.flushReasoningBuffer(state, stage, reasoningBuffer);
-      const language = this.dependencies.visibleLanguage(state);
       toolCallBuffer.addChunk(chunk);
-      const summary = chunk.toolCallDelta?.name
-        ? this.dependencies.streamCoordinator.toolCallPreparingSummary(chunk.toolCallDelta.name, language)
-        : this.dependencies.streamCoordinator.toolCallStreamingSummary(language);
-      await this.dependencies.emitProjectionDelta(state, {
-        type: 'tool_call_delta',
-        stage,
-        status: 'streaming',
-        channel: 'tool',
-        source: 'provider',
-        itemId: chunk.callId ?? String(chunk.index ?? 0),
-        delta: chunk.toolCallDelta?.argumentsDelta,
-        summary,
-        activity: this.dependencies.conversationActivity({
-          activityId: `provider-tool-${chunk.callId ?? chunk.index ?? 0}`,
-          kind: 'toolExecution',
-          status: 'running',
-          title: 'Provider tool call',
-          summary,
-          source: 'provider',
-          runId: state.runId,
-          toolName: chunk.toolCallDelta?.name,
-        }),
-        payload: {
-          index: chunk.index,
-          callId: chunk.callId,
-          finishReason: chunk.finishReason,
-          toolCallDelta: chunk.toolCallDelta,
-          rawProvider: chunk.rawProvider,
-        },
-      });
       await this.updateSemanticDraft(state, stage, chunk);
       return;
     }
     if (event.type === 'provider_usage') {
-      await this.dependencies.emitProjectionDelta(state, {
-        type: 'stage_delta',
-        stage,
-        status: 'running',
-        channel: 'progress',
-        source: 'provider',
-        summary: this.dependencies.streamCoordinator.usageSummary(this.dependencies.visibleLanguage(state)),
-        payload: event.usage ?? chunk?.usage,
-      });
       return;
     }
     if (event.type === 'provider_error') {
-      const summary = event.error ?? chunk?.error ?? 'Provider stream error.';
       await this.discardCurrentSemanticDrafts(state, stage, 'semantic_draft_provider_error');
-      await this.dependencies.emitProjectionDelta(state, {
-        type: 'error',
-        stage,
-        status: 'failed',
-        channel: 'progress',
-        source: 'provider',
-        summary,
-        activity: this.dependencies.conversationActivity({
-          activityId: `provider-${stage}-stream-error`,
-          kind: 'diagnostic',
-          status: 'failed',
-          title: 'Provider stream error',
-          summary,
-          source: 'provider',
-          runId: state.runId,
-        }),
-        payload: event.rawProvider ?? chunk?.rawProvider,
-      });
-    }
-  }
-
-  async flushReasoningBuffer(
-    state: TState,
-    stage: string,
-    buffer: ProviderReasoningDeltaBuffer
-  ): Promise<void> {
-    if (!buffer.pending) return;
-    const delta = buffer.pending;
-    buffer.pending = '';
-    buffer.lastFlushAt = Date.now();
-    const projected = this.projectReasoningDelta(delta, buffer);
-    if (!projected.content) return;
-    buffer.visibleCharsEmitted += projected.content.length;
-    buffer.truncated = buffer.truncated || projected.truncated;
-    await this.dependencies.emitProjectionDelta(state, {
-      type: 'reasoning_delta',
-      stage,
-      status: 'streaming',
-      channel: 'reasoning',
-      source: 'provider',
-      itemId: buffer.itemId,
-      delta: projected.content,
-      activity: this.dependencies.providerActivity({
-        runId: state.runId,
-        userRequest: state.userRequest,
-        stage,
-        status: 'running',
-        language: this.dependencies.visibleLanguage(state),
-      }),
-      payload: {
-        presentation: 'reasoningTrace',
-        streamMode: 'markdownBlocks',
-        buffered: true,
-        reasoningProjectionTruncated: buffer.truncated,
-        reasoningProjectionFullCharLength: buffer.receivedChars,
-        reasoningProjectionVisibleCharLength: buffer.visibleCharsEmitted,
-      },
-    });
-  }
-
-  private async bufferProviderReasoningDelta(
-    state: TState,
-    stage: string,
-    buffer: ProviderReasoningDeltaBuffer,
-    chunk: LlmChatResult['chunks'][number]
-  ): Promise<void> {
-    if (typeof chunk.content !== 'string' || chunk.content.length === 0) return;
-    buffer.pending += chunk.content;
-    buffer.receivedChars += chunk.content.length;
-    buffer.itemId = chunk.callId ?? buffer.itemId;
-    const now = Date.now();
-    if (
-      buffer.pending.length < this.dependencies.reasoningFlushChars &&
-      now - buffer.lastFlushAt < this.dependencies.reasoningFlushMs
-    ) {
       return;
     }
-    await this.flushReasoningBuffer(state, stage, buffer);
-  }
-
-  private projectReasoningDelta(delta: string, buffer: ProviderReasoningDeltaBuffer): { content: string; truncated: boolean } {
-    const maxChars = this.dependencies.visibleReasoningMaxChars ?? VISIBLE_REASONING_MAX_CHARS;
-    if (!Number.isFinite(maxChars) || maxChars <= 0) {
-      return { content: delta, truncated: false };
-    }
-    const remaining = maxChars - buffer.visibleCharsEmitted;
-    if (remaining <= 0) {
-      return { content: '', truncated: true };
-    }
-    const projected = projectVisibleReasoning(delta, remaining);
-    return {
-      content: projected.content,
-      truncated: projected.truncated,
-    };
   }
 
   async flushCurrentSemanticDrafts(state: TState, stage: string): Promise<void> {
@@ -345,7 +169,7 @@ export class ProviderStreamRuntime<TState extends ProviderStreamRuntimeState> {
 
   async discardCurrentSemanticDrafts(
     state: TState,
-    stage: string,
+    _stage: string,
     failureCode: string
   ): Promise<void> {
     for (const record of this.currentSemanticDrafts(state)) {
@@ -353,17 +177,6 @@ export class ProviderStreamRuntime<TState extends ProviderStreamRuntimeState> {
       if (!record.callId || !isSessionSemanticDraftToolName(toolName) || record.discarded) continue;
       record.discarded = failureCode;
       record.revision += 1;
-      const payload = semanticDraftPayload(record, toolName, 'discarded', failureCode);
-      await this.dependencies.emitProjectionDelta(state, {
-        type: 'semantic_delta',
-        stage,
-        status: 'discarded',
-        channel: 'final',
-        source: 'session',
-        itemId: record.callId,
-        summary: 'Semantic draft discarded before commit.',
-        payload,
-      });
     }
   }
 
@@ -428,8 +241,8 @@ export class ProviderStreamRuntime<TState extends ProviderStreamRuntimeState> {
   }
 
   private async publishSemanticDraft(
-    state: TState,
-    stage: string,
+    _state: TState,
+    _stage: string,
     record: SessionSemanticDraftStreamRecord,
     force: boolean
   ): Promise<void> {
@@ -452,21 +265,11 @@ export class ProviderStreamRuntime<TState extends ProviderStreamRuntimeState> {
     record.emitted = payload;
     record.lastEmittedAt = now;
     record.lastEmittedVisibleChars = draft.visibleCharLength;
-    await this.dependencies.emitProjectionDelta(state, {
-      type: 'semantic_delta',
-      stage,
-      status: 'streaming',
-      channel: 'final',
-      source: 'session',
-      itemId: record.callId,
-      summary: draft.kind === 'answer' ? 'Streaming semantic answer.' : 'Streaming semantic plan.',
-      payload,
-    });
   }
 
   private async failSemanticDraftRecord(
-    state: TState,
-    stage: string,
+    _state: TState,
+    _stage: string,
     record: SessionSemanticDraftStreamRecord,
     failureCode: string
   ): Promise<void> {
@@ -477,16 +280,6 @@ export class ProviderStreamRuntime<TState extends ProviderStreamRuntimeState> {
     record.revision += 1;
     const payload = semanticDraftPayload(record, toolName, 'failed', failureCode);
     record.emitted = payload;
-    await this.dependencies.emitProjectionDelta(state, {
-      type: 'semantic_delta',
-      stage,
-      status: 'failed',
-      channel: 'final',
-      source: 'session',
-      itemId: record.callId,
-      summary: 'Semantic draft requires repair.',
-      payload,
-    });
   }
 
   private semanticDraftForToolCall(
@@ -586,20 +379,6 @@ export class ProviderStreamRuntime<TState extends ProviderStreamRuntimeState> {
     activeTurn.submittedPartFrames ??= {};
     const frameKey = `${enrichedFrame.frameId ?? enrichedFrame.draftId}:${stableHash(JSON.stringify(enrichedFrame))}`;
     if (activeTurn.submittedPartFrames[frameKey]) return;
-    await this.dependencies.emitProjectionDelta(state, {
-      type: 'part_delta',
-      stage,
-      status: 'streaming',
-      channel: enrichedFrame.partKind === 'thinkingDelta' ? 'reasoning' : 'draft',
-      source: 'session',
-      itemId: enrichedFrame.frameId ?? enrichedFrame.draftId,
-      draftId: enrichedFrame.draftId,
-      targetPath: enrichedFrame.targetPath,
-      delta: enrichedFrame.chunk,
-      summary: enrichedFrame.summary ?? `Provider stream part: ${enrichedFrame.partKind}`,
-      payload: enrichedFrame,
-    });
-
     activeTurn.submittedPartFrames[frameKey] = true;
   }
 }

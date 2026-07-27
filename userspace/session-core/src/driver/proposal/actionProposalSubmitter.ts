@@ -8,13 +8,21 @@ import {
   normalizeProposalRouterResult,
   type ProposalRouterResult,
 } from './proposalRouter.js';
+import {
+  conversationPresentationLanguageBinding,
+  localizedProjectionText,
+  type ConversationPresentationLanguageState,
+  type ProjectionLanguageBinding,
+} from '../projection/index.js';
 
 export interface ActionProposalSubmitterInput {
   profileId?: string;
 }
 
-export interface ActionProposalSubmitterState {
+export interface ActionProposalSubmitterState extends ConversationPresentationLanguageState {
   sessionId: string;
+  runId: string;
+  phase: string;
   acceptedTaskPlan?: unknown;
 }
 
@@ -43,8 +51,23 @@ export interface ActionProposalSubmitterPorts<
     sessionId: string,
     content: string | ActionProposalSubmitterDiagnostic,
     ts: string,
-    id: string
+    id: string,
+    presentationBinding: ProjectionLanguageBinding
   ): AgentEvent;
+  sessionRunStateEvent(input: {
+    sessionId: string;
+    runId: string;
+    phase: 'failed';
+    status: 'failed';
+    reason: 'task_diagnostic';
+    decisionOwner: {
+      kind: 'session';
+      runId: string;
+      targetId: string;
+    };
+    ts: string;
+    id: string;
+  }): AgentEvent;
   diagnostic(code: string, fallback: string, params?: Record<string, string | number>): ActionProposalSubmitterDiagnostic;
 }
 
@@ -90,13 +113,38 @@ export class ActionProposalSubmitter<
   }
 
   private failClosed(state: State, code: string, fallback: string): Promise<AgentSessionResult> {
+    const presentationBinding = conversationPresentationLanguageBinding(state);
+    const localizedFallback = localizedProjectionText(presentationBinding.language, {
+      zh: code === 'providerActionOutsideAcceptedTask'
+        ? 'Provider 动作指令仅在当前已接受任务合同内有效；Session 已拒绝脱离合同的执行。'
+        : 'Provider 返回了当前 Session profile 未注册的指令；Session 已停止处理该指令。',
+      en: fallback,
+      neutral: `session_directive_rejected code=${code}`,
+    });
+    state.phase = 'failed';
+    const diagnosticId = this.ports.createId('provider-directive-rejected');
     return this.ports.append(state.sessionId, [
       this.ports.finalDiagnosticEvent(
         state.sessionId,
-        this.ports.diagnostic(code, fallback),
+        this.ports.diagnostic(code, localizedFallback),
         this.ports.now(),
-        this.ports.createId('provider-directive-rejected')
+        diagnosticId,
+        presentationBinding
       ),
+      this.ports.sessionRunStateEvent({
+        sessionId: state.sessionId,
+        runId: state.runId,
+        phase: 'failed',
+        status: 'failed',
+        reason: 'task_diagnostic',
+        decisionOwner: {
+          kind: 'session',
+          runId: state.runId,
+          targetId: diagnosticId,
+        },
+        ts: this.ports.now(),
+        id: this.ports.createId('session-run-provider-directive-rejected'),
+      }),
     ]);
   }
 }

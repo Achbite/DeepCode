@@ -8,7 +8,11 @@ export interface PendingPermissionContext {
 }
 
 export class PermissionPipeline {
-  findPendingPermissionContext(events: AgentEvent[], permissionId?: string): PendingPermissionContext | null {
+  findPendingPermissionContext(
+    events: AgentEvent[],
+    permissionId?: string,
+    runId?: string
+  ): PendingPermissionContext | null {
     const resolved = new Set<string>();
     for (let index = events.length - 1; index >= 0; index -= 1) {
       const event = events[index];
@@ -20,6 +24,7 @@ export class PermissionPipeline {
       const request = this.permissionRequestContext(event);
       if (!request?.id) continue;
       if (permissionId && request.id !== permissionId) continue;
+      if (runId && request.runId !== runId) continue;
       if (resolved.has(request.id)) continue;
       return request;
     }

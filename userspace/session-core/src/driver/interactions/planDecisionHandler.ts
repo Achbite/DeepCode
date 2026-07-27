@@ -15,6 +15,13 @@ import type {
 import type { InteractionOverlayContext, SessionTurnPhase } from '../pipelines/interactionOverlayCodec.js';
 import type { PlanContext, PlanContextIndex } from '../proposal/planContextIndex.js';
 import type { PlanProjectionBuilder } from '../projection/planProjectionBuilder.js';
+import {
+  conversationPresentationLanguageBindingFromEvents,
+  conversationPresentationLanguageFromEvents,
+  localizedProjectionText,
+  type ConversationPresentationLanguage,
+  type ProjectionLanguageBinding,
+} from '../projection/conversationPresentationLanguage.js';
 import type { AutonomyMode, InterventionLevel, ReviewContinuationMode } from '../types.js';
 import {
   decisionContinuationInput,
@@ -28,6 +35,7 @@ export type PlanDecisionHandlerInterventionLevel = InterventionLevel;
 
 export interface PlanDecisionHandlerInput {
   sessionId: string;
+  hostRunId?: string;
   decision: PlanDecisionHandlerDecision;
   guidance?: string;
   runId?: string;
@@ -75,8 +83,18 @@ export interface PlanDecisionHandlerPorts {
   createId(prefix: string): string;
   append(sessionId: string, events: AgentEvent[]): Promise<AgentSessionResult>;
   kernel(request: KernelCommandEnvelope): Promise<KernelReply>;
-  appendProjectedKernelEvents(sessionId: string, reply: KernelReply): Promise<AgentSessionResult | undefined>;
-  diagnosticEvent(sessionId: string, content: string, ts: string, id: string): AgentEvent;
+  appendProjectedKernelEvents(
+    sessionId: string,
+    reply: KernelReply,
+    language: ConversationPresentationLanguage
+  ): Promise<AgentSessionResult | undefined>;
+  diagnosticEvent(
+    sessionId: string,
+    content: string,
+    ts: string,
+    id: string,
+    presentationBinding: ProjectionLanguageBinding
+  ): AgentEvent;
   executeAcceptedActionBundlePlan(
     input: PlanDecisionHandlerInput,
     plan: PlanContext,
@@ -105,6 +123,7 @@ export interface PlanDecisionHandlerPorts {
       kind: AgentEvent['kind'];
       summary: string;
       extra: Record<string, unknown>;
+      language?: ConversationPresentationLanguage;
       ts: string;
       id: string;
     }): AgentEvent;
@@ -173,6 +192,10 @@ export class PlanDecisionHandler {
         sessionId: input.sessionId,
         plan,
         status: 'accepted',
+        presentationBinding: conversationPresentationLanguageBindingFromEvents(
+          input.existingEvents ?? [],
+          plan.runId
+        ),
         ts: this.ports.now(),
         id: this.ports.createId('plan-accepted'),
       }),
@@ -207,19 +230,27 @@ export class PlanDecisionHandler {
 
   private activePlanMatches(input: PlanDecisionHandlerInput, events: AgentEvent[]): boolean {
     const active = this.ports.activeDriverInteraction(events);
-    return active?.kind === 'plan' &&
+    return Boolean(input.runId && input.targetId) &&
+      active?.kind === 'plan' &&
       active.runId === input.runId &&
-      (!input.targetId ||
-        active.planId === input.targetId ||
-        Boolean(this.ports.planIndex.findPlanCard(events, input.runId, input.targetId)));
+      active.planId === input.targetId;
   }
 
   private appendNoop(input: PlanDecisionHandlerInput): Promise<AgentSessionResult> {
+    const binding = conversationPresentationLanguageBindingFromEvents(
+      input.existingEvents ?? [],
+      input.runId
+    );
     return this.ports.append(input.sessionId, [
       this.ports.progressProjection.traceEvent({
         sessionId: input.sessionId,
         kind: 'trace/plan_accept_noop',
-        summary: 'Plan review request is already resolved or expired; no duplicate action was taken.',
+        summary: localizedProjectionText(binding.language, {
+          zh: '计划确认请求已解决或过期，未重复执行。',
+          en: 'Plan review request is already resolved or expired; no duplicate action was taken.',
+          neutral: 'plan_decision=noop',
+        }),
+        language: binding.language,
         ts: this.ports.now(),
         id: this.ports.createId('plan-noop'),
         extra: {
@@ -255,6 +286,10 @@ export class PlanDecisionHandler {
         plan,
         status,
         summary: input.guidance,
+        presentationBinding: conversationPresentationLanguageBindingFromEvents(
+          input.existingEvents ?? [],
+          plan.runId
+        ),
         ts: this.ports.now(),
         id: this.ports.createId('plan-decision'),
       }),
@@ -322,7 +357,11 @@ export class PlanDecisionHandler {
         },
       },
     });
-    const result = await this.ports.appendProjectedKernelEvents(input.sessionId, reply);
+    const result = await this.ports.appendProjectedKernelEvents(
+      input.sessionId,
+      reply,
+      conversationPresentationLanguageFromEvents(input.existingEvents ?? [], plan.runId)
+    );
     return reply.ok ? result : undefined;
   }
 
@@ -330,12 +369,21 @@ export class PlanDecisionHandler {
     input: PlanDecisionHandlerInput,
     plan: PlanContext
   ): Promise<AgentSessionResult> {
+    const presentationBinding = conversationPresentationLanguageBindingFromEvents(
+      input.existingEvents ?? [],
+      plan.runId
+    );
     return this.ports.append(input.sessionId, [
       this.ports.diagnosticEvent(
         input.sessionId,
-        'Kernel plan authorization decision failed or the plan authorization contract is unavailable; execution was not started.',
+        localizedProjectionText(presentationBinding.language, {
+          zh: 'Kernel 计划授权决策失败或计划授权合同不可用；Session 未启动执行。',
+          en: 'Kernel plan authorization decision failed or the plan authorization contract is unavailable; execution was not started.',
+          neutral: 'plan_authorization_decision=failed execution_started=false',
+        }),
         this.ports.now(),
-        this.ports.createId('plan-authorization-decision-failed')
+        this.ports.createId('plan-authorization-decision-failed'),
+        presentationBinding
       ),
     ]);
   }

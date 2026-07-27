@@ -11,14 +11,15 @@ import type {
   CurrentTaskContext,
   TaskExecutionCursor,
 } from './types.js';
+import { acceptedPlanSettledTaskIds } from './types.js';
 
 export class AcceptedTaskRegistry {
   constructor(private readonly acceptedPlan: AcceptedTaskPlanContext | undefined) {}
 
   ledger(
     failedTaskId?: string,
-    skippedTaskIds: string[] = [],
-    acceptedIncompleteTaskIds: string[] = []
+    skippedTaskIds: string[] = this.acceptedPlan?.skippedTaskIds ?? [],
+    acceptedIncompleteTaskIds: string[] = this.acceptedPlan?.acceptedIncompleteTaskIds ?? []
   ): TaskLedgerSnapshot | undefined {
     const acceptedPlan = this.acceptedPlan;
     if (!acceptedPlan) return undefined;
@@ -67,7 +68,7 @@ export class AcceptedTaskRegistry {
     if (!acceptedPlan) return undefined;
     const ledger = this.ledger();
     const modelJudgedSufficient = new Set(acceptedPlan.modelJudgedSufficientTaskIds ?? []);
-    const settledTasks = new Set([...acceptedPlan.completedTaskIds, ...modelJudgedSufficient]);
+    const settledTasks = new Set(acceptedPlanSettledTaskIds(acceptedPlan));
     const currentTask = acceptedPlan.tasks.find((task) => !settledTasks.has(task.taskId));
     const lastResourcePacketIds = resourcePackets
       .map((packet) => packet.id)
@@ -129,12 +130,22 @@ export class AcceptedTaskRegistry {
     if (!acceptedPlan) return undefined;
     const completed = new Set(completedTaskIds);
     const modelJudgedSufficient = new Set((acceptedPlan.modelJudgedSufficientTaskIds ?? []).filter((taskId) => !completed.has(taskId)));
-    const settled = new Set([...completed, ...modelJudgedSufficient]);
+    const skippedTaskIds = (acceptedPlan.skippedTaskIds ?? []).filter((taskId) => !completed.has(taskId));
+    const acceptedIncompleteTaskIds = (acceptedPlan.acceptedIncompleteTaskIds ?? [])
+      .filter((taskId) => !completed.has(taskId));
+    const settled = new Set([
+      ...completed,
+      ...modelJudgedSufficient,
+      ...skippedTaskIds,
+      ...acceptedIncompleteTaskIds,
+    ]);
     const nextIndex = acceptedPlan.tasks.findIndex((task) => !settled.has(task.taskId));
     return {
       ...acceptedPlan,
       completedTaskIds,
       modelJudgedSufficientTaskIds: [...modelJudgedSufficient],
+      skippedTaskIds,
+      acceptedIncompleteTaskIds,
       batchIndex: nextIndex >= 0 ? nextIndex + 1 : acceptedPlan.tasks.length + 1,
     };
   }
@@ -144,12 +155,61 @@ export class AcceptedTaskRegistry {
     if (!acceptedPlan) return undefined;
     const completed = new Set(acceptedPlan.completedTaskIds);
     const modelJudgedSufficient = new Set(acceptedPlan.modelJudgedSufficientTaskIds ?? []);
+    const skippedTaskIds = (acceptedPlan.skippedTaskIds ?? []).filter(
+      (candidate) => candidate !== taskId
+    );
+    const acceptedIncompleteTaskIds = (acceptedPlan.acceptedIncompleteTaskIds ?? [])
+      .filter((candidate) => candidate !== taskId);
     if (!completed.has(taskId)) modelJudgedSufficient.add(taskId);
-    const settled = new Set([...completed, ...modelJudgedSufficient]);
+    const settled = new Set([
+      ...completed,
+      ...modelJudgedSufficient,
+      ...skippedTaskIds,
+      ...acceptedIncompleteTaskIds,
+    ]);
     const nextIndex = acceptedPlan.tasks.findIndex((task) => !settled.has(task.taskId));
     return {
       ...acceptedPlan,
       modelJudgedSufficientTaskIds: [...modelJudgedSufficient],
+      skippedTaskIds,
+      acceptedIncompleteTaskIds,
+      batchIndex: nextIndex >= 0 ? nextIndex + 1 : acceptedPlan.tasks.length + 1,
+    };
+  }
+
+  withUserSettled(input: {
+    skippedTaskIds?: string[];
+    acceptedIncompleteTaskIds?: string[];
+  }): AcceptedTaskPlanContext | undefined {
+    const acceptedPlan = this.acceptedPlan;
+    if (!acceptedPlan) return undefined;
+    const completed = new Set(acceptedPlan.completedTaskIds);
+    const modelJudgedSufficient = new Set(acceptedPlan.modelJudgedSufficientTaskIds ?? []);
+    const skipped = new Set(acceptedPlan.skippedTaskIds ?? []);
+    const acceptedIncomplete = new Set(acceptedPlan.acceptedIncompleteTaskIds ?? []);
+    for (const taskId of input.skippedTaskIds ?? []) {
+      if (!completed.has(taskId) && !modelJudgedSufficient.has(taskId)) {
+        acceptedIncomplete.delete(taskId);
+        skipped.add(taskId);
+      }
+    }
+    for (const taskId of input.acceptedIncompleteTaskIds ?? []) {
+      if (!completed.has(taskId) && !modelJudgedSufficient.has(taskId)) {
+        skipped.delete(taskId);
+        acceptedIncomplete.add(taskId);
+      }
+    }
+    const settled = new Set([
+      ...completed,
+      ...modelJudgedSufficient,
+      ...skipped,
+      ...acceptedIncomplete,
+    ]);
+    const nextIndex = acceptedPlan.tasks.findIndex((task) => !settled.has(task.taskId));
+    return {
+      ...acceptedPlan,
+      skippedTaskIds: [...skipped],
+      acceptedIncompleteTaskIds: [...acceptedIncomplete],
       batchIndex: nextIndex >= 0 ? nextIndex + 1 : acceptedPlan.tasks.length + 1,
     };
   }
@@ -158,10 +218,7 @@ export class AcceptedTaskRegistry {
     const acceptedPlan = this.acceptedPlan;
     if (!acceptedPlan) return false;
     if (!acceptedPlan.tasks.length) return true;
-    const settled = new Set([
-      ...acceptedPlan.completedTaskIds,
-      ...(acceptedPlan.modelJudgedSufficientTaskIds ?? []),
-    ]);
+    const settled = new Set(acceptedPlanSettledTaskIds(acceptedPlan));
     return acceptedPlan.tasks.every((task) => settled.has(task.taskId));
   }
 }

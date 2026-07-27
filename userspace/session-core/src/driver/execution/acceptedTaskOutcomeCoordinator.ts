@@ -12,17 +12,22 @@ import type {
   CurrentTaskContext,
   TaskExecutionCursor,
 } from '../../accepted-plan/types.js';
+import { acceptedPlanSettledTaskIds } from '../../accepted-plan/types.js';
 import type { SessionSemanticDirective } from '../../provider/SessionSemanticToolAdapter.js';
+import {
+  conversationPresentationLanguage,
+  type ConversationPresentationLanguage,
+  type ConversationPresentationLanguageState,
+} from '../projection/conversationPresentationLanguage.js';
 import type { SessionDriverTaskResourceProgress } from '../runFrame.js';
 
 export interface PendingAcceptedTaskOutcomeReview {
   readonly taskId: string;
-  readonly summary: string;
   readonly evidenceRefs: string[];
   readonly result: AgentSessionResult;
 }
 
-export interface AcceptedTaskOutcomeCoordinatorState {
+export interface AcceptedTaskOutcomeCoordinatorState extends ConversationPresentationLanguageState {
   sessionId: string;
   runId: string;
   workspaceScopeKey: string;
@@ -56,7 +61,6 @@ export interface AcceptedTaskOutcomeCoordinatorPorts<State extends AcceptedTaskO
     accepted: AcceptedTaskPlanContext;
     nextAccepted: AcceptedTaskPlanContext;
     taskId: string;
-    summary: string;
     evidenceRefs: string[];
     acceptanceResults: Array<{
       criterionIndex: number;
@@ -66,6 +70,7 @@ export interface AcceptedTaskOutcomeCoordinatorPorts<State extends AcceptedTaskO
     evidenceRevision: number;
     progress: AcceptedPlanBatchProgress;
     contextCompactRecord?: ContextAssemblyTaskLocalCompactRecord;
+    language: ConversationPresentationLanguage;
     ts: string;
     id: string;
   }): AgentEvent;
@@ -80,7 +85,8 @@ export interface AcceptedTaskOutcomeCoordinatorPorts<State extends AcceptedTaskO
     context: CurrentTaskContext | undefined,
     ts: string,
     id: string,
-    contextCompactRecord?: ContextAssemblyTaskLocalCompactRecord
+    contextCompactRecord: ContextAssemblyTaskLocalCompactRecord | undefined,
+    language: ConversationPresentationLanguage
   ): AgentEvent;
 }
 
@@ -108,10 +114,7 @@ export class AcceptedTaskOutcomeCoordinator<State extends AcceptedTaskOutcomeCoo
         'session.submit_task_outcome requires one current accepted task.'
       );
     }
-    if (
-      accepted.completedTaskIds.includes(taskId)
-      || (accepted.modelJudgedSufficientTaskIds ?? []).includes(taskId)
-    ) {
+    if (acceptedPlanSettledTaskIds(accepted).includes(taskId)) {
       throw new AcceptedTaskOutcomeError(
         'accepted_task_outcome_stale',
         `Accepted task ${taskId} is already settled.`
@@ -130,12 +133,10 @@ export class AcceptedTaskOutcomeCoordinator<State extends AcceptedTaskOutcomeCoo
     state.acceptedTaskPlan = nextAccepted;
     this.ports.refreshRuntimeState(state);
 
+    const settledTaskIds = new Set(acceptedPlanSettledTaskIds(nextAccepted));
     const remainingTaskIds = nextAccepted.tasks
       .map((task) => task.taskId)
-      .filter((candidate) => (
-        !nextAccepted.completedTaskIds.includes(candidate)
-        && !(nextAccepted.modelJudgedSufficientTaskIds ?? []).includes(candidate)
-      ));
+      .filter((candidate) => !settledTaskIds.has(candidate));
     const progress: AcceptedPlanBatchProgress = {
       actionIds: [],
       targetPaths: current.targets,
@@ -158,6 +159,7 @@ export class AcceptedTaskOutcomeCoordinator<State extends AcceptedTaskOutcomeCoo
       state.taskLocalCompactRecords,
       contextCompactRecord
     );
+    const language = conversationPresentationLanguage(state);
     const savepointId = this.ports.createId('accepted-plan-task-outcome-savepoint');
     const result = await this.ports.append(state.sessionId, [
       this.ports.taskOutcomeCheckpointEvent({
@@ -166,12 +168,12 @@ export class AcceptedTaskOutcomeCoordinator<State extends AcceptedTaskOutcomeCoo
         accepted,
         nextAccepted,
         taskId,
-        summary: directive.summary,
         evidenceRefs: directive.evidenceRefs,
         acceptanceResults: directive.acceptanceResults,
         evidenceRevision: state.resourceEvidenceRevision,
         progress,
         contextCompactRecord,
+        language,
         ts: this.ports.now(),
         id: this.ports.createId('accepted-plan-task-outcome'),
       }),
@@ -186,7 +188,8 @@ export class AcceptedTaskOutcomeCoordinator<State extends AcceptedTaskOutcomeCoo
         state.currentTaskContext,
         this.ports.now(),
         savepointId,
-        contextCompactRecord
+        contextCompactRecord,
+        language
       ),
     ]);
     if (state.taskExecutionCursor) state.taskExecutionCursor.lastSavepointId = savepointId;
@@ -195,7 +198,6 @@ export class AcceptedTaskOutcomeCoordinator<State extends AcceptedTaskOutcomeCoo
     if (planComplete) {
       state.pendingAcceptedTaskOutcomeReview = {
         taskId,
-        summary: directive.summary,
         evidenceRefs: directive.evidenceRefs,
         result,
       };

@@ -3,6 +3,10 @@ import type {
   ReadableProjectionItem,
   ReadableProjectionSection,
 } from './structuredProjectionReadModels.js';
+import {
+  localizedProjectionText,
+  type ProjectionLanguageBinding,
+} from './conversationPresentationLanguage.js';
 
 export interface ReviewProjectionPlan {
   userPlan: string;
@@ -72,7 +76,7 @@ export interface ReviewProjectionBuilderPorts<
   TaskLedger = unknown,
 > {
   reviewFactLines(kernelEvents: unknown[]): string[];
-  staticSyntaxReviewFactLines(kernelEvents: unknown[]): string[];
+  staticSyntaxReviewObservationLines(kernelEvents: unknown[]): string[];
   findReviewFacts(kernelEvents: unknown[]): Record<string, unknown> | undefined;
   concreteContinuationExpectations(value: unknown): unknown[];
   acceptedPlanContext(plan: Plan): AcceptedPlan | undefined;
@@ -94,16 +98,16 @@ export class ReviewProjectionBuilder<
     plan: Plan;
     kernelEvents: unknown[];
     events?: AgentEvent[];
+    presentationBinding: ProjectionLanguageBinding;
     ts: string;
     id: string;
   }): AgentEvent {
     const ports = this.requirePorts();
-    const decodedKernelEvents = input.kernelEvents.map((event) => decodeKernelEventV1(event));
-    const facts = [
-      ...ports.reviewFactLines(input.kernelEvents),
-      ...ports.staticSyntaxReviewFactLines(input.kernelEvents),
-    ];
-    const reviewFacts = ports.findReviewFacts(input.kernelEvents);
+    const kernelEvents = input.kernelEvents.filter((event) => !isStaticSyntaxReviewSessionFact(event));
+    const decodedKernelEvents = kernelEvents.map((event) => decodeKernelEventV1(event));
+    const facts = ports.reviewFactLines(kernelEvents);
+    const sessionModelObservations = ports.staticSyntaxReviewObservationLines(input.kernelEvents);
+    const reviewFacts = ports.findReviewFacts(kernelEvents);
     const rawGitReview = reviewFacts ? objectRecord(reviewFacts.gitReview) : undefined;
     const executionRoot = input.plan.executionRoot
       ?? latestPlanExecutionRootFromEvents(input.events ?? [], input.plan.planId);
@@ -145,7 +149,7 @@ export class ReviewProjectionBuilder<
     const reviewTaskLedger = checkpointTaskLedger ?? (acceptedPlanForReview
       ? ports.acceptedPlanTaskLedger(ports.acceptedPlanAfterBatch(
         acceptedPlanForReview,
-        ports.acceptedPlanBatchCompletedTaskIds(acceptedPlanForReview, input.plan, input.kernelEvents)
+        ports.acceptedPlanBatchCompletedTaskIds(acceptedPlanForReview, input.plan, kernelEvents)
       ))
       : undefined);
     const reviewFactsContextInput: ReviewFactsContextInput<TaskLedger> = {
@@ -178,13 +182,24 @@ export class ReviewProjectionBuilder<
         gitReview,
       }),
     };
+    const summary = localizedProjectionText(input.presentationBinding.language, {
+      zh: `复核待确认：完成 ${completed}，失败 ${failed}，阻塞 ${blocked}，工具事实 ${toolResults}。`,
+      en: `Review awaiting confirmation: completed ${completed}, failed ${failed}, blocked ${blocked}, tool facts ${toolResults}.`,
+      neutral: `Review completed=${completed} failed=${failed} blocked=${blocked} toolFacts=${toolResults}`,
+    });
     return {
       id: input.id,
       sessionId: input.sessionId,
       ts: input.ts,
       kind: 'review_summary',
       payload: {
+        title: localizedProjectionText(input.presentationBinding.language, {
+          zh: '复核',
+          en: 'Review',
+          neutral: 'Review',
+        }),
         titleKey: 'session.projection.review.title',
+        summary,
         summaryKey,
         messageKey: summaryKey,
         messageArgs: {
@@ -194,6 +209,10 @@ export class ReviewProjectionBuilder<
           toolResults: String(toolResults),
         },
         status: 'waitingUserReview',
+        presentationLanguage: input.presentationBinding.language,
+        languageRevision: input.presentationBinding.revision,
+        languageStatus: input.presentationBinding.status,
+        sourceTurnId: input.presentationBinding.sourceTurnId,
         runId: input.plan.runId,
         reviewId: `${input.plan.runId}:${input.plan.planId}`,
         sourcePlanId: input.plan.planId,
@@ -209,12 +228,14 @@ export class ReviewProjectionBuilder<
         changedFiles: readableReview.changedFiles,
         developerDetails: {
           facts,
+          sessionModelObservations,
           reviewFacts,
           gitReview,
           rawGitReview,
           reviewFactsContext,
         },
         facts,
+        sessionModelObservations,
         factCounts,
         channel: 'review',
         visibility: 'conversation',
@@ -404,6 +425,10 @@ export class ReviewProjectionBuilder<
 
 function arrayLength(value: unknown): number {
   return Array.isArray(value) ? value.length : 0;
+}
+
+function isStaticSyntaxReviewSessionFact(value: unknown): boolean {
+  return objectRecord(value)?.kind === 'accepted_plan.static_syntax_review';
 }
 
 function latestAcceptedPlanTaskLedgerFromEvents<TaskLedger>(
@@ -701,7 +726,7 @@ function reviewExpectationItems(plan: ReviewProjectionPlan): ReadableProjectionI
   for (const [index, item] of expectations.entries()) {
     const record = objectRecord(item);
     const text = stringValue(record?.description) ?? stringValue(record?.summary);
-    if (text?.trim()) items.push(projectionItem(`review-expectation-${index + 1}`, 'fact', { text: text.trim(), metadata: record }));
+    if (text?.trim()) items.push(projectionItem(`review-expectation-${index + 1}`, 'text', { text: text.trim(), metadata: record }));
   }
   return items;
 }

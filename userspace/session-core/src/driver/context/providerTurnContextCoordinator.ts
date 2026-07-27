@@ -19,7 +19,10 @@ import type {
   ResourcePacket,
 } from '../../context/types.js';
 import type { RequirementRecord } from '../../requirement/types.js';
-import type { AcceptedTaskPlanContext } from '../../accepted-plan/types.js';
+import {
+  acceptedPlanSettledTaskIds,
+  type AcceptedTaskPlanContext,
+} from '../../accepted-plan/types.js';
 import { dependencyFactsForTask } from '../../accepted-plan/TaskDependencyFacts.js';
 import type { PromptEnvelope } from '../../prompt/types.js';
 import type { HookInput, HookResult } from '../hooks/index.js';
@@ -42,6 +45,8 @@ import {
   renderProjectBootstrapSnapshot,
 } from '../../prompt/projectBootstrap.js';
 import type { AcceptedTaskReplanReason } from '../execution/artifactDraftReplanCoordinator.js';
+import type { ActiveProviderContinuation } from '../pipelines/providerContinuationMessages.js';
+import type { PendingProviderRetryAdmission } from '../pipelines/admittedProviderRequest.js';
 
 export interface ProviderTurnContextState {
   sessionId: string;
@@ -78,6 +83,8 @@ export interface ProviderTurnContextState {
   modelContextBundle?: ModelContextBundle;
   semanticDirectiveErrorSummary?: string;
   taskPlanReplanReason?: AcceptedTaskReplanReason;
+  activeProviderContinuation?: ActiveProviderContinuation;
+  pendingProviderRetry?: PendingProviderRetryAdmission;
 }
 
 export interface ProviderTurnContextInput {
@@ -87,6 +94,10 @@ export interface ProviderTurnContextInput {
   projectMemoryMode?: ProjectMemoryMode;
   interventionLevel?: ContextAssemblyInput['interventionLevel'];
   confirmedRequirement?: RequirementRecord;
+  priorUserGuidance?: readonly {
+    id: string;
+    content: string;
+  }[];
   lastResult: AgentSessionResult;
 }
 
@@ -210,7 +221,12 @@ export class ProviderTurnContextCoordinator<State extends ProviderTurnContextSta
         state.currentTaskContext?.taskId ?? 'missing-task',
         taskTemplateHash ?? 'missing-template',
       ].join(':')
-      : `${profile.id}:${state.workspaceScopeKey}`;
+      : [
+        'planning',
+        profile.id,
+        state.workspaceScopeKey,
+        state.userAuthorityFrame.turnAuthority.taskId,
+      ].join(':');
     const prompt = assembledContext.prompt;
     // ProviderTurnContract and PromptEnvelope must share one ContextAdmission assembly.
     const providerTurnFrame = this.ports.buildProviderTurnContract({
@@ -230,6 +246,24 @@ export class ProviderTurnContextCoordinator<State extends ProviderTurnContextSta
       toolIntentTemplates: this.currentTaskToolIntentTemplates(state),
       nextActionInstruction: this.nextActionInstruction(state, input.confirmedRequirement, allowedProposals),
     });
+    const continuationAuthorityChanged = Boolean(
+      state.activeProviderContinuation
+      && state.activeProviderContinuation.sourceLanguagePolicy.revision
+        !== state.userAuthorityFrame.languagePolicy.revision
+    );
+    if (
+      state.activeProviderContinuation
+      && (
+        state.semanticDirectiveErrorSummary
+        || state.taskPlanReplanReason
+        || continuationAuthorityChanged
+      )
+    ) {
+      state.activeProviderContinuation = undefined;
+    }
+    if (state.taskPlanReplanReason || continuationAuthorityChanged) {
+      state.pendingProviderRetry = undefined;
+    }
     const promptLedger = preparePromptLedger({
       state: state.promptLedger,
       profileId: profile.id,
@@ -257,6 +291,10 @@ export class ProviderTurnContextCoordinator<State extends ProviderTurnContextSta
       repairDelta: state.taskPlanReplanReason || state.semanticDirectiveErrorSummary
         ? this.compactSemanticRepairFrame(state, providerTurnFrame)
         : undefined,
+      priorUserGuidance: input.priorUserGuidance,
+      activeContinuationToolCallIds: state.activeProviderContinuation?.exchanges.map(
+        (exchange) => exchange.toolCall.id
+      ),
       now: this.ports.now(),
       createId: (prefix) => this.ports.createId(prefix),
       contextWindowTokens: assembledContext.contextAssembly.budgetPlan.contextWindowTokens,
@@ -545,10 +583,7 @@ export class ProviderTurnContextCoordinator<State extends ProviderTurnContextSta
         'Accepted task state is missing the canonical task or authorization operation arrays.'
       );
     }
-    const settled = new Set([
-      ...acceptedPlan.completedTaskIds,
-      ...(acceptedPlan.modelJudgedSufficientTaskIds ?? []),
-    ]);
+    const settled = new Set(acceptedPlanSettledTaskIds(acceptedPlan));
     const currentTask = acceptedPlan.tasks.find((task) => !settled.has(task.taskId));
     if (!currentTask) return;
     const currentOperations = acceptedPlan.authorizationOperations

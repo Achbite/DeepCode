@@ -65,7 +65,6 @@ import {
   ReviewProjectionBuilder,
   SessionFailureProjectionBuilder,
   SessionProgressProjectionBuilder,
-  VISIBLE_REASONING_MAX_CHARS,
 } from './projection/index.js';
 import { DriverInteractionIndex } from './interactions/index.js';
 import { ReviewAssembler, ReviewDecisionProjectionBuilder } from './review/index.js';
@@ -155,7 +154,7 @@ export const sessionFailureProjectionBuilder = new SessionFailureProjectionBuild
 });
 export const reviewProjectionBuilder = new ReviewProjectionBuilder<SessionPlanContext, AcceptedTaskPlanContext, TaskLedgerSnapshot>({
   reviewFactLines: (kernelEvents) => reviewAssembler().reviewFactLines(kernelEvents),
-  staticSyntaxReviewFactLines: (kernelEvents) => reviewAssembler().staticSyntaxReviewFactLines(kernelEvents),
+  staticSyntaxReviewObservationLines: (kernelEvents) => reviewAssembler().staticSyntaxReviewObservationLines(kernelEvents),
   findReviewFacts: (kernelEvents) => reviewAssembler().findReviewFacts(kernelEvents),
   concreteContinuationExpectations: (value) => implementationBatchContextBuilder().concreteContinuationExpectations(value),
   acceptedPlanContext: (plan) => plan.taskPlan
@@ -196,7 +195,8 @@ export const resourceRequestLoop = new ResourceRequestLoop({
 });
 export const nativeToolProjectionBuilder = new NativeToolProjectionBuilder({
   conversationActivity: (input) => driverActivityBuilder.conversationActivity(input),
-  packetActivity: (packet, activityId, runId) => resourceRequestLoop.packetActivity(packet, activityId, runId),
+  packetActivity: (packet, activityId, runId, language) =>
+    resourceRequestLoop.packetActivity(packet, activityId, runId, language),
   runningSummary: (toolName, language) => providerStreamCoordinator.nativeToolResolveRunningSummary(toolName, language),
   completedSummary: (toolName, language) => providerStreamCoordinator.nativeToolResolveCompletedSummary(toolName, language),
 });
@@ -205,9 +205,8 @@ export const nativeToolProviderLoop = new NativeToolProviderLoop<SessionDriverLo
   providerPipeline,
   turnHandler: nativeToolTurnHandler,
 });
-export const PROVIDER_REASONING_FLUSH_CHARS = 768;
-export const PROVIDER_REASONING_FLUSH_MS = 120;
-export { VISIBLE_REASONING_MAX_CHARS };
+export const PROVIDER_SEMANTIC_DRAFT_FLUSH_CHARS = 768;
+export const PROVIDER_SEMANTIC_DRAFT_FLUSH_MS = 120;
 export const providerTurnPolicy = new ProviderTurnPolicy();
 export const driverFailureMessageCatalog = new DriverFailureMessageCatalog();
 export const driverParseErrorCatalog = new DriverParseErrorCatalog();

@@ -3,7 +3,10 @@ import type {
   ReviewExpectationDraft,
   ValidationExpectationDraft,
 } from '../protocol/types.js';
-import type { AcceptedTaskPlanContext } from './types.js';
+import {
+  acceptedPlanSettledTaskIds,
+  type AcceptedTaskPlanContext,
+} from './types.js';
 import { AcceptedTaskRegistry } from './AcceptedTaskRegistry.js';
 import { IntentSlotRegistry } from '../driver/execution/intentSlot.js';
 
@@ -64,10 +67,7 @@ export class ExecutionPromptCoordinator<TPlan> {
     acceptedPlan: AcceptedTaskPlanContext,
     guidance?: string
   ): string {
-    const settled = new Set([
-      ...acceptedPlan.completedTaskIds,
-      ...(acceptedPlan.modelJudgedSufficientTaskIds ?? []),
-    ]);
+    const settled = new Set(acceptedPlanSettledTaskIds(acceptedPlan));
     const currentTask = acceptedPlan.tasks.find((task) => !settled.has(task.taskId));
     const registry = new AcceptedTaskRegistry(acceptedPlan);
     const taskLedger = registry.ledger();
@@ -100,11 +100,8 @@ export class ExecutionPromptCoordinator<TPlan> {
 
   sanitizedContext(acceptedPlan: AcceptedTaskPlanContext | undefined): Record<string, unknown> {
     if (!acceptedPlan) return {};
-    const completed = new Set([
-      ...acceptedPlan.completedTaskIds,
-      ...(acceptedPlan.modelJudgedSufficientTaskIds ?? []),
-    ]);
-    const currentTask = acceptedPlan.tasks.find((task) => !completed.has(task.taskId));
+    const settled = new Set(acceptedPlanSettledTaskIds(acceptedPlan));
+    const currentTask = acceptedPlan.tasks.find((task) => !settled.has(task.taskId));
     const intentSlots = this.intentSlots.currentTaskSlots(acceptedPlan);
     return {
       planId: acceptedPlan.planId,
@@ -116,8 +113,9 @@ export class ExecutionPromptCoordinator<TPlan> {
           targets: currentTask.targets,
         }
         : undefined,
-      completedTaskCount: completed.size,
-      remainingTaskCount: acceptedPlan.tasks.filter((task) => !completed.has(task.taskId)).length,
+      kernelCompletedTaskCount: acceptedPlan.completedTaskIds.length,
+      settledTaskCount: settled.size,
+      remainingTaskCount: acceptedPlan.tasks.filter((task) => !settled.has(task.taskId)).length,
       intentSlots,
     };
   }

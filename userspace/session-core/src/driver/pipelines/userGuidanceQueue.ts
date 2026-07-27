@@ -2,7 +2,6 @@ import type {
   AgentEvent,
   AgentSessionResult,
   ConversationLanguage,
-  LlmChatRequest,
   SessionTurnAuthorityPayload,
 } from '@deepcode/protocol';
 import type { UserGuidanceEvent } from '../../context/index.js';
@@ -17,11 +16,13 @@ import {
   normalizeHostLanguage,
   resolveConversationLanguagePolicy,
 } from '../context/conversationLanguagePolicy.js';
+import { SessionDriverLoopError } from '../runtimeSupport.js';
 
 export interface UserGuidanceQueueProviderResumeInput {
   sessionId: string;
   events: AgentEvent[];
   runId: string;
+  hostRunId?: string;
   taskId: string;
   stage: string;
   defaultHostLanguage?: ConversationLanguage;
@@ -34,7 +35,6 @@ export interface UserGuidanceQueueProviderResumeInput {
 export interface UserGuidanceQueueProviderResume {
   guidance: UserGuidanceEvent[];
   events: AgentEvent[];
-  messages: LlmChatRequest['messages'];
 }
 
 export interface UserGuidanceQueueConsumedInput {
@@ -42,6 +42,7 @@ export interface UserGuidanceQueueConsumedInput {
   events: AgentEvent[];
   consumedIds: string[];
   runId: string;
+  hostRunId?: string;
   appliedAtProviderStage: string;
   summary: string;
   now(): string;
@@ -53,6 +54,7 @@ export interface UserGuidanceQueueAppendConsumedInput {
   result: AgentSessionResult;
   consumedIds: string[];
   runId: string;
+  hostRunId?: string;
   appliedAtProviderStage: string;
   summary: string;
   append(sessionId: string, events: AgentEvent[]): Promise<AgentSessionResult>;
@@ -61,30 +63,59 @@ export interface UserGuidanceQueueAppendConsumedInput {
 }
 
 export class UserGuidanceQueue {
-  collectQueued(events: AgentEvent[], runId?: string): CollectedUserGuidanceEvent[] {
-    const consumedIds = new Set<string>();
-    for (const event of events.slice(-120)) {
+  collectQueued(
+    events: AgentEvent[],
+    runId: string,
+    hostRunId?: string
+  ): CollectedUserGuidanceEvent[] {
+    const consumedIdentities = new Set<string>();
+    for (const event of events) {
       if (event.kind !== 'user_guidance') continue;
       const payload = objectRecord(event.payload);
       if (!payload || stringValue(payload.status) !== 'consumed') continue;
-      consumedIds.add(stringValue(payload.guidanceId) ?? event.id);
+      const ownerRunId = guidanceOwnerRunId(payload);
+      if (!guidanceRunMatches(ownerRunId, runId, hostRunId)) continue;
+      const guidanceId = stringValue(payload.guidanceId) ?? event.id;
+      consumedIdentities.add(guidanceIdentity(
+        canonicalGuidanceRunId(ownerRunId, runId, hostRunId),
+        guidanceId
+      ));
     }
 
     const collected: CollectedUserGuidanceEvent[] = [];
-    const seen = new Set<string>();
-    for (const event of events.slice(-80)) {
+    const seen = new Map<string, GuidanceAuthorityIdentity>();
+    for (const event of events) {
       if (event.kind !== 'user_guidance') continue;
       const payload = objectRecord(event.payload);
       if (!payload || stringValue(payload.status) === 'consumed') continue;
-      const eventRunId = stringValue(payload.targetRunId) ?? stringValue(payload.runId);
-      if (runId && eventRunId && eventRunId !== runId) continue;
+      const eventRunId = guidanceOwnerRunId(payload);
+      if (!guidanceRunMatches(eventRunId, runId, hostRunId)) continue;
       const guidanceId = stringValue(payload.guidanceId) ?? event.id;
-      if (consumedIds.has(guidanceId) || seen.has(guidanceId)) continue;
+      const ownerRunId = canonicalGuidanceRunId(eventRunId, runId, hostRunId);
+      const identity = guidanceIdentity(ownerRunId, guidanceId);
+      if (consumedIdentities.has(identity)) continue;
       const content = stringContent(payload.content)
         ?? stringContent(payload.guidance)
         ?? stringContent(payload.summary);
       if (!content?.trim()) continue;
-      seen.add(guidanceId);
+      const authorityIdentity: GuidanceAuthorityIdentity = {
+        guidanceId,
+        ownerRunId,
+        content,
+        hostLanguage: normalizeConversationLanguage(payload.hostLanguage),
+        targetInteractionKind: stringValue(payload.targetInteractionKind),
+      };
+      const existing = seen.get(identity);
+      if (existing) {
+        if (!sameGuidanceAuthority(existing, authorityIdentity)) {
+          throw new SessionDriverLoopError(
+            'session_user_guidance_invalid',
+            `User guidance ${guidanceId} has conflicting authority records for run ${ownerRunId ?? 'unbound'}.`
+          );
+        }
+        continue;
+      }
+      seen.set(identity, authorityIdentity);
       collected.push({
         id: guidanceId,
         ts: event.ts,
@@ -94,13 +125,13 @@ export class UserGuidanceQueue {
         hostLanguage: normalizeConversationLanguage(payload.hostLanguage),
       });
     }
-    return collected.slice(-8);
+    return collected;
   }
 
   providerResume(input: UserGuidanceQueueProviderResumeInput): UserGuidanceQueueProviderResume {
-    const guidance = this.collectQueued(input.events, input.runId);
+    const guidance = this.collectQueued(input.events, input.runId, input.hostRunId);
     if (guidance.length === 0) {
-      return { guidance, events: [], messages: [] };
+      return { guidance, events: [] };
     }
     const authorityEvents: AgentEvent[] = [];
     let revision = nextConversationLanguageRevision(input.events);
@@ -155,7 +186,7 @@ export class UserGuidanceQueue {
       revision += 1;
     }
     if (!authority) {
-      return { guidance: [], events: [], messages: [] };
+      return { guidance: [], events: [] };
     }
     return {
       guidance,
@@ -166,27 +197,12 @@ export class UserGuidanceQueue {
           events: input.events,
           consumedIds: guidance.map((item) => item.id),
           runId: input.runId,
+          hostRunId: input.hostRunId,
           appliedAtProviderStage: input.stage,
           summary: input.summary,
           now: input.now,
           createId: input.createId,
         }),
-      ],
-      messages: [
-        {
-          role: 'user',
-          content: JSON.stringify({
-            kind: 'CurrentTurnAuthority',
-            turnId: authority.turnId,
-            taskId: authority.taskId,
-            relation: authority.relation,
-            sourceMessageIds: authority.sourceMessageIds,
-            sourceMessageHashes: authority.sourceMessageHashes,
-            languagePolicy: authority.languagePolicy,
-            authorityHash: authority.authorityHash,
-          }),
-        },
-        ...guidance.map((item) => ({ role: 'user' as const, content: item.content })),
       ],
     };
   }
@@ -195,24 +211,53 @@ export class UserGuidanceQueue {
     if (input.consumedIds.length === 0) return [];
 
     const alreadyConsumed = new Set<string>();
-    const queuedGuidance = new Map<string, AgentEvent>();
+    const queuedGuidance = new Map<string, {
+      event: AgentEvent;
+      authority: GuidanceAuthorityIdentity;
+    }>();
     for (const event of input.events) {
       if (event.kind !== 'user_guidance') continue;
       const payload = objectRecord(event.payload);
       if (!payload) continue;
       const guidanceId = stringValue(payload.guidanceId) ?? event.id;
+      const ownerRunId = guidanceOwnerRunId(payload);
+      if (!guidanceRunMatches(ownerRunId, input.runId, input.hostRunId)) continue;
       if (stringValue(payload.status) === 'consumed') {
         alreadyConsumed.add(guidanceId);
       } else {
-        queuedGuidance.set(guidanceId, event);
+        const content = stringContent(payload.content)
+          ?? stringContent(payload.guidance)
+          ?? stringContent(payload.summary);
+        if (!content?.trim()) continue;
+        const authority: GuidanceAuthorityIdentity = {
+          guidanceId,
+          ownerRunId: canonicalGuidanceRunId(
+            ownerRunId,
+            input.runId,
+            input.hostRunId
+          ),
+          content,
+          hostLanguage: normalizeConversationLanguage(payload.hostLanguage),
+          targetInteractionKind: stringValue(payload.targetInteractionKind),
+        };
+        const existing = queuedGuidance.get(guidanceId);
+        if (existing && !sameGuidanceAuthority(existing.authority, authority)) {
+          throw new SessionDriverLoopError(
+            'session_user_guidance_invalid',
+            `User guidance ${guidanceId} has conflicting authority records for run ${ownerRunId}.`
+          );
+        }
+        if (!existing) queuedGuidance.set(guidanceId, { event, authority });
       }
     }
 
     const events: AgentEvent[] = [];
+    const emitted = new Set<string>();
     for (const guidanceId of input.consumedIds) {
-      if (alreadyConsumed.has(guidanceId)) continue;
-      const source = queuedGuidance.get(guidanceId);
+      if (alreadyConsumed.has(guidanceId) || emitted.has(guidanceId)) continue;
+      const source = queuedGuidance.get(guidanceId)?.event;
       if (!source) continue;
+      emitted.add(guidanceId);
       const payload = objectRecord(source.payload) ?? {};
       events.push({
         id: input.createId('user-guidance-consumed'),
@@ -231,8 +276,12 @@ export class UserGuidanceQueue {
           appliedAtProviderStage: input.appliedAtProviderStage,
           source: 'session',
           channel: 'progress',
-          visibility: 'conversation',
-          presentation: 'body',
+          visibility: 'hidden',
+          presentation: 'traceOnly',
+        },
+        display: {
+          presentation: 'traceOnly',
+          importance: 'debug',
         },
       });
     }
@@ -245,6 +294,7 @@ export class UserGuidanceQueue {
       events: input.result.events,
       consumedIds: input.consumedIds,
       runId: input.runId,
+      hostRunId: input.hostRunId,
       appliedAtProviderStage: input.appliedAtProviderStage,
       summary: input.summary,
       now: input.now,
@@ -256,6 +306,52 @@ export class UserGuidanceQueue {
 
 interface CollectedUserGuidanceEvent extends UserGuidanceEvent {
   hostLanguage?: ConversationLanguage;
+}
+
+interface GuidanceAuthorityIdentity {
+  guidanceId: string;
+  ownerRunId?: string;
+  content: string;
+  hostLanguage?: ConversationLanguage;
+  targetInteractionKind?: string;
+}
+
+function guidanceOwnerRunId(payload: Record<string, unknown>): string | undefined {
+  return stringValue(payload.targetRunId) ?? stringValue(payload.runId);
+}
+
+function guidanceIdentity(ownerRunId: string | undefined, guidanceId: string): string {
+  return `${ownerRunId ?? 'unbound'}\u0000${guidanceId}`;
+}
+
+function canonicalGuidanceRunId(
+  ownerRunId: string | undefined,
+  sessionRunId: string,
+  hostRunId: string | undefined
+): string | undefined {
+  return guidanceRunMatches(ownerRunId, sessionRunId, hostRunId)
+    ? sessionRunId
+    : ownerRunId;
+}
+
+function guidanceRunMatches(
+  ownerRunId: string | undefined,
+  sessionRunId: string,
+  hostRunId: string | undefined
+): boolean {
+  return ownerRunId === sessionRunId
+    || (Boolean(hostRunId) && ownerRunId === hostRunId);
+}
+
+function sameGuidanceAuthority(
+  left: GuidanceAuthorityIdentity,
+  right: GuidanceAuthorityIdentity
+): boolean {
+  return left.guidanceId === right.guidanceId
+    && left.ownerRunId === right.ownerRunId
+    && left.content === right.content
+    && left.hostLanguage === right.hostLanguage
+    && left.targetInteractionKind === right.targetInteractionKind;
 }
 
 function objectRecord(value: unknown): Record<string, unknown> | undefined {

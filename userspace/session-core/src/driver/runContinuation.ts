@@ -18,6 +18,7 @@ import type { AutonomyMode, InterventionLevel, ReviewContinuationMode } from './
 
 export interface DecisionContinuationSource {
   sessionId: string;
+  hostRunId?: string;
   workspaceBinding?: AgentWorkspaceBinding;
   projectWorkingDirectory?: ProjectWorkingDirectory;
   projectId?: string;
@@ -35,6 +36,7 @@ export interface DecisionContinuationSource {
 
 export interface SessionLoopResumeInput {
   sessionId: string;
+  hostRunId?: string;
   content: string;
   attachments?: AgentContextAttachment[];
   existingEvents?: AgentEvent[];
@@ -76,6 +78,7 @@ export interface DecisionContinuationOverride {
   existingEvents?: AgentEvent[];
   workspaceBinding?: AgentWorkspaceBinding;
   projectWorkingDirectory?: ProjectWorkingDirectory;
+  requirementConfirmationMode?: 'off' | 'always';
   reviewContinuationMode?: ReviewContinuationMode;
   resumeResourcePackets?: boolean;
   confirmedRequirement?: RequirementRecord;
@@ -90,6 +93,7 @@ export interface AcceptedPlanContinuationOverride extends DecisionContinuationOv
 
 export type DecisionContinuationInput<Extra extends object = Record<string, never>> = {
   sessionId: string;
+  hostRunId?: string;
   content: string;
   attachments?: AgentContextAttachment[];
   existingEvents?: AgentEvent[];
@@ -101,7 +105,7 @@ export type DecisionContinuationInput<Extra extends object = Record<string, neve
   profileId?: string;
   workflow?: string;
   appendUserMessage: false;
-  requirementConfirmationMode: 'off';
+  requirementConfirmationMode: 'off' | 'always';
   reviewContinuationMode?: ReviewContinuationMode;
   interventionLevel?: InterventionLevel;
   autonomyMode?: AutonomyMode;
@@ -123,6 +127,7 @@ export function decisionContinuationInput<Extra extends object = Record<string, 
     existingEvents,
     workspaceBinding,
     projectWorkingDirectory,
+    requirementConfirmationMode,
     reviewContinuationMode,
     resumeResourcePackets,
     confirmedRequirement,
@@ -136,6 +141,7 @@ export function decisionContinuationInput<Extra extends object = Record<string, 
   return {
     ...extra,
     sessionId: source.sessionId,
+    hostRunId: source.hostRunId,
     content,
     attachments: attachments ?? [],
     existingEvents,
@@ -147,7 +153,7 @@ export function decisionContinuationInput<Extra extends object = Record<string, 
     profileId: source.profileId,
     workflow: source.workflow,
     appendUserMessage: false,
-    requirementConfirmationMode: 'off',
+    requirementConfirmationMode: requirementConfirmationMode ?? 'off',
     reviewContinuationMode: reviewContinuationMode ?? source.reviewContinuationMode,
     interventionLevel: source.interventionLevel,
     autonomyMode: source.autonomyMode,

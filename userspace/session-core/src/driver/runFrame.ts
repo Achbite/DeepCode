@@ -1,4 +1,12 @@
-import type { AgentEvent, AgentWorkspaceBinding, LlmChatRequest, LlmChatResult } from '@deepcode/protocol';
+import type {
+  AgentEvent,
+  AgentWorkspaceBinding,
+  ConversationLanguagePolicy,
+  LlmChatMessage,
+  LlmChatRequest,
+  LlmChatResult,
+  SessionProviderAdmissionMetadataV1,
+} from '@deepcode/protocol';
 import type {
   ContextAssemblyRecord,
   ContextAssemblyTaskLocalCompactRecord,
@@ -37,6 +45,8 @@ import type {
 import type { ArtifactDraftLease } from './execution/artifactDraftLedger.js';
 import type { AcceptedTaskReplanReason } from './execution/artifactDraftReplanCoordinator.js';
 import type { PendingAcceptedTaskOutcomeReview } from './execution/acceptedTaskOutcomeCoordinator.js';
+import type { ActiveProviderContinuation } from './pipelines/providerContinuationMessages.js';
+import type { PendingProviderRetryAdmission } from './pipelines/admittedProviderRequest.js';
 
 export interface RunFrame {
   readonly sessionId: string;
@@ -271,6 +281,7 @@ export interface ModelContextBundle {
 export interface SessionDriverIdentityState {
   sessionId: string;
   runId: string;
+  hostRunId?: string;
   userRequest: string;
   userAuthorityFrame: UserAuthorityFrame;
   phase: SessionTurnPhase;
@@ -321,6 +332,27 @@ export interface SessionDriverRepairState {
   terminalGuidanceRevisionAttempted: boolean;
 }
 
+export interface PendingSemanticToolTurn {
+  readonly providerAdmission: SessionProviderAdmissionMetadataV1;
+  readonly providerRequestId?: string;
+  readonly providerParentRequestId?: string;
+  readonly continuationBaseMessages: LlmChatRequest['messages'];
+  readonly continuationBaseMessagesDigest: string;
+  readonly sourceLanguagePolicy: ConversationLanguagePolicy;
+  readonly assistantMessage?: LlmChatMessage;
+  readonly providerProfileId?: string;
+  readonly provider?: string;
+  readonly model?: string;
+  readonly content: string;
+  readonly reasoning: string;
+}
+
+export interface PendingSemanticExchange {
+  readonly toolCall: NativeToolCallProposal;
+  readonly turn: PendingSemanticToolTurn;
+  phase: 'admitted' | 'effectStarted' | 'continuationPersistenceStarted';
+}
+
 export interface SessionDriverProviderState {
   providerTurnFrame?: DriverProviderTurnFrame;
   modelContextBundle?: ModelContextBundle;
@@ -337,7 +369,12 @@ export interface SessionDriverProviderState {
   artifactDraftLease?: ArtifactDraftLease;
   artifactChunkRepairAttempts?: Record<string, number>;
   semanticDirectiveRepairAttempts?: Record<string, number>;
-  pendingSemanticToolCalls?: Record<string, NativeToolCallProposal>;
+  pendingSemanticExchanges?: Record<string, PendingSemanticExchange>;
+  activeProviderContinuation?: ActiveProviderContinuation;
+  pendingProviderRetry?: PendingProviderRetryAdmission;
+  lastProviderResponseRequestId?: string;
+  pendingProviderAdmissions?: Record<string, SessionProviderAdmissionMetadataV1>;
+  pendingProviderProposalAdmissions?: Record<string, string>;
   pendingProviderCommitEvents?: AgentEvent[];
   providerCommitDeferred?: boolean;
 }
@@ -470,6 +507,16 @@ export interface ActiveTurnState {
 
 export interface LlmTurnResult {
   result: LlmChatResult;
+  providerAdmission: SessionProviderAdmissionMetadataV1;
+  providerRequestId?: string;
+  providerParentRequestId?: string;
+  continuationBaseMessages: LlmChatRequest['messages'];
+  continuationBaseMessagesDigest: string;
+  sourceLanguagePolicy: ConversationLanguagePolicy;
+  assistantMessage?: LlmChatMessage;
+  providerProfileId?: string;
+  provider?: string;
+  model?: string;
   content: string;
   reasoning: string;
   toolCalls: NativeToolCallProposal[];

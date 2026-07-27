@@ -34,7 +34,6 @@ export interface ProposalRouteExecutorPorts<Input, State extends ProposalRouterS
   now(): string;
   createId(prefix: string): string;
   append(sessionId: string, events: AgentEvent[]): Promise<AgentSessionResult>;
-  proposalNarrationEvent(sessionId: string, proposal: ProposalEnvelope, ts: string, id: string): AgentEvent | null;
   handleAnswer(input: Input, state: State, proposal: ProposalEnvelope): Promise<AgentSessionResult>;
   handleDecisionRequest(input: Input, state: State, proposal: ProposalEnvelope): Promise<AgentSessionResult>;
   handleDiagnostic(state: State, proposal: ProposalEnvelope): Promise<AgentSessionResult>;
@@ -110,15 +109,6 @@ export class ProposalRouteExecutor<Input, State extends ProposalRouterState> {
   async execute(routerInput: ProposalRouterInput<Input, State>): Promise<ProposalRouterResult> {
     const { input, state, prompt, proposal } = routerInput;
     let lastResult = routerInput.lastResult;
-    const narration = this.ports.proposalNarrationEvent(
-      state.sessionId,
-      proposal,
-      this.ports.now(),
-      this.ports.createId('progress-model-narration')
-    );
-    if (narration) {
-      lastResult = await this.ports.append(state.sessionId, [narration]);
-    }
 
     const routed = routerInput.routed ?? routeProposalKind(proposal);
     if (routed.kind === 'answer') {

@@ -4,13 +4,11 @@ export {
 } from './driverActivityBuilder.js';
 export {
   AssistantProjectionBuilder,
-  VISIBLE_REASONING_MAX_CHARS,
   type AssistantDiagnosticInfo,
   type AssistantProjectionLanguage,
-  type VisibleReasoningProjection,
-  projectVisibleReasoning,
 } from './assistantProjectionBuilder.js';
 export { KernelEventProjectionBuilder } from './kernelEventProjectionBuilder.js';
+export * from './conversationPresentationLanguage.js';
 export {
   SessionProgressProjectionBuilder,
   type DecisionOwnerRef,

@@ -79,6 +79,9 @@ export class AcceptedTaskPlanContextBuilder {
       interventionLevel,
       batchIndex: 1,
       completedTaskIds: [],
+      modelJudgedSufficientTaskIds: [],
+      skippedTaskIds: [],
+      acceptedIncompleteTaskIds: [],
       dependencyFacts: [],
       rawPlan,
     };

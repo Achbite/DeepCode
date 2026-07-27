@@ -4,6 +4,7 @@ import type {
   AcceptedTaskPlanTaskContext,
   AcceptedPlanBatchProgress,
 } from './types.js';
+import { acceptedPlanSettledTaskIds } from './types.js';
 
 export interface AcceptedPlanProgressAggregatorPorts {
   workUnitIdsFromKernelEvents(kernelEvents: unknown[]): string[];
@@ -28,11 +29,9 @@ export class AcceptedPlanProgressAggregator {
     const actionToolIds = new Set(uniqueStrings(actionRecords.map((action) => stringValue(action.toolId))));
     const targetPaths = uniqueStrings(actionRecords.flatMap(actionTargets));
     const workUnitIds = this.ports.workUnitIdsFromKernelEvents(kernelEvents);
-    const priorCompleted = new Set(accepted.completedTaskIds);
     const modelJudgedSufficient = new Set(accepted.modelJudgedSufficientTaskIds ?? []);
-    const currentTask = accepted.tasks.find((task) =>
-      !priorCompleted.has(task.taskId) && !modelJudgedSufficient.has(task.taskId)
-    );
+    const priorSettled = new Set(acceptedPlanSettledTaskIds(accepted));
+    const currentTask = accepted.tasks.find((task) => !priorSettled.has(task.taskId));
     const newlyCompleted = new Set<string>();
     if (
       currentTask &&
@@ -43,7 +42,12 @@ export class AcceptedPlanProgressAggregator {
     }
 
     const completedTaskIds = uniqueStrings([...accepted.completedTaskIds, ...newlyCompleted]);
-    const settled = new Set([...completedTaskIds, ...modelJudgedSufficient]);
+    const settled = new Set([
+      ...completedTaskIds,
+      ...modelJudgedSufficient,
+      ...(accepted.skippedTaskIds ?? []),
+      ...(accepted.acceptedIncompleteTaskIds ?? []),
+    ]);
     return {
       actionIds,
       targetPaths,

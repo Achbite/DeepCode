@@ -1,6 +1,8 @@
 import type {
   AgentEvent,
   AgentSessionResult,
+  ConversationLanguage,
+  LlmChatRequest,
 } from '@deepcode/protocol';
 import {
   AcceptedActionBundlePlanExecutor,
@@ -52,6 +54,7 @@ import {
 import {
   createSessionLanguageDecisionEvent,
   decideConversationLanguageFromProvider,
+  effectiveConversationLanguage,
   nextConversationLanguageRevision,
   normalizeHostLanguage,
   resolveConversationLanguagePolicy,
@@ -81,14 +84,30 @@ import { ArtifactDraftCoordinator } from './execution/artifactDraftCoordinator.j
 import { ArtifactDraftError } from './execution/artifactDraftLedger.js';
 import { ArtifactDraftReplanCoordinator } from './execution/artifactDraftReplanCoordinator.js';
 import type { NativeToolCallProposal } from '../provider/providerStreamParts.js';
+import type { ResourcePacketActivityIdentity } from './context/resourceRequestLoop.js';
+import {
+  providerAnalysisTimelineAckViolation,
+  providerSideCallSemanticFailureAnalysisEvent,
+  semanticDirectiveAdmissionAnalysisEvent,
+  semanticDirectiveTerminalAnalysisEvent,
+  semanticExchangeAnalysisEvent,
+} from '../provider/ProviderAnalysisTimeline.js';
 import {
   appendPromptLedgerCurrentTurn,
+  appendPromptLedgerGuidanceBatch,
   appendPromptLedgerSemanticExchange,
+  promptLedgerEpoch,
   promptLedgerWireSemanticExchange,
 } from '../prompt/promptLedger.js';
 import { RunEngine } from './runEngine.js';
 import { diag, isEmptyResponseError, objectRecord, SessionDriverLoopError, stringValue } from './runtimeSupport.js';
 import { AgentRunReactor } from './agentRunReactor.js';
+import { bindPendingProviderProposalAdmission } from './authority/sessionFactLineage.js';
+import {
+  conversationPresentationLanguage,
+  conversationPresentationLanguageBinding,
+  conversationPresentationLanguageBindingFromEvents,
+} from './projection/index.js';
 import {
   acceptedTaskPlanContextBuilder,
   acceptedPlanBatchPreflight,
@@ -108,7 +127,6 @@ import {
   kernelEventStatusIndex,
   nativeToolCoordinator,
   nativeToolExposurePolicy,
-  nativeToolProgressEventBuilder,
   nativeToolProviderLoop,
   nativeToolProjectionBuilder,
   permissionPipeline,
@@ -134,9 +152,8 @@ import {
   sessionProgressProjectionBuilder,
   userGuidanceQueue,
   userInputPipeline,
-  PROVIDER_REASONING_FLUSH_CHARS,
-  PROVIDER_REASONING_FLUSH_MS,
-  VISIBLE_REASONING_MAX_CHARS,
+  PROVIDER_SEMANTIC_DRAFT_FLUSH_CHARS,
+  PROVIDER_SEMANTIC_DRAFT_FLUSH_MS,
 } from './sessionDriverComponents.js';
 import type {
   SessionDecisionResolverInput,
@@ -206,20 +223,55 @@ export class SessionDriverLoop {
       append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
       kernel: (request) => this.agentRunReactor.kernel(request),
       observeKernel: async (request) => kernelEventStatusIndex.observe(await this.ports.kernelCommand(request)),
-      appendProjectedKernelEvents: (sessionId, reply) => this.agentRunReactor.appendProjectedKernelEvents(sessionId, reply),
+      appendProjectedKernelEvents: (sessionId, reply, language) =>
+        this.agentRunReactor.appendProjectedKernelEvents(sessionId, reply, language),
       kernelExecutionContractId: (report) => planReviewGrantProjector.kernelExecutionContractId(report),
       kernelExecutionContractHash: (report) => planReviewGrantProjector.kernelExecutionContractHash(report),
       recentResourcePackets: (events) => resourceRequestLoop.recentPackets(events),
       sessionRunStateEvent: (input) => sessionProgressProjectionBuilder.sessionRunStateEvent(input as Parameters<typeof sessionProgressProjectionBuilder.sessionRunStateEvent>[0]),
-      acceptedPlanActionBatchPreflightEvent: (sessionId, plan, batch, ts, id) =>
-        sessionProgressProjectionBuilder.acceptedPlanActionBatchPreflightEvent(sessionId, plan, batch, ts, id),
-      planActionBundleExecutionFailureEvents: (sessionId, plan, batchEvents, batch, ts, id) =>
-        sessionFailureProjectionBuilder.planActionBundleExecutionFailureEvents(sessionId, plan, batchEvents, batch, ts, id),
-      planActionBundleExecutionExceptionEvents: (sessionId, plan, message, code, ts, id) =>
-        sessionFailureProjectionBuilder.planActionBundleExecutionExceptionEvents(sessionId, plan, message, code, ts, id),
-      acceptedPlanBatchCheckpointEvent: (sessionId, runId, accepted, proposal, kernelEvents, progress, ts, id) =>
-        sessionProgressProjectionBuilder.acceptedPlanBatchCheckpointEvent(sessionId, runId, accepted, proposal as ProposalEnvelope, kernelEvents, progress as Parameters<typeof sessionProgressProjectionBuilder.acceptedPlanBatchCheckpointEvent>[5], ts, id),
-      acceptedPlanTaskSavepointEvent: (sessionId, runId, accepted, nextAccepted, progress, kernelEvents, cursor, context, ts, id) =>
+      acceptedPlanActionBatchPreflightEvent: (sessionId, plan, batch, ts, id, language) =>
+        sessionProgressProjectionBuilder.acceptedPlanActionBatchPreflightEvent(
+          sessionId,
+          plan,
+          batch,
+          ts,
+          id,
+          language
+        ),
+      planActionBundleExecutionFailureEvents: (sessionId, plan, batchEvents, batch, ts, id, language) =>
+        sessionFailureProjectionBuilder.planActionBundleExecutionFailureEvents(
+          sessionId,
+          plan,
+          batchEvents,
+          batch,
+          ts,
+          id,
+          language
+        ),
+      planActionBundleExecutionExceptionEvents: (sessionId, plan, message, code, ts, id, language) =>
+        sessionFailureProjectionBuilder.planActionBundleExecutionExceptionEvents(
+          sessionId,
+          plan,
+          message,
+          code,
+          ts,
+          id,
+          language
+        ),
+      acceptedPlanBatchCheckpointEvent: (sessionId, runId, accepted, proposal, kernelEvents, progress, ts, id, language) =>
+        sessionProgressProjectionBuilder.acceptedPlanBatchCheckpointEvent(
+          sessionId,
+          runId,
+          accepted,
+          proposal as ProposalEnvelope,
+          kernelEvents,
+          progress as Parameters<typeof sessionProgressProjectionBuilder.acceptedPlanBatchCheckpointEvent>[5],
+          ts,
+          id,
+          undefined,
+          language
+        ),
+      acceptedPlanTaskSavepointEvent: (sessionId, runId, accepted, nextAccepted, progress, kernelEvents, cursor, context, ts, id, language) =>
         sessionProgressProjectionBuilder.acceptedPlanTaskSavepointEvent(
           sessionId,
           runId,
@@ -230,7 +282,9 @@ export class SessionDriverLoop {
           cursor as Parameters<typeof sessionProgressProjectionBuilder.acceptedPlanTaskSavepointEvent>[6],
           context as Parameters<typeof sessionProgressProjectionBuilder.acceptedPlanTaskSavepointEvent>[7],
           ts,
-          id
+          id,
+          undefined,
+          language
         ),
       planProposal: (plan) => planContextIndex.proposalEnvelope(plan),
       recordKernelBatchProgress: (input) => acceptedPlanTaskLedger().recordKernelBatchProgress(input),
@@ -244,7 +298,8 @@ export class SessionDriverLoop {
       append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
       kernel: (request) => this.agentRunReactor.kernel(request),
       observeKernel: async (request) => kernelEventStatusIndex.observe(await this.ports.kernelCommand(request)),
-      appendProjectedKernelEvents: (sessionId, reply) => this.agentRunReactor.appendProjectedKernelEvents(sessionId, reply),
+      appendProjectedKernelEvents: (sessionId, reply, language) =>
+        this.agentRunReactor.appendProjectedKernelEvents(sessionId, reply, language),
       emitProjectionDelta: (state, delta) => this.agentRunReactor.emitProjectionDelta(state, delta),
       emitKernelActivityDeltas: (state, events, stage) => this.agentRunReactor.emitKernelActivityDeltas(state, events, stage),
       readActionBundle: (proposal) => driverActivityBuilder.readActionBundle(proposal),
@@ -253,7 +308,8 @@ export class SessionDriverLoop {
           state.sessionId,
           diag(code, fallback, params),
           this.agentRunReactor.ts(),
-          this.agentRunReactor.id(idPrefix)
+          this.agentRunReactor.id(idPrefix),
+          conversationPresentationLanguageBinding(state)
         ),
       ]),
       sessionRunStateEvent: (eventInput) =>
@@ -264,14 +320,40 @@ export class SessionDriverLoop {
       diagnosticSummary: (report) => planReviewReportAnalyzer.diagnosticSummary(report),
       executionContext: (contextInput) => acceptedPlanExecutor.executionContext(contextInput as Parameters<typeof acceptedPlanExecutor.executionContext>[0]),
       normalizeKernelBatch: (normalizeInput) => acceptedPlanExecutor.normalizeKernelBatch(normalizeInput as Parameters<typeof acceptedPlanExecutor.normalizeKernelBatch>[0]),
-      normalizationFailureEvents: (sessionId, runId, accepted, reasons, ts, id) =>
-        sessionFailureProjectionBuilder.acceptedPlanNormalizationFailureEvents(sessionId, runId, accepted, reasons, ts, id),
-      executionExceptionEvents: (sessionId, planRef, message, code, ts, id) =>
-        sessionFailureProjectionBuilder.planActionBundleExecutionExceptionEvents(sessionId, planRef, message, code, ts, id),
-      executionFailureEvents: (sessionId, runId, accepted, batchEvents, batch, ts, id) =>
-        sessionFailureProjectionBuilder.acceptedPlanExecutionFailureEvents(sessionId, runId, accepted, batchEvents, batch, ts, id),
+      normalizationFailureEvents: (sessionId, runId, accepted, reasons, ts, id, language) =>
+        sessionFailureProjectionBuilder.acceptedPlanNormalizationFailureEvents(
+          sessionId,
+          runId,
+          accepted,
+          reasons,
+          ts,
+          id,
+          language
+        ),
+      executionExceptionEvents: (sessionId, planRef, message, code, ts, id, language) =>
+        sessionFailureProjectionBuilder.planActionBundleExecutionExceptionEvents(
+          sessionId,
+          planRef,
+          message,
+          code,
+          ts,
+          id,
+          language
+        ),
+      executionFailureEvents: (sessionId, runId, accepted, batchEvents, batch, ts, id, language) =>
+        sessionFailureProjectionBuilder.acceptedPlanExecutionFailureEvents(
+          sessionId,
+          runId,
+          accepted,
+          batchEvents,
+          batch,
+          ts,
+          id,
+          language
+        ),
       preflightAudit: (batch) => acceptedPlanBatchPreflight.audit(batch),
-      acceptedPlanBatchActivitySummary: (batch) => driverActivityBuilder.acceptedPlanBatchActivitySummary(batch),
+      acceptedPlanBatchActivitySummary: (batch, language) =>
+        driverActivityBuilder.acceptedPlanBatchActivitySummary(batch, language),
       acceptedPlanBatchActivity: (activityInput) => driverActivityBuilder.acceptedPlanBatchActivity(activityInput as Parameters<typeof driverActivityBuilder.acceptedPlanBatchActivity>[0]),
       generatedPacketFromSuccessfulBatch: (state, batch, events, id) =>
         generatedArtifactEvidenceIndex().packetFromSuccessfulBatch(state, batch, events, id),
@@ -283,7 +365,7 @@ export class SessionDriverLoop {
       recordModelTaskOutcome: (outcomeInput) => acceptedPlanTaskLedger().recordModelTaskOutcome(outcomeInput),
       refreshRuntimeState: (state) => acceptedPlanTaskLedger().refreshRuntimeState(state),
       complete: (accepted) => acceptedPlanTaskLedger().complete(accepted),
-      batchCheckpointEvent: (sessionId, runId, accepted, proposal, kernelEvents, progress, ts, id, contextCompactRecord) =>
+      batchCheckpointEvent: (sessionId, runId, accepted, proposal, kernelEvents, progress, ts, id, contextCompactRecord, language) =>
         sessionProgressProjectionBuilder.acceptedPlanBatchCheckpointEvent(
           sessionId,
           runId,
@@ -293,9 +375,10 @@ export class SessionDriverLoop {
           progress as Parameters<typeof sessionProgressProjectionBuilder.acceptedPlanBatchCheckpointEvent>[5],
           ts,
           id,
-          contextCompactRecord
+          contextCompactRecord,
+          language
         ),
-      taskSavepointEvent: (sessionId, runId, accepted, nextAccepted, progress, kernelEvents, cursor, context, ts, id, contextCompactRecord) =>
+      taskSavepointEvent: (sessionId, runId, accepted, nextAccepted, progress, kernelEvents, cursor, context, ts, id, contextCompactRecord, language) =>
         sessionProgressProjectionBuilder.acceptedPlanTaskSavepointEvent(
           sessionId,
           runId,
@@ -307,7 +390,8 @@ export class SessionDriverLoop {
           context as Parameters<typeof sessionProgressProjectionBuilder.acceptedPlanTaskSavepointEvent>[7],
           ts,
           id,
-          contextCompactRecord
+          contextCompactRecord,
+          language
         ),
       executionRequest: (plan, acceptedPlan) => executionPromptCoordinator().executionRequest(plan, acceptedPlan),
       staticSyntaxReview: (reviewInput) => this.acceptedPlanStaticSyntaxReviewCoordinator.run(reviewInput),
@@ -316,7 +400,8 @@ export class SessionDriverLoop {
       now: () => this.agentRunReactor.ts(),
       createId: (prefix) => this.agentRunReactor.id(prefix),
       kernel: (request) => this.agentRunReactor.kernel(request),
-      appendProjectedKernelEvents: (sessionId, reply) => this.agentRunReactor.appendProjectedKernelEvents(sessionId, reply),
+      appendProjectedKernelEvents: (sessionId, reply, language) =>
+        this.agentRunReactor.appendProjectedKernelEvents(sessionId, reply, language),
       append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
       assertKernelReplyOk: (reply, code, fallback) =>
         assertExecutionKernelReplyOk(
@@ -332,11 +417,42 @@ export class SessionDriverLoop {
     this.acceptedPlanStaticSyntaxReviewCoordinator = new AcceptedPlanStaticSyntaxReviewCoordinator<SessionDriverLoopRunState>({
       now: () => this.agentRunReactor.ts(),
       createId: (prefix) => this.agentRunReactor.id(prefix),
+      createError: (code, message) => new SessionDriverLoopError(code, message),
       emitProjectionDelta: (state, delta) => this.agentRunReactor.emitProjectionDelta(state, delta),
-      runStaticSyntaxReview: ({ profileId, state, stage, messages }) =>
+      runStaticSyntaxReview: ({ profileId, state, stage, messages, signal }) =>
         this.providerRuntimeBridge.llmTurn(profileId, state, stage, messages, {
           tools: [...this.providerProfileRegistry.profile('review-v1').tools],
+        }, {
+          abortSignal: signal,
+          consumeGuidance: false,
+          stream: false,
         }),
+      recordStaticSyntaxReviewSemanticExchange: ({
+        state,
+        turn,
+        toolCall,
+        result,
+        stage,
+      }) => this.appendProviderSideCallSemanticExchange(
+        state,
+        turn,
+        toolCall,
+        result,
+        stage
+      ),
+      recordStaticSyntaxReviewSemanticFailure: ({
+        state,
+        turn,
+        toolCall,
+        error,
+        stage,
+      }) => this.appendProviderSideCallSemanticFailure(
+        state,
+        turn,
+        toolCall,
+        error,
+        stage
+      ),
       event: (sessionId, kind, payload) => this.agentRunReactor.event(sessionId, kind, payload),
       reviewAssembler: reviewAssembler(),
       contextFrameBuilder,
@@ -345,7 +461,8 @@ export class SessionDriverLoop {
       now: () => this.agentRunReactor.ts(),
       createId: (prefix) => this.agentRunReactor.id(prefix),
       observeKernel: async (request) => kernelEventStatusIndex.observe(await this.ports.kernelCommand(request)),
-      appendProjectedKernelEvents: (sessionId, reply) => this.agentRunReactor.appendProjectedKernelEvents(sessionId, reply),
+      appendProjectedKernelEvents: (sessionId, reply, language) =>
+        this.agentRunReactor.appendProjectedKernelEvents(sessionId, reply, language),
       append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
       permissionPipeline,
       kernelStatus: kernelEventStatusIndex,
@@ -357,10 +474,16 @@ export class SessionDriverLoop {
       createId: (prefix) => this.agentRunReactor.id(prefix),
       append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
       kernel: (request) => this.agentRunReactor.kernel(request),
-      appendProjectedKernelEvents: (sessionId, reply) =>
-        this.agentRunReactor.appendProjectedKernelEvents(sessionId, reply),
-      diagnosticEvent: (sessionId, content, ts, id) =>
-        assistantProjectionBuilder.finalDiagnosticEvent(sessionId, content, ts, id),
+      appendProjectedKernelEvents: (sessionId, reply, language) =>
+        this.agentRunReactor.appendProjectedKernelEvents(sessionId, reply, language),
+      diagnosticEvent: (sessionId, content, ts, id, presentationBinding) =>
+        assistantProjectionBuilder.finalDiagnosticEvent(
+          sessionId,
+          content,
+          ts,
+          id,
+          presentationBinding
+        ),
       executeAcceptedActionBundlePlan: (handlerInput, plan, initialResult, acceptedOverlay) =>
         this.acceptedActionBundlePlanExecutor.execute(handlerInput, plan, initialResult, acceptedOverlay),
       activeDriverInteraction: (events) => driverInteractionIndex.active(events),
@@ -379,6 +502,7 @@ export class SessionDriverLoop {
     this.requirementDecisionHandler = new RequirementDecisionHandler({
       now: () => this.agentRunReactor.ts(),
       createId: (prefix) => this.agentRunReactor.id(prefix),
+      createError: (code, message) => new SessionDriverLoopError(code, message),
       append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
       activeDriverInteraction: (events) => driverInteractionIndex.active(events),
       executionRootFromDecision: (handlerInput, events) =>
@@ -400,7 +524,8 @@ export class SessionDriverLoop {
       now: () => this.agentRunReactor.ts(),
       createId: (prefix) => this.agentRunReactor.id(prefix),
       kernel: (request) => this.agentRunReactor.kernel(request),
-      appendProjectedKernelEvents: (sessionId, reply) => this.agentRunReactor.appendProjectedKernelEvents(sessionId, reply),
+      appendProjectedKernelEvents: (sessionId, reply, language) =>
+        this.agentRunReactor.appendProjectedKernelEvents(sessionId, reply, language),
       append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
       reviewAssembler: reviewAssembler(),
       reviewDecisionProjection: reviewDecisionProjection(),
@@ -411,11 +536,51 @@ export class SessionDriverLoop {
       now: () => this.agentRunReactor.ts(),
       createId: (prefix) => this.agentRunReactor.id(prefix),
       append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
-      finalDiagnosticEvent: (sessionId, content, ts, id) =>
-        assistantProjectionBuilder.finalDiagnosticEvent(sessionId, content, ts, id),
+      finalDiagnosticEvent: (sessionId, content, ts, id, presentationBinding) =>
+        assistantProjectionBuilder.finalDiagnosticEvent(
+          sessionId,
+          content,
+          ts,
+          id,
+          presentationBinding
+        ),
       missingDecisionKindMessage: (kind) =>
         diag('decisionResolverMissing', `Decision kind "${kind}" is not yet connected to Session DecisionResolver.`, { kind }),
       createError: (code, message) => new SessionDriverLoopError(code, message),
+      exactDecisionTarget: (input, events) => {
+        const runId = input.runId?.trim();
+        const targetId = input.targetId?.trim();
+        if (!runId || !targetId) return undefined;
+        if (input.kind === 'plan' || input.kind === 'requirement') {
+          const active = driverInteractionIndex.active(events);
+          if (
+            input.kind === 'plan'
+            && active?.kind === 'plan'
+            && active.runId === runId
+            && active.planId === targetId
+          ) return { runId, targetId };
+          if (
+            input.kind === 'requirement'
+            && active?.kind === 'requirement'
+            && active.runId === runId
+            && active.requirementId === targetId
+          ) return { runId, targetId };
+          return undefined;
+        }
+        if (input.kind === 'permission') {
+          return permissionPipeline.findPendingPermissionContext(events, targetId, runId)
+            ? { runId, targetId }
+            : undefined;
+        }
+        if (input.kind === 'review') {
+          const assembler = reviewAssembler();
+          const active = assembler.findLatestActiveReviewInteraction(events);
+          return assembler.findWaitingReview(events, runId, active, targetId)
+            ? { runId, targetId }
+            : undefined;
+        }
+        return undefined;
+      },
       resume: (resumeInput) => this.resumeRun(resumeInput),
       assembleReview: (reviewInput) => this.acceptedPlanReviewHandoffCoordinator.handoff(
         reviewInput as AcceptedPlanReviewHandoffRunInput<SessionPlanContext>
@@ -442,12 +607,18 @@ export class SessionDriverLoop {
       createId: (prefix) => this.agentRunReactor.id(prefix),
       append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
       kernel: (request) => this.agentRunReactor.kernel(request),
-      projectKernelEvents: (sessionId, reply) =>
-        this.agentRunReactor.projectKernelEvents(sessionId, reply),
+      projectKernelEvents: (sessionId, reply, language) =>
+        this.agentRunReactor.projectKernelEvents(sessionId, reply, language),
       taskPlanCardEvent: (planInput) =>
         planProjectionBuilder.taskPlanCardEvent(planInput),
-      diagnosticEvent: (sessionId, content, ts, id) =>
-        assistantProjectionBuilder.finalDiagnosticEvent(sessionId, content, ts, id),
+      diagnosticEvent: (sessionId, content, ts, id, presentationBinding) =>
+        assistantProjectionBuilder.finalDiagnosticEvent(
+          sessionId,
+          content,
+          ts,
+          id,
+          presentationBinding
+        ),
       sessionRunStateEvent: (runStateInput) =>
         sessionProgressProjectionBuilder.sessionRunStateEvent(runStateInput),
     });
@@ -457,10 +628,30 @@ export class SessionDriverLoop {
       append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
       reviseAnswer: (handlerInput, state, proposal) =>
         this.terminalGuidanceRevisionCoordinator.revise(handlerInput, state, proposal),
-      answerEvent: (answerSessionId, proposal, ts, id) =>
-        assistantProjectionBuilder.answerEvent(answerSessionId, proposal, ts, id),
-      finalDiagnosticEvent: (diagnosticSessionId, summary, ts, id) =>
-        assistantProjectionBuilder.finalDiagnosticEvent(diagnosticSessionId, summary, ts, id),
+      answerEvent: (answerSessionId, proposal, ts, id, metadata) =>
+        assistantProjectionBuilder.answerEvent(
+          answerSessionId,
+          proposal,
+          ts,
+          id,
+          metadata
+        ),
+      finalDiagnosticEvent: (
+        diagnosticSessionId,
+        summary,
+        ts,
+        id,
+        presentationBinding,
+        metadata
+      ) =>
+        assistantProjectionBuilder.finalDiagnosticEvent(
+          diagnosticSessionId,
+          summary,
+          ts,
+          id,
+          presentationBinding,
+          metadata
+        ),
       acceptedTaskDiagnosticFailureEvents: (failureInput) =>
         sessionFailureProjectionBuilder.acceptedTaskDiagnosticFailureEvents(failureInput),
       sessionRunStateEvent: (runStateInput) =>
@@ -471,8 +662,6 @@ export class SessionDriverLoop {
       now: () => this.agentRunReactor.ts(),
       createId: (prefix) => this.agentRunReactor.id(prefix),
       append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
-      proposalNarrationEvent: (narrationSessionId, proposal, ts, id) =>
-        assistantProjectionBuilder.proposalNarrationEvent(narrationSessionId, proposal, ts, id),
       handleAnswer: (handlerInput, state, proposal) =>
         this.providerTerminalProposalHandler.handleAnswer(handlerInput, state, proposal),
       handleDecisionRequest: (handlerInput, state, proposal) =>
@@ -501,6 +690,8 @@ export class SessionDriverLoop {
       createError: (code, message) => new SessionDriverLoopError(code, message),
       requirementRecordFromProposal: (proposalInput) =>
         userInputPipeline.requirementRecordFromProposal(proposalInput),
+      presentationBinding: (state) =>
+        conversationPresentationLanguageBinding(state),
       confirmationEvent: (confirmationInput) =>
         requirementProjectionBuilder.confirmationEvent(confirmationInput),
       executionRootPayload: (state) =>
@@ -512,12 +703,14 @@ export class SessionDriverLoop {
       now: () => this.agentRunReactor.ts(),
       createId: (prefix) => this.agentRunReactor.id(prefix),
       append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
-      collectQueued: (events, runId) => userGuidanceQueue.collectQueued(events, runId),
+      collectQueued: (events, runId, hostRunId) =>
+        userGuidanceQueue.collectQueued(events, runId, hostRunId),
       admitQueuedGuidance: async (state, current) => {
         const resume = userGuidanceQueue.providerResume({
           sessionId: state.sessionId,
           events: current.events,
           runId: state.runId,
+          hostRunId: state.hostRunId,
           taskId: state.userAuthorityFrame.turnAuthority.taskId,
           stage: 'guidance_revision',
           defaultHostLanguage: state.userAuthorityFrame.languagePolicy.hostLanguage,
@@ -541,6 +734,11 @@ export class SessionDriverLoop {
           { runId: state.runId }
         );
         state.userRequest = latestExplicitUserContent(state.userAuthorityFrame);
+        state.activeProviderContinuation = undefined;
+        state.pendingProviderRetry = undefined;
+        state.semanticDirectiveRepairAttempted = false;
+        state.semanticDirectiveRepairAttempts = {};
+        state.semanticDirectiveErrorSummary = undefined;
         if (state.promptLedger && state.providerTurnFrame?.promptLedgerEpochId) {
           appendPromptLedgerCurrentTurn({
             state: state.promptLedger,
@@ -563,15 +761,10 @@ export class SessionDriverLoop {
       overlay: (overlayInput) =>
         assistantProjectionBuilder.guidanceRevisionOverlay(
           overlayInput.originalRequest,
-          overlayInput.draftAnswer,
-          overlayInput.guidance
+          overlayInput.draftAnswer
         ),
-      answerNarrationEvent: (sessionId, proposal, ts, id) =>
-        assistantProjectionBuilder.answerNarrationEvent(sessionId, proposal, ts, id),
       answerEvent: (sessionId, proposal, ts, id, metadata) =>
         assistantProjectionBuilder.answerEvent(sessionId, proposal, ts, id, metadata),
-      diagnosticEvent: (sessionId, message, ts, id) =>
-        assistantProjectionBuilder.guidanceRevisionDiagnosticEvent(sessionId, message, ts, id),
       sessionRunStateEvent: (runStateInput) =>
         sessionProgressProjectionBuilder.sessionRunStateEvent(runStateInput),
       assembleContext: (contextInput) => assembleContext(contextInput),
@@ -583,6 +776,7 @@ export class SessionDriverLoop {
           result: guidanceInput.result,
           consumedIds: guidanceInput.contextAssembly?.consumedUserGuidanceIds ?? [],
           runId: guidanceInput.runId,
+          hostRunId: guidanceInput.hostRunId,
           appliedAtProviderStage: guidanceInput.appliedAtProviderStage,
           summary: providerStreamCoordinator.userGuidanceConsumedSummary(
             guidanceInput.language
@@ -594,6 +788,7 @@ export class SessionDriverLoop {
       runRevision: (revisionInput, state, prompt, contract) =>
         this.providerRuntimeBridge.runWithNativeTools({
           profileId: revisionInput.profileId,
+          stage: 'guidance_revision',
           state,
           prompt,
           contract,
@@ -612,7 +807,8 @@ export class SessionDriverLoop {
       createError: (code, message) => new SessionDriverLoopError(code, message),
       append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
       kernel: (request) => this.agentRunReactor.kernel(request),
-      appendProjectedKernelEvents: (sessionId, reply) => this.agentRunReactor.appendProjectedKernelEvents(sessionId, reply),
+      projectKernelEvents: (sessionId, reply, language) =>
+        this.agentRunReactor.projectKernelEvents(sessionId, reply, language),
       sessionRunStateEvent: (runStateInput) =>
         sessionProgressProjectionBuilder.sessionRunStateEvent(runStateInput),
       userMessageEvent: ({ sessionId, content, attachments }) =>
@@ -647,14 +843,25 @@ export class SessionDriverLoop {
       append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
       generatedPacketForRequest: (state, request, packetId) =>
         generatedArtifactEvidenceIndex().packetForRequest(state, request, packetId),
-      recordAndAppend: (state, packet, eventIdPrefix) =>
-        this.resourceOrchestrator.recordAndAppend(state, packet, eventIdPrefix),
-      resolveRecordAndAppend: (state, manifest, eventIdPrefix) =>
-        this.resourceOrchestrator.resolveRecordAndAppend(state, manifest, eventIdPrefix),
+      recordAndAppend: (state, packet, eventIdPrefix, activityIdentity) =>
+        this.resourceOrchestrator.recordAndAppend(state, packet, eventIdPrefix, {
+          activityIdentity,
+        }),
+      resolveRecordAndAppend: (state, manifest, eventIdPrefix, activityIdentity) =>
+        this.resourceOrchestrator.resolveRecordAndAppend(state, manifest, eventIdPrefix, {
+          discoverManifestEntries: true,
+          activityIdentity,
+        }),
       resolveResourceRequest: (manifest, request, roots) =>
         resourceRequestResolver().resolve(manifest, request, roots),
-      finalDiagnosticEvent: (sessionId, content, ts, id) =>
-        assistantProjectionBuilder.finalDiagnosticEvent(sessionId, content, ts, id),
+      finalDiagnosticEvent: (sessionId, content, ts, id, presentationBinding) =>
+        assistantProjectionBuilder.finalDiagnosticEvent(
+          sessionId,
+          content,
+          ts,
+          id,
+          presentationBinding
+        ),
       internalFailureEvents: (state, stage, code, message, id) =>
         sessionFailureProjectionBuilder.internalFailureEvents({
           sessionId: state.sessionId,
@@ -662,14 +869,25 @@ export class SessionDriverLoop {
           stage,
           code,
           message,
+          language: state.userAuthorityFrame.effectiveLanguage,
           reason: 'driver_failure',
           ts: this.agentRunReactor.ts(),
           id,
         }),
-      resourceResolutionDiagnostic: (resolution) => resourceRequestLoop.resolutionDiagnostic(resolution),
+      resourceResolutionDiagnostic: (state, resolution) =>
+        resourceRequestLoop.resolutionDiagnostic(
+          resolution,
+          conversationPresentationLanguage(state)
+        ),
       completeResourceSemanticExchange: async (state, proposal, packets, issues = []) => {
-        const toolCall = state.pendingSemanticToolCalls?.[proposal.proposalId];
-        if (!toolCall) return;
+        const pending = state.pendingSemanticExchanges?.[proposal.proposalId];
+        if (!pending) {
+          throw new SessionDriverLoopError(
+            'session_provider_continuation_invalid',
+            `Resource semantic exchange ${proposal.proposalId} has no complete in-memory Provider turn.`
+          );
+        }
+        pending.phase = 'continuationPersistenceStarted';
         const request = objectRecord(proposal.payload);
         const delta = buildResourceDelta({
           requestId: stringValue(request?.id) ?? proposal.proposalId,
@@ -684,8 +902,82 @@ export class SessionDriverLoop {
             reason: issue.reason,
           })));
         }
-        await this.appendSemanticExchange(state, toolCall, delta);
-        delete state.pendingSemanticToolCalls?.[proposal.proposalId];
+        await this.appendSemanticExchange(
+          state,
+          pending.turn,
+          pending.toolCall,
+          delta,
+          true,
+          proposal.proposalId
+        );
+        delete state.pendingSemanticExchanges?.[proposal.proposalId];
+      },
+      beginResourceSemanticEffect: async (state, proposal) => {
+        const pending = state.pendingSemanticExchanges?.[proposal.proposalId];
+        if (!pending) {
+          throw new SessionDriverLoopError(
+            'session_provider_continuation_invalid',
+            `Resource semantic exchange ${proposal.proposalId} has no admitted lifecycle record.`
+          );
+        }
+        const providerRequestId = pending.turn.providerRequestId;
+        if (!providerRequestId) {
+          throw new SessionDriverLoopError(
+            'session_provider_continuation_invalid',
+            `Resource semantic exchange ${proposal.proposalId} has no Provider request identity.`
+          );
+        }
+        if (pending.phase === 'continuationPersistenceStarted') {
+          throw new SessionDriverLoopError(
+            'session_provider_continuation_invalid',
+            `Resource semantic exchange ${proposal.proposalId} already started continuation persistence.`
+          );
+        }
+        const identity = resourcePacketActivityIdentity(
+          state.runId,
+          providerRequestId,
+          pending.toolCall
+        );
+        if (pending.phase === 'admitted') {
+          await this.agentRunReactor.emitProjectionDelta(
+            state,
+            nativeToolProjectionBuilder.toolCallRunningDelta({
+              sessionId: state.sessionId,
+              runId: state.runId,
+              language: effectiveConversationLanguage(pending.turn.sourceLanguagePolicy),
+              toolCall: pending.toolCall,
+              activityId: identity.activityId,
+            })
+          );
+          pending.phase = 'effectStarted';
+        }
+        return identity;
+      },
+      failResourceSemanticExchange: async (state, proposal, error) => {
+        const pending = state.pendingSemanticExchanges?.[proposal.proposalId];
+        if (!pending) return;
+        const status = pending.phase === 'admitted'
+          ? resourceSemanticTerminalStatus(error)
+          : 'postEffectPersistenceFailed';
+        try {
+          await this.appendSemanticDirectiveTerminal(
+            state,
+            pending.turn,
+            pending.toolCall,
+            status,
+            error
+          );
+        } catch (terminalError) {
+          throw new SessionDriverLoopError(
+            'session_analysis_timeline_write_failed',
+            [
+              `Resource semantic exchange ${proposal.proposalId} failed: ${errorText(error)}.`,
+              `Its terminal analysis record also failed: ${errorText(terminalError)}.`,
+            ].join(' ')
+          );
+        } finally {
+          delete state.pendingSemanticExchanges?.[proposal.proposalId];
+        }
       },
       refreshTaskRuntimeState: (state) => acceptedPlanTaskLedger().refreshRuntimeState(state),
       acceptedPlanResourceResumeEvent: (state, packet, ts, id) =>
@@ -697,7 +989,8 @@ export class SessionDriverLoop {
           state.currentTaskContext,
           packet,
           ts,
-          id
+          id,
+          conversationPresentationLanguage(state)
         ),
     });
     this.actionProposalSubmitter = new ActionProposalSubmitter<SessionDriverLoopInput, SessionDriverLoopRunState>({
@@ -707,15 +1000,23 @@ export class SessionDriverLoop {
       readActionBundle: (proposal) => driverActivityBuilder.readActionBundle(proposal),
       submitAcceptedPlanActionProposal: (handlerInput, state, prompt, proposal, fallback) =>
         this.acceptedPlanActionProposalSubmitter.submit(handlerInput, state, prompt, proposal, fallback),
-      finalDiagnosticEvent: (sessionId, content, ts, id) =>
-        assistantProjectionBuilder.finalDiagnosticEvent(sessionId, content, ts, id),
+      finalDiagnosticEvent: (sessionId, content, ts, id, presentationBinding) =>
+        assistantProjectionBuilder.finalDiagnosticEvent(
+          sessionId,
+          content,
+          ts,
+          id,
+          presentationBinding
+        ),
+      sessionRunStateEvent: (runStateInput) =>
+        sessionProgressProjectionBuilder.sessionRunStateEvent(runStateInput),
       diagnostic: (code, fallback, params) => diag(code, fallback, params),
     });
     this.artifactDraftCoordinator = new ArtifactDraftCoordinator<SessionDriverLoopRunState>({
       createId: (prefix) => this.agentRunReactor.id(prefix),
       kernel: (request) => this.agentRunReactor.kernel(request),
-      appendProjectedKernelEvents: (sessionId, reply) =>
-        this.agentRunReactor.appendProjectedKernelEvents(sessionId, reply),
+      appendProjectedKernelEvents: (sessionId, reply, language) =>
+        this.agentRunReactor.appendProjectedKernelEvents(sessionId, reply, language),
       compileArtifacts: (input) => this.semanticToolAdapter.compileArtifacts(input),
       createError: (code, message) => new SessionDriverLoopError(code, message),
     });
@@ -731,7 +1032,20 @@ export class SessionDriverLoop {
       complete: (accepted) => acceptedPlanTaskLedger().complete(accepted),
       taskOutcomeCheckpointEvent: (eventInput) =>
         sessionProgressProjectionBuilder.acceptedPlanTaskOutcomeCheckpointEvent(eventInput),
-      taskSavepointEvent: (sessionId, runId, accepted, nextAccepted, progress, kernelEvents, cursor, context, ts, id, contextCompactRecord) =>
+      taskSavepointEvent: (
+        sessionId,
+        runId,
+        accepted,
+        nextAccepted,
+        progress,
+        kernelEvents,
+        cursor,
+        context,
+        ts,
+        id,
+        contextCompactRecord,
+        language
+      ) =>
         sessionProgressProjectionBuilder.acceptedPlanTaskSavepointEvent(
           sessionId,
           runId,
@@ -743,22 +1057,87 @@ export class SessionDriverLoop {
           context,
           ts,
           id,
-          contextCompactRecord
+          contextCompactRecord,
+          language
         ),
     });
     this.nativeToolHandlerPortsFactory = new NativeToolHandlerPortsFactory({
-      progressEventBuilder: nativeToolProgressEventBuilder,
       projectionBuilder: nativeToolProjectionBuilder,
-      event: (sessionId, kind, payload) => this.agentRunReactor.event(sessionId, kind, payload),
-      append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
       emitProjectionDelta: (state, delta) => this.agentRunReactor.emitProjectionDelta(state, delta),
-      recordSemanticExchange: async (state, toolCall, result) => {
+      recordSemanticDirectiveAdmission: (state, turn, toolCall) =>
+        this.appendSemanticDirectiveAdmission(state, turn, toolCall),
+      recordSemanticDirectiveTerminal: (state, turn, toolCall, status, error) =>
+        this.appendSemanticDirectiveTerminal(
+          state,
+          turn,
+          toolCall,
+          status,
+          error
+        ),
+      recordSemanticExchange: async (state, turn, toolCall, result) => {
+        if (result.kind === 'proposal') {
+          const providerRequestId = exactSemanticProviderRequestId(
+            turn,
+            `Provider proposal ${result.proposal.proposalId}`
+          );
+          try {
+            bindPendingProviderProposalAdmission(
+              state,
+              result.proposal.proposalId,
+              turn.providerAdmission
+            );
+          } catch (error) {
+            throw new SessionDriverLoopError(
+              stringValue(objectRecord(error)?.code)
+                ?? 'session_provider_admission_invalid',
+              error instanceof Error ? error.message : String(error)
+            );
+          }
+          try {
+            await this.ports.bindProviderProposalAdmission?.(
+              state.sessionId,
+              result.proposal.proposalId,
+              providerRequestId
+            );
+          } catch (error) {
+            throw new SessionDriverLoopError(
+              'session_provider_admission_write_failed',
+              `Provider proposal ${result.proposal.proposalId} could not persist its exact request binding: ${
+                error instanceof Error ? error.message : String(error)
+              }`
+            );
+          }
+        }
         if (result.kind === 'proposal' && result.proposal.kind === 'resourceRequest') {
-          state.pendingSemanticToolCalls ??= {};
-          state.pendingSemanticToolCalls[result.proposal.proposalId] = toolCall;
+          state.pendingSemanticExchanges ??= {};
+          state.pendingSemanticExchanges[result.proposal.proposalId] = {
+            toolCall,
+            phase: 'admitted',
+            turn: {
+              providerAdmission: turn.providerAdmission,
+              providerRequestId: turn.providerRequestId,
+              providerParentRequestId: turn.providerParentRequestId,
+              continuationBaseMessages: turn.continuationBaseMessages,
+              continuationBaseMessagesDigest: turn.continuationBaseMessagesDigest,
+              sourceLanguagePolicy: turn.sourceLanguagePolicy,
+              assistantMessage: turn.assistantMessage,
+              providerProfileId: turn.providerProfileId,
+              provider: turn.provider,
+              model: turn.model,
+              content: turn.content,
+              reasoning: turn.reasoning,
+            },
+          };
           return;
         }
-        await this.appendSemanticExchange(state, toolCall, result.toolResult);
+        await this.appendSemanticExchange(
+          state,
+          turn,
+          toolCall,
+          result.toolResult,
+          result.kind === 'providerResume' && toolCall.name !== 'session.submit_task_outcome',
+          result.kind === 'proposal' ? result.proposal.proposalId : undefined
+        );
       },
     });
     this.nativeToolProviderCoordinator = new NativeToolProviderCoordinator<SessionDriverLoopRunState, LlmTurnResult>({
@@ -802,7 +1181,11 @@ export class SessionDriverLoop {
         this.providerRuntimeBridge.llmTurn(profileId, state, stage, messages, options),
       isEmptyResponseError,
       semanticDirectiveError: (error) =>
-        error instanceof SessionDriverLoopError && error.code === 'native_tool_arguments_invalid'
+        error instanceof SessionDriverLoopError && (
+          error.code === 'native_tool_arguments_invalid'
+          || error.code === 'provider_reserved_token_invalid'
+          || error.code === 'provider_continuation_control_leak'
+        )
           ? { code: error.code, message: error.message }
           : undefined,
       onSemanticDraftFailure: (state, callId, failureCode) =>
@@ -827,24 +1210,24 @@ export class SessionDriverLoop {
             previousTaskId: reason.previousTaskId,
             message: reason.message,
             channel: 'progress',
-            visibility: 'conversation',
+            visibility: 'hidden',
+            presentation: 'traceOnly',
           }),
-          assistantProjectionBuilder.thinkingEvent(
+          assistantProjectionBuilder.statusSummaryEvent(
             state.sessionId,
             content,
             this.agentRunReactor.ts(),
-            this.agentRunReactor.id(reason.code)
+            this.agentRunReactor.id(reason.code),
+            undefined,
+            conversationPresentationLanguageBinding(state)
           ),
         ]);
       },
       createError: (code, message) => new SessionDriverLoopError(code, message),
     });
     this.providerStreamRuntime = new ProviderStreamRuntime<SessionDriverLoopRunState>({
-      reasoningFlushChars: PROVIDER_REASONING_FLUSH_CHARS,
-      reasoningFlushMs: PROVIDER_REASONING_FLUSH_MS,
-      semanticDraftFlushChars: PROVIDER_REASONING_FLUSH_CHARS,
-      semanticDraftFlushMs: PROVIDER_REASONING_FLUSH_MS,
-      visibleReasoningMaxChars: VISIBLE_REASONING_MAX_CHARS,
+      semanticDraftFlushChars: PROVIDER_SEMANTIC_DRAFT_FLUSH_CHARS,
+      semanticDraftFlushMs: PROVIDER_SEMANTIC_DRAFT_FLUSH_MS,
       streamCoordinator: providerStreamCoordinator,
       visibleLanguage: (state) => state.userAuthorityFrame.effectiveLanguage,
       providerActivity: (input) => driverActivityBuilder.providerActivity(input),
@@ -861,12 +1244,17 @@ export class SessionDriverLoop {
       visibleLanguage: (state) => state.userAuthorityFrame.effectiveLanguage,
       admitLanguageDecision: async (state, decisionInput) => {
         const policy = state.userAuthorityFrame.languagePolicy;
-        if (policy.status !== 'pending') return;
         const decision = decideConversationLanguageFromProvider({
           hostLanguage: policy.hostLanguage,
           content: decisionInput.content,
           toolCalls: decisionInput.toolCalls,
         });
+        if (policy.status !== 'pending') {
+          // The persisted Session policy remains authoritative for retries and
+          // continuations. Missing, invalid, or conflicting Provider metadata
+          // is normalized at semantic admission without a repair call.
+          return;
+        }
         const appended = await this.agentRunReactor.append(state.sessionId, [
           createSessionLanguageDecisionEvent({
             sessionId: state.sessionId,
@@ -897,8 +1285,6 @@ export class SessionDriverLoop {
       providerActivity: (input) => driverActivityBuilder.providerActivity(input),
       emitProjectionDelta: (state, delta) => this.agentRunReactor.emitProjectionDelta(state, delta),
       cacheTelemetryEvent: (input) => sessionProgressProjectionBuilder.cacheTelemetryEvent(input),
-      reasoningEvent: (sessionId, reasoning, ts, id) =>
-        assistantProjectionBuilder.reasoningEvent(sessionId, reasoning, ts, id),
       createToolCallBuffer: () => new ProviderToolCallBuffer({
         parseArguments: (raw, toolName) => nativeToolCoordinator.parseArguments(raw, toolName),
         normalizeToolName: (name) => nativeToolCoordinator.normalizeToolName(name),
@@ -918,43 +1304,8 @@ export class SessionDriverLoop {
     }, {
       ...this.ports,
       consumeGuidanceMessages: async (state, stage) => {
-        const current = await this.agentRunReactor.append(state.sessionId, []);
-        const language = state.userAuthorityFrame.effectiveLanguage;
-        const resume = userGuidanceQueue.providerResume({
-          sessionId: state.sessionId,
-          events: current.events,
-          runId: state.runId,
-          taskId: state.userAuthorityFrame.turnAuthority.taskId,
-          stage,
-          defaultHostLanguage: state.userAuthorityFrame.languagePolicy.hostLanguage,
-          promptEpochId: state.providerTurnFrame?.promptLedgerEpochId,
-          summary: providerStreamCoordinator.userGuidanceConsumedSummary(language),
-          now: () => this.agentRunReactor.ts(),
-          createId: (prefix) => this.agentRunReactor.id(prefix),
-        });
-        if (resume.events.length) {
-          const appended = await this.agentRunReactor.append(state.sessionId, resume.events);
-          state.userAuthorityFrame = buildUserAuthorityFrame(
-            appended.events,
-            {
-              messageId: state.userAuthorityFrame.rootMessage.messageId,
-              content: state.userAuthorityFrame.rootMessage.content,
-              timestamp: state.userAuthorityFrame.rootMessage.timestamp,
-            },
-            state.userAuthorityFrame.autonomyMode,
-            { runId: state.runId }
-          );
-          state.userRequest = latestExplicitUserContent(state.userAuthorityFrame);
-          if (state.promptLedger && state.providerTurnFrame?.promptLedgerEpochId) {
-            appendPromptLedgerCurrentTurn({
-              state: state.promptLedger,
-              epochId: state.providerTurnFrame.promptLedgerEpochId,
-              authority: state.userAuthorityFrame,
-              createId: (prefix) => this.agentRunReactor.id(prefix),
-            });
-          }
-        }
-        return resume.messages;
+        const admitted = await this.admitQueuedProviderGuidance(state, stage);
+        return admitted.messages;
       },
       createError: (code, message) => new SessionDriverLoopError(code, message),
     });
@@ -1006,12 +1357,18 @@ export class SessionDriverLoop {
         const accepted = state.acceptedTaskPlan;
         if (!pending || !accepted) return undefined;
         state.pendingAcceptedTaskOutcomeReview = undefined;
+        const language = conversationPresentationLanguage(state);
+        const safeAssessmentSummary = language === 'zh-CN'
+          ? `Session 已根据任务 ${pending.taskId} 的当前证据评估其无需额外 workspace mutation；此结论等待用户复核，且不代表 Kernel 执行完成。`
+          : language === 'en-US'
+            ? `Session assessed task ${pending.taskId} from current evidence as requiring no additional workspace mutation; this awaits user review and is not a Kernel execution-completion fact.`
+            : `task=${pending.taskId} evidenceAssessment=noAdditionalMutation userReview=pending kernelExecutionCompleted=false`;
         const plan = acceptedPlanExecutor.modelTaskOutcomeReviewContext({
           sessionId: state.sessionId,
           runId: state.runId,
           acceptedPlan: accepted,
           taskId: pending.taskId,
-          summary: pending.summary,
+          summary: safeAssessmentSummary,
           evidenceRefs: pending.evidenceRefs,
         });
         return {
@@ -1022,18 +1379,28 @@ export class SessionDriverLoop {
           result: pending.result,
           currentKernelEvents: [],
           requestIdPrefix: 'accepted-plan-task-outcome-review-facts-get',
+          presentationBinding: conversationPresentationLanguageBinding(state),
         };
       },
-      prepareProviderContext: (handlerInput, state, lastResult) =>
-        this.providerTurnContextCoordinator.prepare(state, {
+      prepareProviderContext: async (handlerInput, state, lastResult) => {
+        const guidance = await this.admitQueuedProviderGuidance(
+          state,
+          'provider_call',
+          'contextPreparation'
+        );
+        return this.providerTurnContextCoordinator.prepare(state, {
           contextAssemblyId: this.agentRunReactor.id('context-assembly'),
           contractId: this.agentRunReactor.id('provider-turn-contract'),
           inputContent: handlerInput.content,
           projectMemoryMode: handlerInput.projectMemoryMode,
           interventionLevel: handlerInput.interventionLevel,
           confirmedRequirement: handlerInput.confirmedRequirement,
-          lastResult,
-        }),
+          priorUserGuidance: guidance.priorGuidance,
+          lastResult: guidance.result.events.length >= lastResult.events.length
+            ? guidance.result
+            : lastResult,
+        });
+      },
       appendProviderRunningState: (state) => this.agentRunReactor.append(state.sessionId, [
         sessionProgressProjectionBuilder.sessionRunStateEvent({
           sessionId: state.sessionId,
@@ -1062,7 +1429,13 @@ export class SessionDriverLoop {
         ).catch(() => undefined);
         if (error.code === 'session_run_cancelled') {
           takeProviderCommitEvents(state);
+          const language = await this.localOutputLanguage(
+            state.sessionId,
+            state.runId,
+            state.userAuthorityFrame?.languagePolicy.hostLanguage
+          );
           return this.agentRunReactor.append(state.sessionId, [
+            ...language.decisionEvents,
             sessionProgressProjectionBuilder.sessionRunStateEvent({
               sessionId: state.sessionId,
               runId: state.runId,
@@ -1078,8 +1451,18 @@ export class SessionDriverLoop {
             }),
           ]);
         }
-        const diagnostic = driverFailureMessageCatalog.driverFailure(error.code, error.message);
+        const language = await this.localOutputLanguage(
+          state.sessionId,
+          state.runId,
+          state.userAuthorityFrame?.languagePolicy.hostLanguage
+        );
+        const diagnostic = driverFailureMessageCatalog.driverFailure(
+          error.code,
+          error.message,
+          language.language
+        );
         return this.agentRunReactor.append(state.sessionId, [
+          ...language.decisionEvents,
           ...takeProviderCommitEvents(state),
           ...sessionFailureProjectionBuilder.internalFailureEvents({
             sessionId: state.sessionId,
@@ -1087,6 +1470,7 @@ export class SessionDriverLoop {
             stage: 'driver',
             code: diagnostic.code,
             message: diagnostic.fallback,
+            language: language.language,
             reason: 'driver_failure',
             ts: this.agentRunReactor.ts(),
             id: this.agentRunReactor.id(error.code),
@@ -1098,8 +1482,17 @@ export class SessionDriverLoop {
           state,
           'Session stopped the current artifact draft after a Provider failure.'
         ).catch(() => undefined);
-        const diagnostic = driverFailureMessageCatalog.providerFailure(error);
+        const language = await this.localOutputLanguage(
+          state.sessionId,
+          state.runId,
+          state.userAuthorityFrame?.languagePolicy.hostLanguage
+        );
+        const diagnostic = driverFailureMessageCatalog.providerFailure(
+          error,
+          language.language
+        );
         return this.agentRunReactor.append(state.sessionId, [
+          ...language.decisionEvents,
           ...takeProviderCommitEvents(state),
           ...sessionFailureProjectionBuilder.internalFailureEvents({
             sessionId: state.sessionId,
@@ -1107,6 +1500,7 @@ export class SessionDriverLoop {
             stage: 'provider',
             code: diagnostic.code,
             message: diagnostic.fallback,
+            language: language.language,
             reason: 'provider_failure',
             ts: this.agentRunReactor.ts(),
             id: this.agentRunReactor.id('provider-call-failed'),
@@ -1142,17 +1536,34 @@ export class SessionDriverLoop {
             }),
           ]);
         } catch (error) {
-          const message = error instanceof SessionDriverLoopError ? error.message : String(error);
-          return this.agentRunReactor.append(runInput.sessionId, sessionFailureProjectionBuilder.internalFailureEvents({
-            sessionId: runInput.sessionId,
-            runId: state.runId,
-            stage: 'requirement_confirmation',
-            code: 'requirement_confirmation_failed',
-            message,
-            reason: 'driver_failure',
-            ts: this.agentRunReactor.ts(),
-            id: this.agentRunReactor.id('requirement-confirmation-failed'),
-          }));
+          const rawMessage = error instanceof SessionDriverLoopError ? error.message : String(error);
+          const code = error instanceof SessionDriverLoopError
+            ? error.code
+            : 'requirement_confirmation_failed';
+          const language = await this.localOutputLanguage(
+            runInput.sessionId,
+            state.runId,
+            state.userAuthorityFrame?.languagePolicy.hostLanguage
+          );
+          const diagnostic = driverFailureMessageCatalog.driverFailure(
+            code,
+            rawMessage,
+            language.language
+          );
+          return this.agentRunReactor.append(runInput.sessionId, [
+            ...language.decisionEvents,
+            ...sessionFailureProjectionBuilder.internalFailureEvents({
+              sessionId: runInput.sessionId,
+              runId: state.runId,
+              stage: 'requirement_confirmation',
+              code: diagnostic.code,
+              message: diagnostic.fallback,
+              language: language.language,
+              reason: 'driver_failure',
+              ts: this.agentRunReactor.ts(),
+              id: this.agentRunReactor.id('requirement-confirmation-failed'),
+            }),
+          ]);
         }
       },
       runProviderTurn: (cycleInput) => this.providerTurnCycle.run(cycleInput),
@@ -1167,17 +1578,36 @@ export class SessionDriverLoop {
     try {
       return await this.decisionResolver.resolve(input);
     } catch (error) {
-      const message = error instanceof SessionDriverLoopError ? error.message : String(error);
-      return this.agentRunReactor.append(input.sessionId, sessionFailureProjectionBuilder.internalFailureEvents({
-        sessionId: input.sessionId,
-        runId: input.runId ?? latestRunIdForFailure(input.existingEvents ?? []) ?? 'run-unavailable',
-        stage: 'decision_resolver',
-        code: error instanceof SessionDriverLoopError ? error.code : 'decision_resolver_failed',
-        message: `Session decision resolver failed: ${message}`,
-        reason: 'driver_failure',
-        ts: this.agentRunReactor.ts(),
-        id: this.agentRunReactor.id('decision-resolver-failed'),
-      }));
+      const rawMessage = error instanceof SessionDriverLoopError ? error.message : String(error);
+      const code = error instanceof SessionDriverLoopError ? error.code : 'decision_resolver_failed';
+      const language = await this.localOutputLanguage(
+        input.sessionId,
+        input.runId,
+        input.hostLanguage
+      );
+      const diagnostic = driverFailureMessageCatalog.driverFailure(
+        code,
+        rawMessage,
+        language.language
+      );
+      return this.agentRunReactor.append(input.sessionId, [
+        ...(input.bootstrapEvents ?? []),
+        ...language.decisionEvents,
+        ...sessionFailureProjectionBuilder.internalFailureEvents({
+          sessionId: input.sessionId,
+          runId: input.runId
+            ?? language.runId
+            ?? latestRunIdForFailure(language.currentEvents)
+            ?? 'run-unavailable',
+          stage: 'decision_resolver',
+          code: diagnostic.code,
+          message: diagnostic.fallback,
+          language: language.language,
+          reason: 'driver_failure',
+          ts: this.agentRunReactor.ts(),
+          id: this.agentRunReactor.id('decision-resolver-failed'),
+        }),
+      ]);
     }
   }
 
@@ -1185,10 +1615,358 @@ export class SessionDriverLoop {
     return this.runLoopInput(input);
   }
 
+  private async appendSemanticDirectiveAdmission(
+    state: SessionDriverLoopRunState,
+    turn: Pick<
+      LlmTurnResult,
+      | 'providerAdmission'
+      | 'providerRequestId'
+      | 'assistantMessage'
+      | 'providerProfileId'
+      | 'provider'
+      | 'model'
+      | 'content'
+      | 'reasoning'
+    >,
+    toolCall: NativeToolCallProposal
+  ): Promise<void> {
+    const providerRequestId = exactSemanticProviderRequestId(
+      turn,
+      `Session semantic tool ${toolCall.callId} before execution`
+    );
+    if (!this.ports.appendAnalysisTimeline) {
+      if (this.ports.analysisTimelineRequired) {
+        throw new SessionDriverLoopError(
+          'session_analysis_timeline_unavailable',
+          'Session semantic directives require pre-execution analysis persistence.'
+        );
+      }
+      return;
+    }
+    const decodedToolCall = turn.assistantMessage?.toolCalls?.find(
+      (candidate) => candidate.id === toolCall.callId
+    );
+    const analysisEntries = [
+      semanticDirectiveAdmissionAnalysisEvent({
+        state,
+        requestId: providerRequestId,
+        stage: state.activeTurn?.stage ?? 'provider_call',
+        languageRevision: state.userAuthorityFrame.languagePolicy.revision,
+        providerProfileId: turn.providerProfileId,
+        provider: turn.provider,
+        model: turn.model,
+        promptLedgerEpochId: this.semanticPromptLedgerEpochId(state, toolCall.callId),
+        toolCallId: toolCall.callId,
+        toolCall: {
+          ...(decodedToolCall ?? {
+            id: toolCall.callId,
+            name: toolCall.name,
+            arguments: toolCall.arguments,
+          }),
+          arguments: toolCall.rawArguments
+            ?? decodedToolCall?.arguments
+            ?? toolCall.arguments,
+        },
+        assistantContent: turn.assistantMessage?.content ?? turn.content,
+        assistantReasoning: turn.reasoning,
+        recordId: this.agentRunReactor.id('analysis-semantic-directive-admitted'),
+        createdAt: this.agentRunReactor.ts(),
+      }),
+    ];
+    try {
+      const result = await this.ports.appendAnalysisTimeline(
+        state.sessionId,
+        analysisEntries
+      );
+      if (this.ports.analysisTimelineRequired) {
+        const violation = providerAnalysisTimelineAckViolation(analysisEntries, result);
+        if (violation) throw new Error(violation);
+      }
+    } catch (error) {
+      throw new SessionDriverLoopError(
+        'session_analysis_timeline_write_failed',
+        `Session semantic directive admission failed: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  }
+
+  private async appendSemanticDirectiveTerminal(
+    state: SessionDriverLoopRunState,
+    turn: Pick<
+      LlmTurnResult,
+      | 'providerAdmission'
+      | 'providerRequestId'
+      | 'assistantMessage'
+      | 'providerProfileId'
+      | 'provider'
+      | 'model'
+      | 'content'
+      | 'reasoning'
+    >,
+    toolCall: NativeToolCallProposal,
+    status: 'failed' | 'cancelled' | 'superseded' | 'postEffectPersistenceFailed',
+    error: unknown
+  ): Promise<void> {
+    const providerRequestId = exactSemanticProviderRequestId(
+      turn,
+      `Session semantic tool ${toolCall.callId} at terminal analysis`
+    );
+    if (!this.ports.appendAnalysisTimeline) {
+      if (this.ports.analysisTimelineRequired) {
+        throw new SessionDriverLoopError(
+          'session_analysis_timeline_unavailable',
+          'Session semantic directive terminal state requires analysis persistence.'
+        );
+      }
+      return;
+    }
+    const decodedToolCall = turn.assistantMessage?.toolCalls?.find(
+      (candidate) => candidate.id === toolCall.callId
+    );
+    const errorRecord = objectRecord(error);
+    const analysisEntries = [
+      semanticDirectiveTerminalAnalysisEvent({
+        state,
+        requestId: providerRequestId,
+        stage: state.activeTurn?.stage ?? 'provider_call',
+        languageRevision: state.userAuthorityFrame.languagePolicy.revision,
+        providerProfileId: turn.providerProfileId,
+        provider: turn.provider,
+        model: turn.model,
+        promptLedgerEpochId: this.semanticPromptLedgerEpochId(state, toolCall.callId),
+        toolCallId: toolCall.callId,
+        toolCall: {
+          ...(decodedToolCall ?? {
+            id: toolCall.callId,
+            name: toolCall.name,
+            arguments: toolCall.arguments,
+          }),
+          arguments: toolCall.rawArguments
+            ?? decodedToolCall?.arguments
+            ?? toolCall.arguments,
+        },
+        assistantContent: turn.assistantMessage?.content ?? turn.content,
+        assistantReasoning: turn.reasoning,
+        status,
+        errorCode: stringValue(errorRecord?.code)
+          ?? stringValue(errorRecord?.causeCode)
+          ?? (error instanceof Error ? error.name : undefined),
+        errorMessage: error instanceof Error ? error.message : String(error),
+        recordId: this.agentRunReactor.id(`analysis-semantic-directive-${status}`),
+        createdAt: this.agentRunReactor.ts(),
+      }),
+    ];
+    try {
+      const result = await this.ports.appendAnalysisTimeline(
+        state.sessionId,
+        analysisEntries
+      );
+      if (this.ports.analysisTimelineRequired) {
+        const violation = providerAnalysisTimelineAckViolation(analysisEntries, result);
+        if (violation) throw new Error(violation);
+      }
+    } catch (analysisError) {
+      throw new SessionDriverLoopError(
+        'session_analysis_timeline_write_failed',
+        `Session semantic directive terminal append failed: ${analysisError instanceof Error ? analysisError.message : String(analysisError)}`
+      );
+    }
+  }
+
+  private async appendProviderSideCallSemanticExchange(
+    state: SessionDriverLoopRunState,
+    turn: Pick<
+      LlmTurnResult,
+      | 'providerAdmission'
+      | 'providerRequestId'
+      | 'assistantMessage'
+      | 'providerProfileId'
+      | 'provider'
+      | 'model'
+      | 'content'
+      | 'reasoning'
+      | 'sourceLanguagePolicy'
+    >,
+    toolCall: NativeToolCallProposal,
+    result: unknown,
+    stage: string
+  ): Promise<void> {
+    const providerRequestId = exactSemanticProviderRequestId(
+      turn,
+      `Session read-only semantic tool ${toolCall.callId}`
+    );
+    if (!this.ports.appendAnalysisTimeline) {
+      if (this.ports.analysisTimelineRequired) {
+        throw new SessionDriverLoopError(
+          'session_analysis_timeline_unavailable',
+          'Session read-only semantic directives require analysis timeline storage.'
+        );
+      }
+      return;
+    }
+    const decodedToolCall = turn.assistantMessage?.toolCalls?.find(
+      (candidate) => candidate.id === toolCall.callId
+    );
+    const analysisEntries = [
+      semanticExchangeAnalysisEvent({
+        state,
+        requestId: providerRequestId,
+        stage,
+        languageRevision: turn.sourceLanguagePolicy.revision,
+        providerProfileId: turn.providerProfileId,
+        provider: turn.provider,
+        model: turn.model,
+        providerTurnContractId: this.providerSideCallContractId(state, toolCall.callId),
+        toolCallId: toolCall.callId,
+        toolCall: {
+          ...(decodedToolCall ?? {
+            id: toolCall.callId,
+            name: toolCall.name,
+            arguments: toolCall.arguments,
+          }),
+          arguments: toolCall.rawArguments
+            ?? decodedToolCall?.arguments
+            ?? toolCall.arguments,
+        },
+        toolResult: result,
+        assistantContent: turn.assistantMessage?.content ?? turn.content,
+        assistantReasoning: turn.reasoning,
+        recordId: this.agentRunReactor.id('analysis-read-only-semantic-exchange'),
+        createdAt: this.agentRunReactor.ts(),
+      }),
+    ];
+    try {
+      const analysisResult = await this.ports.appendAnalysisTimeline(
+        state.sessionId,
+        analysisEntries
+      );
+      if (this.ports.analysisTimelineRequired) {
+        const violation = providerAnalysisTimelineAckViolation(
+          analysisEntries,
+          analysisResult
+        );
+        if (violation) throw new Error(violation);
+      }
+    } catch (error) {
+      throw new SessionDriverLoopError(
+        'session_analysis_timeline_write_failed',
+        `Session read-only semantic analysis append failed: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  }
+
+  private async appendProviderSideCallSemanticFailure(
+    state: SessionDriverLoopRunState,
+    turn: Pick<
+      LlmTurnResult,
+      | 'providerAdmission'
+      | 'providerRequestId'
+      | 'assistantMessage'
+      | 'providerProfileId'
+      | 'provider'
+      | 'model'
+      | 'content'
+      | 'reasoning'
+      | 'sourceLanguagePolicy'
+    >,
+    toolCall: NativeToolCallProposal | undefined,
+    error: unknown,
+    stage: string
+  ): Promise<void> {
+    const providerRequestId = exactSemanticProviderRequestId(
+      turn,
+      'Session Provider side-call failure'
+    );
+    if (!this.ports.appendAnalysisTimeline) {
+      if (this.ports.analysisTimelineRequired) {
+        throw new SessionDriverLoopError(
+          'session_analysis_timeline_unavailable',
+          'Session Provider side-call failures require analysis timeline storage.'
+        );
+      }
+      return;
+    }
+    const decodedToolCall = toolCall
+      ? turn.assistantMessage?.toolCalls?.find((candidate) => candidate.id === toolCall.callId)
+      : undefined;
+    const errorRecord = objectRecord(error);
+    const contractId = this.providerSideCallContractId(state, toolCall?.callId);
+    const analysisEntries = [
+      providerSideCallSemanticFailureAnalysisEvent({
+        state,
+        requestId: providerRequestId,
+        stage,
+        languageRevision: turn.sourceLanguagePolicy.revision,
+        providerProfileId: turn.providerProfileId,
+        provider: turn.provider,
+        model: turn.model,
+        providerTurnContractId: contractId,
+        ...(toolCall
+          ? {
+              toolCallId: toolCall.callId,
+              toolCall: {
+                ...(decodedToolCall ?? {
+                  id: toolCall.callId,
+                  name: toolCall.name,
+                  arguments: toolCall.arguments,
+                }),
+                arguments: toolCall.rawArguments
+                  ?? decodedToolCall?.arguments
+                  ?? toolCall.arguments,
+              },
+            }
+          : {}),
+        assistantContent: turn.assistantMessage?.content ?? turn.content,
+        assistantReasoning: turn.reasoning,
+        errorCode: stringValue(errorRecord?.code)
+          ?? stringValue(errorRecord?.causeCode)
+          ?? (error instanceof Error ? error.name : undefined),
+        errorMessage: error instanceof Error ? error.message : String(error),
+        recordId: this.agentRunReactor.id('analysis-provider-side-call-failed'),
+        createdAt: this.agentRunReactor.ts(),
+      }),
+    ];
+    try {
+      const analysisResult = await this.ports.appendAnalysisTimeline(
+        state.sessionId,
+        analysisEntries
+      );
+      if (this.ports.analysisTimelineRequired) {
+        const violation = providerAnalysisTimelineAckViolation(
+          analysisEntries,
+          analysisResult
+        );
+        if (violation) throw new Error(violation);
+      }
+    } catch (analysisError) {
+      throw new SessionDriverLoopError(
+        'session_analysis_timeline_write_failed',
+        `Session Provider side-call failure append failed: ${analysisError instanceof Error ? analysisError.message : String(analysisError)}`
+      );
+    }
+  }
+
   private async appendSemanticExchange(
     state: SessionDriverLoopRunState,
+    turn: Pick<
+      LlmTurnResult,
+      | 'providerRequestId'
+      | 'providerParentRequestId'
+      | 'continuationBaseMessages'
+      | 'continuationBaseMessagesDigest'
+      | 'providerAdmission'
+      | 'sourceLanguagePolicy'
+      | 'assistantMessage'
+      | 'providerProfileId'
+      | 'provider'
+      | 'model'
+      | 'content'
+      | 'reasoning'
+    >,
     toolCall: NativeToolCallProposal,
-    result: unknown
+    result: unknown,
+    preserveActiveContinuation: boolean,
+    proposalId?: string
   ): Promise<void> {
     const profileId = this.providerProfileRegistry.profileForFrame(state.providerTurnFrame).id;
     const protocolToolCall = {
@@ -1196,36 +1974,414 @@ export class SessionDriverLoop {
       name: toolCall.name,
       arguments: toolCall.arguments,
     };
-    const epochId = state.providerTurnFrame?.promptLedgerEpochId;
-    if (!epochId) {
-      if (!state.acceptedTaskPlan) return;
+    const decodedReplayToolCall = turn.assistantMessage?.toolCalls?.find(
+      (candidate) => candidate.id === toolCall.callId
+    );
+    if (
+      preserveActiveContinuation
+      && (!turn.assistantMessage || !decodedReplayToolCall)
+    ) {
       throw new SessionDriverLoopError(
-        'session_task_prompt_epoch_incompatible',
-        'Session semantic exchange has no active task-scoped PromptLedger epoch.'
+        'session_provider_continuation_invalid',
+        `Session semantic tool ${toolCall.callId} has no complete Provider assistant replay message.`
       );
     }
-    const epoch = appendPromptLedgerSemanticExchange({
+    if (
+      preserveActiveContinuation
+      && this.ports.providerResponseIdentityRequired
+      && (!turn.providerProfileId || !turn.provider || !turn.model)
+    ) {
+      throw new SessionDriverLoopError(
+        'session_provider_continuation_invalid',
+        `Session semantic tool ${toolCall.callId} has no complete Provider identity.`
+      );
+    }
+    const replayToolCall = {
+      ...(decodedReplayToolCall ?? protocolToolCall),
+      arguments: toolCall.rawArguments
+        ?? decodedReplayToolCall?.arguments
+        ?? protocolToolCall.arguments,
+    };
+    const providerRequestId = exactSemanticProviderRequestId(
+      turn,
+      `Session semantic tool ${toolCall.callId}`
+    );
+    const epochId = state.providerTurnFrame?.promptLedgerEpochId;
+    if (!epochId) {
+      throw new SessionDriverLoopError(
+        'session_task_prompt_epoch_incompatible',
+        'Session semantic exchange has no active PromptLedger epoch.'
+      );
+    }
+    const priorContinuation = state.activeProviderContinuation;
+    if (priorContinuation) {
+      for (const [name, previous, current] of [
+        ['sessionId', priorContinuation.sessionId, state.sessionId],
+        ['runId', priorContinuation.runId, state.runId],
+        ['turnId', priorContinuation.turnId, state.userAuthorityFrame.turnAuthority.turnId],
+        ['taskId', priorContinuation.taskId, state.userAuthorityFrame.turnAuthority.taskId],
+        [
+          'turnAuthorityRef',
+          priorContinuation.turnAuthorityRef,
+          state.userAuthorityFrame.turnAuthorityRef,
+        ],
+        ['promptLedgerEpochId', priorContinuation.promptLedgerEpochId, epochId],
+      ] as const) {
+        if (previous !== current) {
+          throw new SessionDriverLoopError(
+            'session_provider_continuation_invalid',
+            `Session semantic tool ${toolCall.callId} changed continuation ${name} from ${previous} to ${current}.`
+          );
+        }
+      }
+    }
+    const continuationLanguagePolicy = priorContinuation?.sourceLanguagePolicy
+      ?? turn.sourceLanguagePolicy;
+    const toolResultContent = JSON.stringify(result);
+    const continuationExchange = {
+      sourceRequestId: providerRequestId,
+      sourceParentRequestId: turn.providerParentRequestId,
+      languageRevision: state.userAuthorityFrame.languagePolicy.revision,
+      stage: state.activeTurn?.stage ?? 'provider_call',
+      assistantContent: preserveActiveContinuation
+        ? turn.assistantMessage!.content
+        : turn.assistantMessage?.content ?? turn.content,
+      reasoningContent: turn.reasoning,
+      toolCall: replayToolCall,
+      toolResultContent,
+    };
+    if (
+      priorContinuation?.semanticProfileId
+      && priorContinuation.semanticProfileId !== profileId
+    ) {
+      throw new SessionDriverLoopError(
+        'session_provider_continuation_invalid',
+        `Session semantic tool ${toolCall.callId} changed Provider profile within an active continuation.`
+      );
+    }
+    for (const [name, previous, current] of [
+      ['providerProfileId', priorContinuation?.providerProfileId, turn.providerProfileId],
+      ['provider', priorContinuation?.provider, turn.provider],
+      ['model', priorContinuation?.model, turn.model],
+    ] as const) {
+      if (previous && current && previous !== current) {
+        throw new SessionDriverLoopError(
+          'session_provider_continuation_invalid',
+          `Session semantic tool ${toolCall.callId} changed ${name} from ${previous} to ${current}.`
+        );
+      }
+    }
+    if (
+      priorContinuation
+      && priorContinuation.baseMessagesDigest !== turn.continuationBaseMessagesDigest
+    ) {
+      throw new SessionDriverLoopError(
+        'session_provider_continuation_invalid',
+        `Session semantic tool ${toolCall.callId} changed the admitted continuation base messages.`
+      );
+    }
+    if (
+      priorContinuation?.exchanges.some(
+        (exchange) => exchange.toolCall.id === protocolToolCall.id
+      )
+    ) {
+      throw new SessionDriverLoopError(
+        'session_provider_continuation_invalid',
+        `Session semantic tool ${toolCall.callId} duplicated an active continuation call id.`
+      );
+    }
+    const activeProviderContinuation = {
+      schemaVersion: 'deepcode.session.active-provider-continuation.v1' as const,
+      sessionId: state.sessionId,
+      runId: state.runId,
+      turnId: state.userAuthorityFrame.turnAuthority.turnId,
+      taskId: state.userAuthorityFrame.turnAuthority.taskId,
+      turnAuthorityRef: state.userAuthorityFrame.turnAuthorityRef,
+      promptLedgerEpochId: epochId,
+      semanticProfileId: profileId,
+      providerProfileId: priorContinuation?.providerProfileId ?? turn.providerProfileId,
+      provider: priorContinuation?.provider ?? turn.provider,
+      model: priorContinuation?.model ?? turn.model,
+      toolSchemaHash: priorContinuation?.toolSchemaHash
+        ?? state.providerTurnFrame?.snapshot?.toolSchemaHash,
+      responseFormatHash: priorContinuation?.responseFormatHash
+        ?? state.providerTurnFrame?.snapshot?.responseFormatHash,
+      sourceRequestId: priorContinuation?.sourceRequestId ?? providerRequestId,
+      sourceLanguagePolicy: continuationLanguagePolicy,
+      baseMessages: priorContinuation?.baseMessages ?? turn.continuationBaseMessages,
+      baseMessagesDigest: priorContinuation?.baseMessagesDigest ?? turn.continuationBaseMessagesDigest,
+      exchanges: [
+        ...(priorContinuation?.exchanges ?? []),
+        continuationExchange,
+      ],
+    };
+    if (!this.ports.appendAnalysisTimeline) {
+      if (this.ports.analysisTimelineRequired) {
+        throw new SessionDriverLoopError(
+          'session_analysis_timeline_unavailable',
+          'Session semantic directives require the full analysis timeline storage port.'
+        );
+      }
+    } else {
+      const analysisEntries = [
+        semanticExchangeAnalysisEvent({
+          state,
+          requestId: providerRequestId,
+          stage: continuationExchange.stage,
+          languageRevision: continuationExchange.languageRevision,
+          providerProfileId: turn.providerProfileId,
+          provider: turn.provider,
+          model: turn.model,
+          promptLedgerEpochId: epochId,
+          toolCallId: toolCall.callId,
+          proposalId,
+          toolCall: replayToolCall,
+          toolResult: result,
+          assistantContent: preserveActiveContinuation
+            ? turn.assistantMessage!.content
+            : turn.assistantMessage?.content ?? turn.content,
+          assistantReasoning: turn.reasoning,
+          recordId: this.agentRunReactor.id('analysis-semantic-exchange'),
+          createdAt: this.agentRunReactor.ts(),
+        }),
+      ];
+      try {
+        const analysisResult = await this.ports.appendAnalysisTimeline(
+          state.sessionId,
+          analysisEntries
+        );
+        if (this.ports.analysisTimelineRequired) {
+          const violation = providerAnalysisTimelineAckViolation(
+            analysisEntries,
+            analysisResult
+          );
+          if (violation) {
+            throw new Error(violation);
+          }
+        }
+      } catch (error) {
+        throw new SessionDriverLoopError(
+          'session_analysis_timeline_write_failed',
+          `Session semantic analysis append failed: ${error instanceof Error ? error.message : String(error)}`
+        );
+      }
+    }
+    const epoch = promptLedgerEpoch(state.promptLedger, epochId);
+    if (!epoch) {
+      throw new SessionDriverLoopError(
+        'session_task_prompt_epoch_incompatible',
+        `Session semantic exchange PromptLedger epoch ${epochId} is unavailable.`
+      );
+    }
+    if (!this.ports.appendWireLedger) {
+      if (this.ports.wireLedgerRequired) {
+        throw new SessionDriverLoopError(
+          'session_wire_ledger_unavailable',
+          'Session semantic exchange requires the durable wire ledger storage port.'
+        );
+      }
+    } else {
+      await this.ports.appendWireLedger(state.sessionId, promptLedgerWireSemanticExchange({
+          sessionId: state.sessionId,
+          runId: state.runId,
+          profileId,
+          sourceRequestId: providerRequestId,
+          epoch,
+          toolCall: protocolToolCall,
+          result,
+          timestamp: this.agentRunReactor.ts(),
+          createId: (prefix) => this.agentRunReactor.id(prefix),
+      }));
+    }
+    const appendedEpoch = appendPromptLedgerSemanticExchange({
       state: state.promptLedger,
       epochId,
       toolCall: protocolToolCall,
       result,
       createId: (prefix) => this.agentRunReactor.id(prefix),
     });
-    if (!epoch || !this.ports.appendWireLedger) return;
-    await this.ports.appendWireLedger(state.sessionId, promptLedgerWireSemanticExchange({
-      sessionId: state.sessionId,
-      runId: state.runId,
-      profileId,
-      epoch,
-      toolCall: protocolToolCall,
-      result,
-      timestamp: this.agentRunReactor.ts(),
-      createId: (prefix) => this.agentRunReactor.id(prefix),
-    }));
+    if (!appendedEpoch) {
+      throw new SessionDriverLoopError(
+        'session_task_prompt_epoch_incompatible',
+        `Session semantic exchange PromptLedger epoch ${epochId} became unavailable after durable append.`
+      );
+    }
+    state.activeProviderContinuation = preserveActiveContinuation
+      ? activeProviderContinuation
+      : undefined;
   }
 
   private async resumeRun(input: SessionDriverLoopInput): Promise<AgentSessionResult> {
     return this.runLoopInput(input, 'resumeRun');
+  }
+
+  private async admitQueuedProviderGuidance(
+    state: SessionDriverLoopRunState,
+    stage: string,
+    admissionPhase: 'contextPreparation' | 'physicalAdmission' = 'physicalAdmission'
+  ): Promise<{
+    result: AgentSessionResult;
+    messages: LlmChatRequest['messages'];
+    priorGuidance: Array<{ id: string; content: string }>;
+  }> {
+    const current = await this.agentRunReactor.append(state.sessionId, []);
+    const resume = userGuidanceQueue.providerResume({
+      sessionId: state.sessionId,
+      events: current.events,
+      runId: state.runId,
+      hostRunId: state.hostRunId,
+      taskId: state.userAuthorityFrame.turnAuthority.taskId,
+      stage,
+      defaultHostLanguage: state.userAuthorityFrame.languagePolicy.hostLanguage,
+      promptEpochId: state.providerTurnFrame?.promptLedgerEpochId,
+      summary: providerStreamCoordinator.userGuidanceConsumedSummary(
+        state.userAuthorityFrame.effectiveLanguage
+      ),
+      now: () => this.agentRunReactor.ts(),
+      createId: (prefix) => this.agentRunReactor.id(prefix),
+    });
+    if (!resume.events.length) {
+      return { result: current, messages: [], priorGuidance: [] };
+    }
+    const appended = await this.agentRunReactor.append(state.sessionId, resume.events);
+    state.userAuthorityFrame = buildUserAuthorityFrame(
+      appended.events,
+      {
+        messageId: state.userAuthorityFrame.rootMessage.messageId,
+        content: state.userAuthorityFrame.rootMessage.content,
+        timestamp: state.userAuthorityFrame.rootMessage.timestamp,
+      },
+      state.userAuthorityFrame.autonomyMode,
+      { runId: state.runId }
+    );
+    state.userRequest = latestExplicitUserContent(state.userAuthorityFrame);
+    state.activeProviderContinuation = undefined;
+    state.pendingProviderRetry = undefined;
+    state.semanticDirectiveRepairAttempted = false;
+    state.semanticDirectiveRepairAttempts = {};
+    state.semanticDirectiveErrorSummary = undefined;
+    const priorGuidance = resume.guidance.slice(0, -1).map((item) => ({
+      id: item.id,
+      content: item.content,
+    }));
+    if (admissionPhase === 'contextPreparation') {
+      return { result: appended, messages: [], priorGuidance };
+    }
+    const epochId = state.providerTurnFrame?.promptLedgerEpochId;
+    if (!state.promptLedger || !epochId) {
+      throw new SessionDriverLoopError(
+        'session_task_prompt_epoch_incompatible',
+        'Queued user guidance has no active PromptLedger epoch.'
+      );
+    }
+    const epoch = promptLedgerEpoch(state.promptLedger, epochId);
+    if (!epoch) {
+      throw new SessionDriverLoopError(
+        'session_task_prompt_epoch_incompatible',
+        `Queued user guidance PromptLedger epoch ${epochId} is unavailable.`
+      );
+    }
+    const priorEntryIds = new Set(epoch.entries.map((entry) => entry.entryId));
+    appendPromptLedgerGuidanceBatch({
+      state: state.promptLedger,
+      epochId,
+      guidance: priorGuidance,
+      createId: (prefix) => this.agentRunReactor.id(prefix),
+    });
+    appendPromptLedgerCurrentTurn({
+      state: state.promptLedger,
+      epochId,
+      authority: state.userAuthorityFrame,
+      createId: (prefix) => this.agentRunReactor.id(prefix),
+    });
+    const messages = epoch.entries
+      .filter((entry) => !priorEntryIds.has(entry.entryId))
+      .map((entry) => structuredClone(entry.message));
+    return { result: appended, messages, priorGuidance };
+  }
+
+  private async localOutputLanguage(
+    sessionId: string,
+    runId?: string,
+    fallbackHostLanguage?: ConversationLanguage
+  ): Promise<{
+    readonly language: ConversationLanguage;
+    readonly runId?: string;
+    readonly currentEvents: AgentEvent[];
+    readonly decisionEvents: AgentEvent[];
+  }> {
+    const current = await this.agentRunReactor.append(sessionId, []);
+    const authority = latestSessionTurnAuthority(current.events, runId);
+    if (!authority) {
+      return {
+        language: normalizeHostLanguage(fallbackHostLanguage),
+        runId,
+        currentEvents: current.events,
+        decisionEvents: [],
+      };
+    }
+    const policy = resolveConversationLanguagePolicy(current.events, authority);
+    if (policy.status !== 'pending') {
+      return {
+        language: effectiveConversationLanguage(policy),
+        runId: authority.runId,
+        currentEvents: current.events,
+        decisionEvents: [],
+      };
+    }
+    return {
+      language: policy.hostLanguage,
+      runId: authority.runId,
+      currentEvents: current.events,
+      decisionEvents: [
+        createSessionLanguageDecisionEvent({
+          sessionId: authority.sessionId,
+          runId: authority.runId,
+          turnId: authority.turnId,
+          revision: authority.languagePolicy.revision,
+          status: 'fallback',
+          responseLanguage: policy.hostLanguage,
+          decisionSource: 'hostFallbackMissing',
+          eventId: this.agentRunReactor.id('session-language-fallback'),
+          timestamp: this.agentRunReactor.ts(),
+        }),
+      ],
+    };
+  }
+
+  private semanticPromptLedgerEpochId(
+    state: SessionDriverLoopRunState,
+    toolCallId: string
+  ): string {
+    const epochId = state.providerTurnFrame?.promptLedgerEpochId;
+    if (!epochId?.trim()) {
+      throw new SessionDriverLoopError(
+        'session_task_prompt_epoch_incompatible',
+        `Session semantic tool ${toolCallId} has no active PromptLedger epoch.`
+      );
+    }
+    return epochId;
+  }
+
+  private providerSideCallContractId(
+    state: SessionDriverLoopRunState,
+    toolCallId?: string
+  ): string {
+    const frame = state.providerTurnFrame;
+    const contractId = frame?.contractId?.trim();
+    if (!contractId) {
+      throw new SessionDriverLoopError(
+        'session_provider_continuation_invalid',
+        `Session Provider side-call${toolCallId ? ` tool ${toolCallId}` : ''} has no active ProviderTurn contract.`
+      );
+    }
+    if (frame?.promptLedgerEpochId?.trim()) {
+      throw new SessionDriverLoopError(
+        'session_task_prompt_epoch_incompatible',
+        `Session Provider side-call contract ${contractId} must not reuse PromptLedger epoch ${frame.promptLedgerEpochId}.`
+      );
+    }
+    return contractId;
   }
 
   private async runLoopInput(
@@ -1234,12 +2390,16 @@ export class SessionDriverLoop {
   ): Promise<AgentSessionResult> {
     const existingEvents = input.existingEvents ?? [];
     if (hasLegacySessionTurnAuthority(existingEvents) && !latestSessionTurnAuthority(existingEvents)) {
+      const language = normalizeHostLanguage(input.hostLanguage);
       return this.agentRunReactor.append(input.sessionId, sessionFailureProjectionBuilder.internalFailureEvents({
         sessionId: input.sessionId,
         runId: latestRunIdForFailure(existingEvents) ?? 'run-unavailable',
         stage: 'run_engine',
         code: 'session_language_policy_unavailable',
-        message: 'This Session uses turn authority v1 and cannot continue without ConversationLanguagePolicy v1.',
+        message: language === 'zh-CN'
+          ? '此 Session 使用 turn authority v1，缺少 ConversationLanguagePolicy v1，无法继续。'
+          : 'This Session uses turn authority v1 and cannot continue without ConversationLanguagePolicy v1.',
+        language,
         reason: 'driver_failure',
         ts: this.agentRunReactor.ts(),
         id: this.agentRunReactor.id('session-language-policy-unavailable'),
@@ -1254,6 +2414,7 @@ export class SessionDriverLoop {
         || !(input.projectWorkingDirectory?.absolutePath ?? input.projectWorkingDirectory?.displayPath)
       )
     ) {
+      const hostLanguage = normalizeHostLanguage(input.hostLanguage);
       const userMessage = input.appendUserMessage === false
         ? undefined
         : this.agentRunReactor.event(input.sessionId, 'user_msg', {
@@ -1262,7 +2423,12 @@ export class SessionDriverLoop {
           channel: 'user',
           visibility: 'conversation',
         });
-      const events = userMessage ? [userMessage] : [];
+      const events = [
+        ...(input.bootstrapEvents ?? []),
+        ...(userMessage ? [userMessage] : []),
+      ];
+      let responseLanguage = hostLanguage;
+      let failureRunId: string | undefined;
       if (userMessage) {
         const previousAuthority = latestSessionTurnAuthority(existingEvents);
         if (
@@ -1280,52 +2446,197 @@ export class SessionDriverLoop {
             timestamp: this.agentRunReactor.ts(),
           }));
         }
+        const runId = this.agentRunReactor.id('project-root-unavailable-run');
+        failureRunId = runId;
+        const turnId = this.agentRunReactor.id('session-turn');
+        const languageRevision = nextConversationLanguageRevision(existingEvents);
         events.push(createSessionTurnAuthorityEvent({
           sessionId: input.sessionId,
-          runId: this.agentRunReactor.id('project-root-unavailable-run'),
-          turnId: this.agentRunReactor.id('session-turn'),
+          runId,
+          turnId,
           taskId: this.agentRunReactor.id('session-task'),
           messages: [{ messageId: userMessage.id, content: input.content }],
           relation: 'newTask',
           boundAtHookRef: 'run.projectRootUnavailable',
-          languageRevision: nextConversationLanguageRevision(existingEvents),
-          hostLanguage: normalizeHostLanguage(input.hostLanguage),
+          languageRevision,
+          hostLanguage,
           previousTaskId: previousAuthority?.taskId,
           eventId: this.agentRunReactor.id('session-turn-authority'),
           timestamp: this.agentRunReactor.ts(),
         }));
+        events.push(createSessionLanguageDecisionEvent({
+          sessionId: input.sessionId,
+          runId,
+          turnId,
+          revision: languageRevision,
+          status: 'fallback',
+          responseLanguage: hostLanguage,
+          decisionSource: 'hostFallbackMissing',
+          eventId: this.agentRunReactor.id('session-language-fallback'),
+          timestamp: this.agentRunReactor.ts(),
+        }));
+      } else {
+        const authority = latestSessionTurnAuthority(existingEvents);
+        if (authority) {
+          failureRunId = authority.runId;
+          const policy = resolveConversationLanguagePolicy(existingEvents, authority);
+          responseLanguage = effectiveConversationLanguage(policy);
+          if (policy.status === 'pending') {
+            responseLanguage = policy.hostLanguage;
+            events.push(createSessionLanguageDecisionEvent({
+              sessionId: authority.sessionId,
+              runId: authority.runId,
+              turnId: authority.turnId,
+              revision: authority.languagePolicy.revision,
+              status: 'fallback',
+              responseLanguage,
+              decisionSource: 'hostFallbackMissing',
+              eventId: this.agentRunReactor.id('session-language-fallback'),
+              timestamp: this.agentRunReactor.ts(),
+            }));
+          }
+        }
       }
-      events.push(assistantProjectionBuilder.finalDiagnosticEvent(
+      if (!failureRunId) {
+        throw new SessionDriverLoopError(
+          'session_turn_authority_unavailable',
+          'Project-root failure cannot bootstrap a run without an exact turn authority.'
+        );
+      }
+      events.push(sessionProgressProjectionBuilder.sessionRunStateEvent({
+        sessionId: input.sessionId,
+        runId: failureRunId,
+        phase: 'context_reading',
+        status: 'running',
+        reason: 'session',
+        decisionOwner: {
+          kind: 'session',
+          runId: failureRunId,
+        },
+        ts: this.agentRunReactor.ts(),
+        id: this.agentRunReactor.id('session-run-project-root-bootstrap'),
+      }));
+      const bootstrapped = await this.agentRunReactor.append(
+        input.sessionId,
+        events
+      );
+      const diagnosticPresentationBinding =
+        conversationPresentationLanguageBindingFromEvents(bootstrapped.events);
+      const diagnosticId = this.agentRunReactor.id('project-root-unavailable');
+      const terminalEvents = [assistantProjectionBuilder.finalDiagnosticEvent(
         input.sessionId,
         {
           code: 'project_root_unavailable',
-          fallback: 'The project directory is unavailable. Rebind the project directory before using this project session.',
+          fallback: responseLanguage === 'zh-CN'
+            ? '项目目录当前不可用。请重新绑定项目目录后再使用该项目会话。'
+            : 'The project directory is unavailable. Rebind the project directory before using this project session.',
           params: { projectId: input.projectId },
         },
         this.agentRunReactor.ts(),
-        this.agentRunReactor.id('project-root-unavailable')
-      ));
-      return this.agentRunReactor.append(input.sessionId, events);
+        diagnosticId,
+        diagnosticPresentationBinding
+      ), sessionProgressProjectionBuilder.sessionRunStateEvent({
+        sessionId: input.sessionId,
+        runId: failureRunId,
+        phase: 'failed',
+        status: 'failed',
+        reason: 'driver_failure',
+        decisionOwner: {
+          kind: 'session',
+          runId: failureRunId,
+          targetId: diagnosticId,
+        },
+        ts: this.agentRunReactor.ts(),
+        id: this.agentRunReactor.id('session-run-project-root-unavailable'),
+      })];
+      return this.agentRunReactor.append(input.sessionId, terminalEvents);
     }
     try {
       return mode === 'resumeRun'
         ? await this.runEngine.resume(input)
         : await this.runEngine.run(input);
     } catch (error) {
-      const message = error instanceof SessionDriverLoopError ? error.message : String(error);
-      const runId = input.existingEvents ? latestRunIdForFailure(input.existingEvents) : undefined;
-      return this.agentRunReactor.append(input.sessionId, sessionFailureProjectionBuilder.internalFailureEvents({
-        sessionId: input.sessionId,
-        runId: runId ?? 'run-unavailable',
-        stage: 'run_engine',
-        code: error instanceof SessionDriverLoopError ? error.code : 'run_engine_failed',
-        message: `Session RunEngine failed: ${message}`,
-        reason: 'driver_failure',
-        ts: this.agentRunReactor.ts(),
-        id: this.agentRunReactor.id('run-engine-failed'),
-      }));
+      const rawMessage = error instanceof Error ? error.message : String(error);
+      const code = error instanceof SessionDriverLoopError
+        ? error.code
+        : stringValue(objectRecord(error)?.code) ?? 'run_engine_failed';
+      const language = await this.localOutputLanguage(
+        input.sessionId,
+        undefined,
+        input.hostLanguage
+      );
+      const runId = language.runId ?? latestRunIdForFailure(language.currentEvents);
+      if (error instanceof SessionDriverLoopError && error.code === 'session_run_cancelled') {
+        const cancellationRunId = runId ?? 'run-unavailable';
+        return this.agentRunReactor.append(input.sessionId, [
+          ...language.decisionEvents,
+          sessionProgressProjectionBuilder.sessionRunStateEvent({
+            sessionId: input.sessionId,
+            runId: cancellationRunId,
+            phase: 'cancelled',
+            status: 'cancelled',
+            reason: 'session',
+            decisionOwner: {
+              kind: 'session',
+              runId: cancellationRunId,
+            },
+            ts: this.agentRunReactor.ts(),
+            id: this.agentRunReactor.id('session-run-cancelled'),
+          }),
+        ]);
+      }
+      const diagnostic = driverFailureMessageCatalog.driverFailure(
+        code,
+        rawMessage,
+        language.language
+      );
+      try {
+        return await this.agentRunReactor.append(input.sessionId, [
+          ...language.decisionEvents,
+          ...sessionFailureProjectionBuilder.internalFailureEvents({
+            sessionId: input.sessionId,
+            runId: runId ?? 'run-unavailable',
+            stage: 'run_engine',
+            code: diagnostic.code,
+            message: diagnostic.fallback,
+            language: language.language,
+            reason: 'driver_failure',
+            ts: this.agentRunReactor.ts(),
+            id: this.agentRunReactor.id('run-engine-failed'),
+          }),
+        ]);
+      } catch (persistenceError) {
+        const persistenceMessage = persistenceError instanceof Error
+          ? persistenceError.message
+          : String(persistenceError);
+        throw new SessionDriverLoopError(
+          'session_run_failure_persistence_failed',
+          `Run initialization failed with ${code}: ${rawMessage}; persisting that failure also failed: ${persistenceMessage}`
+        );
+      }
     }
   }
+}
+
+function exactSemanticProviderRequestId(
+  turn: Pick<LlmTurnResult, 'providerAdmission' | 'providerRequestId'>,
+  context: string
+): string {
+  const admittedRequestId = turn.providerAdmission.requestId.trim();
+  const reportedRequestId = turn.providerRequestId?.trim();
+  if (!admittedRequestId) {
+    throw new SessionDriverLoopError(
+      'session_provider_admission_unavailable',
+      `${context} has no canonical admitted Provider request identity.`
+    );
+  }
+  if (reportedRequestId && reportedRequestId !== admittedRequestId) {
+    throw new SessionDriverLoopError(
+      'session_provider_admission_invalid',
+      `${context} reported Provider request ${reportedRequestId}, but its canonical admission is ${admittedRequestId}.`
+    );
+  }
+  return admittedRequestId;
 }
 
 function latestRunIdForFailure(events: AgentEvent[]): string | undefined {
@@ -1335,4 +2646,36 @@ function latestRunIdForFailure(events: AgentEvent[]): string | undefined {
     if (runId) return runId;
   }
   return undefined;
+}
+
+function resourcePacketActivityIdentity(
+  runId: string,
+  providerRequestId: string,
+  toolCall: NativeToolCallProposal
+): ResourcePacketActivityIdentity {
+  const identityPart = (value: string): string => encodeURIComponent(value);
+  return {
+    activityId: [
+      'resource',
+      identityPart(runId),
+      identityPart(providerRequestId),
+      identityPart(toolCall.callId),
+    ].join(':'),
+    runId,
+    providerRequestId,
+    callId: toolCall.callId,
+    toolName: toolCall.name,
+  };
+}
+
+function resourceSemanticTerminalStatus(
+  error: unknown
+): 'failed' | 'cancelled' {
+  return stringValue(objectRecord(error)?.code) === 'session_run_cancelled'
+    ? 'cancelled'
+    : 'failed';
+}
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }

@@ -257,7 +257,7 @@ export interface ProjectionDelta {
   targetPath?: string;
   itemId?: string;
   stage?: string;
-  status?: 'queued' | 'running' | 'streaming' | 'waiting' | 'draftReady' | 'discarded' | 'skipped' | 'completed' | 'failed';
+  status?: 'queued' | 'running' | 'streaming' | 'waiting' | 'draftReady' | 'discarded' | 'skipped' | 'completed' | 'cancelled' | 'failed';
   channel?: 'progress' | 'reasoning' | 'final' | 'tool' | 'resource' | 'workunit' | 'draft';
   source?: 'session' | 'driver' | 'llm' | 'kernel' | 'provider';
   delta?: string;

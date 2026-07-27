@@ -82,12 +82,12 @@ export class KernelEventStatusIndex {
       && events.some((event) => event.kind === 'batch.review_ready');
   }
 
-  reviewGateStatus(events: KernelEventV1[] | undefined): string | undefined {
+  reviewGateEvaluation(
+    events: KernelEventV1[] | undefined
+  ): Extract<KernelEventV1, { kind: 'review_gate.evaluated' }> | undefined {
     for (const event of [...(events ?? [])].reverse()) {
       if (event.kind !== 'review_gate.evaluated') continue;
-      const result = objectRecord(event.result);
-      const status = stringValue(result?.status);
-      if (status) return status;
+      return event;
     }
     return undefined;
   }
@@ -105,14 +105,4 @@ export class KernelEventStatusIndex {
     }
     return undefined;
   }
-}
-
-function objectRecord(value: unknown): Record<string, unknown> | undefined {
-  return value && typeof value === 'object' && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : undefined;
-}
-
-function stringValue(value: unknown): string | undefined {
-  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
 }

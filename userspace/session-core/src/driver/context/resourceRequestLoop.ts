@@ -10,6 +10,10 @@ import type {
   ResourcePacketItem,
 } from '../../context/types.js';
 import type { ResourceRequestResolution } from '../../resources/ResourceRequestResolver.js';
+import {
+  localizedProjectionText,
+  type ConversationPresentationLanguage,
+} from '../projection/conversationPresentationLanguage.js';
 
 export interface ResourceRequestLoopOptions {
   maxDerivedManifestEntries?: number;
@@ -29,6 +33,14 @@ export interface ResourceRequestDiagnosticInfo {
   code: string;
   fallback: string;
   params?: Record<string, string | number>;
+}
+
+export interface ResourcePacketActivityIdentity {
+  activityId: string;
+  runId: string;
+  providerRequestId: string;
+  callId: string;
+  toolName: string;
 }
 
 export class ResourceRequestLoop {
@@ -51,20 +63,39 @@ export class ResourceRequestLoop {
     return this.findPacket(reply.events);
   }
 
-  resolutionDiagnostic(resolution: ResourceRequestResolution): ResourceRequestDiagnosticInfo {
+  resolutionDiagnostic(
+    resolution: ResourceRequestResolution,
+    language: ConversationPresentationLanguage = 'neutral'
+  ): ResourceRequestDiagnosticInfo {
     const unresolved = resolution.unresolved.join('; ');
     const ambiguous = resolution.ambiguous.join('; ');
     const roots = resolution.availableRoots.length
       ? resolution.availableRoots.map((root) => `${root.rootId} -> ${root.displayPath}`).join('\n')
       : '';
-    const fallback = [
-      'The requested resources could not be located in the current attachments or project directory; Session rejected the request.',
-      unresolved ? `Unresolved: ${unresolved}` : '',
-      ambiguous ? `Multiple candidate roots: ${ambiguous}` : '',
-      'Available project/attachment roots:',
-      roots || 'No available attachment or project directory.',
-      'Please specify an explicit attachment, rootId, or relative path.',
-    ].filter(Boolean).join('\n');
+    const fallback = language === 'zh-CN'
+      ? [
+          '当前附件或项目目录中无法定位所请求的资源，Session 已拒绝该请求。',
+          unresolved ? `未解析：${unresolved}` : '',
+          ambiguous ? `存在多个候选根目录：${ambiguous}` : '',
+          '可用的项目/附件根目录：',
+          roots || '没有可用的附件或项目目录。',
+          '请明确指定附件、rootId 或相对路径。',
+        ].filter(Boolean).join('\n')
+      : language === 'en-US'
+        ? [
+            'The requested resources could not be located in the current attachments or project directory; Session rejected the request.',
+            unresolved ? `Unresolved: ${unresolved}` : '',
+            ambiguous ? `Multiple candidate roots: ${ambiguous}` : '',
+            'Available project/attachment roots:',
+            roots || 'No available attachment or project directory.',
+            'Please specify an explicit attachment, rootId, or relative path.',
+          ].filter(Boolean).join('\n')
+        : [
+            'resource_resolution=failed',
+            unresolved ? `unresolved=${unresolved}` : '',
+            ambiguous ? `ambiguous=${ambiguous}` : '',
+            roots ? `roots:\n${roots}` : 'roots=none',
+          ].filter(Boolean).join('\n');
     return {
       code: 'resourceResolveFailed',
       fallback,
@@ -111,8 +142,25 @@ export class ResourceRequestLoop {
     return packets.reverse();
   }
 
-  packetEvent(sessionId: string, packet: ResourcePacket, ts: string, id: string): AgentEvent {
-    const activity = this.packetActivity(packet, id);
+  packetEvent(
+    sessionId: string,
+    packet: ResourcePacket,
+    ts: string,
+    id: string,
+    language: ConversationPresentationLanguage = 'neutral',
+    identity?: ResourcePacketActivityIdentity
+  ): AgentEvent {
+    const toolName = identity?.toolName ?? 'kernel.resourceResolve';
+    const activity = {
+      ...this.packetActivity(
+        packet,
+        identity?.activityId ?? id,
+        identity?.runId,
+        language
+      ),
+      toolName,
+      resourcePacketIds: [packet.id],
+    };
     const failed = resourcePacketFailed(packet);
     return {
       id,
@@ -120,9 +168,14 @@ export class ResourceRequestLoop {
       ts,
       kind: 'tool_result',
       payload: {
-        toolName: 'kernel.resourceResolve',
+        toolName,
+        runId: identity?.runId,
+        providerRequestId: identity?.providerRequestId,
+        callId: identity?.callId,
         status: failed ? 'error' : 'ok',
-        summary: resourcePacketSummary(packet),
+        summary: resourcePacketSummary(packet, language),
+        memorySummary: resourcePacketSummary(packet, 'neutral'),
+        presentationLanguage: language,
         output: packet,
         channel: 'tool',
         visibility: 'conversation',
@@ -132,15 +185,30 @@ export class ResourceRequestLoop {
     };
   }
 
-  packetActivity(packet: ResourcePacket, activityId: string, runId?: string): AgentConversationActivity {
+  packetActivity(
+    packet: ResourcePacket,
+    activityId: string,
+    runId?: string,
+    language: ConversationPresentationLanguage = 'neutral'
+  ): AgentConversationActivity {
     const failed = resourcePacketFailed(packet);
     const search = packet.items.some((item) => item.contentKind === 'searchResults');
     return conversationActivity({
       activityId,
       kind: search ? 'resourceSearch' : 'resourceRead',
       status: failed ? 'failed' : 'completed',
-      title: search ? 'Search results resolved' : 'Resource context resolved',
-      summary: resourcePacketSummary(packet),
+      title: search
+        ? localizedProjectionText(language, {
+          zh: '搜索结果已解析',
+          en: 'Search results resolved',
+          neutral: 'Search ✓',
+        })
+        : localizedProjectionText(language, {
+          zh: '资源上下文已解析',
+          en: 'Resource context resolved',
+          neutral: 'Resource ✓',
+        }),
+      summary: resourcePacketSummary(packet, language),
       source: 'kernel',
       runId,
       targets: Array.from(new Set(
@@ -243,11 +311,18 @@ function resourcePacketFailed(packet: ResourcePacket): boolean {
   return packet.items.length > 0 && packet.items.every((item) => item.status === 'error' || item.status === 'denied');
 }
 
-function resourcePacketSummary(packet: ResourcePacket): string {
+function resourcePacketSummary(
+  packet: ResourcePacket,
+  language: ConversationPresentationLanguage
+): string {
   const counts = new Map<ResourcePacketItem['status'], number>();
   for (const item of packet.items) counts.set(item.status, (counts.get(item.status) ?? 0) + 1);
   const detail = [...counts.entries()].map(([status, count]) => `${status}=${count}`).join(', ');
-  return `Kernel resolved ${packet.items.length} resource item(s)${detail ? ` (${detail})` : ''}.`;
+  return localizedProjectionText(language, {
+    zh: `Kernel 已解析 ${packet.items.length} 个资源项${detail ? `（${detail}）` : ''}。`,
+    en: `Kernel resolved ${packet.items.length} resource item(s)${detail ? ` (${detail})` : ''}.`,
+    neutral: `Resource items=${packet.items.length}${detail ? ` (${detail})` : ''}`,
+  });
 }
 
 function conversationActivity(input: AgentConversationActivity): AgentConversationActivity {

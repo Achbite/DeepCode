@@ -1,4 +1,7 @@
-import type { AcceptedTaskPlanContext } from '../../accepted-plan/types.js';
+import {
+  acceptedPlanSettledTaskIds,
+  type AcceptedTaskPlanContext,
+} from '../../accepted-plan/types.js';
 
 export type IntentSlotOperation =
   | 'createFile'
@@ -72,10 +75,7 @@ export class IntentSlotRegistry {
 
   private currentTask(acceptedPlan: AcceptedTaskPlanContext | undefined) {
     if (!acceptedPlan) return undefined;
-    const settled = new Set([
-      ...(acceptedPlan.completedTaskIds ?? []),
-      ...(acceptedPlan.modelJudgedSufficientTaskIds ?? []),
-    ]);
+    const settled = new Set(acceptedPlanSettledTaskIds(acceptedPlan));
     return (acceptedPlan.tasks ?? []).find((candidate) => !settled.has(candidate.taskId));
   }
 

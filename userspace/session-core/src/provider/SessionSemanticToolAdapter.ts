@@ -10,7 +10,11 @@ import type {
   ResourceManifest,
   ResourcePacket,
 } from '../context/types.js';
-import type { KernelArtifactEditMatch, KernelToolCatalogSnapshot } from '@deepcode/protocol';
+import type {
+  ConversationLanguage,
+  KernelArtifactEditMatch,
+  KernelToolCatalogSnapshot,
+} from '@deepcode/protocol';
 
 export interface SessionSemanticToolState {
   readonly sessionId: string;
@@ -30,7 +34,12 @@ export interface SessionSemanticToolState {
       draftAdmissionPolicy?: { maxTotalUtf8Bytes?: number };
     };
   };
-  readonly userAuthorityFrame?: { readonly effectiveLanguage?: 'zh-CN' | 'en-US' | string };
+  readonly userAuthorityFrame?: {
+    readonly effectiveLanguage?: ConversationLanguage;
+    readonly languagePolicy?: {
+      readonly status?: string;
+    };
+  };
 }
 
 export type SessionSemanticDirective =

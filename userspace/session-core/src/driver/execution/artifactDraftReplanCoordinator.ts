@@ -19,7 +19,10 @@ export interface ArtifactDraftReplanState {
   semanticDirectiveRepairAttempts?: Record<string, number>;
   semanticDirectiveRepairAttempted?: boolean;
   semanticDirectiveErrorSummary?: string;
-  pendingSemanticToolCalls?: Record<string, unknown>;
+  pendingSemanticExchanges?: Record<string, unknown>;
+  activeProviderContinuation?: unknown;
+  pendingProviderRetry?: unknown;
+  lastProviderResponseRequestId?: string;
   interactionOverlay?: unknown;
   taskPlanReplanReason?: AcceptedTaskReplanReason;
 }
@@ -55,7 +58,10 @@ export class ArtifactDraftReplanCoordinator<State extends ArtifactDraftReplanSta
     state.semanticDirectiveRepairAttempts = {};
     state.semanticDirectiveRepairAttempted = false;
     state.semanticDirectiveErrorSummary = undefined;
-    state.pendingSemanticToolCalls = {};
+    state.pendingSemanticExchanges = {};
+    state.activeProviderContinuation = undefined;
+    state.pendingProviderRetry = undefined;
+    state.lastProviderResponseRequestId = undefined;
     state.taskPlanReplanReason = reason;
     return reason;
   }

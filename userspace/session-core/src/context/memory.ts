@@ -335,25 +335,32 @@ export function renderDynamicSessionMemoryHints(document: SessionMemoryDocument)
 
 export function collectUserGuidanceEvents(events: AgentEvent[], runId?: string): UserGuidanceEvent[] {
   const collected: UserGuidanceEvent[] = [];
-  const consumedIds = new Set<string>();
-  for (const event of events.slice(-120)) {
+  const consumedAuthorities = new Set<string>();
+  for (const event of events) {
     if (event.kind !== 'user_guidance') continue;
     const record = objectRecord(event.payload);
     if (!record || stringValue(record.status) !== 'consumed') continue;
-    consumedIds.add(stringValue(record.guidanceId) ?? event.id);
+    const eventRunId = stringValue(record.runId) ?? stringValue(record.targetRunId) ?? '';
+    consumedAuthorities.add(
+      `${eventRunId}:${stringValue(record.guidanceId) ?? event.id}`
+    );
   }
-  for (const event of events.slice(-80)) {
+  for (const event of events) {
     const record = objectRecord(event.payload);
     if (!record) continue;
     const eventRunId = stringValue(record.runId) ?? stringValue(record.targetRunId);
     if (runId && eventRunId && eventRunId !== runId) continue;
     if (event.kind === 'user_guidance') {
       const guidanceId = stringValue(record.guidanceId) ?? event.id;
-      if (stringValue(record.status) === 'consumed' || consumedIds.has(guidanceId)) continue;
+      const authorityKey = `${eventRunId ?? ''}:${guidanceId}`;
+      if (
+        stringValue(record.status) === 'consumed'
+        || consumedAuthorities.has(authorityKey)
+      ) continue;
       const content = stringValue(record.content) ?? stringValue(record.guidance) ?? stringValue(record.summary);
       if (content) {
         collected.push({
-          id: event.id,
+          id: guidanceId,
           ts: event.ts,
           content: clip(content, 600),
           source: 'user',
@@ -406,7 +413,7 @@ export function collectUserGuidanceEvents(events: AgentEvent[], runId?: string):
       }
     }
   }
-  return dedupeGuidance(collected).slice(-8);
+  return dedupeGuidance(collected);
 }
 
 function objectRecord(value: unknown): Record<string, unknown> | null {

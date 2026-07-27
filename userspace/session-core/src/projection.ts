@@ -4,18 +4,20 @@ import {
   type AgentEvent,
   type AgentConversationActivity,
   type AgentEventChannel,
+  type AgentEventPresentation,
+  type AgentEventVisibility,
   type AgentTimelineBlock,
   type AgentTimelineBlockKind,
   type AgentTimelineNarrativeKind,
+  type AgentTimelinePermissionRequestView,
   type AgentTimelineResult,
   type AgentTimelineStatus,
   type AgentTimelineTokenUsageProjection,
   type AgentTimelineTokenUsageRequest,
   type AgentTimelineTokenUsageTotals,
   type KernelProposalReviewReport,
-  type PermissionRequest,
   type ProjectionDelta,
-  type SessionSemanticDraftPayload,
+  type SessionKernelFactRefV1,
 } from '@deepcode/protocol';
 import type { ResourcePacket, ResourceRequest } from './context/types.js';
 import type { ReviewPacket } from './review/types.js';
@@ -31,10 +33,26 @@ import {
   type InteractionLedgerActiveInteraction,
 } from './run-state/interactionLedger.js';
 import { planInteractionAwaitsDecision } from './run-state/planInteractionState.js';
-import { readableTaskPlanProjection } from './driver/projection/planProjectionBuilder.js';
+import {
+  parseSessionTurnAuthorityPayload,
+  sessionTurnAuthorities,
+} from './driver/context/userAuthorityFrame.js';
+import {
+  kernelFactRefFromEvent,
+  parseSessionFactLineage,
+  sessionFactLineageDisposition,
+} from './driver/authority/sessionFactLineage.js';
+import {
+  effectiveConversationLanguage,
+  resolveConversationLanguagePolicy,
+} from './driver/context/conversationLanguagePolicy.js';
+import {
+  localizedProjectionText,
+  type ProjectionLanguageBinding,
+} from './driver/projection/conversationPresentationLanguage.js';
 
 export interface PendingPermissionProjection {
-  request: PermissionRequest;
+  request: AgentTimelinePermissionRequestView;
 }
 
 export interface SessionProjectionCard {
@@ -52,17 +70,49 @@ export interface SessionProjection {
   cards: SessionProjectionCard[];
 }
 
-export const NARRATIVE_TIMELINE_SCHEMA_VERSION = 'deepcode.session.timeline.v1' as const;
+export const NARRATIVE_TIMELINE_SCHEMA_VERSION =
+  'deepcode.shared-conversation-projection.v2' as const;
+
+type WorkingAgentTimelineBlock = AgentTimelineBlock & {
+  events: AgentEvent[];
+  sourceEventRefs: string[];
+};
+
+type WorkingAgentTimelineTurn = Omit<AgentTimelineResult['turns'][number], 'blocks'> & {
+  blocks: WorkingAgentTimelineBlock[];
+};
+
+type WorkingAgentTimelineResult = Omit<AgentTimelineResult, 'turns'> & {
+  turns: WorkingAgentTimelineTurn[];
+};
+
+interface ProjectionTurnAuthorityRef {
+  readonly eventIndex: number;
+  readonly sessionId: string;
+  readonly runId: string;
+  readonly turnId: string;
+}
+
+interface ProjectionTurnAuthorityIndex {
+  readonly byEventId: ReadonlyMap<string, ProjectionTurnAuthorityRef | null>;
+  readonly ambiguousTurnIds: ReadonlySet<string>;
+}
 
 export interface NarrativeTimelineProjectionInput {
   sessionId: string;
   events: AgentEvent[];
+  /**
+   * Observability records that may contribute to a read model without
+   * becoming canonical Session domain events or advancing its event version.
+   */
+  auxiliaryEvents?: AgentEvent[];
   generatedAt?: string;
 }
 
 export interface TimelineProjectionWithLiveOverlayInput {
   sessionId: string;
   committedEvents: AgentEvent[];
+  auxiliaryEvents?: AgentEvent[];
   activeDeltas?: ProjectionDelta[];
   generatedAt?: string;
 }
@@ -183,14 +233,36 @@ export class ProjectionEngine {
 }
 
 export function buildNarrativeTimelineProjection(input: NarrativeTimelineProjectionInput): AgentTimelineResult {
-  const turns: AgentTimelineResult['turns'] = [];
-  let currentTurn: AgentTimelineResult['turns'][number] | null = null;
+  return toSharedConversationProjectionV2(buildWorkingNarrativeTimelineProjection(input));
+}
+
+function buildWorkingNarrativeTimelineProjection(
+  input: NarrativeTimelineProjectionInput
+): WorkingAgentTimelineResult {
+  const turns: WorkingAgentTimelineTurn[] = [];
+  let currentTurn: WorkingAgentTimelineTurn | null = null;
+  let currentTurnLanguage: ProjectionLanguageBinding = neutralProjectionLanguageBinding();
   let syntheticTurnIndex = 0;
+  const authorityIndex = buildProjectionTurnAuthorityIndex(input.events);
+  const exactTargetTurnIds = input.events.map((event, index) =>
+    exactProjectionTurnIdForLineageEvent(
+      event,
+      index,
+      authorityIndex
+    )
+  );
+  const referencedExactTurnIds = new Set(
+    exactTargetTurnIds.filter((turnId): turnId is string => Boolean(turnId))
+  );
+  const languageIndex = buildHistoricalProjectionLanguageIndex(input.events);
+  const narrativeBlockBindings = new Map<string, ProjectionLanguageBinding>();
+  const turnBlocksBySourceTurnId = new Map<string, WorkingAgentTimelineBlock[]>();
 
   // 不依赖具体 planId，简单按"是否已出现任何 accepted 的 plan_review"判定。
   const acceptedReviewIndex = findFirstAcceptedReviewIndex(input.events);
 
   input.events.forEach((event, index) => {
+    const exactTargetTurnId = exactTargetTurnIds[index];
     if (event.kind === 'cache_telemetry') {
       return;
     }
@@ -208,35 +280,70 @@ export function buildNarrativeTimelineProjection(input: NarrativeTimelineProject
     const userInputEvent = userInputBubbleEvent(event, index);
     if (userInputEvent) {
       if (currentTurn) turns.push(finalizeNarrativeTurn(currentTurn));
-      const userBlockEvents = isUserInputAuditOnlyEvent(event)
-        ? [userInputEvent, event]
-        : [userInputEvent];
+      const userBlockLanguage = languageIndex.snapshotBindingForEvent(event);
+      currentTurnLanguage = languageIndex.settledBindingForEvent(event, userBlockLanguage);
       currentTurn = {
-        id: `turn-${userInputEvent.id || index}`,
+        id: userBlockLanguage.sourceTurnId ?? `turn-${userInputEvent.id || index}`,
         sessionId: input.sessionId,
         status: 'running',
         startedAt: userInputEvent.ts,
-        blocks: [narrativeBlockFromEvents(userBlockEvents, index)],
+        blocks: [narrativeBlockFromEvents([userInputEvent], index, undefined, undefined, undefined, userBlockLanguage)],
       };
+      if (currentTurnLanguage.sourceTurnId) {
+        registerProjectionTurnBlocks(
+          turnBlocksBySourceTurnId,
+          currentTurnLanguage.sourceTurnId,
+          currentTurn.blocks,
+          referencedExactTurnIds
+        );
+      }
       if (isUserInputAuditOnlyEvent(event)) {
+        if (event.kind !== 'user_guidance') {
+          const exactTargetBlocks = exactTargetTurnId
+            ? requiredProjectionTurnBlocks(
+                turnBlocksBySourceTurnId,
+                exactTargetTurnId,
+                event
+              )
+            : undefined;
+          appendInteractionSettlementToExistingBlock(
+            turns,
+            currentTurn,
+            event,
+            index,
+            userBlockLanguage,
+            exactTargetBlocks
+          );
+        }
         return;
       }
     }
 
     if (event.kind === 'user_msg') {
       if (currentTurn) turns.push(finalizeNarrativeTurn(currentTurn));
+      const userBlockLanguage = languageIndex.snapshotBindingForEvent(event);
+      currentTurnLanguage = languageIndex.settledBindingForEvent(event, userBlockLanguage);
       currentTurn = {
-        id: `turn-${event.id || index}`,
+        id: userBlockLanguage.sourceTurnId ?? `turn-${event.id || index}`,
         sessionId: input.sessionId,
         status: 'running',
         startedAt: event.ts,
-        blocks: [narrativeBlockFromEvents([event], index)],
+        blocks: [narrativeBlockFromEvents([event], index, undefined, undefined, undefined, userBlockLanguage)],
       };
+      if (currentTurnLanguage.sourceTurnId) {
+        registerProjectionTurnBlocks(
+          turnBlocksBySourceTurnId,
+          currentTurnLanguage.sourceTurnId,
+          currentTurn.blocks,
+          referencedExactTurnIds
+        );
+      }
       return;
     }
 
-    if (!currentTurn) {
+    if (!currentTurn && !exactTargetTurnId) {
       syntheticTurnIndex += 1;
+      currentTurnLanguage = languageIndex.settledBindingForEvent(event);
       currentTurn = {
         id: `turn-orphan-${syntheticTurnIndex}`,
         sessionId: input.sessionId,
@@ -246,40 +353,106 @@ export function buildNarrativeTimelineProjection(input: NarrativeTimelineProject
       };
     }
 
-    appendNarrativeBlock(currentTurn.blocks, event, index);
+    const eventPresentationBinding = languageIndex.snapshotBindingForEvent(
+      event,
+      currentTurnLanguage
+    );
+    const eventPayload = isRecordPayload(event.payload) ? event.payload : {};
+    const targetBlocks = exactTargetTurnId
+      ? requiredProjectionTurnBlocks(
+          turnBlocksBySourceTurnId,
+          exactTargetTurnId,
+          event
+        )
+      : eventPayload.activeOverlay === true
+        && eventPresentationBinding.sourceTurnId
+        ? turnBlocksBySourceTurnId.get(eventPresentationBinding.sourceTurnId)
+          ?? currentTurn!.blocks
+        : currentTurn!.blocks;
+    appendNarrativeBlock(
+      targetBlocks,
+      event,
+      index,
+      eventPresentationBinding,
+      narrativeBlockBindings
+    );
   });
 
   if (currentTurn) turns.push(finalizeNarrativeTurn(currentTurn));
+  coalesceNarrativeBlocks(turns);
+  attachHiddenTerminalLineageProvenance(
+    turns,
+    input.events,
+    exactTargetTurnIds
+  );
+  for (let index = 0; index < turns.length; index += 1) {
+    turns[index] = finalizeNarrativeTurn(turns[index]);
+  }
 
-  // 使用 block.rawEventRefs 推断最早事件索引（rawEventRefs 与事件顺序一致）。
+  // 使用私有 sourceEventRefs 推断最早事件索引（与事件顺序一致）。
   if (acceptedReviewIndex >= 0) {
     annotateBlocksWithPhase(turns, input.events, acceptedReviewIndex);
   }
   resolveTimelineInteractionBlocks(turns, input.events);
-  applyTurnAuthorityStates(turns, input.events);
+  applyTurnAuthorityStates(
+    turns,
+    input.events,
+    exactTargetTurnIds
+  );
+  applyTurnSettlementAndExecutionEvidence(
+    turns,
+    input.events,
+    exactTargetTurnIds,
+    authorityIndex
+  );
   stabilizeNarrativeBlockIds(turns);
 
-  const rawEventRefs = Array.from(new Set(
-    turns.flatMap((turn) => turn.blocks.flatMap((block) => block.rawEventRefs ?? []))
-  ));
   const blockIdsByEventId = timelineBlockIdsByEventId(turns);
   const implementationTaskItems = input.events.flatMap((event, index) =>
-    taskPlanTaskProjectionItems(input.events, event, index, blockIdsByEventId.get(event.id))
+    taskPlanTaskProjectionItems(
+      input.events,
+      event,
+      index,
+      blockIdsByEventId.get(event.id),
+      languageIndex.settledBindingForEvent(
+        event,
+        languageIndex.snapshotBindingForEvent(event)
+      )
+    )
   );
   const activeInteraction = findActiveInteraction({
     events: input.events,
     pendingPermission: findLatestPendingPermission(input.events)?.request,
   });
-  if (activeInteraction?.kind === 'requirement' && activeInteraction.decisionRequest) {
+  if (activeInteraction) {
     const blockId = interactionBlockId(turns, activeInteraction);
     for (const block of turns.flatMap((turn) => turn.blocks)) {
-      if (block.id === blockId) block.decisionRequest = activeInteraction.decisionRequest;
+      if (block.id !== blockId) continue;
+      const decisionRequest = activeInteraction.kind === 'requirement'
+        ? activeInteraction.decisionRequest
+        : block.decisionRequest;
+      block.decisionRequest = decisionRequest;
+      block.confirmable = true;
+      block.interaction = {
+        kind: activeInteraction.kind,
+        interactionId: activeInteraction.interactionId,
+        interactionRevision: activeInteraction.interactionRevision,
+        targetId: activeInteraction.targetId,
+        runId: activeInteraction.kind === 'permission'
+          ? undefined
+          : activeInteraction.runId,
+        state: 'open',
+        decisionRequest,
+      };
     }
   }
 
   return {
     schemaVersion: NARRATIVE_TIMELINE_SCHEMA_VERSION,
     sessionId: input.sessionId,
+    revision: 0,
+    sourceEventVersion: input.events.length,
+    lastDeltaSeq: 0,
     generatedAt: input.generatedAt ?? new Date().toISOString(),
     turns,
     eventCount: input.events.length,
@@ -290,10 +463,1487 @@ export function buildNarrativeTimelineProjection(input: NarrativeTimelineProject
     interactionProjection: activeInteraction
       ? { pending: { ...activeInteraction, blockId: interactionBlockId(turns, activeInteraction) } }
       : undefined,
-    tokenUsageProjection: buildTokenUsageProjection(input.events),
+    tokenUsageProjection: buildTokenUsageProjection(
+      orderedUsageProjectionEvents(input.events, input.auxiliaryEvents ?? [])
+    ),
     workspaceProjection: buildWorkspaceProjection(input.events),
-    rawEventRefs,
   };
+}
+
+function buildProjectionTurnAuthorityIndex(
+  events: readonly AgentEvent[]
+): ProjectionTurnAuthorityIndex {
+  const eventIdOccurrences = new Map<string, number>();
+  for (const event of events) {
+    eventIdOccurrences.set(event.id, (eventIdOccurrences.get(event.id) ?? 0) + 1);
+  }
+
+  const byEventId = new Map<string, ProjectionTurnAuthorityRef | null>();
+  const turnIdOccurrences = new Map<string, number>();
+  events.forEach((event, eventIndex) => {
+    if (event.kind !== 'session_turn_authority') return;
+    const authority = parseSessionTurnAuthorityPayload(event.payload);
+    if (!authority) return;
+    turnIdOccurrences.set(
+      authority.turnId,
+      (turnIdOccurrences.get(authority.turnId) ?? 0) + 1
+    );
+    if ((eventIdOccurrences.get(event.id) ?? 0) !== 1 || byEventId.has(event.id)) {
+      byEventId.set(event.id, null);
+      return;
+    }
+    byEventId.set(event.id, {
+      eventIndex,
+      sessionId: authority.sessionId,
+      runId: authority.runId,
+      turnId: authority.turnId,
+    });
+  });
+
+  return {
+    byEventId,
+    ambiguousTurnIds: new Set(
+      [...turnIdOccurrences.entries()]
+        .filter(([, count]) => count !== 1)
+        .map(([turnId]) => turnId)
+    ),
+  };
+}
+
+function exactProjectionTurnIdForLineageEvent(
+  event: AgentEvent,
+  eventIndex: number,
+  authorityIndex: ProjectionTurnAuthorityIndex
+): string | undefined {
+  const payload = isRecordPayload(event.payload) ? event.payload : undefined;
+  if (payload?.lineage === undefined) return undefined;
+  const lineage = parseSessionFactLineage(payload.lineage);
+  if (!lineage) {
+    throw new Error(
+      `session_shared_projection_invalid: fact_lineage_contract:${event.id}`
+    );
+  }
+  if (sessionFactLineageDisposition(event) !== 'persistentDomainFact') {
+    throw new Error(
+      `session_shared_projection_invalid: fact_lineage_disposition:${event.id}`
+    );
+  }
+  const authority = authorityIndex.byEventId.get(lineage.turnAuthorityRef);
+  if (authority === undefined) {
+    throw new Error(
+      `session_shared_projection_invalid: turn_authority_ref_unavailable:${event.id}:${lineage.turnAuthorityRef}`
+    );
+  }
+  if (authority === null) {
+    throw new Error(
+      `session_shared_projection_invalid: turn_authority_ref_ambiguous:${event.id}:${lineage.turnAuthorityRef}`
+    );
+  }
+  if (authority.eventIndex >= eventIndex) {
+    throw new Error(
+      `session_shared_projection_invalid: turn_authority_ref_not_earlier:${event.id}:${lineage.turnAuthorityRef}`
+    );
+  }
+  if (authority.sessionId !== event.sessionId) {
+    throw new Error(
+      `session_shared_projection_invalid: turn_authority_session_mismatch:${event.id}:${lineage.turnAuthorityRef}`
+    );
+  }
+  if (authorityIndex.ambiguousTurnIds.has(authority.turnId)) {
+    throw new Error(
+      `session_shared_projection_invalid: turn_authority_turn_ambiguous:${event.id}:${authority.turnId}`
+    );
+  }
+  return authority.turnId;
+}
+
+function registerProjectionTurnBlocks(
+  index: Map<string, WorkingAgentTimelineBlock[]>,
+  turnId: string,
+  blocks: WorkingAgentTimelineBlock[],
+  referencedExactTurnIds: ReadonlySet<string>
+): void {
+  const existing = index.get(turnId);
+  if (!existing || existing === blocks) {
+    index.set(turnId, blocks);
+    return;
+  }
+  if (referencedExactTurnIds.has(turnId)) {
+    throw new Error(
+      `session_shared_projection_invalid: turn_authority_block_ambiguous:${turnId}`
+    );
+  }
+  index.set(turnId, blocks);
+}
+
+function requiredProjectionTurnBlocks(
+  index: ReadonlyMap<string, WorkingAgentTimelineBlock[]>,
+  turnId: string,
+  event: AgentEvent
+): WorkingAgentTimelineBlock[] {
+  const blocks = index.get(turnId);
+  if (!blocks) {
+    throw new Error(
+      `session_shared_projection_invalid: turn_authority_block_unavailable:${event.id}:${turnId}`
+    );
+  }
+  return blocks;
+}
+
+function attachHiddenTerminalLineageProvenance(
+  turns: WorkingAgentTimelineTurn[],
+  events: readonly AgentEvent[],
+  exactTargetTurnIds: readonly (string | undefined)[]
+): void {
+  events.forEach((event, eventIndex) => {
+    const targetTurnId = exactTargetTurnIds[eventIndex];
+    if (
+      !targetTurnId
+      || !isExplicitlyHiddenTimelineEvent(event)
+      || !isTerminalSessionRunState(event)
+    ) {
+      return;
+    }
+    const matchingTurns = turns.filter((turn) => turn.id === targetTurnId);
+    if (matchingTurns.length !== 1) {
+      throw new Error(
+        `session_shared_projection_invalid: turn_authority_block_unavailable:${event.id}:${targetTurnId}`
+      );
+    }
+    const turn = matchingTurns[0]!;
+    const carrier = terminalLineageProvenanceCarrier(
+      turn.blocks,
+      narrativeEventStatus(event)
+    );
+    if (carrier) {
+      appendProjectionFactProvenance(carrier, event);
+      return;
+    }
+    turn.blocks.push(minimalTerminalStatusBlock(event, eventIndex, turn.blocks));
+  });
+}
+
+function isTerminalSessionRunState(event: AgentEvent): boolean {
+  if (event.kind !== 'session_run_state') return false;
+  const status = narrativeEventStatus(event);
+  return status === 'waiting'
+    || status === 'completed'
+    || status === 'failed'
+    || status === 'cancelled';
+}
+
+function terminalLineageProvenanceCarrier(
+  blocks: readonly WorkingAgentTimelineBlock[],
+  status: string | undefined
+): WorkingAgentTimelineBlock | undefined {
+  const roles = status === 'waiting'
+    ? ['interaction', 'diagnostic'] as const
+    : status === 'failed' || status === 'cancelled'
+      ? ['diagnostic', 'interaction'] as const
+      : ['diagnostic', 'interaction'] as const;
+  for (const role of roles) {
+    const carrier = [...blocks].reverse().find((block) => block.entryRole === role);
+    if (carrier) return carrier;
+  }
+  return undefined;
+}
+
+function appendProjectionFactProvenance(
+  block: WorkingAgentTimelineBlock,
+  event: AgentEvent
+): void {
+  const ref = eventRefForAgentEvent(event);
+  if (!block.sourceEventRefs.includes(ref)) block.sourceEventRefs.push(ref);
+  const factRefs = block.provenance?.factRefs ?? [];
+  if (!factRefs.includes(ref)) {
+    block.provenance = {
+      ...(block.provenance ?? {
+        origin: 'session',
+        authority: 'session',
+        sourceEventRefs: [],
+        evidenceRefs: [],
+      }),
+      factRefs: [...factRefs, ref],
+    };
+  }
+}
+
+function minimalTerminalStatusBlock(
+  event: AgentEvent,
+  eventIndex: number,
+  existingBlocks: readonly WorkingAgentTimelineBlock[]
+): WorkingAgentTimelineBlock {
+  const fallback = existingBlocks[0]
+    ? projectionBindingFromBlock(
+        existingBlocks[0],
+        neutralProjectionLanguageBinding()
+      )
+    : neutralProjectionLanguageBinding();
+  const status = narrativeEventStatus(event);
+  const copy = terminalStatusProjectionCopy(status, fallback.language);
+  const block = narrativeBlockFromEvents(
+    [event],
+    eventIndex,
+    undefined,
+    'error',
+    'diagnostic',
+    fallback
+  );
+  block.title = copy.title;
+  block.summary = copy.summary;
+  block.status = status === 'failed'
+    ? 'failed'
+    : status === 'cancelled'
+      ? 'cancelled'
+      : status === 'waiting'
+        ? 'waiting'
+        : 'completed';
+  block.defaultCollapsed = false;
+  block.bodyMarkdown = undefined;
+  block.feedbackRef = undefined;
+  block.displayHints = narrativeDisplayHints('diagnostic', block.title, block.summary);
+  return block;
+}
+
+function terminalStatusProjectionCopy(
+  status: string | undefined,
+  language: ProjectionLanguageBinding['language']
+): { title: string; summary: string } {
+  if (status === 'failed') {
+    return {
+      title: localizedProjectionText(language, {
+        zh: '任务失败',
+        en: 'Task failed',
+        neutral: 'Task failed',
+      }),
+      summary: localizedProjectionText(language, {
+        zh: '本次任务已失败，请查看同一轮中的诊断信息。',
+        en: 'This task failed. Review the diagnostic information in this turn.',
+        neutral: 'This task failed.',
+      }),
+    };
+  }
+  if (status === 'cancelled') {
+    return {
+      title: localizedProjectionText(language, {
+        zh: '任务已取消',
+        en: 'Task cancelled',
+        neutral: 'Task cancelled',
+      }),
+      summary: localizedProjectionText(language, {
+        zh: '本次任务已取消，没有继续执行。',
+        en: 'This task was cancelled and did not continue.',
+        neutral: 'This task was cancelled.',
+      }),
+    };
+  }
+  if (status === 'waiting') {
+    return {
+      title: localizedProjectionText(language, {
+        zh: '任务已暂停',
+        en: 'Task paused',
+        neutral: 'Task paused',
+      }),
+      summary: localizedProjectionText(language, {
+        zh: '本次任务正在等待继续条件。',
+        en: 'This task is waiting for a continuation condition.',
+        neutral: 'This task is waiting.',
+      }),
+    };
+  }
+  return {
+    title: localizedProjectionText(language, {
+      zh: '任务已完成',
+      en: 'Task completed',
+      neutral: 'Task completed',
+    }),
+    summary: localizedProjectionText(language, {
+      zh: '本次任务已完成。',
+      en: 'This task completed.',
+      neutral: 'This task completed.',
+    }),
+  };
+}
+
+function toSharedConversationProjectionV2(
+  projection: WorkingAgentTimelineResult
+): AgentTimelineResult {
+  const shared: AgentTimelineResult = {
+    ...projection,
+    schemaVersion: NARRATIVE_TIMELINE_SCHEMA_VERSION,
+    turns: projection.turns.map((turn) => ({
+      ...turn,
+      blocks: turn.blocks.map((block) => {
+        const {
+          events: _privateEvents,
+          sourceEventRefs,
+          ...sharedBlock
+        } = block;
+        return {
+          ...sharedBlock,
+          provenance: {
+            ...(sharedBlock.provenance ?? {
+              origin: 'session',
+              authority: 'session',
+              factRefs: [],
+              evidenceRefs: [],
+            }),
+            sourceEventRefs,
+          },
+        };
+      }),
+    })),
+  };
+  assertSharedConversationProjectionV2(shared);
+  return shared;
+}
+
+export function assertSharedConversationProjectionV2(
+  projection: AgentTimelineResult
+): void {
+  if (projection.schemaVersion !== NARRATIVE_TIMELINE_SCHEMA_VERSION) {
+    throw new Error('session_shared_projection_invalid: schema_version');
+  }
+  if (
+    !projectionNonemptyString(projection.sessionId) ||
+    typeof projection.generatedAt !== 'string' ||
+    !projectionNonnegativeInteger(projection.revision) ||
+    !projectionNonnegativeInteger(projection.sourceEventVersion) ||
+    !projectionNonnegativeInteger(projection.lastDeltaSeq) ||
+    !projectionNonnegativeInteger(projection.eventCount) ||
+    !Array.isArray(projection.turns)
+  ) {
+    throw new Error('session_shared_projection_invalid: root_contract');
+  }
+  assertProjectionKeys(projection, [
+    'schemaVersion',
+    'sessionId',
+    'revision',
+    'sourceEventVersion',
+    'lastDeltaSeq',
+    'generatedAt',
+    'turns',
+    'eventCount',
+    'taskProjection',
+    'interactionProjection',
+    'runProjection',
+    'tokenUsageProjection',
+    'workspaceProjection',
+  ], 'root');
+  const turnIds = new Set<string>();
+  const blockIds = new Set<string>();
+  for (const turn of projection.turns) {
+    assertProjectionKeys(turn, [
+      'id',
+      'sequence',
+      'sessionId',
+      'status',
+      'startedAt',
+      'completedAt',
+      'settlement',
+      'executionEvidence',
+      'blocks',
+    ], `turn:${turn.id}`);
+    if (
+      !projectionNonemptyString(turn.id) ||
+      turn.sessionId !== projection.sessionId ||
+      !timelineStatusValue(turn.status) ||
+      (turn.sequence !== undefined && !projectionNonnegativeInteger(turn.sequence)) ||
+      !optionalProjectionString(turn.startedAt) ||
+      !optionalProjectionString(turn.completedAt) ||
+      !Array.isArray(turn.blocks)
+    ) {
+      throw new Error(`session_shared_projection_invalid: turn_contract:${turn.id}`);
+    }
+    if (turnIds.has(turn.id)) {
+      throw new Error(`session_shared_projection_invalid: duplicate_turn_id:${turn.id}`);
+    }
+    assertProjectedTurnSettlement(turn);
+    assertProjectedTurnExecutionEvidence(turn);
+    turnIds.add(turn.id);
+    for (const block of turn.blocks) {
+      if (blockIds.has(block.id)) {
+        throw new Error(`session_shared_projection_invalid: duplicate_block_id:${block.id}`);
+      }
+      blockIds.add(block.id);
+    }
+  }
+  const blocks = projection.turns.flatMap((turn) => turn.blocks);
+  for (const block of blocks) {
+    assertSharedConversationBlockV2(block);
+  }
+  if (projection.taskProjection !== undefined) {
+    if (!isRecordPayload(projection.taskProjection)) {
+      throw new Error('session_shared_projection_invalid: task_projection_contract');
+    }
+    assertProjectionKeys(projection.taskProjection, ['title', 'items'], 'task_projection');
+    if (
+      typeof projection.taskProjection.title !== 'string' ||
+      !Array.isArray(projection.taskProjection.items)
+    ) {
+      throw new Error('session_shared_projection_invalid: task_projection_contract');
+    }
+    for (const item of projection.taskProjection.items) {
+      assertProjectionKeys(item, [
+        'id',
+        'title',
+        'summary',
+        'status',
+        'blockId',
+        'narrativeKind',
+        'settlementKind',
+      ], `task_item:${item.id}`);
+      if (
+        typeof item.id !== 'string' ||
+        typeof item.title !== 'string' ||
+        typeof item.summary !== 'string' ||
+        !timelineStatusValue(item.status) ||
+        typeof item.blockId !== 'string' ||
+        item.narrativeKind === undefined ||
+        !matchesNarrativeKind(item.narrativeKind) ||
+        item.narrativeKind === 'thinking' ||
+        !matchesTaskSettlementKind(item.settlementKind)
+      ) {
+        throw new Error(`session_shared_projection_invalid: task_item_contract:${item.id}`);
+      }
+    }
+  }
+  if (projection.runProjection !== undefined) {
+    if (!isRecordPayload(projection.runProjection)) {
+      throw new Error('session_shared_projection_invalid: run_projection_contract');
+    }
+    assertProjectionKeys(projection.runProjection, [
+      'runId',
+      'turnId',
+      'taskId',
+      'revision',
+      'status',
+      'phase',
+      'waitReason',
+      'activeInteractionId',
+      'languageBinding',
+    ], 'run_projection');
+    if (
+      !projectionNonemptyString(projection.runProjection.runId) ||
+      !optionalProjectionString(projection.runProjection.turnId) ||
+      !optionalProjectionString(projection.runProjection.taskId) ||
+      !projectionNonnegativeInteger(projection.runProjection.revision) ||
+      !matchesRunStatus(projection.runProjection.status) ||
+      !matchesRunPhase(projection.runProjection.phase) ||
+      !optionalProjectionString(projection.runProjection.waitReason) ||
+      !optionalProjectionString(projection.runProjection.activeInteractionId)
+    ) {
+      throw new Error('session_shared_projection_invalid: run_projection_contract');
+    }
+    assertLanguageBinding(projection.runProjection.languageBinding, 'run_projection');
+  }
+  if (projection.workspaceProjection !== undefined) {
+    if (!isRecordPayload(projection.workspaceProjection)) {
+      throw new Error('session_shared_projection_invalid: workspace_projection_contract');
+    }
+    assertProjectionKeys(
+      projection.workspaceProjection,
+      ['revision', 'changedTargets'],
+      'workspace_projection'
+    );
+    if (
+      !projectionNonnegativeInteger(projection.workspaceProjection.revision) ||
+      !projectionStringArray(projection.workspaceProjection.changedTargets)
+    ) {
+      throw new Error('session_shared_projection_invalid: workspace_projection_contract');
+    }
+  }
+  if (projection.tokenUsageProjection !== undefined) {
+    if (!isRecordPayload(projection.tokenUsageProjection)) {
+      throw new Error('session_shared_projection_invalid: usage_projection_contract');
+    }
+    assertProjectionKeys(projection.tokenUsageProjection, ['totals', 'requests'], 'usage_projection');
+    if (!Array.isArray(projection.tokenUsageProjection.requests)) {
+      throw new Error('session_shared_projection_invalid: usage_projection_contract');
+    }
+    assertUsageProjectionRecord(projection.tokenUsageProjection.totals, 'usage_totals');
+    for (const request of projection.tokenUsageProjection.requests) {
+      assertUsageProjectionRecord(request, `usage_request:${request.requestId}`, [
+        'requestId',
+        'turnId',
+        'userEventId',
+        'title',
+        'startedAt',
+        'completedAt',
+        'stages',
+      ]);
+      if (
+        typeof request.requestId !== 'string' ||
+        typeof request.turnId !== 'string' ||
+        typeof request.userEventId !== 'string' ||
+        typeof request.title !== 'string' ||
+        !optionalProjectionString(request.startedAt) ||
+        !optionalProjectionString(request.completedAt) ||
+        !projectionStringArray(request.stages)
+      ) {
+        throw new Error(`session_shared_projection_invalid: usage_request_contract:${request.requestId}`);
+      }
+    }
+  }
+  if (projection.interactionProjection !== undefined) {
+    if (!isRecordPayload(projection.interactionProjection)) {
+      throw new Error('session_shared_projection_invalid: interaction_projection_contract');
+    }
+    assertProjectionKeys(projection.interactionProjection, ['pending'], 'interaction_projection');
+  }
+  const pending = projection.interactionProjection?.pending;
+  if (pending !== undefined) {
+    if (!isRecordPayload(pending)) {
+      throw new Error('session_shared_projection_invalid: pending_interaction_contract');
+    }
+    if (!matchesInteractionKind(pending.kind)) {
+      throw new Error('session_shared_projection_invalid: pending_interaction_kind');
+    }
+    assertProjectionKeys(pending, pending.kind === 'permission'
+      ? [
+          'kind',
+          'interactionId',
+          'interactionRevision',
+          'targetId',
+          'requestId',
+          'request',
+          'blockId',
+          'title',
+          'summary',
+        ]
+      : [
+          'kind',
+          'interactionId',
+          'interactionRevision',
+          'targetId',
+          'runId',
+          pending.kind === 'plan'
+            ? 'planId'
+            : pending.kind === 'review'
+              ? 'reviewId'
+              : 'requirementId',
+          'blockId',
+          'title',
+          'summary',
+          ...(pending.kind === 'requirement' ? ['decisionRequest'] : []),
+        ], 'pending_interaction');
+    if (pending.kind === 'permission') {
+      if (!isRecordPayload(pending.request)) {
+        throw new Error('session_shared_projection_invalid: permission_request_contract');
+      }
+      assertProjectionKeys(pending.request, [
+        'id',
+        'runId',
+        'requestKind',
+        'permissionBundleId',
+        'contractId',
+        'affectedOperationIds',
+        'workUnitIds',
+        'toolId',
+        'toolName',
+        'riskLevel',
+        'summary',
+        'diff',
+        'argumentsPreview',
+      ], 'permission_request');
+      if (
+        !projectionNonemptyString(pending.request.id) ||
+        !optionalProjectionString(pending.request.runId) ||
+        (pending.request.requestKind !== undefined &&
+          pending.request.requestKind !== 'runtimePermission' &&
+          pending.request.requestKind !== 'scopeExpansion') ||
+        !optionalProjectionString(pending.request.permissionBundleId) ||
+        !optionalProjectionString(pending.request.contractId) ||
+        !optionalProjectionString(pending.request.toolId) ||
+        typeof pending.request.toolName !== 'string' ||
+        typeof pending.request.summary !== 'string' ||
+        !matchesPermissionRiskLevel(pending.request.riskLevel) ||
+        !optionalProjectionString(pending.request.diff) ||
+        (pending.request.argumentsPreview !== undefined &&
+          typeof pending.request.argumentsPreview !== 'string') ||
+        !optionalProjectionStringArray(pending.request.affectedOperationIds) ||
+        !optionalProjectionStringArray(pending.request.workUnitIds)
+      ) {
+        throw new Error('session_shared_projection_invalid: permission_request_contract');
+      }
+    }
+    if (pending.kind === 'requirement' && pending.decisionRequest !== undefined) {
+      assertDecisionRequest(
+        pending.decisionRequest,
+        'pending_decision_request'
+      );
+    }
+    if (
+      !projectionNonemptyString(pending.interactionId) ||
+      !projectionNonemptyString(pending.interactionRevision) ||
+      !projectionNonemptyString(pending.targetId) ||
+      !optionalProjectionString(pending.blockId) ||
+      !optionalProjectionString(pending.title) ||
+      !optionalProjectionString(pending.summary) ||
+      (pending.kind !== 'permission' && !projectionNonemptyString(pending.runId)) ||
+      (pending.kind === 'permission' && !projectionNonemptyString(pending.requestId)) ||
+      (pending.kind === 'plan' && pending.planId !== pending.targetId) ||
+      (pending.kind === 'review' &&
+        (pending.reviewId !== pending.targetId || typeof pending.reviewId !== 'string')) ||
+      (pending.kind === 'requirement' &&
+        (pending.requirementId !== pending.targetId ||
+          typeof pending.requirementId !== 'string'))
+    ) {
+      throw new Error('session_shared_projection_invalid: pending_interaction_contract');
+    }
+    const block = blocks.find((candidate) => candidate.id === pending.blockId);
+    if (
+      !block?.interaction ||
+      block.interaction.interactionId !== pending.interactionId ||
+      block.interaction.interactionRevision !== pending.interactionRevision ||
+      block.interaction.targetId !== pending.targetId
+    ) {
+      throw new Error('session_shared_projection_invalid: pending_interaction_identity');
+    }
+  }
+  if (containsForbiddenSharedProjectionKey(projection)) {
+    throw new Error('session_shared_projection_invalid: private_payload');
+  }
+}
+
+export function isSharedConversationProjectionV2(
+  value: unknown
+): value is AgentTimelineResult {
+  if (!isRecordPayload(value) || !Array.isArray(value.turns)) return false;
+  try {
+    assertSharedConversationProjectionV2(value as unknown as AgentTimelineResult);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function isSharedConversationBlockV2(
+  value: unknown
+): value is AgentTimelineBlock {
+  if (!isRecordPayload(value)) return false;
+  try {
+    assertSharedConversationBlockV2(value as unknown as AgentTimelineBlock);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function assertSharedConversationBlockV2(block: AgentTimelineBlock): void {
+  assertProjectionKeys(block, [
+    'id',
+    'sequence',
+    'revision',
+    'deliveryMode',
+    'durability',
+    'kind',
+    'narrativeKind',
+    'entryRole',
+    'activity',
+    'title',
+    'summary',
+    'status',
+    'defaultCollapsed',
+    'bodyMarkdown',
+    'localizedContent',
+    'structuredProjection',
+    'decisionRequest',
+    'interaction',
+    'confirmable',
+    'attachments',
+    'feedbackRef',
+    'displayHints',
+    'evidenceRefs',
+    'provenance',
+    'languageBinding',
+    'taskProjectionRef',
+  ], `block:${block.id}`);
+  if (
+    !projectionNonemptyString(block.id) ||
+    !matchesBlockKind(block.kind) ||
+    !matchesNarrativeKind(block.narrativeKind) ||
+    !matchesEntryRole(block.entryRole) ||
+    !matchesDurability(block.durability) ||
+    (block.sequence !== undefined && !projectionNonnegativeInteger(block.sequence)) ||
+    (block.revision !== undefined && !projectionNonnegativeInteger(block.revision)) ||
+    (block.deliveryMode !== undefined && !matchesDeliveryMode(block.deliveryMode)) ||
+    typeof block.title !== 'string' ||
+    typeof block.summary !== 'string' ||
+    !timelineStatusValue(block.status) ||
+    typeof block.defaultCollapsed !== 'boolean' ||
+    (block.bodyMarkdown !== undefined && typeof block.bodyMarkdown !== 'string') ||
+    !isRecordPayload(block.languageBinding) ||
+    !isRecordPayload(block.provenance) ||
+    (block.confirmable !== undefined && typeof block.confirmable !== 'boolean') ||
+    !optionalProjectionStringArray(block.evidenceRefs) ||
+    !optionalProjectionString(block.taskProjectionRef) ||
+    (block.attachments !== undefined && !Array.isArray(block.attachments))
+  ) {
+    throw new Error(`session_shared_projection_invalid: block_contract:${block.id}`);
+  }
+  if (block.narrativeKind === 'thinking' || block.kind === 'thinking') {
+    throw new Error(`session_shared_projection_invalid: reasoning_block:${block.id}`);
+  }
+  if (block.entryRole === 'finalAnswer' && block.durability !== 'committed') {
+    throw new Error(`session_shared_projection_invalid: uncommitted_final:${block.id}`);
+  }
+  if (block.activity !== undefined) {
+    if (!isRecordPayload(block.activity)) {
+      throw new Error(`session_shared_projection_invalid: activity_contract:${block.id}`);
+    }
+    assertProjectionKeys(block.activity, [
+      'activityId',
+      'activityRevision',
+      'kind',
+      'status',
+      'title',
+      'summary',
+      'source',
+      'runId',
+      'planId',
+      'draftId',
+      'targets',
+      'actionIds',
+      'workUnitIds',
+      'resourcePacketIds',
+      'toolName',
+      'operation',
+      'itemCount',
+      'errorCode',
+      'errorMessage',
+    ], `activity:${block.activity.activityId}`);
+    if (
+      !projectionNonemptyString(block.activity.activityId) ||
+      (block.activity.activityRevision !== undefined &&
+        !projectionNonnegativeInteger(block.activity.activityRevision)) ||
+      !matchesActivityKind(block.activity.kind) ||
+      !timelineStatusValue(block.activity.status) ||
+      typeof block.activity.title !== 'string' ||
+      typeof block.activity.summary !== 'string' ||
+      !matchesActivitySource(block.activity.source) ||
+      !optionalProjectionString(block.activity.runId) ||
+      !optionalProjectionString(block.activity.planId) ||
+      !optionalProjectionString(block.activity.draftId) ||
+      !optionalProjectionStringArray(block.activity.targets) ||
+      !optionalProjectionStringArray(block.activity.actionIds) ||
+      !optionalProjectionStringArray(block.activity.workUnitIds) ||
+      !optionalProjectionStringArray(block.activity.resourcePacketIds) ||
+      !optionalProjectionString(block.activity.toolName) ||
+      !optionalProjectionString(block.activity.operation) ||
+      (block.activity.itemCount !== undefined &&
+        !projectionNonnegativeInteger(block.activity.itemCount)) ||
+      !optionalProjectionString(block.activity.errorCode) ||
+      !optionalProjectionString(block.activity.errorMessage)
+    ) {
+      throw new Error(`session_shared_projection_invalid: activity_contract:${block.id}`);
+    }
+  }
+  if (block.localizedContent !== undefined) {
+    if (!isRecordPayload(block.localizedContent)) {
+      throw new Error(
+        `session_shared_projection_invalid: localized_content_contract:${block.id}`
+      );
+    }
+    assertProjectionKeys(
+      block.localizedContent,
+      ['text', 'messageKey', 'messageArgs'],
+      `localized_content:${block.id}`
+    );
+    if (
+      !optionalProjectionString(block.localizedContent.text) ||
+      !optionalProjectionString(block.localizedContent.messageKey) ||
+      !optionalProjectionStringRecord(block.localizedContent.messageArgs)
+    ) {
+      throw new Error(`session_shared_projection_invalid: localized_content_contract:${block.id}`);
+    }
+  }
+  if (block.structuredProjection !== undefined) {
+    if (!isRecordPayload(block.structuredProjection)) {
+      throw new Error(
+        `session_shared_projection_invalid: structured_projection_contract:${block.id}`
+      );
+    }
+    assertProjectionKeys(block.structuredProjection, [
+      'kind',
+      'schemaVersion',
+      'title',
+      'titleKey',
+      'titleArgs',
+      'summary',
+      'summaryKey',
+      'messageArgs',
+      'sections',
+    ], `structured_projection:${block.id}`);
+    if (
+      (block.structuredProjection.kind !== 'plan' &&
+        block.structuredProjection.kind !== 'review') ||
+      typeof block.structuredProjection.schemaVersion !== 'string' ||
+      !optionalProjectionString(block.structuredProjection.title) ||
+      !optionalProjectionString(block.structuredProjection.titleKey) ||
+      !optionalProjectionStringRecord(block.structuredProjection.titleArgs) ||
+      !optionalProjectionString(block.structuredProjection.summary) ||
+      !optionalProjectionString(block.structuredProjection.summaryKey) ||
+      !optionalProjectionStringRecord(block.structuredProjection.messageArgs) ||
+      !Array.isArray(block.structuredProjection.sections)
+    ) {
+      throw new Error(`session_shared_projection_invalid: structured_projection_contract:${block.id}`);
+    }
+  }
+  if (block.decisionRequest !== undefined) {
+    if (!isRecordPayload(block.decisionRequest)) {
+      throw new Error(
+        `session_shared_projection_invalid: decision_request_contract:${block.id}`
+      );
+    }
+    assertDecisionRequest(block.decisionRequest, `decision_request:${block.id}`);
+  }
+  if (block.interaction !== undefined) {
+    if (!isRecordPayload(block.interaction)) {
+      throw new Error(`session_shared_projection_invalid: interaction_contract:${block.id}`);
+    }
+    assertProjectionKeys(block.interaction, [
+      'kind',
+      'interactionId',
+      'interactionRevision',
+      'targetId',
+      'runId',
+      'state',
+      'decisionRequest',
+      'selectedDecision',
+    ], `interaction:${block.id}`);
+    if (
+      !matchesInteractionKind(block.interaction.kind) ||
+      !projectionNonemptyString(block.interaction.interactionId) ||
+      !projectionNonemptyString(block.interaction.interactionRevision) ||
+      !projectionNonemptyString(block.interaction.targetId) ||
+      !optionalProjectionString(block.interaction.runId) ||
+      !matchesInteractionState(block.interaction.state)
+    ) {
+      throw new Error(`session_shared_projection_invalid: interaction_contract:${block.id}`);
+    }
+    if (block.interaction.decisionRequest !== undefined) {
+      if (!isRecordPayload(block.interaction.decisionRequest)) {
+        throw new Error(
+          `session_shared_projection_invalid: interaction_decision_request_contract:${block.id}`
+        );
+      }
+      assertDecisionRequest(
+        block.interaction.decisionRequest,
+        `interaction_decision_request:${block.id}`
+      );
+    }
+    if (block.interaction.selectedDecision !== undefined) {
+      if (!isRecordPayload(block.interaction.selectedDecision)) {
+        throw new Error(
+          `session_shared_projection_invalid: selected_decision_contract:${block.id}`
+        );
+      }
+      assertProjectionKeys(
+        block.interaction.selectedDecision,
+        ['decision', 'source', 'decidedAt'],
+        `selected_decision:${block.id}`
+      );
+      if (
+        typeof block.interaction.selectedDecision.decision !== 'string' ||
+        (block.interaction.selectedDecision.source !== 'button' &&
+          block.interaction.selectedDecision.source !== 'freeText') ||
+        !optionalProjectionString(block.interaction.selectedDecision.decidedAt)
+      ) {
+        throw new Error(`session_shared_projection_invalid: selected_decision_contract:${block.id}`);
+      }
+    }
+  }
+  for (const attachment of block.attachments ?? []) {
+    assertProjectionKeys(attachment, [
+      'kind',
+      'path',
+      'absolutePath',
+      'resourceId',
+      'folderId',
+      'source',
+      'scope',
+    ], `attachment:${block.id}`);
+    if (
+      (attachment.kind !== 'file' && attachment.kind !== 'directory') ||
+      typeof attachment.path !== 'string' ||
+      !optionalProjectionString(attachment.absolutePath) ||
+      !optionalProjectionString(attachment.resourceId) ||
+      !optionalProjectionString(attachment.folderId) ||
+      (attachment.source !== 'mention' &&
+        attachment.source !== 'contextMenu' &&
+        attachment.source !== 'userSelected') ||
+      (attachment.scope !== 'message' && attachment.scope !== 'session')
+    ) {
+      throw new Error(`session_shared_projection_invalid: attachment_contract:${block.id}`);
+    }
+  }
+  if (block.feedbackRef !== undefined) {
+    if (!isRecordPayload(block.feedbackRef)) {
+      throw new Error(
+        `session_shared_projection_invalid: feedback_ref_contract:${block.id}`
+      );
+    }
+    assertProjectionKeys(
+      block.feedbackRef,
+      ['eventId', 'sessionId', 'kind'],
+      `feedback_ref:${block.id}`
+    );
+    if (
+      typeof block.feedbackRef.eventId !== 'string' ||
+      typeof block.feedbackRef.sessionId !== 'string' ||
+      typeof block.feedbackRef.kind !== 'string'
+    ) {
+      throw new Error(`session_shared_projection_invalid: feedback_ref_contract:${block.id}`);
+    }
+  }
+  if (block.displayHints !== undefined) {
+    if (!isRecordPayload(block.displayHints)) {
+      throw new Error(
+        `session_shared_projection_invalid: display_hints_contract:${block.id}`
+      );
+    }
+    assertProjectionKeys(block.displayHints, [
+      'density',
+      'evidenceMode',
+      'collapseAfterComplete',
+      'checkpointKind',
+      'showInTaskList',
+      'taskListLabel',
+      'taskListSummary',
+      'phase',
+    ], `display_hints:${block.id}`);
+    if (
+      (block.displayHints.density !== undefined &&
+        block.displayHints.density !== 'normal' &&
+        block.displayHints.density !== 'compact' &&
+        block.displayHints.density !== 'debug') ||
+      (block.displayHints.evidenceMode !== undefined &&
+        block.displayHints.evidenceMode !== 'inline' &&
+        block.displayHints.evidenceMode !== 'collapsed' &&
+        block.displayHints.evidenceMode !== 'debugOnly') ||
+      (block.displayHints.collapseAfterComplete !== undefined &&
+        typeof block.displayHints.collapseAfterComplete !== 'boolean') ||
+      !matchesCheckpointKind(block.displayHints.checkpointKind) ||
+      (block.displayHints.showInTaskList !== undefined &&
+        typeof block.displayHints.showInTaskList !== 'boolean') ||
+      !optionalProjectionString(block.displayHints.taskListLabel) ||
+      !optionalProjectionString(block.displayHints.taskListSummary) ||
+      (block.displayHints.phase !== undefined &&
+        block.displayHints.phase !== 'explore' &&
+        block.displayHints.phase !== 'execute')
+    ) {
+      throw new Error(`session_shared_projection_invalid: display_hints_contract:${block.id}`);
+    }
+  }
+  assertProjectionKeys(block.provenance, [
+    'origin',
+    'authority',
+    'sourceEventRefs',
+    'factRefs',
+    'evidenceRefs',
+  ], `provenance:${block.id}`);
+  if (
+    !matchesProvenanceOrigin(block.provenance.origin) ||
+    !matchesProvenanceAuthority(block.provenance.authority) ||
+    !projectionStringArray(block.provenance.sourceEventRefs) ||
+    !projectionStringArray(block.provenance.factRefs) ||
+    !projectionStringArray(block.provenance.evidenceRefs)
+  ) {
+    throw new Error(`session_shared_projection_invalid: provenance_contract:${block.id}`);
+  }
+  assertLanguageBinding(block.languageBinding, `block:${block.id}`);
+  const sections = block.structuredProjection?.sections ?? [];
+  for (const section of sections) {
+    assertProjectionKeys(section, [
+      'sectionId',
+      'titleKey',
+      'titleArgs',
+      'emptyMessageKey',
+      'items',
+    ], `structured_section:${section.sectionId}`);
+    if (
+      typeof section.sectionId !== 'string' ||
+      typeof section.titleKey !== 'string' ||
+      !optionalProjectionStringRecord(section.titleArgs) ||
+      !optionalProjectionString(section.emptyMessageKey) ||
+      !Array.isArray(section.items)
+    ) {
+      throw new Error(`session_shared_projection_invalid: structured_section_contract:${section.sectionId}`);
+    }
+    for (const item of section.items) {
+      assertProjectionKeys(item, [
+        'itemId',
+        'kind',
+        'text',
+        'messageKey',
+        'messageArgs',
+        'status',
+        'targetRefs',
+        'auditRefs',
+        'objective',
+        'acceptanceCriteria',
+        'failureConditions',
+      ], `structured_item:${item.itemId}`);
+      if (
+        typeof item.itemId !== 'string' ||
+        typeof item.kind !== 'string' ||
+        !optionalProjectionString(item.text) ||
+        !optionalProjectionString(item.messageKey) ||
+        !optionalProjectionString(item.status) ||
+        !optionalProjectionStringRecord(item.messageArgs) ||
+        !optionalProjectionStringArray(item.targetRefs) ||
+        !optionalProjectionStringArray(item.auditRefs) ||
+        !optionalProjectionString(item.objective) ||
+        !optionalProjectionStringArray(item.acceptanceCriteria) ||
+        !optionalProjectionStringArray(item.failureConditions)
+      ) {
+        throw new Error(`session_shared_projection_invalid: structured_item_contract:${item.itemId}`);
+      }
+    }
+  }
+}
+
+function assertDecisionRequest(
+  request: unknown,
+  label: string
+): asserts request is NonNullable<AgentTimelineBlock['decisionRequest']> {
+  assertProjectionKeys(
+    request,
+    ['id', 'reason', 'summary', 'allowsFreeform', 'options'],
+    label
+  );
+  if (
+    !optionalProjectionString(request.id) ||
+    !optionalProjectionString(request.reason) ||
+    !optionalProjectionString(request.summary) ||
+    typeof request.allowsFreeform !== 'boolean' ||
+    !Array.isArray(request.options)
+  ) {
+    throw new Error(`session_shared_projection_invalid: ${label}_contract`);
+  }
+  for (const option of request.options) {
+    assertProjectionKeys(option, [
+      'id',
+      'label',
+      'description',
+      'recommended',
+      'effect',
+    ], `${label}_option:${option.id}`);
+    if (
+      typeof option.id !== 'string' ||
+      typeof option.label !== 'string' ||
+      !optionalProjectionString(option.description) ||
+      (option.recommended !== undefined && typeof option.recommended !== 'boolean')
+    ) {
+      throw new Error(`session_shared_projection_invalid: ${label}_option_contract`);
+    }
+    if (option.effect !== undefined) {
+      if (!isRecordPayload(option.effect)) {
+        throw new Error(`session_shared_projection_invalid: ${label}_effect_contract`);
+      }
+      assertProjectionKeys(option.effect, ['kind', 'reason'], `${label}_effect:${option.id}`);
+      if (
+        !matchesInteractionOptionEffect(option.effect.kind) ||
+        !optionalProjectionString(
+          option.effect.kind === 'replan' ? option.effect.reason : undefined
+        ) ||
+        (option.effect.kind !== 'replan' && 'reason' in option.effect)
+      ) {
+        throw new Error(`session_shared_projection_invalid: ${label}_effect_contract`);
+      }
+    }
+  }
+}
+
+function assertLanguageBinding(
+  binding: AgentTimelineBlock['languageBinding'],
+  label: string
+): void {
+  assertProjectionKeys(
+    binding,
+    ['language', 'revision', 'status', 'sourceTurnId'],
+    `language_binding:${label}`
+  );
+  if (
+    !matchesPresentationLanguage(binding.language) ||
+    !matchesLanguageBindingStatus(binding.status) ||
+    (binding.revision !== undefined && !projectionNonnegativeInteger(binding.revision)) ||
+    !optionalProjectionString(binding.sourceTurnId)
+  ) {
+    throw new Error(`session_shared_projection_invalid: language_binding_contract:${label}`);
+  }
+}
+
+function assertProjectedTurnSettlement(
+  turn: AgentTimelineResult['turns'][number]
+): void {
+  const settlement = turn.settlement;
+  if (settlement === undefined) return;
+  assertProjectionKeys(settlement, [
+    'schemaVersion',
+    'status',
+    'factRef',
+    'turnAuthorityRef',
+  ], `turn_settlement:${turn.id}`);
+  if (
+    settlement.schemaVersion !== 'deepcode.session.turn-settlement.v1'
+    || (
+      settlement.status !== 'waiting'
+      && settlement.status !== 'completed'
+      && settlement.status !== 'failed'
+      && settlement.status !== 'cancelled'
+    )
+    || !projectionEventRef(settlement.factRef)
+    || !projectionNonemptyString(settlement.turnAuthorityRef)
+  ) {
+    throw new Error(
+      `session_shared_projection_invalid: turn_settlement_contract:${turn.id}`
+    );
+  }
+}
+
+function assertProjectedTurnExecutionEvidence(
+  turn: AgentTimelineResult['turns'][number]
+): void {
+  const evidence = turn.executionEvidence;
+  if (evidence === undefined) return;
+  assertProjectionKeys(evidence, [
+    'kind',
+    'sourceFactRef',
+    'taskClaims',
+  ], `turn_execution_evidence:${turn.id}`);
+  if (
+    (evidence.kind !== 'notRequired' && evidence.kind !== 'kernelFactBacked')
+    || !projectionEventRef(evidence.sourceFactRef)
+    || !Array.isArray(evidence.taskClaims)
+    || (evidence.kind === 'notRequired' && evidence.taskClaims.length !== 0)
+    || (evidence.kind === 'kernelFactBacked' && evidence.taskClaims.length === 0)
+  ) {
+    throw new Error(
+      `session_shared_projection_invalid: turn_execution_evidence_contract:${turn.id}`
+    );
+  }
+  const taskIds: string[] = [];
+  for (const claim of evidence.taskClaims) {
+    assertProjectionKeys(claim, [
+      'taskId',
+      'workUnitIds',
+      'factRefs',
+    ], `turn_execution_claim:${turn.id}`);
+    if (
+      !projectionNonemptyString(claim.taskId)
+      || !projectionSortedUniqueNonemptyStrings(claim.workUnitIds)
+      || claim.workUnitIds.length === 0
+      || !projectionSortedUniqueNonemptyStrings(claim.factRefs)
+      || claim.factRefs.length === 0
+      || !claim.factRefs.every(projectionEventRef)
+    ) {
+      throw new Error(
+        `session_shared_projection_invalid: turn_execution_claim_contract:${turn.id}`
+      );
+    }
+    taskIds.push(claim.taskId);
+  }
+  if (!projectionSortedUniqueNonemptyStrings(taskIds)) {
+    throw new Error(
+      `session_shared_projection_invalid: turn_execution_claim_order:${turn.id}`
+    );
+  }
+}
+
+function assertUsageProjectionRecord(
+  value: unknown,
+  label: string,
+  extraKeys: readonly string[] = []
+): void {
+  if (!isRecordPayload(value)) {
+    throw new Error(`session_shared_projection_invalid: ${label}_contract`);
+  }
+  assertProjectionKeys(value, [
+    'promptCacheHitTokens',
+    'promptCacheMissTokens',
+    'cachedTokens',
+    'promptTokens',
+    'completionTokens',
+    'totalTokens',
+    'cacheHitRate',
+    'providerCallCount',
+    'providers',
+    ...extraKeys,
+  ], label);
+  for (const key of [
+    'promptCacheHitTokens',
+    'promptCacheMissTokens',
+    'cachedTokens',
+    'promptTokens',
+    'completionTokens',
+    'totalTokens',
+    'providerCallCount',
+  ]) {
+    if (!projectionNonnegativeInteger(value[key])) {
+      throw new Error(`session_shared_projection_invalid: ${label}_contract`);
+    }
+  }
+  const hitRate = value.cacheHitRate;
+  if (
+    hitRate !== null &&
+    (typeof hitRate !== 'number' ||
+      !Number.isFinite(hitRate) ||
+      hitRate < 0 ||
+      hitRate > 1)
+  ) {
+    throw new Error(`session_shared_projection_invalid: ${label}_contract`);
+  }
+  if (!projectionStringArray(value.providers)) {
+    throw new Error(`session_shared_projection_invalid: ${label}_contract`);
+  }
+}
+
+function optionalProjectionString(value: unknown): boolean {
+  return value === undefined || typeof value === 'string';
+}
+
+function projectionStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === 'string');
+}
+
+function projectionSortedUniqueNonemptyStrings(
+  value: unknown
+): value is string[] {
+  return Array.isArray(value)
+    && value.every(projectionNonemptyString)
+    && new Set(value).size === value.length
+    && value.every((item, index) => index === 0 || value[index - 1]! < item);
+}
+
+function projectionEventRef(value: unknown): value is string {
+  return projectionNonemptyString(value) && value.startsWith('event:');
+}
+
+function optionalProjectionStringArray(value: unknown): boolean {
+  return value === undefined || projectionStringArray(value);
+}
+
+function optionalProjectionStringRecord(value: unknown): boolean {
+  return value === undefined ||
+    (isRecordPayload(value) && Object.values(value).every((item) => typeof item === 'string'));
+}
+
+function projectionNonnegativeInteger(value: unknown): value is number {
+  return typeof value === 'number' &&
+    Number.isSafeInteger(value) &&
+    value >= 0;
+}
+
+function projectionNonemptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+function matchesEntryRole(value: unknown): boolean {
+  return value === 'userMessage' ||
+    value === 'agentUpdate' ||
+    value === 'activityGroup' ||
+    value === 'evidence' ||
+    value === 'interaction' ||
+    value === 'finalAnswer' ||
+    value === 'diagnostic';
+}
+
+function matchesBlockKind(value: unknown): boolean {
+  return value === 'user' ||
+    value === 'assistant' ||
+    value === 'thinking' ||
+    value === 'stage' ||
+    value === 'toolBatch' ||
+    value === 'permission' ||
+    value === 'plan' ||
+    value === 'review' ||
+    value === 'error' ||
+    value === 'turnActions';
+}
+
+function matchesNarrativeKind(value: unknown): boolean {
+  return value === undefined ||
+    value === 'user' ||
+    value === 'thinking' ||
+    value === 'assistantNarration' ||
+    value === 'assistantText' ||
+    value === 'operationEvidence' ||
+    value === 'requirement' ||
+    value === 'plan' ||
+    value === 'permission' ||
+    value === 'verification' ||
+    value === 'review' ||
+    value === 'diagnostic';
+}
+
+function matchesDurability(value: unknown): boolean {
+  return value === 'live' || value === 'committed';
+}
+
+function matchesDeliveryMode(value: unknown): boolean {
+  return value === 'live' || value === 'buffered' || value === 'replay';
+}
+
+function timelineStatusValue(value: unknown): boolean {
+  return value === 'queued' ||
+    value === 'running' ||
+    value === 'waiting' ||
+    value === 'blocked' ||
+    value === 'completed' ||
+    value === 'cancelled' ||
+    value === 'failed';
+}
+
+function matchesInteractionKind(value: unknown): boolean {
+  return value === 'requirement' ||
+    value === 'plan' ||
+    value === 'permission' ||
+    value === 'review';
+}
+
+function matchesInteractionState(value: unknown): boolean {
+  return value === 'open' ||
+    value === 'submitting' ||
+    value === 'accepted' ||
+    value === 'rejected' ||
+    value === 'needsRevision' ||
+    value === 'superseded' ||
+    value === 'expired';
+}
+
+function matchesInteractionOptionEffect(value: unknown): boolean {
+  return value === 'continueWithAction' ||
+    value === 'skipCurrentTask' ||
+    value === 'replan' ||
+    value === 'finishRun';
+}
+
+function matchesTaskSettlementKind(value: unknown): boolean {
+  return value === undefined ||
+    value === 'kernelCompleted' ||
+    value === 'sessionEvidenceSatisfied' ||
+    value === 'userSkipped' ||
+    value === 'userAcceptedIncomplete' ||
+    value === 'failed';
+}
+
+function matchesRunStatus(value: unknown): boolean {
+  return value === 'active' ||
+    value === 'waitingUser' ||
+    value === 'waitingExternal' ||
+    value === 'paused' ||
+    value === 'succeeded' ||
+    value === 'failed' ||
+    value === 'cancelled';
+}
+
+function matchesRunPhase(value: unknown): boolean {
+  return value === 'preparing' ||
+    value === 'processing' ||
+    value === 'executing' ||
+    value === 'validating' ||
+    value === 'waiting' ||
+    value === 'settled';
+}
+
+function matchesActivityKind(value: unknown): boolean {
+  return value === 'resourceSearch' ||
+    value === 'resourceRead' ||
+    value === 'editBatchQueued' ||
+    value === 'editFileStarted' ||
+    value === 'editFileCompleted' ||
+    value === 'editFileFailed' ||
+    value === 'toolExecution' ||
+    value === 'reviewCheckpoint' ||
+    value === 'diagnostic';
+}
+
+function matchesActivitySource(value: unknown): boolean {
+  return value === 'session' ||
+    value === 'kernel' ||
+    value === 'provider' ||
+    value === 'llm';
+}
+
+function matchesProvenanceOrigin(value: unknown): boolean {
+  return value === 'user' ||
+    value === 'session' ||
+    value === 'kernel' ||
+    value === 'provider';
+}
+
+function matchesProvenanceAuthority(value: unknown): boolean {
+  return value === 'user' || value === 'session' || value === 'kernel';
+}
+
+function matchesLanguageBindingStatus(value: unknown): boolean {
+  return value === 'pending' ||
+    value === 'resolved' ||
+    value === 'fallback' ||
+    value === 'superseded' ||
+    value === 'unavailable';
+}
+
+function matchesCheckpointKind(value: unknown): boolean {
+  return value === undefined ||
+    value === 'turnStart' ||
+    value === 'llmProposal' ||
+    value === 'resourcePacket' ||
+    value === 'userGuidance' ||
+    value === 'permission' ||
+    value === 'review' ||
+    value === 'final' ||
+    value === 'diagnostic';
+}
+
+function matchesPermissionRiskLevel(value: unknown): boolean {
+  return value === 'low' ||
+    value === 'medium' ||
+    value === 'high' ||
+    value === 'critical';
+}
+
+function matchesPresentationLanguage(value: unknown): boolean {
+  return value === 'zh-CN' || value === 'en-US' || value === 'neutral';
+}
+
+function assertProjectionKeys(
+  value: unknown,
+  allowed: readonly string[],
+  label: string
+): asserts value is Record<string, unknown> {
+  if (!isRecordPayload(value)) {
+    throw new Error(`session_shared_projection_invalid: ${label}_contract`);
+  }
+  const allowedKeys = new Set(allowed);
+  const unexpected = Object.keys(value).find((key) => !allowedKeys.has(key));
+  if (unexpected) {
+    throw new Error(`session_shared_projection_invalid: unexpected_${label}_field:${unexpected}`);
+  }
+}
+
+function containsForbiddenSharedProjectionKey(value: unknown): boolean {
+  if (!value || typeof value !== 'object') return false;
+  if (Array.isArray(value)) return value.some(containsForbiddenSharedProjectionKey);
+  for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
+    if (
+      key === 'events' ||
+      key === 'rawEventRefs' ||
+      key === 'metadata' ||
+      key === 'payload' ||
+      key === 'kernelEvent' ||
+      key === 'developerDetails' ||
+      key === 'reasoningContent' ||
+      key === 'reasoning_content' ||
+      key === 'rawProvider'
+    ) {
+      return true;
+    }
+    if (containsForbiddenSharedProjectionKey(nested)) return true;
+  }
+  return false;
 }
 
 function buildWorkspaceProjection(
@@ -316,7 +1966,7 @@ function buildWorkspaceProjection(
 }
 
 function interactionBlockId(
-  turns: AgentTimelineResult['turns'],
+  turns: WorkingAgentTimelineTurn[],
   active: InteractionLedgerActiveInteraction
 ): string | undefined {
   const blocks = turns.flatMap((turn) => turn.blocks);
@@ -331,7 +1981,11 @@ function eventMatchesInteraction(event: AgentEvent, active: InteractionLedgerAct
   const payload = isRecordPayload(event.payload) ? event.payload : {};
   if (active.kind === 'permission') {
     if (event.kind !== 'permission_request') return false;
-    return [stringField(payload, 'id'), stringField(payload, 'requestId'), stringField(payload, 'permissionId')]
+    return [
+      stringField(payload, 'id'),
+      stringField(payload, 'requestId'),
+      stringField(payload, 'permissionId'),
+    ]
       .includes(active.requestId);
   }
   if (active.kind === 'plan') {
@@ -340,7 +1994,9 @@ function eventMatchesInteraction(event: AgentEvent, active: InteractionLedgerAct
       stringField(payload, 'planId') === active.planId;
   }
   if (active.kind === 'review') {
-    return event.kind === 'review_summary' && stringField(payload, 'runId') === active.runId;
+    return event.kind === 'review_summary' &&
+      stringField(payload, 'runId') === active.runId &&
+      stringField(payload, 'reviewId') === active.reviewId;
   }
   return event.kind === 'requirement_confirmation' &&
     stringField(payload, 'runId') === active.runId &&
@@ -356,12 +2012,19 @@ export function buildTimelineProjectionWithLiveOverlay(
     activeDeltas: input.activeDeltas ?? [],
     generatedAt: input.generatedAt,
   });
-  const projection = buildNarrativeTimelineProjection({
+  const projection = buildWorkingNarrativeTimelineProjection({
     sessionId: input.sessionId,
     events: [...input.committedEvents, ...activeEvents],
+    auxiliaryEvents: input.auxiliaryEvents,
     generatedAt: input.generatedAt,
   });
-  return annotateLiveOverlayBlocks(projection, activeEvents);
+  projection.runProjection = activeRunProjection(
+    input.activeDeltas ?? [],
+    projection.interactionProjection?.pending?.interactionId
+  );
+  return toSharedConversationProjectionV2(
+    annotateLiveOverlayBlocks(projection, activeEvents)
+  );
 }
 
 function projectionDeltasToTransientEvents(input: {
@@ -374,9 +2037,79 @@ function projectionDeltasToTransientEvents(input: {
   return coalesceLiveToolActivities(input.activeDeltas)
     .filter((delta) => delta.sessionId === input.sessionId)
     .filter((delta) => delta.type !== 'committed')
+    .filter((delta) => delta.type !== 'active_turn')
+    .filter((delta) => delta.activity?.kind !== 'providerThinking')
+    .filter((delta) => !isExplicitlyHiddenProjectionDelta(delta))
     .filter((delta) => !activeDeltaAlreadyCommitted(delta, committed))
     .sort((left, right) => (left.seq ?? 0) - (right.seq ?? 0))
     .flatMap((delta) => projectionDeltaToTransientEvent(delta, input.generatedAt));
+}
+
+function activeRunProjection(
+  deltas: ProjectionDelta[],
+  activeInteractionId?: string
+): AgentTimelineResult['runProjection'] {
+  const active = deltas
+    .filter((delta) => delta.type !== 'committed' && Boolean(delta.runId))
+    .sort((left, right) => (left.seq ?? 0) - (right.seq ?? 0));
+  const latest = active[active.length - 1];
+  if (!latest?.runId) return undefined;
+  const payload = isRecordPayload(latest.payload) ? latest.payload : {};
+  const language = stringField(payload, 'presentationLanguage');
+  const languageStatus = stringField(payload, 'languageStatus');
+  const phase = runPhaseForProjectionDelta(latest);
+  const status = latest.status === 'failed'
+    ? 'failed'
+    : latest.status === 'cancelled'
+      ? 'cancelled'
+      : latest.status === 'waiting'
+        ? activeInteractionId ? 'waitingUser' : 'waitingExternal'
+        : 'active';
+  return {
+    runId: latest.runId,
+    turnId: latest.turnId,
+    taskId: stringField(payload, 'taskId'),
+    revision: latest.seq ?? active.length,
+    status,
+    phase,
+    waitReason: status === 'waitingUser' || status === 'waitingExternal'
+      ? latest.summary ?? latest.stage
+      : undefined,
+    activeInteractionId,
+    languageBinding: {
+      language: language === 'zh-CN' || language === 'en-US' ? language : 'neutral',
+      revision: positiveIntegerField(payload, 'languageRevision'),
+      status: languageStatus === 'pending' ||
+        languageStatus === 'resolved' ||
+        languageStatus === 'fallback' ||
+        languageStatus === 'superseded' ||
+        languageStatus === 'unavailable'
+        ? languageStatus
+        : 'unavailable',
+      sourceTurnId: stringField(payload, 'sourceTurnId'),
+    },
+  };
+}
+
+function runPhaseForProjectionDelta(
+  delta: ProjectionDelta
+): NonNullable<AgentTimelineResult['runProjection']>['phase'] {
+  if (delta.status === 'waiting') return 'waiting';
+  if (delta.type === 'resource_delta' ||
+      delta.type === 'tool_call_delta' ||
+      delta.type === 'workunit_delta') {
+    return 'executing';
+  }
+  if (delta.type === 'semantic_delta' ||
+      delta.type === 'committed' ||
+      (delta.type === 'active_turn' && delta.status === 'completed')) {
+    return 'validating';
+  }
+  if (delta.stage?.includes('review') || delta.stage?.includes('validation')) {
+    return 'validating';
+  }
+  if (delta.stage?.includes('prepare') || delta.status === 'queued') return 'preparing';
+  return 'processing';
 }
 
 function coalesceLiveToolActivities(deltas: ProjectionDelta[]): ProjectionDelta[] {
@@ -437,6 +2170,7 @@ function operationFromLiveToolName(toolName: string | undefined): string | undef
 function projectionDeltaToTransientEvent(delta: ProjectionDelta, generatedAt?: string): AgentEvent[] {
   const id = liveOverlayEventId(delta);
   const ts = generatedAt ?? new Date().toISOString();
+  const deltaPayload = isRecordPayload(delta.payload) ? delta.payload : {};
   const basePayload = {
     runId: delta.runId,
     turnId: delta.turnId,
@@ -445,14 +2179,26 @@ function projectionDeltaToTransientEvent(delta: ProjectionDelta, generatedAt?: s
     summary: delta.summary,
     source: delta.source,
     activeOverlay: true,
+    presentationLanguage: stringField(deltaPayload, 'presentationLanguage'),
+    languageRevision: positiveIntegerField(deltaPayload, 'languageRevision'),
+    languageStatus: stringField(deltaPayload, 'languageStatus'),
+    sourceTurnId: stringField(deltaPayload, 'sourceTurnId'),
   };
 
   if (delta.type === 'semantic_delta') {
-    return semanticDraftTransientEvent(delta, id, ts, basePayload);
+    // Semantic drafts remain in the private analysis stream. A plan or final
+    // answer enters Shared Projection only after semantic validation and the
+    // durable Session append has acknowledged the corresponding fact.
+    return [];
   }
 
   const textKind = projectionDeltaTextChannel(delta);
   if (textKind && typeof delta.delta === 'string' && delta.delta.length > 0) {
+    if (textKind === 'final') {
+      // A final answer is not projected from Provider streaming bytes. The
+      // committed assistant fact is the only visible final-answer authority.
+      return [];
+    }
     if (textKind === 'reasoning') {
       return [{
         id,
@@ -514,6 +2260,7 @@ function projectionDeltaToTransientEvent(delta: ProjectionDelta, generatedAt?: s
   if (activity) {
     const stage = delta.stage ?? activity.kind;
     const eventKind = liveActivityEventKind(delta);
+    const displayPolicy = projectionDeltaDisplayPolicy(delta);
     return [{
       id,
       sessionId: delta.sessionId,
@@ -528,11 +2275,11 @@ function projectionDeltaToTransientEvent(delta: ProjectionDelta, generatedAt?: s
         toolName: activity.toolName,
         activity,
         payload: delta.payload,
-        presentation: 'collapsible',
-        visibility: 'conversation',
+        presentation: displayPolicy.presentation ?? 'collapsible',
+        visibility: displayPolicy.visibility ?? 'conversation',
       },
       display: {
-        presentation: 'collapsible',
+        presentation: displayPolicy.presentation ?? 'collapsible',
         defaultOpen: activity.status === 'running' || activity.status === 'waiting' || activity.status === 'failed',
       },
     }];
@@ -541,179 +2288,40 @@ function projectionDeltaToTransientEvent(delta: ProjectionDelta, generatedAt?: s
   return [];
 }
 
-function semanticDraftTransientEvent(
-  delta: ProjectionDelta,
-  id: string,
-  ts: string,
-  basePayload: Record<string, unknown>
-): AgentEvent[] {
-  const draft = sessionSemanticDraftPayload(delta.payload);
-  if (!draft || draft.state === 'discarded') return [];
-  const status = draft.state === 'failed' ? 'failed' : 'running';
-  if (draft.kind === 'answer') {
-    const content = draft.answer?.content ?? '';
-    if (!content) return [];
-    return [{
-      id,
-      sessionId: delta.sessionId,
-      ts,
-      kind: 'assistant_msg',
-      payload: {
-        ...basePayload,
-        content,
-        channel: 'final',
-        visibility: 'conversation',
-        presentation: 'body',
-        proposalId: draft.proposalId,
-        status,
-        semanticDraftState: draft.state,
-        semanticDraftRevision: draft.revision,
-        semanticDraftFailureCode: draft.failureCode,
-      },
-      display: {
-        presentation: 'body',
-        defaultOpen: true,
-      },
-    }];
-  }
-
-  const plan = draft.plan;
-  if (!plan || (!plan.title && !plan.summary && plan.tasks.length === 0)) return [];
-  const summary = plan.title ?? 'Plan';
-  const planId = draft.planId ?? `plan-${draft.callId}`;
-  const readablePlan = readableTaskPlanProjection(
-    plan as unknown as Record<string, unknown>,
-    plan.summary ?? '',
-    {
-      runId: delta.runId ?? 'run',
-      planId,
-      proposalId: draft.proposalId,
-    }
-  );
-  return [{
-    id,
-    sessionId: delta.sessionId,
-    ts,
-    kind: 'plan_card',
-    payload: {
-      ...basePayload,
-      titleKey: 'session.projection.plan.title',
-      summary,
-      readablePlan,
-      runId: delta.runId,
-      planId,
-      proposalId: draft.proposalId,
-      status,
-      confirmable: false,
-      decisionOwner: {
-        kind: 'plan',
-        runId: delta.runId,
-        targetId: planId,
-        planId,
-        source: 'plan_card',
-      },
-      taskPlan: plan,
-      channel: 'action',
-      visibility: 'conversation',
-      presentation: 'body',
-      semanticDraftState: draft.state,
-      semanticDraftRevision: draft.revision,
-      semanticDraftFailureCode: draft.failureCode,
-    },
-    display: {
-      presentation: 'body',
-      defaultOpen: true,
-    },
-  }];
+function isExplicitlyHiddenProjectionDelta(delta: ProjectionDelta): boolean {
+  const policy = projectionDeltaDisplayPolicy(delta);
+  return policy.visibility === 'hidden'
+    || policy.presentation === 'traceOnly'
+    || delta.channel === 'reasoning'
+    || delta.type === 'reasoning_delta';
 }
 
-function sessionSemanticDraftPayload(value: unknown): SessionSemanticDraftPayload | undefined {
-  if (!isRecordPayload(value) || value.schemaVersion !== 'deepcode.session.semantic-draft.v1') return undefined;
-  if (value.kind !== 'answer' && value.kind !== 'plan') return undefined;
-  if (value.toolName !== 'session.submit_answer' && value.toolName !== 'session.submit_plan') return undefined;
-  if ((value.kind === 'answer') !== (value.toolName === 'session.submit_answer')) return undefined;
-  if (typeof value.callId !== 'string' || typeof value.proposalId !== 'string') return undefined;
-  if (typeof value.revision !== 'number' || !Number.isSafeInteger(value.revision) || value.revision < 0) return undefined;
-  if (value.state !== 'streaming' && value.state !== 'failed' && value.state !== 'discarded') return undefined;
-  const revision = value.revision;
-  const state: SessionSemanticDraftPayload['state'] = value.state;
-  const common = {
-    schemaVersion: 'deepcode.session.semantic-draft.v1' as const,
-    kind: value.kind,
-    toolName: value.toolName,
-    callId: value.callId,
-    proposalId: value.proposalId,
-    revision,
-    state,
-    ...(typeof value.failureCode === 'string' && value.failureCode.trim()
-      ? { failureCode: value.failureCode }
-      : {}),
-  };
-  if (value.kind === 'answer') {
-    const answer = isRecordPayload(value.answer) ? value.answer : undefined;
-    if (!answer || typeof answer.content !== 'string') return undefined;
-    return {
-      ...common,
-      kind: 'answer',
-      toolName: 'session.submit_answer',
-      answer: { content: answer.content },
-    };
-  }
-
-  const plan = isRecordPayload(value.plan) ? value.plan : undefined;
-  if (!plan || !Array.isArray(plan.tasks)) return undefined;
-  const tasks = plan.tasks.map(sessionSemanticDraftPlanTask);
-  if (tasks.some((task) => !task)) return undefined;
-  const risks = semanticDraftStringArray(plan.risks);
-  const reviewCheckpoints = semanticDraftStringArray(plan.reviewCheckpoints);
-  if (!risks || !reviewCheckpoints) return undefined;
-  if (plan.title !== undefined && typeof plan.title !== 'string') return undefined;
-  if (plan.summary !== undefined && typeof plan.summary !== 'string') return undefined;
-  if (value.planId !== undefined && typeof value.planId !== 'string') return undefined;
+function projectionDeltaDisplayPolicy(delta: ProjectionDelta): {
+  visibility?: AgentEventVisibility;
+  presentation?: AgentEventPresentation;
+} {
+  const payload = isRecordPayload(delta.payload) ? delta.payload : {};
+  const visibility = stringField(payload, 'visibility');
+  const presentation = stringField(payload, 'presentation');
   return {
-    ...common,
-    kind: 'plan',
-    toolName: 'session.submit_plan',
-    ...(typeof value.planId === 'string' ? { planId: value.planId } : {}),
-    plan: {
-      ...(typeof plan.title === 'string' ? { title: plan.title } : {}),
-      ...(typeof plan.summary === 'string' ? { summary: plan.summary } : {}),
-      tasks: tasks as NonNullable<SessionSemanticDraftPayload['plan']>['tasks'],
-      risks,
-      reviewCheckpoints,
-    },
+    visibility: isAgentEventVisibility(visibility) ? visibility : undefined,
+    presentation: isAgentEventPresentation(presentation) ? presentation : undefined,
   };
 }
 
-function sessionSemanticDraftPlanTask(
-  value: unknown
-): NonNullable<SessionSemanticDraftPayload['plan']>['tasks'][number] | undefined {
-  if (!isRecordPayload(value) || !isRecordPayload(value.args)) return undefined;
-  const target = semanticDraftStringArray(value.target);
-  const dependencies = semanticDraftStringArray(value.dependencies);
-  const acceptanceCriteria = semanticDraftStringArray(value.acceptanceCriteria);
-  const failureCriteria = semanticDraftStringArray(value.failureCriteria);
-  if (!target || !dependencies || !acceptanceCriteria || !failureCriteria) return undefined;
-  if (typeof value.taskId !== 'string' || typeof value.title !== 'string' || typeof value.toolId !== 'string') {
-    return undefined;
-  }
-  return {
-    taskId: value.taskId,
-    title: value.title,
-    toolId: value.toolId,
-    target,
-    dependencies,
-    args: value.args,
-    acceptanceCriteria,
-    failureCriteria,
-  };
+function isAgentEventVisibility(value: string | undefined): value is AgentEventVisibility {
+  return value === 'conversation'
+    || value === 'task'
+    || value === 'trace'
+    || value === 'both'
+    || value === 'hidden';
 }
 
-function semanticDraftStringArray(value: unknown): string[] | undefined {
-  if (!Array.isArray(value) || !value.every((item): item is string => typeof item === 'string')) {
-    return undefined;
-  }
-  return [...value];
+function isAgentEventPresentation(value: string | undefined): value is AgentEventPresentation {
+  return value === 'body'
+    || value === 'collapsible'
+    || value === 'stageSummary'
+    || value === 'traceOnly';
 }
 
 function liveOverlayEventId(delta: ProjectionDelta): string {
@@ -856,14 +2464,22 @@ function eventActivityId(event: AgentEvent): string | undefined {
 
 function isProjectionTimelineHiddenEvent(event: AgentEvent): boolean {
   const activity = conversationActivityFromEvent(event);
+  const payload = isRecordPayload(event.payload) ? event.payload : {};
+  const stage = stringField(payload, 'stage');
+  const isSessionProviderStatus = event.kind === 'workflow_stage'
+    && stage === 'session.provider_status'
+    && activity?.kind === 'providerThinking'
+    && stringField(payload, 'channel') === 'progress';
+  if (isSessionProviderStatus) return true;
   if (event.kind === 'workflow_stage' || event.kind === 'workflow_decision') {
-    const payload = isRecordPayload(event.payload) ? event.payload : {};
-    const stage = stringField(payload, 'stage');
     const kernelEventKind = kernelEventFromPayload(payload)?.kind;
     if (isInternalOrchestrationStage({ stage, kernelEventKind })) return true;
     if (!activity) return true;
   }
-  if (activity && !isMainTimelineActivityShape({ kind: activity.kind, toolName: activity.toolName })) {
+  if (
+    activity
+    && !isMainTimelineActivityShape({ kind: activity.kind, toolName: activity.toolName })
+  ) {
     return true;
   }
   return false;
@@ -874,11 +2490,210 @@ function conversationActivityFromEvent(event: AgentEvent): AgentConversationActi
   return payload ? activityFromValue(payload.activity) : undefined;
 }
 
+interface HistoricalProjectionLanguageIndex {
+  snapshotBindingForEvent(
+    event: AgentEvent,
+    fallback?: ProjectionLanguageBinding
+  ): ProjectionLanguageBinding;
+  settledBindingForEvent(
+    event: AgentEvent,
+    fallback?: ProjectionLanguageBinding
+  ): ProjectionLanguageBinding;
+}
+
+function buildHistoricalProjectionLanguageIndex(
+  events: readonly AgentEvent[]
+): HistoricalProjectionLanguageIndex {
+  interface IndexedBinding {
+    tupleKey: string;
+    binding: ProjectionLanguageBinding;
+  }
+  const byTuple = new Map<string, ProjectionLanguageBinding>();
+  const byRunSourceMessage = new Map<string, IndexedBinding | null>();
+  const bySourceMessage = new Map<string, IndexedBinding | null>();
+  for (const authority of sessionTurnAuthorities(events)) {
+    const tupleKey = projectionAuthorityTupleKey(
+      authority.sessionId,
+      authority.runId,
+      authority.turnId,
+      authority.languagePolicy.revision
+    );
+    const policy = resolveConversationLanguagePolicy(events, authority);
+    const binding = normalizedProjectionLanguageBinding({
+      language: policy.status === 'resolved' || policy.status === 'fallback'
+        ? effectiveConversationLanguage(policy)
+        : undefined,
+      status: policy.status,
+      revision: policy.revision,
+      sourceTurnId: authority.turnId,
+    });
+    byTuple.set(tupleKey, binding);
+    const indexed = { tupleKey, binding };
+    for (const messageId of authority.sourceMessageIds) {
+      indexProjectionSourceBinding(
+        byRunSourceMessage,
+        `${authority.runId}\u0000${messageId}`,
+        indexed
+      );
+      indexProjectionSourceBinding(bySourceMessage, messageId, indexed);
+    }
+  }
+
+  const sourceBinding = (event: AgentEvent): ProjectionLanguageBinding | undefined => {
+    const payload = isRecordPayload(event.payload) ? event.payload : {};
+    const messageId = event.kind === 'user_guidance'
+      ? stringField(payload, 'guidanceId') ?? event.id
+      : event.id;
+    const runId = stringField(payload, 'ownerRunId')
+      ?? stringField(payload, 'targetRunId')
+      ?? stringField(payload, 'runId');
+    if (runId) {
+      const indexed = byRunSourceMessage.get(`${runId}\u0000${messageId}`);
+      if (indexed === null) return neutralProjectionLanguageBinding();
+      if (indexed) return indexed.binding;
+    }
+    const indexed = bySourceMessage.get(messageId);
+    return indexed === null ? neutralProjectionLanguageBinding() : indexed?.binding;
+  };
+
+  const tupleBinding = (event: AgentEvent): ProjectionLanguageBinding | undefined => {
+    if (!isRecordPayload(event.payload)) return undefined;
+    const payload = event.payload;
+    const sessionId = stringField(payload, 'sessionId') ?? event.sessionId;
+    const runId = stringField(payload, 'runId')
+      ?? stringField(payload, 'ownerRunId')
+      ?? stringField(payload, 'targetRunId');
+    const turnId = stringField(payload, 'sourceTurnId');
+    const revision = positiveIntegerField(payload, 'languageRevision');
+    if (!sessionId || !runId || !turnId || !revision) return undefined;
+    return byTuple.get(projectionAuthorityTupleKey(sessionId, runId, turnId, revision));
+  };
+
+  return {
+    snapshotBindingForEvent(event, fallback = neutralProjectionLanguageBinding()) {
+      const local = projectionLanguageBindingFromEvent(event);
+      if (local) return local;
+      return sourceBinding(event) ?? fallback;
+    },
+    settledBindingForEvent(event, fallback = neutralProjectionLanguageBinding()) {
+      return tupleBinding(event) ?? sourceBinding(event) ?? fallback;
+    },
+  };
+}
+
+function projectionLanguageBindingFromEvent(
+  event: AgentEvent
+): ProjectionLanguageBinding | undefined {
+  if (!isRecordPayload(event.payload)) return undefined;
+  const payload = event.payload;
+  const explicitLanguage = stringField(payload, 'presentationLanguage');
+  const providerLanguage = (
+    event.kind === 'plan_card'
+    || event.kind === 'requirement_confirmation'
+    || event.kind === 'assistant_msg'
+  )
+    ? stringField(payload, 'responseLanguage')
+    : undefined;
+  const rawStatus = stringField(payload, 'languageStatus');
+  if (!explicitLanguage && !providerLanguage && !rawStatus) return undefined;
+  return normalizedProjectionLanguageBinding({
+    language: explicitLanguage ?? providerLanguage,
+    status: rawStatus,
+    revision: positiveIntegerField(payload, 'languageRevision'),
+    sourceTurnId: stringField(payload, 'sourceTurnId'),
+  });
+}
+
+function normalizedProjectionLanguageBinding(input: {
+  language?: string;
+  status?: string;
+  revision?: number;
+  sourceTurnId?: string;
+}): ProjectionLanguageBinding {
+  const validStatus = input.status === 'pending'
+    || input.status === 'resolved'
+    || input.status === 'fallback'
+    || input.status === 'superseded'
+    || input.status === 'unavailable'
+    ? input.status
+    : undefined;
+  if (
+    validStatus === 'pending'
+    || validStatus === 'superseded'
+    || validStatus === 'unavailable'
+  ) {
+    return {
+      language: 'neutral',
+      revision: input.revision,
+      status: validStatus,
+      sourceTurnId: input.sourceTurnId,
+    };
+  }
+  if (
+    (validStatus === 'resolved' || validStatus === 'fallback')
+    && (input.language === 'zh-CN' || input.language === 'en-US')
+  ) {
+    return {
+      language: input.language,
+      revision: input.revision,
+      status: validStatus,
+      sourceTurnId: input.sourceTurnId,
+    };
+  }
+  if (
+    input.status === undefined
+    && (input.language === 'zh-CN' || input.language === 'en-US')
+  ) {
+    return {
+      language: input.language,
+      revision: input.revision,
+      status: 'resolved',
+      sourceTurnId: input.sourceTurnId,
+    };
+  }
+  return {
+    language: 'neutral',
+    revision: input.revision,
+    status: 'unavailable',
+    sourceTurnId: input.sourceTurnId,
+  };
+}
+
+function projectionAuthorityTupleKey(
+  sessionId: string,
+  runId: string,
+  turnId: string,
+  revision: number
+): string {
+  return `${sessionId}\u0000${runId}\u0000${turnId}\u0000${revision}`;
+}
+
+function indexProjectionSourceBinding(
+  index: Map<string, { tupleKey: string; binding: ProjectionLanguageBinding } | null>,
+  key: string,
+  value: { tupleKey: string; binding: ProjectionLanguageBinding }
+): void {
+  const existing = index.get(key);
+  if (existing === undefined || existing?.tupleKey === value.tupleKey) {
+    index.set(key, value);
+    return;
+  }
+  index.set(key, null);
+}
+
+function neutralProjectionLanguageBinding(): ProjectionLanguageBinding {
+  return {
+    language: 'neutral',
+    status: 'unavailable',
+  };
+}
+
 function userInputBubbleEvent(event: AgentEvent, index: number): AgentEvent | null {
   const content = userInputBubbleContent(event);
   if (!content) return null;
   const contentKey = userInputBubbleContentKey(event);
   const contentArgs = userInputBubbleContentArgs(event);
+  const sourcePayload = isRecordPayload(event.payload) ? event.payload : {};
   return {
     id: `user-input-${event.id || index}`,
     sessionId: event.sessionId,
@@ -891,6 +2706,18 @@ function userInputBubbleEvent(event: AgentEvent, index: number): AgentEvent | nu
       source: 'user',
       sourceEventId: event.id,
       sourceEventKind: event.kind,
+      ...(stringField(sourcePayload, 'presentationLanguage')
+        ? { presentationLanguage: stringField(sourcePayload, 'presentationLanguage') }
+        : {}),
+      ...(numberField(sourcePayload, 'languageRevision') !== undefined
+        ? { languageRevision: numberField(sourcePayload, 'languageRevision') }
+        : {}),
+      ...(stringField(sourcePayload, 'languageStatus')
+        ? { languageStatus: stringField(sourcePayload, 'languageStatus') }
+        : {}),
+      ...(stringField(sourcePayload, 'sourceTurnId')
+        ? { sourceTurnId: stringField(sourcePayload, 'sourceTurnId') }
+        : {}),
       presentation: 'body',
       visibility: 'conversation',
     },
@@ -907,19 +2734,18 @@ function userInputBubbleContent(event: AgentEvent): string | undefined {
     return firstPayloadText(event.payload, ['content', 'guidance', 'text', 'message']);
   }
   if (event.kind === 'requirement_decision') {
-    return firstPayloadText(event.payload, ['guidance', 'summary', 'message']) ??
-      selectedOptionLabel(event.payload);
+    return firstPayloadText(event.payload, ['guidance', 'userGuidance']);
   }
   if (event.kind === 'plan_review') {
     const status = stringField(event.payload, 'status');
     if (status !== 'accepted' && status !== 'rejected' && status !== 'needsRevision') return undefined;
-    return firstPayloadText(event.payload, ['guidance', 'summary', 'message']);
+    return firstPayloadText(event.payload, ['guidance', 'userGuidance']);
   }
   if (event.kind === 'review_summary') {
     const status = stringField(event.payload, 'status');
     if (status !== 'accepted' && status !== 'rejected' && status !== 'needsRevision') return undefined;
-    if (status === 'accepted') return undefined;
-    return firstPayloadText(event.payload, ['guidance', 'content', 'summary', 'message']);
+    if (stringField(event.payload, 'contentKey')) return undefined;
+    return firstPayloadText(event.payload, ['guidance', 'userGuidance', 'content']);
   }
   return undefined;
 }
@@ -937,11 +2763,6 @@ function userInputBubbleContentArgs(event: AgentEvent): Record<string, string> |
     recordStringValues(event.payload.messageArgs) ??
     recordStringValues(event.payload.summaryArgs);
   return args && Object.keys(args).length > 0 ? args : undefined;
-}
-
-function selectedOptionLabel(payload: Record<string, unknown>): string | undefined {
-  const selectedOption = isRecordPayload(payload.selectedOption) ? payload.selectedOption : undefined;
-  return selectedOption ? stringField(selectedOption, 'label') : undefined;
 }
 
 function recordStringValues(value: unknown): Record<string, string> | undefined {
@@ -968,9 +2789,9 @@ function isUserInputAuditOnlyEvent(event: AgentEvent): boolean {
 }
 
 function annotateLiveOverlayBlocks(
-  projection: AgentTimelineResult,
+  projection: WorkingAgentTimelineResult,
   activeEvents: AgentEvent[]
-): AgentTimelineResult {
+): WorkingAgentTimelineResult {
   if (activeEvents.length === 0) return projection;
   const liveEventIds = new Set(activeEvents.map((event) => event.id));
   const liveEventIndex = new Map(activeEvents.map((event, index) => [event.id, index]));
@@ -1008,13 +2829,16 @@ function isLiveTextEvent(event: AgentEvent): boolean {
   return channel === 'reasoning' || channel === 'progress' || channel === 'final';
 }
 
-function isTimelineTextBlock(block: AgentTimelineBlock): boolean {
+function isTimelineTextBlock(block: WorkingAgentTimelineBlock): boolean {
   return block.narrativeKind === 'thinking' ||
     block.narrativeKind === 'assistantNarration' ||
     block.narrativeKind === 'assistantText';
 }
 
-function turnContainsLiveEvent(turn: AgentTimelineResult['turns'][number], liveEventIds: Set<string>): boolean {
+function turnContainsLiveEvent(
+  turn: WorkingAgentTimelineTurn,
+  liveEventIds: Set<string>
+): boolean {
   return turn.blocks.some((block) => block.events.some((event) => liveEventIds.has(event.id)));
 }
 
@@ -1022,7 +2846,8 @@ function taskPlanTaskProjectionItems(
   events: AgentEvent[],
   event: AgentEvent,
   eventIndex: number,
-  projectedBlockId?: string
+  projectedBlockId: string | undefined,
+  presentationBinding: ProjectionLanguageBinding
 ): NonNullable<AgentTimelineResult['taskProjection']>['items'] {
   if (event.kind !== 'plan_card' || !isRecordPayload(event.payload)) return [];
   const taskPlan = event.payload.taskPlan;
@@ -1043,22 +2868,42 @@ function taskPlanTaskProjectionItems(
       ...stringArrayOrSingleField(item, 'target'),
       ...stringArrayOrSingleField(item, 'targets'),
     ];
+    const ledgerProjection = implementationTaskProjectionFromLedger(taskLedger, taskId);
+    const factStatus = implementationTaskStatus(lifecycle, targets, taskId);
+    const status = mergeImplementationTaskStatus(ledgerProjection?.status, factStatus);
+    const settlementKind = factStatus === 'completed'
+      ? 'completedByKernelFacts'
+      : ledgerProjection?.settlementKind;
     const summary = [
+      implementationTaskSettlementSummary(settlementKind, presentationBinding),
       scope,
       acceptance.length ? `Acceptance: ${acceptance.join('; ')}` : '',
       failure.length ? `Stop/Replan: ${failure.join('; ')}` : '',
     ].filter(Boolean).join(' · ');
-    const ledgerStatus = implementationTaskStatusFromLedger(taskLedger, taskId);
-    const factStatus = implementationTaskStatus(lifecycle, targets, taskId);
     return [{
       id: `implementation-plan-${event.id || eventIndex}-${taskId}`,
       title,
       summary: summary || stringField(taskPlan, 'summary') || '',
-      status: mergeImplementationTaskStatus(ledgerStatus, factStatus),
+      status,
       blockId: projectedBlockId ?? `plan-${event.id || eventIndex}`,
       narrativeKind: 'plan' as const,
+      settlementKind: sharedTaskSettlementKind(settlementKind, status),
     }];
   });
+}
+
+function sharedTaskSettlementKind(
+  settlementKind: ImplementationTaskSettlementKind | undefined,
+  status: AgentTimelineStatus
+): NonNullable<
+  NonNullable<AgentTimelineResult['taskProjection']>['items'][number]['settlementKind']
+> | undefined {
+  if (status === 'failed') return 'failed';
+  if (settlementKind === 'completedByKernelFacts') return 'kernelCompleted';
+  if (settlementKind === 'modelJudgedSufficient') return 'sessionEvidenceSatisfied';
+  if (settlementKind === 'skippedByUser') return 'userSkipped';
+  if (settlementKind === 'acceptedIncompleteByUser') return 'userAcceptedIncomplete';
+  return undefined;
 }
 
 function latestAcceptedPlanTaskLedger(
@@ -1077,10 +2922,19 @@ function latestAcceptedPlanTaskLedger(
   return undefined;
 }
 
-function implementationTaskStatusFromLedger(
+type ImplementationTaskSettlementKind =
+  | 'completedByKernelFacts'
+  | 'modelJudgedSufficient'
+  | 'skippedByUser'
+  | 'acceptedIncompleteByUser';
+
+function implementationTaskProjectionFromLedger(
   ledger: Record<string, unknown> | undefined,
   taskId: string
-): AgentTimelineStatus | undefined {
+): {
+  status: AgentTimelineStatus;
+  settlementKind?: ImplementationTaskSettlementKind;
+} | undefined {
   if (!ledger) return undefined;
   const entries = Array.isArray(ledger.entries) ? ledger.entries : [];
   const normalizedTaskId = normalizeTaskId(taskId);
@@ -1090,16 +2944,53 @@ function implementationTaskStatusFromLedger(
     if (!entryTaskId || entryTaskId !== normalizedTaskId) continue;
     const status = stringField(entry, 'status');
     if (
-      status === 'completedByKernelFacts' ||
-      status === 'modelJudgedSufficient' ||
-      status === 'skippedByUser' ||
-      status === 'acceptedIncompleteByUser'
-    ) return 'completed';
-    if (status === 'failed') return 'failed';
-    if (status === 'inProgress') return 'running';
-    return 'queued';
+      status === 'completedByKernelFacts'
+      || status === 'modelJudgedSufficient'
+      || status === 'skippedByUser'
+      || status === 'acceptedIncompleteByUser'
+    ) {
+      return { status: 'completed', settlementKind: status };
+    }
+    if (status === 'failed') return { status: 'failed' };
+    if (status === 'inProgress') return { status: 'running' };
+    return { status: 'queued' };
   }
   return undefined;
+}
+
+function implementationTaskSettlementSummary(
+  settlementKind: ImplementationTaskSettlementKind | undefined,
+  binding: ProjectionLanguageBinding
+): string {
+  if (settlementKind === 'completedByKernelFacts') {
+    return localizedProjectionText(binding.language, {
+      zh: 'Kernel 事实已确认完成',
+      en: 'Completed by Kernel facts',
+      neutral: 'settlement=kernelFactsCompleted',
+    });
+  }
+  if (settlementKind === 'modelJudgedSufficient') {
+    return localizedProjectionText(binding.language, {
+      zh: 'Session 已评估现有证据足够；没有对应的 Kernel 变更完成事实',
+      en: 'Session assessed the evidence as sufficient; no corresponding Kernel mutation-completion fact exists',
+      neutral: 'settlement=sessionEvidenceAssessed kernelMutationCompleted=false',
+    });
+  }
+  if (settlementKind === 'skippedByUser') {
+    return localizedProjectionText(binding.language, {
+      zh: '用户已跳过此任务',
+      en: 'Skipped by the user',
+      neutral: 'settlement=userSkipped',
+    });
+  }
+  if (settlementKind === 'acceptedIncompleteByUser') {
+    return localizedProjectionText(binding.language, {
+      zh: '用户已接受此任务保持未完成',
+      en: 'Accepted as incomplete by the user',
+      neutral: 'settlement=userAcceptedIncomplete',
+    });
+  }
+  return '';
 }
 
 function mergeImplementationTaskStatus(
@@ -1368,6 +3259,28 @@ export function buildTokenUsageProjection(events: AgentEvent[]): AgentTimelineTo
   };
 }
 
+function orderedUsageProjectionEvents(
+  domainEvents: readonly AgentEvent[],
+  auxiliaryEvents: readonly AgentEvent[]
+): AgentEvent[] {
+  return [...domainEvents, ...auxiliaryEvents]
+    .map((event, index) => ({
+      event,
+      index,
+      timestamp: Date.parse(event.ts),
+    }))
+    .sort((left, right) => {
+      const leftTimestamp = Number.isFinite(left.timestamp)
+        ? left.timestamp
+        : Number.MAX_SAFE_INTEGER;
+      const rightTimestamp = Number.isFinite(right.timestamp)
+        ? right.timestamp
+        : Number.MAX_SAFE_INTEGER;
+      return leftTimestamp - rightTimestamp || left.index - right.index;
+    })
+    .map(({ event }) => event);
+}
+
 interface MutableTokenUsageRequest {
   requestId: string;
   turnId: string;
@@ -1529,20 +3442,179 @@ function tokenUsageRequestTitle(payload: unknown, index: number): string {
   return normalized.length > 42 ? `${normalized.slice(0, 42)}…` : normalized;
 }
 
-function appendNarrativeBlock(blocks: AgentTimelineBlock[], event: AgentEvent, index: number): void {
+function appendInteractionSettlementToExistingBlock(
+  turns: WorkingAgentTimelineTurn[],
+  currentTurn: WorkingAgentTimelineTurn,
+  event: AgentEvent,
+  index: number,
+  fallbackBinding: ProjectionLanguageBinding,
+  exactTargetBlocks?: WorkingAgentTimelineBlock[]
+): void {
+  const candidate = narrativeBlockFromEvents(
+    [event],
+    index,
+    undefined,
+    undefined,
+    undefined,
+    fallbackBinding
+  );
+  const identity = semanticNarrativeBlockIdentity(candidate);
+  if (exactTargetBlocks) {
+    if (
+      identity
+      && mergeInteractionSettlementIntoBlocks(
+        exactTargetBlocks,
+        identity,
+        event,
+        index,
+        fallbackBinding
+      )
+    ) {
+      return;
+    }
+    exactTargetBlocks.push(candidate);
+    return;
+  }
+  if (identity) {
+    for (let turnIndex = turns.length - 1; turnIndex >= 0; turnIndex -= 1) {
+      const blocks = turns[turnIndex].blocks;
+      if (
+        mergeInteractionSettlementIntoBlocks(
+          blocks,
+          identity,
+          event,
+          index,
+          fallbackBinding
+        )
+      ) return;
+    }
+  }
+  currentTurn.blocks.push(candidate);
+}
+
+function mergeInteractionSettlementIntoBlocks(
+  blocks: WorkingAgentTimelineBlock[],
+  identity: string,
+  event: AgentEvent,
+  index: number,
+  fallbackBinding: ProjectionLanguageBinding
+): boolean {
+  for (let blockIndex = blocks.length - 1; blockIndex >= 0; blockIndex -= 1) {
+    const block = blocks[blockIndex];
+    if (semanticNarrativeBlockIdentity(block) !== identity) continue;
+    blocks[blockIndex] = narrativeBlockFromEvents(
+      [...block.events, event],
+      index,
+      block.id,
+      block.kind,
+      block.narrativeKind,
+      projectionBindingFromBlock(block, fallbackBinding)
+    );
+    return true;
+  }
+  return false;
+}
+
+function coalesceNarrativeBlocks(turns: WorkingAgentTimelineTurn[]): void {
+  for (const turn of turns) {
+    const coalesced: WorkingAgentTimelineBlock[] = [];
+    const indexByIdentity = new Map<string, number>();
+    for (const block of turn.blocks) {
+      const identity = semanticNarrativeBlockIdentity(block);
+      const canCoalesce = block.entryRole === 'interaction' ||
+        block.entryRole === 'activityGroup' ||
+        block.entryRole === 'evidence';
+      const existingIndex = identity && canCoalesce
+        ? indexByIdentity.get(identity)
+        : undefined;
+      if (existingIndex === undefined) {
+        if (identity && canCoalesce) indexByIdentity.set(identity, coalesced.length);
+        coalesced.push(block);
+        continue;
+      }
+      const existing = coalesced[existingIndex];
+      coalesced[existingIndex] = narrativeBlockFromEvents(
+        [...existing.events, ...block.events],
+        existingIndex,
+        existing.id,
+        existing.kind,
+        existing.narrativeKind,
+        projectionBindingFromBlock(existing, neutralProjectionLanguageBinding())
+      );
+    }
+    turn.blocks = coalesced;
+  }
+}
+
+function projectionBindingFromBlock(
+  block: WorkingAgentTimelineBlock,
+  fallback: ProjectionLanguageBinding
+): ProjectionLanguageBinding {
+  return block.languageBinding
+    ? {
+        language: block.languageBinding.language,
+        revision: block.languageBinding.revision,
+        status: block.languageBinding.status,
+        sourceTurnId: block.languageBinding.sourceTurnId,
+      }
+    : fallback;
+}
+
+function appendNarrativeBlock(
+  blocks: WorkingAgentTimelineBlock[],
+  event: AgentEvent,
+  index: number,
+  presentationBinding: ProjectionLanguageBinding,
+  blockBindings: Map<string, ProjectionLanguageBinding>
+): void {
   const nextNarrativeKind = narrativeKindForEvent(event);
   const nextLegacyKind = legacyKindForNarrative(nextNarrativeKind);
   const last = blocks[blocks.length - 1];
-  if (last && canGroupNarrativeEvent(last, event, nextNarrativeKind)) {
+  const lastBinding = last ? blockBindings.get(last.id) : undefined;
+  if (
+    last
+    && lastBinding
+    && sameProjectionLanguageBinding(lastBinding, presentationBinding)
+    && canGroupNarrativeEvent(last, event, nextNarrativeKind)
+  ) {
     const events = [...last.events, event];
-    blocks[blocks.length - 1] = narrativeBlockFromEvents(events, index, last.id, nextLegacyKind, nextNarrativeKind);
+    const grouped = narrativeBlockFromEvents(
+      events,
+      index,
+      last.id,
+      nextLegacyKind,
+      nextNarrativeKind,
+      presentationBinding
+    );
+    blocks[blocks.length - 1] = grouped;
+    blockBindings.delete(last.id);
+    blockBindings.set(grouped.id, presentationBinding);
     return;
   }
-  blocks.push(narrativeBlockFromEvents([event], index, undefined, nextLegacyKind, nextNarrativeKind));
+  const block = narrativeBlockFromEvents(
+    [event],
+    index,
+    undefined,
+    nextLegacyKind,
+    nextNarrativeKind,
+    presentationBinding
+  );
+  blocks.push(block);
+  blockBindings.set(block.id, presentationBinding);
+}
+
+function sameProjectionLanguageBinding(
+  left: ProjectionLanguageBinding,
+  right: ProjectionLanguageBinding
+): boolean {
+  return left.language === right.language
+    && left.revision === right.revision
+    && left.status === right.status
+    && left.sourceTurnId === right.sourceTurnId;
 }
 
 function canGroupNarrativeEvent(
-  last: AgentTimelineBlock,
+  last: WorkingAgentTimelineBlock,
   event: AgentEvent,
   nextNarrativeKind: AgentTimelineNarrativeKind
 ): boolean {
@@ -1578,11 +3650,17 @@ function reviewNarrativeGroupKey(events: AgentEvent[]): string | undefined {
 function narrativeActivityGroupKey(events: AgentEvent[]): string | undefined {
   const activity = narrativeActivity(events);
   if (!activity) return undefined;
+  const runId = activity.runId ??
+    events.flatMap((event) => {
+      const payload = isRecordPayload(event.payload) ? event.payload : {};
+      return [stringField(payload, 'runId')];
+    }).find((value): value is string => Boolean(value)) ??
+    'run';
   const actionId = activity.actionIds?.[0];
-  if (actionId) return `action:${actionId}`;
+  if (actionId) return `${runId}:action:${actionId}`;
   const workUnitId = activity.workUnitIds?.[0];
-  if (workUnitId) return `work-unit:${workUnitId}`;
-  return `activity:${activity.activityId}`;
+  if (workUnitId) return `${runId}:work-unit:${workUnitId}`;
+  return `${runId}:activity:${activity.activityId}`;
 }
 
 function narrativeStageGroupKey(event: AgentEvent | undefined): string | undefined {
@@ -1598,40 +3676,215 @@ function narrativeBlockFromEvents(
   index: number,
   existingId?: string,
   forcedKind?: AgentTimelineBlockKind,
-  forcedNarrativeKind?: AgentTimelineNarrativeKind
-): AgentTimelineBlock {
+  forcedNarrativeKind?: AgentTimelineNarrativeKind,
+  presentationBinding: ProjectionLanguageBinding = neutralProjectionLanguageBinding()
+): WorkingAgentTimelineBlock {
   const first = events[0];
   const narrativeKind = forcedNarrativeKind ?? narrativeKindForEvent(first);
   const legacyKind = forcedKind ?? legacyKindForNarrative(narrativeKind);
   const activity = narrativeActivity(events);
   const status = activity?.status ?? narrativeStatus(events);
-  const title = activity?.title ?? narrativeTitle(events, narrativeKind);
-  const summary = activity?.summary ?? summarizeAgentEvents(events);
+  const title = activity?.title ?? narrativeTitle(events, narrativeKind, presentationBinding);
+  const summary = activity?.summary ?? summarizeAgentEvents(events, presentationBinding);
   const body = narrativeBody(events, narrativeKind);
   const structuredProjection = narrativeStructuredProjection(events, narrativeKind);
   const attachments = narrativeAttachments(events);
   const feedbackEvent = [...events].reverse().find((event) => event.kind !== 'user_msg');
+  const evidenceRefs = events.flatMap(eventEvidenceRefs);
+  const entryRole = timelineEntryRole(narrativeKind);
   return {
     id: existingId ?? `${narrativeKind}-${first.id || index}`,
     kind: legacyKind,
     narrativeKind,
+    entryRole,
+    durability: events.some((event) => event.id.startsWith('live:'))
+      ? 'live'
+      : 'committed',
     activity,
     title,
     summary,
     status,
     defaultCollapsed: narrativeDefaultCollapsed(narrativeKind, status),
     bodyMarkdown: body,
+    localizedContent: localizedTimelineContent(events, narrativeKind),
     structuredProjection,
     decisionRequest: undefined,
+    interaction: interactionViewFromEvents(events, narrativeKind),
+    confirmable: events.some((event) =>
+      isRecordPayload(event.payload) && event.payload.confirmable === true
+    ),
     attachments,
     feedbackRef: feedbackEvent
       ? { eventId: feedbackEvent.id, sessionId: feedbackEvent.sessionId, kind: feedbackEvent.kind }
       : undefined,
     displayHints: narrativeDisplayHints(narrativeKind, title, summary),
-    evidenceRefs: events.flatMap(eventEvidenceRefs),
-    rawEventRefs: events.map(eventRefForAgentEvent),
+    evidenceRefs,
+    provenance: narrativeProvenance(events, entryRole, evidenceRefs),
+    languageBinding: {
+      language: presentationBinding.language,
+      revision: presentationBinding.revision,
+      status: presentationBinding.status,
+      sourceTurnId: presentationBinding.sourceTurnId,
+    },
+    sourceEventRefs: events.map(eventRefForAgentEvent),
     taskProjectionRef: shouldShowNarrativeInTaskList(narrativeKind) ? `task-${narrativeKind}-${first.id || index}` : undefined,
     events,
+  };
+}
+
+function interactionViewFromEvents(
+  events: AgentEvent[],
+  kind: AgentTimelineNarrativeKind
+): AgentTimelineBlock['interaction'] {
+  const interactionKind = kind === 'requirement' ||
+    kind === 'plan' ||
+    kind === 'permission' ||
+    kind === 'review'
+    ? kind
+    : undefined;
+  if (!interactionKind) return undefined;
+  const openingEvent = events.find((event) => {
+    const payload = isRecordPayload(event.payload) ? event.payload : {};
+    if (interactionKind === 'requirement') {
+      return event.kind === 'requirement_confirmation' && payload.confirmable === true;
+    }
+    if (interactionKind === 'plan') {
+      return (event.kind === 'plan_card' || event.kind === 'plan_review') &&
+        planInteractionAwaitsDecision(payload);
+    }
+    if (interactionKind === 'permission') return event.kind === 'permission_request';
+    return event.kind === 'review_summary' &&
+      stringField(payload, 'status') === 'waitingUserReview';
+  });
+  if (!openingEvent || !isRecordPayload(openingEvent.payload)) return undefined;
+  const openingPayload = openingEvent.payload;
+  const runId = stringField(openingPayload, 'runId');
+  const targetId = interactionKind === 'requirement'
+    ? stringField(openingPayload, 'requirementId')
+    : interactionKind === 'plan'
+      ? stringField(openingPayload, 'planId')
+      : interactionKind === 'permission'
+        ? stringField(openingPayload, 'id') ??
+          stringField(openingPayload, 'requestId') ??
+          stringField(openingPayload, 'permissionId')
+        : stringField(openingPayload, 'reviewId');
+  if (!targetId) return undefined;
+  const settlement = [...events].reverse().find((event) => {
+    if (event.id === openingEvent.id || !isRecordPayload(event.payload)) return false;
+    return decisionStatusResolved(stringField(event.payload, 'status')) ||
+      event.kind === 'permission_result';
+  });
+  const settlementPayload = settlement && isRecordPayload(settlement.payload)
+    ? settlement.payload
+    : undefined;
+  const state = interactionStateFromSettlement(settlementPayload);
+  const decision = settlementPayload
+    ? stringField(settlementPayload, 'decision') ??
+      stringField(settlementPayload, 'status')
+    : undefined;
+  const freeText = settlementPayload
+    ? Boolean(
+        firstPayloadText(settlementPayload, ['guidance', 'userGuidance']) ||
+        (!stringField(settlementPayload, 'contentKey') &&
+          firstPayloadText(settlementPayload, ['content']))
+      )
+    : false;
+  return {
+    kind: interactionKind,
+    interactionId: `interaction:${interactionKind}:${runId ?? 'session'}:${targetId}`,
+    interactionRevision: openingEvent.id,
+    targetId,
+    runId,
+    state,
+    selectedDecision: decision
+      ? {
+          decision,
+          source: freeText ? 'freeText' : 'button',
+          decidedAt: settlement?.ts,
+        }
+      : undefined,
+  };
+}
+
+function interactionStateFromSettlement(
+  payload: Record<string, unknown> | undefined
+): NonNullable<AgentTimelineBlock['interaction']>['state'] {
+  if (!payload) return 'open';
+  const status = stringField(payload, 'status');
+  if (status === 'accepted' || status === 'completed') return 'accepted';
+  if (status === 'rejected' || status === 'cancelled') return 'rejected';
+  if (status === 'needsRevision') return 'needsRevision';
+  return 'accepted';
+}
+
+function timelineEntryRole(
+  kind: AgentTimelineNarrativeKind
+): NonNullable<AgentTimelineBlock['entryRole']> {
+  switch (kind) {
+    case 'user': return 'userMessage';
+    case 'assistantNarration': return 'agentUpdate';
+    case 'operationEvidence': return 'activityGroup';
+    case 'verification': return 'evidence';
+    case 'requirement':
+    case 'plan':
+    case 'permission':
+    case 'review':
+      return 'interaction';
+    case 'assistantText': return 'finalAnswer';
+    case 'diagnostic':
+    case 'thinking':
+      return 'diagnostic';
+  }
+}
+
+function localizedTimelineContent(
+  events: AgentEvent[],
+  kind: AgentTimelineNarrativeKind
+): AgentTimelineBlock['localizedContent'] {
+  if (kind !== 'user') return undefined;
+  const event = events.find((candidate) => candidate.kind === 'user_msg');
+  if (!event || !isRecordPayload(event.payload)) return undefined;
+  const text = firstPayloadText(event.payload, ['content', 'message', 'text']);
+  const messageKey = stringField(event.payload, 'contentKey') ??
+    stringField(event.payload, 'messageKey');
+  const messageArgs = recordStringValues(event.payload.contentArgs) ??
+    recordStringValues(event.payload.messageArgs);
+  return text || messageKey
+    ? { text, messageKey, messageArgs }
+    : undefined;
+}
+
+function narrativeProvenance(
+  events: AgentEvent[],
+  entryRole: NonNullable<AgentTimelineBlock['entryRole']>,
+  evidenceRefs: string[]
+): NonNullable<AgentTimelineBlock['provenance']> {
+  const sources = events.flatMap((event) => {
+    const payload = isRecordPayload(event.payload) ? event.payload : {};
+    return [stringField(payload, 'source')];
+  }).filter((value): value is string => Boolean(value));
+  const origin = entryRole === 'userMessage'
+    ? 'user'
+    : sources.includes('kernel') || entryRole === 'evidence'
+      ? 'kernel'
+      : sources.includes('provider') || sources.includes('llm') ||
+          entryRole === 'finalAnswer' || entryRole === 'agentUpdate'
+        ? 'provider'
+        : 'session';
+  const authority = entryRole === 'userMessage'
+    ? 'user'
+    : origin === 'kernel'
+      ? 'kernel'
+      : 'session';
+  const factRefs = events
+    .filter((event) => !event.id.startsWith('live:'))
+    .map(eventRefForAgentEvent);
+  return {
+    origin,
+    authority,
+    sourceEventRefs: [],
+    factRefs,
+    evidenceRefs,
   };
 }
 
@@ -1696,7 +3949,15 @@ function narrativeStructuredProjection(
               status: stringField(item, 'status'),
               targetRefs: stringArrayField(item, 'targetRefs'),
               auditRefs: stringArrayField(item, 'auditRefs'),
-              metadata: isRecordPayload(item.metadata) ? item.metadata : undefined,
+              objective: isRecordPayload(item.metadata)
+                ? stringField(item.metadata, 'objective')
+                : undefined,
+              acceptanceCriteria: isRecordPayload(item.metadata)
+                ? stringArrayField(item.metadata, 'acceptance')
+                : undefined,
+              failureConditions: isRecordPayload(item.metadata)
+                ? stringArrayField(item.metadata, 'failure')
+                : undefined,
             }];
           }),
         }];
@@ -1706,15 +3967,18 @@ function narrativeStructuredProjection(
   return undefined;
 }
 
-function finalizeNarrativeTurn(turn: AgentTimelineResult['turns'][number]): AgentTimelineResult['turns'][number] {
+function finalizeNarrativeTurn(turn: WorkingAgentTimelineTurn): WorkingAgentTimelineTurn {
   const hasFailure = turn.blocks.some((block) => block.status === 'failed');
-  const hasWaiting = turn.blocks.some((block) => block.status === 'waiting' || block.status === 'blocked');
+  const hasBlocked = turn.blocks.some((block) => block.status === 'blocked');
+  const hasWaiting = turn.blocks.some((block) => block.status === 'waiting');
   const hasRunning = turn.blocks.some((block) => block.status === 'running');
   const hasAssistant = turn.blocks.some((block) => block.narrativeKind === 'assistantText');
   const status: AgentTimelineStatus = hasFailure
     ? 'failed'
-    : hasWaiting
+    : hasBlocked
       ? 'blocked'
+      : hasWaiting
+        ? 'waiting'
       : hasRunning && !hasAssistant
         ? 'running'
         : 'completed';
@@ -1728,9 +3992,17 @@ function finalizeNarrativeTurn(turn: AgentTimelineResult['turns'][number]): Agen
 }
 
 function applyTurnAuthorityStates(
-  turns: AgentTimelineResult['turns'],
-  events: AgentEvent[]
+  turns: WorkingAgentTimelineTurn[],
+  events: AgentEvent[],
+  exactTargetTurnIds: readonly (string | undefined)[]
 ): void {
+  const latestExactRunStateByTurnId = new Map<string, AgentEvent>();
+  events.forEach((event, index) => {
+    const turnId = exactTargetTurnIds[index];
+    if (turnId && event.kind === 'session_run_state') {
+      latestExactRunStateByTurnId.set(turnId, event);
+    }
+  });
   const authorities = events.flatMap((event, index) => {
     if (event.kind !== 'session_turn_authority' || !isRecordPayload(event.payload)) return [];
     const runId = stringField(event.payload, 'runId');
@@ -1743,6 +4015,11 @@ function applyTurnAuthorityStates(
   for (let turnIndex = 0; turnIndex < turns.length; turnIndex += 1) {
     const turn = turns[turnIndex];
     if (turn.status !== 'completed') continue;
+    const exactRunState = latestExactRunStateByTurnId.get(turn.id);
+    if (exactRunState) {
+      applyProjectedRunState(turns, turnIndex, exactRunState, events);
+      continue;
+    }
     const sourceMessageIds = new Set(turn.blocks.flatMap((block) => block.events.flatMap((event) => {
       if (event.kind !== 'user_msg') return [];
       const payload = isRecordPayload(event.payload) ? event.payload : {};
@@ -1753,53 +4030,428 @@ function applyTurnAuthorityStates(
       [...sourceMessageIds].some((messageId) => candidate.sourceMessageIds.has(messageId))
     );
     if (!authority) continue;
-    const hasFinalAssistant = turn.blocks.some((block) => block.narrativeKind === 'assistantText');
-    const latestRunState = [...events.slice(authority.index)].reverse().find((event) => {
-      if (event.kind !== 'session_run_state' || !isRecordPayload(event.payload)) return false;
-      return stringField(event.payload, 'runId') === authority.runId;
-    });
-    const runStatus = latestRunState ? narrativeEventStatus(latestRunState) : undefined;
-    if (runStatus === 'failed') {
-      turns[turnIndex] = {
-        ...turn,
-        status: 'failed',
-        completedAt: latestRunState?.ts ?? turn.completedAt,
-      };
-      continue;
+    let latestRunState: AgentEvent | undefined;
+    for (let eventIndex = events.length - 1; eventIndex >= authority.index; eventIndex -= 1) {
+      const candidate = events[eventIndex];
+      if (
+        exactTargetTurnIds[eventIndex] !== undefined
+        || candidate?.kind !== 'session_run_state'
+        || !isRecordPayload(candidate.payload)
+        || stringField(candidate.payload, 'runId') !== authority.runId
+      ) {
+        continue;
+      }
+      latestRunState = candidate;
+      break;
     }
-    if (runStatus === 'completed' || runStatus === 'cancelled') continue;
-    if (runStatus === 'waiting' && latestRunState && !runStateInteractionResolved(latestRunState, events)) {
-      turns[turnIndex] = {
-        ...turn,
-        status: 'blocked',
-        completedAt: undefined,
-      };
-      continue;
-    }
-    if (!runStatus && hasFinalAssistant) continue;
-    turns[turnIndex] = {
-      ...turn,
-      status: 'running',
-      completedAt: undefined,
-    };
+    applyProjectedRunState(turns, turnIndex, latestRunState, events);
   }
 }
 
-function stabilizeNarrativeBlockIds(turns: AgentTimelineResult['turns']): void {
+type ProjectedTurnSettlement =
+  NonNullable<AgentTimelineResult['turns'][number]['settlement']>;
+type ProjectedTurnExecutionEvidence =
+  NonNullable<AgentTimelineResult['turns'][number]['executionEvidence']>;
+type ProjectedTurnTaskClaim =
+  ProjectedTurnExecutionEvidence['taskClaims'][number];
+
+interface ProjectionFinalKernelEffectClaim {
+  readonly taskId: string;
+  readonly operationIds: string[];
+  readonly workUnitIds: string[];
+}
+
+function applyTurnSettlementAndExecutionEvidence(
+  turns: WorkingAgentTimelineTurn[],
+  events: readonly AgentEvent[],
+  exactTargetTurnIds: readonly (string | undefined)[],
+  authorityIndex: ProjectionTurnAuthorityIndex
+): void {
+  const settlementByTurnId = new Map<string, {
+    event: AgentEvent;
+    turnAuthorityRef: string;
+  }>();
+  const finalFactByTurnId = new Map<string, {
+    event: AgentEvent;
+    eventIndex: number;
+    turnAuthorityRef: string;
+  }>();
+
+  events.forEach((event, eventIndex) => {
+    const turnId = exactTargetTurnIds[eventIndex];
+    if (!turnId) return;
+    const payload = isRecordPayload(event.payload) ? event.payload : undefined;
+    const lineage = parseSessionFactLineage(payload?.lineage);
+    if (!lineage) {
+      throw new Error(
+        `session_shared_projection_invalid: fact_lineage_contract:${event.id}`
+      );
+    }
+    if (isTerminalSessionRunState(event)) {
+      settlementByTurnId.set(turnId, {
+        event,
+        turnAuthorityRef: lineage.turnAuthorityRef,
+      });
+    }
+    if (
+      event.kind === 'assistant_msg'
+      && stringField(payload ?? {}, 'channel') === 'final'
+    ) {
+      finalFactByTurnId.set(turnId, {
+        event,
+        eventIndex,
+        turnAuthorityRef: lineage.turnAuthorityRef,
+      });
+    }
+  });
+
+  for (const turn of turns) {
+    const settlement = settlementByTurnId.get(turn.id);
+    if (settlement) {
+      const status = projectedTurnSettlementStatus(settlement.event);
+      if (!status) {
+        throw new Error(
+          `session_shared_projection_invalid: turn_settlement_status:${settlement.event.id}`
+        );
+      }
+      turn.settlement = {
+        schemaVersion: 'deepcode.session.turn-settlement.v1',
+        status,
+        factRef: eventRefForAgentEvent(settlement.event),
+        turnAuthorityRef: settlement.turnAuthorityRef,
+      };
+    }
+
+    const finalFact = finalFactByTurnId.get(turn.id);
+    if (!finalFact) continue;
+    const evidence = projectedTurnExecutionEvidence(
+      events,
+      finalFact.eventIndex,
+      finalFact.event,
+      finalFact.turnAuthorityRef,
+      authorityIndex
+    );
+    if (evidence) turn.executionEvidence = evidence;
+  }
+}
+
+function projectedTurnSettlementStatus(
+  event: AgentEvent
+): ProjectedTurnSettlement['status'] | undefined {
+  const status = narrativeEventStatus(event);
+  return status === 'waiting'
+    || status === 'completed'
+    || status === 'failed'
+    || status === 'cancelled'
+    ? status
+    : undefined;
+}
+
+function projectedTurnExecutionEvidence(
+  events: readonly AgentEvent[],
+  eventIndex: number,
+  event: AgentEvent,
+  turnAuthorityRef: string,
+  authorityIndex: ProjectionTurnAuthorityIndex
+): ProjectedTurnExecutionEvidence | undefined {
+  const payload = isRecordPayload(event.payload) ? event.payload : undefined;
+  const lineage = parseSessionFactLineage(payload?.lineage);
+  if (!payload || !lineage || lineage.turnAuthorityRef !== turnAuthorityRef) {
+    throw new Error(
+      `session_shared_projection_invalid: execution_evidence_lineage:${event.id}`
+    );
+  }
+  if (payload.requiresKernelFacts === undefined) return undefined;
+  if (typeof payload.requiresKernelFacts !== 'boolean') {
+    throw new Error(
+      `session_shared_projection_invalid: execution_evidence_requirement:${event.id}`
+    );
+  }
+
+  const claims = projectionFinalKernelEffectClaims(
+    payload.kernelEffectClaims,
+    event.id
+  );
+  if (payload.requiresKernelFacts === false) {
+    if (claims.length > 0 || lineage.kernelFactRefs.length > 0) {
+      throw new Error(
+        `session_shared_projection_invalid: execution_evidence_unclaimed:${event.id}`
+      );
+    }
+    return {
+      kind: 'notRequired',
+      sourceFactRef: eventRefForAgentEvent(event),
+      taskClaims: [],
+    };
+  }
+
+  const authority = authorityIndex.byEventId.get(turnAuthorityRef);
+  if (!authority) {
+    throw new Error(
+      `session_shared_projection_invalid: execution_evidence_authority:${event.id}:${turnAuthorityRef}`
+    );
+  }
+  if (
+    claims.length === 0
+    || claims.some((claim) => claim.workUnitIds.length === 0)
+    || lineage.kernelFactRefs.length === 0
+  ) {
+    throw new Error(
+      `session_shared_projection_invalid: execution_evidence_incomplete:${event.id}`
+    );
+  }
+  const payloadRunId = stringField(payload, 'runId');
+  if (payloadRunId !== undefined && payloadRunId !== authority.runId) {
+    throw new Error(
+      `session_shared_projection_invalid: execution_evidence_run:${event.id}`
+    );
+  }
+
+  const refsByTaskId = new Map<string, SessionKernelFactRefV1[]>(
+    claims.map((claim) => [claim.taskId, []])
+  );
+  const seenKernelEventRefs = new Set<string>();
+  for (const ref of lineage.kernelFactRefs) {
+    if (
+      seenKernelEventRefs.has(ref.kernelEventRef)
+      || ref.runId !== authority.runId
+      || !projectionTerminalOrEffectKernelFactKind(ref.kind)
+    ) {
+      throw new Error(
+        `session_shared_projection_invalid: execution_evidence_kernel_ref:${event.id}:${ref.kernelEventRef}`
+      );
+    }
+    seenKernelEventRefs.add(ref.kernelEventRef);
+
+    const sourceIndexes = events.flatMap((candidate, candidateIndex) =>
+      candidate.id === ref.kernelEventRef ? [candidateIndex] : []
+    );
+    if (
+      sourceIndexes.length !== 1
+      || sourceIndexes[0]! >= eventIndex
+    ) {
+      throw new Error(
+        `session_shared_projection_invalid: execution_evidence_kernel_source:${event.id}:${ref.kernelEventRef}`
+      );
+    }
+    let authoritativeRef: SessionKernelFactRefV1;
+    try {
+      authoritativeRef = kernelFactRefFromEvent({
+        event: events[sourceIndexes[0]!]!,
+        boundRunId: ref.runId,
+      });
+    } catch {
+      throw new Error(
+        `session_shared_projection_invalid: execution_evidence_kernel_source:${event.id}:${ref.kernelEventRef}`
+      );
+    }
+    if (
+      authoritativeRef.kind !== ref.kind
+      || authoritativeRef.runId !== ref.runId
+      || !projectionKernelFactRefFieldsMatch(ref, authoritativeRef)
+    ) {
+      throw new Error(
+        `session_shared_projection_invalid: execution_evidence_kernel_identity:${event.id}:${ref.kernelEventRef}`
+      );
+    }
+
+    const matchingClaims = claims.filter((claim) => (
+      (ref.workUnitId !== undefined && claim.workUnitIds.includes(ref.workUnitId))
+      || (ref.operationId !== undefined && claim.operationIds.includes(ref.operationId))
+    ));
+    if (matchingClaims.length !== 1) {
+      throw new Error(
+        `session_shared_projection_invalid: execution_evidence_kernel_claim:${event.id}:${ref.kernelEventRef}`
+      );
+    }
+    refsByTaskId.get(matchingClaims[0]!.taskId)!.push(ref);
+  }
+
+  const taskClaims: ProjectedTurnTaskClaim[] = claims
+    .map((claim) => {
+      const refs = refsByTaskId.get(claim.taskId) ?? [];
+      const missingWorkUnit = claim.workUnitIds.find((workUnitId) =>
+        !refs.some((ref) => ref.workUnitId === workUnitId)
+      );
+      const missingOperation = claim.operationIds.find((operationId) =>
+        !refs.some((ref) => ref.operationId === operationId)
+      );
+      if (refs.length === 0 || missingWorkUnit || missingOperation) {
+        throw new Error(
+          `session_shared_projection_invalid: execution_evidence_claim_incomplete:${event.id}:${claim.taskId}`
+        );
+      }
+      return {
+        taskId: claim.taskId,
+        workUnitIds: [...claim.workUnitIds].sort(),
+        factRefs: refs
+          .map((ref) => `event:${ref.kernelEventRef}`)
+          .sort(),
+      };
+    })
+    .sort((left, right) => left.taskId < right.taskId ? -1 : left.taskId > right.taskId ? 1 : 0);
+
+  return {
+    kind: 'kernelFactBacked',
+    sourceFactRef: eventRefForAgentEvent(event),
+    taskClaims,
+  };
+}
+
+function projectionFinalKernelEffectClaims(
+  value: unknown,
+  eventId: string
+): ProjectionFinalKernelEffectClaim[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) {
+    throw new Error(
+      `session_shared_projection_invalid: execution_evidence_claims:${eventId}`
+    );
+  }
+  const taskIds = new Set<string>();
+  const operationIds = new Set<string>();
+  const workUnitIds = new Set<string>();
+  return value.map((item) => {
+    if (!isRecordPayload(item)) {
+      throw new Error(
+        `session_shared_projection_invalid: execution_evidence_claims:${eventId}`
+      );
+    }
+    const taskId = projectionIdentity(item.taskId);
+    const claimOperationIds = projectionIdentityArray(item.operationIds);
+    const claimWorkUnitIds = projectionIdentityArray(item.workUnitIds);
+    if (
+      !taskId
+      || !claimOperationIds
+      || !claimWorkUnitIds
+      || (claimOperationIds.length === 0 && claimWorkUnitIds.length === 0)
+      || taskIds.has(taskId)
+      || claimOperationIds.some((operationId) => operationIds.has(operationId))
+      || claimWorkUnitIds.some((workUnitId) => workUnitIds.has(workUnitId))
+    ) {
+      throw new Error(
+        `session_shared_projection_invalid: execution_evidence_claims:${eventId}`
+      );
+    }
+    taskIds.add(taskId);
+    claimOperationIds.forEach((operationId) => operationIds.add(operationId));
+    claimWorkUnitIds.forEach((workUnitId) => workUnitIds.add(workUnitId));
+    return {
+      taskId,
+      operationIds: claimOperationIds,
+      workUnitIds: claimWorkUnitIds,
+    };
+  });
+}
+
+function projectionIdentity(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() === value && value.length > 0
+    ? value
+    : undefined;
+}
+
+function projectionIdentityArray(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const identities = value.map(projectionIdentity);
+  if (identities.some((identity) => identity === undefined)) return undefined;
+  const normalized = identities as string[];
+  return new Set(normalized).size === normalized.length
+    ? normalized
+    : undefined;
+}
+
+function projectionTerminalOrEffectKernelFactKind(
+  kind: SessionKernelFactRefV1['kind']
+): boolean {
+  return kind === 'tool.effect_observed'
+    || kind === 'tool.completed'
+    || kind === 'work_unit.completed'
+    || kind === 'review.facts_produced'
+    || kind === 'review_gate.evaluated'
+    || kind === 'run.completed'
+    || kind === 'resource.cleanup_state_changed';
+}
+
+function projectionKernelFactRefFieldsMatch(
+  ref: SessionKernelFactRefV1,
+  authoritative: SessionKernelFactRefV1
+): boolean {
+  return ([
+    'factId',
+    'planActionId',
+    'capabilityGrantId',
+    'authorizationContractId',
+    'operationId',
+    'workUnitId',
+  ] as const).every((field) =>
+    ref[field] === undefined || ref[field] === authoritative[field]
+  );
+}
+
+function applyProjectedRunState(
+  turns: WorkingAgentTimelineTurn[],
+  turnIndex: number,
+  latestRunState: AgentEvent | undefined,
+  events: AgentEvent[]
+): void {
+  const turn = turns[turnIndex]!;
+  const runStatus = latestRunState ? narrativeEventStatus(latestRunState) : undefined;
+  if (runStatus === 'failed') {
+    turns[turnIndex] = {
+      ...turn,
+      status: 'failed',
+      completedAt: latestRunState?.ts ?? turn.completedAt,
+    };
+    return;
+  }
+  if (runStatus === 'cancelled') {
+    turns[turnIndex] = {
+      ...turn,
+      status: 'cancelled',
+      completedAt: latestRunState?.ts ?? turn.completedAt,
+    };
+    return;
+  }
+  if (runStatus === 'completed') return;
+  if (
+    runStatus === 'waiting'
+    && latestRunState
+    && !runStateInteractionResolved(latestRunState, events)
+  ) {
+    turns[turnIndex] = {
+      ...turn,
+      status: 'waiting',
+      completedAt: undefined,
+    };
+    return;
+  }
+  const hasFinalAssistant = turn.blocks.some((block) =>
+    block.narrativeKind === 'assistantText'
+  );
+  if (!runStatus && hasFinalAssistant) return;
+  turns[turnIndex] = {
+    ...turn,
+    status: 'running',
+    completedAt: undefined,
+  };
+}
+
+function stabilizeNarrativeBlockIds(turns: WorkingAgentTimelineTurn[]): void {
   for (const turn of turns) {
     const occurrences = new Map<string, number>();
     for (const block of turn.blocks) {
       const narrativeKind = block.narrativeKind ?? narrativeKindForLegacyKind(block.kind);
-      const base = semanticNarrativeBlockIdentity(block) ?? `flow:${turn.id}:${narrativeKind}`;
+      const semanticIdentity = semanticNarrativeBlockIdentity(block);
+      const base = semanticIdentity ?? `flow:${turn.id}:${narrativeKind}`;
       const occurrence = (occurrences.get(base) ?? 0) + 1;
       occurrences.set(base, occurrence);
-      block.id = `${base}:${occurrence}`;
+      block.id = semanticIdentity ? base : `${base}:${occurrence}`;
       if (block.taskProjectionRef) block.taskProjectionRef = `task:${block.id}`;
     }
   }
 }
 
-function semanticNarrativeBlockIdentity(block: AgentTimelineBlock): string | undefined {
+function semanticNarrativeBlockIdentity(block: WorkingAgentTimelineBlock): string | undefined {
   if (block.narrativeKind === 'user') {
     const projectedUserEvent = block.events.find((event) => event.kind === 'user_msg');
     const payload = projectedUserEvent && isRecordPayload(projectedUserEvent.payload)
@@ -1828,19 +4480,29 @@ function semanticNarrativeBlockIdentity(block: AgentTimelineBlock): string | und
       if (requirementId) return `timeline:requirement:${runId}:${requirementId}`;
     }
     if (event.kind === 'permission_request' || event.kind === 'permission_result') {
-      const permissionId = stringField(payload, 'permissionId') ?? stringField(payload, 'requestId');
+      const permissionId = stringField(payload, 'permissionId') ??
+        stringField(payload, 'requestId') ??
+        stringField(payload, 'id');
       if (permissionId) return `timeline:permission:${runId}:${permissionId}`;
     }
     if (event.kind === 'assistant_msg') {
       const proposalId = stringField(payload, 'proposalId');
       const channel = stringField(payload, 'channel');
+      if (
+        block.entryRole === 'finalAnswer' &&
+        channel === 'final' &&
+        event.id &&
+        !event.id.startsWith('live:')
+      ) {
+        return `timeline:final:${event.id}`;
+      }
       if (proposalId && channel) return `timeline:proposal:${proposalId}:${channel}`;
     }
   }
   return undefined;
 }
 
-function timelineBlockIdsByEventId(turns: AgentTimelineResult['turns']): Map<string, string> {
+function timelineBlockIdsByEventId(turns: WorkingAgentTimelineTurn[]): Map<string, string> {
   const result = new Map<string, string>();
   for (const turn of turns) {
     for (const block of turn.blocks) {
@@ -1981,7 +4643,7 @@ function kernelEventTimelineStatus(payload: Record<string, unknown>): AgentTimel
 }
 
 function resolveTimelineInteractionBlocks(
-  turns: AgentTimelineResult['turns'],
+  turns: WorkingAgentTimelineTurn[],
   events: AgentEvent[]
 ): void {
   for (let turnIndex = 0; turnIndex < turns.length; turnIndex += 1) {
@@ -2145,27 +4807,106 @@ function runStatusResolved(status?: string): boolean {
     status === 'failed';
 }
 
-function narrativeTitle(events: AgentEvent[], kind: AgentTimelineNarrativeKind): string {
+function narrativeTitle(
+  events: AgentEvent[],
+  kind: AgentTimelineNarrativeKind,
+  binding: ProjectionLanguageBinding
+): string {
   const first = events[0];
-  if (kind === 'user') return 'User';
-  if (first.kind === 'user_guidance') return 'User guidance';
+  const language = binding.language;
+  if (kind === 'user') {
+    return localizedProjectionText(language, {
+      zh: '用户',
+      en: 'User',
+      neutral: 'User',
+    });
+  }
+  if (first.kind === 'user_guidance') {
+    return localizedProjectionText(language, {
+      zh: '用户补充',
+      en: 'User guidance',
+      neutral: 'User guidance',
+    });
+  }
   if (kind === 'assistantText') return 'DeepCode';
   if (kind === 'assistantNarration') return 'DeepCode';
-  if (kind === 'thinking') return 'Thinking';
-  if (kind === 'operationEvidence') return firstNonEmpty(events, ['summary', 'toolName', 'name', 'stage']) ?? 'Operation evidence';
-  if (kind === 'requirement') return firstNonEmpty(events, ['title', 'summary']) ?? 'Requirement';
-  if (kind === 'plan') return firstNonEmpty(events, ['title', 'summary']) ?? 'Plan';
-  if (kind === 'permission') return firstNonEmpty(events, ['summary', 'toolName']) ?? 'Permission';
-  if (kind === 'verification') return firstNonEmpty(events, ['summary']) ?? 'Verification';
-  if (kind === 'review') return firstNonEmpty(events, ['title']) ?? 'Review';
-  return firstNonEmpty([first], ['summary', 'message', 'details']) ?? 'Diagnostic';
+  if (kind === 'thinking') {
+    return localizedProjectionText(language, {
+      zh: '分析',
+      en: 'Analysis',
+      neutral: 'Analysis',
+    });
+  }
+  if (kind === 'operationEvidence') {
+    return firstNonEmpty(events, ['summary', 'toolName', 'name', 'stage'])
+      ?? localizedProjectionText(language, {
+        zh: '操作证据',
+        en: 'Operation evidence',
+        neutral: 'Operation evidence',
+      });
+  }
+  if (kind === 'requirement') {
+    return firstNonEmpty(events, ['title', 'summary'])
+      ?? localizedProjectionText(language, {
+        zh: '需求',
+        en: 'Requirement',
+        neutral: 'Requirement',
+      });
+  }
+  if (kind === 'plan') {
+    return firstNonEmpty(events, ['title', 'summary'])
+      ?? localizedProjectionText(language, {
+        zh: '计划',
+        en: 'Plan',
+        neutral: 'Plan',
+      });
+  }
+  if (kind === 'permission') {
+    return firstNonEmpty(events, ['summary', 'toolName'])
+      ?? localizedProjectionText(language, {
+        zh: '权限',
+        en: 'Permission',
+        neutral: 'Permission',
+      });
+  }
+  if (kind === 'verification') {
+    return firstNonEmpty(events, ['summary'])
+      ?? localizedProjectionText(language, {
+        zh: '验证',
+        en: 'Verification',
+        neutral: 'Verification',
+      });
+  }
+  if (kind === 'review') {
+    return firstNonEmpty(events, ['title'])
+      ?? localizedProjectionText(language, {
+        zh: '复核',
+        en: 'Review',
+        neutral: 'Review',
+      });
+  }
+  return firstNonEmpty([first], ['summary', 'message', 'details'])
+    ?? localizedProjectionText(language, {
+      zh: '诊断',
+      en: 'Diagnostic',
+      neutral: 'Diagnostic',
+    });
 }
 
-function summarizeAgentEvents(events: AgentEvent[]): string {
+function summarizeAgentEvents(
+  events: AgentEvent[],
+  binding: ProjectionLanguageBinding
+): string {
   const summaries = events
     .map((event) => firstNonEmpty([event], ['summary', 'message', 'content', 'details', 'toolName', 'name', 'stage']))
     .filter((value): value is string => Boolean(value));
-  if (summaries.length === 0) return `${events.length} event${events.length === 1 ? '' : 's'}`;
+  if (summaries.length === 0) {
+    return localizedProjectionText(binding.language, {
+      zh: `${events.length} 个事件`,
+      en: `${events.length} event${events.length === 1 ? '' : 's'}`,
+      neutral: `eventCount=${events.length}`,
+    });
+  }
   if (summaries.length === 1) return trimProjectionText(summaries[0], 180);
   return trimProjectionText(summaries.join(' / '), 220);
 }
@@ -2271,12 +5012,49 @@ function firstNonEmpty(events: AgentEvent[], keys: string[]): string | undefined
 }
 
 function narrativeActivity(events: AgentEvent[]): AgentConversationActivity | undefined {
-  for (const event of [...events].reverse()) {
+  const activities: AgentConversationActivity[] = [];
+  for (const event of events) {
     const payload = isRecordPayload(event.payload) ? event.payload : undefined;
     const activity = payload ? activityFromValue(payload.activity) : undefined;
-    if (activity) return activity;
+    if (activity) activities.push(activity);
   }
-  return undefined;
+  const latest = activities[activities.length - 1];
+  if (!latest) return undefined;
+  const matching = activities.filter((activity) => activity.activityId === latest.activityId);
+  const resourcePacketIds: string[] = [];
+  let resourceItemCount = 0;
+  let hasResourceItemCount = false;
+  for (const activity of matching) {
+    const newPacketIds = (activity.resourcePacketIds ?? [])
+      .filter((packetId) => !resourcePacketIds.includes(packetId));
+    if (newPacketIds.length > 0) {
+      resourcePacketIds.push(...newPacketIds);
+      if (activity.itemCount !== undefined) {
+        resourceItemCount += activity.itemCount;
+        hasResourceItemCount = true;
+      }
+    }
+  }
+  return {
+    ...latest,
+    activityRevision: Math.max(
+      ...matching.map((activity) => activity.activityRevision ?? 0)
+    ) || undefined,
+    runId: latest.runId ?? matching.find((activity) => activity.runId)?.runId,
+    planId: latest.planId ?? matching.find((activity) => activity.planId)?.planId,
+    draftId: latest.draftId ?? matching.find((activity) => activity.draftId)?.draftId,
+    targets: uniqueActivityStrings(matching.flatMap((activity) => activity.targets ?? [])),
+    actionIds: uniqueActivityStrings(matching.flatMap((activity) => activity.actionIds ?? [])),
+    workUnitIds: uniqueActivityStrings(matching.flatMap((activity) => activity.workUnitIds ?? [])),
+    resourcePacketIds,
+    toolName: latest.toolName ?? matching.find((activity) => activity.toolName)?.toolName,
+    operation: latest.operation ?? matching.find((activity) => activity.operation)?.operation,
+    itemCount: hasResourceItemCount ? resourceItemCount : latest.itemCount,
+  };
+}
+
+function uniqueActivityStrings(values: string[]): string[] {
+  return Array.from(new Set(values.filter(Boolean)));
 }
 
 function activityFromValue(value: unknown): AgentConversationActivity | undefined {
@@ -2290,6 +5068,7 @@ function activityFromValue(value: unknown): AgentConversationActivity | undefine
   if (!kind || !status || !title || !summary || !source || !activityId) return undefined;
   return {
     activityId,
+    activityRevision: numberField(value, 'activityRevision'),
     kind: kind as AgentConversationActivity['kind'],
     status,
     title,
@@ -2301,6 +5080,7 @@ function activityFromValue(value: unknown): AgentConversationActivity | undefine
     targets: stringArrayField(value, 'targets'),
     actionIds: stringArrayField(value, 'actionIds'),
     workUnitIds: stringArrayField(value, 'workUnitIds'),
+    resourcePacketIds: stringArrayField(value, 'resourcePacketIds'),
     toolName: stringField(value, 'toolName'),
     operation: stringField(value, 'operation'),
     itemCount: numberField(value, 'itemCount'),
@@ -2316,6 +5096,7 @@ function activityStatus(value: string | undefined): AgentTimelineStatus | undefi
     value === 'waiting' ||
     value === 'blocked' ||
     value === 'completed' ||
+    value === 'cancelled' ||
     value === 'failed'
   ) return value;
   return undefined;
@@ -2351,7 +5132,7 @@ function findFirstAcceptedReviewIndex(events: AgentEvent[]): number {
 }
 
 function annotateBlocksWithPhase(
-  turns: AgentTimelineResult['turns'],
+  turns: WorkingAgentTimelineTurn[],
   events: AgentEvent[],
   acceptedIndex: number
 ): void {
@@ -2369,6 +5150,7 @@ function annotateBlocksWithPhase(
   for (const turn of turns) {
     for (const block of turn.blocks) {
       if (!block.narrativeKind || !phaseTargets.has(block.narrativeKind)) continue;
+      if (block.entryRole === 'finalAnswer' && block.durability === 'committed') continue;
       const firstEventId = block.events[0]?.id;
       if (!firstEventId) continue;
       const idx = idToIndex.get(firstEventId);
@@ -2398,6 +5180,16 @@ function stringArrayField(value: Record<string, unknown>, key: string): string[]
 function numberField(value: Record<string, unknown>, key: string): number | undefined {
   const field = value[key];
   return typeof field === 'number' && Number.isFinite(field) ? field : undefined;
+}
+
+function positiveIntegerField(
+  value: Record<string, unknown>,
+  key: string
+): number | undefined {
+  const field = numberField(value, key);
+  return field !== undefined && Number.isSafeInteger(field) && field > 0
+    ? field
+    : undefined;
 }
 
 function eventEvidenceRefs(event: AgentEvent): string[] {
@@ -2674,8 +5466,8 @@ export function findLatestPendingPermission(events: AgentEvent[]): PendingPermis
       continue;
     }
     if (event.kind === 'permission_request') {
-      const request = event.payload as PermissionRequest;
-      if (!resolved.has(request.id)) return { request };
+      const request = safePermissionRequestView(event.payload);
+      if (request && !resolved.has(request.id)) return { request };
       continue;
     }
     const request = permissionRequestFromKernelWorkflowStage(event);
@@ -2704,7 +5496,9 @@ function permissionResultId(event: AgentEvent): string | undefined {
     : undefined;
 }
 
-function permissionRequestFromKernelWorkflowStage(event: AgentEvent): PermissionRequest | null {
+function permissionRequestFromKernelWorkflowStage(
+  event: AgentEvent
+): AgentTimelinePermissionRequestView | null {
   const payload = event.payload && typeof event.payload === 'object' && !Array.isArray(event.payload)
     ? event.payload as Record<string, unknown>
     : undefined;
@@ -2712,8 +5506,9 @@ function permissionRequestFromKernelWorkflowStage(event: AgentEvent): Permission
   const kernelEvent = decodeKernelEventV1(event);
   if (kernelEvent.kind !== 'permission.requested') return null;
   const request = kernelEvent.request;
-  return {
+  return safePermissionRequestView({
     id: request.id,
+    runId: kernelEvent.runId,
     requestKind: request.requestKind,
     permissionBundleId: request.permissionBundleId,
     contractId: request.contractId,
@@ -2724,11 +5519,47 @@ function permissionRequestFromKernelWorkflowStage(event: AgentEvent): Permission
     riskLevel: request.riskLevel,
     summary: request.summary,
     argumentsPreview: request.argsPreview,
-    ...(kernelEvent.runId ? { runId: kernelEvent.runId } : {}),
-  } as PermissionRequest;
+  });
 }
 
 function kernelEventFromPayload(payload: Record<string, unknown>) {
   if (!isRecordPayload(payload.kernelEvent)) return undefined;
   return decodeKernelEventV1({ payload });
+}
+
+function safePermissionRequestView(value: unknown): AgentTimelinePermissionRequestView | null {
+  if (!isRecordPayload(value)) return null;
+  const id = stringField(value, 'id');
+  const toolName = stringField(value, 'toolName');
+  const riskLevel = stringField(value, 'riskLevel');
+  const summary = stringField(value, 'summary');
+  if (!id || !toolName || !summary || !permissionRiskLevel(riskLevel)) return null;
+  const requestKind = stringField(value, 'requestKind');
+  const argumentsPreview = stringField(value, 'argumentsPreview');
+  return {
+    id,
+    runId: stringField(value, 'runId'),
+    requestKind: requestKind === 'runtimePermission' || requestKind === 'scopeExpansion'
+      ? requestKind
+      : undefined,
+    permissionBundleId: stringField(value, 'permissionBundleId'),
+    contractId: stringField(value, 'contractId'),
+    affectedOperationIds: stringArrayField(value, 'affectedOperationIds'),
+    workUnitIds: stringArrayField(value, 'workUnitIds'),
+    toolId: stringField(value, 'toolId'),
+    toolName,
+    riskLevel,
+    summary,
+    diff: stringField(value, 'diff'),
+    argumentsPreview: argumentsPreview?.slice(0, 2_000),
+  };
+}
+
+function permissionRiskLevel(
+  value: string | undefined
+): value is AgentTimelinePermissionRequestView['riskLevel'] {
+  return value === 'low' ||
+    value === 'medium' ||
+    value === 'high' ||
+    value === 'critical';
 }

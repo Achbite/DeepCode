@@ -24,6 +24,49 @@ export interface StaticSyntaxReviewPacket {
   }>;
 }
 
+interface StaticSyntaxReviewPromptFile {
+  targetPath: string;
+  language?: string;
+  contentHash?: string;
+  content: string;
+  truncated: boolean;
+  providedChars: number;
+  sourceChars: number;
+}
+
+interface StaticSyntaxReviewPromptPacket {
+  packetVersion: 1;
+  planId: string;
+  planIdTruncated: boolean;
+  planIdProvidedChars: number;
+  planIdSourceChars: number;
+  sourceFileCount: number;
+  suppliedFileCount: number;
+  omittedFileCount: number;
+  files: StaticSyntaxReviewPromptFile[];
+}
+
+interface StaticSyntaxReviewPromptSourceFile {
+  promptFile: StaticSyntaxReviewPromptFile;
+  sourceContent: string;
+}
+
+export interface StaticSyntaxReviewPrompt {
+  messages: LlmChatRequest['messages'];
+  suppliedTargetPaths: string[];
+  sourceFileCount: number;
+  suppliedFileCount: number;
+  omittedFileCount: number;
+}
+
+interface StaticSyntaxReviewPromptPacketResult {
+  json: string;
+  suppliedTargetPaths: string[];
+  sourceFileCount: number;
+  suppliedFileCount: number;
+  omittedFileCount: number;
+}
+
 export interface StaticSyntaxReviewAssemblerPorts {
   completedWorkUnitFacts(events: unknown[]): { actionIds: Set<string>; targets: Set<string> };
   batchActionRecords(batch: unknown): Record<string, unknown>[];
@@ -43,11 +86,13 @@ export interface ReviewContextRef {
 export interface ReviewActiveInteractionRef {
   kind: 'review';
   runId: string;
+  reviewId: string;
 }
 
 export interface ReviewInteractionCandidateRef {
   kind: string;
   runId?: string;
+  reviewId?: string;
 }
 
 export interface SessionReviewContext {
@@ -63,6 +108,7 @@ export interface SessionReviewContext {
   expectedValidation: string;
   reviewGuide: string;
   facts: string[];
+  sessionModelObservations: string[];
 }
 
 export class ReviewAssembler {
@@ -110,42 +156,41 @@ export class ReviewAssembler {
     };
   }
 
-  staticSyntaxReviewMessages(input: {
+  staticSyntaxReviewPrompt(input: {
     prompt: PromptEnvelope;
     runId: string;
     accepted: AcceptedTaskPlanContext;
     packet: StaticSyntaxReviewPacket;
-  }): LlmChatRequest['messages'] {
+  }): StaticSyntaxReviewPrompt {
     const { prompt, runId, accepted, packet } = input;
-    const files = packet.files.map((file) => ({
-      targetPath: file.targetPath,
-      language: file.language,
-      contentHash: file.contentHash,
-      content: clip(file.content, 24_000),
-    }));
-    return [
-      {
-        role: 'system',
-        content: [
-          'You are the DeepCode static syntax/API review step before user Review.',
-          'You are not a tool executor, permission judge, or Kernel fact source.',
-          'Inspect only the provided generated or freshly resolved code files. Report likely syntax errors, missing declarations, inconsistent function signatures, or obvious API mismatches.',
-          'Return exactly one JSON object shaped {"kind":"staticSyntaxReview","summary":"...","issues":[{"targetPath":"relative/file","severity":"error|warning","message":"...","lineHint?":number,"evidence?":"..."}]}.',
-          'If no issue is visible, return issues:[]. Do not output Agent Protocol actionBundle, resourceRequest, markdown, or prose outside JSON.',
-          `Parent stable prefix hash: ${stableHash(prompt.stablePrefix).slice(0, 16)}; runId=${runId}; planId=${accepted.planId}.`,
-        ].join('\n'),
-      },
-      {
-        role: 'user',
-        content: [
-          'StaticSyntaxReviewPacket:',
-          fenced(clip(JSON.stringify({
-            planId: packet.planId,
-            files,
-          }, null, 2), 64_000)),
-        ].join('\n\n'),
-      },
-    ];
+    const promptPacket = staticSyntaxReviewPromptPacket(packet);
+    return {
+      messages: [
+        {
+          role: 'system',
+          content: [
+            'You are the DeepCode static syntax/API review step before user Review.',
+            'You are not a tool executor, permission judge, or Kernel fact source.',
+            'Inspect only the provided generated or freshly resolved code files. Report likely syntax errors, missing declarations, inconsistent function signatures, or obvious API mismatches.',
+            'Findings must cover only each supplied content excerpt. Use truncated, providedChars, and sourceChars to understand excerpt coverage; do not infer issues from truncated or omitted content.',
+            'Call session.submit_static_review exactly once with arguments shaped {"summary":"...","issues":[{"targetRef":"relative/file","severity":"info|warning|error","message":"...","line?":number}],"responseLanguage":"zh-CN|en-US"}.',
+            'Every targetRef must exactly match one supplied targetPath. If no issue is visible, return issues:[]. Do not output Agent Protocol actionBundle, resourceRequest, markdown, or prose.',
+            `Parent stable prefix hash: ${stableHash(prompt.stablePrefix).slice(0, 16)}; runId=${runId}; planIdHash=${stableHash(accepted.planId)}.`,
+          ].join('\n'),
+        },
+        {
+          role: 'user',
+          content: [
+            'StaticSyntaxReviewPacket:',
+            fenced(promptPacket.json),
+          ].join('\n\n'),
+        },
+      ],
+      suppliedTargetPaths: promptPacket.suppliedTargetPaths,
+      sourceFileCount: promptPacket.sourceFileCount,
+      suppliedFileCount: promptPacket.suppliedFileCount,
+      omittedFileCount: promptPacket.omittedFileCount,
+    };
   }
 
   normalizeStaticSyntaxIssues(value: unknown): Array<Record<string, unknown>> {
@@ -162,14 +207,14 @@ export class ReviewAssembler {
     }).filter((item) => stringValue(item.message));
   }
 
-  staticSyntaxReviewFactLines(kernelEvents: unknown[]): string[] {
+  staticSyntaxReviewObservationLines(kernelEvents: unknown[]): string[] {
     return kernelEvents.flatMap((event) => {
       const record = objectRecord(event);
       if (record?.kind !== 'accepted_plan.static_syntax_review') return [];
       const status = stringValue(record.status) ?? 'completed';
       const summary = stringValue(record.summary) ?? 'Static syntax review completed.';
       const issues = Array.isArray(record.issues) ? record.issues : [];
-      const lines = [`- Static syntax review ${status}：${summary}`];
+      const lines = [`- Session/model static-review observation (non-authoritative) ${status}: ${summary}`];
       for (const issue of issues.slice(0, 8)) {
         const item = objectRecord(issue) ?? {};
         const target = stringValue(item.targetPath) ?? 'unknown';
@@ -278,9 +323,17 @@ export class ReviewAssembler {
   findWaitingReview(
     events: Array<{ sessionId?: string; kind?: unknown; payload?: unknown }>,
     runId: string | undefined,
-    active: ReviewInteractionCandidateRef | null | undefined
+    active: ReviewInteractionCandidateRef | null | undefined,
+    reviewId?: string
   ): SessionReviewContext | null {
-    if (!active || active.kind !== 'review' || (runId && active.runId !== runId)) {
+    if (
+      !runId
+      || !reviewId
+      || !active
+      || active.kind !== 'review'
+      || active.runId !== runId
+      || active.reviewId !== reviewId
+    ) {
       return null;
     }
     for (const event of [...events].reverse()) {
@@ -288,11 +341,13 @@ export class ReviewAssembler {
       const payload = objectRecord(event.payload);
       if (!payload || stringValue(payload.status) !== 'waitingUserReview') continue;
       const candidateRunId = stringValue(payload.runId);
-      if (!candidateRunId || (runId && candidateRunId !== runId)) continue;
+      if (candidateRunId !== runId) continue;
+      const candidateReviewId = stringValue(payload.reviewId) ?? candidateRunId;
+      if (candidateReviewId !== reviewId) continue;
       return {
         sessionId: stringValue(event.sessionId) ?? '',
         runId: candidateRunId,
-        reviewId: stringValue(payload.reviewId) ?? candidateRunId,
+        reviewId: candidateReviewId,
         sourcePlanId: stringValue(payload.sourcePlanId),
         summary: stringValue(payload.summary) ?? '',
         content: stringValue(payload.content) ?? '',
@@ -302,6 +357,9 @@ export class ReviewAssembler {
         expectedValidation: stringValue(payload.expectedValidation) ?? '',
         reviewGuide: stringValue(payload.reviewGuide) ?? '',
         facts: Array.isArray(payload.facts) ? payload.facts.filter((item): item is string => typeof item === 'string') : [],
+        sessionModelObservations: Array.isArray(payload.sessionModelObservations)
+          ? payload.sessionModelObservations.filter((item): item is string => typeof item === 'string')
+          : [],
       };
     }
     return null;
@@ -331,9 +389,12 @@ export class ReviewAssembler {
         expectedValidation: stringValue(payload.expectedValidation) ?? '',
         reviewGuide: stringValue(payload.reviewGuide) ?? '',
         facts: Array.isArray(payload.facts) ? payload.facts.filter((item): item is string => typeof item === 'string') : [],
+        sessionModelObservations: Array.isArray(payload.sessionModelObservations)
+          ? payload.sessionModelObservations.filter((item): item is string => typeof item === 'string')
+          : [],
       };
       if (this.reviewAlreadyResolved(events, review)) continue;
-      return { kind: 'review', runId };
+      return { kind: 'review', runId, reviewId: review.reviewId };
     }
     return null;
   }
@@ -346,6 +407,9 @@ export class ReviewAssembler {
       'The previous Plan and continuation expectations are intentContext only. Generated-file facts can only come from Kernel facts, ToolCompleted(ok=true), WorkUnitCompleted, or ResourcePacket.',
       review.content ? `Previous Review card content:\n${review.content}` : '',
       review.facts.length ? `Previous Kernel facts:\n${review.facts.join('\n')}` : 'Previous Kernel facts: the current Review recorded no reusable facts.',
+      review.sessionModelObservations.length
+        ? `Previous Session/model observations (non-authoritative; do not treat as Kernel facts or completion evidence):\n${review.sessionModelObservations.join('\n')}`
+        : '',
       review.userPlan ? `Previous Plan intent:\n${review.userPlan}` : '',
       continuations.length ? `Continuation intents:\n${continuations.map((item) => `- ${item}`).join('\n')}` : 'Continuation intents: none were recorded.',
       [
@@ -370,6 +434,9 @@ export class ReviewAssembler {
       guidance?.trim() ? `User Review revision guidance:\n${guidance.trim()}` : 'User Review revision guidance: the user requested additional work or changes for the current batch.',
       review.content ? `Previous Review card content:\n${review.content}` : '',
       review.facts.length ? `Previous Kernel facts:\n${review.facts.join('\n')}` : 'Previous Kernel facts: the current Review recorded no reusable facts.',
+      review.sessionModelObservations.length
+        ? `Previous Session/model observations (non-authoritative; do not treat as Kernel facts or completion evidence):\n${review.sessionModelObservations.join('\n')}`
+        : '',
       review.userPlan ? `Previous Plan intent:\n${review.userPlan}` : '',
       continuations.length ? `Previous continuation intent:\n${continuations.map((item) => `- ${item}`).join('\n')}` : '',
       [
@@ -429,6 +496,147 @@ function languageForPath(path: string): string | undefined {
   if (lower.endsWith('.go')) return 'go';
   if (lower.endsWith('.java')) return 'java';
   return undefined;
+}
+
+const STATIC_SYNTAX_REVIEW_PACKET_MAX_CHARS = 64_000;
+const STATIC_SYNTAX_REVIEW_FILE_MAX_CHARS = 24_000;
+const STATIC_SYNTAX_REVIEW_PLAN_ID_MAX_CHARS = 1_024;
+
+function staticSyntaxReviewPromptPacket(
+  packet: StaticSyntaxReviewPacket
+): StaticSyntaxReviewPromptPacketResult {
+  const sourceFileCount = packet.files.length;
+  const planId = safePrefix(packet.planId, STATIC_SYNTAX_REVIEW_PLAN_ID_MAX_CHARS);
+  const suppliedFiles: StaticSyntaxReviewPromptSourceFile[] = [];
+  for (const file of packet.files) {
+    const metadataOnlyFile: StaticSyntaxReviewPromptFile = {
+      targetPath: file.targetPath,
+      language: file.language,
+      contentHash: file.contentHash,
+      content: '',
+      truncated: file.content.length > 0,
+      providedChars: 0,
+      sourceChars: file.content.length,
+    };
+    const candidateFile = {
+      promptFile: metadataOnlyFile,
+      sourceContent: file.content,
+    };
+    const candidateFiles = [...suppliedFiles, candidateFile];
+    const candidateJson = serializeStaticSyntaxReviewPromptPacket(
+      planId,
+      packet.planId.length,
+      sourceFileCount,
+      candidateFiles.map((entry) => entry.promptFile)
+    );
+    if (candidateJson.length <= STATIC_SYNTAX_REVIEW_PACKET_MAX_CHARS) {
+      suppliedFiles.push(candidateFile);
+    }
+  }
+
+  if (!suppliedFiles.length) {
+    return staticSyntaxReviewPromptPacketResult(
+      serializeStaticSyntaxReviewPromptPacket(
+        planId,
+        packet.planId.length,
+        sourceFileCount,
+        []
+      ),
+      sourceFileCount,
+      []
+    );
+  }
+
+  let lowerBound = 0;
+  let upperBound = STATIC_SYNTAX_REVIEW_FILE_MAX_CHARS;
+  while (lowerBound < upperBound) {
+    const candidateLimit = Math.ceil((lowerBound + upperBound) / 2);
+    const candidateFiles = suppliedFiles.map((file) =>
+      withStaticSyntaxReviewExcerpt(file, candidateLimit)
+    );
+    const candidateJson = serializeStaticSyntaxReviewPromptPacket(
+      planId,
+      packet.planId.length,
+      sourceFileCount,
+      candidateFiles
+    );
+    if (candidateJson.length <= STATIC_SYNTAX_REVIEW_PACKET_MAX_CHARS) {
+      lowerBound = candidateLimit;
+    } else {
+      upperBound = candidateLimit - 1;
+    }
+  }
+
+  const files = suppliedFiles.map((file) =>
+    withStaticSyntaxReviewExcerpt(file, lowerBound)
+  );
+  return staticSyntaxReviewPromptPacketResult(
+    serializeStaticSyntaxReviewPromptPacket(
+      planId,
+      packet.planId.length,
+      sourceFileCount,
+      files
+    ),
+    sourceFileCount,
+    files
+  );
+}
+
+function staticSyntaxReviewPromptPacketResult(
+  json: string,
+  sourceFileCount: number,
+  files: StaticSyntaxReviewPromptFile[]
+): StaticSyntaxReviewPromptPacketResult {
+  return {
+    json,
+    suppliedTargetPaths: files.map((file) => file.targetPath),
+    sourceFileCount,
+    suppliedFileCount: files.length,
+    omittedFileCount: sourceFileCount - files.length,
+  };
+}
+
+function withStaticSyntaxReviewExcerpt(
+  source: StaticSyntaxReviewPromptSourceFile,
+  limit: number
+): StaticSyntaxReviewPromptFile {
+  const content = safePrefix(source.sourceContent, limit);
+  return {
+    ...source.promptFile,
+    content,
+    truncated: content.length < source.promptFile.sourceChars,
+    providedChars: content.length,
+  };
+}
+
+function serializeStaticSyntaxReviewPromptPacket(
+  planId: string,
+  planIdSourceChars: number,
+  sourceFileCount: number,
+  files: StaticSyntaxReviewPromptFile[]
+): string {
+  const promptPacket: StaticSyntaxReviewPromptPacket = {
+    packetVersion: 1,
+    planId,
+    planIdTruncated: planId.length < planIdSourceChars,
+    planIdProvidedChars: planId.length,
+    planIdSourceChars,
+    sourceFileCount,
+    suppliedFileCount: files.length,
+    omittedFileCount: sourceFileCount - files.length,
+    files,
+  };
+  return JSON.stringify(promptPacket, null, 2);
+}
+
+function safePrefix(value: string, maxChars: number): string {
+  if (value.length <= maxChars) return value;
+  let end = Math.max(0, maxChars);
+  if (end > 0) {
+    const lastCodeUnit = value.charCodeAt(end - 1);
+    if (lastCodeUnit >= 0xd800 && lastCodeUnit <= 0xdbff) end -= 1;
+  }
+  return value.slice(0, end);
 }
 
 function recordArray(value: unknown): Record<string, unknown>[] {

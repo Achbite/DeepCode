@@ -78,6 +78,12 @@ export type AcceptedPlanLedgerCommand =
     completedTaskIds: string[];
   }
   | {
+    kind: 'recordUserTaskSettlement';
+    acceptedPlan: AcceptedTaskPlanContext;
+    skippedTaskIds?: string[];
+    acceptedIncompleteTaskIds?: string[];
+  }
+  | {
     kind: 'recoverLatestCheckpoint';
     acceptedPlan: AcceptedTaskPlanContext;
     events: AgentEvent[];
@@ -98,6 +104,12 @@ export type AcceptedPlanLedgerEffect =
   | {
     kind: 'taskCompletionRecorded';
     completedTaskIds: string[];
+    nextAcceptedPlan: AcceptedTaskPlanContext;
+  }
+  | {
+    kind: 'userTaskSettlementRecorded';
+    skippedTaskIds: string[];
+    acceptedIncompleteTaskIds: string[];
     nextAcceptedPlan: AcceptedTaskPlanContext;
   }
   | {
@@ -142,6 +154,17 @@ export class AcceptedPlanTaskLedgerCoordinator {
         kind: 'taskCompletionRecorded',
         completedTaskIds: command.completedTaskIds,
         nextAcceptedPlan: this.afterBatch(command.acceptedPlan, command.completedTaskIds),
+      };
+    }
+    if (command.kind === 'recordUserTaskSettlement') {
+      return {
+        kind: 'userTaskSettlementRecorded',
+        skippedTaskIds: command.skippedTaskIds ?? [],
+        acceptedIncompleteTaskIds: command.acceptedIncompleteTaskIds ?? [],
+        nextAcceptedPlan: new AcceptedTaskRegistry(command.acceptedPlan).withUserSettled({
+          skippedTaskIds: command.skippedTaskIds,
+          acceptedIncompleteTaskIds: command.acceptedIncompleteTaskIds,
+        }) ?? command.acceptedPlan,
       };
     }
     return {
@@ -193,6 +216,21 @@ export class AcceptedPlanTaskLedgerCoordinator {
     return effect;
   }
 
+  recordUserTaskSettlement(input: {
+    acceptedPlan: AcceptedTaskPlanContext;
+    skippedTaskIds?: string[];
+    acceptedIncompleteTaskIds?: string[];
+  }): Extract<AcceptedPlanLedgerEffect, { kind: 'userTaskSettlementRecorded' }> {
+    const effect = this.execute({
+      kind: 'recordUserTaskSettlement',
+      ...input,
+    });
+    if (effect.kind !== 'userTaskSettlementRecorded') {
+      throw new Error(`Unexpected accepted-plan ledger effect: ${effect.kind}`);
+    }
+    return effect;
+  }
+
   recoverLatestCheckpoint(input: {
     acceptedPlan: AcceptedTaskPlanContext;
     events: AgentEvent[];
@@ -235,13 +273,13 @@ export class AcceptedPlanTaskLedgerCoordinator {
   ledger(
     acceptedPlan: AcceptedTaskPlanContext | undefined,
     failedTaskId?: string,
-    skippedTaskIds: string[] = [],
-    acceptedIncompleteTaskIds: string[] = []
+    skippedTaskIds?: string[],
+    acceptedIncompleteTaskIds?: string[]
   ): TaskLedgerSnapshot | undefined {
     return new AcceptedTaskRegistry(acceptedPlan).ledger(
       failedTaskId,
-      skippedTaskIds,
-      acceptedIncompleteTaskIds
+      skippedTaskIds ?? acceptedPlan?.skippedTaskIds ?? [],
+      acceptedIncompleteTaskIds ?? acceptedPlan?.acceptedIncompleteTaskIds ?? []
     );
   }
 
@@ -327,8 +365,24 @@ export class AcceptedPlanTaskLedgerCoordinator {
       if (!payload) continue;
       if (stringValue(payload.stage) !== 'accepted_plan.batch_checkpoint') continue;
       if (stringValue(payload.runId) !== acceptedPlan.runId || stringValue(payload.planId) !== acceptedPlan.planId) continue;
-      const completedTaskIds = stringArrayValue(payload.completedTaskIds);
-      const modelJudgedSufficientTaskIds = stringArrayValue(payload.modelJudgedSufficientTaskIds);
+      const taskLedger = objectRecord(payload.taskLedger);
+      const skippedTaskIds = stringArrayValue(payload.skippedTaskIds).length
+        ? stringArrayValue(payload.skippedTaskIds)
+        : stringArrayValue(taskLedger?.skippedTaskIds);
+      const acceptedIncompleteTaskIds = stringArrayValue(payload.acceptedIncompleteTaskIds).length
+        ? stringArrayValue(payload.acceptedIncompleteTaskIds)
+        : stringArrayValue(taskLedger?.acceptedIncompleteTaskIds);
+      const userSettledTaskIds = new Set([
+        ...skippedTaskIds,
+        ...acceptedIncompleteTaskIds,
+      ]);
+      // Older requirement checkpoints placed user-settled tasks in
+      // completedTaskIds as a cursor shortcut. Recover their explicit
+      // authority category instead of upgrading them to Kernel completion.
+      const completedTaskIds = stringArrayValue(payload.completedTaskIds)
+        .filter((taskId) => !userSettledTaskIds.has(taskId));
+      const modelJudgedSufficientTaskIds = stringArrayValue(payload.modelJudgedSufficientTaskIds)
+        .filter((taskId) => !userSettledTaskIds.has(taskId));
       const dependencyFacts = taskDependencyFactArray(payload.dependencyFacts);
       let nextAccepted = acceptedPlan;
       if (completedTaskIds.length) {
@@ -336,6 +390,12 @@ export class AcceptedPlanTaskLedgerCoordinator {
       }
       for (const taskId of modelJudgedSufficientTaskIds) {
         nextAccepted = this.afterTaskOutcome(nextAccepted, taskId);
+      }
+      if (skippedTaskIds.length || acceptedIncompleteTaskIds.length) {
+        nextAccepted = new AcceptedTaskRegistry(nextAccepted).withUserSettled({
+          skippedTaskIds,
+          acceptedIncompleteTaskIds,
+        }) ?? nextAccepted;
       }
       return nextAccepted;
     }

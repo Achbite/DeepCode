@@ -20,6 +20,7 @@ import type { DriverProviderTurnFrame } from '../runFrame.js';
 import { SessionDriverProviderRuntimeAccessor } from '../runFrame.js';
 import { buildProviderTurnSnapshot } from '../context/providerTurnSnapshot.js';
 import { ProviderProfileRegistry } from '../../provider/ProviderProfileRegistry.js';
+import type { ProjectionLanguageBinding } from '../projection/index.js';
 
 const providerProfiles = new ProviderProfileRegistry();
 
@@ -81,6 +82,7 @@ export interface RequirementConfirmationCoordinatorPorts<
     userRequest: string;
     timestamp: string;
   }): RequirementRecord;
+  presentationBinding(state: State): ProjectionLanguageBinding;
   confirmationEvent(input: {
     sessionId: string;
     runId: string;
@@ -89,6 +91,7 @@ export interface RequirementConfirmationCoordinatorPorts<
     originalUserRequest: string;
     attachments: AgentContextAttachment[];
     executionRootPayload?: Record<string, unknown>;
+    presentationBinding: ProjectionLanguageBinding;
     ts: string;
     id: string;
   }): AgentEvent;
@@ -188,6 +191,7 @@ export class RequirementConfirmationCoordinator<
       originalUserRequest: input.content,
       attachments: input.attachments ?? [],
       executionRootPayload: this.ports.executionRootPayload(state),
+      presentationBinding: this.ports.presentationBinding(state),
       ts: this.ports.now(),
       id: this.ports.createId('requirement-confirmation'),
     });

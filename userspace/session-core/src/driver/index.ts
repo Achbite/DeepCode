@@ -1,4 +1,5 @@
 export * from './entryRouter.js';
+export * from './authority/index.js';
 export * from './runCommand.js';
 export * from './runEffect.js';
 export * from './runEngine.js';

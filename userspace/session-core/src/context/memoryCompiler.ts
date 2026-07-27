@@ -263,17 +263,17 @@ function compileMemoryCandidates(events: AgentEvent[]): MemoryCandidate[] {
     }
 
     if (event.kind === 'requirement_decision' || event.kind === 'plan_review') {
+      if (record.auditOnly === true) continue;
       const status = stringValue(record.status) ?? stringValue(record.decision) ?? 'unknown';
       const guidance = stringValue(record.guidance);
-      const summary = stringValue(record.summary) ?? stringValue(record.content);
       candidates.push({
         lane: 'session',
         scope: 'session',
         kind: 'decision',
         authority: 'userDecision',
-        content: `${event.kind}: ${status}${summary ? ` ${clip(summary, 220)}` : ''}${guidance ? ` guidance=${clip(guidance, 220)}` : ''}`,
+        content: `${event.kind}: ${status}${guidance ? ` guidance=${clip(guidance, 220)}` : ''}`,
         event,
-        compression: compressionFor(`${summary ?? ''}${guidance ?? ''}`, 440),
+        compression: compressionFor(guidance ?? '', 220),
       });
       continue;
     }
@@ -312,7 +312,10 @@ function compileMemoryCandidates(events: AgentEvent[]): MemoryCandidate[] {
     if (event.kind === 'assistant_msg') {
       const channel = stringValue(record.channel) ?? '';
       if (channel && channel !== 'final') continue;
-      const content = stringValue(record.content);
+      const content = record.diagnostic === true
+        ? stringValue(record.memorySummary)
+          ?? `Assistant diagnostic: code=${stringValue(record.diagnosticCode) ?? 'unknown'}`
+        : stringValue(record.content);
       if (!content) continue;
       candidates.push({
         lane: 'session',
@@ -344,7 +347,7 @@ function compileToolResultCandidates(
   candidates: MemoryCandidate[]
 ): void {
   const toolName = stringValue(record.toolName) ?? 'tool';
-  const summary = stringValue(record.summary);
+  const summary = stringValue(record.memorySummary) ?? stringValue(record.summary);
   if (summary) {
     candidates.push({
       lane: 'evidence',
@@ -389,7 +392,7 @@ function compileWorkflowStageCandidates(
 ): void {
   const stage = stringValue(record.stage);
   if (stage === 'accepted_plan.task_savepoint') {
-    const summary = stringValue(record.summary);
+    const summary = stringValue(record.memorySummary) ?? stringValue(record.summary);
     const taskId = stringValue(record.taskId);
     const nodeId = stringValue(record.nodeId);
     const nextReadyNodeIds = Array.isArray(record.nextReadyNodeIds)

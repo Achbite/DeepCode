@@ -24,6 +24,7 @@ const COMMON_SYSTEM_CONTRACT = [
   'Never invent permission fields, work units, audit fields, or executable transport payloads.',
   'Obey the dynamic conversation-language frame attached to the current authoritative user message.',
   'Every Session semantic directive must report the selected zh-CN or en-US value in responseLanguage.',
+  'Do not put private chain-of-thought or scratchpad deliberation into user-visible fields. Answers, plans, decisions, diagnostics, titles, and summaries must be concise, outcome-focused, and may include only a brief evidence-based rationale when it helps the user.',
   'Tool identifiers, schema field names, code identifiers, and protocol literals remain unchanged English tokens.',
   'Tool arguments are directives to Session; Kernel remains the authority for permission, execution, facts, and audit.',
   'ProjectBootstrapSnapshot is navigation metadata only: it identifies the bound root and a bounded first-level inventory, but it never proves file content.',

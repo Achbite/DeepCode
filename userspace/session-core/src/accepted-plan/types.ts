@@ -98,8 +98,27 @@ export interface AcceptedTaskPlanContext {
   batchIndex: number;
   completedTaskIds: string[];
   modelJudgedSufficientTaskIds?: string[];
+  skippedTaskIds?: string[];
+  acceptedIncompleteTaskIds?: string[];
   dependencyFacts: TaskDependencyFactRecord[];
   rawPlan: Record<string, unknown>;
+}
+
+export function acceptedPlanSettledTaskIds(
+  acceptedPlan: Pick<
+    AcceptedTaskPlanContext,
+    | 'completedTaskIds'
+    | 'modelJudgedSufficientTaskIds'
+    | 'skippedTaskIds'
+    | 'acceptedIncompleteTaskIds'
+  >
+): string[] {
+  return [...new Set([
+    ...acceptedPlan.completedTaskIds,
+    ...(acceptedPlan.modelJudgedSufficientTaskIds ?? []),
+    ...(acceptedPlan.skippedTaskIds ?? []),
+    ...(acceptedPlan.acceptedIncompleteTaskIds ?? []),
+  ])];
 }
 
 export interface AcceptedPlanTargetScope {

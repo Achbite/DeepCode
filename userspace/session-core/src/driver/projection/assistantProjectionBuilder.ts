@@ -1,6 +1,9 @@
 import type { AgentEvent } from '@deepcode/protocol';
 import type { ProposalEnvelope } from '../../protocol/types.js';
-import type { UserGuidanceEvent } from '../../context/index.js';
+import {
+  localizedProjectionText,
+  type ProjectionLanguageBinding,
+} from './conversationPresentationLanguage.js';
 
 export type AssistantProjectionLanguage = 'zh-CN' | 'en-US';
 
@@ -12,38 +15,6 @@ export interface AssistantDiagnosticInfo {
 
 export interface AssistantProjectionBuilderPorts {
   guidanceRevisionTransitionMessage(language: AssistantProjectionLanguage): string;
-}
-
-export const VISIBLE_REASONING_MAX_CHARS = 2_400;
-
-export interface VisibleReasoningProjection {
-  content: string;
-  truncated: boolean;
-  fullCharLength: number;
-  visibleCharLength: number;
-}
-
-export function projectVisibleReasoning(
-  content: string,
-  maxChars: number = VISIBLE_REASONING_MAX_CHARS
-): VisibleReasoningProjection {
-  if (!Number.isFinite(maxChars) || maxChars <= 0 || content.length <= maxChars) {
-    return {
-      content,
-      truncated: false,
-      fullCharLength: content.length,
-      visibleCharLength: content.length,
-    };
-  }
-  const suffix = '...';
-  const prefixLength = Math.max(0, maxChars - suffix.length);
-  const visible = `${content.slice(0, prefixLength)}${suffix.slice(0, maxChars)}`;
-  return {
-    content: visible,
-    truncated: true,
-    fullCharLength: content.length,
-    visibleCharLength: visible.length,
-  };
 }
 
 export interface AssistantDecisionEffectAnswerInput {
@@ -79,23 +50,11 @@ export class AssistantProjectionBuilder {
         visibility: 'conversation',
         label: 'DeepCode',
         proposalId: proposal.proposalId,
+        responseLanguage: proposal.responseLanguage,
+        presentationLanguage: proposal.responseLanguage,
         ...metadata,
       },
     };
-  }
-
-  answerNarrationEvent(sessionId: string, proposal: ProposalEnvelope, ts: string, id: string): AgentEvent | null {
-    const content = proposal.narration?.trim();
-    if (!content) return null;
-    return this.progressNarrationEvent(sessionId, proposal, content, ts, id);
-  }
-
-  proposalNarrationEvent(sessionId: string, proposal: ProposalEnvelope, ts: string, id: string): AgentEvent | null {
-    if (proposal.source !== 'llm') return null;
-    if (proposal.kind === 'answer') return null;
-    const content = proposal.narration?.trim();
-    if (!content) return null;
-    return this.progressNarrationEvent(sessionId, proposal, content, ts, id);
   }
 
   guidanceRevisionTransitionEvent(
@@ -115,11 +74,15 @@ export class AssistantProjectionBuilder {
         content: this.ports.guidanceRevisionTransitionMessage(language),
         channel: 'progress',
         source: 'session',
-        visibility: 'conversation',
-        presentation: 'body',
+        visibility: 'hidden',
+        presentation: 'traceOnly',
         label: 'DeepCode',
         runId,
         guidanceIds,
+      },
+      display: {
+        presentation: 'traceOnly',
+        importance: 'debug',
       },
     };
   }
@@ -142,25 +105,33 @@ export class AssistantProjectionBuilder {
 
   guidanceRevisionOverlay(
     originalRequest: string,
-    draftAnswer: ProposalEnvelope,
-    guidance: UserGuidanceEvent[]
+    draftAnswer: ProposalEnvelope
   ): string {
     return [
       'Terminal user guidance revision:',
       'A draft answer was generated but has not been shown to the user because new user guidance arrived before the final response was committed.',
       'Return a JSON ProposalEnvelope with kind="answer" only. Do not return resourceRequest, decisionRequest, actionBundle, or diagnostic.',
-      'Include a short top-level narration sentence that naturally acknowledges the guidance merge before the final answer.',
       `Original user request:\n${this.clip(originalRequest, 1800)}`,
       `Unshown draft answer:\n${this.clip(this.answerContent(draftAnswer), 3200)}`,
-      'Latest user guidance to apply:',
-      ...guidance.map((item) => `- id=${item.id} ${this.clip(item.content, 800)}`),
+      'Apply the separately supplied User guidance checkpoint exactly once.',
     ].join('\n\n');
   }
 
-  finalDiagnosticEvent(sessionId: string, content: string | AssistantDiagnosticInfo, ts: string, id: string): AgentEvent {
+  finalDiagnosticEvent(
+    sessionId: string,
+    content: string | AssistantDiagnosticInfo,
+    ts: string,
+    id: string,
+    presentationBinding: ProjectionLanguageBinding = {
+      language: 'neutral',
+      status: 'unavailable',
+    },
+    metadata: Record<string, unknown> = {}
+  ): AgentEvent {
     const info: AssistantDiagnosticInfo = typeof content === 'string'
       ? { code: 'generic', fallback: content }
       : content;
+    const diagnosticParams = conversationSafeDiagnosticParams(info.params);
     return {
       id,
       sessionId,
@@ -173,17 +144,27 @@ export class AssistantProjectionBuilder {
         label: 'DeepCode',
         diagnostic: true,
         diagnosticCode: info.code,
-        ...(info.params ? { diagnosticParams: info.params } : {}),
+        memorySummary: `Assistant diagnostic: code=${info.code}`,
+        presentationLanguage: presentationBinding.language,
+        languageRevision: presentationBinding.revision,
+        languageStatus: presentationBinding.status,
+        sourceTurnId: presentationBinding.sourceTurnId,
+        ...(diagnosticParams ? { diagnosticParams } : {}),
+        ...metadata,
       },
     };
   }
 
-  thinkingEvent(
+  statusSummaryEvent(
     sessionId: string,
     content: string,
     ts: string,
     id: string,
-    message?: { messageKey: string; messageArgs?: Record<string, string> }
+    message?: { messageKey: string; messageArgs?: Record<string, string> },
+    presentationBinding: ProjectionLanguageBinding = {
+      language: 'neutral',
+      status: 'unavailable',
+    }
   ): AgentEvent {
     return {
       id,
@@ -199,30 +180,16 @@ export class AssistantProjectionBuilder {
         source: 'session',
         visibility: 'conversation',
         presentation: 'stageSummary',
-        label: 'Session status',
+        label: localizedProjectionText(presentationBinding.language, {
+          zh: '会话状态',
+          en: 'Session status',
+          neutral: 'Session status',
+        }),
+        presentationLanguage: presentationBinding.language,
+        languageRevision: presentationBinding.revision,
+        languageStatus: presentationBinding.status,
+        sourceTurnId: presentationBinding.sourceTurnId,
         ...(message ? { messageKey: message.messageKey, messageArgs: message.messageArgs ?? {} } : {}),
-      },
-    };
-  }
-
-  reasoningEvent(sessionId: string, content: string, ts: string, id: string): AgentEvent {
-    const projected = projectVisibleReasoning(content);
-    return {
-      id,
-      sessionId,
-      ts,
-      kind: 'assistant_msg',
-      payload: {
-        content: projected.content,
-        channel: 'reasoning',
-        source: 'provider',
-        visibility: 'conversation',
-        presentation: 'collapsible',
-        reasoningTrace: true,
-        reasoningProjectionTruncated: projected.truncated,
-        reasoningProjectionFullCharLength: projected.fullCharLength,
-        reasoningProjectionVisibleCharLength: projected.visibleCharLength,
-        label: 'Model reasoning',
       },
     };
   }
@@ -244,6 +211,7 @@ export class AssistantProjectionBuilder {
       sessionId: input.sessionId,
       source: 'system',
       kind: 'answer',
+      responseLanguage: input.language,
       payload: {
         answer: {
           version: '1',
@@ -253,30 +221,6 @@ export class AssistantProjectionBuilder {
       },
       referencedResourcePacketRefs: [],
       referencedEvidenceRefs: [],
-    };
-  }
-
-  private progressNarrationEvent(
-    sessionId: string,
-    proposal: ProposalEnvelope,
-    content: string,
-    ts: string,
-    id: string
-  ): AgentEvent {
-    return {
-      id,
-      sessionId,
-      ts,
-      kind: 'assistant_msg',
-      payload: {
-        content,
-        channel: 'progress',
-        source: 'llm',
-        visibility: 'conversation',
-        presentation: 'body',
-        label: 'DeepCode',
-        proposalId: proposal.proposalId,
-      },
     };
   }
 
@@ -315,6 +259,24 @@ export class AssistantProjectionBuilder {
       '后续如需继续，需要重新生成或确认新的 Plan；未提交 Kernel 的任务不会被视为完成事实。',
     ].filter(Boolean).join('\n');
   }
+}
+
+function conversationSafeDiagnosticParams(
+  value: Record<string, string | number> | undefined
+): Record<string, string | number> | undefined {
+  if (!value) return undefined;
+  const sensitiveKeys = new Set([
+    'raw',
+    'message',
+    'error',
+    'errormessage',
+    'detail',
+    'details',
+    'cause',
+    'stack',
+  ]);
+  const entries = Object.entries(value).filter(([key]) => !sensitiveKeys.has(key.toLowerCase()));
+  return entries.length ? Object.fromEntries(entries) : undefined;
 }
 
 function objectRecord(value: unknown): Record<string, unknown> | undefined {

@@ -32,6 +32,8 @@ import {
   takeProviderCommitEvents,
   type ProviderCommitBufferState,
 } from '../pipelines/providerCommitBuffer.js';
+import type { AcceptedTaskPlanContext } from '../../accepted-plan/types.js';
+import { finalSettlementEvidenceMetadata } from '../authority/finalSettlementEvidence.js';
 
 const providerProfiles = new ProviderProfileRegistry();
 
@@ -46,7 +48,9 @@ export interface TerminalGuidanceRevisionInput {
 export interface TerminalGuidanceRevisionState extends SessionDriverProviderRuntimeState, ProviderCommitBufferState {
   sessionId: string;
   runId: string;
+  hostRunId?: string;
   phase: string;
+  acceptedTaskPlan?: AcceptedTaskPlanContext;
   userRequest: string;
   terminalGuidanceRevisionAttempted: boolean;
   memoryDocument: SessionMemoryDocument;
@@ -68,7 +72,11 @@ export interface TerminalGuidanceRevisionCoordinatorPorts<
   now(): string;
   createId(prefix: string): string;
   append(sessionId: string, events: AgentEvent[]): Promise<AgentSessionResult>;
-  collectQueued(events: AgentEvent[], runId: string): UserGuidanceEvent[];
+  collectQueued(
+    events: AgentEvent[],
+    runId: string,
+    hostRunId?: string
+  ): UserGuidanceEvent[];
   transitionEvent(input: {
     sessionId: string;
     runId: string;
@@ -80,9 +88,7 @@ export interface TerminalGuidanceRevisionCoordinatorPorts<
   overlay(input: {
     originalRequest: string;
     draftAnswer: ProposalEnvelope;
-    guidance: UserGuidanceEvent[];
   }): string;
-  answerNarrationEvent(sessionId: string, proposal: ProposalEnvelope, ts: string, id: string): AgentEvent | null;
   answerEvent(
     sessionId: string,
     proposal: ProposalEnvelope,
@@ -90,7 +96,6 @@ export interface TerminalGuidanceRevisionCoordinatorPorts<
     id: string,
     metadata?: Record<string, unknown>
   ): AgentEvent;
-  diagnosticEvent(sessionId: string, message: string, ts: string, id: string): AgentEvent;
   sessionRunStateEvent(input: {
     sessionId: string;
     runId: string;
@@ -112,6 +117,7 @@ export interface TerminalGuidanceRevisionCoordinatorPorts<
     result: AgentSessionResult;
     contextAssembly?: ContextAssemblyRecord;
     runId: string;
+    hostRunId?: string;
     userRequest: string;
     language: ConversationLanguage;
     appliedAtProviderStage: string;
@@ -140,11 +146,15 @@ export class TerminalGuidanceRevisionCoordinator<
   ): Promise<AgentSessionResult | null> {
     const repairRuntime = new SessionDriverRepairRuntimeAccessor(state);
     if (repairRuntime.attempted('terminalGuidanceRevisionAttempted')) return null;
-    repairRuntime.markAttempted('terminalGuidanceRevisionAttempted');
 
     let result = await this.ports.append(state.sessionId, []);
-    const guidance = this.ports.collectQueued(result.events, state.runId);
+    const guidance = this.ports.collectQueued(
+      result.events,
+      state.runId,
+      state.hostRunId
+    );
     if (guidance.length === 0) return null;
+    repairRuntime.markAttempted('terminalGuidanceRevisionAttempted');
     result = await this.ports.admitQueuedGuidance(state, result);
 
     result = await this.ports.append(state.sessionId, [
@@ -171,7 +181,6 @@ export class TerminalGuidanceRevisionCoordinator<
       userOverlay: this.ports.overlay({
         originalRequest: input.content,
         draftAnswer,
-        guidance,
       }),
       userGuidance: guidance,
       userRequest: input.content,
@@ -189,6 +198,7 @@ export class TerminalGuidanceRevisionCoordinator<
       result,
       contextAssembly: assembledContext.contextAssembly,
       runId: state.runId,
+      hostRunId: state.hostRunId,
       userRequest: input.content,
       language: state.userAuthorityFrame.effectiveLanguage,
       appliedAtProviderStage: 'guidance_revision',
@@ -254,38 +264,22 @@ export class TerminalGuidanceRevisionCoordinator<
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      state.phase = 'completed';
-      return this.ports.append(state.sessionId, [
-        ...takeProviderCommitEvents(state),
-        this.ports.diagnosticEvent(
-          state.sessionId,
-          `User guidance merge failed; Session fell back to the first answer: ${message}`,
-          this.ports.now(),
-          this.ports.createId('guidance-revision-failed')
-        ),
-        this.ports.answerEvent(state.sessionId, draftAnswer, this.ports.now(), this.ports.createId('answer'), {
-          guidanceRevisionFailed: true,
-          appliedGuidanceIds: guidance.map((item) => item.id),
-          replacesDraftProposalId: draftAnswer.proposalId,
-        }),
-        this.completedRunStateEvent(state),
-      ]);
+      takeProviderCommitEvents(state);
+      state.phase = 'failed';
+      throw this.ports.createError(
+        'guidance_revision_failed',
+        `Queued user guidance could not be applied to the draft answer: ${message}`
+      );
     }
 
-    const narration = this.ports.answerNarrationEvent(
-      state.sessionId,
-      revised,
-      this.ports.now(),
-      this.ports.createId('guidance-revision-narration')
-    );
     state.phase = 'completed';
     return this.ports.append(state.sessionId, [
       ...takeProviderCommitEvents(state),
-      ...(narration ? [narration] : []),
       this.ports.answerEvent(state.sessionId, revised, this.ports.now(), this.ports.createId('answer'), {
         guidanceRevision: true,
         appliedGuidanceIds: guidance.map((item) => item.id),
         replacesDraftProposalId: draftAnswer.proposalId,
+        ...finalSettlementEvidenceMetadata(state.acceptedTaskPlan),
       }),
       this.completedRunStateEvent(state),
     ]);

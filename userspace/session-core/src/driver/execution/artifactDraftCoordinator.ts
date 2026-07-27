@@ -13,6 +13,10 @@ import type {
 } from '../../provider/SessionSemanticToolAdapter.js';
 import { ArtifactDraftError, ArtifactDraftLease } from './artifactDraftLedger.js';
 import type { TaskArtifactDirective } from './operationIntentCompiler.js';
+import {
+  conversationPresentationLanguage,
+  type ConversationPresentationLanguage,
+} from '../projection/conversationPresentationLanguage.js';
 
 export interface ArtifactDraftCoordinatorState extends SessionSemanticToolState {
   artifactDraftLease?: ArtifactDraftLease;
@@ -26,7 +30,11 @@ export type ArtifactDraftCoordinatorResult =
 export interface ArtifactDraftCoordinatorPorts<State extends ArtifactDraftCoordinatorState> {
   createId(prefix: string): string;
   kernel(request: KernelCommandEnvelope): Promise<KernelReply>;
-  appendProjectedKernelEvents(sessionId: string, reply: KernelReply): Promise<AgentSessionResult>;
+  appendProjectedKernelEvents(
+    sessionId: string,
+    reply: KernelReply,
+    language: ConversationPresentationLanguage
+  ): Promise<AgentSessionResult>;
   compileArtifacts(input: {
     state: State;
     callId: string;
@@ -152,7 +160,11 @@ export class ArtifactDraftCoordinator<State extends ArtifactDraftCoordinatorStat
         reply.error?.message ?? 'Kernel rejected the artifact draft frame.'
       );
     }
-    await this.ports.appendProjectedKernelEvents(state.sessionId, reply);
+    await this.ports.appendProjectedKernelEvents(
+      state.sessionId,
+      reply,
+      conversationPresentationLanguage(state)
+    );
   }
 }
 

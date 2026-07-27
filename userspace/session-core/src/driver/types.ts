@@ -12,6 +12,7 @@ import type {
   LlmChatResult,
   LlmChatStreamEvent,
   ProjectionDelta,
+  SessionProviderAdmissionMetadataV1,
 } from '@deepcode/protocol';
 import type { ProjectWorkingDirectory } from '../context/types.js';
 import type { AcceptedTaskPlanContext } from './execution/index.js';
@@ -28,6 +29,10 @@ import type {
 } from '../sessionModes.js';
 import type { TranscriptEntry } from '../transcript.js';
 import type { PromptLedgerWireRecord } from '../prompt/promptLedger.js';
+import type {
+  ProviderAnalysisTimelineAppendResult,
+  ProviderAnalysisTimelineEvent,
+} from '../provider/ProviderAnalysisTimeline.js';
 
 export type {
   InterventionLevel,
@@ -91,16 +96,37 @@ export interface SessionDriverInput extends SessionUserTurn {
 }
 
 export interface SessionDriverLoopPorts {
+  analysisTimelineRequired?: boolean;
+  providerResponseIdentityRequired?: boolean;
+  wireLedgerRequired?: boolean;
   appendEvents(sessionId: string, events: AgentEvent[]): Promise<AgentSessionResult>;
   appendTranscript?: (sessionId: string, entry: TranscriptEntry) => Promise<void>;
   loadWireLedger?: (sessionId: string) => Promise<PromptLedgerWireRecord[]>;
   appendWireLedger?: (sessionId: string, entries: PromptLedgerWireRecord[]) => Promise<void>;
   appendCacheTelemetry?: (sessionId: string, entry: Record<string, unknown>) => Promise<void>;
+  appendAnalysisTimeline?: (
+    sessionId: string,
+    entries: ProviderAnalysisTimelineEvent[]
+  ) => Promise<ProviderAnalysisTimelineAppendResult>;
+  registerProviderAdmission?: (
+    sessionId: string,
+    metadata: SessionProviderAdmissionMetadataV1
+  ) => void | Promise<void>;
+  bindProviderProposalAdmission?: (
+    sessionId: string,
+    proposalId: string,
+    providerRequestId: string
+  ) => void | Promise<void>;
   kernelCommand(request: KernelCommandEnvelope): Promise<KernelReply>;
-  llmChat(request: LlmChatRequest): Promise<ApiResponse<LlmChatResult>>;
+  llmChat(
+    request: LlmChatRequest,
+    signal?: AbortSignal
+  ): Promise<ApiResponse<LlmChatResult>>;
   llmChatStream?: (
     request: LlmChatRequest,
-    onEvent: (event: LlmChatStreamEvent) => void | Promise<void>
+    onEvent: (event: LlmChatStreamEvent) => void | Promise<void>,
+    onEvents?: (events: readonly LlmChatStreamEvent[]) => void | Promise<void>,
+    signal?: AbortSignal
   ) => Promise<ApiResponse<LlmChatResult>>;
   onProjectionDelta?: (delta: ProjectionDelta) => void | Promise<void>;
   now?: () => string;
@@ -109,6 +135,7 @@ export interface SessionDriverLoopPorts {
 
 export interface SessionDriverLoopInput {
   sessionId: string;
+  hostRunId?: string;
   content: string;
   attachments?: AgentContextAttachment[];
   existingEvents?: AgentEvent[];
@@ -130,15 +157,21 @@ export interface SessionDriverLoopInput {
   acceptedTaskPlan?: AcceptedTaskPlanContext;
   interactionOverlay?: InteractionOverlayContext;
   hostLanguage?: ConversationLanguage;
+  bootstrapEvents?: AgentEvent[];
 }
 
 export interface SessionDecisionResolverInput {
   sessionId: string;
+  hostRunId?: string;
   kind: 'requirement' | 'plan' | 'review' | 'permission' | 'boundary';
   decision: 'accept' | 'reject' | 'revise';
   guidance?: string;
   runId?: string;
   targetId?: string;
+  interactionId?: string;
+  interactionRevision?: string;
+  decisionRequestId?: string;
+  reviewId?: string;
   existingEvents?: AgentEvent[];
   workspaceBinding?: AgentWorkspaceBinding;
   projectWorkingDirectory?: ProjectWorkingDirectory;
@@ -153,4 +186,5 @@ export interface SessionDecisionResolverInput {
   projectMemoryMode?: ProjectMemoryMode;
   interactionOverlay?: InteractionOverlayContext;
   hostLanguage?: ConversationLanguage;
+  bootstrapEvents?: AgentEvent[];
 }

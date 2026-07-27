@@ -27,6 +27,7 @@ export class NativeToolResumeMessageBuilder {
       {
         role: 'assistant',
         content: turn.content,
+        reasoningContent: turn.reasoning,
         toolCalls: turn.toolCalls.map((toolCall) => this.ports.callToProtocol(toolCall)),
       },
       ...toolMessages,

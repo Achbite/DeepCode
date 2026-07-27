@@ -14,10 +14,13 @@ export function isExplicitlyHiddenTimelineEvent(event: {
   const payload = recordValue(event.payload);
   const visibility = stringValue(payload?.visibility);
   const payloadPresentation = stringValue(payload?.presentation);
+  const rawReasoningProjection = payload?.reasoningTrace === true
+    || stringValue(payload?.channel) === 'reasoning';
   return visibility === 'hidden' ||
     visibility === 'debug' ||
     payloadPresentation === 'traceOnly' ||
-    event.display?.presentation === 'traceOnly';
+    event.display?.presentation === 'traceOnly' ||
+    rawReasoningProjection;
 }
 
 // 不应单独成块的纯编排/调度生命周期事件 stage / kernelEvent.kind 集合。

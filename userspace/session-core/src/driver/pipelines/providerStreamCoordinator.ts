@@ -1,34 +1,13 @@
 export type ProviderStreamVisibleLanguage = 'zh-CN' | 'en-US';
-
-const ASSISTANT_DELTA_STAGES = new Set([
-  'answer_stream',
-  'review_final',
-]);
-
-const JSON_PROGRESS_STAGES = new Set([
-  'accepted_plan_provider_call',
-  'accepted_plan_resource_resume',
-  'accepted_plan_resource_resume_repair',
-  'accepted_plan_scope_repair',
-  'accepted_plan_parent_fallback',
-  'accepted_plan_parent_fallback_repair',
-]);
+export type ProviderProgressLanguage = ProviderStreamVisibleLanguage | 'neutral';
 
 export class ProviderStreamCoordinator {
-  exposesAssistantDelta(stage: string): boolean {
-    return ASSISTANT_DELTA_STAGES.has(stage);
+  exposesAssistantDelta(_stage: string): boolean {
+    return false;
   }
 
-  emitsJsonProgress(stage: string): boolean {
-    return JSON_PROGRESS_STAGES.has(stage);
-  }
-
-  exposesReasoningTrace(stage: string): boolean {
-    return !this.isRepairStage(stage);
-  }
-
-  private isRepairStage(stage: string): boolean {
-    return stage === 'protocol_repair' || stage.endsWith('_repair') || stage.includes('.repair');
+  emitsJsonProgress(_stage: string): boolean {
+    return false;
   }
 
   jsonProgressSummary(language: ProviderStreamVisibleLanguage, receivedChars: number): string {
@@ -37,7 +16,20 @@ export class ProviderStreamCoordinator {
       : `正在生成可执行 actionBundle 草稿（已接收 ${receivedChars} 字符）。`;
   }
 
-  stageSummary(stage: string, phase: 'request' | 'response', language: ProviderStreamVisibleLanguage = 'zh-CN'): string {
+  stageSummary(stage: string, phase: 'request' | 'response', language: ProviderProgressLanguage = 'zh-CN'): string {
+    if (language === 'neutral') {
+      return phase === 'request' ? 'LLM …' : 'LLM ✓';
+    }
+    if (stage === 'provider_call') {
+      if (language === 'en-US') {
+        return phase === 'request'
+          ? 'Analyzing the current request and preparing a structured response.'
+          : 'The model response has arrived; Session is organizing the result.';
+      }
+      return phase === 'request'
+        ? '正在分析当前请求并生成结构化回复。'
+        : '模型回复已接收，Session 正在整理结果。';
+    }
     const label = stage
       .replace(/_/g, ' ')
       .replace(/\b\w/g, (value) => value.toUpperCase());
