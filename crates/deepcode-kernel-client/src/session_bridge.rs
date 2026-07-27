@@ -32,6 +32,164 @@ pub struct AgentSessionListResult {
 pub struct AgentSessionResult {
     pub session: Value,
     pub events: Vec<Value>,
+    pub append_writeability: AgentSessionAppendWriteabilityV1,
+    pub domain_state: Option<Value>,
+    pub append_receipt: Option<Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "status")]
+pub enum AgentSessionAppendWriteabilityV1 {
+    #[serde(rename = "writable")]
+    Writable {
+        #[serde(rename = "schemaVersion")]
+        schema_version: SessionAppendWriteabilitySchemaV1,
+        format: SessionWritableDomainStorageFormatV1,
+    },
+    #[serde(rename = "readOnly")]
+    LegacyReadOnly {
+        #[serde(rename = "schemaVersion")]
+        schema_version: SessionAppendWriteabilitySchemaV1,
+        format: SessionLegacyDomainStorageFormatV1,
+        reason: SessionLegacyAppendReadOnlyReasonV1,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub enum SessionAppendWriteabilitySchemaV1 {
+    #[serde(rename = "deepcode.session.append-writeability.v1")]
+    V1,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub enum SessionWritableDomainStorageFormatV1 {
+    #[serde(rename = "domainBatchV1")]
+    DomainBatchV1,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub enum SessionLegacyDomainStorageFormatV1 {
+    #[serde(rename = "legacyRawEventsV1")]
+    LegacyRawEventsV1,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub enum SessionLegacyAppendReadOnlyReasonV1 {
+    #[serde(rename = "legacyFormat")]
+    LegacyFormat,
+}
+
+impl AgentSessionResult {
+    pub fn domain_state_if_writable(&self) -> KernelClientResult<Option<&Value>> {
+        match &self.append_writeability {
+            AgentSessionAppendWriteabilityV1::Writable { .. } => {
+                self.domain_state.as_ref().map(Some).ok_or_else(|| {
+                    agent_session_contract_error("writable Session result is missing domainState")
+                })
+            }
+            AgentSessionAppendWriteabilityV1::LegacyReadOnly { .. } => {
+                if self.domain_state.is_some() {
+                    return Err(agent_session_contract_error(
+                        "legacy read-only Session result must not contain domainState",
+                    ));
+                }
+                if self.append_receipt.is_some() {
+                    return Err(agent_session_contract_error(
+                        "legacy read-only Session result must not contain appendReceipt",
+                    ));
+                }
+                Ok(None)
+            }
+        }
+    }
+
+    pub(crate) fn guidance_observation(&self, run_id: &str) -> KernelClientResult<(Value, String)> {
+        let domain_state = self.domain_state_if_writable()?.ok_or_else(|| {
+            KernelClientError::Api(
+                "session_append_legacy_read_only: running guidance requires a writable Session"
+                    .to_string(),
+            )
+        })?;
+        let base_head = domain_state
+            .get("head")
+            .filter(|head| {
+                head.get("schemaVersion").and_then(Value::as_str)
+                    == Some("deepcode.session.domain-head.v1")
+                    && head.get("headRevision").and_then(Value::as_u64).is_some()
+                    && head.get("eventVersion").and_then(Value::as_u64).is_some()
+                    && head
+                        .get("headDigest")
+                        .and_then(Value::as_str)
+                        .is_some_and(|digest| digest.starts_with("sha256:"))
+            })
+            .cloned()
+            .ok_or_else(|| {
+                KernelClientError::Api(
+                    "session_append_recovery_required: writable Session has no canonical domain head"
+                        .to_string(),
+                )
+            })?;
+
+        let claim = self
+            .events
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, event)| {
+                let payload = event.get("payload")?;
+                (event.get("kind").and_then(Value::as_str) == Some("session_interaction_claim")
+                    && payload.get("admittedRunId").and_then(Value::as_str) == Some(run_id))
+                .then(|| {
+                    (
+                        index,
+                        payload
+                            .get("turnAuthorityRef")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                    )
+                })
+            });
+        let authority_after_claim = claim.as_ref().and_then(|(claim_index, _)| {
+            self.events
+                .iter()
+                .enumerate()
+                .skip(claim_index.saturating_add(1))
+                .rev()
+                .find_map(|(_, event)| exact_turn_authority_event_id(event))
+        });
+        let latest_authority = self
+            .events
+            .iter()
+            .rev()
+            .find_map(exact_turn_authority_event_id);
+        let turn_authority_ref = authority_after_claim
+            .or_else(|| claim.and_then(|(_, authority_ref)| authority_ref))
+            .or(latest_authority)
+            .ok_or_else(|| {
+                KernelClientError::Api(
+                    "session_append_lineage_invalid: running guidance has no caller-observed turn authority"
+                        .to_string(),
+                )
+            })?;
+        Ok((base_head, turn_authority_ref))
+    }
+}
+
+fn exact_turn_authority_event_id(event: &Value) -> Option<String> {
+    (event.get("kind").and_then(Value::as_str) == Some("session_turn_authority")
+        && event
+            .pointer("/payload/schemaVersion")
+            .and_then(Value::as_str)
+            == Some("deepcode.session.turn-authority.v2"))
+    .then(|| event.get("id").and_then(Value::as_str).map(str::to_owned))
+    .flatten()
+}
+
+fn agent_session_contract_error(message: &'static str) -> KernelClientError {
+    KernelClientError::Decode(serde_json::Error::io(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        message,
+    )))
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -56,6 +214,10 @@ pub struct StartAgentRunRequest {
     pub guidance: Option<String>,
     pub run_id: Option<String>,
     pub target_id: Option<String>,
+    pub interaction_id: Option<String>,
+    pub interaction_revision: Option<String>,
+    pub decision_request_id: Option<String>,
+    pub review_id: Option<String>,
     pub host_language: Option<String>,
 }
 

@@ -29,9 +29,9 @@ use session_bridge::run_session_host_bridge;
 pub use session_bridge::{
     session_host_bridge_hint, session_host_bridge_path, terminal_host_language,
     terminal_workspace_scope, AgentRunResult, AgentRunStatus, AgentSessionListResult,
-    AgentSessionResult, CreateAgentSessionRequest,
-    ListAgentSessionsRequest, SessionHostBridgeRequest, SessionHostBridgeResult,
-    StartAgentRunRequest, TerminalWorkspaceScope,
+    AgentSessionResult, CreateAgentSessionRequest, ListAgentSessionsRequest,
+    SessionHostBridgeRequest, SessionHostBridgeResult, StartAgentRunRequest,
+    TerminalWorkspaceScope,
 };
 
 #[derive(Debug, Error)]
@@ -388,6 +388,8 @@ impl HttpKernelClient {
         attachments: Vec<Value>,
         host_language: Option<String>,
     ) -> KernelClientResult<AgentRunResult> {
+        let observed_session = self.get_agent_session(session_id).await?;
+        let (base_head, turn_authority_ref) = observed_session.guidance_observation(run_id)?;
         let value = self
             .http
             .post(self.url(&format!(
@@ -397,13 +399,15 @@ impl HttpKernelClient {
                 "guidance": guidance.into(),
                 "attachments": attachments,
                 "hostLanguage": host_language,
+                "baseHead": base_head,
+                "turnAuthorityRef": turn_authority_ref,
             }))
             .send()
             .await?
             .error_for_status()?
             .json::<Value>()
             .await?;
-        decode_api_data(value)
+        decode_api_data_with_code(value)
     }
 
     pub async fn cancel_agent_run(
