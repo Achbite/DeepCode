@@ -117,10 +117,9 @@ export interface AcceptedActionBundlePlanExecutorPorts {
   recordKernelBatchProgress(input: {
     acceptedPlan: AcceptedTaskPlanContext;
     proposal: ProposalEnvelope;
-    kernelEvents: unknown[];
+    kernelEvents: AgentEvent[];
   }): {
     progress: AcceptedPlanBatchProgress;
-    completedTaskIds: string[];
     nextAcceptedPlan: AcceptedTaskPlanContext;
   };
   runtimeSnapshot(input: {
@@ -207,11 +206,13 @@ export class AcceptedActionBundlePlanExecutor {
         },
       });
       const batchReply = observed.reply;
+      const projectionStart = result.events.length;
       result = await this.ports.appendProjectedKernelEvents(
         input.sessionId,
         batchReply,
         presentationLanguage
       ) ?? result;
+      const projectedKernelEvents = result.events.slice(projectionStart);
       const batchEvents = batchReply.events ?? [];
       if (observed.kind === 'commandFailed') {
         throw new AcceptedActionBundlePlanExecutionError(
@@ -260,7 +261,7 @@ export class AcceptedActionBundlePlanExecutor {
         const ledgerEffect = this.ports.recordKernelBatchProgress({
           acceptedPlan: acceptedOverlay.acceptedPlan,
           proposal: progressProposal,
-          kernelEvents: batchEvents,
+          kernelEvents: projectedKernelEvents,
         });
         const progress = ledgerEffect.progress;
         const nextAccepted = ledgerEffect.nextAcceptedPlan;

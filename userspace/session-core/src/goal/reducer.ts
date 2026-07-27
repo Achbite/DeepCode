@@ -7,6 +7,10 @@ import {
   SessionGoalError,
   type ReducedSessionGoalV1,
 } from './types.js';
+import {
+  createTaskLedgerV2,
+  parseTaskLedgerV2,
+} from '../run-state/taskLedger.js';
 
 const GOAL_FACT_SCHEMA = 'deepcode.session.goal-fact.v1';
 
@@ -134,6 +138,8 @@ export function reduceSessionGoals(
         current.confirmedPlanRef = payload.confirmedPlanRef;
         current.authorizationFactRef = payload.authorizationFactRef;
         current.sourceRunId = payload.sourceRunId;
+        current.taskLedger = createGoalTaskLedger(current, payload, event.id);
+        current.taskLedgerFactRef = event.id;
         break;
       }
       case 'suspended': {
@@ -178,7 +184,31 @@ export function reduceSessionGoals(
         current.terminalFactRef = event.id;
         break;
       }
-      case 'taskLedger':
+      case 'taskLedger': {
+        if (
+          payload.lifecycle !== current.lifecycle
+          || !current.confirmedPlanRef
+          || !current.planId
+          || !current.taskLedger
+          || !current.taskLedgerFactRef
+        ) {
+          invalidTransition(current, event, payload.lifecycle);
+        }
+        const taskLedger = parseGoalTaskLedger(payload.taskLedger, event.id);
+        assertGoalTaskLedgerOwner(current, taskLedger, event.id);
+        if (
+          taskLedger.revision !== current.taskLedger.revision + 1
+          || !payload.sourceRefs.includes(current.taskLedgerFactRef)
+        ) {
+          throw new SessionGoalError(
+            'session_goal_recovery_required',
+            `Goal ${current.goalId} has a non-contiguous TaskLedgerV2 fact at ${event.id}.`
+          );
+        }
+        current.taskLedger = taskLedger;
+        current.taskLedgerFactRef = event.id;
+        break;
+      }
       case 'budgetUsage': {
         if (current.lifecycle !== 'running' && current.lifecycle !== 'suspended') {
           invalidTransition(current, event, payload.lifecycle);
@@ -203,6 +233,66 @@ export function reduceSessionGoals(
     current.facts.push({ event, payload });
   }
   return goals;
+}
+
+function createGoalTaskLedger(
+  goal: ReducedSessionGoalV1,
+  payload: Extract<SessionGoalFactPayloadV1, { factKind: 'activated' }>,
+  eventId: string
+) {
+  try {
+    return createTaskLedgerV2({
+      owner: {
+        kind: 'goal',
+        goalId: goal.goalId,
+        goalRevision: goal.goalRevision,
+        confirmedPlanRef: payload.confirmedPlanRef,
+        planId: payload.planId,
+      },
+      tasks: payload.taskSnapshot,
+      sourceRefs: [...payload.sourceRefs, eventId],
+    });
+  } catch (error) {
+    throw new SessionGoalError(
+      'session_goal_schema_unavailable',
+      `Goal activation ${eventId} has an invalid TaskLedgerV2 snapshot: ${errorMessage(error)}`
+    );
+  }
+}
+
+function parseGoalTaskLedger(value: unknown, eventId: string) {
+  try {
+    return parseTaskLedgerV2(value);
+  } catch (error) {
+    throw new SessionGoalError(
+      'session_goal_schema_unavailable',
+      `Goal fact ${eventId} has an invalid TaskLedgerV2 payload: ${errorMessage(error)}`
+    );
+  }
+}
+
+function assertGoalTaskLedgerOwner(
+  goal: ReducedSessionGoalV1,
+  taskLedger: ReturnType<typeof parseTaskLedgerV2>,
+  eventId: string
+): void {
+  const owner = taskLedger.owner;
+  if (
+    owner.kind !== 'goal'
+    || owner.goalId !== goal.goalId
+    || owner.goalRevision !== goal.goalRevision
+    || owner.planId !== goal.planId
+    || owner.confirmedPlanRef !== goal.confirmedPlanRef
+  ) {
+    throw new SessionGoalError(
+      'session_goal_recovery_required',
+      `Goal fact ${eventId} crosses the immutable TaskLedgerV2 owner.`
+    );
+  }
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 export function currentOrLatestGoal(

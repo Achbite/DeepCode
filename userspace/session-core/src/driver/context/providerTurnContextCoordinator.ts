@@ -575,7 +575,7 @@ export class ProviderTurnContextCoordinator<State extends ProviderTurnContextSta
     if (!acceptedPlan) return;
     if (
       !Array.isArray(acceptedPlan.tasks) ||
-      !Array.isArray(acceptedPlan.completedTaskIds) ||
+      acceptedPlan.taskLedger?.schemaVersion !== 'deepcode.session.task-ledger.v2' ||
       !Array.isArray(acceptedPlan.authorizationOperations)
     ) {
       throw this.error(

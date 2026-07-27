@@ -81,8 +81,6 @@ export interface ReviewProjectionBuilderPorts<
   findReviewFacts(kernelEvents: unknown[]): Record<string, unknown> | undefined;
   concreteContinuationExpectations(value: unknown): unknown[];
   acceptedPlanContext(plan: Plan): AcceptedPlan | undefined;
-  acceptedPlanBatchCompletedTaskIds(acceptedPlan: AcceptedPlan, plan: Plan, kernelEvents: unknown[]): string[];
-  acceptedPlanAfterBatch(acceptedPlan: AcceptedPlan, completedTaskIds: string[]): AcceptedPlan;
   acceptedPlanTaskLedger(acceptedPlan: AcceptedPlan): TaskLedger | undefined;
   buildReviewFactsContext(input: ReviewFactsContextInput<TaskLedger>): unknown;
 }
@@ -147,12 +145,10 @@ export class ReviewProjectionBuilder<
       input.plan.runId,
       input.plan.planId
     );
-    const reviewTaskLedger = checkpointTaskLedger ?? (acceptedPlanForReview
-      ? ports.acceptedPlanTaskLedger(ports.acceptedPlanAfterBatch(
-        acceptedPlanForReview,
-        ports.acceptedPlanBatchCompletedTaskIds(acceptedPlanForReview, input.plan, kernelEvents)
-      ))
-      : undefined);
+    const reviewTaskLedger = checkpointTaskLedger
+      ?? (acceptedPlanForReview
+        ? ports.acceptedPlanTaskLedger(acceptedPlanForReview)
+        : undefined);
     const kernelCompletedTaskIds = reviewKernelCompletedTaskIds(
       reviewTaskLedger,
       input.plan.runId,
@@ -771,27 +767,37 @@ function reviewKernelCompletedTaskIds(
   planId: string
 ): string[] {
   const ledger = objectRecord(taskLedger);
-  const value = ledger?.completedTaskIds;
-  if (value === undefined) return [];
+  if (!ledger) return [];
+  const owner = objectRecord(ledger.owner);
   if (
-    stringValue(ledger?.schemaVersion) !== 'deepcode.session.task-ledger.v1'
-    || stringValue(ledger?.runId) !== runId
-    || stringValue(ledger?.planId) !== planId
+    stringValue(ledger.schemaVersion) !== 'deepcode.session.task-ledger.v2'
+    || stringValue(owner?.planId) !== planId
+    || (
+      stringValue(owner?.kind) === 'run'
+      && stringValue(owner?.runId) !== runId
+    )
+    || (
+      stringValue(owner?.kind) !== 'run'
+      && stringValue(owner?.kind) !== 'goal'
+    )
   ) {
     throw new Error(
       'session_review_projection_invalid: task ledger does not match the active run and plan.'
     );
   }
-  if (!Array.isArray(value)) {
+  if (!Array.isArray(ledger.entries)) {
     throw new Error(
-      'session_review_projection_invalid: task ledger completedTaskIds must be an array.'
+      'session_review_projection_invalid: TaskLedgerV2 entries must be an array.'
     );
   }
-  const taskIds = value.map((taskId) =>
-    typeof taskId === 'string' && taskId.trim() === taskId && taskId.length > 0
-      ? taskId
-      : undefined
-  );
+  const taskIds = ledger.entries.flatMap((value) => {
+    const entry = objectRecord(value);
+    const settlement = objectRecord(entry?.settlement);
+    return stringValue(entry?.status) === 'settled'
+      && stringValue(settlement?.kind) === 'kernelFacts'
+      ? [stringValue(entry?.taskId)]
+      : [];
+  });
   if (
     taskIds.some((taskId) => taskId === undefined)
     || new Set(taskIds).size !== taskIds.length

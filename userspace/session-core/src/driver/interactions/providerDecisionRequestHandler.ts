@@ -29,7 +29,6 @@ export interface ProviderDecisionRequestState extends ConversationPresentationLa
   acceptedTaskPlan?: {
     planId?: string;
     runId?: string;
-    completedTaskIds?: string[];
   };
   currentTaskContext?: {
     taskId?: string;
@@ -103,7 +102,6 @@ export class ProviderDecisionRequestHandler<
       acceptedPlanId: state.acceptedTaskPlan?.planId,
       acceptedPlanRunId: state.acceptedTaskPlan?.runId,
       acceptedCurrentTaskId: state.currentTaskContext?.taskId,
-      acceptedCompletedTaskIds: state.acceptedTaskPlan?.completedTaskIds,
     };
     const confirmation = this.ports.confirmationEvent({
       sessionId: state.sessionId,

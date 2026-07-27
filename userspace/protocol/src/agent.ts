@@ -573,6 +573,81 @@ export interface SessionGoalInteractionRefV1 {
   runId: string;
 }
 
+export interface SessionTaskDefinitionV1 {
+  taskId: string;
+  title?: string;
+  targets: string[];
+  toolId?: string;
+  dependencies: string[];
+  acceptanceCriteria: string[];
+  failureCriteria: string[];
+  required: true;
+}
+
+export type TaskLedgerOwnerV2 =
+  | ({
+      kind: 'goal';
+      confirmedPlanRef: string;
+    } & SessionGoalRefV1 & {
+      planId: string;
+    })
+  | {
+      kind: 'run';
+      runId: string;
+      planId: string;
+    };
+
+export type TaskSettlementV2 =
+  | {
+      kind: 'kernelFacts';
+      outcome: 'completed';
+      kernelFactRefs: SessionKernelFactRefV1[];
+    }
+  | {
+      kind: 'userDecision';
+      outcome: 'skipped' | 'acceptedIncomplete';
+      interaction: SessionGoalInteractionRefV1;
+      decisionEventRef: string;
+    }
+  | {
+      kind: 'deterministicCriterion';
+      outcome: 'completed';
+      validatorId: string;
+      validatorVersion: string;
+      evidenceRefs: string[];
+    };
+
+export type TaskFailureV2 =
+  | {
+      kind: 'kernelFacts';
+      reason: string;
+      kernelFactRefs: SessionKernelFactRefV1[];
+    }
+  | {
+      kind: 'sessionInvariant';
+      reason: string;
+      sourceRefs: string[];
+    };
+
+export interface TaskLedgerEntryV2 extends SessionTaskDefinitionV1 {
+  status: 'pending' | 'active' | 'settled' | 'failed';
+  settlement?: TaskSettlementV2;
+  failure?: TaskFailureV2;
+}
+
+export interface TaskLedgerSnapshotV2 {
+  schemaVersion: 'deepcode.session.task-ledger.v2';
+  owner: TaskLedgerOwnerV2;
+  revision: number;
+  taskOrder: string[];
+  currentTaskId?: string;
+  settledTaskIds: string[];
+  failedTaskIds: string[];
+  pendingTaskIds: string[];
+  entries: TaskLedgerEntryV2[];
+  sourceRefs: string[];
+}
+
 export interface SessionGoalFactBaseV1 extends SessionGoalRefV1 {
   schemaVersion: 'deepcode.session.goal-fact.v1';
   lifecycle: SessionGoalLifecycleV1;
@@ -612,7 +687,7 @@ export type SessionGoalFactPayloadV1 =
       confirmedPlanRef: string;
       authorizationFactRef: string;
       sourceRunId: string;
-      taskSnapshot: unknown[];
+      taskSnapshot: SessionTaskDefinitionV1[];
     })
   | (SessionGoalFactBaseV1 & {
       factKind: 'suspended';
@@ -636,7 +711,7 @@ export type SessionGoalFactPayloadV1 =
   | (SessionGoalFactBaseV1 & {
       factKind: 'taskLedger';
       lifecycle: 'running' | 'suspended';
-      taskLedger: unknown;
+      taskLedger: TaskLedgerSnapshotV2;
     })
   | (SessionGoalFactBaseV1 & {
       factKind: 'activeWait';

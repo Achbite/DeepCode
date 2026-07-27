@@ -233,7 +233,16 @@ export function buildGoalProjection(
       sourceEventVersion: input.conversationProjection.sourceEventVersion,
     },
     pendingInteraction,
-    task: { status: 'notAvailable' },
+    task: goal.taskLedger
+      ? {
+          status: 'available',
+          value: {
+            currentTaskId: goal.taskLedger.currentTaskId,
+            settled: goal.taskLedger.settledTaskIds.length,
+            total: goal.taskLedger.taskOrder.length,
+          },
+        }
+      : { status: 'notAvailable' },
     activeWait: { status: 'notAvailable' },
     checkpoint: { status: 'notAvailable' },
     executionBudget: { status: 'notAvailable' },

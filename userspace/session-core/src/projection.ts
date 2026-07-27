@@ -33,6 +33,7 @@ import {
   type InteractionLedgerActiveInteraction,
 } from './run-state/interactionLedger.js';
 import { planInteractionAwaitsDecision } from './run-state/planInteractionState.js';
+import { legacyTaskLedgerEntryV1 } from './run-state/taskLedgerLegacyV1.js';
 import {
   parseSessionTurnAuthorityPayload,
   sessionTurnAuthorities,
@@ -2864,16 +2865,10 @@ function taskPlanTaskProjectionItems(
     const acceptance = stringArrayField(item, 'acceptanceCriteria');
     const failure = stringArrayField(item, 'failureCriteria');
     const scope = stringField(item, 'scope');
-    const targets = [
-      ...stringArrayOrSingleField(item, 'target'),
-      ...stringArrayOrSingleField(item, 'targets'),
-    ];
     const ledgerProjection = implementationTaskProjectionFromLedger(taskLedger, taskId);
-    const factStatus = implementationTaskStatus(lifecycle, targets, taskId);
-    const status = mergeImplementationTaskStatus(ledgerProjection?.status, factStatus);
-    const settlementKind = factStatus === 'completed'
-      ? 'completedByKernelFacts'
-      : ledgerProjection?.settlementKind;
+    const status = ledgerProjection?.status
+      ?? taskPlanLifecycleStatus(lifecycle);
+    const settlementKind = ledgerProjection?.settlementKind;
     const summary = [
       implementationTaskSettlementSummary(settlementKind, presentationBinding),
       scope,
@@ -2899,10 +2894,15 @@ function sharedTaskSettlementKind(
   NonNullable<AgentTimelineResult['taskProjection']>['items'][number]['settlementKind']
 > | undefined {
   if (status === 'failed') return 'failed';
-  if (settlementKind === 'completedByKernelFacts') return 'kernelCompleted';
-  if (settlementKind === 'modelJudgedSufficient') return 'sessionEvidenceSatisfied';
-  if (settlementKind === 'skippedByUser') return 'userSkipped';
-  if (settlementKind === 'acceptedIncompleteByUser') return 'userAcceptedIncomplete';
+  if (settlementKind === 'kernelFacts') return 'kernelCompleted';
+  if (
+    settlementKind === 'deterministicCriterion'
+    || settlementKind === 'legacySessionEvidence'
+  ) {
+    return 'sessionEvidenceSatisfied';
+  }
+  if (settlementKind === 'userSkipped') return 'userSkipped';
+  if (settlementKind === 'userAcceptedIncomplete') return 'userAcceptedIncomplete';
   return undefined;
 }
 
@@ -2923,10 +2923,11 @@ function latestAcceptedPlanTaskLedger(
 }
 
 type ImplementationTaskSettlementKind =
-  | 'completedByKernelFacts'
-  | 'modelJudgedSufficient'
-  | 'skippedByUser'
-  | 'acceptedIncompleteByUser';
+  | 'kernelFacts'
+  | 'deterministicCriterion'
+  | 'userSkipped'
+  | 'userAcceptedIncomplete'
+  | 'legacySessionEvidence';
 
 function implementationTaskProjectionFromLedger(
   ledger: Record<string, unknown> | undefined,
@@ -2936,6 +2937,25 @@ function implementationTaskProjectionFromLedger(
   settlementKind?: ImplementationTaskSettlementKind;
 } | undefined {
   if (!ledger) return undefined;
+  if (stringField(ledger, 'schemaVersion') !== 'deepcode.session.task-ledger.v2') {
+    const legacy = legacyTaskLedgerEntryV1(ledger, taskId);
+    if (!legacy) return undefined;
+    if (legacy.status === 'completedByKernelFacts') {
+      return { status: 'completed', settlementKind: 'kernelFacts' };
+    }
+    if (legacy.status === 'modelJudgedSufficient') {
+      return { status: 'completed', settlementKind: 'legacySessionEvidence' };
+    }
+    if (legacy.status === 'skippedByUser') {
+      return { status: 'completed', settlementKind: 'userSkipped' };
+    }
+    if (legacy.status === 'acceptedIncompleteByUser') {
+      return { status: 'completed', settlementKind: 'userAcceptedIncomplete' };
+    }
+    if (legacy.status === 'failed') return { status: 'failed' };
+    if (legacy.status === 'inProgress') return { status: 'running' };
+    return { status: 'queued' };
+  }
   const entries = Array.isArray(ledger.entries) ? ledger.entries : [];
   const normalizedTaskId = normalizeTaskId(taskId);
   for (const entry of entries) {
@@ -2943,16 +2963,35 @@ function implementationTaskProjectionFromLedger(
     const entryTaskId = normalizeTaskId(stringField(entry, 'taskId') ?? '');
     if (!entryTaskId || entryTaskId !== normalizedTaskId) continue;
     const status = stringField(entry, 'status');
-    if (
-      status === 'completedByKernelFacts'
-      || status === 'modelJudgedSufficient'
-      || status === 'skippedByUser'
-      || status === 'acceptedIncompleteByUser'
-    ) {
-      return { status: 'completed', settlementKind: status };
+    if (status === 'settled') {
+      const settlement = isRecordPayload(entry.settlement)
+        ? entry.settlement
+        : undefined;
+      const kind = settlement ? stringField(settlement, 'kind') : undefined;
+      if (kind === 'kernelFacts') {
+        return { status: 'completed', settlementKind: 'kernelFacts' };
+      }
+      if (kind === 'deterministicCriterion') {
+        return { status: 'completed', settlementKind: 'deterministicCriterion' };
+      }
+      if (kind === 'userDecision') {
+        const outcome = settlement
+          ? stringField(settlement, 'outcome')
+          : undefined;
+        if (outcome === 'skipped') {
+          return { status: 'completed', settlementKind: 'userSkipped' };
+        }
+        if (outcome === 'acceptedIncomplete') {
+          return {
+            status: 'completed',
+            settlementKind: 'userAcceptedIncomplete',
+          };
+        }
+      }
+      return { status: 'failed' };
     }
     if (status === 'failed') return { status: 'failed' };
-    if (status === 'inProgress') return { status: 'running' };
+    if (status === 'active') return { status: 'running' };
     return { status: 'queued' };
   }
   return undefined;
@@ -2962,28 +3001,35 @@ function implementationTaskSettlementSummary(
   settlementKind: ImplementationTaskSettlementKind | undefined,
   binding: ProjectionLanguageBinding
 ): string {
-  if (settlementKind === 'completedByKernelFacts') {
+  if (settlementKind === 'kernelFacts') {
     return localizedProjectionText(binding.language, {
       zh: 'Kernel 事实已确认完成',
       en: 'Completed by Kernel facts',
       neutral: 'settlement=kernelFactsCompleted',
     });
   }
-  if (settlementKind === 'modelJudgedSufficient') {
+  if (settlementKind === 'deterministicCriterion') {
     return localizedProjectionText(binding.language, {
-      zh: 'Session 已评估现有证据足够；没有对应的 Kernel 变更完成事实',
-      en: 'Session assessed the evidence as sufficient; no corresponding Kernel mutation-completion fact exists',
-      neutral: 'settlement=sessionEvidenceAssessed kernelMutationCompleted=false',
+      zh: '已登记的确定性校验器已确认完成',
+      en: 'Confirmed by a registered deterministic validator',
+      neutral: 'settlement=deterministicCriterion',
     });
   }
-  if (settlementKind === 'skippedByUser') {
+  if (settlementKind === 'legacySessionEvidence') {
+    return localizedProjectionText(binding.language, {
+      zh: '历史 Session 证据评估（只读兼容）',
+      en: 'Legacy Session evidence assessment (read-only compatibility)',
+      neutral: 'settlement=legacySessionEvidence readOnly=true',
+    });
+  }
+  if (settlementKind === 'userSkipped') {
     return localizedProjectionText(binding.language, {
       zh: '用户已跳过此任务',
       en: 'Skipped by the user',
       neutral: 'settlement=userSkipped',
     });
   }
-  if (settlementKind === 'acceptedIncompleteByUser') {
+  if (settlementKind === 'userAcceptedIncomplete') {
     return localizedProjectionText(binding.language, {
       zh: '用户已接受此任务保持未完成',
       en: 'Accepted as incomplete by the user',
@@ -2993,28 +3039,10 @@ function implementationTaskSettlementSummary(
   return '';
 }
 
-function mergeImplementationTaskStatus(
-  ledgerStatus: AgentTimelineStatus | undefined,
-  factStatus: AgentTimelineStatus
-): AgentTimelineStatus {
-  // Kernel facts can advance a stale checkpoint ledger; terminal ledger states still remain authoritative.
-  if (!ledgerStatus) return factStatus;
-  if (ledgerStatus === 'failed' || factStatus === 'failed' || factStatus === 'blocked') return 'failed';
-  if (ledgerStatus === 'completed' || factStatus === 'completed') return 'completed';
-  if (ledgerStatus === 'running' || factStatus === 'running') return 'running';
-  return ledgerStatus;
-}
-
 interface TaskPlanLifecycle {
   accepted: boolean;
   needsRevision: boolean;
   rejected: boolean;
-  completedPaths: string[];
-  runningPaths: string[];
-  failedPaths: string[];
-  completedIds: string[];
-  runningIds: string[];
-  failedIds: string[];
 }
 
 function taskPlanLifecycle(
@@ -3029,12 +3057,6 @@ function taskPlanLifecycle(
     accepted: false,
     needsRevision: false,
     rejected: false,
-    completedPaths: [],
-    runningPaths: [],
-    failedPaths: [],
-    completedIds: [],
-    runningIds: [],
-    failedIds: [],
   };
 
   for (const later of events.slice(planEventIndex + 1)) {
@@ -3045,52 +3067,16 @@ function taskPlanLifecycle(
       if (status === 'needsRevision') lifecycle.needsRevision = true;
       if (status === 'rejected' || status === 'failed' || status === 'cancelled') lifecycle.rejected = true;
     }
-    if (!lifecycle.accepted) continue;
-
-    const fact = implementationFactFromEvent(later);
-    if (!fact) continue;
-    if (fact.status === 'completed') {
-      lifecycle.completedPaths.push(...fact.paths);
-      lifecycle.completedIds.push(...fact.ids);
-    } else if (fact.status === 'running' || fact.status === 'queued') {
-      lifecycle.runningPaths.push(...fact.paths);
-      lifecycle.runningIds.push(...fact.ids);
-    } else if (fact.status === 'failed' || fact.status === 'blocked') {
-      lifecycle.failedPaths.push(...fact.paths);
-      lifecycle.failedIds.push(...fact.ids);
-    }
   }
-
-  lifecycle.completedPaths = [...new Set(lifecycle.completedPaths.map(normalizeTaskPath).filter(Boolean))];
-  lifecycle.runningPaths = [...new Set(lifecycle.runningPaths.map(normalizeTaskPath).filter(Boolean))];
-  lifecycle.failedPaths = [...new Set(lifecycle.failedPaths.map(normalizeTaskPath).filter(Boolean))];
-  lifecycle.completedIds = [...new Set(lifecycle.completedIds.map(normalizeTaskId).filter(Boolean))];
-  lifecycle.runningIds = [...new Set(lifecycle.runningIds.map(normalizeTaskId).filter(Boolean))];
-  lifecycle.failedIds = [...new Set(lifecycle.failedIds.map(normalizeTaskId).filter(Boolean))];
   return lifecycle;
 }
 
-function implementationTaskStatus(
-  lifecycle: TaskPlanLifecycle,
-  targets: string[],
-  taskId: string
+function taskPlanLifecycleStatus(
+  lifecycle: TaskPlanLifecycle
 ): AgentTimelineStatus {
   if (lifecycle.rejected) return 'failed';
   if (lifecycle.needsRevision) return 'waiting';
   if (!lifecycle.accepted) return 'waiting';
-
-  const normalizedTargets = targets.map(normalizeTaskPath).filter(Boolean);
-  const normalizedTaskId = normalizeTaskId(taskId);
-  if (normalizedTargets.length > 0) {
-    if (normalizedTargets.some((target) => lifecycle.failedPaths.some((path) => pathMatchesTaskTarget(path, target)))) return 'failed';
-    if (normalizedTargets.some((target) => lifecycle.runningPaths.some((path) => pathMatchesTaskTarget(path, target)))) return 'running';
-    if (normalizedTargets.some((target) => lifecycle.completedPaths.some((path) => pathMatchesTaskTarget(path, target)))) return 'completed';
-  }
-  if (normalizedTaskId) {
-    if (lifecycle.failedIds.some((id) => idMatchesTaskId(id, normalizedTaskId))) return 'failed';
-    if (lifecycle.runningIds.some((id) => idMatchesTaskId(id, normalizedTaskId))) return 'running';
-    if (lifecycle.completedIds.some((id) => idMatchesTaskId(id, normalizedTaskId))) return 'completed';
-  }
   return 'queued';
 }
 
@@ -3110,125 +3096,8 @@ function samePlanDecision(payload: Record<string, unknown>, planRunId?: string, 
   return !planRunId || !decisionRunId || decisionRunId === planRunId;
 }
 
-interface ImplementationFact {
-  status: AgentTimelineStatus;
-  paths: string[];
-  ids: string[];
-}
-
-function implementationFactFromEvent(event: AgentEvent): ImplementationFact | null {
-  const payload = isRecordPayload(event.payload) ? event.payload : {};
-  const kind = kernelEventFromPayload(payload)?.kind ?? stringField(payload, 'stage');
-  const status = implementationFactStatus(kind, stringField(payload, 'status'));
-  if (!status) return null;
-  return {
-    status,
-    paths: eventPathCandidates(payload),
-    ids: eventIdCandidates(payload),
-  };
-}
-
-function implementationFactStatus(kind: string | undefined, status: string | undefined): AgentTimelineStatus | null {
-  if (kind === 'work_unit.queued') return 'queued';
-  if (kind === 'work_unit.started') return 'running';
-  if (kind === 'work_unit.completed' || kind === 'tool.completed') return 'completed';
-  if (kind === 'work_unit.failed' || kind === 'tool.failed') return 'failed';
-  if (kind === 'work_unit.blocked') return 'blocked';
-  if (kind === 'work_unit') {
-    if (status === 'queued') return 'queued';
-    if (status === 'running' || status === 'started') return 'running';
-    if (status === 'completed') return 'completed';
-    if (status === 'failed') return 'failed';
-    if (status === 'blocked') return 'blocked';
-  }
-  return null;
-}
-
-function eventPathCandidates(payload: Record<string, unknown>): string[] {
-  const candidates: string[] = [];
-  const collect = (value: unknown): void => {
-    if (!isRecordPayload(value)) return;
-    for (const key of ['path', 'absolutePath', 'normalizedTargetPath', 'resourceScope', 'target', 'targets', 'targetPath', 'writeSet', 'deleteSet']) {
-      const field = value[key];
-      if (typeof field === 'string' && field.trim()) candidates.push(field);
-      if (Array.isArray(field)) {
-        for (const item of field) {
-          if (typeof item === 'string' && item.trim()) candidates.push(item);
-        }
-      }
-    }
-  };
-  collect(payload);
-  collect(payload.activity);
-  const kernelEvent = kernelEventFromPayload(payload);
-  const kernelRecord = kernelEvent as unknown as Record<string, unknown> | undefined;
-  collect(kernelRecord);
-  if (kernelEvent?.kind === 'tool.completed') {
-    collect(kernelEvent.fact.output);
-  } else if (kernelEvent?.kind === 'tool.requested') {
-    collect(kernelEvent.fact.argsPreview);
-  } else if (kernelRecord && 'output' in kernelRecord) {
-    collect(kernelRecord.output);
-  }
-  if (kernelEvent?.kind === 'work_unit.queued') collect(kernelEvent.workUnit);
-  const output = isRecordPayload(payload.output) ? payload.output : undefined;
-  collect(output);
-  const workUnit = isRecordPayload(payload.workUnit) ? payload.workUnit : undefined;
-  collect(workUnit);
-  return candidates;
-}
-
-function eventIdCandidates(payload: Record<string, unknown>): string[] {
-  const candidates: string[] = [];
-  const collect = (value: unknown): void => {
-    if (!isRecordPayload(value)) return;
-    for (const key of ['id', 'actionId', 'workUnitId', 'toolCallId']) {
-      const field = value[key];
-      if (typeof field === 'string' && field.trim()) candidates.push(field);
-    }
-  };
-  collect(payload);
-  collect(payload.activity);
-  const kernelEvent = kernelEventFromPayload(payload);
-  const kernelRecord = kernelEvent as unknown as Record<string, unknown> | undefined;
-  collect(kernelRecord);
-  if (kernelEvent?.kind === 'tool.completed' || kernelEvent?.kind === 'tool.requested') {
-    collect(kernelEvent.fact);
-  }
-  if (kernelEvent?.kind === 'work_unit.queued') collect(kernelEvent.workUnit);
-  const workUnit = isRecordPayload(payload.workUnit) ? payload.workUnit : undefined;
-  collect(workUnit);
-  return candidates;
-}
-
-function stringArrayOrSingleField(record: Record<string, unknown>, key: string): string[] {
-  const value = record[key];
-  if (typeof value === 'string' && value.trim()) return [value.trim()];
-  if (Array.isArray(value)) return value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0);
-  return [];
-}
-
-function normalizeTaskPath(path: string): string {
-  const normalized = path.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+/g, '/').trim();
-  return normalized === '/' ? normalized : normalized.replace(/\/+$/, '');
-}
-
-function pathMatchesTaskTarget(path: string, target: string): boolean {
-  const normalizedPath = normalizeTaskPath(path);
-  const normalizedTarget = normalizeTaskPath(target);
-  if (!normalizedPath || !normalizedTarget) return false;
-  return normalizedPath === normalizedTarget ||
-    normalizedPath.endsWith(`/${normalizedTarget}`) ||
-    normalizedTarget.endsWith(`/${normalizedPath}`);
-}
-
 function normalizeTaskId(id: string): string {
   return id.trim().toLowerCase();
-}
-
-function idMatchesTaskId(id: string, taskId: string): boolean {
-  if (!id || !taskId) return false;
-  return id === taskId || id.endsWith(`:${taskId}`) || id.endsWith(`/${taskId}`) || id.includes(taskId);
 }
 
 export function buildTokenUsageProjection(events: AgentEvent[]): AgentTimelineTokenUsageProjection {

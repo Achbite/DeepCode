@@ -5,6 +5,7 @@ import type {
   ImplementationBatchContext,
 } from '../execution/index.js';
 import { acceptedPlanSettledTaskIds } from '../../accepted-plan/types.js';
+import { taskLedgerKernelCompletedTaskIds } from '../../run-state/index.js';
 
 export interface ProviderContextSupportState {
   runId: string;
@@ -35,7 +36,7 @@ export class ProviderContextSupport {
       const currentTask = acceptedPlan.tasks.find((task) => !settled.has(task.taskId));
       const currentTaskOperations = this.currentTaskOperations(acceptedPlan);
       hints.push(
-        `AcceptedTaskCursor: planId=${acceptedPlan.planId}; currentTask=${currentTask?.taskId ?? 'complete'}; settledTasks=${settled.size}/${acceptedPlan.tasks.length}; kernelCompletedTasks=${acceptedPlan.completedTaskIds.length}`,
+        `AcceptedTaskCursor: planId=${acceptedPlan.planId}; currentTask=${currentTask?.taskId ?? 'complete'}; settledTasks=${settled.size}/${acceptedPlan.tasks.length}; kernelCompletedTasks=${taskLedgerKernelCompletedTaskIds(acceptedPlan.taskLedger).length}`,
         currentTask
           ? `CurrentAcceptedTask: taskId=${currentTask.taskId}; targets=${currentTask.targets.length ? currentTask.targets.join(', ') : 'none'}; toolId=${currentTask.toolId ?? 'none'}`
           : 'CurrentAcceptedTask: complete-or-unavailable',

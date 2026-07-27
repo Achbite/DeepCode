@@ -7,6 +7,7 @@ import type {
   SessionGoalFactPayloadV1,
   SessionGoalLifecycleV1,
   SessionGoalRefV1,
+  TaskLedgerSnapshotV2,
 } from '@deepcode/protocol';
 
 export type GoalOperationKind =
@@ -39,6 +40,8 @@ export interface ReducedSessionGoalV1 {
   sourceRunId: string;
   confirmedPlanRef?: string;
   authorizationFactRef?: string;
+  taskLedger?: TaskLedgerSnapshotV2;
+  taskLedgerFactRef?: string;
   terminalReason?: string;
   terminalFactRef?: string;
   facts: Array<{

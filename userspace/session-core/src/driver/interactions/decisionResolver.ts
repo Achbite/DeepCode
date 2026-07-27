@@ -51,6 +51,9 @@ export interface DecisionResolverInput {
   guidance?: string;
   runId?: string;
   targetId?: string;
+  interactionId?: string;
+  interactionRevision?: string;
+  decisionRequestId?: string;
   existingEvents?: AgentEvent[];
   workspaceBinding?: AgentWorkspaceBinding;
   projectWorkingDirectory?: ProjectWorkingDirectory;
@@ -157,6 +160,8 @@ export class DecisionResolver {
         guidance: input.guidance,
         runId: input.runId,
         targetId: input.targetId,
+        interactionId: input.interactionId,
+        interactionRevision: input.interactionRevision,
         existingEvents: input.existingEvents,
         workspaceBinding: input.workspaceBinding,
         projectWorkingDirectory: input.projectWorkingDirectory,

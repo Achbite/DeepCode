@@ -215,6 +215,8 @@ export function kernelFactRefFromEvent(
   const fact = objectRecord(kernelEvent.fact)
     ?? objectRecord(kernelEvent.result)
     ?? objectRecord(kernelEvent.output);
+  const projectionWorkUnit = objectRecord(kernelEvent.projectionWorkUnit);
+  const kernelContext = objectRecord(fact?.kernelContext);
   const ref: SessionKernelFactRefV1 = {
     schemaVersion: 'deepcode.session.kernel-fact-ref.v1',
     kernelEventRef: requiredRef(
@@ -227,16 +229,20 @@ export function kernelFactRefFromEvent(
       ?? stringValue(fact?.id)
       ?? stringValue(fact?.factId),
     planActionId: stringValue(kernelEvent.planActionId)
-      ?? stringValue(fact?.planActionId),
+      ?? stringValue(fact?.planActionId)
+      ?? stringValue(projectionWorkUnit?.actionId)
+      ?? stringValue(fact?.actionId),
     capabilityGrantId: stringValue(kernelEvent.capabilityGrantId)
       ?? stringValue(fact?.capabilityGrantId),
     authorizationContractId: stringValue(kernelEvent.authorizationContractId)
       ?? stringValue(fact?.authorizationContractId)
       ?? stringValue(fact?.contractId),
     operationId: stringValue(kernelEvent.operationId)
-      ?? stringValue(fact?.operationId),
+      ?? stringValue(fact?.operationId)
+      ?? stringValue(projectionWorkUnit?.operationId),
     workUnitId: stringValue(kernelEvent.workUnitId)
-      ?? stringValue(fact?.workUnitId),
+      ?? stringValue(fact?.workUnitId)
+      ?? stringValue(kernelContext?.workUnitId),
   };
   const parsed = parseKernelFactRef(ref);
   if (!parsed) {

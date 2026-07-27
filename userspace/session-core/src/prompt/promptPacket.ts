@@ -123,7 +123,7 @@ function taskFrameFromInput(input: PromptEnvelopeBuilderInput): PromptPacketFram
   const targets = stringArray(record.targets);
   const acceptanceCriteria = stringArray(record.acceptanceCriteria);
   const failureCriteria = stringArray(record.failureCriteria);
-  const completed = stringArray(record.completedTaskIds);
+  const settled = stringArray(record.settledTaskIds);
   const goal = input.currentTaskGoal ?? stringValue(record.goal);
   return {
     kind: 'TaskFrame',
@@ -138,7 +138,7 @@ function taskFrameFromInput(input: PromptEnvelopeBuilderInput): PromptPacketFram
       `targets=${targets.length ? targets.join(', ') : 'none'}`,
       `acceptanceCriteria=${acceptanceCriteria.length ? acceptanceCriteria.map((item) => oneLine(item, 180)).join(' | ') : 'none'}`,
       `failureCriteria=${failureCriteria.length ? failureCriteria.map((item) => oneLine(item, 180)).join(' | ') : 'none'}`,
-      `completedTaskCount=${completed.length}`,
+      `settledTaskCount=${settled.length}`,
     ].filter(Boolean),
   };
 }

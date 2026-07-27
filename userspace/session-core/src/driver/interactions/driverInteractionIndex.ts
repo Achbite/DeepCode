@@ -39,10 +39,6 @@ export interface DriverInteractionIndexPorts {
     acceptedPlan: AcceptedTaskPlanContext;
     events: AgentEvent[];
   }): { nextAcceptedPlan: AcceptedTaskPlanContext };
-  recordTaskCompletion(input: {
-    acceptedPlan: AcceptedTaskPlanContext;
-    completedTaskIds: string[];
-  }): { nextAcceptedPlan: AcceptedTaskPlanContext };
 }
 
 export class DriverInteractionIndex {
@@ -65,19 +61,10 @@ export class DriverInteractionIndex {
       ?? this.ports.findPlanCard(events, undefined, planId);
     if (!plan?.taskPlan) return undefined;
     const executionRoot = plan.executionRoot ?? this.ports.executionRootFromDecision(input, events);
-    let acceptedPlan = this.ports.recoverLatestCheckpoint({
+    const acceptedPlan = this.ports.recoverLatestCheckpoint({
       acceptedPlan: this.ports.buildAcceptedPlan({ plan, interventionLevel: input.interventionLevel, executionRoot }),
       events,
     }).nextAcceptedPlan;
-    const overlayCompletedTaskIds = overlay.acceptedCompletedTaskIds ?? [];
-    if (overlayCompletedTaskIds.length) {
-      acceptedPlan = this.ports.recordTaskCompletion({
-        acceptedPlan,
-        completedTaskIds: [
-          ...new Set([...acceptedPlan.completedTaskIds, ...overlayCompletedTaskIds]),
-        ],
-      }).nextAcceptedPlan;
-    }
     return { plan, acceptedPlan };
   }
 }

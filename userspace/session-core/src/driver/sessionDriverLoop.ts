@@ -367,7 +367,6 @@ export class SessionDriverLoop {
       recordGeneratedPacket: (state, packet, stage) =>
         this.resourceOrchestrator.recordAndAppend(state, packet as ResourcePacket, stage),
       recordKernelBatchProgress: (progressInput) => acceptedPlanTaskLedger().recordKernelBatchProgress(progressInput),
-      recordModelTaskOutcome: (outcomeInput) => acceptedPlanTaskLedger().recordModelTaskOutcome(outcomeInput),
       refreshRuntimeState: (state) => acceptedPlanTaskLedger().refreshRuntimeState(state),
       complete: (accepted) => acceptedPlanTaskLedger().complete(accepted),
       batchCheckpointEvent: (sessionId, runId, accepted, proposal, kernelEvents, progress, ts, id, contextCompactRecord, language) =>
@@ -1028,44 +1027,8 @@ export class SessionDriverLoop {
     this.artifactDraftReplanCoordinator = new ArtifactDraftReplanCoordinator<SessionDriverLoopRunState>({
       discard: (state, reason) => this.artifactDraftCoordinator.discard(state, reason),
     });
-    this.acceptedTaskOutcomeCoordinator = new AcceptedTaskOutcomeCoordinator<SessionDriverLoopRunState>({
-      now: () => this.agentRunReactor.ts(),
-      createId: (prefix) => this.agentRunReactor.id(prefix),
-      append: (sessionId, events) => this.agentRunReactor.append(sessionId, events),
-      recordModelTaskOutcome: (outcomeInput) => acceptedPlanTaskLedger().recordModelTaskOutcome(outcomeInput),
-      refreshRuntimeState: (state) => acceptedPlanTaskLedger().refreshRuntimeState(state),
-      complete: (accepted) => acceptedPlanTaskLedger().complete(accepted),
-      taskOutcomeCheckpointEvent: (eventInput) =>
-        sessionProgressProjectionBuilder.acceptedPlanTaskOutcomeCheckpointEvent(eventInput),
-      taskSavepointEvent: (
-        sessionId,
-        runId,
-        accepted,
-        nextAccepted,
-        progress,
-        kernelEvents,
-        cursor,
-        context,
-        ts,
-        id,
-        contextCompactRecord,
-        language
-      ) =>
-        sessionProgressProjectionBuilder.acceptedPlanTaskSavepointEvent(
-          sessionId,
-          runId,
-          accepted,
-          nextAccepted,
-          progress,
-          kernelEvents,
-          cursor,
-          context,
-          ts,
-          id,
-          contextCompactRecord,
-          language
-        ),
-    });
+    this.acceptedTaskOutcomeCoordinator =
+      new AcceptedTaskOutcomeCoordinator<SessionDriverLoopRunState>({});
     this.nativeToolHandlerPortsFactory = new NativeToolHandlerPortsFactory({
       projectionBuilder: nativeToolProjectionBuilder,
       emitProjectionDelta: (state, delta) => this.agentRunReactor.emitProjectionDelta(state, delta),
@@ -1357,36 +1320,6 @@ export class SessionDriverLoop {
     });
     this.providerTurnCycle = new ProviderTurnCycle<SessionDriverLoopInput, SessionDriverLoopRunState>({
       refreshRuntimeState: (state) => acceptedPlanTaskLedger().refreshRuntimeState(state),
-      takePendingReview: (state) => {
-        const pending = state.pendingAcceptedTaskOutcomeReview;
-        const accepted = state.acceptedTaskPlan;
-        if (!pending || !accepted) return undefined;
-        state.pendingAcceptedTaskOutcomeReview = undefined;
-        const language = conversationPresentationLanguage(state);
-        const safeAssessmentSummary = language === 'zh-CN'
-          ? `Session 已根据任务 ${pending.taskId} 的当前证据评估其无需额外 workspace mutation；此结论等待用户复核，且不代表 Kernel 执行完成。`
-          : language === 'en-US'
-            ? `Session assessed task ${pending.taskId} from current evidence as requiring no additional workspace mutation; this awaits user review and is not a Kernel execution-completion fact.`
-            : `task=${pending.taskId} evidenceAssessment=noAdditionalMutation userReview=pending kernelExecutionCompleted=false`;
-        const plan = acceptedPlanExecutor.modelTaskOutcomeReviewContext({
-          sessionId: state.sessionId,
-          runId: state.runId,
-          acceptedPlan: accepted,
-          taskId: pending.taskId,
-          summary: safeAssessmentSummary,
-          evidenceRefs: pending.evidenceRefs,
-        });
-        return {
-          sessionId: state.sessionId,
-          runId: state.runId,
-          planId: accepted.planId,
-          plan,
-          result: pending.result,
-          currentKernelEvents: [],
-          requestIdPrefix: 'accepted-plan-task-outcome-review-facts-get',
-          presentationBinding: conversationPresentationLanguageBinding(state),
-        };
-      },
       prepareProviderContext: async (handlerInput, state, lastResult) => {
         const guidance = await this.admitQueuedProviderGuidance(
           state,

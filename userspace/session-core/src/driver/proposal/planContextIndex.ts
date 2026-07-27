@@ -7,6 +7,7 @@ export interface PlanContext {
   sessionId: string;
   runId: string;
   planId: string;
+  sourceEventRef?: string;
   proposalId?: string;
   userPlan: string;
   actionBundle: Record<string, unknown>;
@@ -79,6 +80,7 @@ export class PlanContextIndex {
       sessionId: event.sessionId,
       runId,
       planId,
+      sourceEventRef: event.id,
       proposalId: stringValue(payload.proposalId),
       userPlan: stringValue(payload.content) ?? stringValue(payload.summary) ?? 'Agent plan',
       actionBundle: actionBundle as unknown as Record<string, unknown>,

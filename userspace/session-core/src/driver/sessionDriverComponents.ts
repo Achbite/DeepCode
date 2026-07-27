@@ -116,7 +116,6 @@ export const driverInteractionIndex = new DriverInteractionIndex({
   executionRootFromDecision: (input, events) => AcceptedPlanExecutionRootResolver.fromDecision(input, events),
   buildAcceptedPlan: (input) => acceptedTaskPlanContextBuilder().build(input),
   recoverLatestCheckpoint: (input) => acceptedPlanTaskLedger().recoverLatestCheckpoint(input),
-  recordTaskCompletion: (input) => acceptedPlanTaskLedger().recordTaskCompletion(input),
 });
 export const kernelEventProjectionBuilder = new KernelEventProjectionBuilder({
   requiredFileOperationsFromReport: (report) => planReviewGrantProjector.requiredFileOperationsFromReport(report),
@@ -160,9 +159,6 @@ export const reviewProjectionBuilder = new ReviewProjectionBuilder<SessionPlanCo
   acceptedPlanContext: (plan) => plan.taskPlan
     ? acceptedTaskPlanContextBuilder().build({ plan, interventionLevel: undefined, executionRoot: plan.executionRoot })
     : undefined,
-  acceptedPlanBatchCompletedTaskIds: (acceptedPlan, plan, kernelEvents) =>
-    acceptedPlanTaskLedger().recordKernelBatchProgress({ acceptedPlan, proposal: planContextIndex.proposalEnvelope(plan), kernelEvents }).completedTaskIds,
-  acceptedPlanAfterBatch: (acceptedPlan, completedTaskIds) => acceptedPlanTaskLedger().recordTaskCompletion({ acceptedPlan, completedTaskIds }).nextAcceptedPlan,
   acceptedPlanTaskLedger: (acceptedPlan) => acceptedPlanTaskLedger().ledger(acceptedPlan),
   buildReviewFactsContext: (input) => buildReviewFactsContext(input),
 });
@@ -256,12 +252,7 @@ export function acceptedTaskPlanContextBuilder(): AcceptedTaskPlanContextBuilder
 }
 
 export function acceptedPlanTaskLedger(): AcceptedPlanTaskLedgerCoordinator {
-  return new AcceptedPlanTaskLedgerCoordinator({
-    workUnitIdsFromKernelEvents: (events) =>
-      kernelEventStatusIndex.workUnitIds(kernelEventStatusIndex.decodeEvents(events)),
-    actionBatchHasFailureOrBlocker: (events) =>
-      kernelEventStatusIndex.hasFailureOrBlocker(kernelEventStatusIndex.decodeEvents(events)),
-  });
+  return new AcceptedPlanTaskLedgerCoordinator();
 }
 
 export function reviewAssembler(): ReviewAssembler {

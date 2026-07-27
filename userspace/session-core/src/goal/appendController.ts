@@ -4,6 +4,7 @@ import type {
   SessionDomainStateSnapshotV1,
   SessionGoalEffectV1,
   SessionGoalFactPayloadV1,
+  SessionTaskDefinitionV1,
 } from '@deepcode/protocol';
 import { stableHash } from '../cache/canonicalizer.js';
 import {
@@ -511,12 +512,37 @@ function latestPlanAuthorizationDecision(
   });
 }
 
-function taskSnapshot(planCard: AgentEvent): unknown[] {
+function taskSnapshot(planCard: AgentEvent): SessionTaskDefinitionV1[] {
   const payload = objectRecord(planCard.payload);
   const taskPlan = objectRecord(payload?.taskPlan);
-  return Array.isArray(taskPlan?.tasks)
-    ? structuredClone(taskPlan.tasks)
-    : [];
+  const tasks = Array.isArray(taskPlan?.tasks) ? taskPlan.tasks : [];
+  const snapshot = tasks.flatMap((value, index): SessionTaskDefinitionV1[] => {
+    const task = objectRecord(value);
+    const taskId = stringField(task, 'taskId')
+      ?? stringField(task, 'id')
+      ?? `task-${index + 1}`;
+    if (!task) return [];
+    return [{
+      taskId,
+      title: stringField(task, 'title'),
+      targets: uniqueStrings([
+        ...stringArray(task.target),
+        ...stringArray(task.targets),
+      ]),
+      toolId: stringField(task, 'toolId'),
+      dependencies: uniqueStrings(stringArray(task.dependencies)),
+      acceptanceCriteria: uniqueStrings(stringArray(task.acceptanceCriteria)),
+      failureCriteria: uniqueStrings(stringArray(task.failureCriteria)),
+      required: true,
+    }];
+  });
+  if (!snapshot.length || snapshot.length !== tasks.length) {
+    throw new SessionGoalError(
+      'session_goal_schema_unavailable',
+      `Goal Plan ${planCard.id} has no closed task snapshot.`
+    );
+  }
+  return snapshot;
 }
 
 function lastEvent(
@@ -554,4 +580,17 @@ function stringField(value: unknown, key: string): string | undefined {
   return typeof field === 'string' && field.trim()
     ? field.trim()
     : undefined;
+}
+
+function stringArray(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return value.flatMap((item) => (
+      typeof item === 'string' && item.trim() ? [item.trim()] : []
+    ));
+  }
+  return typeof value === 'string' && value.trim() ? [value.trim()] : [];
+}
+
+function uniqueStrings(values: string[]): string[] {
+  return [...new Set(values)];
 }

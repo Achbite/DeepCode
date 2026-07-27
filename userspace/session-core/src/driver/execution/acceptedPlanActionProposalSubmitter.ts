@@ -148,17 +148,9 @@ export interface AcceptedPlanActionProposalSubmitterPorts<
   recordKernelBatchProgress(input: {
     acceptedPlan: AcceptedTaskPlanContext;
     proposal: ProposalEnvelope;
-    kernelEvents: unknown[];
+    kernelEvents: AgentEvent[];
   }): {
     progress: AcceptedPlanBatchProgress;
-    completedTaskIds: string[];
-    nextAcceptedPlan: AcceptedTaskPlanContext;
-  };
-  recordModelTaskOutcome(input: {
-    acceptedPlan: AcceptedTaskPlanContext;
-    taskId: string;
-  }): {
-    taskId: string;
     nextAcceptedPlan: AcceptedTaskPlanContext;
   };
   refreshRuntimeState(state: State): void;
@@ -393,11 +385,13 @@ export class AcceptedPlanActionProposalSubmitter<
     });
     const batchReply = observed.reply;
     await this.ports.emitKernelActivityDeltas(state, batchReply.events ?? [], 'accepted_plan.action_batch_submit');
+    const projectionStart = result.events.length;
     result = await this.ports.appendProjectedKernelEvents(
       state.sessionId,
       batchReply,
       conversationPresentationLanguage(state)
     ) ?? result;
+    const projectedKernelEvents = result.events.slice(projectionStart);
     if (observed.kind === 'commandFailed') {
       const message = kernelReplyErrorMessage(batchReply, 'Kernel actionBatchSubmit failed');
       const code = observed.code;
@@ -462,7 +456,11 @@ export class AcceptedPlanActionProposalSubmitter<
       return result;
     }
     const completedTaskId = state.currentTaskContext?.taskId;
-    const ledgerEffect = this.ports.recordKernelBatchProgress({ acceptedPlan: accepted, proposal: executionProposal, kernelEvents: batchReply.events ?? [] });
+    const ledgerEffect = this.ports.recordKernelBatchProgress({
+      acceptedPlan: accepted,
+      proposal: executionProposal,
+      kernelEvents: projectedKernelEvents,
+    });
     const batchProgress = ledgerEffect.progress;
     const nextAccepted = ledgerEffect.nextAcceptedPlan;
     state.acceptedTaskPlan = nextAccepted;

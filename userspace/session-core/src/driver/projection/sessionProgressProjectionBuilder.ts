@@ -5,12 +5,16 @@ import type { ResourcePacket } from '../../context/types.js';
 import type {
   AcceptedTaskPlanContext,
   AcceptedPlanBatchProgress,
-  AcceptedPlanReadOnlyResourceCompletion,
   CurrentTaskContext,
   TaskExecutionCursor,
 } from '../execution/index.js';
 import type { InteractionOverlayContext, SessionTurnPhase } from '../pipelines/index.js';
-import { buildTaskLedgerSnapshot, type AcceptedPlanPromptFrame, type TaskLedgerSnapshot } from '../../run-state/index.js';
+import {
+  taskLedgerDeterministicallySettledTaskIds,
+  taskLedgerKernelCompletedTaskIds,
+  type AcceptedPlanPromptFrame,
+  type TaskLedgerSnapshot,
+} from '../../run-state/index.js';
 import { providerTelemetryFromUsage } from '../../cache/telemetry.js';
 import {
   localizedProjectionText,
@@ -205,15 +209,12 @@ export class SessionProgressProjectionBuilder {
     language: ConversationPresentationLanguage = 'neutral'
   ): AgentEvent {
     const complete = remainingTaskIds.length === 0;
-    const ledger = buildTaskLedgerSnapshot({
-      planId: accepted.planId,
-      runId,
-      tasks: this.taskRecords(accepted),
-      completedTaskIds: accepted.completedTaskIds,
-      modelJudgedSufficientTaskIds: accepted.modelJudgedSufficientTaskIds ?? [],
-      skippedTaskIds: accepted.skippedTaskIds ?? [],
-      acceptedIncompleteTaskIds: accepted.acceptedIncompleteTaskIds ?? [],
-    });
+    const ledger = accepted.taskLedger;
+    const userSkippedTaskIds = taskIdsByUserOutcome(ledger, 'skipped');
+    const userAcceptedIncompleteTaskIds = taskIdsByUserOutcome(
+      ledger,
+      'acceptedIncomplete'
+    );
     const summary = complete
       ? localizedProjectionText(language, {
         zh: '用户需求决策后，已确认计划的任务清单已结算，准备进入最终 Review；该状态不等同于 Kernel 执行完成事实。',
@@ -243,9 +244,9 @@ export class SessionProgressProjectionBuilder {
         batchIndex: accepted.batchIndex,
         newlyCompletedTaskIds: [],
         newlySettledTaskIds,
-        completedTaskIds: ledger.completedTaskIds,
-        skippedTaskIds: ledger.skippedTaskIds,
-        acceptedIncompleteTaskIds: ledger.acceptedIncompleteTaskIds,
+        completedTaskIds: taskLedgerKernelCompletedTaskIds(ledger),
+        skippedTaskIds: userSkippedTaskIds,
+        acceptedIncompleteTaskIds: userAcceptedIncompleteTaskIds,
         remainingTaskIds,
         taskLedger: ledger,
         taskOrder: ledger.taskOrder,
@@ -291,24 +292,11 @@ export class SessionProgressProjectionBuilder {
   ): AgentEvent {
     const failedOrBlocked = this.ports.hasFailureOrBlocker(kernelEvents);
     const complete = !failedOrBlocked && progress.remainingTaskIds.length === 0;
-    const evidenceAssessedTaskIds = progress.modelJudgedSufficientTaskIds
-      ?? accepted.modelJudgedSufficientTaskIds
-      ?? [];
-    const kernelCompletedTaskCount = progress.completedTaskIds.length;
-    const evidenceAssessedTaskCount = evidenceAssessedTaskIds.length;
-    const ledger = buildTaskLedgerSnapshot({
-      planId: accepted.planId,
-      runId,
-      tasks: this.taskRecords(accepted),
-      completedTaskIds: progress.completedTaskIds,
-      modelJudgedSufficientTaskIds: evidenceAssessedTaskIds,
-      failedTaskId: failedOrBlocked
-        ? accepted.tasks.find((task) => (
-          !progress.completedTaskIds.includes(task.taskId)
-          && !evidenceAssessedTaskIds.includes(task.taskId)
-        ))?.taskId
-        : undefined,
-    });
+    const ledger = progress.taskLedger;
+    const kernelCompletedTaskCount = progress.kernelCompletedTaskIds.length;
+    const deterministicTaskIds =
+      taskLedgerDeterministicallySettledTaskIds(ledger);
+    const deterministicTaskCount = deterministicTaskIds.length;
     const summary = failedOrBlocked
       ? localizedProjectionText(language, {
         zh: '已确认计划的当前执行批次存在失败或阻塞，已暂停自动推进。',
@@ -317,9 +305,9 @@ export class SessionProgressProjectionBuilder {
       })
       : complete
         ? localizedProjectionText(language, {
-          zh: `已确认计划的任务已全部结算：${kernelCompletedTaskCount} 个由 Kernel facts 确认完成，${evidenceAssessedTaskCount} 个由 Session 根据任务证据评估为无需额外 workspace mutation；准备进入最终 Review。`,
-          en: `All accepted-plan tasks are settled: ${kernelCompletedTaskCount} completed by Kernel facts and ${evidenceAssessedTaskCount} assessed by Session evidence as requiring no additional workspace mutation; preparing the final Review.`,
-          neutral: `AcceptedPlan settled kernelCompleted=${kernelCompletedTaskCount} evidenceAssessedNoMutation=${evidenceAssessedTaskCount}`,
+          zh: `已确认计划的任务已全部结算：${kernelCompletedTaskCount} 个由 Kernel facts 确认完成，${deterministicTaskCount} 个由已登记的确定性校验器确认；准备进入最终 Review。`,
+          en: `All accepted-plan tasks are settled: ${kernelCompletedTaskCount} completed by Kernel facts and ${deterministicTaskCount} confirmed by registered deterministic validators; preparing the final Review.`,
+          neutral: `AcceptedPlan settled kernelCompleted=${kernelCompletedTaskCount} deterministic=${deterministicTaskCount}`,
         })
         : localizedProjectionText(language, {
           zh: '已确认计划的当前执行批次已完成，Session 将继续生成下一批。',
@@ -343,11 +331,10 @@ export class SessionProgressProjectionBuilder {
         actionIds: progress.actionIds,
         targetPaths: progress.targetPaths,
         workUnitIds: progress.workUnitIds,
-        newlyCompletedTaskIds: progress.newlyCompletedTaskIds,
-        completedTaskIds: progress.completedTaskIds,
+        newlyCompletedTaskIds: progress.newlySettledTaskIds,
+        completedTaskIds: progress.kernelCompletedTaskIds,
         dependencyFacts: accepted.dependencyFacts,
-        newlyModelJudgedSufficientTaskIds: progress.newlyModelJudgedSufficientTaskIds ?? [],
-        modelJudgedSufficientTaskIds: evidenceAssessedTaskIds,
+        deterministicSettlementTaskIds: deterministicTaskIds,
         remainingTaskIds: progress.remainingTaskIds,
         taskLedger: ledger,
         taskOrder: ledger.taskOrder,
@@ -384,89 +371,6 @@ export class SessionProgressProjectionBuilder {
           targets: progress.targetPaths,
           actionIds: progress.actionIds,
           workUnitIds: progress.workUnitIds,
-        }),
-      },
-    };
-  }
-
-  acceptedPlanResourceValidationCheckpointEvent(
-    sessionId: string,
-    runId: string,
-    accepted: AcceptedTaskPlanContext,
-    packet: ResourcePacket,
-    completion: AcceptedPlanReadOnlyResourceCompletion,
-    ts: string,
-    id: string,
-    contextCompactRecord?: ContextAssemblyTaskLocalCompactRecord,
-    language: ConversationPresentationLanguage = 'neutral'
-  ): AgentEvent {
-    const complete = completion.remainingTaskIds.length === 0;
-    const ledger = buildTaskLedgerSnapshot({
-      planId: accepted.planId,
-      runId,
-      tasks: this.taskRecords(accepted),
-      completedTaskIds: completion.completedTaskIds,
-      modelJudgedSufficientTaskIds: accepted.modelJudgedSufficientTaskIds ?? [],
-    });
-    const summary = complete
-      ? localizedProjectionText(language, {
-        zh: '只读证据已满足剩余的已确认任务，准备进入最终 Review。',
-        en: 'Read-only evidence satisfied the remaining accepted task; ready for final review.',
-        neutral: 'ReadOnly evidence ✓',
-      })
-      : localizedProjectionText(language, {
-        zh: '只读证据已满足当前已确认任务，Session 将继续下一项任务。',
-        en: 'Read-only evidence satisfied the current accepted task; Session will continue with the next task.',
-        neutral: 'ReadOnly task ✓',
-      });
-    return {
-      id,
-      sessionId,
-      ts,
-      kind: 'workflow_stage',
-      payload: {
-        stage: 'accepted_plan.batch_checkpoint',
-        status: 'completed',
-        summary,
-        presentationLanguage: language,
-        runId,
-        planId: accepted.planId,
-        source: 'resourceValidation',
-        batchIndex: accepted.batchIndex,
-        resourcePacketId: packet.id,
-        validatedTaskId: completion.taskId,
-        coveredTargets: completion.coveredTargets,
-        targetPaths: completion.coveredTargets,
-        newlyCompletedTaskIds: completion.newlyCompletedTaskIds,
-        completedTaskIds: completion.completedTaskIds,
-        remainingTaskIds: completion.remainingTaskIds,
-        taskLedger: ledger,
-        taskOrder: ledger.taskOrder,
-        nextPendingTaskIds: ledger.pendingTaskIds,
-        contextCompactRecord,
-        channel: 'progress',
-        visibility: 'conversation',
-        presentation: 'collapsible',
-        activity: conversationActivity({
-          activityId: id,
-          kind: complete ? 'reviewCheckpoint' : 'editBatchQueued',
-          status: 'completed',
-          title: complete
-            ? localizedProjectionText(language, {
-              zh: '已确认计划验证完成',
-              en: 'Accepted plan validation complete',
-              neutral: 'Validation ✓',
-            })
-            : localizedProjectionText(language, {
-              zh: '已确认计划的只读验证已完成',
-              en: 'Accepted plan read-only validation completed',
-              neutral: 'ReadOnly validation ✓',
-            }),
-          summary,
-          source: 'session',
-          runId,
-          planId: accepted.planId,
-          targets: completion.coveredTargets,
         }),
       },
     };
@@ -653,16 +557,16 @@ export class SessionProgressProjectionBuilder {
     const complete = progress.remainingTaskIds.length === 0 && !this.ports.hasFailureOrBlocker(kernelEvents);
     const ledger = this.ports.acceptedPlanTaskLedger(nextAccepted);
     const promptFrame = this.ports.acceptedPlanPromptFrame(nextAccepted, ledger);
-    const kernelCompletedTaskCount = progress.completedTaskIds.length;
-    const evidenceAssessedTaskIds = progress.modelJudgedSufficientTaskIds
-      ?? nextAccepted.modelJudgedSufficientTaskIds
-      ?? [];
-    const evidenceAssessedTaskCount = evidenceAssessedTaskIds.length;
+    const kernelCompletedTaskCount = progress.kernelCompletedTaskIds.length;
+    const deterministicTaskIds = ledger
+      ? taskLedgerDeterministicallySettledTaskIds(ledger)
+      : [];
+    const deterministicTaskCount = deterministicTaskIds.length;
     const summary = complete
       ? localizedProjectionText(language, {
-        zh: `已确认 taskPlan 的任务已全部结算：${kernelCompletedTaskCount} 个由 Kernel facts 确认完成，${evidenceAssessedTaskCount} 个由 Session 根据任务证据评估为无需额外 workspace mutation。`,
-        en: `All accepted taskPlan tasks are settled: ${kernelCompletedTaskCount} completed by Kernel facts and ${evidenceAssessedTaskCount} assessed by Session evidence as requiring no additional workspace mutation.`,
-        neutral: `taskPlan settled kernelCompleted=${kernelCompletedTaskCount} evidenceAssessedNoMutation=${evidenceAssessedTaskCount}`,
+        zh: `已确认 taskPlan 的任务已全部结算：${kernelCompletedTaskCount} 个由 Kernel facts 确认完成，${deterministicTaskCount} 个由已登记的确定性校验器确认。`,
+        en: `All accepted taskPlan tasks are settled: ${kernelCompletedTaskCount} completed by Kernel facts and ${deterministicTaskCount} confirmed by registered deterministic validators.`,
+        neutral: `taskPlan settled kernelCompleted=${kernelCompletedTaskCount} deterministic=${deterministicTaskCount}`,
       })
       : localizedProjectionText(language, {
         zh: '已保存已确认 taskPlan 的进度；下一批将按任务清单顺序继续。',
@@ -682,7 +586,7 @@ export class SessionProgressProjectionBuilder {
           'accepted_plan.task_savepoint',
           `status=${complete ? 'completed' : 'running'}`,
           `kernelCompleted=${kernelCompletedTaskCount}`,
-          `evidenceAssessedNoMutation=${evidenceAssessedTaskCount}`,
+          `deterministic=${deterministicTaskCount}`,
           `remaining=${progress.remainingTaskIds.length}`,
         ].join(' '),
         presentationLanguage: language,
@@ -691,19 +595,18 @@ export class SessionProgressProjectionBuilder {
           messageKey: 'session.driver.acceptedPlanTaskSavepointRunning',
         } : {}),
         messageArgs: {
-          newlyCompletedTaskCount: progress.newlyCompletedTaskIds.length,
+          newlyCompletedTaskCount: progress.newlySettledTaskIds.length,
           kernelCompletedTaskCount,
-          evidenceAssessedTaskCount,
+          deterministicTaskCount,
         },
         runId,
         planId: accepted.planId,
         taskCursorId: cursor?.cursorId,
         taskId: context?.taskId,
-        completedTaskIds: progress.completedTaskIds,
-        newlyCompletedTaskIds: progress.newlyCompletedTaskIds,
-        modelJudgedSufficientTaskIds: evidenceAssessedTaskIds,
+        completedTaskIds: progress.kernelCompletedTaskIds,
+        newlyCompletedTaskIds: progress.newlySettledTaskIds,
+        deterministicSettlementTaskIds: deterministicTaskIds,
         dependencyFacts: nextAccepted.dependencyFacts,
-        newlyModelJudgedSufficientTaskIds: progress.newlyModelJudgedSufficientTaskIds ?? [],
         remainingTaskIds: progress.remainingTaskIds,
         taskLedger: ledger,
         taskOrder: ledger?.taskOrder ?? [],
@@ -714,9 +617,9 @@ export class SessionProgressProjectionBuilder {
         kernelEventCount: kernelEvents.length,
         contextCompactRecord,
         memoryUpdateSummary: localizedProjectionText(language, {
-          zh: 'SessionMemory 将分别保留 Kernel 完成记录、证据评估无需 mutation 的记录、当前任务焦点和下一检查点。',
-          en: 'SessionMemory will retain Kernel-completion records, evidence-assessed no-mutation records, the active task focus, and the next checkpoint separately.',
-          neutral: 'SessionMemory checkpoint updated with separate settlement sources',
+          zh: 'SessionMemory 将分别保留 Kernel 完成记录、确定性校验记录、当前任务焦点和下一检查点。',
+          en: 'SessionMemory will retain Kernel-completion records, deterministic-validator records, the active task focus, and the next checkpoint separately.',
+          neutral: 'SessionMemory checkpoint updated with evidence-backed settlement sources',
         }),
         channel: 'progress',
         visibility: 'conversation',
@@ -738,9 +641,9 @@ export class SessionProgressProjectionBuilder {
             }),
           summary: complete
             ? localizedProjectionText(language, {
-              zh: `任务已结算：Kernel facts 完成 ${kernelCompletedTaskCount} 个；证据评估无需 mutation ${evidenceAssessedTaskCount} 个。`,
-              en: `Tasks settled: ${kernelCompletedTaskCount} completed by Kernel facts; ${evidenceAssessedTaskCount} evidence-assessed as needing no mutation.`,
-              neutral: `AcceptedTasks settled kernelCompleted=${kernelCompletedTaskCount} evidenceAssessedNoMutation=${evidenceAssessedTaskCount}`,
+              zh: `任务已结算：Kernel facts 完成 ${kernelCompletedTaskCount} 个；确定性校验器确认 ${deterministicTaskCount} 个。`,
+              en: `Tasks settled: ${kernelCompletedTaskCount} completed by Kernel facts; ${deterministicTaskCount} confirmed by deterministic validators.`,
+              neutral: `AcceptedTasks settled kernelCompleted=${kernelCompletedTaskCount} deterministic=${deterministicTaskCount}`,
             })
             : localizedProjectionText(language, {
               zh: '已保存已确认任务进度，供下一 Provider 检查点继续。',
@@ -750,93 +653,7 @@ export class SessionProgressProjectionBuilder {
           source: 'session',
           runId,
           targets: progress.targetPaths,
-          itemCount: progress.newlyCompletedTaskIds.length
-            + (progress.newlyModelJudgedSufficientTaskIds?.length ?? 0),
-        }),
-      },
-    };
-  }
-
-  acceptedPlanTaskOutcomeCheckpointEvent(input: {
-    sessionId: string;
-    runId: string;
-    accepted: AcceptedTaskPlanContext;
-    nextAccepted: AcceptedTaskPlanContext;
-    taskId: string;
-    evidenceRefs: string[];
-    acceptanceResults: Array<{
-      criterionIndex: number;
-      status: 'satisfied';
-      evidenceRefs: string[];
-    }>;
-    evidenceRevision: number;
-    progress: AcceptedPlanBatchProgress;
-    contextCompactRecord?: ContextAssemblyTaskLocalCompactRecord;
-    language: ConversationPresentationLanguage;
-    ts: string;
-    id: string;
-  }): AgentEvent {
-    const taskLedger = this.ports.acceptedPlanTaskLedger(input.nextAccepted);
-    const summary = localizedProjectionText(input.language, {
-      zh: `Session 已根据当前任务范围内最新、完整且未截断的资源证据，将任务 ${input.taskId} 评估为无需额外 workspace mutation；这不是 Kernel 执行完成事实。`,
-      en: `Session assessed task ${input.taskId} from fresh, complete, non-truncated task-scoped resource evidence as requiring no additional workspace mutation; this is not a Kernel execution-completion fact.`,
-      neutral: `task=${input.taskId} evidenceAssessment=noAdditionalMutation kernelExecutionCompleted=false`,
-    });
-    return {
-      id: input.id,
-      sessionId: input.sessionId,
-      ts: input.ts,
-      kind: 'workflow_stage',
-      payload: {
-        stage: 'accepted_plan.batch_checkpoint',
-        source: 'modelTaskOutcome',
-        assessmentOwner: 'session',
-        settlementKind: 'evidenceAssessedNoMutation',
-        kernelExecutionCompleted: false,
-        status: input.progress.remainingTaskIds.length ? 'running' : 'completed',
-        summary,
-        memorySummary: [
-          'accepted_plan.batch_checkpoint',
-          `taskId=${input.taskId}`,
-          'settlement=evidenceAssessedNoMutation',
-          'kernelExecutionCompleted=false',
-          `evidenceRefs=${input.evidenceRefs.length}`,
-        ].join(' '),
-        presentationLanguage: input.language,
-        runId: input.runId,
-        planId: input.accepted.planId,
-        taskId: input.taskId,
-        outcome: 'alreadySatisfied',
-        modelJudgedSufficient: true,
-        evidenceRefs: input.evidenceRefs,
-        evidenceRevision: input.evidenceRevision,
-        acceptanceResults: input.acceptanceResults,
-        newlyCompletedTaskIds: [],
-        completedTaskIds: input.progress.completedTaskIds,
-        modelJudgedSufficientTaskIds: input.progress.modelJudgedSufficientTaskIds ?? [],
-        newlyModelJudgedSufficientTaskIds: input.progress.newlyModelJudgedSufficientTaskIds ?? [],
-        remainingTaskIds: input.progress.remainingTaskIds,
-        taskLedger,
-        taskOrder: taskLedger?.taskOrder ?? [],
-        nextPendingTaskIds: taskLedger?.pendingTaskIds ?? [],
-        contextCompactRecord: input.contextCompactRecord,
-        channel: 'progress',
-        visibility: 'conversation',
-        presentation: 'collapsible',
-        activity: conversationActivity({
-          activityId: input.id,
-          kind: input.progress.remainingTaskIds.length ? 'editBatchQueued' : 'reviewCheckpoint',
-          status: 'completed',
-          title: localizedProjectionText(input.language, {
-            zh: '任务证据评估结果',
-            en: 'Task evidence assessment',
-            neutral: 'Task evidence assessment',
-          }),
-          summary,
-          source: 'session',
-          runId: input.runId,
-          planId: input.accepted.planId,
-          targets: input.accepted.tasks.find((task) => task.taskId === input.taskId)?.targets,
+          itemCount: progress.newlySettledTaskIds.length,
         }),
       },
     };
@@ -859,23 +676,23 @@ export class SessionProgressProjectionBuilder {
     return { key: 'session.runState.planReview' };
   }
 
-  private taskRecords(accepted: AcceptedTaskPlanContext): Array<{
-    taskId: string;
-    title: string;
-    targets: string[];
-    capability?: string;
-  }> {
-    return accepted.tasks.map((task) => ({
-      taskId: task.taskId,
-      title: task.title ?? task.taskId,
-      targets: task.targets,
-      toolId: task.toolId,
-    }));
-  }
 }
 
 function conversationActivity(input: AgentConversationActivity): AgentConversationActivity {
   return { ...input };
+}
+
+function taskIdsByUserOutcome(
+  ledger: TaskLedgerSnapshot,
+  outcome: 'skipped' | 'acceptedIncomplete'
+): string[] {
+  return ledger.entries.flatMap((entry) => (
+    entry.status === 'settled'
+    && entry.settlement?.kind === 'userDecision'
+    && entry.settlement.outcome === outcome
+      ? [entry.taskId]
+      : []
+  ));
 }
 
 function actionTargetsFromAudit(audit: Record<string, unknown>): string[] {

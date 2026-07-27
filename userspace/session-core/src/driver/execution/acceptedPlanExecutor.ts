@@ -4,14 +4,6 @@ import type { AcceptedTaskPlanContext } from '../../accepted-plan/types.js';
 import type { PlanContext } from '../proposal/planContextIndex.js';
 import type { KernelActionBatchV1, KernelActionV1, KernelContentBlockV1 } from '@deepcode/protocol';
 
-export interface AcceptedPlanReadOnlyResourceCompletion {
-  taskId: string;
-  newlyCompletedTaskIds: string[];
-  completedTaskIds: string[];
-  remainingTaskIds: string[];
-  coveredTargets: string[];
-}
-
 export type NormalizedAcceptedPlanKernelBatch =
   | {
       ok: true;
@@ -61,47 +53,6 @@ export class AcceptedPlanExecutor {
       reviewGuide: stringValue(payload.reviewGuide) ?? '',
       planReviewReport: input.planReviewReport,
       taskPlan: input.acceptedPlan?.rawPlan,
-    };
-  }
-
-  modelTaskOutcomeReviewContext(input: {
-    sessionId: string;
-    runId: string;
-    acceptedPlan: AcceptedTaskPlanContext;
-    taskId: string;
-    summary: string;
-    evidenceRefs: string[];
-  }): PlanContext {
-    return {
-      sessionId: input.sessionId,
-      runId: input.runId,
-      planId: input.acceptedPlan.planId,
-      proposalId: `${input.acceptedPlan.planId}:task-outcome`,
-      userPlan: input.acceptedPlan.summary ?? input.acceptedPlan.title ?? 'Accepted task plan',
-      actionBundle: {
-        version: '1',
-        id: `${input.acceptedPlan.planId}:task-outcome`,
-        goal: input.summary,
-        actions: [],
-        validationExpectations: [{
-          id: `${input.taskId}:already-satisfied`,
-          description: input.summary,
-          evidenceRefs: input.evidenceRefs,
-          source: 'sessionTaskOutcome',
-        }],
-        reviewExpectations: [{
-          id: `${input.taskId}:review-already-satisfied`,
-          description: 'Review the task-scoped evidence showing that no additional workspace mutation was required.',
-        }],
-      },
-      contentBlocks: [],
-      expectedValidation: input.summary,
-      reviewGuide: 'Distinguish Kernel execution facts from Session modelJudgedSufficient task outcomes.',
-      taskPlan: input.acceptedPlan.rawPlan,
-      planHash: input.acceptedPlan.planHash,
-      authorizationContractId: input.acceptedPlan.authorizationContractId,
-      authorizationContractHash: input.acceptedPlan.authorizationContractHash,
-      executionRoot: input.acceptedPlan.executionRoot,
     };
   }
 

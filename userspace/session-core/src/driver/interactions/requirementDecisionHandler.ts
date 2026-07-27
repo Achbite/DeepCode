@@ -58,6 +58,8 @@ export interface RequirementDecisionHandlerInput {
   guidance?: string;
   runId?: string;
   targetId?: string;
+  interactionId?: string;
+  interactionRevision?: string;
   existingEvents?: AgentEvent[];
   workspaceBinding?: AgentWorkspaceBinding;
   projectWorkingDirectory?: ProjectWorkingDirectory;
@@ -500,7 +502,7 @@ export class RequirementDecisionHandler {
       sessionId: input.sessionId,
       runId,
       proposalId: this.ports.createId('finish-with-answer-proposal'),
-      completedTasks: taskLedger?.completedTaskIds.length ?? 0,
+      completedTasks: taskLedger?.settledTaskIds.length ?? 0,
       totalTasks: taskLedger?.taskOrder.length ?? 0,
       pendingTasks: taskLedger?.pendingTaskIds.length ?? 0,
       reason,
@@ -552,13 +554,8 @@ export class RequirementDecisionHandler {
     const accepted = this.recoverAcceptedPlanForRequirement(current.events, runId, planId);
     if (!accepted) return undefined;
 
-    const settledTaskIds = new Set([
-      ...accepted.completedTaskIds,
-      ...(accepted.modelJudgedSufficientTaskIds ?? []),
-      ...(accepted.skippedTaskIds ?? []),
-      ...(accepted.acceptedIncompleteTaskIds ?? []),
-    ]);
-    const currentTaskId = accepted.tasks.find((task) => !settledTaskIds.has(task.taskId))?.taskId;
+    const settledTaskIds = new Set(accepted.taskLedger.settledTaskIds);
+    const currentTaskId = accepted.taskLedger.currentTaskId;
     let skippedTaskIds: string[] = [];
     let acceptedIncompleteTaskIds: string[] = [];
     if (normalizedEffect.kind === 'skipTask') {
@@ -572,17 +569,32 @@ export class RequirementDecisionHandler {
       return undefined;
     }
     const newlySettledTaskIds = [...skippedTaskIds, ...acceptedIncompleteTaskIds];
+    const interactionId = input.interactionId;
+    const interactionRevision = input.interactionRevision;
+    const requirementId = baseOwner.requirementId;
+    if (!interactionId || !interactionRevision || !requirementId) {
+      throw this.ports.createError(
+        'session_interaction_identity_unavailable',
+        'Task settlement requires the exact claimed requirement interaction identity.'
+      );
+    }
+    const outcome = skippedTaskIds.length
+      ? 'skipped' as const
+      : 'acceptedIncomplete' as const;
     const nextAccepted = this.ports.acceptedPlanLedger.recordUserTaskSettlement({
       acceptedPlan: accepted,
-      skippedTaskIds,
-      acceptedIncompleteTaskIds,
+      taskIds: newlySettledTaskIds,
+      outcome,
+      interaction: {
+        kind: 'requirement',
+        interactionId,
+        interactionRevision,
+        targetId: requirementId,
+        runId,
+      },
+      decisionEventRef: decisionEvent.id,
     }).nextAcceptedPlan;
-    const mergedSettledTaskIds = new Set([
-      ...nextAccepted.completedTaskIds,
-      ...(nextAccepted.modelJudgedSufficientTaskIds ?? []),
-      ...(nextAccepted.skippedTaskIds ?? []),
-      ...(nextAccepted.acceptedIncompleteTaskIds ?? []),
-    ]);
+    const mergedSettledTaskIds = new Set(nextAccepted.taskLedger.settledTaskIds);
     const remainingTaskIds = accepted.tasks
       .map((task) => task.taskId)
       .filter((id) => !mergedSettledTaskIds.has(id));
