@@ -295,7 +295,14 @@ function collectResolvedPlanRuns(events: AgentEvent[]): Set<string> {
   for (const event of events) {
     if (event.kind !== 'plan_review' && event.kind !== 'review_summary') continue;
     const payload = asRecord(event.payload);
-    if (!payload || !isTerminalStatus(stringField(payload, 'status'))) continue;
+    const status = payload ? stringField(payload, 'status') : undefined;
+    if (
+      !payload
+      || !isTerminalStatus(status)
+      || status === 'needsRevision'
+    ) {
+      continue;
+    }
     const runId = stringField(payload, 'runId');
     if (runId) resolved.add(runId);
   }

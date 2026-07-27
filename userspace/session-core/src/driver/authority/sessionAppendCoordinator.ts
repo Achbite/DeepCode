@@ -9,6 +9,7 @@ import type {
   SessionDomainHeadV1,
   SessionDomainStateSnapshotV1,
   SessionFactLineageV1,
+  SessionGoalEffectV1,
   SessionInteractionEffectV1,
   SessionInteractionIdentityV1,
   SessionKernelFactRefV1,
@@ -41,6 +42,10 @@ import {
   type PreparedSessionFactBatch,
 } from './sessionFactLineage.js';
 import { TURN_KERNEL_EFFECT_TASK_IDS_STAGING_FIELD } from './finalSettlementEvidence.js';
+import {
+  SessionGoalAppendController,
+  type SessionGoalOperationContext,
+} from '../../goal/index.js';
 
 type WritableAgentSessionResult = AgentSessionResult & {
   appendWriteability: {
@@ -78,8 +83,13 @@ interface ExactClaimedSessionInteraction extends SessionAppendInteractionContext
 
 export interface PreparedCanonicalSessionAppend {
   readonly command: SessionAppendCommandV1;
-  readonly preparedFacts: PreparedSessionFactBatch;
+  readonly preparedFacts: PreparedSessionGoalFactBatch;
   readonly closesRun: boolean;
+}
+
+interface PreparedSessionGoalFactBatch extends PreparedSessionFactBatch {
+  readonly goalPrecondition?: SessionAppendPreconditionV1;
+  readonly goalEffect?: SessionGoalEffectV1;
 }
 
 export class SessionAppendCoordinatorError extends Error {
@@ -105,13 +115,15 @@ export class SessionAppendCoordinator
   pendingProviderProposalAdmissions?: Record<string, string>;
 
   private result: WritableAgentSessionResult;
+  private readonly goalController: SessionGoalAppendController;
 
   constructor(
     private readonly sessionId: string,
     private readonly hostRunId: string,
     initialResult: AgentSessionResult,
     private readonly interaction?: SessionAppendInteractionContext,
-    private readonly bootstrap?: SessionRunBootstrapContext
+    private readonly bootstrap?: SessionRunBootstrapContext,
+    goal?: SessionGoalOperationContext
   ) {
     this.result = writableSessionResult(initialResult);
     if (this.result.session.id !== sessionId) {
@@ -126,6 +138,7 @@ export class SessionAppendCoordinator
         'Canonical Session append requires a Host run identity.'
       );
     }
+    this.goalController = new SessionGoalAppendController(sessionId, goal);
   }
 
   get currentResult(): WritableAgentSessionResult {
@@ -165,19 +178,31 @@ export class SessionAppendCoordinator
     this.result = writable;
   }
 
-  prepareEvents(incomingEvents: readonly AgentEvent[]): PreparedSessionFactBatch {
-    const normalizedIncoming = splitAcceptedPermissionFacts(incomingEvents);
+  prepareEvents(incomingEvents: readonly AgentEvent[]): PreparedSessionGoalFactBatch {
+    const goalPrepared = this.goalController.prepare(
+      this.result.events,
+      incomingEvents,
+      this.currentState
+    );
+    const normalizedIncoming = splitAcceptedPermissionFacts(goalPrepared.events);
     const lineageByEventId = this.buildLineages(normalizedIncoming);
-    return prepareSessionFactBatch({
+    const prepared = prepareSessionFactBatch({
       existingEvents: this.result.events,
       incomingEvents: normalizedIncoming,
       lineageByEventId,
       providerAdmissionRegistry: this,
     });
+    return {
+      ...prepared,
+      ...(goalPrepared.precondition
+        ? { goalPrecondition: goalPrepared.precondition }
+        : {}),
+      ...(goalPrepared.effect ? { goalEffect: goalPrepared.effect } : {}),
+    };
   }
 
   buildCommand(
-    preparedFacts: PreparedSessionFactBatch,
+    preparedFacts: PreparedSessionGoalFactBatch,
     timeline: AgentTimelineResult
   ): PreparedCanonicalSessionAppend {
     if (preparedFacts.events.length === 0) {
@@ -222,6 +247,9 @@ export class SessionAppendCoordinator
             },
       },
     ];
+    if (preparedFacts.goalPrecondition) {
+      preconditions.push(preparedFacts.goalPrecondition);
+    }
 
     let transition: SessionAppendTransitionV1;
     if (terminal) {
@@ -295,6 +323,7 @@ export class SessionAppendCoordinator
       };
     }
 
+    transition = withGoalEffect(transition, preparedFacts.goalEffect);
     const batchId = canonicalBatchId({
       sessionId: this.sessionId,
       hostRunId: this.hostRunId,
@@ -319,7 +348,7 @@ export class SessionAppendCoordinator
   }
 
   private buildBootstrapCommand(
-    preparedFacts: PreparedSessionFactBatch,
+    preparedFacts: PreparedSessionGoalFactBatch,
     timeline: AgentTimelineResult
   ): PreparedCanonicalSessionAppend {
     const bootstrap = this.bootstrap;
@@ -373,13 +402,17 @@ export class SessionAppendCoordinator
       preparedFacts.events
     );
 
-    const transition: SessionAppendTransitionV1 = {
+    let transition: SessionAppendTransitionV1 = {
       kind: 'append',
       intent: 'bootstrapRun',
       runId: this.hostRunId,
       bootstrapAdmissionId: bootstrap.admissionId,
       turnAuthorityRef,
     };
+    transition = withGoalEffect(transition, preparedFacts.goalEffect);
+    const preconditions = preparedFacts.goalPrecondition
+      ? [preparedFacts.goalPrecondition]
+      : [];
     const batchId = canonicalBatchId({
       sessionId: this.sessionId,
       hostRunId: this.hostRunId,
@@ -392,7 +425,7 @@ export class SessionAppendCoordinator
         schemaVersion: 'deepcode.session.append-command.v1',
         batchId,
         baseHead: this.currentState.head,
-        preconditions: [],
+        preconditions,
         transition,
         events: preparedFacts.events,
         timeline,
@@ -838,7 +871,12 @@ function requiredKernelFactRefs(
   authorityRef: string
 ) {
   const payload = objectRecord(event.payload) ?? {};
-  const explicitKernelRef = stringValue(payload.kernelFactEventRef);
+  const goalActivation = event.kind === 'session_goal_fact'
+    && stringValue(payload.factKind) === 'activated';
+  const explicitKernelRef = stringValue(payload.kernelFactEventRef)
+    ?? (goalActivation
+      ? stringValue(payload.authorizationFactRef)
+      : undefined);
   const finalAssistant = isFinalAssistantFact(event, payload);
   const reviewEvidence = isWaitingReviewExecutionEvidenceFact(event, payload);
   const executionEvidenceFact = finalAssistant || reviewEvidence;
@@ -904,6 +942,20 @@ function requiredKernelFactRefs(
     throw new SessionAppendCoordinatorError(
       'session_fact_lineage_invalid',
       `Session fact ${event.id} references a Kernel fact from another run.`
+    );
+  }
+  if (
+    goalActivation
+    && (
+      refs.length !== 1
+      || refs[0]?.kernelEventRef !== explicitKernelRef
+      || refs[0]?.kind !== 'plan_authorization.decision_recorded'
+      || !refs[0].authorizationContractId
+    )
+  ) {
+    throw new SessionAppendCoordinatorError(
+      'session_fact_lineage_invalid',
+      `Goal activation fact ${event.id} requires one exact Kernel PlanAuthorization decision ref.`
     );
   }
   if (executionEvidenceFact && !requiresKernelFacts && refs.length > 0) {
@@ -1349,6 +1401,15 @@ function pendingInteractionOpenEffect(
     interactionRevision: pending.interactionRevision,
     targetId: pending.targetId,
   };
+}
+
+function withGoalEffect(
+  transition: SessionAppendTransitionV1,
+  goalEffect: SessionGoalEffectV1 | undefined
+): SessionAppendTransitionV1 {
+  return goalEffect
+    ? { ...transition, goalEffect } as SessionAppendTransitionV1
+    : transition;
 }
 
 function closingOwner(

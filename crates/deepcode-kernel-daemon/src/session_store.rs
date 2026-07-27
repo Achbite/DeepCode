@@ -90,6 +90,10 @@ pub(crate) enum SessionAppendPreconditionV1 {
         #[serde(rename = "eventId")]
         event_id: String,
     },
+    #[serde(rename = "goalSlot")]
+    GoalSlot {
+        expected: SessionGoalSlotExpectationV1,
+    },
     #[serde(rename = "interaction")]
     Interaction {
         #[serde(rename = "interactionId")]
@@ -99,6 +103,59 @@ pub(crate) enum SessionAppendPreconditionV1 {
         #[serde(rename = "targetId")]
         target_id: String,
         expected: SessionInteractionExpectationV1,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", deny_unknown_fields)]
+pub(crate) enum SessionGoalSlotExpectationV1 {
+    #[serde(rename = "empty")]
+    Empty,
+    #[serde(rename = "active")]
+    Active {
+        #[serde(rename = "goalId")]
+        goal_id: String,
+        #[serde(rename = "goalRevision")]
+        goal_revision: u64,
+        lifecycle: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", deny_unknown_fields)]
+pub(crate) enum SessionGoalEffectV1 {
+    #[serde(rename = "open")]
+    Open {
+        #[serde(rename = "goalId")]
+        goal_id: String,
+        #[serde(rename = "goalRevision")]
+        goal_revision: u64,
+        lifecycle: String,
+        #[serde(rename = "factRef")]
+        fact_ref: String,
+    },
+    #[serde(rename = "transition")]
+    Transition {
+        #[serde(rename = "goalId")]
+        goal_id: String,
+        #[serde(rename = "goalRevision")]
+        goal_revision: u64,
+        #[serde(rename = "fromLifecycle")]
+        from_lifecycle: String,
+        #[serde(rename = "toLifecycle")]
+        to_lifecycle: String,
+        #[serde(rename = "factRef")]
+        fact_ref: String,
+    },
+    #[serde(rename = "release")]
+    Release {
+        #[serde(rename = "goalId")]
+        goal_id: String,
+        #[serde(rename = "goalRevision")]
+        goal_revision: u64,
+        lifecycle: String,
+        #[serde(rename = "factRef")]
+        fact_ref: String,
     },
 }
 
@@ -177,6 +234,12 @@ pub(crate) enum SessionAppendTransitionV1 {
             skip_serializing_if = "Option::is_none"
         )]
         claim_batch_id: Option<String>,
+        #[serde(
+            rename = "goalEffect",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        goal_effect: Option<SessionGoalEffectV1>,
     },
     #[serde(rename = "claim")]
     Claim {
@@ -190,6 +253,12 @@ pub(crate) enum SessionAppendTransitionV1 {
         interaction_revision: String,
         #[serde(rename = "targetId")]
         target_id: String,
+        #[serde(
+            rename = "goalEffect",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        goal_effect: Option<SessionGoalEffectV1>,
     },
     #[serde(rename = "close")]
     Close {
@@ -205,6 +274,12 @@ pub(crate) enum SessionAppendTransitionV1 {
             skip_serializing_if = "Option::is_none"
         )]
         interaction_effect: Option<SessionInteractionEffectV1>,
+        #[serde(
+            rename = "goalEffect",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        goal_effect: Option<SessionGoalEffectV1>,
     },
 }
 
@@ -335,6 +410,7 @@ pub(crate) struct SessionDomainStateSnapshotV1 {
     pub(crate) head: SessionDomainHeadV1,
     pub(crate) run_fences: Vec<SessionRunFenceViewV1>,
     pub(crate) interaction_fences: Vec<SessionInteractionFenceViewV1>,
+    pub(crate) goal_slot: SessionGoalSlotViewV1,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -356,6 +432,37 @@ pub(crate) struct SessionInteractionFenceViewV1 {
     pub(crate) state: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) claim_batch_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "state", rename_all = "camelCase")]
+pub(crate) enum SessionGoalSlotViewV1 {
+    #[serde(rename = "empty")]
+    Empty {
+        capability: String,
+        #[serde(rename = "lastTerminalGoalRef", skip_serializing_if = "Option::is_none")]
+        last_terminal_goal_ref: Option<SessionTerminalGoalRefViewV1>,
+    },
+    #[serde(rename = "active")]
+    Active {
+        capability: String,
+        #[serde(rename = "goalId")]
+        goal_id: String,
+        #[serde(rename = "goalRevision")]
+        goal_revision: u64,
+        lifecycle: String,
+        #[serde(rename = "factRef")]
+        fact_ref: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SessionTerminalGoalRefViewV1 {
+    goal_id: String,
+    goal_revision: u64,
+    lifecycle: String,
+    fact_ref: String,
 }
 
 #[derive(Debug, Clone)]
@@ -558,6 +665,22 @@ enum SessionInteractionFenceSnapshotState {
     Settled,
 }
 
+#[derive(Debug, Clone)]
+struct SessionGoalSlotSnapshot {
+    goal_id: String,
+    goal_revision: u64,
+    lifecycle: String,
+    fact_ref: String,
+}
+
+#[derive(Debug, Clone)]
+struct SessionTerminalGoalSnapshot {
+    goal_id: String,
+    goal_revision: u64,
+    lifecycle: String,
+    fact_ref: String,
+}
+
 #[derive(Clone, Default)]
 struct SessionDomainDerivedState {
     run_fences: HashMap<String, SessionRunFenceSnapshot>,
@@ -565,6 +688,8 @@ struct SessionDomainDerivedState {
     turn_authority_event_ids: std::collections::HashSet<String>,
     event_ids: std::collections::HashSet<String>,
     provider_request_ids: std::collections::HashSet<String>,
+    goal_slot: Option<SessionGoalSlotSnapshot>,
+    last_terminal_goal: Option<SessionTerminalGoalSnapshot>,
 }
 
 #[derive(Debug, Clone)]
@@ -3822,6 +3947,29 @@ fn validate_session_append_precondition_shapes(
                 validate_domain_identity(event_id, "turnAuthority.eventId")?;
                 format!("authority:{event_id}")
             }
+            SessionAppendPreconditionV1::GoalSlot { expected } => {
+                match expected {
+                    SessionGoalSlotExpectationV1::Empty => {}
+                    SessionGoalSlotExpectationV1::Active {
+                        goal_id,
+                        goal_revision,
+                        lifecycle,
+                    } => {
+                        validate_domain_identity(goal_id, "goalSlot.goalId")?;
+                        if *goal_revision == 0 {
+                            return Err(SessionDomainStoreError::new(
+                                "session_append_transition_invalid",
+                                "Active goalSlot expectation requires a positive goalRevision",
+                            ));
+                        }
+                        validate_active_goal_lifecycle(
+                            lifecycle,
+                            "goalSlot.lifecycle",
+                        )?;
+                    }
+                }
+                "goalSlot".to_string()
+            }
             SessionAppendPreconditionV1::Interaction {
                 interaction_id,
                 interaction_revision,
@@ -3878,6 +4026,7 @@ fn validate_session_append_transition_shape(
             interaction_revision,
             target_id,
             claim_batch_id,
+            goal_effect,
         } => {
             validate_domain_identity(run_id, "transition.runId")?;
             match intent {
@@ -3979,6 +4128,9 @@ fn validate_session_append_transition_shape(
                     }
                 }
             }
+            if let Some(effect) = goal_effect {
+                validate_session_goal_effect_shape(effect)?;
+            }
             Ok(())
         }
         SessionAppendTransitionV1::Claim {
@@ -3987,6 +4139,7 @@ fn validate_session_append_transition_shape(
             interaction_id,
             interaction_revision,
             target_id,
+            goal_effect,
         } => {
             for (value, label) in [
                 (claimant_run_id.as_str(), "transition.claimantRunId"),
@@ -4000,6 +4153,12 @@ fn validate_session_append_transition_shape(
             ] {
                 validate_domain_identity(value, label)?;
             }
+            if goal_effect.is_some() {
+                return Err(SessionDomainStoreError::new(
+                    "session_append_transition_invalid",
+                    "Interaction claim transition cannot mutate the Goal slot",
+                ));
+            }
             Ok(())
         }
         SessionAppendTransitionV1::Close {
@@ -4008,6 +4167,7 @@ fn validate_session_append_transition_shape(
             status,
             parent_close_batch_id,
             interaction_effect,
+            goal_effect,
         } => {
             validate_domain_identity(run_id, "transition.runId")?;
             match phase {
@@ -4074,8 +4234,104 @@ fn validate_session_append_transition_shape(
             if let Some(effect) = interaction_effect {
                 validate_session_interaction_effect_shape(effect)?;
             }
+            if let Some(effect) = goal_effect {
+                validate_session_goal_effect_shape(effect)?;
+            }
             Ok(())
         }
+    }
+}
+
+fn validate_session_goal_effect_shape(
+    effect: &SessionGoalEffectV1,
+) -> Result<(), SessionDomainStoreError> {
+    let (goal_id, goal_revision, fact_ref) = match effect {
+        SessionGoalEffectV1::Open {
+            goal_id,
+            goal_revision,
+            lifecycle,
+            fact_ref,
+        } => {
+            if lifecycle != "draft" {
+                return Err(SessionDomainStoreError::new(
+                    "session_append_transition_invalid",
+                    "Goal open effect requires lifecycle=draft",
+                ));
+            }
+            (goal_id, goal_revision, fact_ref)
+        }
+        SessionGoalEffectV1::Transition {
+            goal_id,
+            goal_revision,
+            from_lifecycle,
+            to_lifecycle,
+            fact_ref,
+        } => {
+            validate_active_goal_lifecycle(from_lifecycle, "goalEffect.fromLifecycle")?;
+            validate_active_goal_lifecycle(to_lifecycle, "goalEffect.toLifecycle")?;
+            if !matches!(
+                (from_lifecycle.as_str(), to_lifecycle.as_str()),
+                ("draft", "awaitingPlanAcceptance")
+                    | ("awaitingPlanAcceptance", "running")
+                    | ("running", "suspended")
+                    | ("suspended", "running")
+            ) {
+                return Err(SessionDomainStoreError::new(
+                    "session_append_transition_invalid",
+                    "Goal transition effect does not follow the frozen lifecycle",
+                ));
+            }
+            (goal_id, goal_revision, fact_ref)
+        }
+        SessionGoalEffectV1::Release {
+            goal_id,
+            goal_revision,
+            lifecycle,
+            fact_ref,
+        } => {
+            validate_terminal_goal_lifecycle(lifecycle, "goalEffect.lifecycle")?;
+            (goal_id, goal_revision, fact_ref)
+        }
+    };
+    validate_domain_identity(goal_id, "goalEffect.goalId")?;
+    validate_domain_identity(fact_ref, "goalEffect.factRef")?;
+    if *goal_revision == 0 {
+        return Err(SessionDomainStoreError::new(
+            "session_append_transition_invalid",
+            "Goal effect requires a positive goalRevision",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_active_goal_lifecycle(
+    lifecycle: &str,
+    label: &str,
+) -> Result<(), SessionDomainStoreError> {
+    if matches!(
+        lifecycle,
+        "draft" | "awaitingPlanAcceptance" | "running" | "suspended"
+    ) {
+        Ok(())
+    } else {
+        Err(SessionDomainStoreError::new(
+            "session_append_transition_invalid",
+            format!("{label} is not an active Goal lifecycle"),
+        ))
+    }
+}
+
+fn validate_terminal_goal_lifecycle(
+    lifecycle: &str,
+    label: &str,
+) -> Result<(), SessionDomainStoreError> {
+    if matches!(lifecycle, "completed" | "failed" | "cancelled") {
+        Ok(())
+    } else {
+        Err(SessionDomainStoreError::new(
+            "session_append_transition_invalid",
+            format!("{label} is not a terminal Goal lifecycle"),
+        ))
     }
 }
 
@@ -4285,6 +4541,9 @@ fn validate_session_domain_events(
                 format!("Session domain event {event_id} requires payload"),
             ));
         }
+        if object.get("kind").and_then(Value::as_str) == Some("session_goal_fact") {
+            validate_session_goal_fact(event_id, object.get("payload").unwrap())?;
+        }
         if is_hidden_reasoning_persistence_record(event)
             || strip_hidden_reasoning_fields(event.clone()) != *event
         {
@@ -4295,6 +4554,360 @@ fn validate_session_domain_events(
                 ),
             ));
         }
+    }
+    Ok(())
+}
+
+fn validate_session_goal_fact(
+    event_id: &str,
+    payload: &Value,
+) -> Result<(), SessionDomainStoreError> {
+    let payload = payload.as_object().ok_or_else(|| {
+        SessionDomainStoreError::new(
+            "session_append_transition_invalid",
+            format!("Goal fact {event_id} payload must be an object"),
+        )
+    })?;
+    if payload.get("schemaVersion").and_then(Value::as_str)
+        != Some("deepcode.session.goal-fact.v1")
+    {
+        return Err(SessionDomainStoreError::new(
+            "session_append_transition_invalid",
+            format!("Goal fact {event_id} has an unsupported schemaVersion"),
+        ));
+    }
+    let goal_id = payload
+        .get("goalId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            SessionDomainStoreError::new(
+                "session_append_transition_invalid",
+                format!("Goal fact {event_id} has no goalId"),
+            )
+        })?;
+    validate_domain_identity(goal_id, "goalFact.goalId")?;
+    if payload
+        .get("goalRevision")
+        .and_then(Value::as_u64)
+        .is_none_or(|revision| revision == 0)
+    {
+        return Err(SessionDomainStoreError::new(
+            "session_append_transition_invalid",
+            format!("Goal fact {event_id} has no positive goalRevision"),
+        ));
+    }
+    if !payload
+        .get("objective")
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        return Err(SessionDomainStoreError::new(
+            "session_append_transition_invalid",
+            format!("Goal fact {event_id} has no objective"),
+        ));
+    }
+    let fact_kind = payload
+        .get("factKind")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            SessionDomainStoreError::new(
+                "session_append_transition_invalid",
+                format!("Goal fact {event_id} has no factKind"),
+            )
+        })?;
+    let lifecycle = payload
+        .get("lifecycle")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            SessionDomainStoreError::new(
+                "session_append_transition_invalid",
+                format!("Goal fact {event_id} has no lifecycle"),
+            )
+        })?;
+    let lifecycle_valid = match fact_kind {
+        "draftCreated" => lifecycle == "draft",
+        "planAwaitingAcceptance" | "planRevisionRequested" => {
+            lifecycle == "awaitingPlanAcceptance"
+        }
+        "activated" | "resumed" => lifecycle == "running",
+        "suspended" | "activeWait" => lifecycle == "suspended",
+        "completed" | "failed" | "cancelled" => lifecycle == fact_kind,
+        "taskLedger" | "budgetUsage" => matches!(lifecycle, "running" | "suspended"),
+        "checkpoint" => matches!(
+            lifecycle,
+            "running" | "suspended" | "completed" | "failed" | "cancelled"
+        ),
+        _ => false,
+    };
+    if !lifecycle_valid {
+        return Err(SessionDomainStoreError::new(
+            "session_append_transition_invalid",
+            format!(
+                "Goal fact {event_id} lifecycle {lifecycle} does not match {fact_kind}"
+            ),
+        ));
+    }
+    let source_refs = payload
+        .get("sourceRefs")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            SessionDomainStoreError::new(
+                "session_append_transition_invalid",
+                format!("Goal fact {event_id} has no sourceRefs"),
+            )
+        })?;
+    let mut unique_refs = std::collections::HashSet::new();
+    if source_refs.is_empty()
+        || source_refs.iter().any(|value| {
+            !value
+                .as_str()
+                .is_some_and(|value| !value.trim().is_empty())
+                || !unique_refs.insert(value.as_str().unwrap_or_default())
+        })
+    {
+        return Err(SessionDomainStoreError::new(
+            "session_append_transition_invalid",
+            format!("Goal fact {event_id} has invalid sourceRefs"),
+        ));
+    }
+    validate_goal_command_identity(event_id, payload.get("command"))?;
+    validate_goal_fact_lineage_shape(event_id, payload.get("lineage"))?;
+    validate_goal_fact_variant(event_id, fact_kind, lifecycle, payload)?;
+    Ok(())
+}
+
+fn validate_goal_command_identity(
+    event_id: &str,
+    command: Option<&Value>,
+) -> Result<(), SessionDomainStoreError> {
+    let command = command.and_then(Value::as_object).ok_or_else(|| {
+        SessionDomainStoreError::new(
+            "session_append_transition_invalid",
+            format!("Goal fact {event_id} requires a command identity"),
+        )
+    })?;
+    for field in ["callerRequestId", "requestDigest", "hostRunId"] {
+        let value = command.get(field).and_then(Value::as_str).ok_or_else(|| {
+            SessionDomainStoreError::new(
+                "session_append_transition_invalid",
+                format!("Goal fact {event_id} command has no {field}"),
+            )
+        })?;
+        validate_domain_identity(value, &format!("goalFact.command.{field}"))?;
+    }
+    Ok(())
+}
+
+fn validate_goal_fact_lineage_shape(
+    event_id: &str,
+    lineage: Option<&Value>,
+) -> Result<(), SessionDomainStoreError> {
+    let lineage = lineage.and_then(Value::as_object).ok_or_else(|| {
+        SessionDomainStoreError::new(
+            "session_append_transition_invalid",
+            format!("Goal fact {event_id} requires SessionFactLineage v1"),
+        )
+    })?;
+    if lineage.get("schemaVersion").and_then(Value::as_str)
+        != Some("deepcode.session.fact-lineage.v1")
+    {
+        return Err(SessionDomainStoreError::new(
+            "session_append_transition_invalid",
+            format!("Goal fact {event_id} has unsupported lineage"),
+        ));
+    }
+    let authority = lineage
+        .get("turnAuthorityRef")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            SessionDomainStoreError::new(
+                "session_append_transition_invalid",
+                format!("Goal fact {event_id} lineage has no turnAuthorityRef"),
+            )
+        })?;
+    validate_domain_identity(authority, "goalFact.lineage.turnAuthorityRef")?;
+    if !lineage
+        .get("producer")
+        .is_some_and(Value::is_object)
+        || !lineage
+            .get("domainParentRefs")
+            .is_some_and(Value::is_array)
+        || !lineage
+            .get("kernelFactRefs")
+            .is_some_and(Value::is_array)
+    {
+        return Err(SessionDomainStoreError::new(
+            "session_append_transition_invalid",
+            format!("Goal fact {event_id} has incomplete lineage"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_goal_fact_variant(
+    event_id: &str,
+    fact_kind: &str,
+    lifecycle: &str,
+    payload: &serde_json::Map<String, Value>,
+) -> Result<(), SessionDomainStoreError> {
+    let required_identity = |field: &str| -> Result<(), SessionDomainStoreError> {
+        let value = payload.get(field).and_then(Value::as_str).ok_or_else(|| {
+            SessionDomainStoreError::new(
+                "session_append_transition_invalid",
+                format!("Goal fact {event_id} has no {field}"),
+            )
+        })?;
+        validate_domain_identity(value, &format!("goalFact.{field}"))
+    };
+    let required_positive = |field: &str| -> Result<(), SessionDomainStoreError> {
+        if payload
+            .get(field)
+            .and_then(Value::as_u64)
+            .is_none_or(|value| value == 0)
+        {
+            return Err(SessionDomainStoreError::new(
+                "session_append_transition_invalid",
+                format!("Goal fact {event_id} has no positive {field}"),
+            ));
+        }
+        Ok(())
+    };
+    match fact_kind {
+        "draftCreated" => {
+            if payload.get("planRevision").and_then(Value::as_u64) != Some(0) {
+                return Err(SessionDomainStoreError::new(
+                    "session_append_transition_invalid",
+                    format!("Goal draft fact {event_id} requires planRevision=0"),
+                ));
+            }
+            required_identity("sourceRunId")?;
+            if let Some(predecessor) = payload.get("predecessorGoalRef") {
+                validate_goal_ref_value(event_id, "predecessorGoalRef", predecessor)?;
+            }
+        }
+        "planAwaitingAcceptance" | "planRevisionRequested" => {
+            required_identity("planId")?;
+            required_positive("planRevision")?;
+            required_identity("sourceRunId")?;
+        }
+        "activated" => {
+            required_identity("planId")?;
+            required_positive("planRevision")?;
+            required_identity("confirmedPlanRef")?;
+            required_identity("authorizationFactRef")?;
+            required_identity("sourceRunId")?;
+            if !payload.get("taskSnapshot").is_some_and(Value::is_array) {
+                return Err(SessionDomainStoreError::new(
+                    "session_append_transition_invalid",
+                    format!("Goal activation fact {event_id} has no taskSnapshot"),
+                ));
+            }
+        }
+        "suspended" => {
+            required_identity("waitRef")?;
+            required_identity("sourceRunId")?;
+        }
+        "resumed" => {
+            required_identity("checkpointRef")?;
+            required_identity("sourceRunId")?;
+        }
+        "completed" | "failed" | "cancelled" => {
+            if lifecycle != fact_kind {
+                return Err(SessionDomainStoreError::new(
+                    "session_append_transition_invalid",
+                    format!("Goal terminal fact {event_id} has mismatched lifecycle"),
+                ));
+            }
+            required_identity("sourceRunId")?;
+            if !payload
+                .get("terminalReason")
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.trim().is_empty())
+            {
+                return Err(SessionDomainStoreError::new(
+                    "session_append_transition_invalid",
+                    format!("Goal terminal fact {event_id} has no terminalReason"),
+                ));
+            }
+            if payload.contains_key("checkpointRef") {
+                required_identity("checkpointRef")?;
+            }
+        }
+        "taskLedger" => {
+            if !payload.get("taskLedger").is_some_and(Value::is_object) {
+                return Err(SessionDomainStoreError::new(
+                    "session_append_transition_invalid",
+                    format!("Goal task fact {event_id} has no taskLedger object"),
+                ));
+            }
+        }
+        "activeWait" => {
+            if !payload.get("activeWait").is_some_and(Value::is_object) {
+                return Err(SessionDomainStoreError::new(
+                    "session_append_transition_invalid",
+                    format!("Goal wait fact {event_id} has no activeWait object"),
+                ));
+            }
+        }
+        "checkpoint" => {
+            if !payload.get("checkpoint").is_some_and(Value::is_object) {
+                return Err(SessionDomainStoreError::new(
+                    "session_append_transition_invalid",
+                    format!("Goal checkpoint fact {event_id} has no checkpoint object"),
+                ));
+            }
+        }
+        "budgetUsage" => {
+            if !payload
+                .get("executionBudget")
+                .is_some_and(Value::is_object)
+            {
+                return Err(SessionDomainStoreError::new(
+                    "session_append_transition_invalid",
+                    format!("Goal budget fact {event_id} has no executionBudget object"),
+                ));
+            }
+        }
+        _ => {
+            return Err(SessionDomainStoreError::new(
+                "session_append_transition_invalid",
+                format!("Goal fact {event_id} has unsupported factKind {fact_kind}"),
+            ))
+        }
+    }
+    Ok(())
+}
+
+fn validate_goal_ref_value(
+    event_id: &str,
+    field: &str,
+    value: &Value,
+) -> Result<(), SessionDomainStoreError> {
+    let reference = value.as_object().ok_or_else(|| {
+        SessionDomainStoreError::new(
+            "session_append_transition_invalid",
+            format!("Goal fact {event_id} has invalid {field}"),
+        )
+    })?;
+    let goal_id = reference
+        .get("goalId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            SessionDomainStoreError::new(
+                "session_append_transition_invalid",
+                format!("Goal fact {event_id} {field} has no goalId"),
+            )
+        })?;
+    validate_domain_identity(goal_id, &format!("goalFact.{field}.goalId"))?;
+    if reference
+        .get("goalRevision")
+        .and_then(Value::as_u64)
+        .is_none_or(|revision| revision == 0)
+    {
+        return Err(SessionDomainStoreError::new(
+            "session_append_transition_invalid",
+            format!("Goal fact {event_id} {field} has no positive goalRevision"),
+        ));
     }
     Ok(())
 }
@@ -4608,6 +5221,18 @@ fn validate_session_append_preconditions(
             SessionAppendPreconditionV1::TurnAuthority { event_id } => {
                 state.turn_authority_event_ids.contains(event_id)
             }
+            SessionAppendPreconditionV1::GoalSlot { expected } => match expected {
+                SessionGoalSlotExpectationV1::Empty => state.goal_slot.is_none(),
+                SessionGoalSlotExpectationV1::Active {
+                    goal_id,
+                    goal_revision,
+                    lifecycle,
+                } => state.goal_slot.as_ref().is_some_and(|actual| {
+                    actual.goal_id == *goal_id
+                        && actual.goal_revision == *goal_revision
+                        && actual.lifecycle == *lifecycle
+                }),
+            },
             SessionAppendPreconditionV1::Interaction {
                 interaction_id,
                 interaction_revision,
@@ -4706,6 +5331,20 @@ fn has_exact_interaction_precondition(
     })
 }
 
+fn has_exact_goal_slot_precondition(
+    preconditions: &[SessionAppendPreconditionV1],
+    expected: &SessionGoalSlotExpectationV1,
+) -> bool {
+    preconditions.iter().any(|precondition| {
+        matches!(
+            precondition,
+            SessionAppendPreconditionV1::GoalSlot {
+                expected: candidate
+            } if candidate == expected
+        )
+    })
+}
+
 fn apply_session_append_transition(
     state: &mut SessionDomainDerivedState,
     transition: &SessionAppendTransitionV1,
@@ -4724,6 +5363,7 @@ fn apply_session_append_transition(
             interaction_revision,
             target_id,
             claim_batch_id,
+            goal_effect,
         } => {
             match intent {
                 SessionAppendIntentV1::OpenRun => {
@@ -4848,13 +5488,20 @@ fn apply_session_append_transition(
                     interaction.claimant_run_id = None;
                 }
             }
-            Ok(())
+            apply_session_goal_effect(
+                state,
+                goal_effect.as_ref(),
+                preconditions,
+                incoming_events,
+                transition,
+            )
         }
         SessionAppendTransitionV1::Claim {
             claimant_run_id,
             interaction_id,
             interaction_revision,
             target_id,
+            goal_effect: _,
             ..
         } => {
             if state.run_fences.contains_key(claimant_run_id) {
@@ -4900,6 +5547,7 @@ fn apply_session_append_transition(
             status,
             parent_close_batch_id,
             interaction_effect,
+            goal_effect,
         } => {
             let current = state.run_fences.get(run_id).cloned().ok_or_else(|| {
                 SessionDomainStoreError::new(
@@ -4997,7 +5645,13 @@ fn apply_session_append_transition(
                     transition,
                 )?;
             }
-            Ok(())
+            apply_session_goal_effect(
+                state,
+                goal_effect.as_ref(),
+                preconditions,
+                incoming_events,
+                transition,
+            )
         }
     }
 }
@@ -5095,6 +5749,7 @@ fn exact_interaction_claim_payload<'a>(
         interaction_id,
         interaction_revision,
         target_id,
+        ..
     } = transition
     else {
         return None;
@@ -5290,6 +5945,198 @@ fn apply_session_interaction_effect(
     Ok(())
 }
 
+fn apply_session_goal_effect(
+    state: &mut SessionDomainDerivedState,
+    effect: Option<&SessionGoalEffectV1>,
+    preconditions: &[SessionAppendPreconditionV1],
+    incoming_events: &[Value],
+    transition: &SessionAppendTransitionV1,
+) -> Result<(), SessionDomainStoreError> {
+    let goal_facts = incoming_events
+        .iter()
+        .filter(|event| {
+            event.get("kind").and_then(Value::as_str) == Some("session_goal_fact")
+        })
+        .collect::<Vec<_>>();
+    if effect.is_none() {
+        for event in goal_facts {
+            let payload = event
+                .get("payload")
+                .expect("Goal fact payload validated before transition");
+            let goal_id = payload
+                .get("goalId")
+                .and_then(Value::as_str)
+                .expect("Goal fact goalId validated before transition");
+            let goal_revision = payload
+                .get("goalRevision")
+                .and_then(Value::as_u64)
+                .expect("Goal fact goalRevision validated before transition");
+            let lifecycle = payload
+                .get("lifecycle")
+                .and_then(Value::as_str)
+                .expect("Goal fact lifecycle validated before transition");
+            let expected = SessionGoalSlotExpectationV1::Active {
+                goal_id: goal_id.to_string(),
+                goal_revision,
+                lifecycle: lifecycle.to_string(),
+            };
+            if !has_exact_goal_slot_precondition(preconditions, &expected)
+                || !state.goal_slot.as_ref().is_some_and(|slot| {
+                    slot.goal_id == goal_id
+                        && slot.goal_revision == goal_revision
+                        && slot.lifecycle == lifecycle
+                })
+            {
+                return transition_state_error(
+                    "Goal fact without a slot effect requires the exact active Goal slot precondition",
+                    transition,
+                );
+            }
+        }
+        return Ok(());
+    }
+    if goal_facts.len() != 1 {
+        return transition_state_error(
+            "Goal slot effect requires exactly one Goal fact in the same canonical batch",
+            transition,
+        );
+    }
+    let event = goal_facts[0];
+    let event_id = event
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("Goal event id validated before transition");
+    let payload = event
+        .get("payload")
+        .expect("Goal fact payload validated before transition");
+    let payload_goal_id = payload
+        .get("goalId")
+        .and_then(Value::as_str)
+        .expect("Goal fact goalId validated before transition");
+    let payload_goal_revision = payload
+        .get("goalRevision")
+        .and_then(Value::as_u64)
+        .expect("Goal fact goalRevision validated before transition");
+    let payload_lifecycle = payload
+        .get("lifecycle")
+        .and_then(Value::as_str)
+        .expect("Goal fact lifecycle validated before transition");
+
+    match effect.expect("effect checked above") {
+        SessionGoalEffectV1::Open {
+            goal_id,
+            goal_revision,
+            lifecycle,
+            fact_ref,
+        } => {
+            let expected = SessionGoalSlotExpectationV1::Empty;
+            if state.goal_slot.is_some()
+                || !has_exact_goal_slot_precondition(preconditions, &expected)
+                || event_id != fact_ref
+                || payload_goal_id != goal_id
+                || payload_goal_revision != *goal_revision
+                || payload_lifecycle != lifecycle
+                || payload.get("factKind").and_then(Value::as_str) != Some("draftCreated")
+            {
+                return transition_state_error(
+                    "Goal open effect does not match its empty slot precondition and draft fact",
+                    transition,
+                );
+            }
+            state.goal_slot = Some(SessionGoalSlotSnapshot {
+                goal_id: goal_id.clone(),
+                goal_revision: *goal_revision,
+                lifecycle: lifecycle.clone(),
+                fact_ref: fact_ref.clone(),
+            });
+        }
+        SessionGoalEffectV1::Transition {
+            goal_id,
+            goal_revision,
+            from_lifecycle,
+            to_lifecycle,
+            fact_ref,
+        } => {
+            let expected = SessionGoalSlotExpectationV1::Active {
+                goal_id: goal_id.clone(),
+                goal_revision: *goal_revision,
+                lifecycle: from_lifecycle.clone(),
+            };
+            let current_matches = state.goal_slot.as_ref().is_some_and(|slot| {
+                slot.goal_id == *goal_id
+                    && slot.goal_revision == *goal_revision
+                    && slot.lifecycle == *from_lifecycle
+            });
+            if !current_matches
+                || !has_exact_goal_slot_precondition(preconditions, &expected)
+                || event_id != fact_ref
+                || payload_goal_id != goal_id
+                || payload_goal_revision != *goal_revision
+                || payload_lifecycle != to_lifecycle
+                || payload.get("factKind").and_then(Value::as_str)
+                    != Some(match (from_lifecycle.as_str(), to_lifecycle.as_str()) {
+                        ("draft", "awaitingPlanAcceptance") => "planAwaitingAcceptance",
+                        ("awaitingPlanAcceptance", "running") => "activated",
+                        ("running", "suspended") => "suspended",
+                        ("suspended", "running") => "resumed",
+                        _ => unreachable!("Goal transition shape validated before application"),
+                    })
+            {
+                return transition_state_error(
+                    "Goal transition effect does not match its active slot precondition and fact",
+                    transition,
+                );
+            }
+            let slot = state
+                .goal_slot
+                .as_mut()
+                .expect("active Goal slot checked above");
+            slot.lifecycle = to_lifecycle.clone();
+            slot.fact_ref = fact_ref.clone();
+        }
+        SessionGoalEffectV1::Release {
+            goal_id,
+            goal_revision,
+            lifecycle,
+            fact_ref,
+        } => {
+            let current = state.goal_slot.as_ref().ok_or_else(|| {
+                SessionDomainStoreError::new(
+                    "session_append_transition_invalid",
+                    "Goal release effect has no active Goal slot",
+                )
+            })?;
+            let expected = SessionGoalSlotExpectationV1::Active {
+                goal_id: goal_id.clone(),
+                goal_revision: *goal_revision,
+                lifecycle: current.lifecycle.clone(),
+            };
+            if current.goal_id != *goal_id
+                || current.goal_revision != *goal_revision
+                || !has_exact_goal_slot_precondition(preconditions, &expected)
+                || event_id != fact_ref
+                || payload_goal_id != goal_id
+                || payload_goal_revision != *goal_revision
+                || payload_lifecycle != lifecycle
+                || payload.get("factKind").and_then(Value::as_str) != Some(lifecycle.as_str())
+            {
+                return transition_state_error(
+                    "Goal release effect does not match its active slot precondition and terminal fact",
+                    transition,
+                );
+            }
+            state.last_terminal_goal = Some(SessionTerminalGoalSnapshot {
+                goal_id: goal_id.clone(),
+                goal_revision: *goal_revision,
+                lifecycle: lifecycle.clone(),
+                fact_ref: fact_ref.clone(),
+            });
+            state.goal_slot = None;
+        }
+    }
+    Ok(())
+}
+
 fn transition_state_error<T>(
     message: impl Into<String>,
     _transition: &SessionAppendTransitionV1,
@@ -5339,11 +6186,32 @@ fn session_domain_state_snapshot(
         })
         .collect::<Vec<_>>();
     interaction_fences.sort_by(|left, right| left.interaction_id.cmp(&right.interaction_id));
+    let goal_slot = match state.goal_slot.as_ref() {
+        Some(slot) => SessionGoalSlotViewV1::Active {
+            capability: "goalSlotV1".to_string(),
+            goal_id: slot.goal_id.clone(),
+            goal_revision: slot.goal_revision,
+            lifecycle: slot.lifecycle.clone(),
+            fact_ref: slot.fact_ref.clone(),
+        },
+        None => SessionGoalSlotViewV1::Empty {
+            capability: "goalSlotV1".to_string(),
+            last_terminal_goal_ref: state.last_terminal_goal.as_ref().map(|goal| {
+                SessionTerminalGoalRefViewV1 {
+                    goal_id: goal.goal_id.clone(),
+                    goal_revision: goal.goal_revision,
+                    lifecycle: goal.lifecycle.clone(),
+                    fact_ref: goal.fact_ref.clone(),
+                }
+            }),
+        },
+    };
     SessionDomainStateSnapshotV1 {
         schema_version: "deepcode.session.domain-state-snapshot.v1".to_string(),
         head,
         run_fences,
         interaction_fences,
+        goal_slot,
     }
 }
 
@@ -5464,6 +6332,7 @@ pub(crate) fn admit_session_interaction_claim(
                     interaction_id: interaction_id.to_string(),
                     interaction_revision: interaction_revision.to_string(),
                     target_id: target_id.to_string(),
+                    goal_effect: None,
                 },
                 events,
             )?))
@@ -5605,6 +6474,7 @@ pub(crate) fn admit_session_guidance(
                     interaction_revision: None,
                     target_id: None,
                     claim_batch_id: None,
+                    goal_effect: None,
                 },
                 vec![guidance_event],
             )?;
@@ -5648,6 +6518,7 @@ pub(crate) fn admit_session_cancel_request(
                         status: "cancelRequested".to_string(),
                         parent_close_batch_id: None,
                         interaction_effect: None,
+                        goal_effect: None,
                     },
                     Vec::new(),
                 )?));
@@ -5670,6 +6541,7 @@ pub(crate) fn admit_session_cancel_request(
                         status: "cancelRequested".to_string(),
                         parent_close_batch_id: None,
                         interaction_effect: None,
+                        goal_effect: None,
                     },
                     Vec::new(),
                 )?)),
@@ -5778,6 +6650,7 @@ pub(crate) fn admit_session_release_interaction_claim(
                     interaction_revision: Some(claim.interaction_revision),
                     target_id: Some(claim.target_id),
                     claim_batch_id: Some(claim.claim_batch_id),
+                    goal_effect: None,
                 },
                 Vec::new(),
             )?))
@@ -5921,6 +6794,7 @@ pub(crate) fn admit_session_terminal_close(
                     status,
                     parent_close_batch_id,
                     interaction_effect,
+                    goal_effect: None,
                 },
                 terminal_event.into_iter().collect(),
             )?))
@@ -7027,7 +7901,30 @@ fn validate_session_run_bootstrap_admission_locked(
             }
         }
     }
-    if !command.preconditions.is_empty()
+    let bootstrap_has_unsupported_precondition =
+        command.preconditions.iter().any(|precondition| {
+            !matches!(
+                precondition,
+                SessionAppendPreconditionV1::GoalSlot {
+                    expected: SessionGoalSlotExpectationV1::Empty
+                }
+            )
+        });
+    let bootstrap_goal_preconditions = command
+        .preconditions
+        .iter()
+        .filter(|precondition| {
+            matches!(precondition, SessionAppendPreconditionV1::GoalSlot { .. })
+        })
+        .count();
+    if bootstrap_has_unsupported_precondition
+        || bootstrap_goal_preconditions > usize::from(matches!(
+            command.transition,
+            SessionAppendTransitionV1::Append {
+                goal_effect: Some(SessionGoalEffectV1::Open { .. }),
+                ..
+            }
+        ))
         || !command.provider_admissions.is_empty()
         || command.events.iter().any(|event| {
             event.get("kind").and_then(Value::as_str) == Some("session_run_state")
@@ -7039,7 +7936,7 @@ fn validate_session_run_bootstrap_admission_locked(
     {
         return Err(SessionDomainStoreError::new(
             "session_append_transition_invalid",
-            "bootstrapRun must be authority-first, non-terminal and free of Provider or fence preconditions",
+            "bootstrapRun must be authority-first, non-terminal and free of Provider, run, interaction or non-empty Goal preconditions",
         ));
     }
     let authority_matches = command
@@ -7978,6 +8875,7 @@ fn publish_session_domain_snapshot(
     let domain_state = session_domain_state_snapshot(head.clone(), &derived_state);
     let mut gui = state.gui.lock().expect("gui state lock");
     let sessions_dir = gui.paths.sessions_dir.clone();
+    invalidate_session_goal_projection_cache(&sessions_dir, session_id);
     let mut next_sessions = gui.sessions.clone();
     let Some(position) = next_sessions
         .iter()

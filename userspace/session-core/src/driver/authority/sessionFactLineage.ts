@@ -549,6 +549,7 @@ export function sessionFactLineageDisposition(
   const payload = objectRecord(event.payload);
   if (event.kind === 'session_turn_authority') return 'authority';
   if (event.kind === 'cache_telemetry') return 'auxiliaryLedger';
+  if (event.kind === 'session_goal_fact') return 'persistentDomainFact';
   if (event.kind === 'permission_request' || event.kind === 'permission_result') {
     const kernelEvent = objectRecord(payload?.kernelEvent);
     if (!kernelEvent || acceptedPermissionKernelKind(event.kind, kernelEvent.kind)) {
@@ -1101,7 +1102,8 @@ function providerAttemptKind(
 }
 
 function kernelFactKind(value: unknown): SessionKernelFactKindV1 | undefined {
-  return value === 'tool.execution_attempted'
+  return value === 'plan_authorization.decision_recorded'
+    || value === 'tool.execution_attempted'
     || value === 'tool.effect_observed'
     || value === 'tool.outcome_indeterminate'
     || value === 'tool.completed'

@@ -571,6 +571,10 @@ fn authoritative_kernel_identity_matches(
 
 fn projected_kernel_fact_material(kind: &str, event: &Map<String, Value>) -> Option<Value> {
     match kind {
+        "plan_authorization.decision_recorded" => selected_kernel_material(
+            event,
+            &["authorizationContractId", "decision", "leaseId"],
+        ),
         "tool.execution_attempted"
         | "tool.effect_observed"
         | "tool.outcome_indeterminate"
@@ -594,6 +598,10 @@ fn projected_kernel_fact_material(kind: &str, event: &Map<String, Value>) -> Opt
 
 fn ledger_kernel_fact_material(kind: &str, payload: &Map<String, Value>) -> Option<Value> {
     match kind {
+        "plan_authorization.decision_recorded" => selected_kernel_material(
+            payload,
+            &["authorizationContractId", "decision", "leaseId"],
+        ),
         "tool.execution_attempted"
         | "tool.effect_observed"
         | "tool.outcome_indeterminate"
@@ -663,6 +671,9 @@ fn parse_event<'a>(
 fn event_disposition(event: &EventView<'_>) -> EventDisposition {
     if event.kind == "session_turn_authority" {
         return EventDisposition::Authority;
+    }
+    if event.kind == "session_goal_fact" {
+        return EventDisposition::PersistentDomainFact;
     }
     let payload = event.payload;
     // Terminal run state is a durable outcome fact even though presentation
@@ -2438,7 +2449,8 @@ fn positive_u64_field(record: &Map<String, Value>, field: &str) -> Option<u64> {
 fn supported_kernel_fact_kind(kind: &str) -> bool {
     matches!(
         kind,
-        "tool.execution_attempted"
+        "plan_authorization.decision_recorded"
+            | "tool.execution_attempted"
             | "tool.effect_observed"
             | "tool.outcome_indeterminate"
             | "tool.completed"

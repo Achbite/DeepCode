@@ -15,6 +15,7 @@ import type {
   AcceptedPlanReviewHandoffRunInput,
 } from './review/acceptedPlanReviewHandoffCoordinator.js';
 import type { AutonomyMode, InterventionLevel, ReviewContinuationMode } from './types.js';
+import type { SessionGoalOperationContext } from '../goal/index.js';
 
 export interface DecisionContinuationSource {
   sessionId: string;
@@ -32,6 +33,7 @@ export interface DecisionContinuationSource {
   projectMemoryMode?: ProjectMemoryMode;
   interactionOverlay?: InteractionOverlayContext;
   hostLanguage?: ConversationLanguage;
+  goalContext?: SessionGoalOperationContext;
 }
 
 export interface SessionLoopResumeInput {
@@ -58,6 +60,7 @@ export interface SessionLoopResumeInput {
   acceptedTaskPlan?: AcceptedTaskPlanContext;
   interactionOverlay?: InteractionOverlayContext;
   hostLanguage?: ConversationLanguage;
+  goalContext?: SessionGoalOperationContext;
 }
 
 export type SessionLoopControlResult =
@@ -85,6 +88,7 @@ export interface DecisionContinuationOverride {
   acceptedTaskPlan?: AcceptedTaskPlanContext;
   interactionOverlay?: InteractionOverlayContext;
   hostLanguage?: ConversationLanguage;
+  goalContext?: SessionGoalOperationContext;
 }
 
 export interface AcceptedPlanContinuationOverride extends DecisionContinuationOverride {
@@ -163,6 +167,7 @@ export function decisionContinuationInput<Extra extends object = Record<string, 
     acceptedTaskPlan,
     interactionOverlay: interactionOverlay ?? source.interactionOverlay,
     hostLanguage: hostLanguage ?? source.hostLanguage,
+    goalContext: source.goalContext,
   } as DecisionContinuationInput<Extra>;
 }
 

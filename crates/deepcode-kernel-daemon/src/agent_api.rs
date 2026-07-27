@@ -37,6 +37,15 @@ pub(crate) struct AgentSessionRunRequest {
     pub(crate) decision_request_id: Option<String>,
     pub(crate) review_id: Option<String>,
     pub(crate) host_language: Option<String>,
+    pub(crate) goal_id: Option<String>,
+    pub(crate) goal_revision: Option<u64>,
+    pub(crate) objective: Option<String>,
+    pub(crate) caller_request_id: Option<String>,
+    pub(crate) request_digest: Option<String>,
+    pub(crate) expected_domain_head_digest: Option<String>,
+    pub(crate) predecessor_goal_ref: Option<Value>,
+    #[serde(skip)]
+    pub(crate) admitted_domain_head_digest: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -323,6 +332,28 @@ fn claim_interaction_decision(
             "turnAuthorityRef": turn_authority_ref,
             "decisionRequestId": decision_request_id,
             "admittedRunId": admitted_run_id,
+            "goalCommand": match (
+                body.op.as_deref(),
+                body.goal_id.as_deref(),
+                body.goal_revision,
+                body.caller_request_id.as_deref(),
+                body.request_digest.as_deref(),
+            ) {
+                (
+                    Some("resolveGoalInteraction"),
+                    Some(goal_id),
+                    Some(goal_revision),
+                    Some(caller_request_id),
+                    Some(request_digest),
+                ) => Some(json!({
+                    "goalId": goal_id,
+                    "goalRevision": goal_revision,
+                    "callerRequestId": caller_request_id,
+                    "requestDigest": request_digest,
+                    "hostRunId": admitted_run_id,
+                })),
+                _ => None,
+            },
             "status": "claimed",
             "channel": "task",
             "visibility": "hidden",
@@ -595,7 +626,7 @@ fn durable_session_run_response(
 pub(crate) async fn agent_session_run_start(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
-    Json(body): Json<AgentSessionRunRequest>,
+    Json(mut body): Json<AgentSessionRunRequest>,
 ) -> Json<ApiResponse> {
     let Some((session, _events)) = session_payload(&state, &session_id) else {
         return ApiResponse::error("agent_session_not_found", "agent session not found");
@@ -619,6 +650,31 @@ pub(crate) async fn agent_session_run_start(
     let run_start_guard = run_start_lock.lock_owned().await;
     if let Err(error) = reconcile_session_run_recovery(&state, &session_id) {
         return ApiResponse::error(error.code, error.message);
+    }
+    let active_goal = {
+        let sessions_dir = state
+            .gui
+            .lock()
+            .expect("gui state lock")
+            .paths
+            .sessions_dir
+            .clone();
+        session_domain_state(&sessions_dir, &session_id)
+            .ok()
+            .and_then(|domain| serde_json::to_value(domain).ok())
+            .and_then(|domain| {
+                (domain.pointer("/goalSlot/state").and_then(Value::as_str) == Some("active"))
+                    .then_some(domain)
+            })
+    };
+    if active_goal.is_some()
+        && body.decision_kind.is_some()
+        && body.op.as_deref() != Some("resolveGoalInteraction")
+    {
+        return ApiResponse::error(
+            "session_goal_route_required",
+            "An active Goal interaction must be resolved through its Goal route.",
+        );
     }
     if let Some(decision_request_id) = body
         .decision_request_id
@@ -749,6 +805,21 @@ pub(crate) async fn agent_session_run_start(
         Ok(admission) => admission,
         Err(error) => return ApiResponse::error(error.code, error.message),
     };
+    if matches!(
+        body.op.as_deref(),
+        Some("resolveGoalInteraction" | "advanceGoal" | "resumeGoal" | "cancelGoal")
+    ) {
+        let sessions_dir = state
+            .gui
+            .lock()
+            .expect("gui state lock")
+            .paths
+            .sessions_dir
+            .clone();
+        body.admitted_domain_head_digest = session_domain_state(&sessions_dir, &session_id)
+            .ok()
+            .map(|domain| domain.head.head_digest);
+    }
     let bootstrap_grant = if matches!(interaction_admission, InteractionAdmission::NotRequired) {
         match register_session_run_bootstrap(&state, &session_id, &run_id) {
             Ok(grant) => Some(grant),

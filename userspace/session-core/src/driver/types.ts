@@ -33,6 +33,7 @@ import type {
   ProviderAnalysisTimelineAppendResult,
   ProviderAnalysisTimelineEvent,
 } from '../provider/ProviderAnalysisTimeline.js';
+import type { SessionGoalOperationContext } from '../goal/index.js';
 
 export type {
   InterventionLevel,
@@ -158,6 +159,7 @@ export interface SessionDriverLoopInput {
   interactionOverlay?: InteractionOverlayContext;
   hostLanguage?: ConversationLanguage;
   bootstrapEvents?: AgentEvent[];
+  goalContext?: SessionGoalOperationContext;
 }
 
 export interface SessionDecisionResolverInput {
@@ -187,4 +189,5 @@ export interface SessionDecisionResolverInput {
   interactionOverlay?: InteractionOverlayContext;
   hostLanguage?: ConversationLanguage;
   bootstrapEvents?: AgentEvent[];
+  goalContext?: SessionGoalOperationContext;
 }

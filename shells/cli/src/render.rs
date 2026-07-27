@@ -633,6 +633,12 @@ Usage:
   DeepCode-CLI permission deny <permission-id>
   DeepCode-CLI decision <requirement|plan|review> <accept|reject|revise> [--session <id>] [run-id] [target-id] [guidance]
   DeepCode-CLI decision permission <accept|reject> [--session <id>] [run-id] [target-id]
+  DeepCode-CLI goal start [--session <id>] <objective>
+  DeepCode-CLI goal show [--session <id>] [goal-id]
+  DeepCode-CLI goal step [--session <id>] [goal-id]
+  DeepCode-CLI goal run [--session <id>] [goal-id]
+  DeepCode-CLI goal resume [--session <id>] [goal-id]
+  DeepCode-CLI goal cancel [--session <id>] [goal-id]
   DeepCode-CLI ask [-p|--print] [--session <id>] [--workspace <path>|--no-workspace] <prompt>
   DeepCode-CLI tools run <toolId> --workspace <path> --args-file <json> [--approve-contract]
   DeepCode-CLI tools verify --workspace <path> --cases <jsonl> [--approve-contract]

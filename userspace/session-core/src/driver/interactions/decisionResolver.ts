@@ -20,6 +20,7 @@ import type {
   AcceptedPlanReviewHandoffPlan,
   AcceptedPlanReviewHandoffRunInput,
 } from '../review/acceptedPlanReviewHandoffCoordinator.js';
+import type { SessionGoalOperationContext } from '../../goal/index.js';
 import {
   createSessionTurnAuthorityEvent,
   hasLegacySessionTurnAuthority,
@@ -65,6 +66,7 @@ export interface DecisionResolverInput {
   interactionOverlay?: InteractionOverlayContext;
   hostLanguage?: ConversationLanguage;
   bootstrapEvents?: AgentEvent[];
+  goalContext?: SessionGoalOperationContext;
   admittedFreeformAuthority?: {
     readonly messageId: string;
     readonly runId: string;
@@ -195,6 +197,7 @@ export class DecisionResolver {
         projectMemoryMode: input.projectMemoryMode,
         interactionOverlay: input.interactionOverlay,
         hostLanguage: input.hostLanguage,
+        goalContext: input.goalContext,
       }));
       return { kind: 'decisionRouted', decisionKind: 'plan', result };
     }

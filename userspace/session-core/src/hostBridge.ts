@@ -14,6 +14,7 @@ import type {
   LlmChatResult,
   LlmChatStreamEvent,
   ProjectionDelta,
+  GoalProjectionV1,
   SessionAppendCommandV1,
   SessionAppendErrorDetailsV1,
   ToolCall,
@@ -41,6 +42,11 @@ import {
   type SessionAppendInteractionContext,
   type SessionRunBootstrapContext,
 } from './driver/authority/sessionAppendCoordinator.js';
+import {
+  readSessionGoal,
+  SessionGoalError,
+  type SessionGoalOperationContext,
+} from './goal/index.js';
 
 declare const process: {
   argv: string[];
@@ -54,7 +60,15 @@ declare const process: {
 };
 
 interface HostBridgeRequest {
-  op: 'ask' | 'resolveDecision';
+  op:
+    | 'ask'
+    | 'resolveDecision'
+    | 'startGoal'
+    | 'resolveGoalInteraction'
+    | 'advanceGoal'
+    | 'resumeGoal'
+    | 'cancelGoal'
+    | 'readGoal';
   apiBase?: string;
   sessionId?: string;
   hostRunId?: string;
@@ -87,6 +101,18 @@ interface HostBridgeRequest {
   bootstrapToken?: string;
   bootstrapAdmissionId?: string;
   bootstrapEvents?: AgentEvent[];
+  goalId?: string;
+  goalRevision?: number;
+  objective?: string;
+  callerRequestId?: string;
+  requestDigest?: string;
+  expectedDomainHeadDigest?: string;
+  predecessorGoalRef?: {
+    goalId: string;
+    goalRevision: number;
+  };
+  sessionResult?: AgentSessionResult;
+  conversationProjection?: AgentTimelineResult;
 }
 
 interface HostBridgeResult {
@@ -102,6 +128,7 @@ interface HostBridgeResult {
   terminalReason?: string;
   message?: string;
   error?: string;
+  goalProjection?: GoalProjectionV1 | null;
 }
 
 const MEMORY_ARCHIVE_PERSIST_TIMEOUT_MS = 2_000;
@@ -114,13 +141,50 @@ interface HostRunCancellationContext {
 }
 
 async function main(): Promise<void> {
-  const raw = await readStdin();
-  const request = JSON.parse(raw || '{}') as HostBridgeRequest;
-  const result = request.op === 'resolveDecision'
-    ? await resolveDecision(request)
-    : await runAsk(request);
-  await writeJson(result);
-  process.exit(0);
+  try {
+    const raw = await readStdin();
+    const request = JSON.parse(raw || '{}') as HostBridgeRequest;
+    let result: HostBridgeResult;
+    switch (request.op) {
+      case 'ask':
+      case 'startGoal':
+        result = await runAsk(request);
+        break;
+      case 'resolveDecision':
+      case 'resolveGoalInteraction':
+        result = await resolveDecision(request);
+        break;
+      case 'readGoal':
+        result = readGoal(request);
+        break;
+      case 'advanceGoal':
+      case 'resumeGoal':
+      case 'cancelGoal':
+        throw new SessionGoalError(
+          'session_goal_operation_unavailable',
+          `Goal operation ${request.op} is not available before its Stage2 batch.`
+        );
+      default:
+        throw new SessionGoalError(
+          'session_host_bridge_operation_invalid',
+          `Unknown Session HostBridge operation ${String((request as { op?: unknown }).op)}.`
+        );
+    }
+    await writeJson(result);
+    process.exit(0);
+  } catch (error) {
+    const code = error instanceof SessionGoalError
+      ? error.code
+      : error instanceof SessionAppendCoordinatorError
+        ? error.code
+        : 'session_host_bridge_failed';
+    await writeJson({
+      ok: false,
+      error: code,
+      message: error instanceof Error ? error.message : String(error),
+    });
+    process.exit(1);
+  }
 }
 
 async function runAsk(request: HostBridgeRequest): Promise<HostBridgeResult> {
@@ -158,7 +222,8 @@ async function runAsk(request: HostBridgeRequest): Promise<HostBridgeResult> {
     initialCacheTelemetry,
     deliveryRecorder,
     undefined,
-    bootstrapContext(request)
+    bootstrapContext(request),
+    goalOperationContext(request)
   );
   try {
     const driver = projection.driver;
@@ -174,13 +239,14 @@ async function runAsk(request: HostBridgeRequest): Promise<HostBridgeResult> {
       projectKind: request.projectKind,
       projectRootStatus: request.projectRootStatus,
       profileId: request.profileId,
-      workflow: request.workflow,
+      workflow: request.op === 'startGoal' ? 'planFirst' : request.workflow,
       requirementConfirmationMode: request.requirementConfirmationMode,
       reviewContinuationMode: request.reviewContinuationMode,
       interventionLevel: request.interventionLevel,
       autonomyMode: request.autonomyMode,
       hostLanguage: request.hostLanguage,
       bootstrapEvents: request.bootstrapEvents,
+      goalContext: goalOperationContext(request),
     });
     await persistMemoryArchive(apiBase, result.session.id, result.events ?? [], binding, result.session, request.projectMemoryMode);
     const timeline = projection.buildTimeline(result.events ?? []);
@@ -235,7 +301,8 @@ async function resolveDecision(request: HostBridgeRequest): Promise<HostBridgeRe
     initialCacheTelemetry,
     deliveryRecorder,
     interactionContext(request),
-    bootstrapContext(request)
+    bootstrapContext(request),
+    goalOperationContext(request)
   );
   try {
     const driver = projection.driver;
@@ -265,11 +332,13 @@ async function resolveDecision(request: HostBridgeRequest): Promise<HostBridgeRe
       projectMemoryMode: request.projectMemoryMode,
       hostLanguage: request.hostLanguage,
       bootstrapEvents: request.bootstrapEvents,
+      goalContext: goalOperationContext(request),
     });
     await persistMemoryArchive(apiBase, result.session.id, result.events ?? [], binding, result.session, request.projectMemoryMode);
     const timeline = projection.buildTimeline(result.events ?? []);
     const finalText = extractFinalText(timeline);
-    const lifecycle = inferHostRunLifecycle(result.events, finalText);
+    const lifecycle = goalInteractionHostLifecycle(request, result.events)
+      ?? inferHostRunLifecycle(result.events, finalText);
     return {
       ok: true,
       sessionId: result.session.id,
@@ -282,6 +351,145 @@ async function resolveDecision(request: HostBridgeRequest): Promise<HostBridgeRe
   } finally {
     await deliveryRecorder?.close();
   }
+}
+
+function readGoal(request: HostBridgeRequest): HostBridgeResult {
+  const sessionResult = request.sessionResult;
+  const conversationProjection = request.conversationProjection;
+  if (
+    !sessionResult
+    || !isAgentSessionResult(sessionResult)
+    || sessionResult.appendWriteability.status !== 'writable'
+    || !sessionResult.domainState
+  ) {
+    throw new SessionGoalError(
+      'session_goal_schema_unavailable',
+      'Goal read requires a writable canonical Session snapshot.'
+    );
+  }
+  if (
+    !conversationProjection
+    || conversationProjection.schemaVersion
+      !== 'deepcode.shared-conversation-projection.v2'
+  ) {
+    throw new SessionGoalError(
+      'session_goal_projection_stale',
+      'Goal read requires Shared Conversation Projection v2.'
+    );
+  }
+  const result = readSessionGoal({
+    sessionId: sessionResult.session.id,
+    events: sessionResult.events,
+    domainState: sessionResult.domainState,
+    conversationProjection,
+    goalId: request.goalId,
+  });
+  return {
+    ok: true,
+    sessionId: sessionResult.session.id,
+    goalProjection: result.projection,
+  };
+}
+
+function goalOperationContext(
+  request: HostBridgeRequest
+): SessionGoalOperationContext | undefined {
+  const operation = request.op === 'startGoal'
+    ? 'start'
+    : request.op === 'resolveGoalInteraction'
+      ? 'resolveInteraction'
+      : request.op === 'advanceGoal'
+        ? 'advance'
+        : request.op === 'resumeGoal'
+          ? 'resume'
+          : request.op === 'cancelGoal'
+            ? 'cancel'
+            : undefined;
+  if (!operation) return undefined;
+  const goalId = requiredGoalString(request.goalId, 'goalId');
+  const callerRequestId = requiredGoalString(
+    request.callerRequestId,
+    'callerRequestId'
+  );
+  const requestDigest = requiredGoalString(
+    request.requestDigest,
+    'requestDigest'
+  );
+  const expectedDomainHeadDigest = requiredGoalString(
+    request.expectedDomainHeadDigest,
+    'expectedDomainHeadDigest'
+  );
+  if (
+    !Number.isSafeInteger(request.goalRevision)
+    || (request.goalRevision ?? 0) < 1
+  ) {
+    throw new SessionGoalError(
+      'session_goal_revision_conflict',
+      'Goal operation requires a positive safe goalRevision.'
+    );
+  }
+  const objective = operation === 'start'
+    ? requiredGoalString(request.objective ?? request.prompt, 'objective')
+    : request.objective;
+  return {
+    operation,
+    goalId,
+    goalRevision: request.goalRevision!,
+    objective,
+    expectedDomainHeadDigest,
+    command: {
+      callerRequestId,
+      requestDigest,
+      hostRunId: requiredHostRunId(request),
+    },
+    predecessorGoalRef: request.predecessorGoalRef,
+  };
+}
+
+function requiredGoalString(
+  value: string | undefined,
+  field: string
+): string {
+  const normalized = value?.trim();
+  if (!normalized) {
+    throw new SessionGoalError(
+      'session_goal_request_invalid',
+      `Goal operation requires ${field}.`
+    );
+  }
+  return normalized;
+}
+
+function goalInteractionHostLifecycle(
+  request: HostBridgeRequest,
+  events: readonly AgentEvent[]
+): Pick<
+  HostBridgeResult,
+  'runStatus' | 'decisionKind' | 'targetId' | 'terminalReason'
+> | undefined {
+  if (request.op !== 'resolveGoalInteraction') return undefined;
+  const callerRequestId = request.callerRequestId?.trim();
+  if (!callerRequestId) return undefined;
+  const terminalFact = [...events].reverse().find((event) => {
+    if (event.kind !== 'session_goal_fact') return false;
+    const payload = objectRecord(event.payload);
+    const command = objectRecord(payload?.command);
+    return stringField(command, 'callerRequestId') === callerRequestId
+      && (
+        payload?.factKind === 'activated'
+        || payload?.factKind === 'cancelled'
+      );
+  });
+  if (!terminalFact) return undefined;
+  const payload = objectRecord(terminalFact.payload);
+  return {
+    runStatus: 'completed',
+    decisionKind: request.decisionKind,
+    targetId: request.targetId,
+    terminalReason: payload?.factKind === 'activated'
+      ? 'Goal Plan interaction settled and the Goal is active.'
+      : 'Goal Plan interaction settled and the Goal was cancelled.',
+  };
 }
 
 async function persistMemoryArchive(
@@ -326,7 +534,8 @@ function createProjectionPublishingDriver(
   initialCacheTelemetry: AgentEvent[] = [],
   deliveryRecorder?: ProjectionDeliveryRecorder,
   interaction?: SessionAppendInteractionContext,
-  bootstrap?: SessionRunBootstrapContext
+  bootstrap?: SessionRunBootstrapContext,
+  goal?: SessionGoalOperationContext
 ): {
   driver: SessionDriverLoop;
   buildTimeline: (events?: AgentEvent[]) => AgentTimelineResult;
@@ -338,7 +547,8 @@ function createProjectionPublishingDriver(
     hostRunId,
     initialResult,
     interaction,
-    bootstrap
+    bootstrap,
+    goal
   );
   const projector = new CanonicalTimelineProjector(
     sessionId,
@@ -582,7 +792,7 @@ function bootstrapContext(
       'Run bootstrap requires one admission identity and one transport token.'
     );
   }
-  if (request.op !== 'ask') {
+  if (request.op !== 'ask' && request.op !== 'startGoal') {
     throw new SessionAppendCoordinatorError(
       'session_append_transition_invalid',
       'Only a new authoritative user run may carry a bootstrap admission.'

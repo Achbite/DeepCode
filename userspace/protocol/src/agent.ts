@@ -257,6 +257,7 @@ export type AgentEventKind =
   | 'user_guidance'
   | 'session_turn_authority'
   | 'session_language_decision'
+  | 'session_goal_fact'
   | 'assistant_msg'
   | 'cache_telemetry'
   | 'requirement_confirmation'
@@ -501,6 +502,7 @@ export type SessionFactProducerV1 =
   | SessionRuleProducerV1;
 
 export type SessionKernelFactKindV1 =
+  | 'plan_authorization.decision_recorded'
   | 'tool.execution_attempted'
   | 'tool.effect_observed'
   | 'tool.outcome_indeterminate'
@@ -541,6 +543,231 @@ export interface SessionFactLineageV1 {
   producer: SessionFactProducerV1;
   domainParentRefs: string[];
   kernelFactRefs: SessionKernelFactRefV1[];
+}
+
+export type SessionGoalLifecycleV1 =
+  | 'draft'
+  | 'awaitingPlanAcceptance'
+  | 'running'
+  | 'suspended'
+  | 'completed'
+  | 'failed'
+  | 'cancelled';
+
+export interface SessionGoalRefV1 {
+  goalId: string;
+  goalRevision: number;
+}
+
+export interface SessionGoalCommandIdentityV1 {
+  callerRequestId: string;
+  requestDigest: string;
+  hostRunId?: string;
+}
+
+export interface SessionGoalInteractionRefV1 {
+  kind: 'requirement' | 'plan' | 'review' | 'permission' | 'scopeChange';
+  interactionId: string;
+  interactionRevision: string;
+  targetId: string;
+  runId: string;
+}
+
+export interface SessionGoalFactBaseV1 extends SessionGoalRefV1 {
+  schemaVersion: 'deepcode.session.goal-fact.v1';
+  lifecycle: SessionGoalLifecycleV1;
+  objective: string;
+  sourceRefs: string[];
+  command: SessionGoalCommandIdentityV1;
+  lineage: SessionFactLineageV1;
+}
+
+export type SessionGoalFactPayloadV1 =
+  | (SessionGoalFactBaseV1 & {
+      factKind: 'draftCreated';
+      lifecycle: 'draft';
+      planRevision: 0;
+      sourceRunId: string;
+      predecessorGoalRef?: SessionGoalRefV1;
+    })
+  | (SessionGoalFactBaseV1 & {
+      factKind: 'planAwaitingAcceptance';
+      lifecycle: 'awaitingPlanAcceptance';
+      planId: string;
+      planRevision: number;
+      sourceRunId: string;
+    })
+  | (SessionGoalFactBaseV1 & {
+      factKind: 'planRevisionRequested';
+      lifecycle: 'awaitingPlanAcceptance';
+      planId: string;
+      planRevision: number;
+      sourceRunId: string;
+    })
+  | (SessionGoalFactBaseV1 & {
+      factKind: 'activated';
+      lifecycle: 'running';
+      planId: string;
+      planRevision: number;
+      confirmedPlanRef: string;
+      authorizationFactRef: string;
+      sourceRunId: string;
+      taskSnapshot: unknown[];
+    })
+  | (SessionGoalFactBaseV1 & {
+      factKind: 'suspended';
+      lifecycle: 'suspended';
+      waitRef: string;
+      sourceRunId: string;
+    })
+  | (SessionGoalFactBaseV1 & {
+      factKind: 'resumed';
+      lifecycle: 'running';
+      checkpointRef: string;
+      sourceRunId: string;
+    })
+  | (SessionGoalFactBaseV1 & {
+      factKind: 'completed' | 'failed' | 'cancelled';
+      lifecycle: 'completed' | 'failed' | 'cancelled';
+      sourceRunId: string;
+      terminalReason: string;
+      checkpointRef?: string;
+    })
+  | (SessionGoalFactBaseV1 & {
+      factKind: 'taskLedger';
+      lifecycle: 'running' | 'suspended';
+      taskLedger: unknown;
+    })
+  | (SessionGoalFactBaseV1 & {
+      factKind: 'activeWait';
+      lifecycle: 'suspended';
+      activeWait: unknown;
+    })
+  | (SessionGoalFactBaseV1 & {
+      factKind: 'checkpoint';
+      lifecycle: 'running' | 'suspended' | 'completed' | 'failed' | 'cancelled';
+      checkpoint: unknown;
+    })
+  | (SessionGoalFactBaseV1 & {
+      factKind: 'budgetUsage';
+      lifecycle: 'running' | 'suspended';
+      executionBudget: unknown;
+    });
+
+export type SessionGoalSlotExpectationV1 =
+  | {
+      state: 'empty';
+    }
+  | ({
+      state: 'active';
+      lifecycle: Exclude<
+        SessionGoalLifecycleV1,
+        'completed' | 'failed' | 'cancelled'
+      >;
+    } & SessionGoalRefV1);
+
+export type SessionGoalSlotSnapshotV1 =
+  | {
+      capability: 'goalSlotV1';
+      state: 'empty';
+      lastTerminalGoalRef?: SessionGoalRefV1 & {
+        lifecycle: 'completed' | 'failed' | 'cancelled';
+        factRef: string;
+      };
+    }
+  | ({
+      capability: 'goalSlotV1';
+      state: 'active';
+      lifecycle: Exclude<
+        SessionGoalLifecycleV1,
+        'completed' | 'failed' | 'cancelled'
+      >;
+      factRef: string;
+    } & SessionGoalRefV1);
+
+export type SessionGoalEffectV1 =
+  | ({
+      kind: 'open';
+      lifecycle: 'draft';
+      factRef: string;
+    } & SessionGoalRefV1)
+  | ({
+      kind: 'transition';
+      fromLifecycle: Exclude<
+        SessionGoalLifecycleV1,
+        'completed' | 'failed' | 'cancelled'
+      >;
+      toLifecycle: Exclude<
+        SessionGoalLifecycleV1,
+        'completed' | 'failed' | 'cancelled'
+      >;
+      factRef: string;
+    } & SessionGoalRefV1)
+  | ({
+      kind: 'release';
+      lifecycle: 'completed' | 'failed' | 'cancelled';
+      factRef: string;
+    } & SessionGoalRefV1);
+
+export type GoalProjectionAvailabilityV1<T> =
+  | {
+      status: 'notAvailable';
+    }
+  | {
+      status: 'available';
+      value: T;
+    };
+
+export interface GoalProjectionV1 extends SessionGoalRefV1 {
+  schemaVersion: 'deepcode.session.goal-projection.v1';
+  sessionId: string;
+  lifecycle: SessionGoalLifecycleV1;
+  objective: string;
+  predecessorGoalRef?: SessionGoalRefV1;
+  sourceDomainHead: SessionDomainHeadV1;
+  conversationRef: {
+    revision: number;
+    sourceEventVersion: number;
+  };
+  pendingInteraction?: SessionGoalInteractionRefV1;
+  task: GoalProjectionAvailabilityV1<{
+    currentTaskId?: string;
+    settled: number;
+    total: number;
+  }>;
+  activeWait: GoalProjectionAvailabilityV1<unknown>;
+  checkpoint: GoalProjectionAvailabilityV1<{
+    sequence: number;
+    checkpointRef: string;
+  }>;
+  executionBudget: GoalProjectionAvailabilityV1<unknown>;
+  terminal?: {
+    status: 'completed' | 'failed' | 'cancelled';
+    factRef: string;
+    reason: string;
+  };
+  factRefs: string[];
+  sourceRefs: string[];
+}
+
+export interface SessionGoalCommandReceiptV1 {
+  schemaVersion: 'deepcode.session.goal-command-receipt.v1';
+  sessionId: string;
+  operation:
+    | 'start'
+    | 'resolveInteraction'
+    | 'advance'
+    | 'resume'
+    | 'cancel'
+    | 'read';
+  callerRequestId?: string;
+  requestDigest?: string;
+  idempotent: boolean;
+  goalId?: string;
+  goalRevision?: number;
+  sourceDomainHead: SessionDomainHeadV1;
+  projection: GoalProjectionV1 | null;
+  hostRunId?: string;
 }
 
 export type AgentTimelineBlockKind =
@@ -1297,6 +1524,13 @@ export interface SessionDomainStateSnapshotV1 {
   head: SessionDomainHeadV1;
   runFences: SessionRunFenceSnapshotV1[];
   interactionFences: SessionInteractionFenceSnapshotV1[];
+  /**
+   * Current writers always return this capability. It remains optional in the
+   * structural type so read-only v1 fixtures and legacy snapshots can be
+   * decoded and then rejected by Goal admission rather than failing JSON
+   * decoding before a diagnostic can be produced.
+   */
+  goalSlot?: SessionGoalSlotSnapshotV1;
 }
 
 export type SessionAppendPreconditionV1 =
@@ -1308,6 +1542,10 @@ export type SessionAppendPreconditionV1 =
   | {
       kind: 'turnAuthority';
       eventId: string;
+    }
+  | {
+      kind: 'goalSlot';
+      expected: SessionGoalSlotExpectationV1;
     }
   | ({
       kind: 'interaction';
@@ -1398,9 +1636,15 @@ export type SessionCloseTransitionV1 =
   | SessionCloseTerminalTransitionV1;
 
 export type SessionAppendTransitionV1 =
-  | SessionAppendEventTransitionV1
-  | SessionClaimTransitionV1
-  | SessionCloseTransitionV1;
+  | (SessionAppendEventTransitionV1 & {
+      goalEffect?: SessionGoalEffectV1;
+    })
+  | (SessionClaimTransitionV1 & {
+      goalEffect?: SessionGoalEffectV1;
+    })
+  | (SessionCloseTransitionV1 & {
+      goalEffect?: SessionGoalEffectV1;
+    });
 
 export interface SessionAppendCommandV1 {
   schemaVersion: 'deepcode.session.append-command.v1';

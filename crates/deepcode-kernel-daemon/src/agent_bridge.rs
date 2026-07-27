@@ -117,7 +117,16 @@ pub(crate) fn host_bridge_request(
         "reviewId": body.review_id.clone(),
         "bootstrapAdmissionId": bootstrap_grant.map(|grant| grant.admission_id.clone()),
         "bootstrapToken": bootstrap_grant.map(|grant| grant.token.clone()),
-        "bootstrapEvents": bootstrap_events
+        "bootstrapEvents": bootstrap_events,
+        "goalId": body.goal_id.clone(),
+        "goalRevision": body.goal_revision,
+        "objective": body.objective.clone(),
+        "callerRequestId": body.caller_request_id.clone(),
+        "requestDigest": body.request_digest.clone(),
+        "expectedDomainHeadDigest": body.admitted_domain_head_digest
+            .clone()
+            .or_else(|| body.expected_domain_head_digest.clone()),
+        "predecessorGoalRef": body.predecessor_goal_ref.clone()
     })
 }
 
@@ -404,6 +413,115 @@ pub(crate) fn run_session_bridge_worker(
             );
         }
     }
+}
+
+pub(crate) fn run_readonly_session_bridge(request: Value) -> Result<Value, KernelErrorEnvelope> {
+    let payload = serde_json::to_vec(&request).map_err(|error| KernelErrorEnvelope {
+        code: "session_bridge_request_encode_failed".to_string(),
+        message: format!("failed to encode read-only Session bridge request: {error}"),
+        message_key: None,
+        args: None,
+    })?;
+    let bridge = find_session_host_bridge_daemon().ok_or_else(|| KernelErrorEnvelope {
+        code: "session_bridge_unavailable".to_string(),
+        message: format!(
+            "cannot find session host bridge; {}",
+            session_host_bridge_hint_daemon()
+        ),
+        message_key: None,
+        args: None,
+    })?;
+    let node = find_session_host_node_daemon(&bridge);
+    let mut child = Command::new(&node)
+        .arg(&bridge)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| KernelErrorEnvelope {
+            code: "session_bridge_spawn_failed".to_string(),
+            message: format!(
+                "failed to start Node runtime `{}` for bridge `{}`: {error}",
+                node.display(),
+                bridge.display()
+            ),
+            message_key: None,
+            args: None,
+        })?;
+    let write_result = child
+        .stdin
+        .take()
+        .ok_or_else(|| KernelErrorEnvelope {
+            code: "session_bridge_stdin_unavailable".to_string(),
+            message: "read-only Session bridge stdin is unavailable".to_string(),
+            message_key: None,
+            args: None,
+        })
+        .and_then(|mut stdin| {
+            stdin
+                .write_all(&payload)
+                .map_err(|error| KernelErrorEnvelope {
+                    code: "session_bridge_write_failed".to_string(),
+                    message: format!(
+                        "failed to write read-only Session bridge request: {error}"
+                    ),
+                    message_key: None,
+                    args: None,
+                })
+        });
+    if let Err(error) = write_result {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+    let output = wait_for_child_output_with_cancel_grace(
+        child,
+        || false,
+        Some(Duration::from_secs(30)),
+        Duration::ZERO,
+    )
+    .map_err(|error| KernelErrorEnvelope {
+        code: "session_bridge_failed".to_string(),
+        message: match error {
+            BridgeWorkerStop::Cancelled => {
+                "read-only Session bridge was unexpectedly cancelled".to_string()
+            }
+            BridgeWorkerStop::Failed(message) => message,
+        },
+        message_key: None,
+        args: None,
+    })?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let result = serde_json::from_str::<Value>(stdout.trim()).map_err(|error| {
+        KernelErrorEnvelope {
+            code: "session_bridge_invalid_json".to_string(),
+            message: format!(
+                "read-only Session bridge returned invalid JSON: {error}; stderr={}",
+                stderr.trim()
+            ),
+            message_key: None,
+            args: None,
+        }
+    })?;
+    if !output.status.success() || result.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Err(KernelErrorEnvelope {
+            code: result
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("session_bridge_failed")
+                .to_string(),
+            message: result
+                .get("message")
+                .or_else(|| result.get("error"))
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| stderr.trim())
+                .to_string(),
+            message_key: None,
+            args: None,
+        });
+    }
+    Ok(result)
 }
 
 fn finish_run_terminal(

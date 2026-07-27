@@ -28,6 +28,7 @@ import {
   returnSessionResult,
   type SessionLoopControlResult,
 } from '../runContinuation.js';
+import type { SessionGoalOperationContext } from '../../goal/index.js';
 
 export type PlanDecisionHandlerDecision = 'accept' | 'reject' | 'revise';
 export type PlanDecisionHandlerContinuationMode = ReviewContinuationMode;
@@ -54,6 +55,7 @@ export interface PlanDecisionHandlerInput {
   projectMemoryMode?: ProjectMemoryMode;
   interactionOverlay?: InteractionOverlayContext;
   hostLanguage?: ConversationLanguage;
+  goalContext?: SessionGoalOperationContext;
 }
 
 export interface RecoveredAcceptedPlanContext {
@@ -200,6 +202,12 @@ export class PlanDecisionHandler {
         id: this.ports.createId('plan-accepted'),
       }),
     ]);
+    if (input.goalContext) {
+      return {
+        kind: 'planAcceptedForImplementation',
+        control: returnSessionResult(result),
+      };
+    }
     if (plan.taskPlan) {
       const executionRoot = plan.executionRoot ?? this.ports.executionRootFromDecision(input, result.events);
       const acceptedPlan = this.ports.buildAcceptedTaskPlan({
@@ -307,6 +315,13 @@ export class PlanDecisionHandler {
             interactionOverlay: plan.interactionOverlay ?? input.interactionOverlay,
           }),
         },
+      };
+    }
+
+    if (input.goalContext && input.decision === 'reject') {
+      return {
+        kind: 'planRejected',
+        control: returnSessionResult(result),
       };
     }
 

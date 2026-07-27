@@ -271,6 +271,51 @@ pub struct AgentRunResult {
     pub events: Vec<Value>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartSessionGoalRequest {
+    pub caller_request_id: String,
+    pub expected_goal_revision: u64,
+    pub expected_domain_head: Value,
+    pub objective: String,
+    pub workspace_path: Option<String>,
+    pub no_workspace: Option<bool>,
+    pub host_language: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolveSessionGoalInteractionRequest {
+    pub caller_request_id: String,
+    pub expected_goal_revision: u64,
+    pub expected_domain_head: Value,
+    pub interaction_revision: String,
+    pub target_id: String,
+    pub run_id: String,
+    pub decision_kind: String,
+    pub decision: String,
+    pub guidance: Option<String>,
+    pub workspace_path: Option<String>,
+    pub no_workspace: Option<bool>,
+    pub host_language: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionGoalCommandReceipt {
+    pub schema_version: String,
+    pub operation: String,
+    pub session_id: String,
+    pub goal_id: Option<String>,
+    pub goal_revision: Option<u64>,
+    pub caller_request_id: Option<String>,
+    pub request_digest: Option<String>,
+    pub idempotent: bool,
+    pub source_domain_head: Option<Value>,
+    pub projection: Option<Value>,
+    pub host_run_id: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct TerminalWorkspaceScope {
     pub workspace_id: String,

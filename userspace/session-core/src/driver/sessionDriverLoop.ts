@@ -107,6 +107,7 @@ import {
   SessionFactLineageError,
 } from './authority/sessionFactLineage.js';
 import { SessionAppendCoordinatorError } from './authority/sessionAppendCoordinator.js';
+import { SessionGoalError } from '../goal/index.js';
 import {
   conversationPresentationLanguage,
   conversationPresentationLanguageBinding,
@@ -1582,6 +1583,7 @@ export class SessionDriverLoop {
     try {
       return await this.decisionResolver.resolve(input);
     } catch (error) {
+      if (input.goalContext) throw error;
       const rawMessage = error instanceof SessionDriverLoopError ? error.message : String(error);
       const code = error instanceof SessionDriverLoopError ? error.code : 'decision_resolver_failed';
       const language = await this.localOutputLanguage(
@@ -2577,6 +2579,7 @@ export class SessionDriverLoop {
       if (
         error instanceof SessionAppendCoordinatorError
         || error instanceof SessionFactLineageError
+        || error instanceof SessionGoalError
       ) {
         throw error;
       }

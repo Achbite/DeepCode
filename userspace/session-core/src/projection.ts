@@ -4499,13 +4499,26 @@ function semanticNarrativeBlockIdentity(block: WorkingAgentTimelineBlock): strin
   const activityKey = narrativeActivityGroupKey(block.events);
   if (activityKey) return `timeline:${activityKey}`;
 
+  const planCard = block.events.find((event) => event.kind === 'plan_card');
+  if (planCard) {
+    const payload = isRecordPayload(planCard.payload) ? planCard.payload : {};
+    const runId = stringField(payload, 'runId') ?? 'run';
+    const planId = stringField(payload, 'planId');
+    if (planId) return `timeline:plan:${runId}:${planId}`;
+  }
+  const planDecision = block.events.find((event) => event.kind === 'plan_review');
+  if (planDecision) {
+    const payload = isRecordPayload(planDecision.payload) ? planDecision.payload : {};
+    const runId = stringField(payload, 'runId') ?? 'run';
+    const planId = stringField(payload, 'planId');
+    if (planId) {
+      return `timeline:plan-decision:${runId}:${planId}:${planDecision.id}`;
+    }
+  }
+
   for (const event of block.events) {
     const payload = isRecordPayload(event.payload) ? event.payload : {};
     const runId = stringField(payload, 'runId') ?? 'run';
-    if (event.kind === 'plan_card' || event.kind === 'plan_review') {
-      const planId = stringField(payload, 'planId');
-      if (planId) return `timeline:plan:${runId}:${planId}`;
-    }
     if (event.kind === 'review_summary') {
       const reviewId = stringField(payload, 'reviewId') ?? stringField(payload, 'sourcePlanId');
       if (reviewId) return `timeline:review:${runId}:${reviewId}`;
