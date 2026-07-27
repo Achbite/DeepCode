@@ -2834,6 +2834,7 @@ pub(crate) fn reconcile_session_run_recovery(
         }
     }
     let derived = validate_session_domain_record_chain(session_id, &snapshot.records)?;
+    validate_persisted_session_kernel_fact_authority(state, session_id, &snapshot.events)?;
     let active_run_ids = {
         let runs = state.session_runs.lock().expect("session run state lock");
         runs.values()
@@ -5978,6 +5979,11 @@ where
     }
     publish_session_domain_snapshot(state, session_id, &snapshot)?;
     let derived = validate_session_domain_record_chain(session_id, &snapshot.records)?;
+    // Internal release/terminal paths may return an idempotent receipt or a
+    // no-op before reaching the ordinary locked append admission. Validate the
+    // persisted prefix here so neither path can advance or acknowledge a
+    // Session whose Kernel evidence is no longer authoritative.
+    validate_persisted_session_kernel_fact_authority(state, session_id, &snapshot.events)?;
     let existing = snapshot
         .records
         .iter()
@@ -7377,6 +7383,27 @@ fn admit_session_domain_batch_locked(
         transition: None,
         event_id: error.event_id,
     })?;
+    let authoritative_kernel_events =
+        authoritative_kernel_ledger_events_for_append(state, &command.events)?;
+    validate_session_kernel_fact_authority(
+        session_id,
+        &snapshot.events,
+        &command.events,
+        &authoritative_kernel_events,
+    )
+    .map_err(|error| SessionDomainStoreError {
+        code: error.code,
+        message: error.message,
+        current_head: Some(current_head.clone()),
+        failed_precondition: None,
+        precondition_index: None,
+        batch_id: Some(command.batch_id.clone()),
+        existing_batch_digest: None,
+        submitted_batch_digest: None,
+        expected_head: None,
+        transition: None,
+        event_id: error.event_id,
+    })?;
 
     let mut derived_state = validate_session_domain_record_chain(session_id, &snapshot.records)?;
     validate_session_append_preconditions(&derived_state, &command.preconditions, &current_head)
@@ -7578,6 +7605,84 @@ fn admit_session_domain_batch_locked(
         result_state,
         false,
     ))
+}
+
+fn authoritative_kernel_ledger_events_for_append(
+    state: &AppState,
+    incoming_events: &[Value],
+) -> Result<Vec<Value>, SessionDomainStoreError> {
+    let mut run_ids = std::collections::BTreeSet::new();
+    for event in incoming_events {
+        let Some(refs) = event
+            .pointer("/payload/lineage/kernelFactRefs")
+            .and_then(Value::as_array)
+        else {
+            continue;
+        };
+        for fact_ref in refs {
+            let run_id = fact_ref
+                .get("runId")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| {
+                    SessionDomainStoreError::new(
+                        "session_append_lineage_invalid",
+                        "Kernel fact ref has no authoritative run identity",
+                    )
+                })?;
+            run_ids.insert(run_id.to_string());
+        }
+    }
+    if run_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let runtime = state.runtime.lock().expect("kernel runtime lock");
+    let mut authoritative = Vec::new();
+    for run_id in run_ids {
+        let events = runtime.ledger(&run_id).map_err(|error| {
+            SessionDomainStoreError::new(
+                "session_append_recovery_required",
+                format!("Kernel ledger for run {run_id} is unavailable: {error}"),
+            )
+        })?;
+        for event in events {
+            authoritative.push(serde_json::to_value(event).map_err(|error| {
+                SessionDomainStoreError::new(
+                    "session_append_recovery_required",
+                    format!("Kernel ledger event for run {run_id} cannot be encoded: {error}"),
+                )
+            })?);
+        }
+    }
+    Ok(authoritative)
+}
+
+fn validate_persisted_session_kernel_fact_authority(
+    state: &AppState,
+    session_id: &str,
+    events: &[Value],
+) -> Result<(), SessionDomainStoreError> {
+    let authoritative =
+        authoritative_kernel_ledger_events_for_append(state, events).map_err(|error| {
+            SessionDomainStoreError::new(
+                "session_append_recovery_required",
+                format!(
+                    "Persisted Session Kernel evidence cannot be reloaded from the authoritative ledger: {}",
+                    error.message
+                ),
+            )
+        })?;
+    validate_session_kernel_fact_authority(session_id, &[], events, &authoritative).map_err(
+        |error| {
+            SessionDomainStoreError::new(
+                "session_append_recovery_required",
+                format!(
+                    "Persisted Session Kernel evidence is no longer authoritative: {}",
+                    error.message
+                ),
+            )
+        },
+    )
 }
 
 fn mirror_committed_session_domain_events(state: &AppState, session_id: &str, events: &[Value]) {

@@ -352,6 +352,278 @@ pub(crate) fn validate_session_fact_lineage_batch(
     )
 }
 
+/// Bind every incoming Session kernelFactRef to one immutable event in the
+/// authoritative Kernel ledger. Structural lineage validation runs first; this
+/// second boundary prevents a caller from manufacturing a self-consistent
+/// payload.kernelEvent and treating it as Kernel execution evidence.
+pub(crate) fn validate_session_kernel_fact_authority(
+    session_id: &str,
+    existing_events: &[Value],
+    incoming_events: &[Value],
+    authoritative_ledger_events: &[Value],
+) -> Result<(), SessionFactLineageValidationError> {
+    let values = existing_events
+        .iter()
+        .chain(incoming_events.iter())
+        .collect::<Vec<_>>();
+    let events = values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| parse_event(value, index))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut event_indices = HashMap::new();
+    for (index, event) in events.iter().enumerate() {
+        event_indices.insert(event.id.clone(), index);
+    }
+    let incoming_start = existing_events.len();
+    for (consumer_index, consumer) in events.iter().enumerate().skip(incoming_start) {
+        if event_disposition(consumer) != EventDisposition::PersistentDomainFact {
+            continue;
+        }
+        let raw_lineage = consumer
+            .payload
+            .and_then(|payload| payload.get("lineage"))
+            .ok_or_else(|| {
+                SessionFactLineageValidationError::invalid(
+                    Some(&consumer.id),
+                    "Persistent Session fact has no lineage for Kernel authority validation.",
+                )
+            })?;
+        let lineage = parse_lineage(raw_lineage, &consumer.id)?;
+        for fact_ref in &lineage.kernel_fact_refs {
+            let source_index = earlier_index(
+                &event_indices,
+                &fact_ref.kernel_event_ref,
+                consumer_index,
+                &consumer.id,
+                "Kernel fact",
+            )?;
+            let source = &events[source_index];
+            let kernel_event = source
+                .payload
+                .and_then(|payload| payload.get("kernelEvent"))
+                .and_then(Value::as_object)
+                .ok_or_else(|| {
+                    SessionFactLineageValidationError::invalid(
+                        Some(&consumer.id),
+                        format!(
+                            "Kernel fact ref {} has no projected Kernel event.",
+                            fact_ref.kernel_event_ref
+                        ),
+                    )
+                })?;
+            validate_authoritative_kernel_fact(
+                session_id,
+                &events[..consumer_index],
+                source,
+                kernel_event,
+                fact_ref,
+                authoritative_ledger_events,
+                &consumer.id,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_authoritative_kernel_fact(
+    session_id: &str,
+    earlier_events: &[EventView<'_>],
+    source: &EventView<'_>,
+    projected: &Map<String, Value>,
+    fact_ref: &KernelFactRef,
+    authoritative_ledger_events: &[Value],
+    consumer_id: &str,
+) -> Result<(), SessionFactLineageValidationError> {
+    let sequence = projected
+        .get("sequence")
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            SessionFactLineageValidationError::invalid(
+                Some(consumer_id),
+                format!(
+                    "Projected Kernel fact {} has no positive ledger sequence.",
+                    fact_ref.kernel_event_ref
+                ),
+            )
+        })?;
+    let projected_identity_count = earlier_events
+        .iter()
+        .filter(|candidate| {
+            candidate
+                .payload
+                .and_then(|payload| payload.get("kernelEvent"))
+                .and_then(Value::as_object)
+                .is_some_and(|candidate| {
+                    authoritative_kernel_identity_matches(
+                        candidate,
+                        session_id,
+                        &fact_ref.run_id,
+                        &fact_ref.kind,
+                        sequence,
+                    )
+                })
+        })
+        .count();
+    if projected_identity_count != 1
+        || !authoritative_kernel_identity_matches(
+            projected,
+            session_id,
+            &fact_ref.run_id,
+            &fact_ref.kind,
+            sequence,
+        )
+    {
+        return Err(SessionFactLineageValidationError::invalid(
+            Some(consumer_id),
+            format!(
+                "Kernel fact {} does not resolve one unique projected Kernel identity.",
+                fact_ref.kernel_event_ref
+            ),
+        ));
+    }
+    let expected_ledger_id = format!("evt-{}-{sequence}", fact_ref.run_id);
+    let matching = authoritative_ledger_events
+        .iter()
+        .filter_map(Value::as_object)
+        .filter(|ledger_event| {
+            text_field(ledger_event, "id") == Some(expected_ledger_id.as_str())
+                && text_field(ledger_event, "sessionId") == Some(session_id)
+                && text_field(ledger_event, "runId") == Some(fact_ref.run_id.as_str())
+                && text_field(ledger_event, "kind") == Some(fact_ref.kind.as_str())
+                && ledger_event.get("sequence").and_then(Value::as_u64) == Some(sequence)
+        })
+        .collect::<Vec<_>>();
+    if matching.len() != 1 {
+        return Err(SessionFactLineageValidationError::invalid(
+            Some(consumer_id),
+            format!(
+                "Kernel fact {} does not resolve one authoritative ledger event.",
+                fact_ref.kernel_event_ref
+            ),
+        ));
+    }
+    let ledger_payload = matching[0]
+        .get("payload")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            SessionFactLineageValidationError::invalid(
+                Some(consumer_id),
+                format!(
+                    "Authoritative Kernel ledger event for {} has no object payload.",
+                    fact_ref.kernel_event_ref
+                ),
+            )
+        })?;
+    let projected_material =
+        projected_kernel_fact_material(&fact_ref.kind, projected).ok_or_else(|| {
+            SessionFactLineageValidationError::invalid(
+                Some(consumer_id),
+                format!(
+                    "Projected Kernel fact {} has no comparable fact material.",
+                    fact_ref.kernel_event_ref
+                ),
+            )
+        })?;
+    let ledger_material =
+        ledger_kernel_fact_material(&fact_ref.kind, ledger_payload).ok_or_else(|| {
+            SessionFactLineageValidationError::invalid(
+                Some(consumer_id),
+                format!(
+                    "Authoritative Kernel fact {} has no comparable fact material.",
+                    fact_ref.kernel_event_ref
+                ),
+            )
+        })?;
+    if projected_material != ledger_material {
+        return Err(SessionFactLineageValidationError::invalid(
+            Some(consumer_id),
+            format!(
+                "Projected Kernel fact {} does not match authoritative ledger material.",
+                fact_ref.kernel_event_ref
+            ),
+        ));
+    }
+    if source.session_id != session_id {
+        return Err(SessionFactLineageValidationError::invalid(
+            Some(consumer_id),
+            format!(
+                "Kernel fact {} crosses the Session boundary.",
+                fact_ref.kernel_event_ref
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn authoritative_kernel_identity_matches(
+    kernel_event: &Map<String, Value>,
+    session_id: &str,
+    run_id: &str,
+    kind: &str,
+    sequence: u64,
+) -> bool {
+    text_field(kernel_event, "sessionId") == Some(session_id)
+        && text_field(kernel_event, "runId") == Some(run_id)
+        && text_field(kernel_event, "kind") == Some(kind)
+        && kernel_event.get("sequence").and_then(Value::as_u64) == Some(sequence)
+}
+
+fn projected_kernel_fact_material(kind: &str, event: &Map<String, Value>) -> Option<Value> {
+    match kind {
+        "tool.execution_attempted"
+        | "tool.effect_observed"
+        | "tool.outcome_indeterminate"
+        | "tool.completed"
+        | "resource.cleanup_state_changed" => event.get("fact").cloned(),
+        "work_unit.completed" => selected_kernel_material(event, &["workUnitId", "output"]),
+        "work_unit.failed" => selected_kernel_material(event, &["workUnitId", "error"]),
+        "work_unit.blocked" => selected_kernel_material(event, &["workUnitId", "reason"]),
+        "review.facts_produced" => event.get("facts").cloned(),
+        "review_gate.evaluated" => event.get("result").cloned(),
+        // Kernel cancellation deliberately uses a different presentation
+        // summary from its ledger audit summary. Status is the authoritative
+        // settlement material; display text must not become an effect claim.
+        "run.completed" => selected_kernel_material(event, &["status"]),
+        "runtime.lifecycle_changed" => {
+            selected_kernel_material(event, &["previousState", "currentState", "reason"])
+        }
+        _ => None,
+    }
+}
+
+fn ledger_kernel_fact_material(kind: &str, payload: &Map<String, Value>) -> Option<Value> {
+    match kind {
+        "tool.execution_attempted"
+        | "tool.effect_observed"
+        | "tool.outcome_indeterminate"
+        | "tool.completed" => Some(Value::Object(payload.clone())),
+        "resource.cleanup_state_changed" => payload
+            .get("fact")
+            .cloned()
+            .or_else(|| Some(Value::Object(payload.clone()))),
+        "work_unit.completed" => selected_kernel_material(payload, &["workUnitId", "output"]),
+        "work_unit.failed" => selected_kernel_material(payload, &["workUnitId", "error"]),
+        "work_unit.blocked" => selected_kernel_material(payload, &["workUnitId", "reason"]),
+        "review.facts_produced" => payload.get("facts").cloned(),
+        "review_gate.evaluated" => payload.get("result").cloned(),
+        "run.completed" => selected_kernel_material(payload, &["status"]),
+        "runtime.lifecycle_changed" => {
+            selected_kernel_material(payload, &["previousState", "currentState", "reason"])
+        }
+        _ => None,
+    }
+}
+
+fn selected_kernel_material(record: &Map<String, Value>, fields: &[&str]) -> Option<Value> {
+    let mut selected = Map::new();
+    for field in fields {
+        selected.insert((*field).to_string(), record.get(*field)?.clone());
+    }
+    Some(Value::Object(selected))
+}
+
 fn parse_event<'a>(
     value: &'a Value,
     index: usize,
