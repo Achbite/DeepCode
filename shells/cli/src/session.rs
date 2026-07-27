@@ -117,10 +117,10 @@ async fn run_interactive_decision(
         .map(ToOwned::to_owned)
         .collect::<Vec<_>>();
     let Some(kind) = parts.first().cloned() else {
-        return Err("usage: /decision <requirement|plan|review> <accept|reject|revise> [run-id] [target-id] [guidance]".to_string());
+        return Err("usage: /decision <requirement|plan|review|permission> <accept|reject|revise> [run-id] [target-id] [guidance]".to_string());
     };
     let Some(decision) = parts.get(1).cloned() else {
-        return Err("usage: /decision <requirement|plan|review> <accept|reject|revise> [run-id] [target-id] [guidance]".to_string());
+        return Err("usage: /decision <requirement|plan|review|permission> <accept|reject|revise> [run-id] [target-id] [guidance]".to_string());
     };
     let run_id = parts.get(2).cloned();
     let target_id = parts.get(3).cloned();
@@ -141,11 +141,26 @@ pub(crate) async fn resolve_session_decision(
     guidance: Option<String>,
     host: SessionHostOptions,
 ) -> Result<(), String> {
-    if !matches!(kind.as_str(), "requirement" | "plan" | "review") {
-        return Err("decision kind must be requirement, plan, or review".to_string());
+    if !matches!(
+        kind.as_str(),
+        "requirement" | "plan" | "review" | "permission"
+    ) {
+        return Err("decision kind must be requirement, plan, review, or permission".to_string());
     }
-    if !matches!(decision.as_str(), "accept" | "reject" | "revise") {
-        return Err("decision must be accept, reject, or revise".to_string());
+    if !matches!(
+        (kind.as_str(), decision.as_str()),
+        (
+            "requirement" | "plan" | "review",
+            "accept" | "reject" | "revise"
+        ) | ("permission", "accept" | "reject")
+    ) {
+        return Err(
+            "permission decisions must be accept or reject; other decisions may also revise"
+                .to_string(),
+        );
+    }
+    if kind == "permission" && guidance.is_some() {
+        return Err("permission decisions do not accept free-text guidance".to_string());
     }
     let session_id = if let Some(session_id) = host.session_id.clone() {
         session_id
@@ -154,41 +169,50 @@ pub(crate) async fn resolve_session_decision(
             "no current session; pass --session <id> or create a session first".to_string()
         })?
     };
-    let mut resolved_run_id = run_id;
-    let mut resolved_target_id = target_id;
-    if resolved_run_id.is_none()
-        || (resolved_target_id.is_none() && matches!(kind.as_str(), "requirement" | "plan"))
+    let timeline = client
+        .agent_timeline(&session_id)
+        .await
+        .map_err(|error| format!("failed to read timeline for pending decision: {error}"))?;
+    let pending = find_pending_session_decision(&timeline, &kind, run_id.as_deref()).ok_or_else(
+        || {
+            let run_hint = run_id
+                .as_deref()
+                .map(|value| format!(" for run {value}"))
+                .unwrap_or_default();
+            format!(
+                "no exact pending {kind} decision{run_hint} is available in Shared Projection v2; legacy snapshots are read-only"
+            )
+        },
+    )?;
+    if target_id
+        .as_deref()
+        .is_some_and(|expected| expected != pending.target_id)
     {
-        let timeline = client
-            .agent_timeline(&session_id)
-            .await
-            .map_err(|error| format!("failed to read timeline for pending decision: {error}"))?;
-        let pending = find_pending_session_decision(&timeline, &kind, resolved_run_id.as_deref())
-            .ok_or_else(|| {
-                let run_hint = resolved_run_id
-                    .as_deref()
-                    .map(|value| format!(" for run {value}"))
-                    .unwrap_or_default();
-                format!(
-                    "no pending {kind} decision{run_hint} found in current session timeline; pass run-id and target-id explicitly"
-                )
-            })?;
-        if resolved_run_id.is_none() {
-            resolved_run_id = Some(pending.run_id);
-        }
-        if resolved_target_id.is_none() {
-            resolved_target_id = pending.target_id;
-        }
-        println!(
-            "decision target: {kind} run={} target={}",
-            resolved_run_id.as_deref().unwrap_or("-"),
-            resolved_target_id.as_deref().unwrap_or("-")
-        );
+        return Err(format!(
+            "pending {kind} target changed: expected {}, current {}",
+            target_id.as_deref().unwrap_or("-"),
+            pending.target_id
+        ));
     }
+    println!(
+        "decision target: {kind} run={} target={}",
+        pending.run_id, pending.target_id
+    );
     let mut request = StartAgentRunRequest::resolve_decision(kind, decision);
     request.host_language = Some(deepcode_kernel_client::terminal_host_language());
-    request.run_id = resolved_run_id;
-    request.target_id = resolved_target_id;
+    request.run_id = Some(pending.run_id);
+    request.target_id = Some(pending.target_id);
+    request.interaction_id = Some(pending.interaction_id);
+    request.interaction_revision = Some(pending.interaction_revision);
+    request.review_id = pending.review_id;
+    request.decision_request_id = Some(format!(
+        "cli-decision-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| format!("system clock is before Unix epoch: {error}"))?
+            .as_nanos()
+    ));
     request.guidance = guidance;
     request.workspace_path = workspace_path_for_host(&host);
     request.no_workspace = Some(host.no_workspace);
@@ -584,12 +608,20 @@ pub(crate) async fn print_timeline(
 pub(crate) async fn resolve_permission(
     client: &HttpKernelClient,
     permission_id: &str,
-    decision: PermissionDecision,
+    decision: &str,
+    host: SessionHostOptions,
 ) -> Result<(), String> {
-    client
-        .resolve_permission(permission_id, decision)
-        .await
-        .map_err(|error| format!("failed to resolve permission: {error}"))?;
-    println!("permission {permission_id}: {}", decision.as_str());
-    Ok(())
+    if permission_id.trim().is_empty() {
+        return Err("permission alias requires a non-empty permission id".to_string());
+    }
+    resolve_session_decision(
+        client,
+        "permission".to_string(),
+        decision.to_string(),
+        None,
+        Some(permission_id.to_string()),
+        None,
+        host,
+    )
+    .await
 }

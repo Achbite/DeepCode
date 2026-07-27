@@ -2,12 +2,12 @@ use crate::model::CardModel;
 use crate::renderer::Renderer;
 use deepcode_kernel_client::{
     terminal_workspace_scope, AgentRunResult, CreateAgentSessionRequest, HttpKernelClient,
-    ListAgentSessionsRequest, PermissionDecision, StartAgentRunRequest, TerminalWorkspaceScope,
+    ListAgentSessionsRequest, StartAgentRunRequest, TerminalWorkspaceScope,
 };
 use serde_json::Value;
 use std::{
     env,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const RUNNING_EVENT_POLL_INTERVAL: Duration = Duration::from_millis(300);
@@ -380,16 +380,14 @@ impl TuiApp {
                     .split_once(' ')
                     .map(|(_, value)| value.trim())
                     .unwrap_or_default();
-                self.resolve_permission(permission_id, PermissionDecision::Allow)
-                    .await;
+                self.resolve_permission_alias(permission_id, "accept").await;
             }
             command if command.starts_with("/deny ") || command.starts_with("deny ") => {
                 let permission_id = command
                     .split_once(' ')
                     .map(|(_, value)| value.trim())
                     .unwrap_or_default();
-                self.resolve_permission(permission_id, PermissionDecision::Deny)
-                    .await;
+                self.resolve_permission_alias(permission_id, "reject").await;
             }
             command if command.starts_with("/decision ") || command.starts_with("decision ") => {
                 let args = command
@@ -471,25 +469,41 @@ impl TuiApp {
             .collect::<Vec<_>>();
         let Some(kind) = parts.first().cloned() else {
             self.cards.push(CardModel::error(
-                "用法：/decision <requirement|plan|review> <accept|reject|revise> [run-id] [target-id] [guidance]",
+                "用法：/decision <requirement|plan|review|permission> <accept|reject|revise> [run-id] [target-id] [guidance]",
             ));
             return;
         };
         let Some(decision) = parts.get(1).cloned() else {
             self.cards.push(CardModel::error(
-                "用法：/decision <requirement|plan|review> <accept|reject|revise> [run-id] [target-id] [guidance]",
+                "用法：/decision <requirement|plan|review|permission> <accept|reject|revise> [run-id] [target-id] [guidance]",
             ));
             return;
         };
-        if !matches!(kind.as_str(), "requirement" | "plan" | "review") {
+        if !matches!(
+            kind.as_str(),
+            "requirement" | "plan" | "review" | "permission"
+        ) {
             self.cards.push(CardModel::error(
-                "decision kind 必须是 requirement、plan 或 review",
+                "decision kind 必须是 requirement、plan、review 或 permission",
             ));
             return;
         }
-        if !matches!(decision.as_str(), "accept" | "reject" | "revise") {
-            self.cards
-                .push(CardModel::error("decision 必须是 accept、reject 或 revise"));
+        if !matches!(
+            (kind.as_str(), decision.as_str()),
+            (
+                "requirement" | "plan" | "review",
+                "accept" | "reject" | "revise"
+            ) | ("permission", "accept" | "reject")
+        ) {
+            self.cards.push(CardModel::error(
+                "permission decision 只能是 accept 或 reject；其他 decision 还可使用 revise",
+            ));
+            return;
+        }
+        if kind == "permission" && parts.len() > 4 {
+            self.cards.push(CardModel::error(
+                "permission decision 不接受自由文本 guidance",
+            ));
             return;
         }
         self.start_decision_request(
@@ -507,20 +521,32 @@ impl TuiApp {
     }
 
     async fn resolve_pending_decision_line(&mut self, pending: PendingDecision, line: &str) {
+        if pending.kind == "permission" {
+            let decision = match parse_pending_permission_input(line) {
+                Some(decision) => decision,
+                None => {
+                    self.cards.push(CardModel::error(
+                        "权限决策只能选择 accept/allow/确认，或 reject/deny/拒绝。",
+                    ));
+                    return;
+                }
+            };
+            self.start_decision_request(
+                pending.kind,
+                decision,
+                Some(pending.run_id),
+                Some(pending.target_id),
+                None,
+            )
+            .await;
+            return;
+        }
         let parsed = parse_pending_decision_input(line, &pending);
-        self.cards.push(CardModel::stage(
-            "确认输入",
-            match parsed.decision.as_str() {
-                "accept" => "已选择确认。",
-                "reject" => "已选择结束。",
-                _ => "已提交 Review 信息。",
-            },
-        ));
         self.start_decision_request(
             pending.kind,
             parsed.decision,
             Some(pending.run_id),
-            pending.target_id,
+            Some(pending.target_id),
             parsed.guidance,
         )
         .await;
@@ -534,23 +560,80 @@ impl TuiApp {
         target_id: Option<String>,
         guidance: Option<String>,
     ) {
+        if !matches!(
+            (kind.as_str(), decision.as_str()),
+            (
+                "requirement" | "plan" | "review",
+                "accept" | "reject" | "revise"
+            ) | ("permission", "accept" | "reject")
+        ) || (kind == "permission" && guidance.is_some())
+        {
+            self.cards.push(CardModel::error(
+                "decision kind、decision 或 guidance 不符合 canonical Session decision contract。",
+            ));
+            return;
+        }
         let Some(session_id) = self.current_session_id.clone() else {
             self.cards.push(CardModel::error(
                 "当前没有激活会话。先发送一条消息，或使用 /use <session-id>。",
             ));
             return;
         };
+        let timeline = match self.client.agent_timeline(&session_id).await {
+            Ok(timeline) => timeline,
+            Err(error) => {
+                self.cards.push(CardModel::error(format!(
+                    "读取当前 pending interaction 失败：{error}"
+                )));
+                return;
+            }
+        };
+        let Some(pending) = latest_pending_decision(Some(&timeline)) else {
+            self.cards.push(CardModel::error(
+                "当前 Shared Projection v2 没有可提交的精确 pending interaction；旧版 timeline 只能查看。",
+            ));
+            return;
+        };
+        if pending.kind != kind
+            || run_id
+                .as_deref()
+                .is_some_and(|expected| expected != pending.run_id)
+            || target_id
+                .as_deref()
+                .is_some_and(|expected| expected != pending.target_id)
+        {
+            self.cards.push(CardModel::error(
+                "pending interaction 已变化，请刷新 timeline 后重新选择。",
+            ));
+            self.timeline = Some(timeline);
+            return;
+        }
         let mut request = StartAgentRunRequest::resolve_decision(kind, decision);
         request.host_language = Some(deepcode_kernel_client::terminal_host_language());
-        request.run_id = run_id;
-        request.target_id = target_id;
+        request.run_id = Some(pending.run_id);
+        request.target_id = Some(pending.target_id);
+        request.interaction_id = Some(pending.interaction_id);
+        request.interaction_revision = Some(pending.interaction_revision);
+        request.review_id = pending.review_id;
+        let decision_request_id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| {
+                format!(
+                    "tui-decision-{}-{}",
+                    std::process::id(),
+                    duration.as_nanos()
+                )
+            });
+        let Ok(decision_request_id) = decision_request_id else {
+            self.cards.push(CardModel::error(
+                "系统时钟早于 Unix epoch，无法生成 decision request identity。",
+            ));
+            return;
+        };
+        request.decision_request_id = Some(decision_request_id);
         request.guidance = guidance;
         request.workspace_path = self.workspace_path();
         request.no_workspace = Some(self.host.no_workspace);
-        self.cards.push(CardModel::stage(
-            "Running",
-            "共享 Session Runtime 正在处理决策...",
-        ));
         self.status = format!("API {} · running", self.client.base_url());
         self.running_preview_active = true;
         self.start_run_request(RunOperation::Decision, session_id, request)
@@ -650,10 +733,6 @@ impl TuiApp {
 
     fn preview_user_turn(&mut self, prompt: &str) {
         self.cards.push(CardModel::user(prompt.to_string()));
-        self.cards.push(CardModel::stage(
-            "Running",
-            "共享 Session Runtime 正在处理输入...",
-        ));
         self.status = format!("API {} · running", self.client.base_url());
         self.running_preview_active = true;
     }
@@ -667,13 +746,6 @@ impl TuiApp {
         match self.client.start_agent_run(&session_id, request).await {
             Ok(result) => {
                 let now = Instant::now();
-                self.cards.push(CardModel::stage(
-                    "Run",
-                    format!(
-                        "run id: {}\nstatus: {}",
-                        result.run.run_id, result.run.status
-                    ),
-                ));
                 self.pending_run = Some(PendingRun {
                     operation,
                     session_id: session_id.clone(),
@@ -1105,26 +1177,25 @@ impl TuiApp {
         }
     }
 
-    async fn resolve_permission(&mut self, permission_id: &str, decision: PermissionDecision) {
+    async fn resolve_permission_alias(&mut self, permission_id: &str, decision: &str) {
         if permission_id.is_empty() {
             self.cards.push(CardModel::error(
                 "用法：/allow <permission-id> 或 /deny <permission-id>",
             ));
             return;
         }
-        match self
-            .client
-            .resolve_permission(permission_id, decision)
-            .await
-        {
-            Ok(_) => self.cards.push(CardModel::stage(
-                "权限已处理",
-                format!("{}: {}", permission_id, decision.as_str()),
-            )),
-            Err(error) => self
-                .cards
-                .push(CardModel::error(format!("处理权限失败：{error}"))),
+        if self.is_run_pending() {
+            self.notify_running_input_held();
+            return;
         }
+        self.start_decision_request(
+            "permission".to_string(),
+            decision.to_string(),
+            None,
+            Some(permission_id.to_string()),
+            None,
+        )
+        .await;
     }
 }
 
@@ -1138,7 +1209,10 @@ pub struct TuiHostOptions {
 struct PendingDecision {
     kind: String,
     run_id: String,
-    target_id: Option<String>,
+    target_id: String,
+    interaction_id: String,
+    interaction_revision: String,
+    review_id: Option<String>,
     options: Vec<PendingDecisionOption>,
 }
 
@@ -1197,21 +1271,79 @@ fn looks_like_command(line: &str) -> bool {
 }
 
 fn latest_pending_decision(timeline: Option<&Value>) -> Option<PendingDecision> {
-    let pending = timeline?.get("interactionProjection")?.get("pending")?;
-    let kind = pending.get("kind").and_then(Value::as_str)?;
-    let run_id = pending.get("runId").and_then(Value::as_str)?.to_string();
-    let target_id = match kind {
-        "plan" => pending.get("planId"),
-        "review" => pending.get("reviewId"),
-        "requirement" => pending.get("requirementId"),
-        _ => None,
+    let timeline = timeline?;
+    if timeline.get("schemaVersion").and_then(Value::as_str)
+        != Some("deepcode.shared-conversation-projection.v2")
+    {
+        return None;
     }
-    .and_then(Value::as_str)
-    .map(ToOwned::to_owned);
+    let pending = timeline.get("interactionProjection")?.get("pending")?;
+    let kind = pending.get("kind").and_then(Value::as_str)?;
+    if !matches!(kind, "requirement" | "plan" | "review" | "permission") {
+        return None;
+    }
+    let run_id = if kind == "permission" {
+        let request = pending.get("request")?;
+        let request_id = request
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())?;
+        let pending_request_id = pending
+            .get("requestId")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())?;
+        let target_id = pending
+            .get("targetId")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())?;
+        if request_id != pending_request_id || request_id != target_id {
+            return None;
+        }
+        request
+            .get("runId")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())?
+            .to_string()
+    } else {
+        pending
+            .get("runId")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())?
+            .to_string()
+    };
+    let target_id = pending
+        .get("targetId")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())?
+        .to_string();
+    let interaction_id = pending
+        .get("interactionId")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())?
+        .to_string();
+    let interaction_revision = pending
+        .get("interactionRevision")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())?
+        .to_string();
+    let review_id = if kind == "review" {
+        Some(
+            pending
+                .get("reviewId")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())?
+                .to_string(),
+        )
+    } else {
+        None
+    };
     Some(PendingDecision {
         kind: kind.to_string(),
         run_id,
         target_id,
+        interaction_id,
+        interaction_revision,
+        review_id,
         options: if kind == "requirement" {
             decision_request_options(pending.get("decisionRequest"))
         } else {
@@ -1296,6 +1428,23 @@ fn parse_pending_decision_input(line: &str, pending: &PendingDecision) -> Parsed
         decision: "revise".to_string(),
         guidance,
     }
+}
+
+fn parse_pending_permission_input(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if matches!(lower.as_str(), "1" | "accept" | "allow") || matches!(trimmed, "确认" | "同意")
+    {
+        return Some("accept".to_string());
+    }
+    if matches!(
+        lower.as_str(),
+        "2" | "reject" | "deny" | "/reject" | "/deny"
+    ) || matches!(trimmed, "拒绝")
+    {
+        return Some("reject".to_string());
+    }
+    None
 }
 
 fn parse_technical_choice_input(line: &str, pending: &PendingDecision) -> ParsedDecisionInput {

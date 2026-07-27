@@ -1,7 +1,7 @@
 use deepcode_kernel_client::{
     terminal_workspace_scope, AgentRunResult, CreateAgentSessionRequest, HttpKernelClient,
-    KernelBootstrap, KernelBootstrapOptions, ListAgentSessionsRequest, PermissionDecision,
-    StartAgentRunRequest, TerminalWorkspaceScope,
+    KernelBootstrap, KernelBootstrapOptions, ListAgentSessionsRequest, StartAgentRunRequest,
+    TerminalWorkspaceScope,
 };
 use serde_json::Value;
 use std::env;
@@ -128,9 +128,10 @@ pub(crate) async fn run(command: Command) -> Result<(), String> {
             no_auto_start_kernel,
             permission_id,
             decision,
+            host,
         } => {
             let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
-            resolve_permission(bootstrap.client(), &permission_id, decision).await
+            resolve_permission(bootstrap.client(), &permission_id, &decision, host).await
         }
         Command::Decision {
             api,
@@ -256,7 +257,8 @@ enum Command {
         api: Option<String>,
         no_auto_start_kernel: bool,
         permission_id: String,
-        decision: PermissionDecision,
+        decision: String,
+        host: SessionHostOptions,
     },
     Decision {
         api: Option<String>,
@@ -459,7 +461,8 @@ impl Command {
                     api,
                     no_auto_start_kernel,
                     permission_id: permission_id.to_string(),
-                    decision: PermissionDecision::Allow,
+                    decision: "accept".to_string(),
+                    host,
                 })
             }
             [permission, deny, permission_id] if permission == "permission" && deny == "deny" => {
@@ -467,7 +470,8 @@ impl Command {
                     api,
                     no_auto_start_kernel,
                     permission_id: permission_id.to_string(),
-                    decision: PermissionDecision::Deny,
+                    decision: "reject".to_string(),
+                    host,
                 })
             }
             [decision_cmd, kind, decision, tail @ ..] if decision_cmd == "decision" => {
@@ -490,8 +494,13 @@ impl Command {
                 })
             }
             [kind, decision, tail @ ..]
-                if matches!(kind.as_str(), "requirement" | "plan" | "review")
-                    && matches!(decision.as_str(), "accept" | "reject" | "revise") =>
+                if matches!(
+                    (kind.as_str(), decision.as_str()),
+                    (
+                        "requirement" | "plan" | "review",
+                        "accept" | "reject" | "revise"
+                    ) | ("permission", "accept" | "reject")
+                ) =>
             {
                 let run_id = tail.first().cloned();
                 let target_id = tail.get(1).cloned();
@@ -560,7 +569,10 @@ pub(crate) struct SessionHostOptions {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PendingSessionDecision {
     pub(crate) run_id: String,
-    pub(crate) target_id: Option<String>,
+    pub(crate) target_id: String,
+    pub(crate) interaction_id: String,
+    pub(crate) interaction_revision: String,
+    pub(crate) review_id: Option<String>,
 }
 
 mod render;

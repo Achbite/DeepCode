@@ -235,13 +235,15 @@ Interactive commands:
   /allow <id>        允许权限请求
   /deny <id>         拒绝权限请求
   /decision <requirement|plan|review> <accept|reject|revise> [run-id] [target-id] [guidance]
+  /decision permission <accept|reject> [run-id] [target-id]
   /clear             清理当前可见卡片
   /quit              退出 TUI
 
 pending 计划/Review 时，空 Enter 或 1 确认；文本或 2 <文本> 提交 Review 信息；
 3、end、结束表示结束。/decision 是显式 fallback。
 
-普通文本会直接通过共享 Session Runtime 发送到当前会话；/allow、/deny、
+普通文本会直接通过共享 Session Runtime 发送到当前会话；/allow、/deny 是
+canonical permission decision 的入口别名，不回退旧 permission endpoint。
 /decision、/cancel 是 GUI composer decision / Stop 的终端输入形式。TUI 只负责展示、
 输入和命令入口，不持有 workflow、permission 或 tool execution 事实。"#
     );

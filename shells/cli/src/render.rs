@@ -2,6 +2,8 @@ use crate::*;
 
 pub(crate) fn render_timeline(timeline: &Value) {
     let timeline = timeline_payload(timeline);
+    let is_v2 = timeline.get("schemaVersion").and_then(Value::as_str)
+        == Some("deepcode.shared-conversation-projection.v2");
     let turns = timeline
         .get("turns")
         .and_then(Value::as_array)
@@ -19,11 +21,22 @@ pub(crate) fn render_timeline(timeline: &Value) {
             .into_iter()
             .flatten()
         {
+            let entry_role = block
+                .get("entryRole")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             let kind = block
                 .get("narrativeKind")
                 .or_else(|| block.get("kind"))
                 .and_then(Value::as_str)
                 .unwrap_or("stage");
+            if kind == "thinking"
+                || (is_v2
+                    && entry_role == "finalAnswer"
+                    && block.get("durability").and_then(Value::as_str) != Some("committed"))
+            {
+                continue;
+            }
             let title = block
                 .get("title")
                 .and_then(Value::as_str)
@@ -62,6 +75,7 @@ fn timeline_block_text(block: &Value, kind: &str) -> String {
     }
     block
         .get("bodyMarkdown")
+        .or_else(|| block.pointer("/localizedContent/text"))
         .or_else(|| block.get("summary"))
         .and_then(Value::as_str)
         .map(str::to_string)
@@ -372,45 +386,111 @@ pub(crate) fn find_pending_session_decision(
     requested_kind: &str,
     run_filter: Option<&str>,
 ) -> Option<PendingSessionDecision> {
-    let pending = timeline_payload(timeline)
-        .get("interactionProjection")?
-        .get("pending")?;
+    let timeline = timeline_payload(timeline);
+    if timeline.get("schemaVersion").and_then(Value::as_str)
+        != Some("deepcode.shared-conversation-projection.v2")
+    {
+        return None;
+    }
+    let pending = timeline.get("interactionProjection")?.get("pending")?;
     let kind = pending.get("kind").and_then(Value::as_str)?;
     if kind != requested_kind {
         return None;
     }
-    let run_id = pending.get("runId").and_then(Value::as_str)?.to_string();
+    let run_id = if kind == "permission" {
+        let request = pending.get("request")?;
+        let request_id = request
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())?;
+        let pending_request_id = pending
+            .get("requestId")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())?;
+        let target_id = pending
+            .get("targetId")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())?;
+        if request_id != pending_request_id || request_id != target_id {
+            return None;
+        }
+        request
+            .get("runId")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())?
+            .to_string()
+    } else {
+        pending
+            .get("runId")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())?
+            .to_string()
+    };
     if run_filter.is_some_and(|expected| expected != run_id) {
         return None;
     }
-    let target_id = match kind {
-        "plan" => pending.get("planId"),
-        "review" => pending.get("reviewId"),
-        "requirement" => pending.get("requirementId"),
-        _ => None,
-    }
-    .and_then(Value::as_str)
-    .map(ToOwned::to_owned);
-    Some(PendingSessionDecision { run_id, target_id })
+    let target_id = pending
+        .get("targetId")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())?
+        .to_string();
+    let interaction_id = pending
+        .get("interactionId")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())?
+        .to_string();
+    let interaction_revision = pending
+        .get("interactionRevision")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())?
+        .to_string();
+    let review_id = if kind == "review" {
+        Some(
+            pending
+                .get("reviewId")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())?
+                .to_string(),
+        )
+    } else {
+        None
+    };
+    Some(PendingSessionDecision {
+        run_id,
+        target_id,
+        interaction_id,
+        interaction_revision,
+        review_id,
+    })
 }
 
 fn extract_final_text(timeline: &Value) -> Option<String> {
+    let is_v2 = timeline.get("schemaVersion").and_then(Value::as_str)
+        == Some("deepcode.shared-conversation-projection.v2");
     let turns = timeline.get("turns").and_then(Value::as_array)?;
     for turn in turns.iter().rev() {
         let Some(blocks) = turn.get("blocks").and_then(Value::as_array) else {
             continue;
         };
         for block in blocks.iter().rev() {
+            if is_v2 {
+                if block.get("entryRole").and_then(Value::as_str) != Some("finalAnswer")
+                    || block.get("durability").and_then(Value::as_str) != Some("committed")
+                {
+                    continue;
+                }
+            }
             let narrative = block
                 .get("narrativeKind")
                 .or_else(|| block.get("kind"))
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            if narrative != "assistantText" && narrative != "assistant" {
+            if !is_v2 && narrative != "assistantText" && narrative != "assistant" {
                 continue;
             }
             let text = block
                 .get("bodyMarkdown")
+                .or_else(|| block.pointer("/localizedContent/text"))
                 .or_else(|| block.get("summary"))
                 .and_then(Value::as_str)
                 .unwrap_or_default()
@@ -484,16 +564,21 @@ fn render_pending_decision_text(
     }
     lines.push(format!(
         "Decision target: {decision_kind} run={} target={}",
-        pending.run_id,
-        pending.target_id.as_deref().unwrap_or("-")
+        pending.run_id, pending.target_id
     ));
     if let Some(session_id) = session_id {
         lines.push(format!(
             "Accept: DeepCode-CLI --session {session_id} decision {decision_kind} accept"
         ));
-        lines.push(format!(
-            "Revise: DeepCode-CLI --session {session_id} decision {decision_kind} revise <guidance>"
-        ));
+        if decision_kind == "permission" {
+            lines.push(format!(
+                "Reject: DeepCode-CLI --session {session_id} decision permission reject"
+            ));
+        } else {
+            lines.push(format!(
+                "Revise: DeepCode-CLI --session {session_id} decision {decision_kind} revise <guidance>"
+            ));
+        }
     }
     lines.join("\n")
 }
@@ -547,6 +632,7 @@ Usage:
   DeepCode-CLI permission allow <permission-id>
   DeepCode-CLI permission deny <permission-id>
   DeepCode-CLI decision <requirement|plan|review> <accept|reject|revise> [--session <id>] [run-id] [target-id] [guidance]
+  DeepCode-CLI decision permission <accept|reject> [--session <id>] [run-id] [target-id]
   DeepCode-CLI ask [-p|--print] [--session <id>] [--workspace <path>|--no-workspace] <prompt>
   DeepCode-CLI tools run <toolId> --workspace <path> --args-file <json> [--approve-contract]
   DeepCode-CLI tools verify --workspace <path> --cases <jsonl> [--approve-contract]
@@ -599,10 +685,12 @@ Sessions:
   /timeline             Print current session timeline
 
 Permissions and decisions:
-  /decision ...         Resolve requirement/plan/review through the shared Session Runtime
+  /decision ...         Resolve requirement/plan/review/permission through the shared Session Runtime
   decision plan accept  Confirm the latest pending plan in the shared timeline projection
   decision plan revise  Submit review guidance for a pending plan
   decision plan reject  End a pending plan
+  decision permission accept|reject
+                        Resolve the exact pending permission through a canonical decision run
   any text              Send a message through the shared Session Runtime
 
 Non-interactive:
