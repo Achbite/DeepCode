@@ -400,6 +400,14 @@ pub(crate) async fn llm_chat(
         Ok(profile) => profile,
         Err(error) => return ApiResponse::error("llm_profile_error", error),
     };
+    if let Err(message) = validate_provider_identity_expectation(&profile, &body) {
+        return Json(ApiResponse {
+            ok: false,
+            data: Some(json!({ "requestId": request_id })),
+            error: Some("provider_profile_identity_invalid".to_string()),
+            message: Some(message),
+        });
+    }
     let messages = body
         .get("messages")
         .and_then(Value::as_array)
@@ -417,7 +425,7 @@ pub(crate) async fn llm_chat(
     }
     match call_llm_profile(&profile, request_envelope).await {
         Ok(output) => {
-            let mut payload = llm_output_payload(output);
+            let mut payload = llm_decoded_response_payload(output);
             payload["providerProfileId"] = json!(profile.id);
             payload["provider"] = json!(profile
                 .provider_flavor
@@ -427,15 +435,22 @@ pub(crate) async fn llm_chat(
             payload["requestId"] = json!(request_id);
             ApiResponse::ok(payload)
         }
-        Err(error) => Json(ApiResponse {
-            ok: false,
-            data: Some(json!({
-                "requestId": request_id,
-                "providerError": error
-            })),
-            error: Some("llm_chat_failed".to_string()),
-            message: Some(error.to_string()),
-        }),
+        Err(error) => {
+            let error_code = if error.reason == "provider_thinking_continuation_invalid" {
+                error.reason.clone()
+            } else {
+                "llm_chat_failed".to_string()
+            };
+            Json(ApiResponse {
+                ok: false,
+                data: Some(json!({
+                    "requestId": request_id,
+                    "providerError": error
+                })),
+                error: Some(error_code),
+                message: Some(error.to_string()),
+            })
+        }
     }
 }
 
@@ -486,6 +501,14 @@ pub(crate) async fn llm_chat_stream(
             }));
         }
     };
+    if let Err(message) = validate_provider_identity_expectation(&profile, &body) {
+        return llm_stream_error_response(json!({
+            "type": "provider_error",
+            "requestId": request_id,
+            "error": "provider_profile_identity_invalid",
+            "message": message,
+        }));
+    }
     let messages = body
         .get("messages")
         .and_then(Value::as_array)
