@@ -1589,6 +1589,12 @@ export class SessionDriverLoop {
         input.runId,
         input.hostLanguage
       );
+      if (
+        input.hostRunId
+        && hasClosedHostRunFence(language.currentResult, input.hostRunId)
+      ) {
+        return language.currentResult;
+      }
       const diagnostic = driverFailureMessageCatalog.driverFailure(
         code,
         rawMessage,
@@ -2311,6 +2317,7 @@ export class SessionDriverLoop {
   ): Promise<{
     readonly language: ConversationLanguage;
     readonly runId?: string;
+    readonly currentResult: AgentSessionResult;
     readonly currentEvents: AgentEvent[];
     readonly decisionEvents: AgentEvent[];
   }> {
@@ -2320,6 +2327,7 @@ export class SessionDriverLoop {
       return {
         language: normalizeHostLanguage(fallbackHostLanguage),
         runId,
+        currentResult: current,
         currentEvents: current.events,
         decisionEvents: [],
       };
@@ -2329,6 +2337,7 @@ export class SessionDriverLoop {
       return {
         language: effectiveConversationLanguage(policy),
         runId: authority.runId,
+        currentResult: current,
         currentEvents: current.events,
         decisionEvents: [],
       };
@@ -2336,6 +2345,7 @@ export class SessionDriverLoop {
     return {
       language: policy.hostLanguage,
       runId: authority.runId,
+      currentResult: current,
       currentEvents: current.events,
       decisionEvents: [
         createSessionLanguageDecisionEvent({
@@ -2651,6 +2661,15 @@ function exactSemanticProviderRequestId(
     );
   }
   return admittedRequestId;
+}
+
+function hasClosedHostRunFence(
+  result: AgentSessionResult,
+  hostRunId: string
+): boolean {
+  return result.domainState?.runFences.some(
+    (fence) => fence.runId === hostRunId && fence.state === 'closed'
+  ) ?? false;
 }
 
 function latestRunIdForFailure(events: AgentEvent[]): string | undefined {

@@ -1563,12 +1563,29 @@ function serverDigestForCommand(
     batchId: command.batchId,
     baseHead: command.baseHead,
     preconditions: command.preconditions,
-    transition: command.transition,
+    transition: daemonCanonicalTransitionForDigest(command.transition),
     providerAdmissions: command.providerAdmissions,
     events: command.events,
     projectionDigest: projectionAck?.projectionDigest ?? null,
     projectionRevision: projectionAck?.revision ?? null,
   }));
+}
+
+function daemonCanonicalTransitionForDigest(
+  transition: SessionAppendTransitionV1
+): unknown {
+  if (transition.kind !== 'close') return transition;
+  // Session domain v1 digests are owned by the Daemon's typed Rust
+  // representation. Its close transition serializes an absent optional parent
+  // as null even though the strict wire contract omits that field when no
+  // cancellation parent exists. Normalize digest material only; do not widen
+  // the wire command or invalidate already persisted v1 records.
+  return {
+    ...transition,
+    parentCloseBatchId: 'parentCloseBatchId' in transition
+      ? transition.parentCloseBatchId ?? null
+      : null,
+  };
 }
 
 function resultHeadForCommand(
