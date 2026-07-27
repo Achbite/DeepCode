@@ -1,5 +1,7 @@
 import type {
   AgentEvent,
+  ExecutionBudgetCoreV1,
+  SessionGoalActiveWaitV1,
   SessionGoalFactPayloadV1,
   SessionGoalLifecycleV1,
 } from '@deepcode/protocol';
@@ -10,6 +12,7 @@ import {
 import {
   createTaskLedgerV2,
   parseTaskLedgerV2,
+  taskLedgerAllSettled,
 } from '../run-state/taskLedger.js';
 
 const GOAL_FACT_SCHEMA = 'deepcode.session.goal-fact.v1';
@@ -148,14 +151,22 @@ export function reduceSessionGoals(
         }
         current.lifecycle = 'suspended';
         current.sourceRunId = payload.sourceRunId;
+        current.waitRef = payload.waitRef;
         break;
       }
       case 'resumed': {
-        if (current.lifecycle !== 'suspended') {
+        if (
+          current.lifecycle !== 'suspended'
+          || !current.activeWait
+          || payload.checkpointRef !== current.activeWait.waitId
+        ) {
           invalidTransition(current, event, payload.lifecycle);
         }
         current.lifecycle = 'running';
         current.sourceRunId = payload.sourceRunId;
+        current.waitRef = undefined;
+        current.activeWait = undefined;
+        current.activeWaitFactRef = undefined;
         break;
       }
       case 'completed':
@@ -178,10 +189,24 @@ export function reduceSessionGoals(
         if (payload.lifecycle !== expectedLifecycle) {
           invalidTransition(current, event, payload.lifecycle);
         }
+        if (
+          payload.factKind === 'completed'
+          && (
+            !current.taskLedger
+            || !taskLedgerAllSettled(current.taskLedger)
+            || current.activeWait
+          )
+        ) {
+          throw new SessionGoalError(
+            'session_goal_recovery_required',
+            `Goal ${current.goalId} cannot complete without a fully settled TaskLedgerV2 and no ActiveWait.`
+          );
+        }
         current.lifecycle = expectedLifecycle;
         current.sourceRunId = payload.sourceRunId;
         current.terminalReason = payload.terminalReason;
         current.terminalFactRef = event.id;
+        current.waitRef = undefined;
         break;
       }
       case 'taskLedger': {
@@ -210,15 +235,49 @@ export function reduceSessionGoals(
         break;
       }
       case 'budgetUsage': {
-        if (current.lifecycle !== 'running' && current.lifecycle !== 'suspended') {
+        if (
+          (current.lifecycle !== 'running' && current.lifecycle !== 'suspended')
+          || payload.lifecycle !== current.lifecycle
+        ) {
           invalidTransition(current, event, payload.lifecycle);
         }
+        const executionBudget = parseExecutionBudget(
+          payload.executionBudget,
+          event.id
+        );
+        assertExecutionBudgetTransition(
+          current,
+          executionBudget,
+          payload,
+          event.id
+        );
+        current.executionBudget = executionBudget;
+        current.executionBudgetFactRef = event.id;
         break;
       }
       case 'activeWait': {
-        if (current.lifecycle !== 'suspended') {
+        if (
+          current.lifecycle !== 'suspended'
+          || payload.lifecycle !== current.lifecycle
+          || current.activeWait
+          || !current.waitRef
+        ) {
           invalidTransition(current, event, payload.lifecycle);
         }
+        const activeWait = parseActiveWait(payload.activeWait, event.id);
+        if (
+          activeWait.waitId !== current.waitRef
+          || !payload.sourceRefs.includes(
+            current.facts.at(-1)?.event.id ?? '<missing>'
+          )
+        ) {
+          throw new SessionGoalError(
+            'session_goal_recovery_required',
+            `Goal ${current.goalId} ActiveWait ${event.id} does not settle the exact suspension fact.`
+          );
+        }
+        current.activeWait = activeWait;
+        current.activeWaitFactRef = event.id;
         break;
       }
       case 'checkpoint': {
@@ -289,6 +348,110 @@ function assertGoalTaskLedgerOwner(
       `Goal fact ${eventId} crosses the immutable TaskLedgerV2 owner.`
     );
   }
+}
+
+function parseActiveWait(
+  value: unknown,
+  eventId: string
+): SessionGoalActiveWaitV1 {
+  const wait = objectRecord(value);
+  const kind = wait?.kind;
+  if (
+    wait?.schemaVersion !== 'deepcode.session.active-wait.v1'
+    || !nonEmpty(wait.waitId)
+    || !activeWaitKind(kind)
+    || (wait.source !== 'session' && wait.source !== 'kernel')
+    || !nonEmpty(wait.reason)
+    || typeof wait.resumable !== 'boolean'
+    || !nonEmpty(wait.createdAt)
+    || !stringArray(wait.sourceRefs)
+  ) {
+    throw new SessionGoalError(
+      'session_goal_schema_unavailable',
+      `Goal fact ${eventId} has an invalid ActiveWaitV1 payload.`
+    );
+  }
+  return structuredClone(wait as unknown as SessionGoalActiveWaitV1);
+}
+
+function parseExecutionBudget(
+  value: unknown,
+  eventId: string
+): ExecutionBudgetCoreV1 {
+  const budget = objectRecord(value);
+  const lastStep = objectRecord(budget?.lastStep);
+  if (
+    budget?.schemaVersion !== 'deepcode.session.execution-budget-core.v1'
+    || !positiveInteger(budget.steps)
+    || !nonNegativeInteger(budget.providerCalls)
+    || !nonNegativeInteger(budget.activeTimeMs)
+    || !nonNegativeInteger(budget.consecutiveRetryCount)
+    || budget.consecutiveRetryCount > 3
+    || !lastStep
+    || !nonEmpty(lastStep.callerRequestId)
+    || !goalStepOutcome(lastStep.outcome)
+    || !nonEmpty(lastStep.reason)
+    || !nonEmpty(lastStep.startedAt)
+    || !nonEmpty(lastStep.completedAt)
+    || !stringArray(budget.sourceRefs)
+  ) {
+    throw new SessionGoalError(
+      'session_goal_schema_unavailable',
+      `Goal fact ${eventId} has an invalid ExecutionBudgetCoreV1 payload.`
+    );
+  }
+  return structuredClone(budget as unknown as ExecutionBudgetCoreV1);
+}
+
+function assertExecutionBudgetTransition(
+  goal: ReducedSessionGoalV1,
+  next: ExecutionBudgetCoreV1,
+  payload: Extract<SessionGoalFactPayloadV1, { factKind: 'budgetUsage' }>,
+  eventId: string
+): void {
+  const previous = goal.executionBudget;
+  if (
+    next.lastStep.callerRequestId !== payload.command.callerRequestId
+    || (
+      previous
+        ? (
+            next.steps !== previous.steps + 1
+            || next.providerCalls < previous.providerCalls
+            || next.activeTimeMs < previous.activeTimeMs
+            || !goal.executionBudgetFactRef
+            || !payload.sourceRefs.includes(goal.executionBudgetFactRef)
+          )
+        : next.steps !== 1
+    )
+  ) {
+    throw new SessionGoalError(
+      'session_goal_recovery_required',
+      `Goal ${goal.goalId} has a non-contiguous ExecutionBudgetCoreV1 fact at ${eventId}.`
+    );
+  }
+}
+
+function activeWaitKind(value: unknown): boolean {
+  return value === 'requirement'
+    || value === 'plan'
+    || value === 'review'
+    || value === 'userDecision'
+    || value === 'userAcceptance'
+    || value === 'scopeChange'
+    || value === 'replan'
+    || value === 'budget'
+    || value === 'persistence'
+    || value === 'permission'
+    || value === 'cleanup'
+    || value === 'indeterminate'
+    || value === 'checkpointRequired';
+}
+
+function goalStepOutcome(value: unknown): boolean {
+  return value === 'continue'
+    || value === 'suspend'
+    || value === 'complete'
+    || value === 'fail';
 }
 
 function errorMessage(error: unknown): string {
@@ -554,6 +717,12 @@ function positiveInteger(value: unknown): value is number {
   return typeof value === 'number'
     && Number.isSafeInteger(value)
     && value > 0;
+}
+
+function nonNegativeInteger(value: unknown): value is number {
+  return typeof value === 'number'
+    && Number.isSafeInteger(value)
+    && value >= 0;
 }
 
 function stringArray(value: unknown): value is string[] {

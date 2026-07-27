@@ -1,4 +1,5 @@
 import type { AgentSessionResult } from '@deepcode/protocol';
+import type { GoalStepOutcomeV1 } from '@deepcode/protocol';
 import type { ProviderTurnCycleResult } from './pipelines/providerTurnCycle.js';
 import type { ProposalRouterInput, ProposalRouterResult } from './proposal/proposalRouter.js';
 import type {
@@ -33,6 +34,13 @@ export interface RunEnginePorts<Input, State extends RunEngineState> {
   assembleReview(
     input: AcceptedPlanReviewHandoffRunInput<AcceptedPlanReviewHandoffPlan>
   ): Promise<AgentSessionResult>;
+  settleGoalStep(input: {
+    input: Input;
+    state: State;
+    lastResult: AgentSessionResult;
+    outcome: GoalStepOutcomeV1;
+    reason: string;
+  }): Promise<AgentSessionResult>;
 }
 
 // RunEngine owns command/effect transitions; all session side effects stay behind ports.
@@ -47,7 +55,15 @@ export class RunEngine<Input, State extends RunEngineState> {
     return this.runFromCommand(input, { kind: 'resumeRun' });
   }
 
-  private async runFromCommand(input: Input, initialCommand: RunCommand): Promise<AgentSessionResult> {
+  async advanceGoalStep(input: Input): Promise<AgentSessionResult> {
+    return this.runFromCommand(input, { kind: 'resumeRun' }, true);
+  }
+
+  private async runFromCommand(
+    input: Input,
+    initialCommand: RunCommand,
+    boundedGoalStep = false
+  ): Promise<AgentSessionResult> {
     let command: RunCommand = initialCommand;
     let state: State | undefined;
     let lastResult: AgentSessionResult | undefined;
@@ -97,6 +113,18 @@ export class RunEngine<Input, State extends RunEngineState> {
       if (command.kind === 'callProviderAndParse') {
         if (!state || !lastResult) throw new Error('RunEngine provider state is missing.');
         const cycle = await this.ports.runProviderTurn({ input, state, lastResult });
+        if (cycle.kind === 'retryExhausted') {
+          if (!boundedGoalStep) {
+            throw cycle.error;
+          }
+          return this.terminal(await this.ports.settleGoalStep({
+            input,
+            state,
+            lastResult: cycle.lastResult,
+            outcome: 'suspend',
+            reason: 'retryGuardExhausted',
+          }));
+        }
         if (cycle.kind === 'failed') {
           return this.terminal(cycle.result);
         }
@@ -123,10 +151,31 @@ export class RunEngine<Input, State extends RunEngineState> {
       if (command.kind === 'executeDirective') {
         if (!state || !pendingDirective) throw new Error('RunEngine pending directive is missing.');
         if (pendingDirective.directive.kind === 'providerResume') {
+          if (boundedGoalStep) {
+            return this.terminal(await this.ports.settleGoalStep({
+              input,
+              state,
+              lastResult: pendingDirective.lastResult,
+              outcome: 'continue',
+              reason: 'providerContinuationPrepared',
+            }));
+          }
           lastResult = pendingDirective.lastResult;
           pendingDirective = undefined;
           command = { kind: 'callProviderAndParse' };
           continue;
+        }
+        if (
+          boundedGoalStep
+          && pendingDirective.directive.kind === 'action'
+        ) {
+          return this.terminal(await this.ports.settleGoalStep({
+            input,
+            state,
+            lastResult: pendingDirective.lastResult,
+            outcome: 'suspend',
+            reason: 'checkpointRequired',
+          }));
         }
         if (!pendingDirective.proposal) throw new Error('RunEngine proposal directive is missing its proposal.');
         const handled = await this.ports.executeDirective({
@@ -146,6 +195,15 @@ export class RunEngine<Input, State extends RunEngineState> {
           pendingReview = effect;
           command = { kind: 'assembleReview' };
           continue;
+        }
+        if (boundedGoalStep) {
+          return this.terminal(await this.ports.settleGoalStep({
+            input,
+            state,
+            lastResult: effect.lastResult,
+            outcome: 'continue',
+            reason: 'semanticDirectiveAccepted',
+          }));
         }
         lastResult = effect.lastResult;
         command = this.nextCommandAfterDirective(effect);

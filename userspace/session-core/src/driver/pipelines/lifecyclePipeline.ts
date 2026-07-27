@@ -74,6 +74,7 @@ import { ArtifactDraftLease } from '../execution/artifactDraftLedger.js';
 import type { AcceptedTaskReplanReason } from '../execution/artifactDraftReplanCoordinator.js';
 import type { AutonomyMode } from '../../sessionModes.js';
 import { PermissionPipeline } from './permissionPipeline.js';
+import type { SessionGoalOperationContext } from '../../goal/index.js';
 
 export interface RunLifecycleInput {
   sessionId: string;
@@ -97,6 +98,7 @@ export interface RunLifecycleInput {
   autonomyMode?: AutonomyMode;
   hostLanguage?: ConversationLanguage;
   bootstrapEvents?: AgentEvent[];
+  goalContext?: SessionGoalOperationContext;
 }
 
 export interface RunLifecycleState {
@@ -343,11 +345,40 @@ export class RunLifecyclePipeline<State extends RunLifecycleState> {
   }
 
   async resume(input: RunLifecycleInput): Promise<RunLifecycleResult<State>> {
-    const lastResult = await this.ports.append(input.sessionId, []);
-    const events = input.existingEvents?.length ? input.existingEvents : lastResult.events;
+    let lastResult = await this.ports.append(input.sessionId, []);
+    let events = input.existingEvents?.length ? input.existingEvents : lastResult.events;
     const runId = input.acceptedTaskPlan?.runId
       ?? latestEventRunId(events, input.sessionId)
       ?? this.ports.createId('run-resume');
+    if (input.goalContext?.operation === 'advance') {
+      const runningEvent = this.ports.sessionRunStateEvent({
+        sessionId: input.sessionId,
+        runId,
+        phase: 'context_reading',
+        status: 'running',
+        reason: 'session',
+        decisionOwner: {
+          kind: 'session',
+          runId,
+        },
+        ts: this.ports.now(),
+        id: this.ports.createId('session-goal-step-running'),
+      });
+      runningEvent.payload = {
+        ...(objectRecord(runningEvent.payload) ?? {}),
+        goalCommand: {
+          goalId: input.goalContext.goalId,
+          goalRevision: input.goalContext.goalRevision,
+          callerRequestId: input.goalContext.command.callerRequestId,
+          requestDigest: input.goalContext.command.requestDigest,
+          hostRunId: input.goalContext.command.hostRunId,
+        },
+      };
+      lastResult = await this.ports.append(input.sessionId, [
+        runningEvent,
+      ]);
+      events = lastResult.events;
+    }
     let reconciledInput = input;
     if (input.workspaceBinding) {
       const snapshotReply = await this.ports.kernel({

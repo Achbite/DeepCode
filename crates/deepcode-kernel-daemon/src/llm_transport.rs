@@ -636,7 +636,8 @@ pub(crate) fn llm_stream_response(
                     json!({
                         "type": "provider_error",
                         "requestId": request_id.as_str(),
-                        "error": error.to_string()
+                        "error": "provider_retryable_no_mutation",
+                        "message": error.to_string()
                     }),
                 )));
                 return;
@@ -656,7 +657,12 @@ pub(crate) fn llm_stream_response(
                 json!({
                     "type": "provider_error",
                     "requestId": request_id.as_str(),
-                    "error": format!("LLM provider returned HTTP {}", status.as_u16()),
+                    "error": if retryable_provider_http_status(status.as_u16()) {
+                        "provider_retryable_no_mutation"
+                    } else {
+                        "llm_chat_failed"
+                    },
+                    "message": format!("LLM provider returned HTTP {}", status.as_u16()),
                     "rawProvider": {
                         "status": status.as_u16(),
                         "contentType": content_type,
@@ -709,7 +715,8 @@ pub(crate) fn llm_stream_response(
                         json!({
                             "type": "provider_error",
                             "requestId": request_id.as_str(),
-                            "error": error.to_string()
+                            "error": "provider_retryable_no_mutation",
+                            "message": error.to_string()
                         }),
                     )));
                     return;

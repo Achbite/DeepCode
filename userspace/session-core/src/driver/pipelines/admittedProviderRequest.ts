@@ -8,12 +8,13 @@ export type ProviderAttemptKind =
   | 'primary'
   | 'resume'
   | 'repair'
+  | 'retry'
   | 'emptyRetry'
   | 'streamFallback'
   | 'review';
 
 export interface PendingProviderRetryAdmission {
-  readonly attemptKind: Extract<ProviderAttemptKind, 'repair' | 'emptyRetry'>;
+  readonly attemptKind: Extract<ProviderAttemptKind, 'repair' | 'retry' | 'emptyRetry'>;
   readonly parentRequestId: string;
   readonly reasonCode: string;
   readonly rebaseFromFacts: boolean;

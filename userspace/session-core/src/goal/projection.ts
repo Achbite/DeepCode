@@ -243,9 +243,24 @@ export function buildGoalProjection(
           },
         }
       : { status: 'notAvailable' },
-    activeWait: { status: 'notAvailable' },
+    activeWait: goal.activeWait
+      ? {
+          status: 'available',
+          value: structuredClone(goal.activeWait),
+        }
+      : goal.taskLedger
+        ? {
+            status: 'available',
+            value: null,
+          }
+        : { status: 'notAvailable' },
     checkpoint: { status: 'notAvailable' },
-    executionBudget: { status: 'notAvailable' },
+    executionBudget: goal.executionBudget
+      ? {
+          status: 'available',
+          value: structuredClone(goal.executionBudget),
+        }
+      : { status: 'notAvailable' },
     terminal,
     factRefs: goal.facts.map(({ event }) => event.id),
     sourceRefs,

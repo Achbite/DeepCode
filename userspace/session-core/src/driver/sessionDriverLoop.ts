@@ -107,7 +107,11 @@ import {
   SessionFactLineageError,
 } from './authority/sessionFactLineage.js';
 import { SessionAppendCoordinatorError } from './authority/sessionAppendCoordinator.js';
-import { SessionGoalError } from '../goal/index.js';
+import {
+  currentOrLatestGoal,
+  reduceSessionGoals,
+  SessionGoalError,
+} from '../goal/index.js';
 import {
   conversationPresentationLanguage,
   conversationPresentationLanguageBinding,
@@ -1359,6 +1363,10 @@ export class SessionDriverLoop {
       deterministicProposal: (state) =>
         this.semanticToolAdapter.deterministicCurrentTask(state),
       admitDirective: (proposal) => this.proposalRouter.route(proposal),
+      retryableProviderFailure: (runInput, _state, error) =>
+        runInput.goalContext?.operation === 'advance'
+        && error instanceof SessionDriverLoopError
+        && error.code === 'provider_retryable_no_mutation',
       appendDriverFailure: async (state, error) => {
         if (!(error instanceof SessionDriverLoopError)) return null;
         await this.artifactDraftCoordinator.discard(
@@ -1509,6 +1517,32 @@ export class SessionDriverLoop {
       assembleReview: (reviewInput) => this.acceptedPlanReviewHandoffCoordinator.handoff(
         reviewInput as AcceptedPlanReviewHandoffRunInput<SessionPlanContext>
       ),
+      settleGoalStep: async ({ input: runInput, state, outcome, reason }) => {
+        state.phase = outcome === 'suspend'
+          ? 'executing_accepted_plan'
+          : 'completed';
+        const terminal = sessionProgressProjectionBuilder.sessionRunStateEvent({
+          sessionId: runInput.sessionId,
+          runId: state.runId,
+          phase: state.phase,
+          status: outcome === 'suspend' ? 'waiting' : 'completed',
+          reason: 'accepted_plan_execution',
+          decisionOwner: {
+            kind: 'session',
+            runId: state.runId,
+          },
+          ts: this.agentRunReactor.ts(),
+          id: this.agentRunReactor.id('session-goal-step-settled'),
+        });
+        terminal.payload = {
+          ...(objectRecord(terminal.payload) ?? {}),
+          goalStepReason: reason,
+        };
+        return this.agentRunReactor.append(runInput.sessionId, [
+          ...takeProviderCommitEvents(state),
+          terminal,
+        ]);
+      },
     });
   }
 
@@ -1558,6 +1592,71 @@ export class SessionDriverLoop {
 
   async runUserTurn(input: SessionDriverLoopInput): Promise<AgentSessionResult> {
     return this.runLoopInput(input);
+  }
+
+  async advanceGoalStep(
+    input: SessionDriverLoopInput
+  ): Promise<AgentSessionResult> {
+    const context = input.goalContext;
+    if (!context || context.operation !== 'advance') {
+      throw new SessionGoalError(
+        'session_goal_request_invalid',
+        'advanceGoalStep requires one admitted Goal advance context.'
+      );
+    }
+    const events = input.existingEvents ?? [];
+    const goal = currentOrLatestGoal(
+      reduceSessionGoals(input.sessionId, events)
+    );
+    if (
+      !goal
+      || goal.goalId !== context.goalId
+      || goal.goalRevision !== context.goalRevision
+      || goal.lifecycle !== 'running'
+      || !goal.planId
+      || !goal.confirmedPlanRef
+      || !goal.taskLedger
+    ) {
+      throw new SessionGoalError(
+        'session_goal_lifecycle_conflict',
+        'Goal foreground advance requires an exact running Goal with a confirmed Plan and TaskLedgerV2.'
+      );
+    }
+    const plan = planContextIndex.findPlanCard(
+      events,
+      goal.sourceRunId,
+      goal.planId
+    );
+    if (!plan || plan.sourceEventRef !== goal.confirmedPlanRef) {
+      throw new SessionGoalError(
+        'session_goal_recovery_required',
+        `Goal ${goal.goalId} cannot reconstruct its exact confirmed Plan.`
+      );
+    }
+    const rebuilt = acceptedTaskPlanContextBuilder().build({
+      plan,
+      executionRoot: plan.executionRoot,
+      taskLedgerOwner: goal.taskLedger.owner,
+    });
+    if (
+      rebuilt.taskLedger.taskOrder.join('\u001f')
+      !== goal.taskLedger.taskOrder.join('\u001f')
+    ) {
+      throw new SessionGoalError(
+        'session_goal_recovery_required',
+        `Goal ${goal.goalId} TaskLedgerV2 no longer matches its confirmed Plan.`
+      );
+    }
+    return this.runLoopInput({
+      ...input,
+      content: goal.objective,
+      appendUserMessage: false,
+      resumeResourcePackets: true,
+      acceptedTaskPlan: {
+        ...rebuilt,
+        taskLedger: goal.taskLedger,
+      },
+    }, 'goalStep');
   }
 
   private async appendSemanticDirectiveAdmission(
@@ -2335,7 +2434,7 @@ export class SessionDriverLoop {
 
   private async runLoopInput(
     input: SessionDriverLoopInput,
-    mode: 'userTurn' | 'resumeRun' = 'userTurn'
+    mode: 'userTurn' | 'resumeRun' | 'goalStep' = 'userTurn'
   ): Promise<AgentSessionResult> {
     const existingEvents = input.existingEvents ?? [];
     if (hasLegacySessionTurnAuthority(existingEvents) && !latestSessionTurnAuthority(existingEvents)) {
@@ -2503,7 +2602,9 @@ export class SessionDriverLoop {
     try {
       return mode === 'resumeRun'
         ? await this.runEngine.resume(input)
-        : await this.runEngine.run(input);
+        : mode === 'goalStep'
+          ? await this.runEngine.advanceGoalStep(input)
+          : await this.runEngine.run(input);
     } catch (error) {
       // A rejected canonical append did not establish a new durable authority
       // boundary. A second diagnostic append could bind to an older turn or

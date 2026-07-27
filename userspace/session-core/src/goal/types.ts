@@ -1,7 +1,9 @@
 import type {
   AgentEvent,
   AgentTimelineResult,
+  ExecutionBudgetCoreV1,
   GoalProjectionV1,
+  SessionGoalActiveWaitV1,
   SessionDomainStateSnapshotV1,
   SessionGoalCommandIdentityV1,
   SessionGoalFactPayloadV1,
@@ -42,6 +44,11 @@ export interface ReducedSessionGoalV1 {
   authorizationFactRef?: string;
   taskLedger?: TaskLedgerSnapshotV2;
   taskLedgerFactRef?: string;
+  waitRef?: string;
+  activeWait?: SessionGoalActiveWaitV1;
+  activeWaitFactRef?: string;
+  executionBudget?: ExecutionBudgetCoreV1;
+  executionBudgetFactRef?: string;
   terminalReason?: string;
   terminalFactRef?: string;
   facts: Array<{

@@ -30,6 +30,17 @@ pub(crate) struct GoalInteractionResolveRequest {
     host_language: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct GoalMutationRequest {
+    caller_request_id: String,
+    expected_goal_revision: u64,
+    expected_domain_head: Value,
+    workspace_path: Option<String>,
+    no_workspace: Option<bool>,
+    host_language: Option<String>,
+}
+
 #[derive(Clone)]
 struct CachedGoalProjection {
     head_digest: String,
@@ -103,6 +114,32 @@ pub(crate) async fn agent_session_goal_start(
                 "session_goal_request_conflict",
                 "Goal caller request ID was already used with different content",
             );
+        }
+        if !replay.settled {
+            let Some(host_run_id) = replay.host_run_id.as_deref() else {
+                return ApiResponse::error(
+                    "session_goal_recovery_required",
+                    "Goal advance admission has no recoverable Host run identity",
+                );
+            };
+            if let Err(error) =
+                await_goal_host_run_terminal(&state, &session_id, host_run_id).await
+            {
+                return ApiResponse::error(error.code, error.message);
+            }
+            let settled = goal_command_replay(
+                &session_projection(&state, &session_id),
+                &body.caller_request_id,
+            )
+            .is_some_and(|candidate| {
+                candidate.request_digest == request_digest && candidate.settled
+            });
+            if !settled {
+                return ApiResponse::error(
+                    "session_goal_recovery_required",
+                    "Goal advance Host run stopped without a canonical Goal settlement",
+                );
+            }
         }
         return goal_replay_response(
             &state,
@@ -362,14 +399,157 @@ pub(crate) async fn agent_session_goal_interaction_resolve(
 }
 
 pub(crate) async fn agent_session_goal_advance(
-    State(_state): State<AppState>,
-    Path((_session_id, _goal_id)): Path<(String, String)>,
-    Json(_body): Json<Value>,
+    State(state): State<AppState>,
+    Path((session_id, goal_id)): Path<(String, String)>,
+    Json(body): Json<GoalMutationRequest>,
 ) -> Json<ApiResponse> {
-    ApiResponse::error(
-        "session_goal_operation_unavailable",
-        "Goal advance is not available before Stage2-B2",
+    if let Err(message) = validate_goal_request_identity(&body.caller_request_id) {
+        return ApiResponse::error("session_goal_request_invalid", message);
+    }
+    let request_value = match serde_json::to_value(&body) {
+        Ok(value) => value,
+        Err(error) => {
+            return ApiResponse::error(
+                "session_goal_request_invalid",
+                format!("Goal advance request cannot be encoded: {error}"),
+            )
+        }
+    };
+    let request_digest = goal_request_digest("advance", &request_value);
+    let events = session_projection(&state, &session_id);
+    if let Some(replay) = goal_command_replay(&events, &body.caller_request_id) {
+        if replay.request_digest != request_digest {
+            return ApiResponse::error(
+                "session_goal_request_conflict",
+                "Goal caller request ID was already used with different content",
+            );
+        }
+        return goal_replay_response(
+            &state,
+            &session_id,
+            &replay.goal_id,
+            "advance",
+            Some(&body.caller_request_id),
+            Some(&request_digest),
+            replay.host_run_id.as_deref(),
+            true,
+        )
+        .await;
+    }
+    let domain = match exact_goal_domain_state(
+        &state,
+        &session_id,
+        &body.expected_domain_head,
+    ) {
+        Ok(domain) => domain,
+        Err(response) => return response,
+    };
+    if body.expected_goal_revision == 0
+        || domain.pointer("/goalSlot/state").and_then(Value::as_str) != Some("active")
+        || domain.pointer("/goalSlot/goalId").and_then(Value::as_str)
+            != Some(goal_id.as_str())
+        || domain.pointer("/goalSlot/goalRevision").and_then(Value::as_u64)
+            != Some(body.expected_goal_revision)
+        || domain.pointer("/goalSlot/lifecycle").and_then(Value::as_str)
+            != Some("running")
+    {
+        return ApiResponse::error(
+            "session_goal_lifecycle_conflict",
+            "Goal advance requires the exact active running Goal revision",
+        );
+    }
+    let projection = match read_goal_projection(&state, &session_id, Some(&goal_id)).await {
+        Ok(Some(projection)) => projection,
+        Ok(None) => {
+            return ApiResponse::error("session_goal_not_found", "Goal projection is unavailable")
+        }
+        Err(error) => return ApiResponse::error(error.code, error.message),
+    };
+    if projection.get("lifecycle").and_then(Value::as_str) != Some("running")
+        || projection.get("pendingInteraction").is_some()
+        || projection
+            .pointer("/activeWait/value")
+            .is_some_and(|value| !value.is_null())
+    {
+        return ApiResponse::error(
+            "session_goal_lifecycle_conflict",
+            "Goal advance is only admitted while running without an ActiveWait or pending interaction",
+        );
+    }
+    let expected_head_digest = domain
+        .pointer("/head/headDigest")
+        .and_then(Value::as_str)
+        .expect("exact Goal domain state has a head digest")
+        .to_string();
+    let run_request = AgentSessionRunRequest {
+        op: Some("advanceGoal".to_string()),
+        content: projection
+            .get("objective")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        workspace_path: body.workspace_path,
+        no_workspace: body.no_workspace,
+        host_language: body.host_language,
+        goal_id: Some(goal_id.clone()),
+        goal_revision: Some(body.expected_goal_revision),
+        objective: projection
+            .get("objective")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        caller_request_id: Some(body.caller_request_id.clone()),
+        request_digest: Some(request_digest.clone()),
+        expected_domain_head_digest: Some(expected_head_digest),
+        ..AgentSessionRunRequest::default()
+    };
+    let started = agent_session_run_start(
+        State(state.clone()),
+        Path(session_id.clone()),
+        Json(run_request),
     )
+    .await;
+    if !started.0.ok {
+        return started;
+    }
+    let host_run_id = started
+        .0
+        .data
+        .as_ref()
+        .and_then(|value| value.pointer("/run/runId"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let Some(host_run_id) = host_run_id else {
+        return ApiResponse::error(
+            "session_goal_recovery_required",
+            "Goal advance started without an exact Host run identity",
+        );
+    };
+    if let Err(error) = await_goal_host_run_terminal(&state, &session_id, &host_run_id).await {
+        return ApiResponse::error(error.code, error.message);
+    }
+    let settled = goal_command_replay(
+        &session_projection(&state, &session_id),
+        &body.caller_request_id,
+    )
+    .is_some_and(|candidate| {
+        candidate.request_digest == request_digest && candidate.settled
+    });
+    if !settled {
+        return ApiResponse::error(
+            "session_goal_recovery_required",
+            "Goal advance Host run stopped without a canonical Goal settlement",
+        );
+    }
+    goal_replay_response(
+        &state,
+        &session_id,
+        &goal_id,
+        "advance",
+        Some(&body.caller_request_id),
+        Some(&request_digest),
+        Some(&host_run_id),
+        false,
+    )
+    .await
 }
 
 pub(crate) async fn agent_session_goal_resume(
@@ -435,10 +615,11 @@ struct GoalCommandReplay {
     goal_id: String,
     request_digest: String,
     host_run_id: Option<String>,
+    settled: bool,
 }
 
 fn goal_command_replay(events: &[Value], caller_request_id: &str) -> Option<GoalCommandReplay> {
-    events.iter().find_map(|event| {
+    events.iter().rev().find_map(|event| {
         let payload = event.get("payload")?;
         match event.get("kind").and_then(Value::as_str) {
             Some("session_goal_fact")
@@ -457,6 +638,8 @@ fn goal_command_replay(events: &[Value], caller_request_id: &str) -> Option<Goal
                         .pointer("/command/hostRunId")
                         .and_then(Value::as_str)
                         .map(str::to_string),
+                    settled: payload.get("factKind").and_then(Value::as_str)
+                        != Some("draftCreated"),
                 })
             }
             Some("session_interaction_claim")
@@ -479,6 +662,29 @@ fn goal_command_replay(events: &[Value], caller_request_id: &str) -> Option<Goal
                         .or_else(|| payload.get("admittedRunId"))
                         .and_then(Value::as_str)
                         .map(str::to_string),
+                    settled: false,
+                })
+            }
+            Some("session_run_state")
+                if payload
+                    .pointer("/goalCommand/callerRequestId")
+                    .and_then(Value::as_str)
+                    == Some(caller_request_id) =>
+            {
+                Some(GoalCommandReplay {
+                    goal_id: payload
+                        .pointer("/goalCommand/goalId")
+                        .and_then(Value::as_str)?
+                        .to_string(),
+                    request_digest: payload
+                        .pointer("/goalCommand/requestDigest")
+                        .and_then(Value::as_str)?
+                        .to_string(),
+                    host_run_id: payload
+                        .pointer("/goalCommand/hostRunId")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    settled: false,
                 })
             }
             _ => None,
@@ -526,6 +732,18 @@ async fn goal_replay_response(
     match read_goal_projection(state, session_id, Some(goal_id)).await {
         Ok(Some(projection)) => {
             let source_domain_head = projection.get("sourceDomainHead").cloned();
+            let outcome = caller_request_id.and_then(|caller_request_id| {
+                (projection
+                    .pointer("/executionBudget/value/lastStep/callerRequestId")
+                    .and_then(Value::as_str)
+                    == Some(caller_request_id))
+                .then(|| {
+                    projection
+                        .pointer("/executionBudget/value/lastStep/outcome")
+                        .cloned()
+                })
+                .flatten()
+            });
             ApiResponse::ok(json!({
                 "schemaVersion": "deepcode.session.goal-command-receipt.v1",
                 "operation": operation,
@@ -538,6 +756,7 @@ async fn goal_replay_response(
                 "sourceDomainHead": source_domain_head,
                 "projection": projection,
                 "hostRunId": host_run_id,
+                "outcome": outcome,
             }))
         }
         Ok(None) => ApiResponse::error(
@@ -545,6 +764,36 @@ async fn goal_replay_response(
             "Goal command committed no readable Goal projection",
         ),
         Err(error) => ApiResponse::error(error.code, error.message),
+    }
+}
+
+async fn await_goal_host_run_terminal(
+    state: &AppState,
+    session_id: &str,
+    host_run_id: &str,
+) -> Result<(), KernelErrorEnvelope> {
+    loop {
+        let status = {
+            let runs = state.session_runs.lock().expect("session run state lock");
+            runs.get(host_run_id)
+                .filter(|run| run.session_id == session_id)
+                .map(|run| run.status.clone())
+        };
+        let Some(status) = status else {
+            return Err(KernelErrorEnvelope {
+                code: "session_goal_recovery_required".to_string(),
+                message: format!("Goal Host run {host_run_id} disappeared before settlement"),
+                message_key: None,
+                args: None,
+            });
+        };
+        if matches!(
+            status.as_str(),
+            "completed" | "failed" | "cancelled" | "waiting"
+        ) {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 }
 

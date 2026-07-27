@@ -1,5 +1,6 @@
 use crate::prelude::*;
 use crate::*;
+use deepcode_kernel_abi::LlmProviderDiagnostic;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
@@ -436,11 +437,7 @@ pub(crate) async fn llm_chat(
             ApiResponse::ok(payload)
         }
         Err(error) => {
-            let error_code = if error.reason == "provider_thinking_continuation_invalid" {
-                error.reason.clone()
-            } else {
-                "llm_chat_failed".to_string()
-            };
+            let error_code = llm_provider_error_code(&error).to_string();
             Json(ApiResponse {
                 ok: false,
                 data: Some(json!({
@@ -452,6 +449,24 @@ pub(crate) async fn llm_chat(
             })
         }
     }
+}
+
+fn llm_provider_error_code(error: &LlmProviderDiagnostic) -> &str {
+    if error.reason == "provider_thinking_continuation_invalid" {
+        return error.reason.as_str();
+    }
+    if matches!(
+        error.reason.as_str(),
+        "ProviderTransportFailed" | "ProviderResponseReadFailed"
+    ) || error.status.is_some_and(retryable_provider_http_status)
+    {
+        return "provider_retryable_no_mutation";
+    }
+    "llm_chat_failed"
+}
+
+pub(crate) fn retryable_provider_http_status(status: u16) -> bool {
+    matches!(status, 408 | 425 | 429 | 500 | 502 | 503 | 504)
 }
 
 pub(crate) async fn llm_chat_stream(

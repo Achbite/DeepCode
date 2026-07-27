@@ -369,6 +369,9 @@ pub(crate) async fn step_goal(
                 "callerRequestId": new_cli_request_id("goal-step")?,
                 "expectedGoalRevision": revision,
                 "expectedDomainHead": head,
+                "workspacePath": workspace_path_for_host(&host),
+                "noWorkspace": host.no_workspace,
+                "hostLanguage": deepcode_kernel_client::terminal_host_language(),
             }),
         )
         .await
@@ -395,6 +398,9 @@ pub(crate) async fn run_goal(
                     "callerRequestId": new_cli_request_id("goal-run-step")?,
                     "expectedGoalRevision": revision,
                     "expectedDomainHead": head,
+                    "workspacePath": workspace_path_for_host(&host),
+                    "noWorkspace": host.no_workspace,
+                    "hostLanguage": deepcode_kernel_client::terminal_host_language(),
                 }),
             )
             .await

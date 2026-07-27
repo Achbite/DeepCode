@@ -158,6 +158,8 @@ async function main(): Promise<void> {
         result = readGoal(request);
         break;
       case 'advanceGoal':
+        result = await advanceGoal(request);
+        break;
       case 'resumeGoal':
       case 'cancelGoal':
         throw new SessionGoalError(
@@ -184,6 +186,93 @@ async function main(): Promise<void> {
       message: error instanceof Error ? error.message : String(error),
     });
     process.exit(1);
+  }
+}
+
+async function advanceGoal(
+  request: HostBridgeRequest
+): Promise<HostBridgeResult> {
+  if (!request.sessionId) {
+    throw new SessionGoalError(
+      'session_goal_request_invalid',
+      'Goal advance requires sessionId.'
+    );
+  }
+  const apiBase = normalizeApiBase(request.apiBase);
+  const hostRunId = requiredHostRunId(request);
+  const goalContext = goalOperationContext(request);
+  if (!goalContext || goalContext.operation !== 'advance') {
+    throw new SessionGoalError(
+      'session_goal_request_invalid',
+      'Goal advance requires an admitted Goal operation context.'
+    );
+  }
+  const current = await getAgentSession(apiBase, request.sessionId);
+  const initialTimeline = await loadAgentTimeline(
+    apiBase,
+    request.sessionId,
+    current.events
+  );
+  const initialCacheTelemetry = await loadCacheTelemetryEvents(
+    apiBase,
+    request.sessionId
+  );
+  const binding = request.noWorkspace
+    ? undefined
+    : request.workspaceBinding
+      ?? workspaceBindingFromPath(request.workspacePath);
+  const projectWorkingDirectory = request.noWorkspace
+    ? undefined
+    : projectWorkingDirectoryFromBinding(binding, request.workspacePath);
+  const deliveryRecorder = createProjectionDeliveryRecorder(
+    apiBase,
+    request.sessionId,
+    hostRunId
+  );
+  const projection = createProjectionPublishingDriver(
+    apiBase,
+    hostRunId,
+    request.sessionId,
+    current,
+    initialTimeline,
+    initialCacheTelemetry,
+    deliveryRecorder,
+    undefined,
+    bootstrapContext(request),
+    goalContext
+  );
+  try {
+    const result = await projection.driver.advanceGoalStep({
+      sessionId: request.sessionId,
+      hostRunId,
+      content: request.objective ?? '',
+      existingEvents: current.events,
+      workspaceBinding: binding,
+      projectWorkingDirectory,
+      projectId: request.projectId,
+      projectKind: request.projectKind,
+      projectRootStatus: request.projectRootStatus,
+      profileId: request.profileId,
+      reviewContinuationMode: request.reviewContinuationMode,
+      interventionLevel: request.interventionLevel,
+      autonomyMode: request.autonomyMode,
+      projectMemoryMode: request.projectMemoryMode,
+      hostLanguage: request.hostLanguage,
+      goalContext,
+    });
+    const timeline = projection.buildTimeline(result.events ?? []);
+    const finalText = extractFinalText(timeline);
+    return {
+      ok: true,
+      sessionId: result.session.id,
+      session: result.session,
+      events: result.events,
+      timeline,
+      finalText,
+      ...inferHostRunLifecycle(result.events, finalText),
+    };
+  } finally {
+    await deliveryRecorder?.close();
   }
 }
 
@@ -792,10 +881,16 @@ function bootstrapContext(
       'Run bootstrap requires one admission identity and one transport token.'
     );
   }
-  if (request.op !== 'ask' && request.op !== 'startGoal') {
+  if (
+    request.op !== 'ask'
+    && request.op !== 'startGoal'
+    && request.op !== 'advanceGoal'
+    && request.op !== 'resumeGoal'
+    && request.op !== 'cancelGoal'
+  ) {
     throw new SessionAppendCoordinatorError(
       'session_append_transition_invalid',
-      'Only a new authoritative user run may carry a bootstrap admission.'
+      'Only an authoritative user run or an admitted Goal foreground operation may carry a bootstrap admission.'
     );
   }
   return {
@@ -1197,6 +1292,7 @@ async function llmChatStream(
           errorCode = event.error === 'provider_thinking_continuation_invalid'
             || event.error === 'provider_profile_identity_invalid'
             || event.error === 'provider_request_identity_invalid'
+            || event.error === 'provider_retryable_no_mutation'
             ? event.error
             : undefined;
           errorMessage = eventMessage ?? event.chunk?.error ?? event.error ?? 'Provider stream error.';

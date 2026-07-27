@@ -465,6 +465,7 @@ export type SessionProviderAttemptKindV1 =
   | 'primary'
   | 'resume'
   | 'repair'
+  | 'retry'
   | 'emptyRetry'
   | 'streamFallback'
   | 'review';
@@ -648,6 +649,54 @@ export interface TaskLedgerSnapshotV2 {
   sourceRefs: string[];
 }
 
+export type GoalStepOutcomeV1 =
+  | 'continue'
+  | 'suspend'
+  | 'complete'
+  | 'fail';
+
+export type SessionGoalActiveWaitKindV1 =
+  | 'requirement'
+  | 'plan'
+  | 'review'
+  | 'userDecision'
+  | 'userAcceptance'
+  | 'scopeChange'
+  | 'replan'
+  | 'budget'
+  | 'persistence'
+  | 'permission'
+  | 'cleanup'
+  | 'indeterminate'
+  | 'checkpointRequired';
+
+export interface SessionGoalActiveWaitV1 {
+  schemaVersion: 'deepcode.session.active-wait.v1';
+  waitId: string;
+  kind: SessionGoalActiveWaitKindV1;
+  source: 'session' | 'kernel';
+  reason: string;
+  resumable: boolean;
+  createdAt: string;
+  sourceRefs: string[];
+}
+
+export interface ExecutionBudgetCoreV1 {
+  schemaVersion: 'deepcode.session.execution-budget-core.v1';
+  steps: number;
+  providerCalls: number;
+  activeTimeMs: number;
+  consecutiveRetryCount: number;
+  lastStep: {
+    callerRequestId: string;
+    outcome: GoalStepOutcomeV1;
+    reason: string;
+    startedAt: string;
+    completedAt: string;
+  };
+  sourceRefs: string[];
+}
+
 export interface SessionGoalFactBaseV1 extends SessionGoalRefV1 {
   schemaVersion: 'deepcode.session.goal-fact.v1';
   lifecycle: SessionGoalLifecycleV1;
@@ -716,7 +765,7 @@ export type SessionGoalFactPayloadV1 =
   | (SessionGoalFactBaseV1 & {
       factKind: 'activeWait';
       lifecycle: 'suspended';
-      activeWait: unknown;
+      activeWait: SessionGoalActiveWaitV1;
     })
   | (SessionGoalFactBaseV1 & {
       factKind: 'checkpoint';
@@ -726,7 +775,7 @@ export type SessionGoalFactPayloadV1 =
   | (SessionGoalFactBaseV1 & {
       factKind: 'budgetUsage';
       lifecycle: 'running' | 'suspended';
-      executionBudget: unknown;
+      executionBudget: ExecutionBudgetCoreV1;
     });
 
 export type SessionGoalSlotExpectationV1 =
@@ -810,12 +859,12 @@ export interface GoalProjectionV1 extends SessionGoalRefV1 {
     settled: number;
     total: number;
   }>;
-  activeWait: GoalProjectionAvailabilityV1<unknown>;
+  activeWait: GoalProjectionAvailabilityV1<SessionGoalActiveWaitV1 | null>;
   checkpoint: GoalProjectionAvailabilityV1<{
     sequence: number;
     checkpointRef: string;
   }>;
-  executionBudget: GoalProjectionAvailabilityV1<unknown>;
+  executionBudget: GoalProjectionAvailabilityV1<ExecutionBudgetCoreV1>;
   terminal?: {
     status: 'completed' | 'failed' | 'cancelled';
     factRef: string;
@@ -1636,6 +1685,13 @@ export type SessionAppendEventTransitionV1 =
   | {
       kind: 'append';
       intent: 'bootstrapRun';
+      runId: string;
+      bootstrapAdmissionId: string;
+      turnAuthorityRef: string;
+    }
+  | {
+      kind: 'append';
+      intent: 'bootstrapGoalRun';
       runId: string;
       bootstrapAdmissionId: string;
       turnAuthorityRef: string;

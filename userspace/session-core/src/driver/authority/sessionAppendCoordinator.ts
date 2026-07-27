@@ -116,6 +116,8 @@ export class SessionAppendCoordinator
 
   private result: WritableAgentSessionResult;
   private readonly goalController: SessionGoalAppendController;
+  private readonly goalStepStartedAt = new Date().toISOString();
+  private readonly admittedGoalProviderRequests = new Set<string>();
 
   constructor(
     private readonly sessionId: string,
@@ -123,7 +125,7 @@ export class SessionAppendCoordinator
     initialResult: AgentSessionResult,
     private readonly interaction?: SessionAppendInteractionContext,
     private readonly bootstrap?: SessionRunBootstrapContext,
-    goal?: SessionGoalOperationContext
+    private readonly goal?: SessionGoalOperationContext
   ) {
     this.result = writableSessionResult(initialResult);
     if (this.result.session.id !== sessionId) {
@@ -151,6 +153,9 @@ export class SessionAppendCoordinator
 
   registerProviderAdmission(metadata: SessionProviderAdmissionMetadataV1): void {
     registerPendingProviderAdmission(this, metadata);
+    if (this.goal?.operation === 'advance') {
+      this.admittedGoalProviderRequests.add(metadata.requestId);
+    }
   }
 
   bindProviderProposalAdmission(
@@ -182,7 +187,13 @@ export class SessionAppendCoordinator
     const goalPrepared = this.goalController.prepare(
       this.result.events,
       incomingEvents,
-      this.currentState
+      this.currentState,
+      this.goal?.operation === 'advance'
+        ? {
+            stepStartedAt: this.goalStepStartedAt,
+            providerCallCount: this.admittedGoalProviderRequests.size,
+          }
+        : undefined
     );
     const normalizedIncoming = splitAcceptedPermissionFacts(goalPrepared.events);
     const lineageByEventId = this.buildLineages(normalizedIncoming);
@@ -351,6 +362,16 @@ export class SessionAppendCoordinator
     preparedFacts: PreparedSessionGoalFactBatch,
     timeline: AgentTimelineResult
   ): PreparedCanonicalSessionAppend {
+    if (
+      this.goal
+      && (
+        this.goal.operation === 'advance'
+        || this.goal.operation === 'resume'
+        || this.goal.operation === 'cancel'
+      )
+    ) {
+      return this.buildGoalBootstrapCommand(preparedFacts, timeline);
+    }
     const bootstrap = this.bootstrap;
     if (!bootstrap?.token.trim() || !bootstrap.admissionId.trim()) {
       throw new SessionAppendCoordinatorError(
@@ -413,6 +434,101 @@ export class SessionAppendCoordinator
     const preconditions = preparedFacts.goalPrecondition
       ? [preparedFacts.goalPrecondition]
       : [];
+    const batchId = canonicalBatchId({
+      sessionId: this.sessionId,
+      hostRunId: this.hostRunId,
+      baseHead: this.currentState.head,
+      transition,
+      events: preparedFacts.events,
+    });
+    return {
+      command: {
+        schemaVersion: 'deepcode.session.append-command.v1',
+        batchId,
+        baseHead: this.currentState.head,
+        preconditions,
+        transition,
+        events: preparedFacts.events,
+        timeline,
+        providerAdmissions: [],
+        bootstrapToken: bootstrap.token,
+      },
+      preparedFacts,
+      closesRun: false,
+    };
+  }
+
+  private buildGoalBootstrapCommand(
+    preparedFacts: PreparedSessionGoalFactBatch,
+    timeline: AgentTimelineResult
+  ): PreparedCanonicalSessionAppend {
+    const bootstrap = this.bootstrap;
+    const goal = this.goal;
+    if (
+      !goal
+      || !bootstrap?.token.trim()
+      || !bootstrap.admissionId.trim()
+    ) {
+      throw new SessionAppendCoordinatorError(
+        'session_append_precondition_failed',
+        `Goal Host run fence ${this.hostRunId} has no complete bootstrap admission.`
+      );
+    }
+    if (this.interaction) {
+      throw new SessionAppendCoordinatorError(
+        'session_append_transition_invalid',
+        'A Goal foreground step cannot also claim a user interaction.'
+      );
+    }
+    if (terminalRunState(preparedFacts.events)) {
+      throw new SessionAppendCoordinatorError(
+        'session_append_transition_invalid',
+        'A Goal foreground run must establish its durable fence before a terminal close batch.'
+      );
+    }
+    if (preparedFacts.providerAdmissions.length > 0) {
+      throw new SessionAppendCoordinatorError(
+        'session_append_transition_invalid',
+        'Provider admission cannot precede the durable Goal run bootstrap acknowledgement.'
+      );
+    }
+    if (preparedFacts.events.some(
+      (event) =>
+        event.kind === 'user_msg'
+        || event.kind === 'session_turn_authority'
+    )) {
+      throw new SessionAppendCoordinatorError(
+        'session_append_transition_invalid',
+        'A Goal foreground step reuses its confirmed authority and cannot manufacture a new user message or language revision.'
+      );
+    }
+    const turnAuthorityRef = appendTurnAuthorityRef(
+      this.result.events,
+      preparedFacts
+    );
+    if (!sessionTurnAuthorityEventByRef(this.result.events, turnAuthorityRef)) {
+      throw new SessionAppendCoordinatorError(
+        'session_fact_lineage_unavailable',
+        'A Goal foreground step requires an exact prior turn authority.'
+      );
+    }
+    let transition: SessionAppendTransitionV1 = {
+      kind: 'append',
+      intent: 'bootstrapGoalRun',
+      runId: this.hostRunId,
+      bootstrapAdmissionId: bootstrap.admissionId,
+      turnAuthorityRef,
+    };
+    transition = withGoalEffect(transition, preparedFacts.goalEffect);
+    const preconditions: SessionAppendPreconditionV1[] = [{
+      kind: 'goalSlot',
+      expected: {
+        state: 'active',
+        goalId: goal.goalId,
+        goalRevision: goal.goalRevision,
+        lifecycle: activeGoalLifecycle(this.currentState, goal),
+      },
+    }];
     const batchId = canonicalBatchId({
       sessionId: this.sessionId,
       hostRunId: this.hostRunId,
@@ -646,6 +762,25 @@ function writableSessionResult(result: AgentSessionResult): WritableAgentSession
     );
   }
   return result as WritableAgentSessionResult;
+}
+
+function activeGoalLifecycle(
+  state: SessionDomainStateSnapshotV1,
+  goal: SessionGoalOperationContext
+): 'draft' | 'awaitingPlanAcceptance' | 'running' | 'suspended' {
+  const slot = state.goalSlot;
+  if (
+    !slot
+    || slot.state !== 'active'
+    || slot.goalId !== goal.goalId
+    || slot.goalRevision !== goal.goalRevision
+  ) {
+    throw new SessionAppendCoordinatorError(
+      'session_goal_recovery_required',
+      'Goal foreground bootstrap does not match the exact active Goal slot.'
+    );
+  }
+  return slot.lifecycle;
 }
 
 function splitAcceptedPermissionFacts(

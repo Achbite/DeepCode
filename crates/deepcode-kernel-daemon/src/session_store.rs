@@ -179,6 +179,7 @@ pub(crate) enum SessionInteractionFenceStateV1 {
 pub(crate) enum SessionAppendIntentV1 {
     OpenRun,
     BootstrapRun,
+    BootstrapGoalRun,
     DomainFacts,
     Guidance,
     InteractionSettlement,
@@ -3875,7 +3876,9 @@ fn validate_session_append_command(
     let is_bootstrap = matches!(
         command.transition,
         SessionAppendTransitionV1::Append {
-            intent: SessionAppendIntentV1::BootstrapRun,
+            intent:
+                SessionAppendIntentV1::BootstrapRun
+                | SessionAppendIntentV1::BootstrapGoalRun,
             ..
         }
     );
@@ -3886,7 +3889,7 @@ fn validate_session_append_command(
     } else if command.bootstrap_token.is_some() {
         return Err(SessionDomainStoreError::new(
             "session_append_transition_invalid",
-            "Only bootstrapRun may carry the request-only bootstrapToken",
+            "Only bootstrapRun or bootstrapGoalRun may carry the request-only bootstrapToken",
         ));
     }
     validate_provider_admission_metadata(&command.provider_admissions)?;
@@ -4048,17 +4051,18 @@ fn validate_session_append_transition_shape(
                         ));
                     }
                 }
-                SessionAppendIntentV1::BootstrapRun => {
+                SessionAppendIntentV1::BootstrapRun
+                | SessionAppendIntentV1::BootstrapGoalRun => {
                     let authority = turn_authority_ref.as_deref().ok_or_else(|| {
                         SessionDomainStoreError::new(
                             "session_append_transition_invalid",
-                            "bootstrapRun transition requires turnAuthorityRef",
+                            "bootstrap transition requires turnAuthorityRef",
                         )
                     })?;
                     let admission_id = bootstrap_admission_id.as_deref().ok_or_else(|| {
                         SessionDomainStoreError::new(
                             "session_append_transition_invalid",
-                            "bootstrapRun transition requires bootstrapAdmissionId",
+                            "bootstrap transition requires bootstrapAdmissionId",
                         )
                     })?;
                     validate_domain_identity(authority, "transition.turnAuthorityRef")?;
@@ -4070,7 +4074,7 @@ fn validate_session_append_transition_shape(
                     {
                         return Err(SessionDomainStoreError::new(
                             "session_append_transition_invalid",
-                            "bootstrapRun transition carries interaction settlement fields",
+                            "bootstrap transition carries interaction settlement fields",
                         ));
                     }
                 }
@@ -5404,6 +5408,40 @@ fn apply_session_append_transition(
                     require_transition_authority(
                         state,
                         incoming_events,
+                        turn_authority_ref.as_deref(),
+                        transition,
+                    )?;
+                    state.run_fences.insert(
+                        run_id.clone(),
+                        SessionRunFenceSnapshot {
+                            revision: 1,
+                            state: SessionRunFenceSnapshotState::Open,
+                            owner_batch_id: None,
+                        },
+                    );
+                }
+                SessionAppendIntentV1::BootstrapGoalRun => {
+                    if state.run_fences.contains_key(run_id) {
+                        return transition_state_error(
+                            format!("Goal bootstrap run fence {run_id} already exists"),
+                            transition,
+                        );
+                    }
+                    if preconditions.len() != 1
+                        || !matches!(
+                            preconditions.first(),
+                            Some(SessionAppendPreconditionV1::GoalSlot {
+                                expected: SessionGoalSlotExpectationV1::Active { .. }
+                            })
+                        )
+                    {
+                        return transition_state_error(
+                            "bootstrapGoalRun requires exactly one active Goal-slot precondition",
+                            transition,
+                        );
+                    }
+                    require_prior_transition_authority(
+                        state,
                         turn_authority_ref.as_deref(),
                         transition,
                     )?;
@@ -7630,6 +7668,7 @@ fn current_turn_authority_ref_for_host_run(
             || !matches!(
                 intent,
                 SessionAppendIntentV1::BootstrapRun
+                    | SessionAppendIntentV1::BootstrapGoalRun
                     | SessionAppendIntentV1::DomainFacts
                     | SessionAppendIntentV1::Guidance
             )
@@ -7642,7 +7681,9 @@ fn current_turn_authority_ref_for_host_run(
             record_index,
             matches!(
                 intent,
-                SessionAppendIntentV1::BootstrapRun | SessionAppendIntentV1::DomainFacts
+                SessionAppendIntentV1::BootstrapRun
+                    | SessionAppendIntentV1::BootstrapGoalRun
+                    | SessionAppendIntentV1::DomainFacts
             ),
         )?;
         if let Some((current_position, current_ref)) = current.as_ref() {
@@ -7850,20 +7891,34 @@ fn validate_session_run_bootstrap_admission_locked(
     session_id: &str,
     command: &SessionAppendCommandV1,
 ) -> Result<(), SessionDomainStoreError> {
-    let SessionAppendTransitionV1::Append {
-        intent: SessionAppendIntentV1::BootstrapRun,
+    let (
+        goal_bootstrap,
         run_id,
-        turn_authority_ref: Some(turn_authority_ref),
-        bootstrap_admission_id: Some(bootstrap_admission_id),
-        ..
-    } = &command.transition
-    else {
-        return Ok(());
+        turn_authority_ref,
+        bootstrap_admission_id,
+    ) = match &command.transition {
+        SessionAppendTransitionV1::Append {
+            intent:
+                intent @ (
+                    SessionAppendIntentV1::BootstrapRun
+                    | SessionAppendIntentV1::BootstrapGoalRun
+                ),
+            run_id,
+            turn_authority_ref: Some(turn_authority_ref),
+            bootstrap_admission_id: Some(bootstrap_admission_id),
+            ..
+        } => (
+            *intent == SessionAppendIntentV1::BootstrapGoalRun,
+            run_id,
+            turn_authority_ref,
+            bootstrap_admission_id,
+        ),
+        _ => return Ok(()),
     };
     let token = command.bootstrap_token.as_deref().ok_or_else(|| {
         SessionDomainStoreError::new(
             "session_append_transition_invalid",
-            "A new bootstrapRun batch requires its request-only bootstrap token",
+            "A new bootstrap batch requires its request-only bootstrap token",
         )
     })?;
     let key = session_run_bootstrap_registry_key(sessions_dir, session_id, run_id);
@@ -7900,6 +7955,45 @@ fn validate_session_run_bootstrap_admission_locked(
                 ))
             }
         }
+    }
+    if goal_bootstrap {
+        let exact_goal_precondition = matches!(
+            command.preconditions.as_slice(),
+            [SessionAppendPreconditionV1::GoalSlot {
+                expected: SessionGoalSlotExpectationV1::Active { .. }
+            }]
+        );
+        let contains_new_authority = command.events.iter().any(|event| {
+            matches!(
+                event.get("kind").and_then(Value::as_str),
+                Some("user_msg" | "session_turn_authority")
+            )
+        });
+        let contains_terminal = command.events.iter().any(|event| {
+            event.get("kind").and_then(Value::as_str) == Some("session_run_state")
+                && matches!(
+                    event.pointer("/payload/status").and_then(Value::as_str),
+                    Some("completed" | "failed" | "cancelled" | "waiting")
+                )
+        });
+        if !exact_goal_precondition
+            || contains_new_authority
+            || contains_terminal
+            || !command.provider_admissions.is_empty()
+            || matches!(
+                command.transition,
+                SessionAppendTransitionV1::Append {
+                    goal_effect: Some(_),
+                    ..
+                }
+            )
+        {
+            return Err(SessionDomainStoreError::new(
+                "session_append_transition_invalid",
+                "bootstrapGoalRun must reuse prior authority, require one active Goal slot, and remain non-terminal without Provider admission or Goal effect",
+            ));
+        }
+        return Ok(());
     }
     let bootstrap_has_unsupported_precondition =
         command.preconditions.iter().any(|precondition| {
@@ -8052,7 +8146,9 @@ fn mark_session_run_bootstrap_committed_locked(
     batch_id: &str,
 ) -> Result<(), SessionDomainStoreError> {
     let SessionAppendTransitionV1::Append {
-        intent: SessionAppendIntentV1::BootstrapRun,
+        intent:
+            SessionAppendIntentV1::BootstrapRun
+            | SessionAppendIntentV1::BootstrapGoalRun,
         run_id,
         turn_authority_ref: Some(turn_authority_ref),
         bootstrap_admission_id: Some(bootstrap_admission_id),

@@ -584,6 +584,21 @@ export class ProviderTurnRunner<TState extends ProviderTurnRunnerState> {
         stage,
         'semantic_draft_provider_transport_failed'
       );
+      if (
+        !input.abortSignal?.aborted
+        && isRetryableProviderTransportError(detail.error)
+      ) {
+        state.pendingProviderRetry = {
+          attemptKind: 'retry',
+          parentRequestId: primaryAdmitted.requestId,
+          reasonCode: 'provider_retryable_no_mutation',
+          rebaseFromFacts: false,
+        };
+        throw this.dependencies.createError(
+          'provider_retryable_no_mutation',
+          detail.message
+        );
+      }
       throw error;
     }
     const abortedAfterProviderResult = providerCallAbortError(
@@ -742,6 +757,21 @@ export class ProviderTurnRunner<TState extends ProviderTurnRunnerState> {
             createdAt: this.dependencies.now(),
           }),
         ]);
+        if (
+          !input.abortSignal?.aborted
+          && isRetryableProviderTransportError(detail.error)
+        ) {
+          state.pendingProviderRetry = {
+            attemptKind: 'retry',
+            parentRequestId: fallbackAdmitted.requestId,
+            reasonCode: 'provider_retryable_no_mutation',
+            rebaseFromFacts: false,
+          };
+          throw this.dependencies.createError(
+            'provider_retryable_no_mutation',
+            detail.message
+          );
+        }
         throw error;
       }
     }
@@ -766,6 +796,18 @@ export class ProviderTurnRunner<TState extends ProviderTurnRunnerState> {
         throw this.dependencies.createError(
           result.error ?? 'provider_profile_identity_invalid',
           result.message ?? 'Provider identity validation failed before semantic admission.'
+        );
+      }
+      if (result.error === 'provider_retryable_no_mutation') {
+        state.pendingProviderRetry = {
+          attemptKind: 'retry',
+          parentRequestId: effectiveAdmitted.requestId,
+          reasonCode: result.error,
+          rebaseFromFacts: false,
+        };
+        throw this.dependencies.createError(
+          result.error,
+          result.message ?? 'Provider transport failed before semantic admission.'
         );
       }
       throw this.dependencies.createError(
@@ -1313,6 +1355,20 @@ function providerCallAbortError(
 function isProviderCallAbortCode(code: string | undefined): boolean {
   return code === 'session_provider_deadline_exceeded'
     || code === 'session_provider_call_aborted';
+}
+
+function isRetryableProviderTransportError(code: string | undefined): boolean {
+  if (!code) return false;
+  return code === 'TypeError'
+    || code === 'TimeoutError'
+    || code === 'ETIMEDOUT'
+    || code === 'ECONNABORTED'
+    || code === 'ECONNRESET'
+    || code === 'EPIPE'
+    || code === 'UND_ERR_CONNECT_TIMEOUT'
+    || code === 'UND_ERR_HEADERS_TIMEOUT'
+    || code === 'UND_ERR_BODY_TIMEOUT'
+    || code === 'UND_ERR_SOCKET';
 }
 
 function normalizeProviderResponseIdentity(
