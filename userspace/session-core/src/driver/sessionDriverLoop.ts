@@ -2,7 +2,11 @@ import type {
   AgentEvent,
   AgentSessionResult,
   ConversationLanguage,
+  KernelActionBatchV1,
+  KernelAuditEventFact,
+  KernelEventV1,
   LlmChatRequest,
+  SessionGoalPendingEffectV1,
 } from '@deepcode/protocol';
 import {
   AcceptedActionBundlePlanExecutor,
@@ -91,6 +95,8 @@ import {
   semanticDirectiveAdmissionAnalysisEvent,
   semanticDirectiveTerminalAnalysisEvent,
   semanticExchangeAnalysisEvent,
+  type ProviderAnalysisTimelineAppendAck,
+  type ProviderAnalysisTimelineRecord,
 } from '../provider/ProviderAnalysisTimeline.js';
 import {
   appendPromptLedgerCurrentTurn,
@@ -104,14 +110,21 @@ import { diag, isEmptyResponseError, objectRecord, SessionDriverLoopError, strin
 import { AgentRunReactor } from './agentRunReactor.js';
 import {
   bindPendingProviderProposalAdmission,
+  kernelFactRefFromEvent,
   SessionFactLineageError,
 } from './authority/sessionFactLineage.js';
 import { SessionAppendCoordinatorError } from './authority/sessionAppendCoordinator.js';
 import {
   currentOrLatestGoal,
+  createGoalCancelFactBatch,
+  createGoalEffectCheckpointFact,
+  createGoalResumeFactBatch,
   reduceSessionGoals,
   SessionGoalError,
+  type ReducedSessionGoalV1,
 } from '../goal/index.js';
+import { canonicalJson, stableHash } from '../cache/canonicalizer.js';
+import { failTaskLedgerV2 } from '../run-state/taskLedger.js';
 import {
   conversationPresentationLanguage,
   conversationPresentationLanguageBinding,
@@ -403,6 +416,10 @@ export class SessionDriverLoop {
         ),
       executionRequest: (plan, acceptedPlan) => executionPromptCoordinator().executionRequest(plan, acceptedPlan),
       staticSyntaxReview: (reviewInput) => this.acceptedPlanStaticSyntaxReviewCoordinator.run(reviewInput),
+      beforeKernelMutation: (barrierInput) =>
+        this.persistGoalEffectDispatch(barrierInput),
+      afterKernelObservation: (observationInput) =>
+        this.captureGoalEffectObservation(observationInput),
     });
     this.acceptedPlanReviewHandoffCoordinator = new AcceptedPlanReviewHandoffCoordinator<SessionPlanContext>({
       now: () => this.agentRunReactor.ts(),
@@ -916,7 +933,7 @@ export class SessionDriverLoop {
           pending.toolCall,
           delta,
           true,
-          proposal.proposalId
+          proposal
         );
         delete state.pendingSemanticExchanges?.[proposal.proposalId];
       },
@@ -1108,7 +1125,7 @@ export class SessionDriverLoop {
           toolCall,
           result.toolResult,
           result.kind === 'providerResume' && toolCall.name !== 'session.submit_task_outcome',
-          result.kind === 'proposal' ? result.proposal.proposalId : undefined
+          result.kind === 'proposal' ? result.proposal : undefined
         );
       },
     });
@@ -1324,25 +1341,8 @@ export class SessionDriverLoop {
     });
     this.providerTurnCycle = new ProviderTurnCycle<SessionDriverLoopInput, SessionDriverLoopRunState>({
       refreshRuntimeState: (state) => acceptedPlanTaskLedger().refreshRuntimeState(state),
-      prepareProviderContext: async (handlerInput, state, lastResult) => {
-        const guidance = await this.admitQueuedProviderGuidance(
-          state,
-          'provider_call',
-          'contextPreparation'
-        );
-        return this.providerTurnContextCoordinator.prepare(state, {
-          contextAssemblyId: this.agentRunReactor.id('context-assembly'),
-          contractId: this.agentRunReactor.id('provider-turn-contract'),
-          inputContent: handlerInput.content,
-          projectMemoryMode: handlerInput.projectMemoryMode,
-          interventionLevel: handlerInput.interventionLevel,
-          confirmedRequirement: handlerInput.confirmedRequirement,
-          priorUserGuidance: guidance.priorGuidance,
-          lastResult: guidance.result.events.length >= lastResult.events.length
-            ? guidance.result
-            : lastResult,
-        });
-      },
+      prepareProviderContext: (handlerInput, state, lastResult) =>
+        this.prepareProviderTurnContext(handlerInput, state, lastResult),
       appendProviderRunningState: (state) => this.agentRunReactor.append(state.sessionId, [
         sessionProgressProjectionBuilder.sessionRunStateEvent({
           sessionId: state.sessionId,
@@ -1457,6 +1457,22 @@ export class SessionDriverLoop {
     this.runEngine = new RunEngine<SessionDriverLoopInput, SessionDriverLoopRunState>({
       initialize: (runInput) => this.runLifecyclePipeline.initialize(runInput),
       resume: (runInput) => this.runLifecyclePipeline.resume(runInput),
+      recoverGoalDirective: async ({ input: runInput, state, lastResult }) => {
+        const proposal = runInput.goalRecoveredProposal;
+        if (!proposal) return undefined;
+        const prepared = await this.prepareProviderTurnContext(
+          runInput,
+          state,
+          lastResult
+        );
+        state.goalEffectRuntime = runInput.goalPendingEffect;
+        return {
+          prompt: prepared.prompt,
+          lastResult: prepared.lastResult,
+          proposal,
+          directive: this.proposalRouter.route(proposal),
+        };
+      },
       shouldBuildRequirementConfirmation: (runInput) =>
         this.requirementConfirmationCoordinator.shouldBuild(runInput),
       waitForRequirementDecision: async (runInput, state) => {
@@ -1517,15 +1533,41 @@ export class SessionDriverLoop {
       assembleReview: (reviewInput) => this.acceptedPlanReviewHandoffCoordinator.handoff(
         reviewInput as AcceptedPlanReviewHandoffRunInput<SessionPlanContext>
       ),
-      settleGoalStep: async ({ input: runInput, state, outcome, reason }) => {
-        state.phase = outcome === 'suspend'
+      settleGoalStep: async ({
+        input: runInput,
+        state,
+        lastResult,
+        outcome,
+        reason,
+        proposal,
+      }) => {
+        let pendingEffect = state.goalEffectRuntime;
+        if (
+          reason === 'checkpointRequired'
+          && proposal?.kind === 'actionBundle'
+        ) {
+          pendingEffect = await this.ensureGoalEffectCandidate(state, proposal);
+          state.goalEffectRuntime = pendingEffect;
+        }
+        const settlement = goalStepSettlement({
+          result: lastResult,
+          runId: state.runId,
+          outcome,
+          reason,
+          pendingEffect,
+        });
+        state.phase = settlement.outcome === 'suspend'
           ? 'executing_accepted_plan'
           : 'completed';
         const terminal = sessionProgressProjectionBuilder.sessionRunStateEvent({
           sessionId: runInput.sessionId,
           runId: state.runId,
           phase: state.phase,
-          status: outcome === 'suspend' ? 'waiting' : 'completed',
+          status: settlement.outcome === 'suspend'
+            ? 'waiting'
+            : settlement.outcome === 'fail'
+              ? 'failed'
+              : 'completed',
           reason: 'accepted_plan_execution',
           decisionOwner: {
             kind: 'session',
@@ -1536,7 +1578,9 @@ export class SessionDriverLoop {
         });
         terminal.payload = {
           ...(objectRecord(terminal.payload) ?? {}),
-          goalStepReason: reason,
+          goalStepReason: settlement.reason,
+          ...(pendingEffect ? { goalPendingEffect: pendingEffect } : {}),
+          goalCommand: goalCommandPayload(runInput.goalContext),
         };
         return this.agentRunReactor.append(runInput.sessionId, [
           ...takeProviderCommitEvents(state),
@@ -1594,6 +1638,101 @@ export class SessionDriverLoop {
     return this.runLoopInput(input);
   }
 
+  private async prepareProviderTurnContext(
+    input: SessionDriverLoopInput,
+    state: SessionDriverLoopRunState,
+    lastResult: AgentSessionResult
+  ) {
+    const guidance = await this.admitQueuedProviderGuidance(
+      state,
+      'provider_call',
+      'contextPreparation'
+    );
+    return this.providerTurnContextCoordinator.prepare(state, {
+      contextAssemblyId: this.agentRunReactor.id('context-assembly'),
+      contractId: this.agentRunReactor.id('provider-turn-contract'),
+      inputContent: input.content,
+      projectMemoryMode: input.projectMemoryMode,
+      interventionLevel: input.interventionLevel,
+      confirmedRequirement: input.confirmedRequirement,
+      priorUserGuidance: guidance.priorGuidance,
+      lastResult: guidance.result.events.length >= lastResult.events.length
+        ? guidance.result
+        : lastResult,
+    });
+  }
+
+  private async ensureGoalEffectCandidate(
+    state: SessionDriverLoopRunState,
+    proposal: ProposalEnvelope
+  ): Promise<SessionGoalPendingEffectV1> {
+    const existing = state.goalEffectCandidates?.[proposal.proposalId];
+    if (existing) return existing;
+    if (!this.ports.appendAnalysisTimeline) {
+      throw new SessionDriverLoopError(
+        'session_analysis_timeline_unavailable',
+        'Goal effect preparation requires durable private analysis storage.'
+      );
+    }
+    const providerRequestId = `session-rule:${proposal.proposalId}`;
+    const toolCallId = `session-rule-tool:${proposal.proposalId}`;
+    const entry = semanticExchangeAnalysisEvent({
+      state,
+      requestId: providerRequestId,
+      stage: 'goal_effect_deterministic',
+      languageRevision: state.userAuthorityFrame.languagePolicy.revision,
+      providerTurnContractId: state.providerTurnFrame?.contractId
+        ?? `goal-effect-contract:${proposal.proposalId}`,
+      toolCallId,
+      proposalId: proposal.proposalId,
+      proposal,
+      toolCall: {
+        id: toolCallId,
+        name: 'session.deterministic_action',
+        arguments: {
+          proposalId: proposal.proposalId,
+        },
+      },
+      toolResult: {
+        kind: 'proposal',
+        proposalId: proposal.proposalId,
+      },
+      assistantContent: '',
+      assistantReasoning: '',
+      recordId: this.agentRunReactor.id('analysis-goal-effect'),
+      createdAt: this.agentRunReactor.ts(),
+    });
+    let acknowledgement: ProviderAnalysisTimelineAppendAck;
+    try {
+      const result = await this.ports.appendAnalysisTimeline(
+        state.sessionId,
+        [entry]
+      );
+      const violation = providerAnalysisTimelineAckViolation([entry], result);
+      if (violation || !Array.isArray(result) || result.length !== 1) {
+        throw new Error(
+          violation ?? 'analysis timeline returned no exact acknowledgement'
+        );
+      }
+      acknowledgement = result[0]!;
+    } catch (error) {
+      throw new SessionDriverLoopError(
+        'session_analysis_timeline_write_failed',
+        `Goal effect analysis append failed: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+    const candidate = goalPendingEffectFromAnalysis({
+      state,
+      proposal,
+      providerRequestId,
+      toolCallId,
+      acknowledgement,
+    });
+    state.goalEffectCandidates ??= {};
+    state.goalEffectCandidates[proposal.proposalId] = candidate;
+    return candidate;
+  }
+
   async advanceGoalStep(
     input: SessionDriverLoopInput
   ): Promise<AgentSessionResult> {
@@ -1622,30 +1761,45 @@ export class SessionDriverLoop {
         'Goal foreground advance requires an exact running Goal with a confirmed Plan and TaskLedgerV2.'
       );
     }
-    const plan = planContextIndex.findPlanCard(
-      events,
-      goal.sourceRunId,
-      goal.planId
-    );
-    if (!plan || plan.sourceEventRef !== goal.confirmedPlanRef) {
-      throw new SessionGoalError(
-        'session_goal_recovery_required',
-        `Goal ${goal.goalId} cannot reconstruct its exact confirmed Plan.`
-      );
+    const rebuilt = goalAcceptedTaskPlan(events, goal);
+    const pendingEffect = goal.checkpoint?.pendingEffect;
+    if (pendingEffect?.state === 'dispatched') {
+      return this.reconcileDispatchedGoalEffect({
+        input,
+        goal,
+        acceptedTaskPlan: {
+          ...rebuilt,
+          taskLedger: goal.taskLedger,
+        },
+        pendingEffect,
+      });
     }
-    const rebuilt = acceptedTaskPlanContextBuilder().build({
-      plan,
-      executionRoot: plan.executionRoot,
-      taskLedgerOwner: goal.taskLedger.owner,
-    });
-    if (
-      rebuilt.taskLedger.taskOrder.join('\u001f')
-      !== goal.taskLedger.taskOrder.join('\u001f')
-    ) {
-      throw new SessionGoalError(
-        'session_goal_recovery_required',
-        `Goal ${goal.goalId} TaskLedgerV2 no longer matches its confirmed Plan.`
-      );
+    let recoveredProposal: ProposalEnvelope | undefined;
+    if (pendingEffect?.state === 'prepared') {
+      if (!this.ports.loadAnalysisTimelineRecord) {
+        throw new SessionGoalError(
+          'session_goal_recovery_required',
+          'Goal effect recovery requires exact private analysis record reads.'
+        );
+      }
+      let record: ProviderAnalysisTimelineRecord;
+      try {
+        record = await this.ports.loadAnalysisTimelineRecord(
+          input.sessionId,
+          pendingEffect.semanticRef.recordId
+        );
+      } catch (error) {
+        throw new SessionGoalError(
+          'session_goal_recovery_required',
+          `Goal effect analysis record ${pendingEffect.semanticRef.recordId} is unavailable: ${error instanceof Error ? error.message : String(error)}`
+        );
+      }
+      recoveredProposal = recoverGoalProposalFromAnalysis({
+        record,
+        pendingEffect,
+        sessionId: input.sessionId,
+        runId: pendingEffect.runId,
+      });
     }
     return this.runLoopInput({
       ...input,
@@ -1656,7 +1810,626 @@ export class SessionDriverLoop {
         ...rebuilt,
         taskLedger: goal.taskLedger,
       },
+      goalPendingEffect: pendingEffect,
+      goalRecoveredProposal: recoveredProposal,
     }, 'goalStep');
+  }
+
+  async resumeGoal(input: SessionDriverLoopInput): Promise<AgentSessionResult> {
+    const context = input.goalContext;
+    if (!context || context.operation !== 'resume') {
+      throw new SessionGoalError(
+        'session_goal_request_invalid',
+        'resumeGoal requires one admitted Goal resume context.'
+      );
+    }
+    const current = exactGoalForOperation(input, 'suspended');
+    const running = withGoalCommand(
+      sessionProgressProjectionBuilder.sessionRunStateEvent({
+        sessionId: input.sessionId,
+        runId: current.sourceRunId,
+        phase: 'executing_accepted_plan',
+        status: 'running',
+        reason: 'session',
+        decisionOwner: {
+          kind: 'session',
+          runId: current.sourceRunId,
+        },
+        ts: this.agentRunReactor.ts(),
+        id: this.agentRunReactor.id('session-goal-resume-running'),
+      }),
+      context
+    );
+    const bootstrap = await this.agentRunReactor.append(
+      input.sessionId,
+      [running]
+    );
+    const refreshed = exactGoalForOperation(
+      { ...input, existingEvents: bootstrap.events },
+      'suspended'
+    );
+    const pendingEffect = refreshed.checkpoint?.pendingEffect;
+    if (pendingEffect?.state === 'dispatched') {
+      const acceptedTaskPlan = goalAcceptedTaskPlan(
+        bootstrap.events,
+        refreshed
+      );
+      const lifecycle = await this.runLifecyclePipeline.resume({
+        ...input,
+        content: refreshed.objective,
+        existingEvents: bootstrap.events,
+        appendUserMessage: false,
+        resumeResourcePackets: true,
+        acceptedTaskPlan,
+      });
+      const recoverable = await this.recoverDispatchedGoalEffectEvidence({
+        state: lifecycle.state,
+        currentResult: lifecycle.lastResult,
+        pendingEffect,
+        acceptedTaskPlan,
+      });
+      const currentAfterHydration = exactGoalForOperation(
+        { ...input, existingEvents: lifecycle.lastResult.events },
+        'suspended'
+      );
+      if (!recoverable) {
+        const checkpoint = createGoalEffectCheckpointFact({
+          sessionId: input.sessionId,
+          current: currentAfterHydration,
+          existingEvents: lifecycle.lastResult.events,
+          command: context.command,
+          pendingEffect,
+          sourceRefs: [
+            pendingEffect.kernel!.requestId,
+            currentAfterHydration.activeWaitFactRef!,
+          ],
+          ts: this.agentRunReactor.ts(),
+        });
+        const waiting = withGoalCommand(
+          sessionProgressProjectionBuilder.sessionRunStateEvent({
+            sessionId: input.sessionId,
+            runId: currentAfterHydration.sourceRunId,
+            phase: 'executing_accepted_plan',
+            status: 'waiting',
+            reason: 'accepted_plan_execution',
+            decisionOwner: {
+              kind: 'session',
+              runId: currentAfterHydration.sourceRunId,
+            },
+            ts: this.agentRunReactor.ts(),
+            id: this.agentRunReactor.id('session-goal-resume-indeterminate'),
+          }),
+          context,
+          {
+            goalStepReason: 'kernelIndeterminate',
+            goalPendingEffect: pendingEffect,
+          }
+        );
+        return this.agentRunReactor.append(input.sessionId, [
+          checkpoint,
+          waiting,
+        ]);
+      }
+      const facts = createGoalResumeFactBatch({
+        sessionId: input.sessionId,
+        current: currentAfterHydration,
+        existingEvents: lifecycle.lastResult.events,
+        command: context.command,
+        sourceRunId: currentAfterHydration.sourceRunId,
+        ts: this.agentRunReactor.ts(),
+        taskLedger: recoverable.taskLedger,
+        pendingEffect: recoverable.observed,
+        evidenceRefs: recoverable.evidenceEvents.map((event) => event.id),
+      });
+      const completed = withGoalCommand(
+        sessionProgressProjectionBuilder.sessionRunStateEvent({
+          sessionId: input.sessionId,
+          runId: currentAfterHydration.sourceRunId,
+          phase: 'completed',
+          status: 'completed',
+          reason: 'session',
+          decisionOwner: {
+            kind: 'session',
+            runId: currentAfterHydration.sourceRunId,
+          },
+          ts: this.agentRunReactor.ts(),
+          id: this.agentRunReactor.id('session-goal-resume-reconciled'),
+        }),
+        context,
+        {
+          goalStepReason: recoverable.outcome === 'failed'
+            ? 'work_unit_failed'
+            : 'kernelReconciled',
+          goalPendingEffect: recoverable.observed,
+        }
+      );
+      return this.agentRunReactor.append(input.sessionId, [
+        ...recoverable.newEvents,
+        ...facts,
+        completed,
+      ]);
+    }
+    const facts = createGoalResumeFactBatch({
+      sessionId: input.sessionId,
+      current: refreshed,
+      existingEvents: bootstrap.events,
+      command: context.command,
+      sourceRunId: refreshed.sourceRunId,
+      ts: this.agentRunReactor.ts(),
+    });
+    return this.agentRunReactor.append(input.sessionId, [
+      ...facts,
+      withGoalCommand(
+        sessionProgressProjectionBuilder.sessionRunStateEvent({
+          sessionId: input.sessionId,
+          runId: refreshed.sourceRunId,
+          phase: 'completed',
+          status: 'completed',
+          reason: 'session',
+          decisionOwner: {
+            kind: 'session',
+            runId: refreshed.sourceRunId,
+          },
+          ts: this.agentRunReactor.ts(),
+          id: this.agentRunReactor.id('session-goal-resume-completed'),
+        }),
+        context
+      ),
+    ]);
+  }
+
+  async cancelGoal(input: SessionDriverLoopInput): Promise<AgentSessionResult> {
+    const context = input.goalContext;
+    if (!context || context.operation !== 'cancel') {
+      throw new SessionGoalError(
+        'session_goal_request_invalid',
+        'cancelGoal requires one admitted Goal cancel context.'
+      );
+    }
+    const current = exactGoalForOperation(input, ['running', 'suspended']);
+    const running = sessionProgressProjectionBuilder.sessionRunStateEvent({
+      sessionId: input.sessionId,
+      runId: current.sourceRunId,
+      phase: 'executing_accepted_plan',
+      status: 'running',
+      reason: 'session',
+      decisionOwner: {
+        kind: 'session',
+        runId: current.sourceRunId,
+      },
+      ts: this.agentRunReactor.ts(),
+      id: this.agentRunReactor.id('session-goal-cancel-running'),
+    });
+    running.payload = {
+      ...(objectRecord(running.payload) ?? {}),
+      goalCommand: {
+        goalId: context.goalId,
+        goalRevision: context.goalRevision,
+        callerRequestId: context.command.callerRequestId,
+        requestDigest: context.command.requestDigest,
+        hostRunId: context.command.hostRunId,
+      },
+    };
+    const bootstrap = await this.agentRunReactor.append(
+      input.sessionId,
+      [running]
+    );
+    const refreshed = exactGoalForOperation(
+      { ...input, existingEvents: bootstrap.events },
+      ['running', 'suspended']
+    );
+    const facts = createGoalCancelFactBatch({
+      sessionId: input.sessionId,
+      current: refreshed,
+      existingEvents: bootstrap.events,
+      command: context.command,
+      sourceRunId: refreshed.sourceRunId,
+      terminalReason: 'userCancelled',
+      ts: this.agentRunReactor.ts(),
+    });
+    return this.agentRunReactor.append(input.sessionId, [
+      ...facts,
+      withGoalCommand(
+        sessionProgressProjectionBuilder.sessionRunStateEvent({
+          sessionId: input.sessionId,
+          runId: refreshed.sourceRunId,
+          phase: 'completed',
+          status: 'completed',
+          reason: 'session',
+          decisionOwner: {
+            kind: 'session',
+            runId: refreshed.sourceRunId,
+          },
+          ts: this.agentRunReactor.ts(),
+          id: this.agentRunReactor.id('session-goal-cancel-completed'),
+        }),
+        context
+      ),
+    ]);
+  }
+
+  private async persistGoalEffectDispatch(input: {
+    input: SessionDriverLoopInput;
+    state: SessionDriverLoopRunState;
+    proposal: ProposalEnvelope;
+    batch: KernelActionBatchV1;
+    requestId: string;
+    contractId: string;
+    currentResult: AgentSessionResult;
+  }): Promise<AgentSessionResult> {
+    const context = input.input.goalContext;
+    if (!context || context.operation !== 'advance') {
+      return input.currentResult;
+    }
+    const pending = input.state.goalEffectRuntime
+      ?? input.state.goalEffectCandidates?.[input.proposal.proposalId];
+    if (
+      !pending
+      || pending.state !== 'prepared'
+      || pending.runId !== input.state.runId
+      || pending.planId !== input.batch.planId
+      || pending.semanticRef.proposalId !== input.proposal.proposalId
+      || pending.semanticRef.proposalDigest
+        !== stableHash(canonicalJson(input.proposal))
+      || input.contractId !== input.batch.contractId
+    ) {
+      throw new SessionDriverLoopError(
+        'session_goal_effect_source_invalid',
+        'Goal Kernel mutation cannot cross an unprepared or mismatched semantic effect source.'
+      );
+    }
+    const current = currentOrLatestGoal(
+      reduceSessionGoals(input.state.sessionId, input.currentResult.events)
+    );
+    if (
+      !current
+      || current.goalId !== context.goalId
+      || current.goalRevision !== context.goalRevision
+      || current.lifecycle !== 'running'
+    ) {
+      throw new SessionDriverLoopError(
+        'session_goal_recovery_required',
+        'Goal Kernel mutation barrier cannot reconstruct the exact running Goal.'
+      );
+    }
+    const dispatched: SessionGoalPendingEffectV1 = {
+      ...pending,
+      state: 'dispatched',
+      kernel: {
+        requestId: input.requestId,
+        contractId: input.contractId,
+        contractHash: input.batch.contractHash,
+        workUnitIds: [],
+        kernelFactRefs: [],
+      },
+      sourceRefs: uniqueStrings([
+        ...pending.sourceRefs,
+        current.checkpointFactRef,
+        input.requestId,
+        input.contractId,
+      ]),
+    };
+    const checkpoint = createGoalEffectCheckpointFact({
+      sessionId: input.state.sessionId,
+      current,
+      existingEvents: input.currentResult.events,
+      command: context.command,
+      pendingEffect: dispatched,
+      sourceRefs: [input.requestId, input.contractId],
+      ts: this.agentRunReactor.ts(),
+    });
+    const result = await this.agentRunReactor.append(
+      input.state.sessionId,
+      [checkpoint]
+    );
+    input.state.goalEffectRuntime = dispatched;
+    return result;
+  }
+
+  private captureGoalEffectObservation(input: {
+    input: SessionDriverLoopInput;
+    state: SessionDriverLoopRunState;
+    proposal: ProposalEnvelope;
+    batch: KernelActionBatchV1;
+    requestId: string;
+    contractId: string;
+    observation: ReturnType<typeof kernelEventStatusIndex.observe>;
+    projectedKernelEvents: AgentEvent[];
+  }): void {
+    const context = input.input.goalContext;
+    const pending = input.state.goalEffectRuntime;
+    if (!context || context.operation !== 'advance' || !pending) return;
+    if (
+      pending.state !== 'dispatched'
+      || pending.kernel?.requestId !== input.requestId
+      || pending.kernel.contractId !== input.contractId
+      || pending.planId !== input.batch.planId
+      || pending.semanticRef.proposalId !== input.proposal.proposalId
+    ) {
+      throw new SessionDriverLoopError(
+        'session_goal_effect_source_invalid',
+        'Kernel observation does not match the dispatched Goal effect.'
+      );
+    }
+    const workUnitIds = kernelEventStatusIndex.workUnitIds(
+      input.observation.events
+    );
+    const kernelFactRefs = kernelTerminalProjectionRefs(
+      input.projectedKernelEvents
+    );
+    const observed = input.observation.kind === 'factsObserved'
+      && (
+        input.observation.readyForReview
+        || input.observation.hasFailureOrBlocker
+      )
+      && kernelFactRefs.length > 0;
+    input.state.goalEffectRuntime = {
+      ...pending,
+      state: observed ? 'observed' : 'dispatched',
+      kernel: {
+        ...pending.kernel,
+        workUnitIds: uniqueStrings([
+          ...pending.kernel.workUnitIds,
+          ...workUnitIds,
+        ]),
+        kernelFactRefs: observed
+          ? uniqueStrings([
+              ...pending.kernel.kernelFactRefs,
+              ...kernelFactRefs,
+            ])
+          : pending.kernel.kernelFactRefs,
+      },
+      sourceRefs: uniqueStrings([
+        ...pending.sourceRefs,
+        ...input.projectedKernelEvents.map((event) => event.id),
+      ]),
+    };
+  }
+
+  private async reconcileDispatchedGoalEffect(input: {
+    input: SessionDriverLoopInput;
+    goal: ReducedSessionGoalV1;
+    acceptedTaskPlan: AcceptedTaskPlanContext;
+    pendingEffect: SessionGoalPendingEffectV1;
+  }): Promise<AgentSessionResult> {
+    const context = input.input.goalContext;
+    const kernel = input.pendingEffect.kernel;
+    if (
+      !context
+      || context.operation !== 'advance'
+      || !kernel
+      || input.pendingEffect.state !== 'dispatched'
+    ) {
+      throw new SessionGoalError(
+        'session_goal_recovery_required',
+        'Goal effect reconciliation requires an exact dispatched effect.'
+      );
+    }
+    const lifecycle = await this.runLifecyclePipeline.resume({
+      ...input.input,
+      content: input.goal.objective,
+      appendUserMessage: false,
+      resumeResourcePackets: true,
+      acceptedTaskPlan: input.acceptedTaskPlan,
+    });
+    const state = lifecycle.state;
+    state.goalEffectRuntime = input.pendingEffect;
+    const recovered = await this.recoverDispatchedGoalEffectEvidence({
+      state,
+      currentResult: lifecycle.lastResult,
+      pendingEffect: input.pendingEffect,
+      acceptedTaskPlan: input.acceptedTaskPlan,
+    });
+    if (!recovered) {
+      return this.appendGoalReconciliationSettlement({
+        state,
+        currentResult: lifecycle.lastResult,
+        pendingEffect: input.pendingEffect,
+        outcome: 'indeterminate',
+        kernelEvents: [],
+      });
+    }
+    return this.appendGoalReconciliationSettlement({
+      state,
+      currentResult: lifecycle.lastResult,
+      pendingEffect: recovered.observed,
+      outcome: recovered.outcome,
+      kernelEvents: recovered.newEvents,
+      taskLedger: recovered.taskLedger,
+    });
+  }
+
+  private async recoverDispatchedGoalEffectEvidence(input: {
+    state: SessionDriverLoopRunState;
+    currentResult: AgentSessionResult;
+    pendingEffect: SessionGoalPendingEffectV1;
+    acceptedTaskPlan: AcceptedTaskPlanContext;
+  }): Promise<{
+    outcome: 'completed' | 'failed';
+    evidenceEvents: AgentEvent[];
+    newEvents: AgentEvent[];
+    taskLedger: AcceptedTaskPlanContext['taskLedger'];
+    observed: SessionGoalPendingEffectV1;
+  } | undefined> {
+    const kernel = input.pendingEffect.kernel;
+    if (!kernel || input.pendingEffect.state !== 'dispatched') {
+      throw new SessionGoalError(
+        'session_goal_recovery_required',
+        'Goal effect evidence recovery requires an exact dispatched effect.'
+      );
+    }
+    let auditFacts: KernelAuditEventFact[];
+    try {
+      const reply = await this.ports.kernelCommand({
+        command: {
+          kind: 'auditQuery',
+          requestId: this.agentRunReactor.id('goal-effect-audit-query'),
+          filter: {
+            runId: input.pendingEffect.runId,
+            sessionId: input.state.sessionId,
+            limit: 1_000,
+          },
+        },
+      });
+      if (!reply.ok) {
+        throw new Error(
+          reply.error?.message ?? 'Kernel audit query failed.'
+        );
+      }
+      const audit = kernelEventStatusIndex.decodeEvents(reply.events)
+        .find((event): event is Extract<KernelEventV1, {
+          kind: 'audit.query_completed';
+        }> => event.kind === 'audit.query_completed');
+      if (!audit || audit.result.truncated) {
+        throw new Error(
+          audit?.result.truncated
+            ? 'Kernel audit query was truncated.'
+            : 'Kernel returned no typed audit query result.'
+        );
+      }
+      auditFacts = audit.result.events;
+    } catch {
+      return undefined;
+    }
+    const recovered = exactGoalEffectAuditSegment(
+      auditFacts,
+      input.pendingEffect
+    );
+    if (!recovered) return undefined;
+    const rawEvents = recovered.facts.map((fact) =>
+      kernelEventFromAuditFact(fact, kernel.requestId)
+    );
+    const projected = this.agentRunReactor.projectKernelEvents(
+      input.state.sessionId,
+      {
+        ok: true,
+        events: rawEvents,
+      },
+      conversationPresentationLanguage(input.state)
+    );
+    const canonicalByIdentity = new Map(
+      input.currentResult.events.flatMap((event) => {
+        const identity = projectedKernelIdentity(event);
+        return identity ? [[identity, event] as const] : [];
+      })
+    );
+    const evidenceEvents = projected.map((event) => {
+      const identity = projectedKernelIdentity(event);
+      return identity ? canonicalByIdentity.get(identity) ?? event : event;
+    });
+    const newEvents = evidenceEvents.filter(
+      (event) => !input.currentResult.events.some(
+        (existing) => existing.id === event.id
+      )
+    );
+    const record = await this.loadGoalEffectAnalysisRecord(
+      input.state.sessionId,
+      input.pendingEffect
+    );
+    const proposal = recoverGoalProposalFromAnalysis({
+      record,
+      pendingEffect: input.pendingEffect,
+      sessionId: input.state.sessionId,
+      runId: input.pendingEffect.runId,
+    });
+    const taskLedger = recovered.outcome === 'completed'
+      ? acceptedPlanTaskLedger().recordKernelBatchProgress({
+          acceptedPlan: input.acceptedTaskPlan,
+          proposal,
+          kernelEvents: evidenceEvents,
+        }).nextAcceptedPlan.taskLedger
+      : failedGoalTaskLedger({
+          acceptedTaskPlan: input.acceptedTaskPlan,
+          evidenceEvents,
+          workUnitIds: recovered.workUnitIds,
+        });
+    const observed: SessionGoalPendingEffectV1 = {
+      ...input.pendingEffect,
+      state: 'observed',
+      kernel: {
+        ...kernel,
+        workUnitIds: recovered.workUnitIds,
+        kernelFactRefs: kernelTerminalProjectionRefs(evidenceEvents),
+      },
+      sourceRefs: uniqueStrings([
+        ...input.pendingEffect.sourceRefs,
+        ...evidenceEvents.map((event) => event.id),
+      ]),
+    };
+    return {
+      outcome: recovered.outcome,
+      evidenceEvents,
+      newEvents,
+      taskLedger,
+      observed,
+    };
+  }
+
+  private async loadGoalEffectAnalysisRecord(
+    sessionId: string,
+    pendingEffect: SessionGoalPendingEffectV1
+  ): Promise<ProviderAnalysisTimelineRecord> {
+    if (!this.ports.loadAnalysisTimelineRecord) {
+      throw new SessionGoalError(
+        'session_goal_recovery_required',
+        'Goal effect recovery requires exact private analysis record reads.'
+      );
+    }
+    try {
+      return await this.ports.loadAnalysisTimelineRecord(
+        sessionId,
+        pendingEffect.semanticRef.recordId
+      );
+    } catch (error) {
+      throw new SessionGoalError(
+        'session_goal_recovery_required',
+        `Goal effect analysis record ${pendingEffect.semanticRef.recordId} is unavailable: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  }
+
+  private async appendGoalReconciliationSettlement(input: {
+    state: SessionDriverLoopRunState;
+    currentResult: AgentSessionResult;
+    pendingEffect: SessionGoalPendingEffectV1;
+    outcome: 'completed' | 'failed' | 'indeterminate';
+    kernelEvents: AgentEvent[];
+    taskLedger?: AcceptedTaskPlanContext['taskLedger'];
+  }): Promise<AgentSessionResult> {
+    const waiting = input.outcome === 'indeterminate';
+    const failed = input.outcome === 'failed';
+    const terminal = sessionProgressProjectionBuilder.sessionRunStateEvent({
+      sessionId: input.state.sessionId,
+      runId: input.state.runId,
+      phase: waiting
+        ? 'executing_accepted_plan'
+        : failed
+          ? 'failed'
+          : 'completed',
+      status: waiting ? 'waiting' : failed ? 'failed' : 'completed',
+      reason: 'accepted_plan_execution',
+      decisionOwner: {
+        kind: 'session',
+        runId: input.state.runId,
+      },
+      ts: this.agentRunReactor.ts(),
+      id: this.agentRunReactor.id('session-goal-effect-reconciled'),
+    });
+    terminal.payload = {
+      ...(objectRecord(terminal.payload) ?? {}),
+      goalStepReason: waiting
+        ? 'kernelIndeterminate'
+        : failed
+          ? 'work_unit_failed'
+          : 'kernelReconciled',
+      goalPendingEffect: input.pendingEffect,
+      ...(input.taskLedger ? { taskLedger: input.taskLedger } : {}),
+    };
+    input.state.goalEffectRuntime = input.pendingEffect;
+    return this.agentRunReactor.append(input.state.sessionId, [
+      ...input.kernelEvents,
+      terminal,
+    ]);
   }
 
   private async appendSemanticDirectiveAdmission(
@@ -2010,7 +2783,7 @@ export class SessionDriverLoop {
     toolCall: NativeToolCallProposal,
     result: unknown,
     preserveActiveContinuation: boolean,
-    proposalId?: string
+    proposal?: ProposalEnvelope
   ): Promise<void> {
     const profileId = this.providerProfileRegistry.profileForFrame(state.providerTurnFrame).id;
     const protocolToolCall = {
@@ -2178,7 +2951,8 @@ export class SessionDriverLoop {
           model: turn.model,
           promptLedgerEpochId: epochId,
           toolCallId: toolCall.callId,
-          proposalId,
+          proposalId: proposal?.proposalId,
+          proposal,
           toolCall: replayToolCall,
           toolResult: result,
           assistantContent: preserveActiveContinuation
@@ -2202,6 +2976,21 @@ export class SessionDriverLoop {
           if (violation) {
             throw new Error(violation);
           }
+        }
+        if (
+          proposal?.kind === 'actionBundle'
+          && Array.isArray(analysisResult)
+          && analysisResult.length === 1
+        ) {
+          state.goalEffectCandidates ??= {};
+          state.goalEffectCandidates[proposal.proposalId] =
+            goalPendingEffectFromAnalysis({
+              state,
+              proposal,
+              providerRequestId,
+              toolCallId: toolCall.callId,
+              acknowledgement: analysisResult[0]!,
+            });
         }
       } catch (error) {
         throw new SessionDriverLoopError(
@@ -2677,6 +3466,495 @@ export class SessionDriverLoop {
       }
     }
   }
+}
+
+function goalPendingEffectFromAnalysis(input: {
+  state: SessionDriverLoopRunState;
+  proposal: ProposalEnvelope;
+  providerRequestId: string;
+  toolCallId: string;
+  acknowledgement: ProviderAnalysisTimelineAppendAck;
+}): SessionGoalPendingEffectV1 {
+  const accepted = input.state.acceptedTaskPlan;
+  const taskId = input.state.currentTaskContext?.taskId;
+  const actionIds = proposalActionIds(input.proposal);
+  if (
+    !accepted?.planId
+    || !taskId
+    || actionIds.length === 0
+  ) {
+    throw new SessionDriverLoopError(
+      'session_goal_effect_source_invalid',
+      `Goal action ${input.proposal.proposalId} has no exact Plan, task or action identity.`
+    );
+  }
+  const proposalDigest = stableHash(canonicalJson(input.proposal));
+  const effectId =
+    `goal-effect-${
+      stableHash(`${input.proposal.proposalId}:${input.acknowledgement.recordDigest}`)
+        .replace(/^[^:]+:/, '')
+    }`;
+  return {
+    schemaVersion: 'deepcode.session.pending-effect.v1',
+    effectId,
+    kind: 'kernelAction',
+    state: 'prepared',
+    semanticRef: {
+      schemaVersion: 'deepcode.session.analysis-record-ref.v1',
+      recordId: input.acknowledgement.recordId,
+      analysisSeq: input.acknowledgement.analysisSeq,
+      recordDigest: input.acknowledgement.recordDigest,
+      payloadDigest: input.acknowledgement.payloadDigest,
+      providerRequestId: input.providerRequestId,
+      toolCallId: input.toolCallId,
+      proposalId: input.proposal.proposalId,
+      proposalDigest,
+    },
+    runId: input.proposal.runId,
+    planId: accepted.planId,
+    taskId,
+    actionIds,
+    sourceRefs: [
+      input.acknowledgement.recordId,
+      input.state.userAuthorityFrame.turnAuthorityRef,
+    ],
+  };
+}
+
+function goalAcceptedTaskPlan(
+  events: readonly AgentEvent[],
+  goal: ReducedSessionGoalV1
+): AcceptedTaskPlanContext {
+  if (
+    !goal.planId
+    || !goal.confirmedPlanRef
+    || !goal.taskLedger
+  ) {
+    throw new SessionGoalError(
+      'session_goal_recovery_required',
+      `Goal ${goal.goalId} has no confirmed Plan or TaskLedgerV2 source.`
+    );
+  }
+  const plan = planContextIndex.findPlanCard(
+    [...events],
+    goal.sourceRunId,
+    goal.planId
+  );
+  if (!plan || plan.sourceEventRef !== goal.confirmedPlanRef) {
+    throw new SessionGoalError(
+      'session_goal_recovery_required',
+      `Goal ${goal.goalId} cannot reconstruct its exact confirmed Plan.`
+    );
+  }
+  const rebuilt = acceptedTaskPlanContextBuilder().build({
+    plan,
+    executionRoot: plan.executionRoot,
+    taskLedgerOwner: goal.taskLedger.owner,
+  });
+  if (
+    rebuilt.taskLedger.taskOrder.join('\u001f')
+    !== goal.taskLedger.taskOrder.join('\u001f')
+  ) {
+    throw new SessionGoalError(
+      'session_goal_recovery_required',
+      `Goal ${goal.goalId} TaskLedgerV2 no longer matches its confirmed Plan.`
+    );
+  }
+  return {
+    ...rebuilt,
+    taskLedger: goal.taskLedger,
+  };
+}
+
+function goalCommandPayload(
+  context: SessionDriverLoopInput['goalContext']
+): {
+  goalId: string;
+  goalRevision: number;
+  callerRequestId: string;
+  requestDigest: string;
+  hostRunId: string;
+} {
+  if (!context) {
+    throw new SessionGoalError(
+      'session_goal_request_invalid',
+      'Goal run settlement requires an admitted Goal command.'
+    );
+  }
+  const hostRunId = context.command.hostRunId?.trim();
+  if (!hostRunId) {
+    throw new SessionGoalError(
+      'session_goal_request_invalid',
+      'Goal run settlement requires an exact Host run identity.'
+    );
+  }
+  return {
+    goalId: context.goalId,
+    goalRevision: context.goalRevision,
+    callerRequestId: context.command.callerRequestId,
+    requestDigest: context.command.requestDigest,
+    hostRunId,
+  };
+}
+
+function withGoalCommand(
+  event: AgentEvent,
+  context: SessionDriverLoopInput['goalContext'],
+  extra: Record<string, unknown> = {}
+): AgentEvent {
+  event.payload = {
+    ...(objectRecord(event.payload) ?? {}),
+    ...extra,
+    goalCommand: goalCommandPayload(context),
+  };
+  return event;
+}
+
+function exactGoalForOperation(
+  input: SessionDriverLoopInput,
+  lifecycle: 'running' | 'suspended' | readonly ('running' | 'suspended')[]
+): ReducedSessionGoalV1 {
+  const context = input.goalContext;
+  const allowed = Array.isArray(lifecycle) ? lifecycle : [lifecycle];
+  const current = currentOrLatestGoal(
+    reduceSessionGoals(input.sessionId, input.existingEvents ?? [])
+  );
+  if (
+    !context
+    || !current
+    || current.goalId !== context.goalId
+    || current.goalRevision !== context.goalRevision
+    || !allowed.includes(current.lifecycle as 'running' | 'suspended')
+  ) {
+    throw new SessionGoalError(
+      'session_goal_lifecycle_conflict',
+      `Goal operation requires the exact ${allowed.join(' or ')} Goal revision.`
+    );
+  }
+  return current;
+}
+
+function recoverGoalProposalFromAnalysis(input: {
+  record: ProviderAnalysisTimelineRecord;
+  pendingEffect: SessionGoalPendingEffectV1;
+  sessionId: string;
+  runId: string;
+}): ProposalEnvelope {
+  const { record, pendingEffect } = input;
+  const semantic = pendingEffect.semanticRef;
+  const payload = objectRecord(record.payload);
+  const refs = objectRecord(payload?.sourceRefs);
+  const source = objectRecord(refs?.semantic);
+  const proposal = objectRecord(payload?.proposal);
+  if (
+    record.schemaVersion !== 'deepcode.session.provider-analysis.v1'
+    || record.kind !== 'semantic_exchange'
+    || record.completion !== 'complete'
+    || record.sessionId !== input.sessionId
+    || record.runId !== input.runId
+    || record.recordId !== semantic.recordId
+    || record.analysisSeq !== semantic.analysisSeq
+    || record.recordDigest !== semantic.recordDigest
+    || record.payloadDigest !== semantic.payloadDigest
+    || record.requestId !== semantic.providerRequestId
+    || payload?.phase !== 'completed'
+    || source?.analysisRecordId !== semantic.recordId
+    || source?.providerRequestId !== semantic.providerRequestId
+    || source?.toolCallId !== semantic.toolCallId
+    || source?.proposalId !== semantic.proposalId
+    || !proposal
+    || proposal.schemaVersion !== 'deepcode.agent.protocol.v4'
+    || proposal.kind !== 'actionBundle'
+    || proposal.proposalId !== semantic.proposalId
+    || proposal.sessionId !== input.sessionId
+    || proposal.runId !== pendingEffect.runId
+    || stableHash(canonicalJson(proposal)) !== semantic.proposalDigest
+  ) {
+    throw new SessionGoalError(
+      'session_goal_recovery_required',
+      `Goal effect ${pendingEffect.effectId} cannot recover its exact semantic proposal.`
+    );
+  }
+  const recovered = structuredClone(proposal as unknown as ProposalEnvelope);
+  const actionIds = proposalActionIds(recovered);
+  if (
+    actionIds.length !== pendingEffect.actionIds.length
+    || actionIds.some((actionId, index) =>
+      actionId !== pendingEffect.actionIds[index]
+    )
+  ) {
+    throw new SessionGoalError(
+      'session_goal_recovery_required',
+      `Goal effect ${pendingEffect.effectId} action identity no longer matches its checkpoint.`
+    );
+  }
+  return recovered;
+}
+
+function proposalActionIds(proposal: ProposalEnvelope): string[] {
+  const payload = objectRecord(proposal.payload);
+  const actionBundle = objectRecord(payload?.actionBundle);
+  const rawActions = Array.isArray(actionBundle?.actions)
+    ? actionBundle.actions
+    : Array.isArray(payload?.actions)
+      ? payload.actions
+      : [];
+  const actionIds = rawActions.flatMap((value) => {
+    const actionId = stringValue(objectRecord(value)?.actionId);
+    return actionId ? [actionId] : [];
+  });
+  if (actionIds.length !== rawActions.length) return [];
+  return actionIds;
+}
+
+function goalStepSettlement(input: {
+  result: AgentSessionResult;
+  runId: string;
+  outcome: 'continue' | 'suspend' | 'complete' | 'fail';
+  reason: string;
+  pendingEffect?: SessionGoalPendingEffectV1;
+}): {
+  outcome: 'continue' | 'suspend' | 'complete' | 'fail';
+  reason: string;
+} {
+  const runState = [...input.result.events].reverse().find((event) => {
+    if (event.kind !== 'session_run_state') return false;
+    return stringValue(objectRecord(event.payload)?.runId) === input.runId;
+  });
+  const payload = objectRecord(runState?.payload);
+  const phase = stringValue(payload?.phase);
+  const status = stringValue(payload?.status);
+  if (input.pendingEffect?.state === 'dispatched') {
+    return {
+      outcome: 'suspend',
+      reason: phase === 'waiting_permission' || stringValue(payload?.reason) === 'permission'
+        ? 'permission'
+        : 'kernelIndeterminate',
+    };
+  }
+  if (status === 'waiting') {
+    return {
+      outcome: 'suspend',
+      reason: normalizedGoalWaitReason(
+        phase,
+        stringValue(payload?.reason) ?? input.reason
+      ),
+    };
+  }
+  if (status === 'failed' || status === 'cancelled') {
+    return {
+      outcome: 'fail',
+      reason: stringValue(payload?.reason) ?? input.reason,
+    };
+  }
+  return {
+    outcome: input.outcome,
+    reason: input.reason,
+  };
+}
+
+function normalizedGoalWaitReason(
+  phase: string | undefined,
+  reason: string
+): string {
+  if (phase === 'waiting_permission') return 'permission';
+  if (phase === 'waiting_review') return 'review';
+  if (phase === 'waiting_requirement_confirmation') return 'requirement';
+  if (phase === 'waiting_plan_review') return 'plan_review';
+  return reason;
+}
+
+function kernelTerminalProjectionRefs(events: readonly AgentEvent[]): string[] {
+  const terminalKinds = new Set([
+    'work_unit.completed',
+    'work_unit.failed',
+    'work_unit.blocked',
+    'batch.review_ready',
+    'tool.effect_observed',
+    'tool.outcome_indeterminate',
+  ]);
+  return events.flatMap((event) => {
+    const kernel = objectRecord(objectRecord(event.payload)?.kernelEvent);
+    return terminalKinds.has(String(kernel?.kind)) ? [event.id] : [];
+  });
+}
+
+function exactGoalEffectAuditSegment(
+  facts: readonly KernelAuditEventFact[],
+  pendingEffect: SessionGoalPendingEffectV1
+): {
+  facts: KernelAuditEventFact[];
+  workUnitIds: string[];
+  outcome: 'completed' | 'failed';
+} | undefined {
+  const kernel = pendingEffect.kernel;
+  if (!kernel || pendingEffect.state !== 'dispatched') return undefined;
+  const actionIds = new Set(pendingEffect.actionIds);
+  const queued = facts.filter((fact) => {
+    if (fact.kind !== 'work_unit.queued') return false;
+    const workUnit = objectRecord(objectRecord(fact.payload)?.workUnit);
+    return stringValue(workUnit?.planId) === pendingEffect.planId
+      && actionIds.has(stringValue(workUnit?.actionId) ?? '');
+  });
+  if (queued.length !== pendingEffect.actionIds.length) return undefined;
+  const queuedByAction = new Map<string, KernelAuditEventFact>();
+  const workUnitIds: string[] = [];
+  for (const fact of queued) {
+    const workUnit = objectRecord(objectRecord(fact.payload)?.workUnit);
+    const actionId = stringValue(workUnit?.actionId);
+    const workUnitId = stringValue(workUnit?.id);
+    if (
+      !actionId
+      || !workUnitId
+      || queuedByAction.has(actionId)
+      || !positiveSequence(fact.sequence)
+    ) {
+      return undefined;
+    }
+    queuedByAction.set(actionId, fact);
+    workUnitIds.push(workUnitId);
+  }
+  if (pendingEffect.actionIds.some((actionId) => !queuedByAction.has(actionId))) {
+    return undefined;
+  }
+  const terminalByWorkUnit = new Map<string, KernelAuditEventFact>();
+  for (const fact of facts) {
+    if (
+      fact.kind !== 'work_unit.completed'
+      && fact.kind !== 'work_unit.failed'
+      && fact.kind !== 'work_unit.blocked'
+    ) {
+      continue;
+    }
+    const workUnitId = stringValue(objectRecord(fact.payload)?.workUnitId);
+    if (!workUnitId || !workUnitIds.includes(workUnitId)) continue;
+    if (
+      terminalByWorkUnit.has(workUnitId)
+      || !positiveSequence(fact.sequence)
+    ) {
+      return undefined;
+    }
+    terminalByWorkUnit.set(workUnitId, fact);
+  }
+  if (workUnitIds.some((workUnitId) => !terminalByWorkUnit.has(workUnitId))) {
+    return undefined;
+  }
+  const ready = facts.filter((fact) => {
+    return fact.kind === 'batch.review_ready'
+      && stringValue(objectRecord(fact.payload)?.contractId)
+        === kernel.contractId
+      && positiveSequence(fact.sequence);
+  });
+  const terminalFacts = workUnitIds.map(
+    (workUnitId) => terminalByWorkUnit.get(workUnitId)!
+  );
+  const completed = terminalFacts.every(
+    (fact) => fact.kind === 'work_unit.completed'
+  );
+  if (
+    (completed && ready.length !== 1)
+    || (!completed && ready.length > 1)
+    || (
+      ready.length === 1
+      && terminalFacts.some((fact) => fact.sequence! >= ready[0]!.sequence!)
+    )
+  ) {
+    return undefined;
+  }
+  return {
+    facts: [...queued, ...terminalFacts, ...ready]
+      .sort((left, right) => left.sequence! - right.sequence!),
+    workUnitIds,
+    outcome: completed ? 'completed' : 'failed',
+  };
+}
+
+function kernelEventFromAuditFact(
+  fact: KernelAuditEventFact,
+  requestId: string
+): KernelEventV1 {
+  const payload = objectRecord(fact.payload) ?? {};
+  return {
+    ...payload,
+    kind: fact.kind,
+    requestId,
+    runId: fact.runId,
+    sessionId: fact.sessionId,
+    sequence: fact.sequence,
+  } as KernelEventV1;
+}
+
+function projectedKernelIdentity(event: AgentEvent): string | undefined {
+  const kernel = objectRecord(objectRecord(event.payload)?.kernelEvent);
+  const kind = stringValue(kernel?.kind);
+  const runId = stringValue(kernel?.runId);
+  const sequence = kernel?.sequence;
+  return kind && runId && positiveSequence(sequence)
+    ? `${runId}\u001f${sequence}\u001f${kind}`
+    : undefined;
+}
+
+function positiveSequence(value: unknown): value is number {
+  return typeof value === 'number'
+    && Number.isSafeInteger(value)
+    && value > 0;
+}
+
+function uniqueStrings(
+  values: readonly (string | undefined)[]
+): string[] {
+  return [...new Set(values.flatMap((value) => {
+    const normalized = value?.trim();
+    return normalized ? [normalized] : [];
+  }))];
+}
+
+function failedGoalTaskLedger(input: {
+  acceptedTaskPlan: AcceptedTaskPlanContext;
+  evidenceEvents: readonly AgentEvent[];
+  workUnitIds: readonly string[];
+}): AcceptedTaskPlanContext['taskLedger'] {
+  const taskId = input.acceptedTaskPlan.taskLedger.currentTaskId;
+  if (!taskId) {
+    throw new SessionGoalError(
+      'session_task_ledger_transition_invalid',
+      'Kernel failure reconciliation has no exact active TaskLedgerV2 entry.'
+    );
+  }
+  const allowedWorkUnits = new Set(input.workUnitIds);
+  const kernelFactRefs = input.evidenceEvents.flatMap((event) => {
+    try {
+      const ref = kernelFactRefFromEvent({
+        event,
+        boundRunId: input.acceptedTaskPlan.runId,
+      });
+      return (
+        (ref.kind === 'work_unit.failed' || ref.kind === 'work_unit.blocked')
+        && Boolean(ref.workUnitId)
+        && allowedWorkUnits.has(ref.workUnitId!)
+      )
+        ? [ref]
+        : [];
+    } catch {
+      return [];
+    }
+  });
+  if (kernelFactRefs.length === 0) {
+    throw new SessionGoalError(
+      'session_goal_recovery_required',
+      'Kernel failure reconciliation has no exact failed or blocked WorkUnit fact.'
+    );
+  }
+  return failTaskLedgerV2({
+    ledger: input.acceptedTaskPlan.taskLedger,
+    taskId,
+    failure: {
+      kind: 'kernelFacts',
+      reason: 'Kernel reported terminal failed or blocked WorkUnit facts.',
+      kernelFactRefs,
+    },
+    sourceRefs: kernelFactRefs.map((ref) => ref.kernelEventRef),
+  });
 }
 
 function exactSemanticProviderRequestId(

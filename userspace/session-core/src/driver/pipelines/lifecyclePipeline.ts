@@ -498,6 +498,8 @@ export class RunLifecyclePipeline<State extends RunLifecycleState> {
       lastProviderResponseRequestId: undefined,
       pendingProviderCommitEvents: [],
       providerCommitDeferred: false,
+      goalEffectCandidates: {},
+      goalEffectRuntime: undefined,
       phase: 'context_reading',
       workspaceScopeKey: manifestBuild.manifest.workspaceScopeKey,
       workspaceBinding: input.workspaceBinding,

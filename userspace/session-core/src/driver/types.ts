@@ -12,6 +12,7 @@ import type {
   LlmChatResult,
   LlmChatStreamEvent,
   ProjectionDelta,
+  SessionGoalPendingEffectV1,
   SessionProviderAdmissionMetadataV1,
 } from '@deepcode/protocol';
 import type { ProjectWorkingDirectory } from '../context/types.js';
@@ -32,6 +33,7 @@ import type { PromptLedgerWireRecord } from '../prompt/promptLedger.js';
 import type {
   ProviderAnalysisTimelineAppendResult,
   ProviderAnalysisTimelineEvent,
+  ProviderAnalysisTimelineRecord,
 } from '../provider/ProviderAnalysisTimeline.js';
 import type { SessionGoalOperationContext } from '../goal/index.js';
 
@@ -109,6 +111,10 @@ export interface SessionDriverLoopPorts {
     sessionId: string,
     entries: ProviderAnalysisTimelineEvent[]
   ) => Promise<ProviderAnalysisTimelineAppendResult>;
+  loadAnalysisTimelineRecord?: (
+    sessionId: string,
+    recordId: string
+  ) => Promise<ProviderAnalysisTimelineRecord>;
   registerProviderAdmission?: (
     sessionId: string,
     metadata: SessionProviderAdmissionMetadataV1
@@ -160,6 +166,10 @@ export interface SessionDriverLoopInput {
   hostLanguage?: ConversationLanguage;
   bootstrapEvents?: AgentEvent[];
   goalContext?: SessionGoalOperationContext;
+  /** Internal recovery input; never accepted directly from Host JSON. */
+  goalPendingEffect?: SessionGoalPendingEffectV1;
+  /** Recovered from the exact private analysis record referenced by goalPendingEffect. */
+  goalRecoveredProposal?: ProposalEnvelope;
 }
 
 export interface SessionDecisionResolverInput {

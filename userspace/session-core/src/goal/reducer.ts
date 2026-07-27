@@ -4,6 +4,7 @@ import type {
   SessionGoalActiveWaitV1,
   SessionGoalFactPayloadV1,
   SessionGoalLifecycleV1,
+  SessionGoalPendingEffectV1,
 } from '@deepcode/protocol';
 import {
   SessionGoalError,
@@ -14,6 +15,10 @@ import {
   parseTaskLedgerV2,
   taskLedgerAllSettled,
 } from '../run-state/taskLedger.js';
+import {
+  parseGoalCheckpoint,
+} from './checkpoint.js';
+import { canonicalJson, sha256Hash } from '../cache/canonicalizer.js';
 
 const GOAL_FACT_SCHEMA = 'deepcode.session.goal-fact.v1';
 
@@ -23,6 +28,7 @@ export function reduceSessionGoals(
 ): ReducedSessionGoalV1[] {
   const goals: ReducedSessionGoalV1[] = [];
   let current: ReducedSessionGoalV1 | undefined;
+  let lastCheckpointSequence = 0;
 
   for (const event of events) {
     if (event.kind !== 'session_goal_fact') continue;
@@ -79,6 +85,35 @@ export function reduceSessionGoals(
       continue;
     }
 
+    if (
+      current
+      && terminalLifecycle(current.lifecycle)
+      && payload.factKind === 'checkpoint'
+    ) {
+      assertSameGoal(current, payload, event.id);
+      assertStableObjective(current, payload, event.id);
+      const checkpoint = parseAndValidateCheckpoint(
+        current,
+        payload.checkpoint,
+        event.id,
+        lastCheckpointSequence
+      );
+      if (
+        checkpoint.lifecycle !== current.lifecycle
+        || !current.terminalFactRef
+        || !payload.sourceRefs.includes(current.terminalFactRef)
+      ) {
+        throw new SessionGoalError(
+          'session_goal_recovery_required',
+          `Terminal Goal checkpoint ${event.id} is not bound to its exact terminal fact.`
+        );
+      }
+      current.checkpoint = checkpoint;
+      current.checkpointFactRef = event.id;
+      current.facts.push({ event, payload });
+      lastCheckpointSequence = checkpoint.sequence;
+      continue;
+    }
     if (!current || terminalLifecycle(current.lifecycle)) {
       throw new SessionGoalError(
         'session_goal_recovery_required',
@@ -158,7 +193,8 @@ export function reduceSessionGoals(
         if (
           current.lifecycle !== 'suspended'
           || !current.activeWait
-          || payload.checkpointRef !== current.activeWait.waitId
+          || !current.checkpoint
+          || payload.checkpointRef !== current.checkpoint.checkpointRef
         ) {
           invalidTransition(current, event, payload.lifecycle);
         }
@@ -207,6 +243,8 @@ export function reduceSessionGoals(
         current.terminalReason = payload.terminalReason;
         current.terminalFactRef = event.id;
         current.waitRef = undefined;
+        current.activeWait = undefined;
+        current.activeWaitFactRef = undefined;
         break;
       }
       case 'taskLedger': {
@@ -284,6 +322,15 @@ export function reduceSessionGoals(
         if (payload.lifecycle !== current.lifecycle) {
           invalidTransition(current, event, payload.lifecycle);
         }
+        const checkpoint = parseAndValidateCheckpoint(
+          current,
+          payload.checkpoint,
+          event.id,
+          lastCheckpointSequence
+        );
+        current.checkpoint = checkpoint;
+        current.checkpointFactRef = event.id;
+        lastCheckpointSequence = checkpoint.sequence;
         break;
       }
       default:
@@ -292,6 +339,135 @@ export function reduceSessionGoals(
     current.facts.push({ event, payload });
   }
   return goals;
+}
+
+function parseAndValidateCheckpoint(
+  goal: ReducedSessionGoalV1,
+  value: unknown,
+  eventId: string,
+  lastCheckpointSequence: number
+) {
+  const checkpoint = parseGoalCheckpoint(value, eventId);
+  if (
+    checkpoint.sessionId !== goal.sessionId
+    || checkpoint.goalId !== goal.goalId
+    || checkpoint.goalRevision !== goal.goalRevision
+    || checkpoint.sequence !== lastCheckpointSequence + 1
+    || !goal.taskLedger
+    || !goal.taskLedgerFactRef
+    || checkpoint.taskLedgerRef.factRef !== goal.taskLedgerFactRef
+    || checkpoint.taskLedgerRef.revision !== goal.taskLedger.revision
+    || checkpoint.taskLedgerRef.stateDigest
+      !== sha256Hash(canonicalJson(goal.taskLedger))
+  ) {
+    throw new SessionGoalError(
+      'session_goal_recovery_required',
+      `Goal checkpoint ${eventId} does not match its exact Goal, sequence or TaskLedgerV2 source.`
+    );
+  }
+  if (
+    goal.checkpointFactRef
+    && !checkpoint.sourceRefs.includes(goal.checkpointFactRef)
+  ) {
+    throw new SessionGoalError(
+      'session_goal_recovery_required',
+      `Goal checkpoint ${eventId} does not extend the prior checkpoint fact.`
+    );
+  }
+  if (
+    goal.activeWait
+      ? (
+          checkpoint.activeWaitRef?.factRef !== goal.activeWaitFactRef
+          || checkpoint.activeWaitRef?.waitId !== goal.activeWait.waitId
+        )
+      : checkpoint.activeWaitRef !== undefined
+  ) {
+    throw new SessionGoalError(
+      'session_goal_recovery_required',
+      `Goal checkpoint ${eventId} does not bind the exact ActiveWait state.`
+    );
+  }
+  assertPendingEffectTransition(
+    goal.checkpoint?.pendingEffect,
+    checkpoint.pendingEffect,
+    eventId
+  );
+  return checkpoint;
+}
+
+function assertPendingEffectTransition(
+  previous: SessionGoalPendingEffectV1 | undefined,
+  next: SessionGoalPendingEffectV1 | undefined,
+  eventId: string
+): void {
+  if (!previous) {
+    if (next && next.state !== 'prepared') {
+      throw new SessionGoalError(
+        'session_goal_recovery_required',
+        `Goal checkpoint ${eventId} introduced a non-prepared effect.`
+      );
+    }
+    return;
+  }
+  if (!next) {
+    if (previous.state !== 'observed') {
+      throw new SessionGoalError(
+        'session_goal_recovery_required',
+        `Goal checkpoint ${eventId} discarded an unobserved pending effect.`
+      );
+    }
+    return;
+  }
+  if (previous.effectId !== next.effectId) {
+    if (previous.state !== 'observed' || next.state !== 'prepared') {
+      throw new SessionGoalError(
+        'session_goal_recovery_required',
+        `Goal checkpoint ${eventId} replaced an unsettled effect identity.`
+      );
+    }
+    return;
+  }
+  if (
+    previous.runId !== next.runId
+    || previous.planId !== next.planId
+    || previous.taskId !== next.taskId
+    || canonicalJson(previous.semanticRef) !== canonicalJson(next.semanticRef)
+    || canonicalJson(previous.actionIds) !== canonicalJson(next.actionIds)
+    || previous.sourceRefs.some((sourceRef) =>
+      !next.sourceRefs.includes(sourceRef)
+    )
+  ) {
+    throw new SessionGoalError(
+      'session_goal_recovery_required',
+      `Goal checkpoint ${eventId} changed immutable effect authority or removed source evidence.`
+    );
+  }
+  const rank = { prepared: 0, dispatched: 1, observed: 2 } as const;
+  if (rank[next.state] < rank[previous.state]) {
+    throw new SessionGoalError(
+      'session_goal_recovery_required',
+      `Goal checkpoint ${eventId} regressed effect ${next.effectId}.`
+    );
+  }
+  if (previous.kernel) {
+    if (
+      !next.kernel
+      || previous.kernel.requestId !== next.kernel.requestId
+      || previous.kernel.contractId !== next.kernel.contractId
+      || previous.kernel.contractHash !== next.kernel.contractHash
+      || previous.kernel.workUnitIds.some((workUnitId) =>
+        !next.kernel!.workUnitIds.includes(workUnitId)
+      )
+      || previous.kernel.kernelFactRefs.some((factRef) =>
+        !next.kernel!.kernelFactRefs.includes(factRef)
+      )
+    ) {
+      throw new SessionGoalError(
+        'session_goal_recovery_required',
+        `Goal checkpoint ${eventId} changed or removed dispatched Kernel effect evidence.`
+      );
+    }
+  }
 }
 
 function createGoalTaskLedger(

@@ -254,7 +254,15 @@ export function buildGoalProjection(
             value: null,
           }
         : { status: 'notAvailable' },
-    checkpoint: { status: 'notAvailable' },
+    checkpoint: goal.checkpoint
+      ? {
+          status: 'available',
+          value: {
+            sequence: goal.checkpoint.sequence,
+            checkpointRef: goal.checkpoint.checkpointRef,
+          },
+        }
+      : { status: 'notAvailable' },
     executionBudget: goal.executionBudget
       ? {
           status: 'available',

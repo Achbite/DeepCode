@@ -190,6 +190,25 @@ export interface AcceptedPlanActionProposalSubmitterPorts<
     batch: KernelActionBatchV1;
     batchEvents: unknown[];
   }): Promise<AgentEvent[]>;
+  beforeKernelMutation?(input: {
+    input: Input;
+    state: State;
+    proposal: ProposalEnvelope;
+    batch: KernelActionBatchV1;
+    requestId: string;
+    contractId: string;
+    currentResult: AgentSessionResult;
+  }): Promise<AgentSessionResult>;
+  afterKernelObservation?(input: {
+    input: Input;
+    state: State;
+    proposal: ProposalEnvelope;
+    batch: KernelActionBatchV1;
+    requestId: string;
+    contractId: string;
+    observation: KernelReplyObservation;
+    projectedKernelEvents: AgentEvent[];
+  }): void | Promise<void>;
 }
 
 export class AcceptedPlanActionProposalSubmitter<
@@ -374,10 +393,24 @@ export class AcceptedPlanActionProposalSubmitter<
       },
     } as ProjectionDelta);
 
+    const actionRequestId = this.ports.createId(
+      'accepted-plan-action-batch-submit'
+    );
+    if (this.ports.beforeKernelMutation) {
+      result = await this.ports.beforeKernelMutation({
+        input,
+        state,
+        proposal,
+        batch,
+        requestId: actionRequestId,
+        contractId,
+        currentResult: result,
+      });
+    }
     const observed = await this.ports.observeKernel({
       command: {
         kind: 'actionBatchSubmit',
-        requestId: this.ports.createId('accepted-plan-action-batch-submit'),
+        requestId: actionRequestId,
         runId: state.runId,
         sessionId: state.sessionId,
         batch,
@@ -392,6 +425,16 @@ export class AcceptedPlanActionProposalSubmitter<
       conversationPresentationLanguage(state)
     ) ?? result;
     const projectedKernelEvents = result.events.slice(projectionStart);
+    await this.ports.afterKernelObservation?.({
+      input,
+      state,
+      proposal,
+      batch,
+      requestId: actionRequestId,
+      contractId,
+      observation: observed,
+      projectedKernelEvents,
+    });
     if (observed.kind === 'commandFailed') {
       const message = kernelReplyErrorMessage(batchReply, 'Kernel actionBatchSubmit failed');
       const code = observed.code;

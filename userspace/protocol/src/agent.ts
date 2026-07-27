@@ -697,6 +697,72 @@ export interface ExecutionBudgetCoreV1 {
   sourceRefs: string[];
 }
 
+export interface SessionGoalAnalysisRecordRefV1 {
+  schemaVersion: 'deepcode.session.analysis-record-ref.v1';
+  recordId: string;
+  analysisSeq: number;
+  recordDigest: string;
+  payloadDigest: string;
+  providerRequestId: string;
+  toolCallId: string;
+  proposalId: string;
+  proposalDigest: string;
+}
+
+export interface SessionGoalKernelEffectRefV1 {
+  requestId: string;
+  contractId: string;
+  contractHash?: string;
+  workUnitIds: string[];
+  kernelFactRefs: string[];
+}
+
+export interface SessionGoalPendingEffectV1 {
+  schemaVersion: 'deepcode.session.pending-effect.v1';
+  effectId: string;
+  kind: 'kernelAction';
+  state: 'prepared' | 'dispatched' | 'observed';
+  semanticRef: SessionGoalAnalysisRecordRefV1;
+  runId: string;
+  planId: string;
+  taskId: string;
+  actionIds: string[];
+  kernel?: SessionGoalKernelEffectRefV1;
+  sourceRefs: string[];
+}
+
+export interface GoalCheckpointV1 extends SessionGoalRefV1 {
+  schemaVersion: 'deepcode.session.goal-checkpoint.v1';
+  checkpointRef: string;
+  sequence: number;
+  sessionId: string;
+  lifecycle: Exclude<
+    SessionGoalLifecycleV1,
+    'draft' | 'awaitingPlanAcceptance'
+  >;
+  taskLedgerRef: {
+    factRef: string;
+    revision: number;
+    stateDigest: string;
+  };
+  activeWaitRef?: {
+    factRef: string;
+    waitId: string;
+  };
+  languageRef: {
+    revision: number;
+    status: ConversationLanguagePolicyStatus;
+    sourceTurnId: string;
+    turnAuthorityRef: string;
+  };
+  contextRefs: string[];
+  pendingEffect?: SessionGoalPendingEffectV1;
+  lastKernelFactRef?: string;
+  sourceRefs: string[];
+  createdAt: string;
+  stateDigest: string;
+}
+
 export interface SessionGoalFactBaseV1 extends SessionGoalRefV1 {
   schemaVersion: 'deepcode.session.goal-fact.v1';
   lifecycle: SessionGoalLifecycleV1;
@@ -770,7 +836,7 @@ export type SessionGoalFactPayloadV1 =
   | (SessionGoalFactBaseV1 & {
       factKind: 'checkpoint';
       lifecycle: 'running' | 'suspended' | 'completed' | 'failed' | 'cancelled';
-      checkpoint: unknown;
+      checkpoint: GoalCheckpointV1;
     })
   | (SessionGoalFactBaseV1 & {
       factKind: 'budgetUsage';

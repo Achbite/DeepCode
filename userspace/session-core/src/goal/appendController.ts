@@ -2,12 +2,14 @@ import type {
   AgentEvent,
   ExecutionBudgetCoreV1,
   GoalStepOutcomeV1,
+  GoalCheckpointV1,
   SessionAppendPreconditionV1,
   SessionDomainStateSnapshotV1,
   SessionGoalActiveWaitKindV1,
   SessionGoalActiveWaitV1,
   SessionGoalEffectV1,
   SessionGoalFactPayloadV1,
+  SessionGoalPendingEffectV1,
   SessionTaskDefinitionV1,
   TaskLedgerSnapshotV2,
 } from '@deepcode/protocol';
@@ -26,6 +28,13 @@ import {
   parseTaskLedgerV2,
   taskLedgerAllSettled,
 } from '../run-state/taskLedger.js';
+import {
+  buildGoalCheckpoint,
+  goalCheckpointContextRefs,
+  goalCheckpointLanguageRef,
+  nextGoalCheckpointSequence,
+  parseGoalPendingEffect,
+} from './checkpoint.js';
 
 export interface PreparedGoalAppend {
   events: AgentEvent[];
@@ -66,7 +75,12 @@ export class SessionGoalAppendController {
 
     const events = [...incomingEvents];
     if (!events.some((event) => event.kind === 'session_goal_fact')) {
-      events.push(...this.goalStepFacts(current, events, runtime));
+      events.push(...this.goalStepFacts(
+        current,
+        existingEvents,
+        events,
+        runtime
+      ));
     }
     const injected = this.goalFactForBatch(current, existingEvents, events);
     if (injected) events.push(injected);
@@ -95,6 +109,7 @@ export class SessionGoalAppendController {
 
   private goalStepFacts(
     current: ReducedSessionGoalV1 | null,
+    existingEvents: readonly AgentEvent[],
     events: readonly AgentEvent[],
     runtime: SessionGoalAppendRuntime | undefined
   ): AgentEvent[] {
@@ -175,11 +190,12 @@ export class SessionGoalAppendController {
       sourceRefs,
     };
     const facts: AgentEvent[] = [];
+    let taskLedgerFactRef = current.taskLedgerFactRef;
     if (
       current.taskLedger
       && nextLedger.revision !== current.taskLedger.revision
     ) {
-      facts.push(createSessionGoalFactEvent({
+      const taskLedgerFact = createSessionGoalFactEvent({
         sessionId: this.sessionId,
         ts: completedAt,
         payload: {
@@ -200,7 +216,15 @@ export class SessionGoalAppendController {
         },
         sourceIdentity:
           `${context.command.callerRequestId}:taskLedger:${terminal.id}`,
-      }));
+      });
+      taskLedgerFactRef = taskLedgerFact.id;
+      facts.push(taskLedgerFact);
+    }
+    if (!taskLedgerFactRef) {
+      throw new SessionGoalError(
+        'session_goal_recovery_required',
+        `Goal ${current.goalId} has no TaskLedgerV2 fact for its checkpoint.`
+      );
     }
     const budgetFact = createSessionGoalFactEvent({
       sessionId: this.sessionId,
@@ -220,6 +244,17 @@ export class SessionGoalAppendController {
         `${context.command.callerRequestId}:budgetUsage:${terminal.id}`,
     });
     facts.push(budgetFact);
+
+    let checkpointLifecycle: GoalCheckpointV1['lifecycle'] = 'running';
+    let activeWait: SessionGoalActiveWaitV1 | undefined;
+    let activeWaitFactRef: string | undefined;
+    let terminalGoalFact: AgentEvent | undefined;
+    const checkpointSequence = nextGoalCheckpointSequence(existingEvents);
+    const checkpointRef =
+      `goal-checkpoint-${checkpointSequence}-${
+        stableHash(`${context.command.callerRequestId}:${terminal.id}`)
+          .replace(/^[^:]+:/, '')
+      }`;
 
     if (outcome === 'suspend') {
       const waitKind = activeWaitKindForReason(reason);
@@ -245,39 +280,40 @@ export class SessionGoalAppendController {
         sourceIdentity:
           `${context.command.callerRequestId}:suspended:${terminal.id}`,
       });
-      const activeWait: SessionGoalActiveWaitV1 = {
+      activeWait = {
         schemaVersion: 'deepcode.session.active-wait.v1',
         waitId: waitRef,
         kind: waitKind,
         source: kernelWaitKind(waitKind) ? 'kernel' : 'session',
         reason,
-        resumable: waitKind === 'budget' || waitKind === 'checkpointRequired',
+        resumable: resumableWaitKind(waitKind),
         createdAt: completedAt,
         sourceRefs: [terminal.id, suspendedFact.id],
       };
-      facts.push(
-        suspendedFact,
-        createSessionGoalFactEvent({
-          sessionId: this.sessionId,
-          ts: completedAt,
-          payload: {
-            schemaVersion: 'deepcode.session.goal-fact.v1',
-            factKind: 'activeWait',
-            goalId: current.goalId,
-            goalRevision: current.goalRevision,
-            lifecycle: 'suspended',
-            objective: current.objective,
-            activeWait,
-            sourceRefs: [suspendedFact.id, terminal.id],
-            command: context.command,
-          },
-          sourceIdentity:
-            `${context.command.callerRequestId}:activeWait:${terminal.id}`,
-        })
-      );
+      const activeWaitFact = createSessionGoalFactEvent({
+        sessionId: this.sessionId,
+        ts: completedAt,
+        payload: {
+          schemaVersion: 'deepcode.session.goal-fact.v1',
+          factKind: 'activeWait',
+          goalId: current.goalId,
+          goalRevision: current.goalRevision,
+          lifecycle: 'suspended',
+          objective: current.objective,
+          activeWait,
+          sourceRefs: [suspendedFact.id, terminal.id],
+          command: context.command,
+        },
+        sourceIdentity:
+          `${context.command.callerRequestId}:activeWait:${terminal.id}`,
+      });
+      activeWaitFactRef = activeWaitFact.id;
+      checkpointLifecycle = 'suspended';
+      facts.push(suspendedFact, activeWaitFact);
     } else if (outcome === 'complete' || outcome === 'fail') {
       const factKind = outcome === 'complete' ? 'completed' : 'failed';
-      facts.push(createSessionGoalFactEvent({
+      checkpointLifecycle = factKind;
+      terminalGoalFact = createSessionGoalFactEvent({
         sessionId: this.sessionId,
         ts: completedAt,
         payload: {
@@ -289,13 +325,71 @@ export class SessionGoalAppendController {
           objective: current.objective,
           sourceRunId,
           terminalReason: reason,
+          checkpointRef,
           sourceRefs: [terminal.id, budgetFact.id],
           command: context.command,
         },
         sourceIdentity:
           `${context.command.callerRequestId}:${factKind}:${terminal.id}`,
-      }));
+      });
+      facts.push(terminalGoalFact);
     }
+    const pendingEffect = pendingEffectForSettlement(current, terminal);
+    const checkpointSourceRefs = uniqueStrings([
+      terminal.id,
+      budgetFact.id,
+      taskLedgerFactRef,
+      ...(current.checkpointFactRef ? [current.checkpointFactRef] : []),
+      ...(activeWaitFactRef ? [activeWaitFactRef] : []),
+      ...(terminalGoalFact ? [terminalGoalFact.id] : []),
+      ...(pendingEffect?.sourceRefs ?? []),
+    ]);
+    const checkpoint = buildGoalCheckpoint({
+      sessionId: this.sessionId,
+      goalId: current.goalId,
+      goalRevision: current.goalRevision,
+      lifecycle: checkpointLifecycle,
+      checkpointRef,
+      sequence: checkpointSequence,
+      taskLedger: nextLedger,
+      taskLedgerFactRef,
+      activeWait,
+      activeWaitFactRef,
+      languageRef: goalCheckpointLanguageRef([
+        ...existingEvents,
+        ...events,
+        ...facts,
+      ]),
+      contextRefs: goalCheckpointContextRefs(
+        [...existingEvents, ...events, ...facts],
+        uniqueStrings([
+          current.confirmedPlanRef ?? '',
+          taskLedgerFactRef,
+          ...(pendingEffect ? [pendingEffect.semanticRef.recordId] : []),
+        ])
+      ),
+      pendingEffect,
+      lastKernelFactRef: pendingEffect?.kernel?.kernelFactRefs.at(-1),
+      sourceRefs: checkpointSourceRefs,
+      createdAt: completedAt,
+    });
+    facts.push(createSessionGoalFactEvent({
+      sessionId: this.sessionId,
+      ts: completedAt,
+      payload: {
+        schemaVersion: 'deepcode.session.goal-fact.v1',
+        factKind: 'checkpoint',
+        goalId: current.goalId,
+        goalRevision: current.goalRevision,
+        lifecycle: checkpointLifecycle,
+        objective: current.objective,
+        checkpoint,
+        sourceRefs: checkpointSourceRefs,
+        command: context.command,
+      },
+      sourceIdentity:
+        `${context.command.callerRequestId}:checkpoint:${checkpointSequence}:${terminal.id}`,
+    }));
     return facts;
   }
 
@@ -343,18 +437,26 @@ export class SessionGoalAppendController {
             || factKind === 'budgetUsage'
             || factKind === 'suspended'
             || factKind === 'activeWait'
+            || factKind === 'checkpoint'
             || factKind === 'completed'
             || factKind === 'failed'
           )
         : context.operation === 'resume'
-          ? factKind === 'resumed'
+          ? (
+              factKind === 'taskLedger'
+              || factKind === 'resumed'
+              || factKind === 'checkpoint'
+            )
           : context.operation === 'cancel'
-            ? factKind === 'cancelled'
+            ? factKind === 'cancelled' || factKind === 'checkpoint'
             : context.operation === 'resolveInteraction'
               ? (
                   factKind === 'activated'
                   || factKind === 'cancelled'
                   || factKind === 'planRevisionRequested'
+                  || factKind === 'suspended'
+                  || factKind === 'activeWait'
+                  || factKind === 'checkpoint'
                 )
               : context.operation === 'start'
                 ? (
@@ -693,6 +795,37 @@ export class SessionGoalAppendController {
   }
 }
 
+function pendingEffectForSettlement(
+  current: ReducedSessionGoalV1,
+  terminal: AgentEvent
+): SessionGoalPendingEffectV1 | undefined {
+  const value = objectRecord(terminal.payload)?.goalPendingEffect;
+  const previous = current.checkpoint?.pendingEffect;
+  if (value === undefined) {
+    if (previous && previous.state !== 'observed') {
+      throw new SessionGoalError(
+        'session_goal_recovery_required',
+        `Goal ${current.goalId} step ${terminal.id} lost pending effect ${previous.effectId}.`
+      );
+    }
+    return undefined;
+  }
+  const next = parseGoalPendingEffect(value, terminal.id);
+  if (previous && previous.effectId !== next.effectId) {
+    throw new SessionGoalError(
+      'session_goal_recovery_required',
+      `Goal ${current.goalId} step ${terminal.id} replaced pending effect ${previous.effectId}.`
+    );
+  }
+  if (!previous && next.state !== 'prepared') {
+    throw new SessionGoalError(
+      'session_goal_recovery_required',
+      `Goal ${current.goalId} step ${terminal.id} introduced an effect after preparation.`
+    );
+  }
+  return next;
+}
+
 function goalEffectForFact(
   current: ReducedSessionGoalV1 | null,
   event: AgentEvent
@@ -724,6 +857,26 @@ function goalEffectForFact(
       goalId: payload.goalId,
       goalRevision: payload.goalRevision,
       fromLifecycle: 'awaitingPlanAcceptance',
+      toLifecycle: 'running',
+      factRef: event.id,
+    };
+  }
+  if (payload.factKind === 'suspended') {
+    return {
+      kind: 'transition',
+      goalId: payload.goalId,
+      goalRevision: payload.goalRevision,
+      fromLifecycle: 'running',
+      toLifecycle: 'suspended',
+      factRef: event.id,
+    };
+  }
+  if (payload.factKind === 'resumed') {
+    return {
+      kind: 'transition',
+      goalId: payload.goalId,
+      goalRevision: payload.goalRevision,
+      fromLifecycle: 'suspended',
       toLifecycle: 'running',
       factRef: event.id,
     };
@@ -808,6 +961,326 @@ export function createSessionGoalFactEvent(input: {
       presentation: 'traceOnly',
     },
   };
+}
+
+export function createGoalResumeFactBatch(input: {
+  sessionId: string;
+  current: ReducedSessionGoalV1;
+  existingEvents: readonly AgentEvent[];
+  command: SessionGoalOperationContext['command'];
+  sourceRunId: string;
+  ts: string;
+  taskLedger?: TaskLedgerSnapshotV2;
+  pendingEffect?: SessionGoalPendingEffectV1;
+  evidenceRefs?: string[];
+}): AgentEvent[] {
+  let { current } = input;
+  if (
+    current.lifecycle !== 'suspended'
+    || !current.activeWait
+    || !current.activeWaitFactRef
+    || !current.checkpoint
+    || !current.checkpointFactRef
+    || !current.taskLedger
+    || !current.taskLedgerFactRef
+  ) {
+    throw new SessionGoalError(
+      'session_goal_lifecycle_conflict',
+      `Goal ${current.goalId} has no resumable checkpointed ActiveWait.`
+    );
+  }
+  const priorCheckpoint = current.checkpoint;
+  const priorCheckpointFactRef = current.checkpointFactRef;
+  const priorActiveWaitFactRef = current.activeWaitFactRef;
+  const pendingEffect = input.pendingEffect
+    ?? priorCheckpoint.pendingEffect;
+  const reconciledDispatchedEffect =
+    priorCheckpoint.pendingEffect?.state === 'dispatched'
+    && pendingEffect?.state === 'observed';
+  if (!current.activeWait.resumable && !reconciledDispatchedEffect) {
+    throw new SessionGoalError(
+      'session_goal_lifecycle_conflict',
+      `Goal ${current.goalId} ActiveWait requires exact Kernel reconciliation before resume.`
+    );
+  }
+  if (
+    priorCheckpoint.pendingEffect?.state === 'dispatched'
+    && pendingEffect?.state !== 'observed'
+  ) {
+    throw new SessionGoalError(
+      'session_goal_recovery_required',
+      `Goal ${current.goalId} has a dispatched effect that requires Kernel reconciliation before resume.`
+    );
+  }
+  const facts: AgentEvent[] = [];
+  if (
+    input.taskLedger
+    && input.taskLedger.revision !== current.taskLedger.revision
+  ) {
+    if (input.taskLedger.revision !== current.taskLedger.revision + 1) {
+      throw new SessionGoalError(
+        'session_task_ledger_transition_invalid',
+        `Goal ${current.goalId} reconciliation produced a non-contiguous TaskLedgerV2 revision.`
+      );
+    }
+    const taskLedgerFact = createSessionGoalFactEvent({
+      sessionId: input.sessionId,
+      ts: input.ts,
+      payload: {
+        schemaVersion: 'deepcode.session.goal-fact.v1',
+        factKind: 'taskLedger',
+        goalId: current.goalId,
+        goalRevision: current.goalRevision,
+        lifecycle: 'suspended',
+        objective: current.objective,
+        taskLedger: input.taskLedger,
+        sourceRefs: uniqueStrings([
+          current.taskLedgerFactRef,
+          ...(input.evidenceRefs ?? []),
+        ]),
+        command: input.command,
+      },
+      sourceIdentity:
+        `${input.command.callerRequestId}:resume-task-ledger:${input.taskLedger.revision}`,
+    });
+    facts.push(taskLedgerFact);
+    current = {
+      ...current,
+      taskLedger: input.taskLedger,
+      taskLedgerFactRef: taskLedgerFact.id,
+    };
+  }
+  const resumed = createSessionGoalFactEvent({
+    sessionId: input.sessionId,
+    ts: input.ts,
+    payload: {
+      schemaVersion: 'deepcode.session.goal-fact.v1',
+      factKind: 'resumed',
+      goalId: current.goalId,
+      goalRevision: current.goalRevision,
+      lifecycle: 'running',
+      objective: current.objective,
+      checkpointRef: priorCheckpoint.checkpointRef,
+      sourceRunId: input.sourceRunId,
+      sourceRefs: uniqueStrings([
+        priorCheckpointFactRef,
+        priorActiveWaitFactRef,
+        ...(input.evidenceRefs ?? []),
+        ...facts.map((event) => event.id),
+      ]),
+      command: input.command,
+    },
+    sourceIdentity:
+      `${input.command.callerRequestId}:resumed:${priorCheckpoint.checkpointRef}`,
+  });
+  const checkpoint = explicitCheckpoint({
+    sessionId: input.sessionId,
+    current,
+    existingEvents: input.existingEvents,
+    lifecycle: 'running',
+    command: input.command,
+    ts: input.ts,
+    sourceRefs: uniqueStrings([
+      priorCheckpointFactRef,
+      resumed.id,
+      ...facts.map((event) => event.id),
+      ...(input.evidenceRefs ?? []),
+    ]),
+    pendingEffect,
+    sourceIdentity: `${input.command.callerRequestId}:resume`,
+  });
+  return [...facts, resumed, checkpoint];
+}
+
+export function createGoalCancelFactBatch(input: {
+  sessionId: string;
+  current: ReducedSessionGoalV1;
+  existingEvents: readonly AgentEvent[];
+  command: SessionGoalOperationContext['command'];
+  sourceRunId: string;
+  terminalReason: string;
+  ts: string;
+}): AgentEvent[] {
+  const { current } = input;
+  if (
+    (current.lifecycle !== 'running' && current.lifecycle !== 'suspended')
+    || !current.checkpoint
+    || !current.checkpointFactRef
+    || !current.taskLedger
+    || !current.taskLedgerFactRef
+    || (
+      current.checkpoint.pendingEffect
+      && current.checkpoint.pendingEffect.state !== 'observed'
+    )
+  ) {
+    throw new SessionGoalError(
+      'session_goal_lifecycle_conflict',
+      `Goal ${current.goalId} cannot cancel outside a safe checkpoint.`
+    );
+  }
+  const sequence = nextGoalCheckpointSequence(input.existingEvents);
+  const checkpointRef = checkpointIdentity(
+    sequence,
+    input.command,
+    `${input.command.callerRequestId}:cancel`
+  );
+  const cancelled = createSessionGoalFactEvent({
+    sessionId: input.sessionId,
+    ts: input.ts,
+    payload: {
+      schemaVersion: 'deepcode.session.goal-fact.v1',
+      factKind: 'cancelled',
+      goalId: current.goalId,
+      goalRevision: current.goalRevision,
+      lifecycle: 'cancelled',
+      objective: current.objective,
+      sourceRunId: input.sourceRunId,
+      terminalReason: input.terminalReason,
+      checkpointRef,
+      sourceRefs: uniqueStrings([
+        current.checkpointFactRef,
+        ...(current.activeWaitFactRef ? [current.activeWaitFactRef] : []),
+      ]),
+      command: input.command,
+    },
+    sourceIdentity:
+      `${input.command.callerRequestId}:cancelled:${current.checkpoint.checkpointRef}`,
+  });
+  const checkpoint = explicitCheckpoint({
+    sessionId: input.sessionId,
+    current,
+    existingEvents: input.existingEvents,
+    lifecycle: 'cancelled',
+    command: input.command,
+    ts: input.ts,
+    sourceRefs: [current.checkpointFactRef, cancelled.id],
+    pendingEffect: current.checkpoint.pendingEffect,
+    sourceIdentity: `${input.command.callerRequestId}:cancel`,
+    sequence,
+    checkpointRef,
+  });
+  return [cancelled, checkpoint];
+}
+
+export function createGoalEffectCheckpointFact(input: {
+  sessionId: string;
+  current: ReducedSessionGoalV1;
+  existingEvents: readonly AgentEvent[];
+  command: SessionGoalOperationContext['command'];
+  pendingEffect: SessionGoalPendingEffectV1;
+  sourceRefs: string[];
+  ts: string;
+}): AgentEvent {
+  const { current } = input;
+  if (
+    (current.lifecycle !== 'running' && current.lifecycle !== 'suspended')
+    || !current.checkpoint
+    || !current.checkpointFactRef
+    || !current.taskLedger
+    || !current.taskLedgerFactRef
+    || current.checkpoint.pendingEffect?.effectId !== input.pendingEffect.effectId
+  ) {
+    throw new SessionGoalError(
+      'session_goal_recovery_required',
+      `Goal ${current.goalId} cannot persist a detached effect barrier.`
+    );
+  }
+  return explicitCheckpoint({
+    sessionId: input.sessionId,
+    current,
+    existingEvents: input.existingEvents,
+    lifecycle: current.lifecycle,
+    command: input.command,
+    ts: input.ts,
+    sourceRefs: [
+      current.checkpointFactRef,
+      ...input.sourceRefs,
+    ],
+    pendingEffect: input.pendingEffect,
+    sourceIdentity:
+      `${input.command.callerRequestId}:effect:${input.pendingEffect.effectId}:${input.pendingEffect.state}`,
+  });
+}
+
+function explicitCheckpoint(input: {
+  sessionId: string;
+  current: ReducedSessionGoalV1;
+  existingEvents: readonly AgentEvent[];
+  lifecycle: GoalCheckpointV1['lifecycle'];
+  command: SessionGoalOperationContext['command'];
+  ts: string;
+  sourceRefs: string[];
+  pendingEffect?: SessionGoalPendingEffectV1;
+  sourceIdentity: string;
+  sequence?: number;
+  checkpointRef?: string;
+}): AgentEvent {
+  const { current } = input;
+  if (!current.taskLedger || !current.taskLedgerFactRef) {
+    throw new SessionGoalError(
+      'session_goal_recovery_required',
+      `Goal ${current.goalId} has no TaskLedgerV2 checkpoint source.`
+    );
+  }
+  const sequence = input.sequence
+    ?? nextGoalCheckpointSequence(input.existingEvents);
+  const checkpointRef = input.checkpointRef
+    ?? checkpointIdentity(sequence, input.command, input.sourceIdentity);
+  const sourceRefs = uniqueStrings(input.sourceRefs);
+  const checkpoint = buildGoalCheckpoint({
+    sessionId: input.sessionId,
+    goalId: current.goalId,
+    goalRevision: current.goalRevision,
+    lifecycle: input.lifecycle,
+    checkpointRef,
+    sequence,
+    taskLedger: current.taskLedger,
+    taskLedgerFactRef: current.taskLedgerFactRef,
+    activeWait: input.lifecycle === 'suspended'
+      ? current.activeWait
+      : undefined,
+    activeWaitFactRef: input.lifecycle === 'suspended'
+      ? current.activeWaitFactRef
+      : undefined,
+    languageRef: goalCheckpointLanguageRef(input.existingEvents),
+    contextRefs: goalCheckpointContextRefs(input.existingEvents, [
+      current.confirmedPlanRef ?? '',
+      current.taskLedgerFactRef,
+      ...(input.pendingEffect ? [input.pendingEffect.semanticRef.recordId] : []),
+    ]),
+    pendingEffect: input.pendingEffect,
+    lastKernelFactRef: input.pendingEffect?.kernel?.kernelFactRefs.at(-1),
+    sourceRefs,
+    createdAt: input.ts,
+  });
+  return createSessionGoalFactEvent({
+    sessionId: input.sessionId,
+    ts: input.ts,
+    payload: {
+      schemaVersion: 'deepcode.session.goal-fact.v1',
+      factKind: 'checkpoint',
+      goalId: current.goalId,
+      goalRevision: current.goalRevision,
+      lifecycle: input.lifecycle,
+      objective: current.objective,
+      checkpoint,
+      sourceRefs,
+      command: input.command,
+    },
+    sourceIdentity:
+      `${input.sourceIdentity}:checkpoint:${sequence}:${checkpointRef}`,
+  });
+}
+
+function checkpointIdentity(
+  sequence: number,
+  command: SessionGoalOperationContext['command'],
+  sourceIdentity: string
+): string {
+  return `goal-checkpoint-${sequence}-${
+    stableHash(`${command.callerRequestId}:${sourceIdentity}`)
+      .replace(/^[^:]+:/, '')
+  }`;
 }
 
 function latestPlanAuthorizationDecision(
@@ -1001,6 +1474,15 @@ function kernelWaitKind(kind: SessionGoalActiveWaitKindV1): boolean {
   return kind === 'permission'
     || kind === 'cleanup'
     || kind === 'indeterminate';
+}
+
+function resumableWaitKind(kind: SessionGoalActiveWaitKindV1): boolean {
+  return kind === 'requirement'
+    || kind === 'plan'
+    || kind === 'review'
+    || kind === 'permission'
+    || kind === 'budget'
+    || kind === 'checkpointRequired';
 }
 
 function errorMessage(error: unknown): string {

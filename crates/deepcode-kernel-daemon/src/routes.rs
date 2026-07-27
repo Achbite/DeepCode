@@ -35,7 +35,8 @@ pub(crate) fn build_app(state: AppState) -> Router {
         )
         .route(
             "/api/session-store/:session_id/analysis-timeline",
-            post(session_store_analysis_timeline_append)
+            get(session_store_analysis_timeline_record_get)
+                .post(session_store_analysis_timeline_append)
                 .layer(DefaultBodyLimit::max(LARGE_JSON_BODY_LIMIT_BYTES)),
         )
         .route(

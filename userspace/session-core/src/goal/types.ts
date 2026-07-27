@@ -2,6 +2,7 @@ import type {
   AgentEvent,
   AgentTimelineResult,
   ExecutionBudgetCoreV1,
+  GoalCheckpointV1,
   GoalProjectionV1,
   SessionGoalActiveWaitV1,
   SessionDomainStateSnapshotV1,
@@ -49,6 +50,8 @@ export interface ReducedSessionGoalV1 {
   activeWaitFactRef?: string;
   executionBudget?: ExecutionBudgetCoreV1;
   executionBudgetFactRef?: string;
+  checkpoint?: GoalCheckpointV1;
+  checkpointFactRef?: string;
   terminalReason?: string;
   terminalFactRef?: string;
   facts: Array<{

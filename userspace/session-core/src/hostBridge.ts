@@ -162,10 +162,8 @@ async function main(): Promise<void> {
         break;
       case 'resumeGoal':
       case 'cancelGoal':
-        throw new SessionGoalError(
-          'session_goal_operation_unavailable',
-          `Goal operation ${request.op} is not available before its Stage2 batch.`
-        );
+        result = await mutateGoalLifecycle(request);
+        break;
       default:
         throw new SessionGoalError(
           'session_host_bridge_operation_invalid',
@@ -260,6 +258,83 @@ async function advanceGoal(
       hostLanguage: request.hostLanguage,
       goalContext,
     });
+    const timeline = projection.buildTimeline(result.events ?? []);
+    const finalText = extractFinalText(timeline);
+    return {
+      ok: true,
+      sessionId: result.session.id,
+      session: result.session,
+      events: result.events,
+      timeline,
+      finalText,
+      ...inferHostRunLifecycle(result.events, finalText),
+    };
+  } finally {
+    await deliveryRecorder?.close();
+  }
+}
+
+async function mutateGoalLifecycle(
+  request: HostBridgeRequest
+): Promise<HostBridgeResult> {
+  if (
+    !request.sessionId
+    || (request.op !== 'resumeGoal' && request.op !== 'cancelGoal')
+  ) {
+    throw new SessionGoalError(
+      'session_goal_request_invalid',
+      'Goal lifecycle mutation requires sessionId and an exact operation.'
+    );
+  }
+  const apiBase = normalizeApiBase(request.apiBase);
+  const hostRunId = requiredHostRunId(request);
+  const goalContext = goalOperationContext(request);
+  const expectedOperation = request.op === 'resumeGoal' ? 'resume' : 'cancel';
+  if (!goalContext || goalContext.operation !== expectedOperation) {
+    throw new SessionGoalError(
+      'session_goal_request_invalid',
+      `Goal ${expectedOperation} requires an admitted operation context.`
+    );
+  }
+  const current = await getAgentSession(apiBase, request.sessionId);
+  const initialTimeline = await loadAgentTimeline(
+    apiBase,
+    request.sessionId,
+    current.events
+  );
+  const initialCacheTelemetry = await loadCacheTelemetryEvents(
+    apiBase,
+    request.sessionId
+  );
+  const deliveryRecorder = createProjectionDeliveryRecorder(
+    apiBase,
+    request.sessionId,
+    hostRunId
+  );
+  const projection = createProjectionPublishingDriver(
+    apiBase,
+    hostRunId,
+    request.sessionId,
+    current,
+    initialTimeline,
+    initialCacheTelemetry,
+    deliveryRecorder,
+    undefined,
+    bootstrapContext(request),
+    goalContext
+  );
+  try {
+    const driverInput = {
+      sessionId: request.sessionId,
+      hostRunId,
+      content: request.objective ?? '',
+      existingEvents: current.events,
+      hostLanguage: request.hostLanguage,
+      goalContext,
+    };
+    const result = request.op === 'resumeGoal'
+      ? await projection.driver.resumeGoal(driverInput)
+      : await projection.driver.cancelGoal(driverInput);
     const timeline = projection.buildTimeline(result.events ?? []);
     const finalText = extractFinalText(timeline);
     return {
@@ -686,6 +761,8 @@ function createProjectionPublishingDriver(
     wireLedgerRequired: true,
     appendAnalysisTimeline: (sessionId, entries) =>
       transcriptClient.appendAnalysisTimeline(sessionId, entries),
+    loadAnalysisTimelineRecord: (sessionId, recordId) =>
+      transcriptClient.loadAnalysisTimelineRecord(sessionId, recordId),
     registerProviderAdmission: (_sessionId, metadata) =>
       appendCoordinator.registerProviderAdmission(metadata),
     bindProviderProposalAdmission: (_sessionId, proposalId, providerRequestId) =>

@@ -5,6 +5,7 @@ import type {
   LlmChatMessage,
   LlmChatRequest,
   LlmChatResult,
+  SessionGoalPendingEffectV1,
   SessionProviderAdmissionMetadataV1,
 } from '@deepcode/protocol';
 import type {
@@ -377,6 +378,8 @@ export interface SessionDriverProviderState {
   pendingProviderProposalAdmissions?: Record<string, string>;
   pendingProviderCommitEvents?: AgentEvent[];
   providerCommitDeferred?: boolean;
+  goalEffectCandidates?: Record<string, SessionGoalPendingEffectV1>;
+  goalEffectRuntime?: SessionGoalPendingEffectV1;
 }
 
 export interface SessionDriverProviderRuntimeState {

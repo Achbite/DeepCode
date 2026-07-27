@@ -424,6 +424,31 @@ pub(crate) async fn agent_session_goal_advance(
                 "Goal caller request ID was already used with different content",
             );
         }
+        if !replay.settled {
+            let Some(host_run_id) = replay.host_run_id.as_deref() else {
+                return ApiResponse::error(
+                    "session_goal_recovery_required",
+                    "Goal advance replay has no recoverable Host run identity",
+                );
+            };
+            if let Err(error) =
+                await_goal_host_run_terminal(&state, &session_id, host_run_id).await
+            {
+                return ApiResponse::error(error.code, error.message);
+            }
+            if !goal_command_replay(
+                &session_projection(&state, &session_id),
+                &body.caller_request_id,
+            )
+            .is_some_and(|candidate| {
+                candidate.request_digest == request_digest && candidate.settled
+            }) {
+                return ApiResponse::error(
+                    "session_goal_recovery_required",
+                    "Goal advance replay stopped without canonical settlement",
+                );
+            }
+        }
         return goal_replay_response(
             &state,
             &session_id,
@@ -553,25 +578,258 @@ pub(crate) async fn agent_session_goal_advance(
 }
 
 pub(crate) async fn agent_session_goal_resume(
-    State(_state): State<AppState>,
-    Path((_session_id, _goal_id)): Path<(String, String)>,
-    Json(_body): Json<Value>,
+    State(state): State<AppState>,
+    Path((session_id, goal_id)): Path<(String, String)>,
+    Json(body): Json<GoalMutationRequest>,
 ) -> Json<ApiResponse> {
-    ApiResponse::error(
-        "session_goal_operation_unavailable",
-        "Goal resume is not available before Stage2-C",
+    agent_session_goal_lifecycle_mutation(
+        state,
+        session_id,
+        goal_id,
+        body,
+        "resume",
     )
+    .await
 }
 
 pub(crate) async fn agent_session_goal_cancel(
-    State(_state): State<AppState>,
-    Path((_session_id, _goal_id)): Path<(String, String)>,
-    Json(_body): Json<Value>,
+    State(state): State<AppState>,
+    Path((session_id, goal_id)): Path<(String, String)>,
+    Json(body): Json<GoalMutationRequest>,
 ) -> Json<ApiResponse> {
-    ApiResponse::error(
-        "session_goal_operation_unavailable",
-        "Goal cancel is not available before Stage2-C",
+    agent_session_goal_lifecycle_mutation(
+        state,
+        session_id,
+        goal_id,
+        body,
+        "cancel",
     )
+    .await
+}
+
+async fn agent_session_goal_lifecycle_mutation(
+    state: AppState,
+    session_id: String,
+    goal_id: String,
+    body: GoalMutationRequest,
+    operation: &'static str,
+) -> Json<ApiResponse> {
+    if let Err(message) = validate_goal_request_identity(&body.caller_request_id) {
+        return ApiResponse::error("session_goal_request_invalid", message);
+    }
+    let request_value = match serde_json::to_value(&body) {
+        Ok(value) => value,
+        Err(error) => {
+            return ApiResponse::error(
+                "session_goal_request_invalid",
+                format!("Goal {operation} request cannot be encoded: {error}"),
+            )
+        }
+    };
+    let request_digest = goal_request_digest(operation, &request_value);
+    let events = session_projection(&state, &session_id);
+    if let Some(replay) = goal_command_replay(&events, &body.caller_request_id) {
+        if replay.request_digest != request_digest {
+            return ApiResponse::error(
+                "session_goal_request_conflict",
+                "Goal caller request ID was already used with different content",
+            );
+        }
+        if !replay.settled {
+            let Some(host_run_id) = replay.host_run_id.as_deref() else {
+                return ApiResponse::error(
+                    "session_goal_recovery_required",
+                    format!("Goal {operation} replay has no recoverable Host run identity"),
+                );
+            };
+            if let Err(error) =
+                await_goal_host_run_terminal(&state, &session_id, host_run_id).await
+            {
+                return ApiResponse::error(error.code, error.message);
+            }
+            if !goal_command_replay(
+                &session_projection(&state, &session_id),
+                &body.caller_request_id,
+            )
+            .is_some_and(|candidate| {
+                candidate.request_digest == request_digest && candidate.settled
+            }) {
+                return ApiResponse::error(
+                    "session_goal_recovery_required",
+                    format!("Goal {operation} replay stopped without canonical settlement"),
+                );
+            }
+        }
+        return goal_replay_response(
+            &state,
+            &session_id,
+            &replay.goal_id,
+            operation,
+            Some(&body.caller_request_id),
+            Some(&request_digest),
+            replay.host_run_id.as_deref(),
+            true,
+        )
+        .await;
+    }
+    let domain = match exact_goal_domain_state(
+        &state,
+        &session_id,
+        &body.expected_domain_head,
+    ) {
+        Ok(domain) => domain,
+        Err(response) => return response,
+    };
+    let lifecycle = domain
+        .pointer("/goalSlot/lifecycle")
+        .and_then(Value::as_str);
+    let lifecycle_allowed = match operation {
+        "resume" => lifecycle == Some("suspended"),
+        "cancel" => matches!(lifecycle, Some("running" | "suspended")),
+        _ => false,
+    };
+    if body.expected_goal_revision == 0
+        || domain.pointer("/goalSlot/state").and_then(Value::as_str) != Some("active")
+        || domain.pointer("/goalSlot/goalId").and_then(Value::as_str)
+            != Some(goal_id.as_str())
+        || domain.pointer("/goalSlot/goalRevision").and_then(Value::as_u64)
+            != Some(body.expected_goal_revision)
+        || !lifecycle_allowed
+    {
+        return ApiResponse::error(
+            "session_goal_lifecycle_conflict",
+            format!("Goal {operation} requires the exact active Goal revision"),
+        );
+    }
+    let projection = match read_goal_projection(&state, &session_id, Some(&goal_id)).await {
+        Ok(Some(projection)) => projection,
+        Ok(None) => {
+            return ApiResponse::error("session_goal_not_found", "Goal projection is unavailable")
+        }
+        Err(error) => return ApiResponse::error(error.code, error.message),
+    };
+    if projection.get("lifecycle").and_then(Value::as_str) != lifecycle
+        || projection.get("pendingInteraction").is_some()
+        || projection.pointer("/checkpoint/status").and_then(Value::as_str)
+            != Some("available")
+    {
+        return ApiResponse::error(
+            "session_goal_lifecycle_conflict",
+            format!(
+                "Goal {operation} requires an exact checkpoint without a pending interaction"
+            ),
+        );
+    }
+    let pending_effect_state = latest_goal_pending_effect_state(
+        &events,
+        &goal_id,
+        body.expected_goal_revision,
+    );
+    if operation == "resume" {
+        let has_active_wait =
+            projection.pointer("/activeWait/status").and_then(Value::as_str)
+                == Some("available");
+        let resumable =
+            projection.pointer("/activeWait/value/resumable").and_then(Value::as_bool)
+                == Some(true);
+        if !has_active_wait
+            || (!resumable && pending_effect_state.as_deref() != Some("dispatched"))
+        {
+            return ApiResponse::error(
+                "session_goal_lifecycle_conflict",
+                "Goal resume requires one checkpointed resumable ActiveWait or a dispatched effect eligible for read-only reconciliation",
+            );
+        }
+    }
+    if operation == "cancel"
+        && matches!(
+            pending_effect_state.as_deref(),
+            Some("prepared" | "dispatched")
+        )
+    {
+        return ApiResponse::error(
+            "session_goal_lifecycle_conflict",
+            "Goal cancel requires a safe checkpoint without an unobserved effect",
+        );
+    }
+    let expected_head_digest = domain
+        .pointer("/head/headDigest")
+        .and_then(Value::as_str)
+        .expect("exact Goal domain state has a head digest")
+        .to_string();
+    let run_request = AgentSessionRunRequest {
+        op: Some(if operation == "resume" {
+            "resumeGoal".to_string()
+        } else {
+            "cancelGoal".to_string()
+        }),
+        content: projection
+            .get("objective")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        workspace_path: body.workspace_path,
+        no_workspace: body.no_workspace,
+        host_language: body.host_language,
+        goal_id: Some(goal_id.clone()),
+        goal_revision: Some(body.expected_goal_revision),
+        objective: projection
+            .get("objective")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        caller_request_id: Some(body.caller_request_id.clone()),
+        request_digest: Some(request_digest.clone()),
+        expected_domain_head_digest: Some(expected_head_digest),
+        ..AgentSessionRunRequest::default()
+    };
+    let started = agent_session_run_start(
+        State(state.clone()),
+        Path(session_id.clone()),
+        Json(run_request),
+    )
+    .await;
+    if !started.0.ok {
+        return started;
+    }
+    let host_run_id = started
+        .0
+        .data
+        .as_ref()
+        .and_then(|value| value.pointer("/run/runId"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let Some(host_run_id) = host_run_id else {
+        return ApiResponse::error(
+            "session_goal_recovery_required",
+            format!("Goal {operation} started without an exact Host run identity"),
+        );
+    };
+    if let Err(error) = await_goal_host_run_terminal(&state, &session_id, &host_run_id).await {
+        return ApiResponse::error(error.code, error.message);
+    }
+    let settled = goal_command_replay(
+        &session_projection(&state, &session_id),
+        &body.caller_request_id,
+    )
+    .is_some_and(|candidate| {
+        candidate.request_digest == request_digest && candidate.settled
+    });
+    if !settled {
+        return ApiResponse::error(
+            "session_goal_recovery_required",
+            format!("Goal {operation} Host run stopped without canonical settlement"),
+        );
+    }
+    goal_replay_response(
+        &state,
+        &session_id,
+        &goal_id,
+        operation,
+        Some(&body.caller_request_id),
+        Some(&request_digest),
+        Some(&host_run_id),
+        false,
+    )
+    .await
 }
 
 async fn goal_read_response(
@@ -619,9 +877,12 @@ struct GoalCommandReplay {
 }
 
 fn goal_command_replay(events: &[Value], caller_request_id: &str) -> Option<GoalCommandReplay> {
-    events.iter().rev().find_map(|event| {
-        let payload = event.get("payload")?;
-        match event.get("kind").and_then(Value::as_str) {
+    let mut replay: Option<GoalCommandReplay> = None;
+    for event in events.iter().rev() {
+        let Some(payload) = event.get("payload") else {
+            continue;
+        };
+        let candidate = match event.get("kind").and_then(Value::as_str) {
             Some("session_goal_fact")
                 if payload
                     .pointer("/command/callerRequestId")
@@ -638,8 +899,9 @@ fn goal_command_replay(events: &[Value], caller_request_id: &str) -> Option<Goal
                         .pointer("/command/hostRunId")
                         .and_then(Value::as_str)
                         .map(str::to_string),
-                    settled: payload.get("factKind").and_then(Value::as_str)
-                        != Some("draftCreated"),
+                    settled: goal_fact_settles_command(
+                        payload.get("factKind").and_then(Value::as_str),
+                    ),
                 })
             }
             Some("session_interaction_claim")
@@ -684,11 +946,72 @@ fn goal_command_replay(events: &[Value], caller_request_id: &str) -> Option<Goal
                         .pointer("/goalCommand/hostRunId")
                         .and_then(Value::as_str)
                         .map(str::to_string),
-                    settled: false,
+                    settled: matches!(
+                        payload.get("status").and_then(Value::as_str),
+                        Some("waiting" | "completed" | "failed" | "cancelled")
+                    ),
                 })
             }
             _ => None,
+        };
+        let Some(candidate) = candidate else {
+            continue;
+        };
+        match replay.as_mut() {
+            Some(existing)
+                if existing.goal_id == candidate.goal_id
+                    && existing.request_digest == candidate.request_digest =>
+            {
+                existing.settled |= candidate.settled;
+                if existing.host_run_id.is_none() {
+                    existing.host_run_id = candidate.host_run_id;
+                }
+            }
+            None => replay = Some(candidate),
+            Some(_) => {}
         }
+    }
+    replay
+}
+
+fn goal_fact_settles_command(fact_kind: Option<&str>) -> bool {
+    matches!(
+        fact_kind,
+        Some(
+            "planAwaitingAcceptance"
+                | "planRevisionRequested"
+                | "activated"
+                | "resumed"
+                | "budgetUsage"
+                | "completed"
+                | "failed"
+                | "cancelled"
+        )
+    )
+}
+
+fn latest_goal_pending_effect_state(
+    events: &[Value],
+    goal_id: &str,
+    goal_revision: u64,
+) -> Option<String> {
+    events.iter().rev().find_map(|event| {
+        if event.get("kind").and_then(Value::as_str) != Some("session_goal_fact") {
+            return None;
+        }
+        let payload = event.get("payload")?;
+        if payload.get("factKind").and_then(Value::as_str) != Some("checkpoint")
+            || payload.get("goalId").and_then(Value::as_str) != Some(goal_id)
+            || payload.get("goalRevision").and_then(Value::as_u64)
+                != Some(goal_revision)
+        {
+            return None;
+        }
+        payload
+            .pointer("/checkpoint/pendingEffect/state")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| Some("none".to_string()))
     })
 }
 

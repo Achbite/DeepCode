@@ -5,6 +5,7 @@ import type { ProjectionDeliveryRecord } from '@deepcode/protocol';
 import type {
   ProviderAnalysisTimelineAppendAck,
   ProviderAnalysisTimelineEvent,
+  ProviderAnalysisTimelineRecord,
 } from './provider/ProviderAnalysisTimeline.js';
 
 export class SessionStorageClient {
@@ -97,6 +98,28 @@ export class SessionStorageClient {
   ): Promise<ProviderAnalysisTimelineAppendAck[]> {
     if (entries.length === 0) return [];
     return this.appendAnalysisTimelineBatch(sessionId, entries);
+  }
+
+  async loadAnalysisTimelineRecord(
+    sessionId: string,
+    recordId: string
+  ): Promise<ProviderAnalysisTimelineRecord> {
+    const response = await fetch(
+      `${this.baseUrl}/api/session-store/${encodeURIComponent(sessionId)}/analysis-timeline`
+      + `?recordId=${encodeURIComponent(recordId)}`
+    );
+    if (!response.ok) {
+      throw new Error(`read analysis timeline record failed: HTTP ${response.status}`);
+    }
+    const value = await response.json();
+    assertSessionStoreResponse(value, 'read analysis timeline record failed');
+    const record = objectRecord(objectRecord(value)?.data)?.record;
+    if (!objectRecord(record)) {
+      throw new Error(
+        `read analysis timeline record failed: record ${recordId} is unavailable`
+      );
+    }
+    return record as ProviderAnalysisTimelineRecord;
   }
 
   async appendProjectionDelivery(

@@ -66,6 +66,13 @@ export interface ProviderAnalysisTimelineAppendAck {
   readonly sourcePayloadDigest: string;
 }
 
+export interface ProviderAnalysisTimelineRecord
+  extends ProviderAnalysisTimelineEvent {
+  readonly analysisSeq: number;
+  readonly recordDigest: string;
+  readonly sourcePayloadDigest: string;
+}
+
 export type ProviderAnalysisTimelineAppendResult =
   | readonly ProviderAnalysisTimelineAppendAck[]
   | void;
@@ -250,6 +257,7 @@ export function semanticExchangeAnalysisEvent(input: {
   model?: string;
   toolCallId: string;
   proposalId?: string;
+  proposal?: unknown;
   toolCall: unknown;
   toolResult: unknown;
   assistantContent: string;
@@ -277,6 +285,9 @@ export function semanticExchangeAnalysisEvent(input: {
       },
       toolCall: cloneAnalysisValue(input.toolCall),
       toolResult: cloneAnalysisValue(input.toolResult),
+      ...(input.proposal === undefined
+        ? {}
+        : { proposal: cloneAnalysisValue(input.proposal) }),
     },
     createdAt: input.createdAt,
   });

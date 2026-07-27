@@ -1373,6 +1373,56 @@ pub(crate) async fn session_store_analysis_timeline_append(
     }
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct AnalysisTimelineRecordQuery {
+    record_id: String,
+}
+
+pub(crate) async fn session_store_analysis_timeline_record_get(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    headers: axum::http::HeaderMap,
+    Query(query): Query<AnalysisTimelineRecordQuery>,
+) -> Json<ApiResponse> {
+    if let Some(error) = private_storage_origin_error(&headers) {
+        return error;
+    }
+    if query.record_id.trim().is_empty() {
+        return ApiResponse::error(
+            "analysis_timeline_record_invalid",
+            "analysis timeline recordId must be non-empty",
+        );
+    }
+    let sessions_dir = {
+        let gui = state.gui.lock().expect("gui state lock");
+        if session_metadata(&gui.sessions, &session_id).is_none() {
+            return ApiResponse::error(
+                "analysis_timeline_session_not_found",
+                "analysis timeline requires an exact registered Session identity",
+            );
+        }
+        gui.paths.sessions_dir.clone()
+    };
+    let read_session_id = session_id.clone();
+    let record_id = query.record_id;
+    match tokio::task::spawn_blocking(move || {
+        read_analysis_timeline_record(&sessions_dir, &read_session_id, &record_id)
+    })
+    .await
+    {
+        Ok(Ok(record)) => ApiResponse::ok(json!({
+            "sessionId": session_id,
+            "record": record,
+        })),
+        Ok(Err((code, message))) => ApiResponse::error(code, message),
+        Err(error) => ApiResponse::error(
+            "read_analysis_timeline_failed",
+            format!("analysis timeline blocking read failed: {error}"),
+        ),
+    }
+}
+
 fn trusted_private_storage_origin(headers: &axum::http::HeaderMap) -> bool {
     let Some(origin) = headers
         .get(axum::http::header::ORIGIN)
@@ -1586,6 +1636,61 @@ fn append_analysis_timeline_entries(
             .map(analysis_timeline_ack_value)
             .collect::<Vec<_>>()
     }))
+}
+
+fn read_analysis_timeline_record(
+    sessions_dir: &FsPath,
+    session_id: &str,
+    record_id: &str,
+) -> Result<Value, (String, String)> {
+    use std::io::{BufRead, BufReader};
+
+    let _read_guard = analysis_timeline_append_lock(sessions_dir, session_id)
+        .lock()
+        .expect("analysis timeline read lock");
+    repair_incomplete_analysis_timeline_tail(sessions_dir, session_id)
+        .map_err(|error| ("analysis_timeline_tail_invalid".to_string(), error))?;
+    let tail = read_last_session_jsonl(sessions_dir, session_id, "analysis-timeline.jsonl")
+        .map_err(|error| ("analysis_timeline_tail_invalid".to_string(), error))?;
+    validate_analysis_timeline_chain_if_needed(sessions_dir, session_id, tail.as_ref())
+        .map_err(|error| ("analysis_timeline_chain_invalid".to_string(), error))?;
+    let path = analysis_timeline_path(sessions_dir, session_id);
+    let file = fs::File::open(&path).map_err(|error| {
+        (
+            "analysis_timeline_record_not_found".to_string(),
+            format!("analysis timeline record {record_id} is unavailable: {error}"),
+        )
+    })?;
+    for (line_index, line) in BufReader::new(file).lines().enumerate() {
+        let line = line.map_err(|error| {
+            (
+                "analysis_timeline_chain_invalid".to_string(),
+                format!("analysis timeline record read failed: {error}"),
+            )
+        })?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let record: Value = serde_json::from_str(&line).map_err(|error| {
+            (
+                "analysis_timeline_chain_invalid".to_string(),
+                format!(
+                    "analysis timeline line {} is invalid JSON: {error}",
+                    line_index + 1
+                ),
+            )
+        })?;
+        if record.get("recordId").and_then(Value::as_str) != Some(record_id) {
+            continue;
+        }
+        validate_analysis_timeline_record(&record)
+            .map_err(|error| ("analysis_timeline_chain_invalid".to_string(), error))?;
+        return Ok(record);
+    }
+    Err((
+        "analysis_timeline_record_not_found".to_string(),
+        format!("analysis timeline record {record_id} does not exist"),
+    ))
 }
 
 pub(crate) async fn session_store_projection_delivery_get(
@@ -4854,12 +4959,16 @@ fn validate_goal_fact_variant(
             }
         }
         "checkpoint" => {
-            if !payload.get("checkpoint").is_some_and(Value::is_object) {
-                return Err(SessionDomainStoreError::new(
-                    "session_append_transition_invalid",
-                    format!("Goal checkpoint fact {event_id} has no checkpoint object"),
-                ));
-            }
+            validate_goal_checkpoint_value(
+                event_id,
+                payload.get("checkpoint"),
+                payload.get("goalId").and_then(Value::as_str).unwrap_or_default(),
+                payload
+                    .get("goalRevision")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default(),
+                lifecycle,
+            )?;
         }
         "budgetUsage" => {
             if !payload
@@ -4877,6 +4986,320 @@ fn validate_goal_fact_variant(
                 "session_append_transition_invalid",
                 format!("Goal fact {event_id} has unsupported factKind {fact_kind}"),
             ))
+        }
+    }
+    Ok(())
+}
+
+fn validate_goal_checkpoint_value(
+    event_id: &str,
+    checkpoint: Option<&Value>,
+    goal_id: &str,
+    goal_revision: u64,
+    lifecycle: &str,
+) -> Result<(), SessionDomainStoreError> {
+    let checkpoint = checkpoint.and_then(Value::as_object).ok_or_else(|| {
+        SessionDomainStoreError::new(
+            "session_append_transition_invalid",
+            format!("Goal checkpoint fact {event_id} has no checkpoint object"),
+        )
+    })?;
+    if checkpoint.get("schemaVersion").and_then(Value::as_str)
+        != Some("deepcode.session.goal-checkpoint.v1")
+        || checkpoint.get("goalId").and_then(Value::as_str) != Some(goal_id)
+        || checkpoint.get("goalRevision").and_then(Value::as_u64)
+            != Some(goal_revision)
+        || checkpoint.get("lifecycle").and_then(Value::as_str) != Some(lifecycle)
+        || checkpoint
+            .get("sequence")
+            .and_then(Value::as_u64)
+            .is_none_or(|value| value == 0)
+    {
+        return Err(SessionDomainStoreError::new(
+            "session_append_transition_invalid",
+            format!("Goal checkpoint {event_id} has an invalid schema or Goal identity"),
+        ));
+    }
+    for field in ["checkpointRef", "sessionId", "createdAt"] {
+        let value = checkpoint.get(field).and_then(Value::as_str).ok_or_else(|| {
+            SessionDomainStoreError::new(
+                "session_append_transition_invalid",
+                format!("Goal checkpoint {event_id} has no {field}"),
+            )
+        })?;
+        if field == "createdAt" {
+            if value.trim().is_empty() {
+                return Err(SessionDomainStoreError::new(
+                    "session_append_transition_invalid",
+                    format!("Goal checkpoint {event_id} has an empty createdAt"),
+                ));
+            }
+        } else {
+            validate_domain_identity(value, &format!("goalCheckpoint.{field}"))?;
+        }
+    }
+    for field in ["stateDigest"] {
+        if !checkpoint
+            .get(field)
+            .and_then(Value::as_str)
+            .is_some_and(valid_sha256_digest)
+        {
+            return Err(SessionDomainStoreError::new(
+                "session_append_transition_invalid",
+                format!("Goal checkpoint {event_id} has an invalid {field}"),
+            ));
+        }
+    }
+    let task = checkpoint
+        .get("taskLedgerRef")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            SessionDomainStoreError::new(
+                "session_append_transition_invalid",
+                format!("Goal checkpoint {event_id} has no taskLedgerRef"),
+            )
+        })?;
+    validate_domain_identity(
+        task.get("factRef").and_then(Value::as_str).unwrap_or_default(),
+        "goalCheckpoint.taskLedgerRef.factRef",
+    )?;
+    if task
+        .get("revision")
+        .and_then(Value::as_u64)
+        .is_none_or(|value| value == 0)
+        || !task
+            .get("stateDigest")
+            .and_then(Value::as_str)
+            .is_some_and(valid_sha256_digest)
+    {
+        return Err(SessionDomainStoreError::new(
+            "session_append_transition_invalid",
+            format!("Goal checkpoint {event_id} has an invalid taskLedgerRef"),
+        ));
+    }
+    let language = checkpoint
+        .get("languageRef")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            SessionDomainStoreError::new(
+                "session_append_transition_invalid",
+                format!("Goal checkpoint {event_id} has no languageRef"),
+            )
+        })?;
+    if language
+        .get("revision")
+        .and_then(Value::as_u64)
+        .is_none_or(|value| value == 0)
+        || !matches!(
+            language.get("status").and_then(Value::as_str),
+            Some("pending" | "resolved" | "fallback" | "superseded")
+        )
+    {
+        return Err(SessionDomainStoreError::new(
+            "session_append_transition_invalid",
+            format!("Goal checkpoint {event_id} has an invalid languageRef"),
+        ));
+    }
+    for field in ["sourceTurnId", "turnAuthorityRef"] {
+        validate_domain_identity(
+            language.get(field).and_then(Value::as_str).unwrap_or_default(),
+            &format!("goalCheckpoint.languageRef.{field}"),
+        )?;
+    }
+    validate_goal_identity_array(
+        event_id,
+        checkpoint.get("contextRefs"),
+        "contextRefs",
+        false,
+    )?;
+    validate_goal_identity_array(
+        event_id,
+        checkpoint.get("sourceRefs"),
+        "sourceRefs",
+        true,
+    )?;
+    if let Some(wait) = checkpoint.get("activeWaitRef") {
+        let wait = wait.as_object().ok_or_else(|| {
+            SessionDomainStoreError::new(
+                "session_append_transition_invalid",
+                format!("Goal checkpoint {event_id} has invalid activeWaitRef"),
+            )
+        })?;
+        for field in ["factRef", "waitId"] {
+            validate_domain_identity(
+                wait.get(field).and_then(Value::as_str).unwrap_or_default(),
+                &format!("goalCheckpoint.activeWaitRef.{field}"),
+            )?;
+        }
+    }
+    if let Some(effect) = checkpoint.get("pendingEffect") {
+        validate_goal_pending_effect(event_id, effect)?;
+    }
+    if let Some(fact_ref) = checkpoint.get("lastKernelFactRef") {
+        validate_domain_identity(
+            fact_ref.as_str().unwrap_or_default(),
+            "goalCheckpoint.lastKernelFactRef",
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_goal_pending_effect(
+    event_id: &str,
+    effect: &Value,
+) -> Result<(), SessionDomainStoreError> {
+    let effect = effect.as_object().ok_or_else(|| {
+        SessionDomainStoreError::new(
+            "session_append_transition_invalid",
+            format!("Goal checkpoint {event_id} has invalid pendingEffect"),
+        )
+    })?;
+    let state = effect.get("state").and_then(Value::as_str);
+    if effect.get("schemaVersion").and_then(Value::as_str)
+        != Some("deepcode.session.pending-effect.v1")
+        || effect.get("kind").and_then(Value::as_str) != Some("kernelAction")
+        || !matches!(state, Some("prepared" | "dispatched" | "observed"))
+    {
+        return Err(SessionDomainStoreError::new(
+            "session_append_transition_invalid",
+            format!("Goal checkpoint {event_id} has unsupported pendingEffect"),
+        ));
+    }
+    for field in ["effectId", "runId", "planId", "taskId"] {
+        validate_domain_identity(
+            effect.get(field).and_then(Value::as_str).unwrap_or_default(),
+            &format!("goalPendingEffect.{field}"),
+        )?;
+    }
+    validate_goal_identity_array(
+        event_id,
+        effect.get("actionIds"),
+        "pendingEffect.actionIds",
+        true,
+    )?;
+    validate_goal_identity_array(
+        event_id,
+        effect.get("sourceRefs"),
+        "pendingEffect.sourceRefs",
+        true,
+    )?;
+    let semantic = effect
+        .get("semanticRef")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            SessionDomainStoreError::new(
+                "session_append_transition_invalid",
+                format!("Goal checkpoint {event_id} has no pendingEffect.semanticRef"),
+            )
+        })?;
+    if semantic.get("schemaVersion").and_then(Value::as_str)
+        != Some("deepcode.session.analysis-record-ref.v1")
+        || semantic
+            .get("analysisSeq")
+            .and_then(Value::as_u64)
+            .is_none_or(|value| value == 0)
+    {
+        return Err(SessionDomainStoreError::new(
+            "session_append_transition_invalid",
+            format!("Goal checkpoint {event_id} has invalid pendingEffect.semanticRef"),
+        ));
+    }
+    for field in [
+        "recordId",
+        "providerRequestId",
+        "toolCallId",
+        "proposalId",
+    ] {
+        validate_domain_identity(
+            semantic.get(field).and_then(Value::as_str).unwrap_or_default(),
+            &format!("goalPendingEffect.semanticRef.{field}"),
+        )?;
+    }
+    for field in ["recordDigest", "payloadDigest", "proposalDigest"] {
+        if !semantic
+            .get(field)
+            .and_then(Value::as_str)
+            .is_some_and(valid_sha256_digest)
+        {
+            return Err(SessionDomainStoreError::new(
+                "session_append_transition_invalid",
+                format!("Goal checkpoint {event_id} has invalid semantic {field}"),
+            ));
+        }
+    }
+    match (state, effect.get("kernel")) {
+        (Some("prepared"), None) => {}
+        (Some("dispatched" | "observed"), Some(kernel)) => {
+            let kernel = kernel.as_object().ok_or_else(|| {
+                SessionDomainStoreError::new(
+                    "session_append_transition_invalid",
+                    format!("Goal checkpoint {event_id} has invalid pendingEffect.kernel"),
+                )
+            })?;
+            for field in ["requestId", "contractId"] {
+                validate_domain_identity(
+                    kernel.get(field).and_then(Value::as_str).unwrap_or_default(),
+                    &format!("goalPendingEffect.kernel.{field}"),
+                )?;
+            }
+            if let Some(hash) = kernel.get("contractHash") {
+                if !hash.as_str().is_some_and(|value| !value.trim().is_empty()) {
+                    return Err(SessionDomainStoreError::new(
+                        "session_append_transition_invalid",
+                        format!("Goal checkpoint {event_id} has invalid contractHash"),
+                    ));
+                }
+            }
+            validate_goal_identity_array(
+                event_id,
+                kernel.get("workUnitIds"),
+                "pendingEffect.kernel.workUnitIds",
+                false,
+            )?;
+            validate_goal_identity_array(
+                event_id,
+                kernel.get("kernelFactRefs"),
+                "pendingEffect.kernel.kernelFactRefs",
+                state == Some("observed"),
+            )?;
+        }
+        _ => {
+            return Err(SessionDomainStoreError::new(
+                "session_append_transition_invalid",
+                format!("Goal checkpoint {event_id} has inconsistent pendingEffect state"),
+            ))
+        }
+    }
+    Ok(())
+}
+
+fn validate_goal_identity_array(
+    event_id: &str,
+    value: Option<&Value>,
+    field: &str,
+    require_one: bool,
+) -> Result<(), SessionDomainStoreError> {
+    let values = value.and_then(Value::as_array).ok_or_else(|| {
+        SessionDomainStoreError::new(
+            "session_append_transition_invalid",
+            format!("Goal checkpoint {event_id} has invalid {field}"),
+        )
+    })?;
+    if require_one && values.is_empty() {
+        return Err(SessionDomainStoreError::new(
+            "session_append_transition_invalid",
+            format!("Goal checkpoint {event_id} requires non-empty {field}"),
+        ));
+    }
+    let mut unique = std::collections::HashSet::new();
+    for value in values {
+        let value = value.as_str().unwrap_or_default();
+        validate_domain_identity(value, &format!("goalCheckpoint.{field}"))?;
+        if !unique.insert(value) {
+            return Err(SessionDomainStoreError::new(
+                "session_append_transition_invalid",
+                format!("Goal checkpoint {event_id} duplicates {field}"),
+            ));
         }
     }
     Ok(())
