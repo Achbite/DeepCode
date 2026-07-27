@@ -18,6 +18,7 @@ mod projection_delivery;
 mod routes;
 mod session_archive;
 mod session_archive_render;
+mod session_fact_lineage;
 mod session_memory_store;
 mod session_store;
 mod settings_api;
@@ -49,6 +50,7 @@ pub(crate) use project_store::*;
 pub(crate) use projection_delivery::*;
 pub(crate) use session_archive::*;
 pub(crate) use session_archive_render::*;
+pub(crate) use session_fact_lineage::*;
 pub(crate) use session_memory_store::*;
 pub(crate) use session_store::*;
 pub(crate) use settings_api::*;
@@ -82,6 +84,7 @@ async fn main() {
         session_run_deltas: Arc::new(Mutex::new(HashMap::new())),
         projection_delivery: Arc::new(Mutex::new(ProjectionDeliveryBufferState::default())),
     };
+    discover_session_run_recovery(&state);
     if std::env::var("DEEPCODE_DAEMON_IPC_STDIO")
         .map(|value| value == "1")
         .unwrap_or(false)

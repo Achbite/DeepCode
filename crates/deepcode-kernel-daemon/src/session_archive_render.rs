@@ -2,18 +2,25 @@ use crate::prelude::*;
 use crate::*;
 
 pub(crate) fn append_jsonl_file(path: &FsPath, entries: &[Value]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let _append_guard = jsonl_file_lock(path)
+        .lock()
+        .expect("archive jsonl append lock");
     let Some(parent) = path.parent() else {
         return Ok(());
     };
     fs::create_dir_all(parent)?;
+    let mut bytes = Vec::new();
+    for entry in entries {
+        bytes.extend(serde_json::to_vec(entry).unwrap_or_else(|_| b"{}".to_vec()));
+        bytes.push(b'\n');
+    }
     let mut file = fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)?;
-    for entry in entries {
-        let line = serde_json::to_string(entry).unwrap_or_else(|_| "{}".to_string());
-        writeln!(file, "{line}")?;
-    }
+    file.write_all(&bytes)?;
     Ok(())
 }
 
@@ -37,13 +44,53 @@ pub(crate) fn read_optional_text_file(path: &FsPath) -> Option<String> {
 }
 
 pub(crate) fn read_jsonl_file(path: &FsPath) -> Vec<Value> {
+    let _read_guard = jsonl_file_lock(path)
+        .lock()
+        .expect("archive jsonl read lock");
     let Ok(content) = fs::read_to_string(path) else {
         return Vec::new();
     };
-    content
-        .lines()
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .collect()
+    parse_jsonl_records(&content, path)
+}
+
+fn jsonl_file_lock(path: &FsPath) -> &'static std::sync::Mutex<()> {
+    use std::hash::{Hash, Hasher};
+
+    const SHARD_COUNT: usize = 64;
+    static SHARDS: std::sync::OnceLock<Vec<std::sync::Mutex<()>>> = std::sync::OnceLock::new();
+    let shards = SHARDS.get_or_init(|| {
+        (0..SHARD_COUNT)
+            .map(|_| std::sync::Mutex::new(()))
+            .collect()
+    });
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut hasher);
+    &shards[(hasher.finish() as usize) % SHARD_COUNT]
+}
+
+pub(crate) fn parse_jsonl_records(content: &str, path: &FsPath) -> Vec<Value> {
+    let mut records = Vec::new();
+    for (line_index, line) in content.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let mut stream = serde_json::Deserializer::from_str(line).into_iter::<Value>();
+        while let Some(record) = stream.next() {
+            match record {
+                Ok(record) => records.push(record),
+                Err(error) => {
+                    eprintln!(
+                        "invalid JSONL record in {} at line {}: {}",
+                        path.display(),
+                        line_index + 1,
+                        error
+                    );
+                    break;
+                }
+            }
+        }
+    }
+    records
 }
 
 pub(crate) fn archive_file_entries(archive_dir: &FsPath) -> Vec<Value> {
@@ -81,11 +128,21 @@ fn collect_archive_file_entries(root: &FsPath, current: &FsPath, entries: &mut V
             .unwrap_or(&path)
             .to_string_lossy()
             .replace('\\', "/");
+        if !is_public_conversation_archive_file(&relative) {
+            continue;
+        }
         entries.push(json!({
             "path": relative,
             "sizeBytes": metadata.len()
         }));
     }
+}
+
+pub(crate) fn is_public_conversation_archive_file(relative: &str) -> bool {
+    matches!(
+        relative.replace('\\', "/").as_str(),
+        "exports/complete.md" | "exports/chronological.md"
+    )
 }
 
 pub(crate) fn conversation_complete_markdown(
@@ -103,17 +160,25 @@ pub(crate) fn conversation_complete_markdown(
         String::new(),
         "## Projection".to_string(),
     ];
-    if projection.is_empty() {
+    let visible_projection = projection
+        .iter()
+        .filter(|event| !is_private_analysis_projection_entry(event))
+        .collect::<Vec<_>>();
+    if visible_projection.is_empty() {
         lines.push("- 无 projection events。".to_string());
     } else {
-        for event in projection {
+        for event in visible_projection {
             lines.push(projection_event_markdown(event));
         }
     }
-    if !transcript.is_empty() {
+    let visible_transcript = transcript
+        .iter()
+        .filter(|entry| !is_private_analysis_transcript_entry(entry))
+        .collect::<Vec<_>>();
+    if !visible_transcript.is_empty() {
         lines.push(String::new());
         lines.push("## Transcript".to_string());
-        for entry in transcript {
+        for entry in visible_transcript {
             lines.push(transcript_entry_markdown(entry));
         }
     }
@@ -143,6 +208,11 @@ pub(crate) fn conversation_chronological_markdown(session_id: &str, entries: &[V
             .and_then(Value::as_str)
             .unwrap_or_default();
         let entry = item.get("entry").unwrap_or(&Value::Null);
+        if (source == "projection" && is_private_analysis_projection_entry(entry))
+            || (source == "transcript" && is_private_analysis_transcript_entry(entry))
+        {
+            continue;
+        }
         let heading = if source == "projection" {
             format!(
                 "Projection / {} / {}",
@@ -168,6 +238,61 @@ pub(crate) fn conversation_chronological_markdown(session_id: &str, entries: &[V
         lines.push(String::new());
     }
     lines.join("\n").trim_end().to_string()
+}
+
+fn is_private_analysis_projection_entry(entry: &Value) -> bool {
+    let payload = entry.get("payload").unwrap_or(&Value::Null);
+    let kind = entry
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let channel = payload
+        .get("channel")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let visibility = payload
+        .get("visibility")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let presentation = payload
+        .get("presentation")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            entry
+                .get("display")
+                .and_then(|display| display.get("presentation"))
+                .and_then(Value::as_str)
+        })
+        .unwrap_or_default();
+    kind == "trace"
+        || kind.starts_with("trace/")
+        || matches!(channel, "reasoning" | "thinking" | "trace")
+        || matches!(visibility, "hidden" | "debug" | "trace")
+        || presentation == "traceOnly"
+        || payload
+            .get("reasoningTrace")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+}
+
+fn is_private_analysis_transcript_entry(entry: &Value) -> bool {
+    let kind = entry
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let channel = entry
+        .get("channel")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let visibility = entry
+        .get("visibility")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    kind == "provider_trace"
+        || kind == "trace"
+        || kind.starts_with("trace/")
+        || matches!(channel, "reasoning" | "thinking" | "trace")
+        || matches!(visibility, "hidden" | "debug" | "trace")
 }
 
 pub(crate) fn conversation_context_assemblies_markdown(
@@ -522,6 +647,40 @@ pub(crate) fn is_hidden_reasoning_wire_record(value: &Value) -> bool {
         .and_then(Value::as_str)
         .unwrap_or_default();
     matches!(kind, "reasoning" | "reasoningDelta" | "hiddenReasoning")
+        || is_hidden_reasoning_persistence_record(value)
+}
+
+pub(crate) fn is_hidden_reasoning_persistence_record(value: &Value) -> bool {
+    let payload = value.get("payload").unwrap_or(&Value::Null);
+    let kind = value
+        .get("kind")
+        .and_then(Value::as_str)
+        .map(normalized_archive_key)
+        .unwrap_or_default();
+    let event_type = value
+        .get("type")
+        .and_then(Value::as_str)
+        .or_else(|| payload.get("type").and_then(Value::as_str))
+        .map(normalized_archive_key)
+        .unwrap_or_default();
+    let channel = value
+        .get("channel")
+        .and_then(Value::as_str)
+        .or_else(|| payload.get("channel").and_then(Value::as_str))
+        .map(normalized_archive_key)
+        .unwrap_or_default();
+    matches!(
+        kind.as_str(),
+        "reasoning" | "reasoningdelta" | "providerreasoningdelta" | "hiddenreasoning"
+    ) || matches!(
+        event_type.as_str(),
+        "reasoning" | "reasoningdelta" | "providerreasoningdelta" | "hiddenreasoning"
+    ) || matches!(channel.as_str(), "reasoning" | "thinking")
+        || value
+            .get("reasoningTrace")
+            .or_else(|| payload.get("reasoningTrace"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
 }
 
 pub(crate) fn strip_hidden_reasoning_fields(value: Value) -> Value {

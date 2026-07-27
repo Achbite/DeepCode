@@ -441,7 +441,7 @@ pub(crate) fn ensure_current_agent_session_for_scope(
     gui: &mut GuiState,
     scope_key: &str,
     fallback_scope: Option<(Option<String>, Option<String>, Option<String>)>,
-) {
+) -> Result<(), SessionDomainStoreError> {
     if let Some(next_id) = gui
         .sessions
         .iter()
@@ -452,13 +452,13 @@ pub(crate) fn ensure_current_agent_session_for_scope(
         gui.current_session_ids_by_scope
             .insert(scope_key.to_string(), next_id.clone());
         gui.current_session_id = Some(next_id);
-        return;
+        return Ok(());
     }
 
     let id = format!("session-{}", now_millis());
     let now = now_text();
     let (profile_id, workspace_id, workspace_hash) = fallback_scope.unwrap_or_default();
-    let session = create_agent_session_value(
+    let mut session = create_agent_session_value(
         &id,
         &now,
         "New Agent Session",
@@ -467,12 +467,38 @@ pub(crate) fn ensure_current_agent_session_for_scope(
         workspace_id.as_deref(),
         workspace_hash.as_deref(),
     );
+    let new_session_storage_dir = gui.paths.sessions_dir.join(safe_path_segment(&id));
+    if new_session_storage_dir.exists() {
+        return Err(SessionDomainStoreError::new(
+            "session_append_recovery_required",
+            "generated replacement Session identity already has private storage",
+        ));
+    }
+    if let Err(error) = initialize_session_domain_store(&gui.paths.sessions_dir, &id) {
+        remove_session_storage_dir(&gui.paths.sessions_dir, &id);
+        return Err(error);
+    }
+    let domain_state = match session_domain_state(&gui.paths.sessions_dir, &id) {
+        Ok(domain_state) => domain_state,
+        Err(error) => {
+            remove_session_storage_dir(&gui.paths.sessions_dir, &id);
+            return Err(error);
+        }
+    };
+    session["domainState"] = serde_json::to_value(domain_state).map_err(|error| {
+        remove_session_storage_dir(&gui.paths.sessions_dir, &id);
+        SessionDomainStoreError::new(
+            "session_append_recovery_required",
+            format!("failed to serialize replacement Session domain state: {error}"),
+        )
+    })?;
     gui.current_session_id = Some(id.clone());
     gui.current_session_ids_by_scope
         .insert(session_scope_key(&session), id.clone());
     gui.session_projection_cache.insert(id.clone(), Vec::new());
     gui.trace_events.insert(id.clone(), Vec::new());
     gui.sessions.insert(0, session);
+    Ok(())
 }
 
 pub(crate) fn compact_agent_session_title(content: &str) -> Option<String> {
@@ -544,7 +570,9 @@ pub(crate) fn refresh_pending_session_titles(gui: &mut GuiState) {
             .get(&session_id)
             .cloned()
             .unwrap_or_else(|| read_session_projection_jsonl(&sessions_dir, &session_id));
-        if let Some(content) = first_user_message_content(&events) {
+        if let Some(content) =
+            first_user_message_content(&canonical_session_projection_events(events))
+        {
             maybe_auto_title_session(gui, &session_id, &content);
         }
     }
@@ -563,18 +591,6 @@ pub(crate) fn session_mut<'a>(gui: &'a mut GuiState, session_id: &str) -> Option
         .find(|session| session.get("id").and_then(Value::as_str) == Some(session_id))
 }
 
-pub(crate) fn update_session_event_count(gui: &mut GuiState, session_id: &str) {
-    let count = gui
-        .session_projection_cache
-        .get(session_id)
-        .map(Vec::len)
-        .unwrap_or_default();
-    if let Some(session) = session_mut(gui, session_id) {
-        session["eventCount"] = json!(count);
-        session["updatedAt"] = json!(now_text());
-    }
-}
-
 pub(crate) fn session_result(gui: &GuiState, session_id: &str) -> Json<ApiResponse> {
     let Some(session) = gui
         .sessions
@@ -586,13 +602,56 @@ pub(crate) fn session_result(gui: &GuiState, session_id: &str) -> Json<ApiRespon
     if !session_schema_is_compatible(session) {
         return incompatible_session_response();
     }
-    let events = gui
-        .session_projection_cache
-        .get(session_id)
-        .cloned()
-        .unwrap_or_else(|| read_session_projection_jsonl(&gui.paths.sessions_dir, session_id));
-    ApiResponse::ok(json!({
-        "session": session,
-        "events": events
-    }))
+    let snapshot = match read_session_domain_snapshot(&gui.paths.sessions_dir, session_id) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            return ApiResponse::error_with_data(
+                error.code,
+                error.message.clone(),
+                error.api_details(&gui.paths.sessions_dir, session_id),
+            )
+        }
+    };
+    let events = canonical_session_projection_events(snapshot.events.clone());
+    match snapshot.writeability {
+        SessionDomainWriteability::Current => {
+            let domain_state = match session_domain_state_from_snapshot(session_id, &snapshot) {
+                Ok(domain_state) => domain_state,
+                Err(error) => {
+                    return ApiResponse::error_with_data(
+                        error.code,
+                        error.message.clone(),
+                        error.api_details(&gui.paths.sessions_dir, session_id),
+                    )
+                }
+            };
+            ApiResponse::ok(json!({
+                "session": session,
+                "events": events,
+                "domainState": domain_state,
+                "appendWriteability": {
+                    "schemaVersion": "deepcode.session.append-writeability.v1",
+                    "status": "writable",
+                    "format": "domainBatchV1"
+                }
+            }))
+        }
+        SessionDomainWriteability::LegacyReadOnly | SessionDomainWriteability::Uninitialized => {
+            ApiResponse::ok(json!({
+                "session": session,
+                "events": events,
+                "appendWriteability": {
+                    "schemaVersion": "deepcode.session.append-writeability.v1",
+                    "status": "readOnly",
+                    "format": "legacyRawEventsV1",
+                    "reason": "legacyFormat"
+                }
+            }))
+        }
+        SessionDomainWriteability::Corrupt => ApiResponse::error_with_data(
+            "session_append_recovery_required",
+            "Session domain store failed strict validation",
+            session_append_writeability_value(&gui.paths.sessions_dir, session_id),
+        ),
+    }
 }
