@@ -7107,8 +7107,27 @@ fn validate_session_run_bootstrap_admission_locked(
         }
     }
     let has_running_fact = command.events.iter().any(|event| {
+        let run_id = event
+            .pointer("/payload/runId")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty());
         event.get("kind").and_then(Value::as_str) == Some("session_run_state")
             && event.pointer("/payload/status").and_then(Value::as_str) == Some("running")
+            && event.pointer("/payload/phase").and_then(Value::as_str) == Some("context_reading")
+            && event.pointer("/payload/reason").and_then(Value::as_str) == Some("session")
+            && event
+                .pointer("/payload/decisionKind")
+                .and_then(Value::as_str)
+                == Some("session")
+            && event
+                .pointer("/payload/decisionOwner/kind")
+                .and_then(Value::as_str)
+                == Some("session")
+            && run_id.is_some()
+            && event
+                .pointer("/payload/decisionOwner/runId")
+                .and_then(Value::as_str)
+                == run_id
             && event
                 .pointer("/payload/lineage/turnAuthorityRef")
                 .and_then(Value::as_str)

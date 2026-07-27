@@ -27,6 +27,7 @@ import {
 import {
   acknowledgeProviderAdmissions,
   bindPendingProviderProposalAdmission,
+  isSessionRunBootstrapFact,
   kernelFactRefFromEvent,
   pendingProviderAdmission,
   pendingProviderAdmissionForProposal,
@@ -459,7 +460,17 @@ export class SessionAppendCoordinator
 
     for (let offset = 0; offset < incomingEvents.length; offset += 1) {
       let event = incomingEvents[offset]!;
-      if (sessionFactLineageDisposition(event) !== 'persistentDomainFact') {
+      const materializesBootstrapFact = (
+        !this.currentState.runFences.some(
+          (candidate) => candidate.runId === this.hostRunId
+        )
+        && Boolean(this.bootstrap)
+        && isSessionRunBootstrapFact(event)
+      );
+      if (
+        sessionFactLineageDisposition(event) !== 'persistentDomainFact'
+        && !materializesBootstrapFact
+      ) {
         continue;
       }
       const existing = sessionFactLineage(event);

@@ -102,7 +102,11 @@ import {
 import { RunEngine } from './runEngine.js';
 import { diag, isEmptyResponseError, objectRecord, SessionDriverLoopError, stringValue } from './runtimeSupport.js';
 import { AgentRunReactor } from './agentRunReactor.js';
-import { bindPendingProviderProposalAdmission } from './authority/sessionFactLineage.js';
+import {
+  bindPendingProviderProposalAdmission,
+  SessionFactLineageError,
+} from './authority/sessionFactLineage.js';
+import { SessionAppendCoordinatorError } from './authority/sessionAppendCoordinator.js';
 import {
   conversationPresentationLanguage,
   conversationPresentationLanguageBinding,
@@ -2556,6 +2560,16 @@ export class SessionDriverLoop {
         ? await this.runEngine.resume(input)
         : await this.runEngine.run(input);
     } catch (error) {
+      // A rejected canonical append did not establish a new durable authority
+      // boundary. A second diagnostic append could bind to an older turn or
+      // manufacture an unowned terminal fact, so surface the admission failure
+      // unchanged and let deterministic recovery inspect the durable store.
+      if (
+        error instanceof SessionAppendCoordinatorError
+        || error instanceof SessionFactLineageError
+      ) {
+        throw error;
+      }
       const rawMessage = error instanceof Error ? error.message : String(error);
       const code = error instanceof SessionDriverLoopError
         ? error.code

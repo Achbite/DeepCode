@@ -395,8 +395,9 @@ fn event_disposition(event: &EventView<'_>) -> EventDisposition {
     }
     let payload = event.payload;
     // Terminal run state is a durable outcome fact even though presentation
-    // keeps it out of the visible conversation.
-    if terminal_session_run_state(event) {
+    // keeps it out of the visible conversation. An initial running state is
+    // durable only when the atomic bootstrap supplied explicit lineage.
+    if terminal_session_run_state(event) || durable_session_run_bootstrap_fact(event) {
         return EventDisposition::PersistentDomainFact;
     }
     if matches!(
@@ -480,6 +481,25 @@ fn terminal_session_run_state(event: &EventView<'_>) -> bool {
                 .and_then(|payload| text_field(payload, "status")),
             Some("completed" | "failed" | "cancelled" | "waiting")
         )
+}
+
+fn durable_session_run_bootstrap_fact(event: &EventView<'_>) -> bool {
+    let Some(payload) = event.payload else {
+        return false;
+    };
+    let Some(decision_owner) = payload.get("decisionOwner").and_then(Value::as_object) else {
+        return false;
+    };
+    let run_id = text_field(payload, "runId");
+    event.kind == "session_run_state"
+        && text_field(payload, "status") == Some("running")
+        && text_field(payload, "phase") == Some("context_reading")
+        && text_field(payload, "reason") == Some("session")
+        && text_field(payload, "decisionKind") == Some("session")
+        && text_field(decision_owner, "kind") == Some("session")
+        && run_id.is_some()
+        && text_field(decision_owner, "runId") == run_id
+        && payload.get("lineage").is_some()
 }
 
 fn parse_turn_authority(

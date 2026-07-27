@@ -252,7 +252,10 @@ export function withSessionFactLineage(
   event: AgentEvent,
   lineage: SessionFactLineageV1
 ): AgentEvent {
-  if (sessionFactLineageDisposition(event) !== 'persistentDomainFact') {
+  if (
+    sessionFactLineageDisposition(event) !== 'persistentDomainFact'
+    && !isSessionRunBootstrapFact(event)
+  ) {
     throw new SessionFactLineageError(
       'session_fact_lineage_invalid',
       `Agent event ${event.id} (${event.kind}) is not an eligible persistent Session domain fact.`
@@ -338,7 +341,9 @@ export function prepareSessionFactBatch(
       );
     }
     const lineage = explicit ?? payloadLineage;
-    const disposition = sessionFactLineageDisposition(event);
+    const disposition = isSessionRunBootstrapFact(event) && Boolean(lineage)
+      ? 'persistentDomainFact'
+      : sessionFactLineageDisposition(event);
     if (disposition === 'persistentDomainFact') {
       if (!lineage) {
         throw new SessionFactLineageError(
@@ -553,11 +558,18 @@ export function sessionFactLineageDisposition(
   }
   if (payload?.kernelEvent !== undefined) return 'rawKernelProjection';
   // Terminal run state is a durable Session settlement fact even though its
-  // presentation remains debug-only. Visibility controls projection, not
-  // lineage or append admission.
+  // presentation remains debug-only. The initial running state becomes
+  // durable only after the bootstrap coordinator supplies explicit lineage,
+  // preserving the transient meaning of older unlineaged progress events.
   if (
     event.kind === 'session_run_state'
-    && isTerminalSessionRunStatus(payload?.status)
+    && (
+      isTerminalSessionRunStatus(payload?.status)
+      || (
+        isSessionRunBootstrapFact(event)
+        && sessionFactLineage(event) !== undefined
+      )
+    )
   ) {
     return 'persistentDomainFact';
   }
@@ -592,6 +604,20 @@ export function sessionFactLineageDisposition(
     return 'persistentDomainFact';
   }
   return 'nonDomainEvent';
+}
+
+export function isSessionRunBootstrapFact(event: AgentEvent): boolean {
+  if (event.kind !== 'session_run_state') return false;
+  const payload = objectRecord(event.payload);
+  const decisionOwner = objectRecord(payload?.decisionOwner);
+  const runId = stringValue(payload?.runId);
+  return payload?.status === 'running'
+    && payload?.phase === 'context_reading'
+    && payload?.reason === 'session'
+    && payload?.decisionKind === 'session'
+    && decisionOwner?.kind === 'session'
+    && Boolean(runId)
+    && stringValue(decisionOwner?.runId) === runId;
 }
 
 export function assertNoLegacySessionDomainFacts(
