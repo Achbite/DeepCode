@@ -3,8 +3,9 @@ use deepcode_kernel_abi::v2::{
     EffectEvidenceV2, EffectId, FactId, IdempotencyKeyHashV2, IndeterminateReasonV2, InputId,
     InvocationAuthorityV2, InvocationId, KernelFactEnvelopeV2, OperationId, PlatformV2,
     PostObservedEffectFailureCodeV2, ResolvedResourceV2, ResourceId, ResourceScopeV2,
-    ResourceStateDigestV2, ResourceStateV2, RunId, TargetRevalidationDigestV2,
-    TargetRevalidationObservationV2, WorkspaceBindingDigestV2, WorkspaceObjectKindV2,
+    ResourceStateDigestV2, ResourceStateV2, RunId, RunRetirementReasonCodeV2,
+    TargetRevalidationDigestV2, TargetRevalidationObservationV2, WorkspaceBindingDigestV2,
+    WorkspaceObjectKindV2,
 };
 use deepcode_kernel_abi::v2_command::{InvocationPhaseV2, KernelErrorV2};
 use deepcode_kernel_tools::{AuthorityToolIdV4, ToolInvocationInputV4};
@@ -18,6 +19,18 @@ pub(super) struct RunRecord {
     pub(super) epoch: ControlEpoch,
     pub(super) active_invocation_id: Option<InvocationId>,
     pub(super) admitted_inputs: HashMap<InputId, ControlEpoch>,
+    pub(super) retirement_fence: Option<AuthorityRunRetirementFence>,
+    // Retired records stay in the reducer as a permanent admission fence.
+    // Run retirement itself is accepted only after all admitted work settles.
+    pub(super) retired: Option<RunRetirementReasonCodeV2>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct AuthorityRunRetirementFence {
+    pub(super) fact_id: FactId,
+    pub(super) ledger_sequence: u64,
+    pub(super) reason_code: RunRetirementReasonCodeV2,
+    pub(super) reason: Option<String>,
 }
 
 pub(super) type InvocationPhase = InvocationPhaseV2;

@@ -20,18 +20,20 @@ use crate::executors::{
 use deepcode_kernel_abi::v2::{
     command_request_digest_v2, target_revalidation_set_digest_v2, AttemptId, AuthorizationFactV2,
     CancelRequestId, CancellationReasonCodeV2, CommandEpochContextV2, CommandRequestId,
-    ControlEpoch, EffectEvidenceV2, EffectId, FactId, IndeterminateReasonV2, InvocationAuthorityV2,
-    InvocationFactV2, InvocationId, KernelFactDraftV2, KernelFactEnvelopeV2, KernelFactPayloadV2,
-    LastObservationV2, MutationCommandResultV2, OperationId, PreEffectFailureCodeV2, RecordedAtV2,
-    ResourceAttemptIdentityV2, ResourceFactV2, ResourceId, RunId, V2ValidationError,
+    ControlEpoch, EffectEvidenceV2, EffectId, FactId, IndeterminateReasonV2, InputId,
+    InvocationAuthorityV2, InvocationFactV2, InvocationId, KernelFactDraftV2, KernelFactEnvelopeV2,
+    KernelFactPayloadV2, LastObservationV2, MutationCommandResultV2, OperationId,
+    PreEffectFailureCodeV2, RecordedAtV2, ResourceAttemptIdentityV2, ResourceFactV2, ResourceId,
+    RunId, RunRetirementReasonCodeV2, V2ValidationError,
 };
 use deepcode_kernel_abi::v2_command::{
-    ControlEpochAdvanceV2, ControlEpochAdvancedReplyV2, InvalidFieldViolationV2,
-    InvocationCancelReplyV2, InvocationCancelTargetV2, InvocationCancelV2, KernelCommandEnvelopeV2,
-    KernelCommandV2, KernelErrorV2, KernelReplyV2, RecordedCommandErrorV2, ToolIntentSubmitReplyV2,
+    ControlEpochAdvanceV2, ControlEpochAdvancedReplyV2, EpochPreconditionV2,
+    InvalidFieldViolationV2, InvocationCancelReplyV2, InvocationCancelTargetV2, InvocationCancelV2,
+    KernelCommandEnvelopeV2, KernelCommandV2, KernelErrorV2, KernelReplyV2, RecordedCommandErrorV2,
+    ToolIntentSubmitReplyV2,
 };
 use deepcode_kernel_abi::{
-    CanonicalArgumentsDigestV2, ToolContextRefV2, ToolContractDigestV2, ToolIdV2,
+    CanonicalArgumentsDigestV2, RunCapabilityV2, ToolContextRefV2, ToolContractDigestV2, ToolIdV2,
     WorkspaceBindingRefV2,
 };
 use deepcode_kernel_ledger::v2::{
@@ -43,6 +45,7 @@ use deepcode_kernel_ledger::v2::{
     PublicCommandReceiptV2, PutFactQueryContinuationOutcomeV2, PutPublicCommandReceiptOutcomeV2,
 };
 use deepcode_kernel_tools::ToolInvocationInputV4;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -52,6 +55,47 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const DIRECT_INVOCATION_MATERIAL_KIND: &str = "toolInvocation";
 const DIRECT_INVOCATION_ADMITTED: &str = "admitted";
 const DIRECT_INVOCATION_TERMINAL: &str = "terminal";
+pub(super) const RUN_CAPABILITY_VERIFIER_MATERIAL_KIND: &str = "runCapabilityVerifier";
+pub(super) const RUN_CAPABILITY_VERIFIER_BOUND: &str = "bound";
+
+pub(super) fn run_capability_verifier_digest(
+    run_id: &RunId,
+    capability: &RunCapabilityV2,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"deepcode.run-capability-verifier.v2\0");
+    hasher.update(run_id.as_str().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(capability.expose_to_transport().as_bytes());
+    let digest = hasher.finalize();
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write;
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    encoded
+}
+
+fn run_capability_verifier_material(
+    run_id: &RunId,
+    control_epoch: ControlEpoch,
+    capability: &RunCapabilityV2,
+) -> AuthorityMaterialDraftV2 {
+    AuthorityMaterialDraftV2 {
+        material_kind: RUN_CAPABILITY_VERIFIER_MATERIAL_KIND.to_owned(),
+        material_id: run_id.to_string(),
+        run_id: run_id.clone(),
+        control_epoch: control_epoch.get(),
+        lifecycle: RUN_CAPABILITY_VERIFIER_BOUND.to_owned(),
+        operation_id: None,
+        invocation_id: None,
+        lease: None,
+        payload_json: serde_json::json!({
+            "runId": run_id,
+            "tokenVerifierSha256": run_capability_verifier_digest(run_id, capability),
+        }),
+    }
+}
 
 struct IdMint {
     nonce: String,
@@ -128,6 +172,22 @@ pub(super) struct DirectToolIntentContinuationOutcome {
     pub(super) reply: ToolIntentSubmitReplyV2,
     pub(super) authorization_fact_id: FactId,
     pub(super) authorization_ledger_sequence: u64,
+}
+
+#[derive(Clone)]
+pub(super) struct RunRetirementFenceOutcome {
+    pub(super) control_epoch: ControlEpoch,
+    pub(super) fence_fact_id: FactId,
+    pub(super) fence_ledger_sequence: u64,
+    pub(super) reason_code: RunRetirementReasonCodeV2,
+    pub(super) reason: Option<String>,
+}
+
+struct RunRetirementFenceDraft {
+    fact_id: FactId,
+    reason_code: RunRetirementReasonCodeV2,
+    reason: Option<String>,
+    capability_verifier: Option<AuthorityMaterialDraftV2>,
 }
 
 struct DirectAuthorityAdmittedInvocation {
@@ -270,8 +330,25 @@ impl AuthorityService {
         workspace_root: &Path,
     ) -> AuthorityResult<WorkspaceBinding> {
         let binding = resolve_workspace_binding(workspace_root)?;
+        self.bind_resolved_run_workspace(run_id, binding)
+    }
+
+    pub(super) fn bind_resolved_run_workspace(
+        &self,
+        run_id: &RunId,
+        binding: WorkspaceBinding,
+    ) -> AuthorityResult<WorkspaceBinding> {
         {
             let state = self.inner.state.lock().map_err(|_| storage_fault())?;
+            if state
+                .runs
+                .get(run_id)
+                .is_some_and(|run| run.retirement_fence.is_some() || run.retired.is_some())
+            {
+                return Err(KernelErrorV2::RunNotFound {
+                    run_id: run_id.clone(),
+                });
+            }
             if state.direct_invocations.values().any(|invocation| {
                 invocation.run_id == *run_id
                     && invocation.workspace_binding_digest != binding.digest
@@ -294,6 +371,54 @@ impl AuthorityService {
         }
         workspaces.insert(run_id.clone(), binding.clone());
         Ok(binding)
+    }
+
+    pub(super) fn unbind_run_workspace_host(&self, run_id: &RunId) -> AuthorityResult<()> {
+        self.inner
+            .workspaces
+            .lock()
+            .map_err(|_| storage_fault())?
+            .remove(run_id);
+        Ok(())
+    }
+
+    pub(super) fn run_retirement_fence_host(
+        &self,
+        run_id: &RunId,
+    ) -> AuthorityResult<Option<RunRetirementFenceOutcome>> {
+        let state = self.inner.state.lock().map_err(|_| storage_fault())?;
+        let run = state
+            .runs
+            .get(run_id)
+            .ok_or_else(|| KernelErrorV2::RunNotFound {
+                run_id: run_id.clone(),
+            })?;
+        Ok(run
+            .retirement_fence
+            .as_ref()
+            .map(|fence| RunRetirementFenceOutcome {
+                control_epoch: run.epoch,
+                fence_fact_id: fence.fact_id.clone(),
+                fence_ledger_sequence: fence.ledger_sequence,
+                reason_code: fence.reason_code,
+                reason: fence.reason.clone(),
+            }))
+    }
+
+    pub(super) fn require_run_accepting_commands(&self, run_id: &RunId) -> AuthorityResult<()> {
+        let state = self.inner.state.lock().map_err(|_| storage_fault())?;
+        let run = state
+            .runs
+            .get(run_id)
+            .ok_or_else(|| KernelErrorV2::RunNotFound {
+                run_id: run_id.clone(),
+            })?;
+        if run.retirement_fence.is_some() || run.retired.is_some() {
+            return Err(KernelErrorV2::RunNotFound {
+                run_id: run_id.clone(),
+            });
+        }
+        Ok(())
     }
 
     pub(super) fn workspace_for_run(&self, run_id: &RunId) -> AuthorityResult<WorkspaceBinding> {
@@ -352,6 +477,7 @@ impl AuthorityService {
         workspace_binding_ref: WorkspaceBindingRefV2,
         settings_ceiling_digest: deepcode_kernel_abi::v2::SettingsCeilingDigestV2,
         tool_context_ref: ToolContextRefV2,
+        run_capability: &RunCapabilityV2,
         mut receipt: PublicCommandReceiptV2,
     ) -> AuthorityResult<ControlEpochAdvancedReplyV2> {
         let workspace = self.workspace_for_run(&command.run_id)?;
@@ -403,7 +529,7 @@ impl AuthorityService {
             fact_id: run_opened_fact_id.clone(),
             payload: KernelFactPayloadV2::Control(
                 deepcode_kernel_abi::v2::ControlFactV2::RunOpened {
-                    run_id: command.run_id,
+                    run_id: command.run_id.clone(),
                     control_epoch: new_epoch,
                     public_request_id,
                     public_request_digest,
@@ -416,13 +542,22 @@ impl AuthorityService {
             ),
         });
         receipt.settlement_fact_id = Some(run_opened_fact_id);
+        let verifier_material =
+            run_capability_verifier_material(&command.run_id, new_epoch, run_capability);
         self.prevalidate_drafts(&state, &drafts)?;
         let outcome = self
             .inner
             .writer
             .lock()
             .map_err(|_| storage_fault())?
-            .append_with_public_command_receipt(drafts, receipt)
+            .append_with_public_receipt_and_authority_material(
+                drafts,
+                receipt,
+                vec![AuthorityMaterialMutationV2::Put {
+                    material: verifier_material,
+                    fact_index: 2,
+                }],
+            )
             .map_err(|_| storage_fault())?;
         match outcome.receipt {
             PutPublicCommandReceiptOutcomeV2::Inserted(_) => {
@@ -640,7 +775,86 @@ impl AuthorityService {
             command,
             Some(Box::new(build_receipt)),
             material_mutations,
+            true,
+            None,
         )
+    }
+
+    pub(super) fn fence_run_retirement_host(
+        &self,
+        run_id: &RunId,
+        reason_code: RunRetirementReasonCodeV2,
+        reason: Option<String>,
+        run_capability: Option<&RunCapabilityV2>,
+    ) -> AuthorityResult<RunRetirementFenceOutcome> {
+        let current_epoch = {
+            let state = self.inner.state.lock().map_err(|_| storage_fault())?;
+            let run = state
+                .runs
+                .get(run_id)
+                .ok_or_else(|| KernelErrorV2::RunNotFound {
+                    run_id: run_id.clone(),
+                })?;
+            if run.retirement_fence.is_some() || run.retired.is_some() {
+                return Err(KernelErrorV2::RunNotFound {
+                    run_id: run_id.clone(),
+                });
+            }
+            run.epoch
+        };
+        let command = ControlEpochAdvanceV2 {
+            run_id: run_id.clone(),
+            precondition: EpochPreconditionV2::Exact {
+                control_epoch: current_epoch,
+            },
+            input_id: self.inner.ids.typed("retire-input", InputId::new),
+            opaque_input_ref: "Host requested Run retirement".to_owned(),
+        };
+        let envelope = KernelCommandEnvelopeV2::new(
+            self.inner
+                .ids
+                .typed("retire-command", CommandRequestId::new),
+            KernelCommandV2::ControlEpochAdvance(command.clone()),
+        );
+        let fence_fact_id = self.inner.ids.fact();
+        let capability_verifier = match run_capability {
+            Some(capability) => {
+                let next_epoch = ControlEpoch::new(
+                    current_epoch
+                        .get()
+                        .checked_add(1)
+                        .ok_or_else(storage_fault)?,
+                )
+                .map_err(|_| storage_fault())?;
+                Some(run_capability_verifier_material(
+                    run_id, next_epoch, capability,
+                ))
+            }
+            None => None,
+        };
+        let fence_draft = RunRetirementFenceDraft {
+            fact_id: fence_fact_id.clone(),
+            reason_code,
+            reason: reason.clone(),
+            capability_verifier,
+        };
+        match self.advance_epoch_inner(
+            &envelope,
+            command,
+            None,
+            Vec::new(),
+            false,
+            Some(fence_draft),
+        )? {
+            KernelReplyV2::ControlEpochAdvanced(reply) => Ok(RunRetirementFenceOutcome {
+                control_epoch: reply.accepted_control_epoch,
+                fence_fact_id,
+                fence_ledger_sequence: reply.command_batch_high_water,
+                reason_code,
+                reason,
+            }),
+            _ => Err(corrupt_store()),
+        }
     }
 
     fn advance_epoch_inner(
@@ -650,9 +864,13 @@ impl AuthorityService {
         public_receipt: Option<
             Box<dyn FnOnce(&KernelReplyV2) -> AuthorityResult<PublicCommandReceiptV2>>,
         >,
-        material_mutations: Vec<AuthorityMaterialMutationV2>,
+        mut material_mutations: Vec<AuthorityMaterialMutationV2>,
+        require_workspace: bool,
+        retirement_fence: Option<RunRetirementFenceDraft>,
     ) -> AuthorityResult<KernelReplyV2> {
-        self.workspace_for_run(&command.run_id)?;
+        if require_workspace {
+            self.workspace_for_run(&command.run_id)?;
+        }
         let command_digest =
             command_request_digest_v2(&envelope.command).map_err(|_| corrupt_store())?;
         let mut state = self.inner.state.lock().map_err(|_| storage_fault())?;
@@ -687,7 +905,12 @@ impl AuthorityService {
             .and_then(|run| run.active_invocation_id.clone());
         let (cancellation, cancellation_fact) =
             plan_control_cancellation(&state, active_invocation, || self.inner.ids.cancellation())?;
-        let batch_len = 2 + usize::from(cancellation_fact.is_some());
+        let fence_causation_fact_id = cancellation_fact
+            .as_ref()
+            .map(|(_, _, fact_id)| fact_id.clone())
+            .unwrap_or_else(|| epoch_fact_id.clone());
+        let batch_len =
+            2 + usize::from(cancellation_fact.is_some()) + usize::from(retirement_fence.is_some());
         let high_water = self.predicted_high_water(batch_len)?;
         let reply = ControlEpochAdvancedReplyV2 {
             run_id: command.run_id.clone(),
@@ -697,7 +920,8 @@ impl AuthorityService {
             cancellation: cancellation.clone(),
             command_batch_high_water: high_water,
         };
-        let drafts = epoch_advance_drafts(
+        let command_run_id = command.run_id.clone();
+        let mut drafts = epoch_advance_drafts(
             envelope.request_id.clone(),
             command_digest,
             command,
@@ -709,6 +933,28 @@ impl AuthorityService {
             cancellation_fact,
             reply.clone(),
         );
+        if let Some(fence) = retirement_fence {
+            drafts.push(KernelFactDraftV2 {
+                fact_id: fence.fact_id,
+                payload: KernelFactPayloadV2::Control(
+                    deepcode_kernel_abi::v2::ControlFactV2::RunRetirementFenced {
+                        run_id: command_run_id,
+                        control_epoch: new_epoch,
+                        reason_code: fence.reason_code,
+                        reason: fence.reason,
+                        causation_fact_id: fence_causation_fact_id,
+                    },
+                ),
+            });
+            if let Some(material) = fence.capability_verifier {
+                material_mutations.push(AuthorityMaterialMutationV2::Replace {
+                    expected_lifecycle: RUN_CAPABILITY_VERIFIER_BOUND.to_owned(),
+                    expected_payload_digest: None,
+                    material,
+                    fact_index: drafts.len() - 1,
+                });
+            }
+        }
         let kernel_reply = KernelReplyV2::ControlEpochAdvanced(reply);
         if let Some(build_receipt) = public_receipt {
             let receipt = build_receipt(&kernel_reply)?;
@@ -752,6 +998,11 @@ impl AuthorityService {
             .ok_or_else(|| KernelErrorV2::RunNotFound {
                 run_id: run_id.clone(),
             })?;
+        if run.retirement_fence.is_some() || run.retired.is_some() {
+            return Err(KernelErrorV2::RunNotFound {
+                run_id: run_id.clone(),
+            });
+        }
         let error = if run.epoch != expected_epoch {
             Some(RecordedCommandErrorV2::StaleControlEpoch {
                 run_id: run_id.clone(),
@@ -1544,6 +1795,106 @@ impl AuthorityService {
             }
         }
         Ok(())
+    }
+
+    pub(super) fn observe_run_execution_convergence_host(
+        &self,
+        run_id: &RunId,
+        budget: Duration,
+    ) -> AuthorityResult<bool> {
+        let started = Instant::now();
+        loop {
+            if self.run_execution_converged_once_host(run_id)? {
+                return Ok(true);
+            }
+            let elapsed = started.elapsed();
+            if elapsed >= budget {
+                return Ok(false);
+            }
+            std::thread::sleep(budget.saturating_sub(elapsed).min(Duration::from_millis(2)));
+        }
+    }
+
+    fn run_execution_converged_once_host(&self, run_id: &RunId) -> AuthorityResult<bool> {
+        let (invocation_ids, nonterminal_ids) = {
+            let state = self.inner.state.lock().map_err(|_| storage_fault())?;
+            let run = state
+                .runs
+                .get(run_id)
+                .ok_or_else(|| KernelErrorV2::RunNotFound {
+                    run_id: run_id.clone(),
+                })?;
+            if run.retirement_fence.is_none() && run.retired.is_none() {
+                return Err(corrupt_store());
+            }
+            let invocations = state
+                .direct_invocations
+                .values()
+                .filter(|invocation| &invocation.run_id == run_id)
+                .collect::<Vec<_>>();
+            (
+                invocations
+                    .iter()
+                    .map(|invocation| invocation.invocation_id.clone())
+                    .collect::<Vec<_>>(),
+                invocations
+                    .iter()
+                    .filter(|invocation| !invocation_phase_is_terminal(invocation.phase))
+                    .map(|invocation| invocation.invocation_id.clone())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let (finished, has_unfinished_task) = {
+            let mut tasks = self
+                .inner
+                .execution_tasks
+                .lock()
+                .map_err(|_| storage_fault())?;
+            if nonterminal_ids
+                .iter()
+                .any(|invocation_id| !tasks.contains_key(invocation_id))
+            {
+                return Err(corrupt_store());
+            }
+            let finished_ids = invocation_ids
+                .iter()
+                .filter(|invocation_id| {
+                    tasks
+                        .get(*invocation_id)
+                        .is_some_and(std::thread::JoinHandle::is_finished)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let has_unfinished_task = invocation_ids.iter().any(|invocation_id| {
+                tasks
+                    .get(invocation_id)
+                    .is_some_and(|handle| !handle.is_finished())
+            });
+            let finished = finished_ids
+                .into_iter()
+                .filter_map(|invocation_id| tasks.remove(&invocation_id))
+                .collect::<Vec<_>>();
+            (finished, has_unfinished_task)
+        };
+        for handle in finished {
+            if handle.join().is_err() {
+                return Err(corrupt_store());
+            }
+        }
+        if has_unfinished_task {
+            return Ok(false);
+        }
+
+        let state = self.inner.state.lock().map_err(|_| storage_fault())?;
+        let run = state.runs.get(run_id).ok_or_else(corrupt_store)?;
+        if run.active_invocation_id.is_some()
+            || state.direct_invocations.values().any(|invocation| {
+                &invocation.run_id == run_id && !invocation_phase_is_terminal(invocation.phase)
+            })
+        {
+            return Err(corrupt_store());
+        }
+        Ok(true)
     }
 
     fn cancel_invocation(

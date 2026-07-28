@@ -1,7 +1,8 @@
 use super::model::{
-    invocation_phase_is_terminal, AuthorityResult, AuthorityState, DirectInvocationRecord,
-    ExecutionResolution, InvocationPhase, PreparedDirectToolIntent, RawExecution, ResolvedTarget,
-    ResourceRecord, RunRecord, StopOverlay, VerifiedExecution, WorkspaceBinding,
+    invocation_phase_is_terminal, AuthorityResult, AuthorityRunRetirementFence, AuthorityState,
+    DirectInvocationRecord, ExecutionResolution, InvocationPhase, PreparedDirectToolIntent,
+    RawExecution, ResolvedTarget, ResourceRecord, RunRecord, StopOverlay, VerifiedExecution,
+    WorkspaceBinding,
 };
 use crate::executors::{plan_v2_text_edit, KernelExecutorConfig};
 use crate::network_policy::review_http_target;
@@ -182,6 +183,11 @@ pub(super) fn plan_epoch_advance(
             }),
         };
     };
+    if run.retirement_fence.is_some() || run.retired.is_some() {
+        return Err(KernelErrorV2::RunNotFound {
+            run_id: run_id.clone(),
+        });
+    }
     let error = match precondition {
         EpochPreconditionV2::NoCurrentEpoch {} => {
             Some(RecordedCommandErrorV2::ControlEpochAlreadyExists {
@@ -221,7 +227,8 @@ pub(super) fn plan_epoch_advance(
 }
 
 pub(super) fn resolve_workspace_binding(path: &Path) -> AuthorityResult<WorkspaceBinding> {
-    let canonical_root = fs::canonicalize(path).map_err(|_| storage_fault())?;
+    let canonical_root = fs::canonicalize(path)
+        .map_err(|_| invalid_field("workspaceRoot", InvalidFieldViolationV2::OutOfRange))?;
     if !canonical_root.is_dir() {
         return Err(invalid_field(
             "workspaceRoot",
@@ -2432,6 +2439,11 @@ pub(super) fn require_current_run(
         .ok_or_else(|| KernelErrorV2::RunNotFound {
             run_id: run_id.clone(),
         })?;
+    if run.retirement_fence.is_some() || run.retired.is_some() {
+        return Err(KernelErrorV2::RunNotFound {
+            run_id: run_id.clone(),
+        });
+    }
     if run.epoch != submitted {
         return Err(KernelErrorV2::StaleControlEpoch {
             run_id: run_id.clone(),
@@ -2521,11 +2533,15 @@ impl AuthorityState {
                             epoch: identity.control_epoch,
                             active_invocation_id: None,
                             admitted_inputs,
+                            retirement_fence: None,
+                            retired: None,
                         },
                     );
                 }
                 Some(run)
-                    if *previous_epoch == Some(run.epoch)
+                    if run.retirement_fence.is_none()
+                        && run.retired.is_none()
+                        && *previous_epoch == Some(run.epoch)
                         && identity.control_epoch.get() == run.epoch.get() + 1 =>
                 {
                     run.epoch = identity.control_epoch;
@@ -2566,6 +2582,53 @@ impl AuthorityState {
                     ledger_sequence: envelope.ledger_sequence,
                 };
             }
+            ControlFactV2::RunRetirementFenced {
+                run_id,
+                control_epoch,
+                reason_code,
+                reason,
+                ..
+            } => {
+                let run = self.runs.get_mut(run_id).ok_or_else(corrupt_store)?;
+                if run.epoch != *control_epoch
+                    || run.retirement_fence.is_some()
+                    || run.retired.is_some()
+                {
+                    return Err(corrupt_store());
+                }
+                run.retirement_fence = Some(AuthorityRunRetirementFence {
+                    fact_id: envelope.fact_id.clone(),
+                    ledger_sequence: envelope.ledger_sequence,
+                    reason_code: *reason_code,
+                    reason: reason.clone(),
+                });
+            }
+            ControlFactV2::RunRetired {
+                run_id,
+                control_epoch,
+                reason_code,
+                reason,
+                causation_fact_id,
+            } => {
+                let has_nonterminal_invocation =
+                    self.direct_invocations.values().any(|invocation| {
+                        invocation.run_id == *run_id
+                            && !invocation_phase_is_terminal(invocation.phase)
+                    });
+                let run = self.runs.get_mut(run_id).ok_or_else(corrupt_store)?;
+                let fence = run.retirement_fence.as_ref().ok_or_else(corrupt_store)?;
+                if run.epoch != *control_epoch
+                    || run.retired.is_some()
+                    || run.active_invocation_id.is_some()
+                    || has_nonterminal_invocation
+                    || fence.fact_id != *causation_fact_id
+                    || fence.reason_code != *reason_code
+                    || fence.reason != *reason
+                {
+                    return Err(corrupt_store());
+                }
+                run.retired = Some(*reason_code);
+            }
         }
         Ok(())
     }
@@ -2587,6 +2650,8 @@ impl AuthorityState {
                 let run = self.runs.get(&identity.run_id).ok_or_else(corrupt_store)?;
                 let private_tool_kind = private_tool_kind(tool_id).ok_or_else(corrupt_store)?;
                 if run.epoch != identity.control_epoch
+                    || run.retirement_fence.is_some()
+                    || run.retired.is_some()
                     || run.active_invocation_id.is_some()
                     || *effective_deadline_ms == 0
                     || self
@@ -3668,6 +3733,25 @@ fn edge_kind_matches(predecessor: &KernelFactPayloadV2, current: &KernelFactPayl
                     KernelFactPayloadV2::Control(ControlFactV2::EpochAdvanced { .. })
                 ),
             }
+        }
+        KernelFactPayloadV2::Control(ControlFactV2::RunRetired { control_epoch, .. }) => matches!(
+            predecessor,
+            KernelFactPayloadV2::Control(ControlFactV2::RunRetirementFenced {
+                control_epoch: fenced_epoch,
+                ..
+            }) if fenced_epoch == control_epoch
+        ),
+        KernelFactPayloadV2::Control(ControlFactV2::RunRetirementFenced {
+            control_epoch, ..
+        }) => {
+            predecessor.control_epoch() == Some(*control_epoch)
+                && matches!(
+                    predecessor,
+                    KernelFactPayloadV2::Control(
+                        ControlFactV2::EpochAdvanced { .. }
+                            | ControlFactV2::CancellationRequested { .. }
+                    )
+                )
         }
         KernelFactPayloadV2::Authorization(AuthorizationFactV2::ScopePreviewed { .. }) => {
             matches!(

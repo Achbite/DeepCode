@@ -880,6 +880,12 @@ pub enum KernelErrorV2 {
     RunCapabilityInvalid {
         run_id: RunId,
     },
+    RunRetirementPending {
+        run_id: RunId,
+        control_epoch: ControlEpoch,
+        fence_fact_id: FactId,
+        fence_ledger_sequence: u64,
+    },
     ToolNotRegistered {
         tool_id: ToolIdV2,
     },

@@ -950,6 +950,14 @@ pub enum CancellationReasonCodeV2 {
     EpochSuperseded,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RunRetirementReasonCodeV2 {
+    HostRequested,
+    SessionEnded,
+    RunOpenRollback,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
     tag = "kind",
@@ -1010,6 +1018,20 @@ pub enum ControlFactV2 {
         reason_code: CancellationReasonCodeV2,
         reason: Option<String>,
     },
+    RunRetirementFenced {
+        run_id: RunId,
+        control_epoch: ControlEpoch,
+        reason_code: RunRetirementReasonCodeV2,
+        reason: Option<String>,
+        causation_fact_id: FactId,
+    },
+    RunRetired {
+        run_id: RunId,
+        control_epoch: ControlEpoch,
+        reason_code: RunRetirementReasonCodeV2,
+        reason: Option<String>,
+        causation_fact_id: FactId,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1019,6 +1041,7 @@ pub enum CapabilityLeaseRevokeReasonV2 {
     SettingsChanged,
     ToolRevoked,
     ToolContextChanged,
+    RunRetired,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1375,6 +1398,20 @@ impl KernelFactPayloadV2 {
                 ));
             }
         }
+        if let Self::Control(ControlFactV2::RunRetired {
+            reason: Some(reason),
+            ..
+        }) = self
+        {
+            validate_bounded_text("fact.reason", reason)?;
+        }
+        if let Self::Control(ControlFactV2::RunRetirementFenced {
+            reason: Some(reason),
+            ..
+        }) = self
+        {
+            validate_bounded_text("fact.reason", reason)?;
+        }
         if let Self::Authorization(AuthorizationFactV2::ContextInvalidated {
             previous_context,
             next_context_version,
@@ -1391,10 +1428,7 @@ impl KernelFactPayloadV2 {
                     "must equal nextContextVersion",
                 ));
             }
-            if previous_context
-                .context_version
-                .get()
-                .checked_add(1)
+            if previous_context.context_version.get().checked_add(1)
                 != Some(next_context_version.get())
             {
                 return Err(invalid_value(
@@ -1476,6 +1510,10 @@ impl KernelFactPayloadV2 {
             }
             Self::Control(ControlFactV2::CancellationRequested { identity, .. }) => {
                 Some(identity.control_epoch)
+            }
+            Self::Control(ControlFactV2::RunRetired { control_epoch, .. }) => Some(*control_epoch),
+            Self::Control(ControlFactV2::RunRetirementFenced { control_epoch, .. }) => {
+                Some(*control_epoch)
             }
             Self::Authorization(fact) => Some(fact.control_epoch()),
             Self::Invocation(fact) => Some(fact.identity().control_epoch),
@@ -1669,6 +1707,8 @@ impl ControlFactV2 {
             Self::CommandRecorded { identity, .. } => &identity.run_id,
             Self::EpochAdvanced { identity, .. } => &identity.run_id,
             Self::CancellationRequested { identity, .. } => &identity.run_id,
+            Self::RunRetirementFenced { run_id, .. } => run_id,
+            Self::RunRetired { run_id, .. } => run_id,
         }
     }
 
@@ -1680,6 +1720,12 @@ impl ControlFactV2 {
             Self::CommandRecorded { .. } => None,
             Self::EpochAdvanced { identity, .. } => Some(&identity.causation_fact_id),
             Self::CancellationRequested { identity, .. } => Some(&identity.causation_fact_id),
+            Self::RunRetirementFenced {
+                causation_fact_id, ..
+            } => Some(causation_fact_id),
+            Self::RunRetired {
+                causation_fact_id, ..
+            } => Some(causation_fact_id),
         }
     }
 }

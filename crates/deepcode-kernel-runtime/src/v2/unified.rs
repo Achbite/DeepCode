@@ -1,9 +1,12 @@
 use super::authority::{
     canonicalize_network_scope_url, canonicalize_requested_workspace_path, invalid_field,
-    storage_fault, PrepareFailure,
+    resolve_workspace_binding, storage_fault, PrepareFailure,
 };
 use super::model::{AuthorityResult, WorkspaceBinding};
-use super::service::{AuthorityService, DirectToolIntentRequest};
+use super::service::{
+    run_capability_verifier_digest, AuthorityService, DirectToolIntentRequest,
+    RUN_CAPABILITY_VERIFIER_BOUND, RUN_CAPABILITY_VERIFIER_MATERIAL_KIND,
+};
 use crate::executors::{KernelExecutorConfig, SecretProvider};
 use deepcode_kernel_abi::v2::{
     command_request_digest_v2, idempotency_key_hash_v2, invocation_policy_evaluation_digest_v2,
@@ -13,9 +16,8 @@ use deepcode_kernel_abi::v2::{
     CorrelationSetV2, FactId, InputId, InvocationAuthorityV2, InvocationFactV2, InvocationId,
     KernelFactEnvelopeV2, KernelFactPayloadV2, NetworkTargetObservationDigestV2, OperationId,
     RecordedAtV2, RepositoryAreaV2, ResourceAccessV2, ResourceScopeV2, RunId,
-    SettingsCeilingDigestV2,
-    ToolContextInvalidationIdentityV2, ToolContextInvalidationReasonV2, UserDecisionRefV2,
-    WorkspaceBindingDigestV2,
+    RunRetirementReasonCodeV2, SettingsCeilingDigestV2, ToolContextInvalidationIdentityV2,
+    ToolContextInvalidationReasonV2, UserDecisionRefV2, WorkspaceBindingDigestV2,
 };
 use deepcode_kernel_abi::v2_command::{
     CapabilityApprovalViewV2, CapabilityScopeDispositionV2, CapabilityScopePreviewRecordV2,
@@ -51,11 +53,13 @@ use deepcode_kernel_ledger::v2::{
 use deepcode_kernel_tools::ToolInvocationInputV4;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 const AUTHORITY_MATERIAL_PREVIEW: &str = "scopePreview";
 const AUTHORITY_MATERIAL_LEASE: &str = "capabilityLease";
@@ -69,6 +73,7 @@ const AUTHORITY_MATERIAL_REJECTED: &str = "rejected";
 const AUTHORITY_MATERIAL_REVOKED: &str = "revoked";
 const AUTHORITY_MATERIAL_STALE: &str = "stale";
 const AUTHORITY_MATERIAL_TERMINAL: &str = "terminal";
+const RUN_RETIREMENT_CONVERGENCE_BUDGET: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SettingsCeilingV2 {
@@ -130,8 +135,13 @@ fn unauthorized_run() -> KernelErrorV2 {
 }
 
 fn constant_time_token_eq(expected: &RunCapabilityV2, submitted: &RunCapabilityV2) -> bool {
-    let left = expected.expose_to_transport().as_bytes();
-    let right = submitted.expose_to_transport().as_bytes();
+    constant_time_bytes_eq(
+        expected.expose_to_transport().as_bytes(),
+        submitted.expose_to_transport().as_bytes(),
+    )
+}
+
+fn constant_time_bytes_eq(left: &[u8], right: &[u8]) -> bool {
     let mut difference = left.len() ^ right.len();
     let maximum = left.len().max(right.len());
     for index in 0..maximum {
@@ -157,6 +167,33 @@ fn settings_allow(settings: &SettingsCeilingV2, effect_scope: ToolEffectScopeV2)
 fn settings_digest(settings: &SettingsCeilingV2) -> AuthorityResult<SettingsCeilingDigestV2> {
     let value = serde_json::to_value(settings).map_err(|_| storage_fault())?;
     settings_ceiling_digest_v2(&value).map_err(|_| storage_fault())
+}
+
+fn run_open_host_request_digest(
+    command: &KernelCommandV2,
+    workspace_binding_digest: &WorkspaceBindingDigestV2,
+    settings_ceiling_digest: &SettingsCeilingDigestV2,
+) -> AuthorityResult<CommandRequestDigestV2> {
+    let command_digest = command_request_digest_v2(command).map_err(|_| storage_fault())?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"deepcode.kernel.runtime.v2/host-run-open-request\0");
+    for component in [
+        command_digest.as_str(),
+        workspace_binding_digest.as_str(),
+        settings_ceiling_digest.as_str(),
+    ] {
+        let length = u64::try_from(component.len()).map_err(|_| storage_fault())?;
+        hasher.update(length.to_be_bytes());
+        hasher.update(component.as_bytes());
+    }
+    let digest = hasher.finalize();
+    let mut encoded = String::with_capacity("sha256:".len() + digest.len() * 2);
+    encoded.push_str("sha256:");
+    for byte in digest {
+        use std::fmt::Write;
+        write!(encoded, "{byte:02x}").map_err(|_| storage_fault())?;
+    }
+    CommandRequestDigestV2::parse(encoded).map_err(|_| storage_fault())
 }
 
 fn canonical_invocation(
@@ -533,6 +570,7 @@ fn recover_public_runs(
 
     let mut opened = HashMap::<RunId, OpenMetadata>::new();
     let mut epochs = HashMap::<RunId, (ControlEpoch, InputId, FactId)>::new();
+    let mut retired = HashMap::<RunId, ()>::new();
     for envelope in facts {
         match &envelope.payload {
             KernelFactPayloadV2::Control(ControlFactV2::RunOpened {
@@ -585,12 +623,18 @@ fn recover_public_runs(
                     metadata.context_fact_id = Some(envelope.fact_id.clone());
                 }
             }
+            KernelFactPayloadV2::Control(ControlFactV2::RunRetired { run_id, .. }) => {
+                retired.insert(run_id.clone(), ());
+            }
             _ => {}
         }
     }
 
     let mut recovered = HashMap::new();
     for (run_id, metadata) in opened {
+        if retired.contains_key(&run_id) {
+            continue;
+        }
         let (control_epoch, current_input_id, control_fact_id) =
             epochs.remove(&run_id).ok_or_else(storage_fault)?;
         recovered.insert(
@@ -608,6 +652,86 @@ fn recover_public_runs(
         );
     }
     Ok(recovered)
+}
+
+fn recover_retired_runs(
+    facts: &[KernelFactEnvelopeV2],
+) -> AuthorityResult<HashMap<RunId, RetiredRunRecord>> {
+    let mut retired = HashMap::new();
+    for envelope in facts {
+        if let KernelFactPayloadV2::Control(ControlFactV2::RunRetired {
+            run_id,
+            control_epoch,
+            reason_code,
+            reason,
+            ..
+        }) = &envelope.payload
+        {
+            let record = RetiredRunRecord {
+                control_epoch: *control_epoch,
+                reason_code: *reason_code,
+                reason: reason.clone(),
+                retirement_fact_id: envelope.fact_id.clone(),
+                ledger_sequence: envelope.ledger_sequence,
+            };
+            if retired.insert(run_id.clone(), record).is_some() {
+                return Err(storage_fault());
+            }
+        }
+    }
+    Ok(retired)
+}
+
+fn recover_retirement_fences(
+    facts: &[KernelFactEnvelopeV2],
+    retired_runs: &HashMap<RunId, RetiredRunRecord>,
+) -> HashMap<RunId, RunRetirementFenceRecord> {
+    let mut fences = HashMap::new();
+    for envelope in facts {
+        if let KernelFactPayloadV2::Control(ControlFactV2::RunRetirementFenced {
+            run_id,
+            control_epoch,
+            reason_code,
+            reason,
+            ..
+        }) = &envelope.payload
+        {
+            if !retired_runs.contains_key(run_id) {
+                fences.insert(
+                    run_id.clone(),
+                    RunRetirementFenceRecord {
+                        control_epoch: *control_epoch,
+                        fence_fact_id: envelope.fact_id.clone(),
+                        fence_ledger_sequence: envelope.ledger_sequence,
+                        reason_code: *reason_code,
+                        reason: reason.clone(),
+                    },
+                );
+            }
+        }
+    }
+    fences
+}
+
+fn recover_scope_preview_runs(
+    facts: &[KernelFactEnvelopeV2],
+) -> AuthorityResult<HashMap<CapabilityScopePreviewIdV2, RunId>> {
+    let mut preview_runs = HashMap::new();
+    for envelope in facts {
+        if let KernelFactPayloadV2::Authorization(AuthorizationFactV2::ScopePreviewed {
+            identity,
+            preview_id,
+            ..
+        }) = &envelope.payload
+        {
+            match preview_runs.insert(preview_id.clone(), identity.run_id.clone()) {
+                None => {}
+                Some(existing) if existing == identity.run_id => {}
+                Some(_) => return Err(storage_fault()),
+            }
+        }
+    }
+    Ok(preview_runs)
 }
 
 fn recover_runtime_availability(
@@ -636,6 +760,21 @@ struct RecoveredAuthorityMaterialV2 {
     leases: HashMap<CapabilityLeaseIdV2, CapabilityLeaseRecord>,
     trusts: HashMap<TrustPolicyIdV2, TrustLeaseRecord>,
     pending: HashMap<CapabilityScopePreviewIdV2, PendingIntent>,
+    run_capability_verifiers: HashMap<RunId, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DurableRunCapabilityVerifierV2 {
+    run_id: RunId,
+    token_verifier_sha256: String,
+}
+
+fn valid_sha256_lower_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
 fn recover_authority_material(
@@ -650,6 +789,7 @@ fn recover_authority_material(
     let mut leases = HashMap::new();
     let mut trusts = HashMap::new();
     let mut pending = HashMap::new();
+    let mut run_capability_verifiers = HashMap::new();
     for record in material {
         if record.lifecycle == AUTHORITY_MATERIAL_STALE {
             continue;
@@ -718,6 +858,9 @@ fn recover_authority_material(
             }
             AUTHORITY_MATERIAL_LEASE => {
                 if record.lifecycle != AUTHORITY_MATERIAL_ACTIVE {
+                    if record.lifecycle == AUTHORITY_MATERIAL_REVOKED {
+                        continue;
+                    }
                     return Err(storage_fault());
                 }
                 let durable: DurableCapabilityLeaseV2 =
@@ -883,6 +1026,63 @@ fn recover_authority_material(
                     return Err(storage_fault());
                 }
             }
+            RUN_CAPABILITY_VERIFIER_MATERIAL_KIND => {
+                if record.lifecycle != RUN_CAPABILITY_VERIFIER_BOUND
+                    || record.operation_id.is_some()
+                    || record.invocation_id.is_some()
+                    || record.lease.is_some()
+                {
+                    return Err(storage_fault());
+                }
+                let durable: DurableRunCapabilityVerifierV2 =
+                    serde_json::from_value(record.payload_json).map_err(|_| storage_fault())?;
+                if durable.run_id != record.run_id
+                    || durable.run_id.as_str() != record.material_id
+                    || !valid_sha256_lower_hex(&durable.token_verifier_sha256)
+                {
+                    return Err(storage_fault());
+                }
+                let source = facts_by_id
+                    .get(&record.source_fact_id)
+                    .copied()
+                    .ok_or_else(storage_fault)?;
+                let last = facts_by_id
+                    .get(&record.last_fact_id)
+                    .copied()
+                    .ok_or_else(storage_fault)?;
+                let source_matches = matches!(
+                    &source.payload,
+                    KernelFactPayloadV2::Control(ControlFactV2::RunOpened {
+                        run_id,
+                        control_epoch,
+                        ..
+                    }) if run_id == &durable.run_id && control_epoch.get() <= record.control_epoch
+                );
+                let last_matches = matches!(
+                    &last.payload,
+                    KernelFactPayloadV2::Control(
+                        ControlFactV2::RunOpened {
+                            run_id,
+                            control_epoch,
+                            ..
+                        }
+                        | ControlFactV2::RunRetirementFenced {
+                            run_id,
+                            control_epoch,
+                            ..
+                        }
+                    ) if run_id == &durable.run_id && control_epoch.get() == record.control_epoch
+                );
+                if !source_matches || !last_matches {
+                    return Err(storage_fault());
+                }
+                if run_capability_verifiers
+                    .insert(durable.run_id, durable.token_verifier_sha256)
+                    .is_some()
+                {
+                    return Err(storage_fault());
+                }
+            }
             AUTHORITY_MATERIAL_INVOCATION => {
                 if record.lifecycle != AUTHORITY_MATERIAL_TERMINAL
                     || record.invocation_id.as_ref().map(InvocationId::as_str)
@@ -939,6 +1139,7 @@ fn recover_authority_material(
         leases,
         trusts,
         pending,
+        run_capability_verifiers,
     })
 }
 
@@ -1158,6 +1359,17 @@ pub struct PendingCapabilityDecisionV2 {
     pub binding: CapabilityDecisionBindingV2,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunRetirementReceiptV2 {
+    pub run_id: RunId,
+    pub control_epoch: ControlEpoch,
+    pub reason_code: RunRetirementReasonCodeV2,
+    pub reason: Option<String>,
+    pub retirement_fact_id: FactId,
+    pub retirement_ledger_sequence: u64,
+    pub replayed: bool,
+}
+
 impl OpenedRunTransportV2 {
     pub fn into_parts(self) -> (KernelCommandResponseEnvelopeV2, Option<RunCapabilityV2>) {
         (self.response, self.run_capability)
@@ -1176,6 +1388,10 @@ struct KernelSessionInner {
 struct KernelSessionState {
     runs: HashMap<RunId, PublicRunRecord>,
     recovered_runs: HashMap<RunId, RecoveredRunRecord>,
+    retirement_fences: HashMap<RunId, RunRetirementFenceRecord>,
+    retired_runs: HashMap<RunId, RetiredRunRecord>,
+    run_capability_verifiers: HashMap<RunId, String>,
+    preview_runs: HashMap<CapabilityScopePreviewIdV2, RunId>,
     previews: HashMap<CapabilityScopePreviewIdV2, PreparedScopePreview>,
     leases: HashMap<CapabilityLeaseIdV2, CapabilityLeaseRecord>,
     trusts: HashMap<TrustPolicyIdV2, TrustLeaseRecord>,
@@ -1197,6 +1413,12 @@ struct PublicRunRecord {
     control_fact_id: FactId,
 }
 
+enum RunCapabilityDisposition {
+    Active,
+    RetirementFenced,
+    Retired,
+}
+
 #[derive(Clone)]
 struct RecoveredRunRecord {
     workspace_binding_ref: WorkspaceBindingRefV2,
@@ -1207,6 +1429,102 @@ struct RecoveredRunRecord {
     context_ref: ToolContextRefV2,
     current_input_id: InputId,
     control_fact_id: FactId,
+}
+
+#[derive(Clone)]
+struct RunRetirementFenceRecord {
+    control_epoch: ControlEpoch,
+    fence_fact_id: FactId,
+    fence_ledger_sequence: u64,
+    reason_code: RunRetirementReasonCodeV2,
+    reason: Option<String>,
+}
+
+#[derive(Clone)]
+struct RetiredRunRecord {
+    control_epoch: ControlEpoch,
+    reason_code: RunRetirementReasonCodeV2,
+    reason: Option<String>,
+    retirement_fact_id: FactId,
+    ledger_sequence: u64,
+}
+
+impl RetiredRunRecord {
+    fn receipt(&self, run_id: RunId, replayed: bool) -> RunRetirementReceiptV2 {
+        RunRetirementReceiptV2 {
+            run_id,
+            control_epoch: self.control_epoch,
+            reason_code: self.reason_code,
+            reason: self.reason.clone(),
+            retirement_fact_id: self.retirement_fact_id.clone(),
+            retirement_ledger_sequence: self.ledger_sequence,
+            replayed,
+        }
+    }
+}
+
+fn require_same_retirement_reason(
+    retired: &RetiredRunRecord,
+    reason_code: RunRetirementReasonCodeV2,
+    reason: Option<&str>,
+) -> AuthorityResult<()> {
+    if retired.reason_code != reason_code {
+        return Err(invalid_field(
+            "reasonCode",
+            InvalidFieldViolationV2::InvalidRelation,
+        ));
+    }
+    if retired.reason.as_deref() != reason {
+        return Err(invalid_field(
+            "reason",
+            InvalidFieldViolationV2::InvalidRelation,
+        ));
+    }
+    Ok(())
+}
+
+fn require_same_retirement_fence_reason(
+    fence: &RunRetirementFenceRecord,
+    reason_code: RunRetirementReasonCodeV2,
+    reason: Option<&str>,
+) -> AuthorityResult<()> {
+    if fence.reason_code != reason_code {
+        return Err(invalid_field(
+            "reasonCode",
+            InvalidFieldViolationV2::InvalidRelation,
+        ));
+    }
+    if fence.reason.as_deref() != reason {
+        return Err(invalid_field(
+            "reason",
+            InvalidFieldViolationV2::InvalidRelation,
+        ));
+    }
+    Ok(())
+}
+
+fn require_same_retirement_fence(
+    expected: &RunRetirementFenceRecord,
+    actual: &RunRetirementFenceRecord,
+) -> AuthorityResult<()> {
+    if expected.control_epoch != actual.control_epoch
+        || expected.fence_fact_id != actual.fence_fact_id
+        || expected.fence_ledger_sequence != actual.fence_ledger_sequence
+        || expected.reason_code != actual.reason_code
+        || expected.reason != actual.reason
+    {
+        return Err(storage_fault());
+    }
+    Ok(())
+}
+
+fn retirement_pending(run_id: RunId, fence: &RunRetirementFenceRecord) -> KernelErrorV2 {
+    KernelErrorV2::RunRetirementPending {
+        run_id,
+        control_epoch: fence.control_epoch,
+        fence_fact_id: fence.fence_fact_id.clone(),
+        fence_ledger_sequence: fence.fence_ledger_sequence,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1603,21 +1921,10 @@ struct PublicCommandContext {
     deny_unknown_fields
 )]
 enum DurablePublicReplyV2 {
-    Kernel {
-        reply: KernelReplyV2,
-    },
-    RunOpen {
-        run_id: RunId,
-        control_epoch: ControlEpoch,
-        workspace_binding_digest: WorkspaceBindingDigestV2,
-        context_version: ToolContextVersionV2,
-    },
-    Facts {
-        page: DurableFactPageV2,
-    },
-    UserDecision {
-        reply: UserDecisionReplyV2,
-    },
+    Kernel { reply: KernelReplyV2 },
+    RunOpen { reply: RunOpenReplyV2 },
+    Facts { page: DurableFactPageV2 },
+    UserDecision { reply: UserDecisionReplyV2 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1702,15 +2009,23 @@ impl KernelSessionServiceV2 {
         let inventory = build_inventory()?;
         let facts = authority.snapshot_facts()?;
         let recovered_runs = recover_public_runs(&facts)?;
+        let retired_runs = recover_retired_runs(&facts)?;
+        let retirement_fences = recover_retirement_fences(&facts, &retired_runs);
+        let preview_runs = recover_scope_preview_runs(&facts)?;
         let recovered_authority =
             recover_authority_material(&facts, authority.authority_material_snapshot()?)?;
-        let runtime_availability = recover_runtime_availability(&facts);
+        let mut runtime_availability = recover_runtime_availability(&facts);
+        runtime_availability.retain(|(run_id, _), _| recovered_runs.contains_key(run_id));
         let state = KernelSessionState {
             recovered_runs,
+            retirement_fences,
+            retired_runs,
+            preview_runs,
             previews: recovered_authority.previews,
             leases: recovered_authority.leases,
             trusts: recovered_authority.trusts,
             pending: recovered_authority.pending,
+            run_capability_verifiers: recovered_authority.run_capability_verifiers,
             runtime_availability,
             ..KernelSessionState::default()
         };
@@ -1766,10 +2081,25 @@ impl KernelSessionServiceV2 {
         let (binding, has_existing_lease) = {
             let state = self.inner.state.lock().map_err(|_| storage_fault())?;
             let Some(preview) = state.previews.get(&scope_preview_id) else {
+                if state
+                    .preview_runs
+                    .get(&scope_preview_id)
+                    .is_some_and(|run_id| {
+                        state.retirement_fences.contains_key(run_id)
+                            || state.retired_runs.contains_key(run_id)
+                    })
+                {
+                    return Ok(Err(UserDecisionErrorV2::ScopePreviewStale));
+                }
                 return Ok(Err(UserDecisionErrorV2::ScopePreviewNotFound));
             };
             let run_id = preview.record.run_id.clone();
             let expected_control_epoch = preview.record.control_epoch;
+            if state.retirement_fences.contains_key(&run_id)
+                || state.retired_runs.contains_key(&run_id)
+            {
+                return Ok(Err(UserDecisionErrorV2::ScopePreviewStale));
+            }
             let Some(run) = state.runs.get(&run_id) else {
                 return Ok(Err(UserDecisionErrorV2::ScopePreviewNotFound));
             };
@@ -1835,6 +2165,371 @@ impl KernelSessionServiceV2 {
         self.inner.authority.join_owned_execution_tasks()
     }
 
+    /// Host-only terminal transition. This is intentionally absent from the
+    /// Session command ABI: the typed fence, cancellation, authority-material
+    /// invalidation, and final retirement fact are minted inside Kernel.
+    pub fn retire_run_host(
+        &self,
+        run_id: RunId,
+        reason_code: RunRetirementReasonCodeV2,
+        reason: Option<String>,
+    ) -> AuthorityResult<RunRetirementReceiptV2> {
+        let gate = self
+            .inner
+            .command_gate
+            .lock()
+            .map_err(|_| storage_fault())?;
+
+        let retired_in_memory = {
+            self.inner
+                .state
+                .lock()
+                .map_err(|_| storage_fault())?
+                .retired_runs
+                .get(&run_id)
+                .cloned()
+        };
+        if let Some(retired) = retired_in_memory {
+            self.install_retired_run_state(&run_id, retired.clone())?;
+            require_same_retirement_reason(&retired, reason_code, reason.as_deref())?;
+            return Ok(retired.receipt(run_id, true));
+        }
+        if let Some(retired) =
+            recover_retired_runs(&self.inner.authority.snapshot_facts()?)?.remove(&run_id)
+        {
+            self.install_retired_run_state(&run_id, retired.clone())?;
+            require_same_retirement_reason(&retired, reason_code, reason.as_deref())?;
+            return Ok(retired.receipt(run_id, true));
+        }
+
+        let (known_epoch, known_causation, run_capability, existing_fence) = {
+            let state = self.inner.state.lock().map_err(|_| storage_fault())?;
+            let recovered = state
+                .runs
+                .get(&run_id)
+                .map(|run| {
+                    (
+                        run.control_epoch,
+                        run.control_fact_id.clone(),
+                        Some(run.capability.clone()),
+                    )
+                })
+                .or_else(|| {
+                    state
+                        .recovered_runs
+                        .get(&run_id)
+                        .map(|run| (run.control_epoch, run.control_fact_id.clone(), None))
+                })
+                .ok_or_else(|| KernelErrorV2::RunNotFound {
+                    run_id: run_id.clone(),
+                })?;
+            (
+                recovered.0,
+                recovered.1,
+                recovered.2,
+                state.retirement_fences.get(&run_id).cloned(),
+            )
+        };
+        let existing_fence = match existing_fence {
+            Some(fence) => Some(fence),
+            None => self
+                .inner
+                .authority
+                .run_retirement_fence_host(&run_id)?
+                .map(|fence| RunRetirementFenceRecord {
+                    control_epoch: fence.control_epoch,
+                    fence_fact_id: fence.fence_fact_id,
+                    fence_ledger_sequence: fence.fence_ledger_sequence,
+                    reason_code: fence.reason_code,
+                    reason: fence.reason,
+                }),
+        };
+        KernelFactPayloadV2::Control(ControlFactV2::RunRetired {
+            run_id: run_id.clone(),
+            control_epoch: existing_fence
+                .as_ref()
+                .map(|fence| fence.control_epoch)
+                .unwrap_or(known_epoch),
+            reason_code,
+            reason: reason.clone(),
+            causation_fact_id: existing_fence
+                .as_ref()
+                .map(|fence| fence.fence_fact_id.clone())
+                .unwrap_or(known_causation),
+        })
+        .validate()
+        .map_err(|_| invalid_field("reason", InvalidFieldViolationV2::OutOfRange))?;
+
+        let fence = if let Some(fence) = existing_fence {
+            fence
+        } else {
+            let reply = self.inner.authority.fence_run_retirement_host(
+                &run_id,
+                reason_code,
+                reason.clone(),
+                run_capability.as_ref(),
+            )?;
+            let fence = RunRetirementFenceRecord {
+                control_epoch: reply.control_epoch,
+                fence_fact_id: reply.fence_fact_id,
+                fence_ledger_sequence: reply.fence_ledger_sequence,
+                reason_code: reply.reason_code,
+                reason: reply.reason,
+            };
+            let mut state = self.inner.state.lock().map_err(|_| storage_fault())?;
+            state
+                .retirement_fences
+                .insert(run_id.clone(), fence.clone());
+            if let Some(capability) = run_capability.as_ref() {
+                state.run_capability_verifiers.insert(
+                    run_id.clone(),
+                    run_capability_verifier_digest(&run_id, capability),
+                );
+            }
+            fence
+        };
+        require_same_retirement_fence_reason(&fence, reason_code, reason.as_deref())?;
+        drop(gate);
+        if !self
+            .inner
+            .authority
+            .observe_run_execution_convergence_host(&run_id, RUN_RETIREMENT_CONVERGENCE_BUDGET)?
+        {
+            return Err(retirement_pending(run_id, &fence));
+        }
+
+        let _gate = self
+            .inner
+            .command_gate
+            .lock()
+            .map_err(|_| storage_fault())?;
+        let retired_in_memory = {
+            self.inner
+                .state
+                .lock()
+                .map_err(|_| storage_fault())?
+                .retired_runs
+                .get(&run_id)
+                .cloned()
+        };
+        if let Some(retired) = retired_in_memory {
+            self.install_retired_run_state(&run_id, retired.clone())?;
+            require_same_retirement_reason(&retired, reason_code, reason.as_deref())?;
+            return Ok(retired.receipt(run_id, true));
+        }
+        if let Some(retired) =
+            recover_retired_runs(&self.inner.authority.snapshot_facts()?)?.remove(&run_id)
+        {
+            self.install_retired_run_state(&run_id, retired.clone())?;
+            require_same_retirement_reason(&retired, reason_code, reason.as_deref())?;
+            return Ok(retired.receipt(run_id, true));
+        }
+        let current_fence = {
+            let state = self.inner.state.lock().map_err(|_| storage_fault())?;
+            state.retirement_fences.get(&run_id).cloned()
+        };
+        let current_fence = match current_fence {
+            Some(current) => current,
+            None => self
+                .inner
+                .authority
+                .run_retirement_fence_host(&run_id)?
+                .map(|current| RunRetirementFenceRecord {
+                    control_epoch: current.control_epoch,
+                    fence_fact_id: current.fence_fact_id,
+                    fence_ledger_sequence: current.fence_ledger_sequence,
+                    reason_code: current.reason_code,
+                    reason: current.reason,
+                })
+                .ok_or_else(storage_fault)?,
+        };
+        require_same_retirement_fence(&fence, &current_fence)?;
+        require_same_retirement_fence_reason(&current_fence, reason_code, reason.as_deref())?;
+        if !self
+            .inner
+            .authority
+            .observe_run_execution_convergence_host(&run_id, Duration::ZERO)?
+        {
+            return Err(retirement_pending(run_id, &current_fence));
+        }
+
+        let (mut leases, mut trusts, mut previews, mut pending) = {
+            let state = self.inner.state.lock().map_err(|_| storage_fault())?;
+            (
+                state
+                    .leases
+                    .values()
+                    .filter(|lease| lease.run_id == run_id)
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                state
+                    .trusts
+                    .values()
+                    .filter(|trust| trust.run_id == run_id)
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                state
+                    .previews
+                    .values()
+                    .filter(|preview| preview.record.run_id == run_id)
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                state
+                    .pending
+                    .values()
+                    .filter(|intent| intent.run_id == run_id)
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            )
+        };
+        leases.sort_by(|left, right| {
+            left.reference
+                .lease_id
+                .as_str()
+                .cmp(right.reference.lease_id.as_str())
+        });
+        trusts.sort_by(|left, right| {
+            left.trust_policy_id
+                .as_str()
+                .cmp(right.trust_policy_id.as_str())
+        });
+        previews.sort_by(|left, right| {
+            left.record
+                .preview_id
+                .as_str()
+                .cmp(right.record.preview_id.as_str())
+        });
+        pending.sort_by(|left, right| left.preview_id.as_str().cmp(right.preview_id.as_str()));
+
+        let mut payloads = Vec::with_capacity(leases.len() + trusts.len() + 1);
+        for lease in &leases {
+            payloads.push(KernelFactPayloadV2::Authorization(
+                AuthorizationFactV2::LeaseRevoked {
+                    identity: CapabilityLeaseFactIdentityV2 {
+                        run_id: run_id.clone(),
+                        control_epoch: lease.control_epoch,
+                        plan_revision: lease.plan_revision.clone(),
+                        plan_action_id: lease.plan_action_id.clone(),
+                        operation_id: lease.issuance_operation_id.clone(),
+                        preview_id: lease.preview_id.clone(),
+                        lease_id: lease.reference.lease_id.clone(),
+                        lease_version: lease.reference.version,
+                        causation_fact_id: lease.issuance_fact_id.clone(),
+                        correlation_set: plan_action_correlations(&lease.plan_action_id)?,
+                    },
+                    scope_digest: lease.reference.scope_digest.clone(),
+                    reason: CapabilityLeaseRevokeReasonV2::RunRetired,
+                },
+            ));
+        }
+        for trust in &trusts {
+            payloads.push(KernelFactPayloadV2::Authorization(
+                AuthorizationFactV2::TrustRevoked {
+                    identity: AuthorizationIdentityV2 {
+                        run_id: run_id.clone(),
+                        control_epoch: trust.control_epoch,
+                        plan_revision: trust.plan_revision.clone(),
+                        plan_action_id: trust.plan_action_id.clone(),
+                        operation_id: trust.issuance_operation_id.clone(),
+                        causation_fact_id: trust.fact_id.clone(),
+                        correlation_set: plan_action_correlations(&trust.plan_action_id)?,
+                    },
+                    trust_policy_id: trust.trust_policy_id.clone(),
+                    trust_lease_digest: trust.trust_lease_digest.clone(),
+                    tool_id: trust.tool_id.clone(),
+                    scope_digest: trust.scope_digest.clone(),
+                    workspace_binding_digest: trust.workspace_binding_digest.clone(),
+                    context_ref: trust.context_ref.clone(),
+                    expires_at: trust.expires_at.clone(),
+                },
+            ));
+        }
+        let retirement_index = payloads.len();
+        payloads.push(KernelFactPayloadV2::Control(ControlFactV2::RunRetired {
+            run_id: run_id.clone(),
+            control_epoch: fence.control_epoch,
+            reason_code,
+            reason: reason.clone(),
+            causation_fact_id: fence.fence_fact_id.clone(),
+        }));
+
+        let mut material_mutations =
+            Vec::with_capacity(leases.len() + trusts.len() + previews.len() + pending.len());
+        for (fact_index, lease) in leases.iter().enumerate() {
+            material_mutations.push(AuthorityMaterialMutationV2::Replace {
+                expected_lifecycle: AUTHORITY_MATERIAL_ACTIVE.to_owned(),
+                expected_payload_digest: None,
+                material: capability_lease_material(&lease.durable(), AUTHORITY_MATERIAL_REVOKED)?,
+                fact_index,
+            });
+        }
+        for (offset, trust) in trusts.iter().enumerate() {
+            material_mutations.push(AuthorityMaterialMutationV2::Replace {
+                expected_lifecycle: AUTHORITY_MATERIAL_ACTIVE.to_owned(),
+                expected_payload_digest: None,
+                material: trust_lease_material(&trust.durable(), AUTHORITY_MATERIAL_REVOKED)?,
+                fact_index: leases.len() + offset,
+            });
+        }
+        for preview in &previews {
+            material_mutations.push(AuthorityMaterialMutationV2::Replace {
+                expected_lifecycle: AUTHORITY_MATERIAL_ACTIVE.to_owned(),
+                expected_payload_digest: None,
+                material: scope_preview_material(&preview.durable(), AUTHORITY_MATERIAL_STALE)?,
+                fact_index: retirement_index,
+            });
+        }
+        for intent in &pending {
+            let lease = match &intent.authority {
+                ToolIntentAuthorityV2::PlanAction { lease, .. } => lease.clone(),
+                ToolIntentAuthorityV2::ContextRead { .. } => None,
+            };
+            material_mutations.push(AuthorityMaterialMutationV2::Replace {
+                expected_lifecycle: AUTHORITY_MATERIAL_AWAITING.to_owned(),
+                expected_payload_digest: None,
+                material: pending_intent_material(
+                    &intent.durable(),
+                    AUTHORITY_MATERIAL_STALE,
+                    lease,
+                )?,
+                fact_index: retirement_index,
+            });
+        }
+
+        let committed = self
+            .inner
+            .authority
+            .append_payloads_with_authority_material(payloads, material_mutations)?
+            .facts;
+        let retirement_fact = committed.get(retirement_index).ok_or_else(storage_fault)?;
+        let KernelFactPayloadV2::Control(ControlFactV2::RunRetired {
+            run_id: committed_run_id,
+            control_epoch,
+            reason_code: committed_reason_code,
+            reason: committed_reason,
+            ..
+        }) = &retirement_fact.payload
+        else {
+            return Err(storage_fault());
+        };
+        if committed_run_id != &run_id
+            || *control_epoch != fence.control_epoch
+            || *committed_reason_code != reason_code
+            || committed_reason != &reason
+        {
+            return Err(storage_fault());
+        }
+        let retired = RetiredRunRecord {
+            control_epoch: *control_epoch,
+            reason_code: *committed_reason_code,
+            reason: committed_reason.clone(),
+            retirement_fact_id: retirement_fact.fact_id.clone(),
+            ledger_sequence: retirement_fact.ledger_sequence,
+        };
+        self.install_retired_run_state(&run_id, retired.clone())?;
+        Ok(retired.receipt(run_id, false))
+    }
+
     /// Host-only runtime health transition. Compile-time Disabled tools can
     /// never be enabled, and runtime availability can only shrink from Ready.
     pub fn set_run_tool_availability_host(
@@ -1848,6 +2543,9 @@ impl KernelSessionServiceV2 {
             .command_gate
             .lock()
             .map_err(|_| storage_fault())?;
+        self.inner
+            .authority
+            .require_run_accepting_commands(&run_id)?;
         if !matches!(
             availability,
             ToolAvailabilityV2::Revoked | ToolAvailabilityV2::Unavailable
@@ -2126,6 +2824,9 @@ impl KernelSessionServiceV2 {
         run_id: RunId,
         next: SettingsCeilingV2,
     ) -> AuthorityResult<ToolContextBundleV2> {
+        self.inner
+            .authority
+            .require_run_accepting_commands(&run_id)?;
         let next_settings_digest = settings_digest(&next)?;
         let (run, runtime_availability, leases, trusts, previews, pending) = {
             let state = self.inner.state.lock().map_err(|_| storage_fault())?;
@@ -2269,9 +2970,8 @@ impl KernelSessionServiceV2 {
 
         // The complete invalidation/revocation batch is durable before the
         // effective Settings ceiling changes in memory.
-        let mut material_mutations = Vec::with_capacity(
-            leases.len() + trusts.len() + previews.len() + pending.len(),
-        );
+        let mut material_mutations =
+            Vec::with_capacity(leases.len() + trusts.len() + previews.len() + pending.len());
         for (offset, lease) in leases.iter().enumerate() {
             material_mutations.push(AuthorityMaterialMutationV2::Replace {
                 expected_lifecycle: AUTHORITY_MATERIAL_ACTIVE.to_owned(),
@@ -2344,9 +3044,7 @@ impl KernelSessionServiceV2 {
             state
                 .previews
                 .retain(|_, preview| preview.record.run_id != run_id);
-            state
-                .pending
-                .retain(|_, pending| pending.run_id != run_id);
+            state.pending.retain(|_, pending| pending.run_id != run_id);
         }
         Ok(next_context)
     }
@@ -2386,6 +3084,13 @@ impl KernelSessionServiceV2 {
     ) -> AuthorityResult<(RunOpenReplyV2, RunCapabilityV2)> {
         let recovered = {
             let state = self.inner.state.lock().map_err(|_| storage_fault())?;
+            if state.retirement_fences.contains_key(&run_id)
+                || state.retired_runs.contains_key(&run_id)
+            {
+                return Err(KernelErrorV2::RunNotFound {
+                    run_id: run_id.clone(),
+                });
+            }
             state
                 .runs
                 .get(&run_id)
@@ -2441,7 +3146,8 @@ impl KernelSessionServiceV2 {
             state.run_settings.insert(run_id.clone(), settings.clone());
             state.recovered_runs.remove(&run_id);
         }
-        let tool_context = self.update_run_settings_ceiling_host_locked(run_id.clone(), settings)?;
+        let tool_context =
+            self.update_run_settings_ceiling_host_locked(run_id.clone(), settings)?;
         let reply = RunOpenReplyV2 {
             run_id,
             control_epoch: recovered.control_epoch,
@@ -2482,7 +3188,7 @@ impl KernelSessionServiceV2 {
         match result {
             Ok((reply, handling, run_capability)) => OpenedRunTransportV2 {
                 response: response(request_id, Ok((reply, handling))),
-                run_capability: Some(run_capability),
+                run_capability,
             },
             Err(error) => OpenedRunTransportV2 {
                 response: response(request_id, Err(error)),
@@ -2533,13 +3239,36 @@ impl KernelSessionServiceV2 {
                 _ => Err(storage_fault()),
             };
         }
+        let (retirement_epoch, run) = {
+            let state = self.inner.state.lock().map_err(|_| storage_fault())?;
+            (
+                state
+                    .retirement_fences
+                    .get(&run_id)
+                    .map(|fence| fence.control_epoch)
+                    .or_else(|| {
+                        state
+                            .retired_runs
+                            .get(&run_id)
+                            .map(|retired| retired.control_epoch)
+                    }),
+                state.runs.get(&run_id).cloned(),
+            )
+        };
+        if let Some(current) = retirement_epoch {
+            return self.persist_user_decision_reply(
+                request_id,
+                request_digest,
+                run_id,
+                UserDecisionReplyV2::Stale {
+                    submitted: expected_control_epoch,
+                    current,
+                },
+            );
+        }
         decision
             .validate()
             .map_err(|_| invalid_field("decision", InvalidFieldViolationV2::OutOfRange))?;
-        let run = {
-            let state = self.inner.state.lock().map_err(|_| storage_fault())?;
-            state.runs.get(&run_id).cloned()
-        };
         let Some(run) = run else {
             return self.persist_user_decision_reply(
                 request_id,
@@ -2642,56 +3371,49 @@ impl KernelSessionServiceV2 {
         command: RunOpenV2,
         workspace_root: &Path,
         settings: SettingsCeilingV2,
-    ) -> AuthorityResult<(KernelReplyV2, CommandHandlingV2, RunCapabilityV2)> {
-        let digest = command_request_digest_v2(&envelope.command).map_err(|_| storage_fault())?;
+    ) -> AuthorityResult<(KernelReplyV2, CommandHandlingV2, Option<RunCapabilityV2>)> {
+        let requested_binding = resolve_workspace_binding(workspace_root)?;
+        let requested_settings_digest = settings_digest(&settings)?;
+        let digest = run_open_host_request_digest(
+            &envelope.command,
+            &requested_binding.digest,
+            &requested_settings_digest,
+        )?;
         if let Some(replayed) = self.lookup_replay(&envelope.request_id, &digest)? {
-            let DurablePublicReplyV2::RunOpen {
-                run_id,
-                workspace_binding_digest,
-                ..
-            } = replayed
-            else {
+            let DurablePublicReplyV2::RunOpen { reply: opened } = replayed else {
                 return Err(storage_fault());
             };
-            let active = self
-                .inner
-                .state
-                .lock()
-                .map_err(|_| storage_fault())?
-                .runs
-                .get(&run_id)
-                .cloned();
-            let reply = if let Some(active) = active {
-                if active.workspace_binding_ref != command.workspace_binding_ref
-                    || active.workspace_binding_digest != workspace_binding_digest
-                {
-                    return Err(invalid_field(
-                        "workspaceBindingRef",
-                        InvalidFieldViolationV2::InvalidRelation,
-                    ));
-                }
-                let tool_context =
-                    self.update_run_settings_ceiling_host_locked(run_id.clone(), settings.clone())?;
-                RunOpenReplyV2 {
-                    run_id,
-                    control_epoch: active.control_epoch,
-                    workspace_binding_digest: active.workspace_binding_digest,
-                    tool_context,
-                }
-            } else {
-                let (reply, _) = self.resume_run_host_locked(
-                    run_id,
-                    command.workspace_binding_ref,
-                    workspace_root,
-                    command.input_id,
-                    command.opaque_input_ref,
-                    settings.clone(),
-                )?;
-                reply
+            if opened.workspace_binding_digest != requested_binding.digest {
+                return Err(storage_fault());
+            }
+            let run_id = opened.run_id.clone();
+            let (retirement_tombstoned, active) = {
+                let state = self.inner.state.lock().map_err(|_| storage_fault())?;
+                (
+                    state.retirement_fences.contains_key(&run_id)
+                        || state.retired_runs.contains_key(&run_id),
+                    state.runs.get(&run_id).cloned(),
+                )
             };
-            let run_capability = self.run_record(&reply.run_id)?.capability;
+            if retirement_tombstoned {
+                return Ok((
+                    KernelReplyV2::RunOpened(opened),
+                    CommandHandlingV2::Replayed,
+                    None,
+                ));
+            }
+            let run_capability = match active {
+                Some(active)
+                    if active.workspace_binding_ref == command.workspace_binding_ref
+                        && active.workspace_binding_digest == opened.workspace_binding_digest =>
+                {
+                    Some(active.capability)
+                }
+                Some(_) => return Err(storage_fault()),
+                None => None,
+            };
             return Ok((
-                KernelReplyV2::RunOpened(reply),
+                KernelReplyV2::RunOpened(opened),
                 CommandHandlingV2::Replayed,
                 run_capability,
             ));
@@ -2702,9 +3424,9 @@ impl KernelSessionServiceV2 {
         let binding = self
             .inner
             .authority
-            .bind_run_workspace(&run_id, workspace_root)?;
+            .bind_resolved_run_workspace(&run_id, requested_binding)?;
         let context_version = ToolContextVersionV2::new(1).map_err(|_| storage_fault())?;
-        let settings_ceiling_digest = settings_digest(&settings)?;
+        let settings_ceiling_digest = requested_settings_digest;
         let runtime_availability = self
             .inner
             .state
@@ -2719,11 +3441,14 @@ impl KernelSessionServiceV2 {
             &runtime_availability,
         )?;
         let initial_epoch = ControlEpoch::new(1).map_err(|_| storage_fault())?;
-        let stored = DurablePublicReplyV2::RunOpen {
+        let opened = RunOpenReplyV2 {
             run_id: run_id.clone(),
             control_epoch: initial_epoch,
             workspace_binding_digest: binding.digest.clone(),
-            context_version,
+            tool_context: tool_context.clone(),
+        };
+        let stored = DurablePublicReplyV2::RunOpen {
+            reply: opened.clone(),
         };
         let receipt = public_receipt(
             envelope.request_id.clone(),
@@ -2745,15 +3470,14 @@ impl KernelSessionServiceV2 {
             command.workspace_binding_ref.clone(),
             settings_ceiling_digest.clone(),
             tool_context.context_ref(),
+            &run_capability,
             receipt,
         )?;
         let tool_context_ref = tool_context.context_ref();
-        let reply = KernelReplyV2::RunOpened(RunOpenReplyV2 {
-            run_id: run_id.clone(),
-            control_epoch: epoch.accepted_control_epoch,
-            workspace_binding_digest: binding.digest.clone(),
-            tool_context,
-        });
+        if epoch.accepted_control_epoch != opened.control_epoch {
+            return Err(storage_fault());
+        }
+        let reply = KernelReplyV2::RunOpened(opened);
         {
             let mut state = self.inner.state.lock().map_err(|_| storage_fault())?;
             state.runs.insert(
@@ -2770,9 +3494,13 @@ impl KernelSessionServiceV2 {
                     control_fact_id: epoch.epoch_fact_id,
                 },
             );
+            state.run_capability_verifiers.insert(
+                run_id.clone(),
+                run_capability_verifier_digest(&run_id, &run_capability),
+            );
             state.run_settings.insert(run_id, settings);
         }
-        Ok((reply, CommandHandlingV2::Evaluated, run_capability))
+        Ok((reply, CommandHandlingV2::Evaluated, Some(run_capability)))
     }
 
     fn replay_or_evaluate(
@@ -2783,7 +3511,8 @@ impl KernelSessionServiceV2 {
         let digest = command_request_digest_v2(&envelope.command).map_err(|_| storage_fault())?;
         let run_id = public_command_run_id(&envelope.command)
             .ok_or_else(|| invalid_field("command.kind", InvalidFieldViolationV2::InvalidEnum))?;
-        self.require_run_capability(&run_id, transport_run_capability)?;
+        let capability_disposition =
+            self.verify_run_capability(&run_id, transport_run_capability)?;
         if let Some(replayed) = self.lookup_replay(&envelope.request_id, &digest)? {
             let reply = match replayed {
                 DurablePublicReplyV2::Kernel { reply } => reply,
@@ -2795,6 +3524,12 @@ impl KernelSessionServiceV2 {
             };
             return Ok((reply, CommandHandlingV2::Replayed));
         }
+        let RunCapabilityDisposition::Active = capability_disposition else {
+            return Err(KernelErrorV2::RunNotFound { run_id });
+        };
+        self.inner
+            .authority
+            .require_run_accepting_commands(&run_id)?;
         let mut receipt_persisted = false;
         let reply = match envelope.command.clone() {
             KernelCommandV2::ToolContextGet(command) => {
@@ -3030,12 +3765,19 @@ impl KernelSessionServiceV2 {
         let reply = CapabilityScopePreviewReplyV2::Previewed {
             preview: prepared.record.clone(),
         };
-        self.inner
-            .state
-            .lock()
-            .map_err(|_| storage_fault())?
-            .previews
-            .insert(prepared.record.preview_id.clone(), prepared);
+        {
+            let mut state = self.inner.state.lock().map_err(|_| storage_fault())?;
+            let preview_id = prepared.record.preview_id.clone();
+            let run_id = prepared.record.run_id.clone();
+            if state
+                .preview_runs
+                .insert(preview_id.clone(), run_id.clone())
+                .is_some_and(|existing| existing != run_id)
+            {
+                return Err(storage_fault());
+            }
+            state.previews.insert(preview_id, prepared);
+        }
         Ok((reply, public_command.is_some()))
     }
 
@@ -3047,6 +3789,11 @@ impl KernelSessionServiceV2 {
     ) -> AuthorityResult<Result<PreparedScopePreview, UserDecisionErrorV2>> {
         let (run, preview) = {
             let state = self.inner.state.lock().map_err(|_| storage_fault())?;
+            if state.retirement_fences.contains_key(run_id)
+                || state.retired_runs.contains_key(run_id)
+            {
+                return Ok(Err(UserDecisionErrorV2::ScopePreviewStale));
+            }
             let Some(run) = state.runs.get(run_id) else {
                 return Ok(Err(UserDecisionErrorV2::ScopePreviewNotFound));
             };
@@ -3719,22 +4466,71 @@ impl KernelSessionServiceV2 {
         }
     }
 
-    fn require_run_capability(
+    fn verify_run_capability(
         &self,
         run_id: &RunId,
         transport: &RunCapabilityV2,
-    ) -> AuthorityResult<PublicRunRecord> {
+    ) -> AuthorityResult<RunCapabilityDisposition> {
         let state = self.inner.state.lock().map_err(|_| storage_fault())?;
-        let run = state
-            .runs
-            .get(run_id)
-            .ok_or_else(|| KernelErrorV2::RunNotFound {
-                run_id: run_id.clone(),
-            })?;
-        if !constant_time_token_eq(&run.capability, transport) {
-            return Err(unauthorized_run());
+        if let Some(run) = state.runs.get(run_id).cloned() {
+            if !constant_time_token_eq(&run.capability, transport) {
+                return Err(unauthorized_run());
+            }
+            return if state.retirement_fences.contains_key(run_id) {
+                Ok(RunCapabilityDisposition::RetirementFenced)
+            } else if state.retired_runs.contains_key(run_id) {
+                Ok(RunCapabilityDisposition::Retired)
+            } else {
+                Ok(RunCapabilityDisposition::Active)
+            };
         }
-        Ok(run.clone())
+        let disposition = if state.retirement_fences.contains_key(run_id) {
+            Some(RunCapabilityDisposition::RetirementFenced)
+        } else if state.retired_runs.contains_key(run_id) {
+            Some(RunCapabilityDisposition::Retired)
+        } else {
+            None
+        };
+        if let Some(disposition) = disposition {
+            let Some(expected) = state.run_capability_verifiers.get(run_id) else {
+                return Err(KernelErrorV2::RunNotFound {
+                    run_id: run_id.clone(),
+                });
+            };
+            let submitted = run_capability_verifier_digest(run_id, transport);
+            if !constant_time_bytes_eq(expected.as_bytes(), submitted.as_bytes()) {
+                return Err(unauthorized_run());
+            }
+            return Ok(disposition);
+        }
+        Err(KernelErrorV2::RunNotFound {
+            run_id: run_id.clone(),
+        })
+    }
+
+    fn install_retired_run_state(
+        &self,
+        run_id: &RunId,
+        retired: RetiredRunRecord,
+    ) -> AuthorityResult<()> {
+        {
+            let mut state = self.inner.state.lock().map_err(|_| storage_fault())?;
+            state.runs.remove(run_id);
+            state.recovered_runs.remove(run_id);
+            state.retirement_fences.remove(run_id);
+            state.run_settings.remove(run_id);
+            state
+                .runtime_availability
+                .retain(|(candidate_run_id, _), _| candidate_run_id != run_id);
+            state.leases.retain(|_, lease| &lease.run_id != run_id);
+            state.trusts.retain(|_, trust| &trust.run_id != run_id);
+            state
+                .previews
+                .retain(|_, preview| &preview.record.run_id != run_id);
+            state.pending.retain(|_, intent| &intent.run_id != run_id);
+            state.retired_runs.insert(run_id.clone(), retired);
+        }
+        self.inner.authority.unbind_run_workspace_host(run_id)
     }
 
     fn run_record(&self, run_id: &RunId) -> AuthorityResult<PublicRunRecord> {
