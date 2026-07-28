@@ -4,14 +4,15 @@ mod schema;
 use self::builder::build_tool_contract;
 use self::schema::provider_schema_for_operation;
 use crate::{
-    KernelExecutorBinding, KernelToolContract, OperationExecutionMode, ToolFamily,
-    ToolOperationKind, ToolPermissionMode, ToolRiskLevel,
+    authority_descriptor_v4, AuthorityToolDescriptorV4, KernelExecutorBinding, KernelToolContract,
+    OperationExecutionMode, ToolFamily, ToolOperationKind, ToolPermissionMode, ToolRiskLevel,
 };
 
 #[derive(Debug, Clone)]
 pub struct KernelToolRegistration {
     pub contract: KernelToolContract,
     pub executor_binding: Option<KernelExecutorBinding>,
+    pub(crate) authority_v4: Option<AuthorityToolDescriptorV4>,
 }
 
 #[derive(Clone, Copy)]
@@ -561,5 +562,6 @@ fn registered_tool(
     KernelToolRegistration {
         contract: build_tool_contract(identity, permission, execution, resources),
         executor_binding,
+        authority_v4: authority_descriptor_v4(identity.tool_id),
     }
 }

@@ -491,4 +491,6 @@ mod authorization_tests;
 mod draft_tests;
 mod execution_tests;
 mod tool_tests;
+mod v2_grant_tests;
+mod v2_invocation_tests;
 mod workspace_tests;

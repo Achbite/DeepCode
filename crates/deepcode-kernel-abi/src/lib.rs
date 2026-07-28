@@ -19,10 +19,15 @@ mod resource_packet;
 mod run;
 mod snapshot;
 mod tool;
+pub mod tool_catalog_v4;
+pub mod v2;
+pub mod v2_command;
 mod wire;
 mod workspace;
 
 pub const KERNEL_ABI_VERSION: &str = "deepcode.kernel.abi.v1";
+pub const KERNEL_ABI_V2_VERSION: &str = "deepcode.kernel.abi.v2";
+pub const KERNEL_TOOL_CATALOG_V4_VERSION: &str = "deepcode.kernel.tools.v4";
 
 pub use command::*;
 pub use config::*;
@@ -44,6 +49,7 @@ pub use resource_packet::*;
 pub use run::*;
 pub use snapshot::*;
 pub use tool::*;
+pub use tool_catalog_v4::*;
 pub use wire::*;
 pub use workspace::*;
 

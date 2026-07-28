@@ -69,6 +69,10 @@ pub mod resources;
 pub mod scheduler;
 pub mod state;
 pub mod tools;
+// SP2 keeps the v2 authority core dark until SP4 exposes only the validated
+// command service. Remove this narrow migration allowance at that live cut.
+#[allow(dead_code, unused_imports)]
+mod v2;
 pub mod workspace;
 
 pub(crate) use control::*;

@@ -4,11 +4,17 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 
 mod environment;
+mod grant_v2;
 pub mod workspace_boundary;
 
 pub use environment::{
     ExecutionEnvironmentDecision, ExecutionEnvironmentPolicy, HostShellOverride,
     ShellRuntimePreference,
+};
+pub use grant_v2::{
+    evaluate_capability_grant_auto_issue_v2, CapabilityGrantAutoIssueCandidateV2,
+    CapabilityGrantAutoIssueDecisionV2, CapabilityGrantAutoIssueEvaluationV2,
+    CapabilityGrantAutoIssueReasonV2, GrantAutonomyModeV2, GrantResolvedScopeV2,
 };
 pub use workspace_boundary::WorkspaceBoundary;
 
