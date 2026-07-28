@@ -4,8 +4,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 use crate::v2::{
-    field_too_large, invalid_value, typed_digest, validate_identity, ControlEpoch,
-    ResourceAccessV2, V2ValidationError,
+    field_too_large, invalid_value, typed_digest, validate_identity, ResourceAccessV2,
+    V2ValidationError,
 };
 
 pub const KERNEL_TOOL_REGISTRY_VERSION_V2: &str = "deepcode.kernel.tools.v2";
@@ -71,8 +71,7 @@ identity_type!(CapabilityLeaseIdV2, "capabilityLeaseId");
 identity_type!(FactQueryContinuationV2, "factQueryContinuation");
 identity_type!(TrustPolicyIdV2, "trustPolicyId");
 
-#[derive(Clone, PartialEq, Eq, Hash, Serialize)]
-#[serde(transparent)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct RunCapabilityV2(String);
 
 impl RunCapabilityV2 {
@@ -90,15 +89,6 @@ impl RunCapabilityV2 {
 impl fmt::Debug for RunCapabilityV2 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("RunCapabilityV2([REDACTED])")
-    }
-}
-
-impl<'de> Deserialize<'de> for RunCapabilityV2 {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        Self::new(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
     }
 }
 
@@ -602,13 +592,6 @@ impl ToolIntentAuthorityV2 {
             }
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct RunAuthorityV2 {
-    pub run_capability: RunCapabilityV2,
-    pub expected_control_epoch: ControlEpoch,
 }
 
 pub fn tool_contract_digest_v2(

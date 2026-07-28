@@ -4,19 +4,44 @@ mod schema;
 use self::builder::build_tool_contract;
 use self::schema::provider_schema_for_operation;
 use crate::{
-    authority_descriptor_v4, AuthorityToolDescriptorV4, KernelExecutorBinding, KernelToolContract,
-    OperationExecutionMode, ToolFamily, ToolOperationKind, ToolPermissionMode, ToolRiskLevel,
+    authority_descriptor_v4, normalize_invocation_v4, AuthorityToolDescriptorV4,
+    KernelExecutorBinding, KernelToolContract, OperationExecutionMode, ToolFamily,
+    ToolOperationKind, ToolPermissionMode, ToolRiskLevel,
 };
+use deepcode_kernel_abi::tool_catalog_v4::AuthorityToolIdV4;
 use deepcode_kernel_abi::{
-    ToolAvailabilityV2, ToolDescriptorV2, ToolEffectClassV2, ToolEffectScopeV2, ToolIdV2,
-    ToolInputSchemaV2, ToolRiskV2,
+    ToolAvailabilityV2, ToolDescriptorV2, ToolEffectClassV2,
+    ToolEffectScopeV2, ToolIdV2, ToolInputSchemaV2, ToolRiskV2,
 };
+use serde_json::Value;
+
+pub type KernelArgumentsCanonicalizerV2 = fn(Value) -> Result<Value, String>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KernelExecutionAdapterV2 {
+    Standard,
+    DocumentRead,
+    WebFetch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KernelAdmissionMetadataV2 {
+    pub default_deadline_ms: u32,
+    pub maximum_deadline_ms: u32,
+    pub maximum_output_bytes: u32,
+    pub cancellation_before_effect_only: bool,
+    pub idempotent: bool,
+    pub requires_target_revalidation: bool,
+    pub execution_adapter: KernelExecutionAdapterV2,
+}
 
 #[derive(Debug, Clone)]
 pub struct KernelToolRegistration {
     pub contract: KernelToolContract,
     pub descriptor_v2: ToolDescriptorV2,
     pub executor_binding: Option<KernelExecutorBinding>,
+    pub canonicalize_arguments_v2: KernelArgumentsCanonicalizerV2,
+    pub admission_v2: KernelAdmissionMetadataV2,
     pub(crate) authority_v4: Option<AuthorityToolDescriptorV4>,
 }
 
@@ -407,7 +432,112 @@ fn registered_tool(
         contract,
         descriptor_v2,
         executor_binding,
+        canonicalize_arguments_v2: canonicalizer_for(identity.operation_kind),
+        admission_v2: admission_metadata_v2(identity.operation_kind, resources.read_only),
         authority_v4: authority_descriptor_v4(identity.tool_id),
+    }
+}
+
+macro_rules! legacy_canonicalizer {
+    ($name:ident, $tool:expr) => {
+        fn $name(arguments: Value) -> Result<Value, String> {
+            let canonical =
+                normalize_invocation_v4($tool, arguments).map_err(|error| error.to_string())?;
+            serde_json::to_value(canonical)
+                .ok()
+                .and_then(|value| value.get("arguments").cloned())
+                .ok_or_else(|| "canonical adapter omitted arguments".to_owned())
+        }
+    };
+}
+
+legacy_canonicalizer!(canonicalize_fs_read, AuthorityToolIdV4::FsRead);
+legacy_canonicalizer!(canonicalize_fs_list, AuthorityToolIdV4::FsList);
+legacy_canonicalizer!(canonicalize_fs_glob, AuthorityToolIdV4::FsGlob);
+legacy_canonicalizer!(canonicalize_fs_diff, AuthorityToolIdV4::FsDiff);
+legacy_canonicalizer!(canonicalize_code_grep, AuthorityToolIdV4::CodeGrep);
+legacy_canonicalizer!(canonicalize_fs_create, AuthorityToolIdV4::FsCreate);
+legacy_canonicalizer!(canonicalize_fs_write, AuthorityToolIdV4::FsWrite);
+legacy_canonicalizer!(canonicalize_fs_edit, AuthorityToolIdV4::FsEdit);
+legacy_canonicalizer!(canonicalize_fs_rename, AuthorityToolIdV4::FsRename);
+legacy_canonicalizer!(canonicalize_fs_delete, AuthorityToolIdV4::FsDelete);
+legacy_canonicalizer!(
+    canonicalize_fs_ensure_directory,
+    AuthorityToolIdV4::FsEnsureDirectory
+);
+legacy_canonicalizer!(canonicalize_document_read, AuthorityToolIdV4::DocumentRead);
+legacy_canonicalizer!(canonicalize_git_status, AuthorityToolIdV4::GitStatus);
+legacy_canonicalizer!(canonicalize_git_diff, AuthorityToolIdV4::GitDiff);
+legacy_canonicalizer!(canonicalize_git_stage, AuthorityToolIdV4::GitStage);
+legacy_canonicalizer!(canonicalize_git_unstage, AuthorityToolIdV4::GitUnstage);
+legacy_canonicalizer!(canonicalize_git_commit, AuthorityToolIdV4::GitCommit);
+legacy_canonicalizer!(canonicalize_web_search, AuthorityToolIdV4::WebSearch);
+legacy_canonicalizer!(canonicalize_web_fetch, AuthorityToolIdV4::WebFetch);
+
+fn canonicalizer_for(operation_kind: ToolOperationKind) -> KernelArgumentsCanonicalizerV2 {
+    match operation_kind {
+        ToolOperationKind::FsRead => canonicalize_fs_read,
+        ToolOperationKind::FsList => canonicalize_fs_list,
+        ToolOperationKind::FsGlob => canonicalize_fs_glob,
+        ToolOperationKind::FsDiff => canonicalize_fs_diff,
+        ToolOperationKind::CodeGrep => canonicalize_code_grep,
+        ToolOperationKind::FsCreate => canonicalize_fs_create,
+        ToolOperationKind::FsWrite => canonicalize_fs_write,
+        ToolOperationKind::FsEdit => canonicalize_fs_edit,
+        ToolOperationKind::FsRename => canonicalize_fs_rename,
+        ToolOperationKind::FsDelete => canonicalize_fs_delete,
+        ToolOperationKind::FsEnsureDirectory => canonicalize_fs_ensure_directory,
+        ToolOperationKind::DocumentRead => canonicalize_document_read,
+        ToolOperationKind::GitStatus => canonicalize_git_status,
+        ToolOperationKind::GitDiff => canonicalize_git_diff,
+        ToolOperationKind::GitStage => canonicalize_git_stage,
+        ToolOperationKind::GitUnstage => canonicalize_git_unstage,
+        ToolOperationKind::GitCommit => canonicalize_git_commit,
+        ToolOperationKind::WebSearch => canonicalize_web_search,
+        ToolOperationKind::WebFetch => canonicalize_web_fetch,
+        ToolOperationKind::GitPush
+        | ToolOperationKind::ProcessExec
+        | ToolOperationKind::BrowserOpen
+        | ToolOperationKind::BrowserReload
+        | ToolOperationKind::BrowserSnapshot
+        | ToolOperationKind::BrowserInspect
+        | ToolOperationKind::BrowserClick
+        | ToolOperationKind::BrowserType
+        | ToolOperationKind::BrowserScroll
+        | ToolOperationKind::ProviderCall => {
+            unreachable!("non-registered operation kind has no v2 canonicalizer")
+        }
+    }
+}
+
+fn admission_metadata_v2(
+    operation_kind: ToolOperationKind,
+    read_only: bool,
+) -> KernelAdmissionMetadataV2 {
+    let (default_deadline_ms, maximum_deadline_ms, maximum_output_bytes) = match operation_kind {
+        ToolOperationKind::GitStatus
+        | ToolOperationKind::GitDiff
+        | ToolOperationKind::GitStage
+        | ToolOperationKind::GitUnstage
+        | ToolOperationKind::GitCommit => (30_000, 120_000, 65_536),
+        ToolOperationKind::WebSearch | ToolOperationKind::WebFetch => {
+            (15_000, 60_000, 262_144)
+        }
+        _ => (10_000, 30_000, 4_194_304),
+    };
+    let execution_adapter = match operation_kind {
+        ToolOperationKind::DocumentRead => KernelExecutionAdapterV2::DocumentRead,
+        ToolOperationKind::WebFetch => KernelExecutionAdapterV2::WebFetch,
+        _ => KernelExecutionAdapterV2::Standard,
+    };
+    KernelAdmissionMetadataV2 {
+        default_deadline_ms,
+        maximum_deadline_ms,
+        maximum_output_bytes,
+        cancellation_before_effect_only: true,
+        idempotent: read_only,
+        requires_target_revalidation: true,
+        execution_adapter,
     }
 }
 

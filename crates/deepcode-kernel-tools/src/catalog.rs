@@ -1,13 +1,12 @@
 use crate::registrations::{builtin_tool_registrations, KernelToolRegistration};
 use crate::{
-    normalize_invocation_v4, KernelToolCatalogSnapshot, KernelToolCatalogTool, KernelToolContract,
-    ToolPermissionMode,
+    KernelToolCatalogSnapshot, KernelToolCatalogTool, KernelToolContract, ToolPermissionMode,
 };
 use deepcode_kernel_abi::v2::V2ValidationError;
 use deepcode_kernel_abi::{
     canonical_arguments_digest_v2, tool_catalog_digest_v2, tool_context_digest_v2,
-    AuthorityToolIdV4, CanonicalArgumentsDigestV2, RawToolArgumentsV2, ToolAvailabilityV2,
-    ToolContextBundleV2, ToolContextVersionV2, ToolIdV2, ToolInventoryV2, KERNEL_TOOL_PROMPT_V2,
+    CanonicalArgumentsDigestV2, RawToolArgumentsV2, ToolAvailabilityV2, ToolContextBundleV2,
+    ToolContextVersionV2, ToolIdV2, ToolInventoryV2, KERNEL_TOOL_PROMPT_V2,
     KERNEL_TOOL_REGISTRY_VERSION_V2, TOOL_CONTEXT_FORMAT_V2, TOOL_INVENTORY_FORMAT_V2,
 };
 use serde_json::Value;
@@ -194,28 +193,10 @@ impl KernelToolRegistry {
                 tool_id.to_string(),
             ));
         }
-        let legacy_tool_id = AuthorityToolIdV4::ALL
-            .into_iter()
-            .find(|candidate| candidate.as_str() == tool_id.as_str())
-            .ok_or_else(|| KernelToolRegistryErrorV2::ToolNotRegistered(tool_id.to_string()))?;
-        let canonical = normalize_invocation_v4(legacy_tool_id, raw_arguments.into_value())
-            .map_err(|error| KernelToolRegistryErrorV2::InvalidArguments {
+        let arguments = (registration.canonicalize_arguments_v2)(raw_arguments.into_value())
+            .map_err(|reason| KernelToolRegistryErrorV2::InvalidArguments {
                 tool_id: tool_id.to_string(),
-                reason: error.to_string(),
-            })?;
-        let encoded = serde_json::to_value(canonical).map_err(|error| {
-            KernelToolRegistryErrorV2::InvalidArguments {
-                tool_id: tool_id.to_string(),
-                reason: error.to_string(),
-            }
-        })?;
-        let arguments = encoded
-            .as_object()
-            .and_then(|object| object.get("arguments"))
-            .cloned()
-            .ok_or_else(|| KernelToolRegistryErrorV2::InvalidArguments {
-                tool_id: tool_id.to_string(),
-                reason: "canonical adapter omitted arguments".to_owned(),
+                reason,
             })?;
         let arguments_digest = canonical_arguments_digest_v2(tool_id, &arguments)?;
         Ok(CanonicalToolInvocationV2 {

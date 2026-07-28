@@ -1,16 +1,16 @@
 use super::model::{
     invocation_phase_is_terminal, AuthorityResult, AuthorityState, CommandReplay,
-    ExecutionResolution, GrantDecisionReplay, GrantLifecycle, GrantRecord, InvocationPhase,
-    InvocationRecord, PreparedGrantRequest, RawExecution, ReservationRecord, ResolvedTarget,
-    ResourceRecord, RunLifecycle, RunRecord, StopOverlay, SubmissionBinding, VerifiedExecution,
-    WorkspaceBinding,
+    DirectInvocationRecord, ExecutionResolution, GrantDecisionReplay, GrantLifecycle, GrantRecord,
+    InvocationPhase, InvocationRecord, PreparedDirectToolIntent, PreparedGrantRequest, RawExecution,
+    ReservationRecord, ResolvedTarget, ResourceRecord, RunLifecycle, RunRecord, StopOverlay,
+    SubmissionBinding, VerifiedExecution, WorkspaceBinding,
 };
 use crate::executors::{plan_v2_text_edit, KernelExecutorConfig};
-use crate::network_policy::{review_http_target, ReviewedHttpTarget};
+use crate::network_policy::review_http_target;
 use deepcode_kernel_abi::tool_catalog_v4::{
-    output_payload_measure_v4, tool_output_digest_v4, AuthorityToolIdV4, DeadlineV4,
+    output_payload_measure_v4, AuthorityToolIdV4, DeadlineV4,
     DeleteTargetV4, DocumentPagesV4, EffectScopeV4, ExecutionAvailabilityV4, LineRangeV4,
-    NetworkPublicTargetV4, OutputTruncationV4, PathEntrySizeV4, PathEntryV4, ResourceAccessV4,
+    NetworkPublicTargetV4, OutputTruncationV4, PathEntrySizeV4, PathEntryV4,
     SearchMatchV4, SearchStrategyV4, TextMediaTypeV4, ToolContractV4, ToolInvocationInputV4,
     ToolOutputPayloadV4, ToolOutputV4, ToolRiskV4, WebSearchItemV4, WorkspaceObjectKindV4,
 };
@@ -20,16 +20,20 @@ use deepcode_kernel_abi::v2::{
     invocation_submission_digest_v2, network_response_digest_v2, network_target_digest_v2,
     query_digest_v2, resource_state_digest_v2, target_revalidation_digest_v2,
     target_revalidation_set_digest_v2, workspace_binding_digest_v2, AdmissionRejectionV2,
-    AttemptIdentityV2, AuthorizationRequestDigestV2, AutonomyModeV2, CancelRequestId,
+    AttemptIdentityV2, AuthorizationFactV2, AuthorizationIdentityV2,
+    AuthorizationRequestDigestV2, AutonomyModeV2, CancelRequestId,
     CancellationIdentityV2, CancellationReasonCodeV2, CancellationSourceV2,
-    CanonicalPrivateTargetV2, CleanupFactV2, CommandEpochContextV2, CommandReceiptIdentityV2,
+    CapabilityAwaitingIdentityV2, CapabilityLeaseFactIdentityV2,
+    CanonicalPrivateTargetV2, CommandEpochContextV2, CommandReceiptIdentityV2,
     CommandRequestDigestV2, CommandRequestId, CommandRequestIdentityV2, ControlEpoch,
-    ControlFactV2, CorrelationSetV2, DeletionBeforeObservationV2, DirectoryBeforeObservationV2,
+    ControlFactV2, CorrelationRefV2, CorrelationSetV2, DeletionBeforeObservationV2,
+    DirectoryBeforeObservationV2,
     EffectEvidenceV2, EffectFactV2, EffectId, EffectIdentityV2, ExecutorEvidenceDigestV2, FactId,
     FileBeforeObservationV2, GrantDecisionBasisV2, GrantDecisionDigestV2, GrantDenialReasonV2,
     GrantDeniedIdentityV2, GrantFactV2, GrantId, GrantIssuedIdentityV2, GrantLifecycleIdentityV2,
     GrantSupersessionCauseV2, GrantUsePolicyV2, IdempotencyKeyHashV2, IndeterminateReasonV2,
     InputId, InvocationFactV2, InvocationId, InvocationRejectedIdentityV2,
+    InvocationAuthorityV2,
     InvocationRequestDigestV2, InvocationSubmissionDigestV2, KernelFactDraftV2,
     KernelFactEnvelopeV2, KernelFactPayloadV2, LastObservationV2, MutationCommandResultV2,
     NetworkAddressV2, NetworkHostV2, NetworkOriginV2, NetworkQueryV2, NetworkRequestTargetV2,
@@ -40,26 +44,30 @@ use deepcode_kernel_abi::v2::{
     ResourceAttemptIdentityV2, ResourceFactV2, ResourceId, ResourceProjectionObservationV2,
     ResourceResolvedIdentityV2, ResourceScopeV2, ResourceStateV2, RunId, TargetResolutionFailureV2,
     TargetRevalidationDigestV2, TargetRevalidationObservationV2, TargetRevalidationSetDigestV2,
-    TransitionIdentityV2, WorkspaceBindingDigestV2, WorkspaceObjectKindV2, WorkspaceScopeTargetV2,
+    ToolAttemptIdentityV2, ToolEffectIdentityV2, ToolObservedTerminalIdentityV2,
+    TransitionIdentityV2, WorkspaceObjectKindV2, WorkspaceScopeTargetV2,
     MAX_FACT_PAGE_BYTES_V2,
 };
 use deepcode_kernel_abi::v2_command::{
     CanonicalGrantRequestV2, ControlCancellationReplyV2, ControlEpochAdvanceV2,
     ControlEpochAdvancedReplyV2, DeadlineRequestV2, EpochPreconditionV2, FactPageContinuationV2,
-    GrantDecisionReplyV2, GrantDecisionSubmissionV2, GrantRequestV2, GrantRevokeV2,
+    GrantDecisionReplyV2, GrantRequestV2, GrantRevokeV2,
     GrantRevokedReplyV2, InvalidFieldViolationV2, InvalidRelationV2, InvalidRequestReasonV2,
     InvocationCancelReplyV2, InvocationCancelV2, InvocationStatusIdentityV2,
     InvocationStatusReplyV2, InvocationSubmissionReplyV2, KernelErrorV2, KernelFactFilterV2,
     KernelFactPageV2, KernelFactPredicateV2, KernelFactsQueryV2, KernelReplyV2,
     MutationCommandKindV2, RecordedCommandErrorV2, ResourceLifecycleV2, ResourceResolveReplyV2,
     ResourceResolveV2, RunTerminateV2, RunTerminatedReplyV2, StorageFaultCodeV2,
+    ToolIntentSubmitReplyV2,
 };
 use deepcode_kernel_ledger::v2::FactQueryV2;
 use deepcode_kernel_tools::{
     normalize_canonical_platform_path_v4, validate_canonical_invocation_v4,
     LocalAuthorityToolCatalogV4,
 };
-use std::collections::{BTreeMap, HashMap};
+use deepcode_kernel_abi::ToolIdV2;
+use deepcode_kernel_abi::{CanonicalArgumentsDigestV2, ToolContractDigestV2};
+use std::collections::HashMap;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
@@ -67,12 +75,6 @@ use std::path::{Component, Path, PathBuf};
 pub(super) enum PrepareFailure {
     Kernel(KernelErrorV2),
     Target(TargetResolutionFailureV2),
-}
-
-pub(super) enum DecisionSource {
-    None,
-    BuiltInPolicy,
-    TrustedUserDecision,
 }
 
 pub(super) enum RunCommandCheck {
@@ -94,23 +96,14 @@ pub(super) fn caused_attempt(
     }
 }
 
-pub(super) fn require_decision_source(
-    decision: &GrantDecisionSubmissionV2,
-    source: DecisionSource,
-) -> AuthorityResult<()> {
-    matches!(
-        (decision, source),
-        (
-            GrantDecisionSubmissionV2::ApplyKernelPolicy {},
-            DecisionSource::BuiltInPolicy
-        ) | (
-            GrantDecisionSubmissionV2::UserAllow { .. }
-                | GrantDecisionSubmissionV2::UserDeny { .. },
-            DecisionSource::TrustedUserDecision
-        )
-    )
-    .then_some(())
-    .ok_or(KernelErrorV2::TrustedDecisionSourceRequired {})
+pub(super) fn caused_direct_attempt(
+    identity: &ToolAttemptIdentityV2,
+    causation_fact_id: FactId,
+) -> ToolAttemptIdentityV2 {
+    ToolAttemptIdentityV2 {
+        causation_fact_id,
+        ..identity.clone()
+    }
 }
 
 impl From<KernelErrorV2> for PrepareFailure {
@@ -169,11 +162,18 @@ pub(super) fn plan_control_cancellation(
     let Some(invocation_id) = active_invocation_id else {
         return Ok((ControlCancellationReplyV2::None {}, None));
     };
-    let invocation = state
+    let stop_overlay = state
         .invocations
         .get(&invocation_id)
+        .map(|invocation| &invocation.stop_overlay)
+        .or_else(|| {
+            state
+                .direct_invocations
+                .get(&invocation_id)
+                .map(|invocation| &invocation.stop_overlay)
+        })
         .ok_or_else(corrupt_store)?;
-    if let Some((cancel_request_id, fact_id, _)) = invocation.stop_overlay.cancellation() {
+    if let Some((cancel_request_id, fact_id, _)) = stop_overlay.cancellation() {
         return Ok((
             ControlCancellationReplyV2::AlreadyRequested {
                 cancel_request_id: cancel_request_id.clone(),
@@ -365,6 +365,60 @@ pub(super) fn prepare_grant_request(
     })
 }
 
+pub(super) fn prepare_direct_tool_intent(
+    run_id: &RunId,
+    operation_id: &OperationId,
+    control_epoch: ControlEpoch,
+    idempotency_key: &str,
+    canonical_invocation: &ToolInvocationInputV4,
+    deadline: DeadlineRequestV2,
+    correlation_refs: Vec<CorrelationRefV2>,
+    catalog: &LocalAuthorityToolCatalogV4,
+    workspace: &WorkspaceBinding,
+    executor_config: &KernelExecutorConfig,
+) -> Result<PreparedDirectToolIntent, PrepareFailure> {
+    validate_canonical_invocation_v4(canonical_invocation).map_err(|_| {
+        invalid_field(
+            "canonicalInvocation",
+            InvalidFieldViolationV2::OutOfRange,
+        )
+    })?;
+    let tool_id = canonical_invocation.tool_id();
+    let contract = catalog.contract(tool_id);
+    if contract.execution_availability != ExecutionAvailabilityV4::Ready
+        || catalog.ready_binding(tool_id).is_none()
+    {
+        return Err(PrepareFailure::Kernel(
+            KernelErrorV2::ToolExecutionUnavailable {
+                tool_id,
+                availability: ExecutionAvailabilityV4::Blocked,
+            },
+        ));
+    }
+    let effective_deadline_ms = materialize_deadline(deadline, &contract.deadline)?;
+    let correlations = CorrelationSetV2::materialize(correlation_refs)
+        .map_err(|_| invalid_field("correlationRefs", InvalidFieldViolationV2::Unsorted))?;
+    let idempotency_key_hash =
+        idempotency_key_hash_v2(run_id, idempotency_key).map_err(|_| {
+            invalid_field(
+                "idempotencyKey",
+                InvalidFieldViolationV2::OutOfRange,
+            )
+        })?;
+    let (resource_scope, resolved_targets) =
+        resolve_invocation_targets(canonical_invocation, workspace, executor_config)?;
+    let _ = (operation_id, control_epoch);
+    Ok(PreparedDirectToolIntent {
+        canonical_invocation: canonical_invocation.clone(),
+        resource_scope,
+        resolved_targets,
+        idempotency_key_hash,
+        workspace_binding_digest: workspace.digest.clone(),
+        effective_deadline_ms,
+        correlations,
+    })
+}
+
 pub(super) fn prepare_submission_digest(
     request: &GrantRequestV2,
     grant_id: &GrantId,
@@ -413,6 +467,47 @@ pub(super) fn prepare_effect(
     workspace: &WorkspaceBinding,
     executor_config: &KernelExecutorConfig,
 ) -> Result<EffectPreparation, PreEffectFailureCodeV2> {
+    prepare_effect_inner(
+        invocation,
+        admitted_targets,
+        &identity.run_id,
+        &identity.operation_id,
+        &identity.invocation_id,
+        &identity.attempt_id,
+        workspace,
+        executor_config,
+    )
+}
+
+pub(super) fn prepare_direct_effect(
+    invocation: &ToolInvocationInputV4,
+    admitted_targets: &[(ResourceId, ResolvedTarget)],
+    identity: &ToolAttemptIdentityV2,
+    workspace: &WorkspaceBinding,
+    executor_config: &KernelExecutorConfig,
+) -> Result<EffectPreparation, PreEffectFailureCodeV2> {
+    prepare_effect_inner(
+        invocation,
+        admitted_targets,
+        &identity.run_id,
+        &identity.operation_id,
+        &identity.invocation_id,
+        &identity.attempt_id,
+        workspace,
+        executor_config,
+    )
+}
+
+fn prepare_effect_inner(
+    invocation: &ToolInvocationInputV4,
+    admitted_targets: &[(ResourceId, ResolvedTarget)],
+    run_id: &RunId,
+    operation_id: &OperationId,
+    invocation_id: &InvocationId,
+    attempt_id: &deepcode_kernel_abi::v2::AttemptId,
+    workspace: &WorkspaceBinding,
+    executor_config: &KernelExecutorConfig,
+) -> Result<EffectPreparation, PreEffectFailureCodeV2> {
     let (_, fresh_targets) = resolve_invocation_targets(invocation, workspace, executor_config)
         .map_err(|_| PreEffectFailureCodeV2::TargetRevalidationFailed)?;
     if fresh_targets.len() != admitted_targets.len()
@@ -435,10 +530,10 @@ pub(super) fn prepare_effect(
             let observation =
                 revalidation_observation(invocation, &target, expected_edit.as_deref())?;
             let digest = target_revalidation_digest_v2(
-                &identity.run_id,
-                &identity.operation_id,
-                &identity.invocation_id,
-                &identity.attempt_id,
+                run_id,
+                operation_id,
+                invocation_id,
+                attempt_id,
                 invocation.tool_id(),
                 resource_id,
                 &workspace.digest,
@@ -1148,6 +1243,157 @@ pub(super) fn execution_result_drafts(
     ])
 }
 
+pub(super) fn direct_pre_effect_stop_drafts(
+    identity: &ToolAttemptIdentityV2,
+    observed_fact_id: FactId,
+    terminal_fact_id: FactId,
+    cancellation: Option<(&CancelRequestId, &FactId)>,
+) -> Vec<KernelFactDraftV2> {
+    let (observed, terminal) = match cancellation {
+        Some((cancel_request_id, cancellation_fact_id)) => (
+            InvocationFactV2::ToolCancellationObserved {
+                identity: caused_direct_attempt(identity, cancellation_fact_id.clone()),
+                cancel_request_id: cancel_request_id.clone(),
+            },
+            InvocationFactV2::ToolCancelledBeforeEffect {
+                identity: caused_direct_attempt(identity, observed_fact_id.clone()),
+                cancel_request_id: cancel_request_id.clone(),
+            },
+        ),
+        None => (
+            InvocationFactV2::ToolDeadlineObserved {
+                identity: caused_direct_attempt(identity, identity.causation_fact_id.clone()),
+            },
+            InvocationFactV2::ToolTimedOutBeforeEffect {
+                identity: caused_direct_attempt(identity, observed_fact_id.clone()),
+            },
+        ),
+    };
+    vec![
+        fact_draft(observed_fact_id, KernelFactPayloadV2::Invocation(observed)),
+        fact_draft(terminal_fact_id, KernelFactPayloadV2::Invocation(terminal)),
+    ]
+}
+
+pub(super) fn direct_failed_before_effect_drafts(
+    identity: &ToolAttemptIdentityV2,
+    attempt_prepared_fact_id: &FactId,
+    terminal_fact_id: FactId,
+    error_code: PreEffectFailureCodeV2,
+) -> Vec<KernelFactDraftV2> {
+    vec![fact_draft(
+        terminal_fact_id,
+        KernelFactPayloadV2::Invocation(InvocationFactV2::ToolFailedBeforeEffect {
+            identity: caused_direct_attempt(identity, attempt_prepared_fact_id.clone()),
+            error_code,
+        }),
+    )]
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn direct_execution_result_drafts(
+    identity: &ToolAttemptIdentityV2,
+    execution_started_fact_id: &FactId,
+    effect_id: EffectId,
+    effect_fact_id: FactId,
+    terminal_fact_id: FactId,
+    mut resource_ids: Vec<ResourceId>,
+    resolution: ExecutionResolution,
+    cancel_request_id: Option<&CancelRequestId>,
+    deadline_observed: bool,
+) -> AuthorityResult<Vec<KernelFactDraftV2>> {
+    resource_ids.sort_by(|left, right| left.as_str().as_bytes().cmp(right.as_str().as_bytes()));
+    resource_ids.dedup();
+    let effect_identity = ToolEffectIdentityV2 {
+        run_id: identity.run_id.clone(),
+        control_epoch: identity.control_epoch,
+        operation_id: identity.operation_id.clone(),
+        authority: identity.authority.clone(),
+        invocation_id: identity.invocation_id.clone(),
+        attempt_id: identity.attempt_id.clone(),
+        effect_id: effect_id.clone(),
+        idempotency_key_hash: identity.idempotency_key_hash.clone(),
+        causation_fact_id: execution_started_fact_id.clone(),
+    };
+    let terminal_identity = ToolObservedTerminalIdentityV2 {
+        run_id: identity.run_id.clone(),
+        control_epoch: identity.control_epoch,
+        operation_id: identity.operation_id.clone(),
+        authority: identity.authority.clone(),
+        invocation_id: identity.invocation_id.clone(),
+        attempt_id: identity.attempt_id.clone(),
+        effect_id,
+        idempotency_key_hash: identity.idempotency_key_hash.clone(),
+        causation_fact_id: effect_fact_id.clone(),
+        correlation_set: identity.correlation_set.clone(),
+    };
+    let (effect, terminal) = match resolution {
+        ExecutionResolution::Completed(verified) => {
+            let evidence_digest =
+                executor_evidence_digest_v2(&verified.evidence).map_err(|_| corrupt_store())?;
+            (
+                direct_observed_effect(
+                    effect_identity,
+                    resource_ids,
+                    verified.evidence,
+                    evidence_digest,
+                    cancel_request_id,
+                    deadline_observed,
+                ),
+                InvocationFactV2::ToolCompleted {
+                    identity: terminal_identity,
+                    output: verified.output,
+                },
+            )
+        }
+        ExecutionResolution::FailedAfterObservedEffect {
+            evidence,
+            error_code,
+        } => {
+            let evidence_digest =
+                executor_evidence_digest_v2(&evidence).map_err(|_| corrupt_store())?;
+            (
+                direct_observed_effect(
+                    effect_identity,
+                    resource_ids,
+                    evidence,
+                    evidence_digest,
+                    cancel_request_id,
+                    deadline_observed,
+                ),
+                InvocationFactV2::ToolFailedAfterObservedEffect {
+                    identity: terminal_identity,
+                    error_code,
+                },
+            )
+        }
+        ExecutionResolution::Indeterminate {
+            evidence,
+            reason_code,
+        } => {
+            let evidence_digest =
+                executor_evidence_digest_v2(&evidence).map_err(|_| corrupt_store())?;
+            (
+                EffectFactV2::ToolIndeterminate {
+                    identity: effect_identity,
+                    possible_affected_resource_ids: resource_ids,
+                    reason_code,
+                    evidence,
+                    evidence_digest,
+                },
+                InvocationFactV2::ToolIndeterminate {
+                    identity: terminal_identity,
+                    reason_code,
+                },
+            )
+        }
+    };
+    Ok(vec![
+        fact_draft(effect_fact_id, KernelFactPayloadV2::Effect(effect)),
+        fact_draft(terminal_fact_id, KernelFactPayloadV2::Invocation(terminal)),
+    ])
+}
+
 fn reservation_identity(
     identity: &AttemptIdentityV2,
     causation_fact_id: FactId,
@@ -1195,6 +1441,44 @@ fn observed_effect(
             evidence_digest,
         },
         (None, false) => EffectFactV2::Observed {
+            identity,
+            affected_resource_ids,
+            evidence,
+            evidence_digest,
+        },
+    }
+}
+
+fn direct_observed_effect(
+    identity: ToolEffectIdentityV2,
+    affected_resource_ids: Vec<ResourceId>,
+    evidence: EffectEvidenceV2,
+    evidence_digest: ExecutorEvidenceDigestV2,
+    cancel_request_id: Option<&CancelRequestId>,
+    deadline_observed: bool,
+) -> EffectFactV2 {
+    match (cancel_request_id, deadline_observed) {
+        (Some(cancel_request_id), true) => EffectFactV2::ToolObservedAfterCancelAndDeadline {
+            identity,
+            cancel_request_id: cancel_request_id.clone(),
+            affected_resource_ids,
+            evidence,
+            evidence_digest,
+        },
+        (Some(cancel_request_id), false) => EffectFactV2::ToolObservedAfterCancel {
+            identity,
+            cancel_request_id: cancel_request_id.clone(),
+            affected_resource_ids,
+            evidence,
+            evidence_digest,
+        },
+        (None, true) => EffectFactV2::ToolObservedAfterDeadline {
+            identity,
+            affected_resource_ids,
+            evidence,
+            evidence_digest,
+        },
+        (None, false) => EffectFactV2::ToolObserved {
             identity,
             affected_resource_ids,
             evidence,
@@ -1858,14 +2142,21 @@ fn resolve_workspace_target(
     let canonical_absolute_path_utf8 =
         normalize_canonical_platform_path_v4(workspace.platform, raw)
             .map_err(|_| PrepareFailure::Target(TargetResolutionFailureV2::ResolverUnavailable))?;
+    let canonical_relative_path = canonical_target
+        .strip_prefix(&workspace.canonical_root)
+        .ok()
+        .and_then(Path::to_str)
+        .map(|value| value.replace('\\', "/"))
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| ".".to_owned());
     Ok(ResolvedTarget {
-        relative_path: Some(path.clone()),
+        relative_path: Some(canonical_relative_path.clone()),
         object_kind: Some(object_kind),
         state: Some(state),
         state_digest: Some(state_digest.clone()),
         public_resource: ResolvedResourceV2::Workspace {
             object_kind,
-            relative_path: path,
+            relative_path: canonical_relative_path,
             resolution_state_digest: state_digest,
         },
         private_target: CanonicalPrivateTargetV2::Workspace {
@@ -1922,6 +2213,28 @@ fn resolve_private_workspace_path(
         }
     }
     Ok(resolved)
+}
+
+pub(super) fn canonicalize_requested_workspace_path(
+    workspace: &WorkspaceBinding,
+    relative: &str,
+) -> Result<String, PrepareFailure> {
+    let target = resolve_private_workspace_path(&workspace.canonical_root, relative)?;
+    target
+        .strip_prefix(&workspace.canonical_root)
+        .ok()
+        .and_then(Path::to_str)
+        .map(|value| value.replace('\\', "/"))
+        .map(|value| {
+            if value.is_empty() {
+                ".".to_owned()
+            } else {
+                value
+            }
+        })
+        .ok_or(PrepareFailure::Target(
+            TargetResolutionFailureV2::ResolverUnavailable,
+        ))
 }
 
 fn resource_state_for_path(path: &Path) -> Result<ResourceStateV2, PrepareFailure> {
@@ -2038,6 +2351,16 @@ struct ResolvedNetwork {
     origin: NetworkOriginV2,
     target_digest: NetworkTargetObservationDigestV2,
     private_target: CanonicalPrivateTargetV2,
+}
+
+pub(super) fn canonicalize_network_scope_url(
+    url: &str,
+) -> Result<(String, NetworkTargetObservationDigestV2), PrepareFailure> {
+    let parsed = crate::network_policy::validate_http_url_shape(url)
+        .map_err(|_| PrepareFailure::Target(TargetResolutionFailureV2::NetworkTargetRejected))?;
+    let canonical_url = parsed.to_string();
+    let resolved = resolve_network_target(&canonical_url)?;
+    Ok((canonical_url, resolved.target_digest))
 }
 
 fn resolve_network_target(url: &str) -> Result<ResolvedNetwork, PrepareFailure> {
@@ -2605,6 +2928,151 @@ pub(super) fn invocation_admission_drafts(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub(super) fn direct_tool_intent_admission_drafts(
+    command_fact_id: FactId,
+    admitted_fact_id: FactId,
+    attempt_fact_id: FactId,
+    resource_fact_ids: Vec<FactId>,
+    request_id: CommandRequestId,
+    request_digest: CommandRequestDigestV2,
+    prepared: &PreparedDirectToolIntent,
+    tool_id: ToolIdV2,
+    canonical_arguments_digest: CanonicalArgumentsDigestV2,
+    tool_contract_digest: ToolContractDigestV2,
+    identity: &ToolAttemptIdentityV2,
+    targets: &[(ResourceId, ResolvedTarget)],
+    reply: ToolIntentSubmitReplyV2,
+) -> Vec<KernelFactDraftV2> {
+    let mut drafts = vec![
+        command_receipt_draft(
+            command_fact_id.clone(),
+            identity.run_id.clone(),
+            exact_epoch(identity.control_epoch),
+            request_id,
+            request_digest,
+            MutationCommandKindV2::ToolIntentSubmit,
+            MutationCommandResultV2::ToolIntentSubmission { reply },
+        ),
+        fact_draft(
+            admitted_fact_id.clone(),
+            KernelFactPayloadV2::Invocation(InvocationFactV2::ToolIntentAdmitted {
+                identity: caused_direct_attempt(identity, command_fact_id),
+                tool_id,
+                canonical_arguments_digest,
+                tool_contract_digest,
+                resource_scope: prepared.resource_scope.clone(),
+                workspace_binding_digest: prepared.workspace_binding_digest.clone(),
+                effective_deadline_ms: prepared.effective_deadline_ms,
+            }),
+        ),
+        fact_draft(
+            attempt_fact_id.clone(),
+            KernelFactPayloadV2::Invocation(InvocationFactV2::ToolAttemptPrepared {
+                identity: caused_direct_attempt(identity, admitted_fact_id),
+            }),
+        ),
+    ];
+    drafts.extend(resource_fact_ids.into_iter().zip(targets).map(
+        |(fact_id, (resource_id, target))| {
+            fact_draft(
+                fact_id,
+                KernelFactPayloadV2::Resource(ResourceFactV2::ResolvedForInvocation {
+                    identity: ResourceResolvedIdentityV2 {
+                        run_id: identity.run_id.clone(),
+                        control_epoch: identity.control_epoch,
+                        operation_id: identity.operation_id.clone(),
+                        invocation_id: identity.invocation_id.clone(),
+                        resource_id: resource_id.clone(),
+                        idempotency_key_hash: identity.idempotency_key_hash.clone(),
+                        causation_fact_id: attempt_fact_id.clone(),
+                        correlation_set: identity.correlation_set.clone(),
+                    },
+                    resource: target.public_resource.clone(),
+                }),
+            )
+        },
+    ));
+    drafts
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn direct_tool_intent_continuation_drafts(
+    authorization_fact_id: FactId,
+    authorization: AuthorizationFactV2,
+    admitted_fact_id: FactId,
+    attempt_fact_id: FactId,
+    resource_fact_ids: Vec<FactId>,
+    prepared: &PreparedDirectToolIntent,
+    tool_id: ToolIdV2,
+    canonical_arguments_digest: CanonicalArgumentsDigestV2,
+    tool_contract_digest: ToolContractDigestV2,
+    identity: &ToolAttemptIdentityV2,
+    targets: &[(ResourceId, ResolvedTarget)],
+) -> Vec<KernelFactDraftV2> {
+    let mut drafts = vec![
+        fact_draft(
+            authorization_fact_id.clone(),
+            KernelFactPayloadV2::Authorization(authorization),
+        ),
+        fact_draft(
+            admitted_fact_id.clone(),
+            KernelFactPayloadV2::Invocation(
+                InvocationFactV2::ToolIntentAdmitted {
+                    identity: caused_direct_attempt(
+                        identity,
+                        authorization_fact_id,
+                    ),
+                    tool_id,
+                    canonical_arguments_digest,
+                    tool_contract_digest,
+                    resource_scope: prepared.resource_scope.clone(),
+                    workspace_binding_digest: prepared
+                        .workspace_binding_digest
+                        .clone(),
+                    effective_deadline_ms: prepared.effective_deadline_ms,
+                },
+            ),
+        ),
+        fact_draft(
+            attempt_fact_id.clone(),
+            KernelFactPayloadV2::Invocation(
+                InvocationFactV2::ToolAttemptPrepared {
+                    identity: caused_direct_attempt(
+                        identity,
+                        admitted_fact_id,
+                    ),
+                },
+            ),
+        ),
+    ];
+    drafts.extend(resource_fact_ids.into_iter().zip(targets).map(
+        |(fact_id, (resource_id, target))| {
+            fact_draft(
+                fact_id,
+                KernelFactPayloadV2::Resource(
+                    ResourceFactV2::ResolvedForInvocation {
+                        identity: ResourceResolvedIdentityV2 {
+                            run_id: identity.run_id.clone(),
+                            control_epoch: identity.control_epoch,
+                            operation_id: identity.operation_id.clone(),
+                            invocation_id: identity.invocation_id.clone(),
+                            resource_id: resource_id.clone(),
+                            idempotency_key_hash: identity
+                                .idempotency_key_hash
+                                .clone(),
+                            causation_fact_id: attempt_fact_id.clone(),
+                            correlation_set: identity.correlation_set.clone(),
+                        },
+                        resource: target.public_resource.clone(),
+                    },
+                ),
+            )
+        },
+    ));
+    drafts
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(super) fn epoch_advance_drafts(
     request_id: CommandRequestId,
     request_digest: CommandRequestDigestV2,
@@ -3122,7 +3590,6 @@ pub(super) fn require_input_in_epoch(
 
 pub(super) fn recovery_drafts(
     state: &AuthorityState,
-    workspace_binding_digest: &WorkspaceBindingDigestV2,
     mut fact_id: impl FnMut() -> FactId,
     mut effect_id: impl FnMut() -> EffectId,
 ) -> AuthorityResult<Vec<KernelFactDraftV2>> {
@@ -3194,12 +3661,6 @@ pub(super) fn recovery_drafts(
                     })
                     .map(|resource| resource.resource_id.clone())
                     .collect();
-                let reason_code =
-                    if invocation.workspace_binding_digest == *workspace_binding_digest {
-                        IndeterminateReasonV2::RecoveryEvidenceInsufficient
-                    } else {
-                        IndeterminateReasonV2::WorkspaceBindingMismatch
-                    };
                 drafts.extend(execution_result_drafts(
                     &identity,
                     execution_started_fact_id,
@@ -3211,7 +3672,7 @@ pub(super) fn recovery_drafts(
                         evidence: EffectEvidenceV2::IndeterminateReadBack {
                             last_observation: LastObservationV2::None {},
                         },
-                        reason_code,
+                        reason_code: IndeterminateReasonV2::RecoveryEvidenceInsufficient,
                     },
                     invocation
                         .stop_overlay
@@ -3254,6 +3715,7 @@ impl AuthorityState {
         validate_causation(self, &envelope)?;
         match &envelope.payload {
             KernelFactPayloadV2::Control(fact) => self.reduce_control(&envelope, fact)?,
+            KernelFactPayloadV2::Authorization(_) => {}
             KernelFactPayloadV2::Grant(fact) => self.reduce_grant(&envelope, fact)?,
             KernelFactPayloadV2::Invocation(fact) => self.reduce_invocation(&envelope, fact)?,
             KernelFactPayloadV2::Effect(fact) => self.reduce_effect(&envelope, fact)?,
@@ -3270,6 +3732,26 @@ impl AuthorityState {
         fact: &ControlFactV2,
     ) -> AuthorityResult<()> {
         match fact {
+            ControlFactV2::RunOpened {
+                run_id,
+                control_epoch,
+                ..
+            } => {
+                let run = self.runs.get(run_id).ok_or_else(corrupt_store)?;
+                if run.epoch != *control_epoch
+                    || self.facts_by_id.values().any(|existing| {
+                        matches!(
+                            &existing.payload,
+                            KernelFactPayloadV2::Control(ControlFactV2::RunOpened {
+                                run_id: existing_run_id,
+                                ..
+                            }) if existing_run_id == run_id
+                        )
+                    })
+                {
+                    return Err(corrupt_store());
+                }
+            }
             ControlFactV2::CommandRecorded {
                 identity, result, ..
             } => {
@@ -3324,29 +3806,50 @@ impl AuthorityState {
             ControlFactV2::CancellationRequested {
                 identity, source, ..
             } => {
-                let invocation = self
-                    .invocations
-                    .get(&identity.invocation_id)
-                    .ok_or_else(corrupt_store)?;
+                let legacy = self.invocations.get(&identity.invocation_id);
+                let direct = self.direct_invocations.get(&identity.invocation_id);
+                let (invocation_run_id, invocation_epoch) = match (legacy, direct) {
+                    (Some(invocation), None) => {
+                        (&invocation.run_id, invocation.control_epoch)
+                    }
+                    (None, Some(invocation)) => {
+                        (&invocation.run_id, invocation.control_epoch)
+                    }
+                    _ => return Err(corrupt_store()),
+                };
                 let epoch_matches = match source {
                     CancellationSourceV2::EpochAdvance => {
-                        identity.control_epoch > invocation.control_epoch
+                        identity.control_epoch > invocation_epoch
                     }
                     CancellationSourceV2::ExplicitCommand
                     | CancellationSourceV2::RunTermination => {
-                        identity.control_epoch == invocation.control_epoch
+                        identity.control_epoch == invocation_epoch
                     }
                 };
-                if identity.run_id != invocation.run_id
+                if &identity.run_id != invocation_run_id
                     || !epoch_matches
-                    || self.invocations.values().any(|candidate| {
-                        candidate
-                            .stop_overlay
-                            .cancellation()
-                            .is_some_and(|(request_id, _, _)| {
-                                request_id == &identity.cancel_request_id
-                            })
-                    })
+                    || self
+                        .invocations
+                        .values()
+                        .any(|candidate| {
+                            candidate
+                                .stop_overlay
+                                .cancellation()
+                                .is_some_and(|(request_id, _, _)| {
+                                    request_id == &identity.cancel_request_id
+                                })
+                        })
+                    || self
+                        .direct_invocations
+                        .values()
+                        .any(|candidate| {
+                            candidate
+                                .stop_overlay
+                                .cancellation()
+                                .is_some_and(|(request_id, _, _)| {
+                                    request_id == &identity.cancel_request_id
+                                })
+                        })
                     || self
                         .runs
                         .get(&identity.run_id)
@@ -3355,14 +3858,21 @@ impl AuthorityState {
                 {
                     return Err(corrupt_store());
                 }
-                let invocation = self
-                    .invocations
-                    .get_mut(&identity.invocation_id)
-                    .ok_or_else(corrupt_store)?;
-                if invocation.stop_overlay.cancellation().is_some() {
+                let overlay = if let Some(invocation) =
+                    self.invocations.get_mut(&identity.invocation_id)
+                {
+                    &mut invocation.stop_overlay
+                } else {
+                    &mut self
+                        .direct_invocations
+                        .get_mut(&identity.invocation_id)
+                        .ok_or_else(corrupt_store)?
+                        .stop_overlay
+                };
+                if overlay.cancellation().is_some() {
                     return Err(corrupt_store());
                 }
-                invocation.stop_overlay = StopOverlay::CancellationRequested {
+                *overlay = StopOverlay::CancellationRequested {
                     cancel_request_id: identity.cancel_request_id.clone(),
                     fact_id: envelope.fact_id.clone(),
                     ledger_sequence: envelope.ledger_sequence,
@@ -3620,6 +4130,229 @@ impl AuthorityState {
         fact: &InvocationFactV2,
     ) -> AuthorityResult<()> {
         match fact {
+            InvocationFactV2::ToolIntentAdmitted {
+                identity,
+                tool_id,
+                resource_scope,
+                workspace_binding_digest,
+                effective_deadline_ms,
+                ..
+            } => {
+                let run = self.runs.get(&identity.run_id).ok_or_else(corrupt_store)?;
+                let legacy_tool_id = legacy_tool_id(tool_id).ok_or_else(corrupt_store)?;
+                if run.epoch != identity.control_epoch
+                    || !matches!(run.lifecycle, RunLifecycle::Active)
+                    || run.active_invocation_id.is_some()
+                    || *effective_deadline_ms == 0
+                    || self.invocations.contains_key(&identity.invocation_id)
+                    || self.direct_invocations.contains_key(&identity.invocation_id)
+                    || self
+                        .direct_invocations
+                        .values()
+                        .any(|candidate| candidate.attempt_id == identity.attempt_id)
+                {
+                    return Err(corrupt_store());
+                }
+                if let InvocationAuthorityV2::PlanAction {
+                    plan_action_id,
+                    lease,
+                    ..
+                } = &identity.authority
+                {
+                    if !identity.correlation_set.refs.iter().any(|reference| {
+                        matches!(
+                            reference,
+                            deepcode_kernel_abi::v2::CorrelationRefV2::PlanAction { value }
+                                if value == plan_action_id.as_str()
+                        )
+                    }) || lease.scope_digest.as_str().is_empty()
+                    {
+                        return Err(corrupt_store());
+                    }
+                }
+                self.direct_invocations.insert(
+                    identity.invocation_id.clone(),
+                    DirectInvocationRecord {
+                        run_id: identity.run_id.clone(),
+                        operation_id: identity.operation_id.clone(),
+                        control_epoch: identity.control_epoch,
+                        authority: identity.authority.clone(),
+                        invocation_id: identity.invocation_id.clone(),
+                        attempt_id: identity.attempt_id.clone(),
+                        idempotency_key_hash: identity.idempotency_key_hash.clone(),
+                        tool_id: tool_id.clone(),
+                        legacy_tool_id,
+                        resource_scope: resource_scope.clone(),
+                        workspace_binding_digest: workspace_binding_digest.clone(),
+                        correlations: identity.correlation_set.clone(),
+                        phase: InvocationPhase::AttemptPrepared,
+                        stop_overlay: StopOverlay::None,
+                        admission_fact_id: envelope.fact_id.clone(),
+                        attempt_prepared_fact_id: None,
+                        execution_started_fact_id: None,
+                        cancellation_observed_fact_id: None,
+                        deadline_observed_fact_id: None,
+                        last_fact_id: envelope.fact_id.clone(),
+                    },
+                );
+                self.runs
+                    .get_mut(&identity.run_id)
+                    .ok_or_else(corrupt_store)?
+                    .active_invocation_id = Some(identity.invocation_id.clone());
+            }
+            InvocationFactV2::ToolAttemptPrepared { identity } => {
+                let invocation = self
+                    .direct_invocations
+                    .get_mut(&identity.invocation_id)
+                    .ok_or_else(corrupt_store)?;
+                if !direct_attempt_identity_matches(identity, invocation)
+                    || invocation.phase != InvocationPhase::AttemptPrepared
+                    || invocation.attempt_prepared_fact_id.is_some()
+                {
+                    return Err(corrupt_store());
+                }
+                invocation.attempt_prepared_fact_id = Some(envelope.fact_id.clone());
+                invocation.last_fact_id = envelope.fact_id.clone();
+            }
+            InvocationFactV2::ToolExecutionStarted {
+                identity,
+                target_revalidation_set_digest,
+            } => {
+                let expected = {
+                    let invocation = self
+                        .direct_invocations
+                        .get(&identity.invocation_id)
+                        .ok_or_else(corrupt_store)?;
+                    expected_direct_revalidation_set_digest(self, invocation)?
+                };
+                let invocation = self
+                    .direct_invocations
+                    .get_mut(&identity.invocation_id)
+                    .ok_or_else(corrupt_store)?;
+                if !direct_attempt_identity_matches(identity, invocation)
+                    || invocation.phase != InvocationPhase::AttemptPrepared
+                    || expected != *target_revalidation_set_digest
+                {
+                    return Err(corrupt_store());
+                }
+                invocation.phase = InvocationPhase::Executing;
+                invocation.execution_started_fact_id = Some(envelope.fact_id.clone());
+                invocation.last_fact_id = envelope.fact_id.clone();
+            }
+            InvocationFactV2::ToolCancellationObserved {
+                identity,
+                cancel_request_id,
+            } => {
+                let invocation = self
+                    .direct_invocations
+                    .get_mut(&identity.invocation_id)
+                    .ok_or_else(corrupt_store)?;
+                if !direct_attempt_identity_matches(identity, invocation)
+                    || invocation_phase_is_terminal(invocation.phase)
+                    || invocation.cancellation_observed_fact_id.is_some()
+                    || invocation
+                        .stop_overlay
+                        .cancellation()
+                        .map(|(request_id, _, _)| request_id)
+                        != Some(cancel_request_id)
+                {
+                    return Err(corrupt_store());
+                }
+                invocation.cancellation_observed_fact_id = Some(envelope.fact_id.clone());
+                invocation.last_fact_id = envelope.fact_id.clone();
+            }
+            InvocationFactV2::ToolDeadlineObserved { identity } => {
+                let invocation = self
+                    .direct_invocations
+                    .get_mut(&identity.invocation_id)
+                    .ok_or_else(corrupt_store)?;
+                if !direct_attempt_identity_matches(identity, invocation)
+                    || invocation_phase_is_terminal(invocation.phase)
+                    || invocation.deadline_observed_fact_id.is_some()
+                {
+                    return Err(corrupt_store());
+                }
+                invocation.stop_overlay = match invocation.stop_overlay.clone() {
+                    StopOverlay::None => StopOverlay::DeadlineObserved {
+                        fact_id: envelope.fact_id.clone(),
+                    },
+                    StopOverlay::CancellationRequested {
+                        cancel_request_id,
+                        fact_id,
+                        ledger_sequence,
+                    } => StopOverlay::CancellationAndDeadline {
+                        cancel_request_id,
+                        cancellation_fact_id: fact_id,
+                        cancellation_ledger_sequence: ledger_sequence,
+                        deadline_fact_id: envelope.fact_id.clone(),
+                    },
+                    _ => return Err(corrupt_store()),
+                };
+                invocation.deadline_observed_fact_id = Some(envelope.fact_id.clone());
+                invocation.last_fact_id = envelope.fact_id.clone();
+            }
+            InvocationFactV2::ToolFailedBeforeEffect { identity, .. } => {
+                self.set_direct_attempt_terminal(
+                    identity,
+                    InvocationPhase::FailedBeforeEffect,
+                    envelope.fact_id.clone(),
+                )?
+            }
+            InvocationFactV2::ToolCancelledBeforeEffect {
+                identity,
+                cancel_request_id,
+            } => {
+                let invocation = self
+                    .direct_invocations
+                    .get(&identity.invocation_id)
+                    .ok_or_else(corrupt_store)?;
+                if invocation
+                    .stop_overlay
+                    .cancellation()
+                    .map(|(request_id, _, _)| request_id)
+                    != Some(cancel_request_id)
+                {
+                    return Err(corrupt_store());
+                }
+                self.set_direct_attempt_terminal(
+                    identity,
+                    InvocationPhase::CancelledBeforeEffect,
+                    envelope.fact_id.clone(),
+                )?
+            }
+            InvocationFactV2::ToolTimedOutBeforeEffect { identity } => {
+                self.set_direct_attempt_terminal(
+                    identity,
+                    InvocationPhase::TimedOutBeforeEffect,
+                    envelope.fact_id.clone(),
+                )?
+            }
+            InvocationFactV2::ToolCompleted { identity, output } => {
+                validate_direct_completed_output(self, identity, output)?;
+                self.set_direct_observed_terminal(
+                    identity,
+                    InvocationPhase::Completed,
+                    envelope.fact_id.clone(),
+                )?
+            }
+            InvocationFactV2::ToolFailedAfterObservedEffect { identity, .. } => {
+                self.set_direct_observed_terminal(
+                    identity,
+                    InvocationPhase::FailedAfterObservedEffect,
+                    envelope.fact_id.clone(),
+                )?
+            }
+            InvocationFactV2::ToolIndeterminate {
+                identity,
+                reason_code,
+            } => {
+                validate_direct_indeterminate_pair(self, identity, reason_code)?;
+                self.set_direct_observed_terminal(
+                    identity,
+                    InvocationPhase::Indeterminate,
+                    envelope.fact_id.clone(),
+                )?
+            }
             InvocationFactV2::Admitted {
                 identity,
                 tool_id,
@@ -3995,11 +4728,90 @@ impl AuthorityState {
         Ok(())
     }
 
+    fn set_direct_attempt_terminal(
+        &mut self,
+        identity: &ToolAttemptIdentityV2,
+        phase: InvocationPhase,
+        fact_id: FactId,
+    ) -> AuthorityResult<()> {
+        let invocation = self
+            .direct_invocations
+            .get_mut(&identity.invocation_id)
+            .ok_or_else(corrupt_store)?;
+        if !direct_attempt_identity_matches(identity, invocation)
+            || invocation.phase != InvocationPhase::AttemptPrepared
+        {
+            return Err(corrupt_store());
+        }
+        invocation.phase = phase;
+        invocation.last_fact_id = fact_id;
+        let run = self
+            .runs
+            .get_mut(&identity.run_id)
+            .ok_or_else(corrupt_store)?;
+        if run.active_invocation_id.as_ref() != Some(&identity.invocation_id) {
+            return Err(corrupt_store());
+        }
+        run.active_invocation_id = None;
+        Ok(())
+    }
+
+    fn set_direct_observed_terminal(
+        &mut self,
+        identity: &ToolObservedTerminalIdentityV2,
+        phase: InvocationPhase,
+        fact_id: FactId,
+    ) -> AuthorityResult<()> {
+        let invocation = self
+            .direct_invocations
+            .get_mut(&identity.invocation_id)
+            .ok_or_else(corrupt_store)?;
+        if !direct_observed_identity_matches(identity, invocation)
+            || invocation.phase != InvocationPhase::Executing
+            || self.invocation_effects.get(&identity.invocation_id)
+                != Some(&(
+                    identity.effect_id.clone(),
+                    identity.causation_fact_id.clone(),
+                ))
+        {
+            return Err(corrupt_store());
+        }
+        invocation.phase = phase;
+        invocation.last_fact_id = fact_id;
+        let run = self
+            .runs
+            .get_mut(&identity.run_id)
+            .ok_or_else(corrupt_store)?;
+        if run.active_invocation_id.as_ref() != Some(&identity.invocation_id) {
+            return Err(corrupt_store());
+        }
+        run.active_invocation_id = None;
+        Ok(())
+    }
+
     fn reduce_effect(
         &mut self,
         envelope: &KernelFactEnvelopeV2,
         fact: &EffectFactV2,
     ) -> AuthorityResult<()> {
+        if let Some(identity) = direct_effect_identity(fact) {
+            validate_direct_effect(self, fact)?;
+            if self
+                .invocation_effects
+                .values()
+                .any(|(effect_id, _)| effect_id == &identity.effect_id)
+                || self
+                    .invocation_effects
+                    .contains_key(&identity.invocation_id)
+            {
+                return Err(corrupt_store());
+            }
+            self.invocation_effects.insert(
+                identity.invocation_id.clone(),
+                (identity.effect_id.clone(), envelope.fact_id.clone()),
+            );
+            return Ok(());
+        }
         validate_effect(self, fact)?;
         let identity = effect_identity(fact);
         if self
@@ -4026,16 +4838,28 @@ impl AuthorityState {
     ) -> AuthorityResult<()> {
         match fact {
             ResourceFactV2::ResolvedForInvocation { identity, resource } => {
-                let invocation = self
-                    .invocations
-                    .get(&identity.invocation_id)
-                    .ok_or_else(corrupt_store)?;
-                let grant = self
-                    .grants
-                    .get(&invocation.grant_id)
-                    .ok_or_else(corrupt_store)?;
-                if !resolved_identity_matches_invocation(identity, invocation)
-                    || !resource_matches_scope(resource, &grant.resource_scope)
+                let (identity_matches, scope) =
+                    if let Some(invocation) = self.invocations.get(&identity.invocation_id) {
+                        let grant = self
+                            .grants
+                            .get(&invocation.grant_id)
+                            .ok_or_else(corrupt_store)?;
+                        (
+                            resolved_identity_matches_invocation(identity, invocation),
+                            &grant.resource_scope,
+                        )
+                    } else if let Some(invocation) =
+                        self.direct_invocations.get(&identity.invocation_id)
+                    {
+                        (
+                            direct_resolved_identity_matches_invocation(identity, invocation),
+                            &invocation.resource_scope,
+                        )
+                    } else {
+                        return Err(corrupt_store());
+                    };
+                if !identity_matches
+                    || !resource_matches_scope(resource, scope)
                     || self.resources.contains_key(&identity.resource_id)
                     || self.resources.values().any(|existing| {
                         existing.invocation_id == identity.invocation_id
@@ -4062,15 +4886,29 @@ impl AuthorityState {
                 observation,
                 target_revalidation_digest,
             } => {
-                let invocation = self
-                    .invocations
-                    .get(&identity.invocation_id)
-                    .ok_or_else(corrupt_store)?;
                 let resource = self
                     .resources
                     .get_mut(&identity.resource_id)
                     .ok_or_else(corrupt_store)?;
-                if !resource_attempt_identity_matches_invocation(identity, invocation, resource)
+                let identity_matches =
+                    if let Some(invocation) = self.invocations.get(&identity.invocation_id) {
+                        resource_attempt_identity_matches_invocation(
+                            identity,
+                            invocation,
+                            resource,
+                        )
+                    } else if let Some(invocation) =
+                        self.direct_invocations.get(&identity.invocation_id)
+                    {
+                        direct_resource_attempt_identity_matches_invocation(
+                            identity,
+                            invocation,
+                            resource,
+                        )
+                    } else {
+                        return Err(corrupt_store());
+                    };
+                if !identity_matches
                     || resource.revalidation.is_some()
                 {
                     return Err(corrupt_store());
@@ -4099,6 +4937,20 @@ fn attempt_identity_matches_invocation(
         && identity.operation_id == invocation.operation_id
         && identity.grant_id == invocation.grant_id
         && identity.reservation_id == invocation.reservation_id
+        && identity.invocation_id == invocation.invocation_id
+        && identity.attempt_id == invocation.attempt_id
+        && identity.idempotency_key_hash == invocation.idempotency_key_hash
+        && identity.correlation_set == invocation.correlations
+}
+
+fn direct_attempt_identity_matches(
+    identity: &ToolAttemptIdentityV2,
+    invocation: &DirectInvocationRecord,
+) -> bool {
+    identity.run_id == invocation.run_id
+        && identity.control_epoch == invocation.control_epoch
+        && identity.operation_id == invocation.operation_id
+        && identity.authority == invocation.authority
         && identity.invocation_id == invocation.invocation_id
         && identity.attempt_id == invocation.attempt_id
         && identity.idempotency_key_hash == invocation.idempotency_key_hash
@@ -4134,6 +4986,20 @@ fn observed_identity_matches_invocation(
         && identity.correlation_set == invocation.correlations
 }
 
+fn direct_observed_identity_matches(
+    identity: &ToolObservedTerminalIdentityV2,
+    invocation: &DirectInvocationRecord,
+) -> bool {
+    identity.run_id == invocation.run_id
+        && identity.control_epoch == invocation.control_epoch
+        && identity.operation_id == invocation.operation_id
+        && identity.authority == invocation.authority
+        && identity.invocation_id == invocation.invocation_id
+        && identity.attempt_id == invocation.attempt_id
+        && identity.idempotency_key_hash == invocation.idempotency_key_hash
+        && identity.correlation_set == invocation.correlations
+}
+
 fn effect_identity_matches_invocation(
     identity: &EffectIdentityV2,
     invocation: &InvocationRecord,
@@ -4143,6 +5009,19 @@ fn effect_identity_matches_invocation(
         && identity.operation_id == invocation.operation_id
         && identity.grant_id == invocation.grant_id
         && identity.reservation_id == invocation.reservation_id
+        && identity.invocation_id == invocation.invocation_id
+        && identity.attempt_id == invocation.attempt_id
+        && identity.idempotency_key_hash == invocation.idempotency_key_hash
+}
+
+fn direct_effect_identity_matches_invocation(
+    identity: &ToolEffectIdentityV2,
+    invocation: &DirectInvocationRecord,
+) -> bool {
+    identity.run_id == invocation.run_id
+        && identity.control_epoch == invocation.control_epoch
+        && identity.operation_id == invocation.operation_id
+        && identity.authority == invocation.authority
         && identity.invocation_id == invocation.invocation_id
         && identity.attempt_id == invocation.attempt_id
         && identity.idempotency_key_hash == invocation.idempotency_key_hash
@@ -4170,9 +5049,38 @@ fn resolved_identity_matches_invocation(
         && identity.correlation_set == invocation.correlations
 }
 
+fn direct_resolved_identity_matches_invocation(
+    identity: &ResourceResolvedIdentityV2,
+    invocation: &DirectInvocationRecord,
+) -> bool {
+    identity.run_id == invocation.run_id
+        && identity.control_epoch == invocation.control_epoch
+        && identity.operation_id == invocation.operation_id
+        && identity.invocation_id == invocation.invocation_id
+        && identity.idempotency_key_hash == invocation.idempotency_key_hash
+        && identity.correlation_set == invocation.correlations
+}
+
 fn resource_attempt_identity_matches_invocation(
     identity: &ResourceAttemptIdentityV2,
     invocation: &InvocationRecord,
+    resource: &ResourceRecord,
+) -> bool {
+    identity.run_id == invocation.run_id
+        && identity.control_epoch == invocation.control_epoch
+        && identity.operation_id == invocation.operation_id
+        && identity.invocation_id == invocation.invocation_id
+        && identity.attempt_id == invocation.attempt_id
+        && identity.resource_id == resource.resource_id
+        && resource.run_id == invocation.run_id
+        && resource.invocation_id == invocation.invocation_id
+        && identity.idempotency_key_hash == invocation.idempotency_key_hash
+        && identity.correlation_set == invocation.correlations
+}
+
+fn direct_resource_attempt_identity_matches_invocation(
+    identity: &ResourceAttemptIdentityV2,
+    invocation: &DirectInvocationRecord,
     resource: &ResourceRecord,
 ) -> bool {
     identity.run_id == invocation.run_id
@@ -4231,6 +5139,12 @@ fn resource_matches_scope(resource: &ResolvedResourceV2, scope: &ResourceScopeV2
     }
 }
 
+fn legacy_tool_id(tool_id: &ToolIdV2) -> Option<AuthorityToolIdV4> {
+    AuthorityToolIdV4::ALL
+        .into_iter()
+        .find(|candidate| candidate.as_str() == tool_id.as_str())
+}
+
 fn expected_resource_count(scope: &ResourceScopeV2) -> AuthorityResult<usize> {
     match scope {
         ResourceScopeV2::Workspace { targets } => Ok(targets.len()),
@@ -4253,6 +5167,48 @@ fn expected_revalidation_set_digest(
         .filter(|resource| resource.invocation_id == invocation.invocation_id)
         .collect::<Vec<_>>();
     if resources.len() != expected_resource_count(&grant.resource_scope)?
+        || resources
+            .iter()
+            .any(|resource| resource.revalidation.is_none())
+    {
+        return Err(corrupt_store());
+    }
+    resources.sort_by(|left, right| {
+        left.resource_id
+            .as_str()
+            .as_bytes()
+            .cmp(right.resource_id.as_str().as_bytes())
+    });
+    let entries = resources
+        .iter()
+        .map(|resource| {
+            let (fact_id, digest, _) = resource
+                .revalidation
+                .as_ref()
+                .expect("checked revalidation");
+            (&resource.resource_id, fact_id, digest)
+        })
+        .collect::<Vec<_>>();
+    target_revalidation_set_digest_v2(
+        &invocation.run_id,
+        &invocation.operation_id,
+        &invocation.invocation_id,
+        &invocation.attempt_id,
+        &entries,
+    )
+    .map_err(|_| corrupt_store())
+}
+
+fn expected_direct_revalidation_set_digest(
+    state: &AuthorityState,
+    invocation: &DirectInvocationRecord,
+) -> AuthorityResult<TargetRevalidationSetDigestV2> {
+    let mut resources = state
+        .resources
+        .values()
+        .filter(|resource| resource.invocation_id == invocation.invocation_id)
+        .collect::<Vec<_>>();
+    if resources.len() != expected_resource_count(&invocation.resource_scope)?
         || resources
             .iter()
             .any(|resource| resource.revalidation.is_none())
@@ -4358,6 +5314,11 @@ fn validate_effect(state: &AuthorityState, fact: &EffectFactV2) -> AuthorityResu
             evidence_digest,
             EffectModeRef::Indeterminate,
         ),
+        EffectFactV2::ToolObserved { .. }
+        | EffectFactV2::ToolObservedAfterCancel { .. }
+        | EffectFactV2::ToolObservedAfterDeadline { .. }
+        | EffectFactV2::ToolObservedAfterCancelAndDeadline { .. }
+        | EffectFactV2::ToolIndeterminate { .. } => return Err(corrupt_store()),
     };
     let invocation = state
         .invocations
@@ -4410,6 +5371,129 @@ fn validate_effect(state: &AuthorityState, fact: &EffectFactV2) -> AuthorityResu
         return Err(corrupt_store());
     }
     expected_revalidation_set_digest(state, invocation)?;
+    Ok(())
+}
+
+fn validate_direct_effect(state: &AuthorityState, fact: &EffectFactV2) -> AuthorityResult<()> {
+    let (identity, resources, evidence, evidence_digest, mode) = match fact {
+        EffectFactV2::ToolObserved {
+            identity,
+            affected_resource_ids,
+            evidence,
+            evidence_digest,
+        } => (
+            identity,
+            affected_resource_ids,
+            evidence,
+            evidence_digest,
+            EffectModeRef::Observed,
+        ),
+        EffectFactV2::ToolObservedAfterCancel {
+            identity,
+            cancel_request_id,
+            affected_resource_ids,
+            evidence,
+            evidence_digest,
+        } => (
+            identity,
+            affected_resource_ids,
+            evidence,
+            evidence_digest,
+            EffectModeRef::AfterCancel(cancel_request_id),
+        ),
+        EffectFactV2::ToolObservedAfterDeadline {
+            identity,
+            affected_resource_ids,
+            evidence,
+            evidence_digest,
+        } => (
+            identity,
+            affected_resource_ids,
+            evidence,
+            evidence_digest,
+            EffectModeRef::AfterDeadline,
+        ),
+        EffectFactV2::ToolObservedAfterCancelAndDeadline {
+            identity,
+            cancel_request_id,
+            affected_resource_ids,
+            evidence,
+            evidence_digest,
+        } => (
+            identity,
+            affected_resource_ids,
+            evidence,
+            evidence_digest,
+            EffectModeRef::AfterCancelAndDeadline(cancel_request_id),
+        ),
+        EffectFactV2::ToolIndeterminate {
+            identity,
+            possible_affected_resource_ids,
+            evidence,
+            evidence_digest,
+            ..
+        } => (
+            identity,
+            possible_affected_resource_ids,
+            evidence,
+            evidence_digest,
+            EffectModeRef::Indeterminate,
+        ),
+        _ => return Err(corrupt_store()),
+    };
+    let invocation = state
+        .direct_invocations
+        .get(&identity.invocation_id)
+        .ok_or_else(corrupt_store)?;
+    let mut expected_resources = state
+        .resources
+        .values()
+        .filter(|resource| resource.invocation_id == identity.invocation_id)
+        .map(|resource| resource.resource_id.clone())
+        .collect::<Vec<_>>();
+    expected_resources
+        .sort_by(|left, right| left.as_str().as_bytes().cmp(right.as_str().as_bytes()));
+    let observed_cancel = invocation
+        .stop_overlay
+        .cancellation()
+        .map(|(request_id, _, _)| request_id);
+    let stop_matches = match mode {
+        EffectModeRef::Observed => {
+            invocation.cancellation_observed_fact_id.is_none()
+                && invocation.deadline_observed_fact_id.is_none()
+        }
+        EffectModeRef::AfterCancel(cancel_request_id) => {
+            invocation.cancellation_observed_fact_id.is_some()
+                && invocation.deadline_observed_fact_id.is_none()
+                && observed_cancel == Some(cancel_request_id)
+        }
+        EffectModeRef::AfterDeadline => {
+            invocation.cancellation_observed_fact_id.is_none()
+                && invocation.deadline_observed_fact_id.is_some()
+        }
+        EffectModeRef::AfterCancelAndDeadline(cancel_request_id) => {
+            invocation.cancellation_observed_fact_id.is_some()
+                && invocation.deadline_observed_fact_id.is_some()
+                && observed_cancel == Some(cancel_request_id)
+        }
+        EffectModeRef::Indeterminate => true,
+    };
+    let evidence_matches = match mode {
+        EffectModeRef::Indeterminate => {
+            indeterminate_evidence_legal(invocation.legacy_tool_id, evidence)
+        }
+        _ => observed_evidence_legal(invocation.legacy_tool_id, evidence),
+    };
+    if invocation.phase != InvocationPhase::Executing
+        || !direct_effect_identity_matches_invocation(identity, invocation)
+        || resources != &expected_resources
+        || !stop_matches
+        || !evidence_matches
+        || executor_evidence_digest_v2(evidence).map_err(|_| corrupt_store())? != *evidence_digest
+    {
+        return Err(corrupt_store());
+    }
+    expected_direct_revalidation_set_digest(state, invocation)?;
     Ok(())
 }
 
@@ -4480,6 +5564,24 @@ fn effect_identity(fact: &EffectFactV2) -> &EffectIdentityV2 {
         | EffectFactV2::ObservedAfterDeadline { identity, .. }
         | EffectFactV2::ObservedAfterCancelAndDeadline { identity, .. }
         | EffectFactV2::Indeterminate { identity, .. } => identity,
+        EffectFactV2::ToolObserved { .. }
+        | EffectFactV2::ToolObservedAfterCancel { .. }
+        | EffectFactV2::ToolObservedAfterDeadline { .. }
+        | EffectFactV2::ToolObservedAfterCancelAndDeadline { .. }
+        | EffectFactV2::ToolIndeterminate { .. } => {
+            unreachable!("direct effects are handled before legacy identity projection")
+        }
+    }
+}
+
+fn direct_effect_identity(fact: &EffectFactV2) -> Option<&ToolEffectIdentityV2> {
+    match fact {
+        EffectFactV2::ToolObserved { identity, .. }
+        | EffectFactV2::ToolObservedAfterCancel { identity, .. }
+        | EffectFactV2::ToolObservedAfterDeadline { identity, .. }
+        | EffectFactV2::ToolObservedAfterCancelAndDeadline { identity, .. }
+        | EffectFactV2::ToolIndeterminate { identity, .. } => Some(identity),
+        _ => None,
     }
 }
 
@@ -4530,6 +5632,53 @@ fn validate_indeterminate_pair(
     }
 }
 
+fn validate_direct_completed_output(
+    state: &AuthorityState,
+    identity: &ToolObservedTerminalIdentityV2,
+    output: &ToolOutputV4,
+) -> AuthorityResult<()> {
+    let evidence = match state
+        .facts_by_id
+        .get(&identity.causation_fact_id)
+        .map(|fact| &fact.payload)
+    {
+        Some(KernelFactPayloadV2::Effect(
+            EffectFactV2::ToolObserved { evidence, .. }
+            | EffectFactV2::ToolObservedAfterCancel { evidence, .. }
+            | EffectFactV2::ToolObservedAfterDeadline { evidence, .. }
+            | EffectFactV2::ToolObservedAfterCancelAndDeadline { evidence, .. },
+        )) => evidence,
+        _ => return Err(corrupt_store()),
+    };
+    if matches!(
+        evidence,
+        EffectEvidenceV2::SearchMatchesReadBack { output_digest, .. }
+            | EffectEvidenceV2::WebSearchReadBack { output_digest, .. }
+            if output_digest != &output.full_digest
+    ) {
+        return Err(corrupt_store());
+    }
+    Ok(())
+}
+
+fn validate_direct_indeterminate_pair(
+    state: &AuthorityState,
+    identity: &ToolObservedTerminalIdentityV2,
+    reason_code: &IndeterminateReasonV2,
+) -> AuthorityResult<()> {
+    match state
+        .facts_by_id
+        .get(&identity.causation_fact_id)
+        .map(|fact| &fact.payload)
+    {
+        Some(KernelFactPayloadV2::Effect(EffectFactV2::ToolIndeterminate {
+            reason_code: effect_reason,
+            ..
+        })) if effect_reason == reason_code => Ok(()),
+        _ => Err(corrupt_store()),
+    }
+}
+
 fn submission_reply_from_cause(
     state: &AuthorityState,
     causation_fact_id: &FactId,
@@ -4550,6 +5699,9 @@ fn submission_reply_from_cause(
 
 fn reply_from_recorded_result(result: MutationCommandResultV2) -> KernelReplyV2 {
     match result {
+        MutationCommandResultV2::ToolIntentSubmission { reply } => {
+            KernelReplyV2::ToolIntentSubmission(reply)
+        }
         MutationCommandResultV2::EpochAdvance { reply } => {
             KernelReplyV2::ControlEpochAdvanced(reply)
         }
@@ -4658,8 +5810,323 @@ fn validate_causation(
     Ok(())
 }
 
+fn same_authorization_subject(
+    left: &AuthorizationIdentityV2,
+    right: &AuthorizationIdentityV2,
+) -> bool {
+    left.run_id == right.run_id
+        && left.control_epoch == right.control_epoch
+        && left.plan_revision == right.plan_revision
+        && left.plan_action_id == right.plan_action_id
+        && left.operation_id == right.operation_id
+}
+
+fn lease_matches_authorization_subject(
+    lease: &CapabilityLeaseFactIdentityV2,
+    authorization: &AuthorizationIdentityV2,
+) -> bool {
+    lease.run_id == authorization.run_id
+        && lease.control_epoch == authorization.control_epoch
+        && lease.plan_revision == authorization.plan_revision
+        && lease.plan_action_id == authorization.plan_action_id
+        && lease.operation_id == authorization.operation_id
+}
+
+fn lease_matches_awaiting_subject(
+    lease: &CapabilityLeaseFactIdentityV2,
+    awaiting: &CapabilityAwaitingIdentityV2,
+) -> bool {
+    lease.run_id == awaiting.run_id
+        && lease.control_epoch == awaiting.control_epoch
+        && lease.plan_revision == awaiting.plan_revision
+        && lease.plan_action_id == awaiting.plan_action_id
+        && lease.operation_id == awaiting.operation_id
+}
+
+fn authorization_matches_awaiting_subject(
+    authorization: &AuthorizationIdentityV2,
+    awaiting: &CapabilityAwaitingIdentityV2,
+) -> bool {
+    authorization.run_id == awaiting.run_id
+        && authorization.control_epoch == awaiting.control_epoch
+        && authorization.plan_revision == awaiting.plan_revision
+        && authorization.plan_action_id == awaiting.plan_action_id
+        && authorization.operation_id == awaiting.operation_id
+}
+
+fn authorization_resolution_edge_matches(
+    predecessor: &AuthorizationFactV2,
+    current: &AuthorizationFactV2,
+) -> bool {
+    match (predecessor, current) {
+        (
+            AuthorizationFactV2::ScopePreviewed {
+                identity: source,
+                preview_id,
+                tool_id,
+                scope_digest,
+                tool_contract_digest,
+                context_ref,
+                ..
+            },
+            AuthorizationFactV2::CapabilityIssued {
+                identity,
+                tool_id: issued_tool_id,
+                scope_digest: issued_scope_digest,
+                tool_contract_digest: issued_tool_contract_digest,
+                context_ref: issued_context_ref,
+                ..
+            },
+        ) => {
+            lease_matches_authorization_subject(identity, source)
+                && identity.preview_id == *preview_id
+                && issued_tool_id == tool_id
+                && issued_scope_digest == scope_digest
+                && issued_tool_contract_digest == tool_contract_digest
+                && issued_context_ref == context_ref
+        }
+        (
+            AuthorizationFactV2::CapabilityAwaiting {
+                identity: source,
+                preview_id,
+                tool_id,
+                scope_digest,
+                tool_contract_digest,
+                context_ref,
+                ..
+            },
+            AuthorizationFactV2::CapabilityIssued {
+                identity,
+                tool_id: issued_tool_id,
+                scope_digest: issued_scope_digest,
+                tool_contract_digest: issued_tool_contract_digest,
+                context_ref: issued_context_ref,
+                ..
+            },
+        ) => {
+            lease_matches_awaiting_subject(identity, source)
+                && identity.preview_id == *preview_id
+                && issued_tool_id == tool_id
+                && issued_scope_digest == scope_digest
+                && issued_tool_contract_digest == tool_contract_digest
+                && issued_context_ref == context_ref
+        }
+        (
+            AuthorizationFactV2::ScopePreviewed {
+                identity: source,
+                preview_id,
+                tool_id,
+                scope_digest,
+                ..
+            },
+            AuthorizationFactV2::CapabilityDenied {
+                identity,
+                preview_id: denied_preview_id,
+                tool_id: denied_tool_id,
+                scope_digest: denied_scope_digest,
+                ..
+            },
+        ) => {
+            same_authorization_subject(identity, source)
+                && denied_preview_id == preview_id
+                && denied_tool_id == tool_id
+                && denied_scope_digest == scope_digest
+        }
+        (
+            AuthorizationFactV2::CapabilityAwaiting {
+                identity: source,
+                preview_id,
+                tool_id,
+                scope_digest,
+                ..
+            },
+            AuthorizationFactV2::CapabilityDenied {
+                identity,
+                preview_id: denied_preview_id,
+                tool_id: denied_tool_id,
+                scope_digest: denied_scope_digest,
+                ..
+            },
+        ) => {
+            authorization_matches_awaiting_subject(identity, source)
+                && denied_preview_id == preview_id
+                && denied_tool_id == tool_id
+                && denied_scope_digest == scope_digest
+        }
+        (
+            AuthorizationFactV2::ScopePreviewed {
+                identity: source,
+                preview_id,
+                scope_digest,
+                ..
+            },
+            AuthorizationFactV2::ExpansionAllowed {
+                identity,
+                expanded_scope_digest,
+                ..
+            },
+        ) => {
+            lease_matches_authorization_subject(identity, source)
+                && identity.preview_id == *preview_id
+                && expanded_scope_digest == scope_digest
+        }
+        (
+            AuthorizationFactV2::CapabilityAwaiting {
+                identity: source,
+                preview_id,
+                scope_digest,
+                ..
+            },
+            AuthorizationFactV2::ExpansionAllowed {
+                identity,
+                expanded_scope_digest,
+                ..
+            },
+        ) => {
+            lease_matches_awaiting_subject(identity, source)
+                && identity.preview_id == *preview_id
+                && expanded_scope_digest == scope_digest
+        }
+        (
+            AuthorizationFactV2::ScopePreviewed {
+                identity: source,
+                preview_id,
+                scope_digest,
+                ..
+            },
+            AuthorizationFactV2::ExpansionDenied {
+                identity,
+                preview_id: denied_preview_id,
+                requested_scope_digest,
+                ..
+            },
+        ) => {
+            same_authorization_subject(identity, source)
+                && denied_preview_id == preview_id
+                && requested_scope_digest == scope_digest
+        }
+        (
+            AuthorizationFactV2::CapabilityAwaiting {
+                identity: source,
+                preview_id,
+                scope_digest,
+                ..
+            },
+            AuthorizationFactV2::ExpansionDenied {
+                identity,
+                preview_id: denied_preview_id,
+                requested_scope_digest,
+                ..
+            },
+        ) => {
+            authorization_matches_awaiting_subject(identity, source)
+                && denied_preview_id == preview_id
+                && requested_scope_digest == scope_digest
+        }
+        _ => false,
+    }
+}
+
 fn edge_kind_matches(predecessor: &KernelFactPayloadV2, current: &KernelFactPayloadV2) -> bool {
     match current {
+        KernelFactPayloadV2::Control(ControlFactV2::RunOpened {
+            control_epoch,
+            ..
+        }) => matches!(
+            predecessor,
+            KernelFactPayloadV2::Control(ControlFactV2::EpochAdvanced {
+                identity,
+                ..
+            }) if identity.control_epoch == *control_epoch
+        ),
+        KernelFactPayloadV2::Authorization(
+            deepcode_kernel_abi::v2::AuthorizationFactV2::ScopePreviewed { .. },
+        ) => matches!(
+            predecessor,
+            KernelFactPayloadV2::Control(ControlFactV2::EpochAdvanced { .. })
+                | KernelFactPayloadV2::Authorization(
+                    deepcode_kernel_abi::v2::AuthorizationFactV2::ContextInvalidated { .. }
+                )
+        ),
+        KernelFactPayloadV2::Authorization(AuthorizationFactV2::CapabilityAwaiting {
+            identity,
+            preview_id,
+            tool_id,
+            canonical_arguments_digest,
+            scope_digest,
+            tool_contract_digest,
+            context_ref,
+        }) => match predecessor {
+            KernelFactPayloadV2::Authorization(AuthorizationFactV2::ScopePreviewed {
+                identity: source,
+                preview_id: source_preview_id,
+                tool_id: source_tool_id,
+                canonical_arguments_digest: source_arguments_digest,
+                scope_digest: source_scope_digest,
+                tool_contract_digest: source_tool_contract_digest,
+                context_ref: source_context_ref,
+                ..
+            }) => {
+                authorization_matches_awaiting_subject(source, identity)
+                    && preview_id == source_preview_id
+                    && tool_id == source_tool_id
+                    && canonical_arguments_digest == source_arguments_digest
+                    && scope_digest == source_scope_digest
+                    && tool_contract_digest == source_tool_contract_digest
+                    && context_ref == source_context_ref
+            }
+            _ => false,
+        },
+        KernelFactPayloadV2::Authorization(current)
+            if matches!(
+                current,
+                AuthorizationFactV2::CapabilityIssued { .. }
+                    | AuthorizationFactV2::CapabilityDenied { .. }
+                    | AuthorizationFactV2::ExpansionAllowed { .. }
+                    | AuthorizationFactV2::ExpansionDenied { .. }
+            ) =>
+        {
+            match predecessor {
+                KernelFactPayloadV2::Authorization(predecessor) => {
+                    authorization_resolution_edge_matches(predecessor, current)
+                }
+                _ => false,
+            }
+        }
+        KernelFactPayloadV2::Authorization(
+            deepcode_kernel_abi::v2::AuthorizationFactV2::TrustGranted { .. },
+        ) => matches!(
+            predecessor,
+            KernelFactPayloadV2::Authorization(
+                deepcode_kernel_abi::v2::AuthorizationFactV2::ScopePreviewed { .. }
+            )
+        ),
+        KernelFactPayloadV2::Authorization(
+            deepcode_kernel_abi::v2::AuthorizationFactV2::TrustRevoked { .. },
+        ) => matches!(
+            predecessor,
+            KernelFactPayloadV2::Authorization(
+                deepcode_kernel_abi::v2::AuthorizationFactV2::TrustGranted { .. }
+            )
+        ),
+        KernelFactPayloadV2::Authorization(
+            deepcode_kernel_abi::v2::AuthorizationFactV2::LeaseRevoked { .. }
+                | deepcode_kernel_abi::v2::AuthorizationFactV2::LeaseSuperseded { .. },
+        ) => matches!(
+            predecessor,
+            KernelFactPayloadV2::Authorization(
+                deepcode_kernel_abi::v2::AuthorizationFactV2::CapabilityIssued { .. }
+                    | deepcode_kernel_abi::v2::AuthorizationFactV2::ExpansionAllowed { .. }
+            )
+        ),
+        KernelFactPayloadV2::Authorization(
+            deepcode_kernel_abi::v2::AuthorizationFactV2::ContextInvalidated { .. },
+        ) => matches!(
+            predecessor,
+            KernelFactPayloadV2::Control(ControlFactV2::EpochAdvanced { .. })
+                | KernelFactPayloadV2::Authorization(_)
+        ),
+        KernelFactPayloadV2::Authorization(_) => false,
         KernelFactPayloadV2::Control(ControlFactV2::EpochAdvanced { .. }) => {
             command_edge(predecessor, MutationCommandKindV2::ControlEpochAdvance)
         }
@@ -4697,6 +6164,24 @@ fn edge_kind_matches(predecessor: &KernelFactPayloadV2, current: &KernelFactPayl
         KernelFactPayloadV2::Invocation(
             InvocationFactV2::Admitted { .. } | InvocationFactV2::Rejected { .. },
         ) => command_edge(predecessor, MutationCommandKindV2::InvocationSubmit),
+        KernelFactPayloadV2::Invocation(InvocationFactV2::ToolIntentAdmitted { .. }) => {
+            matches!(
+                predecessor,
+                KernelFactPayloadV2::Control(ControlFactV2::CommandRecorded { .. })
+                    | KernelFactPayloadV2::Authorization(
+                        AuthorizationFactV2::CapabilityIssued { .. }
+                            | AuthorizationFactV2::ExpansionAllowed { .. }
+                    )
+            )
+        }
+        KernelFactPayloadV2::Invocation(InvocationFactV2::ToolAttemptPrepared { .. }) => {
+            matches!(
+                predecessor,
+                KernelFactPayloadV2::Invocation(
+                    InvocationFactV2::ToolIntentAdmitted { .. }
+                )
+            )
+        }
         KernelFactPayloadV2::Grant(GrantFactV2::Reserved { .. }) => matches!(
             predecessor,
             KernelFactPayloadV2::Invocation(InvocationFactV2::Admitted { .. })
@@ -4707,7 +6192,10 @@ fn edge_kind_matches(predecessor: &KernelFactPayloadV2, current: &KernelFactPayl
         ),
         KernelFactPayloadV2::Resource(ResourceFactV2::ResolvedForInvocation { .. }) => matches!(
             predecessor,
-            KernelFactPayloadV2::Invocation(InvocationFactV2::AttemptPrepared { .. })
+            KernelFactPayloadV2::Invocation(
+                InvocationFactV2::AttemptPrepared { .. }
+                    | InvocationFactV2::ToolAttemptPrepared { .. }
+            )
         ),
         KernelFactPayloadV2::Resource(ResourceFactV2::RevalidatedBeforeEffect { .. }) => {
             matches!(
@@ -4726,16 +6214,40 @@ fn edge_kind_matches(predecessor: &KernelFactPayloadV2, current: &KernelFactPayl
             predecessor,
             KernelFactPayloadV2::Grant(GrantFactV2::Consumed { .. })
         ),
+        KernelFactPayloadV2::Invocation(InvocationFactV2::ToolExecutionStarted { .. }) => {
+            matches!(
+                predecessor,
+                KernelFactPayloadV2::Invocation(
+                    InvocationFactV2::ToolAttemptPrepared { .. }
+                ) | KernelFactPayloadV2::Resource(
+                    ResourceFactV2::RevalidatedBeforeEffect { .. }
+                )
+            )
+        }
         KernelFactPayloadV2::Invocation(InvocationFactV2::CancellationObserved { .. }) => {
             matches!(
                 predecessor,
                 KernelFactPayloadV2::Control(ControlFactV2::CancellationRequested { .. })
             )
         }
+        KernelFactPayloadV2::Invocation(
+            InvocationFactV2::ToolCancellationObserved { .. },
+        ) => matches!(
+            predecessor,
+            KernelFactPayloadV2::Control(ControlFactV2::CancellationRequested { .. })
+        ),
         KernelFactPayloadV2::Invocation(InvocationFactV2::DeadlineObserved { .. }) => matches!(
             predecessor,
             KernelFactPayloadV2::Invocation(InvocationFactV2::Admitted { .. })
         ),
+        KernelFactPayloadV2::Invocation(InvocationFactV2::ToolDeadlineObserved { .. }) => {
+            matches!(
+                predecessor,
+                KernelFactPayloadV2::Invocation(
+                    InvocationFactV2::ToolIntentAdmitted { .. }
+                )
+            )
+        }
         KernelFactPayloadV2::Invocation(InvocationFactV2::CancelledBeforeEffect { .. }) => {
             matches!(
                 predecessor,
@@ -4748,14 +6260,46 @@ fn edge_kind_matches(predecessor: &KernelFactPayloadV2, current: &KernelFactPayl
                 KernelFactPayloadV2::Invocation(InvocationFactV2::DeadlineObserved { .. })
             )
         }
+        KernelFactPayloadV2::Invocation(
+            InvocationFactV2::ToolCancelledBeforeEffect { .. },
+        ) => matches!(
+            predecessor,
+            KernelFactPayloadV2::Invocation(
+                InvocationFactV2::ToolCancellationObserved { .. }
+            )
+        ),
+        KernelFactPayloadV2::Invocation(
+            InvocationFactV2::ToolTimedOutBeforeEffect { .. },
+        ) => matches!(
+            predecessor,
+            KernelFactPayloadV2::Invocation(
+                InvocationFactV2::ToolDeadlineObserved { .. }
+            )
+        ),
+        KernelFactPayloadV2::Invocation(
+            InvocationFactV2::ToolFailedBeforeEffect { .. },
+        ) => matches!(
+            predecessor,
+            KernelFactPayloadV2::Invocation(
+                InvocationFactV2::ToolAttemptPrepared { .. }
+            )
+        ),
         KernelFactPayloadV2::Effect(_) => matches!(
             predecessor,
-            KernelFactPayloadV2::Invocation(InvocationFactV2::ExecutionStarted { .. })
+            KernelFactPayloadV2::Invocation(
+                InvocationFactV2::ExecutionStarted { .. }
+                    | InvocationFactV2::ToolExecutionStarted { .. }
+            )
         ),
         KernelFactPayloadV2::Invocation(
             InvocationFactV2::Completed { .. }
             | InvocationFactV2::FailedAfterObservedEffect { .. }
             | InvocationFactV2::Indeterminate { .. },
+        ) => matches!(predecessor, KernelFactPayloadV2::Effect(_)),
+        KernelFactPayloadV2::Invocation(
+            InvocationFactV2::ToolCompleted { .. }
+            | InvocationFactV2::ToolFailedAfterObservedEffect { .. }
+            | InvocationFactV2::ToolIndeterminate { .. },
         ) => matches!(predecessor, KernelFactPayloadV2::Effect(_)),
         KernelFactPayloadV2::Grant(GrantFactV2::ReservationReleased { .. }) => matches!(
             predecessor,

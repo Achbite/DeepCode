@@ -8,7 +8,7 @@ use crate::tool_catalog_v4::{
 use crate::tool_protocol_v2::{
     CanonicalArgumentsDigestV2, CapabilityLeaseRefV2, CapabilityScopeDigestV2,
     CapabilityScopePreviewIdV2, FactQueryContinuationV2, PlanActionIdV2, PlanRevisionV2,
-    RawToolArgumentsV2, RequestedResourceV2, RunCapabilityV2, ToolContextBundleV2,
+    RawToolArgumentsV2, RequestedResourceV2, ToolContextBundleV2,
     ToolContextRefV2, ToolContractDigestV2, ToolEffectClassV2, ToolEffectScopeV2, ToolIdV2,
     ToolIntentAuthorityV2, ToolRiskV2, WorkspaceBindingRefV2,
 };
@@ -62,65 +62,37 @@ impl KernelCommandEnvelopeV2 {
     deny_unknown_fields
 )]
 pub enum KernelCommandV2 {
-    CompatibilityGet {},
-    ToolCatalogGet {},
     RunOpen(RunOpenV2),
     ToolContextGet(ToolContextGetV2),
     CapabilityScopePreview(CapabilityScopePreviewV2),
     ToolIntentSubmit(ToolIntentSubmitV2),
     KernelFactsQueryScoped(KernelFactsQueryScopedV2),
     ControlEpochAdvance(ControlEpochAdvanceV2),
-    GrantPreview(GrantRequestV2),
-    GrantDecisionSubmit(GrantDecisionSubmitV2),
-    GrantRevoke(GrantRevokeV2),
-    InvocationSubmit(InvocationSubmitV2),
     InvocationCancel(InvocationCancelV2),
-    InvocationStatusGet(InvocationStatusGetV2),
-    KernelFactsQuery(KernelFactsQueryV2),
-    ResourceResolve(ResourceResolveV2),
-    RunTerminate(RunTerminateV2),
 }
 
 impl KernelCommandV2 {
     pub fn validate(&self) -> Result<(), V2ValidationError> {
         match self {
-            Self::CompatibilityGet {} | Self::ToolCatalogGet {} => Ok(()),
             Self::RunOpen(value) => value.validate(),
             Self::ToolContextGet(value) => value.validate(),
             Self::CapabilityScopePreview(value) => value.validate(),
             Self::ToolIntentSubmit(value) => value.validate(),
             Self::KernelFactsQueryScoped(value) => value.validate(),
             Self::ControlEpochAdvance(value) => value.validate(),
-            Self::GrantPreview(value) => value.validate(),
-            Self::GrantDecisionSubmit(value) => value.validate(),
-            Self::GrantRevoke(value) => value.validate(),
-            Self::InvocationSubmit(value) => value.validate(),
             Self::InvocationCancel(value) => value.validate(),
-            Self::InvocationStatusGet(_) | Self::ResourceResolve(_) => Ok(()),
-            Self::KernelFactsQuery(value) => value.validate(),
-            Self::RunTerminate(value) => value.validate(),
         }
     }
 
     pub const fn kind(&self) -> &'static str {
         match self {
-            Self::CompatibilityGet {} => "compatibilityGet",
-            Self::ToolCatalogGet {} => "toolCatalogGet",
             Self::RunOpen(_) => "runOpen",
             Self::ToolContextGet(_) => "toolContextGet",
             Self::CapabilityScopePreview(_) => "capabilityScopePreview",
             Self::ToolIntentSubmit(_) => "toolIntentSubmit",
             Self::KernelFactsQueryScoped(_) => "kernelFactsQueryScoped",
             Self::ControlEpochAdvance(_) => "controlEpochAdvance",
-            Self::GrantPreview(_) => "grantPreview",
-            Self::GrantDecisionSubmit(_) => "grantDecisionSubmit",
-            Self::GrantRevoke(_) => "grantRevoke",
-            Self::InvocationSubmit(_) => "invocationSubmit",
             Self::InvocationCancel(_) => "invocationCancel",
-            Self::InvocationStatusGet(_) => "invocationStatusGet",
-            Self::KernelFactsQuery(_) => "kernelFactsQuery",
-            Self::ResourceResolve(_) => "resourceResolve",
-            Self::RunTerminate(_) => "runTerminate",
         }
     }
 
@@ -129,11 +101,7 @@ impl KernelCommandV2 {
             Self::RunOpen(_) => Some(MutationCommandKindV2::RunOpen),
             Self::ToolIntentSubmit(_) => Some(MutationCommandKindV2::ToolIntentSubmit),
             Self::ControlEpochAdvance(_) => Some(MutationCommandKindV2::ControlEpochAdvance),
-            Self::GrantDecisionSubmit(_) => Some(MutationCommandKindV2::GrantDecisionSubmit),
-            Self::GrantRevoke(_) => Some(MutationCommandKindV2::GrantRevoke),
-            Self::InvocationSubmit(_) => Some(MutationCommandKindV2::InvocationSubmit),
             Self::InvocationCancel(_) => Some(MutationCommandKindV2::InvocationCancel),
-            Self::RunTerminate(_) => Some(MutationCommandKindV2::RunTerminate),
             _ => None,
         }
     }
@@ -170,7 +138,6 @@ impl RunOpenV2 {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ToolContextGetV2 {
     pub run_id: RunId,
-    pub run_capability: RunCapabilityV2,
     pub known_context: Option<ToolContextRefV2>,
 }
 
@@ -184,7 +151,6 @@ impl ToolContextGetV2 {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CapabilityScopePreviewV2 {
     pub run_id: RunId,
-    pub run_capability: RunCapabilityV2,
     pub expected_control_epoch: ControlEpoch,
     pub plan_revision: PlanRevisionV2,
     pub plan_action_id: PlanActionIdV2,
@@ -220,7 +186,6 @@ impl CapabilityScopePreviewV2 {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ToolIntentSubmitV2 {
     pub run_id: RunId,
-    pub run_capability: RunCapabilityV2,
     pub expected_control_epoch: ControlEpoch,
     pub operation_id: OperationId,
     pub idempotency_key: String,
@@ -243,8 +208,6 @@ impl ToolIntentSubmitV2 {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct KernelFactsQueryScopedV2 {
     pub run_id: RunId,
-    pub run_capability: RunCapabilityV2,
-    pub tool_context_ref: ToolContextRefV2,
     pub after_ledger_sequence: u64,
     pub limit: u32,
     pub continuation: Option<FactQueryContinuationV2>,
@@ -260,7 +223,6 @@ impl KernelFactsQueryScopedV2 {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ControlEpochAdvanceV2 {
     pub run_id: RunId,
-    pub run_capability: RunCapabilityV2,
     pub precondition: EpochPreconditionV2,
     pub input_id: InputId,
     pub opaque_input_ref: String,
@@ -396,7 +358,6 @@ impl InvocationSubmitV2 {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct InvocationCancelV2 {
     pub run_id: RunId,
-    pub run_capability: RunCapabilityV2,
     pub expected_control_epoch: ControlEpoch,
     pub target: InvocationCancelTargetV2,
     pub reason_code: crate::v2::CancellationReasonCodeV2,
@@ -624,7 +585,6 @@ pub enum CommandHandlingV2 {
 pub struct RunOpenReplyV2 {
     pub run_id: RunId,
     pub control_epoch: ControlEpoch,
-    pub run_capability: RunCapabilityV2,
     pub workspace_binding_digest: WorkspaceBindingDigestV2,
     pub tool_context: ToolContextBundleV2,
 }
@@ -875,7 +835,7 @@ pub struct KernelFactLineageV2 {
     pub control_epoch: Option<ControlEpoch>,
     pub plan_action_ids: Vec<PlanActionIdV2>,
     pub operation_id: Option<OperationId>,
-    pub capability_lease_id: Option<crate::tool_protocol_v2::CapabilityLeaseIdV2>,
+    pub capability_lease: Option<CapabilityLeaseRefV2>,
     pub invocation_id: Option<InvocationId>,
     pub attempt_id: Option<AttemptId>,
     pub effect_id: Option<EffectId>,
@@ -966,7 +926,7 @@ impl KernelFactProjectionV2 {
             control_epoch: envelope.payload.control_epoch(),
             plan_action_ids,
             operation_id: envelope.payload.operation_id().cloned(),
-            capability_lease_id: envelope.payload.capability_lease_id().cloned(),
+            capability_lease: envelope.payload.capability_lease(),
             invocation_id: envelope.payload.invocation_id().cloned(),
             attempt_id: envelope.payload.attempt_id().cloned(),
             effect_id: envelope.payload.effect_id().cloned(),
@@ -1013,7 +973,6 @@ impl KernelFactProjectionV2 {
 pub struct KernelFactProjectionPageV2 {
     pub requested_after_ledger_sequence: u64,
     pub snapshot_high_water: u64,
-    pub query_context: ToolContextRefV2,
     pub facts: Vec<KernelFactProjectionV2>,
     pub has_more: bool,
     pub next_after_ledger_sequence: u64,
@@ -1024,6 +983,12 @@ impl KernelFactProjectionPageV2 {
     pub fn validate(&self) -> Result<(), V2ValidationError> {
         if self.facts.len() > MAX_PAGE_ITEMS_V2 {
             return Err(too_many_values("facts", MAX_PAGE_ITEMS_V2));
+        }
+        if self.requested_after_ledger_sequence > self.snapshot_high_water {
+            return Err(invalid_value(
+                "requestedAfterLedgerSequence",
+                "must be no greater than snapshotHighWater",
+            ));
         }
         let mut previous = self.requested_after_ledger_sequence;
         for fact in &self.facts {
@@ -1036,22 +1001,26 @@ impl KernelFactProjectionPageV2 {
             }
             previous = fact.ledger_sequence;
         }
-        if self.next_after_ledger_sequence != previous {
-            return Err(invalid_value(
-                "nextAfterLedgerSequence",
-                "must equal the final returned sequence or requested cursor",
-            ));
-        }
         if self.has_more != self.next_continuation.is_some() {
             return Err(invalid_value(
                 "nextContinuation",
                 "must be present exactly when hasMore is true",
             ));
         }
-        if !self.has_more && self.next_after_ledger_sequence != self.snapshot_high_water {
+        if self.has_more {
+            if self.facts.is_empty()
+                || self.next_after_ledger_sequence != previous
+                || self.next_after_ledger_sequence >= self.snapshot_high_water
+            {
+                return Err(invalid_value(
+                    "nextAfterLedgerSequence",
+                    "a continued page must advance to its final fact below snapshotHighWater",
+                ));
+            }
+        } else if self.next_after_ledger_sequence != self.snapshot_high_water {
             return Err(invalid_value(
                 "nextAfterLedgerSequence",
-                "must equal snapshotHighWater when caught up",
+                "a caught-up page must advance across run gaps to snapshotHighWater",
             ));
         }
         Ok(())

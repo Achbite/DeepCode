@@ -1,8 +1,12 @@
 use deepcode_kernel_abi::v2::{
-    CleanupFactV2, GrantFactV2, InvocationFactV2, KernelFactDraftV2, KernelFactEnvelopeV2,
+    query_digest_v2, AuthorizationFactV2, CleanupFactV2, CommandRequestDigestV2, CommandRequestId,
+    ControlFactV2, FactId, GrantFactV2, InvocationFactV2, KernelFactDraftV2, KernelFactEnvelopeV2,
     KernelFactPayloadV2, RecordedAtV2, ResourceFactV2, RunId, FACT_STORE_SCHEMA_CONTRACT_V2,
 };
-use deepcode_kernel_abi::KERNEL_ABI_V2_VERSION;
+use deepcode_kernel_abi::{
+    CapabilityLeaseIdV2, CapabilityLeaseRefV2, CapabilityLeaseVersionV2,
+    CapabilityScopeDigestV2, FactQueryContinuationV2, KERNEL_ABI_V2_VERSION,
+};
 use deepcode_kernel_abi::{KernelError, KernelResult};
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{
@@ -18,12 +22,18 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-const SCHEMA_VERSION: &str = "2";
+const SCHEMA_VERSION: &str = "5";
 const SCHEMA_CONTRACT: &str = FACT_STORE_SCHEMA_CONTRACT_V2;
 const WRITER_QUEUE_CAPACITY: usize = 256;
 const BUSY_TIMEOUT: Duration = Duration::from_millis(5_000);
 const WRITER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_OUTBOX_LIMIT: u32 = 1_000;
+const MAX_COMMAND_KIND_BYTES: usize = 128;
+const MAX_PUBLIC_REPLY_BYTES: usize = 5 * 1024 * 1024;
+const MAX_AUTHORITY_MATERIAL_PAYLOAD_BYTES: usize = 5 * 1024 * 1024;
+const MAX_AUTHORITY_MATERIAL_TOKEN_BYTES: usize = 256;
+const MAX_DURABLE_CONTINUATIONS_GLOBAL: u64 = 8_192;
+const MAX_DURABLE_CONTINUATIONS_PER_RUN: u64 = 1_024;
 static MEMORY_DATABASE_ID: AtomicU64 = AtomicU64::new(1);
 
 pub const FACT_STORE_PATH_ENV: &str = "DEEPCODE_KERNEL_FACT_STORE_PATH";
@@ -82,6 +92,177 @@ pub struct OutboxFactV2 {
     pub envelope: KernelFactEnvelopeV2,
     pub publish_attempts: u64,
     pub last_error: Option<String>,
+}
+
+/// Private durable replay metadata for one public v2 command.
+///
+/// This record is deliberately stored outside `kernel_facts`; it is never
+/// returned by `KernelFactsQuery`. `reply_json` must be a secret-free,
+/// reconstructable reply. In particular, ephemeral run or decision
+/// capabilities are rejected at the storage boundary and must be reissued
+/// after restart.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PublicCommandReceiptV2 {
+    pub command_request_id: CommandRequestId,
+    pub command_request_digest: CommandRequestDigestV2,
+    pub command_kind: String,
+    pub run_id: Option<RunId>,
+    pub reply_json: serde_json::Value,
+    pub settlement_fact_id: Option<FactId>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum PutPublicCommandReceiptOutcomeV2 {
+    Inserted(PublicCommandReceiptV2),
+    ExistingSame(PublicCommandReceiptV2),
+    DigestConflict {
+        command_request_id: CommandRequestId,
+        existing: CommandRequestDigestV2,
+        submitted: CommandRequestDigestV2,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AppendWithPublicCommandReceiptOutcomeV2 {
+    pub facts: Vec<KernelFactEnvelopeV2>,
+    pub receipt: PutPublicCommandReceiptOutcomeV2,
+}
+
+/// Private durable authority material used to reconstruct admission state.
+///
+/// Material is not a Kernel fact and is never exposed by fact queries or the
+/// outbox. `payload_json` is deliberately secret-free; run and decision
+/// capabilities are rejected at this storage boundary.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AuthorityMaterialRecordV2 {
+    pub material_kind: String,
+    pub material_id: String,
+    pub run_id: RunId,
+    pub control_epoch: u64,
+    pub lifecycle: String,
+    pub operation_id: Option<deepcode_kernel_abi::v2::OperationId>,
+    pub invocation_id: Option<deepcode_kernel_abi::v2::InvocationId>,
+    pub lease: Option<CapabilityLeaseRefV2>,
+    pub payload_digest: String,
+    pub payload_json: serde_json::Value,
+    pub source_fact_id: FactId,
+    pub last_fact_id: FactId,
+    pub last_ledger_sequence: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AuthorityMaterialDraftV2 {
+    pub material_kind: String,
+    pub material_id: String,
+    pub run_id: RunId,
+    pub control_epoch: u64,
+    pub lifecycle: String,
+    pub operation_id: Option<deepcode_kernel_abi::v2::OperationId>,
+    pub invocation_id: Option<deepcode_kernel_abi::v2::InvocationId>,
+    pub lease: Option<CapabilityLeaseRefV2>,
+    pub payload_json: serde_json::Value,
+}
+
+/// Compare-and-set mutations applied after the referenced facts are appended
+/// but before the same SQLite transaction commits.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AuthorityMaterialMutationV2 {
+    Put {
+        material: AuthorityMaterialDraftV2,
+        fact_index: usize,
+    },
+    Replace {
+        expected_lifecycle: String,
+        expected_payload_digest: Option<String>,
+        material: AuthorityMaterialDraftV2,
+        fact_index: usize,
+    },
+    TransitionRunEpoch {
+        run_id: RunId,
+        through_control_epoch: u64,
+        expected_lifecycles: Vec<String>,
+        next_lifecycle: String,
+        fact_index: usize,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AppendWithAuthorityMaterialOutcomeV2 {
+    pub facts: Vec<KernelFactEnvelopeV2>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AppendWithPublicReceiptAndAuthorityMaterialOutcomeV2 {
+    pub facts: Vec<KernelFactEnvelopeV2>,
+    pub receipt: PutPublicCommandReceiptOutcomeV2,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct FactQueryContinuationDraftV2 {
+    pub token: FactQueryContinuationV2,
+    pub run_id: RunId,
+    pub snapshot_high_water: u64,
+    pub after_ledger_sequence: u64,
+    pub expires_at: RecordedAtV2,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableFactQueryContinuationV2 {
+    pub run_id: RunId,
+    pub snapshot_high_water: u64,
+    pub after_ledger_sequence: u64,
+    pub created_at: RecordedAtV2,
+    pub expires_at: RecordedAtV2,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FactQueryContinuationExpectationV2 {
+    pub run_id: RunId,
+    pub after_ledger_sequence: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FactQueryContinuationConsumerV2 {
+    pub command_request_id: CommandRequestId,
+    pub command_request_digest: CommandRequestDigestV2,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PutFactQueryContinuationOutcomeV2 {
+    Inserted(DurableFactQueryContinuationV2),
+    ExistingSame(DurableFactQueryContinuationV2),
+    ExistingConsumed(DurableFactQueryContinuationV2),
+    ExistingExpired(DurableFactQueryContinuationV2),
+    TokenConflict,
+    CapacityExceeded {
+        scope: FactQueryContinuationCapacityScopeV2,
+        limit: u64,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FactQueryContinuationCapacityScopeV2 {
+    Global,
+    Run,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolveFactQueryContinuationOutcomeV2 {
+    Resolved(DurableFactQueryContinuationV2),
+    NotFound,
+    Expired { expires_at: RecordedAtV2 },
+    ScopeMismatch,
+    Consumed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConsumeFactQueryContinuationOutcomeV2 {
+    Consumed(DurableFactQueryContinuationV2),
+    ExistingSame(DurableFactQueryContinuationV2),
+    NotFound,
+    Expired { expires_at: RecordedAtV2 },
+    ScopeMismatch,
+    AlreadyConsumed,
 }
 
 #[derive(Debug, Clone)]
@@ -150,6 +331,37 @@ enum WriterCommand {
     Append {
         drafts: Vec<KernelFactDraftV2>,
         response: mpsc::Sender<KernelResult<Vec<KernelFactEnvelopeV2>>>,
+    },
+    AppendWithPublicCommandReceipt {
+        drafts: Vec<KernelFactDraftV2>,
+        receipt: PublicCommandReceiptV2,
+        response: mpsc::Sender<KernelResult<AppendWithPublicCommandReceiptOutcomeV2>>,
+    },
+    AppendWithAuthorityMaterial {
+        drafts: Vec<KernelFactDraftV2>,
+        mutations: Vec<AuthorityMaterialMutationV2>,
+        response: mpsc::Sender<KernelResult<AppendWithAuthorityMaterialOutcomeV2>>,
+    },
+    AppendWithPublicReceiptAndAuthorityMaterial {
+        drafts: Vec<KernelFactDraftV2>,
+        receipt: PublicCommandReceiptV2,
+        mutations: Vec<AuthorityMaterialMutationV2>,
+        response:
+            mpsc::Sender<KernelResult<AppendWithPublicReceiptAndAuthorityMaterialOutcomeV2>>,
+    },
+    PutPublicCommandReceipt {
+        receipt: PublicCommandReceiptV2,
+        response: mpsc::Sender<KernelResult<PutPublicCommandReceiptOutcomeV2>>,
+    },
+    PutFactQueryContinuation {
+        continuation: FactQueryContinuationDraftV2,
+        response: mpsc::Sender<KernelResult<PutFactQueryContinuationOutcomeV2>>,
+    },
+    ConsumeFactQueryContinuation {
+        token: FactQueryContinuationV2,
+        expected: FactQueryContinuationExpectationV2,
+        consumer: FactQueryContinuationConsumerV2,
+        response: mpsc::Sender<KernelResult<ConsumeFactQueryContinuationOutcomeV2>>,
     },
     MarkPublished {
         ledger_sequence: u64,
@@ -234,7 +446,10 @@ impl CanonicalFactStore {
             })?;
         }
         let created = create_private_database_file_if_absent(&path)?;
-        match Self::start(DatabaseTarget::File(path.clone())) {
+        if !created {
+            validate_existing_database_read_only(&path)?;
+        }
+        match Self::start(DatabaseTarget::File(path.clone()), created) {
             Ok(store) => Ok(store),
             Err(error) => {
                 if created {
@@ -256,16 +471,16 @@ impl CanonicalFactStore {
             "file:deepcode-kernel-v2-{}-{id}?mode=memory&cache=shared",
             std::process::id()
         );
-        Self::start(DatabaseTarget::SharedMemory(uri))
+        Self::start(DatabaseTarget::SharedMemory(uri), true)
     }
 
-    fn start(target: DatabaseTarget) -> KernelResult<Self> {
+    fn start(target: DatabaseTarget, initialize_schema: bool) -> KernelResult<Self> {
         let (sender, receiver) = mpsc::sync_channel(WRITER_QUEUE_CAPACITY);
         let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
         let writer_target = target.clone();
         let writer = thread::Builder::new()
             .name("deepcode-kernel-fact-writer".to_string())
-            .spawn(move || writer_main(writer_target, receiver, ready_sender))
+            .spawn(move || writer_main(writer_target, initialize_schema, receiver, ready_sender))
             .map_err(|error| store_error_message("spawn_writer", error.to_string()))?;
 
         match ready_receiver.recv_timeout(WRITER_RESPONSE_TIMEOUT) {
@@ -396,6 +611,135 @@ impl CanonicalFactStore {
         encoded
             .map(|encoded| decode_envelope(&encoded, "query_fact_id"))
             .transpose()
+    }
+
+    fn get_public_command_receipt(
+        &self,
+        command_request_id: &CommandRequestId,
+    ) -> KernelResult<Option<PublicCommandReceiptV2>> {
+        let connection = self.inner.target.query_connection()?;
+        read_public_command_receipt(&connection, command_request_id)
+    }
+
+    fn authority_material_snapshot(&self) -> KernelResult<Vec<AuthorityMaterialRecordV2>> {
+        let connection = self.inner.target.query_connection()?;
+        read_authority_material_snapshot(&connection)
+    }
+
+    fn append_with_public_command_receipt(
+        &self,
+        drafts: Vec<KernelFactDraftV2>,
+        receipt: PublicCommandReceiptV2,
+    ) -> KernelResult<AppendWithPublicCommandReceiptOutcomeV2> {
+        let (response, receiver) = mpsc::channel();
+        self.send(WriterCommand::AppendWithPublicCommandReceipt {
+            drafts,
+            receipt,
+            response,
+        })?;
+        receive_response(
+            "append_with_public_command_receipt",
+            receiver,
+            &self.inner.faulted,
+        )
+    }
+
+    fn append_with_authority_material(
+        &self,
+        drafts: Vec<KernelFactDraftV2>,
+        mutations: Vec<AuthorityMaterialMutationV2>,
+    ) -> KernelResult<AppendWithAuthorityMaterialOutcomeV2> {
+        let (response, receiver) = mpsc::channel();
+        self.send(WriterCommand::AppendWithAuthorityMaterial {
+            drafts,
+            mutations,
+            response,
+        })?;
+        receive_response(
+            "append_with_authority_material",
+            receiver,
+            &self.inner.faulted,
+        )
+    }
+
+    fn append_with_public_receipt_and_authority_material(
+        &self,
+        drafts: Vec<KernelFactDraftV2>,
+        receipt: PublicCommandReceiptV2,
+        mutations: Vec<AuthorityMaterialMutationV2>,
+    ) -> KernelResult<AppendWithPublicReceiptAndAuthorityMaterialOutcomeV2> {
+        let (response, receiver) = mpsc::channel();
+        self.send(
+            WriterCommand::AppendWithPublicReceiptAndAuthorityMaterial {
+                drafts,
+                receipt,
+                mutations,
+                response,
+            },
+        )?;
+        receive_response(
+            "append_with_public_receipt_and_authority_material",
+            receiver,
+            &self.inner.faulted,
+        )
+    }
+
+    fn put_public_command_receipt_if_absent(
+        &self,
+        receipt: PublicCommandReceiptV2,
+    ) -> KernelResult<PutPublicCommandReceiptOutcomeV2> {
+        let (response, receiver) = mpsc::channel();
+        self.send(WriterCommand::PutPublicCommandReceipt { receipt, response })?;
+        receive_response(
+            "put_public_command_receipt_if_absent",
+            receiver,
+            &self.inner.faulted,
+        )
+    }
+
+    fn resolve_fact_query_continuation(
+        &self,
+        token: &FactQueryContinuationV2,
+        expected: &FactQueryContinuationExpectationV2,
+    ) -> KernelResult<ResolveFactQueryContinuationOutcomeV2> {
+        let connection = self.inner.target.query_connection()?;
+        resolve_fact_query_continuation(&connection, token, expected)
+    }
+
+    fn put_fact_query_continuation_if_absent(
+        &self,
+        continuation: FactQueryContinuationDraftV2,
+    ) -> KernelResult<PutFactQueryContinuationOutcomeV2> {
+        let (response, receiver) = mpsc::channel();
+        self.send(WriterCommand::PutFactQueryContinuation {
+            continuation,
+            response,
+        })?;
+        receive_response(
+            "put_fact_query_continuation_if_absent",
+            receiver,
+            &self.inner.faulted,
+        )
+    }
+
+    fn consume_fact_query_continuation(
+        &self,
+        token: FactQueryContinuationV2,
+        expected: FactQueryContinuationExpectationV2,
+        consumer: FactQueryContinuationConsumerV2,
+    ) -> KernelResult<ConsumeFactQueryContinuationOutcomeV2> {
+        let (response, receiver) = mpsc::channel();
+        self.send(WriterCommand::ConsumeFactQueryContinuation {
+            token,
+            expected,
+            consumer,
+            response,
+        })?;
+        receive_response(
+            "consume_fact_query_continuation",
+            receiver,
+            &self.inner.faulted,
+        )
     }
 
     fn snapshot(&self) -> KernelResult<FactStoreSnapshotV2> {
@@ -557,6 +901,31 @@ impl CanonicalFactReader {
         store_handle(&self.inner).get_by_fact_id(fact_id)
     }
 
+    pub fn get_public_command_receipt(
+        &self,
+        command_request_id: &CommandRequestId,
+    ) -> KernelResult<Option<PublicCommandReceiptV2>> {
+        store_handle(&self.inner).get_public_command_receipt(command_request_id)
+    }
+
+    /// Returns the private authority reconstruction snapshot. This API is for
+    /// Kernel runtime recovery only and is intentionally separate from facts.
+    pub fn authority_material_snapshot(&self) -> KernelResult<Vec<AuthorityMaterialRecordV2>> {
+        require_recovery(&self.inner, "authority_material_snapshot")?;
+        store_handle(&self.inner).authority_material_snapshot()
+    }
+
+    /// Read-only inspection of a continuation's durable scope and lifecycle.
+    /// This does not authorize page admission; authority code must use the
+    /// writer lease's atomic consume operation.
+    pub fn resolve_fact_query_continuation(
+        &self,
+        token: &FactQueryContinuationV2,
+        expected: &FactQueryContinuationExpectationV2,
+    ) -> KernelResult<ResolveFactQueryContinuationOutcomeV2> {
+        store_handle(&self.inner).resolve_fact_query_continuation(token, expected)
+    }
+
     pub fn snapshot(&self) -> KernelResult<FactStoreSnapshotV2> {
         require_recovery(&self.inner, "snapshot")?;
         store_handle(&self.inner).snapshot()
@@ -582,6 +951,65 @@ impl AuthorityFactWriterLease {
         drafts: Vec<KernelFactDraftV2>,
     ) -> KernelResult<Vec<KernelFactEnvelopeV2>> {
         store_handle(&self.inner).append_batch(drafts)
+    }
+
+    /// Atomically appends settlement facts and installs their private replay
+    /// receipt. An already-recorded matching request returns the stored receipt
+    /// without appending any of the supplied drafts.
+    pub fn append_with_public_command_receipt(
+        &self,
+        drafts: Vec<KernelFactDraftV2>,
+        receipt: PublicCommandReceiptV2,
+    ) -> KernelResult<AppendWithPublicCommandReceiptOutcomeV2> {
+        store_handle(&self.inner).append_with_public_command_receipt(drafts, receipt)
+    }
+
+    pub fn append_with_authority_material(
+        &self,
+        drafts: Vec<KernelFactDraftV2>,
+        mutations: Vec<AuthorityMaterialMutationV2>,
+    ) -> KernelResult<AppendWithAuthorityMaterialOutcomeV2> {
+        store_handle(&self.inner).append_with_authority_material(drafts, mutations)
+    }
+
+    pub fn append_with_public_receipt_and_authority_material(
+        &self,
+        drafts: Vec<KernelFactDraftV2>,
+        receipt: PublicCommandReceiptV2,
+        mutations: Vec<AuthorityMaterialMutationV2>,
+    ) -> KernelResult<AppendWithPublicReceiptAndAuthorityMaterialOutcomeV2> {
+        store_handle(&self.inner)
+            .append_with_public_receipt_and_authority_material(drafts, receipt, mutations)
+    }
+
+    /// Installs a private replay receipt only when its settlement fact already
+    /// exists. This is useful when recovering a fact committed by an older
+    /// process before it could install the receipt.
+    pub fn put_public_command_receipt_if_absent(
+        &self,
+        receipt: PublicCommandReceiptV2,
+    ) -> KernelResult<PutPublicCommandReceiptOutcomeV2> {
+        store_handle(&self.inner).put_public_command_receipt_if_absent(receipt)
+    }
+
+    pub fn put_fact_query_continuation_if_absent(
+        &self,
+        continuation: FactQueryContinuationDraftV2,
+    ) -> KernelResult<PutFactQueryContinuationOutcomeV2> {
+        store_handle(&self.inner).put_fact_query_continuation_if_absent(continuation)
+    }
+
+    /// Atomically consumes a continuation for one public command identity.
+    /// Repeating the same command identity is idempotent; a different command
+    /// cannot reuse the token. Runtime admission must use this method rather
+    /// than treating the reader's resolve result as a consumption grant.
+    pub fn consume_fact_query_continuation(
+        &self,
+        token: FactQueryContinuationV2,
+        expected: FactQueryContinuationExpectationV2,
+        consumer: FactQueryContinuationConsumerV2,
+    ) -> KernelResult<ConsumeFactQueryContinuationOutcomeV2> {
+        store_handle(&self.inner).consume_fact_query_continuation(token, expected, consumer)
     }
 }
 
@@ -699,6 +1127,7 @@ fn receive_response<T>(
 
 fn writer_main(
     target: DatabaseTarget,
+    initialize_schema: bool,
     receiver: Receiver<WriterCommand>,
     ready: SyncSender<KernelResult<()>>,
 ) {
@@ -709,7 +1138,7 @@ fn writer_main(
             return;
         }
     };
-    if let Err(error) = initialize_database(&mut connection, target.is_memory()) {
+    if let Err(error) = prepare_database(&mut connection, target.is_memory(), initialize_schema) {
         let _ = ready.send(Err(error));
         return;
     }
@@ -721,6 +1150,71 @@ fn writer_main(
         match command {
             WriterCommand::Append { drafts, response } => {
                 let _ = response.send(append_batch_transaction(&mut connection, drafts));
+            }
+            WriterCommand::AppendWithPublicCommandReceipt {
+                drafts,
+                receipt,
+                response,
+            } => {
+                let _ = response.send(append_with_public_command_receipt_transaction(
+                    &mut connection,
+                    drafts,
+                    receipt,
+                ));
+            }
+            WriterCommand::AppendWithAuthorityMaterial {
+                drafts,
+                mutations,
+                response,
+            } => {
+                let _ = response.send(append_with_authority_material_transaction(
+                    &mut connection,
+                    drafts,
+                    mutations,
+                ));
+            }
+            WriterCommand::AppendWithPublicReceiptAndAuthorityMaterial {
+                drafts,
+                receipt,
+                mutations,
+                response,
+            } => {
+                let _ = response.send(
+                    append_with_public_receipt_and_authority_material_transaction(
+                        &mut connection,
+                        drafts,
+                        receipt,
+                        mutations,
+                    ),
+                );
+            }
+            WriterCommand::PutPublicCommandReceipt { receipt, response } => {
+                let _ = response.send(put_public_command_receipt_transaction(
+                    &mut connection,
+                    receipt,
+                ));
+            }
+            WriterCommand::PutFactQueryContinuation {
+                continuation,
+                response,
+            } => {
+                let _ = response.send(put_fact_query_continuation_transaction(
+                    &mut connection,
+                    continuation,
+                ));
+            }
+            WriterCommand::ConsumeFactQueryContinuation {
+                token,
+                expected,
+                consumer,
+                response,
+            } => {
+                let _ = response.send(consume_fact_query_continuation_transaction(
+                    &mut connection,
+                    token,
+                    expected,
+                    consumer,
+                ));
             }
             WriterCommand::MarkPublished {
                 ledger_sequence,
@@ -784,7 +1278,135 @@ fn writer_main(
     }
 }
 
-fn initialize_database(connection: &mut Connection, is_memory: bool) -> KernelResult<()> {
+fn validate_existing_database_read_only(path: &Path) -> KernelResult<()> {
+    let uri = immutable_sqlite_uri(path)?;
+    let connection = Connection::open_with_flags(
+        uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| {
+        unsupported_existing_history_schema_error(
+            None,
+            None,
+            None,
+            format!("immutable read-only open failed: {error}"),
+        )
+    })?;
+    validate_current_database_schema(&connection)
+}
+
+fn immutable_sqlite_uri(path: &Path) -> KernelResult<String> {
+    let canonical = fs::canonicalize(path).map_err(|error| {
+        unsupported_existing_history_schema_error(
+            None,
+            None,
+            None,
+            format!("database path cannot be resolved without mutation: {error}"),
+        )
+    })?;
+    let value = canonical.to_str().ok_or_else(|| {
+        unsupported_existing_history_schema_error(
+            None,
+            None,
+            None,
+            "database path is not valid UTF-8 for immutable SQLite inspection".to_string(),
+        )
+    })?;
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(value.len() + 32);
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b':' | b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+            encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+    }
+    Ok(format!("file:{encoded}?mode=ro&immutable=1"))
+}
+
+fn validate_current_database_schema(connection: &Connection) -> KernelResult<()> {
+    let read_meta = |key: &str| {
+        connection
+            .query_row(
+                "SELECT value FROM schema_meta WHERE key = ?1",
+                params![key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+    };
+    let version = read_meta("schema_version").map_err(|error| {
+        unsupported_existing_history_schema_error(
+            None,
+            None,
+            None,
+            format!("schema_meta is unavailable: {error}"),
+        )
+    })?;
+    let contract = read_meta("schema_contract").map_err(|error| {
+        unsupported_existing_history_schema_error(
+            version.as_deref(),
+            None,
+            None,
+            format!("schema contract discriminator is unavailable: {error}"),
+        )
+    })?;
+    let abi_version = read_meta("abi_version").map_err(|error| {
+        unsupported_existing_history_schema_error(
+            version.as_deref(),
+            contract.as_deref(),
+            None,
+            format!("ABI discriminator is unavailable: {error}"),
+        )
+    })?;
+    if version.as_deref() != Some(SCHEMA_VERSION)
+        || contract.as_deref() != Some(SCHEMA_CONTRACT)
+        || abi_version.as_deref() != Some(KERNEL_ABI_V2_VERSION)
+    {
+        return Err(unsupported_existing_history_schema_error(
+            version.as_deref(),
+            contract.as_deref(),
+            abi_version.as_deref(),
+            "schema discriminator does not match the live v2 store".to_string(),
+        ));
+    }
+    validate_schema_contract(connection).map_err(|error| {
+        unsupported_existing_history_schema_error(
+            version.as_deref(),
+            contract.as_deref(),
+            abi_version.as_deref(),
+            format!("live schema contract validation failed: {error}"),
+        )
+    })?;
+    let integrity = connection
+        .query_row("PRAGMA quick_check(1)", [], |row| row.get::<_, String>(0))
+        .map_err(|error| {
+            unsupported_existing_history_schema_error(
+                version.as_deref(),
+                contract.as_deref(),
+                abi_version.as_deref(),
+                format!("read-only integrity check failed: {error}"),
+            )
+        })?;
+    if integrity != "ok" {
+        return Err(unsupported_existing_history_schema_error(
+            version.as_deref(),
+            contract.as_deref(),
+            abi_version.as_deref(),
+            format!("read-only integrity check returned {integrity}"),
+        ));
+    }
+    Ok(())
+}
+
+fn prepare_database(
+    connection: &mut Connection,
+    is_memory: bool,
+    initialize_schema: bool,
+) -> KernelResult<()> {
     connection
         .busy_timeout(BUSY_TIMEOUT)
         .map_err(|error| store_error("configure_busy_timeout", error))?;
@@ -839,12 +1461,13 @@ fn initialize_database(connection: &mut Connection, is_memory: bool) -> KernelRe
         ));
     }
 
-    let transaction = connection
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|error| store_error("begin_schema_initialization", error))?;
-    transaction
-        .execute_batch(
-            "CREATE TABLE IF NOT EXISTS schema_meta (
+    if initialize_schema {
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| store_error("begin_schema_initialization", error))?;
+        transaction
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS schema_meta (
                  key TEXT PRIMARY KEY NOT NULL,
                  value TEXT NOT NULL
              ) WITHOUT ROWID;
@@ -932,6 +1555,100 @@ fn initialize_database(connection: &mut Connection, is_memory: bool) -> KernelRe
                  state_json TEXT NOT NULL
              ) WITHOUT ROWID;
 
+             CREATE TABLE IF NOT EXISTS public_command_receipts (
+                 command_request_id TEXT PRIMARY KEY NOT NULL,
+                 command_request_digest TEXT NOT NULL,
+                 command_kind TEXT NOT NULL,
+                 run_id TEXT NOT NULL,
+                 reply_json TEXT NOT NULL,
+                 settlement_fact_id TEXT
+                     REFERENCES kernel_facts (fact_id) ON DELETE RESTRICT,
+                 recorded_at TEXT NOT NULL
+             ) WITHOUT ROWID;
+             CREATE INDEX IF NOT EXISTS public_command_receipts_run
+                 ON public_command_receipts (run_id, command_request_id);
+             CREATE TRIGGER IF NOT EXISTS public_command_receipts_reject_update
+             BEFORE UPDATE ON public_command_receipts
+             BEGIN
+                 SELECT RAISE(ABORT, 'public_command_receipts is append-only');
+             END;
+             CREATE TRIGGER IF NOT EXISTS public_command_receipts_reject_delete
+             BEFORE DELETE ON public_command_receipts
+             BEGIN
+                 SELECT RAISE(ABORT, 'public_command_receipts is append-only');
+             END;
+
+             CREATE TABLE IF NOT EXISTS fact_query_continuations (
+                 token_hash TEXT PRIMARY KEY NOT NULL,
+                 run_id TEXT NOT NULL,
+                 snapshot_high_water INTEGER NOT NULL,
+                 after_ledger_sequence INTEGER NOT NULL,
+                 created_at TEXT NOT NULL,
+                 expires_at TEXT NOT NULL
+             ) WITHOUT ROWID;
+             CREATE INDEX IF NOT EXISTS fact_query_continuations_expiry
+                 ON fact_query_continuations (expires_at);
+             CREATE INDEX IF NOT EXISTS fact_query_continuations_run
+                 ON fact_query_continuations (run_id);
+             CREATE TRIGGER IF NOT EXISTS fact_query_continuations_reject_update
+             BEFORE UPDATE ON fact_query_continuations
+             BEGIN
+                 SELECT RAISE(ABORT, 'fact_query_continuations is immutable');
+             END;
+
+             CREATE TABLE IF NOT EXISTS fact_query_continuation_consumptions (
+                 token_hash TEXT PRIMARY KEY NOT NULL
+                     REFERENCES fact_query_continuations (token_hash) ON DELETE RESTRICT,
+                 command_request_id TEXT NOT NULL,
+                 command_request_digest TEXT NOT NULL,
+                 consumed_at TEXT NOT NULL
+             ) WITHOUT ROWID;
+             CREATE TRIGGER IF NOT EXISTS fact_query_continuation_consumptions_reject_update
+             BEFORE UPDATE ON fact_query_continuation_consumptions
+             BEGIN
+                 SELECT RAISE(ABORT, 'fact_query_continuation_consumptions is append-only');
+             END;
+
+             CREATE TABLE IF NOT EXISTS authority_material (
+                 material_kind TEXT NOT NULL,
+                 material_id TEXT NOT NULL,
+                 run_id TEXT NOT NULL,
+                 control_epoch INTEGER NOT NULL,
+                 lifecycle TEXT NOT NULL,
+                 operation_id TEXT,
+                 invocation_id TEXT,
+                 lease_id TEXT,
+                 lease_version INTEGER,
+                 lease_scope_digest TEXT,
+                 payload_digest TEXT NOT NULL,
+                 payload_json TEXT NOT NULL,
+                 source_fact_id TEXT NOT NULL
+                     REFERENCES kernel_facts (fact_id) ON DELETE RESTRICT,
+                 last_fact_id TEXT NOT NULL
+                     REFERENCES kernel_facts (fact_id) ON DELETE RESTRICT,
+                 last_ledger_sequence INTEGER NOT NULL,
+                 PRIMARY KEY (material_kind, material_id),
+                 CHECK (
+                     (lease_id IS NULL AND lease_version IS NULL
+                         AND lease_scope_digest IS NULL)
+                     OR
+                     (lease_id IS NOT NULL AND lease_version IS NOT NULL
+                         AND lease_scope_digest IS NOT NULL)
+                 )
+             ) WITHOUT ROWID;
+             CREATE INDEX IF NOT EXISTS authority_material_run_epoch
+                 ON authority_material (
+                     run_id, control_epoch, material_kind, lifecycle
+                 );
+             CREATE INDEX IF NOT EXISTS authority_material_invocation
+                 ON authority_material (run_id, invocation_id)
+                 WHERE invocation_id IS NOT NULL;
+             CREATE TRIGGER IF NOT EXISTS authority_material_reject_delete
+             BEFORE DELETE ON authority_material
+             BEGIN
+                 SELECT RAISE(ABORT, 'authority_material lifecycle rows cannot be deleted');
+             END;
+
              CREATE TABLE IF NOT EXISTS outbox (
                  ledger_sequence INTEGER PRIMARY KEY NOT NULL
                      REFERENCES kernel_facts (ledger_sequence) ON DELETE RESTRICT,
@@ -941,16 +1658,39 @@ fn initialize_database(connection: &mut Connection, is_memory: bool) -> KernelRe
                  publish_attempts INTEGER NOT NULL DEFAULT 0,
                  last_error TEXT
              ) WITHOUT ROWID;",
-        )
-        .map_err(|error| store_error("create_schema", error))?;
+            )
+            .map_err(|error| store_error("create_schema", error))?;
 
-    initialize_or_validate_meta(&transaction, "schema_version", SCHEMA_VERSION)?;
-    initialize_or_validate_meta(&transaction, "schema_contract", SCHEMA_CONTRACT)?;
-    initialize_or_validate_meta(&transaction, "abi_version", KERNEL_ABI_V2_VERSION)?;
-    validate_schema_contract(&transaction)?;
-    transaction
-        .commit()
-        .map_err(|error| store_error("commit_schema_initialization", error))?;
+        initialize_or_validate_schema_meta(&transaction)?;
+        initialize_or_validate_meta(&transaction, "abi_version", KERNEL_ABI_V2_VERSION)?;
+        validate_schema_contract(&transaction)?;
+        transaction
+            .commit()
+            .map_err(|error| store_error("commit_schema_initialization", error))?;
+        if !is_memory {
+            let (busy, wal_frames, checkpointed_frames) = connection
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })
+                .map_err(|error| store_error("checkpoint_schema_initialization", error))?;
+            if busy != 0 || wal_frames != 0 || checkpointed_frames != 0 {
+                return Err(store_error_message(
+                    "checkpoint_schema_initialization",
+                    format!(
+                        "schema WAL checkpoint did not truncate cleanly \
+                         (busy={busy}, wal_frames={wal_frames}, \
+                         checkpointed_frames={checkpointed_frames})"
+                    ),
+                ));
+            }
+        }
+    } else {
+        validate_current_database_schema(connection)?;
+    }
 
     let integrity: String = connection
         .query_row("PRAGMA quick_check(1)", [], |row| row.get(0))
@@ -962,6 +1702,78 @@ fn initialize_database(connection: &mut Connection, is_memory: bool) -> KernelRe
         ));
     }
     Ok(())
+}
+
+fn initialize_or_validate_schema_meta(connection: &Connection) -> KernelResult<()> {
+    let read = |key: &str| {
+        connection
+            .query_row(
+                "SELECT value FROM schema_meta WHERE key = ?1",
+                params![key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| store_error("read_schema_meta", error))
+    };
+    let version = read("schema_version")?;
+    let contract = read("schema_contract")?;
+    match (version.as_deref(), contract.as_deref()) {
+        (None, None) => {
+            connection
+                .execute(
+                    "INSERT INTO schema_meta (key, value) VALUES
+                         ('schema_version', ?1),
+                         ('schema_contract', ?2)",
+                    params![SCHEMA_VERSION, SCHEMA_CONTRACT],
+                )
+                .map_err(|error| store_error("initialize_schema_meta", error))?;
+            Ok(())
+        }
+        (Some(SCHEMA_VERSION), Some(SCHEMA_CONTRACT)) => Ok(()),
+        (version, contract) => Err(unsupported_history_schema_error(version, contract)),
+    }
+}
+
+fn unsupported_history_schema_error(version: Option<&str>, contract: Option<&str>) -> KernelError {
+    let received = format!("version={version:?}, contract={contract:?}");
+    KernelError::Structured {
+        code: "unsupported_history_schema",
+        stage: "validate_schema_meta",
+        message: format!(
+            "unsupported Kernel history schema: expected version={SCHEMA_VERSION:?}, \
+             contract={SCHEMA_CONTRACT:?}; received {received}"
+        ),
+        details: serde_json::json!({
+            "expectedVersion": SCHEMA_VERSION,
+            "expectedContract": SCHEMA_CONTRACT,
+            "receivedVersion": version,
+            "receivedContract": contract,
+        }),
+    }
+}
+
+fn unsupported_existing_history_schema_error(
+    version: Option<&str>,
+    contract: Option<&str>,
+    abi_version: Option<&str>,
+    reason: String,
+) -> KernelError {
+    KernelError::Structured {
+        code: "unsupported_history_schema",
+        stage: "preflight_existing_schema",
+        message: format!(
+            "existing Kernel history is not the exact live schema and was not opened: {reason}"
+        ),
+        details: serde_json::json!({
+            "expectedVersion": SCHEMA_VERSION,
+            "expectedContract": SCHEMA_CONTRACT,
+            "expectedAbiVersion": KERNEL_ABI_V2_VERSION,
+            "receivedVersion": version,
+            "receivedContract": contract,
+            "receivedAbiVersion": abi_version,
+            "reason": reason,
+        }),
+    }
 }
 
 fn initialize_or_validate_meta(
@@ -1013,6 +1825,19 @@ fn validate_schema_contract(connection: &Connection) -> KernelResult<()> {
          FROM invocation_state LIMIT 0",
         "SELECT resource_id, run_id, status, last_ledger_sequence, state_json
          FROM resource_state LIMIT 0",
+        "SELECT command_request_id, command_request_digest, command_kind, run_id,
+                reply_json, settlement_fact_id, recorded_at
+         FROM public_command_receipts LIMIT 0",
+        "SELECT token_hash, run_id, snapshot_high_water,
+                after_ledger_sequence, created_at, expires_at
+         FROM fact_query_continuations LIMIT 0",
+        "SELECT token_hash, command_request_id, command_request_digest, consumed_at
+         FROM fact_query_continuation_consumptions LIMIT 0",
+        "SELECT material_kind, material_id, run_id, control_epoch, lifecycle,
+                operation_id, invocation_id, lease_id, lease_version,
+                lease_scope_digest, payload_digest, payload_json,
+                source_fact_id, last_fact_id, last_ledger_sequence
+         FROM authority_material LIMIT 0",
         "SELECT ledger_sequence, fact_id, envelope_json, published_at,
                 publish_attempts, last_error
          FROM outbox LIMIT 0",
@@ -1022,7 +1847,15 @@ fn validate_schema_contract(connection: &Connection) -> KernelResult<()> {
             .prepare(query)
             .map_err(|error| store_error("validate_schema_contract", error))?;
     }
-    for trigger in ["kernel_facts_reject_update", "kernel_facts_reject_delete"] {
+    for trigger in [
+        "kernel_facts_reject_update",
+        "kernel_facts_reject_delete",
+        "public_command_receipts_reject_update",
+        "public_command_receipts_reject_delete",
+        "fact_query_continuations_reject_update",
+        "fact_query_continuation_consumptions_reject_update",
+        "authority_material_reject_delete",
+    ] {
         let exists: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'trigger' AND name = ?1",
@@ -1034,6 +1867,24 @@ fn validate_schema_contract(connection: &Connection) -> KernelResult<()> {
             return Err(store_error_message(
                 "validate_append_only_trigger",
                 format!("required append-only trigger {trigger} is missing"),
+            ));
+        }
+    }
+    for trigger in [
+        "fact_query_continuations_reject_delete",
+        "fact_query_continuation_consumptions_reject_delete",
+    ] {
+        let exists: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'trigger' AND name = ?1",
+                params![trigger],
+                |row| row.get(0),
+            )
+            .map_err(|error| store_error("validate_forbidden_trigger", error))?;
+        if exists != 0 {
+            return Err(store_error_message(
+                "validate_forbidden_trigger",
+                format!("obsolete trigger {trigger} changes the live private-store contract"),
             ));
         }
     }
@@ -1061,15 +1912,31 @@ fn append_batch_transaction(
     connection: &mut Connection,
     drafts: Vec<KernelFactDraftV2>,
 ) -> KernelResult<Vec<KernelFactEnvelopeV2>> {
-    for draft in &drafts {
+    validate_fact_drafts(&drafts)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| store_error("begin_append", error))?;
+    let envelopes = append_batch_in_transaction(&transaction, drafts)?;
+    transaction
+        .commit()
+        .map_err(|error| store_error("commit_append", error))?;
+    Ok(envelopes)
+}
+
+fn validate_fact_drafts(drafts: &[KernelFactDraftV2]) -> KernelResult<()> {
+    for draft in drafts {
         draft
             .payload
             .validate()
             .map_err(|error| invalid_fact_error("validate_fact_draft", error.to_string()))?;
     }
-    let transaction = connection
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|error| store_error("begin_append", error))?;
+    Ok(())
+}
+
+fn append_batch_in_transaction(
+    transaction: &Transaction<'_>,
+    drafts: Vec<KernelFactDraftV2>,
+) -> KernelResult<Vec<KernelFactEnvelopeV2>> {
     let global_high_water = transaction
         .query_row(
             "SELECT COALESCE(MAX(ledger_sequence), 0) FROM kernel_facts",
@@ -1127,15 +1994,1385 @@ fn append_batch_transaction(
         envelope
             .validate()
             .map_err(|error| invalid_fact_error("assign_fact_sequences", error.to_string()))?;
-        persist_envelope(&transaction, &envelope)?;
+        persist_envelope(transaction, &envelope)?;
         run_high_waters.insert(run_id, run_sequence);
         envelopes.push(envelope);
     }
+    Ok(envelopes)
+}
 
+fn append_with_public_command_receipt_transaction(
+    connection: &mut Connection,
+    drafts: Vec<KernelFactDraftV2>,
+    mut receipt: PublicCommandReceiptV2,
+) -> KernelResult<AppendWithPublicCommandReceiptOutcomeV2> {
+    validate_fact_drafts(&drafts)?;
+    if let Some(first) = drafts.first() {
+        let draft_run_id = first.payload.run_id();
+        if drafts
+            .iter()
+            .any(|draft| draft.payload.run_id() != draft_run_id)
+        {
+            return Err(store_error_message(
+                "append_with_public_command_receipt",
+                "one public command cannot append facts for multiple runs",
+            ));
+        }
+        match &receipt.run_id {
+            Some(receipt_run_id) if receipt_run_id != draft_run_id => {
+                return Err(store_error_message(
+                    "append_with_public_command_receipt",
+                    "receipt runId does not match its canonical fact batch",
+                ));
+            }
+            Some(_) => {}
+            None => receipt.run_id = Some(draft_run_id.clone()),
+        }
+    }
+    validate_public_command_receipt(&receipt)?;
+    if receipt.command_kind == "runOpen" && receipt.settlement_fact_id.is_none() {
+        return Err(store_error_message(
+            "append_with_public_command_receipt",
+            "runOpen must identify its durable RunOpened settlement fact",
+        ));
+    }
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| store_error("begin_append_with_public_command_receipt", error))?;
+
+    if let Some(existing) = read_public_command_receipt(&transaction, &receipt.command_request_id)?
+    {
+        let outcome = compare_public_command_receipt(existing, &receipt);
+        transaction
+            .commit()
+            .map_err(|error| store_error("commit_public_command_receipt_replay", error))?;
+        return Ok(AppendWithPublicCommandReceiptOutcomeV2 {
+            facts: Vec::new(),
+            receipt: outcome,
+        });
+    }
+
+    let facts = append_batch_in_transaction(&transaction, drafts)?;
+    let receipt = put_public_command_receipt_in_transaction(&transaction, receipt)?;
     transaction
         .commit()
-        .map_err(|error| store_error("commit_append", error))?;
-    Ok(envelopes)
+        .map_err(|error| store_error("commit_append_with_public_command_receipt", error))?;
+    Ok(AppendWithPublicCommandReceiptOutcomeV2 { facts, receipt })
+}
+
+fn append_with_authority_material_transaction(
+    connection: &mut Connection,
+    drafts: Vec<KernelFactDraftV2>,
+    mutations: Vec<AuthorityMaterialMutationV2>,
+) -> KernelResult<AppendWithAuthorityMaterialOutcomeV2> {
+    validate_fact_drafts(&drafts)?;
+    validate_authority_material_mutations(&mutations, drafts.len())?;
+    if drafts.is_empty() {
+        return Err(store_error_message(
+            "append_with_authority_material",
+            "authority material mutations require at least one canonical fact",
+        ));
+    }
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| store_error("begin_append_with_authority_material", error))?;
+    let facts = append_batch_in_transaction(&transaction, drafts)?;
+    apply_authority_material_mutations(&transaction, &facts, mutations)?;
+    transaction
+        .commit()
+        .map_err(|error| store_error("commit_append_with_authority_material", error))?;
+    Ok(AppendWithAuthorityMaterialOutcomeV2 { facts })
+}
+
+fn append_with_public_receipt_and_authority_material_transaction(
+    connection: &mut Connection,
+    drafts: Vec<KernelFactDraftV2>,
+    mut receipt: PublicCommandReceiptV2,
+    mutations: Vec<AuthorityMaterialMutationV2>,
+) -> KernelResult<AppendWithPublicReceiptAndAuthorityMaterialOutcomeV2> {
+    validate_fact_drafts(&drafts)?;
+    validate_authority_material_mutations(&mutations, drafts.len())?;
+    if drafts.is_empty() {
+        return Err(store_error_message(
+            "append_with_public_receipt_and_authority_material",
+            "authority material mutations require at least one canonical fact",
+        ));
+    }
+    let first_run_id = drafts
+        .first()
+        .map(|draft| draft.payload.run_id().clone())
+        .ok_or_else(|| store_error_message(
+            "append_with_public_receipt_and_authority_material",
+            "canonical fact batch must not be empty",
+        ))?;
+    if drafts
+        .iter()
+        .any(|draft| draft.payload.run_id() != &first_run_id)
+    {
+        return Err(store_error_message(
+            "append_with_public_receipt_and_authority_material",
+            "one public command cannot append facts for multiple runs",
+        ));
+    }
+    match &receipt.run_id {
+        Some(run_id) if run_id != &first_run_id => {
+            return Err(store_error_message(
+                "append_with_public_receipt_and_authority_material",
+                "receipt runId does not match its canonical fact batch",
+            ));
+        }
+        Some(_) => {}
+        None => receipt.run_id = Some(first_run_id),
+    }
+    validate_public_command_receipt(&receipt)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| {
+            store_error(
+                "begin_append_with_public_receipt_and_authority_material",
+                error,
+            )
+        })?;
+    if let Some(existing) = read_public_command_receipt(&transaction, &receipt.command_request_id)?
+    {
+        let outcome = compare_public_command_receipt(existing, &receipt);
+        transaction.commit().map_err(|error| {
+            store_error(
+                "commit_public_receipt_and_authority_material_replay",
+                error,
+            )
+        })?;
+        return Ok(AppendWithPublicReceiptAndAuthorityMaterialOutcomeV2 {
+            facts: Vec::new(),
+            receipt: outcome,
+        });
+    }
+    let facts = append_batch_in_transaction(&transaction, drafts)?;
+    apply_authority_material_mutations(&transaction, &facts, mutations)?;
+    let receipt = put_public_command_receipt_in_transaction(&transaction, receipt)?;
+    transaction.commit().map_err(|error| {
+        store_error(
+            "commit_append_with_public_receipt_and_authority_material",
+            error,
+        )
+    })?;
+    Ok(AppendWithPublicReceiptAndAuthorityMaterialOutcomeV2 { facts, receipt })
+}
+
+fn validate_authority_material_mutations(
+    mutations: &[AuthorityMaterialMutationV2],
+    fact_count: usize,
+) -> KernelResult<()> {
+    for mutation in mutations {
+        match mutation {
+            AuthorityMaterialMutationV2::Put {
+                material,
+                fact_index,
+            } => {
+                validate_authority_material_draft(material)?;
+                validate_authority_material_fact_index(*fact_index, fact_count)?;
+            }
+            AuthorityMaterialMutationV2::Replace {
+                expected_lifecycle,
+                expected_payload_digest,
+                material,
+                fact_index,
+            } => {
+                validate_authority_material_token("expectedLifecycle", expected_lifecycle)?;
+                if let Some(digest) = expected_payload_digest {
+                    validate_sha256_text("expectedPayloadDigest", digest)?;
+                }
+                validate_authority_material_draft(material)?;
+                validate_authority_material_fact_index(*fact_index, fact_count)?;
+            }
+            AuthorityMaterialMutationV2::TransitionRunEpoch {
+                through_control_epoch,
+                expected_lifecycles,
+                next_lifecycle,
+                fact_index,
+                ..
+            } => {
+                if *through_control_epoch == 0 || expected_lifecycles.is_empty() {
+                    return Err(store_error_message(
+                        "validate_authority_material_mutation",
+                        "run-epoch transition requires a non-zero epoch and lifecycle set",
+                    ));
+                }
+                for lifecycle in expected_lifecycles {
+                    validate_authority_material_token("expectedLifecycle", lifecycle)?;
+                }
+                validate_authority_material_token("nextLifecycle", next_lifecycle)?;
+                validate_authority_material_fact_index(*fact_index, fact_count)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_authority_material_fact_index(
+    fact_index: usize,
+    fact_count: usize,
+) -> KernelResult<()> {
+    if fact_index >= fact_count {
+        Err(store_error_message(
+            "validate_authority_material_mutation",
+            "authority material factIndex is outside its canonical fact batch",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_authority_material_draft(material: &AuthorityMaterialDraftV2) -> KernelResult<()> {
+    validate_authority_material_token("materialKind", &material.material_kind)?;
+    validate_authority_material_token("materialId", &material.material_id)?;
+    validate_authority_material_token("lifecycle", &material.lifecycle)?;
+    if material.control_epoch == 0 {
+        return Err(store_error_message(
+            "validate_authority_material",
+            "controlEpoch must be greater than zero",
+        ));
+    }
+    if !material.payload_json.is_object() {
+        return Err(store_error_message(
+            "validate_authority_material",
+            "payloadJson must be an object",
+        ));
+    }
+    if contains_ephemeral_capability(&material.payload_json) {
+        return Err(store_error_message(
+            "validate_authority_material",
+            "payloadJson must not contain an ephemeral capability or credential",
+        ));
+    }
+    let encoded = serde_json::to_vec(&material.payload_json)
+        .map_err(|error| store_error_message("encode_authority_material", error.to_string()))?;
+    if encoded.len() > MAX_AUTHORITY_MATERIAL_PAYLOAD_BYTES {
+        return Err(store_error_message(
+            "validate_authority_material",
+            format!(
+                "payloadJson exceeds the {MAX_AUTHORITY_MATERIAL_PAYLOAD_BYTES} byte boundary"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_authority_material_token(field: &str, value: &str) -> KernelResult<()> {
+    if value.is_empty()
+        || value.len() > MAX_AUTHORITY_MATERIAL_TOKEN_BYTES
+        || !value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':')
+        })
+    {
+        Err(store_error_message(
+            "validate_authority_material",
+            format!(
+                "{field} must be a 1..={MAX_AUTHORITY_MATERIAL_TOKEN_BYTES} byte ASCII token"
+            ),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_sha256_text(field: &str, value: &str) -> KernelResult<()> {
+    if value.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    }) {
+        Ok(())
+    } else {
+        Err(store_error_message(
+            "validate_authority_material",
+            format!("{field} must be sha256:<64 lowercase hex>"),
+        ))
+    }
+}
+
+fn authority_material_payload_digest(
+    material_kind: &str,
+    material_id: &str,
+    payload_json: &serde_json::Value,
+) -> KernelResult<String> {
+    query_digest_v2(&serde_json::json!({
+        "domain": "deepcode.kernel.authority-material.v2",
+        "materialKind": material_kind,
+        "materialId": material_id,
+        "payload": payload_json,
+    }))
+    .map(|digest| digest.as_str().to_owned())
+    .map_err(|error| invalid_fact_error("digest_authority_material", error.to_string()))
+}
+
+fn apply_authority_material_mutations(
+    transaction: &Transaction<'_>,
+    facts: &[KernelFactEnvelopeV2],
+    mutations: Vec<AuthorityMaterialMutationV2>,
+) -> KernelResult<()> {
+    for mutation in mutations {
+        match mutation {
+            AuthorityMaterialMutationV2::Put {
+                material,
+                fact_index,
+            } => {
+                let fact = &facts[fact_index];
+                require_authority_material_fact_run(&material.run_id, fact)?;
+                insert_authority_material(transaction, material, fact)?;
+            }
+            AuthorityMaterialMutationV2::Replace {
+                expected_lifecycle,
+                expected_payload_digest,
+                material,
+                fact_index,
+            } => {
+                let fact = &facts[fact_index];
+                require_authority_material_fact_run(&material.run_id, fact)?;
+                replace_authority_material(
+                    transaction,
+                    expected_lifecycle,
+                    expected_payload_digest,
+                    material,
+                    fact,
+                )?;
+            }
+            AuthorityMaterialMutationV2::TransitionRunEpoch {
+                run_id,
+                through_control_epoch,
+                expected_lifecycles,
+                next_lifecycle,
+                fact_index,
+            } => {
+                let fact = &facts[fact_index];
+                require_authority_material_fact_run(&run_id, fact)?;
+                transition_authority_material_run_epoch(
+                    transaction,
+                    &run_id,
+                    through_control_epoch,
+                    &expected_lifecycles,
+                    &next_lifecycle,
+                    fact,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn require_authority_material_fact_run(
+    run_id: &RunId,
+    fact: &KernelFactEnvelopeV2,
+) -> KernelResult<()> {
+    if fact.payload.run_id() == run_id {
+        Ok(())
+    } else {
+        Err(store_error_message(
+            "apply_authority_material",
+            "authority material and its causal fact must belong to the same run",
+        ))
+    }
+}
+
+fn insert_authority_material(
+    transaction: &Transaction<'_>,
+    material: AuthorityMaterialDraftV2,
+    fact: &KernelFactEnvelopeV2,
+) -> KernelResult<()> {
+    let payload_digest = authority_material_payload_digest(
+        &material.material_kind,
+        &material.material_id,
+        &material.payload_json,
+    )?;
+    let payload_json = serde_json::to_string(&material.payload_json)
+        .map_err(|error| store_error_message("encode_authority_material", error.to_string()))?;
+    let changed = transaction
+        .execute(
+            "INSERT INTO authority_material (
+                 material_kind, material_id, run_id, control_epoch, lifecycle,
+                 operation_id, invocation_id, lease_id, lease_version,
+                 lease_scope_digest, payload_digest, payload_json,
+                 source_fact_id, last_fact_id, last_ledger_sequence
+             ) VALUES (
+                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                 ?13, ?13, ?14
+             )",
+            params![
+                material.material_kind,
+                material.material_id,
+                material.run_id.as_str(),
+                sqlite_integer(material.control_epoch, "controlEpoch")?,
+                material.lifecycle,
+                material.operation_id.as_ref().map(|value| value.as_str()),
+                material.invocation_id.as_ref().map(|value| value.as_str()),
+                material.lease.as_ref().map(|value| value.lease_id.as_str()),
+                material
+                    .lease
+                    .as_ref()
+                    .map(|value| sqlite_integer(value.version.get(), "leaseVersion"))
+                    .transpose()?,
+                material
+                    .lease
+                    .as_ref()
+                    .map(|value| value.scope_digest.as_str()),
+                payload_digest,
+                payload_json,
+                fact.fact_id.as_str(),
+                sqlite_integer(fact.ledger_sequence, "lastLedgerSequence")?,
+            ],
+        )
+        .map_err(|error| store_error("insert_authority_material", error))?;
+    if changed != 1 {
+        return Err(store_error_message(
+            "insert_authority_material",
+            "authority material insert did not affect exactly one row",
+        ));
+    }
+    Ok(())
+}
+
+fn replace_authority_material(
+    transaction: &Transaction<'_>,
+    expected_lifecycle: String,
+    expected_payload_digest: Option<String>,
+    material: AuthorityMaterialDraftV2,
+    fact: &KernelFactEnvelopeV2,
+) -> KernelResult<()> {
+    let existing = read_authority_material_record(
+        transaction,
+        &material.material_kind,
+        &material.material_id,
+    )?
+    .ok_or_else(|| {
+        store_error_message(
+            "replace_authority_material",
+            "authority material identity does not exist",
+        )
+    })?;
+    if existing.lifecycle != expected_lifecycle
+        || expected_payload_digest
+            .as_ref()
+            .is_some_and(|digest| digest != &existing.payload_digest)
+        || existing.run_id != material.run_id
+        || existing.control_epoch != material.control_epoch
+        || existing.operation_id != material.operation_id
+        || existing.invocation_id != material.invocation_id
+    {
+        return Err(store_error_message(
+            "replace_authority_material",
+            "authority material compare-and-set precondition failed",
+        ));
+    }
+    let payload_digest = authority_material_payload_digest(
+        &material.material_kind,
+        &material.material_id,
+        &material.payload_json,
+    )?;
+    let payload_json = serde_json::to_string(&material.payload_json)
+        .map_err(|error| store_error_message("encode_authority_material", error.to_string()))?;
+    let changed = transaction
+        .execute(
+            "UPDATE authority_material
+             SET lifecycle = ?3,
+                 lease_id = ?4,
+                 lease_version = ?5,
+                 lease_scope_digest = ?6,
+                 payload_digest = ?7,
+                 payload_json = ?8,
+                 last_fact_id = ?9,
+                 last_ledger_sequence = ?10
+             WHERE material_kind = ?1 AND material_id = ?2
+               AND lifecycle = ?11 AND payload_digest = ?12",
+            params![
+                material.material_kind,
+                material.material_id,
+                material.lifecycle,
+                material.lease.as_ref().map(|value| value.lease_id.as_str()),
+                material
+                    .lease
+                    .as_ref()
+                    .map(|value| sqlite_integer(value.version.get(), "leaseVersion"))
+                    .transpose()?,
+                material
+                    .lease
+                    .as_ref()
+                    .map(|value| value.scope_digest.as_str()),
+                payload_digest,
+                payload_json,
+                fact.fact_id.as_str(),
+                sqlite_integer(fact.ledger_sequence, "lastLedgerSequence")?,
+                expected_lifecycle,
+                existing.payload_digest,
+            ],
+        )
+        .map_err(|error| store_error("replace_authority_material", error))?;
+    if changed != 1 {
+        return Err(store_error_message(
+            "replace_authority_material",
+            "authority material compare-and-set lost its transaction precondition",
+        ));
+    }
+    Ok(())
+}
+
+fn transition_authority_material_run_epoch(
+    transaction: &Transaction<'_>,
+    run_id: &RunId,
+    through_control_epoch: u64,
+    expected_lifecycles: &[String],
+    next_lifecycle: &str,
+    fact: &KernelFactEnvelopeV2,
+) -> KernelResult<()> {
+    let placeholders = (0..expected_lifecycles.len())
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(", ");
+    let statement = format!(
+        "UPDATE authority_material
+         SET lifecycle = ?1, last_fact_id = ?2, last_ledger_sequence = ?3
+         WHERE run_id = ?4 AND control_epoch <= ?5
+           AND lifecycle IN ({placeholders})"
+    );
+    let mut values = vec![
+        SqlValue::Text(next_lifecycle.to_owned()),
+        SqlValue::Text(fact.fact_id.to_string()),
+        SqlValue::Integer(sqlite_integer(
+            fact.ledger_sequence,
+            "lastLedgerSequence",
+        )?),
+        SqlValue::Text(run_id.to_string()),
+        SqlValue::Integer(sqlite_integer(
+            through_control_epoch,
+            "throughControlEpoch",
+        )?),
+    ];
+    values.extend(expected_lifecycles.iter().cloned().map(SqlValue::Text));
+    transaction
+        .execute(&statement, params_from_iter(values))
+        .map_err(|error| store_error("transition_authority_material_run_epoch", error))?;
+    Ok(())
+}
+
+fn read_authority_material_record(
+    connection: &Connection,
+    material_kind: &str,
+    material_id: &str,
+) -> KernelResult<Option<AuthorityMaterialRecordV2>> {
+    Ok(read_authority_material_snapshot(connection)?
+        .into_iter()
+        .find(|record| {
+            record.material_kind == material_kind && record.material_id == material_id
+        }))
+}
+
+fn read_authority_material_snapshot(
+    connection: &Connection,
+) -> KernelResult<Vec<AuthorityMaterialRecordV2>> {
+    let mut statement = connection
+        .prepare(
+            "SELECT material.material_kind, material.material_id, material.run_id,
+                    material.control_epoch, material.lifecycle, material.operation_id,
+                    material.invocation_id, material.lease_id, material.lease_version,
+                    material.lease_scope_digest, material.payload_digest,
+                    material.payload_json, material.source_fact_id,
+                    material.last_fact_id, material.last_ledger_sequence,
+                    source.run_id, source.ledger_sequence,
+                    latest.run_id, latest.ledger_sequence
+             FROM authority_material AS material
+             JOIN kernel_facts AS source
+               ON source.fact_id = material.source_fact_id
+             JOIN kernel_facts AS latest
+               ON latest.fact_id = material.last_fact_id
+             ORDER BY material.run_id, material.control_epoch,
+                      material.material_kind, material.material_id",
+        )
+        .map_err(|error| store_error("prepare_authority_material_snapshot", error))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<i64>>(8)?,
+                row.get::<_, Option<String>>(9)?,
+                row.get::<_, String>(10)?,
+                row.get::<_, String>(11)?,
+                row.get::<_, String>(12)?,
+                row.get::<_, String>(13)?,
+                row.get::<_, i64>(14)?,
+                row.get::<_, String>(15)?,
+                row.get::<_, i64>(16)?,
+                row.get::<_, String>(17)?,
+                row.get::<_, i64>(18)?,
+            ))
+        })
+        .map_err(|error| store_error("query_authority_material_snapshot", error))?;
+    let mut records = Vec::new();
+    for row in rows {
+        let (
+            material_kind,
+            material_id,
+            run_id,
+            control_epoch,
+            lifecycle,
+            operation_id,
+            invocation_id,
+            lease_id,
+            lease_version,
+            lease_scope_digest,
+            payload_digest,
+            payload_json,
+            source_fact_id,
+            last_fact_id,
+            last_ledger_sequence,
+            source_run_id,
+            source_ledger_sequence,
+            last_run_id,
+            canonical_last_ledger_sequence,
+        ) = row.map_err(|error| store_error("read_authority_material_snapshot", error))?;
+        validate_authority_material_token("materialKind", &material_kind)?;
+        validate_authority_material_token("materialId", &material_id)?;
+        validate_authority_material_token("lifecycle", &lifecycle)?;
+        validate_sha256_text("payloadDigest", &payload_digest)?;
+        let run_id = RunId::new(run_id).map_err(|error| {
+            invalid_fact_error("decode_authority_material", error.to_string())
+        })?;
+        if source_run_id != run_id.as_str() || last_run_id != run_id.as_str() {
+            return Err(store_error_message(
+                "decode_authority_material",
+                "authority material causal facts belong to a different run",
+            ));
+        }
+        let control_epoch = sqlite_u64(control_epoch, "controlEpoch")?;
+        if control_epoch == 0 {
+            return Err(store_error_message(
+                "decode_authority_material",
+                "authority material controlEpoch must be greater than zero",
+            ));
+        }
+        let source_ledger_sequence =
+            sqlite_u64(source_ledger_sequence, "sourceLedgerSequence")?;
+        let last_ledger_sequence =
+            sqlite_u64(last_ledger_sequence, "lastLedgerSequence")?;
+        let canonical_last_ledger_sequence =
+            sqlite_u64(canonical_last_ledger_sequence, "canonicalLastLedgerSequence")?;
+        if last_ledger_sequence != canonical_last_ledger_sequence
+            || last_ledger_sequence < source_ledger_sequence
+        {
+            return Err(store_error_message(
+                "decode_authority_material",
+                "authority material fact lineage or ledger sequence is inconsistent",
+            ));
+        }
+        let payload_json: serde_json::Value =
+            serde_json::from_str(&payload_json).map_err(|error| {
+                store_error_message("decode_authority_material_payload", error.to_string())
+            })?;
+        let draft = AuthorityMaterialDraftV2 {
+            material_kind: material_kind.clone(),
+            material_id: material_id.clone(),
+            run_id: run_id.clone(),
+            control_epoch,
+            lifecycle: lifecycle.clone(),
+            operation_id: operation_id
+                .map(deepcode_kernel_abi::v2::OperationId::new)
+                .transpose()
+                .map_err(|error| {
+                    invalid_fact_error("decode_authority_material", error.to_string())
+                })?,
+            invocation_id: invocation_id
+                .map(deepcode_kernel_abi::v2::InvocationId::new)
+                .transpose()
+                .map_err(|error| {
+                    invalid_fact_error("decode_authority_material", error.to_string())
+                })?,
+            lease: match (lease_id, lease_version, lease_scope_digest) {
+                (None, None, None) => None,
+                (Some(lease_id), Some(lease_version), Some(scope_digest)) => {
+                    Some(CapabilityLeaseRefV2 {
+                        lease_id: CapabilityLeaseIdV2::new(lease_id).map_err(|error| {
+                            invalid_fact_error(
+                                "decode_authority_material",
+                                error.to_string(),
+                            )
+                        })?,
+                        version: CapabilityLeaseVersionV2::new(sqlite_u64(
+                            lease_version,
+                            "leaseVersion",
+                        )?)
+                        .map_err(|error| {
+                            invalid_fact_error(
+                                "decode_authority_material",
+                                error.to_string(),
+                            )
+                        })?,
+                        scope_digest: CapabilityScopeDigestV2::parse(scope_digest).map_err(
+                            |error| {
+                                invalid_fact_error(
+                                    "decode_authority_material",
+                                    error.to_string(),
+                                )
+                            },
+                        )?,
+                    })
+                }
+                _ => {
+                    return Err(store_error_message(
+                        "decode_authority_material",
+                        "partial capability lease identity is forbidden",
+                    ))
+                }
+            },
+            payload_json: payload_json.clone(),
+        };
+        validate_authority_material_draft(&draft)?;
+        let computed_digest =
+            authority_material_payload_digest(&material_kind, &material_id, &payload_json)?;
+        if computed_digest != payload_digest {
+            return Err(store_error_message(
+                "decode_authority_material",
+                "authority material payload digest does not match payloadJson",
+            ));
+        }
+        records.push(AuthorityMaterialRecordV2 {
+            material_kind,
+            material_id,
+            run_id,
+            control_epoch,
+            lifecycle,
+            operation_id: draft.operation_id,
+            invocation_id: draft.invocation_id,
+            lease: draft.lease,
+            payload_digest,
+            payload_json,
+            source_fact_id: FactId::new(source_fact_id).map_err(|error| {
+                invalid_fact_error("decode_authority_material", error.to_string())
+            })?,
+            last_fact_id: FactId::new(last_fact_id).map_err(|error| {
+                invalid_fact_error("decode_authority_material", error.to_string())
+            })?,
+            last_ledger_sequence,
+        });
+    }
+    Ok(records)
+}
+
+fn put_public_command_receipt_transaction(
+    connection: &mut Connection,
+    receipt: PublicCommandReceiptV2,
+) -> KernelResult<PutPublicCommandReceiptOutcomeV2> {
+    validate_public_command_receipt(&receipt)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| store_error("begin_put_public_command_receipt", error))?;
+    let outcome = put_public_command_receipt_in_transaction(&transaction, receipt)?;
+    transaction
+        .commit()
+        .map_err(|error| store_error("commit_put_public_command_receipt", error))?;
+    Ok(outcome)
+}
+
+fn put_public_command_receipt_in_transaction(
+    transaction: &Transaction<'_>,
+    mut receipt: PublicCommandReceiptV2,
+) -> KernelResult<PutPublicCommandReceiptOutcomeV2> {
+    if let Some(existing) = read_public_command_receipt(transaction, &receipt.command_request_id)? {
+        return Ok(compare_public_command_receipt(existing, &receipt));
+    }
+
+    if let Some(settlement_fact_id) = &receipt.settlement_fact_id {
+        let settlement_json = transaction
+            .query_row(
+                "SELECT envelope_json FROM kernel_facts WHERE fact_id = ?1",
+                params![settlement_fact_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| store_error("read_receipt_settlement_fact", error))?
+            .ok_or_else(|| {
+                store_error_message(
+                    "validate_public_command_receipt",
+                    "settlementFactId does not identify a durable Kernel fact",
+                )
+            })?;
+        let settlement = decode_envelope(&settlement_json, "decode_receipt_settlement_fact")?;
+        if receipt.command_kind == "runOpen" {
+            let KernelFactPayloadV2::Control(ControlFactV2::RunOpened {
+                public_request_id,
+                public_request_digest,
+                ..
+            }) = &settlement.payload
+            else {
+                return Err(store_error_message(
+                    "validate_public_command_receipt",
+                    "runOpen settlementFactId must identify its RunOpened fact",
+                ));
+            };
+            if public_request_id != &receipt.command_request_id
+                || public_request_digest != &receipt.command_request_digest
+            {
+                return Err(store_error_message(
+                    "validate_public_command_receipt",
+                    "runOpen receipt identity does not match its RunOpened fact",
+                ));
+            }
+        }
+        let settlement_run_id = settlement.payload.run_id();
+        if let Some(run_id) = &receipt.run_id {
+            if run_id != settlement_run_id {
+                return Err(store_error_message(
+                    "validate_public_command_receipt",
+                    "receipt runId does not match its settlement fact",
+                ));
+            }
+        } else {
+            receipt.run_id = Some(settlement_run_id.clone());
+        }
+    }
+    if receipt.run_id.is_none() {
+        return Err(store_error_message(
+            "validate_public_command_receipt",
+            "runId is required for every durable public command receipt",
+        ));
+    }
+
+    let encoded = serde_json::to_string(&receipt.reply_json)
+        .map_err(|error| store_error_message("encode_public_command_reply", error.to_string()))?;
+    transaction
+        .execute(
+            "INSERT INTO public_command_receipts (
+                 command_request_id, command_request_digest, command_kind, run_id,
+                 reply_json, settlement_fact_id, recorded_at
+             ) VALUES (
+                 ?1, ?2, ?3, ?4, ?5, ?6, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             )",
+            params![
+                receipt.command_request_id.as_str(),
+                receipt.command_request_digest.as_str(),
+                receipt.command_kind.as_str(),
+                receipt.run_id.as_ref().map(RunId::as_str),
+                encoded,
+                receipt.settlement_fact_id.as_ref().map(FactId::as_str),
+            ],
+        )
+        .map_err(|error| store_error("insert_public_command_receipt", error))?;
+    Ok(PutPublicCommandReceiptOutcomeV2::Inserted(receipt))
+}
+
+fn compare_public_command_receipt(
+    existing: PublicCommandReceiptV2,
+    submitted: &PublicCommandReceiptV2,
+) -> PutPublicCommandReceiptOutcomeV2 {
+    if existing.command_request_digest == submitted.command_request_digest {
+        PutPublicCommandReceiptOutcomeV2::ExistingSame(existing)
+    } else {
+        PutPublicCommandReceiptOutcomeV2::DigestConflict {
+            command_request_id: existing.command_request_id,
+            existing: existing.command_request_digest,
+            submitted: submitted.command_request_digest.clone(),
+        }
+    }
+}
+
+fn read_public_command_receipt(
+    connection: &Connection,
+    command_request_id: &CommandRequestId,
+) -> KernelResult<Option<PublicCommandReceiptV2>> {
+    let row = connection
+        .query_row(
+            "SELECT command_request_digest, command_kind, run_id, reply_json,
+                    settlement_fact_id
+             FROM public_command_receipts
+             WHERE command_request_id = ?1",
+            params![command_request_id.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| store_error("read_public_command_receipt", error))?;
+    let Some((digest, command_kind, run_id, reply_json, settlement_fact_id)) = row else {
+        return Ok(None);
+    };
+    let receipt =
+        PublicCommandReceiptV2 {
+            command_request_id: command_request_id.clone(),
+            command_request_digest: CommandRequestDigestV2::parse(digest).map_err(|error| {
+                invalid_fact_error("decode_public_command_receipt", error.to_string())
+            })?,
+            command_kind,
+            run_id: run_id.map(RunId::new).transpose().map_err(|error| {
+                invalid_fact_error("decode_public_command_receipt", error.to_string())
+            })?,
+            reply_json: serde_json::from_str(&reply_json).map_err(|error| {
+                store_error_message("decode_public_command_receipt", error.to_string())
+            })?,
+            settlement_fact_id: settlement_fact_id.map(FactId::new).transpose().map_err(
+                |error| invalid_fact_error("decode_public_command_receipt", error.to_string()),
+            )?,
+        };
+    validate_public_command_receipt(&receipt)?;
+    Ok(Some(receipt))
+}
+
+fn validate_public_command_receipt(receipt: &PublicCommandReceiptV2) -> KernelResult<()> {
+    if receipt.command_kind.is_empty()
+        || receipt.command_kind.len() > MAX_COMMAND_KIND_BYTES
+        || !receipt
+            .command_kind
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(store_error_message(
+            "validate_public_command_receipt",
+            "commandKind must be a 1..=128 byte ASCII token",
+        ));
+    }
+    if !receipt.reply_json.is_object() {
+        return Err(store_error_message(
+            "validate_public_command_receipt",
+            "replyJson must be an object",
+        ));
+    }
+    if contains_ephemeral_capability(&receipt.reply_json) {
+        return Err(store_error_message(
+            "validate_public_command_receipt",
+            "replyJson must not contain an ephemeral capability or credential",
+        ));
+    }
+    let encoded = serde_json::to_vec(&receipt.reply_json)
+        .map_err(|error| store_error_message("encode_public_command_reply", error.to_string()))?;
+    if encoded.len() > MAX_PUBLIC_REPLY_BYTES {
+        return Err(store_error_message(
+            "validate_public_command_receipt",
+            format!("replyJson exceeds the {MAX_PUBLIC_REPLY_BYTES} byte storage boundary"),
+        ));
+    }
+    Ok(())
+}
+
+fn contains_ephemeral_capability(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(values) => values.iter().any(|(key, value)| {
+            let normalized = key
+                .bytes()
+                .filter(|byte| byte.is_ascii_alphanumeric())
+                .map(|byte| byte.to_ascii_lowercase())
+                .collect::<Vec<_>>();
+            matches!(
+                normalized.as_slice(),
+                b"runcapability"
+                    | b"decisioncapability"
+                    | b"capabilitytoken"
+                    | b"accesstoken"
+                    | b"refreshtoken"
+                    | b"authorization"
+                    | b"secret"
+                    | b"nextcontinuation"
+                    | b"continuationtoken"
+                    | b"factquerycontinuation"
+            ) || contains_ephemeral_capability(value)
+        }),
+        serde_json::Value::Array(values) => values.iter().any(contains_ephemeral_capability),
+        _ => false,
+    }
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ContinuationTokenHashPreimage<'a> {
+    domain: &'static str,
+    token: &'a str,
+}
+
+fn continuation_token_hash(token: &FactQueryContinuationV2) -> KernelResult<String> {
+    query_digest_v2(&ContinuationTokenHashPreimage {
+        domain: "deepcode.kernel.fact-query-continuation-token.v2",
+        token: token.as_str(),
+    })
+    .map(|digest| digest.as_str().to_owned())
+    .map_err(|error| invalid_fact_error("hash_fact_query_continuation_token", error.to_string()))
+}
+
+fn put_fact_query_continuation_transaction(
+    connection: &mut Connection,
+    continuation: FactQueryContinuationDraftV2,
+) -> KernelResult<PutFactQueryContinuationOutcomeV2> {
+    if continuation.after_ledger_sequence > continuation.snapshot_high_water {
+        return Err(store_error_message(
+            "validate_fact_query_continuation",
+            "afterLedgerSequence must not exceed snapshotHighWater",
+        ));
+    }
+    let token_hash = continuation_token_hash(&continuation.token)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| store_error("begin_put_fact_query_continuation", error))?;
+    let run_exists: i64 = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM run_state WHERE run_id = ?1",
+            params![continuation.run_id.as_str()],
+            |row| row.get(0),
+        )
+        .map_err(|error| store_error("validate_fact_query_continuation_run", error))?;
+    if run_exists != 1 {
+        return Err(store_error_message(
+            "validate_fact_query_continuation",
+            "runId does not identify a durable Kernel run",
+        ));
+    }
+    let current_high_water = high_water_with_connection(&transaction)?;
+    if continuation.snapshot_high_water > current_high_water {
+        return Err(store_error_message(
+            "validate_fact_query_continuation",
+            "snapshotHighWater exceeds the durable fact high-water",
+        ));
+    }
+    let created_at = transaction
+        .query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')", [], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(|error| store_error("record_fact_query_continuation_time", error))
+        .and_then(|value| {
+            RecordedAtV2::new(value).map_err(|error| {
+                invalid_fact_error("record_fact_query_continuation_time", error.to_string())
+            })
+        })?;
+    if let Some(existing) = read_fact_query_continuation(&transaction, &token_hash)? {
+        let outcome = if durable_continuation_matches_draft(&existing, &continuation) {
+            if existing.expires_at.as_str() <= created_at.as_str() {
+                delete_fact_query_continuation(&transaction, &token_hash)?;
+                PutFactQueryContinuationOutcomeV2::ExistingExpired(existing)
+            } else if read_fact_query_continuation_consumption(&transaction, &token_hash)?.is_some()
+            {
+                PutFactQueryContinuationOutcomeV2::ExistingConsumed(existing)
+            } else {
+                PutFactQueryContinuationOutcomeV2::ExistingSame(existing)
+            }
+        } else {
+            PutFactQueryContinuationOutcomeV2::TokenConflict
+        };
+        transaction
+            .commit()
+            .map_err(|error| store_error("commit_fact_query_continuation_replay", error))?;
+        return Ok(outcome);
+    }
+
+    if continuation.expires_at.as_str() <= created_at.as_str() {
+        return Err(store_error_message(
+            "validate_fact_query_continuation",
+            "expiresAt must be later than the durable creation time",
+        ));
+    }
+    prune_expired_fact_query_continuations(&transaction, &created_at)?;
+    let global_count = count_fact_query_continuations(&transaction, None)?;
+    if global_count >= MAX_DURABLE_CONTINUATIONS_GLOBAL {
+        transaction
+            .commit()
+            .map_err(|error| store_error("commit_fact_query_continuation_prune", error))?;
+        return Ok(PutFactQueryContinuationOutcomeV2::CapacityExceeded {
+            scope: FactQueryContinuationCapacityScopeV2::Global,
+            limit: MAX_DURABLE_CONTINUATIONS_GLOBAL,
+        });
+    }
+    let run_count = count_fact_query_continuations(&transaction, Some(&continuation.run_id))?;
+    if run_count >= MAX_DURABLE_CONTINUATIONS_PER_RUN {
+        transaction
+            .commit()
+            .map_err(|error| store_error("commit_fact_query_continuation_prune", error))?;
+        return Ok(PutFactQueryContinuationOutcomeV2::CapacityExceeded {
+            scope: FactQueryContinuationCapacityScopeV2::Run,
+            limit: MAX_DURABLE_CONTINUATIONS_PER_RUN,
+        });
+    }
+
+    transaction
+        .execute(
+            "INSERT INTO fact_query_continuations (
+                 token_hash, run_id, snapshot_high_water, after_ledger_sequence,
+                 created_at, expires_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                token_hash,
+                continuation.run_id.as_str(),
+                sqlite_integer(continuation.snapshot_high_water, "snapshotHighWater")?,
+                sqlite_integer(continuation.after_ledger_sequence, "afterLedgerSequence")?,
+                created_at.as_str(),
+                continuation.expires_at.as_str(),
+            ],
+        )
+        .map_err(|error| store_error("insert_fact_query_continuation", error))?;
+    let stored = DurableFactQueryContinuationV2 {
+        run_id: continuation.run_id,
+        snapshot_high_water: continuation.snapshot_high_water,
+        after_ledger_sequence: continuation.after_ledger_sequence,
+        created_at,
+        expires_at: continuation.expires_at,
+    };
+    transaction
+        .commit()
+        .map_err(|error| store_error("commit_put_fact_query_continuation", error))?;
+    Ok(PutFactQueryContinuationOutcomeV2::Inserted(stored))
+}
+
+fn prune_expired_fact_query_continuations(
+    transaction: &Transaction<'_>,
+    now: &RecordedAtV2,
+) -> KernelResult<()> {
+    transaction
+        .execute(
+            "DELETE FROM fact_query_continuation_consumptions
+             WHERE token_hash IN (
+                 SELECT token_hash FROM fact_query_continuations WHERE expires_at <= ?1
+             )",
+            params![now.as_str()],
+        )
+        .map_err(|error| store_error("prune_fact_query_continuation_consumptions", error))?;
+    transaction
+        .execute(
+            "DELETE FROM fact_query_continuations WHERE expires_at <= ?1",
+            params![now.as_str()],
+        )
+        .map_err(|error| store_error("prune_fact_query_continuations", error))?;
+    Ok(())
+}
+
+fn delete_fact_query_continuation(
+    transaction: &Transaction<'_>,
+    token_hash: &str,
+) -> KernelResult<()> {
+    transaction
+        .execute(
+            "DELETE FROM fact_query_continuation_consumptions WHERE token_hash = ?1",
+            params![token_hash],
+        )
+        .map_err(|error| store_error("delete_fact_query_continuation_consumption", error))?;
+    let deleted = transaction
+        .execute(
+            "DELETE FROM fact_query_continuations WHERE token_hash = ?1",
+            params![token_hash],
+        )
+        .map_err(|error| store_error("delete_fact_query_continuation", error))?;
+    if deleted != 1 {
+        return Err(store_error_message(
+            "delete_fact_query_continuation",
+            "exact continuation identity disappeared during maintenance",
+        ));
+    }
+    Ok(())
+}
+
+fn count_fact_query_continuations(
+    transaction: &Transaction<'_>,
+    run_id: Option<&RunId>,
+) -> KernelResult<u64> {
+    let count = match run_id {
+        Some(run_id) => transaction
+            .query_row(
+                "SELECT COUNT(*) FROM fact_query_continuations WHERE run_id = ?1",
+                params![run_id.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| store_error("count_run_fact_query_continuations", error))?,
+        None => transaction
+            .query_row("SELECT COUNT(*) FROM fact_query_continuations", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map_err(|error| store_error("count_fact_query_continuations", error))?,
+    };
+    sqlite_u64(count, "continuationCount")
+}
+
+fn resolve_fact_query_continuation(
+    connection: &Connection,
+    token: &FactQueryContinuationV2,
+    expected: &FactQueryContinuationExpectationV2,
+) -> KernelResult<ResolveFactQueryContinuationOutcomeV2> {
+    let token_hash = continuation_token_hash(token)?;
+    let Some(stored) = read_fact_query_continuation(connection, &token_hash)? else {
+        return Ok(ResolveFactQueryContinuationOutcomeV2::NotFound);
+    };
+    if stored.run_id != expected.run_id
+        || stored.after_ledger_sequence != expected.after_ledger_sequence
+    {
+        return Ok(ResolveFactQueryContinuationOutcomeV2::ScopeMismatch);
+    }
+    if read_fact_query_continuation_consumption(connection, &token_hash)?.is_some() {
+        return Ok(ResolveFactQueryContinuationOutcomeV2::Consumed);
+    }
+    let now = connection
+        .query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')", [], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(|error| store_error("resolve_fact_query_continuation_time", error))?;
+    if stored.expires_at.as_str() <= now.as_str() {
+        return Ok(ResolveFactQueryContinuationOutcomeV2::Expired {
+            expires_at: stored.expires_at,
+        });
+    }
+    Ok(ResolveFactQueryContinuationOutcomeV2::Resolved(stored))
+}
+
+fn consume_fact_query_continuation_transaction(
+    connection: &mut Connection,
+    token: FactQueryContinuationV2,
+    expected: FactQueryContinuationExpectationV2,
+    consumer: FactQueryContinuationConsumerV2,
+) -> KernelResult<ConsumeFactQueryContinuationOutcomeV2> {
+    let token_hash = continuation_token_hash(&token)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| store_error("begin_consume_fact_query_continuation", error))?;
+    let Some(stored) = read_fact_query_continuation(&transaction, &token_hash)? else {
+        return Ok(ConsumeFactQueryContinuationOutcomeV2::NotFound);
+    };
+    if stored.run_id != expected.run_id
+        || stored.after_ledger_sequence != expected.after_ledger_sequence
+    {
+        return Ok(ConsumeFactQueryContinuationOutcomeV2::ScopeMismatch);
+    }
+    if let Some((existing_request_id, existing_request_digest)) =
+        read_fact_query_continuation_consumption(&transaction, &token_hash)?
+    {
+        let outcome = if existing_request_id == consumer.command_request_id
+            && existing_request_digest == consumer.command_request_digest
+        {
+            ConsumeFactQueryContinuationOutcomeV2::ExistingSame(stored)
+        } else {
+            ConsumeFactQueryContinuationOutcomeV2::AlreadyConsumed
+        };
+        transaction
+            .commit()
+            .map_err(|error| store_error("commit_fact_query_continuation_consume_replay", error))?;
+        return Ok(outcome);
+    }
+    let consumed_at = transaction
+        .query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')", [], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(|error| store_error("record_fact_query_continuation_consumption_time", error))?;
+    if stored.expires_at.as_str() <= consumed_at.as_str() {
+        return Ok(ConsumeFactQueryContinuationOutcomeV2::Expired {
+            expires_at: stored.expires_at,
+        });
+    }
+    transaction
+        .execute(
+            "INSERT INTO fact_query_continuation_consumptions (
+                 token_hash, command_request_id, command_request_digest, consumed_at
+             ) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                token_hash,
+                consumer.command_request_id.as_str(),
+                consumer.command_request_digest.as_str(),
+                consumed_at,
+            ],
+        )
+        .map_err(|error| store_error("insert_fact_query_continuation_consumption", error))?;
+    transaction
+        .commit()
+        .map_err(|error| store_error("commit_consume_fact_query_continuation", error))?;
+    Ok(ConsumeFactQueryContinuationOutcomeV2::Consumed(stored))
+}
+
+fn read_fact_query_continuation_consumption(
+    connection: &Connection,
+    token_hash: &str,
+) -> KernelResult<Option<(CommandRequestId, CommandRequestDigestV2)>> {
+    let row = connection
+        .query_row(
+            "SELECT command_request_id, command_request_digest
+             FROM fact_query_continuation_consumptions
+             WHERE token_hash = ?1",
+            params![token_hash],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(|error| store_error("read_fact_query_continuation_consumption", error))?;
+    row.map(|(request_id, request_digest)| {
+        Ok((
+            CommandRequestId::new(request_id).map_err(|error| {
+                invalid_fact_error(
+                    "decode_fact_query_continuation_consumption",
+                    error.to_string(),
+                )
+            })?,
+            CommandRequestDigestV2::parse(request_digest).map_err(|error| {
+                invalid_fact_error(
+                    "decode_fact_query_continuation_consumption",
+                    error.to_string(),
+                )
+            })?,
+        ))
+    })
+    .transpose()
+}
+
+fn read_fact_query_continuation(
+    connection: &Connection,
+    token_hash: &str,
+) -> KernelResult<Option<DurableFactQueryContinuationV2>> {
+    let row = connection
+        .query_row(
+            "SELECT run_id, snapshot_high_water, after_ledger_sequence,
+                    created_at, expires_at
+             FROM fact_query_continuations
+             WHERE token_hash = ?1",
+            params![token_hash],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| store_error("read_fact_query_continuation", error))?;
+    let Some((
+        run_id,
+        snapshot_high_water,
+        after_ledger_sequence,
+        created_at,
+        expires_at,
+    )) = row
+    else {
+        return Ok(None);
+    };
+    let decode_error = |error: deepcode_kernel_abi::v2::V2ValidationError| {
+        invalid_fact_error("decode_fact_query_continuation", error.to_string())
+    };
+    Ok(Some(DurableFactQueryContinuationV2 {
+        run_id: RunId::new(run_id).map_err(&decode_error)?,
+        snapshot_high_water: sqlite_u64(snapshot_high_water, "snapshotHighWater")?,
+        after_ledger_sequence: sqlite_u64(after_ledger_sequence, "afterLedgerSequence")?,
+        created_at: RecordedAtV2::new(created_at).map_err(&decode_error)?,
+        expires_at: RecordedAtV2::new(expires_at).map_err(&decode_error)?,
+    }))
+}
+
+fn durable_continuation_matches_draft(
+    stored: &DurableFactQueryContinuationV2,
+    draft: &FactQueryContinuationDraftV2,
+) -> bool {
+    stored.run_id == draft.run_id
+        && stored.snapshot_high_water == draft.snapshot_high_water
+        && stored.after_ledger_sequence == draft.after_ledger_sequence
+        && stored.expires_at == draft.expires_at
 }
 
 fn persist_envelope(
@@ -1177,7 +3414,11 @@ fn persist_envelope(
                 envelope.payload.operation_id().map(|id| id.as_str()),
                 envelope.payload.invocation_id().map(|id| id.as_str()),
                 envelope.payload.attempt_id().map(|id| id.as_str()),
-                envelope.payload.grant_id().map(|id| id.as_str()),
+                envelope
+                    .payload
+                    .grant_id()
+                    .map(|id| id.as_str())
+                    .or_else(|| { envelope.payload.capability_lease_id().map(|id| id.as_str()) }),
                 envelope.payload.reservation_id().map(|id| id.as_str()),
                 envelope.payload.causation_fact_id().map(|id| id.as_str()),
                 envelope
@@ -1253,6 +3494,71 @@ fn update_materialized_state(
         .map_err(|error| store_error("update_run_state", error))?;
 
     match &envelope.payload {
+        KernelFactPayloadV2::Authorization(fact) => match fact {
+            AuthorizationFactV2::CapabilityIssued { identity, .. }
+            | AuthorizationFactV2::ExpansionAllowed { identity, .. }
+            | AuthorizationFactV2::LeaseRevoked { identity, .. }
+            | AuthorizationFactV2::LeaseSuperseded { identity, .. } => {
+                let status = match fact {
+                    AuthorizationFactV2::CapabilityIssued { .. } => "capabilityIssued",
+                    AuthorizationFactV2::ExpansionAllowed { .. } => "scopeExpanded",
+                    AuthorizationFactV2::LeaseRevoked { .. } => "capabilityRevoked",
+                    AuthorizationFactV2::LeaseSuperseded { .. } => "capabilitySuperseded",
+                    _ => unreachable!(),
+                };
+                transaction
+                    .execute(
+                        "INSERT INTO grant_state (
+                                 grant_id, run_id, observed_use_count, status,
+                                 last_ledger_sequence, state_json
+                             ) VALUES (?1, ?2, 0, ?3, ?4, ?5)
+                             ON CONFLICT(grant_id) DO UPDATE SET
+                                 run_id = excluded.run_id,
+                                 status = excluded.status,
+                                 last_ledger_sequence = excluded.last_ledger_sequence,
+                                 state_json = excluded.state_json
+                             WHERE excluded.last_ledger_sequence >
+                                 grant_state.last_ledger_sequence",
+                        params![
+                            identity.lease_id.as_str(),
+                            run_id,
+                            status,
+                            ledger_sequence,
+                            encoded,
+                        ],
+                    )
+                    .map_err(|error| store_error("update_capability_lease_state", error))?;
+            }
+            AuthorizationFactV2::CapabilityAwaiting { identity, .. } => {
+                transaction
+                    .execute(
+                        "INSERT INTO invocation_state (
+                                 invocation_id, run_id, status,
+                                 last_ledger_sequence, state_json
+                             ) VALUES (?1, ?2, 'awaitingCapability', ?3, ?4)
+                             ON CONFLICT(invocation_id) DO UPDATE SET
+                                 run_id = excluded.run_id,
+                                 status = excluded.status,
+                                 last_ledger_sequence = excluded.last_ledger_sequence,
+                                 state_json = excluded.state_json
+                             WHERE excluded.last_ledger_sequence >
+                                 invocation_state.last_ledger_sequence",
+                        params![
+                            identity.invocation_id.as_str(),
+                            run_id,
+                            ledger_sequence,
+                            encoded,
+                        ],
+                    )
+                    .map_err(|error| store_error("update_awaiting_capability_state", error))?;
+            }
+            AuthorizationFactV2::ScopePreviewed { .. }
+            | AuthorizationFactV2::CapabilityDenied { .. }
+            | AuthorizationFactV2::ExpansionDenied { .. }
+            | AuthorizationFactV2::TrustGranted { .. }
+            | AuthorizationFactV2::TrustRevoked { .. }
+            | AuthorizationFactV2::ContextInvalidated { .. } => {}
+        },
         KernelFactPayloadV2::Grant(fact) => {
             let projection = match fact {
                 GrantFactV2::Denied { .. } => None,
@@ -1319,6 +3625,39 @@ fn update_materialized_state(
         KernelFactPayloadV2::Invocation(fact) => {
             let projection = match fact {
                 InvocationFactV2::Rejected { .. } => None,
+                InvocationFactV2::ToolIntentAdmitted { identity, .. } => {
+                    Some((&identity.invocation_id, "admitted"))
+                }
+                InvocationFactV2::ToolAttemptPrepared { identity } => {
+                    Some((&identity.invocation_id, "attemptPrepared"))
+                }
+                InvocationFactV2::ToolExecutionStarted { identity, .. } => {
+                    Some((&identity.invocation_id, "executing"))
+                }
+                InvocationFactV2::ToolCancellationObserved { identity, .. } => {
+                    Some((&identity.invocation_id, "cancellationObserved"))
+                }
+                InvocationFactV2::ToolDeadlineObserved { identity } => {
+                    Some((&identity.invocation_id, "deadlineObserved"))
+                }
+                InvocationFactV2::ToolFailedBeforeEffect { identity, .. } => {
+                    Some((&identity.invocation_id, "failedBeforeEffect"))
+                }
+                InvocationFactV2::ToolCancelledBeforeEffect { identity, .. } => {
+                    Some((&identity.invocation_id, "cancelledBeforeEffect"))
+                }
+                InvocationFactV2::ToolTimedOutBeforeEffect { identity } => {
+                    Some((&identity.invocation_id, "timedOutBeforeEffect"))
+                }
+                InvocationFactV2::ToolCompleted { identity, .. } => {
+                    Some((&identity.invocation_id, "completed"))
+                }
+                InvocationFactV2::ToolFailedAfterObservedEffect { identity, .. } => {
+                    Some((&identity.invocation_id, "failedAfterObservedEffect"))
+                }
+                InvocationFactV2::ToolIndeterminate { identity, .. } => {
+                    Some((&identity.invocation_id, "indeterminate"))
+                }
                 InvocationFactV2::Admitted { identity, .. } => {
                     Some((&identity.invocation_id, "admitted"))
                 }

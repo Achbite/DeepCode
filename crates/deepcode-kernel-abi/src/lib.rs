@@ -51,7 +51,6 @@ pub use resource_packet::*;
 pub use run::*;
 pub use snapshot::*;
 pub use tool::*;
-pub use tool_catalog_v4::*;
 pub use tool_protocol_v2::*;
 pub use user_decision_v2::*;
 pub use wire::*;

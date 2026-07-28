@@ -1,13 +1,12 @@
 use deepcode_kernel_abi::tool_catalog_v4::{
-    AuthorityToolIdV4, EffectScopeV4, ToolContractDigestV4, ToolInvocationInputV4,
-    ToolOutputDigestV4, ToolOutputV4, ToolRiskV4,
+    AuthorityToolIdV4, EffectScopeV4, ToolInvocationInputV4, ToolOutputV4, ToolRiskV4,
 };
 use deepcode_kernel_abi::v2::{
     AttemptId, AuthorizationRequestDigestV2, CancelRequestId, CanonicalPrivateTargetV2,
     CommandRequestDigestV2, CommandRequestId, ControlEpoch, CorrelationSetV2, EffectEvidenceV2,
-    EffectId, FactId, GrantDecisionBasisV2, GrantDecisionDigestV2, GrantId, GrantReservationId,
+    EffectId, FactId, GrantDecisionDigestV2, GrantId, GrantReservationId,
     GrantScopeDigestV2, GrantSupersessionCauseV2, IdempotencyKeyHashV2, IndeterminateReasonV2,
-    InputId, InvocationId, InvocationRequestDigestV2, InvocationSubmissionDigestV2,
+    InputId, InvocationAuthorityV2, InvocationId, InvocationSubmissionDigestV2,
     KernelFactEnvelopeV2, OperationId, PlatformV2, PostObservedEffectFailureCodeV2,
     ResolvedResourceV2, ResourceId, ResourceScopeV2, ResourceStateDigestV2, ResourceStateV2, RunId,
     TargetRevalidationDigestV2, TargetRevalidationObservationV2, WorkspaceBindingDigestV2,
@@ -17,7 +16,8 @@ use deepcode_kernel_abi::v2_command::{
     GrantDecisionReplyV2, InvocationPhaseV2, InvocationSubmissionReplyV2, KernelErrorV2,
     KernelReplyV2, StopOverlayV2,
 };
-use std::collections::{BTreeMap, HashMap};
+use deepcode_kernel_abi::ToolIdV2;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 pub(super) type AuthorityResult<T> = Result<T, KernelErrorV2>;
@@ -175,6 +175,30 @@ pub(super) struct InvocationRecord {
 }
 
 #[derive(Debug, Clone)]
+pub(super) struct DirectInvocationRecord {
+    pub(super) run_id: RunId,
+    pub(super) operation_id: OperationId,
+    pub(super) control_epoch: ControlEpoch,
+    pub(super) authority: InvocationAuthorityV2,
+    pub(super) invocation_id: InvocationId,
+    pub(super) attempt_id: AttemptId,
+    pub(super) idempotency_key_hash: IdempotencyKeyHashV2,
+    pub(super) tool_id: ToolIdV2,
+    pub(super) legacy_tool_id: AuthorityToolIdV4,
+    pub(super) resource_scope: ResourceScopeV2,
+    pub(super) workspace_binding_digest: WorkspaceBindingDigestV2,
+    pub(super) correlations: CorrelationSetV2,
+    pub(super) phase: InvocationPhase,
+    pub(super) stop_overlay: StopOverlay,
+    pub(super) admission_fact_id: FactId,
+    pub(super) attempt_prepared_fact_id: Option<FactId>,
+    pub(super) execution_started_fact_id: Option<FactId>,
+    pub(super) cancellation_observed_fact_id: Option<FactId>,
+    pub(super) deadline_observed_fact_id: Option<FactId>,
+    pub(super) last_fact_id: FactId,
+}
+
+#[derive(Debug, Clone)]
 pub(super) struct CommandReplay {
     pub(super) digest: CommandRequestDigestV2,
     pub(super) reply: KernelReplyV2,
@@ -214,6 +238,7 @@ pub(super) struct AuthorityState {
     pub(super) grants: HashMap<GrantId, GrantRecord>,
     pub(super) reservations: HashMap<GrantReservationId, ReservationRecord>,
     pub(super) invocations: HashMap<InvocationId, InvocationRecord>,
+    pub(super) direct_invocations: HashMap<InvocationId, DirectInvocationRecord>,
     pub(super) resources: HashMap<ResourceId, ResourceRecord>,
     pub(super) invocation_effects: HashMap<InvocationId, (EffectId, FactId)>,
     pub(super) commands: HashMap<CommandRequestId, CommandReplay>,
@@ -250,6 +275,17 @@ pub(super) struct PreparedGrantRequest {
     pub(super) idempotency_key_hash: IdempotencyKeyHashV2,
     pub(super) grant_scope_digest: GrantScopeDigestV2,
     pub(super) authorization_digest: AuthorizationRequestDigestV2,
+    pub(super) workspace_binding_digest: WorkspaceBindingDigestV2,
+    pub(super) effective_deadline_ms: u32,
+    pub(super) correlations: CorrelationSetV2,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct PreparedDirectToolIntent {
+    pub(super) canonical_invocation: ToolInvocationInputV4,
+    pub(super) resource_scope: ResourceScopeV2,
+    pub(super) resolved_targets: Vec<ResolvedTarget>,
+    pub(super) idempotency_key_hash: IdempotencyKeyHashV2,
     pub(super) workspace_binding_digest: WorkspaceBindingDigestV2,
     pub(super) effective_deadline_ms: u32,
     pub(super) correlations: CorrelationSetV2,

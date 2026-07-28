@@ -2,15 +2,16 @@ use std::collections::BTreeMap;
 
 use deepcode_kernel_abi::v2::PlatformV2;
 use deepcode_kernel_abi::v2::V2ValidationError;
-use deepcode_kernel_abi::{
+use deepcode_kernel_abi::tool_catalog_v4::{
     tool_catalog_digest_v4, tool_contract_digest_v4, AuthorityToolIdV4, CancellationV4, CleanupV4,
     DeadlineV4, DeleteTargetV4, EffectClassV4, EffectScopeV4, EndpointKindRelationV4,
     ExecutionAvailabilityV4, GitDiffScopeV4, IdempotencyV4, InvocationInputSchemaV4,
     OutputBudgetV4, OverwritePolicyV4, PathEndpointConstraintV4, RepositoryAreaV4,
     ResourceAccessV4, ResourceConstraintV4, RollbackV4, TargetExistenceV4, ToolCatalogDigestV4,
     ToolCatalogV4, ToolContractDigestV4, ToolContractV4, ToolInvocationInputV4, ToolRiskV4,
-    VerificationV4, WorkspaceObjectKindV4, KERNEL_TOOL_CATALOG_V4_VERSION,
+    VerificationV4, WorkspaceObjectKindV4,
 };
+use deepcode_kernel_abi::KERNEL_TOOL_CATALOG_V4_VERSION;
 use serde_json::{json, Value};
 use thiserror::Error;
 use unicode_normalization::UnicodeNormalization;

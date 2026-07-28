@@ -1,0 +1,5414 @@
+use super::authority::{
+    canonicalize_network_scope_url, canonicalize_requested_workspace_path, invalid_field,
+    storage_fault, PrepareFailure,
+};
+use super::model::{AuthorityResult, WorkspaceBinding};
+use super::service::{AuthorityService, DirectToolIntentRequest};
+use crate::executors::{KernelExecutorConfig, SecretProvider};
+use deepcode_kernel_abi::tool_catalog_v4::ToolInvocationInputV4;
+use deepcode_kernel_abi::v2::{
+    command_request_digest_v2, invocation_policy_evaluation_digest_v2,
+    settings_ceiling_digest_v2, AuthorizationFactV2, AuthorizationIdentityV2,
+    CapabilityAwaitingIdentityV2, CapabilityLeaseRevokeReasonV2,
+    CapabilityLeaseFactIdentityV2, CommandRequestDigestV2, CommandRequestId, ControlEpoch,
+    ControlFactV2, CorrelationRefV2, CorrelationSetV2, FactId, InputId,
+    InvocationAuthorityV2, InvocationFactV2, InvocationId, KernelFactEnvelopeV2,
+    KernelFactPayloadV2,
+    NetworkTargetObservationDigestV2, OperationId, RecordedAtV2, RepositoryAreaV2,
+    ResourceAccessV2, ResourceScopeV2, RunId, UserDecisionRefV2,
+    ToolContextInvalidationIdentityV2, ToolContextInvalidationReasonV2,
+    WorkspaceBindingDigestV2, idempotency_key_hash_v2,
+};
+use deepcode_kernel_abi::v2_command::{
+    CapabilityApprovalViewV2, CapabilityScopeDispositionV2, CapabilityScopePreviewRecordV2,
+    CapabilityScopePreviewReplyV2, CapabilityScopePreviewV2, CommandHandlingV2,
+    ControlEpochAdvanceV2, DeadlineRequestV2, EpochPreconditionV2,
+    InvalidFieldViolationV2, InvalidRelationV2, InvalidRequestReasonV2,
+    KernelCommandEnvelopeV2, KernelCommandResponseEnvelopeV2, KernelCommandV2, KernelErrorV2,
+    KernelFactDomainProjectionV2, KernelFactLineageV2, KernelFactProjectionPageV2,
+    KernelFactProjectionV2, KernelFactsQueryScopedV2, KernelReplyV2, RunOpenReplyV2, RunOpenV2,
+    ToolContextGetReplyV2, ToolContextGetV2, ToolIntentSubmitReplyV2,
+    ToolIntentSubmitV2,
+};
+use deepcode_kernel_abi::{
+    capability_authorization_digest_v2, capability_scope_digest_v2,
+    canonical_arguments_digest_v2, exact_invocation_digest_v2, tool_context_digest_v2,
+    tool_contract_digest_v2, trust_lease_digest_v2, user_decision_request_digest_v2,
+    CapabilityAuthorizationDigestV2, CapabilityDecisionBindingV2,
+    CapabilityLeaseIdV2,
+    CapabilityLeaseRefV2, CapabilityLeaseVersionV2, CapabilityScopeDigestV2,
+    CapabilityScopePreviewIdV2, ExactInvocationDigestV2, PlanActionIdV2, PlanRevisionV2,
+    RequestedResourceV2, RunCapabilityV2, ToolAvailabilityV2, ToolContextBundleV2,
+    ToolContextRefV2, ToolContextVersionV2, ToolDescriptorV2, ToolEffectClassV2,
+    ToolEffectScopeV2, ToolIdV2, ToolIntentAuthorityV2, ToolInventoryV2,
+    TrustGrantDecisionV2, TrustLeaseDigestV2, TrustPolicyIdV2, UserDecisionErrorV2,
+    UserDecisionReplyV2,
+    UserDecisionRevokeTargetV2, UserDecisionV2, WorkspaceBindingRefV2,
+    KERNEL_TOOL_PROMPT_V2, TOOL_CONTEXT_FORMAT_V2,
+};
+use deepcode_kernel_abi::KernelError as AbiKernelError;
+use deepcode_kernel_ledger::v2::CanonicalFactStore;
+use deepcode_kernel_ledger::v2::{
+    AuthorityMaterialDraftV2, AuthorityMaterialMutationV2, AuthorityMaterialRecordV2,
+    ConsumeFactQueryContinuationOutcomeV2, FactQueryContinuationConsumerV2,
+    FactQueryContinuationDraftV2, FactQueryContinuationExpectationV2,
+    PublicCommandReceiptV2, PutFactQueryContinuationOutcomeV2,
+    PutPublicCommandReceiptOutcomeV2,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::Read;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+
+const AUTHORITY_MATERIAL_PREVIEW: &str = "scopePreview";
+const AUTHORITY_MATERIAL_LEASE: &str = "capabilityLease";
+const AUTHORITY_MATERIAL_PENDING: &str = "pendingIntent";
+const AUTHORITY_MATERIAL_INVOCATION: &str = "toolInvocation";
+const AUTHORITY_MATERIAL_TRUST: &str = "trustLease";
+const AUTHORITY_MATERIAL_ACTIVE: &str = "active";
+const AUTHORITY_MATERIAL_AWAITING: &str = "awaiting";
+const AUTHORITY_MATERIAL_ADMITTED: &str = "admitted";
+const AUTHORITY_MATERIAL_REJECTED: &str = "rejected";
+const AUTHORITY_MATERIAL_REVOKED: &str = "revoked";
+const AUTHORITY_MATERIAL_STALE: &str = "stale";
+const AUTHORITY_MATERIAL_TERMINAL: &str = "terminal";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SettingsCeilingV2 {
+    pub workspace_read: bool,
+    pub workspace_write: bool,
+    pub git_write: bool,
+    pub web_read: bool,
+    pub private_web_read: bool,
+    pub auto_approve_plans: bool,
+}
+
+fn build_inventory() -> AuthorityResult<ToolInventoryV2> {
+    crate::kernel_tool_registry()
+        .tool_inventory_v2()
+        .map_err(|_| storage_fault())
+}
+
+fn response(
+    request_id: CommandRequestId,
+    result: AuthorityResult<(KernelReplyV2, CommandHandlingV2)>,
+) -> KernelCommandResponseEnvelopeV2 {
+    let (reply, handling) = match result {
+        Ok(value) => value,
+        Err(error) => (KernelReplyV2::Error(error), CommandHandlingV2::Evaluated),
+    };
+    KernelCommandResponseEnvelopeV2::Correlated {
+        server_abi_version: deepcode_kernel_abi::KERNEL_ABI_V2_VERSION.to_owned(),
+        request_id,
+        handling,
+        reply,
+    }
+}
+
+fn map_store_open_error(error: AbiKernelError) -> KernelErrorV2 {
+    match error {
+        AbiKernelError::Structured {
+            code: "unsupported_history_schema",
+            details,
+            ..
+        } => {
+            let received = json!({
+                "schemaVersion": details.get("receivedVersion"),
+                "schemaContract": details.get("receivedContract"),
+                "abiVersion": details.get("receivedAbiVersion"),
+            })
+            .to_string();
+            KernelErrorV2::UnsupportedHistorySchema { received }
+        }
+        _ => storage_fault(),
+    }
+}
+
+fn unauthorized_run() -> KernelErrorV2 {
+    KernelErrorV2::InvalidRequest {
+        reason: InvalidRequestReasonV2::InvalidRelation {
+            relation: InvalidRelationV2::RunMismatch,
+        },
+    }
+}
+
+fn constant_time_token_eq(
+    expected: &RunCapabilityV2,
+    submitted: &RunCapabilityV2,
+) -> bool {
+    let left = expected.expose_to_transport().as_bytes();
+    let right = submitted.expose_to_transport().as_bytes();
+    let mut difference = left.len() ^ right.len();
+    let maximum = left.len().max(right.len());
+    for index in 0..maximum {
+        difference |= usize::from(
+            left.get(index).copied().unwrap_or(0)
+                ^ right.get(index).copied().unwrap_or(0),
+        );
+    }
+    difference == 0
+}
+
+fn settings_allow(
+    settings: &SettingsCeilingV2,
+    effect_scope: ToolEffectScopeV2,
+) -> bool {
+    match effect_scope {
+        ToolEffectScopeV2::WorkspaceRead => settings.workspace_read,
+        ToolEffectScopeV2::WorkspaceWrite => settings.workspace_write,
+        ToolEffectScopeV2::RepositoryRead => settings.workspace_read,
+        ToolEffectScopeV2::RepositoryIndexWrite
+        | ToolEffectScopeV2::RepositoryHistoryWrite => settings.git_write,
+        ToolEffectScopeV2::NetworkRead => settings.web_read,
+    }
+}
+
+fn canonical_invocation(
+    tool_id: &ToolIdV2,
+    raw_arguments: &deepcode_kernel_abi::RawToolArgumentsV2,
+) -> AuthorityResult<ToolInvocationInputV4> {
+    let canonical = crate::kernel_tool_registry()
+        .canonicalize_v2(tool_id, raw_arguments.clone())
+        .map_err(|_| {
+            invalid_field(
+                "rawArguments",
+                InvalidFieldViolationV2::OutOfRange,
+            )
+        })?;
+    let mut invocation = serde_json::from_value(json!({
+        "toolId": canonical.tool_id,
+        "arguments": canonical.arguments,
+    }))
+    .map_err(|_| {
+        invalid_field(
+            "rawArguments",
+            InvalidFieldViolationV2::OutOfRange,
+        )
+    })?;
+    match &mut invocation {
+        ToolInvocationInputV4::WebSearch { query, .. } => {
+            *query = query.trim().to_owned();
+            if query.is_empty() || query.chars().any(char::is_control) {
+                return Err(invalid_field(
+                    "rawArguments.query",
+                    InvalidFieldViolationV2::OutOfRange,
+                ));
+            }
+        }
+        ToolInvocationInputV4::WebFetch { url, .. } => {
+            let (canonical_url, _) =
+                canonicalize_network_scope_url(url).map_err(|_| {
+                    invalid_field(
+                        "rawArguments.url",
+                        InvalidFieldViolationV2::OutOfRange,
+                    )
+                })?;
+            *url = canonical_url;
+        }
+        _ => {}
+    }
+    Ok(invocation)
+}
+
+fn canonical_argument_value(
+    invocation: &ToolInvocationInputV4,
+) -> AuthorityResult<Value> {
+    serde_json::to_value(invocation)
+        .ok()
+        .and_then(|value| value.get("arguments").cloned())
+        .ok_or_else(storage_fault)
+}
+
+fn normalize_requested_targets(
+    workspace: &WorkspaceBinding,
+    requested: &[RequestedResourceV2],
+) -> Result<Vec<ScopeTargetKey>, PrepareFailure> {
+    let mut targets = requested
+        .iter()
+        .map(|resource| match resource {
+            RequestedResourceV2::WorkspacePath { path, access } => {
+                canonicalize_requested_workspace_path(workspace, path).map(
+                    |path| ScopeTargetKey::Workspace {
+                        path,
+                        access: *access,
+                    },
+                )
+            }
+            RequestedResourceV2::Repository { area } => {
+                Ok(ScopeTargetKey::Repository { area: *area })
+            }
+            RequestedResourceV2::NetworkUrl { url } => {
+                canonicalize_network_scope_url(url).map(
+                    |(url, reviewed_target_digest)| ScopeTargetKey::NetworkUrl {
+                        url,
+                        reviewed_target_digest,
+                    },
+                )
+            }
+            RequestedResourceV2::NetworkQuery { query } => {
+                let query = query.trim();
+                if query.is_empty() || query.chars().any(char::is_control) {
+                    Err(PrepareFailure::Kernel(invalid_field(
+                        "requestedResources.query",
+                        InvalidFieldViolationV2::OutOfRange,
+                    )))
+                } else {
+                    Ok(ScopeTargetKey::NetworkQuery {
+                        query: query.to_owned(),
+                    })
+                }
+            }
+            RequestedResourceV2::ExactInvocation {
+                invocation_digest,
+            } => Ok(ScopeTargetKey::ExactInvocation {
+                invocation_digest: invocation_digest.clone(),
+            }),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    targets.sort_by_key(scope_target_label);
+    targets.dedup();
+    Ok(targets)
+}
+
+fn exact_targets_for_invocation(
+    workspace: &WorkspaceBinding,
+    invocation: &ToolInvocationInputV4,
+) -> AuthorityResult<Vec<ScopeTargetKey>> {
+    use deepcode_kernel_abi::tool_catalog_v4::{
+        DeleteTargetV4, ToolInvocationInputV4 as Input,
+    };
+    let workspace_target = |path: &str, access| {
+        canonicalize_requested_workspace_path(workspace, path)
+            .map(|path| ScopeTargetKey::Workspace { path, access })
+            .map_err(|failure| match failure {
+                PrepareFailure::Kernel(error) => error,
+                PrepareFailure::Target(_) => invalid_field(
+                    "rawArguments",
+                    InvalidFieldViolationV2::PathEscapesWorkspace,
+                ),
+            })
+    };
+    let target = match invocation {
+        Input::FsRead { path, .. }
+        | Input::FsDiff { path, .. }
+        | Input::DocumentRead { path, .. } => {
+            workspace_target(path, ResourceAccessV2::Read)?
+        }
+        Input::FsList { path, .. } => {
+            workspace_target(path, ResourceAccessV2::Read)?
+        }
+        Input::FsGlob { root, .. } | Input::CodeGrep { root, .. } => {
+            workspace_target(root, ResourceAccessV2::Read)?
+        }
+        Input::FsCreate { path, .. }
+        | Input::FsWrite { path, .. }
+        | Input::FsEdit { path, .. }
+        | Input::FsEnsureDirectory { path } => {
+            workspace_target(path, ResourceAccessV2::Write)?
+        }
+        Input::FsDelete(DeleteTargetV4::File { path })
+        | Input::FsDelete(DeleteTargetV4::DirectoryTree { path }) => {
+            workspace_target(path, ResourceAccessV2::Write)?
+        }
+        Input::WebSearch { query, .. } => ScopeTargetKey::NetworkQuery {
+            query: query.clone(),
+        },
+        Input::WebFetch { url, .. } => {
+            let (url, reviewed_target_digest) =
+                canonicalize_network_scope_url(url).map_err(|failure| match failure {
+                    PrepareFailure::Kernel(error) => error,
+                    PrepareFailure::Target(_) => invalid_field(
+                        "rawArguments.url",
+                        InvalidFieldViolationV2::OutOfRange,
+                    ),
+                })?;
+            ScopeTargetKey::NetworkUrl {
+                url,
+                reviewed_target_digest,
+            }
+        }
+        Input::GitStatus {} | Input::GitDiff { .. } => {
+            ScopeTargetKey::Repository {
+                area: RepositoryAreaV2::State,
+            }
+        }
+        Input::GitStage { .. } | Input::GitUnstage { .. } => {
+            ScopeTargetKey::Repository {
+                area: RepositoryAreaV2::Index,
+            }
+        }
+        Input::GitCommit { .. } => ScopeTargetKey::Repository {
+            area: RepositoryAreaV2::History,
+        },
+        Input::FsRename { .. } => {
+            return Err(invalid_field(
+                "toolId",
+                InvalidFieldViolationV2::OutOfRange,
+            ))
+        }
+    };
+    Ok(vec![target])
+}
+
+fn targets_cover_invocation(
+    approved: &[ScopeTargetKey],
+    canonical_scope: &ResourceScopeV2,
+    invocation: &ToolInvocationInputV4,
+) -> AuthorityResult<bool> {
+    let invocation_digest =
+        exact_invocation_digest_v2(invocation).map_err(|_| storage_fault())?;
+    if approved.iter().any(|target| {
+        matches!(
+            target,
+            ScopeTargetKey::ExactInvocation {
+                invocation_digest: expected
+            } if expected == &invocation_digest
+        )
+    }) {
+        return Ok(true);
+    }
+    let covered = match canonical_scope {
+        ResourceScopeV2::Workspace { targets } => targets.iter().all(|target| {
+            approved.iter().any(|approved| {
+                matches!(
+                    approved,
+                    ScopeTargetKey::Workspace { path, access }
+                        if path == &target.relative_path && access == &target.access
+                )
+            })
+        }),
+        ResourceScopeV2::Repository { area } => approved.iter().any(|target| {
+            matches!(target, ScopeTargetKey::Repository { area: expected } if expected == area)
+        }),
+        ResourceScopeV2::NetworkQuery { .. } => match invocation {
+            ToolInvocationInputV4::WebSearch { query, .. } => approved.iter().any(
+                |target| {
+                    matches!(
+                        target,
+                        ScopeTargetKey::NetworkQuery { query: expected } if expected == query
+                    )
+                },
+            ),
+            _ => false,
+        },
+        ResourceScopeV2::NetworkUrl {
+            target_observation_digest,
+            ..
+        } => match invocation {
+            ToolInvocationInputV4::WebFetch { url, .. } => approved.iter().any(
+                |target| {
+                    matches!(
+                        target,
+                        ScopeTargetKey::NetworkUrl {
+                            url: expected,
+                            reviewed_target_digest,
+                        } if expected == url
+                            && reviewed_target_digest == target_observation_digest
+                    )
+                },
+            ),
+            _ => false,
+        },
+    };
+    Ok(covered)
+}
+
+fn target_set_contains(
+    approved: &[ScopeTargetKey],
+    requested: &[ScopeTargetKey],
+) -> bool {
+    requested.iter().all(|target| approved.contains(target))
+}
+
+fn union_targets(
+    current: &[ScopeTargetKey],
+    requested: &[ScopeTargetKey],
+) -> Vec<ScopeTargetKey> {
+    let mut union = current.to_vec();
+    union.extend_from_slice(requested);
+    union.sort_by_key(scope_target_label);
+    union.dedup();
+    union
+}
+
+fn scope_target_label(target: &ScopeTargetKey) -> String {
+    match target {
+        ScopeTargetKey::Workspace { path, access } => {
+            format!("workspace:{access:?}:{path}")
+        }
+        ScopeTargetKey::Repository { area } => {
+            format!("repository:{area:?}")
+        }
+        ScopeTargetKey::NetworkUrl {
+            url,
+            reviewed_target_digest,
+        } => format!("network-url:{url}:{reviewed_target_digest:?}"),
+        ScopeTargetKey::NetworkQuery { query } => {
+            format!("network-query:{query}")
+        }
+        ScopeTargetKey::ExactInvocation { invocation_digest } => {
+            format!("exact-invocation:{invocation_digest:?}")
+        }
+    }
+}
+
+fn plan_action_correlations(
+    plan_action_id: &PlanActionIdV2,
+) -> AuthorityResult<CorrelationSetV2> {
+    CorrelationSetV2::materialize(vec![CorrelationRefV2::PlanAction {
+        value: plan_action_id.to_string(),
+    }])
+    .map_err(|_| storage_fault())
+}
+
+fn project_fact(fact: KernelFactEnvelopeV2) -> AuthorityResult<KernelFactProjectionV2> {
+    let run_id = fact.payload.run_id().clone();
+    let operation_id = fact.payload.operation_id().cloned();
+    let plan_action_id = authorization_plan_action(&fact.payload);
+    let capability_lease = fact.payload.capability_lease();
+    let effect_id = effect_id(&fact.payload);
+    let mut resource_ids = fact
+        .payload
+        .resource_ids()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    resource_ids.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    resource_ids.dedup();
+    let encoded =
+        serde_json::to_value(&fact.payload).map_err(|_| storage_fault())?;
+    let fact_value = encoded
+        .get("fact")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let fact_kind = fact_value
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_owned();
+    let details = fact_value
+        .get("data")
+        .cloned()
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    let domain = match fact.payload {
+        KernelFactPayloadV2::Control(_) => {
+            KernelFactDomainProjectionV2::Control
+        }
+        KernelFactPayloadV2::Authorization(_)
+        | KernelFactPayloadV2::Grant(_) => {
+            KernelFactDomainProjectionV2::Authorization
+        }
+        KernelFactPayloadV2::Invocation(_) => {
+            KernelFactDomainProjectionV2::Invocation
+        }
+        KernelFactPayloadV2::Effect(_) => KernelFactDomainProjectionV2::Effect,
+        KernelFactPayloadV2::Resource(_) => {
+            KernelFactDomainProjectionV2::Resource
+        }
+        KernelFactPayloadV2::Cleanup(_) => {
+            KernelFactDomainProjectionV2::Cleanup
+        }
+    };
+    let projection = KernelFactProjectionV2 {
+        abi_version: fact.abi_version,
+        fact_id: fact.fact_id,
+        ledger_sequence: fact.ledger_sequence,
+        run_sequence: fact.run_sequence,
+        recorded_at: fact.recorded_at,
+        domain,
+        fact_kind,
+        lineage: KernelFactLineageV2 {
+            run_id,
+            control_epoch: fact.payload.control_epoch(),
+            plan_action_ids: plan_action_id.into_iter().collect(),
+            operation_id,
+            capability_lease,
+            invocation_id: fact.payload.invocation_id().cloned(),
+            attempt_id: fact.payload.attempt_id().cloned(),
+            effect_id,
+            resource_ids,
+        },
+        details,
+    };
+    projection.validate().map_err(|_| storage_fault())?;
+    Ok(projection)
+}
+
+fn authorization_plan_action(
+    payload: &KernelFactPayloadV2,
+) -> Option<PlanActionIdV2> {
+    use AuthorizationFactV2 as Fact;
+    match payload {
+        KernelFactPayloadV2::Authorization(
+            Fact::ScopePreviewed { identity, .. }
+            | Fact::CapabilityDenied { identity, .. }
+            | Fact::ExpansionDenied { identity, .. },
+        ) => Some(identity.plan_action_id.clone()),
+        KernelFactPayloadV2::Authorization(
+            Fact::CapabilityIssued { identity, .. }
+            | Fact::ExpansionAllowed { identity, .. }
+            | Fact::LeaseRevoked { identity, .. }
+            | Fact::LeaseSuperseded { identity, .. },
+        ) => Some(identity.plan_action_id.clone()),
+        KernelFactPayloadV2::Authorization(Fact::CapabilityAwaiting {
+            identity,
+            ..
+        }) => Some(identity.plan_action_id.clone()),
+        _ => None,
+    }
+}
+
+
+fn effect_id(
+    payload: &KernelFactPayloadV2,
+) -> Option<deepcode_kernel_abi::v2::EffectId> {
+    use deepcode_kernel_abi::v2::EffectFactV2 as Fact;
+    match payload {
+        KernelFactPayloadV2::Effect(
+            Fact::Observed { identity, .. }
+            | Fact::ObservedAfterCancel { identity, .. }
+            | Fact::ObservedAfterDeadline { identity, .. }
+            | Fact::ObservedAfterCancelAndDeadline { identity, .. }
+            | Fact::Indeterminate { identity, .. },
+        ) => Some(identity.effect_id.clone()),
+        _ => None,
+    }
+}
+
+fn lower_hex(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write;
+        let _ = write!(output, "{byte:02x}");
+    }
+    output
+}
+
+fn recover_public_runs(
+    facts: &[KernelFactEnvelopeV2],
+) -> AuthorityResult<HashMap<RunId, RecoveredRunRecord>> {
+    #[derive(Clone)]
+    struct OpenMetadata {
+        workspace_binding_ref: WorkspaceBindingRefV2,
+        workspace_binding_digest: WorkspaceBindingDigestV2,
+        context_version: ToolContextVersionV2,
+    }
+
+    let mut opened = HashMap::<RunId, OpenMetadata>::new();
+    let mut epochs = HashMap::<RunId, (ControlEpoch, InputId, FactId)>::new();
+    let mut terminated = HashMap::<RunId, bool>::new();
+    for envelope in facts {
+        match &envelope.payload {
+            KernelFactPayloadV2::Control(ControlFactV2::RunOpened {
+                run_id,
+                workspace_binding_ref,
+                workspace_binding_digest,
+                tool_context_ref,
+                ..
+            }) => {
+                if opened
+                    .insert(
+                        run_id.clone(),
+                        OpenMetadata {
+                            workspace_binding_ref: workspace_binding_ref.clone(),
+                            workspace_binding_digest: workspace_binding_digest.clone(),
+                            context_version: tool_context_ref.context_version,
+                        },
+                    )
+                    .is_some()
+                {
+                    return Err(storage_fault());
+                }
+            }
+            KernelFactPayloadV2::Control(ControlFactV2::EpochAdvanced {
+                identity,
+                input_id,
+                ..
+            }) => {
+                epochs.insert(
+                    identity.run_id.clone(),
+                    (
+                        identity.control_epoch,
+                        input_id.clone(),
+                        envelope.fact_id.clone(),
+                    ),
+                );
+            }
+            KernelFactPayloadV2::Control(ControlFactV2::RunTerminated {
+                identity,
+                ..
+            }) => {
+                terminated.insert(identity.run_id.clone(), true);
+            }
+            KernelFactPayloadV2::Authorization(
+                AuthorizationFactV2::ContextInvalidated {
+                    identity,
+                    next_context_version,
+                    ..
+                },
+            ) => {
+                if let Some(metadata) = opened.get_mut(&identity.run_id) {
+                    metadata.context_version = *next_context_version;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut recovered = HashMap::new();
+    for (run_id, metadata) in opened {
+        if terminated.get(&run_id).copied().unwrap_or(false) {
+            continue;
+        }
+        let (control_epoch, current_input_id, control_fact_id) =
+            epochs.remove(&run_id).ok_or_else(storage_fault)?;
+        recovered.insert(
+            run_id,
+            RecoveredRunRecord {
+                workspace_binding_ref: metadata.workspace_binding_ref,
+                workspace_binding_digest: metadata.workspace_binding_digest,
+                control_epoch,
+                context_version: metadata.context_version,
+                current_input_id,
+                control_fact_id,
+            },
+        );
+    }
+    Ok(recovered)
+}
+
+fn recover_runtime_availability(
+    facts: &[KernelFactEnvelopeV2],
+) -> (
+    HashMap<(RunId, ToolIdV2), ToolAvailabilityV2>,
+    HashMap<(RunId, ToolIdV2), bool>,
+) {
+    let mut runtime_availability = HashMap::new();
+    let mut settings_overrides = HashMap::new();
+    for fact in facts {
+        if let KernelFactPayloadV2::Authorization(
+            AuthorizationFactV2::ContextInvalidated {
+                identity,
+                tool_id: Some(tool_id),
+                availability: Some(next),
+                reason,
+                ..
+            },
+        ) = &fact.payload
+        {
+            let key = (identity.run_id.clone(), tool_id.clone());
+            if *reason == ToolContextInvalidationReasonV2::SettingsChanged {
+                settings_overrides
+                    .insert(key, *next == ToolAvailabilityV2::Ready);
+            } else {
+                runtime_availability.insert(key, *next);
+            }
+        }
+    }
+    (runtime_availability, settings_overrides)
+}
+
+struct RecoveredAuthorityMaterialV2 {
+    previews: HashMap<CapabilityScopePreviewIdV2, PreparedScopePreview>,
+    leases: HashMap<CapabilityLeaseIdV2, CapabilityLeaseRecord>,
+    trusts: HashMap<TrustPolicyIdV2, TrustLeaseRecord>,
+    pending: HashMap<CapabilityScopePreviewIdV2, PendingIntent>,
+}
+
+fn recover_authority_material(
+    facts: &[KernelFactEnvelopeV2],
+    material: Vec<AuthorityMaterialRecordV2>,
+) -> AuthorityResult<RecoveredAuthorityMaterialV2> {
+    let facts_by_id = facts
+        .iter()
+        .map(|fact| (fact.fact_id.clone(), fact))
+        .collect::<HashMap<_, _>>();
+    let mut previews = HashMap::new();
+    let mut leases = HashMap::new();
+    let mut trusts = HashMap::new();
+    let mut pending = HashMap::new();
+    for record in material {
+        if record.lifecycle == AUTHORITY_MATERIAL_STALE {
+            continue;
+        }
+        match record.material_kind.as_str() {
+            AUTHORITY_MATERIAL_PREVIEW => {
+                if record.lifecycle != AUTHORITY_MATERIAL_ACTIVE
+                    || record.lease.is_some()
+                {
+                    return Err(storage_fault());
+                }
+                let durable: DurablePreparedScopePreviewV2 =
+                    serde_json::from_value(record.payload_json)
+                        .map_err(|_| storage_fault())?;
+                durable.record.validate().map_err(|_| storage_fault())?;
+                if durable.record.authorization_digest
+                    != durable.authorization_digest
+                    || durable.record.run_id != record.run_id
+                    || durable.record.control_epoch.get() != record.control_epoch
+                    || durable.record.operation_id.as_str()
+                        != record
+                            .operation_id
+                            .as_ref()
+                            .map(OperationId::as_str)
+                            .unwrap_or("")
+                    || durable.record.preview_id.as_str() != record.material_id
+                    || record.invocation_id.is_some()
+                {
+                    return Err(storage_fault());
+                }
+                let source = facts_by_id
+                    .get(&record.source_fact_id)
+                    .copied()
+                    .ok_or_else(storage_fault)?;
+                let KernelFactPayloadV2::Authorization(
+                    AuthorizationFactV2::ScopePreviewed {
+                        identity,
+                        preview_id,
+                        tool_id,
+                        canonical_arguments_digest,
+                        scope_digest,
+                        tool_contract_digest,
+                        context_ref,
+                        disposition,
+                    },
+                ) = &source.payload
+                else {
+                    return Err(storage_fault());
+                };
+                if identity.run_id != durable.record.run_id
+                    || identity.control_epoch != durable.record.control_epoch
+                    || identity.plan_revision != durable.record.plan_revision
+                    || identity.plan_action_id != durable.record.plan_action_id
+                    || identity.operation_id != durable.record.operation_id
+                    || preview_id != &durable.record.preview_id
+                    || tool_id != &durable.record.tool_id
+                    || canonical_arguments_digest
+                        != &durable.record.canonical_arguments_digest
+                    || scope_digest != &durable.record.scope_digest
+                    || tool_contract_digest
+                        != &durable.record.tool_contract_digest
+                    || context_ref != &durable.record.context_ref
+                    || disposition != &durable.record.disposition
+                {
+                    return Err(storage_fault());
+                }
+                let preview_id = durable.record.preview_id.clone();
+                if previews
+                    .insert(
+                        preview_id,
+                        durable.into_prepared(record.source_fact_id),
+                    )
+                    .is_some()
+                {
+                    return Err(storage_fault());
+                }
+            }
+            AUTHORITY_MATERIAL_LEASE => {
+                if record.lifecycle != AUTHORITY_MATERIAL_ACTIVE {
+                    return Err(storage_fault());
+                }
+                let durable: DurableCapabilityLeaseV2 =
+                    serde_json::from_value(record.payload_json)
+                        .map_err(|_| storage_fault())?;
+                if durable.run_id != record.run_id
+                    || durable.control_epoch.get() != record.control_epoch
+                    || durable.issuance_operation_id != *record
+                        .operation_id
+                        .as_ref()
+                        .ok_or_else(storage_fault)?
+                    || durable.reference.lease_id.as_str() != record.material_id
+                    || record.invocation_id.is_some()
+                    || record.lease.as_ref() != Some(&durable.reference)
+                {
+                    return Err(storage_fault());
+                }
+                let last = facts_by_id
+                    .get(&record.last_fact_id)
+                    .copied()
+                    .ok_or_else(storage_fault)?;
+                let valid_fact = match &last.payload {
+                    KernelFactPayloadV2::Authorization(
+                        AuthorizationFactV2::CapabilityIssued {
+                            identity,
+                            scope_digest,
+                            ..
+                        },
+                    ) => {
+                        identity.lease_id == durable.reference.lease_id
+                            && identity.lease_version
+                                == durable.reference.version
+                            && scope_digest == &durable.reference.scope_digest
+                    }
+                    KernelFactPayloadV2::Authorization(
+                        AuthorizationFactV2::ExpansionAllowed {
+                            identity,
+                            expanded_scope_digest,
+                            ..
+                        },
+                    ) => {
+                        identity.lease_id == durable.reference.lease_id
+                            && identity.lease_version
+                                == durable.reference.version
+                            && expanded_scope_digest
+                                == &durable.reference.scope_digest
+                    }
+                    _ => false,
+                };
+                if !valid_fact {
+                    return Err(storage_fault());
+                }
+                let lease_id = durable.reference.lease_id.clone();
+                if leases
+                    .insert(
+                        lease_id,
+                        durable.into_record(
+                            record.last_fact_id,
+                            record.last_ledger_sequence,
+                        ),
+                    )
+                    .is_some()
+                {
+                    return Err(storage_fault());
+                }
+            }
+            AUTHORITY_MATERIAL_PENDING => {
+                if record.lifecycle != AUTHORITY_MATERIAL_AWAITING {
+                    if matches!(
+                        record.lifecycle.as_str(),
+                        AUTHORITY_MATERIAL_ADMITTED | AUTHORITY_MATERIAL_REJECTED
+                    ) {
+                        continue;
+                    }
+                    return Err(storage_fault());
+                }
+                let durable: DurablePendingIntentV2 =
+                    serde_json::from_value(record.payload_json)
+                        .map_err(|_| storage_fault())?;
+                if durable.run_id != record.run_id
+                    || durable.expected_control_epoch.get()
+                        != record.control_epoch
+                    || durable.operation_id != *record
+                        .operation_id
+                        .as_ref()
+                        .ok_or_else(storage_fault)?
+                    || durable.invocation_id != *record
+                        .invocation_id
+                        .as_ref()
+                        .ok_or_else(storage_fault)?
+                    || durable.preview_id.as_str() != record.material_id
+                {
+                    return Err(storage_fault());
+                }
+                let source = facts_by_id
+                    .get(&record.source_fact_id)
+                    .copied()
+                    .ok_or_else(storage_fault)?;
+                let KernelFactPayloadV2::Authorization(
+                    AuthorizationFactV2::CapabilityAwaiting {
+                        identity,
+                        preview_id,
+                        tool_id,
+                        ..
+                    },
+                ) = &source.payload
+                else {
+                    return Err(storage_fault());
+                };
+                if identity.run_id != durable.run_id
+                    || identity.control_epoch
+                        != durable.expected_control_epoch
+                    || identity.operation_id != durable.operation_id
+                    || identity.invocation_id != durable.invocation_id
+                    || preview_id != &durable.preview_id
+                    || tool_id != &durable.tool_id
+                {
+                    return Err(storage_fault());
+                }
+                let preview_id = durable.preview_id.clone();
+                if pending
+                    .insert(
+                        preview_id,
+                        durable.into_pending(record.source_fact_id),
+                    )
+                    .is_some()
+                {
+                    return Err(storage_fault());
+                }
+            }
+            AUTHORITY_MATERIAL_TRUST => {
+                if record.lifecycle != AUTHORITY_MATERIAL_ACTIVE {
+                    if record.lifecycle == AUTHORITY_MATERIAL_REVOKED {
+                        continue;
+                    }
+                    return Err(storage_fault());
+                }
+                if record.lease.is_some() || record.invocation_id.is_some() {
+                    return Err(storage_fault());
+                }
+                let durable: DurableTrustLeaseV2 =
+                    serde_json::from_value(record.payload_json)
+                        .map_err(|_| storage_fault())?;
+                if durable.run_id != record.run_id
+                    || durable.control_epoch.get() != record.control_epoch
+                    || durable.issuance_operation_id
+                        != *record.operation_id.as_ref().ok_or_else(storage_fault)?
+                    || durable.trust_policy_id.as_str() != record.material_id
+                {
+                    return Err(storage_fault());
+                }
+                let last = facts_by_id
+                    .get(&record.last_fact_id)
+                    .copied()
+                    .ok_or_else(storage_fault)?;
+                let KernelFactPayloadV2::Authorization(
+                    AuthorizationFactV2::TrustGranted {
+                        identity,
+                        trust_policy_id,
+                        trust_lease_digest,
+                        tool_id,
+                        scope_digest,
+                        workspace_binding_digest,
+                        context_ref,
+                        expires_at,
+                    },
+                ) = &last.payload
+                else {
+                    return Err(storage_fault());
+                };
+                if identity.run_id != durable.run_id
+                    || identity.control_epoch != durable.control_epoch
+                    || identity.plan_revision != durable.plan_revision
+                    || identity.plan_action_id != durable.plan_action_id
+                    || identity.operation_id != durable.issuance_operation_id
+                    || trust_policy_id != &durable.trust_policy_id
+                    || trust_lease_digest != &durable.trust_lease_digest
+                    || tool_id != &durable.tool_id
+                    || scope_digest != &durable.scope_digest
+                    || workspace_binding_digest
+                        != &durable.workspace_binding_digest
+                    || context_ref != &durable.context_ref
+                    || expires_at != &durable.expires_at
+                {
+                    return Err(storage_fault());
+                }
+                let trust_policy_id = durable.trust_policy_id.clone();
+                if trusts
+                    .insert(
+                        trust_policy_id,
+                        durable.into_record(record.last_fact_id),
+                    )
+                    .is_some()
+                {
+                    return Err(storage_fault());
+                }
+            }
+            AUTHORITY_MATERIAL_INVOCATION => {
+                if record.lifecycle != AUTHORITY_MATERIAL_TERMINAL
+                    || record.invocation_id.as_ref().map(InvocationId::as_str)
+                        != Some(record.material_id.as_str())
+                {
+                    return Err(storage_fault());
+                }
+                let invocation_id =
+                    record.invocation_id.as_ref().ok_or_else(storage_fault)?;
+                let operation_id =
+                    record.operation_id.as_ref().ok_or_else(storage_fault)?;
+                let source = facts_by_id
+                    .get(&record.source_fact_id)
+                    .copied()
+                    .ok_or_else(storage_fault)?;
+                let last = facts_by_id
+                    .get(&record.last_fact_id)
+                    .copied()
+                    .ok_or_else(storage_fault)?;
+                if source.payload.run_id() != &record.run_id
+                    || source.payload.control_epoch().map(ControlEpoch::get)
+                        != Some(record.control_epoch)
+                    || source.payload.operation_id() != Some(operation_id)
+                    || source.payload.invocation_id() != Some(invocation_id)
+                    || !matches!(
+                        &source.payload,
+                        KernelFactPayloadV2::Invocation(
+                            InvocationFactV2::ToolIntentAdmitted { .. }
+                        )
+                    )
+                    || last.payload.run_id() != &record.run_id
+                    || last.payload.control_epoch().map(ControlEpoch::get)
+                        != Some(record.control_epoch)
+                    || last.payload.operation_id() != Some(operation_id)
+                    || last.payload.invocation_id() != Some(invocation_id)
+                    || !matches!(
+                        &last.payload,
+                        KernelFactPayloadV2::Invocation(
+                            InvocationFactV2::ToolFailedBeforeEffect { .. }
+                                | InvocationFactV2::ToolCancelledBeforeEffect { .. }
+                                | InvocationFactV2::ToolTimedOutBeforeEffect { .. }
+                                | InvocationFactV2::ToolCompleted { .. }
+                                | InvocationFactV2::ToolFailedAfterObservedEffect { .. }
+                                | InvocationFactV2::ToolIndeterminate { .. }
+                        )
+                    )
+                {
+                    return Err(storage_fault());
+                }
+            }
+            _ => return Err(storage_fault()),
+        }
+    }
+    Ok(RecoveredAuthorityMaterialV2 {
+        previews,
+        leases,
+        trusts,
+        pending,
+    })
+}
+
+fn recorded_at_unix_millis(recorded_at: &RecordedAtV2) -> Option<u128> {
+    let value = recorded_at.as_str().as_bytes();
+    let parse = |start: usize, end: usize| {
+        std::str::from_utf8(&value[start..end])
+            .ok()?
+            .parse::<i64>()
+            .ok()
+    };
+    let mut year = parse(0, 4)?;
+    let month = parse(5, 7)?;
+    let day = parse(8, 10)?;
+    let hour = parse(11, 13)?;
+    let minute = parse(14, 16)?;
+    let second = parse(17, 19)?;
+    let millis = parse(20, 23)?;
+    year -= i64::from(month <= 2);
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let shifted_month = month + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * shifted_month + 2) / 5 + day - 1;
+    let day_of_era =
+        year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days_since_epoch = era * 146_097 + day_of_era - 719_468;
+    if days_since_epoch < 0 {
+        return None;
+    }
+    let seconds = days_since_epoch
+        .checked_mul(86_400)?
+        .checked_add(hour.checked_mul(3_600)?)?
+        .checked_add(minute.checked_mul(60)?)?
+        .checked_add(second)?;
+    u128::try_from(seconds)
+        .ok()?
+        .checked_mul(1_000)?
+        .checked_add(u128::try_from(millis).ok()?)
+}
+
+fn recorded_at_is_future(recorded_at: &RecordedAtV2) -> bool {
+    let Some(expiry) = recorded_at_unix_millis(recorded_at) else {
+        return false;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(u128::MAX);
+    expiry > now
+}
+
+fn recorded_at_after(duration: std::time::Duration) -> AuthorityResult<RecordedAtV2> {
+    let timestamp = std::time::SystemTime::now()
+        .checked_add(duration)
+        .ok_or_else(storage_fault)?
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| storage_fault())?;
+    let total_seconds =
+        i64::try_from(timestamp.as_secs()).map_err(|_| storage_fault())?;
+    let days = total_seconds.div_euclid(86_400);
+    let seconds_of_day = total_seconds.rem_euclid(86_400);
+    let shifted_days = days + 719_468;
+    let era = if shifted_days >= 0 {
+        shifted_days
+    } else {
+        shifted_days - 146_096
+    }
+    .div_euclid(146_097);
+    let day_of_era = shifted_days - era * 146_097;
+    let year_of_era = (day_of_era - day_of_era / 1_460
+        + day_of_era / 36_524
+        - day_of_era / 146_096)
+        / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year =
+        day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    let hour = seconds_of_day / 3_600;
+    let minute = seconds_of_day % 3_600 / 60;
+    let second = seconds_of_day % 60;
+    RecordedAtV2::new(format!(
+        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{:03}Z",
+        timestamp.subsec_millis()
+    ))
+    .map_err(|_| storage_fault())
+}
+
+fn public_receipt(
+    request_id: CommandRequestId,
+    request_digest: CommandRequestDigestV2,
+    command_kind: impl Into<String>,
+    run_id: Option<RunId>,
+    reply: &DurablePublicReplyV2,
+    settlement_fact_id: Option<FactId>,
+) -> AuthorityResult<PublicCommandReceiptV2> {
+    Ok(PublicCommandReceiptV2 {
+        command_request_id: request_id,
+        command_request_digest: request_digest,
+        command_kind: command_kind.into(),
+        run_id,
+        reply_json: serde_json::to_value(reply).map_err(|_| storage_fault())?,
+        settlement_fact_id,
+    })
+}
+
+fn receipt_outcome(
+    outcome: PutPublicCommandReceiptOutcomeV2,
+) -> AuthorityResult<DurablePublicReplyV2> {
+    match outcome {
+        PutPublicCommandReceiptOutcomeV2::Inserted(receipt)
+        | PutPublicCommandReceiptOutcomeV2::ExistingSame(receipt) => {
+            serde_json::from_value(receipt.reply_json).map_err(|_| storage_fault())
+        }
+        PutPublicCommandReceiptOutcomeV2::DigestConflict {
+            command_request_id,
+            existing,
+            submitted,
+        } => Err(KernelErrorV2::DuplicateCommandDigestMismatch {
+            command_request_id,
+            existing,
+            submitted,
+        }),
+    }
+}
+
+fn public_command_run_id(command: &KernelCommandV2) -> Option<RunId> {
+    match command {
+        KernelCommandV2::ToolContextGet(command) => Some(command.run_id.clone()),
+        KernelCommandV2::CapabilityScopePreview(command) => {
+            Some(command.run_id.clone())
+        }
+        KernelCommandV2::ToolIntentSubmit(command) => Some(command.run_id.clone()),
+        KernelCommandV2::KernelFactsQueryScoped(command) => {
+            Some(command.run_id.clone())
+        }
+        KernelCommandV2::ControlEpochAdvance(command) => Some(command.run_id.clone()),
+        KernelCommandV2::InvocationCancel(command) => Some(command.run_id.clone()),
+        KernelCommandV2::RunOpen(_) => None,
+    }
+}
+
+fn kernel_reply_settlement_fact(reply: &KernelReplyV2) -> Option<FactId> {
+    match reply {
+        KernelReplyV2::ToolIntentSubmission(
+            ToolIntentSubmitReplyV2::Admitted {
+                admission_fact_id,
+                ..
+            },
+        ) => Some(admission_fact_id.clone()),
+        KernelReplyV2::ToolIntentSubmission(
+            ToolIntentSubmitReplyV2::AwaitingCapability {
+                awaiting_fact_id,
+                ..
+            },
+        ) => Some(awaiting_fact_id.clone()),
+        KernelReplyV2::ToolIntentSubmission(
+            ToolIntentSubmitReplyV2::Rejected {
+                rejection_fact_id,
+                ..
+            },
+        ) => Some(rejection_fact_id.clone()),
+        KernelReplyV2::ControlEpochAdvanced(reply) => {
+            Some(reply.epoch_fact_id.clone())
+        }
+        KernelReplyV2::InvocationCancelResult(
+            deepcode_kernel_abi::v2_command::InvocationCancelReplyV2::Requested {
+                fact_id,
+                ..
+            }
+            | deepcode_kernel_abi::v2_command::InvocationCancelReplyV2::AlreadyRequested {
+                fact_id,
+                ..
+            },
+        ) => Some(fact_id.clone()),
+        KernelReplyV2::InvocationCancelResult(
+            deepcode_kernel_abi::v2_command::InvocationCancelReplyV2::AlreadyTerminal {
+                terminal_fact_id,
+                ..
+            },
+        ) => Some(terminal_fact_id.clone()),
+        _ => None,
+    }
+}
+
+fn user_decision_settlement_fact(reply: &UserDecisionReplyV2) -> Option<FactId> {
+    match reply {
+        UserDecisionReplyV2::CapabilityIssued { fact_id, .. }
+        | UserDecisionReplyV2::CapabilityDenied { fact_id, .. }
+        | UserDecisionReplyV2::ScopeExpansionRecorded { fact_id, .. }
+        | UserDecisionReplyV2::ScopeExpansionDenied { fact_id, .. }
+        | UserDecisionReplyV2::TrustGranted { fact_id, .. }
+        | UserDecisionReplyV2::Revoked { fact_id, .. } => Some(fact_id.clone()),
+        UserDecisionReplyV2::Stale { .. } | UserDecisionReplyV2::Error(_) => None,
+    }
+}
+
+impl Default for SettingsCeilingV2 {
+    fn default() -> Self {
+        Self {
+            workspace_read: true,
+            workspace_write: true,
+            git_write: false,
+            web_read: false,
+            private_web_read: false,
+            auto_approve_plans: false,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct KernelSessionServiceV2 {
+    inner: Arc<KernelSessionInner>,
+}
+
+/// Host transport result for RunOpen. The capability is deliberately kept
+/// outside the serializable Kernel reply and may only be moved into a trusted
+/// transport header or another private Host channel.
+pub struct OpenedRunTransportV2 {
+    response: KernelCommandResponseEnvelopeV2,
+    run_capability: Option<RunCapabilityV2>,
+}
+
+impl OpenedRunTransportV2 {
+    pub fn into_parts(
+        self,
+    ) -> (KernelCommandResponseEnvelopeV2, Option<RunCapabilityV2>) {
+        (self.response, self.run_capability)
+    }
+}
+
+struct KernelSessionInner {
+    authority: AuthorityService,
+    startup_settings: SettingsCeilingV2,
+    inventory: ToolInventoryV2,
+    state: Mutex<KernelSessionState>,
+    command_gate: Mutex<()>,
+    ids: PublicIdMint,
+}
+
+#[derive(Default)]
+struct KernelSessionState {
+    runs: HashMap<RunId, PublicRunRecord>,
+    recovered_runs: HashMap<RunId, RecoveredRunRecord>,
+    previews: HashMap<CapabilityScopePreviewIdV2, PreparedScopePreview>,
+    leases: HashMap<CapabilityLeaseIdV2, CapabilityLeaseRecord>,
+    trusts: HashMap<TrustPolicyIdV2, TrustLeaseRecord>,
+    pending: HashMap<CapabilityScopePreviewIdV2, PendingIntent>,
+    runtime_availability: HashMap<(RunId, ToolIdV2), ToolAvailabilityV2>,
+    run_settings: HashMap<RunId, SettingsCeilingV2>,
+    settings_tool_overrides: HashMap<(RunId, ToolIdV2), bool>,
+}
+
+#[derive(Clone)]
+struct PublicRunRecord {
+    capability: RunCapabilityV2,
+    workspace_binding_ref: WorkspaceBindingRefV2,
+    workspace_binding_digest: WorkspaceBindingDigestV2,
+    control_epoch: ControlEpoch,
+    current_input_id: InputId,
+    context_version: ToolContextVersionV2,
+    control_fact_id: FactId,
+}
+
+#[derive(Clone)]
+struct RecoveredRunRecord {
+    workspace_binding_ref: WorkspaceBindingRefV2,
+    workspace_binding_digest: WorkspaceBindingDigestV2,
+    control_epoch: ControlEpoch,
+    context_version: ToolContextVersionV2,
+    current_input_id: InputId,
+    control_fact_id: FactId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+enum ScopeTargetKey {
+    Workspace {
+        path: String,
+        access: ResourceAccessV2,
+    },
+    Repository {
+        area: RepositoryAreaV2,
+    },
+    NetworkUrl {
+        url: String,
+        reviewed_target_digest: NetworkTargetObservationDigestV2,
+    },
+    NetworkQuery {
+        query: String,
+    },
+    ExactInvocation {
+        invocation_digest: ExactInvocationDigestV2,
+    },
+}
+
+#[derive(Clone)]
+struct PreparedScopePreview {
+    record: CapabilityScopePreviewRecordV2,
+    approved_targets: Vec<ScopeTargetKey>,
+    authorization_digest: CapabilityAuthorizationDigestV2,
+    preview_fact_id: FactId,
+    automatic_decision_ref: Option<UserDecisionRefV2>,
+}
+
+impl PreparedScopePreview {
+    fn durable(&self) -> DurablePreparedScopePreviewV2 {
+        DurablePreparedScopePreviewV2 {
+            record: self.record.clone(),
+            approved_targets: self.approved_targets.clone(),
+            authorization_digest: self.authorization_digest.clone(),
+            automatic_decision_ref: self.automatic_decision_ref.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DurablePreparedScopePreviewV2 {
+    record: CapabilityScopePreviewRecordV2,
+    approved_targets: Vec<ScopeTargetKey>,
+    authorization_digest: CapabilityAuthorizationDigestV2,
+    automatic_decision_ref: Option<UserDecisionRefV2>,
+}
+
+impl DurablePreparedScopePreviewV2 {
+    fn into_prepared(self, preview_fact_id: FactId) -> PreparedScopePreview {
+        PreparedScopePreview {
+            record: self.record,
+            approved_targets: self.approved_targets,
+            authorization_digest: self.authorization_digest,
+            preview_fact_id,
+            automatic_decision_ref: self.automatic_decision_ref,
+        }
+    }
+}
+
+fn scope_preview_material(
+    durable: &DurablePreparedScopePreviewV2,
+    lifecycle: &str,
+) -> AuthorityResult<AuthorityMaterialDraftV2> {
+    Ok(AuthorityMaterialDraftV2 {
+        material_kind: AUTHORITY_MATERIAL_PREVIEW.to_owned(),
+        material_id: durable.record.preview_id.to_string(),
+        run_id: durable.record.run_id.clone(),
+        control_epoch: durable.record.control_epoch.get(),
+        lifecycle: lifecycle.to_owned(),
+        operation_id: Some(durable.record.operation_id.clone()),
+        invocation_id: None,
+        lease: None,
+        payload_json: serde_json::to_value(durable).map_err(|_| storage_fault())?,
+    })
+}
+
+#[derive(Clone)]
+struct CapabilityLeaseRecord {
+    reference: CapabilityLeaseRefV2,
+    run_id: RunId,
+    control_epoch: ControlEpoch,
+    plan_revision: PlanRevisionV2,
+    plan_action_id: PlanActionIdV2,
+    tool_id: ToolIdV2,
+    context_ref: ToolContextRefV2,
+    approved_targets: Vec<ScopeTargetKey>,
+    decision_ref: Option<UserDecisionRefV2>,
+    issuance_operation_id: OperationId,
+    preview_id: CapabilityScopePreviewIdV2,
+    issuance_fact_id: FactId,
+    issuance_ledger_sequence: u64,
+}
+
+impl CapabilityLeaseRecord {
+    fn durable(&self) -> DurableCapabilityLeaseV2 {
+        DurableCapabilityLeaseV2 {
+            reference: self.reference.clone(),
+            run_id: self.run_id.clone(),
+            control_epoch: self.control_epoch,
+            plan_revision: self.plan_revision.clone(),
+            plan_action_id: self.plan_action_id.clone(),
+            tool_id: self.tool_id.clone(),
+            context_ref: self.context_ref.clone(),
+            approved_targets: self.approved_targets.clone(),
+            decision_ref: self.decision_ref.clone(),
+            issuance_operation_id: self.issuance_operation_id.clone(),
+            preview_id: self.preview_id.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DurableCapabilityLeaseV2 {
+    reference: CapabilityLeaseRefV2,
+    run_id: RunId,
+    control_epoch: ControlEpoch,
+    plan_revision: PlanRevisionV2,
+    plan_action_id: PlanActionIdV2,
+    tool_id: ToolIdV2,
+    context_ref: ToolContextRefV2,
+    approved_targets: Vec<ScopeTargetKey>,
+    decision_ref: Option<UserDecisionRefV2>,
+    issuance_operation_id: OperationId,
+    preview_id: CapabilityScopePreviewIdV2,
+}
+
+impl DurableCapabilityLeaseV2 {
+    fn into_record(
+        self,
+        issuance_fact_id: FactId,
+        issuance_ledger_sequence: u64,
+    ) -> CapabilityLeaseRecord {
+        CapabilityLeaseRecord {
+            reference: self.reference,
+            run_id: self.run_id,
+            control_epoch: self.control_epoch,
+            plan_revision: self.plan_revision,
+            plan_action_id: self.plan_action_id,
+            tool_id: self.tool_id,
+            context_ref: self.context_ref,
+            approved_targets: self.approved_targets,
+            decision_ref: self.decision_ref,
+            issuance_operation_id: self.issuance_operation_id,
+            preview_id: self.preview_id,
+            issuance_fact_id,
+            issuance_ledger_sequence,
+        }
+    }
+}
+
+fn capability_lease_material(
+    durable: &DurableCapabilityLeaseV2,
+    lifecycle: &str,
+) -> AuthorityResult<AuthorityMaterialDraftV2> {
+    Ok(AuthorityMaterialDraftV2 {
+        material_kind: AUTHORITY_MATERIAL_LEASE.to_owned(),
+        material_id: durable.reference.lease_id.to_string(),
+        run_id: durable.run_id.clone(),
+        control_epoch: durable.control_epoch.get(),
+        lifecycle: lifecycle.to_owned(),
+        operation_id: Some(durable.issuance_operation_id.clone()),
+        invocation_id: None,
+        lease: Some(durable.reference.clone()),
+        payload_json: serde_json::to_value(durable).map_err(|_| storage_fault())?,
+    })
+}
+
+#[derive(Clone)]
+struct TrustLeaseRecord {
+    trust_policy_id: TrustPolicyIdV2,
+    trust_lease_digest: TrustLeaseDigestV2,
+    run_id: RunId,
+    control_epoch: ControlEpoch,
+    plan_revision: PlanRevisionV2,
+    plan_action_id: PlanActionIdV2,
+    issuance_operation_id: OperationId,
+    tool_id: ToolIdV2,
+    scope_digest: CapabilityScopeDigestV2,
+    approved_targets: Vec<ScopeTargetKey>,
+    workspace_binding_digest: WorkspaceBindingDigestV2,
+    context_ref: ToolContextRefV2,
+    expires_at: Option<RecordedAtV2>,
+    decision_ref: UserDecisionRefV2,
+    fact_id: FactId,
+}
+
+impl TrustLeaseRecord {
+    fn durable(&self) -> DurableTrustLeaseV2 {
+        DurableTrustLeaseV2 {
+            trust_policy_id: self.trust_policy_id.clone(),
+            trust_lease_digest: self.trust_lease_digest.clone(),
+            run_id: self.run_id.clone(),
+            control_epoch: self.control_epoch,
+            plan_revision: self.plan_revision.clone(),
+            plan_action_id: self.plan_action_id.clone(),
+            issuance_operation_id: self.issuance_operation_id.clone(),
+            tool_id: self.tool_id.clone(),
+            scope_digest: self.scope_digest.clone(),
+            approved_targets: self.approved_targets.clone(),
+            workspace_binding_digest: self.workspace_binding_digest.clone(),
+            context_ref: self.context_ref.clone(),
+            expires_at: self.expires_at.clone(),
+            decision_ref: self.decision_ref.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DurableTrustLeaseV2 {
+    trust_policy_id: TrustPolicyIdV2,
+    trust_lease_digest: TrustLeaseDigestV2,
+    run_id: RunId,
+    control_epoch: ControlEpoch,
+    plan_revision: PlanRevisionV2,
+    plan_action_id: PlanActionIdV2,
+    issuance_operation_id: OperationId,
+    tool_id: ToolIdV2,
+    scope_digest: CapabilityScopeDigestV2,
+    approved_targets: Vec<ScopeTargetKey>,
+    workspace_binding_digest: WorkspaceBindingDigestV2,
+    context_ref: ToolContextRefV2,
+    expires_at: Option<RecordedAtV2>,
+    decision_ref: UserDecisionRefV2,
+}
+
+impl DurableTrustLeaseV2 {
+    fn into_record(self, fact_id: FactId) -> TrustLeaseRecord {
+        TrustLeaseRecord {
+            trust_policy_id: self.trust_policy_id,
+            trust_lease_digest: self.trust_lease_digest,
+            run_id: self.run_id,
+            control_epoch: self.control_epoch,
+            plan_revision: self.plan_revision,
+            plan_action_id: self.plan_action_id,
+            issuance_operation_id: self.issuance_operation_id,
+            tool_id: self.tool_id,
+            scope_digest: self.scope_digest,
+            approved_targets: self.approved_targets,
+            workspace_binding_digest: self.workspace_binding_digest,
+            context_ref: self.context_ref,
+            expires_at: self.expires_at,
+            decision_ref: self.decision_ref,
+            fact_id,
+        }
+    }
+}
+
+fn trust_lease_material(
+    durable: &DurableTrustLeaseV2,
+    lifecycle: &str,
+) -> AuthorityResult<AuthorityMaterialDraftV2> {
+    Ok(AuthorityMaterialDraftV2 {
+        material_kind: AUTHORITY_MATERIAL_TRUST.to_owned(),
+        material_id: durable.trust_policy_id.to_string(),
+        run_id: durable.run_id.clone(),
+        control_epoch: durable.control_epoch.get(),
+        lifecycle: lifecycle.to_owned(),
+        operation_id: Some(durable.issuance_operation_id.clone()),
+        invocation_id: None,
+        lease: None,
+        payload_json: serde_json::to_value(durable).map_err(|_| storage_fault())?,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PendingIntent {
+    run_id: RunId,
+    expected_control_epoch: ControlEpoch,
+    operation_id: OperationId,
+    idempotency_key: String,
+    tool_id: ToolIdV2,
+    raw_arguments: deepcode_kernel_abi::RawToolArgumentsV2,
+    authority: ToolIntentAuthorityV2,
+    deadline: DeadlineRequestV2,
+    tool_context_ref: ToolContextRefV2,
+    invocation_id: InvocationId,
+    awaiting_fact_id: FactId,
+    preview_id: CapabilityScopePreviewIdV2,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DurablePendingIntentV2 {
+    run_id: RunId,
+    expected_control_epoch: ControlEpoch,
+    operation_id: OperationId,
+    idempotency_key: String,
+    tool_id: ToolIdV2,
+    raw_arguments: deepcode_kernel_abi::RawToolArgumentsV2,
+    authority: ToolIntentAuthorityV2,
+    deadline: DeadlineRequestV2,
+    tool_context_ref: ToolContextRefV2,
+    invocation_id: InvocationId,
+    preview_id: CapabilityScopePreviewIdV2,
+}
+
+impl PendingIntent {
+    fn durable(&self) -> DurablePendingIntentV2 {
+        DurablePendingIntentV2 {
+            run_id: self.run_id.clone(),
+            expected_control_epoch: self.expected_control_epoch,
+            operation_id: self.operation_id.clone(),
+            idempotency_key: self.idempotency_key.clone(),
+            tool_id: self.tool_id.clone(),
+            raw_arguments: self.raw_arguments.clone(),
+            authority: self.authority.clone(),
+            deadline: self.deadline,
+            tool_context_ref: self.tool_context_ref.clone(),
+            invocation_id: self.invocation_id.clone(),
+            preview_id: self.preview_id.clone(),
+        }
+    }
+}
+
+impl DurablePendingIntentV2 {
+    fn from_command(
+        command: &ToolIntentSubmitV2,
+        invocation_id: InvocationId,
+        preview_id: CapabilityScopePreviewIdV2,
+    ) -> Self {
+        Self {
+            run_id: command.run_id.clone(),
+            expected_control_epoch: command.expected_control_epoch,
+            operation_id: command.operation_id.clone(),
+            idempotency_key: command.idempotency_key.clone(),
+            tool_id: command.tool_id.clone(),
+            raw_arguments: command.raw_arguments.clone(),
+            authority: command.authority.clone(),
+            deadline: command.deadline,
+            tool_context_ref: command.tool_context_ref.clone(),
+            invocation_id,
+            preview_id,
+        }
+    }
+
+    fn into_pending(self, awaiting_fact_id: FactId) -> PendingIntent {
+        PendingIntent {
+            run_id: self.run_id,
+            expected_control_epoch: self.expected_control_epoch,
+            operation_id: self.operation_id,
+            idempotency_key: self.idempotency_key,
+            tool_id: self.tool_id,
+            raw_arguments: self.raw_arguments,
+            authority: self.authority,
+            deadline: self.deadline,
+            tool_context_ref: self.tool_context_ref,
+            invocation_id: self.invocation_id,
+            awaiting_fact_id,
+            preview_id: self.preview_id,
+        }
+    }
+}
+
+fn pending_intent_material(
+    pending: &DurablePendingIntentV2,
+    lifecycle: &str,
+    lease: Option<CapabilityLeaseRefV2>,
+) -> AuthorityResult<AuthorityMaterialDraftV2> {
+    Ok(AuthorityMaterialDraftV2 {
+        material_kind: AUTHORITY_MATERIAL_PENDING.to_owned(),
+        material_id: pending.preview_id.to_string(),
+        run_id: pending.run_id.clone(),
+        control_epoch: pending.expected_control_epoch.get(),
+        lifecycle: lifecycle.to_owned(),
+        operation_id: Some(pending.operation_id.clone()),
+        invocation_id: Some(pending.invocation_id.clone()),
+        lease,
+        payload_json: serde_json::to_value(pending).map_err(|_| storage_fault())?,
+    })
+}
+
+#[derive(Clone)]
+struct PublicCommandContext {
+    request_id: CommandRequestId,
+    request_digest: CommandRequestDigestV2,
+    command_kind: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    content = "data",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+enum DurablePublicReplyV2 {
+    Kernel { reply: KernelReplyV2 },
+    RunOpen {
+        run_id: RunId,
+        control_epoch: ControlEpoch,
+        workspace_binding_digest: WorkspaceBindingDigestV2,
+        context_version: ToolContextVersionV2,
+    },
+    Facts { page: DurableFactPageV2 },
+    UserDecision { reply: UserDecisionReplyV2 },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DurableFactPageV2 {
+    run_id: RunId,
+    requested_after_ledger_sequence: u64,
+    snapshot_high_water: u64,
+    facts: Vec<KernelFactProjectionV2>,
+    has_more: bool,
+    next_after_ledger_sequence: u64,
+}
+
+struct PublicIdMint {
+    nonce: String,
+    next: std::sync::atomic::AtomicU64,
+}
+
+impl PublicIdMint {
+    fn new() -> AuthorityResult<Self> {
+        let mut entropy = [0u8; 32];
+        File::open("/dev/urandom")
+            .and_then(|mut file| file.read_exact(&mut entropy))
+            .map_err(|_| storage_fault())?;
+        Ok(Self {
+            nonce: lower_hex(&entropy),
+            next: std::sync::atomic::AtomicU64::new(1),
+        })
+    }
+
+    fn raw(&self, kind: &str) -> String {
+        let next = self
+            .next
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        format!("kv2-{kind}-{}-{next:x}", self.nonce)
+    }
+
+    fn run_id(&self) -> RunId {
+        RunId::new(self.raw("run")).expect("Kernel-minted RunId is valid")
+    }
+
+    fn command_id(&self) -> CommandRequestId {
+        CommandRequestId::new(self.raw("command"))
+            .expect("Kernel-minted CommandRequestId is valid")
+    }
+
+    fn invocation_id(&self) -> InvocationId {
+        InvocationId::new(self.raw("invocation"))
+            .expect("Kernel-minted InvocationId is valid")
+    }
+
+    fn preview_id(&self) -> CapabilityScopePreviewIdV2 {
+        CapabilityScopePreviewIdV2::new(self.raw("preview"))
+            .expect("Kernel-minted preview identity is valid")
+    }
+
+    fn lease_id(&self) -> CapabilityLeaseIdV2 {
+        CapabilityLeaseIdV2::new(self.raw("lease"))
+            .expect("Kernel-minted lease identity is valid")
+    }
+
+    fn run_capability(&self) -> AuthorityResult<RunCapabilityV2> {
+        let mut entropy = [0u8; 32];
+        File::open("/dev/urandom")
+            .and_then(|mut file| file.read_exact(&mut entropy))
+            .map_err(|_| storage_fault())?;
+        RunCapabilityV2::new(format!("run_{}", lower_hex(&entropy)))
+            .map_err(|_| storage_fault())
+    }
+}
+
+impl KernelSessionServiceV2 {
+    pub fn open(
+        fact_store_path: impl AsRef<Path>,
+        executor_config: KernelExecutorConfig,
+        secret_provider: Arc<dyn SecretProvider>,
+        settings: SettingsCeilingV2,
+    ) -> AuthorityResult<Self> {
+        let store =
+            CanonicalFactStore::open(fact_store_path).map_err(map_store_open_error)?;
+        Self::from_store(store, executor_config, secret_provider, settings)
+    }
+
+    pub fn from_store(
+        store: CanonicalFactStore,
+        executor_config: KernelExecutorConfig,
+        secret_provider: Arc<dyn SecretProvider>,
+        settings: SettingsCeilingV2,
+    ) -> AuthorityResult<Self> {
+        let authority =
+            AuthorityService::open(
+                store,
+                executor_config,
+                secret_provider,
+                deepcode_kernel_abi::v2::AutonomyModeV2::Strict,
+            )?;
+        let inventory = build_inventory()?;
+        let facts = authority.snapshot_facts()?;
+        let recovered_runs = recover_public_runs(&facts)?;
+        let recovered_authority =
+            recover_authority_material(
+                &facts,
+                authority.authority_material_snapshot()?,
+            )?;
+        let (runtime_availability, settings_tool_overrides) =
+            recover_runtime_availability(&facts);
+        let state = KernelSessionState {
+            recovered_runs,
+            previews: recovered_authority.previews,
+            leases: recovered_authority.leases,
+            trusts: recovered_authority.trusts,
+            pending: recovered_authority.pending,
+            runtime_availability,
+            settings_tool_overrides,
+            ..KernelSessionState::default()
+        };
+        Ok(Self {
+            inner: Arc::new(KernelSessionInner {
+                authority,
+                startup_settings: settings,
+                inventory,
+                state: Mutex::new(state),
+                command_gate: Mutex::new(()),
+                ids: PublicIdMint::new()?,
+            }),
+        })
+    }
+
+    pub fn tool_inventory(&self) -> ToolInventoryV2 {
+        self.inner.inventory.clone()
+    }
+
+    /// Host-only read handle for a facts wake broker. This handle contains no
+    /// run capability and must not be exposed through the Session command API.
+    pub fn fact_reader(&self) -> deepcode_kernel_ledger::v2::CanonicalFactReader {
+        self.inner.authority.fact_reader()
+    }
+
+    /// Returns a per-run monotonic wake snapshot without exposing any facts or
+    /// authority material.
+    pub fn run_sequence_high_water(&self, run_id: &RunId) -> AuthorityResult<u64> {
+        self.fact_reader()
+            .run_sequence_high_waters()
+            .map_err(|_| storage_fault())?
+            .into_iter()
+            .find(|high_water| &high_water.run_id == run_id)
+            .map(|high_water| high_water.run_sequence_high_water)
+            .ok_or_else(|| KernelErrorV2::RunNotFound {
+                run_id: run_id.clone(),
+            })
+    }
+
+    pub fn shutdown(&self) -> AuthorityResult<()> {
+        let _gate = self
+            .inner
+            .command_gate
+            .lock()
+            .map_err(|_| storage_fault())?;
+        self.inner.authority.join_owned_execution_tasks()
+    }
+
+    /// Host-only runtime health transition. Compile-time Disabled tools can
+    /// never be enabled, and runtime availability can only shrink from Ready.
+    pub fn set_run_tool_availability_host(
+        &self,
+        run_id: RunId,
+        tool_id: ToolIdV2,
+        availability: ToolAvailabilityV2,
+    ) -> AuthorityResult<ToolContextBundleV2> {
+        let _gate = self
+            .inner
+            .command_gate
+            .lock()
+            .map_err(|_| storage_fault())?;
+        if !matches!(
+            availability,
+            ToolAvailabilityV2::Revoked | ToolAvailabilityV2::Unavailable
+        ) {
+            return Err(invalid_field(
+                "availability",
+                InvalidFieldViolationV2::InvalidEnum,
+            ));
+        }
+        let descriptor = self
+            .inner
+            .inventory
+            .tools
+            .iter()
+            .find(|descriptor| descriptor.tool_id == tool_id)
+            .cloned()
+            .ok_or_else(|| {
+                invalid_field(
+                    "toolId",
+                    InvalidFieldViolationV2::InvalidEnum,
+                )
+            })?;
+        if descriptor.availability != ToolAvailabilityV2::Ready {
+            return Err(invalid_field(
+                "toolId",
+                InvalidFieldViolationV2::InvalidRelation,
+            ));
+        }
+        let (run, current, leases, trusts, previews, pending) = {
+            let state = self.inner.state.lock().map_err(|_| storage_fault())?;
+            let run = state
+                .runs
+                .get(&run_id)
+                .cloned()
+                .ok_or_else(|| KernelErrorV2::RunNotFound {
+                    run_id: run_id.clone(),
+                })?;
+            let current = state
+                .runtime_availability
+                .get(&(run_id.clone(), tool_id.clone()))
+                .copied()
+                .unwrap_or(descriptor.availability);
+            let leases = state
+                .leases
+                .values()
+                .filter(|lease| lease.run_id == run_id && lease.tool_id == tool_id)
+                .cloned()
+                .collect::<Vec<_>>();
+            let trusts = state
+                .trusts
+                .values()
+                .filter(|trust| trust.run_id == run_id && trust.tool_id == tool_id)
+                .cloned()
+                .collect::<Vec<_>>();
+            let previews = state
+                .previews
+                .values()
+                .filter(|preview| {
+                    preview.record.run_id == run_id
+                        && preview.record.tool_id == tool_id
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let pending = state
+                .pending
+                .values()
+                .filter(|pending| {
+                    pending.run_id == run_id && pending.tool_id == tool_id
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            (run, current, leases, trusts, previews, pending)
+        };
+        if current == availability {
+            return self.build_tool_context(&run_id, run.context_version);
+        }
+        if current != ToolAvailabilityV2::Ready {
+            return Err(invalid_field(
+                "availability",
+                InvalidFieldViolationV2::InvalidRelation,
+            ));
+        }
+        let previous_context =
+            self.build_tool_context(&run_id, run.context_version)?;
+        let next_context_version = ToolContextVersionV2::new(
+            run.context_version.get().checked_add(1).ok_or_else(storage_fault)?,
+        )
+        .map_err(|_| storage_fault())?;
+        let reason = match availability {
+            ToolAvailabilityV2::Revoked => {
+                ToolContextInvalidationReasonV2::ToolRevoked
+            }
+            ToolAvailabilityV2::Unavailable => {
+                ToolContextInvalidationReasonV2::ToolUnavailable
+            }
+            _ => unreachable!("validated runtime availability shrink"),
+        };
+
+        // The durable invalidation is committed before any in-memory
+        // availability or context version changes.
+        let mut payloads = vec![KernelFactPayloadV2::Authorization(
+            AuthorizationFactV2::ContextInvalidated {
+                identity: ToolContextInvalidationIdentityV2 {
+                    run_id: run_id.clone(),
+                    control_epoch: run.control_epoch,
+                    causation_fact_id: run.control_fact_id.clone(),
+                },
+                previous_context: previous_context.context_ref(),
+                next_context_version,
+                tool_id: Some(tool_id.clone()),
+                availability: Some(availability),
+                reason,
+            },
+        )];
+        for lease in &leases {
+            payloads.push(KernelFactPayloadV2::Authorization(
+                AuthorizationFactV2::LeaseRevoked {
+                    identity: CapabilityLeaseFactIdentityV2 {
+                        run_id: run_id.clone(),
+                        control_epoch: run.control_epoch,
+                        plan_revision: lease.plan_revision.clone(),
+                        plan_action_id: lease.plan_action_id.clone(),
+                        operation_id: lease.issuance_operation_id.clone(),
+                        preview_id: lease.preview_id.clone(),
+                        lease_id: lease.reference.lease_id.clone(),
+                        lease_version: lease.reference.version,
+                        causation_fact_id: lease.issuance_fact_id.clone(),
+                        correlation_set: plan_action_correlations(
+                            &lease.plan_action_id,
+                        )?,
+                    },
+                    scope_digest: lease.reference.scope_digest.clone(),
+                    reason: CapabilityLeaseRevokeReasonV2::ToolRevoked,
+                },
+            ));
+        }
+        for trust in &trusts {
+            payloads.push(KernelFactPayloadV2::Authorization(
+                AuthorizationFactV2::TrustRevoked {
+                    identity: AuthorizationIdentityV2 {
+                        run_id: run_id.clone(),
+                        control_epoch: run.control_epoch,
+                        plan_revision: trust.plan_revision.clone(),
+                        plan_action_id: trust.plan_action_id.clone(),
+                        operation_id: trust.issuance_operation_id.clone(),
+                        causation_fact_id: trust.fact_id.clone(),
+                        correlation_set: plan_action_correlations(
+                            &trust.plan_action_id,
+                        )?,
+                    },
+                    trust_policy_id: trust.trust_policy_id.clone(),
+                    trust_lease_digest: trust.trust_lease_digest.clone(),
+                    tool_id: trust.tool_id.clone(),
+                    scope_digest: trust.scope_digest.clone(),
+                    workspace_binding_digest: trust
+                        .workspace_binding_digest
+                        .clone(),
+                    context_ref: trust.context_ref.clone(),
+                    expires_at: trust.expires_at.clone(),
+                },
+            ));
+        }
+        let mut material_mutations = Vec::with_capacity(
+            leases.len() + trusts.len() + previews.len() + pending.len(),
+        );
+        for (offset, lease) in leases.iter().enumerate() {
+            material_mutations.push(AuthorityMaterialMutationV2::Replace {
+                expected_lifecycle: AUTHORITY_MATERIAL_ACTIVE.to_owned(),
+                expected_payload_digest: None,
+                material: capability_lease_material(
+                    &lease.durable(),
+                    AUTHORITY_MATERIAL_REVOKED,
+                )?,
+                fact_index: 1 + offset,
+            });
+        }
+        for (offset, trust) in trusts.iter().enumerate() {
+            material_mutations.push(AuthorityMaterialMutationV2::Replace {
+                expected_lifecycle: AUTHORITY_MATERIAL_ACTIVE.to_owned(),
+                expected_payload_digest: None,
+                material: trust_lease_material(
+                    &trust.durable(),
+                    AUTHORITY_MATERIAL_REVOKED,
+                )?,
+                fact_index: 1 + leases.len() + offset,
+            });
+        }
+        for preview in &previews {
+            material_mutations.push(AuthorityMaterialMutationV2::Replace {
+                expected_lifecycle: AUTHORITY_MATERIAL_ACTIVE.to_owned(),
+                expected_payload_digest: None,
+                material: scope_preview_material(
+                    &preview.durable(),
+                    AUTHORITY_MATERIAL_STALE,
+                )?,
+                fact_index: 0,
+            });
+        }
+        for pending in &pending {
+            let lease = match &pending.authority {
+                ToolIntentAuthorityV2::PlanAction { lease, .. } => lease.clone(),
+                ToolIntentAuthorityV2::ContextRead { .. } => None,
+            };
+            material_mutations.push(AuthorityMaterialMutationV2::Replace {
+                expected_lifecycle: AUTHORITY_MATERIAL_AWAITING.to_owned(),
+                expected_payload_digest: None,
+                material: pending_intent_material(
+                    &pending.durable(),
+                    AUTHORITY_MATERIAL_STALE,
+                    lease,
+                )?,
+                fact_index: 0,
+            });
+        }
+        let committed = self
+            .inner
+            .authority
+            .append_payloads_with_authority_material(
+                payloads,
+                material_mutations,
+            )?
+            .facts;
+        let invalidation_fact_id = committed
+            .first()
+            .map(|fact| fact.fact_id.clone())
+            .ok_or_else(storage_fault)?;
+        {
+            let mut state = self.inner.state.lock().map_err(|_| storage_fault())?;
+            let active = state
+                .runs
+                .get_mut(&run_id)
+                .ok_or_else(|| KernelErrorV2::RunNotFound {
+                    run_id: run_id.clone(),
+                })?;
+            if active.control_epoch != run.control_epoch
+                || active.context_version != run.context_version
+            {
+                return Err(storage_fault());
+            }
+            active.context_version = next_context_version;
+            active.control_fact_id = invalidation_fact_id;
+            state.runtime_availability.insert(
+                (run_id.clone(), tool_id.clone()),
+                availability,
+            );
+            state.leases.retain(|_, lease| {
+                lease.run_id != run_id || lease.tool_id != tool_id
+            });
+            state.trusts.retain(|_, trust| {
+                trust.run_id != run_id || trust.tool_id != tool_id
+            });
+            state.previews.retain(|_, preview| {
+                preview.record.run_id != run_id
+                    || preview.record.tool_id != tool_id
+            });
+            state.pending.retain(|_, pending| {
+                pending.run_id != run_id
+                    || pending.tool_id != tool_id
+            });
+        }
+        self.build_tool_context(&run_id, next_context_version)
+    }
+
+    /// Host-only, per-run Settings ceiling update. Expanding the ceiling only
+    /// changes which tools may be planned; it never creates a capability lease.
+    pub fn update_run_settings_ceiling_host(
+        &self,
+        run_id: RunId,
+        next: SettingsCeilingV2,
+    ) -> AuthorityResult<ToolContextBundleV2> {
+        let _gate = self
+            .inner
+            .command_gate
+            .lock()
+            .map_err(|_| storage_fault())?;
+        let (run, previous, leases, trusts, previews, pending) = {
+            let state = self.inner.state.lock().map_err(|_| storage_fault())?;
+            let run = state
+                .runs
+                .get(&run_id)
+                .cloned()
+                .ok_or_else(|| KernelErrorV2::RunNotFound {
+                    run_id: run_id.clone(),
+                })?;
+            let previous = state
+                .run_settings
+                .get(&run_id)
+                .cloned()
+                .unwrap_or_else(|| self.inner.startup_settings.clone());
+            let leases = state
+                .leases
+                .values()
+                .filter(|lease| lease.run_id == run_id)
+                .cloned()
+                .collect::<Vec<_>>();
+            let trusts = state
+                .trusts
+                .values()
+                .filter(|trust| trust.run_id == run_id)
+                .cloned()
+                .collect::<Vec<_>>();
+            let previews = state
+                .previews
+                .values()
+                .filter(|preview| preview.record.run_id == run_id)
+                .cloned()
+                .collect::<Vec<_>>();
+            let pending = state
+                .pending
+                .values()
+                .filter(|pending| pending.run_id == run_id)
+                .cloned()
+                .collect::<Vec<_>>();
+            (run, previous, leases, trusts, previews, pending)
+        };
+        if previous == next {
+            return self.build_tool_context(&run_id, run.context_version);
+        }
+        let changes = self
+            .inner
+            .inventory
+            .tools
+            .iter()
+            .filter(|descriptor| descriptor.availability == ToolAvailabilityV2::Ready)
+            .filter_map(|descriptor| {
+                let was_allowed =
+                    settings_allow(&previous, descriptor.effect_scope);
+                let is_allowed = settings_allow(&next, descriptor.effect_scope);
+                (was_allowed != is_allowed)
+                    .then_some((descriptor.tool_id.clone(), is_allowed))
+            })
+            .collect::<Vec<_>>();
+        let previous_context =
+            self.build_tool_context(&run_id, run.context_version)?;
+        let next_context_version = ToolContextVersionV2::new(
+            run.context_version.get().checked_add(1).ok_or_else(storage_fault)?,
+        )
+        .map_err(|_| storage_fault())?;
+        let mut payloads = if changes.is_empty() {
+            vec![KernelFactPayloadV2::Authorization(
+                AuthorizationFactV2::ContextInvalidated {
+                    identity: ToolContextInvalidationIdentityV2 {
+                        run_id: run_id.clone(),
+                        control_epoch: run.control_epoch,
+                        causation_fact_id: run.control_fact_id.clone(),
+                    },
+                    previous_context: previous_context.context_ref(),
+                    next_context_version,
+                    tool_id: None,
+                    availability: None,
+                    reason: ToolContextInvalidationReasonV2::SettingsChanged,
+                },
+            )]
+        } else {
+            changes
+                .iter()
+                .map(|(tool_id, allowed)| {
+                    KernelFactPayloadV2::Authorization(
+                        AuthorizationFactV2::ContextInvalidated {
+                            identity: ToolContextInvalidationIdentityV2 {
+                                run_id: run_id.clone(),
+                                control_epoch: run.control_epoch,
+                                causation_fact_id: run.control_fact_id.clone(),
+                            },
+                            previous_context: previous_context.context_ref(),
+                            next_context_version,
+                            tool_id: Some(tool_id.clone()),
+                            availability: Some(if *allowed {
+                                ToolAvailabilityV2::Ready
+                            } else {
+                                ToolAvailabilityV2::Unavailable
+                            }),
+                            reason:
+                                ToolContextInvalidationReasonV2::SettingsChanged,
+                        },
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let denied_tools = changes
+            .iter()
+            .filter_map(|(tool_id, allowed)| (!*allowed).then_some(tool_id.clone()))
+            .collect::<Vec<_>>();
+        let revoked_leases = leases
+            .iter()
+            .filter(|lease| denied_tools.contains(&lease.tool_id))
+            .collect::<Vec<_>>();
+        let revoked_trusts = trusts
+            .iter()
+            .filter(|trust| denied_tools.contains(&trust.tool_id))
+            .collect::<Vec<_>>();
+        let stale_previews = previews
+            .iter()
+            .filter(|preview| denied_tools.contains(&preview.record.tool_id))
+            .collect::<Vec<_>>();
+        let stale_pending = pending
+            .iter()
+            .filter(|pending| denied_tools.contains(&pending.tool_id))
+            .collect::<Vec<_>>();
+        for lease in &revoked_leases {
+            payloads.push(KernelFactPayloadV2::Authorization(
+                AuthorizationFactV2::LeaseRevoked {
+                    identity: CapabilityLeaseFactIdentityV2 {
+                        run_id: run_id.clone(),
+                        control_epoch: run.control_epoch,
+                        plan_revision: lease.plan_revision.clone(),
+                        plan_action_id: lease.plan_action_id.clone(),
+                        operation_id: lease.issuance_operation_id.clone(),
+                        preview_id: lease.preview_id.clone(),
+                        lease_id: lease.reference.lease_id.clone(),
+                        lease_version: lease.reference.version,
+                        causation_fact_id: lease.issuance_fact_id.clone(),
+                        correlation_set: plan_action_correlations(
+                            &lease.plan_action_id,
+                        )?,
+                    },
+                    scope_digest: lease.reference.scope_digest.clone(),
+                    reason: CapabilityLeaseRevokeReasonV2::SettingsChanged,
+                },
+            ));
+        }
+        for trust in &revoked_trusts {
+            payloads.push(KernelFactPayloadV2::Authorization(
+                AuthorizationFactV2::TrustRevoked {
+                    identity: AuthorizationIdentityV2 {
+                        run_id: run_id.clone(),
+                        control_epoch: run.control_epoch,
+                        plan_revision: trust.plan_revision.clone(),
+                        plan_action_id: trust.plan_action_id.clone(),
+                        operation_id: trust.issuance_operation_id.clone(),
+                        causation_fact_id: trust.fact_id.clone(),
+                        correlation_set: plan_action_correlations(
+                            &trust.plan_action_id,
+                        )?,
+                    },
+                    trust_policy_id: trust.trust_policy_id.clone(),
+                    trust_lease_digest: trust.trust_lease_digest.clone(),
+                    tool_id: trust.tool_id.clone(),
+                    scope_digest: trust.scope_digest.clone(),
+                    workspace_binding_digest: trust
+                        .workspace_binding_digest
+                        .clone(),
+                    context_ref: trust.context_ref.clone(),
+                    expires_at: trust.expires_at.clone(),
+                },
+            ));
+        }
+
+        // The complete invalidation/revocation batch is durable before the
+        // effective Settings ceiling changes in memory.
+        let revocation_start = if changes.is_empty() {
+            1
+        } else {
+            changes.len()
+        };
+        let mut material_mutations = Vec::with_capacity(
+            revoked_leases.len()
+                + revoked_trusts.len()
+                + stale_previews.len()
+                + stale_pending.len(),
+        );
+        for (offset, lease) in revoked_leases.iter().enumerate() {
+            material_mutations.push(AuthorityMaterialMutationV2::Replace {
+                expected_lifecycle: AUTHORITY_MATERIAL_ACTIVE.to_owned(),
+                expected_payload_digest: None,
+                material: capability_lease_material(
+                    &lease.durable(),
+                    AUTHORITY_MATERIAL_REVOKED,
+                )?,
+                fact_index: revocation_start + offset,
+            });
+        }
+        for (offset, trust) in revoked_trusts.iter().enumerate() {
+            material_mutations.push(AuthorityMaterialMutationV2::Replace {
+                expected_lifecycle: AUTHORITY_MATERIAL_ACTIVE.to_owned(),
+                expected_payload_digest: None,
+                material: trust_lease_material(
+                    &trust.durable(),
+                    AUTHORITY_MATERIAL_REVOKED,
+                )?,
+                fact_index: revocation_start
+                    + revoked_leases.len()
+                    + offset,
+            });
+        }
+        for preview in stale_previews {
+            material_mutations.push(AuthorityMaterialMutationV2::Replace {
+                expected_lifecycle: AUTHORITY_MATERIAL_ACTIVE.to_owned(),
+                expected_payload_digest: None,
+                material: scope_preview_material(
+                    &preview.durable(),
+                    AUTHORITY_MATERIAL_STALE,
+                )?,
+                fact_index: 0,
+            });
+        }
+        for pending in stale_pending {
+            let lease = match &pending.authority {
+                ToolIntentAuthorityV2::PlanAction { lease, .. } => lease.clone(),
+                ToolIntentAuthorityV2::ContextRead { .. } => None,
+            };
+            material_mutations.push(AuthorityMaterialMutationV2::Replace {
+                expected_lifecycle: AUTHORITY_MATERIAL_AWAITING.to_owned(),
+                expected_payload_digest: None,
+                material: pending_intent_material(
+                    &pending.durable(),
+                    AUTHORITY_MATERIAL_STALE,
+                    lease,
+                )?,
+                fact_index: 0,
+            });
+        }
+        let committed = self
+            .inner
+            .authority
+            .append_payloads_with_authority_material(
+                payloads,
+                material_mutations,
+            )?
+            .facts;
+        let causation_fact_id = committed
+            .first()
+            .map(|fact| fact.fact_id.clone())
+            .ok_or_else(storage_fault)?;
+        {
+            let mut state = self.inner.state.lock().map_err(|_| storage_fault())?;
+            let active = state
+                .runs
+                .get_mut(&run_id)
+                .ok_or_else(|| KernelErrorV2::RunNotFound {
+                    run_id: run_id.clone(),
+                })?;
+            if active.control_epoch != run.control_epoch
+                || active.context_version != run.context_version
+            {
+                return Err(storage_fault());
+            }
+            active.context_version = next_context_version;
+            active.control_fact_id = causation_fact_id;
+            state.run_settings.insert(run_id.clone(), next);
+            for (tool_id, allowed) in &changes {
+                state
+                    .settings_tool_overrides
+                    .insert((run_id.clone(), tool_id.clone()), *allowed);
+            }
+            state.leases.retain(|_, lease| {
+                lease.run_id != run_id || !denied_tools.contains(&lease.tool_id)
+            });
+            state.trusts.retain(|_, trust| {
+                trust.run_id != run_id || !denied_tools.contains(&trust.tool_id)
+            });
+            state.previews.retain(|_, preview| {
+                preview.record.run_id != run_id
+                    || !denied_tools.contains(&preview.record.tool_id)
+            });
+            state.pending.retain(|_, pending| {
+                pending.run_id != run_id
+                    || !denied_tools.contains(&pending.tool_id)
+            });
+        }
+        self.build_tool_context(&run_id, next_context_version)
+    }
+
+    pub fn resume_run_host(
+        &self,
+        run_id: RunId,
+        workspace_binding_ref: WorkspaceBindingRefV2,
+        workspace_root: &Path,
+        input_id: InputId,
+        opaque_input_ref: String,
+    ) -> AuthorityResult<(RunOpenReplyV2, RunCapabilityV2)> {
+        let _gate = self
+            .inner
+            .command_gate
+            .lock()
+            .map_err(|_| storage_fault())?;
+        self.resume_run_host_locked(
+            run_id,
+            workspace_binding_ref,
+            workspace_root,
+            input_id,
+            opaque_input_ref,
+        )
+    }
+
+    fn resume_run_host_locked(
+        &self,
+        run_id: RunId,
+        workspace_binding_ref: WorkspaceBindingRefV2,
+        workspace_root: &Path,
+        _input_id: InputId,
+        _opaque_input_ref: String,
+    ) -> AuthorityResult<(RunOpenReplyV2, RunCapabilityV2)> {
+        let recovered = {
+            let state = self.inner.state.lock().map_err(|_| storage_fault())?;
+            state
+                .runs
+                .get(&run_id)
+                .map(|run| RecoveredRunRecord {
+                    workspace_binding_ref: run.workspace_binding_ref.clone(),
+                    workspace_binding_digest: run.workspace_binding_digest.clone(),
+                    control_epoch: run.control_epoch,
+                    context_version: run.context_version,
+                    current_input_id: run.current_input_id.clone(),
+                    control_fact_id: run.control_fact_id.clone(),
+                })
+                .or_else(|| state.recovered_runs.get(&run_id).cloned())
+                .ok_or_else(|| KernelErrorV2::RunNotFound {
+                    run_id: run_id.clone(),
+                })?
+        };
+        if recovered.workspace_binding_ref != workspace_binding_ref {
+            return Err(invalid_field(
+                "workspaceBindingRef",
+                InvalidFieldViolationV2::InvalidRelation,
+            ));
+        }
+        let binding = self
+            .inner
+            .authority
+            .bind_run_workspace(&run_id, workspace_root)?;
+        if binding.digest != recovered.workspace_binding_digest {
+            return Err(invalid_field(
+                "workspaceBindingRef",
+                InvalidFieldViolationV2::OutOfRange,
+            ));
+        }
+
+        let run_capability = self.inner.ids.run_capability()?;
+        let tool_context =
+            self.build_tool_context(&run_id, recovered.context_version)?;
+        let reply = RunOpenReplyV2 {
+            run_id: run_id.clone(),
+            control_epoch: recovered.control_epoch,
+            workspace_binding_digest: binding.digest.clone(),
+            tool_context,
+        };
+        let mut state = self.inner.state.lock().map_err(|_| storage_fault())?;
+        state.runs.insert(
+            run_id.clone(),
+            PublicRunRecord {
+                capability: run_capability.clone(),
+                workspace_binding_ref,
+                workspace_binding_digest: binding.digest,
+                control_epoch: recovered.control_epoch,
+                current_input_id: recovered.current_input_id,
+                context_version: recovered.context_version,
+                control_fact_id: recovered.control_fact_id,
+            },
+        );
+        state
+            .run_settings
+            .entry(run_id.clone())
+            .or_insert_with(|| self.inner.startup_settings.clone());
+        state.recovered_runs.remove(&run_id);
+        Ok((reply, run_capability))
+    }
+
+    pub fn open_run(
+        &self,
+        envelope: KernelCommandEnvelopeV2,
+        workspace_root: &Path,
+    ) -> OpenedRunTransportV2 {
+        let _gate = match self.inner.command_gate.lock() {
+            Ok(gate) => gate,
+            Err(_) => {
+                return OpenedRunTransportV2 {
+                    response: response(envelope.request_id, Err(storage_fault())),
+                    run_capability: None,
+                };
+            }
+        };
+        let request_id = envelope.request_id.clone();
+        let result = envelope
+            .validate()
+            .map_err(|_| invalid_field("command", InvalidFieldViolationV2::OutOfRange))
+            .and_then(|_| match envelope.command.clone() {
+                KernelCommandV2::RunOpen(command) => {
+                    self.open_run_command(&envelope, command, workspace_root)
+                }
+                _ => Err(invalid_field(
+                    "command.kind",
+                    InvalidFieldViolationV2::InvalidEnum,
+                )),
+            });
+        match result {
+            Ok((reply, handling, run_capability)) => OpenedRunTransportV2 {
+                response: response(request_id, Ok((reply, handling))),
+                run_capability: Some(run_capability),
+            },
+            Err(error) => OpenedRunTransportV2 {
+                response: response(request_id, Err(error)),
+                run_capability: None,
+            },
+        }
+    }
+
+    pub fn handle_session_command(
+        &self,
+        envelope: KernelCommandEnvelopeV2,
+        transport_run_capability: &RunCapabilityV2,
+    ) -> KernelCommandResponseEnvelopeV2 {
+        let _gate = match self.inner.command_gate.lock() {
+            Ok(gate) => gate,
+            Err(_) => {
+                return response(envelope.request_id, Err(storage_fault()));
+            }
+        };
+        let request_id = envelope.request_id.clone();
+        let result = envelope
+            .validate()
+            .map_err(|_| invalid_field("command", InvalidFieldViolationV2::OutOfRange))
+            .and_then(|_| {
+                self.replay_or_evaluate(
+                    &envelope,
+                    transport_run_capability,
+                )
+            });
+        response(request_id, result)
+    }
+
+    pub fn apply_host_user_decision(
+        &self,
+        request_id: CommandRequestId,
+        run_id: RunId,
+        expected_control_epoch: ControlEpoch,
+        decision: UserDecisionV2,
+    ) -> AuthorityResult<(UserDecisionReplyV2, CommandHandlingV2)> {
+        let _gate = self
+            .inner
+            .command_gate
+            .lock()
+            .map_err(|_| storage_fault())?;
+        let request_digest = user_decision_request_digest_v2(
+            &run_id,
+            expected_control_epoch,
+            &decision,
+        )
+        .map_err(|_| storage_fault())?;
+        if let Some(replayed) =
+            self.lookup_replay(&request_id, &request_digest)?
+        {
+            return match replayed {
+                DurablePublicReplyV2::UserDecision { reply } => {
+                    Ok((reply, CommandHandlingV2::Replayed))
+                }
+                _ => Err(storage_fault()),
+            };
+        }
+        decision
+            .validate()
+            .map_err(|_| invalid_field("decision", InvalidFieldViolationV2::OutOfRange))?;
+        let run = {
+            let state = self.inner.state.lock().map_err(|_| storage_fault())?;
+            state.runs.get(&run_id).cloned()
+        };
+        let Some(run) = run else {
+            return self.persist_user_decision_reply(
+                request_id,
+                request_digest,
+                run_id,
+                UserDecisionReplyV2::Error(
+                    UserDecisionErrorV2::ScopePreviewNotFound,
+                ),
+            );
+        };
+        if run.control_epoch != expected_control_epoch {
+            return self.persist_user_decision_reply(
+                request_id,
+                request_digest,
+                run_id,
+                UserDecisionReplyV2::Stale {
+                    submitted: expected_control_epoch,
+                    current: run.control_epoch,
+                },
+            );
+        }
+
+        let public_command = PublicCommandContext {
+            request_id: request_id.clone(),
+            request_digest: request_digest.clone(),
+            command_kind: "userDecision",
+        };
+        let (reply, receipt_persisted) = match decision {
+            UserDecisionV2::CapabilityAllow(binding) => self
+                .allow_capability_decision(
+                    &run_id,
+                    expected_control_epoch,
+                    binding,
+                    false,
+                    public_command.clone(),
+                )?,
+            UserDecisionV2::ScopeExpansionAllow(binding) => self
+                .allow_capability_decision(
+                    &run_id,
+                    expected_control_epoch,
+                    binding,
+                    true,
+                    public_command.clone(),
+                )?,
+            UserDecisionV2::CapabilityDeny { binding, guidance } => self
+                .deny_capability_decision(
+                    &run_id,
+                    expected_control_epoch,
+                    binding,
+                    guidance,
+                    false,
+                    public_command.clone(),
+                )?,
+            UserDecisionV2::ScopeExpansionDeny { binding, guidance } => self
+                .deny_capability_decision(
+                    &run_id,
+                    expected_control_epoch,
+                    binding,
+                    guidance,
+                    true,
+                    public_command.clone(),
+                )?,
+            UserDecisionV2::TrustGrant(decision) => {
+                self.grant_trust(
+                    &run_id,
+                    expected_control_epoch,
+                    decision,
+                    public_command.clone(),
+                )?
+            }
+            UserDecisionV2::Revoke(decision) => {
+                if decision.input_id != run.current_input_id {
+                    (
+                        UserDecisionReplyV2::Error(
+                            UserDecisionErrorV2::PlanBindingMismatch,
+                        ),
+                        false,
+                    )
+                } else {
+                    self.revoke_user_authority(
+                        &run_id,
+                        expected_control_epoch,
+                        decision.decision_ref,
+                        decision.target,
+                        public_command,
+                    )?
+                }
+            }
+        };
+        if receipt_persisted {
+            return Ok((reply, CommandHandlingV2::Evaluated));
+        }
+        self.persist_user_decision_reply(
+            request_id,
+            request_digest,
+            run_id,
+            reply,
+        )
+    }
+}
+
+impl Drop for KernelSessionServiceV2 {
+    fn drop(&mut self) {
+        if Arc::strong_count(&self.inner) == 1 {
+            let _ = self.inner.authority.join_owned_execution_tasks();
+        }
+    }
+}
+
+impl KernelSessionServiceV2 {
+    fn open_run_command(
+        &self,
+        envelope: &KernelCommandEnvelopeV2,
+        command: RunOpenV2,
+        workspace_root: &Path,
+    ) -> AuthorityResult<(KernelReplyV2, CommandHandlingV2, RunCapabilityV2)> {
+        let digest =
+            command_request_digest_v2(&envelope.command).map_err(|_| storage_fault())?;
+        if let Some(replayed) = self.lookup_replay(&envelope.request_id, &digest)? {
+            let DurablePublicReplyV2::RunOpen {
+                run_id,
+                workspace_binding_digest,
+                ..
+            } = replayed
+            else {
+                return Err(storage_fault());
+            };
+            let active = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| storage_fault())?
+                .runs
+                .get(&run_id)
+                .cloned();
+            let reply = if let Some(active) = active {
+                if active.workspace_binding_ref != command.workspace_binding_ref
+                    || active.workspace_binding_digest != workspace_binding_digest
+                {
+                    return Err(invalid_field(
+                        "workspaceBindingRef",
+                        InvalidFieldViolationV2::InvalidRelation,
+                    ));
+                }
+                let tool_context =
+                    self.build_tool_context(&run_id, active.context_version)?;
+                RunOpenReplyV2 {
+                    run_id,
+                    control_epoch: active.control_epoch,
+                    workspace_binding_digest: active.workspace_binding_digest,
+                    tool_context,
+                }
+            } else {
+                let (reply, _) = self.resume_run_host_locked(
+                    run_id,
+                    command.workspace_binding_ref,
+                    workspace_root,
+                    command.input_id,
+                    command.opaque_input_ref,
+                )?;
+                reply
+            };
+            let run_capability = self
+                .run_record(&reply.run_id)?
+                .capability;
+            return Ok((
+                KernelReplyV2::RunOpened(reply),
+                CommandHandlingV2::Replayed,
+                run_capability,
+            ));
+        }
+
+        let run_id = self.inner.ids.run_id();
+        let run_capability = self.inner.ids.run_capability()?;
+        let binding = self
+            .inner
+            .authority
+            .bind_run_workspace(&run_id, workspace_root)?;
+        let context_version =
+            ToolContextVersionV2::new(1).map_err(|_| storage_fault())?;
+        let tool_context = self.build_tool_context(&run_id, context_version)?;
+        let initial_epoch = ControlEpoch::new(1).map_err(|_| storage_fault())?;
+        let stored = DurablePublicReplyV2::RunOpen {
+            run_id: run_id.clone(),
+            control_epoch: initial_epoch,
+            workspace_binding_digest: binding.digest.clone(),
+            context_version,
+        };
+        let receipt = public_receipt(
+            envelope.request_id.clone(),
+            digest.clone(),
+            "runOpen",
+            Some(run_id.clone()),
+            &stored,
+            None,
+        )?;
+        let epoch = self.inner.authority.open_run_with_public_receipt(
+            ControlEpochAdvanceV2 {
+                run_id: run_id.clone(),
+                precondition: EpochPreconditionV2::NoCurrentEpoch {},
+                input_id: command.input_id.clone(),
+                opaque_input_ref: command.opaque_input_ref,
+            },
+            envelope.request_id.clone(),
+            digest,
+            command.workspace_binding_ref.clone(),
+            tool_context.context_ref(),
+            receipt,
+        )?;
+        let reply = KernelReplyV2::RunOpened(RunOpenReplyV2 {
+            run_id: run_id.clone(),
+            control_epoch: epoch.accepted_control_epoch,
+            workspace_binding_digest: binding.digest.clone(),
+            tool_context,
+        });
+        {
+            let mut state = self.inner.state.lock().map_err(|_| storage_fault())?;
+            state.runs.insert(
+                run_id.clone(),
+                PublicRunRecord {
+                    capability: run_capability.clone(),
+                    workspace_binding_ref: command.workspace_binding_ref,
+                    workspace_binding_digest: binding.digest.clone(),
+                    control_epoch: epoch.accepted_control_epoch,
+                    current_input_id: command.input_id,
+                    context_version,
+                    control_fact_id: epoch.epoch_fact_id,
+                },
+            );
+            state
+                .run_settings
+                .insert(run_id, self.inner.startup_settings.clone());
+        }
+        Ok((
+            reply,
+            CommandHandlingV2::Evaluated,
+            run_capability,
+        ))
+    }
+
+    fn replay_or_evaluate(
+        &self,
+        envelope: &KernelCommandEnvelopeV2,
+        transport_run_capability: &RunCapabilityV2,
+    ) -> AuthorityResult<(KernelReplyV2, CommandHandlingV2)> {
+        let digest =
+            command_request_digest_v2(&envelope.command).map_err(|_| storage_fault())?;
+        let run_id =
+            public_command_run_id(&envelope.command).ok_or_else(|| {
+                invalid_field(
+                    "command.kind",
+                    InvalidFieldViolationV2::InvalidEnum,
+                )
+            })?;
+        self.require_run_capability(&run_id, transport_run_capability)?;
+        if let Some(replayed) = self.lookup_replay(&envelope.request_id, &digest)? {
+            let reply = match replayed {
+                DurablePublicReplyV2::Kernel { reply } => reply,
+                DurablePublicReplyV2::Facts { page } => {
+                    KernelReplyV2::KernelFactsProjected(
+                        self.materialize_facts_page(page)?,
+                    )
+                }
+                DurablePublicReplyV2::RunOpen { .. }
+                | DurablePublicReplyV2::UserDecision { .. } => {
+                    return Err(storage_fault())
+                }
+            };
+            return Ok((reply, CommandHandlingV2::Replayed));
+        }
+        let mut receipt_persisted = false;
+        let reply = match envelope.command.clone() {
+            KernelCommandV2::ToolContextGet(command) => {
+                KernelReplyV2::ToolContext(self.tool_context_get(command)?)
+            }
+            KernelCommandV2::CapabilityScopePreview(command) => {
+                let (reply, persisted) = self.scope_preview(
+                    command,
+                    Some(PublicCommandContext {
+                        request_id: envelope.request_id.clone(),
+                        request_digest: digest.clone(),
+                        command_kind: envelope.command.kind(),
+                    }),
+                )?;
+                receipt_persisted = persisted;
+                KernelReplyV2::CapabilityScopePreviewed(reply)
+            }
+            KernelCommandV2::ToolIntentSubmit(command) => {
+                let reply = self.submit_tool_intent(
+                    command,
+                    Some(PublicCommandContext {
+                        request_id: envelope.request_id.clone(),
+                        request_digest: digest.clone(),
+                        command_kind: envelope.command.kind(),
+                    }),
+                )?;
+                receipt_persisted = self
+                    .inner
+                    .authority
+                    .public_command_receipt(&envelope.request_id)?
+                    .is_some();
+                KernelReplyV2::ToolIntentSubmission(reply)
+            }
+            KernelCommandV2::KernelFactsQueryScoped(command) => {
+                let page = self.query_projected_facts(
+                    command,
+                    envelope.request_id.clone(),
+                    digest.clone(),
+                )?;
+                receipt_persisted = self
+                    .inner
+                    .authority
+                    .public_command_receipt(&envelope.request_id)?
+                    .is_some();
+                KernelReplyV2::KernelFactsProjected(page)
+            }
+            KernelCommandV2::ControlEpochAdvance(command) => {
+                let current_run = self.run_record(&command.run_id)?;
+                let internal = KernelCommandEnvelopeV2::new(
+                    self.inner.ids.command_id(),
+                    KernelCommandV2::ControlEpochAdvance(command.clone()),
+                );
+                let public_request_id = envelope.request_id.clone();
+                let public_digest = digest.clone();
+                let public_run_id = command.run_id.clone();
+                let command_kind = envelope.command.kind();
+                let reply = self
+                    .inner
+                    .authority
+                    .advance_epoch_with_public_receipt_and_authority_material(
+                        &internal,
+                        command.clone(),
+                        vec![AuthorityMaterialMutationV2::TransitionRunEpoch {
+                            run_id: command.run_id.clone(),
+                            through_control_epoch: current_run.control_epoch.get(),
+                            expected_lifecycles: vec![
+                                AUTHORITY_MATERIAL_ACTIVE.to_owned(),
+                                AUTHORITY_MATERIAL_AWAITING.to_owned(),
+                            ],
+                            next_lifecycle: AUTHORITY_MATERIAL_STALE.to_owned(),
+                            fact_index: 1,
+                        }],
+                        move |reply| {
+                        public_receipt(
+                            public_request_id,
+                            public_digest,
+                            command_kind,
+                            Some(public_run_id),
+                            &DurablePublicReplyV2::Kernel {
+                                reply: reply.clone(),
+                            },
+                            None,
+                        )
+                        },
+                    )?;
+                receipt_persisted = self
+                    .inner
+                    .authority
+                    .public_command_receipt(&envelope.request_id)?
+                    .is_some();
+                if let KernelReplyV2::ControlEpochAdvanced(advanced) = &reply {
+                    let mut state =
+                        self.inner.state.lock().map_err(|_| storage_fault())?;
+                    let run = state
+                        .runs
+                        .get_mut(&command.run_id)
+                        .ok_or_else(|| KernelErrorV2::RunNotFound {
+                            run_id: command.run_id.clone(),
+                        })?;
+                    run.control_epoch = advanced.accepted_control_epoch;
+                    run.current_input_id = command.input_id;
+                    run.control_fact_id = advanced.epoch_fact_id.clone();
+                    state
+                        .leases
+                        .retain(|_, lease| lease.run_id != command.run_id);
+                    state
+                        .pending
+                        .retain(|_, pending| pending.run_id != command.run_id);
+                    state
+                        .previews
+                        .retain(|_, preview| preview.record.run_id != command.run_id);
+                    state
+                        .trusts
+                        .retain(|_, trust| trust.run_id != command.run_id);
+                }
+                reply
+            }
+            KernelCommandV2::InvocationCancel(command) => {
+                let internal = KernelCommandEnvelopeV2::new(
+                    self.inner.ids.command_id(),
+                    KernelCommandV2::InvocationCancel(command.clone()),
+                );
+                KernelReplyV2::InvocationCancelResult(
+                    self.inner
+                        .authority
+                        .cancel_invocation_command(&internal, command)?,
+                )
+            }
+            KernelCommandV2::RunOpen(_) => {
+                return Err(invalid_field(
+                    "command.kind",
+                    InvalidFieldViolationV2::InvalidRelation,
+                ))
+            }
+        };
+        if !receipt_persisted {
+            let stored = DurablePublicReplyV2::Kernel {
+                reply: reply.clone(),
+            };
+            let persisted = self.persist_reply(
+                envelope.request_id.clone(),
+                digest,
+                envelope.command.kind(),
+                public_command_run_id(&envelope.command),
+                stored,
+                kernel_reply_settlement_fact(&reply),
+            )?;
+            if !matches!(persisted, DurablePublicReplyV2::Kernel { .. }) {
+                return Err(storage_fault());
+            }
+        }
+        Ok((reply, CommandHandlingV2::Evaluated))
+    }
+
+    fn tool_context_get(
+        &self,
+        command: ToolContextGetV2,
+    ) -> AuthorityResult<ToolContextGetReplyV2> {
+        let run = self.run_record(&command.run_id)?;
+        let context =
+            self.build_tool_context(&command.run_id, run.context_version)?;
+        match command.known_context {
+            Some(known) if known == context.context_ref() => {
+                Ok(ToolContextGetReplyV2::Current {
+                    context_ref: known,
+                })
+            }
+            _ => Ok(ToolContextGetReplyV2::Updated {
+                tool_context: context,
+            }),
+        }
+    }
+
+    fn scope_preview(
+        &self,
+        command: CapabilityScopePreviewV2,
+        public_command: Option<PublicCommandContext>,
+    ) -> AuthorityResult<(CapabilityScopePreviewReplyV2, bool)> {
+        let run = self.run_record(&command.run_id)?;
+        if run.control_epoch != command.expected_control_epoch {
+            return Ok((CapabilityScopePreviewReplyV2::Rejected {
+                tool_id: command.tool_id,
+                reason: deepcode_kernel_abi::v2_command::CapabilityScopeRejectionReasonV2::StaleControlEpoch,
+                guidance: "Refresh the run epoch before previewing this PlanAction.".to_owned(),
+            }, false));
+        }
+        let context =
+            self.build_tool_context(&command.run_id, run.context_version)?;
+        if command.tool_context_ref != context.context_ref() {
+            return Ok((CapabilityScopePreviewReplyV2::Rejected {
+                tool_id: command.tool_id,
+                reason: deepcode_kernel_abi::v2_command::CapabilityScopeRejectionReasonV2::StaleToolContext,
+                guidance: "Fetch the current ToolContext before previewing this scope.".to_owned(),
+            }, false));
+        }
+        let descriptor =
+            match self.ready_descriptor(&command.run_id, &command.tool_id) {
+            Ok(value) => value,
+            Err(reason) => {
+                return Ok((CapabilityScopePreviewReplyV2::Rejected {
+                    tool_id: command.tool_id,
+                    reason,
+                    guidance: "The requested tool is not currently executable.".to_owned(),
+                }, false))
+            }
+        };
+        let workspace = self.inner.authority.workspace_for_run(&command.run_id)?;
+        let targets = match normalize_requested_targets(
+            &workspace,
+            &command.requested_resources,
+        ) {
+            Ok(value) => value,
+            Err(_) => {
+                return Ok((CapabilityScopePreviewReplyV2::Rejected {
+                    tool_id: command.tool_id,
+                    reason: deepcode_kernel_abi::v2_command::CapabilityScopeRejectionReasonV2::RequestedScopeInvalid,
+                    guidance: "Use canonical workspace-relative resources within this run.".to_owned(),
+                }, false))
+            }
+        };
+        let prepared = self.prepare_preview(
+            &command.run_id,
+            command.expected_control_epoch,
+            command.plan_revision,
+            command.plan_action_id,
+            command.operation_id,
+            command.idempotency_key,
+            command.tool_id,
+            command.raw_arguments,
+            targets,
+            Vec::new(),
+            command.deadline,
+            command.tool_context_ref,
+            descriptor,
+            public_command.as_ref(),
+        )?;
+        let reply = CapabilityScopePreviewReplyV2::Previewed {
+            preview: prepared.record.clone(),
+        };
+        self.inner
+            .state
+            .lock()
+            .map_err(|_| storage_fault())?
+            .previews
+            .insert(prepared.record.preview_id.clone(), prepared);
+        Ok((reply, public_command.is_some()))
+    }
+
+    fn resolve_decision_preview(
+        &self,
+        run_id: &RunId,
+        control_epoch: ControlEpoch,
+        binding: &CapabilityDecisionBindingV2,
+    ) -> AuthorityResult<Result<PreparedScopePreview, UserDecisionErrorV2>> {
+        let (run, preview) = {
+            let state = self.inner.state.lock().map_err(|_| storage_fault())?;
+            let Some(run) = state.runs.get(run_id) else {
+                return Ok(Err(UserDecisionErrorV2::ScopePreviewNotFound));
+            };
+            if run.control_epoch != control_epoch {
+                return Ok(Err(UserDecisionErrorV2::ScopePreviewStale));
+            }
+            if run.current_input_id != binding.input_id {
+                return Ok(Err(UserDecisionErrorV2::PlanBindingMismatch));
+            }
+            let Some(preview) = state.previews.get(&binding.scope_preview_id) else {
+                return Ok(Err(UserDecisionErrorV2::ScopePreviewNotFound));
+            };
+            if preview.record.run_id != *run_id
+                || preview.record.control_epoch != control_epoch
+            {
+                return Ok(Err(UserDecisionErrorV2::ScopePreviewStale));
+            }
+            if preview.authorization_digest
+                != binding.expected_authorization_digest
+            {
+                return Ok(Err(
+                    UserDecisionErrorV2::AuthorizationDigestMismatch,
+                ));
+            }
+            if preview.record.plan_revision != binding.plan_revision
+                || preview.record.plan_action_id != binding.plan_action_id
+                || preview.record.scope_digest != binding.scope_digest
+            {
+                return Ok(Err(UserDecisionErrorV2::PlanBindingMismatch));
+            }
+            (run.clone(), preview.clone())
+        };
+        let current_context = self
+            .build_tool_context(run_id, run.context_version)?
+            .context_ref();
+        if preview.record.context_ref != binding.tool_context_ref
+            || current_context != binding.tool_context_ref
+        {
+            return Ok(Err(UserDecisionErrorV2::ToolContextStale));
+        }
+        Ok(Ok(preview))
+    }
+
+    fn allow_capability_decision(
+        &self,
+        run_id: &RunId,
+        control_epoch: ControlEpoch,
+        binding: CapabilityDecisionBindingV2,
+        expansion: bool,
+        public_command: PublicCommandContext,
+    ) -> AuthorityResult<(UserDecisionReplyV2, bool)> {
+        let preview =
+            match self.resolve_decision_preview(run_id, control_epoch, &binding)? {
+                Ok(preview) => preview,
+                Err(error) => {
+                    return Ok((UserDecisionReplyV2::Error(error), false))
+                }
+            };
+        let (pending, has_existing_lease) = {
+            let state = self.inner.state.lock().map_err(|_| storage_fault())?;
+            (
+                state.pending.get(&binding.scope_preview_id).cloned(),
+                state.leases.values().any(|lease| {
+                    lease.run_id == *run_id
+                        && lease.control_epoch == control_epoch
+                        && lease.plan_revision == preview.record.plan_revision
+                        && lease.plan_action_id == preview.record.plan_action_id
+                        && lease.tool_id == preview.record.tool_id
+                }),
+            )
+        };
+        if expansion != has_existing_lease {
+            return Ok((
+                UserDecisionReplyV2::Error(if expansion {
+                    UserDecisionErrorV2::CapabilityLeaseNotFound
+                } else {
+                    UserDecisionErrorV2::PlanBindingMismatch
+                }),
+                false,
+            ));
+        }
+        let causation = pending
+            .as_ref()
+            .map(|pending| pending.awaiting_fact_id.clone())
+            .unwrap_or_else(|| preview.preview_fact_id.clone());
+        if let Some(pending) = pending {
+            return self.allow_pending_and_continue(
+                &preview,
+                pending,
+                binding.decision_ref,
+                causation,
+                expansion,
+                public_command,
+            );
+        }
+        let lease = self.issue_public_lease(
+            &preview,
+            Some(binding.decision_ref),
+            causation,
+            Some((public_command, expansion)),
+        )?;
+        Ok((if expansion {
+            UserDecisionReplyV2::ScopeExpansionRecorded {
+                lease: lease.reference,
+                fact_id: lease.issuance_fact_id,
+                ledger_sequence: lease.issuance_ledger_sequence,
+            }
+        } else {
+            UserDecisionReplyV2::CapabilityIssued {
+                lease: lease.reference,
+                fact_id: lease.issuance_fact_id,
+                ledger_sequence: lease.issuance_ledger_sequence,
+            }
+        }, true))
+    }
+
+    fn allow_pending_and_continue(
+        &self,
+        preview: &PreparedScopePreview,
+        pending: PendingIntent,
+        decision_ref: UserDecisionRefV2,
+        causation_fact_id: FactId,
+        expansion: bool,
+        public_command: PublicCommandContext,
+    ) -> AuthorityResult<(UserDecisionReplyV2, bool)> {
+        let previous = {
+            let state = self.inner.state.lock().map_err(|_| storage_fault())?;
+            state
+                .leases
+                .values()
+                .filter(|lease| {
+                    lease.run_id == preview.record.run_id
+                        && lease.control_epoch == preview.record.control_epoch
+                        && lease.plan_revision == preview.record.plan_revision
+                        && lease.plan_action_id == preview.record.plan_action_id
+                        && lease.tool_id == preview.record.tool_id
+                })
+                .max_by_key(|lease| lease.reference.version.get())
+                .cloned()
+        };
+        if expansion != previous.is_some() {
+            return Err(invalid_field(
+                "decision",
+                InvalidFieldViolationV2::InvalidRelation,
+            ));
+        }
+        let (submitted_plan_revision, submitted_plan_action_id) =
+            match &pending.authority {
+                ToolIntentAuthorityV2::PlanAction {
+                    plan_revision,
+                    plan_action_id,
+                    ..
+                } => (plan_revision, plan_action_id),
+                ToolIntentAuthorityV2::ContextRead { .. } => {
+                    return Err(invalid_field(
+                        "authority",
+                        InvalidFieldViolationV2::InvalidRelation,
+                    ))
+                }
+            };
+        if submitted_plan_revision != &preview.record.plan_revision
+            || submitted_plan_action_id != &preview.record.plan_action_id
+            || pending.run_id != preview.record.run_id
+            || pending.expected_control_epoch != preview.record.control_epoch
+            || pending.operation_id != preview.record.operation_id
+            || pending.tool_id != preview.record.tool_id
+            || pending.tool_context_ref != preview.record.context_ref
+        {
+            return Err(invalid_field(
+                "authority",
+                InvalidFieldViolationV2::InvalidRelation,
+            ));
+        }
+        let lease_id = previous
+            .as_ref()
+            .map(|lease| lease.reference.lease_id.clone())
+            .unwrap_or_else(|| self.inner.ids.lease_id());
+        let version = CapabilityLeaseVersionV2::new(
+            previous
+                .as_ref()
+                .map(|lease| lease.reference.version.get().saturating_add(1))
+                .unwrap_or(1),
+        )
+        .map_err(|_| storage_fault())?;
+        let reference = CapabilityLeaseRefV2 {
+            lease_id: lease_id.clone(),
+            version,
+            scope_digest: preview.record.scope_digest.clone(),
+        };
+        let lease_identity = CapabilityLeaseFactIdentityV2 {
+            run_id: preview.record.run_id.clone(),
+            control_epoch: preview.record.control_epoch,
+            plan_revision: preview.record.plan_revision.clone(),
+            plan_action_id: preview.record.plan_action_id.clone(),
+            operation_id: preview.record.operation_id.clone(),
+            preview_id: preview.record.preview_id.clone(),
+            lease_id: lease_id.clone(),
+            lease_version: version,
+            causation_fact_id,
+            correlation_set: plan_action_correlations(
+                &preview.record.plan_action_id,
+            )?,
+        };
+        let authorization = match &previous {
+            Some(previous) => AuthorizationFactV2::ExpansionAllowed {
+                identity: lease_identity,
+                previous_lease_id: previous.reference.lease_id.clone(),
+                previous_scope_digest: previous.reference.scope_digest.clone(),
+                expanded_scope_digest: preview.record.scope_digest.clone(),
+                authorization_digest: preview.authorization_digest.clone(),
+            },
+            None => AuthorizationFactV2::CapabilityIssued {
+                identity: lease_identity,
+                tool_id: preview.record.tool_id.clone(),
+                scope_digest: preview.record.scope_digest.clone(),
+                authorization_digest: preview.authorization_digest.clone(),
+                tool_contract_digest: preview
+                    .record
+                    .tool_contract_digest
+                    .clone(),
+                context_ref: preview.record.context_ref.clone(),
+            },
+        };
+        let durable_lease = DurableCapabilityLeaseV2 {
+            reference: reference.clone(),
+            run_id: preview.record.run_id.clone(),
+            control_epoch: preview.record.control_epoch,
+            plan_revision: preview.record.plan_revision.clone(),
+            plan_action_id: preview.record.plan_action_id.clone(),
+            tool_id: preview.record.tool_id.clone(),
+            context_ref: preview.record.context_ref.clone(),
+            approved_targets: preview.approved_targets.clone(),
+            decision_ref: Some(decision_ref),
+            issuance_operation_id: preview.record.operation_id.clone(),
+            preview_id: preview.record.preview_id.clone(),
+        };
+        let lease_material =
+            capability_lease_material(&durable_lease, AUTHORITY_MATERIAL_ACTIVE)?;
+        let lease_mutation = if previous.is_some() {
+            AuthorityMaterialMutationV2::Replace {
+                expected_lifecycle: AUTHORITY_MATERIAL_ACTIVE.to_owned(),
+                expected_payload_digest: None,
+                material: lease_material,
+                fact_index: 0,
+            }
+        } else {
+            AuthorityMaterialMutationV2::Put {
+                material: lease_material,
+                fact_index: 0,
+            }
+        };
+        let pending_mutation = AuthorityMaterialMutationV2::Replace {
+            expected_lifecycle: AUTHORITY_MATERIAL_AWAITING.to_owned(),
+            expected_payload_digest: None,
+            material: pending_intent_material(
+                &pending.durable(),
+                AUTHORITY_MATERIAL_ADMITTED,
+                Some(reference.clone()),
+            )?,
+            fact_index: 1,
+        };
+        let descriptor =
+            self.ready_descriptor(&pending.run_id, &pending.tool_id)
+                .map_err(|_| {
+                    invalid_field(
+                        "toolId",
+                        InvalidFieldViolationV2::OutOfRange,
+                    )
+                })?;
+        let invocation =
+            canonical_invocation(&pending.tool_id, &pending.raw_arguments)?;
+        let workspace = self
+            .inner
+            .authority
+            .workspace_for_run(&pending.run_id)?;
+        let actual_targets =
+            exact_targets_for_invocation(&workspace, &invocation)?;
+        if !target_set_contains(&preview.approved_targets, &actual_targets) {
+            return Err(invalid_field(
+                "requestedResources",
+                InvalidFieldViolationV2::InvalidRelation,
+            ));
+        }
+        let canonical_arguments = canonical_argument_value(&invocation)?;
+        let canonical_arguments_digest =
+            canonical_arguments_digest_v2(&pending.tool_id, &canonical_arguments)
+                .map_err(|_| storage_fault())?;
+        let tool_contract_digest =
+            tool_contract_digest_v2(&descriptor).map_err(|_| storage_fault())?;
+        if canonical_arguments_digest
+            != preview.record.canonical_arguments_digest
+            || tool_contract_digest != preview.record.tool_contract_digest
+        {
+            return Err(invalid_field(
+                "rawArguments",
+                InvalidFieldViolationV2::InvalidRelation,
+            ));
+        }
+        let settings_digest = self.settings_ceiling_digest(&pending.run_id)?;
+        let policy_evaluation_digest = invocation_policy_evaluation_digest_v2(
+            &pending.run_id,
+            pending.expected_control_epoch,
+            &pending.tool_id,
+            &pending.tool_context_ref,
+            &settings_digest,
+            Some(&reference),
+        )
+        .map_err(|_| storage_fault())?;
+        let direct_request = DirectToolIntentRequest {
+            run_id: pending.run_id.clone(),
+            operation_id: pending.operation_id.clone(),
+            control_epoch: pending.expected_control_epoch,
+            idempotency_key: pending.idempotency_key.clone(),
+            tool_id: pending.tool_id.clone(),
+            canonical_arguments_digest,
+            canonical_invocation: invocation,
+            authority: InvocationAuthorityV2::PlanAction {
+                plan_revision: preview.record.plan_revision.clone(),
+                plan_action_id: preview.record.plan_action_id.clone(),
+                lease: reference.clone(),
+                policy_evaluation_digest,
+            },
+            tool_contract_digest,
+            deadline: pending.deadline,
+        };
+        let decision_run_id = pending.run_id.clone();
+        let reply_reference = reference.clone();
+        let outcome = self
+            .inner
+            .authority
+            .continue_direct_tool_intent_with_public_receipt(
+                direct_request,
+                pending.invocation_id.clone(),
+                authorization,
+                vec![lease_mutation, pending_mutation],
+                move |fact_id, ledger_sequence, _| {
+                    let reply = if expansion {
+                        UserDecisionReplyV2::ScopeExpansionRecorded {
+                            lease: reply_reference,
+                            fact_id: fact_id.clone(),
+                            ledger_sequence,
+                        }
+                    } else {
+                        UserDecisionReplyV2::CapabilityIssued {
+                            lease: reply_reference,
+                            fact_id: fact_id.clone(),
+                            ledger_sequence,
+                        }
+                    };
+                    public_receipt(
+                        public_command.request_id,
+                        public_command.request_digest,
+                        public_command.command_kind,
+                        Some(decision_run_id),
+                        &DurablePublicReplyV2::UserDecision { reply },
+                        Some(fact_id.clone()),
+                    )
+                },
+            )?;
+        match &outcome.reply {
+            ToolIntentSubmitReplyV2::Admitted {
+                lease,
+                invocation_id,
+                ..
+            } if lease.as_ref() == Some(&reference)
+                && invocation_id == &pending.invocation_id => {}
+            _ => return Err(storage_fault()),
+        }
+        let lease = durable_lease.into_record(
+            outcome.authorization_fact_id.clone(),
+            outcome.authorization_ledger_sequence,
+        );
+        {
+            let mut state = self.inner.state.lock().map_err(|_| storage_fault())?;
+            state
+                .leases
+                .insert(reference.lease_id.clone(), lease);
+            state.pending.remove(&pending.preview_id);
+        }
+        Ok((
+            if expansion {
+                UserDecisionReplyV2::ScopeExpansionRecorded {
+                    lease: reference,
+                    fact_id: outcome.authorization_fact_id,
+                    ledger_sequence: outcome.authorization_ledger_sequence,
+                }
+            } else {
+                UserDecisionReplyV2::CapabilityIssued {
+                    lease: reference,
+                    fact_id: outcome.authorization_fact_id,
+                    ledger_sequence: outcome.authorization_ledger_sequence,
+                }
+            },
+            true,
+        ))
+    }
+
+    fn deny_capability_decision(
+        &self,
+        run_id: &RunId,
+        control_epoch: ControlEpoch,
+        binding: CapabilityDecisionBindingV2,
+        guidance: String,
+        expansion: bool,
+        public_command: PublicCommandContext,
+    ) -> AuthorityResult<(UserDecisionReplyV2, bool)> {
+        let preview =
+            match self.resolve_decision_preview(run_id, control_epoch, &binding)? {
+                Ok(preview) => preview,
+                Err(error) => {
+                    return Ok((UserDecisionReplyV2::Error(error), false))
+                }
+            };
+        let pending = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| storage_fault())?
+            .pending
+            .get(&binding.scope_preview_id)
+            .cloned();
+        let causation = pending
+            .as_ref()
+            .map(|pending| pending.awaiting_fact_id.clone())
+            .unwrap_or_else(|| preview.preview_fact_id.clone());
+        let material_mutations = pending
+            .as_ref()
+            .map(|pending| {
+                let lease = match &pending.authority {
+                    ToolIntentAuthorityV2::PlanAction { lease, .. } => {
+                        lease.clone()
+                    }
+                    ToolIntentAuthorityV2::ContextRead { .. } => None,
+                };
+                Ok(AuthorityMaterialMutationV2::Replace {
+                    expected_lifecycle: AUTHORITY_MATERIAL_AWAITING.to_owned(),
+                    expected_payload_digest: None,
+                    material: pending_intent_material(
+                        &pending.durable(),
+                        AUTHORITY_MATERIAL_REJECTED,
+                        lease,
+                    )?,
+                    fact_index: 0,
+                })
+            })
+            .transpose()?
+            .into_iter()
+            .collect();
+        let denial =
+            self.record_denial(
+                &preview,
+                causation,
+                guidance,
+                expansion,
+                Some(public_command),
+                material_mutations,
+            )?;
+        let mut state = self.inner.state.lock().map_err(|_| storage_fault())?;
+        state.pending.remove(&binding.scope_preview_id);
+        Ok((if expansion {
+            UserDecisionReplyV2::ScopeExpansionDenied {
+                fact_id: denial.0.fact_id,
+                ledger_sequence: denial.0.ledger_sequence,
+            }
+        } else {
+            UserDecisionReplyV2::CapabilityDenied {
+                fact_id: denial.0.fact_id,
+                ledger_sequence: denial.0.ledger_sequence,
+            }
+        }, denial.1))
+    }
+
+    fn grant_trust(
+        &self,
+        run_id: &RunId,
+        control_epoch: ControlEpoch,
+        decision: TrustGrantDecisionV2,
+        public_command: PublicCommandContext,
+    ) -> AuthorityResult<(UserDecisionReplyV2, bool)> {
+        let preview = match self.resolve_decision_preview(
+            run_id,
+            control_epoch,
+            &decision.binding,
+        )? {
+            Ok(preview) => preview,
+            Err(error) => {
+                return Ok((UserDecisionReplyV2::Error(error), false))
+            }
+        };
+        if decision
+            .expires_at
+            .as_ref()
+            .is_some_and(|expires_at| !recorded_at_is_future(expires_at))
+        {
+            return Ok((
+                UserDecisionReplyV2::Error(
+                    UserDecisionErrorV2::PlanBindingMismatch,
+                ),
+                false,
+            ));
+        }
+        let run = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| storage_fault())?
+            .runs
+            .get(run_id)
+            .cloned()
+            .ok_or_else(|| KernelErrorV2::RunNotFound {
+                run_id: run_id.clone(),
+            })?;
+        let trust_lease_digest = trust_lease_digest_v2(&json!({
+            "trustPolicyId": decision.trust_policy_id,
+            "runId": run_id,
+            "controlEpoch": control_epoch,
+            "toolId": preview.record.tool_id,
+            "approvedTargets": preview.approved_targets,
+            "workspaceBindingDigest": run.workspace_binding_digest,
+            "toolContext": preview.record.context_ref,
+            "expiresAt": decision.expires_at,
+        }))
+        .map_err(|_| storage_fault())?;
+        let durable_trust = DurableTrustLeaseV2 {
+            trust_policy_id: decision.trust_policy_id.clone(),
+            trust_lease_digest: trust_lease_digest.clone(),
+            run_id: run_id.clone(),
+            control_epoch,
+            plan_revision: preview.record.plan_revision.clone(),
+            plan_action_id: preview.record.plan_action_id.clone(),
+            issuance_operation_id: preview.record.operation_id.clone(),
+            tool_id: preview.record.tool_id.clone(),
+            scope_digest: preview.record.scope_digest.clone(),
+            approved_targets: preview.approved_targets.clone(),
+            workspace_binding_digest: run.workspace_binding_digest.clone(),
+            context_ref: preview.record.context_ref.clone(),
+            expires_at: decision.expires_at.clone(),
+            decision_ref: decision.binding.decision_ref.clone(),
+        };
+        let payload = AuthorizationFactV2::TrustGranted {
+                identity: AuthorizationIdentityV2 {
+                    run_id: run_id.clone(),
+                    control_epoch,
+                    plan_revision: preview.record.plan_revision.clone(),
+                    plan_action_id: preview.record.plan_action_id.clone(),
+                    operation_id: preview.record.operation_id.clone(),
+                    causation_fact_id: preview.preview_fact_id.clone(),
+                    correlation_set: plan_action_correlations(
+                        &preview.record.plan_action_id,
+                    )?,
+                },
+                trust_policy_id: decision.trust_policy_id.clone(),
+                trust_lease_digest: trust_lease_digest.clone(),
+                tool_id: preview.record.tool_id.clone(),
+                scope_digest: preview.record.scope_digest.clone(),
+                workspace_binding_digest: run.workspace_binding_digest.clone(),
+                context_ref: preview.record.context_ref.clone(),
+                expires_at: decision.expires_at.clone(),
+            };
+        let reply_policy_id = decision.trust_policy_id.clone();
+        let reply_digest = trust_lease_digest.clone();
+        let (fact, reply) = self.append_user_decision_fact_with_material(
+            run_id.clone(),
+            payload,
+            public_command,
+            vec![AuthorityMaterialMutationV2::Put {
+                material: trust_lease_material(
+                    &durable_trust,
+                    AUTHORITY_MATERIAL_ACTIVE,
+                )?,
+                fact_index: 0,
+            }],
+            move |fact_id, ledger_sequence| {
+                UserDecisionReplyV2::TrustGranted {
+                    trust_policy_id: reply_policy_id,
+                    trust_lease_digest: reply_digest,
+                    fact_id,
+                    ledger_sequence,
+                }
+            },
+        )?;
+        let trust = durable_trust.into_record(fact.fact_id.clone());
+        let mut state = self.inner.state.lock().map_err(|_| storage_fault())?;
+        if state
+            .trusts
+            .insert(decision.trust_policy_id.clone(), trust)
+            .is_some()
+        {
+            return Err(storage_fault());
+        }
+        Ok((reply, true))
+    }
+
+    fn revoke_user_authority(
+        &self,
+        run_id: &RunId,
+        control_epoch: ControlEpoch,
+        _decision_ref: UserDecisionRefV2,
+        target: UserDecisionRevokeTargetV2,
+        public_command: PublicCommandContext,
+    ) -> AuthorityResult<(UserDecisionReplyV2, bool)> {
+        match target {
+            UserDecisionRevokeTargetV2::CapabilityLease { lease_id } => {
+                let lease = {
+                    let state =
+                        self.inner.state.lock().map_err(|_| storage_fault())?;
+                    state.leases.get(&lease_id).cloned()
+                };
+                let Some(lease) = lease.filter(|lease| {
+                    lease.run_id == *run_id
+                        && lease.control_epoch == control_epoch
+                }) else {
+                    return Ok((
+                        UserDecisionReplyV2::Error(
+                            UserDecisionErrorV2::CapabilityLeaseNotFound,
+                        ),
+                        false,
+                    ));
+                };
+                let durable_lease = lease.durable();
+                let payload = AuthorizationFactV2::LeaseRevoked {
+                        identity: CapabilityLeaseFactIdentityV2 {
+                            run_id: run_id.clone(),
+                            control_epoch,
+                            plan_revision: lease.plan_revision.clone(),
+                            plan_action_id: lease.plan_action_id.clone(),
+                            operation_id: lease.issuance_operation_id.clone(),
+                            preview_id: lease.preview_id.clone(),
+                            lease_id: lease.reference.lease_id.clone(),
+                            lease_version: lease.reference.version,
+                            causation_fact_id: lease.issuance_fact_id.clone(),
+                            correlation_set: plan_action_correlations(
+                                &lease.plan_action_id,
+                            )?,
+                        },
+                        scope_digest: lease.reference.scope_digest.clone(),
+                        reason: CapabilityLeaseRevokeReasonV2::UserRevoked,
+                    };
+                let (_, reply) = self.append_user_decision_fact_with_material(
+                    run_id.clone(),
+                    payload,
+                    public_command,
+                    vec![AuthorityMaterialMutationV2::Replace {
+                        expected_lifecycle: AUTHORITY_MATERIAL_ACTIVE.to_owned(),
+                        expected_payload_digest: None,
+                        material: capability_lease_material(
+                            &durable_lease,
+                            AUTHORITY_MATERIAL_REVOKED,
+                        )?,
+                        fact_index: 0,
+                    }],
+                    |fact_id, ledger_sequence| UserDecisionReplyV2::Revoked {
+                        fact_id,
+                        ledger_sequence,
+                    },
+                )?;
+                self.inner
+                    .state
+                    .lock()
+                    .map_err(|_| storage_fault())?
+                    .leases
+                    .remove(&lease_id);
+                Ok((reply, true))
+            }
+            UserDecisionRevokeTargetV2::TrustPolicy { trust_policy_id } => {
+                let trust = {
+                    let state =
+                        self.inner.state.lock().map_err(|_| storage_fault())?;
+                    state.trusts.get(&trust_policy_id).cloned()
+                };
+                let Some(trust) = trust.filter(|trust| {
+                    trust.run_id == *run_id
+                        && trust.control_epoch == control_epoch
+                }) else {
+                    return Ok((
+                        UserDecisionReplyV2::Error(
+                            UserDecisionErrorV2::TrustPolicyNotFound,
+                        ),
+                        false,
+                    ));
+                };
+                let durable_trust = trust.durable();
+                let payload = AuthorizationFactV2::TrustRevoked {
+                        identity: AuthorizationIdentityV2 {
+                            run_id: run_id.clone(),
+                            control_epoch,
+                            plan_revision: trust.plan_revision.clone(),
+                            plan_action_id: trust.plan_action_id.clone(),
+                            operation_id: trust.issuance_operation_id.clone(),
+                            causation_fact_id: trust.fact_id.clone(),
+                            correlation_set: plan_action_correlations(
+                                &trust.plan_action_id,
+                            )?,
+                        },
+                        trust_policy_id: trust.trust_policy_id.clone(),
+                        trust_lease_digest: trust.trust_lease_digest,
+                        tool_id: trust.tool_id,
+                        scope_digest: trust.scope_digest,
+                        workspace_binding_digest: trust.workspace_binding_digest,
+                        context_ref: trust.context_ref,
+                        expires_at: trust.expires_at,
+                    };
+                let (_, reply) = self.append_user_decision_fact_with_material(
+                    run_id.clone(),
+                    payload,
+                    public_command,
+                    vec![AuthorityMaterialMutationV2::Replace {
+                        expected_lifecycle: AUTHORITY_MATERIAL_ACTIVE.to_owned(),
+                        expected_payload_digest: None,
+                        material: trust_lease_material(
+                            &durable_trust,
+                            AUTHORITY_MATERIAL_REVOKED,
+                        )?,
+                        fact_index: 0,
+                    }],
+                    |fact_id, ledger_sequence| UserDecisionReplyV2::Revoked {
+                        fact_id,
+                        ledger_sequence,
+                    },
+                )?;
+                self.inner
+                    .state
+                    .lock()
+                    .map_err(|_| storage_fault())?
+                    .trusts
+                    .remove(&trust_policy_id);
+                Ok((reply, true))
+            }
+        }
+    }
+
+    fn require_run_capability(
+        &self,
+        run_id: &RunId,
+        transport: &RunCapabilityV2,
+    ) -> AuthorityResult<PublicRunRecord> {
+        let state = self.inner.state.lock().map_err(|_| storage_fault())?;
+        let run = state
+            .runs
+            .get(run_id)
+            .ok_or_else(|| KernelErrorV2::RunNotFound {
+                run_id: run_id.clone(),
+            })?;
+        if !constant_time_token_eq(&run.capability, transport) {
+            return Err(unauthorized_run());
+        }
+        Ok(run.clone())
+    }
+
+    fn run_record(&self, run_id: &RunId) -> AuthorityResult<PublicRunRecord> {
+        self.inner
+            .state
+            .lock()
+            .map_err(|_| storage_fault())?
+            .runs
+            .get(run_id)
+            .cloned()
+            .ok_or_else(|| KernelErrorV2::RunNotFound {
+                run_id: run_id.clone(),
+            })
+    }
+
+    fn lookup_replay(
+        &self,
+        request_id: &CommandRequestId,
+        submitted: &CommandRequestDigestV2,
+    ) -> AuthorityResult<Option<DurablePublicReplyV2>> {
+        let Some(existing) = self
+            .inner
+            .authority
+            .public_command_receipt(request_id)?
+        else {
+            return Ok(None);
+        };
+        if &existing.command_request_digest != submitted {
+            return Err(KernelErrorV2::DuplicateCommandDigestMismatch {
+                command_request_id: request_id.clone(),
+                existing: existing.command_request_digest,
+                submitted: submitted.clone(),
+            });
+        }
+        serde_json::from_value(existing.reply_json)
+            .map(Some)
+            .map_err(|_| storage_fault())
+    }
+
+    fn persist_reply(
+        &self,
+        request_id: CommandRequestId,
+        digest: CommandRequestDigestV2,
+        command_kind: &'static str,
+        run_id: Option<RunId>,
+        reply: DurablePublicReplyV2,
+        settlement_fact_id: Option<FactId>,
+    ) -> AuthorityResult<DurablePublicReplyV2> {
+        let receipt = public_receipt(
+            request_id,
+            digest,
+            command_kind,
+            run_id,
+            &reply,
+            settlement_fact_id,
+        )?;
+        receipt_outcome(
+            self.inner
+                .authority
+                .put_public_command_receipt(receipt)?,
+        )
+    }
+
+    fn persist_user_decision_reply(
+        &self,
+        request_id: CommandRequestId,
+        request_digest: CommandRequestDigestV2,
+        run_id: RunId,
+        reply: UserDecisionReplyV2,
+    ) -> AuthorityResult<(UserDecisionReplyV2, CommandHandlingV2)> {
+        let stored = DurablePublicReplyV2::UserDecision {
+            reply: reply.clone(),
+        };
+        let persisted = self.persist_reply(
+            request_id,
+            request_digest,
+            "userDecision",
+            Some(run_id),
+            stored,
+            user_decision_settlement_fact(&reply),
+        )?;
+        match persisted {
+            DurablePublicReplyV2::UserDecision { .. } => {
+                Ok((reply, CommandHandlingV2::Evaluated))
+            }
+            _ => Err(storage_fault()),
+        }
+    }
+
+    fn append_user_decision_fact_with_material<F>(
+        &self,
+        run_id: RunId,
+        payload: AuthorizationFactV2,
+        public_command: PublicCommandContext,
+        material_mutations: Vec<AuthorityMaterialMutationV2>,
+        make_reply: F,
+    ) -> AuthorityResult<(KernelFactEnvelopeV2, UserDecisionReplyV2)>
+    where
+        F: FnOnce(FactId, u64) -> UserDecisionReplyV2,
+    {
+        let outcome = self
+            .inner
+            .authority
+            .append_payloads_with_public_receipt_and_authority_material_builder(
+                vec![KernelFactPayloadV2::Authorization(payload)],
+                Some(0),
+                material_mutations,
+                move |fact_ids, ledger_sequences| {
+                    let reply =
+                        make_reply(fact_ids[0].clone(), ledger_sequences[0]);
+                    public_receipt(
+                        public_command.request_id,
+                        public_command.request_digest,
+                        public_command.command_kind,
+                        Some(run_id),
+                        &DurablePublicReplyV2::UserDecision { reply },
+                        None,
+                    )
+                },
+            )?;
+        let fact = outcome
+            .facts
+            .first()
+            .cloned()
+            .ok_or_else(storage_fault)?;
+        let durable = receipt_outcome(outcome.receipt)?;
+        match durable {
+            DurablePublicReplyV2::UserDecision { reply } => Ok((fact, reply)),
+            _ => Err(storage_fault()),
+        }
+    }
+
+    fn materialize_facts_page(
+        &self,
+        template: DurableFactPageV2,
+    ) -> AuthorityResult<KernelFactProjectionPageV2> {
+        let next_continuation = if template.has_more {
+            let mut issued = None;
+            for _ in 0..4 {
+                let token = deepcode_kernel_abi::FactQueryContinuationV2::new(
+                    self.inner.ids.raw("facts"),
+                )
+                .map_err(|_| storage_fault())?;
+                let outcome = self.inner.authority.put_fact_query_continuation(
+                    FactQueryContinuationDraftV2 {
+                        token: token.clone(),
+                        run_id: template.run_id.clone(),
+                        snapshot_high_water: template.snapshot_high_water,
+                        after_ledger_sequence: template.next_after_ledger_sequence,
+                        expires_at: recorded_at_after(
+                            std::time::Duration::from_secs(15 * 60),
+                        )?,
+                    },
+                )?;
+                match outcome {
+                    PutFactQueryContinuationOutcomeV2::Inserted(_)
+                    | PutFactQueryContinuationOutcomeV2::ExistingSame(_) => {
+                        issued = Some(token);
+                        break;
+                    }
+                    PutFactQueryContinuationOutcomeV2::ExistingConsumed(_)
+                    | PutFactQueryContinuationOutcomeV2::ExistingExpired(_)
+                    | PutFactQueryContinuationOutcomeV2::TokenConflict => continue,
+                    PutFactQueryContinuationOutcomeV2::CapacityExceeded { .. } => {
+                        return Err(KernelErrorV2::FactStoreUnavailable {
+                            fault_code:
+                                deepcode_kernel_abi::v2_command::StorageFaultCodeV2::Full,
+                        })
+                    }
+                }
+            }
+            Some(issued.ok_or_else(storage_fault)?)
+        } else {
+            None
+        };
+        let page = KernelFactProjectionPageV2 {
+            requested_after_ledger_sequence: template.requested_after_ledger_sequence,
+            snapshot_high_water: template.snapshot_high_water,
+            facts: template.facts,
+            has_more: template.has_more,
+            next_after_ledger_sequence: template.next_after_ledger_sequence,
+            next_continuation,
+        };
+        page.validate().map_err(|_| storage_fault())?;
+        Ok(page)
+    }
+
+    fn build_tool_context(
+        &self,
+        run_id: &RunId,
+        context_version: ToolContextVersionV2,
+    ) -> AuthorityResult<ToolContextBundleV2> {
+        let (runtime_availability, settings_overrides, settings) = {
+            let state = self.inner.state.lock().map_err(|_| storage_fault())?;
+            (
+                state.runtime_availability.clone(),
+                state.settings_tool_overrides.clone(),
+                state
+                    .run_settings
+                    .get(run_id)
+                    .cloned()
+                    .unwrap_or_else(|| self.inner.startup_settings.clone()),
+            )
+        };
+        let tools = self
+            .inner
+            .inventory
+            .tools
+            .iter()
+            .filter(|descriptor| {
+                runtime_availability
+                    .get(&(run_id.clone(), descriptor.tool_id.clone()))
+                    .copied()
+                    .unwrap_or(descriptor.availability)
+                    == ToolAvailabilityV2::Ready
+                    && settings_overrides
+                        .get(&(run_id.clone(), descriptor.tool_id.clone()))
+                        .copied()
+                        .unwrap_or_else(|| {
+                            settings_allow(&settings, descriptor.effect_scope)
+                        })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let context_digest = tool_context_digest_v2(
+            context_version,
+            &self.inner.inventory.catalog_digest,
+            KERNEL_TOOL_PROMPT_V2,
+            &tools,
+        )
+        .map_err(|_| storage_fault())?;
+        let context = ToolContextBundleV2 {
+            format_version: TOOL_CONTEXT_FORMAT_V2.to_owned(),
+            context_version,
+            catalog_digest: self.inner.inventory.catalog_digest.clone(),
+            context_digest,
+            fixed_prompt: KERNEL_TOOL_PROMPT_V2.to_owned(),
+            tools,
+        };
+        context.validate().map_err(|_| storage_fault())?;
+        Ok(context)
+    }
+
+    fn ready_descriptor(
+        &self,
+        run_id: &RunId,
+        tool_id: &ToolIdV2,
+    ) -> Result<ToolDescriptorV2, deepcode_kernel_abi::v2_command::CapabilityScopeRejectionReasonV2>
+    {
+        let descriptor = self
+            .inner
+            .inventory
+            .tools
+            .iter()
+            .find(|descriptor| &descriptor.tool_id == tool_id)
+            .cloned()
+            .ok_or(
+                deepcode_kernel_abi::v2_command::CapabilityScopeRejectionReasonV2::ToolNotRegistered,
+            )?;
+        let availability = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| {
+                deepcode_kernel_abi::v2_command::CapabilityScopeRejectionReasonV2::ToolUnavailable
+            })?
+            .runtime_availability
+            .get(&(run_id.clone(), tool_id.clone()))
+            .copied()
+            .unwrap_or(descriptor.availability);
+        if availability != ToolAvailabilityV2::Ready {
+            return Err(
+                deepcode_kernel_abi::v2_command::CapabilityScopeRejectionReasonV2::ToolUnavailable,
+            );
+        }
+        let settings_allowed = {
+            let state = self.inner.state.lock().map_err(|_| {
+                deepcode_kernel_abi::v2_command::CapabilityScopeRejectionReasonV2::ToolUnavailable
+            })?;
+            state
+                .settings_tool_overrides
+                .get(&(run_id.clone(), tool_id.clone()))
+                .copied()
+                .unwrap_or_else(|| {
+                    let settings = state
+                        .run_settings
+                        .get(run_id)
+                        .unwrap_or(&self.inner.startup_settings);
+                    settings_allow(settings, descriptor.effect_scope)
+                })
+        };
+        if !settings_allowed {
+            return Err(
+                deepcode_kernel_abi::v2_command::CapabilityScopeRejectionReasonV2::SettingsDenied,
+            );
+        }
+        Ok(descriptor)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_preview(
+        &self,
+        run_id: &RunId,
+        control_epoch: ControlEpoch,
+        plan_revision: PlanRevisionV2,
+        plan_action_id: PlanActionIdV2,
+        operation_id: OperationId,
+        idempotency_key: String,
+        tool_id: ToolIdV2,
+        raw_arguments: deepcode_kernel_abi::RawToolArgumentsV2,
+        approved_targets: Vec<ScopeTargetKey>,
+        scope_delta: Vec<ScopeTargetKey>,
+        deadline: DeadlineRequestV2,
+        context_ref: ToolContextRefV2,
+        descriptor: ToolDescriptorV2,
+        public_command: Option<&PublicCommandContext>,
+    ) -> AuthorityResult<PreparedScopePreview> {
+        let invocation = canonical_invocation(&tool_id, &raw_arguments)?;
+        let correlation_refs = vec![CorrelationRefV2::PlanAction {
+            value: plan_action_id.to_string(),
+        }];
+        let (canonical_resource_scope, effective_deadline_ms) = self
+            .inner
+            .authority
+            .canonical_scope_for_tool(
+                run_id,
+                &operation_id,
+                control_epoch,
+                &idempotency_key,
+                &invocation,
+                deadline,
+                correlation_refs,
+            )?;
+        let canonical_arguments = canonical_argument_value(&invocation)?;
+        let canonical_arguments_digest =
+            canonical_arguments_digest_v2(&tool_id, &canonical_arguments)
+                .map_err(|_| storage_fault())?;
+        if !targets_cover_invocation(
+            &approved_targets,
+            &canonical_resource_scope,
+            &invocation,
+        )? {
+            return Err(invalid_field(
+                "requestedResources",
+                InvalidFieldViolationV2::InvalidRelation,
+            ));
+        }
+        let run = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| storage_fault())?
+            .runs
+            .get(run_id)
+            .cloned()
+            .ok_or_else(|| KernelErrorV2::RunNotFound {
+                run_id: run_id.clone(),
+            })?;
+        let scope_digest = capability_scope_digest_v2(&json!({
+            "runId": run_id,
+            "workspaceBindingDigest": run.workspace_binding_digest,
+            "controlEpoch": control_epoch,
+            "planRevision": plan_revision,
+            "planActionId": plan_action_id,
+            "toolId": tool_id,
+            "targets": approved_targets,
+            "canonicalResourceScope": canonical_resource_scope,
+            "toolContractDigest": descriptor.contract_digest,
+            "toolContext": context_ref,
+            "effectClass": descriptor.effect_class,
+            "effectScope": descriptor.effect_scope,
+            "risk": descriptor.risk,
+        }))
+        .map_err(|_| storage_fault())?;
+        let preview_id = self.inner.ids.preview_id();
+        let authorization_digest = capability_authorization_digest_v2(&json!({
+            "previewId": preview_id,
+            "runId": run_id,
+            "workspaceBindingDigest": run.workspace_binding_digest,
+            "controlEpoch": control_epoch,
+            "planRevision": plan_revision,
+            "planActionId": plan_action_id,
+            "operationId": operation_id,
+            "toolId": tool_id,
+            "canonicalArgumentsDigest": canonical_arguments_digest,
+            "scopeDigest": scope_digest,
+            "toolContractDigest": descriptor.contract_digest,
+            "toolContext": context_ref,
+        }))
+        .map_err(|_| storage_fault())?;
+        let auto_approve_plans = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| storage_fault())?
+            .run_settings
+            .get(run_id)
+            .map(|settings| settings.auto_approve_plans)
+            .unwrap_or(self.inner.startup_settings.auto_approve_plans);
+        let automatic_decision_ref = if auto_approve_plans
+            && descriptor.effect_class != ToolEffectClassV2::Read
+        {
+            self.inner
+                .state
+                .lock()
+                .map_err(|_| storage_fault())?
+                .trusts
+                .values()
+                .find(|trust| {
+                    trust.run_id == *run_id
+                        && trust.control_epoch == control_epoch
+                        && trust.plan_revision == plan_revision
+                        && trust.plan_action_id == plan_action_id
+                        && trust.tool_id == tool_id
+                        && trust.workspace_binding_digest
+                            == run.workspace_binding_digest
+                        && trust.context_ref == context_ref
+                        && target_set_contains(
+                            &trust.approved_targets,
+                            &approved_targets,
+                        )
+                        && trust
+                            .expires_at
+                            .as_ref()
+                            .is_none_or(recorded_at_is_future)
+                })
+                .map(|trust| trust.decision_ref.clone())
+        } else {
+            None
+        };
+        let disposition = if descriptor.effect_class == ToolEffectClassV2::Read
+            || automatic_decision_ref.is_some()
+        {
+            CapabilityScopeDispositionV2::AutoIssuable
+        } else {
+            CapabilityScopeDispositionV2::RequiresUserDecision
+        };
+        let canonical_targets = approved_targets
+            .iter()
+            .map(scope_target_label)
+            .collect::<Vec<_>>();
+        let approval_view = CapabilityApprovalViewV2 {
+            summary: format!(
+                "{} {} within {} canonical target(s)",
+                if descriptor.effect_class == ToolEffectClassV2::Read {
+                    "Read using"
+                } else {
+                    "Mutate using"
+                },
+                tool_id,
+                canonical_targets.len()
+            ),
+            canonical_targets,
+            scope_delta: scope_delta
+                .iter()
+                .map(scope_target_label)
+                .collect(),
+            risk: descriptor.risk,
+            effect_class: descriptor.effect_class,
+            effect_scope: descriptor.effect_scope,
+            effective_deadline_ms,
+            scope_digest: scope_digest.clone(),
+        };
+        let record = CapabilityScopePreviewRecordV2 {
+            preview_id: preview_id.clone(),
+            run_id: run_id.clone(),
+            control_epoch,
+            plan_revision: plan_revision.clone(),
+            plan_action_id: plan_action_id.clone(),
+            operation_id: operation_id.clone(),
+            tool_id: tool_id.clone(),
+            canonical_arguments_digest: canonical_arguments_digest.clone(),
+            canonical_scope: canonical_resource_scope,
+            scope_digest: scope_digest.clone(),
+            authorization_digest: authorization_digest.clone(),
+            tool_contract_digest: descriptor.contract_digest.clone(),
+            context_ref: context_ref.clone(),
+            effect_class: descriptor.effect_class,
+            effect_scope: descriptor.effect_scope,
+            risk: descriptor.risk,
+            effective_deadline_ms,
+            disposition,
+            approval_view,
+        };
+        let payload = AuthorizationFactV2::ScopePreviewed {
+                identity: AuthorizationIdentityV2 {
+                    run_id: run_id.clone(),
+                    control_epoch,
+                    plan_revision,
+                    plan_action_id,
+                    operation_id,
+                    causation_fact_id: run.control_fact_id,
+                    correlation_set: CorrelationSetV2::materialize(vec![
+                        CorrelationRefV2::PlanAction {
+                            value: record.plan_action_id.to_string(),
+                        },
+                    ])
+                    .map_err(|_| storage_fault())?,
+                },
+                preview_id,
+                tool_id,
+                canonical_arguments_digest,
+                scope_digest,
+                tool_contract_digest: descriptor.contract_digest,
+                context_ref,
+                disposition,
+            };
+        let durable_preview = DurablePreparedScopePreviewV2 {
+            record: record.clone(),
+            approved_targets: approved_targets.clone(),
+            authorization_digest: authorization_digest.clone(),
+            automatic_decision_ref: automatic_decision_ref.clone(),
+        };
+        let material = AuthorityMaterialMutationV2::Put {
+            material: scope_preview_material(
+                &durable_preview,
+                AUTHORITY_MATERIAL_ACTIVE,
+            )?,
+            fact_index: 0,
+        };
+        let fact = if let Some(public_command) = public_command {
+            let reply = DurablePublicReplyV2::Kernel {
+                reply: KernelReplyV2::CapabilityScopePreviewed(
+                    CapabilityScopePreviewReplyV2::Previewed {
+                        preview: record.clone(),
+                    },
+                ),
+            };
+            let receipt = public_receipt(
+                public_command.request_id.clone(),
+                public_command.request_digest.clone(),
+                public_command.command_kind,
+                Some(run_id.clone()),
+                &reply,
+                None,
+            )?;
+            let outcome = self
+                .inner
+                .authority
+                .append_payloads_with_public_receipt_and_authority_material_builder(
+                    vec![KernelFactPayloadV2::Authorization(payload)],
+                    Some(0),
+                    vec![material],
+                    move |_, _| Ok(receipt),
+                )?;
+            match outcome.receipt {
+                PutPublicCommandReceiptOutcomeV2::Inserted(_) => outcome
+                    .facts
+                    .into_iter()
+                    .next()
+                    .ok_or_else(storage_fault)?,
+                PutPublicCommandReceiptOutcomeV2::ExistingSame(_)
+                | PutPublicCommandReceiptOutcomeV2::DigestConflict { .. } => {
+                    return Err(storage_fault())
+                }
+            }
+        } else {
+            self.inner
+                .authority
+                .append_payloads_with_authority_material(
+                    vec![KernelFactPayloadV2::Authorization(payload)],
+                    vec![material],
+                )?
+                .facts
+                .into_iter()
+                .next()
+                .ok_or_else(storage_fault)?
+        };
+        Ok(PreparedScopePreview {
+            record,
+            approved_targets,
+            authorization_digest,
+            preview_fact_id: fact.fact_id,
+            automatic_decision_ref,
+        })
+    }
+
+    fn submit_tool_intent(
+        &self,
+        command: ToolIntentSubmitV2,
+        public_command: Option<PublicCommandContext>,
+    ) -> AuthorityResult<ToolIntentSubmitReplyV2> {
+        let run = self.run_record(&command.run_id)?;
+        if run.control_epoch != command.expected_control_epoch {
+            return Err(KernelErrorV2::StaleControlEpoch {
+                run_id: command.run_id,
+                submitted: command.expected_control_epoch,
+                current: run.control_epoch,
+            });
+        }
+        let context =
+            self.build_tool_context(&command.run_id, run.context_version)?;
+        if command.tool_context_ref != context.context_ref() {
+            return Err(invalid_field(
+                "toolContextRef",
+                InvalidFieldViolationV2::InvalidRelation,
+            ));
+        }
+        let descriptor = self
+            .ready_descriptor(&command.run_id, &command.tool_id)
+            .map_err(|reason| {
+            invalid_field(
+                "toolId",
+                match reason {
+                    deepcode_kernel_abi::v2_command::CapabilityScopeRejectionReasonV2::ToolNotRegistered => {
+                        InvalidFieldViolationV2::InvalidEnum
+                    }
+                    _ => InvalidFieldViolationV2::OutOfRange,
+                },
+            )
+            })?;
+        let invocation = canonical_invocation(&command.tool_id, &command.raw_arguments)?;
+        match command.authority.clone() {
+            ToolIntentAuthorityV2::ContextRead { .. } => {
+                if descriptor.effect_class != ToolEffectClassV2::Read
+                    || descriptor.effect_scope != ToolEffectScopeV2::WorkspaceRead
+                {
+                    return Err(invalid_field(
+                        "authority",
+                        InvalidFieldViolationV2::InvalidRelation,
+                    ));
+                }
+                self.execute_context_read(
+                    command,
+                    invocation,
+                    &descriptor,
+                    public_command,
+                )
+            }
+            ToolIntentAuthorityV2::PlanAction {
+                plan_revision,
+                plan_action_id,
+                lease,
+            } => {
+                let workspace = self
+                    .inner
+                    .authority
+                    .workspace_for_run(&command.run_id)?;
+                let actual_targets =
+                    exact_targets_for_invocation(&workspace, &invocation)?;
+                if let Some(reference) = lease {
+                    let existing = {
+                        let state =
+                            self.inner.state.lock().map_err(|_| storage_fault())?;
+                        state.leases.get(&reference.lease_id).cloned()
+                    };
+                    if let Some(existing) = existing.filter(|record| {
+                        record.reference == reference
+                            && record.run_id == command.run_id
+                            && record.control_epoch == command.expected_control_epoch
+                            && record.plan_revision == plan_revision
+                            && record.plan_action_id == plan_action_id
+                            && record.tool_id == command.tool_id
+                            && record.context_ref == command.tool_context_ref
+                    }) {
+                        if target_set_contains(
+                            &existing.approved_targets,
+                            &actual_targets,
+                        ) {
+                            return self.execute_with_lease(
+                                command,
+                                self.inner.ids.invocation_id(),
+                                &existing,
+                                &descriptor,
+                                public_command,
+                            );
+                        }
+                        let expanded =
+                            union_targets(&existing.approved_targets, &actual_targets);
+                        let delta = actual_targets
+                            .iter()
+                            .filter(|target| {
+                                !existing.approved_targets.contains(target)
+                            })
+                            .cloned()
+                            .collect();
+                        return self.await_capability(
+                            command,
+                            plan_revision,
+                            plan_action_id,
+                            descriptor,
+                            expanded,
+                            delta,
+                            public_command,
+                        );
+                    }
+                    return self.await_capability(
+                        command,
+                        plan_revision,
+                        plan_action_id,
+                        descriptor,
+                        actual_targets,
+                        Vec::new(),
+                        public_command,
+                    );
+                }
+                let existing = {
+                    let state =
+                        self.inner.state.lock().map_err(|_| storage_fault())?;
+                    state
+                        .leases
+                        .values()
+                        .filter(|record| {
+                            record.run_id == command.run_id
+                                && record.control_epoch
+                                    == command.expected_control_epoch
+                                && record.plan_revision == plan_revision
+                                && record.plan_action_id == plan_action_id
+                                && record.tool_id == command.tool_id
+                                && record.context_ref == command.tool_context_ref
+                        })
+                        .max_by_key(|record| {
+                            (
+                                record.reference.version.get(),
+                                record.issuance_ledger_sequence,
+                            )
+                        })
+                        .cloned()
+                };
+                if let Some(existing) = existing {
+                    if target_set_contains(
+                        &existing.approved_targets,
+                        &actual_targets,
+                    ) {
+                        return self.execute_with_lease(
+                            command,
+                            self.inner.ids.invocation_id(),
+                            &existing,
+                            &descriptor,
+                            public_command,
+                        );
+                    }
+                    let expanded =
+                        union_targets(&existing.approved_targets, &actual_targets);
+                    let delta = actual_targets
+                        .iter()
+                        .filter(|target| {
+                            !existing.approved_targets.contains(target)
+                        })
+                        .cloned()
+                        .collect();
+                    return self.await_capability(
+                        command,
+                        plan_revision,
+                        plan_action_id,
+                        descriptor,
+                        expanded,
+                        delta,
+                        public_command,
+                    );
+                }
+                let prepared = self.prepare_preview(
+                    &command.run_id,
+                    command.expected_control_epoch,
+                    plan_revision,
+                    plan_action_id,
+                    command.operation_id.clone(),
+                    command.idempotency_key.clone(),
+                    command.tool_id.clone(),
+                    command.raw_arguments.clone(),
+                    actual_targets,
+                    Vec::new(),
+                    command.deadline,
+                    command.tool_context_ref.clone(),
+                    descriptor.clone(),
+                    None,
+                )?;
+                if prepared.record.disposition == CapabilityScopeDispositionV2::AutoIssuable {
+                    let lease = self.issue_public_lease(
+                        &prepared,
+                        prepared.automatic_decision_ref.clone(),
+                        prepared.preview_fact_id.clone(),
+                        None,
+                    )?;
+                    self.inner
+                        .state
+                        .lock()
+                        .map_err(|_| storage_fault())?
+                        .previews
+                        .insert(prepared.record.preview_id.clone(), prepared);
+                    self.execute_with_lease(
+                        command,
+                        self.inner.ids.invocation_id(),
+                        &lease,
+                        &descriptor,
+                        public_command,
+                    )
+                } else {
+                    let preview_id = prepared.record.preview_id.clone();
+                    self.inner
+                        .state
+                        .lock()
+                        .map_err(|_| storage_fault())?
+                        .previews
+                        .insert(preview_id, prepared);
+                    self.await_existing_preview(command, public_command)
+                }
+            }
+        }
+    }
+
+    fn await_capability(
+        &self,
+        command: ToolIntentSubmitV2,
+        plan_revision: PlanRevisionV2,
+        plan_action_id: PlanActionIdV2,
+        descriptor: ToolDescriptorV2,
+        targets: Vec<ScopeTargetKey>,
+        scope_delta: Vec<ScopeTargetKey>,
+        public_command: Option<PublicCommandContext>,
+    ) -> AuthorityResult<ToolIntentSubmitReplyV2> {
+        let prepared = self.prepare_preview(
+            &command.run_id,
+            command.expected_control_epoch,
+            plan_revision,
+            plan_action_id,
+            command.operation_id.clone(),
+            command.idempotency_key.clone(),
+            command.tool_id.clone(),
+            command.raw_arguments.clone(),
+            targets,
+            scope_delta,
+            command.deadline,
+            command.tool_context_ref.clone(),
+            descriptor,
+            None,
+        )?;
+        let preview_id = prepared.record.preview_id.clone();
+        self.inner
+            .state
+            .lock()
+            .map_err(|_| storage_fault())?
+            .previews
+            .insert(preview_id, prepared);
+        self.await_existing_preview(command, public_command)
+    }
+
+    fn await_existing_preview(
+        &self,
+        command: ToolIntentSubmitV2,
+        public_command: Option<PublicCommandContext>,
+    ) -> AuthorityResult<ToolIntentSubmitReplyV2> {
+        let prepared = {
+            let state = self.inner.state.lock().map_err(|_| storage_fault())?;
+            state
+                .previews
+                .values()
+                .filter(|preview| {
+                    preview.record.run_id == command.run_id
+                        && preview.record.operation_id == command.operation_id
+                        && preview.record.control_epoch == command.expected_control_epoch
+                })
+                .max_by_key(|preview| preview.record.preview_id.as_str().to_owned())
+                .cloned()
+                .ok_or_else(storage_fault)?
+        };
+        let invocation_id = self.inner.ids.invocation_id();
+        let durable_pending = DurablePendingIntentV2::from_command(
+            &command,
+            invocation_id.clone(),
+            prepared.record.preview_id.clone(),
+        );
+        let pending_lease = match &durable_pending.authority {
+            ToolIntentAuthorityV2::PlanAction { lease, .. } => lease.clone(),
+            ToolIntentAuthorityV2::ContextRead { .. } => None,
+        };
+        let pending_material = AuthorityMaterialMutationV2::Put {
+            material: pending_intent_material(
+                &durable_pending,
+                AUTHORITY_MATERIAL_AWAITING,
+                pending_lease,
+            )?,
+            fact_index: 0,
+        };
+        let idempotency_key_hash =
+            idempotency_key_hash_v2(&command.run_id, &command.idempotency_key)
+                .map_err(|_| storage_fault())?;
+        let payload = AuthorizationFactV2::CapabilityAwaiting {
+                identity: CapabilityAwaitingIdentityV2 {
+                    run_id: command.run_id.clone(),
+                    control_epoch: command.expected_control_epoch,
+                    plan_revision: prepared.record.plan_revision.clone(),
+                    plan_action_id: prepared.record.plan_action_id.clone(),
+                    operation_id: command.operation_id.clone(),
+                    invocation_id: invocation_id.clone(),
+                    idempotency_key_hash,
+                    causation_fact_id: prepared.preview_fact_id.clone(),
+                    correlation_set: plan_action_correlations(
+                        &prepared.record.plan_action_id,
+                    )?,
+                },
+                preview_id: prepared.record.preview_id.clone(),
+                tool_id: command.tool_id.clone(),
+                canonical_arguments_digest: prepared
+                    .record
+                    .canonical_arguments_digest
+                    .clone(),
+                scope_digest: prepared.record.scope_digest.clone(),
+                tool_contract_digest: prepared.record.tool_contract_digest.clone(),
+                context_ref: prepared.record.context_ref.clone(),
+            };
+        let fact = if let Some(public_command) = public_command {
+            let run_id = command.run_id.clone();
+            let operation_id = command.operation_id.clone();
+            let preview = prepared.record.clone();
+            let public_invocation_id = invocation_id.clone();
+            let accepted_control_epoch = command.expected_control_epoch;
+            let outcome = self
+                .inner
+                .authority
+                .append_payloads_with_public_receipt_and_authority_material_builder(
+                    vec![KernelFactPayloadV2::Authorization(payload)],
+                    Some(0),
+                    vec![pending_material],
+                    move |fact_ids, ledger_sequences| {
+                        let reply = ToolIntentSubmitReplyV2::AwaitingCapability {
+                            run_id: run_id.clone(),
+                            operation_id: operation_id.clone(),
+                            accepted_control_epoch,
+                            invocation_id: public_invocation_id.clone(),
+                            preview: preview.clone(),
+                            awaiting_fact_id: fact_ids[0].clone(),
+                            awaiting_batch_high_water: ledger_sequences[0],
+                        };
+                        public_receipt(
+                            public_command.request_id,
+                            public_command.request_digest,
+                            public_command.command_kind,
+                            Some(run_id),
+                            &DurablePublicReplyV2::Kernel {
+                                reply: KernelReplyV2::ToolIntentSubmission(reply),
+                            },
+                            None,
+                        )
+                    },
+                )?;
+            match outcome.receipt {
+                PutPublicCommandReceiptOutcomeV2::Inserted(_) => outcome
+                    .facts
+                    .into_iter()
+                    .next()
+                    .ok_or_else(storage_fault)?,
+                PutPublicCommandReceiptOutcomeV2::ExistingSame(_)
+                | PutPublicCommandReceiptOutcomeV2::DigestConflict { .. } => {
+                    return Err(storage_fault())
+                }
+            }
+        } else {
+            self.inner
+                .authority
+                .append_payloads_with_authority_material(
+                    vec![KernelFactPayloadV2::Authorization(payload)],
+                    vec![pending_material],
+                )?
+                .facts
+                .into_iter()
+                .next()
+                .ok_or_else(storage_fault)?
+        };
+        {
+            let mut state = self.inner.state.lock().map_err(|_| storage_fault())?;
+            state.pending.insert(
+                prepared.record.preview_id.clone(),
+                durable_pending.into_pending(fact.fact_id.clone()),
+            );
+        }
+        Ok(ToolIntentSubmitReplyV2::AwaitingCapability {
+            run_id: command.run_id,
+            operation_id: command.operation_id,
+            accepted_control_epoch: command.expected_control_epoch,
+            invocation_id,
+            preview: prepared.record,
+            awaiting_fact_id: fact.fact_id,
+            awaiting_batch_high_water: fact.ledger_sequence,
+        })
+    }
+
+    fn execute_context_read(
+        &self,
+        command: ToolIntentSubmitV2,
+        invocation: ToolInvocationInputV4,
+        descriptor: &ToolDescriptorV2,
+        public_command: Option<PublicCommandContext>,
+    ) -> AuthorityResult<ToolIntentSubmitReplyV2> {
+        let settings_digest = self.settings_ceiling_digest(&command.run_id)?;
+        let tool_context_ref = command.tool_context_ref.clone();
+        let policy_evaluation_digest = invocation_policy_evaluation_digest_v2(
+            &command.run_id,
+            command.expected_control_epoch,
+            &command.tool_id,
+            &tool_context_ref,
+            &settings_digest,
+            None,
+        )
+        .map_err(|_| storage_fault())?;
+        self.execute_direct_tool_intent(
+            command,
+            invocation,
+            InvocationAuthorityV2::ContextRead {
+                tool_context_ref,
+                settings_digest,
+                policy_evaluation_digest,
+            },
+            descriptor,
+            None,
+            public_command,
+        )
+    }
+
+    fn settings_ceiling_digest(
+        &self,
+        run_id: &RunId,
+    ) -> AuthorityResult<deepcode_kernel_abi::v2::SettingsCeilingDigestV2> {
+        let settings = {
+            let state = self.inner.state.lock().map_err(|_| storage_fault())?;
+            state
+                .run_settings
+                .get(run_id)
+                .unwrap_or(&self.inner.startup_settings)
+                .clone()
+        };
+        let value = serde_json::to_value(settings).map_err(|_| storage_fault())?;
+        settings_ceiling_digest_v2(&value).map_err(|_| storage_fault())
+    }
+
+    fn execute_direct_tool_intent(
+        &self,
+        command: ToolIntentSubmitV2,
+        invocation: ToolInvocationInputV4,
+        authority: InvocationAuthorityV2,
+        descriptor: &ToolDescriptorV2,
+        preferred_invocation_id: Option<InvocationId>,
+        public_command: Option<PublicCommandContext>,
+    ) -> AuthorityResult<ToolIntentSubmitReplyV2> {
+        let public_command = public_command.ok_or_else(storage_fault)?;
+        let canonical_arguments = canonical_argument_value(&invocation)?;
+        let canonical_arguments_digest =
+            canonical_arguments_digest_v2(&command.tool_id, &canonical_arguments)
+                .map_err(|_| storage_fault())?;
+        let tool_contract_digest =
+            tool_contract_digest_v2(descriptor).map_err(|_| storage_fault())?;
+        let run_id = command.run_id.clone();
+        self.inner
+            .authority
+            .admit_direct_tool_intent_with_public_receipt(
+                DirectToolIntentRequest {
+                    run_id: command.run_id,
+                    operation_id: command.operation_id,
+                    control_epoch: command.expected_control_epoch,
+                    idempotency_key: command.idempotency_key,
+                    tool_id: command.tool_id,
+                    canonical_arguments_digest,
+                    canonical_invocation: invocation,
+                    authority,
+                    tool_contract_digest,
+                    deadline: command.deadline,
+                },
+                preferred_invocation_id,
+                Vec::new(),
+                move |reply| {
+                    let settlement_fact_id = match reply {
+                        ToolIntentSubmitReplyV2::Admitted {
+                            admission_fact_id,
+                            ..
+                        } => Some(admission_fact_id.clone()),
+                        ToolIntentSubmitReplyV2::AwaitingCapability {
+                            awaiting_fact_id,
+                            ..
+                        } => Some(awaiting_fact_id.clone()),
+                        ToolIntentSubmitReplyV2::Rejected {
+                            rejection_fact_id,
+                            ..
+                        } => Some(rejection_fact_id.clone()),
+                    };
+                    public_receipt(
+                        public_command.request_id,
+                        public_command.request_digest,
+                        public_command.command_kind,
+                        Some(run_id),
+                        &DurablePublicReplyV2::Kernel {
+                            reply: KernelReplyV2::ToolIntentSubmission(
+                                reply.clone(),
+                            ),
+                        },
+                        settlement_fact_id,
+                    )
+                },
+            )
+    }
+
+    fn execute_with_lease(
+        &self,
+        command: ToolIntentSubmitV2,
+        invocation_id: InvocationId,
+        lease: &CapabilityLeaseRecord,
+        descriptor: &ToolDescriptorV2,
+        public_command: Option<PublicCommandContext>,
+    ) -> AuthorityResult<ToolIntentSubmitReplyV2> {
+        let invocation = canonical_invocation(&command.tool_id, &command.raw_arguments)?;
+        let workspace = self
+            .inner
+            .authority
+            .workspace_for_run(&command.run_id)?;
+        let actual_targets = exact_targets_for_invocation(&workspace, &invocation)?;
+        if !target_set_contains(&lease.approved_targets, &actual_targets) {
+            return Err(invalid_field(
+                "authority.lease",
+                InvalidFieldViolationV2::InvalidRelation,
+            ));
+        }
+        let settings_digest = self.settings_ceiling_digest(&command.run_id)?;
+        let policy_evaluation_digest = invocation_policy_evaluation_digest_v2(
+            &command.run_id,
+            command.expected_control_epoch,
+            &command.tool_id,
+            &command.tool_context_ref,
+            &settings_digest,
+            Some(&lease.reference),
+        )
+        .map_err(|_| storage_fault())?;
+        self.execute_direct_tool_intent(
+            command,
+            invocation,
+            InvocationAuthorityV2::PlanAction {
+                plan_revision: lease.plan_revision.clone(),
+                plan_action_id: lease.plan_action_id.clone(),
+                lease: lease.reference.clone(),
+                policy_evaluation_digest,
+            },
+            descriptor,
+            Some(invocation_id),
+            public_command,
+        )
+    }
+
+    fn issue_public_lease(
+        &self,
+        preview: &PreparedScopePreview,
+        decision_ref: Option<UserDecisionRefV2>,
+        causation_fact_id: FactId,
+        public_decision: Option<(PublicCommandContext, bool)>,
+    ) -> AuthorityResult<CapabilityLeaseRecord> {
+        let (
+            previous,
+            lease_id,
+            version,
+        ) = {
+            let state = self.inner.state.lock().map_err(|_| storage_fault())?;
+            let previous = state
+                .leases
+                .values()
+                .filter(|lease| {
+                    lease.run_id == preview.record.run_id
+                        && lease.control_epoch == preview.record.control_epoch
+                        && lease.plan_revision == preview.record.plan_revision
+                        && lease.plan_action_id == preview.record.plan_action_id
+                        && lease.tool_id == preview.record.tool_id
+                })
+                .max_by_key(|lease| lease.reference.version.get())
+                .cloned();
+            let version = previous
+                .as_ref()
+                .map(|lease| lease.reference.version.get().saturating_add(1))
+                .unwrap_or(1);
+            let lease_id = previous
+                .as_ref()
+                .map(|lease| lease.reference.lease_id.clone())
+                .unwrap_or_else(|| self.inner.ids.lease_id());
+            (
+                previous,
+                lease_id,
+                CapabilityLeaseVersionV2::new(version)
+                    .map_err(|_| storage_fault())?,
+            )
+        };
+        let reference = CapabilityLeaseRefV2 {
+            lease_id: lease_id.clone(),
+            version,
+            scope_digest: preview.record.scope_digest.clone(),
+        };
+        let identity = CapabilityLeaseFactIdentityV2 {
+            run_id: preview.record.run_id.clone(),
+            control_epoch: preview.record.control_epoch,
+            plan_revision: preview.record.plan_revision.clone(),
+            plan_action_id: preview.record.plan_action_id.clone(),
+            operation_id: preview.record.operation_id.clone(),
+            preview_id: preview.record.preview_id.clone(),
+            lease_id: lease_id.clone(),
+            lease_version: version,
+            causation_fact_id,
+            correlation_set: plan_action_correlations(
+                &preview.record.plan_action_id,
+            )?,
+        };
+        let payload = match &previous {
+            Some(previous) => AuthorizationFactV2::ExpansionAllowed {
+                    identity,
+                    previous_lease_id: previous.reference.lease_id.clone(),
+                    previous_scope_digest: previous.reference.scope_digest.clone(),
+                    expanded_scope_digest: preview.record.scope_digest.clone(),
+                    authorization_digest: preview.authorization_digest.clone(),
+                },
+            None => AuthorizationFactV2::CapabilityIssued {
+                    identity,
+                    tool_id: preview.record.tool_id.clone(),
+                    scope_digest: preview.record.scope_digest.clone(),
+                    authorization_digest: preview.authorization_digest.clone(),
+                    tool_contract_digest: preview
+                        .record
+                        .tool_contract_digest
+                        .clone(),
+                    context_ref: preview.record.context_ref.clone(),
+                },
+        };
+        let durable_lease = DurableCapabilityLeaseV2 {
+            reference: reference.clone(),
+            run_id: preview.record.run_id.clone(),
+            control_epoch: preview.record.control_epoch,
+            plan_revision: preview.record.plan_revision.clone(),
+            plan_action_id: preview.record.plan_action_id.clone(),
+            tool_id: preview.record.tool_id.clone(),
+            context_ref: preview.record.context_ref.clone(),
+            approved_targets: preview.approved_targets.clone(),
+            decision_ref: decision_ref.clone(),
+            issuance_operation_id: preview.record.operation_id.clone(),
+            preview_id: preview.record.preview_id.clone(),
+        };
+        let material =
+            capability_lease_material(&durable_lease, AUTHORITY_MATERIAL_ACTIVE)?;
+        let material_mutation = if previous.is_some() {
+            AuthorityMaterialMutationV2::Replace {
+                expected_lifecycle: AUTHORITY_MATERIAL_ACTIVE.to_owned(),
+                expected_payload_digest: None,
+                material,
+                fact_index: 0,
+            }
+        } else {
+            AuthorityMaterialMutationV2::Put {
+                material,
+                fact_index: 0,
+            }
+        };
+        let fact = if let Some((public_command, expansion)) = public_decision {
+            let run_id = preview.record.run_id.clone();
+            let reply_reference = reference.clone();
+            self.append_user_decision_fact_with_material(
+                run_id,
+                payload,
+                public_command,
+                vec![material_mutation],
+                move |fact_id, ledger_sequence| {
+                    if expansion {
+                        UserDecisionReplyV2::ScopeExpansionRecorded {
+                            lease: reply_reference,
+                            fact_id,
+                            ledger_sequence,
+                        }
+                    } else {
+                        UserDecisionReplyV2::CapabilityIssued {
+                            lease: reply_reference,
+                            fact_id,
+                            ledger_sequence,
+                        }
+                    }
+                },
+            )?
+            .0
+        } else {
+            self.inner
+                .authority
+                .append_payloads_with_authority_material(
+                    vec![KernelFactPayloadV2::Authorization(payload)],
+                    vec![material_mutation],
+                )?
+                .facts
+                .into_iter()
+                .next()
+                .ok_or_else(storage_fault)?
+        };
+        let lease =
+            durable_lease.into_record(fact.fact_id.clone(), fact.ledger_sequence);
+        {
+            let mut state = self.inner.state.lock().map_err(|_| storage_fault())?;
+            if let Some(previous) = previous {
+                state.leases.remove(&previous.reference.lease_id);
+            }
+            state
+                .leases
+                .insert(reference.lease_id.clone(), lease.clone());
+        }
+        Ok(lease)
+    }
+
+    fn record_denial(
+        &self,
+        preview: &PreparedScopePreview,
+        causation_fact_id: FactId,
+        guidance: String,
+        is_expansion: bool,
+        public_command: Option<PublicCommandContext>,
+        material_mutations: Vec<AuthorityMaterialMutationV2>,
+    ) -> AuthorityResult<(KernelFactEnvelopeV2, bool)> {
+        let identity = AuthorizationIdentityV2 {
+            run_id: preview.record.run_id.clone(),
+            control_epoch: preview.record.control_epoch,
+            plan_revision: preview.record.plan_revision.clone(),
+            plan_action_id: preview.record.plan_action_id.clone(),
+            operation_id: preview.record.operation_id.clone(),
+            causation_fact_id,
+            correlation_set: plan_action_correlations(
+                &preview.record.plan_action_id,
+            )?,
+        };
+        let payload = if is_expansion {
+            AuthorizationFactV2::ExpansionDenied {
+                    identity,
+                    preview_id: preview.record.preview_id.clone(),
+                    requested_scope_digest: preview.record.scope_digest.clone(),
+                    authorization_digest: preview.authorization_digest.clone(),
+                    guidance,
+                }
+        } else {
+            AuthorizationFactV2::CapabilityDenied {
+                    identity,
+                    preview_id: preview.record.preview_id.clone(),
+                    tool_id: preview.record.tool_id.clone(),
+                    scope_digest: preview.record.scope_digest.clone(),
+                    authorization_digest: preview.authorization_digest.clone(),
+                    guidance,
+                }
+        };
+        if let Some(public_command) = public_command {
+            let run_id = preview.record.run_id.clone();
+            let (fact, _) = self.append_user_decision_fact_with_material(
+                run_id,
+                payload,
+                public_command,
+                material_mutations,
+                move |fact_id, ledger_sequence| {
+                    if is_expansion {
+                        UserDecisionReplyV2::ScopeExpansionDenied {
+                            fact_id,
+                            ledger_sequence,
+                        }
+                    } else {
+                        UserDecisionReplyV2::CapabilityDenied {
+                            fact_id,
+                            ledger_sequence,
+                        }
+                    }
+                },
+            )?;
+            Ok((fact, true))
+        } else {
+            self.inner
+                .authority
+                .append_payloads_with_authority_material(
+                    vec![KernelFactPayloadV2::Authorization(payload)],
+                    material_mutations,
+                )?
+                .facts
+                .into_iter()
+                .next()
+                .ok_or_else(storage_fault)
+                .map(|fact| (fact, false))
+        }
+    }
+
+    fn query_projected_facts(
+        &self,
+        command: KernelFactsQueryScopedV2,
+        request_id: CommandRequestId,
+        request_digest: CommandRequestDigestV2,
+    ) -> AuthorityResult<KernelFactProjectionPageV2> {
+        self.run_record(&command.run_id)?;
+        let (snapshot_high_water, requested_after) =
+            if let Some(token) = command.continuation.clone() {
+                let expected = FactQueryContinuationExpectationV2 {
+                    run_id: command.run_id.clone(),
+                    after_ledger_sequence: command.after_ledger_sequence,
+                };
+                let consumed = self
+                    .inner
+                    .authority
+                    .consume_fact_query_continuation(
+                        token,
+                        expected,
+                        FactQueryContinuationConsumerV2 {
+                            command_request_id: request_id.clone(),
+                            command_request_digest: request_digest.clone(),
+                        },
+                    )?;
+                let cursor = match consumed {
+                    ConsumeFactQueryContinuationOutcomeV2::Consumed(cursor)
+                    | ConsumeFactQueryContinuationOutcomeV2::ExistingSame(cursor) => cursor,
+                    ConsumeFactQueryContinuationOutcomeV2::NotFound
+                    | ConsumeFactQueryContinuationOutcomeV2::Expired { .. }
+                    | ConsumeFactQueryContinuationOutcomeV2::ScopeMismatch
+                    | ConsumeFactQueryContinuationOutcomeV2::AlreadyConsumed => {
+                        return Err(invalid_field(
+                            "continuation",
+                            InvalidFieldViolationV2::InvalidRelation,
+                        ))
+                    }
+                };
+                (
+                    cursor.snapshot_high_water,
+                    cursor.after_ledger_sequence,
+                )
+            } else {
+                let high_water = self
+                    .inner
+                    .authority
+                    .query_run_facts(&command.run_id, command.after_ledger_sequence, 1)?
+                    .0;
+                (high_water, command.after_ledger_sequence)
+            };
+        let (_, raw, _) = self.inner.authority.query_run_facts(
+            &command.run_id,
+            requested_after,
+            command.limit.saturating_add(1),
+        )?;
+        let mut raw = raw
+            .into_iter()
+            .filter(|fact| fact.ledger_sequence <= snapshot_high_water)
+            .collect::<Vec<_>>();
+        let has_more = raw.len() > command.limit as usize;
+        raw.truncate(command.limit as usize);
+        let facts = raw
+            .into_iter()
+            .map(project_fact)
+            .collect::<AuthorityResult<Vec<_>>>()?;
+        let next_after = facts
+            .last()
+            .map(|fact| fact.ledger_sequence)
+            .unwrap_or(requested_after);
+        let template = DurableFactPageV2 {
+            run_id: command.run_id.clone(),
+            requested_after_ledger_sequence: requested_after,
+            snapshot_high_water,
+            facts,
+            has_more,
+            next_after_ledger_sequence: if has_more {
+                next_after
+            } else {
+                snapshot_high_water
+            },
+        };
+        let page = self.materialize_facts_page(template.clone())?;
+        page.validate().map_err(|_| storage_fault())?;
+        let stored = DurablePublicReplyV2::Facts { page: template };
+        let persisted = self.persist_reply(
+            request_id,
+            request_digest,
+            "kernelFactsQueryScoped",
+            Some(command.run_id),
+            stored,
+            None,
+        )?;
+        if !matches!(persisted, DurablePublicReplyV2::Facts { .. }) {
+            return Err(storage_fault());
+        }
+        Ok(page)
+    }
+}

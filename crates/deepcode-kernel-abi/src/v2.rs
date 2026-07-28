@@ -12,13 +12,13 @@ use crate::tool_catalog_v4::{
 };
 use crate::tool_protocol_v2::{
     CanonicalArgumentsDigestV2, CapabilityAuthorizationDigestV2, CapabilityLeaseIdV2,
-    CapabilityLeaseVersionV2, CapabilityScopeDigestV2, CapabilityScopePreviewIdV2, PlanActionIdV2,
-    PlanRevisionV2, ToolAvailabilityV2, ToolContextRefV2, ToolContractDigestV2, ToolIdV2,
-    TrustLeaseDigestV2, TrustPolicyIdV2,
+    CapabilityLeaseRefV2, CapabilityLeaseVersionV2, CapabilityScopeDigestV2,
+    CapabilityScopePreviewIdV2, PlanActionIdV2, PlanRevisionV2, ToolAvailabilityV2,
+    ToolContextRefV2, ToolContractDigestV2, ToolIdV2, TrustLeaseDigestV2, TrustPolicyIdV2,
 };
 use crate::KERNEL_ABI_V2_VERSION;
 
-pub const FACT_STORE_SCHEMA_CONTRACT_V2: &str = "deepcode.kernel.fact-store.v2.sqlite.3";
+pub const FACT_STORE_SCHEMA_CONTRACT_V2: &str = "deepcode.kernel.fact-store.v2.sqlite.5";
 pub const MAX_ID_BYTES_V2: usize = 512;
 pub const MAX_TEXT_BYTES_V2: usize = 16 * 1024;
 pub const MAX_CORRELATION_REFS_V2: usize = 256;
@@ -222,6 +222,7 @@ digest_type!(GrantScopeDigestV2);
 digest_type!(AuthorizationRequestDigestV2);
 digest_type!(PolicyConfigurationDigestV2);
 digest_type!(PolicyEvaluationDigestV2);
+digest_type!(SettingsCeilingDigestV2);
 digest_type!(GrantDecisionDigestV2);
 digest_type!(InvocationSubmissionDigestV2);
 digest_type!(InvocationRequestDigestV2);
@@ -819,6 +820,44 @@ pub struct CapabilityAwaitingIdentityV2 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    content = "data",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum InvocationAuthorityV2 {
+    ContextRead {
+        tool_context_ref: ToolContextRefV2,
+        settings_digest: SettingsCeilingDigestV2,
+        policy_evaluation_digest: PolicyEvaluationDigestV2,
+    },
+    PlanAction {
+        plan_revision: PlanRevisionV2,
+        plan_action_id: PlanActionIdV2,
+        lease: CapabilityLeaseRefV2,
+        policy_evaluation_digest: PolicyEvaluationDigestV2,
+    },
+}
+
+impl InvocationAuthorityV2 {
+    pub fn capability_lease(&self) -> Option<&CapabilityLeaseRefV2> {
+        match self {
+            Self::PlanAction { lease, .. } => Some(lease),
+            Self::ContextRead { .. } => None,
+        }
+    }
+
+    pub fn plan_action_id(&self) -> Option<&PlanActionIdV2> {
+        match self {
+            Self::PlanAction { plan_action_id, .. } => Some(plan_action_id),
+            Self::ContextRead { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ToolContextInvalidationIdentityV2 {
     pub run_id: RunId,
@@ -857,6 +896,20 @@ pub struct AttemptIdentityV2 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ToolAttemptIdentityV2 {
+    pub run_id: RunId,
+    pub control_epoch: ControlEpoch,
+    pub operation_id: OperationId,
+    pub authority: InvocationAuthorityV2,
+    pub invocation_id: InvocationId,
+    pub attempt_id: AttemptId,
+    pub idempotency_key_hash: IdempotencyKeyHashV2,
+    pub causation_fact_id: FactId,
+    pub correlation_set: CorrelationSetV2,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct InvocationRejectedIdentityV2 {
     pub run_id: RunId,
     pub current_control_epoch: ControlEpoch,
@@ -884,12 +937,41 @@ pub struct ObservedTerminalIdentityV2 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ToolObservedTerminalIdentityV2 {
+    pub run_id: RunId,
+    pub control_epoch: ControlEpoch,
+    pub operation_id: OperationId,
+    pub authority: InvocationAuthorityV2,
+    pub invocation_id: InvocationId,
+    pub attempt_id: AttemptId,
+    pub effect_id: EffectId,
+    pub idempotency_key_hash: IdempotencyKeyHashV2,
+    pub causation_fact_id: FactId,
+    pub correlation_set: CorrelationSetV2,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EffectIdentityV2 {
     pub run_id: RunId,
     pub control_epoch: ControlEpoch,
     pub operation_id: OperationId,
     pub grant_id: GrantId,
     pub reservation_id: GrantReservationId,
+    pub invocation_id: InvocationId,
+    pub attempt_id: AttemptId,
+    pub effect_id: EffectId,
+    pub idempotency_key_hash: IdempotencyKeyHashV2,
+    pub causation_fact_id: FactId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ToolEffectIdentityV2 {
+    pub run_id: RunId,
+    pub control_epoch: ControlEpoch,
+    pub operation_id: OperationId,
+    pub authority: InvocationAuthorityV2,
     pub invocation_id: InvocationId,
     pub attempt_id: AttemptId,
     pub effect_id: EffectId,
@@ -1064,6 +1146,9 @@ pub enum GrantRevokeReasonCodeV2 {
     deny_unknown_fields
 )]
 pub enum MutationCommandResultV2 {
+    ToolIntentSubmission {
+        reply: crate::v2_command::ToolIntentSubmitReplyV2,
+    },
     EpochAdvance {
         reply: crate::v2_command::ControlEpochAdvancedReplyV2,
     },
@@ -1236,10 +1321,12 @@ pub enum AuthorizationFactV2 {
     },
     LeaseRevoked {
         identity: CapabilityLeaseFactIdentityV2,
+        scope_digest: CapabilityScopeDigestV2,
         reason: CapabilityLeaseRevokeReasonV2,
     },
     LeaseSuperseded {
         identity: CapabilityLeaseFactIdentityV2,
+        scope_digest: CapabilityScopeDigestV2,
         reason: CapabilityLeaseSupersessionReasonV2,
     },
     ContextInvalidated {
@@ -1415,6 +1502,52 @@ pub enum TargetResolutionFailureV2 {
     deny_unknown_fields
 )]
 pub enum InvocationFactV2 {
+    ToolIntentAdmitted {
+        identity: ToolAttemptIdentityV2,
+        tool_id: ToolIdV2,
+        canonical_arguments_digest: CanonicalArgumentsDigestV2,
+        tool_contract_digest: ToolContractDigestV2,
+        resource_scope: ResourceScopeV2,
+        workspace_binding_digest: WorkspaceBindingDigestV2,
+        effective_deadline_ms: u32,
+    },
+    ToolAttemptPrepared {
+        identity: ToolAttemptIdentityV2,
+    },
+    ToolExecutionStarted {
+        identity: ToolAttemptIdentityV2,
+        target_revalidation_set_digest: TargetRevalidationSetDigestV2,
+    },
+    ToolCancellationObserved {
+        identity: ToolAttemptIdentityV2,
+        cancel_request_id: CancelRequestId,
+    },
+    ToolDeadlineObserved {
+        identity: ToolAttemptIdentityV2,
+    },
+    ToolFailedBeforeEffect {
+        identity: ToolAttemptIdentityV2,
+        error_code: PreEffectFailureCodeV2,
+    },
+    ToolCancelledBeforeEffect {
+        identity: ToolAttemptIdentityV2,
+        cancel_request_id: CancelRequestId,
+    },
+    ToolTimedOutBeforeEffect {
+        identity: ToolAttemptIdentityV2,
+    },
+    ToolCompleted {
+        identity: ToolObservedTerminalIdentityV2,
+        output: ToolOutputV4,
+    },
+    ToolFailedAfterObservedEffect {
+        identity: ToolObservedTerminalIdentityV2,
+        error_code: PostObservedEffectFailureCodeV2,
+    },
+    ToolIndeterminate {
+        identity: ToolObservedTerminalIdentityV2,
+        reason_code: IndeterminateReasonV2,
+    },
     Admitted {
         identity: AttemptIdentityV2,
         tool_id: AuthorityToolIdV4,
@@ -1480,6 +1613,39 @@ pub enum InvocationFactV2 {
     deny_unknown_fields
 )]
 pub enum EffectFactV2 {
+    ToolObserved {
+        identity: ToolEffectIdentityV2,
+        affected_resource_ids: Vec<ResourceId>,
+        evidence: EffectEvidenceV2,
+        evidence_digest: ExecutorEvidenceDigestV2,
+    },
+    ToolObservedAfterCancel {
+        identity: ToolEffectIdentityV2,
+        cancel_request_id: CancelRequestId,
+        affected_resource_ids: Vec<ResourceId>,
+        evidence: EffectEvidenceV2,
+        evidence_digest: ExecutorEvidenceDigestV2,
+    },
+    ToolObservedAfterDeadline {
+        identity: ToolEffectIdentityV2,
+        affected_resource_ids: Vec<ResourceId>,
+        evidence: EffectEvidenceV2,
+        evidence_digest: ExecutorEvidenceDigestV2,
+    },
+    ToolObservedAfterCancelAndDeadline {
+        identity: ToolEffectIdentityV2,
+        cancel_request_id: CancelRequestId,
+        affected_resource_ids: Vec<ResourceId>,
+        evidence: EffectEvidenceV2,
+        evidence_digest: ExecutorEvidenceDigestV2,
+    },
+    ToolIndeterminate {
+        identity: ToolEffectIdentityV2,
+        possible_affected_resource_ids: Vec<ResourceId>,
+        reason_code: IndeterminateReasonV2,
+        evidence: EffectEvidenceV2,
+        evidence_digest: ExecutorEvidenceDigestV2,
+    },
     Observed {
         identity: EffectIdentityV2,
         affected_resource_ids: Vec<ResourceId>,
@@ -1756,6 +1922,11 @@ impl KernelFactPayloadV2 {
     pub fn effect_id(&self) -> Option<&EffectId> {
         match self {
             Self::Invocation(
+                InvocationFactV2::ToolCompleted { identity, .. }
+                | InvocationFactV2::ToolFailedAfterObservedEffect { identity, .. }
+                | InvocationFactV2::ToolIndeterminate { identity, .. },
+            ) => Some(&identity.effect_id),
+            Self::Invocation(
                 InvocationFactV2::Completed { identity, .. }
                 | InvocationFactV2::FailedAfterObservedEffect { identity, .. }
                 | InvocationFactV2::Indeterminate { identity, .. },
@@ -1769,7 +1940,7 @@ impl KernelFactPayloadV2 {
         match self {
             Self::Grant(fact) => fact.identity().grant_id,
             Self::Invocation(fact) => fact.identity().grant_id,
-            Self::Effect(fact) => Some(&fact.identity().grant_id),
+            Self::Effect(fact) => fact.identity().grant_id,
             Self::Control(_) | Self::Authorization(_) | Self::Resource(_) | Self::Cleanup(_) => {
                 None
             }
@@ -1778,6 +1949,16 @@ impl KernelFactPayloadV2 {
 
     pub fn capability_lease_id(&self) -> Option<&CapabilityLeaseIdV2> {
         match self {
+            Self::Invocation(fact) => fact
+                .identity()
+                .authority
+                .and_then(InvocationAuthorityV2::capability_lease)
+                .map(|lease| &lease.lease_id),
+            Self::Effect(fact) => fact
+                .identity()
+                .authority
+                .and_then(InvocationAuthorityV2::capability_lease)
+                .map(|lease| &lease.lease_id),
             Self::Authorization(
                 AuthorizationFactV2::CapabilityIssued { identity, .. }
                 | AuthorizationFactV2::ExpansionAllowed { identity, .. }
@@ -1788,11 +1969,55 @@ impl KernelFactPayloadV2 {
         }
     }
 
+    pub fn capability_lease(&self) -> Option<CapabilityLeaseRefV2> {
+        match self {
+            Self::Invocation(fact) => fact
+                .identity()
+                .authority
+                .and_then(InvocationAuthorityV2::capability_lease)
+                .cloned(),
+            Self::Effect(fact) => fact
+                .identity()
+                .authority
+                .and_then(InvocationAuthorityV2::capability_lease)
+                .cloned(),
+            Self::Authorization(AuthorizationFactV2::CapabilityIssued {
+                identity,
+                scope_digest,
+                ..
+            })
+            | Self::Authorization(AuthorizationFactV2::LeaseRevoked {
+                identity,
+                scope_digest,
+                ..
+            })
+            | Self::Authorization(AuthorizationFactV2::LeaseSuperseded {
+                identity,
+                scope_digest,
+                ..
+            }) => Some(CapabilityLeaseRefV2 {
+                lease_id: identity.lease_id.clone(),
+                version: identity.lease_version,
+                scope_digest: scope_digest.clone(),
+            }),
+            Self::Authorization(AuthorizationFactV2::ExpansionAllowed {
+                identity,
+                expanded_scope_digest,
+                ..
+            }) => Some(CapabilityLeaseRefV2 {
+                lease_id: identity.lease_id.clone(),
+                version: identity.lease_version,
+                scope_digest: expanded_scope_digest.clone(),
+            }),
+            _ => None,
+        }
+    }
+
     pub fn reservation_id(&self) -> Option<&GrantReservationId> {
         match self {
             Self::Grant(fact) => fact.identity().reservation_id,
             Self::Invocation(fact) => fact.identity().reservation_id,
-            Self::Effect(fact) => Some(&fact.identity().reservation_id),
+            Self::Effect(fact) => fact.identity().reservation_id,
             Self::Control(_) | Self::Authorization(_) | Self::Resource(_) | Self::Cleanup(_) => {
                 None
             }
@@ -1846,6 +2071,14 @@ impl KernelFactPayloadV2 {
     pub fn authorization_plan_action_id(&self) -> Option<&PlanActionIdV2> {
         match self {
             Self::Authorization(fact) => fact.plan_action_id(),
+            Self::Invocation(fact) => fact
+                .identity()
+                .authority
+                .and_then(InvocationAuthorityV2::plan_action_id),
+            Self::Effect(fact) => fact
+                .identity()
+                .authority
+                .and_then(InvocationAuthorityV2::plan_action_id),
             _ => None,
         }
     }
@@ -2085,6 +2318,7 @@ struct InvocationFactIdentityRef<'a> {
     operation_id: &'a OperationId,
     invocation_id: Option<&'a InvocationId>,
     attempt_id: Option<&'a AttemptId>,
+    authority: Option<&'a InvocationAuthorityV2>,
     grant_id: Option<&'a GrantId>,
     reservation_id: Option<&'a GrantReservationId>,
     idempotency_key_hash: &'a IdempotencyKeyHashV2,
@@ -2095,6 +2329,41 @@ struct InvocationFactIdentityRef<'a> {
 impl InvocationFactV2 {
     fn identity(&self) -> InvocationFactIdentityRef<'_> {
         match self {
+            Self::ToolIntentAdmitted { identity, .. }
+            | Self::ToolAttemptPrepared { identity }
+            | Self::ToolExecutionStarted { identity, .. }
+            | Self::ToolCancellationObserved { identity, .. }
+            | Self::ToolDeadlineObserved { identity }
+            | Self::ToolFailedBeforeEffect { identity, .. }
+            | Self::ToolCancelledBeforeEffect { identity, .. }
+            | Self::ToolTimedOutBeforeEffect { identity } => InvocationFactIdentityRef {
+                run_id: &identity.run_id,
+                control_epoch: identity.control_epoch,
+                operation_id: &identity.operation_id,
+                invocation_id: Some(&identity.invocation_id),
+                attempt_id: Some(&identity.attempt_id),
+                authority: Some(&identity.authority),
+                grant_id: None,
+                reservation_id: None,
+                idempotency_key_hash: &identity.idempotency_key_hash,
+                causation_fact_id: &identity.causation_fact_id,
+                correlation_set: &identity.correlation_set,
+            },
+            Self::ToolCompleted { identity, .. }
+            | Self::ToolFailedAfterObservedEffect { identity, .. }
+            | Self::ToolIndeterminate { identity, .. } => InvocationFactIdentityRef {
+                run_id: &identity.run_id,
+                control_epoch: identity.control_epoch,
+                operation_id: &identity.operation_id,
+                invocation_id: Some(&identity.invocation_id),
+                attempt_id: Some(&identity.attempt_id),
+                authority: Some(&identity.authority),
+                grant_id: None,
+                reservation_id: None,
+                idempotency_key_hash: &identity.idempotency_key_hash,
+                causation_fact_id: &identity.causation_fact_id,
+                correlation_set: &identity.correlation_set,
+            },
             Self::Admitted { identity, .. }
             | Self::AttemptPrepared { identity }
             | Self::ExecutionStarted { identity, .. }
@@ -2108,6 +2377,7 @@ impl InvocationFactV2 {
                 operation_id: &identity.operation_id,
                 invocation_id: Some(&identity.invocation_id),
                 attempt_id: Some(&identity.attempt_id),
+                authority: None,
                 grant_id: Some(&identity.grant_id),
                 reservation_id: Some(&identity.reservation_id),
                 idempotency_key_hash: &identity.idempotency_key_hash,
@@ -2122,6 +2392,7 @@ impl InvocationFactV2 {
                 operation_id: &identity.operation_id,
                 invocation_id: Some(&identity.invocation_id),
                 attempt_id: Some(&identity.attempt_id),
+                authority: None,
                 grant_id: Some(&identity.grant_id),
                 reservation_id: Some(&identity.reservation_id),
                 idempotency_key_hash: &identity.idempotency_key_hash,
@@ -2134,6 +2405,7 @@ impl InvocationFactV2 {
                 operation_id: &identity.operation_id,
                 invocation_id: None,
                 attempt_id: None,
+                authority: None,
                 grant_id: None,
                 reservation_id: None,
                 idempotency_key_hash: &identity.idempotency_key_hash,
@@ -2144,20 +2416,79 @@ impl InvocationFactV2 {
     }
 }
 
+struct EffectFactIdentityRef<'a> {
+    run_id: &'a RunId,
+    control_epoch: ControlEpoch,
+    operation_id: &'a OperationId,
+    authority: Option<&'a InvocationAuthorityV2>,
+    grant_id: Option<&'a GrantId>,
+    reservation_id: Option<&'a GrantReservationId>,
+    invocation_id: &'a InvocationId,
+    attempt_id: &'a AttemptId,
+    effect_id: &'a EffectId,
+    idempotency_key_hash: &'a IdempotencyKeyHashV2,
+    causation_fact_id: &'a FactId,
+}
+
 impl EffectFactV2 {
-    fn identity(&self) -> &EffectIdentityV2 {
+    fn identity(&self) -> EffectFactIdentityRef<'_> {
         match self {
+            Self::ToolObserved { identity, .. }
+            | Self::ToolObservedAfterCancel { identity, .. }
+            | Self::ToolObservedAfterDeadline { identity, .. }
+            | Self::ToolObservedAfterCancelAndDeadline { identity, .. }
+            | Self::ToolIndeterminate { identity, .. } => EffectFactIdentityRef {
+                run_id: &identity.run_id,
+                control_epoch: identity.control_epoch,
+                operation_id: &identity.operation_id,
+                authority: Some(&identity.authority),
+                grant_id: None,
+                reservation_id: None,
+                invocation_id: &identity.invocation_id,
+                attempt_id: &identity.attempt_id,
+                effect_id: &identity.effect_id,
+                idempotency_key_hash: &identity.idempotency_key_hash,
+                causation_fact_id: &identity.causation_fact_id,
+            },
             Self::Observed { identity, .. }
             | Self::ObservedAfterCancel { identity, .. }
             | Self::ObservedAfterDeadline { identity, .. }
             | Self::ObservedAfterCancelAndDeadline { identity, .. }
-            | Self::Indeterminate { identity, .. } => identity,
+            | Self::Indeterminate { identity, .. } => EffectFactIdentityRef {
+                run_id: &identity.run_id,
+                control_epoch: identity.control_epoch,
+                operation_id: &identity.operation_id,
+                authority: None,
+                grant_id: Some(&identity.grant_id),
+                reservation_id: Some(&identity.reservation_id),
+                invocation_id: &identity.invocation_id,
+                attempt_id: &identity.attempt_id,
+                effect_id: &identity.effect_id,
+                idempotency_key_hash: &identity.idempotency_key_hash,
+                causation_fact_id: &identity.causation_fact_id,
+            },
         }
     }
 
     fn resource_ids(&self) -> Vec<&ResourceId> {
         match self {
-            Self::Observed {
+            Self::ToolObserved {
+                affected_resource_ids,
+                ..
+            }
+            | Self::ToolObservedAfterCancel {
+                affected_resource_ids,
+                ..
+            }
+            | Self::ToolObservedAfterDeadline {
+                affected_resource_ids,
+                ..
+            }
+            | Self::ToolObservedAfterCancelAndDeadline {
+                affected_resource_ids,
+                ..
+            }
+            | Self::Observed {
                 affected_resource_ids,
                 ..
             }
@@ -2173,7 +2504,11 @@ impl EffectFactV2 {
                 affected_resource_ids,
                 ..
             } => affected_resource_ids.iter().collect(),
-            Self::Indeterminate {
+            Self::ToolIndeterminate {
+                possible_affected_resource_ids,
+                ..
+            }
+            | Self::Indeterminate {
                 possible_affected_resource_ids,
                 ..
             } => possible_affected_resource_ids.iter().collect(),
@@ -2417,6 +2752,45 @@ pub fn policy_configuration_digest_v2(
                 "strictAutoRisk":"low",
                 "trustedWorkspaceAdds":"boundedMediumWorkspaceMutation",
                 "maximumAddsExactTools":["fs.rename","git.stage","git.unstage"],
+            },
+        }),
+    )
+}
+
+pub fn settings_ceiling_digest_v2(
+    settings: &Value,
+) -> Result<SettingsCeilingDigestV2, V2ValidationError> {
+    if !settings.is_object() {
+        return Err(invalid_value("settingsCeiling", "must be a JSON object"));
+    }
+    typed_digest_newtype(
+        "deepcode.kernel.abi.v2/settings-ceiling",
+        settings,
+    )
+}
+
+pub fn invocation_policy_evaluation_digest_v2(
+    run_id: &RunId,
+    control_epoch: ControlEpoch,
+    tool_id: &ToolIdV2,
+    context_ref: &ToolContextRefV2,
+    settings_digest: &SettingsCeilingDigestV2,
+    lease: Option<&CapabilityLeaseRefV2>,
+) -> Result<PolicyEvaluationDigestV2, V2ValidationError> {
+    typed_digest_newtype(
+        "deepcode.kernel.abi.v2/invocation-policy-evaluation",
+        &serde_json::json!({
+            "runId":run_id,
+            "controlEpoch":control_epoch,
+            "toolId":tool_id,
+            "toolContextRef":context_ref,
+            "settingsDigest":settings_digest,
+            "authority":match lease {
+                Some(lease) => serde_json::json!({
+                    "kind":"planAction",
+                    "lease":lease,
+                }),
+                None => serde_json::json!({"kind":"contextRead"}),
             },
         }),
     )

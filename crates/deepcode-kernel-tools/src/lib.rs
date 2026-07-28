@@ -33,7 +33,9 @@ pub use deepcode_kernel_abi::{
 pub use graph::*;
 pub use input_validation::ToolInputValidationError;
 pub use operation_model::*;
-pub use registrations::KernelToolRegistration;
+pub use registrations::{
+    KernelAdmissionMetadataV2, KernelExecutionAdapterV2, KernelToolRegistration,
+};
 pub use sandbox::{
     CandidateSandboxSpec, SandboxCapabilitySnapshot, SealedSandboxPlan,
     SANDBOX_CAPABILITY_SCHEMA_VERSION, SANDBOX_SPEC_SCHEMA_VERSION,

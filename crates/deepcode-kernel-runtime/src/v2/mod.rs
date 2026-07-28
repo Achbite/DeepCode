@@ -1,5 +1,6 @@
 mod authority;
 mod model;
 mod service;
+mod unified;
 
-pub(super) use service::AuthorityService;
+pub use unified::{KernelSessionServiceV2, SettingsCeilingV2};
