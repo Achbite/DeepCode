@@ -1,4 +1,5 @@
 import type { PromptEnvelope, PromptEnvelopeBuilderInput, PromptSegment, PromptSystemLayer } from './types.js';
+import type { LlmChatMessage } from '@deepcode/protocol';
 import { inferProviderTurnMode, providerVisibleWorkflowState } from './providerTurnContract.js';
 import { resourceEvidenceContentKindCounts } from '../context/resourceEvidenceAccess.js';
 
@@ -248,6 +249,48 @@ export function buildPromptEnvelope(input: PromptEnvelopeBuilderInput): PromptEn
     dynamicLayerNames: dynamicLayers.map((layer) => layer.name),
     auditOnlyLayerNames: auditOnlyLayers.map((layer) => layer.name),
   };
+}
+
+/**
+ * Converts one assembled envelope into Provider frames. Kernel fixedPrompt is
+ * emitted byte-for-byte in its own system frame and is never re-rendered into
+ * either the surrounding Session contract or the dynamic user frame.
+ */
+export function promptEnvelopeProviderMessages(
+  prompt: PromptEnvelope
+): LlmChatMessage[] {
+  const kernelLayers = prompt.layers.filter(
+    (layer) => layer.name === 'kernelToolContext'
+  );
+  if (kernelLayers.length !== 1) {
+    throw new Error(
+      'A v2 Provider request requires exactly one Kernel ToolContext layer.'
+    );
+  }
+  const sessionStable = prompt.layers
+    .filter(
+      (layer) =>
+        layer.stable
+        && layer.name !== 'kernelToolContext'
+        && layer.content.trim()
+    )
+    .map(renderLayer)
+    .join('\n\n');
+  const messages: LlmChatMessage[] = [];
+  if (sessionStable) {
+    messages.push({ role: 'system', content: sessionStable });
+  }
+  messages.push({
+    role: 'system',
+    content: kernelLayers[0]!.content,
+  });
+  if (prompt.dynamicSuffix) {
+    messages.push({
+      role: 'user',
+      content: prompt.dynamicSuffix,
+    });
+  }
+  return messages;
 }
 
 export function bindPromptProviderProfile(

@@ -5,10 +5,14 @@ import type {
   LlmChatResult,
   RawToolArgumentsV2,
   RequestedResourceV2,
-  ToolDefinition,
+  ProviderWireToolDefinition,
 } from '@deepcode/protocol';
 import { decodeRawToolArgumentsV2 } from '@deepcode/protocol';
 import { canonicalJson } from '../cache/canonicalizer.js';
+import { assembleContext } from '../context/assembler.js';
+import {
+  promptEnvelopeProviderMessages,
+} from '../prompt/builder.js';
 import type {
   SessionKernelProviderBackendOutputV2,
   SessionKernelProviderBackendV2,
@@ -81,27 +85,31 @@ implements SessionKernelProviderBackendV2 {
     const request: LlmChatRequest = {
       requestId: input.providerTurnId,
       ...(this.profileId ? { profileId: this.profileId } : {}),
-      messages: [
-        {
-          role: 'system',
-          // Kernel-owned block stays byte-for-byte and occupies its own frame.
-          content: input.toolContext.fixedPrompt,
-        },
-        {
-          role: 'user',
-          content: canonicalJson(providerTurnFrame(input)),
-        },
-      ],
-      tools: exposed.map((tool): ToolDefinition => ({
+      messages: promptEnvelopeProviderMessages(
+        assembleContext({
+          workflowState: `kernel-v2:${input.target.kind}`,
+          allowedProposals: providerAllowedProposals(input),
+          kernelToolContext: input.toolContext.bundle,
+          userRequest: input.currentInput.text,
+          extraMemoryHints: [
+            canonicalJson({
+              conversationInputs: input.conversationInputs,
+              providerOutcomes: input.providerOutcomes,
+            }),
+          ],
+          currentTaskGoal: input.plan?.objective,
+          currentTaskContext: providerTurnFrame(input),
+          profile: {
+            provider: this.profileId ?? 'host-selected',
+            model: 'host-selected',
+          },
+          contextAssemblyId: input.providerTurnId,
+        }).prompt
+      ),
+      tools: exposed.map((tool): ProviderWireToolDefinition => ({
         name: encodeProviderToolId(tool.toolId),
         description: tool.description,
         inputSchema: tool.inputSchema,
-        riskLevel: tool.risk,
-        needsApproval: tool.effectClass === 'mutation',
-        allowedModes: ['readOnly', 'plan', 'askBeforeWrite'],
-        operationKind: tool.toolId,
-        executionMode: 'execute',
-        readOnly: tool.effectClass === 'read',
       })),
       providerOptions: {
         deepcode: {
@@ -170,6 +178,15 @@ implements SessionKernelProviderBackendV2 {
     }
     return { kind: 'text', text };
   }
+}
+
+function providerAllowedProposals(
+  input: SessionProviderTurnInputV2
+): string[] {
+  if (input.target.kind === 'planning') {
+    return ['plan', 'contextRead', 'answer', 'noTool'];
+  }
+  return ['toolIntent', 'answer', 'noTool'];
 }
 
 function providerTurnFrame(

@@ -110,7 +110,7 @@ export function decodeSessionKernelPrefetchedRunDescriptorV2(
 }
 
 /**
- * Transitional process-private seam. The value is consumed once and deleted
+ * Process-private transport seam. The value is consumed once and deleted
  * immediately. Callers must never place it in request JSON or diagnostics.
  */
 export function consumeSessionKernelRunCapabilityFromEnvV2(

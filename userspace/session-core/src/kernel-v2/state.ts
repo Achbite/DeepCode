@@ -20,6 +20,8 @@ import {
   type SessionKernelReviewV2,
   type SessionNaturalLanguagePlanV2,
   type SessionProviderTurnRecordV2,
+  type SessionProviderOutcomeRecordV2,
+  type SessionPlanActionSettlementV2,
   type SessionUserInputRecordV2,
 } from './types.js';
 
@@ -41,6 +43,8 @@ export interface SessionKernelLoopStateV2 {
   activeWait?: SessionActiveWaitV2;
   pendingGuidance: string[];
   providerTurn?: SessionProviderTurnRecordV2;
+  providerOutcomes: SessionProviderOutcomeRecordV2[];
+  planActionSettlements: Record<string, SessionPlanActionSettlementV2>;
   publicRequests: Partial<
     Record<
       SessionKernelPublicRequestRecordV2['lane'],
@@ -88,6 +92,8 @@ export function createSessionKernelLoopStateV2(
     previews: {},
     factsById: {},
     pendingGuidance: [],
+    providerOutcomes: [],
+    planActionSettlements: {},
     publicRequests: {},
     kernelWakeHint: false,
     checkpointRevision: 0,
@@ -131,6 +137,8 @@ export function restoreSessionKernelLoopStateV2(
     }
   }
   state.projectedInputIds ??= [];
+  state.providerOutcomes ??= [];
+  state.planActionSettlements ??= {};
   state.publicRequests ??= {};
   if (state.providerTurn?.status === 'active') {
     state.providerTurn = {
@@ -160,6 +168,9 @@ export function recordSessionPlanV2(
     );
   }
   let next = cloneSessionKernelLoopStateV2(state);
+  if (next.plan?.planRevision !== plan.planRevision) {
+    next.planActionSettlements = {};
+  }
   if (
     next.plan
     && next.plan.planRevision === plan.planRevision
@@ -208,6 +219,7 @@ export function recordSessionUserInputV2(
   next.plan = undefined;
   next.projectedPlanRevision = undefined;
   next.previews = {};
+  next.planActionSettlements = {};
   return next;
 }
 

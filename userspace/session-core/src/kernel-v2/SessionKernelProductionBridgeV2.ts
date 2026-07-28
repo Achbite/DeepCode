@@ -74,10 +74,36 @@ export interface SessionKernelProductionUserInputV2 {
   };
 }
 
+export interface SessionKernelProductionReplanV2 {
+  kind: 'replan';
+  data: {
+    expectedPlanRevision: string;
+    guidance: string[];
+  };
+}
+
+export interface SessionKernelProductionResumeAfterBackpressureV2 {
+  kind: 'resumeAfterBackpressure';
+  data: {
+    operationId: string;
+    retryAt: string;
+    planActionId: string;
+    guidance: string[];
+  };
+}
+
 export interface SessionKernelProductionPreviewPlanActionV2 {
   kind: 'previewPlanAction';
   data: {
     planActionId: string;
+  };
+}
+
+export interface SessionKernelProductionSkipPlanActionV2 {
+  kind: 'skipPlanAction';
+  data: {
+    planActionId: string;
+    reason: string;
   };
 }
 
@@ -103,7 +129,10 @@ export type SessionKernelProductionOperationV2 =
   | SessionKernelProductionInitialTurnV2
   | SessionKernelProductionResumePlanActionV2
   | SessionKernelProductionUserInputV2
+  | SessionKernelProductionReplanV2
+  | SessionKernelProductionResumeAfterBackpressureV2
   | SessionKernelProductionPreviewPlanActionV2
+  | SessionKernelProductionSkipPlanActionV2
   | SessionKernelProductionObserveCapabilityDecisionV2
   | SessionKernelProductionReconcileWakeV2
   | SessionKernelProductionFinalizeReviewV2;
@@ -147,12 +176,24 @@ export type SessionKernelProductionOutcomeV2 =
       result: SessionKernelLoopResultV2;
     }
   | {
+      kind: 'replanResult';
+      result: SessionKernelLoopResultV2;
+    }
+  | {
+      kind: 'backpressureResumeResult';
+      result: SessionKernelLoopResultV2;
+    }
+  | {
       kind: 'resumePlanActionStep';
       step: SessionPlanActionDriveStepV2;
     }
   | {
       kind: 'planActionPreview';
       preview: CapabilityScopePreviewReplyV2;
+    }
+  | {
+      kind: 'planActionSkipped';
+      planActionId: string;
     }
   | {
       kind: 'capabilityDecisionObserved';
@@ -272,6 +313,7 @@ export async function executeSessionKernelProductionRequestV2(
     request.sessionId,
     request.runId,
     request.apiBase,
+    privateAuth,
     fetchImpl
   );
   const persistence = new SessionKernelAppendOnlyPersistenceV2(
@@ -286,6 +328,7 @@ export async function executeSessionKernelProductionRequestV2(
       request.sessionId,
       request.hostRunId,
       request.apiBase,
+      privateAuth,
       fetchImpl
     )
   );
@@ -358,6 +401,16 @@ async function executeProductionOperation(
           operation.data.guidance
         ),
       };
+    case 'replan':
+      return {
+        kind: 'replanResult',
+        result: await runner.replan(operation.data),
+      };
+    case 'resumeAfterBackpressure':
+      return {
+        kind: 'backpressureResumeResult',
+        result: await runner.resumeAfterBackpressure(operation.data),
+      };
     case 'resumePlanAction':
       return {
         kind: 'resumePlanActionStep',
@@ -377,6 +430,15 @@ async function executeProductionOperation(
         preview: await runner.previewPlanAction(
           operation.data.planActionId
         ),
+      };
+    case 'skipPlanAction':
+      await runner.skipPlanAction(
+        operation.data.planActionId,
+        operation.data.reason
+      );
+      return {
+        kind: 'planActionSkipped',
+        planActionId: operation.data.planActionId,
       };
     case 'observeCapabilityDecision': {
       const result = await runner.observeCapabilityDecision({
@@ -570,6 +632,43 @@ function decodeOperation(
       },
     };
   }
+  if (tagged.kind === 'replan') {
+    const body = exactObject(
+      data,
+      ['expectedPlanRevision', 'guidance']
+    );
+    return {
+      kind: tagged.kind,
+      data: {
+        expectedPlanRevision: identity(
+          body.expectedPlanRevision,
+          'expectedPlanRevision'
+        ),
+        guidance: decodeGuidance(body.guidance),
+      },
+    };
+  }
+  if (tagged.kind === 'resumeAfterBackpressure') {
+    const body = exactObject(
+      data,
+      ['operationId', 'retryAt', 'planActionId', 'guidance']
+    );
+    const retryAt = boundedText(body.retryAt, 'retryAt', 1024);
+    if (!Number.isFinite(Date.parse(retryAt))) {
+      throw invalidProductionRequest(
+        'session_kernel_production_retry_at_invalid'
+      );
+    }
+    return {
+      kind: tagged.kind,
+      data: {
+        operationId: identity(body.operationId, 'operationId'),
+        retryAt,
+        planActionId: identity(body.planActionId, 'planActionId'),
+        guidance: decodeGuidance(body.guidance),
+      },
+    };
+  }
   if (tagged.kind === 'previewPlanAction') {
     const body = exactObject(data, ['planActionId']);
     return {
@@ -579,6 +678,16 @@ function decodeOperation(
           body.planActionId,
           'planActionId'
         ),
+      },
+    };
+  }
+  if (tagged.kind === 'skipPlanAction') {
+    const body = exactObject(data, ['planActionId', 'reason']);
+    return {
+      kind: tagged.kind,
+      data: {
+        planActionId: identity(body.planActionId, 'planActionId'),
+        reason: boundedText(body.reason, 'reason', 64 * 1024),
       },
     };
   }
@@ -685,6 +794,8 @@ function productionContinuation(
   switch (outcome.kind) {
     case 'initialTurnResult':
     case 'userInputResult':
+    case 'replanResult':
+    case 'backpressureResumeResult':
       return continuationForLoopResult(outcome.result);
     case 'resumePlanActionStep':
       return continuationForDriveStep(outcome.step);
@@ -705,6 +816,8 @@ function productionContinuation(
                 outcome.preview.data.preview.disposition,
             }
           : { kind: 'readyToDrivePlanAction' };
+    case 'planActionSkipped':
+      return { kind: 'readyToDrivePlanAction' };
     case 'capabilityDecisionObserved':
       return outcome.result
         ? continuationForLoopResult(outcome.result)

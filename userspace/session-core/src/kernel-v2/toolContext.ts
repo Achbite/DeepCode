@@ -7,6 +7,7 @@ import type {
 import type { PromptEnvelopeBuilderInput } from '../prompt/types.js';
 
 export interface ProviderToolContextBindingV2 {
+  bundle: ToolContextBundleV2;
   contextRef: ToolContextRefV2;
   fixedPrompt: string;
   tools: readonly ToolDescriptorV2[];
@@ -80,10 +81,15 @@ export function providerToolContextBindingV2(
 ): ProviderToolContextBindingV2 {
   assertProviderSafeToolContextV2(bundle);
   return {
+    bundle: cloneJson(bundle),
     contextRef: toolContextRefV2(bundle),
     fixedPrompt: bundle.fixedPrompt,
     tools: bundle.tools,
   };
+}
+
+function cloneJson<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
 }
 
 export function toolContextRefV2(bundle: ToolContextBundleV2): ToolContextRefV2 {

@@ -138,6 +138,13 @@ export class SessionKernelHostRunnerV2 {
     return this.loop.previewPlanAction(planActionId);
   }
 
+  async skipPlanAction(
+    planActionId: string,
+    reason: string
+  ): Promise<void> {
+    await this.loop.skipPlanAction(planActionId, reason);
+  }
+
   async runPlanAction(
     planActionId: string,
     guidance: string[] = []
@@ -146,6 +153,61 @@ export class SessionKernelHostRunnerV2 {
       reason: 'planExecution',
       target: { kind: 'planAction', planActionId },
       guidance,
+    });
+  }
+
+  async replan(input: {
+    expectedPlanRevision: string;
+    guidance: string[];
+  }): Promise<SessionKernelLoopResultV2> {
+    const state = this.loop.snapshot();
+    if (state.plan?.planRevision !== input.expectedPlanRevision) {
+      throw new SessionKernelHostRunnerError(
+        'session_kernel_replan_revision_stale',
+        'Replan request does not match the current persisted Plan revision.'
+      );
+    }
+    if (state.activeWait) {
+      throw new SessionKernelHostRunnerError(
+        'session_kernel_replan_wait_active',
+        'Replan cannot start while an authority or invocation wait is active.'
+      );
+    }
+    return this.runProviderTurn({
+      reason: 'recovery',
+      target: { kind: 'planning' },
+      guidance: [
+        ...state.pendingGuidance,
+        ...input.guidance,
+      ],
+    });
+  }
+
+  async resumeAfterBackpressure(input: {
+    operationId: string;
+    retryAt: string;
+    planActionId: string;
+    guidance: string[];
+  }): Promise<SessionKernelLoopResultV2> {
+    const wait = this.loop.snapshot().activeWait;
+    if (
+      !wait
+      || wait.kind !== 'backpressure'
+      || wait.operationId !== input.operationId
+      || wait.retryAt !== input.retryAt
+    ) {
+      throw new SessionKernelHostRunnerError(
+        'session_kernel_backpressure_identity_stale',
+        'Backpressure continuation does not match the current durable wait identity.'
+      );
+    }
+    return this.loop.resumeAfterBackpressure({
+      reason: 'retryGuidance',
+      target: {
+        kind: 'planAction',
+        planActionId: input.planActionId,
+      },
+      guidance: input.guidance,
     });
   }
 

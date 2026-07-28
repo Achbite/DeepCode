@@ -100,16 +100,26 @@ export interface SessionProviderTurnInputV2 {
   runId: string;
   controlEpoch: number;
   currentInput: SessionUserInputRecordV2;
+  conversationInputs: readonly SessionUserInputRecordV2[];
+  providerOutcomes: readonly SessionProviderOutcomeRecordV2[];
   plan?: SessionNaturalLanguagePlanV2;
   kernelFacts: SessionProviderKernelFactsProjectionV2;
   target: SessionProviderTurnTargetV2;
   guidance: string[];
   toolContext: {
+    bundle: import('@deepcode/protocol').ToolContextBundleV2;
     contextRef: ToolContextRefV2;
     fixedPrompt: string;
     tools: readonly ToolDescriptorV2[];
   };
   signal: AbortSignal;
+}
+
+export interface SessionProviderOutcomeRecordV2 {
+  providerTurnId: string;
+  outputKind: SessionProviderTurnOutputV2['kind'];
+  recordedAt: string;
+  summary?: string;
 }
 
 export type SessionProviderTurnOutputV2 =
@@ -221,9 +231,13 @@ export interface SessionReviewFactRefV2 {
   ledgerSequence: number;
   domain: KernelFactProjectionV2['domain'];
   factKind: string;
+  controlEpoch?: number;
+  planActionIds: string[];
+  resourceIds: string[];
   operationId?: string;
   invocationId?: string;
   effectId?: string;
+  details: KernelFactProjectionV2['details'];
 }
 
 export interface SessionReviewPlannedActionV2 {
@@ -237,16 +251,31 @@ export interface SessionKernelReviewV2 {
   revision: number;
   status: 'draft' | 'final';
   planRevision?: string;
+  plan?: {
+    title: string;
+    objective: string;
+    narrative: string;
+    recordedAt: string;
+  };
   snapshotHighWater: number;
   planned: SessionReviewPlannedActionV2[];
   scopeExpansions: SessionReviewFactRefV2[];
   actualEffects: SessionReviewFactRefV2[];
   unexecuted: SessionReviewPlannedActionV2[];
   denied: SessionReviewFactRefV2[];
+  rejections: SessionReviewFactRefV2[];
+  skipped: SessionPlanActionSettlementV2[];
   cleanup: SessionReviewFactRefV2[];
   indeterminate: SessionReviewFactRefV2[];
   createdAt: string;
   finalizedAt?: string;
+}
+
+export interface SessionPlanActionSettlementV2 {
+  kind: 'skipped';
+  planActionId: string;
+  reason: string;
+  recordedAt: string;
 }
 
 export interface SessionKernelProjectionEventV2 {
@@ -267,7 +296,9 @@ export interface SessionKernelProjectionEventV2 {
     | 'toolIntent.submitted'
     | 'capability.awaiting'
     | 'kernelFacts.reconciled'
+    | 'authorization.decided'
     | 'review.revised'
+    | 'planAction.skipped'
     | 'wait.changed'
     | 'diagnostic';
   data: unknown;

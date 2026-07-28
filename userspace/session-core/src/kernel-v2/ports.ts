@@ -36,10 +36,11 @@ export interface SessionKernelPersistencePortV2 {
     request: SessionKernelPublicRequestRecordV2
   ): Promise<void>;
 
-  completePublicRequest(
-    requestId: string,
-    outcome: 'resolved' | 'deterministicFailure',
-    completedAt: string
+  settlePublicRequest(
+    request: SessionKernelPublicRequestRecordV2,
+    outcomeDigest: string,
+    checkpoint: SessionKernelCheckpointV2,
+    projections: SessionKernelProjectionEventV2[]
   ): Promise<void>;
 
   persistCheckpoint(checkpoint: SessionKernelCheckpointV2): Promise<void>;
@@ -57,6 +58,8 @@ export interface SessionKernelProjectionPortV2 {
    * requests can replay after an unknown transport outcome.
    */
   project(event: SessionKernelProjectionEventV2): Promise<void>;
+
+  flushPending(runId: string): Promise<void>;
 }
 
 export interface SessionKernelClockPortV2 {

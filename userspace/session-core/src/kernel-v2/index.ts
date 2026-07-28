@@ -1,4 +1,5 @@
 export * from './authority.js';
+export * from './factKinds.js';
 export * from './lineage.js';
 export * from './ports.js';
 export * from './providerFactProjection.js';

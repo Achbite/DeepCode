@@ -166,6 +166,23 @@ export function recordSessionCapabilityLeaseV2(
   return current;
 }
 
+export function clearSessionCapabilityLeasesV2(
+  state: SessionKernelLineageStateV2,
+  planActionId?: string
+): SessionKernelLineageStateV2 {
+  const current = cloneLineageState(state);
+  for (const operation of Object.values(current.operations)) {
+    if (
+      planActionId !== undefined
+      && operation.planActionId !== planActionId
+    ) {
+      continue;
+    }
+    operation.leases = [];
+  }
+  return current;
+}
+
 export function recordSessionToolIntentSubmissionV2(
   state: SessionKernelLineageStateV2,
   intent: ToolIntentV2,

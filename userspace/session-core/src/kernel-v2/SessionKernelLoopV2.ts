@@ -200,6 +200,47 @@ export class SessionKernelLoopV2 {
     }
   }
 
+  async skipPlanAction(
+    planActionId: string,
+    reason: string
+  ): Promise<void> {
+    this.beginMaintenance('skipPlanAction');
+    try {
+      this.requireNoPendingRequests();
+      if (this.state.activeWait) {
+        throw new SessionKernelLoopError(
+          'session_kernel_plan_action_skip_wait_active',
+          'PlanAction cannot be skipped while an authority or invocation wait is active.'
+        );
+      }
+      sessionPlanActionV2(this.state, planActionId);
+      const recordedAt = this.ports.clock.now();
+      const settlement = {
+        kind: 'skipped' as const,
+        planActionId,
+        reason: requiredReason(reason),
+        recordedAt,
+      };
+      const existing = this.state.planActionSettlements[planActionId];
+      if (existing && JSON.stringify(existing) !== JSON.stringify(settlement)) {
+        throw new SessionKernelLoopError(
+          'session_kernel_plan_action_skip_conflict',
+          `PlanAction ${planActionId} already has a different settlement.`
+        );
+      }
+      this.state.planActionSettlements[planActionId] = settlement;
+      await this.saveCheckpoint();
+      await this.project(
+        `plan-action:${planActionId}:skipped`,
+        'planAction.skipped',
+        settlement,
+        recordedAt
+      );
+    } finally {
+      this.endMaintenance();
+    }
+  }
+
   async previewPlanAction(
     planActionId: string
   ): Promise<CapabilityScopePreviewReplyV2> {
@@ -277,17 +318,17 @@ export class SessionKernelLoopV2 {
     this.beginAuthorityTransition();
     try {
       const oldInvocationId = activeInvocationId(this.state);
+      await this.ports.persistence.persistInput(input);
       this.providers.supersedeForUserInput();
       this.requests.supersedeForUserInput();
       this.state = recordSessionUserInputV2(this.state, input);
-      await this.ports.persistence.persistInput(input);
       await this.saveCheckpoint();
-      await this.ensureInputProjected(input);
 
       await this.advancePendingInput(oldInvocationId);
       await this.reconcileFactsInternal();
       await this.requests.replay('effect');
       await this.reconcileFactsInternal();
+      await this.ensureInputProjected(input);
     } finally {
       this.authorityTransitionActive = false;
     }
@@ -440,10 +481,6 @@ export class SessionKernelLoopV2 {
   async recover(): Promise<void> {
     this.beginMaintenance('recover');
     try {
-      await this.ensurePlanProjected();
-      for (const input of this.state.inputs) {
-        await this.ensureInputProjected(input);
-      }
       const oldInvocationId = activeInvocationId(this.state);
       if (this.state.pendingEpochInput) {
         await this.advancePendingInput(oldInvocationId);
@@ -453,6 +490,11 @@ export class SessionKernelLoopV2 {
       await this.reconcileFactsInternal();
       await this.requests.replay('effect');
       await this.reconcileFactsInternal();
+      await this.ensurePlanProjected();
+      for (const input of this.state.inputs) {
+        await this.ensureInputProjected(input);
+      }
+      await this.ports.projection.flushPending(this.state.runId);
     } finally {
       this.endMaintenance();
     }
@@ -704,6 +746,16 @@ function activeInvocationId(
     : wait?.kind === 'manualRecovery'
       ? wait.invocationId
       : undefined;
+}
+
+function requiredReason(value: string): string {
+  if (!value.trim() || value.length > 64 * 1024) {
+    throw new SessionKernelLoopError(
+      'session_kernel_plan_action_skip_reason_invalid',
+      'Skipped PlanAction requires a bounded non-empty reason.'
+    );
+  }
+  return value;
 }
 
 function authoritativePendingRequests(

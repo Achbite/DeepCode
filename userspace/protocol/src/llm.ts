@@ -1,5 +1,5 @@
 import type { AgentConversationActivity } from './agent.js';
-import type { ToolCall, ToolDefinition } from './tools.js';
+import type { ToolCall } from './tools.js';
 
 export type LlmProviderKind =
   | 'openaiCompatible'
@@ -101,12 +101,22 @@ export interface LlmChatMessage {
   toolCallId?: string;
 }
 
+/**
+ * Provider wire metadata only. Permission, risk, and execution policy remain
+ * Kernel facts and must not be synthesized by Session into Provider tools.
+ */
+export interface ProviderWireToolDefinition {
+  name: string;
+  description: string;
+  inputSchema: unknown;
+}
+
 export interface LlmChatRequest {
   requestId: string;
   parentRequestId?: string;
   profileId?: string;
   messages: LlmChatMessage[];
-  tools?: ToolDefinition[];
+  tools?: ProviderWireToolDefinition[];
   stream?: boolean;
   providerUserId?: string;
   responseFormat?: LlmResponseFormat;

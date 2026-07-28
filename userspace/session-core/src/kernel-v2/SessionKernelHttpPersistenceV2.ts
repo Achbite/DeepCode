@@ -10,6 +10,12 @@ import type {
   SessionNaturalLanguagePlanV2,
   SessionUserInputRecordV2,
 } from './types.js';
+import type {
+  SessionKernelTransportPrivateAuthV2,
+} from './SessionKernelPortV2.js';
+import {
+  SESSION_KERNEL_CHECKPOINT_V2_SCHEMA,
+} from './types.js';
 
 export const SESSION_KERNEL_PERSISTENCE_V2_SCHEMA =
   'deepcode.session.kernel-persistence.v2' as const;
@@ -27,7 +33,7 @@ export type SessionKernelPersistenceRecordKindV2 =
   | 'input'
   | 'plan'
   | 'publicRequest'
-  | 'publicRequestCompleted'
+  | 'publicRequestSettled'
   | 'checkpoint'
   | 'projection'
   | 'projectionDelivered';
@@ -85,15 +91,21 @@ export interface SessionKernelAppendOnlyRecordStoreV2 {
 export class HttpSessionKernelAppendOnlyRecordStoreV2
 implements SessionKernelAppendOnlyRecordStoreV2 {
   private readonly endpoint: string;
+  readonly #runCapability: string;
 
   constructor(
     private readonly sessionId: string,
-    private readonly runId: string,
+    readonly runId: string,
     apiBase: string,
+    privateAuth: SessionKernelTransportPrivateAuthV2,
     private readonly fetchImpl: typeof fetch = fetch
   ) {
     requiredIdentity(sessionId, 'sessionId');
     requiredIdentity(runId, 'runId');
+    this.#runCapability = requiredText(
+      privateAuth.runCapability,
+      'runCapability'
+    );
     this.endpoint = [
       normalizeApiBase(apiBase),
       'api/session-store',
@@ -104,7 +116,11 @@ implements SessionKernelAppendOnlyRecordStoreV2 {
   }
 
   async list(): Promise<unknown[]> {
-    const response = await this.fetchImpl(this.endpoint);
+    const response = await this.fetchImpl(this.endpoint, {
+      headers: {
+        'x-deepcode-run-capability': this.#runCapability,
+      },
+    });
     if (!response.ok) {
       throw persistenceHttpError('read', response.status);
     }
@@ -158,7 +174,10 @@ implements SessionKernelAppendOnlyRecordStoreV2 {
     };
     const response = await this.fetchImpl(this.endpoint, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: {
+        'content-type': 'application/json',
+        'x-deepcode-run-capability': this.#runCapability,
+      },
       body: JSON.stringify(request),
     });
     if (!response.ok) {
@@ -223,7 +242,7 @@ implements SessionKernelPersistencePortV2 {
 
   constructor(
     private readonly sessionId: string,
-    private readonly runId: string,
+    readonly runId: string,
     historySchema: string,
     private readonly store: SessionKernelAppendOnlyRecordStoreV2
   ) {
@@ -240,12 +259,38 @@ implements SessionKernelPersistencePortV2 {
     this.requireRun(runId);
     const records = await this.loadRecords();
     const checkpoints = records
-      .filter((record) => record.recordKind === 'checkpoint')
-      .map((record) => record.data as SessionKernelCheckpointV2)
+      .flatMap((record) => {
+        if (record.recordKind === 'checkpoint') {
+          return [record.data as SessionKernelCheckpointV2];
+        }
+        if (record.recordKind === 'publicRequestSettled') {
+          return [
+            decodePublicRequestSettlement(
+              record.data,
+              this.runId
+            ).checkpoint,
+          ];
+        }
+        return [];
+      })
       .sort(
         (left, right) =>
           left.checkpointRevision - right.checkpointRevision
       );
+    const checkpointByRevision = new Map<number, string>();
+    for (const checkpoint of checkpoints) {
+      const digest = sha256Hash(canonicalJson(checkpoint));
+      const previous = checkpointByRevision.get(
+        checkpoint.checkpointRevision
+      );
+      if (previous && previous !== digest) {
+        throw new SessionKernelPersistenceError(
+          'session_kernel_checkpoint_revision_conflict',
+          `Checkpoint revision ${checkpoint.checkpointRevision} has conflicting durable content.`
+        );
+      }
+      checkpointByRevision.set(checkpoint.checkpointRevision, digest);
+    }
     return cloneJson(checkpoints.at(-1));
   }
 
@@ -291,9 +336,22 @@ implements SessionKernelPersistencePortV2 {
           pending.set(request.requestId, cloneJson(request));
         }
       }
-      if (record.recordKind === 'publicRequestCompleted') {
-        const requestId = stringField(record.data, 'requestId');
-        if (requestId) pending.delete(requestId);
+      if (record.recordKind === 'publicRequestSettled') {
+        const settlement = decodePublicRequestSettlement(
+          record.data,
+          this.runId
+        );
+        const request = pending.get(settlement.requestId);
+        if (
+          !request
+          || publicRequestDigest(request) !== settlement.requestDigest
+        ) {
+          throw new SessionKernelPersistenceError(
+            'session_kernel_public_request_settlement_identity_mismatch',
+            `Settlement ${settlement.requestId} does not match a durable request identity and payload.`
+          );
+        }
+        pending.delete(settlement.requestId);
       }
     }
     return [...pending.values()].sort(
@@ -332,16 +390,26 @@ implements SessionKernelPersistencePortV2 {
     );
   }
 
-  completePublicRequest(
-    requestId: string,
-    outcome: 'resolved' | 'deterministicFailure',
-    completedAt: string
+  settlePublicRequest(
+    request: SessionKernelPublicRequestRecordV2,
+    outcomeDigest: string,
+    checkpoint: SessionKernelCheckpointV2,
+    projections: SessionKernelProjectionEventV2[]
   ): Promise<void> {
     return this.append(
-      'publicRequestCompleted',
-      `request:${requestId}:completed`,
-      { requestId, outcome, completedAt },
-      completedAt
+      'publicRequestSettled',
+      `request:${request.requestId}:settled`,
+      {
+        requestId: request.requestId,
+        requestDigest: publicRequestDigest(request),
+        outcomeDigest: requiredDigest(
+          outcomeDigest,
+          'outcomeDigest'
+        ),
+        checkpoint: cloneJson(checkpoint),
+        projections: projections.map(cloneJson),
+      },
+      checkpoint.savedAt
     );
   }
 
@@ -405,6 +473,25 @@ implements SessionKernelPersistencePortV2 {
         }
         projected.set(event.projectionId, event);
       }
+      if (record.recordKind === 'publicRequestSettled') {
+        const settlement = decodePublicRequestSettlement(
+          record.data,
+          this.runId
+        );
+        for (const event of settlement.projections) {
+          const previous = projected.get(event.projectionId);
+          if (
+            previous
+            && projectionDigest(previous) !== projectionDigest(event)
+          ) {
+            throw new SessionKernelPersistenceError(
+              'session_kernel_projection_identity_conflict',
+              `Projection ${event.projectionId} changed immutable content.`
+            );
+          }
+          projected.set(event.projectionId, event);
+        }
+      }
       if (record.recordKind === 'projectionDelivered') {
         const receipt = decodeProjectionDelivery(record.data);
         const previous = delivered.get(receipt.projectionId);
@@ -436,6 +523,37 @@ implements SessionKernelPersistencePortV2 {
             !== projectionDigest(event)
       )
       .map(cloneJson);
+  }
+
+  async loadProjectionEvents(
+    runId: string
+  ): Promise<SessionKernelProjectionEventV2[]> {
+    this.requireRun(runId);
+    const projected = new Map<string, SessionKernelProjectionEventV2>();
+    for (const record of await this.loadRecords()) {
+      const events = record.recordKind === 'projection'
+        ? [decodeProjectionEvent(record.data, this.runId)]
+        : record.recordKind === 'publicRequestSettled'
+          ? decodePublicRequestSettlement(
+              record.data,
+              this.runId
+            ).projections
+          : [];
+      for (const event of events) {
+        const previous = projected.get(event.projectionId);
+        if (
+          previous
+          && projectionDigest(previous) !== projectionDigest(event)
+        ) {
+          throw new SessionKernelPersistenceError(
+            'session_kernel_projection_identity_conflict',
+            `Projection ${event.projectionId} changed immutable content.`
+          );
+        }
+        if (!previous) projected.set(event.projectionId, event);
+      }
+    }
+    return [...projected.values()].map(cloneJson);
   }
 
   private append(
@@ -562,7 +680,10 @@ implements SessionKernelPersistencePortV2 {
 }
 
 export interface SessionKernelHostProjectionSinkV2 {
-  publish(event: SessionKernelProjectionEventV2): Promise<void>;
+  publish(
+    event: SessionKernelProjectionEventV2,
+    projectionHistory: SessionKernelProjectionEventV2[]
+  ): Promise<void>;
 }
 
 export class DurableSessionKernelProjectionV2
@@ -576,7 +697,10 @@ implements SessionKernelProjectionPortV2 {
   async project(event: SessionKernelProjectionEventV2): Promise<void> {
     await this.persistence.persistProjection(event);
     if (this.sink) {
-      await this.sink.publish(cloneJson(event));
+      await this.sink.publish(
+        cloneJson(event),
+        await this.projectionHistoryThrough(event.projectionId)
+      );
       await this.persistence.persistProjectionDelivered(event);
     }
   }
@@ -587,10 +711,32 @@ implements SessionKernelProjectionPortV2 {
       const event
       of await this.persistence.loadUndeliveredProjections(runId)
     ) {
-      await this.sink.publish(cloneJson(event));
+      await this.sink.publish(
+        cloneJson(event),
+        await this.projectionHistoryThrough(event.projectionId)
+      );
       await this.persistence.persistProjectionDelivered(event);
     }
   }
+
+  private async projectionHistoryThrough(
+    projectionId: string
+  ): Promise<SessionKernelProjectionEventV2[]> {
+    const history = await this.persistence.loadProjectionEvents(
+      this.persistence.runId
+    );
+    const index = history.findIndex(
+      (event) => event.projectionId === projectionId
+    );
+    if (index < 0) {
+      throw new SessionKernelPersistenceError(
+        'session_kernel_projection_history_missing',
+        `Projection ${projectionId} is missing from durable history.`
+      );
+    }
+    return history.slice(0, index + 1);
+  }
+
 }
 
 const SESSION_KERNEL_PROJECTION_KINDS_V2 = new Set<
@@ -605,7 +751,9 @@ const SESSION_KERNEL_PROJECTION_KINDS_V2 = new Set<
   'toolIntent.submitted',
   'capability.awaiting',
   'kernelFacts.reconciled',
+  'authorization.decided',
   'review.revised',
+  'planAction.skipped',
   'wait.changed',
   'diagnostic',
 ]);
@@ -685,6 +833,105 @@ function projectionDigest(
   return sha256Hash(canonicalJson(event));
 }
 
+interface SessionKernelPublicRequestSettlementV2 {
+  requestId: string;
+  requestDigest: string;
+  outcomeDigest: string;
+  checkpoint: SessionKernelCheckpointV2;
+  projections: SessionKernelProjectionEventV2[];
+}
+
+function decodePublicRequestSettlement(
+  value: unknown,
+  runId: string
+): SessionKernelPublicRequestSettlementV2 {
+  const record = exactObject(
+    value,
+    [
+      'requestId',
+      'requestDigest',
+      'outcomeDigest',
+      'checkpoint',
+      'projections',
+    ],
+    'session_kernel_public_request_settlement_invalid'
+  );
+  const checkpointRecord = exactObject(
+    record.checkpoint,
+    ['schemaVersion', 'checkpointRevision', 'savedAt', 'state'],
+    'session_kernel_public_request_settlement_invalid'
+  );
+  const state = objectRecord(checkpointRecord.state);
+  if (
+    checkpointRecord.schemaVersion
+      !== SESSION_KERNEL_CHECKPOINT_V2_SCHEMA
+    || !Number.isSafeInteger(checkpointRecord.checkpointRevision)
+    || (checkpointRecord.checkpointRevision as number) < 1
+    || !state
+    || state.runId !== runId
+    || state.checkpointRevision !== checkpointRecord.checkpointRevision
+    || !Array.isArray(record.projections)
+  ) {
+    throw new UnsupportedHistorySchemaError(
+      'session_kernel_public_request_settlement_invalid'
+    );
+  }
+  const requestId = requiredIdentity(record.requestId, 'requestId');
+  const requestDigest = requiredDigest(
+    record.requestDigest,
+    'requestDigest'
+  );
+  const outcomeDigest = requiredDigest(
+    record.outcomeDigest,
+    'outcomeDigest'
+  );
+  const checkpoint = cloneJson(
+    record.checkpoint
+  ) as SessionKernelCheckpointV2;
+  const pending = Object.values(
+    checkpoint.state.publicRequests ?? {}
+  );
+  if (
+    pending.some(
+      (request) => request?.requestId === requestId
+    )
+  ) {
+    throw new UnsupportedHistorySchemaError(
+      'session_kernel_public_request_settlement_still_pending'
+    );
+  }
+  return {
+    requestId,
+    requestDigest,
+    outcomeDigest,
+    checkpoint,
+    projections: record.projections.map(
+      (projection) => decodeProjectionEvent(projection, runId)
+    ),
+  };
+}
+
+function publicRequestDigest(
+  request: SessionKernelPublicRequestRecordV2
+): string {
+  return sha256Hash(canonicalJson({
+    requestId: request.requestId,
+    lane: request.lane,
+    intent: request.intent,
+  }));
+}
+
+function requiredDigest(value: unknown, field: string): string {
+  const digest = requiredIdentity(value, field);
+  if (!/^sha256:[0-9a-f]{64}$/u.test(digest)) {
+    throw new SessionKernelPersistenceError(
+      'session_kernel_persistence_digest_invalid',
+      `${field} is not a canonical sha256 digest.`
+    );
+  }
+  return digest;
+}
+
 function createRecord(input: {
   sessionId: string;
   runId: string;
@@ -757,7 +1004,7 @@ function decodeRecord(
     && recordKind !== 'input'
     && recordKind !== 'plan'
     && recordKind !== 'publicRequest'
-    && recordKind !== 'publicRequestCompleted'
+    && recordKind !== 'publicRequestSettled'
     && recordKind !== 'checkpoint'
     && recordKind !== 'projection'
     && recordKind !== 'projectionDelivered'
@@ -830,14 +1077,6 @@ function requiredText(value: unknown, field: string): string {
     );
   }
   return value;
-}
-
-function stringField(value: unknown, field: string): string | undefined {
-  const record = objectRecord(value);
-  const candidate = record?.[field];
-  return typeof candidate === 'string' && candidate.trim()
-    ? candidate
-    : undefined;
 }
 
 function objectRecord(

@@ -155,6 +155,8 @@ export class SessionKernelProviderTurnsV2 {
           runId: state.runId,
           controlEpoch: state.controlEpoch,
           currentInput: currentSessionUserInputV2(state),
+          conversationInputs: state.inputs,
+          providerOutcomes: state.providerOutcomes,
           ...(state.plan ? { plan: state.plan } : {}),
           kernelFacts: factProjection,
           target: request.target,
@@ -234,11 +236,21 @@ export class SessionKernelProviderTurnsV2 {
       }
       const current = this.host.readState();
       current.providerTurn!.status = 'completed';
+      current.providerOutcomes.push({
+        providerTurnId,
+        outputKind: output.kind,
+        recordedAt: this.ports.clock.now(),
+        ...providerOutcomeSummary(output),
+      });
       await this.host.saveCheckpoint();
       await this.host.project(
         `provider:${providerTurnId}:completed`,
         'provider.completed',
-        { providerTurnId, outputKind: output.kind }
+        {
+          providerTurnId,
+          outputKind: output.kind,
+          result,
+        }
       );
       return result;
     } finally {
@@ -476,6 +488,21 @@ export class SessionKernelProviderTurnsV2 {
     this.reservation = reservation;
     return reservation;
   }
+}
+
+function providerOutcomeSummary(
+  output: import('./types.js').SessionProviderTurnOutputV2
+): { summary?: string } {
+  if (output.kind === 'answer') {
+    return { summary: output.text.slice(0, 8_192) };
+  }
+  if (output.kind === 'noTool' && output.guidance) {
+    return { summary: output.guidance.slice(0, 8_192) };
+  }
+  if (output.kind === 'plan') {
+    return { summary: `${output.plan.title}\n${output.plan.objective}` };
+  }
+  return {};
 }
 
 function providerSourceToolId(

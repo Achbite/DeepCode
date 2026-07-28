@@ -7,8 +7,10 @@ import type {
   ToolIntentSubmitReplyV2,
 } from '@deepcode/protocol';
 import {
+  clearSessionCapabilityLeasesV2,
   recordSessionToolIntentSubmissionV2,
 } from './lineage.js';
+import { canonicalJson, sha256Hash } from '../cache/canonicalizer.js';
 import type { SessionKernelLoopPortsV2 } from './ports.js';
 import {
   reconcileSessionKernelFactsPageV2,
@@ -24,6 +26,10 @@ import {
 } from './SessionKernelPortV2.js';
 import type { SessionKernelLoopStateV2 } from './state.js';
 import {
+  checkpointSessionKernelStateV2,
+  cloneSessionKernelLoopStateV2,
+} from './state.js';
+import {
   applySessionToolContextReplyV2,
 } from './toolContext.js';
 import type {
@@ -32,6 +38,9 @@ import type {
   SessionKernelPublicRequestLaneV2,
   SessionKernelPublicRequestRecordV2,
 } from './types.js';
+import {
+  SESSION_KERNEL_FACT_KINDS_V2,
+} from './factKinds.js';
 
 export type SessionKernelPublicRequestOutcomeV2 =
   | { kind: 'toolContextGet'; reply: ToolContextGetReplyV2 }
@@ -199,7 +208,7 @@ export class SessionKernelPublicRequestsV2 {
       }
       if (isDeterministicSessionKernelPortFailureV2(error)) {
         attempt.phase = 'applying';
-        await this.complete(record, 'deterministicFailure');
+        await this.settleDeterministicFailure(record, error);
         throw error;
       }
       throw new SessionKernelTransportUnknownError(record, error);
@@ -209,18 +218,35 @@ export class SessionKernelPublicRequestsV2 {
     }
     attempt.phase = 'applying';
 
-    const events = applyPublicRequestOutcome(
-      this.host,
-      record,
-      outcome,
-      this.ports.clock.now(),
-      this.retryDelayMs
+    const previous = cloneSessionKernelLoopStateV2(
+      this.host.readState()
     );
-    await this.host.saveCheckpoint();
-    for (const event of events) {
-      await this.ports.projection.project(event);
+    let events: SessionKernelProjectionEventV2[];
+    try {
+      events = applyPublicRequestOutcome(
+        this.host,
+        record,
+        outcome,
+        this.ports.clock.now(),
+        this.retryDelayMs
+      );
+      this.removePending(record);
+      const checkpoint = checkpointSessionKernelStateV2(
+        this.host.readState(),
+        this.ports.clock.now()
+      );
+      await this.ports.persistence.settlePublicRequest(
+        record,
+        digestOutcome(outcome),
+        checkpoint,
+        events
+      );
+      this.host.replaceState(checkpoint.state);
+    } catch (error) {
+      this.host.replaceState(previous);
+      throw error;
     }
-    await this.complete(record, 'resolved');
+    await this.flushProjectionOutbox();
     return outcome;
   }
 
@@ -234,19 +260,53 @@ export class SessionKernelPublicRequestsV2 {
     this.inFlight.delete(lane);
   }
 
-  private async complete(
+  private async settleDeterministicFailure(
     record: SessionKernelPublicRequestRecordV2,
-    outcome: 'resolved' | 'deterministicFailure'
+    error: SessionKernelPortError
   ): Promise<void> {
-    await this.ports.persistence.completePublicRequest(
-      record.requestId,
-      outcome,
-      this.ports.clock.now()
+    const previous = cloneSessionKernelLoopStateV2(
+      this.host.readState()
     );
+    try {
+      this.removePending(record);
+      const checkpoint = checkpointSessionKernelStateV2(
+        this.host.readState(),
+        this.ports.clock.now()
+      );
+      await this.ports.persistence.settlePublicRequest(
+        record,
+        digestOutcome({
+          kind: 'deterministicFailure',
+          code: error.code,
+          disposition: error.disposition,
+        }),
+        checkpoint,
+        []
+      );
+      this.host.replaceState(checkpoint.state);
+    } catch (settlementError) {
+      this.host.replaceState(previous);
+      throw settlementError;
+    }
+  }
+
+  private removePending(
+    record: SessionKernelPublicRequestRecordV2
+  ): void {
     const current = this.pending(record.lane);
     if (current?.requestId === record.requestId) {
       delete this.host.readState().publicRequests[record.lane];
-      await this.host.saveCheckpoint();
+    }
+  }
+
+  private async flushProjectionOutbox(): Promise<void> {
+    try {
+      await this.ports.projection.flushPending(
+        this.host.readState().runId
+      );
+    } catch {
+      // Settlement owns the durable outbox. Recovery retries delivery only;
+      // projection transport failure must not redispatch the Kernel request.
     }
   }
 }
@@ -425,10 +485,46 @@ function applyPublicRequestOutcome(
         {
           requestId: record.requestId,
           pageFactIds: outcome.reply.facts.map((fact) => fact.factId),
+          facts: outcome.reply.facts,
           snapshotHighWater: outcome.reply.snapshotHighWater,
         },
         record.startedAt
       ));
+      const authorizationDecisionKinds = new Set<string>([
+        SESSION_KERNEL_FACT_KINDS_V2.authorization.capabilityIssued,
+        SESSION_KERNEL_FACT_KINDS_V2.authorization.capabilityDenied,
+        SESSION_KERNEL_FACT_KINDS_V2.authorization.expansionAllowed,
+        SESSION_KERNEL_FACT_KINDS_V2.authorization.expansionDenied,
+      ]);
+      const newFactIds = new Set(result.newFactIds);
+      for (const fact of outcome.reply.facts) {
+        if (
+          !newFactIds.has(fact.factId)
+          || fact.domain !== 'authorization'
+          || !authorizationDecisionKinds.has(fact.factKind)
+        ) {
+          continue;
+        }
+        events.push(host.event(
+          `authorization:${fact.factId}`,
+          'authorization.decided',
+          {
+            factId: fact.factId,
+            factKind: fact.factKind,
+            controlEpoch: fact.lineage.controlEpoch,
+            planActionIds: fact.lineage.planActionIds,
+            operationId: fact.lineage.operationId,
+            capabilityLease: fact.lineage.capabilityLease,
+            resourceIds: fact.lineage.resourceIds,
+            guidance: typeof fact.details.guidance === 'string'
+              ? fact.details.guidance
+              : undefined,
+            scopeDelta: fact.details.scopeDelta,
+            details: fact.details,
+          },
+          fact.recordedAt
+        ));
+      }
       if (result.state.review) {
         events.push(host.event(
           `${record.requestId}:review:${result.state.review.revision}`,
@@ -499,6 +595,16 @@ function applyToolIntentReply(
 
   const stillCurrentEpoch =
     intent.expectedControlEpoch === state.controlEpoch;
+  if (
+    reply.kind === 'rejected'
+    && reply.data.reason === 'capabilityLeaseStale'
+    && intent.authority.kind === 'planAction'
+  ) {
+    state.lineage = clearSessionCapabilityLeasesV2(
+      state.lineage,
+      intent.authority.data.planActionId
+    );
+  }
   if (reply.kind === 'admitted' && stillCurrentEpoch) {
     state.activeWait = {
       kind: 'invocation',
@@ -575,7 +681,7 @@ function assertRecordLane(record: SessionKernelPublicRequestRecordV2): void {
 
 function isDeterministicSessionKernelPortFailureV2(
   error: unknown
-): boolean {
+): error is SessionKernelPortError {
   return error instanceof SessionKernelPortError
     && error.disposition === 'deterministic';
 }
@@ -593,6 +699,10 @@ function addMilliseconds(instant: string, milliseconds: number): string {
     );
   }
   return new Date(value + milliseconds).toISOString();
+}
+
+function digestOutcome(value: unknown): string {
+  return sha256Hash(canonicalJson(value));
 }
 
 export class SessionKernelTransportUnknownError extends Error {

@@ -136,6 +136,11 @@ export type ToolIntentAuthorityV2 =
       };
     };
 
+/**
+ * Host-only command payload. It remains in the shared seven-command wire ABI
+ * so one daemon decoder stays authoritative, but SessionKernelPortV2 must not
+ * expose it and the daemon must require the Host authentication boundary.
+ */
 export interface RunOpenV2 {
   workspaceBindingRef: string;
   inputId: string;
@@ -338,7 +343,7 @@ export interface KernelFactLineageV2 {
   controlEpoch?: ControlEpochV2;
   planActionIds: PlanActionIdV2[];
   operationId?: OperationIdV2;
-  capabilityLeaseId?: string;
+  capabilityLease?: CapabilityLeaseRefV2;
   invocationId?: InvocationIdV2;
   attemptId?: AttemptIdV2;
   effectId?: EffectIdV2;
@@ -399,7 +404,7 @@ export interface ControlEpochAdvancedReplyV2 {
   runId: RunIdV2;
   acceptedControlEpoch: ControlEpochV2;
   epochFactId: FactIdV2;
-  supersededGrantCount: number;
+  supersededCapabilityCount: number;
   cancellation: ControlCancellationReplyV2;
   commandBatchHighWater: number;
 }
@@ -412,7 +417,7 @@ export interface InvocationCancelV2 {
   runId: RunIdV2;
   expectedControlEpoch: ControlEpochV2;
   target: InvocationCancelTargetV2;
-  reasonCode: 'userRequested' | 'epochSuperseded' | 'runTerminated';
+  reasonCode: 'userRequested' | 'epochSuperseded';
   reason?: string;
 }
 
@@ -447,6 +452,10 @@ export type InvocationCancelReplyV2 =
       };
     };
 
+/**
+ * Frozen seven-command v2 wire union. `runOpen` is callable only by Host;
+ * Session and CLI semantic clients consume an already opened Run binding.
+ */
 export type KernelCommandV2 =
   | { kind: 'runOpen'; data: RunOpenV2 }
   | { kind: 'toolContextGet'; data: ToolContextGetV2 }
@@ -1113,7 +1122,7 @@ function decodeFactLineage(value: unknown): KernelFactLineageV2 {
       'controlEpoch',
       'planActionIds',
       'operationId',
-      'capabilityLeaseId',
+      'capabilityLease',
       'invocationId',
       'attemptId',
       'effectId',
@@ -1123,7 +1132,7 @@ function decodeFactLineage(value: unknown): KernelFactLineageV2 {
     [
       'controlEpoch',
       'operationId',
-      'capabilityLeaseId',
+      'capabilityLease',
       'invocationId',
       'attemptId',
       'effectId',
@@ -1141,11 +1150,13 @@ function decodeFactLineage(value: unknown): KernelFactLineageV2 {
     planActionIds,
     ...optionalIdentities(data, [
       'operationId',
-      'capabilityLeaseId',
       'invocationId',
       'attemptId',
       'effectId',
     ]),
+    ...(data.capabilityLease != null
+      ? { capabilityLease: decodeLeaseRef(data.capabilityLease) }
+      : {}),
     resourceIds,
   };
 }
@@ -1159,7 +1170,7 @@ function decodeControlEpochAdvanced(
       'runId',
       'acceptedControlEpoch',
       'epochFactId',
-      'supersededGrantCount',
+      'supersededCapabilityCount',
       'cancellation',
       'commandBatchHighWater',
     ],
@@ -1172,9 +1183,9 @@ function decodeControlEpochAdvanced(
       'acceptedControlEpoch'
     ),
     epochFactId: identity(data.epochFactId, 'epochFactId'),
-    supersededGrantCount: nonNegativeInteger(
-      data.supersededGrantCount,
-      'supersededGrantCount'
+    supersededCapabilityCount: nonNegativeInteger(
+      data.supersededCapabilityCount,
+      'supersededCapabilityCount'
     ),
     cancellation: decodeControlCancellation(data.cancellation),
     commandBatchHighWater: nonNegativeInteger(

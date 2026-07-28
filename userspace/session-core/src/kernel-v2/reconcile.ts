@@ -3,9 +3,15 @@ import type {
   KernelFactProjectionV2,
 } from '@deepcode/protocol';
 import {
+  clearSessionCapabilityLeasesV2,
+  recordSessionCapabilityLeaseV2,
   reduceSessionKernelFactsV2,
   sessionKernelFactsCaughtUpV2,
 } from './lineage.js';
+import {
+  SESSION_KERNEL_FACT_KINDS_V2,
+  SESSION_KERNEL_INVOCATION_TERMINAL_FACT_KINDS_V2,
+} from './factKinds.js';
 import {
   requireSessionToolContextRefreshV2,
 } from './toolContext.js';
@@ -14,23 +20,14 @@ import {
   type SessionKernelLoopStateV2,
 } from './state.js';
 
-const INVOCATION_TERMINAL_FACTS = new Set([
-  'completed',
-  'failedBeforeEffect',
-  'cancelledBeforeEffect',
-  'timedOutBeforeEffect',
-  'failedAfterObservedEffect',
-  'indeterminate',
+const CAPABILITY_ALLOWED_FACTS = new Set<string>([
+  SESSION_KERNEL_FACT_KINDS_V2.authorization.capabilityIssued,
+  SESSION_KERNEL_FACT_KINDS_V2.authorization.expansionAllowed,
 ]);
 
-const CAPABILITY_ALLOWED_FACTS = new Set([
-  'capabilityIssued',
-  'expansionAllowed',
-]);
-
-const CAPABILITY_DENIED_FACTS = new Set([
-  'capabilityDenied',
-  'expansionDenied',
+const CAPABILITY_DENIED_FACTS = new Set<string>([
+  SESSION_KERNEL_FACT_KINDS_V2.authorization.capabilityDenied,
+  SESSION_KERNEL_FACT_KINDS_V2.authorization.expansionDenied,
 ]);
 
 export interface SessionKernelReconcileResultV2 {
@@ -58,12 +55,27 @@ export function reconcileSessionKernelFactsPageV2(
     recordTerminalLineage(next, fact);
     if (
       fact.domain === 'authorization'
-      && fact.factKind === 'contextInvalidated'
+      && fact.factKind
+        === SESSION_KERNEL_FACT_KINDS_V2.authorization.contextInvalidated
     ) {
       next.toolContext = requireSessionToolContextRefreshV2(
         next.toolContext,
         'kernelFact'
       );
+      next.lineage = clearSessionCapabilityLeasesV2(next.lineage);
+    }
+    if (
+      fact.domain === 'authorization'
+      && CAPABILITY_ALLOWED_FACTS.has(fact.factKind)
+      && fact.lineage.capabilityLease
+      && fact.lineage.operationId
+      && fact.lineage.planActionIds.length === 1
+    ) {
+      next.lineage = recordSessionCapabilityLeaseV2(next.lineage, {
+        operationId: fact.lineage.operationId,
+        planActionId: fact.lineage.planActionIds[0]!,
+        lease: fact.lineage.capabilityLease,
+      });
     }
   }
   next.kernelWakeHint = false;
@@ -84,7 +96,9 @@ export function operationTerminalFactsV2(
     (fact) =>
       fact.domain === 'invocation'
       && fact.lineage.operationId === operationId
-      && INVOCATION_TERMINAL_FACTS.has(fact.factKind)
+      && SESSION_KERNEL_INVOCATION_TERMINAL_FACT_KINDS_V2.has(
+        fact.factKind
+      )
   );
 }
 
@@ -116,7 +130,8 @@ function resolveActiveWait(
   let next = state;
   const indeterminate = facts.filter(
     (fact) =>
-      fact.factKind === 'indeterminate'
+      fact.factKind
+        === SESSION_KERNEL_FACT_KINDS_V2.invocation.indeterminate
       && Boolean(fact.lineage.operationId)
   );
   if (indeterminate.length > 0) {
@@ -150,7 +165,9 @@ function resolveActiveWait(
     (fact) =>
       fact.domain === 'invocation'
       && fact.lineage.invocationId === wait.invocationId
-      && INVOCATION_TERMINAL_FACTS.has(fact.factKind)
+      && SESSION_KERNEL_INVOCATION_TERMINAL_FACT_KINDS_V2.has(
+        fact.factKind
+      )
   );
   if (terminal) {
     next.activeWait = undefined;
@@ -200,7 +217,9 @@ function recordTerminalLineage(
   if (
     fact.domain !== 'invocation'
     || !fact.lineage.invocationId
-    || !INVOCATION_TERMINAL_FACTS.has(fact.factKind)
+    || !SESSION_KERNEL_INVOCATION_TERMINAL_FACT_KINDS_V2.has(
+      fact.factKind
+    )
   ) {
     return;
   }

@@ -63,7 +63,7 @@ export interface SessionKernelInvocationCancelRequestV2
   extends SessionKernelCommandRequestV2 {
   expectedControlEpoch: number;
   target: InvocationCancelTargetV2;
-  reasonCode: 'userRequested' | 'epochSuperseded' | 'runTerminated';
+  reasonCode: 'userRequested' | 'epochSuperseded';
   reason?: string;
 }
 

@@ -10,22 +10,19 @@ import type {
   SessionReviewFactRefV2,
   SessionReviewPlannedActionV2,
 } from './types.js';
+import {
+  SESSION_KERNEL_FACT_KINDS_V2,
+  SESSION_KERNEL_OBSERVED_EFFECT_FACT_KINDS_V2,
+} from './factKinds.js';
 
-const SCOPE_EXPANSION_FACTS = new Set([
-  'expansionAllowed',
-  'expansionDenied',
+const SCOPE_EXPANSION_FACTS = new Set<string>([
+  SESSION_KERNEL_FACT_KINDS_V2.authorization.expansionAllowed,
+  SESSION_KERNEL_FACT_KINDS_V2.authorization.expansionDenied,
 ]);
 
-const DENIAL_FACTS = new Set([
-  'capabilityDenied',
-  'expansionDenied',
-]);
-
-const OBSERVED_EFFECT_FACTS = new Set([
-  'observed',
-  'observedAfterCancel',
-  'observedAfterDeadline',
-  'observedAfterCancelAndDeadline',
+const DENIAL_FACTS = new Set<string>([
+  SESSION_KERNEL_FACT_KINDS_V2.authorization.capabilityDenied,
+  SESSION_KERNEL_FACT_KINDS_V2.authorization.expansionDenied,
 ]);
 
 /**
@@ -59,6 +56,16 @@ export function buildSessionKernelReviewV2(
     ...(state.plan?.planRevision
       ? { planRevision: state.plan.planRevision }
       : {}),
+    ...(state.plan
+      ? {
+          plan: {
+            title: state.plan.title,
+            objective: state.plan.objective,
+            narrative: state.plan.narrative,
+            recordedAt: state.plan.recordedAt,
+          },
+        }
+      : {}),
     snapshotHighWater,
     planned,
     scopeExpansions: selectFacts(
@@ -69,11 +76,14 @@ export function buildSessionKernelReviewV2(
       facts,
       (fact) =>
         fact.domain === 'effect'
-        && OBSERVED_EFFECT_FACTS.has(fact.factKind)
+        && SESSION_KERNEL_OBSERVED_EFFECT_FACT_KINDS_V2.has(
+          fact.factKind
+        )
     ),
     unexecuted: planned.filter(
       (action) =>
         planActionInvocationCount(state, action.planActionId) === 0
+        && !state.planActionSettlements[action.planActionId]
     ),
     denied: selectFacts(
       facts,
@@ -81,10 +91,27 @@ export function buildSessionKernelReviewV2(
         fact.domain === 'authorization'
         && DENIAL_FACTS.has(fact.factKind)
     ),
+    rejections: selectFacts(
+      facts,
+      (fact) =>
+        fact.factKind
+          === SESSION_KERNEL_FACT_KINDS_V2.invocation.rejected
+        || (
+          fact.domain === 'authorization'
+          && DENIAL_FACTS.has(fact.factKind)
+        )
+    ),
+    skipped: Object.values(state.planActionSettlements)
+      .sort((left, right) =>
+        left.recordedAt.localeCompare(right.recordedAt)
+        || left.planActionId.localeCompare(right.planActionId)
+      ),
     cleanup: selectFacts(facts, (fact) => fact.domain === 'cleanup'),
     indeterminate: selectFacts(
       facts,
-      (fact) => fact.factKind === 'indeterminate'
+      (fact) =>
+        fact.factKind
+        === SESSION_KERNEL_FACT_KINDS_V2.invocation.indeterminate
     ),
     createdAt,
   };
@@ -96,7 +123,11 @@ function isScopeExpansionFact(
 ): boolean {
   if (fact.domain !== 'authorization') return false;
   if (SCOPE_EXPANSION_FACTS.has(fact.factKind)) return true;
-  if (fact.factKind !== 'scopePreviewed' || !fact.lineage.operationId) {
+  if (
+    fact.factKind
+      !== SESSION_KERNEL_FACT_KINDS_V2.authorization.scopePreviewed
+    || !fact.lineage.operationId
+  ) {
     return false;
   }
   return facts.some(
@@ -105,8 +136,10 @@ function isScopeExpansionFact(
       && candidate.domain === 'authorization'
       && candidate.lineage.operationId === fact.lineage.operationId
       && (
-        candidate.factKind === 'capabilityIssued'
-        || candidate.factKind === 'expansionAllowed'
+        candidate.factKind
+          === SESSION_KERNEL_FACT_KINDS_V2.authorization.capabilityIssued
+        || candidate.factKind
+          === SESSION_KERNEL_FACT_KINDS_V2.authorization.expansionAllowed
       )
   );
 }
@@ -126,11 +159,18 @@ export function canFinalizeSessionKernelReviewV2(
     || state.activeWait
     || state.providerTurn?.status === 'active'
     || Object.keys(state.publicRequests).length > 0
+    || state.pendingGuidance.length > 0
   ) {
     return false;
   }
   const facts = orderedFacts(state);
-  if (facts.some((fact) => fact.factKind === 'indeterminate')) {
+  if (
+    facts.some(
+      (fact) =>
+        fact.factKind
+          === SESSION_KERNEL_FACT_KINDS_V2.invocation.indeterminate
+    )
+  ) {
     return false;
   }
   const deniedOperations = new Set(
@@ -144,6 +184,9 @@ export function canFinalizeSessionKernelReviewV2(
       .map((fact) => fact.lineage.operationId!)
   );
   const everyOperationSettled = state.plan.actions.every((action) => {
+    if (state.planActionSettlements[action.manifest.planActionId]) {
+      return true;
+    }
     const operationIds =
       planActionOperationIds(
         state,
@@ -237,7 +280,9 @@ function cleanupSettled(facts: KernelFactProjectionV2[]): boolean {
     }
   }
   return [...latestByResource.values()].every(
-    (fact) => fact.factKind === 'completed'
+    (fact) =>
+      fact.factKind
+        === SESSION_KERNEL_FACT_KINDS_V2.cleanup.completed
   );
 }
 
@@ -254,6 +299,11 @@ function toFactRef(fact: KernelFactProjectionV2): SessionReviewFactRefV2 {
     ledgerSequence: fact.ledgerSequence,
     domain: fact.domain,
     factKind: fact.factKind,
+    ...(fact.lineage.controlEpoch !== undefined
+      ? { controlEpoch: fact.lineage.controlEpoch }
+      : {}),
+    planActionIds: [...fact.lineage.planActionIds],
+    resourceIds: [...fact.lineage.resourceIds],
     ...(fact.lineage.operationId
       ? { operationId: fact.lineage.operationId }
       : {}),
@@ -261,7 +311,12 @@ function toFactRef(fact: KernelFactProjectionV2): SessionReviewFactRefV2 {
       ? { invocationId: fact.lineage.invocationId }
       : {}),
     ...(fact.lineage.effectId ? { effectId: fact.lineage.effectId } : {}),
+    details: cloneJson(fact.details),
   };
+}
+
+function cloneJson<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
 }
 
 function cloneReview(review: SessionKernelReviewV2): SessionKernelReviewV2 {

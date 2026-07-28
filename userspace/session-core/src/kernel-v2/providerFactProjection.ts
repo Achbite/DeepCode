@@ -5,21 +5,15 @@ import type {
   SessionProviderKernelFactsProjectionV2,
   SessionProviderTurnTargetV2,
 } from './types.js';
+import {
+  SESSION_KERNEL_INVOCATION_TERMINAL_FACT_KINDS_V2,
+} from './factKinds.js';
 
 export const SESSION_PROVIDER_FACTS_MAX_COUNT_V2 = 64;
 export const SESSION_PROVIDER_FACTS_MAX_UTF8_BYTES_V2 = 64 * 1024;
 
 const TARGET_HEAD_FACT_COUNT = 16;
 const ACTIVE_WAIT_HEAD_FACT_COUNT = 8;
-const INVOCATION_TERMINAL_FACTS = new Set([
-  'completed',
-  'failedBeforeEffect',
-  'cancelledBeforeEffect',
-  'timedOutBeforeEffect',
-  'failedAfterObservedEffect',
-  'indeterminate',
-]);
-
 /**
  * Builds a deterministic, bounded projection for model context only.
  * Selection never removes or mutates canonical facts held by Session and
@@ -95,7 +89,9 @@ const IMPORTANT_FACT_BUCKETS: ReadonlyArray<{
   {
     matches: (fact) =>
       fact.domain === 'invocation'
-      && INVOCATION_TERMINAL_FACTS.has(fact.factKind),
+      && SESSION_KERNEL_INVOCATION_TERMINAL_FACT_KINDS_V2.has(
+        fact.factKind
+      ),
   },
   { matches: (fact) => fact.domain === 'effect' },
   { matches: (fact) => fact.domain === 'cleanup' },
