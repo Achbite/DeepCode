@@ -152,20 +152,11 @@ pub(crate) fn normalize_restored_session(
 }
 
 fn summarize_session_projection(sessions_dir: &FsPath, session_id: &str) -> ProjectionSummary {
-    use std::io::BufRead as _;
-
-    let path = sessions_dir
-        .join(safe_path_segment(session_id))
-        .join("projection.jsonl");
-    let Ok(file) = fs::File::open(path) else {
-        return ProjectionSummary::default();
-    };
     let mut summary = ProjectionSummary::default();
-    let reader = std::io::BufReader::new(file);
-    for line in reader.lines().map_while(Result::ok) {
-        let Ok(event) = serde_json::from_str::<Value>(&line) else {
+    for event in read_session_projection_jsonl(sessions_dir, session_id) {
+        if is_legacy_raw_reasoning_projection_event(&event) {
             continue;
-        };
+        }
         summary.event_count += 1;
         let timestamp = event_timestamp(&event);
         if !timestamp.is_empty() {
@@ -272,13 +263,20 @@ pub(crate) fn append_conversation_archive_entries(
     debug_file_name: &str,
     entries: &[Value],
 ) -> std::io::Result<()> {
+    let _append_guard = conversation_archive_append_lock(archive_root, session_id)
+        .lock()
+        .expect("conversation archive append lock");
     let mut groups: HashMap<String, Vec<Value>> = HashMap::new();
     for entry in entries {
-        let run_id = extract_run_id(entry).unwrap_or_else(|| "session".to_string());
+        if is_hidden_reasoning_persistence_record(entry) {
+            continue;
+        }
+        let sanitized = strip_hidden_reasoning_fields(entry.clone());
+        let run_id = extract_run_id(&sanitized).unwrap_or_else(|| "session".to_string());
         groups
             .entry(run_id)
             .or_default()
-            .push(redact_archive_value(entry.clone()));
+            .push(redact_archive_value(sanitized));
     }
 
     for (run_id, grouped_entries) in groups {
@@ -295,6 +293,26 @@ pub(crate) fn append_conversation_archive_entries(
     }
     refresh_session_chronological_archive(archive_root, session_id, session)?;
     Ok(())
+}
+
+fn conversation_archive_append_lock(
+    archive_root: &FsPath,
+    session_id: &str,
+) -> &'static std::sync::Mutex<()> {
+    use std::hash::{Hash, Hasher};
+
+    const SHARD_COUNT: usize = 64;
+    static SHARDS: std::sync::OnceLock<Vec<std::sync::Mutex<()>>> = std::sync::OnceLock::new();
+    let shards = SHARDS.get_or_init(|| {
+        (0..SHARD_COUNT)
+            .map(|_| std::sync::Mutex::new(()))
+            .collect()
+    });
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    archive_root
+        .join(safe_path_segment(session_id))
+        .hash(&mut hasher);
+    &shards[(hasher.finish() as usize) % SHARD_COUNT]
 }
 
 fn refresh_conversation_archive(
@@ -569,6 +587,28 @@ fn collect_chronological_archive_entries(archive_root: &FsPath, session_id: &str
             })
     });
     entries
+}
+
+pub(crate) fn render_public_conversation_archive_file(
+    archive_root: &FsPath,
+    archive_dir: &FsPath,
+    session_id: &str,
+    run_id: &str,
+    relative_path: &str,
+) -> Option<String> {
+    match relative_path.replace('\\', "/").as_str() {
+        "exports/complete.md" => Some(conversation_complete_markdown(
+            session_id,
+            run_id,
+            &read_jsonl_file(&archive_dir.join("projection.jsonl")),
+            &read_jsonl_file(&archive_dir.join("transcript.jsonl")),
+        )),
+        "exports/chronological.md" => Some(conversation_chronological_markdown(
+            session_id,
+            &collect_chronological_archive_entries(archive_root, session_id),
+        )),
+        _ => None,
+    }
 }
 
 fn chronological_entry(source: &str, run_id: &str, order: u64, entry: Value) -> Value {

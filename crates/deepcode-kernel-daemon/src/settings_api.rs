@@ -1,5 +1,6 @@
 use crate::prelude::*;
 use crate::*;
+use deepcode_kernel_abi::LlmProviderDiagnostic;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
@@ -384,6 +385,10 @@ pub(crate) async fn llm_chat(
         Ok(body) => body,
         Err(rejection) => return json_body_rejection_response("/api/llm/chat", rejection),
     };
+    let request_id = match llm_request_id(&body) {
+        Ok(request_id) => request_id,
+        Err(message) => return ApiResponse::error("provider_request_identity_invalid", message),
+    };
     let profile_id = body
         .get("profileId")
         .and_then(Value::as_str)
@@ -396,6 +401,14 @@ pub(crate) async fn llm_chat(
         Ok(profile) => profile,
         Err(error) => return ApiResponse::error("llm_profile_error", error),
     };
+    if let Err(message) = validate_provider_identity_expectation(&profile, &body) {
+        return Json(ApiResponse {
+            ok: false,
+            data: Some(json!({ "requestId": request_id })),
+            error: Some("provider_profile_identity_invalid".to_string()),
+            message: Some(message),
+        });
+    }
     let messages = body
         .get("messages")
         .and_then(Value::as_array)
@@ -413,22 +426,47 @@ pub(crate) async fn llm_chat(
     }
     match call_llm_profile(&profile, request_envelope).await {
         Ok(output) => {
-            let mut payload = llm_output_payload(output);
+            let mut payload = llm_decoded_response_payload(output);
             payload["providerProfileId"] = json!(profile.id);
             payload["provider"] = json!(profile
                 .provider_flavor
                 .as_deref()
                 .unwrap_or(profile.kind.as_str()));
             payload["model"] = json!(profile.model);
+            payload["requestId"] = json!(request_id);
             ApiResponse::ok(payload)
         }
-        Err(error) => Json(ApiResponse {
-            ok: false,
-            data: Some(json!({ "providerError": error })),
-            error: Some("llm_chat_failed".to_string()),
-            message: Some(error.to_string()),
-        }),
+        Err(error) => {
+            let error_code = llm_provider_error_code(&error).to_string();
+            Json(ApiResponse {
+                ok: false,
+                data: Some(json!({
+                    "requestId": request_id,
+                    "providerError": error
+                })),
+                error: Some(error_code),
+                message: Some(error.to_string()),
+            })
+        }
     }
+}
+
+fn llm_provider_error_code(error: &LlmProviderDiagnostic) -> &str {
+    if error.reason == "provider_thinking_continuation_invalid" {
+        return error.reason.as_str();
+    }
+    if matches!(
+        error.reason.as_str(),
+        "ProviderTransportFailed" | "ProviderResponseReadFailed"
+    ) || error.status.is_some_and(retryable_provider_http_status)
+    {
+        return "provider_retryable_no_mutation";
+    }
+    "llm_chat_failed"
+}
+
+pub(crate) fn retryable_provider_http_status(status: u16) -> bool {
+    matches!(status, 408 | 425 | 429 | 500 | 502 | 503 | 504)
 }
 
 pub(crate) async fn llm_chat_stream(
@@ -450,6 +488,16 @@ pub(crate) async fn llm_chat_stream(
             }));
         }
     };
+    let request_id = match llm_request_id(&body) {
+        Ok(request_id) => request_id,
+        Err(message) => {
+            return llm_stream_error_response(json!({
+                "type": "provider_error",
+                "error": "provider_request_identity_invalid",
+                "message": message,
+            }));
+        }
+    };
     let profile_id = body
         .get("profileId")
         .and_then(Value::as_str)
@@ -463,10 +511,19 @@ pub(crate) async fn llm_chat_stream(
         Err(error) => {
             return llm_stream_error_response(json!({
                 "type": "provider_error",
+                "requestId": request_id,
                 "error": error,
             }));
         }
     };
+    if let Err(message) = validate_provider_identity_expectation(&profile, &body) {
+        return llm_stream_error_response(json!({
+            "type": "provider_error",
+            "requestId": request_id,
+            "error": "provider_profile_identity_invalid",
+            "message": message,
+        }));
+    }
     let messages = body
         .get("messages")
         .and_then(Value::as_array)
@@ -482,7 +539,16 @@ pub(crate) async fn llm_chat_stream(
     {
         request_envelope["responseFormat"] = response_format.clone();
     }
-    llm_stream_response(profile, request_envelope)
+    llm_stream_response(profile, request_envelope, request_id)
+}
+
+fn llm_request_id(body: &Value) -> Result<String, String> {
+    body.get("requestId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "requestId must be a non-empty string".to_string())
 }
 
 fn llm_stream_error_response(data: Value) -> Response {

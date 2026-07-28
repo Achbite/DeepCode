@@ -3,15 +3,19 @@ import type {
   ReviewExpectationDraft,
   ValidationExpectationDraft,
 } from '../protocol/types.js';
-import type { AcceptedTaskPlanContext } from './types.js';
+import {
+  acceptedPlanSettledTaskIds,
+  type AcceptedTaskPlanContext,
+} from './types.js';
 import { AcceptedTaskRegistry } from './AcceptedTaskRegistry.js';
 import { IntentSlotRegistry } from '../driver/execution/intentSlot.js';
+import { taskLedgerKernelCompletedTaskIds } from '../run-state/index.js';
 
 export interface DefaultActionBundleUserPlanMarkdownInput {
   goal?: string;
   actions: Record<string, unknown>[];
   existingUserPlan?: string;
-  outputLanguage?: string;
+  responseLanguage?: string;
 }
 
 export interface ExecutionPromptCoordinatorPorts<TPlan> {
@@ -42,13 +46,12 @@ export class ExecutionPromptCoordinator<TPlan> {
       payload.contentBlocks = [];
     }
     const existingUserPlan = this.ports.stringValue(payload.userPlan);
-    const outputLanguage = this.ports.stringValue(payload.outputLanguage);
     if (!this.ports.isDetailedUserPlanMarkdown(existingUserPlan)) {
       const generatedUserPlan = this.ports.defaultActionBundleUserPlanMarkdown({
         goal: this.ports.stringValue(bundle.goal),
         actions,
         existingUserPlan,
-        outputLanguage,
+        responseLanguage: proposal.responseLanguage,
       });
       payload.userPlan = generatedUserPlan;
     }
@@ -65,10 +68,7 @@ export class ExecutionPromptCoordinator<TPlan> {
     acceptedPlan: AcceptedTaskPlanContext,
     guidance?: string
   ): string {
-    const settled = new Set([
-      ...acceptedPlan.completedTaskIds,
-      ...(acceptedPlan.modelJudgedSufficientTaskIds ?? []),
-    ]);
+    const settled = new Set(acceptedPlanSettledTaskIds(acceptedPlan));
     const currentTask = acceptedPlan.tasks.find((task) => !settled.has(task.taskId));
     const registry = new AcceptedTaskRegistry(acceptedPlan);
     const taskLedger = registry.ledger();
@@ -88,12 +88,12 @@ export class ExecutionPromptCoordinator<TPlan> {
         ? `Current task: taskId=${currentTask.taskId}; title=${currentTask.title ?? 'untitled'}; targets=${currentTask.targets.length ? currentTask.targets.join(', ') : 'none'}; toolId=${currentTask.toolId ?? 'none'}.`
         : 'The current task list is complete or unavailable; Session must transition to Review instead of asking the model to invent another task directive.',
       promptFrame
-        ? `AcceptedPlanPromptFrame: stableFrameHash=${promptFrame.stableFrameHash.slice(0, 16)}; currentTask=${promptFrame.taskLedger.currentTaskId ?? 'none'}; completedTaskCount=${promptFrame.taskLedger.completedTaskIds.length}; remainingTaskCount=${promptFrame.taskLedger.pendingTaskIds.length + (promptFrame.taskLedger.currentTaskId ? 1 : 0)}; projectMemoryRefresh=${promptFrame.cachePolicy.projectMemoryRefresh}.`
+        ? `AcceptedPlanPromptFrame: stableFrameHash=${promptFrame.stableFrameHash.slice(0, 16)}; currentTask=${promptFrame.taskLedger.currentTaskId ?? 'none'}; settledTaskCount=${promptFrame.taskLedger.settledTaskIds.length}; remainingTaskCount=${promptFrame.taskLedger.pendingTaskIds.length + (promptFrame.taskLedger.currentTaskId ? 1 : 0)}; projectMemoryRefresh=${promptFrame.cachePolicy.projectMemoryRefresh}.`
         : '',
       'Use session.request_resources only when a missing concrete fact would change current-task content. For exact patches, use match text copied from ResourceEvidence.',
-      'If fresh, non-truncated evidence resolved for this task proves every acceptance criterion is already satisfied, call session.submit_task_outcome with outcome=alreadySatisfied and cite only the task-scoped evidence references supplied by Session.',
-      'If no action or alreadySatisfied outcome applies, use session.request_decision for a recoverable user choice or session.report_diagnostic for a terminal task failure.',
-      'Session advances the ordered task queue. Do not reconsider completed tasks or plan later-task scheduling.',
+      'Do not claim or submit task completion. Session settles tasks only from exact Kernel facts, an explicit user decision, or a registered deterministic validator.',
+      'If no action applies, use session.request_decision for a recoverable user choice or session.report_diagnostic for a terminal task failure.',
+      'Session advances the ordered task queue. Do not reconsider settled tasks or plan later-task scheduling.',
       guidance?.trim() ? `Additional guidance supplied when the user confirmed the plan:\n${guidance.trim()}` : '',
       `Accepted execution IntentSlot context:\n${fenced(JSON.stringify(providerContext, null, 2))}`,
     ].filter(Boolean).join('\n\n');
@@ -101,11 +101,8 @@ export class ExecutionPromptCoordinator<TPlan> {
 
   sanitizedContext(acceptedPlan: AcceptedTaskPlanContext | undefined): Record<string, unknown> {
     if (!acceptedPlan) return {};
-    const completed = new Set([
-      ...acceptedPlan.completedTaskIds,
-      ...(acceptedPlan.modelJudgedSufficientTaskIds ?? []),
-    ]);
-    const currentTask = acceptedPlan.tasks.find((task) => !completed.has(task.taskId));
+    const settled = new Set(acceptedPlanSettledTaskIds(acceptedPlan));
+    const currentTask = acceptedPlan.tasks.find((task) => !settled.has(task.taskId));
     const intentSlots = this.intentSlots.currentTaskSlots(acceptedPlan);
     return {
       planId: acceptedPlan.planId,
@@ -117,8 +114,11 @@ export class ExecutionPromptCoordinator<TPlan> {
           targets: currentTask.targets,
         }
         : undefined,
-      completedTaskCount: completed.size,
-      remainingTaskCount: acceptedPlan.tasks.filter((task) => !completed.has(task.taskId)).length,
+      kernelCompletedTaskCount: taskLedgerKernelCompletedTaskIds(
+        acceptedPlan.taskLedger
+      ).length,
+      settledTaskCount: settled.size,
+      remainingTaskCount: acceptedPlan.tasks.filter((task) => !settled.has(task.taskId)).length,
       intentSlots,
     };
   }

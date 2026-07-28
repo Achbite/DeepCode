@@ -1,7 +1,7 @@
 use deepcode_kernel_client::{
     terminal_workspace_scope, AgentRunResult, CreateAgentSessionRequest, HttpKernelClient,
-    KernelBootstrap, KernelBootstrapOptions, ListAgentSessionsRequest, PermissionDecision,
-    StartAgentRunRequest, TerminalWorkspaceScope,
+    KernelBootstrap, KernelBootstrapOptions, ListAgentSessionsRequest, StartAgentRunRequest,
+    ResolveSessionGoalInteractionRequest, StartSessionGoalRequest, TerminalWorkspaceScope,
 };
 use serde_json::Value;
 use std::env;
@@ -128,9 +128,10 @@ pub(crate) async fn run(command: Command) -> Result<(), String> {
             no_auto_start_kernel,
             permission_id,
             decision,
+            host,
         } => {
             let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
-            resolve_permission(bootstrap.client(), &permission_id, decision).await
+            resolve_permission(bootstrap.client(), &permission_id, &decision, host).await
         }
         Command::Decision {
             api,
@@ -153,6 +154,60 @@ pub(crate) async fn run(command: Command) -> Result<(), String> {
                 host,
             )
             .await
+        }
+        Command::GoalStart {
+            api,
+            no_auto_start_kernel,
+            objective,
+            host,
+        } => {
+            let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
+            start_goal(bootstrap.client(), objective, host).await
+        }
+        Command::GoalShow {
+            api,
+            no_auto_start_kernel,
+            goal_id,
+            host,
+        } => {
+            let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
+            show_goal(bootstrap.client(), goal_id, host).await
+        }
+        Command::GoalStep {
+            api,
+            no_auto_start_kernel,
+            goal_id,
+            host,
+        } => {
+            let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
+            step_goal(bootstrap.client(), goal_id, host).await
+        }
+        Command::GoalRun {
+            api,
+            no_auto_start_kernel,
+            goal_id,
+            host,
+        } => {
+            let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
+            run_goal(bootstrap.client(), goal_id, host).await
+        }
+        Command::GoalResume {
+            api,
+            no_auto_start_kernel,
+            goal_id,
+            host,
+        } => {
+            let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
+            resume_goal(bootstrap.client(), goal_id, host).await
+        }
+        Command::GoalCancel {
+            api,
+            no_auto_start_kernel,
+            goal_id,
+            host,
+        } => {
+            let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
+            cancel_goal(bootstrap.client(), goal_id, host).await
         }
         Command::Ask {
             api,
@@ -256,7 +311,8 @@ enum Command {
         api: Option<String>,
         no_auto_start_kernel: bool,
         permission_id: String,
-        decision: PermissionDecision,
+        decision: String,
+        host: SessionHostOptions,
     },
     Decision {
         api: Option<String>,
@@ -266,6 +322,42 @@ enum Command {
         run_id: Option<String>,
         target_id: Option<String>,
         guidance: Option<String>,
+        host: SessionHostOptions,
+    },
+    GoalStart {
+        api: Option<String>,
+        no_auto_start_kernel: bool,
+        objective: String,
+        host: SessionHostOptions,
+    },
+    GoalShow {
+        api: Option<String>,
+        no_auto_start_kernel: bool,
+        goal_id: Option<String>,
+        host: SessionHostOptions,
+    },
+    GoalStep {
+        api: Option<String>,
+        no_auto_start_kernel: bool,
+        goal_id: Option<String>,
+        host: SessionHostOptions,
+    },
+    GoalRun {
+        api: Option<String>,
+        no_auto_start_kernel: bool,
+        goal_id: Option<String>,
+        host: SessionHostOptions,
+    },
+    GoalResume {
+        api: Option<String>,
+        no_auto_start_kernel: bool,
+        goal_id: Option<String>,
+        host: SessionHostOptions,
+    },
+    GoalCancel {
+        api: Option<String>,
+        no_auto_start_kernel: bool,
+        goal_id: Option<String>,
         host: SessionHostOptions,
     },
     Ask {
@@ -452,6 +544,90 @@ impl Command {
                 session_id: Some(session_id.to_string()),
                 host,
             }),
+            [goal, start, objective @ ..]
+                if goal == "goal" && start == "start" && !objective.is_empty() =>
+            {
+                Ok(Command::GoalStart {
+                    api,
+                    no_auto_start_kernel,
+                    objective: objective.join(" "),
+                    host,
+                })
+            }
+            [goal, show] if goal == "goal" && show == "show" => Ok(Command::GoalShow {
+                api,
+                no_auto_start_kernel,
+                goal_id: None,
+                host,
+            }),
+            [goal, show, goal_id] if goal == "goal" && show == "show" => {
+                Ok(Command::GoalShow {
+                    api,
+                    no_auto_start_kernel,
+                    goal_id: Some(goal_id.to_string()),
+                    host,
+                })
+            }
+            [goal, action] if goal == "goal" && action == "step" => Ok(Command::GoalStep {
+                api,
+                no_auto_start_kernel,
+                goal_id: None,
+                host,
+            }),
+            [goal, action, goal_id] if goal == "goal" && action == "step" => {
+                Ok(Command::GoalStep {
+                    api,
+                    no_auto_start_kernel,
+                    goal_id: Some(goal_id.to_string()),
+                    host,
+                })
+            }
+            [goal, action] if goal == "goal" && action == "run" => Ok(Command::GoalRun {
+                api,
+                no_auto_start_kernel,
+                goal_id: None,
+                host,
+            }),
+            [goal, action, goal_id] if goal == "goal" && action == "run" => {
+                Ok(Command::GoalRun {
+                    api,
+                    no_auto_start_kernel,
+                    goal_id: Some(goal_id.to_string()),
+                    host,
+                })
+            }
+            [goal, action] if goal == "goal" && action == "resume" => {
+                Ok(Command::GoalResume {
+                    api,
+                    no_auto_start_kernel,
+                    goal_id: None,
+                    host,
+                })
+            }
+            [goal, action, goal_id] if goal == "goal" && action == "resume" => {
+                Ok(Command::GoalResume {
+                    api,
+                    no_auto_start_kernel,
+                    goal_id: Some(goal_id.to_string()),
+                    host,
+                })
+            }
+            [goal, action] if goal == "goal" && action == "cancel" => {
+                Ok(Command::GoalCancel {
+                    api,
+                    no_auto_start_kernel,
+                    goal_id: None,
+                    host,
+                })
+            }
+            [goal, action, goal_id] if goal == "goal" && action == "cancel" => {
+                Ok(Command::GoalCancel {
+                    api,
+                    no_auto_start_kernel,
+                    goal_id: Some(goal_id.to_string()),
+                    host,
+                })
+            }
             [permission, allow, permission_id]
                 if permission == "permission" && allow == "allow" =>
             {
@@ -459,7 +635,8 @@ impl Command {
                     api,
                     no_auto_start_kernel,
                     permission_id: permission_id.to_string(),
-                    decision: PermissionDecision::Allow,
+                    decision: "accept".to_string(),
+                    host,
                 })
             }
             [permission, deny, permission_id] if permission == "permission" && deny == "deny" => {
@@ -467,7 +644,8 @@ impl Command {
                     api,
                     no_auto_start_kernel,
                     permission_id: permission_id.to_string(),
-                    decision: PermissionDecision::Deny,
+                    decision: "reject".to_string(),
+                    host,
                 })
             }
             [decision_cmd, kind, decision, tail @ ..] if decision_cmd == "decision" => {
@@ -490,8 +668,13 @@ impl Command {
                 })
             }
             [kind, decision, tail @ ..]
-                if matches!(kind.as_str(), "requirement" | "plan" | "review")
-                    && matches!(decision.as_str(), "accept" | "reject" | "revise") =>
+                if matches!(
+                    (kind.as_str(), decision.as_str()),
+                    (
+                        "requirement" | "plan" | "review",
+                        "accept" | "reject" | "revise"
+                    ) | ("permission", "accept" | "reject")
+                ) =>
             {
                 let run_id = tail.first().cloned();
                 let target_id = tail.get(1).cloned();
@@ -560,7 +743,10 @@ pub(crate) struct SessionHostOptions {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PendingSessionDecision {
     pub(crate) run_id: String,
-    pub(crate) target_id: Option<String>,
+    pub(crate) target_id: String,
+    pub(crate) interaction_id: String,
+    pub(crate) interaction_revision: String,
+    pub(crate) review_id: Option<String>,
 }
 
 mod render;

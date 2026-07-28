@@ -121,11 +121,11 @@ function parseTaskLocalCompactRecord(value: unknown): ContextAssemblyTaskLocalCo
 }
 
 function isCompactSource(value: string | undefined): value is ContextAssemblyTaskLocalCompactSource {
-  return value === 'kernelBatchCheckpoint' || value === 'modelTaskOutcome' || value === 'resourceValidation';
+  return value === 'kernelBatchCheckpoint';
 }
 
 function isCompactStatus(value: string | undefined): value is ContextAssemblyTaskLocalCompactStatus {
-  return value === 'completedByKernelFacts' || value === 'modelJudgedSufficient' || value === 'completedByReadOnlyEvidence';
+  return value === 'completedByKernelFacts';
 }
 
 function objectRecord(value: unknown): Record<string, unknown> | undefined {

@@ -18,6 +18,10 @@ import {
   type SessionLoopControlResult,
 } from '../runContinuation.js';
 import type { InterventionLevel, ReviewContinuationMode } from '../types.js';
+import {
+  conversationPresentationLanguageBindingFromEvents,
+  type ConversationPresentationLanguage,
+} from '../projection/conversationPresentationLanguage.js';
 import { assertKernelReplyOk, kernelReplyErrorMessage } from './kernelReplyGuard.js';
 import type { KernelReplyObservation } from './kernelEventStatusIndex.js';
 
@@ -50,7 +54,11 @@ export interface AcceptedActionBundlePlanExecutorPorts {
   append(sessionId: string, events: AgentEvent[]): Promise<AgentSessionResult>;
   kernel(request: KernelCommandEnvelope): Promise<KernelReply>;
   observeKernel(request: KernelCommandEnvelope): Promise<KernelReplyObservation>;
-  appendProjectedKernelEvents(sessionId: string, reply: KernelReply): Promise<AgentSessionResult | undefined>;
+  appendProjectedKernelEvents(
+    sessionId: string,
+    reply: KernelReply,
+    language: ConversationPresentationLanguage
+  ): Promise<AgentSessionResult | undefined>;
   kernelExecutionContractId(report?: Record<string, unknown>): string | undefined;
   kernelExecutionContractHash(report?: Record<string, unknown>): string | undefined;
   recentResourcePackets(events: AgentEvent[]): ResourcePacket[];
@@ -60,7 +68,8 @@ export interface AcceptedActionBundlePlanExecutorPorts {
     plan: PlanContext,
     batch: KernelActionBatchV1,
     ts: string,
-    id: string
+    id: string,
+    language: ConversationPresentationLanguage
   ): AgentEvent;
   planActionBundleExecutionFailureEvents(
     sessionId: string,
@@ -68,7 +77,8 @@ export interface AcceptedActionBundlePlanExecutorPorts {
     batchEvents: unknown[],
     batch: KernelActionBatchV1,
     ts: string,
-    id: string
+    id: string,
+    language: ConversationPresentationLanguage
   ): AgentEvent[];
   planActionBundleExecutionExceptionEvents(
     sessionId: string,
@@ -76,7 +86,8 @@ export interface AcceptedActionBundlePlanExecutorPorts {
     message: string,
     code: string,
     ts: string,
-    id: string
+    id: string,
+    language: ConversationPresentationLanguage
   ): AgentEvent[];
   acceptedPlanBatchCheckpointEvent(
     sessionId: string,
@@ -86,7 +97,8 @@ export interface AcceptedActionBundlePlanExecutorPorts {
     kernelEvents: unknown[],
     progress: unknown,
     ts: string,
-    id: string
+    id: string,
+    language: ConversationPresentationLanguage
   ): AgentEvent;
   acceptedPlanTaskSavepointEvent(
     sessionId: string,
@@ -98,16 +110,16 @@ export interface AcceptedActionBundlePlanExecutorPorts {
     cursor: unknown,
     context: unknown,
     ts: string,
-    id: string
+    id: string,
+    language: ConversationPresentationLanguage
   ): AgentEvent;
   planProposal(plan: PlanContext): ProposalEnvelope;
   recordKernelBatchProgress(input: {
     acceptedPlan: AcceptedTaskPlanContext;
     proposal: ProposalEnvelope;
-    kernelEvents: unknown[];
+    kernelEvents: AgentEvent[];
   }): {
     progress: AcceptedPlanBatchProgress;
-    completedTaskIds: string[];
     nextAcceptedPlan: AcceptedTaskPlanContext;
   };
   runtimeSnapshot(input: {
@@ -131,6 +143,11 @@ export class AcceptedActionBundlePlanExecutor {
     acceptedOverlay?: AcceptedActionBundlePlanOverlay
   ): Promise<SessionLoopControlResult> {
     let result = initialResult;
+    const presentationBinding = conversationPresentationLanguageBindingFromEvents(
+      initialResult.events,
+      plan.runId
+    );
+    const presentationLanguage = presentationBinding.language;
     try {
       result = await this.ports.append(input.sessionId, [
         this.ports.sessionRunStateEvent({
@@ -166,7 +183,8 @@ export class AcceptedActionBundlePlanExecutor {
           plan,
           batch,
           this.ports.now(),
-          this.ports.createId('accepted-action-plan-preflight')
+          this.ports.createId('accepted-action-plan-preflight'),
+          presentationLanguage
         ),
       ]) ?? result;
 
@@ -188,7 +206,13 @@ export class AcceptedActionBundlePlanExecutor {
         },
       });
       const batchReply = observed.reply;
-      result = await this.ports.appendProjectedKernelEvents(input.sessionId, batchReply) ?? result;
+      const projectionStart = result.events.length;
+      result = await this.ports.appendProjectedKernelEvents(
+        input.sessionId,
+        batchReply,
+        presentationLanguage
+      ) ?? result;
+      const projectedKernelEvents = result.events.slice(projectionStart);
       const batchEvents = batchReply.events ?? [];
       if (observed.kind === 'commandFailed') {
         throw new AcceptedActionBundlePlanExecutionError(
@@ -203,7 +227,8 @@ export class AcceptedActionBundlePlanExecutor {
           batchEvents,
           batch,
           this.ports.now(),
-          this.ports.createId('accepted-action-plan-batch-failed')
+          this.ports.createId('accepted-action-plan-batch-failed'),
+          presentationLanguage
         )) ?? result);
       }
       if (observed.kind === 'permissionInterrupted') {
@@ -236,7 +261,7 @@ export class AcceptedActionBundlePlanExecutor {
         const ledgerEffect = this.ports.recordKernelBatchProgress({
           acceptedPlan: acceptedOverlay.acceptedPlan,
           proposal: progressProposal,
-          kernelEvents: batchEvents,
+          kernelEvents: projectedKernelEvents,
         });
         const progress = ledgerEffect.progress;
         const nextAccepted = ledgerEffect.nextAcceptedPlan;
@@ -254,7 +279,8 @@ export class AcceptedActionBundlePlanExecutor {
             batchEvents,
             progress,
             this.ports.now(),
-            this.ports.createId('accepted-plan-overlay-batch-checkpoint')
+            this.ports.createId('accepted-plan-overlay-batch-checkpoint'),
+            presentationLanguage
           ),
           this.ports.acceptedPlanTaskSavepointEvent(
             input.sessionId,
@@ -266,7 +292,8 @@ export class AcceptedActionBundlePlanExecutor {
             runtime.taskExecutionCursor,
             runtime.currentTaskContext,
             this.ports.now(),
-            savepointId
+            savepointId,
+            presentationLanguage
           ),
         ]) ?? result;
         if (!this.ports.acceptedPlanComplete(nextAccepted)) {
@@ -299,6 +326,7 @@ export class AcceptedActionBundlePlanExecutor {
           result,
           currentKernelEvents: batchEvents,
           requestIdPrefix: 'review-facts-get',
+          presentationBinding,
           interactionOverlay: plan.interactionOverlay ?? input.interactionOverlay,
           assertFactsReplyOk: {
             code: 'accepted_plan_review_facts_failed',
@@ -318,7 +346,8 @@ export class AcceptedActionBundlePlanExecutor {
         message,
         code,
         this.ports.now(),
-        this.ports.createId('accepted-action-plan-execution-failed')
+        this.ports.createId('accepted-action-plan-execution-failed'),
+        presentationLanguage
       )) ?? result);
     }
   }

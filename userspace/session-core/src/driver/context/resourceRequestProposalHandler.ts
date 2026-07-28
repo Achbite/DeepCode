@@ -15,13 +15,20 @@ import { IntentSlotRegistry } from '../execution/intentSlot.js';
 import type { SessionDriverTaskResourceProgress } from '../runFrame.js';
 import type { AssistantDiagnosticInfo } from '../projection/assistantProjectionBuilder.js';
 import {
+  conversationPresentationLanguageBinding,
+  localizedProjectionText,
+  type ConversationPresentationLanguageState,
+  type ProjectionLanguageBinding,
+} from '../projection/index.js';
+import {
   normalizeProposalRouterResult,
   type ProposalRouterResult,
 } from '../proposal/proposalRouter.js';
 import { SessionDriverRepairRuntimeAccessor } from '../runFrame.js';
 import type { ResourcePacketAppendResult } from './resourceOrchestrator.js';
+import type { ResourcePacketActivityIdentity } from './resourceRequestLoop.js';
 
-export interface ResourceRequestProposalHandlerState {
+export interface ResourceRequestProposalHandlerState extends ConversationPresentationLanguageState {
   sessionId: string;
   runId: string;
   workspaceScopeKey: string;
@@ -64,12 +71,14 @@ export interface ResourceRequestProposalHandlerPorts<
   recordAndAppend(
     state: State,
     packet: ResourcePacket,
-    eventIdPrefix: string
+    eventIdPrefix: string,
+    activityIdentity: ResourcePacketActivityIdentity
   ): Promise<ResourcePacketAppendResult>;
   resolveRecordAndAppend(
     state: State,
     manifest: ResourceManifest,
-    eventIdPrefix: string
+    eventIdPrefix: string,
+    activityIdentity: ResourcePacketActivityIdentity
   ): Promise<ResourcePacketAppendResult>;
   resolveResourceRequest(
     manifest: ResourceManifest,
@@ -80,7 +89,8 @@ export interface ResourceRequestProposalHandlerPorts<
     sessionId: string,
     content: string | AssistantDiagnosticInfo,
     ts: string,
-    id: string
+    id: string,
+    presentationBinding: ProjectionLanguageBinding
   ): AgentEvent;
   internalFailureEvents(
     state: State,
@@ -89,12 +99,24 @@ export interface ResourceRequestProposalHandlerPorts<
     message: string,
     id: string
   ): AgentEvent[];
-  resourceResolutionDiagnostic(resolution: ResourceRequestResolution): AssistantDiagnosticInfo;
+  resourceResolutionDiagnostic(
+    state: State,
+    resolution: ResourceRequestResolution
+  ): AssistantDiagnosticInfo;
   completeResourceSemanticExchange(
     state: State,
     proposal: ProposalEnvelope,
     packets: readonly ResourcePacket[],
     issues?: readonly ResourceResolutionIssue[]
+  ): Promise<void>;
+  beginResourceSemanticEffect(
+    state: State,
+    proposal: ProposalEnvelope
+  ): Promise<ResourcePacketActivityIdentity>;
+  failResourceSemanticExchange(
+    state: State,
+    proposal: ProposalEnvelope,
+    error: unknown
   ): Promise<void>;
   refreshTaskRuntimeState(state: State): void;
   acceptedPlanResourceResumeEvent(state: State, packet: ResourcePacket, ts: string, id: string): AgentEvent;
@@ -122,17 +144,45 @@ export class ResourceRequestProposalHandler<
   async handle(
     handlerInput: ResourceRequestProposalHandlerInput<Input, State>
   ): Promise<ResourceRequestProposalHandlerResult> {
+    try {
+      return await this.handleAdmitted(handlerInput);
+    } catch (error) {
+      await this.ports.failResourceSemanticExchange(
+        handlerInput.state,
+        handlerInput.proposal,
+        error
+      );
+      throw error;
+    }
+  }
+
+  private async handleAdmitted(
+    handlerInput: ResourceRequestProposalHandlerInput<Input, State>
+  ): Promise<ResourceRequestProposalHandlerResult> {
     const { state, proposal } = handlerInput;
     let lastResult = handlerInput.lastResult;
     const taskId = this.intentSlots.currentTaskId(state.acceptedTaskPlan);
     const request = proposal.payload as ResourceRequestDraft;
     const requestSignature = resourceRequestSignature(request);
     const resolvedPackets: ResourcePacket[] = [];
+    let activityIdentity: ResourcePacketActivityIdentity | undefined;
+    const beginResourceActivity = async (): Promise<ResourcePacketActivityIdentity> => {
+      activityIdentity ??= await this.ports.beginResourceSemanticEffect(state, proposal);
+      return activityIdentity;
+    };
     const progressByTask = state.resourceRequestProgressByTask ?? new Map<string, SessionDriverTaskResourceProgress>();
     state.resourceRequestProgressByTask = progressByTask;
     const taskProgress = taskId ? taskResourceProgress(progressByTask, taskId) : undefined;
     if (taskId && taskProgress?.signatures.includes(requestSignature)) {
       if (taskProgress.noProgressCount >= 1) {
+        const noProgressMessage = localizedProjectionText(
+          conversationPresentationLanguageBinding(state).language,
+          {
+            zh: `模型在一次受控重定向后仍重复请求任务 ${taskId} 已解析的资源；Session 已停止该轮资源循环。`,
+            en: `The provider repeated an already resolved resource request for task ${taskId} after one controlled redirect; Session stopped this resource loop.`,
+            neutral: `resource_resolution=no_progress; taskId=${taskId}`,
+          }
+        );
         await this.ports.completeResourceSemanticExchange(state, proposal, resolvedPackets, [{
           requestItemId: request.id,
           reason: 'session_resource_no_progress',
@@ -143,7 +193,7 @@ export class ResourceRequestProposalHandler<
             state,
             'resource_resolution',
             'session_resource_no_progress',
-            `The provider repeated an already resolved resource request for task ${taskId} after one controlled redirect.`,
+            noProgressMessage,
             this.ports.createId('resource-no-progress')
           )),
         };
@@ -168,10 +218,12 @@ export class ResourceRequestProposalHandler<
     );
     if (generated.packet) {
       resolvedPackets.push(generated.packet);
+      const activity = await beginResourceActivity();
       lastResult = (await this.ports.recordAndAppend(
         state,
         generated.packet,
-        'generated-artifact-resource-context'
+        'generated-artifact-resource-context',
+        activity
       )).result;
       if (!generated.remaining.items.length) {
         if (taskProgress && generated.packet) recordTaskResourceProgress(taskProgress, requestSignature, generated.packet.id);
@@ -194,6 +246,7 @@ export class ResourceRequestProposalHandler<
         requestItemId: request.id,
         reason: 'project_root_required',
       }]);
+      const presentationBinding = conversationPresentationLanguageBinding(state);
       return {
         kind: 'return',
         result: await this.ports.append(state.sessionId, [
@@ -201,11 +254,16 @@ export class ResourceRequestProposalHandler<
             state.sessionId,
             {
               code: 'project_root_required',
-              fallback: 'This project is not bound to a directory. Bind a project directory before requesting files or workspace actions.',
+              fallback: localizedProjectionText(presentationBinding.language, {
+                zh: '当前项目尚未绑定目录。请先绑定项目目录，再请求文件或工作区操作。',
+                en: 'This project is not bound to a directory. Bind a project directory before requesting files or workspace actions.',
+                neutral: 'project_root_required',
+              }),
               params: { projectId: state.manifest.projectId },
             },
             this.ports.now(),
-            this.ports.createId('project-root-required')
+            this.ports.createId('project-root-required'),
+            presentationBinding
           ),
         ]),
       };
@@ -238,16 +296,18 @@ export class ResourceRequestProposalHandler<
           state,
           'resource_resolution',
           'resource_request_invalid',
-          this.ports.resourceResolutionDiagnostic(subset).fallback,
+          this.ports.resourceResolutionDiagnostic(state, subset).fallback,
           this.ports.createId('resource-invalid')
         )),
       };
     }
 
+    const activity = await beginResourceActivity();
     const resourceAppend = await this.ports.resolveRecordAndAppend(
       state,
       subset.manifest,
-      'resource-context'
+      'resource-context',
+      activity
     );
     const packet = resourceAppend.packet;
     resolvedPackets.push(packet);

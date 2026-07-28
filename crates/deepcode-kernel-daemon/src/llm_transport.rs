@@ -42,7 +42,21 @@ pub(crate) struct LlmChatOutput {
     pub(crate) usage: Option<Value>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct LlmChatDecodedResponse {
+    pub(crate) output: LlmChatOutput,
+    pub(crate) raw_provider: Option<Value>,
+}
+
 const OPENAI_COMPATIBLE_MAX_OUTPUT_TOKENS_CAP: u32 = 16_384;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProviderThinkingCompatibility {
+    DeepSeek,
+    GlmDeferred,
+    KimiDeferred,
+    Generic,
+}
 
 pub(crate) fn llm_profile_is_enabled(config: &Value, profile_id: &str) -> bool {
     config
@@ -177,10 +191,67 @@ pub(crate) fn resolve_llm_profile(
     })
 }
 
+pub(crate) fn validate_provider_identity_expectation(
+    profile: &ResolvedLlmProfile,
+    request: &Value,
+) -> Result<(), String> {
+    let Some(expectation) = request
+        .get("providerOptions")
+        .or_else(|| request.get("provider_options"))
+        .and_then(|options| options.get("deepcode"))
+        .and_then(|deepcode| {
+            deepcode
+                .get("expectedProviderIdentity")
+                .or_else(|| deepcode.get("expected_provider_identity"))
+        })
+    else {
+        return Ok(());
+    };
+    let expectation = expectation
+        .as_object()
+        .ok_or_else(|| "DeepCode expected Provider identity must be an object.".to_string())?;
+    let expected_profile_id =
+        required_provider_identity_field(expectation, "profileId", "profile_id")?;
+    let expected_provider = required_provider_identity_field(expectation, "provider", "provider")?;
+    let expected_model = required_provider_identity_field(expectation, "model", "model")?;
+    let actual_provider = profile
+        .provider_flavor
+        .as_deref()
+        .unwrap_or(profile.kind.as_str());
+    for (name, expected, actual) in [
+        ("profileId", expected_profile_id, profile.id.as_str()),
+        ("provider", expected_provider, actual_provider),
+        ("model", expected_model, profile.model.as_str()),
+    ] {
+        if expected != actual {
+            return Err(format!(
+                "Active Provider continuation expected {name} `{expected}` but Daemon resolved `{actual}`."
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn required_provider_identity_field<'a>(
+    expectation: &'a serde_json::Map<String, Value>,
+    camel_case: &str,
+    snake_case: &str,
+) -> Result<&'a str, String> {
+    expectation
+        .get(camel_case)
+        .or_else(|| expectation.get(snake_case))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            format!("DeepCode expected Provider identity requires non-empty `{camel_case}`.")
+        })
+}
+
 pub(crate) async fn call_llm_profile(
     profile: &ResolvedLlmProfile,
     request_envelope: Value,
-) -> Result<LlmChatOutput, LlmProviderDiagnostic> {
+) -> Result<LlmChatDecodedResponse, LlmProviderDiagnostic> {
     let messages = request_envelope
         .get("messages")
         .and_then(Value::as_array)
@@ -217,7 +288,7 @@ pub(crate) async fn call_openai_compatible_profile(
     messages: Vec<Value>,
     tools: Vec<LlmToolDefinition>,
     response_format: Option<&Value>,
-) -> Result<LlmChatOutput, LlmProviderDiagnostic> {
+) -> Result<LlmChatDecodedResponse, LlmProviderDiagnostic> {
     let api_key = profile.api_key.as_deref().ok_or_else(|| {
         provider_local_error(
             profile,
@@ -225,6 +296,15 @@ pub(crate) async fn call_openai_compatible_profile(
             "ProviderProfileMissingApiKey",
             LlmProviderErrorLayer::Transport,
             format!("LLM profile `{}` has no API key", profile.name),
+        )
+    })?;
+    validate_provider_thinking_continuation(profile, &messages).map_err(|message| {
+        provider_local_error(
+            profile,
+            "openaiCompatible",
+            "provider_thinking_continuation_invalid",
+            LlmProviderErrorLayer::SchemaDecode,
+            message,
         )
     })?;
     let url = normalize_openai_base_url(profile);
@@ -261,7 +341,10 @@ pub(crate) async fn call_openai_compatible_profile(
     })?;
     let mut output = parse_openai_message(choice);
     output.usage = response.value.get("usage").cloned();
-    Ok(output)
+    Ok(LlmChatDecodedResponse {
+        output,
+        raw_provider: Some(response.value.clone()),
+    })
 }
 
 pub(crate) fn openai_compatible_request_body(
@@ -271,15 +354,16 @@ pub(crate) fn openai_compatible_request_body(
     response_format: Option<&Value>,
     stream: bool,
 ) -> Value {
+    let thinking_compatibility = provider_thinking_compatibility(profile);
     let mut body = json!({
         "model": profile.model,
-        "messages": openai_compatible_messages(messages),
+        "messages": openai_compatible_messages(messages, thinking_compatibility),
         "stream": stream
     });
     if let Some(tokens) = effective_openai_compatible_max_tokens(profile) {
         body["max_tokens"] = json!(tokens);
     }
-    if should_send_sampling(profile) {
+    if should_send_sampling(thinking_compatibility) {
         if let Some(temperature) = profile.temperature {
             body["temperature"] = json!(temperature);
         }
@@ -293,13 +377,16 @@ pub(crate) fn openai_compatible_request_body(
     if response_format_is_json_object(response_format) {
         body["response_format"] = json!({ "type": "json_object" });
     }
-    if is_deepseek_profile(profile) {
+    if thinking_compatibility == ProviderThinkingCompatibility::DeepSeek {
         body["user_id"] = json!("deepcode_local");
         if stream {
             body["stream_options"] = json!({ "include_usage": true });
         }
     }
-    if is_zhipu_profile(profile) && stream && !tools.is_empty() {
+    if thinking_compatibility == ProviderThinkingCompatibility::GlmDeferred
+        && stream
+        && !tools.is_empty()
+    {
         body["tool_stream"] = json!(true);
     }
     if !tools.is_empty() {
@@ -318,20 +405,26 @@ pub(crate) fn openai_compatible_request_body(
     body
 }
 
-fn openai_compatible_messages(messages: Vec<Value>) -> Vec<Value> {
+fn openai_compatible_messages(
+    messages: Vec<Value>,
+    thinking_compatibility: ProviderThinkingCompatibility,
+) -> Vec<Value> {
     messages
         .into_iter()
-        .map(openai_compatible_message)
+        .map(|message| openai_compatible_message(message, thinking_compatibility))
         .collect()
 }
 
-fn openai_compatible_message(message: Value) -> Value {
+fn openai_compatible_message(
+    message: Value,
+    thinking_compatibility: ProviderThinkingCompatibility,
+) -> Value {
     let Some(record) = message.as_object() else {
         return message;
     };
     let role = record.get("role").and_then(Value::as_str).unwrap_or("user");
     match role {
-        "assistant" => openai_compatible_assistant_message(record),
+        "assistant" => openai_compatible_assistant_message(record, thinking_compatibility),
         "tool" => openai_compatible_tool_message(record),
         "system" | "user" => json!({
             "role": role,
@@ -344,11 +437,23 @@ fn openai_compatible_message(message: Value) -> Value {
     }
 }
 
-fn openai_compatible_assistant_message(record: &serde_json::Map<String, Value>) -> Value {
+fn openai_compatible_assistant_message(
+    record: &serde_json::Map<String, Value>,
+    thinking_compatibility: ProviderThinkingCompatibility,
+) -> Value {
     let mut message = json!({
         "role": "assistant",
         "content": message_content_string(record.get("content"))
     });
+    if thinking_compatibility == ProviderThinkingCompatibility::DeepSeek {
+        if let Some(reasoning_content) = record
+            .get("reasoning_content")
+            .or_else(|| record.get("reasoningContent"))
+            .and_then(Value::as_str)
+        {
+            message["reasoning_content"] = json!(reasoning_content);
+        }
+    }
     let tool_calls = record
         .get("tool_calls")
         .or_else(|| record.get("toolCalls"))
@@ -419,16 +524,48 @@ fn tool_arguments_string(value: Option<&Value>) -> String {
     }
 }
 
+fn drain_complete_utf8(buffer: &mut Vec<u8>) -> Result<Option<String>, String> {
+    if buffer.is_empty() {
+        return Ok(None);
+    }
+    match std::str::from_utf8(buffer) {
+        Ok(text) => {
+            let text = text.to_string();
+            buffer.clear();
+            Ok(Some(text))
+        }
+        Err(error) if error.error_len().is_none() => {
+            let valid_up_to = error.valid_up_to();
+            if valid_up_to == 0 {
+                return Ok(None);
+            }
+            let text = std::str::from_utf8(&buffer[..valid_up_to])
+                .expect("the UTF-8 validator reported a valid prefix")
+                .to_string();
+            buffer.drain(..valid_up_to);
+            Ok(Some(text))
+        }
+        Err(error) => Err(format!(
+            "LLM provider stream contains invalid UTF-8 at byte {} (invalid length {}).",
+            error.valid_up_to(),
+            error.error_len().unwrap_or(1)
+        )),
+    }
+}
+
 pub(crate) fn llm_stream_response(
     profile: ResolvedLlmProfile,
     request_envelope: Value,
+    request_id: String,
 ) -> Response {
+    let response_request_id = request_id.clone();
     let stream = async_stream::stream! {
         if profile.kind.as_str() != "openaiCompatible" {
             yield Ok::<Bytes, Infallible>(Bytes::from(sse_json_event(
                 "provider_error",
                 json!({
                     "type": "provider_error",
+                    "requestId": request_id.as_str(),
                     "error": format!("Streaming is only implemented for openaiCompatible profiles, got {}", profile.kind),
                 }),
             )));
@@ -439,6 +576,7 @@ pub(crate) fn llm_stream_response(
             "provider_metadata",
             json!({
                 "type": "provider_metadata",
+                "requestId": request_id.as_str(),
                 "providerProfileId": profile.id,
                 "provider": profile.provider_flavor.as_deref().unwrap_or(profile.kind.as_str()),
                 "model": profile.model,
@@ -460,11 +598,24 @@ pub(crate) fn llm_stream_response(
             .get("responseFormat")
             .or_else(|| request_envelope.get("response_format"))
             .cloned();
+        if let Err(error) = validate_provider_thinking_continuation(&profile, &messages) {
+            yield Ok(Bytes::from(sse_json_event(
+                "provider_error",
+                json!({
+                    "type": "provider_error",
+                    "requestId": request_id.as_str(),
+                    "error": "provider_thinking_continuation_invalid",
+                    "message": error,
+                }),
+            )));
+            return;
+        }
         let Some(api_key) = profile.api_key.clone() else {
             yield Ok(Bytes::from(sse_json_event(
                 "provider_error",
                 json!({
                     "type": "provider_error",
+                    "requestId": request_id.as_str(),
                     "error": format!("LLM profile `{}` has no API key", profile.name),
                 }),
             )));
@@ -482,7 +633,12 @@ pub(crate) fn llm_stream_response(
             Err(error) => {
                 yield Ok(Bytes::from(sse_json_event(
                     "provider_error",
-                    json!({ "type": "provider_error", "error": error.to_string() }),
+                    json!({
+                        "type": "provider_error",
+                        "requestId": request_id.as_str(),
+                        "error": "provider_retryable_no_mutation",
+                        "message": error.to_string()
+                    }),
                 )));
                 return;
             }
@@ -500,7 +656,13 @@ pub(crate) fn llm_stream_response(
                 "provider_error",
                 json!({
                     "type": "provider_error",
-                    "error": format!("LLM provider returned HTTP {}", status.as_u16()),
+                    "requestId": request_id.as_str(),
+                    "error": if retryable_provider_http_status(status.as_u16()) {
+                        "provider_retryable_no_mutation"
+                    } else {
+                        "llm_chat_failed"
+                    },
+                    "message": format!("LLM provider returned HTTP {}", status.as_u16()),
                     "rawProvider": {
                         "status": status.as_u16(),
                         "contentType": content_type,
@@ -513,14 +675,36 @@ pub(crate) fn llm_stream_response(
 
         let mut parser = SseDataParser::default();
         let mut accumulator = OpenAiCompatibleStreamAccumulator::default();
+        let mut utf8_buffer = Vec::new();
         let mut response = response;
         loop {
             match response.chunk().await {
                 Ok(Some(chunk)) => {
-                    let text = String::from_utf8_lossy(&chunk);
-                    for data in parser.push(&text) {
-                        for event in openai_stream_events_from_data(&mut accumulator, &data) {
-                            yield Ok(Bytes::from(event));
+                    utf8_buffer.extend_from_slice(&chunk);
+                    match drain_complete_utf8(&mut utf8_buffer) {
+                        Ok(Some(text)) => {
+                            for data in parser.push(&text) {
+                                for event in openai_stream_events_from_data_for_request(
+                                    &mut accumulator,
+                                    &data,
+                                    request_id.as_str(),
+                                ) {
+                                    yield Ok(Bytes::from(event));
+                                }
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(message) => {
+                            yield Ok(Bytes::from(sse_json_event(
+                                "provider_error",
+                                json!({
+                                    "type": "provider_error",
+                                    "requestId": request_id.as_str(),
+                                    "error": "llm_stream_utf8_invalid",
+                                    "message": message,
+                                }),
+                            )));
+                            return;
                         }
                     }
                 }
@@ -528,14 +712,35 @@ pub(crate) fn llm_stream_response(
                 Err(error) => {
                     yield Ok(Bytes::from(sse_json_event(
                         "provider_error",
-                        json!({ "type": "provider_error", "error": error.to_string() }),
+                        json!({
+                            "type": "provider_error",
+                            "requestId": request_id.as_str(),
+                            "error": "provider_retryable_no_mutation",
+                            "message": error.to_string()
+                        }),
                     )));
                     return;
                 }
             }
         }
+        if !utf8_buffer.is_empty() {
+            yield Ok(Bytes::from(sse_json_event(
+                "provider_error",
+                json!({
+                    "type": "provider_error",
+                    "requestId": request_id.as_str(),
+                    "error": "llm_stream_utf8_invalid",
+                    "message": "LLM provider stream ended with an incomplete UTF-8 sequence.",
+                }),
+            )));
+            return;
+        }
         for data in parser.finish() {
-            for event in openai_stream_events_from_data(&mut accumulator, &data) {
+            for event in openai_stream_events_from_data_for_request(
+                &mut accumulator,
+                &data,
+                request_id.as_str(),
+            ) {
                 yield Ok(Bytes::from(event));
             }
         }
@@ -544,6 +749,7 @@ pub(crate) fn llm_stream_response(
                 "provider_done",
                 json!({
                     "type": "provider_done",
+                    "requestId": request_id.as_str(),
                     "chunk": {
                         "type": "done",
                         "usage": accumulator.usage,
@@ -558,7 +764,16 @@ pub(crate) fn llm_stream_response(
         .header(header::CONTENT_TYPE, "text/event-stream; charset=utf-8")
         .header(header::CACHE_CONTROL, "no-cache")
         .body(Body::from_stream(stream))
-        .unwrap_or_else(|_| Response::new(Body::from("event: provider_error\ndata: {\"type\":\"provider_error\",\"error\":\"failed to build stream response\"}\n\n")))
+        .unwrap_or_else(|_| {
+            Response::new(Body::from(sse_json_event(
+                "provider_error",
+                json!({
+                    "type": "provider_error",
+                    "requestId": response_request_id,
+                    "error": "failed to build stream response"
+                }),
+            )))
+        })
 }
 
 fn response_format_is_json_object(response_format: Option<&Value>) -> bool {
@@ -626,40 +841,86 @@ pub(crate) fn normalize_ollama_base_url(profile: &ResolvedLlmProfile) -> String 
     }
 }
 
-fn should_send_sampling(profile: &ResolvedLlmProfile) -> bool {
-    !profile.model.to_ascii_lowercase().contains("deepseek")
+fn should_send_sampling(compatibility: ProviderThinkingCompatibility) -> bool {
+    compatibility != ProviderThinkingCompatibility::DeepSeek
 }
 
-fn is_deepseek_profile(profile: &ResolvedLlmProfile) -> bool {
-    if profile
+fn provider_thinking_compatibility(profile: &ResolvedLlmProfile) -> ProviderThinkingCompatibility {
+    let flavor = profile
         .provider_flavor
         .as_deref()
-        .map(|value| value.eq_ignore_ascii_case("deepseek"))
-        .unwrap_or(false)
-    {
-        return true;
-    }
-    let base_url = profile.base_url.as_deref().unwrap_or_default();
-    profile.model.to_ascii_lowercase().contains("deepseek")
-        || base_url.to_ascii_lowercase().contains("deepseek")
-}
-
-fn is_zhipu_profile(profile: &ResolvedLlmProfile) -> bool {
-    if profile
-        .provider_flavor
-        .as_deref()
-        .map(|value| value.eq_ignore_ascii_case("zhipu"))
-        .unwrap_or(false)
-    {
-        return true;
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !flavor.is_empty() {
+        return match flavor.as_str() {
+            "deepseek" => ProviderThinkingCompatibility::DeepSeek,
+            "zhipu" | "glm" => ProviderThinkingCompatibility::GlmDeferred,
+            "kimi" | "moonshot" => ProviderThinkingCompatibility::KimiDeferred,
+            _ => ProviderThinkingCompatibility::Generic,
+        };
     }
     let base_url = profile.base_url.as_deref().unwrap_or_default();
     let model = profile.model.to_ascii_lowercase();
     let base = base_url.to_ascii_lowercase();
-    model.contains("glm")
+    if model.contains("deepseek") || base.contains("deepseek") {
+        return ProviderThinkingCompatibility::DeepSeek;
+    }
+    if model.contains("glm")
         || model.contains("zhipu")
         || base.contains("bigmodel")
         || base.contains("zhipu")
+    {
+        return ProviderThinkingCompatibility::GlmDeferred;
+    }
+    if model.contains("kimi")
+        || model.contains("moonshot")
+        || base.contains("kimi")
+        || base.contains("moonshot")
+    {
+        return ProviderThinkingCompatibility::KimiDeferred;
+    }
+    ProviderThinkingCompatibility::Generic
+}
+
+fn validate_provider_thinking_continuation(
+    profile: &ResolvedLlmProfile,
+    messages: &[Value],
+) -> Result<(), String> {
+    if provider_thinking_compatibility(profile) != ProviderThinkingCompatibility::DeepSeek
+        || !profile
+            .thinking
+            .as_deref()
+            .map(|value| value.eq_ignore_ascii_case("enabled"))
+            .unwrap_or(false)
+    {
+        return Ok(());
+    }
+    for (index, message) in messages.iter().enumerate() {
+        let Some(record) = message.as_object() else {
+            continue;
+        };
+        if record.get("role").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        let has_tool_calls = record
+            .get("tool_calls")
+            .or_else(|| record.get("toolCalls"))
+            .and_then(Value::as_array)
+            .map(|calls| !calls.is_empty())
+            .unwrap_or(false);
+        if !has_tool_calls {
+            continue;
+        }
+        let reasoning_content = record
+            .get("reasoning_content")
+            .or_else(|| record.get("reasoningContent"));
+        if !matches!(reasoning_content, Some(Value::String(_))) {
+            return Err(format!(
+                "DeepSeek thinking assistant tool-call message at index {index} must include string reasoning_content"
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn provider_tool_name(name: &str) -> String {

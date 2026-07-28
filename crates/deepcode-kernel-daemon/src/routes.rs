@@ -34,6 +34,12 @@ pub(crate) fn build_app(state: AppState) -> Router {
                 .layer(DefaultBodyLimit::max(LARGE_JSON_BODY_LIMIT_BYTES)),
         )
         .route(
+            "/api/session-store/:session_id/analysis-timeline",
+            get(session_store_analysis_timeline_record_get)
+                .post(session_store_analysis_timeline_append)
+                .layer(DefaultBodyLimit::max(LARGE_JSON_BODY_LIMIT_BYTES)),
+        )
+        .route(
             "/api/session-store/:session_id/projection-delivery",
             get(session_store_projection_delivery_get)
                 .post(session_store_projection_delivery_append)
@@ -147,6 +153,34 @@ pub(crate) fn build_app(state: AppState) -> Router {
         .route(
             "/api/agent/sessions/:session_id/runs",
             post(agent_session_run_start),
+        )
+        .route(
+            "/api/agent/sessions/:session_id/goals",
+            post(agent_session_goal_start),
+        )
+        .route(
+            "/api/agent/sessions/:session_id/goals/current",
+            get(agent_session_goal_current),
+        )
+        .route(
+            "/api/agent/sessions/:session_id/goals/:goal_id",
+            get(agent_session_goal_get),
+        )
+        .route(
+            "/api/agent/sessions/:session_id/goals/:goal_id/interactions/:interaction_id/resolve",
+            post(agent_session_goal_interaction_resolve),
+        )
+        .route(
+            "/api/agent/sessions/:session_id/goals/:goal_id/advance",
+            post(agent_session_goal_advance),
+        )
+        .route(
+            "/api/agent/sessions/:session_id/goals/:goal_id/resume",
+            post(agent_session_goal_resume),
+        )
+        .route(
+            "/api/agent/sessions/:session_id/goals/:goal_id/cancel",
+            post(agent_session_goal_cancel),
         )
         .route(
             "/api/agent/sessions/:session_id/runs/:run_id",

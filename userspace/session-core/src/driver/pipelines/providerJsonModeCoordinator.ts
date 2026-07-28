@@ -1,6 +1,6 @@
 import type { LlmChatRequest } from '@deepcode/protocol';
 
-const JSON_OBJECT_MODE_INSTRUCTION =
+export const JSON_OBJECT_MODE_INSTRUCTION =
   'Return exactly one valid JSON object. Do not return markdown, prose outside JSON, or multiple JSON objects.';
 
 export class ProviderJsonModeCoordinator {

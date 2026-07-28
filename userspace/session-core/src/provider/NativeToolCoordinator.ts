@@ -51,6 +51,8 @@ interface NativeToolCallBuffer {
   toToolCalls(): NativeToolCallProposal[];
 }
 
+const PROVIDER_RESERVED_CONTROL_TOKEN = '<｜end▁of▁thinking｜>';
+
 export class NativeToolCoordinatorError extends Error {
   constructor(
     public readonly code: string,
@@ -90,10 +92,12 @@ export class NativeToolCoordinator {
   parseArguments(raw: string, toolName: string): Record<string, unknown> {
     const text = raw.trim();
     if (!text) return {};
+    this.assertNoReservedProviderControl(text, toolName);
     try {
       const parsed = JSON.parse(text) as unknown;
       return this.normalizeArguments(parsed, toolName);
     } catch (error) {
+      if (error instanceof NativeToolCoordinatorError) throw error;
       throw new NativeToolCoordinatorError(
         'native_tool_arguments_invalid',
         `Provider-native tool call ${toolName} returned invalid JSON arguments: ${error instanceof Error ? error.message : String(error)}`
@@ -103,6 +107,7 @@ export class NativeToolCoordinator {
 
   normalizeArguments(value: unknown, toolName: string): Record<string, unknown> {
     if (typeof value === 'string') return this.parseArguments(value, toolName);
+    this.assertNoReservedProviderControl(value, toolName);
     const record = objectRecord(value);
     if (!record) {
       throw new NativeToolCoordinatorError(
@@ -111,6 +116,14 @@ export class NativeToolCoordinator {
       );
     }
     return record;
+  }
+
+  private assertNoReservedProviderControl(value: unknown, toolName: string): void {
+    if (!containsReservedProviderControl(value)) return;
+    throw new NativeToolCoordinatorError(
+      'provider_reserved_token_invalid',
+      `Provider-native tool call ${toolName} contains a reserved Provider control token. The arguments were preserved unchanged and rejected before semantic admission.`
+    );
   }
 
   normalizeToolName(name: string): string {
@@ -350,6 +363,18 @@ function oneLine(value: string): string {
 
 function stringValue(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim().length > 0 ? value : undefined;
+}
+
+function containsReservedProviderControl(value: unknown): boolean {
+  if (typeof value === 'string') return value.includes(PROVIDER_RESERVED_CONTROL_TOKEN);
+  if (Array.isArray(value)) return value.some(containsReservedProviderControl);
+  const record = objectRecord(value);
+  return record
+    ? Object.entries(record).some(([key, item]) => (
+      key.includes(PROVIDER_RESERVED_CONTROL_TOKEN)
+      || containsReservedProviderControl(item)
+    ))
+    : false;
 }
 
 function objectRecord(value: unknown): Record<string, unknown> | undefined {

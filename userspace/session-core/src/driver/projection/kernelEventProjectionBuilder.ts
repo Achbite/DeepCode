@@ -4,6 +4,10 @@ import {
   type AgentEvent,
   type ProjectionDelta,
 } from '@deepcode/protocol';
+import {
+  localizedProjectionText,
+  type ConversationPresentationLanguage,
+} from './conversationPresentationLanguage.js';
 
 export interface KernelEventProjectionBuilderPorts {
   requiredFileOperationsFromReport(report: Record<string, unknown> | undefined): unknown[];
@@ -24,12 +28,15 @@ export class KernelEventProjectionBuilder {
     event: unknown;
     ts: string;
     id: string;
+    language?: ConversationPresentationLanguage;
   }): AgentEvent {
     const { sessionId, event, ts, id } = input;
+    const language = input.language ?? 'neutral';
     let decoded;
     try {
       decoded = decodeKernelEventV1(event);
     } catch (error) {
+      const rawMessage = error instanceof Error ? error.message : String(error);
       return {
         id,
         sessionId,
@@ -37,7 +44,11 @@ export class KernelEventProjectionBuilder {
         kind: 'error',
         payload: {
           code: 'kernel_abi_event_invalid',
-          message: error instanceof Error ? error.message : String(error),
+          message: localizedProjectionText(language, {
+            zh: 'Kernel ABI 事件无效，Session 已停止投影该事件（错误代码：kernel_abi_event_invalid）。',
+            en: `Invalid Kernel ABI event: ${rawMessage}`,
+            neutral: 'kernel_abi_event_invalid',
+          }),
           channel: 'error',
           visibility: 'conversation',
         },
@@ -57,14 +68,22 @@ export class KernelEventProjectionBuilder {
       const planId = stringValue(report.proposalId) ?? stringValue(contract.proposalId) ?? 'agent-plan';
       const summary = stringValue(firstIntervention?.summary)
         ?? diagnostics[0]
-        ?? `Kernel execution contract status=${status}.`;
+        ?? localizedProjectionText(language, {
+          zh: `Kernel 执行合同状态：${status}。`,
+          en: `Kernel execution contract status=${status}.`,
+          neutral: `Kernel contract status=${status}`,
+        });
       return {
         id,
         sessionId,
         ts,
         kind: 'plan_review',
         payload: {
-          title: '计划确认',
+          title: localizedProjectionText(language, {
+            zh: '计划确认',
+            en: 'Plan review',
+            neutral: 'Plan',
+          }),
           summary,
           status,
           runId: typeof record.runId === 'string' ? record.runId : undefined,
@@ -98,7 +117,11 @@ export class KernelEventProjectionBuilder {
           kind: 'error',
           payload: {
             code: 'kernel_permission_projection_invalid',
-            message: 'Kernel permission.requested event is missing its typed capability or risk level.',
+            message: localizedProjectionText(language, {
+              zh: 'Kernel permission.requested 事件缺少类型化 capability 或 risk level。',
+              en: 'Kernel permission.requested event is missing its typed capability or risk level.',
+              neutral: 'kernel_permission_projection_invalid',
+            }),
             channel: 'error',
             visibility: 'conversation',
             kernelEvent: record,
@@ -118,7 +141,11 @@ export class KernelEventProjectionBuilder {
           capability,
           riskLevel,
           requestKind: request.requestKind,
-          summary: stringValue(request.summary) ?? `Permission requested for ${toolName}.`,
+          summary: stringValue(request.summary) ?? localizedProjectionText(language, {
+            zh: `请求授权使用 ${toolName}。`,
+            en: `Permission requested for ${toolName}.`,
+            neutral: `Permission ${toolName}`,
+          }),
           argumentsPreview: request.argsPreview ?? null,
           runId: stringValue(record.runId),
           workUnitIds: stringArrayValue(request.workUnitIds),
@@ -147,14 +174,14 @@ export class KernelEventProjectionBuilder {
       };
     }
     if (kind === 'proposal.rejected' || kind === 'work_unit.failed') {
-      const activity = this.kernelEventActivity(record, id);
+      const activity = this.kernelEventActivity(record, id, undefined, language);
       return {
         id,
         sessionId,
         ts,
         kind: 'error',
         payload: {
-          message: this.kernelFailureMessage(kind, record),
+          message: this.kernelFailureMessage(kind, record, language),
           channel: 'error',
           visibility: 'conversation',
           activity,
@@ -162,7 +189,7 @@ export class KernelEventProjectionBuilder {
         },
       };
     }
-    const activity = this.kernelEventActivity(record, id);
+    const activity = this.kernelEventActivity(record, id, undefined, language);
     return {
       id,
       sessionId,
@@ -171,7 +198,7 @@ export class KernelEventProjectionBuilder {
       payload: {
         stage: kind,
         status: kind.endsWith('produced') || kind.endsWith('accepted') ? 'completed' : 'running',
-        summary: this.kernelEventSummary(kind, record),
+        summary: this.kernelEventSummary(kind, record, language),
         channel: 'progress',
         visibility: 'conversation',
         presentation: 'collapsible',
@@ -211,7 +238,8 @@ export class KernelEventProjectionBuilder {
   kernelEventActivity(
     record: Record<string, unknown>,
     activityId: string,
-    fallbackRunId?: string
+    fallbackRunId?: string,
+    language: ConversationPresentationLanguage = 'neutral'
   ): AgentConversationActivity | undefined {
     const kind = stringValue(record.kind);
     if (!kind) return undefined;
@@ -231,8 +259,12 @@ export class KernelEventProjectionBuilder {
         activityId,
         kind: 'editBatchQueued',
         status: 'queued',
-        title: 'Edit work queued',
-        summary: this.kernelEventSummary(kind, record),
+        title: localizedProjectionText(language, {
+          zh: '编辑任务已排队',
+          en: 'Edit work queued',
+          neutral: 'Edit …',
+        }),
+        summary: this.kernelEventSummary(kind, record, language),
         source: 'kernel',
         runId,
         targets,
@@ -247,8 +279,12 @@ export class KernelEventProjectionBuilder {
         activityId,
         kind: 'editFileStarted',
         status: 'running',
-        title: 'Editing target',
-        summary: this.kernelEventSummary(kind, record),
+        title: localizedProjectionText(language, {
+          zh: '正在编辑目标',
+          en: 'Editing target',
+          neutral: 'Edit …',
+        }),
+        summary: this.kernelEventSummary(kind, record, language),
         source: 'kernel',
         runId,
         targets,
@@ -263,8 +299,12 @@ export class KernelEventProjectionBuilder {
         activityId,
         kind: 'editFileCompleted',
         status: 'completed',
-        title: 'Edit completed',
-        summary: this.kernelEventSummary(kind, record),
+        title: localizedProjectionText(language, {
+          zh: '编辑已完成',
+          en: 'Edit completed',
+          neutral: 'Edit ✓',
+        }),
+        summary: this.kernelEventSummary(kind, record, language),
         source: 'kernel',
         runId,
         targets,
@@ -276,12 +316,25 @@ export class KernelEventProjectionBuilder {
     }
     if (kind === 'work_unit.failed' || kind === 'work_unit.blocked' || kind === 'proposal.rejected') {
       const error = objectRecord(record.error);
-      const message = stringValue(record.message) ?? stringValue(error?.message) ?? stringValue(record.reason) ?? this.kernelFailureMessage(kind, record);
+      const message = stringValue(record.message)
+        ?? stringValue(error?.message)
+        ?? stringValue(record.reason)
+        ?? this.kernelFailureMessage(kind, record, language);
       return conversationActivity({
         activityId,
         kind: 'editFileFailed',
         status: kind === 'work_unit.blocked' ? 'blocked' : 'failed',
-        title: kind === 'work_unit.blocked' ? 'Edit blocked' : 'Edit failed',
+        title: kind === 'work_unit.blocked'
+          ? localizedProjectionText(language, {
+            zh: '编辑已阻塞',
+            en: 'Edit blocked',
+            neutral: 'Edit !',
+          })
+          : localizedProjectionText(language, {
+            zh: '编辑失败',
+            en: 'Edit failed',
+            neutral: 'Edit ×',
+          }),
         summary: message,
         source: 'kernel',
         runId,
@@ -301,7 +354,17 @@ export class KernelEventProjectionBuilder {
         activityId,
         kind: 'toolExecution',
         status: failed ? 'failed' : 'completed',
-        title: failed ? 'Tool failed' : 'Tool completed',
+        title: failed
+          ? localizedProjectionText(language, {
+            zh: '工具执行失败',
+            en: 'Tool failed',
+            neutral: 'Tool ×',
+          })
+          : localizedProjectionText(language, {
+            zh: '工具执行完成',
+            en: 'Tool completed',
+            neutral: 'Tool ✓',
+          }),
         summary: message,
         source: 'kernel',
         runId,
@@ -319,8 +382,12 @@ export class KernelEventProjectionBuilder {
         activityId,
         kind: 'resourceRead',
         status: 'completed',
-        title: 'Resource context resolved',
-        summary: this.kernelEventSummary(kind, record),
+        title: localizedProjectionText(language, {
+          zh: '资源上下文已解析',
+          en: 'Resource context resolved',
+          neutral: 'Resource ✓',
+        }),
+        summary: this.kernelEventSummary(kind, record, language),
         source: 'kernel',
         runId,
         targets,
@@ -399,8 +466,10 @@ export class KernelEventProjectionBuilder {
   projectionDeltaActivity(input: {
     runId: string;
     delta: Omit<ProjectionDelta, 'sessionId' | 'runId' | 'turnId' | 'seq'>;
+    language?: ConversationPresentationLanguage;
   }): AgentConversationActivity | undefined {
     const { runId, delta } = input;
+    const language = input.language ?? 'neutral';
     const status = activityStatusFromDelta(delta.status);
     if (!status) return undefined;
     const stage = delta.stage ?? delta.type;
@@ -424,51 +493,134 @@ export class KernelEventProjectionBuilder {
       return conversationActivity({
         ...base,
         kind: stage.includes('search') ? 'resourceSearch' : 'resourceRead',
-        title: delta.summary ?? 'Resource activity',
+        title: delta.summary ?? localizedProjectionText(language, {
+          zh: '资源操作',
+          en: 'Resource activity',
+          neutral: 'Resource',
+        }),
       });
     }
     if (delta.type === 'workunit_delta') {
       return conversationActivity({
         ...base,
         kind: status === 'failed' ? 'editFileFailed' : status === 'completed' ? 'editFileCompleted' : 'editFileStarted',
-        title: delta.summary ?? 'Workspace edit activity',
+        title: delta.summary ?? localizedProjectionText(language, {
+          zh: '工作区编辑',
+          en: 'Workspace edit activity',
+          neutral: 'Edit',
+        }),
       });
     }
     if (delta.type === 'draft_delta' || delta.type === 'part_delta') {
       return conversationActivity({
         ...base,
         kind: 'toolExecution',
-        title: delta.summary ?? 'Draft activity',
+        title: delta.summary ?? localizedProjectionText(language, {
+          zh: '草稿操作',
+          en: 'Draft activity',
+          neutral: 'Draft',
+        }),
       });
     }
     return undefined;
   }
 
-  private kernelFailureMessage(kind: string, record: Record<string, unknown>): string {
+  private kernelFailureMessage(
+    kind: string,
+    record: Record<string, unknown>,
+    language: ConversationPresentationLanguage
+  ): string {
     const error = objectRecord(record.error);
     const reason = stringValue(record.reason)
       ?? stringValue(error?.message);
     if (kind === 'work_unit.failed') {
       const workUnitId = stringValue(record.workUnitId)
         ?? stringValue(workUnitRecord(record)?.id);
-      const suffix = reason ? `：${reason}` : '。';
-      return workUnitId
-        ? `Kernel work unit ${workUnitId} 执行失败${suffix}`
-        : `Kernel work unit 执行失败${suffix}`;
+      return localizedProjectionText(language, {
+        zh: workUnitId
+          ? `Kernel 工作单元 ${workUnitId} 执行失败${reason ? `：${reason}` : '。'}`
+          : `Kernel 工作单元执行失败${reason ? `：${reason}` : '。'}`,
+        en: workUnitId
+          ? `Kernel work unit ${workUnitId} failed${reason ? `: ${reason}` : '.'}`
+          : `Kernel work unit failed${reason ? `: ${reason}` : '.'}`,
+        neutral: `work_unit.failed${workUnitId ? ` id=${workUnitId}` : ''}${reason ? ` reason=${reason}` : ''}`,
+      });
     }
     if (kind === 'proposal.rejected') {
-      return reason ? `Kernel 拒绝 proposal：${reason}` : 'Kernel 拒绝 proposal。';
+      return localizedProjectionText(language, {
+        zh: reason ? `Kernel 拒绝 proposal：${reason}` : 'Kernel 拒绝 proposal。',
+        en: reason ? `Kernel rejected the proposal: ${reason}` : 'Kernel rejected the proposal.',
+        neutral: `proposal.rejected${reason ? ` reason=${reason}` : ''}`,
+      });
     }
-    return reason ?? 'Kernel 返回失败事件。';
+    return reason ?? localizedProjectionText(language, {
+      zh: 'Kernel 返回失败事件。',
+      en: 'Kernel returned a failure event.',
+      neutral: 'kernel.failure',
+    });
   }
 
-  private kernelEventSummary(kind: string, record: Record<string, unknown>): string {
-    if (kind === 'driver.request_produced') return 'Session DriverRequest produced by Kernel.';
-    if (kind === 'state.entered') return 'Kernel state contract entered.';
-    if (kind === 'resource.packet_produced') return 'Kernel ResourcePacket produced.';
-    if (kind === 'proposal.accepted') return 'Kernel accepted proposal envelope.';
+  private kernelEventSummary(
+    kind: string,
+    record: Record<string, unknown>,
+    language: ConversationPresentationLanguage
+  ): string {
+    if (kind === 'driver.request_produced') {
+      return localizedProjectionText(language, {
+        zh: 'Kernel 已生成 Session DriverRequest。',
+        en: 'Session DriverRequest produced by Kernel.',
+        neutral: 'DriverRequest ✓',
+      });
+    }
+    if (kind === 'state.entered') {
+      return localizedProjectionText(language, {
+        zh: '已进入 Kernel 状态合同。',
+        en: 'Kernel state contract entered.',
+        neutral: 'Kernel state ✓',
+      });
+    }
+    if (kind === 'resource.packet_produced') {
+      return localizedProjectionText(language, {
+        zh: 'Kernel 已生成 ResourcePacket。',
+        en: 'Kernel ResourcePacket produced.',
+        neutral: 'ResourcePacket ✓',
+      });
+    }
+    if (kind === 'proposal.accepted') {
+      return localizedProjectionText(language, {
+        zh: 'Kernel 已接受 proposal envelope。',
+        en: 'Kernel accepted the proposal envelope.',
+        neutral: 'Proposal ✓',
+      });
+    }
+    if (kind === 'work_unit.queued') {
+      return localizedProjectionText(language, {
+        zh: 'Kernel 已将编辑工作单元加入队列。',
+        en: 'Kernel queued the edit work unit.',
+        neutral: 'work_unit.queued',
+      });
+    }
+    if (kind === 'work_unit.started') {
+      return localizedProjectionText(language, {
+        zh: 'Kernel 已开始执行编辑工作单元。',
+        en: 'Kernel started the edit work unit.',
+        neutral: 'work_unit.started',
+      });
+    }
+    if (kind === 'work_unit.completed') {
+      return localizedProjectionText(language, {
+        zh: 'Kernel 已完成编辑工作单元。',
+        en: 'Kernel completed the edit work unit.',
+        neutral: 'work_unit.completed',
+      });
+    }
     if (kind === 'tool.completed') {
-      return stringValue(objectRecord(toolFactRecord(record)?.error)?.message) ?? kind;
+      return stringValue(objectRecord(toolFactRecord(record)?.error)?.message)
+        ?? localizedProjectionText(language, {
+          zh: 'Kernel 工具执行完成。',
+          en: 'Kernel tool execution completed.',
+          neutral: kind,
+        });
     }
     return kind;
   }

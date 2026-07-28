@@ -1,7 +1,4 @@
-import type {
-  AgentConversationActivity,
-  ProjectionDelta,
-} from '@deepcode/protocol';
+import type { ProjectionDelta } from '@deepcode/protocol';
 import type { ProposalEnvelope } from '../../protocol/types.js';
 import type {
   NativeToolCallProposal,
@@ -20,17 +17,6 @@ export interface NativeToolRepairDuplicate {
 }
 
 export interface NativeToolRepairCoordinatorPorts {
-  conversationActivity(input: {
-    activityId: string;
-    kind: AgentConversationActivity['kind'];
-    status: AgentConversationActivity['status'];
-    title: string;
-    summary: string;
-    source: AgentConversationActivity['source'];
-    runId: string;
-    toolName?: string;
-    targets?: string[];
-  }): AgentConversationActivity;
   parseProposal(input: {
     raw: string;
     runId: string;
@@ -77,18 +63,9 @@ export class NativeToolRepairCoordinator {
       channel: 'progress',
       source: 'session',
       summary: 'side_effect_native_tool_blocked',
-      activity: this.ports.conversationActivity({
-        activityId: `native-tool-side-effect-${input.toolCall.callId}`,
-        kind: 'diagnostic',
-        status: 'failed',
-        title: 'Native tool blocked',
-        summary: 'Provider requested a side-effect tool. Session is converting it back through the plan/permission path.',
-        source: 'session',
-        runId: input.runId,
-        toolName: input.toolCall.name,
-      }),
       payload: {
-        visibility: 'task',
+        visibility: 'hidden',
+        presentation: 'traceOnly',
         callId: input.toolCall.callId,
         name: input.toolCall.name,
       },
@@ -109,18 +86,9 @@ export class NativeToolRepairCoordinator {
       channel: 'progress',
       source: 'session',
       summary: 'Provider repeated already resolved read-only native tool targets; Session is requesting a no-tool proposal.',
-      activity: this.ports.conversationActivity({
-        activityId: `native-tool-duplicate-repair-${input.runId}`,
-        kind: 'diagnostic',
-        status: 'running',
-        title: 'Duplicate native read repair',
-        summary: 'Session detected repeated read-only native tool calls with no new evidence.',
-        source: 'session',
-        runId: input.runId,
-        targets: input.duplicates.map((item) => item.signature.path),
-      }),
       payload: {
-        visibility: 'task',
+        visibility: 'hidden',
+        presentation: 'traceOnly',
         duplicateTargets: input.duplicates.map((item) => ({
           callId: item.toolCall.callId,
           toolName: item.toolCall.name,
@@ -149,18 +117,9 @@ export class NativeToolRepairCoordinator {
       channel: 'progress',
       source: 'session',
       summary: `Complete-stage provider requested native tool ${input.toolCall.name}; Session is retrying once with proposal-only contract.`,
-      activity: this.ports.conversationActivity({
-        activityId: `accepted-plan-provider-tool-violation-${input.toolCall.callId}`,
-        kind: 'diagnostic',
-        status: 'failed',
-        title: 'Complete-stage native tool blocked',
-        summary: `Provider requested ${input.toolCall.name} during proposal-only accepted-plan execution.`,
-        source: 'session',
-        runId: input.runId,
-        toolName: input.toolCall.name,
-      }),
       payload: {
-        visibility: 'task',
+        visibility: 'hidden',
+        presentation: 'traceOnly',
         callId: input.toolCall.callId,
         name: input.toolCall.name,
         arguments: input.toolCall.arguments,

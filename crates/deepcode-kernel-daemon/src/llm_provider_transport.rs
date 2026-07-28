@@ -8,7 +8,7 @@ pub(crate) async fn call_anthropic_profile(
     profile: &ResolvedLlmProfile,
     messages: Vec<Value>,
     tools: Vec<LlmToolDefinition>,
-) -> Result<LlmChatOutput, LlmProviderDiagnostic> {
+) -> Result<LlmChatDecodedResponse, LlmProviderDiagnostic> {
     let api_key = profile.api_key.as_deref().ok_or_else(|| {
         provider_local_error(
             profile,
@@ -63,14 +63,17 @@ pub(crate) async fn call_anthropic_profile(
             "Anthropic response must contain content array",
         ));
     }
-    Ok(parse_anthropic_message(&response.value))
+    Ok(LlmChatDecodedResponse {
+        output: parse_anthropic_message(&response.value),
+        raw_provider: Some(response.value.clone()),
+    })
 }
 
 pub(crate) async fn call_ollama_profile(
     profile: &ResolvedLlmProfile,
     messages: Vec<Value>,
     tools: Vec<LlmToolDefinition>,
-) -> Result<LlmChatOutput, LlmProviderDiagnostic> {
+) -> Result<LlmChatDecodedResponse, LlmProviderDiagnostic> {
     let mut body = json!({
         "model": profile.model,
         "messages": messages,
@@ -113,7 +116,10 @@ pub(crate) async fn call_ollama_profile(
             "Ollama response must contain message object",
         )
     })?;
-    Ok(parse_openai_message(message))
+    Ok(LlmChatDecodedResponse {
+        output: parse_openai_message(message),
+        raw_provider: Some(response.value.clone()),
+    })
 }
 
 #[derive(Debug, Clone)]

@@ -1,10 +1,19 @@
+import type {
+  TaskFailureV2,
+  TaskLedgerSnapshotV2,
+  TaskSettlementV2,
+} from '@deepcode/protocol';
 import { stableHash } from '../cache/canonicalizer.js';
 import type { ResourcePacket } from '../context/types.js';
 import {
+  activeTaskEntry,
   buildAcceptedPlanPromptFrame,
-  buildTaskLedgerSnapshot,
+  failTaskLedgerV2,
+  parseTaskLedgerV2,
+  settleTaskLedgerV2,
+  taskLedgerAllSettled,
+  taskLedgerKernelCompletedTaskIds,
   type AcceptedPlanPromptFrame,
-  type TaskLedgerSnapshot,
 } from '../run-state/index.js';
 import type {
   AcceptedTaskPlanContext,
@@ -15,41 +24,15 @@ import type {
 export class AcceptedTaskRegistry {
   constructor(private readonly acceptedPlan: AcceptedTaskPlanContext | undefined) {}
 
-  ledger(
-    failedTaskId?: string,
-    skippedTaskIds: string[] = [],
-    acceptedIncompleteTaskIds: string[] = []
-  ): TaskLedgerSnapshot | undefined {
-    const acceptedPlan = this.acceptedPlan;
-    if (!acceptedPlan) return undefined;
-    const completed = new Set(acceptedPlan.completedTaskIds);
-    const modelJudgedSufficient = new Set(acceptedPlan.modelJudgedSufficientTaskIds ?? []);
-    const currentTask = acceptedPlan.tasks.find((task) =>
-      !completed.has(task.taskId) &&
-      !modelJudgedSufficient.has(task.taskId) &&
-      task.taskId !== failedTaskId &&
-      !skippedTaskIds.includes(task.taskId) &&
-      !acceptedIncompleteTaskIds.includes(task.taskId)
-    );
-    return buildTaskLedgerSnapshot({
-      planId: acceptedPlan.planId,
-      runId: acceptedPlan.runId,
-      tasks: acceptedPlan.tasks.map((task) => ({
-        taskId: task.taskId,
-        title: task.title,
-        targets: task.targets,
-        toolId: task.toolId,
-      })),
-      completedTaskIds: acceptedPlan.completedTaskIds,
-      modelJudgedSufficientTaskIds: acceptedPlan.modelJudgedSufficientTaskIds ?? [],
-      failedTaskId,
-      skippedTaskIds,
-      acceptedIncompleteTaskIds,
-      currentTaskId: currentTask?.taskId,
-    });
+  ledger(): TaskLedgerSnapshotV2 | undefined {
+    return this.acceptedPlan
+      ? parseTaskLedgerV2(this.acceptedPlan.taskLedger)
+      : undefined;
   }
 
-  promptFrame(taskLedger?: TaskLedgerSnapshot): AcceptedPlanPromptFrame | undefined {
+  promptFrame(
+    taskLedger?: TaskLedgerSnapshotV2
+  ): AcceptedPlanPromptFrame | undefined {
     const acceptedPlan = this.acceptedPlan;
     const ledger = taskLedger ?? this.ledger();
     if (!acceptedPlan || !ledger) return undefined;
@@ -62,107 +45,142 @@ export class AcceptedTaskRegistry {
     });
   }
 
-  cursor(resourcePackets: ResourcePacket[], lastSavepointId?: string): TaskExecutionCursor | undefined {
+  cursor(
+    resourcePackets: ResourcePacket[],
+    lastSavepointId?: string
+  ): TaskExecutionCursor | undefined {
     const acceptedPlan = this.acceptedPlan;
-    if (!acceptedPlan) return undefined;
     const ledger = this.ledger();
-    const modelJudgedSufficient = new Set(acceptedPlan.modelJudgedSufficientTaskIds ?? []);
-    const settledTasks = new Set([...acceptedPlan.completedTaskIds, ...modelJudgedSufficient]);
-    const currentTask = acceptedPlan.tasks.find((task) => !settledTasks.has(task.taskId));
+    if (!acceptedPlan || !ledger) return undefined;
     const lastResourcePacketIds = resourcePackets
       .map((packet) => packet.id)
       .filter((id): id is string => typeof id === 'string' && id.trim().length > 0)
       .slice(-6);
     const cursorKey = [
       acceptedPlan.planId,
-      currentTask?.taskId ?? 'none',
-      acceptedPlan.completedTaskIds.join(','),
+      ledger.revision,
+      ledger.currentTaskId ?? 'none',
+      ledger.settledTaskIds.join(','),
       lastResourcePacketIds.join(','),
       lastSavepointId ?? '',
     ].join('|');
     return {
       cursorId: `task-cursor-${stableHash(cursorKey).slice(0, 16)}`,
       planId: acceptedPlan.planId,
-      currentTaskId: currentTask?.taskId,
-      taskOrder: ledger?.taskOrder ?? acceptedPlan.tasks.map((task) => task.taskId),
-      pendingTaskIds: ledger?.pendingTaskIds ?? [],
-      completedTaskIds: [...settledTasks],
-      modelJudgedSufficientTaskIds: [...modelJudgedSufficient],
+      currentTaskId: ledger.currentTaskId,
+      taskOrder: ledger.taskOrder,
+      pendingTaskIds: ledger.pendingTaskIds,
+      settledTaskIds: ledger.settledTaskIds,
+      kernelCompletedTaskIds: taskLedgerKernelCompletedTaskIds(ledger),
       lastResourcePacketIds,
       lastSavepointId,
     };
   }
 
-  currentTaskContext(cursor: TaskExecutionCursor | undefined): CurrentTaskContext | undefined {
+  currentTaskContext(
+    cursor: TaskExecutionCursor | undefined
+  ): CurrentTaskContext | undefined {
     const acceptedPlan = this.acceptedPlan;
-    if (!acceptedPlan || !cursor) return undefined;
-    const task = acceptedPlan.tasks.find((item) => item.taskId === cursor.currentTaskId)
-      ?? acceptedPlan.tasks.find((item) => !cursor.completedTaskIds.includes(item.taskId));
+    const ledger = this.ledger();
+    if (!acceptedPlan || !cursor || !ledger) return undefined;
+    const task = acceptedPlan.tasks.find(
+      (item) => item.taskId === ledger.currentTaskId
+    );
     if (!task) return undefined;
-    const targets = [...new Set((task?.targets ?? []).map(normalizeTaskContextPath).filter(Boolean))];
-    const toolIds = [task?.toolId].filter((item): item is string => Boolean(item && item.trim()));
+    const targets = [...new Set(
+      task.targets.map(normalizeTaskContextPath).filter(Boolean)
+    )];
+    const toolIds = [task.toolId].filter(
+      (item): item is string => Boolean(item?.trim())
+    );
     const goalParts = [
       acceptedPlan.title ?? acceptedPlan.summary ?? acceptedPlan.planId,
-      task ? `task=${task.taskId}${task.title ? ` ${task.title}` : ''}` : '',
+      `task=${task.taskId}${task.title ? ` ${task.title}` : ''}`,
       targets.length ? `targets=${targets.join(', ')}` : '',
     ].filter(Boolean);
     return {
       goal: goalParts.join(' | '),
-      taskId: task?.taskId,
+      taskId: task.taskId,
       nodeId: undefined,
-      taskTitle: task?.title,
+      taskTitle: task.title,
       targets,
       toolIds,
-      acceptanceCriteria: task?.acceptanceCriteria ?? [],
-      failureCriteria: task?.failureCriteria ?? [],
+      acceptanceCriteria: task.acceptanceCriteria ?? [],
+      failureCriteria: task.failureCriteria ?? [],
       taskOrder: cursor.taskOrder,
       pendingTaskIds: cursor.pendingTaskIds,
-      dependsOn: task?.dependencies ?? [],
+      dependsOn: task.dependencies,
       evidenceNeeds: [],
-      completedTaskIds: cursor.completedTaskIds,
-      modelJudgedSufficientTaskIds: cursor.modelJudgedSufficientTaskIds,
+      settledTaskIds: cursor.settledTaskIds,
+      kernelCompletedTaskIds: cursor.kernelCompletedTaskIds,
     };
   }
 
-  withCompleted(completedTaskIds: string[]): AcceptedTaskPlanContext | undefined {
+  settle(input: {
+    taskId: string;
+    settlement: TaskSettlementV2;
+    sourceRefs: readonly string[];
+  }): AcceptedTaskPlanContext | undefined {
     const acceptedPlan = this.acceptedPlan;
     if (!acceptedPlan) return undefined;
-    const completed = new Set(completedTaskIds);
-    const modelJudgedSufficient = new Set((acceptedPlan.modelJudgedSufficientTaskIds ?? []).filter((taskId) => !completed.has(taskId)));
-    const settled = new Set([...completed, ...modelJudgedSufficient]);
-    const nextIndex = acceptedPlan.tasks.findIndex((task) => !settled.has(task.taskId));
-    return {
-      ...acceptedPlan,
-      completedTaskIds,
-      modelJudgedSufficientTaskIds: [...modelJudgedSufficient],
-      batchIndex: nextIndex >= 0 ? nextIndex + 1 : acceptedPlan.tasks.length + 1,
-    };
+    return this.withLedger(settleTaskLedgerV2({
+      ledger: acceptedPlan.taskLedger,
+      taskId: input.taskId,
+      settlement: input.settlement,
+      sourceRefs: input.sourceRefs,
+    }));
   }
 
-  withModelJudgedSufficient(taskId: string): AcceptedTaskPlanContext | undefined {
+  fail(input: {
+    taskId: string;
+    failure: TaskFailureV2;
+    sourceRefs: readonly string[];
+  }): AcceptedTaskPlanContext | undefined {
     const acceptedPlan = this.acceptedPlan;
     if (!acceptedPlan) return undefined;
-    const completed = new Set(acceptedPlan.completedTaskIds);
-    const modelJudgedSufficient = new Set(acceptedPlan.modelJudgedSufficientTaskIds ?? []);
-    if (!completed.has(taskId)) modelJudgedSufficient.add(taskId);
-    const settled = new Set([...completed, ...modelJudgedSufficient]);
-    const nextIndex = acceptedPlan.tasks.findIndex((task) => !settled.has(task.taskId));
+    return this.withLedger(failTaskLedgerV2({
+      ledger: acceptedPlan.taskLedger,
+      taskId: input.taskId,
+      failure: input.failure,
+      sourceRefs: input.sourceRefs,
+    }));
+  }
+
+  withLedger(taskLedger: TaskLedgerSnapshotV2): AcceptedTaskPlanContext | undefined {
+    const acceptedPlan = this.acceptedPlan;
+    if (!acceptedPlan) return undefined;
+    const ledger = parseTaskLedgerV2(taskLedger);
+    if (
+      ledger.owner.planId !== acceptedPlan.planId
+      || (
+        ledger.owner.kind === 'run'
+        && ledger.owner.runId !== acceptedPlan.runId
+      )
+    ) {
+      throw new Error(
+        'session_task_ledger_owner_mismatch: accepted plan and TaskLedgerV2 owner disagree.'
+      );
+    }
+    const activeIndex = ledger.currentTaskId
+      ? ledger.taskOrder.indexOf(ledger.currentTaskId)
+      : -1;
     return {
       ...acceptedPlan,
-      modelJudgedSufficientTaskIds: [...modelJudgedSufficient],
-      batchIndex: nextIndex >= 0 ? nextIndex + 1 : acceptedPlan.tasks.length + 1,
+      taskLedger: ledger,
+      batchIndex: activeIndex >= 0
+        ? activeIndex + 1
+        : acceptedPlan.tasks.length + 1,
     };
   }
 
   complete(): boolean {
-    const acceptedPlan = this.acceptedPlan;
-    if (!acceptedPlan) return false;
-    if (!acceptedPlan.tasks.length) return true;
-    const settled = new Set([
-      ...acceptedPlan.completedTaskIds,
-      ...(acceptedPlan.modelJudgedSufficientTaskIds ?? []),
-    ]);
-    return acceptedPlan.tasks.every((task) => settled.has(task.taskId));
+    const ledger = this.ledger();
+    return ledger ? taskLedgerAllSettled(ledger) : false;
+  }
+
+  activeTaskId(): string | undefined {
+    const ledger = this.ledger();
+    return ledger ? activeTaskEntry(ledger)?.taskId : undefined;
   }
 }
 

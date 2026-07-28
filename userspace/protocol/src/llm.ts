@@ -102,6 +102,8 @@ export interface LlmChatMessage {
 }
 
 export interface LlmChatRequest {
+  requestId: string;
+  parentRequestId?: string;
   profileId?: string;
   messages: LlmChatMessage[];
   tools?: ToolDefinition[];
@@ -162,6 +164,7 @@ export interface AgentStreamPartFrame {
 }
 
 export interface LlmChatResult {
+  requestId?: string;
   chunks: LlmChatChunk[];
   assistantMessage?: LlmChatMessage;
   usage?: Record<string, unknown>;
@@ -180,6 +183,7 @@ export type LlmChatStreamEventType =
   | 'provider_error';
 
 export interface LlmChatStreamEvent {
+  requestId?: string;
   type: LlmChatStreamEventType;
   chunk?: LlmChatChunk;
   error?: string;
@@ -253,7 +257,7 @@ export interface ProjectionDelta {
   targetPath?: string;
   itemId?: string;
   stage?: string;
-  status?: 'queued' | 'running' | 'streaming' | 'waiting' | 'draftReady' | 'discarded' | 'skipped' | 'completed' | 'failed';
+  status?: 'queued' | 'running' | 'streaming' | 'waiting' | 'draftReady' | 'discarded' | 'skipped' | 'completed' | 'cancelled' | 'failed';
   channel?: 'progress' | 'reasoning' | 'final' | 'tool' | 'resource' | 'workunit' | 'draft';
   source?: 'session' | 'driver' | 'llm' | 'kernel' | 'provider';
   delta?: string;

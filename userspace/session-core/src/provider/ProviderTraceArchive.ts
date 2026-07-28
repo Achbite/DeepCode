@@ -1,5 +1,21 @@
 import { stableHash } from '../cache/canonicalizer.js';
 
+const PRIVATE_PROVIDER_CONTROL_MARKERS = [
+  '<｜end▁of▁thinking｜>',
+  '<session-continuation-language>',
+  '</session-continuation-language>',
+] as const;
+
+const PRIVATE_PROVIDER_ANALYSIS_KEYS = new Set([
+  'reasoning',
+  'reasoningcontent',
+  'reasoningdelta',
+  'providerreasoning',
+  'providerreasoningdelta',
+  'hiddenreasoning',
+  'rawprovider',
+]);
+
 export interface ProviderTraceArchiveRecord {
   schemaVersion: 'deepcode.session.provider-trace-archive.v1';
   traceArchiveMode: 'compact';
@@ -8,6 +24,8 @@ export interface ProviderTraceArchiveRecord {
   request?: {
     profileId?: string;
     semanticProfileId?: string;
+    messageMaterialScope?: string;
+    exactAdmittedMessagesAvailable?: boolean;
     messageCount: number;
     totalContentChars: number;
     messages: ProviderTraceMessageDigest[];
@@ -17,6 +35,9 @@ export interface ProviderTraceArchiveRecord {
     cacheTopology?: unknown;
   };
   response?: {
+    requestId?: string;
+    parentRequestId?: string;
+    attemptKind?: string;
     usage?: unknown;
     assistantMessage?: ProviderTraceMessageDigest;
     chunkSummary: ProviderTraceChunkSummary;
@@ -42,6 +63,7 @@ export interface ProviderTraceMessageDigest {
   contentCharLength: number;
   contentHash: string;
   contentPreview: string;
+  contentProviderControlRedacted?: boolean;
   reasoningCharLength?: number;
   reasoningHash?: string;
   toolCallCount?: number;
@@ -56,6 +78,7 @@ export interface ProviderTraceToolCallDigest {
   argumentsCharLength: number;
   argumentsHash: string;
   argumentsPreview: string;
+  argumentsProviderControlRedacted?: boolean;
 }
 
 export interface ProviderTraceChunkSummary {
@@ -85,6 +108,8 @@ export class ProviderTraceArchive {
         request: {
           profileId: stringValue(record.profileId),
           semanticProfileId: stringValue(record.semanticProfileId),
+          messageMaterialScope: stringValue(record.messageMaterialScope),
+          exactAdmittedMessagesAvailable: booleanValue(record.exactAdmittedMessagesAvailable),
           messageCount: messages.length,
           totalContentChars: messageDigests.reduce((sum, item) => sum + item.contentCharLength, 0),
           messages: messageDigests,
@@ -108,6 +133,9 @@ export class ProviderTraceArchive {
         stage,
         kind: 'response',
         response: {
+          requestId: stringValue(record.requestId),
+          parentRequestId: stringValue(record.parentRequestId),
+          attemptKind: stringValue(record.attemptKind),
           usage: compactArchiveValue(record.usage),
           assistantMessage: record.assistantMessage ? providerTraceMessageDigest(record.assistantMessage) : undefined,
           chunkSummary: providerTraceChunkSummary(chunks),
@@ -131,12 +159,18 @@ function providerTraceMessageDigest(value: unknown, index?: number): ProviderTra
   const content = stringValue(record?.content) ?? compactString(record?.content);
   const reasoning = stringValue(record?.reasoningContent) ?? stringValue(record?.reasoning_content);
   const toolCalls = providerTraceAssistantToolCalls(value);
+  const contentContainsProviderControl = containsPrivateProviderControl(content);
   return {
     ...(typeof index === 'number' ? { index } : {}),
     role: stringValue(record?.role),
     contentCharLength: content.length,
     contentHash: stableHash(content),
-    contentPreview: clip(content, 800),
+    contentPreview: contentContainsProviderControl
+      ? '[private-provider-control-redacted]'
+      : clip(content, 800),
+    ...(contentContainsProviderControl
+      ? { contentProviderControlRedacted: true }
+      : {}),
     ...(reasoning
       ? {
         reasoningCharLength: reasoning.length,
@@ -169,13 +203,19 @@ function providerTraceToolCallDigest(value: unknown, index?: number): ProviderTr
   const name = stringValue(record?.name) ?? stringValue(functionRecord?.name);
   const rawArguments = record?.arguments ?? functionRecord?.arguments;
   const argumentsText = typeof rawArguments === 'string' ? rawArguments : compactString(rawArguments);
+  const argumentsContainProviderControl = containsPrivateProviderControl(argumentsText);
   return {
     ...(typeof index === 'number' ? { index } : {}),
     id: stringValue(record?.id),
     name,
     argumentsCharLength: argumentsText.length,
     argumentsHash: stableHash(argumentsText),
-    argumentsPreview: clip(argumentsText, 800),
+    argumentsPreview: argumentsContainProviderControl
+      ? '[private-provider-control-redacted]'
+      : clip(argumentsText, 800),
+    ...(argumentsContainProviderControl
+      ? { argumentsProviderControlRedacted: true }
+      : {}),
   };
 }
 
@@ -241,7 +281,14 @@ function compactArchiveValue(value: unknown, depth = 0): unknown {
   }
   const output: Record<string, unknown> = {};
   for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
-    if (isSensitiveKey(key)) {
+    if (isPrivateProviderAnalysisKey(key)) {
+      const material = compactString(item);
+      output[key] = {
+        redacted: 'private-provider-analysis',
+        charLength: material.length,
+        contentHash: stableHash(material),
+      };
+    } else if (isSensitiveKey(key)) {
       output[key] = '[redacted]';
     } else if (key === 'messages' && Array.isArray(item)) {
       output[key] = item.map((message, index) => providerTraceMessageDigest(message, index));
@@ -258,6 +305,11 @@ function compactArchiveValue(value: unknown, depth = 0): unknown {
   return output;
 }
 
+function isPrivateProviderAnalysisKey(key: string): boolean {
+  const normalized = key.toLowerCase().replace(/[^a-z0-9]/g, '');
+  return PRIVATE_PROVIDER_ANALYSIS_KEYS.has(normalized);
+}
+
 function isSensitiveKey(key: string): boolean {
   const normalized = key.toLowerCase();
   return ['secret', 'apikey', 'api_key', 'authorization', 'password', 'bearer', 'credential', 'cookie', 'token']
@@ -272,6 +324,10 @@ function stringValue(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim().length > 0 ? value : undefined;
 }
 
+function booleanValue(value: unknown): boolean | undefined {
+  return typeof value === 'boolean' ? value : undefined;
+}
+
 function clip(value: string, max: number): string {
   return value.length <= max ? value : `${value.slice(0, max - 20)}... [truncated]`;
 }
@@ -284,4 +340,8 @@ function compactString(value: unknown): string {
   } catch {
     return String(value);
   }
+}
+
+function containsPrivateProviderControl(value: string): boolean {
+  return PRIVATE_PROVIDER_CONTROL_MARKERS.some((marker) => value.includes(marker));
 }

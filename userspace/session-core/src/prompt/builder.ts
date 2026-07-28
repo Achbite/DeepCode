@@ -57,7 +57,7 @@ export function buildPromptEnvelope(input: PromptEnvelopeBuilderInput): PromptEn
         'The system contract and protocol instructions are written in English.',
         'Infer the visible output language from the latest authoritative user input. Use that language for every user-visible answer, plan, decision question, diagnostic, review, narration, title, summary, and description unless the user explicitly requests another language.',
         'Tool identifiers, schema field names, code identifiers, and protocol literals remain unchanged English tokens.',
-        'Visible reasoning, when streamed, must be concise and action-oriented. Do not narrate protocol, tool, permission, or evidence-policy deliberation.',
+        'Raw Provider reasoning is analysis-only and must never be copied into user-visible fields. When explanation is useful, provide only a concise evidence-based rationale in the semantic answer, plan, decision, diagnostic, title, or summary.',
         'Keep private reasoning concise. Use the current frames and emit the narrowest valid semantic directive.',
       ].join('\n'),
     },

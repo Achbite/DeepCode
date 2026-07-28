@@ -566,7 +566,11 @@ export function cancelAgentRunById(
 export function submitAgentRunGuidance(
   sessionId: string,
   runId: string,
-  request: { guidance: string; attachments?: unknown[] }
+  request: {
+    guidance: string;
+    attachments?: unknown[];
+    hostLanguage?: api.StartAgentRunRequest['hostLanguage'];
+  }
 ): Promise<ApiResponse<api.AgentRunResult>> {
   return api.submitAgentRunGuidance(sessionId, runId, request);
 }

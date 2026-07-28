@@ -65,14 +65,13 @@ import {
   ReviewProjectionBuilder,
   SessionFailureProjectionBuilder,
   SessionProgressProjectionBuilder,
-  VISIBLE_REASONING_MAX_CHARS,
 } from './projection/index.js';
 import { DriverInteractionIndex } from './interactions/index.js';
 import { ReviewAssembler, ReviewDecisionProjectionBuilder } from './review/index.js';
 import { DriverFailureMessageCatalog, DriverParseErrorCatalog } from './diagnostics/index.js';
 import { builtinHooks, HookPolicy, HookRegistry, HookRuntime } from './hooks/index.js';
 import type { LlmTurnResult, SessionDriverLoopRunState } from './runFrame.js';
-import { clip, objectRecord, stringValue, visibleLanguageForRequest } from './runtimeSupport.js';
+import { clip, objectRecord, stringValue } from './runtimeSupport.js';
 
 const MAX_DERIVED_MANIFEST_ENTRIES = 240;
 const RESOURCE_MANIFEST_MAX_BYTES = 512 * 1024;
@@ -87,7 +86,6 @@ export const hookRuntime = new HookRuntime(hookRegistry, HookPolicy.observerOnly
 export const actionBundleActionInspector = new ActionBundleActionInspector();
 export const driverActivityBuilder = new DriverActivityBuilder({
   providerStageSummary: (stage, part, language) => providerStreamCoordinator.stageSummary(stage, part, language),
-  visibleLanguageForRequest,
   actionFileTargetPath: (action) => actionBundleActionInspector.actionFileTargetPath(action),
 });
 export const permissionPipeline = new PermissionPipeline();
@@ -118,7 +116,6 @@ export const driverInteractionIndex = new DriverInteractionIndex({
   executionRootFromDecision: (input, events) => AcceptedPlanExecutionRootResolver.fromDecision(input, events),
   buildAcceptedPlan: (input) => acceptedTaskPlanContextBuilder().build(input),
   recoverLatestCheckpoint: (input) => acceptedPlanTaskLedger().recoverLatestCheckpoint(input),
-  recordTaskCompletion: (input) => acceptedPlanTaskLedger().recordTaskCompletion(input),
 });
 export const kernelEventProjectionBuilder = new KernelEventProjectionBuilder({
   requiredFileOperationsFromReport: (report) => planReviewGrantProjector.requiredFileOperationsFromReport(report),
@@ -133,14 +130,11 @@ export const planProjectionBuilder = new PlanProjectionBuilder({
   gateInterventionsFromReport: (report) => planReviewGrantProjector.gateInterventionsFromReport(report),
   planReviewFacts: (report) => planReviewReportAnalyzer.facts(report),
   interactionOverlayProjection: (overlay) => interactionOverlayCodec.toPayload(overlay as Parameters<typeof interactionOverlayCodec.toPayload>[0]),
-  visibleLanguageForRequest,
 });
 export const requirementProjectionBuilder = new RequirementProjectionBuilder({
-  visibleLanguageForRequest,
   interactionOverlayPayload: (payload) => interactionOverlayCodec.toPayload(interactionOverlayCodec.fromPayload(payload)),
 });
 export const assistantProjectionBuilder = new AssistantProjectionBuilder({
-  visibleLanguageForRequest,
   guidanceRevisionTransitionMessage: (language) => providerStreamCoordinator.guidanceRevisionTransitionMessage(language),
 });
 export const sessionProgressProjectionBuilder = new SessionProgressProjectionBuilder({
@@ -159,15 +153,12 @@ export const sessionFailureProjectionBuilder = new SessionFailureProjectionBuild
 });
 export const reviewProjectionBuilder = new ReviewProjectionBuilder<SessionPlanContext, AcceptedTaskPlanContext, TaskLedgerSnapshot>({
   reviewFactLines: (kernelEvents) => reviewAssembler().reviewFactLines(kernelEvents),
-  staticSyntaxReviewFactLines: (kernelEvents) => reviewAssembler().staticSyntaxReviewFactLines(kernelEvents),
+  staticSyntaxReviewObservationLines: (kernelEvents) => reviewAssembler().staticSyntaxReviewObservationLines(kernelEvents),
   findReviewFacts: (kernelEvents) => reviewAssembler().findReviewFacts(kernelEvents),
   concreteContinuationExpectations: (value) => implementationBatchContextBuilder().concreteContinuationExpectations(value),
   acceptedPlanContext: (plan) => plan.taskPlan
     ? acceptedTaskPlanContextBuilder().build({ plan, interventionLevel: undefined, executionRoot: plan.executionRoot })
     : undefined,
-  acceptedPlanBatchCompletedTaskIds: (acceptedPlan, plan, kernelEvents) =>
-    acceptedPlanTaskLedger().recordKernelBatchProgress({ acceptedPlan, proposal: planContextIndex.proposalEnvelope(plan), kernelEvents }).completedTaskIds,
-  acceptedPlanAfterBatch: (acceptedPlan, completedTaskIds) => acceptedPlanTaskLedger().recordTaskCompletion({ acceptedPlan, completedTaskIds }).nextAcceptedPlan,
   acceptedPlanTaskLedger: (acceptedPlan) => acceptedPlanTaskLedger().ledger(acceptedPlan),
   buildReviewFactsContext: (input) => buildReviewFactsContext(input),
 });
@@ -200,7 +191,8 @@ export const resourceRequestLoop = new ResourceRequestLoop({
 });
 export const nativeToolProjectionBuilder = new NativeToolProjectionBuilder({
   conversationActivity: (input) => driverActivityBuilder.conversationActivity(input),
-  packetActivity: (packet, activityId, runId) => resourceRequestLoop.packetActivity(packet, activityId, runId),
+  packetActivity: (packet, activityId, runId, language) =>
+    resourceRequestLoop.packetActivity(packet, activityId, runId, language),
   runningSummary: (toolName, language) => providerStreamCoordinator.nativeToolResolveRunningSummary(toolName, language),
   completedSummary: (toolName, language) => providerStreamCoordinator.nativeToolResolveCompletedSummary(toolName, language),
 });
@@ -209,9 +201,8 @@ export const nativeToolProviderLoop = new NativeToolProviderLoop<SessionDriverLo
   providerPipeline,
   turnHandler: nativeToolTurnHandler,
 });
-export const PROVIDER_REASONING_FLUSH_CHARS = 768;
-export const PROVIDER_REASONING_FLUSH_MS = 120;
-export { VISIBLE_REASONING_MAX_CHARS };
+export const PROVIDER_SEMANTIC_DRAFT_FLUSH_CHARS = 768;
+export const PROVIDER_SEMANTIC_DRAFT_FLUSH_MS = 120;
 export const providerTurnPolicy = new ProviderTurnPolicy();
 export const driverFailureMessageCatalog = new DriverFailureMessageCatalog();
 export const driverParseErrorCatalog = new DriverParseErrorCatalog();
@@ -261,12 +252,7 @@ export function acceptedTaskPlanContextBuilder(): AcceptedTaskPlanContextBuilder
 }
 
 export function acceptedPlanTaskLedger(): AcceptedPlanTaskLedgerCoordinator {
-  return new AcceptedPlanTaskLedgerCoordinator({
-    workUnitIdsFromKernelEvents: (events) =>
-      kernelEventStatusIndex.workUnitIds(kernelEventStatusIndex.decodeEvents(events)),
-    actionBatchHasFailureOrBlocker: (events) =>
-      kernelEventStatusIndex.hasFailureOrBlocker(kernelEventStatusIndex.decodeEvents(events)),
-  });
+  return new AcceptedPlanTaskLedgerCoordinator();
 }
 
 export function reviewAssembler(): ReviewAssembler {

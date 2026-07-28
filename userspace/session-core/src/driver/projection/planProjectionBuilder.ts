@@ -1,4 +1,8 @@
-import type { AgentEvent, KernelPlanAuthorizationReview } from '@deepcode/protocol';
+import type {
+  AgentEvent,
+  ConversationLanguage,
+  KernelPlanAuthorizationReview,
+} from '@deepcode/protocol';
 import type { ActionBundleDraft, ProposalEnvelope } from '../../protocol/types.js';
 import type { ConversationResourceRoot } from '../../context/types.js';
 import {
@@ -11,10 +15,17 @@ import type {
   ReadableProjectionItem,
   ReadableProjectionSection,
 } from './structuredProjectionReadModels.js';
+import {
+  conversationPresentationLanguageBinding,
+  localizedProjectionText,
+  type ConversationPresentationLanguage,
+  type ConversationPresentationLanguageState,
+  type ProjectionLanguageBinding,
+} from './conversationPresentationLanguage.js';
 
-export type PlanProjectionLanguage = 'zh-CN' | 'en-US';
+export type PlanProjectionLanguage = ConversationPresentationLanguage;
 
-export interface PlanProjectionState {
+export interface PlanProjectionState extends ConversationPresentationLanguageState {
   sessionId: string;
   userRequest: string;
   conversationRoots: ConversationResourceRoot[];
@@ -29,7 +40,6 @@ export interface PlanProjectionBuilderPorts {
   gateInterventionsFromReport(report: Record<string, unknown> | undefined): PlanProjectionGateIntervention[];
   planReviewFacts(report: Record<string, unknown> | undefined): string[];
   interactionOverlayProjection(overlay: unknown): Record<string, unknown>;
-  visibleLanguageForRequest(userRequest: string): PlanProjectionLanguage;
 }
 
 export interface PlanProjectionPermissionBundle {
@@ -73,9 +83,11 @@ export class PlanProjectionBuilder {
       userPlan?: string;
       planReviewReport?: Record<string, unknown>;
       interactionOverlay?: unknown;
+      responseLanguage?: ConversationLanguage;
     };
     status: 'accepted' | 'rejected' | 'needsRevision';
     summary?: string;
+    presentationBinding: ProjectionLanguageBinding;
     ts: string;
     id: string;
   }): AgentEvent {
@@ -85,7 +97,7 @@ export class PlanProjectionBuilder {
       : input.status === 'rejected'
         ? 'session.driver.planReviewRejected'
         : 'session.driver.planReviewNeedsRevision';
-    const language = this.ports.visibleLanguageForRequest(input.summary ?? input.plan.userPlan ?? '');
+    const language = input.presentationBinding.language;
     const summary = input.summary ?? defaultPlanReviewDecisionSummary(input.status, language);
     return {
       id: input.id,
@@ -93,13 +105,21 @@ export class PlanProjectionBuilder {
       ts: input.ts,
       kind: 'plan_review',
       payload: {
-        title: 'Plan review',
+        title: localizedProjectionText(language, {
+          zh: '计划确认',
+          en: 'Plan review',
+          neutral: 'Plan decision',
+        }),
         titleKey: 'session.driver.planReviewDecision.title',
         summary,
         summaryKey: messageKey,
         messageKey,
         messageArgs: { status: input.status },
         status: input.status,
+        presentationLanguage: language,
+        languageRevision: input.presentationBinding.revision,
+        languageStatus: input.presentationBinding.status,
+        sourceTurnId: input.presentationBinding.sourceTurnId,
         runId: input.plan.runId,
         planId: input.plan.planId,
         confirmable: false,
@@ -127,9 +147,15 @@ export class PlanProjectionBuilder {
     const { state, proposal, report, ts, id } = input;
     const payload = objectRecord(proposal.payload) ?? {};
     const actionBundle = this.ports.readActionBundle(proposal);
+    const binding = projectionBinding(input.state, proposal);
+    const language = binding.language;
     const userPlan = typeof payload.userPlan === 'string' && payload.userPlan.trim()
       ? payload.userPlan
-      : actionBundle?.goal ?? 'Agent plan';
+      : actionBundle?.goal ?? localizedProjectionText(language, {
+        zh: 'Agent 计划',
+        en: 'Agent plan',
+        neutral: 'Agent plan',
+      });
     const status = stringValue(report?.status) ?? 'pending';
     const planId = actionBundle?.id ?? proposal.proposalId;
     const confirmable = planReviewStatusAwaitingUser(status);
@@ -152,6 +178,11 @@ export class PlanProjectionBuilder {
         runId: proposal.runId,
         planId,
         proposalId: proposal.proposalId,
+        responseLanguage: proposal.responseLanguage,
+        presentationLanguage: binding.language,
+        languageRevision: binding.revision,
+        languageStatus: binding.status,
+        sourceTurnId: binding.sourceTurnId,
         status,
         confirmable,
         decisionOwner: {
@@ -188,9 +219,15 @@ export class PlanProjectionBuilder {
     const { state, proposal, authorizationReview, ts, id } = input;
     const taskPlan = sanitizePlanProjectionPayload(objectRecord(proposal.payload) ?? {});
     const planId = stringValue(taskPlan.id) ?? proposal.proposalId;
+    const binding = projectionBinding(input.state, proposal);
+    const language = binding.language;
     const summary = stringValue(taskPlan.summary)
       ?? stringValue(taskPlan.title)
-      ?? 'Implementation plan';
+      ?? localizedProjectionText(language, {
+        zh: '实施计划',
+        en: 'Implementation plan',
+        neutral: 'Implementation plan',
+      });
     const readablePlan = readableAuthorizedTaskPlan(taskPlan, authorizationReview, summary, {
       runId: proposal.runId,
       planId,
@@ -210,6 +247,11 @@ export class PlanProjectionBuilder {
         runId: proposal.runId,
         planId,
         proposalId: proposal.proposalId,
+        responseLanguage: proposal.responseLanguage,
+        presentationLanguage: binding.language,
+        languageRevision: binding.revision,
+        languageStatus: binding.status,
+        sourceTurnId: binding.sourceTurnId,
         status: authorizationReview.status,
         confirmable: true,
         decisionOwner: {
@@ -259,7 +301,7 @@ export class PlanProjectionBuilder {
     const diagnostics = stringArrayValue(report?.diagnostics);
     const kernelSummary = interventions[0]?.summary
       ?? diagnostics[0]
-      ?? `Kernel gate status=${status}.`;
+      ?? `kernel_gate_status=${status}`;
     return {
       schemaVersion: 'deepcode.session.readable-plan.v1',
       titleKey: 'session.projection.plan.title',
@@ -477,7 +519,7 @@ export function readableTaskPlanProjection(
         sectionId: 'reviewCheckpoints',
         titleKey: 'session.projection.plan.section.reviewCheckpoints',
         emptyMessageKey: 'session.projection.plan.empty.reviewCheckpoints',
-        items: checkpoints.map((item, index) => projectionItem(`review-checkpoint-${index + 1}`, 'fact', { text: item })),
+        items: checkpoints.map((item, index) => projectionItem(`review-checkpoint-${index + 1}`, 'text', { text: item })),
       },
       {
         sectionId: 'boundary',
@@ -530,11 +572,30 @@ function defaultPlanReviewDecisionSummary(
         ? '用户已忽略计划，本轮会话已中止。'
         : '用户要求修改计划。';
   }
+  if (language === 'neutral') {
+    return status === 'accepted'
+      ? 'plan_decision=accepted'
+      : status === 'rejected'
+        ? 'plan_decision=rejected'
+        : 'plan_decision=needsRevision';
+  }
   return status === 'accepted'
-    ? 'The user accepted the plan; execution can continue.'
-    : status === 'rejected'
-      ? 'The user ignored the plan; this run has been cancelled.'
-      : 'The user requested plan changes.';
+      ? 'The user accepted the plan; execution can continue.'
+      : status === 'rejected'
+        ? 'The user ignored the plan; this run has been cancelled.'
+        : 'The user requested plan changes.';
+}
+
+function projectionBinding(
+  state: PlanProjectionState,
+  proposal: ProposalEnvelope
+): ProjectionLanguageBinding {
+  const binding = conversationPresentationLanguageBinding(state);
+  if (binding.status !== 'unavailable') return binding;
+  return {
+    language: proposal.responseLanguage ?? 'neutral',
+    status: proposal.responseLanguage ? 'resolved' : 'unavailable',
+  };
 }
 
 function objectRecord(value: unknown): Record<string, unknown> | undefined {

@@ -27,10 +27,13 @@ mod session_bridge;
 pub use bootstrap::{DaemonStatus, KernelBootstrap, KernelBootstrapGuard, KernelBootstrapOptions};
 use session_bridge::run_session_host_bridge;
 pub use session_bridge::{
-    session_host_bridge_hint, session_host_bridge_path, terminal_workspace_scope, AgentRunResult,
-    AgentRunStatus, AgentSessionListResult, AgentSessionResult, CreateAgentSessionRequest,
-    ListAgentSessionsRequest, SessionHostBridgeRequest, SessionHostBridgeResult,
-    StartAgentRunRequest, TerminalWorkspaceScope,
+    session_host_bridge_hint, session_host_bridge_path, terminal_host_language,
+    ResolveSessionGoalInteractionRequest, SessionGoalCommandReceipt,
+    StartSessionGoalRequest,
+    terminal_workspace_scope, AgentRunResult, AgentRunStatus, AgentSessionListResult,
+    AgentSessionResult, CreateAgentSessionRequest, ListAgentSessionsRequest,
+    SessionHostBridgeRequest, SessionHostBridgeResult, StartAgentRunRequest,
+    TerminalWorkspaceScope,
 };
 
 #[derive(Debug, Error)]
@@ -344,6 +347,139 @@ impl HttpKernelClient {
         decode_api_data_with_code(value)
     }
 
+    pub async fn start_session_goal(
+        &self,
+        session_id: &str,
+        request: StartSessionGoalRequest,
+    ) -> KernelClientResult<SessionGoalCommandReceipt> {
+        let value = self
+            .http
+            .post(self.url(&format!("/api/agent/sessions/{session_id}/goals")))
+            .json(&request)
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Value>()
+            .await?;
+        decode_api_data_with_code(value)
+    }
+
+    pub async fn current_session_goal(
+        &self,
+        session_id: &str,
+    ) -> KernelClientResult<SessionGoalCommandReceipt> {
+        let value = self
+            .http
+            .get(self.url(&format!(
+                "/api/agent/sessions/{session_id}/goals/current"
+            )))
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Value>()
+            .await?;
+        decode_api_data_with_code(value)
+    }
+
+    pub async fn get_session_goal(
+        &self,
+        session_id: &str,
+        goal_id: &str,
+    ) -> KernelClientResult<SessionGoalCommandReceipt> {
+        let value = self
+            .http
+            .get(self.url(&format!(
+                "/api/agent/sessions/{session_id}/goals/{goal_id}"
+            )))
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Value>()
+            .await?;
+        decode_api_data_with_code(value)
+    }
+
+    pub async fn resolve_session_goal_interaction(
+        &self,
+        session_id: &str,
+        goal_id: &str,
+        interaction_id: &str,
+        request: ResolveSessionGoalInteractionRequest,
+    ) -> KernelClientResult<SessionGoalCommandReceipt> {
+        let value = self
+            .http
+            .post(self.url(&format!(
+                "/api/agent/sessions/{session_id}/goals/{goal_id}/interactions/{interaction_id}/resolve"
+            )))
+            .json(&request)
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Value>()
+            .await?;
+        decode_api_data_with_code(value)
+    }
+
+    pub async fn advance_session_goal(
+        &self,
+        session_id: &str,
+        goal_id: &str,
+        request: Value,
+    ) -> KernelClientResult<Value> {
+        let value = self
+            .http
+            .post(self.url(&format!(
+                "/api/agent/sessions/{session_id}/goals/{goal_id}/advance"
+            )))
+            .json(&request)
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Value>()
+            .await?;
+        api_data(value)
+    }
+
+    pub async fn resume_session_goal(
+        &self,
+        session_id: &str,
+        goal_id: &str,
+        request: Value,
+    ) -> KernelClientResult<Value> {
+        let value = self
+            .http
+            .post(self.url(&format!(
+                "/api/agent/sessions/{session_id}/goals/{goal_id}/resume"
+            )))
+            .json(&request)
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Value>()
+            .await?;
+        api_data(value)
+    }
+
+    pub async fn cancel_session_goal(
+        &self,
+        session_id: &str,
+        goal_id: &str,
+        request: Value,
+    ) -> KernelClientResult<Value> {
+        let value = self
+            .http
+            .post(self.url(&format!(
+                "/api/agent/sessions/{session_id}/goals/{goal_id}/cancel"
+            )))
+            .json(&request)
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Value>()
+            .await?;
+        api_data(value)
+    }
+
     pub async fn get_agent_run(
         &self,
         session_id: &str,
@@ -385,7 +521,10 @@ impl HttpKernelClient {
         run_id: &str,
         guidance: impl Into<String>,
         attachments: Vec<Value>,
+        host_language: Option<String>,
     ) -> KernelClientResult<AgentRunResult> {
+        let observed_session = self.get_agent_session(session_id).await?;
+        let (base_head, turn_authority_ref) = observed_session.guidance_observation(run_id)?;
         let value = self
             .http
             .post(self.url(&format!(
@@ -394,13 +533,16 @@ impl HttpKernelClient {
             .json(&json!({
                 "guidance": guidance.into(),
                 "attachments": attachments,
+                "hostLanguage": host_language,
+                "baseHead": base_head,
+                "turnAuthorityRef": turn_authority_ref,
             }))
             .send()
             .await?
             .error_for_status()?
             .json::<Value>()
             .await?;
-        decode_api_data(value)
+        decode_api_data_with_code(value)
     }
 
     pub async fn cancel_agent_run(

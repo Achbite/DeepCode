@@ -1,12 +1,15 @@
 import type { AgentConversationActivity } from '@deepcode/protocol';
 import type { ActionBundleDraft, ProposalEnvelope } from '../../protocol/types.js';
 import type { AcceptedTaskPlanContext } from '../execution/index.js';
+import {
+  localizedProjectionText,
+  type ConversationPresentationLanguage,
+} from './conversationPresentationLanguage.js';
 
-export type DriverActivityLanguage = 'zh-CN' | 'en-US';
+export type DriverActivityLanguage = 'zh-CN' | 'en-US' | 'neutral';
 
 export interface DriverActivityBuilderPorts {
   providerStageSummary(stage: string, part: 'request' | 'response', language: DriverActivityLanguage): string;
-  visibleLanguageForRequest(userRequest: string): DriverActivityLanguage;
   actionFileTargetPath(action: { args?: unknown }): string | undefined;
 }
 
@@ -27,16 +30,22 @@ export class DriverActivityBuilder {
     userRequest: string;
     stage: string;
     status: 'running' | 'completed';
+    language: DriverActivityLanguage;
   }): AgentConversationActivity {
+    const title = input.language === 'neutral'
+      ? input.status === 'running' ? 'LLM …' : 'LLM ✓'
+      : input.language === 'zh-CN'
+        ? input.status === 'running' ? '模型处理中' : '模型处理完成'
+        : input.status === 'running' ? 'Model processing' : 'Model processing completed';
     return this.conversationActivity({
       activityId: `provider-${input.stage}`,
       kind: 'providerThinking',
       status: input.status,
-      title: input.status === 'running' ? 'Provider call running' : 'Provider call completed',
+      title,
       summary: this.ports.providerStageSummary(
         input.stage,
         input.status === 'running' ? 'request' : 'response',
-        this.ports.visibleLanguageForRequest(input.userRequest)
+        input.language
       ),
       source: 'provider',
       runId: input.runId,
@@ -47,14 +56,26 @@ export class DriverActivityBuilder {
     accepted: AcceptedTaskPlanContext;
     batch: unknown;
     status: 'running' | 'completed';
+    language: ConversationPresentationLanguage;
   }): AgentConversationActivity {
     const actions = this.batchActionRecords(input.batch);
+    const title = input.status === 'running'
+      ? localizedProjectionText(input.language, {
+        zh: '正在提交已确认计划批次',
+        en: 'Submitting accepted-plan batch',
+        neutral: 'ActionBatch …',
+      })
+      : localizedProjectionText(input.language, {
+        zh: '已确认计划批次已提交',
+        en: 'Accepted-plan batch submitted',
+        neutral: 'ActionBatch ✓',
+      });
     return this.conversationActivity({
       activityId: `accepted-plan-batch-${input.accepted.planId}-${input.accepted.batchIndex}-${input.status}`,
       kind: 'editBatchQueued',
       status: input.status,
-      title: input.status === 'running' ? 'Submitting accepted-plan batch' : 'Accepted-plan batch submitted',
-      summary: this.acceptedPlanBatchActivitySummary(input.batch),
+      title,
+      summary: this.acceptedPlanBatchActivitySummary(input.batch, input.language),
       source: 'session',
       runId: input.accepted.runId,
       planId: input.accepted.planId,
@@ -64,10 +85,17 @@ export class DriverActivityBuilder {
     });
   }
 
-  acceptedPlanBatchActivitySummary(batch: unknown): string {
+  acceptedPlanBatchActivitySummary(
+    batch: unknown,
+    language: ConversationPresentationLanguage
+  ): string {
     const actions = this.batchActionRecords(batch);
     const targetCount = uniqueStrings(actions.flatMap((action) => this.actionTargetCandidates(action))).length;
-    return `Session is submitting ${actions.length} accepted-plan action(s) for ${targetCount} target(s).`;
+    return localizedProjectionText(language, {
+      zh: `Session 正在为 ${targetCount} 个目标提交 ${actions.length} 个已确认计划操作。`,
+      en: `Session is submitting ${actions.length} accepted-plan action(s) for ${targetCount} target(s).`,
+      neutral: `ActionBatch actions=${actions.length} targets=${targetCount}`,
+    });
   }
 
   batchActionRecords(batch: unknown): Record<string, unknown>[] {

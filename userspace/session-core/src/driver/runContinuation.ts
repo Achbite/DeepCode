@@ -1,4 +1,10 @@
-import type { AgentContextAttachment, AgentEvent, AgentSessionResult, AgentWorkspaceBinding } from '@deepcode/protocol';
+import type {
+  AgentContextAttachment,
+  AgentEvent,
+  AgentSessionResult,
+  AgentWorkspaceBinding,
+  ConversationLanguage,
+} from '@deepcode/protocol';
 import type { ProjectMemoryMode } from '../context/index.js';
 import type { ProjectWorkingDirectory } from '../context/types.js';
 import type { RequirementRecord } from '../requirement/types.js';
@@ -9,9 +15,11 @@ import type {
   AcceptedPlanReviewHandoffRunInput,
 } from './review/acceptedPlanReviewHandoffCoordinator.js';
 import type { AutonomyMode, InterventionLevel, ReviewContinuationMode } from './types.js';
+import type { SessionGoalOperationContext } from '../goal/index.js';
 
 export interface DecisionContinuationSource {
   sessionId: string;
+  hostRunId?: string;
   workspaceBinding?: AgentWorkspaceBinding;
   projectWorkingDirectory?: ProjectWorkingDirectory;
   projectId?: string;
@@ -24,10 +32,13 @@ export interface DecisionContinuationSource {
   autonomyMode?: AutonomyMode;
   projectMemoryMode?: ProjectMemoryMode;
   interactionOverlay?: InteractionOverlayContext;
+  hostLanguage?: ConversationLanguage;
+  goalContext?: SessionGoalOperationContext;
 }
 
 export interface SessionLoopResumeInput {
   sessionId: string;
+  hostRunId?: string;
   content: string;
   attachments?: AgentContextAttachment[];
   existingEvents?: AgentEvent[];
@@ -48,6 +59,8 @@ export interface SessionLoopResumeInput {
   resumeResourcePackets?: boolean;
   acceptedTaskPlan?: AcceptedTaskPlanContext;
   interactionOverlay?: InteractionOverlayContext;
+  hostLanguage?: ConversationLanguage;
+  goalContext?: SessionGoalOperationContext;
 }
 
 export type SessionLoopControlResult =
@@ -68,11 +81,14 @@ export interface DecisionContinuationOverride {
   existingEvents?: AgentEvent[];
   workspaceBinding?: AgentWorkspaceBinding;
   projectWorkingDirectory?: ProjectWorkingDirectory;
+  requirementConfirmationMode?: 'off' | 'always';
   reviewContinuationMode?: ReviewContinuationMode;
   resumeResourcePackets?: boolean;
   confirmedRequirement?: RequirementRecord;
   acceptedTaskPlan?: AcceptedTaskPlanContext;
   interactionOverlay?: InteractionOverlayContext;
+  hostLanguage?: ConversationLanguage;
+  goalContext?: SessionGoalOperationContext;
 }
 
 export interface AcceptedPlanContinuationOverride extends DecisionContinuationOverride {
@@ -81,6 +97,7 @@ export interface AcceptedPlanContinuationOverride extends DecisionContinuationOv
 
 export type DecisionContinuationInput<Extra extends object = Record<string, never>> = {
   sessionId: string;
+  hostRunId?: string;
   content: string;
   attachments?: AgentContextAttachment[];
   existingEvents?: AgentEvent[];
@@ -92,7 +109,7 @@ export type DecisionContinuationInput<Extra extends object = Record<string, neve
   profileId?: string;
   workflow?: string;
   appendUserMessage: false;
-  requirementConfirmationMode: 'off';
+  requirementConfirmationMode: 'off' | 'always';
   reviewContinuationMode?: ReviewContinuationMode;
   interventionLevel?: InterventionLevel;
   autonomyMode?: AutonomyMode;
@@ -101,6 +118,7 @@ export type DecisionContinuationInput<Extra extends object = Record<string, neve
   confirmedRequirement?: RequirementRecord;
   acceptedTaskPlan?: AcceptedTaskPlanContext;
   interactionOverlay?: InteractionOverlayContext;
+  hostLanguage?: ConversationLanguage;
 } & Extra;
 
 export function decisionContinuationInput<Extra extends object = Record<string, never>>(
@@ -113,11 +131,13 @@ export function decisionContinuationInput<Extra extends object = Record<string, 
     existingEvents,
     workspaceBinding,
     projectWorkingDirectory,
+    requirementConfirmationMode,
     reviewContinuationMode,
     resumeResourcePackets,
     confirmedRequirement,
     acceptedTaskPlan,
     interactionOverlay,
+    hostLanguage,
     ...extra
   } = override;
   const hasWorkspaceBindingOverride = hasOwnProperty(override, 'workspaceBinding');
@@ -125,6 +145,7 @@ export function decisionContinuationInput<Extra extends object = Record<string, 
   return {
     ...extra,
     sessionId: source.sessionId,
+    hostRunId: source.hostRunId,
     content,
     attachments: attachments ?? [],
     existingEvents,
@@ -136,7 +157,7 @@ export function decisionContinuationInput<Extra extends object = Record<string, 
     profileId: source.profileId,
     workflow: source.workflow,
     appendUserMessage: false,
-    requirementConfirmationMode: 'off',
+    requirementConfirmationMode: requirementConfirmationMode ?? 'off',
     reviewContinuationMode: reviewContinuationMode ?? source.reviewContinuationMode,
     interventionLevel: source.interventionLevel,
     autonomyMode: source.autonomyMode,
@@ -145,6 +166,8 @@ export function decisionContinuationInput<Extra extends object = Record<string, 
     confirmedRequirement,
     acceptedTaskPlan,
     interactionOverlay: interactionOverlay ?? source.interactionOverlay,
+    hostLanguage: hostLanguage ?? source.hostLanguage,
+    goalContext: source.goalContext,
   } as DecisionContinuationInput<Extra>;
 }
 

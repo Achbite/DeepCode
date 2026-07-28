@@ -47,11 +47,29 @@ export function eventAppender(
   session: AgentSession,
   events: AgentEvent[]
 ): (sessionId: string, nextEvents: AgentEvent[]) => Promise<AgentSessionResult> {
+  let headRevision = 0;
   return async (_sessionId, nextEvents) => {
     events.push(...nextEvents);
+    headRevision += 1;
     return {
       session: { ...session, eventCount: events.length },
       events: [...events],
+      appendWriteability: {
+        schemaVersion: 'deepcode.session.append-writeability.v1',
+        status: 'writable',
+        format: 'domainBatchV1',
+      },
+      domainState: {
+        schemaVersion: 'deepcode.session.domain-state-snapshot.v1',
+        head: {
+          schemaVersion: 'deepcode.session.domain-head.v1',
+          headRevision,
+          eventVersion: events.length,
+          headDigest: `smoke-domain-head-${headRevision}-${events.length}`,
+        },
+        runFences: [],
+        interactionFences: [],
+      },
     };
   };
 }

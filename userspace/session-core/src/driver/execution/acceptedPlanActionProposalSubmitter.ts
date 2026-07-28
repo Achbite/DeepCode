@@ -3,6 +3,7 @@ import type {
   AgentEvent,
   AgentSessionResult,
   AgentWorkspaceBinding,
+  ConversationLanguage,
   KernelCommandEnvelope,
   KernelActionBatchV1,
   KernelProposalEnvelopeV1,
@@ -24,6 +25,12 @@ import type { InteractionOverlayContext } from '../pipelines/interactionOverlayC
 import type { ProposalRouterResult } from '../proposal/proposalRouter.js';
 import { kernelReplyErrorMessage } from './kernelReplyGuard.js';
 import type { KernelReplyObservation } from './kernelEventStatusIndex.js';
+import {
+  conversationPresentationLanguageBinding,
+  conversationPresentationLanguage,
+  localizedProjectionText,
+  type ConversationPresentationLanguage,
+} from '../projection/conversationPresentationLanguage.js';
 
 export interface AcceptedPlanActionProposalInput {
   sessionId: string;
@@ -61,6 +68,14 @@ export interface AcceptedPlanActionProposalState {
   };
   contextAssembly?: ContextAssemblyRecord;
   taskLocalCompactRecords?: ContextAssemblyTaskLocalCompactRecord[];
+  userAuthorityFrame?: {
+    effectiveLanguage: ConversationLanguage;
+    languagePolicy?: {
+      status?: string;
+      revision?: number;
+      sourceTurnId?: string;
+    };
+  };
 }
 
 export interface AcceptedPlanActionProposalSubmitterPorts<
@@ -72,7 +87,11 @@ export interface AcceptedPlanActionProposalSubmitterPorts<
   append(sessionId: string, events: AgentEvent[]): Promise<AgentSessionResult | undefined>;
   kernel(request: KernelCommandEnvelope): Promise<KernelReply>;
   observeKernel(request: KernelCommandEnvelope): Promise<KernelReplyObservation>;
-  appendProjectedKernelEvents(sessionId: string, reply: KernelReply): Promise<AgentSessionResult | undefined>;
+  appendProjectedKernelEvents(
+    sessionId: string,
+    reply: KernelReply,
+    language: ConversationPresentationLanguage
+  ): Promise<AgentSessionResult | undefined>;
   emitProjectionDelta(state: State, delta: ProjectionDelta): Promise<void>;
   emitKernelActivityDeltas(state: State, events: unknown[], stage: string): Promise<void>;
   readActionBundle(proposal: ProposalEnvelope): unknown | undefined;
@@ -84,8 +103,24 @@ export interface AcceptedPlanActionProposalSubmitterPorts<
   diagnosticSummary(report: Record<string, unknown>): string;
   executionContext(input: Record<string, unknown>): any;
   normalizeKernelBatch(input: Record<string, unknown>): { ok: true; batch: KernelActionBatchV1 } | { ok: false; reasons: string[] };
-  normalizationFailureEvents(sessionId: string, runId: string, accepted: AcceptedTaskPlanContext, reasons: string[], ts: string, id: string): AgentEvent[];
-  executionExceptionEvents(sessionId: string, planRef: { runId: string; planId: string }, message: string, code: string, ts: string, id: string): AgentEvent[];
+  normalizationFailureEvents(
+    sessionId: string,
+    runId: string,
+    accepted: AcceptedTaskPlanContext,
+    reasons: string[],
+    ts: string,
+    id: string,
+    language?: ConversationLanguage
+  ): AgentEvent[];
+  executionExceptionEvents(
+    sessionId: string,
+    planRef: { runId: string; planId: string },
+    message: string,
+    code: string,
+    ts: string,
+    id: string,
+    language?: ConversationLanguage
+  ): AgentEvent[];
   executionFailureEvents(
     sessionId: string,
     runId: string,
@@ -93,28 +128,29 @@ export interface AcceptedPlanActionProposalSubmitterPorts<
     batchEvents: unknown[],
     batch: KernelActionBatchV1,
     ts: string,
-    id: string
+    id: string,
+    language?: ConversationLanguage
   ): AgentEvent[];
   preflightAudit(batch: KernelActionBatchV1): unknown;
-  acceptedPlanBatchActivitySummary(batch: KernelActionBatchV1): string;
-  acceptedPlanBatchActivity(input: { accepted: AcceptedTaskPlanContext; batch: KernelActionBatchV1; status: 'running' | 'completed' }): unknown;
+  acceptedPlanBatchActivitySummary(
+    batch: KernelActionBatchV1,
+    language: ConversationPresentationLanguage
+  ): string;
+  acceptedPlanBatchActivity(input: {
+    accepted: AcceptedTaskPlanContext;
+    batch: KernelActionBatchV1;
+    status: 'running' | 'completed';
+    language: ConversationPresentationLanguage;
+  }): unknown;
   generatedPacketFromSuccessfulBatch(state: State, batch: KernelActionBatchV1, events: unknown[], id: string): unknown | undefined;
   indexGeneratedPacket(index: unknown, packet: unknown): void;
   recordGeneratedPacket(state: State, packet: unknown, stage: string): Promise<{ result?: AgentSessionResult }>;
   recordKernelBatchProgress(input: {
     acceptedPlan: AcceptedTaskPlanContext;
     proposal: ProposalEnvelope;
-    kernelEvents: unknown[];
+    kernelEvents: AgentEvent[];
   }): {
     progress: AcceptedPlanBatchProgress;
-    completedTaskIds: string[];
-    nextAcceptedPlan: AcceptedTaskPlanContext;
-  };
-  recordModelTaskOutcome(input: {
-    acceptedPlan: AcceptedTaskPlanContext;
-    taskId: string;
-  }): {
-    taskId: string;
     nextAcceptedPlan: AcceptedTaskPlanContext;
   };
   refreshRuntimeState(state: State): void;
@@ -128,7 +164,8 @@ export interface AcceptedPlanActionProposalSubmitterPorts<
     progress: unknown,
     ts: string,
     id: string,
-    contextCompactRecord?: ContextAssemblyTaskLocalCompactRecord
+    contextCompactRecord?: ContextAssemblyTaskLocalCompactRecord,
+    language?: ConversationPresentationLanguage
   ): AgentEvent;
   taskSavepointEvent(
     sessionId: string,
@@ -141,7 +178,8 @@ export interface AcceptedPlanActionProposalSubmitterPorts<
     context: unknown,
     ts: string,
     id: string,
-    contextCompactRecord?: ContextAssemblyTaskLocalCompactRecord
+    contextCompactRecord?: ContextAssemblyTaskLocalCompactRecord,
+    language?: ConversationPresentationLanguage
   ): AgentEvent;
   executionRequest(plan: any, acceptedPlan: AcceptedTaskPlanContext): string;
   staticSyntaxReview(input: {
@@ -152,6 +190,25 @@ export interface AcceptedPlanActionProposalSubmitterPorts<
     batch: KernelActionBatchV1;
     batchEvents: unknown[];
   }): Promise<AgentEvent[]>;
+  beforeKernelMutation?(input: {
+    input: Input;
+    state: State;
+    proposal: ProposalEnvelope;
+    batch: KernelActionBatchV1;
+    requestId: string;
+    contractId: string;
+    currentResult: AgentSessionResult;
+  }): Promise<AgentSessionResult>;
+  afterKernelObservation?(input: {
+    input: Input;
+    state: State;
+    proposal: ProposalEnvelope;
+    batch: KernelActionBatchV1;
+    requestId: string;
+    contractId: string;
+    observation: KernelReplyObservation;
+    projectedKernelEvents: AgentEvent[];
+  }): void | Promise<void>;
 }
 
 export class AcceptedPlanActionProposalSubmitter<
@@ -179,7 +236,11 @@ export class AcceptedPlanActionProposalSubmitter<
       const appended = await this.ports.appendDiagnostic(
         state,
         'acceptedPlanAuthorizationUnavailable',
-        'The accepted taskPlan is missing its Kernel plan authorization binding; Session will not submit a detached execution proposal.',
+        localizedProjectionText(conversationPresentationLanguage(state), {
+          zh: '已接受的 taskPlan 缺少 Kernel 计划授权绑定；Session 不会提交脱离授权合同的执行提案。',
+          en: 'The accepted taskPlan is missing its Kernel plan authorization binding; Session will not submit a detached execution proposal.',
+          neutral: 'accepted_plan_authorization=unavailable detached_execution_proposal=blocked',
+        }),
         undefined,
         'accepted-plan-authorization-unavailable'
       );
@@ -232,19 +293,31 @@ export class AcceptedPlanActionProposalSubmitter<
       const appended = await this.ports.appendDiagnostic(
         state,
         'autoPlanProposalReviewedMissing',
-        'Kernel did not return a proposal.reviewed event for the accepted-plan actionBundle; Session will not auto-execute this batch.',
+        localizedProjectionText(conversationPresentationLanguage(state), {
+          zh: 'Kernel 未为已接受计划的 actionBundle 返回 proposal.reviewed 事件；Session 不会自动执行该批次。',
+          en: 'Kernel did not return a proposal.reviewed event for the accepted-plan actionBundle; Session will not auto-execute this batch.',
+          neutral: 'proposal_reviewed=missing auto_execute=false',
+        }),
         undefined,
         'accepted-plan-review-missing'
       );
       return appended ?? result;
     }
-    result = await this.ports.appendProjectedKernelEvents(state.sessionId, proposalReply) ?? result;
+    result = await this.ports.appendProjectedKernelEvents(
+      state.sessionId,
+      proposalReply,
+      conversationPresentationLanguage(state)
+    ) ?? result;
     if (this.ports.denied(reviewReport)) {
       const reasons = this.ports.diagnosticSummary(reviewReport);
       const appended = await this.ports.appendDiagnostic(
         state,
         'autoBatchRejected',
-        `Kernel rejected the automatic execution batch: ${reasons}`,
+        localizedProjectionText(conversationPresentationLanguage(state), {
+          zh: `Kernel 拒绝自动执行批次：${reasons}`,
+          en: `Kernel rejected the automatic execution batch: ${reasons}`,
+          neutral: `automatic_execution_batch=rejected detail=${reasons}`,
+        }),
         { reasons },
         'accepted-plan-review-denied'
       );
@@ -270,7 +343,8 @@ export class AcceptedPlanActionProposalSubmitter<
         accepted,
         normalizedBatch.reasons,
         this.ports.now(),
-        this.ports.createId('accepted-plan-batch-normalization-failed')
+        this.ports.createId('accepted-plan-batch-normalization-failed'),
+        state.userAuthorityFrame?.effectiveLanguage
       ))) ?? result;
     }
     const batch = normalizedBatch.batch;
@@ -282,7 +356,8 @@ export class AcceptedPlanActionProposalSubmitter<
         'Kernel proposal review did not produce an execution contract for the accepted task batch.',
         'missing_execution_contract',
         this.ports.now(),
-        this.ports.createId('accepted-plan-execution-contract-missing')
+        this.ports.createId('accepted-plan-execution-contract-missing'),
+        state.userAuthorityFrame?.effectiveLanguage
       ))) ?? result;
     }
     await this.ports.appendTrace(state, 'accepted_plan.action_batch_preflight', {
@@ -291,26 +366,51 @@ export class AcceptedPlanActionProposalSubmitter<
       audit: this.ports.preflightAudit(batch),
     });
 
+    const presentationBinding = conversationPresentationLanguageBinding(state);
+    const presentationLanguage = presentationBinding.language;
     await this.ports.emitProjectionDelta(state, {
       type: 'stage_delta',
       stage: 'accepted_plan.action_batch_submit',
       status: 'running',
       channel: 'progress',
       source: 'session',
-      summary: this.ports.acceptedPlanBatchActivitySummary(batch),
-      activity: this.ports.acceptedPlanBatchActivity({ accepted, batch, status: 'running' }),
+      summary: this.ports.acceptedPlanBatchActivitySummary(batch, presentationLanguage),
+      activity: this.ports.acceptedPlanBatchActivity({
+        accepted,
+        batch,
+        status: 'running',
+        language: presentationLanguage,
+      }),
       payload: {
         visibility: 'task',
+        presentationLanguage,
+        languageRevision: presentationBinding.revision,
+        languageStatus: presentationBinding.status,
+        sourceTurnId: presentationBinding.sourceTurnId,
         planId: accepted.planId,
         batchIndex: accepted.batchIndex,
         actionCount: batch.actionBundle.actions.length,
       },
     } as ProjectionDelta);
 
+    const actionRequestId = this.ports.createId(
+      'accepted-plan-action-batch-submit'
+    );
+    if (this.ports.beforeKernelMutation) {
+      result = await this.ports.beforeKernelMutation({
+        input,
+        state,
+        proposal,
+        batch,
+        requestId: actionRequestId,
+        contractId,
+        currentResult: result,
+      });
+    }
     const observed = await this.ports.observeKernel({
       command: {
         kind: 'actionBatchSubmit',
-        requestId: this.ports.createId('accepted-plan-action-batch-submit'),
+        requestId: actionRequestId,
         runId: state.runId,
         sessionId: state.sessionId,
         batch,
@@ -318,7 +418,23 @@ export class AcceptedPlanActionProposalSubmitter<
     });
     const batchReply = observed.reply;
     await this.ports.emitKernelActivityDeltas(state, batchReply.events ?? [], 'accepted_plan.action_batch_submit');
-    result = await this.ports.appendProjectedKernelEvents(state.sessionId, batchReply) ?? result;
+    const projectionStart = result.events.length;
+    result = await this.ports.appendProjectedKernelEvents(
+      state.sessionId,
+      batchReply,
+      conversationPresentationLanguage(state)
+    ) ?? result;
+    const projectedKernelEvents = result.events.slice(projectionStart);
+    await this.ports.afterKernelObservation?.({
+      input,
+      state,
+      proposal,
+      batch,
+      requestId: actionRequestId,
+      contractId,
+      observation: observed,
+      projectedKernelEvents,
+    });
     if (observed.kind === 'commandFailed') {
       const message = kernelReplyErrorMessage(batchReply, 'Kernel actionBatchSubmit failed');
       const code = observed.code;
@@ -328,7 +444,8 @@ export class AcceptedPlanActionProposalSubmitter<
         message,
         code,
         this.ports.now(),
-        this.ports.createId('accepted-plan-action-batch-submit-failed')
+        this.ports.createId('accepted-plan-action-batch-submit-failed'),
+        state.userAuthorityFrame?.effectiveLanguage
       ))) ?? result;
     }
     const batchEvents = batchReply.events ?? [];
@@ -340,7 +457,8 @@ export class AcceptedPlanActionProposalSubmitter<
         batchEvents,
         batch,
         this.ports.now(),
-        this.ports.createId('accepted-plan-batch-failed')
+        this.ports.createId('accepted-plan-batch-failed'),
+        state.userAuthorityFrame?.effectiveLanguage
       ))) ?? result;
     }
     const generatedPacket = this.ports.generatedPacketFromSuccessfulBatch(
@@ -381,7 +499,11 @@ export class AcceptedPlanActionProposalSubmitter<
       return result;
     }
     const completedTaskId = state.currentTaskContext?.taskId;
-    const ledgerEffect = this.ports.recordKernelBatchProgress({ acceptedPlan: accepted, proposal: executionProposal, kernelEvents: batchReply.events ?? [] });
+    const ledgerEffect = this.ports.recordKernelBatchProgress({
+      acceptedPlan: accepted,
+      proposal: executionProposal,
+      kernelEvents: projectedKernelEvents,
+    });
     const batchProgress = ledgerEffect.progress;
     const nextAccepted = ledgerEffect.nextAcceptedPlan;
     state.acceptedTaskPlan = nextAccepted;
@@ -409,7 +531,8 @@ export class AcceptedPlanActionProposalSubmitter<
         batchProgress,
         this.ports.now(),
         this.ports.createId('accepted-plan-batch-checkpoint'),
-        contextCompactRecord
+        contextCompactRecord,
+        presentationLanguage
       ),
       this.ports.taskSavepointEvent(
         state.sessionId,
@@ -422,7 +545,8 @@ export class AcceptedPlanActionProposalSubmitter<
         state.currentTaskContext,
         this.ports.now(),
         savepointId,
-        contextCompactRecord
+        contextCompactRecord,
+        presentationLanguage
       ),
     ]) ?? result;
     if (state.taskExecutionCursor) {
@@ -455,6 +579,7 @@ export class AcceptedPlanActionProposalSubmitter<
         result,
         currentKernelEvents: [...(batchReply.events ?? []), ...staticReviewEvents.map((event) => event.payload)],
         requestIdPrefix: 'accepted-plan-review-facts-get',
+        presentationBinding,
       },
     };
   }

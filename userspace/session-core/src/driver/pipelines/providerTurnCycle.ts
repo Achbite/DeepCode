@@ -33,12 +33,18 @@ export interface ProviderTurnCyclePorts<Input, State extends ProviderTurnCycleSt
     lastResult: AgentSessionResult
   ): AcceptedPlanReviewHandoffRunInput<AcceptedPlanReviewHandoffPlan> | undefined;
   admitDirective(proposal: ProposalEnvelope): LoopDirective;
+  retryableProviderFailure?(
+    input: Input,
+    state: State,
+    error: unknown
+  ): boolean;
   appendDriverFailure(state: State, error: unknown): Promise<AgentSessionResult | null | undefined>;
   appendProviderFailure(state: State, error: unknown): Promise<AgentSessionResult>;
 }
 
 export type ProviderTurnCycleResult =
   | { kind: 'failed'; result: AgentSessionResult }
+  | { kind: 'retryExhausted'; lastResult: AgentSessionResult; error: unknown }
   | {
     kind: 'reviewRequired';
     request: AcceptedPlanReviewHandoffRunInput<AcceptedPlanReviewHandoffPlan>;
@@ -86,12 +92,32 @@ export class ProviderTurnCycle<Input, State extends ProviderTurnCycleState> {
     state.phase = 'provider_proposing';
     if (enteringProvider) await this.ports.appendProviderRunningState?.(state);
     let providerStep: ProposalEnvelope | NativeToolProviderResumeSignal;
-    try {
-      providerStep = await this.ports.callProviderAndParse(input.input, state, prompt);
-    } catch (error) {
-      const driverFailure = await this.ports.appendDriverFailure(state, error);
-      if (driverFailure) return { kind: 'failed', result: driverFailure };
-      return { kind: 'failed', result: await this.ports.appendProviderFailure(state, error) };
+    let retryCount = 0;
+    for (;;) {
+      try {
+        providerStep = await this.ports.callProviderAndParse(input.input, state, prompt);
+        break;
+      } catch (error) {
+        const retryable = this.ports.retryableProviderFailure?.(
+          input.input,
+          state,
+          error
+        ) === true;
+        if (retryable && retryCount < 3) {
+          retryCount += 1;
+          continue;
+        }
+        if (retryable) {
+          return {
+            kind: 'retryExhausted',
+            lastResult: providerContext.lastResult,
+            error,
+          };
+        }
+        const driverFailure = await this.ports.appendDriverFailure(state, error);
+        if (driverFailure) return { kind: 'failed', result: driverFailure };
+        return { kind: 'failed', result: await this.ports.appendProviderFailure(state, error) };
+      }
     }
     if (providerStep.kind === 'providerResume') {
       return {

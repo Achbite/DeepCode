@@ -6,10 +6,14 @@ import type {
   AcceptedPlanInterventionLevel,
   ExecutionSliceRole,
 } from '../../accepted-plan/types.js';
+import type { TaskLedgerOwnerV2 } from '@deepcode/protocol';
+import { createTaskLedgerV2 } from '../../run-state/index.js';
 
 export interface AcceptedTaskPlanSource {
   planId: string;
   runId: string;
+  sourceEventRef?: string;
+  proposalId?: string;
   planReviewReport?: Record<string, unknown>;
   planAuthorizationReview?: Record<string, unknown>;
   planHash?: string;
@@ -31,6 +35,7 @@ export class AcceptedTaskPlanContextBuilder {
     plan: AcceptedTaskPlanSource;
     interventionLevel?: AcceptedPlanInterventionLevel;
     executionRoot?: AcceptedTaskPlanExecutionRoot;
+    taskLedgerOwner?: TaskLedgerOwnerV2;
   }): AcceptedTaskPlanContext {
     const { plan, interventionLevel, executionRoot } = input;
     const rawPlan = plan.taskPlan ?? {};
@@ -63,6 +68,28 @@ export class AcceptedTaskPlanContextBuilder {
     const toolIds = this.ports.uniqueStrings(taskContexts.map((task) => task.toolId));
     const targetScopes = this.ports.uniqueStrings(taskContexts.flatMap((task) => task.targets));
     const authorizationOperations = planAuthorizationOperations(plan.planAuthorizationReview);
+    const taskLedger = createTaskLedgerV2({
+      owner: input.taskLedgerOwner ?? {
+        kind: 'run',
+        runId: plan.runId,
+        planId: plan.planId,
+      },
+      tasks: taskContexts.map((task) => ({
+        taskId: task.taskId,
+        title: task.title,
+        targets: this.ports.uniqueStrings(task.targets),
+        toolId: task.toolId,
+        dependencies: this.ports.uniqueStrings(task.dependencies),
+        acceptanceCriteria: this.ports.uniqueStrings(task.acceptanceCriteria ?? []),
+        failureCriteria: this.ports.uniqueStrings(task.failureCriteria ?? []),
+        required: true,
+      })),
+      sourceRefs: [
+        plan.sourceEventRef
+          ?? plan.proposalId
+          ?? plan.planId,
+      ],
+    });
     return {
       planId: plan.planId,
       planHash: plan.planHash,
@@ -78,7 +105,7 @@ export class AcceptedTaskPlanContextBuilder {
       executionRoot,
       interventionLevel,
       batchIndex: 1,
-      completedTaskIds: [],
+      taskLedger,
       dependencyFacts: [],
       rawPlan,
     };

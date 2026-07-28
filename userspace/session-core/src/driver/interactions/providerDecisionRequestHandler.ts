@@ -9,6 +9,11 @@ import type {
   InteractionOverlayContext,
   SessionTurnPhase,
 } from '../pipelines/interactionOverlayCodec.js';
+import {
+  conversationPresentationLanguageBinding,
+  type ConversationPresentationLanguageState,
+  type ProjectionLanguageBinding,
+} from '../projection/conversationPresentationLanguage.js';
 
 export interface ProviderDecisionRequestInput {
   sessionId: string;
@@ -16,7 +21,7 @@ export interface ProviderDecisionRequestInput {
   attachments?: AgentContextAttachment[];
 }
 
-export interface ProviderDecisionRequestState {
+export interface ProviderDecisionRequestState extends ConversationPresentationLanguageState {
   sessionId: string;
   runId: string;
   phase: SessionTurnPhase;
@@ -24,7 +29,6 @@ export interface ProviderDecisionRequestState {
   acceptedTaskPlan?: {
     planId?: string;
     runId?: string;
-    completedTaskIds?: string[];
   };
   currentTaskContext?: {
     taskId?: string;
@@ -53,6 +57,7 @@ export interface ProviderDecisionRequestHandlerPorts<
     originalUserRequest: string;
     attachments: AgentContextAttachment[];
     interactionOverlayPayload: Record<string, unknown>;
+    presentationBinding: ProjectionLanguageBinding;
     ts: string;
     id: string;
   }): AgentEvent;
@@ -97,7 +102,6 @@ export class ProviderDecisionRequestHandler<
       acceptedPlanId: state.acceptedTaskPlan?.planId,
       acceptedPlanRunId: state.acceptedTaskPlan?.runId,
       acceptedCurrentTaskId: state.currentTaskContext?.taskId,
-      acceptedCompletedTaskIds: state.acceptedTaskPlan?.completedTaskIds,
     };
     const confirmation = this.ports.confirmationEvent({
       sessionId: state.sessionId,
@@ -107,6 +111,7 @@ export class ProviderDecisionRequestHandler<
       originalUserRequest: input.content,
       attachments: input.attachments ?? [],
       interactionOverlayPayload: this.ports.interactionOverlayPayload(interactionOverlay),
+      presentationBinding: conversationPresentationLanguageBinding(state),
       ts: this.ports.now(),
       id: this.ports.createId('decision-request'),
     });

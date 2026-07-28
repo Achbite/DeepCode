@@ -6,6 +6,10 @@ import type {
 } from '@deepcode/protocol';
 import type { InteractionOverlayContext, SessionTurnPhase } from '../pipelines/interactionOverlayCodec.js';
 import type { ReviewProjectionSummaryPlan } from '../projection/reviewProjectionBuilder.js';
+import type {
+  ConversationPresentationLanguage,
+  ProjectionLanguageBinding,
+} from '../projection/conversationPresentationLanguage.js';
 
 export interface AcceptedPlanReviewHandoffPlan extends ReviewProjectionSummaryPlan {
   interactionOverlay?: InteractionOverlayContext;
@@ -17,7 +21,11 @@ export interface AcceptedPlanReviewHandoffCoordinatorInput<
   now(): string;
   createId(prefix: string): string;
   kernel(request: KernelCommandEnvelope): Promise<KernelReply>;
-  appendProjectedKernelEvents(sessionId: string, reply: KernelReply): Promise<AgentSessionResult | undefined>;
+  appendProjectedKernelEvents(
+    sessionId: string,
+    reply: KernelReply,
+    language: ConversationPresentationLanguage
+  ): Promise<AgentSessionResult | undefined>;
   append(sessionId: string, events: AgentEvent[]): Promise<AgentSessionResult | undefined>;
   assertKernelReplyOk(reply: KernelReply, code: string, fallback: string): void;
   acceptedPlanKernelEvents(
@@ -32,6 +40,7 @@ export interface AcceptedPlanReviewHandoffCoordinatorInput<
       plan: Plan;
       kernelEvents: unknown[];
       events?: AgentEvent[];
+      presentationBinding: ProjectionLanguageBinding;
       ts: string;
       id: string;
     }): AgentEvent;
@@ -66,6 +75,7 @@ export interface AcceptedPlanReviewHandoffRunInput<
   result: AgentSessionResult;
   currentKernelEvents: unknown[];
   requestIdPrefix: string;
+  presentationBinding: ProjectionLanguageBinding;
   interactionOverlay?: InteractionOverlayContext;
   assertFactsReplyOk?: {
     code: string;
@@ -96,7 +106,8 @@ export class AcceptedPlanReviewHandoffCoordinator<
     }
     const result = await this.input.appendProjectedKernelEvents(
       runInput.sessionId,
-      factsReply
+      factsReply,
+      runInput.presentationBinding.language
     ) ?? runInput.result;
     const reviewKernelEvents = this.input.acceptedPlanKernelEvents(
       result.events,
@@ -109,6 +120,7 @@ export class AcceptedPlanReviewHandoffCoordinator<
       plan: runInput.plan,
       kernelEvents: reviewKernelEvents,
       events: result.events,
+      presentationBinding: runInput.presentationBinding,
       ts: this.input.now(),
       id: this.input.createId('review-summary'),
     });

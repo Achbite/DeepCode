@@ -256,6 +256,8 @@ export type AgentEventKind =
   | 'user_msg'
   | 'user_guidance'
   | 'session_turn_authority'
+  | 'session_language_decision'
+  | 'session_goal_fact'
   | 'assistant_msg'
   | 'cache_telemetry'
   | 'requirement_confirmation'
@@ -402,8 +404,35 @@ export interface AgentEvent {
 
 export type SessionTurnAuthorityRelation = 'newTask' | 'interactionContinuation';
 
+export type ConversationLanguage = 'zh-CN' | 'en-US';
+
+export type ConversationLanguagePolicyStatus =
+  | 'pending'
+  | 'resolved'
+  | 'fallback'
+  | 'superseded';
+
+export type ConversationLanguageDecisionSource =
+  | 'modelSemanticDirective'
+  | 'hostFallbackMissing'
+  | 'hostFallbackInvalid'
+  | 'supersededByLaterUserInput';
+
+export interface ConversationLanguagePolicy {
+  schemaVersion: 'deepcode.session.conversation-language-policy.v1';
+  revision: number;
+  sourceTurnId: string;
+  sourceMessageIds: string[];
+  hostLanguage: ConversationLanguage;
+  status: ConversationLanguagePolicyStatus;
+  language?: ConversationLanguage;
+  decisionSource?: ConversationLanguageDecisionSource;
+  sourceProviderRequestId?: string;
+  sourceToolCallId?: string;
+}
+
 export interface SessionTurnAuthorityPayload {
-  schemaVersion: 'deepcode.session.turn-authority.v1';
+  schemaVersion: 'deepcode.session.turn-authority.v2';
   sessionId: string;
   runId: string;
   turnId: string;
@@ -412,10 +441,523 @@ export interface SessionTurnAuthorityPayload {
   sourceMessageHashes: string[];
   relation: SessionTurnAuthorityRelation;
   boundAtHookRef: string;
-  outputLanguage: string;
+  languagePolicy: ConversationLanguagePolicy;
   promptEpochId?: string;
   previousTaskId?: string;
   authorityHash: string;
+}
+
+export interface SessionLanguageDecisionPayload {
+  schemaVersion: 'deepcode.session.language-decision.v1';
+  sessionId: string;
+  runId: string;
+  turnId: string;
+  revision: number;
+  status: Exclude<ConversationLanguagePolicyStatus, 'pending'>;
+  responseLanguage?: ConversationLanguage;
+  decisionSource: ConversationLanguageDecisionSource;
+  sourceProviderRequestId?: string;
+  sourceToolCallId?: string;
+  decisionHash: string;
+}
+
+export type SessionProviderAttemptKindV1 =
+  | 'primary'
+  | 'resume'
+  | 'repair'
+  | 'retry'
+  | 'emptyRetry'
+  | 'streamFallback'
+  | 'review';
+
+/**
+ * Durable control metadata for one admitted physical Provider request.
+ * Prompt messages and Provider reasoning are intentionally excluded.
+ */
+export interface SessionProviderAdmissionMetadataV1 {
+  schemaVersion: 'deepcode.session.provider-admission-metadata.v1';
+  requestId: string;
+  parentRequestId?: string;
+  turnAuthorityRef: string;
+  attemptKind: SessionProviderAttemptKindV1;
+  stage: string;
+  languageRevision?: number;
+  providerPayloadDigest: string;
+  transportDigest: string;
+}
+
+export interface SessionProviderAdmissionProducerV1 {
+  kind: 'providerAdmission';
+  providerRequestId: string;
+  proposalId?: string;
+}
+
+export interface SessionRuleProducerV1 {
+  kind: 'sessionRule';
+  ruleId: string;
+  sourceEventRefs: string[];
+}
+
+export type SessionFactProducerV1 =
+  | SessionProviderAdmissionProducerV1
+  | SessionRuleProducerV1;
+
+export type SessionKernelFactKindV1 =
+  | 'plan_authorization.decision_recorded'
+  | 'tool.execution_attempted'
+  | 'tool.effect_observed'
+  | 'tool.outcome_indeterminate'
+  | 'tool.completed'
+  | 'work_unit.completed'
+  | 'work_unit.failed'
+  | 'work_unit.blocked'
+  | 'review.facts_produced'
+  | 'review_gate.evaluated'
+  | 'run.completed'
+  | 'runtime.lifecycle_changed'
+  | 'resource.cleanup_state_changed';
+
+/**
+ * Immutable reference to a typed Kernel fact. The referenced Kernel event,
+ * rather than these denormalized identity fields, remains authoritative.
+ */
+export interface SessionKernelFactRefV1 {
+  schemaVersion: 'deepcode.session.kernel-fact-ref.v1';
+  kernelEventRef: string;
+  kind: SessionKernelFactKindV1;
+  runId: string;
+  factId?: string;
+  planActionId?: string;
+  capabilityGrantId?: string;
+  authorizationContractId?: string;
+  operationId?: string;
+  workUnitId?: string;
+}
+
+/**
+ * Lineage is composed into applicable durable domain-event payloads. It is not
+ * an optional envelope on every AgentEvent.
+ */
+export interface SessionFactLineageV1 {
+  schemaVersion: 'deepcode.session.fact-lineage.v1';
+  turnAuthorityRef: string;
+  producer: SessionFactProducerV1;
+  domainParentRefs: string[];
+  kernelFactRefs: SessionKernelFactRefV1[];
+}
+
+export type SessionGoalLifecycleV1 =
+  | 'draft'
+  | 'awaitingPlanAcceptance'
+  | 'running'
+  | 'suspended'
+  | 'completed'
+  | 'failed'
+  | 'cancelled';
+
+export interface SessionGoalRefV1 {
+  goalId: string;
+  goalRevision: number;
+}
+
+export interface SessionGoalCommandIdentityV1 {
+  callerRequestId: string;
+  requestDigest: string;
+  hostRunId?: string;
+}
+
+export interface SessionGoalInteractionRefV1 {
+  kind: 'requirement' | 'plan' | 'review' | 'permission' | 'scopeChange';
+  interactionId: string;
+  interactionRevision: string;
+  targetId: string;
+  runId: string;
+}
+
+export interface SessionTaskDefinitionV1 {
+  taskId: string;
+  title?: string;
+  targets: string[];
+  toolId?: string;
+  dependencies: string[];
+  acceptanceCriteria: string[];
+  failureCriteria: string[];
+  required: true;
+}
+
+export type TaskLedgerOwnerV2 =
+  | ({
+      kind: 'goal';
+      confirmedPlanRef: string;
+    } & SessionGoalRefV1 & {
+      planId: string;
+    })
+  | {
+      kind: 'run';
+      runId: string;
+      planId: string;
+    };
+
+export type TaskSettlementV2 =
+  | {
+      kind: 'kernelFacts';
+      outcome: 'completed';
+      kernelFactRefs: SessionKernelFactRefV1[];
+    }
+  | {
+      kind: 'userDecision';
+      outcome: 'skipped' | 'acceptedIncomplete';
+      interaction: SessionGoalInteractionRefV1;
+      decisionEventRef: string;
+    }
+  | {
+      kind: 'deterministicCriterion';
+      outcome: 'completed';
+      validatorId: string;
+      validatorVersion: string;
+      evidenceRefs: string[];
+    };
+
+export type TaskFailureV2 =
+  | {
+      kind: 'kernelFacts';
+      reason: string;
+      kernelFactRefs: SessionKernelFactRefV1[];
+    }
+  | {
+      kind: 'sessionInvariant';
+      reason: string;
+      sourceRefs: string[];
+    };
+
+export interface TaskLedgerEntryV2 extends SessionTaskDefinitionV1 {
+  status: 'pending' | 'active' | 'settled' | 'failed';
+  settlement?: TaskSettlementV2;
+  failure?: TaskFailureV2;
+}
+
+export interface TaskLedgerSnapshotV2 {
+  schemaVersion: 'deepcode.session.task-ledger.v2';
+  owner: TaskLedgerOwnerV2;
+  revision: number;
+  taskOrder: string[];
+  currentTaskId?: string;
+  settledTaskIds: string[];
+  failedTaskIds: string[];
+  pendingTaskIds: string[];
+  entries: TaskLedgerEntryV2[];
+  sourceRefs: string[];
+}
+
+export type GoalStepOutcomeV1 =
+  | 'continue'
+  | 'suspend'
+  | 'complete'
+  | 'fail';
+
+export type SessionGoalActiveWaitKindV1 =
+  | 'requirement'
+  | 'plan'
+  | 'review'
+  | 'userDecision'
+  | 'userAcceptance'
+  | 'scopeChange'
+  | 'replan'
+  | 'budget'
+  | 'persistence'
+  | 'permission'
+  | 'cleanup'
+  | 'indeterminate'
+  | 'checkpointRequired';
+
+export interface SessionGoalActiveWaitV1 {
+  schemaVersion: 'deepcode.session.active-wait.v1';
+  waitId: string;
+  kind: SessionGoalActiveWaitKindV1;
+  source: 'session' | 'kernel';
+  reason: string;
+  resumable: boolean;
+  createdAt: string;
+  sourceRefs: string[];
+}
+
+export interface ExecutionBudgetCoreV1 {
+  schemaVersion: 'deepcode.session.execution-budget-core.v1';
+  steps: number;
+  providerCalls: number;
+  activeTimeMs: number;
+  consecutiveRetryCount: number;
+  lastStep: {
+    callerRequestId: string;
+    outcome: GoalStepOutcomeV1;
+    reason: string;
+    startedAt: string;
+    completedAt: string;
+  };
+  sourceRefs: string[];
+}
+
+export interface SessionGoalAnalysisRecordRefV1 {
+  schemaVersion: 'deepcode.session.analysis-record-ref.v1';
+  recordId: string;
+  analysisSeq: number;
+  recordDigest: string;
+  payloadDigest: string;
+  providerRequestId: string;
+  toolCallId: string;
+  proposalId: string;
+  proposalDigest: string;
+}
+
+export interface SessionGoalKernelEffectRefV1 {
+  requestId: string;
+  contractId: string;
+  contractHash?: string;
+  workUnitIds: string[];
+  kernelFactRefs: string[];
+}
+
+export interface SessionGoalPendingEffectV1 {
+  schemaVersion: 'deepcode.session.pending-effect.v1';
+  effectId: string;
+  kind: 'kernelAction';
+  state: 'prepared' | 'dispatched' | 'observed';
+  semanticRef: SessionGoalAnalysisRecordRefV1;
+  runId: string;
+  planId: string;
+  taskId: string;
+  actionIds: string[];
+  kernel?: SessionGoalKernelEffectRefV1;
+  sourceRefs: string[];
+}
+
+export interface GoalCheckpointV1 extends SessionGoalRefV1 {
+  schemaVersion: 'deepcode.session.goal-checkpoint.v1';
+  checkpointRef: string;
+  sequence: number;
+  sessionId: string;
+  lifecycle: Exclude<
+    SessionGoalLifecycleV1,
+    'draft' | 'awaitingPlanAcceptance'
+  >;
+  taskLedgerRef: {
+    factRef: string;
+    revision: number;
+    stateDigest: string;
+  };
+  activeWaitRef?: {
+    factRef: string;
+    waitId: string;
+  };
+  languageRef: {
+    revision: number;
+    status: ConversationLanguagePolicyStatus;
+    sourceTurnId: string;
+    turnAuthorityRef: string;
+  };
+  contextRefs: string[];
+  pendingEffect?: SessionGoalPendingEffectV1;
+  lastKernelFactRef?: string;
+  sourceRefs: string[];
+  createdAt: string;
+  stateDigest: string;
+}
+
+export interface SessionGoalFactBaseV1 extends SessionGoalRefV1 {
+  schemaVersion: 'deepcode.session.goal-fact.v1';
+  lifecycle: SessionGoalLifecycleV1;
+  objective: string;
+  sourceRefs: string[];
+  command: SessionGoalCommandIdentityV1;
+  lineage: SessionFactLineageV1;
+}
+
+export type SessionGoalFactPayloadV1 =
+  | (SessionGoalFactBaseV1 & {
+      factKind: 'draftCreated';
+      lifecycle: 'draft';
+      planRevision: 0;
+      sourceRunId: string;
+      predecessorGoalRef?: SessionGoalRefV1;
+    })
+  | (SessionGoalFactBaseV1 & {
+      factKind: 'planAwaitingAcceptance';
+      lifecycle: 'awaitingPlanAcceptance';
+      planId: string;
+      planRevision: number;
+      sourceRunId: string;
+    })
+  | (SessionGoalFactBaseV1 & {
+      factKind: 'planRevisionRequested';
+      lifecycle: 'awaitingPlanAcceptance';
+      planId: string;
+      planRevision: number;
+      sourceRunId: string;
+    })
+  | (SessionGoalFactBaseV1 & {
+      factKind: 'activated';
+      lifecycle: 'running';
+      planId: string;
+      planRevision: number;
+      confirmedPlanRef: string;
+      authorizationFactRef: string;
+      sourceRunId: string;
+      taskSnapshot: SessionTaskDefinitionV1[];
+    })
+  | (SessionGoalFactBaseV1 & {
+      factKind: 'suspended';
+      lifecycle: 'suspended';
+      waitRef: string;
+      sourceRunId: string;
+    })
+  | (SessionGoalFactBaseV1 & {
+      factKind: 'resumed';
+      lifecycle: 'running';
+      checkpointRef: string;
+      sourceRunId: string;
+    })
+  | (SessionGoalFactBaseV1 & {
+      factKind: 'completed' | 'failed' | 'cancelled';
+      lifecycle: 'completed' | 'failed' | 'cancelled';
+      sourceRunId: string;
+      terminalReason: string;
+      checkpointRef?: string;
+    })
+  | (SessionGoalFactBaseV1 & {
+      factKind: 'taskLedger';
+      lifecycle: 'running' | 'suspended';
+      taskLedger: TaskLedgerSnapshotV2;
+    })
+  | (SessionGoalFactBaseV1 & {
+      factKind: 'activeWait';
+      lifecycle: 'suspended';
+      activeWait: SessionGoalActiveWaitV1;
+    })
+  | (SessionGoalFactBaseV1 & {
+      factKind: 'checkpoint';
+      lifecycle: 'running' | 'suspended' | 'completed' | 'failed' | 'cancelled';
+      checkpoint: GoalCheckpointV1;
+    })
+  | (SessionGoalFactBaseV1 & {
+      factKind: 'budgetUsage';
+      lifecycle: 'running' | 'suspended';
+      executionBudget: ExecutionBudgetCoreV1;
+    });
+
+export type SessionGoalSlotExpectationV1 =
+  | {
+      state: 'empty';
+    }
+  | ({
+      state: 'active';
+      lifecycle: Exclude<
+        SessionGoalLifecycleV1,
+        'completed' | 'failed' | 'cancelled'
+      >;
+    } & SessionGoalRefV1);
+
+export type SessionGoalSlotSnapshotV1 =
+  | {
+      capability: 'goalSlotV1';
+      state: 'empty';
+      lastTerminalGoalRef?: SessionGoalRefV1 & {
+        lifecycle: 'completed' | 'failed' | 'cancelled';
+        factRef: string;
+      };
+    }
+  | ({
+      capability: 'goalSlotV1';
+      state: 'active';
+      lifecycle: Exclude<
+        SessionGoalLifecycleV1,
+        'completed' | 'failed' | 'cancelled'
+      >;
+      factRef: string;
+    } & SessionGoalRefV1);
+
+export type SessionGoalEffectV1 =
+  | ({
+      kind: 'open';
+      lifecycle: 'draft';
+      factRef: string;
+    } & SessionGoalRefV1)
+  | ({
+      kind: 'transition';
+      fromLifecycle: Exclude<
+        SessionGoalLifecycleV1,
+        'completed' | 'failed' | 'cancelled'
+      >;
+      toLifecycle: Exclude<
+        SessionGoalLifecycleV1,
+        'completed' | 'failed' | 'cancelled'
+      >;
+      factRef: string;
+    } & SessionGoalRefV1)
+  | ({
+      kind: 'release';
+      lifecycle: 'completed' | 'failed' | 'cancelled';
+      factRef: string;
+    } & SessionGoalRefV1);
+
+export type GoalProjectionAvailabilityV1<T> =
+  | {
+      status: 'notAvailable';
+    }
+  | {
+      status: 'available';
+      value: T;
+    };
+
+export interface GoalProjectionV1 extends SessionGoalRefV1 {
+  schemaVersion: 'deepcode.session.goal-projection.v1';
+  sessionId: string;
+  lifecycle: SessionGoalLifecycleV1;
+  objective: string;
+  predecessorGoalRef?: SessionGoalRefV1;
+  sourceDomainHead: SessionDomainHeadV1;
+  conversationRef: {
+    revision: number;
+    sourceEventVersion: number;
+  };
+  pendingInteraction?: SessionGoalInteractionRefV1;
+  task: GoalProjectionAvailabilityV1<{
+    currentTaskId?: string;
+    settled: number;
+    total: number;
+  }>;
+  activeWait: GoalProjectionAvailabilityV1<SessionGoalActiveWaitV1 | null>;
+  checkpoint: GoalProjectionAvailabilityV1<{
+    sequence: number;
+    checkpointRef: string;
+  }>;
+  executionBudget: GoalProjectionAvailabilityV1<ExecutionBudgetCoreV1>;
+  terminal?: {
+    status: 'completed' | 'failed' | 'cancelled';
+    factRef: string;
+    reason: string;
+  };
+  factRefs: string[];
+  sourceRefs: string[];
+}
+
+export interface SessionGoalCommandReceiptV1 {
+  schemaVersion: 'deepcode.session.goal-command-receipt.v1';
+  sessionId: string;
+  operation:
+    | 'start'
+    | 'resolveInteraction'
+    | 'advance'
+    | 'resume'
+    | 'cancel'
+    | 'read';
+  callerRequestId?: string;
+  requestDigest?: string;
+  idempotent: boolean;
+  goalId?: string;
+  goalRevision?: number;
+  sourceDomainHead: SessionDomainHeadV1;
+  projection: GoalProjectionV1 | null;
+  hostRunId?: string;
 }
 
 export type AgentTimelineBlockKind =
@@ -449,7 +991,76 @@ export type AgentTimelineStatus =
   | 'waiting'
   | 'blocked'
   | 'completed'
+  | 'cancelled'
   | 'failed';
+
+export type AgentTimelineEntryRole =
+  | 'userMessage'
+  | 'agentUpdate'
+  | 'activityGroup'
+  | 'evidence'
+  | 'interaction'
+  | 'finalAnswer'
+  | 'diagnostic';
+
+export type AgentTimelineDurability = 'live' | 'committed';
+
+export type AgentTimelineLanguageBindingStatus =
+  | 'pending'
+  | 'resolved'
+  | 'fallback'
+  | 'superseded'
+  | 'unavailable';
+
+export interface AgentTimelineLanguageBinding {
+  language: ConversationLanguage | 'neutral';
+  revision?: number;
+  status: AgentTimelineLanguageBindingStatus;
+  sourceTurnId?: string;
+}
+
+export interface AgentTimelineProvenance {
+  origin: 'user' | 'session' | 'kernel' | 'provider';
+  authority: 'user' | 'session' | 'kernel';
+  sourceEventRefs: string[];
+  factRefs: string[];
+  evidenceRefs: string[];
+}
+
+export interface AgentTimelineLocalizedText {
+  text?: string;
+  messageKey?: string;
+  messageArgs?: Record<string, string>;
+}
+
+export type AgentTimelineRunStatus =
+  | 'active'
+  | 'waitingUser'
+  | 'waitingExternal'
+  | 'paused'
+  | 'succeeded'
+  | 'failed'
+  | 'cancelled';
+
+export type AgentTimelineRunPhase =
+  | 'preparing'
+  | 'processing'
+  | 'executing'
+  | 'validating'
+  | 'waiting'
+  | 'settled';
+
+export interface AgentTimelineRunProjection {
+  runId: string;
+  turnId?: string;
+  taskId?: string;
+  revision: number;
+  status: AgentTimelineRunStatus;
+  phase: AgentTimelineRunPhase;
+  waitReason?: string;
+  activeInteractionId?: string;
+  languageBinding: AgentTimelineLanguageBinding;
+}
 
 export type AgentConversationActivityKind =
   | 'providerThinking'
@@ -465,6 +1076,7 @@ export type AgentConversationActivityKind =
 
 export interface AgentConversationActivity {
   activityId: string;
+  activityRevision?: number;
   kind: AgentConversationActivityKind;
   status: AgentTimelineStatus;
   title: string;
@@ -476,6 +1088,7 @@ export interface AgentConversationActivity {
   targets?: string[];
   actionIds?: string[];
   workUnitIds?: string[];
+  resourcePacketIds?: string[];
   toolName?: string;
   operation?: string;
   itemCount?: number;
@@ -505,6 +1118,12 @@ export interface AgentTimelineTaskProjectionItem {
   status: AgentTimelineStatus;
   blockId: string;
   narrativeKind: AgentTimelineNarrativeKind;
+  settlementKind?:
+    | 'kernelCompleted'
+    | 'sessionEvidenceSatisfied'
+    | 'userSkipped'
+    | 'userAcceptedIncomplete'
+    | 'failed';
 }
 
 export interface AgentTimelineTaskProjection {
@@ -534,18 +1153,79 @@ export interface AgentTimelineDecisionRequest {
   options: AgentTimelineInteractionOption[];
 }
 
+export interface AgentTimelinePermissionRequestView {
+  id: string;
+  runId?: string;
+  requestKind?: 'runtimePermission' | 'scopeExpansion';
+  permissionBundleId?: string;
+  contractId?: string;
+  affectedOperationIds?: string[];
+  workUnitIds?: string[];
+  toolId?: string;
+  toolName: string;
+  riskLevel: 'low' | 'medium' | 'high' | 'critical';
+  summary: string;
+  diff?: string;
+  argumentsPreview?: string;
+}
+
+export type AgentTimelineInteractionState =
+  | 'open'
+  | 'submitting'
+  | 'accepted'
+  | 'rejected'
+  | 'needsRevision'
+  | 'superseded'
+  | 'expired';
+
+export interface AgentTimelineInteractionIdentity {
+  interactionId: string;
+  /**
+   * Opaque durable token of the AgentEvent that opened this interaction.
+   * It is intentionally not a projector counter or array position.
+   */
+  interactionRevision: string;
+  targetId: string;
+}
+
+export interface AgentTimelineInteractionView extends AgentTimelineInteractionIdentity {
+  kind: 'requirement' | 'plan' | 'permission' | 'review';
+  runId?: string;
+  state: AgentTimelineInteractionState;
+  decisionRequest?: AgentTimelineDecisionRequest;
+  selectedDecision?: {
+    decision: string;
+    source: 'button' | 'freeText';
+    decidedAt?: string;
+  };
+}
+
 export type AgentTimelinePendingInteraction =
-  | {
+  | (AgentTimelineInteractionIdentity & {
       kind: 'permission';
       requestId: string;
-      request: PermissionRequest;
+      request: AgentTimelinePermissionRequestView;
       blockId?: string;
       title?: string;
       summary?: string;
-    }
-  | { kind: 'review'; runId: string; blockId?: string; title?: string; summary?: string }
-  | { kind: 'plan'; runId: string; planId: string; blockId?: string; title?: string; summary?: string }
-  | {
+    })
+  | (AgentTimelineInteractionIdentity & {
+      kind: 'review';
+      runId: string;
+      reviewId: string;
+      blockId?: string;
+      title?: string;
+      summary?: string;
+    })
+  | (AgentTimelineInteractionIdentity & {
+      kind: 'plan';
+      runId: string;
+      planId: string;
+      blockId?: string;
+      title?: string;
+      summary?: string;
+    })
+  | (AgentTimelineInteractionIdentity & {
       kind: 'requirement';
       runId: string;
       requirementId: string;
@@ -553,7 +1233,7 @@ export type AgentTimelinePendingInteraction =
       title?: string;
       summary?: string;
       decisionRequest?: AgentTimelineDecisionRequest;
-    };
+    });
 
 export interface AgentTimelineInteractionProjection {
   pending?: AgentTimelinePendingInteraction;
@@ -600,7 +1280,9 @@ export interface AgentTimelineStructuredProjectionItem {
   status?: string;
   targetRefs?: string[];
   auditRefs?: string[];
-  metadata?: Record<string, unknown>;
+  objective?: string;
+  acceptanceCriteria?: string[];
+  failureConditions?: string[];
 }
 
 export interface AgentTimelineStructuredProjectionSection {
@@ -630,16 +1312,21 @@ export interface AgentTimelineBlock {
   sequence?: number;
   revision?: number;
   deliveryMode?: AgentTimelineDeliveryMode;
+  durability: AgentTimelineDurability;
   kind: AgentTimelineBlockKind;
   narrativeKind?: AgentTimelineNarrativeKind;
+  entryRole: AgentTimelineEntryRole;
   activity?: AgentConversationActivity;
   title: string;
   summary: string;
   status: AgentTimelineStatus;
   defaultCollapsed: boolean;
   bodyMarkdown?: string;
+  localizedContent?: AgentTimelineLocalizedText;
   structuredProjection?: AgentTimelineStructuredProjection;
   decisionRequest?: AgentTimelineDecisionRequest;
+  interaction?: AgentTimelineInteractionView;
+  confirmable?: boolean;
   attachments?: AgentContextAttachment[];
   feedbackRef?: {
     eventId: string;
@@ -648,9 +1335,9 @@ export interface AgentTimelineBlock {
   };
   displayHints?: AgentTimelineDisplayHints;
   evidenceRefs?: string[];
-  rawEventRefs?: string[];
+  provenance: AgentTimelineProvenance;
+  languageBinding: AgentTimelineLanguageBinding;
   taskProjectionRef?: string;
-  events: AgentEvent[];
 }
 
 export interface AgentTimelineTurn {
@@ -660,26 +1347,78 @@ export interface AgentTimelineTurn {
   status: AgentTimelineStatus;
   startedAt?: string;
   completedAt?: string;
+  settlement?: {
+    schemaVersion: 'deepcode.session.turn-settlement.v1';
+    status: 'waiting' | 'completed' | 'failed' | 'cancelled';
+    factRef: string;
+    turnAuthorityRef: string;
+  };
+  executionEvidence?: {
+    kind: 'notRequired' | 'kernelFactBacked';
+    sourceFactRef: string;
+    taskClaims: Array<{
+      taskId: string;
+      workUnitIds: string[];
+      factRefs: string[];
+    }>;
+  };
   blocks: AgentTimelineBlock[];
 }
 
 export interface AgentTimelineResult {
-  schemaVersion?: 'deepcode.session.timeline.v1';
+  schemaVersion: 'deepcode.shared-conversation-projection.v2';
   sessionId: string;
-  revision?: number;
-  lastDeltaSeq?: number;
+  revision: number;
+  sourceEventVersion: number;
+  lastDeltaSeq: number;
   generatedAt: string;
   turns: AgentTimelineTurn[];
   eventCount: number;
   taskProjection?: AgentTimelineTaskProjection;
   interactionProjection?: AgentTimelineInteractionProjection;
+  runProjection?: AgentTimelineRunProjection;
   tokenUsageProjection?: AgentTimelineTokenUsageProjection;
   workspaceProjection?: AgentTimelineWorkspaceProjection;
-  rawEventRefs?: string[];
 }
 
+/**
+ * Read-only compatibility shape for snapshots produced before Shared
+ * Projection v2. Hosts must normalize this shape before rendering and must not
+ * submit decisions from legacy blocks because they have no durable interaction
+ * revision token.
+ */
+export interface LegacyAgentTimelineBlockV1
+  extends Omit<
+    AgentTimelineBlock,
+    'durability' | 'entryRole' | 'provenance' | 'languageBinding'
+  > {
+  durability?: AgentTimelineDurability;
+  entryRole?: AgentTimelineEntryRole;
+  provenance?: AgentTimelineProvenance;
+  languageBinding?: AgentTimelineLanguageBinding;
+  events: AgentEvent[];
+}
+
+export interface LegacyAgentTimelineTurnV1 extends Omit<AgentTimelineTurn, 'blocks'> {
+  blocks: LegacyAgentTimelineBlockV1[];
+}
+
+export interface LegacyAgentTimelineResultV1
+  extends Omit<
+    AgentTimelineResult,
+    'schemaVersion' | 'turns' | 'runProjection' | 'revision' | 'sourceEventVersion' | 'lastDeltaSeq'
+  > {
+  schemaVersion: 'deepcode.session.timeline.v1';
+  revision?: number;
+  sourceEventVersion?: number;
+  lastDeltaSeq?: number;
+  turns: LegacyAgentTimelineTurnV1[];
+}
+
+export type AgentTimelineSnapshot = AgentTimelineResult | LegacyAgentTimelineResultV1;
+
 export interface AgentTimelineDeltaBase {
-  schemaVersion: 'deepcode.session.timeline-delta.v1';
+  schemaVersion: 'deepcode.shared-conversation-projection-delta.v2';
   op:
     | 'timeline.synced'
     | 'block.started'
@@ -738,7 +1477,7 @@ export interface AgentTimelineActivityUpsertedDelta extends AgentTimelineDeltaBa
 
 export interface AgentTimelineBlockCompletedDelta extends AgentTimelineDeltaBase {
   op: 'block.completed';
-  status: Extract<AgentTimelineStatus, 'completed' | 'waiting' | 'failed' | 'blocked'>;
+  status: Extract<AgentTimelineStatus, 'completed' | 'waiting' | 'failed' | 'blocked' | 'cancelled'>;
   contentHash?: string;
 }
 
@@ -871,6 +1610,14 @@ export interface ResolveAgentReviewRequest {
   guidance?: string;
 }
 
+export interface SubmitAgentRunGuidanceRequest {
+  guidance: string;
+  attachments?: AgentContextAttachment[];
+  hostLanguage?: ConversationLanguage;
+  baseHead: SessionDomainHeadV1;
+  turnAuthorityRef: string;
+}
+
 export type AgentFeedbackRating = 'up' | 'down';
 
 export interface AgentFeedbackRequest {
@@ -886,12 +1633,335 @@ export interface AgentFeedbackResult {
   message: string;
 }
 
-export interface AppendAgentEventsRequest {
-  events: AgentEvent[];
-  timeline?: AgentTimelineResult;
+export interface SessionDomainHeadV1 {
+  schemaVersion: 'deepcode.session.domain-head.v1';
+  headRevision: number;
+  eventVersion: number;
+  headDigest: string;
 }
 
-export interface AgentSessionResult {
+export type SessionDomainStorageFormatV1 =
+  | 'domainBatchV1'
+  | 'legacyRawEventsV1'
+  | 'mixed'
+  | 'invalid';
+
+export type SessionAppendReadOnlyReasonV1 =
+  | 'legacyFormat'
+  | 'mixedFormat'
+  | 'invalidRecord'
+  | 'recoveryRequired';
+
+export type SessionAppendWriteabilityV1 =
+  | {
+      schemaVersion: 'deepcode.session.append-writeability.v1';
+      status: 'writable';
+      format: 'domainBatchV1';
+    }
+  | {
+      schemaVersion: 'deepcode.session.append-writeability.v1';
+      status: 'readOnly';
+      format: SessionDomainStorageFormatV1;
+      reason: SessionAppendReadOnlyReasonV1;
+    };
+
+export type SessionRunFenceStateV1 = 'open' | 'closing' | 'closed';
+
+export type SessionRunFenceExpectationV1 =
+  | {
+      state: 'open';
+      revision: number;
+    }
+  | {
+      state: 'closing' | 'closed';
+      revision: number;
+      ownerBatchId: string;
+    };
+
+export type SessionRunFenceSnapshotV1 =
+  | {
+      runId: string;
+      state: 'open';
+      revision: number;
+    }
+  | {
+      runId: string;
+      state: 'closing' | 'closed';
+      revision: number;
+      ownerBatchId: string;
+    };
+
+export interface SessionInteractionIdentityV1 {
+  interactionId: string;
+  interactionRevision: string;
+  targetId: string;
+}
+
+export type SessionInteractionExpectationV1 =
+  | {
+      state: 'open';
+    }
+  | {
+      state: 'claimed';
+      claimBatchId: string;
+    };
+
+export type SessionInteractionFenceSnapshotV1 =
+  SessionInteractionIdentityV1 & SessionInteractionExpectationV1;
+
+export interface SessionDomainStateSnapshotV1 {
+  schemaVersion: 'deepcode.session.domain-state-snapshot.v1';
+  head: SessionDomainHeadV1;
+  runFences: SessionRunFenceSnapshotV1[];
+  interactionFences: SessionInteractionFenceSnapshotV1[];
+  /**
+   * Current writers always return this capability. It remains optional in the
+   * structural type so read-only v1 fixtures and legacy snapshots can be
+   * decoded and then rejected by Goal admission rather than failing JSON
+   * decoding before a diagnostic can be produced.
+   */
+  goalSlot?: SessionGoalSlotSnapshotV1;
+}
+
+export type SessionAppendPreconditionV1 =
+  | {
+      kind: 'runFence';
+      runId: string;
+      expected: SessionRunFenceExpectationV1;
+    }
+  | {
+      kind: 'turnAuthority';
+      eventId: string;
+    }
+  | {
+      kind: 'goalSlot';
+      expected: SessionGoalSlotExpectationV1;
+    }
+  | ({
+      kind: 'interaction';
+      expected: SessionInteractionExpectationV1;
+    } & SessionInteractionIdentityV1);
+
+export type SessionAppendEventTransitionV1 =
+  | {
+      kind: 'append';
+      intent: 'openRun';
+      runId: string;
+    }
+  | {
+      kind: 'append';
+      intent: 'bootstrapRun';
+      runId: string;
+      bootstrapAdmissionId: string;
+      turnAuthorityRef: string;
+    }
+  | {
+      kind: 'append';
+      intent: 'bootstrapGoalRun';
+      runId: string;
+      bootstrapAdmissionId: string;
+      turnAuthorityRef: string;
+    }
+  | {
+      kind: 'append';
+      intent: 'domainFacts';
+      runId: string;
+      turnAuthorityRef: string;
+    }
+  | {
+      kind: 'append';
+      intent: 'guidance';
+      runId: string;
+      turnAuthorityRef: string;
+    }
+  | ({
+      kind: 'append';
+      intent: 'interactionSettlement';
+      runId: string;
+      claimBatchId: string;
+    } & SessionInteractionIdentityV1)
+  | ({
+      kind: 'append';
+      intent: 'releaseInteractionClaim';
+      runId: string;
+      claimBatchId: string;
+    } & SessionInteractionIdentityV1);
+
+export type SessionInteractionEffectV1 =
+  | ({
+      kind: 'open';
+    } & SessionInteractionIdentityV1)
+  | ({
+      kind: 'settle';
+      claimBatchId: string;
+    } & SessionInteractionIdentityV1)
+  | ({
+      kind: 'release';
+      claimBatchId: string;
+    } & SessionInteractionIdentityV1);
+
+export type SessionClaimTransitionV1 = {
+  kind: 'claim';
+  claimantRunId: string;
+  decisionRequestId: string;
+} & SessionInteractionIdentityV1;
+
+export type SessionCloseTerminalTransitionV1 = {
+  kind: 'close';
+  phase: 'terminal';
+  runId: string;
+  interactionEffect?: SessionInteractionEffectV1;
+} & (
+  | {
+      status: 'cancelled';
+      parentCloseBatchId: string;
+    }
+  | {
+      status: 'completed' | 'failed' | 'waiting';
+      parentCloseBatchId?: never;
+    }
+);
+
+export type SessionCloseTransitionV1 =
+  | {
+      kind: 'close';
+      phase: 'request';
+      runId: string;
+      status: 'cancelRequested';
+      interactionEffect?: SessionInteractionEffectV1;
+    }
+  | SessionCloseTerminalTransitionV1;
+
+export type SessionAppendTransitionV1 =
+  | (SessionAppendEventTransitionV1 & {
+      goalEffect?: SessionGoalEffectV1;
+    })
+  | (SessionClaimTransitionV1 & {
+      goalEffect?: SessionGoalEffectV1;
+    })
+  | (SessionCloseTransitionV1 & {
+      goalEffect?: SessionGoalEffectV1;
+    });
+
+export interface SessionAppendCommandV1 {
+  schemaVersion: 'deepcode.session.append-command.v1';
+  batchId: string;
+  baseHead: SessionDomainHeadV1;
+  preconditions: SessionAppendPreconditionV1[];
+  transition: SessionAppendTransitionV1;
+  events: AgentEvent[];
+  timeline?: AgentTimelineResult;
+  providerAdmissions: SessionProviderAdmissionMetadataV1[];
+  /**
+   * One-use transport capability for a new bootstrapRun. It is validated by
+   * the Daemon but excluded from the durable batch record and every digest.
+   */
+  bootstrapToken?: string;
+}
+
+export interface SessionProjectionCommitAckV1 {
+  schemaVersion: 'deepcode.session.projection-commit-ack.v1';
+  revision: number;
+  sourceEventVersion: number;
+  projectionDigest: string;
+}
+
+export interface SessionAppendReceiptV1 {
+  schemaVersion: 'deepcode.session.append-receipt.v1';
+  sessionId: string;
+  batchId: string;
+  serverDigest: string;
+  baseHead: SessionDomainHeadV1;
+  resultState: SessionDomainStateSnapshotV1;
+  idempotent: boolean;
+  projectionAck?: SessionProjectionCommitAckV1;
+  committedAt: string;
+}
+
+export type AppendAgentEventsRequest = SessionAppendCommandV1;
+
+export type SessionAppendErrorCodeV1 =
+  | 'session_append_legacy_read_only'
+  | 'session_append_batch_conflict'
+  | 'session_append_head_conflict'
+  | 'session_append_precondition_failed'
+  | 'session_append_transition_invalid'
+  | 'session_append_lineage_invalid'
+  | 'session_append_recovery_required';
+
+interface SessionAppendErrorDetailsBaseV1 {
+  schemaVersion: 'deepcode.session.append-error-details.v1';
+  code: SessionAppendErrorCodeV1;
+  sessionId: string;
+  reason: string;
+}
+
+export type SessionAppendErrorDetailsV1 =
+  | (SessionAppendErrorDetailsBaseV1 & {
+      code: 'session_append_legacy_read_only';
+      writeability: SessionAppendWriteabilityV1;
+    })
+  | (SessionAppendErrorDetailsBaseV1 & {
+      code: 'session_append_batch_conflict';
+      batchId: string;
+      existingBatchDigest: string;
+      submittedBatchDigest: string;
+      currentHead: SessionDomainHeadV1;
+    })
+  | (SessionAppendErrorDetailsBaseV1 & {
+      code: 'session_append_head_conflict';
+      batchId: string;
+      expectedHead: SessionDomainHeadV1;
+      currentHead: SessionDomainHeadV1;
+    })
+  | (SessionAppendErrorDetailsBaseV1 & {
+      code: 'session_append_precondition_failed';
+      batchId: string;
+      currentHead: SessionDomainHeadV1;
+      preconditionIndex: number;
+      failedPrecondition: SessionAppendPreconditionV1;
+    })
+  | (SessionAppendErrorDetailsBaseV1 & {
+      code: 'session_append_transition_invalid';
+      batchId: string;
+      currentHead: SessionDomainHeadV1;
+      transition: SessionAppendTransitionV1;
+    })
+  | (SessionAppendErrorDetailsBaseV1 & {
+      code: 'session_append_lineage_invalid';
+      batchId: string;
+      currentHead: SessionDomainHeadV1;
+      eventId?: string;
+    })
+  | (SessionAppendErrorDetailsBaseV1 & {
+      code: 'session_append_recovery_required';
+      currentHead?: SessionDomainHeadV1;
+      writeability: SessionAppendWriteabilityV1;
+    });
+
+interface AgentSessionResultBase {
   session: AgentSession;
   events: AgentEvent[];
 }
+
+export type AgentSessionResult = AgentSessionResultBase &
+  (
+    | {
+        appendWriteability: Extract<
+          SessionAppendWriteabilityV1,
+          { status: 'writable'; format: 'domainBatchV1' }
+        >;
+        domainState: SessionDomainStateSnapshotV1;
+        appendReceipt?: SessionAppendReceiptV1;
+      }
+    | {
+        appendWriteability: {
+          schemaVersion: 'deepcode.session.append-writeability.v1';
+          status: 'readOnly';
+          format: 'legacyRawEventsV1';
+          reason: 'legacyFormat';
+        };
+        domainState?: never;
+        appendReceipt?: never;
+      }
+  );

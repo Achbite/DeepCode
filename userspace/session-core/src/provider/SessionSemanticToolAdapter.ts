@@ -10,7 +10,11 @@ import type {
   ResourceManifest,
   ResourcePacket,
 } from '../context/types.js';
-import type { KernelArtifactEditMatch, KernelToolCatalogSnapshot } from '@deepcode/protocol';
+import type {
+  ConversationLanguage,
+  KernelArtifactEditMatch,
+  KernelToolCatalogSnapshot,
+} from '@deepcode/protocol';
 
 export interface SessionSemanticToolState {
   readonly sessionId: string;
@@ -30,7 +34,12 @@ export interface SessionSemanticToolState {
       draftAdmissionPolicy?: { maxTotalUtf8Bytes?: number };
     };
   };
-  readonly userAuthorityFrame?: { readonly outputLanguage?: 'zh-CN' | 'en-US' | string };
+  readonly userAuthorityFrame?: {
+    readonly effectiveLanguage?: ConversationLanguage;
+    readonly languagePolicy?: {
+      readonly status?: string;
+    };
+  };
 }
 
 export type SessionSemanticDirective =
@@ -197,6 +206,8 @@ export class SessionSemanticToolAdapter {
       sessionId: state.sessionId,
       source: 'llm',
       kind,
+      responseLanguage: conversationLanguage(toolCall.arguments.responseLanguage)
+        ?? conversationLanguage(state.userAuthorityFrame?.effectiveLanguage),
       narration: stringValue(toolCall.arguments.narration),
       payload,
       referencedResourcePacketRefs: [],
@@ -411,6 +422,10 @@ function requiredString(value: unknown, field: string): string {
 
 function stringValue(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function conversationLanguage(value: unknown): ProposalEnvelope['responseLanguage'] {
+  return value === 'zh-CN' || value === 'en-US' ? value : undefined;
 }
 
 function stringArray(value: unknown): string[] {

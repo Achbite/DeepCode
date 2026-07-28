@@ -3,6 +3,7 @@ import type {
   AgentEvent,
   AgentSessionResult,
   AgentWorkspaceBinding,
+  ConversationLanguage,
   KernelCommandEnvelope,
   KernelReply,
   LlmChatRequest,
@@ -34,21 +35,31 @@ import type {
   TaskLedgerSnapshot,
 } from '../../run-state/index.js';
 import type { DriverRequestRef, KernelStateContractRef } from '../types.js';
+import type { ConversationPresentationLanguage } from '../projection/conversationPresentationLanguage.js';
 import type { InteractionOverlayContext, SessionTurnPhase } from './interactionOverlayCodec.js';
-import type { DriverProviderTurnFrame, SessionDriverTaskResourceProgress } from '../runFrame.js';
+import type {
+  DriverProviderTurnFrame,
+  PendingSemanticExchange,
+  SessionDriverTaskResourceProgress,
+} from '../runFrame.js';
+import type { ActiveProviderContinuation } from './providerContinuationMessages.js';
+import type { PendingProviderRetryAdmission } from './admittedProviderRequest.js';
 import { latestEventRunId, recoverKernelContext } from '../context/kernelEnvelopeReader.js';
 import {
   buildUserAuthorityFrame,
   createSessionTurnAuthorityEvent,
+  hasLegacySessionTurnAuthority,
   latestExplicitUserContent,
   latestSessionTurnAuthority,
   UserAuthorityFrameError,
   type UserAuthorityFrame,
 } from '../context/userAuthorityFrame.js';
 import {
-  visibleLanguageForRequest,
-  type VisibleLanguage,
-} from '../runtimeSupport.js';
+  createSessionLanguageDecisionEvent,
+  nextConversationLanguageRevision,
+  normalizeHostLanguage,
+  resolveConversationLanguagePolicy,
+} from '../context/conversationLanguagePolicy.js';
 import { findActiveInteraction } from '../../run-state/index.js';
 import {
   emptyPromptLedgerState,
@@ -62,11 +73,12 @@ import {
 import { ArtifactDraftLease } from '../execution/artifactDraftLedger.js';
 import type { AcceptedTaskReplanReason } from '../execution/artifactDraftReplanCoordinator.js';
 import type { AutonomyMode } from '../../sessionModes.js';
-import type { NativeToolCallProposal } from '../../provider/providerStreamParts.js';
 import { PermissionPipeline } from './permissionPipeline.js';
+import type { SessionGoalOperationContext } from '../../goal/index.js';
 
 export interface RunLifecycleInput {
   sessionId: string;
+  hostRunId?: string;
   content: string;
   attachments?: AgentContextAttachment[];
   existingEvents?: AgentEvent[];
@@ -84,18 +96,25 @@ export interface RunLifecycleInput {
   acceptedTaskPlan?: AcceptedTaskPlanContext;
   interactionOverlay?: InteractionOverlayContext;
   autonomyMode?: AutonomyMode;
+  hostLanguage?: ConversationLanguage;
+  bootstrapEvents?: AgentEvent[];
+  goalContext?: SessionGoalOperationContext;
 }
 
 export interface RunLifecycleState {
   sessionId: string;
   runId: string;
+  hostRunId?: string;
   userRequest: string;
   userAuthorityFrame: UserAuthorityFrame;
   promptLedger: PromptLedgerState;
   artifactDraftLease?: ArtifactDraftLease;
   artifactChunkRepairAttempts?: Record<string, number>;
   semanticDirectiveRepairAttempts?: Record<string, number>;
-  pendingSemanticToolCalls?: Record<string, NativeToolCallProposal>;
+  pendingSemanticExchanges?: Record<string, PendingSemanticExchange>;
+  activeProviderContinuation?: ActiveProviderContinuation;
+  pendingProviderRetry?: PendingProviderRetryAdmission;
+  lastProviderResponseRequestId?: string;
   pendingProviderCommitEvents?: AgentEvent[];
   providerCommitDeferred?: boolean;
   providerRequestCacheHistory?: Record<string, ProviderRequestCacheHistoryEntry>;
@@ -143,7 +162,11 @@ export interface RunLifecyclePipelinePorts<State extends RunLifecycleState> {
   createError(code: string, message: string): Error;
   append(sessionId: string, events: AgentEvent[]): Promise<AgentSessionResult>;
   kernel(request: KernelCommandEnvelope): Promise<KernelReply>;
-  appendProjectedKernelEvents(sessionId: string, reply: KernelReply): Promise<AgentSessionResult>;
+  projectKernelEvents(
+    sessionId: string,
+    reply: KernelReply,
+    language: ConversationPresentationLanguage
+  ): AgentEvent[];
   sessionRunStateEvent(input: {
     sessionId: string;
     runId: string;
@@ -200,6 +223,13 @@ export class RunLifecyclePipeline<State extends RunLifecycleState> {
 
   async initialize(input: RunLifecycleInput): Promise<RunLifecycleResult<State>> {
     const sessionId = input.sessionId;
+    const events = input.existingEvents ?? [];
+    if (hasLegacySessionTurnAuthority(events) && !latestSessionTurnAuthority(events)) {
+      throw this.ports.createError(
+        'session_language_policy_unavailable',
+        'This Session uses turn authority v1 and is read-only because ConversationLanguagePolicy v1 is unavailable.'
+      );
+    }
     const userMessage = input.appendUserMessage === false
       ? undefined
       : this.ports.userMessageEvent({
@@ -207,7 +237,7 @@ export class RunLifecyclePipeline<State extends RunLifecycleState> {
           content: input.content,
           attachments: input.attachments ?? [],
         });
-    let lastResult = await this.ports.append(sessionId, userMessage ? [userMessage] : []);
+    let lastResult = await this.ports.append(sessionId, []);
 
     const kernelAttachments = this.ports.kernelRunAttachments(input);
     const runReply = await this.ports.kernel({
@@ -224,16 +254,17 @@ export class RunLifecyclePipeline<State extends RunLifecycleState> {
         runOverrides: undefined,
       },
     });
-    lastResult = await this.ports.appendProjectedKernelEvents(sessionId, runReply);
-    const reconciledInput = reconcileKernelWorkspaceBinding(
-      input,
-      runReply.snapshot,
-      this.ports.createError
+    const projectedKernelEvents = this.ports.projectKernelEvents(
+      sessionId,
+      runReply,
+      'neutral'
     );
-
-    const events = input.existingEvents ?? [];
     const runId = firstString(runReply.events, 'runId') ?? this.ports.createId('run');
-    const startEvents: AgentEvent[] = [];
+    const startEvents: AgentEvent[] = [
+      ...(input.bootstrapEvents ?? []),
+      ...(userMessage ? [userMessage] : []),
+      ...projectedKernelEvents,
+    ];
     if (userMessage) {
       const previousAuthority = latestSessionTurnAuthority(events);
       const pendingInteraction = pendingInteractionKind(events);
@@ -247,18 +278,32 @@ export class RunLifecyclePipeline<State extends RunLifecycleState> {
       const taskId = relation === 'interactionContinuation'
         ? previousAuthority!.taskId
         : this.ports.createId('session-task');
-      const outputLanguage = relation === 'interactionContinuation'
-        ? persistedOutputLanguage(previousAuthority?.outputLanguage, input.content)
-        : visibleLanguageForRequest(input.content);
+      const turnId = this.ports.createId('session-turn');
+      if (
+        previousAuthority
+        && resolveConversationLanguagePolicy(events, previousAuthority).status === 'pending'
+      ) {
+        startEvents.push(createSessionLanguageDecisionEvent({
+          sessionId: previousAuthority.sessionId,
+          runId: previousAuthority.runId,
+          turnId: previousAuthority.turnId,
+          revision: previousAuthority.languagePolicy.revision,
+          status: 'superseded',
+          decisionSource: 'supersededByLaterUserInput',
+          eventId: this.ports.createId('session-language-superseded'),
+          timestamp: this.ports.now(),
+        }));
+      }
       startEvents.push(createSessionTurnAuthorityEvent({
         sessionId,
         runId,
-        turnId: this.ports.createId('session-turn'),
+        turnId,
         taskId,
         messages: [{ messageId: userMessage.id, content: input.content }],
         relation,
         boundAtHookRef: pendingInteraction ? `interaction.${pendingInteraction}.input` : 'run.initialized',
-        outputLanguage,
+        languageRevision: nextConversationLanguageRevision(events),
+        hostLanguage: normalizeHostLanguage(input.hostLanguage),
         previousTaskId: relation === 'newTask' ? previousAuthority?.taskId : undefined,
         eventId: this.ports.createId('session-turn-authority'),
         timestamp: this.ports.now(),
@@ -278,6 +323,15 @@ export class RunLifecyclePipeline<State extends RunLifecycleState> {
       id: this.ports.createId('session-run-context-reading'),
     }));
     lastResult = await this.ports.append(sessionId, startEvents);
+    // Persist the user's conversation authority before applying Host-local
+    // workspace reconciliation. A mismatch is a diagnostic under this turn,
+    // not a reason to lose the turn and then fail to persist its terminal
+    // settlement for lack of authority.
+    const reconciledInput = reconcileKernelWorkspaceBinding(
+      input,
+      runReply.snapshot,
+      this.ports.createError
+    );
     return this.hydrate({
       input: reconciledInput,
       lastResult,
@@ -291,11 +345,40 @@ export class RunLifecyclePipeline<State extends RunLifecycleState> {
   }
 
   async resume(input: RunLifecycleInput): Promise<RunLifecycleResult<State>> {
-    const lastResult = await this.ports.append(input.sessionId, []);
-    const events = input.existingEvents?.length ? input.existingEvents : lastResult.events;
+    let lastResult = await this.ports.append(input.sessionId, []);
+    let events = input.existingEvents?.length ? input.existingEvents : lastResult.events;
     const runId = input.acceptedTaskPlan?.runId
       ?? latestEventRunId(events, input.sessionId)
       ?? this.ports.createId('run-resume');
+    if (input.goalContext?.operation === 'advance') {
+      const runningEvent = this.ports.sessionRunStateEvent({
+        sessionId: input.sessionId,
+        runId,
+        phase: 'context_reading',
+        status: 'running',
+        reason: 'session',
+        decisionOwner: {
+          kind: 'session',
+          runId,
+        },
+        ts: this.ports.now(),
+        id: this.ports.createId('session-goal-step-running'),
+      });
+      runningEvent.payload = {
+        ...(objectRecord(runningEvent.payload) ?? {}),
+        goalCommand: {
+          goalId: input.goalContext.goalId,
+          goalRevision: input.goalContext.goalRevision,
+          callerRequestId: input.goalContext.command.callerRequestId,
+          requestDigest: input.goalContext.command.requestDigest,
+          hostRunId: input.goalContext.command.hostRunId,
+        },
+      };
+      lastResult = await this.ports.append(input.sessionId, [
+        runningEvent,
+      ]);
+      events = lastResult.events;
+    }
     let reconciledInput = input;
     if (input.workspaceBinding) {
       const snapshotReply = await this.ports.kernel({
@@ -349,7 +432,7 @@ export class RunLifecyclePipeline<State extends RunLifecycleState> {
       userAuthorityFrame = buildUserAuthorityFrame(authorityEvents, {
         messageId: this.ports.createId('user-authority-fallback'),
         content: input.content,
-      }, visibleLanguageForRequest, input.autonomyMode ?? 'strict', { runId });
+      }, input.autonomyMode ?? 'strict', { runId });
     } catch (error) {
       if (error instanceof UserAuthorityFrameError) {
         throw this.ports.createError(error.code, error.message);
@@ -395,6 +478,7 @@ export class RunLifecyclePipeline<State extends RunLifecycleState> {
     const state = {
       sessionId,
       runId,
+      hostRunId: input.hostRunId,
       userRequest: latestExplicitUserContent(userAuthorityFrame),
       userAuthorityFrame,
       promptLedger,
@@ -408,9 +492,14 @@ export class RunLifecyclePipeline<State extends RunLifecycleState> {
       }),
       artifactChunkRepairAttempts: {},
       semanticDirectiveRepairAttempts: {},
-      pendingSemanticToolCalls: {},
+      pendingSemanticExchanges: {},
+      activeProviderContinuation: undefined,
+      pendingProviderRetry: undefined,
+      lastProviderResponseRequestId: undefined,
       pendingProviderCommitEvents: [],
       providerCommitDeferred: false,
+      goalEffectCandidates: {},
+      goalEffectRuntime: undefined,
       phase: 'context_reading',
       workspaceScopeKey: manifestBuild.manifest.workspaceScopeKey,
       workspaceBinding: input.workspaceBinding,
@@ -465,12 +554,6 @@ function pendingInteractionKind(events: readonly AgentEvent[]): 'permission' | '
   const pendingPermission = new PermissionPipeline().findPendingPermissionContext([...events]);
   if (pendingPermission) return 'permission';
   return findActiveInteraction({ events })?.kind;
-}
-
-function persistedOutputLanguage(value: string | undefined, fallback: string): VisibleLanguage {
-  return value === 'zh-CN' || value === 'en-US'
-    ? value
-    : visibleLanguageForRequest(fallback);
 }
 
 function draftPolicyBytes(stateContract: KernelStateContractRef | undefined): number | undefined {

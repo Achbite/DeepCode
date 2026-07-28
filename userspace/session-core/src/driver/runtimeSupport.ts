@@ -4,18 +4,12 @@ export interface DiagnosticInfo {
   params?: Record<string, string | number>;
 }
 
-export type VisibleLanguage = 'zh-CN' | 'en-US';
-
 export function diag(code: string, fallback: string, params?: Record<string, string | number>): DiagnosticInfo {
   return { code, fallback, params };
 }
 
 export function stringValue(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
-}
-
-export function visibleLanguageForRequest(userRequest: string): VisibleLanguage {
-  return /[\u3400-\u9fff]/.test(userRequest) ? 'zh-CN' : 'en-US';
 }
 
 export function objectRecord(value: unknown): Record<string, unknown> | undefined {

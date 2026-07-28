@@ -3,6 +3,7 @@ import type {
   AgentEvent,
   AgentSessionResult,
   AgentWorkspaceBinding,
+  ConversationLanguage,
 } from '@deepcode/protocol';
 import type { ProjectMemoryMode } from '../../context/index.js';
 import type { ProjectWorkingDirectory } from '../../context/types.js';
@@ -27,24 +28,38 @@ import type {
   SessionProgressProjectionBuilder,
 } from '../projection/index.js';
 import {
+  conversationPresentationLanguageBindingFromEvents,
+  localizedProjectionText,
+} from '../projection/index.js';
+import {
   decisionContinuationInput,
   returnSessionResult,
   type SessionLoopControlResult,
 } from '../runContinuation.js';
 import type { AutonomyMode, InterventionLevel, RequirementConfirmationMode, ReviewContinuationMode } from '../types.js';
+import {
+  createSessionLanguageDecisionEvent,
+  effectiveConversationLanguage,
+  normalizeHostLanguage,
+  resolveConversationLanguagePolicy,
+} from '../context/conversationLanguagePolicy.js';
+import { latestSessionTurnAuthority } from '../context/userAuthorityFrame.js';
+import { finalSettlementEvidenceMetadata } from '../authority/finalSettlementEvidence.js';
 
 export type RequirementDecisionHandlerDecision = 'accept' | 'reject' | 'revise';
 export type RequirementDecisionHandlerContinuationMode = ReviewContinuationMode;
 export type RequirementDecisionHandlerInterventionLevel = InterventionLevel;
 export type RequirementDecisionHandlerConfirmationMode = RequirementConfirmationMode;
-export type RequirementDecisionHandlerVisibleLanguage = 'zh-CN' | 'en-US';
 
 export interface RequirementDecisionHandlerInput {
   sessionId: string;
+  hostRunId?: string;
   decision: RequirementDecisionHandlerDecision;
   guidance?: string;
   runId?: string;
   targetId?: string;
+  interactionId?: string;
+  interactionRevision?: string;
   existingEvents?: AgentEvent[];
   workspaceBinding?: AgentWorkspaceBinding;
   projectWorkingDirectory?: ProjectWorkingDirectory;
@@ -58,6 +73,14 @@ export interface RequirementDecisionHandlerInput {
   autonomyMode?: AutonomyMode;
   projectMemoryMode?: ProjectMemoryMode;
   interactionOverlay?: InteractionOverlayContext;
+  hostLanguage?: ConversationLanguage;
+  admittedFreeformAuthority?: {
+    readonly messageId: string;
+    readonly runId: string;
+    readonly turnId: string;
+    readonly revision: number;
+    readonly hostLanguage: ConversationLanguage;
+  };
 }
 
 export type RequirementDriverInteractionRef =
@@ -73,6 +96,7 @@ export interface RequirementRecoveredAcceptedPlanContext {
 export interface RequirementDecisionHandlerPorts {
   now(): string;
   createId(prefix: string): string;
+  createError(code: string, message: string): Error;
   append(sessionId: string, events: AgentEvent[]): Promise<AgentSessionResult>;
   activeDriverInteraction(events: AgentEvent[]): RequirementDriverInteractionRef | null;
   executionRootFromDecision(input: RequirementDecisionHandlerInput, events: AgentEvent[]): AcceptedTaskPlanExecutionRoot | undefined;
@@ -86,7 +110,6 @@ export interface RequirementDecisionHandlerPorts {
     events: AgentEvent[],
     overlay: InteractionOverlayContext | undefined
   ): RequirementRecoveredAcceptedPlanContext | undefined;
-  visibleLanguageForRequest(userRequest: string): RequirementDecisionHandlerVisibleLanguage;
   userInputPipeline: UserInputPipeline;
   interactionOverlayCodec: InteractionOverlayCodec;
   requirementProjection: RequirementProjectionBuilder;
@@ -103,21 +126,37 @@ export class RequirementDecisionHandler {
   async resolve(input: RequirementDecisionHandlerInput): Promise<SessionLoopControlResult> {
     const events = input.existingEvents ?? [];
     const requirementId = input.targetId;
+    const active = this.ports.activeDriverInteraction(events);
+    if (
+      !input.runId
+      || !requirementId
+      || active?.kind !== 'requirement'
+      || active.runId !== input.runId
+      || active.requirementId !== requirementId
+    ) {
+      return returnSessionResult(await this.appendNoop(input, requirementId));
+    }
     const confirmation = this.ports.userInputPipeline.findRequirementConfirmation(
       events,
       input.runId,
       requirementId,
-      this.ports.activeDriverInteraction(events)
+      active
     );
     if (!confirmation) {
       return returnSessionResult(await this.appendNoop(input, requirementId));
     }
+    const confirmationRunId = stringValue(objectRecord(confirmation.payload)?.runId)
+      ?? input.runId;
 
     const decisionEvent = this.ports.requirementProjection.decisionEvent({
       sessionId: input.sessionId,
       event: confirmation,
       decision: input.decision,
       guidance: input.guidance,
+      presentationBinding: conversationPresentationLanguageBindingFromEvents(
+        events,
+        confirmationRunId
+      ),
       ts: this.ports.now(),
       id: this.ports.createId('requirement-decision'),
     });
@@ -162,11 +201,20 @@ export class RequirementDecisionHandler {
     input: RequirementDecisionHandlerInput,
     requirementId: string | undefined
   ): Promise<AgentSessionResult> {
+    const binding = conversationPresentationLanguageBindingFromEvents(
+      input.existingEvents ?? [],
+      input.runId
+    );
     return this.ports.append(input.sessionId, [
       this.ports.progressProjection.traceEvent({
         sessionId: input.sessionId,
         kind: 'trace/requirement_decision_noop',
-        summary: 'Requirement decision request is already resolved or expired; no duplicate action was taken.',
+        summary: localizedProjectionText(binding.language, {
+          zh: '需求决策请求已解决或过期，未重复执行。',
+          en: 'Requirement decision request is already resolved or expired; no duplicate action was taken.',
+          neutral: 'requirement_decision=noop',
+        }),
+        language: binding.language,
         ts: this.ports.now(),
         id: this.ports.createId('requirement-noop'),
         extra: {
@@ -251,12 +299,26 @@ export class RequirementDecisionHandler {
   ): Promise<AgentSessionResult | SessionLoopControlResult> {
     const acceptedContext = this.ports.recoverAcceptedPlanFromOverlay(input, current.events, interactionOverlay);
     if (!acceptedContext) {
+      const confirmationRunId = stringValue(objectRecord(confirmation.payload)?.runId)
+        ?? input.runId;
+      const presentationBinding = conversationPresentationLanguageBindingFromEvents(
+        current.events,
+        confirmationRunId
+      );
       return this.ports.append(input.sessionId, [
         this.ports.assistantProjection.finalDiagnosticEvent(
           input.sessionId,
-          'Accepted-plan interaction decision could not recover the parent taskPlan; Session will not start a detached requirement flow.',
+          {
+            code: 'accepted_plan_interaction_missing_plan',
+            fallback: localizedProjectionText(presentationBinding.language, {
+              zh: '已接受计划的交互决策无法恢复父级 taskPlan；Session 不会启动脱离原计划的需求流程。',
+              en: 'Accepted-plan interaction decision could not recover the parent taskPlan; Session will not start a detached requirement flow.',
+              neutral: 'accepted_plan_parent_task_plan=unavailable detached_requirement_flow=blocked',
+            }),
+          },
           this.ports.now(),
-          this.ports.createId('accepted-plan-interaction-missing-plan')
+          this.ports.createId('accepted-plan-interaction-missing-plan'),
+          presentationBinding
         ),
       ]) ?? current;
     }
@@ -289,27 +351,18 @@ export class RequirementDecisionHandler {
       : this.ports.userInputPipeline.requirementAttachments(confirmation);
     return {
       kind: 'resume',
-      input: {
-        sessionId: input.sessionId,
+      input: decisionContinuationInput(input, {
         content: this.ports.executionPrompt.executionRequest(acceptedContext.plan, acceptedContext.acceptedPlan, guidance),
         attachments,
         existingEvents: current.events,
         workspaceBinding: continuationWorkspaceBinding(input, attachments),
         projectWorkingDirectory: continuationProjectWorkingDirectory(input, attachments),
-        projectId: input.projectId,
-        projectKind: input.projectKind,
-        projectRootStatus: input.projectRootStatus,
-        profileId: input.profileId,
-        workflow: input.workflow,
-        appendUserMessage: false,
         requirementConfirmationMode: input.decision === 'revise' ? 'always' : 'off',
         reviewContinuationMode: input.reviewContinuationMode,
-        interventionLevel: input.interventionLevel,
-        projectMemoryMode: input.projectMemoryMode,
         resumeResourcePackets: true,
         acceptedTaskPlan: acceptedContext.acceptedPlan,
         interactionOverlay,
-      },
+      }),
     };
   }
 
@@ -340,17 +393,22 @@ export class RequirementDecisionHandler {
     }
 
     if (stateDecision.kind === 'cancel') {
+      const legacyFinishRun = effect.kind === 'finishRun';
       return this.ports.append(input.sessionId, [
         this.ports.progressProjection.sessionRunStateEvent({
           sessionId: input.sessionId,
           runId,
-          phase: 'completed',
-          status: 'completed',
+          phase: legacyFinishRun ? 'completed' : 'cancelled',
+          status: legacyFinishRun ? 'completed' : 'cancelled',
           reason: 'requirement',
           decisionOwner: baseOwner,
           interactionOverlay,
           ts: this.ports.now(),
-          id: this.ports.createId('session-run-completed-requirement'),
+          id: this.ports.createId(
+            legacyFinishRun
+              ? 'session-run-completed-requirement'
+              : 'session-run-cancelled-requirement'
+          ),
         }),
       ]) ?? current;
     }
@@ -374,7 +432,7 @@ export class RequirementDecisionHandler {
     return this.applyTaskProgressEffect(input, confirmation, decisionEvent, interactionOverlay, effect, normalizedEffect, current, runId, baseOwner);
   }
 
-  private finishWithAnswer(
+  private async finishWithAnswer(
     input: RequirementDecisionHandlerInput,
     confirmation: AgentEvent,
     current: AgentSessionResult,
@@ -391,16 +449,65 @@ export class RequirementDecisionHandler {
       : effect.kind === 'markAcceptedIncomplete'
         ? effect.reason
         : undefined;
+    let language = conversationLanguage(confirmationPayload.responseLanguage)
+      ?? normalizeHostLanguage(input.hostLanguage);
+    if (input.guidance?.trim()) {
+      const admittedAuthority = input.admittedFreeformAuthority;
+      if (!admittedAuthority) {
+        throw this.ports.createError(
+          'session_turn_authority_invalid',
+          'Free-text requirement completion has no admitted authority reference.'
+        );
+      }
+      const authority = latestSessionTurnAuthority(current.events, runId);
+      if (
+        !authority
+        || authority.runId !== admittedAuthority.runId
+        || authority.turnId !== admittedAuthority.turnId
+        || authority.languagePolicy.revision !== admittedAuthority.revision
+        || authority.languagePolicy.hostLanguage !== admittedAuthority.hostLanguage
+        || !authority.sourceMessageIds.includes(admittedAuthority.messageId)
+      ) {
+        throw this.ports.createError(
+          'session_turn_authority_invalid',
+          'Free-text requirement completion authority no longer matches the admitted revision.'
+        );
+      }
+      let policy = resolveConversationLanguagePolicy(current.events, authority);
+      if (policy.status === 'pending') {
+        const persisted = await this.ports.append(input.sessionId, [
+          createSessionLanguageDecisionEvent({
+            sessionId: authority.sessionId,
+            runId: authority.runId,
+            turnId: authority.turnId,
+            revision: authority.languagePolicy.revision,
+            status: 'fallback',
+            responseLanguage: policy.hostLanguage,
+            decisionSource: 'hostFallbackMissing',
+            eventId: this.ports.createId('session-language-fallback'),
+            timestamp: this.ports.now(),
+          }),
+        ]);
+        policy = resolveConversationLanguagePolicy(persisted.events, authority);
+      }
+      if (policy.status === 'superseded') {
+        throw this.ports.createError(
+          'session_turn_authority_invalid',
+          'Free-text requirement completion authority was superseded before local output.'
+        );
+      }
+      language = effectiveConversationLanguage(policy);
+    }
     const answerProposal = this.ports.assistantProjection.decisionEffectAnswerProposal({
       sessionId: input.sessionId,
       runId,
       proposalId: this.ports.createId('finish-with-answer-proposal'),
-      completedTasks: taskLedger?.completedTaskIds.length ?? 0,
+      completedTasks: taskLedger?.settledTaskIds.length ?? 0,
       totalTasks: taskLedger?.taskOrder.length ?? 0,
       pendingTasks: taskLedger?.pendingTaskIds.length ?? 0,
       reason,
       guidance: input.guidance,
-      language: this.ports.visibleLanguageForRequest(stringValue(confirmationPayload.originalUserRequest) ?? input.guidance ?? ''),
+      language,
     });
     return this.ports.append(input.sessionId, [
       this.ports.assistantProjection.answerEvent(input.sessionId, answerProposal, this.ports.now(), this.ports.createId('answer'), {
@@ -411,6 +518,7 @@ export class RequirementDecisionHandler {
           }),
           userGuidance: input.guidance,
         }),
+        ...finalSettlementEvidenceMetadata(accepted),
       }),
       this.ports.progressProjection.sessionRunStateEvent({
         sessionId: input.sessionId,
@@ -446,33 +554,47 @@ export class RequirementDecisionHandler {
     const accepted = this.recoverAcceptedPlanForRequirement(current.events, runId, planId);
     if (!accepted) return undefined;
 
-    const settledTaskIds = new Set([
-      ...accepted.completedTaskIds,
-      ...(accepted.modelJudgedSufficientTaskIds ?? []),
-    ]);
-    const currentTaskId = accepted.tasks.find((task) => !settledTaskIds.has(task.taskId))?.taskId;
-    const newlyCompleted: string[] = [];
+    const settledTaskIds = new Set(accepted.taskLedger.settledTaskIds);
+    const currentTaskId = accepted.taskLedger.currentTaskId;
+    let skippedTaskIds: string[] = [];
     let acceptedIncompleteTaskIds: string[] = [];
     if (normalizedEffect.kind === 'skipTask') {
       if (!currentTaskId) return undefined;
-      newlyCompleted.push(currentTaskId);
+      skippedTaskIds = [currentTaskId];
     } else if (normalizedEffect.kind === 'markAcceptedIncomplete') {
       const ids = normalizedEffect.taskIds?.length ? normalizedEffect.taskIds : (currentTaskId ? [currentTaskId] : []);
       acceptedIncompleteTaskIds = ids.filter((id) => !settledTaskIds.has(id) && accepted.tasks.some((task) => task.taskId === id));
-      newlyCompleted.push(...acceptedIncompleteTaskIds);
-      if (newlyCompleted.length === 0) return undefined;
+      if (acceptedIncompleteTaskIds.length === 0) return undefined;
     } else {
       return undefined;
     }
-    const mergedCompletedTaskIds = [...accepted.completedTaskIds, ...newlyCompleted];
-    const nextAccepted = this.ports.acceptedPlanLedger.recordTaskCompletion({
+    const newlySettledTaskIds = [...skippedTaskIds, ...acceptedIncompleteTaskIds];
+    const interactionId = input.interactionId;
+    const interactionRevision = input.interactionRevision;
+    const requirementId = baseOwner.requirementId;
+    if (!interactionId || !interactionRevision || !requirementId) {
+      throw this.ports.createError(
+        'session_interaction_identity_unavailable',
+        'Task settlement requires the exact claimed requirement interaction identity.'
+      );
+    }
+    const outcome = skippedTaskIds.length
+      ? 'skipped' as const
+      : 'acceptedIncomplete' as const;
+    const nextAccepted = this.ports.acceptedPlanLedger.recordUserTaskSettlement({
       acceptedPlan: accepted,
-      completedTaskIds: mergedCompletedTaskIds,
+      taskIds: newlySettledTaskIds,
+      outcome,
+      interaction: {
+        kind: 'requirement',
+        interactionId,
+        interactionRevision,
+        targetId: requirementId,
+        runId,
+      },
+      decisionEventRef: decisionEvent.id,
     }).nextAcceptedPlan;
-    const mergedSettledTaskIds = new Set([
-      ...mergedCompletedTaskIds,
-      ...(accepted.modelJudgedSufficientTaskIds ?? []),
-    ]);
+    const mergedSettledTaskIds = new Set(nextAccepted.taskLedger.settledTaskIds);
     const remainingTaskIds = accepted.tasks
       .map((task) => task.taskId)
       .filter((id) => !mergedSettledTaskIds.has(id));
@@ -484,13 +606,16 @@ export class RequirementDecisionHandler {
         input.sessionId,
         runId,
         nextAccepted,
-        newlyCompleted,
-        mergedCompletedTaskIds,
+        newlySettledTaskIds,
         remainingTaskIds,
         effect.kind,
         stringValue(objectRecord(decisionPayload.selectedOption)?.id),
         this.ports.now(),
-        checkpointId
+        checkpointId,
+        input.guidance?.trim()
+          ? normalizeHostLanguage(input.hostLanguage)
+          : conversationLanguage(confirmationPayload.responseLanguage)
+            ?? normalizeHostLanguage(input.hostLanguage)
       ),
     ];
     if (allDone) {
@@ -552,27 +677,23 @@ export class RequirementDecisionHandler {
     const attachments = this.ports.userInputPipeline.requirementAttachments(confirmation);
     return {
       kind: 'resume',
-      input: {
-        sessionId: input.sessionId,
+      input: decisionContinuationInput(input, {
         content: originalRequest,
         attachments,
         existingEvents: current.events,
         workspaceBinding: continuationWorkspaceBinding(input, attachments),
-        projectMemoryMode: input.projectMemoryMode,
         projectWorkingDirectory: continuationProjectWorkingDirectory(input, attachments),
-        projectId: input.projectId,
-        projectKind: input.projectKind,
-        projectRootStatus: input.projectRootStatus,
-        profileId: input.profileId,
-        workflow: input.workflow,
-        appendUserMessage: false,
         confirmedRequirement: input.decision === 'accept' ? this.ports.userInputPipeline.requirementRecordFromEvent(confirmation, 'confirmed') : undefined,
         requirementConfirmationMode: input.decision === 'revise' ? 'always' : 'off',
-        interventionLevel: input.interventionLevel,
+        reviewContinuationMode: input.reviewContinuationMode,
         interactionOverlay,
-      },
+      }),
     };
   }
+}
+
+function conversationLanguage(value: unknown): ConversationLanguage | undefined {
+  return value === 'zh-CN' || value === 'en-US' ? value : undefined;
 }
 
 function continuationRootOverride(attachments: AgentContextAttachment[]): {

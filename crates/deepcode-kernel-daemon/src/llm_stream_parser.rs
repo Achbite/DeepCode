@@ -62,9 +62,15 @@ pub(crate) struct OpenAiCompatibleStreamAccumulator {
     tool_calls: BTreeMap<i64, ToolCallDeltaBuffer>,
     pub(crate) usage: Option<Value>,
     pub(crate) done_emitted: bool,
+    source_envelope_seq: u64,
 }
 
 impl OpenAiCompatibleStreamAccumulator {
+    fn next_source_envelope_seq(&mut self) -> u64 {
+        self.source_envelope_seq = self.source_envelope_seq.saturating_add(1);
+        self.source_envelope_seq
+    }
+
     #[cfg(test)]
     fn output(&self) -> LlmChatOutput {
         let tool_calls = self
@@ -107,57 +113,105 @@ pub(crate) fn parse_openai_compatible_sse_text(text: &str) -> LlmChatOutput {
     accumulator.output()
 }
 
+#[allow(dead_code)]
 pub(crate) fn openai_stream_events_from_data(
     accumulator: &mut OpenAiCompatibleStreamAccumulator,
     data: &str,
 ) -> Vec<String> {
+    openai_stream_events_from_data_inner(accumulator, data, None)
+}
+
+pub(crate) fn openai_stream_events_from_data_for_request(
+    accumulator: &mut OpenAiCompatibleStreamAccumulator,
+    data: &str,
+    request_id: &str,
+) -> Vec<String> {
+    openai_stream_events_from_data_inner(accumulator, data, Some(request_id))
+}
+
+fn openai_stream_events_from_data_inner(
+    accumulator: &mut OpenAiCompatibleStreamAccumulator,
+    data: &str,
+    request_id: Option<&str>,
+) -> Vec<String> {
     if data.trim() == "[DONE]" {
+        let source_envelope_seq = accumulator.next_source_envelope_seq();
         accumulator.done_emitted = true;
-        return vec![sse_json_event(
+        return vec![provider_sse_json_event(
             "provider_done",
             json!({
                 "type": "provider_done",
+                "providerSource": {
+                    "schemaVersion": "deepcode.provider.source-envelope.v1",
+                    "sequence": source_envelope_seq,
+                    "encoding": "sse-marker",
+                },
+                "rawProvider": "[DONE]",
                 "chunk": {
                     "type": "done",
                     "usage": accumulator.usage,
                 },
                 "usage": accumulator.usage,
             }),
+            request_id,
         )];
     }
     let value = match serde_json::from_str::<Value>(data) {
         Ok(value) => value,
         Err(error) => {
-            return vec![sse_json_event(
+            let source_envelope_seq = accumulator.next_source_envelope_seq();
+            return vec![provider_sse_json_event(
                 "provider_error",
                 json!({
                     "type": "provider_error",
                     "error": error.to_string(),
+                    "providerSource": {
+                        "schemaVersion": "deepcode.provider.source-envelope.v1",
+                        "sequence": source_envelope_seq,
+                        "encoding": "invalid-json",
+                    },
                     "rawProvider": data,
                 }),
+                request_id,
             )];
         }
     };
-    openai_stream_events_from_value(accumulator, value)
+    openai_stream_events_from_value(accumulator, value, request_id)
 }
 
 fn openai_stream_events_from_value(
     accumulator: &mut OpenAiCompatibleStreamAccumulator,
     value: Value,
+    request_id: Option<&str>,
 ) -> Vec<String> {
-    let mut events = Vec::new();
+    let source_envelope_seq = accumulator.next_source_envelope_seq();
+    let mut events = vec![provider_sse_json_event(
+        "provider_metadata",
+        json!({
+            "type": "provider_metadata",
+            "providerSource": {
+                "schemaVersion": "deepcode.provider.source-envelope.v1",
+                "sequence": source_envelope_seq,
+                "encoding": "json",
+            },
+            "rawProvider": value.clone(),
+        }),
+        request_id,
+    )];
     if let Some(usage) = value.get("usage").filter(|usage| !usage.is_null()).cloned() {
         accumulator.usage = Some(usage.clone());
-        events.push(sse_json_event(
+        events.push(provider_sse_json_event(
             "provider_usage",
             json!({
                 "type": "provider_usage",
+                "providerSourceSeq": source_envelope_seq,
                 "usage": usage,
                 "chunk": {
                     "type": "done",
                     "usage": usage,
                 },
             }),
+            request_id,
         ));
     }
     let choices = value
@@ -179,18 +233,19 @@ fn openai_stream_events_from_value(
             .filter(|value| !value.is_empty())
         {
             accumulator.reasoning.push_str(reasoning);
-            events.push(sse_json_event(
+            events.push(provider_sse_json_event(
                 "provider_reasoning_delta",
                 json!({
                     "type": "provider_reasoning_delta",
+                    "providerSourceSeq": source_envelope_seq,
                     "chunk": {
                         "type": "reasoning_delta",
                         "content": reasoning,
                         "index": index,
                         "finishReason": finish_reason,
-                        "rawProvider": choice.clone(),
                     },
                 }),
+                request_id,
             ));
         }
         if let Some(content) = delta
@@ -199,18 +254,19 @@ fn openai_stream_events_from_value(
             .filter(|value| !value.is_empty())
         {
             accumulator.content.push_str(content);
-            events.push(sse_json_event(
+            events.push(provider_sse_json_event(
                 "provider_delta",
                 json!({
                     "type": "provider_delta",
+                    "providerSourceSeq": source_envelope_seq,
                     "chunk": {
                         "type": "delta",
                         "content": content,
                         "index": index,
                         "finishReason": finish_reason,
-                        "rawProvider": choice.clone(),
                     },
                 }),
+                request_id,
             ));
         }
         for tool_call in delta
@@ -246,10 +302,11 @@ fn openai_stream_events_from_value(
             if !arguments_delta.is_empty() {
                 buffer.arguments.push_str(&arguments_delta);
             }
-            events.push(sse_json_event(
+            events.push(provider_sse_json_event(
                 "provider_tool_call_delta",
                 json!({
                     "type": "provider_tool_call_delta",
+                    "providerSourceSeq": source_envelope_seq,
                     "chunk": {
                         "type": "tool_call",
                         "index": tool_index,
@@ -261,13 +318,20 @@ fn openai_stream_events_from_value(
                             "name": buffer.name.clone(),
                             "argumentsDelta": arguments_delta,
                         },
-                        "rawProvider": tool_call.clone(),
                     },
                 }),
+                request_id,
             ));
         }
     }
     events
+}
+
+fn provider_sse_json_event(event: &str, mut value: Value, request_id: Option<&str>) -> String {
+    if let (Some(request_id), Some(record)) = (request_id, value.as_object_mut()) {
+        record.insert("requestId".to_string(), json!(request_id));
+    }
+    sse_json_event(event, value)
 }
 
 pub(crate) fn sse_json_event(event: &str, value: Value) -> String {
@@ -297,12 +361,7 @@ pub(crate) fn parse_openai_message(message: &Value) -> LlmChatOutput {
                 .filter_map(|item| {
                     let function = item.get("function")?;
                     let provider_name = function.get("name").and_then(Value::as_str)?;
-                    let args = function
-                        .get("arguments")
-                        .and_then(Value::as_str)
-                        .and_then(|raw| serde_json::from_str(raw).ok())
-                        .or_else(|| function.get("arguments").cloned())
-                        .unwrap_or_else(|| json!({}));
+                    let args = normalized_openai_tool_arguments(function.get("arguments"));
                     Some(LlmToolCall {
                         id: item
                             .get("id")
@@ -321,6 +380,16 @@ pub(crate) fn parse_openai_message(message: &Value) -> LlmChatOutput {
         reasoning,
         tool_calls,
         usage: None,
+    }
+}
+
+fn normalized_openai_tool_arguments(value: Option<&Value>) -> Value {
+    match value {
+        Some(Value::String(raw)) => {
+            serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.clone()))
+        }
+        Some(value) => value.clone(),
+        None => json!({}),
     }
 }
 
@@ -397,6 +466,30 @@ pub(crate) fn llm_output_payload(output: LlmChatOutput) -> Value {
     });
     if let Some(usage) = usage {
         payload["usage"] = usage;
+    }
+    payload
+}
+
+pub(crate) fn llm_decoded_response_payload(response: LlmChatDecodedResponse) -> Value {
+    let mut payload = llm_output_payload(response.output);
+    let Some(raw_provider) = response.raw_provider else {
+        return payload;
+    };
+    if let Some(done) = payload
+        .get_mut("chunks")
+        .and_then(Value::as_array_mut)
+        .and_then(|chunks| chunks.last_mut())
+        .and_then(Value::as_object_mut)
+    {
+        done.insert("rawProvider".to_string(), raw_provider);
+        done.insert(
+            "providerSource".to_string(),
+            json!({
+                "schemaVersion": "deepcode.provider.source-envelope.v1",
+                "sequence": 1,
+                "encoding": "json",
+            }),
+        );
     }
     payload
 }

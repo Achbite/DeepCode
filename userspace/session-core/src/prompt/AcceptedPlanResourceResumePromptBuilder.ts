@@ -1,6 +1,7 @@
 import type { ProposalEnvelope } from '../protocol/types.js';
 import type { ResourcePacket } from '../context/types.js';
 import type { ProviderRepairMessageBuilder, ProviderRepairMessageState } from './ProviderRepairMessageBuilder.js';
+import type { TaskLedgerSnapshotV2 } from '@deepcode/protocol';
 
 // Resource resume must keep this allow-list aligned with the driver contract and repair parser.
 export const ACCEPTED_PLAN_RESOURCE_RESUME_ALLOWED_KINDS = [
@@ -12,13 +13,13 @@ export const ACCEPTED_PLAN_RESOURCE_RESUME_ALLOWED_KINDS = [
 
 export interface AcceptedPlanResourceResumeAcceptedPlan {
   planId: string;
-  completedTaskIds: string[];
+  taskLedger: TaskLedgerSnapshotV2;
   tasks: Array<{ taskId: string }>;
 }
 
 export interface AcceptedPlanResourceResumeCursor {
   currentTaskId?: string;
-  completedTaskIds: string[];
+  settledTaskIds: string[];
   lastResourcePacketIds: string[];
 }
 
@@ -69,8 +70,8 @@ export class AcceptedPlanResourceResumePromptBuilder {
       `Return exactly one Agent Protocol v4 proposal: ${ACCEPTED_PLAN_RESOURCE_RESUME_ALLOWED_KINDS.join(', ')}.`,
       resourceResumeCarrierLine(),
       'Prefer actionBundle if the just-resolved evidence is sufficient for the current task. If no executable operation is valid, return a diagnostic that states why execution cannot continue. If more evidence is needed, request only a different focused resource. If a concrete operation exceeds accepted scope, Session and Kernel will interrupt for user approval after proposal validation.',
-      acceptedPlan ? `Accepted plan progress: planId=${acceptedPlan.planId}; completedTaskCount=${acceptedPlan.completedTaskIds.length}; remainingTaskCount=${acceptedPlan.tasks.filter((task) => !acceptedPlan.completedTaskIds.includes(task.taskId)).length}.` : '',
-      cursor ? `TaskExecutionCursor: currentTaskId=${cursor.currentTaskId ?? 'none'}; completedTaskCount=${cursor.completedTaskIds.length}; lastResourcePackets=${cursor.lastResourcePacketIds.join(', ') || 'none'}.` : '',
+      acceptedPlan ? `Accepted plan progress: planId=${acceptedPlan.planId}; settledTaskCount=${acceptedPlan.taskLedger.settledTaskIds.length}; remainingTaskCount=${acceptedPlan.taskLedger.pendingTaskIds.length + (acceptedPlan.taskLedger.currentTaskId ? 1 : 0)}.` : '',
+      cursor ? `TaskExecutionCursor: currentTaskId=${cursor.currentTaskId ?? 'none'}; settledTaskCount=${cursor.settledTaskIds.length}; lastResourcePackets=${cursor.lastResourcePacketIds.join(', ') || 'none'}.` : '',
       currentTask ? `CurrentTaskGoal: ${currentTask.goal}` : '',
       currentTask ? `CurrentTaskContext: targets=${currentTask.targets.join(', ') || 'none'}; toolIds=${currentTask.toolIds.join(', ') || 'none'}; evidenceNeeds=${currentTask.evidenceNeeds.join(', ') || 'none'}.` : '',
       `Original resourceRequest proposalId=${requestProposal.proposalId}; kind=${requestProposal.kind}.`,

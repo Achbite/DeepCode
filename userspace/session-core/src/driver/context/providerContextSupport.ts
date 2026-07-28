@@ -4,6 +4,8 @@ import type {
   CurrentTaskContext,
   ImplementationBatchContext,
 } from '../execution/index.js';
+import { acceptedPlanSettledTaskIds } from '../../accepted-plan/types.js';
+import { taskLedgerKernelCompletedTaskIds } from '../../run-state/index.js';
 
 export interface ProviderContextSupportState {
   runId: string;
@@ -30,14 +32,11 @@ export class ProviderContextSupport {
       `ImplementationBatchStatus: nextBatchIndex=${context.batchIndex}`,
     ];
     if (acceptedPlan) {
-      const settled = new Set([
-        ...acceptedPlan.completedTaskIds,
-        ...(acceptedPlan.modelJudgedSufficientTaskIds ?? []),
-      ]);
+      const settled = new Set(acceptedPlanSettledTaskIds(acceptedPlan));
       const currentTask = acceptedPlan.tasks.find((task) => !settled.has(task.taskId));
       const currentTaskOperations = this.currentTaskOperations(acceptedPlan);
       hints.push(
-        `AcceptedTaskCursor: planId=${acceptedPlan.planId}; currentTask=${currentTask?.taskId ?? 'complete'}; completedTasks=${settled.size}/${acceptedPlan.tasks.length}`,
+        `AcceptedTaskCursor: planId=${acceptedPlan.planId}; currentTask=${currentTask?.taskId ?? 'complete'}; settledTasks=${settled.size}/${acceptedPlan.tasks.length}; kernelCompletedTasks=${taskLedgerKernelCompletedTaskIds(acceptedPlan.taskLedger).length}`,
         currentTask
           ? `CurrentAcceptedTask: taskId=${currentTask.taskId}; targets=${currentTask.targets.length ? currentTask.targets.join(', ') : 'none'}; toolId=${currentTask.toolId ?? 'none'}`
           : 'CurrentAcceptedTask: complete-or-unavailable',
@@ -75,7 +74,9 @@ export class ProviderContextSupport {
           toolIds: state.currentTaskContext.toolIds,
         }
         : undefined,
-      completedTaskCount: state.acceptedTaskPlan?.completedTaskIds.length ?? 0,
+      completedTaskCount: state.acceptedTaskPlan
+        ? acceptedPlanSettledTaskIds(state.acceptedTaskPlan).length
+        : 0,
     };
   }
 

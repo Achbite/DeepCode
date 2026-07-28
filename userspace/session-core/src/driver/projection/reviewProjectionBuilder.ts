@@ -3,6 +3,11 @@ import type {
   ReadableProjectionItem,
   ReadableProjectionSection,
 } from './structuredProjectionReadModels.js';
+import {
+  localizedProjectionText,
+  type ProjectionLanguageBinding,
+} from './conversationPresentationLanguage.js';
+import { TURN_KERNEL_EFFECT_TASK_IDS_STAGING_FIELD } from '../authority/finalSettlementEvidence.js';
 
 export interface ReviewProjectionPlan {
   userPlan: string;
@@ -72,12 +77,10 @@ export interface ReviewProjectionBuilderPorts<
   TaskLedger = unknown,
 > {
   reviewFactLines(kernelEvents: unknown[]): string[];
-  staticSyntaxReviewFactLines(kernelEvents: unknown[]): string[];
+  staticSyntaxReviewObservationLines(kernelEvents: unknown[]): string[];
   findReviewFacts(kernelEvents: unknown[]): Record<string, unknown> | undefined;
   concreteContinuationExpectations(value: unknown): unknown[];
   acceptedPlanContext(plan: Plan): AcceptedPlan | undefined;
-  acceptedPlanBatchCompletedTaskIds(acceptedPlan: AcceptedPlan, plan: Plan, kernelEvents: unknown[]): string[];
-  acceptedPlanAfterBatch(acceptedPlan: AcceptedPlan, completedTaskIds: string[]): AcceptedPlan;
   acceptedPlanTaskLedger(acceptedPlan: AcceptedPlan): TaskLedger | undefined;
   buildReviewFactsContext(input: ReviewFactsContextInput<TaskLedger>): unknown;
 }
@@ -94,16 +97,16 @@ export class ReviewProjectionBuilder<
     plan: Plan;
     kernelEvents: unknown[];
     events?: AgentEvent[];
+    presentationBinding: ProjectionLanguageBinding;
     ts: string;
     id: string;
   }): AgentEvent {
     const ports = this.requirePorts();
-    const decodedKernelEvents = input.kernelEvents.map((event) => decodeKernelEventV1(event));
-    const facts = [
-      ...ports.reviewFactLines(input.kernelEvents),
-      ...ports.staticSyntaxReviewFactLines(input.kernelEvents),
-    ];
-    const reviewFacts = ports.findReviewFacts(input.kernelEvents);
+    const kernelEvents = input.kernelEvents.filter((event) => !isStaticSyntaxReviewSessionFact(event));
+    const decodedKernelEvents = kernelEvents.map((event) => decodeKernelEventV1(event));
+    const facts = ports.reviewFactLines(kernelEvents);
+    const sessionModelObservations = ports.staticSyntaxReviewObservationLines(input.kernelEvents);
+    const reviewFacts = ports.findReviewFacts(kernelEvents);
     const rawGitReview = reviewFacts ? objectRecord(reviewFacts.gitReview) : undefined;
     const executionRoot = input.plan.executionRoot
       ?? latestPlanExecutionRootFromEvents(input.events ?? [], input.plan.planId);
@@ -142,12 +145,15 @@ export class ReviewProjectionBuilder<
       input.plan.runId,
       input.plan.planId
     );
-    const reviewTaskLedger = checkpointTaskLedger ?? (acceptedPlanForReview
-      ? ports.acceptedPlanTaskLedger(ports.acceptedPlanAfterBatch(
-        acceptedPlanForReview,
-        ports.acceptedPlanBatchCompletedTaskIds(acceptedPlanForReview, input.plan, input.kernelEvents)
-      ))
-      : undefined);
+    const reviewTaskLedger = checkpointTaskLedger
+      ?? (acceptedPlanForReview
+        ? ports.acceptedPlanTaskLedger(acceptedPlanForReview)
+        : undefined);
+    const kernelCompletedTaskIds = reviewKernelCompletedTaskIds(
+      reviewTaskLedger,
+      input.plan.runId,
+      input.plan.planId
+    );
     const reviewFactsContextInput: ReviewFactsContextInput<TaskLedger> = {
       planId: input.plan.planId,
       runId: input.plan.runId,
@@ -178,13 +184,24 @@ export class ReviewProjectionBuilder<
         gitReview,
       }),
     };
+    const summary = localizedProjectionText(input.presentationBinding.language, {
+      zh: `复核待确认：完成 ${completed}，失败 ${failed}，阻塞 ${blocked}，工具事实 ${toolResults}。`,
+      en: `Review awaiting confirmation: completed ${completed}, failed ${failed}, blocked ${blocked}, tool facts ${toolResults}.`,
+      neutral: `Review completed=${completed} failed=${failed} blocked=${blocked} toolFacts=${toolResults}`,
+    });
     return {
       id: input.id,
       sessionId: input.sessionId,
       ts: input.ts,
       kind: 'review_summary',
       payload: {
+        title: localizedProjectionText(input.presentationBinding.language, {
+          zh: '复核',
+          en: 'Review',
+          neutral: 'Review',
+        }),
         titleKey: 'session.projection.review.title',
+        summary,
         summaryKey,
         messageKey: summaryKey,
         messageArgs: {
@@ -194,6 +211,10 @@ export class ReviewProjectionBuilder<
           toolResults: String(toolResults),
         },
         status: 'waitingUserReview',
+        presentationLanguage: input.presentationBinding.language,
+        languageRevision: input.presentationBinding.revision,
+        languageStatus: input.presentationBinding.status,
+        sourceTurnId: input.presentationBinding.sourceTurnId,
         runId: input.plan.runId,
         reviewId: `${input.plan.runId}:${input.plan.planId}`,
         sourcePlanId: input.plan.planId,
@@ -206,15 +227,23 @@ export class ReviewProjectionBuilder<
         gitReview,
         readableReview,
         reviewFactsContext,
+        ...(kernelCompletedTaskIds.length > 0
+          ? {
+              [TURN_KERNEL_EFFECT_TASK_IDS_STAGING_FIELD]:
+                kernelCompletedTaskIds,
+            }
+          : {}),
         changedFiles: readableReview.changedFiles,
         developerDetails: {
           facts,
+          sessionModelObservations,
           reviewFacts,
           gitReview,
           rawGitReview,
           reviewFactsContext,
         },
         facts,
+        sessionModelObservations,
         factCounts,
         channel: 'review',
         visibility: 'conversation',
@@ -404,6 +433,10 @@ export class ReviewProjectionBuilder<
 
 function arrayLength(value: unknown): number {
   return Array.isArray(value) ? value.length : 0;
+}
+
+function isStaticSyntaxReviewSessionFact(value: unknown): boolean {
+  return objectRecord(value)?.kind === 'accepted_plan.static_syntax_review';
 }
 
 function latestAcceptedPlanTaskLedgerFromEvents<TaskLedger>(
@@ -701,7 +734,7 @@ function reviewExpectationItems(plan: ReviewProjectionPlan): ReadableProjectionI
   for (const [index, item] of expectations.entries()) {
     const record = objectRecord(item);
     const text = stringValue(record?.description) ?? stringValue(record?.summary);
-    if (text?.trim()) items.push(projectionItem(`review-expectation-${index + 1}`, 'fact', { text: text.trim(), metadata: record }));
+    if (text?.trim()) items.push(projectionItem(`review-expectation-${index + 1}`, 'text', { text: text.trim(), metadata: record }));
   }
   return items;
 }
@@ -726,6 +759,54 @@ function stringValue(value: unknown): string | undefined {
 
 function stringArrayValue(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0) : [];
+}
+
+function reviewKernelCompletedTaskIds(
+  taskLedger: unknown,
+  runId: string,
+  planId: string
+): string[] {
+  const ledger = objectRecord(taskLedger);
+  if (!ledger) return [];
+  const owner = objectRecord(ledger.owner);
+  if (
+    stringValue(ledger.schemaVersion) !== 'deepcode.session.task-ledger.v2'
+    || stringValue(owner?.planId) !== planId
+    || (
+      stringValue(owner?.kind) === 'run'
+      && stringValue(owner?.runId) !== runId
+    )
+    || (
+      stringValue(owner?.kind) !== 'run'
+      && stringValue(owner?.kind) !== 'goal'
+    )
+  ) {
+    throw new Error(
+      'session_review_projection_invalid: task ledger does not match the active run and plan.'
+    );
+  }
+  if (!Array.isArray(ledger.entries)) {
+    throw new Error(
+      'session_review_projection_invalid: TaskLedgerV2 entries must be an array.'
+    );
+  }
+  const taskIds = ledger.entries.flatMap((value) => {
+    const entry = objectRecord(value);
+    const settlement = objectRecord(entry?.settlement);
+    return stringValue(entry?.status) === 'settled'
+      && stringValue(settlement?.kind) === 'kernelFacts'
+      ? [stringValue(entry?.taskId)]
+      : [];
+  });
+  if (
+    taskIds.some((taskId) => taskId === undefined)
+    || new Set(taskIds).size !== taskIds.length
+  ) {
+    throw new Error(
+      'session_review_projection_invalid: task ledger has invalid Kernel-completed task identities.'
+    );
+  }
+  return taskIds as string[];
 }
 
 function clip(value: string, max: number): string {

@@ -12,6 +12,11 @@ import type { PermissionPipeline } from '../pipelines/permissionPipeline.js';
 import type { PlanContextIndex } from '../proposal/planContextIndex.js';
 import type { ReviewProjectionSummaryPlan } from '../projection/reviewProjectionBuilder.js';
 import type { SessionTurnPhase } from '../pipelines/interactionOverlayCodec.js';
+import {
+  conversationPresentationLanguageBindingFromEvents,
+  localizedProjectionText,
+  type ConversationPresentationLanguage,
+} from '../projection/conversationPresentationLanguage.js';
 import { returnSessionResult, type SessionLoopControlResult } from '../runContinuation.js';
 
 export interface PermissionDecisionHandlerPorts<
@@ -20,7 +25,11 @@ export interface PermissionDecisionHandlerPorts<
   now(): string;
   createId(prefix: string): string;
   observeKernel(request: KernelCommandEnvelope): Promise<KernelReplyObservation>;
-  appendProjectedKernelEvents(sessionId: string, reply: KernelReply): Promise<AgentSessionResult>;
+  appendProjectedKernelEvents(
+    sessionId: string,
+    reply: KernelReply,
+    language: ConversationPresentationLanguage
+  ): Promise<AgentSessionResult>;
   append(sessionId: string, events: AgentEvent[]): Promise<AgentSessionResult>;
   permissionPipeline: PermissionPipeline;
   kernelStatus: KernelEventStatusIndex;
@@ -31,6 +40,7 @@ export interface PermissionDecisionHandlerPorts<
       kind: AgentEvent['kind'];
       summary: string;
       extra: Record<string, unknown>;
+      language?: ConversationPresentationLanguage;
       ts: string;
       id: string;
     }): AgentEvent;
@@ -56,10 +66,21 @@ export interface PermissionDecisionHandlerPorts<
 
 export interface PermissionDecisionHandlerInput {
   sessionId: string;
+  hostRunId?: string;
   decision: 'accept' | 'reject' | 'revise';
   runId?: string;
   targetId?: string;
   existingEvents?: AgentEvent[];
+}
+
+export class PermissionDecisionHandlerError extends Error {
+  constructor(
+    readonly code: 'session_permission_revision_unsupported',
+    message: string
+  ) {
+    super(message);
+    this.name = 'PermissionDecisionHandlerError';
+  }
 }
 
 export class PermissionDecisionHandler<
@@ -68,14 +89,35 @@ export class PermissionDecisionHandler<
   constructor(private readonly ports: PermissionDecisionHandlerPorts<Plan>) {}
 
   async resolve(input: PermissionDecisionHandlerInput): Promise<SessionLoopControlResult> {
+    if (input.decision === 'revise') {
+      throw new PermissionDecisionHandlerError(
+        'session_permission_revision_unsupported',
+        'Permission requests only support accept or reject; Session did not submit a Kernel decision or persist a substitute settlement.'
+      );
+    }
     const events = input.existingEvents ?? [];
-    const pending = this.ports.permissionPipeline.findPendingPermissionContext(events, input.targetId);
+    const pending = input.runId && input.targetId
+      ? this.ports.permissionPipeline.findPendingPermissionContext(
+          events,
+          input.targetId,
+          input.runId
+        )
+      : null;
     if (!pending) {
+      const binding = conversationPresentationLanguageBindingFromEvents(
+        events,
+        input.runId
+      );
       return returnSessionResult(await this.ports.append(input.sessionId, [
         this.ports.progressProjection.traceEvent({
           sessionId: input.sessionId,
           kind: 'trace/permission_accept_noop',
-          summary: 'Permission request is already resolved or expired; no duplicate action was taken.',
+          summary: localizedProjectionText(binding.language, {
+            zh: '权限请求已解决或过期，未重复执行。',
+            en: 'Permission request is already resolved or expired; no duplicate action was taken.',
+            neutral: 'permission_decision=noop',
+          }),
+          language: binding.language,
           ts: this.ports.now(),
           id: this.ports.createId('permission-noop'),
           extra: {
@@ -88,7 +130,6 @@ export class PermissionDecisionHandler<
         }),
       ]));
     }
-
     const observed = await this.ports.observeKernel({
       command: {
         kind: 'permissionResolve',
@@ -98,13 +139,27 @@ export class PermissionDecisionHandler<
       },
     });
     const decisionReply = observed.reply;
-    let result = await this.ports.appendProjectedKernelEvents(input.sessionId, decisionReply);
+    const presentationBinding = conversationPresentationLanguageBindingFromEvents(
+      events,
+      pending.runId ?? input.runId
+    );
+    const presentationLanguage = presentationBinding.language;
+    let result = await this.ports.appendProjectedKernelEvents(
+      input.sessionId,
+      decisionReply,
+      presentationLanguage
+    );
     if (observed.kind === 'commandFailed') {
       return returnSessionResult(await this.ports.append(input.sessionId, [
         this.ports.progressProjection.traceEvent({
           sessionId: input.sessionId,
           kind: 'trace/permission_accept_noop',
-          summary: 'Kernel could not resume the interrupted command after the permission decision.',
+          summary: localizedProjectionText(presentationLanguage, {
+            zh: '权限决策后，Kernel 无法恢复被中断的命令。',
+            en: 'Kernel could not resume the interrupted command after the permission decision.',
+            neutral: 'permission_resume=failed',
+          }),
+          language: presentationLanguage,
           ts: this.ports.now(),
           id: this.ports.createId('permission-resume-failed'),
           extra: {
@@ -158,6 +213,7 @@ export class PermissionDecisionHandler<
         result,
         currentKernelEvents: decisionReply.events ?? [],
         requestIdPrefix: 'permission-review-facts-get',
+        presentationBinding,
       },
     };
   }

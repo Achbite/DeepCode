@@ -3,6 +3,9 @@ import type {
   SessionTurnAuthorityPayload,
   ToolCall,
 } from '@deepcode/protocol';
+import {
+  stripSessionOwnedConversationLanguageControls,
+} from '../driver/context/conversationLanguagePolicy.js';
 import { stableHash } from '../cache/canonicalizer.js';
 import type { UserAuthorityFrame } from '../driver/context/userAuthorityFrame.js';
 
@@ -14,6 +17,7 @@ export type PromptLedgerEntryKind =
   | 'workspaceBootstrap'
   | 'requestDelta'
   | 'explicitUser'
+  | 'userGuidance'
   | 'memoryDelta'
   | 'workflowDelta'
   | 'resourceDelta'
@@ -73,6 +77,10 @@ export interface PromptLedgerPrepareResult {
 export interface PromptLedgerWireRecord {
   readonly schemaVersion: 'deepcode.session.wire-ledger.v1';
   readonly recordId: string;
+  readonly parentRequestId?: string;
+  readonly sourceRequestId?: string;
+  readonly attemptKind?: string;
+  readonly languageRevision?: number;
   readonly sessionId: string;
   readonly runId: string;
   readonly profileId: string;
@@ -95,6 +103,12 @@ export interface PromptLedgerWireRecord {
   readonly messageHash?: string;
   readonly schemaHash?: string;
   readonly responseFormatHash?: string;
+  readonly providerPayloadDigest?: string;
+  readonly transportDigest?: string;
+  readonly digestMaterialScope?: 'sessionAdmitted';
+  readonly messageMaterialScope?: 'restorationBase';
+  readonly exactExternalWireBody?: false;
+  readonly stream?: boolean;
   readonly promptSegmentDigests?: PromptLedgerSegmentDigest[];
   readonly ledgerEntries?: Array<Pick<PromptLedgerEntry, 'entryId' | 'kind' | 'contentHash' | 'sourceRef'>>;
 }
@@ -106,9 +120,11 @@ export interface PromptLedgerSegmentDigest {
 
 export interface ProviderRequestCacheHistoryEntry {
   readonly requestText?: string;
-  readonly messages?: LlmChatMessage[];
   readonly toolSchemaHash?: string;
   readonly responseFormatHash?: string;
+  readonly exactMaterialAvailable?: boolean;
+  readonly exactMaterialRedactionReason?: 'restoredAdmissionOnly' | 'privateReasoning';
+  readonly disposition?: 'providerObserved' | 'restoredAdmissionOnly';
   readonly segments: PromptLedgerSegmentDigest[];
 }
 
@@ -126,19 +142,24 @@ export class PromptLedgerCompatibilityError extends Error {
 
 export function restorePromptLedger(records: readonly PromptLedgerWireRecord[]): PromptLedgerState {
   const state = emptyPromptLedgerState();
-  const latestRequestByEpoch = new Map<string, PromptLedgerWireRecord>();
-  for (const record of records) {
+  const latestRequestByEpoch = new Map<
+    string,
+    { record: PromptLedgerWireRecord; recordIndex: number }
+  >();
+  for (const [recordIndex, record] of records.entries()) {
     if (record.kind === 'providerRequest' && record.messages?.length) {
-      latestRequestByEpoch.set(record.epochId, record);
+      latestRequestByEpoch.set(record.epochId, { record, recordIndex });
     }
   }
-  for (const record of latestRequestByEpoch.values()) {
+  for (const { record } of latestRequestByEpoch.values()) {
     if (!record.epochScopeKey?.trim()) {
       throw new PromptLedgerCompatibilityError(
         `PromptLedger record ${record.recordId} has no task-scoped epoch metadata.`
       );
     }
-    const messages = record.messages ?? [];
+    const messages = (record.messages ?? []).map(
+      (message, index) => restoreWireLedgerMessage(record, message, index)
+    );
     const systemMessage = messages.find((message) => message.role === 'system');
     const rootUserIndex = record.ledgerEntries?.findIndex((entry) => entry.kind === 'rootUser') ?? -1;
     const rootUser = rootUserIndex >= 0
@@ -147,10 +168,13 @@ export function restorePromptLedger(records: readonly PromptLedgerWireRecord[]):
     if (!systemMessage || !rootUser) continue;
     const entries = messages.map((message, index): PromptLedgerEntry => {
       const stored = record.ledgerEntries?.[index];
+      const restoredControlFrame = record.messages?.[index]?.content !== message.content;
       return {
         entryId: stored?.entryId ?? `${record.epochId}-restored-${index + 1}`,
         kind: stored?.kind ?? restoredEntryKind(message, index),
-        contentHash: stored?.contentHash ?? stableHash(messageSignature(message)),
+        contentHash: restoredControlFrame
+          ? stableHash(message.content)
+          : stored?.contentHash ?? stableHash(messageSignature(message)),
         message: cloneMessage(message),
         sourceRef: stored?.sourceRef ?? message.toolCalls?.[0]?.id ?? message.toolCallId,
       };
@@ -165,6 +189,7 @@ export function restorePromptLedger(records: readonly PromptLedgerWireRecord[]):
       systemHash: record.systemHash ?? stableHash(systemMessage.content),
       toolsHash: record.toolsHash ?? '',
       rootUserHash: stableHash(rootUser.content),
+      memoryHash: restoredPromptLedgerMemoryHash(entries),
       entries,
       explicitUserMessageIds: entries
         .filter((entry) => entry.kind === 'rootUser' || entry.kind === 'explicitUser')
@@ -175,45 +200,91 @@ export function restorePromptLedger(records: readonly PromptLedgerWireRecord[]):
     state.epochs.push(epoch);
     state.activeEpochByScope[activeEpochKey(ledgerProfileId, record.epochScopeKey)] = record.epochId;
   }
-  for (const record of records) {
+  const pendingSemanticToolByEpoch = new Map<string, PromptLedgerWireRecord>();
+  for (const [recordIndex, record] of records.entries()) {
     if (record.kind === 'providerRequest') continue;
+    const restoreBoundary = latestRequestByEpoch.get(record.epochId);
+    if (!restoreBoundary || recordIndex <= restoreBoundary.recordIndex) continue;
     const epoch = state.epochs.find((candidate) => candidate.epochId === record.epochId);
     if (!epoch) continue;
-    if (record.kind === 'assistantSemanticTool' && record.toolCall) {
-      const message: LlmChatMessage = {
+    if (record.kind === 'assistantSemanticTool') {
+      if (record.sourceRequestId !== restoreBoundary.record.recordId) {
+        throw new PromptLedgerCompatibilityError(
+          `PromptLedger semantic tool record ${record.recordId} does not belong to the latest Provider request ${restoreBoundary.record.recordId}.`
+        );
+      }
+      if (!record.toolCall?.id?.trim()) {
+        throw new PromptLedgerCompatibilityError(
+          `PromptLedger semantic tool record ${record.recordId} has no tool-call identity.`
+        );
+      }
+      const pending = pendingSemanticToolByEpoch.get(record.epochId);
+      if (pending) {
+        throw new PromptLedgerCompatibilityError(
+          `PromptLedger record ${record.recordId} follows unmatched semantic tool record ${pending.recordId}.`
+        );
+      }
+      pendingSemanticToolByEpoch.set(record.epochId, record);
+      continue;
+    }
+    if (record.kind === 'sessionToolResult') {
+      if (record.sourceRequestId !== restoreBoundary.record.recordId) {
+        throw new PromptLedgerCompatibilityError(
+          `PromptLedger tool result ${record.recordId} does not belong to the latest Provider request ${restoreBoundary.record.recordId}.`
+        );
+      }
+      if (!record.toolResult?.toolCallId?.trim()) {
+        throw new PromptLedgerCompatibilityError(
+          `PromptLedger tool result ${record.recordId} has no tool-call identity.`
+        );
+      }
+      const pending = pendingSemanticToolByEpoch.get(record.epochId);
+      const toolCall = pending?.toolCall;
+      if (!pending || !toolCall || toolCall.id !== record.toolResult.toolCallId) {
+        throw new PromptLedgerCompatibilityError(
+          `PromptLedger tool result ${record.recordId} has no matching semantic tool record after the latest Provider request.`
+        );
+      }
+      if (epoch.entries.some((entry) => entry.sourceRef === toolCall.id)) {
+        throw new PromptLedgerCompatibilityError(
+          `PromptLedger tool call ${toolCall.id} appears in both the latest Provider request and its post-request semantic records.`
+        );
+      }
+      const assistantMessage: LlmChatMessage = {
         role: 'assistant',
         content: '',
-        toolCalls: [structuredCloneValue(record.toolCall)],
+        toolCalls: [structuredCloneValue(toolCall)],
       };
-      if (!epoch.entries.some((entry) => entry.sourceRef === record.toolCall?.id && entry.kind === 'assistantSemanticTool')) {
-        epoch.entries.push({
-          entryId: record.recordId,
-          kind: 'assistantSemanticTool',
-          contentHash: record.messageHash ?? stableHash(messageSignature(message)),
-          message,
-          sourceRef: record.toolCall.id,
-        });
-      }
-    }
-    if (record.kind === 'sessionToolResult' && record.toolResult) {
+      epoch.entries.push({
+        entryId: pending.recordId,
+        kind: 'assistantSemanticTool',
+        contentHash: pending.messageHash ?? stableHash(messageSignature(assistantMessage)),
+        message: assistantMessage,
+        sourceRef: toolCall.id,
+      });
       const entryKind: PromptLedgerEntryKind = isSerializedResourceDelta(record.toolResult.content)
         ? 'resourceDelta'
         : 'sessionToolResult';
-      const message: LlmChatMessage = {
+      const toolMessage: LlmChatMessage = {
         role: 'tool',
         content: record.toolResult.content,
         toolCallId: record.toolResult.toolCallId,
       };
-      if (!epoch.entries.some((entry) => entry.sourceRef === record.toolResult?.toolCallId && (entry.kind === 'sessionToolResult' || entry.kind === 'resourceDelta'))) {
-        epoch.entries.push({
-          entryId: record.recordId,
-          kind: entryKind,
-          contentHash: record.messageHash ?? stableHash(messageSignature(message)),
-          message,
-          sourceRef: record.toolResult.toolCallId,
-        });
-      }
+      epoch.entries.push({
+        entryId: record.recordId,
+        kind: entryKind,
+        contentHash: record.messageHash ?? stableHash(messageSignature(toolMessage)),
+        message: toolMessage,
+        sourceRef: record.toolResult.toolCallId,
+      });
+      pendingSemanticToolByEpoch.delete(record.epochId);
     }
+  }
+  const unmatched = pendingSemanticToolByEpoch.values().next().value;
+  if (unmatched) {
+    throw new PromptLedgerCompatibilityError(
+      `PromptLedger semantic tool record ${unmatched.recordId} has no matching tool result after the latest Provider request.`
+    );
   }
   state.epochs.sort((left, right) => left.createdAt.localeCompare(right.createdAt));
   return state;
@@ -225,10 +296,14 @@ export function restoreProviderRequestCacheHistory(
   const history: Record<string, ProviderRequestCacheHistoryEntry> = {};
   for (const record of records) {
     if (record.kind !== 'providerRequest' || !record.messages?.length) continue;
-    history[record.semanticProfileId ?? record.profileId] = {
-      messages: record.messages.map(cloneMessage),
+    history[record.profileId] = {
       toolSchemaHash: record.schemaHash ?? record.toolsHash,
       responseFormatHash: record.responseFormatHash,
+      // WireLedger deliberately removes raw reasoning. A restored request
+      // therefore cannot support an exact physical-prefix comparison.
+      exactMaterialAvailable: false,
+      exactMaterialRedactionReason: 'restoredAdmissionOnly',
+      disposition: 'restoredAdmissionOnly',
       segments: (record.promptSegmentDigests ?? []).map((segment) => ({ ...segment })),
     };
   }
@@ -250,6 +325,11 @@ export function preparePromptLedger(input: {
   memorySnapshot?: unknown;
   workflowDelta?: string;
   repairDelta?: string;
+  priorUserGuidance?: readonly {
+    id: string;
+    content: string;
+  }[];
+  activeContinuationToolCallIds?: readonly string[];
   now: string;
   createId(prefix: string): string;
   contextWindowTokens?: number;
@@ -267,6 +347,12 @@ export function preparePromptLedger(input: {
   const priorProfileEpoch = [...state.epochs]
     .reverse()
     .find((epoch) => epoch.profileId === input.profileId);
+  const activeContinuationToolCallIds = input.activeContinuationToolCallIds ?? [];
+  const activeContinuationInEpoch = Boolean(
+    active
+    && activeContinuationToolCallIds.length > 0
+    && activeContinuationToolCallIds.every((toolCallId) => hasToolExchange(active, toolCallId))
+  );
   const activeOccupancy = active
     ? promptLedgerBudget(
       providerPromptEntries(active).map((entry) => entry.message),
@@ -278,10 +364,12 @@ export function preparePromptLedger(input: {
     || active.workspaceScopeKey !== input.workspaceScopeKey
     || active.systemHash !== systemHash
     || active.toolsHash !== toolsHash
-    || activeOccupancy >= 0.8;
+    || (!activeContinuationInEpoch && activeOccupancy >= 0.8);
   const cacheShapeReason = !active
-    ? priorProfileEpoch && input.profileId === 'execution-v1'
-      ? 'acceptedTaskChanged'
+    ? priorProfileEpoch
+      ? input.profileId === 'execution-v1'
+        ? 'acceptedTaskChanged'
+        : 'taskAuthorityChanged'
       : 'newProfileEpoch'
     : active.workspaceScopeKey !== input.workspaceScopeKey
       ? 'workspaceScopeChanged'
@@ -298,19 +386,27 @@ export function preparePromptLedger(input: {
   if (shouldRotate) {
     state.epochs.push(epoch);
     state.activeEpochByScope[activeEpochKey(input.profileId, input.epochScopeKey)] = epoch.epochId;
-  } else {
+  } else if (!activeContinuationInEpoch) {
     appendMemoryDelta(epoch, memoryHash, input.memorySnapshot, input.createId);
   }
-  appendCurrentTurn(epoch, input.authority, input.createId);
-  appendUnique(epoch, 'requestDelta', input.requestFrame, input.createId('prompt-request-delta'));
-  appendUnique(epoch, 'workflowDelta', input.workflowDelta ?? '', input.createId('prompt-workflow-delta'));
-  appendUnique(epoch, 'repairDelta', input.repairDelta ?? '', input.createId('prompt-repair-delta'));
+  if (!activeContinuationInEpoch) {
+    appendGuidanceBatch(epoch, input.priorUserGuidance, input.createId);
+    appendCurrentTurn(epoch, input.authority, input.createId);
+    appendUnique(epoch, 'requestDelta', input.requestFrame, input.createId('prompt-request-delta'));
+    appendUnique(epoch, 'workflowDelta', input.workflowDelta ?? '', input.createId('prompt-workflow-delta'));
+    appendUnique(epoch, 'repairDelta', input.repairDelta ?? '', input.createId('prompt-repair-delta'));
+  }
 
   let messages = providerPromptEntries(epoch).map((entry) => cloneMessage(entry.message));
   let budget = promptLedgerBudget(messages, input.contextWindowTokens, input.maxOutputTokens);
-  if (!shouldRotate && (budget.threshold === 'newEpoch80' || budget.threshold === 'converge90')) {
+  if (
+    !shouldRotate
+    && !activeContinuationInEpoch
+    && (budget.threshold === 'newEpoch80' || budget.threshold === 'converge90')
+  ) {
     epoch.compactionLevel = budget.threshold === 'converge90' ? 'converge' : 'epochSummary';
     const rotated = createEpoch(input, systemHash, toolsHash, rootUserHash, memoryHash);
+    appendGuidanceBatch(rotated, input.priorUserGuidance, input.createId);
     appendCurrentTurn(rotated, input.authority, input.createId);
     appendUnique(rotated, 'requestDelta', input.requestFrame, input.createId('prompt-request-delta'));
     appendUnique(rotated, 'workflowDelta', input.workflowDelta ?? '', input.createId('prompt-workflow-delta'));
@@ -328,7 +424,7 @@ export function preparePromptLedger(input: {
       cacheShapeReason: 'contextOccupancyReached80Percent',
     };
   }
-  if (budget.threshold === 'compact60') {
+  if (!activeContinuationInEpoch && budget.threshold === 'compact60') {
     messages = compactOldToolResults(messages);
     epoch.compactionLevel = 'toolResults';
     budget = promptLedgerBudget(messages, input.contextWindowTokens, input.maxOutputTokens);
@@ -389,6 +485,21 @@ export function appendPromptLedgerCurrentTurn(input: {
   return epoch;
 }
 
+export function appendPromptLedgerGuidanceBatch(input: {
+  state: PromptLedgerState;
+  epochId: string;
+  guidance: readonly {
+    id: string;
+    content: string;
+  }[];
+  createId(prefix: string): string;
+}): PromptLedgerEpoch | undefined {
+  const epoch = input.state.epochs.find((candidate) => candidate.epochId === input.epochId);
+  if (!epoch) return undefined;
+  appendGuidanceBatch(epoch, input.guidance, input.createId);
+  return epoch;
+}
+
 export function promptLedgerBudget(
   messages: readonly LlmChatMessage[],
   contextWindowTokens = 1_000_000,
@@ -432,6 +543,9 @@ export function promptLedgerAuthorityFits(
 
 export function promptLedgerWireRequest(input: {
   recordId: string;
+  parentRequestId?: string;
+  attemptKind?: string;
+  languageRevision?: number;
   sessionId: string;
   runId: string;
   profileId: string;
@@ -441,13 +555,23 @@ export function promptLedgerWireRequest(input: {
   timestamp: string;
   schemaHash?: string;
   responseFormatHash?: string;
+  providerPayloadDigest?: string;
+  transportDigest?: string;
+  digestMaterialScope?: 'sessionAdmitted';
+  messageMaterialScope?: 'restorationBase';
+  exactExternalWireBody?: false;
+  stream?: boolean;
   promptSegmentDigests?: PromptLedgerSegmentDigest[];
   turnAuthority?: SessionTurnAuthorityPayload;
 }): PromptLedgerWireRecord {
   const projectedEntries = providerPromptEntries(input.epoch);
+  const claimedEntryIds = new Set<string>();
   return {
     schemaVersion: 'deepcode.session.wire-ledger.v1',
     recordId: input.recordId,
+    parentRequestId: input.parentRequestId,
+    attemptKind: input.attemptKind,
+    languageRevision: input.languageRevision,
     sessionId: input.sessionId,
     runId: input.runId,
     profileId: input.profileId,
@@ -462,15 +586,26 @@ export function promptLedgerWireRequest(input: {
     authorityHash: input.turnAuthority?.authorityHash,
     kind: 'providerRequest',
     timestamp: input.timestamp,
-    messages: input.messages.map(cloneMessage),
+    messages: input.messages.map(wireSafeMessage),
     systemHash: input.epoch.systemHash,
     toolsHash: input.epoch.toolsHash,
-    messageHash: stableHash(JSON.stringify(input.messages)),
+    messageHash: stableHash(JSON.stringify(input.messages.map(wireSafeMessage))),
     schemaHash: input.schemaHash,
     responseFormatHash: input.responseFormatHash,
+    providerPayloadDigest: input.providerPayloadDigest,
+    transportDigest: input.transportDigest,
+    digestMaterialScope: input.digestMaterialScope,
+    messageMaterialScope: input.messageMaterialScope,
+    exactExternalWireBody: input.exactExternalWireBody,
+    stream: input.stream,
     promptSegmentDigests: input.promptSegmentDigests?.map((segment) => ({ ...segment })),
     ledgerEntries: input.messages.map((message, index) => {
-      const entry = projectedEntries[index];
+      const contentHash = stableHash(messageSignature(wireSafeMessage(message)));
+      const entry = projectedEntries.find((candidate) => (
+        !claimedEntryIds.has(candidate.entryId)
+        && stableHash(messageSignature(wireSafeMessage(candidate.message))) === contentHash
+      ));
+      if (entry) claimedEntryIds.add(entry.entryId);
       return entry ? {
         entryId: entry.entryId,
         kind: entry.kind,
@@ -479,7 +614,7 @@ export function promptLedgerWireRequest(input: {
       } : {
         entryId: `${input.recordId}-message-${index + 1}`,
         kind: restoredEntryKind(message, index),
-        contentHash: stableHash(messageSignature(message)),
+        contentHash,
         sourceRef: message.toolCalls?.[0]?.id ?? message.toolCallId,
       };
     }),
@@ -497,6 +632,7 @@ export function promptLedgerWireSemanticExchange(input: {
   sessionId: string;
   runId: string;
   profileId: string;
+  sourceRequestId: string;
   epoch: PromptLedgerEpoch;
   toolCall: ToolCall;
   result: unknown;
@@ -508,6 +644,7 @@ export function promptLedgerWireSemanticExchange(input: {
     {
       schemaVersion: 'deepcode.session.wire-ledger.v1',
       recordId: input.createId('wire-assistant-tool'),
+      sourceRequestId: input.sourceRequestId,
       sessionId: input.sessionId,
       runId: input.runId,
       profileId: input.profileId,
@@ -525,6 +662,7 @@ export function promptLedgerWireSemanticExchange(input: {
     {
       schemaVersion: 'deepcode.session.wire-ledger.v1',
       recordId: input.createId('wire-tool-result'),
+      sourceRequestId: input.sourceRequestId,
       sessionId: input.sessionId,
       runId: input.runId,
       profileId: input.profileId,
@@ -633,6 +771,22 @@ function appendMemoryDelta(
   epoch.memoryHash = memoryHash;
 }
 
+function restoredPromptLedgerMemoryHash(
+  entries: readonly PromptLedgerEntry[]
+): string | undefined {
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const entry = entries[index]!;
+    if (entry.kind !== 'memoryDelta' || entry.message.role !== 'user') continue;
+    const deltaMatch = /^SessionMemoryDelta: hash=([^\n]+)\n/.exec(entry.message.content);
+    if (deltaMatch?.[1]) return deltaMatch[1];
+    const epochPrefix = 'SessionMemoryEpochSnapshot:\n';
+    if (entry.message.content.startsWith(epochPrefix)) {
+      return stableHash(entry.message.content.slice(epochPrefix.length));
+    }
+  }
+  return undefined;
+}
+
 function serializeSnapshot(value: unknown): string {
   return typeof value === 'string' ? value : JSON.stringify(value);
 }
@@ -652,7 +806,8 @@ function appendCurrentTurn(
       relation: authority.turnAuthority.relation,
       sourceMessageIds: authority.turnAuthority.sourceMessageIds,
       sourceMessageHashes: authority.turnAuthority.sourceMessageHashes,
-      outputLanguage: authority.turnAuthority.outputLanguage,
+      languagePolicy: authority.languagePolicy,
+      effectiveLanguage: authority.effectiveLanguage,
       authorityHash: authority.turnAuthority.authorityHash,
     });
     epoch.entries.push({
@@ -681,6 +836,39 @@ function appendCurrentTurn(
   }
 }
 
+function appendGuidanceBatch(
+  epoch: PromptLedgerEpoch,
+  guidance: readonly {
+    id: string;
+    content: string;
+  }[] | undefined,
+  createId: (prefix: string) => string
+): void {
+  if (!guidance?.length) return;
+  const content = JSON.stringify({
+    schemaVersion: 'deepcode.session.user-guidance-batch.v1',
+    authority: 'user',
+    languageSource: 'The later CurrentTurnAuthority message is the language source.',
+    messages: guidance.map((item) => ({
+      messageId: item.id,
+      content: item.content,
+    })),
+  });
+  const contentHash = stableHash(content);
+  if (epoch.entries.some((entry) => (
+    entry.kind === 'userGuidance' && entry.contentHash === contentHash
+  ))) {
+    return;
+  }
+  appendMessage(epoch, {
+    entryId: createId('prompt-user-guidance-batch'),
+    kind: 'userGuidance',
+    contentHash,
+    message: { role: 'user', content },
+    sourceRef: stableHash(guidance.map((item) => item.id).join('\n')),
+  });
+}
+
 function appendUnique(
   epoch: PromptLedgerEpoch,
   kind: PromptLedgerEntryKind,
@@ -697,6 +885,24 @@ function appendUnique(
     contentHash,
     message: { role: 'user', content },
   });
+}
+
+function hasToolExchange(epoch: PromptLedgerEpoch, toolCallId: string): boolean {
+  const assistantIndex = epoch.entries.findIndex((entry) => (
+    entry.kind === 'assistantSemanticTool'
+    && entry.sourceRef === toolCallId
+    && entry.message.role === 'assistant'
+    && entry.message.toolCalls?.some((toolCall) => toolCall.id === toolCallId)
+  ));
+  if (assistantIndex < 0) return false;
+  const toolResult = epoch.entries[assistantIndex + 1];
+  return Boolean(
+    toolResult
+    && (toolResult.kind === 'sessionToolResult' || toolResult.kind === 'resourceDelta')
+    && toolResult.sourceRef === toolCallId
+    && toolResult.message.role === 'tool'
+    && toolResult.message.toolCallId === toolCallId
+  );
 }
 
 function appendMessage(epoch: PromptLedgerEpoch, entry: PromptLedgerEntry): void {
@@ -760,6 +966,25 @@ function messageSignature(message: LlmChatMessage): string {
 
 function cloneMessage(message: LlmChatMessage): LlmChatMessage {
   return structuredCloneValue(message);
+}
+
+function wireSafeMessage(message: LlmChatMessage): LlmChatMessage {
+  const cloned = cloneMessage(message);
+  delete cloned.reasoningContent;
+  return cloned;
+}
+
+function restoreWireLedgerMessage(
+  _record: PromptLedgerWireRecord,
+  message: LlmChatMessage,
+  _index: number
+): LlmChatMessage {
+  const cloned = cloneMessage(message);
+  if (cloned.role !== 'user') return cloned;
+  const baseContent = stripSessionOwnedConversationLanguageControls(cloned.content);
+  return baseContent === cloned.content
+    ? cloned
+    : { ...cloned, content: baseContent };
 }
 
 function structuredCloneValue<T>(value: T): T {

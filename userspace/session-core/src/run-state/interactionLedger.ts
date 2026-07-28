@@ -1,4 +1,7 @@
-import type { AgentEvent, PermissionRequest } from '@deepcode/protocol';
+import type {
+  AgentEvent,
+  AgentTimelinePermissionRequestView,
+} from '@deepcode/protocol';
 import { planInteractionAwaitsDecision } from './planInteractionState.js';
 
 export type InteractionLedgerOptionEffect =
@@ -26,19 +29,29 @@ export interface InteractionLedgerDecisionRequest {
 export type InteractionLedgerActiveInteraction =
   | {
       kind: 'permission';
+      interactionId: string;
+      interactionRevision: string;
+      targetId: string;
       requestId: string;
-      request: PermissionRequest;
+      request: AgentTimelinePermissionRequestView;
       title?: string;
       summary?: string;
     }
   | {
       kind: 'review';
+      interactionId: string;
+      interactionRevision: string;
+      targetId: string;
       runId: string;
+      reviewId: string;
       title?: string;
       summary?: string;
     }
   | {
       kind: 'plan';
+      interactionId: string;
+      interactionRevision: string;
+      targetId: string;
       runId: string;
       planId: string;
       title?: string;
@@ -46,6 +59,9 @@ export type InteractionLedgerActiveInteraction =
     }
   | {
       kind: 'requirement';
+      interactionId: string;
+      interactionRevision: string;
+      targetId: string;
       runId: string;
       requirementId: string;
       title?: string;
@@ -55,16 +71,28 @@ export type InteractionLedgerActiveInteraction =
 
 export function findActiveInteraction(input: {
   events: readonly AgentEvent[];
-  pendingPermission?: PermissionRequest | null;
+  pendingPermission?: AgentTimelinePermissionRequestView | null;
 }): InteractionLedgerActiveInteraction | null {
   if (input.pendingPermission) {
-    return {
-      kind: 'permission',
-      requestId: input.pendingPermission.id,
-      request: input.pendingPermission,
-      title: input.pendingPermission.toolName,
-      summary: input.pendingPermission.summary,
-    };
+    const targetId = input.pendingPermission.id;
+    const interactionRevision = permissionRequestRevision(input.events, targetId);
+    if (interactionRevision) {
+      const requestPayload = asRecord(input.pendingPermission);
+      return {
+        kind: 'permission',
+        interactionId: interactionIdentity(
+          'permission',
+          requestPayload ? stringField(requestPayload, 'runId') : undefined,
+          targetId
+        ),
+        interactionRevision,
+        targetId,
+        requestId: targetId,
+        request: input.pendingPermission,
+        title: input.pendingPermission.toolName,
+        summary: input.pendingPermission.summary,
+      };
+    }
   }
 
   const events = [...input.events];
@@ -93,12 +121,16 @@ function findLatestActiveReview(
     const reviewId = stringField(payload, 'reviewId');
     const sourcePlanId = stringField(payload, 'sourcePlanId');
     const reviewKey = reviewDecisionKey(runId, reviewId, sourcePlanId);
-    if (!runId || hasTerminalRunState(events, runId) || resolvedReviews.has(reviewKey) || resolvedReviewRuns.has(runId)) {
+    if (!runId || !reviewId || hasTerminalRunState(events, runId) || resolvedReviews.has(reviewKey) || resolvedReviewRuns.has(runId)) {
       continue;
     }
     return {
       kind: 'review',
+      interactionId: interactionIdentity('review', runId, reviewId),
+      interactionRevision: event.id,
+      targetId: reviewId,
       runId,
+      reviewId,
       title: stringField(payload, 'title'),
       summary: stringField(payload, 'summary'),
     };
@@ -132,6 +164,9 @@ function findLatestActivePlan(
     }
     return {
       kind: 'plan',
+      interactionId: interactionIdentity('plan', runId, planId),
+      interactionRevision: event.id,
+      targetId: planId,
       runId,
       planId,
       title: stringField(payload, 'title'),
@@ -164,6 +199,9 @@ function findLatestActiveRequirement(
     ) {
       return {
         kind: 'requirement',
+        interactionId: interactionIdentity('requirement', runId, requirementId),
+        interactionRevision: event.id,
+        targetId: requirementId,
         runId,
         requirementId,
         title: stringField(payload, 'title'),
@@ -173,6 +211,33 @@ function findLatestActiveRequirement(
     }
   }
   return null;
+}
+
+function permissionRequestRevision(
+  events: readonly AgentEvent[],
+  requestId: string
+): string | undefined {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (event.kind === 'permission_request') {
+      const payload = asRecord(event.payload);
+      if (payload && stringField(payload, 'id') === requestId) return event.id;
+    }
+    const payload = asRecord(event.payload);
+    const kernelEvent = payload ? asRecord(payload.kernelEvent) : null;
+    if (kernelEvent?.kind !== 'permission.requested') continue;
+    const request = asRecord(kernelEvent.request);
+    if (request && stringField(request, 'id') === requestId) return event.id;
+  }
+  return undefined;
+}
+
+function interactionIdentity(
+  kind: InteractionLedgerActiveInteraction['kind'],
+  runId: string | undefined,
+  targetId: string
+): string {
+  return `interaction:${kind}:${runId ?? 'session'}:${targetId}`;
 }
 
 function collectResolvedRequirementKeys(events: AgentEvent[]): Set<string> {
@@ -230,7 +295,14 @@ function collectResolvedPlanRuns(events: AgentEvent[]): Set<string> {
   for (const event of events) {
     if (event.kind !== 'plan_review' && event.kind !== 'review_summary') continue;
     const payload = asRecord(event.payload);
-    if (!payload || !isTerminalStatus(stringField(payload, 'status'))) continue;
+    const status = payload ? stringField(payload, 'status') : undefined;
+    if (
+      !payload
+      || !isTerminalStatus(status)
+      || status === 'needsRevision'
+    ) {
+      continue;
+    }
     const runId = stringField(payload, 'runId');
     if (runId) resolved.add(runId);
   }

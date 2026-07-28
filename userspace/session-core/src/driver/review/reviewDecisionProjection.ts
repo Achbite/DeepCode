@@ -1,4 +1,8 @@
 import type { AgentEvent } from '@deepcode/protocol';
+import {
+  localizedProjectionText,
+  type ProjectionLanguageBinding,
+} from '../projection/conversationPresentationLanguage.js';
 
 export type ReviewDecisionProjectionStatus = 'accepted' | 'needsRevision' | 'rejected';
 
@@ -16,6 +20,7 @@ export interface ReviewDecisionProjectionInput {
   content?: string;
   continuationRequested: boolean;
   terminalAcceptedPlan?: boolean;
+  presentationBinding: ProjectionLanguageBinding;
   ts: string;
   id: string;
 }
@@ -24,13 +29,17 @@ export interface ReviewContinuationDecisionPromptInput {
   sessionId: string;
   review: ReviewDecisionProjectionContext;
   continuations: string[];
+  presentationBinding: ProjectionLanguageBinding;
   ts: string;
   id: string;
 }
 
 export class ReviewDecisionProjectionBuilder {
   event(input: ReviewDecisionProjectionInput): AgentEvent {
-    const summary = this.summaryDescriptor(input.status);
+    const summary = this.summaryDescriptor(
+      input.status,
+      input.presentationBinding.language
+    );
     const userContent = input.content?.trim();
     const messageArgs = {
       continuationCount: String(input.review.continuations.length),
@@ -42,7 +51,11 @@ export class ReviewDecisionProjectionBuilder {
       ts: input.ts,
       kind: 'review_summary',
       payload: {
-        title: 'Review',
+        title: localizedProjectionText(input.presentationBinding.language, {
+          zh: '复核',
+          en: 'Review',
+          neutral: 'Review decision',
+        }),
         titleKey: 'review.decision.title',
         summary: summary.fallback,
         summaryKey: summary.key,
@@ -52,6 +65,10 @@ export class ReviewDecisionProjectionBuilder {
           ? { content: userContent }
           : { contentKey: this.defaultContentKey(input.status), contentArgs: messageArgs }),
         status: input.status,
+        presentationLanguage: input.presentationBinding.language,
+        languageRevision: input.presentationBinding.revision,
+        languageStatus: input.presentationBinding.status,
+        sourceTurnId: input.presentationBinding.sourceTurnId,
         runId: input.review.runId,
         reviewId: input.review.reviewId,
         sourcePlanId: input.review.sourcePlanId,
@@ -80,7 +97,11 @@ export class ReviewDecisionProjectionBuilder {
       ts: input.ts,
       kind: 'assistant_msg',
       payload: {
-        title: 'Continuation confirmation',
+        title: localizedProjectionText(input.presentationBinding.language, {
+          zh: '继续执行确认',
+          en: 'Continuation confirmation',
+          neutral: 'Continuation decision',
+        }),
         titleKey: 'review.continuationDecision.title',
         messageKey: 'review.continuationDecision.summary',
         messageArgs: { continuationCount: String(input.continuations.length) },
@@ -90,6 +111,10 @@ export class ReviewDecisionProjectionBuilder {
         runId: input.review.runId,
         reviewId: input.review.reviewId,
         sourcePlanId: input.review.sourcePlanId,
+        presentationLanguage: input.presentationBinding.language,
+        languageRevision: input.presentationBinding.revision,
+        languageStatus: input.presentationBinding.status,
+        sourceTurnId: input.presentationBinding.sourceTurnId,
         channel: 'progress',
         visibility: 'conversation',
         presentation: 'body',
@@ -97,7 +122,38 @@ export class ReviewDecisionProjectionBuilder {
     };
   }
 
-  private summaryDescriptor(status: ReviewDecisionProjectionStatus): { key: string; fallback: string } {
+  private summaryDescriptor(
+    status: ReviewDecisionProjectionStatus,
+    language: ProjectionLanguageBinding['language']
+  ): { key: string; fallback: string } {
+    if (language === 'zh-CN') {
+      if (status === 'accepted') {
+        return {
+          key: 'review.decision.accepted.summary',
+          fallback: '用户已接受复核，本批次已关闭。',
+        };
+      }
+      if (status === 'rejected') {
+        return {
+          key: 'review.decision.rejected.summary',
+          fallback: '用户已忽略复核，本次运行已取消。',
+        };
+      }
+      return {
+        key: 'review.decision.needsRevision.summary',
+        fallback: '用户要求继续处理或修改。',
+      };
+    }
+    if (language === 'neutral') {
+      return {
+        key: status === 'accepted'
+          ? 'review.decision.accepted.summary'
+          : status === 'rejected'
+            ? 'review.decision.rejected.summary'
+            : 'review.decision.needsRevision.summary',
+        fallback: `review_decision=${status}`,
+      };
+    }
     if (status === 'accepted') {
       return {
         key: 'review.decision.accepted.summary',

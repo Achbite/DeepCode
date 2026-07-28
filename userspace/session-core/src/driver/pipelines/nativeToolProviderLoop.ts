@@ -16,6 +16,7 @@ import type {
   ProviderPipelineRunTurnInput,
   ProviderPipelineTurn,
 } from './providerPipeline.js';
+import type { PendingProviderRetryAdmission } from './admittedProviderRequest.js';
 import type { DriverProviderTurnFrame } from '../runFrame.js';
 import { SessionSemanticDirectiveError } from '../../provider/SessionSemanticToolAdapter.js';
 import type { AcceptedTaskReplanReason } from '../execution/artifactDraftReplanCoordinator.js';
@@ -39,6 +40,8 @@ export interface NativeToolProviderLoopState extends NativeToolTurnHandlerState 
   semanticDirectiveRepairAttempts?: Record<string, number>;
   resourceEvidenceRevision?: number;
   taskPlanReplanReason?: AcceptedTaskReplanReason;
+  pendingProviderRetry?: PendingProviderRetryAdmission;
+  lastProviderResponseRequestId?: string;
 }
 
 export interface NativeToolProviderTurnHandlerLike<
@@ -64,6 +67,7 @@ export interface NativeToolProviderLoopInput<
   TTurn extends ProviderPipelineTurn & NativeToolTurnResult,
 > {
   profileId?: string;
+  stage?: string;
   state: TState;
   prompt: TPrompt;
   contract: DriverProviderTurnFrame;
@@ -103,7 +107,7 @@ export class NativeToolProviderLoop<
         profileId: input.profileId,
         state: input.state,
         contract: input.contract,
-        stage: 'provider_call',
+        stage: input.stage ?? 'provider_call',
         messages: this.dependencies.providerPipeline.messages(input.contract),
         options: { tools: input.providerTools },
         runTurn: input.runTurn,
@@ -116,9 +120,21 @@ export class NativeToolProviderLoop<
       return this.scheduleSameProfileRetry(input, [
         `code=${directiveError.code}`,
         `fieldErrors=${directiveError.message}`,
-      ], directiveError.code, directiveError.code);
+      ], directiveError.code, directiveError.code, input.state.lastProviderResponseRequestId);
     }
     const toolCalls = effectiveTurn.toolCalls as NativeToolCallProposal[];
+    if (toolCalls.length !== 1) {
+      await input.onSemanticDraftFailure?.(
+        input.state,
+        undefined,
+        'native_tool_arguments_invalid'
+      );
+      return this.scheduleSameProfileRetry(input, [
+        'code=native_tool_arguments_invalid',
+        `toolCallCount=${toolCalls.length}`,
+        'fieldErrors=Provider must emit exactly one registered Session semantic directive.',
+      ], `semantic:count:${toolCalls.length}:evidence-${input.state.resourceEvidenceRevision ?? 0}`, 'native_tool_arguments_invalid', effectiveTurn.providerRequestId);
+    }
     const registeredNames = new Set(input.providerTools.map((tool) => tool.name));
     const unregistered = toolCalls.find((toolCall) => !registeredNames.has(toolCall.name));
     if (unregistered) {
@@ -127,14 +143,7 @@ export class NativeToolProviderLoop<
         'code=native_tool_arguments_invalid',
         `tool=${unregistered.name}`,
         'fieldErrors=Provider emitted an unregistered Session semantic tool.',
-      ], `semantic:unregistered:${unregistered.name}:evidence-${input.state.resourceEvidenceRevision ?? 0}`, 'native_tool_arguments_invalid');
-    }
-    if (toolCalls.length === 0) {
-      await input.onSemanticDraftFailure?.(input.state, undefined, 'native_tool_arguments_invalid');
-      return this.scheduleSameProfileRetry(input, [
-        'code=native_tool_arguments_invalid',
-        'fieldErrors=Provider did not emit a required Session semantic directive.',
-      ], `semantic:missing:evidence-${input.state.resourceEvidenceRevision ?? 0}`, 'native_tool_arguments_invalid');
+      ], `semantic:unregistered:${unregistered.name}:evidence-${input.state.resourceEvidenceRevision ?? 0}`, 'native_tool_arguments_invalid', effectiveTurn.providerRequestId);
     }
 
     try {
@@ -147,6 +156,7 @@ export class NativeToolProviderLoop<
       });
       input.state.semanticDirectiveRepairAttempted = false;
       input.state.semanticDirectiveErrorSummary = undefined;
+      input.state.pendingProviderRetry = undefined;
       if (handled.kind === 'proposal' && handled.proposal.kind === 'taskPlan') {
         input.state.taskPlanReplanReason = undefined;
       }
@@ -184,7 +194,7 @@ export class NativeToolProviderLoop<
         `callId=${error.callId}`,
         `argumentsHash=${error.argumentsHash}`,
         `fieldErrors=${error.message}`,
-      ], repairKeyForError(error, input.state.resourceEvidenceRevision ?? 0), error.code);
+      ], repairKeyForError(error, input.state.resourceEvidenceRevision ?? 0), error.code, effectiveTurn.providerRequestId);
     }
   }
 
@@ -192,10 +202,15 @@ export class NativeToolProviderLoop<
     input: NativeToolProviderLoopInput<TState, TPrompt, TTurn>,
     details: string[],
     repairKey: string,
-    errorCode: string
+    errorCode: string,
+    sourceRequestId?: string
   ): NativeToolProviderResumeSignal {
     const state = input.state;
     const artifact = isArtifactRepairKey(repairKey);
+    if (!artifact && state.semanticDirectiveRepairAttempted) {
+      const message = `Session semantic directive remained invalid after one same-profile retry: ${details.join('; ')}`;
+      throw input.createError?.(errorCode, message) ?? new Error(`${errorCode}: ${message}`);
+    }
     const attemptsByKey = artifact
       ? (state.artifactChunkRepairAttempts ??= {})
       : (state.semanticDirectiveRepairAttempts ??= {});
@@ -210,6 +225,22 @@ export class NativeToolProviderLoop<
       ...details,
       'requiredAction=Call exactly one registered semantic tool with valid JSON arguments matching its schema and the current task contract.',
     ].join('; ');
+    const parentRequestId = sourceRequestId?.trim()
+      || state.lastProviderResponseRequestId?.trim();
+    if (!parentRequestId) {
+      throw input.createError?.(
+        'session_provider_continuation_invalid',
+        'Session semantic repair has no failed Provider request identity.'
+      ) ?? new Error(
+        'session_provider_continuation_invalid: Session semantic repair has no failed Provider request identity.'
+      );
+    }
+    state.pendingProviderRetry = {
+      attemptKind: 'repair',
+      parentRequestId,
+      reasonCode: errorCode,
+      rebaseFromFacts: true,
+    };
     return { kind: 'providerResume' };
   }
 }

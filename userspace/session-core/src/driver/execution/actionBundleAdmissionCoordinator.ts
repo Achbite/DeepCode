@@ -4,6 +4,14 @@ import type { PromptEnvelope } from '../../prompt/types.js';
 import type { RequirementRecord } from '../../requirement/types.js';
 import type { ProposalRouterResult } from '../proposal/proposalRouter.js';
 import { SessionDriverRepairRuntimeAccessor } from '../runFrame.js';
+import type { AcceptedTaskPlanContext } from '../../accepted-plan/types.js';
+import { finalSettlementEvidenceMetadata } from '../authority/finalSettlementEvidence.js';
+import {
+  conversationPresentationLanguageBinding,
+  localizedProjectionText,
+  type ConversationPresentationLanguageState,
+  type ProjectionLanguageBinding,
+} from '../projection/index.js';
 
 export interface ActionBundleAdmissionCoordinatorInput {
   sessionId: string;
@@ -11,12 +19,13 @@ export interface ActionBundleAdmissionCoordinatorInput {
   attachments?: AgentContextAttachment[];
 }
 
-export interface ActionBundleAdmissionCoordinatorState {
+export interface ActionBundleAdmissionCoordinatorState extends ConversationPresentationLanguageState {
   sessionId: string;
   runId: string;
   userRequest: string;
   actionBundleAdmissionRepairAttempted: boolean;
   phase?: string;
+  acceptedTaskPlan?: AcceptedTaskPlanContext;
 }
 
 export interface ActionBundleAdmissionCoordinatorDiagnostic {
@@ -93,19 +102,21 @@ export interface ActionBundleAdmissionCoordinatorPorts<
     proposal: ProposalEnvelope;
     originalUserRequest: string;
     attachments: AgentContextAttachment[];
+    presentationBinding: ProjectionLanguageBinding;
     ts: string;
     id: string;
   }): AgentEvent;
   sessionRunStateEvent(input: {
     sessionId: string;
     runId: string;
-    phase: 'waiting_plan_review';
-    reason: 'requirement';
+    phase: 'waiting_plan_review' | 'completed' | 'failed';
+    status?: 'waiting' | 'completed' | 'failed';
+    reason: 'requirement' | 'session' | 'task_diagnostic';
     decisionOwner: {
-      kind: 'requirement';
+      kind: 'requirement' | 'session';
       runId: string;
       targetId: string;
-      requirementId: string;
+      requirementId?: string;
     };
     ts: string;
     id: string;
@@ -114,9 +125,16 @@ export interface ActionBundleAdmissionCoordinatorPorts<
     sessionId: string,
     content: string | ActionBundleAdmissionCoordinatorDiagnostic,
     ts: string,
-    id: string
+    id: string,
+    presentationBinding: ProjectionLanguageBinding
   ): AgentEvent;
-  answerEvent(sessionId: string, proposal: ProposalEnvelope, ts: string, id: string): AgentEvent;
+  answerEvent(
+    sessionId: string,
+    proposal: ProposalEnvelope,
+    ts: string,
+    id: string,
+    metadata?: Record<string, unknown>
+  ): AgentEvent;
   diagnosticSummary(proposal: ProposalEnvelope): string;
   diagnostic(code: string, fallback: string, params?: Record<string, string | number>): ActionBundleAdmissionCoordinatorDiagnostic;
 }
@@ -202,6 +220,7 @@ export class ActionBundleAdmissionCoordinator<
         proposal: repaired,
         originalUserRequest: input.content,
         attachments: input.attachments ?? [],
+        presentationBinding: conversationPresentationLanguageBinding(state),
         ts: this.ports.now(),
         id: this.ports.createId('action-bundle-admission-decision'),
       });
@@ -225,32 +244,94 @@ export class ActionBundleAdmissionCoordinator<
       ]) ?? result;
     }
     if (repaired.kind === 'taskPlan') {
+      const presentationBinding = conversationPresentationLanguageBinding(state);
+      state.phase = 'failed';
+      const diagnosticId = this.ports.createId('action-bundle-admission-repair-plan-forbidden');
       return this.ports.append(state.sessionId, [
         this.ports.finalDiagnosticEvent(
           state.sessionId,
           this.ports.diagnostic(
             'actionBundleAdmissionRepairReturnedPlan',
-            'Action-bundle admission repair returned a plan proposal during execution. Session will not switch execution repair back into plan review; request a scoped actionBundle, resourceRequest, decisionRequest, or diagnostic instead.',
+            localizedProjectionText(presentationBinding.language, {
+              zh: 'Action-bundle 入场修复在执行阶段返回了计划提案。Session 不会把执行修复切回计划复核；请改为返回限定范围的 actionBundle、resourceRequest、decisionRequest 或 diagnostic。',
+              en: 'Action-bundle admission repair returned a plan proposal during execution. Session will not switch execution repair back into plan review; request a scoped actionBundle, resourceRequest, decisionRequest, or diagnostic instead.',
+              neutral: 'action_bundle_admission_repair=returned_plan execution_repair=blocked',
+            }),
             { returnedKind: repaired.kind, proposalId: repaired.proposalId }
           ),
           this.ports.now(),
-          this.ports.createId('action-bundle-admission-repair-plan-forbidden')
+          diagnosticId,
+          presentationBinding
         ),
+        this.ports.sessionRunStateEvent({
+          sessionId: state.sessionId,
+          runId: state.runId,
+          phase: 'failed',
+          status: 'failed',
+          reason: 'task_diagnostic',
+          decisionOwner: {
+            kind: 'session',
+            runId: state.runId,
+            targetId: diagnosticId,
+          },
+          ts: this.ports.now(),
+          id: this.ports.createId('session-run-action-bundle-repair-plan-failed'),
+        }),
       ]) ?? result;
     }
     if (repaired.kind === 'answer') {
+      state.phase = 'completed';
+      const answerId = this.ports.createId('answer');
       return this.ports.append(state.sessionId, [
-        this.ports.answerEvent(state.sessionId, repaired, this.ports.now(), this.ports.createId('answer')),
+        this.ports.answerEvent(
+          state.sessionId,
+          repaired,
+          this.ports.now(),
+          answerId,
+          finalSettlementEvidenceMetadata(state.acceptedTaskPlan)
+        ),
+        this.ports.sessionRunStateEvent({
+          sessionId: state.sessionId,
+          runId: state.runId,
+          phase: 'completed',
+          status: 'completed',
+          reason: 'session',
+          decisionOwner: {
+            kind: 'session',
+            runId: state.runId,
+            targetId: answerId,
+          },
+          ts: this.ports.now(),
+          id: this.ports.createId('session-run-action-bundle-repair-answer-completed'),
+        }),
       ]) ?? result;
     }
     if (repaired.kind === 'diagnostic') {
+      const presentationBinding = conversationPresentationLanguageBinding(state);
+      state.phase = 'failed';
+      const diagnosticId = this.ports.createId('action-bundle-admission-diagnostic');
       return this.ports.append(state.sessionId, [
         this.ports.finalDiagnosticEvent(
           state.sessionId,
           this.ports.diagnosticSummary(repaired),
           this.ports.now(),
-          this.ports.createId('action-bundle-admission-diagnostic')
+          diagnosticId,
+          presentationBinding
         ),
+        this.ports.sessionRunStateEvent({
+          sessionId: state.sessionId,
+          runId: state.runId,
+          phase: 'failed',
+          status: 'failed',
+          reason: 'task_diagnostic',
+          decisionOwner: {
+            kind: 'session',
+            runId: state.runId,
+            targetId: diagnosticId,
+          },
+          ts: this.ports.now(),
+          id: this.ports.createId('session-run-action-bundle-repair-diagnostic-failed'),
+        }),
       ]) ?? result;
     }
     return this.ports.submitNonExecutableProposal(state, repaired, result);

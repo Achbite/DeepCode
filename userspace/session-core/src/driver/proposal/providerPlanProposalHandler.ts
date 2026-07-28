@@ -12,11 +12,20 @@ import { canonicalJson, stableHash } from '../../cache/canonicalizer.js';
 import type { ProposalEnvelope } from '../../protocol/types.js';
 import type { PlanProjectionState } from '../projection/planProjectionBuilder.js';
 import {
+  conversationPresentationLanguage,
+  conversationPresentationLanguageBinding,
+  localizedProjectionText,
+  type ConversationPresentationLanguage,
+  type ConversationPresentationLanguageState,
+  type ProjectionLanguageBinding,
+} from '../projection/conversationPresentationLanguage.js';
+import {
   takeProviderCommitEvents,
   type ProviderCommitBufferState,
 } from '../pipelines/providerCommitBuffer.js';
 
-export interface ProviderPlanProposalState extends PlanProjectionState, ProviderCommitBufferState {
+export interface ProviderPlanProposalState
+  extends PlanProjectionState, ProviderCommitBufferState, ConversationPresentationLanguageState {
   runId: string;
   phase: string;
   workspaceBinding?: AgentWorkspaceBinding;
@@ -29,7 +38,11 @@ export interface ProviderPlanProposalHandlerPorts<State extends ProviderPlanProp
   createId(prefix: string): string;
   append(sessionId: string, events: AgentEvent[]): Promise<AgentSessionResult>;
   kernel(request: KernelCommandEnvelope): Promise<KernelReply>;
-  projectKernelEvents(sessionId: string, reply: KernelReply): AgentEvent[];
+  projectKernelEvents(
+    sessionId: string,
+    reply: KernelReply,
+    language: ConversationPresentationLanguage
+  ): AgentEvent[];
   taskPlanCardEvent(input: {
     state: State;
     proposal: ProposalEnvelope;
@@ -37,7 +50,13 @@ export interface ProviderPlanProposalHandlerPorts<State extends ProviderPlanProp
     ts: string;
     id: string;
   }): AgentEvent;
-  diagnosticEvent(sessionId: string, content: string, ts: string, id: string): AgentEvent;
+  diagnosticEvent(
+    sessionId: string,
+    content: string,
+    ts: string,
+    id: string,
+    presentationBinding: ProjectionLanguageBinding
+  ): AgentEvent;
   sessionRunStateEvent(input: {
     sessionId: string;
     runId: string;
@@ -80,7 +99,11 @@ export class ProviderPlanProposalHandler<State extends ProviderPlanProposalState
         intent,
       },
     });
-    const kernelEvents = this.ports.projectKernelEvents(state.sessionId, reply);
+    const kernelEvents = this.ports.projectKernelEvents(
+      state.sessionId,
+      reply,
+      conversationPresentationLanguage(state)
+    );
     const review = planAuthorizationReview(reply.events, planId);
     if (!reply.ok || !review) {
       return this.failPlanAuthorization(
@@ -130,14 +153,20 @@ export class ProviderPlanProposalHandler<State extends ProviderPlanProposalState
     kernelEvents: AgentEvent[]
   ): Promise<AgentSessionResult> {
     state.phase = 'failed';
+    const presentationBinding = conversationPresentationLanguageBinding(state);
     return this.ports.append(state.sessionId, [
       ...takeProviderCommitEvents(state),
       ...kernelEvents,
       this.ports.diagnosticEvent(
         state.sessionId,
-        `Kernel plan authorization failed: ${message}`,
+        localizedProjectionText(presentationBinding.language, {
+          zh: 'Kernel 计划授权失败，Session 已停止进入执行阶段（错误代码：plan_authorization_failed）。',
+          en: `Kernel plan authorization failed: ${message}`,
+          neutral: 'plan_authorization_failed',
+        }),
         this.ports.now(),
-        this.ports.createId('plan-authorization-failed')
+        this.ports.createId('plan-authorization-failed'),
+        presentationBinding
       ),
       this.ports.sessionRunStateEvent({
         sessionId: state.sessionId,

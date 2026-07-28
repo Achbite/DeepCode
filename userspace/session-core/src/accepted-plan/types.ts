@@ -1,4 +1,8 @@
-import type { AgentContextAttachment } from '@deepcode/protocol';
+import type {
+  AgentContextAttachment,
+  SessionKernelFactRefV1,
+  TaskLedgerSnapshotV2,
+} from '@deepcode/protocol';
 import type { InterventionLevel } from '../sessionModes.js';
 
 export type ExecutionSliceRole = 'sourceCode' | 'infra' | 'script' | 'test' | 'docs' | 'config' | 'review';
@@ -10,8 +14,8 @@ export interface TaskExecutionCursor {
   currentTaskId?: string;
   taskOrder: string[];
   pendingTaskIds: string[];
-  completedTaskIds: string[];
-  modelJudgedSufficientTaskIds?: string[];
+  settledTaskIds: string[];
+  kernelCompletedTaskIds: string[];
   lastResourcePacketIds: string[];
   lastSavepointId?: string;
 }
@@ -29,8 +33,8 @@ export interface CurrentTaskContext {
   pendingTaskIds: string[];
   dependsOn: string[];
   evidenceNeeds: string[];
-  completedTaskIds: string[];
-  modelJudgedSufficientTaskIds?: string[];
+  settledTaskIds: string[];
+  kernelCompletedTaskIds: string[];
 }
 
 export interface AcceptedTaskPlanTaskContext {
@@ -96,10 +100,15 @@ export interface AcceptedTaskPlanContext {
   executionRoot?: AcceptedTaskPlanExecutionRoot;
   interventionLevel?: AcceptedPlanInterventionLevel;
   batchIndex: number;
-  completedTaskIds: string[];
-  modelJudgedSufficientTaskIds?: string[];
+  taskLedger: TaskLedgerSnapshotV2;
   dependencyFacts: TaskDependencyFactRecord[];
   rawPlan: Record<string, unknown>;
+}
+
+export function acceptedPlanSettledTaskIds(
+  acceptedPlan: Pick<AcceptedTaskPlanContext, 'taskLedger'>
+): string[] {
+  return [...acceptedPlan.taskLedger.settledTaskIds];
 }
 
 export interface AcceptedPlanTargetScope {
@@ -111,11 +120,11 @@ export interface AcceptedPlanBatchProgress {
   actionIds: string[];
   targetPaths: string[];
   workUnitIds: string[];
-  newlyCompletedTaskIds: string[];
-  completedTaskIds: string[];
-  modelJudgedSufficientTaskIds?: string[];
-  newlyModelJudgedSufficientTaskIds?: string[];
+  kernelFactRefs: SessionKernelFactRefV1[];
+  newlySettledTaskIds: string[];
+  kernelCompletedTaskIds: string[];
   remainingTaskIds: string[];
+  taskLedger: TaskLedgerSnapshotV2;
 }
 
 export interface AcceptedPlanBatchValidationResult {

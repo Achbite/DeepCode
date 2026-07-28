@@ -24,11 +24,12 @@ pub(crate) fn run_response(state: &AppState, session_id: &str, run_id: &str) -> 
 pub(crate) fn session_payload(state: &AppState, session_id: &str) -> Option<(Value, Vec<Value>)> {
     let gui = state.gui.lock().expect("gui state lock");
     let session = session_by_id(&gui, session_id)?.clone();
-    let events = gui
-        .session_projection_cache
-        .get(session_id)
-        .cloned()
-        .unwrap_or_else(|| read_session_projection_jsonl(&gui.paths.sessions_dir, session_id));
+    let events = canonical_session_projection_events(
+        gui.session_projection_cache
+            .get(session_id)
+            .cloned()
+            .unwrap_or_else(|| read_session_projection_jsonl(&gui.paths.sessions_dir, session_id)),
+    );
     Some((session, events))
 }
 
@@ -40,7 +41,10 @@ pub(crate) fn host_bridge_request(
     intervention_level: Option<String>,
     project_memory_mode: String,
     autonomy_mode: String,
+    host_language: String,
     project_context: Option<&Value>,
+    bootstrap_grant: Option<&SessionRunBootstrapGrant>,
+    bootstrap_events: Vec<Value>,
 ) -> Value {
     let op = body.op.as_deref().unwrap_or_else(|| {
         if body.decision_kind.is_some() {
@@ -101,12 +105,56 @@ pub(crate) fn host_bridge_request(
         "interventionLevel": intervention_level,
         "projectMemoryMode": project_memory_mode,
         "autonomyMode": autonomy_mode,
+        "hostLanguage": host_language,
         "decisionKind": body.decision_kind.clone(),
         "decision": body.decision.clone(),
         "guidance": body.guidance.clone(),
         "runId": body.run_id.clone(),
-        "targetId": body.target_id.clone()
+        "targetId": body.target_id.clone(),
+        "interactionId": body.interaction_id.clone(),
+        "interactionRevision": body.interaction_revision.clone(),
+        "decisionRequestId": body.decision_request_id.clone(),
+        "reviewId": body.review_id.clone(),
+        "bootstrapAdmissionId": bootstrap_grant.map(|grant| grant.admission_id.clone()),
+        "bootstrapToken": bootstrap_grant.map(|grant| grant.token.clone()),
+        "bootstrapEvents": bootstrap_events,
+        "goalId": body.goal_id.clone(),
+        "goalRevision": body.goal_revision,
+        "objective": body.objective.clone(),
+        "callerRequestId": body.caller_request_id.clone(),
+        "requestDigest": body.request_digest.clone(),
+        "expectedDomainHeadDigest": body.admitted_domain_head_digest
+            .clone()
+            .or_else(|| body.expected_domain_head_digest.clone()),
+        "predecessorGoalRef": body.predecessor_goal_ref.clone()
     })
+}
+
+pub(crate) fn normalize_host_language(
+    request: Option<&str>,
+    setting: Option<String>,
+) -> (String, &'static str) {
+    if matches!(request, Some("zh-CN" | "en-US")) {
+        return (request.unwrap_or("zh-CN").to_string(), "request");
+    }
+    if matches!(setting.as_deref(), Some("zh-CN" | "en-US")) {
+        return (
+            setting.unwrap_or_else(|| "zh-CN".to_string()),
+            if request.is_some() {
+                "daemonSettingAfterInvalidRequest"
+            } else {
+                "daemonSetting"
+            },
+        );
+    }
+    (
+        "zh-CN".to_string(),
+        if request.is_some() {
+            "defaultAfterInvalidRequest"
+        } else {
+            "default"
+        },
+    )
 }
 
 pub(crate) fn authoritative_project_run_context(
@@ -346,8 +394,9 @@ pub(crate) fn run_session_bridge_worker(
             finish_run_from_bridge_output(&state, &session_id, &run_id, output, start_event_count)
         }
         Err(BridgeWorkerStop::Cancelled) => {
-            let _ = set_run_terminal(
+            finish_run_terminal(
                 &state,
+                &session_id,
                 &run_id,
                 "cancelled",
                 Some("Run cancelled by user.".to_string()),
@@ -361,6 +410,200 @@ pub(crate) fn run_session_bridge_worker(
                 &run_id,
                 "session_bridge_failed",
                 message,
+            );
+        }
+    }
+}
+
+pub(crate) fn run_readonly_session_bridge(request: Value) -> Result<Value, KernelErrorEnvelope> {
+    let payload = serde_json::to_vec(&request).map_err(|error| KernelErrorEnvelope {
+        code: "session_bridge_request_encode_failed".to_string(),
+        message: format!("failed to encode read-only Session bridge request: {error}"),
+        message_key: None,
+        args: None,
+    })?;
+    let bridge = find_session_host_bridge_daemon().ok_or_else(|| KernelErrorEnvelope {
+        code: "session_bridge_unavailable".to_string(),
+        message: format!(
+            "cannot find session host bridge; {}",
+            session_host_bridge_hint_daemon()
+        ),
+        message_key: None,
+        args: None,
+    })?;
+    let node = find_session_host_node_daemon(&bridge);
+    let mut child = Command::new(&node)
+        .arg(&bridge)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| KernelErrorEnvelope {
+            code: "session_bridge_spawn_failed".to_string(),
+            message: format!(
+                "failed to start Node runtime `{}` for bridge `{}`: {error}",
+                node.display(),
+                bridge.display()
+            ),
+            message_key: None,
+            args: None,
+        })?;
+    let write_result = child
+        .stdin
+        .take()
+        .ok_or_else(|| KernelErrorEnvelope {
+            code: "session_bridge_stdin_unavailable".to_string(),
+            message: "read-only Session bridge stdin is unavailable".to_string(),
+            message_key: None,
+            args: None,
+        })
+        .and_then(|mut stdin| {
+            stdin
+                .write_all(&payload)
+                .map_err(|error| KernelErrorEnvelope {
+                    code: "session_bridge_write_failed".to_string(),
+                    message: format!(
+                        "failed to write read-only Session bridge request: {error}"
+                    ),
+                    message_key: None,
+                    args: None,
+                })
+        });
+    if let Err(error) = write_result {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+    let output = wait_for_child_output_with_cancel_grace(
+        child,
+        || false,
+        Some(Duration::from_secs(30)),
+        Duration::ZERO,
+    )
+    .map_err(|error| KernelErrorEnvelope {
+        code: "session_bridge_failed".to_string(),
+        message: match error {
+            BridgeWorkerStop::Cancelled => {
+                "read-only Session bridge was unexpectedly cancelled".to_string()
+            }
+            BridgeWorkerStop::Failed(message) => message,
+        },
+        message_key: None,
+        args: None,
+    })?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let result = serde_json::from_str::<Value>(stdout.trim()).map_err(|error| {
+        KernelErrorEnvelope {
+            code: "session_bridge_invalid_json".to_string(),
+            message: format!(
+                "read-only Session bridge returned invalid JSON: {error}; stderr={}",
+                stderr.trim()
+            ),
+            message_key: None,
+            args: None,
+        }
+    })?;
+    if !output.status.success() || result.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Err(KernelErrorEnvelope {
+            code: result
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("session_bridge_failed")
+                .to_string(),
+            message: result
+                .get("message")
+                .or_else(|| result.get("error"))
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| stderr.trim())
+                .to_string(),
+            message_key: None,
+            args: None,
+        });
+    }
+    Ok(result)
+}
+
+fn finish_run_terminal(
+    state: &AppState,
+    session_id: &str,
+    run_id: &str,
+    requested_status: &str,
+    message: Option<String>,
+    final_text: Option<String>,
+) {
+    match session_run_has_durable_fence(state, session_id, run_id) {
+        Ok(false) => {
+            let status = if requested_status == "cancelled" {
+                "cancelled"
+            } else {
+                "failed"
+            };
+            let terminal_message = message.or_else(|| {
+                Some("Session run ended before its durable bootstrap was acknowledged.".to_string())
+            });
+            let _ = set_run_terminal(state, run_id, status, terminal_message, None);
+            return;
+        }
+        Err(error) => {
+            let _ = set_run_terminal(
+                state,
+                run_id,
+                "failed",
+                Some(format!(
+                    "{}Session run-fence inspection failed: {}",
+                    message
+                        .as_deref()
+                        .map(|value| format!("{value} "))
+                        .unwrap_or_default(),
+                    error.message
+                )),
+                None,
+            );
+            return;
+        }
+        Ok(true) => {}
+    }
+    if let Err(error) = admit_session_release_interaction_claim(state, session_id, run_id) {
+        eprintln!(
+            "failed to release Session interaction claim for {run_id} [{}]: {}",
+            error.code, error.message
+        );
+    }
+    match admit_session_terminal_close(
+        state,
+        session_id,
+        run_id,
+        requested_status,
+        None,
+        message.as_deref(),
+    ) {
+        Ok(outcome) => {
+            let message = if outcome.status == "cancelled" {
+                Some("Run cancelled by user.".to_string())
+            } else {
+                message
+            };
+            let _ = set_run_terminal(state, run_id, &outcome.status, message, final_text);
+        }
+        Err(error) => {
+            eprintln!(
+                "failed to persist terminal Session close for {run_id} [{}]: {}",
+                error.code, error.message
+            );
+            let _ = set_run_terminal(
+                state,
+                run_id,
+                "failed",
+                Some(format!(
+                    "{}Session close persistence failed: {}",
+                    message
+                        .as_deref()
+                        .map(|value| format!("{value} "))
+                        .unwrap_or_default(),
+                    error.message
+                )),
+                None,
             );
         }
     }
@@ -551,13 +794,23 @@ fn finish_run_from_bridge_output(
             return;
         }
     };
-    if let Err(error) = store_session_timeline(state, session_id, timeline) {
+    let Some(committed_timeline) = session_timeline(state, session_id) else {
         fail_run_with_event(
             state,
             session_id,
             run_id,
-            "write_session_timeline_failed",
-            format!("failed to persist canonical session timeline: {error}"),
+            "session_bridge_timeline_uncommitted",
+            "session bridge returned a timeline that was not committed with its domain batch",
+        );
+        return;
+    };
+    if committed_timeline != timeline {
+        fail_run_with_event(
+            state,
+            session_id,
+            run_id,
+            "session_bridge_timeline_mismatch",
+            "session bridge timeline does not match the canonical committed timeline",
         );
         return;
     }
@@ -570,7 +823,7 @@ fn finish_run_from_bridge_output(
                     .and_then(Value::as_str)
                     .unwrap_or("Session run is waiting for user input.")
                     .to_string();
-                let _ = set_run_terminal(state, run_id, "waiting", Some(message), None);
+                finish_run_terminal(state, session_id, run_id, "waiting", Some(message), None);
                 return;
             }
             "failed" => {
@@ -579,7 +832,7 @@ fn finish_run_from_bridge_output(
                     .and_then(Value::as_str)
                     .unwrap_or("Session run failed.")
                     .to_string();
-                let _ = set_run_terminal(state, run_id, "failed", Some(message), None);
+                finish_run_terminal(state, session_id, run_id, "failed", Some(message), None);
                 return;
             }
             "cancelled" => {
@@ -588,7 +841,7 @@ fn finish_run_from_bridge_output(
                     .and_then(Value::as_str)
                     .unwrap_or("Session run is cancelled.")
                     .to_string();
-                let _ = set_run_terminal(state, run_id, "cancelled", Some(message), None);
+                finish_run_terminal(state, session_id, run_id, "cancelled", Some(message), None);
                 return;
             }
             "completed" => {}
@@ -602,7 +855,7 @@ fn finish_run_from_bridge_output(
         .filter(|value| !value.trim().is_empty())
         .map(ToOwned::to_owned)
         .or_else(|| latest_final_text(state, session_id, start_event_count));
-    let _ = set_run_terminal(state, run_id, "completed", None, final_text);
+    finish_run_terminal(state, session_id, run_id, "completed", None, final_text);
 }
 
 fn session_host_bridge_timeout() -> Option<Duration> {

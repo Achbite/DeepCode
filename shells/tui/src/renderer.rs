@@ -337,7 +337,6 @@ impl Renderer {
         match card.kind {
             CardKind::User => self.theme.accent,
             CardKind::Assistant => Color::White,
-            CardKind::Thinking => self.theme.dim,
             CardKind::CommandHelp => self.theme.accent,
             CardKind::Stage => self.theme.success,
             CardKind::Tool => self.theme.warning,
@@ -353,7 +352,7 @@ impl Renderer {
     fn body_color(&self, card: &CardModel) -> Color {
         match card.kind {
             CardKind::Error | CardKind::BridgeError => self.theme.danger,
-            CardKind::Thinking | CardKind::Stage | CardKind::AuditStatus => Color::Gray,
+            CardKind::Stage | CardKind::AuditStatus => Color::Gray,
             _ => Color::White,
         }
     }
@@ -367,7 +366,6 @@ fn icon(card: &CardModel) -> &'static str {
     match card.kind {
         CardKind::User => "›",
         CardKind::Assistant | CardKind::Final => "◆",
-        CardKind::Thinking => "·",
         CardKind::CommandHelp => "?",
         CardKind::Stage => "•",
         CardKind::Tool => "⌁",
@@ -384,7 +382,6 @@ fn label(card: &CardModel) -> &'static str {
     match card.kind {
         CardKind::User => "你",
         CardKind::Assistant => "DeepCode",
-        CardKind::Thinking => "思考",
         CardKind::CommandHelp => "命令",
         CardKind::Stage => "状态",
         CardKind::Tool => "工具",

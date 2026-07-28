@@ -135,14 +135,10 @@ export interface ContextAssemblyTaskLocalFoldPlan {
 }
 
 export type ContextAssemblyTaskLocalCompactSource =
-  | 'kernelBatchCheckpoint'
-  | 'modelTaskOutcome'
-  | 'resourceValidation';
+  | 'kernelBatchCheckpoint';
 
 export type ContextAssemblyTaskLocalCompactStatus =
-  | 'completedByKernelFacts'
-  | 'modelJudgedSufficient'
-  | 'completedByReadOnlyEvidence';
+  | 'completedByKernelFacts';
 
 export interface ContextAssemblyTaskLocalCompactRecord {
   schemaVersion: 'deepcode.session.context-task-compact.v1';

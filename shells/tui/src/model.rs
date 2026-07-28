@@ -4,7 +4,6 @@ use serde_json::Value;
 pub enum CardKind {
     User,
     Assistant,
-    Thinking,
     CommandHelp,
     Stage,
     Tool,
@@ -46,6 +45,8 @@ impl CardModel {
     }
 
     pub fn from_timeline(timeline: &Value) -> Vec<Self> {
+        let is_v2 = timeline.get("schemaVersion").and_then(Value::as_str)
+            == Some("deepcode.shared-conversation-projection.v2");
         let turns = timeline
             .get("turns")
             .and_then(Value::as_array)
@@ -59,15 +60,26 @@ impl CardModel {
                 .cloned()
                 .unwrap_or_default();
             for block in blocks {
-                cards.push(Self::from_timeline_block(&block));
+                if let Some(card) = Self::from_timeline_block(&block, is_v2) {
+                    cards.push(card);
+                }
             }
         }
         cards
     }
 
-    fn from_timeline_block(block: &Value) -> Self {
+    fn from_timeline_block(block: &Value, is_v2: bool) -> Option<Self> {
         let kind = block.get_str("kind").unwrap_or("stage");
         let narrative_kind = block.get_str("narrativeKind").unwrap_or(kind);
+        let entry_role = block.get_str("entryRole");
+        if narrative_kind == "thinking"
+            || kind == "thinking"
+            || (is_v2
+                && entry_role == Some("finalAnswer")
+                && block.get_str("durability") != Some("committed"))
+        {
+            return None;
+        }
         let status = block.get_str("status").unwrap_or("completed");
         let title = block
             .get_str("title")
@@ -78,36 +90,55 @@ impl CardModel {
             .get_str("bodyMarkdown")
             .filter(|value| !value.trim().is_empty())
             .map(str::to_string)
+            .or_else(|| {
+                block
+                    .pointer("/localizedContent/text")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                    .map(str::to_string)
+            })
             .or_else(|| structured_projection_text(block))
             .unwrap_or_else(|| summary.to_string());
-        let card_kind = match narrative_kind {
-            "user" => CardKind::User,
-            "assistant" | "assistantText" => CardKind::Final,
-            "assistantNarration" => CardKind::Assistant,
-            "thinking" => CardKind::Thinking,
-            "toolBatch" | "operationEvidence" | "verification" => CardKind::Tool,
-            "permission" => CardKind::Permission,
-            "plan" => CardKind::Plan,
-            "review" => CardKind::Review,
-            "error" => CardKind::Error,
-            "bridgeError" => CardKind::BridgeError,
-            _ => match kind {
+        let card_kind = match entry_role {
+            Some("userMessage") => CardKind::User,
+            Some("finalAnswer") => CardKind::Final,
+            Some("agentUpdate") => CardKind::Assistant,
+            Some("activityGroup" | "evidence") => CardKind::Tool,
+            Some("diagnostic") => CardKind::Error,
+            Some("interaction") => match narrative_kind {
+                "permission" => CardKind::Permission,
+                "plan" => CardKind::Plan,
+                "review" => CardKind::Review,
+                _ => CardKind::Stage,
+            },
+            _ => match narrative_kind {
                 "user" => CardKind::User,
-                "assistant" => CardKind::Final,
-                "toolBatch" => CardKind::Tool,
+                "assistant" | "assistantText" => CardKind::Final,
+                "assistantNarration" => CardKind::Assistant,
+                "toolBatch" | "operationEvidence" | "verification" => CardKind::Tool,
                 "permission" => CardKind::Permission,
                 "plan" => CardKind::Plan,
                 "review" => CardKind::Review,
                 "error" => CardKind::Error,
                 "bridgeError" => CardKind::BridgeError,
-                _ => CardKind::Stage,
+                _ => match kind {
+                    "user" => CardKind::User,
+                    "assistant" => CardKind::Final,
+                    "toolBatch" => CardKind::Tool,
+                    "permission" => CardKind::Permission,
+                    "plan" => CardKind::Plan,
+                    "review" => CardKind::Review,
+                    "error" => CardKind::Error,
+                    "bridgeError" => CardKind::BridgeError,
+                    _ => CardKind::Stage,
+                },
             },
         };
-        Self::new(
+        Some(Self::new(
             card_kind,
             format!("{title} · {}", status_label(status)),
             body,
-        )
+        ))
     }
 
     fn new(kind: CardKind, title: impl Into<String>, body: impl Into<String>) -> Self {
@@ -191,9 +222,11 @@ pub fn command_help() -> &'static str {
 /allow <id>           允许权限请求\n\
 /deny <id>            拒绝权限请求\n\
 /decision <requirement|plan|review> <accept|reject|revise> [run-id] [target-id] [guidance]\n\
+/decision permission <accept|reject> [run-id] [target-id]\n\
 /audit                显示审计占位状态\n\
 \n\
 pending 计划/Review 时，空 Enter 或 1 表示确认；输入文本或 2 <文本> 表示提交 Review 信息；3、end、结束表示结束。\n\
+permission accept/reject 与 /allow、/deny 别名都通过共享 Session Runtime 的 canonical decision run；不会回退旧 permission endpoint。\n\
 这些命令对应 GUI composer decision / Stop 的终端输入形式；会话事实仍来自共享 daemon Session Runtime projection。\n\
 \n\
 普通文本会通过共享 daemon Session Runtime 发送；TUI 只负责展示、输入和权限确认，不持有 workflow、permission 或 tool execution 事实。"
@@ -221,8 +254,10 @@ fn timeline_kind_title(kind: &str) -> &'static str {
 
 fn status_label(status: &str) -> &'static str {
     match status {
+        "queued" => "排队中",
         "running" => "运行中",
         "blocked" | "waiting" => "等待确认",
+        "cancelled" => "已取消",
         "failed" => "失败",
         "completed" | "done" => "完成",
         "pending" => "等待中",

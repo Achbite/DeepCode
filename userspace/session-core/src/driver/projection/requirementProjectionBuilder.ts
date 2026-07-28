@@ -1,9 +1,14 @@
 import type { AgentContextAttachment, AgentEvent } from '@deepcode/protocol';
 import type { ProposalEnvelope } from '../../protocol/types.js';
 import type { RequirementRecord } from '../../requirement/types.js';
+import {
+  localizedProjectionText,
+  type ConversationPresentationLanguage,
+  type ProjectionLanguageBinding,
+} from './conversationPresentationLanguage.js';
 
 export type RequirementDecisionKind = 'accept' | 'reject' | 'revise';
-export type RequirementDecisionLanguage = 'zh-CN' | 'en-US';
+export type RequirementDecisionLanguage = ConversationPresentationLanguage;
 
 export interface RequirementDecisionOption {
   id: string;
@@ -17,7 +22,6 @@ export interface RequirementDecisionOption {
 }
 
 export interface RequirementProjectionBuilderPorts {
-  visibleLanguageForRequest(userRequest: string): RequirementDecisionLanguage;
   interactionOverlayPayload(payload: Record<string, unknown>): Record<string, unknown>;
 }
 
@@ -26,6 +30,7 @@ export interface RequirementDecisionEventInput {
   event: AgentEvent;
   decision: RequirementDecisionKind;
   guidance?: string;
+  presentationBinding: ProjectionLanguageBinding;
   ts: string;
   id: string;
 }
@@ -45,6 +50,7 @@ export interface RequirementConfirmationEventInput {
   attachments: AgentContextAttachment[];
   executionRootPayload?: Record<string, unknown>;
   interactionOverlayPayload?: Record<string, unknown>;
+  presentationBinding: ProjectionLanguageBinding;
   ts: string;
   id: string;
 }
@@ -54,10 +60,17 @@ export class RequirementProjectionBuilder {
 
   confirmationEvent(input: RequirementConfirmationEventInput): AgentEvent {
     const decisionRequest = objectRecord(input.proposal.payload);
-    const language = this.ports.visibleLanguageForRequest(input.originalUserRequest);
+    const binding = input.presentationBinding.status === 'unavailable'
+      && input.proposal.responseLanguage
+      ? {
+          language: input.proposal.responseLanguage,
+          status: 'resolved' as const,
+        }
+      : input.presentationBinding;
+    const language = binding.language;
     const content = decisionRequest && this.isDecisionRequestPayload(decisionRequest)
       ? this.renderDecisionRequestMarkdown(decisionRequest, language)
-      : this.renderRequirementConfirmationMarkdown(input.requirement);
+      : this.renderRequirementConfirmationMarkdown(input.requirement, language);
     const summary = this.decisionRequestSummary(decisionRequest) ?? this.requirementSummary(input.requirement);
     return {
       id: input.id,
@@ -65,7 +78,11 @@ export class RequirementProjectionBuilder {
       ts: input.ts,
       kind: 'requirement_confirmation',
       payload: {
-        title: '用户介入请求',
+        title: localizedProjectionText(language, {
+          zh: '用户介入请求',
+          en: 'User decision required',
+          neutral: 'Decision required',
+        }),
         titleKey: 'session.driver.requirementConfirmation.title',
         summary,
         content,
@@ -76,6 +93,11 @@ export class RequirementProjectionBuilder {
         requirement: input.requirement,
         decisionRequest: input.proposal.payload,
         proposalId: input.proposal.proposalId,
+        responseLanguage: input.proposal.responseLanguage,
+        presentationLanguage: language,
+        languageRevision: binding.revision,
+        languageStatus: binding.status,
+        sourceTurnId: binding.sourceTurnId,
         originalUserRequest: input.originalUserRequest,
         attachments: input.attachments,
         executionRoot: input.executionRootPayload,
@@ -93,7 +115,7 @@ export class RequirementProjectionBuilder {
     const selectedOption = input.decision === 'accept'
       ? this.selectedDecisionOptionFromGuidance(decisionRequest, input.guidance)
       : undefined;
-    const language = this.ports.visibleLanguageForRequest(stringValue(payload.originalUserRequest) ?? '');
+    const language = input.presentationBinding.language;
     const summary = this.decisionSummary(input.decision, selectedOption, language);
     const overlayPayload = this.ports.interactionOverlayPayload(payload);
     return {
@@ -102,7 +124,11 @@ export class RequirementProjectionBuilder {
       ts: input.ts,
       kind: 'requirement_decision',
       payload: {
-        title: 'Requirement decision',
+        title: localizedProjectionText(language, {
+          zh: '需求决策',
+          en: 'Requirement decision',
+          neutral: 'Requirement decision',
+        }),
         titleKey: 'session.driver.requirementDecision.title',
         summary: summary.text,
         summaryKey: summary.key,
@@ -112,6 +138,10 @@ export class RequirementProjectionBuilder {
         runId: stringValue(payload.runId),
         requirementId: stringValue(payload.requirementId),
         decision: input.decision,
+        presentationLanguage: language,
+        languageRevision: input.presentationBinding.revision,
+        languageStatus: input.presentationBinding.status,
+        sourceTurnId: input.presentationBinding.sourceTurnId,
         guidance: input.guidance,
         selectedOption,
         ...overlayPayload,
@@ -177,6 +207,21 @@ export class RequirementProjectionBuilder {
     selectedOption: RequirementDecisionOption | undefined,
     language: RequirementDecisionLanguage
   ): RequirementLocalizedSummary {
+    if (language === 'neutral') {
+      return {
+        text: selectedOption?.label && decision === 'accept'
+          ? `requirement_decision=accepted option=${selectedOption.label}`
+          : `requirement_decision=${decision === 'revise' ? 'needsRevision' : decision === 'accept' ? 'accepted' : 'rejected'}`,
+        key: decision === 'accept'
+          ? selectedOption?.label
+            ? 'session.driver.requirementDecision.selectedOption'
+            : 'session.driver.requirementDecision.accepted'
+          : decision === 'revise'
+            ? 'session.driver.requirementDecision.needsRevision'
+            : 'session.driver.requirementDecision.rejected',
+        args: selectedOption?.label ? { label: selectedOption.label } : {},
+      };
+    }
     if (language === 'en-US') {
       if (decision === 'accept' && selectedOption?.label) {
         return {
@@ -233,22 +278,34 @@ export class RequirementProjectionBuilder {
     };
   }
 
-  private renderRequirementConfirmationMarkdown(requirement: RequirementRecord): string {
+  private renderRequirementConfirmationMarkdown(
+    requirement: RequirementRecord,
+    language: RequirementDecisionLanguage
+  ): string {
     const checklist = requirement.checklist;
+    const labels = language === 'zh-CN'
+      ? {
+          headings: ['目标', '范围', '非目标', '约束', '风险点', '验收标准', '仍不明确的问题'],
+          empty: '暂无。',
+        }
+      : {
+          headings: ['Goal', 'Scope', 'Out of scope', 'Constraints', 'Risks', 'Acceptance criteria', 'Open questions'],
+          empty: 'None.',
+        };
     const sections = [
-      ['目标', checklist?.goal ? [checklist.goal] : []],
-      ['范围', checklist?.explicitTasks ?? []],
-      ['非目标', checklist?.outOfScope ?? []],
-      ['约束', checklist?.inferredTasks ?? []],
-      ['风险点', checklist?.riskNotes ?? []],
-      ['验收标准', checklist?.acceptanceCriteriaCandidates ?? []],
-      ['仍不明确的问题', checklist?.clarificationQuestions ?? []],
+      [labels.headings[0], checklist?.goal ? [checklist.goal] : []],
+      [labels.headings[1], checklist?.explicitTasks ?? []],
+      [labels.headings[2], checklist?.outOfScope ?? []],
+      [labels.headings[3], checklist?.inferredTasks ?? []],
+      [labels.headings[4], checklist?.riskNotes ?? []],
+      [labels.headings[5], checklist?.acceptanceCriteriaCandidates ?? []],
+      [labels.headings[6], checklist?.clarificationQuestions ?? []],
     ] as const;
     return sections
       .map(([heading, items]) => {
         const body = items.length
           ? items.map((item) => `- ${item}`).join('\n')
-          : '- 暂无。';
+          : `- ${labels.empty}`;
         return `## ${heading}\n${body}`;
       })
       .join('\n\n');
@@ -290,6 +347,10 @@ export class RequirementProjectionBuilder {
   private requirementSummary(requirement: RequirementRecord): string {
     return requirement.checklist?.goal || requirement.initialUserRequest;
   }
+}
+
+function conversationLanguage(value: unknown): RequirementDecisionLanguage | undefined {
+  return value === 'zh-CN' || value === 'en-US' ? value : undefined;
 }
 
 function objectRecord(value: unknown): Record<string, unknown> | undefined {

@@ -1,4 +1,8 @@
-import type { AgentEvent } from '@deepcode/protocol';
+import type {
+  AgentEvent,
+  SessionGoalInteractionRefV1,
+  TaskLedgerSnapshotV2,
+} from '@deepcode/protocol';
 import type { ProposalEnvelope } from '../../protocol/types.js';
 import { AcceptedPlanProgressAggregator } from '../../accepted-plan/AcceptedPlanProgressAggregator.js';
 import { AcceptedTaskRegistry } from '../../accepted-plan/AcceptedTaskRegistry.js';
@@ -10,15 +14,16 @@ import type {
   TaskExecutionCursor,
 } from '../../accepted-plan/types.js';
 import type { ResourcePacket } from '../../context/types.js';
-import type {
-  AcceptedPlanPromptFrame,
-  TaskLedgerSnapshot,
+import {
+  parseTaskLedgerV2,
+  readLegacyTaskLedgerV1,
+  type AcceptedPlanPromptFrame,
 } from '../../run-state/index.js';
 
 export interface AcceptedPlanTaskRuntimeSnapshot {
   taskExecutionCursor?: TaskExecutionCursor;
   currentTaskContext?: CurrentTaskContext;
-  taskLedger?: TaskLedgerSnapshot;
+  taskLedger?: TaskLedgerSnapshotV2;
   acceptedPlanPromptFrame?: AcceptedPlanPromptFrame;
 }
 
@@ -27,11 +32,10 @@ export interface AcceptedPlanTaskRuntimeState {
   resourcePackets: ResourcePacket[];
   taskExecutionCursor?: TaskExecutionCursor;
   currentTaskContext?: CurrentTaskContext;
-  taskLedger?: TaskLedgerSnapshot;
+  taskLedger?: TaskLedgerSnapshotV2;
   acceptedPlanPromptFrame?: AcceptedPlanPromptFrame;
 }
 
-// The accepted-plan runtime fields are a single snapshot boundary for task projection and provider context.
 export class AcceptedPlanTaskRuntimeAccessor {
   constructor(private readonly state: AcceptedPlanTaskRuntimeState) {}
 
@@ -55,105 +59,122 @@ export class AcceptedPlanTaskRuntimeAccessor {
   }
 }
 
-export interface AcceptedPlanTaskLedgerCoordinatorPorts {
-  workUnitIdsFromKernelEvents(kernelEvents: unknown[]): string[];
-  actionBatchHasFailureOrBlocker(kernelEvents: unknown[]): boolean;
-}
-
 export type AcceptedPlanLedgerCommand =
   | {
-    kind: 'recordKernelBatchProgress';
-    acceptedPlan: AcceptedTaskPlanContext;
-    proposal: ProposalEnvelope;
-    kernelEvents: unknown[];
-  }
+      kind: 'recordKernelBatchProgress';
+      acceptedPlan: AcceptedTaskPlanContext;
+      proposal: ProposalEnvelope;
+      kernelEvents: AgentEvent[];
+    }
   | {
-    kind: 'recordModelTaskOutcome';
-    acceptedPlan: AcceptedTaskPlanContext;
-    taskId: string;
-  }
+      kind: 'recordUserTaskSettlement';
+      acceptedPlan: AcceptedTaskPlanContext;
+      taskIds: string[];
+      outcome: 'skipped' | 'acceptedIncomplete';
+      interaction: SessionGoalInteractionRefV1;
+      decisionEventRef: string;
+    }
   | {
-    kind: 'recordTaskCompletion';
-    acceptedPlan: AcceptedTaskPlanContext;
-    completedTaskIds: string[];
-  }
-  | {
-    kind: 'recoverLatestCheckpoint';
-    acceptedPlan: AcceptedTaskPlanContext;
-    events: AgentEvent[];
-  };
+      kind: 'recoverLatestCheckpoint';
+      acceptedPlan: AcceptedTaskPlanContext;
+      events: AgentEvent[];
+    };
 
 export type AcceptedPlanLedgerEffect =
   | {
-    kind: 'kernelBatchProgressRecorded';
-    progress: AcceptedPlanBatchProgress;
-    completedTaskIds: string[];
-    nextAcceptedPlan: AcceptedTaskPlanContext;
-  }
+      kind: 'kernelBatchProgressRecorded';
+      progress: AcceptedPlanBatchProgress;
+      nextAcceptedPlan: AcceptedTaskPlanContext;
+    }
   | {
-    kind: 'modelTaskOutcomeRecorded';
-    taskId: string;
-    nextAcceptedPlan: AcceptedTaskPlanContext;
-  }
+      kind: 'userTaskSettlementRecorded';
+      settledTaskIds: string[];
+      nextAcceptedPlan: AcceptedTaskPlanContext;
+    }
   | {
-    kind: 'taskCompletionRecorded';
-    completedTaskIds: string[];
-    nextAcceptedPlan: AcceptedTaskPlanContext;
-  }
-  | {
-    kind: 'latestCheckpointRecovered';
-    nextAcceptedPlan: AcceptedTaskPlanContext;
-  };
+      kind: 'latestCheckpointRecovered';
+      nextAcceptedPlan: AcceptedTaskPlanContext;
+    };
 
 export class AcceptedPlanTaskLedgerCoordinator {
-  constructor(private readonly ports?: AcceptedPlanTaskLedgerCoordinatorPorts) {}
-
-  // Accepted-plan ledger mutations are command effects so projections and cursors share one state transition owner.
   execute(command: AcceptedPlanLedgerCommand): AcceptedPlanLedgerEffect {
     if (command.kind === 'recordKernelBatchProgress') {
-      const progress = this.batchProgress({
-        acceptedPlan: command.acceptedPlan,
-        proposal: command.proposal,
-        kernelEvents: command.kernelEvents,
-      });
-      const newDependencyFacts = progress.newlyCompletedTaskIds.flatMap((taskId) =>
+      const progress = new AcceptedPlanProgressAggregator().progress(
+        command.acceptedPlan,
+        command.proposal,
+        command.kernelEvents
+      );
+      const dependencyFacts = progress.newlySettledTaskIds.flatMap((taskId) =>
         taskDependencyFactsFromKernelEvents(taskId, command.kernelEvents)
+      );
+      const nextAcceptedPlan = new AcceptedTaskRegistry(
+        command.acceptedPlan
+      ).withLedger(progress.taskLedger);
+      if (!nextAcceptedPlan) {
+        throw new Error(
+          'session_task_ledger_transition_invalid: Kernel settlement did not produce an accepted plan.'
+        );
+      }
+      const facts = new Map(
+        [...command.acceptedPlan.dependencyFacts, ...dependencyFacts]
+          .map((fact) => [fact.factRef, fact] as const)
       );
       return {
         kind: 'kernelBatchProgressRecorded',
         progress,
-        completedTaskIds: progress.completedTaskIds,
-        nextAcceptedPlan: this.afterBatch(
-          command.acceptedPlan,
-          progress.completedTaskIds,
-          newDependencyFacts
-        ),
+        nextAcceptedPlan: {
+          ...nextAcceptedPlan,
+          dependencyFacts: [...facts.values()],
+        },
       };
     }
-    if (command.kind === 'recordModelTaskOutcome') {
+    if (command.kind === 'recordUserTaskSettlement') {
+      let nextAcceptedPlan = command.acceptedPlan;
+      const settledTaskIds: string[] = [];
+      for (const taskId of command.taskIds) {
+        const activeTaskId = nextAcceptedPlan.taskLedger.currentTaskId;
+        if (taskId !== activeTaskId) {
+          throw new Error(
+            `session_task_ledger_transition_invalid: user decision task ${taskId} is not the exact active task ${activeTaskId ?? '<none>'}.`
+          );
+        }
+        const next = new AcceptedTaskRegistry(nextAcceptedPlan).settle({
+          taskId,
+          settlement: {
+            kind: 'userDecision',
+            outcome: command.outcome,
+            interaction: command.interaction,
+            decisionEventRef: command.decisionEventRef,
+          },
+          sourceRefs: [command.decisionEventRef],
+        });
+        if (!next) {
+          throw new Error(
+            'session_task_ledger_transition_invalid: user settlement did not produce an accepted plan.'
+          );
+        }
+        nextAcceptedPlan = next;
+        settledTaskIds.push(taskId);
+      }
       return {
-        kind: 'modelTaskOutcomeRecorded',
-        taskId: command.taskId,
-        nextAcceptedPlan: this.afterTaskOutcome(command.acceptedPlan, command.taskId),
-      };
-    }
-    if (command.kind === 'recordTaskCompletion') {
-      return {
-        kind: 'taskCompletionRecorded',
-        completedTaskIds: command.completedTaskIds,
-        nextAcceptedPlan: this.afterBatch(command.acceptedPlan, command.completedTaskIds),
+        kind: 'userTaskSettlementRecorded',
+        settledTaskIds,
+        nextAcceptedPlan,
       };
     }
     return {
       kind: 'latestCheckpointRecovered',
-      nextAcceptedPlan: this.withLatestCheckpoint(command.acceptedPlan, command.events),
+      nextAcceptedPlan: this.withLatestCheckpoint(
+        command.acceptedPlan,
+        command.events
+      ),
     };
   }
 
   recordKernelBatchProgress(input: {
     acceptedPlan: AcceptedTaskPlanContext;
     proposal: ProposalEnvelope;
-    kernelEvents: unknown[];
+    kernelEvents: AgentEvent[];
   }): Extract<AcceptedPlanLedgerEffect, { kind: 'kernelBatchProgressRecorded' }> {
     const effect = this.execute({
       kind: 'recordKernelBatchProgress',
@@ -165,29 +186,18 @@ export class AcceptedPlanTaskLedgerCoordinator {
     return effect;
   }
 
-  recordModelTaskOutcome(input: {
+  recordUserTaskSettlement(input: {
     acceptedPlan: AcceptedTaskPlanContext;
-    taskId: string;
-  }): Extract<AcceptedPlanLedgerEffect, { kind: 'modelTaskOutcomeRecorded' }> {
+    taskIds: string[];
+    outcome: 'skipped' | 'acceptedIncomplete';
+    interaction: SessionGoalInteractionRefV1;
+    decisionEventRef: string;
+  }): Extract<AcceptedPlanLedgerEffect, { kind: 'userTaskSettlementRecorded' }> {
     const effect = this.execute({
-      kind: 'recordModelTaskOutcome',
+      kind: 'recordUserTaskSettlement',
       ...input,
     });
-    if (effect.kind !== 'modelTaskOutcomeRecorded') {
-      throw new Error(`Unexpected accepted-plan ledger effect: ${effect.kind}`);
-    }
-    return effect;
-  }
-
-  recordTaskCompletion(input: {
-    acceptedPlan: AcceptedTaskPlanContext;
-    completedTaskIds: string[];
-  }): Extract<AcceptedPlanLedgerEffect, { kind: 'taskCompletionRecorded' }> {
-    const effect = this.execute({
-      kind: 'recordTaskCompletion',
-      ...input,
-    });
-    if (effect.kind !== 'taskCompletionRecorded') {
+    if (effect.kind !== 'userTaskSettlementRecorded') {
       throw new Error(`Unexpected accepted-plan ledger effect: ${effect.kind}`);
     }
     return effect;
@@ -217,7 +227,10 @@ export class AcceptedPlanTaskLedgerCoordinator {
       input.resourcePackets,
       input.lastSavepointId
     );
-    const currentTaskContext = this.currentTaskContext(input.acceptedPlan, taskExecutionCursor);
+    const currentTaskContext = this.currentTaskContext(
+      input.acceptedPlan,
+      taskExecutionCursor
+    );
     const taskLedger = this.ledger(input.acceptedPlan);
     return {
       taskExecutionCursor,
@@ -233,21 +246,14 @@ export class AcceptedPlanTaskLedgerCoordinator {
   }
 
   ledger(
-    acceptedPlan: AcceptedTaskPlanContext | undefined,
-    failedTaskId?: string,
-    skippedTaskIds: string[] = [],
-    acceptedIncompleteTaskIds: string[] = []
-  ): TaskLedgerSnapshot | undefined {
-    return new AcceptedTaskRegistry(acceptedPlan).ledger(
-      failedTaskId,
-      skippedTaskIds,
-      acceptedIncompleteTaskIds
-    );
+    acceptedPlan: AcceptedTaskPlanContext | undefined
+  ): TaskLedgerSnapshotV2 | undefined {
+    return new AcceptedTaskRegistry(acceptedPlan).ledger();
   }
 
   promptFrame(
     acceptedPlan: AcceptedTaskPlanContext | undefined,
-    taskLedger: TaskLedgerSnapshot | undefined
+    taskLedger: TaskLedgerSnapshotV2 | undefined
   ): AcceptedPlanPromptFrame | undefined {
     return new AcceptedTaskRegistry(acceptedPlan).promptFrame(taskLedger);
   }
@@ -257,7 +263,10 @@ export class AcceptedPlanTaskLedgerCoordinator {
     resourcePackets: ResourcePacket[],
     lastSavepointId?: string
   ): TaskExecutionCursor | undefined {
-    return new AcceptedTaskRegistry(acceptedPlan).cursor(resourcePackets, lastSavepointId);
+    return new AcceptedTaskRegistry(acceptedPlan).cursor(
+      resourcePackets,
+      lastSavepointId
+    );
   }
 
   currentTaskContext(
@@ -272,74 +281,8 @@ export class AcceptedPlanTaskLedgerCoordinator {
     return [
       'CurrentTaskGoal:',
       context.goal,
-      `CurrentTaskContext: taskId=${context.taskId ?? 'none'}; targets=${context.targets.join(', ') || 'none'}; toolIds=${context.toolIds.join(', ') || 'none'}; completedTasks=${context.completedTaskIds.length}.`,
+      `CurrentTaskContext: taskId=${context.taskId ?? 'none'}; targets=${context.targets.join(', ') || 'none'}; toolIds=${context.toolIds.join(', ') || 'none'}; settledTasks=${context.settledTaskIds.length}.`,
     ];
-  }
-
-  withCompleted(
-    acceptedPlan: AcceptedTaskPlanContext | undefined,
-    completedTaskIds: string[]
-  ): AcceptedTaskPlanContext | undefined {
-    return new AcceptedTaskRegistry(acceptedPlan).withCompleted(completedTaskIds);
-  }
-
-  batchProgress(input: {
-    acceptedPlan: AcceptedTaskPlanContext;
-    proposal: ProposalEnvelope;
-    kernelEvents: unknown[];
-  }): AcceptedPlanBatchProgress {
-    if (!this.ports) {
-      throw new Error('AcceptedPlanTaskLedgerCoordinator batchProgress requires kernel event ports.');
-    }
-    return new AcceptedPlanProgressAggregator({
-      workUnitIdsFromKernelEvents: this.ports.workUnitIdsFromKernelEvents,
-      actionBatchHasFailureOrBlocker: this.ports.actionBatchHasFailureOrBlocker,
-    }).progress(input.acceptedPlan, input.proposal, input.kernelEvents);
-  }
-
-  afterBatch(
-    acceptedPlan: AcceptedTaskPlanContext,
-    completedTaskIds: string[],
-    dependencyFacts: AcceptedTaskPlanContext['dependencyFacts'] = []
-  ): AcceptedTaskPlanContext {
-    const completed = this.withCompleted(acceptedPlan, completedTaskIds) ?? acceptedPlan;
-    const facts = new Map(
-      [...(acceptedPlan.dependencyFacts ?? []), ...dependencyFacts]
-        .map((fact) => [fact.factRef, fact] as const)
-    );
-    return { ...completed, dependencyFacts: [...facts.values()] };
-  }
-
-  afterTaskOutcome(
-    acceptedPlan: AcceptedTaskPlanContext,
-    taskId: string
-  ): AcceptedTaskPlanContext {
-    return new AcceptedTaskRegistry(acceptedPlan).withModelJudgedSufficient(taskId) ?? acceptedPlan;
-  }
-
-  withLatestCheckpoint(
-    acceptedPlan: AcceptedTaskPlanContext,
-    events: AgentEvent[]
-  ): AcceptedTaskPlanContext {
-    for (const event of [...events].reverse()) {
-      if (event.kind !== 'workflow_stage') continue;
-      const payload = objectRecord(event.payload);
-      if (!payload) continue;
-      if (stringValue(payload.stage) !== 'accepted_plan.batch_checkpoint') continue;
-      if (stringValue(payload.runId) !== acceptedPlan.runId || stringValue(payload.planId) !== acceptedPlan.planId) continue;
-      const completedTaskIds = stringArrayValue(payload.completedTaskIds);
-      const modelJudgedSufficientTaskIds = stringArrayValue(payload.modelJudgedSufficientTaskIds);
-      const dependencyFacts = taskDependencyFactArray(payload.dependencyFacts);
-      let nextAccepted = acceptedPlan;
-      if (completedTaskIds.length) {
-        nextAccepted = this.afterBatch(nextAccepted, completedTaskIds, dependencyFacts);
-      }
-      for (const taskId of modelJudgedSufficientTaskIds) {
-        nextAccepted = this.afterTaskOutcome(nextAccepted, taskId);
-      }
-      return nextAccepted;
-    }
-    return acceptedPlan;
   }
 
   complete(acceptedPlan: AcceptedTaskPlanContext): boolean {
@@ -355,9 +298,48 @@ export class AcceptedPlanTaskLedgerCoordinator {
     }
     return undefined;
   }
+
+  private withLatestCheckpoint(
+    acceptedPlan: AcceptedTaskPlanContext,
+    events: AgentEvent[]
+  ): AcceptedTaskPlanContext {
+    for (const event of [...events].reverse()) {
+      if (event.kind !== 'workflow_stage') continue;
+      const payload = objectRecord(event.payload);
+      if (!payload) continue;
+      if (stringValue(payload.stage) !== 'accepted_plan.batch_checkpoint') continue;
+      if (
+        stringValue(payload.runId) !== acceptedPlan.runId
+        || stringValue(payload.planId) !== acceptedPlan.planId
+      ) {
+        continue;
+      }
+      const taskLedger = objectRecord(payload.taskLedger);
+      if (!taskLedger) return acceptedPlan;
+      if (readLegacyTaskLedgerV1(taskLedger)) {
+        throw new Error(
+          'session_task_ledger_legacy_read_only: TaskLedgerV1 checkpoints may be viewed but not continued.'
+        );
+      }
+      const parsed = parseTaskLedgerV2(taskLedger);
+      const next = new AcceptedTaskRegistry(acceptedPlan).withLedger(parsed);
+      if (!next) {
+        throw new Error(
+          'session_task_ledger_transition_invalid: checkpoint TaskLedgerV2 could not be restored.'
+        );
+      }
+      return {
+        ...next,
+        dependencyFacts: taskDependencyFactArray(payload.dependencyFacts),
+      };
+    }
+    return acceptedPlan;
+  }
 }
 
-function taskDependencyFactArray(value: unknown): AcceptedTaskPlanContext['dependencyFacts'] {
+function taskDependencyFactArray(
+  value: unknown
+): AcceptedTaskPlanContext['dependencyFacts'] {
   if (!Array.isArray(value)) return [];
   return value.flatMap((item) => {
     const record = objectRecord(item);
@@ -367,7 +349,9 @@ function taskDependencyFactArray(value: unknown): AcceptedTaskPlanContext['depen
     const workUnitId = stringValue(record?.workUnitId);
     const toolId = stringValue(record?.toolId);
     const path = stringValue(record?.path);
-    if (!taskId || !factRef || !toolCallId || !workUnitId || !toolId || !path) return [];
+    if (!taskId || !factRef || !toolCallId || !workUnitId || !toolId || !path) {
+      return [];
+    }
     return [{
       taskId,
       factRef,
@@ -379,7 +363,9 @@ function taskDependencyFactArray(value: unknown): AcceptedTaskPlanContext['depen
       contentHash: stringValue(record?.contentHash),
       sizeBytes: integerValue(record?.sizeBytes),
       mode: integerValue(record?.mode),
-      executable: typeof record?.executable === 'boolean' ? record.executable : undefined,
+      executable: typeof record?.executable === 'boolean'
+        ? record.executable
+        : undefined,
     }];
   });
 }
@@ -394,16 +380,10 @@ function stringValue(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value : undefined;
 }
 
-function stringArrayValue(value: unknown): string[] {
-  if (!Array.isArray(value)) {
-    const single = stringValue(value);
-    return single ? [single] : [];
-  }
-  return value
-    .map((item) => stringValue(item))
-    .filter((item): item is string => Boolean(item));
-}
-
 function integerValue(value: unknown): number | undefined {
-  return typeof value === 'number' && Number.isInteger(value) && value >= 0 ? value : undefined;
+  return typeof value === 'number'
+    && Number.isInteger(value)
+    && value >= 0
+    ? value
+    : undefined;
 }

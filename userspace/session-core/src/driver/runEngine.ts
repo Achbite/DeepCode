@@ -1,4 +1,5 @@
 import type { AgentSessionResult } from '@deepcode/protocol';
+import type { GoalStepOutcomeV1 } from '@deepcode/protocol';
 import type { ProviderTurnCycleResult } from './pipelines/providerTurnCycle.js';
 import type { ProposalRouterInput, ProposalRouterResult } from './proposal/proposalRouter.js';
 import type {
@@ -22,6 +23,16 @@ export interface RunEngineState {
 export interface RunEnginePorts<Input, State extends RunEngineState> {
   initialize(input: Input): Promise<RunEngineLifecycleResult<State>>;
   resume(input: Input): Promise<RunEngineLifecycleResult<State>>;
+  recoverGoalDirective?(input: {
+    input: Input;
+    state: State;
+    lastResult: AgentSessionResult;
+  }): Promise<{
+    prompt: ProposalRouterInput<Input, State>['prompt'];
+    lastResult: AgentSessionResult;
+    proposal: NonNullable<ProposalRouterInput<Input, State>['proposal']>;
+    directive: NonNullable<ProposalRouterInput<Input, State>['routed']>;
+  } | undefined>;
   shouldBuildRequirementConfirmation(input: Input): boolean;
   waitForRequirementDecision(input: Input, state: State): Promise<AgentSessionResult>;
   runProviderTurn(input: {
@@ -33,6 +44,14 @@ export interface RunEnginePorts<Input, State extends RunEngineState> {
   assembleReview(
     input: AcceptedPlanReviewHandoffRunInput<AcceptedPlanReviewHandoffPlan>
   ): Promise<AgentSessionResult>;
+  settleGoalStep(input: {
+    input: Input;
+    state: State;
+    lastResult: AgentSessionResult;
+    outcome: GoalStepOutcomeV1;
+    reason: string;
+    proposal?: ProposalRouterInput<Input, State>['proposal'];
+  }): Promise<AgentSessionResult>;
 }
 
 // RunEngine owns command/effect transitions; all session side effects stay behind ports.
@@ -47,12 +66,21 @@ export class RunEngine<Input, State extends RunEngineState> {
     return this.runFromCommand(input, { kind: 'resumeRun' });
   }
 
-  private async runFromCommand(input: Input, initialCommand: RunCommand): Promise<AgentSessionResult> {
+  async advanceGoalStep(input: Input): Promise<AgentSessionResult> {
+    return this.runFromCommand(input, { kind: 'resumeRun' }, true);
+  }
+
+  private async runFromCommand(
+    input: Input,
+    initialCommand: RunCommand,
+    boundedGoalStep = false
+  ): Promise<AgentSessionResult> {
     let command: RunCommand = initialCommand;
     let state: State | undefined;
     let lastResult: AgentSessionResult | undefined;
     let pendingDirective: Extract<RunEffect<State>, { kind: 'providerDirectiveReady' }> | undefined;
     let pendingReview: Extract<RunEffect<State>, { kind: 'reviewAssemblyRequired' }> | undefined;
+    let recoveredGoalDirective = false;
 
     while (true) {
       if (command.kind === 'initializeRun') {
@@ -79,6 +107,25 @@ export class RunEngine<Input, State extends RunEngineState> {
 
       if (command.kind === 'maybeBuildRequirementConfirmation') {
         if (!state || !lastResult) throw new Error('RunEngine initialized state is missing.');
+        if (boundedGoalStep && this.ports.recoverGoalDirective) {
+          const recovered = await this.ports.recoverGoalDirective({
+            input,
+            state,
+            lastResult,
+          });
+          if (recovered) {
+            pendingDirective = {
+              kind: 'providerDirectiveReady',
+              prompt: recovered.prompt,
+              lastResult: recovered.lastResult,
+              proposal: recovered.proposal,
+              directive: recovered.directive,
+            };
+            recoveredGoalDirective = true;
+            command = { kind: 'executeDirective' };
+            continue;
+          }
+        }
         command = this.ports.shouldBuildRequirementConfirmation(input)
           ? { kind: 'waitForRequirementDecision' }
           : { kind: 'callProviderAndParse' };
@@ -91,13 +138,43 @@ export class RunEngine<Input, State extends RunEngineState> {
           kind: 'requirementDecisionRequired',
           result: await this.ports.waitForRequirementDecision(input, state),
         };
+        if (boundedGoalStep) {
+          return this.terminal(await this.ports.settleGoalStep({
+            input,
+            state,
+            lastResult: effect.result,
+            outcome: 'suspend',
+            reason: 'requirement',
+          }));
+        }
         return this.terminal(effect.result);
       }
 
       if (command.kind === 'callProviderAndParse') {
         if (!state || !lastResult) throw new Error('RunEngine provider state is missing.');
         const cycle = await this.ports.runProviderTurn({ input, state, lastResult });
+        if (cycle.kind === 'retryExhausted') {
+          if (!boundedGoalStep) {
+            throw cycle.error;
+          }
+          return this.terminal(await this.ports.settleGoalStep({
+            input,
+            state,
+            lastResult: cycle.lastResult,
+            outcome: 'suspend',
+            reason: 'retryGuardExhausted',
+          }));
+        }
         if (cycle.kind === 'failed') {
+          if (boundedGoalStep) {
+            return this.terminal(await this.ports.settleGoalStep({
+              input,
+              state,
+              lastResult: cycle.result,
+              outcome: 'fail',
+              reason: 'provider_failure',
+            }));
+          }
           return this.terminal(cycle.result);
         }
         if (cycle.kind === 'reviewRequired') {
@@ -123,10 +200,33 @@ export class RunEngine<Input, State extends RunEngineState> {
       if (command.kind === 'executeDirective') {
         if (!state || !pendingDirective) throw new Error('RunEngine pending directive is missing.');
         if (pendingDirective.directive.kind === 'providerResume') {
+          if (boundedGoalStep) {
+            return this.terminal(await this.ports.settleGoalStep({
+              input,
+              state,
+              lastResult: pendingDirective.lastResult,
+              outcome: 'continue',
+              reason: 'providerContinuationPrepared',
+            }));
+          }
           lastResult = pendingDirective.lastResult;
           pendingDirective = undefined;
           command = { kind: 'callProviderAndParse' };
           continue;
+        }
+        if (
+          boundedGoalStep
+          && pendingDirective.directive.kind === 'action'
+          && !recoveredGoalDirective
+        ) {
+          return this.terminal(await this.ports.settleGoalStep({
+            input,
+            state,
+            lastResult: pendingDirective.lastResult,
+            outcome: 'suspend',
+            reason: 'checkpointRequired',
+            proposal: pendingDirective.proposal,
+          }));
         }
         if (!pendingDirective.proposal) throw new Error('RunEngine proposal directive is missing its proposal.');
         const handled = await this.ports.executeDirective({
@@ -139,13 +239,33 @@ export class RunEngine<Input, State extends RunEngineState> {
         });
         const effect = this.effectFromDirective(pendingDirective, handled);
         pendingDirective = undefined;
+        recoveredGoalDirective = false;
         if (effect.kind === 'directiveReturned') {
+          if (boundedGoalStep) {
+            return this.terminal(await this.ports.settleGoalStep({
+              input,
+              state,
+              lastResult: effect.result,
+              outcome: 'continue',
+              reason: 'semanticDirectiveReturned',
+              proposal: effect.proposal,
+            }));
+          }
           return this.terminal(effect.result);
         }
         if (effect.kind === 'reviewAssemblyRequired') {
           pendingReview = effect;
           command = { kind: 'assembleReview' };
           continue;
+        }
+        if (boundedGoalStep) {
+          return this.terminal(await this.ports.settleGoalStep({
+            input,
+            state,
+            lastResult: effect.lastResult,
+            outcome: 'continue',
+            reason: 'semanticDirectiveAccepted',
+          }));
         }
         lastResult = effect.lastResult;
         command = this.nextCommandAfterDirective(effect);
@@ -156,6 +276,16 @@ export class RunEngine<Input, State extends RunEngineState> {
         if (!pendingReview) throw new Error('RunEngine pending review assembly is missing.');
         const result = await this.ports.assembleReview(pendingReview.request);
         pendingReview = undefined;
+        if (boundedGoalStep) {
+          if (!state) throw new Error('RunEngine review state is missing.');
+          return this.terminal(await this.ports.settleGoalStep({
+            input,
+            state,
+            lastResult: result,
+            outcome: 'suspend',
+            reason: 'review',
+          }));
+        }
         return this.terminal(result);
       }
 
