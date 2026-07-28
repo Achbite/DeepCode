@@ -294,19 +294,9 @@ function publicPresentation(
     }
     case 'scope.previewed':
       if (data?.kind === 'rejected') {
-        return {
-          kind: 'permission_result',
-          channel: 'tool',
-          visibility: 'conversation',
-          fields: {
-            status: 'denied',
-            decision: 'deny',
-            guidance: nestedText(data, ['data', 'guidance']),
-            operationId: textField(data, 'operationId'),
-          },
-        };
+        return rejectedPlanScopePresentation(data);
       }
-      return permissionRequestPresentation(event, data);
+      return planScopePreviewPresentation(event, data);
     case 'capability.awaiting':
       return permissionRequestPresentation(event, data);
     case 'toolIntent.submitted':
@@ -340,11 +330,15 @@ function publicPresentation(
       const allowed = factKind === 'capabilityIssued'
         || factKind === 'expansionAllowed';
       const lease = objectRecord(data?.capabilityLease);
+      const previewId = textField(data, 'previewId');
       return {
         kind: 'permission_result',
         channel: 'tool',
         visibility: 'conversation',
         fields: {
+          id: previewId,
+          permissionId: previewId,
+          previewId,
           status: allowed ? 'allowed' : 'denied',
           decision: allowed ? 'allow' : 'deny',
           factId: textField(data, 'factId'),
@@ -478,6 +472,276 @@ function publicPresentation(
   }
 }
 
+function planScopePreviewPresentation(
+  event: SessionKernelProjectionEventV2,
+  data: Record<string, unknown> | undefined
+): ReturnType<typeof publicPresentation> {
+  const plan = objectRecord(data?.plan);
+  const previews = scopePreviewRecords(data);
+  const currentPreview = objectRecord(objectRecord(data?.data)?.preview);
+  const planRevision = textField(plan, 'planRevision')
+    ?? textField(currentPreview, 'planRevision')
+    ?? textField(data, 'planRevision');
+  const planId = planRevision ?? event.projectionId;
+  const title = textField(plan, 'title') ?? 'Plan';
+  const objective = textField(plan, 'objective')
+    ?? textField(plan, 'narrative')
+    ?? 'Plan is ready for review.';
+  return {
+    kind: 'plan_card',
+    channel: 'task',
+    visibility: 'both',
+    fields: {
+      planId,
+      planRevision,
+      title,
+      summary: objective,
+      userPlan: textField(plan, 'narrative'),
+      status: 'awaitingUserApproval',
+      confirmable: true,
+      tasks: planTasksWithScopePreviews(plan, previews),
+      scopePreviews: cloneJson(previews),
+      scopeApprovalView: {
+        planRevision,
+        previews: previews.map((preview) => ({
+          previewId: textField(preview, 'previewId'),
+          planActionId: textField(preview, 'planActionId'),
+          operationId: textField(preview, 'operationId'),
+          toolId: textField(preview, 'toolId'),
+          authorizationDigest:
+            textField(preview, 'authorizationDigest'),
+          approvalView: preview.approvalView === undefined
+            ? undefined
+            : cloneJson(preview.approvalView),
+        })),
+      },
+      readablePlan: readablePlanScopeApproval(
+        plan,
+        planId,
+        title,
+        objective,
+        previews
+      ),
+    },
+  };
+}
+
+function rejectedPlanScopePresentation(
+  data: Record<string, unknown> | undefined
+): ReturnType<typeof publicPresentation> {
+  const plan = objectRecord(data?.plan);
+  const planRevision = textField(plan, 'planRevision')
+    ?? textField(data, 'planRevision');
+  const guidance = nestedText(data, ['data', 'guidance']);
+  return {
+    kind: 'plan_review',
+    channel: 'task',
+    visibility: 'both',
+    fields: {
+      planId: planRevision,
+      planRevision,
+      status: 'needsRevision',
+      decision: 'revise',
+      confirmable: false,
+      guidance,
+      operationId: textField(data, 'operationId'),
+      planActionId: textField(data, 'planActionId'),
+      summary: guidance
+        ?? 'Kernel rejected a planned scope; replanning is required.',
+    },
+  };
+}
+
+function scopePreviewRecords(
+  data: Record<string, unknown> | undefined
+): Record<string, unknown>[] {
+  const previews = Array.isArray(data?.scopePreviews)
+    ? data.scopePreviews.flatMap((value) => {
+        const preview = objectRecord(value);
+        return preview ? [preview] : [];
+      })
+    : [];
+  const current = objectRecord(objectRecord(data?.data)?.preview);
+  if (
+    current
+    && !previews.some(
+      (preview) =>
+        textField(preview, 'previewId') === textField(current, 'previewId')
+    )
+  ) {
+    previews.push(current);
+  }
+  return previews;
+}
+
+function planTasksWithScopePreviews(
+  plan: Record<string, unknown> | undefined,
+  previews: Record<string, unknown>[]
+): unknown[] {
+  if (!Array.isArray(plan?.actions)) return [];
+  return plan.actions.map((value) => {
+    const action = objectRecord(value);
+    if (!action) return cloneJson(value);
+    const manifest = objectRecord(action.manifest);
+    const operationId = textField(manifest, 'operationId');
+    const preview = previews.find(
+      (candidate) =>
+        textField(candidate, 'operationId') === operationId
+    );
+    return preview
+      ? {
+          ...cloneJson(action),
+          scopePreview: cloneJson(preview),
+          approvalView: preview.approvalView === undefined
+            ? undefined
+            : cloneJson(preview.approvalView),
+        }
+      : cloneJson(action);
+  });
+}
+
+function readablePlanScopeApproval(
+  plan: Record<string, unknown> | undefined,
+  planId: string,
+  title: string,
+  objective: string,
+  previews: Record<string, unknown>[]
+): Record<string, unknown> {
+  const actions = Array.isArray(plan?.actions)
+    ? plan.actions.flatMap((value) => {
+        const action = objectRecord(value);
+        return action ? [action] : [];
+      })
+    : [];
+  const readableTasks = actions.map((action, index) => {
+    const manifest = objectRecord(action.manifest);
+    const taskId = textField(action, 'taskId')
+      ?? textField(manifest, 'planActionId')
+      ?? `plan-action-${index + 1}`;
+    const toolId = textField(manifest, 'toolId') ?? 'kernel.tool';
+    const operationId = textField(manifest, 'operationId');
+    return {
+      taskId,
+      title: toolId,
+      objective: operationId
+        ? `operationId=${operationId}`
+        : undefined,
+      targets: requestedResourceRefs(manifest),
+      acceptance: [],
+      failure: [],
+      intentKind: toolId,
+    };
+  });
+  return {
+    schemaVersion: 'deepcode.session.readable-plan.v1',
+    titleKey: 'session.projection.plan.title',
+    title,
+    summary: objective,
+    sourceRefs: {
+      planRevision: planId,
+    },
+    tasks: readableTasks,
+    sections: [
+      {
+        sectionId: 'summary',
+        titleKey: 'session.projection.plan.section.summary',
+        items: [{
+          itemId: 'summary',
+          kind: 'text',
+          text: textField(plan, 'narrative') ?? objective,
+        }],
+      },
+      {
+        sectionId: 'tasks',
+        titleKey: 'session.projection.plan.section.tasks',
+        emptyMessageKey: 'session.projection.plan.empty.tasks',
+        items: readableTasks.map((task) => ({
+          itemId: task.taskId,
+          kind: 'task',
+          text: task.title,
+          targetRefs: task.targets,
+          metadata: {
+            objective: task.objective,
+            acceptance: task.acceptance,
+            failure: task.failure,
+          },
+        })),
+      },
+      {
+        sectionId: 'scopeApproval',
+        titleKey:
+          'session.projection.plan.section.permissionBundles',
+        emptyMessageKey:
+          'session.projection.plan.empty.permissionBundles',
+        items: previews.map(scopeApprovalProjectionItem),
+      },
+    ],
+  };
+}
+
+function scopeApprovalProjectionItem(
+  preview: Record<string, unknown>
+): Record<string, unknown> {
+  const approval = objectRecord(preview.approvalView);
+  const previewId = textField(preview, 'previewId') ?? 'scope-preview';
+  const toolId = textField(preview, 'toolId') ?? 'kernel.tool';
+  const risk = textField(approval, 'risk')
+    ?? textField(preview, 'risk')
+    ?? 'unknown';
+  const effectClass = textField(approval, 'effectClass')
+    ?? textField(preview, 'effectClass')
+    ?? 'unknown';
+  const effectScope = textField(approval, 'effectScope')
+    ?? textField(preview, 'effectScope')
+    ?? 'unknown';
+  const scopeDigest = textField(approval, 'scopeDigest')
+    ?? textField(preview, 'scopeDigest')
+    ?? 'unknown';
+  const summary = textField(approval, 'summary')
+    ?? 'Canonical Kernel scope';
+  return {
+    itemId: previewId,
+    kind: 'permission',
+    text: `${toolId}: ${summary} [risk=${risk}; effect=${effectClass}/${effectScope}; scopeDigest=${scopeDigest}]`,
+    status: textField(preview, 'disposition'),
+    targetRefs: stringArrayField(approval, 'canonicalTargets'),
+    auditRefs: [
+      previewId,
+      scopeDigest,
+      textField(preview, 'authorizationDigest'),
+    ].filter((value): value is string => Boolean(value)),
+    metadata: {
+      objective: [
+        `planActionId=${textField(preview, 'planActionId') ?? 'unknown'}`,
+        `operationId=${textField(preview, 'operationId') ?? 'unknown'}`,
+        `authorizationDigest=${
+          textField(preview, 'authorizationDigest') ?? 'unknown'
+        }`,
+      ].join('; '),
+      acceptance: stringArrayField(approval, 'scopeDelta'),
+      failure: [],
+    },
+  };
+}
+
+function requestedResourceRefs(
+  manifest: Record<string, unknown> | undefined
+): string[] {
+  if (!Array.isArray(manifest?.requestedResources)) return [];
+  return manifest.requestedResources.flatMap((value) => {
+    const resource = objectRecord(value);
+    const kind = textField(resource, 'kind');
+    const details = objectRecord(resource?.data);
+    const target = textField(details, 'path')
+      ?? textField(details, 'url')
+      ?? textField(details, 'query')
+      ?? textField(details, 'invocationDigest')
+      ?? textField(details, 'area');
+    if (kind && target) return [`${kind}:${target}`];
+    return kind ? [kind] : [];
+  });
+}
+
 function permissionRequestPresentation(
   event: SessionKernelProjectionEventV2,
   data: Record<string, unknown> | undefined
@@ -523,6 +787,18 @@ function textField(
 ): string | undefined {
   const candidate = value?.[key];
   return typeof candidate === 'string' ? candidate : undefined;
+}
+
+function stringArrayField(
+  value: Record<string, unknown> | undefined,
+  key: string
+): string[] {
+  const candidate = value?.[key];
+  return Array.isArray(candidate)
+    ? candidate.filter(
+        (item): item is string => typeof item === 'string'
+      )
+    : [];
 }
 
 function objectRecord(

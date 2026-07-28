@@ -444,11 +444,26 @@ export class SessionKernelLoopV2 {
         outcome,
         'capabilityPreview'
       ).reply;
+      const scopePreviews = this.state.plan?.actions.flatMap(
+        (planAction) => {
+          const preview =
+            this.state.previews[planAction.manifest.operationId];
+          return preview ? [preview] : [];
+        }
+      ) ?? [];
+      const projectionData = {
+        ...reply,
+        plan: this.state.plan,
+        scopePreviews,
+        planRevision: action.manifest.planRevision,
+        planActionId: action.manifest.planActionId,
+        operationId: action.manifest.operationId,
+      };
       if (reply.kind === 'previewed') {
         await this.project(
           `scope:${reply.data.preview.previewId}`,
           'scope.previewed',
-          reply
+          projectionData
         );
       } else {
         await this.project(
@@ -461,12 +476,7 @@ export class SessionKernelLoopV2 {
             'rejected',
           ].join(':'),
           'scope.previewed',
-          {
-            ...reply,
-            planRevision: action.manifest.planRevision,
-            planActionId: action.manifest.planActionId,
-            operationId: action.manifest.operationId,
-          }
+          projectionData
         );
       }
       return reply;

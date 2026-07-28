@@ -599,6 +599,8 @@ function applyPublicRequestOutcome(
           {
             factId: fact.factId,
             factKind: fact.factKind,
+            previewId:
+              authorizationDecisionPreviewId(fact.details),
             controlEpoch: fact.lineage.controlEpoch,
             planActionIds: fact.lineage.planActionIds,
             operationId: fact.lineage.operationId,
@@ -766,6 +768,28 @@ function applyToolIntentReply(
     state.activeWait,
     record.startedAt
   ));
+}
+
+function authorizationDecisionPreviewId(
+  details: unknown
+): string | undefined {
+  if (!details || typeof details !== 'object' || Array.isArray(details)) {
+    return undefined;
+  }
+  const record = details as Record<string, unknown>;
+  if (typeof record.previewId === 'string') {
+    return record.previewId;
+  }
+  if (
+    record.identity
+    && typeof record.identity === 'object'
+    && !Array.isArray(record.identity)
+  ) {
+    const previewId =
+      (record.identity as Record<string, unknown>).previewId;
+    return typeof previewId === 'string' ? previewId : undefined;
+  }
+  return undefined;
 }
 
 function assertRecordLane(record: SessionKernelPublicRequestRecordV2): void {
