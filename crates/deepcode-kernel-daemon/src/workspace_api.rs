@@ -14,13 +14,12 @@ pub(crate) struct FileQuery {
 }
 
 pub(crate) async fn workspace_current(State(state): State<AppState>) -> Json<ApiResponse> {
-    match dispatch_workspace(
-        &state.runtime,
-        KernelCommand::HostWorkspaceCurrent {
-            request_id: rid("workspace-current"),
+    let service = &state.host_services.workspace;
+    match service.current(rid("workspace-current")) {
+        Ok(result) => match host_workspace_payload(result.output) {
+            Ok(output) => ApiResponse::ok(output),
+            Err(error) => ApiResponse::error(error.code, error.message),
         },
-    ) {
-        Ok(output) => ApiResponse::ok(output),
         Err(error) => ApiResponse::error(error.code, error.message),
     }
 }
@@ -37,14 +36,12 @@ pub(crate) async fn workspace_open(
     State(state): State<AppState>,
     Json(body): Json<OpenWorkspaceRequest>,
 ) -> Json<ApiResponse> {
-    match dispatch_workspace(
-        &state.runtime,
-        KernelCommand::HostWorkspaceOpen {
-            request_id: rid("workspace-open"),
-            path: body.path,
+    let service = &state.host_services.workspace;
+    match service.open(rid("workspace-open"), body.path) {
+        Ok(result) => match host_workspace_payload(result.output) {
+            Ok(output) => ApiResponse::ok(output),
+            Err(error) => ApiResponse::error(error.code, error.message),
         },
-    ) {
-        Ok(output) => ApiResponse::ok(output),
         Err(error) => ApiResponse::error(error.code, error.message),
     }
 }
@@ -53,17 +50,17 @@ pub(crate) async fn workspace_save_file(
     State(state): State<AppState>,
     Json(body): Json<Value>,
 ) -> Json<ApiResponse> {
-    match dispatch_workspace(
-        &state.runtime,
-        KernelCommand::HostWorkspaceSave {
-            request_id: rid("workspace-save"),
-            file_name: body
-                .get("fileName")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-        },
+    let service = &state.host_services.workspace;
+    match service.save(
+        rid("workspace-save"),
+        body.get("fileName")
+            .and_then(Value::as_str)
+            .map(str::to_string),
     ) {
-        Ok(output) => ApiResponse::ok(output),
+        Ok(result) => match host_workspace_payload(result.output) {
+            Ok(output) => ApiResponse::ok(output),
+            Err(error) => ApiResponse::error(error.code, error.message),
+        },
         Err(error) => ApiResponse::error(error.code, error.message),
     }
 }
@@ -98,7 +95,7 @@ pub(crate) async fn fs_initial_locations(State(state): State<AppState>) -> Json<
             "kind": "drive"
         }));
     }
-    if let Ok(current) = current_workspace(&state.runtime) {
+    if let Ok(current) = current_workspace(&state.host_services.workspace) {
         if let Some(path) = current
             .current
             .as_ref()
@@ -122,8 +119,9 @@ pub(crate) async fn fs_browse(
     State(state): State<AppState>,
     Query(query): Query<FileQuery>,
 ) -> Json<ApiResponse> {
-    match dispatch_host_inspection(
-        &state.runtime,
+    let service = &state.host_services.inspection;
+    match service.query(
+        rid("host-inspection"),
         HostInspectionQuery::Browse { path: query.path },
     ) {
         Ok(HostInspectionResult {
@@ -139,63 +137,11 @@ pub(crate) async fn host_inspect(
     State(state): State<AppState>,
     Json(query): Json<HostInspectionQuery>,
 ) -> Json<ApiResponse> {
-    match dispatch_host_inspection(&state.runtime, query) {
+    let service = &state.host_services.inspection;
+    match service.query(rid("host-inspection"), query) {
         Ok(result) => ApiResponse::ok(json!(result)),
         Err(error) => ApiResponse::error(error.code, error.message),
     }
-}
-
-fn dispatch_host_inspection(
-    runtime: &SharedRuntime,
-    query: HostInspectionQuery,
-) -> Result<HostInspectionResult, KernelErrorEnvelope> {
-    let mut runtime = runtime.lock().expect("kernel runtime lock");
-    let events = runtime
-        .dispatch(KernelCommand::HostResourceQuery {
-            request_id: rid("host-inspection"),
-            query,
-        })
-        .map_err(|error| KernelErrorEnvelope::from(&error))?;
-    for event in events {
-        if let KernelEvent::HostInspectionCompleted { result, .. } = event {
-            return Ok(result);
-        }
-    }
-    Err(KernelErrorEnvelope {
-        code: "unexpected_event".to_string(),
-        message: "expected typed host inspection result".to_string(),
-        message_key: None,
-        args: None,
-    })
-}
-
-pub(crate) fn dispatch_workspace(
-    runtime: &SharedRuntime,
-    command: KernelCommand,
-) -> Result<Value, KernelErrorEnvelope> {
-    let result = dispatch_workspace_result(runtime, command)?;
-    host_workspace_payload(result.output)
-}
-
-pub(crate) fn dispatch_workspace_result(
-    runtime: &SharedRuntime,
-    command: KernelCommand,
-) -> Result<HostWorkspaceResult, KernelErrorEnvelope> {
-    let mut runtime = runtime.lock().expect("kernel runtime lock");
-    let events = runtime
-        .dispatch(command)
-        .map_err(|error| KernelErrorEnvelope::from(&error))?;
-    for event in events {
-        if let KernelEvent::HostWorkspaceCompleted { result, .. } = event {
-            return Ok(result);
-        }
-    }
-    Err(KernelErrorEnvelope {
-        code: "unexpected_event".to_string(),
-        message: "expected workspace host projection result".to_string(),
-        message_key: None,
-        args: None,
-    })
 }
 
 fn host_workspace_payload(output: HostWorkspaceOutput) -> Result<Value, KernelErrorEnvelope> {
@@ -217,14 +163,9 @@ fn encode_host_payload<T: serde::Serialize>(value: T) -> Result<Value, KernelErr
 }
 
 pub(crate) fn current_workspace(
-    runtime: &SharedRuntime,
+    service: &HostWorkspaceService,
 ) -> Result<HostWorkspaceCurrent, KernelErrorEnvelope> {
-    let result = dispatch_workspace_result(
-        runtime,
-        KernelCommand::HostWorkspaceCurrent {
-            request_id: rid("workspace-current"),
-        },
-    )?;
+    let result = service.current(rid("workspace-current"))?;
     match result.output {
         HostWorkspaceOutput::Current(current) => Ok(current),
         _ => Err(KernelErrorEnvelope {

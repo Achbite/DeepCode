@@ -44,13 +44,18 @@ pub(crate) async fn agent_project_create(
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let binding = match root_path {
-        Some(path) => match resolve_project_binding(&state.runtime, path) {
-            Ok(binding) => Some(binding),
+    let binding_change = match root_path {
+        Some(path) => match state
+            .host_services
+            .workspace
+            .begin_project_binding(None, path)
+        {
+            Ok(change) => Some(change),
             Err(error) => return ApiResponse::error(error.code, error.message),
         },
         None => None,
     };
+    let binding = binding_change.as_ref().map(|change| change.value.clone());
     let now = now_text();
     let id = format!("project-{}", now_millis());
     let default_title = root_path
@@ -71,7 +76,12 @@ pub(crate) async fn agent_project_create(
     gui.projects.insert(0, project.clone());
     if let Err(error) = persist_agent_projects(&gui) {
         gui.projects.remove(0);
-        return ApiResponse::error("agent_project_persist_failed", error);
+        let message = rollback_project_binding_after_persist_failure(
+            &state.host_services.workspace,
+            binding_change,
+            error,
+        );
+        return ApiResponse::error("agent_project_persist_failed", message);
     }
     ApiResponse::ok(json!({ "project": project }))
 }
@@ -116,23 +126,43 @@ pub(crate) async fn agent_project_rebind(
     else {
         return ApiResponse::error("project_root_required", "project root path is required");
     };
-    let binding = match resolve_project_binding(&state.runtime, root_path) {
-        Ok(binding) => binding,
+    let existing_binding = {
+        let gui = state.gui.lock().expect("gui state lock");
+        let Some(project) = project_by_id(&gui, &project_id) else {
+            return ApiResponse::error("agent_project_not_found", "agent project not found");
+        };
+        project_workspace_binding(project)
+    };
+    let binding_change = match state
+        .host_services
+        .workspace
+        .begin_project_binding(existing_binding.as_ref(), root_path)
+    {
+        Ok(change) => change,
         Err(error) => return ApiResponse::error(error.code, error.message),
     };
     let mut gui = state.gui.lock().expect("gui state lock");
     let previous_projects = gui.projects.clone();
     let Some(project) = project_mut(&mut gui, &project_id) else {
+        let _ = state
+            .host_services
+            .workspace
+            .rollback_project_binding(binding_change);
         return ApiResponse::error("agent_project_not_found", "agent project not found");
     };
     project["kind"] = json!("folder");
-    project["workspaceBinding"] = binding;
+    project["workspaceBinding"] = binding_change.value.clone();
     project["rootStatus"] = json!("ready");
     project["updatedAt"] = json!(now_text());
     let result = project.clone();
     if let Err(error) = persist_agent_projects(&gui) {
         gui.projects = previous_projects;
-        return ApiResponse::error("agent_project_persist_failed", error);
+        let message = rollback_project_binding_after_persist_failure(
+            &state.host_services.workspace,
+            Some(binding_change),
+            error,
+        );
+        return ApiResponse::error("agent_project_persist_failed", message);
     }
     ApiResponse::ok(json!({ "project": result }))
 }
@@ -195,37 +225,23 @@ pub(crate) fn project_workspace_binding(project: &Value) -> Option<Value> {
         .cloned()
 }
 
-pub(crate) fn resolve_project_binding(
-    runtime: &SharedRuntime,
-    root_path: &str,
-) -> Result<Value, KernelErrorEnvelope> {
-    let result = dispatch_workspace_result(
-        runtime,
-        KernelCommand::HostWorkspaceBindingResolve {
-            request_id: rid(&format!("project-binding-{}", now_millis())),
-            path: root_path.to_string(),
-        },
-    )
-    .map_err(|error| KernelErrorEnvelope {
-        code: "project_root_unavailable".to_string(),
-        message: format!("project workspace root is unavailable: {}", error.message),
-        message_key: None,
-        args: None,
-    })?;
-    let HostWorkspaceOutput::BindingResolved(output) = result.output else {
-        return Err(KernelErrorEnvelope {
-            code: "project_root_unavailable".to_string(),
-            message: "Kernel did not return a workspace binding".to_string(),
-            message_key: None,
-            args: None,
-        });
+fn rollback_project_binding_after_persist_failure(
+    workspace: &HostWorkspaceService,
+    change: Option<HostProjectBindingChange>,
+    persist_error: String,
+) -> String {
+    let Some(change) = change else {
+        return persist_error;
     };
-    serde_json::to_value(output.workspace_binding).map_err(|error| KernelErrorEnvelope {
-        code: "project_workspace_binding_encoding_failed".to_string(),
-        message: error.to_string(),
-        message_key: None,
-        args: None,
-    })
+    match workspace.rollback_project_binding(change) {
+        Ok(()) => persist_error,
+        Err(rollback_error) => {
+            format!(
+                "{persist_error}; workspace registry rollback failed: {}",
+                rollback_error.message
+            )
+        }
+    }
 }
 
 pub(crate) fn set_project_root_status(state: &AppState, project_id: &str, status: &str) {

@@ -68,12 +68,11 @@ pub(crate) async fn agent_tools() -> Json<ApiResponse> {
 }
 
 pub(crate) async fn host_skills(State(state): State<AppState>) -> Json<ApiResponse> {
-    match dispatch_host_skill_catalog(
-        &state.runtime,
-        KernelCommand::HostSkillDiscover {
-            request_id: rid("skill-discover"),
-        },
-    ) {
+    match state
+        .host_services
+        .skill_admin
+        .discover(rid("skill-discover"))
+    {
         Ok(result) => ApiResponse::ok(json!(result)),
         Err(error) => ApiResponse::error(error.code, error.message),
     }
@@ -612,7 +611,22 @@ pub(crate) fn session_result(gui: &GuiState, session_id: &str) -> Json<ApiRespon
             )
         }
     };
-    let events = canonical_session_projection_events(snapshot.events.clone());
+    let events = match merge_session_kernel_v2_public_agent_events(
+        &gui.paths.sessions_dir,
+        session_id,
+        canonical_session_projection_events(snapshot.events.clone()),
+    ) {
+        Ok(events) => events,
+        Err(error) => {
+            return ApiResponse::error(
+                error.code,
+                format!(
+                    "Session v2 public projection is unavailable: {}",
+                    error.message
+                ),
+            )
+        }
+    };
     match snapshot.writeability {
         SessionDomainWriteability::Current => {
             let domain_state = match session_domain_state_from_snapshot(session_id, &snapshot) {

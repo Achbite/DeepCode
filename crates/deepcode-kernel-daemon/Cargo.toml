@@ -22,3 +22,5 @@ reqwest.workspace = true
 portable-pty.workspace = true
 async-stream.workspace = true
 bytes.workspace = true
+sha2.workspace = true
+regex.workspace = true

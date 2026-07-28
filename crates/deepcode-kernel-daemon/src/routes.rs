@@ -1,5 +1,11 @@
+use crate::kernel_v2_transport::{
+    kernel_v2_commands, kernel_v2_user_decisions, KERNEL_V2_COMMANDS_PATH,
+    KERNEL_V2_USER_DECISIONS_PATH,
+};
 use crate::prelude::*;
 use crate::*;
+use deepcode_kernel_abi::v2_command::MAX_COMMAND_BYTES_V2;
+use deepcode_kernel_abi::MAX_USER_DECISION_BYTES_V2;
 
 pub(crate) fn build_app(state: AppState) -> Router {
     let mut app = Router::new()
@@ -8,9 +14,23 @@ pub(crate) fn build_app(state: AppState) -> Router {
         .route("/assets/*asset_path", get(gui_asset))
         .route("/api/health", get(health))
         .route("/api/kernel/commands", post(kernel_commands))
+        .route(
+            KERNEL_V2_COMMANDS_PATH,
+            post(kernel_v2_commands).layer(DefaultBodyLimit::max(MAX_COMMAND_BYTES_V2)),
+        )
+        .route(
+            KERNEL_V2_USER_DECISIONS_PATH,
+            post(kernel_v2_user_decisions).layer(DefaultBodyLimit::max(MAX_USER_DECISION_BYTES_V2)),
+        )
         .route("/api/kernel/snapshot", get(kernel_snapshot))
         .route("/api/kernel/events/stream", get(kernel_events_stream))
         .route("/api/session-store/index", get(session_store_index))
+        .route(
+            "/api/session-store/:session_id/kernel-v2/:run_id",
+            get(session_kernel_v2_store_get)
+                .post(session_kernel_v2_store_append)
+                .layer(DefaultBodyLimit::max(SESSION_KERNEL_V2_BODY_LIMIT_BYTES)),
+        )
         .route(
             "/api/session-store/:session_id/projection",
             get(session_store_projection_get).post(session_store_projection_append),
@@ -153,6 +173,11 @@ pub(crate) fn build_app(state: AppState) -> Router {
         .route(
             "/api/agent/sessions/:session_id/runs",
             post(agent_session_run_start),
+        )
+        .route(
+            "/api/agent/sessions/:session_id/runs/:host_run_id/kernel-v2/projections",
+            post(session_kernel_v2_projection_append)
+                .layer(DefaultBodyLimit::max(SESSION_KERNEL_V2_BODY_LIMIT_BYTES)),
         )
         .route(
             "/api/agent/sessions/:session_id/goals",

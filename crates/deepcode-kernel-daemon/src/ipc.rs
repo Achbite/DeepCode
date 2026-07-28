@@ -165,9 +165,16 @@ pub(crate) fn dispatch_kernel_command(
     let _idempotency_key = body.idempotency_key.as_deref();
     let _expected_snapshot_seq = body.expected_snapshot_seq;
 
-    let result = {
+    let result = if let Some(result) = state
+        .host_services
+        .dispatch_host_command(body.command.clone())
+    {
+        result
+    } else {
         let mut runtime = state.runtime.lock().expect("kernel runtime lock");
-        runtime.dispatch(body.command)
+        runtime
+            .dispatch(body.command)
+            .map_err(|error| KernelErrorEnvelope::from(&error))
     };
 
     match result {
@@ -188,7 +195,7 @@ pub(crate) fn dispatch_kernel_command(
             ok: false,
             events: Vec::new(),
             snapshot: None,
-            error: Some(KernelErrorEnvelope::from(&error)),
+            error: Some(error),
         },
     }
 }

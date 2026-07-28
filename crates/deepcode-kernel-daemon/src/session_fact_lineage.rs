@@ -571,10 +571,9 @@ fn authoritative_kernel_identity_matches(
 
 fn projected_kernel_fact_material(kind: &str, event: &Map<String, Value>) -> Option<Value> {
     match kind {
-        "plan_authorization.decision_recorded" => selected_kernel_material(
-            event,
-            &["authorizationContractId", "decision", "leaseId"],
-        ),
+        "plan_authorization.decision_recorded" => {
+            selected_kernel_material(event, &["authorizationContractId", "decision", "leaseId"])
+        }
         "tool.execution_attempted"
         | "tool.effect_observed"
         | "tool.outcome_indeterminate"
@@ -598,10 +597,9 @@ fn projected_kernel_fact_material(kind: &str, event: &Map<String, Value>) -> Opt
 
 fn ledger_kernel_fact_material(kind: &str, payload: &Map<String, Value>) -> Option<Value> {
     match kind {
-        "plan_authorization.decision_recorded" => selected_kernel_material(
-            payload,
-            &["authorizationContractId", "decision", "leaseId"],
-        ),
+        "plan_authorization.decision_recorded" => {
+            selected_kernel_material(payload, &["authorizationContractId", "decision", "leaseId"])
+        }
         "tool.execution_attempted"
         | "tool.effect_observed"
         | "tool.outcome_indeterminate"

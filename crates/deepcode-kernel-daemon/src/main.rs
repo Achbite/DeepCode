@@ -6,10 +6,19 @@ mod agent_session_state;
 mod agent_timeline;
 mod api_response;
 mod browser_api;
+mod decision_capability_v2;
 mod event_projection;
 mod goal_api;
+mod host_inspection;
+mod host_kernel_run_v2;
+mod host_run_broker_v2;
+mod host_services;
+mod host_v2_storage;
+mod host_workspace_registry_v2;
 mod ipc;
 mod kernel_api;
+mod kernel_v2_ipc;
+mod kernel_v2_transport;
 mod llm_provider_transport;
 mod llm_stream_parser;
 mod llm_transport;
@@ -20,6 +29,7 @@ mod routes;
 mod session_archive;
 mod session_archive_render;
 mod session_fact_lineage;
+mod session_kernel_v2_store;
 mod session_memory_store;
 mod session_store;
 mod settings_api;
@@ -43,6 +53,7 @@ pub(crate) use api_response::*;
 pub(crate) use browser_api::*;
 pub(crate) use event_projection::*;
 pub(crate) use goal_api::*;
+pub(crate) use host_services::*;
 pub(crate) use ipc::*;
 pub(crate) use kernel_api::*;
 pub(crate) use llm_provider_transport::*;
@@ -53,6 +64,7 @@ pub(crate) use projection_delivery::*;
 pub(crate) use session_archive::*;
 pub(crate) use session_archive_render::*;
 pub(crate) use session_fact_lineage::*;
+pub(crate) use session_kernel_v2_store::*;
 pub(crate) use session_memory_store::*;
 pub(crate) use session_store::*;
 pub(crate) use settings_api::*;
@@ -77,9 +89,37 @@ async fn main() {
     };
     let gui_state = GuiState::new();
     configure_runtime_tools(&mut runtime, &gui_state);
+    let (kernel_v2_executor_config, kernel_v2_secrets) = runtime_tool_configuration(&gui_state);
+    let kernel_v2_fact_store_path =
+        deepcode_kernel_ledger::v2::configured_fact_store_path(user_config_root())
+            .expect("resolve canonical Kernel v2 fact store path");
+    let kernel_v2_service = deepcode_kernel_runtime::v2::KernelSessionServiceV2::open(
+        kernel_v2_fact_store_path,
+        kernel_v2_executor_config,
+        Arc::new(kernel_v2_secrets),
+        kernel_v2_settings_ceiling(&gui_state),
+    )
+    .expect("open canonical Kernel v2 service");
+    let host_services = HostServices::from_projects(
+        &gui_state.projects,
+        gui_state.paths.sessions_dir.clone(),
+        Some(kernel_v2_service.fact_reader()),
+    );
+    let (kernel_v2_host_authority, kernel_v2_host_capability) =
+        crate::kernel_v2_transport::HostTransportAuthorityV2::new_pair()
+            .expect("initialize Host-only Kernel v2 transport authority");
+    let kernel_v2 = crate::kernel_v2_transport::KernelV2TransportState::new(
+        kernel_v2_service,
+        host_services.workspace.resolver_v2(),
+        kernel_v2_host_authority,
+    )
+    .expect("initialize Kernel v2 transport");
     let state = AppState {
         runtime: Arc::new(Mutex::new(runtime)),
+        kernel_v2,
+        kernel_v2_host_capability,
         gui: Arc::new(Mutex::new(gui_state)),
+        host_services,
         terminal_runtime: Arc::new(Mutex::new(TerminalRuntime::new())),
         kernel_events: Arc::new(Mutex::new(Vec::new())),
         session_runs: Arc::new(Mutex::new(HashMap::new())),
@@ -103,6 +143,10 @@ async fn main() {
     }
     let app = routes::build_app(state);
     let addr: SocketAddr = format!("{host}:{port}").parse().expect("valid host/port");
+    assert!(
+        addr.ip().is_loopback(),
+        "Kernel v2 capability transport requires a loopback listener"
+    );
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .expect("bind deepcode web host");
@@ -171,5 +215,26 @@ fn permission_mode_setting(value: &str) -> deepcode_kernel_tools::ToolPermission
         "allow" => deepcode_kernel_tools::ToolPermissionMode::Allow,
         "deny" => deepcode_kernel_tools::ToolPermissionMode::Deny,
         _ => deepcode_kernel_tools::ToolPermissionMode::Ask,
+    }
+}
+
+fn kernel_v2_settings_ceiling(gui: &GuiState) -> deepcode_kernel_runtime::v2::SettingsCeilingV2 {
+    let permission_enabled = |key: &str| {
+        gui.user_settings
+            .get(key)
+            .and_then(Value::as_str)
+            .is_some_and(|value| value != "deny")
+    };
+    deepcode_kernel_runtime::v2::SettingsCeilingV2 {
+        workspace_read: permission_enabled("agent.permissions.workspaceRead"),
+        workspace_write: permission_enabled("agent.permissions.workspaceWrite"),
+        git_write: permission_enabled("agent.permissions.gitWrite"),
+        web_read: permission_enabled("agent.permissions.webRead"),
+        private_web_read: permission_enabled("agent.permissions.privateWebRead"),
+        auto_approve_plans: gui
+            .user_settings
+            .get("agent.permissions.autoApprovePlans")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
     }
 }

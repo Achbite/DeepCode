@@ -1423,7 +1423,7 @@ pub(crate) async fn session_store_analysis_timeline_record_get(
     }
 }
 
-fn trusted_private_storage_origin(headers: &axum::http::HeaderMap) -> bool {
+pub(crate) fn trusted_private_storage_origin(headers: &axum::http::HeaderMap) -> bool {
     let Some(origin) = headers
         .get(axum::http::header::ORIGIN)
         .and_then(|value| value.to_str().ok())

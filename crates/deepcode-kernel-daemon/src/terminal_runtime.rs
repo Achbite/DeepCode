@@ -1,10 +1,5 @@
 use crate::prelude::*;
 use crate::*;
-use deepcode_kernel_abi::{
-    KernelResource, KernelResourceCleanupPolicy, KernelResourceIdentity, KernelResourceKind,
-    KernelResourceMetadata, KernelResourceOwner, KernelResourceScope,
-};
-use deepcode_kernel_runtime::resources::KernelResourceManager;
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use std::collections::BTreeMap;
 use std::thread;
@@ -12,11 +7,10 @@ use std::thread;
 pub(crate) const DEFAULT_COLS: u16 = 120;
 pub(crate) const DEFAULT_ROWS: u16 = 30;
 const MAX_TERMINAL_EVENTS: usize = 2_000;
+const HOST_TERMINAL_OWNER: &str = "deepcode-host-terminal";
 
 pub(crate) struct TerminalRuntime {
     sessions: BTreeMap<String, TerminalPtySession>,
-    resources: KernelResourceManager,
-    next_resource_index: u64,
 }
 
 struct TerminalPtySession {
@@ -28,14 +22,25 @@ struct TerminalPtySession {
     created_at: String,
     updated_at: String,
     order: usize,
-    owner: KernelResourceOwner,
-    resource_id: String,
-    exit_code: Arc<Mutex<Option<i32>>>,
+    child: TerminalChildOwner,
     writer: Box<dyn Write + Send>,
     master: Box<dyn MasterPty + Send>,
-    child: Arc<Mutex<Box<dyn portable_pty::Child + Send + Sync>>>,
     events: Arc<Mutex<Vec<Value>>>,
     next_sequence: Arc<Mutex<u64>>,
+}
+
+struct TerminalChildOwner {
+    state: Arc<Mutex<TerminalChildState>>,
+}
+
+#[derive(Clone)]
+struct TerminalChildObserver {
+    state: Arc<Mutex<TerminalChildState>>,
+}
+
+struct TerminalChildState {
+    child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
+    exit_code: Option<i32>,
 }
 
 struct TerminalSpawnRequest {
@@ -46,15 +51,12 @@ struct TerminalSpawnRequest {
     cols: Option<u16>,
     rows: Option<u16>,
     order: usize,
-    owner: KernelResourceOwner,
 }
 
 impl TerminalRuntime {
     pub(crate) fn new() -> Self {
         Self {
             sessions: BTreeMap::new(),
-            resources: KernelResourceManager::new(),
-            next_resource_index: 0,
         }
     }
 
@@ -71,7 +73,7 @@ impl TerminalRuntime {
                 "available": true,
                 "command": shell.program,
                 "args": shell.argv,
-                "managedBy": "deepcode-kernel",
+                "managedBy": HOST_TERMINAL_OWNER,
                 "problems": []
             }
         })
@@ -84,7 +86,7 @@ impl TerminalRuntime {
             "defaultShell": shell.kind,
             "startedAt": null,
             "completedAt": now_text(),
-            "message": "Kernel PTY terminal runtime is ready.",
+            "message": "Host PTY terminal runtime is ready.",
             "problems": []
         })
     }
@@ -99,7 +101,6 @@ impl TerminalRuntime {
     ) -> Result<Value, String> {
         let id = format!("term-{}", now_millis());
         let order = self.sessions.len();
-        let owner = KernelResourceOwner::user_session(id.clone());
         self.spawn_session(TerminalSpawnRequest {
             id,
             name,
@@ -108,7 +109,6 @@ impl TerminalRuntime {
             cols,
             rows,
             order,
-            owner,
         })
     }
 
@@ -121,10 +121,7 @@ impl TerminalRuntime {
             cols,
             rows,
             order,
-            owner,
         } = request;
-        self.next_resource_index += 1;
-        let resource_id = format!("terminal-resource-{id}-{}", self.next_resource_index);
         let now = now_text();
         let shell = shell_spec(requested_shell_kind.as_deref());
         let size = PtySize {
@@ -148,6 +145,7 @@ impl TerminalRuntime {
             .slave
             .spawn_command(command)
             .map_err(|error| format!("spawn terminal shell {}: {error}", shell.program))?;
+        let child = TerminalChildOwner::new(child);
         drop(pty.slave);
         let reader = pty
             .master
@@ -159,7 +157,6 @@ impl TerminalRuntime {
             .map_err(|error| format!("open pty writer: {error}"))?;
         let events = Arc::new(Mutex::new(Vec::new()));
         let next_sequence = Arc::new(Mutex::new(1_u64));
-        let exit_code = Arc::new(Mutex::new(None));
         push_terminal_event(
             &events,
             &next_sequence,
@@ -168,15 +165,13 @@ impl TerminalRuntime {
             Some(format!("Terminal ready at {}", cwd.display())),
             None,
         );
-        let child = Arc::new(Mutex::new(child));
         spawn_terminal_reader(
             id.clone(),
             reader,
             Arc::clone(&events),
             Arc::clone(&next_sequence),
-            Arc::clone(&child),
-            Arc::clone(&exit_code),
-        );
+            child.observer(),
+        )?;
 
         let session = TerminalPtySession {
             id: id.clone(),
@@ -187,37 +182,13 @@ impl TerminalRuntime {
             created_at: now.clone(),
             updated_at: now,
             order,
-            owner: owner.clone(),
-            resource_id: resource_id.clone(),
-            exit_code,
+            child,
             writer,
             master: pty.master,
-            child,
             events,
             next_sequence,
         };
         let output = session.to_json();
-        self.resources
-            .acquire_batch(
-                vec![KernelResource::active(
-                    KernelResourceIdentity::new(
-                        resource_id,
-                        format!("terminal-session:{id}"),
-                        format!("terminal-session:{id}:{}", self.next_resource_index),
-                    ),
-                    KernelResourceKind::TerminalSession,
-                    owner,
-                    KernelResourceScope::Session,
-                    KernelResourceCleanupPolicy::OnSessionEnd,
-                    KernelResourceMetadata::TerminalSession {
-                        terminal_id: id.clone(),
-                        cwd: session.cwd.to_string_lossy().to_string(),
-                        shell_kind: session.shell_kind.clone(),
-                    },
-                )],
-                |_| Ok(()),
-            )
-            .map_err(|error| format!("register terminal resource: {error}"))?;
         self.sessions.insert(id, session);
         Ok(output)
     }
@@ -290,34 +261,16 @@ impl TerminalRuntime {
     }
 
     pub(crate) fn restart(&mut self, session_id: &str) -> Result<Value, String> {
-        let (name, shell_kind, cwd, order, owner, resource_id) = {
-            let session = self
-                .sessions
-                .get_mut(session_id)
-                .ok_or_else(|| "terminal session not found".to_string())?;
-            kill_child(&session.child);
-            (
-                session.name.clone(),
-                session.shell_kind.clone(),
-                session.cwd.clone(),
-                session.order,
-                session.owner.clone(),
-                session.resource_id.clone(),
-            )
-        };
-        let release = self
-            .resources
-            .release(&resource_id, |_| Ok(()))
-            .map_err(|error| format!("release terminal resource before restart: {error}"))?;
-        if !release.released {
-            return Err(format!(
-                "release terminal resource before restart: {}",
-                release
-                    .error
-                    .unwrap_or_else(|| "unknown cleanup failure".to_string())
-            ));
-        }
-        self.sessions.remove(session_id);
+        let mut session = self
+            .sessions
+            .remove(session_id)
+            .ok_or_else(|| "terminal session not found".to_string())?;
+        let name = session.name.clone();
+        let shell_kind = session.shell_kind.clone();
+        let cwd = session.cwd.clone();
+        let order = session.order;
+        session.shutdown();
+        drop(session);
         let session_json = self.spawn_session(TerminalSpawnRequest {
             id: session_id.to_string(),
             name: Some(name),
@@ -326,7 +279,6 @@ impl TerminalRuntime {
             cols: None,
             rows: None,
             order,
-            owner,
         })?;
         if let Some(session) = self.sessions.get(session_id) {
             push_terminal_event(
@@ -342,22 +294,10 @@ impl TerminalRuntime {
     }
 
     pub(crate) fn delete(&mut self, session_id: &str) -> Result<Value, String> {
-        let Some(session) = self.sessions.remove(session_id) else {
+        let Some(mut session) = self.sessions.remove(session_id) else {
             return Err("terminal session not found".to_string());
         };
-        kill_child(&session.child);
-        let release = self
-            .resources
-            .release(&session.resource_id, |_| Ok(()))
-            .map_err(|error| format!("release terminal resource: {error}"))?;
-        if !release.released {
-            return Err(format!(
-                "release terminal resource: {}",
-                release
-                    .error
-                    .unwrap_or_else(|| "unknown cleanup failure".to_string())
-            ));
-        }
+        session.shutdown();
         Ok(session.to_json())
     }
 
@@ -384,38 +324,24 @@ impl TerminalRuntime {
     }
 }
 
-impl Drop for TerminalRuntime {
-    fn drop(&mut self) {
-        for session in self.sessions.values() {
-            let _ = self.resources.release(&session.resource_id, |_| Ok(()));
-            kill_child(&session.child);
-        }
-    }
-}
-
-impl Drop for TerminalPtySession {
-    fn drop(&mut self) {
-        kill_child(&self.child);
-    }
-}
-
 impl TerminalPtySession {
     fn refresh_status(&mut self) {
         if self.status != "running" {
             return;
         }
-        if let Ok(mut child) = self.child.lock() {
-            if let Ok(Some(status)) = child.try_wait() {
-                self.status = "exited".to_string();
-                self.updated_at = now_text();
-                *self.exit_code.lock().expect("terminal exit code lock") =
-                    Some(status.exit_code() as i32);
-            }
+        if self.child.observe_exit().is_some() {
+            self.status = "exited".to_string();
+            self.updated_at = now_text();
         }
     }
 
+    fn shutdown(&mut self) {
+        self.child.terminate_and_wait();
+        self.status = "exited".to_string();
+        self.updated_at = now_text();
+    }
+
     fn to_json(&self) -> Value {
-        let exit_code = *self.exit_code.lock().expect("terminal exit code lock");
         json!({
             "id": self.id,
             "name": self.name,
@@ -425,10 +351,90 @@ impl TerminalPtySession {
             "createdAt": self.created_at,
             "updatedAt": self.updated_at,
             "order": self.order,
-            "owner": &self.owner,
-            "exitCode": exit_code
+            "owner": HOST_TERMINAL_OWNER,
+            "exitCode": self.child.exit_code()
         })
     }
+}
+
+impl TerminalChildOwner {
+    fn new(child: Box<dyn portable_pty::Child + Send + Sync>) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(TerminalChildState {
+                child: Some(child),
+                exit_code: None,
+            })),
+        }
+    }
+
+    fn observer(&self) -> TerminalChildObserver {
+        TerminalChildObserver {
+            state: Arc::clone(&self.state),
+        }
+    }
+
+    fn observe_exit(&self) -> Option<i32> {
+        observe_terminal_child_exit(&self.state)
+    }
+
+    fn exit_code(&self) -> Option<i32> {
+        lock_terminal_child_state(&self.state).exit_code
+    }
+
+    fn terminate_and_wait(&mut self) -> Option<i32> {
+        let child = {
+            let mut state = lock_terminal_child_state(&self.state);
+            state.child.take()
+        };
+        let Some(mut child) = child else {
+            return self.exit_code();
+        };
+
+        let _ = child.kill();
+        let exit_code = child.wait().ok().map(|status| status.exit_code() as i32);
+        let mut state = lock_terminal_child_state(&self.state);
+        if exit_code.is_some() {
+            state.exit_code = exit_code;
+        }
+        state.exit_code
+    }
+}
+
+impl Drop for TerminalChildOwner {
+    fn drop(&mut self) {
+        self.terminate_and_wait();
+    }
+}
+
+impl TerminalChildObserver {
+    fn observe_exit(&self) -> Option<i32> {
+        observe_terminal_child_exit(&self.state)
+    }
+}
+
+fn lock_terminal_child_state(
+    state: &Arc<Mutex<TerminalChildState>>,
+) -> std::sync::MutexGuard<'_, TerminalChildState> {
+    state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn observe_terminal_child_exit(state: &Arc<Mutex<TerminalChildState>>) -> Option<i32> {
+    let mut state = lock_terminal_child_state(state);
+    let exit_code = match state.child.as_mut() {
+        Some(child) => child
+            .try_wait()
+            .ok()
+            .flatten()
+            .map(|status| status.exit_code() as i32),
+        None => return state.exit_code,
+    };
+    if let Some(exit_code) = exit_code {
+        state.exit_code = Some(exit_code);
+        state.child.take();
+    }
+    state.exit_code
 }
 
 #[derive(Clone)]
@@ -453,54 +459,53 @@ fn spawn_terminal_reader(
     mut reader: Box<dyn Read + Send>,
     events: Arc<Mutex<Vec<Value>>>,
     next_sequence: Arc<Mutex<u64>>,
-    child: Arc<Mutex<Box<dyn portable_pty::Child + Send + Sync>>>,
-    exit_code: Arc<Mutex<Option<i32>>>,
-) {
-    thread::spawn(move || {
-        let mut buffer = [0_u8; 4096];
-        loop {
-            match reader.read(&mut buffer) {
-                Ok(0) => {
-                    let code = if let Ok(mut child) = child.lock() {
-                        child
-                            .try_wait()
-                            .ok()
-                            .flatten()
-                            .map(|status| status.exit_code() as i32)
-                    } else {
-                        None
-                    };
-                    if let Some(code) = code {
-                        *exit_code.lock().expect("terminal exit code lock") = Some(code);
+    child: TerminalChildObserver,
+) -> Result<(), String> {
+    thread::Builder::new()
+        .name(format!("terminal-reader-{session_id}"))
+        .spawn(move || {
+            let mut buffer = [0_u8; 4096];
+            loop {
+                match reader.read(&mut buffer) {
+                    Ok(0) => {
+                        let code = child.observe_exit();
+                        push_terminal_event(
+                            &events,
+                            &next_sequence,
+                            &session_id,
+                            "exit",
+                            None,
+                            code,
+                        );
+                        break;
                     }
-                    push_terminal_event(&events, &next_sequence, &session_id, "exit", None, code);
-                    break;
-                }
-                Ok(read) => {
-                    let text = String::from_utf8_lossy(&buffer[..read]).to_string();
-                    push_terminal_event(
-                        &events,
-                        &next_sequence,
-                        &session_id,
-                        "stdout",
-                        Some(text),
-                        None,
-                    );
-                }
-                Err(error) => {
-                    push_terminal_event(
-                        &events,
-                        &next_sequence,
-                        &session_id,
-                        "error",
-                        Some(format!("read terminal output: {error}")),
-                        None,
-                    );
-                    break;
+                    Ok(read) => {
+                        let text = String::from_utf8_lossy(&buffer[..read]).to_string();
+                        push_terminal_event(
+                            &events,
+                            &next_sequence,
+                            &session_id,
+                            "stdout",
+                            Some(text),
+                            None,
+                        );
+                    }
+                    Err(error) => {
+                        push_terminal_event(
+                            &events,
+                            &next_sequence,
+                            &session_id,
+                            "error",
+                            Some(format!("read terminal output: {error}")),
+                            None,
+                        );
+                        break;
+                    }
                 }
             }
-        }
-    });
+        })
+        .map(|_| ())
+        .map_err(|error| format!("spawn terminal reader: {error}"))
 }
 
 fn push_terminal_event(
@@ -535,13 +540,6 @@ fn push_terminal_event(
     if guard.len() > MAX_TERMINAL_EVENTS {
         let overflow = guard.len() - MAX_TERMINAL_EVENTS;
         guard.drain(0..overflow);
-    }
-}
-
-fn kill_child(child: &Arc<Mutex<Box<dyn portable_pty::Child + Send + Sync>>>) {
-    if let Ok(mut child) = child.lock() {
-        let _ = child.kill();
-        let _ = child.wait();
     }
 }
 

@@ -30,6 +30,9 @@ pub(crate) fn session_payload(state: &AppState, session_id: &str) -> Option<(Val
             .cloned()
             .unwrap_or_else(|| read_session_projection_jsonl(&gui.paths.sessions_dir, session_id)),
     );
+    let events =
+        merge_session_kernel_v2_public_agent_events(&gui.paths.sessions_dir, session_id, events)
+            .ok()?;
     Some((session, events))
 }
 
@@ -212,46 +215,21 @@ pub(crate) fn authoritative_project_run_context(
             args: None,
         }
     })?;
-    let open_path = stored_binding
-        .get("openPath")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
+    let resolved_binding = state
+        .host_services
+        .workspace
+        .validate_project_binding(&stored_binding)
+        .map_err(|error| {
             if !continuing_run {
                 set_project_root_status(state, project_id, "unavailable");
             }
             KernelErrorEnvelope {
-                code: "project_root_unavailable".to_string(),
-                message: "project workspace root is unavailable; rebind the project directory"
-                    .to_string(),
-                message_key: None,
-                args: None,
+                code: error.code,
+                message: format!("project workspace root is unavailable: {}", error.message),
+                message_key: error.message_key,
+                args: error.args,
             }
         })?;
-    let resolved_binding = resolve_project_binding(&state.runtime, open_path).map_err(|error| {
-        if !continuing_run {
-            set_project_root_status(state, project_id, "unavailable");
-        }
-        KernelErrorEnvelope {
-            code: "project_root_unavailable".to_string(),
-            message: format!("project workspace root is unavailable: {}", error.message),
-            message_key: None,
-            args: None,
-        }
-    })?;
-    if stored_binding.get("workspaceHash") != resolved_binding.get("workspaceHash") {
-        if !continuing_run {
-            set_project_root_status(state, project_id, "unavailable");
-        }
-        return Err(KernelErrorEnvelope {
-            code: "project_workspace_binding_mismatch".to_string(),
-            message: "project workspace binding no longer matches the configured directory; rebind the project"
-                .to_string(),
-            message_key: None,
-            args: None,
-        });
-    }
     if !continuing_run {
         set_project_root_status(state, project_id, "ready");
     }
@@ -462,9 +440,7 @@ pub(crate) fn run_readonly_session_bridge(request: Value) -> Result<Value, Kerne
                 .write_all(&payload)
                 .map_err(|error| KernelErrorEnvelope {
                     code: "session_bridge_write_failed".to_string(),
-                    message: format!(
-                        "failed to write read-only Session bridge request: {error}"
-                    ),
+                    message: format!("failed to write read-only Session bridge request: {error}"),
                     message_key: None,
                     args: None,
                 })
@@ -493,8 +469,8 @@ pub(crate) fn run_readonly_session_bridge(request: Value) -> Result<Value, Kerne
     })?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let result = serde_json::from_str::<Value>(stdout.trim()).map_err(|error| {
-        KernelErrorEnvelope {
+    let result =
+        serde_json::from_str::<Value>(stdout.trim()).map_err(|error| KernelErrorEnvelope {
             code: "session_bridge_invalid_json".to_string(),
             message: format!(
                 "read-only Session bridge returned invalid JSON: {error}; stderr={}",
@@ -502,8 +478,7 @@ pub(crate) fn run_readonly_session_bridge(request: Value) -> Result<Value, Kerne
             ),
             message_key: None,
             args: None,
-        }
-    })?;
+        })?;
     if !output.status.success() || result.get("ok").and_then(Value::as_bool) != Some(true) {
         return Err(KernelErrorEnvelope {
             code: result
@@ -915,7 +890,7 @@ fn find_bridge_from_root_daemon(root: &FsPath) -> Option<PathBuf> {
     None
 }
 
-fn find_session_host_node_daemon(bridge: &FsPath) -> PathBuf {
+pub(crate) fn find_session_host_node_daemon(bridge: &FsPath) -> PathBuf {
     if let Ok(path) = std::env::var("DEEPCODE_NODE") {
         if !path.trim().is_empty() {
             return PathBuf::from(path);

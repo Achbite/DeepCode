@@ -23,17 +23,21 @@ use std::os::windows::process::CommandExt as WindowsCommandExt;
 
 mod bootstrap;
 mod session_bridge;
+mod v2;
 
 pub use bootstrap::{DaemonStatus, KernelBootstrap, KernelBootstrapGuard, KernelBootstrapOptions};
 use session_bridge::run_session_host_bridge;
 pub use session_bridge::{
     session_host_bridge_hint, session_host_bridge_path, terminal_host_language,
-    ResolveSessionGoalInteractionRequest, SessionGoalCommandReceipt,
-    StartSessionGoalRequest,
     terminal_workspace_scope, AgentRunResult, AgentRunStatus, AgentSessionListResult,
     AgentSessionResult, CreateAgentSessionRequest, ListAgentSessionsRequest,
-    SessionHostBridgeRequest, SessionHostBridgeResult, StartAgentRunRequest,
-    TerminalWorkspaceScope,
+    ResolveSessionGoalInteractionRequest, SessionGoalCommandReceipt, SessionHostBridgeRequest,
+    SessionHostBridgeResult, StartAgentRunRequest, StartSessionGoalRequest, TerminalWorkspaceScope,
+};
+pub use v2::{
+    HostDecisionKernelV2Client, HostKernelV2Client, HostRunOpenTransportV2,
+    HostTransportCredentialV2, KernelV2ClientError, KernelV2ClientResult, KernelV2HttpErrorCode,
+    SessionKernelV2Client,
 };
 
 #[derive(Debug, Error)]
@@ -370,9 +374,7 @@ impl HttpKernelClient {
     ) -> KernelClientResult<SessionGoalCommandReceipt> {
         let value = self
             .http
-            .get(self.url(&format!(
-                "/api/agent/sessions/{session_id}/goals/current"
-            )))
+            .get(self.url(&format!("/api/agent/sessions/{session_id}/goals/current")))
             .send()
             .await?
             .error_for_status()?
@@ -388,9 +390,7 @@ impl HttpKernelClient {
     ) -> KernelClientResult<SessionGoalCommandReceipt> {
         let value = self
             .http
-            .get(self.url(&format!(
-                "/api/agent/sessions/{session_id}/goals/{goal_id}"
-            )))
+            .get(self.url(&format!("/api/agent/sessions/{session_id}/goals/{goal_id}")))
             .send()
             .await?
             .error_for_status()?

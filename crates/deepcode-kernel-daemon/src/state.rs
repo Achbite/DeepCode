@@ -4,7 +4,10 @@ use crate::*;
 #[derive(Clone)]
 pub(crate) struct AppState {
     pub(crate) runtime: Arc<Mutex<DeepCodeKernelRuntime>>,
+    pub(crate) kernel_v2: crate::kernel_v2_transport::KernelV2TransportState,
+    pub(crate) kernel_v2_host_capability: crate::kernel_v2_transport::HostTransportCapabilityV2,
     pub(crate) gui: Arc<Mutex<GuiState>>,
+    pub(crate) host_services: HostServices,
     pub(crate) terminal_runtime: Arc<Mutex<crate::terminal_api::TerminalRuntime>>,
     pub(crate) kernel_events: Arc<Mutex<Vec<KernelEvent>>>,
     pub(crate) session_runs: Arc<Mutex<HashMap<String, AgentRunState>>>,
@@ -12,7 +15,11 @@ pub(crate) struct AppState {
     pub(crate) projection_delivery: Arc<Mutex<ProjectionDeliveryBufferState>>,
 }
 
-pub(crate) type SharedRuntime = Arc<Mutex<DeepCodeKernelRuntime>>;
+impl axum::extract::FromRef<AppState> for crate::kernel_v2_transport::KernelV2TransportState {
+    fn from_ref(state: &AppState) -> Self {
+        state.kernel_v2.clone()
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct HostPaths {

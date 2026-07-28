@@ -1,5 +1,5 @@
 use crate::prelude::*;
-use crate::{now_millis, now_text, AppState, SharedRuntime};
+use crate::{now_millis, now_text, AppState};
 pub(crate) fn record_kernel_events(state: &AppState, events: &[KernelEvent]) {
     if events.is_empty() {
         return;
@@ -22,27 +22,6 @@ pub(crate) fn kernel_command_session_id(command: &KernelCommand) -> Option<Strin
 
 pub(crate) fn kernel_event_session_id(event: &KernelEvent) -> Option<String> {
     event.session_id().map(|session_id| session_id.0.clone())
-}
-
-pub(crate) fn dispatch_host_skill_catalog(
-    runtime: &SharedRuntime,
-    command: KernelCommand,
-) -> Result<HostSkillCatalogResult, KernelErrorEnvelope> {
-    let mut runtime = runtime.lock().expect("kernel runtime lock");
-    let events = runtime
-        .dispatch(command)
-        .map_err(|error| KernelErrorEnvelope::from(&error))?;
-    for event in events {
-        if let KernelEvent::HostSkillsDiscovered { result, .. } = event {
-            return Ok(result);
-        }
-    }
-    Err(KernelErrorEnvelope {
-        code: "unexpected_event".to_string(),
-        message: "expected host skill catalog result".to_string(),
-        message_key: None,
-        args: None,
-    })
 }
 
 pub(crate) fn kernel_events_to_agent_events(

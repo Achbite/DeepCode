@@ -2,7 +2,7 @@ use crate::prelude::*;
 use crate::*;
 
 pub(crate) async fn health(State(state): State<AppState>) -> Json<ApiResponse> {
-    let workspace = current_workspace(&state.runtime)
+    let workspace = current_workspace(&state.host_services.workspace)
         .ok()
         .and_then(|workspace| serde_json::to_value(workspace).ok())
         .unwrap_or(Value::Null);
@@ -20,7 +20,11 @@ pub(crate) async fn health(State(state): State<AppState>) -> Json<ApiResponse> {
         "toolCatalogCount": deepcode_kernel_runtime::kernel_visible_tool_catalog_count(),
         "toolCatalogHash": &tool_catalog_snapshot.catalog_hash,
         "toolCatalogSnapshot": tool_catalog_snapshot,
-        "workspace": workspace
+        "workspace": workspace,
+        "hostWorkspaceRegistry": format!("{:?}", state.host_services.workspace.readiness()).to_ascii_lowercase(),
+        "hostActiveRunBrokerV2": state.host_services.active_runs_v2.status(),
+        "sessionKernelProjectionV2": state.host_services.projection_v2.status(),
+        "audit": state.host_services.audit.status()
     }))
 }
 
