@@ -5,6 +5,7 @@ export * from './context/index.js';
 export * from './controller.js';
 export * from './driver/index.js';
 export * from './goal/index.js';
+export * from './kernel-v2/index.js';
 export * from './projection.js';
 export * from './projectionDelivery.js';
 export * from './prompt/index.js';

@@ -12,6 +12,11 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
       "default": "./dist/index.js"
+    },
+    "./kernel-v2": {
+      "types": "./dist/kernel-v2/index.d.ts",
+      "import": "./dist/kernel-v2/index.js",
+      "default": "./dist/kernel-v2/index.js"
     }
   },
   "files": [

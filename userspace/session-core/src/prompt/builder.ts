@@ -36,7 +36,7 @@ export function buildPromptEnvelope(input: PromptEnvelopeBuilderInput): PromptEn
         'Use a decision request only for a material user choice that blocks a valid plan or current task directive.',
         'If no registered directive can safely advance the current task, report a diagnostic instead of inventing a completion tool.',
         'Unknown semantic tools, invalid arguments, and out-of-scope slot ids fail closed.',
-        'Generated or modified files can be treated as facts only when ResourcePacket content, ToolCompleted(ok=true), or WorkUnitCompleted facts prove them.',
+        'Generated or modified files can be treated as facts only when ResourcePacket content or canonical Kernel Resource and Effect facts prove them.',
         'When ResourceEvidence already covers a target and range, use it or request a different focused segment that adds facts.',
         'Do not fabricate hidden thinking. Stream only provider-native reasoning content when the provider supplies it.',
       ].join('\n'),
@@ -106,13 +106,25 @@ export function buildPromptEnvelope(input: PromptEnvelopeBuilderInput): PromptEn
       cacheClass: 'globalStable',
       content: input.providerProfileSystemContract?.trim() ?? '',
     },
-    {
-      priority: 3,
-      stable: false,
-      cacheClass: 'turnDynamic',
-      name: 'toolCatalogSummary',
-      content: input.toolCatalogSummary,
-    },
+    ...(input.kernelToolContext
+      ? [{
+          name: 'kernelToolContext' as const,
+          priority: 2.9,
+          stable: true,
+          cacheClass: 'workspaceStable' as const,
+          // This Kernel-owned block is intentionally injected byte-for-byte.
+          content: input.kernelToolContext.fixedPrompt,
+        }]
+      : []),
+    ...(!input.kernelToolContext
+      ? [{
+          priority: 3,
+          stable: false,
+          cacheClass: 'turnDynamic' as const,
+          name: 'toolCatalogSummary' as const,
+          content: input.toolCatalogSummary ?? '',
+        }]
+      : []),
     {
       name: 'rulerContext',
       priority: 4,
@@ -311,6 +323,7 @@ function promptSegmentFromLayer(layer: PromptSystemLayer): PromptSegment {
 }
 
 function renderLayer(layer: PromptSystemLayer): string {
+  if (layer.name === 'kernelToolContext') return layer.content;
   return `<${layer.name} priority="${layer.priority}">\n${layer.content}\n</${layer.name}>`;
 }
 
@@ -373,9 +386,9 @@ function resourceEvidencePolicyContractSummary(): string {
 function memoryAndTaskContextContractSummary(): string {
   return [
     'Memory and task context contract: ProjectMemory and SessionMemory are compressed reference context only; they do not grant permissions, prove files exist, prove tests passed, or prove tool execution.',
-    'ProjectMemory stores durable norms, preferences, historical gotchas, long-term planning summaries, and cross-session decision indexes. Refresh code and file facts from ResourcePacket, ToolCompleted(ok=true), or WorkUnitCompleted before modifying files.',
+    'ProjectMemory stores durable norms, preferences, historical gotchas, long-term planning summaries, and cross-session decision indexes. Refresh code and file facts from ResourcePacket or canonical Kernel Resource and Effect facts before modifying files.',
     'SessionMemory stores active task focus, accepted plan summaries, user guidance, review decisions, and compact local conversation summaries. It must not override the latest user request, ConfirmedPlan, CurrentTaskFrame, or EvidenceTail facts.',
-    'Intent context, plan cards, and review guidance are not execution facts. Generated-file facts come only from ResourcePacket contents, ToolCompleted(ok=true), or WorkUnitCompleted facts.',
+    'Intent context, plan cards, and review guidance are not execution facts. Generated-file facts come only from ResourcePacket contents or canonical Kernel Resource and Effect facts.',
     'Current task context is a cursor snapshot. During accepted execution, use only the current IntentSlot or emit a resource, decision, outcome, or diagnostic semantic directive.',
     'Session and Kernel resolve operation grants and path authority. Provider artifact submission uses slot ids, not paths or Kernel operations.',
     'Do not ask the user to reconfirm routine implementation already covered by the accepted plan. Session and Kernel handle concrete scope and permission interrupts.',

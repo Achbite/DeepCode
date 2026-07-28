@@ -2,6 +2,7 @@ import type { ConversationResourceRoot, InitialContextPacket, ResourcePacket, Re
 import type { RequirementRecord } from '../requirement/types.js';
 import type { AuthoritativeDocExcerpt } from './docProbe.js';
 import type { CompiledRuler } from './ruler.js';
+import type { ToolContextBundleV2 } from '@deepcode/protocol';
 
 export interface PromptSystemLayer {
   name:
@@ -13,6 +14,7 @@ export interface PromptSystemLayer {
     | 'resourceEvidencePolicyContract'
     | 'memoryAndTaskContextContract'
     | 'providerProfileContract'
+    | 'kernelToolContext'
     | 'toolCatalogSummary'
     | 'rulerContext'
     | 'authoritativeDocExcerpts'
@@ -57,7 +59,8 @@ export interface PromptSegment {
 export interface PromptEnvelopeBuilderInput {
   workflowState: string;
   allowedProposals: string[];
-  toolCatalogSummary: string;
+  toolCatalogSummary?: string;
+  kernelToolContext?: ToolContextBundleV2;
   builtinSystemPromptVersion?: string;
   providerProfileSystemContract?: string;
   compiledRuler?: CompiledRuler;

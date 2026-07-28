@@ -86,12 +86,20 @@ export function inferProviderTurnMode(input: PromptEnvelopeBuilderInput): Provid
 export function providerVisibleSchemaDigest(input: PromptEnvelopeBuilderInput): string {
   const turnMode = inferProviderTurnMode(input);
   const executionLikeTurn = turnMode === 'acceptedTaskExecution' || turnMode === 'resourceResume' || turnMode === 'scopeIntervention';
+  if (input.kernelToolContext) {
+    return [
+      'Kernel v2 tool execution uses only provider-native tool calls from the current ready ToolContext.',
+      'When a provider has no native tool-call channel, the only executable text form is one standalone deepcode.session.tool-intent-frame.v2 JSON object.',
+      'Narration, Markdown, embedded JSON, inferred paths, and tool names mentioned in prose are never executable.',
+      'Session binds the current run, control epoch, operation, PlanAction or context-read authority, idempotency key, deadline, and ToolContext digest; never emit capabilities, leases, permission flags, or audit facts.',
+    ].join('\n');
+  }
   if (executionLikeTurn) {
     return [
       'Execution uses provider-native Session semantic tools.',
       'Use exactly one of: session.request_resources, session.request_decision, session.submit_task_outcome, session.append_artifact_chunk, session.finalize_task_artifacts, session.report_diagnostic.',
       'For generated content, submit only current IntentSlot ids and artifact content. Session compiles the directive into an internal Kernel command.',
-      'Do not output Kernel tool identifiers, actionBundle transport fields, permission fields, WorkUnit fields, or audit fields.',
+      'Do not output Kernel tool identifiers, actionBundle transport fields, permission fields, capabilities, or audit fields.',
     ].join('\n');
   }
   return [
@@ -99,7 +107,7 @@ export function providerVisibleSchemaDigest(input: PromptEnvelopeBuilderInput): 
     'Use exactly one of: session.request_resources, session.request_decision, session.submit_plan, session.submit_answer, session.report_diagnostic.',
     'A submitted plan is an ordered task queue. Each task must list only earlier task IDs in dependencies, using [] when it has none.',
     'Every submitted task toolId must exactly match a provider-visible entry in the current Kernel tool catalog.',
-    'Do not invent tool identifiers or output permission fields, WorkUnit fields, or audit fields.',
+    'Do not invent tool identifiers or output permission fields, capabilities, or audit fields.',
   ].join('\n');
 }
 
@@ -109,7 +117,16 @@ export function providerVisibleWorkflowState(input: PromptEnvelopeBuilderInput):
     `Current workflow state: ${input.workflowState}.`,
     `Provider turn mode: ${mode}.`,
   ];
-  if (mode === 'acceptedTaskExecution') {
+  if (input.kernelToolContext) {
+    lines.push(
+      'The current ready Kernel tool schemas and instructions are supplied in the immutable kernelToolContext layer. Use only that exact projection.'
+    );
+    if (mode === 'acceptedTaskExecution') {
+      lines.push(
+        'The current operation and approved PlanAction binding are supplied by Session outside model-controlled arguments.'
+      );
+    }
+  } else if (mode === 'acceptedTaskExecution') {
     lines.push(`Current accepted task IntentSlot scope:\n${input.toolCatalogSummary || 'none'}`);
   } else {
     lines.push(`Current Kernel tool catalog for planning:\n${input.toolCatalogSummary || 'Kernel tool catalog unavailable. Do not invent toolIds; use session.report_diagnostic.'}`);
@@ -139,6 +156,12 @@ function defaultRepairPolicy(turnMode: ProviderTurnMode): ProviderRepairPolicy {
 function toolIntentTemplates(input: PromptEnvelopeBuilderInput, turnMode: ProviderTurnMode): string[] {
   if (turnMode !== 'acceptedTaskExecution' && turnMode !== 'resourceResume' && turnMode !== 'scopeIntervention') {
     return [];
+  }
+  if (input.kernelToolContext) {
+    return [
+      'Prefer a provider-native call to one ready tool from kernelToolContext.',
+      'Text-only fallback must be exactly {"schemaVersion":"deepcode.session.tool-intent-frame.v2","kind":"toolIntent","toolId":"<ready namespaced id>","arguments":{...}} with no surrounding narration.',
+    ];
   }
   const record = objectRecord(input.currentTaskContext);
   const targets = stringArray(record?.targets);

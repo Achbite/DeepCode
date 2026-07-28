@@ -21,7 +21,10 @@ import {
   type UserGuidanceEvent,
   type SessionMemoryDocument,
 } from './memory.js';
-import type { AgentEvent } from '@deepcode/protocol';
+import type {
+  AgentEvent,
+  ToolContextBundleV2,
+} from '@deepcode/protocol';
 
 const PROMPT_POLICY_VERSION = 'deepcode.prompt-policy.v1';
 const MEMORY_COMPRESSION_MODE = 'memory-v3-soft-cap-lines';
@@ -230,7 +233,12 @@ export interface ContextAssemblyRecord {
   dynamicSuffixHash: string;
   cacheHash: string;
   auditHash: string;
-  catalogHash: string;
+  catalogHash?: string;
+  toolContextRef?: {
+    contextVersion: number;
+    catalogDigest: string;
+    contextDigest: string;
+  };
   stateContractHash: string;
   cacheAffectsCorrectness: false;
   segmentOrder: string[];
@@ -284,7 +292,8 @@ export interface ContextAssemblyRecord {
 export interface ContextAssemblyInput {
   workflowState: string;
   allowedProposals: string[];
-  toolCatalogSummary: string;
+  toolCatalogSummary?: string;
+  kernelToolContext?: ToolContextBundleV2;
   userRequest: string;
   existingEvents?: AgentEvent[];
   initialContext?: InitialContextPacket;
@@ -338,7 +347,9 @@ export function assembleContext(input: ContextAssemblyInput): ContextAssemblyRes
   const promptInput: PromptEnvelopeBuilderInput = {
     workflowState: input.workflowState,
     allowedProposals: input.allowedProposals,
-    toolCatalogSummary: input.toolCatalogSummary,
+    ...(input.kernelToolContext
+      ? { kernelToolContext: input.kernelToolContext }
+      : { toolCatalogSummary: input.toolCatalogSummary ?? '' }),
     projectMemoryHints: renderProjectMemoryHints(memoryDocument),
     projectMemoryRecallHints: renderProjectMemoryRecallHints(memoryDocument),
     sessionMemoryHints: [
@@ -445,7 +456,18 @@ export function assembleContext(input: ContextAssemblyInput): ContextAssemblyRes
     dynamicSuffixHash: canonical.dynamicSuffixHash,
     cacheHash: canonical.cacheHash,
     auditHash: canonical.auditHash,
-    catalogHash: stableHash(input.toolCatalogSummary || 'none'),
+    ...(input.kernelToolContext
+      ? {
+          toolContextRef: {
+            contextVersion: input.kernelToolContext.contextVersion,
+            catalogDigest: input.kernelToolContext.catalogDigest,
+            contextDigest: input.kernelToolContext.contextDigest,
+          },
+        }
+      : {
+          catalogHash:
+            stableHash(input.toolCatalogSummary || 'none'),
+        }),
     stateContractHash: stableHash([
       input.workflowState,
       ...input.allowedProposals,
@@ -690,6 +712,7 @@ function contextAssemblyPartitionName(segment: PromptSegment): ContextAssemblyPa
     case 'memoryAndTaskContextContract':
     case 'providerProfileContract':
       return 'AgentOperatingContract';
+    case 'kernelToolContext':
     case 'toolCatalogSummary':
       return 'StaticToolCatalogDigest';
     case 'rulerContext':
