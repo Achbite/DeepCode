@@ -1,16 +1,61 @@
-use crate::v2::{
-    empty_field, field_too_large, invalid_value, typed_digest, zero_value, NetworkOriginV2,
-    NetworkTargetObservationDigestV2, ResourceStateDigestV2, V2ValidationError,
+use deepcode_kernel_abi::v2::{
+    NetworkOriginV2, NetworkTargetObservationDigestV2, ResourceStateDigestV2, ToolOutputDigestV2,
+    V2ValidationError,
 };
-use crate::KERNEL_TOOL_CATALOG_V4_VERSION;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
+
+pub(crate) const KERNEL_TOOL_CATALOG_V4_VERSION: &str = "deepcode.kernel.tools.v4";
 
 pub const MAX_CANONICAL_INVOCATION_BYTES_V4: usize = 1024 * 1024;
 pub const MAX_INVOCATION_SCHEMA_BYTES_V4: usize = 64 * 1024;
 pub const MAX_TOOL_CATALOG_BYTES_V4: usize = 2 * 1024 * 1024;
 const MAX_LIST_ITEMS_V4: usize = 256;
 const MAX_ORDINARY_STRING_BYTES_V4: usize = 16 * 1024;
+
+fn empty_field(field: &'static str) -> V2ValidationError {
+    V2ValidationError::EmptyField { field }
+}
+
+fn zero_value(field: &'static str) -> V2ValidationError {
+    V2ValidationError::ZeroValue { field }
+}
+
+fn field_too_large(field: &'static str, maximum_bytes: usize) -> V2ValidationError {
+    V2ValidationError::FieldTooLarge {
+        field,
+        maximum_bytes,
+    }
+}
+
+fn invalid_value(field: &'static str, reason: &'static str) -> V2ValidationError {
+    V2ValidationError::InvalidValue { field, reason }
+}
+
+fn typed_digest<T: Serialize>(
+    domain: &'static str,
+    value: &T,
+) -> Result<[u8; 32], V2ValidationError> {
+    let encoded =
+        serde_json::to_vec(value).map_err(|_| invalid_value("digestPreimage", "must serialize"))?;
+    let mut hasher = Sha256::new();
+    hasher.update(domain.as_bytes());
+    hasher.update([0]);
+    hasher.update(encoded);
+    Ok(hasher.finalize().into())
+}
+
+fn encoded_digest(bytes: [u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(71);
+    encoded.push_str("sha256:");
+    for byte in bytes {
+        encoded.push(char::from(HEX[(byte >> 4) as usize]));
+        encoded.push(char::from(HEX[(byte & 0x0f) as usize]));
+    }
+    encoded
+}
 
 macro_rules! digest_type {
     ($name:ident) => {
@@ -62,7 +107,6 @@ macro_rules! digest_type {
 
 digest_type!(ToolCatalogDigestV4);
 digest_type!(ToolContractDigestV4);
-digest_type!(ToolOutputDigestV4);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum AuthorityToolIdV4 {
@@ -874,7 +918,7 @@ pub enum OutputTruncationV4 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ToolOutputV4 {
-    pub full_digest: ToolOutputDigestV4,
+    pub full_digest: ToolOutputDigestV2,
     pub total_bytes: u64,
     pub truncation: OutputTruncationV4,
     pub payload: ToolOutputPayloadV4,
@@ -928,8 +972,8 @@ pub fn tool_catalog_digest_v4(
 pub fn tool_output_digest_v4(
     tool_id: AuthorityToolIdV4,
     payload: &ToolOutputPayloadV4,
-) -> Result<ToolOutputDigestV4, V2ValidationError> {
-    Ok(ToolOutputDigestV4::from_raw_digest(typed_digest(
+) -> Result<ToolOutputDigestV2, V2ValidationError> {
+    ToolOutputDigestV2::parse(encoded_digest(typed_digest(
         "deepcode.kernel.tools.v4/output",
         &serde_json::json!({
             "toolId":tool_id,

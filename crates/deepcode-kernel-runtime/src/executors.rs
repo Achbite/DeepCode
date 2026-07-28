@@ -263,10 +263,10 @@ struct TextPatchResult {
 
 pub(crate) fn plan_v2_text_edit(
     original: &str,
-    matcher: &deepcode_kernel_abi::tool_catalog_v4::EditMatcherV4,
+    matcher: &deepcode_kernel_tools::EditMatcherV4,
     replacement: &str,
 ) -> KernelResult<(Value, String)> {
-    use deepcode_kernel_abi::tool_catalog_v4::{EditMatcherV4, FileDigestPreconditionV4};
+    use deepcode_kernel_tools::{EditMatcherV4, FileDigestPreconditionV4};
     let match_value = match matcher {
         EditMatcherV4::ExactBlock { text } => {
             serde_json::json!({"kind":"exactBlock","text":text})

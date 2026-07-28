@@ -1,11 +1,11 @@
 use deepcode_kernel_abi::v2::{
     query_digest_v2, AuthorizationFactV2, CleanupFactV2, CommandRequestDigestV2, CommandRequestId,
-    ControlFactV2, FactId, GrantFactV2, InvocationFactV2, KernelFactDraftV2, KernelFactEnvelopeV2,
+    ControlFactV2, FactId, InvocationFactV2, KernelFactDraftV2, KernelFactEnvelopeV2,
     KernelFactPayloadV2, RecordedAtV2, ResourceFactV2, RunId, FACT_STORE_SCHEMA_CONTRACT_V2,
 };
 use deepcode_kernel_abi::{
-    CapabilityLeaseIdV2, CapabilityLeaseRefV2, CapabilityLeaseVersionV2,
-    CapabilityScopeDigestV2, FactQueryContinuationV2, KERNEL_ABI_V2_VERSION,
+    CapabilityLeaseIdV2, CapabilityLeaseRefV2, CapabilityLeaseVersionV2, CapabilityScopeDigestV2,
+    FactQueryContinuationV2, KERNEL_ABI_V2_VERSION,
 };
 use deepcode_kernel_abi::{KernelError, KernelResult};
 use rusqlite::types::Value as SqlValue;
@@ -60,8 +60,6 @@ pub struct FactQueryV2 {
     pub operation_id: Option<String>,
     pub invocation_id: Option<String>,
     pub attempt_id: Option<String>,
-    pub grant_id: Option<String>,
-    pub grant_reservation_id: Option<String>,
     pub causation_id: Option<String>,
     pub idempotency_key_hash: Option<String>,
     pub correlation_ref: Option<(String, String)>,
@@ -346,8 +344,7 @@ enum WriterCommand {
         drafts: Vec<KernelFactDraftV2>,
         receipt: PublicCommandReceiptV2,
         mutations: Vec<AuthorityMaterialMutationV2>,
-        response:
-            mpsc::Sender<KernelResult<AppendWithPublicReceiptAndAuthorityMaterialOutcomeV2>>,
+        response: mpsc::Sender<KernelResult<AppendWithPublicReceiptAndAuthorityMaterialOutcomeV2>>,
     },
     PutPublicCommandReceipt {
         receipt: PublicCommandReceiptV2,
@@ -669,14 +666,12 @@ impl CanonicalFactStore {
         mutations: Vec<AuthorityMaterialMutationV2>,
     ) -> KernelResult<AppendWithPublicReceiptAndAuthorityMaterialOutcomeV2> {
         let (response, receiver) = mpsc::channel();
-        self.send(
-            WriterCommand::AppendWithPublicReceiptAndAuthorityMaterial {
-                drafts,
-                receipt,
-                mutations,
-                response,
-            },
-        )?;
+        self.send(WriterCommand::AppendWithPublicReceiptAndAuthorityMaterial {
+            drafts,
+            receipt,
+            mutations,
+            response,
+        })?;
         receive_response(
             "append_with_public_receipt_and_authority_material",
             receiver,
@@ -1481,8 +1476,6 @@ fn prepare_database(
                  operation_id TEXT,
                  invocation_id TEXT,
                  attempt_id TEXT,
-                 grant_id TEXT,
-                 grant_reservation_id TEXT,
                  causation_id TEXT,
                  idempotency_key_hash TEXT,
                  correlation_refs_json TEXT NOT NULL,
@@ -1502,10 +1495,6 @@ fn prepare_database(
                  ON kernel_facts (invocation_id, ledger_sequence);
              CREATE INDEX IF NOT EXISTS kernel_facts_attempt
                  ON kernel_facts (attempt_id, ledger_sequence);
-             CREATE INDEX IF NOT EXISTS kernel_facts_grant
-                 ON kernel_facts (grant_id, ledger_sequence);
-             CREATE INDEX IF NOT EXISTS kernel_facts_reservation
-                 ON kernel_facts (grant_reservation_id, ledger_sequence);
              CREATE INDEX IF NOT EXISTS kernel_facts_causation
                  ON kernel_facts (causation_id, ledger_sequence);
              CREATE UNIQUE INDEX IF NOT EXISTS kernel_facts_command_request
@@ -1526,15 +1515,6 @@ fn prepare_database(
                  run_id TEXT PRIMARY KEY NOT NULL,
                  run_sequence_high_water INTEGER NOT NULL,
                  control_epoch INTEGER NOT NULL,
-                 last_ledger_sequence INTEGER NOT NULL,
-                 state_json TEXT NOT NULL
-             ) WITHOUT ROWID;
-
-             CREATE TABLE IF NOT EXISTS grant_state (
-                 grant_id TEXT PRIMARY KEY NOT NULL,
-                 run_id TEXT NOT NULL,
-                 observed_use_count INTEGER NOT NULL,
-                 status TEXT NOT NULL,
                  last_ledger_sequence INTEGER NOT NULL,
                  state_json TEXT NOT NULL
              ) WITHOUT ROWID;
@@ -1811,16 +1791,13 @@ fn validate_schema_contract(connection: &Connection) -> KernelResult<()> {
     let required_queries = [
         "SELECT key, value FROM schema_meta LIMIT 0",
         "SELECT ledger_sequence, run_id, run_sequence, fact_id, command_request_id,
-                operation_id, invocation_id, attempt_id, grant_id, grant_reservation_id,
+                operation_id, invocation_id, attempt_id,
                 causation_id, idempotency_key_hash, correlation_refs_json, control_epoch,
                 resource_ids_json, fact_kind, recorded_at, envelope_json
          FROM kernel_facts LIMIT 0",
         "SELECT run_id, run_sequence_high_water, control_epoch,
                 last_ledger_sequence, state_json
          FROM run_state LIMIT 0",
-        "SELECT grant_id, run_id, observed_use_count, status,
-                last_ledger_sequence, state_json
-         FROM grant_state LIMIT 0",
         "SELECT invocation_id, run_id, status, last_ledger_sequence, state_json
          FROM invocation_state LIMIT 0",
         "SELECT resource_id, run_id, status, last_ledger_sequence, state_json
@@ -2101,10 +2078,12 @@ fn append_with_public_receipt_and_authority_material_transaction(
     let first_run_id = drafts
         .first()
         .map(|draft| draft.payload.run_id().clone())
-        .ok_or_else(|| store_error_message(
-            "append_with_public_receipt_and_authority_material",
-            "canonical fact batch must not be empty",
-        ))?;
+        .ok_or_else(|| {
+            store_error_message(
+                "append_with_public_receipt_and_authority_material",
+                "canonical fact batch must not be empty",
+            )
+        })?;
     if drafts
         .iter()
         .any(|draft| draft.payload.run_id() != &first_run_id)
@@ -2137,10 +2116,7 @@ fn append_with_public_receipt_and_authority_material_transaction(
     {
         let outcome = compare_public_command_receipt(existing, &receipt);
         transaction.commit().map_err(|error| {
-            store_error(
-                "commit_public_receipt_and_authority_material_replay",
-                error,
-            )
+            store_error("commit_public_receipt_and_authority_material_replay", error)
         })?;
         return Ok(AppendWithPublicReceiptAndAuthorityMaterialOutcomeV2 {
             facts: Vec::new(),
@@ -2250,9 +2226,7 @@ fn validate_authority_material_draft(material: &AuthorityMaterialDraftV2) -> Ker
     if encoded.len() > MAX_AUTHORITY_MATERIAL_PAYLOAD_BYTES {
         return Err(store_error_message(
             "validate_authority_material",
-            format!(
-                "payloadJson exceeds the {MAX_AUTHORITY_MATERIAL_PAYLOAD_BYTES} byte boundary"
-            ),
+            format!("payloadJson exceeds the {MAX_AUTHORITY_MATERIAL_PAYLOAD_BYTES} byte boundary"),
         ));
     }
     Ok(())
@@ -2261,15 +2235,13 @@ fn validate_authority_material_draft(material: &AuthorityMaterialDraftV2) -> Ker
 fn validate_authority_material_token(field: &str, value: &str) -> KernelResult<()> {
     if value.is_empty()
         || value.len() > MAX_AUTHORITY_MATERIAL_TOKEN_BYTES
-        || !value.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':')
-        })
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':'))
     {
         Err(store_error_message(
             "validate_authority_material",
-            format!(
-                "{field} must be a 1..={MAX_AUTHORITY_MATERIAL_TOKEN_BYTES} byte ASCII token"
-            ),
+            format!("{field} must be a 1..={MAX_AUTHORITY_MATERIAL_TOKEN_BYTES} byte ASCII token"),
         ))
     } else {
         Ok(())
@@ -2537,10 +2509,7 @@ fn transition_authority_material_run_epoch(
     let mut values = vec![
         SqlValue::Text(next_lifecycle.to_owned()),
         SqlValue::Text(fact.fact_id.to_string()),
-        SqlValue::Integer(sqlite_integer(
-            fact.ledger_sequence,
-            "lastLedgerSequence",
-        )?),
+        SqlValue::Integer(sqlite_integer(fact.ledger_sequence, "lastLedgerSequence")?),
         SqlValue::Text(run_id.to_string()),
         SqlValue::Integer(sqlite_integer(
             through_control_epoch,
@@ -2561,9 +2530,7 @@ fn read_authority_material_record(
 ) -> KernelResult<Option<AuthorityMaterialRecordV2>> {
     Ok(read_authority_material_snapshot(connection)?
         .into_iter()
-        .find(|record| {
-            record.material_kind == material_kind && record.material_id == material_id
-        }))
+        .find(|record| record.material_kind == material_kind && record.material_id == material_id))
 }
 
 fn read_authority_material_snapshot(
@@ -2640,9 +2607,8 @@ fn read_authority_material_snapshot(
         validate_authority_material_token("materialId", &material_id)?;
         validate_authority_material_token("lifecycle", &lifecycle)?;
         validate_sha256_text("payloadDigest", &payload_digest)?;
-        let run_id = RunId::new(run_id).map_err(|error| {
-            invalid_fact_error("decode_authority_material", error.to_string())
-        })?;
+        let run_id = RunId::new(run_id)
+            .map_err(|error| invalid_fact_error("decode_authority_material", error.to_string()))?;
         if source_run_id != run_id.as_str() || last_run_id != run_id.as_str() {
             return Err(store_error_message(
                 "decode_authority_material",
@@ -2656,12 +2622,12 @@ fn read_authority_material_snapshot(
                 "authority material controlEpoch must be greater than zero",
             ));
         }
-        let source_ledger_sequence =
-            sqlite_u64(source_ledger_sequence, "sourceLedgerSequence")?;
-        let last_ledger_sequence =
-            sqlite_u64(last_ledger_sequence, "lastLedgerSequence")?;
-        let canonical_last_ledger_sequence =
-            sqlite_u64(canonical_last_ledger_sequence, "canonicalLastLedgerSequence")?;
+        let source_ledger_sequence = sqlite_u64(source_ledger_sequence, "sourceLedgerSequence")?;
+        let last_ledger_sequence = sqlite_u64(last_ledger_sequence, "lastLedgerSequence")?;
+        let canonical_last_ledger_sequence = sqlite_u64(
+            canonical_last_ledger_sequence,
+            "canonicalLastLedgerSequence",
+        )?;
         if last_ledger_sequence != canonical_last_ledger_sequence
             || last_ledger_sequence < source_ledger_sequence
         {
@@ -2697,27 +2663,18 @@ fn read_authority_material_snapshot(
                 (Some(lease_id), Some(lease_version), Some(scope_digest)) => {
                     Some(CapabilityLeaseRefV2 {
                         lease_id: CapabilityLeaseIdV2::new(lease_id).map_err(|error| {
-                            invalid_fact_error(
-                                "decode_authority_material",
-                                error.to_string(),
-                            )
+                            invalid_fact_error("decode_authority_material", error.to_string())
                         })?,
                         version: CapabilityLeaseVersionV2::new(sqlite_u64(
                             lease_version,
                             "leaseVersion",
                         )?)
                         .map_err(|error| {
-                            invalid_fact_error(
-                                "decode_authority_material",
-                                error.to_string(),
-                            )
+                            invalid_fact_error("decode_authority_material", error.to_string())
                         })?,
                         scope_digest: CapabilityScopeDigestV2::parse(scope_digest).map_err(
                             |error| {
-                                invalid_fact_error(
-                                    "decode_authority_material",
-                                    error.to_string(),
-                                )
+                                invalid_fact_error("decode_authority_material", error.to_string())
                             },
                         )?,
                     })
@@ -3343,13 +3300,7 @@ fn read_fact_query_continuation(
         )
         .optional()
         .map_err(|error| store_error("read_fact_query_continuation", error))?;
-    let Some((
-        run_id,
-        snapshot_high_water,
-        after_ledger_sequence,
-        created_at,
-        expires_at,
-    )) = row
+    let Some((run_id, snapshot_high_water, after_ledger_sequence, created_at, expires_at)) = row
     else {
         return Ok(None);
     };
@@ -3398,12 +3349,12 @@ fn persist_envelope(
         .execute(
             "INSERT INTO kernel_facts (
                  ledger_sequence, run_id, run_sequence, fact_id, command_request_id,
-                 operation_id, invocation_id, attempt_id, grant_id, grant_reservation_id,
+                 operation_id, invocation_id, attempt_id,
                  causation_id, idempotency_key_hash, correlation_refs_json, control_epoch,
                  resource_ids_json, fact_kind, recorded_at, envelope_json
              ) VALUES (
-                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                 ?14, ?15, ?16, ?17, ?18
+                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                 ?13, ?14, ?15, ?16
              )",
             params![
                 sqlite_integer(envelope.ledger_sequence, "ledgerSequence")?,
@@ -3414,12 +3365,6 @@ fn persist_envelope(
                 envelope.payload.operation_id().map(|id| id.as_str()),
                 envelope.payload.invocation_id().map(|id| id.as_str()),
                 envelope.payload.attempt_id().map(|id| id.as_str()),
-                envelope
-                    .payload
-                    .grant_id()
-                    .map(|id| id.as_str())
-                    .or_else(|| { envelope.payload.capability_lease_id().map(|id| id.as_str()) }),
-                envelope.payload.reservation_id().map(|id| id.as_str()),
                 envelope.payload.causation_fact_id().map(|id| id.as_str()),
                 envelope
                     .payload
@@ -3495,40 +3440,6 @@ fn update_materialized_state(
 
     match &envelope.payload {
         KernelFactPayloadV2::Authorization(fact) => match fact {
-            AuthorizationFactV2::CapabilityIssued { identity, .. }
-            | AuthorizationFactV2::ExpansionAllowed { identity, .. }
-            | AuthorizationFactV2::LeaseRevoked { identity, .. }
-            | AuthorizationFactV2::LeaseSuperseded { identity, .. } => {
-                let status = match fact {
-                    AuthorizationFactV2::CapabilityIssued { .. } => "capabilityIssued",
-                    AuthorizationFactV2::ExpansionAllowed { .. } => "scopeExpanded",
-                    AuthorizationFactV2::LeaseRevoked { .. } => "capabilityRevoked",
-                    AuthorizationFactV2::LeaseSuperseded { .. } => "capabilitySuperseded",
-                    _ => unreachable!(),
-                };
-                transaction
-                    .execute(
-                        "INSERT INTO grant_state (
-                                 grant_id, run_id, observed_use_count, status,
-                                 last_ledger_sequence, state_json
-                             ) VALUES (?1, ?2, 0, ?3, ?4, ?5)
-                             ON CONFLICT(grant_id) DO UPDATE SET
-                                 run_id = excluded.run_id,
-                                 status = excluded.status,
-                                 last_ledger_sequence = excluded.last_ledger_sequence,
-                                 state_json = excluded.state_json
-                             WHERE excluded.last_ledger_sequence >
-                                 grant_state.last_ledger_sequence",
-                        params![
-                            identity.lease_id.as_str(),
-                            run_id,
-                            status,
-                            ledger_sequence,
-                            encoded,
-                        ],
-                    )
-                    .map_err(|error| store_error("update_capability_lease_state", error))?;
-            }
             AuthorizationFactV2::CapabilityAwaiting { identity, .. } => {
                 transaction
                     .execute(
@@ -3553,147 +3464,51 @@ fn update_materialized_state(
                     .map_err(|error| store_error("update_awaiting_capability_state", error))?;
             }
             AuthorizationFactV2::ScopePreviewed { .. }
+            | AuthorizationFactV2::CapabilityIssued { .. }
             | AuthorizationFactV2::CapabilityDenied { .. }
             | AuthorizationFactV2::ExpansionDenied { .. }
+            | AuthorizationFactV2::ExpansionAllowed { .. }
             | AuthorizationFactV2::TrustGranted { .. }
             | AuthorizationFactV2::TrustRevoked { .. }
+            | AuthorizationFactV2::LeaseRevoked { .. }
+            | AuthorizationFactV2::LeaseSuperseded { .. }
             | AuthorizationFactV2::ContextInvalidated { .. } => {}
         },
-        KernelFactPayloadV2::Grant(fact) => {
-            let projection = match fact {
-                GrantFactV2::Denied { .. } => None,
-                GrantFactV2::Issued { identity, .. } => {
-                    Some((&identity.grant_id, Some(0), "issued"))
-                }
-                GrantFactV2::Reserved { identity } => Some((&identity.grant_id, None, "reserved")),
-                GrantFactV2::Consumed {
-                    identity,
-                    use_count,
-                    ..
-                } => Some((&identity.grant_id, Some(*use_count), "consumed")),
-                GrantFactV2::ReservationReleased { identity, .. } => {
-                    Some((&identity.grant_id, None, "reservationReleased"))
-                }
-                GrantFactV2::Revoked { identity, .. } => {
-                    Some((&identity.grant_id, None, "revoked"))
-                }
-                GrantFactV2::Superseded { identity, .. } => {
-                    Some((&identity.grant_id, None, "superseded"))
-                }
-            };
-            let Some((grant_id, use_count, status)) = projection else {
-                return Ok(());
-            };
-            let observed_use_count = match use_count {
-                Some(value) => value,
-                None => transaction
-                    .query_row(
-                        "SELECT observed_use_count FROM grant_state WHERE grant_id = ?1",
-                        params![grant_id.as_str()],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .optional()
-                    .map_err(|error| store_error("read_grant_use_count", error))?
-                    .map(|value| sqlite_u64(value, "observedUseCount"))
-                    .transpose()?
-                    .unwrap_or(0),
-            };
-            transaction
-                .execute(
-                    "INSERT INTO grant_state (
-                         grant_id, run_id, observed_use_count, status,
-                         last_ledger_sequence, state_json
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                     ON CONFLICT(grant_id) DO UPDATE SET
-                         run_id = excluded.run_id,
-                         observed_use_count = excluded.observed_use_count,
-                         status = excluded.status,
-                         last_ledger_sequence = excluded.last_ledger_sequence,
-                         state_json = excluded.state_json
-                     WHERE excluded.last_ledger_sequence > grant_state.last_ledger_sequence",
-                    params![
-                        grant_id.as_str(),
-                        run_id,
-                        sqlite_integer(observed_use_count, "observedUseCount")?,
-                        status,
-                        ledger_sequence,
-                        encoded,
-                    ],
-                )
-                .map_err(|error| store_error("update_grant_state", error))?;
-        }
         KernelFactPayloadV2::Invocation(fact) => {
-            let projection = match fact {
-                InvocationFactV2::Rejected { .. } => None,
+            let (invocation_id, status) = match fact {
                 InvocationFactV2::ToolIntentAdmitted { identity, .. } => {
-                    Some((&identity.invocation_id, "admitted"))
+                    (&identity.invocation_id, "admitted")
                 }
                 InvocationFactV2::ToolAttemptPrepared { identity } => {
-                    Some((&identity.invocation_id, "attemptPrepared"))
+                    (&identity.invocation_id, "attemptPrepared")
                 }
                 InvocationFactV2::ToolExecutionStarted { identity, .. } => {
-                    Some((&identity.invocation_id, "executing"))
+                    (&identity.invocation_id, "executing")
                 }
                 InvocationFactV2::ToolCancellationObserved { identity, .. } => {
-                    Some((&identity.invocation_id, "cancellationObserved"))
+                    (&identity.invocation_id, "cancellationObserved")
                 }
                 InvocationFactV2::ToolDeadlineObserved { identity } => {
-                    Some((&identity.invocation_id, "deadlineObserved"))
+                    (&identity.invocation_id, "deadlineObserved")
                 }
                 InvocationFactV2::ToolFailedBeforeEffect { identity, .. } => {
-                    Some((&identity.invocation_id, "failedBeforeEffect"))
+                    (&identity.invocation_id, "failedBeforeEffect")
                 }
                 InvocationFactV2::ToolCancelledBeforeEffect { identity, .. } => {
-                    Some((&identity.invocation_id, "cancelledBeforeEffect"))
+                    (&identity.invocation_id, "cancelledBeforeEffect")
                 }
                 InvocationFactV2::ToolTimedOutBeforeEffect { identity } => {
-                    Some((&identity.invocation_id, "timedOutBeforeEffect"))
+                    (&identity.invocation_id, "timedOutBeforeEffect")
                 }
                 InvocationFactV2::ToolCompleted { identity, .. } => {
-                    Some((&identity.invocation_id, "completed"))
+                    (&identity.invocation_id, "completed")
                 }
                 InvocationFactV2::ToolFailedAfterObservedEffect { identity, .. } => {
-                    Some((&identity.invocation_id, "failedAfterObservedEffect"))
+                    (&identity.invocation_id, "failedAfterObservedEffect")
                 }
                 InvocationFactV2::ToolIndeterminate { identity, .. } => {
-                    Some((&identity.invocation_id, "indeterminate"))
+                    (&identity.invocation_id, "indeterminate")
                 }
-                InvocationFactV2::Admitted { identity, .. } => {
-                    Some((&identity.invocation_id, "admitted"))
-                }
-                InvocationFactV2::AttemptPrepared { identity } => {
-                    Some((&identity.invocation_id, "attemptPrepared"))
-                }
-                InvocationFactV2::ExecutionStarted { identity, .. } => {
-                    Some((&identity.invocation_id, "executing"))
-                }
-                InvocationFactV2::CancellationObserved { identity, .. } => {
-                    Some((&identity.invocation_id, "cancellationObserved"))
-                }
-                InvocationFactV2::DeadlineObserved { identity } => {
-                    Some((&identity.invocation_id, "deadlineObserved"))
-                }
-                InvocationFactV2::FailedBeforeEffect { identity, .. } => {
-                    Some((&identity.invocation_id, "failedBeforeEffect"))
-                }
-                InvocationFactV2::CancelledBeforeEffect { identity, .. } => {
-                    Some((&identity.invocation_id, "cancelledBeforeEffect"))
-                }
-                InvocationFactV2::TimedOutBeforeEffect { identity } => {
-                    Some((&identity.invocation_id, "timedOutBeforeEffect"))
-                }
-                InvocationFactV2::Completed { identity, .. } => {
-                    Some((&identity.invocation_id, "completed"))
-                }
-                InvocationFactV2::FailedAfterObservedEffect { identity, .. } => {
-                    Some((&identity.invocation_id, "failedAfterObservedEffect"))
-                }
-                InvocationFactV2::Indeterminate { identity, .. } => {
-                    Some((&identity.invocation_id, "indeterminate"))
-                }
-            };
-            let Some((invocation_id, status)) = projection else {
-                return Ok(());
             };
             transaction
                 .execute(
@@ -3724,8 +3539,6 @@ fn update_materialized_state(
                 ResourceFactV2::RevalidatedBeforeEffect { identity, .. } => {
                     (&identity.resource_id, "revalidated")
                 }
-                ResourceFactV2::Acquired { identity } => (&identity.resource_id, "acquired"),
-                ResourceFactV2::Released { identity } => (&identity.resource_id, "released"),
             };
             update_resource_state(
                 transaction,
@@ -3823,18 +3636,6 @@ fn query_facts(
         &mut values,
         "attempt_id",
         filter.attempt_id.as_deref(),
-    );
-    push_filter(
-        &mut sql,
-        &mut values,
-        "grant_id",
-        filter.grant_id.as_deref(),
-    );
-    push_filter(
-        &mut sql,
-        &mut values,
-        "grant_reservation_id",
-        filter.grant_reservation_id.as_deref(),
     );
     push_filter(
         &mut sql,
@@ -3957,7 +3758,6 @@ fn rebuild_materialized_state_transaction(connection: &mut Connection) -> Kernel
     transaction
         .execute_batch(
             "DELETE FROM run_state;
-             DELETE FROM grant_state;
              DELETE FROM invocation_state;
              DELETE FROM resource_state;",
         )

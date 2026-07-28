@@ -3,15 +3,15 @@ mod schema;
 
 use self::builder::build_tool_contract;
 use self::schema::provider_schema_for_operation;
+use crate::runtime_adapter_v4::AuthorityToolIdV4;
 use crate::{
     authority_descriptor_v4, normalize_invocation_v4, AuthorityToolDescriptorV4,
     KernelExecutorBinding, KernelToolContract, OperationExecutionMode, ToolFamily,
     ToolOperationKind, ToolPermissionMode, ToolRiskLevel,
 };
-use deepcode_kernel_abi::tool_catalog_v4::AuthorityToolIdV4;
 use deepcode_kernel_abi::{
-    ToolAvailabilityV2, ToolDescriptorV2, ToolEffectClassV2,
-    ToolEffectScopeV2, ToolIdV2, ToolInputSchemaV2, ToolRiskV2,
+    ToolAvailabilityV2, ToolDescriptorV2, ToolEffectClassV2, ToolEffectScopeV2, ToolIdV2,
+    ToolInputSchemaV2, ToolRiskV2,
 };
 use serde_json::Value;
 
@@ -520,9 +520,7 @@ fn admission_metadata_v2(
         | ToolOperationKind::GitStage
         | ToolOperationKind::GitUnstage
         | ToolOperationKind::GitCommit => (30_000, 120_000, 65_536),
-        ToolOperationKind::WebSearch | ToolOperationKind::WebFetch => {
-            (15_000, 60_000, 262_144)
-        }
+        ToolOperationKind::WebSearch | ToolOperationKind::WebFetch => (15_000, 60_000, 262_144),
         _ => (10_000, 30_000, 4_194_304),
     };
     let execution_adapter = match operation_kind {

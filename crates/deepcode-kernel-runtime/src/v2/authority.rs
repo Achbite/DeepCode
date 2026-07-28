@@ -1,72 +1,51 @@
 use super::model::{
-    invocation_phase_is_terminal, AuthorityResult, AuthorityState, CommandReplay,
-    DirectInvocationRecord, ExecutionResolution, GrantDecisionReplay, GrantLifecycle, GrantRecord,
-    InvocationPhase, InvocationRecord, PreparedDirectToolIntent, PreparedGrantRequest, RawExecution,
-    ReservationRecord, ResolvedTarget, ResourceRecord, RunLifecycle, RunRecord, StopOverlay,
-    SubmissionBinding, VerifiedExecution, WorkspaceBinding,
+    invocation_phase_is_terminal, AuthorityResult, AuthorityState, DirectInvocationRecord,
+    ExecutionResolution, InvocationPhase, PreparedDirectToolIntent, RawExecution, ResolvedTarget,
+    ResourceRecord, RunRecord, StopOverlay, VerifiedExecution, WorkspaceBinding,
 };
 use crate::executors::{plan_v2_text_edit, KernelExecutorConfig};
 use crate::network_policy::review_http_target;
-use deepcode_kernel_abi::tool_catalog_v4::{
-    output_payload_measure_v4, AuthorityToolIdV4, DeadlineV4,
-    DeleteTargetV4, DocumentPagesV4, EffectScopeV4, ExecutionAvailabilityV4, LineRangeV4,
-    NetworkPublicTargetV4, OutputTruncationV4, PathEntrySizeV4, PathEntryV4,
-    SearchMatchV4, SearchStrategyV4, TextMediaTypeV4, ToolContractV4, ToolInvocationInputV4,
-    ToolOutputPayloadV4, ToolOutputV4, ToolRiskV4, WebSearchItemV4, WorkspaceObjectKindV4,
-};
 use deepcode_kernel_abi::v2::{
-    authorization_request_digest_v2, collection_digest_v2, content_digest_v2,
-    executor_evidence_digest_v2, grant_scope_digest_v2, idempotency_key_hash_v2,
-    invocation_submission_digest_v2, network_response_digest_v2, network_target_digest_v2,
-    query_digest_v2, resource_state_digest_v2, target_revalidation_digest_v2,
-    target_revalidation_set_digest_v2, workspace_binding_digest_v2, AdmissionRejectionV2,
-    AttemptIdentityV2, AuthorizationFactV2, AuthorizationIdentityV2,
-    AuthorizationRequestDigestV2, AutonomyModeV2, CancelRequestId,
+    collection_digest_v2, content_digest_v2, executor_evidence_digest_v2, idempotency_key_hash_v2,
+    network_response_digest_v2, network_target_digest_v2, query_digest_v2,
+    resource_state_digest_v2, target_revalidation_digest_v2, target_revalidation_set_digest_v2,
+    workspace_binding_digest_v2, AuthorizationFactV2, AuthorizationIdentityV2, CancelRequestId,
     CancellationIdentityV2, CancellationReasonCodeV2, CancellationSourceV2,
-    CapabilityAwaitingIdentityV2, CapabilityLeaseFactIdentityV2,
-    CanonicalPrivateTargetV2, CommandEpochContextV2, CommandReceiptIdentityV2,
-    CommandRequestDigestV2, CommandRequestId, CommandRequestIdentityV2, ControlEpoch,
-    ControlFactV2, CorrelationRefV2, CorrelationSetV2, DeletionBeforeObservationV2,
-    DirectoryBeforeObservationV2,
-    EffectEvidenceV2, EffectFactV2, EffectId, EffectIdentityV2, ExecutorEvidenceDigestV2, FactId,
-    FileBeforeObservationV2, GrantDecisionBasisV2, GrantDecisionDigestV2, GrantDenialReasonV2,
-    GrantDeniedIdentityV2, GrantFactV2, GrantId, GrantIssuedIdentityV2, GrantLifecycleIdentityV2,
-    GrantSupersessionCauseV2, GrantUsePolicyV2, IdempotencyKeyHashV2, IndeterminateReasonV2,
-    InputId, InvocationFactV2, InvocationId, InvocationRejectedIdentityV2,
-    InvocationAuthorityV2,
-    InvocationRequestDigestV2, InvocationSubmissionDigestV2, KernelFactDraftV2,
-    KernelFactEnvelopeV2, KernelFactPayloadV2, LastObservationV2, MutationCommandResultV2,
-    NetworkAddressV2, NetworkHostV2, NetworkOriginV2, NetworkQueryV2, NetworkRequestTargetV2,
-    NetworkSchemeV2, NetworkTargetObservationDigestV2, ObservedTerminalIdentityV2, OperationId,
-    OperationIdempotencyConflictV2, PairKnownSideV2, PlatformV2, PostObservedEffectFailureCodeV2,
-    PreEffectFailureCodeV2, PresentFileObservationV2, ReservationIdentityV2,
-    ReservationReleaseReasonV2, ResolutionObservationV2, ResolvedResourceV2, ResourceAccessV2,
-    ResourceAttemptIdentityV2, ResourceFactV2, ResourceId, ResourceProjectionObservationV2,
-    ResourceResolvedIdentityV2, ResourceScopeV2, ResourceStateV2, RunId, TargetResolutionFailureV2,
-    TargetRevalidationDigestV2, TargetRevalidationObservationV2, TargetRevalidationSetDigestV2,
-    ToolAttemptIdentityV2, ToolEffectIdentityV2, ToolObservedTerminalIdentityV2,
-    TransitionIdentityV2, WorkspaceObjectKindV2, WorkspaceScopeTargetV2,
-    MAX_FACT_PAGE_BYTES_V2,
+    CanonicalPrivateTargetV2, CapabilityAwaitingIdentityV2, CapabilityLeaseFactIdentityV2,
+    CommandEpochContextV2, CommandReceiptIdentityV2, CommandRequestDigestV2, CommandRequestId,
+    CommandRequestIdentityV2, ControlEpoch, ControlFactV2, CorrelationRefV2, CorrelationSetV2,
+    DeletionBeforeObservationV2, DirectoryBeforeObservationV2, EffectEvidenceV2, EffectFactV2,
+    EffectId, ExecutorEvidenceDigestV2, FactId, FileBeforeObservationV2, IndeterminateReasonV2,
+    InvocationAuthorityV2, InvocationFactV2, InvocationId, KernelFactDraftV2, KernelFactEnvelopeV2,
+    KernelFactPayloadV2, LastObservationV2, MutationCommandResultV2, NetworkAddressV2,
+    NetworkHostV2, NetworkOriginV2, NetworkQueryV2, NetworkRequestTargetV2, NetworkSchemeV2,
+    NetworkTargetObservationDigestV2, OperationId, PlatformV2, PostObservedEffectFailureCodeV2,
+    PreEffectFailureCodeV2, PresentFileObservationV2, ResolvedResourceV2, ResourceAccessV2,
+    ResourceAttemptIdentityV2, ResourceFactV2, ResourceId, ResourceResolvedIdentityV2,
+    ResourceScopeV2, ResourceStateV2, RunId, TargetRevalidationDigestV2,
+    TargetRevalidationObservationV2, TargetRevalidationSetDigestV2, ToolAttemptIdentityV2,
+    ToolEffectIdentityV2, ToolObservedTerminalIdentityV2, TransitionIdentityV2,
+    WorkspaceObjectKindV2, WorkspaceScopeTargetV2,
 };
 use deepcode_kernel_abi::v2_command::{
-    CanonicalGrantRequestV2, ControlCancellationReplyV2, ControlEpochAdvanceV2,
-    ControlEpochAdvancedReplyV2, DeadlineRequestV2, EpochPreconditionV2, FactPageContinuationV2,
-    GrantDecisionReplyV2, GrantRequestV2, GrantRevokeV2,
-    GrantRevokedReplyV2, InvalidFieldViolationV2, InvalidRelationV2, InvalidRequestReasonV2,
-    InvocationCancelReplyV2, InvocationCancelV2, InvocationStatusIdentityV2,
-    InvocationStatusReplyV2, InvocationSubmissionReplyV2, KernelErrorV2, KernelFactFilterV2,
-    KernelFactPageV2, KernelFactPredicateV2, KernelFactsQueryV2, KernelReplyV2,
-    MutationCommandKindV2, RecordedCommandErrorV2, ResourceLifecycleV2, ResourceResolveReplyV2,
-    ResourceResolveV2, RunTerminateV2, RunTerminatedReplyV2, StorageFaultCodeV2,
-    ToolIntentSubmitReplyV2,
+    ControlCancellationReplyV2, ControlEpochAdvanceV2, ControlEpochAdvancedReplyV2,
+    DeadlineRequestV2, EpochPreconditionV2, InvalidFieldViolationV2, InvalidRequestReasonV2,
+    InvocationCancelReplyV2, InvocationCancelV2, KernelErrorV2, KernelReplyV2,
+    MutationCommandKindV2, RecordedCommandErrorV2, StorageFaultCodeV2, ToolIntentSubmitReplyV2,
 };
-use deepcode_kernel_ledger::v2::FactQueryV2;
+use deepcode_kernel_abi::ToolIdV2;
+use deepcode_kernel_abi::{CanonicalArgumentsDigestV2, ToolContractDigestV2};
 use deepcode_kernel_tools::{
     normalize_canonical_platform_path_v4, validate_canonical_invocation_v4,
     LocalAuthorityToolCatalogV4,
 };
-use deepcode_kernel_abi::ToolIdV2;
-use deepcode_kernel_abi::{CanonicalArgumentsDigestV2, ToolContractDigestV2};
+use deepcode_kernel_tools::{
+    output_payload_measure_v4, AuthorityToolIdV4, DeadlineV4, DeleteTargetV4, DocumentPagesV4,
+    ExecutionAvailabilityV4, LineRangeV4, NetworkPublicTargetV4, OutputTruncationV4,
+    PathEntrySizeV4, PathEntryV4, SearchMatchV4, SearchStrategyV4, TextMediaTypeV4,
+    ToolInvocationInputV4, ToolOutputPayloadV4, ToolOutputV4, WebSearchItemV4,
+    WorkspaceObjectKindV4,
+};
 use std::collections::HashMap;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -74,7 +53,17 @@ use std::path::{Component, Path, PathBuf};
 
 pub(super) enum PrepareFailure {
     Kernel(KernelErrorV2),
-    Target(TargetResolutionFailureV2),
+    Target(TargetResolutionFailure),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) enum TargetResolutionFailure {
+    AlreadyExists,
+    NetworkTargetRejected,
+    NotFound,
+    ResolverUnavailable,
+    SymlinkPolicyViolation,
+    WrongObjectKind,
 }
 
 pub(super) enum RunCommandCheck {
@@ -84,16 +73,6 @@ pub(super) enum RunCommandCheck {
 
 pub(super) const fn exact_epoch(control_epoch: ControlEpoch) -> CommandEpochContextV2 {
     CommandEpochContextV2::Exact { control_epoch }
-}
-
-pub(super) fn caused_attempt(
-    identity: &AttemptIdentityV2,
-    causation_fact_id: FactId,
-) -> AttemptIdentityV2 {
-    AttemptIdentityV2 {
-        causation_fact_id,
-        ..identity.clone()
-    }
 }
 
 pub(super) fn caused_direct_attempt(
@@ -163,15 +142,9 @@ pub(super) fn plan_control_cancellation(
         return Ok((ControlCancellationReplyV2::None {}, None));
     };
     let stop_overlay = state
-        .invocations
+        .direct_invocations
         .get(&invocation_id)
         .map(|invocation| &invocation.stop_overlay)
-        .or_else(|| {
-            state
-                .direct_invocations
-                .get(&invocation_id)
-                .map(|invocation| &invocation.stop_overlay)
-        })
         .ok_or_else(corrupt_store)?;
     if let Some((cancel_request_id, fact_id, _)) = stop_overlay.cancellation() {
         return Ok((
@@ -225,14 +198,6 @@ pub(super) fn plan_epoch_advance(
                 current: run.epoch,
             })
         }
-        EpochPreconditionV2::Exact { .. }
-            if matches!(run.lifecycle, RunLifecycle::Terminated { .. }) =>
-        {
-            Some(RecordedCommandErrorV2::RunTerminated {
-                run_id: run_id.clone(),
-                control_epoch: run.epoch,
-            })
-        }
         EpochPreconditionV2::Exact { .. } => None,
     };
     if let Some(error) = error {
@@ -281,90 +246,6 @@ pub(super) fn resolve_workspace_binding(path: &Path) -> AuthorityResult<Workspac
     })
 }
 
-fn request_tool_id(request: &GrantRequestV2) -> AuthorityResult<AuthorityToolIdV4> {
-    validate_canonical_invocation_v4(&request.canonical_invocation).map_err(|_| {
-        invalid_field(
-            "request.canonicalInvocation",
-            InvalidFieldViolationV2::OutOfRange,
-        )
-    })?;
-    Ok(request.canonical_invocation.tool_id())
-}
-
-fn request_identity_fields(
-    request: &GrantRequestV2,
-) -> AuthorityResult<(CorrelationSetV2, IdempotencyKeyHashV2)> {
-    let correlations = CorrelationSetV2::materialize(request.correlation_refs.clone())
-        .map_err(|_| invalid_field("request.correlationRefs", InvalidFieldViolationV2::Unsorted))?;
-    let idempotency_key_hash = idempotency_key_hash_v2(&request.run_id, &request.idempotency_key)
-        .map_err(|_| {
-        invalid_field(
-            "request.idempotencyKey",
-            InvalidFieldViolationV2::OutOfRange,
-        )
-    })?;
-    Ok((correlations, idempotency_key_hash))
-}
-
-pub(super) fn prepare_grant_request(
-    request: &GrantRequestV2,
-    catalog: &LocalAuthorityToolCatalogV4,
-    workspace: &WorkspaceBinding,
-    executor_config: &KernelExecutorConfig,
-) -> Result<PreparedGrantRequest, PrepareFailure> {
-    let tool_id = request_tool_id(request)?;
-    let contract = catalog.contract(tool_id);
-    if contract.execution_availability != ExecutionAvailabilityV4::Ready
-        || catalog.ready_binding(tool_id).is_none()
-    {
-        return Err(PrepareFailure::Kernel(
-            KernelErrorV2::ToolExecutionUnavailable {
-                tool_id,
-                availability: ExecutionAvailabilityV4::Blocked,
-            },
-        ));
-    }
-    let effective_deadline_ms = materialize_deadline(request.deadline, &contract.deadline)?;
-    let (correlations, idempotency_key_hash) = request_identity_fields(request)?;
-    let (resource_scope, resolved_targets) =
-        resolve_invocation_targets(&request.canonical_invocation, workspace, executor_config)?;
-    let grant_scope_digest = grant_scope_digest_v2(
-        &request.run_id,
-        request.control_epoch,
-        tool_id,
-        &contract.contract_digest,
-        &request.canonical_invocation,
-        &resource_scope,
-        contract.effect_scope,
-        contract.risk,
-        &workspace.digest,
-    )
-    .map_err(|_| storage_fault())?;
-    let authorization_digest = authorization_request_digest_v2(
-        &request.run_id,
-        &request.operation_id,
-        request.control_epoch,
-        &idempotency_key_hash,
-        &contract.contract_digest,
-        &request.canonical_invocation,
-        &grant_scope_digest,
-        effective_deadline_ms,
-        &workspace.digest,
-    )
-    .map_err(|_| storage_fault())?;
-    Ok(PreparedGrantRequest {
-        canonical_invocation: request.canonical_invocation.clone(),
-        resource_scope,
-        resolved_targets,
-        idempotency_key_hash,
-        grant_scope_digest,
-        authorization_digest,
-        workspace_binding_digest: workspace.digest.clone(),
-        effective_deadline_ms,
-        correlations,
-    })
-}
-
 pub(super) fn prepare_direct_tool_intent(
     run_id: &RunId,
     operation_id: &OperationId,
@@ -377,34 +258,23 @@ pub(super) fn prepare_direct_tool_intent(
     workspace: &WorkspaceBinding,
     executor_config: &KernelExecutorConfig,
 ) -> Result<PreparedDirectToolIntent, PrepareFailure> {
-    validate_canonical_invocation_v4(canonical_invocation).map_err(|_| {
-        invalid_field(
-            "canonicalInvocation",
-            InvalidFieldViolationV2::OutOfRange,
-        )
-    })?;
+    validate_canonical_invocation_v4(canonical_invocation)
+        .map_err(|_| invalid_field("canonicalInvocation", InvalidFieldViolationV2::OutOfRange))?;
     let tool_id = canonical_invocation.tool_id();
     let contract = catalog.contract(tool_id);
     if contract.execution_availability != ExecutionAvailabilityV4::Ready
         || catalog.ready_binding(tool_id).is_none()
     {
-        return Err(PrepareFailure::Kernel(
-            KernelErrorV2::ToolExecutionUnavailable {
-                tool_id,
-                availability: ExecutionAvailabilityV4::Blocked,
-            },
-        ));
+        return Err(PrepareFailure::Kernel(invalid_field(
+            "toolId",
+            InvalidFieldViolationV2::OutOfRange,
+        )));
     }
     let effective_deadline_ms = materialize_deadline(deadline, &contract.deadline)?;
     let correlations = CorrelationSetV2::materialize(correlation_refs)
         .map_err(|_| invalid_field("correlationRefs", InvalidFieldViolationV2::Unsorted))?;
-    let idempotency_key_hash =
-        idempotency_key_hash_v2(run_id, idempotency_key).map_err(|_| {
-            invalid_field(
-                "idempotencyKey",
-                InvalidFieldViolationV2::OutOfRange,
-            )
-        })?;
+    let idempotency_key_hash = idempotency_key_hash_v2(run_id, idempotency_key)
+        .map_err(|_| invalid_field("idempotencyKey", InvalidFieldViolationV2::OutOfRange))?;
     let (resource_scope, resolved_targets) =
         resolve_invocation_targets(canonical_invocation, workspace, executor_config)?;
     let _ = (operation_id, control_epoch);
@@ -419,35 +289,6 @@ pub(super) fn prepare_direct_tool_intent(
     })
 }
 
-pub(super) fn prepare_submission_digest(
-    request: &GrantRequestV2,
-    grant_id: &GrantId,
-    catalog: &LocalAuthorityToolCatalogV4,
-    workspace: &WorkspaceBinding,
-) -> AuthorityResult<(AuthorityToolIdV4, InvocationSubmissionDigestV2)> {
-    let tool_id = request_tool_id(request)?;
-    let contract = catalog.contract(tool_id);
-    let effective_deadline_ms = materialize_deadline(request.deadline, &contract.deadline)
-        .map_err(|failure| match failure {
-            PrepareFailure::Kernel(error) => error,
-            PrepareFailure::Target(_) => corrupt_store(),
-        })?;
-    let (_, idempotency_key_hash) = request_identity_fields(request)?;
-    let digest = invocation_submission_digest_v2(
-        &request.run_id,
-        &request.operation_id,
-        request.control_epoch,
-        &idempotency_key_hash,
-        grant_id,
-        &contract.contract_digest,
-        &request.canonical_invocation,
-        effective_deadline_ms,
-        &workspace.digest,
-    )
-    .map_err(|_| corrupt_store())?;
-    Ok((tool_id, digest))
-}
-
 pub(super) struct PreparedRevalidation {
     pub(super) resource_id: ResourceId,
     pub(super) target: ResolvedTarget,
@@ -458,25 +299,6 @@ pub(super) struct PreparedRevalidation {
 pub(super) struct EffectPreparation {
     pub(super) executor_input: serde_json::Value,
     pub(super) revalidations: Vec<PreparedRevalidation>,
-}
-
-pub(super) fn prepare_effect(
-    invocation: &ToolInvocationInputV4,
-    admitted_targets: &[(ResourceId, ResolvedTarget)],
-    identity: &AttemptIdentityV2,
-    workspace: &WorkspaceBinding,
-    executor_config: &KernelExecutorConfig,
-) -> Result<EffectPreparation, PreEffectFailureCodeV2> {
-    prepare_effect_inner(
-        invocation,
-        admitted_targets,
-        &identity.run_id,
-        &identity.operation_id,
-        &identity.invocation_id,
-        &identity.attempt_id,
-        workspace,
-        executor_config,
-    )
 }
 
 pub(super) fn prepare_direct_effect(
@@ -529,12 +351,14 @@ fn prepare_effect_inner(
         .map(|((resource_id, _), target)| {
             let observation =
                 revalidation_observation(invocation, &target, expected_edit.as_deref())?;
+            let tool_id = ToolIdV2::parse(invocation.tool_id().as_str())
+                .map_err(|_| PreEffectFailureCodeV2::TargetRevalidationFailed)?;
             let digest = target_revalidation_digest_v2(
                 run_id,
                 operation_id,
                 invocation_id,
                 attempt_id,
-                invocation.tool_id(),
+                &tool_id,
                 resource_id,
                 &workspace.digest,
                 &target.private_target,
@@ -1065,182 +889,10 @@ pub(super) fn resolve_execution(
         }
         _ => return indeterminate(LastObservationV2::None {}),
     };
+    let Ok(output) = serde_json::to_value(output) else {
+        return indeterminate(LastObservationV2::None {});
+    };
     ExecutionResolution::Completed(VerifiedExecution { output, evidence })
-}
-
-pub(super) fn pre_effect_stop_drafts(
-    identity: &AttemptIdentityV2,
-    observed_fact_id: FactId,
-    terminal_fact_id: FactId,
-    release_fact_id: FactId,
-    cancellation: Option<(&CancelRequestId, &FactId)>,
-) -> Vec<KernelFactDraftV2> {
-    let (observed, terminal, release_reason) = match cancellation {
-        Some((cancel_request_id, cancellation_fact_id)) => (
-            InvocationFactV2::CancellationObserved {
-                identity: caused_attempt(identity, cancellation_fact_id.clone()),
-                cancel_request_id: cancel_request_id.clone(),
-            },
-            InvocationFactV2::CancelledBeforeEffect {
-                identity: caused_attempt(identity, observed_fact_id.clone()),
-                cancel_request_id: cancel_request_id.clone(),
-            },
-            ReservationReleaseReasonV2::CancelledBeforeEffect,
-        ),
-        None => (
-            InvocationFactV2::DeadlineObserved {
-                identity: caused_attempt(identity, identity.causation_fact_id.clone()),
-            },
-            InvocationFactV2::TimedOutBeforeEffect {
-                identity: caused_attempt(identity, observed_fact_id.clone()),
-            },
-            ReservationReleaseReasonV2::TimedOutBeforeEffect,
-        ),
-    };
-    vec![
-        fact_draft(observed_fact_id, KernelFactPayloadV2::Invocation(observed)),
-        fact_draft(
-            terminal_fact_id.clone(),
-            KernelFactPayloadV2::Invocation(terminal),
-        ),
-        fact_draft(
-            release_fact_id,
-            KernelFactPayloadV2::Grant(GrantFactV2::ReservationReleased {
-                identity: reservation_identity(identity, terminal_fact_id),
-                reason_code: release_reason,
-            }),
-        ),
-    ]
-}
-
-pub(super) fn failed_before_effect_drafts(
-    identity: &AttemptIdentityV2,
-    attempt_prepared_fact_id: &FactId,
-    terminal_fact_id: FactId,
-    release_fact_id: FactId,
-    error_code: PreEffectFailureCodeV2,
-) -> Vec<KernelFactDraftV2> {
-    vec![
-        fact_draft(
-            terminal_fact_id.clone(),
-            KernelFactPayloadV2::Invocation(InvocationFactV2::FailedBeforeEffect {
-                identity: caused_attempt(identity, attempt_prepared_fact_id.clone()),
-                error_code,
-            }),
-        ),
-        fact_draft(
-            release_fact_id,
-            KernelFactPayloadV2::Grant(GrantFactV2::ReservationReleased {
-                identity: reservation_identity(identity, terminal_fact_id),
-                reason_code: ReservationReleaseReasonV2::FailedBeforeEffect,
-            }),
-        ),
-    ]
-}
-
-pub(super) fn execution_result_drafts(
-    identity: &AttemptIdentityV2,
-    execution_started_fact_id: &FactId,
-    effect_id: EffectId,
-    effect_fact_id: FactId,
-    terminal_fact_id: FactId,
-    mut resource_ids: Vec<ResourceId>,
-    resolution: ExecutionResolution,
-    cancel_request_id: Option<&CancelRequestId>,
-    deadline_observed: bool,
-) -> AuthorityResult<Vec<KernelFactDraftV2>> {
-    resource_ids.sort_by(|left, right| left.as_str().as_bytes().cmp(right.as_str().as_bytes()));
-    resource_ids.dedup();
-    let effect_identity = EffectIdentityV2 {
-        run_id: identity.run_id.clone(),
-        control_epoch: identity.control_epoch,
-        operation_id: identity.operation_id.clone(),
-        grant_id: identity.grant_id.clone(),
-        reservation_id: identity.reservation_id.clone(),
-        invocation_id: identity.invocation_id.clone(),
-        attempt_id: identity.attempt_id.clone(),
-        effect_id: effect_id.clone(),
-        idempotency_key_hash: identity.idempotency_key_hash.clone(),
-        causation_fact_id: execution_started_fact_id.clone(),
-    };
-    let terminal_identity = ObservedTerminalIdentityV2 {
-        run_id: identity.run_id.clone(),
-        control_epoch: identity.control_epoch,
-        operation_id: identity.operation_id.clone(),
-        grant_id: identity.grant_id.clone(),
-        reservation_id: identity.reservation_id.clone(),
-        invocation_id: identity.invocation_id.clone(),
-        attempt_id: identity.attempt_id.clone(),
-        effect_id,
-        idempotency_key_hash: identity.idempotency_key_hash.clone(),
-        causation_fact_id: effect_fact_id.clone(),
-        correlation_set: identity.correlation_set.clone(),
-    };
-    let (effect, terminal) = match resolution {
-        ExecutionResolution::Completed(verified) => {
-            let evidence_digest =
-                executor_evidence_digest_v2(&verified.evidence).map_err(|_| corrupt_store())?;
-            (
-                observed_effect(
-                    effect_identity,
-                    resource_ids,
-                    verified.evidence,
-                    evidence_digest,
-                    cancel_request_id,
-                    deadline_observed,
-                ),
-                InvocationFactV2::Completed {
-                    identity: terminal_identity,
-                    output: verified.output,
-                },
-            )
-        }
-        ExecutionResolution::FailedAfterObservedEffect {
-            evidence,
-            error_code,
-        } => {
-            let evidence_digest =
-                executor_evidence_digest_v2(&evidence).map_err(|_| corrupt_store())?;
-            (
-                observed_effect(
-                    effect_identity,
-                    resource_ids,
-                    evidence,
-                    evidence_digest,
-                    cancel_request_id,
-                    deadline_observed,
-                ),
-                InvocationFactV2::FailedAfterObservedEffect {
-                    identity: terminal_identity,
-                    error_code,
-                },
-            )
-        }
-        ExecutionResolution::Indeterminate {
-            evidence,
-            reason_code,
-        } => {
-            let evidence_digest =
-                executor_evidence_digest_v2(&evidence).map_err(|_| corrupt_store())?;
-            (
-                EffectFactV2::Indeterminate {
-                    identity: effect_identity,
-                    possible_affected_resource_ids: resource_ids,
-                    reason_code,
-                    evidence,
-                    evidence_digest,
-                },
-                InvocationFactV2::Indeterminate {
-                    identity: terminal_identity,
-                    reason_code,
-                },
-            )
-        }
-    };
-    Ok(vec![
-        fact_draft(effect_fact_id, KernelFactPayloadV2::Effect(effect)),
-        fact_draft(terminal_fact_id, KernelFactPayloadV2::Invocation(terminal)),
-    ])
 }
 
 pub(super) fn direct_pre_effect_stop_drafts(
@@ -1394,61 +1046,6 @@ pub(super) fn direct_execution_result_drafts(
     ])
 }
 
-fn reservation_identity(
-    identity: &AttemptIdentityV2,
-    causation_fact_id: FactId,
-) -> ReservationIdentityV2 {
-    ReservationIdentityV2 {
-        run_id: identity.run_id.clone(),
-        control_epoch: identity.control_epoch,
-        operation_id: identity.operation_id.clone(),
-        grant_id: identity.grant_id.clone(),
-        reservation_id: identity.reservation_id.clone(),
-        invocation_id: identity.invocation_id.clone(),
-        idempotency_key_hash: identity.idempotency_key_hash.clone(),
-        causation_fact_id,
-        correlation_set: identity.correlation_set.clone(),
-    }
-}
-
-fn observed_effect(
-    identity: EffectIdentityV2,
-    affected_resource_ids: Vec<ResourceId>,
-    evidence: EffectEvidenceV2,
-    evidence_digest: ExecutorEvidenceDigestV2,
-    cancel_request_id: Option<&CancelRequestId>,
-    deadline_observed: bool,
-) -> EffectFactV2 {
-    match (cancel_request_id, deadline_observed) {
-        (Some(cancel_request_id), true) => EffectFactV2::ObservedAfterCancelAndDeadline {
-            identity,
-            cancel_request_id: cancel_request_id.clone(),
-            affected_resource_ids,
-            evidence,
-            evidence_digest,
-        },
-        (Some(cancel_request_id), false) => EffectFactV2::ObservedAfterCancel {
-            identity,
-            cancel_request_id: cancel_request_id.clone(),
-            affected_resource_ids,
-            evidence,
-            evidence_digest,
-        },
-        (None, true) => EffectFactV2::ObservedAfterDeadline {
-            identity,
-            affected_resource_ids,
-            evidence,
-            evidence_digest,
-        },
-        (None, false) => EffectFactV2::Observed {
-            identity,
-            affected_resource_ids,
-            evidence,
-            evidence_digest,
-        },
-    }
-}
-
 fn direct_observed_effect(
     identity: ToolEffectIdentityV2,
     affected_resource_ids: Vec<ResourceId>,
@@ -1575,6 +1172,7 @@ fn resolve_mutation(
             maximum_output_bytes,
         )
         .expect("no-primary-content output is bounded");
+        let output = serde_json::to_value(output).expect("ToolOutputV4 serializes to a JSON value");
         ExecutionResolution::Completed(VerifiedExecution { output, evidence })
     } else if expected {
         ExecutionResolution::FailedAfterObservedEffect {
@@ -1994,12 +1592,10 @@ fn resolve_invocation_targets(
         | Input::GitStage { .. }
         | Input::GitUnstage { .. }
         | Input::GitCommit { .. } => {
-            return Err(PrepareFailure::Kernel(
-                KernelErrorV2::ToolExecutionUnavailable {
-                    tool_id: invocation.tool_id(),
-                    availability: ExecutionAvailabilityV4::Blocked,
-                },
-            ));
+            return Err(PrepareFailure::Kernel(invalid_field(
+                "toolId",
+                InvalidFieldViolationV2::OutOfRange,
+            )));
         }
         Input::WebSearch { .. } | Input::WebFetch { .. } => None,
     };
@@ -2034,7 +1630,7 @@ fn resolve_invocation_targets(
                 query,
                 u64::from(*limit),
             )
-            .map_err(|_| PrepareFailure::Target(TargetResolutionFailureV2::ResolverUnavailable))?;
+            .map_err(|_| PrepareFailure::Target(TargetResolutionFailure::ResolverUnavailable))?;
             let network = resolve_network_target(&url)?;
             let query_digest = query_digest_v2(&serde_json::json!({
                 "kind":"webSearch",
@@ -2084,7 +1680,7 @@ fn resolve_invocation_targets(
             ))
         }
         _ => Err(PrepareFailure::Target(
-            TargetResolutionFailureV2::ResolverUnavailable,
+            TargetResolutionFailure::ResolverUnavailable,
         )),
     }
 }
@@ -2123,25 +1719,25 @@ fn resolve_workspace_target(
         }
         (ExpectedTarget::MustAbsent(_), _) => {
             return Err(PrepareFailure::Target(
-                TargetResolutionFailureV2::AlreadyExists,
+                TargetResolutionFailure::AlreadyExists,
             ));
         }
         (_, ResourceStateV2::Absent {}) => {
-            return Err(PrepareFailure::Target(TargetResolutionFailureV2::NotFound));
+            return Err(PrepareFailure::Target(TargetResolutionFailure::NotFound));
         }
         _ => {
             return Err(PrepareFailure::Target(
-                TargetResolutionFailureV2::WrongObjectKind,
+                TargetResolutionFailure::WrongObjectKind,
             ));
         }
     };
     let state_digest = resource_state_digest_v2(&state).map_err(|_| storage_fault())?;
     let raw = canonical_target
         .to_str()
-        .ok_or_else(|| PrepareFailure::Target(TargetResolutionFailureV2::ResolverUnavailable))?;
+        .ok_or_else(|| PrepareFailure::Target(TargetResolutionFailure::ResolverUnavailable))?;
     let canonical_absolute_path_utf8 =
         normalize_canonical_platform_path_v4(workspace.platform, raw)
-            .map_err(|_| PrepareFailure::Target(TargetResolutionFailureV2::ResolverUnavailable))?;
+            .map_err(|_| PrepareFailure::Target(TargetResolutionFailure::ResolverUnavailable))?;
     let canonical_relative_path = canonical_target
         .strip_prefix(&workspace.canonical_root)
         .ok()
@@ -2177,7 +1773,7 @@ fn resolve_private_workspace_path(
             Component::CurDir if relative == "." => {}
             _ => {
                 return Err(PrepareFailure::Target(
-                    TargetResolutionFailureV2::SymlinkPolicyViolation,
+                    TargetResolutionFailure::SymlinkPolicyViolation,
                 ));
             }
         }
@@ -2185,19 +1781,19 @@ fn resolve_private_workspace_path(
     let mut existing = candidate.as_path();
     let mut suffix = Vec::new();
     while !existing.exists() {
-        let name = existing.file_name().ok_or_else(|| {
-            PrepareFailure::Target(TargetResolutionFailureV2::ResolverUnavailable)
-        })?;
+        let name = existing
+            .file_name()
+            .ok_or_else(|| PrepareFailure::Target(TargetResolutionFailure::ResolverUnavailable))?;
         suffix.push(name.to_os_string());
-        existing = existing.parent().ok_or_else(|| {
-            PrepareFailure::Target(TargetResolutionFailureV2::ResolverUnavailable)
-        })?;
+        existing = existing
+            .parent()
+            .ok_or_else(|| PrepareFailure::Target(TargetResolutionFailure::ResolverUnavailable))?;
     }
     let mut resolved = fs::canonicalize(existing)
-        .map_err(|_| PrepareFailure::Target(TargetResolutionFailureV2::ResolverUnavailable))?;
+        .map_err(|_| PrepareFailure::Target(TargetResolutionFailure::ResolverUnavailable))?;
     if !resolved.starts_with(canonical_root) {
         return Err(PrepareFailure::Target(
-            TargetResolutionFailureV2::SymlinkPolicyViolation,
+            TargetResolutionFailure::SymlinkPolicyViolation,
         ));
     }
     for part in suffix.iter().rev() {
@@ -2205,10 +1801,10 @@ fn resolve_private_workspace_path(
     }
     if candidate.exists() {
         resolved = fs::canonicalize(&candidate)
-            .map_err(|_| PrepareFailure::Target(TargetResolutionFailureV2::ResolverUnavailable))?;
+            .map_err(|_| PrepareFailure::Target(TargetResolutionFailure::ResolverUnavailable))?;
         if !resolved.starts_with(canonical_root) {
             return Err(PrepareFailure::Target(
-                TargetResolutionFailureV2::SymlinkPolicyViolation,
+                TargetResolutionFailure::SymlinkPolicyViolation,
             ));
         }
     }
@@ -2233,7 +1829,7 @@ pub(super) fn canonicalize_requested_workspace_path(
             }
         })
         .ok_or(PrepareFailure::Target(
-            TargetResolutionFailureV2::ResolverUnavailable,
+            TargetResolutionFailure::ResolverUnavailable,
         ))
 }
 
@@ -2245,13 +1841,13 @@ fn resource_state_for_path(path: &Path) -> Result<ResourceStateV2, PrepareFailur
         }
         Err(_) => {
             return Err(PrepareFailure::Target(
-                TargetResolutionFailureV2::ResolverUnavailable,
+                TargetResolutionFailure::ResolverUnavailable,
             ));
         }
     };
     if metadata.is_file() {
         let bytes = fs::read(path)
-            .map_err(|_| PrepareFailure::Target(TargetResolutionFailureV2::ResolverUnavailable))?;
+            .map_err(|_| PrepareFailure::Target(TargetResolutionFailure::ResolverUnavailable))?;
         return Ok(ResourceStateV2::File {
             content_digest: content_digest_v2(&bytes),
             byte_length: bytes.len() as u64,
@@ -2267,7 +1863,7 @@ fn resource_state_for_path(path: &Path) -> Result<ResourceStateV2, PrepareFailur
         });
     }
     Err(PrepareFailure::Target(
-        TargetResolutionFailureV2::WrongObjectKind,
+        TargetResolutionFailure::WrongObjectKind,
     ))
 }
 
@@ -2278,18 +1874,18 @@ fn collect_path_entries(root: &Path) -> Result<Vec<PathEntryV4>, PrepareFailure>
         entries: &mut Vec<PathEntryV4>,
     ) -> Result<(), PrepareFailure> {
         let mut children = fs::read_dir(current)
-            .map_err(|_| PrepareFailure::Target(TargetResolutionFailureV2::ResolverUnavailable))?
+            .map_err(|_| PrepareFailure::Target(TargetResolutionFailure::ResolverUnavailable))?
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| PrepareFailure::Target(TargetResolutionFailureV2::ResolverUnavailable))?;
+            .map_err(|_| PrepareFailure::Target(TargetResolutionFailure::ResolverUnavailable))?;
         children.sort_by_key(|entry| entry.file_name());
         for child in children {
             let path = child.path();
             let metadata = fs::symlink_metadata(&path).map_err(|_| {
-                PrepareFailure::Target(TargetResolutionFailureV2::ResolverUnavailable)
+                PrepareFailure::Target(TargetResolutionFailure::ResolverUnavailable)
             })?;
             if metadata.file_type().is_symlink() {
                 return Err(PrepareFailure::Target(
-                    TargetResolutionFailureV2::SymlinkPolicyViolation,
+                    TargetResolutionFailure::SymlinkPolicyViolation,
                 ));
             }
             let relative = path
@@ -2297,7 +1893,7 @@ fn collect_path_entries(root: &Path) -> Result<Vec<PathEntryV4>, PrepareFailure>
                 .ok()
                 .and_then(Path::to_str)
                 .ok_or_else(|| {
-                    PrepareFailure::Target(TargetResolutionFailureV2::ResolverUnavailable)
+                    PrepareFailure::Target(TargetResolutionFailure::ResolverUnavailable)
                 })?
                 .replace('\\', "/");
             let (kind, size) = if metadata.is_dir() {
@@ -2357,7 +1953,7 @@ pub(super) fn canonicalize_network_scope_url(
     url: &str,
 ) -> Result<(String, NetworkTargetObservationDigestV2), PrepareFailure> {
     let parsed = crate::network_policy::validate_http_url_shape(url)
-        .map_err(|_| PrepareFailure::Target(TargetResolutionFailureV2::NetworkTargetRejected))?;
+        .map_err(|_| PrepareFailure::Target(TargetResolutionFailure::NetworkTargetRejected))?;
     let canonical_url = parsed.to_string();
     let resolved = resolve_network_target(&canonical_url)?;
     Ok((canonical_url, resolved.target_digest))
@@ -2365,7 +1961,7 @@ pub(super) fn canonicalize_network_scope_url(
 
 fn resolve_network_target(url: &str) -> Result<ResolvedNetwork, PrepareFailure> {
     let parsed = crate::network_policy::validate_http_url_shape(url)
-        .map_err(|_| PrepareFailure::Target(TargetResolutionFailureV2::NetworkTargetRejected))?;
+        .map_err(|_| PrepareFailure::Target(TargetResolutionFailure::NetworkTargetRejected))?;
     if parsed.fragment().is_some()
         || !parsed.username().is_empty()
         || parsed.password().is_some()
@@ -2374,18 +1970,18 @@ fn resolve_network_target(url: &str) -> Result<ResolvedNetwork, PrepareFailure> 
             .is_some_and(|host| host.is_ascii() && !host.ends_with('.'))
     {
         return Err(PrepareFailure::Target(
-            TargetResolutionFailureV2::NetworkTargetRejected,
+            TargetResolutionFailure::NetworkTargetRejected,
         ));
     }
     let reviewed = review_http_target(url)
-        .map_err(|_| PrepareFailure::Target(TargetResolutionFailureV2::NetworkTargetRejected))?;
+        .map_err(|_| PrepareFailure::Target(TargetResolutionFailure::NetworkTargetRejected))?;
     if reviewed
         .resolved_addresses
         .iter()
         .any(|address| denied_network_address(address.ip()))
     {
         return Err(PrepareFailure::Target(
-            TargetResolutionFailureV2::NetworkTargetRejected,
+            TargetResolutionFailure::NetworkTargetRejected,
         ));
     }
     let request_target = materialize_request_target(&parsed)?;
@@ -2398,7 +1994,7 @@ fn resolve_network_target(url: &str) -> Result<ResolvedNetwork, PrepareFailure> 
     reviewed_addresses.dedup();
     if reviewed_addresses.is_empty() {
         return Err(PrepareFailure::Target(
-            TargetResolutionFailureV2::ResolverUnavailable,
+            TargetResolutionFailure::ResolverUnavailable,
         ));
     }
     let target_digest = network_target_digest_v2(&serde_json::json!({
@@ -2430,14 +2026,14 @@ fn materialize_request_target(
         "https" => NetworkSchemeV2::Https,
         _ => {
             return Err(PrepareFailure::Target(
-                TargetResolutionFailureV2::NetworkTargetRejected,
+                TargetResolutionFailure::NetworkTargetRejected,
             ));
         }
     };
     let host_text = parsed
         .host_str()
         .ok_or(PrepareFailure::Target(
-            TargetResolutionFailureV2::NetworkTargetRejected,
+            TargetResolutionFailure::NetworkTargetRejected,
         ))?
         .to_ascii_lowercase();
     let host = if let Ok(address) = host_text.parse::<Ipv4Addr>() {
@@ -2463,7 +2059,7 @@ fn materialize_request_target(
             })
         {
             return Err(PrepareFailure::Target(
-                TargetResolutionFailureV2::NetworkTargetRejected,
+                TargetResolutionFailure::NetworkTargetRejected,
             ));
         }
         NetworkHostV2::DnsName { labels }
@@ -2474,7 +2070,7 @@ fn materialize_request_target(
         port: parsed
             .port_or_known_default()
             .ok_or(PrepareFailure::Target(
-                TargetResolutionFailureV2::NetworkTargetRejected,
+                TargetResolutionFailure::NetworkTargetRejected,
             ))?,
         path_utf8: if parsed.path().is_empty() {
             "/".to_owned()
@@ -2567,146 +2163,6 @@ fn in_prefix_u128(value: u128, network: u128, prefix: u32) -> bool {
     value & mask == network & mask
 }
 
-pub(super) fn policy_auto_issuable(
-    mode: AutonomyModeV2,
-    tool_id: AuthorityToolIdV4,
-    risk: ToolRiskV4,
-    effect_scope: EffectScopeV4,
-) -> bool {
-    let low = risk == ToolRiskV4::Low;
-    let trusted = low
-        || (risk == ToolRiskV4::Medium
-            && matches!(
-                effect_scope,
-                EffectScopeV4::WorkspaceRead | EffectScopeV4::WorkspaceWrite
-            ));
-    match mode {
-        AutonomyModeV2::Strict => low,
-        AutonomyModeV2::TrustedWorkspace => trusted,
-        AutonomyModeV2::Maximum => {
-            trusted
-                || matches!(
-                    tool_id,
-                    AuthorityToolIdV4::FsRename
-                        | AuthorityToolIdV4::GitStage
-                        | AuthorityToolIdV4::GitUnstage
-                )
-        }
-    }
-}
-
-pub(super) enum SubmissionDisposition {
-    Fresh,
-    Retry,
-    Replay(InvocationSubmissionReplyV2),
-    Reject(AdmissionRejectionV2),
-}
-
-pub(super) fn classify_submission_binding(
-    state: &AuthorityState,
-    run_id: &RunId,
-    operation_id: &OperationId,
-    idempotency_key_hash: &IdempotencyKeyHashV2,
-    submitted: &InvocationSubmissionDigestV2,
-) -> AuthorityResult<SubmissionDisposition> {
-    let operation = state
-        .operation_bindings
-        .get(&(run_id.clone(), operation_id.clone()));
-    let idempotency = state
-        .idempotency_bindings
-        .get(&(run_id.clone(), idempotency_key_hash.clone()));
-    match (operation, idempotency) {
-        (None, None) => Ok(SubmissionDisposition::Fresh),
-        (Some(operation), Some(idempotency)) => {
-            if operation != idempotency {
-                return Err(corrupt_store());
-            }
-            if operation.digest == *submitted {
-                if operation.retryable_rejection {
-                    Ok(SubmissionDisposition::Retry)
-                } else {
-                    Ok(SubmissionDisposition::Replay(operation.reply.clone()))
-                }
-            } else {
-                Ok(SubmissionDisposition::Reject(
-                    AdmissionRejectionV2::DuplicateOperationDigestMismatch {
-                        conflict: OperationIdempotencyConflictV2::Both {
-                            operation_existing: operation.digest.clone(),
-                            idempotency_existing: idempotency.digest.clone(),
-                        },
-                        submitted: submitted.clone(),
-                    },
-                ))
-            }
-        }
-        (Some(operation), None) if operation.digest == *submitted => Ok(
-            SubmissionDisposition::Reject(AdmissionRejectionV2::OperationIdempotencyPairMismatch {
-                known: PairKnownSideV2::Operation,
-            }),
-        ),
-        (None, Some(idempotency)) if idempotency.digest == *submitted => Ok(
-            SubmissionDisposition::Reject(AdmissionRejectionV2::OperationIdempotencyPairMismatch {
-                known: PairKnownSideV2::Idempotency,
-            }),
-        ),
-        (Some(operation), None) => Ok(SubmissionDisposition::Reject(
-            AdmissionRejectionV2::DuplicateOperationDigestMismatch {
-                conflict: OperationIdempotencyConflictV2::Operation {
-                    existing: operation.digest.clone(),
-                },
-                submitted: submitted.clone(),
-            },
-        )),
-        (None, Some(idempotency)) => Ok(SubmissionDisposition::Reject(
-            AdmissionRejectionV2::DuplicateOperationDigestMismatch {
-                conflict: OperationIdempotencyConflictV2::Idempotency {
-                    existing: idempotency.digest.clone(),
-                },
-                submitted: submitted.clone(),
-            },
-        )),
-    }
-}
-
-pub(super) fn grant_decision_key(
-    run_id: &RunId,
-    operation_id: &OperationId,
-    control_epoch: ControlEpoch,
-    authorization_digest: &AuthorizationRequestDigestV2,
-    basis: &GrantDecisionBasisV2,
-) -> AuthorityResult<String> {
-    serde_json::to_string(&(
-        run_id,
-        operation_id,
-        control_epoch,
-        authorization_digest,
-        basis,
-    ))
-    .map_err(|_| corrupt_store())
-}
-
-pub(super) fn canonical_grant_request(
-    request: &GrantRequestV2,
-    prepared: &PreparedGrantRequest,
-    contract: &ToolContractV4,
-) -> CanonicalGrantRequestV2 {
-    CanonicalGrantRequestV2 {
-        run_id: request.run_id.clone(),
-        operation_id: request.operation_id.clone(),
-        control_epoch: request.control_epoch,
-        idempotency_key_hash: prepared.idempotency_key_hash.clone(),
-        canonical_invocation: prepared.canonical_invocation.clone(),
-        local_tool_contract_digest: contract.contract_digest.clone(),
-        resource_scope: prepared.resource_scope.clone(),
-        effect_scope: contract.effect_scope,
-        risk: contract.risk,
-        effective_deadline_ms: prepared.effective_deadline_ms,
-        workspace_binding_digest: prepared.workspace_binding_digest.clone(),
-        authorization_request_digest: prepared.authorization_digest.clone(),
-        correlation_refs: prepared.correlations.refs.clone(),
-    }
-}
-
 pub(super) fn command_receipt_draft(
     fact_id: FactId,
     run_id: RunId,
@@ -2731,200 +2187,6 @@ pub(super) fn command_receipt_draft(
             result,
         }),
     )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(super) fn grant_decision_drafts(
-    command_fact_id: FactId,
-    business_fact_id: FactId,
-    request_id: CommandRequestId,
-    request_digest: CommandRequestDigestV2,
-    request: GrantRequestV2,
-    prepared: PreparedGrantRequest,
-    contract: &ToolContractV4,
-    decision_digest: GrantDecisionDigestV2,
-    basis: GrantDecisionBasisV2,
-    reply: GrantDecisionReplyV2,
-) -> Vec<KernelFactDraftV2> {
-    let business = match &reply {
-        GrantDecisionReplyV2::Issued { grant_id, .. } => {
-            KernelFactPayloadV2::Grant(GrantFactV2::Issued {
-                identity: GrantIssuedIdentityV2 {
-                    run_id: request.run_id.clone(),
-                    grant_epoch: request.control_epoch,
-                    issuance_operation_id: request.operation_id.clone(),
-                    grant_id: grant_id.clone(),
-                    causation_fact_id: command_fact_id.clone(),
-                    correlation_set: prepared.correlations.clone(),
-                },
-                tool_id: contract.tool_id,
-                issuance_authorization_digest: prepared.authorization_digest,
-                grant_decision_digest: decision_digest,
-                grant_scope_digest: prepared.grant_scope_digest,
-                resource_scope: prepared.resource_scope,
-                effect_scope: contract.effect_scope,
-                risk: contract.risk,
-                use_policy: GrantUsePolicyV2::UnboundedWithinEpoch,
-                decision_basis: basis,
-            })
-        }
-        GrantDecisionReplyV2::Denied { .. } => KernelFactPayloadV2::Grant(GrantFactV2::Denied {
-            identity: GrantDeniedIdentityV2 {
-                run_id: request.run_id.clone(),
-                control_epoch: request.control_epoch,
-                operation_id: request.operation_id,
-                causation_fact_id: command_fact_id.clone(),
-                correlation_set: prepared.correlations,
-            },
-            tool_id: contract.tool_id,
-            authorization_request_digest: prepared.authorization_digest,
-            grant_decision_digest: decision_digest,
-            reason_code: GrantDenialReasonV2::UserDenied,
-            decision_basis: basis,
-        }),
-        GrantDecisionReplyV2::RequiresUserDecision { .. } => {
-            unreachable!("requires-user decisions have no business fact")
-        }
-    };
-    vec![
-        command_receipt_draft(
-            command_fact_id,
-            request.run_id,
-            exact_epoch(request.control_epoch),
-            request_id,
-            request_digest,
-            MutationCommandKindV2::GrantDecisionSubmit,
-            MutationCommandResultV2::GrantDecision { reply },
-        ),
-        fact_draft(business_fact_id, business),
-    ]
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(super) fn invocation_rejection_drafts(
-    command_fact_id: FactId,
-    rejection_fact_id: FactId,
-    request_id: CommandRequestId,
-    request_digest: CommandRequestDigestV2,
-    request: &GrantRequestV2,
-    current_epoch: ControlEpoch,
-    tool_id: AuthorityToolIdV4,
-    submission_digest: InvocationSubmissionDigestV2,
-    rejection: AdmissionRejectionV2,
-    reply: InvocationSubmissionReplyV2,
-) -> AuthorityResult<Vec<KernelFactDraftV2>> {
-    Ok(vec![
-        command_receipt_draft(
-            command_fact_id.clone(),
-            request.run_id.clone(),
-            exact_epoch(current_epoch),
-            request_id,
-            request_digest,
-            MutationCommandKindV2::InvocationSubmit,
-            MutationCommandResultV2::InvocationSubmission { reply },
-        ),
-        fact_draft(
-            rejection_fact_id,
-            KernelFactPayloadV2::Invocation(InvocationFactV2::Rejected {
-                identity: InvocationRejectedIdentityV2 {
-                    run_id: request.run_id.clone(),
-                    current_control_epoch: current_epoch,
-                    operation_id: request.operation_id.clone(),
-                    idempotency_key_hash: idempotency_key_hash_v2(
-                        &request.run_id,
-                        &request.idempotency_key,
-                    )
-                    .map_err(|_| corrupt_store())?,
-                    causation_fact_id: command_fact_id,
-                    correlation_set: CorrelationSetV2::materialize(
-                        request.correlation_refs.clone(),
-                    )
-                    .map_err(|_| corrupt_store())?,
-                },
-                tool_id,
-                submission_digest,
-                rejection,
-            }),
-        ),
-    ])
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(super) fn invocation_admission_drafts(
-    command_fact_id: FactId,
-    admitted_fact_id: FactId,
-    reserved_fact_id: FactId,
-    attempt_fact_id: FactId,
-    resource_fact_ids: Vec<FactId>,
-    request_id: CommandRequestId,
-    request_digest: CommandRequestDigestV2,
-    prepared: &PreparedGrantRequest,
-    grant: &GrantRecord,
-    contract: &ToolContractV4,
-    submission_digest: InvocationSubmissionDigestV2,
-    invocation_digest: InvocationRequestDigestV2,
-    identity: &AttemptIdentityV2,
-    targets: &[(ResourceId, ResolvedTarget)],
-    reply: InvocationSubmissionReplyV2,
-) -> Vec<KernelFactDraftV2> {
-    let mut drafts = vec![
-        command_receipt_draft(
-            command_fact_id.clone(),
-            identity.run_id.clone(),
-            exact_epoch(identity.control_epoch),
-            request_id,
-            request_digest,
-            MutationCommandKindV2::InvocationSubmit,
-            MutationCommandResultV2::InvocationSubmission { reply },
-        ),
-        fact_draft(
-            admitted_fact_id.clone(),
-            KernelFactPayloadV2::Invocation(InvocationFactV2::Admitted {
-                identity: caused_attempt(identity, command_fact_id),
-                tool_id: contract.tool_id,
-                submission_digest,
-                invocation_digest,
-                grant_scope_digest: grant.grant_scope_digest.clone(),
-                grant_issuance_authorization_digest: grant.issuance_authorization_digest.clone(),
-                tool_contract_digest: contract.contract_digest.clone(),
-                workspace_binding_digest: prepared.workspace_binding_digest.clone(),
-                effective_deadline_ms: prepared.effective_deadline_ms,
-            }),
-        ),
-        fact_draft(
-            reserved_fact_id.clone(),
-            KernelFactPayloadV2::Grant(GrantFactV2::Reserved {
-                identity: reservation_identity(identity, admitted_fact_id),
-            }),
-        ),
-        fact_draft(
-            attempt_fact_id.clone(),
-            KernelFactPayloadV2::Invocation(InvocationFactV2::AttemptPrepared {
-                identity: caused_attempt(identity, reserved_fact_id),
-            }),
-        ),
-    ];
-    drafts.extend(resource_fact_ids.into_iter().zip(targets).map(
-        |(fact_id, (resource_id, target))| {
-            fact_draft(
-                fact_id,
-                KernelFactPayloadV2::Resource(ResourceFactV2::ResolvedForInvocation {
-                    identity: ResourceResolvedIdentityV2 {
-                        run_id: identity.run_id.clone(),
-                        control_epoch: identity.control_epoch,
-                        operation_id: identity.operation_id.clone(),
-                        invocation_id: identity.invocation_id.clone(),
-                        resource_id: resource_id.clone(),
-                        idempotency_key_hash: identity.idempotency_key_hash.clone(),
-                        causation_fact_id: attempt_fact_id.clone(),
-                        correlation_set: identity.correlation_set.clone(),
-                    },
-                    resource: target.public_resource.clone(),
-                }),
-            )
-        },
-    ));
-    drafts
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3016,56 +2278,40 @@ pub(super) fn direct_tool_intent_continuation_drafts(
         ),
         fact_draft(
             admitted_fact_id.clone(),
-            KernelFactPayloadV2::Invocation(
-                InvocationFactV2::ToolIntentAdmitted {
-                    identity: caused_direct_attempt(
-                        identity,
-                        authorization_fact_id,
-                    ),
-                    tool_id,
-                    canonical_arguments_digest,
-                    tool_contract_digest,
-                    resource_scope: prepared.resource_scope.clone(),
-                    workspace_binding_digest: prepared
-                        .workspace_binding_digest
-                        .clone(),
-                    effective_deadline_ms: prepared.effective_deadline_ms,
-                },
-            ),
+            KernelFactPayloadV2::Invocation(InvocationFactV2::ToolIntentAdmitted {
+                identity: caused_direct_attempt(identity, authorization_fact_id),
+                tool_id,
+                canonical_arguments_digest,
+                tool_contract_digest,
+                resource_scope: prepared.resource_scope.clone(),
+                workspace_binding_digest: prepared.workspace_binding_digest.clone(),
+                effective_deadline_ms: prepared.effective_deadline_ms,
+            }),
         ),
         fact_draft(
             attempt_fact_id.clone(),
-            KernelFactPayloadV2::Invocation(
-                InvocationFactV2::ToolAttemptPrepared {
-                    identity: caused_direct_attempt(
-                        identity,
-                        admitted_fact_id,
-                    ),
-                },
-            ),
+            KernelFactPayloadV2::Invocation(InvocationFactV2::ToolAttemptPrepared {
+                identity: caused_direct_attempt(identity, admitted_fact_id),
+            }),
         ),
     ];
     drafts.extend(resource_fact_ids.into_iter().zip(targets).map(
         |(fact_id, (resource_id, target))| {
             fact_draft(
                 fact_id,
-                KernelFactPayloadV2::Resource(
-                    ResourceFactV2::ResolvedForInvocation {
-                        identity: ResourceResolvedIdentityV2 {
-                            run_id: identity.run_id.clone(),
-                            control_epoch: identity.control_epoch,
-                            operation_id: identity.operation_id.clone(),
-                            invocation_id: identity.invocation_id.clone(),
-                            resource_id: resource_id.clone(),
-                            idempotency_key_hash: identity
-                                .idempotency_key_hash
-                                .clone(),
-                            causation_fact_id: attempt_fact_id.clone(),
-                            correlation_set: identity.correlation_set.clone(),
-                        },
-                        resource: target.public_resource.clone(),
+                KernelFactPayloadV2::Resource(ResourceFactV2::ResolvedForInvocation {
+                    identity: ResourceResolvedIdentityV2 {
+                        run_id: identity.run_id.clone(),
+                        control_epoch: identity.control_epoch,
+                        operation_id: identity.operation_id.clone(),
+                        invocation_id: identity.invocation_id.clone(),
+                        resource_id: resource_id.clone(),
+                        idempotency_key_hash: identity.idempotency_key_hash.clone(),
+                        causation_fact_id: attempt_fact_id.clone(),
+                        correlation_set: identity.correlation_set.clone(),
                     },
-                ),
+                    resource: target.public_resource.clone(),
+                }),
             )
         },
     ));
@@ -3082,7 +2328,6 @@ pub(super) fn epoch_advance_drafts(
     new_epoch: ControlEpoch,
     command_fact_id: FactId,
     epoch_fact_id: FactId,
-    superseded: Vec<(GrantRecord, FactId)>,
     cancellation: Option<(InvocationId, CancelRequestId, FactId)>,
     reply: ControlEpochAdvancedReplyV2,
 ) -> Vec<KernelFactDraftV2> {
@@ -3110,15 +2355,6 @@ pub(super) fn epoch_advance_drafts(
             }),
         ),
     ];
-    drafts.extend(superseded.into_iter().map(|(grant, fact_id)| {
-        fact_draft(
-            fact_id,
-            KernelFactPayloadV2::Grant(GrantFactV2::Superseded {
-                identity: grant_lifecycle_identity(grant, epoch_fact_id.clone()),
-                cause: GrantSupersessionCauseV2::EpochAdvance { new_epoch },
-            }),
-        )
-    }));
     if let Some((invocation_id, cancel_request_id, fact_id)) = cancellation {
         drafts.push(fact_draft(
             fact_id,
@@ -3137,37 +2373,6 @@ pub(super) fn epoch_advance_drafts(
         ));
     }
     drafts
-}
-
-pub(super) fn grant_revocation_drafts(
-    request_id: CommandRequestId,
-    request_digest: CommandRequestDigestV2,
-    command: GrantRevokeV2,
-    current_epoch: ControlEpoch,
-    command_fact_id: FactId,
-    revocation_fact_id: FactId,
-    grant: GrantRecord,
-    reply: GrantRevokedReplyV2,
-) -> Vec<KernelFactDraftV2> {
-    vec![
-        command_receipt_draft(
-            command_fact_id.clone(),
-            command.run_id,
-            exact_epoch(current_epoch),
-            request_id,
-            request_digest,
-            MutationCommandKindV2::GrantRevoke,
-            MutationCommandResultV2::GrantRevoke { reply },
-        ),
-        fact_draft(
-            revocation_fact_id,
-            KernelFactPayloadV2::Grant(GrantFactV2::Revoked {
-                identity: grant_lifecycle_identity(grant, command_fact_id),
-                reason_code: command.reason_code,
-                reason: command.reason,
-            }),
-        ),
-    ]
 }
 
 pub(super) fn explicit_cancellation_drafts(
@@ -3210,336 +2415,6 @@ pub(super) fn explicit_cancellation_drafts(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn run_termination_drafts(
-    request_id: CommandRequestId,
-    request_digest: CommandRequestDigestV2,
-    command: RunTerminateV2,
-    current_epoch: ControlEpoch,
-    command_fact_id: FactId,
-    termination_fact_id: FactId,
-    superseded: Vec<(GrantRecord, FactId)>,
-    cancellation: Option<(InvocationId, CancelRequestId, FactId)>,
-    reply: RunTerminatedReplyV2,
-) -> Vec<KernelFactDraftV2> {
-    let mut drafts = vec![
-        command_receipt_draft(
-            command_fact_id.clone(),
-            command.run_id.clone(),
-            exact_epoch(current_epoch),
-            request_id,
-            request_digest,
-            MutationCommandKindV2::RunTerminate,
-            MutationCommandResultV2::RunTerminate { reply },
-        ),
-        fact_draft(
-            termination_fact_id.clone(),
-            KernelFactPayloadV2::Control(ControlFactV2::RunTerminated {
-                identity: TransitionIdentityV2 {
-                    run_id: command.run_id.clone(),
-                    control_epoch: current_epoch,
-                    causation_fact_id: command_fact_id,
-                },
-                reason_code: command.reason_code,
-                reason: command.reason,
-            }),
-        ),
-    ];
-    drafts.extend(
-        superseded
-            .into_iter()
-            .map(|(grant, fact_id)| KernelFactDraftV2 {
-                fact_id,
-                payload: KernelFactPayloadV2::Grant(GrantFactV2::Superseded {
-                    identity: grant_lifecycle_identity(grant, termination_fact_id.clone()),
-                    cause: GrantSupersessionCauseV2::RunTermination {
-                        terminated_at_epoch: current_epoch,
-                    },
-                }),
-            }),
-    );
-    if let Some((invocation_id, cancel_request_id, fact_id)) = cancellation {
-        drafts.push(fact_draft(
-            fact_id,
-            KernelFactPayloadV2::Control(ControlFactV2::CancellationRequested {
-                identity: CancellationIdentityV2 {
-                    run_id: command.run_id,
-                    control_epoch: current_epoch,
-                    invocation_id,
-                    cancel_request_id,
-                    causation_fact_id: termination_fact_id,
-                },
-                source: CancellationSourceV2::RunTermination,
-                reason_code: CancellationReasonCodeV2::RunTerminated,
-                reason: None,
-            }),
-        ));
-    }
-    drafts
-}
-
-fn grant_lifecycle_identity(
-    grant: GrantRecord,
-    causation_fact_id: FactId,
-) -> GrantLifecycleIdentityV2 {
-    GrantLifecycleIdentityV2 {
-        run_id: grant.run_id,
-        grant_epoch: grant.grant_epoch,
-        issuance_operation_id: grant.issuance_operation_id,
-        grant_id: grant.grant_id,
-        causation_fact_id,
-    }
-}
-
-fn apply_fact_predicate(filter: &mut FactQueryV2, predicate: &KernelFactPredicateV2) {
-    use KernelFactPredicateV2 as Predicate;
-    match predicate {
-        Predicate::Run { run_id } => filter.run_id = Some(run_id.to_string()),
-        Predicate::Operation {
-            run_id,
-            operation_id,
-        } => {
-            filter.run_id = Some(run_id.to_string());
-            filter.operation_id = Some(operation_id.to_string());
-        }
-        Predicate::Invocation {
-            run_id,
-            invocation_id,
-        } => {
-            filter.run_id = Some(run_id.to_string());
-            filter.invocation_id = Some(invocation_id.to_string());
-        }
-        Predicate::Attempt { run_id, attempt_id } => {
-            filter.run_id = Some(run_id.to_string());
-            filter.attempt_id = Some(attempt_id.to_string());
-        }
-        Predicate::Grant { run_id, grant_id } => {
-            filter.run_id = Some(run_id.to_string());
-            filter.grant_id = Some(grant_id.to_string());
-        }
-        Predicate::Reservation {
-            run_id,
-            reservation_id,
-        } => {
-            filter.run_id = Some(run_id.to_string());
-            filter.grant_reservation_id = Some(reservation_id.to_string());
-        }
-        Predicate::Resource {
-            run_id,
-            resource_id,
-        } => {
-            filter.run_id = Some(run_id.to_string());
-            filter.resource_id = Some(resource_id.to_string());
-        }
-        Predicate::Command { command_request_id } => {
-            filter.command_request_id = Some(command_request_id.to_string())
-        }
-        Predicate::Fact { fact_id } => filter.fact_id = Some(fact_id.to_string()),
-        Predicate::Causation { causation_fact_id } => {
-            filter.causation_id = Some(causation_fact_id.to_string())
-        }
-        Predicate::Idempotency {
-            run_id,
-            idempotency_key_hash,
-        } => {
-            filter.run_id = Some(run_id.to_string());
-            filter.idempotency_key_hash = Some(idempotency_key_hash.as_str().to_owned());
-        }
-        Predicate::Correlation(correlation) => {
-            let (kind, value) = correlation.sort_key();
-            filter.correlation_ref = Some((kind.to_owned(), value.to_owned()));
-        }
-    }
-}
-
-pub(super) fn fact_query(command: &KernelFactsQueryV2) -> FactQueryV2 {
-    let mut filter = FactQueryV2 {
-        after_ledger_sequence: Some(command.page.after_ledger_sequence),
-        limit: Some(command.page.limit.saturating_add(1)),
-        ..Default::default()
-    };
-    if let KernelFactFilterV2::MatchAll { predicates } = &command.filter {
-        for predicate in predicates {
-            apply_fact_predicate(&mut filter, predicate);
-        }
-    }
-    filter
-}
-
-pub(super) fn bounded_fact_page(
-    requested_after: u64,
-    high_water: u64,
-    mut facts: Vec<KernelFactEnvelopeV2>,
-    requested_limit: usize,
-) -> AuthorityResult<KernelFactPageV2> {
-    let mut has_more = facts.len() > requested_limit;
-    facts.truncate(requested_limit);
-    loop {
-        let final_sequence = facts
-            .last()
-            .map(|fact| fact.ledger_sequence)
-            .unwrap_or(requested_after);
-        let continuation = if has_more {
-            FactPageContinuationV2::More {
-                after_ledger_sequence: final_sequence,
-            }
-        } else {
-            FactPageContinuationV2::CaughtUp {
-                at_ledger_sequence: high_water,
-            }
-        };
-        let page = KernelFactPageV2 {
-            requested_after_ledger_sequence: requested_after,
-            ledger_sequence_high_water: high_water,
-            facts,
-            continuation,
-        };
-        if serde_json::to_vec(&page)
-            .map_err(|_| corrupt_store())?
-            .len()
-            <= MAX_FACT_PAGE_BYTES_V2
-        {
-            page.validate().map_err(|_| corrupt_store())?;
-            return Ok(page);
-        }
-        facts = page.facts;
-        if facts.pop().is_none() {
-            return Err(corrupt_store());
-        }
-        has_more = true;
-    }
-}
-
-fn resource_projection_reply(
-    resource: &ResourceRecord,
-    as_of_ledger_sequence: u64,
-) -> ResourceResolveReplyV2 {
-    let observation = match &resource.revalidation {
-        Some((fact_id, digest, observation)) => ResourceProjectionObservationV2::Revalidated {
-            source_fact_id: fact_id.clone(),
-            target_revalidation_digest: digest.clone(),
-            observation: observation.clone(),
-        },
-        None => ResourceProjectionObservationV2::Resolution {
-            source_fact_id: resource.resolution_fact_id.clone(),
-            observation: match &resource.resolved {
-                ResolvedResourceV2::Workspace {
-                    resolution_state_digest,
-                    ..
-                } => ResolutionObservationV2::WorkspaceState {
-                    digest: resolution_state_digest.clone(),
-                },
-                ResolvedResourceV2::NetworkQuery {
-                    query_digest,
-                    target_observation_digest,
-                    ..
-                } => ResolutionObservationV2::NetworkQuery {
-                    query_digest: query_digest.clone(),
-                    target_digest: target_observation_digest.clone(),
-                },
-                ResolvedResourceV2::NetworkEndpoint {
-                    target_observation_digest,
-                    ..
-                } => ResolutionObservationV2::NetworkTarget {
-                    digest: target_observation_digest.clone(),
-                },
-            },
-        },
-    };
-    let lifecycle = ResourceLifecycleV2::Resolved {};
-    match &resource.resolved {
-        ResolvedResourceV2::Workspace {
-            object_kind,
-            relative_path,
-            ..
-        } => ResourceResolveReplyV2::Workspace {
-            resource_id: resource.resource_id.clone(),
-            invocation_id: resource.invocation_id.clone(),
-            relative_path: relative_path.clone(),
-            object_kind: *object_kind,
-            observation,
-            lifecycle,
-            last_fact_id: resource.last_fact_id.clone(),
-            as_of_ledger_sequence,
-        },
-        ResolvedResourceV2::NetworkQuery {
-            query_digest,
-            service_origin,
-            ..
-        } => ResourceResolveReplyV2::NetworkQuery {
-            resource_id: resource.resource_id.clone(),
-            invocation_id: resource.invocation_id.clone(),
-            query_digest: query_digest.clone(),
-            service_origin: service_origin.clone(),
-            observation,
-            lifecycle,
-            last_fact_id: resource.last_fact_id.clone(),
-            as_of_ledger_sequence,
-        },
-        ResolvedResourceV2::NetworkEndpoint { origin, .. } => {
-            ResourceResolveReplyV2::NetworkEndpoint {
-                resource_id: resource.resource_id.clone(),
-                invocation_id: resource.invocation_id.clone(),
-                origin: origin.clone(),
-                observation,
-                lifecycle,
-                last_fact_id: resource.last_fact_id.clone(),
-                as_of_ledger_sequence,
-            }
-        }
-    }
-}
-
-pub(super) fn resource_resolve_reply(
-    state: &AuthorityState,
-    command: &ResourceResolveV2,
-    as_of_ledger_sequence: u64,
-) -> AuthorityResult<ResourceResolveReplyV2> {
-    let resource = state
-        .resources
-        .get(&command.resource_id)
-        .filter(|resource| resource.run_id == command.run_id)
-        .ok_or_else(|| KernelErrorV2::ResourceNotFound {
-            run_id: command.run_id.clone(),
-            resource_id: command.resource_id.clone(),
-        })?;
-    Ok(resource_projection_reply(resource, as_of_ledger_sequence))
-}
-
-pub(super) fn invocation_status_reply(
-    state: &AuthorityState,
-    run_id: &RunId,
-    invocation_id: &InvocationId,
-    ledger_sequence_high_water: u64,
-) -> AuthorityResult<InvocationStatusReplyV2> {
-    let invocation =
-        state
-            .invocations
-            .get(invocation_id)
-            .ok_or_else(|| KernelErrorV2::InvocationNotFound {
-                run_id: run_id.clone(),
-                invocation_id: invocation_id.clone(),
-            })?;
-    if &invocation.run_id != run_id {
-        return Err(KernelErrorV2::InvocationNotOwnedByRun {
-            run_id: run_id.clone(),
-            invocation_id: invocation_id.clone(),
-        });
-    }
-    Ok(InvocationStatusReplyV2 {
-        identity: InvocationStatusIdentityV2 {
-            run_id: invocation.run_id.clone(),
-            operation_id: invocation.operation_id.clone(),
-            control_epoch: invocation.control_epoch,
-            invocation_id: invocation.invocation_id.clone(),
-            attempt_id: invocation.attempt_id.clone(),
-        },
-        phase: invocation.phase,
-        stop_overlay: invocation.stop_overlay.wire(),
-        latest_fact_id: invocation.last_fact_id.clone(),
-        ledger_sequence_high_water,
-    })
-}
-
 pub(super) fn require_current_run(
     state: &AuthorityState,
     run_id: &RunId,
@@ -3558,140 +2433,14 @@ pub(super) fn require_current_run(
             current: run.epoch,
         });
     }
-    if matches!(run.lifecycle, RunLifecycle::Terminated { .. }) {
-        return Err(KernelErrorV2::RunTerminated {
-            run_id: run_id.clone(),
-            control_epoch: run.epoch,
-        });
-    }
     Ok(())
-}
-
-pub(super) fn require_input_in_epoch(
-    state: &AuthorityState,
-    run_id: &RunId,
-    epoch: ControlEpoch,
-    input_id: &InputId,
-) -> AuthorityResult<()> {
-    if state
-        .runs
-        .get(run_id)
-        .and_then(|run| run.admitted_inputs.get(input_id))
-        != Some(&epoch)
-    {
-        return Err(KernelErrorV2::InvalidRequest {
-            reason: InvalidRequestReasonV2::InvalidRelation {
-                relation: InvalidRelationV2::DecisionInputNotInEpoch,
-            },
-        });
-    }
-    Ok(())
-}
-
-pub(super) fn recovery_drafts(
-    state: &AuthorityState,
-    mut fact_id: impl FnMut() -> FactId,
-    mut effect_id: impl FnMut() -> EffectId,
-) -> AuthorityResult<Vec<KernelFactDraftV2>> {
-    let open = state
-        .invocations
-        .values()
-        .filter(|invocation| !invocation_phase_is_terminal(invocation.phase))
-        .cloned()
-        .collect::<Vec<_>>();
-    let mut drafts = Vec::new();
-    for invocation in open {
-        let identity = AttemptIdentityV2 {
-            run_id: invocation.run_id.clone(),
-            control_epoch: invocation.control_epoch,
-            operation_id: invocation.operation_id.clone(),
-            grant_id: invocation.grant_id.clone(),
-            reservation_id: invocation.reservation_id.clone(),
-            invocation_id: invocation.invocation_id.clone(),
-            attempt_id: invocation.attempt_id.clone(),
-            idempotency_key_hash: invocation.idempotency_key_hash.clone(),
-            causation_fact_id: invocation.admission_fact_id.clone(),
-            correlation_set: invocation.correlations.clone(),
-        };
-        match invocation.phase {
-            InvocationPhase::AttemptPrepared => {
-                let attempt_fact_id = invocation
-                    .attempt_prepared_fact_id
-                    .as_ref()
-                    .ok_or_else(corrupt_store)?;
-                if let Some((cancel_request_id, cancellation_fact_id, _)) =
-                    invocation.stop_overlay.cancellation()
-                {
-                    drafts.extend(pre_effect_stop_drafts(
-                        &identity,
-                        fact_id(),
-                        fact_id(),
-                        fact_id(),
-                        Some((cancel_request_id, cancellation_fact_id)),
-                    ));
-                } else if invocation.stop_overlay.deadline_observed() {
-                    drafts.extend(pre_effect_stop_drafts(
-                        &identity,
-                        fact_id(),
-                        fact_id(),
-                        fact_id(),
-                        None,
-                    ));
-                } else {
-                    drafts.extend(failed_before_effect_drafts(
-                        &identity,
-                        attempt_fact_id,
-                        fact_id(),
-                        fact_id(),
-                        PreEffectFailureCodeV2::TargetRevalidationFailed,
-                    ));
-                }
-            }
-            InvocationPhase::Executing => {
-                let execution_started_fact_id = invocation
-                    .execution_started_fact_id
-                    .as_ref()
-                    .ok_or_else(corrupt_store)?;
-                let possible_resources = state
-                    .resources
-                    .values()
-                    .filter(|resource| {
-                        resource.invocation_id == invocation.invocation_id
-                            && resource.revalidation.is_some()
-                    })
-                    .map(|resource| resource.resource_id.clone())
-                    .collect();
-                drafts.extend(execution_result_drafts(
-                    &identity,
-                    execution_started_fact_id,
-                    effect_id(),
-                    fact_id(),
-                    fact_id(),
-                    possible_resources,
-                    ExecutionResolution::Indeterminate {
-                        evidence: EffectEvidenceV2::IndeterminateReadBack {
-                            last_observation: LastObservationV2::None {},
-                        },
-                        reason_code: IndeterminateReasonV2::RecoveryEvidenceInsufficient,
-                    },
-                    invocation
-                        .stop_overlay
-                        .cancellation()
-                        .map(|(request_id, _, _)| request_id),
-                    invocation.stop_overlay.deadline_observed(),
-                )?);
-            }
-            _ => return Err(corrupt_store()),
-        }
-    }
-    Ok(drafts)
 }
 
 impl AuthorityState {
     pub(super) fn restore(facts: Vec<KernelFactEnvelopeV2>) -> AuthorityResult<Self> {
         let mut state = Self::default();
-        for envelope in facts {
-            state.apply_fact(envelope)?;
+        for fact in facts {
+            state.apply_fact(fact)?;
         }
         Ok(state)
     }
@@ -3715,12 +2464,10 @@ impl AuthorityState {
         validate_causation(self, &envelope)?;
         match &envelope.payload {
             KernelFactPayloadV2::Control(fact) => self.reduce_control(&envelope, fact)?,
-            KernelFactPayloadV2::Authorization(_) => {}
-            KernelFactPayloadV2::Grant(fact) => self.reduce_grant(&envelope, fact)?,
+            KernelFactPayloadV2::Authorization(_) | KernelFactPayloadV2::Cleanup(_) => {}
             KernelFactPayloadV2::Invocation(fact) => self.reduce_invocation(&envelope, fact)?,
             KernelFactPayloadV2::Effect(fact) => self.reduce_effect(&envelope, fact)?,
             KernelFactPayloadV2::Resource(fact) => self.reduce_resource(&envelope, fact)?,
-            KernelFactPayloadV2::Cleanup(_) => return Err(corrupt_store()),
         }
         self.facts_by_id.insert(envelope.fact_id.clone(), envelope);
         Ok(())
@@ -3752,27 +2499,7 @@ impl AuthorityState {
                     return Err(corrupt_store());
                 }
             }
-            ControlFactV2::CommandRecorded {
-                identity, result, ..
-            } => {
-                let reply = reply_from_recorded_result(result.clone());
-                if self
-                    .commands
-                    .insert(
-                        identity.command_request_identity.command_request_id.clone(),
-                        CommandReplay {
-                            digest: identity
-                                .command_request_identity
-                                .command_request_digest
-                                .clone(),
-                            reply,
-                        },
-                    )
-                    .is_some()
-                {
-                    return Err(corrupt_store());
-                }
-            }
+            ControlFactV2::CommandRecorded { .. } => {}
             ControlFactV2::EpochAdvanced {
                 identity,
                 input_id,
@@ -3786,15 +2513,13 @@ impl AuthorityState {
                         identity.run_id.clone(),
                         RunRecord {
                             epoch: identity.control_epoch,
-                            lifecycle: RunLifecycle::Active,
                             active_invocation_id: None,
                             admitted_inputs,
                         },
                     );
                 }
                 Some(run)
-                    if matches!(run.lifecycle, RunLifecycle::Active)
-                        && *previous_epoch == Some(run.epoch)
+                    if *previous_epoch == Some(run.epoch)
                         && identity.control_epoch.get() == run.epoch.get() + 1 =>
                 {
                     run.epoch = identity.control_epoch;
@@ -3806,50 +2531,21 @@ impl AuthorityState {
             ControlFactV2::CancellationRequested {
                 identity, source, ..
             } => {
-                let legacy = self.invocations.get(&identity.invocation_id);
-                let direct = self.direct_invocations.get(&identity.invocation_id);
-                let (invocation_run_id, invocation_epoch) = match (legacy, direct) {
-                    (Some(invocation), None) => {
-                        (&invocation.run_id, invocation.control_epoch)
-                    }
-                    (None, Some(invocation)) => {
-                        (&invocation.run_id, invocation.control_epoch)
-                    }
-                    _ => return Err(corrupt_store()),
-                };
+                let invocation = self
+                    .direct_invocations
+                    .get_mut(&identity.invocation_id)
+                    .ok_or_else(corrupt_store)?;
                 let epoch_matches = match source {
                     CancellationSourceV2::EpochAdvance => {
-                        identity.control_epoch > invocation_epoch
+                        identity.control_epoch > invocation.control_epoch
                     }
-                    CancellationSourceV2::ExplicitCommand
-                    | CancellationSourceV2::RunTermination => {
-                        identity.control_epoch == invocation_epoch
+                    CancellationSourceV2::ExplicitCommand => {
+                        identity.control_epoch == invocation.control_epoch
                     }
                 };
-                if &identity.run_id != invocation_run_id
+                if identity.run_id != invocation.run_id
                     || !epoch_matches
-                    || self
-                        .invocations
-                        .values()
-                        .any(|candidate| {
-                            candidate
-                                .stop_overlay
-                                .cancellation()
-                                .is_some_and(|(request_id, _, _)| {
-                                    request_id == &identity.cancel_request_id
-                                })
-                        })
-                    || self
-                        .direct_invocations
-                        .values()
-                        .any(|candidate| {
-                            candidate
-                                .stop_overlay
-                                .cancellation()
-                                .is_some_and(|(request_id, _, _)| {
-                                    request_id == &identity.cancel_request_id
-                                })
-                        })
+                    || invocation.stop_overlay.cancellation().is_some()
                     || self
                         .runs
                         .get(&identity.run_id)
@@ -3858,266 +2554,10 @@ impl AuthorityState {
                 {
                     return Err(corrupt_store());
                 }
-                let overlay = if let Some(invocation) =
-                    self.invocations.get_mut(&identity.invocation_id)
-                {
-                    &mut invocation.stop_overlay
-                } else {
-                    &mut self
-                        .direct_invocations
-                        .get_mut(&identity.invocation_id)
-                        .ok_or_else(corrupt_store)?
-                        .stop_overlay
-                };
-                if overlay.cancellation().is_some() {
-                    return Err(corrupt_store());
-                }
-                *overlay = StopOverlay::CancellationRequested {
+                invocation.stop_overlay = StopOverlay::CancellationRequested {
                     cancel_request_id: identity.cancel_request_id.clone(),
                     fact_id: envelope.fact_id.clone(),
                     ledger_sequence: envelope.ledger_sequence,
-                };
-            }
-            ControlFactV2::RunTerminated { identity, .. } => {
-                let run = self
-                    .runs
-                    .get_mut(&identity.run_id)
-                    .ok_or_else(corrupt_store)?;
-                if run.epoch != identity.control_epoch
-                    || !matches!(run.lifecycle, RunLifecycle::Active)
-                {
-                    return Err(corrupt_store());
-                }
-                run.lifecycle = RunLifecycle::Terminated {
-                    fact_id: envelope.fact_id.clone(),
-                    ledger_sequence: envelope.ledger_sequence,
-                };
-            }
-        }
-        Ok(())
-    }
-
-    fn reduce_grant(
-        &mut self,
-        envelope: &KernelFactEnvelopeV2,
-        fact: &GrantFactV2,
-    ) -> AuthorityResult<()> {
-        match fact {
-            GrantFactV2::Issued {
-                identity,
-                tool_id,
-                issuance_authorization_digest,
-                grant_decision_digest,
-                grant_scope_digest,
-                resource_scope,
-                effect_scope,
-                risk,
-                use_policy,
-                decision_basis,
-            } => {
-                let run = self.runs.get(&identity.run_id).ok_or_else(corrupt_store)?;
-                let decision_input_valid = match decision_basis {
-                    GrantDecisionBasisV2::AutomaticPolicy { .. } => true,
-                    GrantDecisionBasisV2::UserDecision { input_id, .. } => {
-                        run.admitted_inputs.get(input_id) == Some(&identity.grant_epoch)
-                    }
-                };
-                if run.epoch != identity.grant_epoch
-                    || !matches!(run.lifecycle, RunLifecycle::Active)
-                    || !decision_input_valid
-                    || *use_policy != GrantUsePolicyV2::UnboundedWithinEpoch
-                    || self.grants.contains_key(&identity.grant_id)
-                {
-                    return Err(corrupt_store());
-                }
-                let replay_key = grant_decision_key(
-                    &identity.run_id,
-                    &identity.issuance_operation_id,
-                    identity.grant_epoch,
-                    issuance_authorization_digest,
-                    decision_basis,
-                )?;
-                let replay = GrantDecisionReplay {
-                    digest: grant_decision_digest.clone(),
-                    reply: GrantDecisionReplyV2::Issued {
-                        grant_id: identity.grant_id.clone(),
-                        fact_id: envelope.fact_id.clone(),
-                        ledger_sequence: envelope.ledger_sequence,
-                    },
-                };
-                if self.grant_decisions.insert(replay_key, replay).is_some() {
-                    return Err(corrupt_store());
-                }
-                self.grants.insert(
-                    identity.grant_id.clone(),
-                    GrantRecord {
-                        run_id: identity.run_id.clone(),
-                        grant_epoch: identity.grant_epoch,
-                        issuance_operation_id: identity.issuance_operation_id.clone(),
-                        grant_id: identity.grant_id.clone(),
-                        tool_id: *tool_id,
-                        issuance_authorization_digest: issuance_authorization_digest.clone(),
-                        grant_scope_digest: grant_scope_digest.clone(),
-                        resource_scope: resource_scope.clone(),
-                        effect_scope: *effect_scope,
-                        risk: *risk,
-                        lifecycle: GrantLifecycle::Issued,
-                        use_count: 0,
-                    },
-                );
-            }
-            GrantFactV2::Denied {
-                identity,
-                authorization_request_digest,
-                grant_decision_digest,
-                decision_basis,
-                ..
-            } => {
-                let run = self.runs.get(&identity.run_id).ok_or_else(corrupt_store)?;
-                let valid_user_decision = match decision_basis {
-                    GrantDecisionBasisV2::UserDecision { input_id, .. } => {
-                        run.admitted_inputs.get(input_id) == Some(&identity.control_epoch)
-                    }
-                    GrantDecisionBasisV2::AutomaticPolicy { .. } => false,
-                };
-                if run.epoch != identity.control_epoch
-                    || !matches!(run.lifecycle, RunLifecycle::Active)
-                    || !valid_user_decision
-                {
-                    return Err(corrupt_store());
-                }
-                let replay_key = grant_decision_key(
-                    &identity.run_id,
-                    &identity.operation_id,
-                    identity.control_epoch,
-                    authorization_request_digest,
-                    decision_basis,
-                )?;
-                let replay = GrantDecisionReplay {
-                    digest: grant_decision_digest.clone(),
-                    reply: GrantDecisionReplyV2::Denied {
-                        fact_id: envelope.fact_id.clone(),
-                        ledger_sequence: envelope.ledger_sequence,
-                    },
-                };
-                if self.grant_decisions.insert(replay_key, replay).is_some() {
-                    return Err(corrupt_store());
-                }
-            }
-            GrantFactV2::Reserved { identity } => {
-                let invocation = self
-                    .invocations
-                    .get(&identity.invocation_id)
-                    .ok_or_else(corrupt_store)?;
-                if !reservation_identity_matches_invocation(identity, invocation)
-                    || self.reservations.contains_key(&identity.reservation_id)
-                {
-                    return Err(corrupt_store());
-                }
-                self.reservations.insert(
-                    identity.reservation_id.clone(),
-                    ReservationRecord {
-                        consumed: false,
-                        released: false,
-                    },
-                );
-            }
-            GrantFactV2::Consumed {
-                identity,
-                use_count,
-                target_revalidation_set_digest,
-            } => {
-                let invocation = self
-                    .invocations
-                    .get(&identity.invocation_id)
-                    .ok_or_else(corrupt_store)?;
-                if !attempt_identity_matches_invocation(identity, invocation)
-                    || invocation.phase != InvocationPhase::AttemptPrepared
-                    || expected_revalidation_set_digest(self, invocation)?
-                        != *target_revalidation_set_digest
-                {
-                    return Err(corrupt_store());
-                }
-                let reservation = self
-                    .reservations
-                    .get_mut(&identity.reservation_id)
-                    .ok_or_else(corrupt_store)?;
-                let grant = self
-                    .grants
-                    .get_mut(&identity.grant_id)
-                    .ok_or_else(corrupt_store)?;
-                if reservation.consumed || reservation.released || *use_count != grant.use_count + 1
-                {
-                    return Err(corrupt_store());
-                }
-                reservation.consumed = true;
-                grant.use_count = *use_count;
-            }
-            GrantFactV2::ReservationReleased {
-                identity,
-                reason_code,
-            } => {
-                let invocation = self
-                    .invocations
-                    .get(&identity.invocation_id)
-                    .ok_or_else(corrupt_store)?;
-                let reason_matches = matches!(
-                    (reason_code, &invocation.phase),
-                    (
-                        ReservationReleaseReasonV2::FailedBeforeEffect,
-                        InvocationPhase::FailedBeforeEffect
-                    ) | (
-                        ReservationReleaseReasonV2::CancelledBeforeEffect,
-                        InvocationPhase::CancelledBeforeEffect
-                    ) | (
-                        ReservationReleaseReasonV2::TimedOutBeforeEffect,
-                        InvocationPhase::TimedOutBeforeEffect
-                    )
-                );
-                if !reservation_identity_matches_invocation(identity, invocation) || !reason_matches
-                {
-                    return Err(corrupt_store());
-                }
-                let reservation = self
-                    .reservations
-                    .get_mut(&identity.reservation_id)
-                    .ok_or_else(corrupt_store)?;
-                if reservation.consumed || reservation.released {
-                    return Err(corrupt_store());
-                }
-                reservation.released = true;
-            }
-            GrantFactV2::Revoked { identity, .. } => {
-                let grant = self
-                    .grants
-                    .get_mut(&identity.grant_id)
-                    .ok_or_else(corrupt_store)?;
-                if !grant_lifecycle_identity_matches(identity, grant)
-                    || !matches!(grant.lifecycle, GrantLifecycle::Issued)
-                {
-                    return Err(corrupt_store());
-                }
-                grant.lifecycle = GrantLifecycle::Revoked {
-                    fact_id: envelope.fact_id.clone(),
-                    ledger_sequence: envelope.ledger_sequence,
-                };
-            }
-            GrantFactV2::Superseded {
-                identity, cause, ..
-            } => {
-                let grant = self
-                    .grants
-                    .get_mut(&identity.grant_id)
-                    .ok_or_else(corrupt_store)?;
-                if !grant_lifecycle_identity_matches(identity, grant)
-                    || !matches!(grant.lifecycle, GrantLifecycle::Issued)
-                {
-                    return Err(corrupt_store());
-                }
-                grant.lifecycle = GrantLifecycle::Superseded {
-                    fact_id: envelope.fact_id.clone(),
-                    ledger_sequence: envelope.ledger_sequence,
-                    cause: cause.clone(),
                 };
             }
         }
@@ -4141,11 +2581,11 @@ impl AuthorityState {
                 let run = self.runs.get(&identity.run_id).ok_or_else(corrupt_store)?;
                 let legacy_tool_id = legacy_tool_id(tool_id).ok_or_else(corrupt_store)?;
                 if run.epoch != identity.control_epoch
-                    || !matches!(run.lifecycle, RunLifecycle::Active)
                     || run.active_invocation_id.is_some()
                     || *effective_deadline_ms == 0
-                    || self.invocations.contains_key(&identity.invocation_id)
-                    || self.direct_invocations.contains_key(&identity.invocation_id)
+                    || self
+                        .direct_invocations
+                        .contains_key(&identity.invocation_id)
                     || self
                         .direct_invocations
                         .values()
@@ -4162,7 +2602,7 @@ impl AuthorityState {
                     if !identity.correlation_set.refs.iter().any(|reference| {
                         matches!(
                             reference,
-                            deepcode_kernel_abi::v2::CorrelationRefV2::PlanAction { value }
+                            CorrelationRefV2::PlanAction { value }
                                 if value == plan_action_id.as_str()
                         )
                     }) || lease.scope_digest.as_str().is_empty()
@@ -4180,7 +2620,6 @@ impl AuthorityState {
                         invocation_id: identity.invocation_id.clone(),
                         attempt_id: identity.attempt_id.clone(),
                         idempotency_key_hash: identity.idempotency_key_hash.clone(),
-                        tool_id: tool_id.clone(),
                         legacy_tool_id,
                         resource_scope: resource_scope.clone(),
                         workspace_binding_digest: workspace_binding_digest.clone(),
@@ -4291,13 +2730,12 @@ impl AuthorityState {
                 invocation.deadline_observed_fact_id = Some(envelope.fact_id.clone());
                 invocation.last_fact_id = envelope.fact_id.clone();
             }
-            InvocationFactV2::ToolFailedBeforeEffect { identity, .. } => {
-                self.set_direct_attempt_terminal(
+            InvocationFactV2::ToolFailedBeforeEffect { identity, .. } => self
+                .set_direct_attempt_terminal(
                     identity,
                     InvocationPhase::FailedBeforeEffect,
                     envelope.fact_id.clone(),
-                )?
-            }
+                )?,
             InvocationFactV2::ToolCancelledBeforeEffect {
                 identity,
                 cancel_request_id,
@@ -4320,13 +2758,12 @@ impl AuthorityState {
                     envelope.fact_id.clone(),
                 )?
             }
-            InvocationFactV2::ToolTimedOutBeforeEffect { identity } => {
-                self.set_direct_attempt_terminal(
+            InvocationFactV2::ToolTimedOutBeforeEffect { identity } => self
+                .set_direct_attempt_terminal(
                     identity,
                     InvocationPhase::TimedOutBeforeEffect,
                     envelope.fact_id.clone(),
-                )?
-            }
+                )?,
             InvocationFactV2::ToolCompleted { identity, output } => {
                 validate_direct_completed_output(self, identity, output)?;
                 self.set_direct_observed_terminal(
@@ -4335,13 +2772,12 @@ impl AuthorityState {
                     envelope.fact_id.clone(),
                 )?
             }
-            InvocationFactV2::ToolFailedAfterObservedEffect { identity, .. } => {
-                self.set_direct_observed_terminal(
+            InvocationFactV2::ToolFailedAfterObservedEffect { identity, .. } => self
+                .set_direct_observed_terminal(
                     identity,
                     InvocationPhase::FailedAfterObservedEffect,
                     envelope.fact_id.clone(),
-                )?
-            }
+                )?,
             InvocationFactV2::ToolIndeterminate {
                 identity,
                 reason_code,
@@ -4353,378 +2789,7 @@ impl AuthorityState {
                     envelope.fact_id.clone(),
                 )?
             }
-            InvocationFactV2::Admitted {
-                identity,
-                tool_id,
-                submission_digest,
-                invocation_digest: _,
-                grant_scope_digest,
-                grant_issuance_authorization_digest,
-                tool_contract_digest: _,
-                workspace_binding_digest,
-                effective_deadline_ms,
-            } => {
-                let run = self.runs.get(&identity.run_id).ok_or_else(corrupt_store)?;
-                let grant = self
-                    .grants
-                    .get(&identity.grant_id)
-                    .ok_or_else(corrupt_store)?;
-                if run.epoch != identity.control_epoch
-                    || !matches!(run.lifecycle, RunLifecycle::Active)
-                    || run.active_invocation_id.is_some()
-                    || grant.run_id != identity.run_id
-                    || grant.grant_epoch != identity.control_epoch
-                    || !matches!(grant.lifecycle, GrantLifecycle::Issued)
-                    || grant.tool_id != *tool_id
-                    || grant.grant_scope_digest != *grant_scope_digest
-                    || grant.issuance_authorization_digest != *grant_issuance_authorization_digest
-                    || *effective_deadline_ms == 0
-                    || self.invocations.contains_key(&identity.invocation_id)
-                    || self.invocations.values().any(|candidate| {
-                        candidate.attempt_id == identity.attempt_id
-                            || candidate.reservation_id == identity.reservation_id
-                    })
-                {
-                    return Err(corrupt_store());
-                }
-                let reply = submission_reply_from_cause(self, &identity.causation_fact_id)?;
-                self.apply_submission_binding(
-                    &identity.run_id,
-                    &identity.operation_id,
-                    &identity.idempotency_key_hash,
-                    submission_digest,
-                    reply,
-                    false,
-                )?;
-                self.invocations.insert(
-                    identity.invocation_id.clone(),
-                    InvocationRecord {
-                        run_id: identity.run_id.clone(),
-                        operation_id: identity.operation_id.clone(),
-                        control_epoch: identity.control_epoch,
-                        grant_id: identity.grant_id.clone(),
-                        reservation_id: identity.reservation_id.clone(),
-                        invocation_id: identity.invocation_id.clone(),
-                        attempt_id: identity.attempt_id.clone(),
-                        idempotency_key_hash: identity.idempotency_key_hash.clone(),
-                        tool_id: *tool_id,
-                        workspace_binding_digest: workspace_binding_digest.clone(),
-                        correlations: identity.correlation_set.clone(),
-                        phase: InvocationPhase::AttemptPrepared,
-                        stop_overlay: StopOverlay::None,
-                        admission_fact_id: envelope.fact_id.clone(),
-                        attempt_prepared_fact_id: None,
-                        execution_started_fact_id: None,
-                        cancellation_observed_fact_id: None,
-                        deadline_observed_fact_id: None,
-                        last_fact_id: envelope.fact_id.clone(),
-                    },
-                );
-                let run = self
-                    .runs
-                    .get_mut(&identity.run_id)
-                    .ok_or_else(corrupt_store)?;
-                run.active_invocation_id = Some(identity.invocation_id.clone());
-            }
-            InvocationFactV2::Rejected {
-                identity,
-                tool_id,
-                submission_digest,
-                rejection,
-            } => {
-                let run = self.runs.get(&identity.run_id).ok_or_else(corrupt_store)?;
-                let rejection_valid = match rejection {
-                    AdmissionRejectionV2::ToolExecutionUnavailable {
-                        tool_id: rejected_tool,
-                        availability,
-                    } => {
-                        rejected_tool == tool_id
-                            && *availability == ExecutionAvailabilityV4::Blocked
-                    }
-                    AdmissionRejectionV2::StaleControlEpoch { current, .. } => {
-                        *current == identity.current_control_epoch
-                    }
-                    AdmissionRejectionV2::RunBusy {
-                        active_invocation_id,
-                        retry_after_ms,
-                    } => {
-                        *retry_after_ms == 100
-                            && run.active_invocation_id.as_ref() == Some(active_invocation_id)
-                    }
-                    AdmissionRejectionV2::CapacityExceeded {
-                        maximum_active_runs,
-                        retry_after_ms,
-                    } => *maximum_active_runs == 4 && *retry_after_ms == 100,
-                    AdmissionRejectionV2::RunTerminated {} => {
-                        matches!(run.lifecycle, RunLifecycle::Terminated { .. })
-                    }
-                    _ => true,
-                };
-                if run.epoch != identity.current_control_epoch || !rejection_valid {
-                    return Err(corrupt_store());
-                }
-                if !matches!(
-                    rejection,
-                    AdmissionRejectionV2::DuplicateOperationDigestMismatch { .. }
-                        | AdmissionRejectionV2::OperationIdempotencyPairMismatch { .. }
-                ) {
-                    let reply = submission_reply_from_cause(self, &identity.causation_fact_id)?;
-                    self.apply_submission_binding(
-                        &identity.run_id,
-                        &identity.operation_id,
-                        &identity.idempotency_key_hash,
-                        submission_digest,
-                        reply,
-                        matches!(
-                            rejection,
-                            AdmissionRejectionV2::RunBusy { .. }
-                                | AdmissionRejectionV2::CapacityExceeded { .. }
-                        ),
-                    )?;
-                }
-            }
-            InvocationFactV2::AttemptPrepared { identity } => {
-                let invocation = self
-                    .invocations
-                    .get_mut(&identity.invocation_id)
-                    .ok_or_else(corrupt_store)?;
-                if !attempt_identity_matches_invocation(identity, invocation)
-                    || invocation.phase != InvocationPhase::AttemptPrepared
-                    || invocation.attempt_prepared_fact_id.is_some()
-                {
-                    return Err(corrupt_store());
-                }
-                invocation.attempt_prepared_fact_id = Some(envelope.fact_id.clone());
-                invocation.last_fact_id = envelope.fact_id.clone();
-            }
-            InvocationFactV2::ExecutionStarted {
-                identity,
-                target_revalidation_set_digest,
-            } => {
-                let expected_digest = {
-                    let invocation = self
-                        .invocations
-                        .get(&identity.invocation_id)
-                        .ok_or_else(corrupt_store)?;
-                    expected_revalidation_set_digest(self, invocation)?
-                };
-                let invocation = self
-                    .invocations
-                    .get_mut(&identity.invocation_id)
-                    .ok_or_else(corrupt_store)?;
-                if !attempt_identity_matches_invocation(identity, invocation)
-                    || invocation.phase != InvocationPhase::AttemptPrepared
-                    || expected_digest != *target_revalidation_set_digest
-                {
-                    return Err(corrupt_store());
-                }
-                invocation.phase = InvocationPhase::Executing;
-                invocation.execution_started_fact_id = Some(envelope.fact_id.clone());
-                invocation.last_fact_id = envelope.fact_id.clone();
-            }
-            InvocationFactV2::CancellationObserved {
-                identity,
-                cancel_request_id,
-            } => {
-                let invocation = self
-                    .invocations
-                    .get_mut(&identity.invocation_id)
-                    .ok_or_else(corrupt_store)?;
-                if !attempt_identity_matches_invocation(identity, invocation)
-                    || invocation_phase_is_terminal(invocation.phase)
-                    || invocation.cancellation_observed_fact_id.is_some()
-                    || invocation
-                        .stop_overlay
-                        .cancellation()
-                        .map(|(request_id, _, _)| request_id)
-                        != Some(cancel_request_id)
-                {
-                    return Err(corrupt_store());
-                }
-                invocation.cancellation_observed_fact_id = Some(envelope.fact_id.clone());
-                invocation.last_fact_id = envelope.fact_id.clone();
-            }
-            InvocationFactV2::DeadlineObserved { identity } => {
-                let invocation = self
-                    .invocations
-                    .get_mut(&identity.invocation_id)
-                    .ok_or_else(corrupt_store)?;
-                if !attempt_identity_matches_invocation(identity, invocation)
-                    || invocation_phase_is_terminal(invocation.phase)
-                    || invocation.deadline_observed_fact_id.is_some()
-                {
-                    return Err(corrupt_store());
-                }
-                invocation.stop_overlay = match invocation.stop_overlay.clone() {
-                    StopOverlay::None => StopOverlay::DeadlineObserved {
-                        fact_id: envelope.fact_id.clone(),
-                    },
-                    StopOverlay::CancellationRequested {
-                        cancel_request_id,
-                        fact_id,
-                        ledger_sequence,
-                    } => StopOverlay::CancellationAndDeadline {
-                        cancel_request_id,
-                        cancellation_fact_id: fact_id,
-                        cancellation_ledger_sequence: ledger_sequence,
-                        deadline_fact_id: envelope.fact_id.clone(),
-                    },
-                    _ => return Err(corrupt_store()),
-                };
-                invocation.deadline_observed_fact_id = Some(envelope.fact_id.clone());
-                invocation.last_fact_id = envelope.fact_id.clone();
-            }
-            InvocationFactV2::FailedBeforeEffect { identity, .. } => self.set_attempt_terminal(
-                identity,
-                InvocationPhase::FailedBeforeEffect,
-                envelope.fact_id.clone(),
-            )?,
-            InvocationFactV2::CancelledBeforeEffect {
-                identity,
-                cancel_request_id,
-            } => {
-                let invocation = self
-                    .invocations
-                    .get(&identity.invocation_id)
-                    .ok_or_else(corrupt_store)?;
-                if invocation
-                    .stop_overlay
-                    .cancellation()
-                    .map(|(request_id, _, _)| request_id)
-                    != Some(cancel_request_id)
-                {
-                    return Err(corrupt_store());
-                }
-                self.set_attempt_terminal(
-                    identity,
-                    InvocationPhase::CancelledBeforeEffect,
-                    envelope.fact_id.clone(),
-                )?
-            }
-            InvocationFactV2::TimedOutBeforeEffect { identity } => self.set_attempt_terminal(
-                identity,
-                InvocationPhase::TimedOutBeforeEffect,
-                envelope.fact_id.clone(),
-            )?,
-            InvocationFactV2::Completed { identity, output } => {
-                validate_completed_output(self, identity, output)?;
-                self.set_observed_terminal(
-                    identity,
-                    InvocationPhase::Completed,
-                    envelope.fact_id.clone(),
-                )?
-            }
-            InvocationFactV2::FailedAfterObservedEffect { identity, .. } => self
-                .set_observed_terminal(
-                    identity,
-                    InvocationPhase::FailedAfterObservedEffect,
-                    envelope.fact_id.clone(),
-                )?,
-            InvocationFactV2::Indeterminate {
-                identity,
-                reason_code,
-            } => {
-                validate_indeterminate_pair(self, identity, reason_code)?;
-                self.set_observed_terminal(
-                    identity,
-                    InvocationPhase::Indeterminate,
-                    envelope.fact_id.clone(),
-                )?
-            }
         }
-        Ok(())
-    }
-
-    fn apply_submission_binding(
-        &mut self,
-        run_id: &RunId,
-        operation_id: &OperationId,
-        idempotency_key_hash: &IdempotencyKeyHashV2,
-        digest: &InvocationSubmissionDigestV2,
-        reply: InvocationSubmissionReplyV2,
-        retryable_rejection: bool,
-    ) -> AuthorityResult<()> {
-        let operation_key = (run_id.clone(), operation_id.clone());
-        let idempotency_key = (run_id.clone(), idempotency_key_hash.clone());
-        let previous_operation = self.operation_bindings.get(&operation_key);
-        let previous_idempotency = self.idempotency_bindings.get(&idempotency_key);
-        match (previous_operation, previous_idempotency) {
-            (None, None) => {}
-            (Some(operation), Some(idempotency))
-                if operation == idempotency
-                    && operation.digest == *digest
-                    && operation.retryable_rejection => {}
-            _ => return Err(corrupt_store()),
-        }
-        let binding = SubmissionBinding {
-            digest: digest.clone(),
-            reply,
-            retryable_rejection,
-        };
-        self.operation_bindings
-            .insert(operation_key, binding.clone());
-        self.idempotency_bindings.insert(idempotency_key, binding);
-        Ok(())
-    }
-
-    fn set_attempt_terminal(
-        &mut self,
-        identity: &AttemptIdentityV2,
-        phase: InvocationPhase,
-        fact_id: FactId,
-    ) -> AuthorityResult<()> {
-        let invocation = self
-            .invocations
-            .get_mut(&identity.invocation_id)
-            .ok_or_else(corrupt_store)?;
-        if !attempt_identity_matches_invocation(identity, invocation)
-            || invocation.phase != InvocationPhase::AttemptPrepared
-        {
-            return Err(corrupt_store());
-        }
-        invocation.phase = phase;
-        invocation.last_fact_id = fact_id;
-        let run = self
-            .runs
-            .get_mut(&identity.run_id)
-            .ok_or_else(corrupt_store)?;
-        if run.active_invocation_id.as_ref() != Some(&identity.invocation_id) {
-            return Err(corrupt_store());
-        }
-        run.active_invocation_id = None;
-        Ok(())
-    }
-
-    fn set_observed_terminal(
-        &mut self,
-        identity: &ObservedTerminalIdentityV2,
-        phase: InvocationPhase,
-        fact_id: FactId,
-    ) -> AuthorityResult<()> {
-        let invocation = self
-            .invocations
-            .get_mut(&identity.invocation_id)
-            .ok_or_else(corrupt_store)?;
-        if !observed_identity_matches_invocation(identity, invocation)
-            || invocation.phase != InvocationPhase::Executing
-            || self.invocation_effects.get(&identity.invocation_id)
-                != Some(&(
-                    identity.effect_id.clone(),
-                    identity.causation_fact_id.clone(),
-                ))
-        {
-            return Err(corrupt_store());
-        }
-        invocation.phase = phase;
-        invocation.last_fact_id = fact_id;
-        let run = self
-            .runs
-            .get_mut(&identity.run_id)
-            .ok_or_else(corrupt_store)?;
-        if run.active_invocation_id.as_ref() != Some(&identity.invocation_id) {
-            return Err(corrupt_store());
-        }
-        run.active_invocation_id = None;
         Ok(())
     }
 
@@ -4794,26 +2859,8 @@ impl AuthorityState {
         envelope: &KernelFactEnvelopeV2,
         fact: &EffectFactV2,
     ) -> AuthorityResult<()> {
-        if let Some(identity) = direct_effect_identity(fact) {
-            validate_direct_effect(self, fact)?;
-            if self
-                .invocation_effects
-                .values()
-                .any(|(effect_id, _)| effect_id == &identity.effect_id)
-                || self
-                    .invocation_effects
-                    .contains_key(&identity.invocation_id)
-            {
-                return Err(corrupt_store());
-            }
-            self.invocation_effects.insert(
-                identity.invocation_id.clone(),
-                (identity.effect_id.clone(), envelope.fact_id.clone()),
-            );
-            return Ok(());
-        }
-        validate_effect(self, fact)?;
-        let identity = effect_identity(fact);
+        validate_direct_effect(self, fact)?;
+        let identity = direct_effect_identity(fact);
         if self
             .invocation_effects
             .values()
@@ -4838,28 +2885,12 @@ impl AuthorityState {
     ) -> AuthorityResult<()> {
         match fact {
             ResourceFactV2::ResolvedForInvocation { identity, resource } => {
-                let (identity_matches, scope) =
-                    if let Some(invocation) = self.invocations.get(&identity.invocation_id) {
-                        let grant = self
-                            .grants
-                            .get(&invocation.grant_id)
-                            .ok_or_else(corrupt_store)?;
-                        (
-                            resolved_identity_matches_invocation(identity, invocation),
-                            &grant.resource_scope,
-                        )
-                    } else if let Some(invocation) =
-                        self.direct_invocations.get(&identity.invocation_id)
-                    {
-                        (
-                            direct_resolved_identity_matches_invocation(identity, invocation),
-                            &invocation.resource_scope,
-                        )
-                    } else {
-                        return Err(corrupt_store());
-                    };
-                if !identity_matches
-                    || !resource_matches_scope(resource, scope)
+                let invocation = self
+                    .direct_invocations
+                    .get(&identity.invocation_id)
+                    .ok_or_else(corrupt_store)?;
+                if !direct_resolved_identity_matches_invocation(identity, invocation)
+                    || !resource_matches_scope(resource, &invocation.resource_scope)
                     || self.resources.contains_key(&identity.resource_id)
                     || self.resources.values().any(|existing| {
                         existing.invocation_id == identity.invocation_id
@@ -4890,26 +2921,13 @@ impl AuthorityState {
                     .resources
                     .get_mut(&identity.resource_id)
                     .ok_or_else(corrupt_store)?;
-                let identity_matches =
-                    if let Some(invocation) = self.invocations.get(&identity.invocation_id) {
-                        resource_attempt_identity_matches_invocation(
-                            identity,
-                            invocation,
-                            resource,
-                        )
-                    } else if let Some(invocation) =
-                        self.direct_invocations.get(&identity.invocation_id)
-                    {
-                        direct_resource_attempt_identity_matches_invocation(
-                            identity,
-                            invocation,
-                            resource,
-                        )
-                    } else {
-                        return Err(corrupt_store());
-                    };
-                if !identity_matches
-                    || resource.revalidation.is_some()
+                let invocation = self
+                    .direct_invocations
+                    .get(&identity.invocation_id)
+                    .ok_or_else(corrupt_store)?;
+                if !direct_resource_attempt_identity_matches_invocation(
+                    identity, invocation, resource,
+                ) || resource.revalidation.is_some()
                 {
                     return Err(corrupt_store());
                 }
@@ -4920,27 +2938,9 @@ impl AuthorityState {
                 ));
                 resource.last_fact_id = envelope.fact_id.clone();
             }
-            ResourceFactV2::Acquired { .. } | ResourceFactV2::Released { .. } => {
-                return Err(corrupt_store());
-            }
         }
         Ok(())
     }
-}
-
-fn attempt_identity_matches_invocation(
-    identity: &AttemptIdentityV2,
-    invocation: &InvocationRecord,
-) -> bool {
-    identity.run_id == invocation.run_id
-        && identity.control_epoch == invocation.control_epoch
-        && identity.operation_id == invocation.operation_id
-        && identity.grant_id == invocation.grant_id
-        && identity.reservation_id == invocation.reservation_id
-        && identity.invocation_id == invocation.invocation_id
-        && identity.attempt_id == invocation.attempt_id
-        && identity.idempotency_key_hash == invocation.idempotency_key_hash
-        && identity.correlation_set == invocation.correlations
 }
 
 fn direct_attempt_identity_matches(
@@ -4951,35 +2951,6 @@ fn direct_attempt_identity_matches(
         && identity.control_epoch == invocation.control_epoch
         && identity.operation_id == invocation.operation_id
         && identity.authority == invocation.authority
-        && identity.invocation_id == invocation.invocation_id
-        && identity.attempt_id == invocation.attempt_id
-        && identity.idempotency_key_hash == invocation.idempotency_key_hash
-        && identity.correlation_set == invocation.correlations
-}
-
-fn reservation_identity_matches_invocation(
-    identity: &ReservationIdentityV2,
-    invocation: &InvocationRecord,
-) -> bool {
-    identity.run_id == invocation.run_id
-        && identity.control_epoch == invocation.control_epoch
-        && identity.operation_id == invocation.operation_id
-        && identity.grant_id == invocation.grant_id
-        && identity.reservation_id == invocation.reservation_id
-        && identity.invocation_id == invocation.invocation_id
-        && identity.idempotency_key_hash == invocation.idempotency_key_hash
-        && identity.correlation_set == invocation.correlations
-}
-
-fn observed_identity_matches_invocation(
-    identity: &ObservedTerminalIdentityV2,
-    invocation: &InvocationRecord,
-) -> bool {
-    identity.run_id == invocation.run_id
-        && identity.control_epoch == invocation.control_epoch
-        && identity.operation_id == invocation.operation_id
-        && identity.grant_id == invocation.grant_id
-        && identity.reservation_id == invocation.reservation_id
         && identity.invocation_id == invocation.invocation_id
         && identity.attempt_id == invocation.attempt_id
         && identity.idempotency_key_hash == invocation.idempotency_key_hash
@@ -5000,20 +2971,6 @@ fn direct_observed_identity_matches(
         && identity.correlation_set == invocation.correlations
 }
 
-fn effect_identity_matches_invocation(
-    identity: &EffectIdentityV2,
-    invocation: &InvocationRecord,
-) -> bool {
-    identity.run_id == invocation.run_id
-        && identity.control_epoch == invocation.control_epoch
-        && identity.operation_id == invocation.operation_id
-        && identity.grant_id == invocation.grant_id
-        && identity.reservation_id == invocation.reservation_id
-        && identity.invocation_id == invocation.invocation_id
-        && identity.attempt_id == invocation.attempt_id
-        && identity.idempotency_key_hash == invocation.idempotency_key_hash
-}
-
 fn direct_effect_identity_matches_invocation(
     identity: &ToolEffectIdentityV2,
     invocation: &DirectInvocationRecord,
@@ -5027,28 +2984,6 @@ fn direct_effect_identity_matches_invocation(
         && identity.idempotency_key_hash == invocation.idempotency_key_hash
 }
 
-fn grant_lifecycle_identity_matches(
-    identity: &GrantLifecycleIdentityV2,
-    grant: &GrantRecord,
-) -> bool {
-    identity.run_id == grant.run_id
-        && identity.grant_epoch == grant.grant_epoch
-        && identity.issuance_operation_id == grant.issuance_operation_id
-        && identity.grant_id == grant.grant_id
-}
-
-fn resolved_identity_matches_invocation(
-    identity: &ResourceResolvedIdentityV2,
-    invocation: &InvocationRecord,
-) -> bool {
-    identity.run_id == invocation.run_id
-        && identity.control_epoch == invocation.control_epoch
-        && identity.operation_id == invocation.operation_id
-        && identity.invocation_id == invocation.invocation_id
-        && identity.idempotency_key_hash == invocation.idempotency_key_hash
-        && identity.correlation_set == invocation.correlations
-}
-
 fn direct_resolved_identity_matches_invocation(
     identity: &ResourceResolvedIdentityV2,
     invocation: &DirectInvocationRecord,
@@ -5057,23 +2992,6 @@ fn direct_resolved_identity_matches_invocation(
         && identity.control_epoch == invocation.control_epoch
         && identity.operation_id == invocation.operation_id
         && identity.invocation_id == invocation.invocation_id
-        && identity.idempotency_key_hash == invocation.idempotency_key_hash
-        && identity.correlation_set == invocation.correlations
-}
-
-fn resource_attempt_identity_matches_invocation(
-    identity: &ResourceAttemptIdentityV2,
-    invocation: &InvocationRecord,
-    resource: &ResourceRecord,
-) -> bool {
-    identity.run_id == invocation.run_id
-        && identity.control_epoch == invocation.control_epoch
-        && identity.operation_id == invocation.operation_id
-        && identity.invocation_id == invocation.invocation_id
-        && identity.attempt_id == invocation.attempt_id
-        && identity.resource_id == resource.resource_id
-        && resource.run_id == invocation.run_id
-        && resource.invocation_id == invocation.invocation_id
         && identity.idempotency_key_hash == invocation.idempotency_key_hash
         && identity.correlation_set == invocation.correlations
 }
@@ -5153,52 +3071,6 @@ fn expected_resource_count(scope: &ResourceScopeV2) -> AuthorityResult<usize> {
     }
 }
 
-fn expected_revalidation_set_digest(
-    state: &AuthorityState,
-    invocation: &InvocationRecord,
-) -> AuthorityResult<TargetRevalidationSetDigestV2> {
-    let grant = state
-        .grants
-        .get(&invocation.grant_id)
-        .ok_or_else(corrupt_store)?;
-    let mut resources = state
-        .resources
-        .values()
-        .filter(|resource| resource.invocation_id == invocation.invocation_id)
-        .collect::<Vec<_>>();
-    if resources.len() != expected_resource_count(&grant.resource_scope)?
-        || resources
-            .iter()
-            .any(|resource| resource.revalidation.is_none())
-    {
-        return Err(corrupt_store());
-    }
-    resources.sort_by(|left, right| {
-        left.resource_id
-            .as_str()
-            .as_bytes()
-            .cmp(right.resource_id.as_str().as_bytes())
-    });
-    let entries = resources
-        .iter()
-        .map(|resource| {
-            let (fact_id, digest, _) = resource
-                .revalidation
-                .as_ref()
-                .expect("checked revalidation");
-            (&resource.resource_id, fact_id, digest)
-        })
-        .collect::<Vec<_>>();
-    target_revalidation_set_digest_v2(
-        &invocation.run_id,
-        &invocation.operation_id,
-        &invocation.invocation_id,
-        &invocation.attempt_id,
-        &entries,
-    )
-    .map_err(|_| corrupt_store())
-}
-
 fn expected_direct_revalidation_set_digest(
     state: &AuthorityState,
     invocation: &DirectInvocationRecord,
@@ -5247,131 +3119,6 @@ enum EffectModeRef<'a> {
     AfterDeadline,
     AfterCancelAndDeadline(&'a CancelRequestId),
     Indeterminate,
-}
-
-fn validate_effect(state: &AuthorityState, fact: &EffectFactV2) -> AuthorityResult<()> {
-    let (identity, resources, evidence, evidence_digest, mode) = match fact {
-        EffectFactV2::Observed {
-            identity,
-            affected_resource_ids,
-            evidence,
-            evidence_digest,
-        } => (
-            identity,
-            affected_resource_ids,
-            evidence,
-            evidence_digest,
-            EffectModeRef::Observed,
-        ),
-        EffectFactV2::ObservedAfterCancel {
-            identity,
-            cancel_request_id,
-            affected_resource_ids,
-            evidence,
-            evidence_digest,
-        } => (
-            identity,
-            affected_resource_ids,
-            evidence,
-            evidence_digest,
-            EffectModeRef::AfterCancel(cancel_request_id),
-        ),
-        EffectFactV2::ObservedAfterDeadline {
-            identity,
-            affected_resource_ids,
-            evidence,
-            evidence_digest,
-        } => (
-            identity,
-            affected_resource_ids,
-            evidence,
-            evidence_digest,
-            EffectModeRef::AfterDeadline,
-        ),
-        EffectFactV2::ObservedAfterCancelAndDeadline {
-            identity,
-            cancel_request_id,
-            affected_resource_ids,
-            evidence,
-            evidence_digest,
-        } => (
-            identity,
-            affected_resource_ids,
-            evidence,
-            evidence_digest,
-            EffectModeRef::AfterCancelAndDeadline(cancel_request_id),
-        ),
-        EffectFactV2::Indeterminate {
-            identity,
-            possible_affected_resource_ids,
-            evidence,
-            evidence_digest,
-            ..
-        } => (
-            identity,
-            possible_affected_resource_ids,
-            evidence,
-            evidence_digest,
-            EffectModeRef::Indeterminate,
-        ),
-        EffectFactV2::ToolObserved { .. }
-        | EffectFactV2::ToolObservedAfterCancel { .. }
-        | EffectFactV2::ToolObservedAfterDeadline { .. }
-        | EffectFactV2::ToolObservedAfterCancelAndDeadline { .. }
-        | EffectFactV2::ToolIndeterminate { .. } => return Err(corrupt_store()),
-    };
-    let invocation = state
-        .invocations
-        .get(&identity.invocation_id)
-        .ok_or_else(corrupt_store)?;
-    let mut expected_resources = state
-        .resources
-        .values()
-        .filter(|resource| resource.invocation_id == identity.invocation_id)
-        .map(|resource| resource.resource_id.clone())
-        .collect::<Vec<_>>();
-    expected_resources
-        .sort_by(|left, right| left.as_str().as_bytes().cmp(right.as_str().as_bytes()));
-    let observed_cancel = invocation
-        .stop_overlay
-        .cancellation()
-        .map(|(request_id, _, _)| request_id);
-    let stop_matches = match mode {
-        EffectModeRef::Observed => {
-            invocation.cancellation_observed_fact_id.is_none()
-                && invocation.deadline_observed_fact_id.is_none()
-        }
-        EffectModeRef::AfterCancel(cancel_request_id) => {
-            invocation.cancellation_observed_fact_id.is_some()
-                && invocation.deadline_observed_fact_id.is_none()
-                && observed_cancel == Some(cancel_request_id)
-        }
-        EffectModeRef::AfterDeadline => {
-            invocation.cancellation_observed_fact_id.is_none()
-                && invocation.deadline_observed_fact_id.is_some()
-        }
-        EffectModeRef::AfterCancelAndDeadline(cancel_request_id) => {
-            invocation.cancellation_observed_fact_id.is_some()
-                && invocation.deadline_observed_fact_id.is_some()
-                && observed_cancel == Some(cancel_request_id)
-        }
-        EffectModeRef::Indeterminate => true,
-    };
-    let evidence_matches = match mode {
-        EffectModeRef::Indeterminate => indeterminate_evidence_legal(invocation.tool_id, evidence),
-        _ => observed_evidence_legal(invocation.tool_id, evidence),
-    };
-    if invocation.phase != InvocationPhase::Executing
-        || !effect_identity_matches_invocation(identity, invocation)
-        || resources != &expected_resources
-        || !stop_matches
-        || !evidence_matches
-        || executor_evidence_digest_v2(evidence).map_err(|_| corrupt_store())? != *evidence_digest
-    {
-        return Err(corrupt_store());
-    }
-    expected_revalidation_set_digest(state, invocation)?;
-    Ok(())
 }
 
 fn validate_direct_effect(state: &AuthorityState, fact: &EffectFactV2) -> AuthorityResult<()> {
@@ -5439,7 +3186,6 @@ fn validate_direct_effect(state: &AuthorityState, fact: &EffectFactV2) -> Author
             evidence_digest,
             EffectModeRef::Indeterminate,
         ),
-        _ => return Err(corrupt_store()),
     };
     let invocation = state
         .direct_invocations
@@ -5557,86 +3303,23 @@ fn indeterminate_evidence_legal(tool_id: AuthorityToolIdV4, evidence: &EffectEvi
     }
 }
 
-fn effect_identity(fact: &EffectFactV2) -> &EffectIdentityV2 {
-    match fact {
-        EffectFactV2::Observed { identity, .. }
-        | EffectFactV2::ObservedAfterCancel { identity, .. }
-        | EffectFactV2::ObservedAfterDeadline { identity, .. }
-        | EffectFactV2::ObservedAfterCancelAndDeadline { identity, .. }
-        | EffectFactV2::Indeterminate { identity, .. } => identity,
-        EffectFactV2::ToolObserved { .. }
-        | EffectFactV2::ToolObservedAfterCancel { .. }
-        | EffectFactV2::ToolObservedAfterDeadline { .. }
-        | EffectFactV2::ToolObservedAfterCancelAndDeadline { .. }
-        | EffectFactV2::ToolIndeterminate { .. } => {
-            unreachable!("direct effects are handled before legacy identity projection")
-        }
-    }
-}
-
-fn direct_effect_identity(fact: &EffectFactV2) -> Option<&ToolEffectIdentityV2> {
+fn direct_effect_identity(fact: &EffectFactV2) -> &ToolEffectIdentityV2 {
     match fact {
         EffectFactV2::ToolObserved { identity, .. }
         | EffectFactV2::ToolObservedAfterCancel { identity, .. }
         | EffectFactV2::ToolObservedAfterDeadline { identity, .. }
         | EffectFactV2::ToolObservedAfterCancelAndDeadline { identity, .. }
-        | EffectFactV2::ToolIndeterminate { identity, .. } => Some(identity),
-        _ => None,
-    }
-}
-
-fn validate_completed_output(
-    state: &AuthorityState,
-    identity: &ObservedTerminalIdentityV2,
-    output: &ToolOutputV4,
-) -> AuthorityResult<()> {
-    let evidence = match state
-        .facts_by_id
-        .get(&identity.causation_fact_id)
-        .map(|fact| &fact.payload)
-    {
-        Some(KernelFactPayloadV2::Effect(
-            EffectFactV2::Observed { evidence, .. }
-            | EffectFactV2::ObservedAfterCancel { evidence, .. }
-            | EffectFactV2::ObservedAfterDeadline { evidence, .. }
-            | EffectFactV2::ObservedAfterCancelAndDeadline { evidence, .. },
-        )) => evidence,
-        _ => return Err(corrupt_store()),
-    };
-    if matches!(
-        evidence,
-        EffectEvidenceV2::SearchMatchesReadBack { output_digest, .. }
-            | EffectEvidenceV2::WebSearchReadBack { output_digest, .. }
-            if output_digest != &output.full_digest
-    ) {
-        return Err(corrupt_store());
-    }
-    Ok(())
-}
-
-fn validate_indeterminate_pair(
-    state: &AuthorityState,
-    identity: &ObservedTerminalIdentityV2,
-    reason_code: &IndeterminateReasonV2,
-) -> AuthorityResult<()> {
-    match state
-        .facts_by_id
-        .get(&identity.causation_fact_id)
-        .map(|fact| &fact.payload)
-    {
-        Some(KernelFactPayloadV2::Effect(EffectFactV2::Indeterminate {
-            reason_code: effect_reason,
-            ..
-        })) if effect_reason == reason_code => Ok(()),
-        _ => Err(corrupt_store()),
+        | EffectFactV2::ToolIndeterminate { identity, .. } => identity,
     }
 }
 
 fn validate_direct_completed_output(
     state: &AuthorityState,
     identity: &ToolObservedTerminalIdentityV2,
-    output: &ToolOutputV4,
+    output: &serde_json::Value,
 ) -> AuthorityResult<()> {
+    let output =
+        serde_json::from_value::<ToolOutputV4>(output.clone()).map_err(|_| corrupt_store())?;
     let evidence = match state
         .facts_by_id
         .get(&identity.causation_fact_id)
@@ -5679,59 +3362,15 @@ fn validate_direct_indeterminate_pair(
     }
 }
 
-fn submission_reply_from_cause(
-    state: &AuthorityState,
-    causation_fact_id: &FactId,
-) -> AuthorityResult<InvocationSubmissionReplyV2> {
-    match state
-        .facts_by_id
-        .get(causation_fact_id)
-        .map(|fact| &fact.payload)
-    {
-        Some(KernelFactPayloadV2::Control(ControlFactV2::CommandRecorded {
-            command_kind: MutationCommandKindV2::InvocationSubmit,
-            result: MutationCommandResultV2::InvocationSubmission { reply },
-            ..
-        })) => Ok(reply.clone()),
-        _ => Err(corrupt_store()),
-    }
-}
-
-fn reply_from_recorded_result(result: MutationCommandResultV2) -> KernelReplyV2 {
-    match result {
-        MutationCommandResultV2::ToolIntentSubmission { reply } => {
-            KernelReplyV2::ToolIntentSubmission(reply)
-        }
-        MutationCommandResultV2::EpochAdvance { reply } => {
-            KernelReplyV2::ControlEpochAdvanced(reply)
-        }
-        MutationCommandResultV2::GrantDecision { reply } => {
-            KernelReplyV2::GrantDecisionRecorded(reply)
-        }
-        MutationCommandResultV2::GrantRevoke { reply } => KernelReplyV2::GrantRevoked(reply),
-        MutationCommandResultV2::InvocationSubmission { reply } => {
-            KernelReplyV2::InvocationSubmission(reply)
-        }
-        MutationCommandResultV2::InvocationCancel { reply } => {
-            KernelReplyV2::InvocationCancelResult(reply)
-        }
-        MutationCommandResultV2::RunTerminate { reply } => KernelReplyV2::RunTerminated(reply),
-        MutationCommandResultV2::RecordedSemanticError { error } => {
-            KernelReplyV2::Error(recorded_error_to_error(error))
-        }
-    }
-}
-
 pub(super) fn recorded_error_to_error(error: RecordedCommandErrorV2) -> KernelErrorV2 {
-    use RecordedCommandErrorV2 as Recorded;
     match error {
-        Recorded::ControlEpochAlreadyExists { run_id, current } => {
+        RecordedCommandErrorV2::ControlEpochAlreadyExists { run_id, current } => {
             KernelErrorV2::ControlEpochAlreadyExists { run_id, current }
         }
-        Recorded::ControlEpochExhausted { run_id, current } => {
+        RecordedCommandErrorV2::ControlEpochExhausted { run_id, current } => {
             KernelErrorV2::ControlEpochExhausted { run_id, current }
         }
-        Recorded::StaleControlEpoch {
+        RecordedCommandErrorV2::StaleControlEpoch {
             run_id,
             submitted,
             current,
@@ -5740,41 +3379,14 @@ pub(super) fn recorded_error_to_error(error: RecordedCommandErrorV2) -> KernelEr
             submitted,
             current,
         },
-        Recorded::RunTerminated {
-            run_id,
-            control_epoch,
-        } => KernelErrorV2::RunTerminated {
-            run_id,
-            control_epoch,
-        },
-        Recorded::ToolExecutionUnavailable {
-            tool_id,
-            availability,
-        } => KernelErrorV2::ToolExecutionUnavailable {
-            tool_id,
-            availability,
-        },
-        Recorded::GrantNotFound { run_id } => KernelErrorV2::GrantNotFound { run_id },
-        Recorded::AuthorizationDigestMismatch { expected, actual } => {
-            KernelErrorV2::AuthorizationDigestMismatch { expected, actual }
-        }
-        Recorded::DuplicateGrantDecisionDigestMismatch {
-            authorization_request_digest,
-            existing,
-            submitted,
-        } => KernelErrorV2::DuplicateGrantDecisionDigestMismatch {
-            authorization_request_digest,
-            existing,
-            submitted,
-        },
-        Recorded::InvocationNotFound {
+        RecordedCommandErrorV2::InvocationNotFound {
             run_id,
             invocation_id,
         } => KernelErrorV2::InvocationNotFound {
             run_id,
             invocation_id,
         },
-        Recorded::InvocationNotOwnedByRun {
+        RecordedCommandErrorV2::InvocationNotOwnedByRun {
             run_id,
             invocation_id,
         } => KernelErrorV2::InvocationNotOwnedByRun {
@@ -5789,13 +3401,14 @@ fn validate_causation(
     envelope: &KernelFactEnvelopeV2,
 ) -> AuthorityResult<()> {
     let Some(causation_id) = envelope.payload.causation_fact_id() else {
-        if matches!(
+        return if matches!(
             envelope.payload,
             KernelFactPayloadV2::Control(ControlFactV2::CommandRecorded { .. })
         ) {
-            return Ok(());
-        }
-        return Err(corrupt_store());
+            Ok(())
+        } else {
+            Err(corrupt_store())
+        };
     };
     let predecessor = state
         .facts_by_id
@@ -6029,109 +3642,15 @@ fn authorization_resolution_edge_matches(
 
 fn edge_kind_matches(predecessor: &KernelFactPayloadV2, current: &KernelFactPayloadV2) -> bool {
     match current {
-        KernelFactPayloadV2::Control(ControlFactV2::RunOpened {
-            control_epoch,
-            ..
-        }) => matches!(
+        KernelFactPayloadV2::Control(ControlFactV2::RunOpened { control_epoch, .. }) => matches!(
             predecessor,
             KernelFactPayloadV2::Control(ControlFactV2::EpochAdvanced {
                 identity,
                 ..
             }) if identity.control_epoch == *control_epoch
         ),
-        KernelFactPayloadV2::Authorization(
-            deepcode_kernel_abi::v2::AuthorizationFactV2::ScopePreviewed { .. },
-        ) => matches!(
-            predecessor,
-            KernelFactPayloadV2::Control(ControlFactV2::EpochAdvanced { .. })
-                | KernelFactPayloadV2::Authorization(
-                    deepcode_kernel_abi::v2::AuthorizationFactV2::ContextInvalidated { .. }
-                )
-        ),
-        KernelFactPayloadV2::Authorization(AuthorizationFactV2::CapabilityAwaiting {
-            identity,
-            preview_id,
-            tool_id,
-            canonical_arguments_digest,
-            scope_digest,
-            tool_contract_digest,
-            context_ref,
-        }) => match predecessor {
-            KernelFactPayloadV2::Authorization(AuthorizationFactV2::ScopePreviewed {
-                identity: source,
-                preview_id: source_preview_id,
-                tool_id: source_tool_id,
-                canonical_arguments_digest: source_arguments_digest,
-                scope_digest: source_scope_digest,
-                tool_contract_digest: source_tool_contract_digest,
-                context_ref: source_context_ref,
-                ..
-            }) => {
-                authorization_matches_awaiting_subject(source, identity)
-                    && preview_id == source_preview_id
-                    && tool_id == source_tool_id
-                    && canonical_arguments_digest == source_arguments_digest
-                    && scope_digest == source_scope_digest
-                    && tool_contract_digest == source_tool_contract_digest
-                    && context_ref == source_context_ref
-            }
-            _ => false,
-        },
-        KernelFactPayloadV2::Authorization(current)
-            if matches!(
-                current,
-                AuthorizationFactV2::CapabilityIssued { .. }
-                    | AuthorizationFactV2::CapabilityDenied { .. }
-                    | AuthorizationFactV2::ExpansionAllowed { .. }
-                    | AuthorizationFactV2::ExpansionDenied { .. }
-            ) =>
-        {
-            match predecessor {
-                KernelFactPayloadV2::Authorization(predecessor) => {
-                    authorization_resolution_edge_matches(predecessor, current)
-                }
-                _ => false,
-            }
-        }
-        KernelFactPayloadV2::Authorization(
-            deepcode_kernel_abi::v2::AuthorizationFactV2::TrustGranted { .. },
-        ) => matches!(
-            predecessor,
-            KernelFactPayloadV2::Authorization(
-                deepcode_kernel_abi::v2::AuthorizationFactV2::ScopePreviewed { .. }
-            )
-        ),
-        KernelFactPayloadV2::Authorization(
-            deepcode_kernel_abi::v2::AuthorizationFactV2::TrustRevoked { .. },
-        ) => matches!(
-            predecessor,
-            KernelFactPayloadV2::Authorization(
-                deepcode_kernel_abi::v2::AuthorizationFactV2::TrustGranted { .. }
-            )
-        ),
-        KernelFactPayloadV2::Authorization(
-            deepcode_kernel_abi::v2::AuthorizationFactV2::LeaseRevoked { .. }
-                | deepcode_kernel_abi::v2::AuthorizationFactV2::LeaseSuperseded { .. },
-        ) => matches!(
-            predecessor,
-            KernelFactPayloadV2::Authorization(
-                deepcode_kernel_abi::v2::AuthorizationFactV2::CapabilityIssued { .. }
-                    | deepcode_kernel_abi::v2::AuthorizationFactV2::ExpansionAllowed { .. }
-            )
-        ),
-        KernelFactPayloadV2::Authorization(
-            deepcode_kernel_abi::v2::AuthorizationFactV2::ContextInvalidated { .. },
-        ) => matches!(
-            predecessor,
-            KernelFactPayloadV2::Control(ControlFactV2::EpochAdvanced { .. })
-                | KernelFactPayloadV2::Authorization(_)
-        ),
-        KernelFactPayloadV2::Authorization(_) => false,
         KernelFactPayloadV2::Control(ControlFactV2::EpochAdvanced { .. }) => {
             command_edge(predecessor, MutationCommandKindV2::ControlEpochAdvance)
-        }
-        KernelFactPayloadV2::Control(ControlFactV2::RunTerminated { .. }) => {
-            command_edge(predecessor, MutationCommandKindV2::RunTerminate)
         }
         KernelFactPayloadV2::Control(ControlFactV2::CancellationRequested { source, .. }) => {
             match source {
@@ -6142,28 +3661,88 @@ fn edge_kind_matches(predecessor: &KernelFactPayloadV2, current: &KernelFactPayl
                     predecessor,
                     KernelFactPayloadV2::Control(ControlFactV2::EpochAdvanced { .. })
                 ),
-                CancellationSourceV2::RunTermination => matches!(
-                    predecessor,
-                    KernelFactPayloadV2::Control(ControlFactV2::RunTerminated { .. })
-                ),
             }
         }
-        KernelFactPayloadV2::Grant(GrantFactV2::Issued { .. })
-        | KernelFactPayloadV2::Grant(GrantFactV2::Denied { .. }) => {
-            command_edge(predecessor, MutationCommandKindV2::GrantDecisionSubmit)
+        KernelFactPayloadV2::Authorization(AuthorizationFactV2::ScopePreviewed { .. }) => {
+            matches!(
+                predecessor,
+                KernelFactPayloadV2::Control(ControlFactV2::EpochAdvanced { .. })
+                    | KernelFactPayloadV2::Authorization(
+                        AuthorizationFactV2::ContextInvalidated { .. }
+                    )
+            )
         }
-        KernelFactPayloadV2::Grant(GrantFactV2::Revoked { .. }) => {
-            command_edge(predecessor, MutationCommandKindV2::GrantRevoke)
-        }
-        KernelFactPayloadV2::Grant(GrantFactV2::Superseded { .. }) => matches!(
+        KernelFactPayloadV2::Authorization(AuthorizationFactV2::CapabilityAwaiting {
+            identity,
+            preview_id,
+            tool_id,
+            canonical_arguments_digest,
+            scope_digest,
+            tool_contract_digest,
+            context_ref,
+        }) => matches!(
             predecessor,
-            KernelFactPayloadV2::Control(
-                ControlFactV2::EpochAdvanced { .. } | ControlFactV2::RunTerminated { .. }
+            KernelFactPayloadV2::Authorization(AuthorizationFactV2::ScopePreviewed {
+                identity: source,
+                preview_id: source_preview_id,
+                tool_id: source_tool_id,
+                canonical_arguments_digest: source_arguments_digest,
+                scope_digest: source_scope_digest,
+                tool_contract_digest: source_tool_contract_digest,
+                context_ref: source_context_ref,
+                ..
+            }) if authorization_matches_awaiting_subject(source, identity)
+                && preview_id == source_preview_id
+                && tool_id == source_tool_id
+                && canonical_arguments_digest == source_arguments_digest
+                && scope_digest == source_scope_digest
+                && tool_contract_digest == source_tool_contract_digest
+                && context_ref == source_context_ref
+        ),
+        KernelFactPayloadV2::Authorization(current)
+            if matches!(
+                current,
+                AuthorizationFactV2::CapabilityIssued { .. }
+                    | AuthorizationFactV2::CapabilityDenied { .. }
+                    | AuthorizationFactV2::ExpansionAllowed { .. }
+                    | AuthorizationFactV2::ExpansionDenied { .. }
+            ) =>
+        {
+            matches!(
+                predecessor,
+                KernelFactPayloadV2::Authorization(previous)
+                    if authorization_resolution_edge_matches(previous, current)
+            )
+        }
+        KernelFactPayloadV2::Authorization(AuthorizationFactV2::TrustGranted { .. }) => {
+            matches!(
+                predecessor,
+                KernelFactPayloadV2::Authorization(AuthorizationFactV2::ScopePreviewed { .. })
+            )
+        }
+        KernelFactPayloadV2::Authorization(AuthorizationFactV2::TrustRevoked { .. }) => {
+            matches!(
+                predecessor,
+                KernelFactPayloadV2::Authorization(AuthorizationFactV2::TrustGranted { .. })
+            )
+        }
+        KernelFactPayloadV2::Authorization(
+            AuthorizationFactV2::LeaseRevoked { .. } | AuthorizationFactV2::LeaseSuperseded { .. },
+        ) => matches!(
+            predecessor,
+            KernelFactPayloadV2::Authorization(
+                AuthorizationFactV2::CapabilityIssued { .. }
+                    | AuthorizationFactV2::ExpansionAllowed { .. }
             )
         ),
-        KernelFactPayloadV2::Invocation(
-            InvocationFactV2::Admitted { .. } | InvocationFactV2::Rejected { .. },
-        ) => command_edge(predecessor, MutationCommandKindV2::InvocationSubmit),
+        KernelFactPayloadV2::Authorization(AuthorizationFactV2::ContextInvalidated { .. }) => {
+            matches!(
+                predecessor,
+                KernelFactPayloadV2::Control(ControlFactV2::EpochAdvanced { .. })
+                    | KernelFactPayloadV2::Authorization(_)
+            )
+        }
+        KernelFactPayloadV2::Authorization(_) => false,
         KernelFactPayloadV2::Invocation(InvocationFactV2::ToolIntentAdmitted { .. }) => {
             matches!(
                 predecessor,
@@ -6177,143 +3756,69 @@ fn edge_kind_matches(predecessor: &KernelFactPayloadV2, current: &KernelFactPayl
         KernelFactPayloadV2::Invocation(InvocationFactV2::ToolAttemptPrepared { .. }) => {
             matches!(
                 predecessor,
-                KernelFactPayloadV2::Invocation(
-                    InvocationFactV2::ToolIntentAdmitted { .. }
-                )
+                KernelFactPayloadV2::Invocation(InvocationFactV2::ToolIntentAdmitted { .. })
             )
         }
-        KernelFactPayloadV2::Grant(GrantFactV2::Reserved { .. }) => matches!(
-            predecessor,
-            KernelFactPayloadV2::Invocation(InvocationFactV2::Admitted { .. })
-        ),
-        KernelFactPayloadV2::Invocation(InvocationFactV2::AttemptPrepared { .. }) => matches!(
-            predecessor,
-            KernelFactPayloadV2::Grant(GrantFactV2::Reserved { .. })
-        ),
-        KernelFactPayloadV2::Resource(ResourceFactV2::ResolvedForInvocation { .. }) => matches!(
-            predecessor,
-            KernelFactPayloadV2::Invocation(
-                InvocationFactV2::AttemptPrepared { .. }
-                    | InvocationFactV2::ToolAttemptPrepared { .. }
+        KernelFactPayloadV2::Resource(ResourceFactV2::ResolvedForInvocation { .. }) => {
+            matches!(
+                predecessor,
+                KernelFactPayloadV2::Invocation(InvocationFactV2::ToolAttemptPrepared { .. })
             )
-        ),
+        }
         KernelFactPayloadV2::Resource(ResourceFactV2::RevalidatedBeforeEffect { .. }) => {
             matches!(
                 predecessor,
                 KernelFactPayloadV2::Resource(ResourceFactV2::ResolvedForInvocation { .. })
             )
         }
-        KernelFactPayloadV2::Grant(GrantFactV2::Consumed { .. })
-        | KernelFactPayloadV2::Invocation(InvocationFactV2::FailedBeforeEffect { .. }) => {
-            matches!(
-                predecessor,
-                KernelFactPayloadV2::Invocation(InvocationFactV2::AttemptPrepared { .. })
-            )
-        }
-        KernelFactPayloadV2::Invocation(InvocationFactV2::ExecutionStarted { .. }) => matches!(
-            predecessor,
-            KernelFactPayloadV2::Grant(GrantFactV2::Consumed { .. })
-        ),
         KernelFactPayloadV2::Invocation(InvocationFactV2::ToolExecutionStarted { .. }) => {
             matches!(
                 predecessor,
-                KernelFactPayloadV2::Invocation(
-                    InvocationFactV2::ToolAttemptPrepared { .. }
-                ) | KernelFactPayloadV2::Resource(
-                    ResourceFactV2::RevalidatedBeforeEffect { .. }
-                )
+                KernelFactPayloadV2::Invocation(InvocationFactV2::ToolAttemptPrepared { .. })
+                    | KernelFactPayloadV2::Resource(ResourceFactV2::RevalidatedBeforeEffect { .. })
             )
         }
-        KernelFactPayloadV2::Invocation(InvocationFactV2::CancellationObserved { .. }) => {
+        KernelFactPayloadV2::Invocation(InvocationFactV2::ToolCancellationObserved { .. }) => {
             matches!(
                 predecessor,
                 KernelFactPayloadV2::Control(ControlFactV2::CancellationRequested { .. })
             )
         }
-        KernelFactPayloadV2::Invocation(
-            InvocationFactV2::ToolCancellationObserved { .. },
-        ) => matches!(
-            predecessor,
-            KernelFactPayloadV2::Control(ControlFactV2::CancellationRequested { .. })
-        ),
-        KernelFactPayloadV2::Invocation(InvocationFactV2::DeadlineObserved { .. }) => matches!(
-            predecessor,
-            KernelFactPayloadV2::Invocation(InvocationFactV2::Admitted { .. })
-        ),
         KernelFactPayloadV2::Invocation(InvocationFactV2::ToolDeadlineObserved { .. }) => {
             matches!(
                 predecessor,
-                KernelFactPayloadV2::Invocation(
-                    InvocationFactV2::ToolIntentAdmitted { .. }
-                )
+                KernelFactPayloadV2::Invocation(InvocationFactV2::ToolIntentAdmitted { .. })
             )
         }
-        KernelFactPayloadV2::Invocation(InvocationFactV2::CancelledBeforeEffect { .. }) => {
+        KernelFactPayloadV2::Invocation(InvocationFactV2::ToolCancelledBeforeEffect { .. }) => {
             matches!(
                 predecessor,
-                KernelFactPayloadV2::Invocation(InvocationFactV2::CancellationObserved { .. })
+                KernelFactPayloadV2::Invocation(InvocationFactV2::ToolCancellationObserved { .. })
             )
         }
-        KernelFactPayloadV2::Invocation(InvocationFactV2::TimedOutBeforeEffect { .. }) => {
+        KernelFactPayloadV2::Invocation(InvocationFactV2::ToolTimedOutBeforeEffect { .. }) => {
             matches!(
                 predecessor,
-                KernelFactPayloadV2::Invocation(InvocationFactV2::DeadlineObserved { .. })
+                KernelFactPayloadV2::Invocation(InvocationFactV2::ToolDeadlineObserved { .. })
             )
         }
-        KernelFactPayloadV2::Invocation(
-            InvocationFactV2::ToolCancelledBeforeEffect { .. },
-        ) => matches!(
-            predecessor,
-            KernelFactPayloadV2::Invocation(
-                InvocationFactV2::ToolCancellationObserved { .. }
+        KernelFactPayloadV2::Invocation(InvocationFactV2::ToolFailedBeforeEffect { .. }) => {
+            matches!(
+                predecessor,
+                KernelFactPayloadV2::Invocation(InvocationFactV2::ToolAttemptPrepared { .. })
             )
-        ),
-        KernelFactPayloadV2::Invocation(
-            InvocationFactV2::ToolTimedOutBeforeEffect { .. },
-        ) => matches!(
-            predecessor,
-            KernelFactPayloadV2::Invocation(
-                InvocationFactV2::ToolDeadlineObserved { .. }
-            )
-        ),
-        KernelFactPayloadV2::Invocation(
-            InvocationFactV2::ToolFailedBeforeEffect { .. },
-        ) => matches!(
-            predecessor,
-            KernelFactPayloadV2::Invocation(
-                InvocationFactV2::ToolAttemptPrepared { .. }
-            )
-        ),
+        }
         KernelFactPayloadV2::Effect(_) => matches!(
             predecessor,
-            KernelFactPayloadV2::Invocation(
-                InvocationFactV2::ExecutionStarted { .. }
-                    | InvocationFactV2::ToolExecutionStarted { .. }
-            )
+            KernelFactPayloadV2::Invocation(InvocationFactV2::ToolExecutionStarted { .. })
         ),
-        KernelFactPayloadV2::Invocation(
-            InvocationFactV2::Completed { .. }
-            | InvocationFactV2::FailedAfterObservedEffect { .. }
-            | InvocationFactV2::Indeterminate { .. },
-        ) => matches!(predecessor, KernelFactPayloadV2::Effect(_)),
         KernelFactPayloadV2::Invocation(
             InvocationFactV2::ToolCompleted { .. }
             | InvocationFactV2::ToolFailedAfterObservedEffect { .. }
             | InvocationFactV2::ToolIndeterminate { .. },
         ) => matches!(predecessor, KernelFactPayloadV2::Effect(_)),
-        KernelFactPayloadV2::Grant(GrantFactV2::ReservationReleased { .. }) => matches!(
-            predecessor,
-            KernelFactPayloadV2::Invocation(
-                InvocationFactV2::FailedBeforeEffect { .. }
-                    | InvocationFactV2::CancelledBeforeEffect { .. }
-                    | InvocationFactV2::TimedOutBeforeEffect { .. }
-            )
-        ),
-        KernelFactPayloadV2::Resource(
-            ResourceFactV2::Acquired { .. } | ResourceFactV2::Released { .. },
-        )
-        | KernelFactPayloadV2::Cleanup(_)
-        | KernelFactPayloadV2::Control(ControlFactV2::CommandRecorded { .. }) => false,
+        KernelFactPayloadV2::Cleanup(_) => true,
+        KernelFactPayloadV2::Control(ControlFactV2::CommandRecorded { .. }) => false,
     }
 }
 

@@ -19,7 +19,6 @@ mod resource_packet;
 mod run;
 mod snapshot;
 mod tool;
-pub mod tool_catalog_v4;
 pub mod tool_protocol_v2;
 pub mod user_decision_v2;
 pub mod v2;
@@ -29,7 +28,6 @@ mod workspace;
 
 pub const KERNEL_ABI_VERSION: &str = "deepcode.kernel.abi.v1";
 pub const KERNEL_ABI_V2_VERSION: &str = "deepcode.kernel.abi.v2";
-pub const KERNEL_TOOL_CATALOG_V4_VERSION: &str = "deepcode.kernel.tools.v4";
 
 pub use command::*;
 pub use config::*;

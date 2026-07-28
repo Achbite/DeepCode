@@ -12,6 +12,7 @@ mod operation_builders;
 mod operation_model;
 mod registrations;
 mod review;
+mod runtime_adapter_v4;
 mod sandbox;
 
 pub use admission::*;
@@ -36,6 +37,7 @@ pub use operation_model::*;
 pub use registrations::{
     KernelAdmissionMetadataV2, KernelExecutionAdapterV2, KernelToolRegistration,
 };
+pub use runtime_adapter_v4::*;
 pub use sandbox::{
     CandidateSandboxSpec, SandboxCapabilitySnapshot, SealedSandboxPlan,
     SANDBOX_CAPABILITY_SCHEMA_VERSION, SANDBOX_SPEC_SCHEMA_VERSION,

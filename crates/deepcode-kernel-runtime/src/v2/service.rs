@@ -1,78 +1,51 @@
 use super::authority::{
-    bounded_fact_page, canonical_grant_request, caused_attempt, caused_direct_attempt,
-    classify_submission_binding, command_receipt_draft, corrupt_store,
-    direct_execution_result_drafts, direct_failed_before_effect_drafts,
-    direct_pre_effect_stop_drafts, direct_tool_intent_admission_drafts,
-    direct_tool_intent_continuation_drafts, epoch_advance_drafts, exact_epoch,
-    execution_result_drafts, explicit_cancellation_drafts, fact_draft, fact_query,
-    failed_before_effect_drafts, grant_decision_drafts, grant_decision_key,
-    grant_revocation_drafts, invalid_field, invocation_admission_drafts,
-    invocation_rejection_drafts, invocation_status_reply, plan_control_cancellation,
-    plan_epoch_advance, policy_auto_issuable, pre_effect_stop_drafts, prepare_direct_effect,
-    prepare_direct_tool_intent, prepare_effect, prepare_grant_request, prepare_submission_digest,
-    recorded_error_to_error, recovery_drafts, require_current_run,
-    require_input_in_epoch, resolve_execution, resolve_workspace_binding, resource_resolve_reply,
-    run_termination_drafts, storage_fault, EffectPreparation, EpochAdvancePlan,
-    PrepareFailure, RunCommandCheck, SubmissionDisposition,
+    caused_direct_attempt, command_receipt_draft, corrupt_store, direct_execution_result_drafts,
+    direct_failed_before_effect_drafts, direct_pre_effect_stop_drafts,
+    direct_tool_intent_admission_drafts, direct_tool_intent_continuation_drafts,
+    epoch_advance_drafts, exact_epoch, explicit_cancellation_drafts, fact_draft, invalid_field,
+    plan_control_cancellation, plan_epoch_advance, prepare_direct_effect,
+    prepare_direct_tool_intent, recorded_error_to_error, require_current_run, resolve_execution,
+    resolve_workspace_binding, storage_fault, EffectPreparation, EpochAdvancePlan, PrepareFailure,
+    RunCommandCheck,
 };
 use super::model::{
     invocation_phase_is_terminal, AuthorityResult, AuthorityState, ExecutionResolution,
-    GrantLifecycle, InvocationPhase, PreparedGrantRequest, RawExecution, ResolvedTarget,
-    RunLifecycle, WorkspaceBinding,
+    InvocationPhase, RawExecution, ResolvedTarget, WorkspaceBinding,
 };
 use crate::executors::{
     builtin_executors, invoke_document_read_complete, invoke_web_fetch_complete,
     KernelExecutorConfig, KernelExecutorRegistry, KernelToolExecutionContext, KernelToolInvocation,
     SecretProvider,
 };
-use deepcode_kernel_abi::tool_catalog_v4::{
-    AuthorityToolIdV4, ExecutionAvailabilityV4, ToolInvocationInputV4,
-};
 use deepcode_kernel_abi::v2::{
-    automatic_grant_decision_digest_v2, command_request_digest_v2, idempotency_key_hash_v2,
-    invocation_request_digest_v2, policy_auto_issue_digest_v2, policy_configuration_digest_v2,
-    policy_requires_user_decision_digest_v2, target_revalidation_set_digest_v2,
-    user_allow_grant_decision_digest_v2, user_deny_grant_decision_digest_v2, AdmissionRejectionV2,
-    AttemptId, AttemptIdentityV2, AuthorizationFactV2, AutonomyModeV2,
-    CancelRequestId, CancellationReasonCodeV2, CommandEpochContextV2,
-    CommandRequestId, ControlEpoch, EffectEvidenceV2, EffectId, FactId,
-    GrantDecisionBasisV2, GrantFactV2, GrantId, GrantReservationId, GrantScopeMismatchV2,
-    GrantUnusableLifecycleV2, IndeterminateReasonV2, InvocationFactV2,
-    InvocationId, InvocationSubmissionDigestV2, InvocationAuthorityV2, OperationId,
-    KernelFactDraftV2, KernelFactEnvelopeV2, KernelFactPayloadV2,
-    LastObservationV2, MutationCommandResultV2, PolicyConfigurationDigestV2,
-    PreEffectFailureCodeV2, ResourceAttemptIdentityV2, RecordedAtV2,
-    ResourceFactV2, ResourceId, RunId, V2ValidationError,
+    command_request_digest_v2, target_revalidation_set_digest_v2, AttemptId, AuthorizationFactV2,
+    CancelRequestId, CancellationReasonCodeV2, CommandEpochContextV2, CommandRequestId,
+    ControlEpoch, EffectEvidenceV2, EffectId, FactId, IndeterminateReasonV2, InvocationAuthorityV2,
+    InvocationFactV2, InvocationId, KernelFactDraftV2, KernelFactEnvelopeV2, KernelFactPayloadV2,
+    LastObservationV2, MutationCommandResultV2, OperationId, PreEffectFailureCodeV2, RecordedAtV2,
+    ResourceAttemptIdentityV2, ResourceFactV2, ResourceId, RunId, V2ValidationError,
 };
 use deepcode_kernel_abi::v2_command::{
-    ControlEpochAdvanceV2, ControlEpochAdvancedReplyV2,
-    GrantDecisionReplyV2, GrantDecisionSubmissionV2, GrantDecisionSubmitV2, GrantPreviewReplyV2,
-    GrantRequestV2, GrantRevokeOutcomeV2, GrantRevokeV2, GrantRevokedReplyV2,
-    InvalidFieldViolationV2, InvocationCancelReplyV2, InvocationCancelTargetV2, InvocationCancelV2,
-    InvocationSubmissionReplyV2, InvocationSubmitV2, KernelCommandEnvelopeV2,
-    KernelCommandV2, KernelErrorV2, KernelFactsQueryV2,
-    KernelReplyV2, RecordedCommandErrorV2, ResourceResolveV2,
-    RunTerminateV2, RunTerminatedReplyV2, RunTerminationOutcomeV2,
-    ToolIntentSubmitReplyV2,
+    ControlEpochAdvanceV2, ControlEpochAdvancedReplyV2, InvalidFieldViolationV2,
+    InvocationCancelReplyV2, InvocationCancelTargetV2, InvocationCancelV2, KernelCommandEnvelopeV2,
+    KernelCommandV2, KernelErrorV2, KernelReplyV2, RecordedCommandErrorV2, ToolIntentSubmitReplyV2,
 };
-use deepcode_kernel_ledger::v2::{
-    AppendWithAuthorityMaterialOutcomeV2, AppendWithPublicCommandReceiptOutcomeV2,
-    AppendWithPublicReceiptAndAuthorityMaterialOutcomeV2, AuthorityFactWriterLease,
-    AuthorityMaterialDraftV2, AuthorityMaterialMutationV2,
-    AuthorityMaterialRecordV2, CanonicalFactReader,
-    CanonicalFactStore, ConsumeFactQueryContinuationOutcomeV2,
-    FactQueryContinuationConsumerV2, FactQueryContinuationDraftV2,
-    FactQueryContinuationExpectationV2, OutboxPublisherLease,
-    PublicCommandReceiptV2, PutFactQueryContinuationOutcomeV2,
-    PutPublicCommandReceiptOutcomeV2,
-};
-use deepcode_kernel_tools::LocalAuthorityToolCatalogV4;
 use deepcode_kernel_abi::{
     CanonicalArgumentsDigestV2, ToolContextRefV2, ToolContractDigestV2, ToolIdV2,
     WorkspaceBindingRefV2,
 };
-use std::path::Path;
+use deepcode_kernel_ledger::v2::{
+    AppendWithAuthorityMaterialOutcomeV2, AppendWithPublicReceiptAndAuthorityMaterialOutcomeV2,
+    AuthorityFactWriterLease, AuthorityMaterialDraftV2, AuthorityMaterialMutationV2,
+    AuthorityMaterialRecordV2, CanonicalFactReader, CanonicalFactStore,
+    ConsumeFactQueryContinuationOutcomeV2, FactQueryContinuationConsumerV2,
+    FactQueryContinuationDraftV2, FactQueryContinuationExpectationV2, OutboxPublisherLease,
+    PublicCommandReceiptV2, PutFactQueryContinuationOutcomeV2, PutPublicCommandReceiptOutcomeV2,
+};
+use deepcode_kernel_tools::LocalAuthorityToolCatalogV4;
+use deepcode_kernel_tools::ToolInvocationInputV4;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -130,8 +103,6 @@ struct ServiceInner {
     executor_config: KernelExecutorConfig,
     executors: Arc<KernelExecutorRegistry>,
     execution_tasks: Mutex<HashMap<InvocationId, std::thread::JoinHandle<()>>>,
-    autonomy_mode: AutonomyModeV2,
-    policy_configuration_digest: PolicyConfigurationDigestV2,
     ids: IdMint,
 }
 
@@ -140,22 +111,6 @@ struct ServiceInner {
 #[derive(Clone)]
 pub(crate) struct AuthorityService {
     inner: Arc<ServiceInner>,
-}
-
-struct PreAdmissionInvocation {
-    request: InvocationSubmitV2,
-    prepared: PreparedGrantRequest,
-    submission_digest: InvocationSubmissionDigestV2,
-    preferred_invocation_id: Option<InvocationId>,
-}
-
-struct AuthorityAdmittedInvocation {
-    identity: AttemptIdentityV2,
-    invocation: ToolInvocationInputV4,
-    targets: Vec<(ResourceId, ResolvedTarget)>,
-    attempt_prepared_fact_id: FactId,
-    admitted_at: Instant,
-    effective_deadline: Duration,
 }
 
 pub(super) struct DirectToolIntentRequest {
@@ -188,13 +143,6 @@ struct DirectAuthorityAdmittedInvocation {
 }
 
 struct PersistedEffectPermit;
-
-struct EffectReadyInvocation {
-    admitted: AuthorityAdmittedInvocation,
-    preparation: EffectPreparation,
-    execution_started_fact_id: FactId,
-    _permit: PersistedEffectPermit,
-}
 
 struct DirectEffectReadyInvocation {
     admitted: DirectAuthorityAdmittedInvocation,
@@ -282,7 +230,6 @@ impl AuthorityService {
         store: CanonicalFactStore,
         executor_config: KernelExecutorConfig,
         secret_provider: Arc<dyn SecretProvider>,
-        autonomy_mode: AutonomyModeV2,
     ) -> AuthorityResult<Self> {
         let mut recovery = store.claim_recovery_admin().map_err(|_| storage_fault())?;
         recovery
@@ -304,9 +251,6 @@ impl AuthorityService {
             executor_config.clone(),
             secret_provider,
         )));
-        let policy_configuration_digest =
-            policy_configuration_digest_v2(autonomy_mode, catalog.catalog_digest())
-                .map_err(|_| corrupt_store())?;
         let service = Self {
             inner: Arc::new(ServiceInner {
                 state: Mutex::new(state),
@@ -318,8 +262,6 @@ impl AuthorityService {
                 executor_config,
                 executors,
                 execution_tasks: Mutex::new(HashMap::new()),
-                autonomy_mode,
-                policy_configuration_digest,
                 ids: IdMint::new(snapshot.ledger_sequence_high_water),
             }),
         };
@@ -335,25 +277,17 @@ impl AuthorityService {
         let binding = resolve_workspace_binding(workspace_root)?;
         {
             let state = self.inner.state.lock().map_err(|_| storage_fault())?;
-            if state
-                .invocations
-                .values()
-                .any(|invocation| {
-                    invocation.run_id == *run_id
-                        && invocation.workspace_binding_digest != binding.digest
-                })
-            {
+            if state.direct_invocations.values().any(|invocation| {
+                invocation.run_id == *run_id
+                    && invocation.workspace_binding_digest != binding.digest
+            }) {
                 return Err(invalid_field(
                     "workspaceRoot",
                     InvalidFieldViolationV2::OutOfRange,
                 ));
             }
         }
-        let mut workspaces = self
-            .inner
-            .workspaces
-            .lock()
-            .map_err(|_| storage_fault())?;
+        let mut workspaces = self.inner.workspaces.lock().map_err(|_| storage_fault())?;
         if let Some(existing) = workspaces.get(run_id) {
             if existing.digest != binding.digest {
                 return Err(invalid_field(
@@ -367,22 +301,14 @@ impl AuthorityService {
         Ok(binding)
     }
 
-    pub(super) fn workspace_for_run(
-        &self,
-        run_id: &RunId,
-    ) -> AuthorityResult<WorkspaceBinding> {
+    pub(super) fn workspace_for_run(&self, run_id: &RunId) -> AuthorityResult<WorkspaceBinding> {
         self.inner
             .workspaces
             .lock()
             .map_err(|_| storage_fault())?
             .get(run_id)
             .cloned()
-            .ok_or_else(|| {
-                invalid_field(
-                    "runId",
-                    InvalidFieldViolationV2::InvalidRelation,
-                )
-            })
+            .ok_or_else(|| invalid_field("runId", InvalidFieldViolationV2::InvalidRelation))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -392,7 +318,7 @@ impl AuthorityService {
         operation_id: &OperationId,
         control_epoch: ControlEpoch,
         idempotency_key: &str,
-        canonical_invocation: &deepcode_kernel_abi::tool_catalog_v4::ToolInvocationInputV4,
+        canonical_invocation: &deepcode_kernel_tools::ToolInvocationInputV4,
         deadline: deepcode_kernel_abi::v2_command::DeadlineRequestV2,
         correlation_refs: Vec<deepcode_kernel_abi::v2::CorrelationRefV2>,
     ) -> AuthorityResult<(deepcode_kernel_abi::v2::ResourceScopeV2, u32)> {
@@ -415,10 +341,10 @@ impl AuthorityService {
         )
         .map_err(|failure| match failure {
             PrepareFailure::Kernel(error) => error,
-            PrepareFailure::Target(_) => invalid_field(
-                "rawArguments",
-                InvalidFieldViolationV2::OutOfRange,
-            ),
+            PrepareFailure::Target(reason) => {
+                let _ = reason;
+                invalid_field("rawArguments", InvalidFieldViolationV2::OutOfRange)
+            }
         })?;
         Ok((prepared.resource_scope, prepared.effective_deadline_ms))
     }
@@ -449,12 +375,8 @@ impl AuthorityService {
             return Err(corrupt_store());
         }
 
-        let internal_request_id = self
-            .inner
-            .ids
-            .typed("command", CommandRequestId::new);
-        let internal_command =
-            KernelCommandV2::ControlEpochAdvance(command.clone());
+        let internal_request_id = self.inner.ids.typed("command", CommandRequestId::new);
+        let internal_command = KernelCommandV2::ControlEpochAdvance(command.clone());
         let internal_digest =
             command_request_digest_v2(&internal_command).map_err(|_| corrupt_store())?;
         let command_fact_id = self.inner.ids.fact();
@@ -465,7 +387,7 @@ impl AuthorityService {
             run_id: command.run_id.clone(),
             accepted_control_epoch: new_epoch,
             epoch_fact_id: epoch_fact_id.clone(),
-            superseded_grant_count: 0,
+            superseded_capability_count: 0,
             cancellation: deepcode_kernel_abi::v2_command::ControlCancellationReplyV2::None {},
             command_batch_high_water: high_water,
         };
@@ -478,7 +400,6 @@ impl AuthorityService {
             new_epoch,
             command_fact_id,
             epoch_fact_id.clone(),
-            Vec::new(),
             None,
             reply.clone(),
         );
@@ -512,9 +433,7 @@ impl AuthorityService {
                 Ok(reply)
             }
             PutPublicCommandReceiptOutcomeV2::ExistingSame(_)
-            | PutPublicCommandReceiptOutcomeV2::DigestConflict { .. } => {
-                Err(corrupt_store())
-            }
+            | PutPublicCommandReceiptOutcomeV2::DigestConflict { .. } => Err(corrupt_store()),
         }
     }
 
@@ -523,7 +442,11 @@ impl AuthorityService {
         run_id: &RunId,
         after_ledger_sequence: u64,
         limit: u32,
-    ) -> AuthorityResult<(u64, Vec<deepcode_kernel_abi::v2::KernelFactEnvelopeV2>, bool)> {
+    ) -> AuthorityResult<(
+        u64,
+        Vec<deepcode_kernel_abi::v2::KernelFactEnvelopeV2>,
+        bool,
+    )> {
         {
             let state = self.inner.state.lock().map_err(|_| storage_fault())?;
             if !state.runs.contains_key(run_id) {
@@ -650,66 +573,6 @@ impl AuthorityService {
         Ok(outcome)
     }
 
-    pub(super) fn append_payloads_with_public_receipt_builder<F>(
-        &self,
-        payloads: Vec<KernelFactPayloadV2>,
-        settlement_index: Option<usize>,
-        build_receipt: F,
-    ) -> AuthorityResult<AppendWithPublicCommandReceiptOutcomeV2>
-    where
-        F: FnOnce(
-            &[FactId],
-            &[u64],
-        ) -> AuthorityResult<PublicCommandReceiptV2>,
-    {
-        if payloads.is_empty()
-            || settlement_index.is_some_and(|index| index >= payloads.len())
-        {
-            return Err(storage_fault());
-        }
-        let mut state = self.inner.state.lock().map_err(|_| storage_fault())?;
-        let first_ledger_sequence = self
-            .high_water()?
-            .checked_add(1)
-            .ok_or_else(storage_fault)?;
-        let drafts = payloads
-            .into_iter()
-            .map(|payload| KernelFactDraftV2 {
-                fact_id: self.inner.ids.fact(),
-                payload,
-            })
-            .collect::<Vec<_>>();
-        self.prevalidate_drafts(&state, &drafts)?;
-        let fact_ids = drafts
-            .iter()
-            .map(|draft| draft.fact_id.clone())
-            .collect::<Vec<_>>();
-        let ledger_sequences = (0..drafts.len())
-            .map(|offset| {
-                first_ledger_sequence
-                    .checked_add(offset as u64)
-                    .ok_or_else(storage_fault)
-            })
-            .collect::<AuthorityResult<Vec<_>>>()?;
-        let mut receipt = build_receipt(&fact_ids, &ledger_sequences)?;
-        receipt.settlement_fact_id =
-            settlement_index.map(|index| fact_ids[index].clone());
-        let outcome = self
-            .inner
-            .writer
-            .lock()
-            .map_err(|_| storage_fault())?
-            .append_with_public_command_receipt(drafts, receipt)
-            .map_err(|_| storage_fault())?;
-        if !outcome.facts.is_empty() {
-            if let Err(error) = state.apply_committed(outcome.facts.clone()) {
-                state.storage_faulted = true;
-                return Err(error);
-            }
-        }
-        Ok(outcome)
-    }
-
     pub(super) fn append_payloads_with_public_receipt_and_authority_material_builder<F>(
         &self,
         payloads: Vec<KernelFactPayloadV2>,
@@ -720,9 +583,7 @@ impl AuthorityService {
     where
         F: FnOnce(&[FactId], &[u64]) -> AuthorityResult<PublicCommandReceiptV2>,
     {
-        if payloads.is_empty()
-            || settlement_index.is_some_and(|index| index >= payloads.len())
-        {
+        if payloads.is_empty() || settlement_index.is_some_and(|index| index >= payloads.len()) {
             return Err(storage_fault());
         }
         let mut state = self.inner.state.lock().map_err(|_| storage_fault())?;
@@ -750,18 +611,13 @@ impl AuthorityService {
             })
             .collect::<AuthorityResult<Vec<_>>>()?;
         let mut receipt = build_receipt(&fact_ids, &ledger_sequences)?;
-        receipt.settlement_fact_id =
-            settlement_index.map(|index| fact_ids[index].clone());
+        receipt.settlement_fact_id = settlement_index.map(|index| fact_ids[index].clone());
         let outcome = self
             .inner
             .writer
             .lock()
             .map_err(|_| storage_fault())?
-            .append_with_public_receipt_and_authority_material(
-                drafts,
-                receipt,
-                mutations,
-            )
+            .append_with_public_receipt_and_authority_material(drafts, receipt, mutations)
             .map_err(|_| storage_fault())?;
         if !outcome.facts.is_empty() {
             if let Err(error) = state.apply_committed(outcome.facts.clone()) {
@@ -780,8 +636,7 @@ impl AuthorityService {
         build_receipt: F,
     ) -> AuthorityResult<KernelReplyV2>
     where
-        F: FnOnce(&KernelReplyV2) -> AuthorityResult<PublicCommandReceiptV2>
-            + 'static,
+        F: FnOnce(&KernelReplyV2) -> AuthorityResult<PublicCommandReceiptV2> + 'static,
     {
         self.advance_epoch_inner(
             envelope,
@@ -796,11 +651,7 @@ impl AuthorityService {
         envelope: &KernelCommandEnvelopeV2,
         command: ControlEpochAdvanceV2,
         public_receipt: Option<
-            Box<
-                dyn FnOnce(
-                    &KernelReplyV2,
-                ) -> AuthorityResult<PublicCommandReceiptV2>,
-            >,
+            Box<dyn FnOnce(&KernelReplyV2) -> AuthorityResult<PublicCommandReceiptV2>>,
         >,
         material_mutations: Vec<AuthorityMaterialMutationV2>,
     ) -> AuthorityResult<KernelReplyV2> {
@@ -833,28 +684,19 @@ impl AuthorityService {
 
         let command_fact_id = self.inner.ids.fact();
         let epoch_fact_id = self.inner.ids.fact();
-        let superseded = state
-            .grants
-            .values()
-            .filter(|grant| {
-                grant.run_id == command.run_id && matches!(grant.lifecycle, GrantLifecycle::Issued)
-            })
-            .cloned()
-            .map(|grant| (grant, self.inner.ids.fact()))
-            .collect::<Vec<_>>();
         let active_invocation = state
             .runs
             .get(&command.run_id)
             .and_then(|run| run.active_invocation_id.clone());
         let (cancellation, cancellation_fact) =
             plan_control_cancellation(&state, active_invocation, || self.inner.ids.cancellation())?;
-        let batch_len = 2 + superseded.len() + usize::from(cancellation_fact.is_some());
+        let batch_len = 2 + usize::from(cancellation_fact.is_some());
         let high_water = self.predicted_high_water(batch_len)?;
         let reply = ControlEpochAdvancedReplyV2 {
             run_id: command.run_id.clone(),
             accepted_control_epoch: new_epoch,
             epoch_fact_id: epoch_fact_id.clone(),
-            superseded_grant_count: superseded.len() as u64,
+            superseded_capability_count: 0,
             cancellation: cancellation.clone(),
             command_batch_high_water: high_water,
         };
@@ -867,7 +709,6 @@ impl AuthorityService {
             new_epoch,
             command_fact_id,
             epoch_fact_id.clone(),
-            superseded,
             cancellation_fact,
             reply.clone(),
         );
@@ -906,7 +747,6 @@ impl AuthorityService {
         envelope: &KernelCommandEnvelopeV2,
         run_id: &RunId,
         expected_epoch: ControlEpoch,
-        require_active: bool,
     ) -> AuthorityResult<RunCommandCheck> {
         let run = state
             .runs
@@ -920,11 +760,6 @@ impl AuthorityService {
                 run_id: run_id.clone(),
                 submitted: expected_epoch,
                 current: run.epoch,
-            })
-        } else if require_active && matches!(run.lifecycle, RunLifecycle::Terminated { .. }) {
-            Some(RecordedCommandErrorV2::RunTerminated {
-                run_id: run_id.clone(),
-                control_epoch: run.epoch,
             })
         } else {
             None
@@ -962,21 +797,15 @@ impl AuthorityService {
         }
         let descriptor = crate::kernel_tool_registry()
             .get_v2(&request.tool_id)
-            .ok_or_else(|| {
-                invalid_field("toolId", InvalidFieldViolationV2::InvalidEnum)
-            })?;
+            .ok_or_else(|| invalid_field("toolId", InvalidFieldViolationV2::InvalidEnum))?;
         let expected_contract_digest =
             deepcode_kernel_abi::tool_contract_digest_v2(&descriptor.descriptor_v2)
                 .map_err(|_| corrupt_store())?;
-        if descriptor.descriptor_v2.availability
-            != deepcode_kernel_abi::ToolAvailabilityV2::Ready
+        if descriptor.descriptor_v2.availability != deepcode_kernel_abi::ToolAvailabilityV2::Ready
             || descriptor.executor_binding.is_none()
             || expected_contract_digest != request.tool_contract_digest
         {
-            return Err(invalid_field(
-                "toolId",
-                InvalidFieldViolationV2::OutOfRange,
-            ));
+            return Err(invalid_field("toolId", InvalidFieldViolationV2::OutOfRange));
         }
         let workspace = self.workspace_for_run(&request.run_id)?;
         let correlation_refs = match &request.authority {
@@ -1001,31 +830,26 @@ impl AuthorityService {
         )
         .map_err(|failure| match failure {
             PrepareFailure::Kernel(error) => error,
-            PrepareFailure::Target(_) => invalid_field(
-                "rawArguments",
-                InvalidFieldViolationV2::OutOfRange,
-            ),
+            PrepareFailure::Target(reason) => {
+                let _ = reason;
+                invalid_field("rawArguments", InvalidFieldViolationV2::OutOfRange)
+            }
         })?;
         let mut state = self.inner.state.lock().map_err(|_| storage_fault())?;
-        let run = state
-            .runs
-            .get(&request.run_id)
-            .cloned()
-            .ok_or_else(|| KernelErrorV2::RunNotFound {
-                run_id: request.run_id.clone(),
-            })?;
+        let run =
+            state
+                .runs
+                .get(&request.run_id)
+                .cloned()
+                .ok_or_else(|| KernelErrorV2::RunNotFound {
+                    run_id: request.run_id.clone(),
+                })?;
         if run.epoch != request.control_epoch {
             return Err(KernelErrorV2::StaleControlEpoch {
                 run_id: request.run_id,
                 submitted: request.control_epoch,
                 current: run.epoch,
             });
-        }
-        if matches!(run.lifecycle, RunLifecycle::Terminated { .. }) {
-            return Err(invalid_field(
-                "runId",
-                InvalidFieldViolationV2::InvalidRelation,
-            ));
         }
         if let Some(active_invocation_id) = run.active_invocation_id {
             let _ = active_invocation_id;
@@ -1041,10 +865,7 @@ impl AuthorityService {
             .count()
             >= 4
         {
-            return Err(invalid_field(
-                "runId",
-                InvalidFieldViolationV2::OutOfRange,
-            ));
+            return Err(invalid_field("runId", InvalidFieldViolationV2::OutOfRange));
         }
         if state.direct_invocations.values().any(|existing| {
             existing.run_id == request.run_id
@@ -1138,9 +959,7 @@ impl AuthorityService {
             targets,
             attempt_prepared_fact_id: attempt_fact_id,
             admitted_at: Instant::now(),
-            effective_deadline: Duration::from_millis(u64::from(
-                prepared.effective_deadline_ms,
-            )),
+            effective_deadline: Duration::from_millis(u64::from(prepared.effective_deadline_ms)),
             authority_material,
         })?;
         Ok(reply)
@@ -1162,9 +981,7 @@ impl AuthorityService {
         ) -> AuthorityResult<PublicCommandReceiptV2>,
     {
         self.reap_finished_execution_tasks()?;
-        if request.canonical_invocation.tool_id().as_str()
-            != request.tool_id.as_str()
-        {
+        if request.canonical_invocation.tool_id().as_str() != request.tool_id.as_str() {
             return Err(invalid_field(
                 "toolId",
                 InvalidFieldViolationV2::InvalidRelation,
@@ -1172,30 +989,20 @@ impl AuthorityService {
         }
         let descriptor = crate::kernel_tool_registry()
             .get_v2(&request.tool_id)
-            .ok_or_else(|| {
-                invalid_field("toolId", InvalidFieldViolationV2::InvalidEnum)
-            })?;
+            .ok_or_else(|| invalid_field("toolId", InvalidFieldViolationV2::InvalidEnum))?;
         let expected_contract_digest =
-            deepcode_kernel_abi::tool_contract_digest_v2(
-                &descriptor.descriptor_v2,
-            )
-            .map_err(|_| corrupt_store())?;
-        if descriptor.descriptor_v2.availability
-            != deepcode_kernel_abi::ToolAvailabilityV2::Ready
+            deepcode_kernel_abi::tool_contract_digest_v2(&descriptor.descriptor_v2)
+                .map_err(|_| corrupt_store())?;
+        if descriptor.descriptor_v2.availability != deepcode_kernel_abi::ToolAvailabilityV2::Ready
             || descriptor.executor_binding.is_none()
             || expected_contract_digest != request.tool_contract_digest
         {
-            return Err(invalid_field(
-                "toolId",
-                InvalidFieldViolationV2::OutOfRange,
-            ));
+            return Err(invalid_field("toolId", InvalidFieldViolationV2::OutOfRange));
         }
         let workspace = self.workspace_for_run(&request.run_id)?;
         let correlation_refs = match &request.authority {
             InvocationAuthorityV2::ContextRead { .. } => Vec::new(),
-            InvocationAuthorityV2::PlanAction {
-                plan_action_id, ..
-            } => {
+            InvocationAuthorityV2::PlanAction { plan_action_id, .. } => {
                 vec![deepcode_kernel_abi::v2::CorrelationRefV2::PlanAction {
                     value: plan_action_id.to_string(),
                 }]
@@ -1215,19 +1022,20 @@ impl AuthorityService {
         )
         .map_err(|failure| match failure {
             PrepareFailure::Kernel(error) => error,
-            PrepareFailure::Target(_) => invalid_field(
-                "rawArguments",
-                InvalidFieldViolationV2::OutOfRange,
-            ),
+            PrepareFailure::Target(reason) => {
+                let _ = reason;
+                invalid_field("rawArguments", InvalidFieldViolationV2::OutOfRange)
+            }
         })?;
         let mut state = self.inner.state.lock().map_err(|_| storage_fault())?;
-        let run = state
-            .runs
-            .get(&request.run_id)
-            .cloned()
-            .ok_or_else(|| KernelErrorV2::RunNotFound {
-                run_id: request.run_id.clone(),
-            })?;
+        let run =
+            state
+                .runs
+                .get(&request.run_id)
+                .cloned()
+                .ok_or_else(|| KernelErrorV2::RunNotFound {
+                    run_id: request.run_id.clone(),
+                })?;
         if run.epoch != request.control_epoch {
             return Err(KernelErrorV2::StaleControlEpoch {
                 run_id: request.run_id,
@@ -1235,9 +1043,7 @@ impl AuthorityService {
                 current: run.epoch,
             });
         }
-        if matches!(run.lifecycle, RunLifecycle::Terminated { .. })
-            || run.active_invocation_id.is_some()
-        {
+        if run.active_invocation_id.is_some() {
             return Err(invalid_field(
                 "runId",
                 InvalidFieldViolationV2::InvalidRelation,
@@ -1250,16 +1056,12 @@ impl AuthorityService {
             .count()
             >= 4
         {
-            return Err(invalid_field(
-                "runId",
-                InvalidFieldViolationV2::OutOfRange,
-            ));
+            return Err(invalid_field("runId", InvalidFieldViolationV2::OutOfRange));
         }
         if state.direct_invocations.values().any(|existing| {
             existing.run_id == request.run_id
                 && (existing.operation_id == request.operation_id
-                    || existing.idempotency_key_hash
-                        == prepared.idempotency_key_hash)
+                    || existing.idempotency_key_hash == prepared.idempotency_key_hash)
         }) {
             return Err(invalid_field(
                 "operationId",
@@ -1274,9 +1076,7 @@ impl AuthorityService {
             .resolved_targets
             .iter()
             .cloned()
-            .map(|target| {
-                (self.inner.ids.typed("resource", ResourceId::new), target)
-            })
+            .map(|target| (self.inner.ids.typed("resource", ResourceId::new), target))
             .collect::<Vec<_>>();
         let resource_fact_ids = targets
             .iter()
@@ -1353,9 +1153,7 @@ impl AuthorityService {
             targets,
             attempt_prepared_fact_id: attempt_fact_id,
             admitted_at: Instant::now(),
-            effective_deadline: Duration::from_millis(u64::from(
-                prepared.effective_deadline_ms,
-            )),
+            effective_deadline: Duration::from_millis(u64::from(prepared.effective_deadline_ms)),
             authority_material,
         })?;
         Ok(DirectToolIntentContinuationOutcome {
@@ -1445,9 +1243,7 @@ impl AuthorityService {
         let context = KernelToolExecutionContext {
             workspace_root: Some(workspace.canonical_root_utf8.clone()),
         };
-        let registration = match crate::kernel_tool_registry()
-            .get(&invocation.tool_id)
-        {
+        let registration = match crate::kernel_tool_registry().get(&invocation.tool_id) {
             Some(registration) => registration,
             None => return,
         };
@@ -1548,9 +1344,7 @@ impl AuthorityService {
             let resolution_fact_id = state
                 .resources
                 .get(&item.resource_id)
-                .filter(|resource| {
-                    resource.invocation_id == admitted.identity.invocation_id
-                })
+                .filter(|resource| resource.invocation_id == admitted.identity.invocation_id)
                 .map(|resource| resource.resolution_fact_id.clone())
                 .ok_or_else(corrupt_store)?;
             let fact_id = self.inner.ids.fact();
@@ -1636,15 +1430,13 @@ impl AuthorityService {
             if record.cancellation_observed_fact_id.is_none() {
                 drafts.push(fact_draft(
                     self.inner.ids.fact(),
-                    KernelFactPayloadV2::Invocation(
-                        InvocationFactV2::ToolCancellationObserved {
-                            identity: caused_direct_attempt(
-                                &ready.admitted.identity,
-                                cancellation_fact_id.clone(),
-                            ),
-                            cancel_request_id: request_id.clone(),
-                        },
-                    ),
+                    KernelFactPayloadV2::Invocation(InvocationFactV2::ToolCancellationObserved {
+                        identity: caused_direct_attempt(
+                            &ready.admitted.identity,
+                            cancellation_fact_id.clone(),
+                        ),
+                        cancel_request_id: request_id.clone(),
+                    }),
                 ));
             }
         }
@@ -1774,7 +1566,6 @@ impl AuthorityService {
             envelope,
             &command.run_id,
             command.expected_control_epoch,
-            true,
         )? {
             RunCommandCheck::Current(run) => run,
             RunCommandCheck::Recorded(reply) => return Ok(reply),
@@ -1783,15 +1574,9 @@ impl AuthorityService {
             InvocationCancelTargetV2::CurrentForRun {} => run.active_invocation_id.clone(),
             InvocationCancelTargetV2::Exact { invocation_id } => {
                 let invocation_run_id = state
-                    .invocations
+                    .direct_invocations
                     .get(&invocation_id)
-                    .map(|invocation| &invocation.run_id)
-                    .or_else(|| {
-                        state
-                            .direct_invocations
-                            .get(&invocation_id)
-                            .map(|invocation| &invocation.run_id)
-                    });
+                    .map(|invocation| &invocation.run_id);
                 let Some(invocation_run_id) = invocation_run_id else {
                     return self.record_semantic_error(
                         &mut state,
@@ -1825,25 +1610,16 @@ impl AuthorityService {
                 control_epoch: run.epoch,
             },
             Some(invocation_id) => {
-                let (phase, last_fact_id, stop_overlay) = if let Some(invocation) =
-                    state.invocations.get(&invocation_id)
-                {
-                    (
-                        invocation.phase,
-                        invocation.last_fact_id.clone(),
-                        invocation.stop_overlay.clone(),
-                    )
-                } else if let Some(invocation) =
-                    state.direct_invocations.get(&invocation_id)
-                {
-                    (
-                        invocation.phase,
-                        invocation.last_fact_id.clone(),
-                        invocation.stop_overlay.clone(),
-                    )
-                } else {
-                    return Err(corrupt_store());
-                };
+                let (phase, last_fact_id, stop_overlay) =
+                    if let Some(invocation) = state.direct_invocations.get(&invocation_id) {
+                        (
+                            invocation.phase,
+                            invocation.last_fact_id.clone(),
+                            invocation.stop_overlay.clone(),
+                        )
+                    } else {
+                        return Err(corrupt_store());
+                    };
                 if invocation_phase_is_terminal(phase) {
                     InvocationCancelReplyV2::AlreadyTerminal {
                         invocation_id,
@@ -1998,8 +1774,8 @@ impl AuthorityService {
                 })
                 .or_insert(fact.run_sequence);
         }
-        let recorded_at = RecordedAtV2::new("1970-01-01T00:00:00.000Z")
-            .map_err(|_| corrupt_store())?;
+        let recorded_at =
+            RecordedAtV2::new("1970-01-01T00:00:00.000Z").map_err(|_| corrupt_store())?;
         let mut envelopes = Vec::with_capacity(drafts.len());
         for draft in drafts {
             next_ledger_sequence = next_ledger_sequence
@@ -2079,11 +1855,7 @@ impl AuthorityService {
             .writer
             .lock()
             .map_err(|_| storage_fault())?
-            .append_with_public_receipt_and_authority_material(
-                drafts,
-                receipt,
-                mutations,
-            )
+            .append_with_public_receipt_and_authority_material(drafts, receipt, mutations)
             .map_err(|_| storage_fault())?;
         match outcome.receipt {
             PutPublicCommandReceiptOutcomeV2::Inserted(_) => {}
@@ -2100,18 +1872,6 @@ impl AuthorityService {
     }
 
     fn reconcile_open_attempts(&self) -> AuthorityResult<()> {
-        {
-            let mut state =
-                self.inner.state.lock().map_err(|_| storage_fault())?;
-            let drafts = recovery_drafts(
-                &state,
-                || self.inner.ids.fact(),
-                || self.inner.ids.typed("effect", EffectId::new),
-            )?;
-            if !drafts.is_empty() {
-                self.commit_locked(&mut state, drafts)?;
-            }
-        }
         let material = self
             .inner
             .reader
@@ -2119,18 +1879,14 @@ impl AuthorityService {
             .map_err(|_| storage_fault())?;
         let material_by_invocation = material
             .into_iter()
-            .filter(|record| {
-                record.material_kind == DIRECT_INVOCATION_MATERIAL_KIND
-            })
+            .filter(|record| record.material_kind == DIRECT_INVOCATION_MATERIAL_KIND)
             .map(|record| (record.material_id.clone(), record))
             .collect::<HashMap<_, _>>();
         let mut state = self.inner.state.lock().map_err(|_| storage_fault())?;
         let open = state
             .direct_invocations
             .values()
-            .filter(|invocation| {
-                !invocation_phase_is_terminal(invocation.phase)
-            })
+            .filter(|invocation| !invocation_phase_is_terminal(invocation.phase))
             .cloned()
             .collect::<Vec<_>>();
         for invocation in open {
@@ -2151,11 +1907,8 @@ impl AuthorityService {
                         .attempt_prepared_fact_id
                         .as_ref()
                         .ok_or_else(corrupt_store)?;
-                    if let Some((
-                        cancel_request_id,
-                        cancellation_fact_id,
-                        _,
-                    )) = invocation.stop_overlay.cancellation()
+                    if let Some((cancel_request_id, cancellation_fact_id, _)) =
+                        invocation.stop_overlay.cancellation()
                     {
                         direct_pre_effect_stop_drafts(
                             &identity,
@@ -2188,8 +1941,7 @@ impl AuthorityService {
                         .resources
                         .values()
                         .filter(|resource| {
-                            resource.invocation_id
-                                == invocation.invocation_id
+                            resource.invocation_id == invocation.invocation_id
                                 && resource.revalidation.is_some()
                         })
                         .map(|resource| resource.resource_id.clone())
@@ -2202,13 +1954,10 @@ impl AuthorityService {
                         self.inner.ids.fact(),
                         possible_resources,
                         ExecutionResolution::Indeterminate {
-                            evidence:
-                                EffectEvidenceV2::IndeterminateReadBack {
-                                    last_observation:
-                                        LastObservationV2::None {},
-                                },
-                            reason_code:
-                                IndeterminateReasonV2::RecoveryEvidenceInsufficient,
+                            evidence: EffectEvidenceV2::IndeterminateReadBack {
+                                last_observation: LastObservationV2::None {},
+                            },
+                            reason_code: IndeterminateReasonV2::RecoveryEvidenceInsufficient,
                         },
                         invocation
                             .stop_overlay
@@ -2219,8 +1968,7 @@ impl AuthorityService {
                 }
                 _ => return Err(corrupt_store()),
             };
-            let terminal_index =
-                drafts.len().checked_sub(1).ok_or_else(corrupt_store)?;
+            let terminal_index = drafts.len().checked_sub(1).ok_or_else(corrupt_store)?;
             let material_record = material_by_invocation
                 .get(invocation.invocation_id.as_str())
                 .ok_or_else(corrupt_store)?;
