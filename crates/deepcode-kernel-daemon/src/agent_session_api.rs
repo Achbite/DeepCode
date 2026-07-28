@@ -215,15 +215,14 @@ pub(crate) async fn agent_session_rename(
         .filter(|object| object.contains_key("profileId"))
         .map(|_| body.get("profileId").cloned().unwrap_or(Value::Null));
     let resolved_profile_id = if let Some(requested_profile_id) = requested_profile_id {
-        let run_locked = state
-            .session_runs
-            .lock()
-            .expect("session run state lock")
-            .values()
-            .any(|run| {
-                run.session_id == session_id
-                    && matches!(run.status.as_str(), "running" | "cancelling")
-            });
+        let run_locked = match state
+            .host_services
+            .active_runs_v2
+            .resolve_session_active_run(&session_id)
+        {
+            Ok(active) => active.is_some(),
+            Err(error) => return ApiResponse::error(error.code, error.message),
+        };
         if run_locked || session_has_pending_interaction(&gui, &session_id) {
             return ApiResponse::error(
                 "agent_session_profile_locked",
@@ -325,6 +324,17 @@ pub(crate) async fn agent_session_delete(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
 ) -> Json<ApiResponse> {
+    if let Err(error) = retire_agent_kernel_run_v2(
+        &state,
+        &session_id,
+        None,
+        "cancelled",
+        "Session deletion retired the active Kernel–Session v2 Run.",
+    )
+    .await
+    {
+        return ApiResponse::error(error.code, error.message);
+    }
     let safe_session_id = safe_path_segment(&session_id);
     let (
         sessions_dir,
@@ -395,11 +405,24 @@ pub(crate) async fn agent_session_archive(
     Path(session_id): Path<String>,
     Json(body): Json<Value>,
 ) -> Json<ApiResponse> {
-    let mut gui = state.gui.lock().expect("gui state lock");
     let should_archive = body
         .get("archived")
         .and_then(Value::as_bool)
         .unwrap_or(true);
+    if should_archive {
+        if let Err(error) = retire_agent_kernel_run_v2(
+            &state,
+            &session_id,
+            None,
+            "cancelled",
+            "Session archival retired the active Kernel–Session v2 Run.",
+        )
+        .await
+        {
+            return ApiResponse::error(error.code, error.message);
+        }
+    }
+    let mut gui = state.gui.lock().expect("gui state lock");
     let archived_scope_key = session_by_id(&gui, &session_id).map(session_scope_key);
     let was_global_current = gui.current_session_id.as_deref() == Some(session_id.as_str());
     let was_scoped_current = archived_scope_key

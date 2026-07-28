@@ -42,6 +42,7 @@ pub(crate) enum HostWorkspaceRegistryErrorV2 {
     RootInaccessible,
     InvalidBindingReference,
     BindingNotFound,
+    BindingIdentityMismatch,
     CapacityExceeded,
     EntropyUnavailable,
     RegistryUnavailable,
@@ -57,6 +58,9 @@ impl fmt::Display for HostWorkspaceRegistryErrorV2 {
             Self::RootInaccessible => "workspace root is not accessible",
             Self::InvalidBindingReference => "workspace binding reference is invalid",
             Self::BindingNotFound => "workspace binding reference was not found",
+            Self::BindingIdentityMismatch => {
+                "workspace binding identity does not match the registered root"
+            }
             Self::CapacityExceeded => "workspace binding registry capacity was exceeded",
             Self::EntropyUnavailable => "workspace binding reference entropy is unavailable",
             Self::RegistryUnavailable => "workspace binding registry is unavailable",
@@ -293,6 +297,48 @@ impl HostWorkspaceRegistryAdminV2 {
         } else {
             Err(HostWorkspaceRegistryErrorV2::BindingNotFound)
         }
+    }
+
+    pub(crate) fn unregister_exact(
+        &self,
+        workspace_binding_ref: &WorkspaceBindingRefV2,
+        expected_workspace_identity: &str,
+    ) -> Result<(), HostWorkspaceRegistryErrorV2> {
+        self.require_operational()?;
+        validate_workspace_binding_ref(workspace_binding_ref)?;
+        let mut state = self
+            .inner
+            .state
+            .write()
+            .map_err(|_| HostWorkspaceRegistryErrorV2::RegistryUnavailable)?;
+        let HostWorkspaceRegistryStateV2::Operational {
+            bindings,
+            conflicts,
+            ..
+        } = &mut *state
+        else {
+            return Err(HostWorkspaceRegistryErrorV2::RegistryUnavailable);
+        };
+        if conflicts.contains(workspace_binding_ref) {
+            return Err(HostWorkspaceRegistryErrorV2::BindingIdentityMismatch);
+        }
+        let record = bindings
+            .get(workspace_binding_ref)
+            .ok_or(HostWorkspaceRegistryErrorV2::BindingNotFound)?;
+        let WorkspaceBindingRecordV2::Ready {
+            canonical_root,
+            root_identity,
+        } = record
+        else {
+            return Err(HostWorkspaceRegistryErrorV2::BindingIdentityMismatch);
+        };
+        if workspace_identity_token_from_stored(canonical_root, root_identity)
+            != expected_workspace_identity
+        {
+            return Err(HostWorkspaceRegistryErrorV2::BindingIdentityMismatch);
+        }
+        bindings.remove(workspace_binding_ref);
+        Ok(())
     }
 
     pub(crate) fn rehydrate(
@@ -557,11 +603,33 @@ fn workspace_identity_token(root: &ValidatedWorkspaceRootV2) -> String {
     )
 }
 
+#[cfg(unix)]
+fn workspace_identity_token_from_stored(
+    _canonical_root: &Path,
+    root_identity: &WorkspaceRootIdentityV2,
+) -> String {
+    format!(
+        "deepcode.workspace-root.v2:unix:{:016x}:{:016x}",
+        root_identity.device, root_identity.inode
+    )
+}
+
 #[cfg(not(unix))]
 fn workspace_identity_token(root: &ValidatedWorkspaceRootV2) -> String {
     format!(
         "deepcode.workspace-root.v2:path:{}",
         deepcode_kernel_tools::hash_bytes(root.canonical_root.to_string_lossy().as_bytes())
+    )
+}
+
+#[cfg(not(unix))]
+fn workspace_identity_token_from_stored(
+    canonical_root: &Path,
+    _root_identity: &WorkspaceRootIdentityV2,
+) -> String {
+    format!(
+        "deepcode.workspace-root.v2:path:{}",
+        deepcode_kernel_tools::hash_bytes(canonical_root.to_string_lossy().as_bytes())
     )
 }
 

@@ -1,5 +1,6 @@
 mod agent_api;
 mod agent_bridge;
+mod agent_kernel_v2;
 mod agent_run_projection;
 mod agent_session_api;
 mod agent_session_state;
@@ -10,6 +11,7 @@ mod decision_capability_v2;
 mod event_projection;
 mod goal_api;
 mod host_inspection;
+mod host_kernel_operation_store_v2;
 mod host_kernel_run_v2;
 mod host_run_broker_v2;
 mod host_services;
@@ -45,6 +47,7 @@ use crate::prelude::*;
 
 pub(crate) use agent_api::*;
 pub(crate) use agent_bridge::*;
+pub(crate) use agent_kernel_v2::*;
 pub(crate) use agent_run_projection::*;
 pub(crate) use agent_session_api::*;
 pub(crate) use agent_session_state::*;
@@ -82,6 +85,11 @@ async fn main() {
         .ok()
         .and_then(|value| value.parse::<u16>().ok())
         .unwrap_or(31245);
+    let addr: SocketAddr = format!("{host}:{port}").parse().expect("valid host/port");
+    assert!(
+        addr.ip().is_loopback(),
+        "Kernel v2 capability transport requires a loopback listener"
+    );
     let mut runtime = if let Some(path) = kernel_ledger_path() {
         DeepCodeKernelRuntime::with_ndjson_ledger(path)
     } else {
@@ -97,28 +105,48 @@ async fn main() {
         kernel_v2_fact_store_path,
         kernel_v2_executor_config,
         Arc::new(kernel_v2_secrets),
-        kernel_v2_settings_ceiling(&gui_state),
     )
     .expect("open canonical Kernel v2 service");
     let host_services = HostServices::from_projects(
         &gui_state.projects,
         gui_state.paths.sessions_dir.clone(),
+        kernel_v2_service.clone(),
         Some(kernel_v2_service.fact_reader()),
     );
+    let gui = Arc::new(Mutex::new(gui_state));
     let (kernel_v2_host_authority, kernel_v2_host_capability) =
         crate::kernel_v2_transport::HostTransportAuthorityV2::new_pair()
             .expect("initialize Host-only Kernel v2 transport authority");
     let kernel_v2 = crate::kernel_v2_transport::KernelV2TransportState::new(
         kernel_v2_service,
         host_services.workspace.resolver_v2(),
+        Arc::new(GuiRunSettingsResolverV2 {
+            gui: Arc::clone(&gui),
+        }),
         kernel_v2_host_authority,
     )
     .expect("initialize Kernel v2 transport");
+    let kernel_v2_bridge_assets =
+        crate::host_kernel_run_v2::HostKernelBridgeAssetsV2::resolve_at_daemon_start()
+            .expect("resolve trusted Session Kernel v2 bridge assets");
+    let kernel_session_v2 = crate::host_kernel_run_v2::HostKernelRunCoordinatorV2::new(
+        host_services.clone(),
+        kernel_v2.clone(),
+        kernel_v2_bridge_assets,
+        format!("http://{addr}"),
+    )
+    .expect("initialize Host-owned Session Kernel v2 coordinator");
+    if let Err(error) = kernel_session_v2.reconcile_startup().await {
+        host_services
+            .active_runs_v2
+            .record_startup_error(error.code);
+    }
     let state = AppState {
         runtime: Arc::new(Mutex::new(runtime)),
         kernel_v2,
+        kernel_session_v2,
         kernel_v2_host_capability,
-        gui: Arc::new(Mutex::new(gui_state)),
+        gui,
         host_services,
         terminal_runtime: Arc::new(Mutex::new(TerminalRuntime::new())),
         kernel_events: Arc::new(Mutex::new(Vec::new())),
@@ -126,7 +154,6 @@ async fn main() {
         session_run_deltas: Arc::new(Mutex::new(HashMap::new())),
         projection_delivery: Arc::new(Mutex::new(ProjectionDeliveryBufferState::default())),
     };
-    discover_session_run_recovery(&state);
     if std::env::var("DEEPCODE_DAEMON_IPC_STDIO")
         .map(|value| value == "1")
         .unwrap_or(false)
@@ -142,11 +169,6 @@ async fn main() {
         return;
     }
     let app = routes::build_app(state);
-    let addr: SocketAddr = format!("{host}:{port}").parse().expect("valid host/port");
-    assert!(
-        addr.ip().is_loopback(),
-        "Kernel v2 capability transport requires a loopback listener"
-    );
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .expect("bind deepcode web host");
@@ -219,22 +241,45 @@ fn permission_mode_setting(value: &str) -> deepcode_kernel_tools::ToolPermission
 }
 
 fn kernel_v2_settings_ceiling(gui: &GuiState) -> deepcode_kernel_runtime::v2::SettingsCeilingV2 {
-    let permission_enabled = |key: &str| {
-        gui.user_settings
-            .get(key)
-            .and_then(Value::as_str)
-            .is_some_and(|value| value != "deny")
-    };
+    let permission_enabled =
+        |key: &str, default_enabled: bool| match gui.user_settings.get(key).and_then(Value::as_str)
+        {
+            Some("deny") => false,
+            Some(_) => true,
+            None => default_enabled,
+        };
     deepcode_kernel_runtime::v2::SettingsCeilingV2 {
-        workspace_read: permission_enabled("agent.permissions.workspaceRead"),
-        workspace_write: permission_enabled("agent.permissions.workspaceWrite"),
-        git_write: permission_enabled("agent.permissions.gitWrite"),
-        web_read: permission_enabled("agent.permissions.webRead"),
-        private_web_read: permission_enabled("agent.permissions.privateWebRead"),
+        workspace_read: permission_enabled("agent.permissions.workspaceRead", true),
+        workspace_write: permission_enabled("agent.permissions.workspaceWrite", true),
+        git_write: permission_enabled("agent.permissions.gitWrite", false),
+        web_read: permission_enabled("agent.permissions.webRead", false),
+        private_web_read: permission_enabled("agent.permissions.privateWebRead", false),
         auto_approve_plans: gui
             .user_settings
             .get("agent.permissions.autoApprovePlans")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+    }
+}
+
+#[derive(Clone)]
+struct GuiRunSettingsResolverV2 {
+    gui: Arc<Mutex<GuiState>>,
+}
+
+impl crate::kernel_v2_transport::HostRunSettingsResolverV2 for GuiRunSettingsResolverV2 {
+    fn resolve_run_settings(
+        &self,
+        _workspace_binding_ref: &deepcode_kernel_abi::WorkspaceBindingRefV2,
+    ) -> Result<
+        deepcode_kernel_runtime::v2::SettingsCeilingV2,
+        crate::host_workspace_registry_v2::HostWorkspaceResolveErrorV2,
+    > {
+        self.gui
+            .lock()
+            .map(|gui| kernel_v2_settings_ceiling(&gui))
+            .map_err(|_| {
+                crate::host_workspace_registry_v2::HostWorkspaceResolveErrorV2::Unavailable
+            })
     }
 }

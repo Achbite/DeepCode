@@ -198,10 +198,23 @@ impl KernelV2IpcDispatcher {
                 ))
             }
         };
+        let settings = match self
+            .state
+            .settings_resolver()
+            .resolve_run_settings(&workspace_binding_ref)
+        {
+            Ok(settings) => settings,
+            Err(error) => {
+                return KernelV2IpcDispatchV2::response_only(encode_transport_error(
+                    workspace_error(error).1,
+                    Some(request_id),
+                ))
+            }
+        };
         let (response, run_capability) = self
             .state
             .service()
-            .open_run(envelope, &workspace_root)
+            .open_run(envelope, &workspace_root, settings)
             .into_parts();
         KernelV2IpcDispatchV2 {
             response_body: encode_or_service_error(&response, Some(request_id)),

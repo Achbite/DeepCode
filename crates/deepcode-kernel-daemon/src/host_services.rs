@@ -1,5 +1,10 @@
 use crate::host_inspection::HostInspectionExecutor;
-use crate::host_run_broker_v2::{HostActiveRunBrokerV2, HostRunSettingsCeilingV2};
+use crate::host_kernel_operation_store_v2::HostKernelOperationStoreV2;
+use crate::host_run_broker_v2::{
+    HostActiveRunBrokerV2, HostKernelRunRetirementProofV2, HostRunRetirementReceiptV2,
+    HostRunSettingsCeilingV2, HostSessionTurnGuardV2,
+};
+use crate::host_v2_storage::HostV2StorageError;
 use crate::host_workspace_registry_v2::{
     HostWorkspaceBindingRegisteredV2, HostWorkspaceBindingResolverV2, HostWorkspaceRegistryAdminV2,
     HostWorkspaceRegistryErrorV2, HostWorkspaceRegistryReadinessV2, HostWorkspaceRegistryV2,
@@ -7,6 +12,7 @@ use crate::host_workspace_registry_v2::{
 };
 use crate::prelude::*;
 use crate::session_kernel_v2_store::{SessionKernelProjectionSinkV2, SessionKernelV2Store};
+use deepcode_kernel_abi::v2::{RunId, RunRetirementReasonCodeV2};
 use deepcode_kernel_abi::{
     HostInspectionResult, HostMcpRiskDecisionRecord, HostMcpRiskDecisionSubmit, HostResultSource,
     HostSkillActivationStatus, HostSkillAdapterKind, HostSkillCatalogResult, HostSkillDescriptor,
@@ -16,6 +22,7 @@ use deepcode_kernel_abi::{
     HostWorkspaceSourceKind, HostWorkspaceSpec, WorkspaceBinding, WorkspaceBindingRefV2,
 };
 use deepcode_kernel_ledger::v2::CanonicalFactReader;
+use deepcode_kernel_runtime::v2::KernelSessionServiceV2;
 use deepcode_kernel_skills::{scan_skill_mount, SkillActivationStatus, SkillMountEntry};
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -87,6 +94,29 @@ impl HostWorkspaceService {
         self.registry_admin
             .unregister(workspace_binding_ref)
             .map_err(registry_error)
+    }
+
+    fn unregister_exact_managed_root_if_present_v2(
+        &self,
+        workspace_binding_ref: &WorkspaceBindingRefV2,
+        expected_workspace_identity: &str,
+    ) -> Result<(), HostV2StorageError> {
+        match self
+            .registry_admin
+            .unregister_exact(workspace_binding_ref, expected_workspace_identity)
+        {
+            Ok(()) | Err(HostWorkspaceRegistryErrorV2::BindingNotFound) => Ok(()),
+            Err(HostWorkspaceRegistryErrorV2::BindingIdentityMismatch) => {
+                Err(HostV2StorageError::conflict(
+                    "host_run_workspace_identity_mismatch",
+                    "Host Run workspace binding no longer matches its durable owned identity",
+                ))
+            }
+            Err(error) => Err(HostV2StorageError::io(
+                "host_run_workspace_unregister_failed",
+                format!("unregister exact Host Run workspace binding: {error}"),
+            )),
+        }
     }
 
     pub(crate) fn resolve_binding(
@@ -611,14 +641,17 @@ pub(crate) struct HostServices {
     pub(crate) skill_admin: HostSkillAdminService,
     pub(crate) audit: AuditService,
     pub(crate) active_runs_v2: HostActiveRunBrokerV2,
+    pub(crate) kernel_operations_v2: HostKernelOperationStoreV2,
     pub(crate) session_kernel_v2: SessionKernelV2Store,
     pub(crate) projection_v2: SessionKernelProjectionSinkV2,
+    kernel_v2_service: KernelSessionServiceV2,
 }
 
 impl HostServices {
     pub(crate) fn from_projects(
         projects: &[Value],
         sessions_dir: PathBuf,
+        kernel_v2_service: KernelSessionServiceV2,
         audit_reader: Option<CanonicalFactReader>,
     ) -> Self {
         let active_runs_v2 = HostActiveRunBrokerV2::new(sessions_dir.clone());
@@ -626,6 +659,20 @@ impl HostServices {
             projects,
             active_runs_v2.workspace_rehydrate_records(),
         );
+        let recovery_kernel_v2_service = kernel_v2_service.clone();
+        if let Err(error) = active_runs_v2.recover_retiring_runs(
+            |run_id, reason_code, reason| {
+                retire_kernel_authority_v2(&recovery_kernel_v2_service, run_id, reason_code, reason)
+            },
+            |workspace_binding_ref, workspace_identity| {
+                workspace.unregister_exact_managed_root_if_present_v2(
+                    workspace_binding_ref,
+                    workspace_identity,
+                )
+            },
+        ) {
+            active_runs_v2.record_startup_error(error.code);
+        }
         Self {
             inspection: HostInspectionService::new(workspace.clone()),
             workspace,
@@ -635,9 +682,57 @@ impl HostServices {
                 sessions_dir.clone(),
                 active_runs_v2.clone(),
             ),
-            projection_v2: SessionKernelProjectionSinkV2::new(sessions_dir, active_runs_v2.clone()),
+            projection_v2: SessionKernelProjectionSinkV2::new(
+                sessions_dir.clone(),
+                active_runs_v2.clone(),
+            ),
+            kernel_operations_v2: HostKernelOperationStoreV2::new(sessions_dir),
             active_runs_v2,
+            kernel_v2_service,
         }
+    }
+
+    pub(crate) async fn retire_kernel_run_v2(
+        &self,
+        session_id: &str,
+        host_run_id: &str,
+        run_id: &str,
+    ) -> Result<HostRunRetirementReceiptV2, HostV2StorageError> {
+        let turn = self.active_runs_v2.begin_session_turn(session_id).await?;
+        self.retire_kernel_run_with_turn_v2(
+            &turn,
+            host_run_id,
+            run_id,
+            RunRetirementReasonCodeV2::SessionEnded,
+            None,
+        )
+    }
+
+    pub(crate) fn retire_kernel_run_with_turn_v2(
+        &self,
+        turn: &HostSessionTurnGuardV2,
+        host_run_id: &str,
+        run_id: &str,
+        reason_code: RunRetirementReasonCodeV2,
+        reason: Option<&str>,
+    ) -> Result<HostRunRetirementReceiptV2, HostV2StorageError> {
+        self.active_runs_v2.retire_run(
+            turn,
+            host_run_id,
+            run_id,
+            &crate::utils::now_text(),
+            reason_code,
+            reason,
+            |run_id, reason_code, reason| {
+                retire_kernel_authority_v2(&self.kernel_v2_service, run_id, reason_code, reason)
+            },
+            |workspace_binding_ref, workspace_identity| {
+                self.workspace.unregister_exact_managed_root_if_present_v2(
+                    workspace_binding_ref,
+                    workspace_identity,
+                )
+            },
+        )
     }
 
     pub(crate) fn prepare_empty_run_workspace(
@@ -649,7 +744,24 @@ impl HostServices {
             .active_runs_v2
             .prepare_empty_workspace_root(session_id, host_run_id)
             .map_err(host_v2_service_error)?;
-        let registered = self.workspace.register_managed_root(&empty.root)?;
+        let registered = match self.workspace.register_managed_root(&empty.root) {
+            Ok(registered) => registered,
+            Err(register_error) => {
+                return match self
+                    .active_runs_v2
+                    .discard_prepared_empty_workspace_root(&empty.key)
+                {
+                    Ok(()) => Err(register_error),
+                    Err(cleanup_error) => Err(host_service_error(
+                        "host_empty_workspace_prepare_cleanup_failed",
+                        format!(
+                            "register prepared workspace failed with {}; remove prepared root failed with {}",
+                            register_error.code, cleanup_error.code
+                        ),
+                    )),
+                };
+            }
+        };
         Ok(HostPreparedEmptyWorkspaceV2 {
             workspace_binding_ref: registered.workspace_binding_ref,
             workspace_binding_identity: registered.workspace_identity,
@@ -658,12 +770,57 @@ impl HostServices {
         })
     }
 
+    pub(crate) fn prepare_bound_run_workspace(
+        &self,
+        path: &str,
+    ) -> Result<HostPreparedBoundWorkspaceV2, KernelErrorEnvelope> {
+        let resolved = resolve_workspace_root(path)?;
+        preflight_workspace_root_readable(&resolved.root)?;
+        let registered = self.workspace.register_managed_root(&resolved.root)?;
+        Ok(HostPreparedBoundWorkspaceV2 {
+            workspace_binding_ref: registered.workspace_binding_ref,
+            workspace_binding_identity: registered.workspace_identity,
+        })
+    }
+
+    pub(crate) fn discard_prepared_bound_run_workspace(
+        &self,
+        prepared: &HostPreparedBoundWorkspaceV2,
+    ) -> Result<(), KernelErrorEnvelope> {
+        self.workspace
+            .unregister_exact_managed_root_if_present_v2(
+                &prepared.workspace_binding_ref,
+                &prepared.workspace_binding_identity,
+            )
+            .map_err(host_v2_service_error)
+    }
+
     pub(crate) fn discard_prepared_empty_run_workspace(
         &self,
         prepared: &HostPreparedEmptyWorkspaceV2,
     ) -> Result<(), KernelErrorEnvelope> {
-        self.workspace
-            .unregister_managed_root(&prepared.workspace_binding_ref)
+        let unregister = self
+            .workspace
+            .unregister_exact_managed_root_if_present_v2(
+                &prepared.workspace_binding_ref,
+                &prepared.workspace_binding_identity,
+            )
+            .map_err(host_v2_service_error);
+        let remove = self
+            .active_runs_v2
+            .discard_prepared_empty_workspace_root(&prepared.empty_workspace_key)
+            .map_err(host_v2_service_error);
+        match (unregister, remove) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(unregister_error), Err(remove_error)) => Err(host_service_error(
+                "host_empty_workspace_cleanup_failed",
+                format!(
+                    "unregister prepared workspace failed with {}; remove prepared root failed with {}",
+                    unregister_error.code, remove_error.code
+                ),
+            )),
+        }
     }
 
     /// Routes Host-owned read and administration commands without consulting
@@ -741,6 +898,12 @@ pub(crate) struct HostPreparedEmptyWorkspaceV2 {
     pub(crate) workspace_binding_identity: String,
     pub(crate) empty_workspace_key: String,
     pub(crate) run_settings: HostRunSettingsCeilingV2,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct HostPreparedBoundWorkspaceV2 {
+    pub(crate) workspace_binding_ref: WorkspaceBindingRefV2,
+    pub(crate) workspace_binding_identity: String,
 }
 
 struct ResolvedWorkspaceRoot {
@@ -1171,6 +1334,32 @@ fn registry_error(error: HostWorkspaceRegistryErrorV2) -> KernelErrorEnvelope {
 
 fn host_v2_service_error(error: crate::host_v2_storage::HostV2StorageError) -> KernelErrorEnvelope {
     host_service_error(error.code, error.message)
+}
+
+fn retire_kernel_authority_v2(
+    service: &KernelSessionServiceV2,
+    run_id: &str,
+    reason_code: RunRetirementReasonCodeV2,
+    reason: Option<&str>,
+) -> Result<HostKernelRunRetirementProofV2, HostV2StorageError> {
+    let run_id = RunId::new(run_id.to_string()).map_err(|_| {
+        HostV2StorageError::conflict(
+            "host_kernel_run_id_invalid",
+            "Host Run contains an invalid Kernel Run identity",
+        )
+    })?;
+    let receipt = service
+        .retire_run_host(run_id, reason_code, reason.map(ToOwned::to_owned))
+        .map_err(|_| {
+            HostV2StorageError::io(
+                "host_kernel_run_retirement_failed",
+                "Kernel Run retirement did not reach its durable terminal fact",
+            )
+        })?;
+    Ok(HostKernelRunRetirementProofV2 {
+        fact_id: receipt.retirement_fact_id.as_str().to_string(),
+        ledger_sequence: receipt.retirement_ledger_sequence,
+    })
 }
 
 fn resolve_error(error: HostWorkspaceResolveErrorV2) -> KernelErrorEnvelope {

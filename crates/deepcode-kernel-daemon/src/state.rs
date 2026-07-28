@@ -5,6 +5,7 @@ use crate::*;
 pub(crate) struct AppState {
     pub(crate) runtime: Arc<Mutex<DeepCodeKernelRuntime>>,
     pub(crate) kernel_v2: crate::kernel_v2_transport::KernelV2TransportState,
+    pub(crate) kernel_session_v2: crate::host_kernel_run_v2::HostKernelRunCoordinatorV2,
     pub(crate) kernel_v2_host_capability: crate::kernel_v2_transport::HostTransportCapabilityV2,
     pub(crate) gui: Arc<Mutex<GuiState>>,
     pub(crate) host_services: HostServices,

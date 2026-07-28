@@ -109,10 +109,28 @@ pub(crate) fn reject_transport_capabilities(value: &Value) -> Result<(), HostV2S
         }
         Value::Object(fields) => {
             for (key, nested) in fields {
-                if matches!(key.as_str(), "runCapability" | "decisionCapability") {
+                let normalized_key = key
+                    .bytes()
+                    .filter(u8::is_ascii_alphanumeric)
+                    .map(|byte| byte.to_ascii_lowercase())
+                    .collect::<Vec<_>>();
+                if matches!(
+                    normalized_key.as_slice(),
+                    b"runcapability"
+                        | b"decisioncapability"
+                        | b"authorization"
+                        | b"cookie"
+                        | b"apikey"
+                        | b"accesstoken"
+                        | b"refreshtoken"
+                        | b"bearertoken"
+                        | b"clientsecret"
+                        | b"password"
+                        | b"token"
+                ) {
                     return Err(HostV2StorageError::invalid(
                         "host_v2_transport_secret_forbidden",
-                        "Transport capabilities cannot enter Host v2 persistence",
+                        "Transport capabilities or secret material cannot enter Host v2 persistence",
                     ));
                 }
                 reject_transport_capabilities(nested)?;
@@ -182,6 +200,29 @@ pub(crate) fn sha256_prefixed(value: &[u8]) -> String {
 
 pub(crate) fn sha256_path_component(value: &str) -> String {
     lower_hex(&Sha256::digest(value.as_bytes()))
+}
+
+pub(crate) fn validate_sha256_digest(
+    value: &str,
+    field: &'static str,
+) -> Result<(), HostV2StorageError> {
+    let Some(hex) = value.strip_prefix("sha256:") else {
+        return Err(HostV2StorageError::invalid(
+            "host_v2_digest_invalid",
+            format!("{field} must be a sha256 digest"),
+        ));
+    };
+    if hex.len() != 64
+        || !hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(HostV2StorageError::invalid(
+            "host_v2_digest_invalid",
+            format!("{field} must be a lowercase sha256 digest"),
+        ));
+    }
+    Ok(())
 }
 
 fn lower_hex(value: &[u8]) -> String {

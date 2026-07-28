@@ -1,6 +1,8 @@
 use axum::body::Body;
-use axum::extract::State;
-use axum::http::{header, HeaderMap, Method, StatusCode, Uri};
+use axum::extract::{Request, State};
+use axum::http::request::Parts;
+use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
 use axum::Router;
@@ -10,7 +12,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
 
 #[derive(Clone)]
@@ -98,8 +100,15 @@ async fn main() {
         );
     }
 
-    let app = app.with_state(state).layer(localhost_cors_layer());
+    let app = app
+        .with_state(state)
+        .layer(localhost_cors_layer())
+        .layer(axum::middleware::from_fn(trusted_local_origin_gate));
     let addr: SocketAddr = format!("{host}:{port}").parse().expect("valid host/port");
+    assert!(
+        addr.ip().is_loopback(),
+        "DeepCode Host private API requires a loopback listener"
+    );
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .expect("bind deepcode dev host");
@@ -147,7 +156,9 @@ fn spawn_daemon_if_requested(host: &str, port: u16) -> Option<Child> {
 
 fn localhost_cors_layer() -> CorsLayer {
     CorsLayer::new()
-        .allow_origin(Any)
+        .allow_origin(AllowOrigin::predicate(
+            |origin: &HeaderValue, _request: &Parts| trusted_cors_origin(origin),
+        ))
         .allow_methods([
             Method::GET,
             Method::POST,
@@ -157,6 +168,64 @@ fn localhost_cors_layer() -> CorsLayer {
             Method::OPTIONS,
         ])
         .allow_headers([header::CONTENT_TYPE])
+}
+
+async fn trusted_local_origin_gate(request: Request, next: Next) -> Response {
+    if trusted_local_origin(request.headers()) {
+        return next.run(request).await;
+    }
+    (
+        StatusCode::FORBIDDEN,
+        ApiResponse::error(
+            "host_origin_forbidden",
+            "DeepCode Host APIs accept only non-browser local clients, the same loopback application origin, or deepcode-gui://localhost",
+        ),
+    )
+        .into_response()
+}
+
+fn trusted_local_origin(headers: &HeaderMap) -> bool {
+    let Some(origin) = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return true;
+    };
+    if origin == "deepcode-gui://localhost" {
+        return true;
+    }
+    let Some(origin_authority) = origin.strip_prefix("http://") else {
+        return false;
+    };
+    let Some(request_authority) = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    origin_authority == request_authority && is_loopback_authority(origin_authority)
+}
+
+fn trusted_cors_origin(origin: &HeaderValue) -> bool {
+    let Ok(origin) = origin.to_str() else {
+        return false;
+    };
+    if origin == "deepcode-gui://localhost" {
+        return true;
+    }
+    origin
+        .strip_prefix("http://")
+        .map(is_loopback_authority)
+        .unwrap_or(false)
+}
+
+fn is_loopback_authority(authority: &str) -> bool {
+    authority == "localhost"
+        || authority.starts_with("localhost:")
+        || authority == "127.0.0.1"
+        || authority.starts_with("127.0.0.1:")
+        || authority == "[::1]"
+        || authority.starts_with("[::1]:")
 }
 
 fn client_dist_dir() -> Option<PathBuf> {

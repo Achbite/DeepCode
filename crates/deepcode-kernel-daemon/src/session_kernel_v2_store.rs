@@ -28,6 +28,8 @@ const SESSION_KERNEL_PERSISTENCE_LIST_REPLY_V2_SCHEMA: &str =
     "deepcode.session.kernel-persistence-list-reply.v2";
 const SESSION_KERNEL_PERSISTENCE_APPEND_REPLY_V2_SCHEMA: &str =
     "deepcode.session.kernel-persistence-append-reply.v2";
+const SESSION_KERNEL_OPERATION_RESULT_V2_SCHEMA: &str =
+    "deepcode.session.kernel-operation-result.v2";
 const SESSION_KERNEL_HOST_PROJECTION_REQUEST_V2_SCHEMA: &str =
     "deepcode.session.kernel-host-projection-request.v2";
 const SESSION_KERNEL_HOST_PROJECTION_REPLY_V2_SCHEMA: &str =
@@ -46,9 +48,11 @@ pub(crate) enum SessionKernelPersistenceRecordKindV2 {
     StoreHeader,
     Input,
     Plan,
+    PlanDecision,
     PublicRequest,
     PublicRequestSettled,
     Checkpoint,
+    OperationResult,
     Projection,
     ProjectionDelivered,
 }
@@ -185,6 +189,7 @@ impl SessionKernelV2Store {
                     format!("encode Session Kernel persistence record: {error}"),
                 )
             })?;
+            preflight_store_append(&path, records.len(), &value)?;
             append_json_line_durable(&path, &value)?;
             Ok(SessionKernelPersistenceAppendReplyV2 {
                 schema_version: SESSION_KERNEL_PERSISTENCE_APPEND_REPLY_V2_SCHEMA,
@@ -194,6 +199,74 @@ impl SessionKernelV2Store {
                 record_digest: request.record.record_digest,
                 replayed: false,
             })
+        })
+    }
+
+    fn get_record(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        record_id: &str,
+        capability: &RunCapabilityV2,
+    ) -> Result<SessionKernelPersistenceRecordV2, HostV2StorageError> {
+        self.active_runs
+            .authorize_session_run_transport(session_id, run_id, capability)?;
+        validate_bounded_identity(record_id, "recordId", 128 * 1024)?;
+        let path = self.run_store_path(session_id, run_id)?;
+        with_storage_path_lock(&path, || {
+            read_run_store(&path, session_id, run_id)?
+                .into_iter()
+                .find(|record| record.record_id == record_id)
+                .ok_or_else(|| {
+                    HostV2StorageError::not_found(
+                        "session_kernel_persistence_record_not_found",
+                        "Session Kernel persistence record was not found",
+                    )
+                })
+        })
+    }
+
+    pub(crate) fn resolve_operation_result(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        operation_request_id: &str,
+        record_id: &str,
+        record_digest: &str,
+        result_digest: &str,
+        capability: &RunCapabilityV2,
+    ) -> Result<Value, HostV2StorageError> {
+        validate_bounded_identity(operation_request_id, "operationRequestId", 512)?;
+        validate_bounded_identity(record_digest, "recordDigest", 512)?;
+        validate_bounded_identity(result_digest, "resultDigest", 512)?;
+        let record = self.get_record(session_id, run_id, record_id, capability)?;
+        if record.record_kind != SessionKernelPersistenceRecordKindV2::OperationResult
+            || record.record_digest != record_digest
+        {
+            return Err(HostV2StorageError::conflict(
+                "session_kernel_operation_result_reference_conflict",
+                "Stored Session operation result does not match its immutable reference",
+            ));
+        }
+        let data = record.data.as_object().ok_or_else(|| {
+            HostV2StorageError::conflict(
+                "session_kernel_operation_result_reference_conflict",
+                "Stored Session operation result has an invalid durable envelope",
+            )
+        })?;
+        if data.get("operationRequestId").and_then(Value::as_str) != Some(operation_request_id)
+            || data.get("resultDigest").and_then(Value::as_str) != Some(result_digest)
+        {
+            return Err(HostV2StorageError::conflict(
+                "session_kernel_operation_result_reference_conflict",
+                "Stored Session operation result belongs to another operation or digest",
+            ));
+        }
+        data.get("result").cloned().ok_or_else(|| {
+            HostV2StorageError::conflict(
+                "session_kernel_operation_result_reference_conflict",
+                "Stored Session operation result has no durable result payload",
+            )
         })
     }
 
@@ -210,6 +283,51 @@ impl SessionKernelV2Store {
             .join("kernel-v2")
             .join(format!("{}.jsonl", sha256_path_component(run_id))))
     }
+}
+
+fn preflight_store_append(
+    path: &FsPath,
+    record_count: usize,
+    value: &Value,
+) -> Result<(), HostV2StorageError> {
+    if record_count >= MAX_V2_STORE_RECORDS {
+        return Err(HostV2StorageError::conflict(
+            "host_v2_storage_limit_exceeded",
+            "Host v2 JSONL stream reached its bounded record count",
+        ));
+    }
+    let encoded = serde_json::to_vec(value).map_err(|error| {
+        HostV2StorageError::invalid(
+            "host_v2_storage_encode_failed",
+            format!("encode Host v2 JSONL record: {error}"),
+        )
+    })?;
+    if encoded.is_empty() || encoded.len() > MAX_V2_STORE_RECORD_BYTES {
+        return Err(HostV2StorageError::conflict(
+            "host_v2_storage_record_invalid",
+            "Host v2 JSONL record is empty or exceeds its bounded size",
+        ));
+    }
+    let current_bytes = match fs::metadata(path) {
+        Ok(metadata) => metadata.len(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => {
+            return Err(HostV2StorageError::io(
+                "host_v2_storage_read_failed",
+                format!("inspect Host v2 JSONL stream before append: {error}"),
+            ))
+        }
+    };
+    let appended_bytes = u64::try_from(encoded.len())
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    if current_bytes.saturating_add(appended_bytes) > MAX_V2_STORE_FILE_BYTES {
+        return Err(HostV2StorageError::conflict(
+            "host_v2_storage_limit_exceeded",
+            "Host v2 JSONL append would exceed its bounded size",
+        ));
+    }
+    Ok(())
 }
 
 fn read_run_store(
@@ -302,6 +420,94 @@ fn validate_persistence_record(
         return Err(HostV2StorageError::invalid(
             "session_kernel_persistence_digest_mismatch",
             "Session Kernel persistence record failed digest verification",
+        ));
+    }
+    if record.record_kind == SessionKernelPersistenceRecordKindV2::OperationResult {
+        validate_operation_result_record(record, session_id, run_id)?;
+    }
+    Ok(())
+}
+
+fn validate_operation_result_record(
+    record: &SessionKernelPersistenceRecordV2,
+    session_id: &str,
+    run_id: &str,
+) -> Result<(), HostV2StorageError> {
+    let object = record.data.as_object().ok_or_else(|| {
+        HostV2StorageError::invalid(
+            "session_kernel_operation_result_invalid",
+            "Session Kernel operation result data must be an object",
+        )
+    })?;
+    let expected_keys = [
+        "operationRequestId",
+        "result",
+        "resultDigest",
+        "schemaVersion",
+    ];
+    if object.len() != expected_keys.len()
+        || expected_keys.iter().any(|key| !object.contains_key(*key))
+        || object.get("schemaVersion").and_then(Value::as_str)
+            != Some(SESSION_KERNEL_OPERATION_RESULT_V2_SCHEMA)
+    {
+        return Err(HostV2StorageError::invalid(
+            "session_kernel_operation_result_invalid",
+            "Session Kernel operation result has an invalid strict envelope",
+        ));
+    }
+    let operation_request_id = object
+        .get("operationRequestId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            HostV2StorageError::invalid(
+                "session_kernel_operation_result_invalid",
+                "Session Kernel operation result has no operationRequestId",
+            )
+        })?;
+    validate_bounded_identity(operation_request_id, "operationRequestId", 512)?;
+    if record.record_id
+        != format!("session-kernel-v2:{run_id}:operation-result:{operation_request_id}")
+    {
+        return Err(HostV2StorageError::invalid(
+            "session_kernel_operation_result_identity_mismatch",
+            "Session Kernel operation result recordId does not bind its operationRequestId",
+        ));
+    }
+    let result = object.get("result").ok_or_else(|| {
+        HostV2StorageError::invalid(
+            "session_kernel_operation_result_invalid",
+            "Session Kernel operation result payload is missing",
+        )
+    })?;
+    let result_object = result.as_object().ok_or_else(|| {
+        HostV2StorageError::invalid(
+            "session_kernel_operation_result_invalid",
+            "Session Kernel operation result payload must be an object",
+        )
+    })?;
+    if result_object.get("ok").and_then(Value::as_bool) != Some(true)
+        || result_object.get("sessionId").and_then(Value::as_str) != Some(session_id)
+        || result_object.get("runId").and_then(Value::as_str) != Some(run_id)
+    {
+        return Err(HostV2StorageError::invalid(
+            "session_kernel_operation_result_identity_mismatch",
+            "Session Kernel operation result payload belongs to another Session or Run",
+        ));
+    }
+    let result_digest = object
+        .get("resultDigest")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            HostV2StorageError::invalid(
+                "session_kernel_operation_result_invalid",
+                "Session Kernel operation result has no resultDigest",
+            )
+        })?;
+    validate_bounded_identity(result_digest, "resultDigest", 512)?;
+    if canonical_sha256(result)? != result_digest {
+        return Err(HostV2StorageError::invalid(
+            "session_kernel_operation_result_digest_mismatch",
+            "Session Kernel operation result failed digest verification",
         ));
     }
     Ok(())
@@ -782,6 +988,7 @@ fn validate_projection_request(
     if !matches!(
         request.event.kind.as_str(),
         "plan.persisted"
+            | "plan.decided"
             | "input.persisted"
             | "scope.previewed"
             | "provider.started"
@@ -793,6 +1000,7 @@ fn validate_projection_request(
             | "authorization.decided"
             | "review.revised"
             | "planAction.skipped"
+            | "planAction.completed"
             | "wait.changed"
             | "diagnostic"
     ) {
@@ -1197,6 +1405,40 @@ pub(crate) async fn session_kernel_v2_store_append(
             StatusCode::INTERNAL_SERVER_ERROR,
             "session_kernel_persistence_task_failed",
             "Session Kernel persistence append task failed",
+        ),
+    }
+}
+
+pub(crate) async fn session_kernel_v2_store_record_get(
+    State(state): State<AppState>,
+    Path((session_id, run_id, record_id)): Path<(String, String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    if !trusted_private_storage_origin(&headers) {
+        return v2_error_response(
+            StatusCode::FORBIDDEN,
+            "session_kernel_persistence_origin_forbidden",
+            "Session Kernel v2 persistence accepts only trusted local clients",
+        );
+    }
+    let capability = match run_transport_capability(&headers) {
+        Ok(capability) => capability,
+        Err(error) => return storage_error_response(error),
+    };
+    let store = state.host_services.session_kernel_v2.clone();
+    let read_session_id = session_id.clone();
+    let read_run_id = run_id.clone();
+    match tokio::task::spawn_blocking(move || {
+        store.get_record(&read_session_id, &read_run_id, &record_id, &capability)
+    })
+    .await
+    {
+        Ok(Ok(record)) => v2_success_response(StatusCode::OK, &record),
+        Ok(Err(error)) => storage_error_response(error),
+        Err(_) => v2_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "session_kernel_persistence_task_failed",
+            "Session Kernel persistence record read task failed",
         ),
     }
 }

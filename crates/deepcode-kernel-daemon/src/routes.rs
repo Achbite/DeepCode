@@ -13,7 +13,6 @@ pub(crate) fn build_app(state: AppState) -> Router {
         .route("/index.html", get(gui_index))
         .route("/assets/*asset_path", get(gui_asset))
         .route("/api/health", get(health))
-        .route("/api/kernel/commands", post(kernel_commands))
         .route(
             KERNEL_V2_COMMANDS_PATH,
             post(kernel_v2_commands).layer(DefaultBodyLimit::max(MAX_COMMAND_BYTES_V2)),
@@ -22,14 +21,16 @@ pub(crate) fn build_app(state: AppState) -> Router {
             KERNEL_V2_USER_DECISIONS_PATH,
             post(kernel_v2_user_decisions).layer(DefaultBodyLimit::max(MAX_USER_DECISION_BYTES_V2)),
         )
-        .route("/api/kernel/snapshot", get(kernel_snapshot))
-        .route("/api/kernel/events/stream", get(kernel_events_stream))
         .route("/api/session-store/index", get(session_store_index))
         .route(
             "/api/session-store/:session_id/kernel-v2/:run_id",
             get(session_kernel_v2_store_get)
                 .post(session_kernel_v2_store_append)
                 .layer(DefaultBodyLimit::max(SESSION_KERNEL_V2_BODY_LIMIT_BYTES)),
+        )
+        .route(
+            "/api/session-store/:session_id/kernel-v2/:run_id/records/:record_id",
+            get(session_kernel_v2_store_record_get),
         )
         .route(
             "/api/session-store/:session_id/projection",
@@ -248,7 +249,6 @@ pub(crate) fn build_app(state: AppState) -> Router {
             "/api/agent/workflow-config",
             get(agent_workflow_config_get).patch(agent_workflow_config_patch),
         )
-        .route("/api/agent/tools", get(agent_tools))
         .route("/api/host/skills", get(host_skills))
         .route("/api/browser/runtime-status", get(browser_status))
         .route("/api/browser/open", post(browser_open))
@@ -265,5 +265,7 @@ pub(crate) fn build_app(state: AppState) -> Router {
             client_dist.display()
         );
     }
-    app.with_state(state).layer(localhost_cors_layer())
+    app.with_state(state)
+        .layer(localhost_cors_layer())
+        .layer(axum::middleware::from_fn(trusted_local_origin_gate))
 }

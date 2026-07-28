@@ -6,7 +6,7 @@ pub(crate) async fn health(State(state): State<AppState>) -> Json<ApiResponse> {
         .ok()
         .and_then(|workspace| serde_json::to_value(workspace).ok())
         .unwrap_or(Value::Null);
-    let tool_catalog_snapshot = deepcode_kernel_runtime::kernel_tool_catalog_snapshot();
+    let tool_inventory = state.kernel_v2.service().tool_inventory();
     let build_info = packaged_build_info().unwrap_or(Value::Null);
     ApiResponse::ok(json!({
         "service": "deepcode-kernel-daemon",
@@ -14,12 +14,12 @@ pub(crate) async fn health(State(state): State<AppState>) -> Json<ApiResponse> {
         "kernel": "ready",
         "buildCommit": build_commit(),
         "buildInfo": build_info,
-        "kernelAbiVersion": deepcode_kernel_runtime::KERNEL_ABI_VERSION,
-        "protocolVersion": deepcode_kernel_runtime::AGENT_PROTOCOL_VERSION,
-        "toolCatalogVersion": deepcode_kernel_runtime::TOOL_CATALOG_VERSION,
-        "toolCatalogCount": deepcode_kernel_runtime::kernel_visible_tool_catalog_count(),
-        "toolCatalogHash": &tool_catalog_snapshot.catalog_hash,
-        "toolCatalogSnapshot": tool_catalog_snapshot,
+        "kernelAbiVersion": deepcode_kernel_abi::KERNEL_ABI_V2_VERSION,
+        "protocolVersion": deepcode_kernel_abi::KERNEL_ABI_V2_VERSION,
+        "toolCatalogVersion": tool_inventory.catalog_version,
+        "toolCatalogCount": tool_inventory.tools.len(),
+        "toolCatalogDigest": tool_inventory.catalog_digest,
+        "toolInventory": tool_inventory,
         "workspace": workspace,
         "hostWorkspaceRegistry": format!("{:?}", state.host_services.workspace.readiness()).to_ascii_lowercase(),
         "hostActiveRunBrokerV2": state.host_services.active_runs_v2.status(),

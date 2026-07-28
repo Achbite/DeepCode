@@ -3284,5 +3284,5 @@ pub(crate) fn run_status_active(status: &str) -> bool {
 }
 
 pub(crate) fn run_status_terminal(status: &str) -> bool {
-    matches!(status, "completed" | "failed" | "cancelled" | "waiting")
+    matches!(status, "completed" | "failed" | "cancelled")
 }

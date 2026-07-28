@@ -1,6 +1,7 @@
 use crate::decision_capability_v2::{
-    DecisionCapabilityAuthorityV2, DecisionCapabilityAuthorizationErrorV2,
-    DecisionCapabilityGrantV2, DecisionCapabilityIssueErrorV2, DecisionCapabilityPermitV2,
+    CapabilityDecisionClassV2, DecisionCapabilityAuthorityV2,
+    DecisionCapabilityAuthorizationErrorV2, DecisionCapabilityGrantV2,
+    DecisionCapabilityIssueErrorV2, DecisionCapabilityPermitV2, DecisionCapabilitySubjectV2,
 };
 pub(crate) use crate::host_workspace_registry_v2::{
     HostWorkspaceBindingResolverV2, HostWorkspaceResolveErrorV2,
@@ -10,15 +11,19 @@ use axum::extract::rejection::BytesRejection;
 use axum::extract::State;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
-use deepcode_kernel_abi::v2::{CommandRequestId, V2WireDecodeError};
+use deepcode_kernel_abi::v2::{CommandRequestId, UserDecisionRefV2, V2WireDecodeError};
 use deepcode_kernel_abi::v2_command::{
-    decode_kernel_command_v2, CommandHandlingV2, KernelCommandV2, KernelErrorV2,
+    decode_kernel_command_v2, CommandHandlingV2, KernelCommandEnvelopeV2,
+    KernelCommandResponseEnvelopeV2, KernelCommandV2, KernelErrorV2,
 };
 use deepcode_kernel_abi::{
-    decode_user_decision_v2, RunCapabilityV2, UserDecisionEnvelopeV2, UserDecisionErrorV2,
-    UserDecisionReplyV2, UserDecisionResponseEnvelopeV2, KERNEL_ABI_V2_VERSION,
+    decode_user_decision_v2, CapabilityScopePreviewIdV2, RunCapabilityV2, UserDecisionEnvelopeV2,
+    UserDecisionErrorV2, UserDecisionReplyV2, UserDecisionResponseEnvelopeV2, UserDecisionV2,
+    KERNEL_ABI_V2_VERSION,
 };
-use deepcode_kernel_runtime::v2::KernelSessionServiceV2;
+use deepcode_kernel_runtime::v2::{
+    KernelSessionServiceV2, PendingCapabilityDecisionClassV2, SettingsCeilingV2,
+};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::fmt;
@@ -32,6 +37,33 @@ pub(crate) const KERNEL_V2_USER_DECISIONS_PATH: &str = "/api/kernel/v2/user-deci
 pub(crate) const HOST_TRANSPORT_CAPABILITY_HEADER: &str = "x-deepcode-host-capability";
 pub(crate) const RUN_TRANSPORT_CAPABILITY_HEADER: &str = "x-deepcode-run-capability";
 pub(crate) const MAX_V2_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
+
+pub(crate) trait HostRunSettingsResolverV2: Send + Sync {
+    fn resolve_run_settings(
+        &self,
+        workspace_binding_ref: &deepcode_kernel_abi::WorkspaceBindingRefV2,
+    ) -> Result<SettingsCeilingV2, HostWorkspaceResolveErrorV2>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HostCapabilityDecisionKindV2 {
+    Allow,
+    Deny,
+}
+
+pub(crate) struct HostCapabilityDecisionRequestV2 {
+    pub(crate) request_id: CommandRequestId,
+    pub(crate) decision_ref: UserDecisionRefV2,
+    pub(crate) scope_preview_id: CapabilityScopePreviewIdV2,
+    pub(crate) decision: HostCapabilityDecisionKindV2,
+    pub(crate) guidance: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HostCapabilityDecisionApplyErrorV2 {
+    Kernel(UserDecisionErrorV2),
+    Transport(KernelV2HttpErrorCode),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -126,6 +158,7 @@ impl HostTransportAuthorityV2 {
 pub(crate) struct KernelV2TransportState {
     service: KernelSessionServiceV2,
     workspace_resolver: Arc<dyn HostWorkspaceBindingResolverV2>,
+    settings_resolver: Arc<dyn HostRunSettingsResolverV2>,
     host_authority: HostTransportAuthorityV2,
     decision_authority: DecisionCapabilityAuthorityV2,
 }
@@ -139,6 +172,7 @@ impl KernelV2TransportState {
     pub(crate) fn new(
         service: KernelSessionServiceV2,
         workspace_resolver: Arc<dyn HostWorkspaceBindingResolverV2>,
+        settings_resolver: Arc<dyn HostRunSettingsResolverV2>,
         host_authority: HostTransportAuthorityV2,
     ) -> Result<Self, KernelV2TransportStartupError> {
         let decision_authority = DecisionCapabilityAuthorityV2::new()
@@ -146,6 +180,7 @@ impl KernelV2TransportState {
         Ok(Self {
             service,
             workspace_resolver,
+            settings_resolver,
             host_authority,
             decision_authority,
         })
@@ -159,12 +194,127 @@ impl KernelV2TransportState {
         self.decision_authority.issue(grant, lifetime)
     }
 
+    /// Applies a trusted UI decision without ever returning the short-lived
+    /// decision capability to Session, the browser, or a JSON payload.
+    pub(crate) fn apply_host_capability_decision(
+        &self,
+        request: HostCapabilityDecisionRequestV2,
+    ) -> Result<UserDecisionResponseEnvelopeV2, HostCapabilityDecisionApplyErrorV2> {
+        let pending = self
+            .service
+            .resolve_pending_capability_decision_host(
+                request.scope_preview_id,
+                request.decision_ref,
+            )
+            .map_err(|_| {
+                HostCapabilityDecisionApplyErrorV2::Transport(
+                    KernelV2HttpErrorCode::ServiceUnavailable,
+                )
+            })?
+            .map_err(HostCapabilityDecisionApplyErrorV2::Kernel)?;
+        let (class, decision) = match (pending.class, request.decision) {
+            (PendingCapabilityDecisionClassV2::Capability, HostCapabilityDecisionKindV2::Allow) => {
+                (
+                    CapabilityDecisionClassV2::Capability,
+                    UserDecisionV2::CapabilityAllow(pending.binding.clone()),
+                )
+            }
+            (PendingCapabilityDecisionClassV2::Capability, HostCapabilityDecisionKindV2::Deny) => (
+                CapabilityDecisionClassV2::Capability,
+                UserDecisionV2::CapabilityDeny {
+                    binding: pending.binding.clone(),
+                    guidance: request.guidance,
+                },
+            ),
+            (
+                PendingCapabilityDecisionClassV2::ScopeExpansion,
+                HostCapabilityDecisionKindV2::Allow,
+            ) => (
+                CapabilityDecisionClassV2::ScopeExpansion,
+                UserDecisionV2::ScopeExpansionAllow(pending.binding.clone()),
+            ),
+            (
+                PendingCapabilityDecisionClassV2::ScopeExpansion,
+                HostCapabilityDecisionKindV2::Deny,
+            ) => (
+                CapabilityDecisionClassV2::ScopeExpansion,
+                UserDecisionV2::ScopeExpansionDeny {
+                    binding: pending.binding.clone(),
+                    guidance: request.guidance,
+                },
+            ),
+        };
+        let capability = self
+            .issue_user_decision_capability(
+                DecisionCapabilityGrantV2 {
+                    run_id: pending.run_id.clone(),
+                    expected_control_epoch: pending.expected_control_epoch,
+                    subject: DecisionCapabilitySubjectV2::Capability {
+                        class,
+                        binding: pending.binding,
+                    },
+                },
+                Duration::from_secs(60),
+            )
+            .map_err(|_| {
+                HostCapabilityDecisionApplyErrorV2::Transport(
+                    KernelV2HttpErrorCode::ServiceUnavailable,
+                )
+            })?;
+        let envelope = UserDecisionEnvelopeV2::new(
+            request.request_id,
+            pending.run_id,
+            capability,
+            pending.expected_control_epoch,
+            decision,
+        );
+        let permit = self
+            .decision_authority
+            .authorize(&envelope)
+            .map_err(|error| {
+                HostCapabilityDecisionApplyErrorV2::Transport(decision_authorization_error(error).1)
+            })?;
+        apply_authorized_user_decision(self.service.clone(), permit, envelope)
+            .map_err(HostCapabilityDecisionApplyErrorV2::Transport)
+    }
+
+    /// Opens a Run through the typed in-process Host boundary. The caller
+    /// supplies the exact Settings ceiling resolved for this workspace; no
+    /// process-private Host token or global Settings re-resolution is needed.
+    pub(crate) fn open_run_host_with_settings(
+        &self,
+        envelope: KernelCommandEnvelopeV2,
+        settings: SettingsCeilingV2,
+    ) -> Result<
+        (KernelCommandResponseEnvelopeV2, Option<RunCapabilityV2>),
+        HostWorkspaceResolveErrorV2,
+    > {
+        let workspace_binding_ref = match &envelope.command {
+            KernelCommandV2::RunOpen(command) => command.workspace_binding_ref.clone(),
+            _ => return Err(HostWorkspaceResolveErrorV2::Unavailable),
+        };
+        let workspace_root = self
+            .workspace_resolver
+            .resolve_workspace_binding(&workspace_binding_ref)?;
+        if !workspace_root.is_absolute() {
+            return Err(HostWorkspaceResolveErrorV2::Unavailable);
+        }
+        Ok(self
+            .service
+            .open_run(envelope, &workspace_root, settings)
+            .into_parts())
+    }
+
     pub(crate) fn service(&self) -> KernelSessionServiceV2 {
         self.service.clone()
     }
 
     pub(crate) fn workspace_resolver(&self) -> Arc<dyn HostWorkspaceBindingResolverV2> {
         Arc::clone(&self.workspace_resolver)
+    }
+
+    pub(crate) fn settings_resolver(&self) -> Arc<dyn HostRunSettingsResolverV2> {
+        Arc::clone(&self.settings_resolver)
     }
 
     pub(crate) fn host_authority(&self) -> HostTransportAuthorityV2 {
@@ -203,6 +353,7 @@ pub(crate) async fn kernel_v2_commands(
             }
             let workspace_binding_ref = command.workspace_binding_ref.clone();
             let workspace_resolver = Arc::clone(&state.workspace_resolver);
+            let settings_resolver = Arc::clone(&state.settings_resolver);
             let service = state.service.clone();
             let opened = tokio::task::spawn_blocking(move || {
                 let workspace_root =
@@ -210,7 +361,8 @@ pub(crate) async fn kernel_v2_commands(
                 if !workspace_root.is_absolute() {
                     return Err(HostWorkspaceResolveErrorV2::Unavailable);
                 }
-                Ok(service.open_run(envelope, &workspace_root))
+                let settings = settings_resolver.resolve_run_settings(&workspace_binding_ref)?;
+                Ok(service.open_run(envelope, &workspace_root, settings))
             })
             .await;
             match opened {

@@ -22,5 +22,5 @@ pub(crate) use std::process::{Child, Command, Output, Stdio};
 pub(crate) use std::sync::{Arc, Mutex};
 pub(crate) use std::thread;
 pub(crate) use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-pub(crate) use tower_http::cors::{Any, CorsLayer};
+pub(crate) use tower_http::cors::CorsLayer;
 pub(crate) use tower_http::services::{ServeDir, ServeFile};

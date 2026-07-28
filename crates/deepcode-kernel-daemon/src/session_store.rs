@@ -441,7 +441,10 @@ pub(crate) enum SessionGoalSlotViewV1 {
     #[serde(rename = "empty")]
     Empty {
         capability: String,
-        #[serde(rename = "lastTerminalGoalRef", skip_serializing_if = "Option::is_none")]
+        #[serde(
+            rename = "lastTerminalGoalRef",
+            skip_serializing_if = "Option::is_none"
+        )]
         last_terminal_goal_ref: Option<SessionTerminalGoalRefViewV1>,
     },
     #[serde(rename = "active")]
@@ -3981,9 +3984,7 @@ fn validate_session_append_command(
     let is_bootstrap = matches!(
         command.transition,
         SessionAppendTransitionV1::Append {
-            intent:
-                SessionAppendIntentV1::BootstrapRun
-                | SessionAppendIntentV1::BootstrapGoalRun,
+            intent: SessionAppendIntentV1::BootstrapRun | SessionAppendIntentV1::BootstrapGoalRun,
             ..
         }
     );
@@ -4070,10 +4071,7 @@ fn validate_session_append_precondition_shapes(
                                 "Active goalSlot expectation requires a positive goalRevision",
                             ));
                         }
-                        validate_active_goal_lifecycle(
-                            lifecycle,
-                            "goalSlot.lifecycle",
-                        )?;
+                        validate_active_goal_lifecycle(lifecycle, "goalSlot.lifecycle")?;
                     }
                 }
                 "goalSlot".to_string()
@@ -4156,8 +4154,7 @@ fn validate_session_append_transition_shape(
                         ));
                     }
                 }
-                SessionAppendIntentV1::BootstrapRun
-                | SessionAppendIntentV1::BootstrapGoalRun => {
+                SessionAppendIntentV1::BootstrapRun | SessionAppendIntentV1::BootstrapGoalRun => {
                     let authority = turn_authority_ref.as_deref().ok_or_else(|| {
                         SessionDomainStoreError::new(
                             "session_append_transition_invalid",
@@ -4677,8 +4674,7 @@ fn validate_session_goal_fact(
             format!("Goal fact {event_id} payload must be an object"),
         )
     })?;
-    if payload.get("schemaVersion").and_then(Value::as_str)
-        != Some("deepcode.session.goal-fact.v1")
+    if payload.get("schemaVersion").and_then(Value::as_str) != Some("deepcode.session.goal-fact.v1")
     {
         return Err(SessionDomainStoreError::new(
             "session_append_transition_invalid",
@@ -4735,9 +4731,7 @@ fn validate_session_goal_fact(
         })?;
     let lifecycle_valid = match fact_kind {
         "draftCreated" => lifecycle == "draft",
-        "planAwaitingAcceptance" | "planRevisionRequested" => {
-            lifecycle == "awaitingPlanAcceptance"
-        }
+        "planAwaitingAcceptance" | "planRevisionRequested" => lifecycle == "awaitingPlanAcceptance",
         "activated" | "resumed" => lifecycle == "running",
         "suspended" | "activeWait" => lifecycle == "suspended",
         "completed" | "failed" | "cancelled" => lifecycle == fact_kind,
@@ -4751,9 +4745,7 @@ fn validate_session_goal_fact(
     if !lifecycle_valid {
         return Err(SessionDomainStoreError::new(
             "session_append_transition_invalid",
-            format!(
-                "Goal fact {event_id} lifecycle {lifecycle} does not match {fact_kind}"
-            ),
+            format!("Goal fact {event_id} lifecycle {lifecycle} does not match {fact_kind}"),
         ));
     }
     let source_refs = payload
@@ -4768,9 +4760,7 @@ fn validate_session_goal_fact(
     let mut unique_refs = std::collections::HashSet::new();
     if source_refs.is_empty()
         || source_refs.iter().any(|value| {
-            !value
-                .as_str()
-                .is_some_and(|value| !value.trim().is_empty())
+            !value.as_str().is_some_and(|value| !value.trim().is_empty())
                 || !unique_refs.insert(value.as_str().unwrap_or_default())
         })
     {
@@ -4835,15 +4825,9 @@ fn validate_goal_fact_lineage_shape(
             )
         })?;
     validate_domain_identity(authority, "goalFact.lineage.turnAuthorityRef")?;
-    if !lineage
-        .get("producer")
-        .is_some_and(Value::is_object)
-        || !lineage
-            .get("domainParentRefs")
-            .is_some_and(Value::is_array)
-        || !lineage
-            .get("kernelFactRefs")
-            .is_some_and(Value::is_array)
+    if !lineage.get("producer").is_some_and(Value::is_object)
+        || !lineage.get("domainParentRefs").is_some_and(Value::is_array)
+        || !lineage.get("kernelFactRefs").is_some_and(Value::is_array)
     {
         return Err(SessionDomainStoreError::new(
             "session_append_transition_invalid",
@@ -4962,7 +4946,10 @@ fn validate_goal_fact_variant(
             validate_goal_checkpoint_value(
                 event_id,
                 payload.get("checkpoint"),
-                payload.get("goalId").and_then(Value::as_str).unwrap_or_default(),
+                payload
+                    .get("goalId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
                 payload
                     .get("goalRevision")
                     .and_then(Value::as_u64)
@@ -4971,10 +4958,7 @@ fn validate_goal_fact_variant(
             )?;
         }
         "budgetUsage" => {
-            if !payload
-                .get("executionBudget")
-                .is_some_and(Value::is_object)
-            {
+            if !payload.get("executionBudget").is_some_and(Value::is_object) {
                 return Err(SessionDomainStoreError::new(
                     "session_append_transition_invalid",
                     format!("Goal budget fact {event_id} has no executionBudget object"),
@@ -5007,8 +4991,7 @@ fn validate_goal_checkpoint_value(
     if checkpoint.get("schemaVersion").and_then(Value::as_str)
         != Some("deepcode.session.goal-checkpoint.v1")
         || checkpoint.get("goalId").and_then(Value::as_str) != Some(goal_id)
-        || checkpoint.get("goalRevision").and_then(Value::as_u64)
-            != Some(goal_revision)
+        || checkpoint.get("goalRevision").and_then(Value::as_u64) != Some(goal_revision)
         || checkpoint.get("lifecycle").and_then(Value::as_str) != Some(lifecycle)
         || checkpoint
             .get("sequence")
@@ -5021,12 +5004,15 @@ fn validate_goal_checkpoint_value(
         ));
     }
     for field in ["checkpointRef", "sessionId", "createdAt"] {
-        let value = checkpoint.get(field).and_then(Value::as_str).ok_or_else(|| {
-            SessionDomainStoreError::new(
-                "session_append_transition_invalid",
-                format!("Goal checkpoint {event_id} has no {field}"),
-            )
-        })?;
+        let value = checkpoint
+            .get(field)
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                SessionDomainStoreError::new(
+                    "session_append_transition_invalid",
+                    format!("Goal checkpoint {event_id} has no {field}"),
+                )
+            })?;
         if field == "createdAt" {
             if value.trim().is_empty() {
                 return Err(SessionDomainStoreError::new(
@@ -5060,7 +5046,9 @@ fn validate_goal_checkpoint_value(
             )
         })?;
     validate_domain_identity(
-        task.get("factRef").and_then(Value::as_str).unwrap_or_default(),
+        task.get("factRef")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
         "goalCheckpoint.taskLedgerRef.factRef",
     )?;
     if task
@@ -5102,7 +5090,10 @@ fn validate_goal_checkpoint_value(
     }
     for field in ["sourceTurnId", "turnAuthorityRef"] {
         validate_domain_identity(
-            language.get(field).and_then(Value::as_str).unwrap_or_default(),
+            language
+                .get(field)
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
             &format!("goalCheckpoint.languageRef.{field}"),
         )?;
     }
@@ -5112,12 +5103,7 @@ fn validate_goal_checkpoint_value(
         "contextRefs",
         false,
     )?;
-    validate_goal_identity_array(
-        event_id,
-        checkpoint.get("sourceRefs"),
-        "sourceRefs",
-        true,
-    )?;
+    validate_goal_identity_array(event_id, checkpoint.get("sourceRefs"), "sourceRefs", true)?;
     if let Some(wait) = checkpoint.get("activeWaitRef") {
         let wait = wait.as_object().ok_or_else(|| {
             SessionDomainStoreError::new(
@@ -5167,7 +5153,10 @@ fn validate_goal_pending_effect(
     }
     for field in ["effectId", "runId", "planId", "taskId"] {
         validate_domain_identity(
-            effect.get(field).and_then(Value::as_str).unwrap_or_default(),
+            effect
+                .get(field)
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
             &format!("goalPendingEffect.{field}"),
         )?;
     }
@@ -5204,14 +5193,12 @@ fn validate_goal_pending_effect(
             format!("Goal checkpoint {event_id} has invalid pendingEffect.semanticRef"),
         ));
     }
-    for field in [
-        "recordId",
-        "providerRequestId",
-        "toolCallId",
-        "proposalId",
-    ] {
+    for field in ["recordId", "providerRequestId", "toolCallId", "proposalId"] {
         validate_domain_identity(
-            semantic.get(field).and_then(Value::as_str).unwrap_or_default(),
+            semantic
+                .get(field)
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
             &format!("goalPendingEffect.semanticRef.{field}"),
         )?;
     }
@@ -5238,7 +5225,10 @@ fn validate_goal_pending_effect(
             })?;
             for field in ["requestId", "contractId"] {
                 validate_domain_identity(
-                    kernel.get(field).and_then(Value::as_str).unwrap_or_default(),
+                    kernel
+                        .get(field)
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
                     &format!("goalPendingEffect.kernel.{field}"),
                 )?;
             }
@@ -6415,9 +6405,7 @@ fn apply_session_goal_effect(
 ) -> Result<(), SessionDomainStoreError> {
     let goal_facts = incoming_events
         .iter()
-        .filter(|event| {
-            event.get("kind").and_then(Value::as_str) == Some("session_goal_fact")
-        })
+        .filter(|event| event.get("kind").and_then(Value::as_str) == Some("session_goal_fact"))
         .collect::<Vec<_>>();
     if effect.is_none() {
         for event in goal_facts {
@@ -8314,18 +8302,12 @@ fn validate_session_run_bootstrap_admission_locked(
     session_id: &str,
     command: &SessionAppendCommandV1,
 ) -> Result<(), SessionDomainStoreError> {
-    let (
-        goal_bootstrap,
-        run_id,
-        turn_authority_ref,
-        bootstrap_admission_id,
-    ) = match &command.transition {
+    let (goal_bootstrap, run_id, turn_authority_ref, bootstrap_admission_id) = match &command
+        .transition
+    {
         SessionAppendTransitionV1::Append {
             intent:
-                intent @ (
-                    SessionAppendIntentV1::BootstrapRun
-                    | SessionAppendIntentV1::BootstrapGoalRun
-                ),
+                intent @ (SessionAppendIntentV1::BootstrapRun | SessionAppendIntentV1::BootstrapGoalRun),
             run_id,
             turn_authority_ref: Some(turn_authority_ref),
             bootstrap_admission_id: Some(bootstrap_admission_id),
@@ -8418,30 +8400,28 @@ fn validate_session_run_bootstrap_admission_locked(
         }
         return Ok(());
     }
-    let bootstrap_has_unsupported_precondition =
-        command.preconditions.iter().any(|precondition| {
-            !matches!(
-                precondition,
-                SessionAppendPreconditionV1::GoalSlot {
-                    expected: SessionGoalSlotExpectationV1::Empty
-                }
-            )
-        });
+    let bootstrap_has_unsupported_precondition = command.preconditions.iter().any(|precondition| {
+        !matches!(
+            precondition,
+            SessionAppendPreconditionV1::GoalSlot {
+                expected: SessionGoalSlotExpectationV1::Empty
+            }
+        )
+    });
     let bootstrap_goal_preconditions = command
         .preconditions
         .iter()
-        .filter(|precondition| {
-            matches!(precondition, SessionAppendPreconditionV1::GoalSlot { .. })
-        })
+        .filter(|precondition| matches!(precondition, SessionAppendPreconditionV1::GoalSlot { .. }))
         .count();
     if bootstrap_has_unsupported_precondition
-        || bootstrap_goal_preconditions > usize::from(matches!(
-            command.transition,
-            SessionAppendTransitionV1::Append {
-                goal_effect: Some(SessionGoalEffectV1::Open { .. }),
-                ..
-            }
-        ))
+        || bootstrap_goal_preconditions
+            > usize::from(matches!(
+                command.transition,
+                SessionAppendTransitionV1::Append {
+                    goal_effect: Some(SessionGoalEffectV1::Open { .. }),
+                    ..
+                }
+            ))
         || !command.provider_admissions.is_empty()
         || command.events.iter().any(|event| {
             event.get("kind").and_then(Value::as_str) == Some("session_run_state")
@@ -8569,9 +8549,7 @@ fn mark_session_run_bootstrap_committed_locked(
     batch_id: &str,
 ) -> Result<(), SessionDomainStoreError> {
     let SessionAppendTransitionV1::Append {
-        intent:
-            SessionAppendIntentV1::BootstrapRun
-            | SessionAppendIntentV1::BootstrapGoalRun,
+        intent: SessionAppendIntentV1::BootstrapRun | SessionAppendIntentV1::BootstrapGoalRun,
         run_id,
         turn_authority_ref: Some(turn_authority_ref),
         bootstrap_admission_id: Some(bootstrap_admission_id),

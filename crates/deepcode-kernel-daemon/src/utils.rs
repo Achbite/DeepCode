@@ -1,4 +1,10 @@
+use crate::api_response::ApiResponse;
 use crate::prelude::*;
+use axum::extract::Request;
+use axum::http::request::Parts;
+use axum::http::HeaderValue;
+use axum::middleware::Next;
+use tower_http::cors::AllowOrigin;
 
 pub(crate) fn kernel_ledger_path() -> Option<PathBuf> {
     if std::env::var("DEEPCODE_LEDGER_BACKEND")
@@ -16,7 +22,9 @@ pub(crate) fn kernel_ledger_path() -> Option<PathBuf> {
 
 pub(crate) fn localhost_cors_layer() -> CorsLayer {
     CorsLayer::new()
-        .allow_origin(Any)
+        .allow_origin(AllowOrigin::predicate(
+            |origin: &HeaderValue, _request: &Parts| trusted_cors_origin(origin),
+        ))
         .allow_methods([
             Method::GET,
             Method::POST,
@@ -26,6 +34,42 @@ pub(crate) fn localhost_cors_layer() -> CorsLayer {
             Method::OPTIONS,
         ])
         .allow_headers([header::CONTENT_TYPE])
+}
+
+pub(crate) async fn trusted_local_origin_gate(request: Request, next: Next) -> Response {
+    if crate::session_store::trusted_private_storage_origin(request.headers()) {
+        return next.run(request).await;
+    }
+    (
+        StatusCode::FORBIDDEN,
+        ApiResponse::error(
+            "host_origin_forbidden",
+            "DeepCode Host APIs accept only non-browser local clients, the same loopback application origin, or deepcode-gui://localhost",
+        ),
+    )
+        .into_response()
+}
+
+fn trusted_cors_origin(origin: &HeaderValue) -> bool {
+    let Ok(origin) = origin.to_str() else {
+        return false;
+    };
+    if origin == "deepcode-gui://localhost" {
+        return true;
+    }
+    origin
+        .strip_prefix("http://")
+        .map(is_loopback_origin_authority)
+        .unwrap_or(false)
+}
+
+fn is_loopback_origin_authority(authority: &str) -> bool {
+    authority == "localhost"
+        || authority.starts_with("localhost:")
+        || authority == "127.0.0.1"
+        || authority.starts_with("127.0.0.1:")
+        || authority == "[::1]"
+        || authority.starts_with("[::1]:")
 }
 
 pub(crate) fn distribution_root() -> PathBuf {
