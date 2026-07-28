@@ -2517,6 +2517,19 @@ impl AuthorityState {
                     return Err(corrupt_store());
                 }
             }
+            ControlFactV2::RunTransportRebound {
+                run_id,
+                control_epoch,
+                ..
+            } => {
+                let run = self.runs.get(run_id).ok_or_else(corrupt_store)?;
+                if run.epoch != *control_epoch
+                    || run.retirement_fence.is_some()
+                    || run.retired.is_some()
+                {
+                    return Err(corrupt_store());
+                }
+            }
             ControlFactV2::CommandRecorded { .. } => {}
             ControlFactV2::EpochAdvanced {
                 identity,
@@ -3720,6 +3733,26 @@ fn edge_kind_matches(predecessor: &KernelFactPayloadV2, current: &KernelFactPayl
                 ..
             }) if identity.control_epoch == *control_epoch
         ),
+        KernelFactPayloadV2::Control(ControlFactV2::RunTransportRebound {
+            control_epoch,
+            transport_generation,
+            ..
+        }) => match predecessor {
+            KernelFactPayloadV2::Control(ControlFactV2::RunOpened { .. }) => {
+                *transport_generation == 2
+            }
+            KernelFactPayloadV2::Control(ControlFactV2::RunTransportRebound {
+                control_epoch: previous_epoch,
+                transport_generation: previous_generation,
+                ..
+            }) => {
+                previous_epoch <= control_epoch
+                    && previous_generation
+                        .checked_add(1)
+                        .is_some_and(|next| next == *transport_generation)
+            }
+            _ => false,
+        },
         KernelFactPayloadV2::Control(ControlFactV2::EpochAdvanced { .. }) => {
             command_edge(predecessor, MutationCommandKindV2::ControlEpochAdvance)
         }

@@ -58,6 +58,25 @@ const DIRECT_INVOCATION_TERMINAL: &str = "terminal";
 pub(super) const RUN_CAPABILITY_VERIFIER_MATERIAL_KIND: &str = "runCapabilityVerifier";
 pub(super) const RUN_CAPABILITY_VERIFIER_BOUND: &str = "bound";
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct DurableRunCapabilityVerifierV2 {
+    pub run_id: RunId,
+    pub token_verifier_sha256: String,
+    #[serde(default = "initial_run_transport_generation")]
+    pub transport_generation: u64,
+}
+
+pub(super) fn initial_run_transport_generation() -> u64 {
+    1
+}
+
+pub(super) struct RunTransportRebindOutcomeV2 {
+    pub transport_generation: u64,
+    pub fact_id: FactId,
+    pub ledger_sequence: u64,
+}
+
 pub(super) fn run_capability_verifier_digest(
     run_id: &RunId,
     capability: &RunCapabilityV2,
@@ -93,6 +112,7 @@ fn run_capability_verifier_material(
         payload_json: serde_json::json!({
             "runId": run_id,
             "tokenVerifierSha256": run_capability_verifier_digest(run_id, capability),
+            "transportGeneration": initial_run_transport_generation(),
         }),
     }
 }
@@ -567,6 +587,85 @@ impl AuthorityService {
             PutPublicCommandReceiptOutcomeV2::ExistingSame(_)
             | PutPublicCommandReceiptOutcomeV2::DigestConflict { .. } => Err(corrupt_store()),
         }
+    }
+
+    pub(super) fn rebind_run_capability_host(
+        &self,
+        run_id: &RunId,
+        control_epoch: ControlEpoch,
+        next_capability: &RunCapabilityV2,
+    ) -> AuthorityResult<RunTransportRebindOutcomeV2> {
+        let record = self
+            .authority_material_snapshot()?
+            .into_iter()
+            .find(|record| {
+                record.material_kind == RUN_CAPABILITY_VERIFIER_MATERIAL_KIND
+                    && record.material_id == run_id.as_str()
+            })
+            .ok_or_else(corrupt_store)?;
+        if record.run_id != *run_id
+            || record.lifecycle != RUN_CAPABILITY_VERIFIER_BOUND
+            || record.operation_id.is_some()
+            || record.invocation_id.is_some()
+            || record.lease.is_some()
+        {
+            return Err(corrupt_store());
+        }
+        let durable: DurableRunCapabilityVerifierV2 =
+            serde_json::from_value(record.payload_json.clone()).map_err(|_| corrupt_store())?;
+        if durable.run_id != *run_id
+            || durable.transport_generation == 0
+            || durable.token_verifier_sha256.len() != 64
+            || !durable
+                .token_verifier_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        {
+            return Err(corrupt_store());
+        }
+        let transport_generation = durable
+            .transport_generation
+            .checked_add(1)
+            .ok_or_else(corrupt_store)?;
+        let payload = KernelFactPayloadV2::Control(
+            deepcode_kernel_abi::v2::ControlFactV2::RunTransportRebound {
+                run_id: run_id.clone(),
+                control_epoch,
+                transport_generation,
+                causation_fact_id: record.last_fact_id.clone(),
+            },
+        );
+        payload.validate().map_err(|_| corrupt_store())?;
+        let replacement = AuthorityMaterialDraftV2 {
+            material_kind: record.material_kind,
+            material_id: record.material_id,
+            run_id: run_id.clone(),
+            control_epoch: record.control_epoch,
+            lifecycle: RUN_CAPABILITY_VERIFIER_BOUND.to_owned(),
+            operation_id: None,
+            invocation_id: None,
+            lease: None,
+            payload_json: serde_json::json!({
+                "runId": run_id,
+                "tokenVerifierSha256": run_capability_verifier_digest(run_id, next_capability),
+                "transportGeneration": transport_generation,
+            }),
+        };
+        let outcome = self.append_payloads_with_authority_material(
+            vec![payload],
+            vec![AuthorityMaterialMutationV2::Replace {
+                expected_lifecycle: RUN_CAPABILITY_VERIFIER_BOUND.to_owned(),
+                expected_payload_digest: Some(record.payload_digest),
+                material: replacement,
+                fact_index: 0,
+            }],
+        )?;
+        let fact = outcome.facts.into_iter().next().ok_or_else(corrupt_store)?;
+        Ok(RunTransportRebindOutcomeV2 {
+            transport_generation,
+            fact_id: fact.fact_id,
+            ledger_sequence: fact.ledger_sequence,
+        })
     }
 
     pub(super) fn query_run_facts(

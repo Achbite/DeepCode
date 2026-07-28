@@ -1001,6 +1001,12 @@ pub enum ControlFactV2 {
         settings_ceiling_digest: SettingsCeilingDigestV2,
         tool_context_ref: ToolContextRefV2,
     },
+    RunTransportRebound {
+        run_id: RunId,
+        control_epoch: ControlEpoch,
+        transport_generation: u64,
+        causation_fact_id: FactId,
+    },
     CommandRecorded {
         identity: CommandReceiptIdentityV2,
         command_kind: crate::v2_command::MutationCommandKindV2,
@@ -1398,6 +1404,18 @@ impl KernelFactPayloadV2 {
                 ));
             }
         }
+        if let Self::Control(ControlFactV2::RunTransportRebound {
+            transport_generation,
+            ..
+        }) = self
+        {
+            if *transport_generation < 2 {
+                return Err(invalid_value(
+                    "fact.transportGeneration",
+                    "RunTransportRebound must advance beyond the initial transport generation",
+                ));
+            }
+        }
         if let Self::Control(ControlFactV2::RunRetired {
             reason: Some(reason),
             ..
@@ -1499,6 +1517,9 @@ impl KernelFactPayloadV2 {
     pub fn control_epoch(&self) -> Option<ControlEpoch> {
         match self {
             Self::Control(ControlFactV2::RunOpened { control_epoch, .. }) => Some(*control_epoch),
+            Self::Control(ControlFactV2::RunTransportRebound { control_epoch, .. }) => {
+                Some(*control_epoch)
+            }
             Self::Control(ControlFactV2::CommandRecorded { identity, .. }) => {
                 match identity.epoch_context {
                     CommandEpochContextV2::NoCurrentEpoch {} => None,
@@ -1704,6 +1725,7 @@ impl ControlFactV2 {
     fn run_id(&self) -> &RunId {
         match self {
             Self::RunOpened { run_id, .. } => run_id,
+            Self::RunTransportRebound { run_id, .. } => run_id,
             Self::CommandRecorded { identity, .. } => &identity.run_id,
             Self::EpochAdvanced { identity, .. } => &identity.run_id,
             Self::CancellationRequested { identity, .. } => &identity.run_id,
@@ -1715,6 +1737,9 @@ impl ControlFactV2 {
     fn causation(&self) -> Option<&FactId> {
         match self {
             Self::RunOpened {
+                causation_fact_id, ..
+            } => Some(causation_fact_id),
+            Self::RunTransportRebound {
                 causation_fact_id, ..
             } => Some(causation_fact_id),
             Self::CommandRecorded { .. } => None,
