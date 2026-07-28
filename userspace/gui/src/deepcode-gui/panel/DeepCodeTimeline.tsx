@@ -537,7 +537,7 @@ function timelineScrollSignature(view: AgentTimelineResult, loading: boolean): s
   if (!lastTurn) return `empty:${loading ? 'running' : 'idle'}`;
   const blockSignature = lastTurn.blocks
     .map((block) => {
-      const sourceCount = block.rawEventRefs?.length ?? 0;
+      const sourceCount = block.provenance.sourceEventRefs.length;
       const bodyLength = block.bodyMarkdown?.length ?? 0;
       return `${block.id}:${block.kind}:${block.status}:${sourceCount}:${bodyLength}`;
     })
@@ -1635,14 +1635,15 @@ const TypewriterMarkdown: React.FC<{
 };
 
 function localizedUserBlockContent(block: AgentTimelineBlock, language: UiLanguage): string {
-  for (const event of block.events) {
-    if (event.kind !== 'user_msg' || !isRecordValue(event.payload)) continue;
-    const contentKey = stringValue(event.payload.contentKey);
-    if (!contentKey) continue;
-    const localized = t(language, contentKey, stringRecord(event.payload.contentArgs));
+  const contentKey = stringValue(block.localizedContent?.messageKey);
+  if (contentKey) {
+    const localized = t(language, contentKey, block.localizedContent?.messageArgs);
     if (localized !== contentKey) return localized;
   }
-  return localizedTimelineText(language, block.bodyMarkdown ?? block.summary ?? '');
+  return localizedTimelineText(
+    language,
+    block.localizedContent?.text ?? block.bodyMarkdown ?? block.summary ?? ''
+  );
 }
 
 function isRecordValue(value: unknown): value is Record<string, unknown> {
@@ -1651,15 +1652,6 @@ function isRecordValue(value: unknown): value is Record<string, unknown> {
 
 function stringValue(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
-}
-
-function stringRecord(value: unknown): Record<string, string> {
-  if (!isRecordValue(value)) return {};
-  const result: Record<string, string> = {};
-  for (const [key, item] of Object.entries(value)) {
-    if (item !== undefined && item !== null) result[key] = String(item);
-  }
-  return result;
 }
 
 function localizedTimelineText(language: UiLanguage, text: string): string {
@@ -1676,11 +1668,7 @@ function planBlockMarkdown(block: AgentTimelineBlock, language: UiLanguage): str
 }
 
 function planBlockAuthorized(block: AgentTimelineBlock): boolean {
-  return block.events.some((event) => (
-    event.kind === 'plan_card' &&
-    isRecordValue(event.payload) &&
-    event.payload.confirmable === true
-  ));
+  return block.confirmable === true;
 }
 
 function reviewBlockMarkdown(block: AgentTimelineBlock, language: UiLanguage = 'zh-CN'): string {

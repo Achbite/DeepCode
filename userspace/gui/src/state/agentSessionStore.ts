@@ -5,12 +5,12 @@ import type {
   AgentMode,
   AgentSession,
   AgentTimelineDelta,
+  AgentTimelinePermissionRequestView,
   AgentTimelineResult,
   AgentTraceEvent,
   AgentWorkflowConfig,
   AgentWorkflowMode,
   ListAgentSessionsRequest,
-  PermissionRequest,
 } from '@deepcode/protocol';
 import {
   applyAgentTimelineDelta,
@@ -52,7 +52,7 @@ import { useWorkspaceStore } from './workspaceStore';
 import { projectionDeliveryDiagnostics } from '../services/projectionDeliveryDiagnostics';
 
 interface PendingPermission {
-  request: PermissionRequest;
+  request: AgentTimelinePermissionRequestView;
 }
 
 type PermissionResolution = {
@@ -141,8 +141,8 @@ interface AgentSessionActions {
   clearMessageAttachments: () => void;
   sendMessage: (content: string, attachmentsOverride?: AgentContextAttachment[]) => Promise<void>;
   cancelCurrentRun: () => Promise<void>;
-  acceptPermission: (request?: PermissionRequest) => Promise<void>;
-  rejectPermission: (request?: PermissionRequest) => Promise<void>;
+  acceptPermission: (request?: AgentTimelinePermissionRequestView) => Promise<void>;
+  rejectPermission: (request?: AgentTimelinePermissionRequestView) => Promise<void>;
   resolveRequirement: (runId: string, requirementId: string, decision: 'accept' | 'reject' | 'revise', guidance?: string) => Promise<void>;
   resolvePlan: (runId: string, planId: string, decision: 'accept' | 'reject' | 'revise', guidance?: string) => Promise<void>;
   resolveReview: (runId: string, decision: 'accept' | 'reject' | 'revise', guidance?: string) => Promise<void>;
@@ -230,9 +230,8 @@ function currentWorkspacePath(): string | undefined {
   })?.openPath;
 }
 
-function permissionRequestRunId(request: PermissionRequest): string | undefined {
-  const record = request as unknown as Record<string, unknown>;
-  return typeof record.runId === 'string' ? record.runId : undefined;
+function permissionRequestRunId(request: AgentTimelinePermissionRequestView): string | undefined {
+  return request.runId;
 }
 
 function isEmptyAgentSession(session: AgentSession | null | undefined): boolean {
