@@ -27,6 +27,9 @@ Tool arguments are untrusted intent: the Kernel resolves resources, checks the \
 active capability and current tool availability, and records execution facts. \
 Never claim that a tool ran from narration alone. Treat an awaiting-capability, \
 denied, stale-context, failed, cancelled, or indeterminate result as non-success.";
+const KERNEL_TOOL_PROMPT_SECTION_V2: &str = "\n\n\
+Kernel-owned per-tool instructions follow in ascending ToolId order. Each \
+instruction is bound only to the ToolId shown.";
 
 macro_rules! identity_type {
     ($name:ident, $field:literal) => {
@@ -484,13 +487,13 @@ impl ToolContextBundleV2 {
                 "must be deepcode.kernel.tool-context.v2",
             ));
         }
-        if self.fixed_prompt != KERNEL_TOOL_PROMPT_V2 {
+        validate_descriptor_order(&self.tools, true)?;
+        if self.fixed_prompt != render_kernel_tool_prompt_v2(&self.tools)? {
             return Err(invalid_value(
                 "fixedPrompt",
-                "must equal the compiled Kernel prompt",
+                "must equal the compiled Kernel prompt for these ready tools",
             ));
         }
-        validate_descriptor_order(&self.tools, true)?;
         if tool_context_digest_v2(
             self.context_version,
             &self.catalog_digest,
@@ -510,6 +513,27 @@ impl ToolContextBundleV2 {
         }
         Ok(())
     }
+}
+
+/// Materializes the Kernel-owned prompt block for one provider-visible
+/// ToolContext. Descriptor ordering, readiness, and each registered prompt
+/// template are part of the canonical bytes bound by `contextDigest`.
+pub fn render_kernel_tool_prompt_v2(
+    tools: &[ToolDescriptorV2],
+) -> Result<String, V2ValidationError> {
+    validate_descriptor_order(tools, true)?;
+    let mut prompt = String::from(KERNEL_TOOL_PROMPT_V2);
+    prompt.push_str(KERNEL_TOOL_PROMPT_SECTION_V2);
+    for tool in tools {
+        prompt.push_str("\n\nToolId: ");
+        prompt.push_str(tool.tool_id.as_str());
+        prompt.push_str("\nInstruction: ");
+        prompt.push_str(&tool.prompt_template);
+    }
+    if prompt.len() > MAX_TOOL_CONTEXT_BYTES_V2 {
+        return Err(field_too_large("fixedPrompt", MAX_TOOL_CONTEXT_BYTES_V2));
+    }
+    Ok(prompt)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

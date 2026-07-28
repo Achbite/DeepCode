@@ -4,9 +4,9 @@ use crate::{
 };
 use deepcode_kernel_abi::v2::V2ValidationError;
 use deepcode_kernel_abi::{
-    canonical_arguments_digest_v2, tool_catalog_digest_v2, tool_context_digest_v2,
-    CanonicalArgumentsDigestV2, RawToolArgumentsV2, ToolAvailabilityV2, ToolContextBundleV2,
-    ToolContextVersionV2, ToolIdV2, ToolInventoryV2, KERNEL_TOOL_PROMPT_V2,
+    canonical_arguments_digest_v2, render_kernel_tool_prompt_v2, tool_catalog_digest_v2,
+    tool_context_digest_v2, CanonicalArgumentsDigestV2, RawToolArgumentsV2, ToolAvailabilityV2,
+    ToolContextBundleV2, ToolContextVersionV2, ToolIdV2, ToolInventoryV2,
     KERNEL_TOOL_REGISTRY_VERSION_V2, TOOL_CONTEXT_FORMAT_V2, TOOL_INVENTORY_FORMAT_V2,
 };
 use serde_json::Value;
@@ -198,10 +198,11 @@ impl KernelToolRegistry {
             })
             .map(|registration| registration.descriptor_v2.clone())
             .collect::<Vec<_>>();
+        let fixed_prompt = render_kernel_tool_prompt_v2(&tools)?;
         let context_digest = tool_context_digest_v2(
             context_version,
             &inventory.catalog_digest,
-            KERNEL_TOOL_PROMPT_V2,
+            &fixed_prompt,
             &tools,
         )?;
         let context = ToolContextBundleV2 {
@@ -209,7 +210,7 @@ impl KernelToolRegistry {
             context_version,
             catalog_digest: inventory.catalog_digest,
             context_digest,
-            fixed_prompt: KERNEL_TOOL_PROMPT_V2.to_owned(),
+            fixed_prompt,
             tools,
         };
         context.validate()?;

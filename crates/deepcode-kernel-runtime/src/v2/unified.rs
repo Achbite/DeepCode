@@ -33,16 +33,16 @@ use deepcode_kernel_abi::v2_command::{
 use deepcode_kernel_abi::KernelError as AbiKernelError;
 use deepcode_kernel_abi::{
     canonical_arguments_digest_v2, capability_authorization_digest_v2, capability_scope_digest_v2,
-    exact_invocation_digest_v2, tool_context_digest_v2, tool_contract_digest_v2,
-    trust_lease_digest_v2, user_decision_request_digest_v2, CapabilityAuthorizationDigestV2,
-    CapabilityDecisionBindingV2, CapabilityLeaseIdV2, CapabilityLeaseRefV2,
-    CapabilityLeaseVersionV2, CapabilityScopeDigestV2, CapabilityScopePreviewIdV2,
-    ExactInvocationDigestV2, PlanActionIdV2, PlanRevisionV2, RequestedResourceV2, RunCapabilityV2,
-    ToolAvailabilityV2, ToolContextBundleV2, ToolContextRefV2, ToolContextVersionV2,
-    ToolDescriptorV2, ToolEffectClassV2, ToolEffectScopeV2, ToolIdV2, ToolIntentAuthorityV2,
-    ToolInventoryV2, TrustGrantDecisionV2, TrustLeaseDigestV2, TrustPolicyIdV2,
-    UserDecisionErrorV2, UserDecisionReplyV2, UserDecisionRevokeTargetV2, UserDecisionV2,
-    WorkspaceBindingRefV2, KERNEL_TOOL_PROMPT_V2, TOOL_CONTEXT_FORMAT_V2,
+    exact_invocation_digest_v2, render_kernel_tool_prompt_v2, tool_context_digest_v2,
+    tool_contract_digest_v2, trust_lease_digest_v2, user_decision_request_digest_v2,
+    CapabilityAuthorizationDigestV2, CapabilityDecisionBindingV2, CapabilityLeaseIdV2,
+    CapabilityLeaseRefV2, CapabilityLeaseVersionV2, CapabilityScopeDigestV2,
+    CapabilityScopePreviewIdV2, ExactInvocationDigestV2, PlanActionIdV2, PlanRevisionV2,
+    RequestedResourceV2, RunCapabilityV2, ToolAvailabilityV2, ToolContextBundleV2,
+    ToolContextRefV2, ToolContextVersionV2, ToolDescriptorV2, ToolEffectClassV2, ToolEffectScopeV2,
+    ToolIdV2, ToolIntentAuthorityV2, ToolInventoryV2, TrustGrantDecisionV2, TrustLeaseDigestV2,
+    TrustPolicyIdV2, UserDecisionErrorV2, UserDecisionReplyV2, UserDecisionRevokeTargetV2,
+    UserDecisionV2, WorkspaceBindingRefV2, TOOL_CONTEXT_FORMAT_V2,
 };
 use deepcode_kernel_ledger::v2::CanonicalFactStore;
 use deepcode_kernel_ledger::v2::{
@@ -4871,10 +4871,11 @@ impl KernelSessionServiceV2 {
             })
             .cloned()
             .collect::<Vec<_>>();
+        let fixed_prompt = render_kernel_tool_prompt_v2(&tools).map_err(|_| storage_fault())?;
         let context_digest = tool_context_digest_v2(
             context_version,
             &self.inner.inventory.catalog_digest,
-            KERNEL_TOOL_PROMPT_V2,
+            &fixed_prompt,
             &tools,
         )
         .map_err(|_| storage_fault())?;
@@ -4883,7 +4884,7 @@ impl KernelSessionServiceV2 {
             context_version,
             catalog_digest: self.inner.inventory.catalog_digest.clone(),
             context_digest,
-            fixed_prompt: KERNEL_TOOL_PROMPT_V2.to_owned(),
+            fixed_prompt,
             tools,
         };
         context.validate().map_err(|_| storage_fault())?;
