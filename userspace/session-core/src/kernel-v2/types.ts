@@ -45,6 +45,13 @@ export interface SessionNaturalLanguagePlanV2 {
   recordedAt: string;
 }
 
+export interface SessionPlanDecisionV2 {
+  planRevision: string;
+  decision: 'accept' | 'reject' | 'revise';
+  guidance?: string;
+  recordedAt: string;
+}
+
 export interface SessionUserInputRecordV2 {
   inputId: string;
   opaqueInputRef: string;
@@ -103,6 +110,7 @@ export interface SessionProviderTurnInputV2 {
   conversationInputs: readonly SessionUserInputRecordV2[];
   providerOutcomes: readonly SessionProviderOutcomeRecordV2[];
   plan?: SessionNaturalLanguagePlanV2;
+  planDecision?: SessionPlanDecisionV2;
   kernelFacts: SessionProviderKernelFactsProjectionV2;
   target: SessionProviderTurnTargetV2;
   guidance: string[];
@@ -251,6 +259,7 @@ export interface SessionKernelReviewV2 {
   revision: number;
   status: 'draft' | 'final';
   planRevision?: string;
+  planDecision?: SessionPlanDecisionV2;
   plan?: {
     title: string;
     objective: string;
@@ -288,6 +297,7 @@ export interface SessionKernelProjectionEventV2 {
   recordedAt: string;
   kind:
     | 'plan.persisted'
+    | 'plan.decided'
     | 'input.persisted'
     | 'scope.previewed'
     | 'provider.started'

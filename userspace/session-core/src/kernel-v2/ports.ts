@@ -4,6 +4,7 @@ import type {
   SessionKernelProjectionEventV2,
   SessionKernelPublicRequestRecordV2,
   SessionNaturalLanguagePlanV2,
+  SessionPlanDecisionV2,
   SessionProviderTurnInputV2,
   SessionProviderTurnOutputV2,
   SessionUserInputRecordV2,
@@ -20,6 +21,11 @@ export interface SessionKernelPersistencePortV2 {
     runId: string
   ): Promise<SessionUserInputRecordV2 | undefined>;
 
+  loadPlanDecision(
+    runId: string,
+    planRevision: string
+  ): Promise<SessionPlanDecisionV2 | undefined>;
+
   loadPendingPublicRequests(
     runId: string
   ): Promise<SessionKernelPublicRequestRecordV2[]>;
@@ -29,6 +35,8 @@ export interface SessionKernelPersistencePortV2 {
    * same revision with different content is a permanent identity conflict.
    */
   persistPlan(plan: SessionNaturalLanguagePlanV2): Promise<void>;
+
+  persistPlanDecision(decision: SessionPlanDecisionV2): Promise<void>;
 
   persistInput(input: SessionUserInputRecordV2): Promise<void>;
 

@@ -61,6 +61,8 @@ export interface SessionKernelProviderTurnHostV2 {
   requireNoPendingRequests(): void;
 
   requirePlanProjected(): void;
+
+  requirePlanAccepted(): void;
 }
 
 /**
@@ -158,6 +160,9 @@ export class SessionKernelProviderTurnsV2 {
           conversationInputs: state.inputs,
           providerOutcomes: state.providerOutcomes,
           ...(state.plan ? { plan: state.plan } : {}),
+          ...(state.planDecision
+            ? { planDecision: state.planDecision }
+            : {}),
           kernelFacts: factProjection,
           target: request.target,
           guidance,
@@ -438,6 +443,7 @@ export class SessionKernelProviderTurnsV2 {
     }
     if (request.target.kind === 'planAction') {
       this.host.requirePlanProjected();
+      this.host.requirePlanAccepted();
       sessionPlanActionV2(state, request.target.planActionId);
     }
   }

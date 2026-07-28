@@ -41,6 +41,7 @@ import type {
   SessionActiveWaitV2,
   SessionKernelLoopResultV2,
   SessionKernelReviewV2,
+  SessionPlanDecisionV2,
   SessionUserInputRecordV2,
 } from './types.js';
 
@@ -99,6 +100,15 @@ export interface SessionKernelProductionPreviewPlanActionV2 {
   };
 }
 
+export interface SessionKernelProductionDecidePlanV2 {
+  kind: 'decidePlan';
+  data: {
+    planRevision: string;
+    decision: SessionPlanDecisionV2['decision'];
+    guidance?: string;
+  };
+}
+
 export interface SessionKernelProductionSkipPlanActionV2 {
   kind: 'skipPlanAction';
   data: {
@@ -132,6 +142,7 @@ export type SessionKernelProductionOperationV2 =
   | SessionKernelProductionReplanV2
   | SessionKernelProductionResumeAfterBackpressureV2
   | SessionKernelProductionPreviewPlanActionV2
+  | SessionKernelProductionDecidePlanV2
   | SessionKernelProductionSkipPlanActionV2
   | SessionKernelProductionObserveCapabilityDecisionV2
   | SessionKernelProductionReconcileWakeV2
@@ -159,6 +170,16 @@ export interface SessionKernelProductionStateSummaryV2 {
   controlEpoch: number;
   currentInputId: string;
   planRevision?: string;
+  planDecision?: SessionPlanDecisionV2;
+  planConfirmation: {
+    status:
+      | 'none'
+      | 'pending'
+      | 'accepted'
+      | 'rejected'
+      | 'revisionRequested';
+    planRevision?: string;
+  };
   activeWait?: SessionActiveWaitV2;
   factsAfterLedgerSequence: number;
   factsSnapshotHighWater: number;
@@ -190,6 +211,10 @@ export type SessionKernelProductionOutcomeV2 =
   | {
       kind: 'planActionPreview';
       preview: CapabilityScopePreviewReplyV2;
+    }
+  | {
+      kind: 'planDecisionRecorded';
+      decision: SessionPlanDecisionV2;
     }
   | {
       kind: 'planActionSkipped';
@@ -430,6 +455,11 @@ async function executeProductionOperation(
         preview: await runner.previewPlanAction(
           operation.data.planActionId
         ),
+      };
+    case 'decidePlan':
+      return {
+        kind: 'planDecisionRecorded',
+        decision: await runner.decidePlan(operation.data),
       };
     case 'skipPlanAction':
       await runner.skipPlanAction(
@@ -681,6 +711,44 @@ function decodeOperation(
       },
     };
   }
+  if (tagged.kind === 'decidePlan') {
+    const body = exactObject(
+      data,
+      ['planRevision', 'decision'],
+      ['guidance']
+    );
+    if (
+      body.decision !== 'accept'
+      && body.decision !== 'reject'
+      && body.decision !== 'revise'
+    ) {
+      throw invalidProductionRequest(
+        'session_kernel_production_plan_decision_invalid'
+      );
+    }
+    const guidance = body.guidance === undefined
+      ? undefined
+      : optionalText(body.guidance, 'guidance', 64 * 1024);
+    if (
+      (guidance !== undefined && guidance.trim() !== guidance)
+      || (
+        body.decision !== 'accept'
+        && !guidance?.trim()
+      )
+    ) {
+      throw invalidProductionRequest(
+        'session_kernel_production_plan_guidance_invalid'
+      );
+    }
+    return {
+      kind: tagged.kind,
+      data: {
+        planRevision: identity(body.planRevision, 'planRevision'),
+        decision: body.decision,
+        ...(guidance !== undefined ? { guidance } : {}),
+      },
+    };
+  }
   if (tagged.kind === 'skipPlanAction') {
     const body = exactObject(data, ['planActionId', 'reason']);
     return {
@@ -748,6 +816,10 @@ function summarizeState(
     ...(state.plan
       ? { planRevision: state.plan.planRevision }
       : {}),
+    ...(state.planDecision
+      ? { planDecision: cloneJson(state.planDecision) }
+      : {}),
+    planConfirmation: summarizePlanConfirmation(state),
     ...(state.activeWait
       ? { activeWait: cloneJson(state.activeWait) }
       : {}),
@@ -791,6 +863,39 @@ function productionContinuation(
       guidance: [...state.pendingGuidance],
     };
   }
+  if (
+    outcome.kind === 'replanResult'
+    && outcome.result.kind !== 'plan'
+  ) {
+    return continuationForLoopResult(outcome.result);
+  }
+  if (
+    state.plan
+    && (
+      state.planDecision?.planRevision !== state.plan.planRevision
+      || state.planDecision.decision !== 'accept'
+    )
+  ) {
+    return {
+      kind: 'awaitingUserPlanConfirmation',
+      planRevision: state.plan.planRevision,
+    };
+  }
+  if (
+    state.plan
+    && state.planDecision?.planRevision === state.plan.planRevision
+    && state.planDecision.decision === 'accept'
+    && (
+      (
+        outcome.kind === 'initialTurnResult'
+        || outcome.kind === 'userInputResult'
+        || outcome.kind === 'replanResult'
+      )
+      && outcome.result.kind === 'plan'
+    )
+  ) {
+    return { kind: 'readyToDrivePlanAction' };
+  }
   switch (outcome.kind) {
     case 'initialTurnResult':
     case 'userInputResult':
@@ -816,6 +921,15 @@ function productionContinuation(
                 outcome.preview.data.preview.disposition,
             }
           : { kind: 'readyToDrivePlanAction' };
+    case 'planDecisionRecorded':
+      return outcome.decision.decision === 'accept'
+        ? { kind: 'readyToDrivePlanAction' }
+        : {
+            kind: 'replanRequired',
+            guidance: outcome.decision.guidance
+              ? [outcome.decision.guidance]
+              : [],
+          };
     case 'planActionSkipped':
       return { kind: 'readyToDrivePlanAction' };
     case 'capabilityDecisionObserved':
@@ -831,6 +945,29 @@ function productionContinuation(
         snapshotHighWater: outcome.review.snapshotHighWater,
       };
   }
+}
+
+function summarizePlanConfirmation(
+  state: SessionKernelLoopStateV2
+): SessionKernelProductionStateSummaryV2['planConfirmation'] {
+  if (!state.plan) return { status: 'none' };
+  if (
+    !state.planDecision
+    || state.planDecision.planRevision !== state.plan.planRevision
+  ) {
+    return {
+      status: 'pending',
+      planRevision: state.plan.planRevision,
+    };
+  }
+  return {
+    status: state.planDecision.decision === 'accept'
+      ? 'accepted'
+      : state.planDecision.decision === 'reject'
+        ? 'rejected'
+        : 'revisionRequested',
+    planRevision: state.plan.planRevision,
+  };
 }
 
 function continuationForWait(

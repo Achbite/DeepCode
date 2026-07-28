@@ -8,6 +8,7 @@ import type {
   SessionKernelProjectionEventV2,
   SessionKernelPublicRequestRecordV2,
   SessionNaturalLanguagePlanV2,
+  SessionPlanDecisionV2,
   SessionUserInputRecordV2,
 } from './types.js';
 import type {
@@ -32,6 +33,7 @@ export type SessionKernelPersistenceRecordKindV2 =
   | 'storeHeader'
   | 'input'
   | 'plan'
+  | 'planDecision'
   | 'publicRequest'
   | 'publicRequestSettled'
   | 'checkpoint'
@@ -316,6 +318,33 @@ implements SessionKernelPersistencePortV2 {
     );
   }
 
+  async loadPlanDecision(
+    runId: string,
+    planRevision: string
+  ): Promise<SessionPlanDecisionV2 | undefined> {
+    this.requireRun(runId);
+    requiredIdentity(planRevision, 'planRevision');
+    const expectedRecordId = [
+      'session-kernel-v2',
+      runId,
+      `plan-decision:${planRevision}`,
+    ].join(':');
+    const record = (await this.loadRecords()).find(
+      (candidate) =>
+        candidate.recordKind === 'planDecision'
+        && candidate.recordId === expectedRecordId
+    );
+    if (!record) return undefined;
+    const decision = objectRecord(record.data);
+    if (decision?.planRevision !== planRevision) {
+      throw new SessionKernelPersistenceError(
+        'session_kernel_plan_decision_identity_mismatch',
+        `Plan decision ${planRevision} does not match its durable record identity.`
+      );
+    }
+    return cloneJson(record.data as SessionPlanDecisionV2);
+  }
+
   async loadPendingPublicRequests(
     runId: string
   ): Promise<SessionKernelPublicRequestRecordV2[]> {
@@ -367,6 +396,17 @@ implements SessionKernelPersistencePortV2 {
       `plan:${plan.planRevision}`,
       plan,
       plan.recordedAt
+    );
+  }
+
+  persistPlanDecision(
+    decision: SessionPlanDecisionV2
+  ): Promise<void> {
+    return this.append(
+      'planDecision',
+      `plan-decision:${decision.planRevision}`,
+      decision,
+      decision.recordedAt
     );
   }
 
@@ -743,6 +783,7 @@ const SESSION_KERNEL_PROJECTION_KINDS_V2 = new Set<
   SessionKernelProjectionEventV2['kind']
 >([
   'plan.persisted',
+  'plan.decided',
   'input.persisted',
   'scope.previewed',
   'provider.started',
@@ -1003,6 +1044,7 @@ function decodeRecord(
     recordKind !== 'storeHeader'
     && recordKind !== 'input'
     && recordKind !== 'plan'
+    && recordKind !== 'planDecision'
     && recordKind !== 'publicRequest'
     && recordKind !== 'publicRequestSettled'
     && recordKind !== 'checkpoint'

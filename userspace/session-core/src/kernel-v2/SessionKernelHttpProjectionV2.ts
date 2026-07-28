@@ -266,6 +266,32 @@ function publicPresentation(
             : [],
         },
       };
+    case 'plan.decided': {
+      const decision = textField(data, 'decision');
+      const status = decision === 'accept'
+        ? 'accepted'
+        : decision === 'reject'
+          ? 'rejected'
+          : 'needsRevision';
+      return {
+        kind: 'plan_review',
+        channel: decision === 'accept' ? 'progress' : 'task',
+        visibility: 'both',
+        fields: {
+          planId: textField(data, 'planRevision'),
+          planRevision: textField(data, 'planRevision'),
+          status,
+          decision,
+          guidance: textField(data, 'guidance'),
+          confirmable: false,
+          summary: decision === 'accept'
+            ? 'Plan accepted for scoped execution.'
+            : decision === 'reject'
+              ? 'Plan rejected; replanning guidance recorded.'
+              : 'Plan revision requested; guidance recorded.',
+        },
+      };
+    }
     case 'scope.previewed':
       if (data?.kind === 'rejected') {
         return {

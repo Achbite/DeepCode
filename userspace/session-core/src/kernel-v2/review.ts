@@ -45,6 +45,8 @@ export function buildSessionKernelReviewV2(
     state.review
     && state.review.snapshotHighWater === snapshotHighWater
     && state.review.planRevision === state.plan?.planRevision
+    && JSON.stringify(state.review.planDecision)
+      === JSON.stringify(state.planDecision)
   ) {
     return cloneReview(state.review);
   }
@@ -55,6 +57,9 @@ export function buildSessionKernelReviewV2(
     status: 'draft',
     ...(state.plan?.planRevision
       ? { planRevision: state.plan.planRevision }
+      : {}),
+    ...(state.planDecision
+      ? { planDecision: cloneJson(state.planDecision) }
       : {}),
     ...(state.plan
       ? {
@@ -155,6 +160,8 @@ export function canFinalizeSessionKernelReviewV2(
 ): boolean {
   if (
     !state.plan
+    || state.planDecision?.planRevision !== state.plan.planRevision
+    || state.planDecision.decision !== 'accept'
     || !sessionKernelFactsCaughtUpV2(state.lineage)
     || state.activeWait
     || state.providerTurn?.status === 'active'

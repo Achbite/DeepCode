@@ -10,7 +10,6 @@ import {
   type KernelCommandEnvelopeV2,
   type KernelCommandV2,
   type KernelFactProjectionPageV2,
-  type KernelReplyV2,
   type RawToolArgumentsV2,
   type RunOpenReplyV2,
   type ScopeManifestV2,

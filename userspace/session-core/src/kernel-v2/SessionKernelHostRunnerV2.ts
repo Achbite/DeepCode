@@ -13,6 +13,7 @@ import type {
   SessionKernelLoopResultV2,
   SessionKernelReviewV2,
   SessionProviderTurnRequestV2,
+  SessionPlanDecisionV2,
   SessionUserInputRecordV2,
 } from './types.js';
 
@@ -138,6 +139,14 @@ export class SessionKernelHostRunnerV2 {
     return this.loop.previewPlanAction(planActionId);
   }
 
+  async decidePlan(input: {
+    planRevision: string;
+    decision: SessionPlanDecisionV2['decision'];
+    guidance?: string;
+  }): Promise<SessionPlanDecisionV2> {
+    return this.loop.decidePlan(input);
+  }
+
   async skipPlanAction(
     planActionId: string,
     reason: string
@@ -189,7 +198,9 @@ export class SessionKernelHostRunnerV2 {
     planActionId: string;
     guidance: string[];
   }): Promise<SessionKernelLoopResultV2> {
-    const wait = this.loop.snapshot().activeWait;
+    const snapshot = this.loop.snapshot();
+    requireAcceptedPlanRevision(snapshot);
+    const wait = snapshot.activeWait;
     if (
       !wait
       || wait.kind !== 'backpressure'
@@ -221,6 +232,7 @@ export class SessionKernelHostRunnerV2 {
     planActionId: string,
     options: SessionPlanActionDriveOptionsV2 = {}
   ): Promise<SessionPlanActionDriveStepV2> {
+    requireAcceptedPlanRevision(this.loop.snapshot());
     const budget = normalizeProviderCallBudget(
       options.providerCallBudget
     );
@@ -406,4 +418,19 @@ function planActionProviderCallCount(
 
 function cloneJson<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function requireAcceptedPlanRevision(
+  state: SessionKernelLoopStateV2
+): void {
+  if (
+    !state.plan
+    || state.planDecision?.planRevision !== state.plan.planRevision
+    || state.planDecision.decision !== 'accept'
+  ) {
+    throw new SessionKernelHostRunnerError(
+      'session_kernel_plan_acceptance_required',
+      'The exact current Plan revision must be durably accepted before PlanAction drive.'
+    );
+  }
 }

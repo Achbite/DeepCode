@@ -19,6 +19,7 @@ import {
   checkpointSessionKernelStateV2,
   cloneSessionKernelLoopStateV2,
   createSessionKernelLoopStateV2,
+  recordSessionPlanDecisionV2,
   recordSessionPlanV2,
   recordSessionUserInputV2,
   restoreSessionKernelLoopStateV2,
@@ -35,6 +36,7 @@ import type {
   SessionKernelPublicRequestRecordV2,
   SessionKernelReviewV2,
   SessionNaturalLanguagePlanV2,
+  SessionPlanDecisionV2,
   SessionProviderTurnRequestV2,
   SessionUserInputRecordV2,
 } from './types.js';
@@ -61,6 +63,7 @@ export class SessionKernelLoopV2 {
   private authorityTransitionActive = false;
   private maintenanceActive = false;
   private checkpointWrites: Promise<void> = Promise.resolve();
+  private pendingPlanDecision?: SessionPlanDecisionV2;
 
   private constructor(
     private state: SessionKernelLoopStateV2,
@@ -99,6 +102,7 @@ export class SessionKernelLoopV2 {
           this.authorityTransitionActive || this.maintenanceActive,
         requireNoPendingRequests: () => this.requireNoPendingRequests(),
         requirePlanProjected: () => this.requirePlanProjected(),
+        requirePlanAccepted: () => this.requireAcceptedPlan(),
       }
     );
   }
@@ -178,6 +182,30 @@ export class SessionKernelLoopV2 {
     ) {
       state = recordSessionPlanV2(state, persistedPlan);
     }
+    const persistedPlanDecision = state.plan
+      ? await ports.persistence.loadPlanDecision(
+          initial.runId,
+          state.plan.planRevision
+        )
+      : undefined;
+    if (
+      state.planDecision
+      && !persistedPlanDecision
+    ) {
+      throw new SessionKernelLoopError(
+        'session_kernel_persisted_plan_decision_missing',
+        'Checkpoint Plan decision requires its immutable durable decision record.'
+      );
+    }
+    if (
+      persistedPlanDecision
+      && persistedPlanDecision.planRevision === state.plan?.planRevision
+    ) {
+      state = recordSessionPlanDecisionV2(
+        state,
+        persistedPlanDecision
+      );
+    }
     state.publicRequests = authoritativePendingRequests(
       state,
       pendingRequests
@@ -200,6 +228,76 @@ export class SessionKernelLoopV2 {
     }
   }
 
+  async decidePlan(input: {
+    planRevision: string;
+    decision: SessionPlanDecisionV2['decision'];
+    guidance?: string;
+  }): Promise<SessionPlanDecisionV2> {
+    this.beginMaintenance('decidePlan');
+    try {
+      this.requireNoPendingRequests();
+      this.requirePlanProjected();
+      if (this.state.activeWait) {
+        throw new SessionKernelLoopError(
+          'session_kernel_plan_decision_wait_active',
+          'Plan decision cannot change while authority or invocation work is active.'
+        );
+      }
+      if (this.state.plan?.planRevision !== input.planRevision) {
+        throw new SessionKernelLoopError(
+          'session_kernel_plan_decision_revision_stale',
+          `Plan revision ${input.planRevision} is not the current persisted Plan.`
+        );
+      }
+      const guidance = input.guidance;
+      const existing = this.state.planDecision
+        ?? (
+          this.pendingPlanDecision?.planRevision === input.planRevision
+            ? this.pendingPlanDecision
+            : undefined
+        );
+      if (existing) {
+        if (
+          existing.planRevision !== input.planRevision
+          || existing.decision !== input.decision
+          || (existing.guidance ?? undefined) !== (guidance || undefined)
+        ) {
+          throw new SessionKernelLoopError(
+            'session_kernel_plan_decision_conflict',
+            `Plan revision ${input.planRevision} already has a different immutable decision attempt.`
+          );
+        }
+        if (!this.state.planDecision) {
+          await this.ports.persistence.persistPlanDecision(existing);
+          this.state = recordSessionPlanDecisionV2(
+            this.state,
+            existing
+          );
+          this.pendingPlanDecision = undefined;
+          await this.saveCheckpoint();
+        }
+        await this.ensurePlanDecisionProjected();
+        return cloneJson(existing);
+      }
+      const decision: SessionPlanDecisionV2 = {
+        planRevision: input.planRevision,
+        decision: input.decision,
+        ...(guidance ? { guidance } : {}),
+        recordedAt: this.ports.clock.now(),
+      };
+      const next = recordSessionPlanDecisionV2(this.state, decision);
+      this.pendingPlanDecision = decision;
+      await this.ports.persistence.persistPlanDecision(decision);
+      this.state = next;
+      this.pendingPlanDecision = undefined;
+      await this.saveCheckpoint();
+      await this.ensurePlanDecisionProjected();
+      return cloneJson(decision);
+    } finally {
+      this.endMaintenance();
+    }
+  }
+
   async skipPlanAction(
     planActionId: string,
     reason: string
@@ -207,6 +305,7 @@ export class SessionKernelLoopV2 {
     this.beginMaintenance('skipPlanAction');
     try {
       this.requireNoPendingRequests();
+      this.requireAcceptedPlan();
       if (this.state.activeWait) {
         throw new SessionKernelLoopError(
           'session_kernel_plan_action_skip_wait_active',
@@ -248,6 +347,7 @@ export class SessionKernelLoopV2 {
     try {
       this.requireNoPendingRequests();
       this.requirePlanProjected();
+      this.requireAcceptedPlan();
       if (this.state.toolContext.refreshRequired) {
         throw new SessionKernelLoopError(
           'session_kernel_context_refresh_boundary_required',
@@ -308,6 +408,9 @@ export class SessionKernelLoopV2 {
   async runProviderTurn(
     request: SessionProviderTurnRequestV2
   ): Promise<SessionKernelLoopResultV2> {
+    if (request.target.kind === 'planAction') {
+      this.requireAcceptedPlan();
+    }
     return this.providers.run(request);
   }
 
@@ -459,6 +562,7 @@ export class SessionKernelLoopV2 {
     this.beginMaintenance('finalizeReview');
     try {
       this.requireNoPendingRequests();
+      this.requireAcceptedPlan();
       await this.reconcileFactsInternal();
       const review = finalizeSessionKernelReviewV2(
         this.state,
@@ -491,6 +595,7 @@ export class SessionKernelLoopV2 {
       await this.requests.replay('effect');
       await this.reconcileFactsInternal();
       await this.ensurePlanProjected();
+      await this.ensurePlanDecisionProjected();
       for (const input of this.state.inputs) {
         await this.ensureInputProjected(input);
       }
@@ -588,6 +693,21 @@ export class SessionKernelLoopV2 {
     await this.saveCheckpoint();
   }
 
+  private async ensurePlanDecisionProjected(): Promise<void> {
+    const decision = this.state.planDecision;
+    if (!decision) return;
+    const key = planDecisionKey(decision);
+    if (this.state.projectedPlanDecisionKey === key) return;
+    await this.project(
+      `plan-decision:${decision.planRevision}`,
+      'plan.decided',
+      decision,
+      decision.recordedAt
+    );
+    this.state.projectedPlanDecisionKey = key;
+    await this.saveCheckpoint();
+  }
+
   private async persistPlan(
     plan: SessionNaturalLanguagePlanV2
   ): Promise<void> {
@@ -635,6 +755,22 @@ export class SessionKernelLoopV2 {
       throw new SessionKernelLoopError(
         'session_kernel_plan_projection_required',
         'A Plan must be durably persisted and projected before preview or ToolIntent generation.'
+      );
+    }
+  }
+
+  private requireAcceptedPlan(): void {
+    const plan = this.state.plan;
+    const decision = this.state.planDecision;
+    if (
+      !plan
+      || !decision
+      || decision.planRevision !== plan.planRevision
+      || decision.decision !== 'accept'
+    ) {
+      throw new SessionKernelLoopError(
+        'session_kernel_plan_acceptance_required',
+        'The exact current Plan revision must be durably accepted before preview or execution.'
       );
     }
   }
@@ -756,6 +892,18 @@ function requiredReason(value: string): string {
     );
   }
   return value;
+}
+
+function planDecisionKey(decision: SessionPlanDecisionV2): string {
+  return JSON.stringify([
+    decision.planRevision,
+    decision.decision,
+    decision.guidance ?? '',
+  ]);
+}
+
+function cloneJson<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
 }
 
 function authoritativePendingRequests(

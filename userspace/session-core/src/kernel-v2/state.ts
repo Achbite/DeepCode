@@ -19,6 +19,7 @@ import {
   type SessionKernelPublicRequestRecordV2,
   type SessionKernelReviewV2,
   type SessionNaturalLanguagePlanV2,
+  type SessionPlanDecisionV2,
   type SessionProviderTurnRecordV2,
   type SessionProviderOutcomeRecordV2,
   type SessionPlanActionSettlementV2,
@@ -36,7 +37,9 @@ export interface SessionKernelLoopStateV2 {
   projectedInputIds: string[];
   toolContext: SessionToolContextStateV2;
   plan?: SessionNaturalLanguagePlanV2;
+  planDecision?: SessionPlanDecisionV2;
   projectedPlanRevision?: string;
+  projectedPlanDecisionKey?: string;
   lineage: SessionKernelLineageStateV2;
   previews: Record<string, CapabilityScopePreviewRecordV2>;
   factsById: Record<string, KernelFactProjectionV2>;
@@ -136,6 +139,15 @@ export function restoreSessionKernelLoopStateV2(
       );
     }
   }
+  if (state.planDecision) {
+    validatePlanDecision(state.planDecision);
+    if (state.planDecision.planRevision !== state.plan?.planRevision) {
+      throw new SessionKernelStateError(
+        'session_kernel_checkpoint_plan_decision_mismatch',
+        'Checkpoint Plan decision does not bind the current Plan revision.'
+      );
+    }
+  }
   state.projectedInputIds ??= [];
   state.providerOutcomes ??= [];
   state.planActionSettlements ??= {};
@@ -170,6 +182,8 @@ export function recordSessionPlanV2(
   let next = cloneSessionKernelLoopStateV2(state);
   if (next.plan?.planRevision !== plan.planRevision) {
     next.planActionSettlements = {};
+    next.planDecision = undefined;
+    next.projectedPlanDecisionKey = undefined;
   }
   if (
     next.plan
@@ -188,6 +202,37 @@ export function recordSessionPlanV2(
     });
   }
   next.plan = cloneJson(plan);
+  return next;
+}
+
+export function recordSessionPlanDecisionV2(
+  state: SessionKernelLoopStateV2,
+  decision: SessionPlanDecisionV2
+): SessionKernelLoopStateV2 {
+  validatePlanDecision(decision);
+  if (!state.plan || state.plan.planRevision !== decision.planRevision) {
+    throw new SessionKernelStateError(
+      'session_kernel_plan_decision_revision_stale',
+      `Plan decision ${decision.planRevision} does not bind the current Plan revision.`
+    );
+  }
+  const next = cloneSessionKernelLoopStateV2(state);
+  if (
+    next.planDecision
+    && JSON.stringify(next.planDecision) !== JSON.stringify(decision)
+  ) {
+    throw new SessionKernelStateError(
+      'session_kernel_plan_decision_conflict',
+      `Plan revision ${decision.planRevision} already has a different durable decision.`
+    );
+  }
+  next.planDecision = cloneJson(decision);
+  next.projectedPlanDecisionKey = undefined;
+  if (decision.decision !== 'accept' && decision.guidance) {
+    if (!next.pendingGuidance.includes(decision.guidance)) {
+      next.pendingGuidance.push(decision.guidance);
+    }
+  }
   return next;
 }
 
@@ -217,7 +262,9 @@ export function recordSessionUserInputV2(
   next.currentInputId = input.inputId;
   next.pendingEpochInput = cloneJson(input);
   next.plan = undefined;
+  next.planDecision = undefined;
   next.projectedPlanRevision = undefined;
+  next.projectedPlanDecisionKey = undefined;
   next.previews = {};
   next.planActionSettlements = {};
   return next;
@@ -313,6 +360,52 @@ function validatePlan(plan: SessionNaturalLanguagePlanV2): void {
     actionIds.add(action.manifest.planActionId);
     operationIds.add(action.manifest.operationId);
     idempotencyKeys.add(action.idempotencyKey);
+  }
+}
+
+function validatePlanDecision(decision: SessionPlanDecisionV2): void {
+  requiredIdentity(decision.planRevision, 'planRevision');
+  if (
+    decision.decision !== 'accept'
+    && decision.decision !== 'reject'
+    && decision.decision !== 'revise'
+  ) {
+    throw new SessionKernelStateError(
+      'session_kernel_plan_decision_invalid',
+      'Plan decision must be accept, reject, or revise.'
+    );
+  }
+  if (
+    decision.decision !== 'accept'
+    && !decision.guidance?.trim()
+  ) {
+    throw new SessionKernelStateError(
+      'session_kernel_plan_decision_guidance_required',
+      'Reject and revise decisions require user guidance.'
+    );
+  }
+  if (
+    decision.guidance !== undefined
+    && (
+      new TextEncoder().encode(decision.guidance).byteLength
+        > 64 * 1024
+      || decision.guidance.trim() !== decision.guidance
+    )
+  ) {
+    throw new SessionKernelStateError(
+      'session_kernel_plan_decision_guidance_invalid',
+      'Plan decision guidance must be trimmed and bounded.'
+    );
+  }
+  const recordedAt = Date.parse(decision.recordedAt);
+  if (
+    !Number.isFinite(recordedAt)
+    || new Date(recordedAt).toISOString() !== decision.recordedAt
+  ) {
+    throw new SessionKernelStateError(
+      'session_kernel_plan_decision_time_invalid',
+      'Plan decision recordedAt must be an ISO-compatible instant.'
+    );
   }
 }
 

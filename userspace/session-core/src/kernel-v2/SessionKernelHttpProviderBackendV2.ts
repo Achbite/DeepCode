@@ -200,6 +200,9 @@ function providerTurnFrame(
     toolContextRef: input.toolContext.contextRef,
     currentInput: input.currentInput,
     ...(input.plan ? { plan: input.plan } : {}),
+    ...(input.planDecision
+      ? { planDecision: input.planDecision }
+      : {}),
     target: input.target,
     guidance: input.guidance,
     kernelFacts: input.kernelFacts,
