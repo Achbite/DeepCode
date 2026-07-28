@@ -10,9 +10,15 @@ use crate::tool_catalog_v4::{
     AuthorityToolIdV4, EffectScopeV4, ExecutionAvailabilityV4, ToolCatalogDigestV4,
     ToolContractDigestV4, ToolInvocationInputV4, ToolOutputV4, ToolRiskV4,
 };
+use crate::tool_protocol_v2::{
+    CanonicalArgumentsDigestV2, CapabilityAuthorizationDigestV2, CapabilityLeaseIdV2,
+    CapabilityLeaseVersionV2, CapabilityScopeDigestV2, CapabilityScopePreviewIdV2, PlanActionIdV2,
+    PlanRevisionV2, ToolAvailabilityV2, ToolContextRefV2, ToolContractDigestV2, ToolIdV2,
+    TrustLeaseDigestV2, TrustPolicyIdV2,
+};
 use crate::KERNEL_ABI_V2_VERSION;
 
-pub const FACT_STORE_SCHEMA_CONTRACT_V2: &str = "deepcode.kernel.fact-store.v2.sqlite.2";
+pub const FACT_STORE_SCHEMA_CONTRACT_V2: &str = "deepcode.kernel.fact-store.v2.sqlite.3";
 pub const MAX_ID_BYTES_V2: usize = 512;
 pub const MAX_TEXT_BYTES_V2: usize = 16 * 1024;
 pub const MAX_CORRELATION_REFS_V2: usize = 256;
@@ -186,11 +192,15 @@ macro_rules! digest_type {
             pub fn as_str(&self) -> &str {
                 &self.0
             }
+
+            pub(crate) fn from_raw_digest(bytes: [u8; 32]) -> Self {
+                Self(format!("sha256:{}", encode_lower_hex(&bytes)))
+            }
         }
 
         impl DigestFromRaw for $name {
             fn from_raw_digest(bytes: [u8; 32]) -> Self {
-                Self(format!("sha256:{}", encode_lower_hex(&bytes)))
+                Self::from_raw_digest(bytes)
             }
         }
 
@@ -769,6 +779,55 @@ pub struct GrantLifecycleIdentityV2 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AuthorizationIdentityV2 {
+    pub run_id: RunId,
+    pub control_epoch: ControlEpoch,
+    pub plan_revision: PlanRevisionV2,
+    pub plan_action_id: PlanActionIdV2,
+    pub operation_id: OperationId,
+    pub causation_fact_id: FactId,
+    pub correlation_set: CorrelationSetV2,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CapabilityLeaseFactIdentityV2 {
+    pub run_id: RunId,
+    pub control_epoch: ControlEpoch,
+    pub plan_revision: PlanRevisionV2,
+    pub plan_action_id: PlanActionIdV2,
+    pub operation_id: OperationId,
+    pub preview_id: CapabilityScopePreviewIdV2,
+    pub lease_id: CapabilityLeaseIdV2,
+    pub lease_version: CapabilityLeaseVersionV2,
+    pub causation_fact_id: FactId,
+    pub correlation_set: CorrelationSetV2,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CapabilityAwaitingIdentityV2 {
+    pub run_id: RunId,
+    pub control_epoch: ControlEpoch,
+    pub plan_revision: PlanRevisionV2,
+    pub plan_action_id: PlanActionIdV2,
+    pub operation_id: OperationId,
+    pub invocation_id: InvocationId,
+    pub idempotency_key_hash: IdempotencyKeyHashV2,
+    pub causation_fact_id: FactId,
+    pub correlation_set: CorrelationSetV2,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ToolContextInvalidationIdentityV2 {
+    pub run_id: RunId,
+    pub control_epoch: ControlEpoch,
+    pub causation_fact_id: FactId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReservationIdentityV2 {
     pub run_id: RunId,
     pub control_epoch: ControlEpoch,
@@ -1037,6 +1096,16 @@ pub enum MutationCommandResultV2 {
     deny_unknown_fields
 )]
 pub enum ControlFactV2 {
+    RunOpened {
+        run_id: RunId,
+        control_epoch: ControlEpoch,
+        public_request_id: CommandRequestId,
+        public_request_digest: CommandRequestDigestV2,
+        causation_fact_id: FactId,
+        workspace_binding_ref: crate::tool_protocol_v2::WorkspaceBindingRefV2,
+        workspace_binding_digest: WorkspaceBindingDigestV2,
+        tool_context_ref: ToolContextRefV2,
+    },
     CommandRecorded {
         identity: CommandReceiptIdentityV2,
         command_kind: crate::v2_command::MutationCommandKindV2,
@@ -1058,6 +1127,128 @@ pub enum ControlFactV2 {
         identity: TransitionIdentityV2,
         reason_code: RunTerminationReasonCodeV2,
         reason: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CapabilityLeaseRevokeReasonV2 {
+    UserRevoked,
+    SettingsChanged,
+    ToolRevoked,
+    RunTerminated,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CapabilityLeaseSupersessionReasonV2 {
+    ControlEpochAdvanced,
+    ScopeExpanded,
+    ToolContextChanged,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ToolContextInvalidationReasonV2 {
+    ToolRevoked,
+    ToolUnavailable,
+    SettingsChanged,
+    RegistryChanged,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    content = "data",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum AuthorizationFactV2 {
+    ScopePreviewed {
+        identity: AuthorizationIdentityV2,
+        preview_id: CapabilityScopePreviewIdV2,
+        tool_id: ToolIdV2,
+        canonical_arguments_digest: CanonicalArgumentsDigestV2,
+        scope_digest: CapabilityScopeDigestV2,
+        tool_contract_digest: ToolContractDigestV2,
+        context_ref: ToolContextRefV2,
+        disposition: crate::v2_command::CapabilityScopeDispositionV2,
+    },
+    CapabilityIssued {
+        identity: CapabilityLeaseFactIdentityV2,
+        tool_id: ToolIdV2,
+        scope_digest: CapabilityScopeDigestV2,
+        authorization_digest: CapabilityAuthorizationDigestV2,
+        tool_contract_digest: ToolContractDigestV2,
+        context_ref: ToolContextRefV2,
+    },
+    CapabilityDenied {
+        identity: AuthorizationIdentityV2,
+        preview_id: CapabilityScopePreviewIdV2,
+        tool_id: ToolIdV2,
+        scope_digest: CapabilityScopeDigestV2,
+        authorization_digest: CapabilityAuthorizationDigestV2,
+        guidance: String,
+    },
+    CapabilityAwaiting {
+        identity: CapabilityAwaitingIdentityV2,
+        preview_id: CapabilityScopePreviewIdV2,
+        tool_id: ToolIdV2,
+        canonical_arguments_digest: CanonicalArgumentsDigestV2,
+        scope_digest: CapabilityScopeDigestV2,
+        tool_contract_digest: ToolContractDigestV2,
+        context_ref: ToolContextRefV2,
+    },
+    ExpansionAllowed {
+        identity: CapabilityLeaseFactIdentityV2,
+        previous_lease_id: CapabilityLeaseIdV2,
+        previous_scope_digest: CapabilityScopeDigestV2,
+        expanded_scope_digest: CapabilityScopeDigestV2,
+        authorization_digest: CapabilityAuthorizationDigestV2,
+    },
+    ExpansionDenied {
+        identity: AuthorizationIdentityV2,
+        preview_id: CapabilityScopePreviewIdV2,
+        requested_scope_digest: CapabilityScopeDigestV2,
+        authorization_digest: CapabilityAuthorizationDigestV2,
+        guidance: String,
+    },
+    TrustGranted {
+        identity: AuthorizationIdentityV2,
+        trust_policy_id: TrustPolicyIdV2,
+        trust_lease_digest: TrustLeaseDigestV2,
+        tool_id: ToolIdV2,
+        scope_digest: CapabilityScopeDigestV2,
+        workspace_binding_digest: WorkspaceBindingDigestV2,
+        context_ref: ToolContextRefV2,
+        expires_at: Option<RecordedAtV2>,
+    },
+    TrustRevoked {
+        identity: AuthorizationIdentityV2,
+        trust_policy_id: TrustPolicyIdV2,
+        trust_lease_digest: TrustLeaseDigestV2,
+        tool_id: ToolIdV2,
+        scope_digest: CapabilityScopeDigestV2,
+        workspace_binding_digest: WorkspaceBindingDigestV2,
+        context_ref: ToolContextRefV2,
+        expires_at: Option<RecordedAtV2>,
+    },
+    LeaseRevoked {
+        identity: CapabilityLeaseFactIdentityV2,
+        reason: CapabilityLeaseRevokeReasonV2,
+    },
+    LeaseSuperseded {
+        identity: CapabilityLeaseFactIdentityV2,
+        reason: CapabilityLeaseSupersessionReasonV2,
+    },
+    ContextInvalidated {
+        identity: ToolContextInvalidationIdentityV2,
+        previous_context: ToolContextRefV2,
+        next_context_version: crate::tool_protocol_v2::ToolContextVersionV2,
+        tool_id: Option<ToolIdV2>,
+        availability: Option<ToolAvailabilityV2>,
+        reason: ToolContextInvalidationReasonV2,
     },
 }
 
@@ -1395,6 +1586,7 @@ pub enum CleanupFactV2 {
 )]
 pub enum KernelFactPayloadV2 {
     Control(ControlFactV2),
+    Authorization(AuthorizationFactV2),
     Grant(GrantFactV2),
     Invocation(InvocationFactV2),
     Effect(EffectFactV2),
@@ -1475,6 +1667,7 @@ impl KernelFactPayloadV2 {
     pub fn run_id(&self) -> &RunId {
         match self {
             Self::Control(fact) => fact.run_id(),
+            Self::Authorization(fact) => fact.run_id(),
             Self::Grant(fact) => fact.identity().run_id,
             Self::Invocation(fact) => fact.identity().run_id,
             Self::Effect(fact) => &fact.identity().run_id,
@@ -1485,6 +1678,7 @@ impl KernelFactPayloadV2 {
 
     pub fn control_epoch(&self) -> Option<ControlEpoch> {
         match self {
+            Self::Control(ControlFactV2::RunOpened { control_epoch, .. }) => Some(*control_epoch),
             Self::Control(ControlFactV2::CommandRecorded { identity, .. }) => {
                 match identity.epoch_context {
                     CommandEpochContextV2::NoCurrentEpoch {} => None,
@@ -1498,6 +1692,7 @@ impl KernelFactPayloadV2 {
             Self::Control(ControlFactV2::CancellationRequested { identity, .. }) => {
                 Some(identity.control_epoch)
             }
+            Self::Authorization(fact) => Some(fact.control_epoch()),
             Self::Grant(fact) => Some(fact.identity().control_epoch),
             Self::Invocation(InvocationFactV2::Rejected { identity, .. }) => {
                 Some(identity.current_control_epoch)
@@ -1512,6 +1707,7 @@ impl KernelFactPayloadV2 {
     pub fn causation_fact_id(&self) -> Option<&FactId> {
         match self {
             Self::Control(fact) => fact.causation(),
+            Self::Authorization(fact) => Some(fact.causation_fact_id()),
             Self::Grant(fact) => Some(fact.identity().causation_fact_id),
             Self::Invocation(fact) => Some(fact.identity().causation_fact_id),
             Self::Effect(fact) => Some(&fact.identity().causation_fact_id),
@@ -1523,6 +1719,7 @@ impl KernelFactPayloadV2 {
     pub fn operation_id(&self) -> Option<&OperationId> {
         match self {
             Self::Control(_) => None,
+            Self::Authorization(fact) => fact.operation_id(),
             Self::Grant(fact) => Some(fact.identity().operation_id),
             Self::Invocation(fact) => Some(fact.identity().operation_id),
             Self::Effect(fact) => Some(&fact.identity().operation_id),
@@ -1537,6 +1734,7 @@ impl KernelFactPayloadV2 {
                 Some(&identity.invocation_id)
             }
             Self::Control(_) => None,
+            Self::Authorization(fact) => fact.invocation_id(),
             Self::Grant(fact) => fact.identity().invocation_id,
             Self::Invocation(fact) => fact.identity().invocation_id,
             Self::Effect(fact) => Some(&fact.identity().invocation_id),
@@ -1551,6 +1749,18 @@ impl KernelFactPayloadV2 {
             Self::Effect(fact) => Some(&fact.identity().attempt_id),
             Self::Resource(fact) => fact.identity().attempt_id,
             Self::Cleanup(fact) => Some(&fact.identity().attempt_id),
+            Self::Control(_) | Self::Authorization(_) | Self::Grant(_) => None,
+        }
+    }
+
+    pub fn effect_id(&self) -> Option<&EffectId> {
+        match self {
+            Self::Invocation(
+                InvocationFactV2::Completed { identity, .. }
+                | InvocationFactV2::FailedAfterObservedEffect { identity, .. }
+                | InvocationFactV2::Indeterminate { identity, .. },
+            ) => Some(&identity.effect_id),
+            Self::Effect(fact) => Some(&fact.identity().effect_id),
             _ => None,
         }
     }
@@ -1560,6 +1770,20 @@ impl KernelFactPayloadV2 {
             Self::Grant(fact) => fact.identity().grant_id,
             Self::Invocation(fact) => fact.identity().grant_id,
             Self::Effect(fact) => Some(&fact.identity().grant_id),
+            Self::Control(_) | Self::Authorization(_) | Self::Resource(_) | Self::Cleanup(_) => {
+                None
+            }
+        }
+    }
+
+    pub fn capability_lease_id(&self) -> Option<&CapabilityLeaseIdV2> {
+        match self {
+            Self::Authorization(
+                AuthorizationFactV2::CapabilityIssued { identity, .. }
+                | AuthorizationFactV2::ExpansionAllowed { identity, .. }
+                | AuthorizationFactV2::LeaseRevoked { identity, .. }
+                | AuthorizationFactV2::LeaseSuperseded { identity, .. },
+            ) => Some(&identity.lease_id),
             _ => None,
         }
     }
@@ -1569,22 +1793,28 @@ impl KernelFactPayloadV2 {
             Self::Grant(fact) => fact.identity().reservation_id,
             Self::Invocation(fact) => fact.identity().reservation_id,
             Self::Effect(fact) => Some(&fact.identity().reservation_id),
-            _ => None,
+            Self::Control(_) | Self::Authorization(_) | Self::Resource(_) | Self::Cleanup(_) => {
+                None
+            }
         }
     }
 
     pub fn idempotency_hash(&self) -> Option<&IdempotencyKeyHashV2> {
         match self {
+            Self::Authorization(fact) => fact.idempotency_key_hash(),
             Self::Grant(fact) => fact.identity().idempotency_key_hash,
             Self::Invocation(fact) => Some(fact.identity().idempotency_key_hash),
             Self::Effect(fact) => Some(&fact.identity().idempotency_key_hash),
             Self::Resource(fact) => Some(fact.identity().idempotency_key_hash),
-            _ => None,
+            Self::Control(_) | Self::Cleanup(_) => None,
         }
     }
 
     pub fn command_request_id(&self) -> Option<&CommandRequestId> {
         match self {
+            Self::Control(ControlFactV2::RunOpened {
+                public_request_id, ..
+            }) => Some(public_request_id),
             Self::Control(ControlFactV2::CommandRecorded { identity, .. }) => {
                 Some(&identity.command_request_identity.command_request_id)
             }
@@ -1597,15 +1827,25 @@ impl KernelFactPayloadV2 {
             Self::Effect(fact) => fact.resource_ids(),
             Self::Resource(fact) => vec![fact.identity().resource_id],
             Self::Cleanup(fact) => vec![&fact.identity().resource_id],
-            _ => Vec::new(),
+            Self::Control(_) | Self::Authorization(_) | Self::Grant(_) | Self::Invocation(_) => {
+                Vec::new()
+            }
         }
     }
 
     pub fn correlation_set(&self) -> Option<&CorrelationSetV2> {
         match self {
+            Self::Authorization(fact) => fact.correlation_set(),
             Self::Grant(fact) => fact.identity().correlation_set,
             Self::Invocation(fact) => Some(fact.identity().correlation_set),
             Self::Resource(fact) => Some(fact.identity().correlation_set),
+            Self::Control(_) | Self::Effect(_) | Self::Cleanup(_) => None,
+        }
+    }
+
+    pub fn authorization_plan_action_id(&self) -> Option<&PlanActionIdV2> {
+        match self {
+            Self::Authorization(fact) => fact.plan_action_id(),
             _ => None,
         }
     }
@@ -1613,6 +1853,7 @@ impl KernelFactPayloadV2 {
     pub fn kind_token(&self) -> &'static str {
         match self {
             Self::Control(_) => "control",
+            Self::Authorization(_) => "authorization",
             Self::Grant(_) => "grant",
             Self::Invocation(_) => "invocation",
             Self::Effect(_) => "effect",
@@ -1625,6 +1866,7 @@ impl KernelFactPayloadV2 {
 impl ControlFactV2 {
     fn run_id(&self) -> &RunId {
         match self {
+            Self::RunOpened { run_id, .. } => run_id,
             Self::CommandRecorded { identity, .. } => &identity.run_id,
             Self::EpochAdvanced { identity, .. } | Self::RunTerminated { identity, .. } => {
                 &identity.run_id
@@ -1635,11 +1877,126 @@ impl ControlFactV2 {
 
     fn causation(&self) -> Option<&FactId> {
         match self {
+            Self::RunOpened {
+                causation_fact_id, ..
+            } => Some(causation_fact_id),
             Self::CommandRecorded { .. } => None,
             Self::EpochAdvanced { identity, .. } | Self::RunTerminated { identity, .. } => {
                 Some(&identity.causation_fact_id)
             }
             Self::CancellationRequested { identity, .. } => Some(&identity.causation_fact_id),
+        }
+    }
+}
+
+impl AuthorizationFactV2 {
+    fn run_id(&self) -> &RunId {
+        match self {
+            Self::ScopePreviewed { identity, .. }
+            | Self::CapabilityDenied { identity, .. }
+            | Self::ExpansionDenied { identity, .. }
+            | Self::TrustGranted { identity, .. }
+            | Self::TrustRevoked { identity, .. } => &identity.run_id,
+            Self::CapabilityIssued { identity, .. }
+            | Self::ExpansionAllowed { identity, .. }
+            | Self::LeaseRevoked { identity, .. }
+            | Self::LeaseSuperseded { identity, .. } => &identity.run_id,
+            Self::CapabilityAwaiting { identity, .. } => &identity.run_id,
+            Self::ContextInvalidated { identity, .. } => &identity.run_id,
+        }
+    }
+
+    fn control_epoch(&self) -> ControlEpoch {
+        match self {
+            Self::ScopePreviewed { identity, .. }
+            | Self::CapabilityDenied { identity, .. }
+            | Self::ExpansionDenied { identity, .. }
+            | Self::TrustGranted { identity, .. }
+            | Self::TrustRevoked { identity, .. } => identity.control_epoch,
+            Self::CapabilityIssued { identity, .. }
+            | Self::ExpansionAllowed { identity, .. }
+            | Self::LeaseRevoked { identity, .. }
+            | Self::LeaseSuperseded { identity, .. } => identity.control_epoch,
+            Self::CapabilityAwaiting { identity, .. } => identity.control_epoch,
+            Self::ContextInvalidated { identity, .. } => identity.control_epoch,
+        }
+    }
+
+    fn causation_fact_id(&self) -> &FactId {
+        match self {
+            Self::ScopePreviewed { identity, .. }
+            | Self::CapabilityDenied { identity, .. }
+            | Self::ExpansionDenied { identity, .. }
+            | Self::TrustGranted { identity, .. }
+            | Self::TrustRevoked { identity, .. } => &identity.causation_fact_id,
+            Self::CapabilityIssued { identity, .. }
+            | Self::ExpansionAllowed { identity, .. }
+            | Self::LeaseRevoked { identity, .. }
+            | Self::LeaseSuperseded { identity, .. } => &identity.causation_fact_id,
+            Self::CapabilityAwaiting { identity, .. } => &identity.causation_fact_id,
+            Self::ContextInvalidated { identity, .. } => &identity.causation_fact_id,
+        }
+    }
+
+    fn operation_id(&self) -> Option<&OperationId> {
+        match self {
+            Self::ScopePreviewed { identity, .. }
+            | Self::CapabilityDenied { identity, .. }
+            | Self::ExpansionDenied { identity, .. }
+            | Self::TrustGranted { identity, .. }
+            | Self::TrustRevoked { identity, .. } => Some(&identity.operation_id),
+            Self::CapabilityIssued { identity, .. }
+            | Self::ExpansionAllowed { identity, .. }
+            | Self::LeaseRevoked { identity, .. }
+            | Self::LeaseSuperseded { identity, .. } => Some(&identity.operation_id),
+            Self::CapabilityAwaiting { identity, .. } => Some(&identity.operation_id),
+            Self::ContextInvalidated { .. } => None,
+        }
+    }
+
+    fn invocation_id(&self) -> Option<&InvocationId> {
+        match self {
+            Self::CapabilityAwaiting { identity, .. } => Some(&identity.invocation_id),
+            _ => None,
+        }
+    }
+
+    fn idempotency_key_hash(&self) -> Option<&IdempotencyKeyHashV2> {
+        match self {
+            Self::CapabilityAwaiting { identity, .. } => Some(&identity.idempotency_key_hash),
+            _ => None,
+        }
+    }
+
+    fn correlation_set(&self) -> Option<&CorrelationSetV2> {
+        match self {
+            Self::ScopePreviewed { identity, .. }
+            | Self::CapabilityDenied { identity, .. }
+            | Self::ExpansionDenied { identity, .. }
+            | Self::TrustGranted { identity, .. }
+            | Self::TrustRevoked { identity, .. } => Some(&identity.correlation_set),
+            Self::CapabilityIssued { identity, .. }
+            | Self::ExpansionAllowed { identity, .. }
+            | Self::LeaseRevoked { identity, .. }
+            | Self::LeaseSuperseded { identity, .. } => Some(&identity.correlation_set),
+            Self::CapabilityAwaiting { identity, .. } => Some(&identity.correlation_set),
+            Self::ContextInvalidated { .. } => None,
+        }
+    }
+
+    fn plan_action_id(&self) -> Option<&PlanActionIdV2> {
+        match self {
+            Self::ScopePreviewed { identity, .. }
+            | Self::CapabilityDenied { identity, .. }
+            | Self::ExpansionDenied { identity, .. }
+            | Self::TrustGranted { identity, .. }
+            | Self::TrustRevoked { identity, .. } => Some(&identity.plan_action_id),
+            Self::CapabilityIssued { identity, .. }
+            | Self::ExpansionAllowed { identity, .. }
+            | Self::LeaseRevoked { identity, .. }
+            | Self::LeaseSuperseded { identity, .. } => Some(&identity.plan_action_id),
+            Self::CapabilityAwaiting { identity, .. } => Some(&identity.plan_action_id),
+            Self::ContextInvalidated { .. } => None,
         }
     }
 }
@@ -2359,12 +2716,6 @@ fn write_canonical_json(
         Value::Null => output.extend_from_slice(b"null"),
         Value::Bool(value) => output.extend_from_slice(if *value { b"true" } else { b"false" }),
         Value::Number(number) => {
-            if number.as_u64().is_none() {
-                return Err(invalid_value(
-                    "digestPreimage",
-                    "only non-negative integers are allowed",
-                ));
-            }
             output.extend_from_slice(number.to_string().as_bytes());
         }
         Value::String(value) => {
@@ -2621,11 +2972,14 @@ impl<'de> Visitor<'de> for StrictJsonVisitor {
         Ok(StrictJsonValue(Value::Number(value.into())))
     }
 
-    fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E>
+    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
     where
         E: serde::de::Error,
     {
-        Err(E::custom("floating-point JSON values are unsupported"))
+        serde_json::Number::from_f64(value)
+            .map(Value::Number)
+            .map(StrictJsonValue)
+            .ok_or_else(|| E::custom("non-finite JSON numbers are unsupported"))
     }
 
     fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {

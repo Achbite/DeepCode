@@ -5,11 +5,18 @@ use crate::tool_catalog_v4::{
     AuthorityToolIdV4, ExecutionAvailabilityV4, ToolCatalogDigestV4, ToolCatalogV4,
     ToolContractDigestV4, ToolInvocationInputV4, ToolRiskV4,
 };
+use crate::tool_protocol_v2::{
+    CanonicalArgumentsDigestV2, CapabilityLeaseRefV2, CapabilityScopeDigestV2,
+    CapabilityScopePreviewIdV2, FactQueryContinuationV2, PlanActionIdV2, PlanRevisionV2,
+    RawToolArgumentsV2, RequestedResourceV2, RunCapabilityV2, ToolContextBundleV2,
+    ToolContextRefV2, ToolContractDigestV2, ToolEffectClassV2, ToolEffectScopeV2, ToolIdV2,
+    ToolIntentAuthorityV2, ToolRiskV2, WorkspaceBindingRefV2,
+};
 use crate::v2::{
     decode_strict_json, empty_field, field_too_large, invalid_value, too_many_values,
     validate_identity, validate_wire_abi_header, zero_value, AdmissionRejectionV2, AttemptId,
     AuthorizationRequestDigestV2, CancelRequestId, CommandRequestDigestV2, CommandRequestId,
-    ControlEpoch, CorrelationRefV2, CorrelationSetV2, FactId, GrantDecisionDigestV2,
+    ControlEpoch, CorrelationRefV2, CorrelationSetV2, EffectId, FactId, GrantDecisionDigestV2,
     GrantDenialReasonV2, GrantId, GrantReservationId, GrantScopeDigestV2, GrantSupersessionCauseV2,
     IdempotencyKeyHashV2, InputId, InvocationId, InvocationSubmissionDigestV2,
     KernelFactEnvelopeV2, NetworkOriginV2, OperationId, OperationIdempotencyConflictV2,
@@ -57,6 +64,11 @@ impl KernelCommandEnvelopeV2 {
 pub enum KernelCommandV2 {
     CompatibilityGet {},
     ToolCatalogGet {},
+    RunOpen(RunOpenV2),
+    ToolContextGet(ToolContextGetV2),
+    CapabilityScopePreview(CapabilityScopePreviewV2),
+    ToolIntentSubmit(ToolIntentSubmitV2),
+    KernelFactsQueryScoped(KernelFactsQueryScopedV2),
     ControlEpochAdvance(ControlEpochAdvanceV2),
     GrantPreview(GrantRequestV2),
     GrantDecisionSubmit(GrantDecisionSubmitV2),
@@ -73,6 +85,11 @@ impl KernelCommandV2 {
     pub fn validate(&self) -> Result<(), V2ValidationError> {
         match self {
             Self::CompatibilityGet {} | Self::ToolCatalogGet {} => Ok(()),
+            Self::RunOpen(value) => value.validate(),
+            Self::ToolContextGet(value) => value.validate(),
+            Self::CapabilityScopePreview(value) => value.validate(),
+            Self::ToolIntentSubmit(value) => value.validate(),
+            Self::KernelFactsQueryScoped(value) => value.validate(),
             Self::ControlEpochAdvance(value) => value.validate(),
             Self::GrantPreview(value) => value.validate(),
             Self::GrantDecisionSubmit(value) => value.validate(),
@@ -89,6 +106,11 @@ impl KernelCommandV2 {
         match self {
             Self::CompatibilityGet {} => "compatibilityGet",
             Self::ToolCatalogGet {} => "toolCatalogGet",
+            Self::RunOpen(_) => "runOpen",
+            Self::ToolContextGet(_) => "toolContextGet",
+            Self::CapabilityScopePreview(_) => "capabilityScopePreview",
+            Self::ToolIntentSubmit(_) => "toolIntentSubmit",
+            Self::KernelFactsQueryScoped(_) => "kernelFactsQueryScoped",
             Self::ControlEpochAdvance(_) => "controlEpochAdvance",
             Self::GrantPreview(_) => "grantPreview",
             Self::GrantDecisionSubmit(_) => "grantDecisionSubmit",
@@ -104,6 +126,8 @@ impl KernelCommandV2 {
 
     pub const fn mutation_kind(&self) -> Option<MutationCommandKindV2> {
         match self {
+            Self::RunOpen(_) => Some(MutationCommandKindV2::RunOpen),
+            Self::ToolIntentSubmit(_) => Some(MutationCommandKindV2::ToolIntentSubmit),
             Self::ControlEpochAdvance(_) => Some(MutationCommandKindV2::ControlEpochAdvance),
             Self::GrantDecisionSubmit(_) => Some(MutationCommandKindV2::GrantDecisionSubmit),
             Self::GrantRevoke(_) => Some(MutationCommandKindV2::GrantRevoke),
@@ -118,6 +142,8 @@ impl KernelCommandV2 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum MutationCommandKindV2 {
+    RunOpen,
+    ToolIntentSubmit,
     ControlEpochAdvance,
     GrantDecisionSubmit,
     GrantRevoke,
@@ -128,8 +154,113 @@ pub enum MutationCommandKindV2 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RunOpenV2 {
+    pub workspace_binding_ref: WorkspaceBindingRefV2,
+    pub input_id: InputId,
+    pub opaque_input_ref: String,
+}
+
+impl RunOpenV2 {
+    pub fn validate(&self) -> Result<(), V2ValidationError> {
+        validate_text("opaqueInputRef", &self.opaque_input_ref)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ToolContextGetV2 {
+    pub run_id: RunId,
+    pub run_capability: RunCapabilityV2,
+    pub known_context: Option<ToolContextRefV2>,
+}
+
+impl ToolContextGetV2 {
+    pub fn validate(&self) -> Result<(), V2ValidationError> {
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CapabilityScopePreviewV2 {
+    pub run_id: RunId,
+    pub run_capability: RunCapabilityV2,
+    pub expected_control_epoch: ControlEpoch,
+    pub plan_revision: PlanRevisionV2,
+    pub plan_action_id: PlanActionIdV2,
+    pub operation_id: OperationId,
+    pub idempotency_key: String,
+    pub tool_id: ToolIdV2,
+    pub raw_arguments: RawToolArgumentsV2,
+    pub requested_resources: Vec<RequestedResourceV2>,
+    pub deadline: DeadlineRequestV2,
+    pub tool_context_ref: ToolContextRefV2,
+}
+
+impl CapabilityScopePreviewV2 {
+    pub fn validate(&self) -> Result<(), V2ValidationError> {
+        validate_text("idempotencyKey", &self.idempotency_key)?;
+        if self.requested_resources.is_empty() {
+            return Err(empty_field("requestedResources"));
+        }
+        if self.requested_resources.len() > MAX_CORRELATION_REFS_V2 {
+            return Err(too_many_values(
+                "requestedResources",
+                MAX_CORRELATION_REFS_V2,
+            ));
+        }
+        for resource in &self.requested_resources {
+            resource.validate()?;
+        }
+        self.deadline.validate()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ToolIntentSubmitV2 {
+    pub run_id: RunId,
+    pub run_capability: RunCapabilityV2,
+    pub expected_control_epoch: ControlEpoch,
+    pub operation_id: OperationId,
+    pub idempotency_key: String,
+    pub tool_id: ToolIdV2,
+    pub raw_arguments: RawToolArgumentsV2,
+    pub authority: ToolIntentAuthorityV2,
+    pub deadline: DeadlineRequestV2,
+    pub tool_context_ref: ToolContextRefV2,
+}
+
+impl ToolIntentSubmitV2 {
+    pub fn validate(&self) -> Result<(), V2ValidationError> {
+        validate_text("idempotencyKey", &self.idempotency_key)?;
+        self.authority.validate()?;
+        self.deadline.validate()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct KernelFactsQueryScopedV2 {
+    pub run_id: RunId,
+    pub run_capability: RunCapabilityV2,
+    pub tool_context_ref: ToolContextRefV2,
+    pub after_ledger_sequence: u64,
+    pub limit: u32,
+    pub continuation: Option<FactQueryContinuationV2>,
+}
+
+impl KernelFactsQueryScopedV2 {
+    pub fn validate(&self) -> Result<(), V2ValidationError> {
+        validate_page_limit(self.limit, "limit")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ControlEpochAdvanceV2 {
     pub run_id: RunId,
+    pub run_capability: RunCapabilityV2,
     pub precondition: EpochPreconditionV2,
     pub input_id: InputId,
     pub opaque_input_ref: String,
@@ -265,6 +396,7 @@ impl InvocationSubmitV2 {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct InvocationCancelV2 {
     pub run_id: RunId,
+    pub run_capability: RunCapabilityV2,
     pub expected_control_epoch: ControlEpoch,
     pub target: InvocationCancelTargetV2,
     pub reason_code: crate::v2::CancellationReasonCodeV2,
@@ -441,6 +573,11 @@ impl RunTerminateV2 {
 pub enum KernelReplyV2 {
     Compatibility(CompatibilityReplyV2),
     ToolCatalog(ToolCatalogV4),
+    RunOpened(RunOpenReplyV2),
+    ToolContext(ToolContextGetReplyV2),
+    CapabilityScopePreviewed(CapabilityScopePreviewReplyV2),
+    ToolIntentSubmission(ToolIntentSubmitReplyV2),
+    KernelFactsProjected(KernelFactProjectionPageV2),
     ControlEpochAdvanced(ControlEpochAdvancedReplyV2),
     GrantPreviewed(GrantPreviewReplyV2),
     GrantDecisionRecorded(GrantDecisionReplyV2),
@@ -480,6 +617,445 @@ pub enum KernelCommandResponseEnvelopeV2 {
 pub enum CommandHandlingV2 {
     Evaluated,
     Replayed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RunOpenReplyV2 {
+    pub run_id: RunId,
+    pub control_epoch: ControlEpoch,
+    pub run_capability: RunCapabilityV2,
+    pub workspace_binding_digest: WorkspaceBindingDigestV2,
+    pub tool_context: ToolContextBundleV2,
+}
+
+impl RunOpenReplyV2 {
+    pub fn validate(&self) -> Result<(), V2ValidationError> {
+        self.tool_context.validate()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    content = "data",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum ToolContextGetReplyV2 {
+    Current { context_ref: ToolContextRefV2 },
+    Updated { tool_context: ToolContextBundleV2 },
+}
+
+impl ToolContextGetReplyV2 {
+    pub fn validate(&self) -> Result<(), V2ValidationError> {
+        match self {
+            Self::Current { .. } => Ok(()),
+            Self::Updated { tool_context } => tool_context.validate(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CapabilityScopeDispositionV2 {
+    AutoIssuable,
+    RequiresUserDecision,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CapabilityApprovalViewV2 {
+    pub summary: String,
+    pub canonical_targets: Vec<String>,
+    pub scope_delta: Vec<String>,
+    pub risk: ToolRiskV2,
+    pub effect_class: ToolEffectClassV2,
+    pub effect_scope: ToolEffectScopeV2,
+    pub effective_deadline_ms: u32,
+    pub scope_digest: CapabilityScopeDigestV2,
+}
+
+impl CapabilityApprovalViewV2 {
+    pub fn validate(&self) -> Result<(), V2ValidationError> {
+        validate_text("approvalView.summary", &self.summary)?;
+        if self.effective_deadline_ms == 0 {
+            return Err(zero_value("approvalView.effectiveDeadlineMs"));
+        }
+        if self.canonical_targets.len() > MAX_CORRELATION_REFS_V2
+            || self.scope_delta.len() > MAX_CORRELATION_REFS_V2
+        {
+            return Err(too_many_values(
+                "approvalView.targets",
+                MAX_CORRELATION_REFS_V2,
+            ));
+        }
+        for target in self.canonical_targets.iter().chain(self.scope_delta.iter()) {
+            validate_text("approvalView.target", target)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CapabilityScopePreviewRecordV2 {
+    pub preview_id: CapabilityScopePreviewIdV2,
+    pub run_id: RunId,
+    pub control_epoch: ControlEpoch,
+    pub plan_revision: PlanRevisionV2,
+    pub plan_action_id: PlanActionIdV2,
+    pub operation_id: OperationId,
+    pub tool_id: ToolIdV2,
+    pub canonical_arguments_digest: CanonicalArgumentsDigestV2,
+    pub canonical_scope: ResourceScopeV2,
+    pub scope_digest: CapabilityScopeDigestV2,
+    pub authorization_digest: crate::tool_protocol_v2::CapabilityAuthorizationDigestV2,
+    pub tool_contract_digest: ToolContractDigestV2,
+    pub context_ref: ToolContextRefV2,
+    pub effect_class: ToolEffectClassV2,
+    pub effect_scope: ToolEffectScopeV2,
+    pub risk: ToolRiskV2,
+    pub effective_deadline_ms: u32,
+    pub disposition: CapabilityScopeDispositionV2,
+    pub approval_view: CapabilityApprovalViewV2,
+}
+
+impl CapabilityScopePreviewRecordV2 {
+    pub fn validate(&self) -> Result<(), V2ValidationError> {
+        if self.effective_deadline_ms == 0 {
+            return Err(zero_value("effectiveDeadlineMs"));
+        }
+        if self.approval_view.risk != self.risk
+            || self.approval_view.effect_class != self.effect_class
+            || self.approval_view.effect_scope != self.effect_scope
+            || self.approval_view.effective_deadline_ms != self.effective_deadline_ms
+            || self.approval_view.scope_digest != self.scope_digest
+        {
+            return Err(invalid_value(
+                "approvalView",
+                "must describe the exact canonical preview",
+            ));
+        }
+        self.approval_view.validate()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CapabilityScopeRejectionReasonV2 {
+    ToolNotRegistered,
+    ToolUnavailable,
+    InvalidArguments,
+    RequestedScopeInvalid,
+    SettingsDenied,
+    StaleToolContext,
+    StaleControlEpoch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    content = "data",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum CapabilityScopePreviewReplyV2 {
+    Previewed {
+        preview: CapabilityScopePreviewRecordV2,
+    },
+    Rejected {
+        tool_id: ToolIdV2,
+        reason: CapabilityScopeRejectionReasonV2,
+        guidance: String,
+    },
+}
+
+impl CapabilityScopePreviewReplyV2 {
+    pub fn validate(&self) -> Result<(), V2ValidationError> {
+        match self {
+            Self::Previewed { preview } => preview.validate(),
+            Self::Rejected { guidance, .. } => {
+                validate_optional_text("guidance", Some(guidance.as_str()))
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ToolIntentRejectionReasonV2 {
+    ToolNotRegistered,
+    ToolUnavailable,
+    InvalidArguments,
+    StaleToolContext,
+    StaleControlEpoch,
+    PlanActionRequired,
+    CapabilityLeaseStale,
+    CapabilityScopeMismatch,
+    SettingsDenied,
+    RunBusy,
+    CapacityExceeded,
+    IndeterminateRecoveryRequired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    content = "data",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum ToolIntentSubmitReplyV2 {
+    Admitted {
+        run_id: RunId,
+        operation_id: OperationId,
+        accepted_control_epoch: ControlEpoch,
+        lease: Option<CapabilityLeaseRefV2>,
+        invocation_id: InvocationId,
+        attempt_id: AttemptId,
+        effective_deadline_ms: u32,
+        admission_fact_id: FactId,
+        admission_batch_high_water: u64,
+    },
+    AwaitingCapability {
+        run_id: RunId,
+        operation_id: OperationId,
+        accepted_control_epoch: ControlEpoch,
+        invocation_id: InvocationId,
+        preview: CapabilityScopePreviewRecordV2,
+        awaiting_fact_id: FactId,
+        awaiting_batch_high_water: u64,
+    },
+    Rejected {
+        run_id: RunId,
+        operation_id: OperationId,
+        current_control_epoch: ControlEpoch,
+        reason: ToolIntentRejectionReasonV2,
+        guidance: String,
+        rejection_fact_id: FactId,
+        rejection_batch_high_water: u64,
+    },
+}
+
+impl ToolIntentSubmitReplyV2 {
+    pub fn validate(&self) -> Result<(), V2ValidationError> {
+        match self {
+            Self::Admitted {
+                effective_deadline_ms,
+                ..
+            } if *effective_deadline_ms == 0 => Err(zero_value("effectiveDeadlineMs")),
+            Self::AwaitingCapability { preview, .. } => preview.validate(),
+            Self::Rejected { guidance, .. } => {
+                validate_optional_text("guidance", Some(guidance.as_str()))
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum KernelFactDomainProjectionV2 {
+    Control,
+    Authorization,
+    Invocation,
+    Effect,
+    Resource,
+    Cleanup,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct KernelFactLineageV2 {
+    pub run_id: RunId,
+    pub control_epoch: Option<ControlEpoch>,
+    pub plan_action_ids: Vec<PlanActionIdV2>,
+    pub operation_id: Option<OperationId>,
+    pub capability_lease_id: Option<crate::tool_protocol_v2::CapabilityLeaseIdV2>,
+    pub invocation_id: Option<InvocationId>,
+    pub attempt_id: Option<AttemptId>,
+    pub effect_id: Option<EffectId>,
+    pub resource_ids: Vec<ResourceId>,
+}
+
+impl KernelFactLineageV2 {
+    pub fn validate(&self) -> Result<(), V2ValidationError> {
+        if self.plan_action_ids.len() > MAX_CORRELATION_REFS_V2
+            || self.resource_ids.len() > MAX_CORRELATION_REFS_V2
+        {
+            return Err(too_many_values("fact.lineage", MAX_CORRELATION_REFS_V2));
+        }
+        if !self
+            .plan_action_ids
+            .windows(2)
+            .all(|pair| pair[0] < pair[1])
+            || !self
+                .resource_ids
+                .windows(2)
+                .all(|pair| pair[0].as_str() < pair[1].as_str())
+        {
+            return Err(invalid_value(
+                "fact.lineage",
+                "identifier lists must be strictly sorted and unique",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct KernelFactProjectionV2 {
+    pub abi_version: String,
+    pub fact_id: FactId,
+    pub ledger_sequence: u64,
+    pub run_sequence: u64,
+    pub recorded_at: crate::v2::RecordedAtV2,
+    pub domain: KernelFactDomainProjectionV2,
+    pub fact_kind: String,
+    pub lineage: KernelFactLineageV2,
+    pub details: Value,
+}
+
+impl KernelFactProjectionV2 {
+    pub fn from_envelope(envelope: &KernelFactEnvelopeV2) -> Result<Self, V2ValidationError> {
+        envelope.validate()?;
+        let details = serde_json::to_value(&envelope.payload)
+            .map_err(|_| invalid_value("fact.details", "must serialize"))?;
+        let fact_kind = details
+            .as_object()
+            .and_then(|object| object.get("fact"))
+            .and_then(Value::as_object)
+            .and_then(|object| object.get("kind"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid_value("fact.details", "must contain a typed fact kind"))?
+            .to_owned();
+        let domain = match &envelope.payload {
+            crate::v2::KernelFactPayloadV2::Control(_) => KernelFactDomainProjectionV2::Control,
+            crate::v2::KernelFactPayloadV2::Authorization(_)
+            | crate::v2::KernelFactPayloadV2::Grant(_) => {
+                KernelFactDomainProjectionV2::Authorization
+            }
+            crate::v2::KernelFactPayloadV2::Invocation(_) => {
+                KernelFactDomainProjectionV2::Invocation
+            }
+            crate::v2::KernelFactPayloadV2::Effect(_) => KernelFactDomainProjectionV2::Effect,
+            crate::v2::KernelFactPayloadV2::Resource(_) => KernelFactDomainProjectionV2::Resource,
+            crate::v2::KernelFactPayloadV2::Cleanup(_) => KernelFactDomainProjectionV2::Cleanup,
+        };
+        let mut plan_action_ids = envelope
+            .payload
+            .correlation_set()
+            .into_iter()
+            .flat_map(|set| set.refs.iter())
+            .map(|reference| match reference {
+                CorrelationRefV2::PlanAction { value } => PlanActionIdV2::new(value.clone()),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if let Some(plan_action_id) = envelope.payload.authorization_plan_action_id() {
+            plan_action_ids.push(plan_action_id.clone());
+        }
+        plan_action_ids.sort();
+        plan_action_ids.dedup();
+        let lineage = KernelFactLineageV2 {
+            run_id: envelope.payload.run_id().clone(),
+            control_epoch: envelope.payload.control_epoch(),
+            plan_action_ids,
+            operation_id: envelope.payload.operation_id().cloned(),
+            capability_lease_id: envelope.payload.capability_lease_id().cloned(),
+            invocation_id: envelope.payload.invocation_id().cloned(),
+            attempt_id: envelope.payload.attempt_id().cloned(),
+            effect_id: envelope.payload.effect_id().cloned(),
+            resource_ids: envelope
+                .payload
+                .resource_ids()
+                .into_iter()
+                .cloned()
+                .collect(),
+        };
+        let projection = Self {
+            abi_version: envelope.abi_version.clone(),
+            fact_id: envelope.fact_id.clone(),
+            ledger_sequence: envelope.ledger_sequence,
+            run_sequence: envelope.run_sequence,
+            recorded_at: envelope.recorded_at.clone(),
+            domain,
+            fact_kind,
+            lineage,
+            details,
+        };
+        projection.validate()?;
+        Ok(projection)
+    }
+
+    pub fn validate(&self) -> Result<(), V2ValidationError> {
+        validate_abi_version(&self.abi_version)?;
+        if self.ledger_sequence == 0 {
+            return Err(zero_value("ledgerSequence"));
+        }
+        if self.run_sequence == 0 {
+            return Err(zero_value("runSequence"));
+        }
+        validate_text("factKind", &self.fact_kind)?;
+        if !self.details.is_object() {
+            return Err(invalid_value("details", "must be a JSON object"));
+        }
+        self.lineage.validate()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct KernelFactProjectionPageV2 {
+    pub requested_after_ledger_sequence: u64,
+    pub snapshot_high_water: u64,
+    pub query_context: ToolContextRefV2,
+    pub facts: Vec<KernelFactProjectionV2>,
+    pub has_more: bool,
+    pub next_after_ledger_sequence: u64,
+    pub next_continuation: Option<FactQueryContinuationV2>,
+}
+
+impl KernelFactProjectionPageV2 {
+    pub fn validate(&self) -> Result<(), V2ValidationError> {
+        if self.facts.len() > MAX_PAGE_ITEMS_V2 {
+            return Err(too_many_values("facts", MAX_PAGE_ITEMS_V2));
+        }
+        let mut previous = self.requested_after_ledger_sequence;
+        for fact in &self.facts {
+            fact.validate()?;
+            if fact.ledger_sequence <= previous || fact.ledger_sequence > self.snapshot_high_water {
+                return Err(invalid_value(
+                    "facts",
+                    "must be strictly increasing and no greater than high-water",
+                ));
+            }
+            previous = fact.ledger_sequence;
+        }
+        if self.next_after_ledger_sequence != previous {
+            return Err(invalid_value(
+                "nextAfterLedgerSequence",
+                "must equal the final returned sequence or requested cursor",
+            ));
+        }
+        if self.has_more != self.next_continuation.is_some() {
+            return Err(invalid_value(
+                "nextContinuation",
+                "must be present exactly when hasMore is true",
+            ));
+        }
+        if !self.has_more && self.next_after_ledger_sequence != self.snapshot_high_water {
+            return Err(invalid_value(
+                "nextAfterLedgerSequence",
+                "must equal snapshotHighWater when caught up",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -838,6 +1414,40 @@ pub enum KernelErrorV2 {
     RunNotFound {
         run_id: RunId,
     },
+    WorkspaceBindingNotFound {
+        workspace_binding_ref: WorkspaceBindingRefV2,
+    },
+    RunCapabilityRequired {
+        run_id: RunId,
+    },
+    RunCapabilityInvalid {
+        run_id: RunId,
+    },
+    ToolNotRegistered {
+        tool_id: ToolIdV2,
+    },
+    ToolUnavailable {
+        tool_id: ToolIdV2,
+        availability: crate::tool_protocol_v2::ToolAvailabilityV2,
+    },
+    ToolContextStale {
+        submitted: ToolContextRefV2,
+        current: ToolContextRefV2,
+    },
+    CapabilityLeaseNotFound {
+        run_id: RunId,
+        lease_id: crate::tool_protocol_v2::CapabilityLeaseIdV2,
+    },
+    CapabilityLeaseStale {
+        lease: CapabilityLeaseRefV2,
+    },
+    CapabilityScopeMismatch {
+        submitted: CapabilityScopeDigestV2,
+        authorized: CapabilityScopeDigestV2,
+    },
+    UnsupportedHistorySchema {
+        received: String,
+    },
     ControlEpochAlreadyExists {
         run_id: RunId,
         current: ControlEpoch,
@@ -941,6 +1551,7 @@ pub enum InvalidFieldViolationV2 {
     OutOfRange,
     MalformedIdentity,
     InvalidEnum,
+    InvalidRelation,
     Unsorted,
     Duplicate,
     PathEscapesWorkspace,
@@ -1044,6 +1655,7 @@ pub enum RecordedCommandErrorV2 {
 pub enum KernelWireErrorV2 {
     PayloadTooLarge { maximum_bytes: usize },
     InvalidJson {},
+    InvalidPayload {},
     DuplicateKey {},
     MissingAbiVersion {},
     InvalidAbiVersion {},

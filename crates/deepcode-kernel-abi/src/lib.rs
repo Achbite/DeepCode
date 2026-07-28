@@ -20,6 +20,8 @@ mod run;
 mod snapshot;
 mod tool;
 pub mod tool_catalog_v4;
+pub mod tool_protocol_v2;
+pub mod user_decision_v2;
 pub mod v2;
 pub mod v2_command;
 mod wire;
@@ -50,6 +52,8 @@ pub use run::*;
 pub use snapshot::*;
 pub use tool::*;
 pub use tool_catalog_v4::*;
+pub use tool_protocol_v2::*;
+pub use user_decision_v2::*;
 pub use wire::*;
 pub use workspace::*;
 

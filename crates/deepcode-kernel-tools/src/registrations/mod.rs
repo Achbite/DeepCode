@@ -7,10 +7,15 @@ use crate::{
     authority_descriptor_v4, AuthorityToolDescriptorV4, KernelExecutorBinding, KernelToolContract,
     OperationExecutionMode, ToolFamily, ToolOperationKind, ToolPermissionMode, ToolRiskLevel,
 };
+use deepcode_kernel_abi::{
+    ToolAvailabilityV2, ToolDescriptorV2, ToolEffectClassV2, ToolEffectScopeV2, ToolIdV2,
+    ToolInputSchemaV2, ToolRiskV2,
+};
 
 #[derive(Debug, Clone)]
 pub struct KernelToolRegistration {
     pub contract: KernelToolContract,
+    pub descriptor_v2: ToolDescriptorV2,
     pub executor_binding: Option<KernelExecutorBinding>,
     pub(crate) authority_v4: Option<AuthorityToolDescriptorV4>,
 }
@@ -213,7 +218,7 @@ pub(crate) fn builtin_tool_registrations() -> Vec<KernelToolRegistration> {
             resources(true, false),
             KernelExecutorBinding::FsEdit,
         ),
-        workspace_tool(
+        registered_tool(
             identity(
                 "fs.rename",
                 ToolOperationKind::FsRename,
@@ -224,8 +229,12 @@ pub(crate) fn builtin_tool_registrations() -> Vec<KernelToolRegistration> {
                 ToolRiskLevel::High,
                 ToolPermissionMode::Ask,
             ),
+            execution(
+                "kernel.disabled.fs.rename",
+                None,
+                OperationExecutionMode::Blocked,
+            ),
             resources(true, false),
-            KernelExecutorBinding::FsRename,
         ),
         workspace_tool(
             identity(
@@ -277,9 +286,9 @@ pub(crate) fn builtin_tool_registrations() -> Vec<KernelToolRegistration> {
             identity("git.status", ToolOperationKind::GitStatus, ToolFamily::Git),
             permission("git.read", ToolRiskLevel::Low, ToolPermissionMode::Allow),
             execution(
-                "kernel.cli.git.status",
-                Some(KernelExecutorBinding::GitStatus),
-                OperationExecutionMode::Execute,
+                "kernel.disabled.git.status",
+                None,
+                OperationExecutionMode::Blocked,
             ),
             resources(true, true),
         ),
@@ -287,9 +296,9 @@ pub(crate) fn builtin_tool_registrations() -> Vec<KernelToolRegistration> {
             identity("git.diff", ToolOperationKind::GitDiff, ToolFamily::Git),
             permission("git.read", ToolRiskLevel::Low, ToolPermissionMode::Allow),
             execution(
-                "kernel.cli.git.diff",
-                Some(KernelExecutorBinding::GitDiff),
-                OperationExecutionMode::Execute,
+                "kernel.disabled.git.diff",
+                None,
+                OperationExecutionMode::Blocked,
             ),
             resources(true, true),
         ),
@@ -297,9 +306,9 @@ pub(crate) fn builtin_tool_registrations() -> Vec<KernelToolRegistration> {
             identity("git.stage", ToolOperationKind::GitStage, ToolFamily::Git),
             permission("git.write", ToolRiskLevel::High, ToolPermissionMode::Ask),
             execution(
-                "kernel.cli.git.stage",
-                Some(KernelExecutorBinding::GitStage),
-                OperationExecutionMode::Execute,
+                "kernel.disabled.git.stage",
+                None,
+                OperationExecutionMode::Blocked,
             ),
             resources(true, false),
         ),
@@ -311,9 +320,9 @@ pub(crate) fn builtin_tool_registrations() -> Vec<KernelToolRegistration> {
             ),
             permission("git.write", ToolRiskLevel::High, ToolPermissionMode::Ask),
             execution(
-                "kernel.cli.git.unstage",
-                Some(KernelExecutorBinding::GitUnstage),
-                OperationExecutionMode::Execute,
+                "kernel.disabled.git.unstage",
+                None,
+                OperationExecutionMode::Blocked,
             ),
             resources(true, false),
         ),
@@ -321,35 +330,11 @@ pub(crate) fn builtin_tool_registrations() -> Vec<KernelToolRegistration> {
             identity("git.commit", ToolOperationKind::GitCommit, ToolFamily::Git),
             permission("git.write", ToolRiskLevel::High, ToolPermissionMode::Ask),
             execution(
-                "kernel.cli.git.commit",
-                Some(KernelExecutorBinding::GitCommit),
-                OperationExecutionMode::Execute,
-            ),
-            resources(true, false),
-        ),
-        registered_tool(
-            identity("git.push", ToolOperationKind::GitPush, ToolFamily::Git),
-            permission("git.push", ToolRiskLevel::Critical, ToolPermissionMode::Ask),
-            execution(
-                "kernel.blocked.git.push",
+                "kernel.disabled.git.commit",
                 None,
                 OperationExecutionMode::Blocked,
             ),
             resources(true, false),
-        ),
-        registered_tool(
-            identity(
-                "process.exec",
-                ToolOperationKind::ProcessExec,
-                ToolFamily::Process,
-            ),
-            permission("process.exec", ToolRiskLevel::High, ToolPermissionMode::Ask),
-            execution(
-                "kernel.blocked.process.exec",
-                None,
-                OperationExecutionMode::Blocked,
-            ),
-            resources(false, false),
         ),
         registered_tool(
             identity(
@@ -387,150 +372,6 @@ pub(crate) fn builtin_tool_registrations() -> Vec<KernelToolRegistration> {
             ),
             resources(false, true),
         ),
-        registered_tool(
-            identity(
-                "browser.open",
-                ToolOperationKind::BrowserOpen,
-                ToolFamily::Browser,
-            ),
-            permission(
-                "browser.control",
-                ToolRiskLevel::High,
-                ToolPermissionMode::Ask,
-            ),
-            execution(
-                "kernel.blocked.browser.open",
-                None,
-                OperationExecutionMode::Blocked,
-            ),
-            resources(false, false),
-        ),
-        registered_tool(
-            identity(
-                "browser.reload",
-                ToolOperationKind::BrowserReload,
-                ToolFamily::Browser,
-            ),
-            permission(
-                "browser.control",
-                ToolRiskLevel::High,
-                ToolPermissionMode::Ask,
-            ),
-            execution(
-                "kernel.blocked.browser.reload",
-                None,
-                OperationExecutionMode::Blocked,
-            ),
-            resources(false, false),
-        ),
-        registered_tool(
-            identity(
-                "browser.snapshot",
-                ToolOperationKind::BrowserSnapshot,
-                ToolFamily::Browser,
-            ),
-            permission(
-                "browser.control",
-                ToolRiskLevel::High,
-                ToolPermissionMode::Ask,
-            ),
-            execution(
-                "kernel.blocked.browser.snapshot",
-                None,
-                OperationExecutionMode::Blocked,
-            ),
-            resources(false, true),
-        ),
-        registered_tool(
-            identity(
-                "browser.inspect",
-                ToolOperationKind::BrowserInspect,
-                ToolFamily::Browser,
-            ),
-            permission(
-                "browser.control",
-                ToolRiskLevel::High,
-                ToolPermissionMode::Ask,
-            ),
-            execution(
-                "kernel.blocked.browser.inspect",
-                None,
-                OperationExecutionMode::Blocked,
-            ),
-            resources(false, true),
-        ),
-        registered_tool(
-            identity(
-                "browser.click",
-                ToolOperationKind::BrowserClick,
-                ToolFamily::Browser,
-            ),
-            permission(
-                "browser.control",
-                ToolRiskLevel::High,
-                ToolPermissionMode::Ask,
-            ),
-            execution(
-                "kernel.blocked.browser.click",
-                None,
-                OperationExecutionMode::Blocked,
-            ),
-            resources(false, false),
-        ),
-        registered_tool(
-            identity(
-                "browser.type",
-                ToolOperationKind::BrowserType,
-                ToolFamily::Browser,
-            ),
-            permission(
-                "browser.control",
-                ToolRiskLevel::High,
-                ToolPermissionMode::Ask,
-            ),
-            execution(
-                "kernel.blocked.browser.type",
-                None,
-                OperationExecutionMode::Blocked,
-            ),
-            resources(false, false),
-        ),
-        registered_tool(
-            identity(
-                "browser.scroll",
-                ToolOperationKind::BrowserScroll,
-                ToolFamily::Browser,
-            ),
-            permission(
-                "browser.control",
-                ToolRiskLevel::High,
-                ToolPermissionMode::Ask,
-            ),
-            execution(
-                "kernel.blocked.browser.scroll",
-                None,
-                OperationExecutionMode::Blocked,
-            ),
-            resources(false, false),
-        ),
-        registered_tool(
-            identity(
-                "provider.call",
-                ToolOperationKind::ProviderCall,
-                ToolFamily::Provider,
-            ),
-            permission(
-                "provider.egress",
-                ToolRiskLevel::High,
-                ToolPermissionMode::Ask,
-            ),
-            execution(
-                "kernel.blocked.provider.call",
-                None,
-                OperationExecutionMode::Blocked,
-            ),
-            resources(false, true),
-        ),
     ]
 }
 
@@ -559,9 +400,104 @@ fn registered_tool(
     resources: RegistrationResources,
 ) -> KernelToolRegistration {
     let executor_binding = execution.executor_binding;
+    let contract = build_tool_contract(identity, permission, execution, resources);
+    let descriptor_v2 = descriptor_v2(&contract, executor_binding.is_some())
+        .unwrap_or_else(|error| panic!("invalid built-in tool `{}`: {error}", identity.tool_id));
     KernelToolRegistration {
-        contract: build_tool_contract(identity, permission, execution, resources),
+        contract,
+        descriptor_v2,
         executor_binding,
         authority_v4: authority_descriptor_v4(identity.tool_id),
+    }
+}
+
+fn descriptor_v2(
+    contract: &KernelToolContract,
+    has_executor: bool,
+) -> Result<ToolDescriptorV2, deepcode_kernel_abi::v2::V2ValidationError> {
+    ToolDescriptorV2::materialize(
+        ToolIdV2::parse(contract.tool_id)?,
+        tool_description_v2(contract.tool_id).to_owned(),
+        ToolInputSchemaV2::new(contract.input.schema.clone())?,
+        tool_prompt_v2(contract.tool_id).to_owned(),
+        if contract.execution.execution_mode == OperationExecutionMode::Execute && has_executor {
+            ToolAvailabilityV2::Ready
+        } else {
+            ToolAvailabilityV2::Disabled
+        },
+        if contract.resource.read_only {
+            ToolEffectClassV2::Read
+        } else {
+            ToolEffectClassV2::Mutation
+        },
+        effect_scope_v2(contract.operation_kind),
+        match contract.permission.risk {
+            ToolRiskLevel::Low => ToolRiskV2::Low,
+            ToolRiskLevel::Medium => ToolRiskV2::Medium,
+            ToolRiskLevel::High => ToolRiskV2::High,
+            ToolRiskLevel::Critical => ToolRiskV2::Critical,
+        },
+    )
+}
+
+fn effect_scope_v2(operation_kind: ToolOperationKind) -> ToolEffectScopeV2 {
+    match operation_kind {
+        ToolOperationKind::GitStatus | ToolOperationKind::GitDiff => {
+            ToolEffectScopeV2::RepositoryRead
+        }
+        ToolOperationKind::GitStage | ToolOperationKind::GitUnstage => {
+            ToolEffectScopeV2::RepositoryIndexWrite
+        }
+        ToolOperationKind::GitCommit | ToolOperationKind::GitPush => {
+            ToolEffectScopeV2::RepositoryHistoryWrite
+        }
+        ToolOperationKind::WebSearch | ToolOperationKind::WebFetch => {
+            ToolEffectScopeV2::NetworkRead
+        }
+        _ if operation_kind.is_workspace_mutation() => ToolEffectScopeV2::WorkspaceWrite,
+        _ => ToolEffectScopeV2::WorkspaceRead,
+    }
+}
+
+fn tool_description_v2(tool_id: &str) -> &'static str {
+    match tool_id {
+        "code.grep" => "Search workspace text with a bounded literal or regular expression query.",
+        "document.read" => "Read bounded text from a supported workspace document.",
+        "fs.create" => "Create a new workspace file without overwriting an existing target.",
+        "fs.delete" => "Delete one explicitly scoped workspace file or directory tree.",
+        "fs.diff" => "Preview the textual difference for proposed workspace file content.",
+        "fs.edit" => "Apply a preconditioned edit to an existing workspace file.",
+        "fs.ensure_directory" => "Ensure that an explicitly scoped workspace directory exists.",
+        "fs.glob" => "Find workspace paths matching a bounded glob pattern.",
+        "fs.list" => "List a bounded workspace directory tree.",
+        "fs.read" => "Read bounded text from a workspace file.",
+        "fs.rename" => "Rename one workspace path to a new non-existing destination.",
+        "fs.write" => "Replace the content of an existing workspace file.",
+        "git.commit" => "Create a repository commit from the staged index.",
+        "git.diff" => "Read repository differences for the repository or selected paths.",
+        "git.stage" => "Stage explicitly scoped workspace paths in the repository index.",
+        "git.status" => "Read the repository working tree and index status.",
+        "git.unstage" => "Remove explicitly scoped paths from the repository index.",
+        "web.fetch" => "Fetch bounded public HTTP or HTTPS text.",
+        "web.search" => "Search the public web with a bounded result count.",
+        _ => "Execute a Kernel-registered tool.",
+    }
+}
+
+fn tool_prompt_v2(tool_id: &str) -> &'static str {
+    match tool_id {
+        "fs.create" | "fs.write" | "fs.edit" | "fs.delete" | "fs.ensure_directory" => {
+            "Use only for an accepted PlanAction and provide workspace-relative targets."
+        }
+        "fs.rename" | "git.commit" | "git.stage" | "git.unstage" => {
+            "This registration is disabled and must not be emitted as a provider tool call."
+        }
+        "git.status" | "git.diff" => {
+            "This registration is disabled and must not be emitted as a provider tool call."
+        }
+        "web.search" | "web.fetch" => {
+            "Use only when network access is in Settings and the active authority scope."
+        }
+        _ => "Provide only the arguments defined by this schema; paths are workspace-relative.",
     }
 }
