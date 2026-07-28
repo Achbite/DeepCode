@@ -10,6 +10,12 @@ import type {
   SessionUserInputRecordV2,
 } from './types.js';
 
+export interface SessionKernelStoredOperationResultRefV2 {
+  recordId: string;
+  recordDigest: string;
+  resultDigest: string;
+}
+
 export interface SessionKernelPersistencePortV2 {
   loadCheckpoint(runId: string): Promise<SessionKernelCheckpointV2 | undefined>;
 
@@ -19,6 +25,11 @@ export interface SessionKernelPersistencePortV2 {
 
   loadLatestInput(
     runId: string
+  ): Promise<SessionUserInputRecordV2 | undefined>;
+
+  loadInput(
+    runId: string,
+    inputId: string
   ): Promise<SessionUserInputRecordV2 | undefined>;
 
   loadPlanDecision(
@@ -52,6 +63,12 @@ export interface SessionKernelPersistencePortV2 {
   ): Promise<void>;
 
   persistCheckpoint(checkpoint: SessionKernelCheckpointV2): Promise<void>;
+
+  persistOperationResult(
+    operationRequestId: string,
+    result: unknown,
+    recordedAt: string
+  ): Promise<SessionKernelStoredOperationResultRefV2>;
 }
 
 export interface SessionKernelProviderPortV2 {

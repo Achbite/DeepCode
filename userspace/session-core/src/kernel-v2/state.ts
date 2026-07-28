@@ -23,8 +23,16 @@ import {
   type SessionProviderTurnRecordV2,
   type SessionProviderOutcomeRecordV2,
   type SessionPlanActionSettlementV2,
+  type SessionReviewFactAccumulatorV2,
   type SessionUserInputRecordV2,
 } from './types.js';
+
+const MAX_SESSION_INPUT_HISTORY_COUNT = 32;
+const MAX_SESSION_INPUT_HISTORY_BYTES = 512 * 1024;
+const MAX_SESSION_PROVIDER_OUTCOME_COUNT = 128;
+const MAX_SESSION_PROVIDER_OUTCOME_BYTES = 256 * 1024;
+const MAX_SESSION_PLAN_ACTIONS = 256;
+const MAX_SESSION_PLAN_BYTES = 512 * 1024;
 
 export interface SessionKernelLoopStateV2 {
   schemaVersion: typeof SESSION_KERNEL_LOOP_V2_SCHEMA;
@@ -33,6 +41,7 @@ export interface SessionKernelLoopStateV2 {
   controlEpoch: number;
   currentInputId: string;
   inputs: SessionUserInputRecordV2[];
+  inputHistoryOmittedCount: number;
   pendingEpochInput?: SessionUserInputRecordV2;
   projectedInputIds: string[];
   toolContext: SessionToolContextStateV2;
@@ -43,10 +52,13 @@ export interface SessionKernelLoopStateV2 {
   lineage: SessionKernelLineageStateV2;
   previews: Record<string, CapabilityScopePreviewRecordV2>;
   factsById: Record<string, KernelFactProjectionV2>;
+  factHistoryOmittedCount: number;
+  reviewFacts: SessionReviewFactAccumulatorV2;
   activeWait?: SessionActiveWaitV2;
   pendingGuidance: string[];
   providerTurn?: SessionProviderTurnRecordV2;
   providerOutcomes: SessionProviderOutcomeRecordV2[];
+  providerOutcomeHistoryOmittedCount: number;
   planActionSettlements: Record<string, SessionPlanActionSettlementV2>;
   publicRequests: Partial<
     Record<
@@ -89,13 +101,20 @@ export function createSessionKernelLoopStateV2(
     controlEpoch: initial.controlEpoch,
     currentInputId: initial.initialInput.inputId,
     inputs: [cloneJson(initial.initialInput)],
+    inputHistoryOmittedCount: 0,
     projectedInputIds: [],
     toolContext: createSessionToolContextStateV2(initial.toolContext),
     lineage: createSessionKernelLineageStateV2(initial.runId),
     previews: {},
     factsById: {},
+    factHistoryOmittedCount: 0,
+    reviewFacts: createSessionReviewFactAccumulatorV2(
+      initial.controlEpoch,
+      0
+    ),
     pendingGuidance: [],
     providerOutcomes: [],
+    providerOutcomeHistoryOmittedCount: 0,
     planActionSettlements: {},
     publicRequests: {},
     kernelWakeHint: false,
@@ -130,6 +149,16 @@ export function restoreSessionKernelLoopStateV2(
   positiveEpoch(state.controlEpoch);
   state.inputs.forEach(validateUserInput);
   currentSessionUserInputV2(state);
+  state.inputHistoryOmittedCount = nonnegativeSafeInteger(
+    state.inputHistoryOmittedCount ?? 0,
+    'inputHistoryOmittedCount'
+  );
+  const boundedInputs = boundedInputHistory(
+    state.inputs,
+    state.currentInputId
+  );
+  state.inputs = boundedInputs.records;
+  state.inputHistoryOmittedCount += boundedInputs.omittedCount;
   if (state.plan) {
     validatePlan(state.plan);
     if (state.plan.inputId !== state.currentInputId) {
@@ -148,9 +177,47 @@ export function restoreSessionKernelLoopStateV2(
       );
     }
   }
-  state.projectedInputIds ??= [];
+  state.projectedInputIds = (state.projectedInputIds ?? [])
+    .filter((inputId) =>
+      state.inputs.some((input) => input.inputId === inputId)
+    );
   state.providerOutcomes ??= [];
+  state.providerOutcomeHistoryOmittedCount = nonnegativeSafeInteger(
+    state.providerOutcomeHistoryOmittedCount ?? 0,
+    'providerOutcomeHistoryOmittedCount'
+  );
+  const boundedOutcomes = boundedProviderOutcomeHistory(
+    state.providerOutcomes
+  );
+  state.providerOutcomes = boundedOutcomes.records;
+  state.providerOutcomeHistoryOmittedCount +=
+    boundedOutcomes.omittedCount;
   state.planActionSettlements ??= {};
+  state.factHistoryOmittedCount = nonnegativeSafeInteger(
+    state.factHistoryOmittedCount ?? 0,
+    'factHistoryOmittedCount'
+  );
+  state.reviewFacts ??= createSessionReviewFactAccumulatorV2(
+    state.controlEpoch,
+    0
+  );
+  for (const [planActionId, settlement] of Object.entries(
+    state.planActionSettlements
+  )) {
+    validatePlanActionSettlement(settlement);
+    if (
+      settlement.planActionId !== planActionId
+      || !state.plan?.actions.some(
+        (action) =>
+          action.manifest.planActionId === planActionId
+      )
+    ) {
+      throw new SessionKernelStateError(
+        'session_kernel_plan_action_settlement_mismatch',
+        'PlanAction settlement does not bind the current persisted Plan.'
+      );
+    }
+  }
   state.publicRequests ??= {};
   if (state.providerTurn?.status === 'active') {
     state.providerTurn = {
@@ -182,6 +249,7 @@ export function recordSessionPlanV2(
   let next = cloneSessionKernelLoopStateV2(state);
   if (next.plan?.planRevision !== plan.planRevision) {
     next.planActionSettlements = {};
+    next.previews = {};
     next.planDecision = undefined;
     next.projectedPlanDecisionKey = undefined;
   }
@@ -260,6 +328,16 @@ export function recordSessionUserInputV2(
   }
   next.inputs.push(cloneJson(input));
   next.currentInputId = input.inputId;
+  const bounded = boundedInputHistory(
+    next.inputs,
+    next.currentInputId
+  );
+  next.inputs = bounded.records;
+  next.inputHistoryOmittedCount += bounded.omittedCount;
+  next.projectedInputIds = next.projectedInputIds.filter(
+    (inputId) =>
+      next.inputs.some((record) => record.inputId === inputId)
+  );
   next.pendingEpochInput = cloneJson(input);
   next.plan = undefined;
   next.planDecision = undefined;
@@ -267,7 +345,31 @@ export function recordSessionUserInputV2(
   next.projectedPlanDecisionKey = undefined;
   next.previews = {};
   next.planActionSettlements = {};
+  next.factsById = {};
+  next.factHistoryOmittedCount = 0;
+  next.reviewFacts = createSessionReviewFactAccumulatorV2(
+    state.controlEpoch + 1,
+    state.lineage.cursor.afterLedgerSequence
+  );
+  next.lineage.taskPlanActions = {};
+  next.lineage.planActions = {};
+  next.lineage.operations = {};
+  next.lineage.invocations = {};
+  next.review = undefined;
   return next;
+}
+
+export function recordSessionProviderOutcomeV2(
+  state: SessionKernelLoopStateV2,
+  outcome: SessionProviderOutcomeRecordV2
+): void {
+  state.providerOutcomes.push(cloneJson(outcome));
+  const bounded = boundedProviderOutcomeHistory(
+    state.providerOutcomes
+  );
+  state.providerOutcomes = bounded.records;
+  state.providerOutcomeHistoryOmittedCount +=
+    bounded.omittedCount;
 }
 
 export function sessionPlanActionV2(
@@ -307,11 +409,55 @@ export function checkpointSessionKernelStateV2(
 ): SessionKernelCheckpointV2 {
   const next = cloneSessionKernelLoopStateV2(state);
   next.checkpointRevision += 1;
+  next.factsById = {};
+  next.factHistoryOmittedCount = 0;
+  next.reviewFacts = createSessionReviewFactAccumulatorV2(
+    state.reviewFacts.controlEpoch,
+    state.reviewFacts.coverageAfterLedgerSequence
+  );
+  next.lineage = createSessionKernelLineageStateV2(next.runId);
+  for (const action of next.plan?.actions ?? []) {
+    next.lineage = registerSessionPlanActionLineageV2(
+      next.lineage,
+      {
+        taskId: action.taskId,
+        manifest: action.manifest,
+      }
+    );
+  }
   return {
     schemaVersion: SESSION_KERNEL_CHECKPOINT_V2_SCHEMA,
     checkpointRevision: next.checkpointRevision,
     savedAt,
     state: next,
+  };
+}
+
+export function createSessionReviewFactAccumulatorV2(
+  controlEpoch: number,
+  coverageAfterLedgerSequence: number
+): SessionReviewFactAccumulatorV2 {
+  positiveEpoch(controlEpoch);
+  nonnegativeSafeInteger(
+    coverageAfterLedgerSequence,
+    'coverageAfterLedgerSequence'
+  );
+  const category = () => ({
+    totalCount: 0,
+    samples: [],
+  });
+  return {
+    controlEpoch,
+    coverageAfterLedgerSequence,
+    scopeExpansions: category(),
+    actualEffects: category(),
+    denied: category(),
+    rejections: category(),
+    cleanup: category(),
+    indeterminate: category(),
+    priorEpochLateFacts: category(),
+    authorizedOperationSequences: {},
+    pendingCleanupByResource: {},
   };
 }
 
@@ -333,6 +479,15 @@ function validatePlan(plan: SessionNaturalLanguagePlanV2): void {
     throw new SessionKernelStateError(
       'session_kernel_plan_actions_empty',
       'A persisted Plan must contain at least one structured PlanAction.'
+    );
+  }
+  if (
+    plan.actions.length > MAX_SESSION_PLAN_ACTIONS
+    || jsonByteLength(plan) > MAX_SESSION_PLAN_BYTES
+  ) {
+    throw new SessionKernelStateError(
+      'session_kernel_plan_size_invalid',
+      'A persisted Plan exceeds the bounded action or byte budget.'
     );
   }
   const actionIds = new Set<string>();
@@ -416,6 +571,30 @@ function validateUserInput(input: SessionUserInputRecordV2): void {
   requiredText(input.recordedAt, 'input.recordedAt');
 }
 
+function validatePlanActionSettlement(
+  settlement: SessionPlanActionSettlementV2
+): void {
+  requiredIdentity(settlement.planActionId, 'planActionId');
+  requiredText(settlement.recordedAt, 'settlement.recordedAt');
+  if (settlement.kind === 'skipped') {
+    requiredText(settlement.reason, 'settlement.reason');
+    return;
+  }
+  if (
+    settlement.completionKind !== 'answer'
+    && settlement.completionKind !== 'noTool'
+  ) {
+    throw new SessionKernelStateError(
+      'session_kernel_plan_action_completion_invalid',
+      'PlanAction completion kind must be answer or noTool.'
+    );
+  }
+  requiredIdentity(
+    settlement.providerTurnId,
+    'settlement.providerTurnId'
+  );
+}
+
 function positiveEpoch(value: number): void {
   if (!Number.isSafeInteger(value) || value <= 0) {
     throw new SessionKernelStateError(
@@ -423,6 +602,19 @@ function positiveEpoch(value: number): void {
       'Session Kernel controlEpoch must be a positive safe integer.'
     );
   }
+}
+
+function nonnegativeSafeInteger(
+  value: number,
+  field: string
+): number {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new SessionKernelStateError(
+      'session_kernel_state_counter_invalid',
+      `${field} must be a non-negative safe integer.`
+    );
+  }
+  return value;
 }
 
 function requiredIdentity(value: string, field: string): string {
@@ -442,6 +634,83 @@ function requiredText(value: string, field: string): void {
       `${field} must contain 1..=65536 UTF-8 bytes.`
     );
   }
+}
+
+function boundedInputHistory(
+  records: SessionUserInputRecordV2[],
+  currentInputId: string
+): {
+  records: SessionUserInputRecordV2[];
+  omittedCount: number;
+} {
+  if (records.length === 0) {
+    return { records: [], omittedCount: 0 };
+  }
+  const pinnedIds = new Set([
+    records[0]!.inputId,
+    currentInputId,
+  ]);
+  const selected = new Set<string>();
+  let bytes = 0;
+  for (const record of records) {
+    if (!pinnedIds.has(record.inputId)) continue;
+    selected.add(record.inputId);
+    bytes += jsonByteLength(record);
+  }
+  for (let index = records.length - 1; index >= 0; index -= 1) {
+    const record = records[index]!;
+    if (selected.has(record.inputId)) continue;
+    const recordBytes = jsonByteLength(record);
+    if (
+      selected.size >= MAX_SESSION_INPUT_HISTORY_COUNT
+      || bytes + recordBytes > MAX_SESSION_INPUT_HISTORY_BYTES
+    ) {
+      continue;
+    }
+    selected.add(record.inputId);
+    bytes += recordBytes;
+  }
+  const bounded = records
+    .filter((record) => selected.has(record.inputId))
+    .map(cloneJson);
+  return {
+    records: bounded,
+    omittedCount: records.length - bounded.length,
+  };
+}
+
+function boundedProviderOutcomeHistory(
+  records: SessionProviderOutcomeRecordV2[]
+): {
+  records: SessionProviderOutcomeRecordV2[];
+  omittedCount: number;
+} {
+  const bounded: SessionProviderOutcomeRecordV2[] = [];
+  let bytes = 0;
+  for (let index = records.length - 1; index >= 0; index -= 1) {
+    const record = records[index]!;
+    const recordBytes = jsonByteLength(record);
+    if (
+      bounded.length >= MAX_SESSION_PROVIDER_OUTCOME_COUNT
+      || (
+        bounded.length > 0
+        && bytes + recordBytes > MAX_SESSION_PROVIDER_OUTCOME_BYTES
+      )
+    ) {
+      continue;
+    }
+    bounded.push(cloneJson(record));
+    bytes += recordBytes;
+  }
+  bounded.reverse();
+  return {
+    records: bounded,
+    omittedCount: records.length - bounded.length,
+  };
+}
+
+function jsonByteLength(value: unknown): number {
+  return new TextEncoder().encode(JSON.stringify(value)).byteLength;
 }
 
 function cloneJson<T>(value: T): T {

@@ -17,6 +17,13 @@ export const SESSION_KERNEL_PREFETCHED_RUN_V2_SCHEMA =
   'deepcode.session.prefetched-kernel-run.v2' as const;
 export const SESSION_KERNEL_RUN_CAPABILITY_ENV_V2 =
   'DEEPCODE_SESSION_RUN_CAPABILITY_V2' as const;
+export const SESSION_KERNEL_API_BASE_ENV_V2 =
+  'DEEPCODE_SESSION_API_BASE_V2' as const;
+
+export interface SessionKernelPrivateProcessBindingV2 {
+  privateAuth: SessionKernelTransportPrivateAuthV2;
+  apiBase: string;
+}
 
 export interface SessionKernelPrefetchedRunDescriptorV2 {
   schemaVersion: typeof SESSION_KERNEL_PREFETCHED_RUN_V2_SCHEMA;
@@ -113,16 +120,19 @@ export function decodeSessionKernelPrefetchedRunDescriptorV2(
  * Process-private transport seam. The value is consumed once and deleted
  * immediately. Callers must never place it in request JSON or diagnostics.
  */
-export function consumeSessionKernelRunCapabilityFromEnvV2(
+export function consumeSessionKernelPrivateProcessBindingFromEnvV2(
   environment: Record<string, string | undefined>
-): SessionKernelTransportPrivateAuthV2 {
-  const value = environment[SESSION_KERNEL_RUN_CAPABILITY_ENV_V2];
+): SessionKernelPrivateProcessBindingV2 {
+  const capability =
+    environment[SESSION_KERNEL_RUN_CAPABILITY_ENV_V2];
+  const apiBase = environment[SESSION_KERNEL_API_BASE_ENV_V2];
   delete environment[SESSION_KERNEL_RUN_CAPABILITY_ENV_V2];
+  delete environment[SESSION_KERNEL_API_BASE_ENV_V2];
   if (
-    !value
-    || value.length < 16
-    || value.length > 2_048
-    || ![...value].every((character) => {
+    !capability
+    || capability.length < 16
+    || capability.length > 2_048
+    || ![...capability].every((character) => {
       const code = character.charCodeAt(0);
       return code >= 0x21 && code <= 0x7e;
     })
@@ -132,7 +142,47 @@ export function consumeSessionKernelRunCapabilityFromEnvV2(
       'Process-private Kernel Run transport capability is unavailable.'
     );
   }
-  return { runCapability: value };
+  return {
+    privateAuth: { runCapability: capability },
+    apiBase: trustedLoopbackApiBase(apiBase),
+  };
+}
+
+function trustedLoopbackApiBase(value: string | undefined): string {
+  if (!value || value.length > 4_096) {
+    throw new PrefetchedSessionKernelRunError(
+      'session_kernel_api_base_unavailable',
+      'Process-private Session endpoint binding is unavailable.'
+    );
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new PrefetchedSessionKernelRunError(
+      'session_kernel_api_base_invalid',
+      'Process-private Session endpoint binding is invalid.'
+    );
+  }
+  if (
+    parsed.protocol !== 'http:'
+    || !['127.0.0.1', 'localhost', '[::1]'].includes(
+      parsed.hostname
+    )
+    || !parsed.port
+    || parsed.port === '0'
+    || parsed.username
+    || parsed.password
+    || parsed.search
+    || parsed.hash
+    || parsed.pathname !== '/'
+  ) {
+    throw new PrefetchedSessionKernelRunError(
+      'session_kernel_api_base_invalid',
+      'Process-private Session endpoint must be an explicit loopback HTTP origin.'
+    );
+  }
+  return parsed.origin;
 }
 
 function exactRecord(

@@ -93,8 +93,19 @@ implements SessionKernelProviderBackendV2 {
           userRequest: input.currentInput.text,
           extraMemoryHints: [
             canonicalJson({
-              conversationInputs: input.conversationInputs,
-              providerOutcomes: input.providerOutcomes,
+              conversationInputHistory: {
+                omittedCount:
+                  input.conversationInputOmittedCount,
+                highWaterInputId: input.currentInput.inputId,
+                records: input.conversationInputs,
+              },
+              providerOutcomeHistory: {
+                omittedCount:
+                  input.providerOutcomeOmittedCount,
+                highWaterProviderTurnId:
+                  input.providerOutcomes.at(-1)?.providerTurnId,
+                records: input.providerOutcomes,
+              },
             }),
           ],
           currentTaskGoal: input.plan?.objective,

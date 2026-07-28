@@ -2,7 +2,10 @@ import type { CapabilityScopePreviewReplyV2 } from '@deepcode/protocol';
 import {
   nextSessionKernelFactsQueryV2,
 } from './lineage.js';
-import type { SessionKernelLoopPortsV2 } from './ports.js';
+import type {
+  SessionKernelLoopPortsV2,
+  SessionKernelStoredOperationResultRefV2,
+} from './ports.js';
 import {
   SessionKernelProviderTurnsV2,
 } from './providerTurns.js';
@@ -36,6 +39,7 @@ import type {
   SessionKernelPublicRequestRecordV2,
   SessionKernelReviewV2,
   SessionNaturalLanguagePlanV2,
+  SessionPlanActionSettlementV2,
   SessionPlanDecisionV2,
   SessionProviderTurnRequestV2,
   SessionUserInputRecordV2,
@@ -62,8 +66,15 @@ export class SessionKernelLoopV2 {
   private readonly providers: SessionKernelProviderTurnsV2;
   private authorityTransitionActive = false;
   private maintenanceActive = false;
+  private maintenanceQuiescence: Promise<void> = Promise.resolve();
+  private resolveMaintenanceQuiescence?: () => void;
+  private readonly pendingUserInputFences = new Set<number>();
   private checkpointWrites: Promise<void> = Promise.resolve();
   private pendingPlanDecision?: SessionPlanDecisionV2;
+  private readonly userInputQuiescence = new Map<
+    number,
+    Promise<void>
+  >();
 
   private constructor(
     private state: SessionKernelLoopStateV2,
@@ -93,11 +104,20 @@ export class SessionKernelLoopV2 {
       {
         readState: () => this.state,
         saveCheckpoint: () => this.saveCheckpoint(),
-        project: (projectionId, kind, data) =>
-          this.project(projectionId, kind, data),
+        project: (projectionId, kind, data, recordedAt) =>
+          this.project(projectionId, kind, data, recordedAt),
         reconcileFacts: () => this.reconcileFactsInternal(),
         recordProviderPlan: (plan) =>
           this.persistPlan(plan),
+        settlePlanActionCompleted: (
+          planActionId,
+          completionKind,
+          providerTurnId
+        ) => this.settlePlanActionCompleted(
+          planActionId,
+          completionKind,
+          providerTurnId
+        ),
         transitionBlocked: () =>
           this.authorityTransitionActive || this.maintenanceActive,
         requireNoPendingRequests: () => this.requireNoPendingRequests(),
@@ -219,6 +239,17 @@ export class SessionKernelLoopV2 {
     return cloneSessionKernelLoopStateV2(this.state);
   }
 
+  persistOperationResult(
+    operationRequestId: string,
+    result: unknown
+  ): Promise<SessionKernelStoredOperationResultRefV2> {
+    return this.ports.persistence.persistOperationResult(
+      operationRequestId,
+      result,
+      this.ports.clock.now()
+    );
+  }
+
   async recordPlan(plan: SessionNaturalLanguagePlanV2): Promise<void> {
     this.beginMaintenance('recordPlan');
     try {
@@ -247,6 +278,42 @@ export class SessionKernelLoopV2 {
         throw new SessionKernelLoopError(
           'session_kernel_plan_decision_revision_stale',
           `Plan revision ${input.planRevision} is not the current persisted Plan.`
+        );
+      }
+      if (
+        input.decision === 'accept'
+        && (
+          this.state.toolContext.refreshRequired
+          || this.state.plan.actions.some((action) => {
+            const preview =
+              this.state.previews[action.manifest.operationId];
+            const contextRef = toolContextRefV2(
+              this.state.toolContext.bundle
+            );
+            return (
+              !preview
+              || preview.runId !== this.state.runId
+              || preview.controlEpoch !== this.state.controlEpoch
+              || preview.planRevision
+                !== action.manifest.planRevision
+              || preview.planActionId
+                !== action.manifest.planActionId
+              || preview.operationId
+                !== action.manifest.operationId
+              || preview.toolId !== action.manifest.toolId
+              || preview.contextRef.contextVersion
+                !== contextRef.contextVersion
+              || preview.contextRef.catalogDigest
+                !== contextRef.catalogDigest
+              || preview.contextRef.contextDigest
+                !== contextRef.contextDigest
+            );
+          })
+        )
+      ) {
+        throw new SessionKernelLoopError(
+          'session_kernel_plan_scope_preview_required',
+          'Every PlanAction must have a canonical Kernel scope preview before Plan acceptance.'
         );
       }
       const guidance = input.guidance;
@@ -300,11 +367,13 @@ export class SessionKernelLoopV2 {
 
   async skipPlanAction(
     planActionId: string,
+    expectedPlanRevision: string,
     reason: string
   ): Promise<void> {
     this.beginMaintenance('skipPlanAction');
     try {
       this.requireNoPendingRequests();
+      this.requireCurrentPlanRevision(expectedPlanRevision);
       this.requireAcceptedPlan();
       if (this.state.activeWait) {
         throw new SessionKernelLoopError(
@@ -341,13 +410,14 @@ export class SessionKernelLoopV2 {
   }
 
   async previewPlanAction(
-    planActionId: string
+    planActionId: string,
+    expectedPlanRevision: string
   ): Promise<CapabilityScopePreviewReplyV2> {
     this.beginMaintenance('previewPlanAction');
     try {
       this.requireNoPendingRequests();
       this.requirePlanProjected();
-      this.requireAcceptedPlan();
+      this.requireCurrentPlanRevision(expectedPlanRevision);
       if (this.state.toolContext.refreshRequired) {
         throw new SessionKernelLoopError(
           'session_kernel_context_refresh_boundary_required',
@@ -418,12 +488,83 @@ export class SessionKernelLoopV2 {
     input: SessionUserInputRecordV2,
     nextTurn: SessionProviderTurnRequestV2
   ): Promise<SessionKernelLoopResultV2> {
-    this.beginAuthorityTransition();
+    const generation = this.fenceProviderForUserInput();
+    await this.applyFencedUserInput(input, generation);
+    return this.runProviderTurn(nextTurn);
+  }
+
+  /**
+   * Establishes the local Provider/output fence synchronously. The returned
+   * generation carries a quiescence barrier for local preparing/applying
+   * commits; an already-durable transport attempt is detached and can only be
+   * recovered with its exact persisted identity after the epoch advances.
+   */
+  fenceProviderForUserInput(): number {
+    const providerFence = this.providers.supersedeForUserInput();
+    const requestQuiescence = this.requests.supersedeForUserInput();
+    this.pendingUserInputFences.add(providerFence.generation);
+    this.userInputQuiescence.set(
+      providerFence.generation,
+      Promise.all([
+        providerFence.quiescence,
+        requestQuiescence,
+        this.maintenanceQuiescence,
+      ]).then(() => undefined)
+    );
+    return providerFence.generation;
+  }
+
+  isUserInputFenceCurrent(generation: number): boolean {
+    return this.providers.isAuthorityGenerationCurrent(generation);
+  }
+
+  async applyFencedUserInput(
+    input: SessionUserInputRecordV2,
+    generation: number
+  ): Promise<void> {
+    let transitionStarted = false;
     try {
+      if (!Number.isSafeInteger(generation) || generation < 1) {
+        throw new SessionKernelLoopError(
+          'session_kernel_user_input_fence_invalid',
+          'User input transition requires a valid local Provider fence.'
+        );
+      }
+      const quiescence = this.userInputQuiescence.get(generation);
+      if (!quiescence) {
+        throw new SessionKernelLoopError(
+          'session_kernel_user_input_fence_unknown',
+          'User input transition does not match a live local fence.'
+        );
+      }
+      await quiescence;
+      this.beginAuthorityTransition();
+      transitionStarted = true;
       const oldInvocationId = activeInvocationId(this.state);
+      const durableInput =
+        await this.ports.persistence.loadInput(
+          this.state.runId,
+          input.inputId
+        );
+      if (
+        durableInput
+        && JSON.stringify(durableInput) !== JSON.stringify(input)
+      ) {
+        throw new SessionKernelLoopError(
+          'session_kernel_input_identity_conflict',
+          `Input ${input.inputId} already has different durable content.`
+        );
+      }
+      if (
+        durableInput
+        && this.state.currentInputId !== input.inputId
+      ) {
+        throw new SessionKernelLoopError(
+          'session_kernel_input_identity_reused',
+          `Input ${input.inputId} cannot be reused as a later user turn.`
+        );
+      }
       await this.ports.persistence.persistInput(input);
-      this.providers.supersedeForUserInput();
-      this.requests.supersedeForUserInput();
       this.state = recordSessionUserInputV2(this.state, input);
       await this.saveCheckpoint();
 
@@ -432,26 +573,41 @@ export class SessionKernelLoopV2 {
       await this.requests.replay('effect');
       await this.reconcileFactsInternal();
       await this.ensureInputProjected(input);
+      this.providers.releaseUserInputFence(generation);
     } finally {
-      this.authorityTransitionActive = false;
+      this.userInputQuiescence.delete(generation);
+      this.pendingUserInputFences.delete(generation);
+      if (transitionStarted) {
+        this.authorityTransitionActive = false;
+      }
     }
-    return this.runProviderTurn(nextTurn);
   }
 
   async observeCapabilityDecision(input: {
     decision: 'allow' | 'deny';
     guidance?: string;
+    previewId: string;
+    operationId: string;
+    invocationId: string;
+    planActionId?: string;
+    expectedPlanRevision?: string;
     nextTurn?: SessionProviderTurnRequestV2;
   }): Promise<SessionKernelLoopResultV2 | undefined> {
     let continueWith: SessionProviderTurnRequestV2 | undefined;
     this.beginMaintenance('observeCapabilityDecision');
     try {
-      if (this.state.activeWait?.kind !== 'capability') {
+      if (
+        this.state.activeWait?.kind !== 'capability'
+        || this.state.activeWait.previewId !== input.previewId
+        || this.state.activeWait.operationId !== input.operationId
+        || this.state.activeWait.invocationId !== input.invocationId
+      ) {
         throw new SessionKernelLoopError(
-          'session_kernel_capability_wait_missing',
-          'No capability ActiveWait is available for reconciliation.'
+          'session_kernel_capability_wait_stale',
+          'Capability observation does not match the current durable ActiveWait.'
         );
       }
+      this.requireExactPlanActionBinding(input.operationId, input);
       this.state.activeWait.decisionHint = input.decision;
       if (input.guidance) {
         this.state.activeWait.denialGuidance = input.guidance;
@@ -473,12 +629,38 @@ export class SessionKernelLoopV2 {
       : undefined;
   }
 
-  async notifyKernelWakeHint(): Promise<void> {
+  async notifyKernelWakeHint(input: {
+    waitKind: 'capability' | 'invocation';
+    operationId: string;
+    invocationId: string;
+    previewId?: string;
+    planActionId?: string;
+    expectedPlanRevision?: string;
+  }): Promise<void> {
+    const wait = this.state.activeWait;
+    if (
+      !wait
+      || wait.kind !== input.waitKind
+      || wait.operationId !== input.operationId
+      || wait.invocationId !== input.invocationId
+      || (
+        wait.kind === 'capability'
+          ? wait.previewId !== input.previewId
+          : input.previewId !== undefined
+      )
+    ) {
+      throw new SessionKernelLoopError(
+        'session_kernel_wake_identity_stale',
+        'Kernel wake does not match the current durable ActiveWait.'
+      );
+    }
+    this.requireExactPlanActionBinding(input.operationId, input);
     this.state.kernelWakeHint = true;
     if (
       this.authorityTransitionActive
       || this.maintenanceActive
       || this.providers.isReserved()
+      || this.pendingUserInputFences.size > 0
     ) {
       return;
     }
@@ -496,7 +678,8 @@ export class SessionKernelLoopV2 {
    * supply a newly planned operation after the delay.
    */
   async resumeAfterBackpressure(
-    nextTurn: SessionProviderTurnRequestV2
+    guidance: string[] = [],
+    signal?: AbortSignal
   ): Promise<SessionKernelLoopResultV2> {
     const wait = this.state.activeWait;
     if (!wait || wait.kind !== 'backpressure') {
@@ -505,14 +688,7 @@ export class SessionKernelLoopV2 {
         'No backpressure ActiveWait is present.'
       );
     }
-    const nextOperationId = this.operationIdForTarget(nextTurn);
-    if (nextOperationId === wait.operationId) {
-      throw new SessionKernelLoopError(
-        'session_kernel_backpressure_replan_required',
-        'Backpressure requires a new planned operation; the rejected ToolIntent cannot be resubmitted.'
-      );
-    }
-    await this.ports.clock.waitUntil(wait.retryAt);
+    await this.ports.clock.waitUntil(wait.retryAt, signal);
     this.beginMaintenance('resumeAfterBackpressure');
     try {
       if (
@@ -540,16 +716,27 @@ export class SessionKernelLoopV2 {
       this.endMaintenance();
     }
     return this.runProviderTurn({
-      ...nextTurn,
       reason: 'retryGuidance',
+      target: { kind: 'planning' },
       guidance: unique([
-        ...(nextTurn.guidance ?? []),
+        ...guidance,
         wait.guidance,
       ]),
     });
   }
 
-  async reconcileFacts(): Promise<void> {
+  async reconcileFacts(observedHighWater: number): Promise<void> {
+    if (
+      !Number.isSafeInteger(observedHighWater)
+      || observedHighWater < 0
+      || observedHighWater
+        > this.state.lineage.cursor.snapshotHighWater
+    ) {
+      throw new SessionKernelLoopError(
+        'session_kernel_facts_high_water_invalid',
+        'Facts reconciliation must bind an observed Session high-water.'
+      );
+    }
     this.beginMaintenance('reconcileFacts');
     try {
       await this.reconcileFactsInternal();
@@ -558,10 +745,13 @@ export class SessionKernelLoopV2 {
     }
   }
 
-  async finalizeReview(): Promise<SessionKernelReviewV2> {
+  async finalizeReview(
+    expectedPlanRevision: string
+  ): Promise<SessionKernelReviewV2> {
     this.beginMaintenance('finalizeReview');
     try {
       this.requireNoPendingRequests();
+      this.requireCurrentPlanRevision(expectedPlanRevision);
       this.requireAcceptedPlan();
       await this.reconcileFactsInternal();
       const review = finalizeSessionKernelReviewV2(
@@ -599,6 +789,7 @@ export class SessionKernelLoopV2 {
       for (const input of this.state.inputs) {
         await this.ensureInputProjected(input);
       }
+      await this.ensurePlanActionSettlementsProjected();
       await this.ports.projection.flushPending(this.state.runId);
     } finally {
       this.endMaintenance();
@@ -672,10 +863,8 @@ export class SessionKernelLoopV2 {
       ).reply;
       if (!page.hasMore) return;
     }
-    throw new SessionKernelLoopError(
-      'session_kernel_fact_page_budget_exhausted',
-      'Kernel facts remained paginated after the bounded wake budget.'
-    );
+    this.state.kernelWakeHint = true;
+    await this.saveCheckpoint();
   }
 
   private async ensurePlanProjected(): Promise<void> {
@@ -732,6 +921,57 @@ export class SessionKernelLoopV2 {
     await this.ensurePlanProjected();
   }
 
+  private settlePlanActionCompleted(
+    planActionId: string,
+    completionKind: 'answer' | 'noTool',
+    providerTurnId: string
+  ): SessionPlanActionSettlementV2 {
+    this.requireAcceptedPlan();
+    sessionPlanActionV2(this.state, planActionId);
+    const existing = this.state.planActionSettlements[planActionId];
+    if (existing) {
+      if (
+        existing.kind === 'completed'
+        && existing.completionKind === completionKind
+        && existing.providerTurnId === providerTurnId
+      ) {
+        return cloneJson(existing);
+      }
+      throw new SessionKernelLoopError(
+        'session_kernel_plan_action_completion_conflict',
+        `PlanAction ${planActionId} already has a different Session settlement.`
+      );
+    }
+    const settlement: SessionPlanActionSettlementV2 = {
+      kind: 'completed',
+      planActionId,
+      completionKind,
+      providerTurnId,
+      recordedAt: this.ports.clock.now(),
+    };
+    this.state.planActionSettlements[planActionId] = settlement;
+    return cloneJson(settlement);
+  }
+
+  private async ensurePlanActionSettlementsProjected(): Promise<void> {
+    const settlements = Object.values(
+      this.state.planActionSettlements
+    ).sort((left, right) =>
+      left.recordedAt.localeCompare(right.recordedAt)
+      || left.planActionId.localeCompare(right.planActionId)
+    );
+    for (const settlement of settlements) {
+      await this.project(
+        `plan-action:${settlement.planActionId}:${settlement.kind}`,
+        settlement.kind === 'completed'
+          ? 'planAction.completed'
+          : 'planAction.skipped',
+        settlement,
+        settlement.recordedAt
+      );
+    }
+  }
+
   private async ensureInputProjected(
     input: SessionUserInputRecordV2
   ): Promise<void> {
@@ -775,22 +1015,57 @@ export class SessionKernelLoopV2 {
     }
   }
 
-  private operationIdForTarget(
-    request: SessionProviderTurnRequestV2
-  ): string {
-    if (request.target.kind === 'planAction') {
-      return sessionPlanActionV2(
-        this.state,
-        request.target.planActionId
-      ).manifest.operationId;
+  private requireCurrentPlanRevision(
+    expectedPlanRevision: string
+  ): void {
+    if (
+      !expectedPlanRevision.trim()
+      || this.state.plan?.planRevision !== expectedPlanRevision
+    ) {
+      throw new SessionKernelLoopError(
+        'session_kernel_plan_revision_stale',
+        'Operation does not match the current persisted Plan revision.'
+      );
     }
-    if (request.target.kind === 'contextRead') {
-      return request.target.operationId;
+  }
+
+  private requireExactPlanActionBinding(
+    operationId: string,
+    input: {
+      planActionId?: string;
+      expectedPlanRevision?: string;
     }
-    throw new SessionKernelLoopError(
-      'session_kernel_backpressure_target_invalid',
-      'A planning turn cannot replace a backpressured operation.'
-    );
+  ): void {
+    if (
+      Boolean(input.planActionId)
+        !== Boolean(input.expectedPlanRevision)
+    ) {
+      throw new SessionKernelLoopError(
+        'session_kernel_plan_action_binding_invalid',
+        'PlanAction identity and Plan revision must be supplied together.'
+      );
+    }
+    const actualPlanActionId =
+      this.state.lineage.operations[operationId]?.planActionId;
+    if (!actualPlanActionId) {
+      if (input.planActionId || input.expectedPlanRevision) {
+        throw new SessionKernelLoopError(
+          'session_kernel_plan_action_binding_unexpected',
+          'Context-read operation cannot carry a PlanAction binding.'
+        );
+      }
+      return;
+    }
+    if (
+      input.planActionId !== actualPlanActionId
+      || this.state.plan?.planRevision
+        !== input.expectedPlanRevision
+    ) {
+      throw new SessionKernelLoopError(
+        'session_kernel_plan_action_binding_stale',
+        'Operation does not match the current PlanAction binding.'
+      );
+    }
   }
 
   private beginAuthorityTransition(): void {
@@ -815,10 +1090,16 @@ export class SessionKernelLoopV2 {
       );
     }
     this.maintenanceActive = true;
+    this.maintenanceQuiescence = new Promise((resolve) => {
+      this.resolveMaintenanceQuiescence = resolve;
+    });
   }
 
   private endMaintenance(): void {
     this.maintenanceActive = false;
+    this.resolveMaintenanceQuiescence?.();
+    this.resolveMaintenanceQuiescence = undefined;
+    this.maintenanceQuiescence = Promise.resolve();
   }
 
   private requireNoPendingRequests(): void {

@@ -397,6 +397,19 @@ function publicPresentation(
           planActionId: textField(data, 'planActionId'),
           summary: textField(data, 'reason')
             ?? 'Plan action skipped.',
+          },
+      };
+    case 'planAction.completed':
+      return {
+        kind: 'workflow_stage',
+        channel: 'task',
+        visibility: 'both',
+        fields: {
+          status: 'completed',
+          planActionId: textField(data, 'planActionId'),
+          providerTurnId: textField(data, 'providerTurnId'),
+          completionKind: textField(data, 'completionKind'),
+          summary: 'Plan action completed by the Session provider loop.',
         },
       };
     case 'provider.completed': {

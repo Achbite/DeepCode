@@ -28,9 +28,11 @@ import type { SessionKernelLoopStateV2 } from './state.js';
 import {
   checkpointSessionKernelStateV2,
   cloneSessionKernelLoopStateV2,
+  createSessionReviewFactAccumulatorV2,
 } from './state.js';
 import {
   applySessionToolContextReplyV2,
+  toolContextRefV2,
 } from './toolContext.js';
 import type {
   SessionKernelProjectionEventV2,
@@ -70,6 +72,10 @@ interface SessionKernelTransportAttemptV2 {
   controller: AbortController;
   phase: 'preparing' | 'transport' | 'applying';
   superseded: boolean;
+  preparingSettled: Promise<void>;
+  resolvePreparing: () => void;
+  transportSuperseded: Promise<void>;
+  resolveTransportSuperseded: () => void;
   promise: Promise<SessionKernelPublicRequestOutcomeV2>;
 }
 
@@ -106,9 +112,14 @@ export class SessionKernelPublicRequestsV2 {
    * request identity and payload remain pending for an exact replay. Control
    * fences are never aborted or replaced with a new identity.
    */
-  supersedeForUserInput(): void {
-    this.supersedeTransportAttempt('effect');
-    this.supersedeTransportAttempt('query');
+  supersedeForUserInput(): Promise<void> {
+    const barriers = [
+      this.supersedeTransportAttempt('effect'),
+      this.supersedeTransportAttempt('query'),
+    ].filter(
+      (barrier): barrier is Promise<void> => Boolean(barrier)
+    );
+    return Promise.all(barriers).then(() => undefined);
   }
 
   newRecord(
@@ -146,11 +157,23 @@ export class SessionKernelPublicRequestsV2 {
       }
       return active.promise;
     }
+    let resolvePreparing: () => void = () => {};
+    const preparingSettled = new Promise<void>((resolve) => {
+      resolvePreparing = resolve;
+    });
+    let resolveTransportSuperseded: () => void = () => {};
+    const transportSuperseded = new Promise<void>((resolve) => {
+      resolveTransportSuperseded = resolve;
+    });
     const attempt: SessionKernelTransportAttemptV2 = {
       request: requested,
       controller: new AbortController(),
       phase: 'preparing',
       superseded: false,
+      preparingSettled,
+      resolvePreparing,
+      transportSuperseded,
+      resolveTransportSuperseded,
       promise: Promise.resolve(undefined as never),
     };
     attempt.promise = this.executeInLane(requested, attempt);
@@ -184,22 +207,44 @@ export class SessionKernelPublicRequestsV2 {
       };
     }
 
-    await this.ports.persistence.persistPublicRequest(record);
-    this.host.readState().publicRequests[record.lane] = record;
-    await this.host.saveCheckpoint();
+    try {
+      await this.ports.persistence.persistPublicRequest(record);
+      this.host.readState().publicRequests[record.lane] = record;
+      await this.host.saveCheckpoint();
+    } finally {
+      attempt.resolvePreparing();
+    }
     if (attempt.superseded) {
       throw new SessionKernelTransportAttemptSupersededError(record);
     }
 
     let outcome: SessionKernelPublicRequestOutcomeV2;
     attempt.phase = 'transport';
-    try {
-      outcome = await dispatchPublicRequest(
-        this.ports,
-        record,
-        attempt.controller.signal
-      );
-    } catch (error) {
+    const dispatched = dispatchPublicRequest(
+      this.ports,
+      record,
+      attempt.controller.signal
+    ).then(
+      (value) => ({
+        kind: 'outcome' as const,
+        value,
+      }),
+      (error: unknown) => ({
+        kind: 'error' as const,
+        error,
+      })
+    );
+    const transport = await Promise.race([
+      dispatched,
+      attempt.transportSuperseded.then(() => ({
+        kind: 'superseded' as const,
+      })),
+    ]);
+    if (transport.kind === 'superseded') {
+      throw new SessionKernelTransportAttemptSupersededError(record);
+    }
+    if (transport.kind === 'error') {
+      const error = transport.error;
       if (attempt.superseded || attempt.controller.signal.aborted) {
         throw new SessionKernelTransportAttemptSupersededError(
           record,
@@ -213,6 +258,7 @@ export class SessionKernelPublicRequestsV2 {
       }
       throw new SessionKernelTransportUnknownError(record, error);
     }
+    outcome = transport.value;
     if (attempt.superseded) {
       throw new SessionKernelTransportAttemptSupersededError(record);
     }
@@ -241,7 +287,8 @@ export class SessionKernelPublicRequestsV2 {
         checkpoint,
         events
       );
-      this.host.replaceState(checkpoint.state);
+      this.host.readState().checkpointRevision =
+        checkpoint.checkpointRevision;
     } catch (error) {
       this.host.replaceState(previous);
       throw error;
@@ -252,12 +299,41 @@ export class SessionKernelPublicRequestsV2 {
 
   private supersedeTransportAttempt(
     lane: 'effect' | 'query'
-  ): void {
+  ): Promise<void> | undefined {
     const attempt = this.inFlight.get(lane);
-    if (!attempt || attempt.phase === 'applying') return;
-    attempt.superseded = true;
-    attempt.controller.abort('userInput');
-    this.inFlight.delete(lane);
+    if (!attempt) return undefined;
+    if (attempt.phase === 'preparing') {
+      attempt.superseded = true;
+      attempt.controller.abort('userInput');
+      return attempt.preparingSettled.then(() => {
+        attempt.resolveTransportSuperseded();
+        this.detachSupersededAttempt(lane, attempt);
+      });
+    }
+    if (attempt.phase === 'transport') {
+      attempt.superseded = true;
+      attempt.controller.abort('userInput');
+      attempt.resolveTransportSuperseded();
+      this.detachSupersededAttempt(lane, attempt);
+      return Promise.resolve();
+    }
+    return attempt.promise.then(
+      () => undefined,
+      () => undefined
+    );
+  }
+
+  private detachSupersededAttempt(
+    lane: 'effect' | 'query',
+    attempt: SessionKernelTransportAttemptV2
+  ): void {
+    if (
+      attempt.superseded
+      && attempt.phase !== 'applying'
+      && this.inFlight.get(lane) === attempt
+    ) {
+      this.inFlight.delete(lane);
+    }
   }
 
   private async settleDeterministicFailure(
@@ -434,12 +510,22 @@ function applyPublicRequestOutcome(
   const state = host.readState();
   const events: SessionKernelProjectionEventV2[] = [];
   switch (outcome.kind) {
-    case 'toolContextGet':
-      state.toolContext = applySessionToolContextReplyV2(
+    case 'toolContextGet': {
+      const previous = state.toolContext;
+      const next = applySessionToolContextReplyV2(
         state.toolContext,
         outcome.reply
       );
+      if (
+        previous.refreshRequired
+        || JSON.stringify(toolContextRefV2(previous.bundle))
+          !== JSON.stringify(toolContextRefV2(next.bundle))
+      ) {
+        state.previews = {};
+      }
+      state.toolContext = next;
       break;
+    }
     case 'capabilityPreview':
       if (record.intent.kind !== 'capabilityPreview') {
         throw new SessionKernelPublicRequestError(
@@ -485,7 +571,9 @@ function applyPublicRequestOutcome(
         {
           requestId: record.requestId,
           pageFactIds: outcome.reply.facts.map((fact) => fact.factId),
-          facts: outcome.reply.facts,
+          pageFactCount: outcome.reply.facts.length,
+          nextAfterLedgerSequence:
+            outcome.reply.nextAfterLedgerSequence,
           snapshotHighWater: outcome.reply.snapshotHighWater,
         },
         record.startedAt
@@ -549,6 +637,15 @@ function applyPublicRequestOutcome(
         );
       }
       state.controlEpoch = outcome.reply.acceptedControlEpoch;
+      if (
+        state.reviewFacts.controlEpoch
+          !== outcome.reply.acceptedControlEpoch
+      ) {
+        state.reviewFacts = createSessionReviewFactAccumulatorV2(
+          outcome.reply.acceptedControlEpoch,
+          state.reviewFacts.coverageAfterLedgerSequence
+        );
+      }
       state.previews = {};
       if (
         state.pendingEpochInput?.inputId
@@ -650,7 +747,8 @@ function applyToolIntentReply(
     && reply.data.reason === 'indeterminateRecoveryRequired'
   ) {
     const invocationId =
-      state.lineage.operations[intent.operationId]?.invocationIds.at(-1);
+      state.lineage.operations[intent.operationId]
+        ?.latestInvocationId;
     state.activeWait = {
       kind: 'manualRecovery',
       operationId: reply.data.operationId,

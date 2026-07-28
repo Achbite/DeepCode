@@ -16,6 +16,7 @@ import {
 } from './publicRequests.js';
 import {
   currentSessionUserInputV2,
+  recordSessionProviderOutcomeV2,
   sessionPlanActionV2,
   type SessionKernelLoopStateV2,
 } from './state.js';
@@ -23,6 +24,9 @@ import {
   providerToolContextBindingV2,
   toolContextRefV2,
 } from './toolContext.js';
+import {
+  sessionKernelFactsCaughtUpV2,
+} from './lineage.js';
 import {
   projectSessionProviderFactsV2,
 } from './providerFactProjection.js';
@@ -35,6 +39,7 @@ import type { SessionKernelLoopPortsV2 } from './ports.js';
 import type {
   SessionKernelLoopResultV2,
   SessionNaturalLanguagePlanV2,
+  SessionPlanActionSettlementV2,
   SessionKernelProjectionEventV2,
   SessionProviderTurnRequestV2,
 } from './types.js';
@@ -47,7 +52,8 @@ export interface SessionKernelProviderTurnHostV2 {
   project(
     projectionId: string,
     kind: SessionKernelProjectionEventV2['kind'],
-    data: unknown
+    data: unknown,
+    recordedAt?: string
   ): Promise<void>;
 
   reconcileFacts(): Promise<void>;
@@ -55,6 +61,12 @@ export interface SessionKernelProviderTurnHostV2 {
   recordProviderPlan(
     plan: SessionNaturalLanguagePlanV2
   ): Promise<void>;
+
+  settlePlanActionCompleted(
+    planActionId: string,
+    completionKind: 'answer' | 'noTool',
+    providerTurnId: string
+  ): SessionPlanActionSettlementV2;
 
   transitionBlocked(): boolean;
 
@@ -72,10 +84,16 @@ export interface SessionKernelProviderTurnHostV2 {
  */
 export class SessionKernelProviderTurnsV2 {
   private authorityGeneration = 0;
+  private userInputFenceGeneration?: number;
   private reservation?: symbol;
   private providerAbort?: {
     reservation: symbol;
     controller: AbortController;
+  };
+  private admissionCommit?: {
+    token: symbol;
+    settled: Promise<void>;
+    resolve: () => void;
   };
 
   constructor(
@@ -88,8 +106,14 @@ export class SessionKernelProviderTurnsV2 {
     return Boolean(this.reservation);
   }
 
-  supersedeForUserInput(): void {
+  supersedeForUserInput(): {
+    generation: number;
+    quiescence: Promise<void>;
+  } {
     this.authorityGeneration += 1;
+    this.userInputFenceGeneration = this.authorityGeneration;
+    const quiescence =
+      this.admissionCommit?.settled ?? Promise.resolve();
     this.providerAbort?.controller.abort('userInput');
     this.providerAbort = undefined;
     this.reservation = undefined;
@@ -98,6 +122,20 @@ export class SessionKernelProviderTurnsV2 {
       state.providerTurn.status = 'cancelled';
       state.providerTurn.cancellationReason = 'userInput';
     }
+    return {
+      generation: this.authorityGeneration,
+      quiescence,
+    };
+  }
+
+  releaseUserInputFence(generation: number): void {
+    if (this.userInputFenceGeneration === generation) {
+      this.userInputFenceGeneration = undefined;
+    }
+  }
+
+  isAuthorityGenerationCurrent(generation: number): boolean {
+    return generation === this.authorityGeneration;
   }
 
   async run(
@@ -126,29 +164,44 @@ export class SessionKernelProviderTurnsV2 {
         state,
         request.target
       );
-      state.providerTurn = {
-        providerTurnId,
-        controlEpoch: state.controlEpoch,
-        contextRef: binding.contextRef,
-        factProjection: {
-          snapshotHighWater: factProjection.snapshotHighWater,
-          omittedCount: factProjection.omittedCount,
-          factIds: factProjection.facts.map((fact) => fact.factId),
-        },
-        startedAt: this.ports.clock.now(),
-        status: 'active',
-      };
-      await this.host.saveCheckpoint();
-      await this.host.project(
-        `provider:${providerTurnId}:started`,
-        'provider.started',
-        {
+      const startCommit = this.beginAdmissionCommit(
+        reservation,
+        generation
+      );
+      if (!startCommit) {
+        return await this.settleStale(providerTurnId);
+      }
+      try {
+        state.providerTurn = {
           providerTurnId,
           controlEpoch: state.controlEpoch,
           contextRef: binding.contextRef,
-          factProjection: state.providerTurn.factProjection,
-        }
-      );
+          factProjection: {
+            snapshotHighWater: factProjection.snapshotHighWater,
+            omittedCount: factProjection.omittedCount,
+            factIds: factProjection.facts.map((fact) => fact.factId),
+          },
+          startedAt: this.ports.clock.now(),
+          status: 'active',
+        };
+        this.providerAbort = { reservation, controller };
+        await this.host.saveCheckpoint();
+        await this.host.project(
+          `provider:${providerTurnId}:started`,
+          'provider.started',
+          {
+            providerTurnId,
+            controlEpoch: state.controlEpoch,
+            contextRef: binding.contextRef,
+            factProjection: state.providerTurn.factProjection,
+          }
+        );
+      } finally {
+        this.endAdmissionCommit(startCommit);
+      }
+      if (this.resultIsStale(reservation, providerTurnId, generation)) {
+        return await this.settleStale(providerTurnId);
+      }
 
       let output;
       try {
@@ -158,7 +211,11 @@ export class SessionKernelProviderTurnsV2 {
           controlEpoch: state.controlEpoch,
           currentInput: currentSessionUserInputV2(state),
           conversationInputs: state.inputs,
+          conversationInputOmittedCount:
+            state.inputHistoryOmittedCount,
           providerOutcomes: state.providerOutcomes,
+          providerOutcomeOmittedCount:
+            state.providerOutcomeHistoryOmittedCount,
           ...(state.plan ? { plan: state.plan } : {}),
           ...(state.planDecision
             ? { planDecision: state.planDecision }
@@ -173,19 +230,30 @@ export class SessionKernelProviderTurnsV2 {
         if (this.resultIsStale(reservation, providerTurnId, generation)) {
           return await this.settleStale(providerTurnId);
         }
-        const latest = this.host.readState();
-        if (latest.providerTurn?.providerTurnId === providerTurnId) {
-          latest.providerTurn.status = 'failed';
-          await this.host.saveCheckpoint();
-          await this.host.project(
-            `provider:${providerTurnId}:failed`,
-            'diagnostic',
-            {
-              providerTurnId,
-              code: safeErrorCode(error),
-              stage: 'provider.requestTurn',
-            }
-          );
+        const failureCommit = this.beginAdmissionCommit(
+          reservation,
+          generation
+        );
+        if (!failureCommit) {
+          return await this.settleStale(providerTurnId);
+        }
+        try {
+          const latest = this.host.readState();
+          if (latest.providerTurn?.providerTurnId === providerTurnId) {
+            latest.providerTurn.status = 'failed';
+            await this.host.saveCheckpoint();
+            await this.host.project(
+              `provider:${providerTurnId}:failed`,
+              'diagnostic',
+              {
+                providerTurnId,
+                code: safeErrorCode(error),
+                stage: 'provider.requestTurn',
+              }
+            );
+          }
+        } finally {
+          this.endAdmissionCommit(failureCommit);
         }
         throw error;
       } finally {
@@ -197,66 +265,179 @@ export class SessionKernelProviderTurnsV2 {
       if (this.resultIsStale(reservation, providerTurnId, generation)) {
         return await this.settleStale(providerTurnId);
       }
-      this.host.readState().pendingGuidance = [];
 
-      let result: SessionKernelLoopResultV2;
+      let result: SessionKernelLoopResultV2 | undefined;
+      let toolIntent: ToolIntentV2 | undefined;
+      const outputCommit = this.beginAdmissionCommit(
+        reservation,
+        generation
+      );
+      if (!outputCommit) {
+        return await this.settleStale(providerTurnId);
+      }
       try {
-        if (output.kind === 'answer') {
-          result = { kind: 'answer', text: output.text };
-        } else if (output.kind === 'plan') {
-          await this.host.recordProviderPlan(output.plan);
-          result = { kind: 'plan', plan: output.plan };
-        } else if (output.kind === 'noTool') {
-          result = {
-            kind: 'noTool',
-            ...(output.guidance ? { guidance: output.guidance } : {}),
-          };
-        } else {
-          const intent = this.normalizeOutput(output.source, request);
-          result = await this.submitIntentOnce(intent);
+        this.host.readState().pendingGuidance = [];
+        try {
+          if (output.kind === 'answer') {
+            result = { kind: 'answer', text: output.text };
+          } else if (output.kind === 'plan') {
+            await this.host.recordProviderPlan(output.plan);
+            result = { kind: 'plan', plan: output.plan };
+          } else if (output.kind === 'noTool') {
+            result = {
+              kind: 'noTool',
+              ...(output.guidance ? { guidance: output.guidance } : {}),
+            };
+          } else {
+            toolIntent = this.normalizeOutput(output.source, request);
+          }
+        } catch (error) {
+          if (this.resultIsStale(
+            reservation,
+            providerTurnId,
+            generation
+          )) {
+            return await this.settleStale(providerTurnId);
+          }
+          const latest = this.host.readState();
+          if (latest.providerTurn?.providerTurnId === providerTurnId) {
+            latest.providerTurn.status = 'failed';
+            await this.host.saveCheckpoint();
+            await this.host.project(
+              `provider:${providerTurnId}:failed`,
+              'diagnostic',
+              {
+                providerTurnId,
+                code: safeErrorCode(error),
+                stage: 'provider.outputAdmission',
+              }
+            );
+          }
+          throw error;
         }
-      } catch (error) {
-        if (this.resultIsStale(reservation, providerTurnId, generation)) {
+      } finally {
+        this.endAdmissionCommit(outputCommit);
+      }
+
+      if (toolIntent) {
+        try {
+          result = await this.submitIntentOnce(toolIntent);
+        } catch (error) {
+          if (this.resultIsStale(
+            reservation,
+            providerTurnId,
+            generation
+          )) {
+            return await this.settleStale(providerTurnId);
+          }
+          const failureCommit = this.beginAdmissionCommit(
+            reservation,
+            generation
+          );
+          if (!failureCommit) {
+            return await this.settleStale(providerTurnId);
+          }
+          try {
+            const latest = this.host.readState();
+            if (latest.providerTurn?.providerTurnId === providerTurnId) {
+              latest.providerTurn.status = 'failed';
+              await this.host.saveCheckpoint();
+              await this.host.project(
+                `provider:${providerTurnId}:failed`,
+                'diagnostic',
+                {
+                  providerTurnId,
+                  code: safeErrorCode(error),
+                  stage: 'provider.outputAdmission',
+                }
+              );
+            }
+          } finally {
+            this.endAdmissionCommit(failureCommit);
+          }
+          throw error;
+        }
+        if (this.resultIsStale(
+          reservation,
+          providerTurnId,
+          generation
+        )) {
           return await this.settleStale(providerTurnId);
         }
-        const latest = this.host.readState();
-        if (latest.providerTurn?.providerTurnId === providerTurnId) {
-          latest.providerTurn.status = 'failed';
-          await this.host.saveCheckpoint();
-          await this.host.project(
-            `provider:${providerTurnId}:failed`,
-            'diagnostic',
-            {
-              providerTurnId,
-              code: safeErrorCode(error),
-              stage: 'provider.outputAdmission',
-            }
-          );
+        const reconcileCommit = this.beginAdmissionCommit(
+          reservation,
+          generation
+        );
+        if (!reconcileCommit) {
+          return await this.settleStale(providerTurnId);
         }
-        throw error;
+        try {
+          await this.host.reconcileFacts();
+        } finally {
+          this.endAdmissionCommit(reconcileCommit);
+        }
       }
 
       if (this.resultIsStale(reservation, providerTurnId, generation)) {
         return await this.settleStale(providerTurnId);
       }
-      const current = this.host.readState();
-      current.providerTurn!.status = 'completed';
-      current.providerOutcomes.push({
-        providerTurnId,
-        outputKind: output.kind,
-        recordedAt: this.ports.clock.now(),
-        ...providerOutcomeSummary(output),
-      });
-      await this.host.saveCheckpoint();
-      await this.host.project(
-        `provider:${providerTurnId}:completed`,
-        'provider.completed',
-        {
+      if (!result) {
+        throw new SessionKernelProviderTurnError(
+          'session_kernel_provider_result_missing',
+          'Provider output admission did not produce a Session result.'
+        );
+      }
+      const terminalCommit = this.beginAdmissionCommit(
+        reservation,
+        generation
+      );
+      if (!terminalCommit) {
+        return await this.settleStale(providerTurnId);
+      }
+      try {
+        const current = this.host.readState();
+        let planActionSettlement:
+          | SessionPlanActionSettlementV2
+          | undefined;
+        if (
+          request.target.kind === 'planAction'
+          && (output.kind === 'answer' || output.kind === 'noTool')
+        ) {
+          planActionSettlement =
+            this.host.settlePlanActionCompleted(
+              request.target.planActionId,
+              output.kind,
+              providerTurnId
+            );
+        }
+        current.providerTurn!.status = 'completed';
+        recordSessionProviderOutcomeV2(current, {
           providerTurnId,
           outputKind: output.kind,
-          result,
+          recordedAt: this.ports.clock.now(),
+          ...providerOutcomeSummary(output),
+        });
+        await this.host.saveCheckpoint();
+        await this.host.project(
+          `provider:${providerTurnId}:completed`,
+          'provider.completed',
+          {
+            providerTurnId,
+            outputKind: output.kind,
+            result,
+          }
+        );
+        if (planActionSettlement) {
+          await this.host.project(
+            `plan-action:${planActionSettlement.planActionId}:completed`,
+            'planAction.completed',
+            planActionSettlement,
+            planActionSettlement.recordedAt
+          );
         }
-      );
+      } finally {
+        this.endAdmissionCommit(terminalCommit);
+      }
       return result;
     } finally {
       if (this.reservation === reservation) {
@@ -383,7 +564,6 @@ export class SessionKernelProviderTurnsV2 {
       outcome,
       'toolIntentSubmit'
     ).reply;
-    await this.host.reconcileFacts();
     if (reply.kind === 'admitted') {
       return {
         kind: 'admitted',
@@ -428,6 +608,12 @@ export class SessionKernelProviderTurnsV2 {
 
   private assertMayRun(request: SessionProviderTurnRequestV2): void {
     const state = this.host.readState();
+    if (this.userInputFenceGeneration !== undefined) {
+      throw new SessionKernelProviderTurnError(
+        'session_kernel_user_input_admission_fenced',
+        'Provider output admission is fenced until the ordered user input transition is durable.'
+      );
+    }
     if (this.host.transitionBlocked()) {
       throw new SessionKernelProviderTurnError(
         'session_kernel_authority_transition_active',
@@ -435,6 +621,15 @@ export class SessionKernelProviderTurnsV2 {
       );
     }
     this.host.requireNoPendingRequests();
+    if (
+      state.kernelWakeHint
+      || !sessionKernelFactsCaughtUpV2(state.lineage)
+    ) {
+      throw new SessionKernelProviderTurnError(
+        'session_kernel_facts_not_caught_up',
+        'Provider execution is blocked until durable Kernel facts reach the advertised high-water mark.'
+      );
+    }
     if (state.activeWait) {
       throw new SessionKernelProviderTurnError(
         'session_kernel_active_wait',
@@ -445,6 +640,12 @@ export class SessionKernelProviderTurnsV2 {
       this.host.requirePlanProjected();
       this.host.requirePlanAccepted();
       sessionPlanActionV2(state, request.target.planActionId);
+      if (state.planActionSettlements[request.target.planActionId]) {
+        throw new SessionKernelProviderTurnError(
+          'session_kernel_plan_action_already_settled',
+          `PlanAction ${request.target.planActionId} is already settled.`
+        );
+      }
     }
   }
 
@@ -483,6 +684,44 @@ export class SessionKernelProviderTurnsV2 {
     return { kind: 'staleProviderResult', providerTurnId };
   }
 
+  private beginAdmissionCommit(
+    reservation: symbol,
+    generation: number
+  ): symbol | undefined {
+    if (
+      this.reservation !== reservation
+      || generation !== this.authorityGeneration
+      || this.userInputFenceGeneration !== undefined
+    ) {
+      return undefined;
+    }
+    if (this.admissionCommit) {
+      throw new SessionKernelProviderTurnError(
+        'session_kernel_provider_commit_concurrent',
+        'Provider admission commit phases must be serialized.'
+      );
+    }
+    const token = Symbol('providerAdmissionCommit');
+    let resolve: () => void = () => {};
+    const settled = new Promise<void>((complete) => {
+      resolve = complete;
+    });
+    this.admissionCommit = { token, settled, resolve };
+    return token;
+  }
+
+  private endAdmissionCommit(token: symbol): void {
+    const commit = this.admissionCommit;
+    if (!commit || commit.token !== token) {
+      throw new SessionKernelProviderTurnError(
+        'session_kernel_provider_commit_identity_mismatch',
+        'Provider admission commit identity was lost.'
+      );
+    }
+    this.admissionCommit = undefined;
+    commit.resolve();
+  }
+
   private begin(): symbol {
     if (this.reservation) {
       throw new SessionKernelProviderTurnError(
@@ -506,7 +745,10 @@ function providerOutcomeSummary(
     return { summary: output.guidance.slice(0, 8_192) };
   }
   if (output.kind === 'plan') {
-    return { summary: `${output.plan.title}\n${output.plan.objective}` };
+    return {
+      summary: `${output.plan.title}\n${output.plan.objective}`
+        .slice(0, 8_192),
+    };
   }
   return {};
 }

@@ -11,14 +11,23 @@ import {
 import {
   SESSION_KERNEL_FACT_KINDS_V2,
   SESSION_KERNEL_INVOCATION_TERMINAL_FACT_KINDS_V2,
+  SESSION_KERNEL_OBSERVED_EFFECT_FACT_KINDS_V2,
 } from './factKinds.js';
 import {
   requireSessionToolContextRefreshV2,
 } from './toolContext.js';
 import {
+  canonicalJson,
+  sha256Hash,
+} from '../cache/canonicalizer.js';
+import {
   cloneSessionKernelLoopStateV2,
   type SessionKernelLoopStateV2,
 } from './state.js';
+import type {
+  SessionReviewFactCategoryAccumulatorV2,
+  SessionReviewFactRefV2,
+} from './types.js';
 
 const CAPABILITY_ALLOWED_FACTS = new Set<string>([
   SESSION_KERNEL_FACT_KINDS_V2.authorization.capabilityIssued,
@@ -29,6 +38,18 @@ const CAPABILITY_DENIED_FACTS = new Set<string>([
   SESSION_KERNEL_FACT_KINDS_V2.authorization.capabilityDenied,
   SESSION_KERNEL_FACT_KINDS_V2.authorization.expansionDenied,
 ]);
+
+const SCOPE_EXPANSION_FACTS = new Set<string>([
+  SESSION_KERNEL_FACT_KINDS_V2.authorization.expansionAllowed,
+  SESSION_KERNEL_FACT_KINDS_V2.authorization.expansionDenied,
+]);
+const MAX_RECENT_FACT_COUNT = 256;
+const MAX_RECENT_FACT_BYTES = 512 * 1024;
+const MAX_RECENT_SINGLE_FACT_BYTES = 64 * 1024;
+const MAX_REVIEW_FACT_SAMPLES_PER_CATEGORY = 16;
+const MAX_REVIEW_FACT_DETAILS_BYTES = 4 * 1024;
+const MAX_REVIEW_FACT_REF_BYTES = 16 * 1024;
+const MAX_REVIEW_LINEAGE_IDS = 4;
 
 export interface SessionKernelReconcileResultV2 {
   state: SessionKernelLoopStateV2;
@@ -46,12 +67,17 @@ export function reconcileSessionKernelFactsPageV2(
   page: KernelFactProjectionPageV2
 ): SessionKernelReconcileResultV2 {
   const previousWait = JSON.stringify(state.activeWait);
-  const known = new Set(Object.keys(state.factsById));
   let next = cloneSessionKernelLoopStateV2(state);
   next.lineage = reduceSessionKernelFactsV2(next.lineage, page);
-  const newFacts = page.facts.filter((fact) => !known.has(fact.factId));
+  const newFacts = page.facts;
   for (const fact of newFacts) {
-    next.factsById[fact.factId] = cloneFact(fact);
+    const recent = compactRecentFact(fact);
+    if (recent) {
+      next.factsById[fact.factId] = recent;
+    } else {
+      next.factHistoryOmittedCount += 1;
+    }
+    recordReviewFact(next, fact);
     recordTerminalLineage(next, fact);
     if (
       fact.domain === 'authorization'
@@ -63,6 +89,7 @@ export function reconcileSessionKernelFactsPageV2(
         'kernelFact'
       );
       next.lineage = clearSessionCapabilityLeasesV2(next.lineage);
+      next.previews = {};
     }
     if (
       fact.domain === 'authorization'
@@ -78,6 +105,7 @@ export function reconcileSessionKernelFactsPageV2(
       });
     }
   }
+  boundRecentFacts(next);
   next.kernelWakeHint = false;
   next = resolveActiveWait(next, newFacts);
   return {
@@ -247,4 +275,301 @@ function detailText(
 
 function cloneFact(fact: KernelFactProjectionV2): KernelFactProjectionV2 {
   return JSON.parse(JSON.stringify(fact)) as KernelFactProjectionV2;
+}
+
+function compactRecentFact(
+  fact: KernelFactProjectionV2
+): KernelFactProjectionV2 | undefined {
+  const cloned = cloneFact(fact);
+  const details = canonicalJson(cloned.details);
+  const detailBytes = utf8Bytes(details);
+  if (detailBytes > MAX_REVIEW_FACT_DETAILS_BYTES) {
+    cloned.details = {
+      detailsOmitted: true,
+      detailsDigest: sha256Hash(details),
+      detailsByteLength: detailBytes,
+    };
+  }
+  return utf8Bytes(canonicalJson(cloned))
+      <= MAX_RECENT_SINGLE_FACT_BYTES
+    ? cloned
+    : undefined;
+}
+
+function boundRecentFacts(
+  state: SessionKernelLoopStateV2
+): void {
+  const ordered = Object.values(state.factsById).sort(
+    (left, right) =>
+      right.ledgerSequence - left.ledgerSequence
+      || left.factId.localeCompare(right.factId)
+  );
+  const retained: KernelFactProjectionV2[] = [];
+  let bytes = 0;
+  for (const fact of ordered) {
+    if (retained.length >= MAX_RECENT_FACT_COUNT) break;
+    const factBytes = utf8Bytes(canonicalJson(fact));
+    if (bytes + factBytes > MAX_RECENT_FACT_BYTES) {
+      continue;
+    }
+    retained.push(fact);
+    bytes += factBytes;
+  }
+  const retainedIds = new Set(
+    retained.map((fact) => fact.factId)
+  );
+  state.factHistoryOmittedCount +=
+    ordered.length - retained.length;
+  state.factsById = Object.fromEntries(
+    Object.entries(state.factsById)
+      .filter(([factId]) => retainedIds.has(factId))
+  );
+}
+
+function recordReviewFact(
+  state: SessionKernelLoopStateV2,
+  fact: KernelFactProjectionV2
+): void {
+  if (
+    fact.ledgerSequence
+      <= state.reviewFacts.coverageAfterLedgerSequence
+  ) {
+    return;
+  }
+  if (
+    fact.lineage.controlEpoch
+      !== state.reviewFacts.controlEpoch
+  ) {
+    recordPriorEpochLateFact(state, fact);
+    return;
+  }
+  const operationId = fact.lineage.operationId;
+  const priorAuthorizationSequence = operationId
+    ? state.reviewFacts.authorizedOperationSequences[operationId]
+    : undefined;
+  const isScopeExpansion =
+    fact.domain === 'authorization'
+    && (
+      SCOPE_EXPANSION_FACTS.has(fact.factKind)
+      || (
+        fact.factKind
+          === SESSION_KERNEL_FACT_KINDS_V2.authorization.scopePreviewed
+        && priorAuthorizationSequence !== undefined
+        && priorAuthorizationSequence < fact.ledgerSequence
+      )
+    );
+  if (isScopeExpansion) {
+    appendReviewSample(
+      state.reviewFacts.scopeExpansions,
+      fact
+    );
+  }
+  if (
+    fact.domain === 'authorization'
+    && CAPABILITY_ALLOWED_FACTS.has(fact.factKind)
+    && operationId
+  ) {
+    state.reviewFacts.authorizedOperationSequences[operationId] =
+      fact.ledgerSequence;
+  }
+  if (
+    fact.domain === 'effect'
+    && SESSION_KERNEL_OBSERVED_EFFECT_FACT_KINDS_V2.has(
+      fact.factKind
+    )
+  ) {
+    appendReviewSample(state.reviewFacts.actualEffects, fact);
+  }
+  if (
+    fact.domain === 'authorization'
+    && CAPABILITY_DENIED_FACTS.has(fact.factKind)
+  ) {
+    appendReviewSample(state.reviewFacts.denied, fact);
+    appendReviewSample(state.reviewFacts.rejections, fact);
+  } else if (
+    fact.factKind
+      === SESSION_KERNEL_FACT_KINDS_V2.invocation.rejected
+  ) {
+    appendReviewSample(state.reviewFacts.rejections, fact);
+  }
+  if (fact.domain === 'cleanup') {
+    appendReviewSample(state.reviewFacts.cleanup, fact);
+    updatePendingCleanup(state, fact);
+  }
+  if (
+    fact.domain === 'invocation'
+    && fact.factKind
+      === SESSION_KERNEL_FACT_KINDS_V2.invocation.indeterminate
+  ) {
+    appendReviewSample(state.reviewFacts.indeterminate, fact);
+  }
+}
+
+function recordPriorEpochLateFact(
+  state: SessionKernelLoopStateV2,
+  fact: KernelFactProjectionV2
+): void {
+  const observedEffect =
+    fact.domain === 'effect'
+    && SESSION_KERNEL_OBSERVED_EFFECT_FACT_KINDS_V2.has(
+      fact.factKind
+    );
+  const cleanup = fact.domain === 'cleanup';
+  const indeterminate =
+    fact.domain === 'invocation'
+    && fact.factKind
+      === SESSION_KERNEL_FACT_KINDS_V2.invocation.indeterminate;
+  const failedAfterEffect =
+    fact.domain === 'invocation'
+    && fact.factKind
+      === SESSION_KERNEL_FACT_KINDS_V2.invocation
+        .failedAfterObservedEffect;
+  if (
+    !observedEffect
+    && !cleanup
+    && !indeterminate
+    && !failedAfterEffect
+  ) {
+    return;
+  }
+  appendReviewSample(
+    state.reviewFacts.priorEpochLateFacts,
+    fact
+  );
+  if (observedEffect) {
+    appendReviewSample(state.reviewFacts.actualEffects, fact);
+  }
+  if (cleanup) {
+    appendReviewSample(state.reviewFacts.cleanup, fact);
+    updatePendingCleanup(state, fact);
+  }
+  if (indeterminate) {
+    appendReviewSample(state.reviewFacts.indeterminate, fact);
+  }
+}
+
+function appendReviewSample(
+  category: SessionReviewFactCategoryAccumulatorV2,
+  fact: KernelFactProjectionV2
+): void {
+  category.totalCount += 1;
+  const reference = toReviewFactRef(fact);
+  if (
+    category.samples.length
+      < MAX_REVIEW_FACT_SAMPLES_PER_CATEGORY
+  ) {
+    category.samples.push(reference);
+    return;
+  }
+  category.samples.splice(4, 1);
+  category.samples.push(reference);
+}
+
+function updatePendingCleanup(
+  state: SessionKernelLoopStateV2,
+  fact: KernelFactProjectionV2
+): void {
+  const resourceIds = fact.lineage.resourceIds.length > 0
+    ? fact.lineage.resourceIds
+    : ['unscoped'];
+  for (const resourceId of resourceIds) {
+    const resourceKey = sha256Hash(
+      canonicalJson({ resourceId })
+    );
+    if (
+      fact.factKind
+        === SESSION_KERNEL_FACT_KINDS_V2.cleanup.completed
+    ) {
+      delete state.reviewFacts.pendingCleanupByResource[
+        resourceKey
+      ];
+      continue;
+    }
+    state.reviewFacts.pendingCleanupByResource[resourceKey] = {
+      factId: fact.factId,
+      ledgerSequence: fact.ledgerSequence,
+      factKind: fact.factKind,
+    };
+  }
+}
+
+function toReviewFactRef(
+  fact: KernelFactProjectionV2
+): SessionReviewFactRefV2 {
+  const originalDetails = canonicalJson(fact.details);
+  const originalFact = canonicalJson(fact);
+  const detailBytes = utf8Bytes(originalDetails);
+  const compactDetails = detailBytes
+      <= MAX_REVIEW_FACT_DETAILS_BYTES
+    ? cloneFact(fact).details
+    : {
+        detailsOmitted: true,
+        detailsDigest: sha256Hash(originalDetails),
+        detailsByteLength: detailBytes,
+      };
+  let reference: SessionReviewFactRefV2 = {
+    factId: fact.factId,
+    ledgerSequence: fact.ledgerSequence,
+    domain: fact.domain,
+    factKind: fact.factKind,
+    ...(fact.lineage.controlEpoch !== undefined
+      ? { controlEpoch: fact.lineage.controlEpoch }
+      : {}),
+    planActionIds: [
+      ...fact.lineage.planActionIds.slice(
+        0,
+        MAX_REVIEW_LINEAGE_IDS
+      ),
+    ],
+    resourceIds: [
+      ...fact.lineage.resourceIds.slice(
+        0,
+        MAX_REVIEW_LINEAGE_IDS
+      ),
+    ],
+    ...(fact.lineage.operationId
+      ? { operationId: fact.lineage.operationId }
+      : {}),
+    ...(fact.lineage.invocationId
+      ? { invocationId: fact.lineage.invocationId }
+      : {}),
+    ...(fact.lineage.effectId
+      ? { effectId: fact.lineage.effectId }
+      : {}),
+    details: {
+      ...compactDetails,
+      planActionIdCount: fact.lineage.planActionIds.length,
+      resourceIdCount: fact.lineage.resourceIds.length,
+    },
+  };
+  if (
+    utf8Bytes(canonicalJson(reference))
+      > MAX_REVIEW_FACT_REF_BYTES
+  ) {
+    reference = {
+      ...reference,
+      planActionIds: [],
+      resourceIds: [],
+      details: {
+        factSummaryOmitted: true,
+        factDigest: sha256Hash(originalFact),
+        factByteLength: utf8Bytes(originalFact),
+        planActionIdCount: fact.lineage.planActionIds.length,
+        resourceIdCount: fact.lineage.resourceIds.length,
+      },
+    };
+  }
+  if (
+    utf8Bytes(canonicalJson(reference))
+      > MAX_REVIEW_FACT_REF_BYTES
+  ) {
+    throw new Error(
+      'session_kernel_review_fact_reference_oversized'
+    );
+  }
+  return reference;
+}
+
+function utf8Bytes(value: string): number {
+  return new TextEncoder().encode(value).byteLength;
 }

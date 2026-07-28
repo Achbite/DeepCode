@@ -15,9 +15,9 @@ export const SESSION_PROVIDER_FACTS_MAX_UTF8_BYTES_V2 = 64 * 1024;
 const TARGET_HEAD_FACT_COUNT = 16;
 const ACTIVE_WAIT_HEAD_FACT_COUNT = 8;
 /**
- * Builds a deterministic, bounded projection for model context only.
- * Selection never removes or mutates canonical facts held by Session and
- * therefore cannot affect authority, reconciliation, recovery, or Review.
+ * Builds a deterministic, bounded projection for model context only. Kernel
+ * remains the canonical fact store; Session retains only a recent fact window
+ * plus compact reducers and exact high-water lineage.
  */
 export function projectSessionProviderFactsV2(
   state: SessionKernelLoopStateV2,
@@ -62,7 +62,10 @@ export function projectSessionProviderFactsV2(
     const trialFacts = [...selected, cloned].sort(compareFactsAscending);
     const trial = {
       snapshotHighWater: state.lineage.cursor.snapshotHighWater,
-      omittedCount: canonicalFacts.length - trialFacts.length,
+      omittedCount:
+        state.factHistoryOmittedCount
+        + canonicalFacts.length
+        - trialFacts.length,
       facts: trialFacts,
     };
     if (
@@ -76,7 +79,10 @@ export function projectSessionProviderFactsV2(
   const facts = selected.sort(compareFactsAscending);
   return {
     snapshotHighWater: state.lineage.cursor.snapshotHighWater,
-    omittedCount: canonicalFacts.length - facts.length,
+    omittedCount:
+      state.factHistoryOmittedCount
+      + canonicalFacts.length
+      - facts.length,
     facts,
   };
 }

@@ -2,6 +2,7 @@ import { canonicalJson, sha256Hash } from '../cache/canonicalizer.js';
 import type {
   SessionKernelPersistencePortV2,
   SessionKernelProjectionPortV2,
+  SessionKernelStoredOperationResultRefV2,
 } from './ports.js';
 import type { SessionKernelCheckpointV2 } from './state.js';
 import type {
@@ -28,6 +29,8 @@ export const SESSION_KERNEL_PERSISTENCE_LIST_REPLY_V2_SCHEMA =
   'deepcode.session.kernel-persistence-list-reply.v2' as const;
 export const SESSION_KERNEL_PERSISTENCE_APPEND_REPLY_V2_SCHEMA =
   'deepcode.session.kernel-persistence-append-reply.v2' as const;
+export const SESSION_KERNEL_OPERATION_RESULT_V2_SCHEMA =
+  'deepcode.session.kernel-operation-result.v2' as const;
 
 export type SessionKernelPersistenceRecordKindV2 =
   | 'storeHeader'
@@ -37,6 +40,7 @@ export type SessionKernelPersistenceRecordKindV2 =
   | 'publicRequest'
   | 'publicRequestSettled'
   | 'checkpoint'
+  | 'operationResult'
   | 'projection'
   | 'projectionDelivered';
 
@@ -318,6 +322,33 @@ implements SessionKernelPersistencePortV2 {
     );
   }
 
+  async loadInput(
+    runId: string,
+    inputId: string
+  ): Promise<SessionUserInputRecordV2 | undefined> {
+    this.requireRun(runId);
+    requiredIdentity(inputId, 'inputId');
+    const expectedRecordId = [
+      'session-kernel-v2',
+      runId,
+      `input:${inputId}`,
+    ].join(':');
+    const record = (await this.loadRecords()).find(
+      (candidate) =>
+        candidate.recordKind === 'input'
+        && candidate.recordId === expectedRecordId
+    );
+    if (!record) return undefined;
+    const input = record.data as SessionUserInputRecordV2;
+    if (input.inputId !== inputId) {
+      throw new SessionKernelPersistenceError(
+        'session_kernel_input_identity_mismatch',
+        `Input ${inputId} does not match its durable record identity.`
+      );
+    }
+    return cloneJson(input);
+  }
+
   async loadPlanDecision(
     runId: string,
     planRevision: string
@@ -464,6 +495,77 @@ implements SessionKernelPersistencePortV2 {
     );
   }
 
+  async persistOperationResult(
+    operationRequestId: string,
+    result: unknown,
+    recordedAt: string
+  ): Promise<SessionKernelStoredOperationResultRefV2> {
+    requiredIdentity(operationRequestId, 'operationRequestId');
+    const resultDigest = sha256Hash(canonicalJson(result));
+    const recordId = [
+      'session-kernel-v2',
+      this.runId,
+      `operation-result:${operationRequestId}`,
+    ].join(':');
+    const operation = this.writeChain
+      .catch(() => undefined)
+      .then(async () => {
+        await this.ensureInitialized(recordedAt);
+        const records = await this.loadRecords();
+        const existing = records.find(
+          (candidate) => candidate.recordId === recordId
+        );
+        if (existing) {
+          const data = exactObject(
+            existing.data,
+            [
+              'schemaVersion',
+              'operationRequestId',
+              'resultDigest',
+              'result',
+            ],
+            'session_kernel_operation_result_invalid'
+          );
+          if (
+            existing.recordKind !== 'operationResult'
+            || data.schemaVersion
+              !== SESSION_KERNEL_OPERATION_RESULT_V2_SCHEMA
+            || data.operationRequestId !== operationRequestId
+            || data.resultDigest !== resultDigest
+            || sha256Hash(canonicalJson(data.result)) !== resultDigest
+          ) {
+            throw new SessionKernelPersistenceError(
+              'session_kernel_persistence_identity_conflict',
+              `Operation result ${operationRequestId} changed immutable content.`
+            );
+          }
+          return existing;
+        }
+        const created = createRecord({
+          sessionId: this.sessionId,
+          runId: this.runId,
+          recordKind: 'operationResult',
+          logicalId: `operation-result:${operationRequestId}`,
+          recordedAt,
+          data: {
+            schemaVersion: SESSION_KERNEL_OPERATION_RESULT_V2_SCHEMA,
+            operationRequestId,
+            resultDigest,
+            result: cloneJson(result),
+          },
+        });
+        await this.appendUnique(created);
+        return created;
+      });
+    this.writeChain = operation.then(() => undefined);
+    const record = await operation;
+    return {
+      recordId: record.recordId,
+      recordDigest: record.recordDigest,
+      resultDigest,
+    };
+  }
+
   persistProjection(
     event: SessionKernelProjectionEventV2
   ): Promise<void> {
@@ -602,6 +704,20 @@ implements SessionKernelPersistencePortV2 {
     data: unknown,
     recordedAt: string
   ): Promise<void> {
+    return this.appendRecord(
+      recordKind,
+      logicalId,
+      data,
+      recordedAt
+    ).then(() => undefined);
+  }
+
+  private appendRecord(
+    recordKind: SessionKernelPersistenceRecordKindV2,
+    logicalId: string,
+    data: unknown,
+    recordedAt: string
+  ): Promise<SessionKernelPersistenceRecordV2> {
     const operation = this.writeChain
       .catch(() => undefined)
       .then(async () => {
@@ -615,8 +731,9 @@ implements SessionKernelPersistencePortV2 {
           data,
         });
         await this.appendUnique(record);
+        return record;
       });
-    this.writeChain = operation;
+    this.writeChain = operation.then(() => undefined);
     return operation;
   }
 
@@ -795,6 +912,7 @@ const SESSION_KERNEL_PROJECTION_KINDS_V2 = new Set<
   'authorization.decided',
   'review.revised',
   'planAction.skipped',
+  'planAction.completed',
   'wait.changed',
   'diagnostic',
 ]);
@@ -1048,6 +1166,7 @@ function decodeRecord(
     && recordKind !== 'publicRequest'
     && recordKind !== 'publicRequestSettled'
     && recordKind !== 'checkpoint'
+    && recordKind !== 'operationResult'
     && recordKind !== 'projection'
     && recordKind !== 'projectionDelivered'
   ) {

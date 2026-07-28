@@ -1,29 +1,16 @@
-import type { KernelFactProjectionV2 } from '@deepcode/protocol';
-import { sessionKernelFactsCaughtUpV2 } from './lineage.js';
 import {
-  operationTerminalFactsV2,
-  orderedFacts,
-} from './reconcile.js';
+  canonicalJson,
+  sha256Hash,
+} from '../cache/canonicalizer.js';
+import { sessionKernelFactsCaughtUpV2 } from './lineage.js';
 import type { SessionKernelLoopStateV2 } from './state.js';
 import type {
   SessionKernelReviewV2,
-  SessionReviewFactRefV2,
+  SessionPlanActionSettlementV2,
+  SessionReviewFactCategoryAccumulatorV2,
+  SessionReviewFactCoverageV2,
   SessionReviewPlannedActionV2,
 } from './types.js';
-import {
-  SESSION_KERNEL_FACT_KINDS_V2,
-  SESSION_KERNEL_OBSERVED_EFFECT_FACT_KINDS_V2,
-} from './factKinds.js';
-
-const SCOPE_EXPANSION_FACTS = new Set<string>([
-  SESSION_KERNEL_FACT_KINDS_V2.authorization.expansionAllowed,
-  SESSION_KERNEL_FACT_KINDS_V2.authorization.expansionDenied,
-]);
-
-const DENIAL_FACTS = new Set<string>([
-  SESSION_KERNEL_FACT_KINDS_V2.authorization.capabilityDenied,
-  SESSION_KERNEL_FACT_KINDS_V2.authorization.expansionDenied,
-]);
 
 /**
  * Review is a Session projection over a complete Kernel snapshot. A later
@@ -41,17 +28,25 @@ export function buildSessionKernelReviewV2(
     );
   }
   const snapshotHighWater = state.lineage.cursor.snapshotHighWater;
+  const planActionSettlementDigest = sha256Hash(canonicalJson(
+    Object.values(state.planActionSettlements).sort(
+      (left, right) =>
+        left.planActionId.localeCompare(right.planActionId)
+    )
+  ));
   if (
     state.review
     && state.review.snapshotHighWater === snapshotHighWater
     && state.review.planRevision === state.plan?.planRevision
     && JSON.stringify(state.review.planDecision)
       === JSON.stringify(state.planDecision)
+    && state.review.planActionSettlementDigest
+      === planActionSettlementDigest
   ) {
     return cloneReview(state.review);
   }
-  const facts = orderedFacts(state);
   const planned = plannedActions(state);
+  const reviewFacts = state.reviewFacts;
   return {
     revision: (state.review?.revision ?? 0) + 1,
     status: 'draft',
@@ -71,82 +66,73 @@ export function buildSessionKernelReviewV2(
           },
         }
       : {}),
+    planActionSettlementDigest,
     snapshotHighWater,
     planned,
-    scopeExpansions: selectFacts(
-      facts,
-      (fact) => isScopeExpansionFact(fact, facts)
-    ),
-    actualEffects: selectFacts(
-      facts,
-      (fact) =>
-        fact.domain === 'effect'
-        && SESSION_KERNEL_OBSERVED_EFFECT_FACT_KINDS_V2.has(
-          fact.factKind
-        )
-    ),
+    scopeExpansions: cloneJson(reviewFacts.scopeExpansions.samples),
+    actualEffects: cloneJson(reviewFacts.actualEffects.samples),
     unexecuted: planned.filter(
       (action) =>
         planActionInvocationCount(state, action.planActionId) === 0
-        && !state.planActionSettlements[action.planActionId]
     ),
-    denied: selectFacts(
-      facts,
-      (fact) =>
-        fact.domain === 'authorization'
-        && DENIAL_FACTS.has(fact.factKind)
-    ),
-    rejections: selectFacts(
-      facts,
-      (fact) =>
-        fact.factKind
-          === SESSION_KERNEL_FACT_KINDS_V2.invocation.rejected
-        || (
-          fact.domain === 'authorization'
-          && DENIAL_FACTS.has(fact.factKind)
-        )
-    ),
+    denied: cloneJson(reviewFacts.denied.samples),
+    rejections: cloneJson(reviewFacts.rejections.samples),
     skipped: Object.values(state.planActionSettlements)
+      .filter(
+        (
+          settlement
+        ): settlement is Extract<
+          SessionPlanActionSettlementV2,
+          { kind: 'skipped' }
+        > => settlement.kind === 'skipped'
+      )
       .sort((left, right) =>
         left.recordedAt.localeCompare(right.recordedAt)
         || left.planActionId.localeCompare(right.planActionId)
       ),
-    cleanup: selectFacts(facts, (fact) => fact.domain === 'cleanup'),
-    indeterminate: selectFacts(
-      facts,
-      (fact) =>
-        fact.factKind
-        === SESSION_KERNEL_FACT_KINDS_V2.invocation.indeterminate
+    completions: Object.values(state.planActionSettlements)
+      .filter(
+        (
+          settlement
+        ): settlement is Extract<
+          SessionPlanActionSettlementV2,
+          { kind: 'completed' }
+        > => settlement.kind === 'completed'
+      )
+      .sort((left, right) =>
+        left.recordedAt.localeCompare(right.recordedAt)
+        || left.planActionId.localeCompare(right.planActionId)
+      ),
+    cleanup: cloneJson(reviewFacts.cleanup.samples),
+    indeterminate: cloneJson(reviewFacts.indeterminate.samples),
+    priorEpochLateFacts: cloneJson(
+      reviewFacts.priorEpochLateFacts.samples
     ),
+    factCoverage: {
+      scopeExpansions: factCoverage(
+        reviewFacts.scopeExpansions
+      ),
+      actualEffects: factCoverage(reviewFacts.actualEffects),
+      denied: factCoverage(reviewFacts.denied),
+      rejections: factCoverage(reviewFacts.rejections),
+      cleanup: factCoverage(reviewFacts.cleanup),
+      indeterminate: factCoverage(reviewFacts.indeterminate),
+      priorEpochLateFacts: factCoverage(
+        reviewFacts.priorEpochLateFacts
+      ),
+    },
+    factsQuery: {
+      runId: state.runId,
+      controlEpoch: reviewFacts.controlEpoch,
+      afterLedgerSequence:
+        reviewFacts.coverageAfterLedgerSequence,
+      snapshotHighWater,
+    },
+    pendingCleanupCount: Object.keys(
+      reviewFacts.pendingCleanupByResource
+    ).length,
     createdAt,
   };
-}
-
-function isScopeExpansionFact(
-  fact: KernelFactProjectionV2,
-  facts: KernelFactProjectionV2[]
-): boolean {
-  if (fact.domain !== 'authorization') return false;
-  if (SCOPE_EXPANSION_FACTS.has(fact.factKind)) return true;
-  if (
-    fact.factKind
-      !== SESSION_KERNEL_FACT_KINDS_V2.authorization.scopePreviewed
-    || !fact.lineage.operationId
-  ) {
-    return false;
-  }
-  return facts.some(
-    (candidate) =>
-      candidate.ledgerSequence < fact.ledgerSequence
-      && candidate.domain === 'authorization'
-      && candidate.lineage.operationId === fact.lineage.operationId
-      && (
-        candidate.factKind
-          === SESSION_KERNEL_FACT_KINDS_V2.authorization.capabilityIssued
-        || candidate.factKind
-          === SESSION_KERNEL_FACT_KINDS_V2.authorization.expansionAllowed
-      )
-  );
 }
 
 /**
@@ -170,52 +156,27 @@ export function canFinalizeSessionKernelReviewV2(
   ) {
     return false;
   }
-  const facts = orderedFacts(state);
-  if (
-    facts.some(
-      (fact) =>
-        fact.factKind
-          === SESSION_KERNEL_FACT_KINDS_V2.invocation.indeterminate
-    )
-  ) {
+  if (state.reviewFacts.indeterminate.totalCount > 0) {
     return false;
   }
-  const deniedOperations = new Set(
-    facts
-      .filter(
-        (fact) =>
-          fact.domain === 'authorization'
-          && DENIAL_FACTS.has(fact.factKind)
-          && fact.lineage.operationId
-      )
-      .map((fact) => fact.lineage.operationId!)
-  );
-  const everyOperationSettled = state.plan.actions.every((action) => {
-    if (state.planActionSettlements[action.manifest.planActionId]) {
-      return true;
-    }
-    const operationIds =
-      planActionOperationIds(
+  const everyOperationSettled = state.plan.actions.every(
+    (action) =>
+      sessionKernelPlanActionSettledV2(
         state,
         action.manifest.planActionId
-      );
-    const invokedOperationIds = operationIds.filter(
-      (operationId) =>
-        (state.lineage.operations[operationId]?.invocationIds.length
-          ?? 0) > 0
-    );
-    if (invokedOperationIds.length === 0) {
-      return operationIds.some(
-        (operationId) => deniedOperations.has(operationId)
-      );
-    }
-    return invokedOperationIds.every(
-      (operationId) =>
-        operationTerminalFactsV2(state, operationId).length > 0
-        || deniedOperations.has(operationId)
-    );
-  });
-  return everyOperationSettled && cleanupSettled(facts);
+      )
+  );
+  return everyOperationSettled
+    && Object.keys(
+      state.reviewFacts.pendingCleanupByResource
+    ).length === 0;
+}
+
+export function sessionKernelPlanActionSettledV2(
+  state: SessionKernelLoopStateV2,
+  planActionId: string
+): boolean {
+  return Boolean(state.planActionSettlements[planActionId]);
 }
 
 export function finalizeSessionKernelReviewV2(
@@ -264,61 +225,21 @@ function planActionInvocationCount(
     (count, operationId) =>
       count
       + (
-        state.lineage.operations[operationId]?.invocationIds.length
+        state.lineage.operations[operationId]?.invocationCount
         ?? 0
       ),
     0
   );
 }
 
-function cleanupSettled(facts: KernelFactProjectionV2[]): boolean {
-  const cleanupFacts = facts.filter((fact) => fact.domain === 'cleanup');
-  if (cleanupFacts.length === 0) return true;
-  const latestByResource = new Map<string, KernelFactProjectionV2>();
-  for (const fact of cleanupFacts) {
-    const resourceIds = fact.lineage.resourceIds.length > 0
-      ? fact.lineage.resourceIds
-      : [`fact:${fact.factId}`];
-    for (const resourceId of resourceIds) {
-      const previous = latestByResource.get(resourceId);
-      if (!previous || previous.ledgerSequence < fact.ledgerSequence) {
-        latestByResource.set(resourceId, fact);
-      }
-    }
-  }
-  return [...latestByResource.values()].every(
-    (fact) =>
-      fact.factKind
-        === SESSION_KERNEL_FACT_KINDS_V2.cleanup.completed
-  );
-}
-
-function selectFacts(
-  facts: KernelFactProjectionV2[],
-  predicate: (fact: KernelFactProjectionV2) => boolean
-): SessionReviewFactRefV2[] {
-  return facts.filter(predicate).map(toFactRef);
-}
-
-function toFactRef(fact: KernelFactProjectionV2): SessionReviewFactRefV2 {
+function factCoverage(
+  category: SessionReviewFactCategoryAccumulatorV2
+): SessionReviewFactCoverageV2 {
   return {
-    factId: fact.factId,
-    ledgerSequence: fact.ledgerSequence,
-    domain: fact.domain,
-    factKind: fact.factKind,
-    ...(fact.lineage.controlEpoch !== undefined
-      ? { controlEpoch: fact.lineage.controlEpoch }
-      : {}),
-    planActionIds: [...fact.lineage.planActionIds],
-    resourceIds: [...fact.lineage.resourceIds],
-    ...(fact.lineage.operationId
-      ? { operationId: fact.lineage.operationId }
-      : {}),
-    ...(fact.lineage.invocationId
-      ? { invocationId: fact.lineage.invocationId }
-      : {}),
-    ...(fact.lineage.effectId ? { effectId: fact.lineage.effectId } : {}),
-    details: cloneJson(fact.details),
+    totalCount: category.totalCount,
+    retainedCount: category.samples.length,
+    omittedCount:
+      category.totalCount - category.samples.length,
   };
 }
 

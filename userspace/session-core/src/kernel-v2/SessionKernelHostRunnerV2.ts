@@ -7,6 +7,9 @@ import {
   sessionKernelLoopPortsFromHostV2,
   type SessionKernelHostAdaptersV2,
 } from './SessionKernelHostAdaptersV2.js';
+import type {
+  SessionKernelStoredOperationResultRefV2,
+} from './ports.js';
 import type { SessionKernelLoopStateV2 } from './state.js';
 import type {
   SessionActiveWaitV2,
@@ -24,7 +27,6 @@ export interface SessionKernelHostRunnerOpenV2 {
 }
 
 export interface SessionPlanActionDriveOptionsV2 {
-  wakeHint?: boolean;
   providerCallBudget?: number;
   guidance?: string[];
 }
@@ -100,6 +102,16 @@ export class SessionKernelHostRunnerV2 {
     return this.loop.snapshot();
   }
 
+  persistOperationResult(
+    operationRequestId: string,
+    result: unknown
+  ): Promise<SessionKernelStoredOperationResultRefV2> {
+    return this.loop.persistOperationResult(
+      operationRequestId,
+      result
+    );
+  }
+
   async runInitialTurn(
     guidance: string[] = []
   ): Promise<SessionKernelLoopResultV2> {
@@ -126,6 +138,31 @@ export class SessionKernelHostRunnerV2 {
     return this.requireProviderPlanRecorded(result);
   }
 
+  fenceProviderForUserInput(): number {
+    return this.loop.fenceProviderForUserInput();
+  }
+
+  isUserInputFenceCurrent(generation: number): boolean {
+    return this.loop.isUserInputFenceCurrent(generation);
+  }
+
+  async applyFencedUserInput(
+    input: SessionUserInputRecordV2,
+    generation: number
+  ): Promise<void> {
+    await this.loop.applyFencedUserInput(input, generation);
+  }
+
+  async runUserInputProviderTurn(
+    guidance: string[] = []
+  ): Promise<SessionKernelLoopResultV2> {
+    return this.runProviderTurn({
+      reason: 'userInput',
+      target: { kind: 'planning' },
+      guidance,
+    });
+  }
+
   async runProviderTurn(
     request: SessionProviderTurnRequestV2
   ): Promise<SessionKernelLoopResultV2> {
@@ -134,9 +171,13 @@ export class SessionKernelHostRunnerV2 {
   }
 
   async previewPlanAction(
-    planActionId: string
+    planActionId: string,
+    expectedPlanRevision: string
   ): Promise<CapabilityScopePreviewReplyV2> {
-    return this.loop.previewPlanAction(planActionId);
+    return this.loop.previewPlanAction(
+      planActionId,
+      expectedPlanRevision
+    );
   }
 
   async decidePlan(input: {
@@ -149,15 +190,24 @@ export class SessionKernelHostRunnerV2 {
 
   async skipPlanAction(
     planActionId: string,
+    expectedPlanRevision: string,
     reason: string
   ): Promise<void> {
-    await this.loop.skipPlanAction(planActionId, reason);
+    await this.loop.skipPlanAction(
+      planActionId,
+      expectedPlanRevision,
+      reason
+    );
   }
 
   async runPlanAction(
     planActionId: string,
+    expectedPlanRevision: string,
     guidance: string[] = []
   ): Promise<SessionKernelLoopResultV2> {
+    const state = this.loop.snapshot();
+    requireExactPlanRevision(state, expectedPlanRevision);
+    requirePlanActionUnsettled(state, planActionId);
     return this.runProviderTurn({
       reason: 'planExecution',
       target: { kind: 'planAction', planActionId },
@@ -195,11 +245,11 @@ export class SessionKernelHostRunnerV2 {
   async resumeAfterBackpressure(input: {
     operationId: string;
     retryAt: string;
-    planActionId: string;
+    planActionId?: string;
+    expectedPlanRevision?: string;
     guidance: string[];
-  }): Promise<SessionKernelLoopResultV2> {
+  }, signal?: AbortSignal): Promise<SessionKernelLoopResultV2> {
     const snapshot = this.loop.snapshot();
-    requireAcceptedPlanRevision(snapshot);
     const wait = snapshot.activeWait;
     if (
       !wait
@@ -212,14 +262,39 @@ export class SessionKernelHostRunnerV2 {
         'Backpressure continuation does not match the current durable wait identity.'
       );
     }
-    return this.loop.resumeAfterBackpressure({
-      reason: 'retryGuidance',
-      target: {
-        kind: 'planAction',
-        planActionId: input.planActionId,
-      },
-      guidance: input.guidance,
-    });
+    const operationLineage =
+      snapshot.lineage.operations[input.operationId];
+    if (!operationLineage) {
+      throw new SessionKernelHostRunnerError(
+        'session_kernel_backpressure_operation_stale',
+        'Backpressure continuation does not bind a current operation.'
+      );
+    }
+    const expectedPlanActionId = operationLineage.planActionId;
+    if (expectedPlanActionId) {
+      if (!input.planActionId || !input.expectedPlanRevision) {
+        throw new SessionKernelHostRunnerError(
+          'session_kernel_backpressure_plan_binding_required',
+          'PlanAction backpressure requires its exact PlanAction identity and Plan revision.'
+        );
+      }
+      requireAcceptedPlanRevision(snapshot);
+      if (
+        snapshot.plan?.planRevision !== input.expectedPlanRevision
+        || expectedPlanActionId !== input.planActionId
+      ) {
+        throw new SessionKernelHostRunnerError(
+          'session_kernel_backpressure_plan_binding_stale',
+          'Backpressure continuation does not match the current PlanAction binding.'
+        );
+      }
+    } else if (input.planActionId || input.expectedPlanRevision) {
+      throw new SessionKernelHostRunnerError(
+        'session_kernel_backpressure_plan_binding_unexpected',
+        'Planning context-read backpressure cannot carry a PlanAction binding.'
+      );
+    }
+    return this.loop.resumeAfterBackpressure(input.guidance, signal);
   }
 
   /**
@@ -230,15 +305,16 @@ export class SessionKernelHostRunnerV2 {
    */
   async drivePlanActionStep(
     planActionId: string,
+    expectedPlanRevision: string,
     options: SessionPlanActionDriveOptionsV2 = {}
   ): Promise<SessionPlanActionDriveStepV2> {
-    requireAcceptedPlanRevision(this.loop.snapshot());
+    const initialState = this.loop.snapshot();
+    requireAcceptedPlanRevision(initialState);
+    requireExactPlanRevision(initialState, expectedPlanRevision);
+    requirePlanActionUnsettled(initialState, planActionId);
     const budget = normalizeProviderCallBudget(
       options.providerCallBudget
     );
-    if (options.wakeHint) {
-      await this.loop.notifyKernelWakeHint();
-    }
     let state = this.loop.snapshot();
     if (state.activeWait) {
       return {
@@ -263,6 +339,7 @@ export class SessionKernelHostRunnerV2 {
     }
     const result = await this.runPlanAction(
       planActionId,
+      expectedPlanRevision,
       options.guidance
     );
     state = this.loop.snapshot();
@@ -304,9 +381,26 @@ export class SessionKernelHostRunnerV2 {
     decision: 'allow' | 'deny';
     guidance?: string;
     replanAfterDeny?: boolean;
+    previewId: string;
+    operationId: string;
+    invocationId: string;
+    planActionId?: string;
+    expectedPlanRevision?: string;
   }): Promise<SessionKernelLoopResultV2 | undefined> {
     return this.loop.observeCapabilityDecision({
       decision: input.decision,
+      previewId: input.previewId,
+      operationId: input.operationId,
+      invocationId: input.invocationId,
+      ...(input.planActionId
+        ? { planActionId: input.planActionId }
+        : {}),
+      ...(input.expectedPlanRevision
+        ? {
+            expectedPlanRevision:
+              input.expectedPlanRevision,
+          }
+        : {}),
       ...(input.guidance ? { guidance: input.guidance } : {}),
       ...(input.decision === 'deny' && input.replanAfterDeny
         ? {
@@ -322,8 +416,15 @@ export class SessionKernelHostRunnerV2 {
     });
   }
 
-  async notifyKernelWakeHint(): Promise<void> {
-    await this.loop.notifyKernelWakeHint();
+  async notifyKernelWakeHint(input: {
+    waitKind: 'capability' | 'invocation';
+    operationId: string;
+    invocationId: string;
+    previewId?: string;
+    planActionId?: string;
+    expectedPlanRevision?: string;
+  }): Promise<void> {
+    await this.loop.notifyKernelWakeHint(input);
   }
 
   /**
@@ -331,9 +432,17 @@ export class SessionKernelHostRunnerV2 {
    * the Provider receives the new canonical facts instead of planning blind.
    */
   async resumePlanningAfterContextRead(
+    wake: {
+      waitKind: 'capability' | 'invocation';
+      operationId: string;
+      invocationId: string;
+      previewId?: string;
+      planActionId?: string;
+      expectedPlanRevision?: string;
+    },
     guidance: string[] = []
   ): Promise<SessionKernelLoopResultV2 | undefined> {
-    await this.loop.notifyKernelWakeHint();
+    await this.loop.notifyKernelWakeHint(wake);
     const state = this.loop.snapshot();
     if (
       state.activeWait
@@ -348,12 +457,48 @@ export class SessionKernelHostRunnerV2 {
     });
   }
 
-  async reconcileFacts(): Promise<void> {
-    await this.loop.reconcileFacts();
+  async resumePlanning(
+    guidance: string[] = []
+  ): Promise<SessionKernelLoopResultV2 | undefined> {
+    const highWater =
+      this.loop.snapshot().lineage.cursor.snapshotHighWater;
+    await this.loop.reconcileFacts(highWater);
+    const state = this.loop.snapshot();
+    if (
+      state.activeWait
+      || Object.keys(state.publicRequests).length > 0
+    ) {
+      return undefined;
+    }
+    return this.runProviderTurn({
+      reason: 'recovery',
+      target: { kind: 'planning' },
+      guidance,
+    });
   }
 
-  async finalizeReview(): Promise<SessionKernelReviewV2> {
-    return this.loop.finalizeReview();
+  async reconcileFactsAfter(
+    observedHighWater: number
+  ): Promise<void> {
+    const currentHighWater =
+      this.loop.snapshot().lineage.cursor.snapshotHighWater;
+    if (
+      !Number.isSafeInteger(observedHighWater)
+      || observedHighWater < 0
+      || observedHighWater > currentHighWater
+    ) {
+      throw new SessionKernelHostRunnerError(
+        'session_kernel_facts_high_water_invalid',
+        'Facts reconciliation must bind an observed Session high-water.'
+      );
+    }
+    await this.loop.reconcileFacts(observedHighWater);
+  }
+
+  async finalizeReview(
+    expectedPlanRevision: string
+  ): Promise<SessionKernelReviewV2> {
+    return this.loop.finalizeReview(expectedPlanRevision);
   }
 
   private requireProviderPlanRecorded(
@@ -431,6 +576,33 @@ function requireAcceptedPlanRevision(
     throw new SessionKernelHostRunnerError(
       'session_kernel_plan_acceptance_required',
       'The exact current Plan revision must be durably accepted before PlanAction drive.'
+    );
+  }
+}
+
+function requireExactPlanRevision(
+  state: SessionKernelLoopStateV2,
+  expectedPlanRevision: string
+): void {
+  if (
+    !expectedPlanRevision.trim()
+    || state.plan?.planRevision !== expectedPlanRevision
+  ) {
+    throw new SessionKernelHostRunnerError(
+      'session_kernel_plan_revision_stale',
+      'Operation does not match the current persisted Plan revision.'
+    );
+  }
+}
+
+function requirePlanActionUnsettled(
+  state: SessionKernelLoopStateV2,
+  planActionId: string
+): void {
+  if (state.planActionSettlements[planActionId]) {
+    throw new SessionKernelHostRunnerError(
+      'session_kernel_plan_action_already_settled',
+      `PlanAction ${planActionId} is already settled.`
     );
   }
 }

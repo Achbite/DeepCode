@@ -22,25 +22,24 @@ export interface SessionKernelOperationLineageV2 {
   planActionId?: string;
   toolId?: string;
   leases: CapabilityLeaseRefV2[];
-  invocationIds: string[];
-  factIds: string[];
+  invocationCount: number;
+  latestInvocationId?: string;
+  factCount: number;
+  lastFactId?: string;
+  lastFactSequence?: number;
 }
 
 export interface SessionKernelInvocationLineageV2 {
   invocationId: string;
   operationId?: string;
-  attemptIds: string[];
-  factIds: string[];
-  effectIds: string[];
+  attemptCount: number;
+  latestAttemptId?: string;
+  factCount: number;
+  lastFactId?: string;
+  lastFactSequence?: number;
+  effectCount: number;
+  latestEffectId?: string;
   lastTerminalPhase?: string;
-}
-
-export interface SessionKernelFactIndexEntryV2 {
-  factId: string;
-  ledgerSequence: number;
-  runSequence: number;
-  domain: KernelFactProjectionV2['domain'];
-  kind: string;
 }
 
 export interface SessionKernelLineageStateV2 {
@@ -50,7 +49,9 @@ export interface SessionKernelLineageStateV2 {
   planActions: Record<string, SessionKernelPlanActionLineageV2>;
   operations: Record<string, SessionKernelOperationLineageV2>;
   invocations: Record<string, SessionKernelInvocationLineageV2>;
-  facts: Record<string, SessionKernelFactIndexEntryV2>;
+  factCount: number;
+  lastFactId?: string;
+  lastFactSequence?: number;
   cursor: {
     afterLedgerSequence: number;
     hasMore: boolean;
@@ -82,7 +83,7 @@ export function createSessionKernelLineageStateV2(
     planActions: {},
     operations: {},
     invocations: {},
-    facts: {},
+    factCount: 0,
     cursor: {
       afterLedgerSequence: 0,
       hasMore: false,
@@ -157,7 +158,22 @@ export function recordSessionCapabilityLeaseV2(
       `Lease ${input.lease.leaseId} version ${input.lease.version} changed scope digest.`
     );
   }
+  const newestExistingVersion = operation.leases
+    .filter((lease) => lease.leaseId === input.lease.leaseId)
+    .reduce(
+      (newest, lease) => Math.max(newest, lease.version),
+      -1
+    );
+  if (newestExistingVersion > input.lease.version) {
+    current.operations[operation.operationId] = operation;
+    return current;
+  }
   if (!existing) operation.leases.push({ ...input.lease });
+  operation.leases = operation.leases.filter(
+    (lease) =>
+      lease.leaseId !== input.lease.leaseId
+      || lease.version === input.lease.version
+  );
   operation.leases.sort(
     (left, right) => left.version - right.version
       || left.leaseId.localeCompare(right.leaseId)
@@ -234,12 +250,12 @@ export function recordSessionToolIntentSubmissionV2(
     : undefined;
   if (invocationId) {
     const latestOperation = current.operations[intent.operationId] ?? recordedOperation;
-    appendUnique(latestOperation.invocationIds, invocationId);
+    recordLatestInvocation(latestOperation, invocationId);
     const invocation = current.invocations[invocationId]
       ?? emptyInvocation(invocationId);
     bindInvocationOperation(invocation, intent.operationId);
     if (reply.kind === 'admitted') {
-      appendUnique(invocation.attemptIds, reply.data.attemptId);
+      recordLatestAttempt(invocation, reply.data.attemptId);
     }
     current.invocations[invocationId] = invocation;
   }
@@ -267,29 +283,19 @@ export function reduceSessionKernelFactsV2(
   }
   let current = cloneLineageState(state);
   for (const fact of page.facts) {
-    const existing = current.facts[fact.factId];
-    if (existing) {
-      if (
-        existing.ledgerSequence !== fact.ledgerSequence
-        || existing.runSequence !== fact.runSequence
-        || existing.domain !== fact.domain
-        || existing.kind !== fact.factKind
-      ) {
-        throw new SessionKernelLineageError(
-          'session_kernel_fact_identity_conflict',
-          `Kernel fact ${fact.factId} changed immutable envelope fields.`
-        );
-      }
-      continue;
+    if (
+      current.lastFactSequence !== undefined
+      && fact.ledgerSequence <= current.lastFactSequence
+    ) {
+      throw new SessionKernelLineageError(
+        'session_kernel_fact_sequence_invalid',
+        `Kernel fact ${fact.factId} did not advance the durable ledger sequence.`
+      );
     }
-    current.facts[fact.factId] = {
-      factId: fact.factId,
-      ledgerSequence: fact.ledgerSequence,
-      runSequence: fact.runSequence,
-      domain: fact.domain,
-      kind: fact.factKind,
-    };
     current = reduceFactLineage(current, fact);
+    current.factCount += 1;
+    current.lastFactId = fact.factId;
+    current.lastFactSequence = fact.ledgerSequence;
   }
   current.cursor = {
     afterLedgerSequence: Math.max(
@@ -348,9 +354,11 @@ function reduceFactLineage(
     if (fact.lineage.planActionIds.length === 1) {
       bindOperationPlanAction(operation, fact.lineage.planActionIds[0]!);
     }
-    appendUnique(operation.factIds, fact.factId);
+    operation.factCount += 1;
+    operation.lastFactId = fact.factId;
+    operation.lastFactSequence = fact.ledgerSequence;
     if (fact.lineage.invocationId) {
-      appendUnique(operation.invocationIds, fact.lineage.invocationId);
+      recordLatestInvocation(operation, fact.lineage.invocationId);
     }
     state.operations[operationId] = operation;
   }
@@ -359,12 +367,14 @@ function reduceFactLineage(
       ?? emptyInvocation(fact.lineage.invocationId);
     if (operationId) bindInvocationOperation(invocation, operationId);
     if (fact.lineage.attemptId) {
-      appendUnique(invocation.attemptIds, fact.lineage.attemptId);
+      recordLatestAttempt(invocation, fact.lineage.attemptId);
     }
     if (fact.lineage.effectId) {
-      appendUnique(invocation.effectIds, fact.lineage.effectId);
+      recordLatestEffect(invocation, fact.lineage.effectId);
     }
-    appendUnique(invocation.factIds, fact.factId);
+    invocation.factCount += 1;
+    invocation.lastFactId = fact.factId;
+    invocation.lastFactSequence = fact.ledgerSequence;
     state.invocations[invocation.invocationId] = invocation;
   }
   return state;
@@ -374,17 +384,17 @@ function emptyOperation(operationId: string): SessionKernelOperationLineageV2 {
   return {
     operationId: requiredIdentity(operationId, 'operationId'),
     leases: [],
-    invocationIds: [],
-    factIds: [],
+    invocationCount: 0,
+    factCount: 0,
   };
 }
 
 function emptyInvocation(invocationId: string): SessionKernelInvocationLineageV2 {
   return {
     invocationId: requiredIdentity(invocationId, 'invocationId'),
-    attemptIds: [],
-    factIds: [],
-    effectIds: [],
+    attemptCount: 0,
+    factCount: 0,
+    effectCount: 0,
   };
 }
 
@@ -435,6 +445,36 @@ function appendUnique(values: string[], value: string): void {
   if (!values.includes(identity)) values.push(identity);
 }
 
+function recordLatestInvocation(
+  operation: SessionKernelOperationLineageV2,
+  invocationId: string
+): void {
+  const identity = requiredIdentity(invocationId, 'invocationId');
+  if (operation.latestInvocationId === identity) return;
+  operation.latestInvocationId = identity;
+  operation.invocationCount += 1;
+}
+
+function recordLatestAttempt(
+  invocation: SessionKernelInvocationLineageV2,
+  attemptId: string
+): void {
+  const identity = requiredIdentity(attemptId, 'attemptId');
+  if (invocation.latestAttemptId === identity) return;
+  invocation.latestAttemptId = identity;
+  invocation.attemptCount += 1;
+}
+
+function recordLatestEffect(
+  invocation: SessionKernelInvocationLineageV2,
+  effectId: string
+): void {
+  const identity = requiredIdentity(effectId, 'effectId');
+  if (invocation.latestEffectId === identity) return;
+  invocation.latestEffectId = identity;
+  invocation.effectCount += 1;
+}
+
 function requiredIdentity(value: string, field: string): string {
   if (!value.trim()) {
     throw new SessionKernelLineageError(
@@ -475,8 +515,6 @@ function cloneLineageState(
           {
             ...value,
             leases: value.leases.map((lease) => ({ ...lease })),
-            invocationIds: [...value.invocationIds],
-            factIds: [...value.factIds],
           },
         ])
     ),
@@ -484,17 +522,8 @@ function cloneLineageState(
       Object.entries(state.invocations)
         .map(([key, value]) => [
           key,
-          {
-            ...value,
-            attemptIds: [...value.attemptIds],
-            factIds: [...value.factIds],
-            effectIds: [...value.effectIds],
-          },
+          { ...value },
         ])
-    ),
-    facts: Object.fromEntries(
-      Object.entries(state.facts)
-        .map(([key, value]) => [key, { ...value }])
     ),
     cursor: { ...state.cursor },
   };

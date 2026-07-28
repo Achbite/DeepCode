@@ -108,7 +108,9 @@ export interface SessionProviderTurnInputV2 {
   controlEpoch: number;
   currentInput: SessionUserInputRecordV2;
   conversationInputs: readonly SessionUserInputRecordV2[];
+  conversationInputOmittedCount: number;
   providerOutcomes: readonly SessionProviderOutcomeRecordV2[];
+  providerOutcomeOmittedCount: number;
   plan?: SessionNaturalLanguagePlanV2;
   planDecision?: SessionPlanDecisionV2;
   kernelFacts: SessionProviderKernelFactsProjectionV2;
@@ -248,6 +250,32 @@ export interface SessionReviewFactRefV2 {
   details: KernelFactProjectionV2['details'];
 }
 
+export interface SessionReviewFactCategoryAccumulatorV2 {
+  totalCount: number;
+  samples: SessionReviewFactRefV2[];
+}
+
+export interface SessionReviewFactAccumulatorV2 {
+  controlEpoch: number;
+  coverageAfterLedgerSequence: number;
+  scopeExpansions: SessionReviewFactCategoryAccumulatorV2;
+  actualEffects: SessionReviewFactCategoryAccumulatorV2;
+  denied: SessionReviewFactCategoryAccumulatorV2;
+  rejections: SessionReviewFactCategoryAccumulatorV2;
+  cleanup: SessionReviewFactCategoryAccumulatorV2;
+  indeterminate: SessionReviewFactCategoryAccumulatorV2;
+  priorEpochLateFacts: SessionReviewFactCategoryAccumulatorV2;
+  authorizedOperationSequences: Record<string, number>;
+  pendingCleanupByResource: Record<
+    string,
+    {
+      factId: string;
+      ledgerSequence: number;
+      factKind: string;
+    }
+  >;
+}
+
 export interface SessionReviewPlannedActionV2 {
   taskId: string;
   planActionId: string;
@@ -266,6 +294,7 @@ export interface SessionKernelReviewV2 {
     narrative: string;
     recordedAt: string;
   };
+  planActionSettlementDigest: string;
   snapshotHighWater: number;
   planned: SessionReviewPlannedActionV2[];
   scopeExpansions: SessionReviewFactRefV2[];
@@ -273,19 +302,55 @@ export interface SessionKernelReviewV2 {
   unexecuted: SessionReviewPlannedActionV2[];
   denied: SessionReviewFactRefV2[];
   rejections: SessionReviewFactRefV2[];
-  skipped: SessionPlanActionSettlementV2[];
+  skipped: Array<
+    Extract<SessionPlanActionSettlementV2, { kind: 'skipped' }>
+  >;
+  completions: Array<
+    Extract<SessionPlanActionSettlementV2, { kind: 'completed' }>
+  >;
   cleanup: SessionReviewFactRefV2[];
   indeterminate: SessionReviewFactRefV2[];
+  priorEpochLateFacts: SessionReviewFactRefV2[];
+  factCoverage: {
+    scopeExpansions: SessionReviewFactCoverageV2;
+    actualEffects: SessionReviewFactCoverageV2;
+    denied: SessionReviewFactCoverageV2;
+    rejections: SessionReviewFactCoverageV2;
+    cleanup: SessionReviewFactCoverageV2;
+    indeterminate: SessionReviewFactCoverageV2;
+    priorEpochLateFacts: SessionReviewFactCoverageV2;
+  };
+  factsQuery: {
+    runId: string;
+    controlEpoch: number;
+    afterLedgerSequence: number;
+    snapshotHighWater: number;
+  };
+  pendingCleanupCount: number;
   createdAt: string;
   finalizedAt?: string;
 }
 
-export interface SessionPlanActionSettlementV2 {
-  kind: 'skipped';
-  planActionId: string;
-  reason: string;
-  recordedAt: string;
+export interface SessionReviewFactCoverageV2 {
+  totalCount: number;
+  retainedCount: number;
+  omittedCount: number;
 }
+
+export type SessionPlanActionSettlementV2 =
+  | {
+      kind: 'skipped';
+      planActionId: string;
+      reason: string;
+      recordedAt: string;
+    }
+  | {
+      kind: 'completed';
+      planActionId: string;
+      completionKind: 'answer' | 'noTool';
+      providerTurnId: string;
+      recordedAt: string;
+    };
 
 export interface SessionKernelProjectionEventV2 {
   /**
@@ -309,6 +374,7 @@ export interface SessionKernelProjectionEventV2 {
     | 'authorization.decided'
     | 'review.revised'
     | 'planAction.skipped'
+    | 'planAction.completed'
     | 'wait.changed'
     | 'diagnostic';
   data: unknown;
