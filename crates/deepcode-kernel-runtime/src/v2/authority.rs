@@ -33,18 +33,16 @@ use deepcode_kernel_abi::v2_command::{
     InvocationCancelReplyV2, InvocationCancelV2, KernelErrorV2, KernelReplyV2,
     MutationCommandKindV2, RecordedCommandErrorV2, StorageFaultCodeV2, ToolIntentSubmitReplyV2,
 };
-use deepcode_kernel_abi::ToolIdV2;
 use deepcode_kernel_abi::{CanonicalArgumentsDigestV2, ToolContractDigestV2};
+use deepcode_kernel_abi::{ToolAvailabilityV2, ToolIdV2};
 use deepcode_kernel_tools::{
-    normalize_canonical_platform_path_v4, validate_canonical_invocation_v4,
-    LocalAuthorityToolCatalogV4,
+    normalize_canonical_platform_path, validate_canonical_invocation, KernelToolRegistry,
 };
 use deepcode_kernel_tools::{
-    output_payload_measure_v4, AuthorityToolIdV4, DeadlineV4, DeleteTargetV4, DocumentPagesV4,
-    ExecutionAvailabilityV4, LineRangeV4, NetworkPublicTargetV4, OutputTruncationV4,
-    PathEntrySizeV4, PathEntryV4, SearchMatchV4, SearchStrategyV4, TextMediaTypeV4,
-    ToolInvocationInputV4, ToolOutputPayloadV4, ToolOutputV4, WebSearchItemV4,
-    WorkspaceObjectKindV4,
+    output_payload_measure_v4, AuthorityToolIdV4, DeleteTargetV4, DocumentPagesV4, LineRangeV4,
+    NetworkPublicTargetV4, OutputTruncationV4, PathEntrySizeV4, PathEntryV4, SearchMatchV4,
+    SearchStrategyV4, TextMediaTypeV4, ToolInvocationInputV4, ToolOutputPayloadV4, ToolOutputV4,
+    WebSearchItemV4, WorkspaceObjectKindV4,
 };
 use std::collections::HashMap;
 use std::fs;
@@ -234,7 +232,7 @@ pub(super) fn resolve_workspace_binding(path: &Path) -> AuthorityResult<Workspac
     let raw = canonical_root.to_str().ok_or_else(|| {
         invalid_field("workspaceRoot", InvalidFieldViolationV2::MalformedIdentity)
     })?;
-    let canonical_root_utf8 = normalize_canonical_platform_path_v4(platform, raw)
+    let canonical_root_utf8 = normalize_canonical_platform_path(platform, raw)
         .map_err(|_| invalid_field("workspaceRoot", InvalidFieldViolationV2::MalformedIdentity))?;
     let digest =
         workspace_binding_digest_v2(platform, &canonical_root_utf8).map_err(|_| storage_fault())?;
@@ -254,23 +252,32 @@ pub(super) fn prepare_direct_tool_intent(
     canonical_invocation: &ToolInvocationInputV4,
     deadline: DeadlineRequestV2,
     correlation_refs: Vec<CorrelationRefV2>,
-    catalog: &LocalAuthorityToolCatalogV4,
+    registry: &KernelToolRegistry,
     workspace: &WorkspaceBinding,
     executor_config: &KernelExecutorConfig,
 ) -> Result<PreparedDirectToolIntent, PrepareFailure> {
-    validate_canonical_invocation_v4(canonical_invocation)
+    validate_canonical_invocation(canonical_invocation)
         .map_err(|_| invalid_field("canonicalInvocation", InvalidFieldViolationV2::OutOfRange))?;
     let tool_id = canonical_invocation.tool_id();
-    let contract = catalog.contract(tool_id);
-    if contract.execution_availability != ExecutionAvailabilityV4::Ready
-        || catalog.ready_binding(tool_id).is_none()
+    let Some(registration) = registry.get(tool_id.as_str()) else {
+        return Err(PrepareFailure::Kernel(invalid_field(
+            "toolId",
+            InvalidFieldViolationV2::OutOfRange,
+        )));
+    };
+    if registration.descriptor_v2.availability != ToolAvailabilityV2::Ready
+        || registration.executor_binding.is_none()
     {
         return Err(PrepareFailure::Kernel(invalid_field(
             "toolId",
             InvalidFieldViolationV2::OutOfRange,
         )));
     }
-    let effective_deadline_ms = materialize_deadline(deadline, &contract.deadline)?;
+    let effective_deadline_ms = materialize_deadline(
+        deadline,
+        registration.admission_v2.default_deadline_ms,
+        registration.admission_v2.maximum_deadline_ms,
+    )?;
     let correlations = CorrelationSetV2::materialize(correlation_refs)
         .map_err(|_| invalid_field("correlationRefs", InvalidFieldViolationV2::Unsorted))?;
     let idempotency_key_hash = idempotency_key_hash_v2(run_id, idempotency_key)
@@ -1519,20 +1526,19 @@ fn serialized_fits(payload: &ToolOutputPayloadV4, maximum: usize) -> Option<bool
 
 fn materialize_deadline(
     request: DeadlineRequestV2,
-    contract: &DeadlineV4,
+    default_ms: u32,
+    maximum_ms: u32,
 ) -> Result<u32, PrepareFailure> {
     match request {
-        DeadlineRequestV2::ContractDefault {} => Ok(contract.default_ms),
-        DeadlineRequestV2::ExactMilliseconds { value }
-            if value > 0 && value <= contract.maximum_ms =>
-        {
+        DeadlineRequestV2::ContractDefault {} => Ok(default_ms),
+        DeadlineRequestV2::ExactMilliseconds { value } if value > 0 && value <= maximum_ms => {
             Ok(value)
         }
         DeadlineRequestV2::ExactMilliseconds { value } => {
             Err(PrepareFailure::Kernel(KernelErrorV2::InvalidRequest {
                 reason: InvalidRequestReasonV2::DeadlineOutOfContract {
                     requested_ms: value,
-                    maximum_ms: contract.maximum_ms,
+                    maximum_ms,
                 },
             }))
         }
@@ -1736,7 +1742,7 @@ fn resolve_workspace_target(
         .to_str()
         .ok_or_else(|| PrepareFailure::Target(TargetResolutionFailure::ResolverUnavailable))?;
     let canonical_absolute_path_utf8 =
-        normalize_canonical_platform_path_v4(workspace.platform, raw)
+        normalize_canonical_platform_path(workspace.platform, raw)
             .map_err(|_| PrepareFailure::Target(TargetResolutionFailure::ResolverUnavailable))?;
     let canonical_relative_path = canonical_target
         .strip_prefix(&workspace.canonical_root)
@@ -2579,7 +2585,7 @@ impl AuthorityState {
                 ..
             } => {
                 let run = self.runs.get(&identity.run_id).ok_or_else(corrupt_store)?;
-                let legacy_tool_id = legacy_tool_id(tool_id).ok_or_else(corrupt_store)?;
+                let private_tool_kind = private_tool_kind(tool_id).ok_or_else(corrupt_store)?;
                 if run.epoch != identity.control_epoch
                     || run.active_invocation_id.is_some()
                     || *effective_deadline_ms == 0
@@ -2620,7 +2626,7 @@ impl AuthorityState {
                         invocation_id: identity.invocation_id.clone(),
                         attempt_id: identity.attempt_id.clone(),
                         idempotency_key_hash: identity.idempotency_key_hash.clone(),
-                        legacy_tool_id,
+                        private_tool_kind,
                         resource_scope: resource_scope.clone(),
                         workspace_binding_digest: workspace_binding_digest.clone(),
                         correlations: identity.correlation_set.clone(),
@@ -3057,10 +3063,10 @@ fn resource_matches_scope(resource: &ResolvedResourceV2, scope: &ResourceScopeV2
     }
 }
 
-fn legacy_tool_id(tool_id: &ToolIdV2) -> Option<AuthorityToolIdV4> {
-    AuthorityToolIdV4::ALL
-        .into_iter()
-        .find(|candidate| candidate.as_str() == tool_id.as_str())
+fn private_tool_kind(tool_id: &ToolIdV2) -> Option<AuthorityToolIdV4> {
+    crate::kernel_tool_registry()
+        .get_v2(tool_id)
+        .map(|registration| registration.private_tool_kind())
 }
 
 fn expected_resource_count(scope: &ResourceScopeV2) -> AuthorityResult<usize> {
@@ -3226,9 +3232,9 @@ fn validate_direct_effect(state: &AuthorityState, fact: &EffectFactV2) -> Author
     };
     let evidence_matches = match mode {
         EffectModeRef::Indeterminate => {
-            indeterminate_evidence_legal(invocation.legacy_tool_id, evidence)
+            indeterminate_evidence_legal(invocation.private_tool_kind, evidence)
         }
-        _ => observed_evidence_legal(invocation.legacy_tool_id, evidence),
+        _ => observed_evidence_legal(invocation.private_tool_kind, evidence),
     };
     if invocation.phase != InvocationPhase::Executing
         || !direct_effect_identity_matches_invocation(identity, invocation)

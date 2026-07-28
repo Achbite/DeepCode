@@ -160,11 +160,7 @@ fn canonical_invocation(
     let canonical = crate::kernel_tool_registry()
         .canonicalize_v2(tool_id, raw_arguments.clone())
         .map_err(|_| invalid_field("rawArguments", InvalidFieldViolationV2::OutOfRange))?;
-    let mut invocation = serde_json::from_value(json!({
-        "toolId": canonical.tool_id,
-        "arguments": canonical.arguments,
-    }))
-    .map_err(|_| invalid_field("rawArguments", InvalidFieldViolationV2::OutOfRange))?;
+    let mut invocation = canonical.invocation;
     match &mut invocation {
         ToolInvocationInputV4::WebSearch { query, .. } => {
             *query = query.trim().to_owned();

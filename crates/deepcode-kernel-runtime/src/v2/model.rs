@@ -88,7 +88,7 @@ pub(super) struct DirectInvocationRecord {
     pub(super) invocation_id: InvocationId,
     pub(super) attempt_id: AttemptId,
     pub(super) idempotency_key_hash: IdempotencyKeyHashV2,
-    pub(super) legacy_tool_id: AuthorityToolIdV4,
+    pub(super) private_tool_kind: AuthorityToolIdV4,
     pub(super) resource_scope: ResourceScopeV2,
     pub(super) workspace_binding_digest: WorkspaceBindingDigestV2,
     pub(super) correlations: CorrelationSetV2,

@@ -42,7 +42,6 @@ use deepcode_kernel_ledger::v2::{
     FactQueryContinuationDraftV2, FactQueryContinuationExpectationV2, OutboxPublisherLease,
     PublicCommandReceiptV2, PutFactQueryContinuationOutcomeV2, PutPublicCommandReceiptOutcomeV2,
 };
-use deepcode_kernel_tools::LocalAuthorityToolCatalogV4;
 use deepcode_kernel_tools::ToolInvocationInputV4;
 use std::collections::HashMap;
 use std::path::Path;
@@ -98,7 +97,6 @@ struct ServiceInner {
     writer: Mutex<AuthorityFactWriterLease>,
     reader: CanonicalFactReader,
     _publisher: OutboxPublisherLease,
-    catalog: LocalAuthorityToolCatalogV4,
     workspaces: Mutex<HashMap<RunId, WorkspaceBinding>>,
     executor_config: KernelExecutorConfig,
     executors: Arc<KernelExecutorRegistry>,
@@ -244,8 +242,6 @@ impl AuthorityService {
         let publisher = store
             .claim_outbox_publisher()
             .map_err(|_| storage_fault())?;
-        let catalog =
-            LocalAuthorityToolCatalogV4::from_builtin_registry().map_err(|_| corrupt_store())?;
         let executors = Arc::new(KernelExecutorRegistry::from_executors(builtin_executors(
             crate::kernel_tool_registry(),
             executor_config.clone(),
@@ -257,7 +253,6 @@ impl AuthorityService {
                 writer: Mutex::new(writer),
                 reader,
                 _publisher: publisher,
-                catalog,
                 workspaces: Mutex::new(HashMap::new()),
                 executor_config,
                 executors,
@@ -335,7 +330,7 @@ impl AuthorityService {
             canonical_invocation,
             deadline,
             correlation_refs,
-            &self.inner.catalog,
+            crate::kernel_tool_registry(),
             &workspace,
             &self.inner.executor_config,
         )
@@ -824,7 +819,7 @@ impl AuthorityService {
             &request.canonical_invocation,
             request.deadline,
             correlation_refs,
-            &self.inner.catalog,
+            crate::kernel_tool_registry(),
             &workspace,
             &self.inner.executor_config,
         )
@@ -1016,7 +1011,7 @@ impl AuthorityService {
             &request.canonical_invocation,
             request.deadline,
             correlation_refs,
-            &self.inner.catalog,
+            crate::kernel_tool_registry(),
             &workspace,
             &self.inner.executor_config,
         )

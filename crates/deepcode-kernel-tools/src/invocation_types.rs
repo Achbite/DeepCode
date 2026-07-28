@@ -2,24 +2,15 @@ use deepcode_kernel_abi::v2::{
     NetworkOriginV2, NetworkTargetObservationDigestV2, ResourceStateDigestV2, ToolOutputDigestV2,
     V2ValidationError,
 };
-use serde::{Deserialize, Deserializer, Serialize};
-use serde_json::Value;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-pub(crate) const KERNEL_TOOL_CATALOG_V4_VERSION: &str = "deepcode.kernel.tools.v4";
-
-pub const MAX_CANONICAL_INVOCATION_BYTES_V4: usize = 1024 * 1024;
-pub const MAX_INVOCATION_SCHEMA_BYTES_V4: usize = 64 * 1024;
-pub const MAX_TOOL_CATALOG_BYTES_V4: usize = 2 * 1024 * 1024;
+pub const MAX_CANONICAL_INVOCATION_BYTES: usize = 1024 * 1024;
 const MAX_LIST_ITEMS_V4: usize = 256;
 const MAX_ORDINARY_STRING_BYTES_V4: usize = 16 * 1024;
 
 fn empty_field(field: &'static str) -> V2ValidationError {
     V2ValidationError::EmptyField { field }
-}
-
-fn zero_value(field: &'static str) -> V2ValidationError {
-    V2ValidationError::ZeroValue { field }
 }
 
 fn field_too_large(field: &'static str, maximum_bytes: usize) -> V2ValidationError {
@@ -56,57 +47,6 @@ fn encoded_digest(bytes: [u8; 32]) -> String {
     }
     encoded
 }
-
-macro_rules! digest_type {
-    ($name:ident) => {
-        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-        #[serde(transparent)]
-        pub struct $name(String);
-
-        impl $name {
-            pub fn parse(value: impl Into<String>) -> Result<Self, V2ValidationError> {
-                let value = value.into();
-                let valid = value.strip_prefix("sha256:").is_some_and(|hex| {
-                    hex.len() == 64
-                        && hex
-                            .as_bytes()
-                            .iter()
-                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
-                });
-                if !valid {
-                    return Err(invalid_value(
-                        stringify!($name),
-                        "must be sha256:<64 lowercase hex>",
-                    ));
-                }
-                Ok(Self(value))
-            }
-
-            pub(crate) fn from_raw_digest(bytes: [u8; 32]) -> Self {
-                const HEX: &[u8; 16] = b"0123456789abcdef";
-                let mut encoded = String::with_capacity(71);
-                encoded.push_str("sha256:");
-                for byte in bytes {
-                    encoded.push(char::from(HEX[(byte >> 4) as usize]));
-                    encoded.push(char::from(HEX[(byte & 0x0f) as usize]));
-                }
-                Self(encoded)
-            }
-        }
-
-        impl<'de> Deserialize<'de> for $name {
-            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-            where
-                D: Deserializer<'de>,
-            {
-                Self::parse(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
-            }
-        }
-    };
-}
-
-digest_type!(ToolCatalogDigestV4);
-digest_type!(ToolContractDigestV4);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum AuthorityToolIdV4 {
@@ -151,28 +91,6 @@ pub enum AuthorityToolIdV4 {
 }
 
 impl AuthorityToolIdV4 {
-    pub const ALL: [Self; 19] = [
-        Self::CodeGrep,
-        Self::DocumentRead,
-        Self::FsCreate,
-        Self::FsDelete,
-        Self::FsDiff,
-        Self::FsEdit,
-        Self::FsEnsureDirectory,
-        Self::FsGlob,
-        Self::FsList,
-        Self::FsRead,
-        Self::FsRename,
-        Self::FsWrite,
-        Self::GitCommit,
-        Self::GitDiff,
-        Self::GitStage,
-        Self::GitStatus,
-        Self::GitUnstage,
-        Self::WebFetch,
-        Self::WebSearch,
-    ];
-
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::CodeGrep => "code.grep",
@@ -195,298 +113,6 @@ impl AuthorityToolIdV4 {
             Self::WebFetch => "web.fetch",
             Self::WebSearch => "web.search",
         }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum ExecutionAvailabilityV4 {
-    Ready,
-    Blocked,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum EffectClassV4 {
-    Read,
-    Mutation,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum EffectScopeV4 {
-    WorkspaceRead,
-    WorkspaceWrite,
-    RepositoryRead,
-    RepositoryIndexWrite,
-    RepositoryHistoryWrite,
-    NetworkRead,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum ToolRiskV4 {
-    Low,
-    Medium,
-    High,
-    Critical,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum ResourceAccessV4 {
-    Read,
-    Write,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum TargetExistenceV4 {
-    MustExist,
-    MustNotExist,
-    MayExist,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum WorkspaceObjectKindV4 {
-    File,
-    Directory,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum RepositoryAreaV4 {
-    State,
-    Index,
-    History,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum EndpointKindRelationV4 {
-    SameAsSource,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum OverwritePolicyV4 {
-    Forbidden,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct PathEndpointConstraintV4 {
-    pub access: ResourceAccessV4,
-    pub existence: TargetExistenceV4,
-    pub allowed_kinds: Vec<WorkspaceObjectKindV4>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(
-    tag = "kind",
-    content = "data",
-    rename_all = "camelCase",
-    rename_all_fields = "camelCase",
-    deny_unknown_fields
-)]
-pub enum ResourceConstraintV4 {
-    WorkspacePath {
-        access: ResourceAccessV4,
-        existence: TargetExistenceV4,
-        allowed_kinds: Vec<WorkspaceObjectKindV4>,
-    },
-    WorkspacePathPair {
-        source: PathEndpointConstraintV4,
-        destination: PathEndpointConstraintV4,
-        kind_relation: EndpointKindRelationV4,
-        overwrite: OverwritePolicyV4,
-    },
-    WorkspaceSearch {
-        root_existence: TargetExistenceV4,
-    },
-    Repository {
-        access: ResourceAccessV4,
-        area: RepositoryAreaV4,
-    },
-    NetworkQuery {},
-    NetworkUrl {},
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum CancellationV4 {
-    Unavailable,
-    BeforeEffectOnly,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum IdempotencyV4 {
-    ReadOnlyObservation,
-    MutationGuarded,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct DeadlineV4 {
-    pub default_ms: u32,
-    pub maximum_ms: u32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum VerificationV4 {
-    OutputDigest,
-    FileContentReadBack,
-    TargetAbsenceReadBack,
-    DirectoryTypeReadBack,
-    RenameReadBack,
-    RepositoryStateReadBack,
-    ResponseDigestAndReviewedTarget,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum RollbackV4 {
-    NotApplicable,
-    NotProvided,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct OutputBudgetV4 {
-    pub maximum_canonical_bytes: u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CleanupV4 {
-    pub required: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(transparent)]
-pub struct InvocationInputSchemaV4(Value);
-
-impl InvocationInputSchemaV4 {
-    pub fn new(value: Value) -> Result<Self, V2ValidationError> {
-        validate_schema(&value, 0)?;
-        let bytes = serde_json::to_vec(&value)
-            .map_err(|_| invalid_value("invocationInput", "must serialize"))?;
-        if bytes.len() > MAX_INVOCATION_SCHEMA_BYTES_V4 {
-            return Err(field_too_large(
-                "invocationInput",
-                MAX_INVOCATION_SCHEMA_BYTES_V4,
-            ));
-        }
-        Ok(Self(value))
-    }
-}
-
-impl<'de> Deserialize<'de> for InvocationInputSchemaV4 {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        Self::new(Value::deserialize(deserializer)?).map_err(serde::de::Error::custom)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ToolContractV4 {
-    pub tool_id: AuthorityToolIdV4,
-    pub execution_availability: ExecutionAvailabilityV4,
-    pub effect_class: EffectClassV4,
-    pub effect_scope: EffectScopeV4,
-    pub risk: ToolRiskV4,
-    pub resource_constraint: ResourceConstraintV4,
-    pub cancellation: CancellationV4,
-    pub idempotency: IdempotencyV4,
-    pub deadline: DeadlineV4,
-    pub verification: VerificationV4,
-    pub rollback: RollbackV4,
-    pub output_budget: OutputBudgetV4,
-    pub cleanup: CleanupV4,
-    pub invocation_input: InvocationInputSchemaV4,
-    pub contract_digest: ToolContractDigestV4,
-}
-
-impl ToolContractV4 {
-    pub fn validate(&self) -> Result<(), V2ValidationError> {
-        if self.deadline.default_ms == 0
-            || self.deadline.maximum_ms == 0
-            || self.deadline.default_ms > self.deadline.maximum_ms
-        {
-            return Err(invalid_value(
-                "deadline",
-                "requires 0 < defaultMs <= maximumMs",
-            ));
-        }
-        if self.output_budget.maximum_canonical_bytes == 0 {
-            return Err(zero_value("outputBudget.maximumCanonicalBytes"));
-        }
-        if self.cleanup.required {
-            return Err(invalid_value(
-                "cleanup.required",
-                "must be false in the v4 catalog",
-            ));
-        }
-        validate_resource_constraint(&self.resource_constraint)?;
-        if tool_contract_digest_v4(self)? != self.contract_digest {
-            return Err(invalid_value(
-                "contractDigest",
-                "does not match contract content",
-            ));
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ToolCatalogV4 {
-    pub catalog_version: String,
-    pub tools: Vec<ToolContractV4>,
-    pub catalog_digest: ToolCatalogDigestV4,
-}
-
-impl ToolCatalogV4 {
-    pub fn validate(&self) -> Result<(), V2ValidationError> {
-        if self.catalog_version != KERNEL_TOOL_CATALOG_V4_VERSION {
-            return Err(invalid_value(
-                "catalogVersion",
-                "must be deepcode.kernel.tools.v4",
-            ));
-        }
-        if self.tools.len() != AuthorityToolIdV4::ALL.len() {
-            return Err(invalid_value(
-                "tools",
-                "must contain exactly the 19 v4 identities",
-            ));
-        }
-        for (contract, expected) in self.tools.iter().zip(AuthorityToolIdV4::ALL) {
-            if contract.tool_id != expected {
-                return Err(invalid_value(
-                    "tools",
-                    "must use exact lexical identity order",
-                ));
-            }
-            contract.validate()?;
-        }
-        if tool_catalog_digest_v4(&self.tools)? != self.catalog_digest {
-            return Err(invalid_value(
-                "catalogDigest",
-                "does not match contract leaves",
-            ));
-        }
-        let bytes =
-            serde_json::to_vec(self).map_err(|_| invalid_value("catalog", "must serialize"))?;
-        if bytes.len() > MAX_TOOL_CATALOG_BYTES_V4 {
-            return Err(field_too_large("catalog", MAX_TOOL_CATALOG_BYTES_V4));
-        }
-        Ok(())
     }
 }
 
@@ -695,10 +321,10 @@ impl ToolInvocationInputV4 {
     pub fn validate(&self) -> Result<(), V2ValidationError> {
         let encoded = serde_json::to_vec(self)
             .map_err(|_| invalid_value("canonicalInvocation", "must serialize"))?;
-        if encoded.len() > MAX_CANONICAL_INVOCATION_BYTES_V4 {
+        if encoded.len() > MAX_CANONICAL_INVOCATION_BYTES {
             return Err(field_too_large(
                 "canonicalInvocation",
-                MAX_CANONICAL_INVOCATION_BYTES_V4,
+                MAX_CANONICAL_INVOCATION_BYTES,
             ));
         }
         match self {
@@ -826,6 +452,13 @@ pub enum TextMediaTypeV4 {
     TextDocumentUtf8,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WorkspaceObjectKindV4 {
+    File,
+    Directory,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
     tag = "kind",
@@ -924,51 +557,6 @@ pub struct ToolOutputV4 {
     pub payload: ToolOutputPayloadV4,
 }
 
-pub fn tool_contract_digest_v4(
-    contract: &ToolContractV4,
-) -> Result<ToolContractDigestV4, V2ValidationError> {
-    Ok(ToolContractDigestV4::from_raw_digest(typed_digest(
-        "deepcode.kernel.tools.v4/contract",
-        &serde_json::json!({
-            "toolId":contract.tool_id,
-            "executionAvailability":contract.execution_availability,
-            "effectClass":contract.effect_class,
-            "effectScope":contract.effect_scope,
-            "risk":contract.risk,
-            "resourceConstraint":contract.resource_constraint,
-            "cancellation":contract.cancellation,
-            "idempotency":contract.idempotency,
-            "deadline":contract.deadline,
-            "verification":contract.verification,
-            "rollback":contract.rollback,
-            "outputBudget":contract.output_budget,
-            "cleanup":contract.cleanup,
-            "invocationInput":contract.invocation_input,
-        }),
-    )?))
-}
-
-pub fn tool_catalog_digest_v4(
-    contracts: &[ToolContractV4],
-) -> Result<ToolCatalogDigestV4, V2ValidationError> {
-    let leaves = contracts
-        .iter()
-        .map(|contract| {
-            serde_json::json!({
-                "toolId":contract.tool_id,
-                "contractDigest":contract.contract_digest,
-            })
-        })
-        .collect::<Vec<_>>();
-    Ok(ToolCatalogDigestV4::from_raw_digest(typed_digest(
-        "deepcode.kernel.tools.v4/catalog",
-        &serde_json::json!({
-            "catalogVersion":KERNEL_TOOL_CATALOG_V4_VERSION,
-            "contracts":leaves,
-        }),
-    )?))
-}
-
 pub fn tool_output_digest_v4(
     tool_id: AuthorityToolIdV4,
     payload: &ToolOutputPayloadV4,
@@ -995,90 +583,6 @@ pub fn output_payload_measure_v4(
         truncation: OutputTruncationV4::Complete {},
         payload,
     })
-}
-
-fn validate_schema(value: &Value, depth: usize) -> Result<(), V2ValidationError> {
-    if depth > 32 {
-        return Err(invalid_value(
-            "invocationInput",
-            "schema nesting exceeds 32",
-        ));
-    }
-    match value {
-        Value::Object(object) => {
-            const ALLOWED: &[&str] = &[
-                "type",
-                "properties",
-                "required",
-                "additionalProperties",
-                "items",
-                "enum",
-                "const",
-                "minimum",
-                "maximum",
-                "minItems",
-                "maxItems",
-                "uniqueItems",
-                "oneOf",
-            ];
-            for (key, child) in object {
-                if !ALLOWED.contains(&key.as_str()) {
-                    return Err(invalid_value(
-                        "invocationInput",
-                        "contains an unsupported schema keyword",
-                    ));
-                }
-                validate_schema(child, depth + 1)?;
-            }
-        }
-        Value::Array(values) => {
-            for child in values {
-                validate_schema(child, depth + 1)?;
-            }
-        }
-        Value::Number(number) if number.as_u64().is_none() => {
-            return Err(invalid_value(
-                "invocationInput",
-                "contains a negative or floating-point number",
-            ));
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-fn validate_resource_constraint(value: &ResourceConstraintV4) -> Result<(), V2ValidationError> {
-    let validate_kinds = |kinds: &[WorkspaceObjectKindV4]| {
-        if kinds.is_empty() {
-            return Err(empty_field("allowedKinds"));
-        }
-        if !kinds.windows(2).all(|pair| pair[0] < pair[1]) {
-            return Err(invalid_value("allowedKinds", "must be sorted and unique"));
-        }
-        Ok(())
-    };
-    match value {
-        ResourceConstraintV4::WorkspacePath { allowed_kinds, .. } => validate_kinds(allowed_kinds),
-        ResourceConstraintV4::WorkspacePathPair {
-            source,
-            destination,
-            kind_relation,
-            overwrite,
-        } => {
-            validate_kinds(&source.allowed_kinds)?;
-            validate_kinds(&destination.allowed_kinds)?;
-            if *kind_relation != EndpointKindRelationV4::SameAsSource
-                || *overwrite != OverwritePolicyV4::Forbidden
-            {
-                return Err(invalid_value(
-                    "workspacePathPair",
-                    "must preserve same-kind and no-overwrite semantics",
-                ));
-            }
-            Ok(())
-        }
-        _ => Ok(()),
-    }
 }
 
 fn validate_path(value: &str, allow_dot: bool) -> Result<(), V2ValidationError> {

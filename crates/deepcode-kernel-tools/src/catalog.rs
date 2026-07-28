@@ -34,6 +34,7 @@ pub struct CanonicalToolInvocationV2 {
     pub tool_id: ToolIdV2,
     pub arguments: Value,
     pub arguments_digest: CanonicalArgumentsDigestV2,
+    pub invocation: crate::ToolInvocationInputV4,
 }
 
 #[derive(Debug, Clone)]
@@ -80,6 +81,43 @@ impl KernelToolRegistry {
             ready, 13,
             "compiled Kernel registry must expose exactly 13 ready tools"
         );
+        let executable = registrations
+            .values()
+            .filter(|registration| registration.executor_binding.is_some())
+            .count();
+        assert_eq!(
+            executable, 13,
+            "only the frozen 13 ready tools may install executors"
+        );
+        let disabled = registrations
+            .values()
+            .filter(|registration| {
+                registration.descriptor_v2.availability == ToolAvailabilityV2::Disabled
+            })
+            .map(KernelToolRegistration::tool_id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            disabled,
+            vec![
+                "fs.rename",
+                "git.commit",
+                "git.diff",
+                "git.stage",
+                "git.status",
+                "git.unstage",
+            ],
+            "compiled Kernel registry must preserve the frozen six disabled identities"
+        );
+        for registration in registrations.values() {
+            let ready = registration.descriptor_v2.availability == ToolAvailabilityV2::Ready;
+            assert_eq!(
+                ready,
+                registration.executor_binding.is_some()
+                    && registration.execution_mode() == crate::OperationExecutionMode::Execute,
+                "tool availability and executor binding diverged for {}",
+                registration.tool_id()
+            );
+        }
         Self {
             registrations,
             operation_index,
@@ -193,16 +231,24 @@ impl KernelToolRegistry {
                 tool_id.to_string(),
             ));
         }
-        let arguments = (registration.canonicalize_arguments_v2)(raw_arguments.into_value())
+        let invocation = (registration.canonicalize_invocation)(raw_arguments.into_value())
             .map_err(|reason| KernelToolRegistryErrorV2::InvalidArguments {
                 tool_id: tool_id.to_string(),
                 reason,
+            })?;
+        let arguments = serde_json::to_value(&invocation)
+            .ok()
+            .and_then(|value| value.get("arguments").cloned())
+            .ok_or_else(|| KernelToolRegistryErrorV2::InvalidArguments {
+                tool_id: tool_id.to_string(),
+                reason: "private invocation adapter omitted canonical arguments".to_owned(),
             })?;
         let arguments_digest = canonical_arguments_digest_v2(tool_id, &arguments)?;
         Ok(CanonicalToolInvocationV2 {
             tool_id: tool_id.clone(),
             arguments,
             arguments_digest,
+            invocation,
         })
     }
 

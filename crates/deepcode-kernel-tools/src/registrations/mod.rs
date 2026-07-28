@@ -3,11 +3,10 @@ mod schema;
 
 use self::builder::build_tool_contract;
 use self::schema::provider_schema_for_operation;
-use crate::runtime_adapter_v4::AuthorityToolIdV4;
 use crate::{
-    authority_descriptor_v4, normalize_invocation_v4, AuthorityToolDescriptorV4,
-    KernelExecutorBinding, KernelToolContract, OperationExecutionMode, ToolFamily,
-    ToolOperationKind, ToolPermissionMode, ToolRiskLevel,
+    canonicalize_invocation, AuthorityToolIdV4, KernelExecutorBinding, KernelToolContract,
+    OperationExecutionMode, ToolFamily, ToolInvocationInputV4, ToolOperationKind,
+    ToolPermissionMode, ToolRiskLevel,
 };
 use deepcode_kernel_abi::{
     ToolAvailabilityV2, ToolDescriptorV2, ToolEffectClassV2, ToolEffectScopeV2, ToolIdV2,
@@ -15,7 +14,7 @@ use deepcode_kernel_abi::{
 };
 use serde_json::Value;
 
-pub type KernelArgumentsCanonicalizerV2 = fn(Value) -> Result<Value, String>;
+pub type KernelInvocationCanonicalizer = fn(Value) -> Result<ToolInvocationInputV4, String>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KernelExecutionAdapterV2 {
@@ -40,9 +39,9 @@ pub struct KernelToolRegistration {
     pub contract: KernelToolContract,
     pub descriptor_v2: ToolDescriptorV2,
     pub executor_binding: Option<KernelExecutorBinding>,
-    pub canonicalize_arguments_v2: KernelArgumentsCanonicalizerV2,
+    pub canonicalize_invocation: KernelInvocationCanonicalizer,
     pub admission_v2: KernelAdmissionMetadataV2,
-    pub(crate) authority_v4: Option<AuthorityToolDescriptorV4>,
+    private_tool_kind: AuthorityToolIdV4,
 }
 
 #[derive(Clone, Copy)]
@@ -146,6 +145,10 @@ impl KernelToolRegistration {
 
     pub fn read_only(&self) -> bool {
         self.contract.resource.read_only
+    }
+
+    pub fn private_tool_kind(&self) -> AuthorityToolIdV4 {
+        self.private_tool_kind
     }
 }
 
@@ -432,49 +435,44 @@ fn registered_tool(
         contract,
         descriptor_v2,
         executor_binding,
-        canonicalize_arguments_v2: canonicalizer_for(identity.operation_kind),
+        canonicalize_invocation: canonicalizer_for(identity.operation_kind),
         admission_v2: admission_metadata_v2(identity.operation_kind, resources.read_only),
-        authority_v4: authority_descriptor_v4(identity.tool_id),
+        private_tool_kind: private_tool_kind_for(identity.operation_kind),
     }
 }
 
-macro_rules! legacy_canonicalizer {
+macro_rules! invocation_canonicalizer {
     ($name:ident, $tool:expr) => {
-        fn $name(arguments: Value) -> Result<Value, String> {
-            let canonical =
-                normalize_invocation_v4($tool, arguments).map_err(|error| error.to_string())?;
-            serde_json::to_value(canonical)
-                .ok()
-                .and_then(|value| value.get("arguments").cloned())
-                .ok_or_else(|| "canonical adapter omitted arguments".to_owned())
+        fn $name(arguments: Value) -> Result<ToolInvocationInputV4, String> {
+            canonicalize_invocation($tool, arguments).map_err(|error| error.to_string())
         }
     };
 }
 
-legacy_canonicalizer!(canonicalize_fs_read, AuthorityToolIdV4::FsRead);
-legacy_canonicalizer!(canonicalize_fs_list, AuthorityToolIdV4::FsList);
-legacy_canonicalizer!(canonicalize_fs_glob, AuthorityToolIdV4::FsGlob);
-legacy_canonicalizer!(canonicalize_fs_diff, AuthorityToolIdV4::FsDiff);
-legacy_canonicalizer!(canonicalize_code_grep, AuthorityToolIdV4::CodeGrep);
-legacy_canonicalizer!(canonicalize_fs_create, AuthorityToolIdV4::FsCreate);
-legacy_canonicalizer!(canonicalize_fs_write, AuthorityToolIdV4::FsWrite);
-legacy_canonicalizer!(canonicalize_fs_edit, AuthorityToolIdV4::FsEdit);
-legacy_canonicalizer!(canonicalize_fs_rename, AuthorityToolIdV4::FsRename);
-legacy_canonicalizer!(canonicalize_fs_delete, AuthorityToolIdV4::FsDelete);
-legacy_canonicalizer!(
+invocation_canonicalizer!(canonicalize_fs_read, AuthorityToolIdV4::FsRead);
+invocation_canonicalizer!(canonicalize_fs_list, AuthorityToolIdV4::FsList);
+invocation_canonicalizer!(canonicalize_fs_glob, AuthorityToolIdV4::FsGlob);
+invocation_canonicalizer!(canonicalize_fs_diff, AuthorityToolIdV4::FsDiff);
+invocation_canonicalizer!(canonicalize_code_grep, AuthorityToolIdV4::CodeGrep);
+invocation_canonicalizer!(canonicalize_fs_create, AuthorityToolIdV4::FsCreate);
+invocation_canonicalizer!(canonicalize_fs_write, AuthorityToolIdV4::FsWrite);
+invocation_canonicalizer!(canonicalize_fs_edit, AuthorityToolIdV4::FsEdit);
+invocation_canonicalizer!(canonicalize_fs_rename, AuthorityToolIdV4::FsRename);
+invocation_canonicalizer!(canonicalize_fs_delete, AuthorityToolIdV4::FsDelete);
+invocation_canonicalizer!(
     canonicalize_fs_ensure_directory,
     AuthorityToolIdV4::FsEnsureDirectory
 );
-legacy_canonicalizer!(canonicalize_document_read, AuthorityToolIdV4::DocumentRead);
-legacy_canonicalizer!(canonicalize_git_status, AuthorityToolIdV4::GitStatus);
-legacy_canonicalizer!(canonicalize_git_diff, AuthorityToolIdV4::GitDiff);
-legacy_canonicalizer!(canonicalize_git_stage, AuthorityToolIdV4::GitStage);
-legacy_canonicalizer!(canonicalize_git_unstage, AuthorityToolIdV4::GitUnstage);
-legacy_canonicalizer!(canonicalize_git_commit, AuthorityToolIdV4::GitCommit);
-legacy_canonicalizer!(canonicalize_web_search, AuthorityToolIdV4::WebSearch);
-legacy_canonicalizer!(canonicalize_web_fetch, AuthorityToolIdV4::WebFetch);
+invocation_canonicalizer!(canonicalize_document_read, AuthorityToolIdV4::DocumentRead);
+invocation_canonicalizer!(canonicalize_git_status, AuthorityToolIdV4::GitStatus);
+invocation_canonicalizer!(canonicalize_git_diff, AuthorityToolIdV4::GitDiff);
+invocation_canonicalizer!(canonicalize_git_stage, AuthorityToolIdV4::GitStage);
+invocation_canonicalizer!(canonicalize_git_unstage, AuthorityToolIdV4::GitUnstage);
+invocation_canonicalizer!(canonicalize_git_commit, AuthorityToolIdV4::GitCommit);
+invocation_canonicalizer!(canonicalize_web_search, AuthorityToolIdV4::WebSearch);
+invocation_canonicalizer!(canonicalize_web_fetch, AuthorityToolIdV4::WebFetch);
 
-fn canonicalizer_for(operation_kind: ToolOperationKind) -> KernelArgumentsCanonicalizerV2 {
+fn canonicalizer_for(operation_kind: ToolOperationKind) -> KernelInvocationCanonicalizer {
     match operation_kind {
         ToolOperationKind::FsRead => canonicalize_fs_read,
         ToolOperationKind::FsList => canonicalize_fs_list,
@@ -506,6 +504,42 @@ fn canonicalizer_for(operation_kind: ToolOperationKind) -> KernelArgumentsCanoni
         | ToolOperationKind::BrowserScroll
         | ToolOperationKind::ProviderCall => {
             unreachable!("non-registered operation kind has no v2 canonicalizer")
+        }
+    }
+}
+
+fn private_tool_kind_for(operation_kind: ToolOperationKind) -> AuthorityToolIdV4 {
+    match operation_kind {
+        ToolOperationKind::FsRead => AuthorityToolIdV4::FsRead,
+        ToolOperationKind::FsList => AuthorityToolIdV4::FsList,
+        ToolOperationKind::FsGlob => AuthorityToolIdV4::FsGlob,
+        ToolOperationKind::FsDiff => AuthorityToolIdV4::FsDiff,
+        ToolOperationKind::CodeGrep => AuthorityToolIdV4::CodeGrep,
+        ToolOperationKind::FsCreate => AuthorityToolIdV4::FsCreate,
+        ToolOperationKind::FsWrite => AuthorityToolIdV4::FsWrite,
+        ToolOperationKind::FsEdit => AuthorityToolIdV4::FsEdit,
+        ToolOperationKind::FsRename => AuthorityToolIdV4::FsRename,
+        ToolOperationKind::FsDelete => AuthorityToolIdV4::FsDelete,
+        ToolOperationKind::FsEnsureDirectory => AuthorityToolIdV4::FsEnsureDirectory,
+        ToolOperationKind::DocumentRead => AuthorityToolIdV4::DocumentRead,
+        ToolOperationKind::GitStatus => AuthorityToolIdV4::GitStatus,
+        ToolOperationKind::GitDiff => AuthorityToolIdV4::GitDiff,
+        ToolOperationKind::GitStage => AuthorityToolIdV4::GitStage,
+        ToolOperationKind::GitUnstage => AuthorityToolIdV4::GitUnstage,
+        ToolOperationKind::GitCommit => AuthorityToolIdV4::GitCommit,
+        ToolOperationKind::WebSearch => AuthorityToolIdV4::WebSearch,
+        ToolOperationKind::WebFetch => AuthorityToolIdV4::WebFetch,
+        ToolOperationKind::GitPush
+        | ToolOperationKind::ProcessExec
+        | ToolOperationKind::BrowserOpen
+        | ToolOperationKind::BrowserReload
+        | ToolOperationKind::BrowserSnapshot
+        | ToolOperationKind::BrowserInspect
+        | ToolOperationKind::BrowserClick
+        | ToolOperationKind::BrowserType
+        | ToolOperationKind::BrowserScroll
+        | ToolOperationKind::ProviderCall => {
+            unreachable!("non-registered operation kind has no private invocation kind")
         }
     }
 }
