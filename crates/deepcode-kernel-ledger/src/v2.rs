@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-const SCHEMA_VERSION: &str = "5";
+const SCHEMA_VERSION: &str = "6";
 const SCHEMA_CONTRACT: &str = FACT_STORE_SCHEMA_CONTRACT_V2;
 const WRITER_QUEUE_CAPACITY: usize = 256;
 const BUSY_TIMEOUT: Duration = Duration::from_millis(5_000);

@@ -990,6 +990,7 @@ pub enum ControlFactV2 {
         causation_fact_id: FactId,
         workspace_binding_ref: crate::tool_protocol_v2::WorkspaceBindingRefV2,
         workspace_binding_digest: WorkspaceBindingDigestV2,
+        settings_ceiling_digest: SettingsCeilingDigestV2,
         tool_context_ref: ToolContextRefV2,
     },
     CommandRecorded {
@@ -1017,6 +1018,7 @@ pub enum CapabilityLeaseRevokeReasonV2 {
     UserRevoked,
     SettingsChanged,
     ToolRevoked,
+    ToolContextChanged,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1128,6 +1130,8 @@ pub enum AuthorizationFactV2 {
         identity: ToolContextInvalidationIdentityV2,
         previous_context: ToolContextRefV2,
         next_context_version: crate::tool_protocol_v2::ToolContextVersionV2,
+        next_context_ref: ToolContextRefV2,
+        settings_ceiling_digest: SettingsCeilingDigestV2,
         tool_id: Option<ToolIdV2>,
         availability: Option<ToolAvailabilityV2>,
         reason: ToolContextInvalidationReasonV2,
@@ -1351,6 +1355,77 @@ impl KernelFactPayloadV2 {
     pub fn validate(&self) -> Result<(), V2ValidationError> {
         if let Some(correlations) = self.correlation_set() {
             correlations.validate()?;
+        }
+        if let Self::Control(ControlFactV2::RunOpened {
+            control_epoch,
+            tool_context_ref,
+            ..
+        }) = self
+        {
+            if control_epoch.get() != 1 {
+                return Err(invalid_value(
+                    "fact.controlEpoch",
+                    "RunOpened must bind control epoch 1",
+                ));
+            }
+            if tool_context_ref.context_version.get() != 1 {
+                return Err(invalid_value(
+                    "fact.toolContextRef.contextVersion",
+                    "RunOpened must bind ToolContext version 1",
+                ));
+            }
+        }
+        if let Self::Authorization(AuthorizationFactV2::ContextInvalidated {
+            previous_context,
+            next_context_version,
+            next_context_ref,
+            tool_id,
+            availability,
+            reason,
+            ..
+        }) = self
+        {
+            if next_context_ref.context_version != *next_context_version {
+                return Err(invalid_value(
+                    "fact.nextContextRef.contextVersion",
+                    "must equal nextContextVersion",
+                ));
+            }
+            if previous_context
+                .context_version
+                .get()
+                .checked_add(1)
+                != Some(next_context_version.get())
+            {
+                return Err(invalid_value(
+                    "fact.nextContextVersion",
+                    "must immediately follow previousContext.contextVersion",
+                ));
+            }
+            if previous_context == next_context_ref {
+                return Err(invalid_value(
+                    "fact.nextContextRef",
+                    "must differ from previousContext",
+                ));
+            }
+            let relation_is_valid = match reason {
+                ToolContextInvalidationReasonV2::ToolRevoked => {
+                    tool_id.is_some() && *availability == Some(ToolAvailabilityV2::Revoked)
+                }
+                ToolContextInvalidationReasonV2::ToolUnavailable => {
+                    tool_id.is_some() && *availability == Some(ToolAvailabilityV2::Unavailable)
+                }
+                ToolContextInvalidationReasonV2::SettingsChanged
+                | ToolContextInvalidationReasonV2::RegistryChanged => {
+                    tool_id.is_none() && availability.is_none()
+                }
+            };
+            if !relation_is_valid {
+                return Err(invalid_value(
+                    "fact.contextInvalidation",
+                    "reason, toolId, and availability must describe one canonical transition",
+                ));
+            }
         }
         let resources = self.resource_ids();
         if !strictly_sorted_unique_ids(&resources) {

@@ -350,6 +350,7 @@ impl AuthorityService {
         public_request_id: CommandRequestId,
         public_request_digest: deepcode_kernel_abi::v2::CommandRequestDigestV2,
         workspace_binding_ref: WorkspaceBindingRefV2,
+        settings_ceiling_digest: deepcode_kernel_abi::v2::SettingsCeilingDigestV2,
         tool_context_ref: ToolContextRefV2,
         mut receipt: PublicCommandReceiptV2,
     ) -> AuthorityResult<ControlEpochAdvancedReplyV2> {
@@ -409,6 +410,7 @@ impl AuthorityService {
                     causation_fact_id: epoch_fact_id,
                     workspace_binding_ref,
                     workspace_binding_digest: workspace.digest,
+                    settings_ceiling_digest,
                     tool_context_ref,
                 },
             ),

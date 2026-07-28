@@ -13,6 +13,7 @@ use deepcode_kernel_abi::v2::{
     CorrelationSetV2, FactId, InputId, InvocationAuthorityV2, InvocationFactV2, InvocationId,
     KernelFactEnvelopeV2, KernelFactPayloadV2, NetworkTargetObservationDigestV2, OperationId,
     RecordedAtV2, RepositoryAreaV2, ResourceAccessV2, ResourceScopeV2, RunId,
+    SettingsCeilingDigestV2,
     ToolContextInvalidationIdentityV2, ToolContextInvalidationReasonV2, UserDecisionRefV2,
     WorkspaceBindingDigestV2,
 };
@@ -151,6 +152,11 @@ fn settings_allow(settings: &SettingsCeilingV2, effect_scope: ToolEffectScopeV2)
         }
         ToolEffectScopeV2::NetworkRead => settings.web_read,
     }
+}
+
+fn settings_digest(settings: &SettingsCeilingV2) -> AuthorityResult<SettingsCeilingDigestV2> {
+    let value = serde_json::to_value(settings).map_err(|_| storage_fault())?;
+    settings_ceiling_digest_v2(&value).map_err(|_| storage_fault())
 }
 
 fn canonical_invocation(
@@ -520,7 +526,9 @@ fn recover_public_runs(
     struct OpenMetadata {
         workspace_binding_ref: WorkspaceBindingRefV2,
         workspace_binding_digest: WorkspaceBindingDigestV2,
-        context_version: ToolContextVersionV2,
+        settings_ceiling_digest: SettingsCeilingDigestV2,
+        context_ref: ToolContextRefV2,
+        context_fact_id: Option<FactId>,
     }
 
     let mut opened = HashMap::<RunId, OpenMetadata>::new();
@@ -531,6 +539,7 @@ fn recover_public_runs(
                 run_id,
                 workspace_binding_ref,
                 workspace_binding_digest,
+                settings_ceiling_digest,
                 tool_context_ref,
                 ..
             }) => {
@@ -540,7 +549,9 @@ fn recover_public_runs(
                         OpenMetadata {
                             workspace_binding_ref: workspace_binding_ref.clone(),
                             workspace_binding_digest: workspace_binding_digest.clone(),
-                            context_version: tool_context_ref.context_version,
+                            settings_ceiling_digest: settings_ceiling_digest.clone(),
+                            context_ref: tool_context_ref.clone(),
+                            context_fact_id: None,
                         },
                     )
                     .is_some()
@@ -564,11 +575,14 @@ fn recover_public_runs(
             }
             KernelFactPayloadV2::Authorization(AuthorizationFactV2::ContextInvalidated {
                 identity,
-                next_context_version,
+                next_context_ref,
+                settings_ceiling_digest,
                 ..
             }) => {
                 if let Some(metadata) = opened.get_mut(&identity.run_id) {
-                    metadata.context_version = *next_context_version;
+                    metadata.context_ref = next_context_ref.clone();
+                    metadata.settings_ceiling_digest = settings_ceiling_digest.clone();
+                    metadata.context_fact_id = Some(envelope.fact_id.clone());
                 }
             }
             _ => {}
@@ -584,10 +598,12 @@ fn recover_public_runs(
             RecoveredRunRecord {
                 workspace_binding_ref: metadata.workspace_binding_ref,
                 workspace_binding_digest: metadata.workspace_binding_digest,
+                settings_ceiling_digest: metadata.settings_ceiling_digest,
                 control_epoch,
-                context_version: metadata.context_version,
+                context_version: metadata.context_ref.context_version,
+                context_ref: metadata.context_ref,
                 current_input_id,
-                control_fact_id,
+                control_fact_id: metadata.context_fact_id.unwrap_or(control_fact_id),
             },
         );
     }
@@ -596,12 +612,8 @@ fn recover_public_runs(
 
 fn recover_runtime_availability(
     facts: &[KernelFactEnvelopeV2],
-) -> (
-    HashMap<(RunId, ToolIdV2), ToolAvailabilityV2>,
-    HashMap<(RunId, ToolIdV2), bool>,
-) {
+) -> HashMap<(RunId, ToolIdV2), ToolAvailabilityV2> {
     let mut runtime_availability = HashMap::new();
-    let mut settings_overrides = HashMap::new();
     for fact in facts {
         if let KernelFactPayloadV2::Authorization(AuthorizationFactV2::ContextInvalidated {
             identity,
@@ -611,15 +623,12 @@ fn recover_runtime_availability(
             ..
         }) = &fact.payload
         {
-            let key = (identity.run_id.clone(), tool_id.clone());
-            if *reason == ToolContextInvalidationReasonV2::SettingsChanged {
-                settings_overrides.insert(key, *next == ToolAvailabilityV2::Ready);
-            } else {
-                runtime_availability.insert(key, *next);
+            if *reason != ToolContextInvalidationReasonV2::SettingsChanged {
+                runtime_availability.insert((identity.run_id.clone(), tool_id.clone()), *next);
             }
         }
     }
-    (runtime_availability, settings_overrides)
+    runtime_availability
 }
 
 struct RecoveredAuthorityMaterialV2 {
@@ -1135,6 +1144,20 @@ pub struct OpenedRunTransportV2 {
     run_capability: Option<RunCapabilityV2>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingCapabilityDecisionClassV2 {
+    Capability,
+    ScopeExpansion,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingCapabilityDecisionV2 {
+    pub run_id: RunId,
+    pub expected_control_epoch: ControlEpoch,
+    pub class: PendingCapabilityDecisionClassV2,
+    pub binding: CapabilityDecisionBindingV2,
+}
+
 impl OpenedRunTransportV2 {
     pub fn into_parts(self) -> (KernelCommandResponseEnvelopeV2, Option<RunCapabilityV2>) {
         (self.response, self.run_capability)
@@ -1143,7 +1166,6 @@ impl OpenedRunTransportV2 {
 
 struct KernelSessionInner {
     authority: AuthorityService,
-    startup_settings: SettingsCeilingV2,
     inventory: ToolInventoryV2,
     state: Mutex<KernelSessionState>,
     command_gate: Mutex<()>,
@@ -1160,7 +1182,6 @@ struct KernelSessionState {
     pending: HashMap<CapabilityScopePreviewIdV2, PendingIntent>,
     runtime_availability: HashMap<(RunId, ToolIdV2), ToolAvailabilityV2>,
     run_settings: HashMap<RunId, SettingsCeilingV2>,
-    settings_tool_overrides: HashMap<(RunId, ToolIdV2), bool>,
 }
 
 #[derive(Clone)]
@@ -1168,9 +1189,11 @@ struct PublicRunRecord {
     capability: RunCapabilityV2,
     workspace_binding_ref: WorkspaceBindingRefV2,
     workspace_binding_digest: WorkspaceBindingDigestV2,
+    settings_ceiling_digest: SettingsCeilingDigestV2,
     control_epoch: ControlEpoch,
     current_input_id: InputId,
     context_version: ToolContextVersionV2,
+    context_ref: ToolContextRefV2,
     control_fact_id: FactId,
 }
 
@@ -1178,8 +1201,10 @@ struct PublicRunRecord {
 struct RecoveredRunRecord {
     workspace_binding_ref: WorkspaceBindingRefV2,
     workspace_binding_digest: WorkspaceBindingDigestV2,
+    settings_ceiling_digest: SettingsCeilingDigestV2,
     control_epoch: ControlEpoch,
     context_version: ToolContextVersionV2,
+    context_ref: ToolContextRefV2,
     current_input_id: InputId,
     control_fact_id: FactId,
 }
@@ -1663,17 +1688,15 @@ impl KernelSessionServiceV2 {
         fact_store_path: impl AsRef<Path>,
         executor_config: KernelExecutorConfig,
         secret_provider: Arc<dyn SecretProvider>,
-        settings: SettingsCeilingV2,
     ) -> AuthorityResult<Self> {
         let store = CanonicalFactStore::open(fact_store_path).map_err(map_store_open_error)?;
-        Self::from_store(store, executor_config, secret_provider, settings)
+        Self::from_store(store, executor_config, secret_provider)
     }
 
     pub fn from_store(
         store: CanonicalFactStore,
         executor_config: KernelExecutorConfig,
         secret_provider: Arc<dyn SecretProvider>,
-        settings: SettingsCeilingV2,
     ) -> AuthorityResult<Self> {
         let authority = AuthorityService::open(store, executor_config, secret_provider)?;
         let inventory = build_inventory()?;
@@ -1681,7 +1704,7 @@ impl KernelSessionServiceV2 {
         let recovered_runs = recover_public_runs(&facts)?;
         let recovered_authority =
             recover_authority_material(&facts, authority.authority_material_snapshot()?)?;
-        let (runtime_availability, settings_tool_overrides) = recover_runtime_availability(&facts);
+        let runtime_availability = recover_runtime_availability(&facts);
         let state = KernelSessionState {
             recovered_runs,
             previews: recovered_authority.previews,
@@ -1689,13 +1712,11 @@ impl KernelSessionServiceV2 {
             trusts: recovered_authority.trusts,
             pending: recovered_authority.pending,
             runtime_availability,
-            settings_tool_overrides,
             ..KernelSessionState::default()
         };
         Ok(Self {
             inner: Arc::new(KernelSessionInner {
                 authority,
-                startup_settings: settings,
                 inventory,
                 state: Mutex::new(state),
                 command_gate: Mutex::new(()),
@@ -1726,6 +1747,83 @@ impl KernelSessionServiceV2 {
             .ok_or_else(|| KernelErrorV2::RunNotFound {
                 run_id: run_id.clone(),
             })
+    }
+
+    /// Resolves the exact durable preview that a trusted Host is displaying
+    /// into a decision binding. The Host must use this result verbatim when it
+    /// mints the short-lived decision capability; projections are not an
+    /// authority source.
+    pub fn resolve_pending_capability_decision_host(
+        &self,
+        scope_preview_id: CapabilityScopePreviewIdV2,
+        decision_ref: UserDecisionRefV2,
+    ) -> AuthorityResult<Result<PendingCapabilityDecisionV2, UserDecisionErrorV2>> {
+        let _gate = self
+            .inner
+            .command_gate
+            .lock()
+            .map_err(|_| storage_fault())?;
+        let (binding, has_existing_lease) = {
+            let state = self.inner.state.lock().map_err(|_| storage_fault())?;
+            let Some(preview) = state.previews.get(&scope_preview_id) else {
+                return Ok(Err(UserDecisionErrorV2::ScopePreviewNotFound));
+            };
+            let run_id = preview.record.run_id.clone();
+            let expected_control_epoch = preview.record.control_epoch;
+            let Some(run) = state.runs.get(&run_id) else {
+                return Ok(Err(UserDecisionErrorV2::ScopePreviewNotFound));
+            };
+            if run.control_epoch != expected_control_epoch {
+                return Ok(Err(UserDecisionErrorV2::ScopePreviewStale));
+            }
+            if preview.record.run_id != run_id
+                || preview.record.control_epoch != expected_control_epoch
+            {
+                return Ok(Err(UserDecisionErrorV2::ScopePreviewStale));
+            }
+            if preview.record.disposition != CapabilityScopeDispositionV2::RequiresUserDecision {
+                return Ok(Err(UserDecisionErrorV2::PlanBindingMismatch));
+            }
+            let binding = CapabilityDecisionBindingV2 {
+                input_id: run.current_input_id.clone(),
+                decision_ref,
+                scope_preview_id,
+                expected_authorization_digest: preview.authorization_digest.clone(),
+                plan_revision: preview.record.plan_revision.clone(),
+                plan_action_id: preview.record.plan_action_id.clone(),
+                scope_digest: preview.record.scope_digest.clone(),
+                tool_context_ref: preview.record.context_ref.clone(),
+            };
+            let has_existing_lease = state.leases.values().any(|lease| {
+                lease.run_id == run_id
+                    && lease.control_epoch == expected_control_epoch
+                    && lease.plan_revision == preview.record.plan_revision
+                    && lease.plan_action_id == preview.record.plan_action_id
+                    && lease.tool_id == preview.record.tool_id
+            });
+            (binding, has_existing_lease)
+        };
+        let (run_id, expected_control_epoch) = {
+            let state = self.inner.state.lock().map_err(|_| storage_fault())?;
+            let preview = state
+                .previews
+                .get(&binding.scope_preview_id)
+                .ok_or_else(storage_fault)?;
+            (preview.record.run_id.clone(), preview.record.control_epoch)
+        };
+        match self.resolve_decision_preview(&run_id, expected_control_epoch, &binding)? {
+            Ok(_) => Ok(Ok(PendingCapabilityDecisionV2 {
+                run_id,
+                expected_control_epoch,
+                class: if has_existing_lease {
+                    PendingCapabilityDecisionClassV2::ScopeExpansion
+                } else {
+                    PendingCapabilityDecisionClassV2::Capability
+                },
+                binding,
+            })),
+            Err(error) => Ok(Err(error)),
+        }
     }
 
     pub fn shutdown(&self) -> AuthorityResult<()> {
@@ -1773,7 +1871,7 @@ impl KernelSessionServiceV2 {
                 InvalidFieldViolationV2::InvalidRelation,
             ));
         }
-        let (run, current, leases, trusts, previews, pending) = {
+        let (run, current, settings, runtime_availability, leases, trusts, previews, pending) = {
             let state = self.inner.state.lock().map_err(|_| storage_fault())?;
             let run =
                 state
@@ -1788,6 +1886,12 @@ impl KernelSessionServiceV2 {
                 .get(&(run_id.clone(), tool_id.clone()))
                 .copied()
                 .unwrap_or(descriptor.availability);
+            let settings = state
+                .run_settings
+                .get(&run_id)
+                .cloned()
+                .ok_or_else(storage_fault)?;
+            let runtime_availability = state.runtime_availability.clone();
             let leases = state
                 .leases
                 .values()
@@ -1814,7 +1918,16 @@ impl KernelSessionServiceV2 {
                 .filter(|pending| pending.run_id == run_id && pending.tool_id == tool_id)
                 .cloned()
                 .collect::<Vec<_>>();
-            (run, current, leases, trusts, previews, pending)
+            (
+                run,
+                current,
+                settings,
+                runtime_availability,
+                leases,
+                trusts,
+                previews,
+                pending,
+            )
         };
         if current == availability {
             return self.build_tool_context(&run_id, run.context_version);
@@ -1825,7 +1938,6 @@ impl KernelSessionServiceV2 {
                 InvalidFieldViolationV2::InvalidRelation,
             ));
         }
-        let previous_context = self.build_tool_context(&run_id, run.context_version)?;
         let next_context_version = ToolContextVersionV2::new(
             run.context_version
                 .get()
@@ -1838,6 +1950,15 @@ impl KernelSessionServiceV2 {
             ToolAvailabilityV2::Unavailable => ToolContextInvalidationReasonV2::ToolUnavailable,
             _ => unreachable!("validated runtime availability shrink"),
         };
+        let settings_ceiling_digest = self.settings_ceiling_digest(&run_id)?;
+        let mut next_runtime_availability = runtime_availability;
+        next_runtime_availability.insert((run_id.clone(), tool_id.clone()), availability);
+        let next_context = self.build_tool_context_from_inputs(
+            &run_id,
+            next_context_version,
+            &settings,
+            &next_runtime_availability,
+        )?;
 
         // The durable invalidation is committed before any in-memory
         // availability or context version changes.
@@ -1848,8 +1969,10 @@ impl KernelSessionServiceV2 {
                     control_epoch: run.control_epoch,
                     causation_fact_id: run.control_fact_id.clone(),
                 },
-                previous_context: previous_context.context_ref(),
+                previous_context: run.context_ref.clone(),
                 next_context_version,
+                next_context_ref: next_context.context_ref(),
+                settings_ceiling_digest,
                 tool_id: Some(tool_id.clone()),
                 availability: Some(availability),
                 reason,
@@ -1962,6 +2085,7 @@ impl KernelSessionServiceV2 {
                 return Err(storage_fault());
             }
             active.context_version = next_context_version;
+            active.context_ref = next_context.context_ref();
             active.control_fact_id = invalidation_fact_id;
             state
                 .runtime_availability
@@ -1979,7 +2103,7 @@ impl KernelSessionServiceV2 {
                 .pending
                 .retain(|_, pending| pending.run_id != run_id || pending.tool_id != tool_id);
         }
-        self.build_tool_context(&run_id, next_context_version)
+        Ok(next_context)
     }
 
     /// Host-only, per-run Settings ceiling update. Expanding the ceiling only
@@ -1994,7 +2118,16 @@ impl KernelSessionServiceV2 {
             .command_gate
             .lock()
             .map_err(|_| storage_fault())?;
-        let (run, previous, leases, trusts, previews, pending) = {
+        self.update_run_settings_ceiling_host_locked(run_id, next)
+    }
+
+    fn update_run_settings_ceiling_host_locked(
+        &self,
+        run_id: RunId,
+        next: SettingsCeilingV2,
+    ) -> AuthorityResult<ToolContextBundleV2> {
+        let next_settings_digest = settings_digest(&next)?;
+        let (run, runtime_availability, leases, trusts, previews, pending) = {
             let state = self.inner.state.lock().map_err(|_| storage_fault())?;
             let run =
                 state
@@ -2004,11 +2137,9 @@ impl KernelSessionServiceV2 {
                     .ok_or_else(|| KernelErrorV2::RunNotFound {
                         run_id: run_id.clone(),
                     })?;
-            let previous = state
-                .run_settings
-                .get(&run_id)
-                .cloned()
-                .unwrap_or_else(|| self.inner.startup_settings.clone());
+            if !state.run_settings.contains_key(&run_id) {
+                return Err(storage_fault());
+            }
             let leases = state
                 .leases
                 .values()
@@ -2033,24 +2164,37 @@ impl KernelSessionServiceV2 {
                 .filter(|pending| pending.run_id == run_id)
                 .cloned()
                 .collect::<Vec<_>>();
-            (run, previous, leases, trusts, previews, pending)
+            (
+                run,
+                state.runtime_availability.clone(),
+                leases,
+                trusts,
+                previews,
+                pending,
+            )
         };
-        if previous == next {
-            return self.build_tool_context(&run_id, run.context_version);
+        let current_candidate = self.build_tool_context_from_inputs(
+            &run_id,
+            run.context_version,
+            &next,
+            &runtime_availability,
+        )?;
+        if run.settings_ceiling_digest == next_settings_digest
+            && run.context_ref == current_candidate.context_ref()
+        {
+            return Ok(current_candidate);
         }
-        let changes = self
-            .inner
-            .inventory
-            .tools
-            .iter()
-            .filter(|descriptor| descriptor.availability == ToolAvailabilityV2::Ready)
-            .filter_map(|descriptor| {
-                let was_allowed = settings_allow(&previous, descriptor.effect_scope);
-                let is_allowed = settings_allow(&next, descriptor.effect_scope);
-                (was_allowed != is_allowed).then_some((descriptor.tool_id.clone(), is_allowed))
-            })
-            .collect::<Vec<_>>();
-        let previous_context = self.build_tool_context(&run_id, run.context_version)?;
+        let invalidation_reason = if run.settings_ceiling_digest != next_settings_digest {
+            ToolContextInvalidationReasonV2::SettingsChanged
+        } else {
+            ToolContextInvalidationReasonV2::RegistryChanged
+        };
+        let lease_revoke_reason =
+            if invalidation_reason == ToolContextInvalidationReasonV2::SettingsChanged {
+                CapabilityLeaseRevokeReasonV2::SettingsChanged
+            } else {
+                CapabilityLeaseRevokeReasonV2::ToolContextChanged
+            };
         let next_context_version = ToolContextVersionV2::new(
             run.context_version
                 .get()
@@ -2058,65 +2202,29 @@ impl KernelSessionServiceV2 {
                 .ok_or_else(storage_fault)?,
         )
         .map_err(|_| storage_fault())?;
-        let mut payloads = if changes.is_empty() {
-            vec![KernelFactPayloadV2::Authorization(
-                AuthorizationFactV2::ContextInvalidated {
-                    identity: ToolContextInvalidationIdentityV2 {
-                        run_id: run_id.clone(),
-                        control_epoch: run.control_epoch,
-                        causation_fact_id: run.control_fact_id.clone(),
-                    },
-                    previous_context: previous_context.context_ref(),
-                    next_context_version,
-                    tool_id: None,
-                    availability: None,
-                    reason: ToolContextInvalidationReasonV2::SettingsChanged,
+        let next_context = self.build_tool_context_from_inputs(
+            &run_id,
+            next_context_version,
+            &next,
+            &runtime_availability,
+        )?;
+        let mut payloads = vec![KernelFactPayloadV2::Authorization(
+            AuthorizationFactV2::ContextInvalidated {
+                identity: ToolContextInvalidationIdentityV2 {
+                    run_id: run_id.clone(),
+                    control_epoch: run.control_epoch,
+                    causation_fact_id: run.control_fact_id.clone(),
                 },
-            )]
-        } else {
-            changes
-                .iter()
-                .map(|(tool_id, allowed)| {
-                    KernelFactPayloadV2::Authorization(AuthorizationFactV2::ContextInvalidated {
-                        identity: ToolContextInvalidationIdentityV2 {
-                            run_id: run_id.clone(),
-                            control_epoch: run.control_epoch,
-                            causation_fact_id: run.control_fact_id.clone(),
-                        },
-                        previous_context: previous_context.context_ref(),
-                        next_context_version,
-                        tool_id: Some(tool_id.clone()),
-                        availability: Some(if *allowed {
-                            ToolAvailabilityV2::Ready
-                        } else {
-                            ToolAvailabilityV2::Unavailable
-                        }),
-                        reason: ToolContextInvalidationReasonV2::SettingsChanged,
-                    })
-                })
-                .collect::<Vec<_>>()
-        };
-        let denied_tools = changes
-            .iter()
-            .filter_map(|(tool_id, allowed)| (!*allowed).then_some(tool_id.clone()))
-            .collect::<Vec<_>>();
-        let revoked_leases = leases
-            .iter()
-            .filter(|lease| denied_tools.contains(&lease.tool_id))
-            .collect::<Vec<_>>();
-        let revoked_trusts = trusts
-            .iter()
-            .filter(|trust| denied_tools.contains(&trust.tool_id))
-            .collect::<Vec<_>>();
-        let stale_previews = previews
-            .iter()
-            .filter(|preview| denied_tools.contains(&preview.record.tool_id))
-            .collect::<Vec<_>>();
-        let stale_pending = pending
-            .iter()
-            .filter(|pending| denied_tools.contains(&pending.tool_id))
-            .collect::<Vec<_>>();
-        for lease in &revoked_leases {
+                previous_context: run.context_ref.clone(),
+                next_context_version,
+                next_context_ref: next_context.context_ref(),
+                settings_ceiling_digest: next_settings_digest.clone(),
+                tool_id: None,
+                availability: None,
+                reason: invalidation_reason,
+            },
+        )];
+        for lease in &leases {
             payloads.push(KernelFactPayloadV2::Authorization(
                 AuthorizationFactV2::LeaseRevoked {
                     identity: CapabilityLeaseFactIdentityV2 {
@@ -2132,11 +2240,11 @@ impl KernelSessionServiceV2 {
                         correlation_set: plan_action_correlations(&lease.plan_action_id)?,
                     },
                     scope_digest: lease.reference.scope_digest.clone(),
-                    reason: CapabilityLeaseRevokeReasonV2::SettingsChanged,
+                    reason: lease_revoke_reason,
                 },
             ));
         }
-        for trust in &revoked_trusts {
+        for trust in &trusts {
             payloads.push(KernelFactPayloadV2::Authorization(
                 AuthorizationFactV2::TrustRevoked {
                     identity: AuthorizationIdentityV2 {
@@ -2161,30 +2269,26 @@ impl KernelSessionServiceV2 {
 
         // The complete invalidation/revocation batch is durable before the
         // effective Settings ceiling changes in memory.
-        let revocation_start = if changes.is_empty() { 1 } else { changes.len() };
         let mut material_mutations = Vec::with_capacity(
-            revoked_leases.len()
-                + revoked_trusts.len()
-                + stale_previews.len()
-                + stale_pending.len(),
+            leases.len() + trusts.len() + previews.len() + pending.len(),
         );
-        for (offset, lease) in revoked_leases.iter().enumerate() {
+        for (offset, lease) in leases.iter().enumerate() {
             material_mutations.push(AuthorityMaterialMutationV2::Replace {
                 expected_lifecycle: AUTHORITY_MATERIAL_ACTIVE.to_owned(),
                 expected_payload_digest: None,
                 material: capability_lease_material(&lease.durable(), AUTHORITY_MATERIAL_REVOKED)?,
-                fact_index: revocation_start + offset,
+                fact_index: 1 + offset,
             });
         }
-        for (offset, trust) in revoked_trusts.iter().enumerate() {
+        for (offset, trust) in trusts.iter().enumerate() {
             material_mutations.push(AuthorityMaterialMutationV2::Replace {
                 expected_lifecycle: AUTHORITY_MATERIAL_ACTIVE.to_owned(),
                 expected_payload_digest: None,
                 material: trust_lease_material(&trust.durable(), AUTHORITY_MATERIAL_REVOKED)?,
-                fact_index: revocation_start + revoked_leases.len() + offset,
+                fact_index: 1 + leases.len() + offset,
             });
         }
-        for preview in stale_previews {
+        for preview in &previews {
             material_mutations.push(AuthorityMaterialMutationV2::Replace {
                 expected_lifecycle: AUTHORITY_MATERIAL_ACTIVE.to_owned(),
                 expected_payload_digest: None,
@@ -2192,7 +2296,7 @@ impl KernelSessionServiceV2 {
                 fact_index: 0,
             });
         }
-        for pending in stale_pending {
+        for pending in &pending {
             let lease = match &pending.authority {
                 ToolIntentAuthorityV2::PlanAction { lease, .. } => lease.clone(),
                 ToolIntentAuthorityV2::ContextRead { .. } => None,
@@ -2231,27 +2335,20 @@ impl KernelSessionServiceV2 {
                 return Err(storage_fault());
             }
             active.context_version = next_context_version;
+            active.context_ref = next_context.context_ref();
+            active.settings_ceiling_digest = next_settings_digest;
             active.control_fact_id = causation_fact_id;
             state.run_settings.insert(run_id.clone(), next);
-            for (tool_id, allowed) in &changes {
-                state
-                    .settings_tool_overrides
-                    .insert((run_id.clone(), tool_id.clone()), *allowed);
-            }
-            state.leases.retain(|_, lease| {
-                lease.run_id != run_id || !denied_tools.contains(&lease.tool_id)
-            });
-            state.trusts.retain(|_, trust| {
-                trust.run_id != run_id || !denied_tools.contains(&trust.tool_id)
-            });
-            state.previews.retain(|_, preview| {
-                preview.record.run_id != run_id || !denied_tools.contains(&preview.record.tool_id)
-            });
-            state.pending.retain(|_, pending| {
-                pending.run_id != run_id || !denied_tools.contains(&pending.tool_id)
-            });
+            state.leases.retain(|_, lease| lease.run_id != run_id);
+            state.trusts.retain(|_, trust| trust.run_id != run_id);
+            state
+                .previews
+                .retain(|_, preview| preview.record.run_id != run_id);
+            state
+                .pending
+                .retain(|_, pending| pending.run_id != run_id);
         }
-        self.build_tool_context(&run_id, next_context_version)
+        Ok(next_context)
     }
 
     pub fn resume_run_host(
@@ -2261,6 +2358,7 @@ impl KernelSessionServiceV2 {
         workspace_root: &Path,
         input_id: InputId,
         opaque_input_ref: String,
+        settings: SettingsCeilingV2,
     ) -> AuthorityResult<(RunOpenReplyV2, RunCapabilityV2)> {
         let _gate = self
             .inner
@@ -2273,6 +2371,7 @@ impl KernelSessionServiceV2 {
             workspace_root,
             input_id,
             opaque_input_ref,
+            settings,
         )
     }
 
@@ -2283,6 +2382,7 @@ impl KernelSessionServiceV2 {
         workspace_root: &Path,
         _input_id: InputId,
         _opaque_input_ref: String,
+        settings: SettingsCeilingV2,
     ) -> AuthorityResult<(RunOpenReplyV2, RunCapabilityV2)> {
         let recovered = {
             let state = self.inner.state.lock().map_err(|_| storage_fault())?;
@@ -2292,8 +2392,10 @@ impl KernelSessionServiceV2 {
                 .map(|run| RecoveredRunRecord {
                     workspace_binding_ref: run.workspace_binding_ref.clone(),
                     workspace_binding_digest: run.workspace_binding_digest.clone(),
+                    settings_ceiling_digest: run.settings_ceiling_digest.clone(),
                     control_epoch: run.control_epoch,
                     context_version: run.context_version,
+                    context_ref: run.context_ref.clone(),
                     current_input_id: run.current_input_id.clone(),
                     control_fact_id: run.control_fact_id.clone(),
                 })
@@ -2320,31 +2422,32 @@ impl KernelSessionServiceV2 {
         }
 
         let run_capability = self.inner.ids.run_capability()?;
-        let tool_context = self.build_tool_context(&run_id, recovered.context_version)?;
+        {
+            let mut state = self.inner.state.lock().map_err(|_| storage_fault())?;
+            state.runs.insert(
+                run_id.clone(),
+                PublicRunRecord {
+                    capability: run_capability.clone(),
+                    workspace_binding_ref,
+                    workspace_binding_digest: binding.digest.clone(),
+                    settings_ceiling_digest: recovered.settings_ceiling_digest,
+                    control_epoch: recovered.control_epoch,
+                    current_input_id: recovered.current_input_id,
+                    context_version: recovered.context_version,
+                    context_ref: recovered.context_ref,
+                    control_fact_id: recovered.control_fact_id,
+                },
+            );
+            state.run_settings.insert(run_id.clone(), settings.clone());
+            state.recovered_runs.remove(&run_id);
+        }
+        let tool_context = self.update_run_settings_ceiling_host_locked(run_id.clone(), settings)?;
         let reply = RunOpenReplyV2 {
-            run_id: run_id.clone(),
+            run_id,
             control_epoch: recovered.control_epoch,
-            workspace_binding_digest: binding.digest.clone(),
+            workspace_binding_digest: binding.digest,
             tool_context,
         };
-        let mut state = self.inner.state.lock().map_err(|_| storage_fault())?;
-        state.runs.insert(
-            run_id.clone(),
-            PublicRunRecord {
-                capability: run_capability.clone(),
-                workspace_binding_ref,
-                workspace_binding_digest: binding.digest,
-                control_epoch: recovered.control_epoch,
-                current_input_id: recovered.current_input_id,
-                context_version: recovered.context_version,
-                control_fact_id: recovered.control_fact_id,
-            },
-        );
-        state
-            .run_settings
-            .entry(run_id.clone())
-            .or_insert_with(|| self.inner.startup_settings.clone());
-        state.recovered_runs.remove(&run_id);
         Ok((reply, run_capability))
     }
 
@@ -2352,6 +2455,7 @@ impl KernelSessionServiceV2 {
         &self,
         envelope: KernelCommandEnvelopeV2,
         workspace_root: &Path,
+        settings: SettingsCeilingV2,
     ) -> OpenedRunTransportV2 {
         let _gate = match self.inner.command_gate.lock() {
             Ok(gate) => gate,
@@ -2368,7 +2472,7 @@ impl KernelSessionServiceV2 {
             .map_err(|_| invalid_field("command", InvalidFieldViolationV2::OutOfRange))
             .and_then(|_| match envelope.command.clone() {
                 KernelCommandV2::RunOpen(command) => {
-                    self.open_run_command(&envelope, command, workspace_root)
+                    self.open_run_command(&envelope, command, workspace_root, settings)
                 }
                 _ => Err(invalid_field(
                     "command.kind",
@@ -2537,6 +2641,7 @@ impl KernelSessionServiceV2 {
         envelope: &KernelCommandEnvelopeV2,
         command: RunOpenV2,
         workspace_root: &Path,
+        settings: SettingsCeilingV2,
     ) -> AuthorityResult<(KernelReplyV2, CommandHandlingV2, RunCapabilityV2)> {
         let digest = command_request_digest_v2(&envelope.command).map_err(|_| storage_fault())?;
         if let Some(replayed) = self.lookup_replay(&envelope.request_id, &digest)? {
@@ -2565,7 +2670,8 @@ impl KernelSessionServiceV2 {
                         InvalidFieldViolationV2::InvalidRelation,
                     ));
                 }
-                let tool_context = self.build_tool_context(&run_id, active.context_version)?;
+                let tool_context =
+                    self.update_run_settings_ceiling_host_locked(run_id.clone(), settings.clone())?;
                 RunOpenReplyV2 {
                     run_id,
                     control_epoch: active.control_epoch,
@@ -2579,6 +2685,7 @@ impl KernelSessionServiceV2 {
                     workspace_root,
                     command.input_id,
                     command.opaque_input_ref,
+                    settings.clone(),
                 )?;
                 reply
             };
@@ -2597,7 +2704,20 @@ impl KernelSessionServiceV2 {
             .authority
             .bind_run_workspace(&run_id, workspace_root)?;
         let context_version = ToolContextVersionV2::new(1).map_err(|_| storage_fault())?;
-        let tool_context = self.build_tool_context(&run_id, context_version)?;
+        let settings_ceiling_digest = settings_digest(&settings)?;
+        let runtime_availability = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| storage_fault())?
+            .runtime_availability
+            .clone();
+        let tool_context = self.build_tool_context_from_inputs(
+            &run_id,
+            context_version,
+            &settings,
+            &runtime_availability,
+        )?;
         let initial_epoch = ControlEpoch::new(1).map_err(|_| storage_fault())?;
         let stored = DurablePublicReplyV2::RunOpen {
             run_id: run_id.clone(),
@@ -2623,9 +2743,11 @@ impl KernelSessionServiceV2 {
             envelope.request_id.clone(),
             digest,
             command.workspace_binding_ref.clone(),
+            settings_ceiling_digest.clone(),
             tool_context.context_ref(),
             receipt,
         )?;
+        let tool_context_ref = tool_context.context_ref();
         let reply = KernelReplyV2::RunOpened(RunOpenReplyV2 {
             run_id: run_id.clone(),
             control_epoch: epoch.accepted_control_epoch,
@@ -2640,15 +2762,15 @@ impl KernelSessionServiceV2 {
                     capability: run_capability.clone(),
                     workspace_binding_ref: command.workspace_binding_ref,
                     workspace_binding_digest: binding.digest.clone(),
+                    settings_ceiling_digest,
                     control_epoch: epoch.accepted_control_epoch,
                     current_input_id: command.input_id,
                     context_version,
+                    context_ref: tool_context_ref,
                     control_fact_id: epoch.epoch_fact_id,
                 },
             );
-            state
-                .run_settings
-                .insert(run_id, self.inner.startup_settings.clone());
+            state.run_settings.insert(run_id, settings);
         }
         Ok((reply, CommandHandlingV2::Evaluated, run_capability))
     }
@@ -3786,18 +3908,32 @@ impl KernelSessionServiceV2 {
         run_id: &RunId,
         context_version: ToolContextVersionV2,
     ) -> AuthorityResult<ToolContextBundleV2> {
-        let (runtime_availability, settings_overrides, settings) = {
+        let (runtime_availability, settings) = {
             let state = self.inner.state.lock().map_err(|_| storage_fault())?;
             (
                 state.runtime_availability.clone(),
-                state.settings_tool_overrides.clone(),
                 state
                     .run_settings
                     .get(run_id)
                     .cloned()
-                    .unwrap_or_else(|| self.inner.startup_settings.clone()),
+                    .ok_or_else(storage_fault)?,
             )
         };
+        self.build_tool_context_from_inputs(
+            run_id,
+            context_version,
+            &settings,
+            &runtime_availability,
+        )
+    }
+
+    fn build_tool_context_from_inputs(
+        &self,
+        run_id: &RunId,
+        context_version: ToolContextVersionV2,
+        settings: &SettingsCeilingV2,
+        runtime_availability: &HashMap<(RunId, ToolIdV2), ToolAvailabilityV2>,
+    ) -> AuthorityResult<ToolContextBundleV2> {
         let tools = self
             .inner
             .inventory
@@ -3809,10 +3945,7 @@ impl KernelSessionServiceV2 {
                     .copied()
                     .unwrap_or(descriptor.availability)
                     == ToolAvailabilityV2::Ready
-                    && settings_overrides
-                        .get(&(run_id.clone(), descriptor.tool_id.clone()))
-                        .copied()
-                        .unwrap_or_else(|| settings_allow(&settings, descriptor.effect_scope))
+                    && settings_allow(settings, descriptor.effect_scope)
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -3871,17 +4004,10 @@ impl KernelSessionServiceV2 {
             let state = self.inner.state.lock().map_err(|_| {
                 deepcode_kernel_abi::v2_command::CapabilityScopeRejectionReasonV2::ToolUnavailable
             })?;
-            state
-                .settings_tool_overrides
-                .get(&(run_id.clone(), tool_id.clone()))
-                .copied()
-                .unwrap_or_else(|| {
-                    let settings = state
-                        .run_settings
-                        .get(run_id)
-                        .unwrap_or(&self.inner.startup_settings);
-                    settings_allow(settings, descriptor.effect_scope)
-                })
+            let settings = state.run_settings.get(run_id).ok_or(
+                deepcode_kernel_abi::v2_command::CapabilityScopeRejectionReasonV2::ToolUnavailable,
+            )?;
+            settings_allow(settings, descriptor.effect_scope)
         };
         if !settings_allowed {
             return Err(
@@ -3984,7 +4110,7 @@ impl KernelSessionServiceV2 {
             .run_settings
             .get(run_id)
             .map(|settings| settings.auto_approve_plans)
-            .unwrap_or(self.inner.startup_settings.auto_approve_plans);
+            .ok_or_else(storage_fault)?;
         let automatic_decision_ref =
             if auto_approve_plans && descriptor.effect_class != ToolEffectClassV2::Read {
                 self.inner
@@ -4556,11 +4682,10 @@ impl KernelSessionServiceV2 {
             state
                 .run_settings
                 .get(run_id)
-                .unwrap_or(&self.inner.startup_settings)
-                .clone()
+                .cloned()
+                .ok_or_else(storage_fault)?
         };
-        let value = serde_json::to_value(settings).map_err(|_| storage_fault())?;
-        settings_ceiling_digest_v2(&value).map_err(|_| storage_fault())
+        settings_digest(&settings)
     }
 
     fn execute_direct_tool_intent(
