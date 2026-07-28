@@ -1,2369 +1,4793 @@
 use super::model::{
-    require_non_empty, AuthorityError, AuthorityResult, CapabilityScope, ControlAdvance,
-    EffectCompletion, GrantIssueRequest, GrantLifecycle, GrantReservationLifecycle, GrantSnapshot,
-    InvocationAdmission, InvocationLifecycle, InvocationSnapshot, InvocationSubmitRequest,
-    TerminalInvocationOutcome,
+    invocation_phase_is_terminal, AuthorityResult, AuthorityState, CommandReplay,
+    ExecutionResolution, GrantDecisionReplay, GrantLifecycle, GrantRecord, InvocationPhase,
+    InvocationRecord, PreparedGrantRequest, RawExecution, ReservationRecord, ResolvedTarget,
+    ResourceRecord, RunLifecycle, RunRecord, StopOverlay, SubmissionBinding, VerifiedExecution,
+    WorkspaceBinding,
+};
+use crate::executors::{plan_v2_text_edit, KernelExecutorConfig};
+use crate::network_policy::{review_http_target, ReviewedHttpTarget};
+use deepcode_kernel_abi::tool_catalog_v4::{
+    output_payload_measure_v4, tool_output_digest_v4, AuthorityToolIdV4, DeadlineV4,
+    DeleteTargetV4, DocumentPagesV4, EffectScopeV4, ExecutionAvailabilityV4, LineRangeV4,
+    NetworkPublicTargetV4, OutputTruncationV4, PathEntrySizeV4, PathEntryV4, ResourceAccessV4,
+    SearchMatchV4, SearchStrategyV4, TextMediaTypeV4, ToolContractV4, ToolInvocationInputV4,
+    ToolOutputPayloadV4, ToolOutputV4, ToolRiskV4, WebSearchItemV4, WorkspaceObjectKindV4,
 };
 use deepcode_kernel_abi::v2::{
-    AttemptId, CausalIdentityV2, ControlEpoch, ControlFactKindV2, ControlFactV2, EffectFactV2,
-    EffectId, EffectOutcomeV2, FactId, GrantFactKindV2, GrantFactV2, GrantId, GrantReservationId,
-    GrantUsePolicyV2, InputId, InvocationFactKindV2, InvocationFactV2, InvocationId,
-    KernelErrorCodeV2, KernelFactDraftV2, KernelFactEnvelopeV2, KernelFactPayloadV2, OperationId,
-    RunId,
+    authorization_request_digest_v2, collection_digest_v2, content_digest_v2,
+    executor_evidence_digest_v2, grant_scope_digest_v2, idempotency_key_hash_v2,
+    invocation_submission_digest_v2, network_response_digest_v2, network_target_digest_v2,
+    query_digest_v2, resource_state_digest_v2, target_revalidation_digest_v2,
+    target_revalidation_set_digest_v2, workspace_binding_digest_v2, AdmissionRejectionV2,
+    AttemptIdentityV2, AuthorizationRequestDigestV2, AutonomyModeV2, CancelRequestId,
+    CancellationIdentityV2, CancellationReasonCodeV2, CancellationSourceV2,
+    CanonicalPrivateTargetV2, CleanupFactV2, CommandEpochContextV2, CommandReceiptIdentityV2,
+    CommandRequestDigestV2, CommandRequestId, CommandRequestIdentityV2, ControlEpoch,
+    ControlFactV2, CorrelationSetV2, DeletionBeforeObservationV2, DirectoryBeforeObservationV2,
+    EffectEvidenceV2, EffectFactV2, EffectId, EffectIdentityV2, ExecutorEvidenceDigestV2, FactId,
+    FileBeforeObservationV2, GrantDecisionBasisV2, GrantDecisionDigestV2, GrantDenialReasonV2,
+    GrantDeniedIdentityV2, GrantFactV2, GrantId, GrantIssuedIdentityV2, GrantLifecycleIdentityV2,
+    GrantSupersessionCauseV2, GrantUsePolicyV2, IdempotencyKeyHashV2, IndeterminateReasonV2,
+    InputId, InvocationFactV2, InvocationId, InvocationRejectedIdentityV2,
+    InvocationRequestDigestV2, InvocationSubmissionDigestV2, KernelFactDraftV2,
+    KernelFactEnvelopeV2, KernelFactPayloadV2, LastObservationV2, MutationCommandResultV2,
+    NetworkAddressV2, NetworkHostV2, NetworkOriginV2, NetworkQueryV2, NetworkRequestTargetV2,
+    NetworkSchemeV2, NetworkTargetObservationDigestV2, ObservedTerminalIdentityV2, OperationId,
+    OperationIdempotencyConflictV2, PairKnownSideV2, PlatformV2, PostObservedEffectFailureCodeV2,
+    PreEffectFailureCodeV2, PresentFileObservationV2, ReservationIdentityV2,
+    ReservationReleaseReasonV2, ResolutionObservationV2, ResolvedResourceV2, ResourceAccessV2,
+    ResourceAttemptIdentityV2, ResourceFactV2, ResourceId, ResourceProjectionObservationV2,
+    ResourceResolvedIdentityV2, ResourceScopeV2, ResourceStateV2, RunId, TargetResolutionFailureV2,
+    TargetRevalidationDigestV2, TargetRevalidationObservationV2, TargetRevalidationSetDigestV2,
+    TransitionIdentityV2, WorkspaceBindingDigestV2, WorkspaceObjectKindV2, WorkspaceScopeTargetV2,
+    MAX_FACT_PAGE_BYTES_V2,
 };
-use deepcode_kernel_ledger::v2::CanonicalFactStore;
-use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use deepcode_kernel_abi::v2_command::{
+    CanonicalGrantRequestV2, ControlCancellationReplyV2, ControlEpochAdvanceV2,
+    ControlEpochAdvancedReplyV2, DeadlineRequestV2, EpochPreconditionV2, FactPageContinuationV2,
+    GrantDecisionReplyV2, GrantDecisionSubmissionV2, GrantRequestV2, GrantRevokeV2,
+    GrantRevokedReplyV2, InvalidFieldViolationV2, InvalidRelationV2, InvalidRequestReasonV2,
+    InvocationCancelReplyV2, InvocationCancelV2, InvocationStatusIdentityV2,
+    InvocationStatusReplyV2, InvocationSubmissionReplyV2, KernelErrorV2, KernelFactFilterV2,
+    KernelFactPageV2, KernelFactPredicateV2, KernelFactsQueryV2, KernelReplyV2,
+    MutationCommandKindV2, RecordedCommandErrorV2, ResourceLifecycleV2, ResourceResolveReplyV2,
+    ResourceResolveV2, RunTerminateV2, RunTerminatedReplyV2, StorageFaultCodeV2,
+};
+use deepcode_kernel_ledger::v2::FactQueryV2;
+use deepcode_kernel_tools::{
+    normalize_canonical_platform_path_v4, validate_canonical_invocation_v4,
+    LocalAuthorityToolCatalogV4,
+};
+use std::collections::{BTreeMap, HashMap};
+use std::fs;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::path::{Component, Path, PathBuf};
 
-static AUTHORITY_INSTANCE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
-
-#[derive(Debug, Clone)]
-struct GrantReservation {
-    reservation_id: GrantReservationId,
-    invocation_id: InvocationId,
-    operation_id: OperationId,
-    control_epoch: ControlEpoch,
-    lifecycle: GrantReservationLifecycle,
+pub(super) enum PrepareFailure {
+    Kernel(KernelErrorV2),
+    Target(TargetResolutionFailureV2),
 }
 
-#[derive(Debug, Clone)]
-struct GrantRecord {
-    grant_id: GrantId,
-    run_id: RunId,
-    control_epoch: ControlEpoch,
-    scope: CapabilityScope,
-    request_digest: String,
-    lifecycle: GrantLifecycle,
-    observed_use_count: u64,
-    reservations: HashMap<GrantReservationId, GrantReservation>,
+pub(super) enum DecisionSource {
+    None,
+    BuiltInPolicy,
+    TrustedUserDecision,
 }
 
-#[derive(Debug, Clone)]
-struct InvocationRecord {
-    invocation_id: InvocationId,
-    run_id: RunId,
-    operation_id: OperationId,
-    control_epoch: ControlEpoch,
-    grant_id: GrantId,
-    reservation_id: GrantReservationId,
-    scope: CapabilityScope,
-    request_digest: String,
-    idempotency_key_hash: String,
-    attempt_id: Option<AttemptId>,
-    lifecycle: InvocationLifecycle,
-    last_fact_id: FactId,
-    effect_outcome: Option<EffectOutcomeV2>,
+pub(super) enum RunCommandCheck {
+    Current(RunRecord),
+    Recorded(KernelReplyV2),
 }
 
-#[derive(Debug, Clone)]
-struct OperationRecord {
-    request_digest: String,
-    admission: InvocationAdmission,
+pub(super) const fn exact_epoch(control_epoch: ControlEpoch) -> CommandEpochContextV2 {
+    CommandEpochContextV2::Exact { control_epoch }
 }
 
-#[derive(Debug, Clone)]
-struct GrantOperationRecord {
-    request_digest: String,
-    grant_id: GrantId,
-}
-
-#[derive(Debug, Clone)]
-struct ReplaySubmission {
-    fact_id: FactId,
-    run_id: RunId,
-    operation_id: OperationId,
-    control_epoch: ControlEpoch,
-    tool_id: String,
-    request_digest: String,
-    idempotency_key_hash: String,
-}
-
-#[derive(Debug, Clone)]
-struct ReplayReservation {
-    fact_id: FactId,
-    run_id: RunId,
-    operation_id: OperationId,
-    control_epoch: ControlEpoch,
-    grant_id: GrantId,
-    reservation_id: GrantReservationId,
-}
-
-#[derive(Debug, Default)]
-struct ReplayPending {
-    submissions: HashMap<InvocationId, ReplaySubmission>,
-    reservations: HashMap<InvocationId, ReplayReservation>,
-}
-
-#[derive(Debug, Clone)]
-struct IdentityParts {
-    run_id: RunId,
-    control_epoch: ControlEpoch,
-    operation_id: Option<OperationId>,
-    grant_id: Option<GrantId>,
-    reservation_id: Option<GrantReservationId>,
-    invocation_id: Option<InvocationId>,
-    attempt_id: Option<AttemptId>,
-    causation_id: Option<FactId>,
-    idempotency_key_hash: Option<String>,
-}
-
-/// Dark v2 authority coordinator.
-///
-/// This type is deliberately not connected to the production command ingress.
-/// It owns only authority state and canonical fact writes; scheduling and
-/// executor dispatch remain outside this SP2 core.
-pub(crate) struct AuthorityRuntime {
-    fact_store: CanonicalFactStore,
-    current_epochs: HashMap<RunId, ControlEpoch>,
-    grants: HashMap<GrantId, GrantRecord>,
-    grant_operations: HashMap<(RunId, OperationId), GrantOperationRecord>,
-    invocations: HashMap<InvocationId, InvocationRecord>,
-    operations: HashMap<(RunId, OperationId), OperationRecord>,
-    instance_nonce: String,
-    next_id: u64,
-    storage_faulted_after_effect: bool,
-}
-
-impl std::fmt::Debug for AuthorityRuntime {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("AuthorityRuntime")
-            .field("current_epochs", &self.current_epochs)
-            .field("grants", &self.grants)
-            .field("grant_operations", &self.grant_operations)
-            .field("invocations", &self.invocations)
-            .field("operations", &self.operations)
-            .field(
-                "storage_faulted_after_effect",
-                &self.storage_faulted_after_effect,
-            )
-            .finish_non_exhaustive()
+pub(super) fn caused_attempt(
+    identity: &AttemptIdentityV2,
+    causation_fact_id: FactId,
+) -> AttemptIdentityV2 {
+    AttemptIdentityV2 {
+        causation_fact_id,
+        ..identity.clone()
     }
 }
 
-impl AuthorityRuntime {
-    /// Opens the authority coordinator from the canonical fact snapshot.
-    ///
-    /// Existing facts are always reduced before this method returns. An
-    /// unclosed durable attempt is failed before effect, while an unclosed
-    /// effect boundary is persisted as indeterminate. Recovery never exposes
-    /// a silently empty executable authority state.
-    pub(crate) fn open(fact_store: CanonicalFactStore) -> AuthorityResult<Self> {
-        let snapshot =
-            fact_store
-                .snapshot()
-                .map_err(|error| AuthorityError::FactStoreUnavailable {
-                    operation: "restore_authority_state",
-                    message: error.to_string(),
-                })?;
-        let instance_sequence = AUTHORITY_INSTANCE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let startup_nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or_default();
-        let mut runtime = Self {
-            fact_store,
-            current_epochs: HashMap::new(),
-            grants: HashMap::new(),
-            grant_operations: HashMap::new(),
-            invocations: HashMap::new(),
-            operations: HashMap::new(),
-            instance_nonce: format!(
-                "{startup_nanos:x}-{:x}-{:x}-{instance_sequence:x}",
-                std::process::id(),
-                snapshot.ledger_sequence_high_water
-            ),
-            next_id: 1,
-            storage_faulted_after_effect: false,
-        };
-        runtime.replay(snapshot.facts)?;
-        runtime.reconcile_unclosed_attempts()?;
-        Ok(runtime)
-    }
-
-    pub(crate) fn fact_store(&self) -> &CanonicalFactStore {
-        &self.fact_store
-    }
-
-    pub(crate) fn current_epoch(&self, run_id: &RunId) -> Option<ControlEpoch> {
-        self.current_epochs.get(run_id).copied()
-    }
-
-    pub(crate) fn is_storage_faulted_after_effect(&self) -> bool {
-        self.storage_faulted_after_effect
-    }
-
-    pub(crate) fn advance_control_epoch(
-        &mut self,
-        run_id: RunId,
-        input_id: InputId,
-        reason: Option<String>,
-    ) -> AuthorityResult<ControlAdvance> {
-        self.ensure_mutations_allowed()?;
-        run_id
-            .validate_as("runId")
-            .map_err(|error| invalid_request("runId", error))?;
-        input_id
-            .validate_as("inputId")
-            .map_err(|error| invalid_request("inputId", error))?;
-        validate_optional_text("reason", reason.as_deref())?;
-
-        let previous_epoch = self.current_epochs.get(&run_id).copied();
-        let next_epoch_value = previous_epoch
-            .map(ControlEpoch::get)
-            .unwrap_or(0)
-            .checked_add(1)
-            .ok_or_else(|| AuthorityError::InvalidRequest {
-                field: "controlEpoch",
-                reason: "overflow".to_string(),
-            })?;
-        let control_epoch = ControlEpoch::new(next_epoch_value)
-            .map_err(|error| invalid_request("controlEpoch", error))?;
-
-        let superseded = self
-            .grants
-            .values()
-            .filter(|grant| {
-                grant.run_id == run_id
-                    && grant.lifecycle == GrantLifecycle::Issued
-                    && grant.control_epoch != control_epoch
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        let unstarted_invocations = self
-            .invocations
-            .values()
-            .filter(|invocation| {
-                invocation.run_id == run_id
-                    && matches!(
-                        invocation.lifecycle,
-                        InvocationLifecycle::Admitted | InvocationLifecycle::AttemptPrepared
-                    )
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-
-        let epoch_fact_id = self.next_fact_id();
-        let mut drafts = vec![KernelFactDraftV2::new(
-            epoch_fact_id.clone(),
-            occurred_at(),
-            causal_identity(IdentityParts {
-                run_id: run_id.clone(),
-                control_epoch,
-                operation_id: None,
-                grant_id: None,
-                reservation_id: None,
-                invocation_id: None,
-                attempt_id: None,
-                causation_id: None,
-                idempotency_key_hash: None,
-            }),
-            KernelFactPayloadV2::Control(ControlFactV2 {
-                kind: ControlFactKindV2::EpochAdvanced,
-                input_id: Some(input_id),
-                cancel_request_id: None,
-                previous_epoch,
-                target_invocation_id: None,
-                reason: reason.clone(),
-            }),
-        )];
-
-        let authority_fact_id = if previous_epoch.is_some() {
-            let authority_fact_id = self.next_fact_id();
-            drafts.push(KernelFactDraftV2::new(
-                authority_fact_id.clone(),
-                occurred_at(),
-                causal_identity(IdentityParts {
-                    run_id: run_id.clone(),
-                    control_epoch,
-                    operation_id: None,
-                    grant_id: None,
-                    reservation_id: None,
-                    invocation_id: None,
-                    attempt_id: None,
-                    causation_id: Some(epoch_fact_id.clone()),
-                    idempotency_key_hash: None,
-                }),
-                KernelFactPayloadV2::Control(ControlFactV2 {
-                    kind: ControlFactKindV2::AuthoritySuperseded,
-                    input_id: None,
-                    cancel_request_id: None,
-                    previous_epoch,
-                    target_invocation_id: None,
-                    reason,
-                }),
-            ));
-            Some(authority_fact_id)
-        } else {
-            None
-        };
-
-        let mut closed_invocations = Vec::with_capacity(unstarted_invocations.len());
-        for invocation in &unstarted_invocations {
-            let grant = self
-                .grants
-                .get(&invocation.grant_id)
-                .cloned()
-                .ok_or_else(|| recovery_error("active invocation references unknown grant"))?;
-            let released = self.grant_draft(
-                &grant,
-                GrantFactKindV2::ReservationReleased,
-                Some(invocation.operation_id.clone()),
-                Some(invocation.invocation_id.clone()),
-                Some(invocation.reservation_id.clone()),
-                Some(invocation.last_fact_id.clone()),
-                Some("control_epoch_superseded".to_string()),
-            );
-            let released_fact_id = released.fact_id.clone();
-            drafts.push(released);
-            let terminal_kind = if invocation.attempt_id.is_some() {
-                InvocationFactKindV2::Failed
-            } else {
-                InvocationFactKindV2::FailedBeforeAttempt
-            };
-            let terminal = self.invocation_record_draft(
-                invocation,
-                terminal_kind,
-                invocation.attempt_id.clone(),
-                Some("ControlEpochSuperseded".to_string()),
-                Some(false),
-                Some(released_fact_id),
-            );
-            let terminal_fact_id = terminal.fact_id.clone();
-            drafts.push(terminal);
-            closed_invocations.push((invocation.invocation_id.clone(), terminal_fact_id));
-        }
-
-        for grant in &superseded {
-            drafts.push(self.grant_draft(
-                grant,
-                GrantFactKindV2::Superseded,
-                None,
-                None,
-                None,
-                authority_fact_id.clone(),
-                Some("control_epoch_advanced".to_string()),
-            ));
-        }
-
-        self.persist("advance_control_epoch", drafts, false)?;
-        self.current_epochs.insert(run_id, control_epoch);
-        for grant in &superseded {
-            if let Some(record) = self.grants.get_mut(&grant.grant_id) {
-                record.lifecycle = GrantLifecycle::Superseded;
-            }
-        }
-        for (invocation_id, terminal_fact_id) in closed_invocations {
-            if let Some(invocation) = self.invocations.get_mut(&invocation_id) {
-                invocation.lifecycle = InvocationLifecycle::Failed;
-                invocation.last_fact_id = terminal_fact_id;
-                if let Some(grant) = self.grants.get_mut(&invocation.grant_id) {
-                    if let Some(reservation) =
-                        grant.reservations.get_mut(&invocation.reservation_id)
-                    {
-                        reservation.lifecycle = GrantReservationLifecycle::Released;
-                    }
-                }
-            }
-        }
-
-        Ok(ControlAdvance {
-            previous_epoch,
-            control_epoch,
-            superseded_grant_ids: superseded.into_iter().map(|grant| grant.grant_id).collect(),
-        })
-    }
-
-    pub(crate) fn issue_grant(
-        &mut self,
-        request: GrantIssueRequest,
-    ) -> AuthorityResult<GrantSnapshot> {
-        self.ensure_mutations_allowed()?;
-        request
-            .run_id
-            .validate_as("runId")
-            .map_err(|error| invalid_request("runId", error))?;
-        request
-            .operation_id
-            .validate_as("operationId")
-            .map_err(|error| invalid_request("operationId", error))?;
-        request
-            .control_epoch
-            .validate()
-            .map_err(|error| invalid_request("controlEpoch", error))?;
-        self.validate_current_epoch(&request.run_id, request.control_epoch)?;
-        validate_scope(&request.scope)?;
-        require_non_empty("requestDigest", &request.request_digest)?;
-        validate_optional_text("reason", request.reason.as_deref())?;
-
-        let operation_key = (request.run_id.clone(), request.operation_id.clone());
-        if let Some(existing) = self.grant_operations.get(&operation_key) {
-            if existing.request_digest != request.request_digest {
-                return Err(AuthorityError::DuplicateOperationDigestMismatch {
-                    run_id: request.run_id,
-                    operation_id: request.operation_id,
-                });
-            }
-            return self
-                .grant_snapshot(&existing.grant_id)
-                .ok_or_else(|| recovery_error("grant operation index references unknown grant"));
-        }
-        if self
-            .operations
-            .get(&operation_key)
-            .is_some_and(|existing| existing.request_digest != request.request_digest)
-        {
-            return Err(AuthorityError::DuplicateOperationDigestMismatch {
-                run_id: request.run_id,
-                operation_id: request.operation_id,
-            });
-        }
-
-        let grant_id = GrantId::new(self.next_kernel_id("grant"));
-        let grant = GrantRecord {
-            grant_id: grant_id.clone(),
-            run_id: request.run_id,
-            control_epoch: request.control_epoch,
-            scope: request.scope,
-            request_digest: request.request_digest,
-            lifecycle: GrantLifecycle::Issued,
-            observed_use_count: 0,
-            reservations: HashMap::new(),
-        };
-        let draft = self.grant_draft(
-            &grant,
-            GrantFactKindV2::Issued,
-            Some(request.operation_id),
-            None,
-            None,
-            None,
-            request.reason,
-        );
-        self.persist("issue_grant", vec![draft], false)?;
-        self.grants.insert(grant_id.clone(), grant.clone());
-        self.grant_operations.insert(
-            operation_key,
-            GrantOperationRecord {
-                request_digest: grant.request_digest.clone(),
-                grant_id,
-            },
-        );
-        Ok(grant_snapshot(&grant))
-    }
-
-    pub(crate) fn revoke_grant(
-        &mut self,
-        run_id: &RunId,
-        grant_id: &GrantId,
-        reason: Option<String>,
-    ) -> AuthorityResult<GrantSnapshot> {
-        self.ensure_mutations_allowed()?;
-        run_id
-            .validate_as("runId")
-            .map_err(|error| invalid_request("runId", error))?;
-        grant_id
-            .validate_as("grantId")
-            .map_err(|error| invalid_request("grantId", error))?;
-        validate_optional_text("reason", reason.as_deref())?;
-        let grant =
-            self.grants
-                .get(grant_id)
-                .cloned()
-                .ok_or_else(|| AuthorityError::GrantRequired {
-                    grant_id: grant_id.clone(),
-                })?;
-        if &grant.run_id != run_id {
-            return Err(AuthorityError::GrantScopeMismatch {
-                grant_id: grant_id.clone(),
-            });
-        }
-        if grant.lifecycle != GrantLifecycle::Issued {
-            return Ok(grant_snapshot(&grant));
-        }
-
-        let unstarted_invocations = self
-            .invocations
-            .values()
-            .filter(|invocation| {
-                invocation.grant_id == grant.grant_id
-                    && matches!(
-                        invocation.lifecycle,
-                        InvocationLifecycle::Admitted | InvocationLifecycle::AttemptPrepared
-                    )
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut drafts = Vec::with_capacity(unstarted_invocations.len() * 2 + 1);
-        let mut closed_invocations = Vec::with_capacity(unstarted_invocations.len());
-        for invocation in &unstarted_invocations {
-            let released = self.grant_draft(
-                &grant,
-                GrantFactKindV2::ReservationReleased,
-                Some(invocation.operation_id.clone()),
-                Some(invocation.invocation_id.clone()),
-                Some(invocation.reservation_id.clone()),
-                Some(invocation.last_fact_id.clone()),
-                Some("grant_revoked".to_string()),
-            );
-            let released_fact_id = released.fact_id.clone();
-            drafts.push(released);
-            let terminal_kind = if invocation.attempt_id.is_some() {
-                InvocationFactKindV2::Failed
-            } else {
-                InvocationFactKindV2::FailedBeforeAttempt
-            };
-            let terminal = self.invocation_record_draft(
-                invocation,
-                terminal_kind,
-                invocation.attempt_id.clone(),
-                Some("GrantRevoked".to_string()),
-                Some(false),
-                Some(released_fact_id),
-            );
-            let terminal_fact_id = terminal.fact_id.clone();
-            drafts.push(terminal);
-            closed_invocations.push((invocation.invocation_id.clone(), terminal_fact_id));
-        }
-        let revoked = self.grant_draft(
-            &grant,
-            GrantFactKindV2::Revoked,
-            None,
-            None,
-            None,
-            None,
-            reason,
-        );
-        drafts.push(revoked);
-        self.persist("revoke_grant", drafts, false)?;
-        let record = self
-            .grants
-            .get_mut(grant_id)
-            .expect("grant existence checked before persistence");
-        record.lifecycle = GrantLifecycle::Revoked;
-        for (invocation_id, terminal_fact_id) in closed_invocations {
-            if let Some(invocation) = self.invocations.get_mut(&invocation_id) {
-                invocation.lifecycle = InvocationLifecycle::Failed;
-                invocation.last_fact_id = terminal_fact_id;
-                if let Some(reservation) = record.reservations.get_mut(&invocation.reservation_id) {
-                    reservation.lifecycle = GrantReservationLifecycle::Released;
-                }
-            }
-        }
-        Ok(grant_snapshot(record))
-    }
-
-    pub(crate) fn submit_invocation(
-        &mut self,
-        request: InvocationSubmitRequest,
-    ) -> AuthorityResult<InvocationAdmission> {
-        self.ensure_mutations_allowed()?;
-        request
-            .run_id
-            .validate_as("runId")
-            .map_err(|error| invalid_request("runId", error))?;
-        request
-            .operation_id
-            .validate_as("operationId")
-            .map_err(|error| invalid_request("operationId", error))?;
-        request
-            .grant_id
-            .validate_as("grantId")
-            .map_err(|error| invalid_request("grantId", error))?;
-        request
-            .control_epoch
-            .validate()
-            .map_err(|error| invalid_request("controlEpoch", error))?;
-        validate_scope(&request.scope)?;
-        require_non_empty("requestDigest", &request.request_digest)?;
-        require_non_empty("idempotencyKeyHash", &request.idempotency_key_hash)?;
-
-        self.validate_current_epoch(&request.run_id, request.control_epoch)?;
-        let operation_key = (request.run_id.clone(), request.operation_id.clone());
-        if let Some(existing) = self.operations.get(&operation_key) {
-            if existing.request_digest != request.request_digest {
-                return Err(AuthorityError::DuplicateOperationDigestMismatch {
-                    run_id: request.run_id,
-                    operation_id: request.operation_id,
-                });
-            }
-            let mut admission = existing.admission.clone();
-            admission.replayed = true;
-            return Ok(admission);
-        }
-        if self
-            .grant_operations
-            .get(&operation_key)
-            .is_some_and(|existing| existing.request_digest != request.request_digest)
-        {
-            return Err(AuthorityError::DuplicateOperationDigestMismatch {
-                run_id: request.run_id,
-                operation_id: request.operation_id,
-            });
-        }
-
-        let invocation_id = InvocationId::new(self.next_kernel_id("invocation"));
-        let submitted_fact_id = self.next_fact_id();
-        let submitted = self.invocation_draft(
-            &request,
-            invocation_id.clone(),
-            None,
-            None,
-            InvocationFactKindV2::Submitted,
-            None,
-            None,
-            None,
-            None,
-            submitted_fact_id.clone(),
-        );
-
-        let grant = match self.grants.get(&request.grant_id).cloned() {
-            Some(grant)
-                if grant.run_id == request.run_id
-                    && grant.control_epoch == request.control_epoch
-                    && grant.lifecycle == GrantLifecycle::Issued =>
-            {
-                grant
-            }
-            _ => {
-                return self.reject_invocation(
-                    &request,
-                    invocation_id,
-                    submitted,
-                    submitted_fact_id,
-                    KernelErrorCodeV2::GrantRequired,
-                    false,
-                );
-            }
-        };
-        if grant.scope != request.scope {
-            return self.reject_invocation(
-                &request,
-                invocation_id,
-                submitted,
-                submitted_fact_id,
-                KernelErrorCodeV2::GrantScopeMismatch,
-                false,
-            );
-        }
-
-        let reservation_id = GrantReservationId::new(self.next_kernel_id("reservation"));
-        let reserved = self.grant_draft(
-            &grant,
-            GrantFactKindV2::Reserved,
-            Some(request.operation_id.clone()),
-            Some(invocation_id.clone()),
-            Some(reservation_id.clone()),
-            Some(submitted_fact_id),
-            None,
-        );
-        let reserved_fact_id = reserved.fact_id.clone();
-        let admitted_fact_id = self.next_fact_id();
-        let admitted = self.invocation_draft(
-            &request,
-            invocation_id.clone(),
-            Some(grant.grant_id.clone()),
-            Some(reservation_id.clone()),
-            InvocationFactKindV2::Admitted,
-            None,
-            None,
-            None,
-            Some(reserved_fact_id),
-            admitted_fact_id.clone(),
-        );
-        self.persist(
-            "submit_invocation",
-            vec![submitted, reserved, admitted],
-            false,
-        )?;
-
-        let reservation = GrantReservation {
-            reservation_id: reservation_id.clone(),
-            invocation_id: invocation_id.clone(),
-            operation_id: request.operation_id.clone(),
-            control_epoch: request.control_epoch,
-            lifecycle: GrantReservationLifecycle::Reserved,
-        };
-        self.grants
-            .get_mut(&grant.grant_id)
-            .expect("grant existence checked before persistence")
-            .reservations
-            .insert(reservation_id.clone(), reservation);
-
-        let record = InvocationRecord {
-            invocation_id: invocation_id.clone(),
-            run_id: request.run_id.clone(),
-            operation_id: request.operation_id.clone(),
-            control_epoch: request.control_epoch,
-            grant_id: grant.grant_id,
-            reservation_id,
-            scope: request.scope,
-            request_digest: request.request_digest.clone(),
-            idempotency_key_hash: request.idempotency_key_hash,
-            attempt_id: None,
-            lifecycle: InvocationLifecycle::Admitted,
-            last_fact_id: admitted_fact_id,
-            effect_outcome: None,
-        };
-        self.invocations.insert(invocation_id.clone(), record);
-        let admission = InvocationAdmission {
-            invocation_id,
-            admitted: true,
-            rejection_code: None,
-            retryable: false,
-            replayed: false,
-        };
-        self.operations.insert(
-            operation_key,
-            OperationRecord {
-                request_digest: request.request_digest,
-                admission: admission.clone(),
-            },
-        );
-        Ok(admission)
-    }
-
-    pub(crate) fn prepare_attempt(
-        &mut self,
-        invocation_id: &InvocationId,
-    ) -> AuthorityResult<AttemptId> {
-        self.ensure_mutations_allowed()?;
-        let invocation = self.invocation(invocation_id)?.clone();
-        require_state(&invocation, InvocationLifecycle::Admitted, "admitted")?;
-        self.validate_current_epoch(&invocation.run_id, invocation.control_epoch)?;
-        let grant =
-            self.grants
-                .get(&invocation.grant_id)
-                .ok_or_else(|| AuthorityError::GrantRequired {
-                    grant_id: invocation.grant_id.clone(),
-                })?;
-        if grant.lifecycle != GrantLifecycle::Issued {
-            return Err(AuthorityError::GrantRequired {
-                grant_id: invocation.grant_id,
-            });
-        }
-        let reservation = grant
-            .reservations
-            .get(&invocation.reservation_id)
-            .ok_or_else(|| AuthorityError::GrantRequired {
-                grant_id: invocation.grant_id.clone(),
-            })?;
-        if grant.run_id != invocation.run_id
-            || grant.control_epoch != invocation.control_epoch
-            || grant.scope != invocation.scope
-            || reservation.lifecycle != GrantReservationLifecycle::Reserved
-            || reservation.invocation_id != invocation.invocation_id
-            || reservation.operation_id != invocation.operation_id
-        {
-            return Err(AuthorityError::GrantScopeMismatch {
-                grant_id: invocation.grant_id,
-            });
-        }
-        let attempt_id = AttemptId::new(self.next_kernel_id("attempt"));
-        let draft = self.invocation_record_draft(
-            &invocation,
-            InvocationFactKindV2::AttemptPrepared,
-            Some(attempt_id.clone()),
-            None,
-            None,
-            Some(invocation.last_fact_id.clone()),
-        );
-        let prepared_fact_id = draft.fact_id.clone();
-        self.persist("prepare_attempt", vec![draft], false)?;
-        let record = self
-            .invocations
-            .get_mut(invocation_id)
-            .expect("invocation existence checked before persistence");
-        record.attempt_id = Some(attempt_id.clone());
-        record.lifecycle = InvocationLifecycle::AttemptPrepared;
-        record.last_fact_id = prepared_fact_id;
-        Ok(attempt_id)
-    }
-
-    /// Commits the durable effect boundary. The caller must not invoke the
-    /// executor until this method succeeds.
-    pub(crate) fn begin_effect(&mut self, invocation_id: &InvocationId) -> AuthorityResult<()> {
-        self.ensure_mutations_allowed()?;
-        let invocation = self.invocation(invocation_id)?.clone();
-        require_state(
-            &invocation,
-            InvocationLifecycle::AttemptPrepared,
-            "attemptPrepared",
-        )?;
-        self.validate_current_epoch(&invocation.run_id, invocation.control_epoch)?;
-        let attempt_id = invocation
-            .attempt_id
-            .clone()
-            .expect("attempt-prepared invocation owns an attempt id");
-        let grant = self
-            .grants
-            .get(&invocation.grant_id)
-            .cloned()
-            .ok_or_else(|| AuthorityError::GrantRequired {
-                grant_id: invocation.grant_id.clone(),
-            })?;
-        if grant.lifecycle != GrantLifecycle::Issued {
-            return Err(AuthorityError::GrantRequired {
-                grant_id: grant.grant_id,
-            });
-        }
-        if grant.run_id != invocation.run_id
-            || grant.control_epoch != invocation.control_epoch
-            || grant.scope != invocation.scope
-        {
-            return Err(AuthorityError::GrantScopeMismatch {
-                grant_id: grant.grant_id,
-            });
-        }
-        let reservation = grant
-            .reservations
-            .get(&invocation.reservation_id)
-            .ok_or_else(|| AuthorityError::GrantRequired {
-                grant_id: grant.grant_id.clone(),
-            })?;
-        if reservation.lifecycle != GrantReservationLifecycle::Reserved
-            || reservation.invocation_id != invocation.invocation_id
-            || reservation.operation_id != invocation.operation_id
-            || reservation.control_epoch != invocation.control_epoch
-        {
-            return Err(AuthorityError::GrantScopeMismatch {
-                grant_id: grant.grant_id,
-            });
-        }
-
-        let consumed_fact_id = self.next_fact_id();
-        let consumed = self.grant_draft_with_use_count(
-            &grant,
-            GrantFactKindV2::Consumed,
-            Some(invocation.operation_id.clone()),
-            Some(invocation.invocation_id.clone()),
-            Some(invocation.reservation_id.clone()),
-            Some(attempt_id.clone()),
-            Some(invocation.last_fact_id.clone()),
-            None,
-            grant.observed_use_count.checked_add(1).ok_or_else(|| {
-                AuthorityError::InvalidRequest {
-                    field: "observedUseCount",
-                    reason: "overflow".to_string(),
-                }
-            })?,
-            consumed_fact_id.clone(),
-        );
-        let started = self.invocation_record_draft(
-            &invocation,
-            InvocationFactKindV2::ExecutionStarted,
-            Some(attempt_id),
-            None,
-            None,
-            Some(consumed_fact_id),
-        );
-        let started_fact_id = started.fact_id.clone();
-        self.persist("begin_effect", vec![consumed, started], false)?;
-
-        let grant = self
-            .grants
-            .get_mut(&invocation.grant_id)
-            .expect("grant existence checked before persistence");
-        grant.observed_use_count += 1;
-        grant
-            .reservations
-            .get_mut(&invocation.reservation_id)
-            .expect("reservation existence checked before persistence")
-            .lifecycle = GrantReservationLifecycle::Consumed;
-        let invocation = self
-            .invocations
-            .get_mut(invocation_id)
-            .expect("invocation existence checked before persistence");
-        invocation.lifecycle = InvocationLifecycle::EffectStarted;
-        invocation.last_fact_id = started_fact_id;
-        Ok(())
-    }
-
-    pub(crate) fn finalize_pre_effect_failure(
-        &mut self,
-        invocation_id: &InvocationId,
-        error_code: impl Into<String>,
-    ) -> AuthorityResult<()> {
-        self.ensure_mutations_allowed()?;
-        let invocation = self.invocation(invocation_id)?.clone();
-        if !matches!(
-            invocation.lifecycle,
-            InvocationLifecycle::Admitted | InvocationLifecycle::AttemptPrepared
-        ) {
-            return Err(AuthorityError::InvalidInvocationState {
-                invocation_id: invocation.invocation_id,
-                expected: "admitted or attemptPrepared",
-                actual: invocation.lifecycle,
-            });
-        }
-        let error_code = error_code.into();
-        require_non_empty("errorCode", &error_code)?;
-        let grant = self
-            .grants
-            .get(&invocation.grant_id)
-            .cloned()
-            .ok_or_else(|| AuthorityError::GrantRequired {
-                grant_id: invocation.grant_id.clone(),
-            })?;
-
-        let released = self.grant_draft(
-            &grant,
-            GrantFactKindV2::ReservationReleased,
-            Some(invocation.operation_id.clone()),
-            Some(invocation.invocation_id.clone()),
-            Some(invocation.reservation_id.clone()),
-            Some(invocation.last_fact_id.clone()),
-            Some(error_code.clone()),
-        );
-        let release_fact_id = released.fact_id.clone();
-        let terminal_kind = if invocation.attempt_id.is_some() {
-            InvocationFactKindV2::Failed
-        } else {
-            InvocationFactKindV2::FailedBeforeAttempt
-        };
-        let terminal = self.invocation_record_draft(
-            &invocation,
-            terminal_kind,
-            invocation.attempt_id.clone(),
-            Some(error_code),
-            Some(false),
-            Some(release_fact_id),
-        );
-        let terminal_fact_id = terminal.fact_id.clone();
-        self.persist(
-            "finalize_pre_effect_failure",
-            vec![released, terminal],
-            false,
-        )?;
-
-        if let Some(grant) = self.grants.get_mut(&invocation.grant_id) {
-            if let Some(reservation) = grant.reservations.get_mut(&invocation.reservation_id) {
-                reservation.lifecycle = GrantReservationLifecycle::Released;
-            }
-        }
-        let record = self
-            .invocations
-            .get_mut(invocation_id)
-            .expect("invocation existence checked before persistence");
-        record.lifecycle = InvocationLifecycle::Failed;
-        record.last_fact_id = terminal_fact_id;
-        Ok(())
-    }
-
-    pub(crate) fn finalize_effect(
-        &mut self,
-        invocation_id: &InvocationId,
-        completion: EffectCompletion,
-    ) -> AuthorityResult<()> {
-        self.ensure_mutations_allowed()?;
-        let invocation = self.invocation(invocation_id)?.clone();
-        require_state(
-            &invocation,
-            InvocationLifecycle::EffectStarted,
-            "effectStarted",
-        )?;
-        if let Some(error_code) = completion.error_code.as_deref() {
-            require_non_empty("errorCode", error_code)?;
-        }
-        let attempt_id = invocation
-            .attempt_id
-            .clone()
-            .expect("effect-started invocation owns an attempt id");
-        let effect_fact_id = self.next_fact_id();
-        let effect = KernelFactDraftV2::new(
-            effect_fact_id.clone(),
-            occurred_at(),
-            causal_identity(IdentityParts {
-                run_id: invocation.run_id.clone(),
-                control_epoch: invocation.control_epoch,
-                operation_id: Some(invocation.operation_id.clone()),
-                grant_id: Some(invocation.grant_id.clone()),
-                reservation_id: Some(invocation.reservation_id.clone()),
-                invocation_id: Some(invocation.invocation_id.clone()),
-                attempt_id: Some(attempt_id.clone()),
-                causation_id: Some(invocation.last_fact_id.clone()),
-                idempotency_key_hash: Some(invocation.idempotency_key_hash.clone()),
-            }),
-            KernelFactPayloadV2::Effect(EffectFactV2 {
-                effect_id: EffectId::new(self.next_kernel_id("effect")),
-                invocation_id: invocation.invocation_id.clone(),
-                attempt_id: attempt_id.clone(),
-                outcome: EffectOutcomeV2::Observed,
-                affected_resources: completion.affected_resource_ids,
-                receipt: Some(completion.receipt),
-            }),
-        );
-        let (fact_kind, lifecycle, error_code) = match completion.terminal_outcome {
-            TerminalInvocationOutcome::Completed => (
-                InvocationFactKindV2::Completed,
-                InvocationLifecycle::Completed,
-                None,
-            ),
-            TerminalInvocationOutcome::Failed => (
-                InvocationFactKindV2::Failed,
-                InvocationLifecycle::Failed,
-                Some(
-                    completion
-                        .error_code
-                        .unwrap_or_else(|| "ExecutorFailedAfterEffect".to_string()),
-                ),
-            ),
-        };
-        let terminal = self.invocation_record_draft(
-            &invocation,
-            fact_kind,
-            Some(attempt_id),
-            error_code,
-            Some(false),
-            Some(effect_fact_id),
-        );
-        let terminal_fact_id = terminal.fact_id.clone();
-        self.persist("finalize_effect", vec![effect, terminal], true)?;
-        let record = self
-            .invocations
-            .get_mut(invocation_id)
-            .expect("invocation existence checked before persistence");
-        record.lifecycle = lifecycle;
-        record.last_fact_id = terminal_fact_id;
-        record.effect_outcome = Some(EffectOutcomeV2::Observed);
-        Ok(())
-    }
-
-    pub(crate) fn finalize_indeterminate(
-        &mut self,
-        invocation_id: &InvocationId,
-        receipt: serde_json::Value,
-    ) -> AuthorityResult<()> {
-        self.ensure_mutations_allowed()?;
-        let invocation = self.invocation(invocation_id)?.clone();
-        require_state(
-            &invocation,
-            InvocationLifecycle::EffectStarted,
-            "effectStarted",
-        )?;
-        let attempt_id = invocation
-            .attempt_id
-            .clone()
-            .expect("effect-started invocation owns an attempt id");
-        let effect_fact_id = self.next_fact_id();
-        let effect = KernelFactDraftV2::new(
-            effect_fact_id.clone(),
-            occurred_at(),
-            causal_identity(IdentityParts {
-                run_id: invocation.run_id.clone(),
-                control_epoch: invocation.control_epoch,
-                operation_id: Some(invocation.operation_id.clone()),
-                grant_id: Some(invocation.grant_id.clone()),
-                reservation_id: Some(invocation.reservation_id.clone()),
-                invocation_id: Some(invocation.invocation_id.clone()),
-                attempt_id: Some(attempt_id.clone()),
-                causation_id: Some(invocation.last_fact_id.clone()),
-                idempotency_key_hash: Some(invocation.idempotency_key_hash.clone()),
-            }),
-            KernelFactPayloadV2::Effect(EffectFactV2 {
-                effect_id: EffectId::new(self.next_kernel_id("effect")),
-                invocation_id: invocation.invocation_id.clone(),
-                attempt_id: attempt_id.clone(),
-                outcome: EffectOutcomeV2::Indeterminate,
-                affected_resources: Vec::new(),
-                receipt: Some(receipt),
-            }),
-        );
-        let terminal = self.invocation_record_draft(
-            &invocation,
-            InvocationFactKindV2::Indeterminate,
-            Some(attempt_id),
-            Some("EffectIndeterminate".to_string()),
-            Some(false),
-            Some(effect_fact_id),
-        );
-        let terminal_fact_id = terminal.fact_id.clone();
-        self.persist("finalize_indeterminate", vec![effect, terminal], true)?;
-        let record = self
-            .invocations
-            .get_mut(invocation_id)
-            .expect("invocation existence checked before persistence");
-        record.lifecycle = InvocationLifecycle::Indeterminate;
-        record.last_fact_id = terminal_fact_id;
-        record.effect_outcome = Some(EffectOutcomeV2::Indeterminate);
-        Ok(())
-    }
-
-    pub(crate) fn grant_snapshot(&self, grant_id: &GrantId) -> Option<GrantSnapshot> {
-        self.grants.get(grant_id).map(grant_snapshot)
-    }
-
-    pub(crate) fn invocation_snapshot(
-        &self,
-        invocation_id: &InvocationId,
-    ) -> Option<InvocationSnapshot> {
-        self.invocations.get(invocation_id).map(invocation_snapshot)
-    }
-
-    fn replay(&mut self, facts: Vec<KernelFactEnvelopeV2>) -> AuthorityResult<()> {
-        let mut seen_fact_ids = HashSet::with_capacity(facts.len());
-        let mut pending = ReplayPending::default();
-        for fact in facts {
-            if matches!(
-                &fact.payload,
-                KernelFactPayloadV2::Grant(_)
-                    | KernelFactPayloadV2::Invocation(_)
-                    | KernelFactPayloadV2::Effect(_)
-            ) {
-                if let Some(causation_id) = fact.identity.causation_id.as_ref() {
-                    if !seen_fact_ids.contains(causation_id) {
-                        return Err(recovery_error(format!(
-                            "runtime authority fact {} references non-prior cause {}",
-                            fact.fact_id, causation_id
-                        )));
-                    }
-                }
-            }
-            match &fact.payload {
-                KernelFactPayloadV2::Control(control) => {
-                    if control.kind == ControlFactKindV2::EpochAdvanced {
-                        let current = self.current_epochs.get(&fact.identity.run_id).copied();
-                        match current {
-                            None => {
-                                if control.previous_epoch.is_some()
-                                    || fact.identity.control_epoch.get() != 1
-                                {
-                                    return Err(recovery_error(format!(
-                                        "run {} must start at control epoch 1 without a previous epoch",
-                                        fact.identity.run_id
-                                    )));
-                                }
-                            }
-                            Some(current) => {
-                                let expected = current.get().checked_add(1).ok_or_else(|| {
-                                    recovery_error(format!(
-                                        "run {} control epoch overflowed during replay",
-                                        fact.identity.run_id
-                                    ))
-                                })?;
-                                if control.previous_epoch != Some(current)
-                                    || fact.identity.control_epoch.get() != expected
-                                {
-                                    return Err(recovery_error(format!(
-                                        "run {} control epoch {:?} does not exactly follow {:?}",
-                                        fact.identity.run_id, fact.identity.control_epoch, current
-                                    )));
-                                }
-                            }
-                        }
-                        self.current_epochs
-                            .insert(fact.identity.run_id.clone(), fact.identity.control_epoch);
-                    }
-                }
-                KernelFactPayloadV2::Grant(grant) => {
-                    self.replay_grant(&fact, grant, &mut pending)?;
-                }
-                KernelFactPayloadV2::Invocation(invocation) => {
-                    self.replay_invocation(&fact, invocation, &mut pending)?;
-                }
-                KernelFactPayloadV2::Effect(effect) => {
-                    self.replay_effect(&fact, effect)?;
-                }
-                KernelFactPayloadV2::Resource(_) | KernelFactPayloadV2::Cleanup(_) => {}
-            }
-            if !seen_fact_ids.insert(fact.fact_id.clone()) {
-                return Err(recovery_error(format!(
-                    "canonical snapshot repeats fact id {}",
-                    fact.fact_id
-                )));
-            }
-        }
-
-        if !pending.submissions.is_empty() || !pending.reservations.is_empty() {
-            return Err(recovery_error(
-                "canonical snapshot ends with an incomplete invocation admission chain",
-            ));
-        }
-        for grant in self.grants.values() {
-            let current_epoch = self.current_epochs.get(&grant.run_id).copied();
-            if current_epoch.is_none() {
-                return Err(recovery_error(format!(
-                    "grant {} has no preceding control epoch",
-                    grant.grant_id
-                )));
-            }
-        }
-        Ok(())
-    }
-
-    fn replay_grant(
-        &mut self,
-        envelope: &KernelFactEnvelopeV2,
-        fact: &GrantFactV2,
-        pending: &mut ReplayPending,
-    ) -> AuthorityResult<()> {
-        if fact.kind == GrantFactKindV2::Requested {
-            return Ok(());
-        }
-        let scope = CapabilityScope::new(
-            fact.tool_id.clone(),
-            fact.resource_scope.clone(),
-            fact.effect_scope.clone(),
-        )?;
-        if !self.grants.contains_key(&fact.grant_id) {
-            if fact.kind != GrantFactKindV2::Issued || fact.observed_use_count != 0 {
-                return Err(recovery_error(format!(
-                    "grant {} must begin with an issued fact at observedUseCount 0",
-                    fact.grant_id
-                )));
-            }
-            let operation_id = envelope
-                .identity
-                .operation_id
-                .clone()
-                .ok_or_else(|| recovery_error("issued grant has no operation id"))?;
-            let operation_key = (envelope.identity.run_id.clone(), operation_id.clone());
-            match self.grant_operations.get(&operation_key) {
-                Some(existing)
-                    if existing.request_digest == fact.request_digest
-                        && existing.grant_id == fact.grant_id => {}
-                Some(_) => {
-                    return Err(recovery_error(format!(
-                        "grant operation {operation_id} has conflicting issuance facts"
-                    )));
-                }
-                None => {
-                    self.grant_operations.insert(
-                        operation_key.clone(),
-                        GrantOperationRecord {
-                            request_digest: fact.request_digest.clone(),
-                            grant_id: fact.grant_id.clone(),
-                        },
-                    );
-                }
-            }
-            if self
-                .operations
-                .get(&operation_key)
-                .is_some_and(|existing| existing.request_digest != fact.request_digest)
-            {
-                return Err(recovery_error(format!(
-                    "operation {operation_id} has different grant and invocation digests"
-                )));
-            }
-            self.grants.insert(
-                fact.grant_id.clone(),
-                GrantRecord {
-                    grant_id: fact.grant_id.clone(),
-                    run_id: envelope.identity.run_id.clone(),
-                    control_epoch: envelope.identity.control_epoch,
-                    scope,
-                    request_digest: fact.request_digest.clone(),
-                    lifecycle: GrantLifecycle::Issued,
-                    observed_use_count: 0,
-                    reservations: HashMap::new(),
-                },
-            );
-            return Ok(());
-        }
-
-        let grant = self
-            .grants
-            .get_mut(&fact.grant_id)
-            .expect("grant existence checked above");
-        if grant.run_id != envelope.identity.run_id
-            || grant.control_epoch != envelope.identity.control_epoch
-            || grant.scope != scope
-            || grant.request_digest != fact.request_digest
-        {
-            return Err(recovery_error(format!(
-                "grant {} changed its run, epoch, or exact scope",
-                fact.grant_id
-            )));
-        }
-        if grant.lifecycle != GrantLifecycle::Issued {
-            return Err(recovery_error(format!(
-                "terminal grant {} received later {:?} fact",
-                fact.grant_id, fact.kind
-            )));
-        }
-
-        let mut advance_invocation_cursor = None;
-        match fact.kind {
-            GrantFactKindV2::Issued => {
-                return Err(recovery_error(format!(
-                    "grant {} was issued more than once",
-                    fact.grant_id
-                )));
-            }
-            GrantFactKindV2::Revoked | GrantFactKindV2::Expired | GrantFactKindV2::Superseded => {
-                if fact.observed_use_count != grant.observed_use_count {
-                    return Err(recovery_error(format!(
-                        "terminal grant {} changed observedUseCount from {} to {}",
-                        fact.grant_id, grant.observed_use_count, fact.observed_use_count
-                    )));
-                }
-                grant.lifecycle = match fact.kind {
-                    GrantFactKindV2::Revoked => GrantLifecycle::Revoked,
-                    GrantFactKindV2::Expired => GrantLifecycle::Expired,
-                    GrantFactKindV2::Superseded => GrantLifecycle::Superseded,
-                    _ => unreachable!("terminal grant kinds matched above"),
-                };
-            }
-            GrantFactKindV2::Reserved
-            | GrantFactKindV2::Consumed
-            | GrantFactKindV2::ReservationReleased => {
-                let reservation_id =
-                    envelope
-                        .identity
-                        .grant_reservation_id
-                        .clone()
-                        .ok_or_else(|| {
-                            recovery_error("grant reservation fact has no reservation id")
-                        })?;
-                let invocation_id =
-                    envelope.identity.invocation_id.clone().ok_or_else(|| {
-                        recovery_error("grant reservation fact has no invocation id")
-                    })?;
-                let operation_id =
-                    envelope.identity.operation_id.clone().ok_or_else(|| {
-                        recovery_error("grant reservation fact has no operation id")
-                    })?;
-                match fact.kind {
-                    GrantFactKindV2::Reserved => {
-                        let submission =
-                            pending.submissions.get(&invocation_id).ok_or_else(|| {
-                                recovery_error(format!(
-                                    "reservation {reservation_id} has no exact submitted invocation"
-                                ))
-                            })?;
-                        if submission.run_id != envelope.identity.run_id
-                            || submission.operation_id != operation_id
-                            || submission.control_epoch != envelope.identity.control_epoch
-                            || submission.tool_id != fact.tool_id
-                            || envelope.identity.causation_id.as_ref() != Some(&submission.fact_id)
-                        {
-                            return Err(recovery_error(format!(
-                                "reservation {reservation_id} does not exactly follow invocation submission {invocation_id}"
-                            )));
-                        }
-                        if fact.observed_use_count != grant.observed_use_count {
-                            return Err(recovery_error(format!(
-                                "reservation {reservation_id} changed observedUseCount"
-                            )));
-                        }
-                        if grant.reservations.contains_key(&reservation_id) {
-                            return Err(recovery_error(format!(
-                                "reservation {reservation_id} was reserved more than once"
-                            )));
-                        }
-                        if pending.reservations.contains_key(&invocation_id) {
-                            return Err(recovery_error(format!(
-                                "invocation {invocation_id} owns more than one pending reservation"
-                            )));
-                        }
-                        pending.reservations.insert(
-                            invocation_id.clone(),
-                            ReplayReservation {
-                                fact_id: envelope.fact_id.clone(),
-                                run_id: envelope.identity.run_id.clone(),
-                                operation_id: operation_id.clone(),
-                                control_epoch: envelope.identity.control_epoch,
-                                grant_id: fact.grant_id.clone(),
-                                reservation_id: reservation_id.clone(),
-                            },
-                        );
-                        grant.reservations.insert(
-                            reservation_id.clone(),
-                            GrantReservation {
-                                reservation_id,
-                                invocation_id,
-                                operation_id,
-                                control_epoch: envelope.identity.control_epoch,
-                                lifecycle: GrantReservationLifecycle::Reserved,
-                            },
-                        );
-                    }
-                    GrantFactKindV2::Consumed | GrantFactKindV2::ReservationReleased => {
-                        let reservation =
-                            grant.reservations.get_mut(&reservation_id).ok_or_else(|| {
-                                recovery_error(format!(
-                                    "reservation {reservation_id} terminal fact precedes reservation"
-                                ))
-                            })?;
-                        if reservation.invocation_id != invocation_id
-                            || reservation.operation_id != operation_id
-                            || reservation.control_epoch != envelope.identity.control_epoch
-                        {
-                            return Err(recovery_error(format!(
-                                "reservation {reservation_id} changed its causal binding"
-                            )));
-                        }
-                        if reservation.lifecycle != GrantReservationLifecycle::Reserved {
-                            return Err(recovery_error(format!(
-                                "reservation {reservation_id} cannot transition from {:?} via {:?}",
-                                reservation.lifecycle, fact.kind
-                            )));
-                        }
-                        match fact.kind {
-                            GrantFactKindV2::Consumed => {
-                                let expected =
-                                    grant.observed_use_count.checked_add(1).ok_or_else(|| {
-                                        recovery_error(format!(
-                                            "grant {} observedUseCount overflowed",
-                                            fact.grant_id
-                                        ))
-                                    })?;
-                                if fact.observed_use_count != expected {
-                                    return Err(recovery_error(format!(
-                                        "grant {} consumed count {} does not exactly follow {}",
-                                        fact.grant_id,
-                                        fact.observed_use_count,
-                                        grant.observed_use_count
-                                    )));
-                                }
-                                reservation.lifecycle = GrantReservationLifecycle::Consumed;
-                                advance_invocation_cursor = Some((
-                                    invocation_id,
-                                    operation_id,
-                                    reservation_id,
-                                    GrantFactKindV2::Consumed,
-                                ));
-                            }
-                            GrantFactKindV2::ReservationReleased => {
-                                if fact.observed_use_count != grant.observed_use_count {
-                                    return Err(recovery_error(format!(
-                                        "reservation {reservation_id} release changed observedUseCount"
-                                    )));
-                                }
-                                reservation.lifecycle = GrantReservationLifecycle::Released;
-                                advance_invocation_cursor = Some((
-                                    invocation_id,
-                                    operation_id,
-                                    reservation_id,
-                                    GrantFactKindV2::ReservationReleased,
-                                ));
-                            }
-                            _ => unreachable!("reservation terminal kinds matched above"),
-                        }
-                    }
-                    _ => unreachable!("reservation fact kinds matched above"),
-                }
-            }
-            GrantFactKindV2::Requested => {}
-        }
-        grant.observed_use_count = fact.observed_use_count;
-        if let Some((invocation_id, operation_id, reservation_id, kind)) = advance_invocation_cursor
-        {
-            let invocation = self.invocations.get_mut(&invocation_id).ok_or_else(|| {
-                recovery_error(format!(
-                    "grant {kind:?} fact references unknown invocation {invocation_id}"
-                ))
-            })?;
-            let legal_state = match kind {
-                GrantFactKindV2::Consumed => {
-                    invocation.lifecycle == InvocationLifecycle::AttemptPrepared
-                        && invocation.attempt_id == envelope.identity.attempt_id
-                }
-                GrantFactKindV2::ReservationReleased => {
-                    matches!(
-                        invocation.lifecycle,
-                        InvocationLifecycle::Admitted | InvocationLifecycle::AttemptPrepared
-                    ) && envelope
-                        .identity
-                        .attempt_id
-                        .as_ref()
-                        .is_none_or(|attempt_id| invocation.attempt_id.as_ref() == Some(attempt_id))
-                }
-                _ => false,
-            };
-            if !legal_state
-                || invocation.run_id != envelope.identity.run_id
-                || invocation.operation_id != operation_id
-                || invocation.control_epoch != envelope.identity.control_epoch
-                || invocation.grant_id != fact.grant_id
-                || invocation.reservation_id != reservation_id
-                || envelope.identity.causation_id.as_ref() != Some(&invocation.last_fact_id)
-            {
-                return Err(recovery_error(format!(
-                    "grant {kind:?} fact illegally follows invocation {invocation_id}"
-                )));
-            }
-            invocation.last_fact_id = envelope.fact_id.clone();
-        }
-        Ok(())
-    }
-
-    fn replay_invocation(
-        &mut self,
-        envelope: &KernelFactEnvelopeV2,
-        fact: &InvocationFactV2,
-        pending: &mut ReplayPending,
-    ) -> AuthorityResult<()> {
-        let operation_id = envelope
-            .identity
-            .operation_id
-            .clone()
-            .ok_or_else(|| recovery_error("invocation fact has no operation id"))?;
-        match fact.kind {
-            InvocationFactKindV2::Submitted => {
-                if self.invocations.contains_key(&fact.invocation_id)
-                    || pending.submissions.contains_key(&fact.invocation_id)
-                    || pending.reservations.contains_key(&fact.invocation_id)
-                {
-                    return Err(recovery_error(format!(
-                        "invocation {} was submitted more than once",
-                        fact.invocation_id
-                    )));
-                }
-                if envelope.identity.invocation_id.as_ref() != Some(&fact.invocation_id)
-                    || envelope.identity.capability_grant_id.is_some()
-                    || envelope.identity.grant_reservation_id.is_some()
-                    || envelope.identity.attempt_id.is_some()
-                    || envelope.identity.causation_id.is_some()
-                    || envelope.identity.idempotency_key_hash.as_deref()
-                        != Some(&fact.idempotency_key_hash)
-                    || fact.attempt_id.is_some()
-                {
-                    return Err(recovery_error(format!(
-                        "submitted invocation {} has invalid causal identity",
-                        fact.invocation_id
-                    )));
-                }
-                pending.submissions.insert(
-                    fact.invocation_id.clone(),
-                    ReplaySubmission {
-                        fact_id: envelope.fact_id.clone(),
-                        run_id: envelope.identity.run_id.clone(),
-                        operation_id,
-                        control_epoch: envelope.identity.control_epoch,
-                        tool_id: fact.tool_id.clone(),
-                        request_digest: fact.request_digest.clone(),
-                        idempotency_key_hash: fact.idempotency_key_hash.clone(),
-                    },
-                );
-                return Ok(());
-            }
-            InvocationFactKindV2::Rejected
-                if !self.invocations.contains_key(&fact.invocation_id) =>
-            {
-                let submission =
-                    pending
-                        .submissions
-                        .remove(&fact.invocation_id)
-                        .ok_or_else(|| {
-                            recovery_error(format!(
-                                "rejected invocation {} has no exact submission",
-                                fact.invocation_id
-                            ))
-                        })?;
-                if pending.reservations.contains_key(&fact.invocation_id)
-                    || submission.run_id != envelope.identity.run_id
-                    || submission.operation_id != operation_id
-                    || submission.control_epoch != envelope.identity.control_epoch
-                    || submission.tool_id != fact.tool_id
-                    || submission.request_digest != fact.request_digest
-                    || submission.idempotency_key_hash != fact.idempotency_key_hash
-                    || envelope.identity.invocation_id.as_ref() != Some(&fact.invocation_id)
-                    || envelope.identity.capability_grant_id.is_some()
-                    || envelope.identity.grant_reservation_id.is_some()
-                    || envelope.identity.attempt_id.is_some()
-                    || envelope.identity.idempotency_key_hash.as_deref()
-                        != Some(&fact.idempotency_key_hash)
-                    || envelope.identity.causation_id.as_ref() != Some(&submission.fact_id)
-                {
-                    return Err(recovery_error(format!(
-                        "rejected invocation {} does not exactly follow its submission",
-                        fact.invocation_id
-                    )));
-                }
-                let operation_key = (envelope.identity.run_id.clone(), operation_id.clone());
-                if self
-                    .grant_operations
-                    .get(&operation_key)
-                    .is_some_and(|existing| existing.request_digest != fact.request_digest)
-                {
-                    return Err(recovery_error(format!(
-                        "operation {operation_id} has different grant and invocation digests"
-                    )));
-                }
-                if fact.retryable != Some(true) {
-                    let rejection_code = fact
-                        .error_code
-                        .as_deref()
-                        .and_then(parse_error_code)
-                        .unwrap_or(KernelErrorCodeV2::InvalidRequest);
-                    let admission = InvocationAdmission {
-                        invocation_id: fact.invocation_id.clone(),
-                        admitted: false,
-                        rejection_code: Some(rejection_code),
-                        retryable: false,
-                        replayed: false,
-                    };
-                    match self.operations.get(&operation_key) {
-                        Some(existing)
-                            if existing.request_digest == fact.request_digest
-                                && existing.admission == admission => {}
-                        Some(_) => {
-                            return Err(recovery_error(format!(
-                                "rejected operation {operation_id} has conflicting facts"
-                            )));
-                        }
-                        None => {
-                            self.operations.insert(
-                                operation_key,
-                                OperationRecord {
-                                    request_digest: fact.request_digest.clone(),
-                                    admission,
-                                },
-                            );
-                        }
-                    }
-                }
-                return Ok(());
-            }
-            InvocationFactKindV2::Admitted => {
-                if self.invocations.contains_key(&fact.invocation_id) {
-                    return Err(recovery_error(format!(
-                        "invocation {} was admitted more than once",
-                        fact.invocation_id
-                    )));
-                }
-                let grant_id = envelope
-                    .identity
-                    .capability_grant_id
-                    .clone()
-                    .ok_or_else(|| recovery_error("admitted invocation has no grant id"))?;
-                let reservation_id = envelope
-                    .identity
-                    .grant_reservation_id
-                    .clone()
-                    .ok_or_else(|| recovery_error("admitted invocation has no reservation id"))?;
-                let submission =
-                    pending
-                        .submissions
-                        .remove(&fact.invocation_id)
-                        .ok_or_else(|| {
-                            recovery_error(format!(
-                                "admitted invocation {} has no exact submission",
-                                fact.invocation_id
-                            ))
-                        })?;
-                let pending_reservation = pending
-                    .reservations
-                    .remove(&fact.invocation_id)
-                    .ok_or_else(|| {
-                        recovery_error(format!(
-                            "admitted invocation {} has no exact reservation",
-                            fact.invocation_id
-                        ))
-                    })?;
-                if submission.run_id != envelope.identity.run_id
-                    || submission.operation_id != operation_id
-                    || submission.control_epoch != envelope.identity.control_epoch
-                    || submission.tool_id != fact.tool_id
-                    || submission.request_digest != fact.request_digest
-                    || submission.idempotency_key_hash != fact.idempotency_key_hash
-                    || pending_reservation.run_id != envelope.identity.run_id
-                    || pending_reservation.operation_id != operation_id
-                    || pending_reservation.control_epoch != envelope.identity.control_epoch
-                    || pending_reservation.grant_id != grant_id
-                    || pending_reservation.reservation_id != reservation_id
-                    || envelope.identity.invocation_id.as_ref() != Some(&fact.invocation_id)
-                    || envelope.identity.attempt_id.is_some()
-                    || envelope.identity.idempotency_key_hash.as_deref()
-                        != Some(&fact.idempotency_key_hash)
-                    || envelope.identity.causation_id.as_ref() != Some(&pending_reservation.fact_id)
-                {
-                    return Err(recovery_error(format!(
-                        "admitted invocation {} does not exactly follow its reservation",
-                        fact.invocation_id
-                    )));
-                }
-                let grant = self.grants.get(&grant_id).ok_or_else(|| {
-                    recovery_error("admitted invocation references unknown grant")
-                })?;
-                let reservation = grant.reservations.get(&reservation_id).ok_or_else(|| {
-                    recovery_error("admitted invocation references unknown reservation")
-                })?;
-                if reservation.invocation_id != fact.invocation_id
-                    || reservation.operation_id != operation_id
-                    || reservation.control_epoch != envelope.identity.control_epoch
-                    || grant.run_id != envelope.identity.run_id
-                    || grant.control_epoch != envelope.identity.control_epoch
-                    || grant.lifecycle != GrantLifecycle::Issued
-                    || fact.tool_id != grant.scope.tool_id
-                    || self.current_epochs.get(&envelope.identity.run_id).copied()
-                        != Some(envelope.identity.control_epoch)
-                {
-                    return Err(recovery_error(format!(
-                        "invocation {} does not own reservation {}",
-                        fact.invocation_id, reservation_id
-                    )));
-                }
-                let admission = InvocationAdmission {
-                    invocation_id: fact.invocation_id.clone(),
-                    admitted: true,
-                    rejection_code: None,
-                    retryable: false,
-                    replayed: false,
-                };
-                let operation_key = (envelope.identity.run_id.clone(), operation_id.clone());
-                if self
-                    .grant_operations
-                    .get(&operation_key)
-                    .is_some_and(|existing| existing.request_digest != fact.request_digest)
-                {
-                    return Err(recovery_error(format!(
-                        "operation {operation_id} has different grant and invocation digests"
-                    )));
-                }
-                if let Some(existing) = self.operations.get(&operation_key) {
-                    if existing.request_digest != fact.request_digest
-                        || existing.admission.invocation_id != fact.invocation_id
-                    {
-                        return Err(recovery_error(format!(
-                            "operation {operation_id} has conflicting invocation facts"
-                        )));
-                    }
-                } else {
-                    self.operations.insert(
-                        operation_key,
-                        OperationRecord {
-                            request_digest: fact.request_digest.clone(),
-                            admission,
-                        },
-                    );
-                }
-                self.invocations.insert(
-                    fact.invocation_id.clone(),
-                    InvocationRecord {
-                        invocation_id: fact.invocation_id.clone(),
-                        run_id: envelope.identity.run_id.clone(),
-                        operation_id,
-                        control_epoch: envelope.identity.control_epoch,
-                        grant_id,
-                        reservation_id,
-                        scope: grant.scope.clone(),
-                        request_digest: fact.request_digest.clone(),
-                        idempotency_key_hash: fact.idempotency_key_hash.clone(),
-                        attempt_id: None,
-                        lifecycle: InvocationLifecycle::Admitted,
-                        last_fact_id: envelope.fact_id.clone(),
-                        effect_outcome: None,
-                    },
-                );
-                return Ok(());
-            }
-            _ => {}
-        }
-
-        let invocation = self
-            .invocations
-            .get_mut(&fact.invocation_id)
-            .ok_or_else(|| {
-                recovery_error(format!(
-                    "invocation fact {:?} precedes admission for {}",
-                    fact.kind, fact.invocation_id
-                ))
-            })?;
-        if invocation.run_id != envelope.identity.run_id
-            || invocation.operation_id != operation_id
-            || invocation.control_epoch != envelope.identity.control_epoch
-            || envelope.identity.capability_grant_id.as_ref() != Some(&invocation.grant_id)
-            || envelope.identity.grant_reservation_id.as_ref() != Some(&invocation.reservation_id)
-            || invocation.request_digest != fact.request_digest
-            || invocation.idempotency_key_hash != fact.idempotency_key_hash
-            || invocation.scope.tool_id != fact.tool_id
-            || envelope.identity.causation_id.as_ref() != Some(&invocation.last_fact_id)
-        {
-            return Err(recovery_error(format!(
-                "invocation {} changed its causal identity or digest",
-                fact.invocation_id
-            )));
-        }
-        match fact.kind {
-            InvocationFactKindV2::AttemptPrepared => {
-                if invocation.lifecycle != InvocationLifecycle::Admitted
-                    || invocation.attempt_id.is_some()
-                    || fact.attempt_id.is_none()
-                {
-                    return Err(illegal_replay_transition(invocation, fact.kind));
-                }
-                invocation.attempt_id = fact.attempt_id.clone();
-                invocation.lifecycle = InvocationLifecycle::AttemptPrepared;
-            }
-            InvocationFactKindV2::ExecutionStarted => {
-                if invocation.lifecycle != InvocationLifecycle::AttemptPrepared
-                    || invocation.attempt_id != fact.attempt_id
-                {
-                    return Err(illegal_replay_transition(invocation, fact.kind));
-                }
-                invocation.lifecycle = InvocationLifecycle::EffectStarted;
-            }
-            InvocationFactKindV2::Completed => {
-                if invocation.lifecycle != InvocationLifecycle::EffectStarted
-                    || invocation.attempt_id != fact.attempt_id
-                    || !matches!(
-                        invocation.effect_outcome,
-                        Some(EffectOutcomeV2::Observed | EffectOutcomeV2::ObservedAfterCancel)
-                    )
-                {
-                    return Err(illegal_replay_transition(invocation, fact.kind));
-                }
-                invocation.lifecycle = InvocationLifecycle::Completed;
-            }
-            InvocationFactKindV2::FailedBeforeAttempt => {
-                if invocation.lifecycle != InvocationLifecycle::Admitted
-                    || invocation.attempt_id.is_some()
-                    || fact.attempt_id.is_some()
-                    || invocation.effect_outcome.is_some()
-                {
-                    return Err(illegal_replay_transition(invocation, fact.kind));
-                }
-                invocation.lifecycle = InvocationLifecycle::Failed;
-            }
-            InvocationFactKindV2::Failed => {
-                let legal_pre_effect = invocation.lifecycle == InvocationLifecycle::AttemptPrepared
-                    && invocation.effect_outcome.is_none();
-                let legal_post_effect = invocation.lifecycle == InvocationLifecycle::EffectStarted
-                    && matches!(
-                        invocation.effect_outcome,
-                        Some(EffectOutcomeV2::Observed | EffectOutcomeV2::ObservedAfterCancel)
-                    );
-                if (!legal_pre_effect && !legal_post_effect)
-                    || invocation.attempt_id != fact.attempt_id
-                {
-                    return Err(illegal_replay_transition(invocation, fact.kind));
-                }
-                invocation.lifecycle = InvocationLifecycle::Failed;
-            }
-            InvocationFactKindV2::Indeterminate => {
-                if invocation.lifecycle != InvocationLifecycle::EffectStarted
-                    || invocation.attempt_id != fact.attempt_id
-                    || invocation.effect_outcome != Some(EffectOutcomeV2::Indeterminate)
-                {
-                    return Err(illegal_replay_transition(invocation, fact.kind));
-                }
-                invocation.lifecycle = InvocationLifecycle::Indeterminate;
-            }
-            InvocationFactKindV2::Rejected => {
-                return Err(recovery_error(format!(
-                    "rejected fact cannot attach to admitted invocation {}",
-                    fact.invocation_id
-                )));
-            }
-            InvocationFactKindV2::CancellationObserved => {
-                return Err(recovery_error(format!(
-                    "SP2 cannot restore cancellation state for invocation {}",
-                    fact.invocation_id
-                )));
-            }
-            InvocationFactKindV2::Submitted | InvocationFactKindV2::Admitted => {
-                unreachable!("handled above")
-            }
-        }
-        invocation.last_fact_id = envelope.fact_id.clone();
-        Ok(())
-    }
-
-    fn replay_effect(
-        &mut self,
-        envelope: &KernelFactEnvelopeV2,
-        fact: &EffectFactV2,
-    ) -> AuthorityResult<()> {
-        let invocation = self
-            .invocations
-            .get_mut(&fact.invocation_id)
-            .ok_or_else(|| {
-                recovery_error(format!(
-                    "effect fact precedes admission for invocation {}",
-                    fact.invocation_id
-                ))
-            })?;
-        if invocation.lifecycle != InvocationLifecycle::EffectStarted
-            || invocation.effect_outcome.is_some()
-            || invocation.run_id != envelope.identity.run_id
-            || envelope.identity.operation_id.as_ref() != Some(&invocation.operation_id)
-            || invocation.control_epoch != envelope.identity.control_epoch
-            || envelope.identity.capability_grant_id.as_ref() != Some(&invocation.grant_id)
-            || envelope.identity.grant_reservation_id.as_ref() != Some(&invocation.reservation_id)
-            || envelope.identity.invocation_id.as_ref() != Some(&invocation.invocation_id)
-            || invocation.attempt_id.as_ref() != Some(&fact.attempt_id)
-            || envelope.identity.attempt_id.as_ref() != Some(&fact.attempt_id)
-            || envelope.identity.idempotency_key_hash.as_deref()
-                != Some(&invocation.idempotency_key_hash)
-            || envelope.identity.causation_id.as_ref() != Some(&invocation.last_fact_id)
-        {
-            return Err(recovery_error(format!(
-                "effect fact changed identity or illegally followed invocation {}",
-                fact.invocation_id
-            )));
-        }
-        if fact.outcome == EffectOutcomeV2::None {
-            return Err(recovery_error(format!(
-                "effect fact for invocation {} cannot record a none outcome",
-                fact.invocation_id
-            )));
-        }
-        invocation.effect_outcome = Some(fact.outcome);
-        invocation.last_fact_id = envelope.fact_id.clone();
-        Ok(())
-    }
-
-    fn reconcile_unclosed_attempts(&mut self) -> AuthorityResult<()> {
-        let admitted = self
-            .invocations
-            .values()
-            .filter(|invocation| invocation.lifecycle == InvocationLifecycle::Admitted)
-            .map(|invocation| invocation.invocation_id.clone())
-            .collect::<Vec<_>>();
-        for invocation_id in admitted {
-            self.finalize_pre_effect_failure(&invocation_id, "RecoveryBeforeAttempt")?;
-        }
-
-        let prepared = self
-            .invocations
-            .values()
-            .filter(|invocation| invocation.lifecycle == InvocationLifecycle::AttemptPrepared)
-            .map(|invocation| invocation.invocation_id.clone())
-            .collect::<Vec<_>>();
-        for invocation_id in prepared {
-            self.finalize_pre_effect_failure(&invocation_id, "RecoveryBeforeEffect")?;
-        }
-
-        let crossed_effect_boundary = self
-            .invocations
-            .values()
-            .filter(|invocation| invocation.lifecycle == InvocationLifecycle::EffectStarted)
-            .map(|invocation| (invocation.invocation_id.clone(), invocation.effect_outcome))
-            .collect::<Vec<_>>();
-        for (invocation_id, effect_outcome) in crossed_effect_boundary {
-            if effect_outcome.is_some() {
-                return Err(recovery_error(format!(
-                    "invocation {invocation_id} has an effect fact without an atomic terminal fact"
-                )));
-            }
-            self.finalize_indeterminate(
-                &invocation_id,
-                serde_json::json!({
-                    "reason": "recovery_unclosed_effect_boundary",
-                    "automaticRetryAllowed": false,
-                }),
-            )?;
-        }
-        Ok(())
-    }
-
-    fn reject_invocation(
-        &mut self,
-        request: &InvocationSubmitRequest,
-        invocation_id: InvocationId,
-        submitted: KernelFactDraftV2,
-        submitted_fact_id: FactId,
-        code: KernelErrorCodeV2,
-        retryable: bool,
-    ) -> AuthorityResult<InvocationAdmission> {
-        let rejected_fact_id = self.next_fact_id();
-        let rejected = self.invocation_draft(
-            request,
-            invocation_id.clone(),
-            None,
-            None,
-            InvocationFactKindV2::Rejected,
-            None,
-            Some(error_code_name(code).to_string()),
-            Some(retryable),
-            Some(submitted_fact_id),
-            rejected_fact_id,
-        );
-        self.persist("reject_invocation", vec![submitted, rejected], false)?;
-        let admission = InvocationAdmission {
-            invocation_id,
-            admitted: false,
-            rejection_code: Some(code),
-            retryable,
-            replayed: false,
-        };
-        if !retryable {
-            self.operations.insert(
-                (request.run_id.clone(), request.operation_id.clone()),
-                OperationRecord {
-                    request_digest: request.request_digest.clone(),
-                    admission: admission.clone(),
-                },
-            );
-        }
-        Ok(admission)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn invocation_draft(
-        &self,
-        request: &InvocationSubmitRequest,
-        invocation_id: InvocationId,
-        grant_id: Option<GrantId>,
-        reservation_id: Option<GrantReservationId>,
-        kind: InvocationFactKindV2,
-        attempt_id: Option<AttemptId>,
-        error_code: Option<String>,
-        retryable: Option<bool>,
-        causation_id: Option<FactId>,
-        fact_id: FactId,
-    ) -> KernelFactDraftV2 {
-        KernelFactDraftV2::new(
-            fact_id,
-            occurred_at(),
-            causal_identity(IdentityParts {
-                run_id: request.run_id.clone(),
-                control_epoch: request.control_epoch,
-                operation_id: Some(request.operation_id.clone()),
-                grant_id,
-                reservation_id,
-                invocation_id: Some(invocation_id.clone()),
-                attempt_id: attempt_id.clone(),
-                causation_id,
-                idempotency_key_hash: Some(request.idempotency_key_hash.clone()),
-            }),
-            KernelFactPayloadV2::Invocation(InvocationFactV2 {
-                kind,
-                invocation_id,
-                tool_id: request.scope.tool_id.clone(),
-                request_digest: request.request_digest.clone(),
-                idempotency_key_hash: request.idempotency_key_hash.clone(),
-                attempt_id,
-                error_code,
-                retryable,
-            }),
-        )
-    }
-
-    fn invocation_record_draft(
-        &mut self,
-        invocation: &InvocationRecord,
-        kind: InvocationFactKindV2,
-        attempt_id: Option<AttemptId>,
-        error_code: Option<String>,
-        retryable: Option<bool>,
-        causation_id: Option<FactId>,
-    ) -> KernelFactDraftV2 {
-        let request = InvocationSubmitRequest {
-            run_id: invocation.run_id.clone(),
-            operation_id: invocation.operation_id.clone(),
-            control_epoch: invocation.control_epoch,
-            grant_id: invocation.grant_id.clone(),
-            scope: invocation.scope.clone(),
-            request_digest: invocation.request_digest.clone(),
-            idempotency_key_hash: invocation.idempotency_key_hash.clone(),
-        };
-        let fact_id = self.next_fact_id();
-        self.invocation_draft(
-            &request,
-            invocation.invocation_id.clone(),
-            if matches!(kind, InvocationFactKindV2::Rejected) {
-                None
-            } else {
-                Some(invocation.grant_id.clone())
-            },
-            if matches!(kind, InvocationFactKindV2::Rejected) {
-                None
-            } else {
-                Some(invocation.reservation_id.clone())
-            },
-            kind,
-            attempt_id,
-            error_code,
-            retryable,
-            causation_id,
-            fact_id,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn grant_draft(
-        &mut self,
-        grant: &GrantRecord,
-        kind: GrantFactKindV2,
-        operation_id: Option<OperationId>,
-        invocation_id: Option<InvocationId>,
-        reservation_id: Option<GrantReservationId>,
-        causation_id: Option<FactId>,
-        reason: Option<String>,
-    ) -> KernelFactDraftV2 {
-        let fact_id = self.next_fact_id();
-        self.grant_draft_with_use_count(
-            grant,
-            kind,
-            operation_id,
-            invocation_id,
-            reservation_id,
-            None,
-            causation_id,
-            reason,
-            grant.observed_use_count,
-            fact_id,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn grant_draft_with_use_count(
-        &self,
-        grant: &GrantRecord,
-        kind: GrantFactKindV2,
-        operation_id: Option<OperationId>,
-        invocation_id: Option<InvocationId>,
-        reservation_id: Option<GrantReservationId>,
-        attempt_id: Option<AttemptId>,
-        causation_id: Option<FactId>,
-        reason: Option<String>,
-        observed_use_count: u64,
-        fact_id: FactId,
-    ) -> KernelFactDraftV2 {
-        KernelFactDraftV2::new(
-            fact_id,
-            occurred_at(),
-            causal_identity(IdentityParts {
-                run_id: grant.run_id.clone(),
-                control_epoch: grant.control_epoch,
-                operation_id,
-                grant_id: Some(grant.grant_id.clone()),
-                reservation_id,
-                invocation_id,
-                attempt_id,
-                causation_id,
-                idempotency_key_hash: None,
-            }),
-            KernelFactPayloadV2::Grant(GrantFactV2 {
-                kind,
-                grant_id: grant.grant_id.clone(),
-                tool_id: grant.scope.tool_id.clone(),
-                resource_scope: grant.scope.resource_scope.clone(),
-                effect_scope: grant.scope.effect_scope.clone(),
-                request_digest: grant.request_digest.clone(),
-                use_policy: GrantUsePolicyV2::UnboundedWithinEpoch,
-                observed_use_count,
-                reason,
-            }),
-        )
-    }
-
-    fn validate_current_epoch(&self, run_id: &RunId, actual: ControlEpoch) -> AuthorityResult<()> {
-        let expected = self.current_epochs.get(run_id).copied();
-        if expected != Some(actual) {
-            return Err(AuthorityError::StaleControlEpoch { expected, actual });
-        }
-        Ok(())
-    }
-
-    fn invocation(&self, invocation_id: &InvocationId) -> AuthorityResult<&InvocationRecord> {
-        self.invocations
-            .get(invocation_id)
-            .ok_or_else(|| AuthorityError::InvocationNotFound {
-                invocation_id: invocation_id.clone(),
-            })
-    }
-
-    fn ensure_mutations_allowed(&self) -> AuthorityResult<()> {
-        if self.storage_faulted_after_effect {
-            return Err(AuthorityError::FactStoreUnavailable {
-                operation: "mutation_guard",
-                message:
-                    "a post-effect fact write failed; reopen and reconcile before new mutations"
-                        .to_string(),
-            });
-        }
-        Ok(())
-    }
-
-    fn persist(
-        &mut self,
-        operation: &'static str,
-        drafts: Vec<KernelFactDraftV2>,
-        post_effect: bool,
-    ) -> AuthorityResult<()> {
-        match self.fact_store.append_batch(drafts) {
-            Ok(_) => Ok(()),
-            Err(error) => {
-                if post_effect {
-                    self.storage_faulted_after_effect = true;
-                }
-                Err(AuthorityError::FactStoreUnavailable {
-                    operation,
-                    message: error.to_string(),
-                })
-            }
-        }
-    }
-
-    fn next_kernel_id(&mut self, kind: &str) -> String {
-        let sequence = self.next_id;
-        self.next_id = self.next_id.saturating_add(1);
-        format!("{kind}-{}-{sequence}", self.instance_nonce)
-    }
-
-    fn next_fact_id(&mut self) -> FactId {
-        FactId::new(self.next_kernel_id("fact"))
-    }
-}
-
-fn causal_identity(parts: IdentityParts) -> CausalIdentityV2 {
-    CausalIdentityV2 {
-        run_id: parts.run_id,
-        control_epoch: parts.control_epoch,
-        operation_id: parts.operation_id,
-        capability_grant_id: parts.grant_id,
-        grant_reservation_id: parts.reservation_id,
-        invocation_id: parts.invocation_id,
-        attempt_id: parts.attempt_id,
-        causation_id: parts.causation_id,
-        correlation_refs: Vec::new(),
-        idempotency_key_hash: parts.idempotency_key_hash,
-    }
-}
-
-fn validate_scope(scope: &CapabilityScope) -> AuthorityResult<()> {
-    require_non_empty("toolId", &scope.tool_id)?;
-    if scope.resource_scope.is_empty() {
-        return Err(AuthorityError::InvalidRequest {
-            field: "resourceScope",
-            reason: "must contain at least one exact value".to_string(),
-        });
-    }
-    if scope.effect_scope.is_empty() {
-        return Err(AuthorityError::InvalidRequest {
-            field: "effectScope",
-            reason: "must contain at least one exact value".to_string(),
-        });
-    }
-    for value in &scope.resource_scope {
-        require_non_empty("resourceScope", value)?;
-    }
-    for value in &scope.effect_scope {
-        require_non_empty("effectScope", value)?;
-    }
-    let canonical = CapabilityScope::new(
-        scope.tool_id.clone(),
-        scope.resource_scope.clone(),
-        scope.effect_scope.clone(),
-    )?;
-    if &canonical != scope {
-        return Err(AuthorityError::InvalidRequest {
-            field: "scope",
-            reason: "must be canonical, duplicate-free, and deterministically ordered".to_string(),
-        });
-    }
-    Ok(())
-}
-
-fn validate_optional_text(field: &'static str, value: Option<&str>) -> AuthorityResult<()> {
-    if let Some(value) = value {
-        require_non_empty(field, value)?;
-    }
-    Ok(())
-}
-
-fn require_state(
-    invocation: &InvocationRecord,
-    expected: InvocationLifecycle,
-    expected_name: &'static str,
+pub(super) fn require_decision_source(
+    decision: &GrantDecisionSubmissionV2,
+    source: DecisionSource,
 ) -> AuthorityResult<()> {
-    if invocation.lifecycle != expected {
-        return Err(AuthorityError::InvalidInvocationState {
-            invocation_id: invocation.invocation_id.clone(),
-            expected: expected_name,
-            actual: invocation.lifecycle,
-        });
-    }
-    Ok(())
+    matches!(
+        (decision, source),
+        (
+            GrantDecisionSubmissionV2::ApplyKernelPolicy {},
+            DecisionSource::BuiltInPolicy
+        ) | (
+            GrantDecisionSubmissionV2::UserAllow { .. }
+                | GrantDecisionSubmissionV2::UserDeny { .. },
+            DecisionSource::TrustedUserDecision
+        )
+    )
+    .then_some(())
+    .ok_or(KernelErrorV2::TrustedDecisionSourceRequired {})
 }
 
-fn illegal_replay_transition(
-    invocation: &InvocationRecord,
-    next: InvocationFactKindV2,
-) -> AuthorityError {
-    recovery_error(format!(
-        "invocation {} cannot transition from {:?} via {:?}",
-        invocation.invocation_id, invocation.lifecycle, next
+impl From<KernelErrorV2> for PrepareFailure {
+    fn from(value: KernelErrorV2) -> Self {
+        Self::Kernel(value)
+    }
+}
+
+pub(super) fn storage_fault() -> KernelErrorV2 {
+    KernelErrorV2::FactStoreUnavailable {
+        fault_code: StorageFaultCodeV2::Unavailable,
+    }
+}
+
+pub(super) fn corrupt_store() -> KernelErrorV2 {
+    KernelErrorV2::FactStoreUnavailable {
+        fault_code: StorageFaultCodeV2::Corrupt,
+    }
+}
+
+pub(super) fn invalid_field(
+    field_path: impl Into<String>,
+    violation: InvalidFieldViolationV2,
+) -> KernelErrorV2 {
+    KernelErrorV2::InvalidRequest {
+        reason: InvalidRequestReasonV2::InvalidField {
+            field_path: field_path.into(),
+            violation,
+        },
+    }
+}
+
+pub(super) fn fact_draft(fact_id: FactId, payload: KernelFactPayloadV2) -> KernelFactDraftV2 {
+    KernelFactDraftV2 { fact_id, payload }
+}
+
+pub(super) enum EpochAdvancePlan {
+    Ready {
+        epoch_context: CommandEpochContextV2,
+        previous_epoch: Option<ControlEpoch>,
+        new_epoch: ControlEpoch,
+    },
+    Recorded {
+        current_epoch: ControlEpoch,
+        error: RecordedCommandErrorV2,
+    },
+}
+
+pub(super) type PendingCancellation = (InvocationId, CancelRequestId, FactId);
+
+pub(super) fn plan_control_cancellation(
+    state: &AuthorityState,
+    active_invocation_id: Option<InvocationId>,
+    mint_ids: impl FnOnce() -> (CancelRequestId, FactId),
+) -> AuthorityResult<(ControlCancellationReplyV2, Option<PendingCancellation>)> {
+    let Some(invocation_id) = active_invocation_id else {
+        return Ok((ControlCancellationReplyV2::None {}, None));
+    };
+    let invocation = state
+        .invocations
+        .get(&invocation_id)
+        .ok_or_else(corrupt_store)?;
+    if let Some((cancel_request_id, fact_id, _)) = invocation.stop_overlay.cancellation() {
+        return Ok((
+            ControlCancellationReplyV2::AlreadyRequested {
+                cancel_request_id: cancel_request_id.clone(),
+                invocation_id,
+                cancellation_fact_id: fact_id.clone(),
+            },
+            None,
+        ));
+    }
+    let (cancel_request_id, fact_id) = mint_ids();
+    Ok((
+        ControlCancellationReplyV2::Requested {
+            cancel_request_id: cancel_request_id.clone(),
+            invocation_id: invocation_id.clone(),
+            cancellation_fact_id: fact_id.clone(),
+        },
+        Some((invocation_id, cancel_request_id, fact_id)),
     ))
 }
 
-fn grant_snapshot(grant: &GrantRecord) -> GrantSnapshot {
-    let mut reservations = grant
-        .reservations
-        .values()
-        .map(|reservation| (reservation.reservation_id.clone(), reservation.lifecycle))
-        .collect::<Vec<_>>();
-    reservations.sort_by(|left, right| left.0.cmp(&right.0));
-    GrantSnapshot {
-        grant_id: grant.grant_id.clone(),
-        run_id: grant.run_id.clone(),
-        control_epoch: grant.control_epoch,
-        scope: grant.scope.clone(),
-        request_digest: grant.request_digest.clone(),
-        lifecycle: grant.lifecycle,
-        observed_use_count: grant.observed_use_count,
-        reservations,
-    }
-}
-
-fn invocation_snapshot(invocation: &InvocationRecord) -> InvocationSnapshot {
-    InvocationSnapshot {
-        invocation_id: invocation.invocation_id.clone(),
-        run_id: invocation.run_id.clone(),
-        operation_id: invocation.operation_id.clone(),
-        control_epoch: invocation.control_epoch,
-        grant_id: invocation.grant_id.clone(),
-        reservation_id: invocation.reservation_id.clone(),
-        attempt_id: invocation.attempt_id.clone(),
-        lifecycle: invocation.lifecycle,
-    }
-}
-
-fn error_code_name(code: KernelErrorCodeV2) -> &'static str {
-    match code {
-        KernelErrorCodeV2::UnsupportedAbiVersion => "UnsupportedAbiVersion",
-        KernelErrorCodeV2::InvalidRequest => "InvalidRequest",
-        KernelErrorCodeV2::RunBusy => "RunBusy",
-        KernelErrorCodeV2::CapacityExceeded => "CapacityExceeded",
-        KernelErrorCodeV2::StaleControlEpoch => "StaleControlEpoch",
-        KernelErrorCodeV2::GrantRequired => "GrantRequired",
-        KernelErrorCodeV2::GrantScopeMismatch => "GrantScopeMismatch",
-        KernelErrorCodeV2::DuplicateOperationDigestMismatch => "DuplicateOperationDigestMismatch",
-        KernelErrorCodeV2::InvocationNotOwnedByRun => "InvocationNotOwnedByRun",
-        KernelErrorCodeV2::FactStoreUnavailable => "FactStoreUnavailable",
-    }
-}
-
-fn parse_error_code(value: &str) -> Option<KernelErrorCodeV2> {
-    match value {
-        "UnsupportedAbiVersion" => Some(KernelErrorCodeV2::UnsupportedAbiVersion),
-        "InvalidRequest" => Some(KernelErrorCodeV2::InvalidRequest),
-        "RunBusy" => Some(KernelErrorCodeV2::RunBusy),
-        "CapacityExceeded" => Some(KernelErrorCodeV2::CapacityExceeded),
-        "StaleControlEpoch" => Some(KernelErrorCodeV2::StaleControlEpoch),
-        "GrantRequired" => Some(KernelErrorCodeV2::GrantRequired),
-        "GrantScopeMismatch" => Some(KernelErrorCodeV2::GrantScopeMismatch),
-        "DuplicateOperationDigestMismatch" => {
-            Some(KernelErrorCodeV2::DuplicateOperationDigestMismatch)
+pub(super) fn plan_epoch_advance(
+    run_id: &RunId,
+    run: Option<&RunRecord>,
+    precondition: EpochPreconditionV2,
+) -> AuthorityResult<EpochAdvancePlan> {
+    let Some(run) = run else {
+        return match precondition {
+            EpochPreconditionV2::NoCurrentEpoch {} => Ok(EpochAdvancePlan::Ready {
+                epoch_context: CommandEpochContextV2::NoCurrentEpoch {},
+                previous_epoch: None,
+                new_epoch: ControlEpoch::new(1).expect("one is a valid epoch"),
+            }),
+            EpochPreconditionV2::Exact { .. } => Err(KernelErrorV2::RunNotFound {
+                run_id: run_id.clone(),
+            }),
+        };
+    };
+    let error = match precondition {
+        EpochPreconditionV2::NoCurrentEpoch {} => {
+            Some(RecordedCommandErrorV2::ControlEpochAlreadyExists {
+                run_id: run_id.clone(),
+                current: run.epoch,
+            })
         }
-        "InvocationNotOwnedByRun" => Some(KernelErrorCodeV2::InvocationNotOwnedByRun),
-        "FactStoreUnavailable" => Some(KernelErrorCodeV2::FactStoreUnavailable),
+        EpochPreconditionV2::Exact { control_epoch } if control_epoch != run.epoch => {
+            Some(RecordedCommandErrorV2::StaleControlEpoch {
+                run_id: run_id.clone(),
+                submitted: control_epoch,
+                current: run.epoch,
+            })
+        }
+        EpochPreconditionV2::Exact { .. }
+            if matches!(run.lifecycle, RunLifecycle::Terminated { .. }) =>
+        {
+            Some(RecordedCommandErrorV2::RunTerminated {
+                run_id: run_id.clone(),
+                control_epoch: run.epoch,
+            })
+        }
+        EpochPreconditionV2::Exact { .. } => None,
+    };
+    if let Some(error) = error {
+        return Ok(EpochAdvancePlan::Recorded {
+            current_epoch: run.epoch,
+            error,
+        });
+    }
+    let Some(next) = run.epoch.get().checked_add(1) else {
+        return Ok(EpochAdvancePlan::Recorded {
+            current_epoch: run.epoch,
+            error: RecordedCommandErrorV2::ControlEpochExhausted {
+                run_id: run_id.clone(),
+                current: run.epoch,
+            },
+        });
+    };
+    Ok(EpochAdvancePlan::Ready {
+        epoch_context: exact_epoch(run.epoch),
+        previous_epoch: Some(run.epoch),
+        new_epoch: ControlEpoch::new(next).expect("checked non-zero epoch"),
+    })
+}
+
+pub(super) fn resolve_workspace_binding(path: &Path) -> AuthorityResult<WorkspaceBinding> {
+    let canonical_root = fs::canonicalize(path).map_err(|_| storage_fault())?;
+    if !canonical_root.is_dir() {
+        return Err(invalid_field(
+            "workspaceRoot",
+            InvalidFieldViolationV2::OutOfRange,
+        ));
+    }
+    let platform = CURRENT_PLATFORM;
+    let raw = canonical_root.to_str().ok_or_else(|| {
+        invalid_field("workspaceRoot", InvalidFieldViolationV2::MalformedIdentity)
+    })?;
+    let canonical_root_utf8 = normalize_canonical_platform_path_v4(platform, raw)
+        .map_err(|_| invalid_field("workspaceRoot", InvalidFieldViolationV2::MalformedIdentity))?;
+    let digest =
+        workspace_binding_digest_v2(platform, &canonical_root_utf8).map_err(|_| storage_fault())?;
+    Ok(WorkspaceBinding {
+        platform,
+        canonical_root,
+        canonical_root_utf8,
+        digest,
+    })
+}
+
+fn request_tool_id(request: &GrantRequestV2) -> AuthorityResult<AuthorityToolIdV4> {
+    validate_canonical_invocation_v4(&request.canonical_invocation).map_err(|_| {
+        invalid_field(
+            "request.canonicalInvocation",
+            InvalidFieldViolationV2::OutOfRange,
+        )
+    })?;
+    Ok(request.canonical_invocation.tool_id())
+}
+
+fn request_identity_fields(
+    request: &GrantRequestV2,
+) -> AuthorityResult<(CorrelationSetV2, IdempotencyKeyHashV2)> {
+    let correlations = CorrelationSetV2::materialize(request.correlation_refs.clone())
+        .map_err(|_| invalid_field("request.correlationRefs", InvalidFieldViolationV2::Unsorted))?;
+    let idempotency_key_hash = idempotency_key_hash_v2(&request.run_id, &request.idempotency_key)
+        .map_err(|_| {
+        invalid_field(
+            "request.idempotencyKey",
+            InvalidFieldViolationV2::OutOfRange,
+        )
+    })?;
+    Ok((correlations, idempotency_key_hash))
+}
+
+pub(super) fn prepare_grant_request(
+    request: &GrantRequestV2,
+    catalog: &LocalAuthorityToolCatalogV4,
+    workspace: &WorkspaceBinding,
+    executor_config: &KernelExecutorConfig,
+) -> Result<PreparedGrantRequest, PrepareFailure> {
+    let tool_id = request_tool_id(request)?;
+    let contract = catalog.contract(tool_id);
+    if contract.execution_availability != ExecutionAvailabilityV4::Ready
+        || catalog.ready_binding(tool_id).is_none()
+    {
+        return Err(PrepareFailure::Kernel(
+            KernelErrorV2::ToolExecutionUnavailable {
+                tool_id,
+                availability: ExecutionAvailabilityV4::Blocked,
+            },
+        ));
+    }
+    let effective_deadline_ms = materialize_deadline(request.deadline, &contract.deadline)?;
+    let (correlations, idempotency_key_hash) = request_identity_fields(request)?;
+    let (resource_scope, resolved_targets) =
+        resolve_invocation_targets(&request.canonical_invocation, workspace, executor_config)?;
+    let grant_scope_digest = grant_scope_digest_v2(
+        &request.run_id,
+        request.control_epoch,
+        tool_id,
+        &contract.contract_digest,
+        &request.canonical_invocation,
+        &resource_scope,
+        contract.effect_scope,
+        contract.risk,
+        &workspace.digest,
+    )
+    .map_err(|_| storage_fault())?;
+    let authorization_digest = authorization_request_digest_v2(
+        &request.run_id,
+        &request.operation_id,
+        request.control_epoch,
+        &idempotency_key_hash,
+        &contract.contract_digest,
+        &request.canonical_invocation,
+        &grant_scope_digest,
+        effective_deadline_ms,
+        &workspace.digest,
+    )
+    .map_err(|_| storage_fault())?;
+    Ok(PreparedGrantRequest {
+        canonical_invocation: request.canonical_invocation.clone(),
+        resource_scope,
+        resolved_targets,
+        idempotency_key_hash,
+        grant_scope_digest,
+        authorization_digest,
+        workspace_binding_digest: workspace.digest.clone(),
+        effective_deadline_ms,
+        correlations,
+    })
+}
+
+pub(super) fn prepare_submission_digest(
+    request: &GrantRequestV2,
+    grant_id: &GrantId,
+    catalog: &LocalAuthorityToolCatalogV4,
+    workspace: &WorkspaceBinding,
+) -> AuthorityResult<(AuthorityToolIdV4, InvocationSubmissionDigestV2)> {
+    let tool_id = request_tool_id(request)?;
+    let contract = catalog.contract(tool_id);
+    let effective_deadline_ms = materialize_deadline(request.deadline, &contract.deadline)
+        .map_err(|failure| match failure {
+            PrepareFailure::Kernel(error) => error,
+            PrepareFailure::Target(_) => corrupt_store(),
+        })?;
+    let (_, idempotency_key_hash) = request_identity_fields(request)?;
+    let digest = invocation_submission_digest_v2(
+        &request.run_id,
+        &request.operation_id,
+        request.control_epoch,
+        &idempotency_key_hash,
+        grant_id,
+        &contract.contract_digest,
+        &request.canonical_invocation,
+        effective_deadline_ms,
+        &workspace.digest,
+    )
+    .map_err(|_| corrupt_store())?;
+    Ok((tool_id, digest))
+}
+
+pub(super) struct PreparedRevalidation {
+    pub(super) resource_id: ResourceId,
+    pub(super) target: ResolvedTarget,
+    pub(super) observation: TargetRevalidationObservationV2,
+    pub(super) digest: TargetRevalidationDigestV2,
+}
+
+pub(super) struct EffectPreparation {
+    pub(super) executor_input: serde_json::Value,
+    pub(super) revalidations: Vec<PreparedRevalidation>,
+}
+
+pub(super) fn prepare_effect(
+    invocation: &ToolInvocationInputV4,
+    admitted_targets: &[(ResourceId, ResolvedTarget)],
+    identity: &AttemptIdentityV2,
+    workspace: &WorkspaceBinding,
+    executor_config: &KernelExecutorConfig,
+) -> Result<EffectPreparation, PreEffectFailureCodeV2> {
+    let (_, fresh_targets) = resolve_invocation_targets(invocation, workspace, executor_config)
+        .map_err(|_| PreEffectFailureCodeV2::TargetRevalidationFailed)?;
+    if fresh_targets.len() != admitted_targets.len()
+        || fresh_targets
+            .iter()
+            .zip(admitted_targets)
+            .any(|(fresh, (_, admitted))| {
+                fresh.private_target != admitted.private_target
+                    || fresh.public_resource != admitted.public_resource
+            })
+    {
+        return Err(PreEffectFailureCodeV2::TargetRevalidationFailed);
+    }
+    let (executor_input, expected_edit) = executor_input(invocation, &fresh_targets)
+        .map_err(|_| PreEffectFailureCodeV2::TargetRevalidationFailed)?;
+    let mut revalidations = admitted_targets
+        .iter()
+        .zip(fresh_targets)
+        .map(|((resource_id, _), target)| {
+            let observation =
+                revalidation_observation(invocation, &target, expected_edit.as_deref())?;
+            let digest = target_revalidation_digest_v2(
+                &identity.run_id,
+                &identity.operation_id,
+                &identity.invocation_id,
+                &identity.attempt_id,
+                invocation.tool_id(),
+                resource_id,
+                &workspace.digest,
+                &target.private_target,
+                &observation,
+            )
+            .map_err(|_| PreEffectFailureCodeV2::TargetRevalidationFailed)?;
+            Ok(PreparedRevalidation {
+                resource_id: resource_id.clone(),
+                target,
+                observation,
+                digest,
+            })
+        })
+        .collect::<Result<Vec<_>, PreEffectFailureCodeV2>>()?;
+    revalidations.sort_by(|left, right| {
+        left.resource_id
+            .as_str()
+            .as_bytes()
+            .cmp(right.resource_id.as_str().as_bytes())
+    });
+    Ok(EffectPreparation {
+        executor_input,
+        revalidations,
+    })
+}
+
+fn executor_input(
+    invocation: &ToolInvocationInputV4,
+    targets: &[ResolvedTarget],
+) -> Result<(serde_json::Value, Option<Vec<u8>>), ()> {
+    use ToolInvocationInputV4 as Input;
+    let value = match invocation {
+        Input::FsRead { path, range } => {
+            let mut value = serde_json::json!({"path":path});
+            if let LineRangeV4::Lines {
+                start_line,
+                end_line,
+            } = range
+            {
+                value["startLine"] = (*start_line).into();
+                value["endLine"] = (*end_line).into();
+            }
+            value
+        }
+        Input::FsList {
+            path,
+            depth,
+            include_hidden,
+        } => serde_json::json!({
+            "path":path,"depth":depth,"includeHidden":include_hidden
+        }),
+        Input::FsGlob {
+            root,
+            pattern,
+            max_results,
+        } => serde_json::json!({
+            "path":root,"pattern":pattern,"maxResults":max_results
+        }),
+        Input::FsDiff {
+            path,
+            proposed_content,
+        } => serde_json::json!({"path":path,"proposedContent":proposed_content}),
+        Input::CodeGrep {
+            root,
+            query,
+            include,
+            exclude,
+            strategy,
+            context_lines,
+            max_results,
+        } => serde_json::json!({
+            "path":root,
+            "query":query,
+            "include":include,
+            "exclude":exclude,
+            "strategy":match strategy {
+                SearchStrategyV4::Literal => "literal",
+                SearchStrategyV4::Regex => "regex",
+            },
+            "contextLines":context_lines,
+            "maxResults":max_results
+        }),
+        Input::FsCreate {
+            path,
+            content,
+            executable,
+        } => serde_json::json!({"path":path,"content":content,"executable":executable}),
+        Input::FsWrite { path, content } => serde_json::json!({"path":path,"content":content}),
+        Input::FsEdit {
+            path,
+            matcher,
+            replacement,
+        } => {
+            let target = target_path(targets.first().ok_or(())?)?;
+            let original = fs::read_to_string(target).map_err(|_| ())?;
+            let (patch_spec, updated) =
+                plan_v2_text_edit(&original, matcher, replacement).map_err(|_| ())?;
+            return Ok((
+                serde_json::json!({
+                    "path":path,"replacement":replacement,"patchSpec":patch_spec
+                }),
+                Some(updated.into_bytes()),
+            ));
+        }
+        Input::FsDelete(DeleteTargetV4::File { path }) => {
+            serde_json::json!({"path":path,"targetKind":"file","recursive":false})
+        }
+        Input::FsDelete(DeleteTargetV4::DirectoryTree { path }) => {
+            serde_json::json!({"path":path,"targetKind":"directory","recursive":true})
+        }
+        Input::FsEnsureDirectory { path } => serde_json::json!({"path":path}),
+        Input::DocumentRead { path, pages } => {
+            let mut value = serde_json::json!({"path":path});
+            if let DocumentPagesV4::Range {
+                start_page,
+                end_page,
+            } = pages
+            {
+                value["startPage"] = (*start_page).into();
+                value["endPage"] = (*end_page).into();
+            }
+            value
+        }
+        Input::WebSearch { query, limit } => serde_json::json!({
+            "query":query,
+            "limit":limit,
+            "kernelReviewedTarget":reviewed_target_value(
+                &targets.first().ok_or(())?.private_target
+            )?
+        }),
+        Input::WebFetch { url, max_bytes } => serde_json::json!({
+            "url":url,
+            "maxBytes":max_bytes,
+            "kernelReviewedTarget":reviewed_target_value(
+                &targets.first().ok_or(())?.private_target
+            )?
+        }),
+        Input::FsRename { .. }
+        | Input::GitStatus {}
+        | Input::GitDiff { .. }
+        | Input::GitStage { .. }
+        | Input::GitUnstage { .. }
+        | Input::GitCommit { .. } => return Err(()),
+    };
+    Ok((value, None))
+}
+
+fn revalidation_observation(
+    invocation: &ToolInvocationInputV4,
+    target: &ResolvedTarget,
+    expected_edit: Option<&[u8]>,
+) -> Result<TargetRevalidationObservationV2, PreEffectFailureCodeV2> {
+    use ToolInvocationInputV4 as Input;
+    match invocation {
+        Input::FsRead { .. } | Input::FsDiff { .. } | Input::DocumentRead { .. } => {
+            Ok(TargetRevalidationObservationV2::FileRead {
+                observed: present_file(target.state.as_ref())?,
+            })
+        }
+        Input::FsList { .. } | Input::FsGlob { .. } | Input::CodeGrep { .. } => {
+            let ResourceStateV2::Directory {
+                collection_digest,
+                item_count,
+            } = target
+                .state
+                .as_ref()
+                .ok_or(PreEffectFailureCodeV2::TargetRevalidationFailed)?
+            else {
+                return Err(PreEffectFailureCodeV2::TargetRevalidationFailed);
+            };
+            Ok(TargetRevalidationObservationV2::CollectionRead {
+                listing_digest: collection_digest.clone(),
+                item_count: *item_count,
+            })
+        }
+        Input::FsCreate {
+            content,
+            executable,
+            ..
+        } => file_mutation_observation(target, content.as_bytes(), *executable),
+        Input::FsWrite { content, .. } => file_mutation_observation(
+            target,
+            content.as_bytes(),
+            state_executable(target.state.as_ref())?,
+        ),
+        Input::FsEdit { .. } => file_mutation_observation(
+            target,
+            expected_edit.ok_or(PreEffectFailureCodeV2::TargetRevalidationFailed)?,
+            state_executable(target.state.as_ref())?,
+        ),
+        Input::FsDelete(_) => {
+            let state = target
+                .state
+                .as_ref()
+                .ok_or(PreEffectFailureCodeV2::TargetRevalidationFailed)?;
+            let digest = target
+                .state_digest
+                .clone()
+                .ok_or(PreEffectFailureCodeV2::TargetRevalidationFailed)?;
+            let before = match state {
+                ResourceStateV2::File { .. } => DeletionBeforeObservationV2::PresentFile {
+                    state_digest: digest,
+                },
+                ResourceStateV2::Directory { .. } => {
+                    DeletionBeforeObservationV2::PresentDirectory {
+                        state_digest: digest,
+                    }
+                }
+                ResourceStateV2::Absent {} => {
+                    return Err(PreEffectFailureCodeV2::TargetRevalidationFailed)
+                }
+            };
+            Ok(TargetRevalidationObservationV2::DeletionPrepared {
+                before,
+                expected_after: ResourceStateV2::Absent {},
+            })
+        }
+        Input::FsEnsureDirectory { .. } => {
+            let before = match target.state.as_ref() {
+                Some(ResourceStateV2::Absent {}) => DirectoryBeforeObservationV2::Absent {},
+                Some(ResourceStateV2::Directory { .. }) => {
+                    DirectoryBeforeObservationV2::PresentDirectory {
+                        state_digest: target
+                            .state_digest
+                            .clone()
+                            .ok_or(PreEffectFailureCodeV2::TargetRevalidationFailed)?,
+                    }
+                }
+                _ => return Err(PreEffectFailureCodeV2::TargetRevalidationFailed),
+            };
+            Ok(TargetRevalidationObservationV2::DirectoryPrepared {
+                before,
+                expected_after: WorkspaceObjectKindV2::Directory,
+            })
+        }
+        Input::WebSearch { .. } => match &target.public_resource {
+            ResolvedResourceV2::NetworkQuery {
+                query_digest,
+                target_observation_digest,
+                ..
+            } => Ok(TargetRevalidationObservationV2::WebQuery {
+                query_digest: query_digest.clone(),
+                reviewed_target_digest: target_observation_digest.clone(),
+            }),
+            _ => Err(PreEffectFailureCodeV2::TargetRevalidationFailed),
+        },
+        Input::WebFetch { .. } => match &target.public_resource {
+            ResolvedResourceV2::NetworkEndpoint {
+                target_observation_digest,
+                ..
+            } => Ok(TargetRevalidationObservationV2::WebTarget {
+                reviewed_target_digest: target_observation_digest.clone(),
+            }),
+            _ => Err(PreEffectFailureCodeV2::TargetRevalidationFailed),
+        },
+        _ => Err(PreEffectFailureCodeV2::ExecutorUnavailable),
+    }
+}
+
+fn file_mutation_observation(
+    target: &ResolvedTarget,
+    expected: &[u8],
+    executable: bool,
+) -> Result<TargetRevalidationObservationV2, PreEffectFailureCodeV2> {
+    let before = match target.state.as_ref() {
+        Some(ResourceStateV2::Absent {}) => FileBeforeObservationV2::Absent {},
+        Some(ResourceStateV2::File {
+            content_digest,
+            byte_length,
+            executable,
+        }) => FileBeforeObservationV2::PresentFile {
+            content_digest: content_digest.clone(),
+            byte_length: *byte_length,
+            executable: *executable,
+        },
+        _ => return Err(PreEffectFailureCodeV2::TargetRevalidationFailed),
+    };
+    Ok(TargetRevalidationObservationV2::FileMutationPrepared {
+        before,
+        expected_after: PresentFileObservationV2::PresentFile {
+            content_digest: content_digest_v2(expected),
+            byte_length: expected.len() as u64,
+            executable,
+        },
+    })
+}
+
+fn present_file(
+    state: Option<&ResourceStateV2>,
+) -> Result<PresentFileObservationV2, PreEffectFailureCodeV2> {
+    match state {
+        Some(ResourceStateV2::File {
+            content_digest,
+            byte_length,
+            executable,
+        }) => Ok(PresentFileObservationV2::PresentFile {
+            content_digest: content_digest.clone(),
+            byte_length: *byte_length,
+            executable: *executable,
+        }),
+        _ => Err(PreEffectFailureCodeV2::TargetRevalidationFailed),
+    }
+}
+
+fn state_executable(state: Option<&ResourceStateV2>) -> Result<bool, PreEffectFailureCodeV2> {
+    match state {
+        Some(ResourceStateV2::File { executable, .. }) => Ok(*executable),
+        _ => Err(PreEffectFailureCodeV2::TargetRevalidationFailed),
+    }
+}
+
+fn target_path(target: &ResolvedTarget) -> Result<PathBuf, ()> {
+    match &target.private_target {
+        CanonicalPrivateTargetV2::Workspace {
+            canonical_absolute_path_utf8,
+            ..
+        } => Ok(PathBuf::from(canonical_absolute_path_utf8)),
+        CanonicalPrivateTargetV2::Network { .. } => Err(()),
+    }
+}
+
+fn reviewed_target_value(target: &CanonicalPrivateTargetV2) -> Result<serde_json::Value, ()> {
+    let CanonicalPrivateTargetV2::Network {
+        request_target,
+        reviewed_addresses,
+    } = target
+    else {
+        return Err(());
+    };
+    let host = match &request_target.host {
+        NetworkHostV2::DnsName { labels } => labels.join("."),
+        NetworkHostV2::Ipv4 { octets } => Ipv4Addr::from(*octets).to_string(),
+        NetworkHostV2::Ipv6 { octets } => Ipv6Addr::from(*octets).to_string(),
+    };
+    let addresses = reviewed_addresses
+        .iter()
+        .map(|address| match address {
+            NetworkAddressV2::Ipv4 { octets } => {
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::from(*octets)), request_target.port)
+            }
+            NetworkAddressV2::Ipv6 { octets } => {
+                SocketAddr::new(IpAddr::V6(Ipv6Addr::from(*octets)), request_target.port)
+            }
+        })
+        .collect::<Vec<_>>();
+    let selected_address = addresses.first().ok_or(())?;
+    Ok(serde_json::json!({
+        "host":host,
+        "port":request_target.port,
+        "selectedAddress":selected_address,
+        "resolvedAddresses":addresses,
+        "private":false
+    }))
+}
+
+pub(super) fn resolve_execution(
+    invocation: &ToolInvocationInputV4,
+    preparation: &EffectPreparation,
+    raw: Result<RawExecution, ()>,
+    workspace: &WorkspaceBinding,
+    maximum_output_bytes: u32,
+) -> ExecutionResolution {
+    use ToolInvocationInputV4 as Input;
+    if matches!(
+        invocation,
+        Input::FsCreate { .. }
+            | Input::FsWrite { .. }
+            | Input::FsEdit { .. }
+            | Input::FsDelete(_)
+            | Input::FsEnsureDirectory { .. }
+    ) {
+        return resolve_mutation(invocation, preparation, raw.is_ok(), maximum_output_bytes);
+    }
+    let Ok(raw) = raw else {
+        return indeterminate(LastObservationV2::None {});
+    };
+    let Some(revalidation) = preparation.revalidations.first() else {
+        return indeterminate(LastObservationV2::None {});
+    };
+    let built = match invocation {
+        Input::FsRead { .. } => utf8_output(
+            invocation.tool_id(),
+            TextMediaTypeV4::TextPlainUtf8,
+            raw.output
+                .get("content")
+                .and_then(serde_json::Value::as_str),
+            maximum_output_bytes,
+        ),
+        Input::FsDiff { .. } => utf8_output(
+            invocation.tool_id(),
+            TextMediaTypeV4::TextDiffUtf8,
+            raw.output.get("diff").and_then(serde_json::Value::as_str),
+            maximum_output_bytes,
+        ),
+        Input::DocumentRead { .. } => utf8_output(
+            invocation.tool_id(),
+            TextMediaTypeV4::TextDocumentUtf8,
+            raw.complete_document_text.as_deref(),
+            maximum_output_bytes,
+        ),
+        Input::FsList { .. } => path_entries_from_nodes(
+            invocation.tool_id(),
+            raw.output.get("nodes"),
+            maximum_output_bytes,
+        ),
+        Input::FsGlob { .. } => path_entries_from_glob(
+            invocation.tool_id(),
+            raw.output.get("matches"),
+            &workspace.canonical_root,
+            maximum_output_bytes,
+        ),
+        Input::CodeGrep {
+            query, strategy, ..
+        } => search_matches_output(
+            invocation.tool_id(),
+            raw.output.get("matches"),
+            query,
+            *strategy,
+            maximum_output_bytes,
+        ),
+        Input::WebSearch { .. } => web_search_output(
+            invocation.tool_id(),
+            raw.output.get("results"),
+            maximum_output_bytes,
+        ),
+        Input::WebFetch { .. } => web_response_output(
+            invocation.tool_id(),
+            &raw,
+            revalidation,
+            maximum_output_bytes,
+        ),
+        _ => None,
+    };
+    let Some(output) = built else {
+        return indeterminate(LastObservationV2::None {});
+    };
+    let evidence = match invocation {
+        Input::FsRead { .. } | Input::FsDiff { .. } | Input::DocumentRead { .. } => {
+            let complete_text = match invocation {
+                Input::DocumentRead { .. } => raw.complete_document_text.as_deref(),
+                Input::FsRead { .. } => raw
+                    .output
+                    .get("content")
+                    .and_then(serde_json::Value::as_str),
+                Input::FsDiff { .. } => raw.output.get("diff").and_then(serde_json::Value::as_str),
+                _ => None,
+            };
+            let Some(complete_text) = complete_text else {
+                return indeterminate(LastObservationV2::None {});
+            };
+            EffectEvidenceV2::ContentRead {
+                content_digest: content_digest_v2(complete_text.as_bytes()),
+                byte_length: complete_text.len() as u64,
+            }
+        }
+        Input::FsList { .. } | Input::FsGlob { .. } => {
+            let ToolOutputPayloadV4::PathEntries { entries } =
+                complete_payload_for_output(invocation, &raw, workspace)
+                    .unwrap_or_else(|| output.payload.clone())
+            else {
+                return indeterminate(LastObservationV2::None {});
+            };
+            EffectEvidenceV2::CollectionRead {
+                result_digest: match collection_digest_v2(&entries) {
+                    Ok(value) => value,
+                    Err(_) => return indeterminate(LastObservationV2::None {}),
+                },
+                item_count: entries.len() as u64,
+            }
+        }
+        Input::CodeGrep { .. } => EffectEvidenceV2::SearchMatchesReadBack {
+            output_digest: output.full_digest.clone(),
+            match_count: raw
+                .output
+                .get("matches")
+                .and_then(serde_json::Value::as_array)
+                .map(|items| items.len() as u64)
+                .unwrap_or(0),
+        },
+        Input::WebSearch { .. } => {
+            let TargetRevalidationObservationV2::WebQuery {
+                query_digest,
+                reviewed_target_digest,
+            } = &revalidation.observation
+            else {
+                return indeterminate(LastObservationV2::None {});
+            };
+            EffectEvidenceV2::WebSearchReadBack {
+                query_digest: query_digest.clone(),
+                reviewed_target_digest: reviewed_target_digest.clone(),
+                output_digest: output.full_digest.clone(),
+                result_count: raw
+                    .output
+                    .get("results")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|items| items.len() as u64)
+                    .unwrap_or(0),
+            }
+        }
+        Input::WebFetch { .. } => {
+            let TargetRevalidationObservationV2::WebTarget {
+                reviewed_target_digest,
+            } = &revalidation.observation
+            else {
+                return indeterminate(LastObservationV2::None {});
+            };
+            let body = raw
+                .output
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let status_code = raw.http_status_code.unwrap_or_default();
+            let content_type = raw.http_content_type.as_deref().unwrap_or_default();
+            let response_digest = match network_response_digest_v2(&serde_json::json!({
+                "reviewedTargetDigest":reviewed_target_digest,
+                "statusCode":status_code,
+                "contentType":content_type,
+                "bodyContentDigest":content_digest_v2(body.as_bytes())
+            })) {
+                Ok(value) => value,
+                Err(_) => return indeterminate(LastObservationV2::None {}),
+            };
+            EffectEvidenceV2::WebReadBack {
+                reviewed_target_digest: reviewed_target_digest.clone(),
+                response_digest,
+                status_code,
+            }
+        }
+        _ => return indeterminate(LastObservationV2::None {}),
+    };
+    ExecutionResolution::Completed(VerifiedExecution { output, evidence })
+}
+
+pub(super) fn pre_effect_stop_drafts(
+    identity: &AttemptIdentityV2,
+    observed_fact_id: FactId,
+    terminal_fact_id: FactId,
+    release_fact_id: FactId,
+    cancellation: Option<(&CancelRequestId, &FactId)>,
+) -> Vec<KernelFactDraftV2> {
+    let (observed, terminal, release_reason) = match cancellation {
+        Some((cancel_request_id, cancellation_fact_id)) => (
+            InvocationFactV2::CancellationObserved {
+                identity: caused_attempt(identity, cancellation_fact_id.clone()),
+                cancel_request_id: cancel_request_id.clone(),
+            },
+            InvocationFactV2::CancelledBeforeEffect {
+                identity: caused_attempt(identity, observed_fact_id.clone()),
+                cancel_request_id: cancel_request_id.clone(),
+            },
+            ReservationReleaseReasonV2::CancelledBeforeEffect,
+        ),
+        None => (
+            InvocationFactV2::DeadlineObserved {
+                identity: caused_attempt(identity, identity.causation_fact_id.clone()),
+            },
+            InvocationFactV2::TimedOutBeforeEffect {
+                identity: caused_attempt(identity, observed_fact_id.clone()),
+            },
+            ReservationReleaseReasonV2::TimedOutBeforeEffect,
+        ),
+    };
+    vec![
+        fact_draft(observed_fact_id, KernelFactPayloadV2::Invocation(observed)),
+        fact_draft(
+            terminal_fact_id.clone(),
+            KernelFactPayloadV2::Invocation(terminal),
+        ),
+        fact_draft(
+            release_fact_id,
+            KernelFactPayloadV2::Grant(GrantFactV2::ReservationReleased {
+                identity: reservation_identity(identity, terminal_fact_id),
+                reason_code: release_reason,
+            }),
+        ),
+    ]
+}
+
+pub(super) fn failed_before_effect_drafts(
+    identity: &AttemptIdentityV2,
+    attempt_prepared_fact_id: &FactId,
+    terminal_fact_id: FactId,
+    release_fact_id: FactId,
+    error_code: PreEffectFailureCodeV2,
+) -> Vec<KernelFactDraftV2> {
+    vec![
+        fact_draft(
+            terminal_fact_id.clone(),
+            KernelFactPayloadV2::Invocation(InvocationFactV2::FailedBeforeEffect {
+                identity: caused_attempt(identity, attempt_prepared_fact_id.clone()),
+                error_code,
+            }),
+        ),
+        fact_draft(
+            release_fact_id,
+            KernelFactPayloadV2::Grant(GrantFactV2::ReservationReleased {
+                identity: reservation_identity(identity, terminal_fact_id),
+                reason_code: ReservationReleaseReasonV2::FailedBeforeEffect,
+            }),
+        ),
+    ]
+}
+
+pub(super) fn execution_result_drafts(
+    identity: &AttemptIdentityV2,
+    execution_started_fact_id: &FactId,
+    effect_id: EffectId,
+    effect_fact_id: FactId,
+    terminal_fact_id: FactId,
+    mut resource_ids: Vec<ResourceId>,
+    resolution: ExecutionResolution,
+    cancel_request_id: Option<&CancelRequestId>,
+    deadline_observed: bool,
+) -> AuthorityResult<Vec<KernelFactDraftV2>> {
+    resource_ids.sort_by(|left, right| left.as_str().as_bytes().cmp(right.as_str().as_bytes()));
+    resource_ids.dedup();
+    let effect_identity = EffectIdentityV2 {
+        run_id: identity.run_id.clone(),
+        control_epoch: identity.control_epoch,
+        operation_id: identity.operation_id.clone(),
+        grant_id: identity.grant_id.clone(),
+        reservation_id: identity.reservation_id.clone(),
+        invocation_id: identity.invocation_id.clone(),
+        attempt_id: identity.attempt_id.clone(),
+        effect_id: effect_id.clone(),
+        idempotency_key_hash: identity.idempotency_key_hash.clone(),
+        causation_fact_id: execution_started_fact_id.clone(),
+    };
+    let terminal_identity = ObservedTerminalIdentityV2 {
+        run_id: identity.run_id.clone(),
+        control_epoch: identity.control_epoch,
+        operation_id: identity.operation_id.clone(),
+        grant_id: identity.grant_id.clone(),
+        reservation_id: identity.reservation_id.clone(),
+        invocation_id: identity.invocation_id.clone(),
+        attempt_id: identity.attempt_id.clone(),
+        effect_id,
+        idempotency_key_hash: identity.idempotency_key_hash.clone(),
+        causation_fact_id: effect_fact_id.clone(),
+        correlation_set: identity.correlation_set.clone(),
+    };
+    let (effect, terminal) = match resolution {
+        ExecutionResolution::Completed(verified) => {
+            let evidence_digest =
+                executor_evidence_digest_v2(&verified.evidence).map_err(|_| corrupt_store())?;
+            (
+                observed_effect(
+                    effect_identity,
+                    resource_ids,
+                    verified.evidence,
+                    evidence_digest,
+                    cancel_request_id,
+                    deadline_observed,
+                ),
+                InvocationFactV2::Completed {
+                    identity: terminal_identity,
+                    output: verified.output,
+                },
+            )
+        }
+        ExecutionResolution::FailedAfterObservedEffect {
+            evidence,
+            error_code,
+        } => {
+            let evidence_digest =
+                executor_evidence_digest_v2(&evidence).map_err(|_| corrupt_store())?;
+            (
+                observed_effect(
+                    effect_identity,
+                    resource_ids,
+                    evidence,
+                    evidence_digest,
+                    cancel_request_id,
+                    deadline_observed,
+                ),
+                InvocationFactV2::FailedAfterObservedEffect {
+                    identity: terminal_identity,
+                    error_code,
+                },
+            )
+        }
+        ExecutionResolution::Indeterminate {
+            evidence,
+            reason_code,
+        } => {
+            let evidence_digest =
+                executor_evidence_digest_v2(&evidence).map_err(|_| corrupt_store())?;
+            (
+                EffectFactV2::Indeterminate {
+                    identity: effect_identity,
+                    possible_affected_resource_ids: resource_ids,
+                    reason_code,
+                    evidence,
+                    evidence_digest,
+                },
+                InvocationFactV2::Indeterminate {
+                    identity: terminal_identity,
+                    reason_code,
+                },
+            )
+        }
+    };
+    Ok(vec![
+        fact_draft(effect_fact_id, KernelFactPayloadV2::Effect(effect)),
+        fact_draft(terminal_fact_id, KernelFactPayloadV2::Invocation(terminal)),
+    ])
+}
+
+fn reservation_identity(
+    identity: &AttemptIdentityV2,
+    causation_fact_id: FactId,
+) -> ReservationIdentityV2 {
+    ReservationIdentityV2 {
+        run_id: identity.run_id.clone(),
+        control_epoch: identity.control_epoch,
+        operation_id: identity.operation_id.clone(),
+        grant_id: identity.grant_id.clone(),
+        reservation_id: identity.reservation_id.clone(),
+        invocation_id: identity.invocation_id.clone(),
+        idempotency_key_hash: identity.idempotency_key_hash.clone(),
+        causation_fact_id,
+        correlation_set: identity.correlation_set.clone(),
+    }
+}
+
+fn observed_effect(
+    identity: EffectIdentityV2,
+    affected_resource_ids: Vec<ResourceId>,
+    evidence: EffectEvidenceV2,
+    evidence_digest: ExecutorEvidenceDigestV2,
+    cancel_request_id: Option<&CancelRequestId>,
+    deadline_observed: bool,
+) -> EffectFactV2 {
+    match (cancel_request_id, deadline_observed) {
+        (Some(cancel_request_id), true) => EffectFactV2::ObservedAfterCancelAndDeadline {
+            identity,
+            cancel_request_id: cancel_request_id.clone(),
+            affected_resource_ids,
+            evidence,
+            evidence_digest,
+        },
+        (Some(cancel_request_id), false) => EffectFactV2::ObservedAfterCancel {
+            identity,
+            cancel_request_id: cancel_request_id.clone(),
+            affected_resource_ids,
+            evidence,
+            evidence_digest,
+        },
+        (None, true) => EffectFactV2::ObservedAfterDeadline {
+            identity,
+            affected_resource_ids,
+            evidence,
+            evidence_digest,
+        },
+        (None, false) => EffectFactV2::Observed {
+            identity,
+            affected_resource_ids,
+            evidence,
+            evidence_digest,
+        },
+    }
+}
+
+fn resolve_mutation(
+    invocation: &ToolInvocationInputV4,
+    preparation: &EffectPreparation,
+    executor_ok: bool,
+    maximum_output_bytes: u32,
+) -> ExecutionResolution {
+    let Some(revalidation) = preparation.revalidations.first() else {
+        return indeterminate(LastObservationV2::None {});
+    };
+    let Ok(path) = target_path(&revalidation.target) else {
+        return indeterminate(LastObservationV2::None {});
+    };
+    let Ok(after) = resource_state_for_path(&path) else {
+        return indeterminate(LastObservationV2::None {});
+    };
+    let Ok(after_digest) = resource_state_digest_v2(&after) else {
+        return indeterminate(LastObservationV2::None {});
+    };
+    let before_digest =
+        revalidation.target.state_digest.clone().unwrap_or_else(|| {
+            resource_state_digest_v2(&ResourceStateV2::Absent {}).expect("absent")
+        });
+    let (expected, evidence) = match (&revalidation.observation, invocation) {
+        (
+            TargetRevalidationObservationV2::FileMutationPrepared { expected_after, .. },
+            ToolInvocationInputV4::FsCreate { .. }
+            | ToolInvocationInputV4::FsWrite { .. }
+            | ToolInvocationInputV4::FsEdit { .. },
+        ) => {
+            let expected_state = match expected_after {
+                PresentFileObservationV2::PresentFile {
+                    content_digest,
+                    byte_length,
+                    executable,
+                } => ResourceStateV2::File {
+                    content_digest: content_digest.clone(),
+                    byte_length: *byte_length,
+                    executable: *executable,
+                },
+            };
+            (
+                after == expected_state,
+                EffectEvidenceV2::MutationReadBack {
+                    before_digest,
+                    after_digest: after_digest.clone(),
+                    target_kind: WorkspaceObjectKindV2::File,
+                },
+            )
+        }
+        (
+            TargetRevalidationObservationV2::DirectoryPrepared { .. },
+            ToolInvocationInputV4::FsEnsureDirectory { .. },
+        ) => (
+            matches!(after, ResourceStateV2::Directory { .. }),
+            EffectEvidenceV2::MutationReadBack {
+                before_digest,
+                after_digest: after_digest.clone(),
+                target_kind: WorkspaceObjectKindV2::Directory,
+            },
+        ),
+        (
+            TargetRevalidationObservationV2::DeletionPrepared { before, .. },
+            ToolInvocationInputV4::FsDelete(_),
+        ) => {
+            let previous_digest = match before {
+                DeletionBeforeObservationV2::PresentFile { state_digest }
+                | DeletionBeforeObservationV2::PresentDirectory { state_digest } => {
+                    state_digest.clone()
+                }
+            };
+            (
+                matches!(after, ResourceStateV2::Absent {}),
+                EffectEvidenceV2::DeletionReadBack { previous_digest },
+            )
+        }
+        _ => {
+            return indeterminate(LastObservationV2::ResourceState {
+                digest: after_digest,
+            })
+        }
+    };
+    if executor_ok && expected {
+        let output = bounded_output(
+            invocation.tool_id(),
+            ToolOutputPayloadV4::NoPrimaryContent {},
+            maximum_output_bytes,
+        )
+        .expect("no-primary-content output is bounded");
+        ExecutionResolution::Completed(VerifiedExecution { output, evidence })
+    } else if expected {
+        ExecutionResolution::FailedAfterObservedEffect {
+            evidence,
+            error_code: PostObservedEffectFailureCodeV2::BackendReportedFailure,
+        }
+    } else if executor_ok {
+        ExecutionResolution::FailedAfterObservedEffect {
+            evidence,
+            error_code: PostObservedEffectFailureCodeV2::VerificationFailed,
+        }
+    } else {
+        indeterminate(LastObservationV2::ResourceState {
+            digest: after_digest,
+        })
+    }
+}
+
+fn indeterminate(last_observation: LastObservationV2) -> ExecutionResolution {
+    ExecutionResolution::Indeterminate {
+        evidence: EffectEvidenceV2::IndeterminateReadBack { last_observation },
+        reason_code: IndeterminateReasonV2::VerificationAmbiguous,
+    }
+}
+
+fn utf8_output(
+    tool_id: AuthorityToolIdV4,
+    media_type: TextMediaTypeV4,
+    text: Option<&str>,
+    budget: u32,
+) -> Option<ToolOutputV4> {
+    bounded_output(
+        tool_id,
+        ToolOutputPayloadV4::Utf8Text {
+            media_type,
+            text: text?.to_owned(),
+        },
+        budget,
+    )
+}
+
+fn path_entries_from_nodes(
+    tool_id: AuthorityToolIdV4,
+    nodes: Option<&serde_json::Value>,
+    budget: u32,
+) -> Option<ToolOutputV4> {
+    fn visit(value: &serde_json::Value, output: &mut Vec<PathEntryV4>) -> Option<()> {
+        for node in value.as_array()? {
+            let kind = match node.get("type")?.as_str()? {
+                "file" => WorkspaceObjectKindV4::File,
+                "directory" => WorkspaceObjectKindV4::Directory,
+                _ => return None,
+            };
+            output.push(PathEntryV4 {
+                relative_path: node.get("path")?.as_str()?.to_owned(),
+                kind,
+                size: node
+                    .get("sizeBytes")
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|value| PathEntrySizeV4::Bytes { value })
+                    .unwrap_or(PathEntrySizeV4::Unavailable {}),
+            });
+            if let Some(children) = node.get("children") {
+                visit(children, output)?;
+            }
+        }
+        Some(())
+    }
+    let mut entries = Vec::new();
+    visit(nodes?, &mut entries)?;
+    entries.sort_by(|left, right| {
+        left.relative_path
+            .as_bytes()
+            .cmp(right.relative_path.as_bytes())
+    });
+    bounded_output(
+        tool_id,
+        ToolOutputPayloadV4::PathEntries { entries },
+        budget,
+    )
+}
+
+fn path_entries_from_glob(
+    tool_id: AuthorityToolIdV4,
+    matches: Option<&serde_json::Value>,
+    workspace: &Path,
+    budget: u32,
+) -> Option<ToolOutputV4> {
+    let mut entries = matches?
+        .as_array()?
+        .iter()
+        .map(|value| {
+            let relative_path = value.as_str()?.to_owned();
+            let metadata = fs::metadata(workspace.join(&relative_path)).ok()?;
+            Some(PathEntryV4 {
+                relative_path,
+                kind: if metadata.is_dir() {
+                    WorkspaceObjectKindV4::Directory
+                } else if metadata.is_file() {
+                    WorkspaceObjectKindV4::File
+                } else {
+                    return None;
+                },
+                size: PathEntrySizeV4::Bytes {
+                    value: metadata.len(),
+                },
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    entries.sort_by(|left, right| {
+        left.relative_path
+            .as_bytes()
+            .cmp(right.relative_path.as_bytes())
+    });
+    bounded_output(
+        tool_id,
+        ToolOutputPayloadV4::PathEntries { entries },
+        budget,
+    )
+}
+
+fn search_matches_output(
+    tool_id: AuthorityToolIdV4,
+    raw: Option<&serde_json::Value>,
+    query: &str,
+    strategy: SearchStrategyV4,
+    budget: u32,
+) -> Option<ToolOutputV4> {
+    let regex = matches!(strategy, SearchStrategyV4::Regex)
+        .then(|| regex::Regex::new(query).ok())
+        .flatten();
+    let matches = raw?
+        .as_array()?
+        .iter()
+        .map(|value| {
+            let preview = value.get("preview")?.as_str()?.to_owned();
+            let start = match strategy {
+                SearchStrategyV4::Literal => preview.find(query),
+                SearchStrategyV4::Regex => {
+                    regex.as_ref()?.find(&preview).map(|value| value.start())
+                }
+            }?;
+            Some(SearchMatchV4 {
+                relative_path: value.get("path")?.as_str()?.to_owned(),
+                line: u32::try_from(value.get("line")?.as_u64()?).ok()?,
+                column: u32::try_from(preview[..start].chars().count() + 1).ok()?,
+                preview,
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    bounded_output(
+        tool_id,
+        ToolOutputPayloadV4::SearchMatches { matches },
+        budget,
+    )
+}
+
+fn web_search_output(
+    tool_id: AuthorityToolIdV4,
+    raw: Option<&serde_json::Value>,
+    budget: u32,
+) -> Option<ToolOutputV4> {
+    let items = raw?
+        .as_array()?
+        .iter()
+        .map(|value| {
+            Some(WebSearchItemV4 {
+                title: value.get("title")?.as_str()?.to_owned(),
+                url: value.get("url")?.as_str()?.to_owned(),
+                snippet: value
+                    .get("snippet")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    bounded_output(
+        tool_id,
+        ToolOutputPayloadV4::WebSearchResults { items },
+        budget,
+    )
+}
+
+fn web_response_output(
+    tool_id: AuthorityToolIdV4,
+    raw: &RawExecution,
+    revalidation: &PreparedRevalidation,
+    budget: u32,
+) -> Option<ToolOutputV4> {
+    let ResolvedResourceV2::NetworkEndpoint {
+        origin,
+        target_observation_digest,
+    } = &revalidation.target.public_resource
+    else {
+        return None;
+    };
+    bounded_output(
+        tool_id,
+        ToolOutputPayloadV4::WebResponse {
+            status_code: raw.http_status_code?,
+            final_target: NetworkPublicTargetV4 {
+                origin: origin.clone(),
+                target_observation_digest: target_observation_digest.clone(),
+            },
+            content_type: raw.http_content_type.clone()?,
+            body: raw.output.get("content")?.as_str()?.to_owned(),
+        },
+        budget,
+    )
+}
+
+fn complete_payload_for_output(
+    invocation: &ToolInvocationInputV4,
+    raw: &RawExecution,
+    workspace: &WorkspaceBinding,
+) -> Option<ToolOutputPayloadV4> {
+    match invocation {
+        ToolInvocationInputV4::FsList { .. } => {
+            let output =
+                path_entries_from_nodes(invocation.tool_id(), raw.output.get("nodes"), u32::MAX)?;
+            Some(output.payload)
+        }
+        ToolInvocationInputV4::FsGlob { .. } => {
+            let output = path_entries_from_glob(
+                invocation.tool_id(),
+                raw.output.get("matches"),
+                &workspace.canonical_root,
+                u32::MAX,
+            )?;
+            Some(output.payload)
+        }
         _ => None,
     }
 }
 
-fn invalid_request(field: &'static str, error: impl std::fmt::Display) -> AuthorityError {
-    AuthorityError::InvalidRequest {
-        field,
-        reason: error.to_string(),
+fn bounded_output(
+    tool_id: AuthorityToolIdV4,
+    complete: ToolOutputPayloadV4,
+    maximum_bytes: u32,
+) -> Option<ToolOutputV4> {
+    let complete_output = output_payload_measure_v4(tool_id, complete).ok()?;
+    let maximum = maximum_bytes as usize;
+    if complete_output.total_bytes <= maximum as u64 {
+        return Some(complete_output);
+    }
+    let retained = truncate_payload_to_budget(&complete_output.payload, maximum)?;
+    let retained_bytes = serde_json::to_vec(&retained).ok()?.len() as u64;
+    Some(ToolOutputV4 {
+        full_digest: complete_output.full_digest,
+        total_bytes: complete_output.total_bytes,
+        truncation: OutputTruncationV4::Truncated { retained_bytes },
+        payload: retained,
+    })
+}
+
+fn truncate_payload_to_budget(
+    complete: &ToolOutputPayloadV4,
+    maximum: usize,
+) -> Option<ToolOutputPayloadV4> {
+    match complete {
+        ToolOutputPayloadV4::Utf8Text { media_type, text } => {
+            truncate_text(text, maximum, |text| ToolOutputPayloadV4::Utf8Text {
+                media_type: *media_type,
+                text,
+            })
+        }
+        ToolOutputPayloadV4::WebResponse {
+            status_code,
+            content_type,
+            body,
+            final_target,
+        } => truncate_text(body, maximum, |body| ToolOutputPayloadV4::WebResponse {
+            status_code: *status_code,
+            content_type: content_type.clone(),
+            body,
+            final_target: final_target.clone(),
+        }),
+        ToolOutputPayloadV4::PathEntries { entries } => {
+            truncate_items(entries, maximum, |entries| {
+                ToolOutputPayloadV4::PathEntries { entries }
+            })
+        }
+        ToolOutputPayloadV4::SearchMatches { matches } => {
+            truncate_items(matches, maximum, |matches| {
+                ToolOutputPayloadV4::SearchMatches { matches }
+            })
+        }
+        ToolOutputPayloadV4::WebSearchResults { items } => {
+            truncate_items(items, maximum, |items| {
+                ToolOutputPayloadV4::WebSearchResults { items }
+            })
+        }
+        ToolOutputPayloadV4::NoPrimaryContent {} => None,
     }
 }
 
-fn recovery_error(message: impl Into<String>) -> AuthorityError {
-    AuthorityError::FactStoreUnavailable {
-        operation: "restore_authority_state",
-        message: message.into(),
+fn truncate_text(
+    text: &str,
+    maximum: usize,
+    build: impl Fn(String) -> ToolOutputPayloadV4,
+) -> Option<ToolOutputPayloadV4> {
+    let boundaries = text
+        .char_indices()
+        .map(|(index, _)| index)
+        .chain(std::iter::once(text.len()))
+        .collect::<Vec<_>>();
+    let retained = largest_prefix(boundaries.len() - 1, |count| {
+        serialized_fits(&build(text[..boundaries[count]].to_owned()), maximum)
+    })?;
+    Some(build(text[..boundaries[retained]].to_owned()))
+}
+
+fn truncate_items<T: Clone>(
+    items: &[T],
+    maximum: usize,
+    build: impl Fn(Vec<T>) -> ToolOutputPayloadV4,
+) -> Option<ToolOutputPayloadV4> {
+    let retained = largest_prefix(items.len(), |count| {
+        serialized_fits(&build(items[..count].to_vec()), maximum)
+    })?;
+    Some(build(items[..retained].to_vec()))
+}
+
+fn largest_prefix(upper: usize, mut fits: impl FnMut(usize) -> Option<bool>) -> Option<usize> {
+    if !fits(0)? {
+        return None;
+    }
+    let (mut low, mut high) = (0, upper.saturating_add(1));
+    while low + 1 < high {
+        let middle = low + (high - low) / 2;
+        if fits(middle)? {
+            low = middle;
+        } else {
+            high = middle;
+        }
+    }
+    Some(low)
+}
+
+fn serialized_fits(payload: &ToolOutputPayloadV4, maximum: usize) -> Option<bool> {
+    Some(serde_json::to_vec(payload).ok()?.len() <= maximum)
+}
+
+fn materialize_deadline(
+    request: DeadlineRequestV2,
+    contract: &DeadlineV4,
+) -> Result<u32, PrepareFailure> {
+    match request {
+        DeadlineRequestV2::ContractDefault {} => Ok(contract.default_ms),
+        DeadlineRequestV2::ExactMilliseconds { value }
+            if value > 0 && value <= contract.maximum_ms =>
+        {
+            Ok(value)
+        }
+        DeadlineRequestV2::ExactMilliseconds { value } => {
+            Err(PrepareFailure::Kernel(KernelErrorV2::InvalidRequest {
+                reason: InvalidRequestReasonV2::DeadlineOutOfContract {
+                    requested_ms: value,
+                    maximum_ms: contract.maximum_ms,
+                },
+            }))
+        }
     }
 }
 
-fn occurred_at() -> String {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis().to_string())
-        .unwrap_or_else(|_| "0".to_string())
+fn resolve_invocation_targets(
+    invocation: &ToolInvocationInputV4,
+    workspace: &WorkspaceBinding,
+    executor_config: &KernelExecutorConfig,
+) -> Result<(ResourceScopeV2, Vec<ResolvedTarget>), PrepareFailure> {
+    use ToolInvocationInputV4 as Input;
+    let workspace_spec = match invocation {
+        Input::FsRead { path, .. }
+        | Input::FsDiff { path, .. }
+        | Input::DocumentRead { path, .. } => Some(WorkspaceTargetSpec::new(
+            path,
+            ExpectedTarget::MustFile,
+            ResourceAccessV2::Read,
+        )),
+        Input::FsList { path, .. } => Some(WorkspaceTargetSpec::new(
+            path,
+            ExpectedTarget::MustDirectory,
+            ResourceAccessV2::Read,
+        )),
+        Input::FsGlob { root, .. } | Input::CodeGrep { root, .. } => Some(
+            WorkspaceTargetSpec::new(root, ExpectedTarget::MustDirectory, ResourceAccessV2::Read),
+        ),
+        Input::FsCreate { path, .. } => Some(WorkspaceTargetSpec::new(
+            path,
+            ExpectedTarget::MustAbsent(WorkspaceObjectKindV2::File),
+            ResourceAccessV2::Write,
+        )),
+        Input::FsWrite { path, .. } | Input::FsEdit { path, .. } => Some(WorkspaceTargetSpec::new(
+            path,
+            ExpectedTarget::MustFile,
+            ResourceAccessV2::Write,
+        )),
+        Input::FsDelete(DeleteTargetV4::File { path }) => Some(WorkspaceTargetSpec::new(
+            path,
+            ExpectedTarget::MustFile,
+            ResourceAccessV2::Write,
+        )),
+        Input::FsDelete(DeleteTargetV4::DirectoryTree { path }) => Some(WorkspaceTargetSpec::new(
+            path,
+            ExpectedTarget::MustDirectory,
+            ResourceAccessV2::Write,
+        )),
+        Input::FsEnsureDirectory { path } => Some(WorkspaceTargetSpec::new(
+            path,
+            ExpectedTarget::DirectoryOrAbsent,
+            ResourceAccessV2::Write,
+        )),
+        Input::FsRename { .. }
+        | Input::GitStatus {}
+        | Input::GitDiff { .. }
+        | Input::GitStage { .. }
+        | Input::GitUnstage { .. }
+        | Input::GitCommit { .. } => {
+            return Err(PrepareFailure::Kernel(
+                KernelErrorV2::ToolExecutionUnavailable {
+                    tool_id: invocation.tool_id(),
+                    availability: ExecutionAvailabilityV4::Blocked,
+                },
+            ));
+        }
+        Input::WebSearch { .. } | Input::WebFetch { .. } => None,
+    };
+
+    if let Some(spec) = workspace_spec {
+        let access = spec.2;
+        let resolved = resolve_workspace_target(workspace, spec)?;
+        let target = WorkspaceScopeTargetV2 {
+            relative_path: resolved
+                .relative_path
+                .clone()
+                .expect("workspace target path"),
+            object_kind: resolved.object_kind.expect("workspace target kind"),
+            access,
+            target_observation_digest: resolved
+                .state_digest
+                .clone()
+                .expect("workspace target state"),
+        };
+        return Ok((
+            ResourceScopeV2::Workspace {
+                targets: vec![target],
+            },
+            vec![resolved],
+        ));
+    }
+
+    match invocation {
+        Input::WebSearch { query, limit } => {
+            let url = crate::executors::web::web_search_target_url(
+                executor_config,
+                query,
+                u64::from(*limit),
+            )
+            .map_err(|_| PrepareFailure::Target(TargetResolutionFailureV2::ResolverUnavailable))?;
+            let network = resolve_network_target(&url)?;
+            let query_digest = query_digest_v2(&serde_json::json!({
+                "kind":"webSearch",
+                "query":query
+            }))
+            .map_err(|_| storage_fault())?;
+            let public_resource = ResolvedResourceV2::NetworkQuery {
+                query_digest: query_digest.clone(),
+                service_origin: network.origin.clone(),
+                target_observation_digest: network.target_digest.clone(),
+            };
+            Ok((
+                ResourceScopeV2::NetworkQuery {
+                    query_digest,
+                    service_origin: network.origin,
+                    target_observation_digest: network.target_digest,
+                },
+                vec![ResolvedTarget {
+                    relative_path: None,
+                    object_kind: None,
+                    state: None,
+                    state_digest: None,
+                    public_resource,
+                    private_target: network.private_target,
+                }],
+            ))
+        }
+        Input::WebFetch { url, .. } => {
+            let network = resolve_network_target(url)?;
+            let public_resource = ResolvedResourceV2::NetworkEndpoint {
+                origin: network.origin.clone(),
+                target_observation_digest: network.target_digest.clone(),
+            };
+            Ok((
+                ResourceScopeV2::NetworkUrl {
+                    origin: network.origin,
+                    target_observation_digest: network.target_digest,
+                },
+                vec![ResolvedTarget {
+                    relative_path: None,
+                    object_kind: None,
+                    state: None,
+                    state_digest: None,
+                    public_resource,
+                    private_target: network.private_target,
+                }],
+            ))
+        }
+        _ => Err(PrepareFailure::Target(
+            TargetResolutionFailureV2::ResolverUnavailable,
+        )),
+    }
 }
+
+enum ExpectedTarget {
+    MustFile,
+    MustDirectory,
+    MustAbsent(WorkspaceObjectKindV2),
+    DirectoryOrAbsent,
+}
+
+struct WorkspaceTargetSpec(String, ExpectedTarget, ResourceAccessV2);
+
+impl WorkspaceTargetSpec {
+    fn new(path: &str, expected: ExpectedTarget, access: ResourceAccessV2) -> Self {
+        Self(path.to_owned(), expected, access)
+    }
+}
+
+fn resolve_workspace_target(
+    workspace: &WorkspaceBinding,
+    spec: WorkspaceTargetSpec,
+) -> Result<ResolvedTarget, PrepareFailure> {
+    let WorkspaceTargetSpec(path, expected, _) = spec;
+    let canonical_target = resolve_private_workspace_path(&workspace.canonical_root, &path)?;
+    let state = resource_state_for_path(&canonical_target)?;
+    let object_kind = match (&expected, &state) {
+        (ExpectedTarget::MustFile, ResourceStateV2::File { .. }) => WorkspaceObjectKindV2::File,
+        (ExpectedTarget::MustDirectory, ResourceStateV2::Directory { .. }) => {
+            WorkspaceObjectKindV2::Directory
+        }
+        (ExpectedTarget::MustAbsent(kind), ResourceStateV2::Absent {}) => *kind,
+        (ExpectedTarget::DirectoryOrAbsent, ResourceStateV2::Absent {})
+        | (ExpectedTarget::DirectoryOrAbsent, ResourceStateV2::Directory { .. }) => {
+            WorkspaceObjectKindV2::Directory
+        }
+        (ExpectedTarget::MustAbsent(_), _) => {
+            return Err(PrepareFailure::Target(
+                TargetResolutionFailureV2::AlreadyExists,
+            ));
+        }
+        (_, ResourceStateV2::Absent {}) => {
+            return Err(PrepareFailure::Target(TargetResolutionFailureV2::NotFound));
+        }
+        _ => {
+            return Err(PrepareFailure::Target(
+                TargetResolutionFailureV2::WrongObjectKind,
+            ));
+        }
+    };
+    let state_digest = resource_state_digest_v2(&state).map_err(|_| storage_fault())?;
+    let raw = canonical_target
+        .to_str()
+        .ok_or_else(|| PrepareFailure::Target(TargetResolutionFailureV2::ResolverUnavailable))?;
+    let canonical_absolute_path_utf8 =
+        normalize_canonical_platform_path_v4(workspace.platform, raw)
+            .map_err(|_| PrepareFailure::Target(TargetResolutionFailureV2::ResolverUnavailable))?;
+    Ok(ResolvedTarget {
+        relative_path: Some(path.clone()),
+        object_kind: Some(object_kind),
+        state: Some(state),
+        state_digest: Some(state_digest.clone()),
+        public_resource: ResolvedResourceV2::Workspace {
+            object_kind,
+            relative_path: path,
+            resolution_state_digest: state_digest,
+        },
+        private_target: CanonicalPrivateTargetV2::Workspace {
+            platform: workspace.platform,
+            canonical_absolute_path_utf8,
+        },
+    })
+}
+
+fn resolve_private_workspace_path(
+    canonical_root: &Path,
+    relative: &str,
+) -> Result<PathBuf, PrepareFailure> {
+    let mut candidate = canonical_root.to_path_buf();
+    for component in Path::new(relative).components() {
+        match component {
+            Component::Normal(value) => candidate.push(value),
+            Component::CurDir if relative == "." => {}
+            _ => {
+                return Err(PrepareFailure::Target(
+                    TargetResolutionFailureV2::SymlinkPolicyViolation,
+                ));
+            }
+        }
+    }
+    let mut existing = candidate.as_path();
+    let mut suffix = Vec::new();
+    while !existing.exists() {
+        let name = existing.file_name().ok_or_else(|| {
+            PrepareFailure::Target(TargetResolutionFailureV2::ResolverUnavailable)
+        })?;
+        suffix.push(name.to_os_string());
+        existing = existing.parent().ok_or_else(|| {
+            PrepareFailure::Target(TargetResolutionFailureV2::ResolverUnavailable)
+        })?;
+    }
+    let mut resolved = fs::canonicalize(existing)
+        .map_err(|_| PrepareFailure::Target(TargetResolutionFailureV2::ResolverUnavailable))?;
+    if !resolved.starts_with(canonical_root) {
+        return Err(PrepareFailure::Target(
+            TargetResolutionFailureV2::SymlinkPolicyViolation,
+        ));
+    }
+    for part in suffix.iter().rev() {
+        resolved.push(part);
+    }
+    if candidate.exists() {
+        resolved = fs::canonicalize(&candidate)
+            .map_err(|_| PrepareFailure::Target(TargetResolutionFailureV2::ResolverUnavailable))?;
+        if !resolved.starts_with(canonical_root) {
+            return Err(PrepareFailure::Target(
+                TargetResolutionFailureV2::SymlinkPolicyViolation,
+            ));
+        }
+    }
+    Ok(resolved)
+}
+
+fn resource_state_for_path(path: &Path) -> Result<ResourceStateV2, PrepareFailure> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ResourceStateV2::Absent {});
+        }
+        Err(_) => {
+            return Err(PrepareFailure::Target(
+                TargetResolutionFailureV2::ResolverUnavailable,
+            ));
+        }
+    };
+    if metadata.is_file() {
+        let bytes = fs::read(path)
+            .map_err(|_| PrepareFailure::Target(TargetResolutionFailureV2::ResolverUnavailable))?;
+        return Ok(ResourceStateV2::File {
+            content_digest: content_digest_v2(&bytes),
+            byte_length: bytes.len() as u64,
+            executable: executable(&metadata),
+        });
+    }
+    if metadata.is_dir() {
+        let entries = collect_path_entries(path)?;
+        let collection_digest = collection_digest_v2(&entries).map_err(|_| storage_fault())?;
+        return Ok(ResourceStateV2::Directory {
+            collection_digest,
+            item_count: entries.len() as u64,
+        });
+    }
+    Err(PrepareFailure::Target(
+        TargetResolutionFailureV2::WrongObjectKind,
+    ))
+}
+
+fn collect_path_entries(root: &Path) -> Result<Vec<PathEntryV4>, PrepareFailure> {
+    fn visit(
+        root: &Path,
+        current: &Path,
+        entries: &mut Vec<PathEntryV4>,
+    ) -> Result<(), PrepareFailure> {
+        let mut children = fs::read_dir(current)
+            .map_err(|_| PrepareFailure::Target(TargetResolutionFailureV2::ResolverUnavailable))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| PrepareFailure::Target(TargetResolutionFailureV2::ResolverUnavailable))?;
+        children.sort_by_key(|entry| entry.file_name());
+        for child in children {
+            let path = child.path();
+            let metadata = fs::symlink_metadata(&path).map_err(|_| {
+                PrepareFailure::Target(TargetResolutionFailureV2::ResolverUnavailable)
+            })?;
+            if metadata.file_type().is_symlink() {
+                return Err(PrepareFailure::Target(
+                    TargetResolutionFailureV2::SymlinkPolicyViolation,
+                ));
+            }
+            let relative = path
+                .strip_prefix(root)
+                .ok()
+                .and_then(Path::to_str)
+                .ok_or_else(|| {
+                    PrepareFailure::Target(TargetResolutionFailureV2::ResolverUnavailable)
+                })?
+                .replace('\\', "/");
+            let (kind, size) = if metadata.is_dir() {
+                (
+                    WorkspaceObjectKindV4::Directory,
+                    PathEntrySizeV4::Unavailable {},
+                )
+            } else if metadata.is_file() {
+                (
+                    WorkspaceObjectKindV4::File,
+                    PathEntrySizeV4::Bytes {
+                        value: metadata.len(),
+                    },
+                )
+            } else {
+                continue;
+            };
+            entries.push(PathEntryV4 {
+                relative_path: relative,
+                kind,
+                size,
+            });
+            if metadata.is_dir() {
+                visit(root, &path, entries)?;
+            }
+        }
+        Ok(())
+    }
+    let mut entries = Vec::new();
+    visit(root, root, &mut entries)?;
+    entries.sort_by(|left, right| {
+        left.relative_path
+            .as_bytes()
+            .cmp(right.relative_path.as_bytes())
+    });
+    Ok(entries)
+}
+
+#[cfg(unix)]
+fn executable(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn executable(_metadata: &fs::Metadata) -> bool {
+    false
+}
+
+struct ResolvedNetwork {
+    origin: NetworkOriginV2,
+    target_digest: NetworkTargetObservationDigestV2,
+    private_target: CanonicalPrivateTargetV2,
+}
+
+fn resolve_network_target(url: &str) -> Result<ResolvedNetwork, PrepareFailure> {
+    let parsed = crate::network_policy::validate_http_url_shape(url)
+        .map_err(|_| PrepareFailure::Target(TargetResolutionFailureV2::NetworkTargetRejected))?;
+    if parsed.fragment().is_some()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || !parsed
+            .host_str()
+            .is_some_and(|host| host.is_ascii() && !host.ends_with('.'))
+    {
+        return Err(PrepareFailure::Target(
+            TargetResolutionFailureV2::NetworkTargetRejected,
+        ));
+    }
+    let reviewed = review_http_target(url)
+        .map_err(|_| PrepareFailure::Target(TargetResolutionFailureV2::NetworkTargetRejected))?;
+    if reviewed
+        .resolved_addresses
+        .iter()
+        .any(|address| denied_network_address(address.ip()))
+    {
+        return Err(PrepareFailure::Target(
+            TargetResolutionFailureV2::NetworkTargetRejected,
+        ));
+    }
+    let request_target = materialize_request_target(&parsed)?;
+    let mut reviewed_addresses = reviewed
+        .resolved_addresses
+        .iter()
+        .map(|address| network_address(address.ip()))
+        .collect::<Vec<_>>();
+    reviewed_addresses.sort();
+    reviewed_addresses.dedup();
+    if reviewed_addresses.is_empty() {
+        return Err(PrepareFailure::Target(
+            TargetResolutionFailureV2::ResolverUnavailable,
+        ));
+    }
+    let target_digest = network_target_digest_v2(&serde_json::json!({
+        "networkPolicyContract":"deepcode.kernel.network-policy.v2",
+        "requestTarget":request_target,
+        "reviewedAddresses":reviewed_addresses
+    }))
+    .map_err(|_| storage_fault())?;
+    let origin = NetworkOriginV2 {
+        scheme: request_target.scheme,
+        host: request_target.host.clone(),
+        port: request_target.port,
+    };
+    Ok(ResolvedNetwork {
+        origin,
+        target_digest,
+        private_target: CanonicalPrivateTargetV2::Network {
+            request_target,
+            reviewed_addresses,
+        },
+    })
+}
+
+fn materialize_request_target(
+    parsed: &reqwest::Url,
+) -> Result<NetworkRequestTargetV2, PrepareFailure> {
+    let scheme = match parsed.scheme() {
+        "http" => NetworkSchemeV2::Http,
+        "https" => NetworkSchemeV2::Https,
+        _ => {
+            return Err(PrepareFailure::Target(
+                TargetResolutionFailureV2::NetworkTargetRejected,
+            ));
+        }
+    };
+    let host_text = parsed
+        .host_str()
+        .ok_or(PrepareFailure::Target(
+            TargetResolutionFailureV2::NetworkTargetRejected,
+        ))?
+        .to_ascii_lowercase();
+    let host = if let Ok(address) = host_text.parse::<Ipv4Addr>() {
+        NetworkHostV2::Ipv4 {
+            octets: address.octets(),
+        }
+    } else if let Ok(address) = host_text.parse::<Ipv6Addr>() {
+        NetworkHostV2::Ipv6 {
+            octets: address.octets(),
+        }
+    } else {
+        let labels = host_text.split('.').map(str::to_owned).collect::<Vec<_>>();
+        if labels.is_empty()
+            || host_text.len() > 253
+            || labels.iter().any(|label| {
+                label.is_empty()
+                    || label.len() > 63
+                    || label.starts_with('-')
+                    || label.ends_with('-')
+                    || !label.bytes().all(|byte| {
+                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
+                    })
+            })
+        {
+            return Err(PrepareFailure::Target(
+                TargetResolutionFailureV2::NetworkTargetRejected,
+            ));
+        }
+        NetworkHostV2::DnsName { labels }
+    };
+    Ok(NetworkRequestTargetV2 {
+        scheme,
+        host,
+        port: parsed
+            .port_or_known_default()
+            .ok_or(PrepareFailure::Target(
+                TargetResolutionFailureV2::NetworkTargetRejected,
+            ))?,
+        path_utf8: if parsed.path().is_empty() {
+            "/".to_owned()
+        } else {
+            parsed.path().to_owned()
+        },
+        query: match parsed.query() {
+            Some(query) => NetworkQueryV2::Exact {
+                utf8: query.to_owned(),
+            },
+            None => NetworkQueryV2::None {},
+        },
+    })
+}
+
+fn network_address(address: IpAddr) -> NetworkAddressV2 {
+    match address {
+        IpAddr::V4(address) => NetworkAddressV2::Ipv4 {
+            octets: address.octets(),
+        },
+        IpAddr::V6(address) => NetworkAddressV2::Ipv6 {
+            octets: address.octets(),
+        },
+    }
+}
+
+fn denied_network_address(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => {
+            let value = u32::from_be_bytes(address.octets());
+            [
+                (0x0000_0000, 8),
+                (0x0a00_0000, 8),
+                (0x6440_0000, 10),
+                (0x7f00_0000, 8),
+                (0xa9fe_0000, 16),
+                (0xac10_0000, 12),
+                (0xc000_0000, 24),
+                (0xc000_0200, 24),
+                (0xc058_6300, 24),
+                (0xc0a8_0000, 16),
+                (0xc612_0000, 15),
+                (0xc633_6400, 24),
+                (0xcb00_7100, 24),
+                (0xe000_0000, 4),
+                (0xf000_0000, 4),
+            ]
+            .into_iter()
+            .any(|(network, prefix)| in_prefix_u32(value, network, prefix))
+        }
+        IpAddr::V6(address) => {
+            let value = u128::from_be_bytes(address.octets());
+            [
+                (0u128, 128),
+                (1u128, 128),
+                (0x0000_0000_0000_0000_0000_ffff_0000_0000, 96),
+                (0x0064_ff9b_0000_0000_0000_0000_0000_0000, 96),
+                (0x0064_ff9b_0001_0000_0000_0000_0000_0000, 48),
+                (0x0100_0000_0000_0000_0000_0000_0000_0000, 64),
+                (0x2001_0000_0000_0000_0000_0000_0000_0000, 23),
+                (0x2001_0db8_0000_0000_0000_0000_0000_0000, 32),
+                (0x2002_0000_0000_0000_0000_0000_0000_0000, 16),
+                (0x3ffe_0000_0000_0000_0000_0000_0000_0000, 16),
+                (0xfc00_0000_0000_0000_0000_0000_0000_0000, 7),
+                (0xfe80_0000_0000_0000_0000_0000_0000_0000, 10),
+                (0xfec0_0000_0000_0000_0000_0000_0000_0000, 10),
+                (0xff00_0000_0000_0000_0000_0000_0000_0000, 8),
+            ]
+            .into_iter()
+            .any(|(network, prefix)| in_prefix_u128(value, network, prefix))
+        }
+    }
+}
+
+fn in_prefix_u32(value: u32, network: u32, prefix: u32) -> bool {
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    };
+    value & mask == network & mask
+}
+
+fn in_prefix_u128(value: u128, network: u128, prefix: u32) -> bool {
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u128::MAX << (128 - prefix)
+    };
+    value & mask == network & mask
+}
+
+pub(super) fn policy_auto_issuable(
+    mode: AutonomyModeV2,
+    tool_id: AuthorityToolIdV4,
+    risk: ToolRiskV4,
+    effect_scope: EffectScopeV4,
+) -> bool {
+    let low = risk == ToolRiskV4::Low;
+    let trusted = low
+        || (risk == ToolRiskV4::Medium
+            && matches!(
+                effect_scope,
+                EffectScopeV4::WorkspaceRead | EffectScopeV4::WorkspaceWrite
+            ));
+    match mode {
+        AutonomyModeV2::Strict => low,
+        AutonomyModeV2::TrustedWorkspace => trusted,
+        AutonomyModeV2::Maximum => {
+            trusted
+                || matches!(
+                    tool_id,
+                    AuthorityToolIdV4::FsRename
+                        | AuthorityToolIdV4::GitStage
+                        | AuthorityToolIdV4::GitUnstage
+                )
+        }
+    }
+}
+
+pub(super) enum SubmissionDisposition {
+    Fresh,
+    Retry,
+    Replay(InvocationSubmissionReplyV2),
+    Reject(AdmissionRejectionV2),
+}
+
+pub(super) fn classify_submission_binding(
+    state: &AuthorityState,
+    run_id: &RunId,
+    operation_id: &OperationId,
+    idempotency_key_hash: &IdempotencyKeyHashV2,
+    submitted: &InvocationSubmissionDigestV2,
+) -> AuthorityResult<SubmissionDisposition> {
+    let operation = state
+        .operation_bindings
+        .get(&(run_id.clone(), operation_id.clone()));
+    let idempotency = state
+        .idempotency_bindings
+        .get(&(run_id.clone(), idempotency_key_hash.clone()));
+    match (operation, idempotency) {
+        (None, None) => Ok(SubmissionDisposition::Fresh),
+        (Some(operation), Some(idempotency)) => {
+            if operation != idempotency {
+                return Err(corrupt_store());
+            }
+            if operation.digest == *submitted {
+                if operation.retryable_rejection {
+                    Ok(SubmissionDisposition::Retry)
+                } else {
+                    Ok(SubmissionDisposition::Replay(operation.reply.clone()))
+                }
+            } else {
+                Ok(SubmissionDisposition::Reject(
+                    AdmissionRejectionV2::DuplicateOperationDigestMismatch {
+                        conflict: OperationIdempotencyConflictV2::Both {
+                            operation_existing: operation.digest.clone(),
+                            idempotency_existing: idempotency.digest.clone(),
+                        },
+                        submitted: submitted.clone(),
+                    },
+                ))
+            }
+        }
+        (Some(operation), None) if operation.digest == *submitted => Ok(
+            SubmissionDisposition::Reject(AdmissionRejectionV2::OperationIdempotencyPairMismatch {
+                known: PairKnownSideV2::Operation,
+            }),
+        ),
+        (None, Some(idempotency)) if idempotency.digest == *submitted => Ok(
+            SubmissionDisposition::Reject(AdmissionRejectionV2::OperationIdempotencyPairMismatch {
+                known: PairKnownSideV2::Idempotency,
+            }),
+        ),
+        (Some(operation), None) => Ok(SubmissionDisposition::Reject(
+            AdmissionRejectionV2::DuplicateOperationDigestMismatch {
+                conflict: OperationIdempotencyConflictV2::Operation {
+                    existing: operation.digest.clone(),
+                },
+                submitted: submitted.clone(),
+            },
+        )),
+        (None, Some(idempotency)) => Ok(SubmissionDisposition::Reject(
+            AdmissionRejectionV2::DuplicateOperationDigestMismatch {
+                conflict: OperationIdempotencyConflictV2::Idempotency {
+                    existing: idempotency.digest.clone(),
+                },
+                submitted: submitted.clone(),
+            },
+        )),
+    }
+}
+
+pub(super) fn grant_decision_key(
+    run_id: &RunId,
+    operation_id: &OperationId,
+    control_epoch: ControlEpoch,
+    authorization_digest: &AuthorizationRequestDigestV2,
+    basis: &GrantDecisionBasisV2,
+) -> AuthorityResult<String> {
+    serde_json::to_string(&(
+        run_id,
+        operation_id,
+        control_epoch,
+        authorization_digest,
+        basis,
+    ))
+    .map_err(|_| corrupt_store())
+}
+
+pub(super) fn canonical_grant_request(
+    request: &GrantRequestV2,
+    prepared: &PreparedGrantRequest,
+    contract: &ToolContractV4,
+) -> CanonicalGrantRequestV2 {
+    CanonicalGrantRequestV2 {
+        run_id: request.run_id.clone(),
+        operation_id: request.operation_id.clone(),
+        control_epoch: request.control_epoch,
+        idempotency_key_hash: prepared.idempotency_key_hash.clone(),
+        canonical_invocation: prepared.canonical_invocation.clone(),
+        local_tool_contract_digest: contract.contract_digest.clone(),
+        resource_scope: prepared.resource_scope.clone(),
+        effect_scope: contract.effect_scope,
+        risk: contract.risk,
+        effective_deadline_ms: prepared.effective_deadline_ms,
+        workspace_binding_digest: prepared.workspace_binding_digest.clone(),
+        authorization_request_digest: prepared.authorization_digest.clone(),
+        correlation_refs: prepared.correlations.refs.clone(),
+    }
+}
+
+pub(super) fn command_receipt_draft(
+    fact_id: FactId,
+    run_id: RunId,
+    epoch_context: CommandEpochContextV2,
+    request_id: CommandRequestId,
+    request_digest: CommandRequestDigestV2,
+    command_kind: MutationCommandKindV2,
+    result: MutationCommandResultV2,
+) -> KernelFactDraftV2 {
+    fact_draft(
+        fact_id,
+        KernelFactPayloadV2::Control(ControlFactV2::CommandRecorded {
+            identity: CommandReceiptIdentityV2 {
+                run_id,
+                epoch_context,
+                command_request_identity: CommandRequestIdentityV2 {
+                    command_request_id: request_id,
+                    command_request_digest: request_digest,
+                },
+            },
+            command_kind,
+            result,
+        }),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn grant_decision_drafts(
+    command_fact_id: FactId,
+    business_fact_id: FactId,
+    request_id: CommandRequestId,
+    request_digest: CommandRequestDigestV2,
+    request: GrantRequestV2,
+    prepared: PreparedGrantRequest,
+    contract: &ToolContractV4,
+    decision_digest: GrantDecisionDigestV2,
+    basis: GrantDecisionBasisV2,
+    reply: GrantDecisionReplyV2,
+) -> Vec<KernelFactDraftV2> {
+    let business = match &reply {
+        GrantDecisionReplyV2::Issued { grant_id, .. } => {
+            KernelFactPayloadV2::Grant(GrantFactV2::Issued {
+                identity: GrantIssuedIdentityV2 {
+                    run_id: request.run_id.clone(),
+                    grant_epoch: request.control_epoch,
+                    issuance_operation_id: request.operation_id.clone(),
+                    grant_id: grant_id.clone(),
+                    causation_fact_id: command_fact_id.clone(),
+                    correlation_set: prepared.correlations.clone(),
+                },
+                tool_id: contract.tool_id,
+                issuance_authorization_digest: prepared.authorization_digest,
+                grant_decision_digest: decision_digest,
+                grant_scope_digest: prepared.grant_scope_digest,
+                resource_scope: prepared.resource_scope,
+                effect_scope: contract.effect_scope,
+                risk: contract.risk,
+                use_policy: GrantUsePolicyV2::UnboundedWithinEpoch,
+                decision_basis: basis,
+            })
+        }
+        GrantDecisionReplyV2::Denied { .. } => KernelFactPayloadV2::Grant(GrantFactV2::Denied {
+            identity: GrantDeniedIdentityV2 {
+                run_id: request.run_id.clone(),
+                control_epoch: request.control_epoch,
+                operation_id: request.operation_id,
+                causation_fact_id: command_fact_id.clone(),
+                correlation_set: prepared.correlations,
+            },
+            tool_id: contract.tool_id,
+            authorization_request_digest: prepared.authorization_digest,
+            grant_decision_digest: decision_digest,
+            reason_code: GrantDenialReasonV2::UserDenied,
+            decision_basis: basis,
+        }),
+        GrantDecisionReplyV2::RequiresUserDecision { .. } => {
+            unreachable!("requires-user decisions have no business fact")
+        }
+    };
+    vec![
+        command_receipt_draft(
+            command_fact_id,
+            request.run_id,
+            exact_epoch(request.control_epoch),
+            request_id,
+            request_digest,
+            MutationCommandKindV2::GrantDecisionSubmit,
+            MutationCommandResultV2::GrantDecision { reply },
+        ),
+        fact_draft(business_fact_id, business),
+    ]
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn invocation_rejection_drafts(
+    command_fact_id: FactId,
+    rejection_fact_id: FactId,
+    request_id: CommandRequestId,
+    request_digest: CommandRequestDigestV2,
+    request: &GrantRequestV2,
+    current_epoch: ControlEpoch,
+    tool_id: AuthorityToolIdV4,
+    submission_digest: InvocationSubmissionDigestV2,
+    rejection: AdmissionRejectionV2,
+    reply: InvocationSubmissionReplyV2,
+) -> AuthorityResult<Vec<KernelFactDraftV2>> {
+    Ok(vec![
+        command_receipt_draft(
+            command_fact_id.clone(),
+            request.run_id.clone(),
+            exact_epoch(current_epoch),
+            request_id,
+            request_digest,
+            MutationCommandKindV2::InvocationSubmit,
+            MutationCommandResultV2::InvocationSubmission { reply },
+        ),
+        fact_draft(
+            rejection_fact_id,
+            KernelFactPayloadV2::Invocation(InvocationFactV2::Rejected {
+                identity: InvocationRejectedIdentityV2 {
+                    run_id: request.run_id.clone(),
+                    current_control_epoch: current_epoch,
+                    operation_id: request.operation_id.clone(),
+                    idempotency_key_hash: idempotency_key_hash_v2(
+                        &request.run_id,
+                        &request.idempotency_key,
+                    )
+                    .map_err(|_| corrupt_store())?,
+                    causation_fact_id: command_fact_id,
+                    correlation_set: CorrelationSetV2::materialize(
+                        request.correlation_refs.clone(),
+                    )
+                    .map_err(|_| corrupt_store())?,
+                },
+                tool_id,
+                submission_digest,
+                rejection,
+            }),
+        ),
+    ])
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn invocation_admission_drafts(
+    command_fact_id: FactId,
+    admitted_fact_id: FactId,
+    reserved_fact_id: FactId,
+    attempt_fact_id: FactId,
+    resource_fact_ids: Vec<FactId>,
+    request_id: CommandRequestId,
+    request_digest: CommandRequestDigestV2,
+    prepared: &PreparedGrantRequest,
+    grant: &GrantRecord,
+    contract: &ToolContractV4,
+    submission_digest: InvocationSubmissionDigestV2,
+    invocation_digest: InvocationRequestDigestV2,
+    identity: &AttemptIdentityV2,
+    targets: &[(ResourceId, ResolvedTarget)],
+    reply: InvocationSubmissionReplyV2,
+) -> Vec<KernelFactDraftV2> {
+    let mut drafts = vec![
+        command_receipt_draft(
+            command_fact_id.clone(),
+            identity.run_id.clone(),
+            exact_epoch(identity.control_epoch),
+            request_id,
+            request_digest,
+            MutationCommandKindV2::InvocationSubmit,
+            MutationCommandResultV2::InvocationSubmission { reply },
+        ),
+        fact_draft(
+            admitted_fact_id.clone(),
+            KernelFactPayloadV2::Invocation(InvocationFactV2::Admitted {
+                identity: caused_attempt(identity, command_fact_id),
+                tool_id: contract.tool_id,
+                submission_digest,
+                invocation_digest,
+                grant_scope_digest: grant.grant_scope_digest.clone(),
+                grant_issuance_authorization_digest: grant.issuance_authorization_digest.clone(),
+                tool_contract_digest: contract.contract_digest.clone(),
+                workspace_binding_digest: prepared.workspace_binding_digest.clone(),
+                effective_deadline_ms: prepared.effective_deadline_ms,
+            }),
+        ),
+        fact_draft(
+            reserved_fact_id.clone(),
+            KernelFactPayloadV2::Grant(GrantFactV2::Reserved {
+                identity: reservation_identity(identity, admitted_fact_id),
+            }),
+        ),
+        fact_draft(
+            attempt_fact_id.clone(),
+            KernelFactPayloadV2::Invocation(InvocationFactV2::AttemptPrepared {
+                identity: caused_attempt(identity, reserved_fact_id),
+            }),
+        ),
+    ];
+    drafts.extend(resource_fact_ids.into_iter().zip(targets).map(
+        |(fact_id, (resource_id, target))| {
+            fact_draft(
+                fact_id,
+                KernelFactPayloadV2::Resource(ResourceFactV2::ResolvedForInvocation {
+                    identity: ResourceResolvedIdentityV2 {
+                        run_id: identity.run_id.clone(),
+                        control_epoch: identity.control_epoch,
+                        operation_id: identity.operation_id.clone(),
+                        invocation_id: identity.invocation_id.clone(),
+                        resource_id: resource_id.clone(),
+                        idempotency_key_hash: identity.idempotency_key_hash.clone(),
+                        causation_fact_id: attempt_fact_id.clone(),
+                        correlation_set: identity.correlation_set.clone(),
+                    },
+                    resource: target.public_resource.clone(),
+                }),
+            )
+        },
+    ));
+    drafts
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn epoch_advance_drafts(
+    request_id: CommandRequestId,
+    request_digest: CommandRequestDigestV2,
+    command: ControlEpochAdvanceV2,
+    epoch_context: CommandEpochContextV2,
+    previous_epoch: Option<ControlEpoch>,
+    new_epoch: ControlEpoch,
+    command_fact_id: FactId,
+    epoch_fact_id: FactId,
+    superseded: Vec<(GrantRecord, FactId)>,
+    cancellation: Option<(InvocationId, CancelRequestId, FactId)>,
+    reply: ControlEpochAdvancedReplyV2,
+) -> Vec<KernelFactDraftV2> {
+    let mut drafts = vec![
+        command_receipt_draft(
+            command_fact_id.clone(),
+            command.run_id.clone(),
+            epoch_context,
+            request_id,
+            request_digest,
+            MutationCommandKindV2::ControlEpochAdvance,
+            MutationCommandResultV2::EpochAdvance { reply },
+        ),
+        fact_draft(
+            epoch_fact_id.clone(),
+            KernelFactPayloadV2::Control(ControlFactV2::EpochAdvanced {
+                identity: TransitionIdentityV2 {
+                    run_id: command.run_id.clone(),
+                    control_epoch: new_epoch,
+                    causation_fact_id: command_fact_id,
+                },
+                input_id: command.input_id,
+                previous_epoch,
+                opaque_input_ref: command.opaque_input_ref,
+            }),
+        ),
+    ];
+    drafts.extend(superseded.into_iter().map(|(grant, fact_id)| {
+        fact_draft(
+            fact_id,
+            KernelFactPayloadV2::Grant(GrantFactV2::Superseded {
+                identity: grant_lifecycle_identity(grant, epoch_fact_id.clone()),
+                cause: GrantSupersessionCauseV2::EpochAdvance { new_epoch },
+            }),
+        )
+    }));
+    if let Some((invocation_id, cancel_request_id, fact_id)) = cancellation {
+        drafts.push(fact_draft(
+            fact_id,
+            KernelFactPayloadV2::Control(ControlFactV2::CancellationRequested {
+                identity: CancellationIdentityV2 {
+                    run_id: command.run_id,
+                    control_epoch: new_epoch,
+                    invocation_id,
+                    cancel_request_id,
+                    causation_fact_id: epoch_fact_id,
+                },
+                source: CancellationSourceV2::EpochAdvance,
+                reason_code: CancellationReasonCodeV2::EpochSuperseded,
+                reason: None,
+            }),
+        ));
+    }
+    drafts
+}
+
+pub(super) fn grant_revocation_drafts(
+    request_id: CommandRequestId,
+    request_digest: CommandRequestDigestV2,
+    command: GrantRevokeV2,
+    current_epoch: ControlEpoch,
+    command_fact_id: FactId,
+    revocation_fact_id: FactId,
+    grant: GrantRecord,
+    reply: GrantRevokedReplyV2,
+) -> Vec<KernelFactDraftV2> {
+    vec![
+        command_receipt_draft(
+            command_fact_id.clone(),
+            command.run_id,
+            exact_epoch(current_epoch),
+            request_id,
+            request_digest,
+            MutationCommandKindV2::GrantRevoke,
+            MutationCommandResultV2::GrantRevoke { reply },
+        ),
+        fact_draft(
+            revocation_fact_id,
+            KernelFactPayloadV2::Grant(GrantFactV2::Revoked {
+                identity: grant_lifecycle_identity(grant, command_fact_id),
+                reason_code: command.reason_code,
+                reason: command.reason,
+            }),
+        ),
+    ]
+}
+
+pub(super) fn explicit_cancellation_drafts(
+    request_id: CommandRequestId,
+    request_digest: CommandRequestDigestV2,
+    command: InvocationCancelV2,
+    current_epoch: ControlEpoch,
+    invocation_id: InvocationId,
+    cancel_request_id: CancelRequestId,
+    command_fact_id: FactId,
+    cancellation_fact_id: FactId,
+    reply: InvocationCancelReplyV2,
+) -> Vec<KernelFactDraftV2> {
+    vec![
+        command_receipt_draft(
+            command_fact_id.clone(),
+            command.run_id.clone(),
+            exact_epoch(current_epoch),
+            request_id,
+            request_digest,
+            MutationCommandKindV2::InvocationCancel,
+            MutationCommandResultV2::InvocationCancel { reply },
+        ),
+        fact_draft(
+            cancellation_fact_id,
+            KernelFactPayloadV2::Control(ControlFactV2::CancellationRequested {
+                identity: CancellationIdentityV2 {
+                    run_id: command.run_id,
+                    control_epoch: current_epoch,
+                    invocation_id,
+                    cancel_request_id,
+                    causation_fact_id: command_fact_id,
+                },
+                source: CancellationSourceV2::ExplicitCommand,
+                reason_code: command.reason_code,
+                reason: command.reason,
+            }),
+        ),
+    ]
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn run_termination_drafts(
+    request_id: CommandRequestId,
+    request_digest: CommandRequestDigestV2,
+    command: RunTerminateV2,
+    current_epoch: ControlEpoch,
+    command_fact_id: FactId,
+    termination_fact_id: FactId,
+    superseded: Vec<(GrantRecord, FactId)>,
+    cancellation: Option<(InvocationId, CancelRequestId, FactId)>,
+    reply: RunTerminatedReplyV2,
+) -> Vec<KernelFactDraftV2> {
+    let mut drafts = vec![
+        command_receipt_draft(
+            command_fact_id.clone(),
+            command.run_id.clone(),
+            exact_epoch(current_epoch),
+            request_id,
+            request_digest,
+            MutationCommandKindV2::RunTerminate,
+            MutationCommandResultV2::RunTerminate { reply },
+        ),
+        fact_draft(
+            termination_fact_id.clone(),
+            KernelFactPayloadV2::Control(ControlFactV2::RunTerminated {
+                identity: TransitionIdentityV2 {
+                    run_id: command.run_id.clone(),
+                    control_epoch: current_epoch,
+                    causation_fact_id: command_fact_id,
+                },
+                reason_code: command.reason_code,
+                reason: command.reason,
+            }),
+        ),
+    ];
+    drafts.extend(
+        superseded
+            .into_iter()
+            .map(|(grant, fact_id)| KernelFactDraftV2 {
+                fact_id,
+                payload: KernelFactPayloadV2::Grant(GrantFactV2::Superseded {
+                    identity: grant_lifecycle_identity(grant, termination_fact_id.clone()),
+                    cause: GrantSupersessionCauseV2::RunTermination {
+                        terminated_at_epoch: current_epoch,
+                    },
+                }),
+            }),
+    );
+    if let Some((invocation_id, cancel_request_id, fact_id)) = cancellation {
+        drafts.push(fact_draft(
+            fact_id,
+            KernelFactPayloadV2::Control(ControlFactV2::CancellationRequested {
+                identity: CancellationIdentityV2 {
+                    run_id: command.run_id,
+                    control_epoch: current_epoch,
+                    invocation_id,
+                    cancel_request_id,
+                    causation_fact_id: termination_fact_id,
+                },
+                source: CancellationSourceV2::RunTermination,
+                reason_code: CancellationReasonCodeV2::RunTerminated,
+                reason: None,
+            }),
+        ));
+    }
+    drafts
+}
+
+fn grant_lifecycle_identity(
+    grant: GrantRecord,
+    causation_fact_id: FactId,
+) -> GrantLifecycleIdentityV2 {
+    GrantLifecycleIdentityV2 {
+        run_id: grant.run_id,
+        grant_epoch: grant.grant_epoch,
+        issuance_operation_id: grant.issuance_operation_id,
+        grant_id: grant.grant_id,
+        causation_fact_id,
+    }
+}
+
+fn apply_fact_predicate(filter: &mut FactQueryV2, predicate: &KernelFactPredicateV2) {
+    use KernelFactPredicateV2 as Predicate;
+    match predicate {
+        Predicate::Run { run_id } => filter.run_id = Some(run_id.to_string()),
+        Predicate::Operation {
+            run_id,
+            operation_id,
+        } => {
+            filter.run_id = Some(run_id.to_string());
+            filter.operation_id = Some(operation_id.to_string());
+        }
+        Predicate::Invocation {
+            run_id,
+            invocation_id,
+        } => {
+            filter.run_id = Some(run_id.to_string());
+            filter.invocation_id = Some(invocation_id.to_string());
+        }
+        Predicate::Attempt { run_id, attempt_id } => {
+            filter.run_id = Some(run_id.to_string());
+            filter.attempt_id = Some(attempt_id.to_string());
+        }
+        Predicate::Grant { run_id, grant_id } => {
+            filter.run_id = Some(run_id.to_string());
+            filter.grant_id = Some(grant_id.to_string());
+        }
+        Predicate::Reservation {
+            run_id,
+            reservation_id,
+        } => {
+            filter.run_id = Some(run_id.to_string());
+            filter.grant_reservation_id = Some(reservation_id.to_string());
+        }
+        Predicate::Resource {
+            run_id,
+            resource_id,
+        } => {
+            filter.run_id = Some(run_id.to_string());
+            filter.resource_id = Some(resource_id.to_string());
+        }
+        Predicate::Command { command_request_id } => {
+            filter.command_request_id = Some(command_request_id.to_string())
+        }
+        Predicate::Fact { fact_id } => filter.fact_id = Some(fact_id.to_string()),
+        Predicate::Causation { causation_fact_id } => {
+            filter.causation_id = Some(causation_fact_id.to_string())
+        }
+        Predicate::Idempotency {
+            run_id,
+            idempotency_key_hash,
+        } => {
+            filter.run_id = Some(run_id.to_string());
+            filter.idempotency_key_hash = Some(idempotency_key_hash.as_str().to_owned());
+        }
+        Predicate::Correlation(correlation) => {
+            let (kind, value) = correlation.sort_key();
+            filter.correlation_ref = Some((kind.to_owned(), value.to_owned()));
+        }
+    }
+}
+
+pub(super) fn fact_query(command: &KernelFactsQueryV2) -> FactQueryV2 {
+    let mut filter = FactQueryV2 {
+        after_ledger_sequence: Some(command.page.after_ledger_sequence),
+        limit: Some(command.page.limit.saturating_add(1)),
+        ..Default::default()
+    };
+    if let KernelFactFilterV2::MatchAll { predicates } = &command.filter {
+        for predicate in predicates {
+            apply_fact_predicate(&mut filter, predicate);
+        }
+    }
+    filter
+}
+
+pub(super) fn bounded_fact_page(
+    requested_after: u64,
+    high_water: u64,
+    mut facts: Vec<KernelFactEnvelopeV2>,
+    requested_limit: usize,
+) -> AuthorityResult<KernelFactPageV2> {
+    let mut has_more = facts.len() > requested_limit;
+    facts.truncate(requested_limit);
+    loop {
+        let final_sequence = facts
+            .last()
+            .map(|fact| fact.ledger_sequence)
+            .unwrap_or(requested_after);
+        let continuation = if has_more {
+            FactPageContinuationV2::More {
+                after_ledger_sequence: final_sequence,
+            }
+        } else {
+            FactPageContinuationV2::CaughtUp {
+                at_ledger_sequence: high_water,
+            }
+        };
+        let page = KernelFactPageV2 {
+            requested_after_ledger_sequence: requested_after,
+            ledger_sequence_high_water: high_water,
+            facts,
+            continuation,
+        };
+        if serde_json::to_vec(&page)
+            .map_err(|_| corrupt_store())?
+            .len()
+            <= MAX_FACT_PAGE_BYTES_V2
+        {
+            page.validate().map_err(|_| corrupt_store())?;
+            return Ok(page);
+        }
+        facts = page.facts;
+        if facts.pop().is_none() {
+            return Err(corrupt_store());
+        }
+        has_more = true;
+    }
+}
+
+fn resource_projection_reply(
+    resource: &ResourceRecord,
+    as_of_ledger_sequence: u64,
+) -> ResourceResolveReplyV2 {
+    let observation = match &resource.revalidation {
+        Some((fact_id, digest, observation)) => ResourceProjectionObservationV2::Revalidated {
+            source_fact_id: fact_id.clone(),
+            target_revalidation_digest: digest.clone(),
+            observation: observation.clone(),
+        },
+        None => ResourceProjectionObservationV2::Resolution {
+            source_fact_id: resource.resolution_fact_id.clone(),
+            observation: match &resource.resolved {
+                ResolvedResourceV2::Workspace {
+                    resolution_state_digest,
+                    ..
+                } => ResolutionObservationV2::WorkspaceState {
+                    digest: resolution_state_digest.clone(),
+                },
+                ResolvedResourceV2::NetworkQuery {
+                    query_digest,
+                    target_observation_digest,
+                    ..
+                } => ResolutionObservationV2::NetworkQuery {
+                    query_digest: query_digest.clone(),
+                    target_digest: target_observation_digest.clone(),
+                },
+                ResolvedResourceV2::NetworkEndpoint {
+                    target_observation_digest,
+                    ..
+                } => ResolutionObservationV2::NetworkTarget {
+                    digest: target_observation_digest.clone(),
+                },
+            },
+        },
+    };
+    let lifecycle = ResourceLifecycleV2::Resolved {};
+    match &resource.resolved {
+        ResolvedResourceV2::Workspace {
+            object_kind,
+            relative_path,
+            ..
+        } => ResourceResolveReplyV2::Workspace {
+            resource_id: resource.resource_id.clone(),
+            invocation_id: resource.invocation_id.clone(),
+            relative_path: relative_path.clone(),
+            object_kind: *object_kind,
+            observation,
+            lifecycle,
+            last_fact_id: resource.last_fact_id.clone(),
+            as_of_ledger_sequence,
+        },
+        ResolvedResourceV2::NetworkQuery {
+            query_digest,
+            service_origin,
+            ..
+        } => ResourceResolveReplyV2::NetworkQuery {
+            resource_id: resource.resource_id.clone(),
+            invocation_id: resource.invocation_id.clone(),
+            query_digest: query_digest.clone(),
+            service_origin: service_origin.clone(),
+            observation,
+            lifecycle,
+            last_fact_id: resource.last_fact_id.clone(),
+            as_of_ledger_sequence,
+        },
+        ResolvedResourceV2::NetworkEndpoint { origin, .. } => {
+            ResourceResolveReplyV2::NetworkEndpoint {
+                resource_id: resource.resource_id.clone(),
+                invocation_id: resource.invocation_id.clone(),
+                origin: origin.clone(),
+                observation,
+                lifecycle,
+                last_fact_id: resource.last_fact_id.clone(),
+                as_of_ledger_sequence,
+            }
+        }
+    }
+}
+
+pub(super) fn resource_resolve_reply(
+    state: &AuthorityState,
+    command: &ResourceResolveV2,
+    as_of_ledger_sequence: u64,
+) -> AuthorityResult<ResourceResolveReplyV2> {
+    let resource = state
+        .resources
+        .get(&command.resource_id)
+        .filter(|resource| resource.run_id == command.run_id)
+        .ok_or_else(|| KernelErrorV2::ResourceNotFound {
+            run_id: command.run_id.clone(),
+            resource_id: command.resource_id.clone(),
+        })?;
+    Ok(resource_projection_reply(resource, as_of_ledger_sequence))
+}
+
+pub(super) fn invocation_status_reply(
+    state: &AuthorityState,
+    run_id: &RunId,
+    invocation_id: &InvocationId,
+    ledger_sequence_high_water: u64,
+) -> AuthorityResult<InvocationStatusReplyV2> {
+    let invocation =
+        state
+            .invocations
+            .get(invocation_id)
+            .ok_or_else(|| KernelErrorV2::InvocationNotFound {
+                run_id: run_id.clone(),
+                invocation_id: invocation_id.clone(),
+            })?;
+    if &invocation.run_id != run_id {
+        return Err(KernelErrorV2::InvocationNotOwnedByRun {
+            run_id: run_id.clone(),
+            invocation_id: invocation_id.clone(),
+        });
+    }
+    Ok(InvocationStatusReplyV2 {
+        identity: InvocationStatusIdentityV2 {
+            run_id: invocation.run_id.clone(),
+            operation_id: invocation.operation_id.clone(),
+            control_epoch: invocation.control_epoch,
+            invocation_id: invocation.invocation_id.clone(),
+            attempt_id: invocation.attempt_id.clone(),
+        },
+        phase: invocation.phase,
+        stop_overlay: invocation.stop_overlay.wire(),
+        latest_fact_id: invocation.last_fact_id.clone(),
+        ledger_sequence_high_water,
+    })
+}
+
+pub(super) fn require_current_run(
+    state: &AuthorityState,
+    run_id: &RunId,
+    submitted: ControlEpoch,
+) -> AuthorityResult<()> {
+    let run = state
+        .runs
+        .get(run_id)
+        .ok_or_else(|| KernelErrorV2::RunNotFound {
+            run_id: run_id.clone(),
+        })?;
+    if run.epoch != submitted {
+        return Err(KernelErrorV2::StaleControlEpoch {
+            run_id: run_id.clone(),
+            submitted,
+            current: run.epoch,
+        });
+    }
+    if matches!(run.lifecycle, RunLifecycle::Terminated { .. }) {
+        return Err(KernelErrorV2::RunTerminated {
+            run_id: run_id.clone(),
+            control_epoch: run.epoch,
+        });
+    }
+    Ok(())
+}
+
+pub(super) fn require_input_in_epoch(
+    state: &AuthorityState,
+    run_id: &RunId,
+    epoch: ControlEpoch,
+    input_id: &InputId,
+) -> AuthorityResult<()> {
+    if state
+        .runs
+        .get(run_id)
+        .and_then(|run| run.admitted_inputs.get(input_id))
+        != Some(&epoch)
+    {
+        return Err(KernelErrorV2::InvalidRequest {
+            reason: InvalidRequestReasonV2::InvalidRelation {
+                relation: InvalidRelationV2::DecisionInputNotInEpoch,
+            },
+        });
+    }
+    Ok(())
+}
+
+pub(super) fn recovery_drafts(
+    state: &AuthorityState,
+    workspace_binding_digest: &WorkspaceBindingDigestV2,
+    mut fact_id: impl FnMut() -> FactId,
+    mut effect_id: impl FnMut() -> EffectId,
+) -> AuthorityResult<Vec<KernelFactDraftV2>> {
+    let open = state
+        .invocations
+        .values()
+        .filter(|invocation| !invocation_phase_is_terminal(invocation.phase))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut drafts = Vec::new();
+    for invocation in open {
+        let identity = AttemptIdentityV2 {
+            run_id: invocation.run_id.clone(),
+            control_epoch: invocation.control_epoch,
+            operation_id: invocation.operation_id.clone(),
+            grant_id: invocation.grant_id.clone(),
+            reservation_id: invocation.reservation_id.clone(),
+            invocation_id: invocation.invocation_id.clone(),
+            attempt_id: invocation.attempt_id.clone(),
+            idempotency_key_hash: invocation.idempotency_key_hash.clone(),
+            causation_fact_id: invocation.admission_fact_id.clone(),
+            correlation_set: invocation.correlations.clone(),
+        };
+        match invocation.phase {
+            InvocationPhase::AttemptPrepared => {
+                let attempt_fact_id = invocation
+                    .attempt_prepared_fact_id
+                    .as_ref()
+                    .ok_or_else(corrupt_store)?;
+                if let Some((cancel_request_id, cancellation_fact_id, _)) =
+                    invocation.stop_overlay.cancellation()
+                {
+                    drafts.extend(pre_effect_stop_drafts(
+                        &identity,
+                        fact_id(),
+                        fact_id(),
+                        fact_id(),
+                        Some((cancel_request_id, cancellation_fact_id)),
+                    ));
+                } else if invocation.stop_overlay.deadline_observed() {
+                    drafts.extend(pre_effect_stop_drafts(
+                        &identity,
+                        fact_id(),
+                        fact_id(),
+                        fact_id(),
+                        None,
+                    ));
+                } else {
+                    drafts.extend(failed_before_effect_drafts(
+                        &identity,
+                        attempt_fact_id,
+                        fact_id(),
+                        fact_id(),
+                        PreEffectFailureCodeV2::TargetRevalidationFailed,
+                    ));
+                }
+            }
+            InvocationPhase::Executing => {
+                let execution_started_fact_id = invocation
+                    .execution_started_fact_id
+                    .as_ref()
+                    .ok_or_else(corrupt_store)?;
+                let possible_resources = state
+                    .resources
+                    .values()
+                    .filter(|resource| {
+                        resource.invocation_id == invocation.invocation_id
+                            && resource.revalidation.is_some()
+                    })
+                    .map(|resource| resource.resource_id.clone())
+                    .collect();
+                let reason_code =
+                    if invocation.workspace_binding_digest == *workspace_binding_digest {
+                        IndeterminateReasonV2::RecoveryEvidenceInsufficient
+                    } else {
+                        IndeterminateReasonV2::WorkspaceBindingMismatch
+                    };
+                drafts.extend(execution_result_drafts(
+                    &identity,
+                    execution_started_fact_id,
+                    effect_id(),
+                    fact_id(),
+                    fact_id(),
+                    possible_resources,
+                    ExecutionResolution::Indeterminate {
+                        evidence: EffectEvidenceV2::IndeterminateReadBack {
+                            last_observation: LastObservationV2::None {},
+                        },
+                        reason_code,
+                    },
+                    invocation
+                        .stop_overlay
+                        .cancellation()
+                        .map(|(request_id, _, _)| request_id),
+                    invocation.stop_overlay.deadline_observed(),
+                )?);
+            }
+            _ => return Err(corrupt_store()),
+        }
+    }
+    Ok(drafts)
+}
+
+impl AuthorityState {
+    pub(super) fn restore(facts: Vec<KernelFactEnvelopeV2>) -> AuthorityResult<Self> {
+        let mut state = Self::default();
+        for envelope in facts {
+            state.apply_fact(envelope)?;
+        }
+        Ok(state)
+    }
+
+    pub(super) fn apply_committed(
+        &mut self,
+        facts: Vec<KernelFactEnvelopeV2>,
+    ) -> AuthorityResult<()> {
+        let mut next = self.clone();
+        for fact in facts {
+            next.apply_fact(fact)?;
+        }
+        *self = next;
+        Ok(())
+    }
+
+    fn apply_fact(&mut self, envelope: KernelFactEnvelopeV2) -> AuthorityResult<()> {
+        if self.facts_by_id.contains_key(&envelope.fact_id) {
+            return Err(corrupt_store());
+        }
+        validate_causation(self, &envelope)?;
+        match &envelope.payload {
+            KernelFactPayloadV2::Control(fact) => self.reduce_control(&envelope, fact)?,
+            KernelFactPayloadV2::Grant(fact) => self.reduce_grant(&envelope, fact)?,
+            KernelFactPayloadV2::Invocation(fact) => self.reduce_invocation(&envelope, fact)?,
+            KernelFactPayloadV2::Effect(fact) => self.reduce_effect(&envelope, fact)?,
+            KernelFactPayloadV2::Resource(fact) => self.reduce_resource(&envelope, fact)?,
+            KernelFactPayloadV2::Cleanup(_) => return Err(corrupt_store()),
+        }
+        self.facts_by_id.insert(envelope.fact_id.clone(), envelope);
+        Ok(())
+    }
+
+    fn reduce_control(
+        &mut self,
+        envelope: &KernelFactEnvelopeV2,
+        fact: &ControlFactV2,
+    ) -> AuthorityResult<()> {
+        match fact {
+            ControlFactV2::CommandRecorded {
+                identity, result, ..
+            } => {
+                let reply = reply_from_recorded_result(result.clone());
+                if self
+                    .commands
+                    .insert(
+                        identity.command_request_identity.command_request_id.clone(),
+                        CommandReplay {
+                            digest: identity
+                                .command_request_identity
+                                .command_request_digest
+                                .clone(),
+                            reply,
+                        },
+                    )
+                    .is_some()
+                {
+                    return Err(corrupt_store());
+                }
+            }
+            ControlFactV2::EpochAdvanced {
+                identity,
+                input_id,
+                previous_epoch,
+                ..
+            } => match self.runs.get_mut(&identity.run_id) {
+                None if previous_epoch.is_none() && identity.control_epoch.get() == 1 => {
+                    let mut admitted_inputs = HashMap::new();
+                    admitted_inputs.insert(input_id.clone(), identity.control_epoch);
+                    self.runs.insert(
+                        identity.run_id.clone(),
+                        RunRecord {
+                            epoch: identity.control_epoch,
+                            lifecycle: RunLifecycle::Active,
+                            active_invocation_id: None,
+                            admitted_inputs,
+                        },
+                    );
+                }
+                Some(run)
+                    if matches!(run.lifecycle, RunLifecycle::Active)
+                        && *previous_epoch == Some(run.epoch)
+                        && identity.control_epoch.get() == run.epoch.get() + 1 =>
+                {
+                    run.epoch = identity.control_epoch;
+                    run.admitted_inputs
+                        .insert(input_id.clone(), identity.control_epoch);
+                }
+                _ => return Err(corrupt_store()),
+            },
+            ControlFactV2::CancellationRequested {
+                identity, source, ..
+            } => {
+                let invocation = self
+                    .invocations
+                    .get(&identity.invocation_id)
+                    .ok_or_else(corrupt_store)?;
+                let epoch_matches = match source {
+                    CancellationSourceV2::EpochAdvance => {
+                        identity.control_epoch > invocation.control_epoch
+                    }
+                    CancellationSourceV2::ExplicitCommand
+                    | CancellationSourceV2::RunTermination => {
+                        identity.control_epoch == invocation.control_epoch
+                    }
+                };
+                if identity.run_id != invocation.run_id
+                    || !epoch_matches
+                    || self.invocations.values().any(|candidate| {
+                        candidate
+                            .stop_overlay
+                            .cancellation()
+                            .is_some_and(|(request_id, _, _)| {
+                                request_id == &identity.cancel_request_id
+                            })
+                    })
+                    || self
+                        .runs
+                        .get(&identity.run_id)
+                        .and_then(|run| run.active_invocation_id.as_ref())
+                        != Some(&identity.invocation_id)
+                {
+                    return Err(corrupt_store());
+                }
+                let invocation = self
+                    .invocations
+                    .get_mut(&identity.invocation_id)
+                    .ok_or_else(corrupt_store)?;
+                if invocation.stop_overlay.cancellation().is_some() {
+                    return Err(corrupt_store());
+                }
+                invocation.stop_overlay = StopOverlay::CancellationRequested {
+                    cancel_request_id: identity.cancel_request_id.clone(),
+                    fact_id: envelope.fact_id.clone(),
+                    ledger_sequence: envelope.ledger_sequence,
+                };
+            }
+            ControlFactV2::RunTerminated { identity, .. } => {
+                let run = self
+                    .runs
+                    .get_mut(&identity.run_id)
+                    .ok_or_else(corrupt_store)?;
+                if run.epoch != identity.control_epoch
+                    || !matches!(run.lifecycle, RunLifecycle::Active)
+                {
+                    return Err(corrupt_store());
+                }
+                run.lifecycle = RunLifecycle::Terminated {
+                    fact_id: envelope.fact_id.clone(),
+                    ledger_sequence: envelope.ledger_sequence,
+                };
+            }
+        }
+        Ok(())
+    }
+
+    fn reduce_grant(
+        &mut self,
+        envelope: &KernelFactEnvelopeV2,
+        fact: &GrantFactV2,
+    ) -> AuthorityResult<()> {
+        match fact {
+            GrantFactV2::Issued {
+                identity,
+                tool_id,
+                issuance_authorization_digest,
+                grant_decision_digest,
+                grant_scope_digest,
+                resource_scope,
+                effect_scope,
+                risk,
+                use_policy,
+                decision_basis,
+            } => {
+                let run = self.runs.get(&identity.run_id).ok_or_else(corrupt_store)?;
+                let decision_input_valid = match decision_basis {
+                    GrantDecisionBasisV2::AutomaticPolicy { .. } => true,
+                    GrantDecisionBasisV2::UserDecision { input_id, .. } => {
+                        run.admitted_inputs.get(input_id) == Some(&identity.grant_epoch)
+                    }
+                };
+                if run.epoch != identity.grant_epoch
+                    || !matches!(run.lifecycle, RunLifecycle::Active)
+                    || !decision_input_valid
+                    || *use_policy != GrantUsePolicyV2::UnboundedWithinEpoch
+                    || self.grants.contains_key(&identity.grant_id)
+                {
+                    return Err(corrupt_store());
+                }
+                let replay_key = grant_decision_key(
+                    &identity.run_id,
+                    &identity.issuance_operation_id,
+                    identity.grant_epoch,
+                    issuance_authorization_digest,
+                    decision_basis,
+                )?;
+                let replay = GrantDecisionReplay {
+                    digest: grant_decision_digest.clone(),
+                    reply: GrantDecisionReplyV2::Issued {
+                        grant_id: identity.grant_id.clone(),
+                        fact_id: envelope.fact_id.clone(),
+                        ledger_sequence: envelope.ledger_sequence,
+                    },
+                };
+                if self.grant_decisions.insert(replay_key, replay).is_some() {
+                    return Err(corrupt_store());
+                }
+                self.grants.insert(
+                    identity.grant_id.clone(),
+                    GrantRecord {
+                        run_id: identity.run_id.clone(),
+                        grant_epoch: identity.grant_epoch,
+                        issuance_operation_id: identity.issuance_operation_id.clone(),
+                        grant_id: identity.grant_id.clone(),
+                        tool_id: *tool_id,
+                        issuance_authorization_digest: issuance_authorization_digest.clone(),
+                        grant_scope_digest: grant_scope_digest.clone(),
+                        resource_scope: resource_scope.clone(),
+                        effect_scope: *effect_scope,
+                        risk: *risk,
+                        lifecycle: GrantLifecycle::Issued,
+                        use_count: 0,
+                    },
+                );
+            }
+            GrantFactV2::Denied {
+                identity,
+                authorization_request_digest,
+                grant_decision_digest,
+                decision_basis,
+                ..
+            } => {
+                let run = self.runs.get(&identity.run_id).ok_or_else(corrupt_store)?;
+                let valid_user_decision = match decision_basis {
+                    GrantDecisionBasisV2::UserDecision { input_id, .. } => {
+                        run.admitted_inputs.get(input_id) == Some(&identity.control_epoch)
+                    }
+                    GrantDecisionBasisV2::AutomaticPolicy { .. } => false,
+                };
+                if run.epoch != identity.control_epoch
+                    || !matches!(run.lifecycle, RunLifecycle::Active)
+                    || !valid_user_decision
+                {
+                    return Err(corrupt_store());
+                }
+                let replay_key = grant_decision_key(
+                    &identity.run_id,
+                    &identity.operation_id,
+                    identity.control_epoch,
+                    authorization_request_digest,
+                    decision_basis,
+                )?;
+                let replay = GrantDecisionReplay {
+                    digest: grant_decision_digest.clone(),
+                    reply: GrantDecisionReplyV2::Denied {
+                        fact_id: envelope.fact_id.clone(),
+                        ledger_sequence: envelope.ledger_sequence,
+                    },
+                };
+                if self.grant_decisions.insert(replay_key, replay).is_some() {
+                    return Err(corrupt_store());
+                }
+            }
+            GrantFactV2::Reserved { identity } => {
+                let invocation = self
+                    .invocations
+                    .get(&identity.invocation_id)
+                    .ok_or_else(corrupt_store)?;
+                if !reservation_identity_matches_invocation(identity, invocation)
+                    || self.reservations.contains_key(&identity.reservation_id)
+                {
+                    return Err(corrupt_store());
+                }
+                self.reservations.insert(
+                    identity.reservation_id.clone(),
+                    ReservationRecord {
+                        consumed: false,
+                        released: false,
+                    },
+                );
+            }
+            GrantFactV2::Consumed {
+                identity,
+                use_count,
+                target_revalidation_set_digest,
+            } => {
+                let invocation = self
+                    .invocations
+                    .get(&identity.invocation_id)
+                    .ok_or_else(corrupt_store)?;
+                if !attempt_identity_matches_invocation(identity, invocation)
+                    || invocation.phase != InvocationPhase::AttemptPrepared
+                    || expected_revalidation_set_digest(self, invocation)?
+                        != *target_revalidation_set_digest
+                {
+                    return Err(corrupt_store());
+                }
+                let reservation = self
+                    .reservations
+                    .get_mut(&identity.reservation_id)
+                    .ok_or_else(corrupt_store)?;
+                let grant = self
+                    .grants
+                    .get_mut(&identity.grant_id)
+                    .ok_or_else(corrupt_store)?;
+                if reservation.consumed || reservation.released || *use_count != grant.use_count + 1
+                {
+                    return Err(corrupt_store());
+                }
+                reservation.consumed = true;
+                grant.use_count = *use_count;
+            }
+            GrantFactV2::ReservationReleased {
+                identity,
+                reason_code,
+            } => {
+                let invocation = self
+                    .invocations
+                    .get(&identity.invocation_id)
+                    .ok_or_else(corrupt_store)?;
+                let reason_matches = matches!(
+                    (reason_code, &invocation.phase),
+                    (
+                        ReservationReleaseReasonV2::FailedBeforeEffect,
+                        InvocationPhase::FailedBeforeEffect
+                    ) | (
+                        ReservationReleaseReasonV2::CancelledBeforeEffect,
+                        InvocationPhase::CancelledBeforeEffect
+                    ) | (
+                        ReservationReleaseReasonV2::TimedOutBeforeEffect,
+                        InvocationPhase::TimedOutBeforeEffect
+                    )
+                );
+                if !reservation_identity_matches_invocation(identity, invocation) || !reason_matches
+                {
+                    return Err(corrupt_store());
+                }
+                let reservation = self
+                    .reservations
+                    .get_mut(&identity.reservation_id)
+                    .ok_or_else(corrupt_store)?;
+                if reservation.consumed || reservation.released {
+                    return Err(corrupt_store());
+                }
+                reservation.released = true;
+            }
+            GrantFactV2::Revoked { identity, .. } => {
+                let grant = self
+                    .grants
+                    .get_mut(&identity.grant_id)
+                    .ok_or_else(corrupt_store)?;
+                if !grant_lifecycle_identity_matches(identity, grant)
+                    || !matches!(grant.lifecycle, GrantLifecycle::Issued)
+                {
+                    return Err(corrupt_store());
+                }
+                grant.lifecycle = GrantLifecycle::Revoked {
+                    fact_id: envelope.fact_id.clone(),
+                    ledger_sequence: envelope.ledger_sequence,
+                };
+            }
+            GrantFactV2::Superseded {
+                identity, cause, ..
+            } => {
+                let grant = self
+                    .grants
+                    .get_mut(&identity.grant_id)
+                    .ok_or_else(corrupt_store)?;
+                if !grant_lifecycle_identity_matches(identity, grant)
+                    || !matches!(grant.lifecycle, GrantLifecycle::Issued)
+                {
+                    return Err(corrupt_store());
+                }
+                grant.lifecycle = GrantLifecycle::Superseded {
+                    fact_id: envelope.fact_id.clone(),
+                    ledger_sequence: envelope.ledger_sequence,
+                    cause: cause.clone(),
+                };
+            }
+        }
+        Ok(())
+    }
+
+    fn reduce_invocation(
+        &mut self,
+        envelope: &KernelFactEnvelopeV2,
+        fact: &InvocationFactV2,
+    ) -> AuthorityResult<()> {
+        match fact {
+            InvocationFactV2::Admitted {
+                identity,
+                tool_id,
+                submission_digest,
+                invocation_digest: _,
+                grant_scope_digest,
+                grant_issuance_authorization_digest,
+                tool_contract_digest: _,
+                workspace_binding_digest,
+                effective_deadline_ms,
+            } => {
+                let run = self.runs.get(&identity.run_id).ok_or_else(corrupt_store)?;
+                let grant = self
+                    .grants
+                    .get(&identity.grant_id)
+                    .ok_or_else(corrupt_store)?;
+                if run.epoch != identity.control_epoch
+                    || !matches!(run.lifecycle, RunLifecycle::Active)
+                    || run.active_invocation_id.is_some()
+                    || grant.run_id != identity.run_id
+                    || grant.grant_epoch != identity.control_epoch
+                    || !matches!(grant.lifecycle, GrantLifecycle::Issued)
+                    || grant.tool_id != *tool_id
+                    || grant.grant_scope_digest != *grant_scope_digest
+                    || grant.issuance_authorization_digest != *grant_issuance_authorization_digest
+                    || *effective_deadline_ms == 0
+                    || self.invocations.contains_key(&identity.invocation_id)
+                    || self.invocations.values().any(|candidate| {
+                        candidate.attempt_id == identity.attempt_id
+                            || candidate.reservation_id == identity.reservation_id
+                    })
+                {
+                    return Err(corrupt_store());
+                }
+                let reply = submission_reply_from_cause(self, &identity.causation_fact_id)?;
+                self.apply_submission_binding(
+                    &identity.run_id,
+                    &identity.operation_id,
+                    &identity.idempotency_key_hash,
+                    submission_digest,
+                    reply,
+                    false,
+                )?;
+                self.invocations.insert(
+                    identity.invocation_id.clone(),
+                    InvocationRecord {
+                        run_id: identity.run_id.clone(),
+                        operation_id: identity.operation_id.clone(),
+                        control_epoch: identity.control_epoch,
+                        grant_id: identity.grant_id.clone(),
+                        reservation_id: identity.reservation_id.clone(),
+                        invocation_id: identity.invocation_id.clone(),
+                        attempt_id: identity.attempt_id.clone(),
+                        idempotency_key_hash: identity.idempotency_key_hash.clone(),
+                        tool_id: *tool_id,
+                        workspace_binding_digest: workspace_binding_digest.clone(),
+                        correlations: identity.correlation_set.clone(),
+                        phase: InvocationPhase::AttemptPrepared,
+                        stop_overlay: StopOverlay::None,
+                        admission_fact_id: envelope.fact_id.clone(),
+                        attempt_prepared_fact_id: None,
+                        execution_started_fact_id: None,
+                        cancellation_observed_fact_id: None,
+                        deadline_observed_fact_id: None,
+                        last_fact_id: envelope.fact_id.clone(),
+                    },
+                );
+                let run = self
+                    .runs
+                    .get_mut(&identity.run_id)
+                    .ok_or_else(corrupt_store)?;
+                run.active_invocation_id = Some(identity.invocation_id.clone());
+            }
+            InvocationFactV2::Rejected {
+                identity,
+                tool_id,
+                submission_digest,
+                rejection,
+            } => {
+                let run = self.runs.get(&identity.run_id).ok_or_else(corrupt_store)?;
+                let rejection_valid = match rejection {
+                    AdmissionRejectionV2::ToolExecutionUnavailable {
+                        tool_id: rejected_tool,
+                        availability,
+                    } => {
+                        rejected_tool == tool_id
+                            && *availability == ExecutionAvailabilityV4::Blocked
+                    }
+                    AdmissionRejectionV2::StaleControlEpoch { current, .. } => {
+                        *current == identity.current_control_epoch
+                    }
+                    AdmissionRejectionV2::RunBusy {
+                        active_invocation_id,
+                        retry_after_ms,
+                    } => {
+                        *retry_after_ms == 100
+                            && run.active_invocation_id.as_ref() == Some(active_invocation_id)
+                    }
+                    AdmissionRejectionV2::CapacityExceeded {
+                        maximum_active_runs,
+                        retry_after_ms,
+                    } => *maximum_active_runs == 4 && *retry_after_ms == 100,
+                    AdmissionRejectionV2::RunTerminated {} => {
+                        matches!(run.lifecycle, RunLifecycle::Terminated { .. })
+                    }
+                    _ => true,
+                };
+                if run.epoch != identity.current_control_epoch || !rejection_valid {
+                    return Err(corrupt_store());
+                }
+                if !matches!(
+                    rejection,
+                    AdmissionRejectionV2::DuplicateOperationDigestMismatch { .. }
+                        | AdmissionRejectionV2::OperationIdempotencyPairMismatch { .. }
+                ) {
+                    let reply = submission_reply_from_cause(self, &identity.causation_fact_id)?;
+                    self.apply_submission_binding(
+                        &identity.run_id,
+                        &identity.operation_id,
+                        &identity.idempotency_key_hash,
+                        submission_digest,
+                        reply,
+                        matches!(
+                            rejection,
+                            AdmissionRejectionV2::RunBusy { .. }
+                                | AdmissionRejectionV2::CapacityExceeded { .. }
+                        ),
+                    )?;
+                }
+            }
+            InvocationFactV2::AttemptPrepared { identity } => {
+                let invocation = self
+                    .invocations
+                    .get_mut(&identity.invocation_id)
+                    .ok_or_else(corrupt_store)?;
+                if !attempt_identity_matches_invocation(identity, invocation)
+                    || invocation.phase != InvocationPhase::AttemptPrepared
+                    || invocation.attempt_prepared_fact_id.is_some()
+                {
+                    return Err(corrupt_store());
+                }
+                invocation.attempt_prepared_fact_id = Some(envelope.fact_id.clone());
+                invocation.last_fact_id = envelope.fact_id.clone();
+            }
+            InvocationFactV2::ExecutionStarted {
+                identity,
+                target_revalidation_set_digest,
+            } => {
+                let expected_digest = {
+                    let invocation = self
+                        .invocations
+                        .get(&identity.invocation_id)
+                        .ok_or_else(corrupt_store)?;
+                    expected_revalidation_set_digest(self, invocation)?
+                };
+                let invocation = self
+                    .invocations
+                    .get_mut(&identity.invocation_id)
+                    .ok_or_else(corrupt_store)?;
+                if !attempt_identity_matches_invocation(identity, invocation)
+                    || invocation.phase != InvocationPhase::AttemptPrepared
+                    || expected_digest != *target_revalidation_set_digest
+                {
+                    return Err(corrupt_store());
+                }
+                invocation.phase = InvocationPhase::Executing;
+                invocation.execution_started_fact_id = Some(envelope.fact_id.clone());
+                invocation.last_fact_id = envelope.fact_id.clone();
+            }
+            InvocationFactV2::CancellationObserved {
+                identity,
+                cancel_request_id,
+            } => {
+                let invocation = self
+                    .invocations
+                    .get_mut(&identity.invocation_id)
+                    .ok_or_else(corrupt_store)?;
+                if !attempt_identity_matches_invocation(identity, invocation)
+                    || invocation_phase_is_terminal(invocation.phase)
+                    || invocation.cancellation_observed_fact_id.is_some()
+                    || invocation
+                        .stop_overlay
+                        .cancellation()
+                        .map(|(request_id, _, _)| request_id)
+                        != Some(cancel_request_id)
+                {
+                    return Err(corrupt_store());
+                }
+                invocation.cancellation_observed_fact_id = Some(envelope.fact_id.clone());
+                invocation.last_fact_id = envelope.fact_id.clone();
+            }
+            InvocationFactV2::DeadlineObserved { identity } => {
+                let invocation = self
+                    .invocations
+                    .get_mut(&identity.invocation_id)
+                    .ok_or_else(corrupt_store)?;
+                if !attempt_identity_matches_invocation(identity, invocation)
+                    || invocation_phase_is_terminal(invocation.phase)
+                    || invocation.deadline_observed_fact_id.is_some()
+                {
+                    return Err(corrupt_store());
+                }
+                invocation.stop_overlay = match invocation.stop_overlay.clone() {
+                    StopOverlay::None => StopOverlay::DeadlineObserved {
+                        fact_id: envelope.fact_id.clone(),
+                    },
+                    StopOverlay::CancellationRequested {
+                        cancel_request_id,
+                        fact_id,
+                        ledger_sequence,
+                    } => StopOverlay::CancellationAndDeadline {
+                        cancel_request_id,
+                        cancellation_fact_id: fact_id,
+                        cancellation_ledger_sequence: ledger_sequence,
+                        deadline_fact_id: envelope.fact_id.clone(),
+                    },
+                    _ => return Err(corrupt_store()),
+                };
+                invocation.deadline_observed_fact_id = Some(envelope.fact_id.clone());
+                invocation.last_fact_id = envelope.fact_id.clone();
+            }
+            InvocationFactV2::FailedBeforeEffect { identity, .. } => self.set_attempt_terminal(
+                identity,
+                InvocationPhase::FailedBeforeEffect,
+                envelope.fact_id.clone(),
+            )?,
+            InvocationFactV2::CancelledBeforeEffect {
+                identity,
+                cancel_request_id,
+            } => {
+                let invocation = self
+                    .invocations
+                    .get(&identity.invocation_id)
+                    .ok_or_else(corrupt_store)?;
+                if invocation
+                    .stop_overlay
+                    .cancellation()
+                    .map(|(request_id, _, _)| request_id)
+                    != Some(cancel_request_id)
+                {
+                    return Err(corrupt_store());
+                }
+                self.set_attempt_terminal(
+                    identity,
+                    InvocationPhase::CancelledBeforeEffect,
+                    envelope.fact_id.clone(),
+                )?
+            }
+            InvocationFactV2::TimedOutBeforeEffect { identity } => self.set_attempt_terminal(
+                identity,
+                InvocationPhase::TimedOutBeforeEffect,
+                envelope.fact_id.clone(),
+            )?,
+            InvocationFactV2::Completed { identity, output } => {
+                validate_completed_output(self, identity, output)?;
+                self.set_observed_terminal(
+                    identity,
+                    InvocationPhase::Completed,
+                    envelope.fact_id.clone(),
+                )?
+            }
+            InvocationFactV2::FailedAfterObservedEffect { identity, .. } => self
+                .set_observed_terminal(
+                    identity,
+                    InvocationPhase::FailedAfterObservedEffect,
+                    envelope.fact_id.clone(),
+                )?,
+            InvocationFactV2::Indeterminate {
+                identity,
+                reason_code,
+            } => {
+                validate_indeterminate_pair(self, identity, reason_code)?;
+                self.set_observed_terminal(
+                    identity,
+                    InvocationPhase::Indeterminate,
+                    envelope.fact_id.clone(),
+                )?
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_submission_binding(
+        &mut self,
+        run_id: &RunId,
+        operation_id: &OperationId,
+        idempotency_key_hash: &IdempotencyKeyHashV2,
+        digest: &InvocationSubmissionDigestV2,
+        reply: InvocationSubmissionReplyV2,
+        retryable_rejection: bool,
+    ) -> AuthorityResult<()> {
+        let operation_key = (run_id.clone(), operation_id.clone());
+        let idempotency_key = (run_id.clone(), idempotency_key_hash.clone());
+        let previous_operation = self.operation_bindings.get(&operation_key);
+        let previous_idempotency = self.idempotency_bindings.get(&idempotency_key);
+        match (previous_operation, previous_idempotency) {
+            (None, None) => {}
+            (Some(operation), Some(idempotency))
+                if operation == idempotency
+                    && operation.digest == *digest
+                    && operation.retryable_rejection => {}
+            _ => return Err(corrupt_store()),
+        }
+        let binding = SubmissionBinding {
+            digest: digest.clone(),
+            reply,
+            retryable_rejection,
+        };
+        self.operation_bindings
+            .insert(operation_key, binding.clone());
+        self.idempotency_bindings.insert(idempotency_key, binding);
+        Ok(())
+    }
+
+    fn set_attempt_terminal(
+        &mut self,
+        identity: &AttemptIdentityV2,
+        phase: InvocationPhase,
+        fact_id: FactId,
+    ) -> AuthorityResult<()> {
+        let invocation = self
+            .invocations
+            .get_mut(&identity.invocation_id)
+            .ok_or_else(corrupt_store)?;
+        if !attempt_identity_matches_invocation(identity, invocation)
+            || invocation.phase != InvocationPhase::AttemptPrepared
+        {
+            return Err(corrupt_store());
+        }
+        invocation.phase = phase;
+        invocation.last_fact_id = fact_id;
+        let run = self
+            .runs
+            .get_mut(&identity.run_id)
+            .ok_or_else(corrupt_store)?;
+        if run.active_invocation_id.as_ref() != Some(&identity.invocation_id) {
+            return Err(corrupt_store());
+        }
+        run.active_invocation_id = None;
+        Ok(())
+    }
+
+    fn set_observed_terminal(
+        &mut self,
+        identity: &ObservedTerminalIdentityV2,
+        phase: InvocationPhase,
+        fact_id: FactId,
+    ) -> AuthorityResult<()> {
+        let invocation = self
+            .invocations
+            .get_mut(&identity.invocation_id)
+            .ok_or_else(corrupt_store)?;
+        if !observed_identity_matches_invocation(identity, invocation)
+            || invocation.phase != InvocationPhase::Executing
+            || self.invocation_effects.get(&identity.invocation_id)
+                != Some(&(
+                    identity.effect_id.clone(),
+                    identity.causation_fact_id.clone(),
+                ))
+        {
+            return Err(corrupt_store());
+        }
+        invocation.phase = phase;
+        invocation.last_fact_id = fact_id;
+        let run = self
+            .runs
+            .get_mut(&identity.run_id)
+            .ok_or_else(corrupt_store)?;
+        if run.active_invocation_id.as_ref() != Some(&identity.invocation_id) {
+            return Err(corrupt_store());
+        }
+        run.active_invocation_id = None;
+        Ok(())
+    }
+
+    fn reduce_effect(
+        &mut self,
+        envelope: &KernelFactEnvelopeV2,
+        fact: &EffectFactV2,
+    ) -> AuthorityResult<()> {
+        validate_effect(self, fact)?;
+        let identity = effect_identity(fact);
+        if self
+            .invocation_effects
+            .values()
+            .any(|(effect_id, _)| effect_id == &identity.effect_id)
+            || self
+                .invocation_effects
+                .contains_key(&identity.invocation_id)
+        {
+            return Err(corrupt_store());
+        }
+        self.invocation_effects.insert(
+            identity.invocation_id.clone(),
+            (identity.effect_id.clone(), envelope.fact_id.clone()),
+        );
+        Ok(())
+    }
+
+    fn reduce_resource(
+        &mut self,
+        envelope: &KernelFactEnvelopeV2,
+        fact: &ResourceFactV2,
+    ) -> AuthorityResult<()> {
+        match fact {
+            ResourceFactV2::ResolvedForInvocation { identity, resource } => {
+                let invocation = self
+                    .invocations
+                    .get(&identity.invocation_id)
+                    .ok_or_else(corrupt_store)?;
+                let grant = self
+                    .grants
+                    .get(&invocation.grant_id)
+                    .ok_or_else(corrupt_store)?;
+                if !resolved_identity_matches_invocation(identity, invocation)
+                    || !resource_matches_scope(resource, &grant.resource_scope)
+                    || self.resources.contains_key(&identity.resource_id)
+                    || self.resources.values().any(|existing| {
+                        existing.invocation_id == identity.invocation_id
+                            && existing.resolved == *resource
+                    })
+                {
+                    return Err(corrupt_store());
+                }
+                self.resources.insert(
+                    identity.resource_id.clone(),
+                    ResourceRecord {
+                        run_id: identity.run_id.clone(),
+                        invocation_id: identity.invocation_id.clone(),
+                        resource_id: identity.resource_id.clone(),
+                        resolved: resource.clone(),
+                        resolution_fact_id: envelope.fact_id.clone(),
+                        revalidation: None,
+                        last_fact_id: envelope.fact_id.clone(),
+                    },
+                );
+            }
+            ResourceFactV2::RevalidatedBeforeEffect {
+                identity,
+                observation,
+                target_revalidation_digest,
+            } => {
+                let invocation = self
+                    .invocations
+                    .get(&identity.invocation_id)
+                    .ok_or_else(corrupt_store)?;
+                let resource = self
+                    .resources
+                    .get_mut(&identity.resource_id)
+                    .ok_or_else(corrupt_store)?;
+                if !resource_attempt_identity_matches_invocation(identity, invocation, resource)
+                    || resource.revalidation.is_some()
+                {
+                    return Err(corrupt_store());
+                }
+                resource.revalidation = Some((
+                    envelope.fact_id.clone(),
+                    target_revalidation_digest.clone(),
+                    observation.clone(),
+                ));
+                resource.last_fact_id = envelope.fact_id.clone();
+            }
+            ResourceFactV2::Acquired { .. } | ResourceFactV2::Released { .. } => {
+                return Err(corrupt_store());
+            }
+        }
+        Ok(())
+    }
+}
+
+fn attempt_identity_matches_invocation(
+    identity: &AttemptIdentityV2,
+    invocation: &InvocationRecord,
+) -> bool {
+    identity.run_id == invocation.run_id
+        && identity.control_epoch == invocation.control_epoch
+        && identity.operation_id == invocation.operation_id
+        && identity.grant_id == invocation.grant_id
+        && identity.reservation_id == invocation.reservation_id
+        && identity.invocation_id == invocation.invocation_id
+        && identity.attempt_id == invocation.attempt_id
+        && identity.idempotency_key_hash == invocation.idempotency_key_hash
+        && identity.correlation_set == invocation.correlations
+}
+
+fn reservation_identity_matches_invocation(
+    identity: &ReservationIdentityV2,
+    invocation: &InvocationRecord,
+) -> bool {
+    identity.run_id == invocation.run_id
+        && identity.control_epoch == invocation.control_epoch
+        && identity.operation_id == invocation.operation_id
+        && identity.grant_id == invocation.grant_id
+        && identity.reservation_id == invocation.reservation_id
+        && identity.invocation_id == invocation.invocation_id
+        && identity.idempotency_key_hash == invocation.idempotency_key_hash
+        && identity.correlation_set == invocation.correlations
+}
+
+fn observed_identity_matches_invocation(
+    identity: &ObservedTerminalIdentityV2,
+    invocation: &InvocationRecord,
+) -> bool {
+    identity.run_id == invocation.run_id
+        && identity.control_epoch == invocation.control_epoch
+        && identity.operation_id == invocation.operation_id
+        && identity.grant_id == invocation.grant_id
+        && identity.reservation_id == invocation.reservation_id
+        && identity.invocation_id == invocation.invocation_id
+        && identity.attempt_id == invocation.attempt_id
+        && identity.idempotency_key_hash == invocation.idempotency_key_hash
+        && identity.correlation_set == invocation.correlations
+}
+
+fn effect_identity_matches_invocation(
+    identity: &EffectIdentityV2,
+    invocation: &InvocationRecord,
+) -> bool {
+    identity.run_id == invocation.run_id
+        && identity.control_epoch == invocation.control_epoch
+        && identity.operation_id == invocation.operation_id
+        && identity.grant_id == invocation.grant_id
+        && identity.reservation_id == invocation.reservation_id
+        && identity.invocation_id == invocation.invocation_id
+        && identity.attempt_id == invocation.attempt_id
+        && identity.idempotency_key_hash == invocation.idempotency_key_hash
+}
+
+fn grant_lifecycle_identity_matches(
+    identity: &GrantLifecycleIdentityV2,
+    grant: &GrantRecord,
+) -> bool {
+    identity.run_id == grant.run_id
+        && identity.grant_epoch == grant.grant_epoch
+        && identity.issuance_operation_id == grant.issuance_operation_id
+        && identity.grant_id == grant.grant_id
+}
+
+fn resolved_identity_matches_invocation(
+    identity: &ResourceResolvedIdentityV2,
+    invocation: &InvocationRecord,
+) -> bool {
+    identity.run_id == invocation.run_id
+        && identity.control_epoch == invocation.control_epoch
+        && identity.operation_id == invocation.operation_id
+        && identity.invocation_id == invocation.invocation_id
+        && identity.idempotency_key_hash == invocation.idempotency_key_hash
+        && identity.correlation_set == invocation.correlations
+}
+
+fn resource_attempt_identity_matches_invocation(
+    identity: &ResourceAttemptIdentityV2,
+    invocation: &InvocationRecord,
+    resource: &ResourceRecord,
+) -> bool {
+    identity.run_id == invocation.run_id
+        && identity.control_epoch == invocation.control_epoch
+        && identity.operation_id == invocation.operation_id
+        && identity.invocation_id == invocation.invocation_id
+        && identity.attempt_id == invocation.attempt_id
+        && identity.resource_id == resource.resource_id
+        && resource.run_id == invocation.run_id
+        && resource.invocation_id == invocation.invocation_id
+        && identity.idempotency_key_hash == invocation.idempotency_key_hash
+        && identity.correlation_set == invocation.correlations
+}
+
+fn resource_matches_scope(resource: &ResolvedResourceV2, scope: &ResourceScopeV2) -> bool {
+    match (resource, scope) {
+        (
+            ResolvedResourceV2::Workspace {
+                object_kind,
+                relative_path,
+                resolution_state_digest,
+            },
+            ResourceScopeV2::Workspace { targets },
+        ) => targets.iter().any(|target| {
+            target.object_kind == *object_kind
+                && target.relative_path == *relative_path
+                && target.target_observation_digest == *resolution_state_digest
+        }),
+        (
+            ResolvedResourceV2::NetworkQuery {
+                query_digest,
+                service_origin,
+                target_observation_digest,
+            },
+            ResourceScopeV2::NetworkQuery {
+                query_digest: expected_query,
+                service_origin: expected_origin,
+                target_observation_digest: expected_target,
+            },
+        ) => {
+            query_digest == expected_query
+                && service_origin == expected_origin
+                && target_observation_digest == expected_target
+        }
+        (
+            ResolvedResourceV2::NetworkEndpoint {
+                origin,
+                target_observation_digest,
+            },
+            ResourceScopeV2::NetworkUrl {
+                origin: expected_origin,
+                target_observation_digest: expected_target,
+            },
+        ) => origin == expected_origin && target_observation_digest == expected_target,
+        _ => false,
+    }
+}
+
+fn expected_resource_count(scope: &ResourceScopeV2) -> AuthorityResult<usize> {
+    match scope {
+        ResourceScopeV2::Workspace { targets } => Ok(targets.len()),
+        ResourceScopeV2::NetworkQuery { .. } | ResourceScopeV2::NetworkUrl { .. } => Ok(1),
+        ResourceScopeV2::Repository { .. } => Err(corrupt_store()),
+    }
+}
+
+fn expected_revalidation_set_digest(
+    state: &AuthorityState,
+    invocation: &InvocationRecord,
+) -> AuthorityResult<TargetRevalidationSetDigestV2> {
+    let grant = state
+        .grants
+        .get(&invocation.grant_id)
+        .ok_or_else(corrupt_store)?;
+    let mut resources = state
+        .resources
+        .values()
+        .filter(|resource| resource.invocation_id == invocation.invocation_id)
+        .collect::<Vec<_>>();
+    if resources.len() != expected_resource_count(&grant.resource_scope)?
+        || resources
+            .iter()
+            .any(|resource| resource.revalidation.is_none())
+    {
+        return Err(corrupt_store());
+    }
+    resources.sort_by(|left, right| {
+        left.resource_id
+            .as_str()
+            .as_bytes()
+            .cmp(right.resource_id.as_str().as_bytes())
+    });
+    let entries = resources
+        .iter()
+        .map(|resource| {
+            let (fact_id, digest, _) = resource
+                .revalidation
+                .as_ref()
+                .expect("checked revalidation");
+            (&resource.resource_id, fact_id, digest)
+        })
+        .collect::<Vec<_>>();
+    target_revalidation_set_digest_v2(
+        &invocation.run_id,
+        &invocation.operation_id,
+        &invocation.invocation_id,
+        &invocation.attempt_id,
+        &entries,
+    )
+    .map_err(|_| corrupt_store())
+}
+
+enum EffectModeRef<'a> {
+    Observed,
+    AfterCancel(&'a CancelRequestId),
+    AfterDeadline,
+    AfterCancelAndDeadline(&'a CancelRequestId),
+    Indeterminate,
+}
+
+fn validate_effect(state: &AuthorityState, fact: &EffectFactV2) -> AuthorityResult<()> {
+    let (identity, resources, evidence, evidence_digest, mode) = match fact {
+        EffectFactV2::Observed {
+            identity,
+            affected_resource_ids,
+            evidence,
+            evidence_digest,
+        } => (
+            identity,
+            affected_resource_ids,
+            evidence,
+            evidence_digest,
+            EffectModeRef::Observed,
+        ),
+        EffectFactV2::ObservedAfterCancel {
+            identity,
+            cancel_request_id,
+            affected_resource_ids,
+            evidence,
+            evidence_digest,
+        } => (
+            identity,
+            affected_resource_ids,
+            evidence,
+            evidence_digest,
+            EffectModeRef::AfterCancel(cancel_request_id),
+        ),
+        EffectFactV2::ObservedAfterDeadline {
+            identity,
+            affected_resource_ids,
+            evidence,
+            evidence_digest,
+        } => (
+            identity,
+            affected_resource_ids,
+            evidence,
+            evidence_digest,
+            EffectModeRef::AfterDeadline,
+        ),
+        EffectFactV2::ObservedAfterCancelAndDeadline {
+            identity,
+            cancel_request_id,
+            affected_resource_ids,
+            evidence,
+            evidence_digest,
+        } => (
+            identity,
+            affected_resource_ids,
+            evidence,
+            evidence_digest,
+            EffectModeRef::AfterCancelAndDeadline(cancel_request_id),
+        ),
+        EffectFactV2::Indeterminate {
+            identity,
+            possible_affected_resource_ids,
+            evidence,
+            evidence_digest,
+            ..
+        } => (
+            identity,
+            possible_affected_resource_ids,
+            evidence,
+            evidence_digest,
+            EffectModeRef::Indeterminate,
+        ),
+    };
+    let invocation = state
+        .invocations
+        .get(&identity.invocation_id)
+        .ok_or_else(corrupt_store)?;
+    let mut expected_resources = state
+        .resources
+        .values()
+        .filter(|resource| resource.invocation_id == identity.invocation_id)
+        .map(|resource| resource.resource_id.clone())
+        .collect::<Vec<_>>();
+    expected_resources
+        .sort_by(|left, right| left.as_str().as_bytes().cmp(right.as_str().as_bytes()));
+    let observed_cancel = invocation
+        .stop_overlay
+        .cancellation()
+        .map(|(request_id, _, _)| request_id);
+    let stop_matches = match mode {
+        EffectModeRef::Observed => {
+            invocation.cancellation_observed_fact_id.is_none()
+                && invocation.deadline_observed_fact_id.is_none()
+        }
+        EffectModeRef::AfterCancel(cancel_request_id) => {
+            invocation.cancellation_observed_fact_id.is_some()
+                && invocation.deadline_observed_fact_id.is_none()
+                && observed_cancel == Some(cancel_request_id)
+        }
+        EffectModeRef::AfterDeadline => {
+            invocation.cancellation_observed_fact_id.is_none()
+                && invocation.deadline_observed_fact_id.is_some()
+        }
+        EffectModeRef::AfterCancelAndDeadline(cancel_request_id) => {
+            invocation.cancellation_observed_fact_id.is_some()
+                && invocation.deadline_observed_fact_id.is_some()
+                && observed_cancel == Some(cancel_request_id)
+        }
+        EffectModeRef::Indeterminate => true,
+    };
+    let evidence_matches = match mode {
+        EffectModeRef::Indeterminate => indeterminate_evidence_legal(invocation.tool_id, evidence),
+        _ => observed_evidence_legal(invocation.tool_id, evidence),
+    };
+    if invocation.phase != InvocationPhase::Executing
+        || !effect_identity_matches_invocation(identity, invocation)
+        || resources != &expected_resources
+        || !stop_matches
+        || !evidence_matches
+        || executor_evidence_digest_v2(evidence).map_err(|_| corrupt_store())? != *evidence_digest
+    {
+        return Err(corrupt_store());
+    }
+    expected_revalidation_set_digest(state, invocation)?;
+    Ok(())
+}
+
+fn observed_evidence_legal(tool_id: AuthorityToolIdV4, evidence: &EffectEvidenceV2) -> bool {
+    use AuthorityToolIdV4 as Tool;
+    match (tool_id, evidence) {
+        (
+            Tool::FsRead | Tool::FsDiff | Tool::DocumentRead,
+            EffectEvidenceV2::ContentRead { .. },
+        )
+        | (Tool::FsList | Tool::FsGlob, EffectEvidenceV2::CollectionRead { .. })
+        | (Tool::CodeGrep, EffectEvidenceV2::SearchMatchesReadBack { .. })
+        | (
+            Tool::FsCreate | Tool::FsWrite | Tool::FsEdit,
+            EffectEvidenceV2::MutationReadBack {
+                target_kind: WorkspaceObjectKindV2::File,
+                ..
+            },
+        )
+        | (
+            Tool::FsEnsureDirectory,
+            EffectEvidenceV2::MutationReadBack {
+                target_kind: WorkspaceObjectKindV2::Directory,
+                ..
+            },
+        )
+        | (Tool::FsDelete, EffectEvidenceV2::DeletionReadBack { .. })
+        | (Tool::WebSearch, EffectEvidenceV2::WebSearchReadBack { .. })
+        | (Tool::WebFetch, EffectEvidenceV2::WebReadBack { .. }) => true,
+        _ => false,
+    }
+}
+
+fn indeterminate_evidence_legal(tool_id: AuthorityToolIdV4, evidence: &EffectEvidenceV2) -> bool {
+    let EffectEvidenceV2::IndeterminateReadBack { last_observation } = evidence else {
+        return false;
+    };
+    use AuthorityToolIdV4 as Tool;
+    match (tool_id, last_observation) {
+        (_, LastObservationV2::None {}) => true,
+        (Tool::FsRead | Tool::FsDiff | Tool::DocumentRead, LastObservationV2::Content { .. })
+        | (Tool::FsList | Tool::FsGlob, LastObservationV2::Collection { .. })
+        | (Tool::CodeGrep, LastObservationV2::ToolOutput { .. })
+        | (
+            Tool::FsCreate
+            | Tool::FsWrite
+            | Tool::FsEdit
+            | Tool::FsDelete
+            | Tool::FsEnsureDirectory,
+            LastObservationV2::ResourceState { .. },
+        )
+        | (
+            Tool::WebSearch,
+            LastObservationV2::NetworkTarget { .. } | LastObservationV2::ToolOutput { .. },
+        )
+        | (
+            Tool::WebFetch,
+            LastObservationV2::NetworkTarget { .. } | LastObservationV2::NetworkResponse { .. },
+        ) => true,
+        _ => false,
+    }
+}
+
+fn effect_identity(fact: &EffectFactV2) -> &EffectIdentityV2 {
+    match fact {
+        EffectFactV2::Observed { identity, .. }
+        | EffectFactV2::ObservedAfterCancel { identity, .. }
+        | EffectFactV2::ObservedAfterDeadline { identity, .. }
+        | EffectFactV2::ObservedAfterCancelAndDeadline { identity, .. }
+        | EffectFactV2::Indeterminate { identity, .. } => identity,
+    }
+}
+
+fn validate_completed_output(
+    state: &AuthorityState,
+    identity: &ObservedTerminalIdentityV2,
+    output: &ToolOutputV4,
+) -> AuthorityResult<()> {
+    let evidence = match state
+        .facts_by_id
+        .get(&identity.causation_fact_id)
+        .map(|fact| &fact.payload)
+    {
+        Some(KernelFactPayloadV2::Effect(
+            EffectFactV2::Observed { evidence, .. }
+            | EffectFactV2::ObservedAfterCancel { evidence, .. }
+            | EffectFactV2::ObservedAfterDeadline { evidence, .. }
+            | EffectFactV2::ObservedAfterCancelAndDeadline { evidence, .. },
+        )) => evidence,
+        _ => return Err(corrupt_store()),
+    };
+    if matches!(
+        evidence,
+        EffectEvidenceV2::SearchMatchesReadBack { output_digest, .. }
+            | EffectEvidenceV2::WebSearchReadBack { output_digest, .. }
+            if output_digest != &output.full_digest
+    ) {
+        return Err(corrupt_store());
+    }
+    Ok(())
+}
+
+fn validate_indeterminate_pair(
+    state: &AuthorityState,
+    identity: &ObservedTerminalIdentityV2,
+    reason_code: &IndeterminateReasonV2,
+) -> AuthorityResult<()> {
+    match state
+        .facts_by_id
+        .get(&identity.causation_fact_id)
+        .map(|fact| &fact.payload)
+    {
+        Some(KernelFactPayloadV2::Effect(EffectFactV2::Indeterminate {
+            reason_code: effect_reason,
+            ..
+        })) if effect_reason == reason_code => Ok(()),
+        _ => Err(corrupt_store()),
+    }
+}
+
+fn submission_reply_from_cause(
+    state: &AuthorityState,
+    causation_fact_id: &FactId,
+) -> AuthorityResult<InvocationSubmissionReplyV2> {
+    match state
+        .facts_by_id
+        .get(causation_fact_id)
+        .map(|fact| &fact.payload)
+    {
+        Some(KernelFactPayloadV2::Control(ControlFactV2::CommandRecorded {
+            command_kind: MutationCommandKindV2::InvocationSubmit,
+            result: MutationCommandResultV2::InvocationSubmission { reply },
+            ..
+        })) => Ok(reply.clone()),
+        _ => Err(corrupt_store()),
+    }
+}
+
+fn reply_from_recorded_result(result: MutationCommandResultV2) -> KernelReplyV2 {
+    match result {
+        MutationCommandResultV2::EpochAdvance { reply } => {
+            KernelReplyV2::ControlEpochAdvanced(reply)
+        }
+        MutationCommandResultV2::GrantDecision { reply } => {
+            KernelReplyV2::GrantDecisionRecorded(reply)
+        }
+        MutationCommandResultV2::GrantRevoke { reply } => KernelReplyV2::GrantRevoked(reply),
+        MutationCommandResultV2::InvocationSubmission { reply } => {
+            KernelReplyV2::InvocationSubmission(reply)
+        }
+        MutationCommandResultV2::InvocationCancel { reply } => {
+            KernelReplyV2::InvocationCancelResult(reply)
+        }
+        MutationCommandResultV2::RunTerminate { reply } => KernelReplyV2::RunTerminated(reply),
+        MutationCommandResultV2::RecordedSemanticError { error } => {
+            KernelReplyV2::Error(recorded_error_to_error(error))
+        }
+    }
+}
+
+pub(super) fn recorded_error_to_error(error: RecordedCommandErrorV2) -> KernelErrorV2 {
+    use RecordedCommandErrorV2 as Recorded;
+    match error {
+        Recorded::ControlEpochAlreadyExists { run_id, current } => {
+            KernelErrorV2::ControlEpochAlreadyExists { run_id, current }
+        }
+        Recorded::ControlEpochExhausted { run_id, current } => {
+            KernelErrorV2::ControlEpochExhausted { run_id, current }
+        }
+        Recorded::StaleControlEpoch {
+            run_id,
+            submitted,
+            current,
+        } => KernelErrorV2::StaleControlEpoch {
+            run_id,
+            submitted,
+            current,
+        },
+        Recorded::RunTerminated {
+            run_id,
+            control_epoch,
+        } => KernelErrorV2::RunTerminated {
+            run_id,
+            control_epoch,
+        },
+        Recorded::ToolExecutionUnavailable {
+            tool_id,
+            availability,
+        } => KernelErrorV2::ToolExecutionUnavailable {
+            tool_id,
+            availability,
+        },
+        Recorded::GrantNotFound { run_id } => KernelErrorV2::GrantNotFound { run_id },
+        Recorded::AuthorizationDigestMismatch { expected, actual } => {
+            KernelErrorV2::AuthorizationDigestMismatch { expected, actual }
+        }
+        Recorded::DuplicateGrantDecisionDigestMismatch {
+            authorization_request_digest,
+            existing,
+            submitted,
+        } => KernelErrorV2::DuplicateGrantDecisionDigestMismatch {
+            authorization_request_digest,
+            existing,
+            submitted,
+        },
+        Recorded::InvocationNotFound {
+            run_id,
+            invocation_id,
+        } => KernelErrorV2::InvocationNotFound {
+            run_id,
+            invocation_id,
+        },
+        Recorded::InvocationNotOwnedByRun {
+            run_id,
+            invocation_id,
+        } => KernelErrorV2::InvocationNotOwnedByRun {
+            run_id,
+            invocation_id,
+        },
+    }
+}
+
+fn validate_causation(
+    state: &AuthorityState,
+    envelope: &KernelFactEnvelopeV2,
+) -> AuthorityResult<()> {
+    let Some(causation_id) = envelope.payload.causation_fact_id() else {
+        if matches!(
+            envelope.payload,
+            KernelFactPayloadV2::Control(ControlFactV2::CommandRecorded { .. })
+        ) {
+            return Ok(());
+        }
+        return Err(corrupt_store());
+    };
+    let predecessor = state
+        .facts_by_id
+        .get(causation_id)
+        .ok_or_else(corrupt_store)?;
+    if predecessor.ledger_sequence >= envelope.ledger_sequence
+        || predecessor.payload.run_id() != envelope.payload.run_id()
+        || !edge_kind_matches(&predecessor.payload, &envelope.payload)
+    {
+        return Err(corrupt_store());
+    }
+    Ok(())
+}
+
+fn edge_kind_matches(predecessor: &KernelFactPayloadV2, current: &KernelFactPayloadV2) -> bool {
+    match current {
+        KernelFactPayloadV2::Control(ControlFactV2::EpochAdvanced { .. }) => {
+            command_edge(predecessor, MutationCommandKindV2::ControlEpochAdvance)
+        }
+        KernelFactPayloadV2::Control(ControlFactV2::RunTerminated { .. }) => {
+            command_edge(predecessor, MutationCommandKindV2::RunTerminate)
+        }
+        KernelFactPayloadV2::Control(ControlFactV2::CancellationRequested { source, .. }) => {
+            match source {
+                CancellationSourceV2::ExplicitCommand => {
+                    command_edge(predecessor, MutationCommandKindV2::InvocationCancel)
+                }
+                CancellationSourceV2::EpochAdvance => matches!(
+                    predecessor,
+                    KernelFactPayloadV2::Control(ControlFactV2::EpochAdvanced { .. })
+                ),
+                CancellationSourceV2::RunTermination => matches!(
+                    predecessor,
+                    KernelFactPayloadV2::Control(ControlFactV2::RunTerminated { .. })
+                ),
+            }
+        }
+        KernelFactPayloadV2::Grant(GrantFactV2::Issued { .. })
+        | KernelFactPayloadV2::Grant(GrantFactV2::Denied { .. }) => {
+            command_edge(predecessor, MutationCommandKindV2::GrantDecisionSubmit)
+        }
+        KernelFactPayloadV2::Grant(GrantFactV2::Revoked { .. }) => {
+            command_edge(predecessor, MutationCommandKindV2::GrantRevoke)
+        }
+        KernelFactPayloadV2::Grant(GrantFactV2::Superseded { .. }) => matches!(
+            predecessor,
+            KernelFactPayloadV2::Control(
+                ControlFactV2::EpochAdvanced { .. } | ControlFactV2::RunTerminated { .. }
+            )
+        ),
+        KernelFactPayloadV2::Invocation(
+            InvocationFactV2::Admitted { .. } | InvocationFactV2::Rejected { .. },
+        ) => command_edge(predecessor, MutationCommandKindV2::InvocationSubmit),
+        KernelFactPayloadV2::Grant(GrantFactV2::Reserved { .. }) => matches!(
+            predecessor,
+            KernelFactPayloadV2::Invocation(InvocationFactV2::Admitted { .. })
+        ),
+        KernelFactPayloadV2::Invocation(InvocationFactV2::AttemptPrepared { .. }) => matches!(
+            predecessor,
+            KernelFactPayloadV2::Grant(GrantFactV2::Reserved { .. })
+        ),
+        KernelFactPayloadV2::Resource(ResourceFactV2::ResolvedForInvocation { .. }) => matches!(
+            predecessor,
+            KernelFactPayloadV2::Invocation(InvocationFactV2::AttemptPrepared { .. })
+        ),
+        KernelFactPayloadV2::Resource(ResourceFactV2::RevalidatedBeforeEffect { .. }) => {
+            matches!(
+                predecessor,
+                KernelFactPayloadV2::Resource(ResourceFactV2::ResolvedForInvocation { .. })
+            )
+        }
+        KernelFactPayloadV2::Grant(GrantFactV2::Consumed { .. })
+        | KernelFactPayloadV2::Invocation(InvocationFactV2::FailedBeforeEffect { .. }) => {
+            matches!(
+                predecessor,
+                KernelFactPayloadV2::Invocation(InvocationFactV2::AttemptPrepared { .. })
+            )
+        }
+        KernelFactPayloadV2::Invocation(InvocationFactV2::ExecutionStarted { .. }) => matches!(
+            predecessor,
+            KernelFactPayloadV2::Grant(GrantFactV2::Consumed { .. })
+        ),
+        KernelFactPayloadV2::Invocation(InvocationFactV2::CancellationObserved { .. }) => {
+            matches!(
+                predecessor,
+                KernelFactPayloadV2::Control(ControlFactV2::CancellationRequested { .. })
+            )
+        }
+        KernelFactPayloadV2::Invocation(InvocationFactV2::DeadlineObserved { .. }) => matches!(
+            predecessor,
+            KernelFactPayloadV2::Invocation(InvocationFactV2::Admitted { .. })
+        ),
+        KernelFactPayloadV2::Invocation(InvocationFactV2::CancelledBeforeEffect { .. }) => {
+            matches!(
+                predecessor,
+                KernelFactPayloadV2::Invocation(InvocationFactV2::CancellationObserved { .. })
+            )
+        }
+        KernelFactPayloadV2::Invocation(InvocationFactV2::TimedOutBeforeEffect { .. }) => {
+            matches!(
+                predecessor,
+                KernelFactPayloadV2::Invocation(InvocationFactV2::DeadlineObserved { .. })
+            )
+        }
+        KernelFactPayloadV2::Effect(_) => matches!(
+            predecessor,
+            KernelFactPayloadV2::Invocation(InvocationFactV2::ExecutionStarted { .. })
+        ),
+        KernelFactPayloadV2::Invocation(
+            InvocationFactV2::Completed { .. }
+            | InvocationFactV2::FailedAfterObservedEffect { .. }
+            | InvocationFactV2::Indeterminate { .. },
+        ) => matches!(predecessor, KernelFactPayloadV2::Effect(_)),
+        KernelFactPayloadV2::Grant(GrantFactV2::ReservationReleased { .. }) => matches!(
+            predecessor,
+            KernelFactPayloadV2::Invocation(
+                InvocationFactV2::FailedBeforeEffect { .. }
+                    | InvocationFactV2::CancelledBeforeEffect { .. }
+                    | InvocationFactV2::TimedOutBeforeEffect { .. }
+            )
+        ),
+        KernelFactPayloadV2::Resource(
+            ResourceFactV2::Acquired { .. } | ResourceFactV2::Released { .. },
+        )
+        | KernelFactPayloadV2::Cleanup(_)
+        | KernelFactPayloadV2::Control(ControlFactV2::CommandRecorded { .. }) => false,
+    }
+}
+
+fn command_edge(predecessor: &KernelFactPayloadV2, expected: MutationCommandKindV2) -> bool {
+    matches!(
+        predecessor,
+        KernelFactPayloadV2::Control(ControlFactV2::CommandRecorded {
+            command_kind,
+            ..
+        }) if *command_kind == expected
+    )
+}
+
+#[cfg(target_os = "macos")]
+const CURRENT_PLATFORM: PlatformV2 = PlatformV2::Macos;
+#[cfg(target_os = "linux")]
+const CURRENT_PLATFORM: PlatformV2 = PlatformV2::Linux;
+#[cfg(target_os = "windows")]
+const CURRENT_PLATFORM: PlatformV2 = PlatformV2::Windows;
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+compile_error!("Kernel v2 authority supports macOS, Linux, and Windows");

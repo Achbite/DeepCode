@@ -19,6 +19,7 @@ mod resource_packet;
 mod run;
 mod snapshot;
 mod tool;
+pub mod tool_catalog_v4;
 pub mod v2;
 pub mod v2_command;
 mod wire;
@@ -48,6 +49,7 @@ pub use resource_packet::*;
 pub use run::*;
 pub use snapshot::*;
 pub use tool::*;
+pub use tool_catalog_v4::*;
 pub use wire::*;
 pub use workspace::*;
 

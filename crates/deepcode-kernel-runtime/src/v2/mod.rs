@@ -1,9 +1,5 @@
 mod authority;
 mod model;
+mod service;
 
-pub(crate) use authority::AuthorityRuntime;
-pub(crate) use model::{
-    AuthorityError, CapabilityScope, EffectCompletion, GrantIssueRequest, GrantLifecycle,
-    GrantReservationLifecycle, InvocationLifecycle, InvocationSubmitRequest,
-    TerminalInvocationOutcome,
-};
+pub(super) use service::AuthorityService;

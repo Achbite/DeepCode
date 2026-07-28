@@ -1,259 +1,280 @@
-use deepcode_kernel_abi::v2::{
-    AttemptId, ControlEpoch, GrantId, GrantReservationId, InvocationId, KernelErrorCodeV2,
-    OperationId, RunId,
+use deepcode_kernel_abi::tool_catalog_v4::{
+    AuthorityToolIdV4, EffectScopeV4, ToolContractDigestV4, ToolInvocationInputV4,
+    ToolOutputDigestV4, ToolOutputV4, ToolRiskV4,
 };
-use serde_json::Value;
-use std::fmt;
+use deepcode_kernel_abi::v2::{
+    AttemptId, AuthorizationRequestDigestV2, CancelRequestId, CanonicalPrivateTargetV2,
+    CommandRequestDigestV2, CommandRequestId, ControlEpoch, CorrelationSetV2, EffectEvidenceV2,
+    EffectId, FactId, GrantDecisionBasisV2, GrantDecisionDigestV2, GrantId, GrantReservationId,
+    GrantScopeDigestV2, GrantSupersessionCauseV2, IdempotencyKeyHashV2, IndeterminateReasonV2,
+    InputId, InvocationId, InvocationRequestDigestV2, InvocationSubmissionDigestV2,
+    KernelFactEnvelopeV2, OperationId, PlatformV2, PostObservedEffectFailureCodeV2,
+    ResolvedResourceV2, ResourceId, ResourceScopeV2, ResourceStateDigestV2, ResourceStateV2, RunId,
+    TargetRevalidationDigestV2, TargetRevalidationObservationV2, WorkspaceBindingDigestV2,
+    WorkspaceObjectKindV2,
+};
+use deepcode_kernel_abi::v2_command::{
+    GrantDecisionReplyV2, InvocationPhaseV2, InvocationSubmissionReplyV2, KernelErrorV2,
+    KernelReplyV2, StopOverlayV2,
+};
+use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
+
+pub(super) type AuthorityResult<T> = Result<T, KernelErrorV2>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CapabilityScope {
-    pub tool_id: String,
-    pub resource_scope: Vec<String>,
-    pub effect_scope: Vec<String>,
+pub(super) enum RunLifecycle {
+    Active,
+    Terminated {
+        fact_id: FactId,
+        ledger_sequence: u64,
+    },
 }
 
-impl CapabilityScope {
-    pub fn new(
-        tool_id: impl Into<String>,
-        resource_scope: Vec<String>,
-        effect_scope: Vec<String>,
-    ) -> AuthorityResult<Self> {
-        let scope = Self {
-            tool_id: tool_id.into(),
-            resource_scope: normalize_scope("resourceScope", resource_scope)?,
-            effect_scope: normalize_scope("effectScope", effect_scope)?,
-        };
-        require_non_empty("toolId", &scope.tool_id)?;
-        Ok(scope)
-    }
+#[derive(Debug, Clone)]
+pub(super) struct RunRecord {
+    pub(super) epoch: ControlEpoch,
+    pub(super) lifecycle: RunLifecycle,
+    pub(super) active_invocation_id: Option<InvocationId>,
+    pub(super) admitted_inputs: HashMap<InputId, ControlEpoch>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GrantIssueRequest {
-    pub run_id: RunId,
-    pub operation_id: OperationId,
-    pub control_epoch: ControlEpoch,
-    pub scope: CapabilityScope,
-    pub request_digest: String,
-    pub reason: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GrantLifecycle {
+pub(super) enum GrantLifecycle {
     Issued,
-    Revoked,
-    Expired,
-    Superseded,
+    Revoked {
+        fact_id: FactId,
+        ledger_sequence: u64,
+    },
+    Superseded {
+        fact_id: FactId,
+        ledger_sequence: u64,
+        cause: GrantSupersessionCauseV2,
+    },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GrantReservationLifecycle {
-    Reserved,
-    Consumed,
-    Released,
+#[derive(Debug, Clone)]
+pub(super) struct GrantRecord {
+    pub(super) run_id: RunId,
+    pub(super) grant_epoch: ControlEpoch,
+    pub(super) issuance_operation_id: OperationId,
+    pub(super) grant_id: GrantId,
+    pub(super) tool_id: AuthorityToolIdV4,
+    pub(super) issuance_authorization_digest: AuthorizationRequestDigestV2,
+    pub(super) grant_scope_digest: GrantScopeDigestV2,
+    pub(super) resource_scope: ResourceScopeV2,
+    pub(super) effect_scope: EffectScopeV4,
+    pub(super) risk: ToolRiskV4,
+    pub(super) lifecycle: GrantLifecycle,
+    pub(super) use_count: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct ReservationRecord {
+    pub(super) consumed: bool,
+    pub(super) released: bool,
+}
+
+pub(super) type InvocationPhase = InvocationPhaseV2;
+
+pub(super) const fn invocation_phase_is_terminal(phase: InvocationPhase) -> bool {
+    matches!(
+        phase,
+        InvocationPhase::FailedBeforeEffect
+            | InvocationPhase::CancelledBeforeEffect
+            | InvocationPhase::TimedOutBeforeEffect
+            | InvocationPhase::Completed
+            | InvocationPhase::FailedAfterObservedEffect
+            | InvocationPhase::Indeterminate
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GrantSnapshot {
-    pub grant_id: GrantId,
-    pub run_id: RunId,
-    pub control_epoch: ControlEpoch,
-    pub scope: CapabilityScope,
-    pub request_digest: String,
-    pub lifecycle: GrantLifecycle,
-    pub observed_use_count: u64,
-    pub reservations: Vec<(GrantReservationId, GrantReservationLifecycle)>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InvocationSubmitRequest {
-    pub run_id: RunId,
-    pub operation_id: OperationId,
-    pub control_epoch: ControlEpoch,
-    pub grant_id: GrantId,
-    pub scope: CapabilityScope,
-    pub request_digest: String,
-    pub idempotency_key_hash: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InvocationLifecycle {
-    Admitted,
-    AttemptPrepared,
-    EffectStarted,
-    Completed,
-    Failed,
-    Indeterminate,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InvocationAdmission {
-    pub invocation_id: InvocationId,
-    pub admitted: bool,
-    pub rejection_code: Option<KernelErrorCodeV2>,
-    pub retryable: bool,
-    pub replayed: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InvocationSnapshot {
-    pub invocation_id: InvocationId,
-    pub run_id: RunId,
-    pub operation_id: OperationId,
-    pub control_epoch: ControlEpoch,
-    pub grant_id: GrantId,
-    pub reservation_id: GrantReservationId,
-    pub attempt_id: Option<AttemptId>,
-    pub lifecycle: InvocationLifecycle,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TerminalInvocationOutcome {
-    Completed,
-    Failed,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct EffectCompletion {
-    pub receipt: Value,
-    pub affected_resource_ids: Vec<deepcode_kernel_abi::v2::ResourceId>,
-    pub terminal_outcome: TerminalInvocationOutcome,
-    pub error_code: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ControlAdvance {
-    pub previous_epoch: Option<ControlEpoch>,
-    pub control_epoch: ControlEpoch,
-    pub superseded_grant_ids: Vec<GrantId>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AuthorityError {
-    InvalidRequest {
-        field: &'static str,
-        reason: String,
+pub(super) enum StopOverlay {
+    None,
+    CancellationRequested {
+        cancel_request_id: CancelRequestId,
+        fact_id: FactId,
+        ledger_sequence: u64,
     },
-    DuplicateOperationDigestMismatch {
-        run_id: RunId,
-        operation_id: OperationId,
+    DeadlineObserved {
+        fact_id: FactId,
     },
-    GrantRequired {
-        grant_id: GrantId,
-    },
-    GrantScopeMismatch {
-        grant_id: GrantId,
-    },
-    StaleControlEpoch {
-        expected: Option<ControlEpoch>,
-        actual: ControlEpoch,
-    },
-    InvocationNotFound {
-        invocation_id: InvocationId,
-    },
-    InvalidInvocationState {
-        invocation_id: InvocationId,
-        expected: &'static str,
-        actual: InvocationLifecycle,
-    },
-    FactStoreUnavailable {
-        operation: &'static str,
-        message: String,
+    CancellationAndDeadline {
+        cancel_request_id: CancelRequestId,
+        cancellation_fact_id: FactId,
+        cancellation_ledger_sequence: u64,
+        deadline_fact_id: FactId,
     },
 }
 
-pub type AuthorityResult<T> = Result<T, AuthorityError>;
-
-impl AuthorityError {
-    pub const fn code(&self) -> KernelErrorCodeV2 {
+impl StopOverlay {
+    pub(super) fn cancellation(&self) -> Option<(&CancelRequestId, &FactId, u64)> {
         match self {
-            Self::DuplicateOperationDigestMismatch { .. } => {
-                KernelErrorCodeV2::DuplicateOperationDigestMismatch
+            Self::CancellationRequested {
+                cancel_request_id,
+                fact_id,
+                ledger_sequence,
             }
-            Self::GrantRequired { .. } => KernelErrorCodeV2::GrantRequired,
-            Self::GrantScopeMismatch { .. } => KernelErrorCodeV2::GrantScopeMismatch,
-            Self::StaleControlEpoch { .. } => KernelErrorCodeV2::StaleControlEpoch,
-            Self::FactStoreUnavailable { .. } => KernelErrorCodeV2::FactStoreUnavailable,
-            Self::InvalidRequest { .. }
-            | Self::InvocationNotFound { .. }
-            | Self::InvalidInvocationState { .. } => KernelErrorCodeV2::InvalidRequest,
+            | Self::CancellationAndDeadline {
+                cancel_request_id,
+                cancellation_fact_id: fact_id,
+                cancellation_ledger_sequence: ledger_sequence,
+                ..
+            } => Some((cancel_request_id, fact_id, *ledger_sequence)),
+            Self::None | Self::DeadlineObserved { .. } => None,
         }
     }
-}
 
-impl fmt::Display for AuthorityError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    pub(super) const fn deadline_observed(&self) -> bool {
+        matches!(
+            self,
+            Self::DeadlineObserved { .. } | Self::CancellationAndDeadline { .. }
+        )
+    }
+
+    pub(super) fn wire(&self) -> StopOverlayV2 {
         match self {
-            Self::InvalidRequest { field, reason } => {
-                write!(formatter, "invalid {field}: {reason}")
-            }
-            Self::DuplicateOperationDigestMismatch {
-                run_id,
-                operation_id,
-            } => write!(
-                formatter,
-                "operation {operation_id} in run {run_id} was already bound to another digest"
-            ),
-            Self::GrantRequired { grant_id } => {
-                write!(formatter, "active capability grant {grant_id} is required")
-            }
-            Self::GrantScopeMismatch { grant_id } => {
-                write!(
-                    formatter,
-                    "capability grant {grant_id} does not match the request scope"
-                )
-            }
-            Self::StaleControlEpoch { expected, actual } => write!(
-                formatter,
-                "control epoch {actual:?} is stale; current epoch is {expected:?}"
-            ),
-            Self::InvocationNotFound { invocation_id } => {
-                write!(formatter, "invocation {invocation_id} was not found")
-            }
-            Self::InvalidInvocationState {
-                invocation_id,
-                expected,
-                actual,
-            } => write!(
-                formatter,
-                "invocation {invocation_id} is {actual:?}; expected {expected}"
-            ),
-            Self::FactStoreUnavailable { operation, message } => {
-                write!(
-                    formatter,
-                    "fact store unavailable during {operation}: {message}"
-                )
-            }
+            Self::None => StopOverlayV2::None {},
+            Self::CancellationRequested {
+                cancel_request_id, ..
+            } => StopOverlayV2::CancellationRequested {
+                cancel_request_id: cancel_request_id.clone(),
+            },
+            Self::DeadlineObserved { .. } => StopOverlayV2::DeadlineObserved {},
+            Self::CancellationAndDeadline {
+                cancel_request_id, ..
+            } => StopOverlayV2::CancellationAndDeadline {
+                cancel_request_id: cancel_request_id.clone(),
+            },
         }
     }
 }
 
-impl std::error::Error for AuthorityError {}
-
-pub(crate) fn require_non_empty(field: &'static str, value: &str) -> AuthorityResult<()> {
-    if value.trim().is_empty() {
-        return Err(AuthorityError::InvalidRequest {
-            field,
-            reason: "must not be empty".to_string(),
-        });
-    }
-    Ok(())
+#[derive(Debug, Clone)]
+pub(super) struct InvocationRecord {
+    pub(super) run_id: RunId,
+    pub(super) operation_id: OperationId,
+    pub(super) control_epoch: ControlEpoch,
+    pub(super) grant_id: GrantId,
+    pub(super) reservation_id: GrantReservationId,
+    pub(super) invocation_id: InvocationId,
+    pub(super) attempt_id: AttemptId,
+    pub(super) idempotency_key_hash: IdempotencyKeyHashV2,
+    pub(super) tool_id: AuthorityToolIdV4,
+    pub(super) workspace_binding_digest: WorkspaceBindingDigestV2,
+    pub(super) correlations: CorrelationSetV2,
+    pub(super) phase: InvocationPhase,
+    pub(super) stop_overlay: StopOverlay,
+    pub(super) admission_fact_id: FactId,
+    pub(super) attempt_prepared_fact_id: Option<FactId>,
+    pub(super) execution_started_fact_id: Option<FactId>,
+    pub(super) cancellation_observed_fact_id: Option<FactId>,
+    pub(super) deadline_observed_fact_id: Option<FactId>,
+    pub(super) last_fact_id: FactId,
 }
 
-fn normalize_scope(field: &'static str, values: Vec<String>) -> AuthorityResult<Vec<String>> {
-    if values.is_empty() {
-        return Err(AuthorityError::InvalidRequest {
-            field,
-            reason: "must contain at least one exact value".to_string(),
-        });
-    }
-    let mut normalized = Vec::with_capacity(values.len());
-    for value in values {
-        require_non_empty(field, &value)?;
-        if !normalized.contains(&value) {
-            normalized.push(value);
-        }
-    }
-    normalized.sort();
-    Ok(normalized)
+#[derive(Debug, Clone)]
+pub(super) struct CommandReplay {
+    pub(super) digest: CommandRequestDigestV2,
+    pub(super) reply: KernelReplyV2,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct GrantDecisionReplay {
+    pub(super) digest: GrantDecisionDigestV2,
+    pub(super) reply: GrantDecisionReplyV2,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SubmissionBinding {
+    pub(super) digest: InvocationSubmissionDigestV2,
+    pub(super) reply: InvocationSubmissionReplyV2,
+    pub(super) retryable_rejection: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct ResourceRecord {
+    pub(super) run_id: RunId,
+    pub(super) invocation_id: InvocationId,
+    pub(super) resource_id: ResourceId,
+    pub(super) resolved: ResolvedResourceV2,
+    pub(super) resolution_fact_id: FactId,
+    pub(super) revalidation: Option<(
+        FactId,
+        TargetRevalidationDigestV2,
+        TargetRevalidationObservationV2,
+    )>,
+    pub(super) last_fact_id: FactId,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(super) struct AuthorityState {
+    pub(super) runs: HashMap<RunId, RunRecord>,
+    pub(super) grants: HashMap<GrantId, GrantRecord>,
+    pub(super) reservations: HashMap<GrantReservationId, ReservationRecord>,
+    pub(super) invocations: HashMap<InvocationId, InvocationRecord>,
+    pub(super) resources: HashMap<ResourceId, ResourceRecord>,
+    pub(super) invocation_effects: HashMap<InvocationId, (EffectId, FactId)>,
+    pub(super) commands: HashMap<CommandRequestId, CommandReplay>,
+    pub(super) grant_decisions: HashMap<String, GrantDecisionReplay>,
+    pub(super) operation_bindings: HashMap<(RunId, OperationId), SubmissionBinding>,
+    pub(super) idempotency_bindings: HashMap<(RunId, IdempotencyKeyHashV2), SubmissionBinding>,
+    pub(super) storage_faulted: bool,
+    pub(super) facts_by_id: HashMap<FactId, KernelFactEnvelopeV2>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct WorkspaceBinding {
+    pub(super) platform: PlatformV2,
+    pub(super) canonical_root: PathBuf,
+    pub(super) canonical_root_utf8: String,
+    pub(super) digest: WorkspaceBindingDigestV2,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct ResolvedTarget {
+    pub(super) relative_path: Option<String>,
+    pub(super) object_kind: Option<WorkspaceObjectKindV2>,
+    pub(super) state: Option<ResourceStateV2>,
+    pub(super) state_digest: Option<ResourceStateDigestV2>,
+    pub(super) public_resource: ResolvedResourceV2,
+    pub(super) private_target: CanonicalPrivateTargetV2,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct PreparedGrantRequest {
+    pub(super) canonical_invocation: ToolInvocationInputV4,
+    pub(super) resource_scope: ResourceScopeV2,
+    pub(super) resolved_targets: Vec<ResolvedTarget>,
+    pub(super) idempotency_key_hash: IdempotencyKeyHashV2,
+    pub(super) grant_scope_digest: GrantScopeDigestV2,
+    pub(super) authorization_digest: AuthorizationRequestDigestV2,
+    pub(super) workspace_binding_digest: WorkspaceBindingDigestV2,
+    pub(super) effective_deadline_ms: u32,
+    pub(super) correlations: CorrelationSetV2,
+}
+
+pub(super) struct RawExecution {
+    pub(super) output: serde_json::Value,
+    pub(super) complete_document_text: Option<String>,
+    pub(super) http_status_code: Option<u16>,
+    pub(super) http_content_type: Option<String>,
+}
+
+pub(super) struct VerifiedExecution {
+    pub(super) output: ToolOutputV4,
+    pub(super) evidence: EffectEvidenceV2,
+}
+
+pub(super) enum ExecutionResolution {
+    Completed(VerifiedExecution),
+    FailedAfterObservedEffect {
+        evidence: EffectEvidenceV2,
+        error_code: PostObservedEffectFailureCodeV2,
+    },
+    Indeterminate {
+        evidence: EffectEvidenceV2,
+        reason_code: IndeterminateReasonV2,
+    },
 }

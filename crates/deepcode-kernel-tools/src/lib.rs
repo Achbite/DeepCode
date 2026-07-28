@@ -1,6 +1,7 @@
 use sha2::{Digest, Sha256};
 
 mod admission;
+mod authority_v4;
 mod authorization;
 mod catalog;
 mod contracts;
@@ -14,6 +15,7 @@ mod review;
 mod sandbox;
 
 pub use admission::*;
+pub use authority_v4::*;
 pub use authorization::*;
 pub use catalog::*;
 pub use contracts::*;

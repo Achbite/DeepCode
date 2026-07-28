@@ -214,11 +214,13 @@ mod git;
 mod search;
 pub(crate) mod web;
 
-use document::*;
+pub(crate) use document::invoke_document_read_complete;
+use document::DocumentReadExecutor;
 use filesystem::*;
 use git::*;
 pub(crate) use search::{grep_workspace_with_options, CodeGrepOptions};
 use search::{skip_directory, CodeGrepExecutor, FsGlobExecutor};
+pub(crate) use web::invoke_web_fetch_complete;
 use web::*;
 
 fn ok(invocation_id: String, output: Value) -> KernelToolExecutionResult {
@@ -257,6 +259,53 @@ struct TextPatchResult {
     updated: String,
     match_kind: String,
     changed_ranges: Value,
+}
+
+pub(crate) fn plan_v2_text_edit(
+    original: &str,
+    matcher: &deepcode_kernel_abi::tool_catalog_v4::EditMatcherV4,
+    replacement: &str,
+) -> KernelResult<(Value, String)> {
+    use deepcode_kernel_abi::tool_catalog_v4::{EditMatcherV4, FileDigestPreconditionV4};
+    let match_value = match matcher {
+        EditMatcherV4::ExactBlock { text } => {
+            serde_json::json!({"kind":"exactBlock","text":text})
+        }
+        EditMatcherV4::ContextBlock {
+            before,
+            target,
+            after,
+        } => serde_json::json!({
+            "kind":"contextBlock",
+            "before":before,
+            "target":target,
+            "after":after
+        }),
+        EditMatcherV4::LineRange {
+            start_line,
+            end_line,
+            precondition,
+        } => {
+            let mut value = serde_json::json!({
+                "kind":"lineRange",
+                "startLine":start_line,
+                "endLine":end_line
+            });
+            match precondition {
+                FileDigestPreconditionV4::ExpectedFileDigest { .. } => {
+                    value["expectedFileHash"] =
+                        Value::String(deepcode_kernel_tools::hash_bytes(original.as_bytes()));
+                }
+                FileDigestPreconditionV4::ExpectedBeforeBlock { text } => {
+                    value["expectedBeforeBlock"] = Value::String(text.clone());
+                }
+            }
+            value
+        }
+    };
+    let patch_spec = serde_json::json!({"match":match_value});
+    let patch = apply_text_patch(original, replacement, &patch_spec)?;
+    Ok((patch_spec, patch.updated))
 }
 
 fn apply_text_patch(
