@@ -1254,12 +1254,16 @@
     },
     "agent.permissions.autonomyMode": {
       "label": "介入模式",
-      "description": "在 Kernel 权限门禁之前应用的 Session 自主性策略。",
+      "description": "仅控制 Session Loop 的介入节奏，不会授予任何 Kernel 能力。",
       "options": {
         "strict": "严格",
         "trustedWorkspace": "受信工作区",
         "maximum": "最大自主"
       }
+    },
+    "agent.permissions.autoApprovePlans": {
+      "label": "自动批准计划",
+      "description": "仅允许 Kernel 对已持久化且位于有效 Host 信任租约范围内的计划签发能力。"
     },
     "agent.permissions.workspaceWrite": {
       "label": "工作区写入",

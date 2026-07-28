@@ -385,7 +385,7 @@ export const SETTING_DEFINITIONS: SettingDefinition[] = [
   {
     key: 'agent.permissions.autonomyMode',
     label: 'Autonomy Mode',
-    description: 'Session autonomy policy applied before Kernel permission gates.',
+    description: 'Controls Session loop cadence only; it never grants Kernel capabilities.',
     group: 'agent',
     control: 'select',
     options: [
@@ -393,6 +393,13 @@ export const SETTING_DEFINITIONS: SettingDefinition[] = [
       { label: 'Trusted Workspace', value: 'trustedWorkspace' },
       { label: 'Maximum', value: 'maximum' },
     ],
+  },
+  {
+    key: 'agent.permissions.autoApprovePlans',
+    label: 'Auto-approve Plans',
+    description: 'Allow Kernel capability issuance only for persisted plans covered by an active Host trust lease.',
+    group: 'agent',
+    control: 'boolean',
   },
   {
     key: 'agent.permissions.workspaceWrite',

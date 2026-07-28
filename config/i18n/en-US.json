@@ -1254,12 +1254,16 @@
     },
     "agent.permissions.autonomyMode": {
       "label": "Autonomy Mode",
-      "description": "Session autonomy policy applied before Kernel permission gates.",
+      "description": "Controls Session loop cadence only; it never grants Kernel capabilities.",
       "options": {
         "strict": "Strict",
         "trustedWorkspace": "Trusted Workspace",
         "maximum": "Maximum"
       }
+    },
+    "agent.permissions.autoApprovePlans": {
+      "label": "Auto-approve Plans",
+      "description": "Allow Kernel capability issuance only for persisted plans covered by an active Host trust lease."
     },
     "agent.permissions.workspaceWrite": {
       "label": "Workspace Write",

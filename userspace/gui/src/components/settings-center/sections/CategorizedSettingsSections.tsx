@@ -50,6 +50,7 @@ const AGENT_SETTING_KEYS = [
 
 const EDITABLE_PERMISSION_KEYS = [
   'agent.permissions.autonomyMode',
+  'agent.permissions.autoApprovePlans',
   'agent.permissions.webRead',
   'agent.permissions.privateWebRead',
 ] as const;
