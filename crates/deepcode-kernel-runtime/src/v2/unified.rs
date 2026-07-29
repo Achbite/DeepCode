@@ -6,7 +6,8 @@ use super::model::{AuthorityResult, WorkspaceBinding};
 use super::service::{
     initial_run_transport_generation, run_capability_verifier_digest, AuthorityService,
     DirectToolIntentRequest, DurableRunCapabilityVerifierV2, InitialToolContextInvalidationV2,
-    RUN_CAPABILITY_VERIFIER_BOUND, RUN_CAPABILITY_VERIFIER_MATERIAL_KIND,
+    AUTHORITY_MATERIAL_RETIREMENT_PENDING, RUN_CAPABILITY_VERIFIER_BOUND,
+    RUN_CAPABILITY_VERIFIER_MATERIAL_KIND,
 };
 use crate::executors::{KernelExecutorConfig, SecretProvider};
 use deepcode_kernel_abi::v2::{
@@ -669,6 +670,77 @@ fn valid_sha256_lower_hex(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
+fn capability_lease_fact_matches(
+    payload: &KernelFactPayloadV2,
+    durable: &DurableCapabilityLeaseV2,
+) -> bool {
+    match payload {
+        KernelFactPayloadV2::Authorization(AuthorizationFactV2::CapabilityIssued {
+            identity,
+            tool_id,
+            scope_digest,
+            context_ref,
+            ..
+        }) => {
+            identity.run_id == durable.run_id
+                && identity.control_epoch == durable.control_epoch
+                && identity.plan_revision == durable.plan_revision
+                && identity.plan_action_id == durable.plan_action_id
+                && identity.operation_id == durable.issuance_operation_id
+                && identity.preview_id == durable.preview_id
+                && identity.lease_id == durable.reference.lease_id
+                && identity.lease_version == durable.reference.version
+                && tool_id == &durable.tool_id
+                && scope_digest == &durable.reference.scope_digest
+                && context_ref == &durable.context_ref
+        }
+        KernelFactPayloadV2::Authorization(AuthorizationFactV2::ExpansionAllowed {
+            identity,
+            expanded_scope_digest,
+            ..
+        }) => {
+            identity.run_id == durable.run_id
+                && identity.control_epoch == durable.control_epoch
+                && identity.plan_revision == durable.plan_revision
+                && identity.plan_action_id == durable.plan_action_id
+                && identity.operation_id == durable.issuance_operation_id
+                && identity.preview_id == durable.preview_id
+                && identity.lease_id == durable.reference.lease_id
+                && identity.lease_version == durable.reference.version
+                && expanded_scope_digest == &durable.reference.scope_digest
+        }
+        _ => false,
+    }
+}
+
+fn trust_grant_fact_matches(payload: &KernelFactPayloadV2, durable: &DurableTrustLeaseV2) -> bool {
+    let KernelFactPayloadV2::Authorization(AuthorizationFactV2::TrustGranted {
+        identity,
+        trust_policy_id,
+        trust_lease_digest,
+        tool_id,
+        scope_digest,
+        workspace_binding_digest,
+        context_ref,
+        expires_at,
+    }) = payload
+    else {
+        return false;
+    };
+    identity.run_id == durable.run_id
+        && identity.control_epoch == durable.control_epoch
+        && identity.plan_revision == durable.plan_revision
+        && identity.plan_action_id == durable.plan_action_id
+        && identity.operation_id == durable.issuance_operation_id
+        && trust_policy_id == &durable.trust_policy_id
+        && trust_lease_digest == &durable.trust_lease_digest
+        && tool_id == &durable.tool_id
+        && scope_digest == &durable.scope_digest
+        && workspace_binding_digest == &durable.workspace_binding_digest
+        && context_ref == &durable.context_ref
+        && expires_at == &durable.expires_at
+}
+
 fn recover_authority_material(
     facts: &[KernelFactEnvelopeV2],
     material: Vec<AuthorityMaterialRecordV2>,
@@ -677,6 +749,8 @@ fn recover_authority_material(
         .iter()
         .map(|fact| (fact.fact_id.clone(), fact))
         .collect::<HashMap<_, _>>();
+    let retired_runs = recover_retired_runs(facts)?;
+    let retirement_fences = recover_retirement_fences(facts, &retired_runs);
     let mut previews = HashMap::new();
     let mut leases = HashMap::new();
     let mut trusts = HashMap::new();
@@ -686,9 +760,26 @@ fn recover_authority_material(
         if record.lifecycle == AUTHORITY_MATERIAL_STALE {
             continue;
         }
+        let retirement_pending = record.lifecycle == AUTHORITY_MATERIAL_RETIREMENT_PENDING;
+        let retirement_fence = if retirement_pending {
+            let fence = retirement_fences
+                .get(&record.run_id)
+                .ok_or_else(storage_fault)?;
+            if record.last_fact_id != fence.fence_fact_id
+                || record.last_ledger_sequence != fence.fence_ledger_sequence
+                || record.control_epoch >= fence.control_epoch.get()
+            {
+                return Err(storage_fault());
+            }
+            Some(fence)
+        } else {
+            None
+        };
         match record.material_kind.as_str() {
             AUTHORITY_MATERIAL_PREVIEW => {
-                if record.lifecycle != AUTHORITY_MATERIAL_ACTIVE || record.lease.is_some() {
+                if (!retirement_pending && record.lifecycle != AUTHORITY_MATERIAL_ACTIVE)
+                    || record.lease.is_some()
+                {
                     return Err(storage_fault());
                 }
                 let durable: DurablePreparedScopePreviewV2 =
@@ -749,7 +840,7 @@ fn recover_authority_material(
                 }
             }
             AUTHORITY_MATERIAL_LEASE => {
-                if record.lifecycle != AUTHORITY_MATERIAL_ACTIVE {
+                if !retirement_pending && record.lifecycle != AUTHORITY_MATERIAL_ACTIVE {
                     if record.lifecycle == AUTHORITY_MATERIAL_REVOKED {
                         continue;
                     }
@@ -767,39 +858,31 @@ fn recover_authority_material(
                 {
                     return Err(storage_fault());
                 }
-                let last = facts_by_id
-                    .get(&record.last_fact_id)
-                    .copied()
-                    .ok_or_else(storage_fault)?;
-                let valid_fact = match &last.payload {
-                    KernelFactPayloadV2::Authorization(AuthorizationFactV2::CapabilityIssued {
-                        identity,
-                        scope_digest,
-                        ..
-                    }) => {
-                        identity.lease_id == durable.reference.lease_id
-                            && identity.lease_version == durable.reference.version
-                            && scope_digest == &durable.reference.scope_digest
+                let issuance = match retirement_fence {
+                    Some(fence) => facts
+                        .iter()
+                        .rev()
+                        .find(|fact| {
+                            fact.ledger_sequence < fence.fence_ledger_sequence
+                                && capability_lease_fact_matches(&fact.payload, &durable)
+                        })
+                        .ok_or_else(storage_fault)?,
+                    None => {
+                        let last = facts_by_id
+                            .get(&record.last_fact_id)
+                            .copied()
+                            .ok_or_else(storage_fault)?;
+                        if !capability_lease_fact_matches(&last.payload, &durable) {
+                            return Err(storage_fault());
+                        }
+                        last
                     }
-                    KernelFactPayloadV2::Authorization(AuthorizationFactV2::ExpansionAllowed {
-                        identity,
-                        expanded_scope_digest,
-                        ..
-                    }) => {
-                        identity.lease_id == durable.reference.lease_id
-                            && identity.lease_version == durable.reference.version
-                            && expanded_scope_digest == &durable.reference.scope_digest
-                    }
-                    _ => false,
                 };
-                if !valid_fact {
-                    return Err(storage_fault());
-                }
                 let lease_id = durable.reference.lease_id.clone();
                 if leases
                     .insert(
                         lease_id,
-                        durable.into_record(record.last_fact_id, record.last_ledger_sequence),
+                        durable.into_record(issuance.fact_id.clone(), issuance.ledger_sequence),
                     )
                     .is_some()
                 {
@@ -807,7 +890,7 @@ fn recover_authority_material(
                 }
             }
             AUTHORITY_MATERIAL_PENDING => {
-                if record.lifecycle != AUTHORITY_MATERIAL_AWAITING {
+                if !retirement_pending && record.lifecycle != AUTHORITY_MATERIAL_AWAITING {
                     if matches!(
                         record.lifecycle.as_str(),
                         AUTHORITY_MATERIAL_ADMITTED | AUTHORITY_MATERIAL_REJECTED
@@ -859,7 +942,7 @@ fn recover_authority_material(
                 }
             }
             AUTHORITY_MATERIAL_TRUST => {
-                if record.lifecycle != AUTHORITY_MATERIAL_ACTIVE {
+                if !retirement_pending && record.lifecycle != AUTHORITY_MATERIAL_ACTIVE {
                     if record.lifecycle == AUTHORITY_MATERIAL_REVOKED {
                         continue;
                     }
@@ -878,48 +961,36 @@ fn recover_authority_material(
                 {
                     return Err(storage_fault());
                 }
-                let last = facts_by_id
-                    .get(&record.last_fact_id)
-                    .copied()
-                    .ok_or_else(storage_fault)?;
-                let KernelFactPayloadV2::Authorization(AuthorizationFactV2::TrustGranted {
-                    identity,
-                    trust_policy_id,
-                    trust_lease_digest,
-                    tool_id,
-                    scope_digest,
-                    workspace_binding_digest,
-                    context_ref,
-                    expires_at,
-                }) = &last.payload
-                else {
-                    return Err(storage_fault());
+                let grant = match retirement_fence {
+                    Some(fence) => facts
+                        .iter()
+                        .rev()
+                        .find(|fact| {
+                            fact.ledger_sequence < fence.fence_ledger_sequence
+                                && trust_grant_fact_matches(&fact.payload, &durable)
+                        })
+                        .ok_or_else(storage_fault)?,
+                    None => {
+                        let last = facts_by_id
+                            .get(&record.last_fact_id)
+                            .copied()
+                            .ok_or_else(storage_fault)?;
+                        if !trust_grant_fact_matches(&last.payload, &durable) {
+                            return Err(storage_fault());
+                        }
+                        last
+                    }
                 };
-                if identity.run_id != durable.run_id
-                    || identity.control_epoch != durable.control_epoch
-                    || identity.plan_revision != durable.plan_revision
-                    || identity.plan_action_id != durable.plan_action_id
-                    || identity.operation_id != durable.issuance_operation_id
-                    || trust_policy_id != &durable.trust_policy_id
-                    || trust_lease_digest != &durable.trust_lease_digest
-                    || tool_id != &durable.tool_id
-                    || scope_digest != &durable.scope_digest
-                    || workspace_binding_digest != &durable.workspace_binding_digest
-                    || context_ref != &durable.context_ref
-                    || expires_at != &durable.expires_at
-                {
-                    return Err(storage_fault());
-                }
                 let trust_policy_id = durable.trust_policy_id.clone();
                 if trusts
-                    .insert(trust_policy_id, durable.into_record(record.last_fact_id))
+                    .insert(trust_policy_id, durable.into_record(grant.fact_id.clone()))
                     .is_some()
                 {
                     return Err(storage_fault());
                 }
             }
             RUN_CAPABILITY_VERIFIER_MATERIAL_KIND => {
-                if record.lifecycle != RUN_CAPABILITY_VERIFIER_BOUND
+                if (!retirement_pending && record.lifecycle != RUN_CAPABILITY_VERIFIER_BOUND)
                     || record.operation_id.is_some()
                     || record.invocation_id.is_some()
                     || record.lease.is_some()
@@ -975,11 +1046,19 @@ fn recover_authority_material(
                         run_id,
                         control_epoch,
                         ..
-                    }) => run_id == &durable.run_id && control_epoch.get() == record.control_epoch,
+                    }) => {
+                        retirement_pending
+                            && run_id == &durable.run_id
+                            && Some(control_epoch)
+                                == retirement_fence.map(|fence| &fence.control_epoch)
+                    }
                     _ => false,
                 };
                 if !source_matches || !last_matches {
                     return Err(storage_fault());
+                }
+                if retirement_pending {
+                    continue;
                 }
                 if run_capability_verifiers
                     .insert(durable.run_id, durable.token_verifier_sha256)
@@ -1387,12 +1466,6 @@ struct PublicRunRecord {
     context_version: ToolContextVersionV2,
     context_ref: ToolContextRefV2,
     control_fact_id: FactId,
-}
-
-enum RunCapabilityDisposition {
-    Active,
-    RetirementFenced,
-    Retired,
 }
 
 #[derive(Clone)]
@@ -2263,23 +2336,17 @@ impl KernelSessionServiceV2 {
             return Ok(retired.receipt(run_id, true));
         }
 
-        let (known_epoch, known_causation, run_capability, existing_fence) = {
+        let (known_epoch, known_causation, existing_fence) = {
             let state = self.inner.state.lock().map_err(|_| storage_fault())?;
             let recovered = state
                 .runs
                 .get(&run_id)
-                .map(|run| {
-                    (
-                        run.control_epoch,
-                        run.control_fact_id.clone(),
-                        Some(run.capability.clone()),
-                    )
-                })
+                .map(|run| (run.control_epoch, run.control_fact_id.clone()))
                 .or_else(|| {
                     state
                         .recovered_runs
                         .get(&run_id)
-                        .map(|run| (run.control_epoch, run.control_fact_id.clone(), None))
+                        .map(|run| (run.control_epoch, run.control_fact_id.clone()))
                 })
                 .ok_or_else(|| KernelErrorV2::RunNotFound {
                     run_id: run_id.clone(),
@@ -2287,7 +2354,6 @@ impl KernelSessionServiceV2 {
             (
                 recovered.0,
                 recovered.1,
-                recovered.2,
                 state.retirement_fences.get(&run_id).cloned(),
             )
         };
@@ -2328,7 +2394,6 @@ impl KernelSessionServiceV2 {
                 &run_id,
                 reason_code,
                 reason.clone(),
-                run_capability.as_ref(),
             )?;
             let fence = RunRetirementFenceRecord {
                 control_epoch: reply.control_epoch,
@@ -2341,13 +2406,11 @@ impl KernelSessionServiceV2 {
             state
                 .retirement_fences
                 .insert(run_id.clone(), fence.clone());
-            if let Some(capability) = run_capability.as_ref() {
-                let verifier = state
-                    .run_capability_verifiers
-                    .get_mut(&run_id)
-                    .ok_or_else(storage_fault)?;
-                *verifier = run_capability_verifier_digest(&run_id, capability);
+            if let Some(run) = state.runs.get_mut(&run_id) {
+                run.control_epoch = fence.control_epoch;
+                run.control_fact_id = fence.fence_fact_id.clone();
             }
+            state.run_capability_verifiers.remove(&run_id);
             fence
         };
         require_same_retirement_fence_reason(&fence, reason_code, reason.as_deref())?;
@@ -2516,10 +2579,10 @@ impl KernelSessionServiceV2 {
         }));
 
         let mut material_mutations =
-            Vec::with_capacity(leases.len() + trusts.len() + previews.len() + pending.len());
+            Vec::with_capacity(leases.len() + trusts.len() + previews.len() + pending.len() + 1);
         for (fact_index, lease) in leases.iter().enumerate() {
             material_mutations.push(AuthorityMaterialMutationV2::Replace {
-                expected_lifecycle: AUTHORITY_MATERIAL_ACTIVE.to_owned(),
+                expected_lifecycle: AUTHORITY_MATERIAL_RETIREMENT_PENDING.to_owned(),
                 expected_payload_digest: None,
                 material: capability_lease_material(&lease.durable(), AUTHORITY_MATERIAL_REVOKED)?,
                 fact_index,
@@ -2527,7 +2590,7 @@ impl KernelSessionServiceV2 {
         }
         for (offset, trust) in trusts.iter().enumerate() {
             material_mutations.push(AuthorityMaterialMutationV2::Replace {
-                expected_lifecycle: AUTHORITY_MATERIAL_ACTIVE.to_owned(),
+                expected_lifecycle: AUTHORITY_MATERIAL_RETIREMENT_PENDING.to_owned(),
                 expected_payload_digest: None,
                 material: trust_lease_material(&trust.durable(), AUTHORITY_MATERIAL_REVOKED)?,
                 fact_index: leases.len() + offset,
@@ -2535,7 +2598,7 @@ impl KernelSessionServiceV2 {
         }
         for preview in &previews {
             material_mutations.push(AuthorityMaterialMutationV2::Replace {
-                expected_lifecycle: AUTHORITY_MATERIAL_ACTIVE.to_owned(),
+                expected_lifecycle: AUTHORITY_MATERIAL_RETIREMENT_PENDING.to_owned(),
                 expected_payload_digest: None,
                 material: scope_preview_material(&preview.durable(), AUTHORITY_MATERIAL_STALE)?,
                 fact_index: retirement_index,
@@ -2547,7 +2610,7 @@ impl KernelSessionServiceV2 {
                 ToolIntentAuthorityV2::ContextRead { .. } => None,
             };
             material_mutations.push(AuthorityMaterialMutationV2::Replace {
-                expected_lifecycle: AUTHORITY_MATERIAL_AWAITING.to_owned(),
+                expected_lifecycle: AUTHORITY_MATERIAL_RETIREMENT_PENDING.to_owned(),
                 expected_payload_digest: None,
                 material: pending_intent_material(
                     &intent.durable(),
@@ -2557,6 +2620,13 @@ impl KernelSessionServiceV2 {
                 fact_index: retirement_index,
             });
         }
+        material_mutations.push(AuthorityMaterialMutationV2::TransitionRunEpoch {
+            run_id: run_id.clone(),
+            through_control_epoch: fence.control_epoch.get(),
+            expected_lifecycles: vec![AUTHORITY_MATERIAL_RETIREMENT_PENDING.to_owned()],
+            next_lifecycle: AUTHORITY_MATERIAL_STALE.to_owned(),
+            fact_index: retirement_index,
+        });
 
         let committed = self
             .inner
@@ -3736,8 +3806,7 @@ impl KernelSessionServiceV2 {
         let digest = command_request_digest_v2(&envelope.command).map_err(|_| storage_fault())?;
         let run_id = public_command_run_id(&envelope.command)
             .ok_or_else(|| invalid_field("command.kind", InvalidFieldViolationV2::InvalidEnum))?;
-        let capability_disposition =
-            self.verify_run_capability(&run_id, transport_run_capability)?;
+        self.verify_run_capability(&run_id, transport_run_capability)?;
         if let Some(replayed) = self.lookup_replay(&envelope.request_id, &digest)? {
             let reply = match replayed {
                 DurablePublicReplyV2::Kernel { reply } => reply,
@@ -3749,9 +3818,6 @@ impl KernelSessionServiceV2 {
             };
             return Ok((reply, CommandHandlingV2::Replayed));
         }
-        let RunCapabilityDisposition::Active = capability_disposition else {
-            return Err(KernelErrorV2::RunNotFound { run_id });
-        };
         self.inner
             .authority
             .require_run_accepting_commands(&run_id)?;
@@ -4735,42 +4801,23 @@ impl KernelSessionServiceV2 {
         &self,
         run_id: &RunId,
         transport: &RunCapabilityV2,
-    ) -> AuthorityResult<RunCapabilityDisposition> {
+    ) -> AuthorityResult<()> {
         let state = self.inner.state.lock().map_err(|_| storage_fault())?;
-        if let Some(run) = state.runs.get(run_id).cloned() {
-            if !constant_time_token_eq(&run.capability, transport) {
-                return Err(unauthorized_run());
-            }
-            return if state.retirement_fences.contains_key(run_id) {
-                Ok(RunCapabilityDisposition::RetirementFenced)
-            } else if state.retired_runs.contains_key(run_id) {
-                Ok(RunCapabilityDisposition::Retired)
-            } else {
-                Ok(RunCapabilityDisposition::Active)
-            };
+        if state.retirement_fences.contains_key(run_id) || state.retired_runs.contains_key(run_id) {
+            return Err(KernelErrorV2::RunNotFound {
+                run_id: run_id.clone(),
+            });
         }
-        let disposition = if state.retirement_fences.contains_key(run_id) {
-            Some(RunCapabilityDisposition::RetirementFenced)
-        } else if state.retired_runs.contains_key(run_id) {
-            Some(RunCapabilityDisposition::Retired)
-        } else {
-            None
-        };
-        if let Some(disposition) = disposition {
-            let Some(expected) = state.run_capability_verifiers.get(run_id) else {
-                return Err(KernelErrorV2::RunNotFound {
-                    run_id: run_id.clone(),
-                });
-            };
-            let submitted = run_capability_verifier_digest(run_id, transport);
-            if !constant_time_bytes_eq(expected.as_bytes(), submitted.as_bytes()) {
-                return Err(unauthorized_run());
-            }
-            return Ok(disposition);
+        let run = state
+            .runs
+            .get(run_id)
+            .ok_or_else(|| KernelErrorV2::RunNotFound {
+                run_id: run_id.clone(),
+            })?;
+        if !constant_time_token_eq(&run.capability, transport) {
+            return Err(unauthorized_run());
         }
-        Err(KernelErrorV2::RunNotFound {
-            run_id: run_id.clone(),
-        })
+        Ok(())
     }
 
     fn install_retired_run_state(

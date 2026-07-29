@@ -1204,7 +1204,7 @@ export class SessionKernelLoopV2 {
       runId: this.state.runId,
       recordedAt: recordedAt ?? this.ports.clock.now(),
       kind,
-      data,
+      data: data === undefined ? null : data,
     };
   }
 }

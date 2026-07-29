@@ -45,7 +45,13 @@ cargo check --quiet --workspace
 pass "Rust production workspace"
 
 info "TypeScript production packages"
+pnpm --filter @deepcode/protocol clean
+rm -f userspace/protocol/tsconfig.tsbuildinfo
 pnpm --filter @deepcode/protocol build
+if find userspace/protocol/dist -maxdepth 1 -type f \
+  \( -name 'kernel.*' -o -name 'kernelAbiV1.*' \) -print -quit | grep -q .; then
+  fail "Protocol production output contains retired Kernel ABI modules"
+fi
 pnpm --filter @deepcode/session-core build
 [ ! -e userspace/session-core/dist/__tests__ ] \
   || fail "Session production output contains test assets"

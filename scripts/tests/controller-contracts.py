@@ -29,6 +29,7 @@ REQUIRED_SUITE_IDS = [
     "repository.required",
     "kernel.v2.contracts",
     "session.v2.contracts",
+    "host.v2.integration",
 ]
 ALL_SUITE_IDS = ["repository.static", *REQUIRED_SUITE_IDS, *SMOKE_SUITE_IDS]
 
@@ -250,6 +251,11 @@ def assert_internal_runners_are_guarded() -> None:
             "session-v2-contracts.sh",
             [],
             "use bash ./test.sh --suite session.v2.contracts",
+        ),
+        (
+            "host-v2-integration.sh",
+            [],
+            "use bash ./test.sh --suite host.v2.integration",
         ),
     ):
         completed = subprocess.run(

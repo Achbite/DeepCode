@@ -49,6 +49,9 @@ LINUX_DIR="$BIN_ROOT/linux-x64"
 WIN_DIR="$BIN_ROOT/win64"
 CLIENT_DIR="$ROOT_DIR/userspace/gui"
 WINDOWS_TARGET="x86_64-pc-windows-gnu"
+KERNEL_ABI_VERSION="deepcode.kernel.abi.v2"
+TOOL_REGISTRY_VERSION="deepcode.kernel.tools.v2"
+SESSION_BRIDGE_NAME="hostBridgeV2.js"
 
 fs_type_of() {
   stat -f -c %T "$1" 2>/dev/null || true
@@ -865,6 +868,8 @@ build_frontend_shared() {
     return
   fi
   echo "==[build][frontend-shared]== build protocol/session-core and check client types"
+  pnpm --filter @deepcode/protocol clean
+  rm -f "$ROOT_DIR/userspace/protocol/tsconfig.tsbuildinfo"
   pnpm --filter @deepcode/protocol build
   pnpm --filter @deepcode/session-core build
   pnpm --filter @deepcode/client build:types
@@ -1101,6 +1106,22 @@ verify_runtime_executable() {
   echo "==[build][verify-package-runtime]== ok $label: $path"
 }
 
+verify_protocol_v2_runtime() {
+  local dist_dir="$1"
+  local label="$2"
+  local required
+  local failed=0
+  for required in index.js tools.js kernelAbiV2.js; do
+    verify_runtime_file "$dist_dir/$required" "$label $required" || failed=1
+  done
+  if [ -d "$dist_dir" ] && find "$dist_dir" -maxdepth 1 -type f \
+    \( -name 'kernel.*' -o -name 'kernelAbiV1.*' \) -print -quit | grep -q .; then
+    echo "==[build][verify-package-runtime][error]== $label contains a retired Kernel ABI module" >&2
+    failed=1
+  fi
+  return "$failed"
+}
+
 verify_frontend_package_assets() {
   local dist_dir="$1"
   local label="$2"
@@ -1144,7 +1165,7 @@ verify_macos_app_identity() {
     echo "==[build][verify-package-runtime][error]== macOS shared kernel and $product bundled kernel differ" >&2
     failed=1
   fi
-  for field in buildCommit sourceFingerprint protocolVersion toolCatalogVersion; do
+  for field in buildCommit sourceFingerprint kernelAbiVersion toolRegistryVersion sessionBridge; do
     root_value="$(build_info_string_field "$root_build_info" "$field")"
     app_value="$(build_info_string_field "$app_build_info" "$field")"
     if [ -z "$root_value" ] || [ "$root_value" != "$app_value" ]; then
@@ -1152,6 +1173,21 @@ verify_macos_app_identity() {
       failed=1
     fi
   done
+  root_value="$(build_info_string_field "$root_build_info" kernelAbiVersion)"
+  if [ "$root_value" != "$KERNEL_ABI_VERSION" ]; then
+    echo "==[build][verify-package-runtime][error]== macOS build-info kernelAbiVersion=$root_value" >&2
+    failed=1
+  fi
+  root_value="$(build_info_string_field "$root_build_info" toolRegistryVersion)"
+  if [ "$root_value" != "$TOOL_REGISTRY_VERSION" ]; then
+    echo "==[build][verify-package-runtime][error]== macOS build-info toolRegistryVersion=$root_value" >&2
+    failed=1
+  fi
+  root_value="$(build_info_string_field "$root_build_info" sessionBridge)"
+  if [ "$root_value" != "$SESSION_BRIDGE_NAME" ]; then
+    echo "==[build][verify-package-runtime][error]== macOS build-info sessionBridge=$root_value" >&2
+    failed=1
+  fi
   app_value="$(build_info_string_field "$app_build_info" product)"
   if [ "$app_value" != "$product" ]; then
     echo "==[build][verify-package-runtime][error]== $product build-info product=$app_value" >&2
@@ -1198,8 +1234,10 @@ verify_macos_package_runtime() {
   echo "==[build][verify-package-runtime]== check macos-arm64 package"
   verify_runtime_executable "$macos_dir/deepcode-kernel" "macOS shared kernel" || missing=1
   verify_runtime_file "$macos_dir/build-info.json" "macOS shared build-info" || missing=1
-  verify_runtime_file "$macos_dir/session-core/hostBridge.js" "macOS session bridge" || missing=1
-  verify_runtime_file "$macos_dir/node_modules/@deepcode/protocol/dist/index.js" "macOS protocol runtime" || missing=1
+  verify_runtime_file "$macos_dir/session-core/$SESSION_BRIDGE_NAME" "macOS Session v2 bridge" || missing=1
+  verify_protocol_v2_runtime \
+    "$macos_dir/node_modules/@deepcode/protocol/dist" \
+    "macOS protocol runtime" || missing=1
   verify_runtime_executable "$macos_dir/node/bin/node" "macOS packaged node" || missing=1
 
   if [ -d "$macos_dir/DeepCode.app" ]; then

@@ -21,7 +21,8 @@
       "suites": [
         "repository.required",
         "kernel.v2.contracts",
-        "session.v2.contracts"
+        "session.v2.contracts",
+        "host.v2.integration"
       ]
     },
     "static": {
@@ -45,6 +46,7 @@
         "repository.required",
         "kernel.v2.contracts",
         "session.v2.contracts",
+        "host.v2.integration",
         "session.smoke.communication",
         "session.smoke.tools",
         "session.smoke.paths",
@@ -191,6 +193,43 @@
         "userspace/session-core/tests/v2/loop-contracts.mjs",
         "userspace/session-core/tests/v2/recovery-contracts.mjs",
         "userspace/session-core/tests/v2/review-contracts.mjs"
+      ]
+    },
+    {
+      "id": "host.v2.integration",
+      "description": "Required real Host v2 workspace binding, public transport lanes, CLI, restart/replay, legacy rejection, and owned-resource cleanup.",
+      "layer": "host",
+      "kind": "integration",
+      "owner": "host",
+      "approvalClass": "test-runtime",
+      "requiredGate": true,
+      "transitional": false,
+      "runner": {
+        "type": "shell",
+        "path": "scripts/tests/host-v2-integration.sh",
+        "args": [],
+        "timeoutSeconds": 1200,
+        "terminateGraceSeconds": 10
+      },
+      "environment": {
+        "container": "preferred",
+        "hostPolicy": "explicit-opt-in",
+        "hostOptInEnv": "DEEPCODE_ALLOW_HOST_TEST"
+      },
+      "resources": [
+        "test-owned-daemon",
+        "test-owned-session-bridge",
+        "test-owned-cli",
+        "test-owned-listener-ports",
+        "test-owned-locks",
+        "test-owned-temporary-directories"
+      ],
+      "contractSources": [
+        "scripts/tests/host-v2-integration.sh",
+        "scripts/tests/host-v2-integration.py",
+        "crates/deepcode-kernel-client/src/lib.rs",
+        "shells/cli/src/main.rs",
+        "shells/cli/src/cli_tests.rs"
       ]
     },
     {

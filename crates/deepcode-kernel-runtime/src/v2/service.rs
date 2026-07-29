@@ -59,6 +59,9 @@ const DIRECT_INVOCATION_ADMITTED: &str = "admitted";
 const DIRECT_INVOCATION_TERMINAL: &str = "terminal";
 pub(super) const RUN_CAPABILITY_VERIFIER_MATERIAL_KIND: &str = "runCapabilityVerifier";
 pub(super) const RUN_CAPABILITY_VERIFIER_BOUND: &str = "bound";
+pub(super) const AUTHORITY_MATERIAL_RETIREMENT_PENDING: &str = "retirementPending";
+const AUTHORITY_MATERIAL_ACTIVE: &str = "active";
+const AUTHORITY_MATERIAL_AWAITING: &str = "awaiting";
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -242,7 +245,6 @@ struct RunRetirementFenceDraft {
     fact_id: FactId,
     reason_code: RunRetirementReasonCodeV2,
     reason: Option<String>,
-    capability_verifier: Option<AuthorityMaterialDraftV2>,
 }
 
 #[derive(Clone)]
@@ -1082,7 +1084,6 @@ impl AuthorityService {
         run_id: &RunId,
         reason_code: RunRetirementReasonCodeV2,
         reason: Option<String>,
-        run_capability: Option<&RunCapabilityV2>,
     ) -> AuthorityResult<RunRetirementFenceOutcome> {
         let current_epoch = {
             let state = self.inner.state.lock().map_err(|_| storage_fault())?;
@@ -1114,26 +1115,10 @@ impl AuthorityService {
             KernelCommandV2::ControlEpochAdvance(command.clone()),
         );
         let fence_fact_id = self.inner.ids.fact();
-        let capability_verifier = match run_capability {
-            Some(capability) => {
-                let next_epoch = ControlEpoch::new(
-                    current_epoch
-                        .get()
-                        .checked_add(1)
-                        .ok_or_else(storage_fault)?,
-                )
-                .map_err(|_| storage_fault())?;
-                Some(run_capability_verifier_material(
-                    run_id, next_epoch, capability,
-                ))
-            }
-            None => None,
-        };
         let fence_draft = RunRetirementFenceDraft {
             fact_id: fence_fact_id.clone(),
             reason_code,
             reason: reason.clone(),
-            capability_verifier,
         };
         match self.advance_epoch_inner(
             &envelope,
@@ -1248,7 +1233,7 @@ impl AuthorityService {
                 fact_id: fence.fact_id,
                 payload: KernelFactPayloadV2::Control(
                     deepcode_kernel_abi::v2::ControlFactV2::RunRetirementFenced {
-                        run_id: command_run_id,
+                        run_id: command_run_id.clone(),
                         control_epoch: new_epoch,
                         reason_code: fence.reason_code,
                         reason: fence.reason,
@@ -1256,14 +1241,19 @@ impl AuthorityService {
                     },
                 ),
             });
-            if let Some(material) = fence.capability_verifier {
-                material_mutations.push(AuthorityMaterialMutationV2::Replace {
-                    expected_lifecycle: RUN_CAPABILITY_VERIFIER_BOUND.to_owned(),
-                    expected_payload_digest: None,
-                    material,
-                    fact_index: drafts.len() - 1,
-                });
-            }
+            material_mutations.push(AuthorityMaterialMutationV2::TransitionRunEpoch {
+                run_id: command_run_id,
+                through_control_epoch: previous_epoch
+                    .map(ControlEpoch::get)
+                    .ok_or_else(corrupt_store)?,
+                expected_lifecycles: vec![
+                    AUTHORITY_MATERIAL_ACTIVE.to_owned(),
+                    AUTHORITY_MATERIAL_AWAITING.to_owned(),
+                    RUN_CAPABILITY_VERIFIER_BOUND.to_owned(),
+                ],
+                next_lifecycle: AUTHORITY_MATERIAL_RETIREMENT_PENDING.to_owned(),
+                fact_index: drafts.len() - 1,
+            });
         }
         let kernel_reply = KernelReplyV2::ControlEpochAdvanced(reply);
         if let Some(build_receipt) = public_receipt {
