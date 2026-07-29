@@ -15,11 +15,11 @@ use std::time::Duration;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt as UnixCommandExt;
 #[cfg(windows)]
-use std::os::windows::io::AsRawHandle;
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt as WindowsCommandExt;
 #[cfg(windows)]
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+use windows_sys::Win32::Foundation::HANDLE;
 #[cfg(windows)]
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
@@ -294,7 +294,7 @@ struct OwnedKernelProcess {
 
 #[cfg(windows)]
 struct WindowsKillOnCloseJob {
-    handle: Option<HANDLE>,
+    handle: Option<OwnedHandle>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -727,20 +727,18 @@ impl WindowsKillOnCloseJob {
         if handle.is_null() {
             return Err(std::io::Error::last_os_error());
         }
+        let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
         let mut information = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         information.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
         let configured = unsafe {
             SetInformationJobObject(
-                handle,
+                handle.as_raw_handle() as HANDLE,
                 JobObjectExtendedLimitInformation,
                 (&information as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
                 std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
             )
         };
         if configured == 0 {
-            unsafe {
-                CloseHandle(handle);
-            }
             return Err(std::io::Error::last_os_error());
         }
         Ok(Self {
@@ -749,29 +747,20 @@ impl WindowsKillOnCloseJob {
     }
 
     fn assign(&self, child: &Child) -> std::io::Result<()> {
-        let Some(handle) = self.handle else {
+        let Some(handle) = self.handle.as_ref() else {
             return Err(std::io::Error::other("Kernel Job Object is closed"));
         };
         let process_handle = child.as_raw_handle() as HANDLE;
-        if unsafe { AssignProcessToJobObject(handle, process_handle) } == 0 {
+        if unsafe { AssignProcessToJobObject(handle.as_raw_handle() as HANDLE, process_handle) }
+            == 0
+        {
             return Err(std::io::Error::last_os_error());
         }
         Ok(())
     }
 
     fn close(&mut self) {
-        if let Some(handle) = self.handle.take() {
-            unsafe {
-                CloseHandle(handle);
-            }
-        }
-    }
-}
-
-#[cfg(windows)]
-impl Drop for WindowsKillOnCloseJob {
-    fn drop(&mut self) {
-        self.close();
+        drop(self.handle.take());
     }
 }
 
