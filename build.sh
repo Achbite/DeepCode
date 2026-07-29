@@ -709,14 +709,15 @@ stage_hash() {
           crates/deepcode-kernel-runtime crates/deepcode-kernel-policy crates/deepcode-kernel-ledger \
           crates/deepcode-kernel-config \
           crates/deepcode-kernel-context crates/deepcode-kernel-skills crates/deepcode-kernel-audit \
-          crates/deepcode-kernel-client crates/deepcode-kernel-daemon shells/cli shells/tui
+          crates/deepcode-kernel-client crates/deepcode-kernel-daemon crates/deepcode-host-web \
+          shells/cli shells/tui
         ;;
       daemon)
         tracked_files Cargo.toml Cargo.lock crates/deepcode-kernel-abi \
           crates/deepcode-kernel-runtime crates/deepcode-kernel-policy crates/deepcode-kernel-ledger \
           crates/deepcode-kernel-config \
           crates/deepcode-kernel-context crates/deepcode-kernel-skills crates/deepcode-kernel-audit \
-          crates/deepcode-kernel-daemon
+          crates/deepcode-kernel-daemon crates/deepcode-host-web
         ;;
       cli)
         tracked_files Cargo.toml Cargo.lock crates/deepcode-kernel-abi crates/deepcode-kernel-client shells/cli
@@ -904,14 +905,17 @@ build_deepcode_gui() {
 build_daemon() {
   if stage_should_skip daemon \
     "$CARGO_TARGET_ROOT/release/deepcode-kernel-daemon" \
-    "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-kernel-daemon.exe"; then
+    "$CARGO_TARGET_ROOT/release/deepcode-host-web" \
+    "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-kernel-daemon.exe" \
+    "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-host-web.exe"; then
     return
   fi
   configure_sccache
-  echo "==[build][daemon]== build Rust Kernel daemon for Linux"
-  cargo_with_fallback build --release -p deepcode-kernel-daemon
-  echo "==[build][daemon]== build Rust Kernel daemon for Windows GNU"
-  cargo_with_fallback build --release --target "$WINDOWS_TARGET" -p deepcode-kernel-daemon
+  echo "==[build][daemon]== build Rust Kernel daemon and private Host proxy for Linux"
+  cargo_with_fallback build --release -p deepcode-kernel-daemon -p deepcode-host-web
+  echo "==[build][daemon]== build Rust Kernel daemon and private Host proxy for Windows GNU"
+  cargo_with_fallback build --release --target "$WINDOWS_TARGET" \
+    -p deepcode-kernel-daemon -p deepcode-host-web
   mark_stage_built daemon
   show_sccache_stats
 }
@@ -1068,9 +1072,11 @@ validate_package_inputs() {
   require_package_dir "$CLIENT_DIR/dist" "run ./build.sh --stage gui first" || missing=1
   require_package_dir "$CLIENT_DIR/dist-deepcode-gui" "run ./build.sh --stage deepcode-gui first" || missing=1
   require_package_file "$CARGO_TARGET_ROOT/release/deepcode-kernel-daemon" "run ./build.sh --stage kernel first" || missing=1
+  require_package_file "$CARGO_TARGET_ROOT/release/deepcode-host-web" "run ./build.sh --stage kernel first" || missing=1
   require_package_file "$CARGO_TARGET_ROOT/release/deepcode-cli" "run ./build.sh --stage kernel first" || missing=1
   require_package_file "$CARGO_TARGET_ROOT/release/deepcode-tui" "run ./build.sh --stage kernel first" || missing=1
   require_package_file "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-kernel-daemon.exe" "run ./build.sh --stage kernel first" || missing=1
+  require_package_file "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-host-web.exe" "run ./build.sh --stage kernel first" || missing=1
   require_package_file "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-cli.exe" "run ./build.sh --stage kernel first" || missing=1
   require_package_file "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-tui.exe" "run ./build.sh --stage kernel first" || missing=1
   require_package_file "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/DeepCode.exe" "run ./build.sh --stage tauri first" || missing=1
@@ -1302,7 +1308,7 @@ verify_package_runtime() {
 write_readme() {
   local dist_dir="$1"
   local platform="$2"
-  local gui_entries="  deepcode-gui          Linux GUI host launcher"
+  local gui_entries=""
   if [ "$platform" = "win64" ]; then
     gui_entries="  DeepCode.exe          Windows Editor shell, starts the same-dir Kernel on a free localhost port
   DeepCode-GUI.exe      Windows DeepCode-GUI shell, shares the same Kernel and config"
@@ -1312,7 +1318,8 @@ DeepCode Unified Distribution ($platform)
 =========================================
 
 This folder is one DeepCode host distribution. GUI, CLI, and TUI entries share
-the same Rust Kernel binary, bundled config directory, and packs directory.
+the same Rust Kernel binary, private desktop Host proxy, bundled config directory,
+and packs directory.
 Editor assets live in web/. DeepCode-GUI assets live in web-deepcode-gui/.
 User session composition lives in the TS session-core package; all sensitive
 workspace, process, skill, and context operations must enter the Kernel through
@@ -1330,6 +1337,7 @@ Direct CLI/daemon runs use the OS config root unless DEEPCODE_CONFIG_DIR is set.
 
 Entries:
   deepcode-kernel       Rust Kernel Daemon + localhost API
+  deepcode-host-web     Private desktop Host proxy
 $gui_entries
   deepcode              CLI Host Shell MVP over KernelClient (Linux)
   deepcode-cli          CLI Host Shell MVP over KernelClient
@@ -1344,20 +1352,15 @@ Windows GUI runtime:
 
 Optional desktop shell:
   Tauri thin shell source lives in shells/tauri and shells/deepcode-gui. Each
-  shell embeds its matching React dist, starts or connects to the same-dir
-  Kernel Daemon in the background, and does not contain Agent runtime. Windows
+  shell embeds its matching React dist and owns the same-dir Kernel Daemon plus
+  private Host proxy process tree. It does not contain Agent runtime. Windows
   distribution includes DeepCode.exe and DeepCode-GUI.exe. The desktop shell
-  chooses an available localhost port by default; set DEEPCODE_PORT to force a
-  fixed port such as 31245.
+  chooses available localhost ports by default; set DEEPCODE_PORT to force the
+  proxy port to a fixed value such as 31245.
 
-Run the Linux GUI launcher or force DEEPCODE_PORT=31245, then open:
-  http://127.0.0.1:31245/
-
-The internal browser, Chrome, or any regular browser can open that URL. The
-browser is only a Host client; the Kernel remains the fact source.
-
-Health check:
-  http://127.0.0.1:31245/api/health
+The Linux portable distribution exposes CLI/TUI and the runtime sidecars.
+Desktop GUI use requires the optional Tauri shell build. Ordinary browser
+contexts intentionally receive no private Host bootstrap or capability.
 README
 }
 
@@ -1382,6 +1385,7 @@ clean_package_generated_outputs() {
     "$dist_dir/deepcode"
     "$dist_dir/deepcode-cli"
     "$dist_dir/deepcode-gui"
+    "$dist_dir/deepcode-host-web"
     "$dist_dir/deepcode-kernel"
     "$dist_dir/deepcode-tui"
     "$dist_dir/DeepCode"
@@ -1389,6 +1393,7 @@ clean_package_generated_outputs() {
     "$dist_dir/deepcode-tui.bat"
     "$dist_dir/deepcode.cmd"
     "$dist_dir/deepcode-cli.exe"
+    "$dist_dir/deepcode-host-web.exe"
     "$dist_dir/deepcode-kernel.exe"
     "$dist_dir/deepcode-tui.exe"
     "$dist_dir/DeepCode.exe"
@@ -1410,7 +1415,9 @@ package_distribution() {
 
   copy_required_file "$CARGO_TARGET_ROOT/release/deepcode-kernel-daemon" "$LINUX_DIR/deepcode-kernel" \
     "run ./build.sh --stage kernel first"
-  chmod +x "$LINUX_DIR/deepcode-kernel"
+  copy_required_file "$CARGO_TARGET_ROOT/release/deepcode-host-web" "$LINUX_DIR/deepcode-host-web" \
+    "run ./build.sh --stage kernel first"
+  chmod +x "$LINUX_DIR/deepcode-kernel" "$LINUX_DIR/deepcode-host-web"
   copy_required_file "$CARGO_TARGET_ROOT/release/deepcode-cli" "$LINUX_DIR/deepcode-cli" \
     "run ./build.sh --stage kernel first"
   copy_required_file "$CARGO_TARGET_ROOT/release/deepcode-cli" "$LINUX_DIR/deepcode" \
@@ -1420,6 +1427,8 @@ package_distribution() {
   chmod +x "$LINUX_DIR/deepcode-cli" "$LINUX_DIR/deepcode" "$LINUX_DIR/deepcode-tui"
 
   copy_required_file "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-kernel-daemon.exe" "$WIN_DIR/deepcode-kernel.exe" \
+    "run ./build.sh --stage kernel first"
+  copy_required_file "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-host-web.exe" "$WIN_DIR/deepcode-host-web.exe" \
     "run ./build.sh --stage kernel first"
   copy_required_file "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-cli.exe" "$WIN_DIR/deepcode-cli.exe" \
     "run ./build.sh --stage kernel first"
@@ -1440,17 +1449,6 @@ package_distribution() {
   cp -v "$webview2_loader_dll" "$WIN_DIR/WebView2Loader.dll"
 
   echo "==[build][package]== generate host launchers"
-  cat > "$LINUX_DIR/deepcode-gui" <<'LAUNCHER'
-#!/usr/bin/env bash
-set -euo pipefail
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-export DEEPCODE_CLIENT_DIST="${DEEPCODE_CLIENT_DIST:-$SCRIPT_DIR/web}"
-export DEEPCODE_HOST="${DEEPCODE_HOST:-127.0.0.1}"
-export DEEPCODE_PORT="${DEEPCODE_PORT:-31245}"
-"$SCRIPT_DIR/deepcode-kernel" "$@"
-LAUNCHER
-  chmod +x "$LINUX_DIR/deepcode-gui"
-
   cat > "$WIN_DIR/deepcode-cli.bat" <<'LAUNCHER'
 @echo off
 setlocal

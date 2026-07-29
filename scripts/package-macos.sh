@@ -250,6 +250,7 @@ running_process_ids_for_path() {
 target_app_process_ids() {
   local app_bin="$BIN_DIR/$APP_NAME.app/Contents/MacOS/$TAURI_BIN_NAME"
   local kernel_bin="$BIN_DIR/$APP_NAME.app/Contents/MacOS/deepcode-kernel"
+  local host_web_bin="$BIN_DIR/$APP_NAME.app/Contents/MacOS/deepcode-host-web"
   local distribution_kernel_bin="$BIN_DIR/deepcode-kernel"
 
   if [ -e "$app_bin" ]; then
@@ -257,6 +258,9 @@ target_app_process_ids() {
   fi
   if [ -e "$kernel_bin" ]; then
     running_process_ids_for_path "$kernel_bin" || true
+  fi
+  if [ -e "$host_web_bin" ]; then
+    running_process_ids_for_path "$host_web_bin" || true
   fi
   if [ -e "$distribution_kernel_bin" ]; then
     running_process_ids_for_path "$distribution_kernel_bin" || true
@@ -346,6 +350,7 @@ clean_shared_package_cache() {
     "$BIN_DIR/README.txt" \
     "$BIN_DIR/build-info.json" \
     "$CARGO_TARGET_ROOT/release/deepcode-kernel-daemon" \
+    "$CARGO_TARGET_ROOT/release/deepcode-host-web" \
     "$CARGO_TARGET_ROOT/release/deepcode-cli" \
     "$CARGO_TARGET_ROOT/release/deepcode-tui"
 }
@@ -685,8 +690,9 @@ build_gui_dist() {
 }
 
 build_rust_bins() {
-  log "build Darwin Kernel/CLI/TUI release binaries"
-  DEEPCODE_BUILD_COMMIT="$BUILD_COMMIT" cargo build --locked --release -p deepcode-kernel-daemon -p deepcode-cli -p deepcode-tui
+  log "build Darwin Kernel/private Host proxy/CLI/TUI release binaries"
+  DEEPCODE_BUILD_COMMIT="$BUILD_COMMIT" cargo build --locked --release \
+    -p deepcode-kernel-daemon -p deepcode-host-web -p deepcode-cli -p deepcode-tui
 }
 
 build_tauri_app() {
@@ -1211,9 +1217,9 @@ write_readme() {
   gui_section=""
   note_assets=""
   if [ "$PRODUCT" = "DeepCode" ] || [ -d "$BIN_DIR/DeepCode.app" ]; then
-    app_entries="  DeepCode.app              Native macOS Editor shell. Starts its bundled Kernel."
+    app_entries="  DeepCode.app              Native macOS Editor shell. Starts its bundled Kernel and private Host proxy."
     gui_section="  open DeepCode.app"
-    note_assets="  DeepCode.app contains deepcode-kernel and web/ under Contents/MacOS."
+    note_assets="  DeepCode.app contains deepcode-kernel, deepcode-host-web, and web/ under Contents/MacOS."
   fi
   if [ "$PRODUCT" = "DeepCode-GUI" ] || [ -d "$BIN_DIR/DeepCode-GUI.app" ]; then
     if [ "$WEB_DIR_NAME" != "web-deepcode-gui" ]; then
@@ -1223,15 +1229,15 @@ write_readme() {
     fi
     if [ -n "$app_entries" ]; then
       app_entries="$app_entries
-  DeepCode-GUI.app          Native macOS conversational GUI shell. Starts its bundled Kernel."
+  DeepCode-GUI.app          Native macOS conversational GUI shell. Starts its bundled Kernel and private Host proxy."
       gui_section="$gui_section
   open DeepCode-GUI.app"
       note_assets="$note_assets
-  DeepCode-GUI.app contains deepcode-kernel and web-deepcode-gui/ under Contents/MacOS."
+  DeepCode-GUI.app contains deepcode-kernel, deepcode-host-web, and web-deepcode-gui/ under Contents/MacOS."
     else
-      app_entries="  DeepCode-GUI.app          Native macOS conversational GUI shell. Starts its bundled Kernel."
+      app_entries="  DeepCode-GUI.app          Native macOS conversational GUI shell. Starts its bundled Kernel and private Host proxy."
       gui_section="  open DeepCode-GUI.app"
-      note_assets="  DeepCode-GUI.app contains deepcode-kernel and web-deepcode-gui/ under Contents/MacOS."
+      note_assets="  DeepCode-GUI.app contains deepcode-kernel, deepcode-host-web, and web-deepcode-gui/ under Contents/MacOS."
     fi
   fi
 
@@ -1314,6 +1320,7 @@ stage_product_app() {
 
   copy_required_file "$CARGO_TARGET_ROOT/release/$TAURI_BIN_NAME" "$app_macos_dir/$TAURI_BIN_NAME" 755
   copy_required_file "$CARGO_TARGET_ROOT/release/deepcode-kernel-daemon" "$app_macos_dir/deepcode-kernel" 755
+  copy_required_file "$CARGO_TARGET_ROOT/release/deepcode-host-web" "$app_macos_dir/deepcode-host-web" 755
   write_build_info "$app_macos_dir/build-info.json"
 
   copy_web_dist "$app_macos_dir/$WEB_DIR_NAME"
