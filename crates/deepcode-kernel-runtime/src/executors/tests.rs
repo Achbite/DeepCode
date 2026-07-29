@@ -1,5 +1,5 @@
 use super::*;
-use deepcode_kernel_tools::OperationExecutionMode;
+use std::thread;
 
 struct TempWorkspace(PathBuf);
 
@@ -125,25 +125,39 @@ fn atomic_create_sets_executable_mode_and_atomic_write_preserves_it() {
 }
 
 #[test]
-fn blocked_tools_have_no_runtime_executor_binding() {
+fn disabled_v2_tools_have_no_runtime_executor_binding() {
     let tool_registry = KernelToolRegistry::default();
     let registry = KernelExecutorRegistry::from_executors(builtin_executors(
         &tool_registry,
         KernelExecutorConfig::default(),
         Arc::new(EmptySecretProvider),
     ));
-    let error = registry
-        .invoke(
-            "browser.open",
-            KernelToolInvocation {
-                id: "blocked-browser".to_string(),
-                tool_id: "browser.open".to_string(),
-                input: serde_json::json!({ "url": "https://example.invalid" }),
-            },
-            context(Path::new(".")),
-        )
-        .expect_err("blocked tools must not have executable bindings");
-    assert!(format!("{error}").contains("no executable binding"));
+    let executable = registry
+        .tool_ids()
+        .collect::<std::collections::BTreeSet<_>>();
+
+    for disabled in [
+        "fs.rename",
+        "git.commit",
+        "git.diff",
+        "git.stage",
+        "git.status",
+        "git.unstage",
+    ] {
+        assert!(!executable.contains(disabled));
+        let error = registry
+            .invoke(
+                disabled,
+                KernelToolInvocation {
+                    id: format!("disabled-{disabled}"),
+                    tool_id: disabled.to_owned(),
+                    input: serde_json::json!({}),
+                },
+                context(Path::new(".")),
+            )
+            .expect_err("Disabled tools must not have executable bindings");
+        assert!(format!("{error}").contains("no executable binding"));
+    }
 }
 
 #[test]
@@ -169,7 +183,7 @@ fn executor_registry_rejects_invocation_identity_mismatch() {
 }
 
 #[test]
-fn executable_tool_contracts_have_exactly_one_runtime_binding() {
+fn ready_v2_tools_have_exactly_one_runtime_binding() {
     let registry = KernelToolRegistry::default();
     let executors = builtin_executors(
         &registry,
@@ -186,25 +200,21 @@ fn executable_tool_contracts_have_exactly_one_runtime_binding() {
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(binding_ids.len(), unique_binding_ids.len());
 
-    for template in registry.contracts() {
+    let inventory = registry
+        .tool_inventory_v2()
+        .expect("compiled v2 inventory must validate");
+    for descriptor in inventory.tools {
         let binding_count = binding_ids
             .iter()
-            .filter(|tool_id| tool_id.as_str() == template.tool_id)
+            .filter(|tool_id| tool_id.as_str() == descriptor.tool_id.as_str())
             .count();
-        match template.execution.execution_mode {
-            OperationExecutionMode::Execute => assert_eq!(
-                binding_count, 1,
-                "executable tool {} requires exactly one runtime binding",
-                template.tool_id
-            ),
-            OperationExecutionMode::PreviewOnly | OperationExecutionMode::Blocked => {
-                assert_eq!(
-                    binding_count, 0,
-                    "non-executable tool {} must not have a runtime binding",
-                    template.tool_id
-                );
-            }
-        }
+        let expected =
+            usize::from(descriptor.availability == deepcode_kernel_abi::ToolAvailabilityV2::Ready);
+        assert_eq!(
+            binding_count, expected,
+            "v2 tool {} has {binding_count} runtime binding(s); expected {expected}",
+            descriptor.tool_id
+        );
     }
 }
 
@@ -336,111 +346,6 @@ async fn controlled_http_backend_is_safe_inside_tokio_runtime() {
     server.join().expect("temporary endpoint exits");
     assert_eq!(result.output["untrustedEvidence"], true);
     assert_eq!(result.output["content"], "runtime-safe evidence");
-}
-
-#[test]
-fn supervised_git_backend_reports_real_repository_status() {
-    let workspace = TempWorkspace::new("git-status");
-    git_output(&workspace.0, &["init"]).expect("initialize repository");
-    git_output(&workspace.0, &["config", "user.name", "DeepCode Test"])
-        .expect("set repository identity");
-    git_output(
-        &workspace.0,
-        &["config", "user.email", "test@example.invalid"],
-    )
-    .expect("set repository identity email");
-    fs::write(workspace.0.join("tracked.txt"), "content\n").unwrap();
-
-    let result = GitStatusExecutor
-        .invoke(
-            KernelToolInvocation {
-                id: "git-status-test".to_string(),
-                tool_id: "git.status".to_string(),
-                input: serde_json::json!({}),
-            },
-            context(&workspace.0),
-        )
-        .expect("git status executor succeeds");
-    assert!(result.output["changes"]
-        .as_array()
-        .is_some_and(|items| !items.is_empty()));
-}
-
-#[test]
-fn supervised_git_backend_runs_v1_write_workflow() {
-    let workspace = TempWorkspace::new("git-write-workflow");
-    git_output(&workspace.0, &["init"]).expect("initialize repository");
-    git_output(&workspace.0, &["config", "user.name", "DeepCode Test"])
-        .expect("set repository identity");
-    git_output(
-        &workspace.0,
-        &["config", "user.email", "test@example.invalid"],
-    )
-    .expect("set repository identity email");
-    fs::write(workspace.0.join("tracked.txt"), "initial\n").unwrap();
-    git_output(&workspace.0, &["add", "--", "tracked.txt"]).expect("stage initial file");
-    git_output(&workspace.0, &["commit", "-m", "initial"]).expect("commit initial file");
-    fs::write(workspace.0.join("tracked.txt"), "updated\n").unwrap();
-    let context = context(&workspace.0);
-
-    let diff = GitDiffExecutor
-        .invoke(
-            KernelToolInvocation {
-                id: "git-diff-test".to_string(),
-                tool_id: "git.diff".to_string(),
-                input: serde_json::json!({ "path": "tracked.txt" }),
-            },
-            context.clone(),
-        )
-        .expect("git diff succeeds");
-    assert!(diff.output["diff"]
-        .as_str()
-        .is_some_and(|value| value.contains("updated")));
-
-    GitStageExecutor
-        .invoke(
-            KernelToolInvocation {
-                id: "git-stage-test".to_string(),
-                tool_id: "git.stage".to_string(),
-                input: serde_json::json!({ "paths": ["tracked.txt"] }),
-            },
-            context.clone(),
-        )
-        .expect("git stage succeeds");
-    GitUnstageExecutor
-        .invoke(
-            KernelToolInvocation {
-                id: "git-unstage-test".to_string(),
-                tool_id: "git.unstage".to_string(),
-                input: serde_json::json!({ "paths": ["tracked.txt"] }),
-            },
-            context.clone(),
-        )
-        .expect("git unstage succeeds");
-    GitStageExecutor
-        .invoke(
-            KernelToolInvocation {
-                id: "git-restage-test".to_string(),
-                tool_id: "git.stage".to_string(),
-                input: serde_json::json!({ "paths": ["tracked.txt"] }),
-            },
-            context.clone(),
-        )
-        .expect("git restage succeeds");
-    let commit = GitCommitExecutor
-        .invoke(
-            KernelToolInvocation {
-                id: "git-commit-test".to_string(),
-                tool_id: "git.commit".to_string(),
-                input: serde_json::json!({ "message": "update tracked content" }),
-            },
-            context,
-        )
-        .expect("git commit succeeds");
-    assert_eq!(commit.output["committed"], true);
-    assert!(commit.output["commitSha"]
-        .as_str()
-        .is_some_and(|value| !value.is_empty()));
 }
 
 #[test]

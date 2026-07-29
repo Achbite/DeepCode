@@ -36,6 +36,7 @@ for script in \
   scripts/package-macos.sh \
   scripts/tests/static-contracts.sh \
   scripts/tests/repository-required.sh \
+  scripts/tests/kernel-v2-contracts.sh \
   scripts/tests/session-smoke.sh
 do
   bash -n "$script"
@@ -50,6 +51,14 @@ compile(path.read_text(encoding="utf-8"), str(path), "exec")
 PY
 
 /usr/bin/python3 -I -S - "$ROOT_DIR/scripts/test-change-gate.py" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+compile(path.read_text(encoding="utf-8"), str(path), "exec")
+PY
+
+/usr/bin/python3 -I -S - "$ROOT_DIR/scripts/tests/legacy-cutover-contracts.py" <<'PY'
 from pathlib import Path
 import sys
 

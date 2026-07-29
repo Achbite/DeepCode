@@ -21,6 +21,3 @@ pub use tool_protocol_v2::*;
 pub use transport_v2::*;
 pub use user_decision_v2::*;
 pub use workspace::*;
-
-#[cfg(test)]
-mod tests;

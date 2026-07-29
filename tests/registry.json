@@ -19,7 +19,8 @@
     "required": {
       "description": "Authoritative repository integration gate containing every and only requiredGate suite; it never runs smoke checks or degrades to host static checks.",
       "suites": [
-        "repository.required"
+        "repository.required",
+        "kernel.v2.contracts"
       ]
     },
     "static": {
@@ -41,6 +42,7 @@
       "description": "Non-authoritative run of the required integration gate followed by every registered smoke group.",
       "suites": [
         "repository.required",
+        "kernel.v2.contracts",
         "session.smoke.communication",
         "session.smoke.tools",
         "session.smoke.paths",
@@ -77,12 +79,15 @@
         "scripts/branch-flow.sh",
         "tests/protected-paths.json",
         "scripts/check-architecture.sh",
-        "scripts/test-branch-flow.sh"
+        "scripts/test-branch-flow.sh",
+        "scripts/tests/repository-required.sh",
+        "scripts/tests/kernel-v2-contracts.sh",
+        "scripts/tests/legacy-cutover-contracts.py"
       ]
     },
     {
       "id": "repository.required",
-      "description": "Required Rust, TypeScript build, daemon, Host Web, and IPC integration checks.",
+      "description": "Required production builds and v2 legacy-cutover semantic contracts.",
       "layer": "cross-layer",
       "kind": "integration",
       "owner": "repository",
@@ -101,14 +106,54 @@
         "hostPolicy": "explicit-opt-in",
         "hostOptInEnv": "DEEPCODE_ALLOW_HOST_TEST"
       },
+      "resources": [],
+      "contractSources": [
+        "scripts/tests/repository-required.sh",
+        "scripts/tests/legacy-cutover-contracts.py"
+      ]
+    },
+    {
+      "id": "kernel.v2.contracts",
+      "description": "Required Kernel v2 ABI, fact store, registry, policy, grant, invocation, replay, and recovery contracts.",
+      "layer": "kernel",
+      "kind": "contract",
+      "owner": "kernel",
+      "approvalClass": "test-runtime",
+      "requiredGate": true,
+      "transitional": false,
+      "runner": {
+        "type": "shell",
+        "path": "scripts/tests/kernel-v2-contracts.sh",
+        "args": [],
+        "timeoutSeconds": 3600,
+        "terminateGraceSeconds": 10
+      },
+      "environment": {
+        "container": "optional",
+        "hostPolicy": "allowed"
+      },
       "resources": [
-        "kernel-daemon",
-        "host-web-proxy",
-        "temporary-config-directory",
-        "temporary-logs"
+        "test-owned-temporary-directories",
+        "test-owned-sqlite-databases"
       ],
       "contractSources": [
-        "scripts/tests/repository-required.sh"
+        "scripts/tests/kernel-v2-contracts.sh",
+        "crates/deepcode-kernel-abi/tests/root_roundtrip.rs",
+        "crates/deepcode-kernel-abi/tests/v2_wire_contract.rs",
+        "crates/deepcode-kernel-ledger/tests/v2_ledger_contract.rs",
+        "crates/deepcode-kernel-client/src/lib.rs",
+        "crates/deepcode-kernel-policy/src/tests.rs",
+        "crates/deepcode-kernel-tools/tests/v2_registry_contract.rs",
+        "crates/deepcode-kernel-runtime/src/executors/tests.rs",
+        "crates/deepcode-kernel-runtime/src/v2/authority.rs",
+        "crates/deepcode-kernel-runtime/src/tests.rs",
+        "crates/deepcode-kernel-runtime/src/tests/v2_grant_tests.rs",
+        "crates/deepcode-kernel-runtime/src/tests/v2_invocation_tests.rs",
+        "crates/deepcode-kernel-runtime/src/tests/v2_unified_tests.rs",
+        "crates/deepcode-kernel-daemon/src/agent_api_tests.rs",
+        "crates/deepcode-kernel-daemon/src/llm_stream_parser.rs",
+        "shells/cli/src/main.rs",
+        "shells/cli/src/cli_tests.rs"
       ]
     },
     {

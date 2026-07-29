@@ -34,6 +34,7 @@ const MAX_AUTHORITY_MATERIAL_PAYLOAD_BYTES: usize = 5 * 1024 * 1024;
 const MAX_AUTHORITY_MATERIAL_TOKEN_BYTES: usize = 256;
 const MAX_DURABLE_CONTINUATIONS_GLOBAL: u64 = 8_192;
 const MAX_DURABLE_CONTINUATIONS_PER_RUN: u64 = 1_024;
+const CAPABILITY_LEASE_AUTHORITY_MATERIAL_KIND: &str = "capabilityLease";
 static MEMORY_DATABASE_ID: AtomicU64 = AtomicU64::new(1);
 
 pub const FACT_STORE_PATH_ENV: &str = "DEEPCODE_KERNEL_FACT_STORE_PATH";
@@ -2404,6 +2405,53 @@ fn insert_authority_material(
     Ok(())
 }
 
+fn is_versioned_lease_replacement(
+    existing: &AuthorityMaterialRecordV2,
+    replacement: &AuthorityMaterialDraftV2,
+    fact: &KernelFactEnvelopeV2,
+) -> bool {
+    let (
+        Some(previous_lease),
+        Some(expanded_lease),
+        KernelFactPayloadV2::Authorization(AuthorizationFactV2::ExpansionAllowed {
+            identity,
+            previous_lease_id,
+            previous_scope_digest,
+            expanded_scope_digest,
+            ..
+        }),
+    ) = (&existing.lease, &replacement.lease, &fact.payload)
+    else {
+        return false;
+    };
+
+    existing.material_kind == CAPABILITY_LEASE_AUTHORITY_MATERIAL_KIND
+        && replacement.material_kind == CAPABILITY_LEASE_AUTHORITY_MATERIAL_KIND
+        && existing.material_id == replacement.material_id
+        && existing.material_id == previous_lease.lease_id.as_str()
+        && replacement.material_id == expanded_lease.lease_id.as_str()
+        && existing.run_id == replacement.run_id
+        && existing.control_epoch == replacement.control_epoch
+        && existing.lifecycle == replacement.lifecycle
+        && existing.invocation_id.is_none()
+        && replacement.invocation_id.is_none()
+        && replacement.operation_id.as_ref() == Some(&identity.operation_id)
+        && identity.run_id == replacement.run_id
+        && identity.control_epoch.get() == replacement.control_epoch
+        && previous_lease.lease_id == expanded_lease.lease_id
+        && previous_lease.lease_id == identity.lease_id
+        && previous_lease_id == &previous_lease.lease_id
+        && previous_lease.scope_digest == *previous_scope_digest
+        && expanded_lease.scope_digest == *expanded_scope_digest
+        && previous_scope_digest != expanded_scope_digest
+        && expanded_lease.version == identity.lease_version
+        && previous_lease
+            .version
+            .get()
+            .checked_add(1)
+            .is_some_and(|next| next == expanded_lease.version.get())
+}
+
 fn replace_authority_material(
     transaction: &Transaction<'_>,
     expected_lifecycle: String,
@@ -2422,14 +2470,15 @@ fn replace_authority_material(
             "authority material identity does not exist",
         )
     })?;
+    let stable_subject = existing.operation_id == material.operation_id
+        && existing.invocation_id == material.invocation_id;
     if existing.lifecycle != expected_lifecycle
         || expected_payload_digest
             .as_ref()
             .is_some_and(|digest| digest != &existing.payload_digest)
         || existing.run_id != material.run_id
         || existing.control_epoch != material.control_epoch
-        || existing.operation_id != material.operation_id
-        || existing.invocation_id != material.invocation_id
+        || (!stable_subject && !is_versioned_lease_replacement(&existing, &material, fact))
     {
         return Err(store_error_message(
             "replace_authority_material",
@@ -2447,19 +2496,23 @@ fn replace_authority_material(
         .execute(
             "UPDATE authority_material
              SET lifecycle = ?3,
-                 lease_id = ?4,
-                 lease_version = ?5,
-                 lease_scope_digest = ?6,
-                 payload_digest = ?7,
-                 payload_json = ?8,
-                 last_fact_id = ?9,
-                 last_ledger_sequence = ?10
+                 operation_id = ?4,
+                 invocation_id = ?5,
+                 lease_id = ?6,
+                 lease_version = ?7,
+                 lease_scope_digest = ?8,
+                 payload_digest = ?9,
+                 payload_json = ?10,
+                 last_fact_id = ?11,
+                 last_ledger_sequence = ?12
              WHERE material_kind = ?1 AND material_id = ?2
-               AND lifecycle = ?11 AND payload_digest = ?12",
+               AND lifecycle = ?13 AND payload_digest = ?14",
             params![
                 material.material_kind,
                 material.material_id,
                 material.lifecycle,
+                material.operation_id.as_ref().map(|value| value.as_str()),
+                material.invocation_id.as_ref().map(|value| value.as_str()),
                 material.lease.as_ref().map(|value| value.lease_id.as_str()),
                 material
                     .lease

@@ -25,7 +25,8 @@ SMOKE_SUITE_IDS = [
     "session.smoke.paths",
     "session.smoke.authorization",
 ]
-ALL_SUITE_IDS = ["repository.static", "repository.required", *SMOKE_SUITE_IDS]
+REQUIRED_SUITE_IDS = ["repository.required", "kernel.v2.contracts"]
+ALL_SUITE_IDS = ["repository.static", *REQUIRED_SUITE_IDS, *SMOKE_SUITE_IDS]
 
 
 def load_controller():
@@ -52,7 +53,7 @@ def assert_registry_and_selection(controller) -> None:
 
     default_args = argparse.Namespace(profile=None, suite=None)
     suite_ids, selected_by = controller.select_suite_ids(data, suites, default_args)
-    assert suite_ids == ["repository.required"]
+    assert suite_ids == REQUIRED_SUITE_IDS
     assert selected_by == "profile:required"
 
     static_args = argparse.Namespace(profile="static", suite=None)
@@ -67,7 +68,7 @@ def assert_registry_and_selection(controller) -> None:
 
     full_args = argparse.Namespace(profile="full", suite=None)
     suite_ids, selected_by = controller.select_suite_ids(data, suites, full_args)
-    assert suite_ids == ["repository.required", *SMOKE_SUITE_IDS]
+    assert suite_ids == [*REQUIRED_SUITE_IDS, *SMOKE_SUITE_IDS]
     assert selected_by == "profile:full"
 
     weakened = copy.deepcopy(data)
@@ -98,7 +99,7 @@ def assert_registry_and_selection(controller) -> None:
         raise AssertionError("self-declared test review model was accepted")
 
     omitted = copy.deepcopy(data)
-    omitted["profiles"]["required"]["suites"] = ["repository.static"]
+    omitted["profiles"]["required"]["suites"] = ["repository.required"]
     try:
         controller.validate_registry(omitted, ROOT)
     except controller.ControllerError as error:
@@ -236,6 +237,11 @@ def assert_internal_runners_are_guarded() -> None:
     for runner, arguments, expected in (
         ("session-smoke.sh", ["communication"], "use bash ./test.sh --profile smoke"),
         ("repository-required.sh", [], "use bash ./test.sh"),
+        (
+            "kernel-v2-contracts.sh",
+            [],
+            "use bash ./test.sh --suite kernel.v2.contracts",
+        ),
     ):
         completed = subprocess.run(
             ["bash", str(ROOT / "scripts" / "tests" / runner), *arguments],
@@ -325,7 +331,7 @@ def assert_isolated_public_entrypoint() -> None:
             "profiles": {
                 "required": {
                     "description": "Required fixture profile.",
-                    "suites": ["repository.required"],
+                    "suites": ["repository.required", "kernel.v2.contracts"],
                 },
                 "static": {
                     "description": "Static fixture profile.",
@@ -339,12 +345,14 @@ def assert_isolated_public_entrypoint() -> None:
                     "description": "Full fixture profile.",
                     "suites": [
                         "repository.required",
+                        "kernel.v2.contracts",
                         "session.smoke.fixture",
                     ],
                 },
             },
             "suites": [
                 fixture_suite("repository.required", True),
+                fixture_suite("kernel.v2.contracts", True),
                 fixture_suite("repository.static", False),
                 fixture_suite("session.smoke.fixture", False, kind="smoke"),
             ],
@@ -372,6 +380,7 @@ def assert_isolated_public_entrypoint() -> None:
         assert payload["defaultProfile"] == "required"
         assert [suite["id"] for suite in payload["suites"]] == [
             "repository.required",
+            "kernel.v2.contracts",
             "repository.static",
             "session.smoke.fixture",
         ]
@@ -395,6 +404,7 @@ def assert_isolated_public_entrypoint() -> None:
         assert receipt["selectedAssets"]["headBound"] is True
         assert receipt["worktree"]["indexTrusted"] is True
         assert receipt["results"][0]["id"] == "repository.required"
+        assert receipt["results"][1]["id"] == "kernel.v2.contracts"
 
         required_receipt = run_receipt("--profile", "required")
         assert required_receipt["authoritative"] is True

@@ -3853,8 +3853,9 @@ fn edge_kind_matches(predecessor: &KernelFactPayloadV2, current: &KernelFactPayl
         KernelFactPayloadV2::Authorization(AuthorizationFactV2::ContextInvalidated { .. }) => {
             matches!(
                 predecessor,
-                KernelFactPayloadV2::Control(ControlFactV2::EpochAdvanced { .. })
-                    | KernelFactPayloadV2::Authorization(_)
+                KernelFactPayloadV2::Control(
+                    ControlFactV2::EpochAdvanced { .. } | ControlFactV2::RunOpened { .. }
+                ) | KernelFactPayloadV2::Authorization(_)
             )
         }
         KernelFactPayloadV2::Authorization(_) => false,

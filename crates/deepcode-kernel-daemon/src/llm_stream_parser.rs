@@ -113,7 +113,7 @@ pub(crate) fn parse_openai_compatible_sse_text(text: &str) -> LlmChatOutput {
     accumulator.output()
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn openai_stream_events_from_data(
     accumulator: &mut OpenAiCompatibleStreamAccumulator,
     data: &str,

@@ -473,25 +473,49 @@ mod tests {
     }
 
     #[test]
-    fn decodes_real_audit_verify_event() {
-        let result = decode_audit_verify(KernelReply {
-            ok: true,
-            events: vec![KernelEvent::AuditVerifyCompleted {
-                request_id: Some(RequestId("req-audit".to_string())),
-                ok: true,
-                report: json!({
-                    "degraded": true,
-                    "message": "audit chain verified"
-                }),
-                sequence: None,
-            }],
-            snapshot: None,
-            error: None,
-        })
-        .expect("decode audit verification result");
+    fn host_shell_capability_debug_output_is_redacted() {
+        let capability = format!("dchostv2_{}", "a".repeat(64));
+        let config = KernelClientConfig::new("http://127.0.0.1:31245")
+            .with_host_shell_capability(capability.clone());
+        let debug = format!("{config:?}");
 
-        assert_eq!(result.status, "verified");
-        assert!(result.degraded);
-        assert_eq!(result.message, "audit chain verified");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains(&capability));
+    }
+
+    #[test]
+    fn host_shell_capability_is_required_and_validated() {
+        let missing = KernelClientConfig {
+            base_url: "http://127.0.0.1:31245".to_owned(),
+            host_shell_capability: None,
+        };
+        assert!(matches!(
+            HttpKernelClient::new(missing),
+            Err(KernelClientError::HostAdmissionCapabilityMissing)
+        ));
+
+        let invalid = KernelClientConfig {
+            base_url: "http://127.0.0.1:31245".to_owned(),
+            host_shell_capability: Some(HostShellCapabilityV2::new("short")),
+        };
+        assert!(matches!(
+            HttpKernelClient::new(invalid),
+            Err(KernelClientError::HostAdmissionCapabilityInvalid)
+        ));
+    }
+
+    #[test]
+    fn session_kernel_v2_client_rejects_non_loopback_origins() {
+        let run_capability =
+            deepcode_kernel_abi::RunCapabilityV2::new("run-capability-secret-0001")
+                .expect("valid run capability");
+
+        assert!(matches!(
+            SessionKernelV2Client::new(
+                KernelClientConfig::new("https://example.com"),
+                run_capability
+            ),
+            Err(KernelV2ClientError::InvalidBaseUrl)
+        ));
     }
 }

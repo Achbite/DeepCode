@@ -47,6 +47,3 @@ pub fn hash_bytes(bytes: &[u8]) -> String {
     }
     output
 }
-
-#[cfg(test)]
-mod tests;

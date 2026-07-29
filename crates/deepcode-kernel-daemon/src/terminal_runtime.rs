@@ -775,23 +775,7 @@ mod tests {
             session["cwd"].as_str(),
             Some(cwd.to_string_lossy().as_ref())
         );
-        let resource = runtime
-            .resources
-            .list()
-            .into_iter()
-            .find(|resource| {
-                matches!(
-                    &resource.metadata,
-                    KernelResourceMetadata::TerminalSession { terminal_id, .. }
-                        if terminal_id == &session_id
-                ) && resource.state == deepcode_kernel_abi::KernelResourceState::Active
-            })
-            .expect("terminal resource");
-        assert_eq!(resource.kind, KernelResourceKind::TerminalSession);
-        assert_eq!(
-            resource.owner.kind,
-            deepcode_kernel_abi::KernelResourceOwnerKind::UserSession
-        );
+        assert_eq!(session["owner"].as_str(), Some(HOST_TERMINAL_OWNER));
 
         runtime
             .resize(&session_id, 80, 20)
@@ -821,16 +805,17 @@ mod tests {
             .restart(&session_id)
             .expect("restart terminal session");
         assert_eq!(restarted["id"].as_str(), Some(session_id.as_str()));
-        runtime
+        assert_eq!(restarted["owner"].as_str(), Some(HOST_TERMINAL_OWNER));
+        let deleted = runtime
             .delete(&session_id)
             .expect("delete terminal session");
+        assert_eq!(deleted["status"].as_str(), Some("exited"));
+        assert_eq!(deleted["owner"].as_str(), Some(HOST_TERMINAL_OWNER));
+        assert!(
+            deleted["exitCode"].is_i64() || deleted["exitCode"].is_u64(),
+            "delete must synchronously terminate and wait for the owned child"
+        );
         assert!(runtime.sessions_json().is_empty());
-        assert!(runtime.resources.list().into_iter().all(|resource| {
-            !matches!(
-                &resource.metadata,
-                KernelResourceMetadata::TerminalSession { terminal_id, .. }
-                    if terminal_id == &session_id
-            ) || resource.state == deepcode_kernel_abi::KernelResourceState::Released
-        }));
+        assert!(runtime.events(&session_id, 0).is_empty());
     }
 }

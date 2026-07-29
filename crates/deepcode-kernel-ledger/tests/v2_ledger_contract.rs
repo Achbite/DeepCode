@@ -1,7 +1,7 @@
 use deepcode_kernel_abi::v2::{
-    AttemptId, CancelRequestId, CausalIdentityV2, ControlEpoch, ControlFactKindV2, ControlFactV2,
-    CorrelationRefV2, EffectFactV2, EffectId, EffectOutcomeV2, FactId, GrantId, GrantReservationId,
-    InputId, InvocationId, KernelFactDraftV2, KernelFactPayloadV2, OperationId, ResourceId, RunId,
+    CancelRequestId, CancellationIdentityV2, CancellationReasonCodeV2, CancellationSourceV2,
+    ControlEpoch, ControlFactV2, FactId, InvocationId, KernelFactDraftV2, KernelFactPayloadV2,
+    RunId,
 };
 use deepcode_kernel_ledger::v2::{CanonicalFactStore, FactQueryV2};
 use std::collections::{BTreeMap, BTreeSet};
@@ -51,86 +51,63 @@ impl Drop for TestRoot {
     }
 }
 
-fn identity(run_id: &str, epoch: u64) -> CausalIdentityV2 {
-    CausalIdentityV2 {
-        run_id: RunId::from(run_id),
-        control_epoch: ControlEpoch::new(epoch).expect("non-zero epoch"),
-        operation_id: None,
-        capability_grant_id: None,
-        grant_reservation_id: None,
-        invocation_id: None,
-        attempt_id: None,
-        causation_id: None,
-        correlation_refs: Vec::new(),
-        idempotency_key_hash: None,
+fn fact_id(value: impl Into<String>) -> FactId {
+    FactId::new(value).expect("valid fact id")
+}
+
+fn run_id(value: impl Into<String>) -> RunId {
+    RunId::new(value).expect("valid run id")
+}
+
+fn recover(store: &CanonicalFactStore) {
+    let mut recovery = store
+        .claim_recovery_admin()
+        .expect("claim startup recovery");
+    recovery
+        .rebuild_materialized_state()
+        .expect("complete startup recovery");
+}
+
+fn control_draft(fact: &str, run: &str, epoch: u64) -> KernelFactDraftV2 {
+    KernelFactDraftV2 {
+        fact_id: fact_id(fact),
+        payload: KernelFactPayloadV2::Control(ControlFactV2::RunTransportRebound {
+            run_id: run_id(run),
+            control_epoch: ControlEpoch::new(epoch).expect("non-zero epoch"),
+            transport_generation: epoch + 1,
+            causation_fact_id: fact_id(format!("cause-{fact}")),
+        }),
     }
 }
 
-fn control_draft(fact_id: &str, run_id: &str, epoch: u64) -> KernelFactDraftV2 {
-    KernelFactDraftV2::new(
-        FactId::from(fact_id),
-        format!("2026-07-26T04:00:{epoch:02}Z"),
-        identity(run_id, epoch),
-        KernelFactPayloadV2::Control(ControlFactV2 {
-            kind: ControlFactKindV2::EpochAdvanced,
-            input_id: Some(InputId::from(format!("input-{fact_id}"))),
-            cancel_request_id: None::<CancelRequestId>,
-            previous_epoch: (epoch > 1)
-                .then(|| ControlEpoch::new(epoch - 1).expect("previous epoch")),
-            target_invocation_id: None,
+fn cancellation_draft(fact: &str, run: &str, epoch: u64, invocation: &str) -> KernelFactDraftV2 {
+    KernelFactDraftV2 {
+        fact_id: fact_id(fact),
+        payload: KernelFactPayloadV2::Control(ControlFactV2::CancellationRequested {
+            identity: CancellationIdentityV2 {
+                run_id: run_id(run),
+                control_epoch: ControlEpoch::new(epoch).expect("non-zero epoch"),
+                invocation_id: InvocationId::new(invocation).expect("invocation id"),
+                cancel_request_id: CancelRequestId::new(format!("cancel-{fact}"))
+                    .expect("cancel request id"),
+                causation_fact_id: fact_id(format!("cause-{fact}")),
+            },
+            source: CancellationSourceV2::ExplicitCommand,
+            reason_code: CancellationReasonCodeV2::UserRequested,
             reason: None,
         }),
-    )
-}
-
-struct EffectIdentity<'a> {
-    run_id: &'a str,
-    operation_id: &'a str,
-    invocation_id: &'a str,
-    attempt_id: &'a str,
-    grant_id: &'a str,
-    reservation_id: &'a str,
-    resource_id: &'a str,
-    epoch: u64,
-}
-
-fn effect_draft(fact_id: &str, values: EffectIdentity<'_>) -> KernelFactDraftV2 {
-    let invocation_id = InvocationId::from(values.invocation_id);
-    let attempt_id = AttemptId::from(values.attempt_id);
-    let resource_id = ResourceId::from(values.resource_id);
-    KernelFactDraftV2::new(
-        FactId::from(fact_id),
-        format!("2026-07-26T05:00:{:02}Z", values.epoch),
-        CausalIdentityV2 {
-            run_id: RunId::from(values.run_id),
-            control_epoch: ControlEpoch::new(values.epoch).expect("non-zero epoch"),
-            operation_id: Some(OperationId::from(values.operation_id)),
-            capability_grant_id: Some(GrantId::from(values.grant_id)),
-            grant_reservation_id: Some(GrantReservationId::from(values.reservation_id)),
-            invocation_id: Some(invocation_id.clone()),
-            attempt_id: Some(attempt_id.clone()),
-            causation_id: Some(FactId::from(format!("cause-{fact_id}"))),
-            correlation_refs: vec![CorrelationRefV2 {
-                kind: "source".to_string(),
-                value: format!("source-{}", values.operation_id),
-            }],
-            idempotency_key_hash: Some(format!("hash-{}", values.operation_id)),
-        },
-        KernelFactPayloadV2::Effect(EffectFactV2 {
-            effect_id: EffectId::from(format!("effect-{fact_id}")),
-            invocation_id,
-            attempt_id,
-            outcome: EffectOutcomeV2::Observed,
-            affected_resources: vec![resource_id],
-            receipt: Some(serde_json::json!({"factId": fact_id})),
-        }),
-    )
+    }
 }
 
 #[test]
 fn v2_append_batch_is_atomic_and_monotonic_per_run() {
     let store = CanonicalFactStore::open_in_memory().expect("open memory store");
-    let committed = store
+    recover(&store);
+    let writer = store
+        .claim_authority_writer()
+        .expect("claim authority writer");
+    let reader = store.reader();
+    let committed = writer
         .append_batch(vec![
             control_draft("fact-a1", "run-a", 1),
             control_draft("fact-b1", "run-b", 1),
@@ -154,12 +131,12 @@ fn v2_append_batch_is_atomic_and_monotonic_per_run() {
     );
 
     let duplicate = control_draft("duplicate", "run-a", 3);
-    assert!(store
+    assert!(writer
         .append_batch(vec![duplicate.clone(), duplicate])
         .is_err());
-    assert_eq!(store.ledger_sequence_high_water().unwrap(), 3);
+    assert_eq!(reader.ledger_sequence_high_water().unwrap(), 3);
 
-    let next = store
+    let next = writer
         .append(control_draft("fact-a3", "run-a", 3))
         .expect("append after rolled-back batch");
     assert_eq!(next.ledger_sequence, 4);
@@ -169,15 +146,21 @@ fn v2_append_batch_is_atomic_and_monotonic_per_run() {
 #[test]
 fn v2_concurrent_append_allocates_unique_sequences() {
     let store = CanonicalFactStore::open_in_memory().expect("open memory store");
-    let participants = 64;
+    recover(&store);
+    let writer = Arc::new(
+        store
+            .claim_authority_writer()
+            .expect("claim authority writer"),
+    );
+    let participants = 32;
     let barrier = Arc::new(Barrier::new(participants));
     let mut handles = Vec::new();
     for index in 0..participants {
-        let store = store.clone();
-        let barrier = barrier.clone();
+        let writer = Arc::clone(&writer);
+        let barrier = Arc::clone(&barrier);
         handles.push(thread::spawn(move || {
             barrier.wait();
-            store
+            writer
                 .append(control_draft(
                     &format!("fact-{index}"),
                     &format!("run-{}", index % 4),
@@ -204,73 +187,47 @@ fn v2_concurrent_append_allocates_unique_sequences() {
     let mut per_run = BTreeMap::<String, BTreeSet<u64>>::new();
     for fact in facts {
         per_run
-            .entry(fact.identity.run_id.as_str().to_string())
+            .entry(fact.payload.run_id().as_str().to_owned())
             .or_default()
             .insert(fact.run_sequence);
     }
     assert_eq!(per_run.len(), 4);
     for sequences in per_run.values() {
-        assert_eq!(sequences, &(1..=16).collect());
+        assert_eq!(sequences, &(1..=8).collect());
     }
 }
 
 #[test]
-fn v2_identity_query_filters_are_exact_and_composable() {
+fn v2_fact_query_filters_are_exact_and_composable() {
     let store = CanonicalFactStore::open_in_memory().expect("open memory store");
-    store
+    recover(&store);
+    let writer = store
+        .claim_authority_writer()
+        .expect("claim authority writer");
+    let reader = store.reader();
+    writer
         .append_batch(vec![
-            effect_draft(
-                "fact-1",
-                EffectIdentity {
-                    run_id: "run-1",
-                    operation_id: "operation-1",
-                    invocation_id: "invocation-1",
-                    attempt_id: "attempt-1",
-                    grant_id: "grant-1",
-                    reservation_id: "reservation-1",
-                    resource_id: "resource-1",
-                    epoch: 1,
-                },
-            ),
-            effect_draft(
-                "fact-2",
-                EffectIdentity {
-                    run_id: "run-1",
-                    operation_id: "operation-2",
-                    invocation_id: "invocation-2",
-                    attempt_id: "attempt-2",
-                    grant_id: "grant-2",
-                    reservation_id: "reservation-2",
-                    resource_id: "resource-2",
-                    epoch: 2,
-                },
-            ),
+            cancellation_draft("fact-1", "run-1", 1, "invocation-1"),
+            cancellation_draft("fact-2", "run-1", 2, "invocation-2"),
         ])
-        .expect("append effect facts");
+        .expect("append cancellation facts");
 
-    let matched = store
+    let matched = reader
         .query(&FactQueryV2 {
-            run_id: Some("run-1".to_string()),
-            operation_id: Some("operation-2".to_string()),
-            invocation_id: Some("invocation-2".to_string()),
-            attempt_id: Some("attempt-2".to_string()),
-            capability_grant_id: Some("grant-2".to_string()),
-            grant_reservation_id: Some("reservation-2".to_string()),
-            causation_id: Some("cause-fact-2".to_string()),
-            idempotency_key_hash: Some("hash-operation-2".to_string()),
-            correlation_ref: Some(("source".to_string(), "source-operation-2".to_string())),
+            run_id: Some("run-1".to_owned()),
+            invocation_id: Some("invocation-2".to_owned()),
+            causation_id: Some("cause-fact-2".to_owned()),
             control_epoch: Some(2),
-            resource_id: Some("resource-2".to_string()),
             ..FactQueryV2::default()
         })
-        .expect("query exact causal identity");
+        .expect("query exact fact identity");
     assert_eq!(matched.len(), 1);
     assert_eq!(matched[0].fact_id.as_str(), "fact-2");
 
-    assert!(store
+    assert!(reader
         .query(&FactQueryV2 {
-            invocation_id: Some("invocation-2".to_string()),
-            resource_id: Some("resource-1".to_string()),
+            invocation_id: Some("invocation-2".to_owned()),
+            causation_id: Some("cause-fact-1".to_owned()),
             ..FactQueryV2::default()
         })
         .expect("query mismatched composition")
@@ -278,18 +235,22 @@ fn v2_identity_query_filters_are_exact_and_composable() {
 }
 
 #[test]
-fn v2_replay_rebuilds_indexes_without_rewriting_legacy_bytes() {
+fn v2_rebuild_ignores_and_preserves_unrelated_legacy_bytes() {
     let root = TestRoot::new("replay");
     let database = root.database();
     let legacy = root.path.join("ledger.ndjson");
     let legacy_bytes = b"{\"abiVersion\":\"deepcode.kernel.abi.v1\"}\n";
-    fs::write(&legacy, legacy_bytes).expect("write legacy ledger");
+    fs::write(&legacy, legacy_bytes).expect("write unrelated legacy bytes");
     set_legacy_mode(&legacy, 0o640);
     let initial_mode = legacy_mode(&legacy);
 
     {
         let store = CanonicalFactStore::open(&database).expect("open file store");
-        store
+        recover(&store);
+        let writer = store
+            .claim_authority_writer()
+            .expect("claim authority writer");
+        writer
             .append_batch(vec![
                 control_draft("fact-a1", "run-a", 1),
                 control_draft("fact-a2", "run-a", 2),
@@ -300,10 +261,8 @@ fn v2_replay_rebuilds_indexes_without_rewriting_legacy_bytes() {
 
     {
         let store = CanonicalFactStore::open(&database).expect("reopen file store");
-        store
-            .rebuild_materialized_state()
-            .expect("rebuild materialized indexes");
-        let snapshot = store.snapshot().expect("snapshot after replay");
+        recover(&store);
+        let snapshot = store.reader().snapshot().expect("snapshot after rebuild");
         assert_eq!(snapshot.ledger_sequence_high_water, 3);
         assert_eq!(snapshot.facts.len(), 3);
         let high_waters = snapshot
@@ -311,7 +270,7 @@ fn v2_replay_rebuilds_indexes_without_rewriting_legacy_bytes() {
             .into_iter()
             .map(|entry| {
                 (
-                    entry.run_id.as_str().to_string(),
+                    entry.run_id.as_str().to_owned(),
                     entry.run_sequence_high_water,
                 )
             })
@@ -320,28 +279,36 @@ fn v2_replay_rebuilds_indexes_without_rewriting_legacy_bytes() {
         assert_eq!(high_waters.get("run-b"), Some(&1));
     }
 
-    assert_eq!(fs::read(&legacy).expect("read legacy ledger"), legacy_bytes);
+    assert_eq!(fs::read(&legacy).expect("read legacy bytes"), legacy_bytes);
     assert_eq!(legacy_mode(&legacy), initial_mode);
     root.cleanup();
 }
 
 #[test]
-fn failed_append_is_not_visible_to_queries() {
+fn failed_append_is_not_visible_to_queries_or_outbox() {
     let store = CanonicalFactStore::open_in_memory().expect("open memory store");
+    recover(&store);
+    let writer = store
+        .claim_authority_writer()
+        .expect("claim authority writer");
+    let publisher = store
+        .claim_outbox_publisher()
+        .expect("claim outbox publisher");
+    let reader = store.reader();
     let duplicate = control_draft("same-fact", "run-1", 1);
-    assert!(store
+    assert!(writer
         .append_batch(vec![duplicate.clone(), duplicate])
         .is_err());
-    assert!(store
+    assert!(reader
         .query(&FactQueryV2::default())
         .expect("query after rollback")
         .is_empty());
-    assert!(store
-        .pending_outbox(0, None)
+    assert!(publisher
+        .pending(0, None)
         .expect("outbox after rollback")
         .is_empty());
 
-    let committed = store
+    let committed = writer
         .append(control_draft("first-visible", "run-1", 1))
         .expect("append after rollback");
     assert_eq!(committed.ledger_sequence, 1);
@@ -351,20 +318,27 @@ fn failed_append_is_not_visible_to_queries() {
 #[test]
 fn exact_outbox_ack_does_not_hide_an_earlier_failure() {
     let store = CanonicalFactStore::open_in_memory().expect("open memory store");
-    let facts = store
+    recover(&store);
+    let writer = store
+        .claim_authority_writer()
+        .expect("claim authority writer");
+    let publisher = store
+        .claim_outbox_publisher()
+        .expect("claim outbox publisher");
+    let facts = writer
         .append_batch(vec![
             control_draft("fact-1", "run-1", 1),
             control_draft("fact-2", "run-1", 2),
         ])
         .expect("append outbox facts");
-    store
-        .record_outbox_publish_failure(facts[0].ledger_sequence, "transport unavailable")
+    publisher
+        .record_publish_failure(facts[0].ledger_sequence, "transport unavailable")
         .expect("record publish failure");
-    store
-        .mark_outbox_published(facts[1].ledger_sequence, facts[1].fact_id.as_str())
+    publisher
+        .mark_published(facts[1].ledger_sequence, facts[1].fact_id.as_str())
         .expect("ack exact later fact");
 
-    let pending = store.pending_outbox(0, None).expect("pending outbox");
+    let pending = publisher.pending(0, None).expect("pending outbox");
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].fact_id, "fact-1");
     assert_eq!(pending[0].publish_attempts, 1);
@@ -372,8 +346,8 @@ fn exact_outbox_ack_does_not_hide_an_earlier_failure() {
         pending[0].last_error.as_deref(),
         Some("transport unavailable")
     );
-    assert!(store
-        .mark_outbox_published(facts[0].ledger_sequence, "wrong-fact")
+    assert!(publisher
+        .mark_published(facts[0].ledger_sequence, "wrong-fact")
         .is_err());
 }
 
@@ -382,7 +356,11 @@ fn file_store_uses_wal_and_the_frozen_schema_family() {
     let root = TestRoot::new("schema");
     let database = root.database();
     let store = CanonicalFactStore::open(&database).expect("open file store");
-    store
+    recover(&store);
+    let writer = store
+        .claim_authority_writer()
+        .expect("claim authority writer");
+    writer
         .append(control_draft("fact-1", "run-1", 1))
         .expect("append fact");
 
@@ -410,16 +388,19 @@ fn file_store_uses_wal_and_the_frozen_schema_family() {
     assert_eq!(
         tables,
         [
-            "grant_state",
+            "authority_material",
+            "fact_query_continuation_consumptions",
+            "fact_query_continuations",
             "invocation_state",
             "kernel_facts",
             "outbox",
+            "public_command_receipts",
             "resource_state",
             "run_state",
             "schema_meta",
         ]
         .into_iter()
-        .map(str::to_string)
+        .map(str::to_owned)
         .collect()
     );
     drop(connection);
@@ -431,6 +412,7 @@ fn file_store_uses_wal_and_the_frozen_schema_family() {
         )
         .is_err());
     drop(mutator);
+    drop(writer);
     drop(store);
     root.cleanup();
 }

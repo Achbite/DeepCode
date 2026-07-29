@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "DeepCode Kernel append-only event ledger."
+description = "DeepCode Kernel canonical SQLite fact store."
 
 [dependencies]
 deepcode-kernel-abi.workspace = true

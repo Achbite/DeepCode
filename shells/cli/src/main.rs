@@ -5,10 +5,8 @@ use deepcode_kernel_client::{
 };
 use serde_json::Value;
 use std::env;
-use std::fs;
 use std::io::{self, IsTerminal, Write};
-use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 const EXIT_DAEMON_UNAVAILABLE: i32 = 3;
 const EXIT_BAD_ARGS: i32 = 4;
@@ -489,14 +487,6 @@ pub(crate) struct PendingSessionDecision {
     pub(crate) target_id: String,
 }
 
-pub(crate) fn unique_cli_id() -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    format!("{}-{nanos}", std::process::id())
-}
-
 pub(crate) async fn bootstrap_kernel(
     api: Option<String>,
     no_auto_start_kernel: bool,
@@ -508,11 +498,9 @@ pub(crate) async fn bootstrap_kernel(
 
 mod render;
 mod session;
-mod tools_verify;
 
 pub(crate) use render::*;
 pub(crate) use session::*;
-pub(crate) use tools_verify::*;
 
 #[cfg(test)]
 #[path = "cli_tests.rs"]
