@@ -3,6 +3,7 @@ use crate::*;
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use std::collections::BTreeMap;
 use std::thread;
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
 pub(crate) const DEFAULT_COLS: u16 = 120;
@@ -415,15 +416,18 @@ impl TerminalChildOwner {
     }
 
     fn terminate_and_wait(&mut self) -> Option<i32> {
+        #[cfg(unix)]
         let (child, process_id, process_group_id) = {
             let mut state = lock_terminal_child_state(&self.state);
             let child = state.child.take();
             let process_id = state.process_id.take();
-            #[cfg(unix)]
             let process_group_id = state.process_group_id.take();
-            #[cfg(not(unix))]
-            let process_group_id = None;
             (child, process_id, process_group_id)
+        };
+        #[cfg(not(unix))]
+        let (child, process_id) = {
+            let mut state = lock_terminal_child_state(&self.state);
+            (state.child.take(), state.process_id.take())
         };
 
         #[cfg(unix)]
