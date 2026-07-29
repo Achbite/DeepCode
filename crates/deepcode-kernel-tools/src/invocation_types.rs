@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const MAX_CANONICAL_INVOCATION_BYTES: usize = 1024 * 1024;
-const MAX_LIST_ITEMS_V4: usize = 256;
-const MAX_ORDINARY_STRING_BYTES_V4: usize = 16 * 1024;
+const MAX_LIST_ITEMS: usize = 256;
+const MAX_ORDINARY_STRING_BYTES: usize = 16 * 1024;
 
 fn empty_field(field: &'static str) -> V2ValidationError {
     V2ValidationError::EmptyField { field }
@@ -49,7 +49,7 @@ fn encoded_digest(bytes: [u8; 32]) -> String {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub enum AuthorityToolIdV4 {
+pub enum KernelToolKind {
     #[serde(rename = "code.grep")]
     CodeGrep,
     #[serde(rename = "document.read")]
@@ -90,7 +90,7 @@ pub enum AuthorityToolIdV4 {
     WebSearch,
 }
 
-impl AuthorityToolIdV4 {
+impl KernelToolKind {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::CodeGrep => "code.grep",
@@ -124,7 +124,7 @@ impl AuthorityToolIdV4 {
     rename_all_fields = "camelCase",
     deny_unknown_fields
 )]
-pub enum LineRangeV4 {
+pub enum KernelLineRange {
     Whole {},
     Lines { start_line: u32, end_line: u32 },
 }
@@ -137,14 +137,14 @@ pub enum LineRangeV4 {
     rename_all_fields = "camelCase",
     deny_unknown_fields
 )]
-pub enum DocumentPagesV4 {
+pub enum KernelDocumentPages {
     All {},
     Range { start_page: u32, end_page: u32 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub enum SearchStrategyV4 {
+pub enum KernelSearchStrategy {
     Literal,
     Regex,
 }
@@ -157,7 +157,7 @@ pub enum SearchStrategyV4 {
     rename_all_fields = "camelCase",
     deny_unknown_fields
 )]
-pub enum FileDigestPreconditionV4 {
+pub enum KernelFileDigestPrecondition {
     ExpectedFileDigest { digest: ResourceStateDigestV2 },
     ExpectedBeforeBlock { text: String },
 }
@@ -170,7 +170,7 @@ pub enum FileDigestPreconditionV4 {
     rename_all_fields = "camelCase",
     deny_unknown_fields
 )]
-pub enum EditMatcherV4 {
+pub enum KernelEditMatcher {
     ExactBlock {
         text: String,
     },
@@ -182,7 +182,7 @@ pub enum EditMatcherV4 {
     LineRange {
         start_line: u32,
         end_line: u32,
-        precondition: FileDigestPreconditionV4,
+        precondition: KernelFileDigestPrecondition,
     },
 }
 
@@ -194,7 +194,7 @@ pub enum EditMatcherV4 {
     rename_all_fields = "camelCase",
     deny_unknown_fields
 )]
-pub enum DeleteTargetV4 {
+pub enum KernelDeleteTarget {
     File { path: String },
     DirectoryTree { path: String },
 }
@@ -207,7 +207,7 @@ pub enum DeleteTargetV4 {
     rename_all_fields = "camelCase",
     deny_unknown_fields
 )]
-pub enum GitDiffScopeV4 {
+pub enum KernelGitDiffScope {
     Repository {},
     Paths { paths: Vec<String> },
 }
@@ -219,9 +219,12 @@ pub enum GitDiffScopeV4 {
     rename_all_fields = "camelCase",
     deny_unknown_fields
 )]
-pub enum ToolInvocationInputV4 {
+pub enum KernelCanonicalInvocation {
     #[serde(rename = "fs.read")]
-    FsRead { path: String, range: LineRangeV4 },
+    FsRead {
+        path: String,
+        range: KernelLineRange,
+    },
     #[serde(rename = "fs.list")]
     FsList {
         path: String,
@@ -245,7 +248,7 @@ pub enum ToolInvocationInputV4 {
         query: String,
         include: Vec<String>,
         exclude: Vec<String>,
-        strategy: SearchStrategyV4,
+        strategy: KernelSearchStrategy,
         context_lines: u32,
         max_results: u32,
     },
@@ -260,7 +263,7 @@ pub enum ToolInvocationInputV4 {
     #[serde(rename = "fs.edit")]
     FsEdit {
         path: String,
-        matcher: EditMatcherV4,
+        matcher: KernelEditMatcher,
         replacement: String,
     },
     #[serde(rename = "fs.rename")]
@@ -269,18 +272,21 @@ pub enum ToolInvocationInputV4 {
         destination_path: String,
     },
     #[serde(rename = "fs.delete")]
-    FsDelete(DeleteTargetV4),
+    FsDelete(KernelDeleteTarget),
     #[serde(rename = "fs.ensure_directory")]
     FsEnsureDirectory { path: String },
     #[serde(rename = "document.read")]
     DocumentRead {
         path: String,
-        pages: DocumentPagesV4,
+        pages: KernelDocumentPages,
     },
     #[serde(rename = "git.status")]
     GitStatus {},
     #[serde(rename = "git.diff")]
-    GitDiff { scope: GitDiffScopeV4, staged: bool },
+    GitDiff {
+        scope: KernelGitDiffScope,
+        staged: bool,
+    },
     #[serde(rename = "git.stage")]
     GitStage { paths: Vec<String> },
     #[serde(rename = "git.unstage")]
@@ -293,28 +299,28 @@ pub enum ToolInvocationInputV4 {
     WebFetch { url: String, max_bytes: u32 },
 }
 
-impl ToolInvocationInputV4 {
-    pub fn tool_id(&self) -> AuthorityToolIdV4 {
+impl KernelCanonicalInvocation {
+    pub fn tool_id(&self) -> KernelToolKind {
         match self {
-            Self::FsRead { .. } => AuthorityToolIdV4::FsRead,
-            Self::FsList { .. } => AuthorityToolIdV4::FsList,
-            Self::FsGlob { .. } => AuthorityToolIdV4::FsGlob,
-            Self::FsDiff { .. } => AuthorityToolIdV4::FsDiff,
-            Self::CodeGrep { .. } => AuthorityToolIdV4::CodeGrep,
-            Self::FsCreate { .. } => AuthorityToolIdV4::FsCreate,
-            Self::FsWrite { .. } => AuthorityToolIdV4::FsWrite,
-            Self::FsEdit { .. } => AuthorityToolIdV4::FsEdit,
-            Self::FsRename { .. } => AuthorityToolIdV4::FsRename,
-            Self::FsDelete(_) => AuthorityToolIdV4::FsDelete,
-            Self::FsEnsureDirectory { .. } => AuthorityToolIdV4::FsEnsureDirectory,
-            Self::DocumentRead { .. } => AuthorityToolIdV4::DocumentRead,
-            Self::GitStatus { .. } => AuthorityToolIdV4::GitStatus,
-            Self::GitDiff { .. } => AuthorityToolIdV4::GitDiff,
-            Self::GitStage { .. } => AuthorityToolIdV4::GitStage,
-            Self::GitUnstage { .. } => AuthorityToolIdV4::GitUnstage,
-            Self::GitCommit { .. } => AuthorityToolIdV4::GitCommit,
-            Self::WebSearch { .. } => AuthorityToolIdV4::WebSearch,
-            Self::WebFetch { .. } => AuthorityToolIdV4::WebFetch,
+            Self::FsRead { .. } => KernelToolKind::FsRead,
+            Self::FsList { .. } => KernelToolKind::FsList,
+            Self::FsGlob { .. } => KernelToolKind::FsGlob,
+            Self::FsDiff { .. } => KernelToolKind::FsDiff,
+            Self::CodeGrep { .. } => KernelToolKind::CodeGrep,
+            Self::FsCreate { .. } => KernelToolKind::FsCreate,
+            Self::FsWrite { .. } => KernelToolKind::FsWrite,
+            Self::FsEdit { .. } => KernelToolKind::FsEdit,
+            Self::FsRename { .. } => KernelToolKind::FsRename,
+            Self::FsDelete(_) => KernelToolKind::FsDelete,
+            Self::FsEnsureDirectory { .. } => KernelToolKind::FsEnsureDirectory,
+            Self::DocumentRead { .. } => KernelToolKind::DocumentRead,
+            Self::GitStatus { .. } => KernelToolKind::GitStatus,
+            Self::GitDiff { .. } => KernelToolKind::GitDiff,
+            Self::GitStage { .. } => KernelToolKind::GitStage,
+            Self::GitUnstage { .. } => KernelToolKind::GitUnstage,
+            Self::GitCommit { .. } => KernelToolKind::GitCommit,
+            Self::WebSearch { .. } => KernelToolKind::WebSearch,
+            Self::WebFetch { .. } => KernelToolKind::WebFetch,
         }
     }
 
@@ -330,7 +336,7 @@ impl ToolInvocationInputV4 {
         match self {
             Self::FsRead { path, range } => {
                 validate_path(path, false)?;
-                if let LineRangeV4::Lines {
+                if let KernelLineRange::Lines {
                     start_line,
                     end_line,
                 } = range
@@ -396,13 +402,13 @@ impl ToolInvocationInputV4 {
                 }
             }
             Self::FsDelete(target) => match target {
-                DeleteTargetV4::File { path } | DeleteTargetV4::DirectoryTree { path } => {
+                KernelDeleteTarget::File { path } | KernelDeleteTarget::DirectoryTree { path } => {
                     validate_path(path, false)?
                 }
             },
             Self::DocumentRead { path, pages } => {
                 validate_path(path, false)?;
-                if let DocumentPagesV4::Range {
+                if let KernelDocumentPages::Range {
                     start_page,
                     end_page,
                 } = pages
@@ -415,7 +421,7 @@ impl ToolInvocationInputV4 {
             }
             Self::GitStatus {} => {}
             Self::GitDiff { scope, .. } => {
-                if let GitDiffScopeV4::Paths { paths } = scope {
+                if let KernelGitDiffScope::Paths { paths } = scope {
                     validate_path_list("paths", paths, false)?;
                 }
             }
@@ -444,7 +450,7 @@ impl ToolInvocationInputV4 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub enum TextMediaTypeV4 {
+pub enum KernelTextMediaType {
     TextPlainUtf8,
     TextMarkdownUtf8,
     ApplicationJsonUtf8,
@@ -454,7 +460,7 @@ pub enum TextMediaTypeV4 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub enum WorkspaceObjectKindV4 {
+pub enum KernelWorkspaceObjectKind {
     File,
     Directory,
 }
@@ -467,22 +473,22 @@ pub enum WorkspaceObjectKindV4 {
     rename_all_fields = "camelCase",
     deny_unknown_fields
 )]
-pub enum PathEntrySizeV4 {
+pub enum KernelPathEntrySize {
     Unavailable {},
     Bytes { value: u64 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct PathEntryV4 {
+pub struct KernelPathEntry {
     pub relative_path: String,
-    pub kind: WorkspaceObjectKindV4,
-    pub size: PathEntrySizeV4,
+    pub kind: KernelWorkspaceObjectKind,
+    pub size: KernelPathEntrySize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct SearchMatchV4 {
+pub struct KernelSearchMatch {
     pub relative_path: String,
     pub line: u32,
     pub column: u32,
@@ -491,7 +497,7 @@ pub struct SearchMatchV4 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct WebSearchItemV4 {
+pub struct KernelWebSearchItem {
     pub title: String,
     pub url: String,
     pub snippet: String,
@@ -499,7 +505,7 @@ pub struct WebSearchItemV4 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct NetworkPublicTargetV4 {
+pub struct KernelNetworkPublicTarget {
     pub origin: NetworkOriginV2,
     pub target_observation_digest: NetworkTargetObservationDigestV2,
 }
@@ -512,23 +518,23 @@ pub struct NetworkPublicTargetV4 {
     rename_all_fields = "camelCase",
     deny_unknown_fields
 )]
-pub enum ToolOutputPayloadV4 {
+pub enum KernelToolOutputPayload {
     Utf8Text {
-        media_type: TextMediaTypeV4,
+        media_type: KernelTextMediaType,
         text: String,
     },
     PathEntries {
-        entries: Vec<PathEntryV4>,
+        entries: Vec<KernelPathEntry>,
     },
     SearchMatches {
-        matches: Vec<SearchMatchV4>,
+        matches: Vec<KernelSearchMatch>,
     },
     WebSearchResults {
-        items: Vec<WebSearchItemV4>,
+        items: Vec<KernelWebSearchItem>,
     },
     WebResponse {
         status_code: u16,
-        final_target: NetworkPublicTargetV4,
+        final_target: KernelNetworkPublicTarget,
         content_type: String,
         body: String,
     },
@@ -543,26 +549,26 @@ pub enum ToolOutputPayloadV4 {
     rename_all_fields = "camelCase",
     deny_unknown_fields
 )]
-pub enum OutputTruncationV4 {
+pub enum KernelOutputTruncation {
     Complete {},
     Truncated { retained_bytes: u64 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ToolOutputV4 {
+pub struct KernelToolOutput {
     pub full_digest: ToolOutputDigestV2,
     pub total_bytes: u64,
-    pub truncation: OutputTruncationV4,
-    pub payload: ToolOutputPayloadV4,
+    pub truncation: KernelOutputTruncation,
+    pub payload: KernelToolOutputPayload,
 }
 
-pub fn tool_output_digest_v4(
-    tool_id: AuthorityToolIdV4,
-    payload: &ToolOutputPayloadV4,
+pub fn kernel_tool_output_digest(
+    tool_id: KernelToolKind,
+    payload: &KernelToolOutputPayload,
 ) -> Result<ToolOutputDigestV2, V2ValidationError> {
     ToolOutputDigestV2::parse(encoded_digest(typed_digest(
-        "deepcode.kernel.tools.v4/output",
+        "deepcode.kernel.tool-output.v2",
         &serde_json::json!({
             "toolId":tool_id,
             "typedOutputPayload":payload,
@@ -570,17 +576,17 @@ pub fn tool_output_digest_v4(
     )?))
 }
 
-pub fn output_payload_measure_v4(
-    tool_id: AuthorityToolIdV4,
-    payload: ToolOutputPayloadV4,
-) -> Result<ToolOutputV4, V2ValidationError> {
+pub fn measure_kernel_output_payload(
+    tool_id: KernelToolKind,
+    payload: KernelToolOutputPayload,
+) -> Result<KernelToolOutput, V2ValidationError> {
     let total_bytes = serde_json::to_vec(&payload)
         .map_err(|_| invalid_value("toolOutput", "must serialize"))?
         .len() as u64;
-    Ok(ToolOutputV4 {
-        full_digest: tool_output_digest_v4(tool_id, &payload)?,
+    Ok(KernelToolOutput {
+        full_digest: kernel_tool_output_digest(tool_id, &payload)?,
         total_bytes,
-        truncation: OutputTruncationV4::Complete {},
+        truncation: KernelOutputTruncation::Complete {},
         payload,
     })
 }
@@ -608,7 +614,7 @@ fn validate_path_list(
     values: &[String],
     allow_dot: bool,
 ) -> Result<(), V2ValidationError> {
-    if values.is_empty() || values.len() > MAX_LIST_ITEMS_V4 {
+    if values.is_empty() || values.len() > MAX_LIST_ITEMS {
         return Err(invalid_value(
             field,
             "must be a non-empty list of at most 256 paths",
@@ -628,7 +634,7 @@ fn validate_string_list(
     values: &[String],
     allow_empty_list: bool,
 ) -> Result<(), V2ValidationError> {
-    if (!allow_empty_list && values.is_empty()) || values.len() > MAX_LIST_ITEMS_V4 {
+    if (!allow_empty_list && values.is_empty()) || values.len() > MAX_LIST_ITEMS {
         return Err(invalid_value(field, "has an invalid item count"));
     }
     for value in values {
@@ -648,8 +654,8 @@ fn validate_text(
     if (!allow_empty && value.trim().is_empty()) || value.contains('\0') {
         return Err(empty_field(field));
     }
-    if value.len() > MAX_ORDINARY_STRING_BYTES_V4 {
-        return Err(field_too_large(field, MAX_ORDINARY_STRING_BYTES_V4));
+    if value.len() > MAX_ORDINARY_STRING_BYTES {
+        return Err(field_too_large(field, MAX_ORDINARY_STRING_BYTES));
     }
     Ok(())
 }
@@ -673,10 +679,10 @@ fn validate_range(field: &'static str, start: u32, end: u32) -> Result<(), V2Val
     Ok(())
 }
 
-fn validate_matcher(value: &EditMatcherV4) -> Result<(), V2ValidationError> {
+fn validate_matcher(value: &KernelEditMatcher) -> Result<(), V2ValidationError> {
     match value {
-        EditMatcherV4::ExactBlock { text } => validate_text("matcher.text", text, false),
-        EditMatcherV4::ContextBlock {
+        KernelEditMatcher::ExactBlock { text } => validate_text("matcher.text", text, false),
+        KernelEditMatcher::ContextBlock {
             before,
             target,
             after,
@@ -685,13 +691,13 @@ fn validate_matcher(value: &EditMatcherV4) -> Result<(), V2ValidationError> {
             validate_text("matcher.target", target, false)?;
             validate_text("matcher.after", after, true)
         }
-        EditMatcherV4::LineRange {
+        KernelEditMatcher::LineRange {
             start_line,
             end_line,
             precondition,
         } => {
             validate_range("matcher.lineRange", *start_line, *end_line)?;
-            if let FileDigestPreconditionV4::ExpectedBeforeBlock { text } = precondition {
+            if let KernelFileDigestPrecondition::ExpectedBeforeBlock { text } = precondition {
                 validate_text("expectedBeforeBlock", text, false)?;
             }
             Ok(())

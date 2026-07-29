@@ -1,11 +1,11 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import type { AgentContextAttachment } from '@deepcode/protocol';
+import type { AgentInputAttachmentV2 } from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
 import { useSettingsStore } from '../../state/settingsStore';
 import { useWorkspaceStore } from '../../state/workspaceStore';
 import ContextAttachmentPicker from './ContextAttachmentPicker';
-import UserAttachmentDialog, { type PickedUserAttachment } from './UserAttachmentDialog';
-import type { AgentComposerDecisionOption, AgentComposerPendingDecision } from './pendingDecision';
+import UserAttachmentDialog from './UserAttachmentDialog';
+import type { AgentComposerPendingDecision } from './pendingDecision';
 
 const COMPOSER_TEXTAREA_MIN_HEIGHT = 34;
 const COMPOSER_TEXTAREA_MAX_HEIGHT = 150;
@@ -32,14 +32,18 @@ function resizeComposerTextarea(textarea: HTMLTextAreaElement): void {
 }
 
 interface AgentComposerProps {
-  messageAttachments: AgentContextAttachment[];
-  sessionAttachments: AgentContextAttachment[];
+  messageAttachments: AgentInputAttachmentV2[];
+  sessionAttachments: AgentInputAttachmentV2[];
   language: UiLanguage;
   loading: boolean;
   onSend: (content: string) => void | Promise<void>;
   onStop: () => void;
-  onAddAttachment: (attachment: AgentContextAttachment) => void;
-  onRemoveAttachment: (path: string, scope: AgentContextAttachment['scope']) => void;
+  onAddAttachment: (attachment: AgentInputAttachmentV2) => void;
+  onRemoveAttachment: (
+    path: string,
+    scope: AgentInputAttachmentV2['scope'],
+    folderId?: string
+  ) => void;
   footerControls?: React.ReactNode;
   sendBlocked?: boolean;
   sendBlockedTitle?: string;
@@ -54,21 +58,19 @@ interface AgentModifiedFileView {
 }
 
 const MODIFIED_FILES: AgentModifiedFileView[] = [];
-const LAST_ATTACHMENT_DIRECTORY_KEY_PREFIX = 'deepcode.agent.lastAttachmentDirectory';
 const PRIMARY_DECISION_OPTION_ID = '__primary__';
 
-function attachmentLabel(attachment: AgentContextAttachment, language: UiLanguage): string {
-  if (attachment.kind === 'directory') {
-    return `${t(language, 'agent.composer.dir')} ${attachment.path || '.'}`;
-  }
-  return `${t(language, 'agent.composer.file')} ${attachment.path || '.'}`;
+function attachmentLabel(attachment: AgentInputAttachmentV2, language: UiLanguage): string {
+  const kind = attachment.kind === 'directory'
+    ? t(language, 'agent.composer.dir')
+    : t(language, 'agent.composer.file');
+  const scope = attachment.scope === 'session'
+    ? t(language, 'agent.attachmentDialog.sessionScope')
+    : t(language, 'agent.attachmentDialog.messageScope');
+  return `${kind} · ${scope} · ${attachment.path}`;
 }
 
-function attachmentKindLabel(attachment: AgentContextAttachment, language: UiLanguage): string {
-  return t(language, attachment.kind === 'directory' ? 'agent.composer.dir' : 'agent.composer.file');
-}
-
-function AttachmentIcon({ kind }: Pick<AgentContextAttachment, 'kind'>): React.ReactElement {
+function AttachmentIcon({ kind }: Pick<AgentInputAttachmentV2, 'kind'>): React.ReactElement {
   if (kind === 'directory') {
     return (
       <svg viewBox="0 0 20 20" aria-hidden="true">
@@ -109,47 +111,6 @@ function openVscodeFile(absolutePath: string): void {
   window.location.href = `vscode://file${encodeURI(urlPath)}`;
 }
 
-function relativeToWorkspacePath(root: string, absolutePath: string): string | null {
-  const normalizedRoot = root.replace(/\\/g, '/').replace(/\/+$/, '');
-  const normalizedPath = absolutePath.replace(/\\/g, '/').replace(/\/+$/, '');
-  if (normalizedPath === normalizedRoot) return '.';
-  const prefix = `${normalizedRoot}/`;
-  if (!normalizedPath.startsWith(prefix)) return null;
-  return normalizedPath.slice(prefix.length) || '.';
-}
-
-function selectedAttachmentPath(absolutePath: string): string {
-  return absolutePath.replace(/\\/g, '/');
-}
-
-function storageAvailable(): boolean {
-  return typeof window !== 'undefined' && typeof window.localStorage !== 'undefined';
-}
-
-function lastAttachmentDirectoryKey(workspaceRoot?: string): string {
-  const scope = workspaceRoot?.replace(/\\/g, '/').replace(/\/+$/, '') || 'no-workspace';
-  return `${LAST_ATTACHMENT_DIRECTORY_KEY_PREFIX}:${scope}`;
-}
-
-function readLastAttachmentDirectory(workspaceRoot?: string): string | null {
-  if (!storageAvailable()) return null;
-  try {
-    return window.localStorage.getItem(lastAttachmentDirectoryKey(workspaceRoot));
-  } catch {
-    return null;
-  }
-}
-
-function writeLastAttachmentDirectory(workspaceRoot: string | undefined, absolutePath: string): void {
-  if (!storageAvailable()) return;
-  const normalized = selectedAttachmentPath(absolutePath).replace(/\/+$/, '');
-  if (!normalized) return;
-  try {
-    window.localStorage.setItem(lastAttachmentDirectoryKey(workspaceRoot), normalized);
-  } catch {
-  }
-}
-
 function isImeComposing(event: React.KeyboardEvent<HTMLElement>): boolean {
   const syntheticEvent = event as React.KeyboardEvent<HTMLElement> & { isComposing?: boolean };
   const nativeEvent = event.nativeEvent as KeyboardEvent & { isComposing?: boolean; keyCode?: number };
@@ -162,60 +123,31 @@ function isImeComposing(event: React.KeyboardEvent<HTMLElement>): boolean {
 }
 
 function composerDecisionText(decision: AgentComposerPendingDecision, language: UiLanguage): { title: string; summary?: string } {
-  if (isTechnicalChoiceDecision(decision)) {
-    return {
-      title: decision.title || t(language, 'agent.composer.decision.choice'),
-    };
-  }
   if (decision.kind === 'plan') {
     return {
       title: t(language, 'agent.composer.decision.planQuestion'),
     };
   }
-  const fallbackTitle = decision.kind === 'requirement'
-    ? t(language, 'agent.composer.decision.requirement')
-    : decision.kind === 'review'
-      ? t(language, 'agent.composer.decision.review')
-      : t(language, 'agent.composer.decision.permission');
   return {
-    title: decision.title || fallbackTitle,
-    summary: decision.kind === 'permission' ? decision.summary : undefined,
+    title: decision.title || t(language, 'agent.composer.decision.permission'),
+    summary: decision.summary,
   };
 }
 
 function decisionPlaceholder(decision: AgentComposerPendingDecision, language: UiLanguage): string {
-  if (isTechnicalChoiceDecision(decision)) return t(language, 'agent.composer.decision.choicePlaceholder');
-  if (decision.kind === 'requirement') return t(language, 'agent.composer.decision.requirementPlaceholder');
   if (decision.kind === 'plan') return t(language, 'agent.composer.decision.planPlaceholder');
-  if (decision.kind === 'review') return t(language, 'agent.composer.decision.reviewPlaceholder');
   return t(language, 'agent.composer.decision.permissionPlaceholder');
 }
 
 function decisionSubmitLabel(decision: AgentComposerPendingDecision, value: string, language: UiLanguage): string {
   if (decision.kind === 'permission') return t(language, 'agent.permission.accept');
-  if (isTechnicalChoiceDecision(decision)) {
-    return technicalChoiceInputIsFreeform(decision, value)
-      ? t(language, 'agent.requirement.submitRevision')
-      : t(language, 'agent.composer.decision.submitChoice');
-  }
-  if (decision.kind === 'requirement') {
-    return value.trim()
-      ? t(language, 'agent.requirement.submitRevision')
-      : t(language, 'agent.requirement.accept');
-  }
-  if (value.trim()) {
-    return decision.kind === 'review'
-      ? t(language, 'agent.review.submitRevision')
-      : t(language, 'agent.plan.submitReview');
-  }
-  return decision.kind === 'review'
-    ? t(language, 'agent.review.acceptContinue')
+  return value.trim()
+    ? t(language, 'agent.plan.submitReview')
     : t(language, 'agent.plan.accept');
 }
 
 function decisionSubmitTitle(decision: AgentComposerPendingDecision, value: string, language: UiLanguage): string {
   if (decision.kind === 'permission') return t(language, 'agent.permission.accept');
-  if (isTechnicalChoiceDecision(decision)) return t(language, 'agent.composer.decision.submitChoiceTitle');
   return value.trim()
     ? t(language, 'agent.composer.decision.submitGuidanceTitle')
     : t(language, 'agent.composer.decision.acceptTitle');
@@ -224,14 +156,6 @@ function decisionSubmitTitle(decision: AgentComposerPendingDecision, value: stri
 function decisionPrimaryOptionLabel(decision: AgentComposerPendingDecision, language: UiLanguage): string {
   if (decision.kind === 'plan') return t(language, 'agent.composer.decision.planOption');
   return decisionSubmitLabel(decision, '', language);
-}
-
-function isTechnicalChoiceDecision(
-  decision: AgentComposerPendingDecision
-): decision is Extract<AgentComposerPendingDecision, { kind: 'requirement' }> & {
-  decisionRequest: NonNullable<Extract<AgentComposerPendingDecision, { kind: 'requirement' }>['decisionRequest']>;
-} {
-  return decision.kind === 'requirement' && Boolean(decision.decisionRequest?.options.length);
 }
 
 function normalizeDecisionInput(
@@ -262,117 +186,16 @@ function normalizeDecisionInput(
   return { action: 'revise', guidance: trimmed };
 }
 
-function recommendedChoice(options: AgentComposerDecisionOption[]): AgentComposerDecisionOption | null {
-  return options.find((option) => option.recommended) ?? options[0] ?? null;
-}
-
-type TechnicalChoiceInput =
-  | { action: 'accept'; option: AgentComposerDecisionOption; supplement?: string }
-  | { action: 'revise'; guidance: string }
-  | { action: 'reject'; option?: AgentComposerDecisionOption };
-
-function technicalChoiceInputIsFreeform(decision: AgentComposerPendingDecision, value: string): boolean {
-  if (!isTechnicalChoiceDecision(decision)) return false;
-  const fallback = recommendedChoice(decision.decisionRequest.options);
-  if (!fallback) return false;
-  return parseTechnicalChoiceInput(value, decision.decisionRequest.options, fallback).action === 'revise';
-}
-
-function parseTechnicalChoiceInput(
-  value: string,
-  options: AgentComposerDecisionOption[],
-  fallback: AgentComposerDecisionOption
-): TechnicalChoiceInput {
-  const trimmed = value.trim();
-  const lower = trimmed.toLowerCase();
-  if (!trimmed) return { action: 'accept', option: fallback };
-  if (
-    lower === 'end' ||
-    lower === 'stop' ||
-    lower === 'reject' ||
-    trimmed === '结束' ||
-    trimmed === '拒绝'
-  ) {
-    return { action: 'reject', option: fallback };
-  }
-  if (lower === 'accept' || trimmed === '确认' || trimmed === '同意') {
-    return { action: 'accept', option: fallback };
-  }
-  const numbered = trimmed.match(/^(\d+)(?:[\s.)、:：-]+([\s\S]*))?$/);
-  if (numbered) {
-    const option = options[Number(numbered[1]) - 1];
-    if (option) {
-      const supplement = numbered[2]?.trim();
-      return { action: 'accept', option, supplement: supplement || undefined };
-    }
-  }
-  for (const option of options) {
-    const id = option.id.toLowerCase();
-    const label = option.label.toLowerCase();
-    if (lower === id || lower === label) return { action: 'accept', option };
-    if (lower.startsWith(`${id} `)) {
-      const supplement = trimmed.slice(option.id.length).trim();
-      return { action: 'accept', option, supplement: supplement || undefined };
-    }
-    if (lower.startsWith(`${label} `)) {
-      const supplement = trimmed.slice(option.label.length).trim();
-      return { action: 'accept', option, supplement: supplement || undefined };
-    }
-  }
-  return {
-    action: 'revise',
-    guidance: trimmed,
-  };
-}
-
-function decisionChoiceCount(options: AgentComposerDecisionOption[], language: UiLanguage): string {
-  return t(language, 'agent.composer.decision.choiceCount', { count: options.length });
-}
-
 function decisionCopyText(decision: AgentComposerPendingDecision, language: UiLanguage): string {
   const text = composerDecisionText(decision, language);
   const lines = [text.title];
   if (decision.summary) lines.push('', decision.summary);
-  if (isTechnicalChoiceDecision(decision)) {
-    const request = decision.decisionRequest;
-    if (request.summary || request.reason) {
-      lines.push('', request.summary ?? request.reason ?? '');
-    }
-    for (const option of request.options) {
-      lines.push('', `- ${option.label}${option.recommended ? ` (${t(language, 'agent.composer.decision.recommended')})` : ''}`);
-      if (option.description) lines.push(`  ${option.description}`);
-    }
-  }
   return lines.filter((line) => line !== undefined).join('\n').trim();
-}
-
-function decisionChoiceGuidance(
-  option: AgentComposerDecisionOption,
-  supplement: string | undefined,
-  language: UiLanguage
-): string {
-  const lines = [
-    t(language, 'agent.composer.choiceGuidance.selected'),
-    `- id: ${normalizeGuidanceLine(option.id)}`,
-    `- label: ${normalizeGuidanceLine(option.label)}`,
-    option.description ? `- description: ${normalizeGuidanceLine(option.description)}` : '',
-    supplement ? t(language, 'agent.composer.choiceGuidance.supplement') : '',
-    supplement ? supplement.trim() : '',
-  ];
-  return lines.filter(Boolean).join('\n');
-}
-
-function normalizeGuidanceLine(value: string): string {
-  return value.replace(/\s+/g, ' ').trim();
 }
 
 function decisionInstanceKey(decision: AgentComposerPendingDecision | null | undefined): string {
   if (!decision) return 'none';
-  if (decision.kind === 'requirement') {
-    return `${decision.kind}:${decision.runId}:${decision.requirementId}:${decision.decisionRequest?.id ?? ''}`;
-  }
   if (decision.kind === 'plan') return `${decision.kind}:${decision.runId}:${decision.planId}`;
-  if (decision.kind === 'review') return `${decision.kind}:${decision.runId}`;
   return `${decision.kind}:${decision.requestId}`;
 }
 
@@ -409,68 +232,38 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
 }) => {
   const [value, setValue] = useState('');
   const [inputFocused, setInputFocused] = useState(false);
-  const [selectedChoiceId, setSelectedChoiceId] = useState<string | null>(null);
   const [attachmentDialogOpen, setAttachmentDialogOpen] = useState(false);
+  const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const [changesOpen, setChangesOpen] = useState(true);
   const [decisionCopyStatus, setDecisionCopyStatus] = useState<'idle' | 'copied' | 'error'>('idle');
-  const [lastAttachmentDirectory, setLastAttachmentDirectory] = useState<string | null>(() =>
-    readLastAttachmentDirectory()
-  );
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const defaultDecisionOptionRef = useRef<HTMLButtonElement | null>(null);
   const focusedOptionClickConfirmRef = useRef<string | null>(null);
-  const focusedDecisionOptionIdRef = useRef<string | null>(null);
   const activeFolder = useWorkspaceStore((s) => s.getActiveFolder());
-  const activeWorkspaceRoot = activeFolder?.absolutePath;
   const previewEditor = String(
     useSettingsStore((s) => s.effectiveSettings['workbench.previewEditor'] ?? 'vscode')
   );
-
   const mention = useMemo(() => {
     const match = value.match(/@([^@\s]*)$/);
     if (!match) return null;
-    return { query: match[1], start: match.index ?? value.length - match[0].length };
+    return {
+      query: match[1],
+      start: match.index ?? value.length - match[0].length,
+      length: match[0].length,
+    };
   }, [value]);
 
   const decisionKey = decisionInstanceKey(pendingDecision);
-  const technicalChoiceOptions = pendingDecision && isTechnicalChoiceDecision(pendingDecision)
-    ? pendingDecision.decisionRequest.options
-    : [];
-  const defaultChoice = recommendedChoice(technicalChoiceOptions);
-  const selectedChoice = technicalChoiceOptions.find((option) => option.id === selectedChoiceId)
-    ?? defaultChoice;
 
   useEffect(() => {
-    setSelectedChoiceId(defaultChoice?.id ?? null);
     setDecisionCopyStatus('idle');
     focusedOptionClickConfirmRef.current = null;
-    focusedDecisionOptionIdRef.current = defaultChoice?.id ?? PRIMARY_DECISION_OPTION_ID;
-  }, [decisionKey, defaultChoice?.id]);
+  }, [decisionKey]);
 
   const send = () => {
     const nextValue = value;
     if (pendingDecision) {
       if (pendingDecision.resolving) return;
-      const focusedChoice = technicalChoiceOptions.find((option) => option.id === focusedDecisionOptionIdRef.current)
-        ?? selectedChoice;
-      if (isTechnicalChoiceDecision(pendingDecision) && focusedChoice) {
-        const parsed = parseTechnicalChoiceInput(nextValue, technicalChoiceOptions, focusedChoice);
-        setValue('');
-        if (parsed.action !== 'revise' && parsed.option) {
-          setSelectedChoiceId(parsed.option.id);
-          focusedDecisionOptionIdRef.current = parsed.option.id;
-        }
-        if (parsed.action === 'reject') {
-          void onDecisionReject?.();
-          return;
-        }
-        if (parsed.action === 'revise') {
-          void onDecisionSubmit?.(parsed.guidance, 'revise');
-          return;
-        }
-        void onDecisionSubmit?.(decisionChoiceGuidance(parsed.option, parsed.supplement, language), 'accept');
-        return;
-      }
       const normalized = normalizeDecisionInput(pendingDecision, nextValue);
       setValue('');
       if (normalized.action === 'reject') {
@@ -518,23 +311,27 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
     resizeComposerTextarea(textarea);
   }, [value]);
 
-  useEffect(() => {
-    setLastAttachmentDirectory(readLastAttachmentDirectory(activeWorkspaceRoot));
-  }, [activeWorkspaceRoot]);
+  const updateValue = (nextValue: string) => {
+    setValue(nextValue);
+    setAttachmentError(null);
+  };
 
-  const pickAttachment = (attachment: AgentContextAttachment) => {
+  const pickAttachment = (attachment: AgentInputAttachmentV2) => {
+    setAttachmentError(null);
     onAddAttachment(attachment);
     if (mention) {
-      setValue(`${value.slice(0, mention.start)}${value.slice(mention.start + mention.query.length + 1)}`);
+      setValue(`${value.slice(0, mention.start)}${value.slice(mention.start + mention.length)}`);
     }
   };
 
-  const updateValue = (nextValue: string) => {
-    setValue(nextValue);
-  };
-
   const chips = [...sessionAttachments, ...messageAttachments];
-  const composerExpanded = Boolean(value.trim() || chips.length > 0 || attachmentDialogOpen || mention || pendingDecision);
+  const composerExpanded = Boolean(
+    value.trim()
+    || chips.length > 0
+    || attachmentDialogOpen
+    || mention
+    || pendingDecision
+  );
   const decisionText = pendingDecision ? composerDecisionText(pendingDecision, language) : null;
   const decisionResolving = Boolean(pendingDecision?.resolving);
   const sendDisabled = loading
@@ -560,56 +357,13 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
     }
   };
 
-  const pickUserSelectedAttachment = (picked: PickedUserAttachment) => {
-    const absolutePath = selectedAttachmentPath(picked.absolutePath);
-    const workspacePath = activeFolder?.absolutePath
-      ? relativeToWorkspacePath(activeFolder.absolutePath, absolutePath)
-      : null;
-    onAddAttachment({
-      kind: picked.kind,
-      path: workspacePath ?? absolutePath,
-      absolutePath,
-      folderId: workspacePath && activeFolder ? activeFolder.id : undefined,
-      source: 'userSelected',
-      scope: 'message',
-    });
-  };
-
-  const updateLastAttachmentDirectory = (absolutePath: string) => {
-    const normalized = selectedAttachmentPath(absolutePath);
-    setLastAttachmentDirectory(normalized);
-    writeLastAttachmentDirectory(activeWorkspaceRoot, normalized);
-  };
-
-  const dialogInitialDirectory = lastAttachmentDirectory ?? activeFolder?.absolutePath ?? null;
   const armFocusedOptionClick = (
-    event: React.MouseEvent<HTMLButtonElement>,
+    _event: React.MouseEvent<HTMLButtonElement>,
     optionId: string
   ) => {
-    focusedOptionClickConfirmRef.current = focusedDecisionOptionIdRef.current === optionId
+    focusedOptionClickConfirmRef.current = document.activeElement === defaultDecisionOptionRef.current
       ? optionId
       : null;
-  };
-
-  const selectTechnicalChoice = (
-    event: React.MouseEvent<HTMLButtonElement>,
-    option: AgentComposerDecisionOption
-  ) => {
-    if (!pendingDecision || pendingDecision.resolving) return;
-    if (focusedOptionClickConfirmRef.current === option.id) {
-      send();
-      return;
-    }
-    event.currentTarget.focus();
-    setSelectedChoiceId(option.id);
-    focusedDecisionOptionIdRef.current = option.id;
-    focusedOptionClickConfirmRef.current = null;
-  };
-
-  const focusTechnicalChoice = (option: AgentComposerDecisionOption) => {
-    if (!pendingDecision || pendingDecision.resolving) return;
-    setSelectedChoiceId(option.id);
-    focusedDecisionOptionIdRef.current = option.id;
   };
 
   const activatePrimaryDecisionOption = (event: React.MouseEvent<HTMLButtonElement>) => {
@@ -619,7 +373,6 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
       return;
     }
     event.currentTarget.focus();
-    focusedDecisionOptionIdRef.current = PRIMARY_DECISION_OPTION_ID;
     focusedOptionClickConfirmRef.current = null;
   };
 
@@ -648,13 +401,6 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
           onKeyDown={handleDecisionShortcut}
           placeholder={pendingDecision ? decisionPlaceholder(pendingDecision, language) : undefined}
         />
-        {mention && (
-          <ContextAttachmentPicker
-            query={mention.query}
-            language={language}
-            onPick={pickAttachment}
-          />
-        )}
       </div>
     </div>
   );
@@ -675,11 +421,6 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
             >
               ⧉
             </button>
-            {technicalChoiceOptions.length > 0 && (
-              <div className="agent-composer-decision__count">
-                {decisionChoiceCount(technicalChoiceOptions, language)}
-              </div>
-            )}
           </div>
           {decisionText.summary && <div className="agent-composer-decision__summary">{decisionText.summary}</div>}
           {decisionResolving ? (
@@ -689,55 +430,24 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
           ) : (
             <>
               <div
-                className={`agent-composer-decision__options${
-                  technicalChoiceOptions.length > 0 ? ' agent-composer-decision__options--choices' : ''
-                }`}
+                className="agent-composer-decision__options"
               >
-                {technicalChoiceOptions.length > 0 ? technicalChoiceOptions.map((option, index) => (
-                  <button
-                    key={option.id}
-                    className={`agent-composer-decision__option${option.id === selectedChoice?.id ? ' agent-composer-decision__option--selected' : ''}`}
-                    type="button"
-                    disabled={decisionResolving}
-                    title={option.description}
-                    ref={option.id === defaultChoice?.id ? defaultDecisionOptionRef : undefined}
-                    onMouseDown={(event) => armFocusedOptionClick(event, option.id)}
-                    onFocus={() => focusTechnicalChoice(option)}
-                    onClick={(event) => selectTechnicalChoice(event, option)}
-                  >
-                    <span className="agent-composer-decision__number">{index + 1}</span>
-                    <span className="agent-composer-decision__option-body">
-                      <span className="agent-composer-decision__label">
-                        {option.label}
-                        {option.recommended && (
-                          <span className="agent-composer-decision__recommended">
-                            {t(language, 'agent.composer.decision.recommended')}
-                          </span>
-                        )}
-                      </span>
-                      {option.description && (
-                        <span className="agent-composer-decision__description">{option.description}</span>
-                      )}
+                <button
+                  className="agent-composer-decision__option agent-composer-decision__option--selected"
+                  type="button"
+                  disabled={decisionResolving}
+                  title={decisionSubmitTitle(pendingDecision!, '', language)}
+                  ref={defaultDecisionOptionRef}
+                  onMouseDown={(event) => armFocusedOptionClick(event, PRIMARY_DECISION_OPTION_ID)}
+                  onClick={activatePrimaryDecisionOption}
+                >
+                  <span className="agent-composer-decision__number">1</span>
+                  <span className="agent-composer-decision__option-body">
+                    <span className="agent-composer-decision__label">
+                      {decisionPrimaryOptionLabel(pendingDecision!, language)}
                     </span>
-                  </button>
-                )) : (
-                  <button
-                    className="agent-composer-decision__option agent-composer-decision__option--selected"
-                    type="button"
-                    disabled={decisionResolving}
-                    title={decisionSubmitTitle(pendingDecision!, '', language)}
-                    ref={defaultDecisionOptionRef}
-                    onMouseDown={(event) => armFocusedOptionClick(event, PRIMARY_DECISION_OPTION_ID)}
-                    onClick={activatePrimaryDecisionOption}
-                  >
-                    <span className="agent-composer-decision__number">1</span>
-                    <span className="agent-composer-decision__option-body">
-                      <span className="agent-composer-decision__label">
-                        {decisionPrimaryOptionLabel(pendingDecision!, language)}
-                      </span>
-                    </span>
-                  </button>
-                )}
+                  </span>
+                </button>
               </div>
               <div className="agent-composer-decision__control-row">
                 {renderDecisionInput()}
@@ -776,24 +486,35 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
         <div className="agent-attachment-chips">
           {chips.map((attachment) => (
             <button
-              key={`${attachment.scope}:${attachment.folderId ?? ''}:${attachment.path}`}
+              key={`${attachment.scope}:${attachment.folderId ?? ''}:${attachment.path}:${attachment.kind}`}
               className={`agent-chip agent-chip--${attachment.scope} agent-chip--${attachment.kind}`}
               title={attachmentLabel(attachment, language)}
-              onClick={() => onRemoveAttachment(attachment.path, attachment.scope)}
+              onClick={() => onRemoveAttachment(
+                attachment.path,
+                attachment.scope,
+                attachment.folderId
+              )}
               type="button"
             >
               <span className="agent-chip__icon">
                 <AttachmentIcon kind={attachment.kind} />
               </span>
               <span className="agent-chip__body">
-                <span className="agent-chip__path">
-                  {attachment.path || t(language, 'agent.composer.workspaceRoot')}
+                <span className="agent-chip__path">{attachment.path}</span>
+                <span className="agent-chip__kind">
+                  {attachment.scope === 'session'
+                    ? t(language, 'agent.attachmentDialog.sessionScope')
+                    : t(language, 'agent.attachmentDialog.messageScope')}
                 </span>
-                <span className="agent-chip__kind">{attachmentKindLabel(attachment, language)}</span>
               </span>
               <span className="agent-chip__remove" aria-hidden="true">×</span>
             </button>
           ))}
+        </div>
+      )}
+      {attachmentError && (
+        <div className="agent-composer__attachment-error" role="alert">
+          {attachmentError}
         </div>
       )}
       {MODIFIED_FILES.length > 0 && (
@@ -879,23 +600,25 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
               query={mention.query}
               language={language}
               onPick={pickAttachment}
+              onError={setAttachmentError}
             />
           )}
         </div>
       )}
       {!pendingDecision && <div className="agent-composer__footer">
         <div className="agent-composer__footer-left">
-          <div className="agent-composer__attach-wrap">
-            <button
-              className="agent-add-file-button"
-              type="button"
-              title={t(language, 'agent.composer.addFile')}
-              aria-label={t(language, 'agent.composer.addFile')}
-              onClick={() => setAttachmentDialogOpen(true)}
-            >
-              +
-            </button>
-          </div>
+          <button
+            className="agent-add-file-button"
+            type="button"
+            title={t(language, 'agent.composer.addAttachment')}
+            aria-label={t(language, 'agent.composer.addAttachment')}
+            onClick={() => {
+              setAttachmentError(null);
+              setAttachmentDialogOpen(true);
+            }}
+          >
+            +
+          </button>
         </div>
         <div className="agent-composer__footer-right">
           {footerControls}
@@ -914,11 +637,9 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
       </div>}
       <UserAttachmentDialog
         visible={attachmentDialogOpen}
-        initialDirectory={dialogInitialDirectory}
         language={language}
         onClose={() => setAttachmentDialogOpen(false)}
-        onPick={pickUserSelectedAttachment}
-        onDirectoryChange={updateLastAttachmentDirectory}
+        onPick={pickAttachment}
       />
     </div>
   );

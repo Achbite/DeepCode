@@ -192,11 +192,13 @@ pub(crate) async fn agent_project_delete(
             session["updatedAt"] = json!(now_text());
         }
     }
-    if let Err(error) = persist_agent_projects(&gui).and_then(|_| persist_session_index(&gui)) {
+    if let Err(error) = persist_agent_projects(&gui)
+        .and_then(|_| crate::session_metadata_v2::persist_session_index(&gui))
+    {
         gui.projects = previous_projects;
         gui.sessions = previous_sessions;
         let rollback_error = persist_agent_projects(&gui)
-            .and_then(|_| persist_session_index(&gui))
+            .and_then(|_| crate::session_metadata_v2::persist_session_index(&gui))
             .err();
         let message = rollback_error
             .map(|rollback| format!("{error}; rollback failed: {rollback}"))

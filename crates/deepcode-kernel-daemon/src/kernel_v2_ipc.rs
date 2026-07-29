@@ -1,14 +1,15 @@
 use crate::kernel_v2_transport::{
     apply_authorized_user_decision, decision_authorization_error, encode_bounded_json,
-    wire_error_code, workspace_error, BoundedJsonEncodeErrorV2, HostTransportCapabilityV2,
-    KernelV2HttpErrorCode, KernelV2TransportErrorEnvelope, KernelV2TransportState,
-    MAX_V2_RESPONSE_BYTES,
+    wire_error_code, BoundedJsonEncodeErrorV2, KernelV2TransportState, MAX_V2_RESPONSE_BYTES,
 };
 use deepcode_kernel_abi::v2::{CommandRequestId, V2WireDecodeError};
 use deepcode_kernel_abi::v2_command::{
     decode_kernel_command_v2, KernelCommandV2, MAX_COMMAND_BYTES_V2,
 };
-use deepcode_kernel_abi::{decode_user_decision_v2, RunCapabilityV2, MAX_USER_DECISION_BYTES_V2};
+use deepcode_kernel_abi::{
+    decode_user_decision_v2, KernelV2HttpErrorCode, KernelV2IpcErrorEnvelope, RunCapabilityV2,
+    MAX_USER_DECISION_BYTES_V2,
+};
 use serde::Serialize;
 use std::io::{self, ErrorKind, Read, Write};
 
@@ -16,16 +17,13 @@ pub(crate) enum KernelV2IpcPortV2 {
     SessionCommand {
         transport_run_capability: RunCapabilityV2,
     },
-    HostRunOpen {
-        host_capability: HostTransportCapabilityV2,
-    },
     UserDecision,
 }
 
 impl KernelV2IpcPortV2 {
     fn maximum_request_bytes(&self) -> usize {
         match self {
-            Self::SessionCommand { .. } | Self::HostRunOpen { .. } => MAX_COMMAND_BYTES_V2,
+            Self::SessionCommand { .. } => MAX_COMMAND_BYTES_V2,
             Self::UserDecision => MAX_USER_DECISION_BYTES_V2,
         }
     }
@@ -72,9 +70,6 @@ impl KernelV2IpcDispatcher {
             } => KernelV2IpcDispatchV2::response_only(
                 self.dispatch_session_command(body, transport_run_capability),
             ),
-            KernelV2IpcPortV2::HostRunOpen { host_capability } => {
-                self.dispatch_host_run_open(body, host_capability)
-            }
             KernelV2IpcPortV2::UserDecision => {
                 KernelV2IpcDispatchV2::response_only(self.dispatch_user_decision(body))
             }
@@ -91,12 +86,6 @@ impl KernelV2IpcDispatcher {
         R: Read,
         W: Write,
     {
-        if matches!(port, KernelV2IpcPortV2::HostRunOpen { .. }) {
-            return Err(io::Error::new(
-                ErrorKind::InvalidInput,
-                "Host RunOpen requires typed IPC dispatch with private capability metadata",
-            ));
-        }
         loop {
             let Some(length) = read_frame_length(reader)? else {
                 return Ok(());
@@ -145,81 +134,6 @@ impl KernelV2IpcDispatcher {
                 .handle_session_command(envelope, transport_run_capability),
             Some(request_id),
         )
-    }
-
-    fn dispatch_host_run_open(
-        &self,
-        body: &[u8],
-        host_capability: &HostTransportCapabilityV2,
-    ) -> KernelV2IpcDispatchV2 {
-        let envelope = match decode_kernel_command_v2(body) {
-            Ok(envelope) => envelope,
-            Err(error) => {
-                return KernelV2IpcDispatchV2::response_only(encode_wire_error(error));
-            }
-        };
-        let request_id = envelope.request_id.clone();
-        if self
-            .state
-            .host_authority()
-            .authorize_token(host_capability.expose_to_host_transport())
-            .is_err()
-        {
-            return KernelV2IpcDispatchV2::response_only(encode_transport_error(
-                KernelV2HttpErrorCode::HostAuthorityInvalid,
-                Some(request_id),
-            ));
-        }
-        let workspace_binding_ref = match &envelope.command {
-            KernelCommandV2::RunOpen(command) => command.workspace_binding_ref.clone(),
-            _ => {
-                return KernelV2IpcDispatchV2::response_only(encode_transport_error(
-                    KernelV2HttpErrorCode::InvalidPayload,
-                    Some(request_id),
-                ))
-            }
-        };
-        let workspace_root = match self
-            .state
-            .workspace_resolver()
-            .resolve_workspace_binding(&workspace_binding_ref)
-        {
-            Ok(root) if root.is_absolute() => root,
-            Ok(_) => {
-                return KernelV2IpcDispatchV2::response_only(encode_transport_error(
-                    KernelV2HttpErrorCode::WorkspaceBindingUnavailable,
-                    Some(request_id),
-                ))
-            }
-            Err(error) => {
-                return KernelV2IpcDispatchV2::response_only(encode_transport_error(
-                    workspace_error(error).1,
-                    Some(request_id),
-                ))
-            }
-        };
-        let settings = match self
-            .state
-            .settings_resolver()
-            .resolve_run_settings(&workspace_binding_ref)
-        {
-            Ok(settings) => settings,
-            Err(error) => {
-                return KernelV2IpcDispatchV2::response_only(encode_transport_error(
-                    workspace_error(error).1,
-                    Some(request_id),
-                ))
-            }
-        };
-        let (response, run_capability) = self
-            .state
-            .service()
-            .open_run(envelope, &workspace_root, settings)
-            .into_parts();
-        KernelV2IpcDispatchV2 {
-            response_body: encode_or_service_error(&response, Some(request_id)),
-            run_capability,
-        }
     }
 
     fn dispatch_user_decision(&self, body: &[u8]) -> Vec<u8> {
@@ -280,12 +194,7 @@ fn encode_transport_error(
     code: KernelV2HttpErrorCode,
     request_id: Option<CommandRequestId>,
 ) -> Vec<u8> {
-    encode_bounded_json(&KernelV2TransportErrorEnvelope {
-        format: "deepcode.kernel.ipc-error.v2",
-        code,
-        request_id,
-    })
-    .unwrap_or_else(|_| {
+    encode_bounded_json(&KernelV2IpcErrorEnvelope::new(code, request_id)).unwrap_or_else(|_| {
         b"{\"format\":\"deepcode.kernel.ipc-error.v2\",\"code\":\"service_unavailable\"}".to_vec()
     })
 }

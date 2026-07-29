@@ -4,8 +4,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 use crate::v2::{
-    field_too_large, invalid_value, typed_digest, validate_identity, ResourceAccessV2,
-    V2ValidationError,
+    cross_language_safe_integer_number_v2, field_too_large, invalid_value, typed_digest,
+    validate_identity, ResourceAccessV2, V2ValidationError,
 };
 
 pub const KERNEL_TOOL_REGISTRY_VERSION_V2: &str = "deepcode.kernel.tools.v2";
@@ -793,6 +793,12 @@ fn validate_json_value(
         }
         Value::String(value) if value.len() > maximum_bytes => {
             return Err(field_too_large(field, maximum_bytes));
+        }
+        Value::Number(value) if cross_language_safe_integer_number_v2(value).is_none() => {
+            return Err(invalid_value(
+                field,
+                "contains a number that is not a cross-language safe integer",
+            ));
         }
         _ => {}
     }

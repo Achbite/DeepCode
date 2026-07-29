@@ -1,5 +1,4 @@
 use crate::*;
-use serde_json::json;
 
 pub(crate) async fn run_interactive(
     client: HttpKernelClient,
@@ -80,8 +79,8 @@ pub(crate) async fn ask(
     host: SessionHostOptions,
 ) -> Result<(), String> {
     let session_id = session_id_for_turn(client, &host, &prompt).await?;
-    let mut request = StartAgentRunRequest::ask(prompt);
-    request.host_language = Some(deepcode_kernel_client::terminal_host_language());
+    let caller_request_id = new_cli_request_id("ask")?;
+    let mut request = StartAgentRunRequest::ask(prompt, caller_request_id);
     request.workspace_path = workspace_path_for_host(&host);
     request.no_workspace = Some(host.no_workspace);
     let result = start_and_wait_for_run(client, &session_id, request, !plain).await?;
@@ -118,10 +117,10 @@ async fn run_interactive_decision(
         .map(ToOwned::to_owned)
         .collect::<Vec<_>>();
     let Some(kind) = parts.first().cloned() else {
-        return Err("usage: /decision <requirement|plan|review|permission> <accept|reject|revise> [run-id] [target-id] [guidance]".to_string());
+        return Err("usage: /decision <plan|permission> <accept|reject|revise> [run-id] [target-id] [guidance]".to_string());
     };
     let Some(decision) = parts.get(1).cloned() else {
-        return Err("usage: /decision <requirement|plan|review|permission> <accept|reject|revise> [run-id] [target-id] [guidance]".to_string());
+        return Err("usage: /decision <plan|permission> <accept|reject|revise> [run-id] [target-id] [guidance]".to_string());
     };
     let run_id = parts.get(2).cloned();
     let target_id = parts.get(3).cloned();
@@ -142,18 +141,12 @@ pub(crate) async fn resolve_session_decision(
     guidance: Option<String>,
     host: SessionHostOptions,
 ) -> Result<(), String> {
-    if !matches!(
-        kind.as_str(),
-        "requirement" | "plan" | "review" | "permission"
-    ) {
-        return Err("decision kind must be requirement, plan, review, or permission".to_string());
+    if !matches!(kind.as_str(), "plan" | "permission") {
+        return Err("decision kind must be plan or permission".to_string());
     }
     if !matches!(
         (kind.as_str(), decision.as_str()),
-        (
-            "requirement" | "plan" | "review",
-            "accept" | "reject" | "revise"
-        ) | ("permission", "accept" | "reject")
+        ("plan", "accept" | "reject" | "revise") | ("permission", "accept" | "reject")
     ) {
         return Err(
             "permission decisions must be accept or reject; other decisions may also revise"
@@ -200,93 +193,10 @@ pub(crate) async fn resolve_session_decision(
         pending.run_id, pending.target_id
     );
     let caller_request_id = new_cli_request_id("decision")?;
-    if let Ok(goal_receipt) = client.current_session_goal(&session_id).await {
-        if let Some(goal_projection) = goal_receipt.projection.as_ref() {
-            let goal_pending = goal_projection.get("pendingInteraction");
-            let goal_matches = goal_pending
-                .and_then(|value| value.get("kind"))
-                .and_then(Value::as_str)
-                == Some(kind.as_str())
-                && goal_pending
-                    .and_then(|value| value.get("interactionId"))
-                    .and_then(Value::as_str)
-                    == Some(pending.interaction_id.as_str())
-                && goal_pending
-                    .and_then(|value| value.get("interactionRevision"))
-                    .and_then(Value::as_str)
-                    == Some(pending.interaction_revision.as_str())
-                && goal_pending
-                    .and_then(|value| value.get("targetId"))
-                    .and_then(Value::as_str)
-                    == Some(pending.target_id.as_str());
-            if goal_matches {
-                let goal_id = goal_projection
-                    .get("goalId")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| "Goal Projection has no goalId".to_string())?;
-                let goal_revision = goal_projection
-                    .get("goalRevision")
-                    .and_then(Value::as_u64)
-                    .ok_or_else(|| "Goal Projection has no goalRevision".to_string())?;
-                let expected_domain_head = goal_projection
-                    .get("sourceDomainHead")
-                    .cloned()
-                    .ok_or_else(|| "Goal Projection has no sourceDomainHead".to_string())?;
-                let receipt = client
-                    .resolve_session_goal_interaction(
-                        &session_id,
-                        goal_id,
-                        &pending.interaction_id,
-                        ResolveSessionGoalInteractionRequest {
-                            caller_request_id,
-                            expected_goal_revision: goal_revision,
-                            expected_domain_head,
-                            interaction_revision: pending.interaction_revision,
-                            target_id: pending.target_id,
-                            run_id: pending.run_id,
-                            decision_kind: kind,
-                            decision,
-                            guidance,
-                            workspace_path: workspace_path_for_host(&host),
-                            no_workspace: Some(host.no_workspace),
-                            host_language: Some(
-                                deepcode_kernel_client::terminal_host_language(),
-                            ),
-                        },
-                    )
-                    .await
-                    .map_err(|error| {
-                        format!("failed to resolve canonical Goal interaction: {error}")
-                    })?;
-                if let Some(host_run_id) = receipt.host_run_id.as_deref() {
-                    let _ = wait_for_existing_run(
-                        client,
-                        &session_id,
-                        host_run_id,
-                        true,
-                    )
-                    .await?;
-                }
-                let current = client
-                    .get_session_goal(&session_id, goal_id)
-                    .await
-                    .map_err(|error| format!("failed to read Goal after decision: {error}"))?;
-                print_goal_receipt(&current);
-                return Ok(());
-            }
-        }
-    }
-    let mut request = StartAgentRunRequest::resolve_decision(kind, decision);
-    request.host_language = Some(deepcode_kernel_client::terminal_host_language());
+    let mut request = StartAgentRunRequest::resolve_decision(kind, decision, caller_request_id);
     request.run_id = Some(pending.run_id);
     request.target_id = Some(pending.target_id);
-    request.interaction_id = Some(pending.interaction_id);
-    request.interaction_revision = Some(pending.interaction_revision);
-    request.review_id = pending.review_id;
-    request.decision_request_id = Some(caller_request_id);
     request.guidance = guidance;
-    request.workspace_path = workspace_path_for_host(&host);
-    request.no_workspace = Some(host.no_workspace);
     let result = start_and_wait_for_run(client, &session_id, request, true).await?;
     println!("session: {}", result.run.session_id);
     let timeline = client
@@ -295,250 +205,6 @@ pub(crate) async fn resolve_session_decision(
         .map_err(|error| format!("failed to read timeline: {error}"))?;
     render_decision_result(&timeline);
     Ok(())
-}
-
-pub(crate) async fn start_goal(
-    client: &HttpKernelClient,
-    objective: String,
-    host: SessionHostOptions,
-) -> Result<(), String> {
-    let session_id = session_id_for_turn(client, &host, &objective).await?;
-    let observed = client
-        .get_agent_session(&session_id)
-        .await
-        .map_err(|error| format!("failed to read Session before Goal start: {error}"))?;
-    let expected_domain_head = observed
-        .domain_state_if_writable()
-        .map_err(|error| format!("Goal start requires a writable Session: {error}"))?
-        .cloned()
-        .and_then(|state| state.get("head").cloned())
-        .ok_or_else(|| "Goal start requires a canonical Session domain head".to_string())?;
-    let receipt = client
-        .start_session_goal(
-            &session_id,
-            StartSessionGoalRequest {
-                caller_request_id: new_cli_request_id("goal-start")?,
-                expected_goal_revision: 0,
-                expected_domain_head,
-                objective,
-                workspace_path: workspace_path_for_host(&host),
-                no_workspace: Some(host.no_workspace),
-                host_language: Some(deepcode_kernel_client::terminal_host_language()),
-            },
-        )
-        .await
-        .map_err(|error| format!("failed to start Goal: {error}"))?;
-    if let Some(host_run_id) = receipt.host_run_id.as_deref() {
-        let _ = wait_for_existing_run(client, &session_id, host_run_id, true).await?;
-    }
-    let current = client
-        .current_session_goal(&session_id)
-        .await
-        .map_err(|error| format!("failed to read started Goal: {error}"))?;
-    print_goal_receipt(&current);
-    Ok(())
-}
-
-pub(crate) async fn show_goal(
-    client: &HttpKernelClient,
-    goal_id: Option<String>,
-    host: SessionHostOptions,
-) -> Result<(), String> {
-    let session_id = goal_session_id(client, &host).await?;
-    let receipt = match goal_id.as_deref() {
-        Some(goal_id) => client.get_session_goal(&session_id, goal_id).await,
-        None => client.current_session_goal(&session_id).await,
-    }
-    .map_err(|error| format!("failed to read Goal: {error}"))?;
-    print_goal_receipt(&receipt);
-    Ok(())
-}
-
-pub(crate) async fn step_goal(
-    client: &HttpKernelClient,
-    goal_id: Option<String>,
-    host: SessionHostOptions,
-) -> Result<(), String> {
-    let (session_id, goal_id, revision, head) =
-        active_goal_mutation_context(client, goal_id, &host).await?;
-    let result = client
-        .advance_session_goal(
-            &session_id,
-            &goal_id,
-            json!({
-                "callerRequestId": new_cli_request_id("goal-step")?,
-                "expectedGoalRevision": revision,
-                "expectedDomainHead": head,
-                "workspacePath": workspace_path_for_host(&host),
-                "noWorkspace": host.no_workspace,
-                "hostLanguage": deepcode_kernel_client::terminal_host_language(),
-            }),
-        )
-        .await
-        .map_err(|error| format!("failed to advance Goal: {error}"))?;
-    print_goal_value(&result);
-    Ok(())
-}
-
-pub(crate) async fn run_goal(
-    client: &HttpKernelClient,
-    goal_id: Option<String>,
-    host: SessionHostOptions,
-) -> Result<(), String> {
-    let mut selected_goal = goal_id;
-    loop {
-        let (session_id, goal_id, revision, head) =
-            active_goal_mutation_context(client, selected_goal.clone(), &host).await?;
-        selected_goal = Some(goal_id.clone());
-        let result = client
-            .advance_session_goal(
-                &session_id,
-                &goal_id,
-                json!({
-                    "callerRequestId": new_cli_request_id("goal-run-step")?,
-                    "expectedGoalRevision": revision,
-                    "expectedDomainHead": head,
-                    "workspacePath": workspace_path_for_host(&host),
-                    "noWorkspace": host.no_workspace,
-                    "hostLanguage": deepcode_kernel_client::terminal_host_language(),
-                }),
-            )
-            .await
-            .map_err(|error| format!("failed to advance Goal: {error}"))?;
-        print_goal_value(&result);
-        if result.get("outcome").and_then(Value::as_str) != Some("continue") {
-            return Ok(());
-        }
-    }
-}
-
-pub(crate) async fn resume_goal(
-    client: &HttpKernelClient,
-    goal_id: Option<String>,
-    host: SessionHostOptions,
-) -> Result<(), String> {
-    let (session_id, goal_id, revision, head) =
-        active_goal_mutation_context(client, goal_id, &host).await?;
-    let result = client
-        .resume_session_goal(
-            &session_id,
-            &goal_id,
-            json!({
-                "callerRequestId": new_cli_request_id("goal-resume")?,
-                "expectedGoalRevision": revision,
-                "expectedDomainHead": head,
-            }),
-        )
-        .await
-        .map_err(|error| format!("failed to resume Goal: {error}"))?;
-    print_goal_value(&result);
-    Ok(())
-}
-
-pub(crate) async fn cancel_goal(
-    client: &HttpKernelClient,
-    goal_id: Option<String>,
-    host: SessionHostOptions,
-) -> Result<(), String> {
-    let (session_id, goal_id, revision, head) =
-        active_goal_mutation_context(client, goal_id, &host).await?;
-    let result = client
-        .cancel_session_goal(
-            &session_id,
-            &goal_id,
-            json!({
-                "callerRequestId": new_cli_request_id("goal-cancel")?,
-                "expectedGoalRevision": revision,
-                "expectedDomainHead": head,
-            }),
-        )
-        .await
-        .map_err(|error| format!("failed to cancel Goal: {error}"))?;
-    print_goal_value(&result);
-    Ok(())
-}
-
-async fn active_goal_mutation_context(
-    client: &HttpKernelClient,
-    goal_id: Option<String>,
-    host: &SessionHostOptions,
-) -> Result<(String, String, u64, Value), String> {
-    let session_id = goal_session_id(client, host).await?;
-    let receipt = match goal_id.as_deref() {
-        Some(goal_id) => client.get_session_goal(&session_id, goal_id).await,
-        None => client.current_session_goal(&session_id).await,
-    }
-    .map_err(|error| format!("failed to read Goal mutation context: {error}"))?;
-    let projection = receipt
-        .projection
-        .ok_or_else(|| "Session has no Goal".to_string())?;
-    let goal_id = projection
-        .get("goalId")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "Goal Projection has no goalId".to_string())?
-        .to_string();
-    let revision = projection
-        .get("goalRevision")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| "Goal Projection has no goalRevision".to_string())?;
-    let head = projection
-        .get("sourceDomainHead")
-        .cloned()
-        .ok_or_else(|| "Goal Projection has no sourceDomainHead".to_string())?;
-    Ok((session_id, goal_id, revision, head))
-}
-
-async fn goal_session_id(
-    client: &HttpKernelClient,
-    host: &SessionHostOptions,
-) -> Result<String, String> {
-    if let Some(session_id) = host.session_id.clone() {
-        return Ok(session_id);
-    }
-    current_session_id(client, host).await?.ok_or_else(|| {
-        "no current session; pass --session <id> or create a session first".to_string()
-    })
-}
-
-fn print_goal_receipt(receipt: &deepcode_kernel_client::SessionGoalCommandReceipt) {
-    match receipt.projection.as_ref() {
-        Some(projection) => print_goal_value(projection),
-        None => println!("goal: none"),
-    }
-}
-
-fn print_goal_value(value: &Value) {
-    let projection = value.get("projection").unwrap_or(value);
-    if projection.is_null() {
-        println!("goal: none");
-        return;
-    }
-    println!(
-        "goal: {} r{} {}",
-        projection.get("goalId").and_then(Value::as_str).unwrap_or("-"),
-        projection
-            .get("goalRevision")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        projection
-            .get("lifecycle")
-            .and_then(Value::as_str)
-            .unwrap_or("-")
-    );
-    if let Some(objective) = projection.get("objective").and_then(Value::as_str) {
-        println!("objective: {objective}");
-    }
-    if let Some(pending) = projection.get("pendingInteraction") {
-        println!(
-            "waiting: {} interaction={} target={}",
-            pending.get("kind").and_then(Value::as_str).unwrap_or("-"),
-            pending
-                .get("interactionId")
-                .and_then(Value::as_str)
-                .unwrap_or("-"),
-            pending.get("targetId").and_then(Value::as_str).unwrap_or("-")
-        );
-    }
 }
 
 fn new_cli_request_id(prefix: &str) -> Result<String, String> {
@@ -550,19 +216,6 @@ fn new_cli_request_id(prefix: &str) -> Result<String, String> {
             .map_err(|error| format!("system clock is before Unix epoch: {error}"))?
             .as_nanos()
     ))
-}
-
-async fn wait_for_existing_run(
-    client: &HttpKernelClient,
-    session_id: &str,
-    run_id: &str,
-    show_progress: bool,
-) -> Result<AgentRunResult, String> {
-    let result = client
-        .get_agent_run(session_id, run_id)
-        .await
-        .map_err(|error| format!("failed to read Goal host run: {error}"))?;
-    wait_for_started_run(client, result, show_progress).await
 }
 
 async fn session_id_for_turn(
@@ -579,7 +232,6 @@ async fn session_id_for_turn(
     let scope = workspace_scope(host);
     let result = client
         .create_agent_session(CreateAgentSessionRequest {
-            initial_mode: Some("plan".to_string()),
             workspace_id: scope.as_ref().map(|scope| scope.workspace_id.clone()),
             workspace_hash: scope.as_ref().map(|scope| scope.workspace_hash.clone()),
             title: Some(title.to_string()),
@@ -829,7 +481,6 @@ pub(crate) async fn create_session(
     let scope = workspace_scope(host);
     let result = client
         .create_agent_session(CreateAgentSessionRequest {
-            initial_mode: Some("plan".to_string()),
             workspace_id: scope.as_ref().map(|scope| scope.workspace_id.clone()),
             workspace_hash: scope.as_ref().map(|scope| scope.workspace_hash.clone()),
             title,

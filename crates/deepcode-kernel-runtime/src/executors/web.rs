@@ -28,6 +28,32 @@ pub(crate) fn web_search_target_url(
         .replace("{limit}", &limit.clamp(1, 10).to_string()))
 }
 
+pub(crate) fn web_search_runtime_is_ready(
+    config: &KernelExecutorConfig,
+    secret_provider: &dyn SecretProvider,
+) -> bool {
+    let Ok(target) = web_search_target_url(config, "deepcode-runtime-readiness", 1) else {
+        return false;
+    };
+    if validate_http_url(&target).is_err() {
+        return false;
+    }
+    let secret_ref = config.web_search_auth_secret_ref.as_str();
+    if secret_ref.trim().is_empty() {
+        return true;
+    }
+    let Some(secret) = secret_provider.resolve(secret_ref) else {
+        return false;
+    };
+    if secret.is_empty()
+        || reqwest::header::HeaderName::from_bytes(config.web_search_auth_header_name.as_bytes())
+            .is_err()
+    {
+        return false;
+    }
+    reqwest::header::HeaderValue::from_str(&secret).is_ok()
+}
+
 pub(super) struct WebSearchExecutor {
     pub(super) config: KernelExecutorConfig,
     pub(super) secret_provider: Arc<dyn SecretProvider>,

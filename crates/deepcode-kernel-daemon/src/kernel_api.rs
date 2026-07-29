@@ -6,7 +6,6 @@ pub(crate) async fn health(State(state): State<AppState>) -> Json<ApiResponse> {
         .ok()
         .and_then(|workspace| serde_json::to_value(workspace).ok())
         .unwrap_or(Value::Null);
-    let tool_inventory = state.kernel_v2.service().tool_inventory();
     let build_info = packaged_build_info().unwrap_or(Value::Null);
     ApiResponse::ok(json!({
         "service": "deepcode-kernel-daemon",
@@ -16,13 +15,10 @@ pub(crate) async fn health(State(state): State<AppState>) -> Json<ApiResponse> {
         "buildInfo": build_info,
         "kernelAbiVersion": deepcode_kernel_abi::KERNEL_ABI_V2_VERSION,
         "protocolVersion": deepcode_kernel_abi::KERNEL_ABI_V2_VERSION,
-        "toolCatalogVersion": tool_inventory.catalog_version,
-        "toolCatalogCount": tool_inventory.tools.len(),
-        "toolCatalogDigest": tool_inventory.catalog_digest,
-        "toolInventory": tool_inventory,
         "workspace": workspace,
         "hostWorkspaceRegistry": format!("{:?}", state.host_services.workspace.readiness()).to_ascii_lowercase(),
         "hostActiveRunBrokerV2": state.host_services.active_runs_v2.status(),
+        "hostKernelStartupRecoveryV2": state.kernel_session_v2.startup_recovery_status(),
         "sessionKernelProjectionV2": state.host_services.projection_v2.status(),
         "audit": state.host_services.audit.status()
     }))
@@ -58,119 +54,6 @@ fn packaged_build_info() -> Option<Value> {
     ]
     .into_iter()
     .find_map(|path| read_json_file(&path))
-}
-
-pub(crate) async fn kernel_commands(
-    State(state): State<AppState>,
-    body: axum::body::Bytes,
-) -> Json<KernelReply> {
-    let body = match serde_json::from_slice::<KernelCommandEnvelope>(&body) {
-        Ok(body) => body,
-        Err(error) => {
-            return Json(KernelReply {
-                ok: false,
-                events: Vec::new(),
-                snapshot: None,
-                error: Some(KernelErrorEnvelope {
-                    code: "kernel_command_decode_failed".to_string(),
-                    message: format!("Kernel command JSON decode failed: {error}"),
-                    message_key: None,
-                    args: Some(json!({
-                        "expected": "KernelCommandEnvelope { command: KernelCommand }",
-                        "bodyPreview": kernel_command_body_preview(&body)
-                    })),
-                }),
-            });
-        }
-    };
-    Json(dispatch_kernel_command(&state, body))
-}
-
-fn kernel_command_body_preview(body: &[u8]) -> String {
-    let text = String::from_utf8_lossy(body);
-    let mut preview = String::new();
-    for line in text.lines() {
-        let lower = line.to_ascii_lowercase();
-        if lower.contains("authorization")
-            || lower.contains("api_key")
-            || lower.contains("apikey")
-            || lower.contains("secret")
-            || lower.contains("password")
-            || lower.contains("token")
-            || lower.contains("bearer ")
-        {
-            preview.push_str("[redacted-kernel-command-line]\n");
-        } else {
-            preview.push_str(line);
-            preview.push('\n');
-        }
-        if preview.chars().count() >= 1200 {
-            break;
-        }
-    }
-    preview.trim().chars().take(1200).collect()
-}
-
-pub(crate) async fn kernel_snapshot(
-    State(state): State<AppState>,
-    Query(query): Query<KernelSnapshotQuery>,
-) -> Json<KernelReply> {
-    let snapshot = {
-        let runtime = state.runtime.lock().expect("kernel runtime lock");
-        runtime.snapshot(query.session_id.as_deref())
-    };
-    Json(KernelReply {
-        ok: true,
-        events: Vec::new(),
-        snapshot: Some(snapshot),
-        error: None,
-    })
-}
-
-pub(crate) async fn kernel_events_stream(
-    State(state): State<AppState>,
-    Query(query): Query<KernelEventStreamQuery>,
-) -> Response {
-    let events = {
-        let events = state
-            .kernel_events
-            .lock()
-            .expect("kernel event stream lock");
-        events
-            .iter()
-            .filter(|event| {
-                query
-                    .session_id
-                    .as_deref()
-                    .map(|session_id| kernel_event_session_id(event).as_deref() == Some(session_id))
-                    .unwrap_or(true)
-            })
-            .cloned()
-            .collect::<Vec<_>>()
-    };
-
-    let mut body = String::new();
-    if events.is_empty() {
-        body.push_str(": deepcode kernel event stream ready\n\n");
-    } else {
-        for event in events {
-            let data = serde_json::to_string(&event)
-                .unwrap_or_else(|_| "{\"kind\":\"error\"}".to_string());
-            body.push_str("event: kernel\n");
-            body.push_str("data: ");
-            body.push_str(&data);
-            body.push_str("\n\n");
-        }
-    }
-
-    (
-        [
-            (header::CONTENT_TYPE, "text/event-stream; charset=utf-8"),
-            (header::CACHE_CONTROL, "no-cache"),
-        ],
-        body,
-    )
-        .into_response()
 }
 
 pub(crate) async fn api_route_not_found(

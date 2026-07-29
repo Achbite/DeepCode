@@ -5,14 +5,12 @@
  *   - 当前焦点目录决定 toolbar 新建文件 / 文件夹落点；
  *   - 右键菜单按资源类型显示 Explorer 操作；
  *   - 文件 / 文件夹均支持 inline rename；
- *   - 文件树右键可把文件 / 文件夹添加到当前 Agent 对话。
  */
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { getFileTree } from '../../services/runtimeAdapter';
 import type { FileTreeNode } from '@deepcode/protocol';
 import { useWorkspaceStore } from '../../state/workspaceStore';
 import { useUiStore } from '../../state/uiStore';
-import { useAgentSessionStore } from '../../state/agentSessionStore';
 import {
   ChevronRightIcon,
   ChevronDownIcon,
@@ -98,7 +96,6 @@ const FileTree: React.FC<FileTreeProps> = ({ onFileSelect, selectedTabId, langua
   const bumpTreeRevision = useWorkspaceStore((s) => s.bumpTreeRevision);
   const getActiveFolder = useWorkspaceStore((s) => s.getActiveFolder);
   const showWorkspaceOpenDialog = useUiStore((s) => s.showWorkspaceOpenDialog);
-  const addAgentAttachment = useAgentSessionStore((s) => s.addAttachment);
 
   const [tree, setTree] = useState<FileTreeNode[]>([]);
   const [expandedDirs, setExpandedDirs] = useState<Set<string>>(new Set());
@@ -319,21 +316,6 @@ const FileTree: React.FC<FileTreeProps> = ({ onFileSelect, selectedTabId, langua
     event.stopPropagation();
     setSelectedResource(target);
     setContextMenu({ x: event.clientX, y: event.clientY, target });
-  };
-
-  const addToAgent = (target: ResourceTarget, scope: 'message' | 'session' = 'message') => {
-    const folder =
-      currentWorkspace?.folders.find((candidate) => candidate.id === target.folderId) ??
-      getActiveFolder();
-    addAgentAttachment({
-      kind: target.kind,
-      path: target.path,
-      absolutePath: folder ? absolutePathForTarget(folder.absolutePath, target.path) : undefined,
-      folderId: target.folderId,
-      source: 'contextMenu',
-      scope,
-    });
-    setContextMenu(null);
   };
 
   const copyRelativePath = async (target: ResourceTarget) => {
@@ -585,8 +567,6 @@ const FileTree: React.FC<FileTreeProps> = ({ onFileSelect, selectedTabId, langua
           onDelete={() => void submitDelete(contextMenu.target)}
           onCopyRelativePath={() => void copyRelativePath(contextMenu.target)}
           onCopyAbsolutePath={() => void copyAbsolutePath(contextMenu.target)}
-          onAddToAgent={() => addToAgent(contextMenu.target, 'message')}
-          onAddToAgentSession={() => addToAgent(contextMenu.target, 'session')}
           deleting={false}
           language={language}
         />
@@ -654,8 +634,6 @@ interface ExplorerContextMenuProps {
   onDelete: () => void;
   onCopyRelativePath: () => void;
   onCopyAbsolutePath: () => void;
-  onAddToAgent: () => void;
-  onAddToAgentSession: () => void;
   deleting: boolean;
   language: UiLanguage;
 }
@@ -668,8 +646,6 @@ const ExplorerContextMenu: React.FC<ExplorerContextMenuProps> = ({
   onDelete,
   onCopyRelativePath,
   onCopyAbsolutePath,
-  onAddToAgent,
-  onAddToAgentSession,
   deleting,
   language,
 }) => {
@@ -723,13 +699,6 @@ const ExplorerContextMenu: React.FC<ExplorerContextMenuProps> = ({
       </button>
       <button type="button" onClick={(event) => runAction(event, onCopyAbsolutePath)}>
         {t(language, 'explorer.copyAbsolutePath')}
-      </button>
-      <div className="file-tree__context-separator" />
-      <button type="button" onClick={(event) => runAction(event, onAddToAgent)}>
-        {t(language, 'explorer.addToAgentMessage')}
-      </button>
-      <button type="button" onClick={(event) => runAction(event, onAddToAgentSession)}>
-        {t(language, 'explorer.pinToAgentSession')}
       </button>
     </div>
   );

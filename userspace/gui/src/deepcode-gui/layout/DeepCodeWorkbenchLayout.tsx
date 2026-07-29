@@ -6,13 +6,11 @@ import type {
   BrowsePathResult,
   InitialLocation,
 } from '@deepcode/protocol';
-import type { SessionMemorySnapshot } from '@deepcode/session-core';
 import { normalizeUiLanguage, t, type UiLanguage } from '../../i18n';
 import {
   browsePath,
   createAgentProject,
   deleteAgentProject,
-  getAgentSessionMemorySnapshot,
   getInitialLocations,
   listAgentProjects,
   listAgentSessions,
@@ -73,16 +71,6 @@ interface DeepCodeProjectContextMenu {
 interface DeepCodeProjectCreateMenu {
   x: number;
   y: number;
-}
-
-interface DeepCodeMemoryPanel {
-  kind: 'project' | 'session';
-  title: string;
-  subtitle?: string;
-  sessionIds: string[];
-  snapshots: SessionMemorySnapshot[];
-  loading: boolean;
-  error?: string | null;
 }
 
 interface DeepCodeTextInputDialog {
@@ -402,7 +390,7 @@ function deriveCacheHitSummary(
   language: UiLanguage,
   tokenUsageProjection?: AgentTimelineResult['tokenUsageProjection'] | null
 ): DeepCodeCacheHitSummary | null {
-  const stats = deriveTokenUsageStats([], tokenUsageProjection);
+  const stats = deriveTokenUsageStats(tokenUsageProjection);
   const percent = formatPercent(stats.cacheHitRate);
   const label = t(language, 'deepcodeGui.cache.label', { percent });
   if (!stats.hasCacheData) {
@@ -439,7 +427,8 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
   const [projectFolderDialogOpen, setProjectFolderDialogOpen] = useState(false);
   const [rebindProjectId, setRebindProjectId] = useState<string | null>(null);
   const [textDialog, setTextDialog] = useState<DeepCodeTextInputDialog | null>(null);
-  const [memoryPanel, setMemoryPanel] = useState<DeepCodeMemoryPanel | null>(null);
+  const [memoryOpen, setMemoryOpen] = useState(false);
+  const [memoryRefreshing, setMemoryRefreshing] = useState(false);
   const [sidebarPendingAction, setSidebarPendingAction] = useState<string | null>(null);
   const pendingProjectSendRef = useRef<PendingProjectSession | null>(null);
   const sidebarPendingActionRef = useRef<string | null>(null);
@@ -459,11 +448,9 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
   const activateSession = useAgentSessionStore((s) => s.activateSession);
   const renameSession = useAgentSessionStore((s) => s.renameSession);
   const deleteSession = useAgentSessionStore((s) => s.deleteSession);
+  const refreshActiveSessionContext = useAgentSessionStore((s) => s.refreshActiveSessionContext);
   const language = normalizeUiLanguage(
     useSettingsStore((s) => s.effectiveSettings['workbench.language'])
-  );
-  const projectMemoryMode = useSettingsStore((s) =>
-    s.effectiveSettings['agent.memory.projectMode'] === 'auto' ? 'auto' : 'confirm'
   );
 
   useEffect(() => {
@@ -579,13 +566,6 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
     }
     return Array.from(byId.values());
   }, [activeSession, events.length, knownSessions, sessions]);
-  const memorySessionLabels = useMemo(() => {
-    const labels: Record<string, string> = {};
-    for (const session of displaySessions) {
-      labels[session.id] = displaySessionTitle(language, session.title);
-    }
-    return labels;
-  }, [displaySessions, language]);
   const activeSessionRunning = Boolean(activeSession?.id && runningSessionIds.includes(activeSession.id));
   const highlightedSessionId = projectDraftActive ? null : activeSession?.id ?? null;
   const isHome = projectDraftActive
@@ -662,7 +642,11 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
     if (!draftTargetProjectId) return true;
     const targetProjectId = draftTargetProjectId;
     pendingProjectSendRef.current = null;
-    const nextSession = await createNewSession({ reuseEmpty: true, projectId: targetProjectId });
+    const nextSession = await createNewSession({
+      reuseEmpty: true,
+      projectId: targetProjectId,
+      preserveAttachments: true,
+    });
     if (!nextSession?.id) {
       return false;
     }
@@ -855,56 +839,6 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
     await copyText(session.id);
   };
 
-  const loadMemoryPanelSnapshots = async (
-    basePanel: Omit<DeepCodeMemoryPanel, 'snapshots' | 'loading' | 'error'>
-  ) => {
-    setMemoryPanel({
-      ...basePanel,
-      snapshots: [],
-      loading: true,
-      error: null,
-    });
-    const snapshots: SessionMemorySnapshot[] = [];
-    let error: string | null = null;
-    for (const sessionId of basePanel.sessionIds) {
-      const result = await getAgentSessionMemorySnapshot(sessionId, { projectMemoryMode });
-      if (result.ok && result.data) {
-        snapshots.push(result.data);
-      } else {
-        error = result.message ?? result.error ?? t(language, 'memory.loadFailed');
-      }
-    }
-    setMemoryPanel({
-      ...basePanel,
-      snapshots,
-      loading: false,
-      error,
-    });
-  };
-
-  const handleOpenSessionMemory = (session: AgentSession) => {
-    setSessionMenu(null);
-    void loadMemoryPanelSnapshots({
-      kind: 'session',
-      title: t(language, 'memory.sessionMemory'),
-      subtitle: displaySessionTitle(language, session.title),
-      sessionIds: [session.id],
-    });
-  };
-
-  const handleOpenProjectMemory = (project: DeepCodeGuiProject) => {
-    setProjectMenu(null);
-    const sessionIds = displaySessions
-      .filter((session) => session.projectId === project.id)
-      .map((session) => session.id);
-    void loadMemoryPanelSnapshots({
-      kind: 'project',
-      title: t(language, 'memory.projectMemory'),
-      subtitle: project.title,
-      sessionIds,
-    });
-  };
-
   const handleMoveSessionToProject = (session: AgentSession, projectId: string) => {
     setSessionMenu(null);
     void moveSessionToProject(projectId, session.id);
@@ -1018,8 +952,19 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
           <div className="deepcode-gui-session-context-menu__title">
             {displaySessionTitle(language, sessionMenu.session.title)}
           </div>
-          <button type="button" role="menuitem" onClick={() => handleOpenSessionMemory(sessionMenu.session)}>
-            {t(language, 'memory.openSessionMemory')}
+          <button
+            type="button"
+            role="menuitem"
+            disabled={activeSession?.id !== sessionMenu.session.id}
+            title={activeSession?.id === sessionMenu.session.id
+              ? t(language, 'memoryV2.open')
+              : t(language, 'memoryV2.currentOnly')}
+            onClick={() => {
+              setSessionMenu(null);
+              setMemoryOpen(true);
+            }}
+          >
+            {t(language, 'memoryV2.open')}
           </button>
           <button type="button" role="menuitem" onClick={() => handleRenameSession(sessionMenu.session)}>
             {t(language, 'agent.session.rename')}
@@ -1070,9 +1015,6 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
           <div className="deepcode-gui-session-context-menu__title">
             {projectMenu.project.title}
           </div>
-          <button type="button" role="menuitem" onClick={() => handleOpenProjectMemory(projectMenu.project)}>
-            {t(language, 'memory.openProjectMemory')}
-          </button>
           <button type="button" role="menuitem" onClick={() => handleRenameProject(projectMenu.project)}>
             {t(language, 'deepcodeGui.project.rename')}
           </button>
@@ -1087,6 +1029,34 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
           >
             {t(language, 'deepcodeGui.project.delete')}
           </button>
+        </div>
+      )}
+
+      {memoryOpen && (
+        <div
+          className="agent-memory-overlay"
+          role="dialog"
+          aria-modal="true"
+          aria-label={t(language, 'memoryV2.title')}
+          onMouseDown={() => setMemoryOpen(false)}
+        >
+          <div className="agent-memory-sheet" onMouseDown={(event) => event.stopPropagation()}>
+            <AgentMemoryViewer
+              language={language}
+              events={events}
+              sessionId={activeSession?.id}
+              refreshing={memoryRefreshing}
+              onRefresh={async () => {
+                setMemoryRefreshing(true);
+                try {
+                  await refreshActiveSessionContext();
+                } finally {
+                  setMemoryRefreshing(false);
+                }
+              }}
+              onClose={() => setMemoryOpen(false)}
+            />
+          </div>
         </div>
       )}
 
@@ -1150,39 +1120,6 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
           }}
           onSelect={(path) => void commitProjectFolderPath(path)}
         />
-      )}
-
-      {memoryPanel && (
-        <div
-          className="deepcode-gui-memory-overlay"
-          role="dialog"
-          aria-modal="true"
-          aria-label={memoryPanel.title}
-          onMouseDown={() => setMemoryPanel(null)}
-        >
-          <section
-            className="deepcode-gui-memory-sheet"
-            onMouseDown={(event) => event.stopPropagation()}
-          >
-            <AgentMemoryViewer
-              language={language}
-              title={memoryPanel.title}
-              subtitle={memoryPanel.subtitle}
-              snapshots={memoryPanel.snapshots}
-              defaultScope={memoryPanel.kind === 'session' ? 'session' : 'project'}
-              loading={memoryPanel.loading}
-              error={memoryPanel.error}
-              sessionLabels={memorySessionLabels}
-              onRefresh={() => void loadMemoryPanelSnapshots({
-                kind: memoryPanel.kind,
-                title: memoryPanel.title,
-                subtitle: memoryPanel.subtitle,
-                sessionIds: memoryPanel.sessionIds,
-              })}
-              onClose={() => setMemoryPanel(null)}
-            />
-          </section>
-        </div>
       )}
 
       <Suspense fallback={null}>

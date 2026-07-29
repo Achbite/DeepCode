@@ -5,7 +5,8 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "DeepCode kernel tool registry, operation compiler, and work-unit graph metadata."
+description = "DeepCode Kernel v2 tool registry, canonicalization, and execution adapter metadata."
+publish = false
 
 [dependencies]
 deepcode-kernel-abi = { path = "../deepcode-kernel-abi" }

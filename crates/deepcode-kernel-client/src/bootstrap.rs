@@ -1,9 +1,51 @@
 use super::*;
+use deepcode_kernel_abi::{
+    HOST_AUTHORITY_ENTROPY_BYTES_V2, HOST_INSTANCE_ID_ENV_V2, HOST_INSTANCE_ID_PREFIX_V2,
+    HOST_SHELL_CAPABILITY_PREFIX_V2,
+};
+use serde::{Deserialize, Serialize};
+use std::fmt;
+use std::fs::{File, OpenOptions};
+use std::io::{ErrorKind, Write};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::time::Duration;
 
-#[derive(Debug, Clone)]
+#[cfg(unix)]
+use std::os::unix::process::CommandExt as UnixCommandExt;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt as WindowsCommandExt;
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+#[cfg(windows)]
+use windows_sys::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+    SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+};
+
+#[derive(Clone)]
 pub struct KernelBootstrapOptions {
     pub api: Option<String>,
     pub auto_start: bool,
+    host_shell_capability: Option<HostShellCapabilityV2>,
+}
+
+impl fmt::Debug for KernelBootstrapOptions {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("KernelBootstrapOptions")
+            .field("api", &self.api)
+            .field("auto_start", &self.auto_start)
+            .field(
+                "host_shell_capability",
+                &self.host_shell_capability.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
 }
 
 impl KernelBootstrapOptions {
@@ -11,11 +53,17 @@ impl KernelBootstrapOptions {
         Self {
             api,
             auto_start: true,
+            host_shell_capability: None,
         }
     }
 
     pub fn auto_start(mut self, auto_start: bool) -> Self {
         self.auto_start = auto_start;
+        self
+    }
+
+    pub fn host_shell_capability(mut self, capability: impl Into<String>) -> Self {
+        self.host_shell_capability = Some(HostShellCapabilityV2::new(capability));
         self
     }
 }
@@ -27,58 +75,114 @@ pub struct KernelBootstrap {
 
 impl KernelBootstrap {
     pub async fn connect(options: KernelBootstrapOptions) -> KernelClientResult<Self> {
-        let config = options
+        let mut config = options
             .api
             .map(KernelClientConfig::new)
             .unwrap_or_else(KernelClientConfig::from_env);
-        let client = HttpKernelClient::new(config);
-        if probe_kernel_health(&client).await {
-            return Ok(Self {
-                client,
-                _guard: KernelBootstrapGuard::external(),
+        if let Some(capability) = options.host_shell_capability {
+            config.host_shell_capability = Some(capability);
+        }
+        config.validate_host_shell_capability()?;
+        if !is_local_kernel_url(&config.base_url) {
+            if !config.has_host_shell_capability() {
+                return Err(KernelClientError::HostAdmissionCapabilityMissing);
+            }
+            return Err(KernelClientError::DaemonUnavailable {
+                base_url: config.base_url.clone(),
+                reason: "Host admission is restricted to a local Kernel URL".to_string(),
             });
+        }
+        match probe_existing_kernel(&config).await? {
+            ExistingKernelProbe::Healthy(client) => {
+                return Ok(Self {
+                    client,
+                    _guard: KernelBootstrapGuard::external(),
+                });
+            }
+            ExistingKernelProbe::NotListening => {}
+            ExistingKernelProbe::AdmissionMissing => {
+                return Err(KernelClientError::HostAdmissionCapabilityMissing);
+            }
+            ExistingKernelProbe::AdmissionRejected => {
+                return Err(KernelClientError::HostAdmissionRejected {
+                    base_url: config.base_url.clone(),
+                });
+            }
+            ExistingKernelProbe::Unavailable(reason) => {
+                return Err(KernelClientError::DaemonUnavailable {
+                    base_url: config.base_url.clone(),
+                    reason,
+                });
+            }
         }
 
         if !kernel_auto_start_enabled(options.auto_start) {
-            return Ok(Self {
-                client,
-                _guard: KernelBootstrapGuard::external(),
+            if !config.has_host_shell_capability() {
+                return Err(KernelClientError::HostAdmissionCapabilityMissing);
+            }
+            return Err(KernelClientError::DaemonUnavailable {
+                base_url: config.base_url.clone(),
+                reason: "automatic startup is disabled".to_string(),
             });
         }
 
-        if !is_local_kernel_url(client.base_url()) {
-            return Ok(Self {
-                client,
-                _guard: KernelBootstrapGuard::external(),
-            });
-        }
-
-        let (host, port) = parse_kernel_host_port(client.base_url()).ok_or_else(|| {
+        let (host, port) = parse_kernel_host_port(&config.base_url).ok_or_else(|| {
             KernelClientError::Bootstrap(format!(
                 "cannot resolve local host/port from {}",
-                client.base_url()
+                config.base_url
             ))
         })?;
         let Some(_start_lock) = acquire_kernel_start_lock(&host, &port)? else {
+            if !config.has_host_shell_capability() {
+                return Err(KernelClientError::HostAdmissionCapabilityMissing);
+            }
             for _ in 0..80 {
-                if probe_kernel_health(&client).await {
-                    return Ok(Self {
-                        client,
-                        _guard: KernelBootstrapGuard::external(),
-                    });
+                match probe_existing_kernel(&config).await? {
+                    ExistingKernelProbe::Healthy(client) => {
+                        return Ok(Self {
+                            client,
+                            _guard: KernelBootstrapGuard::external(),
+                        });
+                    }
+                    ExistingKernelProbe::AdmissionRejected => {
+                        return Err(KernelClientError::HostAdmissionRejected {
+                            base_url: config.base_url.clone(),
+                        });
+                    }
+                    ExistingKernelProbe::AdmissionMissing => {
+                        return Err(KernelClientError::HostAdmissionCapabilityMissing);
+                    }
+                    ExistingKernelProbe::NotListening | ExistingKernelProbe::Unavailable(_) => {}
                 }
                 std::thread::sleep(Duration::from_millis(75));
             }
-            return Err(KernelClientError::Bootstrap(format!(
-                "kernel start is already in progress for {} but did not become healthy",
-                client.base_url()
-            )));
-        };
-        if probe_kernel_health(&client).await {
-            return Ok(Self {
-                client,
-                _guard: KernelBootstrapGuard::external(),
+            return Err(KernelClientError::DaemonUnavailable {
+                base_url: config.base_url.clone(),
+                reason: "another owner is starting the Kernel, but its authenticated health endpoint did not become ready".to_string(),
             });
+        };
+        match probe_existing_kernel(&config).await? {
+            ExistingKernelProbe::Healthy(client) => {
+                return Ok(Self {
+                    client,
+                    _guard: KernelBootstrapGuard::external(),
+                });
+            }
+            ExistingKernelProbe::NotListening => {}
+            ExistingKernelProbe::AdmissionMissing => {
+                return Err(KernelClientError::HostAdmissionCapabilityMissing);
+            }
+            ExistingKernelProbe::AdmissionRejected => {
+                return Err(KernelClientError::HostAdmissionRejected {
+                    base_url: config.base_url.clone(),
+                });
+            }
+            ExistingKernelProbe::Unavailable(reason) => {
+                return Err(KernelClientError::DaemonUnavailable {
+                    base_url: config.base_url.clone(),
+                    reason,
+                });
+            }
         }
         let kernel_bin = find_kernel_binary().ok_or_else(|| {
             KernelClientError::Bootstrap(
@@ -86,23 +190,66 @@ impl KernelBootstrap {
                     .to_string(),
             )
         })?;
-        let mut child = spawn_kernel_binary(&kernel_bin, &host, &port)?;
+        let owned_capability = generate_host_authority_value(HOST_SHELL_CAPABILITY_PREFIX_V2)?;
+        let owned_instance_id = generate_host_authority_value(HOST_INSTANCE_ID_PREFIX_V2)?;
+        let mut process = spawn_kernel_binary(
+            &kernel_bin,
+            &host,
+            &port,
+            &owned_capability,
+            &owned_instance_id,
+        )?;
+        let owned_config = config.with_host_shell_capability(owned_capability);
+        drop(owned_instance_id);
 
         for _ in 0..80 {
-            if probe_kernel_health(&client).await {
-                return Ok(Self {
-                    client,
-                    _guard: KernelBootstrapGuard::owned(child),
-                });
+            let probe = match probe_existing_kernel(&owned_config).await {
+                Ok(probe) => probe,
+                Err(error) => {
+                    terminate_owned_kernel_process(&mut process);
+                    return Err(error);
+                }
+            };
+            match probe {
+                ExistingKernelProbe::Healthy(client) => {
+                    return Ok(Self {
+                        client,
+                        _guard: KernelBootstrapGuard::owned(process),
+                    });
+                }
+                ExistingKernelProbe::AdmissionRejected => {
+                    terminate_owned_kernel_process(&mut process);
+                    return Err(KernelClientError::HostAdmissionRejected {
+                        base_url: owned_config.base_url.clone(),
+                    });
+                }
+                ExistingKernelProbe::AdmissionMissing => {
+                    terminate_owned_kernel_process(&mut process);
+                    return Err(KernelClientError::HostAdmissionCapabilityMissing);
+                }
+                ExistingKernelProbe::NotListening | ExistingKernelProbe::Unavailable(_) => {}
+            }
+            match process.child.try_wait() {
+                Ok(Some(status)) => {
+                    return Err(KernelClientError::Bootstrap(format!(
+                        "owned Kernel process exited before authenticated health became ready: {status}"
+                    )));
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    terminate_owned_kernel_process(&mut process);
+                    return Err(KernelClientError::Bootstrap(format!(
+                        "failed to observe the owned Kernel process: {error}"
+                    )));
+                }
             }
             std::thread::sleep(Duration::from_millis(75));
         }
 
-        let _ = child.kill();
-        let _ = child.wait();
+        terminate_owned_kernel_process(&mut process);
         Err(KernelClientError::Bootstrap(format!(
             "kernel did not become healthy at {}",
-            client.base_url()
+            owned_config.base_url
         )))
     }
 
@@ -112,16 +259,18 @@ impl KernelBootstrap {
 }
 
 pub struct KernelBootstrapGuard {
-    child: Option<Child>,
+    process: Option<OwnedKernelProcess>,
 }
 
 impl KernelBootstrapGuard {
     fn external() -> Self {
-        Self { child: None }
+        Self { process: None }
     }
 
-    fn owned(child: Child) -> Self {
-        Self { child: Some(child) }
+    fn owned(process: OwnedKernelProcess) -> Self {
+        Self {
+            process: Some(process),
+        }
     }
 }
 
@@ -129,11 +278,23 @@ impl Drop for KernelBootstrapGuard {
     fn drop(&mut self) {
         // Only the shell that spawned the daemon owns its lifetime. Connections to an
         // already-running daemon use the external guard and are never terminated here.
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+        if let Some(mut process) = self.process.take() {
+            terminate_owned_kernel_process(&mut process);
         }
     }
+}
+
+struct OwnedKernelProcess {
+    child: Child,
+    #[cfg(unix)]
+    process_group_id: libc::pid_t,
+    #[cfg(windows)]
+    job: WindowsKillOnCloseJob,
+}
+
+#[cfg(windows)]
+struct WindowsKillOnCloseJob {
+    handle: Option<HANDLE>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -143,11 +304,54 @@ pub struct DaemonStatus {
     pub raw: Value,
 }
 
-async fn probe_kernel_health(client: &HttpKernelClient) -> bool {
-    if !probe_kernel_tcp(client.base_url()) {
-        return false;
+enum ExistingKernelProbe {
+    NotListening,
+    Healthy(HttpKernelClient),
+    AdmissionMissing,
+    AdmissionRejected,
+    Unavailable(String),
+}
+
+async fn probe_existing_kernel(
+    config: &KernelClientConfig,
+) -> KernelClientResult<ExistingKernelProbe> {
+    if !probe_kernel_tcp(&config.base_url) {
+        return Ok(ExistingKernelProbe::NotListening);
     }
-    matches!(client.health().await, Ok(status) if status.ok)
+    if !config.has_host_shell_capability() {
+        return Ok(ExistingKernelProbe::AdmissionMissing);
+    }
+    let client = HttpKernelClient::new(config.clone())?;
+    match client.health().await {
+        Ok(status) if status.ok => Ok(ExistingKernelProbe::Healthy(client)),
+        Ok(_) => Ok(ExistingKernelProbe::Unavailable(
+            "authenticated health endpoint reported an unhealthy state".to_string(),
+        )),
+        Err(KernelClientError::Http(error))
+            if error.status() == Some(reqwest::StatusCode::UNAUTHORIZED) =>
+        {
+            Ok(ExistingKernelProbe::AdmissionRejected)
+        }
+        Err(error) => Ok(ExistingKernelProbe::Unavailable(error.to_string())),
+    }
+}
+
+fn generate_host_authority_value(prefix: &str) -> KernelClientResult<String> {
+    let mut entropy = [0_u8; HOST_AUTHORITY_ENTROPY_BYTES_V2];
+    getrandom::fill(&mut entropy).map_err(|error| {
+        KernelClientError::Bootstrap(format!(
+            "operating-system CSPRNG could not create Host admission authority: {error}"
+        ))
+    })?;
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(prefix.len() + entropy.len() * 2);
+    encoded.push_str(prefix);
+    for &byte in &entropy {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    entropy.fill(0);
+    Ok(encoded)
 }
 
 fn probe_kernel_tcp(base_url: &str) -> bool {
@@ -396,7 +600,13 @@ fn kernel_platform_dir_names() -> Vec<&'static str> {
     }
 }
 
-fn spawn_kernel_binary(kernel_bin: &Path, host: &str, port: &str) -> KernelClientResult<Child> {
+fn spawn_kernel_binary(
+    kernel_bin: &Path,
+    host: &str,
+    port: &str,
+    host_shell_capability: &str,
+    host_instance_id: &str,
+) -> KernelClientResult<OwnedKernelProcess> {
     let kernel_dir = kernel_bin
         .parent()
         .map(Path::to_path_buf)
@@ -410,19 +620,159 @@ fn spawn_kernel_binary(kernel_bin: &Path, host: &str, port: &str) -> KernelClien
         .current_dir(&kernel_dir)
         .env("DEEPCODE_HOST", host)
         .env("DEEPCODE_PORT", port)
+        .env(HOST_SHELL_CAPABILITY_ENV_V2, host_shell_capability)
+        .env(HOST_INSTANCE_ID_ENV_V2, host_instance_id)
         .stdin(Stdio::null())
         .stdout(Stdio::from(log_file))
         .stderr(Stdio::from(stderr));
 
     #[cfg(unix)]
-    command.process_group(0);
+    {
+        command.process_group(0);
+        let mut child = command.spawn().map_err(|error| {
+            KernelClientError::Bootstrap(format!(
+                "failed to start {}: {error}",
+                kernel_bin.display()
+            ))
+        })?;
+        let pid = child.id() as libc::pid_t;
+        let process_group_id = unsafe { libc::getpgid(pid) };
+        if process_group_id <= 0 || process_group_id != pid {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(KernelClientError::Bootstrap(format!(
+                "{} did not enter its exact owned process group",
+                kernel_bin.display()
+            )));
+        }
+        return Ok(OwnedKernelProcess {
+            child,
+            process_group_id,
+        });
+    }
 
     #[cfg(windows)]
-    command.creation_flags(0x0800_0000);
+    {
+        let job = WindowsKillOnCloseJob::new().map_err(|error| {
+            KernelClientError::Bootstrap(format!(
+                "failed to create the Kernel process owner: {error}"
+            ))
+        })?;
+        command.creation_flags(0x0800_0200);
+        let mut child = command.spawn().map_err(|error| {
+            KernelClientError::Bootstrap(format!(
+                "failed to start {}: {error}",
+                kernel_bin.display()
+            ))
+        })?;
+        if let Err(error) = job.assign(&child) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(KernelClientError::Bootstrap(format!(
+                "failed to assign {} to its process owner: {error}",
+                kernel_bin.display()
+            )));
+        }
+        return Ok(OwnedKernelProcess { child, job });
+    }
+}
 
-    command.spawn().map_err(|error| {
-        KernelClientError::Bootstrap(format!("failed to start {}: {error}", kernel_bin.display()))
-    })
+fn terminate_owned_kernel_process(process: &mut OwnedKernelProcess) {
+    if process.child.try_wait().ok().flatten().is_some() {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        let pid = process.child.id() as libc::pid_t;
+        if unsafe { libc::getpgid(pid) } == process.process_group_id {
+            unsafe {
+                libc::kill(-process.process_group_id, libc::SIGTERM);
+            }
+        }
+        if !wait_for_kernel_exit(process, 20) {
+            if unsafe { libc::getpgid(pid) } == process.process_group_id {
+                unsafe {
+                    libc::kill(-process.process_group_id, libc::SIGKILL);
+                }
+            } else {
+                let _ = process.child.kill();
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        process.job.close();
+        if !wait_for_kernel_exit(process, 20) {
+            let _ = process.child.kill();
+        }
+    }
+    let _ = process.child.wait();
+}
+
+fn wait_for_kernel_exit(process: &mut OwnedKernelProcess, attempts: usize) -> bool {
+    for _ in 0..attempts {
+        match process.child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
+#[cfg(windows)]
+impl WindowsKillOnCloseJob {
+    fn new() -> std::io::Result<Self> {
+        let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if handle.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut information = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        information.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let configured = unsafe {
+            SetInformationJobObject(
+                handle,
+                JobObjectExtendedLimitInformation,
+                (&information as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        };
+        if configured == 0 {
+            unsafe {
+                CloseHandle(handle);
+            }
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self {
+            handle: Some(handle),
+        })
+    }
+
+    fn assign(&self, child: &Child) -> std::io::Result<()> {
+        let Some(handle) = self.handle else {
+            return Err(std::io::Error::other("Kernel Job Object is closed"));
+        };
+        let process_handle = child.as_raw_handle() as HANDLE;
+        if unsafe { AssignProcessToJobObject(handle, process_handle) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn close(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            unsafe {
+                CloseHandle(handle);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsKillOnCloseJob {
+    fn drop(&mut self) {
+        self.close();
+    }
 }
 
 struct KernelStartLock {

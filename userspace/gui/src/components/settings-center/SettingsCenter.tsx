@@ -14,7 +14,6 @@ import RulerRulesSection from './sections/RulerRulesSection';
 import LlmSection from './sections/LlmSection';
 import McpServicesSection from './sections/McpServicesSection';
 import {
-  AgentSettingsSection,
   GuiSettingsSection,
   PermissionSettingsSection,
   UnavailableIntegrationSection,
@@ -24,7 +23,6 @@ type SettingsKey =
   | 'workspace'
   | 'common'
   | 'gui'
-  | 'agent'
   | 'permissions'
   | 'token'
   | 'llm'
@@ -91,8 +89,6 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
             query={searchQuery}
           />
         );
-      case 'agent':
-        return <AgentSettingsSection query={searchQuery} />;
       case 'permissions':
         return <PermissionSettingsSection query={searchQuery} />;
       case 'token':
@@ -181,7 +177,6 @@ function guiNavGroups(language: ReturnType<typeof normalizeUiLanguage>): NavGrou
       label: t(language, 'settings.navGroup.personal'),
       items: [
         { key: 'gui', icon: 'GU', label: t(language, 'settings.nav.gui') },
-        { key: 'agent', icon: 'AG', label: t(language, 'settings.nav.agent') },
         { key: 'permissions', icon: 'PM', label: t(language, 'settings.nav.permissions') },
         { key: 'token', icon: 'TK', label: t(language, 'settings.nav.token') },
       ],

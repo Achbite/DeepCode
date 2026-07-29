@@ -4,7 +4,6 @@ import type {
   ToolContextRefV2,
   ToolDescriptorV2,
 } from '@deepcode/protocol';
-import type { PromptEnvelopeBuilderInput } from '../prompt/types.js';
 
 export interface ProviderToolContextBindingV2 {
   bundle: ToolContextBundleV2;
@@ -97,26 +96,6 @@ export function toolContextRefV2(bundle: ToolContextBundleV2): ToolContextRefV2 
     contextVersion: bundle.contextVersion,
     catalogDigest: bundle.catalogDigest,
     contextDigest: bundle.contextDigest,
-  };
-}
-
-/**
- * The Prompt builder consumes fixedPrompt verbatim. Any caller-supplied
- * catalog summary is cleared so Session cannot publish a second, divergent
- * tool description beside the Kernel-owned block.
- */
-export function withKernelToolContextV2(
-  input: PromptEnvelopeBuilderInput,
-  bundle: ToolContextBundleV2
-): PromptEnvelopeBuilderInput {
-  assertProviderSafeToolContextV2(bundle);
-  const {
-    toolCatalogSummary: _discardedToolCatalogSummary,
-    ...withoutCallerCatalog
-  } = input;
-  return {
-    ...withoutCallerCatalog,
-    kernelToolContext: bundle,
   };
 }
 

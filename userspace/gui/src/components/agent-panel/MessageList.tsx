@@ -1,5 +1,9 @@
 import React from 'react';
-import type { AgentTimelineBlock, AgentTimelineResult } from '@deepcode/protocol';
+import type {
+  AgentTimelineAttachment,
+  AgentTimelineBlock,
+  AgentTimelineResult,
+} from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
 import MarkdownContent from './LazyMarkdownContent';
 import {
@@ -12,26 +16,6 @@ interface MessageListProps {
   timeline: AgentTimelineResult;
   loading?: boolean;
   language: UiLanguage;
-  resolvingPlan?: {
-    runId: string;
-    planId: string;
-    decision: 'accept' | 'reject' | 'revise';
-  } | null;
-  resolvingReview?: {
-    runId: string;
-    decision: 'accept' | 'reject' | 'revise';
-  } | null;
-  onPlanResolve?: (
-    runId: string,
-    planId: string,
-    decision: 'accept' | 'reject' | 'revise',
-    guidance?: string
-  ) => void;
-  onReviewResolve?: (
-    runId: string,
-    decision: 'accept' | 'reject' | 'revise',
-    guidance?: string
-  ) => void;
 }
 
 function blockText(block: AgentTimelineBlock, language: UiLanguage): string {
@@ -40,11 +24,40 @@ function blockText(block: AgentTimelineBlock, language: UiLanguage): string {
     block.summary;
 }
 
+function AttachmentChips({
+  attachments,
+  language,
+}: {
+  attachments: AgentTimelineAttachment[];
+  language: UiLanguage;
+}) {
+  if (attachments.length === 0) return null;
+  return (
+    <div className="agent-message-attachments" aria-label={t(language, 'agent.message.attachments')}>
+      {attachments.map((attachment, index) => (
+        <span
+          key={`${attachment.scope}:${attachment.folderId ?? ''}:${attachment.path}:${index}`}
+          className={`agent-message-attachment agent-message-attachment--${attachment.scope}`}
+          title={attachment.path}
+        >
+          <span className="agent-message-attachment__kind">
+            {attachment.kind === 'directory'
+              ? t(language, 'agent.composer.dir')
+              : t(language, 'agent.composer.file')}
+          </span>
+          <span className="agent-message-attachment__path">{attachment.path || '.'}</span>
+        </span>
+      ))}
+    </div>
+  );
+}
+
 function UserBlock({ block, language }: { block: AgentTimelineBlock; language: UiLanguage }) {
   return (
     <article className="agent-message agent-message--user">
       <div className="agent-message__role">{t(language, 'agent.message.user')}</div>
       <div className="agent-message__body agent-message__body--plain">{blockText(block, language)}</div>
+      <AttachmentChips attachments={block.attachments ?? []} language={language} />
     </article>
   );
 }
@@ -151,7 +164,7 @@ function ProjectedBlock({ block, language }: { block: AgentTimelineBlock; langua
   if (block.narrativeKind === 'plan' || block.narrativeKind === 'review' || block.kind === 'plan' || block.kind === 'review') {
     return <StructuredBlock block={block} language={language} />;
   }
-  if (block.narrativeKind === 'operationEvidence' || block.narrativeKind === 'verification' || block.kind === 'toolBatch') {
+  if (block.narrativeKind === 'operationEvidence' || block.narrativeKind === 'verification') {
     return <OperationBlock block={block} />;
   }
   return <GenericBlock block={block} language={language} />;

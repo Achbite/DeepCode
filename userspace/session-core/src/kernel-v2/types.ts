@@ -1,4 +1,6 @@
 import type {
+  AgentInputAttachmentV2,
+  LlmChatMessage,
   CapabilityScopePreviewRecordV2,
   DeadlineRequestV2,
   KernelFactProjectionV2,
@@ -8,6 +10,9 @@ import type {
   ToolDescriptorV2,
   ToolIntentV2,
 } from '@deepcode/protocol';
+import type {
+  SessionContextMemoryV2,
+} from './sessionMemory.js';
 import type {
   SessionKernelCapabilityPreviewRequestV2,
   SessionKernelEpochAdvanceRequestV2,
@@ -21,6 +26,65 @@ export const SESSION_KERNEL_LOOP_V2_SCHEMA =
   'deepcode.session.kernel-loop.v2' as const;
 export const SESSION_KERNEL_CHECKPOINT_V2_SCHEMA =
   'deepcode.session.kernel-checkpoint.v2' as const;
+export const SESSION_PROVIDER_PROFILE_BOOTSTRAP_V2_SCHEMA =
+  'deepcode.host.provider-profile-bootstrap.v2' as const;
+export const SESSION_PROVIDER_CONTEXT_RECEIPT_V2_SCHEMA =
+  'deepcode.session.provider-context-receipt.v2' as const;
+
+export interface SessionProviderProfileBootstrapV2 {
+  schemaVersion: typeof SESSION_PROVIDER_PROFILE_BOOTSTRAP_V2_SCHEMA;
+  providerProfileId: string;
+  providerProfileRevisionDigest: string;
+  contextWindowTokens: number;
+  maxOutputTokens: number;
+}
+
+export type SessionProviderContextSectionV2 =
+  | 'kernelFixedPrompt'
+  | 'sessionContract'
+  | 'currentInput'
+  | 'priorSessionMemory'
+  | 'planDecision'
+  | 'providerOutcomes'
+  | 'canonicalFacts';
+
+export interface SessionProviderContextSectionReceiptV2 {
+  section: SessionProviderContextSectionV2;
+  estimatedTokens: number;
+  originalCount: number;
+  selectedCount: number;
+  omittedCount: number;
+  digest: string;
+}
+
+export interface SessionProviderContextReceiptV2 {
+  schemaVersion: typeof SESSION_PROVIDER_CONTEXT_RECEIPT_V2_SCHEMA;
+  providerProfile: {
+    providerProfileId: string;
+    providerProfileRevisionDigest: string;
+    contextWindowTokens: number;
+    maxOutputTokens: number;
+  };
+  inputTokenBudget: number;
+  estimatedInputTokens: number;
+  memory: SessionContextMemoryV2;
+  trimming: {
+    strategy: 'utf8-bytes-upper-bound.v2';
+    sections: SessionProviderContextSectionReceiptV2[];
+  };
+}
+
+export interface SessionProviderContextAssemblyV2 {
+  messages: LlmChatMessage[];
+  receipt: SessionProviderContextReceiptV2;
+}
+
+export interface SessionProviderResultMetadataV2 {
+  providerProfileId?: string;
+  provider?: string;
+  model?: string;
+  usage?: Record<string, unknown>;
+}
 
 export interface SessionPlanActionV2 {
   taskId: string;
@@ -56,6 +120,7 @@ export interface SessionUserInputRecordV2 {
   inputId: string;
   opaqueInputRef: string;
   text: string;
+  attachments: AgentInputAttachmentV2[];
   recordedAt: string;
 }
 
@@ -111,6 +176,8 @@ export interface SessionProviderTurnInputV2 {
   conversationInputOmittedCount: number;
   providerOutcomes: readonly SessionProviderOutcomeRecordV2[];
   providerOutcomeOmittedCount: number;
+  sessionMemory: SessionContextMemoryV2;
+  providerProfile: SessionProviderProfileBootstrapV2;
   plan?: SessionNaturalLanguagePlanV2;
   planDecision?: SessionPlanDecisionV2;
   kernelFacts: SessionProviderKernelFactsProjectionV2;
@@ -122,6 +189,7 @@ export interface SessionProviderTurnInputV2 {
     fixedPrompt: string;
     tools: readonly ToolDescriptorV2[];
   };
+  contextAssembly: SessionProviderContextAssemblyV2;
   signal: AbortSignal;
 }
 
@@ -130,24 +198,29 @@ export interface SessionProviderOutcomeRecordV2 {
   outputKind: SessionProviderTurnOutputV2['kind'];
   recordedAt: string;
   summary?: string;
+  providerResult: SessionProviderResultMetadataV2;
 }
 
 export type SessionProviderTurnOutputV2 =
   | {
       kind: 'plan';
       plan: SessionNaturalLanguagePlanV2;
+      providerResult: SessionProviderResultMetadataV2;
     }
   | {
       kind: 'toolIntent';
       source: ProviderKernelToolSourceV2;
+      providerResult: SessionProviderResultMetadataV2;
     }
   | {
       kind: 'answer';
       text: string;
+      providerResult: SessionProviderResultMetadataV2;
     }
   | {
       kind: 'noTool';
       guidance?: string;
+      providerResult: SessionProviderResultMetadataV2;
     };
 
 export type SessionActiveWaitV2 =
@@ -231,6 +304,7 @@ export interface SessionProviderTurnRecordV2 {
   controlEpoch: number;
   contextRef: ToolContextRefV2;
   factProjection: SessionProviderFactProjectionReceiptV2;
+  contextAssembly: SessionProviderContextReceiptV2;
   startedAt: string;
   status: 'active' | 'cancelled' | 'completed' | 'stale' | 'failed';
   cancellationReason?: 'userInput' | 'superseded' | 'shutdown';
@@ -302,12 +376,7 @@ export interface SessionKernelReviewV2 {
   unexecuted: SessionReviewPlannedActionV2[];
   denied: SessionReviewFactRefV2[];
   rejections: SessionReviewFactRefV2[];
-  skipped: Array<
-    Extract<SessionPlanActionSettlementV2, { kind: 'skipped' }>
-  >;
-  completions: Array<
-    Extract<SessionPlanActionSettlementV2, { kind: 'completed' }>
-  >;
+  completions: SessionPlanActionSettlementV2[];
   cleanup: SessionReviewFactRefV2[];
   indeterminate: SessionReviewFactRefV2[];
   priorEpochLateFacts: SessionReviewFactRefV2[];
@@ -337,20 +406,13 @@ export interface SessionReviewFactCoverageV2 {
   omittedCount: number;
 }
 
-export type SessionPlanActionSettlementV2 =
-  | {
-      kind: 'skipped';
-      planActionId: string;
-      reason: string;
-      recordedAt: string;
-    }
-  | {
-      kind: 'completed';
-      planActionId: string;
-      completionKind: 'answer' | 'noTool';
-      providerTurnId: string;
-      recordedAt: string;
-    };
+export interface SessionPlanActionSettlementV2 {
+  kind: 'completed';
+  planActionId: string;
+  completionKind: 'answer' | 'noTool';
+  providerTurnId: string;
+  recordedAt: string;
+}
 
 export interface SessionKernelProjectionEventV2 {
   /**
@@ -373,7 +435,6 @@ export interface SessionKernelProjectionEventV2 {
     | 'kernelFacts.reconciled'
     | 'authorization.decided'
     | 'review.revised'
-    | 'planAction.skipped'
     | 'planAction.completed'
     | 'wait.changed'
     | 'diagnostic';

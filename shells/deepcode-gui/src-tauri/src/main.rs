@@ -1,6 +1,15 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use serde::Serialize;
+use deepcode_kernel_abi::{
+    is_valid_host_instance_id_v2, is_valid_host_shell_capability_v2,
+    is_valid_host_ui_capability_v2, HOST_AUTHORITY_ENTROPY_BYTES_V2, HOST_INSTANCE_ID_ENV_V2,
+    HOST_INSTANCE_ID_PREFIX_V2, HOST_SHELL_CAPABILITY_ENV_V2, HOST_SHELL_CAPABILITY_HEADER_V2,
+    HOST_SHELL_CAPABILITY_PREFIX_V2, HOST_UI_CAPABILITY_ENV_V2, HOST_UI_CAPABILITY_HEADER_V2,
+    HOST_UI_CAPABILITY_PREFIX_V2,
+};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -9,46 +18,94 @@ use std::time::Duration;
 use tauri::http::{header, Request, Response, StatusCode};
 use tauri::{Manager, State, WebviewUrl, WebviewWindowBuilder, Window, WindowEvent};
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+#[cfg(windows)]
+use windows_sys::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+    SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+};
 
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: &str = "31246";
 const APP_ASSET_SCHEME: &str = "deepcode-gui";
 const APP_ASSET_DIR: &str = "web-deepcode-gui";
 
-struct KernelProcess {
-    child: Mutex<Option<Child>>,
+struct HostProcessGroup {
+    children: Mutex<Option<OwnedHostChildren>>,
 }
 
-impl KernelProcess {
-    fn new(child: Option<Child>) -> Self {
+struct OwnedHostChildren {
+    daemon: OwnedHostProcess,
+    proxy: OwnedHostProcess,
+    daemon_host: String,
+    daemon_port: String,
+    daemon_capability: String,
+    instance_id: String,
+}
+
+struct OwnedHostProcess {
+    child: Child,
+    #[cfg(unix)]
+    process_group_id: libc::pid_t,
+    #[cfg(windows)]
+    job: WindowsKillOnCloseJob,
+}
+
+#[cfg(windows)]
+struct WindowsKillOnCloseJob {
+    handle: Option<HANDLE>,
+}
+
+impl HostProcessGroup {
+    fn new(children: Option<OwnedHostChildren>) -> Self {
         Self {
-            child: Mutex::new(child),
+            children: Mutex::new(children),
         }
     }
 
-    fn replace(&self, child: Option<Child>) {
-        if let Ok(mut current) = self.child.lock() {
-            if let Some(mut process) = current.take() {
-                let _ = process.kill();
-                let _ = process.wait();
+    fn replace(&self, children: Option<OwnedHostChildren>) {
+        if let Ok(mut current) = self.children.lock() {
+            if let Some(mut processes) = current.take() {
+                processes.shutdown();
             }
-            *current = child;
+            *current = children;
         }
     }
 
     fn terminate(&self) {
-        if let Ok(mut child) = self.child.lock() {
-            if let Some(mut process) = child.take() {
-                let _ = process.kill();
-                let _ = process.wait();
+        if let Ok(mut children) = self.children.lock() {
+            if let Some(mut processes) = children.take() {
+                processes.shutdown();
             }
         }
     }
 }
 
-impl Drop for KernelProcess {
+impl OwnedHostChildren {
+    fn shutdown(&mut self) {
+        let requested = request_daemon_shutdown(
+            &self.daemon_host,
+            &self.daemon_port,
+            &self.daemon_capability,
+            &self.instance_id,
+            self.daemon.child.id(),
+        );
+        terminate_owned_process_tree(&mut self.proxy);
+        if !requested || !wait_for_child_exit(&mut self.daemon, 80) {
+            terminate_owned_process_tree(&mut self.daemon);
+        }
+    }
+}
+
+impl Drop for HostProcessGroup {
     fn drop(&mut self) {
         self.terminate();
     }
@@ -69,18 +126,20 @@ fn main() {
         ])
         .setup(|app| {
             let target = resolve_launch_target();
+            let host_admission = HostAdmissionCapabilities::resolve()?;
             app.manage(target.clone());
-            app.manage(KernelProcess::new(None));
-            create_main_window(app, &target)?;
+            app.manage(host_admission.clone());
+            app.manage(HostProcessGroup::new(None));
+            create_main_window(app, &target, &host_admission)?;
             if startup_permission_preflight(APP_ASSET_DIR) {
-                let child = spawn_kernel_if_available(&target.host, &target.port);
-                app.state::<KernelProcess>().replace(child);
+                let children = spawn_host_processes_if_available(&target, &host_admission);
+                app.state::<HostProcessGroup>().replace(children);
             }
             Ok(())
         })
         .on_window_event(|window, event| match event {
             WindowEvent::CloseRequested { .. } | WindowEvent::Destroyed => {
-                window.state::<KernelProcess>().terminate();
+                window.state::<HostProcessGroup>().terminate();
                 window.app_handle().exit(0);
             }
             _ => {}
@@ -90,7 +149,7 @@ fn main() {
 
     app.run(|app_handle, event| match event {
         tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => {
-            app_handle.state::<KernelProcess>().terminate();
+            app_handle.state::<HostProcessGroup>().terminate();
         }
         _ => {}
     });
@@ -101,6 +160,117 @@ fn main() {
 struct LaunchTarget {
     host: String,
     port: String,
+    #[serde(skip)]
+    daemon_port: String,
+}
+
+#[derive(Clone)]
+struct HostAdmissionCapabilities {
+    daemon: String,
+    proxy: String,
+    instance_id: String,
+}
+
+impl HostAdmissionCapabilities {
+    fn resolve() -> Result<Self, std::io::Error> {
+        let daemon = resolve_capability(
+            HOST_SHELL_CAPABILITY_ENV_V2,
+            HOST_SHELL_CAPABILITY_PREFIX_V2,
+            is_valid_host_shell_capability_v2,
+        )?;
+        let proxy = resolve_capability(
+            HOST_UI_CAPABILITY_ENV_V2,
+            HOST_UI_CAPABILITY_PREFIX_V2,
+            is_valid_host_ui_capability_v2,
+        )?;
+        if daemon == proxy {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Host UI and daemon capabilities must be independent",
+            ));
+        }
+        let instance_id =
+            generate_local_identity(HOST_INSTANCE_ID_PREFIX_V2, is_valid_host_instance_id_v2)?;
+        Ok(Self {
+            daemon,
+            proxy,
+            instance_id,
+        })
+    }
+
+    fn daemon_capability(&self) -> &str {
+        &self.daemon
+    }
+
+    fn proxy_capability(&self) -> &str {
+        &self.proxy
+    }
+
+    fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+}
+
+fn resolve_capability(
+    environment_key: &str,
+    prefix: &str,
+    validator: fn(&str) -> bool,
+) -> Result<String, std::io::Error> {
+    if let Ok(value) = std::env::var(environment_key) {
+        if validator(&value) {
+            return Ok(value);
+        }
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{environment_key} is malformed"),
+        ));
+    }
+    generate_local_identity(prefix, validator)
+}
+
+fn generate_local_identity(
+    prefix: &str,
+    validator: fn(&str) -> bool,
+) -> Result<String, std::io::Error> {
+    let mut entropy = [0_u8; HOST_AUTHORITY_ENTROPY_BYTES_V2];
+    getrandom::fill(&mut entropy)
+        .map_err(|error| std::io::Error::other(format!("generate local identity: {error}")))?;
+    let mut encoded = String::with_capacity(HOST_AUTHORITY_ENTROPY_BYTES_V2 * 2);
+    for byte in entropy {
+        use std::fmt::Write;
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    let value = format!("{prefix}{encoded}");
+    if validator(&value) {
+        Ok(value)
+    } else {
+        Err(std::io::Error::other(
+            "generated Host authority value does not satisfy the v2 format",
+        ))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HostIdentityV2 {
+    service: String,
+    instance_id: String,
+    pid: u32,
+    address: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HostShutdownReceiptV2 {
+    accepted: bool,
+    identity: HostIdentityV2,
+    cleanup_complete: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct HostApiEnvelopeV2<T> {
+    ok: bool,
+    data: Option<T>,
 }
 
 #[derive(Serialize)]
@@ -124,7 +294,8 @@ fn deepcode_default_workspace_path() -> Option<String> {
 #[tauri::command]
 fn deepcode_start_kernel_after_permission(
     target: State<'_, LaunchTarget>,
-    kernel: State<'_, KernelProcess>,
+    host_admission: State<'_, HostAdmissionCapabilities>,
+    processes: State<'_, HostProcessGroup>,
 ) -> KernelStartResult {
     if !startup_permission_preflight(APP_ASSET_DIR) {
         return KernelStartResult {
@@ -134,17 +305,19 @@ fn deepcode_start_kernel_after_permission(
         };
     }
 
-    if local_port_has_listener(&target.host, &target.port) {
+    if local_port_has_listener(&target.host, &target.port)
+        || local_port_has_listener(&target.host, &target.daemon_port)
+    {
         return KernelStartResult {
             started: false,
             blocked: false,
-            message: "kernel is already running".to_string(),
+            message: "a required private Host port is already in use".to_string(),
         };
     }
-    let child = spawn_kernel_if_available(&target.host, &target.port);
-    let started = child.is_some();
+    let children = spawn_host_processes_if_available(&target, &host_admission);
+    let started = children.is_some();
     if started {
-        kernel.replace(child);
+        processes.replace(children);
     }
     KernelStartResult {
         started,
@@ -178,6 +351,10 @@ fn deepcode_window_close(window: Window) -> Result<(), String> {
 
 fn resolve_launch_target() -> LaunchTarget {
     let host = std::env::var("DEEPCODE_HOST").unwrap_or_else(|_| DEFAULT_HOST.to_string());
+    assert!(
+        is_loopback_host(&host),
+        "DeepCode desktop Host requires a loopback target"
+    );
     let port = std::env::var("DEEPCODE_PORT")
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -188,18 +365,31 @@ fn resolve_launch_target() -> LaunchTarget {
                 available_local_port(&host).unwrap_or_else(|| DEFAULT_PORT.to_string())
             }
         });
-    LaunchTarget { host, port }
+    let daemon_port = available_local_port(&host)
+        .filter(|candidate| candidate != &port)
+        .expect("available loopback daemon port");
+    LaunchTarget {
+        host,
+        port,
+        daemon_port,
+    }
 }
 
 fn create_main_window(
     app: &tauri::App,
     target: &LaunchTarget,
+    host_admission: &HostAdmissionCapabilities,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let boot_url = format!(
-        "{APP_ASSET_SCHEME}://localhost/index.html#host={}&port={}",
-        target.host, target.port
+    let boot_url = format!("{APP_ASSET_SCHEME}://localhost/index.html");
+    let initialization_script = format!(
+        "Object.defineProperty(window,'__DEEPCODE_HOST_BOOT_V2__',{{value:Object.freeze({{schemaVersion:'deepcode.host-ui-bootstrap.v2',host:'{}',port:'{}',proxyCapability:'{}'}}),writable:false,configurable:true}});",
+        target.host,
+        target.port,
+        host_admission.proxy_capability()
     );
     let builder = WebviewWindowBuilder::new(app, "main", WebviewUrl::External(boot_url.parse()?))
+        .initialization_script(initialization_script)
+        .on_navigation(trusted_app_navigation)
         .title("DeepCode-GUI")
         .inner_size(1500.0, 920.0)
         .min_inner_size(1120.0, 720.0)
@@ -222,6 +412,11 @@ fn create_main_window(
 
     builder.build()?;
     Ok(())
+}
+
+fn trusted_app_navigation(url: &tauri::Url) -> bool {
+    (url.scheme() == APP_ASSET_SCHEME && url.host_str() == Some("localhost"))
+        || (url.scheme() == "http" && url.host_str() == Some(concat!("deepcode-gui", ".localhost")))
 }
 
 fn startup_permission_preflight(web_dir_name: &str) -> bool {
@@ -347,49 +542,158 @@ fn content_type_for_path(path: &Path) -> &'static str {
     }
 }
 
-fn spawn_kernel_if_available(host: &str, port: &str) -> Option<Child> {
+fn spawn_host_processes_if_available(
+    target: &LaunchTarget,
+    host_admission: &HostAdmissionCapabilities,
+) -> Option<OwnedHostChildren> {
     if env_truthy("DEEPCODE_SHELL_CONNECT_ONLY") {
         return None;
     }
-    if local_port_has_listener(host, port) {
+    if local_port_has_listener(&target.host, &target.port)
+        || local_port_has_listener(&target.host, &target.daemon_port)
+    {
         return None;
     }
-    let _start_lock = acquire_kernel_start_lock(host, port)?;
-    if local_port_has_listener(host, port) {
+    let _start_lock = acquire_kernel_start_lock(&target.host, &target.port)?;
+    if local_port_has_listener(&target.host, &target.port)
+        || local_port_has_listener(&target.host, &target.daemon_port)
+    {
         return None;
     }
 
     let exe_dir = current_exe_dir()?;
-    let kernel_path = find_bundled_file(&exe_dir, kernel_binary_name())?;
-    let kernel_dir = parent_dir(&kernel_path).unwrap_or_else(|| exe_dir.clone());
+    let daemon_path =
+        configured_or_bundled_file("DEEPCODE_KERNEL_DAEMON_BIN", &exe_dir, kernel_binary_name())?;
+    let proxy_path =
+        configured_or_bundled_file("DEEPCODE_HOST_WEB_BIN", &exe_dir, host_web_binary_name())?;
+    let daemon_dir = parent_dir(&daemon_path).unwrap_or_else(|| exe_dir.clone());
+    let proxy_dir = parent_dir(&proxy_path).unwrap_or_else(|| exe_dir.clone());
     let config_root = std::env::var_os("DEEPCODE_CONFIG_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| package_root(&exe_dir).unwrap_or_else(|| kernel_dir.clone()));
+        .unwrap_or_else(|| package_root(&exe_dir).unwrap_or_else(|| daemon_dir.clone()));
 
     let web_dir = std::env::var("DEEPCODE_CLIENT_DIST")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
             find_bundled_dir(&exe_dir, "web-deepcode-gui")
-                .unwrap_or_else(|| kernel_dir.join("web-deepcode-gui"))
+                .unwrap_or_else(|| proxy_dir.join("web-deepcode-gui"))
         });
 
-    let mut command = Command::new(kernel_path);
-    command
-        .current_dir(&kernel_dir)
-        .env("DEEPCODE_HOST", host)
-        .env("DEEPCODE_PORT", port)
+    let mut daemon_command = Command::new(daemon_path);
+    daemon_command
+        .current_dir(&daemon_dir)
+        .env("DEEPCODE_HOST", &target.host)
+        .env("DEEPCODE_PORT", &target.daemon_port)
         .env("DEEPCODE_CONFIG_DIR", config_root)
-        .env("DEEPCODE_CLIENT_DIST", web_dir)
+        .env_remove(HOST_UI_CAPABILITY_ENV_V2)
+        .env(
+            HOST_SHELL_CAPABILITY_ENV_V2,
+            host_admission.daemon_capability(),
+        )
+        .env(HOST_INSTANCE_ID_ENV_V2, host_admission.instance_id())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
 
-    #[cfg(windows)]
-    command.creation_flags(0x0800_0000);
+    let mut daemon = spawn_owned_host_process(&mut daemon_command).ok()?;
+    if !wait_for_public_identity(
+        &mut daemon,
+        &target.host,
+        &target.daemon_port,
+        "deepcode-kernel-daemon",
+        host_admission.instance_id(),
+        40,
+    ) || !wait_for_authenticated_health(
+        &mut daemon,
+        &target.host,
+        &target.daemon_port,
+        HOST_SHELL_CAPABILITY_HEADER_V2,
+        host_admission.daemon_capability(),
+        40,
+    ) {
+        terminate_owned_process_tree(&mut daemon);
+        return None;
+    }
 
-    let child = command.spawn().ok()?;
-    wait_for_kernel_listener(host, port, 20);
-    Some(child)
+    let mut proxy_command = Command::new(proxy_path);
+    proxy_command
+        .current_dir(&proxy_dir)
+        .env("DEEPCODE_HOST", &target.host)
+        .env("DEEPCODE_PORT", &target.port)
+        .env("DEEPCODE_DAEMON_HOST", &target.host)
+        .env("DEEPCODE_DAEMON_PORT", &target.daemon_port)
+        .env("DEEPCODE_HOST_WEB_SPAWN_DAEMON", "0")
+        .env("DEEPCODE_CLIENT_DIST", web_dir)
+        .env(HOST_UI_CAPABILITY_ENV_V2, host_admission.proxy_capability())
+        .env(
+            HOST_SHELL_CAPABILITY_ENV_V2,
+            host_admission.daemon_capability(),
+        )
+        .env(HOST_INSTANCE_ID_ENV_V2, host_admission.instance_id())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    let mut proxy = match spawn_owned_host_process(&mut proxy_command) {
+        Ok(proxy) => proxy,
+        Err(_) => {
+            shutdown_daemon_process(
+                &mut daemon,
+                &target.host,
+                &target.daemon_port,
+                host_admission.daemon_capability(),
+                host_admission.instance_id(),
+            );
+            return None;
+        }
+    };
+    if !wait_for_public_identity(
+        &mut proxy,
+        &target.host,
+        &target.port,
+        "deepcode-host-web",
+        host_admission.instance_id(),
+        40,
+    ) || !wait_for_authenticated_health(
+        &mut proxy,
+        &target.host,
+        &target.port,
+        HOST_UI_CAPABILITY_HEADER_V2,
+        host_admission.proxy_capability(),
+        40,
+    ) {
+        terminate_owned_process_tree(&mut proxy);
+        shutdown_daemon_process(
+            &mut daemon,
+            &target.host,
+            &target.daemon_port,
+            host_admission.daemon_capability(),
+            host_admission.instance_id(),
+        );
+        return None;
+    }
+    Some(OwnedHostChildren {
+        daemon,
+        proxy,
+        daemon_host: target.host.clone(),
+        daemon_port: target.daemon_port.clone(),
+        daemon_capability: host_admission.daemon_capability().to_string(),
+        instance_id: host_admission.instance_id().to_string(),
+    })
+}
+
+fn configured_or_bundled_file(
+    environment_key: &str,
+    exe_dir: &Path,
+    bundled_name: &str,
+) -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os(environment_key).map(PathBuf::from) {
+        return path
+            .is_absolute()
+            .then_some(path)
+            .filter(|path| path.is_file());
+    }
+    find_bundled_file(exe_dir, bundled_name)
 }
 
 struct KernelStartLock {
@@ -408,9 +712,16 @@ fn acquire_kernel_start_lock(host: &str, port: &str) -> Option<KernelStartLock> 
         sanitize_lock_component(host),
         sanitize_lock_component(port)
     ));
-    match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
         Ok(mut file) => {
-            let _ = std::io::Write::write_all(&mut file, format!("pid={}\n", std::process::id()).as_bytes());
+            let _ = std::io::Write::write_all(
+                &mut file,
+                format!("pid={}\n", std::process::id()).as_bytes(),
+            );
             Some(KernelStartLock { path })
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -449,6 +760,350 @@ fn wait_for_kernel_listener(host: &str, port: &str, attempts: usize) -> bool {
         std::thread::sleep(Duration::from_millis(75));
     }
     false
+}
+
+fn wait_for_authenticated_health(
+    process: &mut OwnedHostProcess,
+    host: &str,
+    port: &str,
+    capability_header: &str,
+    capability: &str,
+    attempts: usize,
+) -> bool {
+    for _ in 0..attempts {
+        match process.child.try_wait() {
+            Ok(Some(_)) | Err(_) => return false,
+            Ok(None) => {}
+        }
+        if authenticated_health_ready(host, port, capability_header, capability) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(75));
+    }
+    false
+}
+
+fn wait_for_public_identity(
+    process: &mut OwnedHostProcess,
+    host: &str,
+    port: &str,
+    expected_service: &str,
+    expected_instance_id: &str,
+    attempts: usize,
+) -> bool {
+    let expected_pid = process.child.id();
+    for _ in 0..attempts {
+        match process.child.try_wait() {
+            Ok(Some(_)) | Err(_) => return false,
+            Ok(None) => {}
+        }
+        if public_identity_matches(
+            host,
+            port,
+            expected_service,
+            expected_instance_id,
+            expected_pid,
+        ) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(75));
+    }
+    false
+}
+
+fn public_identity_matches(
+    host: &str,
+    port: &str,
+    expected_service: &str,
+    expected_instance_id: &str,
+    expected_pid: u32,
+) -> bool {
+    let request = http_request(host, port, "GET", "/api/host/identity", &[]);
+    let Some(envelope) =
+        request_loopback_json::<HostApiEnvelopeV2<HostIdentityV2>>(host, port, &request, 300)
+    else {
+        return false;
+    };
+    let Some(identity) = envelope.ok.then_some(envelope.data).flatten() else {
+        return false;
+    };
+    identity.service == expected_service
+        && identity.instance_id == expected_instance_id
+        && identity.pid == expected_pid
+        && identity.address == loopback_http_address(host, port)
+}
+
+fn authenticated_health_ready(
+    host: &str,
+    port: &str,
+    capability_header: &str,
+    capability: &str,
+) -> bool {
+    let Ok(port_number) = port.parse::<u16>() else {
+        return false;
+    };
+    let Ok(addrs) = (host, port_number).to_socket_addrs() else {
+        return false;
+    };
+    let request = http_request(
+        host,
+        port,
+        "GET",
+        "/api/health",
+        &[(capability_header, capability)],
+    );
+    addrs.into_iter().any(|addr| {
+        let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(180)) else {
+            return false;
+        };
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(300)));
+        let _ = stream.set_write_timeout(Some(Duration::from_millis(300)));
+        if stream.write_all(request.as_bytes()).is_err() {
+            return false;
+        }
+        let mut response = Vec::with_capacity(4096);
+        let _ = stream.take(64 * 1024).read_to_end(&mut response);
+        response.starts_with(b"HTTP/1.1 200")
+            && response
+                .windows(br#""ok":true"#.len())
+                .any(|window| window == br#""ok":true"#)
+    })
+}
+
+fn request_daemon_shutdown(
+    host: &str,
+    port: &str,
+    capability: &str,
+    instance_id: &str,
+    pid: u32,
+) -> bool {
+    let request = http_request(
+        host,
+        port,
+        "POST",
+        "/api/host/shutdown",
+        &[(HOST_SHELL_CAPABILITY_HEADER_V2, capability)],
+    );
+    let Some(envelope) = request_loopback_json::<HostApiEnvelopeV2<HostShutdownReceiptV2>>(
+        host, port, &request, 600,
+    ) else {
+        return false;
+    };
+    let Some(receipt) = envelope.ok.then_some(envelope.data).flatten() else {
+        return false;
+    };
+    receipt.accepted
+        && receipt.cleanup_complete
+        && receipt.identity.service == "deepcode-kernel-daemon"
+        && receipt.identity.instance_id == instance_id
+        && receipt.identity.pid == pid
+        && receipt.identity.address == loopback_http_address(host, port)
+}
+
+fn shutdown_daemon_process(
+    process: &mut OwnedHostProcess,
+    host: &str,
+    port: &str,
+    capability: &str,
+    instance_id: &str,
+) {
+    if !request_daemon_shutdown(host, port, capability, instance_id, process.child.id())
+        || !wait_for_child_exit(process, 80)
+    {
+        terminate_owned_process_tree(process);
+    }
+}
+
+fn wait_for_child_exit(process: &mut OwnedHostProcess, attempts: usize) -> bool {
+    for _ in 0..attempts {
+        match process.child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
+fn terminate_owned_process_tree(process: &mut OwnedHostProcess) {
+    if process.child.try_wait().ok().flatten().is_some() {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        let pid = process.child.id() as libc::pid_t;
+        if unsafe { libc::getpgid(pid) } == process.process_group_id {
+            unsafe {
+                libc::kill(-process.process_group_id, libc::SIGTERM);
+            }
+        }
+        if !wait_for_child_exit(process, 20) {
+            if unsafe { libc::getpgid(pid) } == process.process_group_id {
+                unsafe {
+                    libc::kill(-process.process_group_id, libc::SIGKILL);
+                }
+            } else {
+                let _ = process.child.kill();
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        process.job.close();
+        if !wait_for_child_exit(process, 20) {
+            let _ = process.child.kill();
+        }
+    }
+    let _ = process.child.wait();
+}
+
+fn spawn_owned_host_process(command: &mut Command) -> std::io::Result<OwnedHostProcess> {
+    #[cfg(unix)]
+    {
+        command.process_group(0);
+        let mut child = command.spawn()?;
+        let pid = child.id() as libc::pid_t;
+        let process_group_id = unsafe { libc::getpgid(pid) };
+        if process_group_id <= 0 || process_group_id != pid {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(std::io::Error::other(
+                "spawned Host child did not enter its exact owned process group",
+            ));
+        }
+        return Ok(OwnedHostProcess {
+            child,
+            process_group_id,
+        });
+    }
+    #[cfg(windows)]
+    {
+        let job = WindowsKillOnCloseJob::new()?;
+        command.creation_flags(0x0800_0200);
+        let mut child = command.spawn()?;
+        if let Err(error) = job.assign(&child) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+        return Ok(OwnedHostProcess { child, job });
+    }
+}
+
+#[cfg(windows)]
+impl WindowsKillOnCloseJob {
+    fn new() -> std::io::Result<Self> {
+        let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if handle.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut information = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        information.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let configured = unsafe {
+            SetInformationJobObject(
+                handle,
+                JobObjectExtendedLimitInformation,
+                (&information as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        };
+        if configured == 0 {
+            unsafe {
+                CloseHandle(handle);
+            }
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self {
+            handle: Some(handle),
+        })
+    }
+
+    fn assign(&self, child: &Child) -> std::io::Result<()> {
+        let Some(handle) = self.handle else {
+            return Err(std::io::Error::other("Host Job Object is closed"));
+        };
+        let process_handle = child.as_raw_handle() as HANDLE;
+        if unsafe { AssignProcessToJobObject(handle, process_handle) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn close(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            unsafe {
+                CloseHandle(handle);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsKillOnCloseJob {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+fn http_request(
+    host: &str,
+    port: &str,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+) -> String {
+    let authority = if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
+    let mut request = format!("{method} {path} HTTP/1.1\r\nHost: {authority}\r\n");
+    for (name, value) in headers {
+        request.push_str(name);
+        request.push_str(": ");
+        request.push_str(value);
+        request.push_str("\r\n");
+    }
+    request.push_str("Content-Length: 0\r\nConnection: close\r\n\r\n");
+    request
+}
+
+fn request_loopback_json<T: DeserializeOwned>(
+    host: &str,
+    port: &str,
+    request: &str,
+    read_timeout_millis: u64,
+) -> Option<T> {
+    let port_number = port.parse::<u16>().ok()?;
+    let addrs = (host, port_number).to_socket_addrs().ok()?;
+    addrs.into_iter().find_map(|addr| {
+        let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(180)).ok()?;
+        stream
+            .set_read_timeout(Some(Duration::from_millis(read_timeout_millis)))
+            .ok()?;
+        stream
+            .set_write_timeout(Some(Duration::from_millis(300)))
+            .ok()?;
+        stream.write_all(request.as_bytes()).ok()?;
+        let mut response = Vec::with_capacity(4096);
+        stream.take(64 * 1024).read_to_end(&mut response).ok()?;
+        if !response.starts_with(b"HTTP/1.1 200") {
+            return None;
+        }
+        let body_offset = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|offset| offset + 4)?;
+        serde_json::from_slice(&response[body_offset..]).ok()
+    })
+}
+
+fn loopback_http_address(host: &str, port: &str) -> String {
+    if host.contains(':') {
+        format!("http://[{host}]:{port}")
+    } else {
+        format!("http://{host}:{port}")
+    }
 }
 
 fn local_port_has_listener(host: &str, port: &str) -> bool {
@@ -526,6 +1181,18 @@ fn kernel_binary_name() -> &'static str {
     } else {
         "deepcode-kernel"
     }
+}
+
+fn host_web_binary_name() -> &'static str {
+    if cfg!(windows) {
+        "deepcode-host-web.exe"
+    } else {
+        "deepcode-host-web"
+    }
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    matches!(host.trim(), "127.0.0.1" | "::1" | "localhost")
 }
 
 fn default_workspace_path() -> Option<PathBuf> {

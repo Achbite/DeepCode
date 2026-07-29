@@ -19,6 +19,7 @@ import {
 } from './toolIntent.js';
 import type {
   SessionNaturalLanguagePlanV2,
+  SessionProviderResultMetadataV2,
   SessionProviderTurnInputV2,
   SessionProviderTurnOutputV2,
 } from './types.js';
@@ -41,7 +42,7 @@ export interface SessionProviderPlanDraftV2 {
   actions: SessionProviderPlanActionDraftV2[];
 }
 
-export type SessionKernelProviderBackendOutputV2 =
+export type SessionKernelProviderBackendOutputV2 = (
   | {
       kind: 'plan';
       plan: SessionProviderPlanDraftV2;
@@ -59,7 +60,10 @@ export type SessionKernelProviderBackendOutputV2 =
   | {
       kind: 'noTool';
       guidance?: string;
-    };
+    }
+) & {
+  providerResult: SessionProviderResultMetadataV2;
+};
 
 /**
  * Provider-specific implementations runtime-decode their wire format before
@@ -106,6 +110,7 @@ implements SessionKernelProviderAdapterV2 {
             output.plan,
             this.clock.now()
           ),
+          providerResult: output.providerResult,
         };
       case 'nativeToolCall':
         const nativeToolId =
@@ -119,9 +124,15 @@ implements SessionKernelProviderAdapterV2 {
             toolId: nativeToolId,
             arguments: output.arguments,
           },
+          providerResult: output.providerResult,
         };
       case 'text':
-        if (!output.text.trim()) return { kind: 'noTool' };
+        if (!output.text.trim()) {
+          return {
+            kind: 'noTool',
+            providerResult: output.providerResult,
+          };
+        }
         requiredText(output.text, 'Provider text', 1024 * 1024);
         if (claimsToolIntentFrame(output.text)) {
           const frame =
@@ -133,15 +144,21 @@ implements SessionKernelProviderAdapterV2 {
               source: 'textFrame',
               frame: output.text,
             },
+            providerResult: output.providerResult,
           };
         }
-        return { kind: 'answer', text: output.text };
+        return {
+          kind: 'answer',
+          text: output.text,
+          providerResult: output.providerResult,
+        };
       case 'noTool':
         return {
           kind: 'noTool',
           ...(output.guidance?.trim()
             ? { guidance: output.guidance }
             : {}),
+          providerResult: output.providerResult,
         };
     }
   }

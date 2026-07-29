@@ -9,12 +9,10 @@ description = "DeepCode headless Kernel admission, gate, execution, resource, an
 
 [dependencies]
 deepcode-kernel-abi.workspace = true
-deepcode-kernel-audit.workspace = true
-deepcode-kernel-config.workspace = true
 deepcode-kernel-ledger.workspace = true
 deepcode-kernel-policy.workspace = true
-deepcode-kernel-skills.workspace = true
 deepcode-kernel-tools.workspace = true
+getrandom = "0.3"
 pdf-extract.workspace = true
 regex.workspace = true
 reqwest = { workspace = true, features = ["blocking"] }

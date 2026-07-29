@@ -31,6 +31,9 @@ import {
   projectSessionProviderFactsV2,
 } from './providerFactProjection.js';
 import {
+  buildSessionProviderContextV2,
+} from './providerContext.js';
+import {
   decodeProviderToolIntentTextFrameV2,
   normalizeProviderKernelToolIntentV2,
   type ProviderKernelToolSourceV2,
@@ -143,17 +146,23 @@ export class SessionKernelProviderTurnsV2 {
   ): Promise<SessionKernelLoopResultV2> {
     const reservation = this.begin();
     const generation = this.authorityGeneration;
-    let providerTurnId: string | undefined;
+    const providerTurnId = this.ports.ids.nextProviderTurnId();
     try {
-      this.assertMayRun(request);
+      this.assertMayReconcileProviderBoundary();
+      await this.host.reconcileFacts();
+      if (!this.boundaryIsCurrent(reservation, generation)) {
+        return await this.settleStale(providerTurnId);
+      }
       await this.refreshToolContextAtBoundary();
+      if (!this.boundaryIsCurrent(reservation, generation)) {
+        return await this.settleStale(providerTurnId);
+      }
       this.assertMayRun(request);
 
       const state = this.host.readState();
       const binding = providerToolContextBindingV2(
         state.toolContext.bundle
       );
-      providerTurnId = this.ports.ids.nextProviderTurnId();
       const controller = new AbortController();
       this.providerAbort = { reservation, controller };
       const guidance = unique([
@@ -163,6 +172,31 @@ export class SessionKernelProviderTurnsV2 {
       const factProjection = projectSessionProviderFactsV2(
         state,
         request.target
+      );
+      const providerInput = {
+        providerTurnId,
+        runId: state.runId,
+        controlEpoch: state.controlEpoch,
+        currentInput: currentSessionUserInputV2(state),
+        conversationInputs: state.inputs,
+        conversationInputOmittedCount:
+          state.inputHistoryOmittedCount,
+        providerOutcomes: state.providerOutcomes,
+        providerOutcomeOmittedCount:
+          state.providerOutcomeHistoryOmittedCount,
+        sessionMemory: state.sessionMemory,
+        providerProfile: state.providerProfile,
+        ...(state.plan ? { plan: state.plan } : {}),
+        ...(state.planDecision
+          ? { planDecision: state.planDecision }
+          : {}),
+        kernelFacts: factProjection,
+        target: request.target,
+        guidance,
+        toolContext: binding,
+      };
+      const contextAssembly = buildSessionProviderContextV2(
+        providerInput
       );
       const startCommit = this.beginAdmissionCommit(
         reservation,
@@ -181,6 +215,7 @@ export class SessionKernelProviderTurnsV2 {
             omittedCount: factProjection.omittedCount,
             factIds: factProjection.facts.map((fact) => fact.factId),
           },
+          contextAssembly: contextAssembly.receipt,
           startedAt: this.ports.clock.now(),
           status: 'active',
         };
@@ -194,6 +229,7 @@ export class SessionKernelProviderTurnsV2 {
             controlEpoch: state.controlEpoch,
             contextRef: binding.contextRef,
             factProjection: state.providerTurn.factProjection,
+            contextAssembly: state.providerTurn.contextAssembly,
           }
         );
       } finally {
@@ -206,24 +242,8 @@ export class SessionKernelProviderTurnsV2 {
       let output;
       try {
         output = await this.ports.provider.requestTurn({
-          providerTurnId,
-          runId: state.runId,
-          controlEpoch: state.controlEpoch,
-          currentInput: currentSessionUserInputV2(state),
-          conversationInputs: state.inputs,
-          conversationInputOmittedCount:
-            state.inputHistoryOmittedCount,
-          providerOutcomes: state.providerOutcomes,
-          providerOutcomeOmittedCount:
-            state.providerOutcomeHistoryOmittedCount,
-          ...(state.plan ? { plan: state.plan } : {}),
-          ...(state.planDecision
-            ? { planDecision: state.planDecision }
-            : {}),
-          kernelFacts: factProjection,
-          target: request.target,
-          guidance,
-          toolContext: binding,
+          ...providerInput,
+          contextAssembly,
           signal: controller.signal,
         });
       } catch (error) {
@@ -416,6 +436,7 @@ export class SessionKernelProviderTurnsV2 {
           outputKind: output.kind,
           recordedAt: this.ports.clock.now(),
           ...providerOutcomeSummary(output),
+          providerResult: output.providerResult,
         });
         await this.host.saveCheckpoint();
         await this.host.project(
@@ -423,8 +444,10 @@ export class SessionKernelProviderTurnsV2 {
           'provider.completed',
           {
             providerTurnId,
+            controlEpoch: current.providerTurn!.controlEpoch,
             outputKind: output.kind,
             result,
+            providerOutcome: output.providerResult,
           }
         );
         if (planActionSettlement) {
@@ -458,6 +481,31 @@ export class SessionKernelProviderTurnsV2 {
       })
     );
     expectSessionKernelPublicRequestOutcomeV2(outcome, 'toolContextGet');
+  }
+
+  private assertMayReconcileProviderBoundary(): void {
+    if (this.userInputFenceGeneration !== undefined) {
+      throw new SessionKernelProviderTurnError(
+        'session_kernel_user_input_admission_fenced',
+        'Provider boundary reconciliation is fenced until the ordered user input transition is durable.'
+      );
+    }
+    if (this.host.transitionBlocked()) {
+      throw new SessionKernelProviderTurnError(
+        'session_kernel_authority_transition_active',
+        'A serialized Session authority transition is active.'
+      );
+    }
+    this.host.requireNoPendingRequests();
+  }
+
+  private boundaryIsCurrent(
+    reservation: symbol,
+    generation: number
+  ): boolean {
+    return this.reservation === reservation
+      && generation === this.authorityGeneration
+      && this.userInputFenceGeneration === undefined;
   }
 
   private normalizeOutput(
@@ -666,20 +714,28 @@ export class SessionKernelProviderTurnsV2 {
     providerTurnId: string
   ): Promise<SessionKernelLoopResultV2> {
     const state = this.host.readState();
+    const providerTurn = state.providerTurn?.providerTurnId === providerTurnId
+      ? state.providerTurn
+      : undefined;
     if (
-      state.providerTurn?.providerTurnId === providerTurnId
+      providerTurn
       && (
-        state.providerTurn.status === 'active'
-        || state.providerTurn.status === 'completed'
+        providerTurn.status === 'active'
+        || providerTurn.status === 'completed'
       )
     ) {
-      state.providerTurn.status = 'stale';
+      providerTurn.status = 'stale';
       await this.host.saveCheckpoint();
     }
     await this.host.project(
       `provider:${providerTurnId}:stale`,
       'provider.stale',
-      { providerTurnId }
+      {
+        providerTurnId,
+        ...(providerTurn
+          ? { controlEpoch: providerTurn.controlEpoch }
+          : {}),
+      }
     );
     return { kind: 'staleProviderResult', providerTurnId };
   }

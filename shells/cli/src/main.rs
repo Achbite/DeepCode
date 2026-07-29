@@ -1,7 +1,7 @@
 use deepcode_kernel_client::{
     terminal_workspace_scope, AgentRunResult, CreateAgentSessionRequest, HttpKernelClient,
     KernelBootstrap, KernelBootstrapOptions, ListAgentSessionsRequest, StartAgentRunRequest,
-    ResolveSessionGoalInteractionRequest, StartSessionGoalRequest, TerminalWorkspaceScope,
+    TerminalWorkspaceScope,
 };
 use serde_json::Value;
 use std::env;
@@ -155,60 +155,6 @@ pub(crate) async fn run(command: Command) -> Result<(), String> {
             )
             .await
         }
-        Command::GoalStart {
-            api,
-            no_auto_start_kernel,
-            objective,
-            host,
-        } => {
-            let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
-            start_goal(bootstrap.client(), objective, host).await
-        }
-        Command::GoalShow {
-            api,
-            no_auto_start_kernel,
-            goal_id,
-            host,
-        } => {
-            let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
-            show_goal(bootstrap.client(), goal_id, host).await
-        }
-        Command::GoalStep {
-            api,
-            no_auto_start_kernel,
-            goal_id,
-            host,
-        } => {
-            let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
-            step_goal(bootstrap.client(), goal_id, host).await
-        }
-        Command::GoalRun {
-            api,
-            no_auto_start_kernel,
-            goal_id,
-            host,
-        } => {
-            let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
-            run_goal(bootstrap.client(), goal_id, host).await
-        }
-        Command::GoalResume {
-            api,
-            no_auto_start_kernel,
-            goal_id,
-            host,
-        } => {
-            let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
-            resume_goal(bootstrap.client(), goal_id, host).await
-        }
-        Command::GoalCancel {
-            api,
-            no_auto_start_kernel,
-            goal_id,
-            host,
-        } => {
-            let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
-            cancel_goal(bootstrap.client(), goal_id, host).await
-        }
         Command::Ask {
             api,
             no_auto_start_kernel,
@@ -218,35 +164,6 @@ pub(crate) async fn run(command: Command) -> Result<(), String> {
         } => {
             let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
             ask(bootstrap.client(), prompt, plain, host).await
-        }
-        Command::ToolsRun {
-            api,
-            no_auto_start_kernel,
-            tool_id,
-            workspace,
-            args_file,
-            approve_contract,
-        } => {
-            let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
-            run_kernel_tool_contract(
-                bootstrap.client(),
-                &tool_id,
-                &workspace,
-                &args_file,
-                approve_contract,
-            )
-            .await
-        }
-        Command::ToolsVerify {
-            api,
-            no_auto_start_kernel,
-            workspace,
-            cases,
-            approve_contract,
-        } => {
-            let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
-            verify_kernel_tool_contracts(bootstrap.client(), &workspace, &cases, approve_contract)
-                .await
         }
     }
 }
@@ -324,63 +241,12 @@ enum Command {
         guidance: Option<String>,
         host: SessionHostOptions,
     },
-    GoalStart {
-        api: Option<String>,
-        no_auto_start_kernel: bool,
-        objective: String,
-        host: SessionHostOptions,
-    },
-    GoalShow {
-        api: Option<String>,
-        no_auto_start_kernel: bool,
-        goal_id: Option<String>,
-        host: SessionHostOptions,
-    },
-    GoalStep {
-        api: Option<String>,
-        no_auto_start_kernel: bool,
-        goal_id: Option<String>,
-        host: SessionHostOptions,
-    },
-    GoalRun {
-        api: Option<String>,
-        no_auto_start_kernel: bool,
-        goal_id: Option<String>,
-        host: SessionHostOptions,
-    },
-    GoalResume {
-        api: Option<String>,
-        no_auto_start_kernel: bool,
-        goal_id: Option<String>,
-        host: SessionHostOptions,
-    },
-    GoalCancel {
-        api: Option<String>,
-        no_auto_start_kernel: bool,
-        goal_id: Option<String>,
-        host: SessionHostOptions,
-    },
     Ask {
         api: Option<String>,
         no_auto_start_kernel: bool,
         prompt: String,
         plain: bool,
         host: SessionHostOptions,
-    },
-    ToolsRun {
-        api: Option<String>,
-        no_auto_start_kernel: bool,
-        tool_id: String,
-        workspace: String,
-        args_file: String,
-        approve_contract: bool,
-    },
-    ToolsVerify {
-        api: Option<String>,
-        no_auto_start_kernel: bool,
-        workspace: String,
-        cases: String,
-        approve_contract: bool,
     },
 }
 
@@ -395,9 +261,6 @@ impl Command {
         let mut no_workspace = false;
         let mut no_auto_start_kernel = false;
         let mut session_id = None;
-        let mut args_file = None;
-        let mut cases = None;
-        let mut approve_contract = false;
         let mut rest = Vec::new();
         let mut iter = args.into_iter();
         while let Some(arg) = iter.next() {
@@ -425,19 +288,6 @@ impl Command {
                         return Err("--session requires a session id".to_string());
                     }
                 }
-                "--args-file" => {
-                    args_file = iter.next();
-                    if args_file.is_none() {
-                        return Err("--args-file requires a JSON path".to_string());
-                    }
-                }
-                "--cases" => {
-                    cases = iter.next();
-                    if cases.is_none() {
-                        return Err("--cases requires a JSONL path".to_string());
-                    }
-                }
-                "--approve-contract" => approve_contract = true,
                 _ => rest.push(arg),
             }
         }
@@ -544,90 +394,6 @@ impl Command {
                 session_id: Some(session_id.to_string()),
                 host,
             }),
-            [goal, start, objective @ ..]
-                if goal == "goal" && start == "start" && !objective.is_empty() =>
-            {
-                Ok(Command::GoalStart {
-                    api,
-                    no_auto_start_kernel,
-                    objective: objective.join(" "),
-                    host,
-                })
-            }
-            [goal, show] if goal == "goal" && show == "show" => Ok(Command::GoalShow {
-                api,
-                no_auto_start_kernel,
-                goal_id: None,
-                host,
-            }),
-            [goal, show, goal_id] if goal == "goal" && show == "show" => {
-                Ok(Command::GoalShow {
-                    api,
-                    no_auto_start_kernel,
-                    goal_id: Some(goal_id.to_string()),
-                    host,
-                })
-            }
-            [goal, action] if goal == "goal" && action == "step" => Ok(Command::GoalStep {
-                api,
-                no_auto_start_kernel,
-                goal_id: None,
-                host,
-            }),
-            [goal, action, goal_id] if goal == "goal" && action == "step" => {
-                Ok(Command::GoalStep {
-                    api,
-                    no_auto_start_kernel,
-                    goal_id: Some(goal_id.to_string()),
-                    host,
-                })
-            }
-            [goal, action] if goal == "goal" && action == "run" => Ok(Command::GoalRun {
-                api,
-                no_auto_start_kernel,
-                goal_id: None,
-                host,
-            }),
-            [goal, action, goal_id] if goal == "goal" && action == "run" => {
-                Ok(Command::GoalRun {
-                    api,
-                    no_auto_start_kernel,
-                    goal_id: Some(goal_id.to_string()),
-                    host,
-                })
-            }
-            [goal, action] if goal == "goal" && action == "resume" => {
-                Ok(Command::GoalResume {
-                    api,
-                    no_auto_start_kernel,
-                    goal_id: None,
-                    host,
-                })
-            }
-            [goal, action, goal_id] if goal == "goal" && action == "resume" => {
-                Ok(Command::GoalResume {
-                    api,
-                    no_auto_start_kernel,
-                    goal_id: Some(goal_id.to_string()),
-                    host,
-                })
-            }
-            [goal, action] if goal == "goal" && action == "cancel" => {
-                Ok(Command::GoalCancel {
-                    api,
-                    no_auto_start_kernel,
-                    goal_id: None,
-                    host,
-                })
-            }
-            [goal, action, goal_id] if goal == "goal" && action == "cancel" => {
-                Ok(Command::GoalCancel {
-                    api,
-                    no_auto_start_kernel,
-                    goal_id: Some(goal_id.to_string()),
-                    host,
-                })
-            }
             [permission, allow, permission_id]
                 if permission == "permission" && allow == "allow" =>
             {
@@ -670,10 +436,7 @@ impl Command {
             [kind, decision, tail @ ..]
                 if matches!(
                     (kind.as_str(), decision.as_str()),
-                    (
-                        "requirement" | "plan" | "review",
-                        "accept" | "reject" | "revise"
-                    ) | ("permission", "accept" | "reject")
+                    ("plan", "accept" | "reject" | "revise") | ("permission", "accept" | "reject")
                 ) =>
             {
                 let run_id = tail.first().cloned();
@@ -701,26 +464,6 @@ impl Command {
                 plain,
                 host,
             }),
-            [tools, run, tool_id] if tools == "tools" && run == "run" => Ok(Command::ToolsRun {
-                api,
-                no_auto_start_kernel,
-                tool_id: tool_id.to_string(),
-                workspace: host
-                    .workspace
-                    .ok_or_else(|| "tools run requires --workspace <path>".to_string())?,
-                args_file: args_file
-                    .ok_or_else(|| "tools run requires --args-file <json>".to_string())?,
-                approve_contract,
-            }),
-            [tools, verify] if tools == "tools" && verify == "verify" => Ok(Command::ToolsVerify {
-                api,
-                no_auto_start_kernel,
-                workspace: host
-                    .workspace
-                    .ok_or_else(|| "tools verify requires --workspace <path>".to_string())?,
-                cases: cases.ok_or_else(|| "tools verify requires --cases <jsonl>".to_string())?,
-                approve_contract,
-            }),
             prompt if plain && !prompt.is_empty() => Ok(Command::Ask {
                 api,
                 no_auto_start_kernel,
@@ -744,19 +487,31 @@ pub(crate) struct SessionHostOptions {
 pub(crate) struct PendingSessionDecision {
     pub(crate) run_id: String,
     pub(crate) target_id: String,
-    pub(crate) interaction_id: String,
-    pub(crate) interaction_revision: String,
-    pub(crate) review_id: Option<String>,
+}
+
+pub(crate) fn unique_cli_id() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("{}-{nanos}", std::process::id())
+}
+
+pub(crate) async fn bootstrap_kernel(
+    api: Option<String>,
+    no_auto_start_kernel: bool,
+) -> Result<KernelBootstrap, String> {
+    KernelBootstrap::connect(KernelBootstrapOptions::new(api).auto_start(!no_auto_start_kernel))
+        .await
+        .map_err(|error| format!("daemon unavailable: {error}"))
 }
 
 mod render;
 mod session;
-mod tools;
 mod tools_verify;
 
 pub(crate) use render::*;
 pub(crate) use session::*;
-pub(crate) use tools::*;
 pub(crate) use tools_verify::*;
 
 #[cfg(test)]

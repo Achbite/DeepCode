@@ -1,13 +1,8 @@
 use deepcode_kernel_abi::v2::{CommandRequestId, ControlEpoch, RunId};
-use deepcode_kernel_abi::{
-    user_decision_request_digest_v2, CapabilityDecisionBindingV2, DecisionCapabilityV2,
-    TrustGrantDecisionV2, UserDecisionRevokeV2, UserDecisionV2,
-};
+use deepcode_kernel_abi::{user_decision_request_digest_v2, DecisionCapabilityV2, UserDecisionV2};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::Read;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -15,25 +10,12 @@ const DECISION_CAPABILITY_PREFIX: &str = "dcv2d";
 const MAX_DECISION_CAPABILITY_LIFETIME: Duration = Duration::from_secs(10 * 60);
 const MAX_DECISION_CAPABILITY_RECORDS: usize = 4096;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) enum CapabilityDecisionClassV2 {
-    Capability,
-    ScopeExpansion,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", content = "data", rename_all = "camelCase")]
 pub(crate) enum DecisionCapabilitySubjectV2 {
-    Capability {
-        class: CapabilityDecisionClassV2,
-        binding: CapabilityDecisionBindingV2,
-    },
-    TrustGrant {
-        decision: TrustGrantDecisionV2,
-    },
-    Revoke {
-        decision: UserDecisionRevokeV2,
+    ExactUserDecision {
+        request_id: CommandRequestId,
+        decision: UserDecisionV2,
     },
 }
 
@@ -52,48 +34,11 @@ impl DecisionCapabilityGrantV2 {
         {
             return false;
         }
-        match (&self.subject, &envelope.decision) {
-            (
-                DecisionCapabilitySubjectV2::Capability {
-                    class: CapabilityDecisionClassV2::Capability,
-                    binding: expected,
-                },
-                UserDecisionV2::CapabilityAllow(submitted),
-            )
-            | (
-                DecisionCapabilitySubjectV2::Capability {
-                    class: CapabilityDecisionClassV2::Capability,
-                    binding: expected,
-                },
-                UserDecisionV2::CapabilityDeny {
-                    binding: submitted, ..
-                },
-            )
-            | (
-                DecisionCapabilitySubjectV2::Capability {
-                    class: CapabilityDecisionClassV2::ScopeExpansion,
-                    binding: expected,
-                },
-                UserDecisionV2::ScopeExpansionAllow(submitted),
-            )
-            | (
-                DecisionCapabilitySubjectV2::Capability {
-                    class: CapabilityDecisionClassV2::ScopeExpansion,
-                    binding: expected,
-                },
-                UserDecisionV2::ScopeExpansionDeny {
-                    binding: submitted, ..
-                },
-            ) => expected == submitted,
-            (
-                DecisionCapabilitySubjectV2::TrustGrant { decision: expected },
-                UserDecisionV2::TrustGrant(submitted),
-            ) => expected == submitted,
-            (
-                DecisionCapabilitySubjectV2::Revoke { decision: expected },
-                UserDecisionV2::Revoke(submitted),
-            ) => expected == submitted,
-            _ => false,
+        match &self.subject {
+            DecisionCapabilitySubjectV2::ExactUserDecision {
+                request_id,
+                decision,
+            } => request_id == &envelope.request_id && decision == &envelope.decision,
         }
     }
 }
@@ -429,9 +374,9 @@ fn prune_expired(records: &mut HashMap<[u8; 32], StoredDecisionCapabilityV2>, no
     records.retain(|_, record| record.expires_at_instant > now);
 }
 
-fn random_32_bytes() -> std::io::Result<[u8; 32]> {
+fn random_32_bytes() -> Result<[u8; 32], getrandom::Error> {
     let mut value = [0_u8; 32];
-    File::open("/dev/urandom")?.read_exact(&mut value)?;
+    getrandom::fill(&mut value)?;
     Ok(value)
 }
 

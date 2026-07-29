@@ -1,9 +1,10 @@
-use deepcode_kernel_abi::{KernelError, KernelResult, ToolEffectOutcome, ToolEffectReceipt};
+use deepcode_kernel_abi::{KernelError, KernelResult};
 use deepcode_kernel_policy::WorkspaceBoundary;
 use deepcode_kernel_tools::file_content::{
     lightweight_file_classification, read_text_file_for_llm,
 };
-use deepcode_kernel_tools::{KernelExecutorBinding, KernelToolRegistry};
+use deepcode_kernel_tools::kernel_internal::KernelExecutorBinding;
+use deepcode_kernel_tools::KernelToolRegistry;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -15,18 +16,14 @@ use std::io::Read;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone)]
 pub struct KernelExecutorConfig {
     pub web_search_endpoint_template: String,
     pub web_search_auth_header_name: String,
     pub web_search_auth_secret_ref: String,
-    pub web_read_permission: deepcode_kernel_tools::ToolPermissionMode,
-    pub private_web_read_permission: deepcode_kernel_tools::ToolPermissionMode,
 }
 
 impl Default for KernelExecutorConfig {
@@ -35,8 +32,6 @@ impl Default for KernelExecutorConfig {
             web_search_endpoint_template: String::new(),
             web_search_auth_header_name: String::new(),
             web_search_auth_secret_ref: String::new(),
-            web_read_permission: deepcode_kernel_tools::ToolPermissionMode::Allow,
-            private_web_read_permission: deepcode_kernel_tools::ToolPermissionMode::Ask,
         }
     }
 }
@@ -52,6 +47,33 @@ impl SecretProvider for EmptySecretProvider {
     fn resolve(&self, _secret_ref: &str) -> Option<String> {
         None
     }
+}
+
+struct SnapshotSecretProvider {
+    values: BTreeMap<String, String>,
+}
+
+impl SecretProvider for SnapshotSecretProvider {
+    fn resolve(&self, secret_ref: &str) -> Option<String> {
+        self.values.get(secret_ref).cloned()
+    }
+}
+
+pub(crate) fn snapshot_executor_secrets(
+    config: &KernelExecutorConfig,
+    secret_provider: &dyn SecretProvider,
+) -> Arc<dyn SecretProvider> {
+    let secret_ref = config.web_search_auth_secret_ref.as_str();
+    let values = (!secret_ref.trim().is_empty())
+        .then(|| {
+            secret_provider
+                .resolve(secret_ref)
+                .map(|value| (secret_ref.to_owned(), value))
+        })
+        .flatten()
+        .into_iter()
+        .collect();
+    Arc::new(SnapshotSecretProvider { values })
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -72,7 +94,6 @@ pub struct KernelToolExecutionContext {
 pub struct KernelToolExecutionResult {
     pub invocation_id: String,
     pub output: Value,
-    pub effect_receipt: ToolEffectReceipt,
 }
 
 pub trait KernelToolExecutor: Send + Sync {
@@ -131,18 +152,34 @@ pub fn builtin_executors(
     secret_provider: Arc<dyn SecretProvider>,
 ) -> Vec<(&'static str, Box<dyn KernelToolExecutor>)> {
     let executors = registry
-        .registrations()
-        .filter_map(|registration| {
-            registration.executor_binding.map(|binding| {
-                (
-                    registration.tool_id(),
-                    executor_for_binding(binding, config.clone(), Arc::clone(&secret_provider)),
-                )
-            })
+        .kernel_internal_ready_executor_bindings()
+        .map(|(tool_id, binding)| {
+            (
+                tool_id,
+                executor_for_binding(binding, config.clone(), Arc::clone(&secret_provider)),
+            )
         })
         .collect::<Vec<_>>();
     assert_executor_bindings_match_tool_registry(registry, &executors);
     executors
+}
+
+pub(crate) fn runtime_unavailable_tool_ids(
+    registry: &KernelToolRegistry,
+    config: &KernelExecutorConfig,
+    secret_provider: &dyn SecretProvider,
+) -> Vec<deepcode_kernel_abi::ToolIdV2> {
+    let web_search_id =
+        deepcode_kernel_abi::ToolIdV2::parse("web.search").expect("compiled ToolId is valid");
+    match registry.descriptor_v2(&web_search_id) {
+        Some(descriptor)
+            if descriptor.availability == deepcode_kernel_abi::ToolAvailabilityV2::Ready
+                && !web::web_search_runtime_is_ready(config, secret_provider) =>
+        {
+            vec![web_search_id]
+        }
+        _ => Vec::new(),
+    }
 }
 
 fn executor_for_binding(
@@ -158,16 +195,10 @@ fn executor_for_binding(
         KernelExecutorBinding::FsCreate => Box::new(FsCreateExecutor),
         KernelExecutorBinding::FsWrite => Box::new(FsWriteExecutor),
         KernelExecutorBinding::FsEdit => Box::new(FsEditExecutor),
-        KernelExecutorBinding::FsRename => Box::new(FsRenameExecutor),
         KernelExecutorBinding::FsDelete => Box::new(FsDeleteExecutor),
         KernelExecutorBinding::FsEnsureDirectory => Box::new(FsEnsureDirectoryExecutor),
         KernelExecutorBinding::CodeGrep => Box::new(CodeGrepExecutor),
         KernelExecutorBinding::DocumentRead => Box::new(DocumentReadExecutor),
-        KernelExecutorBinding::GitStatus => Box::new(GitStatusExecutor),
-        KernelExecutorBinding::GitDiff => Box::new(GitDiffExecutor),
-        KernelExecutorBinding::GitStage => Box::new(GitStageExecutor),
-        KernelExecutorBinding::GitUnstage => Box::new(GitUnstageExecutor),
-        KernelExecutorBinding::GitCommit => Box::new(GitCommitExecutor),
         KernelExecutorBinding::WebSearch => Box::new(WebSearchExecutor {
             config,
             secret_provider,
@@ -184,24 +215,27 @@ fn assert_executor_bindings_match_tool_registry(
         .iter()
         .map(|(tool_id, _)| *tool_id)
         .collect::<Vec<_>>();
-    for template in registry.contracts() {
+    let inventory = registry
+        .tool_inventory_v2()
+        .expect("compiled Kernel tool inventory must be valid");
+    for descriptor in inventory.tools {
         let binding_count = binding_ids
             .iter()
-            .filter(|tool_id| **tool_id == template.tool_id)
+            .filter(|tool_id| **tool_id == descriptor.tool_id.as_str())
             .count();
-        let expected = usize::from(
-            template.execution.execution_mode
-                == deepcode_kernel_tools::OperationExecutionMode::Execute,
-        );
+        let expected =
+            usize::from(descriptor.availability == deepcode_kernel_abi::ToolAvailabilityV2::Ready);
         assert_eq!(
             binding_count, expected,
             "Kernel tool {} has {binding_count} executor binding(s); expected {expected}",
-            template.tool_id
+            descriptor.tool_id
         );
     }
     for tool_id in binding_ids {
+        let tool_id_v2 =
+            deepcode_kernel_abi::ToolIdV2::parse(tool_id).expect("registered tool id is valid");
         assert!(
-            registry.get(tool_id).is_some(),
+            registry.descriptor_v2(&tool_id_v2).is_some(),
             "runtime executor {tool_id} has no canonical ToolRegistration"
         );
     }
@@ -210,15 +244,12 @@ fn assert_executor_bindings_match_tool_registry(
 mod document;
 #[path = "executors/fs.rs"]
 mod filesystem;
-mod git;
 mod search;
 pub(crate) mod web;
 
 pub(crate) use document::invoke_document_read_complete;
 use document::DocumentReadExecutor;
 use filesystem::*;
-use git::*;
-pub(crate) use search::{grep_workspace_with_options, CodeGrepOptions};
 use search::{skip_directory, CodeGrepExecutor, FsGlobExecutor};
 pub(crate) use web::invoke_web_fetch_complete;
 use web::*;
@@ -235,22 +266,10 @@ fn ok(invocation_id: String, output: Value) -> KernelToolExecutionResult {
         .collect::<Vec<_>>();
     affected_resources.sort();
     affected_resources.dedup();
-    let validation = output.get("validation").cloned();
-    let outcome = if affected_resources.is_empty() && validation.is_none() {
-        ToolEffectOutcome::None
-    } else {
-        ToolEffectOutcome::Observed
-    };
+    let _ = affected_resources;
     KernelToolExecutionResult {
-        invocation_id: invocation_id.clone(),
+        invocation_id,
         output,
-        effect_receipt: ToolEffectReceipt {
-            attempt_id: invocation_id,
-            outcome,
-            affected_resources,
-            validation,
-            cleanup_refs: Vec::new(),
-        },
     }
 }
 
@@ -263,15 +282,15 @@ struct TextPatchResult {
 
 pub(crate) fn plan_v2_text_edit(
     original: &str,
-    matcher: &deepcode_kernel_tools::EditMatcherV4,
+    matcher: &deepcode_kernel_tools::kernel_internal::KernelEditMatcher,
     replacement: &str,
 ) -> KernelResult<(Value, String)> {
-    use deepcode_kernel_tools::{EditMatcherV4, FileDigestPreconditionV4};
+    use deepcode_kernel_tools::kernel_internal::{KernelEditMatcher, KernelFileDigestPrecondition};
     let match_value = match matcher {
-        EditMatcherV4::ExactBlock { text } => {
+        KernelEditMatcher::ExactBlock { text } => {
             serde_json::json!({"kind":"exactBlock","text":text})
         }
-        EditMatcherV4::ContextBlock {
+        KernelEditMatcher::ContextBlock {
             before,
             target,
             after,
@@ -281,7 +300,7 @@ pub(crate) fn plan_v2_text_edit(
             "target":target,
             "after":after
         }),
-        EditMatcherV4::LineRange {
+        KernelEditMatcher::LineRange {
             start_line,
             end_line,
             precondition,
@@ -292,11 +311,11 @@ pub(crate) fn plan_v2_text_edit(
                 "endLine":end_line
             });
             match precondition {
-                FileDigestPreconditionV4::ExpectedFileDigest { .. } => {
+                KernelFileDigestPrecondition::ExpectedFileDigest { .. } => {
                     value["expectedFileHash"] =
                         Value::String(deepcode_kernel_tools::hash_bytes(original.as_bytes()));
                 }
-                FileDigestPreconditionV4::ExpectedBeforeBlock { text } => {
+                KernelFileDigestPrecondition::ExpectedBeforeBlock { text } => {
                     value["expectedBeforeBlock"] = Value::String(text.clone());
                 }
             }

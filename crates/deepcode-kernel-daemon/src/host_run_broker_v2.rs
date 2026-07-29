@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
-use std::fs::{self, File};
-use std::io::{self, Read};
+use std::fs;
+use std::io;
 use std::path::PathBuf;
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -86,9 +86,7 @@ pub(crate) struct HostRunRetirementProgressV2 {
 pub(crate) struct HostRunSettingsCeilingV2 {
     pub(crate) workspace_read: bool,
     pub(crate) workspace_write: bool,
-    pub(crate) git_write: bool,
     pub(crate) web_read: bool,
-    pub(crate) private_web_read: bool,
     pub(crate) auto_approve_plans: bool,
 }
 
@@ -97,9 +95,7 @@ impl HostRunSettingsCeilingV2 {
         Self {
             workspace_read: false,
             workspace_write: false,
-            git_write: false,
             web_read: false,
-            private_web_read: false,
             auto_approve_plans: false,
         }
     }
@@ -115,6 +111,7 @@ pub(crate) struct HostActiveRunRegistrationV2 {
     pub(crate) workspace_binding_digest: String,
     pub(crate) workspace_binding_identity: String,
     pub(crate) workspace_kind: HostRunWorkspaceKindV2,
+    pub(crate) active_folder_id: Option<String>,
     pub(crate) empty_workspace_key: Option<String>,
     pub(crate) initial_input_id: String,
     pub(crate) initial_opaque_input_ref: String,
@@ -135,6 +132,8 @@ pub(crate) struct HostActiveRunRecordV2 {
     pub(crate) workspace_binding_digest: String,
     pub(crate) workspace_binding_identity: String,
     pub(crate) workspace_kind: HostRunWorkspaceKindV2,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) active_folder_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) empty_workspace_key: Option<String>,
     pub(crate) initial_input_id: String,
@@ -162,10 +161,7 @@ pub(crate) struct HostActiveRunRegistrationReceiptV2 {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct HostRunRetirementReceiptV2 {
-    pub(crate) record: HostActiveRunRecordV2,
-    pub(crate) replayed: bool,
-}
+pub(crate) struct HostRunRetirementReceiptV2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HostKernelRunRetirementProofV2 {
@@ -186,16 +182,16 @@ pub(crate) struct HostActiveRunBrokerV2 {
 }
 
 impl HostActiveRunBrokerV2 {
-    pub(crate) fn new(sessions_dir: PathBuf) -> Self {
+    pub(crate) fn new(sessions_dir: PathBuf) -> Result<Self, HostV2StorageError> {
         let sessions_dir = Arc::new(sessions_dir);
-        let owner_instance_id = Arc::new(boot_owner_instance_id());
+        let owner_instance_id = Arc::new(boot_owner_instance_id()?);
         let bridge_slots = Arc::new(Mutex::new(HashMap::new()));
         let bridge_finalizer = Arc::new(HostBridgeFinalizerV2 {
             sessions_dir: Arc::clone(&sessions_dir),
             owner_instance_id: Arc::clone(&owner_instance_id),
             bridge_slots: Arc::clone(&bridge_slots),
         });
-        Self {
+        Ok(Self {
             sessions_dir,
             owner_instance_id,
             startup_errors: Arc::new(Mutex::new(Vec::new())),
@@ -203,7 +199,7 @@ impl HostActiveRunBrokerV2 {
             bridge_slots,
             _bridge_finalizer: bridge_finalizer,
             run_transport_capabilities: Arc::new(Mutex::new(HashMap::new())),
-        }
+        })
     }
 
     pub(crate) fn owner_instance_id(&self) -> String {
@@ -538,31 +534,6 @@ impl HostActiveRunBrokerV2 {
             generation,
             slot,
         })
-    }
-
-    pub(crate) fn supersede_bridge_child(
-        &self,
-        turn: &HostSessionTurnGuardV2,
-    ) -> Result<bool, HostV2StorageError> {
-        let slot = self.bridge_slot(&turn.session_id)?;
-        let mut current = slot.lock().map_err(|_| {
-            HostV2StorageError::io(
-                "host_bridge_v2_owner_unavailable",
-                "Host bridge child owner is unavailable",
-            )
-        })?;
-        let Some(previous) = current.as_mut() else {
-            return Ok(false);
-        };
-        terminate_owned_bridge_child_ref(&mut previous.child)?;
-        self.mark_bridge_reaped_exact(
-            &turn.session_id,
-            &previous.host_run_id,
-            &previous.run_id,
-            previous.generation,
-        )?;
-        current.take();
-        Ok(true)
     }
 
     fn remove_empty_bridge_slot(&self, session_id: &str) {
@@ -915,6 +886,17 @@ impl HostActiveRunBrokerV2 {
         Ok(active)
     }
 
+    pub(crate) fn active_run_records(
+        &self,
+    ) -> Result<Vec<HostActiveRunRecordV2>, HostV2StorageError> {
+        self.scan_active_run_records().map(|records| {
+            records
+                .into_iter()
+                .filter(|record| record.lifecycle == HostRunLifecycleV2::Active)
+                .collect()
+        })
+    }
+
     pub(crate) fn retire_run(
         &self,
         turn: &HostSessionTurnGuardV2,
@@ -947,10 +929,7 @@ impl HostActiveRunBrokerV2 {
             reason,
         )?;
         if started.lifecycle == HostRunLifecycleV2::Retired {
-            return Ok(HostRunRetirementReceiptV2 {
-                record: started,
-                replayed: true,
-            });
+            return Ok(HostRunRetirementReceiptV2);
         }
         self.resume_retirement(
             Some(turn),
@@ -1096,10 +1075,7 @@ impl HostActiveRunBrokerV2 {
         ) -> Result<(), HostV2StorageError>,
     ) -> Result<HostRunRetirementReceiptV2, HostV2StorageError> {
         if record.lifecycle == HostRunLifecycleV2::Retired {
-            return Ok(HostRunRetirementReceiptV2 {
-                record,
-                replayed: true,
-            });
+            return Ok(HostRunRetirementReceiptV2);
         }
         require_retiring(&record)?;
 
@@ -1400,10 +1376,7 @@ impl HostActiveRunBrokerV2 {
                         "Host retired-run archive does not contain a retired Run",
                     ));
                 }
-                return Ok(HostRunRetirementReceiptV2 {
-                    record,
-                    replayed: true,
-                });
+                return Ok(HostRunRetirementReceiptV2);
             };
             let mut record = decode_active_run_record(value)?;
             require_same_retiring_run(&record, expected)?;
@@ -1458,10 +1431,7 @@ impl HostActiveRunBrokerV2 {
             if let Some(parent) = path.parent() {
                 sync_directory(parent)?;
             }
-            Ok(HostRunRetirementReceiptV2 {
-                record,
-                replayed: false,
-            })
+            Ok(HostRunRetirementReceiptV2)
         })
     }
 
@@ -1988,22 +1958,6 @@ pub(crate) struct HostBridgeChildLeaseV2 {
 }
 
 impl HostBridgeChildLeaseV2 {
-    pub(crate) fn session_id(&self) -> &str {
-        &self.session_id
-    }
-
-    pub(crate) fn host_run_id(&self) -> &str {
-        &self.host_run_id
-    }
-
-    pub(crate) fn run_id(&self) -> &str {
-        &self.run_id
-    }
-
-    pub(crate) fn generation(&self) -> u64 {
-        self.generation
-    }
-
     pub(crate) fn take_stdin(&self) -> Result<Option<ChildStdin>, HostV2StorageError> {
         self.with_child(|child| Ok(child.stdin.take()))
     }
@@ -2176,6 +2130,9 @@ fn validate_registration(input: &HostActiveRunRegistrationV2) -> Result<(), Host
         validate_bounded_identity(value, field, 128 * 1024)?;
     }
     crate::host_v2_storage::validate_sha256_digest(&input.bootstrap_digest, "bootstrapDigest")?;
+    if let Some(folder_id) = input.active_folder_id.as_deref() {
+        validate_bounded_identity(folder_id, "activeFolderId", 512)?;
+    }
     match input.workspace_kind {
         HostRunWorkspaceKindV2::Bound if input.empty_workspace_key.is_some() => {
             return Err(HostV2StorageError::invalid(
@@ -2184,6 +2141,12 @@ fn validate_registration(input: &HostActiveRunRegistrationV2) -> Result<(), Host
             ))
         }
         HostRunWorkspaceKindV2::Empty => {
+            if input.active_folder_id.is_some() {
+                return Err(HostV2StorageError::invalid(
+                    "host_active_run_workspace_invalid",
+                    "Empty Host run cannot carry an active folder identity",
+                ));
+            }
             let key = input.empty_workspace_key.as_deref().ok_or_else(|| {
                 HostV2StorageError::invalid(
                     "host_active_run_workspace_invalid",
@@ -2254,6 +2217,9 @@ fn active_run_record(
     if let Some(key) = input.empty_workspace_key {
         value["emptyWorkspaceKey"] = Value::String(key);
     }
+    if let Some(folder_id) = input.active_folder_id {
+        value["activeFolderId"] = Value::String(folder_id);
+    }
     reject_transport_capabilities(&value)?;
     let digest = canonical_sha256(&value)?;
     value["recordDigest"] = Value::String(digest);
@@ -2296,6 +2262,7 @@ fn decode_active_run_record(value: Value) -> Result<HostActiveRunRecordV2, HostV
         workspace_binding_digest: record.workspace_binding_digest.clone(),
         workspace_binding_identity: record.workspace_binding_identity.clone(),
         workspace_kind: record.workspace_kind,
+        active_folder_id: record.active_folder_id.clone(),
         empty_workspace_key: record.empty_workspace_key.clone(),
         initial_input_id: record.initial_input_id.clone(),
         initial_opaque_input_ref: record.initial_opaque_input_ref.clone(),
@@ -2311,6 +2278,7 @@ fn decode_active_run_record(value: Value) -> Result<HostActiveRunRecordV2, HostV
         workspace_binding_digest: record.workspace_binding_digest.clone(),
         workspace_binding_identity: record.workspace_binding_identity.clone(),
         workspace_kind: record.workspace_kind,
+        active_folder_id: record.active_folder_id.clone(),
         empty_workspace_key: record.empty_workspace_key.clone(),
         initial_input_id: record.initial_input_id.clone(),
         initial_opaque_input_ref: record.initial_opaque_input_ref.clone(),
@@ -2330,7 +2298,7 @@ fn decode_active_run_record(value: Value) -> Result<HostActiveRunRecordV2, HostV
 fn active_run_registration_digest(
     input: &HostActiveRunRegistrationV2,
 ) -> Result<String, HostV2StorageError> {
-    let value = json!({
+    let mut value = json!({
         "sessionId": input.session_id,
         "hostRunId": input.host_run_id,
         "runId": input.run_id,
@@ -2345,6 +2313,9 @@ fn active_run_registration_digest(
         "runSettings": input.run_settings,
         "recordedAt": input.recorded_at,
     });
+    if let Some(folder_id) = input.active_folder_id.as_deref() {
+        value["activeFolderId"] = Value::String(folder_id.to_string());
+    }
     reject_transport_capabilities(&value)?;
     canonical_sha256(&value)
 }
@@ -2427,29 +2398,20 @@ fn next_bridge_generation() -> Result<u64, HostV2StorageError> {
         })
 }
 
-fn boot_owner_instance_id() -> String {
+fn boot_owner_instance_id() -> Result<String, HostV2StorageError> {
     let mut entropy = [0_u8; 32];
-    if File::open("/dev/urandom")
-        .and_then(|mut source| source.read_exact(&mut entropy))
-        .is_err()
-    {
-        let fallback = format!(
-            "deepcode.host.bridge-owner.v2\0{}\0{}\0{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|duration| duration.as_nanos())
-                .unwrap_or_default(),
-            HOST_BRIDGE_GENERATION_V2.fetch_add(1, Ordering::Relaxed)
-        );
-        entropy.copy_from_slice(&Sha256::digest(fallback.as_bytes()));
-    }
+    getrandom::fill(&mut entropy).map_err(|_| {
+        HostV2StorageError::io(
+            "host_bridge_owner_entropy_unavailable",
+            "Operating-system CSPRNG could not create the Host bridge owner identity",
+        )
+    })?;
     let mut encoded = String::with_capacity(entropy.len() * 2);
     for byte in entropy {
         use std::fmt::Write;
         let _ = write!(encoded, "{byte:02x}");
     }
-    format!("host-bridge-owner-v2-{encoded}")
+    Ok(format!("host-bridge-owner-v2-{encoded}"))
 }
 
 fn empty_workspace_key(session_id: &str, host_run_id: &str) -> String {

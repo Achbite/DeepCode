@@ -24,25 +24,25 @@ const AgentPanel: React.FC = () => {
   const messageAttachments = useAgentSessionStore((s) => s.messageAttachments);
   const sessionAttachments = useAgentSessionStore((s) => s.sessionAttachments);
   const resolvingPermission = useAgentSessionStore((s) => s.resolvingPermission);
-  const resolvingRequirement = useAgentSessionStore((s) => s.resolvingRequirement);
   const resolvingPlan = useAgentSessionStore((s) => s.resolvingPlan);
-  const resolvingReview = useAgentSessionStore((s) => s.resolvingReview);
   const loadOrCreate = useAgentSessionStore((s) => s.loadOrCreate);
   const refreshSessions = useAgentSessionStore((s) => s.refreshSessions);
   const createNewSession = useAgentSessionStore((s) => s.createNewSession);
   const activateSession = useAgentSessionStore((s) => s.activateSession);
   const renameSession = useAgentSessionStore((s) => s.renameSession);
   const archiveSession = useAgentSessionStore((s) => s.archiveSession);
+  const sendMessage = useAgentSessionStore((s) => s.sendMessage);
   const addAttachment = useAgentSessionStore((s) => s.addAttachment);
   const removeAttachment = useAgentSessionStore((s) => s.removeAttachment);
-  const sendMessage = useAgentSessionStore((s) => s.sendMessage);
+  const synchronizeAttachmentRoot = useAgentSessionStore((s) => s.synchronizeAttachmentRoot);
   const cancelCurrentRun = useAgentSessionStore((s) => s.cancelCurrentRun);
   const acceptPermission = useAgentSessionStore((s) => s.acceptPermission);
   const rejectPermission = useAgentSessionStore((s) => s.rejectPermission);
-  const resolveRequirement = useAgentSessionStore((s) => s.resolveRequirement);
   const resolvePlan = useAgentSessionStore((s) => s.resolvePlan);
-  const resolveReview = useAgentSessionStore((s) => s.resolveReview);
   const workspaceScopeKey = useWorkspaceStore((s) => createWorkspaceScopeKey(s.current));
+  const activeFolderId = useWorkspaceStore((s) => (
+    s.activeFolderId ?? s.getActiveFolder()?.id ?? null
+  ));
   const language = normalizeUiLanguage(
     useSettingsStore((s) => s.effectiveSettings['workbench.language'])
   );
@@ -53,9 +53,7 @@ const AgentPanel: React.FC = () => {
   const timelineProjection = timelineOrEmpty(timeline, session?.id);
   const pendingDecision = findPendingComposerDecisionFromProjection({
     timeline: timelineProjection,
-    resolvingRequirement,
     resolvingPlan,
-    resolvingReview,
     resolvingPermission,
   });
   const pendingDecisionResolving = Boolean(pendingDecision?.resolving);
@@ -67,6 +65,10 @@ const AgentPanel: React.FC = () => {
     void loadOrCreate();
     void refreshSessions();
   }, [loadOrCreate, refreshSessions, workspaceScopeKey]);
+
+  useEffect(() => {
+    synchronizeAttachmentRoot(activeFolderId);
+  }, [activeFolderId, synchronizeAttachmentRoot]);
 
   return (
     <div className="agent-panel-shell">
@@ -91,14 +93,6 @@ const AgentPanel: React.FC = () => {
         timeline={timelineProjection}
         loading={agentBusy}
         language={language}
-        resolvingPlan={resolvingPlan}
-        resolvingReview={resolvingReview}
-        onPlanResolve={(runId, planId, decision, guidance) =>
-          void resolvePlan(runId, planId, decision, guidance)
-        }
-        onReviewResolve={(runId, decision, guidance) =>
-          void resolveReview(runId, decision, guidance)
-        }
       />
 
       {pendingPermissionRequest && (
@@ -131,15 +125,6 @@ const AgentPanel: React.FC = () => {
         onDecisionSubmit={(guidance, action) => {
           if (!composerPendingDecision) return;
           const decision = action ?? (guidance ? 'revise' : 'accept');
-          if (composerPendingDecision.kind === 'requirement') {
-            void resolveRequirement(
-              composerPendingDecision.runId,
-              composerPendingDecision.requirementId,
-              decision,
-              guidance
-            );
-            return;
-          }
           if (composerPendingDecision.kind === 'plan') {
             void resolvePlan(
               composerPendingDecision.runId,
@@ -147,24 +132,12 @@ const AgentPanel: React.FC = () => {
               decision,
               guidance
             );
-            return;
-          }
-          if (composerPendingDecision.kind === 'review') {
-            void resolveReview(composerPendingDecision.runId, decision, guidance);
           }
         }}
         onDecisionReject={() => {
           if (!composerPendingDecision) return;
-          if (composerPendingDecision.kind === 'requirement') {
-            void resolveRequirement(composerPendingDecision.runId, composerPendingDecision.requirementId, 'reject');
-            return;
-          }
           if (composerPendingDecision.kind === 'plan') {
             void resolvePlan(composerPendingDecision.runId, composerPendingDecision.planId, 'reject');
-            return;
-          }
-          if (composerPendingDecision.kind === 'review') {
-            void resolveReview(composerPendingDecision.runId, 'reject');
           }
         }}
       />

@@ -213,9 +213,8 @@ Session Runtime:
   普通输入通过 daemon /api/agent/sessions/:id/runs 提交到共享 Session Runtime。
   TUI 只读取 run status、timeline projection 和权限/决策事件；不维护独立会话编排。
   若共享运行时提示缺少 session-core，请运行 pnpm --filter @deepcode/session-core build，
-  或使用包含 session-core/dist、node_modules/@deepcode/protocol 和 node/bin/node 的打包产物。
-  可通过 DEEPCODE_SESSION_BRIDGE 或 DEEPCODE_NODE 覆盖 daemon 内部查找。
-  DEEPCODE_SESSION_BRIDGE_TIMEOUT_MS 控制 daemon 内部 session run hard timeout，默认 600000；0 表示禁用。
+  或使用包含 session-core/dist/hostBridgeV2.js、node_modules/@deepcode/protocol
+  和受信 Node runtime 的打包产物。daemon 启动时固定并校验这些资产。
 
 Kernel:
   默认先连接 --api / DEEPCODE_API_URL / DEEPCODE_HOST:DEEPCODE_PORT。
@@ -234,7 +233,7 @@ Interactive commands:
   /timeline [id]     读取 timeline
   /allow <id>        允许权限请求
   /deny <id>         拒绝权限请求
-  /decision <requirement|plan|review> <accept|reject|revise> [run-id] [target-id] [guidance]
+  /decision plan <accept|reject|revise> [run-id] [target-id] [guidance]
   /decision permission <accept|reject> [run-id] [target-id]
   /clear             清理当前可见卡片
   /quit              退出 TUI

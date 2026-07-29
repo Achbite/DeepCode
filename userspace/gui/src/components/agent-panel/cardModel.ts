@@ -20,7 +20,6 @@ export type CardKind =
   | 'plan'
   | 'review'
   | 'permission'
-  | 'requirement'
   | 'workMeta'
   | 'error';
 

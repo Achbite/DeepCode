@@ -6,7 +6,6 @@ import { sessionKernelFactsCaughtUpV2 } from './lineage.js';
 import type { SessionKernelLoopStateV2 } from './state.js';
 import type {
   SessionKernelReviewV2,
-  SessionPlanActionSettlementV2,
   SessionReviewFactCategoryAccumulatorV2,
   SessionReviewFactCoverageV2,
   SessionReviewPlannedActionV2,
@@ -73,32 +72,14 @@ export function buildSessionKernelReviewV2(
     actualEffects: cloneJson(reviewFacts.actualEffects.samples),
     unexecuted: planned.filter(
       (action) =>
-        planActionInvocationCount(state, action.planActionId) === 0
+        !sessionKernelPlanActionSettledV2(
+          state,
+          action.planActionId
+        )
     ),
     denied: cloneJson(reviewFacts.denied.samples),
     rejections: cloneJson(reviewFacts.rejections.samples),
-    skipped: Object.values(state.planActionSettlements)
-      .filter(
-        (
-          settlement
-        ): settlement is Extract<
-          SessionPlanActionSettlementV2,
-          { kind: 'skipped' }
-        > => settlement.kind === 'skipped'
-      )
-      .sort((left, right) =>
-        left.recordedAt.localeCompare(right.recordedAt)
-        || left.planActionId.localeCompare(right.planActionId)
-      ),
     completions: Object.values(state.planActionSettlements)
-      .filter(
-        (
-          settlement
-        ): settlement is Extract<
-          SessionPlanActionSettlementV2,
-          { kind: 'completed' }
-        > => settlement.kind === 'completed'
-      )
       .sort((left, right) =>
         left.recordedAt.localeCompare(right.recordedAt)
         || left.planActionId.localeCompare(right.planActionId)
@@ -137,9 +118,9 @@ export function buildSessionKernelReviewV2(
 
 /**
  * Caught-up means only that the current facts snapshot is complete. Final
- * Review additionally requires every planned operation to be canonically
- * terminal or denied, no active orchestration/request state, no
- * indeterminate outcome, and settled cleanup facts.
+ * Review additionally requires no active orchestration/request state, no
+ * indeterminate outcome, and settled cleanup facts. Unsettled PlanActions are
+ * represented as unexecuted review items rather than synthetic settlements.
  */
 export function canFinalizeSessionKernelReviewV2(
   state: SessionKernelLoopStateV2
@@ -159,17 +140,9 @@ export function canFinalizeSessionKernelReviewV2(
   if (state.reviewFacts.indeterminate.totalCount > 0) {
     return false;
   }
-  const everyOperationSettled = state.plan.actions.every(
-    (action) =>
-      sessionKernelPlanActionSettledV2(
-        state,
-        action.manifest.planActionId
-      )
-  );
-  return everyOperationSettled
-    && Object.keys(
-      state.reviewFacts.pendingCleanupByResource
-    ).length === 0;
+  return Object.keys(
+    state.reviewFacts.pendingCleanupByResource
+  ).length === 0;
 }
 
 export function sessionKernelPlanActionSettledV2(
@@ -186,7 +159,7 @@ export function finalizeSessionKernelReviewV2(
   if (!canFinalizeSessionKernelReviewV2(state)) {
     throw new SessionKernelReviewError(
       'session_kernel_review_not_finalizable',
-      'Review cannot be finalized while planned work, active state, cleanup, or indeterminate outcomes remain unresolved.'
+      'Review cannot be finalized while active state, cleanup, or indeterminate outcomes remain unresolved.'
     );
   }
   const draft = buildSessionKernelReviewV2(state, finalizedAt);
@@ -206,30 +179,6 @@ function plannedActions(
     operationId: action.manifest.operationId,
     toolId: action.manifest.toolId,
   }));
-}
-
-function planActionOperationIds(
-  state: SessionKernelLoopStateV2,
-  planActionId: string
-): string[] {
-  return [
-    ...(state.lineage.planActions[planActionId]?.operationIds ?? []),
-  ];
-}
-
-function planActionInvocationCount(
-  state: SessionKernelLoopStateV2,
-  planActionId: string
-): number {
-  return planActionOperationIds(state, planActionId).reduce(
-    (count, operationId) =>
-      count
-      + (
-        state.lineage.operations[operationId]?.invocationCount
-        ?? 0
-      ),
-    0
-  );
 }
 
 function factCoverage(

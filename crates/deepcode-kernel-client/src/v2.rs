@@ -1,57 +1,17 @@
 use crate::KernelClientConfig;
 use deepcode_kernel_abi::v2::CommandRequestId;
 use deepcode_kernel_abi::v2_command::{
-    KernelCommandEnvelopeV2, KernelCommandResponseEnvelopeV2, KernelCommandV2, KernelReplyV2,
+    KernelCommandEnvelopeV2, KernelCommandResponseEnvelopeV2, KernelCommandV2,
 };
-use deepcode_kernel_abi::{
-    RunCapabilityV2, UserDecisionEnvelopeV2, UserDecisionResponseEnvelopeV2, KERNEL_ABI_V2_VERSION,
-};
+pub use deepcode_kernel_abi::KernelV2HttpErrorCode;
+use deepcode_kernel_abi::{KernelV2HttpErrorEnvelope, RunCapabilityV2, KERNEL_ABI_V2_VERSION};
 use reqwest::{StatusCode, Url};
-use serde::Deserialize;
-use std::fmt;
 use std::net::IpAddr;
 use thiserror::Error;
 
 const KERNEL_V2_COMMANDS_PATH: &str = "/api/kernel/v2/commands";
-const KERNEL_V2_USER_DECISIONS_PATH: &str = "/api/kernel/v2/user-decisions";
-const HOST_TRANSPORT_CAPABILITY_HEADER: &str = "x-deepcode-host-capability";
 const RUN_TRANSPORT_CAPABILITY_HEADER: &str = "x-deepcode-run-capability";
 const MAX_V2_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum KernelV2HttpErrorCode {
-    PayloadTooLarge,
-    InvalidJson,
-    DuplicateJsonKey,
-    MissingAbiVersion,
-    InvalidAbiVersion,
-    UnsupportedAbiVersion,
-    InvalidPayload,
-    HostAuthorityRequired,
-    HostAuthorityInvalid,
-    RunCapabilityRequired,
-    RunCapabilityInvalid,
-    WorkspaceBindingNotFound,
-    WorkspaceBindingStale,
-    WorkspaceBindingUnavailable,
-    DecisionCapabilityRequired,
-    DecisionCapabilityInvalid,
-    DecisionCapabilityExpired,
-    DecisionCapabilityBindingMismatch,
-    DecisionCapabilityRequestConflict,
-    DecisionCapabilityInUse,
-    ResponseTooLarge,
-    ServiceUnavailable,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct KernelV2HttpErrorEnvelope {
-    format: String,
-    code: KernelV2HttpErrorCode,
-    request_id: Option<String>,
-}
 
 #[derive(Debug, Error)]
 pub enum KernelV2ClientError {
@@ -79,16 +39,6 @@ pub enum KernelV2ClientError {
     UncorrelatedResponse,
     #[error("Session Kernel client cannot open a Run")]
     RunOpenRequiresHost,
-    #[error("Host Kernel open client accepts only RunOpen")]
-    HostOpenCommandRequired,
-    #[error("Host transport credential is malformed")]
-    InvalidHostTransportCredential,
-    #[error("Host RunOpen response is missing its private Run capability")]
-    RunCapabilityMissing,
-    #[error("Host RunOpen response carried a malformed private Run capability")]
-    RunCapabilityInvalid,
-    #[error("Kernel returned a private Run capability for a non-RunOpened response")]
-    UnexpectedRunCapability,
 }
 
 pub type KernelV2ClientResult<T> = Result<T, KernelV2ClientError>;
@@ -96,7 +46,6 @@ pub type KernelV2ClientResult<T> = Result<T, KernelV2ClientError>;
 #[derive(Clone)]
 struct KernelV2HttpTransport {
     commands_url: Url,
-    user_decisions_url: Url,
     http: reqwest::Client,
 }
 
@@ -104,53 +53,6 @@ struct KernelV2HttpTransport {
 pub struct SessionKernelV2Client {
     transport: KernelV2HttpTransport,
     run_capability: RunCapabilityV2,
-}
-
-#[derive(Clone)]
-pub struct HostKernelV2Client {
-    transport: KernelV2HttpTransport,
-    host_credential: HostTransportCredentialV2,
-}
-
-pub struct HostRunOpenTransportV2 {
-    response: KernelCommandResponseEnvelopeV2,
-    run_capability: Option<RunCapabilityV2>,
-}
-
-impl HostRunOpenTransportV2 {
-    pub fn into_parts(self) -> (KernelCommandResponseEnvelopeV2, Option<RunCapabilityV2>) {
-        (self.response, self.run_capability)
-    }
-}
-
-#[derive(Clone)]
-pub struct HostDecisionKernelV2Client {
-    transport: KernelV2HttpTransport,
-}
-
-#[derive(Clone)]
-pub struct HostTransportCredentialV2(String);
-
-impl fmt::Debug for HostTransportCredentialV2 {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("HostTransportCredentialV2([REDACTED])")
-    }
-}
-
-impl HostTransportCredentialV2 {
-    pub fn new(value: impl Into<String>) -> KernelV2ClientResult<Self> {
-        let value = value.into();
-        if value.len() < 16
-            || value.len() > 2048
-            || !value
-                .as_bytes()
-                .iter()
-                .all(|byte| (0x21..=0x7e).contains(byte))
-        {
-            return Err(KernelV2ClientError::InvalidHostTransportCredential);
-        }
-        Ok(Self(value))
-    }
 }
 
 impl SessionKernelV2Client {
@@ -183,57 +85,14 @@ impl SessionKernelV2Client {
     }
 }
 
-impl HostKernelV2Client {
-    pub fn new(
-        config: KernelClientConfig,
-        host_credential: HostTransportCredentialV2,
-    ) -> KernelV2ClientResult<Self> {
-        Ok(Self {
-            transport: KernelV2HttpTransport::new(config)?,
-            host_credential,
-        })
-    }
-
-    pub async fn open_run(
-        &self,
-        envelope: KernelCommandEnvelopeV2,
-    ) -> KernelV2ClientResult<HostRunOpenTransportV2> {
-        if !matches!(&envelope.command, KernelCommandV2::RunOpen(_)) {
-            return Err(KernelV2ClientError::HostOpenCommandRequired);
-        }
-        self.transport
-            .post_host_run_open(envelope, self.host_credential.0.as_str())
-            .await
-    }
-}
-
-impl HostDecisionKernelV2Client {
-    pub fn new(config: KernelClientConfig) -> KernelV2ClientResult<Self> {
-        Ok(Self {
-            transport: KernelV2HttpTransport::new(config)?,
-        })
-    }
-
-    pub async fn submit(
-        &self,
-        envelope: UserDecisionEnvelopeV2,
-    ) -> KernelV2ClientResult<UserDecisionResponseEnvelopeV2> {
-        self.transport.post_user_decision(envelope).await
-    }
-}
-
 impl KernelV2HttpTransport {
     fn new(config: KernelClientConfig) -> KernelV2ClientResult<Self> {
         let base_url = parse_loopback_http_base_url(&config.base_url)?;
         let commands_url = base_url
             .join(KERNEL_V2_COMMANDS_PATH.trim_start_matches('/'))
             .map_err(|_| KernelV2ClientError::InvalidBaseUrl)?;
-        let user_decisions_url = base_url
-            .join(KERNEL_V2_USER_DECISIONS_PATH.trim_start_matches('/'))
-            .map_err(|_| KernelV2ClientError::InvalidBaseUrl)?;
         Ok(Self {
             commands_url,
-            user_decisions_url,
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(60))
                 .redirect(reqwest::redirect::Policy::none())
@@ -260,68 +119,6 @@ impl KernelV2HttpTransport {
         let decoded = decode_response(response, &request_id).await?;
         validate_command_response(&decoded, &request_id)?;
         Ok(decoded)
-    }
-
-    async fn post_user_decision(
-        &self,
-        envelope: UserDecisionEnvelopeV2,
-    ) -> KernelV2ClientResult<UserDecisionResponseEnvelopeV2> {
-        let request_id = envelope.request_id.clone();
-        let response = self
-            .http
-            .post(self.user_decisions_url.clone())
-            .json(&envelope)
-            .send()
-            .await
-            .map_err(KernelV2ClientError::Transport)?;
-        let decoded = decode_response(response, &request_id).await?;
-        validate_user_decision_response(&decoded, &request_id)?;
-        Ok(decoded)
-    }
-
-    async fn post_host_run_open(
-        &self,
-        envelope: KernelCommandEnvelopeV2,
-        host_credential: &str,
-    ) -> KernelV2ClientResult<HostRunOpenTransportV2> {
-        let request_id = envelope.request_id.clone();
-        let response = self
-            .http
-            .post(self.commands_url.clone())
-            .header(HOST_TRANSPORT_CAPABILITY_HEADER, host_credential)
-            .json(&envelope)
-            .send()
-            .await
-            .map_err(KernelV2ClientError::Transport)?;
-        let run_capability = response
-            .headers()
-            .get(RUN_TRANSPORT_CAPABILITY_HEADER)
-            .map(|value| {
-                value
-                    .to_str()
-                    .ok()
-                    .and_then(|value| RunCapabilityV2::new(value.to_owned()).ok())
-                    .ok_or(KernelV2ClientError::RunCapabilityInvalid)
-            })
-            .transpose()?;
-        let decoded = decode_response(response, &request_id).await?;
-        validate_command_response(&decoded, &request_id)?;
-        let run_opened = matches!(
-            &decoded,
-            KernelCommandResponseEnvelopeV2::Correlated {
-                reply: KernelReplyV2::RunOpened(_),
-                ..
-            }
-        );
-        match (run_opened, run_capability.as_ref()) {
-            (true, None) => return Err(KernelV2ClientError::RunCapabilityMissing),
-            (false, Some(_)) => return Err(KernelV2ClientError::UnexpectedRunCapability),
-            _ => {}
-        }
-        Ok(HostRunOpenTransportV2 {
-            response: decoded,
-            run_capability,
-        })
     }
 }
 
@@ -369,20 +166,22 @@ where
     if !status.is_success() {
         let error = serde_json::from_slice::<KernelV2HttpErrorEnvelope>(&body)
             .map_err(|_| KernelV2ClientError::InvalidHttpError)?;
-        if error.format != "deepcode.kernel.http-error.v2" {
+        if !error.has_supported_format() {
             return Err(KernelV2ClientError::InvalidHttpError);
         }
         if error
             .request_id
-            .as_deref()
-            .is_some_and(|request_id| request_id != expected_request_id.as_str())
+            .as_ref()
+            .is_some_and(|request_id| request_id.as_str() != expected_request_id.as_str())
         {
             return Err(KernelV2ClientError::ResponseRequestIdMismatch);
         }
         return Err(KernelV2ClientError::Http {
             status,
             code: error.code,
-            request_id: error.request_id,
+            request_id: error
+                .request_id
+                .map(|request_id| request_id.as_str().to_owned()),
         });
     }
     serde_json::from_slice(&body).map_err(KernelV2ClientError::Decode)
@@ -427,25 +226,6 @@ fn validate_command_response(
             ..
         } => validate_response_identity(server_abi_version, Some(request_id), expected_request_id),
         KernelCommandResponseEnvelopeV2::UncorrelatedWireFailure {
-            server_abi_version, ..
-        } => {
-            validate_response_identity(server_abi_version, None, expected_request_id)?;
-            Err(KernelV2ClientError::UncorrelatedResponse)
-        }
-    }
-}
-
-fn validate_user_decision_response(
-    response: &UserDecisionResponseEnvelopeV2,
-    expected_request_id: &CommandRequestId,
-) -> KernelV2ClientResult<()> {
-    match response {
-        UserDecisionResponseEnvelopeV2::Correlated {
-            server_abi_version,
-            request_id,
-            ..
-        } => validate_response_identity(server_abi_version, Some(request_id), expected_request_id),
-        UserDecisionResponseEnvelopeV2::UncorrelatedWireFailure {
             server_abi_version, ..
         } => {
             validate_response_identity(server_abi_version, None, expected_request_id)?;

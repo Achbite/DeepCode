@@ -1,4 +1,4 @@
-use crate::{ResourceFileClassification, ResourceSearchMatch, WorkspaceBinding};
+use crate::WorkspaceBinding;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -199,75 +199,6 @@ pub struct HostSkillCatalogResult {
     pub skills: Vec<HostSkillDescriptor>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum HostSkillTrustDecisionKind {
-    Accept,
-    Reject,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum HostSkillTrustMode {
-    Declarative,
-    BrokeredScript,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HostSkillTrustDecisionSubmit {
-    pub decision: HostSkillTrustDecisionKind,
-    pub trust_mode: HostSkillTrustMode,
-    pub revision_hash: Option<String>,
-    pub approved_capabilities: Vec<String>,
-    pub approved_at: Option<String>,
-    pub approved_by: Option<String>,
-    pub expires_at: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HostSkillTrustDecisionRecord {
-    pub skill_id: String,
-    pub decision: HostSkillTrustDecisionKind,
-    pub trust_mode: HostSkillTrustMode,
-    pub revision_hash: Option<String>,
-    pub approved_capabilities: Vec<String>,
-    pub approved_at: Option<String>,
-    pub approved_by: Option<String>,
-    pub expires_at: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum HostMcpRiskDecisionKind {
-    Acknowledge,
-    Reject,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HostMcpRiskDecisionSubmit {
-    pub decision: HostMcpRiskDecisionKind,
-    pub revision_hash: Option<String>,
-    pub acknowledged_by: Option<String>,
-    pub acknowledged_at: Option<String>,
-    pub risk_level: HostSkillRiskLevel,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HostMcpRiskDecisionRecord {
-    pub connector_id: String,
-    pub binding_id: Option<String>,
-    pub decision: HostMcpRiskDecisionKind,
-    pub revision_hash: Option<String>,
-    pub acknowledged_by: Option<String>,
-    pub acknowledged_at: Option<String>,
-    pub risk_level: HostSkillRiskLevel,
-    pub permission_granted: bool,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
     tag = "kind",
@@ -337,6 +268,41 @@ pub enum HostFileTreeNodeKind {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct HostFileClassification {
+    pub kind: String,
+    pub readable_text: bool,
+    pub binary: bool,
+    pub executable: bool,
+    pub size_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extension: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub magic: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostSearchContextLine {
+    pub line: usize,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostSearchMatch {
+    pub path: String,
+    pub line: usize,
+    pub preview: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub before: Vec<HostSearchContextLine>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub after: Vec<HostSearchContextLine>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct HostFileTreeNode {
     pub name: String,
     pub path: String,
@@ -347,7 +313,7 @@ pub struct HostFileTreeNode {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub file_classification: Option<ResourceFileClassification>,
+    pub file_classification: Option<HostFileClassification>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -362,7 +328,7 @@ pub struct HostFileReadResult {
     pub end_line: usize,
     pub content_hash: String,
     pub binary: bool,
-    pub file_classification: ResourceFileClassification,
+    pub file_classification: HostFileClassification,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -382,7 +348,7 @@ pub struct HostGrepResult {
     pub skipped_files: usize,
     pub skipped_binary_files: usize,
     pub skipped_executable_files: usize,
-    pub matches: Vec<ResourceSearchMatch>,
+    pub matches: Vec<HostSearchMatch>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -8,7 +8,7 @@ use deepcode_kernel_abi::v2::{
     WorkspaceObjectKindV2,
 };
 use deepcode_kernel_abi::v2_command::{InvocationPhaseV2, KernelErrorV2};
-use deepcode_kernel_tools::{AuthorityToolIdV4, ToolInvocationInputV4};
+use deepcode_kernel_tools::kernel_internal::{KernelCanonicalInvocation, KernelToolKind};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -101,7 +101,7 @@ pub(super) struct DirectInvocationRecord {
     pub(super) invocation_id: InvocationId,
     pub(super) attempt_id: AttemptId,
     pub(super) idempotency_key_hash: IdempotencyKeyHashV2,
-    pub(super) private_tool_kind: AuthorityToolIdV4,
+    pub(super) private_tool_kind: KernelToolKind,
     pub(super) resource_scope: ResourceScopeV2,
     pub(super) workspace_binding_digest: WorkspaceBindingDigestV2,
     pub(super) correlations: CorrelationSetV2,
@@ -160,7 +160,7 @@ pub(super) struct ResolvedTarget {
 
 #[derive(Debug, Clone)]
 pub(super) struct PreparedDirectToolIntent {
-    pub(super) canonical_invocation: ToolInvocationInputV4,
+    pub(super) canonical_invocation: KernelCanonicalInvocation,
     pub(super) resource_scope: ResourceScopeV2,
     pub(super) resolved_targets: Vec<ResolvedTarget>,
     pub(super) idempotency_key_hash: IdempotencyKeyHashV2,

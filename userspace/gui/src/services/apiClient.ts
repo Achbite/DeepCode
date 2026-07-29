@@ -27,7 +27,6 @@ import type {
   CodeGrepResult,
   GitStatusResult,
   GitDiffResult,
-  AgentMode,
   AgentProjectListResult,
   AgentProjectResult,
   AgentSessionListResult,
@@ -41,16 +40,6 @@ import type {
   ArchiveAgentSessionRequest,
   AgentSessionResult,
   AgentTimelineResult,
-  AppendAgentEventsRequest,
-  ResolveAgentPermissionRequest,
-  ResolveAgentPlanRequest,
-  ResolveAgentReviewRequest,
-  AgentFeedbackRequest,
-  AgentFeedbackResult,
-  GetAgentEventSnapshotResult,
-  GetAgentWorkflowConfigResult,
-  PatchAgentWorkflowConfigRequest,
-  ListToolsResult,
   ShellEnvironmentStatus,
   TerminalCapability,
   TerminalSession,
@@ -67,11 +56,11 @@ import type {
   SetBrowserInspectModeRequest,
   KernelHostInspectionQuery,
   KernelHostInspectionResult,
-  ProjectionDeliveryRecord,
-  ConversationLanguage,
+  AgentRunGuidanceRequest,
+  StartAgentRunRequest,
 } from '@deepcode/protocol';
 import { activeT } from '../i18n';
-import { getKernelApiBase } from './hostTarget';
+import { getHostAdmissionHeaders, getKernelApiBase } from './hostTarget';
 
 const API_BASE = getKernelApiBase();
 
@@ -79,26 +68,34 @@ interface SendJsonOptions {
   signal?: AbortSignal;
 }
 
-export interface StartAgentRunRequest {
-  op?: 'ask' | 'resolveDecision';
-  content?: string;
-  prompt?: string;
-  attachments?: unknown[];
-  workspacePath?: string;
-  noWorkspace?: boolean;
-  profileId?: string;
-  workflow?: string;
-  requirementConfirmationMode?: 'auto' | 'always' | 'off';
-  reviewContinuationMode?: 'auto' | 'ask' | 'off';
-  interventionLevel?: 'low' | 'medium' | 'high';
-  projectMemoryMode?: 'confirm' | 'auto';
-  title?: string;
-  decisionKind?: 'requirement' | 'plan' | 'review' | 'permission' | 'boundary';
-  decision?: 'accept' | 'reject' | 'revise';
-  guidance?: string;
-  runId?: string;
-  targetId?: string;
-  hostLanguage?: ConversationLanguage;
+export type {
+  AgentInputAttachmentV2,
+  AgentRunGuidanceRequest,
+  AskAgentRunRequest,
+  ResolveAgentRunDecisionRequest,
+  StartAgentRunRequest,
+} from '@deepcode/protocol';
+
+function agentRunMutationPayload(request: StartAgentRunRequest): StartAgentRunRequest {
+  if (request.op === 'ask') {
+    return {
+      op: 'ask',
+      content: request.content,
+      workspacePath: request.workspacePath,
+      noWorkspace: request.noWorkspace,
+      attachments: request.attachments,
+      callerRequestId: request.callerRequestId,
+    };
+  }
+  return {
+    op: 'resolveDecision',
+    decisionKind: request.decisionKind,
+    decision: request.decision,
+    guidance: request.guidance,
+    runId: request.runId,
+    targetId: request.targetId,
+    callerRequestId: request.callerRequestId,
+  };
 }
 
 export interface AgentRunStatus {
@@ -213,37 +210,6 @@ export interface SkillMountScanResult {
   warnings: string[];
 }
 
-export interface ConversationArchiveFileEntry {
-  path: string;
-  sizeBytes: number;
-}
-
-export interface ConversationArchiveManifest {
-  schemaVersion: string;
-  sessionId: string;
-  workspaceScopeKey: string;
-  runId: string;
-  archivePath: string;
-  createdAt: string;
-  updatedAt: string;
-  files: ConversationArchiveFileEntry[];
-}
-
-export interface ConversationArchiveResult {
-  sessionId: string;
-  conversationArchiveRoot: string;
-  defaultWorkspaceScopeKey: string;
-  archives: ConversationArchiveManifest[];
-}
-
-export interface ConversationArchiveFileResult {
-  sessionId: string;
-  workspaceScopeKey: string;
-  runId: string;
-  path: string;
-  content: string;
-}
-
 export interface DefaultWorkspacePathResult {
   path: string | null;
 }
@@ -287,7 +253,9 @@ function toErrorResponse(err: unknown): ApiResponse<never> {
 /** 通用 GET 包装 */
 async function getJson<T>(url: string): Promise<ApiResponse<T>> {
   try {
-    const response = await fetch(url);
+    const response = await fetch(url, {
+      headers: getHostAdmissionHeaders(),
+    });
     if (!response.ok) {
       return {
         ok: false,
@@ -311,7 +279,10 @@ async function sendJson<T>(
   try {
     const response = await fetch(url, {
       method,
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        ...getHostAdmissionHeaders(),
+      },
       body: JSON.stringify(body),
       signal: options.signal,
     });
@@ -328,12 +299,26 @@ async function sendJson<T>(
   }
 }
 
+async function sendReplayableHostMutation<T>(
+  url: string,
+  body: unknown
+): Promise<ApiResponse<T>> {
+  const response = await sendJson<T>(url, 'POST', body);
+  if (response.error !== 'network_error') {
+    return response;
+  }
+  return sendJson<T>(url, 'POST', body);
+}
+
 async function streamSse(
   url: string,
   onEvent: (event: AgentRunStreamEvent) => void,
   signal?: AbortSignal
 ): Promise<void> {
-  if (typeof EventSource !== 'undefined') {
+  if (
+    typeof EventSource !== 'undefined' &&
+    Object.keys(getHostAdmissionHeaders()).length === 0
+  ) {
     return streamSseWithEventSource(url, onEvent, signal);
   }
   return streamSseWithFetch(url, onEvent, signal);
@@ -385,7 +370,6 @@ function streamSseWithEventSource(
 
     const eventNames: AgentRunStreamEvent['event'][] = [
       'run',
-      'delta',
       'events',
       'terminal',
       'heartbeat',
@@ -404,7 +388,10 @@ async function streamSseWithFetch(
   signal?: AbortSignal
 ): Promise<void> {
   const response = await fetch(url, {
-    headers: { Accept: 'text/event-stream' },
+    headers: {
+      Accept: 'text/event-stream',
+      ...getHostAdmissionHeaders(),
+    },
     signal,
   });
   if (!response.ok) {
@@ -446,7 +433,7 @@ function consumeSseEvents(buffer: string): { items: AgentRunStreamEvent[]; remai
 
 function parseAgentRunSseEvent(raw: string): AgentRunStreamEvent | null {
   if (!raw.trim()) return null;
-  let eventName: AgentRunStreamEvent['event'] = 'delta';
+  let eventName: AgentRunStreamEvent['event'] = 'events';
   const data: string[] = [];
   for (const line of raw.split(/\r?\n/)) {
     if (!line || line.startsWith(':')) continue;
@@ -779,49 +766,6 @@ export async function deleteAgentSession(
   return result;
 }
 
-export function getConversationArchive(
-  sessionId: string
-): Promise<ApiResponse<ConversationArchiveResult>> {
-  return getJson<ConversationArchiveResult>(
-    `${API_BASE}/session-store/${encodeURIComponent(sessionId)}/archive`
-  );
-}
-
-export function readConversationArchiveFile(
-  sessionId: string,
-  request: { path: string; runId?: string }
-): Promise<ApiResponse<ConversationArchiveFileResult>> {
-  const qs = buildQuery({
-    path: request.path,
-    runId: request.runId,
-  });
-  return getJson<ConversationArchiveFileResult>(
-    `${API_BASE}/session-store/${encodeURIComponent(sessionId)}/archive/file${qs}`
-  );
-}
-
-export function persistAgentSessionMemoryArchive(
-  sessionId: string,
-  request: { snapshot: unknown }
-): Promise<ApiResponse<unknown>> {
-  return sendJson<unknown>(
-    `${API_BASE}/session-store/${encodeURIComponent(sessionId)}/memory/archive`,
-    'POST',
-    request
-  );
-}
-
-export function appendAgentEvents(
-  sessionId: string,
-  request: AppendAgentEventsRequest
-): Promise<ApiResponse<AgentSessionResult>> {
-  return sendJson<AgentSessionResult>(
-    `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/events`,
-    'POST',
-    request
-  );
-}
-
 export function getAgentSession(
   sessionId: string
 ): Promise<ApiResponse<AgentSessionResult>> {
@@ -842,10 +786,9 @@ export function startAgentRun(
   sessionId: string,
   request: StartAgentRunRequest
 ): Promise<ApiResponse<AgentRunResult>> {
-  return sendJson<AgentRunResult>(
+  return sendReplayableHostMutation<AgentRunResult>(
     `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/runs`,
-    'POST',
-    request
+    agentRunMutationPayload(request)
   );
 }
 
@@ -859,7 +802,7 @@ export function getAgentRun(
 }
 
 export interface AgentRunStreamEvent {
-  event: 'run' | 'delta' | 'events' | 'terminal' | 'heartbeat' | 'error';
+  event: 'run' | 'events' | 'terminal' | 'heartbeat' | 'error';
   data: unknown;
 }
 
@@ -867,12 +810,11 @@ export function streamAgentRun(
   sessionId: string,
   runId: string,
   onEvent: (event: AgentRunStreamEvent) => void,
-  cursor?: { sinceEventCount?: number; sinceDeltaSeq?: number },
+  cursor?: { sinceEventCount?: number },
   signal?: AbortSignal
 ): Promise<void> {
   const qs = buildQuery({
     sinceEventCount: cursor?.sinceEventCount === undefined ? undefined : String(cursor.sinceEventCount),
-    sinceDeltaSeq: cursor?.sinceDeltaSeq === undefined ? undefined : String(cursor.sinceDeltaSeq),
   });
   return streamSse(
     `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/runs/${encodeURIComponent(runId)}/stream${qs}`,
@@ -881,124 +823,30 @@ export function streamAgentRun(
   );
 }
 
-export function appendProjectionDelivery(
-  sessionId: string,
-  entries: ProjectionDeliveryRecord[],
-  signal?: AbortSignal
-): Promise<ApiResponse<{ sessionId: string; appended: number }>> {
-  return sendJson<{ sessionId: string; appended: number }>(
-    `${API_BASE}/session-store/${encodeURIComponent(sessionId)}/projection-delivery`,
-    'POST',
-    { entries },
-    { signal }
-  );
-}
-
 export function cancelAgentRunById(
   sessionId: string,
-  runId: string
+  runId: string,
+  callerRequestId: string
 ): Promise<ApiResponse<AgentRunResult>> {
-  return sendJson<AgentRunResult>(
+  return sendReplayableHostMutation<AgentRunResult>(
     `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/runs/${encodeURIComponent(runId)}/cancel`,
-    'POST',
-    {}
+    { callerRequestId }
   );
 }
 
 export function submitAgentRunGuidance(
   sessionId: string,
   runId: string,
-  request: { guidance: string; attachments?: unknown[]; hostLanguage?: ConversationLanguage }
+  request: AgentRunGuidanceRequest
 ): Promise<ApiResponse<AgentRunResult>> {
-  return sendJson<AgentRunResult>(
+  return sendReplayableHostMutation<AgentRunResult>(
     `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/runs/${encodeURIComponent(runId)}/guidance`,
-    'POST',
-    request
+    {
+      guidance: request.guidance,
+      attachments: request.attachments,
+      callerRequestId: request.callerRequestId,
+    }
   );
-}
-
-export function cancelAgentRun(
-  sessionId: string
-): Promise<ApiResponse<AgentSessionResult>> {
-  return sendJson<AgentSessionResult>(
-    `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/cancel`,
-    'POST',
-    {}
-  );
-}
-
-export function getAgentEventSnapshot(
-  sessionId: string
-): Promise<ApiResponse<GetAgentEventSnapshotResult>> {
-  return getJson<GetAgentEventSnapshotResult>(
-    `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/trace`
-  );
-}
-
-export function resolveAgentPermission(
-  permissionId: string,
-  request: ResolveAgentPermissionRequest
-): Promise<ApiResponse<AgentSessionResult>> {
-  return sendJson<AgentSessionResult>(
-    `${API_BASE}/agent/permissions/${encodeURIComponent(permissionId)}/resolve`,
-    'POST',
-    request
-  );
-}
-
-export function resolveAgentPlan(
-  runId: string,
-  planId: string,
-  request: ResolveAgentPlanRequest
-): Promise<ApiResponse<AgentSessionResult>> {
-  return sendJson<AgentSessionResult>(
-    `${API_BASE}/agent/plans/${encodeURIComponent(runId)}/${encodeURIComponent(planId)}/resolve`,
-    'POST',
-    request
-  );
-}
-
-export function resolveAgentReview(
-  sessionId: string,
-  runId: string,
-  request: ResolveAgentReviewRequest
-): Promise<ApiResponse<AgentSessionResult>> {
-  return sendJson<AgentSessionResult>(
-    `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/runs/${encodeURIComponent(runId)}/review`,
-    'POST',
-    request
-  );
-}
-
-export function submitAgentFeedback(
-  request: AgentFeedbackRequest
-): Promise<ApiResponse<AgentFeedbackResult>> {
-  return sendJson<AgentFeedbackResult>(
-    `${API_BASE}/agent/feedback`,
-    'POST',
-    request
-  );
-}
-
-export function getAgentWorkflowConfig(): Promise<ApiResponse<GetAgentWorkflowConfigResult>> {
-  return getJson<GetAgentWorkflowConfigResult>(`${API_BASE}/agent/workflow-config`);
-}
-
-export function patchAgentWorkflowConfig(
-  request: PatchAgentWorkflowConfigRequest
-): Promise<ApiResponse<GetAgentWorkflowConfigResult>> {
-  return sendJson<GetAgentWorkflowConfigResult>(
-    `${API_BASE}/agent/workflow-config`,
-    'PATCH',
-    request
-  );
-}
-
-export function listAgentTools(
-  mode?: AgentMode
-): Promise<ApiResponse<ListToolsResult>> {
-  const qs = buildQuery({ mode });
-  return getJson<ListToolsResult>(`${API_BASE}/agent/tools${qs}`);
 }
 
 export function getShellEnvironment(): Promise<ApiResponse<ShellEnvironmentStatus>> {

@@ -1,8 +1,7 @@
 use deepcode_kernel_abi::WorkspaceBindingRefV2;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::fs::{self, File};
-use std::io::Read;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
@@ -181,6 +180,52 @@ impl HostWorkspaceRegistryV2 {
             },
             Self { inner },
         )
+    }
+
+    pub(crate) fn resolve_exact(
+        &self,
+        workspace_binding_ref: &WorkspaceBindingRefV2,
+        expected_workspace_identity: &str,
+    ) -> Result<PathBuf, HostWorkspaceRegistryErrorV2> {
+        validate_workspace_binding_ref(workspace_binding_ref)?;
+        let state = self
+            .inner
+            .state
+            .read()
+            .map_err(|_| HostWorkspaceRegistryErrorV2::RegistryUnavailable)?;
+        let HostWorkspaceRegistryStateV2::Operational {
+            bindings,
+            conflicts,
+            ..
+        } = &*state
+        else {
+            return Err(HostWorkspaceRegistryErrorV2::RegistryUnavailable);
+        };
+        if conflicts.contains(workspace_binding_ref) {
+            return Err(HostWorkspaceRegistryErrorV2::BindingIdentityMismatch);
+        }
+        let record = bindings
+            .get(workspace_binding_ref)
+            .ok_or(HostWorkspaceRegistryErrorV2::BindingNotFound)?;
+        let WorkspaceBindingRecordV2::Ready {
+            canonical_root,
+            root_identity,
+        } = record
+        else {
+            return Err(HostWorkspaceRegistryErrorV2::BindingIdentityMismatch);
+        };
+        if workspace_identity_token_from_stored(canonical_root, root_identity)
+            != expected_workspace_identity
+        {
+            return Err(HostWorkspaceRegistryErrorV2::BindingIdentityMismatch);
+        }
+        let current = validate_workspace_root(canonical_root)?;
+        if current.canonical_root.as_path() != canonical_root.as_path()
+            || current.root_identity != *root_identity
+        {
+            return Err(HostWorkspaceRegistryErrorV2::BindingIdentityMismatch);
+        }
+        Ok(current.canonical_root)
     }
 }
 
@@ -662,9 +707,7 @@ fn validate_workspace_binding_ref(
 
 fn issue_workspace_binding_ref() -> Result<WorkspaceBindingRefV2, HostWorkspaceRegistryErrorV2> {
     let mut entropy = [0_u8; WORKSPACE_BINDING_REF_ENTROPY_BYTES_V2];
-    File::open("/dev/urandom")
-        .and_then(|mut source| source.read_exact(&mut entropy))
-        .map_err(|_| HostWorkspaceRegistryErrorV2::EntropyUnavailable)?;
+    getrandom::fill(&mut entropy).map_err(|_| HostWorkspaceRegistryErrorV2::EntropyUnavailable)?;
     WorkspaceBindingRefV2::new(format!(
         "{WORKSPACE_BINDING_REF_PREFIX_V2}{}",
         encode_hex(&entropy)

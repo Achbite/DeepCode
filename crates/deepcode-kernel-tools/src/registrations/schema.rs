@@ -1,9 +1,9 @@
-use crate::ToolOperationKind;
+use crate::invocation_types::KernelToolKind;
 use serde_json::Value;
 
-pub(super) fn provider_schema_for_operation(operation_kind: ToolOperationKind) -> Value {
+pub(super) fn provider_schema_for_tool(operation_kind: KernelToolKind) -> Value {
     match operation_kind {
-        ToolOperationKind::FsRead => serde_json::json!({
+        KernelToolKind::FsRead => serde_json::json!({
             "type": "object",
             "required": ["path"],
             "properties": {
@@ -13,7 +13,7 @@ pub(super) fn provider_schema_for_operation(operation_kind: ToolOperationKind) -
             },
             "additionalProperties": false
         }),
-        ToolOperationKind::FsList => serde_json::json!({
+        KernelToolKind::FsList => serde_json::json!({
             "type": "object",
             "required": ["path"],
             "properties": {
@@ -23,7 +23,7 @@ pub(super) fn provider_schema_for_operation(operation_kind: ToolOperationKind) -
             },
             "additionalProperties": false
         }),
-        ToolOperationKind::FsGlob => serde_json::json!({
+        KernelToolKind::FsGlob => serde_json::json!({
             "type": "object",
             "required": ["pattern"],
             "properties": {
@@ -33,7 +33,7 @@ pub(super) fn provider_schema_for_operation(operation_kind: ToolOperationKind) -
             },
             "additionalProperties": false
         }),
-        ToolOperationKind::FsDiff => serde_json::json!({
+        KernelToolKind::FsDiff => serde_json::json!({
             "type": "object",
             "required": ["path", "contentBlockId"],
             "properties": {
@@ -42,7 +42,7 @@ pub(super) fn provider_schema_for_operation(operation_kind: ToolOperationKind) -
             },
             "additionalProperties": false
         }),
-        ToolOperationKind::FsDelete => serde_json::json!({
+        KernelToolKind::FsDelete => serde_json::json!({
             "type": "object",
             "required": ["path"],
             "properties": {
@@ -52,7 +52,7 @@ pub(super) fn provider_schema_for_operation(operation_kind: ToolOperationKind) -
             },
             "additionalProperties": false
         }),
-        ToolOperationKind::CodeGrep => serde_json::json!({
+        KernelToolKind::CodeGrep => serde_json::json!({
             "type": "object",
             "required": ["query"],
             "properties": {
@@ -66,7 +66,7 @@ pub(super) fn provider_schema_for_operation(operation_kind: ToolOperationKind) -
             },
             "additionalProperties": false
         }),
-        ToolOperationKind::FsCreate => serde_json::json!({
+        KernelToolKind::FsCreate => serde_json::json!({
             "type": "object",
             "required": ["path", "contentBlockId"],
             "properties": {
@@ -77,7 +77,7 @@ pub(super) fn provider_schema_for_operation(operation_kind: ToolOperationKind) -
             },
             "additionalProperties": false
         }),
-        ToolOperationKind::FsWrite => serde_json::json!({
+        KernelToolKind::FsWrite => serde_json::json!({
             "type": "object",
             "required": ["path", "contentBlockId"],
             "properties": {
@@ -87,7 +87,7 @@ pub(super) fn provider_schema_for_operation(operation_kind: ToolOperationKind) -
             },
             "additionalProperties": false
         }),
-        ToolOperationKind::FsEnsureDirectory => serde_json::json!({
+        KernelToolKind::FsEnsureDirectory => serde_json::json!({
             "type": "object",
             "required": ["path"],
             "properties": {
@@ -95,7 +95,7 @@ pub(super) fn provider_schema_for_operation(operation_kind: ToolOperationKind) -
             },
             "additionalProperties": false
         }),
-        ToolOperationKind::FsEdit => serde_json::json!({
+        KernelToolKind::FsEdit => serde_json::json!({
             "type": "object",
             "required": ["path", "patchSpec", "replacementBlockId"],
             "properties": {
@@ -105,7 +105,7 @@ pub(super) fn provider_schema_for_operation(operation_kind: ToolOperationKind) -
             },
             "additionalProperties": false
         }),
-        ToolOperationKind::FsRename => serde_json::json!({
+        KernelToolKind::FsRename => serde_json::json!({
             "type": "object",
             "required": ["path", "destinationPath"],
             "properties": {
@@ -114,7 +114,7 @@ pub(super) fn provider_schema_for_operation(operation_kind: ToolOperationKind) -
             },
             "additionalProperties": false
         }),
-        ToolOperationKind::DocumentRead => serde_json::json!({
+        KernelToolKind::DocumentRead => serde_json::json!({
             "type": "object",
             "required": ["path"],
             "properties": {
@@ -124,10 +124,10 @@ pub(super) fn provider_schema_for_operation(operation_kind: ToolOperationKind) -
             },
             "additionalProperties": false
         }),
-        ToolOperationKind::GitStatus => {
+        KernelToolKind::GitStatus => {
             serde_json::json!({ "type": "object", "properties": {}, "additionalProperties": false })
         }
-        ToolOperationKind::GitDiff => serde_json::json!({
+        KernelToolKind::GitDiff => serde_json::json!({
             "type": "object",
             "properties": {
                 "path": { "type": "string" },
@@ -135,7 +135,7 @@ pub(super) fn provider_schema_for_operation(operation_kind: ToolOperationKind) -
             },
             "additionalProperties": false
         }),
-        ToolOperationKind::GitStage | ToolOperationKind::GitUnstage => serde_json::json!({
+        KernelToolKind::GitStage | KernelToolKind::GitUnstage => serde_json::json!({
             "type": "object",
             "properties": {
                 "path": { "type": "string" },
@@ -143,7 +143,7 @@ pub(super) fn provider_schema_for_operation(operation_kind: ToolOperationKind) -
             },
             "additionalProperties": false
         }),
-        ToolOperationKind::GitCommit => serde_json::json!({
+        KernelToolKind::GitCommit => serde_json::json!({
             "type": "object",
             "required": ["message"],
             "properties": {
@@ -151,26 +151,7 @@ pub(super) fn provider_schema_for_operation(operation_kind: ToolOperationKind) -
             },
             "additionalProperties": false
         }),
-        ToolOperationKind::GitPush => serde_json::json!({
-            "type": "object",
-            "properties": {
-                "remote": { "type": "string" },
-                "branch": { "type": "string" }
-            },
-            "additionalProperties": false
-        }),
-        ToolOperationKind::ProcessExec => serde_json::json!({
-            "type": "object",
-            "required": ["argv"],
-            "properties": {
-                "argv": { "type": "array", "items": { "type": "string" } },
-                "cwd": { "type": "string" },
-                "timeoutMs": { "type": "integer", "minimum": 1 },
-                "envPolicy": { "type": "string" }
-            },
-            "additionalProperties": false
-        }),
-        ToolOperationKind::WebSearch => serde_json::json!({
+        KernelToolKind::WebSearch => serde_json::json!({
             "type": "object",
             "required": ["query"],
             "properties": {
@@ -179,71 +160,12 @@ pub(super) fn provider_schema_for_operation(operation_kind: ToolOperationKind) -
             },
             "additionalProperties": false
         }),
-        ToolOperationKind::WebFetch => serde_json::json!({
+        KernelToolKind::WebFetch => serde_json::json!({
             "type": "object",
             "required": ["url"],
             "properties": {
                 "url": { "type": "string" },
                 "maxBytes": { "type": "integer", "minimum": 1 }
-            },
-            "additionalProperties": false
-        }),
-        ToolOperationKind::BrowserOpen => serde_json::json!({
-            "type": "object",
-            "required": ["url"],
-            "properties": {
-                "url": { "type": "string" }
-            },
-            "additionalProperties": false
-        }),
-        ToolOperationKind::BrowserClick => serde_json::json!({
-            "type": "object",
-            "required": ["selector"],
-            "properties": {
-                "selector": { "type": "string" }
-            },
-            "additionalProperties": false
-        }),
-        ToolOperationKind::BrowserSnapshot => serde_json::json!({
-            "type": "object",
-            "properties": {
-                "selector": { "type": "string" }
-            },
-            "additionalProperties": false
-        }),
-        ToolOperationKind::BrowserInspect => serde_json::json!({
-            "type": "object",
-            "properties": {
-                "inspectState": { "type": "string" }
-            },
-            "additionalProperties": false
-        }),
-        ToolOperationKind::BrowserType => serde_json::json!({
-            "type": "object",
-            "required": ["selector", "text"],
-            "properties": {
-                "selector": { "type": "string" },
-                "text": { "type": "string" }
-            },
-            "additionalProperties": false
-        }),
-        ToolOperationKind::BrowserScroll => serde_json::json!({
-            "type": "object",
-            "properties": {
-                "deltaY": { "type": "integer" }
-            },
-            "additionalProperties": false
-        }),
-        ToolOperationKind::BrowserReload => serde_json::json!({
-            "type": "object",
-            "properties": {},
-            "additionalProperties": false
-        }),
-        ToolOperationKind::ProviderCall => serde_json::json!({
-            "type": "object",
-            "properties": {
-                "profileRef": { "type": "string" },
-                "budgetRef": { "type": "string" }
             },
             "additionalProperties": false
         }),

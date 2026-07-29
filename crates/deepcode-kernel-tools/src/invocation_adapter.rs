@@ -1,4 +1,6 @@
-use crate::{AuthorityToolIdV4, DeleteTargetV4, GitDiffScopeV4, ToolInvocationInputV4};
+use crate::invocation_types::{
+    KernelCanonicalInvocation, KernelDeleteTarget, KernelGitDiffScope, KernelToolKind,
+};
 use deepcode_kernel_abi::v2::{PlatformV2, V2ValidationError};
 use serde_json::{json, Value};
 use thiserror::Error;
@@ -19,10 +21,10 @@ fn invalid_arguments(tool_id: &'static str) -> InvocationNormalizationError {
 }
 
 pub fn canonicalize_invocation(
-    tool_id: AuthorityToolIdV4,
+    tool_id: KernelToolKind,
     mut arguments: Value,
-) -> Result<ToolInvocationInputV4, InvocationNormalizationError> {
-    use AuthorityToolIdV4 as Tool;
+) -> Result<KernelCanonicalInvocation, InvocationNormalizationError> {
+    use KernelToolKind as Tool;
     let fields = arguments
         .as_object_mut()
         .ok_or_else(|| invalid_arguments(tool_id.as_str()))?;
@@ -57,28 +59,28 @@ pub fn canonicalize_invocation(
         Tool::WebFetch => materialize("maxBytes", json!(98_304)),
         _ => {}
     }
-    let mut invocation = serde_json::from_value::<ToolInvocationInputV4>(json!({
+    let mut invocation = serde_json::from_value::<KernelCanonicalInvocation>(json!({
         "toolId":tool_id,
         "arguments":arguments,
     }))
     .map_err(|_| invalid_arguments(tool_id.as_str()))?;
     match &mut invocation {
-        ToolInvocationInputV4::FsRead { path, .. }
-        | ToolInvocationInputV4::FsDiff { path, .. }
-        | ToolInvocationInputV4::FsCreate { path, .. }
-        | ToolInvocationInputV4::FsWrite { path, .. }
-        | ToolInvocationInputV4::FsEdit { path, .. }
-        | ToolInvocationInputV4::FsEnsureDirectory { path }
-        | ToolInvocationInputV4::DocumentRead { path, .. } => {
+        KernelCanonicalInvocation::FsRead { path, .. }
+        | KernelCanonicalInvocation::FsDiff { path, .. }
+        | KernelCanonicalInvocation::FsCreate { path, .. }
+        | KernelCanonicalInvocation::FsWrite { path, .. }
+        | KernelCanonicalInvocation::FsEdit { path, .. }
+        | KernelCanonicalInvocation::FsEnsureDirectory { path }
+        | KernelCanonicalInvocation::DocumentRead { path, .. } => {
             *path = normalize_workspace_path(path, false)?;
         }
-        ToolInvocationInputV4::FsList { path, .. } => {
+        KernelCanonicalInvocation::FsList { path, .. } => {
             *path = normalize_workspace_path(path, true)?;
         }
-        ToolInvocationInputV4::FsGlob { root, .. } => {
+        KernelCanonicalInvocation::FsGlob { root, .. } => {
             *root = normalize_workspace_path(root, true)?;
         }
-        ToolInvocationInputV4::CodeGrep {
+        KernelCanonicalInvocation::CodeGrep {
             root,
             include,
             exclude,
@@ -88,26 +90,29 @@ pub fn canonicalize_invocation(
             *include = normalize_string_set(std::mem::take(include))?;
             *exclude = normalize_string_set(std::mem::take(exclude))?;
         }
-        ToolInvocationInputV4::FsRename {
+        KernelCanonicalInvocation::FsRename {
             source_path,
             destination_path,
         } => {
             *source_path = normalize_workspace_path(source_path, false)?;
             *destination_path = normalize_workspace_path(destination_path, false)?;
         }
-        ToolInvocationInputV4::FsDelete(target) => {
+        KernelCanonicalInvocation::FsDelete(target) => {
             let path = match target {
-                DeleteTargetV4::File { path } | DeleteTargetV4::DirectoryTree { path } => path,
+                KernelDeleteTarget::File { path } | KernelDeleteTarget::DirectoryTree { path } => {
+                    path
+                }
             };
             *path = normalize_workspace_path(path, false)?;
         }
-        ToolInvocationInputV4::GitDiff {
-            scope: GitDiffScopeV4::Paths { paths },
+        KernelCanonicalInvocation::GitDiff {
+            scope: KernelGitDiffScope::Paths { paths },
             ..
         } => {
             *paths = normalize_path_set(std::mem::take(paths))?;
         }
-        ToolInvocationInputV4::GitStage { paths } | ToolInvocationInputV4::GitUnstage { paths } => {
+        KernelCanonicalInvocation::GitStage { paths }
+        | KernelCanonicalInvocation::GitUnstage { paths } => {
             *paths = normalize_path_set(std::mem::take(paths))?;
         }
         _ => {}
@@ -117,7 +122,7 @@ pub fn canonicalize_invocation(
 }
 
 pub fn validate_canonical_invocation(
-    invocation: &ToolInvocationInputV4,
+    invocation: &KernelCanonicalInvocation,
 ) -> Result<(), InvocationNormalizationError> {
     invocation.validate()?;
     let encoded = serde_json::to_value(invocation)

@@ -5,8 +5,8 @@ use super::authority::{
 use super::model::{AuthorityResult, WorkspaceBinding};
 use super::service::{
     initial_run_transport_generation, run_capability_verifier_digest, AuthorityService,
-    DirectToolIntentRequest, DurableRunCapabilityVerifierV2, RUN_CAPABILITY_VERIFIER_BOUND,
-    RUN_CAPABILITY_VERIFIER_MATERIAL_KIND,
+    DirectToolIntentRequest, DurableRunCapabilityVerifierV2, InitialToolContextInvalidationV2,
+    RUN_CAPABILITY_VERIFIER_BOUND, RUN_CAPABILITY_VERIFIER_MATERIAL_KIND,
 };
 use crate::executors::{KernelExecutorConfig, SecretProvider};
 use deepcode_kernel_abi::v2::{
@@ -42,7 +42,7 @@ use deepcode_kernel_abi::{
     ToolContextRefV2, ToolContextVersionV2, ToolDescriptorV2, ToolEffectClassV2, ToolEffectScopeV2,
     ToolIdV2, ToolIntentAuthorityV2, ToolInventoryV2, TrustGrantDecisionV2, TrustLeaseDigestV2,
     TrustPolicyIdV2, UserDecisionErrorV2, UserDecisionReplyV2, UserDecisionRevokeTargetV2,
-    UserDecisionV2, WorkspaceBindingRefV2, TOOL_CONTEXT_FORMAT_V2,
+    UserDecisionRevokeV2, UserDecisionV2, WorkspaceBindingRefV2, TOOL_CONTEXT_FORMAT_V2,
 };
 use deepcode_kernel_ledger::v2::CanonicalFactStore;
 use deepcode_kernel_ledger::v2::{
@@ -51,13 +51,11 @@ use deepcode_kernel_ledger::v2::{
     FactQueryContinuationDraftV2, FactQueryContinuationExpectationV2, PublicCommandReceiptV2,
     PutFactQueryContinuationOutcomeV2, PutPublicCommandReceiptOutcomeV2,
 };
-use deepcode_kernel_tools::ToolInvocationInputV4;
+use deepcode_kernel_tools::kernel_internal::KernelCanonicalInvocation;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::Read;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -80,9 +78,7 @@ const RUN_RETIREMENT_CONVERGENCE_BUDGET: Duration = Duration::from_millis(100);
 pub struct SettingsCeilingV2 {
     pub workspace_read: bool,
     pub workspace_write: bool,
-    pub git_write: bool,
     pub web_read: bool,
-    pub private_web_read: bool,
     pub auto_approve_plans: bool,
 }
 
@@ -159,7 +155,7 @@ fn settings_allow(settings: &SettingsCeilingV2, effect_scope: ToolEffectScopeV2)
         ToolEffectScopeV2::WorkspaceWrite => settings.workspace_write,
         ToolEffectScopeV2::RepositoryRead => settings.workspace_read,
         ToolEffectScopeV2::RepositoryIndexWrite | ToolEffectScopeV2::RepositoryHistoryWrite => {
-            settings.git_write
+            false
         }
         ToolEffectScopeV2::NetworkRead => settings.web_read,
     }
@@ -200,13 +196,13 @@ fn run_open_host_request_digest(
 fn canonical_invocation(
     tool_id: &ToolIdV2,
     raw_arguments: &deepcode_kernel_abi::RawToolArgumentsV2,
-) -> AuthorityResult<ToolInvocationInputV4> {
+) -> AuthorityResult<KernelCanonicalInvocation> {
     let canonical = crate::kernel_tool_registry()
         .canonicalize_v2(tool_id, raw_arguments.clone())
         .map_err(|_| invalid_field("rawArguments", InvalidFieldViolationV2::OutOfRange))?;
-    let mut invocation = canonical.invocation;
+    let mut invocation = canonical.into_kernel_invocation();
     match &mut invocation {
-        ToolInvocationInputV4::WebSearch { query, .. } => {
+        KernelCanonicalInvocation::WebSearch { query, .. } => {
             *query = query.trim().to_owned();
             if query.is_empty() || query.chars().any(char::is_control) {
                 return Err(invalid_field(
@@ -215,7 +211,7 @@ fn canonical_invocation(
                 ));
             }
         }
-        ToolInvocationInputV4::WebFetch { url, .. } => {
+        KernelCanonicalInvocation::WebFetch { url, .. } => {
             let (canonical_url, _) = canonicalize_network_scope_url(url).map_err(|_| {
                 invalid_field("rawArguments.url", InvalidFieldViolationV2::OutOfRange)
             })?;
@@ -226,7 +222,7 @@ fn canonical_invocation(
     Ok(invocation)
 }
 
-fn canonical_argument_value(invocation: &ToolInvocationInputV4) -> AuthorityResult<Value> {
+fn canonical_argument_value(invocation: &KernelCanonicalInvocation) -> AuthorityResult<Value> {
     serde_json::to_value(invocation)
         .ok()
         .and_then(|value| value.get("arguments").cloned())
@@ -286,9 +282,11 @@ fn normalize_requested_targets(
 
 fn exact_targets_for_invocation(
     workspace: &WorkspaceBinding,
-    invocation: &ToolInvocationInputV4,
+    invocation: &KernelCanonicalInvocation,
 ) -> AuthorityResult<Vec<ScopeTargetKey>> {
-    use deepcode_kernel_tools::{DeleteTargetV4, ToolInvocationInputV4 as Input};
+    use deepcode_kernel_tools::kernel_internal::{
+        KernelCanonicalInvocation as Input, KernelDeleteTarget,
+    };
     let workspace_target = |path: &str, access| {
         canonicalize_requested_workspace_path(workspace, path)
             .map(|path| ScopeTargetKey::Workspace { path, access })
@@ -315,8 +313,8 @@ fn exact_targets_for_invocation(
         | Input::FsWrite { path, .. }
         | Input::FsEdit { path, .. }
         | Input::FsEnsureDirectory { path } => workspace_target(path, ResourceAccessV2::Write)?,
-        Input::FsDelete(DeleteTargetV4::File { path })
-        | Input::FsDelete(DeleteTargetV4::DirectoryTree { path }) => {
+        Input::FsDelete(KernelDeleteTarget::File { path })
+        | Input::FsDelete(KernelDeleteTarget::DirectoryTree { path }) => {
             workspace_target(path, ResourceAccessV2::Write)?
         }
         Input::WebSearch { query, .. } => ScopeTargetKey::NetworkQuery {
@@ -355,7 +353,7 @@ fn exact_targets_for_invocation(
 fn targets_cover_invocation(
     approved: &[ScopeTargetKey],
     canonical_scope: &ResourceScopeV2,
-    invocation: &ToolInvocationInputV4,
+    invocation: &KernelCanonicalInvocation,
 ) -> AuthorityResult<bool> {
     let invocation_digest = exact_invocation_digest_v2(invocation).map_err(|_| storage_fault())?;
     if approved.iter().any(|target| {
@@ -382,7 +380,7 @@ fn targets_cover_invocation(
             matches!(target, ScopeTargetKey::Repository { area: expected } if expected == area)
         }),
         ResourceScopeV2::NetworkQuery { .. } => match invocation {
-            ToolInvocationInputV4::WebSearch { query, .. } => approved.iter().any(
+            KernelCanonicalInvocation::WebSearch { query, .. } => approved.iter().any(
                 |target| {
                     matches!(
                         target,
@@ -396,7 +394,7 @@ fn targets_cover_invocation(
             target_observation_digest,
             ..
         } => match invocation {
-            ToolInvocationInputV4::WebFetch { url, .. } => approved.iter().any(
+            KernelCanonicalInvocation::WebFetch { url, .. } => approved.iter().any(
                 |target| {
                     matches!(
                         target,
@@ -1331,9 +1329,7 @@ impl Default for SettingsCeilingV2 {
         Self {
             workspace_read: true,
             workspace_write: true,
-            git_write: false,
             web_read: false,
-            private_web_read: false,
             auto_approve_plans: false,
         }
     }
@@ -2022,9 +2018,7 @@ struct PublicIdMint {
 impl PublicIdMint {
     fn new() -> AuthorityResult<Self> {
         let mut entropy = [0u8; 32];
-        File::open("/dev/urandom")
-            .and_then(|mut file| file.read_exact(&mut entropy))
-            .map_err(|_| storage_fault())?;
+        getrandom::fill(&mut entropy).map_err(|_| storage_fault())?;
         Ok(Self {
             nonce: lower_hex(&entropy),
             next: std::sync::atomic::AtomicU64::new(1),
@@ -2059,9 +2053,7 @@ impl PublicIdMint {
 
     fn run_capability(&self) -> AuthorityResult<RunCapabilityV2> {
         let mut entropy = [0u8; 32];
-        File::open("/dev/urandom")
-            .and_then(|mut file| file.read_exact(&mut entropy))
-            .map_err(|_| storage_fault())?;
+        getrandom::fill(&mut entropy).map_err(|_| storage_fault())?;
         RunCapabilityV2::new(format!("run_{}", lower_hex(&entropy))).map_err(|_| storage_fault())
     }
 }
@@ -2118,6 +2110,24 @@ impl KernelSessionServiceV2 {
 
     pub fn tool_inventory(&self) -> ToolInventoryV2 {
         self.inner.inventory.clone()
+    }
+
+    /// Atomically replaces the Host-owned executor configuration and secret
+    /// bindings. The replacement is fully built before it becomes visible;
+    /// in-flight execution retains the runtime snapshot it already acquired.
+    pub fn replace_executor_runtime_host(
+        &self,
+        executor_config: KernelExecutorConfig,
+        secret_provider: Arc<dyn SecretProvider>,
+    ) -> AuthorityResult<()> {
+        let _gate = self
+            .inner
+            .command_gate
+            .lock()
+            .map_err(|_| storage_fault())?;
+        self.inner
+            .authority
+            .replace_executor_runtime_host(executor_config, secret_provider)
     }
 
     /// Host-only read handle for a facts wake broker. This handle contains no
@@ -2219,6 +2229,72 @@ impl KernelSessionServiceV2 {
             })),
             Err(error) => Ok(Err(error)),
         }
+    }
+
+    /// Resolves a trusted Host revoke request against the current Run state.
+    /// The Host supplies only the public target identity and user decision
+    /// reference; Kernel binds the decision to the current input and epoch.
+    pub fn resolve_user_authority_revoke_host(
+        &self,
+        run_id: &RunId,
+        decision_ref: UserDecisionRefV2,
+        target: UserDecisionRevokeTargetV2,
+        reason: String,
+    ) -> AuthorityResult<Result<(ControlEpoch, UserDecisionV2), UserDecisionErrorV2>> {
+        let _gate = self
+            .inner
+            .command_gate
+            .lock()
+            .map_err(|_| storage_fault())?;
+        self.inner
+            .authority
+            .require_run_accepting_commands(run_id)?;
+        let (control_epoch, input_id, target_exists) = {
+            let state = self.inner.state.lock().map_err(|_| storage_fault())?;
+            let run = state
+                .runs
+                .get(run_id)
+                .ok_or_else(|| KernelErrorV2::RunNotFound {
+                    run_id: run_id.clone(),
+                })?;
+            let target_exists = match &target {
+                UserDecisionRevokeTargetV2::CapabilityLease { lease_id } => {
+                    state.leases.get(lease_id).is_some_and(|lease| {
+                        lease.run_id == *run_id && lease.control_epoch == run.control_epoch
+                    })
+                }
+                UserDecisionRevokeTargetV2::TrustPolicy { trust_policy_id } => {
+                    state.trusts.get(trust_policy_id).is_some_and(|trust| {
+                        trust.run_id == *run_id && trust.control_epoch == run.control_epoch
+                    })
+                }
+            };
+            (
+                run.control_epoch,
+                run.current_input_id.clone(),
+                target_exists,
+            )
+        };
+        if !target_exists {
+            return Ok(Err(match target {
+                UserDecisionRevokeTargetV2::CapabilityLease { .. } => {
+                    UserDecisionErrorV2::CapabilityLeaseNotFound
+                }
+                UserDecisionRevokeTargetV2::TrustPolicy { .. } => {
+                    UserDecisionErrorV2::TrustPolicyNotFound
+                }
+            }));
+        }
+        let decision = UserDecisionV2::Revoke(UserDecisionRevokeV2 {
+            input_id,
+            decision_ref,
+            target,
+            reason,
+        });
+        decision
+            .validate()
+            .map_err(|_| invalid_field("decision", InvalidFieldViolationV2::OutOfRange))?;
+        Ok(Ok((control_epoch, decision)))
     }
 
     pub fn shutdown(&self) -> AuthorityResult<()> {
@@ -2609,6 +2685,15 @@ impl KernelSessionServiceV2 {
             .command_gate
             .lock()
             .map_err(|_| storage_fault())?;
+        self.set_run_tool_availability_host_locked(run_id, tool_id, availability)
+    }
+
+    fn set_run_tool_availability_host_locked(
+        &self,
+        run_id: RunId,
+        tool_id: ToolIdV2,
+        availability: ToolAvailabilityV2,
+    ) -> AuthorityResult<ToolContextBundleV2> {
         self.inner
             .authority
             .require_run_accepting_commands(&run_id)?;
@@ -2870,19 +2955,60 @@ impl KernelSessionServiceV2 {
         Ok(next_context)
     }
 
-    /// Host-only, per-run Settings ceiling update. Expanding the ceiling only
-    /// changes which tools may be planned; it never creates a capability lease.
-    pub fn update_run_settings_ceiling_host(
+    fn reconcile_executor_unavailability_for_run_locked(
         &self,
-        run_id: RunId,
-        next: SettingsCeilingV2,
-    ) -> AuthorityResult<ToolContextBundleV2> {
+        run_id: &RunId,
+    ) -> AuthorityResult<()> {
+        for tool_id in self.inner.authority.runtime_unavailable_tool_ids()? {
+            let descriptor = self
+                .inner
+                .inventory
+                .tools
+                .iter()
+                .find(|descriptor| descriptor.tool_id == tool_id)
+                .ok_or_else(storage_fault)?;
+            if descriptor.availability != ToolAvailabilityV2::Ready {
+                return Err(storage_fault());
+            }
+            let current = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| storage_fault())?
+                .runtime_availability
+                .get(&(run_id.clone(), tool_id.clone()))
+                .copied()
+                .unwrap_or(descriptor.availability);
+            if current == ToolAvailabilityV2::Ready {
+                self.set_run_tool_availability_host_locked(
+                    run_id.clone(),
+                    tool_id,
+                    ToolAvailabilityV2::Unavailable,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns the current per-run Settings ceiling to trusted in-process Host
+    /// orchestration. This value is never included in Session command replies.
+    pub fn run_settings_ceiling_host(&self, run_id: &RunId) -> AuthorityResult<SettingsCeilingV2> {
         let _gate = self
             .inner
             .command_gate
             .lock()
             .map_err(|_| storage_fault())?;
-        self.update_run_settings_ceiling_host_locked(run_id, next)
+        self.inner
+            .authority
+            .require_run_accepting_commands(run_id)?;
+        self.inner
+            .state
+            .lock()
+            .map_err(|_| storage_fault())?
+            .run_settings
+            .get(run_id)
+            .cloned()
+            .ok_or_else(storage_fault)
     }
 
     fn update_run_settings_ceiling_host_locked(
@@ -3262,6 +3388,7 @@ impl KernelSessionServiceV2 {
             state.run_settings.insert(run_id.clone(), settings.clone());
             state.recovered_runs.remove(&run_id);
         }
+        self.reconcile_executor_unavailability_for_run_locked(&run_id)?;
         let tool_context =
             self.update_run_settings_ceiling_host_locked(run_id.clone(), settings)?;
         let reply = RunOpenReplyV2 {
@@ -3549,21 +3676,68 @@ impl KernelSessionServiceV2 {
             .inner
             .authority
             .bind_resolved_run_workspace(&run_id, requested_binding)?;
-        let context_version = ToolContextVersionV2::new(1).map_err(|_| storage_fault())?;
+        let initial_context_version = ToolContextVersionV2::new(1).map_err(|_| storage_fault())?;
         let settings_ceiling_digest = requested_settings_digest;
-        let runtime_availability = self
+        let mut runtime_availability = self
             .inner
             .state
             .lock()
             .map_err(|_| storage_fault())?
             .runtime_availability
             .clone();
-        let tool_context = self.build_tool_context_from_inputs(
+        let initial_tool_context = self.build_tool_context_from_inputs(
             &run_id,
-            context_version,
+            initial_context_version,
             &settings,
             &runtime_availability,
         )?;
+        let mut tool_context = initial_tool_context.clone();
+        let mut initial_context_invalidations = Vec::new();
+        let mut initially_unavailable_tool_ids = Vec::new();
+        for tool_id in self.inner.authority.runtime_unavailable_tool_ids()? {
+            let descriptor = self
+                .inner
+                .inventory
+                .tools
+                .iter()
+                .find(|descriptor| descriptor.tool_id == tool_id)
+                .ok_or_else(storage_fault)?;
+            if descriptor.availability != ToolAvailabilityV2::Ready
+                || runtime_availability
+                    .get(&(run_id.clone(), tool_id.clone()))
+                    .copied()
+                    .unwrap_or(descriptor.availability)
+                    != ToolAvailabilityV2::Ready
+            {
+                return Err(storage_fault());
+            }
+            let next_context_version = ToolContextVersionV2::new(
+                tool_context
+                    .context_version
+                    .get()
+                    .checked_add(1)
+                    .ok_or_else(storage_fault)?,
+            )
+            .map_err(|_| storage_fault())?;
+            runtime_availability.insert(
+                (run_id.clone(), tool_id.clone()),
+                ToolAvailabilityV2::Unavailable,
+            );
+            let next_context = self.build_tool_context_from_inputs(
+                &run_id,
+                next_context_version,
+                &settings,
+                &runtime_availability,
+            )?;
+            initial_context_invalidations.push(InitialToolContextInvalidationV2 {
+                tool_id: tool_id.clone(),
+                previous_context: tool_context.context_ref(),
+                next_context: next_context.context_ref(),
+            });
+            initially_unavailable_tool_ids.push(tool_id);
+            tool_context = next_context;
+        }
+        let context_version = tool_context.context_version;
         let initial_epoch = ControlEpoch::new(1).map_err(|_| storage_fault())?;
         let opened = RunOpenReplyV2 {
             run_id: run_id.clone(),
@@ -3582,7 +3756,7 @@ impl KernelSessionServiceV2 {
             &stored,
             None,
         )?;
-        let epoch = self.inner.authority.open_run_with_public_receipt(
+        let (epoch, initial_context_fact_id) = self.inner.authority.open_run_with_public_receipt(
             ControlEpochAdvanceV2 {
                 run_id: run_id.clone(),
                 precondition: EpochPreconditionV2::NoCurrentEpoch {},
@@ -3593,7 +3767,8 @@ impl KernelSessionServiceV2 {
             digest,
             command.workspace_binding_ref.clone(),
             settings_ceiling_digest.clone(),
-            tool_context.context_ref(),
+            initial_tool_context.context_ref(),
+            initial_context_invalidations,
             &run_capability,
             receipt,
         )?;
@@ -3616,13 +3791,18 @@ impl KernelSessionServiceV2 {
                     current_input_id: command.input_id,
                     context_version,
                     context_ref: tool_context_ref,
-                    control_fact_id: epoch.epoch_fact_id,
+                    control_fact_id: initial_context_fact_id,
                 },
             );
             state.run_capability_verifiers.insert(
                 run_id.clone(),
                 run_capability_verifier_digest(&run_id, &run_capability),
             );
+            for tool_id in initially_unavailable_tool_ids {
+                state
+                    .runtime_availability
+                    .insert((run_id.clone(), tool_id), ToolAvailabilityV2::Unavailable);
+            }
             state.run_settings.insert(run_id, settings);
         }
         Ok((reply, CommandHandlingV2::Evaluated, Some(run_capability)))
@@ -3703,6 +3883,15 @@ impl KernelSessionServiceV2 {
             }
             KernelCommandV2::ControlEpochAdvance(command) => {
                 let current_run = self.run_record(&command.run_id)?;
+                let superseded_capability_count = self
+                    .inner
+                    .state
+                    .lock()
+                    .map_err(|_| storage_fault())?
+                    .leases
+                    .values()
+                    .filter(|lease| lease.run_id == command.run_id)
+                    .count() as u64;
                 let internal = KernelCommandEnvelopeV2::new(
                     self.inner.ids.command_id(),
                     KernelCommandV2::ControlEpochAdvance(command.clone()),
@@ -3717,6 +3906,7 @@ impl KernelSessionServiceV2 {
                     .advance_epoch_with_public_receipt_and_authority_material(
                         &internal,
                         command.clone(),
+                        superseded_capability_count,
                         vec![AuthorityMaterialMutationV2::TransitionRunEpoch {
                             run_id: command.run_id.clone(),
                             through_control_epoch: current_run.control_epoch.get(),
@@ -5573,7 +5763,7 @@ impl KernelSessionServiceV2 {
     fn execute_context_read(
         &self,
         command: ToolIntentSubmitV2,
-        invocation: ToolInvocationInputV4,
+        invocation: KernelCanonicalInvocation,
         descriptor: &ToolDescriptorV2,
         public_command: Option<PublicCommandContext>,
     ) -> AuthorityResult<ToolIntentSubmitReplyV2> {
@@ -5620,7 +5810,7 @@ impl KernelSessionServiceV2 {
     fn execute_direct_tool_intent(
         &self,
         command: ToolIntentSubmitV2,
-        invocation: ToolInvocationInputV4,
+        invocation: KernelCanonicalInvocation,
         authority: InvocationAuthorityV2,
         descriptor: &ToolDescriptorV2,
         preferred_invocation_id: Option<InvocationId>,

@@ -608,7 +608,7 @@ export function decodeToolContextBundleV2(value: unknown): ToolContextBundleV2 {
 export function decodeRawToolArgumentsV2(value: unknown): RawToolArgumentsV2 {
   if (!isBoundedRawJson(value, 0) || Array.isArray(value) || value === null) {
     throw new KernelV2WireError(
-      'rawArguments must be an object containing bounded finite JSON values.'
+      'rawArguments must be an object containing bounded JSON values with only cross-language safe integer numbers.'
     );
   }
   const encoded = JSON.stringify(value);
@@ -1515,7 +1515,9 @@ function array(value: unknown, field: string): unknown[] {
 
 function jsonObject(value: unknown, field: string): JsonObjectV2 {
   if (!isJsonObjectV2(value)) {
-    throw new KernelV2WireError(`${field} must be a finite JSON object.`);
+    throw new KernelV2WireError(
+      `${field} must be a JSON object with only cross-language safe integer numbers.`
+    );
   }
   return value;
 }
@@ -1574,7 +1576,7 @@ function isJsonValue(value: unknown): value is JsonValueV2 {
   ) {
     return true;
   }
-  if (typeof value === 'number') return Number.isFinite(value);
+  if (typeof value === 'number') return Number.isSafeInteger(value);
   if (Array.isArray(value)) return value.every(isJsonValue);
   return isJsonObjectV2(value);
 }
@@ -1588,7 +1590,7 @@ function isBoundedRawJson(value: unknown, depth: number): boolean {
   ) {
     return true;
   }
-  if (typeof value === 'number') return Number.isFinite(value);
+  if (typeof value === 'number') return Number.isSafeInteger(value);
   if (Array.isArray(value)) {
     return value.every((item) => isBoundedRawJson(item, depth + 1));
   }

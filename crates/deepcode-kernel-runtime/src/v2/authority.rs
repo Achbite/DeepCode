@@ -34,17 +34,17 @@ use deepcode_kernel_abi::v2_command::{
     InvocationCancelReplyV2, InvocationCancelV2, KernelErrorV2, KernelReplyV2,
     MutationCommandKindV2, RecordedCommandErrorV2, StorageFaultCodeV2, ToolIntentSubmitReplyV2,
 };
+use deepcode_kernel_abi::ToolIdV2;
 use deepcode_kernel_abi::{CanonicalArgumentsDigestV2, ToolContractDigestV2};
-use deepcode_kernel_abi::{ToolAvailabilityV2, ToolIdV2};
-use deepcode_kernel_tools::{
-    normalize_canonical_platform_path, validate_canonical_invocation, KernelToolRegistry,
+use deepcode_kernel_tools::kernel_internal::{
+    measure_kernel_output_payload, normalize_canonical_platform_path,
+    validate_canonical_invocation, KernelCanonicalInvocation, KernelDeleteTarget,
+    KernelDocumentPages, KernelLineRange, KernelNetworkPublicTarget, KernelOutputTruncation,
+    KernelPathEntry, KernelPathEntrySize, KernelSearchMatch, KernelSearchStrategy,
+    KernelTextMediaType, KernelToolKind, KernelToolOutput, KernelToolOutputPayload,
+    KernelWebSearchItem, KernelWorkspaceObjectKind,
 };
-use deepcode_kernel_tools::{
-    output_payload_measure_v4, AuthorityToolIdV4, DeleteTargetV4, DocumentPagesV4, LineRangeV4,
-    NetworkPublicTargetV4, OutputTruncationV4, PathEntrySizeV4, PathEntryV4, SearchMatchV4,
-    SearchStrategyV4, TextMediaTypeV4, ToolInvocationInputV4, ToolOutputPayloadV4, ToolOutputV4,
-    WebSearchItemV4, WorkspaceObjectKindV4,
-};
+use deepcode_kernel_tools::KernelToolRegistry;
 use std::collections::HashMap;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -256,7 +256,7 @@ pub(super) fn prepare_direct_tool_intent(
     operation_id: &OperationId,
     control_epoch: ControlEpoch,
     idempotency_key: &str,
-    canonical_invocation: &ToolInvocationInputV4,
+    canonical_invocation: &KernelCanonicalInvocation,
     deadline: DeadlineRequestV2,
     correlation_refs: Vec<CorrelationRefV2>,
     registry: &KernelToolRegistry,
@@ -266,24 +266,19 @@ pub(super) fn prepare_direct_tool_intent(
     validate_canonical_invocation(canonical_invocation)
         .map_err(|_| invalid_field("canonicalInvocation", InvalidFieldViolationV2::OutOfRange))?;
     let tool_id = canonical_invocation.tool_id();
-    let Some(registration) = registry.get(tool_id.as_str()) else {
+    let tool_id_v2 = ToolIdV2::parse(tool_id.as_str()).map_err(|_| {
+        PrepareFailure::Kernel(invalid_field("toolId", InvalidFieldViolationV2::OutOfRange))
+    })?;
+    let Some(admission) = registry.kernel_internal_admission_metadata(&tool_id_v2) else {
         return Err(PrepareFailure::Kernel(invalid_field(
             "toolId",
             InvalidFieldViolationV2::OutOfRange,
         )));
     };
-    if registration.descriptor_v2.availability != ToolAvailabilityV2::Ready
-        || registration.executor_binding.is_none()
-    {
-        return Err(PrepareFailure::Kernel(invalid_field(
-            "toolId",
-            InvalidFieldViolationV2::OutOfRange,
-        )));
-    }
     let effective_deadline_ms = materialize_deadline(
         deadline,
-        registration.admission_v2.default_deadline_ms,
-        registration.admission_v2.maximum_deadline_ms,
+        admission.default_deadline_ms,
+        admission.maximum_deadline_ms,
     )?;
     let correlations = CorrelationSetV2::materialize(correlation_refs)
         .map_err(|_| invalid_field("correlationRefs", InvalidFieldViolationV2::Unsorted))?;
@@ -316,7 +311,7 @@ pub(super) struct EffectPreparation {
 }
 
 pub(super) fn prepare_direct_effect(
-    invocation: &ToolInvocationInputV4,
+    invocation: &KernelCanonicalInvocation,
     admitted_targets: &[(ResourceId, ResolvedTarget)],
     identity: &ToolAttemptIdentityV2,
     workspace: &WorkspaceBinding,
@@ -335,7 +330,7 @@ pub(super) fn prepare_direct_effect(
 }
 
 fn prepare_effect_inner(
-    invocation: &ToolInvocationInputV4,
+    invocation: &KernelCanonicalInvocation,
     admitted_targets: &[(ResourceId, ResolvedTarget)],
     run_id: &RunId,
     operation_id: &OperationId,
@@ -400,14 +395,14 @@ fn prepare_effect_inner(
 }
 
 fn executor_input(
-    invocation: &ToolInvocationInputV4,
+    invocation: &KernelCanonicalInvocation,
     targets: &[ResolvedTarget],
 ) -> Result<(serde_json::Value, Option<Vec<u8>>), ()> {
-    use ToolInvocationInputV4 as Input;
+    use KernelCanonicalInvocation as Input;
     let value = match invocation {
         Input::FsRead { path, range } => {
             let mut value = serde_json::json!({"path":path});
-            if let LineRangeV4::Lines {
+            if let KernelLineRange::Lines {
                 start_line,
                 end_line,
             } = range
@@ -449,8 +444,8 @@ fn executor_input(
             "include":include,
             "exclude":exclude,
             "strategy":match strategy {
-                SearchStrategyV4::Literal => "literal",
-                SearchStrategyV4::Regex => "regex",
+                KernelSearchStrategy::Literal => "literal",
+                KernelSearchStrategy::Regex => "regex",
             },
             "contextLines":context_lines,
             "maxResults":max_results
@@ -477,16 +472,16 @@ fn executor_input(
                 Some(updated.into_bytes()),
             ));
         }
-        Input::FsDelete(DeleteTargetV4::File { path }) => {
+        Input::FsDelete(KernelDeleteTarget::File { path }) => {
             serde_json::json!({"path":path,"targetKind":"file","recursive":false})
         }
-        Input::FsDelete(DeleteTargetV4::DirectoryTree { path }) => {
+        Input::FsDelete(KernelDeleteTarget::DirectoryTree { path }) => {
             serde_json::json!({"path":path,"targetKind":"directory","recursive":true})
         }
         Input::FsEnsureDirectory { path } => serde_json::json!({"path":path}),
         Input::DocumentRead { path, pages } => {
             let mut value = serde_json::json!({"path":path});
-            if let DocumentPagesV4::Range {
+            if let KernelDocumentPages::Range {
                 start_page,
                 end_page,
             } = pages
@@ -521,11 +516,11 @@ fn executor_input(
 }
 
 fn revalidation_observation(
-    invocation: &ToolInvocationInputV4,
+    invocation: &KernelCanonicalInvocation,
     target: &ResolvedTarget,
     expected_edit: Option<&[u8]>,
 ) -> Result<TargetRevalidationObservationV2, PreEffectFailureCodeV2> {
-    use ToolInvocationInputV4 as Input;
+    use KernelCanonicalInvocation as Input;
     match invocation {
         Input::FsRead { .. } | Input::FsDiff { .. } | Input::DocumentRead { .. } => {
             Ok(TargetRevalidationObservationV2::FileRead {
@@ -729,13 +724,13 @@ fn reviewed_target_value(target: &CanonicalPrivateTargetV2) -> Result<serde_json
 }
 
 pub(super) fn resolve_execution(
-    invocation: &ToolInvocationInputV4,
+    invocation: &KernelCanonicalInvocation,
     preparation: &EffectPreparation,
     raw: Result<RawExecution, ()>,
     workspace: &WorkspaceBinding,
     maximum_output_bytes: u32,
 ) -> ExecutionResolution {
-    use ToolInvocationInputV4 as Input;
+    use KernelCanonicalInvocation as Input;
     if matches!(
         invocation,
         Input::FsCreate { .. }
@@ -755,7 +750,7 @@ pub(super) fn resolve_execution(
     let built = match invocation {
         Input::FsRead { .. } => utf8_output(
             invocation.tool_id(),
-            TextMediaTypeV4::TextPlainUtf8,
+            KernelTextMediaType::TextPlainUtf8,
             raw.output
                 .get("content")
                 .and_then(serde_json::Value::as_str),
@@ -763,13 +758,13 @@ pub(super) fn resolve_execution(
         ),
         Input::FsDiff { .. } => utf8_output(
             invocation.tool_id(),
-            TextMediaTypeV4::TextDiffUtf8,
+            KernelTextMediaType::TextDiffUtf8,
             raw.output.get("diff").and_then(serde_json::Value::as_str),
             maximum_output_bytes,
         ),
         Input::DocumentRead { .. } => utf8_output(
             invocation.tool_id(),
-            TextMediaTypeV4::TextDocumentUtf8,
+            KernelTextMediaType::TextDocumentUtf8,
             raw.complete_document_text.as_deref(),
             maximum_output_bytes,
         ),
@@ -829,7 +824,7 @@ pub(super) fn resolve_execution(
             }
         }
         Input::FsList { .. } | Input::FsGlob { .. } => {
-            let ToolOutputPayloadV4::PathEntries { entries } =
+            let KernelToolOutputPayload::PathEntries { entries } =
                 complete_payload_for_output(invocation, &raw, workspace)
                     .unwrap_or_else(|| output.payload.clone())
             else {
@@ -1099,7 +1094,7 @@ fn direct_observed_effect(
 }
 
 fn resolve_mutation(
-    invocation: &ToolInvocationInputV4,
+    invocation: &KernelCanonicalInvocation,
     preparation: &EffectPreparation,
     executor_ok: bool,
     maximum_output_bytes: u32,
@@ -1123,9 +1118,9 @@ fn resolve_mutation(
     let (expected, evidence) = match (&revalidation.observation, invocation) {
         (
             TargetRevalidationObservationV2::FileMutationPrepared { expected_after, .. },
-            ToolInvocationInputV4::FsCreate { .. }
-            | ToolInvocationInputV4::FsWrite { .. }
-            | ToolInvocationInputV4::FsEdit { .. },
+            KernelCanonicalInvocation::FsCreate { .. }
+            | KernelCanonicalInvocation::FsWrite { .. }
+            | KernelCanonicalInvocation::FsEdit { .. },
         ) => {
             let expected_state = match expected_after {
                 PresentFileObservationV2::PresentFile {
@@ -1149,7 +1144,7 @@ fn resolve_mutation(
         }
         (
             TargetRevalidationObservationV2::DirectoryPrepared { .. },
-            ToolInvocationInputV4::FsEnsureDirectory { .. },
+            KernelCanonicalInvocation::FsEnsureDirectory { .. },
         ) => (
             matches!(after, ResourceStateV2::Directory { .. }),
             EffectEvidenceV2::MutationReadBack {
@@ -1160,7 +1155,7 @@ fn resolve_mutation(
         ),
         (
             TargetRevalidationObservationV2::DeletionPrepared { before, .. },
-            ToolInvocationInputV4::FsDelete(_),
+            KernelCanonicalInvocation::FsDelete(_),
         ) => {
             let previous_digest = match before {
                 DeletionBeforeObservationV2::PresentFile { state_digest }
@@ -1182,11 +1177,12 @@ fn resolve_mutation(
     if executor_ok && expected {
         let output = bounded_output(
             invocation.tool_id(),
-            ToolOutputPayloadV4::NoPrimaryContent {},
+            KernelToolOutputPayload::NoPrimaryContent {},
             maximum_output_bytes,
         )
         .expect("no-primary-content output is bounded");
-        let output = serde_json::to_value(output).expect("ToolOutputV4 serializes to a JSON value");
+        let output =
+            serde_json::to_value(output).expect("KernelToolOutput serializes to a JSON value");
         ExecutionResolution::Completed(VerifiedExecution { output, evidence })
     } else if expected {
         ExecutionResolution::FailedAfterObservedEffect {
@@ -1213,14 +1209,14 @@ fn indeterminate(last_observation: LastObservationV2) -> ExecutionResolution {
 }
 
 fn utf8_output(
-    tool_id: AuthorityToolIdV4,
-    media_type: TextMediaTypeV4,
+    tool_id: KernelToolKind,
+    media_type: KernelTextMediaType,
     text: Option<&str>,
     budget: u32,
-) -> Option<ToolOutputV4> {
+) -> Option<KernelToolOutput> {
     bounded_output(
         tool_id,
-        ToolOutputPayloadV4::Utf8Text {
+        KernelToolOutputPayload::Utf8Text {
             media_type,
             text: text?.to_owned(),
         },
@@ -1229,25 +1225,25 @@ fn utf8_output(
 }
 
 fn path_entries_from_nodes(
-    tool_id: AuthorityToolIdV4,
+    tool_id: KernelToolKind,
     nodes: Option<&serde_json::Value>,
     budget: u32,
-) -> Option<ToolOutputV4> {
-    fn visit(value: &serde_json::Value, output: &mut Vec<PathEntryV4>) -> Option<()> {
+) -> Option<KernelToolOutput> {
+    fn visit(value: &serde_json::Value, output: &mut Vec<KernelPathEntry>) -> Option<()> {
         for node in value.as_array()? {
             let kind = match node.get("type")?.as_str()? {
-                "file" => WorkspaceObjectKindV4::File,
-                "directory" => WorkspaceObjectKindV4::Directory,
+                "file" => KernelWorkspaceObjectKind::File,
+                "directory" => KernelWorkspaceObjectKind::Directory,
                 _ => return None,
             };
-            output.push(PathEntryV4 {
+            output.push(KernelPathEntry {
                 relative_path: node.get("path")?.as_str()?.to_owned(),
                 kind,
                 size: node
                     .get("sizeBytes")
                     .and_then(serde_json::Value::as_u64)
-                    .map(|value| PathEntrySizeV4::Bytes { value })
-                    .unwrap_or(PathEntrySizeV4::Unavailable {}),
+                    .map(|value| KernelPathEntrySize::Bytes { value })
+                    .unwrap_or(KernelPathEntrySize::Unavailable {}),
             });
             if let Some(children) = node.get("children") {
                 visit(children, output)?;
@@ -1264,33 +1260,33 @@ fn path_entries_from_nodes(
     });
     bounded_output(
         tool_id,
-        ToolOutputPayloadV4::PathEntries { entries },
+        KernelToolOutputPayload::PathEntries { entries },
         budget,
     )
 }
 
 fn path_entries_from_glob(
-    tool_id: AuthorityToolIdV4,
+    tool_id: KernelToolKind,
     matches: Option<&serde_json::Value>,
     workspace: &Path,
     budget: u32,
-) -> Option<ToolOutputV4> {
+) -> Option<KernelToolOutput> {
     let mut entries = matches?
         .as_array()?
         .iter()
         .map(|value| {
             let relative_path = value.as_str()?.to_owned();
             let metadata = fs::metadata(workspace.join(&relative_path)).ok()?;
-            Some(PathEntryV4 {
+            Some(KernelPathEntry {
                 relative_path,
                 kind: if metadata.is_dir() {
-                    WorkspaceObjectKindV4::Directory
+                    KernelWorkspaceObjectKind::Directory
                 } else if metadata.is_file() {
-                    WorkspaceObjectKindV4::File
+                    KernelWorkspaceObjectKind::File
                 } else {
                     return None;
                 },
-                size: PathEntrySizeV4::Bytes {
+                size: KernelPathEntrySize::Bytes {
                     value: metadata.len(),
                 },
             })
@@ -1303,19 +1299,19 @@ fn path_entries_from_glob(
     });
     bounded_output(
         tool_id,
-        ToolOutputPayloadV4::PathEntries { entries },
+        KernelToolOutputPayload::PathEntries { entries },
         budget,
     )
 }
 
 fn search_matches_output(
-    tool_id: AuthorityToolIdV4,
+    tool_id: KernelToolKind,
     raw: Option<&serde_json::Value>,
     query: &str,
-    strategy: SearchStrategyV4,
+    strategy: KernelSearchStrategy,
     budget: u32,
-) -> Option<ToolOutputV4> {
-    let regex = matches!(strategy, SearchStrategyV4::Regex)
+) -> Option<KernelToolOutput> {
+    let regex = matches!(strategy, KernelSearchStrategy::Regex)
         .then(|| regex::Regex::new(query).ok())
         .flatten();
     let matches = raw?
@@ -1324,12 +1320,12 @@ fn search_matches_output(
         .map(|value| {
             let preview = value.get("preview")?.as_str()?.to_owned();
             let start = match strategy {
-                SearchStrategyV4::Literal => preview.find(query),
-                SearchStrategyV4::Regex => {
+                KernelSearchStrategy::Literal => preview.find(query),
+                KernelSearchStrategy::Regex => {
                     regex.as_ref()?.find(&preview).map(|value| value.start())
                 }
             }?;
-            Some(SearchMatchV4 {
+            Some(KernelSearchMatch {
                 relative_path: value.get("path")?.as_str()?.to_owned(),
                 line: u32::try_from(value.get("line")?.as_u64()?).ok()?,
                 column: u32::try_from(preview[..start].chars().count() + 1).ok()?,
@@ -1339,21 +1335,21 @@ fn search_matches_output(
         .collect::<Option<Vec<_>>>()?;
     bounded_output(
         tool_id,
-        ToolOutputPayloadV4::SearchMatches { matches },
+        KernelToolOutputPayload::SearchMatches { matches },
         budget,
     )
 }
 
 fn web_search_output(
-    tool_id: AuthorityToolIdV4,
+    tool_id: KernelToolKind,
     raw: Option<&serde_json::Value>,
     budget: u32,
-) -> Option<ToolOutputV4> {
+) -> Option<KernelToolOutput> {
     let items = raw?
         .as_array()?
         .iter()
         .map(|value| {
-            Some(WebSearchItemV4 {
+            Some(KernelWebSearchItem {
                 title: value.get("title")?.as_str()?.to_owned(),
                 url: value.get("url")?.as_str()?.to_owned(),
                 snippet: value
@@ -1366,17 +1362,17 @@ fn web_search_output(
         .collect::<Option<Vec<_>>>()?;
     bounded_output(
         tool_id,
-        ToolOutputPayloadV4::WebSearchResults { items },
+        KernelToolOutputPayload::WebSearchResults { items },
         budget,
     )
 }
 
 fn web_response_output(
-    tool_id: AuthorityToolIdV4,
+    tool_id: KernelToolKind,
     raw: &RawExecution,
     revalidation: &PreparedRevalidation,
     budget: u32,
-) -> Option<ToolOutputV4> {
+) -> Option<KernelToolOutput> {
     let ResolvedResourceV2::NetworkEndpoint {
         origin,
         target_observation_digest,
@@ -1386,9 +1382,9 @@ fn web_response_output(
     };
     bounded_output(
         tool_id,
-        ToolOutputPayloadV4::WebResponse {
+        KernelToolOutputPayload::WebResponse {
             status_code: raw.http_status_code?,
-            final_target: NetworkPublicTargetV4 {
+            final_target: KernelNetworkPublicTarget {
                 origin: origin.clone(),
                 target_observation_digest: target_observation_digest.clone(),
             },
@@ -1400,17 +1396,17 @@ fn web_response_output(
 }
 
 fn complete_payload_for_output(
-    invocation: &ToolInvocationInputV4,
+    invocation: &KernelCanonicalInvocation,
     raw: &RawExecution,
     workspace: &WorkspaceBinding,
-) -> Option<ToolOutputPayloadV4> {
+) -> Option<KernelToolOutputPayload> {
     match invocation {
-        ToolInvocationInputV4::FsList { .. } => {
+        KernelCanonicalInvocation::FsList { .. } => {
             let output =
                 path_entries_from_nodes(invocation.tool_id(), raw.output.get("nodes"), u32::MAX)?;
             Some(output.payload)
         }
-        ToolInvocationInputV4::FsGlob { .. } => {
+        KernelCanonicalInvocation::FsGlob { .. } => {
             let output = path_entries_from_glob(
                 invocation.tool_id(),
                 raw.output.get("matches"),
@@ -1424,71 +1420,71 @@ fn complete_payload_for_output(
 }
 
 fn bounded_output(
-    tool_id: AuthorityToolIdV4,
-    complete: ToolOutputPayloadV4,
+    tool_id: KernelToolKind,
+    complete: KernelToolOutputPayload,
     maximum_bytes: u32,
-) -> Option<ToolOutputV4> {
-    let complete_output = output_payload_measure_v4(tool_id, complete).ok()?;
+) -> Option<KernelToolOutput> {
+    let complete_output = measure_kernel_output_payload(tool_id, complete).ok()?;
     let maximum = maximum_bytes as usize;
     if complete_output.total_bytes <= maximum as u64 {
         return Some(complete_output);
     }
     let retained = truncate_payload_to_budget(&complete_output.payload, maximum)?;
     let retained_bytes = serde_json::to_vec(&retained).ok()?.len() as u64;
-    Some(ToolOutputV4 {
+    Some(KernelToolOutput {
         full_digest: complete_output.full_digest,
         total_bytes: complete_output.total_bytes,
-        truncation: OutputTruncationV4::Truncated { retained_bytes },
+        truncation: KernelOutputTruncation::Truncated { retained_bytes },
         payload: retained,
     })
 }
 
 fn truncate_payload_to_budget(
-    complete: &ToolOutputPayloadV4,
+    complete: &KernelToolOutputPayload,
     maximum: usize,
-) -> Option<ToolOutputPayloadV4> {
+) -> Option<KernelToolOutputPayload> {
     match complete {
-        ToolOutputPayloadV4::Utf8Text { media_type, text } => {
-            truncate_text(text, maximum, |text| ToolOutputPayloadV4::Utf8Text {
+        KernelToolOutputPayload::Utf8Text { media_type, text } => {
+            truncate_text(text, maximum, |text| KernelToolOutputPayload::Utf8Text {
                 media_type: *media_type,
                 text,
             })
         }
-        ToolOutputPayloadV4::WebResponse {
+        KernelToolOutputPayload::WebResponse {
             status_code,
             content_type,
             body,
             final_target,
-        } => truncate_text(body, maximum, |body| ToolOutputPayloadV4::WebResponse {
+        } => truncate_text(body, maximum, |body| KernelToolOutputPayload::WebResponse {
             status_code: *status_code,
             content_type: content_type.clone(),
             body,
             final_target: final_target.clone(),
         }),
-        ToolOutputPayloadV4::PathEntries { entries } => {
+        KernelToolOutputPayload::PathEntries { entries } => {
             truncate_items(entries, maximum, |entries| {
-                ToolOutputPayloadV4::PathEntries { entries }
+                KernelToolOutputPayload::PathEntries { entries }
             })
         }
-        ToolOutputPayloadV4::SearchMatches { matches } => {
+        KernelToolOutputPayload::SearchMatches { matches } => {
             truncate_items(matches, maximum, |matches| {
-                ToolOutputPayloadV4::SearchMatches { matches }
+                KernelToolOutputPayload::SearchMatches { matches }
             })
         }
-        ToolOutputPayloadV4::WebSearchResults { items } => {
+        KernelToolOutputPayload::WebSearchResults { items } => {
             truncate_items(items, maximum, |items| {
-                ToolOutputPayloadV4::WebSearchResults { items }
+                KernelToolOutputPayload::WebSearchResults { items }
             })
         }
-        ToolOutputPayloadV4::NoPrimaryContent {} => None,
+        KernelToolOutputPayload::NoPrimaryContent {} => None,
     }
 }
 
 fn truncate_text(
     text: &str,
     maximum: usize,
-    build: impl Fn(String) -> ToolOutputPayloadV4,
-) -> Option<ToolOutputPayloadV4> {
+    build: impl Fn(String) -> KernelToolOutputPayload,
+) -> Option<KernelToolOutputPayload> {
     let boundaries = text
         .char_indices()
         .map(|(index, _)| index)
@@ -1503,8 +1499,8 @@ fn truncate_text(
 fn truncate_items<T: Clone>(
     items: &[T],
     maximum: usize,
-    build: impl Fn(Vec<T>) -> ToolOutputPayloadV4,
-) -> Option<ToolOutputPayloadV4> {
+    build: impl Fn(Vec<T>) -> KernelToolOutputPayload,
+) -> Option<KernelToolOutputPayload> {
     let retained = largest_prefix(items.len(), |count| {
         serialized_fits(&build(items[..count].to_vec()), maximum)
     })?;
@@ -1527,7 +1523,7 @@ fn largest_prefix(upper: usize, mut fits: impl FnMut(usize) -> Option<bool>) -> 
     Some(low)
 }
 
-fn serialized_fits(payload: &ToolOutputPayloadV4, maximum: usize) -> Option<bool> {
+fn serialized_fits(payload: &KernelToolOutputPayload, maximum: usize) -> Option<bool> {
     Some(serde_json::to_vec(payload).ok()?.len() <= maximum)
 }
 
@@ -1553,11 +1549,11 @@ fn materialize_deadline(
 }
 
 fn resolve_invocation_targets(
-    invocation: &ToolInvocationInputV4,
+    invocation: &KernelCanonicalInvocation,
     workspace: &WorkspaceBinding,
     executor_config: &KernelExecutorConfig,
 ) -> Result<(ResourceScopeV2, Vec<ResolvedTarget>), PrepareFailure> {
-    use ToolInvocationInputV4 as Input;
+    use KernelCanonicalInvocation as Input;
     let workspace_spec = match invocation {
         Input::FsRead { path, .. }
         | Input::FsDiff { path, .. }
@@ -1584,16 +1580,14 @@ fn resolve_invocation_targets(
             ExpectedTarget::MustFile,
             ResourceAccessV2::Write,
         )),
-        Input::FsDelete(DeleteTargetV4::File { path }) => Some(WorkspaceTargetSpec::new(
+        Input::FsDelete(KernelDeleteTarget::File { path }) => Some(WorkspaceTargetSpec::new(
             path,
             ExpectedTarget::MustFile,
             ResourceAccessV2::Write,
         )),
-        Input::FsDelete(DeleteTargetV4::DirectoryTree { path }) => Some(WorkspaceTargetSpec::new(
-            path,
-            ExpectedTarget::MustDirectory,
-            ResourceAccessV2::Write,
-        )),
+        Input::FsDelete(KernelDeleteTarget::DirectoryTree { path }) => Some(
+            WorkspaceTargetSpec::new(path, ExpectedTarget::MustDirectory, ResourceAccessV2::Write),
+        ),
         Input::FsEnsureDirectory { path } => Some(WorkspaceTargetSpec::new(
             path,
             ExpectedTarget::DirectoryOrAbsent,
@@ -1880,11 +1874,11 @@ fn resource_state_for_path(path: &Path) -> Result<ResourceStateV2, PrepareFailur
     ))
 }
 
-fn collect_path_entries(root: &Path) -> Result<Vec<PathEntryV4>, PrepareFailure> {
+fn collect_path_entries(root: &Path) -> Result<Vec<KernelPathEntry>, PrepareFailure> {
     fn visit(
         root: &Path,
         current: &Path,
-        entries: &mut Vec<PathEntryV4>,
+        entries: &mut Vec<KernelPathEntry>,
     ) -> Result<(), PrepareFailure> {
         let mut children = fs::read_dir(current)
             .map_err(|_| PrepareFailure::Target(TargetResolutionFailure::ResolverUnavailable))?
@@ -1911,20 +1905,20 @@ fn collect_path_entries(root: &Path) -> Result<Vec<PathEntryV4>, PrepareFailure>
                 .replace('\\', "/");
             let (kind, size) = if metadata.is_dir() {
                 (
-                    WorkspaceObjectKindV4::Directory,
-                    PathEntrySizeV4::Unavailable {},
+                    KernelWorkspaceObjectKind::Directory,
+                    KernelPathEntrySize::Unavailable {},
                 )
             } else if metadata.is_file() {
                 (
-                    WorkspaceObjectKindV4::File,
-                    PathEntrySizeV4::Bytes {
+                    KernelWorkspaceObjectKind::File,
+                    KernelPathEntrySize::Bytes {
                         value: metadata.len(),
                     },
                 )
             } else {
                 continue;
             };
-            entries.push(PathEntryV4 {
+            entries.push(KernelPathEntry {
                 relative_path: relative,
                 kind,
                 size,
@@ -3141,10 +3135,8 @@ fn resource_matches_scope(resource: &ResolvedResourceV2, scope: &ResourceScopeV2
     }
 }
 
-fn private_tool_kind(tool_id: &ToolIdV2) -> Option<AuthorityToolIdV4> {
-    crate::kernel_tool_registry()
-        .get_v2(tool_id)
-        .map(|registration| registration.private_tool_kind())
+fn private_tool_kind(tool_id: &ToolIdV2) -> Option<KernelToolKind> {
+    crate::kernel_tool_registry().kernel_internal_tool_kind(tool_id)
 }
 
 fn expected_resource_count(scope: &ResourceScopeV2) -> AuthorityResult<usize> {
@@ -3327,8 +3319,8 @@ fn validate_direct_effect(state: &AuthorityState, fact: &EffectFactV2) -> Author
     Ok(())
 }
 
-fn observed_evidence_legal(tool_id: AuthorityToolIdV4, evidence: &EffectEvidenceV2) -> bool {
-    use AuthorityToolIdV4 as Tool;
+fn observed_evidence_legal(tool_id: KernelToolKind, evidence: &EffectEvidenceV2) -> bool {
+    use KernelToolKind as Tool;
     match (tool_id, evidence) {
         (
             Tool::FsRead | Tool::FsDiff | Tool::DocumentRead,
@@ -3357,11 +3349,11 @@ fn observed_evidence_legal(tool_id: AuthorityToolIdV4, evidence: &EffectEvidence
     }
 }
 
-fn indeterminate_evidence_legal(tool_id: AuthorityToolIdV4, evidence: &EffectEvidenceV2) -> bool {
+fn indeterminate_evidence_legal(tool_id: KernelToolKind, evidence: &EffectEvidenceV2) -> bool {
     let EffectEvidenceV2::IndeterminateReadBack { last_observation } = evidence else {
         return false;
     };
-    use AuthorityToolIdV4 as Tool;
+    use KernelToolKind as Tool;
     match (tool_id, last_observation) {
         (_, LastObservationV2::None {}) => true,
         (Tool::FsRead | Tool::FsDiff | Tool::DocumentRead, LastObservationV2::Content { .. })
@@ -3403,7 +3395,7 @@ fn validate_direct_completed_output(
     output: &serde_json::Value,
 ) -> AuthorityResult<()> {
     let output =
-        serde_json::from_value::<ToolOutputV4>(output.clone()).map_err(|_| corrupt_store())?;
+        serde_json::from_value::<KernelToolOutput>(output.clone()).map_err(|_| corrupt_store())?;
     let evidence = match state
         .facts_by_id
         .get(&identity.causation_fact_id)

@@ -1,43 +1,27 @@
 use deepcode_kernel_abi::{
-    KernelCommand, KernelCommandEnvelope, KernelEvent, KernelReply, RequestId,
+    is_valid_host_shell_capability_v2, HOST_SHELL_CAPABILITY_ENV_V2,
+    HOST_SHELL_CAPABILITY_HEADER_V2,
 };
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
-use std::fs::{File, OpenOptions};
-use std::io::{ErrorKind, Write};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
-use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::fmt;
+use std::time::Duration;
 use thiserror::Error;
 
-#[cfg(unix)]
-use std::os::unix::process::CommandExt as UnixCommandExt;
-#[cfg(windows)]
-use std::os::windows::process::CommandExt as WindowsCommandExt;
-
+mod agent;
 mod bootstrap;
-mod session_bridge;
 mod v2;
 
-pub use bootstrap::{DaemonStatus, KernelBootstrap, KernelBootstrapGuard, KernelBootstrapOptions};
-use session_bridge::run_session_host_bridge;
-pub use session_bridge::{
-    session_host_bridge_hint, session_host_bridge_path, terminal_host_language,
-    terminal_workspace_scope, AgentRunResult, AgentRunStatus, AgentSessionListResult,
-    AgentSessionResult, CreateAgentSessionRequest, ListAgentSessionsRequest,
-    ResolveSessionGoalInteractionRequest, SessionGoalCommandReceipt, SessionHostBridgeRequest,
-    SessionHostBridgeResult, StartAgentRunRequest, StartSessionGoalRequest, TerminalWorkspaceScope,
+pub use agent::{
+    terminal_workspace_scope, AgentInputAttachmentKindV2, AgentInputAttachmentScopeV2,
+    AgentInputAttachmentV2, AgentRunCallerRequest, AgentRunGuidanceRequest, AgentRunResult,
+    AgentRunStatus, AgentSessionListResult, AgentSessionResult, CreateAgentSessionRequest,
+    ListAgentSessionsRequest, StartAgentRunRequest, TerminalWorkspaceScope,
 };
+pub use bootstrap::{DaemonStatus, KernelBootstrap, KernelBootstrapGuard, KernelBootstrapOptions};
 pub use v2::{
-    HostDecisionKernelV2Client, HostKernelV2Client, HostRunOpenTransportV2,
-    HostTransportCredentialV2, KernelV2ClientError, KernelV2ClientResult, KernelV2HttpErrorCode,
-    SessionKernelV2Client,
+    KernelV2ClientError, KernelV2ClientResult, KernelV2HttpErrorCode, SessionKernelV2Client,
 };
 
 #[derive(Debug, Error)]
@@ -48,19 +32,58 @@ pub enum KernelClientError {
     Api(String),
     #[error("daemon response decode failed: {0}")]
     Decode(#[from] serde_json::Error),
-    #[error("daemon response is missing field: {0}")]
-    MissingField(&'static str),
-    #[error("session host bridge failed: {0}")]
-    Bridge(String),
+    #[error(
+        "Host shell admission capability is required through the v2 environment or KernelBootstrapOptions"
+    )]
+    HostAdmissionCapabilityMissing,
+    #[error("Host shell admission capability does not use the required v2 format")]
+    HostAdmissionCapabilityInvalid,
+    #[error("daemon at {base_url} rejected the Host shell admission capability")]
+    HostAdmissionRejected { base_url: String },
+    #[error("daemon at {base_url} is unavailable: {reason}")]
+    DaemonUnavailable { base_url: String, reason: String },
     #[error("kernel bootstrap failed: {0}")]
     Bootstrap(String),
 }
 
 pub type KernelClientResult<T> = Result<T, KernelClientError>;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
+struct HostShellCapabilityV2(String);
+
+impl fmt::Debug for HostShellCapabilityV2 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("HostShellCapabilityV2([REDACTED])")
+    }
+}
+
+impl HostShellCapabilityV2 {
+    fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    fn expose_to_transport(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone)]
 pub struct KernelClientConfig {
     pub base_url: String,
+    host_shell_capability: Option<HostShellCapabilityV2>,
+}
+
+impl fmt::Debug for KernelClientConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("KernelClientConfig")
+            .field("base_url", &self.base_url)
+            .field(
+                "host_shell_capability",
+                &self.host_shell_capability.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
 }
 
 impl KernelClientConfig {
@@ -76,7 +99,32 @@ impl KernelClientConfig {
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
+            host_shell_capability: std::env::var(HOST_SHELL_CAPABILITY_ENV_V2)
+                .ok()
+                .map(HostShellCapabilityV2::new),
         }
+    }
+
+    pub fn with_host_shell_capability(mut self, capability: impl Into<String>) -> Self {
+        self.host_shell_capability = Some(HostShellCapabilityV2::new(capability));
+        self
+    }
+
+    pub(crate) fn has_host_shell_capability(&self) -> bool {
+        self.host_shell_capability.is_some()
+    }
+
+    pub(crate) fn validate_host_shell_capability(&self) -> KernelClientResult<()> {
+        if self
+            .host_shell_capability
+            .as_ref()
+            .is_some_and(|capability| {
+                !is_valid_host_shell_capability_v2(capability.expose_to_transport())
+            })
+        {
+            return Err(KernelClientError::HostAdmissionCapabilityInvalid);
+        }
+        Ok(())
     }
 }
 
@@ -87,47 +135,32 @@ pub struct HttpKernelClient {
 }
 
 impl HttpKernelClient {
-    pub fn new(config: KernelClientConfig) -> Self {
-        Self {
-            config,
-            http: reqwest::Client::builder()
-                .timeout(Duration::from_secs(60))
-                .build()
-                .unwrap_or_else(|_| reqwest::Client::new()),
-        }
+    pub fn new(mut config: KernelClientConfig) -> KernelClientResult<Self> {
+        config.validate_host_shell_capability()?;
+        let capability = config
+            .host_shell_capability
+            .as_ref()
+            .ok_or(KernelClientError::HostAdmissionCapabilityMissing)?;
+        let mut capability_header = HeaderValue::from_str(capability.expose_to_transport())
+            .map_err(|_| KernelClientError::HostAdmissionCapabilityInvalid)?;
+        capability_header.set_sensitive(true);
+        let mut default_headers = HeaderMap::new();
+        default_headers.insert(
+            HeaderName::from_static(HOST_SHELL_CAPABILITY_HEADER_V2),
+            capability_header,
+        );
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .default_headers(default_headers)
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .build()?;
+        config.host_shell_capability = None;
+        Ok(Self { config, http })
     }
 
     pub fn base_url(&self) -> &str {
         &self.config.base_url
-    }
-
-    pub async fn kernel_command(&self, command: KernelCommand) -> KernelClientResult<KernelReply> {
-        self.kernel_command_envelope(KernelCommandEnvelope::new(command))
-            .await
-    }
-
-    pub async fn kernel_command_envelope(
-        &self,
-        envelope: KernelCommandEnvelope,
-    ) -> KernelClientResult<KernelReply> {
-        let reply = self
-            .http
-            .post(self.url("/api/kernel/commands"))
-            .json(&envelope)
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<KernelReply>()
-            .await?;
-        if !reply.ok {
-            let message = reply
-                .error
-                .as_ref()
-                .map(|error| error.message.as_str())
-                .unwrap_or("Kernel command failed");
-            return Err(KernelClientError::Api(message.to_owned()));
-        }
-        Ok(reply)
     }
 
     pub async fn health(&self) -> KernelClientResult<DaemonStatus> {
@@ -317,28 +350,12 @@ impl HttpKernelClient {
         decode_api_data(value)
     }
 
-    pub async fn append_agent_events(
-        &self,
-        session_id: &str,
-        events: Vec<Value>,
-    ) -> KernelClientResult<AgentSessionResult> {
-        let value = self
-            .http
-            .post(self.url(&format!("/api/agent/sessions/{session_id}/events")))
-            .json(&json!({ "events": events }))
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<Value>()
-            .await?;
-        decode_api_data(value)
-    }
-
     pub async fn start_agent_run(
         &self,
         session_id: &str,
         request: StartAgentRunRequest,
     ) -> KernelClientResult<AgentRunResult> {
+        request.validate()?;
         let value = self
             .http
             .post(self.url(&format!("/api/agent/sessions/{session_id}/runs")))
@@ -349,135 +366,6 @@ impl HttpKernelClient {
             .json::<Value>()
             .await?;
         decode_api_data_with_code(value)
-    }
-
-    pub async fn start_session_goal(
-        &self,
-        session_id: &str,
-        request: StartSessionGoalRequest,
-    ) -> KernelClientResult<SessionGoalCommandReceipt> {
-        let value = self
-            .http
-            .post(self.url(&format!("/api/agent/sessions/{session_id}/goals")))
-            .json(&request)
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<Value>()
-            .await?;
-        decode_api_data_with_code(value)
-    }
-
-    pub async fn current_session_goal(
-        &self,
-        session_id: &str,
-    ) -> KernelClientResult<SessionGoalCommandReceipt> {
-        let value = self
-            .http
-            .get(self.url(&format!("/api/agent/sessions/{session_id}/goals/current")))
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<Value>()
-            .await?;
-        decode_api_data_with_code(value)
-    }
-
-    pub async fn get_session_goal(
-        &self,
-        session_id: &str,
-        goal_id: &str,
-    ) -> KernelClientResult<SessionGoalCommandReceipt> {
-        let value = self
-            .http
-            .get(self.url(&format!("/api/agent/sessions/{session_id}/goals/{goal_id}")))
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<Value>()
-            .await?;
-        decode_api_data_with_code(value)
-    }
-
-    pub async fn resolve_session_goal_interaction(
-        &self,
-        session_id: &str,
-        goal_id: &str,
-        interaction_id: &str,
-        request: ResolveSessionGoalInteractionRequest,
-    ) -> KernelClientResult<SessionGoalCommandReceipt> {
-        let value = self
-            .http
-            .post(self.url(&format!(
-                "/api/agent/sessions/{session_id}/goals/{goal_id}/interactions/{interaction_id}/resolve"
-            )))
-            .json(&request)
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<Value>()
-            .await?;
-        decode_api_data_with_code(value)
-    }
-
-    pub async fn advance_session_goal(
-        &self,
-        session_id: &str,
-        goal_id: &str,
-        request: Value,
-    ) -> KernelClientResult<Value> {
-        let value = self
-            .http
-            .post(self.url(&format!(
-                "/api/agent/sessions/{session_id}/goals/{goal_id}/advance"
-            )))
-            .json(&request)
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<Value>()
-            .await?;
-        api_data(value)
-    }
-
-    pub async fn resume_session_goal(
-        &self,
-        session_id: &str,
-        goal_id: &str,
-        request: Value,
-    ) -> KernelClientResult<Value> {
-        let value = self
-            .http
-            .post(self.url(&format!(
-                "/api/agent/sessions/{session_id}/goals/{goal_id}/resume"
-            )))
-            .json(&request)
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<Value>()
-            .await?;
-        api_data(value)
-    }
-
-    pub async fn cancel_session_goal(
-        &self,
-        session_id: &str,
-        goal_id: &str,
-        request: Value,
-    ) -> KernelClientResult<Value> {
-        let value = self
-            .http
-            .post(self.url(&format!(
-                "/api/agent/sessions/{session_id}/goals/{goal_id}/cancel"
-            )))
-            .json(&request)
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<Value>()
-            .await?;
-        api_data(value)
     }
 
     pub async fn get_agent_run(
@@ -500,13 +388,15 @@ impl HttpKernelClient {
         &self,
         session_id: &str,
         run_id: &str,
+        request: AgentRunCallerRequest,
     ) -> KernelClientResult<AgentRunResult> {
+        request.validate()?;
         let value = self
             .http
             .post(self.url(&format!(
                 "/api/agent/sessions/{session_id}/runs/{run_id}/cancel"
             )))
-            .json(&json!({}))
+            .json(&request)
             .send()
             .await?
             .error_for_status()?
@@ -519,24 +409,15 @@ impl HttpKernelClient {
         &self,
         session_id: &str,
         run_id: &str,
-        guidance: impl Into<String>,
-        attachments: Vec<Value>,
-        host_language: Option<String>,
+        request: AgentRunGuidanceRequest,
     ) -> KernelClientResult<AgentRunResult> {
-        let observed_session = self.get_agent_session(session_id).await?;
-        let (base_head, turn_authority_ref) = observed_session.guidance_observation(run_id)?;
+        request.validate()?;
         let value = self
             .http
             .post(self.url(&format!(
                 "/api/agent/sessions/{session_id}/runs/{run_id}/guidance"
             )))
-            .json(&json!({
-                "guidance": guidance.into(),
-                "attachments": attachments,
-                "hostLanguage": host_language,
-                "baseHead": base_head,
-                "turnAuthorityRef": turn_authority_ref,
-            }))
+            .json(&request)
             .send()
             .await?
             .error_for_status()?
@@ -545,98 +426,8 @@ impl HttpKernelClient {
         decode_api_data_with_code(value)
     }
 
-    pub async fn cancel_agent_run(
-        &self,
-        session_id: &str,
-    ) -> KernelClientResult<AgentSessionResult> {
-        let value = self
-            .http
-            .post(self.url(&format!("/api/agent/sessions/{session_id}/cancel")))
-            .json(&json!({}))
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<Value>()
-            .await?;
-        decode_api_data(value)
-    }
-
-    pub async fn resolve_permission(
-        &self,
-        permission_id: &str,
-        decision: PermissionDecision,
-    ) -> KernelClientResult<Value> {
-        let response = self
-            .http
-            .post(self.url(&format!("/api/agent/permissions/{permission_id}/resolve")))
-            .json(&json!({
-                "decision": decision.as_str(),
-                "approved": matches!(decision, PermissionDecision::Allow),
-            }))
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<Value>()
-            .await?;
-        api_data(response)
-    }
-
-    pub fn run_session_host_bridge(
-        &self,
-        mut request: SessionHostBridgeRequest,
-    ) -> KernelClientResult<SessionHostBridgeResult> {
-        request.api_base = Some(self.config.base_url.clone());
-        run_session_host_bridge(request, None)
-    }
-
-    pub fn run_session_host_bridge_with_cancel(
-        &self,
-        mut request: SessionHostBridgeRequest,
-        cancel_requested: Arc<AtomicBool>,
-    ) -> KernelClientResult<SessionHostBridgeResult> {
-        request.api_base = Some(self.config.base_url.clone());
-        run_session_host_bridge(request, Some(cancel_requested))
-    }
-
-    pub async fn audit_verify(&self) -> KernelClientResult<AuditVerifyResult> {
-        let request_id = RequestId(format!(
-            "client-audit-verify-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
-        let command = KernelCommand::AuditVerify {
-            request_id,
-            scope: json!({ "kind": "all" }),
-        };
-        decode_audit_verify(self.kernel_command(command).await?)
-    }
-
     fn url(&self, path: &str) -> String {
         format!("{}{}", self.config.base_url, path)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AuditVerifyResult {
-    pub status: String,
-    pub degraded: bool,
-    pub message: String,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum PermissionDecision {
-    Allow,
-    Deny,
-}
-
-impl PermissionDecision {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            PermissionDecision::Allow => "allow",
-            PermissionDecision::Deny => "deny",
-        }
     }
 }
 
@@ -669,34 +460,6 @@ fn decode_api_data_with_code<T: DeserializeOwned>(value: Value) -> KernelClientR
         return Err(KernelClientError::Api(format!("{code}: {message}")));
     }
     decode_api_data(value)
-}
-
-fn decode_audit_verify(reply: KernelReply) -> KernelClientResult<AuditVerifyResult> {
-    for event in reply.events {
-        let KernelEvent::AuditVerifyCompleted { ok, report, .. } = event else {
-            continue;
-        };
-        let message = report
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or(if ok {
-                "audit chain verified"
-            } else {
-                "audit chain verification failed"
-            })
-            .to_string();
-        return Ok(AuditVerifyResult {
-            status: if ok { "verified" } else { "failed" }.to_string(),
-            degraded: report
-                .get("degraded")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            message,
-        });
-    }
-    Err(KernelClientError::MissingField(
-        "events[].audit.verify_completed",
-    ))
 }
 
 #[cfg(test)]

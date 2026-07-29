@@ -6,20 +6,6 @@ use axum::http::HeaderValue;
 use axum::middleware::Next;
 use tower_http::cors::AllowOrigin;
 
-pub(crate) fn kernel_ledger_path() -> Option<PathBuf> {
-    if std::env::var("DEEPCODE_LEDGER_BACKEND")
-        .map(|value| value.eq_ignore_ascii_case("memory"))
-        .unwrap_or(false)
-    {
-        return None;
-    }
-    Some(
-        std::env::var_os("DEEPCODE_LEDGER_PATH")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| user_config_root().join("kernel").join("ledger.ndjson")),
-    )
-}
-
 pub(crate) fn localhost_cors_layer() -> CorsLayer {
     CorsLayer::new()
         .allow_origin(AllowOrigin::predicate(
@@ -33,11 +19,16 @@ pub(crate) fn localhost_cors_layer() -> CorsLayer {
             Method::DELETE,
             Method::OPTIONS,
         ])
-        .allow_headers([header::CONTENT_TYPE])
+        .allow_headers([
+            header::CONTENT_TYPE,
+            header::HeaderName::from_static(
+                crate::host_admission_v2::HOST_SHELL_CAPABILITY_HEADER_V2,
+            ),
+        ])
 }
 
 pub(crate) async fn trusted_local_origin_gate(request: Request, next: Next) -> Response {
-    if crate::session_store::trusted_private_storage_origin(request.headers()) {
+    if crate::session_metadata_v2::trusted_private_storage_origin(request.headers()) {
         return next.run(request).await;
     }
     (
@@ -45,6 +36,30 @@ pub(crate) async fn trusted_local_origin_gate(request: Request, next: Next) -> R
         ApiResponse::error(
             "host_origin_forbidden",
             "DeepCode Host APIs accept only non-browser local clients, the same loopback application origin, or deepcode-gui://localhost",
+        ),
+    )
+        .into_response()
+}
+
+pub(crate) async fn trusted_host_admission_gate(
+    axum::extract::State(authority): axum::extract::State<
+        crate::host_admission_v2::HostShellAuthorityV2,
+    >,
+    request: Request,
+    next: Next,
+) -> Response {
+    if crate::host_admission_v2::route_uses_specialized_transport(
+        request.method(),
+        request.uri().path(),
+    ) || authority.authorize(request.headers())
+    {
+        return next.run(request).await;
+    }
+    (
+        StatusCode::UNAUTHORIZED,
+        ApiResponse::error(
+            "host_admission_required",
+            "This Host API requires the process-private Host shell admission capability",
         ),
     )
         .into_response()
@@ -164,6 +179,19 @@ pub(crate) fn atomic_write_json(path: &PathBuf, value: &Value) -> Result<(), Str
     fs::rename(&tmp, path).map_err(|error| format!("rename {}: {error}", path.display()))
 }
 
+pub(crate) fn safe_path_segment(input: &str) -> String {
+    input
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 pub(crate) fn merge_object(target: &mut Value, patch: &Value) {
     let Some(target_object) = target.as_object_mut() else {
         return;
@@ -189,8 +217,4 @@ pub(crate) fn now_millis() -> u128 {
 
 pub(crate) fn now_text() -> String {
     now_millis().to_string()
-}
-
-pub(crate) fn rid(value: &str) -> RequestId {
-    RequestId(value.to_string())
 }

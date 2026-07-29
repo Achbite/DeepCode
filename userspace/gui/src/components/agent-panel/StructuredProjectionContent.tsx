@@ -1,4 +1,8 @@
 import React from 'react';
+import {
+  AGENT_TIMELINE_READABLE_PLAN_SCHEMA_V2,
+  AGENT_TIMELINE_READABLE_REVIEW_SCHEMA_V2,
+} from '@deepcode/protocol';
 import type { AgentTimelineStructuredProjection } from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
 
@@ -126,8 +130,14 @@ function readableProjection(
   projection: AgentTimelineStructuredProjection | undefined
 ): Record<string, unknown> | undefined {
   if (!projection) return undefined;
-  if (projection.kind === 'plan' && projection.schemaVersion !== 'deepcode.session.readable-plan.v1') return undefined;
-  if (projection.kind === 'review' && projection.schemaVersion !== 'deepcode.session.readable-review.v1') return undefined;
+  if (
+    projection.kind === 'plan'
+    && projection.schemaVersion !== AGENT_TIMELINE_READABLE_PLAN_SCHEMA_V2
+  ) return undefined;
+  if (
+    projection.kind === 'review'
+    && projection.schemaVersion !== AGENT_TIMELINE_READABLE_REVIEW_SCHEMA_V2
+  ) return undefined;
   return projection as unknown as Record<string, unknown>;
 }
 

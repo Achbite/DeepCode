@@ -154,7 +154,12 @@ export class SessionKernelLoopV2 {
       ports.persistence.loadPendingPublicRequests(initial.runId),
     ]);
     let state = checkpoint
-      ? restoreSessionKernelLoopStateV2(checkpoint, ports.kernel.run)
+      ? restoreSessionKernelLoopStateV2(checkpoint, {
+          runId: initial.runId,
+          workspaceBindingDigest: initial.workspaceBindingDigest,
+          sessionMemory: initial.sessionMemory,
+          providerProfile: initial.providerProfile,
+        })
       : createSessionKernelLoopStateV2(initial);
     const checkpointInitial = state.inputs.find(
       (input) => input.inputId === initial.initialInput.inputId
@@ -365,50 +370,6 @@ export class SessionKernelLoopV2 {
     }
   }
 
-  async skipPlanAction(
-    planActionId: string,
-    expectedPlanRevision: string,
-    reason: string
-  ): Promise<void> {
-    this.beginMaintenance('skipPlanAction');
-    try {
-      this.requireNoPendingRequests();
-      this.requireCurrentPlanRevision(expectedPlanRevision);
-      this.requireAcceptedPlan();
-      if (this.state.activeWait) {
-        throw new SessionKernelLoopError(
-          'session_kernel_plan_action_skip_wait_active',
-          'PlanAction cannot be skipped while an authority or invocation wait is active.'
-        );
-      }
-      sessionPlanActionV2(this.state, planActionId);
-      const recordedAt = this.ports.clock.now();
-      const settlement = {
-        kind: 'skipped' as const,
-        planActionId,
-        reason: requiredReason(reason),
-        recordedAt,
-      };
-      const existing = this.state.planActionSettlements[planActionId];
-      if (existing && JSON.stringify(existing) !== JSON.stringify(settlement)) {
-        throw new SessionKernelLoopError(
-          'session_kernel_plan_action_skip_conflict',
-          `PlanAction ${planActionId} already has a different settlement.`
-        );
-      }
-      this.state.planActionSettlements[planActionId] = settlement;
-      await this.saveCheckpoint();
-      await this.project(
-        `plan-action:${planActionId}:skipped`,
-        'planAction.skipped',
-        settlement,
-        recordedAt
-      );
-    } finally {
-      this.endMaintenance();
-    }
-  }
-
   async previewPlanAction(
     planActionId: string,
     expectedPlanRevision: string
@@ -498,9 +459,46 @@ export class SessionKernelLoopV2 {
     input: SessionUserInputRecordV2,
     nextTurn: SessionProviderTurnRequestV2
   ): Promise<SessionKernelLoopResultV2> {
-    const generation = this.fenceProviderForUserInput();
+    const generation =
+      await this.persistUserInputBeforeFence(input);
     await this.applyFencedUserInput(input, generation);
     return this.runProviderTurn(nextTurn);
+  }
+
+  /**
+   * Persists the immutable user input before changing any local authority or
+   * cancelling in-flight work. Once persistence succeeds, the synchronous
+   * fence prevents later Provider output from crossing the new-input
+   * boundary while the epoch transition is made durable.
+   */
+  async persistUserInputBeforeFence(
+    input: SessionUserInputRecordV2
+  ): Promise<number> {
+    const durableInput =
+      await this.ports.persistence.loadInput(
+        this.state.runId,
+        input.inputId
+      );
+    if (
+      durableInput
+      && JSON.stringify(durableInput) !== JSON.stringify(input)
+    ) {
+      throw new SessionKernelLoopError(
+        'session_kernel_input_identity_conflict',
+        `Input ${input.inputId} already has different durable content.`
+      );
+    }
+    if (
+      durableInput
+      && this.state.currentInputId !== input.inputId
+    ) {
+      throw new SessionKernelLoopError(
+        'session_kernel_input_identity_reused',
+        `Input ${input.inputId} cannot be reused as a later user turn.`
+      );
+    }
+    await this.ports.persistence.persistInput(input);
+    return this.fenceProviderForUserInput();
   }
 
   /**
@@ -551,30 +549,6 @@ export class SessionKernelLoopV2 {
       this.beginAuthorityTransition();
       transitionStarted = true;
       const oldInvocationId = activeInvocationId(this.state);
-      const durableInput =
-        await this.ports.persistence.loadInput(
-          this.state.runId,
-          input.inputId
-        );
-      if (
-        durableInput
-        && JSON.stringify(durableInput) !== JSON.stringify(input)
-      ) {
-        throw new SessionKernelLoopError(
-          'session_kernel_input_identity_conflict',
-          `Input ${input.inputId} already has different durable content.`
-        );
-      }
-      if (
-        durableInput
-        && this.state.currentInputId !== input.inputId
-      ) {
-        throw new SessionKernelLoopError(
-          'session_kernel_input_identity_reused',
-          `Input ${input.inputId} cannot be reused as a later user turn.`
-        );
-      }
-      await this.ports.persistence.persistInput(input);
       this.state = recordSessionUserInputV2(this.state, input);
       await this.saveCheckpoint();
 
@@ -972,10 +946,8 @@ export class SessionKernelLoopV2 {
     );
     for (const settlement of settlements) {
       await this.project(
-        `plan-action:${settlement.planActionId}:${settlement.kind}`,
-        settlement.kind === 'completed'
-          ? 'planAction.completed'
-          : 'planAction.skipped',
+        `plan-action:${settlement.planActionId}:completed`,
+        'planAction.completed',
         settlement,
         settlement.recordedAt
       );
@@ -989,7 +961,10 @@ export class SessionKernelLoopV2 {
     await this.project(
       `input:${input.inputId}`,
       'input.persisted',
-      input,
+      {
+        ...input,
+        controlEpoch: this.state.controlEpoch,
+      },
       input.recordedAt
     );
     this.state.projectedInputIds.push(input.inputId);
@@ -1173,16 +1148,6 @@ function activeInvocationId(
     : wait?.kind === 'manualRecovery'
       ? wait.invocationId
       : undefined;
-}
-
-function requiredReason(value: string): string {
-  if (!value.trim() || value.length > 64 * 1024) {
-    throw new SessionKernelLoopError(
-      'session_kernel_plan_action_skip_reason_invalid',
-      'Skipped PlanAction requires a bounded non-empty reason.'
-    );
-  }
-  return value;
 }
 
 function planDecisionKey(decision: SessionPlanDecisionV2): string {

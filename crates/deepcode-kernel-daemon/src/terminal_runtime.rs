@@ -3,11 +3,14 @@ use crate::*;
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use std::collections::BTreeMap;
 use std::thread;
+use std::time::{Duration, Instant};
 
 pub(crate) const DEFAULT_COLS: u16 = 120;
 pub(crate) const DEFAULT_ROWS: u16 = 30;
 const MAX_TERMINAL_EVENTS: usize = 2_000;
 const HOST_TERMINAL_OWNER: &str = "deepcode-host-terminal";
+#[cfg(unix)]
+const TERMINAL_CHILD_GRACE_PERIOD: Duration = Duration::from_millis(500);
 
 pub(crate) struct TerminalRuntime {
     sessions: BTreeMap<String, TerminalPtySession>,
@@ -40,6 +43,9 @@ struct TerminalChildObserver {
 
 struct TerminalChildState {
     child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
+    process_id: Option<u32>,
+    #[cfg(unix)]
+    process_group_id: Option<i32>,
     exit_code: Option<i32>,
 }
 
@@ -145,7 +151,19 @@ impl TerminalRuntime {
             .slave
             .spawn_command(command)
             .map_err(|error| format!("spawn terminal shell {}: {error}", shell.program))?;
-        let child = TerminalChildOwner::new(child);
+        let process_id = child.process_id();
+        #[cfg(unix)]
+        let process_group_id = pty
+            .master
+            .process_group_leader()
+            .filter(|process_group_id| {
+                u32::try_from(*process_group_id)
+                    .ok()
+                    .is_some_and(|process_group_id| Some(process_group_id) == process_id)
+            });
+        #[cfg(not(unix))]
+        let process_group_id = None;
+        let child = TerminalChildOwner::new(child, process_id, process_group_id);
         drop(pty.slave);
         let reader = pty
             .master
@@ -322,6 +340,12 @@ impl TerminalRuntime {
             })
             .unwrap_or_default()
     }
+
+    pub(crate) fn shutdown_all(&mut self) {
+        for (_, mut session) in std::mem::take(&mut self.sessions) {
+            session.shutdown();
+        }
+    }
 }
 
 impl TerminalPtySession {
@@ -358,10 +382,19 @@ impl TerminalPtySession {
 }
 
 impl TerminalChildOwner {
-    fn new(child: Box<dyn portable_pty::Child + Send + Sync>) -> Self {
+    fn new(
+        child: Box<dyn portable_pty::Child + Send + Sync>,
+        process_id: Option<u32>,
+        process_group_id: Option<i32>,
+    ) -> Self {
+        #[cfg(not(unix))]
+        let _ = process_group_id;
         Self {
             state: Arc::new(Mutex::new(TerminalChildState {
                 child: Some(child),
+                process_id,
+                #[cfg(unix)]
+                process_group_id,
                 exit_code: None,
             })),
         }
@@ -382,16 +415,22 @@ impl TerminalChildOwner {
     }
 
     fn terminate_and_wait(&mut self) -> Option<i32> {
-        let child = {
+        let (child, process_id, process_group_id) = {
             let mut state = lock_terminal_child_state(&self.state);
-            state.child.take()
-        };
-        let Some(mut child) = child else {
-            return self.exit_code();
+            let child = state.child.take();
+            let process_id = state.process_id.take();
+            #[cfg(unix)]
+            let process_group_id = state.process_group_id.take();
+            #[cfg(not(unix))]
+            let process_group_id = None;
+            (child, process_id, process_group_id)
         };
 
-        let _ = child.kill();
-        let exit_code = child.wait().ok().map(|status| status.exit_code() as i32);
+        #[cfg(unix)]
+        let exit_code = terminate_owned_unix_process_group(child, process_id, process_group_id);
+        #[cfg(not(unix))]
+        let exit_code = terminate_owned_child(child, process_id);
+
         let mut state = lock_terminal_child_state(&self.state);
         if exit_code.is_some() {
             state.exit_code = exit_code;
@@ -435,6 +474,87 @@ fn observe_terminal_child_exit(state: &Arc<Mutex<TerminalChildState>>) -> Option
         state.child.take();
     }
     state.exit_code
+}
+
+#[cfg(unix)]
+fn terminate_owned_unix_process_group(
+    mut child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
+    process_id: Option<u32>,
+    process_group_id: Option<i32>,
+) -> Option<i32> {
+    let Some(process_group_id) = process_group_id.filter(|process_group_id| {
+        u32::try_from(*process_group_id)
+            .ok()
+            .is_some_and(|process_group_id| Some(process_group_id) == process_id)
+    }) else {
+        return terminate_owned_child(child, process_id);
+    };
+
+    signal_owned_unix_process_group(process_group_id, UNIX_SIGHUP);
+    signal_owned_unix_process_group(process_group_id, UNIX_SIGTERM);
+
+    let exit_code = child
+        .as_mut()
+        .and_then(|child| wait_for_terminal_child(child.as_mut(), TERMINAL_CHILD_GRACE_PERIOD));
+
+    signal_owned_unix_process_group(process_group_id, UNIX_SIGKILL);
+    if exit_code.is_some() {
+        return exit_code;
+    }
+
+    let Some(mut child) = child else {
+        return None;
+    };
+    let _ = child.kill();
+    child.wait().ok().map(|status| status.exit_code() as i32)
+}
+
+fn terminate_owned_child(
+    child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
+    _process_id: Option<u32>,
+) -> Option<i32> {
+    let Some(mut child) = child else {
+        return None;
+    };
+    let _ = child.kill();
+    child.wait().ok().map(|status| status.exit_code() as i32)
+}
+
+#[cfg(unix)]
+fn wait_for_terminal_child(child: &mut dyn portable_pty::Child, timeout: Duration) -> Option<i32> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait().ok().flatten() {
+            return Some(status.exit_code() as i32);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+fn signal_owned_unix_process_group(process_group_id: i32, signal: i32) {
+    if process_group_id <= 0 {
+        return;
+    }
+    unsafe {
+        let _ = deepcode_unix_kill(-process_group_id, signal);
+    }
+}
+
+#[cfg(unix)]
+const UNIX_SIGHUP: i32 = 1;
+#[cfg(unix)]
+const UNIX_SIGKILL: i32 = 9;
+#[cfg(unix)]
+const UNIX_SIGTERM: i32 = 15;
+
+#[cfg(unix)]
+unsafe extern "C" {
+    #[link_name = "kill"]
+    fn deepcode_unix_kill(process_id: i32, signal: i32) -> i32;
 }
 
 #[derive(Clone)]

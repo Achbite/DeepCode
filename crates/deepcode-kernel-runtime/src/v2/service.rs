@@ -14,8 +14,9 @@ use super::model::{
 };
 use crate::executors::{
     builtin_executors, invoke_document_read_complete, invoke_web_fetch_complete,
-    KernelExecutorConfig, KernelExecutorRegistry, KernelToolExecutionContext, KernelToolInvocation,
-    SecretProvider,
+    runtime_unavailable_tool_ids, snapshot_executor_secrets, KernelExecutorConfig,
+    KernelExecutorRegistry, KernelToolExecutionContext,
+    KernelToolInvocation as ExecutorToolInvocation, SecretProvider,
 };
 use deepcode_kernel_abi::v2::{
     command_request_digest_v2, target_revalidation_set_digest_v2, AttemptId, AuthorizationFactV2,
@@ -44,12 +45,12 @@ use deepcode_kernel_ledger::v2::{
     FactQueryContinuationDraftV2, FactQueryContinuationExpectationV2, OutboxPublisherLease,
     PublicCommandReceiptV2, PutFactQueryContinuationOutcomeV2, PutPublicCommandReceiptOutcomeV2,
 };
-use deepcode_kernel_tools::ToolInvocationInputV4;
+use deepcode_kernel_tools::kernel_internal::KernelCanonicalInvocation;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DIRECT_INVOCATION_MATERIAL_KIND: &str = "toolInvocation";
@@ -162,10 +163,37 @@ struct ServiceInner {
     reader: CanonicalFactReader,
     _publisher: OutboxPublisherLease,
     workspaces: Mutex<HashMap<RunId, WorkspaceBinding>>,
-    executor_config: KernelExecutorConfig,
-    executors: Arc<KernelExecutorRegistry>,
+    executor_runtime: RwLock<ExecutorRuntimeSnapshot>,
     execution_tasks: Mutex<HashMap<InvocationId, std::thread::JoinHandle<()>>>,
     ids: IdMint,
+}
+
+#[derive(Clone)]
+struct ExecutorRuntimeSnapshot {
+    config: KernelExecutorConfig,
+    executors: Arc<KernelExecutorRegistry>,
+    unavailable_tool_ids: Arc<Vec<ToolIdV2>>,
+}
+
+impl ExecutorRuntimeSnapshot {
+    fn build(config: KernelExecutorConfig, secret_provider: Arc<dyn SecretProvider>) -> Self {
+        let secret_provider = snapshot_executor_secrets(&config, secret_provider.as_ref());
+        let unavailable_tool_ids = Arc::new(runtime_unavailable_tool_ids(
+            crate::kernel_tool_registry(),
+            &config,
+            secret_provider.as_ref(),
+        ));
+        let executors = Arc::new(KernelExecutorRegistry::from_executors(builtin_executors(
+            crate::kernel_tool_registry(),
+            config.clone(),
+            secret_provider,
+        )));
+        Self {
+            config,
+            executors,
+            unavailable_tool_ids,
+        }
+    }
 }
 
 /// Sole coordinator for the sealed v2 admission and effect chain.
@@ -182,10 +210,16 @@ pub(super) struct DirectToolIntentRequest {
     pub(super) idempotency_key: String,
     pub(super) tool_id: ToolIdV2,
     pub(super) canonical_arguments_digest: CanonicalArgumentsDigestV2,
-    pub(super) canonical_invocation: ToolInvocationInputV4,
+    pub(super) canonical_invocation: KernelCanonicalInvocation,
     pub(super) authority: InvocationAuthorityV2,
     pub(super) tool_contract_digest: ToolContractDigestV2,
     pub(super) deadline: deepcode_kernel_abi::v2_command::DeadlineRequestV2,
+}
+
+pub(super) struct InitialToolContextInvalidationV2 {
+    pub(super) tool_id: ToolIdV2,
+    pub(super) previous_context: ToolContextRefV2,
+    pub(super) next_context: ToolContextRefV2,
 }
 
 pub(super) struct DirectToolIntentContinuationOutcome {
@@ -212,7 +246,7 @@ struct RunRetirementFenceDraft {
 
 struct DirectAuthorityAdmittedInvocation {
     identity: deepcode_kernel_abi::v2::ToolAttemptIdentityV2,
-    invocation: ToolInvocationInputV4,
+    invocation: KernelCanonicalInvocation,
     targets: Vec<(ResourceId, ResolvedTarget)>,
     attempt_prepared_fact_id: FactId,
     admitted_at: Instant,
@@ -322,11 +356,7 @@ impl AuthorityService {
         let publisher = store
             .claim_outbox_publisher()
             .map_err(|_| storage_fault())?;
-        let executors = Arc::new(KernelExecutorRegistry::from_executors(builtin_executors(
-            crate::kernel_tool_registry(),
-            executor_config.clone(),
-            secret_provider,
-        )));
+        let executor_runtime = ExecutorRuntimeSnapshot::build(executor_config, secret_provider);
         let service = Self {
             inner: Arc::new(ServiceInner {
                 state: Mutex::new(state),
@@ -334,14 +364,57 @@ impl AuthorityService {
                 reader,
                 _publisher: publisher,
                 workspaces: Mutex::new(HashMap::new()),
-                executor_config,
-                executors,
+                executor_runtime: RwLock::new(executor_runtime),
                 execution_tasks: Mutex::new(HashMap::new()),
                 ids: IdMint::new(snapshot.ledger_sequence_high_water),
             }),
         };
         service.reconcile_open_attempts()?;
         Ok(service)
+    }
+
+    pub(super) fn replace_executor_runtime_host(
+        &self,
+        executor_config: KernelExecutorConfig,
+        secret_provider: Arc<dyn SecretProvider>,
+    ) -> AuthorityResult<()> {
+        let replacement = ExecutorRuntimeSnapshot::build(executor_config, secret_provider);
+        if self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| storage_fault())?
+            .runs
+            .values()
+            .any(|run| run.retirement_fence.is_none() && run.retired.is_none())
+        {
+            return Err(invalid_field(
+                "executorRuntime",
+                InvalidFieldViolationV2::InvalidRelation,
+            ));
+        }
+        *self
+            .inner
+            .executor_runtime
+            .write()
+            .map_err(|_| storage_fault())? = replacement;
+        Ok(())
+    }
+
+    pub(super) fn runtime_unavailable_tool_ids(&self) -> AuthorityResult<Vec<ToolIdV2>> {
+        Ok(self
+            .executor_runtime_snapshot()?
+            .unavailable_tool_ids
+            .as_ref()
+            .clone())
+    }
+
+    fn executor_runtime_snapshot(&self) -> AuthorityResult<ExecutorRuntimeSnapshot> {
+        self.inner
+            .executor_runtime
+            .read()
+            .map_err(|_| storage_fault())
+            .map(|runtime| runtime.clone())
     }
 
     pub(super) fn bind_run_workspace(
@@ -458,7 +531,7 @@ impl AuthorityService {
         operation_id: &OperationId,
         control_epoch: ControlEpoch,
         idempotency_key: &str,
-        canonical_invocation: &deepcode_kernel_tools::ToolInvocationInputV4,
+        canonical_invocation: &deepcode_kernel_tools::kernel_internal::KernelCanonicalInvocation,
         deadline: deepcode_kernel_abi::v2_command::DeadlineRequestV2,
         correlation_refs: Vec<deepcode_kernel_abi::v2::CorrelationRefV2>,
     ) -> AuthorityResult<(deepcode_kernel_abi::v2::ResourceScopeV2, u32)> {
@@ -467,6 +540,7 @@ impl AuthorityService {
             require_current_run(&state, run_id, control_epoch)?;
         }
         let workspace = self.workspace_for_run(run_id)?;
+        let executor_runtime = self.executor_runtime_snapshot()?;
         let prepared = prepare_direct_tool_intent(
             run_id,
             operation_id,
@@ -477,7 +551,7 @@ impl AuthorityService {
             correlation_refs,
             crate::kernel_tool_registry(),
             &workspace,
-            &self.inner.executor_config,
+            &executor_runtime.config,
         )
         .map_err(|failure| match failure {
             PrepareFailure::Kernel(error) => error,
@@ -496,10 +570,11 @@ impl AuthorityService {
         public_request_digest: deepcode_kernel_abi::v2::CommandRequestDigestV2,
         workspace_binding_ref: WorkspaceBindingRefV2,
         settings_ceiling_digest: deepcode_kernel_abi::v2::SettingsCeilingDigestV2,
-        tool_context_ref: ToolContextRefV2,
+        initial_tool_context_ref: ToolContextRefV2,
+        initial_context_invalidations: Vec<InitialToolContextInvalidationV2>,
         run_capability: &RunCapabilityV2,
         mut receipt: PublicCommandReceiptV2,
-    ) -> AuthorityResult<ControlEpochAdvancedReplyV2> {
+    ) -> AuthorityResult<(ControlEpochAdvancedReplyV2, FactId)> {
         let workspace = self.workspace_for_run(&command.run_id)?;
         let mut state = self.inner.state.lock().map_err(|_| storage_fault())?;
         let existing_run = state.runs.get(&command.run_id).cloned();
@@ -524,7 +599,11 @@ impl AuthorityService {
         let command_fact_id = self.inner.ids.fact();
         let epoch_fact_id = self.inner.ids.fact();
         let run_opened_fact_id = self.inner.ids.fact();
-        let high_water = self.predicted_high_water(3)?;
+        let high_water = self.predicted_high_water(
+            3usize
+                .checked_add(initial_context_invalidations.len())
+                .ok_or_else(storage_fault)?,
+        )?;
         let reply = ControlEpochAdvancedReplyV2 {
             run_id: command.run_id.clone(),
             accepted_control_epoch: new_epoch,
@@ -556,11 +635,52 @@ impl AuthorityService {
                     causation_fact_id: epoch_fact_id,
                     workspace_binding_ref,
                     workspace_binding_digest: workspace.digest,
-                    settings_ceiling_digest,
-                    tool_context_ref,
+                    settings_ceiling_digest: settings_ceiling_digest.clone(),
+                    tool_context_ref: initial_tool_context_ref.clone(),
                 },
             ),
         });
+        let mut previous_context = initial_tool_context_ref;
+        let mut causation_fact_id = run_opened_fact_id.clone();
+        for invalidation in initial_context_invalidations {
+            if invalidation.previous_context != previous_context
+                || invalidation.next_context.context_version.get()
+                    != previous_context
+                        .context_version
+                        .get()
+                        .checked_add(1)
+                        .ok_or_else(storage_fault)?
+            {
+                return Err(corrupt_store());
+            }
+            let invalidation_fact_id = self.inner.ids.fact();
+            previous_context = invalidation.next_context.clone();
+            drafts.push(KernelFactDraftV2 {
+                fact_id: invalidation_fact_id.clone(),
+                payload: KernelFactPayloadV2::Authorization(
+                    AuthorizationFactV2::ContextInvalidated {
+                        identity:
+                            deepcode_kernel_abi::v2::ToolContextInvalidationIdentityV2 {
+                                run_id: command.run_id.clone(),
+                                control_epoch: new_epoch,
+                                causation_fact_id,
+                            },
+                        previous_context: invalidation.previous_context,
+                        next_context_version: invalidation.next_context.context_version,
+                        next_context_ref: invalidation.next_context,
+                        settings_ceiling_digest: settings_ceiling_digest.clone(),
+                        tool_id: Some(invalidation.tool_id),
+                        availability: Some(
+                            deepcode_kernel_abi::ToolAvailabilityV2::Unavailable,
+                        ),
+                        reason:
+                            deepcode_kernel_abi::v2::ToolContextInvalidationReasonV2::ToolUnavailable,
+                    },
+                ),
+            });
+            causation_fact_id = invalidation_fact_id;
+        }
+        let context_fact_id = causation_fact_id;
         receipt.settlement_fact_id = Some(run_opened_fact_id);
         let verifier_material =
             run_capability_verifier_material(&command.run_id, new_epoch, run_capability);
@@ -582,7 +702,7 @@ impl AuthorityService {
         match outcome.receipt {
             PutPublicCommandReceiptOutcomeV2::Inserted(_) => {
                 state.apply_committed(outcome.facts)?;
-                Ok(reply)
+                Ok((reply, context_fact_id))
             }
             PutPublicCommandReceiptOutcomeV2::ExistingSame(_)
             | PutPublicCommandReceiptOutcomeV2::DigestConflict { .. } => Err(corrupt_store()),
@@ -863,6 +983,7 @@ impl AuthorityService {
         &self,
         envelope: &KernelCommandEnvelopeV2,
         command: ControlEpochAdvanceV2,
+        superseded_capability_count: u64,
         material_mutations: Vec<AuthorityMaterialMutationV2>,
         build_receipt: F,
     ) -> AuthorityResult<KernelReplyV2>
@@ -872,6 +993,7 @@ impl AuthorityService {
         self.advance_epoch_inner(
             envelope,
             command,
+            superseded_capability_count,
             Some(Box::new(build_receipt)),
             material_mutations,
             true,
@@ -940,6 +1062,7 @@ impl AuthorityService {
         match self.advance_epoch_inner(
             &envelope,
             command,
+            0,
             None,
             Vec::new(),
             false,
@@ -960,6 +1083,7 @@ impl AuthorityService {
         &self,
         envelope: &KernelCommandEnvelopeV2,
         command: ControlEpochAdvanceV2,
+        superseded_capability_count: u64,
         public_receipt: Option<
             Box<dyn FnOnce(&KernelReplyV2) -> AuthorityResult<PublicCommandReceiptV2>>,
         >,
@@ -1015,7 +1139,7 @@ impl AuthorityService {
             run_id: command.run_id.clone(),
             accepted_control_epoch: new_epoch,
             epoch_fact_id: epoch_fact_id.clone(),
-            superseded_capability_count: 0,
+            superseded_capability_count,
             cancellation: cancellation.clone(),
             command_batch_high_water: high_water,
         };
@@ -1143,13 +1267,11 @@ impl AuthorityService {
             ));
         }
         let descriptor = crate::kernel_tool_registry()
-            .get_v2(&request.tool_id)
+            .descriptor_v2(&request.tool_id)
             .ok_or_else(|| invalid_field("toolId", InvalidFieldViolationV2::InvalidEnum))?;
-        let expected_contract_digest =
-            deepcode_kernel_abi::tool_contract_digest_v2(&descriptor.descriptor_v2)
-                .map_err(|_| corrupt_store())?;
-        if descriptor.descriptor_v2.availability != deepcode_kernel_abi::ToolAvailabilityV2::Ready
-            || descriptor.executor_binding.is_none()
+        let expected_contract_digest = deepcode_kernel_abi::tool_contract_digest_v2(descriptor)
+            .map_err(|_| corrupt_store())?;
+        if descriptor.availability != deepcode_kernel_abi::ToolAvailabilityV2::Ready
             || expected_contract_digest != request.tool_contract_digest
         {
             return Err(invalid_field("toolId", InvalidFieldViolationV2::OutOfRange));
@@ -1163,6 +1285,7 @@ impl AuthorityService {
                 }]
             }
         };
+        let executor_runtime = self.executor_runtime_snapshot()?;
         let prepared = prepare_direct_tool_intent(
             &request.run_id,
             &request.operation_id,
@@ -1173,7 +1296,7 @@ impl AuthorityService {
             correlation_refs,
             crate::kernel_tool_registry(),
             &workspace,
-            &self.inner.executor_config,
+            &executor_runtime.config,
         )
         .map_err(|failure| match failure {
             PrepareFailure::Kernel(error) => error,
@@ -1335,13 +1458,11 @@ impl AuthorityService {
             ));
         }
         let descriptor = crate::kernel_tool_registry()
-            .get_v2(&request.tool_id)
+            .descriptor_v2(&request.tool_id)
             .ok_or_else(|| invalid_field("toolId", InvalidFieldViolationV2::InvalidEnum))?;
-        let expected_contract_digest =
-            deepcode_kernel_abi::tool_contract_digest_v2(&descriptor.descriptor_v2)
-                .map_err(|_| corrupt_store())?;
-        if descriptor.descriptor_v2.availability != deepcode_kernel_abi::ToolAvailabilityV2::Ready
-            || descriptor.executor_binding.is_none()
+        let expected_contract_digest = deepcode_kernel_abi::tool_contract_digest_v2(descriptor)
+            .map_err(|_| corrupt_store())?;
+        if descriptor.availability != deepcode_kernel_abi::ToolAvailabilityV2::Ready
             || expected_contract_digest != request.tool_contract_digest
         {
             return Err(invalid_field("toolId", InvalidFieldViolationV2::OutOfRange));
@@ -1355,6 +1476,7 @@ impl AuthorityService {
                 }]
             }
         };
+        let executor_runtime = self.executor_runtime_snapshot()?;
         let prepared = prepare_direct_tool_intent(
             &request.run_id,
             &request.operation_id,
@@ -1365,7 +1487,7 @@ impl AuthorityService {
             correlation_refs,
             crate::kernel_tool_registry(),
             &workspace,
-            &self.inner.executor_config,
+            &executor_runtime.config,
         )
         .map_err(|failure| match failure {
             PrepareFailure::Kernel(error) => error,
@@ -1565,12 +1687,22 @@ impl AuthorityService {
                 return;
             }
         };
+        let executor_runtime = match self.executor_runtime_snapshot() {
+            Ok(runtime) => runtime,
+            Err(_) => {
+                let _ = self.fail_direct_before_effect(
+                    admitted,
+                    PreEffectFailureCodeV2::ExecutorUnavailable,
+                );
+                return;
+            }
+        };
         let preparation = match prepare_direct_effect(
             &admitted.invocation,
             &admitted.targets,
             &admitted.identity,
             &workspace,
-            &self.inner.executor_config,
+            &executor_runtime.config,
         ) {
             Ok(value) => value,
             Err(code) => {
@@ -1582,7 +1714,7 @@ impl AuthorityService {
             Ok(Some(value)) => value,
             Ok(None) | Err(_) => return,
         };
-        let invocation = KernelToolInvocation {
+        let invocation = ExecutorToolInvocation {
             id: ready.admitted.identity.invocation_id.to_string(),
             tool_id: ready.admitted.invocation.tool_id().as_str().to_owned(),
             input: ready.preparation.executor_input.clone(),
@@ -1590,13 +1722,24 @@ impl AuthorityService {
         let context = KernelToolExecutionContext {
             workspace_root: Some(workspace.canonical_root_utf8.clone()),
         };
-        let registration = match crate::kernel_tool_registry().get(&invocation.tool_id) {
-            Some(registration) => registration,
+        let execution_adapter = match crate::kernel_tool_registry()
+            .kernel_internal_execution_adapter(&invocation.tool_id)
+        {
+            Some(execution_adapter) => execution_adapter,
             None => return,
         };
-        let raw = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            match registration.admission_v2.execution_adapter {
-                deepcode_kernel_tools::KernelExecutionAdapterV2::DocumentRead => {
+        let tool_id_v2 = match deepcode_kernel_abi::ToolIdV2::parse(&invocation.tool_id) {
+            Ok(tool_id) => tool_id,
+            Err(_) => return,
+        };
+        let admission =
+            match crate::kernel_tool_registry().kernel_internal_admission_metadata(&tool_id_v2) {
+                Some(admission) => admission,
+                None => return,
+            };
+        let raw =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match execution_adapter {
+                deepcode_kernel_tools::kernel_internal::KernelExecutionAdapter::DocumentRead => {
                     invoke_document_read_complete(invocation, context).map(|value| RawExecution {
                         output: value.execution.output,
                         complete_document_text: Some(value.complete_text),
@@ -1604,7 +1747,7 @@ impl AuthorityService {
                         http_content_type: None,
                     })
                 }
-                deepcode_kernel_tools::KernelExecutionAdapterV2::WebFetch => {
+                deepcode_kernel_tools::kernel_internal::KernelExecutionAdapter::WebFetch => {
                     invoke_web_fetch_complete(invocation).map(|value| RawExecution {
                         output: value.execution.output,
                         complete_document_text: None,
@@ -1612,9 +1755,9 @@ impl AuthorityService {
                         http_content_type: Some(value.content_type),
                     })
                 }
-                deepcode_kernel_tools::KernelExecutionAdapterV2::Standard => {
+                deepcode_kernel_tools::kernel_internal::KernelExecutionAdapter::Standard => {
                     let tool_id = invocation.tool_id.clone();
-                    self.inner
+                    executor_runtime
                         .executors
                         .invoke(&tool_id, invocation, context)
                         .map(|value| RawExecution {
@@ -1624,16 +1767,15 @@ impl AuthorityService {
                             http_content_type: None,
                         })
                 }
-            }
-        }))
-        .map_err(|_| ())
-        .and_then(|value| value.map_err(|_| ()));
+            }))
+            .map_err(|_| ())
+            .and_then(|value| value.map_err(|_| ()));
         let resolution = resolve_execution(
             &ready.admitted.invocation,
             &ready.preparation,
             raw,
             &workspace,
-            registration.admission_v2.maximum_output_bytes,
+            admission.maximum_output_bytes,
         );
         let _ = self.finalize_direct_execution(ready, resolution);
     }

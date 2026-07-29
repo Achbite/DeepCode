@@ -1,78 +1,11 @@
 use crate::prelude::*;
 use crate::*;
 
-pub(crate) async fn agent_feedback() -> Json<ApiResponse> {
-    ApiResponse::ok(json!({
-        "accepted": true,
-        "message": "Feedback recorded as Host session metadata."
-    }))
-}
-
-pub(crate) async fn agent_workflow_config_get(State(state): State<AppState>) -> Json<ApiResponse> {
-    let gui = state.gui.lock().expect("gui state lock");
-    ApiResponse::ok(json!({
-        "config": gui.workflow_config,
-        "storePath": gui.paths.workflow_config_path.to_string_lossy(),
-        "initialized": true
-    }))
-}
-
-pub(crate) async fn agent_workflow_config_patch(
-    State(state): State<AppState>,
-    Json(body): Json<Value>,
-) -> Json<ApiResponse> {
-    let config = body.get("config").cloned().unwrap_or_else(|| json!({}));
-    let mut gui = state.gui.lock().expect("gui state lock");
-    merge_object(&mut gui.workflow_config, &config);
-    match atomic_write_json(&gui.paths.workflow_config_path, &gui.workflow_config) {
-        Ok(()) => ApiResponse::ok(json!({
-            "config": gui.workflow_config,
-            "storePath": gui.paths.workflow_config_path.to_string_lossy(),
-            "initialized": true
-        })),
-        Err(error) => ApiResponse::error("write_workflow_config_failed", error),
-    }
-}
-
-pub(crate) async fn agent_tools() -> Json<ApiResponse> {
-    let tool_catalog_snapshot = deepcode_kernel_runtime::kernel_tool_catalog_snapshot();
-    let tools = tool_catalog_snapshot
-        .tools
-        .iter()
-        .map(|tool| {
-            json!({
-                "name": tool.tool_id,
-                "description": format!("Kernel tool {} ({})", tool.tool_id, tool.capability),
-                "inputSchema": &tool.provider_schema,
-                "riskLevel": tool.risk.as_str(),
-                "needsApproval": tool.permission_mode.as_str() != "allow",
-                "allowedModes": ["readOnly", "plan", "askBeforeWrite"],
-                "capability": tool.capability,
-                "family": tool.family,
-                "operationKind": tool.operation_kind,
-                "permissionMode": tool.permission_mode,
-                "pathScopePolicy": tool.path_scope_policy,
-                "executionMode": tool.execution_mode,
-                "readOnly": tool.read_only,
-                "catalogVersion": tool_catalog_snapshot.catalog_version,
-                "catalogHash": &tool_catalog_snapshot.catalog_hash
-            })
-        })
-        .collect::<Vec<_>>();
-    ApiResponse::ok(json!({
-        "tools": tools,
-        "catalogVersion": deepcode_kernel_runtime::TOOL_CATALOG_VERSION,
-        "catalogHash": &tool_catalog_snapshot.catalog_hash,
-        "toolCatalog": tool_catalog_snapshot
-    }))
-}
+pub(crate) const AGENT_SESSION_SCHEMA_V2: &str = "deepcode.agent.session.v2";
+pub(crate) const SESSION_KERNEL_HISTORY_SCHEMA_V2: &str = "deepcode.session.kernel-persistence.v2";
 
 pub(crate) async fn host_skills(State(state): State<AppState>) -> Json<ApiResponse> {
-    match state
-        .host_services
-        .skill_admin
-        .discover(rid("skill-discover"))
-    {
+    match state.host_services.skill_admin.discover() {
         Ok(result) => ApiResponse::ok(json!(result)),
         Err(error) => ApiResponse::error(error.code, error.message),
     }
@@ -82,7 +15,6 @@ pub(crate) fn create_agent_session_value(
     id: &str,
     now: &str,
     title: &str,
-    mode: &str,
     profile_id: Option<&str>,
     workspace_id: Option<&str>,
     workspace_hash: Option<&str>,
@@ -90,11 +22,10 @@ pub(crate) fn create_agent_session_value(
     let workspace_scope_key = scope_key_from_parts(workspace_id, workspace_hash);
     json!({
         "id": id,
-        "kernelAbiVersion": deepcode_kernel_runtime::KERNEL_ABI_VERSION,
-        "agentProtocolVersion": deepcode_kernel_runtime::AGENT_PROTOCOL_VERSION,
-        "toolCatalogVersion": deepcode_kernel_runtime::TOOL_CATALOG_VERSION,
+        "sessionSchemaVersion": AGENT_SESSION_SCHEMA_V2,
+        "historySchema": SESSION_KERNEL_HISTORY_SCHEMA_V2,
+        "kernelAbiVersion": deepcode_kernel_abi::KERNEL_ABI_V2_VERSION,
         "title": title,
-        "mode": mode,
         "profileId": profile_id,
         "workspaceId": workspace_id,
         "workspaceHash": workspace_hash,
@@ -107,22 +38,21 @@ pub(crate) fn create_agent_session_value(
 }
 
 pub(crate) fn session_schema_is_compatible(session: &Value) -> bool {
-    session.get("kernelAbiVersion").and_then(Value::as_str)
-        == Some(deepcode_kernel_runtime::KERNEL_ABI_VERSION)
-        && session.get("agentProtocolVersion").and_then(Value::as_str)
-            == Some(deepcode_kernel_runtime::AGENT_PROTOCOL_VERSION)
-        && session.get("toolCatalogVersion").and_then(Value::as_str)
-            == Some(deepcode_kernel_runtime::TOOL_CATALOG_VERSION)
+    session.get("sessionSchemaVersion").and_then(Value::as_str) == Some(AGENT_SESSION_SCHEMA_V2)
+        && session.get("historySchema").and_then(Value::as_str)
+            == Some(SESSION_KERNEL_HISTORY_SCHEMA_V2)
+        && session.get("kernelAbiVersion").and_then(Value::as_str)
+            == Some(deepcode_kernel_abi::KERNEL_ABI_V2_VERSION)
 }
 
 pub(crate) fn incompatible_session_response() -> Json<ApiResponse> {
     ApiResponse::error(
-        "session_schema_incompatible",
+        "unsupported_history_schema",
         format!(
-            "session schema is incompatible: expected kernelAbiVersion={}, agentProtocolVersion={} and toolCatalogVersion={}",
-            deepcode_kernel_runtime::KERNEL_ABI_VERSION,
-            deepcode_kernel_runtime::AGENT_PROTOCOL_VERSION,
-            deepcode_kernel_runtime::TOOL_CATALOG_VERSION
+            "session history is unsupported: expected sessionSchemaVersion={}, historySchema={} and kernelAbiVersion={}",
+            AGENT_SESSION_SCHEMA_V2,
+            SESSION_KERNEL_HISTORY_SCHEMA_V2,
+            deepcode_kernel_abi::KERNEL_ABI_V2_VERSION
         ),
     )
 }
@@ -135,163 +65,6 @@ pub(crate) fn remove_session_storage_dir(sessions_dir: &FsPath, safe_session_id:
     let path = sessions_dir.join(safe_session_id);
     if path.starts_with(sessions_dir) {
         let _ = fs::remove_dir_all(path);
-    }
-}
-
-pub(crate) fn remove_conversation_archive_dirs(archive_root: &FsPath, safe_session_id: &str) {
-    let Ok(workspaces) = fs::read_dir(archive_root) else {
-        return;
-    };
-    for workspace in workspaces.filter_map(Result::ok) {
-        let session_dir = workspace.path().join(safe_session_id);
-        if session_dir.starts_with(archive_root) {
-            let _ = fs::remove_dir_all(session_dir);
-        }
-    }
-}
-
-pub(crate) fn remove_session_memory_archive(
-    memory_root: &FsPath,
-    workspace_scope_key: &str,
-    safe_session_id: &str,
-    session_id: &str,
-) -> Value {
-    let safe_scope_key = safe_path_segment(workspace_scope_key);
-    let archive_dir = memory_root.join(&safe_scope_key);
-    let sessions_dir = archive_dir.join("sessions");
-    let targets = [
-        sessions_dir.join(format!("{safe_session_id}.md")),
-        sessions_dir.join(format!("{safe_session_id}.memory.json")),
-    ];
-    let mut removed_files = Vec::new();
-    let mut missing_files = Vec::new();
-    let mut errors = Vec::new();
-
-    for target in targets {
-        let display_path = target
-            .strip_prefix(memory_root)
-            .unwrap_or(target.as_path())
-            .to_string_lossy()
-            .to_string();
-        if !target.starts_with(&sessions_dir) {
-            errors.push(json!({
-                "path": display_path,
-                "code": "memory_cleanup_path_out_of_scope"
-            }));
-            continue;
-        }
-        if !target.exists() {
-            missing_files.push(json!(display_path));
-            continue;
-        }
-        match fs::remove_file(&target) {
-            Ok(()) => removed_files.push(json!(display_path)),
-            Err(error) => errors.push(json!({
-                "path": display_path,
-                "code": "memory_cleanup_remove_failed",
-                "message": error.to_string()
-            })),
-        }
-    }
-
-    let project_archive_needs_refresh = !removed_files.is_empty();
-    let manifest = append_session_memory_cleanup_manifest(
-        &archive_dir,
-        session_id,
-        safe_session_id,
-        &removed_files,
-        &missing_files,
-        &errors,
-        project_archive_needs_refresh,
-    );
-
-    json!({
-        "workspaceScopeKey": safe_scope_key,
-        "sessionId": session_id,
-        "safeSessionId": safe_session_id,
-        "removedFiles": removed_files,
-        "missingFiles": missing_files,
-        "errors": errors,
-        "projectArchiveNeedsRefresh": project_archive_needs_refresh,
-        "manifestUpdated": manifest.get("updated").and_then(Value::as_bool).unwrap_or(false),
-        "manifestError": manifest.get("error").cloned().unwrap_or(Value::Null)
-    })
-}
-
-fn append_session_memory_cleanup_manifest(
-    archive_dir: &FsPath,
-    session_id: &str,
-    safe_session_id: &str,
-    removed_files: &[Value],
-    missing_files: &[Value],
-    errors: &[Value],
-    project_archive_needs_refresh: bool,
-) -> Value {
-    if !archive_dir.exists() {
-        return json!({
-            "updated": false,
-            "error": null
-        });
-    }
-    let manifest_path = archive_dir.join("manifest.json");
-    let mut manifest = fs::read_to_string(&manifest_path)
-        .ok()
-        .and_then(|content| serde_json::from_str::<Value>(&content).ok())
-        .unwrap_or_else(|| {
-            json!({
-                "schemaVersion": "deepcode.session.memory-archive-manifest.v1",
-                "archivePath": archive_dir.to_string_lossy()
-            })
-        });
-    if !manifest.is_object() {
-        manifest = json!({
-            "schemaVersion": "deepcode.session.memory-archive-manifest.v1",
-            "archivePath": archive_dir.to_string_lossy()
-        });
-    }
-
-    let cleanup_event = json!({
-        "event": "session_memory_removed",
-        "sessionId": session_id,
-        "safeSessionId": safe_session_id,
-        "removedAt": now_text(),
-        "removedFiles": removed_files,
-        "missingFiles": missing_files,
-        "errors": errors,
-        "projectArchiveNeedsRefresh": project_archive_needs_refresh
-    });
-
-    if let Some(object) = manifest.as_object_mut() {
-        object.insert(
-            "projectArchiveNeedsRefresh".to_string(),
-            json!(project_archive_needs_refresh),
-        );
-        if let Some(array) = object
-            .get_mut("cleanupEvents")
-            .and_then(Value::as_array_mut)
-        {
-            array.push(cleanup_event);
-        } else {
-            object.insert("cleanupEvents".to_string(), json!([cleanup_event]));
-        }
-        object.insert("updatedAt".to_string(), json!(now_text()));
-    }
-
-    match serde_json::to_string_pretty(&manifest) {
-        Ok(content) => match fs::write(&manifest_path, content) {
-            Ok(()) => json!({
-                "updated": true,
-                "error": null
-            }),
-            Err(error) => json!({
-                "updated": false,
-                "error": error.to_string()
-            }),
-        },
-        Err(error) => json!({
-            "updated": false,
-            "error": error.to_string()
-        }),
     }
 }
 
@@ -440,7 +213,7 @@ pub(crate) fn ensure_current_agent_session_for_scope(
     gui: &mut GuiState,
     scope_key: &str,
     fallback_scope: Option<(Option<String>, Option<String>, Option<String>)>,
-) -> Result<(), SessionDomainStoreError> {
+) -> Result<(), String> {
     if let Some(next_id) = gui
         .sessions
         .iter()
@@ -457,45 +230,23 @@ pub(crate) fn ensure_current_agent_session_for_scope(
     let id = format!("session-{}", now_millis());
     let now = now_text();
     let (profile_id, workspace_id, workspace_hash) = fallback_scope.unwrap_or_default();
-    let mut session = create_agent_session_value(
+    let session = create_agent_session_value(
         &id,
         &now,
         "New Agent Session",
-        "plan",
         profile_id.as_deref(),
         workspace_id.as_deref(),
         workspace_hash.as_deref(),
     );
     let new_session_storage_dir = gui.paths.sessions_dir.join(safe_path_segment(&id));
     if new_session_storage_dir.exists() {
-        return Err(SessionDomainStoreError::new(
-            "session_append_recovery_required",
-            "generated replacement Session identity already has private storage",
-        ));
+        return Err(
+            "generated replacement Session identity already has private storage".to_string(),
+        );
     }
-    if let Err(error) = initialize_session_domain_store(&gui.paths.sessions_dir, &id) {
-        remove_session_storage_dir(&gui.paths.sessions_dir, &id);
-        return Err(error);
-    }
-    let domain_state = match session_domain_state(&gui.paths.sessions_dir, &id) {
-        Ok(domain_state) => domain_state,
-        Err(error) => {
-            remove_session_storage_dir(&gui.paths.sessions_dir, &id);
-            return Err(error);
-        }
-    };
-    session["domainState"] = serde_json::to_value(domain_state).map_err(|error| {
-        remove_session_storage_dir(&gui.paths.sessions_dir, &id);
-        SessionDomainStoreError::new(
-            "session_append_recovery_required",
-            format!("failed to serialize replacement Session domain state: {error}"),
-        )
-    })?;
     gui.current_session_id = Some(id.clone());
     gui.current_session_ids_by_scope
         .insert(session_scope_key(&session), id.clone());
-    gui.session_projection_cache.insert(id.clone(), Vec::new());
-    gui.trace_events.insert(id.clone(), Vec::new());
     gui.sessions.insert(0, session);
     Ok(())
 }
@@ -564,14 +315,9 @@ pub(crate) fn refresh_pending_session_titles(gui: &mut GuiState) {
         .collect::<Vec<_>>();
 
     for session_id in pending_ids {
-        let events = gui
-            .session_projection_cache
-            .get(&session_id)
-            .cloned()
-            .unwrap_or_else(|| read_session_projection_jsonl(&sessions_dir, &session_id));
-        if let Some(content) =
-            first_user_message_content(&canonical_session_projection_events(events))
-        {
+        let events = read_session_kernel_v2_public_agent_events(&sessions_dir, &session_id)
+            .unwrap_or_default();
+        if let Some(content) = first_user_message_content(&events) {
             maybe_auto_title_session(gui, &session_id, &content);
         }
     }
@@ -601,71 +347,21 @@ pub(crate) fn session_result(gui: &GuiState, session_id: &str) -> Json<ApiRespon
     if !session_schema_is_compatible(session) {
         return incompatible_session_response();
     }
-    let snapshot = match read_session_domain_snapshot(&gui.paths.sessions_dir, session_id) {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            return ApiResponse::error_with_data(
-                error.code,
-                error.message.clone(),
-                error.api_details(&gui.paths.sessions_dir, session_id),
-            )
-        }
-    };
-    let events = match merge_session_kernel_v2_public_agent_events(
-        &gui.paths.sessions_dir,
-        session_id,
-        canonical_session_projection_events(snapshot.events.clone()),
-    ) {
-        Ok(events) => events,
-        Err(error) => {
-            return ApiResponse::error(
-                error.code,
-                format!(
-                    "Session v2 public projection is unavailable: {}",
-                    error.message
-                ),
-            )
-        }
-    };
-    match snapshot.writeability {
-        SessionDomainWriteability::Current => {
-            let domain_state = match session_domain_state_from_snapshot(session_id, &snapshot) {
-                Ok(domain_state) => domain_state,
-                Err(error) => {
-                    return ApiResponse::error_with_data(
-                        error.code,
-                        error.message.clone(),
-                        error.api_details(&gui.paths.sessions_dir, session_id),
-                    )
-                }
-            };
-            ApiResponse::ok(json!({
-                "session": session,
-                "events": events,
-                "domainState": domain_state,
-                "appendWriteability": {
-                    "schemaVersion": "deepcode.session.append-writeability.v1",
-                    "status": "writable",
-                    "format": "domainBatchV1"
-                }
-            }))
-        }
-        SessionDomainWriteability::LegacyReadOnly | SessionDomainWriteability::Uninitialized => {
-            ApiResponse::ok(json!({
-                "session": session,
-                "events": events,
-                "appendWriteability": {
-                    "schemaVersion": "deepcode.session.append-writeability.v1",
-                    "status": "readOnly",
-                    "format": "legacyRawEventsV1",
-                    "reason": "legacyFormat"
-                }
-            }))
-        }
-        SessionDomainWriteability::Corrupt => ApiResponse::error_with_data(
-            "session_append_recovery_required",
-            "Session domain store failed strict validation",
-            session_append_writeability_value(&gui.paths.sessions_dir, session_id),
-        ),
-    }
+    let events =
+        match read_session_kernel_v2_public_agent_events(&gui.paths.sessions_dir, session_id) {
+            Ok(events) => events,
+            Err(error) => {
+                return ApiResponse::error(
+                    error.code,
+                    format!(
+                        "Session v2 public projection is unavailable: {}",
+                        error.message
+                    ),
+                )
+            }
+        };
+    ApiResponse::ok(json!({
+        "session": session,
+        "events": events
+    }))
 }

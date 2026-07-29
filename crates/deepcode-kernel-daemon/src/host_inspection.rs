@@ -1,10 +1,11 @@
 use deepcode_kernel_abi::{
-    HostBrowseEntry, HostBrowseResult, HostFileReadResult, HostFileTreeNode, HostFileTreeNodeKind,
-    HostGitChange, HostGitDiffResult, HostGitStatusResult, HostGrepResult, HostInspectionOutput,
-    HostInspectionQuery, KernelErrorEnvelope, ResourceSearchContextLine, ResourceSearchMatch,
+    HostBrowseEntry, HostBrowseResult, HostFileClassification, HostFileReadResult,
+    HostFileTreeNode, HostFileTreeNodeKind, HostGitChange, HostGitDiffResult, HostGitStatusResult,
+    HostGrepResult, HostInspectionOutput, HostInspectionQuery, HostSearchContextLine,
+    HostSearchMatch, KernelErrorEnvelope,
 };
 use deepcode_kernel_tools::file_content::{
-    lightweight_file_classification, read_text_file_for_llm,
+    lightweight_file_classification, read_text_file_for_llm, FileContentClassification,
 };
 use regex::Regex;
 use std::cmp::Ordering;
@@ -307,7 +308,9 @@ fn list_nodes(
                 kind: HostFileTreeNodeKind::File,
                 children: None,
                 size_bytes: Some(metadata.len()),
-                file_classification: Some(lightweight_file_classification(&entry_path, &metadata)),
+                file_classification: Some(host_file_classification(
+                    lightweight_file_classification(&entry_path, &metadata),
+                )),
             });
         }
     }
@@ -340,9 +343,22 @@ fn host_read(root: &Path, path: &str) -> Result<HostFileReadResult, KernelErrorE
         end_line,
         content_hash: deepcode_kernel_tools::hash_bytes(content.as_bytes()),
         binary: false,
-        file_classification: read.classification,
+        file_classification: host_file_classification(read.classification),
         content,
     })
+}
+
+fn host_file_classification(classification: FileContentClassification) -> HostFileClassification {
+    HostFileClassification {
+        kind: classification.kind,
+        readable_text: classification.readable_text,
+        binary: classification.binary,
+        executable: classification.executable,
+        size_bytes: classification.size_bytes,
+        extension: classification.extension,
+        magic: classification.magic,
+        reason: classification.reason,
+    }
 }
 
 struct HostGrepRequest {
@@ -452,7 +468,7 @@ struct HostSearchTraversal<'a> {
     skipped_files: usize,
     skipped_binary_files: usize,
     skipped_executable_files: usize,
-    matches: Vec<ResourceSearchMatch>,
+    matches: Vec<HostSearchMatch>,
 }
 
 impl HostSearchTraversal<'_> {
@@ -531,19 +547,19 @@ impl HostSearchTraversal<'_> {
                 }
                 let before_start = line_index.saturating_sub(self.context_lines);
                 let before = (before_start..line_index)
-                    .map(|index| ResourceSearchContextLine {
+                    .map(|index| HostSearchContextLine {
                         line: index + 1,
                         text: lines[index].to_string(),
                     })
                     .collect();
                 let after_end = (line_index + 1 + self.context_lines).min(lines.len());
                 let after = (line_index + 1..after_end)
-                    .map(|index| ResourceSearchContextLine {
+                    .map(|index| HostSearchContextLine {
                         line: index + 1,
                         text: lines[index].to_string(),
                     })
                     .collect();
-                self.matches.push(ResourceSearchMatch {
+                self.matches.push(HostSearchMatch {
                     path: relative.clone(),
                     line: line_index + 1,
                     preview: (*line).to_string(),

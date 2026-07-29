@@ -6,7 +6,7 @@ use crate::host_v2_storage::{
 };
 use crate::kernel_v2_transport::RUN_TRANSPORT_CAPABILITY_HEADER;
 use crate::prelude::*;
-use crate::{trusted_private_storage_origin, AppState};
+use crate::AppState;
 use axum::body::Body;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
@@ -1022,9 +1022,10 @@ fn validate_projection_request(
         Some((&request.projection_id, &request.event.recorded_at)),
     )?;
     reject_transport_capabilities(&request.timeline)?;
-    crate::validate_shared_projection_timeline(&request.timeline).map_err(|message| {
-        HostV2StorageError::invalid("session_kernel_public_timeline_invalid", message)
-    })?;
+    crate::session_public_projection_v2::validate_shared_projection_timeline(&request.timeline)
+        .map_err(|message| {
+            HostV2StorageError::invalid("session_kernel_public_timeline_invalid", message)
+        })?;
     if request.timeline.get("sessionId").and_then(Value::as_str) != Some(session_id) {
         return Err(HostV2StorageError::invalid(
             "session_kernel_public_timeline_identity_mismatch",
@@ -1053,37 +1054,6 @@ pub(crate) fn read_session_kernel_v2_public_agent_events(
     with_storage_path_lock(&guard_path, || {
         read_session_kernel_v2_public_agent_events_unlocked(sessions_dir, session_id)
     })
-}
-
-pub(crate) fn merge_session_kernel_v2_public_agent_events(
-    sessions_dir: &FsPath,
-    session_id: &str,
-    mut base_events: Vec<Value>,
-) -> Result<Vec<Value>, HostV2StorageError> {
-    let mut events_by_id = base_events
-        .iter()
-        .filter_map(|event| {
-            event
-                .get("id")
-                .and_then(Value::as_str)
-                .map(|id| (id.to_string(), event.clone()))
-        })
-        .collect::<HashMap<_, _>>();
-    for event in read_session_kernel_v2_public_agent_events(sessions_dir, session_id)? {
-        let event_id = public_agent_event_id(&event)?.to_string();
-        if let Some(existing) = events_by_id.get(&event_id) {
-            if existing != &event {
-                return Err(HostV2StorageError::conflict(
-                    "session_kernel_public_event_identity_conflict",
-                    "Session AgentEvent sources have conflicting event content",
-                ));
-            }
-            continue;
-        }
-        events_by_id.insert(event_id, event.clone());
-        base_events.push(event);
-    }
-    Ok(base_events)
 }
 
 fn read_session_kernel_v2_public_agent_events_unlocked(
@@ -1167,9 +1137,13 @@ fn read_public_timeline_records(
             ));
         }
         reject_transport_capabilities(&record.timeline)?;
-        crate::validate_shared_projection_timeline(&record.timeline).map_err(|message| {
-            HostV2StorageError::conflict("session_kernel_public_timeline_history_corrupt", message)
-        })?;
+        crate::session_public_projection_v2::validate_shared_projection_timeline(&record.timeline)
+            .map_err(|message| {
+                HostV2StorageError::conflict(
+                    "session_kernel_public_timeline_history_corrupt",
+                    message,
+                )
+            })?;
         if record.timeline.get("sessionId").and_then(Value::as_str) != Some(session_id)
             || timeline_u64(&record.timeline, "revision")? != record.timeline_revision
             || timeline_u64(&record.timeline, "sourceEventVersion")? != record.source_event_version
@@ -1290,6 +1264,27 @@ fn validate_public_agent_event(
             "Session public AgentEvent does not match the Session or has no payload",
         ));
     }
+    if object.get("kind").and_then(Value::as_str) == Some("user_msg") {
+        let attachments = object
+            .get("payload")
+            .and_then(Value::as_object)
+            .and_then(|payload| payload.get("attachments"))
+            .ok_or_else(|| {
+                HostV2StorageError::invalid(
+                    "session_kernel_public_event_attachment_invalid",
+                    "Session v2 user event requires the exact nested attachment DTO",
+                )
+            })?;
+        deepcode_kernel_abi::decode_agent_input_attachments_v2(attachments).map_err(|error| {
+            HostV2StorageError::invalid(
+                "session_kernel_public_event_attachment_invalid",
+                format!(
+                    "Session v2 user event has invalid attachments: {}",
+                    error.code
+                ),
+            )
+        })?;
+    }
     if let Some((projection_id, recorded_at)) = expected {
         let expected_id = format!("kernel-v2:{projection_id}");
         if object.get("id").and_then(Value::as_str) != Some(expected_id.as_str())
@@ -1327,7 +1322,7 @@ pub(crate) async fn session_kernel_v2_store_get(
     Path((session_id, run_id)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Response {
-    if !trusted_private_storage_origin(&headers) {
+    if !crate::session_metadata_v2::trusted_private_storage_origin(&headers) {
         return v2_error_response(
             StatusCode::FORBIDDEN,
             "session_kernel_persistence_origin_forbidden",
@@ -1370,7 +1365,7 @@ pub(crate) async fn session_kernel_v2_store_append(
     headers: HeaderMap,
     body: Result<Json<SessionKernelPersistenceAppendRequestV2>, JsonRejection>,
 ) -> Response {
-    if !trusted_private_storage_origin(&headers) {
+    if !crate::session_metadata_v2::trusted_private_storage_origin(&headers) {
         return v2_error_response(
             StatusCode::FORBIDDEN,
             "session_kernel_persistence_origin_forbidden",
@@ -1414,7 +1409,7 @@ pub(crate) async fn session_kernel_v2_store_record_get(
     Path((session_id, run_id, record_id)): Path<(String, String, String)>,
     headers: HeaderMap,
 ) -> Response {
-    if !trusted_private_storage_origin(&headers) {
+    if !crate::session_metadata_v2::trusted_private_storage_origin(&headers) {
         return v2_error_response(
             StatusCode::FORBIDDEN,
             "session_kernel_persistence_origin_forbidden",
@@ -1449,7 +1444,7 @@ pub(crate) async fn session_kernel_v2_projection_append(
     headers: HeaderMap,
     body: Result<Json<SessionKernelHostProjectionRequestV2>, JsonRejection>,
 ) -> Response {
-    if !trusted_private_storage_origin(&headers) {
+    if !crate::session_metadata_v2::trusted_private_storage_origin(&headers) {
         return v2_error_response(
             StatusCode::FORBIDDEN,
             "session_kernel_projection_origin_forbidden",

@@ -1,7 +1,6 @@
 import React from 'react';
 import { t, type UiLanguage } from '../../i18n';
 import type { ToolEvidenceSummary } from '../../utils/toolEvidence';
-import { formatDurationMs } from '../../utils/toolEvidence';
 
 interface ToolEvidenceDetailsProps {
   evidence: ToolEvidenceSummary;
@@ -46,22 +45,10 @@ const ToolEvidenceDetails: React.FC<ToolEvidenceDetailsProps> = ({
               <pre>{item.preview}</pre>
             </details>
           )}
-          {item.kind === 'command' && (
-            <div className="agent-evidence-item__meta">
-              {typeof item.exitCode === 'number' && (
-                <span>{t(language, 'agent.toolEvidence.exitCode', { code: item.exitCode })}</span>
-              )}
-              {item.cwd && <span>{t(language, 'agent.toolEvidence.cwd', { cwd: item.cwd })}</span>}
-              {formatDurationMs(item.durationMs) && <span>{formatDurationMs(item.durationMs)}</span>}
-              {item.truncated && <span>{t(language, 'common.truncated')}</span>}
-            </div>
-          )}
-          {(item.stdout || item.stderr || item.error) && (
+          {item.error && (
             <details className="agent-evidence-output">
               <summary>{t(language, 'agent.toolEvidence.details.output')}</summary>
-              {item.stdout && <pre>{item.stdout}</pre>}
-              {item.stderr && <pre>{item.stderr}</pre>}
-              {item.error && <pre>{item.error}</pre>}
+              <pre>{item.error}</pre>
             </details>
           )}
         </div>

@@ -1,664 +1,463 @@
-mod builder;
 mod schema;
 
-use self::builder::build_tool_contract;
-use self::schema::provider_schema_for_operation;
-use crate::{
-    canonicalize_invocation, AuthorityToolIdV4, KernelExecutorBinding, KernelToolContract,
-    OperationExecutionMode, ToolFamily, ToolInvocationInputV4, ToolOperationKind,
-    ToolPermissionMode, ToolRiskLevel,
-};
+use self::schema::provider_schema_for_tool;
+use crate::invocation_adapter::canonicalize_invocation;
+use crate::invocation_types::{KernelCanonicalInvocation, KernelToolKind};
 use deepcode_kernel_abi::{
     ToolAvailabilityV2, ToolDescriptorV2, ToolEffectClassV2, ToolEffectScopeV2, ToolIdV2,
     ToolInputSchemaV2, ToolRiskV2,
 };
 use serde_json::Value;
 
-pub type KernelInvocationCanonicalizer = fn(Value) -> Result<ToolInvocationInputV4, String>;
+pub(crate) type KernelInvocationCanonicalizer =
+    fn(Value) -> Result<KernelCanonicalInvocation, String>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KernelExecutionAdapterV2 {
+pub enum KernelExecutorBinding {
+    FsRead,
+    FsList,
+    FsGlob,
+    FsDiff,
+    FsCreate,
+    FsWrite,
+    FsEdit,
+    FsDelete,
+    FsEnsureDirectory,
+    CodeGrep,
+    DocumentRead,
+    WebSearch,
+    WebFetch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KernelExecutionAdapter {
     Standard,
     DocumentRead,
     WebFetch,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct KernelAdmissionMetadataV2 {
+pub struct KernelAdmissionMetadata {
+    pub settings_capability: &'static str,
+    pub needs_workspace: bool,
+    pub requires_plan_action: bool,
     pub default_deadline_ms: u32,
     pub maximum_deadline_ms: u32,
     pub maximum_output_bytes: u32,
     pub cancellation_before_effect_only: bool,
     pub idempotent: bool,
     pub requires_target_revalidation: bool,
-    pub execution_adapter: KernelExecutionAdapterV2,
+    pub execution_adapter: KernelExecutionAdapter,
 }
 
 #[derive(Debug, Clone)]
-pub struct KernelToolRegistration {
-    pub contract: KernelToolContract,
-    pub descriptor_v2: ToolDescriptorV2,
-    pub executor_binding: Option<KernelExecutorBinding>,
-    pub canonicalize_invocation: KernelInvocationCanonicalizer,
-    pub admission_v2: KernelAdmissionMetadataV2,
-    private_tool_kind: AuthorityToolIdV4,
-}
-
-#[derive(Clone, Copy)]
-struct RegistrationIdentity {
+pub(crate) struct KernelToolRegistration {
+    pub(crate) descriptor_v2: ToolDescriptorV2,
+    pub(crate) executor_binding: Option<KernelExecutorBinding>,
+    pub(crate) canonicalize_invocation: KernelInvocationCanonicalizer,
+    pub(crate) admission_v2: KernelAdmissionMetadata,
     tool_id: &'static str,
-    operation_kind: ToolOperationKind,
-    family: ToolFamily,
-}
-
-#[derive(Clone, Copy)]
-struct RegistrationPermission {
-    capability: &'static str,
-    risk: ToolRiskLevel,
-    mode: ToolPermissionMode,
-}
-
-#[derive(Clone, Copy)]
-struct RegistrationExecution {
-    executor_ref: &'static str,
-    executor_binding: Option<KernelExecutorBinding>,
-    mode: OperationExecutionMode,
-}
-
-#[derive(Clone, Copy)]
-struct RegistrationResources {
-    needs_workspace: bool,
-    read_only: bool,
-}
-
-const fn identity(
-    tool_id: &'static str,
-    operation_kind: ToolOperationKind,
-    family: ToolFamily,
-) -> RegistrationIdentity {
-    RegistrationIdentity {
-        tool_id,
-        operation_kind,
-        family,
-    }
-}
-
-const fn permission(
-    capability: &'static str,
-    risk: ToolRiskLevel,
-    mode: ToolPermissionMode,
-) -> RegistrationPermission {
-    RegistrationPermission {
-        capability,
-        risk,
-        mode,
-    }
-}
-
-const fn execution(
-    executor_ref: &'static str,
-    executor_binding: Option<KernelExecutorBinding>,
-    mode: OperationExecutionMode,
-) -> RegistrationExecution {
-    RegistrationExecution {
-        executor_ref,
-        executor_binding,
-        mode,
-    }
-}
-
-const fn resources(needs_workspace: bool, read_only: bool) -> RegistrationResources {
-    RegistrationResources {
-        needs_workspace,
-        read_only,
-    }
+    private_tool_kind: KernelToolKind,
 }
 
 impl KernelToolRegistration {
-    pub fn tool_id(&self) -> &'static str {
-        self.contract.tool_id
+    pub(crate) fn tool_id(&self) -> &'static str {
+        self.tool_id
     }
 
-    pub fn capability(&self) -> &'static str {
-        self.contract.permission.capability
-    }
-
-    pub fn operation_kind(&self) -> ToolOperationKind {
-        self.contract.operation_kind
-    }
-
-    pub fn risk(&self) -> ToolRiskLevel {
-        self.contract.permission.risk
-    }
-
-    pub fn permission_mode(&self) -> ToolPermissionMode {
-        self.contract.permission.mode
-    }
-
-    pub fn execution_mode(&self) -> OperationExecutionMode {
-        self.contract.execution.execution_mode
-    }
-
-    pub fn needs_workspace(&self) -> bool {
-        self.contract.resource.needs_workspace
-    }
-
-    pub fn read_only(&self) -> bool {
-        self.contract.resource.read_only
-    }
-
-    pub fn private_tool_kind(&self) -> AuthorityToolIdV4 {
+    pub(crate) fn private_tool_kind(&self) -> KernelToolKind {
         self.private_tool_kind
     }
 }
 
+#[derive(Clone, Copy)]
+struct ToolSpec {
+    tool: KernelToolKind,
+    availability: ToolAvailabilityV2,
+    executor_binding: Option<KernelExecutorBinding>,
+    settings_capability: &'static str,
+    needs_workspace: bool,
+    effect_class: ToolEffectClassV2,
+    effect_scope: ToolEffectScopeV2,
+    risk: ToolRiskV2,
+}
+
+const fn ready(
+    tool: KernelToolKind,
+    executor_binding: KernelExecutorBinding,
+    settings_capability: &'static str,
+    needs_workspace: bool,
+    effect_class: ToolEffectClassV2,
+    effect_scope: ToolEffectScopeV2,
+    risk: ToolRiskV2,
+) -> ToolSpec {
+    ToolSpec {
+        tool,
+        availability: ToolAvailabilityV2::Ready,
+        executor_binding: Some(executor_binding),
+        settings_capability,
+        needs_workspace,
+        effect_class,
+        effect_scope,
+        risk,
+    }
+}
+
+const fn disabled(
+    tool: KernelToolKind,
+    settings_capability: &'static str,
+    needs_workspace: bool,
+    effect_class: ToolEffectClassV2,
+    effect_scope: ToolEffectScopeV2,
+    risk: ToolRiskV2,
+) -> ToolSpec {
+    ToolSpec {
+        tool,
+        availability: ToolAvailabilityV2::Disabled,
+        executor_binding: None,
+        settings_capability,
+        needs_workspace,
+        effect_class,
+        effect_scope,
+        risk,
+    }
+}
+
 pub(crate) fn builtin_tool_registrations() -> Vec<KernelToolRegistration> {
-    vec![
-        workspace_tool(
-            identity("fs.read", ToolOperationKind::FsRead, ToolFamily::Workspace),
-            permission(
-                "workspace.read",
-                ToolRiskLevel::Low,
-                ToolPermissionMode::Allow,
-            ),
-            resources(true, true),
-            KernelExecutorBinding::FsRead,
+    use KernelExecutorBinding as Executor;
+    use KernelToolKind as Tool;
+    use ToolEffectClassV2::{Mutation, Read};
+    use ToolEffectScopeV2::{
+        NetworkRead, RepositoryHistoryWrite, RepositoryIndexWrite, RepositoryRead, WorkspaceRead,
+        WorkspaceWrite,
+    };
+    use ToolRiskV2::{High, Low, Medium};
+
+    [
+        ready(
+            Tool::FsRead,
+            Executor::FsRead,
+            "workspace.read",
+            true,
+            Read,
+            WorkspaceRead,
+            Low,
         ),
-        workspace_tool(
-            identity("fs.list", ToolOperationKind::FsList, ToolFamily::Workspace),
-            permission(
-                "workspace.read",
-                ToolRiskLevel::Low,
-                ToolPermissionMode::Allow,
-            ),
-            resources(true, true),
-            KernelExecutorBinding::FsList,
+        ready(
+            Tool::FsList,
+            Executor::FsList,
+            "workspace.read",
+            true,
+            Read,
+            WorkspaceRead,
+            Low,
         ),
-        workspace_tool(
-            identity("fs.glob", ToolOperationKind::FsGlob, ToolFamily::Workspace),
-            permission(
-                "workspace.read",
-                ToolRiskLevel::Low,
-                ToolPermissionMode::Allow,
-            ),
-            resources(true, true),
-            KernelExecutorBinding::FsGlob,
+        ready(
+            Tool::FsGlob,
+            Executor::FsGlob,
+            "workspace.read",
+            true,
+            Read,
+            WorkspaceRead,
+            Low,
         ),
-        workspace_tool(
-            identity("fs.diff", ToolOperationKind::FsDiff, ToolFamily::Workspace),
-            permission(
-                "workspace.read",
-                ToolRiskLevel::Low,
-                ToolPermissionMode::Allow,
-            ),
-            resources(true, true),
-            KernelExecutorBinding::FsDiff,
+        ready(
+            Tool::FsDiff,
+            Executor::FsDiff,
+            "workspace.read",
+            true,
+            Read,
+            WorkspaceRead,
+            Low,
         ),
-        workspace_tool(
-            identity(
-                "code.grep",
-                ToolOperationKind::CodeGrep,
-                ToolFamily::Workspace,
-            ),
-            permission(
-                "workspace.read",
-                ToolRiskLevel::Low,
-                ToolPermissionMode::Allow,
-            ),
-            resources(true, true),
-            KernelExecutorBinding::CodeGrep,
+        ready(
+            Tool::CodeGrep,
+            Executor::CodeGrep,
+            "workspace.read",
+            true,
+            Read,
+            WorkspaceRead,
+            Low,
         ),
-        workspace_tool(
-            identity(
-                "fs.create",
-                ToolOperationKind::FsCreate,
-                ToolFamily::Workspace,
-            ),
-            permission(
-                "workspace.write",
-                ToolRiskLevel::Medium,
-                ToolPermissionMode::Ask,
-            ),
-            resources(true, false),
-            KernelExecutorBinding::FsCreate,
+        ready(
+            Tool::FsCreate,
+            Executor::FsCreate,
+            "workspace.write",
+            true,
+            Mutation,
+            WorkspaceWrite,
+            Medium,
         ),
-        workspace_tool(
-            identity(
-                "fs.write",
-                ToolOperationKind::FsWrite,
-                ToolFamily::Workspace,
-            ),
-            permission(
-                "workspace.write",
-                ToolRiskLevel::Medium,
-                ToolPermissionMode::Ask,
-            ),
-            resources(true, false),
-            KernelExecutorBinding::FsWrite,
+        ready(
+            Tool::FsWrite,
+            Executor::FsWrite,
+            "workspace.write",
+            true,
+            Mutation,
+            WorkspaceWrite,
+            Medium,
         ),
-        workspace_tool(
-            identity("fs.edit", ToolOperationKind::FsEdit, ToolFamily::Workspace),
-            permission(
-                "workspace.write",
-                ToolRiskLevel::Medium,
-                ToolPermissionMode::Ask,
-            ),
-            resources(true, false),
-            KernelExecutorBinding::FsEdit,
+        ready(
+            Tool::FsEdit,
+            Executor::FsEdit,
+            "workspace.write",
+            true,
+            Mutation,
+            WorkspaceWrite,
+            Medium,
         ),
-        registered_tool(
-            identity(
-                "fs.rename",
-                ToolOperationKind::FsRename,
-                ToolFamily::Workspace,
-            ),
-            permission(
-                "workspace.write",
-                ToolRiskLevel::High,
-                ToolPermissionMode::Ask,
-            ),
-            execution(
-                "kernel.disabled.fs.rename",
-                None,
-                OperationExecutionMode::Blocked,
-            ),
-            resources(true, false),
+        disabled(
+            Tool::FsRename,
+            "workspace.write",
+            true,
+            Mutation,
+            WorkspaceWrite,
+            High,
         ),
-        workspace_tool(
-            identity(
-                "fs.delete",
-                ToolOperationKind::FsDelete,
-                ToolFamily::Workspace,
-            ),
-            permission(
-                "workspace.write",
-                ToolRiskLevel::High,
-                ToolPermissionMode::Ask,
-            ),
-            resources(true, false),
-            KernelExecutorBinding::FsDelete,
+        ready(
+            Tool::FsDelete,
+            Executor::FsDelete,
+            "workspace.write",
+            true,
+            Mutation,
+            WorkspaceWrite,
+            High,
         ),
-        workspace_tool(
-            identity(
-                "fs.ensure_directory",
-                ToolOperationKind::FsEnsureDirectory,
-                ToolFamily::Workspace,
-            ),
-            permission(
-                "workspace.write",
-                ToolRiskLevel::Medium,
-                ToolPermissionMode::Ask,
-            ),
-            resources(true, false),
-            KernelExecutorBinding::FsEnsureDirectory,
+        ready(
+            Tool::FsEnsureDirectory,
+            Executor::FsEnsureDirectory,
+            "workspace.write",
+            true,
+            Mutation,
+            WorkspaceWrite,
+            Medium,
         ),
-        registered_tool(
-            identity(
-                "document.read",
-                ToolOperationKind::DocumentRead,
-                ToolFamily::Document,
-            ),
-            permission(
-                "workspace.read",
-                ToolRiskLevel::Low,
-                ToolPermissionMode::Allow,
-            ),
-            execution(
-                "kernel.document.read",
-                Some(KernelExecutorBinding::DocumentRead),
-                OperationExecutionMode::Execute,
-            ),
-            resources(true, true),
+        ready(
+            Tool::DocumentRead,
+            Executor::DocumentRead,
+            "workspace.read",
+            true,
+            Read,
+            WorkspaceRead,
+            Low,
         ),
-        registered_tool(
-            identity("git.status", ToolOperationKind::GitStatus, ToolFamily::Git),
-            permission("git.read", ToolRiskLevel::Low, ToolPermissionMode::Allow),
-            execution(
-                "kernel.disabled.git.status",
-                None,
-                OperationExecutionMode::Blocked,
-            ),
-            resources(true, true),
+        disabled(Tool::GitStatus, "git.read", true, Read, RepositoryRead, Low),
+        disabled(Tool::GitDiff, "git.read", true, Read, RepositoryRead, Low),
+        disabled(
+            Tool::GitStage,
+            "git.write",
+            true,
+            Mutation,
+            RepositoryIndexWrite,
+            High,
         ),
-        registered_tool(
-            identity("git.diff", ToolOperationKind::GitDiff, ToolFamily::Git),
-            permission("git.read", ToolRiskLevel::Low, ToolPermissionMode::Allow),
-            execution(
-                "kernel.disabled.git.diff",
-                None,
-                OperationExecutionMode::Blocked,
-            ),
-            resources(true, true),
+        disabled(
+            Tool::GitUnstage,
+            "git.write",
+            true,
+            Mutation,
+            RepositoryIndexWrite,
+            High,
         ),
-        registered_tool(
-            identity("git.stage", ToolOperationKind::GitStage, ToolFamily::Git),
-            permission("git.write", ToolRiskLevel::High, ToolPermissionMode::Ask),
-            execution(
-                "kernel.disabled.git.stage",
-                None,
-                OperationExecutionMode::Blocked,
-            ),
-            resources(true, false),
+        disabled(
+            Tool::GitCommit,
+            "git.write",
+            true,
+            Mutation,
+            RepositoryHistoryWrite,
+            High,
         ),
-        registered_tool(
-            identity(
-                "git.unstage",
-                ToolOperationKind::GitUnstage,
-                ToolFamily::Git,
-            ),
-            permission("git.write", ToolRiskLevel::High, ToolPermissionMode::Ask),
-            execution(
-                "kernel.disabled.git.unstage",
-                None,
-                OperationExecutionMode::Blocked,
-            ),
-            resources(true, false),
+        ready(
+            Tool::WebSearch,
+            Executor::WebSearch,
+            "network.egress",
+            false,
+            Read,
+            NetworkRead,
+            High,
         ),
-        registered_tool(
-            identity("git.commit", ToolOperationKind::GitCommit, ToolFamily::Git),
-            permission("git.write", ToolRiskLevel::High, ToolPermissionMode::Ask),
-            execution(
-                "kernel.disabled.git.commit",
-                None,
-                OperationExecutionMode::Blocked,
-            ),
-            resources(true, false),
-        ),
-        registered_tool(
-            identity(
-                "web.search",
-                ToolOperationKind::WebSearch,
-                ToolFamily::Network,
-            ),
-            permission(
-                "network.egress",
-                ToolRiskLevel::High,
-                ToolPermissionMode::Ask,
-            ),
-            execution(
-                "kernel.http.web.search",
-                Some(KernelExecutorBinding::WebSearch),
-                OperationExecutionMode::Execute,
-            ),
-            resources(false, true),
-        ),
-        registered_tool(
-            identity(
-                "web.fetch",
-                ToolOperationKind::WebFetch,
-                ToolFamily::Network,
-            ),
-            permission(
-                "network.egress",
-                ToolRiskLevel::High,
-                ToolPermissionMode::Ask,
-            ),
-            execution(
-                "kernel.http.web.fetch",
-                Some(KernelExecutorBinding::WebFetch),
-                OperationExecutionMode::Execute,
-            ),
-            resources(false, true),
+        ready(
+            Tool::WebFetch,
+            Executor::WebFetch,
+            "network.egress",
+            false,
+            Read,
+            NetworkRead,
+            High,
         ),
     ]
+    .into_iter()
+    .map(register_tool)
+    .collect()
 }
 
-fn workspace_tool(
-    identity: RegistrationIdentity,
-    permission: RegistrationPermission,
-    resources: RegistrationResources,
-    executor_binding: KernelExecutorBinding,
-) -> KernelToolRegistration {
-    registered_tool(
-        identity,
-        permission,
-        execution(
-            "kernel.builtin.workspace",
-            Some(executor_binding),
-            OperationExecutionMode::Execute,
-        ),
-        resources,
+fn register_tool(spec: ToolSpec) -> KernelToolRegistration {
+    let tool_id = spec.tool.as_str();
+    let descriptor_v2 = ToolDescriptorV2::materialize(
+        ToolIdV2::parse(tool_id)
+            .unwrap_or_else(|error| panic!("invalid built-in tool id `{tool_id}`: {error}")),
+        tool_description_v2(spec.tool).to_owned(),
+        ToolInputSchemaV2::new(provider_schema_for_tool(spec.tool))
+            .unwrap_or_else(|error| panic!("invalid schema for `{tool_id}`: {error}")),
+        tool_prompt_v2(spec.tool).to_owned(),
+        spec.availability,
+        spec.effect_class,
+        spec.effect_scope,
+        spec.risk,
     )
-}
-
-fn registered_tool(
-    identity: RegistrationIdentity,
-    permission: RegistrationPermission,
-    execution: RegistrationExecution,
-    resources: RegistrationResources,
-) -> KernelToolRegistration {
-    let executor_binding = execution.executor_binding;
-    let contract = build_tool_contract(identity, permission, execution, resources);
-    let descriptor_v2 = descriptor_v2(&contract, executor_binding.is_some())
-        .unwrap_or_else(|error| panic!("invalid built-in tool `{}`: {error}", identity.tool_id));
+    .unwrap_or_else(|error| panic!("invalid built-in tool `{tool_id}`: {error}"));
     KernelToolRegistration {
-        contract,
         descriptor_v2,
-        executor_binding,
-        canonicalize_invocation: canonicalizer_for(identity.operation_kind),
-        admission_v2: admission_metadata_v2(identity.operation_kind, resources.read_only),
-        private_tool_kind: private_tool_kind_for(identity.operation_kind),
+        executor_binding: spec.executor_binding,
+        canonicalize_invocation: canonicalizer_for(spec.tool),
+        admission_v2: kernel_internal_admission_metadata(spec),
+        tool_id,
+        private_tool_kind: spec.tool,
     }
 }
 
 macro_rules! invocation_canonicalizer {
     ($name:ident, $tool:expr) => {
-        fn $name(arguments: Value) -> Result<ToolInvocationInputV4, String> {
+        fn $name(arguments: Value) -> Result<KernelCanonicalInvocation, String> {
             canonicalize_invocation($tool, arguments).map_err(|error| error.to_string())
         }
     };
 }
 
-invocation_canonicalizer!(canonicalize_fs_read, AuthorityToolIdV4::FsRead);
-invocation_canonicalizer!(canonicalize_fs_list, AuthorityToolIdV4::FsList);
-invocation_canonicalizer!(canonicalize_fs_glob, AuthorityToolIdV4::FsGlob);
-invocation_canonicalizer!(canonicalize_fs_diff, AuthorityToolIdV4::FsDiff);
-invocation_canonicalizer!(canonicalize_code_grep, AuthorityToolIdV4::CodeGrep);
-invocation_canonicalizer!(canonicalize_fs_create, AuthorityToolIdV4::FsCreate);
-invocation_canonicalizer!(canonicalize_fs_write, AuthorityToolIdV4::FsWrite);
-invocation_canonicalizer!(canonicalize_fs_edit, AuthorityToolIdV4::FsEdit);
-invocation_canonicalizer!(canonicalize_fs_rename, AuthorityToolIdV4::FsRename);
-invocation_canonicalizer!(canonicalize_fs_delete, AuthorityToolIdV4::FsDelete);
+invocation_canonicalizer!(canonicalize_fs_read, KernelToolKind::FsRead);
+invocation_canonicalizer!(canonicalize_fs_list, KernelToolKind::FsList);
+invocation_canonicalizer!(canonicalize_fs_glob, KernelToolKind::FsGlob);
+invocation_canonicalizer!(canonicalize_fs_diff, KernelToolKind::FsDiff);
+invocation_canonicalizer!(canonicalize_code_grep, KernelToolKind::CodeGrep);
+invocation_canonicalizer!(canonicalize_fs_create, KernelToolKind::FsCreate);
+invocation_canonicalizer!(canonicalize_fs_write, KernelToolKind::FsWrite);
+invocation_canonicalizer!(canonicalize_fs_edit, KernelToolKind::FsEdit);
+invocation_canonicalizer!(canonicalize_fs_rename, KernelToolKind::FsRename);
+invocation_canonicalizer!(canonicalize_fs_delete, KernelToolKind::FsDelete);
 invocation_canonicalizer!(
     canonicalize_fs_ensure_directory,
-    AuthorityToolIdV4::FsEnsureDirectory
+    KernelToolKind::FsEnsureDirectory
 );
-invocation_canonicalizer!(canonicalize_document_read, AuthorityToolIdV4::DocumentRead);
-invocation_canonicalizer!(canonicalize_git_status, AuthorityToolIdV4::GitStatus);
-invocation_canonicalizer!(canonicalize_git_diff, AuthorityToolIdV4::GitDiff);
-invocation_canonicalizer!(canonicalize_git_stage, AuthorityToolIdV4::GitStage);
-invocation_canonicalizer!(canonicalize_git_unstage, AuthorityToolIdV4::GitUnstage);
-invocation_canonicalizer!(canonicalize_git_commit, AuthorityToolIdV4::GitCommit);
-invocation_canonicalizer!(canonicalize_web_search, AuthorityToolIdV4::WebSearch);
-invocation_canonicalizer!(canonicalize_web_fetch, AuthorityToolIdV4::WebFetch);
+invocation_canonicalizer!(canonicalize_document_read, KernelToolKind::DocumentRead);
+invocation_canonicalizer!(canonicalize_git_status, KernelToolKind::GitStatus);
+invocation_canonicalizer!(canonicalize_git_diff, KernelToolKind::GitDiff);
+invocation_canonicalizer!(canonicalize_git_stage, KernelToolKind::GitStage);
+invocation_canonicalizer!(canonicalize_git_unstage, KernelToolKind::GitUnstage);
+invocation_canonicalizer!(canonicalize_git_commit, KernelToolKind::GitCommit);
+invocation_canonicalizer!(canonicalize_web_search, KernelToolKind::WebSearch);
+invocation_canonicalizer!(canonicalize_web_fetch, KernelToolKind::WebFetch);
 
-fn canonicalizer_for(operation_kind: ToolOperationKind) -> KernelInvocationCanonicalizer {
-    match operation_kind {
-        ToolOperationKind::FsRead => canonicalize_fs_read,
-        ToolOperationKind::FsList => canonicalize_fs_list,
-        ToolOperationKind::FsGlob => canonicalize_fs_glob,
-        ToolOperationKind::FsDiff => canonicalize_fs_diff,
-        ToolOperationKind::CodeGrep => canonicalize_code_grep,
-        ToolOperationKind::FsCreate => canonicalize_fs_create,
-        ToolOperationKind::FsWrite => canonicalize_fs_write,
-        ToolOperationKind::FsEdit => canonicalize_fs_edit,
-        ToolOperationKind::FsRename => canonicalize_fs_rename,
-        ToolOperationKind::FsDelete => canonicalize_fs_delete,
-        ToolOperationKind::FsEnsureDirectory => canonicalize_fs_ensure_directory,
-        ToolOperationKind::DocumentRead => canonicalize_document_read,
-        ToolOperationKind::GitStatus => canonicalize_git_status,
-        ToolOperationKind::GitDiff => canonicalize_git_diff,
-        ToolOperationKind::GitStage => canonicalize_git_stage,
-        ToolOperationKind::GitUnstage => canonicalize_git_unstage,
-        ToolOperationKind::GitCommit => canonicalize_git_commit,
-        ToolOperationKind::WebSearch => canonicalize_web_search,
-        ToolOperationKind::WebFetch => canonicalize_web_fetch,
-        ToolOperationKind::GitPush
-        | ToolOperationKind::ProcessExec
-        | ToolOperationKind::BrowserOpen
-        | ToolOperationKind::BrowserReload
-        | ToolOperationKind::BrowserSnapshot
-        | ToolOperationKind::BrowserInspect
-        | ToolOperationKind::BrowserClick
-        | ToolOperationKind::BrowserType
-        | ToolOperationKind::BrowserScroll
-        | ToolOperationKind::ProviderCall => {
-            unreachable!("non-registered operation kind has no v2 canonicalizer")
-        }
+fn canonicalizer_for(tool: KernelToolKind) -> KernelInvocationCanonicalizer {
+    match tool {
+        KernelToolKind::FsRead => canonicalize_fs_read,
+        KernelToolKind::FsList => canonicalize_fs_list,
+        KernelToolKind::FsGlob => canonicalize_fs_glob,
+        KernelToolKind::FsDiff => canonicalize_fs_diff,
+        KernelToolKind::CodeGrep => canonicalize_code_grep,
+        KernelToolKind::FsCreate => canonicalize_fs_create,
+        KernelToolKind::FsWrite => canonicalize_fs_write,
+        KernelToolKind::FsEdit => canonicalize_fs_edit,
+        KernelToolKind::FsRename => canonicalize_fs_rename,
+        KernelToolKind::FsDelete => canonicalize_fs_delete,
+        KernelToolKind::FsEnsureDirectory => canonicalize_fs_ensure_directory,
+        KernelToolKind::DocumentRead => canonicalize_document_read,
+        KernelToolKind::GitStatus => canonicalize_git_status,
+        KernelToolKind::GitDiff => canonicalize_git_diff,
+        KernelToolKind::GitStage => canonicalize_git_stage,
+        KernelToolKind::GitUnstage => canonicalize_git_unstage,
+        KernelToolKind::GitCommit => canonicalize_git_commit,
+        KernelToolKind::WebSearch => canonicalize_web_search,
+        KernelToolKind::WebFetch => canonicalize_web_fetch,
     }
 }
 
-fn private_tool_kind_for(operation_kind: ToolOperationKind) -> AuthorityToolIdV4 {
-    match operation_kind {
-        ToolOperationKind::FsRead => AuthorityToolIdV4::FsRead,
-        ToolOperationKind::FsList => AuthorityToolIdV4::FsList,
-        ToolOperationKind::FsGlob => AuthorityToolIdV4::FsGlob,
-        ToolOperationKind::FsDiff => AuthorityToolIdV4::FsDiff,
-        ToolOperationKind::CodeGrep => AuthorityToolIdV4::CodeGrep,
-        ToolOperationKind::FsCreate => AuthorityToolIdV4::FsCreate,
-        ToolOperationKind::FsWrite => AuthorityToolIdV4::FsWrite,
-        ToolOperationKind::FsEdit => AuthorityToolIdV4::FsEdit,
-        ToolOperationKind::FsRename => AuthorityToolIdV4::FsRename,
-        ToolOperationKind::FsDelete => AuthorityToolIdV4::FsDelete,
-        ToolOperationKind::FsEnsureDirectory => AuthorityToolIdV4::FsEnsureDirectory,
-        ToolOperationKind::DocumentRead => AuthorityToolIdV4::DocumentRead,
-        ToolOperationKind::GitStatus => AuthorityToolIdV4::GitStatus,
-        ToolOperationKind::GitDiff => AuthorityToolIdV4::GitDiff,
-        ToolOperationKind::GitStage => AuthorityToolIdV4::GitStage,
-        ToolOperationKind::GitUnstage => AuthorityToolIdV4::GitUnstage,
-        ToolOperationKind::GitCommit => AuthorityToolIdV4::GitCommit,
-        ToolOperationKind::WebSearch => AuthorityToolIdV4::WebSearch,
-        ToolOperationKind::WebFetch => AuthorityToolIdV4::WebFetch,
-        ToolOperationKind::GitPush
-        | ToolOperationKind::ProcessExec
-        | ToolOperationKind::BrowserOpen
-        | ToolOperationKind::BrowserReload
-        | ToolOperationKind::BrowserSnapshot
-        | ToolOperationKind::BrowserInspect
-        | ToolOperationKind::BrowserClick
-        | ToolOperationKind::BrowserType
-        | ToolOperationKind::BrowserScroll
-        | ToolOperationKind::ProviderCall => {
-            unreachable!("non-registered operation kind has no private invocation kind")
-        }
-    }
-}
-
-fn admission_metadata_v2(
-    operation_kind: ToolOperationKind,
-    read_only: bool,
-) -> KernelAdmissionMetadataV2 {
-    let (default_deadline_ms, maximum_deadline_ms, maximum_output_bytes) = match operation_kind {
-        ToolOperationKind::GitStatus
-        | ToolOperationKind::GitDiff
-        | ToolOperationKind::GitStage
-        | ToolOperationKind::GitUnstage
-        | ToolOperationKind::GitCommit => (30_000, 120_000, 65_536),
-        ToolOperationKind::WebSearch | ToolOperationKind::WebFetch => (15_000, 60_000, 262_144),
+fn kernel_internal_admission_metadata(spec: ToolSpec) -> KernelAdmissionMetadata {
+    let (default_deadline_ms, maximum_deadline_ms, maximum_output_bytes) = match spec.tool {
+        KernelToolKind::GitStatus
+        | KernelToolKind::GitDiff
+        | KernelToolKind::GitStage
+        | KernelToolKind::GitUnstage
+        | KernelToolKind::GitCommit => (30_000, 120_000, 65_536),
+        KernelToolKind::WebSearch | KernelToolKind::WebFetch => (15_000, 60_000, 262_144),
         _ => (10_000, 30_000, 4_194_304),
     };
-    let execution_adapter = match operation_kind {
-        ToolOperationKind::DocumentRead => KernelExecutionAdapterV2::DocumentRead,
-        ToolOperationKind::WebFetch => KernelExecutionAdapterV2::WebFetch,
-        _ => KernelExecutionAdapterV2::Standard,
+    let execution_adapter = match spec.tool {
+        KernelToolKind::DocumentRead => KernelExecutionAdapter::DocumentRead,
+        KernelToolKind::WebFetch => KernelExecutionAdapter::WebFetch,
+        _ => KernelExecutionAdapter::Standard,
     };
-    KernelAdmissionMetadataV2 {
+    KernelAdmissionMetadata {
+        settings_capability: spec.settings_capability,
+        needs_workspace: spec.needs_workspace,
+        requires_plan_action: spec.effect_class == ToolEffectClassV2::Mutation
+            || spec.effect_scope == ToolEffectScopeV2::NetworkRead,
         default_deadline_ms,
         maximum_deadline_ms,
         maximum_output_bytes,
         cancellation_before_effect_only: true,
-        idempotent: read_only,
+        idempotent: spec.effect_class == ToolEffectClassV2::Read,
         requires_target_revalidation: true,
         execution_adapter,
     }
 }
 
-fn descriptor_v2(
-    contract: &KernelToolContract,
-    has_executor: bool,
-) -> Result<ToolDescriptorV2, deepcode_kernel_abi::v2::V2ValidationError> {
-    ToolDescriptorV2::materialize(
-        ToolIdV2::parse(contract.tool_id)?,
-        tool_description_v2(contract.tool_id).to_owned(),
-        ToolInputSchemaV2::new(contract.input.schema.clone())?,
-        tool_prompt_v2(contract.tool_id).to_owned(),
-        if contract.execution.execution_mode == OperationExecutionMode::Execute && has_executor {
-            ToolAvailabilityV2::Ready
-        } else {
-            ToolAvailabilityV2::Disabled
-        },
-        if contract.resource.read_only {
-            ToolEffectClassV2::Read
-        } else {
-            ToolEffectClassV2::Mutation
-        },
-        effect_scope_v2(contract.operation_kind),
-        match contract.permission.risk {
-            ToolRiskLevel::Low => ToolRiskV2::Low,
-            ToolRiskLevel::Medium => ToolRiskV2::Medium,
-            ToolRiskLevel::High => ToolRiskV2::High,
-            ToolRiskLevel::Critical => ToolRiskV2::Critical,
-        },
-    )
-}
-
-fn effect_scope_v2(operation_kind: ToolOperationKind) -> ToolEffectScopeV2 {
-    match operation_kind {
-        ToolOperationKind::GitStatus | ToolOperationKind::GitDiff => {
-            ToolEffectScopeV2::RepositoryRead
+fn tool_description_v2(tool: KernelToolKind) -> &'static str {
+    match tool {
+        KernelToolKind::CodeGrep => {
+            "Search workspace text with a bounded literal or regular expression query."
         }
-        ToolOperationKind::GitStage | ToolOperationKind::GitUnstage => {
-            ToolEffectScopeV2::RepositoryIndexWrite
+        KernelToolKind::DocumentRead => "Read bounded text from a supported workspace document.",
+        KernelToolKind::FsCreate => {
+            "Create a new workspace file without overwriting an existing target."
         }
-        ToolOperationKind::GitCommit | ToolOperationKind::GitPush => {
-            ToolEffectScopeV2::RepositoryHistoryWrite
+        KernelToolKind::FsDelete => {
+            "Delete one explicitly scoped workspace file or directory tree."
         }
-        ToolOperationKind::WebSearch | ToolOperationKind::WebFetch => {
-            ToolEffectScopeV2::NetworkRead
+        KernelToolKind::FsDiff => {
+            "Preview the textual difference for proposed workspace file content."
         }
-        _ if operation_kind.is_workspace_mutation() => ToolEffectScopeV2::WorkspaceWrite,
-        _ => ToolEffectScopeV2::WorkspaceRead,
+        KernelToolKind::FsEdit => "Apply a preconditioned edit to an existing workspace file.",
+        KernelToolKind::FsEnsureDirectory => {
+            "Ensure that an explicitly scoped workspace directory exists."
+        }
+        KernelToolKind::FsGlob => "Find workspace paths matching a bounded glob pattern.",
+        KernelToolKind::FsList => "List a bounded workspace directory tree.",
+        KernelToolKind::FsRead => "Read bounded text from a workspace file.",
+        KernelToolKind::FsRename => "Rename one workspace path to a new non-existing destination.",
+        KernelToolKind::FsWrite => "Replace the content of an existing workspace file.",
+        KernelToolKind::GitCommit => "Create a repository commit from the staged index.",
+        KernelToolKind::GitDiff => {
+            "Read repository differences for the repository or selected paths."
+        }
+        KernelToolKind::GitStage => {
+            "Stage explicitly scoped workspace paths in the repository index."
+        }
+        KernelToolKind::GitStatus => "Read the repository working tree and index status.",
+        KernelToolKind::GitUnstage => "Remove explicitly scoped paths from the repository index.",
+        KernelToolKind::WebFetch => "Fetch bounded public HTTP or HTTPS text.",
+        KernelToolKind::WebSearch => "Search the public web with a bounded result count.",
     }
 }
 
-fn tool_description_v2(tool_id: &str) -> &'static str {
-    match tool_id {
-        "code.grep" => "Search workspace text with a bounded literal or regular expression query.",
-        "document.read" => "Read bounded text from a supported workspace document.",
-        "fs.create" => "Create a new workspace file without overwriting an existing target.",
-        "fs.delete" => "Delete one explicitly scoped workspace file or directory tree.",
-        "fs.diff" => "Preview the textual difference for proposed workspace file content.",
-        "fs.edit" => "Apply a preconditioned edit to an existing workspace file.",
-        "fs.ensure_directory" => "Ensure that an explicitly scoped workspace directory exists.",
-        "fs.glob" => "Find workspace paths matching a bounded glob pattern.",
-        "fs.list" => "List a bounded workspace directory tree.",
-        "fs.read" => "Read bounded text from a workspace file.",
-        "fs.rename" => "Rename one workspace path to a new non-existing destination.",
-        "fs.write" => "Replace the content of an existing workspace file.",
-        "git.commit" => "Create a repository commit from the staged index.",
-        "git.diff" => "Read repository differences for the repository or selected paths.",
-        "git.stage" => "Stage explicitly scoped workspace paths in the repository index.",
-        "git.status" => "Read the repository working tree and index status.",
-        "git.unstage" => "Remove explicitly scoped paths from the repository index.",
-        "web.fetch" => "Fetch bounded public HTTP or HTTPS text.",
-        "web.search" => "Search the public web with a bounded result count.",
-        _ => "Execute a Kernel-registered tool.",
-    }
-}
-
-fn tool_prompt_v2(tool_id: &str) -> &'static str {
-    match tool_id {
-        "fs.create" | "fs.write" | "fs.edit" | "fs.delete" | "fs.ensure_directory" => {
+fn tool_prompt_v2(tool: KernelToolKind) -> &'static str {
+    match tool {
+        KernelToolKind::FsCreate
+        | KernelToolKind::FsWrite
+        | KernelToolKind::FsEdit
+        | KernelToolKind::FsDelete
+        | KernelToolKind::FsEnsureDirectory => {
             "Use only for an accepted PlanAction and provide workspace-relative targets."
         }
-        "fs.rename" | "git.commit" | "git.stage" | "git.unstage" => {
+        KernelToolKind::FsRename
+        | KernelToolKind::GitCommit
+        | KernelToolKind::GitStage
+        | KernelToolKind::GitUnstage
+        | KernelToolKind::GitStatus
+        | KernelToolKind::GitDiff => {
             "This registration is disabled and must not be emitted as a provider tool call."
         }
-        "git.status" | "git.diff" => {
-            "This registration is disabled and must not be emitted as a provider tool call."
-        }
-        "web.search" | "web.fetch" => {
-            "Use only when network access is in Settings and the active authority scope."
+        KernelToolKind::WebSearch | KernelToolKind::WebFetch => {
+            "Use only when network access is in Settings and the active PlanAction scope."
         }
         _ => "Provide only the arguments defined by this schema; paths are workspace-relative.",
     }

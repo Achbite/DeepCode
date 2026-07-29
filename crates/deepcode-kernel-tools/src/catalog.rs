@@ -1,7 +1,4 @@
 use crate::registrations::{builtin_tool_registrations, KernelToolRegistration};
-use crate::{
-    KernelToolCatalogSnapshot, KernelToolCatalogTool, KernelToolContract, ToolPermissionMode,
-};
 use deepcode_kernel_abi::v2::V2ValidationError;
 use deepcode_kernel_abi::{
     canonical_arguments_digest_v2, render_kernel_tool_prompt_v2, tool_catalog_digest_v2,
@@ -12,8 +9,6 @@ use deepcode_kernel_abi::{
 use serde_json::Value;
 use std::collections::BTreeMap;
 use thiserror::Error;
-
-pub const TOOL_REGISTRY_VERSION: &str = KERNEL_TOOL_REGISTRY_VERSION_V2;
 
 #[derive(Debug, Error)]
 pub enum KernelToolRegistryErrorV2 {
@@ -34,13 +29,19 @@ pub struct CanonicalToolInvocationV2 {
     pub tool_id: ToolIdV2,
     pub arguments: Value,
     pub arguments_digest: CanonicalArgumentsDigestV2,
-    pub invocation: crate::ToolInvocationInputV4,
+    invocation: crate::invocation_types::KernelCanonicalInvocation,
+}
+
+impl CanonicalToolInvocationV2 {
+    #[doc(hidden)]
+    pub fn into_kernel_invocation(self) -> crate::kernel_internal::KernelCanonicalInvocation {
+        self.invocation
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct KernelToolRegistry {
     registrations: BTreeMap<&'static str, KernelToolRegistration>,
-    operation_index: BTreeMap<crate::ToolOperationKind, &'static str>,
 }
 
 impl Default for KernelToolRegistry {
@@ -52,18 +53,11 @@ impl Default for KernelToolRegistry {
 impl KernelToolRegistry {
     pub fn new() -> Self {
         let mut registrations = BTreeMap::new();
-        let mut operation_index = BTreeMap::new();
         for registration in builtin_tool_registrations() {
             let tool_id = registration.tool_id();
-            let operation_kind = registration.operation_kind();
             assert!(
                 registrations.insert(tool_id, registration).is_none(),
                 "duplicate canonical Kernel tool registration: {tool_id}"
-            );
-            assert!(
-                operation_index.insert(operation_kind, tool_id).is_none(),
-                "duplicate Kernel operation kind registration: {}",
-                operation_kind.wire_name()
             );
         }
         let ready = registrations
@@ -71,6 +65,10 @@ impl KernelToolRegistry {
             .filter(|registration| {
                 registration.descriptor_v2.availability == ToolAvailabilityV2::Ready
             })
+            .count();
+        let executable = registrations
+            .values()
+            .filter(|registration| registration.executor_binding.is_some())
             .count();
         assert_eq!(
             registrations.len(),
@@ -81,10 +79,6 @@ impl KernelToolRegistry {
             ready, 13,
             "compiled Kernel registry must expose exactly 13 ready tools"
         );
-        let executable = registrations
-            .values()
-            .filter(|registration| registration.executor_binding.is_some())
-            .count();
         assert_eq!(
             executable, 13,
             "only the frozen 13 ready tools may install executors"
@@ -109,40 +103,81 @@ impl KernelToolRegistry {
             "compiled Kernel registry must preserve the frozen six disabled identities"
         );
         for registration in registrations.values() {
-            let ready = registration.descriptor_v2.availability == ToolAvailabilityV2::Ready;
             assert_eq!(
-                ready,
-                registration.executor_binding.is_some()
-                    && registration.execution_mode() == crate::OperationExecutionMode::Execute,
+                registration.descriptor_v2.availability == ToolAvailabilityV2::Ready,
+                registration.executor_binding.is_some(),
                 "tool availability and executor binding diverged for {}",
                 registration.tool_id()
             );
         }
-        Self {
-            registrations,
-            operation_index,
-        }
+        Self { registrations }
     }
 
-    pub fn get(&self, tool_id: &str) -> Option<&KernelToolRegistration> {
-        self.registrations.get(tool_id)
-    }
-
-    pub fn get_by_operation_kind(
-        &self,
-        operation_kind: crate::ToolOperationKind,
-    ) -> Option<&KernelToolRegistration> {
-        self.operation_index
-            .get(&operation_kind)
-            .and_then(|tool_id| self.registrations.get(tool_id))
-    }
-
-    pub fn registrations(&self) -> impl Iterator<Item = &KernelToolRegistration> {
-        self.registrations.values()
-    }
-
-    pub fn get_v2(&self, tool_id: &ToolIdV2) -> Option<&KernelToolRegistration> {
+    fn get_v2(&self, tool_id: &ToolIdV2) -> Option<&KernelToolRegistration> {
         self.registrations.get(tool_id.as_str())
+    }
+
+    pub fn descriptor_v2(
+        &self,
+        tool_id: &ToolIdV2,
+    ) -> Option<&deepcode_kernel_abi::ToolDescriptorV2> {
+        self.get_v2(tool_id)
+            .map(|registration| &registration.descriptor_v2)
+    }
+
+    #[doc(hidden)]
+    pub fn kernel_internal_tool_kind(
+        &self,
+        tool_id: &ToolIdV2,
+    ) -> Option<crate::kernel_internal::KernelToolKind> {
+        self.get_v2(tool_id)
+            .map(KernelToolRegistration::private_tool_kind)
+    }
+
+    #[doc(hidden)]
+    pub fn kernel_internal_execution_adapter(
+        &self,
+        tool_id: &str,
+    ) -> Option<crate::kernel_internal::KernelExecutionAdapter> {
+        self.registrations
+            .get(tool_id)
+            .filter(|registration| {
+                registration.descriptor_v2.availability == ToolAvailabilityV2::Ready
+                    && registration.executor_binding.is_some()
+            })
+            .map(|registration| registration.admission_v2.execution_adapter)
+    }
+
+    #[doc(hidden)]
+    pub fn kernel_internal_admission_metadata(
+        &self,
+        tool_id: &ToolIdV2,
+    ) -> Option<crate::kernel_internal::KernelAdmissionMetadata> {
+        self.get_v2(tool_id).and_then(|registration| {
+            if registration.descriptor_v2.availability == ToolAvailabilityV2::Ready
+                && registration.executor_binding.is_some()
+            {
+                Some(registration.admission_v2)
+            } else {
+                None
+            }
+        })
+    }
+
+    #[doc(hidden)]
+    pub fn kernel_internal_ready_executor_bindings(
+        &self,
+    ) -> impl Iterator<Item = (&'static str, crate::kernel_internal::KernelExecutorBinding)> + '_
+    {
+        self.registrations.values().filter_map(|registration| {
+            if registration.descriptor_v2.availability == ToolAvailabilityV2::Ready {
+                registration
+                    .executor_binding
+                    .map(|binding| (registration.tool_id(), binding))
+            } else {
+                None
+            }
+        })
     }
 
     pub fn tool_inventory_v2(&self) -> Result<ToolInventoryV2, KernelToolRegistryErrorV2> {
@@ -251,103 +286,5 @@ impl KernelToolRegistry {
             arguments_digest,
             invocation,
         })
-    }
-
-    pub fn contract(&self, tool_id: &str) -> Option<KernelToolContract> {
-        self.registrations
-            .get(tool_id)
-            .map(|registration| registration.contract.clone())
-    }
-
-    pub fn contracts(&self) -> impl Iterator<Item = KernelToolContract> + '_ {
-        self.registrations
-            .values()
-            .map(|registration| registration.contract.clone())
-    }
-
-    pub fn snapshot(&self) -> KernelToolCatalogSnapshot {
-        let mut tools = self
-            .registrations
-            .values()
-            .map(|registration| {
-                let template = &registration.contract;
-                KernelToolCatalogTool {
-                    tool_id: template.tool_id.to_string(),
-                    capability: template.permission.capability.to_string(),
-                    family: template.family,
-                    operation_kind: template.operation_kind,
-                    provider_schema: template.input.schema.clone(),
-                    planning_schema: template.input.planning_schema.clone(),
-                    provider_visible: template.provider_visible,
-                    forbidden_fields: template.input.forbidden_fields.clone(),
-                    risk: template.permission.risk,
-                    permission_mode: template.permission.mode,
-                    permission_summary: permission_summary_for_contract(template),
-                    path_scope_policy: template.resource.path_scope_policy,
-                    plan_target_mode: template.resource.plan_target_mode,
-                    plan_target_source: template.resource.plan_target_source,
-                    execution_mode: template.execution.execution_mode,
-                    isolation: template.execution.isolation.clone(),
-                    hard_deny_rules: template.hard_deny_rules.clone(),
-                    needs_workspace: template.resource.needs_workspace,
-                    read_only: template.resource.read_only,
-                    usage_constraints: template.usage_constraints.clone(),
-                }
-            })
-            .collect::<Vec<_>>();
-        tools.sort_by(|left, right| left.tool_id.cmp(&right.tool_id));
-        let hash_payload = serde_json::json!({
-            "catalogVersion": TOOL_REGISTRY_VERSION,
-            "tools": &tools
-        });
-        let catalog_hash = fnv1a64_hex(&serde_json::to_string(&hash_payload).unwrap_or_default());
-        KernelToolCatalogSnapshot {
-            catalog_version: TOOL_REGISTRY_VERSION.to_string(),
-            catalog_hash,
-            tools,
-        }
-    }
-
-    pub fn capability_for_tool(&self, tool_id: &str) -> Option<&'static str> {
-        self.get(tool_id).map(KernelToolRegistration::capability)
-    }
-
-    pub fn risk_for_tool(&self, tool_id: &str) -> Option<crate::ToolRiskLevel> {
-        self.get(tool_id).map(KernelToolRegistration::risk)
-    }
-
-    pub fn permission_mode_for_tool(&self, tool_id: &str) -> Option<ToolPermissionMode> {
-        self.get(tool_id)
-            .map(KernelToolRegistration::permission_mode)
-    }
-
-    pub fn needs_workspace(&self, tool_id: &str) -> Option<bool> {
-        self.get(tool_id)
-            .map(KernelToolRegistration::needs_workspace)
-    }
-}
-
-pub fn fnv1a64_hex(input: &str) -> String {
-    let mut hash: u64 = 0xcbf29ce484222325;
-    for byte in input.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    format!("fnv1a64:{hash:016x}")
-}
-
-fn permission_summary_for_contract(template: &KernelToolContract) -> String {
-    match template.permission.mode {
-        ToolPermissionMode::Allow => {
-            "Kernel policy allows this tool without user confirmation in the current mode."
-                .to_string()
-        }
-        ToolPermissionMode::Ask => format!(
-            "Kernel gate asks the user before executing {} operations.",
-            template.permission.capability
-        ),
-        ToolPermissionMode::Deny => {
-            "Kernel policy denies this tool unless policy is changed.".to_string()
-        }
     }
 }

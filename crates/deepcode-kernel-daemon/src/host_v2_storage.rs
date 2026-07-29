@@ -142,52 +142,12 @@ pub(crate) fn reject_transport_capabilities(value: &Value) -> Result<(), HostV2S
 }
 
 pub(crate) fn canonical_json_bytes(value: &Value) -> Result<Vec<u8>, HostV2StorageError> {
-    let mut output = Vec::new();
-    write_canonical_json(value, &mut output)?;
-    Ok(output)
-}
-
-fn write_canonical_json(value: &Value, output: &mut Vec<u8>) -> Result<(), HostV2StorageError> {
-    match value {
-        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {
-            serde_json::to_writer(output, value).map_err(|error| {
-                HostV2StorageError::invalid(
-                    "host_v2_canonical_json_failed",
-                    format!("encode canonical JSON scalar: {error}"),
-                )
-            })?;
-        }
-        Value::Array(items) => {
-            output.push(b'[');
-            for (index, item) in items.iter().enumerate() {
-                if index > 0 {
-                    output.push(b',');
-                }
-                write_canonical_json(item, output)?;
-            }
-            output.push(b']');
-        }
-        Value::Object(fields) => {
-            let mut ordered = fields.iter().collect::<Vec<_>>();
-            ordered.sort_by(|(left, _), (right, _)| left.encode_utf16().cmp(right.encode_utf16()));
-            output.push(b'{');
-            for (index, (key, nested)) in ordered.into_iter().enumerate() {
-                if index > 0 {
-                    output.push(b',');
-                }
-                serde_json::to_writer(&mut *output, key).map_err(|error| {
-                    HostV2StorageError::invalid(
-                        "host_v2_canonical_json_failed",
-                        format!("encode canonical JSON key: {error}"),
-                    )
-                })?;
-                output.push(b':');
-                write_canonical_json(nested, output)?;
-            }
-            output.push(b'}');
-        }
-    }
-    Ok(())
+    deepcode_kernel_abi::v2::canonical_json_bytes_v2(value).map_err(|error| {
+        HostV2StorageError::invalid(
+            "host_v2_canonical_json_failed",
+            format!("encode canonical JSON: {error}"),
+        )
+    })
 }
 
 pub(crate) fn canonical_sha256(value: &Value) -> Result<String, HostV2StorageError> {

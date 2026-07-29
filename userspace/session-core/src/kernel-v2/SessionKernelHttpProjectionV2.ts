@@ -2,6 +2,9 @@ import {
   canonicalJson,
   sha256Hash,
 } from '../cache/canonicalizer.js';
+import {
+  AGENT_TIMELINE_READABLE_PLAN_SCHEMA_V2,
+} from '@deepcode/protocol';
 import type {
   AgentEvent,
   AgentEventChannel,
@@ -122,7 +125,6 @@ implements SessionKernelHostProjectionSinkV2 {
       ...projected,
       revision: agentEvents.length,
       sourceEventVersion: agentEvents.length,
-      lastDeltaSeq: agentEvents.length,
       generatedAt: event.recordedAt,
     };
     if (
@@ -244,6 +246,10 @@ function publicPresentation(
         fields: {
           content: textField(data, 'text') ?? '',
           inputId: textField(data, 'inputId'),
+          attachments: Array.isArray(data?.attachments)
+            ? cloneJson(data.attachments)
+            : [],
+          controlEpoch: data?.controlEpoch,
         },
       };
     case 'plan.persisted':
@@ -308,6 +314,11 @@ function publicPresentation(
           status: textField(data, 'replyKind') ?? 'submitted',
           operationId: textField(data, 'operationId'),
           requestId: textField(data, 'requestId'),
+          toolId: textField(data, 'toolId'),
+          controlEpoch: data?.expectedControlEpoch,
+          authorityKind: textField(data, 'authorityKind'),
+          planRevision: textField(data, 'planRevision'),
+          planActionId: textField(data, 'planActionId'),
           summary: 'Kernel tool intent submitted.',
         },
       };
@@ -381,18 +392,6 @@ function publicPresentation(
           review: cloneJson(event.data),
         },
       };
-    case 'planAction.skipped':
-      return {
-        kind: 'workflow_stage',
-        channel: 'task',
-        visibility: 'both',
-        fields: {
-          status: 'skipped',
-          planActionId: textField(data, 'planActionId'),
-          summary: textField(data, 'reason')
-            ?? 'Plan action skipped.',
-          },
-      };
     case 'planAction.completed':
       return {
         kind: 'workflow_stage',
@@ -419,9 +418,40 @@ function publicPresentation(
           content: textField(result, 'text'),
           outputKind: data?.outputKind,
           providerTurnId: data?.providerTurnId,
+          controlEpoch: data?.controlEpoch,
+          providerOutcome: data?.providerOutcome === undefined
+            ? undefined
+            : cloneJson(data.providerOutcome),
         },
       };
     }
+    case 'provider.started':
+      return {
+        kind: 'workflow_stage',
+        channel: 'progress',
+        visibility: 'trace',
+        fields: {
+          status: 'running',
+          providerTurnId: textField(data, 'providerTurnId'),
+          controlEpoch: data?.controlEpoch,
+          contextAssembly: data?.contextAssembly === undefined
+            ? undefined
+            : cloneJson(data.contextAssembly),
+          summary: 'Session provider turn started.',
+        },
+      };
+    case 'provider.stale':
+      return {
+        kind: 'workflow_stage',
+        channel: 'progress',
+        visibility: 'trace',
+        fields: {
+          status: 'cancelled',
+          providerTurnId: textField(data, 'providerTurnId'),
+          controlEpoch: data?.controlEpoch,
+          summary: 'Session provider turn was superseded.',
+        },
+      };
     case 'wait.changed': {
       const wait = objectRecord(event.data);
       return {
@@ -633,7 +663,7 @@ function readablePlanScopeApproval(
     };
   });
   return {
-    schemaVersion: 'deepcode.session.readable-plan.v1',
+    schemaVersion: AGENT_TIMELINE_READABLE_PLAN_SCHEMA_V2,
     titleKey: 'session.projection.plan.title',
     title,
     summary: objective,

@@ -18,6 +18,9 @@ import type {
 import {
   SESSION_KERNEL_CHECKPOINT_V2_SCHEMA,
 } from './types.js';
+import {
+  decodeAgentInputAttachmentsV2,
+} from './inputAttachmentsV2.js';
 
 export const SESSION_KERNEL_PERSISTENCE_V2_SCHEMA =
   'deepcode.session.kernel-persistence.v2' as const;
@@ -911,7 +914,6 @@ const SESSION_KERNEL_PROJECTION_KINDS_V2 = new Set<
   'kernelFacts.reconciled',
   'authorization.decided',
   'review.revised',
-  'planAction.skipped',
   'planAction.completed',
   'wait.changed',
   'diagnostic',
@@ -1179,7 +1181,9 @@ function decodeRecord(
     runId,
     recordKind: recordKind as SessionKernelPersistenceRecordKindV2,
     recordedAt: requiredText(value.recordedAt, 'recordedAt'),
-    data: cloneJson(value.data),
+    data: recordKind === 'input'
+      ? decodePersistedSessionInputV2(value.data)
+      : cloneJson(value.data),
   };
   const recordDigest = requiredIdentity(
     value.recordDigest,
@@ -1193,6 +1197,52 @@ function decodeRecord(
   }
   assertNoTransportCapabilities(withoutDigest.data);
   return { ...withoutDigest, recordDigest };
+}
+
+function decodePersistedSessionInputV2(
+  value: unknown
+): SessionUserInputRecordV2 {
+  const record = exactObject(
+    value,
+    [
+      'inputId',
+      'opaqueInputRef',
+      'text',
+      'attachments',
+      'recordedAt',
+    ],
+    'session_kernel_persisted_input_invalid'
+  );
+  const text = requiredText(record.text, 'input.text');
+  if (new TextEncoder().encode(text).byteLength > 64 * 1024) {
+    throw new UnsupportedHistorySchemaError(
+      'session_kernel_persisted_input_too_large'
+    );
+  }
+  const opaqueInputRef = requiredIdentity(
+    record.opaqueInputRef,
+    'opaqueInputRef'
+  );
+  if (
+    new TextEncoder().encode(opaqueInputRef).byteLength > 64 * 1024
+  ) {
+    throw new UnsupportedHistorySchemaError(
+      'session_kernel_persisted_input_identity_too_large'
+    );
+  }
+  const recordedAt = requiredText(record.recordedAt, 'recordedAt');
+  if (!Number.isFinite(Date.parse(recordedAt))) {
+    throw new UnsupportedHistorySchemaError(
+      'session_kernel_persisted_input_time_invalid'
+    );
+  }
+  return {
+    inputId: requiredIdentity(record.inputId, 'inputId'),
+    opaqueInputRef,
+    text,
+    attachments: decodeAgentInputAttachmentsV2(record.attachments),
+    recordedAt,
+  };
 }
 
 function assertNoTransportCapabilities(value: unknown): void {

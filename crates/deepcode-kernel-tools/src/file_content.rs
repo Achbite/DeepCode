@@ -1,10 +1,26 @@
-pub use deepcode_kernel_abi::ResourceFileClassification as FileContentClassification;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::Path;
 
 pub const MAX_LLM_TEXT_FILE_BYTES: u64 = 4 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileContentClassification {
+    pub kind: String,
+    pub readable_text: bool,
+    pub binary: bool,
+    pub executable: bool,
+    pub size_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extension: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub magic: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SafeTextFile {

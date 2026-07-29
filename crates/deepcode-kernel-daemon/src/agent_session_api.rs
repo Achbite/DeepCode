@@ -5,6 +5,11 @@ pub(crate) async fn agent_sessions_list(
     State(state): State<AppState>,
     Query(query): Query<AgentSessionScopeQuery>,
 ) -> Json<ApiResponse> {
+    if let Some(response) =
+        crate::session_metadata_v2::session_metadata_unavailable_response(&state)
+    {
+        return response;
+    }
     let mut gui = state.gui.lock().expect("gui state lock");
     refresh_pending_session_titles(&mut gui);
     let include_archived = query.include_archived.unwrap_or(false);
@@ -36,14 +41,14 @@ pub(crate) async fn agent_session_create(
     State(state): State<AppState>,
     Json(body): Json<Value>,
 ) -> Json<ApiResponse> {
+    if let Some(response) =
+        crate::session_metadata_v2::session_metadata_unavailable_response(&state)
+    {
+        return response;
+    }
     let mut gui = state.gui.lock().expect("gui state lock");
     let id = format!("session-{}", now_millis());
     let now = now_text();
-    let mode = body
-        .get("mode")
-        .or_else(|| body.get("initialMode"))
-        .and_then(Value::as_str)
-        .unwrap_or("plan");
     let project_id = body
         .get("projectId")
         .and_then(Value::as_str)
@@ -82,7 +87,6 @@ pub(crate) async fn agent_session_create(
         body.get("title")
             .and_then(Value::as_str)
             .unwrap_or("New Agent Session"),
-        mode,
         default_profile_id.as_deref(),
         workspace_id,
         workspace_hash,
@@ -98,57 +102,16 @@ pub(crate) async fn agent_session_create(
             "generated Session identity already has private storage",
         );
     }
-    let genesis_head = match initialize_session_domain_store(&gui.paths.sessions_dir, &id) {
-        Ok(head) => head,
-        Err(error) => {
-            remove_session_storage_dir(&gui.paths.sessions_dir, &id);
-            return ApiResponse::error_with_data(
-                error.code,
-                error.message.clone(),
-                error.api_details(&gui.paths.sessions_dir, &id),
-            );
-        }
-    };
-    let domain_state = match session_domain_state(&gui.paths.sessions_dir, &id) {
-        Ok(domain_state) => domain_state,
-        Err(error) => {
-            remove_session_storage_dir(&gui.paths.sessions_dir, &id);
-            return ApiResponse::error_with_data(
-                error.code,
-                error.message.clone(),
-                error.api_details(&gui.paths.sessions_dir, &id),
-            );
-        }
-    };
-    session["domainState"] = match serde_json::to_value(&domain_state) {
-        Ok(value) => value,
-        Err(error) => {
-            remove_session_storage_dir(&gui.paths.sessions_dir, &id);
-            return ApiResponse::error(
-                "agent_session_persist_failed",
-                format!(
-                    "failed to serialize new Session domain state after genesis {}: {error}",
-                    genesis_head.head_digest
-                ),
-            );
-        }
-    };
     let scope_key = session_scope_key(&session);
     let previous_current_session_id = gui.current_session_id.clone();
     let previous_scope_session_id = gui.current_session_ids_by_scope.get(&scope_key).cloned();
     gui.current_session_id = Some(id.clone());
     gui.current_session_ids_by_scope
         .insert(scope_key.clone(), id.clone());
-    gui.session_projection_cache.insert(id.clone(), Vec::new());
-    gui.session_timeline_cache.remove(&id);
-    gui.trace_events.insert(id.clone(), Vec::new());
     gui.sessions.insert(0, session.clone());
-    if let Err(error) = persist_session_index(&gui) {
+    if let Err(error) = crate::session_metadata_v2::persist_session_index(&gui) {
         gui.sessions
             .retain(|candidate| candidate.get("id").and_then(Value::as_str) != Some(id.as_str()));
-        gui.session_projection_cache.remove(&id);
-        gui.session_timeline_cache.remove(&id);
-        gui.trace_events.remove(&id);
         gui.current_session_id = previous_current_session_id;
         if let Some(previous_scope_session_id) = previous_scope_session_id {
             gui.current_session_ids_by_scope
@@ -156,7 +119,6 @@ pub(crate) async fn agent_session_create(
         } else {
             gui.current_session_ids_by_scope.remove(&scope_key);
         }
-        remove_session_storage_dir(&gui.paths.sessions_dir, &id);
         return ApiResponse::error("agent_session_persist_failed", error);
     }
     session_result(&gui, &id)
@@ -166,6 +128,11 @@ pub(crate) async fn agent_session_current(
     State(state): State<AppState>,
     Query(query): Query<AgentSessionScopeQuery>,
 ) -> Json<ApiResponse> {
+    if let Some(response) =
+        crate::session_metadata_v2::session_metadata_unavailable_response(&state)
+    {
+        return response;
+    }
     let mut gui = state.gui.lock().expect("gui state lock");
     refresh_pending_session_titles(&mut gui);
     let scope_key = scope_key_from_query(&query);
@@ -184,6 +151,11 @@ pub(crate) async fn agent_session_activate(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
 ) -> Json<ApiResponse> {
+    if let Some(response) =
+        crate::session_metadata_v2::session_metadata_unavailable_response(&state)
+    {
+        return response;
+    }
     let mut gui = state.gui.lock().expect("gui state lock");
     if has_session(&gui, &session_id) {
         let readable = session_result(&gui, &session_id);
@@ -206,6 +178,11 @@ pub(crate) async fn agent_session_rename(
     Path(session_id): Path<String>,
     Json(body): Json<Value>,
 ) -> Json<ApiResponse> {
+    if let Some(response) =
+        crate::session_metadata_v2::session_metadata_unavailable_response(&state)
+    {
+        return response;
+    }
     let mut gui = state.gui.lock().expect("gui state lock");
     if !has_session(&gui, &session_id) {
         return ApiResponse::error("agent_session_not_found", "agent session not found");
@@ -223,7 +200,7 @@ pub(crate) async fn agent_session_rename(
             Ok(active) => active.is_some(),
             Err(error) => return ApiResponse::error(error.code, error.message),
         };
-        if run_locked || session_has_pending_interaction(&gui, &session_id) {
+        if run_locked || session_has_pending_interaction(&state, &session_id) {
             return ApiResponse::error(
                 "agent_session_profile_locked",
                 "session Profile is locked while a run or user interaction is active",
@@ -295,7 +272,7 @@ pub(crate) async fn agent_session_rename(
             session["profileId"] = json!(profile_id);
         }
         session["updatedAt"] = json!(now_text());
-        if let Err(error) = persist_session_index(&gui) {
+        if let Err(error) = crate::session_metadata_v2::persist_session_index(&gui) {
             return ApiResponse::error("agent_session_persist_failed", error);
         }
         return session_result(&gui, &session_id);
@@ -303,17 +280,13 @@ pub(crate) async fn agent_session_rename(
     ApiResponse::error("agent_session_not_found", "agent session not found")
 }
 
-pub(crate) fn session_has_pending_interaction(gui: &GuiState, session_id: &str) -> bool {
-    let cached = gui.session_timeline_cache.get(session_id).cloned();
-    let timeline = cached.or_else(|| {
-        read_json_file(
-            &gui.paths
-                .sessions_dir
-                .join(safe_path_segment(session_id))
-                .join("timeline.json"),
-        )
-    });
-    timeline
+pub(crate) fn session_has_pending_interaction(state: &AppState, session_id: &str) -> bool {
+    state
+        .host_services
+        .projection_v2
+        .latest_timeline(session_id)
+        .ok()
+        .flatten()
         .as_ref()
         .and_then(|timeline| timeline.get("interactionProjection"))
         .and_then(|projection| projection.get("pending"))
@@ -324,6 +297,11 @@ pub(crate) async fn agent_session_delete(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
 ) -> Json<ApiResponse> {
+    if let Some(response) =
+        crate::session_metadata_v2::session_metadata_unavailable_response(&state)
+    {
+        return response;
+    }
     if let Err(error) = retire_agent_kernel_run_v2(
         &state,
         &session_id,
@@ -336,15 +314,7 @@ pub(crate) async fn agent_session_delete(
         return ApiResponse::error(error.code, error.message);
     }
     let safe_session_id = safe_path_segment(&session_id);
-    let (
-        sessions_dir,
-        archive_root,
-        memory_root,
-        delete_scope_key,
-        response_scope_key,
-        response_current_id,
-        response_sessions,
-    ) = {
+    let (sessions_dir, response_scope_key, response_current_id, response_sessions) = {
         let mut gui = state.gui.lock().expect("gui state lock");
         let Some(position) = gui.sessions.iter().position(|session| {
             session.get("id").and_then(Value::as_str) == Some(session_id.as_str())
@@ -354,9 +324,6 @@ pub(crate) async fn agent_session_delete(
 
         let scope_key = session_scope_key(&gui.sessions[position]);
         gui.sessions.remove(position);
-        gui.session_projection_cache.remove(&session_id);
-        gui.session_timeline_cache.remove(&session_id);
-        gui.trace_events.remove(&session_id);
         gui.current_session_ids_by_scope
             .retain(|_, current_id| current_id != &session_id);
         if gui.current_session_id.as_deref() == Some(session_id.as_str()) {
@@ -369,14 +336,11 @@ pub(crate) async fn agent_session_delete(
         }
         let response_current_id = current_agent_session_id_for_scope(&mut gui, &scope_key);
         let response_sessions = scoped_sessions(&gui, &scope_key, false);
-        if let Err(error) = persist_session_index(&gui) {
+        if let Err(error) = crate::session_metadata_v2::persist_session_index(&gui) {
             return ApiResponse::error("agent_session_persist_failed", error);
         }
         (
             gui.paths.sessions_dir.clone(),
-            gui.paths.conversation_archives_dir.clone(),
-            gui.paths.memory_archives_dir.clone(),
-            scope_key.clone(),
             scope_key,
             response_current_id,
             response_sessions,
@@ -384,19 +348,11 @@ pub(crate) async fn agent_session_delete(
     };
 
     remove_session_storage_dir(&sessions_dir, &safe_session_id);
-    remove_conversation_archive_dirs(&archive_root, &safe_session_id);
-    let memory_cleanup = remove_session_memory_archive(
-        &memory_root,
-        &delete_scope_key,
-        &safe_session_id,
-        &session_id,
-    );
 
     ApiResponse::ok(json!({
         "sessions": response_sessions,
         "currentSessionId": response_current_id,
-        "workspaceScopeKey": response_scope_key,
-        "memoryCleanup": memory_cleanup
+        "workspaceScopeKey": response_scope_key
     }))
 }
 
@@ -405,6 +361,11 @@ pub(crate) async fn agent_session_archive(
     Path(session_id): Path<String>,
     Json(body): Json<Value>,
 ) -> Json<ApiResponse> {
+    if let Some(response) =
+        crate::session_metadata_v2::session_metadata_unavailable_response(&state)
+    {
+        return response;
+    }
     let should_archive = body
         .get("archived")
         .and_then(Value::as_bool)
@@ -466,18 +427,14 @@ pub(crate) async fn agent_session_archive(
                 archived_scope_key.as_deref().unwrap_or("unbound-workspace"),
                 replacement_scope,
             ) {
-                return ApiResponse::error_with_data(
-                    error.code,
-                    error.message.clone(),
-                    error.api_details(&gui.paths.sessions_dir, &session_id),
-                );
+                return ApiResponse::error("agent_session_replacement_failed", error);
             }
         }
     }
     let response_scope_key = archived_scope_key.unwrap_or_else(|| scope_key_from_parts(None, None));
     let response_current_id = current_agent_session_id_for_scope(&mut gui, &response_scope_key);
     let response_sessions = scoped_sessions(&gui, &response_scope_key, false);
-    if let Err(error) = persist_session_index(&gui) {
+    if let Err(error) = crate::session_metadata_v2::persist_session_index(&gui) {
         return ApiResponse::error("agent_session_persist_failed", error);
     }
     ApiResponse::ok(json!({
@@ -491,59 +448,11 @@ pub(crate) async fn agent_session_events(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
 ) -> Json<ApiResponse> {
-    let gui = state.gui.lock().expect("gui state lock");
-    session_result(&gui, &session_id)
-}
-
-pub(crate) async fn agent_session_append_events(
-    State(state): State<AppState>,
-    Path(session_id): Path<String>,
-    Json(body): Json<Value>,
-) -> Json<ApiResponse> {
-    let sessions_dir = state
-        .gui
-        .lock()
-        .expect("gui state lock")
-        .paths
-        .sessions_dir
-        .clone();
-    let command = match parse_session_append_command(body) {
-        Ok(command) => command,
-        Err(error) => {
-            return ApiResponse::error_with_data(
-                error.code,
-                error.message.clone(),
-                error.api_details(&sessions_dir, &session_id),
-            )
-        }
-    };
-    let receipt = match admit_session_domain_batch(&state, &session_id, command) {
-        Ok(receipt) => receipt,
-        Err(error) => {
-            return ApiResponse::error_with_data(
-                error.code,
-                error.message.clone(),
-                error.api_details(&sessions_dir, &session_id),
-            )
-        }
-    };
-    let mut gui = state.gui.lock().expect("gui state lock");
-    refresh_pending_session_titles(&mut gui);
-    let mut response = session_result(&gui, &session_id);
-    if !response.0.ok {
+    if let Some(response) =
+        crate::session_metadata_v2::session_metadata_unavailable_response(&state)
+    {
         return response;
     }
-    let receipt = match serde_json::to_value(receipt) {
-        Ok(receipt) => receipt,
-        Err(error) => {
-            return ApiResponse::error(
-                "session_append_recovery_required",
-                format!("Session append committed, but receipt serialization failed: {error}"),
-            )
-        }
-    };
-    if let Some(data) = response.0.data.as_mut().and_then(Value::as_object_mut) {
-        data.insert("appendReceipt".to_string(), receipt);
-    }
-    response
+    let gui = state.gui.lock().expect("gui state lock");
+    session_result(&gui, &session_id)
 }

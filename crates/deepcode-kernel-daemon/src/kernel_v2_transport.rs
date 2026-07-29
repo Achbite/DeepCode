@@ -1,7 +1,7 @@
 use crate::decision_capability_v2::{
-    CapabilityDecisionClassV2, DecisionCapabilityAuthorityV2,
-    DecisionCapabilityAuthorizationErrorV2, DecisionCapabilityGrantV2,
-    DecisionCapabilityIssueErrorV2, DecisionCapabilityPermitV2, DecisionCapabilitySubjectV2,
+    DecisionCapabilityAuthorityV2, DecisionCapabilityAuthorizationErrorV2,
+    DecisionCapabilityGrantV2, DecisionCapabilityIssueErrorV2, DecisionCapabilityPermitV2,
+    DecisionCapabilitySubjectV2,
 };
 pub(crate) use crate::host_workspace_registry_v2::{
     HostWorkspaceBindingResolverV2, HostWorkspaceResolveErrorV2,
@@ -11,30 +11,30 @@ use axum::extract::rejection::BytesRejection;
 use axum::extract::State;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
-use deepcode_kernel_abi::v2::{CommandRequestId, UserDecisionRefV2, V2WireDecodeError};
+use deepcode_kernel_abi::v2::{
+    CommandRequestId, RecordedAtV2, RunId, UserDecisionRefV2, V2WireDecodeError,
+};
 use deepcode_kernel_abi::v2_command::{
     decode_kernel_command_v2, CommandHandlingV2, KernelCommandEnvelopeV2,
     KernelCommandResponseEnvelopeV2, KernelCommandV2, KernelErrorV2,
 };
 use deepcode_kernel_abi::{
-    decode_user_decision_v2, CapabilityScopePreviewIdV2, RunCapabilityV2, UserDecisionEnvelopeV2,
-    UserDecisionErrorV2, UserDecisionReplyV2, UserDecisionResponseEnvelopeV2, UserDecisionV2,
+    decode_user_decision_v2, CapabilityScopePreviewIdV2, KernelV2HttpErrorCode,
+    KernelV2HttpErrorEnvelope, RunCapabilityV2, TrustGrantDecisionV2, TrustPolicyIdV2,
+    UserDecisionEnvelopeV2, UserDecisionErrorV2, UserDecisionReplyV2,
+    UserDecisionResponseEnvelopeV2, UserDecisionRevokeTargetV2, UserDecisionV2,
     KERNEL_ABI_V2_VERSION,
 };
 use deepcode_kernel_runtime::v2::{
     KernelSessionServiceV2, PendingCapabilityDecisionClassV2, SettingsCeilingV2,
 };
 use serde::Serialize;
-use sha2::{Digest, Sha256};
-use std::fmt;
-use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::sync::Arc;
 use std::time::Duration;
 
 pub(crate) const KERNEL_V2_COMMANDS_PATH: &str = "/api/kernel/v2/commands";
 pub(crate) const KERNEL_V2_USER_DECISIONS_PATH: &str = "/api/kernel/v2/user-decisions";
-pub(crate) const HOST_TRANSPORT_CAPABILITY_HEADER: &str = "x-deepcode-host-capability";
 pub(crate) const RUN_TRANSPORT_CAPABILITY_HEADER: &str = "x-deepcode-run-capability";
 pub(crate) const MAX_V2_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
 
@@ -59,99 +59,33 @@ pub(crate) struct HostCapabilityDecisionRequestV2 {
     pub(crate) guidance: String,
 }
 
+pub(crate) struct HostTrustGrantRequestV2 {
+    pub(crate) request_id: CommandRequestId,
+    pub(crate) decision_ref: UserDecisionRefV2,
+    pub(crate) scope_preview_id: CapabilityScopePreviewIdV2,
+    pub(crate) trust_policy_id: TrustPolicyIdV2,
+    pub(crate) expires_at: Option<RecordedAtV2>,
+}
+
+pub(crate) struct HostAuthorityRevokeResolveRequestV2 {
+    pub(crate) run_id: RunId,
+    pub(crate) decision_ref: UserDecisionRefV2,
+    pub(crate) target: UserDecisionRevokeTargetV2,
+    pub(crate) reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct HostResolvedAuthorityRevokeV2 {
+    pub(crate) run_id: RunId,
+    pub(crate) expected_control_epoch: deepcode_kernel_abi::v2::ControlEpoch,
+    pub(crate) decision: UserDecisionV2,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HostCapabilityDecisionApplyErrorV2 {
     Kernel(UserDecisionErrorV2),
     Transport(KernelV2HttpErrorCode),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum KernelV2HttpErrorCode {
-    PayloadTooLarge,
-    InvalidJson,
-    DuplicateJsonKey,
-    MissingAbiVersion,
-    InvalidAbiVersion,
-    UnsupportedAbiVersion,
-    InvalidPayload,
-    HostAuthorityRequired,
-    HostAuthorityInvalid,
-    RunCapabilityRequired,
-    RunCapabilityInvalid,
-    WorkspaceBindingNotFound,
-    WorkspaceBindingStale,
-    WorkspaceBindingUnavailable,
-    DecisionCapabilityRequired,
-    DecisionCapabilityInvalid,
-    DecisionCapabilityExpired,
-    DecisionCapabilityBindingMismatch,
-    DecisionCapabilityRequestConflict,
-    DecisionCapabilityInUse,
-    ResponseTooLarge,
-    ServiceUnavailable,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct KernelV2TransportErrorEnvelope {
-    pub(crate) format: &'static str,
-    pub(crate) code: KernelV2HttpErrorCode,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) request_id: Option<CommandRequestId>,
-}
-
-#[derive(Clone)]
-pub(crate) struct HostTransportAuthorityV2 {
-    capability_digest: Arc<[u8; 32]>,
-}
-
-#[derive(Clone)]
-pub(crate) struct HostTransportCapabilityV2(String);
-
-impl fmt::Debug for HostTransportCapabilityV2 {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("HostTransportCapabilityV2([REDACTED])")
-    }
-}
-
-impl HostTransportCapabilityV2 {
-    pub(crate) fn expose_to_host_transport(&self) -> &str {
-        &self.0
-    }
-}
-
-impl HostTransportAuthorityV2 {
-    pub(crate) fn new_pair() -> std::io::Result<(Self, HostTransportCapabilityV2)> {
-        let mut entropy = [0_u8; 32];
-        File::open("/dev/urandom")?.read_exact(&mut entropy)?;
-        let capability = format!("dcv2h_{}", encode_hex(&entropy));
-        Ok((
-            Self {
-                capability_digest: Arc::new(sha256(capability.as_bytes())),
-            },
-            HostTransportCapabilityV2(capability),
-        ))
-    }
-
-    fn authorize(&self, headers: &HeaderMap) -> Result<(), KernelV2HttpErrorCode> {
-        let Some(submitted) = headers
-            .get(HOST_TRANSPORT_CAPABILITY_HEADER)
-            .and_then(|value| value.to_str().ok())
-        else {
-            return Err(KernelV2HttpErrorCode::HostAuthorityRequired);
-        };
-        self.authorize_token(submitted)
-    }
-
-    pub(crate) fn authorize_token(&self, submitted: &str) -> Result<(), KernelV2HttpErrorCode> {
-        let submitted_digest = sha256(submitted.as_bytes());
-        if constant_time_eq(self.capability_digest.as_ref(), &submitted_digest) {
-            Ok(())
-        } else {
-            Err(KernelV2HttpErrorCode::HostAuthorityInvalid)
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -159,7 +93,6 @@ pub(crate) struct KernelV2TransportState {
     service: KernelSessionServiceV2,
     workspace_resolver: Arc<dyn HostWorkspaceBindingResolverV2>,
     settings_resolver: Arc<dyn HostRunSettingsResolverV2>,
-    host_authority: HostTransportAuthorityV2,
     decision_authority: DecisionCapabilityAuthorityV2,
 }
 
@@ -173,7 +106,6 @@ impl KernelV2TransportState {
         service: KernelSessionServiceV2,
         workspace_resolver: Arc<dyn HostWorkspaceBindingResolverV2>,
         settings_resolver: Arc<dyn HostRunSettingsResolverV2>,
-        host_authority: HostTransportAuthorityV2,
     ) -> Result<Self, KernelV2TransportStartupError> {
         let decision_authority = DecisionCapabilityAuthorityV2::new()
             .map_err(|_| KernelV2TransportStartupError::DecisionCapabilityEntropyUnavailable)?;
@@ -181,12 +113,11 @@ impl KernelV2TransportState {
             service,
             workspace_resolver,
             settings_resolver,
-            host_authority,
             decision_authority,
         })
     }
 
-    pub(crate) fn issue_user_decision_capability(
+    fn issue_user_decision_capability(
         &self,
         grant: DecisionCapabilityGrantV2,
         lifetime: Duration,
@@ -212,46 +143,127 @@ impl KernelV2TransportState {
                 )
             })?
             .map_err(HostCapabilityDecisionApplyErrorV2::Kernel)?;
-        let (class, decision) = match (pending.class, request.decision) {
+        let decision = match (pending.class, request.decision) {
             (PendingCapabilityDecisionClassV2::Capability, HostCapabilityDecisionKindV2::Allow) => {
-                (
-                    CapabilityDecisionClassV2::Capability,
-                    UserDecisionV2::CapabilityAllow(pending.binding.clone()),
-                )
+                UserDecisionV2::CapabilityAllow(pending.binding.clone())
             }
-            (PendingCapabilityDecisionClassV2::Capability, HostCapabilityDecisionKindV2::Deny) => (
-                CapabilityDecisionClassV2::Capability,
+            (PendingCapabilityDecisionClassV2::Capability, HostCapabilityDecisionKindV2::Deny) => {
                 UserDecisionV2::CapabilityDeny {
                     binding: pending.binding.clone(),
                     guidance: request.guidance,
-                },
-            ),
+                }
+            }
             (
                 PendingCapabilityDecisionClassV2::ScopeExpansion,
                 HostCapabilityDecisionKindV2::Allow,
-            ) => (
-                CapabilityDecisionClassV2::ScopeExpansion,
-                UserDecisionV2::ScopeExpansionAllow(pending.binding.clone()),
-            ),
+            ) => UserDecisionV2::ScopeExpansionAllow(pending.binding.clone()),
             (
                 PendingCapabilityDecisionClassV2::ScopeExpansion,
                 HostCapabilityDecisionKindV2::Deny,
-            ) => (
-                CapabilityDecisionClassV2::ScopeExpansion,
-                UserDecisionV2::ScopeExpansionDeny {
-                    binding: pending.binding.clone(),
-                    guidance: request.guidance,
-                },
-            ),
+            ) => UserDecisionV2::ScopeExpansionDeny {
+                binding: pending.binding.clone(),
+                guidance: request.guidance,
+            },
         };
+        self.apply_host_resolved_user_decision(
+            request.request_id,
+            pending.run_id,
+            pending.expected_control_epoch,
+            decision,
+        )
+    }
+
+    /// Grants trust from Kernel's exact pending preview binding. The caller
+    /// cannot submit a binding, and the short-lived decision capability is
+    /// minted and consumed entirely inside this process.
+    pub(crate) fn apply_host_trust_grant(
+        &self,
+        request: HostTrustGrantRequestV2,
+    ) -> Result<UserDecisionResponseEnvelopeV2, HostCapabilityDecisionApplyErrorV2> {
+        let pending = self
+            .service
+            .resolve_pending_capability_decision_host(
+                request.scope_preview_id,
+                request.decision_ref,
+            )
+            .map_err(|_| {
+                HostCapabilityDecisionApplyErrorV2::Transport(
+                    KernelV2HttpErrorCode::ServiceUnavailable,
+                )
+            })?
+            .map_err(HostCapabilityDecisionApplyErrorV2::Kernel)?;
+        let decision = UserDecisionV2::TrustGrant(TrustGrantDecisionV2 {
+            binding: pending.binding,
+            trust_policy_id: request.trust_policy_id,
+            expires_at: request.expires_at,
+        });
+        self.apply_host_resolved_user_decision(
+            request.request_id,
+            pending.run_id,
+            pending.expected_control_epoch,
+            decision,
+        )
+    }
+
+    /// Resolves a current lease or trust policy through the typed Host boundary.
+    /// The exact decision is persisted by Host before it crosses the effect
+    /// boundary, so an unknown transport result can replay the same identity.
+    pub(crate) fn resolve_host_authority_revoke(
+        &self,
+        request: HostAuthorityRevokeResolveRequestV2,
+    ) -> Result<HostResolvedAuthorityRevokeV2, HostCapabilityDecisionApplyErrorV2> {
+        let resolved = self
+            .service
+            .resolve_user_authority_revoke_host(
+                &request.run_id,
+                request.decision_ref,
+                request.target,
+                request.reason,
+            )
+            .map_err(|_| {
+                HostCapabilityDecisionApplyErrorV2::Transport(
+                    KernelV2HttpErrorCode::ServiceUnavailable,
+                )
+            })?
+            .map_err(HostCapabilityDecisionApplyErrorV2::Kernel)?;
+        Ok(HostResolvedAuthorityRevokeV2 {
+            run_id: request.run_id,
+            expected_control_epoch: resolved.0,
+            decision: resolved.1,
+        })
+    }
+
+    /// Applies only an already-resolved and durably bound Host revoke. This
+    /// method never re-resolves the target, which preserves Kernel request
+    /// replay after the first successful revoke removed the live authority.
+    pub(crate) fn apply_host_resolved_authority_revoke(
+        &self,
+        request_id: CommandRequestId,
+        resolved: HostResolvedAuthorityRevokeV2,
+    ) -> Result<UserDecisionResponseEnvelopeV2, HostCapabilityDecisionApplyErrorV2> {
+        self.apply_host_resolved_user_decision(
+            request_id,
+            resolved.run_id,
+            resolved.expected_control_epoch,
+            resolved.decision,
+        )
+    }
+
+    fn apply_host_resolved_user_decision(
+        &self,
+        request_id: CommandRequestId,
+        run_id: RunId,
+        expected_control_epoch: deepcode_kernel_abi::v2::ControlEpoch,
+        decision: UserDecisionV2,
+    ) -> Result<UserDecisionResponseEnvelopeV2, HostCapabilityDecisionApplyErrorV2> {
         let capability = self
             .issue_user_decision_capability(
                 DecisionCapabilityGrantV2 {
-                    run_id: pending.run_id.clone(),
-                    expected_control_epoch: pending.expected_control_epoch,
-                    subject: DecisionCapabilitySubjectV2::Capability {
-                        class,
-                        binding: pending.binding,
+                    run_id: run_id.clone(),
+                    expected_control_epoch,
+                    subject: DecisionCapabilitySubjectV2::ExactUserDecision {
+                        request_id: request_id.clone(),
+                        decision: decision.clone(),
                     },
                 },
                 Duration::from_secs(60),
@@ -262,10 +274,10 @@ impl KernelV2TransportState {
                 )
             })?;
         let envelope = UserDecisionEnvelopeV2::new(
-            request.request_id,
-            pending.run_id,
+            request_id,
+            run_id,
             capability,
-            pending.expected_control_epoch,
+            expected_control_epoch,
             decision,
         );
         let permit = self
@@ -317,10 +329,6 @@ impl KernelV2TransportState {
         Arc::clone(&self.settings_resolver)
     }
 
-    pub(crate) fn host_authority(&self) -> HostTransportAuthorityV2 {
-        self.host_authority.clone()
-    }
-
     pub(crate) fn decision_authority(&self) -> DecisionCapabilityAuthorityV2 {
         self.decision_authority.clone()
     }
@@ -347,45 +355,11 @@ pub(crate) async fn kernel_v2_commands(
     };
     let request_id = envelope.request_id.clone();
     match &envelope.command {
-        KernelCommandV2::RunOpen(command) => {
-            if let Err(code) = state.host_authority.authorize(&headers) {
-                return http_error_response(auth_status(code), code, Some(request_id));
-            }
-            let workspace_binding_ref = command.workspace_binding_ref.clone();
-            let workspace_resolver = Arc::clone(&state.workspace_resolver);
-            let settings_resolver = Arc::clone(&state.settings_resolver);
-            let service = state.service.clone();
-            let opened = tokio::task::spawn_blocking(move || {
-                let workspace_root =
-                    workspace_resolver.resolve_workspace_binding(&workspace_binding_ref)?;
-                if !workspace_root.is_absolute() {
-                    return Err(HostWorkspaceResolveErrorV2::Unavailable);
-                }
-                let settings = settings_resolver.resolve_run_settings(&workspace_binding_ref)?;
-                Ok(service.open_run(envelope, &workspace_root, settings))
-            })
-            .await;
-            match opened {
-                Ok(Ok(opened)) => {
-                    let (response, run_capability) = opened.into_parts();
-                    no_store_run_open_json(
-                        StatusCode::OK,
-                        response,
-                        run_capability.as_ref(),
-                        Some(request_id),
-                    )
-                }
-                Ok(Err(error)) => {
-                    let (status, code) = workspace_error(error);
-                    http_error_response(status, code, Some(request_id))
-                }
-                Err(_) => http_error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    KernelV2HttpErrorCode::ServiceUnavailable,
-                    Some(request_id),
-                ),
-            }
-        }
+        KernelCommandV2::RunOpen(_) => http_error_response(
+            StatusCode::FORBIDDEN,
+            KernelV2HttpErrorCode::HostAuthorityRequired,
+            Some(request_id),
+        ),
         _ => {
             let transport_run_capability = match transport_run_capability(&headers) {
                 Ok(capability) => capability,
@@ -534,32 +508,6 @@ pub(crate) fn wire_error_code(error: V2WireDecodeError) -> (StatusCode, KernelV2
     }
 }
 
-fn auth_status(code: KernelV2HttpErrorCode) -> StatusCode {
-    match code {
-        KernelV2HttpErrorCode::HostAuthorityRequired => StatusCode::UNAUTHORIZED,
-        _ => StatusCode::FORBIDDEN,
-    }
-}
-
-pub(crate) fn workspace_error(
-    error: HostWorkspaceResolveErrorV2,
-) -> (StatusCode, KernelV2HttpErrorCode) {
-    match error {
-        HostWorkspaceResolveErrorV2::NotFound => (
-            StatusCode::NOT_FOUND,
-            KernelV2HttpErrorCode::WorkspaceBindingNotFound,
-        ),
-        HostWorkspaceResolveErrorV2::Stale => (
-            StatusCode::CONFLICT,
-            KernelV2HttpErrorCode::WorkspaceBindingStale,
-        ),
-        HostWorkspaceResolveErrorV2::Unavailable => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            KernelV2HttpErrorCode::WorkspaceBindingUnavailable,
-        ),
-    }
-}
-
 pub(crate) fn decision_authorization_error(
     error: DecisionCapabilityAuthorizationErrorV2,
 ) -> (StatusCode, KernelV2HttpErrorCode) {
@@ -600,11 +548,7 @@ fn http_error_response(
     code: KernelV2HttpErrorCode,
     request_id: Option<CommandRequestId>,
 ) -> Response {
-    let envelope = KernelV2TransportErrorEnvelope {
-        format: "deepcode.kernel.http-error.v2",
-        code,
-        request_id,
-    };
+    let envelope = KernelV2HttpErrorEnvelope::new(code, request_id);
     let body = encode_bounded_json(&envelope).unwrap_or_else(|_| {
         b"{\"format\":\"deepcode.kernel.http-error.v2\",\"code\":\"service_unavailable\"}".to_vec()
     });
@@ -629,32 +573,6 @@ fn no_store_json(
             request_id,
         ),
     }
-}
-
-fn no_store_run_open_json(
-    status: StatusCode,
-    body: impl Serialize,
-    run_capability: Option<&RunCapabilityV2>,
-    request_id: Option<CommandRequestId>,
-) -> Response {
-    let mut response = no_store_json(status, body, request_id.clone());
-    let Some(run_capability) = run_capability else {
-        return response;
-    };
-    let header_value = match HeaderValue::from_str(run_capability.expose_to_transport()) {
-        Ok(value) => value,
-        Err(_) => {
-            return http_error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                KernelV2HttpErrorCode::ServiceUnavailable,
-                request_id,
-            )
-        }
-    };
-    response
-        .headers_mut()
-        .insert(RUN_TRANSPORT_CAPABILITY_HEADER, header_value);
-    response
 }
 
 fn json_bytes_response(status: StatusCode, body: Vec<u8>) -> Response {
@@ -726,28 +644,4 @@ impl Write for BoundedResponseWriterV2 {
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
-}
-
-fn sha256(value: &[u8]) -> [u8; 32] {
-    Sha256::digest(value).into()
-}
-
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    let mut difference = left.len() ^ right.len();
-    let maximum = left.len().max(right.len());
-    for index in 0..maximum {
-        difference |= usize::from(
-            left.get(index).copied().unwrap_or(0) ^ right.get(index).copied().unwrap_or(0),
-        );
-    }
-    difference == 0
-}
-
-fn encode_hex(value: &[u8]) -> String {
-    let mut output = String::with_capacity(value.len() * 2);
-    for byte in value {
-        use std::fmt::Write;
-        let _ = write!(output, "{byte:02x}");
-    }
-    output
 }

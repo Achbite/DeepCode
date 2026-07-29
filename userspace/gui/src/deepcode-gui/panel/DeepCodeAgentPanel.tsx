@@ -12,7 +12,6 @@ import {
 } from '../../components/agent-panel/pendingDecision';
 import DeepCodeTimeline from './DeepCodeTimeline';
 import SessionModelSelector from './SessionModelSelector';
-import { projectionDeliveryDiagnostics } from '../../services/projectionDeliveryDiagnostics';
 
 interface DeepCodeAgentPanelProps {
   language: UiLanguage;
@@ -48,21 +47,21 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
   const messageAttachments = useAgentSessionStore((s) => s.messageAttachments);
   const sessionAttachments = useAgentSessionStore((s) => s.sessionAttachments);
   const resolvingPermission = useAgentSessionStore((s) => s.resolvingPermission);
-  const resolvingRequirement = useAgentSessionStore((s) => s.resolvingRequirement);
   const resolvingPlan = useAgentSessionStore((s) => s.resolvingPlan);
-  const resolvingReview = useAgentSessionStore((s) => s.resolvingReview);
   const loadOrCreate = useAgentSessionStore((s) => s.loadOrCreate);
   const refreshSessions = useAgentSessionStore((s) => s.refreshSessions);
+  const sendMessage = useAgentSessionStore((s) => s.sendMessage);
   const addAttachment = useAgentSessionStore((s) => s.addAttachment);
   const removeAttachment = useAgentSessionStore((s) => s.removeAttachment);
-  const sendMessage = useAgentSessionStore((s) => s.sendMessage);
+  const synchronizeAttachmentRoot = useAgentSessionStore((s) => s.synchronizeAttachmentRoot);
   const cancelCurrentRun = useAgentSessionStore((s) => s.cancelCurrentRun);
   const acceptPermission = useAgentSessionStore((s) => s.acceptPermission);
   const rejectPermission = useAgentSessionStore((s) => s.rejectPermission);
-  const resolveRequirement = useAgentSessionStore((s) => s.resolveRequirement);
   const resolvePlan = useAgentSessionStore((s) => s.resolvePlan);
-  const resolveReview = useAgentSessionStore((s) => s.resolveReview);
   const workspaceScopeKey = useWorkspaceStore((s) => createWorkspaceScopeKey(s.current));
+  const activeFolderId = useWorkspaceStore((s) => (
+    s.activeFolderId ?? s.getActiveFolder()?.id ?? null
+  ));
   const [timelineTypewriterBlockIds, setTimelineTypewriterBlockIds] = useState<string[]>([]);
   const [revealedPendingDecisionKey, setRevealedPendingDecisionKey] = useState<string | null>(null);
   const [followLatestSignal, setFollowLatestSignal] = useState(0);
@@ -78,15 +77,17 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
     if (!forceHome) void loadOrCreate();
   }, [forceHome, loadOrCreate, refreshSessions, workspaceScopeKey]);
 
+  useEffect(() => {
+    synchronizeAttachmentRoot(activeFolderId);
+  }, [activeFolderId, synchronizeAttachmentRoot]);
+
   const activeSessionTitle = displaySessionTitle(language, session?.title);
   const hasTimelineTurns = timeline.turns.length > 0;
   const pendingDecision = suppressPendingDecision
     ? null
     : findPendingComposerDecisionFromProjection({
       timeline,
-      resolvingRequirement,
       resolvingPlan,
-      resolvingReview,
       resolvingPermission,
     });
   const pendingDecisionKey = pendingDecisionIdentity(pendingDecision);
@@ -155,15 +156,6 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
         if (!composerPendingDecision) return;
         requestFollowLatest();
         const decision = action ?? (guidance ? 'revise' : 'accept');
-        if (composerPendingDecision.kind === 'requirement') {
-          void resolveRequirement(
-            composerPendingDecision.runId,
-            composerPendingDecision.requirementId,
-            decision,
-            guidance
-          );
-          return;
-        }
         if (composerPendingDecision.kind === 'plan') {
           void resolvePlan(
             composerPendingDecision.runId,
@@ -171,25 +163,13 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
             decision,
             guidance
           );
-          return;
-        }
-        if (composerPendingDecision.kind === 'review') {
-          void resolveReview(composerPendingDecision.runId, decision, guidance);
         }
       }}
       onDecisionReject={() => {
         if (!composerPendingDecision) return;
         requestFollowLatest();
-        if (composerPendingDecision.kind === 'requirement') {
-          void resolveRequirement(composerPendingDecision.runId, composerPendingDecision.requirementId, 'reject');
-          return;
-        }
         if (composerPendingDecision.kind === 'plan') {
           void resolvePlan(composerPendingDecision.runId, composerPendingDecision.planId, 'reject');
-          return;
-        }
-        if (composerPendingDecision.kind === 'review') {
-          void resolveReview(composerPendingDecision.runId, 'reject');
         }
       }}
     />
@@ -224,7 +204,6 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
         scrollWatchElement={bottomChromeElement}
         onTypewriterBlocksChange={(blockIds) => {
           setTimelineTypewriterBlockIds(blockIds);
-          projectionDeliveryDiagnostics.updateAnimatingBlocks(timeline.sessionId, blockIds);
         }}
         onPlanResolve={(runId, planId, decision, guidance) => {
           requestFollowLatest();
@@ -266,14 +245,8 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
 
 function pendingDecisionIdentity(decision: AgentComposerPendingDecision | null): string | null {
   if (!decision) return null;
-  if (decision.kind === 'requirement') {
-    return `${decision.kind}:${decision.runId}:${decision.requirementId}`;
-  }
   if (decision.kind === 'plan') {
     return `${decision.kind}:${decision.runId}:${decision.planId}`;
-  }
-  if (decision.kind === 'review') {
-    return `${decision.kind}:${decision.runId}`;
   }
   return `${decision.kind}:${decision.requestId}`;
 }

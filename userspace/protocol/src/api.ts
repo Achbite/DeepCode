@@ -10,7 +10,6 @@ export interface ApiResponse<T> {
 }
 
 import type { WorkspaceSummary } from './workspace.js';
-import type { KernelToolCatalogSnapshot } from './tools.js';
 
 /**
  * 健康检查状态
@@ -27,10 +26,6 @@ export interface HealthStatus {
   buildCommit?: string;
   kernelAbiVersion?: string;
   protocolVersion?: string;
-  toolCatalogVersion?: string;
-  toolCatalogCount?: number;
-  toolCatalogHash?: string;
-  toolCatalogSnapshot?: KernelToolCatalogSnapshot;
   kernel?: string;
   /** 当前活动工作区摘要；无工作区时 available=false */
   workspace: WorkspaceSummary;

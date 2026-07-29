@@ -1,13 +1,12 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type {
   AgentConversationActivity,
-  AgentContextAttachment,
+  AgentTimelineAttachment,
   AgentTimelineBlock,
   AgentTimelineResult,
   AgentTimelineTurn,
 } from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
-import { submitAgentFeedback } from '../../services/runtimeAdapter';
 import MarkdownContent from '../../components/agent-panel/LazyMarkdownContent';
 import {
   hasStructuredProjection,
@@ -20,7 +19,6 @@ import {
   bufferedTypewriterNextIndex,
   type BufferedTypewriterSpeed,
 } from '../../utils/typewriterBuffer';
-import { projectionDeliveryDiagnostics } from '../../services/projectionDeliveryDiagnostics';
 
 interface DeepCodeTimelineProps {
   timeline: AgentTimelineResult;
@@ -73,10 +71,6 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
   const lastScrollTopRef = useRef(0);
   const lastTouchYRef = useRef<number | null>(null);
   const [showJumpToLatest, setShowJumpToLatest] = useState(false);
-  const deliverySessionIdRef = useRef('');
-  const releasedDeliverySignaturesRef = useRef<Set<string>>(new Set());
-  const renderedDeliverySignaturesRef = useRef<Set<string>>(new Set());
-  const settledDeliverySignaturesRef = useRef<Set<string>>(new Set());
   const scrollSignature = useMemo(
     () => timelineScrollSignature(viewWithActive, loading),
     [viewWithActive, loading]
@@ -154,38 +148,7 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
       next.set(blockId, textLength);
       return next;
     });
-    const block = flattenTimelineBlocks(viewWithActive).find((candidate) => candidate.id === blockId);
-    if (!block) return;
-    const signature = deliverySignature(block);
-    if (settledDeliverySignaturesRef.current.has(signature)) return;
-    settledDeliverySignaturesRef.current.add(signature);
-    projectionDeliveryDiagnostics.recordBlock('gui.playback_settled', viewWithActive.sessionId, block);
-  }, [viewWithActive]);
-
-  useLayoutEffect(() => {
-    if (deliverySessionIdRef.current !== viewWithActive.sessionId) {
-      deliverySessionIdRef.current = viewWithActive.sessionId;
-      releasedDeliverySignaturesRef.current.clear();
-      renderedDeliverySignaturesRef.current.clear();
-      settledDeliverySignaturesRef.current.clear();
-    }
-    for (const block of flattenTimelineBlocks(viewWithActive)) {
-      if (!isVisibleTimelineBlock(block) || !playbackVisibleBlockIds.has(block.id)) continue;
-      const signature = deliverySignature(block);
-      if (!releasedDeliverySignaturesRef.current.has(signature)) {
-        releasedDeliverySignaturesRef.current.add(signature);
-        projectionDeliveryDiagnostics.recordBlock('gui.playback_released', viewWithActive.sessionId, block);
-      }
-      if (!renderedDeliverySignaturesRef.current.has(signature)) {
-        renderedDeliverySignaturesRef.current.add(signature);
-        projectionDeliveryDiagnostics.recordBlock('gui.render_committed', viewWithActive.sessionId, block);
-      }
-      if (!animatingBlockIds.has(block.id) && !settledDeliverySignaturesRef.current.has(signature)) {
-        settledDeliverySignaturesRef.current.add(signature);
-        projectionDeliveryDiagnostics.recordBlock('gui.playback_settled', viewWithActive.sessionId, block);
-      }
-    }
-  }, [animatingBlockIds, playbackVisibleBlockIds, viewWithActive]);
+  }, []);
 
   const setFollowMode = useCallback((mode: TimelineFollowMode) => {
     followModeRef.current = mode;
@@ -431,10 +394,6 @@ function flattenTimelineBlocks(view: AgentTimelineResult): AgentTimelineBlock[] 
   return view.turns.flatMap((turn) => turn.blocks);
 }
 
-function deliverySignature(block: AgentTimelineBlock): string {
-  return `${block.id}:${block.revision ?? 0}:${(block.bodyMarkdown ?? block.summary ?? '').length}`;
-}
-
 
 function activityKindLabel(language: UiLanguage, kind: AgentConversationActivity['kind']): string {
   return t(language, `deepcodeGui.activity.kind.${kind}`);
@@ -485,7 +444,10 @@ function activityTargetsLabel(activity: AgentConversationActivity, language: UiL
   if (activity.kind === 'resourceRead' || activity.kind === 'resourceSearch') {
     return t(language, 'deepcodeGui.activity.filesRead');
   }
-  if (activity.kind === 'editBatchQueued' || activity.kind === 'editFileStarted' || activity.kind === 'editFileCompleted' || activity.kind === 'editFileFailed') {
+  if (
+    activity.kind === 'toolExecution'
+    && ['write', 'create', 'patch', 'rename', 'delete'].includes(activity.operation ?? '')
+  ) {
     return t(language, 'deepcodeGui.activity.filesChanged');
   }
   return t(language, 'deepcodeGui.activity.targets');
@@ -650,7 +612,6 @@ function shouldAnimateTimelineBlock(block: AgentTimelineBlock): boolean {
   return block.narrativeKind === 'thinking' ||
     block.narrativeKind === 'assistantNarration' ||
     block.narrativeKind === 'assistantText' ||
-    block.narrativeKind === 'requirement' ||
     block.narrativeKind === 'permission' ||
     block.narrativeKind === 'diagnostic' ||
     block.kind === 'plan' ||
@@ -724,9 +685,8 @@ const TurnActionBar: React.FC<{
   blocks: AgentTimelineBlock[];
   language: UiLanguage;
 }> = ({ blocks, language }) => {
-  const [status, setStatus] = useState<'idle' | 'copied' | 'rated' | 'error'>('idle');
+  const [status, setStatus] = useState<'idle' | 'copied' | 'error'>('idle');
   const actionBlocks = blocks.filter(isActionableAgentOutputBlock);
-  const feedbackEvent = feedbackTargetEvent(actionBlocks);
 
   if (actionBlocks.length === 0) return null;
 
@@ -740,24 +700,6 @@ const TurnActionBar: React.FC<{
     }
   };
 
-  const rateTurn = (rating: 'up' | 'down') => {
-    if (!feedbackEvent) return;
-    window.dispatchEvent(new CustomEvent('deepcode:agent-feedback', {
-      detail: {
-        eventId: feedbackEvent.eventId,
-        kind: feedbackEvent.kind,
-        rating,
-      },
-    }));
-    void submitAgentFeedback({
-      eventId: feedbackEvent.eventId,
-      sessionId: feedbackEvent.sessionId,
-      kind: feedbackEvent.kind,
-      rating,
-    });
-    setStatus('rated');
-  };
-
   return (
     <div className="deepcode-gui-turn-actions" aria-label={t(language, 'agent.message.actions')}>
       <button
@@ -767,42 +709,20 @@ const TurnActionBar: React.FC<{
         title={t(language, 'agent.message.copyAgentOutput')}
         aria-label={t(language, 'agent.message.copyAgentOutput')}
       >
-        <DeepCodeTurnActionIcon name="copy" />
-      </button>
-      <button
-        type="button"
-        className="deepcode-gui-turn-actions__button"
-        onClick={() => rateTurn('up')}
-        disabled={!feedbackEvent}
-        title={t(language, 'agent.message.feedbackUpTitle')}
-        aria-label={t(language, 'agent.message.feedbackUpTitle')}
-      >
-        <DeepCodeTurnActionIcon name="up" />
-      </button>
-      <button
-        type="button"
-        className="deepcode-gui-turn-actions__button"
-        onClick={() => rateTurn('down')}
-        disabled={!feedbackEvent}
-        title={t(language, 'agent.message.feedbackDownTitle')}
-        aria-label={t(language, 'agent.message.feedbackDownTitle')}
-      >
-        <DeepCodeTurnActionIcon name="down" />
+        <DeepCodeTurnActionIcon />
       </button>
       {status !== 'idle' && (
         <span className={`deepcode-gui-turn-actions__status deepcode-gui-turn-actions__status--${status}`}>
           {status === 'copied'
             ? t(language, 'agent.message.copyDone', { label: t(language, 'agent.message.copyAgentOutput') })
-            : status === 'rated'
-              ? t(language, 'agent.message.feedbackGroup')
-              : t(language, 'deepcodeGui.status.error')}
+            : t(language, 'deepcodeGui.status.error')}
         </span>
       )}
     </div>
   );
 };
 
-const DeepCodeTurnActionIcon: React.FC<{ name: 'copy' | 'up' | 'down' }> = ({ name }) => {
+const DeepCodeTurnActionIcon: React.FC<{ name?: 'copy' }> = () => {
   const common = {
     width: 17,
     height: 17,
@@ -815,34 +735,16 @@ const DeepCodeTurnActionIcon: React.FC<{ name: 'copy' | 'up' | 'down' }> = ({ na
     'aria-hidden': true,
   };
 
-  if (name === 'copy') {
-    return (
-      <svg {...common}>
-        <rect x="9" y="9" width="10" height="10" rx="2" />
-        <path d="M5 15H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v1" />
-      </svg>
-    );
-  }
-
-  if (name === 'up') {
-    return (
-      <svg {...common}>
-        <path d="M7 11v10" />
-        <path d="M15 6.5 14 11h5.1a2 2 0 0 1 1.9 2.5l-1.6 6A2 2 0 0 1 17.5 21H7a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2h1.6L12 3.2a1.5 1.5 0 0 1 3 0v3.3z" />
-      </svg>
-    );
-  }
-
   return (
     <svg {...common}>
-      <path d="M7 13V3" />
-      <path d="M15 17.5 14 13h5.1a2 2 0 0 0 1.9-2.5l-1.6-6A2 2 0 0 0 17.5 3H7a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h1.6L12 20.8a1.5 1.5 0 0 0 3 0v-3.3z" />
+      <rect x="9" y="9" width="10" height="10" rx="2" />
+      <path d="M5 15H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v1" />
     </svg>
   );
 };
 
 const DeepCodeAttachmentChips: React.FC<{
-  attachments: AgentContextAttachment[];
+  attachments: AgentTimelineAttachment[];
   language: UiLanguage;
 }> = ({ attachments, language }) => {
   if (attachments.length === 0) return null;
@@ -852,7 +754,7 @@ const DeepCodeAttachmentChips: React.FC<{
         <span
           key={`${attachment.scope}:${attachment.folderId ?? ''}:${attachment.path}:${index}`}
           className={`agent-message-attachment agent-message-attachment--${attachment.scope}`}
-          title={attachment.absolutePath ?? attachment.path}
+          title={attachment.path}
         >
           <span className="agent-message-attachment__kind">
             {attachmentKindLabel(attachment, language)}
@@ -908,9 +810,6 @@ const TimelineBlock: React.FC<{
   }
 
   if (block.kind === 'assistant') {
-    const requirementOptions = block.narrativeKind === 'requirement'
-      ? extractRequirementOptionsFromBlock(block)
-      : [];
     return (
       <article className={`deepcode-gui-assistant-text${narrativeClass}${densityClass}${phaseClassName(block)}`}>
         <TypewriterMarkdown
@@ -921,7 +820,6 @@ const TimelineBlock: React.FC<{
           onVisibleContentChange={onLiveContentChange}
           onAnimationComplete={() => onTypewriterComplete(block.id, visibleTypewriterMarkdown(block, language).length)}
         />
-        {requirementOptions.length > 0 && <DeepCodeRequirementOptionsList options={requirementOptions} language={language} />}
       </article>
     );
   }
@@ -1685,10 +1583,6 @@ function isActionableAgentOutputBlock(block: AgentTimelineBlock): boolean {
   return block.kind === 'assistant';
 }
 
-function feedbackTargetEvent(blocks: AgentTimelineBlock[]): AgentTimelineBlock['feedbackRef'] {
-  return [...blocks].reverse().find((block) => block.feedbackRef)?.feedbackRef;
-}
-
 function turnCopyText(
   blocks: AgentTimelineBlock[],
   language: UiLanguage
@@ -1764,87 +1658,27 @@ async function copyText(text: string): Promise<void> {
   document.body.removeChild(textarea);
 }
 
-// Requirement blocks expose option effects so both shells render the same decision choices.
-interface DeepCodeRequirementOption {
-  id: string;
-  label: string;
-  description?: string;
-  recommended?: boolean;
-  effect?: { kind: string; taskIds?: string[]; reason?: string };
-}
-
-function extractRequirementOptionsFromBlock(block: AgentTimelineBlock): DeepCodeRequirementOption[] {
-  return (block.decisionRequest?.options ?? []).map((option) => ({
-    id: option.id,
-    label: option.label,
-    description: option.description,
-    recommended: option.recommended,
-    effect: option.effect ? { kind: option.effect.kind } : undefined,
-  }));
-}
-
-function formatDeepCodeOptionEffect(effect: DeepCodeRequirementOption['effect'], language: UiLanguage): string | undefined {
-  if (!effect) return undefined;
-  const key = `requirement.optionEffect.${effect.kind}`;
-  const translated = t(language, key);
-  return translated === key ? undefined : translated;
-}
-
-const DeepCodeRequirementOptionsList: React.FC<{
-  options: DeepCodeRequirementOption[];
-  language: UiLanguage;
-}> = ({ options, language }) => {
-  return (
-    <ul className="deepcode-gui-requirement-options" aria-label={t(language, 'requirement.optionsTitle')}>
-      {options.map((option) => {
-        const effectText = formatDeepCodeOptionEffect(option.effect, language);
-        return (
-          <li key={option.id} className="deepcode-gui-requirement-option">
-            <div className="deepcode-gui-requirement-option__head">
-              <span className="deepcode-gui-requirement-option__label">{option.label}</span>
-              {option.recommended && (
-                <span className="deepcode-gui-requirement-option__badge">{t(language, 'requirement.optionRecommended')}</span>
-              )}
-            </div>
-            {option.description && (
-              <div className="deepcode-gui-requirement-option__desc">{option.description}</div>
-            )}
-            {effectText && (
-              <div className="deepcode-gui-requirement-option__effect">
-                <span className="deepcode-gui-requirement-option__effect-label">
-                  {t(language, 'requirement.optionEffectLabel')}：
-                </span>
-                {effectText}
-              </div>
-            )}
-          </li>
-        );
-      })}
-    </ul>
-  );
-};
-
 function phaseClassName(block: AgentTimelineBlock): string {
   if (block.kind === 'thinking' || block.narrativeKind === 'thinking') return '';
   const phase = block.displayHints?.phase;
   return phase ? ` deepcode-gui-block--phase-${phase}` : '';
 }
 
-function blockAttachments(block: AgentTimelineBlock): AgentContextAttachment[] {
+function blockAttachments(block: AgentTimelineBlock): AgentTimelineAttachment[] {
   if (block.kind !== 'user') return [];
   return block.attachments ?? [];
 }
 
-function attachmentKindLabel(attachment: AgentContextAttachment, language: UiLanguage): string {
+function attachmentKindLabel(attachment: AgentTimelineAttachment, language: UiLanguage): string {
   if (attachment.kind === 'directory') return t(language, 'agent.composer.dir');
   return t(language, 'agent.composer.file');
 }
 
-function attachmentDisplayPath(attachment: AgentContextAttachment): string {
-  return attachment.path || attachment.absolutePath || '.';
+function attachmentDisplayPath(attachment: AgentTimelineAttachment): string {
+  return attachment.path || '.';
 }
 
-function attachmentCopyText(attachments: AgentContextAttachment[], language: UiLanguage): string {
+function attachmentCopyText(attachments: AgentTimelineAttachment[], language: UiLanguage): string {
   if (attachments.length === 0) return '';
   return [
     t(language, 'agent.message.attachments'),

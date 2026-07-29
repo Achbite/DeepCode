@@ -8,11 +8,11 @@ use deepcode_kernel_abi::v2_command::MAX_COMMAND_BYTES_V2;
 use deepcode_kernel_abi::MAX_USER_DECISION_BYTES_V2;
 
 pub(crate) fn build_app(state: AppState) -> Router {
-    let mut app = Router::new()
-        .route("/", get(gui_index))
-        .route("/index.html", get(gui_index))
-        .route("/assets/*asset_path", get(gui_asset))
+    let host_shell_authority = state.host_shell_authority.clone();
+    Router::new()
+        .route("/api/host/identity", get(host_identity_v2))
         .route("/api/health", get(health))
+        .route("/api/host/shutdown", post(host_shutdown_v2))
         .route(
             KERNEL_V2_COMMANDS_PATH,
             post(kernel_v2_commands).layer(DefaultBodyLimit::max(MAX_COMMAND_BYTES_V2)),
@@ -21,7 +21,6 @@ pub(crate) fn build_app(state: AppState) -> Router {
             KERNEL_V2_USER_DECISIONS_PATH,
             post(kernel_v2_user_decisions).layer(DefaultBodyLimit::max(MAX_USER_DECISION_BYTES_V2)),
         )
-        .route("/api/session-store/index", get(session_store_index))
         .route(
             "/api/session-store/:session_id/kernel-v2/:run_id",
             get(session_kernel_v2_store_get)
@@ -31,54 +30,6 @@ pub(crate) fn build_app(state: AppState) -> Router {
         .route(
             "/api/session-store/:session_id/kernel-v2/:run_id/records/:record_id",
             get(session_kernel_v2_store_record_get),
-        )
-        .route(
-            "/api/session-store/:session_id/projection",
-            get(session_store_projection_get).post(session_store_projection_append),
-        )
-        .route(
-            "/api/session-store/:session_id/transcript",
-            get(session_store_transcript_get)
-                .post(session_store_transcript_append)
-                .layer(DefaultBodyLimit::max(LARGE_JSON_BODY_LIMIT_BYTES)),
-        )
-        .route(
-            "/api/session-store/:session_id/wire-ledger",
-            get(session_store_wire_ledger_get)
-                .post(session_store_wire_ledger_append)
-                .layer(DefaultBodyLimit::max(LARGE_JSON_BODY_LIMIT_BYTES)),
-        )
-        .route(
-            "/api/session-store/:session_id/cache-telemetry",
-            get(session_store_cache_telemetry_get)
-                .post(session_store_cache_telemetry_append)
-                .layer(DefaultBodyLimit::max(LARGE_JSON_BODY_LIMIT_BYTES)),
-        )
-        .route(
-            "/api/session-store/:session_id/analysis-timeline",
-            get(session_store_analysis_timeline_record_get)
-                .post(session_store_analysis_timeline_append)
-                .layer(DefaultBodyLimit::max(LARGE_JSON_BODY_LIMIT_BYTES)),
-        )
-        .route(
-            "/api/session-store/:session_id/projection-delivery",
-            get(session_store_projection_delivery_get)
-                .post(session_store_projection_delivery_append)
-                .layer(DefaultBodyLimit::max(LARGE_JSON_BODY_LIMIT_BYTES)),
-        )
-        .route(
-            "/api/session-store/:session_id/archive",
-            get(session_store_archive_get),
-        )
-        .route(
-            "/api/session-store/:session_id/archive/file",
-            get(session_store_archive_file_get),
-        )
-        .route(
-            "/api/session-store/:session_id/memory/archive",
-            get(session_store_memory_archive_get)
-                .post(session_store_memory_archive_post)
-                .layer(DefaultBodyLimit::max(LARGE_JSON_BODY_LIMIT_BYTES)),
         )
         .route("/api/workspaces/current", get(workspace_current))
         .route("/api/workspaces/default-path", get(workspace_default_path))
@@ -165,11 +116,7 @@ pub(crate) fn build_app(state: AppState) -> Router {
         )
         .route(
             "/api/agent/sessions/:session_id/events",
-            get(agent_session_events).post(agent_session_append_events),
-        )
-        .route(
-            "/api/agent/sessions/:session_id/cancel",
-            post(agent_session_cancel),
+            get(agent_session_events),
         )
         .route(
             "/api/agent/sessions/:session_id/runs",
@@ -181,34 +128,6 @@ pub(crate) fn build_app(state: AppState) -> Router {
                 .layer(DefaultBodyLimit::max(SESSION_KERNEL_V2_BODY_LIMIT_BYTES)),
         )
         .route(
-            "/api/agent/sessions/:session_id/goals",
-            post(agent_session_goal_start),
-        )
-        .route(
-            "/api/agent/sessions/:session_id/goals/current",
-            get(agent_session_goal_current),
-        )
-        .route(
-            "/api/agent/sessions/:session_id/goals/:goal_id",
-            get(agent_session_goal_get),
-        )
-        .route(
-            "/api/agent/sessions/:session_id/goals/:goal_id/interactions/:interaction_id/resolve",
-            post(agent_session_goal_interaction_resolve),
-        )
-        .route(
-            "/api/agent/sessions/:session_id/goals/:goal_id/advance",
-            post(agent_session_goal_advance),
-        )
-        .route(
-            "/api/agent/sessions/:session_id/goals/:goal_id/resume",
-            post(agent_session_goal_resume),
-        )
-        .route(
-            "/api/agent/sessions/:session_id/goals/:goal_id/cancel",
-            post(agent_session_goal_cancel),
-        )
-        .route(
             "/api/agent/sessions/:session_id/runs/:run_id",
             get(agent_session_run_get),
         )
@@ -217,20 +136,16 @@ pub(crate) fn build_app(state: AppState) -> Router {
             post(agent_session_run_cancel),
         )
         .route(
-            "/api/agent/sessions/:session_id/runs/:run_id/deltas",
-            post(agent_session_run_delta),
-        )
-        .route(
             "/api/agent/sessions/:session_id/runs/:run_id/guidance",
             post(agent_session_run_guidance),
         )
         .route(
-            "/api/agent/sessions/:session_id/runs/:run_id/stream",
-            get(agent_session_run_stream),
+            "/api/agent/sessions/:session_id/runs/:run_id/authority/revoke",
+            post(agent_session_run_authority_revoke),
         )
         .route(
-            "/api/agent/sessions/:session_id/trace",
-            get(agent_session_trace),
+            "/api/agent/sessions/:session_id/runs/:run_id/stream",
+            get(agent_session_run_stream),
         )
         .route(
             "/api/agent/sessions/:session_id/timeline",
@@ -240,32 +155,17 @@ pub(crate) fn build_app(state: AppState) -> Router {
             "/api/agent/sessions/:session_id",
             patch(agent_session_rename).delete(agent_session_delete),
         )
-        .route(
-            "/api/agent/permissions/:permission_id/resolve",
-            post(agent_permission_resolve),
-        )
-        .route("/api/agent/feedback", post(agent_feedback))
-        .route(
-            "/api/agent/workflow-config",
-            get(agent_workflow_config_get).patch(agent_workflow_config_patch),
-        )
         .route("/api/host/skills", get(host_skills))
         .route("/api/browser/runtime-status", get(browser_status))
         .route("/api/browser/open", post(browser_open))
         .route("/api/browser/reload", post(browser_reload))
         .route("/api/browser/inspect-mode", post(browser_inspect_mode))
-        .route("/api/*path", any(api_route_not_found));
-    if let Some(client_dist) = client_dist_dir() {
-        let index_path = client_dist.join("index.html");
-        app = app.fallback_service(
-            ServeDir::new(client_dist.clone()).not_found_service(ServeFile::new(index_path)),
-        );
-        println!(
-            "DeepCode daemon GUI assets served from {}",
-            client_dist.display()
-        );
-    }
-    app.with_state(state)
+        .route("/api/*path", any(api_route_not_found))
+        .with_state(state)
         .layer(localhost_cors_layer())
+        .layer(axum::middleware::from_fn_with_state(
+            host_shell_authority,
+            trusted_host_admission_gate,
+        ))
         .layer(axum::middleware::from_fn(trusted_local_origin_gate))
 }

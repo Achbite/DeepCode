@@ -2075,8 +2075,7 @@ pub(crate) fn typed_digest<T: Serialize>(
 ) -> Result<[u8; 32], V2ValidationError> {
     let value = serde_json::to_value(value)
         .map_err(|_| invalid_value("digestPreimage", "must serialize"))?;
-    let mut canonical = Vec::new();
-    write_canonical_json(&value, &mut canonical, 0)?;
+    let canonical = canonical_json_bytes_v2(&value)?;
     let mut hasher = Sha256::new();
     hasher.update(domain.as_bytes());
     hasher.update([0]);
@@ -2275,6 +2274,12 @@ pub fn executor_evidence_digest_v2<T: Serialize>(
     typed_digest_newtype("deepcode.kernel.abi.v2/executor-evidence", value)
 }
 
+pub fn canonical_json_bytes_v2(value: &Value) -> Result<Vec<u8>, V2ValidationError> {
+    let mut output = Vec::new();
+    write_canonical_json(value, &mut output, 0)?;
+    Ok(output)
+}
+
 fn write_canonical_json(
     value: &Value,
     output: &mut Vec<u8>,
@@ -2290,7 +2295,7 @@ fn write_canonical_json(
         Value::Null => output.extend_from_slice(b"null"),
         Value::Bool(value) => output.extend_from_slice(if *value { b"true" } else { b"false" }),
         Value::Number(number) => {
-            output.extend_from_slice(number.to_string().as_bytes());
+            write_canonical_number(number, output)?;
         }
         Value::String(value) => {
             output.extend_from_slice(
@@ -2312,7 +2317,7 @@ fn write_canonical_json(
         Value::Object(values) => {
             output.push(b'{');
             let mut keys = values.keys().collect::<Vec<_>>();
-            keys.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+            keys.sort_by(|left, right| left.encode_utf16().cmp(right.encode_utf16()));
             for (index, key) in keys.iter().enumerate() {
                 if index > 0 {
                     output.push(b',');
@@ -2329,6 +2334,33 @@ fn write_canonical_json(
         }
     }
     Ok(())
+}
+
+fn write_canonical_number(
+    number: &serde_json::Number,
+    output: &mut Vec<u8>,
+) -> Result<(), V2ValidationError> {
+    let value = cross_language_safe_integer_number_v2(number).ok_or_else(|| {
+        invalid_value(
+            "digestPreimage",
+            "must contain only cross-language safe integer numbers",
+        )
+    })?;
+    output.extend_from_slice(value.to_string().as_bytes());
+    Ok(())
+}
+
+pub(crate) fn cross_language_safe_integer_number_v2(number: &serde_json::Number) -> Option<i64> {
+    const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+    if let Some(value) = number.as_i64() {
+        return (value.unsigned_abs() <= MAX_SAFE_INTEGER).then_some(value);
+    }
+    if let Some(value) = number.as_u64() {
+        return (value <= MAX_SAFE_INTEGER).then_some(value as i64);
+    }
+    let value = number.as_f64()?;
+    (value.is_finite() && value.fract() == 0.0 && value.abs() <= MAX_SAFE_INTEGER as f64)
+        .then_some(value as i64)
 }
 
 pub(crate) const fn invalid_value(field: &'static str, reason: &'static str) -> V2ValidationError {
@@ -2539,21 +2571,31 @@ impl<'de> Visitor<'de> for StrictJsonVisitor {
     where
         E: serde::de::Error,
     {
-        Ok(StrictJsonValue(Value::Number(value.into())))
+        let number = serde_json::Number::from(value);
+        cross_language_safe_integer_number_v2(&number)
+            .map(|value| StrictJsonValue(Value::Number(value.into())))
+            .ok_or_else(|| E::custom("JSON numbers must be cross-language safe integers"))
     }
 
-    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
-        Ok(StrictJsonValue(Value::Number(value.into())))
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        let number = serde_json::Number::from(value);
+        cross_language_safe_integer_number_v2(&number)
+            .map(|value| StrictJsonValue(Value::Number(value.into())))
+            .ok_or_else(|| E::custom("JSON numbers must be cross-language safe integers"))
     }
 
     fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
     where
         E: serde::de::Error,
     {
-        serde_json::Number::from_f64(value)
-            .map(Value::Number)
-            .map(StrictJsonValue)
-            .ok_or_else(|| E::custom("non-finite JSON numbers are unsupported"))
+        let number = serde_json::Number::from_f64(value)
+            .ok_or_else(|| E::custom("non-finite JSON numbers are unsupported"))?;
+        cross_language_safe_integer_number_v2(&number)
+            .map(|value| StrictJsonValue(Value::Number(value.into())))
+            .ok_or_else(|| E::custom("JSON numbers must be cross-language safe integers"))
     }
 
     fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {

@@ -4,7 +4,10 @@ use crate::host_run_broker_v2::{
     HostActiveRunBrokerV2, HostKernelRunRetirementProofV2, HostRunRetirementReceiptV2,
     HostRunSettingsCeilingV2, HostSessionTurnGuardV2,
 };
-use crate::host_v2_storage::HostV2StorageError;
+use crate::host_v2_storage::{
+    append_json_line_durable, canonical_sha256, reject_transport_capabilities,
+    validate_bounded_identity, validate_sha256_digest, with_storage_path_lock, HostV2StorageError,
+};
 use crate::host_workspace_registry_v2::{
     HostWorkspaceBindingRegisteredV2, HostWorkspaceBindingResolverV2, HostWorkspaceRegistryAdminV2,
     HostWorkspaceRegistryErrorV2, HostWorkspaceRegistryReadinessV2, HostWorkspaceRegistryV2,
@@ -14,10 +17,9 @@ use crate::prelude::*;
 use crate::session_kernel_v2_store::{SessionKernelProjectionSinkV2, SessionKernelV2Store};
 use deepcode_kernel_abi::v2::{RunId, RunRetirementReasonCodeV2};
 use deepcode_kernel_abi::{
-    HostInspectionResult, HostMcpRiskDecisionRecord, HostMcpRiskDecisionSubmit, HostResultSource,
-    HostSkillActivationStatus, HostSkillAdapterKind, HostSkillCatalogResult, HostSkillDescriptor,
-    HostSkillEffect, HostSkillRiskLevel, HostSkillSource, HostSkillTrustDecisionRecord,
-    HostSkillTrustDecisionSubmit, HostUnsupportedWorkspaceField, HostWorkspaceBindingResolved,
+    HostInspectionResult, HostResultSource, HostSkillActivationStatus, HostSkillAdapterKind,
+    HostSkillCatalogResult, HostSkillDescriptor, HostSkillEffect, HostSkillRiskLevel,
+    HostSkillSource, HostUnsupportedWorkspaceField, HostWorkspaceBindingResolved,
     HostWorkspaceFolder, HostWorkspaceOpened, HostWorkspaceRootStatus, HostWorkspaceSaved,
     HostWorkspaceSourceKind, HostWorkspaceSpec, WorkspaceBinding, WorkspaceBindingRefV2,
 };
@@ -87,13 +89,16 @@ impl HostWorkspaceService {
         self.registry_admin.register(root).map_err(registry_error)
     }
 
-    pub(crate) fn unregister_managed_root(
+    pub(crate) fn resolve_exact_run_binding(
         &self,
         workspace_binding_ref: &WorkspaceBindingRefV2,
-    ) -> Result<(), KernelErrorEnvelope> {
-        self.registry_admin
-            .unregister(workspace_binding_ref)
-            .map_err(registry_error)
+        expected_workspace_identity: &str,
+    ) -> Result<WorkspaceBinding, KernelErrorEnvelope> {
+        let root = self
+            .registry_resolver
+            .resolve_exact(workspace_binding_ref, expected_workspace_identity)
+            .map_err(registry_error)?;
+        Ok(workspace_binding_from_root(&root))
     }
 
     fn unregister_exact_managed_root_if_present_v2(
@@ -121,7 +126,6 @@ impl HostWorkspaceService {
 
     pub(crate) fn resolve_binding(
         &self,
-        _request_id: RequestId,
         path: String,
     ) -> Result<HostWorkspaceResult, KernelErrorEnvelope> {
         let requested = PathBuf::from(path.trim());
@@ -144,11 +148,7 @@ impl HostWorkspaceService {
         )))
     }
 
-    pub(crate) fn open(
-        &self,
-        _request_id: RequestId,
-        path: String,
-    ) -> Result<HostWorkspaceResult, KernelErrorEnvelope> {
+    pub(crate) fn open(&self, path: String) -> Result<HostWorkspaceResult, KernelErrorEnvelope> {
         let resolved = resolve_workspace_root(&path)?;
         preflight_workspace_root_readable(&resolved.root)?;
         let mut state = self.lock_state()?;
@@ -160,10 +160,7 @@ impl HostWorkspaceService {
         )))
     }
 
-    pub(crate) fn current(
-        &self,
-        _request_id: RequestId,
-    ) -> Result<HostWorkspaceResult, KernelErrorEnvelope> {
+    pub(crate) fn current(&self) -> Result<HostWorkspaceResult, KernelErrorEnvelope> {
         let state = self.lock_state()?;
         Ok(workspace_result(HostWorkspaceOutput::Current(
             HostWorkspaceCurrent {
@@ -176,7 +173,6 @@ impl HostWorkspaceService {
 
     pub(crate) fn save(
         &self,
-        _request_id: RequestId,
         file_name: Option<String>,
     ) -> Result<HostWorkspaceResult, KernelErrorEnvelope> {
         let current = self.lock_state()?.current.clone().ok_or_else(|| {
@@ -220,16 +216,49 @@ impl HostWorkspaceService {
             .map(|workspace| workspace.root.clone()))
     }
 
+    pub(crate) fn patch_settings(&self, patches: Value) -> Result<Value, KernelErrorEnvelope> {
+        let patches = patches.as_object().ok_or_else(|| {
+            host_service_error(
+                "host_workspace_settings_invalid",
+                "Workspace settings patches must be a JSON object",
+            )
+        })?;
+        if let Some(key) = patches.keys().find(|key| !key.starts_with("deepcode.")) {
+            return Err(host_service_error(
+                "host_workspace_settings_key_invalid",
+                format!("Workspace setting is outside the deepcode namespace: {key}"),
+            ));
+        }
+        let mut state = self.lock_state()?;
+        let current = state.current.as_mut().ok_or_else(|| {
+            host_service_error(
+                "host_workspace_missing",
+                "Workspace settings require an open workspace",
+            )
+        })?;
+        let settings = current.settings.as_object_mut().ok_or_else(|| {
+            host_service_error(
+                "host_workspace_settings_invalid",
+                "Open workspace settings must be a JSON object",
+            )
+        })?;
+        for (key, value) in patches {
+            if value.is_null() {
+                settings.remove(key);
+            } else {
+                settings.insert(key.clone(), value.clone());
+            }
+        }
+        Ok(current.settings.clone())
+    }
+
     pub(crate) fn begin_project_binding(
         &self,
         existing_binding: Option<&Value>,
         root_path: &str,
     ) -> Result<HostProjectBindingChange, KernelErrorEnvelope> {
         let binding_result = self
-            .resolve_binding(
-                RequestId("host-project-binding".to_string()),
-                root_path.to_string(),
-            )
+            .resolve_binding(root_path.to_string())
             .map_err(|error| {
                 host_service_error(
                     "project_root_unavailable",
@@ -425,7 +454,6 @@ impl HostInspectionService {
 
     pub(crate) fn query(
         &self,
-        _request_id: RequestId,
         query: HostInspectionQuery,
     ) -> Result<HostInspectionResult, KernelErrorEnvelope> {
         let workspace_root = self.workspace.current_root()?;
@@ -440,9 +468,6 @@ impl HostInspectionService {
 #[derive(Default)]
 struct HostSkillAdminState {
     catalog: BTreeMap<String, HostSkillDescriptor>,
-    trust_decisions: BTreeMap<String, HostSkillTrustDecisionRecord>,
-    mcp_decisions: BTreeMap<String, HostMcpRiskDecisionRecord>,
-    next_sequence: u64,
 }
 
 #[derive(Clone, Default)]
@@ -451,10 +476,7 @@ pub(crate) struct HostSkillAdminService {
 }
 
 impl HostSkillAdminService {
-    pub(crate) fn discover(
-        &self,
-        _request_id: RequestId,
-    ) -> Result<HostSkillCatalogResult, KernelErrorEnvelope> {
+    pub(crate) fn discover(&self) -> Result<HostSkillCatalogResult, KernelErrorEnvelope> {
         let skills = self
             .state
             .lock()
@@ -492,145 +514,112 @@ impl HostSkillAdminService {
         }
         Ok(result)
     }
-
-    pub(crate) fn record_skill_trust(
-        &self,
-        request_id: RequestId,
-        skill_id: String,
-        decision: HostSkillTrustDecisionSubmit,
-    ) -> Result<Vec<KernelEvent>, KernelErrorEnvelope> {
-        if skill_id.trim().is_empty() {
-            return Err(host_service_error(
-                "host_skill_id_invalid",
-                "Host skill trust decision requires a non-empty skill id",
-            ));
-        }
-        let record = HostSkillTrustDecisionRecord {
-            skill_id: skill_id.clone(),
-            decision: decision.decision,
-            trust_mode: decision.trust_mode,
-            revision_hash: decision.revision_hash,
-            approved_capabilities: decision.approved_capabilities,
-            approved_at: decision.approved_at,
-            approved_by: decision.approved_by,
-            expires_at: decision.expires_at,
-        };
-        let mut state = self.lock_state()?;
-        let sequence = next_host_admin_sequence(&mut state)?;
-        state.trust_decisions.insert(skill_id, record.clone());
-        Ok(vec![KernelEvent::HostSkillTrustDecisionRecorded {
-            request_id,
-            record,
-            sequence: Some(sequence),
-        }])
-    }
-
-    pub(crate) fn record_mcp_risk(
-        &self,
-        request_id: RequestId,
-        connector_id: String,
-        binding_id: Option<String>,
-        decision: HostMcpRiskDecisionSubmit,
-    ) -> Result<Vec<KernelEvent>, KernelErrorEnvelope> {
-        if connector_id.trim().is_empty() {
-            return Err(host_service_error(
-                "host_mcp_connector_id_invalid",
-                "Host MCP risk decision requires a non-empty connector id",
-            ));
-        }
-        let record = HostMcpRiskDecisionRecord {
-            connector_id,
-            binding_id,
-            decision: decision.decision,
-            revision_hash: decision.revision_hash,
-            acknowledged_by: decision.acknowledged_by,
-            acknowledged_at: decision.acknowledged_at,
-            risk_level: decision.risk_level,
-            permission_granted: false,
-        };
-        let key = format!(
-            "{}\u{0}{}",
-            record.connector_id,
-            record.binding_id.as_deref().unwrap_or_default()
-        );
-        let mut state = self.lock_state()?;
-        let sequence = next_host_admin_sequence(&mut state)?;
-        state.mcp_decisions.insert(key, record.clone());
-        Ok(vec![KernelEvent::HostMcpRiskDecisionRecorded {
-            request_id,
-            record,
-            sequence: Some(sequence),
-        }])
-    }
-
-    fn lock_state(
-        &self,
-    ) -> Result<std::sync::MutexGuard<'_, HostSkillAdminState>, KernelErrorEnvelope> {
-        self.state.lock().map_err(|_| {
-            host_service_error(
-                "host_skill_admin_unavailable",
-                "Host skill administration state is unavailable",
-            )
-        })
-    }
 }
 
-fn next_host_admin_sequence(state: &mut HostSkillAdminState) -> Result<u64, KernelErrorEnvelope> {
-    let sequence = state.next_sequence.checked_add(1).ok_or_else(|| {
-        host_service_error(
-            "host_skill_admin_sequence_exhausted",
-            "Host skill administration sequence is exhausted",
-        )
-    })?;
-    state.next_sequence = sequence;
-    Ok(sequence)
-}
-
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(crate) struct AuditService {
     reader: Option<CanonicalFactReader>,
+    host_management_audit_path: Arc<PathBuf>,
 }
 
 impl AuditService {
-    fn new(reader: Option<CanonicalFactReader>) -> Self {
-        Self { reader }
+    fn new(reader: Option<CanonicalFactReader>, sessions_dir: &Path) -> Self {
+        Self {
+            reader,
+            host_management_audit_path: Arc::new(
+                sessions_dir
+                    .join(".host-management-v2")
+                    .join("config-audit.jsonl"),
+            ),
+        }
+    }
+
+    pub(crate) fn record_config_change(
+        &self,
+        config_kind: &str,
+        changed_keys: &[String],
+        store_path: &Path,
+        old_hash: &str,
+        new_hash: &str,
+        source: &str,
+        transition: Value,
+    ) -> Result<Value, HostV2StorageError> {
+        validate_bounded_identity(config_kind, "configKind", 128)?;
+        validate_bounded_identity(source, "source", 256)?;
+        validate_sha256_digest(old_hash, "oldHash")?;
+        validate_sha256_digest(new_hash, "newHash")?;
+        reject_transport_capabilities(&transition)?;
+
+        let store_path = store_path.to_string_lossy().to_string();
+        validate_bounded_identity(&store_path, "storePath", 4096)?;
+
+        let mut changed_keys = changed_keys.to_vec();
+        changed_keys.sort();
+        changed_keys.dedup();
+        if changed_keys.is_empty() {
+            return Err(HostV2StorageError::invalid(
+                "host_config_audit_changed_keys_missing",
+                "Host config audit requires at least one changed key",
+            ));
+        }
+        for changed_key in &changed_keys {
+            validate_bounded_identity(changed_key, "changedKey", 256)?;
+        }
+
+        let record_body = json!({
+            "schemaVersion": "deepcode.host.config-audit.v2",
+            "recordedAt": crate::utils::now_text(),
+            "configKind": config_kind,
+            "changedKeys": changed_keys,
+            "storePath": store_path,
+            "oldHash": old_hash,
+            "newHash": new_hash,
+            "source": source,
+            "transition": transition
+        });
+        let record_digest = canonical_sha256(&record_body)?;
+        let digest_identity = record_digest.strip_prefix("sha256:").ok_or_else(|| {
+            HostV2StorageError::invalid(
+                "host_config_audit_digest_invalid",
+                "Host config audit canonical digest is invalid",
+            )
+        })?;
+        let record_id = format!("host-config-change-v2:{}", digest_identity);
+        let mut record = record_body;
+        let record_object = record.as_object_mut().ok_or_else(|| {
+            HostV2StorageError::invalid(
+                "host_config_audit_record_invalid",
+                "Host config audit record must be a JSON object",
+            )
+        })?;
+        record_object.insert("recordId".to_string(), json!(record_id));
+        record_object.insert("recordDigest".to_string(), json!(record_digest));
+        reject_transport_capabilities(&record)?;
+
+        with_storage_path_lock(&self.host_management_audit_path, || {
+            append_json_line_durable(&self.host_management_audit_path, &record)
+        })?;
+        Ok(record)
     }
 
     pub(crate) fn status(&self) -> Value {
         let Some(reader) = &self.reader else {
             return json!({
                 "status": "awaitingLiveComposition",
-                "factSource": "CanonicalFactStoreV2",
-                "legacySignedVerification": false
+                "factSource": "CanonicalFactStoreV2"
             });
         };
         match reader.ledger_sequence_high_water() {
             Ok(high_water) => json!({
                 "status": "ready",
                 "factSource": "CanonicalFactStoreV2",
-                "ledgerSequenceHighWater": high_water,
-                "legacySignedVerification": false
+                "ledgerSequenceHighWater": high_water
             }),
             Err(_) => json!({
                 "status": "unavailable",
-                "factSource": "CanonicalFactStoreV2",
-                "legacySignedVerification": false
+                "factSource": "CanonicalFactStoreV2"
             }),
         }
-    }
-
-    fn reject_legacy_query(&self) -> Result<Vec<KernelEvent>, KernelErrorEnvelope> {
-        Err(host_service_error(
-            "legacy_audit_query_unsupported",
-            "Legacy audit query is removed; use run-scoped KernelFactsQuery v2",
-        ))
-    }
-
-    fn reject_legacy_verify(&self) -> Result<Vec<KernelEvent>, KernelErrorEnvelope> {
-        Err(host_service_error(
-            "legacy_audit_verify_unsupported",
-            "Legacy signed audit verification is removed; CanonicalFactStore v2 facts are the audit source",
-        ))
     }
 }
 
@@ -653,8 +642,8 @@ impl HostServices {
         sessions_dir: PathBuf,
         kernel_v2_service: KernelSessionServiceV2,
         audit_reader: Option<CanonicalFactReader>,
-    ) -> Self {
-        let active_runs_v2 = HostActiveRunBrokerV2::new(sessions_dir.clone());
+    ) -> Result<Self, HostV2StorageError> {
+        let active_runs_v2 = HostActiveRunBrokerV2::new(sessions_dir.clone())?;
         let workspace = HostWorkspaceService::from_projects(
             projects,
             active_runs_v2.workspace_rehydrate_records(),
@@ -673,11 +662,11 @@ impl HostServices {
         ) {
             active_runs_v2.record_startup_error(error.code);
         }
-        Self {
+        Ok(Self {
             inspection: HostInspectionService::new(workspace.clone()),
             workspace,
             skill_admin: HostSkillAdminService::default(),
-            audit: AuditService::new(audit_reader),
+            audit: AuditService::new(audit_reader, &sessions_dir),
             session_kernel_v2: SessionKernelV2Store::new(
                 sessions_dir.clone(),
                 active_runs_v2.clone(),
@@ -689,23 +678,7 @@ impl HostServices {
             kernel_operations_v2: HostKernelOperationStoreV2::new(sessions_dir),
             active_runs_v2,
             kernel_v2_service,
-        }
-    }
-
-    pub(crate) async fn retire_kernel_run_v2(
-        &self,
-        session_id: &str,
-        host_run_id: &str,
-        run_id: &str,
-    ) -> Result<HostRunRetirementReceiptV2, HostV2StorageError> {
-        let turn = self.active_runs_v2.begin_session_turn(session_id).await?;
-        self.retire_kernel_run_with_turn_v2(
-            &turn,
-            host_run_id,
-            run_id,
-            RunRetirementReasonCodeV2::SessionEnded,
-            None,
-        )
+        })
     }
 
     pub(crate) fn retire_kernel_run_with_turn_v2(
@@ -820,74 +793,6 @@ impl HostServices {
                     unregister_error.code, remove_error.code
                 ),
             )),
-        }
-    }
-
-    /// Routes Host-owned read and administration commands without consulting
-    /// the legacy Runtime. Legacy audit commands fail closed instead of
-    /// projecting the old ledger as canonical facts.
-    pub(crate) fn dispatch_host_command(
-        &self,
-        command: KernelCommand,
-    ) -> Option<Result<Vec<KernelEvent>, KernelErrorEnvelope>> {
-        match command {
-            KernelCommand::HostWorkspaceBindingResolve { request_id, path } => Some(
-                self.workspace
-                    .resolve_binding(request_id.clone(), path)
-                    .map(|result| vec![KernelEvent::HostWorkspaceCompleted { request_id, result }]),
-            ),
-            KernelCommand::HostWorkspaceOpen { request_id, path } => Some(
-                self.workspace
-                    .open(request_id.clone(), path)
-                    .map(|result| vec![KernelEvent::HostWorkspaceCompleted { request_id, result }]),
-            ),
-            KernelCommand::HostWorkspaceCurrent { request_id } => Some(
-                self.workspace
-                    .current(request_id.clone())
-                    .map(|result| vec![KernelEvent::HostWorkspaceCompleted { request_id, result }]),
-            ),
-            KernelCommand::HostWorkspaceSave {
-                request_id,
-                file_name,
-            } => Some(
-                self.workspace
-                    .save(request_id.clone(), file_name)
-                    .map(|result| vec![KernelEvent::HostWorkspaceCompleted { request_id, result }]),
-            ),
-            KernelCommand::HostResourceQuery { request_id, query } => Some(
-                self.inspection
-                    .query(request_id.clone(), query)
-                    .map(|result| {
-                        vec![KernelEvent::HostInspectionCompleted { request_id, result }]
-                    }),
-            ),
-            KernelCommand::HostSkillDiscover { request_id } => Some(
-                self.skill_admin
-                    .discover(request_id.clone())
-                    .map(|result| vec![KernelEvent::HostSkillsDiscovered { request_id, result }]),
-            ),
-            KernelCommand::HostSkillTrustDecisionSubmit {
-                request_id,
-                skill_id,
-                decision,
-            } => Some(
-                self.skill_admin
-                    .record_skill_trust(request_id, skill_id, decision),
-            ),
-            KernelCommand::HostMcpRiskDecisionSubmit {
-                request_id,
-                connector_id,
-                binding_id,
-                decision,
-            } => Some(self.skill_admin.record_mcp_risk(
-                request_id,
-                connector_id,
-                binding_id,
-                decision,
-            )),
-            KernelCommand::AuditQuery { .. } => Some(self.audit.reject_legacy_query()),
-            KernelCommand::AuditVerify { .. } => Some(self.audit.reject_legacy_verify()),
-            _ => None,
         }
     }
 }

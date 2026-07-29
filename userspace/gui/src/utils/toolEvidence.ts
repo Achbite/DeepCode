@@ -2,7 +2,7 @@ import type { AgentEvent } from '@deepcode/protocol';
 import { t, type UiLanguage } from '../i18n';
 
 export type ToolEvidenceStatus = 'running' | 'completed' | 'failed' | 'waiting';
-export type ToolEvidenceItemKind = 'file' | 'directory' | 'command' | 'search' | 'tool';
+export type ToolEvidenceItemKind = 'file' | 'directory' | 'search' | 'tool';
 
 export interface ToolEvidenceItem {
   id: string;
@@ -13,12 +13,7 @@ export interface ToolEvidenceItem {
   preview?: string;
   matches?: string[];
   status: ToolEvidenceStatus;
-  exitCode?: number | null;
-  cwd?: string;
-  stdout?: string;
-  stderr?: string;
   error?: string;
-  durationMs?: number;
   truncated?: boolean;
 }
 
@@ -47,8 +42,8 @@ export function formatToolEvidence(
   );
   const items: ToolEvidenceItem[] = [];
 
-  // 先收集 workflow_stage 携带的文件活动（editFileStarted/editFileCompleted/toolExecution 等），
-  // 这些是 Kernel 执行文件读写时的真实事件来源，但不以 tool_call/tool_result 形态出现。
+  // workflow_stage can carry current resource/tool activities in addition to
+  // the canonical tool_call/tool_result pair.
   items.push(...collectActivityItems(events, language));
 
   events.forEach((event) => {
@@ -75,14 +70,7 @@ export function formatDurationMs(value: number | undefined): string | undefined 
   return `${(value / 1000).toFixed(1)}s`;
 }
 
-// ---- workflow_stage 文件活动识别 ----
-// Kernel 执行文件读写时以 workflow_stage(activity=editFileStarted/toolExecution/editFileCompleted)
-// 形态出现，而非 tool_call/tool_result；此处把同一目标的活动合并为单条读写证据。
 const FILE_ACTIVITY_KINDS = new Set([
-  'editBatchQueued',
-  'editFileStarted',
-  'editFileCompleted',
-  'editFileFailed',
   'toolExecution',
   'resourceRead',
   'resourceSearch',
@@ -107,9 +95,7 @@ function pickActivityTarget(targets: string[]): string | undefined {
 }
 
 function activityStatusOf(activityKind: string): ToolEvidenceStatus {
-  if (activityKind === 'editBatchQueued') return 'waiting';
-  if (activityKind === 'editFileStarted') return 'running';
-  if (activityKind === 'editFileFailed') return 'failed';
+  if (activityKind === 'toolExecution') return 'running';
   return 'completed';
 }
 
@@ -122,7 +108,6 @@ function activityItemKind(toolName: string | undefined): ToolEvidenceItemKind {
   if (!toolName) return 'file';
   if (toolName === 'code.grep') return 'search';
   if (toolName === 'fs.list') return 'directory';
-  if (toolName === 'process.exec') return 'command';
   return 'file';
 }
 
@@ -143,10 +128,8 @@ function activityActionLabel(
   if (operation === 'list') return t(language, 'agent.toolEvidence.action.list');
   if (operation === 'read' || activityKind === 'resourceRead') return t(language, 'agent.toolEvidence.action.read');
   if (operation === 'diff') return t(language, 'agent.toolEvidence.action.previewDiff');
-  if (operation === 'exec') return t(language, 'agent.toolEvidence.action.run');
   if (
-    operation === 'write' || operation === 'create' || operation === 'patch' || operation === 'rename' ||
-    activityKind === 'editFileStarted' || activityKind === 'editFileCompleted' || activityKind === 'editFileFailed'
+    operation === 'write' || operation === 'create' || operation === 'patch' || operation === 'rename'
   ) {
     return t(language, 'agent.toolEvidence.action.write');
   }
@@ -160,7 +143,7 @@ function activityActionLabel(
 function collectActivityItems(events: AgentEvent[], language: UiLanguage): ToolEvidenceItem[] {
   const byKey = new Map<string, ToolEvidenceItem>();
   for (const event of events) {
-    if (event.kind !== 'workflow_stage' && event.kind !== 'workflow_decision') continue;
+    if (event.kind !== 'workflow_stage') continue;
     const activity = activityRecord(event);
     if (!activity) continue;
     const activityKind = stringValue(activity, 'kind');
@@ -210,30 +193,6 @@ function itemsForEvent(event: AgentEvent, language: UiLanguage): ToolEvidenceIte
     : [];
   if (resourceItems.length > 0) {
     return resourceItems.map((item, index) => resourceItem(event, item, index, language, status));
-  }
-
-  if (isShellTool(toolName, output, args)) {
-    const command = stringValue(output, 'command') ?? stringValue(args, 'command') ?? stringValue(payload, 'command') ?? toolName;
-    const exitCode = numberValue(output, 'exitCode');
-    const stdout = stringValue(output, 'stdout');
-    const stderr = stringValue(output, 'stderr');
-    const error = stringValue(output, 'error') ?? stringValue(payload, 'error');
-    const durationMs = numberValue(output, 'durationMs');
-    return [{
-      id: `${event.id}:command`,
-      kind: 'command',
-      action: t(language, 'agent.toolEvidence.action.run'),
-      label: command,
-      detail: commandDetail(output, args, language),
-      status: exitCode !== undefined && exitCode !== 0 ? 'failed' : status,
-      exitCode,
-      cwd: stringValue(output, 'cwd') ?? stringValue(args, 'cwd'),
-      stdout,
-      stderr,
-      error,
-      durationMs,
-      truncated: booleanValue(output, 'truncated') ?? booleanValue(payload, 'truncated'),
-    }];
   }
 
   const path = pathFor(payload, output, args);
@@ -323,10 +282,6 @@ function evidenceTitle(
   fallbackTitle?: string
 ): string {
   if (items.length === 0) return fallbackTitle || t(language, 'agent.toolEvidence.title.empty');
-  const commandCount = items.filter((item) => item.kind === 'command').length;
-  if (commandCount > 0 && commandCount === items.length) {
-    return t(language, 'agent.toolEvidence.title.commands', { count: commandCount });
-  }
   const fileCount = items.filter((item) => item.kind === 'file').length;
   const directoryCount = items.filter((item) => item.kind === 'directory').length;
   const fileItems = items.filter((item) => item.kind === 'file');
@@ -399,7 +354,7 @@ function dedupeItems(items: ToolEvidenceItem[]): ToolEvidenceItem[] {
   const seen = new Set<string>();
   const deduped: ToolEvidenceItem[] = [];
   for (const item of items) {
-    const key = `${item.kind}:${item.action}:${item.label}:${item.exitCode ?? ''}`;
+    const key = `${item.kind}:${item.action}:${item.label}`;
     if (seen.has(key)) continue;
     seen.add(key);
     deduped.push(item);
@@ -431,15 +386,6 @@ function statusForEvent(event: AgentEvent): ToolEvidenceStatus {
   if (status === 'running' || status === 'started') return 'running';
   if (status === 'waiting' || status === 'pending') return 'waiting';
   return event.kind === 'tool_call' ? 'running' : 'completed';
-}
-
-function isShellTool(
-  toolName: string,
-  output?: Record<string, unknown>,
-  args?: Record<string, unknown>
-): boolean {
-  return toolName === 'process.exec' ||
-    Boolean(stringValue(output, 'command') ?? stringValue(args, 'command'));
 }
 
 function pathFor(
@@ -485,7 +431,6 @@ function normalizeOperation(value: string | undefined): string | undefined {
     'fs.list': 'list',
     'fs.diff': 'diff',
     'code.grep': 'search',
-    'process.exec': 'exec',
     write: 'write',
     create: 'create',
     patch: 'patch',
@@ -495,7 +440,6 @@ function normalizeOperation(value: string | undefined): string | undefined {
     list: 'list',
     diff: 'diff',
     search: 'search',
-    exec: 'exec',
   };
   return operations[value.trim()] ?? value.trim();
 }
@@ -505,22 +449,6 @@ function pathDetail(output: Record<string, unknown> | undefined, language: UiLan
     numberValue(output, 'sizeBytes') !== undefined ? formatBytes(numberValue(output, 'sizeBytes') ?? 0) : undefined,
     booleanValue(output, 'truncated') ? t(language, 'common.truncated') : undefined,
     stringValue(output, 'summary'),
-  ].filter(Boolean);
-  return parts.join(' · ') || undefined;
-}
-
-function commandDetail(
-  output: Record<string, unknown> | undefined,
-  args: Record<string, unknown> | undefined,
-  language: UiLanguage
-): string | undefined {
-  const exitCode = numberValue(output, 'exitCode');
-  const duration = formatDurationMs(numberValue(output, 'durationMs'));
-  const cwd = stringValue(output, 'cwd') ?? stringValue(args, 'cwd');
-  const parts = [
-    exitCode !== undefined ? t(language, 'agent.toolEvidence.exitCode', { code: exitCode }) : undefined,
-    duration,
-    cwd ? t(language, 'agent.toolEvidence.cwd', { cwd }) : undefined,
   ].filter(Boolean);
   return parts.join(' · ') || undefined;
 }
@@ -575,7 +503,7 @@ function readableToolDetail(
 }
 
 function isInternalDisplayToken(value: string): boolean {
-  return /^(native-call|attachment|work-unit|resource-request|resource-item|kernel-activity)[_-]/i.test(value) ||
+  return /^(native-call|attachment|resource-request|resource-item|kernel-activity)[_-]/i.test(value) ||
     /^turn-[a-z_]+-/i.test(value);
 }
 

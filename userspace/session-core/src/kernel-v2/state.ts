@@ -13,6 +13,13 @@ import {
   type SessionToolContextStateV2,
 } from './toolContext.js';
 import {
+  validateAgentInputAttachmentsV2,
+} from './inputAttachmentsV2.js';
+import {
+  validateSessionContextMemoryV2,
+  type SessionContextMemoryV2,
+} from './sessionMemory.js';
+import {
   SESSION_KERNEL_CHECKPOINT_V2_SCHEMA,
   SESSION_KERNEL_LOOP_V2_SCHEMA,
   type SessionActiveWaitV2,
@@ -22,6 +29,7 @@ import {
   type SessionPlanDecisionV2,
   type SessionProviderTurnRecordV2,
   type SessionProviderOutcomeRecordV2,
+  type SessionProviderProfileBootstrapV2,
   type SessionPlanActionSettlementV2,
   type SessionReviewFactAccumulatorV2,
   type SessionUserInputRecordV2,
@@ -38,6 +46,8 @@ export interface SessionKernelLoopStateV2 {
   schemaVersion: typeof SESSION_KERNEL_LOOP_V2_SCHEMA;
   runId: string;
   workspaceBindingDigest: string;
+  sessionMemory: SessionContextMemoryV2;
+  providerProfile: SessionProviderProfileBootstrapV2;
   controlEpoch: number;
   currentInputId: string;
   inputs: SessionUserInputRecordV2[];
@@ -84,6 +94,8 @@ export interface SessionKernelInitialStateV2 {
   controlEpoch: number;
   initialInput: SessionUserInputRecordV2;
   toolContext: ToolContextBundleV2;
+  sessionMemory: SessionContextMemoryV2;
+  providerProfile: SessionProviderProfileBootstrapV2;
 }
 
 export function createSessionKernelLoopStateV2(
@@ -91,6 +103,8 @@ export function createSessionKernelLoopStateV2(
 ): SessionKernelLoopStateV2 {
   positiveEpoch(initial.controlEpoch);
   validateUserInput(initial.initialInput);
+  validateSessionContextMemoryV2(initial.sessionMemory);
+  validateProviderProfile(initial.providerProfile);
   return {
     schemaVersion: SESSION_KERNEL_LOOP_V2_SCHEMA,
     runId: requiredIdentity(initial.runId, 'runId'),
@@ -98,6 +112,8 @@ export function createSessionKernelLoopStateV2(
       initial.workspaceBindingDigest,
       'workspaceBindingDigest'
     ),
+    sessionMemory: cloneJson(initial.sessionMemory),
+    providerProfile: cloneJson(initial.providerProfile),
     controlEpoch: initial.controlEpoch,
     currentInputId: initial.initialInput.inputId,
     inputs: [cloneJson(initial.initialInput)],
@@ -127,6 +143,8 @@ export function restoreSessionKernelLoopStateV2(
   expected: {
     runId: string;
     workspaceBindingDigest: string;
+    sessionMemory: SessionContextMemoryV2;
+    providerProfile: SessionProviderProfileBootstrapV2;
   }
 ): SessionKernelLoopStateV2 {
   if (checkpoint.schemaVersion !== SESSION_KERNEL_CHECKPOINT_V2_SCHEMA) {
@@ -140,6 +158,10 @@ export function restoreSessionKernelLoopStateV2(
     state.schemaVersion !== SESSION_KERNEL_LOOP_V2_SCHEMA
     || state.runId !== expected.runId
     || state.workspaceBindingDigest !== expected.workspaceBindingDigest
+    || JSON.stringify(state.sessionMemory)
+      !== JSON.stringify(expected.sessionMemory)
+    || JSON.stringify(state.providerProfile)
+      !== JSON.stringify(expected.providerProfile)
   ) {
     throw new SessionKernelStateError(
       'session_kernel_checkpoint_identity_mismatch',
@@ -147,6 +169,8 @@ export function restoreSessionKernelLoopStateV2(
     );
   }
   positiveEpoch(state.controlEpoch);
+  validateSessionContextMemoryV2(state.sessionMemory);
+  validateProviderProfile(state.providerProfile);
   state.inputs.forEach(validateUserInput);
   currentSessionUserInputV2(state);
   state.inputHistoryOmittedCount = nonnegativeSafeInteger(
@@ -568,6 +592,7 @@ function validateUserInput(input: SessionUserInputRecordV2): void {
   requiredIdentity(input.inputId, 'inputId');
   requiredIdentity(input.opaqueInputRef, 'opaqueInputRef');
   requiredText(input.text, 'input.text');
+  validateAgentInputAttachmentsV2(input.attachments);
   requiredText(input.recordedAt, 'input.recordedAt');
 }
 
@@ -576,9 +601,11 @@ function validatePlanActionSettlement(
 ): void {
   requiredIdentity(settlement.planActionId, 'planActionId');
   requiredText(settlement.recordedAt, 'settlement.recordedAt');
-  if (settlement.kind === 'skipped') {
-    requiredText(settlement.reason, 'settlement.reason');
-    return;
+  if (settlement.kind !== 'completed') {
+    throw new SessionKernelStateError(
+      'session_kernel_plan_action_settlement_kind_invalid',
+      'PlanAction settlements only record completed provider outcomes.'
+    );
   }
   if (
     settlement.completionKind !== 'answer'
@@ -632,6 +659,30 @@ function requiredText(value: string, field: string): void {
     throw new SessionKernelStateError(
       'session_kernel_state_text_invalid',
       `${field} must contain 1..=65536 UTF-8 bytes.`
+    );
+  }
+}
+
+function validateProviderProfile(
+  profile: SessionProviderProfileBootstrapV2
+): void {
+  if (
+    profile.schemaVersion
+      !== 'deepcode.host.provider-profile-bootstrap.v2'
+    || !profile.providerProfileId?.trim()
+    || !/^sha256:[0-9a-f]{64}$/u.test(
+      profile.providerProfileRevisionDigest
+    )
+    || !Number.isSafeInteger(profile.contextWindowTokens)
+    || profile.contextWindowTokens <= 0
+    || profile.contextWindowTokens > 1_000_000_000
+    || !Number.isSafeInteger(profile.maxOutputTokens)
+    || profile.maxOutputTokens <= 0
+    || profile.maxOutputTokens >= profile.contextWindowTokens
+  ) {
+    throw new SessionKernelStateError(
+      'session_kernel_provider_profile_invalid',
+      'Session provider profile bootstrap is not exact v2.'
     );
   }
 }

@@ -15,7 +15,7 @@ pub(crate) struct FileQuery {
 
 pub(crate) async fn workspace_current(State(state): State<AppState>) -> Json<ApiResponse> {
     let service = &state.host_services.workspace;
-    match service.current(rid("workspace-current")) {
+    match service.current() {
         Ok(result) => match host_workspace_payload(result.output) {
             Ok(output) => ApiResponse::ok(output),
             Err(error) => ApiResponse::error(error.code, error.message),
@@ -37,7 +37,7 @@ pub(crate) async fn workspace_open(
     Json(body): Json<OpenWorkspaceRequest>,
 ) -> Json<ApiResponse> {
     let service = &state.host_services.workspace;
-    match service.open(rid("workspace-open"), body.path) {
+    match service.open(body.path) {
         Ok(result) => match host_workspace_payload(result.output) {
             Ok(output) => ApiResponse::ok(output),
             Err(error) => ApiResponse::error(error.code, error.message),
@@ -52,7 +52,6 @@ pub(crate) async fn workspace_save_file(
 ) -> Json<ApiResponse> {
     let service = &state.host_services.workspace;
     match service.save(
-        rid("workspace-save"),
         body.get("fileName")
             .and_then(Value::as_str)
             .map(str::to_string),
@@ -70,12 +69,9 @@ pub(crate) async fn workspace_patch_settings(
     Json(body): Json<Value>,
 ) -> Json<ApiResponse> {
     let settings = body.get("settings").cloned().unwrap_or_else(|| json!({}));
-    let mut gui = state.gui.lock().expect("gui state lock");
-    merge_object(&mut gui.user_settings, &settings);
-    let write_result = atomic_write_json(&gui.paths.settings_path, &gui.user_settings);
-    match write_result {
-        Ok(()) => ApiResponse::ok(json!({ "settings": settings })),
-        Err(error) => ApiResponse::error("write_settings_failed", error),
+    match state.host_services.workspace.patch_settings(settings) {
+        Ok(settings) => ApiResponse::ok(json!({ "settings": settings })),
+        Err(error) => ApiResponse::error(error.code, error.message),
     }
 }
 
@@ -120,10 +116,7 @@ pub(crate) async fn fs_browse(
     Query(query): Query<FileQuery>,
 ) -> Json<ApiResponse> {
     let service = &state.host_services.inspection;
-    match service.query(
-        rid("host-inspection"),
-        HostInspectionQuery::Browse { path: query.path },
-    ) {
+    match service.query(HostInspectionQuery::Browse { path: query.path }) {
         Ok(HostInspectionResult {
             output: HostInspectionOutput::Browse(output),
             ..
@@ -138,7 +131,7 @@ pub(crate) async fn host_inspect(
     Json(query): Json<HostInspectionQuery>,
 ) -> Json<ApiResponse> {
     let service = &state.host_services.inspection;
-    match service.query(rid("host-inspection"), query) {
+    match service.query(query) {
         Ok(result) => ApiResponse::ok(json!(result)),
         Err(error) => ApiResponse::error(error.code, error.message),
     }
@@ -165,7 +158,7 @@ fn encode_host_payload<T: serde::Serialize>(value: T) -> Result<Value, KernelErr
 pub(crate) fn current_workspace(
     service: &HostWorkspaceService,
 ) -> Result<HostWorkspaceCurrent, KernelErrorEnvelope> {
-    let result = service.current(rid("workspace-current"))?;
+    let result = service.current()?;
     match result.output {
         HostWorkspaceOutput::Current(current) => Ok(current),
         _ => Err(KernelErrorEnvelope {

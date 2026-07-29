@@ -228,15 +228,6 @@ fn readable_message_text(key: &str, item: &Value) -> Option<String> {
             arg("status"),
             arg("reason")
         )),
-        "session.projection.review.count.workUnitsCompleted" => {
-            Some(format!("WorkUnits completed: {}", arg("count")))
-        }
-        "session.projection.review.count.workUnitsFailed" => {
-            Some(format!("WorkUnits failed: {}", arg("count")))
-        }
-        "session.projection.review.count.workUnitsBlocked" => {
-            Some(format!("WorkUnits blocked: {}", arg("count")))
-        }
         "session.projection.review.count.toolFacts" => {
             Some(format!("Tool facts: {}", arg("count")))
         }
@@ -386,6 +377,9 @@ pub(crate) fn find_pending_session_decision(
     requested_kind: &str,
     run_filter: Option<&str>,
 ) -> Option<PendingSessionDecision> {
+    if !matches!(requested_kind, "plan" | "permission") {
+        return None;
+    }
     let timeline = timeline_payload(timeline);
     if timeline.get("schemaVersion").and_then(Value::as_str)
         != Some("deepcode.shared-conversation-projection.v2")
@@ -434,34 +428,7 @@ pub(crate) fn find_pending_session_decision(
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())?
         .to_string();
-    let interaction_id = pending
-        .get("interactionId")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())?
-        .to_string();
-    let interaction_revision = pending
-        .get("interactionRevision")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())?
-        .to_string();
-    let review_id = if kind == "review" {
-        Some(
-            pending
-                .get("reviewId")
-                .and_then(Value::as_str)
-                .filter(|value| !value.trim().is_empty())?
-                .to_string(),
-        )
-    } else {
-        None
-    };
-    Some(PendingSessionDecision {
-        run_id,
-        target_id,
-        interaction_id,
-        interaction_revision,
-        review_id,
-    })
+    Some(PendingSessionDecision { run_id, target_id })
 }
 
 fn extract_final_text(timeline: &Value) -> Option<String> {
@@ -515,8 +482,6 @@ fn extract_pending_decision_text(timeline: &Value) -> Option<String> {
     let pending = find_pending_session_decision(timeline, decision_kind, None)?;
     let heading = match decision_kind {
         "plan" => "Pending plan decision",
-        "review" => "Pending review decision",
-        "requirement" => "Pending requirement decision",
         "permission" => "Pending permission decision",
         _ => "Pending decision",
     };
@@ -631,17 +596,9 @@ Usage:
   DeepCode-CLI timeline [session-id]
   DeepCode-CLI permission allow <permission-id>
   DeepCode-CLI permission deny <permission-id>
-  DeepCode-CLI decision <requirement|plan|review> <accept|reject|revise> [--session <id>] [run-id] [target-id] [guidance]
+  DeepCode-CLI decision plan <accept|reject|revise> [--session <id>] [run-id] [plan-revision] [guidance]
   DeepCode-CLI decision permission <accept|reject> [--session <id>] [run-id] [target-id]
-  DeepCode-CLI goal start [--session <id>] <objective>
-  DeepCode-CLI goal show [--session <id>] [goal-id]
-  DeepCode-CLI goal step [--session <id>] [goal-id]
-  DeepCode-CLI goal run [--session <id>] [goal-id]
-  DeepCode-CLI goal resume [--session <id>] [goal-id]
-  DeepCode-CLI goal cancel [--session <id>] [goal-id]
   DeepCode-CLI ask [-p|--print] [--session <id>] [--workspace <path>|--no-workspace] <prompt>
-  DeepCode-CLI tools run <toolId> --workspace <path> --args-file <json> [--approve-contract]
-  DeepCode-CLI tools verify --workspace <path> --cases <jsonl> [--approve-contract]
 
 Options:
   --api <url>                 Kernel daemon HTTP base URL. Defaults to DEEPCODE_API_URL or http://$DEEPCODE_HOST:$DEEPCODE_PORT.
@@ -649,15 +606,11 @@ Options:
   --workspace, -C             Bind the turn to a workspace path. Defaults to DEEPCODE_WORKSPACE or the current directory.
   --no-workspace              Send an ordinary chat turn without a workspace binding.
   --session <id>              Continue a specific Agent session.
-  --approve-contract          Explicitly accept mutation contracts for CLI tool verification.
 
 Environment:
   DEEPCODE_KERNEL_AUTO_START=0 disables local Kernel auto-start.
   DEEPCODE_KERNEL_BIN=/path/to/deepcode-kernel overrides Kernel binary lookup.
   DEEPCODE_WORKSPACE=/path/to/project sets the default terminal workspace.
-  DEEPCODE_SESSION_BRIDGE=/path/to/hostBridge.js overrides daemon session-core lookup.
-  DEEPCODE_NODE=/path/to/node overrides daemon internal Node runtime lookup.
-  DEEPCODE_SESSION_BRIDGE_TIMEOUT_MS controls daemon session run timeout. Defaults to 600000; 0 disables it.
   DEEPCODE_CLI_RUN_TIMEOUT_MS stops CLI polling after the given milliseconds. Defaults to no CLI-side timeout; 0 disables it.
 
 Session Runtime:
@@ -691,7 +644,7 @@ Sessions:
   /timeline             Print current session timeline
 
 Permissions and decisions:
-  /decision ...         Resolve requirement/plan/review/permission through the shared Session Runtime
+  /decision ...         Resolve an exact plan or permission wait through the shared Session Runtime
   decision plan accept  Confirm the latest pending plan in the shared timeline projection
   decision plan revise  Submit review guidance for a pending plan
   decision plan reject  End a pending plan
@@ -710,9 +663,6 @@ This shell uses the same daemon Session Runtime and Kernel permission settings a
     );
     println!("{}", workspace_status(host));
     println!("session runtime: daemon /runs");
-    println!(
-        "session run timeout: DEEPCODE_SESSION_BRIDGE_TIMEOUT_MS, default 600000 ms, 0 disables"
-    );
     println!("cli wait timeout: DEEPCODE_CLI_RUN_TIMEOUT_MS, default unset, 0 disables");
     if !io::stdin().is_terminal() {
         println!("stdin is not a terminal; EOF exits immediately.");

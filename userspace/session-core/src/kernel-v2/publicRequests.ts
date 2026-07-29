@@ -687,6 +687,15 @@ function applyToolIntentReply(
     {
       requestId: record.requestId,
       operationId: intent.operationId,
+      toolId: intent.toolId,
+      expectedControlEpoch: intent.expectedControlEpoch,
+      authorityKind: intent.authority.kind,
+      ...(intent.authority.kind === 'planAction'
+        ? {
+            planRevision: intent.authority.data.planRevision,
+            planActionId: intent.authority.data.planActionId,
+          }
+        : {}),
       replyKind: reply.kind,
     },
     record.startedAt

@@ -78,46 +78,6 @@ pub(crate) fn validate_http_url_shape(url: &str) -> KernelResult<reqwest::Url> {
     Ok(parsed)
 }
 
-impl crate::DeepCodeKernelRuntime {
-    pub(crate) fn reviewed_http_target_for_operation(
-        &self,
-        run_id: &str,
-        contract_id: &str,
-        operation_id: &str,
-    ) -> KernelResult<ReviewedHttpTarget> {
-        self.ledger
-            .list_by_run(run_id)?
-            .into_iter()
-            .rev()
-            .find(|event| {
-                event.kind == "network.target_reviewed"
-                    && event
-                        .payload
-                        .get("contractId")
-                        .and_then(serde_json::Value::as_str)
-                        == Some(contract_id)
-                    && event
-                        .payload
-                        .get("operationId")
-                        .and_then(serde_json::Value::as_str)
-                        == Some(operation_id)
-            })
-            .and_then(|event| event.payload.get("target").cloned())
-            .map(serde_json::from_value)
-            .transpose()
-            .map_err(|error| {
-                KernelError::InvalidCommand(format!(
-                    "decode reviewed HTTP target for operation {operation_id}: {error}"
-                ))
-            })?
-            .ok_or_else(|| {
-                KernelError::PermissionDenied(format!(
-                    "operation {operation_id} has no Kernel-reviewed HTTP target"
-                ))
-            })
-    }
-}
-
 fn resolve_addresses(host: &str, port: u16) -> KernelResult<Vec<SocketAddr>> {
     let mut addresses = (host, port)
         .to_socket_addrs()

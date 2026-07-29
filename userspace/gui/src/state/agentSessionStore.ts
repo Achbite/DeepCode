@@ -1,26 +1,18 @@
 import { create } from 'zustand';
 import type {
-  AgentContextAttachment,
+  AgentInputAttachmentV2,
   AgentEvent,
-  AgentMode,
   AgentSession,
-  AgentTimelineDelta,
   AgentTimelinePermissionRequestView,
   AgentTimelineResult,
-  AgentTraceEvent,
-  AgentWorkflowConfig,
-  AgentWorkflowMode,
   ListAgentSessionsRequest,
 } from '@deepcode/protocol';
 import {
-  applyAgentTimelineDelta,
   createWorkspaceBinding,
   createWorkspaceScope,
   createWorkspaceScopeKey,
   emptyTimeline,
   findLatestPendingPermission,
-  isAgentTimelineDelta,
-  mergeContextAttachment,
   reconcileTimelineSnapshot,
   timelineAsReplay,
 } from '@deepcode/session-core';
@@ -28,17 +20,13 @@ import {
   activateAgentSession,
   archiveAgentSession,
   deleteAgentSession,
-  cancelAgentRun,
   cancelAgentRunById,
   createAgentSession,
   getAgentRun,
   getAgentSession,
   getAgentTimeline,
-  getAgentWorkflowConfig,
-  getAgentEventSnapshot,
   getCurrentAgentSession,
   listAgentSessions,
-  patchAgentWorkflowConfig,
   renameAgentSession,
   startAgentRun,
   streamAgentRun,
@@ -46,10 +34,8 @@ import {
   updateAgentSession,
 } from '../services/runtimeAdapter';
 import type { AgentRunResult, AgentRunStreamEvent, StartAgentRunRequest } from '../services/apiClient';
-import { useSettingsStore } from './settingsStore';
-import { activeT, normalizeUiLanguage } from '../i18n';
+import { activeT } from '../i18n';
 import { useWorkspaceStore } from './workspaceStore';
-import { projectionDeliveryDiagnostics } from '../services/projectionDeliveryDiagnostics';
 
 interface PendingPermission {
   request: AgentTimelinePermissionRequestView;
@@ -70,25 +56,10 @@ type PlanResolution = {
   decision: 'accept' | 'reject' | 'revise';
 };
 
-type RequirementResolution = {
-  runId: string;
-  requirementId: string;
-  decision: 'accept' | 'reject' | 'revise';
-};
-
-type ReviewResolution = {
-  runId: string;
-  decision: 'accept' | 'reject' | 'revise';
-};
-
-interface QueuedAgentMessage {
-  content: string;
-  attachments: AgentContextAttachment[];
-}
-
 interface CreateAgentSessionOptions {
   reuseEmpty?: boolean;
   projectId?: string;
+  preserveAttachments?: boolean;
 }
 
 interface AgentSessionState {
@@ -98,26 +69,17 @@ interface AgentSessionState {
   localWorkspaceScopeKey?: string;
   events: AgentEvent[];
   timeline: AgentTimelineResult | null;
-  traceEvents: AgentTraceEvent[];
-  mode: AgentMode;
-  workflow: AgentWorkflowMode;
-  workflowConfig: AgentWorkflowConfig | null;
-  workflowConfigStorePath?: string;
   profileId?: string;
   profileSelectionBusy: boolean;
   loading: boolean;
   runningSessionIds: string[];
   cancellingSessionIds: string[];
   errorMessage: string | null;
-  fixedContextAttachments: AgentContextAttachment[];
-  messageAttachments: AgentContextAttachment[];
-  sessionAttachments: AgentContextAttachment[];
+  messageAttachments: AgentInputAttachmentV2[];
+  sessionAttachments: AgentInputAttachmentV2[];
   pendingPermission: PendingPermission | null;
   resolvingPermission: PermissionResolution | null;
-  resolvingRequirement: RequirementResolution | null;
   resolvingPlan: PlanResolution | null;
-  resolvingReview: ReviewResolution | null;
-  queuedMessages: QueuedAgentMessage[];
 }
 
 interface AgentSessionActions {
@@ -128,61 +90,29 @@ interface AgentSessionActions {
   renameSession: (sessionId: string, title: string) => Promise<void>;
   archiveSession: (sessionId: string) => Promise<void>;
   deleteSession: (sessionId: string) => Promise<void>;
-  refreshTraceEvents: (sessionId?: string) => Promise<void>;
-  loadWorkflowConfig: () => Promise<void>;
-  patchWorkflowConfig: (config: AgentWorkflowConfig) => Promise<void>;
-  setMode: (mode: AgentMode) => void;
-  setWorkflow: (workflow: AgentWorkflowMode) => void;
   selectProfile: (profileId: string | null) => Promise<boolean>;
   refreshSessionProfile: () => Promise<void>;
-  setFixedContextAttachments: (attachments: AgentContextAttachment[]) => void;
-  addAttachment: (attachment: AgentContextAttachment) => void;
-  removeAttachment: (path: string, scope: AgentContextAttachment['scope']) => void;
+  refreshActiveSessionContext: () => Promise<void>;
+  addAttachment: (attachment: AgentInputAttachmentV2) => void;
+  removeAttachment: (
+    path: string,
+    scope: AgentInputAttachmentV2['scope'],
+    folderId?: string
+  ) => void;
   clearMessageAttachments: () => void;
-  sendMessage: (content: string, attachmentsOverride?: AgentContextAttachment[]) => Promise<void>;
+  synchronizeAttachmentRoot: (folderId?: string | null) => void;
+  sendMessage: (content: string) => Promise<void>;
   cancelCurrentRun: () => Promise<void>;
   acceptPermission: (request?: AgentTimelinePermissionRequestView) => Promise<void>;
   rejectPermission: (request?: AgentTimelinePermissionRequestView) => Promise<void>;
-  resolveRequirement: (runId: string, requirementId: string, decision: 'accept' | 'reject' | 'revise', guidance?: string) => Promise<void>;
   resolvePlan: (runId: string, planId: string, decision: 'accept' | 'reject' | 'revise', guidance?: string) => Promise<void>;
-  resolveReview: (runId: string, decision: 'accept' | 'reject' | 'revise', guidance?: string) => Promise<void>;
 }
 
 type Store = AgentSessionState & AgentSessionActions;
 
 const activeAgentRunIds = new Map<string, string>();
 const workspaceTreeRevisionBySession = new Map<string, number>();
-
-function emptyWorkflowConfig(): AgentWorkflowConfig {
-  return {} as AgentWorkflowConfig;
-}
-
-function settingMode(value: unknown): AgentMode {
-  return value === 'readOnly' || value === 'askBeforeWrite' || value === 'plan'
-    ? value
-    : 'plan';
-}
-
-function settingWorkflow(value: unknown): AgentWorkflowMode {
-  return value === 'actOnRequest' ? 'actOnRequest' : 'planFirst';
-}
-
-function settingRequirementConfirmationMode(value: unknown): 'auto' | 'always' | 'off' {
-  return value === 'always' || value === 'off' ? value : 'auto';
-}
-
-function settingReviewContinuationMode(value: unknown): 'auto' | 'ask' | 'off' {
-  return value === 'ask' || value === 'off' ? value : 'auto';
-}
-
-function settingInterventionLevel(value: unknown): 'low' | 'medium' | 'high' {
-  return value === 'low' || value === 'high' ? value : 'medium';
-}
-
-function settingProjectMemoryMode(value: unknown): 'confirm' | 'auto' {
-  return value === 'auto' ? 'auto' : 'confirm';
-}
-
+const MAX_AGENT_INPUT_ATTACHMENTS_V2 = 32;
 
 function createLocalEvent(
   sessionId: string,
@@ -196,20 +126,6 @@ function createLocalEvent(
     kind,
     payload,
   };
-}
-
-function readMessageAttachments(state: Store, override?: AgentContextAttachment[]): AgentContextAttachment[] {
-  return mergeContextAttachments(
-    state.fixedContextAttachments,
-    state.sessionAttachments,
-    override ?? state.messageAttachments
-  );
-}
-
-function mergeContextAttachments(...groups: AgentContextAttachment[][]): AgentContextAttachment[] {
-  return groups.reduce((merged, group) => {
-    return group.reduce((current, attachment) => mergeContextAttachment(current, attachment), merged);
-  }, [] as AgentContextAttachment[]);
 }
 
 function currentWorkspaceScope(): ListAgentSessionsRequest {
@@ -230,8 +146,282 @@ function currentWorkspacePath(): string | undefined {
   })?.openPath;
 }
 
-function permissionRequestRunId(request: AgentTimelinePermissionRequestView): string | undefined {
-  return request.runId;
+function normalizeWorkspaceRelativePath(path: string): string | null {
+  if (
+    path.trim() !== path
+    || new TextEncoder().encode(path).byteLength > 4096
+    || /[\u0000-\u001f\u007f-\u009f]/u.test(path)
+  ) {
+    return null;
+  }
+  const normalized = path.replace(/\\/g, '/').replace(/\/+/g, '/');
+  if (
+    !normalized.trim()
+    || normalized.startsWith('/')
+    || /^[a-zA-Z]:\//.test(normalized)
+    || normalized.includes('\0')
+  ) {
+    return null;
+  }
+  const parts: string[] = [];
+  for (const part of normalized.split('/')) {
+    if (!part || part === '.') continue;
+    if (part === '..') return null;
+    parts.push(part);
+  }
+  return parts.length > 0 ? parts.join('/') : null;
+}
+
+function decodeDurableWorkspaceRelativePath(value: unknown): string | null {
+  if (
+    typeof value !== 'string'
+    || !value
+    || value.trim() !== value
+    || new TextEncoder().encode(value).byteLength > 4096
+    || /[\u0000-\u001f\u007f-\u009f]/u.test(value)
+    || value.startsWith('/')
+    || /^[A-Za-z]:/u.test(value)
+    || value.includes('\\')
+    || value.split('/').some((part) => !part || part === '.' || part === '..')
+  ) {
+    return null;
+  }
+  return value;
+}
+
+function normalizeInputAttachment(
+  attachment: AgentInputAttachmentV2,
+  requireSessionBinding = false
+): AgentInputAttachmentV2 | null {
+  const workspace = useWorkspaceStore.getState().current;
+  const session = useAgentSessionStore.getState().session;
+  const workspaceHash = createWorkspaceScope(workspace).workspaceHash;
+  const sessionWorkspaceHash = session?.workspaceHash
+    ?? session?.workspaceBinding?.workspaceHash;
+  if (
+    requireSessionBinding
+    && (
+      (session?.projectId && !sessionWorkspaceHash)
+      || (sessionWorkspaceHash && sessionWorkspaceHash !== workspaceHash)
+    )
+  ) {
+    return null;
+  }
+  const requestedFolderId = attachment.folderId?.trim();
+  const activeFolder = useWorkspaceStore.getState().getActiveFolder();
+  const activeFolderId = useWorkspaceStore.getState().activeFolderId
+    ?? activeFolder?.id;
+  if (
+    !activeFolder
+    || !activeFolderId
+    || (requestedFolderId && requestedFolderId !== activeFolderId)
+  ) {
+    return null;
+  }
+  const folder = activeFolder;
+  const path = normalizeWorkspaceRelativePath(attachment.path);
+  if (
+    !folder
+    || !path
+    || (attachment.kind !== 'file' && attachment.kind !== 'directory')
+    || (attachment.scope !== 'message' && attachment.scope !== 'session')
+  ) {
+    return null;
+  }
+  const resourceId = attachment.resourceId;
+  if (
+    resourceId !== undefined
+    && (
+      !resourceId
+      || resourceId.trim() !== resourceId
+      || new TextEncoder().encode(resourceId).byteLength > 512
+      || /[\u0000-\u001f\u007f-\u009f]/u.test(resourceId)
+    )
+  ) {
+    return null;
+  }
+  return {
+    kind: attachment.kind,
+    path,
+    scope: attachment.scope,
+    folderId: folder.id,
+    ...(resourceId ? { resourceId } : {}),
+  };
+}
+
+function attachmentKey(attachment: AgentInputAttachmentV2): string {
+  return [
+    attachment.scope,
+    attachment.folderId ?? '',
+    attachment.kind,
+    attachment.path,
+    attachment.resourceId ?? '',
+  ].join(':');
+}
+
+function mergeAttachments(
+  existing: AgentInputAttachmentV2[],
+  attachment: AgentInputAttachmentV2
+): AgentInputAttachmentV2[] {
+  const key = attachmentKey(attachment);
+  return [
+    ...existing.filter((candidate) => attachmentKey(candidate) !== key),
+    attachment,
+  ];
+}
+
+function outboundAttachments(state: Store): AgentInputAttachmentV2[] | undefined {
+  const normalized = [...state.sessionAttachments, ...state.messageAttachments]
+    .map((attachment) => normalizeInputAttachment(attachment, true));
+  if (normalized.some((attachment) => attachment === null)) return undefined;
+  const deduplicated = new Map<string, AgentInputAttachmentV2>();
+  for (const attachment of normalized) {
+    if (!attachment) continue;
+    if (deduplicated.has(attachment.path)) return undefined;
+    deduplicated.set(attachment.path, attachment);
+  }
+  return [...deduplicated.values()];
+}
+
+type DurableSessionAttachments =
+  | { ok: true; attachments: AgentInputAttachmentV2[] }
+  | { ok: false };
+
+function durableSessionAttachments(
+  events: AgentEvent[],
+  activeFolderId?: string | null,
+  expectedSessionId?: string
+): DurableSessionAttachments {
+  if (!activeFolderId) return { ok: true, attachments: [] };
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (event.kind !== 'user_msg') continue;
+    if (expectedSessionId && event.sessionId !== expectedSessionId) {
+      return { ok: false };
+    }
+    const payload = isRecord(event.payload) ? event.payload : null;
+    if (
+      payload?.schemaVersion !== 'deepcode.session.kernel-public-projection.v2'
+      || payload.projectionKind !== 'input.persisted'
+    ) {
+      continue;
+    }
+    if (!Array.isArray(payload.attachments) || payload.attachments.length > 32) {
+      return { ok: false };
+    }
+    const decoded: AgentInputAttachmentV2[] = [];
+    const paths = new Set<string>();
+    for (const value of payload.attachments) {
+      if (!isRecord(value)) return { ok: false };
+      const keys = Object.keys(value);
+      if (
+        keys.some((key) => ![
+          'kind',
+          'path',
+          'scope',
+          'resourceId',
+          'folderId',
+        ].includes(key))
+        || !Object.hasOwn(value, 'kind')
+        || !Object.hasOwn(value, 'path')
+        || !Object.hasOwn(value, 'scope')
+        || (value.kind !== 'file' && value.kind !== 'directory')
+        || (value.scope !== 'message' && value.scope !== 'session')
+      ) {
+        return { ok: false };
+      }
+      const path = decodeDurableWorkspaceRelativePath(value.path);
+      if (!path || paths.has(path)) return { ok: false };
+      paths.add(path);
+      const folderId = typeof value.folderId === 'string'
+        ? value.folderId
+        : undefined;
+      const resourceId = typeof value.resourceId === 'string'
+        ? value.resourceId
+        : undefined;
+      if (
+        value.folderId !== undefined && folderId === undefined
+        || value.resourceId !== undefined && resourceId === undefined
+        || (
+          folderId !== undefined
+          && (
+            !folderId
+            || folderId.trim() !== folderId
+            || new TextEncoder().encode(folderId).byteLength > 512
+            || /[\u0000-\u001f\u007f-\u009f]/u.test(folderId)
+          )
+        )
+        || (
+          resourceId !== undefined
+          && (
+            !resourceId
+            || resourceId.trim() !== resourceId
+            || new TextEncoder().encode(resourceId).byteLength > 512
+            || /[\u0000-\u001f\u007f-\u009f]/u.test(resourceId)
+          )
+        )
+      ) {
+        return { ok: false };
+      }
+      decoded.push({
+        kind: value.kind,
+        path,
+        scope: value.scope,
+        folderId,
+        ...(resourceId ? { resourceId } : {}),
+      });
+    }
+    const sessionAttachments = decoded.filter((attachment) => attachment.scope === 'session');
+    if (sessionAttachments.some((attachment) => attachment.folderId !== activeFolderId)) {
+      return { ok: false };
+    }
+    return { ok: true, attachments: sessionAttachments };
+  }
+  return { ok: true, attachments: [] };
+}
+
+function restoredSessionAttachmentState(
+  events: AgentEvent[],
+  expectedSessionId?: string
+): {
+  sessionAttachments: AgentInputAttachmentV2[];
+  attachmentError: string | null;
+} {
+  const workspaceState = useWorkspaceStore.getState();
+  const activeFolderId = workspaceState.activeFolderId
+    ?? workspaceState.getActiveFolder()?.id;
+  const restored = durableSessionAttachments(
+    events,
+    activeFolderId,
+    expectedSessionId
+  );
+  return restored.ok
+    ? { sessionAttachments: restored.attachments, attachmentError: null }
+    : {
+        sessionAttachments: [],
+        attachmentError: agentSessionMessage('agent.attachment.durableInvalid'),
+      };
+}
+
+function permissionRequestRunId(request: AgentTimelinePermissionRequestView): string | null {
+  const runId = request.runId?.trim();
+  return runId || null;
+}
+
+function cancellableTimelineRunId(
+  timeline: AgentTimelineResult | null
+): string | null {
+  const projection = timeline?.runProjection;
+  if (
+    !projection
+    || !['active', 'waitingUser', 'waitingExternal', 'paused'].includes(
+      projection.status
+    )
+  ) {
+    return null;
+  }
+  const runId = projection.runId.trim();
+  return runId || null;
 }
 
 function isEmptyAgentSession(session: AgentSession | null | undefined): boolean {
@@ -292,75 +482,11 @@ function refreshWorkspaceTreeForTimeline(timeline: AgentTimelineResult): void {
 
 
 function streamHandlersForSession(sessionId: string): {
-  onDelta: (delta: AgentTimelineDelta) => void;
   onEvents: (events: AgentEvent[]) => void;
 } {
-  let pendingTextDeltas: AgentTimelineDelta[] = [];
-  let pendingFrame: number | null = null;
-
-  const applyDeltas = (deltas: AgentTimelineDelta[]) => {
-    if (!deltas.length) return;
-    const activeSession = useAgentSessionStore.getState().session;
-    if (activeSession?.id !== sessionId) return;
-    let needsSnapshot = false;
-    let nextTimeline: AgentTimelineResult | null = null;
-    useAgentSessionStore.setState((state) => {
-      let timeline = state.timeline;
-      for (const delta of deltas) {
-        const applied = applyAgentTimelineDelta(timeline, delta);
-        projectionDeliveryDiagnostics.recordDelta(
-          applied.status === 'gap' ? 'gui.reducer_gap' : 'gui.reducer_applied',
-          delta,
-          applied.status === 'applied'
-            ? 'accepted'
-            : applied.status === 'gap'
-              ? 'gap'
-              : 'ignored'
-        );
-        if (applied.status === 'gap') {
-          needsSnapshot = true;
-          break;
-        }
-        timeline = applied.timeline;
-      }
-      nextTimeline = needsSnapshot ? null : timeline;
-      return needsSnapshot ? state : { timeline };
-    });
-    if (nextTimeline) refreshWorkspaceTreeForTimeline(nextTimeline);
-    if (needsSnapshot) void refreshCanonicalTimeline(sessionId, true);
-  };
-
-  const flushTextDeltas = () => {
-    if (pendingFrame !== null) {
-      window.cancelAnimationFrame(pendingFrame);
-      pendingFrame = null;
-    }
-    const deltas = pendingTextDeltas;
-    pendingTextDeltas = [];
-    applyDeltas(deltas);
-  };
-
   return {
-    onDelta: (delta) => {
-      if (delta.sessionId !== sessionId) return;
-      if (delta.op === 'text.append') {
-        pendingTextDeltas.push(delta);
-        if (pendingFrame === null) {
-          pendingFrame = window.requestAnimationFrame(() => {
-            pendingFrame = null;
-            const deltas = pendingTextDeltas;
-            pendingTextDeltas = [];
-            applyDeltas(deltas);
-          });
-        }
-        return;
-      }
-      flushTextDeltas();
-      applyDeltas([delta]);
-    },
     onEvents: (events) => {
       if (!events.length) return;
-      flushTextDeltas();
       const activeSession = useAgentSessionStore.getState().session;
       if (activeSession?.id !== sessionId) return;
       useAgentSessionStore.setState((state) => {
@@ -375,38 +501,33 @@ function streamHandlersForSession(sessionId: string): {
 }
 
 function isTerminalRunStatus(status: string): boolean {
-  return status === 'completed' || status === 'failed' || status === 'cancelled' || status === 'waiting';
+  return status === 'completed' || status === 'failed' || status === 'cancelled';
 }
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
+function newHostCallerRequestId(kind: string): string {
+  return `host-ui-${kind}-${globalThis.crypto.randomUUID()}`;
+}
+
 async function startAndWaitAgentRun(
   sessionId: string,
   request: StartAgentRunRequest,
   handlers: {
-    onDelta?: (delta: AgentTimelineDelta) => void;
     onEvents?: (events: AgentEvent[]) => void;
   } = {}
 ): Promise<AgentRunResult> {
-  const admittedRequest: StartAgentRunRequest = {
-    ...request,
-    hostLanguage: request.hostLanguage ?? normalizeUiLanguage(
-      useSettingsStore.getState().effectiveSettings['workbench.language']
-    ),
-  };
-  const started = await startAgentRun(sessionId, admittedRequest);
+  const started = await startAgentRun(sessionId, request);
   if (!started.ok || !started.data) {
     throw new Error(started.message ?? started.error ?? 'Shared session run start failed');
   }
   let result = started.data;
   const runId = result.run.runId;
   activeAgentRunIds.set(sessionId, runId);
-  projectionDeliveryDiagnostics.begin(sessionId, runId);
   handlers.onEvents?.(result.events);
   const controller = new AbortController();
-  let lastDeltaSeq = 0;
   let lastEventCount = result.events.length;
   let terminalStreamObserved = false;
   let stopStream = false;
@@ -424,22 +545,6 @@ async function startAndWaitAgentRun(
   const handleStreamEvent = (event: AgentRunStreamEvent) => {
     const data = event.data;
     if (!isRecord(data) || !streamEventMatchesRun(data)) return;
-    if (event.event === 'delta') {
-      const delta = data.delta;
-      if (!isRecord(delta) || !isAgentTimelineDelta(delta)) return;
-      const deltaHostRunId = typeof delta.hostRunId === 'string' ? delta.hostRunId : null;
-      if (delta.sessionId !== sessionId || deltaHostRunId !== runId) return;
-      const deltaSeq = typeof delta.deltaSeq === 'number' ? delta.deltaSeq : 0;
-      projectionDeliveryDiagnostics.recordDelta(
-        'gui.sse_delta_received',
-        delta,
-        deltaSeq > 0 && deltaSeq <= lastDeltaSeq ? 'ignored' : 'accepted'
-      );
-      if (deltaSeq > 0 && deltaSeq <= lastDeltaSeq) return;
-      if (deltaSeq > 0) lastDeltaSeq = deltaSeq;
-      handlers.onDelta?.(delta);
-      return;
-    }
     if ((event.event === 'events' || event.event === 'terminal') && Array.isArray(data.events)) {
       const events = data.events.filter(isRecord) as unknown as AgentEvent[];
       updateEventCursor(data, events.length);
@@ -454,39 +559,20 @@ async function startAndWaitAgentRun(
   const streamDone = (async () => {
     let retryIndex = 0;
     while (!stopStream && !controller.signal.aborted && !terminalStreamObserved) {
-      const beforeDeltaSeq = lastDeltaSeq;
       const beforeEventCount = lastEventCount;
-      projectionDeliveryDiagnostics.recordRun(
-        sessionId,
-        runId,
-        'gui.sse_stream_started',
-        'accepted'
-      );
       try {
         await streamAgentRun(
           sessionId,
           runId,
           handleStreamEvent,
-          { sinceEventCount: lastEventCount, sinceDeltaSeq: lastDeltaSeq },
+          { sinceEventCount: lastEventCount },
           controller.signal
         );
-        projectionDeliveryDiagnostics.recordRun(
-          sessionId,
-          runId,
-          'gui.sse_stream_ended',
-          'accepted'
-        );
       } catch {
-        projectionDeliveryDiagnostics.recordRun(
-          sessionId,
-          runId,
-          'gui.sse_stream_failed',
-          'failed'
-        );
         if (stopStream || controller.signal.aborted) break;
       }
       if (stopStream || controller.signal.aborted || terminalStreamObserved) break;
-      const progressed = lastDeltaSeq > beforeDeltaSeq || lastEventCount > beforeEventCount;
+      const progressed = lastEventCount > beforeEventCount;
       if (progressed) retryIndex = 0;
       const retryDelay = retryDelays[Math.min(retryIndex, retryDelays.length - 1)];
       retryIndex = Math.min(retryIndex + 1, retryDelays.length - 1);
@@ -510,7 +596,6 @@ async function startAndWaitAgentRun(
       await Promise.race([terminalStreamEvent, sleep(1500)]);
     }
     await refreshCanonicalTimeline(sessionId, true);
-    projectionDeliveryDiagnostics.markTerminal(sessionId, runId);
     return result;
   } finally {
     stopStream = true;
@@ -544,25 +629,17 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
   localWorkspaceScopeKey: undefined,
   events: [],
   timeline: null,
-  traceEvents: [],
-  mode: 'plan',
-  workflow: 'planFirst',
-  workflowConfig: null,
   profileId: undefined,
   profileSelectionBusy: false,
   loading: false,
   runningSessionIds: [],
   cancellingSessionIds: [],
   errorMessage: null,
-  fixedContextAttachments: [],
   messageAttachments: [],
   sessionAttachments: [],
   pendingPermission: null,
   resolvingPermission: null,
-  resolvingRequirement: null,
   resolvingPlan: null,
-  resolvingReview: null,
-  queuedMessages: [],
 
   loadOrCreate: async () => {
     const nextScopeKey = currentWorkspaceScopeKey();
@@ -574,13 +651,13 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       }
       return;
     }
-    set({ loading: true, errorMessage: null });
+    set({
+      loading: true,
+      errorMessage: null,
+      messageAttachments: [],
+      sessionAttachments: [],
+    });
     try {
-      const settings = useSettingsStore.getState().effectiveSettings;
-      const initialMode = settingMode(settings['agent.defaultMode']);
-      const workflow = settingWorkflow(settings['agent.defaultWorkflow']);
-      set({ mode: initialMode, workflow });
-      await get().loadWorkflowConfig();
       const scope = currentWorkspaceScope();
       const list = await listAgentSessions(scope);
       if (list.ok && list.data) {
@@ -592,6 +669,10 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       const current = await getCurrentAgentSession(scope);
       if (current.ok && current.data) {
         const timelineResult = await getAgentTimeline(current.data.session.id);
+        const restoredAttachments = restoredSessionAttachmentState(
+          current.data.events,
+          current.data.session.id
+        );
         set({
           session: current.data.session,
           localWorkspaceScopeKey: nextScopeKey,
@@ -599,14 +680,15 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
           timeline: timelineResult.ok && timelineResult.data
             ? timelineAsReplay(timelineResult.data)
             : emptyTimeline(current.data.session.id),
-          mode: current.data.session.mode,
           profileId: current.data.session.profileId,
+          messageAttachments: [],
+          sessionAttachments: restoredAttachments.sessionAttachments,
+          errorMessage: restoredAttachments.attachmentError,
           loading: false,
         });
-        void get().refreshTraceEvents(current.data.session.id);
         return;
       }
-      const created = await createAgentSession({ initialMode, ...scope });
+      const created = await createAgentSession(scope);
       if (created.ok && created.data) {
         set({
           session: created.data.session,
@@ -615,11 +697,11 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
           currentSessionId: created.data.session.id,
           events: created.data.events,
           timeline: emptyTimeline(created.data.session.id),
-          mode: created.data.session.mode,
           profileId: created.data.session.profileId,
+          messageAttachments: [],
+          sessionAttachments: [],
           loading: false,
         });
-        void get().refreshTraceEvents(created.data.session.id);
       } else {
         set({
           errorMessage: created.message ?? current.message ?? 'Agent session initialization failed',
@@ -668,6 +750,8 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
           ],
           currentSessionId: rebound.data!.session.id,
           events: rebound.data!.events,
+          messageAttachments: options.preserveAttachments ? state.messageAttachments : [],
+          sessionAttachments: options.preserveAttachments ? state.sessionAttachments : [],
           errorMessage: null,
         }));
         return rebound.data.session;
@@ -675,30 +759,25 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       set({ errorMessage: null });
       return currentSession ?? null;
     }
-    const settings = useSettingsStore.getState().effectiveSettings;
-    const initialMode = settingMode(settings['agent.defaultMode']);
     const result = await createAgentSession({
-      initialMode,
       ...(options.projectId ? { projectId: options.projectId } : currentWorkspaceScope()),
     });
     if (result.ok && result.data) {
-      set({
-        session: result.data.session,
+      set((state) => ({
+        session: result.data!.session,
         localWorkspaceScopeKey: currentWorkspaceScopeKey(),
-        sessions: [result.data.session, ...get().sessions.filter((item) => item.id !== result.data!.session.id)],
-        currentSessionId: result.data.session.id,
-        events: result.data.events,
-        timeline: emptyTimeline(result.data.session.id),
-        traceEvents: [],
-        mode: result.data.session.mode,
-        profileId: result.data.session.profileId,
+        sessions: [result.data!.session, ...state.sessions.filter((item) => item.id !== result.data!.session.id)],
+        currentSessionId: result.data!.session.id,
+        events: result.data!.events,
+        timeline: emptyTimeline(result.data!.session.id),
+        profileId: result.data!.session.profileId,
         pendingPermission: null,
         resolvingPermission: null,
-        resolvingRequirement: null,
         resolvingPlan: null,
-        resolvingReview: null,
+        messageAttachments: options.preserveAttachments ? state.messageAttachments : [],
+        sessionAttachments: options.preserveAttachments ? state.sessionAttachments : [],
         errorMessage: null,
-      });
+      }));
       void get().refreshSessions();
       return result.data.session;
     }
@@ -713,6 +792,10 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       const result = await activateAgentSession(sessionId);
       if (result.ok && result.data) {
         const timelineResult = await getAgentTimeline(result.data.session.id);
+        const restoredAttachments = restoredSessionAttachmentState(
+          result.data.events,
+          result.data.session.id
+        );
         set({
           session: result.data.session,
           localWorkspaceScopeKey: currentWorkspaceScopeKey(),
@@ -721,17 +804,15 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
           timeline: timelineResult.ok && timelineResult.data
             ? timelineAsReplay(timelineResult.data)
             : emptyTimeline(result.data.session.id),
-          traceEvents: [],
-          mode: result.data.session.mode,
           profileId: result.data.session.profileId,
           pendingPermission: findLatestPendingPermission(result.data.events),
           resolvingPermission: null,
-          resolvingRequirement: null,
           resolvingPlan: null,
-          resolvingReview: null,
+          messageAttachments: [],
+          sessionAttachments: restoredAttachments.sessionAttachments,
+          errorMessage: restoredAttachments.attachmentError,
           loading: false,
         });
-        void get().refreshTraceEvents(result.data.session.id);
         void refreshCanonicalTimeline(result.data.session.id, false);
         void get().refreshSessions();
         return;
@@ -770,12 +851,9 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
           session: null,
           events: [],
           timeline: null,
-          traceEvents: [],
           pendingPermission: null,
           resolvingPermission: null,
-          resolvingRequirement: null,
           resolvingPlan: null,
-          resolvingReview: null,
           messageAttachments: [],
           sessionAttachments: [],
           errorMessage: null,
@@ -808,12 +886,9 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
           session: null,
           events: [],
           timeline: null,
-          traceEvents: [],
           pendingPermission: null,
           resolvingPermission: null,
-          resolvingRequirement: null,
           resolvingPlan: null,
-          resolvingReview: null,
           messageAttachments: [],
           sessionAttachments: [],
           errorMessage: null,
@@ -831,42 +906,6 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     set({ errorMessage: result.message ?? 'Agent session delete failed' });
   },
 
-  refreshTraceEvents: async (sessionId) => {
-    const id = sessionId ?? get().session?.id;
-    if (!id) return;
-    const result = await getAgentEventSnapshot(id);
-    if (result.ok && result.data) {
-      set({ traceEvents: result.data.trace.events });
-    }
-  },
-
-  loadWorkflowConfig: async () => {
-    const result = await getAgentWorkflowConfig();
-    if (result.ok && result.data) {
-      set({
-        workflowConfig: result.data.config,
-        workflowConfigStorePath: result.data.storePath,
-      });
-      return;
-    }
-    set({ workflowConfig: emptyWorkflowConfig() });
-  },
-
-  patchWorkflowConfig: async (config) => {
-    set({ workflowConfig: config });
-    const result = await patchAgentWorkflowConfig({ config });
-    if (result.ok && result.data) {
-      set({
-        workflowConfig: result.data.config,
-        workflowConfigStorePath: result.data.storePath,
-      });
-    } else {
-      set({ errorMessage: result.message ?? 'Agent workflow config save failed' });
-    }
-  },
-
-  setMode: (mode) => set({ mode }),
-  setWorkflow: (workflow) => set({ workflow }),
   selectProfile: async (profileId) => {
     const state = get();
     const session = state.session;
@@ -878,9 +917,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       || Boolean(state.timeline?.interactionProjection?.pending)
       || Boolean(
         state.resolvingPermission
-        || state.resolvingRequirement
         || state.resolvingPlan
-        || state.resolvingReview
       );
     if (locked) {
       set({ errorMessage: agentSessionMessage('agent.profile.locked') });
@@ -933,6 +970,10 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       return;
     }
     if (!result.ok || !result.data) return;
+    const restoredAttachments = restoredSessionAttachmentState(
+      result.data.events,
+      result.data.session.id
+    );
     set((state) => ({
       session: state.session?.id === sessionId ? result.data!.session : state.session,
       sessions: [
@@ -942,89 +983,151 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       profileId: state.session?.id === sessionId
         ? result.data!.session.profileId
         : state.profileId,
+      events: state.session?.id === sessionId
+        ? result.data!.events
+        : state.events,
+      messageAttachments: state.session?.id === sessionId
+        ? []
+        : state.messageAttachments,
+      sessionAttachments: state.session?.id === sessionId
+        ? restoredAttachments.sessionAttachments
+        : state.sessionAttachments,
+      errorMessage: state.session?.id === sessionId
+        ? restoredAttachments.attachmentError
+        : state.errorMessage,
     }));
   },
-  setFixedContextAttachments: (attachments) => set({
-    fixedContextAttachments: mergeContextAttachments(attachments),
-  }),
-
-  addAttachment: (attachment) => {
-    if (attachment.scope === 'session') {
-      set((state) => ({
-        sessionAttachments: mergeContextAttachment(state.sessionAttachments, attachment),
-      }));
-    } else {
-      set((state) => ({
-        messageAttachments: mergeContextAttachment(state.messageAttachments, attachment),
-      }));
+  refreshActiveSessionContext: async () => {
+    const sessionId = get().session?.id;
+    if (!sessionId) return;
+    const [sessionResult, timelineResult] = await Promise.all([
+      getAgentSession(sessionId),
+      getAgentTimeline(sessionId),
+    ]);
+    if (!sessionResult.ok || !sessionResult.data) {
+      set({
+        errorMessage: sessionResult.message
+          ?? agentSessionMessage('memoryV2.refreshFailed'),
+      });
+      return;
     }
+    if (get().session?.id !== sessionId) return;
+    const restoredAttachments = restoredSessionAttachmentState(
+      sessionResult.data.events,
+      sessionResult.data.session.id
+    );
+    set((state) => ({
+      session: sessionResult.data!.session,
+      sessions: [
+        sessionResult.data!.session,
+        ...state.sessions.filter((item) => item.id !== sessionResult.data!.session.id),
+      ],
+      events: sessionResult.data!.events,
+      timeline: timelineResult.ok && timelineResult.data
+        ? timelineAsReplay(timelineResult.data)
+        : state.timeline,
+      pendingPermission: findLatestPendingPermission(sessionResult.data!.events),
+      messageAttachments: [],
+      sessionAttachments: restoredAttachments.sessionAttachments,
+      errorMessage: restoredAttachments.attachmentError,
+    }));
   },
-
-  removeAttachment: (path, scope) => {
-    const remove = (items: AgentContextAttachment[]) =>
-      items.filter((item) => !(item.path === path && item.scope === scope));
+  addAttachment: (attachment) => {
+    const normalized = normalizeInputAttachment(attachment);
+    if (!normalized) {
+      set({
+        errorMessage: agentSessionMessage('agent.attachment.invalidWorkspacePath'),
+      });
+      return;
+    }
+    const existingCount = get().messageAttachments.length + get().sessionAttachments.length;
+    const alreadyPresent = [...get().messageAttachments, ...get().sessionAttachments]
+      .some((candidate) => candidate.path === normalized.path);
+    if (!alreadyPresent && existingCount >= MAX_AGENT_INPUT_ATTACHMENTS_V2) {
+      set({
+        errorMessage: agentSessionMessage('agent.attachment.tooMany'),
+      });
+      return;
+    }
+    if (normalized.scope === 'session') {
+      set((state) => ({
+        sessionAttachments: mergeAttachments(
+          state.sessionAttachments.filter((candidate) => candidate.path !== normalized.path),
+          normalized
+        ),
+        messageAttachments: state.messageAttachments.filter(
+          (candidate) => candidate.path !== normalized.path
+        ),
+        errorMessage: null,
+      }));
+      return;
+    }
+    set((state) => ({
+      messageAttachments: mergeAttachments(
+        state.messageAttachments.filter((candidate) => candidate.path !== normalized.path),
+        normalized
+      ),
+      sessionAttachments: state.sessionAttachments.filter(
+        (candidate) => candidate.path !== normalized.path
+      ),
+      errorMessage: null,
+    }));
+  },
+  removeAttachment: (path, scope, folderId) => {
+    const remove = (attachments: AgentInputAttachmentV2[]) => attachments.filter((attachment) => (
+      attachment.path !== path
+      || attachment.scope !== scope
+      || (folderId !== undefined && attachment.folderId !== folderId)
+    ));
     if (scope === 'session') {
       set((state) => ({ sessionAttachments: remove(state.sessionAttachments) }));
-    } else {
-      set((state) => ({ messageAttachments: remove(state.messageAttachments) }));
+      return;
     }
+    set((state) => ({ messageAttachments: remove(state.messageAttachments) }));
   },
-
   clearMessageAttachments: () => set({ messageAttachments: [] }),
-
-  sendMessage: async (content, attachmentsOverride) => {
+  synchronizeAttachmentRoot: (folderId) => {
+    const normalizedFolderId = folderId?.trim() || null;
+    set((state) => {
+      const mismatched = [...state.messageAttachments, ...state.sessionAttachments]
+        .some((attachment) => attachment.folderId !== normalizedFolderId);
+      return mismatched
+        ? {
+            messageAttachments: [],
+            sessionAttachments: [],
+            errorMessage: agentSessionMessage('agent.attachment.rootChanged'),
+          }
+        : state;
+    });
+  },
+  sendMessage: async (content) => {
     const trimmed = content.trim();
     if (!trimmed) return;
     if (!get().session) await get().loadOrCreate();
     const session = get().session;
     if (!session) return;
-
-    const attachments = readMessageAttachments(get(), attachmentsOverride);
-    const activeInteraction = get().timeline?.interactionProjection?.pending ?? null;
-    if (activeInteraction) {
-      if (activeInteraction.kind === 'permission') {
-        set({ errorMessage: 'Permission confirmation is pending. Resolve the permission request before sending new guidance.' });
-        return;
-      }
+    const attachments = outboundAttachments(get());
+    if (!attachments) {
       set({
-        messageAttachments: [],
-        errorMessage: null,
+        errorMessage: agentSessionMessage('agent.attachment.invalidWorkspacePath'),
       });
-      if (activeInteraction.kind === 'requirement') {
-        await get().resolveRequirement(
-          activeInteraction.runId,
-          activeInteraction.requirementId,
-          'revise',
-          trimmed
-        );
-        return;
-      }
-      if (activeInteraction.kind === 'plan') {
-        await get().resolvePlan(activeInteraction.runId, activeInteraction.planId, 'revise', trimmed);
-        return;
-      }
-      if (activeInteraction.kind === 'review') {
-        await get().resolveReview(activeInteraction.runId, 'revise', trimmed);
-        return;
-      }
+      return;
     }
 
-    if (get().runningSessionIds.includes(session.id)) {
-      const activeRunId = activeAgentRunIds.get(session.id);
-      if (!activeRunId) {
-        set({ errorMessage: 'No active shared run id is available for guidance. Refresh the session or start a new turn.' });
-        return;
-      }
+    const activeInteraction = get().timeline?.interactionProjection?.pending ?? null;
+    const interactionRunId = activeInteraction?.kind === 'permission'
+      ? permissionRequestRunId(activeInteraction.request)
+      : activeInteraction?.kind === 'plan'
+        ? activeInteraction.runId
+        : null;
+    if (interactionRunId) {
       set({
-        messageAttachments: [],
         errorMessage: null,
       });
-      const result = await submitAgentRunGuidance(session.id, activeRunId, {
+      const result = await submitAgentRunGuidance(session.id, interactionRunId, {
         guidance: trimmed,
-        attachments,
-        hostLanguage: normalizeUiLanguage(
-          useSettingsStore.getState().effectiveSettings['workbench.language']
-        ),
+        ...(attachments.length > 0 ? { attachments } : {}),
+        callerRequestId: newHostCallerRequestId('input'),
       });
       if (result.ok && result.data) {
         set({
@@ -1036,11 +1139,46 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
           messageAttachments: [],
           errorMessage: null,
         });
-        void get().refreshTraceEvents(result.data.session.id);
         void refreshCanonicalTimeline(result.data.session.id, true);
       } else {
         set({
+          errorMessage: result.message ?? 'New user input append failed',
+        });
+      }
+      return;
+    }
+    if (activeInteraction?.kind === 'permission') {
+      set({ errorMessage: 'Permission request is missing its v2 Run identity.' });
+      return;
+    }
+
+    if (get().runningSessionIds.includes(session.id)) {
+      const activeRunId = activeAgentRunIds.get(session.id);
+      if (!activeRunId) {
+        set({ errorMessage: 'No active shared run id is available for guidance. Refresh the session or start a new turn.' });
+        return;
+      }
+      set({
+        errorMessage: null,
+      });
+      const result = await submitAgentRunGuidance(session.id, activeRunId, {
+        guidance: trimmed,
+        ...(attachments.length > 0 ? { attachments } : {}),
+        callerRequestId: newHostCallerRequestId('input'),
+      });
+      if (result.ok && result.data) {
+        set({
+          session: result.data.session,
+          sessions: [result.data.session, ...get().sessions.filter((item) => item.id !== result.data!.session.id)],
+          currentSessionId: result.data.session.id,
+          events: mergeEventsById(get().events, result.data.events),
+          pendingPermission: findLatestPendingPermission(result.data.events),
           messageAttachments: [],
+          errorMessage: null,
+        });
+        void refreshCanonicalTimeline(result.data.session.id, true);
+      } else {
+        set({
           errorMessage: result.message ?? 'User guidance append failed',
         });
       }
@@ -1048,7 +1186,6 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     }
 
     set((state) => ({
-      messageAttachments: [],
       runningSessionIds: addRunningSessionId(state.runningSessionIds, session.id),
       errorMessage: null,
     }));
@@ -1066,7 +1203,6 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
             pendingPermission: findLatestPendingPermission(current.data.events),
           });
         }
-        await get().refreshTraceEvents(session.id);
       }
     };
     progressTimer = window.setInterval(() => {
@@ -1075,24 +1211,14 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     void refreshProgress();
 
     try {
+      const workspacePath = session.projectId ? undefined : currentWorkspacePath();
       const result = await startAndWaitAgentRun(session.id, {
         op: 'ask',
         content: trimmed,
-        attachments,
-        workspacePath: session.projectId ? undefined : currentWorkspacePath(),
-        workflow: get().workflow,
-        requirementConfirmationMode: settingRequirementConfirmationMode(
-          useSettingsStore.getState().effectiveSettings['agent.requirementConfirmationMode']
-        ),
-        reviewContinuationMode: settingReviewContinuationMode(
-          useSettingsStore.getState().effectiveSettings['agent.reviewContinuationMode']
-        ),
-        interventionLevel: settingInterventionLevel(
-          useSettingsStore.getState().effectiveSettings['agent.interventionLevel']
-        ),
-        projectMemoryMode: settingProjectMemoryMode(
-          useSettingsStore.getState().effectiveSettings['agent.memory.projectMode']
-        ),
+        ...(attachments.length > 0 ? { attachments } : {}),
+        workspacePath,
+        noWorkspace: session.projectId ? undefined : !workspacePath,
+        callerRequestId: newHostCallerRequestId('ask'),
       }, streamHandlersForSession(session.id));
       const data = {
         session: result.session,
@@ -1106,9 +1232,8 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
           sessions: [data.session, ...state.sessions.filter((item) => item.id !== data.session.id)],
           runningSessionIds: removeRunningSessionId(state.runningSessionIds, data.session.id),
           resolvingPermission: null,
-          resolvingRequirement: null,
           resolvingPlan: null,
-          resolvingReview: null,
+          messageAttachments: [],
         };
         if (isActiveSession) {
           nextState.session = data.session;
@@ -1118,7 +1243,6 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         }
         return nextState;
       });
-      void get().refreshTraceEvents(data.session.id);
       void refreshCanonicalTimeline(data.session.id, true);
     } catch (err) {
       pollingStopped = true;
@@ -1136,37 +1260,39 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       }));
     }
 
-    const nextQueuedMessage = get().queuedMessages[0];
-    if (nextQueuedMessage) {
-      set((state) => ({
-        queuedMessages: state.queuedMessages.slice(1),
-      }));
-      void get().sendMessage(nextQueuedMessage.content, nextQueuedMessage.attachments);
-    }
   },
 
   cancelCurrentRun: async () => {
     const session = get().session;
     if (!session) return;
     if (get().cancellingSessionIds.includes(session.id)) return;
-    const activeRunId = activeAgentRunIds.get(session.id);
+    const activeRunId =
+      activeAgentRunIds.get(session.id)
+      ?? cancellableTimelineRunId(get().timeline);
+    if (!activeRunId) {
+      set({
+        errorMessage:
+          'The active Kernel–Session v2 Run identity is unavailable; refresh the canonical timeline before cancelling.',
+      });
+      return;
+    }
     set((state) => ({
       runningSessionIds: removeRunningSessionId(state.runningSessionIds, session.id),
       cancellingSessionIds: addRunningSessionId(state.cancellingSessionIds, session.id),
-      queuedMessages: [],
       pendingPermission: null,
       resolvingPermission: null,
-      resolvingRequirement: null,
       resolvingPlan: null,
-      resolvingReview: null,
       errorMessage: null,
     }));
 
     let result;
     try {
-      result = activeRunId
-        ? await cancelAgentRunById(session.id, activeRunId)
-        : await cancelAgentRun(session.id);
+      const callerRequestId = newHostCallerRequestId('cancel');
+      result = await cancelAgentRunById(
+        session.id,
+        activeRunId,
+        callerRequestId
+      );
     } catch (error) {
       set((state) => ({
         cancellingSessionIds: removeRunningSessionId(state.cancellingSessionIds, session.id),
@@ -1183,14 +1309,11 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         events: mergeEventsById(get().events, result.data.events),
         pendingPermission: findLatestPendingPermission(result.data.events),
         resolvingPermission: null,
-        resolvingRequirement: null,
         resolvingPlan: null,
-        resolvingReview: null,
         cancellingSessionIds: removeRunningSessionId(get().cancellingSessionIds, session.id),
         loading: false,
         errorMessage: null,
       });
-      void get().refreshTraceEvents(result.data.session.id);
       void refreshCanonicalTimeline(result.data.session.id, true);
       return;
     }
@@ -1216,6 +1339,11 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     const request = requestOverride ?? get().pendingPermission?.request;
     const session = get().session;
     if (!request || !session || get().resolvingPermission) return;
+    const runId = permissionRequestRunId(request);
+    if (!runId) {
+      set({ errorMessage: 'Permission request is missing its v2 Run identity.' });
+      return;
+    }
     set((state) => ({
       resolvingPermission: { id: request.id, decision: 'accept' },
       runningSessionIds: addRunningSessionId(state.runningSessionIds, session.id),
@@ -1234,7 +1362,6 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
             pendingPermission: findLatestPendingPermission(current.data.events),
           });
         }
-        await get().refreshTraceEvents(session.id);
       }
     };
     progressTimer = window.setInterval(() => {
@@ -1246,16 +1373,9 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         op: 'resolveDecision',
         decisionKind: 'permission',
         decision: 'accept',
-        runId: permissionRequestRunId(request),
+        runId,
         targetId: request.id,
-        workspacePath: session.projectId ? undefined : currentWorkspacePath(),
-        workflow: get().workflow,
-        interventionLevel: settingInterventionLevel(
-          useSettingsStore.getState().effectiveSettings['agent.interventionLevel']
-        ),
-        projectMemoryMode: settingProjectMemoryMode(
-          useSettingsStore.getState().effectiveSettings['agent.memory.projectMode']
-        ),
+        callerRequestId: newHostCallerRequestId('permission-allow'),
       }, streamHandlersForSession(session.id));
       const data = {
         session: result.session,
@@ -1270,7 +1390,6 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         resolvingPermission: null,
         runningSessionIds: removeRunningSessionId(state.runningSessionIds, data.session.id),
       }));
-      void get().refreshTraceEvents(data.session.id);
       void refreshCanonicalTimeline(data.session.id, true);
     } catch (err) {
       pollingStopped = true;
@@ -1288,6 +1407,11 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     const request = requestOverride ?? get().pendingPermission?.request;
     const session = get().session;
     if (!request || !session || get().resolvingPermission) return;
+    const runId = permissionRequestRunId(request);
+    if (!runId) {
+      set({ errorMessage: 'Permission request is missing its v2 Run identity.' });
+      return;
+    }
     set((state) => ({
       resolvingPermission: { id: request.id, decision: 'reject' },
       runningSessionIds: addRunningSessionId(state.runningSessionIds, session.id),
@@ -1306,7 +1430,6 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
             pendingPermission: findLatestPendingPermission(current.data.events),
           });
         }
-        await get().refreshTraceEvents(session.id);
       }
     };
     progressTimer = window.setInterval(() => {
@@ -1318,91 +1441,9 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         op: 'resolveDecision',
         decisionKind: 'permission',
         decision: 'reject',
-        runId: permissionRequestRunId(request),
-        targetId: request.id,
-        workspacePath: session.projectId ? undefined : currentWorkspacePath(),
-        workflow: get().workflow,
-        interventionLevel: settingInterventionLevel(
-          useSettingsStore.getState().effectiveSettings['agent.interventionLevel']
-        ),
-        projectMemoryMode: settingProjectMemoryMode(
-          useSettingsStore.getState().effectiveSettings['agent.memory.projectMode']
-        ),
-      }, streamHandlersForSession(session.id));
-      const data = {
-        session: result.session,
-        events: result.events,
-      };
-      pollingStopped = true;
-      if (progressTimer !== undefined) window.clearInterval(progressTimer);
-      set((state) => ({
-        session: data.session,
-        events: mergeEventsById(state.events, data.events),
-        pendingPermission: findLatestPendingPermission(data.events),
-        resolvingPermission: null,
-        runningSessionIds: removeRunningSessionId(state.runningSessionIds, data.session.id),
-      }));
-      void get().refreshTraceEvents(data.session.id);
-      void refreshCanonicalTimeline(data.session.id, true);
-    } catch (err) {
-      pollingStopped = true;
-      if (progressTimer !== undefined) window.clearInterval(progressTimer);
-      const message = err instanceof Error ? err.message : String(err);
-      set((state) => ({
-        errorMessage: message,
-        resolvingPermission: null,
-        runningSessionIds: removeRunningSessionId(state.runningSessionIds, session.id),
-      }));
-    }
-  },
-
-  resolveRequirement: async (runId, requirementId, decision, guidance) => {
-    const session = get().session;
-    if (!session || get().resolvingRequirement) return;
-
-    set((state) => ({
-      resolvingRequirement: { runId, requirementId, decision },
-      runningSessionIds: addRunningSessionId(state.runningSessionIds, session.id),
-      errorMessage: null,
-    }));
-
-    let progressTimer: number | undefined;
-    let pollingStopped = false;
-    const refreshProgress = async () => {
-      if (pollingStopped) return;
-      const current = await getAgentSession(session.id);
-      if (current.ok && current.data) {
-        if (get().session?.id === session.id) {
-          set({
-            session: current.data.session,
-            events: mergeEventsById(get().events, current.data.events),
-            pendingPermission: findLatestPendingPermission(current.data.events),
-          });
-        }
-        await get().refreshTraceEvents(session.id);
-      }
-    };
-    progressTimer = window.setInterval(() => {
-      void refreshProgress();
-    }, 300);
-    void refreshProgress();
-
-    try {
-      const result = await startAndWaitAgentRun(session.id, {
-        op: 'resolveDecision',
-        decisionKind: 'requirement',
-        decision,
-        guidance,
         runId,
-        targetId: requirementId,
-        workspacePath: session.projectId ? undefined : currentWorkspacePath(),
-        workflow: get().workflow,
-        interventionLevel: settingInterventionLevel(
-          useSettingsStore.getState().effectiveSettings['agent.interventionLevel']
-        ),
-        projectMemoryMode: settingProjectMemoryMode(
-          useSettingsStore.getState().effectiveSettings['agent.memory.projectMode']
-        ),
+        targetId: request.id,
+        callerRequestId: newHostCallerRequestId('permission-deny'),
       }, streamHandlersForSession(session.id));
       const data = {
         session: result.session,
@@ -1412,17 +1453,11 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       if (progressTimer !== undefined) window.clearInterval(progressTimer);
       set((state) => ({
         session: data.session,
-        sessions: [data.session, ...state.sessions.filter((item) => item.id !== data.session.id)],
-        currentSessionId: data.session.id,
         events: mergeEventsById(state.events, data.events),
         pendingPermission: findLatestPendingPermission(data.events),
-        resolvingRequirement: null,
         resolvingPermission: null,
-        resolvingPlan: null,
-        resolvingReview: null,
         runningSessionIds: removeRunningSessionId(state.runningSessionIds, data.session.id),
       }));
-      void get().refreshTraceEvents(data.session.id);
       void refreshCanonicalTimeline(data.session.id, true);
     } catch (err) {
       pollingStopped = true;
@@ -1430,7 +1465,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       const message = err instanceof Error ? err.message : String(err);
       set((state) => ({
         errorMessage: message,
-        resolvingRequirement: null,
+        resolvingPermission: null,
         runningSessionIds: removeRunningSessionId(state.runningSessionIds, session.id),
       }));
     }
@@ -1457,7 +1492,6 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
             pendingPermission: findLatestPendingPermission(current.data.events),
           });
         }
-        await get().refreshTraceEvents(session.id);
       }
     };
     progressTimer = window.setInterval(() => {
@@ -1472,14 +1506,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         guidance,
         runId,
         targetId: planId,
-        workspacePath: session.projectId ? undefined : currentWorkspacePath(),
-        workflow: get().workflow,
-        interventionLevel: settingInterventionLevel(
-          useSettingsStore.getState().effectiveSettings['agent.interventionLevel']
-        ),
-        projectMemoryMode: settingProjectMemoryMode(
-          useSettingsStore.getState().effectiveSettings['agent.memory.projectMode']
-        ),
+        callerRequestId: newHostCallerRequestId('plan-decision'),
       }, streamHandlersForSession(session.id));
       const data = {
         session: result.session,
@@ -1494,12 +1521,9 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         events: mergeEventsById(state.events, data.events),
         pendingPermission: findLatestPendingPermission(data.events),
         resolvingPermission: null,
-        resolvingRequirement: null,
         resolvingPlan: null,
-        resolvingReview: null,
         runningSessionIds: removeRunningSessionId(state.runningSessionIds, data.session.id),
       }));
-      void get().refreshTraceEvents(data.session.id);
       void refreshCanonicalTimeline(data.session.id, true);
     } catch (err) {
       pollingStopped = true;
@@ -1513,82 +1537,4 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     }
   },
 
-  resolveReview: async (runId, decision, guidance) => {
-    const session = get().session;
-    if (!session || get().resolvingReview) return;
-    set((state) => ({
-      resolvingReview: { runId, decision },
-      runningSessionIds: addRunningSessionId(state.runningSessionIds, session.id),
-      errorMessage: null,
-    }));
-    let progressTimer: number | undefined;
-    let pollingStopped = false;
-    const refreshProgress = async () => {
-      if (pollingStopped) return;
-      const current = await getAgentSession(session.id);
-      if (current.ok && current.data) {
-        if (get().session?.id === session.id) {
-          set({
-            session: current.data.session,
-            events: mergeEventsById(get().events, current.data.events),
-            pendingPermission: findLatestPendingPermission(current.data.events),
-          });
-        }
-        await get().refreshTraceEvents(session.id);
-      }
-    };
-    progressTimer = window.setInterval(() => {
-      void refreshProgress();
-    }, 300);
-    void refreshProgress();
-    try {
-      const result = await startAndWaitAgentRun(session.id, {
-        op: 'resolveDecision',
-        decisionKind: 'review',
-        decision,
-        guidance,
-        runId,
-        workspacePath: session.projectId ? undefined : currentWorkspacePath(),
-        workflow: get().workflow,
-        reviewContinuationMode: settingReviewContinuationMode(
-          useSettingsStore.getState().effectiveSettings['agent.reviewContinuationMode']
-        ),
-        interventionLevel: settingInterventionLevel(
-          useSettingsStore.getState().effectiveSettings['agent.interventionLevel']
-        ),
-        projectMemoryMode: settingProjectMemoryMode(
-          useSettingsStore.getState().effectiveSettings['agent.memory.projectMode']
-        ),
-      }, streamHandlersForSession(session.id));
-      const data = {
-        session: result.session,
-        events: result.events,
-      };
-      pollingStopped = true;
-      if (progressTimer !== undefined) window.clearInterval(progressTimer);
-      set((state) => ({
-        session: data.session,
-        sessions: [data.session, ...state.sessions.filter((item) => item.id !== data.session.id)],
-        currentSessionId: data.session.id,
-        events: mergeEventsById(state.events, data.events),
-        pendingPermission: findLatestPendingPermission(data.events),
-        resolvingPermission: null,
-        resolvingRequirement: null,
-        resolvingPlan: null,
-        resolvingReview: null,
-        runningSessionIds: removeRunningSessionId(state.runningSessionIds, data.session.id),
-      }));
-      void get().refreshTraceEvents(data.session.id);
-      void refreshCanonicalTimeline(data.session.id, true);
-    } catch (err) {
-      pollingStopped = true;
-      if (progressTimer !== undefined) window.clearInterval(progressTimer);
-      const message = err instanceof Error ? err.message : String(err);
-      set((state) => ({
-        errorMessage: message,
-        resolvingReview: null,
-        runningSessionIds: removeRunningSessionId(state.runningSessionIds, session.id),
-      }));
-    }
-  },
 }));

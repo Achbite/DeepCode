@@ -43,6 +43,14 @@ import {
 import {
   sessionKernelFactsCaughtUpV2,
 } from './lineage.js';
+import {
+  decodeAgentInputAttachmentsV2,
+} from './inputAttachmentsV2.js';
+import {
+  buildSessionContextMemoryV2,
+  decodeSessionPriorEventsSourceV2,
+  type SessionPriorEventsSourceV2,
+} from './sessionMemory.js';
 import type {
   SessionKernelClockPortV2,
   SessionKernelIdFactoryPortV2,
@@ -53,7 +61,11 @@ import type {
   SessionKernelLoopResultV2,
   SessionKernelReviewV2,
   SessionPlanDecisionV2,
+  SessionProviderProfileBootstrapV2,
   SessionUserInputRecordV2,
+} from './types.js';
+import {
+  SESSION_PROVIDER_PROFILE_BOOTSTRAP_V2_SCHEMA,
 } from './types.js';
 
 export const SESSION_KERNEL_PRODUCTION_REQUEST_V2_SCHEMA =
@@ -143,15 +155,6 @@ export interface SessionKernelProductionDecidePlanV2 {
   };
 }
 
-export interface SessionKernelProductionSkipPlanActionV2 {
-  kind: 'skipPlanAction';
-  data: {
-    planActionId: string;
-    expectedPlanRevision: string;
-    reason: string;
-  };
-}
-
 export interface SessionKernelProductionObserveCapabilityDecisionV2 {
   kind: 'observeCapabilityDecision';
   data: {
@@ -201,7 +204,6 @@ export type SessionKernelProductionOperationV2 =
   | SessionKernelProductionResumeAfterBackpressureV2
   | SessionKernelProductionPreviewPlanActionV2
   | SessionKernelProductionDecidePlanV2
-  | SessionKernelProductionSkipPlanActionV2
   | SessionKernelProductionObserveCapabilityDecisionV2
   | SessionKernelProductionReconcileWakeV2
   | SessionKernelProductionReconcileFactsV2
@@ -218,7 +220,8 @@ export interface SessionKernelProductionRequestV2 {
   hostRunId: string;
   runId: string;
   historySchema: typeof SESSION_KERNEL_PERSISTENCE_V2_SCHEMA;
-  providerProfileId?: string;
+  providerProfile: SessionProviderProfileBootstrapV2;
+  priorSessionEvents: SessionPriorEventsSourceV2;
   prefetchedRun: SessionKernelPrefetchedRunDescriptorV2;
   initialInput: SessionUserInputRecordV2;
   operation: SessionKernelProductionOperationV2;
@@ -286,10 +289,6 @@ export type SessionKernelProductionOutcomeV2 =
   | {
       kind: 'planDecisionRecorded';
       decision: SessionPlanDecisionV2;
-    }
-  | {
-      kind: 'planActionSkipped';
-      planActionId: string;
     }
   | {
       kind: 'capabilityDecisionObserved';
@@ -633,13 +632,7 @@ export class SessionKernelProductionActorV2 {
     }
     const operationGeneration = ++this.operationSequence;
     const authorityGeneration =
-      request.operation.kind === 'userInput'
-        ? ++this.authorityGeneration
-        : this.authorityGeneration;
-    if (request.operation.kind === 'userInput') {
-      this.markActiveOrdinarySuperseded();
-      this.ordinaryTail = Promise.resolve();
-    }
+      this.authorityGeneration;
     let execution: Promise<SessionKernelProductionSuccessV2>;
     try {
       execution = this.schedule(request, {
@@ -792,29 +785,25 @@ export class SessionKernelProductionActorV2 {
       authorityGeneration: number;
     }
   ): Promise<SessionKernelProductionSuccessV2> {
-    const fenced = this.activeRunner
-      ? Promise.resolve({
-          activeRunner: this.activeRunner,
-          fenceGeneration:
-            this.activeRunner.fenceProviderForUserInput(),
-        })
-      : runner.then((activeRunner) => ({
-          activeRunner,
-          fenceGeneration:
-            activeRunner.fenceProviderForUserInput(),
-        }));
     const predecessor = this.inputTransitionTail;
-    const transition = Promise.all([
-      predecessor,
-      fenced,
-    ]).then(async ([, input]) => {
-      await input.activeRunner.applyFencedUserInput(
+    const transition = predecessor.then(async () => {
+      const activeRunner = await runner;
+      const fenceGeneration =
+        await activeRunner.persistUserInputBeforeFence(
+          request.operation.data.input
+        );
+      const authorityGeneration = ++this.authorityGeneration;
+      this.markActiveOrdinarySuperseded();
+      this.ordinaryTail = Promise.resolve();
+      await activeRunner.applyFencedUserInput(
         request.operation.data.input,
-        input.fenceGeneration
+        fenceGeneration
       );
       return {
-        ...input,
-        causalState: input.activeRunner.snapshot(),
+        activeRunner,
+        fenceGeneration,
+        authorityGeneration,
+        causalState: activeRunner.snapshot(),
       };
     });
     this.inputTransitionTail = transition.then(
@@ -824,7 +813,7 @@ export class SessionKernelProductionActorV2 {
     const execution = transition.then(async (input) => {
       const context: SessionKernelProductionOperationContextV2 = {
         operationGeneration: generation.operationGeneration,
-        authorityGeneration: generation.authorityGeneration,
+        authorityGeneration: input.authorityGeneration,
         causalState: input.causalState,
         superseded: false,
       };
@@ -1086,9 +1075,12 @@ async function createProductionRunner(
     new HttpSessionKernelProviderBackendV2(
       new HttpSessionKernelLlmTransportV2(
         trustedApiBase,
+        privateAuth,
+        request.sessionId,
+        request.runId,
         fetchImpl
       ),
-      request.providerProfileId
+      request.providerProfile.providerProfileId
     ),
     clock
   );
@@ -1099,6 +1091,11 @@ async function createProductionRunner(
       workspaceBindingRef:
         request.prefetchedRun.workspaceBindingRef,
       initialInput: request.initialInput,
+      sessionMemory: buildSessionContextMemoryV2({
+        source: request.priorSessionEvents,
+        excludeRunId: request.runId,
+      }),
+      providerProfile: request.providerProfile,
     },
     {
       runs: runAdapter,
@@ -1259,20 +1256,6 @@ async function executeProductionOperation(
         kind: 'planDecisionRecorded',
         decision: await runner.decidePlan(operation.data),
       };
-    case 'skipPlanAction':
-      requireProductionPlanRevision(
-        runner.snapshot(),
-        operation.data.expectedPlanRevision
-      );
-      await runner.skipPlanAction(
-        operation.data.planActionId,
-        operation.data.expectedPlanRevision,
-        operation.data.reason
-      );
-      return {
-        kind: 'planActionSkipped',
-        planActionId: operation.data.planActionId,
-      };
     case 'observeCapabilityDecision': {
       const state = runner.snapshot();
       requireExactCapabilityWait(
@@ -1396,11 +1379,12 @@ export function decodeSessionKernelProductionRequestV2(
       'hostRunId',
       'runId',
       'historySchema',
+      'providerProfile',
+      'priorSessionEvents',
       'prefetchedRun',
       'initialInput',
       'operation',
-    ],
-    ['providerProfileId']
+    ]
   );
   if (
     record.schemaVersion !== SESSION_KERNEL_PRODUCTION_REQUEST_V2_SCHEMA
@@ -1418,10 +1402,17 @@ export function decodeSessionKernelProductionRequestV2(
   const hostRunId = identity(record.hostRunId, 'hostRunId');
   const runId = identity(record.runId, 'runId');
   const initialInput = decodeInitialInput(record.initialInput);
+  const providerProfile = decodeProviderProfileBootstrapV2(
+    record.providerProfile
+  );
+  const priorSessionEvents = decodeSessionPriorEventsSourceV2(
+    record.priorSessionEvents
+  );
   if (
     prefetchedRun.runOpenReply.runId !== runId
     || prefetchedRun.inputId !== initialInput.inputId
     || prefetchedRun.opaqueInputRef !== initialInput.opaqueInputRef
+    || priorSessionEvents.sessionId !== sessionId
   ) {
     throw invalidProductionRequest(
       'session_kernel_production_run_identity_mismatch'
@@ -1434,17 +1425,56 @@ export function decodeSessionKernelProductionRequestV2(
     hostRunId,
     runId,
     historySchema: SESSION_KERNEL_PERSISTENCE_V2_SCHEMA,
-    ...(record.providerProfileId !== undefined
-      ? {
-          providerProfileId: identity(
-            record.providerProfileId,
-            'providerProfileId'
-          ),
-        }
-      : {}),
+    providerProfile,
+    priorSessionEvents,
     prefetchedRun,
     initialInput,
     operation: decodeOperation(record.operation),
+  };
+}
+
+function decodeProviderProfileBootstrapV2(
+  value: unknown
+): SessionProviderProfileBootstrapV2 {
+  const record = exactObject(value, [
+    'schemaVersion',
+    'providerProfileId',
+    'providerProfileRevisionDigest',
+    'contextWindowTokens',
+    'maxOutputTokens',
+  ]);
+  if (
+    record.schemaVersion !== SESSION_PROVIDER_PROFILE_BOOTSTRAP_V2_SCHEMA
+  ) {
+    throw invalidProductionRequest(
+      'session_kernel_provider_profile_schema_unsupported'
+    );
+  }
+  const contextWindowTokens = positiveTokenLimit(
+    record.contextWindowTokens,
+    'contextWindowTokens'
+  );
+  const maxOutputTokens = positiveTokenLimit(
+    record.maxOutputTokens,
+    'maxOutputTokens'
+  );
+  if (maxOutputTokens >= contextWindowTokens) {
+    throw invalidProductionRequest(
+      'session_kernel_provider_profile_budget_invalid'
+    );
+  }
+  return {
+    schemaVersion: SESSION_PROVIDER_PROFILE_BOOTSTRAP_V2_SCHEMA,
+    providerProfileId: identity(
+      record.providerProfileId,
+      'providerProfileId'
+    ),
+    providerProfileRevisionDigest: sha256Digest(
+      record.providerProfileRevisionDigest,
+      'providerProfileRevisionDigest'
+    ),
+    contextWindowTokens,
+    maxOutputTokens,
   };
 }
 
@@ -1482,7 +1512,13 @@ function safeProductionErrorCode(error: unknown): string {
 function decodeInitialInput(value: unknown): SessionUserInputRecordV2 {
   const record = exactObject(
     value,
-    ['inputId', 'opaqueInputRef', 'text', 'recordedAt']
+    [
+      'inputId',
+      'opaqueInputRef',
+      'text',
+      'attachments',
+      'recordedAt',
+    ]
   );
   const recordedAt = boundedText(
     record.recordedAt,
@@ -1502,6 +1538,7 @@ function decodeInitialInput(value: unknown): SessionUserInputRecordV2 {
       64 * 1024
     ),
     text: boundedText(record.text, 'text', 1024 * 1024),
+    attachments: decodeAgentInputAttachmentsV2(record.attachments),
     recordedAt,
   };
 }
@@ -1668,23 +1705,6 @@ function decodeOperation(
         planRevision: identity(body.planRevision, 'planRevision'),
         decision: body.decision,
         ...(guidance !== undefined ? { guidance } : {}),
-      },
-    };
-  }
-  if (tagged.kind === 'skipPlanAction') {
-    const body = exactObject(
-      data,
-      ['planActionId', 'expectedPlanRevision', 'reason']
-    );
-    return {
-      kind: tagged.kind,
-      data: {
-        planActionId: identity(body.planActionId, 'planActionId'),
-        expectedPlanRevision: identity(
-          body.expectedPlanRevision,
-          'expectedPlanRevision'
-        ),
-        reason: boundedText(body.reason, 'reason', 64 * 1024),
       },
     };
   }
@@ -2055,8 +2075,6 @@ function productionContinuation(
               : [],
             ...planRevisionField(state),
           };
-    case 'planActionSkipped':
-      return readyToDriveOrFinalize(state, planAction);
     case 'capabilityDecisionObserved':
       return outcome.result
         ? continuationForLoopResult(
@@ -2389,27 +2407,6 @@ function planActionContinuationContext(
       return current;
     }
   }
-  if (operation.kind === 'skipPlanAction') {
-    const actions = state.plan?.actions ?? [];
-    const skippedIndex = actions.findIndex(
-      (action) =>
-        action.manifest.planActionId
-          === operation.data.planActionId
-    );
-    const next = actions.slice(skippedIndex + 1).find(
-      (action) =>
-        !sessionKernelPlanActionSettledV2(
-          state,
-          action.manifest.planActionId
-        )
-    );
-    if (next) {
-      return planActionById(
-        state,
-        next.manifest.planActionId
-      );
-    }
-  }
   const currentWait = state.activeWait
     ? planActionForOperation(state, state.activeWait.operationId)
     : undefined;
@@ -2605,22 +2602,24 @@ function readyToDriveOrFinalize(
     return awaitingKernelFacts(state);
   }
   const plan = state.plan;
-  if (plan && canFinalizeSessionKernelReviewV2(state)) {
+  const everyPlanActionSettled = plan?.actions.every((action) =>
+    sessionKernelPlanActionSettledV2(
+      state,
+      action.manifest.planActionId
+    )
+  ) ?? false;
+  if (
+    plan
+    && everyPlanActionSettled
+    && canFinalizeSessionKernelReviewV2(state)
+  ) {
     return {
       kind: 'readyToFinalizeReview',
       expectedPlanRevision: plan.planRevision,
     };
   }
   if (context) return readyForPlanAction(state, context);
-  if (
-    plan
-    && plan.actions.every((action) =>
-      sessionKernelPlanActionSettledV2(
-        state,
-        action.manifest.planActionId
-      )
-    )
-  ) {
+  if (plan && everyPlanActionSettled) {
     return {
       kind: 'awaitingKernelFacts',
       observedHighWater:
@@ -2961,7 +2960,8 @@ function productionBootstrapFingerprint(
     hostRunId: request.hostRunId,
     runId: request.runId,
     historySchema: request.historySchema,
-    providerProfileId: request.providerProfileId ?? null,
+    providerProfile: request.providerProfile,
+    priorSessionEvents: request.priorSessionEvents,
     prefetchedRun: request.prefetchedRun,
     initialInput: request.initialInput,
   });
@@ -3086,6 +3086,34 @@ function identity(value: unknown, field: string): string {
     );
   }
   return text;
+}
+
+function sha256Digest(value: unknown, _field: string): string {
+  if (
+    typeof value !== 'string'
+    || !/^sha256:[0-9a-f]{64}$/u.test(value)
+  ) {
+    throw invalidProductionRequest(
+      'session_kernel_production_digest_invalid'
+    );
+  }
+  return value;
+}
+
+function positiveTokenLimit(
+  value: unknown,
+  _field: string
+): number {
+  if (
+    !Number.isSafeInteger(value)
+    || Number(value) <= 0
+    || Number(value) > 1_000_000_000
+  ) {
+    throw invalidProductionRequest(
+      'session_kernel_provider_profile_budget_invalid'
+    );
+  }
+  return Number(value);
 }
 
 function boundedText(

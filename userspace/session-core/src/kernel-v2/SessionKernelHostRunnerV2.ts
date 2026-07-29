@@ -16,13 +16,19 @@ import type {
   SessionKernelLoopResultV2,
   SessionKernelReviewV2,
   SessionProviderTurnRequestV2,
+  SessionProviderProfileBootstrapV2,
   SessionPlanDecisionV2,
   SessionUserInputRecordV2,
 } from './types.js';
+import type {
+  SessionContextMemoryV2,
+} from './sessionMemory.js';
 
 export interface SessionKernelHostRunnerOpenV2 {
   workspaceBindingRef: string;
   initialInput: SessionUserInputRecordV2;
+  sessionMemory: SessionContextMemoryV2;
+  providerProfile: SessionProviderProfileBootstrapV2;
   signal?: AbortSignal;
 }
 
@@ -91,6 +97,8 @@ export class SessionKernelHostRunnerV2 {
         controlEpoch: binding.controlEpoch,
         initialInput: input.initialInput,
         toolContext: binding.toolContext,
+        sessionMemory: input.sessionMemory,
+        providerProfile: input.providerProfile,
       },
       sessionKernelLoopPortsFromHostV2(adapters, binding),
       options
@@ -138,8 +146,10 @@ export class SessionKernelHostRunnerV2 {
     return this.requireProviderPlanRecorded(result);
   }
 
-  fenceProviderForUserInput(): number {
-    return this.loop.fenceProviderForUserInput();
+  persistUserInputBeforeFence(
+    input: SessionUserInputRecordV2
+  ): Promise<number> {
+    return this.loop.persistUserInputBeforeFence(input);
   }
 
   isUserInputFenceCurrent(generation: number): boolean {
@@ -186,18 +196,6 @@ export class SessionKernelHostRunnerV2 {
     guidance?: string;
   }): Promise<SessionPlanDecisionV2> {
     return this.loop.decidePlan(input);
-  }
-
-  async skipPlanAction(
-    planActionId: string,
-    expectedPlanRevision: string,
-    reason: string
-  ): Promise<void> {
-    await this.loop.skipPlanAction(
-      planActionId,
-      expectedPlanRevision,
-      reason
-    );
   }
 
   async runPlanAction(

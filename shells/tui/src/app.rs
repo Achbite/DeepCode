@@ -1,8 +1,9 @@
 use crate::model::CardModel;
 use crate::renderer::Renderer;
 use deepcode_kernel_client::{
-    terminal_workspace_scope, AgentRunResult, CreateAgentSessionRequest, HttpKernelClient,
-    ListAgentSessionsRequest, StartAgentRunRequest, TerminalWorkspaceScope,
+    terminal_workspace_scope, AgentRunCallerRequest, AgentRunGuidanceRequest, AgentRunResult,
+    CreateAgentSessionRequest, HttpKernelClient, ListAgentSessionsRequest, StartAgentRunRequest,
+    TerminalWorkspaceScope,
 };
 use serde_json::Value;
 use std::{
@@ -417,8 +418,15 @@ impl TuiApp {
             self.running_preview_active = false;
             return;
         };
-        let mut request = StartAgentRunRequest::ask(prompt.to_string());
-        request.host_language = Some(deepcode_kernel_client::terminal_host_language());
+        let caller_request_id = match new_tui_request_id("ask") {
+            Ok(request_id) => request_id,
+            Err(error) => {
+                self.running_preview_active = false;
+                self.cards.push(CardModel::error(error));
+                return;
+            }
+        };
+        let mut request = StartAgentRunRequest::ask(prompt.to_string(), caller_request_id);
         request.workspace_path = self.workspace_path();
         request.no_workspace = Some(self.host.no_workspace);
         self.start_run_request(RunOperation::Ask, session_id.clone(), request)
@@ -437,23 +445,33 @@ impl TuiApp {
             "补充引导已提交给共享 Session Runtime，将在下一次 provider checkpoint 生效。",
         ));
         self.status = format!("API {} · guidance queued", self.client.base_url());
+        self.submit_user_input_to_run(&session_id, &run_id, guidance)
+            .await;
+    }
+
+    async fn submit_user_input_to_run(&mut self, session_id: &str, run_id: &str, input: &str) {
+        let caller_request_id = match new_tui_request_id("input") {
+            Ok(request_id) => request_id,
+            Err(error) => {
+                self.status = format!("API {} · input failed", self.client.base_url());
+                self.cards.push(CardModel::error(error));
+                return;
+            }
+        };
         match self
             .client
             .submit_agent_run_guidance(
-                &session_id,
-                &run_id,
-                guidance.to_string(),
-                Vec::new(),
-                Some(deepcode_kernel_client::terminal_host_language()),
+                session_id,
+                run_id,
+                AgentRunGuidanceRequest::new(input, caller_request_id),
             )
             .await
         {
             Ok(result) => self.apply_run_snapshot(&result).await,
             Err(error) => {
-                self.status = format!("API {} · guidance failed", self.client.base_url());
-                self.cards.push(CardModel::error(format!(
-                    "提交补充引导失败：{error}\n如果当前正在等待权限或 Review，请先处理 pending decision。"
-                )));
+                self.status = format!("API {} · input failed", self.client.base_url());
+                self.cards
+                    .push(CardModel::error(format!("提交新用户输入失败：{error}")));
             }
         }
     }
@@ -469,34 +487,27 @@ impl TuiApp {
             .collect::<Vec<_>>();
         let Some(kind) = parts.first().cloned() else {
             self.cards.push(CardModel::error(
-                "用法：/decision <requirement|plan|review|permission> <accept|reject|revise> [run-id] [target-id] [guidance]",
+                "用法：/decision <plan|permission> <accept|reject|revise> [run-id] [target-id] [guidance]",
             ));
             return;
         };
         let Some(decision) = parts.get(1).cloned() else {
             self.cards.push(CardModel::error(
-                "用法：/decision <requirement|plan|review|permission> <accept|reject|revise> [run-id] [target-id] [guidance]",
+                "用法：/decision <plan|permission> <accept|reject|revise> [run-id] [target-id] [guidance]",
             ));
             return;
         };
-        if !matches!(
-            kind.as_str(),
-            "requirement" | "plan" | "review" | "permission"
-        ) {
-            self.cards.push(CardModel::error(
-                "decision kind 必须是 requirement、plan、review 或 permission",
-            ));
+        if !matches!(kind.as_str(), "plan" | "permission") {
+            self.cards
+                .push(CardModel::error("decision kind 必须是 plan 或 permission"));
             return;
         }
         if !matches!(
             (kind.as_str(), decision.as_str()),
-            (
-                "requirement" | "plan" | "review",
-                "accept" | "reject" | "revise"
-            ) | ("permission", "accept" | "reject")
+            ("plan", "accept" | "reject" | "revise") | ("permission", "accept" | "reject")
         ) {
             self.cards.push(CardModel::error(
-                "permission decision 只能是 accept 或 reject；其他 decision 还可使用 revise",
+                "permission decision 只能是 accept 或 reject；plan 还可使用 revise",
             ));
             return;
         }
@@ -525,9 +536,13 @@ impl TuiApp {
             let decision = match parse_pending_permission_input(line) {
                 Some(decision) => decision,
                 None => {
-                    self.cards.push(CardModel::error(
-                        "权限决策只能选择 accept/allow/确认，或 reject/deny/拒绝。",
-                    ));
+                    let Some(session_id) = self.current_session_id.clone() else {
+                        self.cards
+                            .push(CardModel::error("当前没有激活会话，无法提交新的用户输入。"));
+                        return;
+                    };
+                    self.submit_user_input_to_run(&session_id, &pending.run_id, line)
+                        .await;
                     return;
                 }
             };
@@ -562,10 +577,7 @@ impl TuiApp {
     ) {
         if !matches!(
             (kind.as_str(), decision.as_str()),
-            (
-                "requirement" | "plan" | "review",
-                "accept" | "reject" | "revise"
-            ) | ("permission", "accept" | "reject")
+            ("plan", "accept" | "reject" | "revise") | ("permission", "accept" | "reject")
         ) || (kind == "permission" && guidance.is_some())
         {
             self.cards.push(CardModel::error(
@@ -608,32 +620,17 @@ impl TuiApp {
             self.timeline = Some(timeline);
             return;
         }
-        let mut request = StartAgentRunRequest::resolve_decision(kind, decision);
-        request.host_language = Some(deepcode_kernel_client::terminal_host_language());
+        let caller_request_id = match new_tui_request_id("decision") {
+            Ok(request_id) => request_id,
+            Err(error) => {
+                self.cards.push(CardModel::error(error));
+                return;
+            }
+        };
+        let mut request = StartAgentRunRequest::resolve_decision(kind, decision, caller_request_id);
         request.run_id = Some(pending.run_id);
         request.target_id = Some(pending.target_id);
-        request.interaction_id = Some(pending.interaction_id);
-        request.interaction_revision = Some(pending.interaction_revision);
-        request.review_id = pending.review_id;
-        let decision_request_id = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| {
-                format!(
-                    "tui-decision-{}-{}",
-                    std::process::id(),
-                    duration.as_nanos()
-                )
-            });
-        let Ok(decision_request_id) = decision_request_id else {
-            self.cards.push(CardModel::error(
-                "系统时钟早于 Unix epoch，无法生成 decision request identity。",
-            ));
-            return;
-        };
-        request.decision_request_id = Some(decision_request_id);
         request.guidance = guidance;
-        request.workspace_path = self.workspace_path();
-        request.no_workspace = Some(self.host.no_workspace);
         self.status = format!("API {} · running", self.client.base_url());
         self.running_preview_active = true;
         self.start_run_request(RunOperation::Decision, session_id, request)
@@ -701,7 +698,6 @@ impl TuiApp {
         match self
             .client
             .create_agent_session(CreateAgentSessionRequest {
-                initial_mode: Some("plan".to_string()),
                 workspace_id: scope.as_ref().map(|scope| scope.workspace_id.clone()),
                 workspace_hash: scope.as_ref().map(|scope| scope.workspace_hash.clone()),
                 title: Some(title.to_string()),
@@ -791,7 +787,17 @@ impl TuiApp {
         self.status = format!("API {} · stopped", self.client.base_url());
         match self
             .client
-            .cancel_agent_run_by_id(&session_id, &run_id)
+            .cancel_agent_run_by_id(
+                &session_id,
+                &run_id,
+                match new_tui_request_id("cancel") {
+                    Ok(request_id) => AgentRunCallerRequest::new(request_id),
+                    Err(error) => {
+                        self.cards.push(CardModel::error(error));
+                        return;
+                    }
+                },
+            )
             .await
         {
             Ok(result) => self.apply_run_result(result),
@@ -900,10 +906,14 @@ impl TuiApp {
     }
 
     async fn refresh_audit_status(&mut self) {
-        match self.client.audit_verify().await {
-            Ok(report) => self.cards.push(CardModel::audit_status(
-                report.status,
-                format!("degraded: {}\n{}", report.degraded, report.message),
+        match self.client.daemon_status().await {
+            Ok(status) => self.cards.push(CardModel::audit_status(
+                if status.ok { "ok" } else { "degraded" },
+                status
+                    .raw
+                    .get("audit")
+                    .map(Value::to_string)
+                    .unwrap_or_else(|| "Host audit status unavailable.".to_string()),
             )),
             Err(error) => self
                 .cards
@@ -966,7 +976,6 @@ impl TuiApp {
         let result = self
             .client
             .create_agent_session(CreateAgentSessionRequest {
-                initial_mode: Some("plan".to_string()),
                 workspace_id: scope.as_ref().map(|scope| scope.workspace_id.clone()),
                 workspace_hash: scope.as_ref().map(|scope| scope.workspace_hash.clone()),
                 title: title.map(ToOwned::to_owned),
@@ -1199,6 +1208,17 @@ impl TuiApp {
     }
 }
 
+fn new_tui_request_id(prefix: &str) -> Result<String, String> {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "系统时钟早于 Unix epoch，无法生成 caller request identity。")?;
+    Ok(format!(
+        "tui-{prefix}-{}-{}",
+        std::process::id(),
+        timestamp.as_nanos()
+    ))
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct TuiHostOptions {
     pub workspace_path: Option<String>,
@@ -1210,18 +1230,6 @@ struct PendingDecision {
     kind: String,
     run_id: String,
     target_id: String,
-    interaction_id: String,
-    interaction_revision: String,
-    review_id: Option<String>,
-    options: Vec<PendingDecisionOption>,
-}
-
-#[derive(Debug, Clone)]
-struct PendingDecisionOption {
-    id: String,
-    label: String,
-    description: Option<String>,
-    recommended: bool,
 }
 
 struct ParsedDecisionInput {
@@ -1279,7 +1287,7 @@ fn latest_pending_decision(timeline: Option<&Value>) -> Option<PendingDecision> 
     }
     let pending = timeline.get("interactionProjection")?.get("pending")?;
     let kind = pending.get("kind").and_then(Value::as_str)?;
-    if !matches!(kind, "requirement" | "plan" | "review" | "permission") {
+    if !matches!(kind, "plan" | "permission") {
         return None;
     }
     let run_id = if kind == "permission" {
@@ -1316,84 +1324,14 @@ fn latest_pending_decision(timeline: Option<&Value>) -> Option<PendingDecision> 
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())?
         .to_string();
-    let interaction_id = pending
-        .get("interactionId")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())?
-        .to_string();
-    let interaction_revision = pending
-        .get("interactionRevision")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())?
-        .to_string();
-    let review_id = if kind == "review" {
-        Some(
-            pending
-                .get("reviewId")
-                .and_then(Value::as_str)
-                .filter(|value| !value.trim().is_empty())?
-                .to_string(),
-        )
-    } else {
-        None
-    };
     Some(PendingDecision {
         kind: kind.to_string(),
         run_id,
         target_id,
-        interaction_id,
-        interaction_revision,
-        review_id,
-        options: if kind == "requirement" {
-            decision_request_options(pending.get("decisionRequest"))
-        } else {
-            Vec::new()
-        },
     })
 }
 
-fn decision_request_options(value: Option<&Value>) -> Vec<PendingDecisionOption> {
-    let Some(options) = value
-        .and_then(|item| item.get("options"))
-        .and_then(Value::as_array)
-    else {
-        return Vec::new();
-    };
-    let parsed = options
-        .iter()
-        .filter_map(|item| {
-            let id = item
-                .get("id")
-                .and_then(Value::as_str)
-                .or_else(|| item.get("label").and_then(Value::as_str))?;
-            let label = item.get("label").and_then(Value::as_str).unwrap_or(id);
-            Some(PendingDecisionOption {
-                id: id.to_string(),
-                label: label.to_string(),
-                description: item
-                    .get("description")
-                    .and_then(Value::as_str)
-                    .or_else(|| item.get("impact").and_then(Value::as_str))
-                    .or_else(|| item.get("tradeoff").and_then(Value::as_str))
-                    .map(ToOwned::to_owned),
-                recommended: item
-                    .get("recommended")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-            })
-        })
-        .collect::<Vec<_>>();
-    if parsed.len() >= 2 {
-        parsed
-    } else {
-        Vec::new()
-    }
-}
-
-fn parse_pending_decision_input(line: &str, pending: &PendingDecision) -> ParsedDecisionInput {
-    if !pending.options.is_empty() {
-        return parse_technical_choice_input(line, pending);
-    }
+fn parse_pending_decision_input(line: &str, _pending: &PendingDecision) -> ParsedDecisionInput {
     let trimmed = line.trim();
     let lower = trimmed.to_ascii_lowercase();
     if trimmed.is_empty()
@@ -1445,80 +1383,6 @@ fn parse_pending_permission_input(line: &str) -> Option<String> {
         return Some("reject".to_string());
     }
     None
-}
-
-fn parse_technical_choice_input(line: &str, pending: &PendingDecision) -> ParsedDecisionInput {
-    let trimmed = line.trim();
-    let lower = trimmed.to_ascii_lowercase();
-    if matches!(
-        lower.as_str(),
-        "end" | "stop" | "reject" | "/reject" | "/end" | "/stop"
-    ) || matches!(trimmed, "结束" | "拒绝")
-    {
-        return ParsedDecisionInput {
-            decision: "reject".to_string(),
-            guidance: None,
-        };
-    }
-    let default = pending
-        .options
-        .iter()
-        .find(|option| option.recommended)
-        .unwrap_or(&pending.options[0]);
-    let (option, supplement) = if let Some((index, tail)) = numbered_choice(trimmed) {
-        (
-            pending.options.get(index).unwrap_or(default),
-            tail.filter(|value| !value.is_empty()),
-        )
-    } else if trimmed.is_empty() || lower == "accept" || trimmed == "确认" || trimmed == "同意"
-    {
-        (default, None)
-    } else {
-        (default, Some(trimmed))
-    };
-    ParsedDecisionInput {
-        decision: "accept".to_string(),
-        guidance: Some(technical_choice_guidance(option, supplement)),
-    }
-}
-
-fn numbered_choice(value: &str) -> Option<(usize, Option<&str>)> {
-    let mut chars = value.chars();
-    let first = chars.next()?;
-    if !matches!(first, '1' | '2' | '3') {
-        return None;
-    }
-    let rest = chars.as_str();
-    if let Some(next) = rest.chars().next() {
-        if !next.is_whitespace() {
-            return None;
-        }
-    }
-    let index = first.to_digit(10)? as usize - 1;
-    Some((index, Some(rest.trim()).filter(|tail| !tail.is_empty())))
-}
-
-fn technical_choice_guidance(option: &PendingDecisionOption, supplement: Option<&str>) -> String {
-    let mut lines = vec![
-        "用户已选择技术方案：".to_string(),
-        format!("- id: {}", normalize_guidance_line(&option.id)),
-        format!("- label: {}", normalize_guidance_line(&option.label)),
-    ];
-    if let Some(description) = option.description.as_deref() {
-        lines.push(format!(
-            "- description: {}",
-            normalize_guidance_line(description)
-        ));
-    }
-    if let Some(supplement) = supplement {
-        lines.push("用户补充信息：".to_string());
-        lines.push(supplement.trim().to_string());
-    }
-    lines.join("\n")
-}
-
-fn normalize_guidance_line(value: &str) -> String {
-    value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 #[cfg(test)]

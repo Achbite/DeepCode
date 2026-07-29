@@ -4,6 +4,8 @@ use crate::host_v2_storage::{
     reject_transport_capabilities, sha256_path_component, validate_bounded_identity,
     validate_safe_session_identity, validate_sha256_digest, HostV2StorageError,
 };
+use crate::session_bootstrap_v2::{HostProviderProfileBootstrapV2, HostSessionPriorEventsV2};
+use crate::AgentInputAttachmentV2;
 use deepcode_kernel_abi::v2_command::{KernelCommandEnvelopeV2, KernelCommandV2, RunOpenReplyV2};
 use rusqlite::{
     params, Connection, OpenFlags, OptionalExtension, Row, Transaction, TransactionBehavior,
@@ -19,22 +21,25 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const STORE_SCHEMA_V2: &str = "deepcode.host.kernel-durable-store.v2";
 const RUN_ROW_SCHEMA_V2: &str = "deepcode.host.kernel-run.v2";
 const BOOTSTRAP_SCHEMA_V2: &str = "deepcode.host.kernel-run-bootstrap.v2";
+const CALLER_REQUEST_SCHEMA_V2: &str = "deepcode.host.caller-request.v2";
 const OPERATION_ROW_SCHEMA_V2: &str = "deepcode.host.kernel-operation.v2";
 const ATTEMPT_ROW_SCHEMA_V2: &str = "deepcode.host.kernel-dispatch-attempt.v2";
 const HISTORY_SCHEMA_V2: &str = "deepcode.session.kernel-persistence.v2";
 const PRODUCTION_FRAME_SCHEMA_V2: &str = "deepcode.session.kernel-production-request-frame.v2";
 const PRODUCTION_REQUEST_SCHEMA_V2: &str = "deepcode.session.kernel-production-request.v2";
 const PREFETCHED_RUN_SCHEMA_V2: &str = "deepcode.session.prefetched-kernel-run.v2";
-const SQLITE_USER_VERSION_V2: i64 = 2;
+const SESSION_BOOTSTRAP_MATERIAL_SCHEMA_V2: &str =
+    "deepcode.host.kernel-session-bootstrap-material.v2";
+const SQLITE_USER_VERSION_V2: i64 = 5;
 
 const MAX_BOOTSTRAP_BYTES: usize = 8 * 1024 * 1024;
 const MAX_INITIAL_INPUT_BYTES: usize = 1024 * 1024;
 const MAX_OPERATION_FRAME_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
 const MAX_RUN_ROWS: i64 = 16_384;
+const MAX_CALLER_REQUEST_ROWS: i64 = 262_144;
 const MAX_OPERATION_ROWS: i64 = 131_072;
 const MAX_ATTEMPT_ROWS: i64 = 262_144;
-const MAX_OPERATION_PAGE_ITEMS: usize = 4_096;
 const MAX_DATABASE_BYTES: i64 = 512 * 1024 * 1024;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const SQLITE_WAL_LIMIT_BYTES: i64 = 64 * 1024 * 1024;
@@ -47,21 +52,35 @@ pub(crate) struct HostKernelBootstrapInitialInputV2 {
     pub(crate) input_id: String,
     pub(crate) opaque_input_ref: String,
     pub(crate) text: String,
+    pub(crate) attachments: Vec<AgentInputAttachmentV2>,
     pub(crate) recorded_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct HostKernelSessionBootstrapMaterialV2 {
+    schema_version: String,
+    active_folder_id: Option<String>,
+    initial_input: HostKernelBootstrapInitialInputV2,
+    prior_session_events: HostSessionPriorEventsV2,
+    provider_profile: HostProviderProfileBootstrapV2,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct HostKernelRunOpeningInputV2 {
     pub(crate) session_id: String,
     pub(crate) host_run_id: String,
+    pub(crate) drive_caller_request_id: String,
+    pub(crate) drive_request_digest: String,
     pub(crate) run_open_request_id: String,
     pub(crate) run_open_envelope: KernelCommandEnvelopeV2,
     pub(crate) workspace_binding_identity: String,
     pub(crate) workspace_kind: HostRunWorkspaceKindV2,
+    pub(crate) active_folder_id: Option<String>,
     pub(crate) empty_workspace_key: Option<String>,
     pub(crate) run_settings: HostRunSettingsCeilingV2,
-    pub(crate) provider_profile_id: Option<String>,
-    pub(crate) provider_profile_revision_digest: Option<String>,
+    pub(crate) provider_profile: HostProviderProfileBootstrapV2,
+    pub(crate) prior_session_events: HostSessionPriorEventsV2,
     pub(crate) initial_input: HostKernelBootstrapInitialInputV2,
     pub(crate) opening_recorded_at: String,
 }
@@ -75,21 +94,19 @@ pub(crate) enum HostKernelStoredRunLifecycleV2 {
 
 #[derive(Debug, Clone)]
 pub(crate) struct HostKernelRunOpeningRecordV2 {
-    pub(crate) schema_version: String,
-    pub(crate) history_schema: String,
     pub(crate) lifecycle: HostKernelStoredRunLifecycleV2,
     pub(crate) session_id: String,
     pub(crate) host_run_id: String,
     pub(crate) run_open_request_id: String,
     pub(crate) run_open_envelope: KernelCommandEnvelopeV2,
-    pub(crate) run_open_envelope_digest: String,
     pub(crate) workspace_binding_ref: String,
     pub(crate) workspace_binding_identity: String,
     pub(crate) workspace_kind: HostRunWorkspaceKindV2,
+    pub(crate) active_folder_id: Option<String>,
     pub(crate) empty_workspace_key: Option<String>,
     pub(crate) run_settings: HostRunSettingsCeilingV2,
-    pub(crate) provider_profile_id: Option<String>,
-    pub(crate) provider_profile_revision_digest: Option<String>,
+    pub(crate) provider_profile: HostProviderProfileBootstrapV2,
+    pub(crate) prior_session_events: HostSessionPriorEventsV2,
     pub(crate) initial_input: HostKernelBootstrapInitialInputV2,
     pub(crate) opening_recorded_at: String,
     pub(crate) opening_digest: String,
@@ -98,7 +115,6 @@ pub(crate) struct HostKernelRunOpeningRecordV2 {
 #[derive(Debug, Clone)]
 pub(crate) struct HostKernelRunOpeningReceiptV2 {
     pub(crate) record: HostKernelRunOpeningRecordV2,
-    pub(crate) replayed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -112,31 +128,79 @@ pub(crate) struct HostKernelBootstrapActivationV2 {
 
 #[derive(Debug, Clone)]
 pub(crate) struct HostKernelBootstrapRecordV2 {
-    pub(crate) schema_version: String,
-    pub(crate) history_schema: String,
     pub(crate) session_id: String,
     pub(crate) host_run_id: String,
-    pub(crate) run_open_request_id: String,
     pub(crate) run_id: String,
     pub(crate) workspace_binding_ref: String,
     pub(crate) workspace_binding_digest: String,
     pub(crate) workspace_binding_identity: String,
     pub(crate) workspace_kind: HostRunWorkspaceKindV2,
+    pub(crate) active_folder_id: Option<String>,
     pub(crate) empty_workspace_key: Option<String>,
     pub(crate) run_settings: HostRunSettingsCeilingV2,
     pub(crate) run_open_reply: RunOpenReplyV2,
-    pub(crate) provider_profile_id: Option<String>,
-    pub(crate) provider_profile_revision_digest: Option<String>,
+    pub(crate) provider_profile: HostProviderProfileBootstrapV2,
+    pub(crate) prior_session_events: HostSessionPriorEventsV2,
     pub(crate) initial_input: HostKernelBootstrapInitialInputV2,
-    pub(crate) opening_digest: String,
     pub(crate) bootstrap_digest: String,
-    pub(crate) activated_at: String,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct HostKernelBootstrapReceiptV2 {
     pub(crate) record: HostKernelBootstrapRecordV2,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct HostCallerRequestBindingInputV2 {
+    pub(crate) session_id: String,
+    pub(crate) caller_request_id: String,
+    pub(crate) request_kind: String,
+    pub(crate) request_digest: String,
+    pub(crate) response_identity: Value,
+    pub(crate) recorded_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct HostCallerRequestBindingReceiptV2 {
+    pub(crate) session_id: String,
+    pub(crate) caller_request_id: String,
+    pub(crate) request_kind: String,
+    pub(crate) request_digest: String,
+    pub(crate) response_identity: Value,
+    pub(crate) recorded_at: String,
+    pub(crate) drive_state: HostCallerRequestDriveStateV2,
+    pub(crate) drive_owner_instance_id: Option<String>,
+    pub(crate) drive_started_at: Option<String>,
+    pub(crate) outcome: Option<Value>,
+    pub(crate) outcome_digest: Option<String>,
     pub(crate) replayed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HostCallerRequestDriveStateV2 {
+    Bound,
+    Driving,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct HostCallerRequestDriveClaimReceiptV2 {
+    pub(crate) binding: HostCallerRequestBindingReceiptV2,
+    pub(crate) acquired: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct HostCallerRequestRecoveryEvidenceV2 {
+    pub(crate) binding: HostCallerRequestBindingReceiptV2,
+    pub(crate) run_lifecycle: Option<HostKernelStoredRunLifecycleV2>,
+    pub(crate) provider_profile_id: Option<String>,
+    pub(crate) run_recorded_at: Option<String>,
+    pub(crate) retired_at: Option<String>,
+    pub(crate) retirement_caller_request_id: Option<String>,
+    pub(crate) retirement_request_digest: Option<String>,
+    pub(crate) first_operation_present: bool,
+    pub(crate) first_operation_pending: bool,
+    pub(crate) first_settlement: Option<HostKernelOperationSettlementReceiptV2>,
+    pub(crate) latest_settlement: Option<HostKernelOperationSettlementReceiptV2>,
 }
 
 #[derive(Debug, Clone)]
@@ -153,15 +217,8 @@ pub(crate) struct HostKernelOperationPreparedV2 {
     pub(crate) recorded_at: String,
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct HostKernelPreparedOperationReceiptV2 {
-    pub(crate) operation_sequence: u64,
-    pub(crate) operation_request_id: String,
-    pub(crate) production_frame: Value,
-    pub(crate) production_frame_digest: String,
-    pub(crate) recorded_at: String,
-    pub(crate) replayed: bool,
-}
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HostKernelPreparedOperationReceiptV2;
 
 #[derive(Debug, Clone)]
 pub(crate) struct HostKernelOperationRefV2 {
@@ -201,18 +258,11 @@ pub(crate) enum HostKernelDispatchAttemptStateV2 {
 
 #[derive(Debug, Clone)]
 pub(crate) struct HostKernelDispatchAttemptReceiptV2 {
-    pub(crate) operation_sequence: u64,
-    pub(crate) attempt_sequence: u64,
-    pub(crate) operation_request_id: String,
     pub(crate) attempt_id: String,
     pub(crate) owner_instance_id: String,
-    pub(crate) owner_binding_digest: String,
     pub(crate) state: HostKernelDispatchAttemptStateV2,
-    pub(crate) recovery_of_attempt_id: Option<String>,
     pub(crate) observed_response: Option<Value>,
     pub(crate) response_digest: Option<String>,
-    pub(crate) response_observed_at: Option<String>,
-    pub(crate) replayed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -241,30 +291,17 @@ pub(crate) struct HostKernelPendingOperationV2 {
     pub(crate) host_run_id: String,
     pub(crate) run_id: String,
     pub(crate) bootstrap_digest: String,
-    pub(crate) provider_profile_revision_digest: Option<String>,
     pub(crate) operation_sequence: u64,
     pub(crate) operation_request_id: String,
     pub(crate) production_frame: Value,
-    pub(crate) production_frame_digest: String,
-    pub(crate) recorded_at: String,
     pub(crate) latest_attempt: Option<HostKernelDispatchAttemptReceiptV2>,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct HostKernelPendingOperationPageV2 {
-    pub(crate) operations: Vec<HostKernelPendingOperationV2>,
-    pub(crate) high_water_operation_sequence: u64,
-    pub(crate) has_more: bool,
-}
-
-#[derive(Debug, Clone)]
 pub(crate) struct HostKernelOperationSettlementReceiptV2 {
-    pub(crate) operation_sequence: u64,
     pub(crate) operation_request_id: String,
-    pub(crate) attempt_id: String,
     pub(crate) settlement: HostKernelOperationSettlementV2,
     pub(crate) settlement_digest: String,
-    pub(crate) replayed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -287,6 +324,488 @@ impl HostKernelOperationStoreV2 {
         }
     }
 
+    pub(crate) fn caller_request_binding(
+        &self,
+        session_id: &str,
+        caller_request_id: &str,
+        request_kind: &str,
+        request_digest: &str,
+    ) -> Result<Option<HostCallerRequestBindingReceiptV2>, HostV2StorageError> {
+        validate_caller_request_identity(
+            session_id,
+            caller_request_id,
+            request_kind,
+            request_digest,
+        )?;
+        self.with_connection(|connection| {
+            let Some(stored) = stored_caller_request(connection, session_id, caller_request_id)?
+            else {
+                return Ok(None);
+            };
+            decode_caller_request_binding(stored, request_kind, request_digest, true).map(Some)
+        })
+    }
+
+    pub(crate) fn bind_caller_request(
+        &self,
+        input: HostCallerRequestBindingInputV2,
+    ) -> Result<HostCallerRequestBindingReceiptV2, HostV2StorageError> {
+        validate_caller_request_identity(
+            &input.session_id,
+            &input.caller_request_id,
+            &input.request_kind,
+            &input.request_digest,
+        )?;
+        validate_bounded_identity(&input.recorded_at, "recordedAt", 1024)?;
+        reject_transport_capabilities(&input.response_identity)?;
+        let response_identity_json = canonical_json_string(&input.response_identity)?;
+        let response_identity_digest = canonical_sha256(&input.response_identity)?;
+        if response_identity_json.len() > MAX_OPERATION_FRAME_BYTES {
+            return Err(HostV2StorageError::invalid(
+                "host_caller_request_identity_too_large",
+                "Host caller request identity exceeds its bounded size",
+            ));
+        }
+        self.with_write_transaction(|transaction| {
+            if let Some(stored) =
+                stored_caller_request(transaction, &input.session_id, &input.caller_request_id)?
+            {
+                return decode_caller_request_binding(
+                    stored,
+                    &input.request_kind,
+                    &input.request_digest,
+                    true,
+                );
+            }
+            reserve_row(transaction, "caller_request_rows", MAX_CALLER_REQUEST_ROWS)?;
+            transaction
+                .execute(
+                    "INSERT INTO host_caller_requests (
+                        schema_version, session_id, caller_request_id, request_kind,
+                        request_digest, response_identity_json,
+                        response_identity_digest, recorded_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        CALLER_REQUEST_SCHEMA_V2,
+                        input.session_id,
+                        input.caller_request_id,
+                        input.request_kind,
+                        input.request_digest,
+                        response_identity_json,
+                        response_identity_digest,
+                        input.recorded_at,
+                    ],
+                )
+                .map_err(|error| database_error("host_caller_request_bind_failed", error))?;
+            Ok(HostCallerRequestBindingReceiptV2 {
+                session_id: input.session_id,
+                caller_request_id: input.caller_request_id,
+                request_kind: input.request_kind,
+                request_digest: input.request_digest,
+                response_identity: input.response_identity,
+                recorded_at: input.recorded_at,
+                drive_state: HostCallerRequestDriveStateV2::Bound,
+                drive_owner_instance_id: None,
+                drive_started_at: None,
+                outcome: None,
+                outcome_digest: None,
+                replayed: false,
+            })
+        })
+    }
+
+    /// `Bound` is the only replay-safe admission state. Once a request becomes
+    /// `Driving`, all later callers must reconcile its correlated operations or
+    /// retirement; they must never acquire execution ownership again.
+    pub(crate) fn claim_caller_request_drive(
+        &self,
+        session_id: &str,
+        caller_request_id: &str,
+        request_kind: &str,
+        request_digest: &str,
+        owner_instance_id: &str,
+        started_at: &str,
+    ) -> Result<HostCallerRequestDriveClaimReceiptV2, HostV2StorageError> {
+        validate_caller_request_identity(
+            session_id,
+            caller_request_id,
+            request_kind,
+            request_digest,
+        )?;
+        validate_bounded_identity(owner_instance_id, "driveOwnerInstanceId", 256)?;
+        validate_bounded_identity(started_at, "driveStartedAt", 1024)?;
+        self.with_write_transaction(|transaction| {
+            let stored = stored_caller_request(transaction, session_id, caller_request_id)?
+                .ok_or_else(|| {
+                    HostV2StorageError::not_found(
+                        "host_caller_request_not_found",
+                        "Host caller request must be bound before drive admission",
+                    )
+                })?;
+            let existing =
+                decode_caller_request_binding(stored, request_kind, request_digest, true)?;
+            if existing.outcome.is_some()
+                || existing.drive_state == HostCallerRequestDriveStateV2::Driving
+            {
+                return Ok(HostCallerRequestDriveClaimReceiptV2 {
+                    binding: existing,
+                    acquired: false,
+                });
+            }
+            let changed = transaction
+                .execute(
+                    "UPDATE host_caller_requests
+                     SET drive_state = 'Driving', drive_owner_instance_id = ?1,
+                         drive_started_at = ?2
+                     WHERE session_id = ?3 AND caller_request_id = ?4
+                       AND drive_state = 'Bound' AND outcome_json IS NULL",
+                    params![owner_instance_id, started_at, session_id, caller_request_id,],
+                )
+                .map_err(|error| database_error("host_caller_request_drive_claim_failed", error))?;
+            if changed != 1 {
+                return Err(HostV2StorageError::conflict(
+                    "host_caller_request_drive_claim_conflict",
+                    "Host caller request drive ownership changed before durable admission",
+                ));
+            }
+            let host_run_id = existing
+                .response_identity
+                .get("hostRunId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    HostV2StorageError::conflict(
+                        "host_caller_request_identity_invalid",
+                        "Host caller request drive has no exact Host Run identity",
+                    )
+                })?;
+            if let Some(run) = stored_run_by_session_host(transaction, session_id, host_run_id)? {
+                if parse_run_lifecycle(&run.lifecycle)? != HostKernelStoredRunLifecycleV2::Active {
+                    return Err(HostV2StorageError::conflict(
+                        "host_caller_request_run_not_active",
+                        "Host caller request cannot acquire a non-active Run drive",
+                    ));
+                }
+                match (
+                    run.drive_caller_request_id.as_deref(),
+                    run.drive_request_digest.as_deref(),
+                ) {
+                    (None, None) => {
+                        let changed = transaction
+                            .execute(
+                                "UPDATE host_kernel_runs
+                                 SET drive_caller_request_id = ?1, drive_request_digest = ?2
+                                 WHERE id = ?3 AND lifecycle = 'Active'
+                                   AND drive_caller_request_id IS NULL
+                                   AND drive_request_digest IS NULL",
+                                params![caller_request_id, request_digest, run.id],
+                            )
+                            .map_err(|error| {
+                                database_error("host_caller_request_run_drive_bind_failed", error)
+                            })?;
+                        if changed != 1 {
+                            return Err(HostV2StorageError::conflict(
+                                "host_caller_request_run_drive_conflict",
+                                "Host Run drive ownership changed during caller admission",
+                            ));
+                        }
+                    }
+                    (Some(current_id), Some(current_digest))
+                        if current_id == caller_request_id && current_digest == request_digest => {}
+                    _ => {
+                        return Err(HostV2StorageError::conflict(
+                            "host_caller_request_run_drive_conflict",
+                            "Host Run is already driven by another caller request",
+                        ))
+                    }
+                }
+            }
+            let stored = stored_caller_request(transaction, session_id, caller_request_id)?
+                .ok_or_else(|| {
+                    HostV2StorageError::io(
+                        "host_caller_request_drive_claim_lost",
+                        "Drive-owned Host caller request disappeared before commit",
+                    )
+                })?;
+            Ok(HostCallerRequestDriveClaimReceiptV2 {
+                binding: decode_caller_request_binding(
+                    stored,
+                    request_kind,
+                    request_digest,
+                    false,
+                )?,
+                acquired: true,
+            })
+        })
+    }
+
+    pub(crate) fn settle_caller_request(
+        &self,
+        session_id: &str,
+        caller_request_id: &str,
+        request_kind: &str,
+        request_digest: &str,
+        outcome: Value,
+        settled_at: String,
+    ) -> Result<HostCallerRequestBindingReceiptV2, HostV2StorageError> {
+        validate_caller_request_identity(
+            session_id,
+            caller_request_id,
+            request_kind,
+            request_digest,
+        )?;
+        validate_bounded_identity(&settled_at, "settledAt", 1024)?;
+        reject_transport_capabilities(&outcome)?;
+        let release_run_drive =
+            outcome.get("disposition").and_then(Value::as_str) != Some("indeterminate");
+        let outcome_json = canonical_json_string(&outcome)?;
+        if outcome_json.len() > MAX_RESPONSE_BYTES {
+            return Err(HostV2StorageError::invalid(
+                "host_caller_request_outcome_too_large",
+                "Host caller request outcome exceeds its bounded size",
+            ));
+        }
+        let outcome_digest = canonical_sha256(&outcome)?;
+        self.with_write_transaction(|transaction| {
+            let stored = stored_caller_request(transaction, session_id, caller_request_id)?
+                .ok_or_else(|| {
+                    HostV2StorageError::not_found(
+                        "host_caller_request_not_found",
+                        "Host caller request must be bound before settlement",
+                    )
+                })?;
+            let existing =
+                decode_caller_request_binding(stored, request_kind, request_digest, true)?;
+            if let Some(existing_digest) = &existing.outcome_digest {
+                if existing_digest == &outcome_digest {
+                    return Ok(existing);
+                }
+                return Err(HostV2StorageError::conflict(
+                    "host_caller_request_outcome_conflict",
+                    "Host caller request is already settled with a different outcome",
+                ));
+            }
+            let host_run_id = existing
+                .response_identity
+                .get("hostRunId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    HostV2StorageError::conflict(
+                        "host_caller_request_identity_invalid",
+                        "Host caller request settlement has no exact Host Run identity",
+                    )
+                })?;
+            let changed = transaction
+                .execute(
+                    "UPDATE host_caller_requests
+                     SET outcome_json = ?1, outcome_digest = ?2, settled_at = ?3
+                     WHERE session_id = ?4 AND caller_request_id = ?5
+                       AND outcome_json IS NULL",
+                    params![
+                        outcome_json,
+                        outcome_digest,
+                        settled_at,
+                        session_id,
+                        caller_request_id,
+                    ],
+                )
+                .map_err(|error| database_error("host_caller_request_settle_failed", error))?;
+            if changed != 1 {
+                return Err(HostV2StorageError::conflict(
+                    "host_caller_request_settle_conflict",
+                    "Host caller request changed before durable settlement",
+                ));
+            }
+            if release_run_drive {
+                transaction
+                    .execute(
+                        "UPDATE host_kernel_runs
+                         SET drive_caller_request_id = NULL, drive_request_digest = NULL
+                         WHERE session_id = ?1 AND host_run_id = ?2
+                           AND drive_caller_request_id = ?3 AND drive_request_digest = ?4",
+                        params![session_id, host_run_id, caller_request_id, request_digest,],
+                    )
+                    .map_err(|error| {
+                        database_error("host_caller_request_drive_release_failed", error)
+                    })?;
+            }
+            let stored = stored_caller_request(transaction, session_id, caller_request_id)?
+                .ok_or_else(|| {
+                    HostV2StorageError::io(
+                        "host_caller_request_settlement_lost",
+                        "Settled Host caller request disappeared before commit",
+                    )
+                })?;
+            decode_caller_request_binding(stored, request_kind, request_digest, false)
+        })
+    }
+
+    pub(crate) fn caller_request_recovery_evidence(
+        &self,
+        session_id: &str,
+        caller_request_id: &str,
+        request_kind: &str,
+        request_digest: &str,
+    ) -> Result<HostCallerRequestRecoveryEvidenceV2, HostV2StorageError> {
+        validate_caller_request_identity(
+            session_id,
+            caller_request_id,
+            request_kind,
+            request_digest,
+        )?;
+        self.with_connection(|connection| {
+            let stored = stored_caller_request(connection, session_id, caller_request_id)?
+                .ok_or_else(|| {
+                    HostV2StorageError::not_found(
+                        "host_caller_request_not_found",
+                        "Host caller request recovery requires an exact durable binding",
+                    )
+                })?;
+            let binding =
+                decode_caller_request_binding(stored, request_kind, request_digest, true)?;
+            let host_run_id = binding
+                .response_identity
+                .get("hostRunId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    HostV2StorageError::conflict(
+                        "host_caller_request_identity_invalid",
+                        "Host caller request recovery has no exact Host Run identity",
+                    )
+                })?;
+            validate_bounded_identity(host_run_id, "hostRunId", 512)?;
+            let run = stored_run_by_session_host(connection, session_id, host_run_id)?;
+            if let Some(run) = run.as_ref() {
+                if run.drive_caller_request_id.as_deref()
+                    != Some(binding.caller_request_id.as_str())
+                    || run.drive_request_digest.as_deref() != Some(binding.request_digest.as_str())
+                {
+                    return Err(HostV2StorageError::conflict(
+                        "host_caller_request_run_drive_conflict",
+                        "Driving caller request does not own the exact durable Run correlation",
+                    ));
+                }
+            }
+            let (
+                run_lifecycle,
+                provider_profile_id,
+                run_recorded_at,
+                retired_at,
+                retirement_caller_request_id,
+                retirement_request_digest,
+            ) = match run.as_ref() {
+                Some(run) => {
+                    let opening = decode_opening_record(run)?;
+                    (
+                        Some(opening.lifecycle),
+                        Some(opening.provider_profile.provider_profile_id),
+                        Some(opening.opening_recorded_at),
+                        run.retired_at.clone(),
+                        run.retirement_caller_request_id.clone(),
+                        run.retirement_request_digest.clone(),
+                    )
+                }
+                None => (None, None, None, None, None, None),
+            };
+            if let (Some(expected_run_id), Some(run)) = (
+                binding
+                    .response_identity
+                    .get("runId")
+                    .and_then(Value::as_str),
+                run.as_ref(),
+            ) {
+                if run.run_id.as_deref() != Some(expected_run_id) {
+                    return Err(HostV2StorageError::conflict(
+                        "host_caller_request_run_identity_conflict",
+                        "Host caller request Kernel Run identity does not match durable state",
+                    ));
+                }
+            }
+            let first_operation_request_id = binding
+                .response_identity
+                .get("operationRequestId")
+                .and_then(Value::as_str);
+            let first_operation = first_operation_request_id
+                .map(|operation_request_id| {
+                    validate_operation_identity(operation_request_id)?;
+                    stored_operation_by_request(connection, operation_request_id)
+                })
+                .transpose()?
+                .flatten();
+            if let (Some(run), Some(operation)) = (run.as_ref(), first_operation.as_ref()) {
+                if operation.run_row_id != run.id {
+                    return Err(HostV2StorageError::conflict(
+                        "host_caller_request_operation_conflict",
+                        "Host caller request first operation belongs to another Run",
+                    ));
+                }
+                validate_stored_operation(operation)?;
+                if operation.caller_request_id.as_deref()
+                    != Some(binding.caller_request_id.as_str())
+                    || operation.caller_request_digest.as_deref()
+                        != Some(binding.request_digest.as_str())
+                {
+                    return Err(HostV2StorageError::conflict(
+                        "host_caller_request_operation_correlation_conflict",
+                        "Host caller request first operation lacks exact drive correlation",
+                    ));
+                }
+            } else if first_operation.is_some() {
+                return Err(corrupt(
+                    "Host caller request operation references a missing Run",
+                ));
+            }
+            let first_settlement = first_operation
+                .as_ref()
+                .filter(|operation| operation.settlement_digest.is_some())
+                .map(|operation| verified_settlement_receipt(connection, operation))
+                .transpose()?;
+            let first_operation_present = first_operation.is_some();
+            let first_operation_pending = first_operation
+                .as_ref()
+                .is_some_and(|operation| operation.settlement_digest.is_none());
+            let latest_settlement = run
+                .as_ref()
+                .map(|run| {
+                    connection
+                        .query_row(
+                            &format!(
+                                "SELECT {} FROM host_kernel_operations
+                                 WHERE run_row_id = ?1
+                                   AND caller_request_id = ?2
+                                   AND caller_request_digest = ?3
+                                   AND settlement_digest IS NOT NULL
+                                 ORDER BY operation_sequence DESC LIMIT 1",
+                                OPERATION_COLUMNS
+                            ),
+                            params![run.id, binding.caller_request_id, binding.request_digest],
+                            StoredOperationV2::from_row,
+                        )
+                        .optional()
+                        .map_err(|error| {
+                            database_error("host_kernel_operation_latest_query_failed", error)
+                        })?
+                        .as_ref()
+                        .map(|operation| verified_settlement_receipt(connection, operation))
+                        .transpose()
+                })
+                .transpose()?
+                .flatten();
+            Ok(HostCallerRequestRecoveryEvidenceV2 {
+                binding,
+                run_lifecycle,
+                provider_profile_id,
+                run_recorded_at,
+                retired_at,
+                retirement_caller_request_id,
+                retirement_request_digest,
+                first_operation_present,
+                first_operation_pending,
+                first_settlement,
+                latest_settlement,
+            })
+        })
+    }
+
     /// Durably reserves the Session before Kernel RunOpen. A second active or
     /// opening Run for the same Session is rejected by a partial unique index.
     pub(crate) fn begin_opening(
@@ -303,10 +822,7 @@ impl HostKernelOperationStoreV2 {
                     && existing.session_id == prepared.session_id
                     && existing.host_run_id == prepared.host_run_id
                 {
-                    return Ok(HostKernelRunOpeningReceiptV2 {
-                        record,
-                        replayed: true,
-                    });
+                    return Ok(HostKernelRunOpeningReceiptV2 { record });
                 }
                 return Err(HostV2StorageError::conflict(
                     "host_kernel_run_open_request_conflict",
@@ -328,10 +844,11 @@ impl HostKernelOperationStoreV2 {
                         workspace_binding_ref, workspace_binding_identity, workspace_kind,
                         empty_workspace_key, run_settings_json, provider_profile_id,
                         provider_revision_digest, initial_input_json, opening_recorded_at,
-                        opening_digest
+                        opening_digest, opening_caller_request_id, opening_request_digest,
+                        drive_caller_request_id, drive_request_digest
                      ) VALUES (
                         ?1, ?2, ?3, ?4, 'Opening', ?5, ?6, ?7, ?8, ?9, ?10,
-                        ?11, ?12, ?13, ?14, ?15, ?16
+                        ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?17, ?18
                      )",
                     params![
                         RUN_ROW_SCHEMA_V2,
@@ -350,6 +867,8 @@ impl HostKernelOperationStoreV2 {
                         prepared.initial_input_json,
                         prepared.opening_recorded_at,
                         prepared.opening_digest,
+                        prepared.drive_caller_request_id,
+                        prepared.drive_request_digest,
                     ],
                 )
                 .map_err(|error| database_error("host_kernel_run_opening_write_failed", error))?;
@@ -362,7 +881,6 @@ impl HostKernelOperationStoreV2 {
                 })?;
             Ok(HostKernelRunOpeningReceiptV2 {
                 record: decode_opening_record(&stored)?,
-                replayed: false,
             })
         })
     }
@@ -420,7 +938,6 @@ impl HostKernelOperationStoreV2 {
                     })?;
                     Ok(HostKernelBootstrapReceiptV2 {
                         record: decode_bootstrap_record(&active)?,
-                        replayed: false,
                     })
                 }
                 HostKernelStoredRunLifecycleV2::Active => {
@@ -429,7 +946,6 @@ impl HostKernelOperationStoreV2 {
                     {
                         return Ok(HostKernelBootstrapReceiptV2 {
                             record: decode_bootstrap_record(&stored)?,
-                            replayed: true,
                         });
                     }
                     Err(HostV2StorageError::conflict(
@@ -531,6 +1047,47 @@ impl HostKernelOperationStoreV2 {
         bootstrap_digest: &str,
         retired_at: &str,
     ) -> Result<bool, HostV2StorageError> {
+        self.retire_active_with_caller_correlation(
+            session_id,
+            host_run_id,
+            run_id,
+            bootstrap_digest,
+            retired_at,
+            None,
+        )
+    }
+
+    pub(crate) fn retire_active_for_caller(
+        &self,
+        session_id: &str,
+        host_run_id: &str,
+        run_id: &str,
+        bootstrap_digest: &str,
+        retired_at: &str,
+        caller_request_id: &str,
+        request_digest: &str,
+    ) -> Result<bool, HostV2StorageError> {
+        validate_bounded_identity(caller_request_id, "retirementCallerRequestId", 512)?;
+        validate_sha256_digest(request_digest, "retirementRequestDigest")?;
+        self.retire_active_with_caller_correlation(
+            session_id,
+            host_run_id,
+            run_id,
+            bootstrap_digest,
+            retired_at,
+            Some((caller_request_id, request_digest)),
+        )
+    }
+
+    fn retire_active_with_caller_correlation(
+        &self,
+        session_id: &str,
+        host_run_id: &str,
+        run_id: &str,
+        bootstrap_digest: &str,
+        retired_at: &str,
+        caller_correlation: Option<(&str, &str)>,
+    ) -> Result<bool, HostV2StorageError> {
         validate_safe_session_identity(session_id)?;
         for (field, value) in [
             ("hostRunId", host_run_id),
@@ -558,19 +1115,39 @@ impl HostKernelOperationStoreV2 {
             }
             match parse_run_lifecycle(&stored.lifecycle)? {
                 HostKernelStoredRunLifecycleV2::Active => {
+                    let (caller_request_id, request_digest) = caller_correlation
+                        .map(|(caller_request_id, request_digest)| {
+                            (Some(caller_request_id), Some(request_digest))
+                        })
+                        .unwrap_or((None, None));
                     transaction
                         .execute(
                             "UPDATE host_kernel_runs
-                             SET lifecycle = 'Retired', retired_at = ?1
-                             WHERE id = ?2 AND lifecycle = 'Active'",
-                            params![retired_at, stored.id],
+                             SET lifecycle = 'Retired', retired_at = ?1,
+                                 retirement_caller_request_id = ?2,
+                                 retirement_request_digest = ?3
+                             WHERE id = ?4 AND lifecycle = 'Active'",
+                            params![retired_at, caller_request_id, request_digest, stored.id],
                         )
                         .map_err(|error| {
                             database_error("host_kernel_run_retirement_failed", error)
                         })?;
                     Ok(false)
                 }
-                HostKernelStoredRunLifecycleV2::Retired => Ok(true),
+                HostKernelStoredRunLifecycleV2::Retired => {
+                    if stored.retirement_caller_request_id.as_deref()
+                        == caller_correlation.map(|(caller_request_id, _)| caller_request_id)
+                        && stored.retirement_request_digest.as_deref()
+                            == caller_correlation.map(|(_, request_digest)| request_digest)
+                    {
+                        Ok(true)
+                    } else {
+                        Err(HostV2StorageError::conflict(
+                            "host_kernel_run_retirement_caller_conflict",
+                            "Retired Host Kernel Run has a different caller causation",
+                        ))
+                    }
+                }
                 HostKernelStoredRunLifecycleV2::Opening => Err(HostV2StorageError::conflict(
                     "host_kernel_run_retirement_not_active",
                     "Opening Host Kernel Run has no active bootstrap to retire",
@@ -611,18 +1188,8 @@ impl HostKernelOperationStoreV2 {
                         == prepared.provider_profile_revision_digest
                 {
                     validate_stored_operation(&existing)?;
-                    let production_frame = decode_stored_production_frame(&existing)?;
-                    return Ok(HostKernelPreparedOperationReceiptV2 {
-                        operation_sequence: positive_u64(
-                            existing.operation_sequence,
-                            "operationSequence",
-                        )?,
-                        operation_request_id: existing.operation_request_id,
-                        production_frame,
-                        production_frame_digest: existing.production_frame_digest,
-                        recorded_at: existing.recorded_at,
-                        replayed: true,
-                    });
+                    decode_stored_production_frame(&existing)?;
+                    return Ok(HostKernelPreparedOperationReceiptV2);
                 }
                 return Err(HostV2StorageError::conflict(
                     "host_kernel_operation_request_conflict",
@@ -650,15 +1217,20 @@ impl HostKernelOperationStoreV2 {
                 .execute(
                     "INSERT INTO host_kernel_operations (
                         schema_version, run_row_id, operation_sequence,
-                        operation_request_id, run_id, bootstrap_digest,
+                        operation_request_id, caller_request_id, caller_request_digest,
+                        run_id, bootstrap_digest,
                         provider_revision_digest, production_frame_json,
                         production_frame_digest, recorded_at
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                     ) VALUES (
+                        ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12
+                     )",
                     params![
                         OPERATION_ROW_SCHEMA_V2,
                         run.id,
                         next_sequence,
                         prepared.operation_request_id,
+                        run.drive_caller_request_id,
+                        run.drive_request_digest,
                         prepared.run_id,
                         prepared.bootstrap_digest,
                         prepared.provider_profile_revision_digest,
@@ -668,14 +1240,51 @@ impl HostKernelOperationStoreV2 {
                     ],
                 )
                 .map_err(|error| database_error("host_kernel_operation_prepare_failed", error))?;
-            Ok(HostKernelPreparedOperationReceiptV2 {
-                operation_sequence: positive_u64(next_sequence, "operationSequence")?,
-                operation_request_id: prepared.operation_request_id,
-                production_frame: prepared.production_frame,
-                production_frame_digest: prepared.production_frame_digest,
-                recorded_at: prepared.recorded_at,
-                replayed: false,
-            })
+            positive_u64(next_sequence, "operationSequence")?;
+            Ok(HostKernelPreparedOperationReceiptV2)
+        })
+    }
+
+    pub(crate) fn prepared_operation(
+        &self,
+        input: HostKernelOperationPreparedV2,
+    ) -> Result<Option<HostKernelPreparedOperationReceiptV2>, HostV2StorageError> {
+        let prepared = PreparedOperationV2::new(input)?;
+        self.with_connection(|connection| {
+            let run = require_active_run(
+                connection,
+                &prepared.session_id,
+                &prepared.host_run_id,
+                &prepared.run_id,
+                &prepared.bootstrap_digest,
+            )?;
+            let bootstrap = decode_bootstrap_record(&run)?;
+            validate_frame_against_bootstrap(&prepared.production_frame, &bootstrap)?;
+            if run.provider_revision_digest != prepared.provider_profile_revision_digest {
+                return Err(HostV2StorageError::conflict(
+                    "host_kernel_operation_provider_revision_conflict",
+                    "Operation provider revision does not match the immutable bootstrap",
+                ));
+            }
+            let Some(existing) =
+                stored_operation_by_request(connection, &prepared.operation_request_id)?
+            else {
+                return Ok(None);
+            };
+            if existing.run_row_id != run.id
+                || existing.production_frame_digest != prepared.production_frame_digest
+                || existing.run_id != prepared.run_id
+                || existing.bootstrap_digest != prepared.bootstrap_digest
+                || existing.provider_revision_digest != prepared.provider_profile_revision_digest
+            {
+                return Err(HostV2StorageError::conflict(
+                    "host_kernel_operation_request_conflict",
+                    "Operation request identity is permanently bound to different content",
+                ));
+            }
+            validate_stored_operation(&existing)?;
+            decode_stored_production_frame(&existing)?;
+            Ok(Some(HostKernelPreparedOperationReceiptV2))
         })
     }
 
@@ -729,16 +1338,24 @@ impl HostKernelOperationStoreV2 {
                 );
             }
             if let Some(latest) = latest_attempt(transaction, operation.id)? {
-                return Err(HostV2StorageError::conflict(
-                    match parse_attempt_state(&latest.state)? {
-                        HostKernelDispatchAttemptStateV2::Lost
-                        | HostKernelDispatchAttemptStateV2::Indeterminate => {
-                            "host_kernel_dispatch_recovery_required"
-                        }
-                        _ => "host_kernel_dispatch_attempt_already_exists",
-                    },
-                    "Operation already has a dispatch attempt; a new attempt requires the explicit recovery API",
-                ));
+                return match parse_attempt_state(&latest.state)? {
+                    HostKernelDispatchAttemptStateV2::Lost => {
+                        Err(HostV2StorageError::conflict(
+                            "host_kernel_dispatch_recovery_required",
+                            "Operation has a proven pre-write Lost attempt; a new attempt requires the explicit recovery API",
+                        ))
+                    }
+                    HostKernelDispatchAttemptStateV2::Indeterminate => {
+                        Err(HostV2StorageError::conflict(
+                            "host_kernel_dispatch_indeterminate_manual_reconciliation_required",
+                            "Operation has an Indeterminate attempt and cannot be dispatched again without explicit fact reconciliation",
+                        ))
+                    }
+                    _ => Err(HostV2StorageError::conflict(
+                        "host_kernel_dispatch_attempt_already_exists",
+                        "Operation already has a dispatch attempt",
+                    )),
+                };
             }
             insert_attempt(
                 transaction,
@@ -759,6 +1376,24 @@ impl HostKernelOperationStoreV2 {
         self.with_write_transaction(|transaction| {
             let operation = require_pending_operation(transaction, &input.operation, true)?;
             if let Some(existing) = stored_attempt_by_id(transaction, &input.attempt_id)? {
+                let previous =
+                    stored_attempt_by_id(transaction, &input.previous_attempt_id)?.ok_or_else(
+                        || {
+                            HostV2StorageError::conflict(
+                                "host_kernel_dispatch_recovery_predecessor_missing",
+                                "Dispatch recovery predecessor is missing",
+                            )
+                        },
+                    )?;
+                if previous.operation_row_id != operation.id
+                    || parse_attempt_state(&previous.state)?
+                        != HostKernelDispatchAttemptStateV2::Lost
+                {
+                    return Err(HostV2StorageError::conflict(
+                        "host_kernel_dispatch_recovery_not_allowed",
+                        "Dispatch recovery replay is valid only when its exact predecessor is a Lost attempt",
+                    ));
+                }
                 return replay_exact_attempt(
                     existing,
                     &operation,
@@ -770,19 +1405,16 @@ impl HostKernelOperationStoreV2 {
             let latest = latest_attempt(transaction, operation.id)?.ok_or_else(|| {
                 HostV2StorageError::conflict(
                     "host_kernel_dispatch_recovery_without_attempt",
-                    "Dispatch recovery requires an existing Lost or Indeterminate attempt",
+                    "Dispatch recovery requires an existing Lost attempt",
                 )
             })?;
             if latest.attempt_id != input.previous_attempt_id
-                || !matches!(
-                    parse_attempt_state(&latest.state)?,
-                    HostKernelDispatchAttemptStateV2::Lost
-                        | HostKernelDispatchAttemptStateV2::Indeterminate
-                )
+                || parse_attempt_state(&latest.state)?
+                    != HostKernelDispatchAttemptStateV2::Lost
             {
                 return Err(HostV2StorageError::conflict(
                     "host_kernel_dispatch_recovery_not_allowed",
-                    "Only the latest Lost or Indeterminate attempt can be recovered",
+                    "Only the latest Lost attempt can be recovered; Indeterminate attempts require explicit fact reconciliation",
                 ));
             }
             insert_attempt(
@@ -823,13 +1455,12 @@ impl HostKernelOperationStoreV2 {
                                 "Committed dispatch attempt disappeared before commit",
                             )
                         })?,
-                        false,
                     )
                 }
                 HostKernelDispatchAttemptStateV2::Committed
                 | HostKernelDispatchAttemptStateV2::ResponseObserved
                 | HostKernelDispatchAttemptStateV2::Settled => {
-                    attempt_receipt(&stored_operation, attempt, true)
+                    attempt_receipt(&stored_operation, attempt)
                 }
                 HostKernelDispatchAttemptStateV2::Indeterminate
                 | HostKernelDispatchAttemptStateV2::Lost => Err(HostV2StorageError::conflict(
@@ -875,13 +1506,12 @@ impl HostKernelOperationStoreV2 {
                                 "Lost dispatch attempt disappeared before commit",
                             )
                         })?,
-                        false,
                     )
                 }
                 HostKernelDispatchAttemptStateV2::Lost
                     if attempt.state_reason_code.as_deref() == Some(reason_code) =>
                 {
-                    attempt_receipt(&stored_operation, attempt, true)
+                    attempt_receipt(&stored_operation, attempt)
                 }
                 _ => Err(HostV2StorageError::conflict(
                     "host_kernel_dispatch_lost_transition_invalid",
@@ -927,13 +1557,12 @@ impl HostKernelOperationStoreV2 {
                                 "Indeterminate dispatch attempt disappeared before commit",
                             )
                         })?,
-                        false,
                     )
                 }
                 HostKernelDispatchAttemptStateV2::Indeterminate
                     if attempt.state_reason_code.as_deref() == Some(reason_code) =>
                 {
-                    attempt_receipt(&stored_operation, attempt, true)
+                    attempt_receipt(&stored_operation, attempt)
                 }
                 _ => Err(HostV2StorageError::conflict(
                     "host_kernel_dispatch_indeterminate_transition_invalid",
@@ -986,14 +1615,13 @@ impl HostKernelOperationStoreV2 {
                                 "Response-observed attempt disappeared before commit",
                             )
                         })?,
-                        false,
                     )
                 }
                 HostKernelDispatchAttemptStateV2::ResponseObserved
                 | HostKernelDispatchAttemptStateV2::Settled
                     if attempt.response_digest.as_deref() == Some(response_digest.as_str()) =>
                 {
-                    attempt_receipt(&stored_operation, attempt, true)
+                    attempt_receipt(&stored_operation, attempt)
                 }
                 HostKernelDispatchAttemptStateV2::Prepared => Err(HostV2StorageError::conflict(
                     "host_kernel_response_before_dispatch",
@@ -1051,7 +1679,7 @@ impl HostKernelOperationStoreV2 {
                 if existing_digest == &settlement_digest
                     && stored_operation.settled_attempt_id.as_deref() == Some(attempt_id)
                 {
-                    return settlement_receipt(&stored_operation, true);
+                    return settlement_receipt(&stored_operation);
                 }
                 return Err(HostV2StorageError::conflict(
                     "host_kernel_operation_settlement_conflict",
@@ -1124,52 +1752,7 @@ impl HostKernelOperationStoreV2 {
                         "Settled operation disappeared before commit",
                     )
                 })?;
-            settlement_receipt(&settled, false)
-        })
-    }
-
-    pub(crate) fn pending_operations(
-        &self,
-        session_id: &str,
-        host_run_id: &str,
-        after_operation_sequence: u64,
-        limit: usize,
-    ) -> Result<HostKernelPendingOperationPageV2, HostV2StorageError> {
-        validate_safe_session_identity(session_id)?;
-        validate_bounded_identity(host_run_id, "hostRunId", 512)?;
-        if limit == 0 || limit > MAX_OPERATION_PAGE_ITEMS {
-            return Err(HostV2StorageError::invalid(
-                "host_kernel_operation_page_limit_invalid",
-                "Pending operation page limit is outside the v2 bound",
-            ));
-        }
-        let after = i64::try_from(after_operation_sequence).map_err(|_| {
-            HostV2StorageError::invalid(
-                "host_kernel_operation_sequence_invalid",
-                "afterOperationSequence exceeds the SQLite v2 range",
-            )
-        })?;
-        self.with_connection(|connection| {
-            let run = stored_run_by_session_host(connection, session_id, host_run_id)?.ok_or_else(
-                || {
-                    HostV2StorageError::not_found(
-                        "host_kernel_run_not_found",
-                        "Host Kernel Run was not found",
-                    )
-                },
-            )?;
-            let mut operations =
-                query_pending_operations_for_run(connection, &run, after, limit + 1)?;
-            let has_more = operations.len() > limit;
-            operations.truncate(limit);
-            Ok(HostKernelPendingOperationPageV2 {
-                operations,
-                high_water_operation_sequence: nonnegative_u64(
-                    run.next_operation_sequence,
-                    "highWaterOperationSequence",
-                )?,
-                has_more,
-            })
+            settlement_receipt(&settled)
         })
     }
 
@@ -1203,9 +1786,7 @@ impl HostKernelOperationStoreV2 {
             if operation.settlement_digest.is_none() {
                 return Ok(None);
             }
-            Ok(Some(verified_settlement_receipt(
-                connection, &operation, true,
-            )?))
+            Ok(Some(verified_settlement_receipt(connection, &operation)?))
         })
     }
 
@@ -1237,7 +1818,7 @@ impl HostKernelOperationStoreV2 {
                 })?;
             operation
                 .as_ref()
-                .map(|operation| verified_settlement_receipt(connection, operation, true))
+                .map(|operation| verified_settlement_receipt(connection, operation))
                 .transpose()
         })
     }
@@ -1273,7 +1854,7 @@ impl HostKernelOperationStoreV2 {
                 let operation = row.map_err(|error| {
                     database_error("host_kernel_operation_list_query_failed", error)
                 })?;
-                settlements.push(verified_settlement_receipt(connection, &operation, true)?);
+                settlements.push(verified_settlement_receipt(connection, &operation)?);
             }
             Ok(settlements)
         })
@@ -1406,6 +1987,8 @@ impl HostKernelOperationStoreV2 {
 struct PreparedOpeningV2 {
     session_id: String,
     host_run_id: String,
+    drive_caller_request_id: String,
+    drive_request_digest: String,
     run_open_request_id: String,
     run_open_envelope_json: String,
     run_open_envelope_digest: String,
@@ -1447,14 +2030,22 @@ impl PreparedOpeningV2 {
             )
         })?;
         let run_settings_json = canonical_json_string(&run_settings_value)?;
-        let initial_input_value = serde_json::to_value(&input.initial_input).map_err(|error| {
-            HostV2StorageError::invalid(
-                "host_kernel_initial_input_invalid",
-                format!("encode initial input: {error}"),
-            )
-        })?;
-        reject_host_private_persistence_fields(&initial_input_value)?;
-        let initial_input_json = canonical_json_string(&initial_input_value)?;
+        let session_bootstrap_material = HostKernelSessionBootstrapMaterialV2 {
+            schema_version: SESSION_BOOTSTRAP_MATERIAL_SCHEMA_V2.to_string(),
+            active_folder_id: input.active_folder_id.clone(),
+            initial_input: input.initial_input.clone(),
+            prior_session_events: input.prior_session_events.clone(),
+            provider_profile: input.provider_profile.clone(),
+        };
+        let session_bootstrap_value =
+            serde_json::to_value(&session_bootstrap_material).map_err(|error| {
+                HostV2StorageError::invalid(
+                    "host_kernel_session_bootstrap_invalid",
+                    format!("encode Session bootstrap material: {error}"),
+                )
+            })?;
+        reject_host_private_persistence_fields(&session_bootstrap_value)?;
+        let initial_input_json = canonical_json_string(&session_bootstrap_value)?;
         let durable_opening_bytes = run_open_envelope_json
             .len()
             .checked_add(run_settings_json.len())
@@ -1480,21 +2071,26 @@ impl PreparedOpeningV2 {
             "historySchema": HISTORY_SCHEMA_V2,
             "sessionId": input.session_id,
             "hostRunId": input.host_run_id,
+            "driveCallerRequestId": input.drive_caller_request_id,
+            "driveRequestDigest": input.drive_request_digest,
             "runOpenRequestId": input.run_open_request_id,
             "runOpenEnvelopeDigest": run_open_envelope_digest,
             "workspaceBindingRef": workspace_binding_ref,
             "workspaceBindingIdentity": input.workspace_binding_identity,
             "workspaceKind": workspace_kind_text(input.workspace_kind),
+            "activeFolderId": input.active_folder_id,
             "emptyWorkspaceKey": input.empty_workspace_key,
             "runSettings": run_settings_value,
-            "providerProfileId": input.provider_profile_id,
-            "providerProfileRevisionDigest": input.provider_profile_revision_digest,
-            "initialInput": initial_input_value,
+            "providerProfile": input.provider_profile,
+            "priorSessionEvents": input.prior_session_events,
+            "initialInput": input.initial_input,
             "openingRecordedAt": input.opening_recorded_at,
         }))?;
         Ok(Self {
             session_id: input.session_id,
             host_run_id: input.host_run_id,
+            drive_caller_request_id: input.drive_caller_request_id,
+            drive_request_digest: input.drive_request_digest,
             run_open_request_id: input.run_open_request_id,
             run_open_envelope_json,
             run_open_envelope_digest,
@@ -1503,8 +2099,10 @@ impl PreparedOpeningV2 {
             workspace_kind: input.workspace_kind,
             empty_workspace_key: input.empty_workspace_key,
             run_settings_json,
-            provider_profile_id: input.provider_profile_id,
-            provider_profile_revision_digest: input.provider_profile_revision_digest,
+            provider_profile_id: Some(input.provider_profile.provider_profile_id),
+            provider_profile_revision_digest: Some(
+                input.provider_profile.provider_profile_revision_digest,
+            ),
             initial_input_json,
             opening_recorded_at: input.opening_recorded_at,
             opening_digest,
@@ -1587,6 +2185,7 @@ impl PreparedBootstrapV2 {
             "runId": run_id,
             "workspaceBindingRef": opening.workspace_binding_ref,
             "workspaceBindingDigest": workspace_binding_digest,
+            "activeFolderId": opening.active_folder_id,
             "runOpenReply": reply_value,
         }))?;
         Ok(Self {
@@ -1648,6 +2247,44 @@ impl PreparedOperationV2 {
     }
 }
 
+struct StoredCallerRequestV2 {
+    schema_version: String,
+    session_id: String,
+    caller_request_id: String,
+    request_kind: String,
+    request_digest: String,
+    response_identity_json: String,
+    response_identity_digest: String,
+    recorded_at: String,
+    drive_state: String,
+    drive_owner_instance_id: Option<String>,
+    drive_started_at: Option<String>,
+    outcome_json: Option<String>,
+    outcome_digest: Option<String>,
+    settled_at: Option<String>,
+}
+
+impl StoredCallerRequestV2 {
+    fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            schema_version: row.get("schema_version")?,
+            session_id: row.get("session_id")?,
+            caller_request_id: row.get("caller_request_id")?,
+            request_kind: row.get("request_kind")?,
+            request_digest: row.get("request_digest")?,
+            response_identity_json: row.get("response_identity_json")?,
+            response_identity_digest: row.get("response_identity_digest")?,
+            recorded_at: row.get("recorded_at")?,
+            drive_state: row.get("drive_state")?,
+            drive_owner_instance_id: row.get("drive_owner_instance_id")?,
+            drive_started_at: row.get("drive_started_at")?,
+            outcome_json: row.get("outcome_json")?,
+            outcome_digest: row.get("outcome_digest")?,
+            settled_at: row.get("settled_at")?,
+        })
+    }
+}
+
 #[derive(Debug)]
 struct StoredRunV2 {
     id: i64,
@@ -1674,6 +2311,12 @@ struct StoredRunV2 {
     bootstrap_digest: Option<String>,
     activated_at: Option<String>,
     retired_at: Option<String>,
+    opening_caller_request_id: String,
+    opening_request_digest: String,
+    drive_caller_request_id: Option<String>,
+    drive_request_digest: Option<String>,
+    retirement_caller_request_id: Option<String>,
+    retirement_request_digest: Option<String>,
     next_operation_sequence: i64,
 }
 
@@ -1704,6 +2347,12 @@ impl StoredRunV2 {
             bootstrap_digest: row.get("bootstrap_digest")?,
             activated_at: row.get("activated_at")?,
             retired_at: row.get("retired_at")?,
+            opening_caller_request_id: row.get("opening_caller_request_id")?,
+            opening_request_digest: row.get("opening_request_digest")?,
+            drive_caller_request_id: row.get("drive_caller_request_id")?,
+            drive_request_digest: row.get("drive_request_digest")?,
+            retirement_caller_request_id: row.get("retirement_caller_request_id")?,
+            retirement_request_digest: row.get("retirement_request_digest")?,
             next_operation_sequence: row.get("next_operation_sequence")?,
         })
     }
@@ -1716,6 +2365,8 @@ struct StoredOperationV2 {
     run_row_id: i64,
     operation_sequence: i64,
     operation_request_id: String,
+    caller_request_id: Option<String>,
+    caller_request_digest: Option<String>,
     run_id: String,
     bootstrap_digest: String,
     provider_revision_digest: Option<String>,
@@ -1736,6 +2387,8 @@ impl StoredOperationV2 {
             run_row_id: row.get("run_row_id")?,
             operation_sequence: row.get("operation_sequence")?,
             operation_request_id: row.get("operation_request_id")?,
+            caller_request_id: row.get("caller_request_id")?,
+            caller_request_digest: row.get("caller_request_digest")?,
             run_id: row.get("run_id")?,
             bootstrap_digest: row.get("bootstrap_digest")?,
             provider_revision_digest: row.get("provider_revision_digest")?,
@@ -1874,8 +2527,9 @@ fn initialize_or_validate_schema(connection: &mut Connection) -> Result<(), Host
         transaction
             .execute(
                 "INSERT INTO host_store_limits (
-                    singleton, run_rows, operation_rows, attempt_rows
-                 ) VALUES (1, 0, 0, 0)",
+                    singleton, run_rows, caller_request_rows,
+                    operation_rows, attempt_rows
+                 ) VALUES (1, 0, 0, 0, 0)",
                 [],
             )
             .map_err(|error| database_error("host_kernel_store_schema_create_failed", error))?;
@@ -1905,7 +2559,7 @@ fn initialize_or_validate_schema(connection: &mut Connection) -> Result<(), Host
         .map_err(|error| database_error("host_kernel_store_schema_inspect_failed", error))?;
     if discriminator.as_deref() != Some(STORE_SCHEMA_V2)
         || user_version != SQLITE_USER_VERSION_V2
-        || user_table_count != 5
+        || user_table_count != 6
     {
         return Err(HostV2StorageError::conflict(
             "host_kernel_store_schema_unsupported",
@@ -1915,6 +2569,7 @@ fn initialize_or_validate_schema(connection: &mut Connection) -> Result<(), Host
     for required in [
         "host_store_meta",
         "host_store_limits",
+        "host_caller_requests",
         "host_kernel_runs",
         "host_kernel_operations",
         "host_kernel_dispatch_attempts",
@@ -1950,9 +2605,48 @@ CREATE TABLE host_store_meta (
 CREATE TABLE host_store_limits (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     run_rows INTEGER NOT NULL CHECK (run_rows >= 0),
+    caller_request_rows INTEGER NOT NULL CHECK (caller_request_rows >= 0),
     operation_rows INTEGER NOT NULL CHECK (operation_rows >= 0),
     attempt_rows INTEGER NOT NULL CHECK (attempt_rows >= 0)
 ) STRICT;
+
+CREATE TABLE host_caller_requests (
+    id INTEGER PRIMARY KEY,
+    schema_version TEXT NOT NULL
+        CHECK (schema_version = 'deepcode.host.caller-request.v2'),
+    session_id TEXT NOT NULL,
+    caller_request_id TEXT NOT NULL,
+    request_kind TEXT NOT NULL,
+    request_digest TEXT NOT NULL,
+    response_identity_json TEXT NOT NULL,
+    response_identity_digest TEXT NOT NULL,
+    recorded_at TEXT NOT NULL,
+    drive_state TEXT NOT NULL DEFAULT 'Bound'
+        CHECK (drive_state IN ('Bound', 'Driving')),
+    drive_owner_instance_id TEXT,
+    drive_started_at TEXT,
+    outcome_json TEXT,
+    outcome_digest TEXT,
+    settled_at TEXT,
+    CHECK (
+        (drive_state = 'Bound'
+            AND drive_owner_instance_id IS NULL
+            AND drive_started_at IS NULL)
+        OR (drive_state = 'Driving'
+            AND drive_owner_instance_id IS NOT NULL
+            AND drive_started_at IS NOT NULL)
+    ),
+    CHECK (
+        (outcome_json IS NULL AND outcome_digest IS NULL AND settled_at IS NULL)
+        OR (outcome_json IS NOT NULL
+            AND outcome_digest IS NOT NULL
+            AND settled_at IS NOT NULL)
+    ),
+    UNIQUE (session_id, caller_request_id)
+) STRICT;
+
+CREATE INDEX host_caller_requests_recorded
+ON host_caller_requests(recorded_at, id);
 
 CREATE TABLE host_kernel_runs (
     id INTEGER PRIMARY KEY,
@@ -1979,6 +2673,12 @@ CREATE TABLE host_kernel_runs (
     bootstrap_digest TEXT,
     activated_at TEXT,
     retired_at TEXT,
+    opening_caller_request_id TEXT NOT NULL,
+    opening_request_digest TEXT NOT NULL,
+    drive_caller_request_id TEXT,
+    drive_request_digest TEXT,
+    retirement_caller_request_id TEXT,
+    retirement_request_digest TEXT,
     next_operation_sequence INTEGER NOT NULL DEFAULT 0
         CHECK (next_operation_sequence >= 0),
     UNIQUE (session_id, host_run_id),
@@ -2006,6 +2706,20 @@ CREATE TABLE host_kernel_runs (
             AND activated_at IS NOT NULL
             AND retired_at IS NULL)
         OR (lifecycle = 'Retired')
+    ),
+    CHECK (
+        length(opening_caller_request_id) > 0
+        AND length(opening_request_digest) > 0
+    ),
+    CHECK (
+        (drive_caller_request_id IS NULL AND drive_request_digest IS NULL)
+        OR (drive_caller_request_id IS NOT NULL AND drive_request_digest IS NOT NULL)
+    ),
+    CHECK (
+        (retirement_caller_request_id IS NULL AND retirement_request_digest IS NULL)
+        OR (lifecycle = 'Retired'
+            AND retirement_caller_request_id IS NOT NULL
+            AND retirement_request_digest IS NOT NULL)
     )
 ) STRICT;
 
@@ -2027,6 +2741,8 @@ CREATE TABLE host_kernel_operations (
         REFERENCES host_kernel_runs(id) ON DELETE RESTRICT,
     operation_sequence INTEGER NOT NULL CHECK (operation_sequence > 0),
     operation_request_id TEXT NOT NULL UNIQUE,
+    caller_request_id TEXT,
+    caller_request_digest TEXT,
     run_id TEXT NOT NULL,
     bootstrap_digest TEXT NOT NULL,
     provider_revision_digest TEXT,
@@ -2038,6 +2754,10 @@ CREATE TABLE host_kernel_operations (
     settled_attempt_id TEXT,
     settled_at TEXT,
     UNIQUE (run_row_id, operation_sequence),
+    CHECK (
+        (caller_request_id IS NULL AND caller_request_digest IS NULL)
+        OR (caller_request_id IS NOT NULL AND caller_request_digest IS NOT NULL)
+    ),
     CHECK (
         (settlement_json IS NULL
             AND settlement_digest IS NULL
@@ -2102,6 +2822,11 @@ fn validate_opening_input(input: &HostKernelRunOpeningInputV2) -> Result<(), Hos
     validate_safe_session_identity(&input.session_id)?;
     for (field, value, maximum) in [
         ("hostRunId", input.host_run_id.as_str(), 512),
+        (
+            "driveCallerRequestId",
+            input.drive_caller_request_id.as_str(),
+            512,
+        ),
         ("runOpenRequestId", input.run_open_request_id.as_str(), 512),
         (
             "workspaceBindingIdentity",
@@ -2127,6 +2852,16 @@ fn validate_opening_input(input: &HostKernelRunOpeningInputV2) -> Result<(), Hos
     ] {
         validate_bounded_identity(value, field, maximum)?;
     }
+    validate_sha256_digest(&input.drive_request_digest, "driveRequestDigest")?;
+    if let Some(active_folder_id) = input.active_folder_id.as_deref() {
+        validate_bounded_identity(active_folder_id, "activeFolderId", 512)?;
+    }
+    if input.workspace_kind == HostRunWorkspaceKindV2::Empty && input.active_folder_id.is_some() {
+        return Err(HostV2StorageError::invalid(
+            "host_kernel_workspace_binding_invalid",
+            "Empty Run cannot carry an active folder identity",
+        ));
+    }
     if !input
         .workspace_binding_identity
         .starts_with("deepcode.workspace-root.v2:")
@@ -2142,10 +2877,10 @@ fn validate_opening_input(input: &HostKernelRunOpeningInputV2) -> Result<(), Hos
             "Host Kernel initial input exceeds its bounded size",
         ));
     }
-    validate_provider_pair(
-        input.provider_profile_id.as_deref(),
-        input.provider_profile_revision_digest.as_deref(),
-    )?;
+    crate::validate_agent_input_attachment_slice_v2(&input.initial_input.attachments)
+        .map_err(|error| HostV2StorageError::invalid(error.code, error.message))?;
+    input.provider_profile.validate()?;
+    input.prior_session_events.validate(&input.session_id)?;
     validate_workspace_shape(
         input.workspace_kind,
         input.empty_workspace_key.as_deref(),
@@ -2180,6 +2915,18 @@ fn validate_opening_input(input: &HostKernelRunOpeningInputV2) -> Result<(), Hos
     Ok(())
 }
 
+fn validate_caller_request_identity(
+    session_id: &str,
+    caller_request_id: &str,
+    request_kind: &str,
+    request_digest: &str,
+) -> Result<(), HostV2StorageError> {
+    validate_safe_session_identity(session_id)?;
+    validate_bounded_identity(caller_request_id, "callerRequestId", 512)?;
+    validate_bounded_identity(request_kind, "requestKind", 128)?;
+    validate_sha256_digest(request_digest, "requestDigest")
+}
+
 fn validate_activation_input(
     input: &HostKernelBootstrapActivationV2,
 ) -> Result<(), HostV2StorageError> {
@@ -2197,23 +2944,6 @@ fn validate_activation_input(
             "RunOpen reply failed strict v2 validation",
         )
     })
-}
-
-fn validate_provider_pair(
-    provider_profile_id: Option<&str>,
-    provider_revision_digest: Option<&str>,
-) -> Result<(), HostV2StorageError> {
-    match (provider_profile_id, provider_revision_digest) {
-        (Some(profile_id), Some(revision)) => {
-            validate_bounded_identity(profile_id, "providerProfileId", 512)?;
-            validate_sha256_digest(revision, "providerProfileRevisionDigest")
-        }
-        (None, None) => Ok(()),
-        _ => Err(HostV2StorageError::invalid(
-            "host_kernel_provider_profile_incomplete",
-            "Provider profile id and revision digest must be present together",
-        )),
-    }
 }
 
 fn validate_workspace_shape(
@@ -2286,10 +3016,11 @@ fn validate_production_frame(
             "hostRunId",
             "runId",
             "historySchema",
+            "providerProfile",
+            "priorSessionEvents",
             "prefetchedRun",
             "initialInput",
             "operation",
-            "providerProfileId",
         ],
         &[
             "schemaVersion",
@@ -2297,6 +3028,8 @@ fn validate_production_frame(
             "hostRunId",
             "runId",
             "historySchema",
+            "providerProfile",
+            "priorSessionEvents",
             "prefetchedRun",
             "initialInput",
             "operation",
@@ -2306,17 +3039,45 @@ fn validate_production_frame(
     if request.get("schemaVersion").and_then(Value::as_str) != Some(PRODUCTION_REQUEST_SCHEMA_V2)
         || request.get("historySchema").and_then(Value::as_str) != Some(HISTORY_SCHEMA_V2)
         || !request.get("operation").is_some_and(Value::is_object)
-        || (request.contains_key("providerProfileId")
-            && request
-                .get("providerProfileId")
-                .and_then(Value::as_str)
-                .is_none())
     {
         return Err(HostV2StorageError::invalid(
             "host_kernel_operation_request_invalid",
             "Production request is not the exact safe v2 shape",
         ));
     }
+    let provider_profile: HostProviderProfileBootstrapV2 =
+        serde_json::from_value(request.get("providerProfile").cloned().ok_or_else(|| {
+            HostV2StorageError::invalid(
+                "host_kernel_operation_provider_profile_missing",
+                "Production request has no immutable Provider profile",
+            )
+        })?)
+        .map_err(|_| {
+            HostV2StorageError::invalid(
+                "host_kernel_operation_provider_profile_invalid",
+                "Production request Provider profile is not exact v2",
+            )
+        })?;
+    provider_profile.validate()?;
+    let prior_events: HostSessionPriorEventsV2 =
+        serde_json::from_value(request.get("priorSessionEvents").cloned().ok_or_else(|| {
+            HostV2StorageError::invalid(
+                "host_kernel_operation_prior_events_missing",
+                "Production request has no immutable prior Session event source",
+            )
+        })?)
+        .map_err(|_| {
+            HostV2StorageError::invalid(
+                "host_kernel_operation_prior_events_invalid",
+                "Production request prior Session events are not exact v2",
+            )
+        })?;
+    prior_events.validate(
+        request
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+    )?;
     Ok(())
 }
 
@@ -2342,18 +3103,27 @@ fn validate_frame_against_bootstrap(
             "Production frame does not match the exact Active Run identity",
         ));
     }
-    match (
-        request.get("providerProfileId").and_then(Value::as_str),
-        bootstrap.provider_profile_id.as_deref(),
-    ) {
-        (None, None) => {}
-        (Some(actual), Some(expected)) if actual == expected => {}
-        _ => {
-            return Err(HostV2StorageError::conflict(
-                "host_kernel_operation_provider_binding_conflict",
-                "Production frame provider does not match the immutable bootstrap",
-            ))
-        }
+    let expected_provider_profile =
+        serde_json::to_value(&bootstrap.provider_profile).map_err(|error| {
+            HostV2StorageError::invalid(
+                "host_kernel_operation_provider_profile_invalid",
+                format!("encode bootstrap Provider profile: {error}"),
+            )
+        })?;
+    let expected_prior_events =
+        serde_json::to_value(&bootstrap.prior_session_events).map_err(|error| {
+            HostV2StorageError::invalid(
+                "host_kernel_operation_prior_events_invalid",
+                format!("encode bootstrap prior Session events: {error}"),
+            )
+        })?;
+    if request.get("providerProfile") != Some(&expected_provider_profile)
+        || request.get("priorSessionEvents") != Some(&expected_prior_events)
+    {
+        return Err(HostV2StorageError::conflict(
+            "host_kernel_operation_session_bootstrap_conflict",
+            "Production frame Session context differs from the immutable bootstrap",
+        ));
     }
     let prefetched = exact_object_fields(
         request.get("prefetchedRun").ok_or_else(|| {
@@ -2656,6 +3426,11 @@ fn reserve_row(
             "UPDATE host_store_limits SET run_rows = run_rows + 1
              WHERE singleton = 1 AND run_rows < ?1"
         }
+        "caller_request_rows" => {
+            "UPDATE host_store_limits
+             SET caller_request_rows = caller_request_rows + 1
+             WHERE singleton = 1 AND caller_request_rows < ?1"
+        }
         "operation_rows" => {
             "UPDATE host_store_limits SET operation_rows = operation_rows + 1
              WHERE singleton = 1 AND operation_rows < ?1"
@@ -2821,7 +3596,7 @@ fn insert_attempt(
             "Prepared dispatch attempt disappeared before commit",
         )
     })?;
-    attempt_receipt(operation, stored, false)
+    attempt_receipt(operation, stored)
 }
 
 fn replay_exact_attempt(
@@ -2841,7 +3616,7 @@ fn replay_exact_attempt(
             "Dispatch attempt identity is permanently bound to different content",
         ));
     }
-    attempt_receipt(operation, attempt, true)
+    attempt_receipt(operation, attempt)
 }
 
 fn require_owned_attempt(
@@ -2889,7 +3664,6 @@ fn update_attempt_state(
 fn attempt_receipt(
     operation: &StoredOperationV2,
     attempt: StoredAttemptV2,
-    replayed: bool,
 ) -> Result<HostKernelDispatchAttemptReceiptV2, HostV2StorageError> {
     validate_stored_operation(operation)?;
     validate_stored_attempt(&attempt)?;
@@ -2921,25 +3695,19 @@ fn attempt_receipt(
             serde_json::from_str(value).map_err(|_| corrupt("Observed response JSON is corrupt"))
         })
         .transpose()?;
+    positive_u64(operation.operation_sequence, "operationSequence")?;
+    positive_u64(attempt.attempt_sequence, "attemptSequence")?;
     Ok(HostKernelDispatchAttemptReceiptV2 {
-        operation_sequence: positive_u64(operation.operation_sequence, "operationSequence")?,
-        attempt_sequence: positive_u64(attempt.attempt_sequence, "attemptSequence")?,
-        operation_request_id: operation.operation_request_id.clone(),
         attempt_id: attempt.attempt_id,
         owner_instance_id: attempt.owner_instance_id,
-        owner_binding_digest: attempt.owner_binding_digest,
         state: parse_attempt_state(&attempt.state)?,
-        recovery_of_attempt_id: attempt.recovery_of_attempt_id,
         observed_response,
         response_digest: attempt.response_digest,
-        response_observed_at: attempt.response_observed_at,
-        replayed,
     })
 }
 
 fn settlement_receipt(
     operation: &StoredOperationV2,
-    replayed: bool,
 ) -> Result<HostKernelOperationSettlementReceiptV2, HostV2StorageError> {
     validate_stored_operation(operation)?;
     let settlement_json = operation
@@ -2958,23 +3726,21 @@ fn settlement_receipt(
     let settlement: HostKernelOperationSettlementV2 = serde_json::from_value(value)
         .map_err(|_| corrupt("Host Kernel operation settlement is not exact v2"))?;
     validate_settlement(&settlement)?;
+    positive_u64(operation.operation_sequence, "operationSequence")?;
+    operation
+        .settled_attempt_id
+        .as_ref()
+        .ok_or_else(|| corrupt("Settled operation has no attempt identity"))?;
     Ok(HostKernelOperationSettlementReceiptV2 {
-        operation_sequence: positive_u64(operation.operation_sequence, "operationSequence")?,
         operation_request_id: operation.operation_request_id.clone(),
-        attempt_id: operation
-            .settled_attempt_id
-            .clone()
-            .ok_or_else(|| corrupt("Settled operation has no attempt identity"))?,
         settlement,
         settlement_digest: digest,
-        replayed,
     })
 }
 
 fn verified_settlement_receipt(
     connection: &Connection,
     operation: &StoredOperationV2,
-    replayed: bool,
 ) -> Result<HostKernelOperationSettlementReceiptV2, HostV2StorageError> {
     validate_stored_operation(operation)?;
     let run = stored_run_by_id(connection, operation.run_row_id)?
@@ -2988,13 +3754,13 @@ fn verified_settlement_receipt(
         .ok_or_else(|| corrupt("Settled Host Kernel operation has no attempt identity"))?;
     let attempt = stored_attempt_by_id(connection, settled_attempt_id)?
         .ok_or_else(|| corrupt("Settled Host Kernel operation references a missing attempt"))?;
-    let attempt = attempt_receipt(operation, attempt, replayed)?;
+    let attempt = attempt_receipt(operation, attempt)?;
     if attempt.state != HostKernelDispatchAttemptStateV2::Settled {
         return Err(corrupt(
             "Settled Host Kernel operation attempt binding is invalid",
         ));
     }
-    let settlement = settlement_receipt(operation, replayed)?;
+    let settlement = settlement_receipt(operation)?;
     if let HostKernelOperationSettlementV2::Succeeded { response, .. } = &settlement.settlement {
         let response_digest = canonical_sha256(response)?;
         if attempt.response_digest.as_deref() != Some(response_digest.as_str()) {
@@ -3004,6 +3770,91 @@ fn verified_settlement_receipt(
         }
     }
     Ok(settlement)
+}
+
+fn decode_caller_request_binding(
+    stored: StoredCallerRequestV2,
+    expected_kind: &str,
+    expected_request_digest: &str,
+    replayed: bool,
+) -> Result<HostCallerRequestBindingReceiptV2, HostV2StorageError> {
+    if stored.schema_version != CALLER_REQUEST_SCHEMA_V2 {
+        return Err(corrupt("Host caller request row schema is not exact v2"));
+    }
+    validate_caller_request_identity(
+        &stored.session_id,
+        &stored.caller_request_id,
+        &stored.request_kind,
+        &stored.request_digest,
+    )?;
+    validate_bounded_identity(&stored.recorded_at, "recordedAt", 1024)?;
+    if stored.request_kind != expected_kind || stored.request_digest != expected_request_digest {
+        return Err(HostV2StorageError::conflict(
+            "host_caller_request_conflict",
+            "Host caller request identity is permanently bound to different content",
+        ));
+    }
+    let response_identity: Value = serde_json::from_str(&stored.response_identity_json)
+        .map_err(|_| corrupt("Host caller response identity JSON is corrupt"))?;
+    reject_transport_capabilities(&response_identity)?;
+    validate_sha256_digest(&stored.response_identity_digest, "responseIdentityDigest")?;
+    if canonical_sha256(&response_identity)? != stored.response_identity_digest {
+        return Err(corrupt(
+            "Host caller response identity failed digest verification",
+        ));
+    }
+    let drive_state = match stored.drive_state.as_str() {
+        "Bound" => HostCallerRequestDriveStateV2::Bound,
+        "Driving" => HostCallerRequestDriveStateV2::Driving,
+        _ => return Err(corrupt("Host caller request has an invalid drive state")),
+    };
+    match (
+        drive_state,
+        stored.drive_owner_instance_id.as_deref(),
+        stored.drive_started_at.as_deref(),
+    ) {
+        (HostCallerRequestDriveStateV2::Bound, None, None) => {}
+        (HostCallerRequestDriveStateV2::Driving, Some(owner), Some(started_at)) => {
+            validate_bounded_identity(owner, "driveOwnerInstanceId", 256)?;
+            validate_bounded_identity(started_at, "driveStartedAt", 1024)?;
+        }
+        _ => return Err(corrupt("Host caller request drive fields are partial")),
+    }
+    let (outcome, outcome_digest) = match (
+        stored.outcome_json,
+        stored.outcome_digest,
+        stored.settled_at,
+    ) {
+        (None, None, None) => (None, None),
+        (Some(outcome_json), Some(outcome_digest), Some(settled_at)) => {
+            validate_sha256_digest(&outcome_digest, "outcomeDigest")?;
+            validate_bounded_identity(&settled_at, "settledAt", 1024)?;
+            let outcome: Value = serde_json::from_str(&outcome_json)
+                .map_err(|_| corrupt("Host caller request outcome JSON is corrupt"))?;
+            reject_transport_capabilities(&outcome)?;
+            if canonical_sha256(&outcome)? != outcome_digest {
+                return Err(corrupt(
+                    "Host caller request outcome failed digest verification",
+                ));
+            }
+            (Some(outcome), Some(outcome_digest))
+        }
+        _ => return Err(corrupt("Host caller request settlement fields are partial")),
+    };
+    Ok(HostCallerRequestBindingReceiptV2 {
+        session_id: stored.session_id,
+        caller_request_id: stored.caller_request_id,
+        request_kind: stored.request_kind,
+        request_digest: stored.request_digest,
+        response_identity,
+        recorded_at: stored.recorded_at,
+        drive_state,
+        drive_owner_instance_id: stored.drive_owner_instance_id,
+        drive_started_at: stored.drive_started_at,
+        outcome,
+        outcome_digest,
+        replayed,
+    })
 }
 
 fn decode_opening_record(
@@ -3027,33 +3878,65 @@ fn decode_opening_record(
         .map_err(|_| corrupt("Host Kernel Settings JSON is corrupt"))?;
     let run_settings: HostRunSettingsCeilingV2 = serde_json::from_value(settings_value.clone())
         .map_err(|_| corrupt("Host Kernel Settings ceiling is not exact v2"))?;
-    let initial_value: Value = serde_json::from_str(&stored.initial_input_json)
-        .map_err(|_| corrupt("Host Kernel initial input JSON is corrupt"))?;
-    reject_host_private_persistence_fields(&initial_value)?;
-    let initial_input: HostKernelBootstrapInitialInputV2 =
-        serde_json::from_value(initial_value.clone())
-            .map_err(|_| corrupt("Host Kernel initial input is not exact v2"))?;
+    let session_bootstrap_value: Value = serde_json::from_str(&stored.initial_input_json)
+        .map_err(|_| corrupt("Host Kernel Session bootstrap JSON is corrupt"))?;
+    reject_host_private_persistence_fields(&session_bootstrap_value)?;
+    let session_bootstrap: HostKernelSessionBootstrapMaterialV2 =
+        serde_json::from_value(session_bootstrap_value)
+            .map_err(|_| corrupt("Host Kernel Session bootstrap is not exact v2"))?;
+    if session_bootstrap.schema_version != SESSION_BOOTSTRAP_MATERIAL_SCHEMA_V2 {
+        return Err(corrupt(
+            "Host Kernel Session bootstrap schema is unsupported",
+        ));
+    }
+    session_bootstrap
+        .provider_profile
+        .validate()
+        .map_err(|_| corrupt("Host Kernel Provider profile bootstrap is not exact v2"))?;
+    session_bootstrap
+        .prior_session_events
+        .validate(&stored.session_id)
+        .map_err(|_| corrupt("Host Kernel prior Session events are not exact v2"))?;
+    let initial_input = session_bootstrap.initial_input;
     let workspace_kind = parse_workspace_kind(&stored.workspace_kind)?;
     validate_workspace_shape(
         workspace_kind,
         stored.empty_workspace_key.as_deref(),
         &run_settings,
     )?;
-    validate_provider_pair(
-        stored.provider_profile_id.as_deref(),
-        stored.provider_revision_digest.as_deref(),
-    )?;
+    if stored.provider_profile_id.as_deref()
+        != Some(
+            session_bootstrap
+                .provider_profile
+                .provider_profile_id
+                .as_str(),
+        )
+        || stored.provider_revision_digest.as_deref()
+            != Some(
+                session_bootstrap
+                    .provider_profile
+                    .provider_profile_revision_digest
+                    .as_str(),
+            )
+    {
+        return Err(corrupt(
+            "Host Kernel Provider profile columns conflict with bootstrap material",
+        ));
+    }
     let candidate = HostKernelRunOpeningInputV2 {
         session_id: stored.session_id.clone(),
         host_run_id: stored.host_run_id.clone(),
+        drive_caller_request_id: stored.opening_caller_request_id.clone(),
+        drive_request_digest: stored.opening_request_digest.clone(),
         run_open_request_id: stored.run_open_request_id.clone(),
         run_open_envelope: run_open_envelope.clone(),
         workspace_binding_identity: stored.workspace_binding_identity.clone(),
         workspace_kind,
+        active_folder_id: session_bootstrap.active_folder_id.clone(),
         empty_workspace_key: stored.empty_workspace_key.clone(),
         run_settings: run_settings.clone(),
-        provider_profile_id: stored.provider_profile_id.clone(),
-        provider_profile_revision_digest: stored.provider_revision_digest.clone(),
+        provider_profile: session_bootstrap.provider_profile.clone(),
+        prior_session_events: session_bootstrap.prior_session_events.clone(),
         initial_input: initial_input.clone(),
         opening_recorded_at: stored.opening_recorded_at.clone(),
     };
@@ -3087,22 +3970,64 @@ fn decode_opening_record(
         }
         _ => {}
     }
+    validate_bounded_identity(
+        &stored.opening_caller_request_id,
+        "openingCallerRequestId",
+        512,
+    )?;
+    validate_sha256_digest(&stored.opening_request_digest, "openingRequestDigest")?;
+    match (
+        stored.drive_caller_request_id.as_deref(),
+        stored.drive_request_digest.as_deref(),
+    ) {
+        (None, None) => {}
+        (Some(caller_request_id), Some(request_digest)) => {
+            validate_bounded_identity(caller_request_id, "driveCallerRequestId", 512)?;
+            validate_sha256_digest(request_digest, "driveRequestDigest")?;
+        }
+        _ => return Err(corrupt("Host Kernel Run drive correlation is partial")),
+    }
+    if lifecycle == HostKernelStoredRunLifecycleV2::Opening
+        && (stored.drive_caller_request_id.as_deref()
+            != Some(stored.opening_caller_request_id.as_str())
+            || stored.drive_request_digest.as_deref()
+                != Some(stored.opening_request_digest.as_str()))
+    {
+        return Err(corrupt(
+            "Opening Host Kernel Run lost its immutable caller drive correlation",
+        ));
+    }
+    match (
+        stored.retirement_caller_request_id.as_deref(),
+        stored.retirement_request_digest.as_deref(),
+    ) {
+        (None, None) => {}
+        (Some(caller_request_id), Some(request_digest))
+            if lifecycle == HostKernelStoredRunLifecycleV2::Retired =>
+        {
+            validate_bounded_identity(caller_request_id, "retirementCallerRequestId", 512)?;
+            validate_sha256_digest(request_digest, "retirementRequestDigest")?;
+        }
+        _ => {
+            return Err(corrupt(
+                "Host Kernel Run retirement caller correlation is partial or non-retired",
+            ))
+        }
+    }
     Ok(HostKernelRunOpeningRecordV2 {
-        schema_version: RUN_ROW_SCHEMA_V2.to_string(),
-        history_schema: HISTORY_SCHEMA_V2.to_string(),
         lifecycle,
         session_id: stored.session_id.clone(),
         host_run_id: stored.host_run_id.clone(),
         run_open_request_id: stored.run_open_request_id.clone(),
         run_open_envelope,
-        run_open_envelope_digest: stored.run_open_envelope_digest.clone(),
         workspace_binding_ref: stored.workspace_binding_ref.clone(),
         workspace_binding_identity: stored.workspace_binding_identity.clone(),
         workspace_kind,
+        active_folder_id: session_bootstrap.active_folder_id,
         empty_workspace_key: stored.empty_workspace_key.clone(),
         run_settings,
-        provider_profile_id: stored.provider_profile_id.clone(),
-        provider_profile_revision_digest: stored.provider_revision_digest.clone(),
+        provider_profile: session_bootstrap.provider_profile,
+        prior_session_events: session_bootstrap.prior_session_events,
         initial_input,
         opening_recorded_at: stored.opening_recorded_at.clone(),
         opening_digest: stored.opening_digest.clone(),
@@ -3146,29 +4071,27 @@ fn decode_bootstrap_record(
             "Host Kernel bootstrap failed immutable digest verification",
         ));
     }
+    let activated_at = stored
+        .activated_at
+        .as_deref()
+        .ok_or_else(|| corrupt("Active Host Kernel Run has no activation time"))?;
+    validate_bounded_identity(activated_at, "activatedAt", 1024)?;
     Ok(HostKernelBootstrapRecordV2 {
-        schema_version: BOOTSTRAP_SCHEMA_V2.to_string(),
-        history_schema: HISTORY_SCHEMA_V2.to_string(),
         session_id: opening.session_id,
         host_run_id: opening.host_run_id,
-        run_open_request_id: opening.run_open_request_id,
         run_id: prepared.run_id,
         workspace_binding_ref: opening.workspace_binding_ref,
         workspace_binding_digest: prepared.workspace_binding_digest,
         workspace_binding_identity: opening.workspace_binding_identity,
         workspace_kind: opening.workspace_kind,
+        active_folder_id: opening.active_folder_id,
         empty_workspace_key: opening.empty_workspace_key,
         run_settings: opening.run_settings,
         run_open_reply: reply,
-        provider_profile_id: opening.provider_profile_id,
-        provider_profile_revision_digest: opening.provider_profile_revision_digest,
+        provider_profile: opening.provider_profile,
+        prior_session_events: opening.prior_session_events,
         initial_input: opening.initial_input,
-        opening_digest: opening.opening_digest,
         bootstrap_digest: prepared.bootstrap_digest,
-        activated_at: stored
-            .activated_at
-            .clone()
-            .ok_or_else(|| corrupt("Active Host Kernel Run has no activation time"))?,
     })
 }
 
@@ -3178,7 +4101,23 @@ fn validate_stored_operation(operation: &StoredOperationV2) -> Result<(), HostV2
     }
     positive_u64(operation.operation_sequence, "operationSequence")?;
     validate_operation_identity(&operation.operation_request_id)?;
+    match (
+        operation.caller_request_id.as_deref(),
+        operation.caller_request_digest.as_deref(),
+    ) {
+        (None, None) => {}
+        (Some(caller_request_id), Some(request_digest)) => {
+            validate_bounded_identity(caller_request_id, "operationCallerRequestId", 512)?;
+            validate_sha256_digest(request_digest, "operationCallerRequestDigest")?;
+        }
+        _ => {
+            return Err(corrupt(
+                "Host Kernel operation caller correlation is partial",
+            ))
+        }
+    }
     validate_bounded_identity(&operation.run_id, "runId", 512)?;
+    validate_bounded_identity(&operation.recorded_at, "recordedAt", 1024)?;
     validate_sha256_digest(&operation.bootstrap_digest, "bootstrapDigest")?;
     validate_sha256_digest(&operation.production_frame_digest, "productionFrameDigest")?;
     let production_frame = decode_stored_production_frame(operation)?;
@@ -3332,23 +4271,39 @@ fn query_pending_operations_for_run(
         let production_frame = decode_stored_production_frame(&operation)?;
         validate_frame_against_bootstrap(&production_frame, &bootstrap)?;
         let latest = latest_attempt(connection, operation.id)?
-            .map(|attempt| attempt_receipt(&operation, attempt, true))
+            .map(|attempt| attempt_receipt(&operation, attempt))
             .transpose()?;
         output.push(HostKernelPendingOperationV2 {
             session_id: run.session_id.clone(),
             host_run_id: run.host_run_id.clone(),
             run_id: operation.run_id.clone(),
             bootstrap_digest: operation.bootstrap_digest.clone(),
-            provider_profile_revision_digest: operation.provider_revision_digest.clone(),
             operation_sequence: positive_u64(operation.operation_sequence, "operationSequence")?,
             operation_request_id: operation.operation_request_id,
             production_frame,
-            production_frame_digest: operation.production_frame_digest,
-            recorded_at: operation.recorded_at,
             latest_attempt: latest,
         });
     }
     Ok(output)
+}
+
+fn stored_caller_request(
+    connection: &Connection,
+    session_id: &str,
+    caller_request_id: &str,
+) -> Result<Option<StoredCallerRequestV2>, HostV2StorageError> {
+    connection
+        .query_row(
+            &format!(
+                "SELECT {} FROM host_caller_requests
+                 WHERE session_id = ?1 AND caller_request_id = ?2",
+                CALLER_REQUEST_COLUMNS
+            ),
+            params![session_id, caller_request_id],
+            StoredCallerRequestV2::from_row,
+        )
+        .optional()
+        .map_err(|error| database_error("host_caller_request_query_failed", error))
 }
 
 fn stored_run_by_open_request(
@@ -3553,12 +4508,24 @@ const RUN_COLUMNS: &str = "
     empty_workspace_key, run_settings_json, provider_profile_id,
     provider_revision_digest, initial_input_json, opening_recorded_at,
     opening_digest, run_id, run_open_reply_json, workspace_binding_digest,
-    bootstrap_digest, activated_at, retired_at, next_operation_sequence
+    bootstrap_digest, activated_at, retired_at,
+    opening_caller_request_id, opening_request_digest,
+    drive_caller_request_id, drive_request_digest,
+    retirement_caller_request_id, retirement_request_digest,
+    next_operation_sequence
+";
+
+const CALLER_REQUEST_COLUMNS: &str = "
+    schema_version, session_id, caller_request_id, request_kind,
+    request_digest, response_identity_json, response_identity_digest, recorded_at,
+    drive_state, drive_owner_instance_id, drive_started_at,
+    outcome_json, outcome_digest, settled_at
 ";
 
 const OPERATION_COLUMNS: &str = "
     id, schema_version, run_row_id, operation_sequence,
-    operation_request_id, run_id, bootstrap_digest,
+    operation_request_id, caller_request_id, caller_request_digest,
+    run_id, bootstrap_digest,
     provider_revision_digest, production_frame_json,
     production_frame_digest, recorded_at,
     settlement_json, settlement_digest, settled_attempt_id, settled_at
@@ -3582,13 +4549,6 @@ fn corrupt(message: impl Into<String>) -> HostV2StorageError {
 fn positive_u64(value: i64, field: &'static str) -> Result<u64, HostV2StorageError> {
     if value <= 0 {
         return Err(corrupt(format!("{field} is not positive")));
-    }
-    Ok(value as u64)
-}
-
-fn nonnegative_u64(value: i64, field: &'static str) -> Result<u64, HostV2StorageError> {
-    if value < 0 {
-        return Err(corrupt(format!("{field} is negative")));
     }
     Ok(value as u64)
 }

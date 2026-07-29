@@ -8,23 +8,30 @@ import type {
   ProviderWireToolDefinition,
 } from '@deepcode/protocol';
 import { decodeRawToolArgumentsV2 } from '@deepcode/protocol';
-import { canonicalJson } from '../cache/canonicalizer.js';
-import { assembleContext } from '../context/assembler.js';
 import {
-  promptEnvelopeProviderMessages,
-} from '../prompt/builder.js';
+  canonicalJson,
+  sha256Hash,
+} from '../cache/canonicalizer.js';
+import {
+  providerCallableToolsV2,
+  providerWireToolNameV2,
+} from './providerContext.js';
 import type {
   SessionKernelProviderBackendOutputV2,
   SessionKernelProviderBackendV2,
   SessionProviderPlanActionDraftV2,
   SessionProviderPlanDraftV2,
 } from './SessionKernelProviderAdapterV2.js';
-import type { SessionProviderTurnInputV2 } from './types.js';
+import type {
+  SessionKernelTransportPrivateAuthV2,
+} from './SessionKernelPortV2.js';
+import type {
+  SessionProviderResultMetadataV2,
+  SessionProviderTurnInputV2,
+} from './types.js';
 
 export const SESSION_PROVIDER_PLAN_DRAFT_V2_SCHEMA =
   'deepcode.session.plan-draft.v2' as const;
-const SESSION_PROVIDER_TURN_INPUT_V2_SCHEMA =
-  'deepcode.session.provider-turn-input.v2' as const;
 
 export interface SessionKernelLlmTransportV2 {
   request(
@@ -35,10 +42,17 @@ export interface SessionKernelLlmTransportV2 {
 
 export class HttpSessionKernelLlmTransportV2
 implements SessionKernelLlmTransportV2 {
+  readonly #runCapability: string;
+
   constructor(
     private readonly apiBase: string,
+    privateAuth: SessionKernelTransportPrivateAuthV2,
+    private readonly sessionId: string,
+    private readonly runId: string,
     private readonly fetchImpl: typeof fetch = fetch
-  ) {}
+  ) {
+    this.#runCapability = privateAuth.runCapability;
+  }
 
   async request(
     request: LlmChatRequest,
@@ -48,7 +62,12 @@ implements SessionKernelLlmTransportV2 {
       `${normalizeApiBase(this.apiBase)}/api/llm/chat`,
       {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: {
+          'content-type': 'application/json',
+          'x-deepcode-run-capability': this.#runCapability,
+          'x-deepcode-session-id': this.sessionId,
+          'x-deepcode-run-id': this.runId,
+        },
         body: JSON.stringify(request),
         signal,
       }
@@ -72,53 +91,26 @@ export class HttpSessionKernelProviderBackendV2
 implements SessionKernelProviderBackendV2 {
   constructor(
     private readonly transport: SessionKernelLlmTransportV2,
-    private readonly profileId?: string
+    private readonly profileId: string
   ) {}
 
   async requestTurn(
     input: SessionProviderTurnInputV2
   ): Promise<SessionKernelProviderBackendOutputV2> {
-    const exposed = callableTools(input);
+    assertProviderToolContextBindingV2(input);
+    const exposed = providerCallableToolsV2(input);
     const encodedNames = new Map(
-      exposed.map((tool) => [encodeProviderToolId(tool.toolId), tool.toolId])
+      exposed.map((tool) => [
+        providerWireToolNameV2(tool.toolId),
+        tool.toolId,
+      ])
     );
     const request: LlmChatRequest = {
       requestId: input.providerTurnId,
-      ...(this.profileId ? { profileId: this.profileId } : {}),
-      messages: promptEnvelopeProviderMessages(
-        assembleContext({
-          workflowState: `kernel-v2:${input.target.kind}`,
-          allowedProposals: providerAllowedProposals(input),
-          kernelToolContext: input.toolContext.bundle,
-          userRequest: input.currentInput.text,
-          extraMemoryHints: [
-            canonicalJson({
-              conversationInputHistory: {
-                omittedCount:
-                  input.conversationInputOmittedCount,
-                highWaterInputId: input.currentInput.inputId,
-                records: input.conversationInputs,
-              },
-              providerOutcomeHistory: {
-                omittedCount:
-                  input.providerOutcomeOmittedCount,
-                highWaterProviderTurnId:
-                  input.providerOutcomes.at(-1)?.providerTurnId,
-                records: input.providerOutcomes,
-              },
-            }),
-          ],
-          currentTaskGoal: input.plan?.objective,
-          currentTaskContext: providerTurnFrame(input),
-          profile: {
-            provider: this.profileId ?? 'host-selected',
-            model: 'host-selected',
-          },
-          contextAssemblyId: input.providerTurnId,
-        }).prompt
-      ),
+      profileId: this.profileId,
+      messages: cloneJson(input.contextAssembly.messages),
       tools: exposed.map((tool): ProviderWireToolDefinition => ({
-        name: encodeProviderToolId(tool.toolId),
+        name: providerWireToolNameV2(tool.toolId),
         description: tool.description,
         inputSchema: tool.inputSchema,
       })),
@@ -131,6 +123,13 @@ implements SessionKernelProviderBackendV2 {
             factsSnapshotHighWater:
               input.kernelFacts.snapshotHighWater,
             factsOmittedCount: input.kernelFacts.omittedCount,
+            providerProfileRevisionDigest:
+              input.providerProfile.providerProfileRevisionDigest,
+            memoryContextDigest:
+              input.contextAssembly.receipt.memory.contextDigest,
+            contextAssemblyDigest: sha256Hash(
+              canonicalJson(input.contextAssembly.receipt)
+            ),
           },
         },
       },
@@ -159,6 +158,10 @@ implements SessionKernelProviderBackendV2 {
       );
     }
     const calls = assistant.toolCalls ?? [];
+    const providerResult = providerResultMetadataV2(
+      response.data,
+      this.profileId
+    );
     if (calls.length > 1) {
       throw new SessionKernelProviderTransportError(
         'session_kernel_provider_multiple_calls',
@@ -179,80 +182,48 @@ implements SessionKernelProviderBackendV2 {
         callId: requiredIdentity(call.id, 'callId'),
         toolId,
         arguments: call.arguments,
+        providerResult,
       };
     }
     const text = assistant.content ?? '';
-    if (!text.trim()) return { kind: 'noTool' };
+    if (!text.trim()) return { kind: 'noTool', providerResult };
     if (input.target.kind === 'planning') {
       const plan = decodeProviderPlanDraftFrame(text);
-      if (plan) return { kind: 'plan', plan };
+      if (plan) return { kind: 'plan', plan, providerResult };
     }
-    return { kind: 'text', text };
+    return { kind: 'text', text, providerResult };
   }
 }
 
-function providerAllowedProposals(
+function assertProviderToolContextBindingV2(
   input: SessionProviderTurnInputV2
-): string[] {
-  if (input.target.kind === 'planning') {
-    return ['plan', 'contextRead', 'answer', 'noTool'];
-  }
-  return ['toolIntent', 'answer', 'noTool'];
-}
-
-function providerTurnFrame(
-  input: SessionProviderTurnInputV2
-): Record<string, unknown> {
-  return {
-    schemaVersion: SESSION_PROVIDER_TURN_INPUT_V2_SCHEMA,
-    providerTurnId: input.providerTurnId,
-    runId: input.runId,
-    controlEpoch: input.controlEpoch,
-    toolContextRef: input.toolContext.contextRef,
-    currentInput: input.currentInput,
-    ...(input.plan ? { plan: input.plan } : {}),
-    ...(input.planDecision
-      ? { planDecision: input.planDecision }
-      : {}),
-    target: input.target,
-    guidance: input.guidance,
-    kernelFacts: input.kernelFacts,
-    outputContract:
-      input.target.kind === 'planning'
-        ? {
-            planSchemaVersion:
-              SESSION_PROVIDER_PLAN_DRAFT_V2_SCHEMA,
-            rule:
-              'Return either one exact plan-draft JSON object, one exposed read-only native tool call for more context, or ordinary text. Never invent authority identities.',
-          }
-        : {
-            rule:
-              'Return at most one exposed native tool call, one exact standalone ToolIntent text frame, ordinary text, or no tool.',
-          },
-  };
-}
-
-function callableTools(input: SessionProviderTurnInputV2) {
-  if (input.target.kind === 'planAction') {
-    const planActionId = input.target.planActionId;
-    const toolId = input.plan?.actions.find(
-      (action) =>
-        action.manifest.planActionId === planActionId
-    )?.manifest.toolId;
-    return input.toolContext.tools.filter(
-      (tool) => tool.toolId === toolId
+): void {
+  const bundle = input.toolContext.bundle;
+  const contextRef = input.toolContext.contextRef;
+  if (
+    input.toolContext.fixedPrompt !== bundle.fixedPrompt
+    || canonicalJson(input.toolContext.tools)
+      !== canonicalJson(bundle.tools)
+    || contextRef.contextVersion !== bundle.contextVersion
+    || contextRef.catalogDigest !== bundle.catalogDigest
+    || contextRef.contextDigest !== bundle.contextDigest
+    || bundle.tools.some((tool) => tool.availability !== 'ready')
+    || input.contextAssembly.messages.length !== 7
+    || input.contextAssembly.messages[0]?.role !== 'system'
+    || input.contextAssembly.messages[0]?.content
+      !== bundle.fixedPrompt
+    || input.contextAssembly.receipt.providerProfile
+      .providerProfileId
+      !== input.providerProfile.providerProfileId
+    || input.contextAssembly.receipt.providerProfile
+      .providerProfileRevisionDigest
+      !== input.providerProfile.providerProfileRevisionDigest
+  ) {
+    throw new SessionKernelProviderTransportError(
+      'session_kernel_provider_tool_context_binding_invalid',
+      'Provider ToolContext binding differs from the immutable Kernel bundle.'
     );
   }
-  return input.toolContext.tools.filter(
-    (tool) => tool.effectClass === 'read'
-  );
-}
-
-function encodeProviderToolId(toolId: string): string {
-  const bytes = new TextEncoder().encode(toolId);
-  return `dcv2_${[...bytes]
-    .map((byte) => byte.toString(16).padStart(2, '0'))
-    .join('')}`;
 }
 
 function decodeProviderPlanDraftFrame(
@@ -417,12 +388,107 @@ function exactKeys(
   }
 }
 
+function providerResultMetadataV2(
+  result: LlmChatResult,
+  expectedProfileId: string
+): SessionProviderResultMetadataV2 {
+  if (
+    result.providerProfileId !== undefined
+    && result.providerProfileId !== expectedProfileId
+  ) {
+    throw new SessionKernelProviderTransportError(
+      'session_kernel_provider_profile_result_mismatch',
+      'Provider result profile does not match the immutable Run bootstrap.'
+    );
+  }
+  const provider = optionalMetadataIdentity(
+    result.provider,
+    'provider'
+  );
+  const model = optionalMetadataIdentity(result.model, 'model');
+  const usage = result.usage === undefined
+    ? undefined
+    : boundedUsageRecord(result.usage);
+  return {
+    providerProfileId: expectedProfileId,
+    ...(provider ? { provider } : {}),
+    ...(model ? { model } : {}),
+    ...(usage ? { usage } : {}),
+  };
+}
+
+function boundedUsageRecord(
+  value: unknown
+): Record<string, unknown> {
+  const maximumUsageCounter = 1_000_000_000_000;
+  const usage = objectRecord(value);
+  if (!usage) return {};
+  let visited = 0;
+  const sanitize = (
+    candidate: Record<string, unknown>,
+    depth: number
+  ): Record<string, unknown> => {
+    if (depth > 4) return {};
+    const sanitized: Record<string, unknown> = {};
+    for (const [key, nested] of Object.entries(candidate).sort()) {
+      visited += 1;
+      if (
+        visited > 256
+        || !/^[A-Za-z][A-Za-z0-9_]{0,127}$/u.test(key)
+      ) {
+        continue;
+      }
+      if (
+        typeof nested === 'number'
+        && Number.isSafeInteger(nested)
+        && nested >= 0
+        && nested <= maximumUsageCounter
+      ) {
+        sanitized[key] = nested;
+      } else {
+        const child = objectRecord(nested);
+        if (child) sanitized[key] = sanitize(child, depth + 1);
+      }
+    }
+    return sanitized;
+  };
+  const sanitized = sanitize(usage, 0);
+  if (
+    new TextEncoder().encode(canonicalJson(sanitized)).byteLength
+      > 64 * 1024
+  ) {
+    return {};
+  }
+  return sanitized;
+}
+
+function optionalMetadataIdentity(
+  value: unknown,
+  _field: string
+): string | undefined {
+  if (value === undefined) return undefined;
+  if (
+    typeof value !== 'string'
+    || !value
+    || value.trim() !== value
+    || new TextEncoder().encode(value).byteLength > 1024
+    || /[\u0000-\u001f\u007f-\u009f]/u.test(value)
+  ) {
+    return undefined;
+  }
+  return value;
+}
+
 function objectRecord(
   value: unknown
 ): Record<string, unknown> | undefined {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
     : undefined;
+}
+
+function cloneJson<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
 }
 
 function requiredIdentity(value: unknown, field: string): string {
