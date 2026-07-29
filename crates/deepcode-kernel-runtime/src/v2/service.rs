@@ -4,9 +4,9 @@ use super::authority::{
     direct_tool_intent_admission_drafts, direct_tool_intent_continuation_drafts,
     epoch_advance_drafts, exact_epoch, explicit_cancellation_drafts, fact_draft, invalid_field,
     plan_control_cancellation, plan_epoch_advance, prepare_direct_effect,
-    prepare_direct_tool_intent, recorded_error_to_error, require_current_run, resolve_execution,
-    resolve_workspace_binding, storage_fault, EffectPreparation, EpochAdvancePlan, PrepareFailure,
-    RunCommandCheck,
+    prepare_direct_tool_intent, prepare_failure_error, recorded_error_to_error,
+    require_current_run, resolve_execution, resolve_workspace_binding, storage_fault,
+    EffectPreparation, EpochAdvancePlan,
 };
 use super::model::{
     invocation_phase_is_terminal, AuthorityResult, AuthorityState, ExecutionResolution,
@@ -19,19 +19,20 @@ use crate::executors::{
     KernelToolInvocation as ExecutorToolInvocation, SecretProvider,
 };
 use deepcode_kernel_abi::v2::{
-    command_request_digest_v2, target_revalidation_set_digest_v2, AttemptId, AuthorizationFactV2,
-    CancelRequestId, CancellationReasonCodeV2, CommandEpochContextV2, CommandRequestId,
-    ControlEpoch, EffectEvidenceV2, EffectId, FactId, IndeterminateReasonV2, InputId,
-    InvocationAuthorityV2, InvocationFactV2, InvocationId, KernelFactDraftV2, KernelFactEnvelopeV2,
-    KernelFactPayloadV2, LastObservationV2, MutationCommandResultV2, OperationId,
-    PreEffectFailureCodeV2, RecordedAtV2, ResourceAttemptIdentityV2, ResourceFactV2, ResourceId,
-    RunId, RunRetirementReasonCodeV2, V2ValidationError,
+    command_request_digest_v2, target_revalidation_set_digest_v2,
+    validate_cross_language_safe_u64_v2, AttemptId, AuthorizationFactV2, CancelRequestId,
+    CancellationReasonCodeV2, CommandEpochContextV2, CommandRequestId, ControlEpoch,
+    EffectEvidenceV2, EffectId, FactId, IndeterminateReasonV2, InputId, InvocationAuthorityV2,
+    InvocationFactV2, InvocationId, KernelFactDraftV2, KernelFactEnvelopeV2, KernelFactPayloadV2,
+    LastObservationV2, MutationCommandResultV2, OperationId, PreEffectFailureCodeV2, RecordedAtV2,
+    ResourceAttemptIdentityV2, ResourceFactV2, ResourceId, RunId, RunRetirementReasonCodeV2,
+    V2ValidationError,
 };
 use deepcode_kernel_abi::v2_command::{
     ControlEpochAdvanceV2, ControlEpochAdvancedReplyV2, EpochPreconditionV2,
     InvalidFieldViolationV2, InvocationCancelReplyV2, InvocationCancelTargetV2, InvocationCancelV2,
-    KernelCommandEnvelopeV2, KernelCommandV2, KernelErrorV2, KernelReplyV2, RecordedCommandErrorV2,
-    ToolIntentSubmitReplyV2,
+    KernelCommandEnvelopeV2, KernelCommandV2, KernelErrorV2, KernelReplyV2, MutationCommandKindV2,
+    RecordedCommandErrorV2, ToolIntentRejectionReasonV2, ToolIntentSubmitReplyV2,
 };
 use deepcode_kernel_abi::{
     CanonicalArgumentsDigestV2, RunCapabilityV2, ToolContextRefV2, ToolContractDigestV2, ToolIdV2,
@@ -164,7 +165,7 @@ struct ServiceInner {
     _publisher: OutboxPublisherLease,
     workspaces: Mutex<HashMap<RunId, WorkspaceBinding>>,
     executor_runtime: RwLock<ExecutorRuntimeSnapshot>,
-    execution_tasks: Mutex<HashMap<InvocationId, std::thread::JoinHandle<()>>>,
+    execution_tasks: Mutex<HashMap<InvocationId, std::thread::JoinHandle<AuthorityResult<()>>>>,
     ids: IdMint,
 }
 
@@ -244,6 +245,7 @@ struct RunRetirementFenceDraft {
     capability_verifier: Option<AuthorityMaterialDraftV2>,
 }
 
+#[derive(Clone)]
 struct DirectAuthorityAdmittedInvocation {
     identity: deepcode_kernel_abi::v2::ToolAttemptIdentityV2,
     invocation: KernelCanonicalInvocation,
@@ -553,13 +555,7 @@ impl AuthorityService {
             &workspace,
             &executor_runtime.config,
         )
-        .map_err(|failure| match failure {
-            PrepareFailure::Kernel(error) => error,
-            PrepareFailure::Target(reason) => {
-                let _ = reason;
-                invalid_field("rawArguments", InvalidFieldViolationV2::OutOfRange)
-            }
-        })?;
+        .map_err(|failure| prepare_failure_error("rawArguments", failure))?;
         Ok((prepared.resource_scope, prepared.effective_deadline_ms))
     }
 
@@ -938,9 +934,12 @@ impl AuthorityService {
             return Err(storage_fault());
         }
         let mut state = self.inner.state.lock().map_err(|_| storage_fault())?;
-        let first_ledger_sequence = self
-            .high_water()?
-            .checked_add(1)
+        let batch_len = payloads.len();
+        let batch_len_u64 = u64::try_from(batch_len).map_err(|_| storage_fault())?;
+        let high_water = self.predicted_high_water(batch_len)?;
+        let first_ledger_sequence = high_water
+            .checked_sub(batch_len_u64)
+            .and_then(|value| value.checked_add(1))
             .ok_or_else(storage_fault)?;
         let drafts = payloads
             .into_iter()
@@ -956,8 +955,9 @@ impl AuthorityService {
             .collect::<Vec<_>>();
         let ledger_sequences = (0..drafts.len())
             .map(|offset| {
+                let offset = u64::try_from(offset).map_err(|_| storage_fault())?;
                 first_ledger_sequence
-                    .checked_add(offset as u64)
+                    .checked_add(offset)
                     .ok_or_else(storage_fault)
             })
             .collect::<AuthorityResult<Vec<_>>>()?;
@@ -970,6 +970,82 @@ impl AuthorityService {
             .map_err(|_| storage_fault())?
             .append_with_public_receipt_and_authority_material(drafts, receipt, mutations)
             .map_err(|_| storage_fault())?;
+        match outcome.receipt {
+            PutPublicCommandReceiptOutcomeV2::Inserted(_) => {}
+            PutPublicCommandReceiptOutcomeV2::ExistingSame(_)
+            | PutPublicCommandReceiptOutcomeV2::DigestConflict { .. } => {
+                return Err(corrupt_store())
+            }
+        }
+        if !outcome.facts.is_empty() {
+            if let Err(error) = state.apply_committed(outcome.facts.clone()) {
+                state.storage_faulted = true;
+                return Err(error);
+            }
+        }
+        Ok(outcome)
+    }
+
+    pub(super) fn append_built_payloads_with_public_receipt_and_authority_material<F>(
+        &self,
+        payload_count: usize,
+        settlement_index: usize,
+        mutations: Vec<AuthorityMaterialMutationV2>,
+        build: F,
+    ) -> AuthorityResult<AppendWithPublicReceiptAndAuthorityMaterialOutcomeV2>
+    where
+        F: FnOnce(
+            &[FactId],
+            &[u64],
+        ) -> AuthorityResult<(Vec<KernelFactPayloadV2>, PublicCommandReceiptV2)>,
+    {
+        if payload_count == 0 || settlement_index >= payload_count {
+            return Err(storage_fault());
+        }
+        let mut state = self.inner.state.lock().map_err(|_| storage_fault())?;
+        let payload_count_u64 = u64::try_from(payload_count).map_err(|_| storage_fault())?;
+        let high_water = self.predicted_high_water(payload_count)?;
+        let first_ledger_sequence = high_water
+            .checked_sub(payload_count_u64)
+            .and_then(|value| value.checked_add(1))
+            .ok_or_else(storage_fault)?;
+        let fact_ids = (0..payload_count)
+            .map(|_| self.inner.ids.fact())
+            .collect::<Vec<_>>();
+        let ledger_sequences = (0..payload_count)
+            .map(|offset| {
+                let offset = u64::try_from(offset).map_err(|_| storage_fault())?;
+                first_ledger_sequence
+                    .checked_add(offset)
+                    .ok_or_else(storage_fault)
+            })
+            .collect::<AuthorityResult<Vec<_>>>()?;
+        let (payloads, mut receipt) = build(&fact_ids, &ledger_sequences)?;
+        if payloads.len() != payload_count {
+            return Err(storage_fault());
+        }
+        let drafts = fact_ids
+            .iter()
+            .cloned()
+            .zip(payloads)
+            .map(|(fact_id, payload)| KernelFactDraftV2 { fact_id, payload })
+            .collect::<Vec<_>>();
+        receipt.settlement_fact_id = Some(fact_ids[settlement_index].clone());
+        self.prevalidate_drafts(&state, &drafts)?;
+        let outcome = self
+            .inner
+            .writer
+            .lock()
+            .map_err(|_| storage_fault())?
+            .append_with_public_receipt_and_authority_material(drafts, receipt, mutations)
+            .map_err(|_| storage_fault())?;
+        match outcome.receipt {
+            PutPublicCommandReceiptOutcomeV2::Inserted(_) => {}
+            PutPublicCommandReceiptOutcomeV2::ExistingSame(_)
+            | PutPublicCommandReceiptOutcomeV2::DigestConflict { .. } => {
+                return Err(corrupt_store())
+            }
+        }
         if !outcome.facts.is_empty() {
             if let Err(error) = state.apply_committed(outcome.facts.clone()) {
                 state.storage_faulted = true;
@@ -1110,6 +1186,16 @@ impl AuthorityService {
                     current_epoch,
                     error,
                 } => {
+                    if let Some(build_receipt) = public_receipt {
+                        return self.record_semantic_error_with_public_receipt(
+                            &mut state,
+                            envelope,
+                            command.run_id.clone(),
+                            exact_epoch(current_epoch),
+                            error,
+                            build_receipt,
+                        );
+                    }
                     return self.record_semantic_error(
                         &mut state,
                         envelope,
@@ -1121,6 +1207,7 @@ impl AuthorityService {
             };
 
         let command_fact_id = self.inner.ids.fact();
+        let command_settlement_fact_id = command_fact_id.clone();
         let epoch_fact_id = self.inner.ids.fact();
         let active_invocation = state
             .runs
@@ -1185,7 +1272,7 @@ impl AuthorityService {
                 &mut state,
                 drafts,
                 receipt,
-                Some(epoch_fact_id),
+                Some(command_settlement_fact_id),
                 material_mutations,
             )?;
         } else if material_mutations.is_empty() {
@@ -1205,48 +1292,6 @@ impl AuthorityService {
             }
         }
         Ok(kernel_reply)
-    }
-
-    fn check_run_command(
-        &self,
-        state: &mut AuthorityState,
-        envelope: &KernelCommandEnvelopeV2,
-        run_id: &RunId,
-        expected_epoch: ControlEpoch,
-    ) -> AuthorityResult<RunCommandCheck> {
-        let run = state
-            .runs
-            .get(run_id)
-            .cloned()
-            .ok_or_else(|| KernelErrorV2::RunNotFound {
-                run_id: run_id.clone(),
-            })?;
-        if run.retirement_fence.is_some() || run.retired.is_some() {
-            return Err(KernelErrorV2::RunNotFound {
-                run_id: run_id.clone(),
-            });
-        }
-        let error = if run.epoch != expected_epoch {
-            Some(RecordedCommandErrorV2::StaleControlEpoch {
-                run_id: run_id.clone(),
-                submitted: expected_epoch,
-                current: run.epoch,
-            })
-        } else {
-            None
-        };
-        match error {
-            Some(error) => self
-                .record_semantic_error(
-                    state,
-                    envelope,
-                    run_id.clone(),
-                    exact_epoch(run.epoch),
-                    error,
-                )
-                .map(RunCommandCheck::Recorded),
-            None => Ok(RunCommandCheck::Current(run)),
-        }
     }
 
     pub(super) fn admit_direct_tool_intent_with_public_receipt<F>(
@@ -1298,13 +1343,7 @@ impl AuthorityService {
             &workspace,
             &executor_runtime.config,
         )
-        .map_err(|failure| match failure {
-            PrepareFailure::Kernel(error) => error,
-            PrepareFailure::Target(reason) => {
-                let _ = reason;
-                invalid_field("rawArguments", InvalidFieldViolationV2::OutOfRange)
-            }
-        })?;
+        .map_err(|failure| prepare_failure_error("rawArguments", failure))?;
         let mut state = self.inner.state.lock().map_err(|_| storage_fault())?;
         let run =
             state
@@ -1315,18 +1354,27 @@ impl AuthorityService {
                     run_id: request.run_id.clone(),
                 })?;
         if run.epoch != request.control_epoch {
-            return Err(KernelErrorV2::StaleControlEpoch {
-                run_id: request.run_id,
-                submitted: request.control_epoch,
-                current: run.epoch,
-            });
+            return self.reject_tool_intent_locked(
+                &mut state,
+                request.run_id,
+                request.operation_id,
+                request.control_epoch,
+                ToolIntentRejectionReasonV2::StaleControlEpoch,
+                "Refresh the current control epoch before re-planning.".to_owned(),
+                build_receipt,
+            );
         }
         if let Some(active_invocation_id) = run.active_invocation_id {
             let _ = active_invocation_id;
-            return Err(invalid_field(
-                "runId",
-                InvalidFieldViolationV2::InvalidRelation,
-            ));
+            return self.reject_tool_intent_locked(
+                &mut state,
+                request.run_id,
+                request.operation_id,
+                request.control_epoch,
+                ToolIntentRejectionReasonV2::RunBusy,
+                "Wait for the current invocation to settle before retrying.".to_owned(),
+                build_receipt,
+            );
         }
         if state
             .runs
@@ -1335,19 +1383,50 @@ impl AuthorityService {
             .count()
             >= 4
         {
-            return Err(invalid_field("runId", InvalidFieldViolationV2::OutOfRange));
+            return self.reject_tool_intent_locked(
+                &mut state,
+                request.run_id,
+                request.operation_id,
+                request.control_epoch,
+                ToolIntentRejectionReasonV2::CapacityExceeded,
+                "Wait for execution capacity before retrying.".to_owned(),
+                build_receipt,
+            );
         }
-        if state.direct_invocations.values().any(|existing| {
-            existing.run_id == request.run_id
-                && (existing.operation_id == request.operation_id
-                    || existing.idempotency_key_hash == prepared.idempotency_key_hash)
-        }) {
-            return Err(invalid_field(
-                "operationId",
-                InvalidFieldViolationV2::InvalidRelation,
-            ));
+        let duplicate_phase = state
+            .direct_invocations
+            .values()
+            .find(|existing| {
+                existing.run_id == request.run_id
+                    && (existing.operation_id == request.operation_id
+                        || existing.idempotency_key_hash == prepared.idempotency_key_hash)
+            })
+            .map(|existing| existing.phase);
+        if let Some(duplicate_phase) = duplicate_phase {
+            let (reason, guidance) = if duplicate_phase == InvocationPhase::Indeterminate {
+                (
+                    ToolIntentRejectionReasonV2::IndeterminateRecoveryRequired,
+                    "Review the indeterminate invocation facts before taking another action."
+                        .to_owned(),
+                )
+            } else {
+                (
+                    ToolIntentRejectionReasonV2::RunBusy,
+                    "Query the existing operation facts instead of resubmitting it.".to_owned(),
+                )
+            };
+            return self.reject_tool_intent_locked(
+                &mut state,
+                request.run_id,
+                request.operation_id,
+                request.control_epoch,
+                reason,
+                guidance,
+                build_receipt,
+            );
         }
         let command_fact_id = self.inner.ids.fact();
+        let command_settlement_fact_id = command_fact_id.clone();
         let admitted_fact_id = self.inner.ids.fact();
         let attempt_fact_id = self.inner.ids.fact();
         let invocation_id = preferred_invocation_id
@@ -1419,7 +1498,7 @@ impl AuthorityService {
             &mut state,
             drafts,
             receipt,
-            Some(admitted_fact_id),
+            Some(command_settlement_fact_id),
             material_mutations,
         )?;
         drop(state);
@@ -1432,6 +1511,92 @@ impl AuthorityService {
             effective_deadline: Duration::from_millis(u64::from(prepared.effective_deadline_ms)),
             authority_material,
         })?;
+        Ok(reply)
+    }
+
+    pub(super) fn reject_tool_intent_with_public_receipt<F>(
+        &self,
+        run_id: RunId,
+        operation_id: OperationId,
+        submitted_control_epoch: ControlEpoch,
+        reason: ToolIntentRejectionReasonV2,
+        guidance: String,
+        build_receipt: F,
+    ) -> AuthorityResult<ToolIntentSubmitReplyV2>
+    where
+        F: FnOnce(&ToolIntentSubmitReplyV2) -> AuthorityResult<PublicCommandReceiptV2>,
+    {
+        let mut state = self.inner.state.lock().map_err(|_| storage_fault())?;
+        self.reject_tool_intent_locked(
+            &mut state,
+            run_id,
+            operation_id,
+            submitted_control_epoch,
+            reason,
+            guidance,
+            build_receipt,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn reject_tool_intent_locked<F>(
+        &self,
+        state: &mut AuthorityState,
+        run_id: RunId,
+        operation_id: OperationId,
+        submitted_control_epoch: ControlEpoch,
+        reason: ToolIntentRejectionReasonV2,
+        guidance: String,
+        build_receipt: F,
+    ) -> AuthorityResult<ToolIntentSubmitReplyV2>
+    where
+        F: FnOnce(&ToolIntentSubmitReplyV2) -> AuthorityResult<PublicCommandReceiptV2>,
+    {
+        let current_control_epoch = state
+            .runs
+            .get(&run_id)
+            .ok_or_else(|| KernelErrorV2::RunNotFound {
+                run_id: run_id.clone(),
+            })?
+            .epoch;
+        let (reason, guidance) = if current_control_epoch != submitted_control_epoch {
+            (
+                ToolIntentRejectionReasonV2::StaleControlEpoch,
+                "Refresh the current control epoch before re-planning.".to_owned(),
+            )
+        } else {
+            (reason, guidance)
+        };
+        let rejection_fact_id = self.inner.ids.fact();
+        let rejection_batch_high_water = self.predicted_high_water(1)?;
+        let reply = ToolIntentSubmitReplyV2::Rejected {
+            run_id: run_id.clone(),
+            operation_id,
+            current_control_epoch,
+            reason,
+            guidance,
+            rejection_fact_id: rejection_fact_id.clone(),
+            rejection_batch_high_water,
+        };
+        let receipt = build_receipt(&reply)?;
+        let draft = command_receipt_draft(
+            rejection_fact_id.clone(),
+            run_id,
+            exact_epoch(current_control_epoch),
+            receipt.command_request_id.clone(),
+            receipt.command_request_digest.clone(),
+            MutationCommandKindV2::ToolIntentSubmit,
+            MutationCommandResultV2::ToolIntentSubmission {
+                reply: reply.clone(),
+            },
+        );
+        self.commit_locked_with_public_receipt_and_authority_material(
+            state,
+            vec![draft],
+            receipt,
+            Some(rejection_fact_id),
+            Vec::new(),
+        )?;
         Ok(reply)
     }
 
@@ -1489,13 +1654,7 @@ impl AuthorityService {
             &workspace,
             &executor_runtime.config,
         )
-        .map_err(|failure| match failure {
-            PrepareFailure::Kernel(error) => error,
-            PrepareFailure::Target(reason) => {
-                let _ = reason;
-                invalid_field("rawArguments", InvalidFieldViolationV2::OutOfRange)
-            }
-        })?;
+        .map_err(|failure| prepare_failure_error("rawArguments", failure))?;
         let mut state = self.inner.state.lock().map_err(|_| storage_fault())?;
         let run =
             state
@@ -1553,8 +1712,9 @@ impl AuthorityService {
             .collect::<Vec<_>>();
         let batch_len = 3 + targets.len();
         let high_water = self.predicted_high_water(batch_len)?;
+        let batch_len_u64 = u64::try_from(batch_len).map_err(|_| storage_fault())?;
         let authorization_ledger_sequence = high_water
-            .checked_sub(batch_len as u64)
+            .checked_sub(batch_len_u64)
             .and_then(|value| value.checked_add(1))
             .ok_or_else(storage_fault)?;
         let lease = request.authority.capability_lease().cloned();
@@ -1639,34 +1799,35 @@ impl AuthorityService {
         let service = self.clone();
         let invocation_id = admitted.identity.invocation_id.clone();
         let thread_name = format!("deepcode-v2-{invocation_id}");
-        let pending = Arc::new(Mutex::new(Some(admitted)));
-        let task_pending = Arc::clone(&pending);
+        let task_admitted = admitted.clone();
+        let mut execution_tasks = self
+            .inner
+            .execution_tasks
+            .lock()
+            .map_err(|_| storage_fault())?;
+        if execution_tasks.contains_key(&invocation_id) {
+            return Err(corrupt_store());
+        }
         match std::thread::Builder::new()
             .name(thread_name)
             .spawn(move || {
-                if let Ok(mut pending) = task_pending.lock() {
-                    if let Some(admitted) = pending.take() {
-                        service.execute_direct_admitted(admitted);
+                let execution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    service.execute_direct_admitted(&task_admitted)
+                }));
+                match execution {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(_)) | Err(_) => {
+                        service.settle_abandoned_direct_execution(&task_admitted)
                     }
                 }
             }) {
             Ok(handle) => {
-                let replaced = self
-                    .inner
-                    .execution_tasks
-                    .lock()
-                    .map_err(|_| storage_fault())?
-                    .insert(invocation_id, handle);
-                if replaced.is_some() {
+                if execution_tasks.insert(invocation_id, handle).is_some() {
                     return Err(corrupt_store());
                 }
             }
             Err(_) => {
-                let admitted = pending
-                    .lock()
-                    .map_err(|_| storage_fault())?
-                    .take()
-                    .ok_or_else(corrupt_store)?;
+                drop(execution_tasks);
                 self.fail_direct_before_effect(
                     admitted,
                     PreEffectFailureCodeV2::ExecutorUnavailable,
@@ -1676,25 +1837,26 @@ impl AuthorityService {
         Ok(())
     }
 
-    fn execute_direct_admitted(&self, admitted: DirectAuthorityAdmittedInvocation) {
+    fn execute_direct_admitted(
+        &self,
+        admitted: &DirectAuthorityAdmittedInvocation,
+    ) -> AuthorityResult<()> {
         let workspace = match self.workspace_for_run(&admitted.identity.run_id) {
             Ok(workspace) => workspace,
             Err(_) => {
-                let _ = self.fail_direct_before_effect(
-                    admitted,
+                return self.fail_direct_before_effect(
+                    admitted.clone(),
                     PreEffectFailureCodeV2::ExecutorUnavailable,
-                );
-                return;
+                )
             }
         };
         let executor_runtime = match self.executor_runtime_snapshot() {
             Ok(runtime) => runtime,
             Err(_) => {
-                let _ = self.fail_direct_before_effect(
-                    admitted,
+                return self.fail_direct_before_effect(
+                    admitted.clone(),
                     PreEffectFailureCodeV2::ExecutorUnavailable,
-                );
-                return;
+                )
             }
         };
         let preparation = match prepare_direct_effect(
@@ -1705,14 +1867,11 @@ impl AuthorityService {
             &executor_runtime.config,
         ) {
             Ok(value) => value,
-            Err(code) => {
-                let _ = self.fail_direct_before_effect(admitted, code);
-                return;
-            }
+            Err(code) => return self.fail_direct_before_effect(admitted.clone(), code),
         };
-        let ready = match self.persist_direct_effect_boundary(admitted, preparation) {
-            Ok(Some(value)) => value,
-            Ok(None) | Err(_) => return,
+        let ready = match self.persist_direct_effect_boundary(admitted.clone(), preparation)? {
+            Some(value) => value,
+            None => return Ok(()),
         };
         let invocation = ExecutorToolInvocation {
             id: ready.admitted.identity.invocation_id.to_string(),
@@ -1726,16 +1885,16 @@ impl AuthorityService {
             .kernel_internal_execution_adapter(&invocation.tool_id)
         {
             Some(execution_adapter) => execution_adapter,
-            None => return,
+            None => return Err(corrupt_store()),
         };
         let tool_id_v2 = match deepcode_kernel_abi::ToolIdV2::parse(&invocation.tool_id) {
             Ok(tool_id) => tool_id,
-            Err(_) => return,
+            Err(_) => return Err(corrupt_store()),
         };
         let admission =
             match crate::kernel_tool_registry().kernel_internal_admission_metadata(&tool_id_v2) {
                 Some(admission) => admission,
-                None => return,
+                None => return Err(corrupt_store()),
             };
         let raw =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match execution_adapter {
@@ -1777,7 +1936,7 @@ impl AuthorityService {
             &workspace,
             admission.maximum_output_bytes,
         );
-        let _ = self.finalize_direct_execution(ready, resolution);
+        self.finalize_direct_execution(ready, resolution)
     }
 
     fn persist_direct_effect_boundary(
@@ -1995,6 +2154,96 @@ impl AuthorityService {
         )
     }
 
+    fn settle_abandoned_direct_execution(
+        &self,
+        admitted: &DirectAuthorityAdmittedInvocation,
+    ) -> AuthorityResult<()> {
+        let mut state = self.inner.state.lock().map_err(|_| storage_fault())?;
+        let snapshot = match self.inner.reader.snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(_) => {
+                state.storage_faulted = true;
+                return Err(storage_fault());
+            }
+        };
+        let restored = match AuthorityState::restore(snapshot.facts) {
+            Ok(restored) => restored,
+            Err(error) => {
+                state.storage_faulted = true;
+                return Err(error);
+            }
+        };
+        *state = restored;
+        let invocation = state
+            .direct_invocations
+            .get(&admitted.identity.invocation_id)
+            .cloned()
+            .ok_or_else(corrupt_store)?;
+        let drafts = match invocation.phase {
+            phase if invocation_phase_is_terminal(phase) => return Ok(()),
+            InvocationPhase::AttemptPrepared => {
+                let attempt_prepared_fact_id = invocation
+                    .attempt_prepared_fact_id
+                    .as_ref()
+                    .ok_or_else(corrupt_store)?;
+                direct_failed_before_effect_drafts(
+                    &admitted.identity,
+                    attempt_prepared_fact_id,
+                    self.inner.ids.fact(),
+                    PreEffectFailureCodeV2::ExecutorUnavailable,
+                )
+            }
+            InvocationPhase::Executing => {
+                let execution_started_fact_id = invocation
+                    .execution_started_fact_id
+                    .as_ref()
+                    .ok_or_else(corrupt_store)?;
+                let possible_resources = state
+                    .resources
+                    .values()
+                    .filter(|resource| {
+                        resource.invocation_id == invocation.invocation_id
+                            && resource.revalidation.is_some()
+                    })
+                    .map(|resource| resource.resource_id.clone())
+                    .collect();
+                direct_execution_result_drafts(
+                    &admitted.identity,
+                    execution_started_fact_id,
+                    self.inner.ids.typed("effect", EffectId::new),
+                    self.inner.ids.fact(),
+                    self.inner.ids.fact(),
+                    possible_resources,
+                    ExecutionResolution::Indeterminate {
+                        evidence: EffectEvidenceV2::IndeterminateReadBack {
+                            last_observation: LastObservationV2::None {},
+                        },
+                        reason_code: IndeterminateReasonV2::StorageFaultAfterPermit,
+                    },
+                    invocation
+                        .stop_overlay
+                        .cancellation()
+                        .map(|(request_id, _, _)| request_id),
+                    invocation.stop_overlay.deadline_observed(),
+                )?
+            }
+            _ => return Err(corrupt_store()),
+        };
+        let terminal_index = drafts.len().checked_sub(1).ok_or_else(corrupt_store)?;
+        if let Err(error) = self.commit_locked_with_authority_material(
+            &mut state,
+            drafts,
+            vec![terminal_direct_invocation_material(
+                admitted,
+                terminal_index,
+            )],
+        ) {
+            state.storage_faulted = true;
+            return Err(error);
+        }
+        Ok(())
+    }
+
     fn reap_finished_execution_tasks(&self) -> AuthorityResult<()> {
         let finished = {
             let mut tasks = self
@@ -2013,12 +2262,17 @@ impl AuthorityService {
                 .filter_map(|invocation_id| tasks.remove(&invocation_id))
                 .collect::<Vec<_>>()
         };
+        let mut failure = None;
         for handle in finished {
-            if handle.join().is_err() {
-                return Err(corrupt_store());
+            let outcome = handle.join().unwrap_or_else(|_| Err(corrupt_store()));
+            if let Err(error) = outcome {
+                if let Ok(mut state) = self.inner.state.lock() {
+                    state.storage_faulted = true;
+                }
+                failure.get_or_insert(error);
             }
         }
-        Ok(())
+        failure.map_or(Ok(()), Err)
     }
 
     pub(super) fn join_owned_execution_tasks(&self) -> AuthorityResult<()> {
@@ -2030,12 +2284,17 @@ impl AuthorityService {
                 .map_err(|_| storage_fault())?;
             tasks.drain().map(|(_, handle)| handle).collect::<Vec<_>>()
         };
+        let mut failure = None;
         for handle in tasks {
-            if handle.join().is_err() {
-                return Err(corrupt_store());
+            let outcome = handle.join().unwrap_or_else(|_| Err(corrupt_store()));
+            if let Err(error) = outcome {
+                if let Ok(mut state) = self.inner.state.lock() {
+                    state.storage_faulted = true;
+                }
+                failure.get_or_insert(error);
             }
         }
-        Ok(())
+        failure.map_or(Ok(()), Err)
     }
 
     pub(super) fn observe_run_execution_convergence_host(
@@ -2117,10 +2376,18 @@ impl AuthorityService {
                 .collect::<Vec<_>>();
             (finished, has_unfinished_task)
         };
+        let mut failure = None;
         for handle in finished {
-            if handle.join().is_err() {
-                return Err(corrupt_store());
+            let outcome = handle.join().unwrap_or_else(|_| Err(corrupt_store()));
+            if let Err(error) = outcome {
+                failure.get_or_insert(error);
             }
+        }
+        if let Some(error) = failure {
+            if let Ok(mut state) = self.inner.state.lock() {
+                state.storage_faulted = true;
+            }
+            return Err(error);
         }
         if has_unfinished_task {
             return Ok(false);
@@ -2138,11 +2405,15 @@ impl AuthorityService {
         Ok(true)
     }
 
-    fn cancel_invocation(
+    pub(super) fn cancel_invocation_with_public_receipt<F>(
         &self,
         envelope: &KernelCommandEnvelopeV2,
         command: InvocationCancelV2,
-    ) -> AuthorityResult<KernelReplyV2> {
+        build_receipt: F,
+    ) -> AuthorityResult<KernelReplyV2>
+    where
+        F: FnOnce(&KernelReplyV2) -> AuthorityResult<PublicCommandReceiptV2>,
+    {
         if command.reason_code != CancellationReasonCodeV2::UserRequested {
             return Err(invalid_field(
                 "command.reasonCode",
@@ -2150,14 +2421,32 @@ impl AuthorityService {
             ));
         }
         let mut state = self.inner.state.lock().map_err(|_| storage_fault())?;
-        let run = match self.check_run_command(
-            &mut state,
-            envelope,
-            &command.run_id,
-            command.expected_control_epoch,
-        )? {
-            RunCommandCheck::Current(run) => run,
-            RunCommandCheck::Recorded(reply) => return Ok(reply),
+        let run =
+            state
+                .runs
+                .get(&command.run_id)
+                .cloned()
+                .ok_or_else(|| KernelErrorV2::RunNotFound {
+                    run_id: command.run_id.clone(),
+                })?;
+        if run.retirement_fence.is_some() || run.retired.is_some() {
+            return Err(KernelErrorV2::RunNotFound {
+                run_id: command.run_id.clone(),
+            });
+        }
+        if run.epoch != command.expected_control_epoch {
+            return self.record_semantic_error_with_public_receipt(
+                &mut state,
+                envelope,
+                command.run_id.clone(),
+                exact_epoch(run.epoch),
+                RecordedCommandErrorV2::StaleControlEpoch {
+                    run_id: command.run_id,
+                    submitted: command.expected_control_epoch,
+                    current: run.epoch,
+                },
+                build_receipt,
+            );
         };
         let target_id = match command.target.clone() {
             InvocationCancelTargetV2::CurrentForRun {} => run.active_invocation_id.clone(),
@@ -2167,7 +2456,7 @@ impl AuthorityService {
                     .get(&invocation_id)
                     .map(|invocation| &invocation.run_id);
                 let Some(invocation_run_id) = invocation_run_id else {
-                    return self.record_semantic_error(
+                    return self.record_semantic_error_with_public_receipt(
                         &mut state,
                         envelope,
                         command.run_id.clone(),
@@ -2176,10 +2465,11 @@ impl AuthorityService {
                             run_id: command.run_id,
                             invocation_id,
                         },
+                        build_receipt,
                     );
                 };
                 if invocation_run_id != &command.run_id {
-                    return self.record_semantic_error(
+                    return self.record_semantic_error_with_public_receipt(
                         &mut state,
                         envelope,
                         command.run_id.clone(),
@@ -2188,6 +2478,7 @@ impl AuthorityService {
                             run_id: command.run_id,
                             invocation_id,
                         },
+                        build_receipt,
                     );
                 }
                 Some(invocation_id)
@@ -2247,36 +2538,47 @@ impl AuthorityService {
                         run.epoch,
                         invocation_id,
                         cancel_request_id,
-                        command_fact_id,
+                        command_fact_id.clone(),
                         cancellation_fact_id,
                         reply.clone(),
                     );
-                    self.commit_locked(&mut state, drafts)?;
-                    return Ok(KernelReplyV2::InvocationCancelResult(reply));
+                    let kernel_reply = KernelReplyV2::InvocationCancelResult(reply);
+                    let receipt = build_receipt(&kernel_reply)?;
+                    self.commit_locked_with_public_receipt_and_authority_material(
+                        &mut state,
+                        drafts,
+                        receipt,
+                        Some(command_fact_id),
+                        Vec::new(),
+                    )?;
+                    return Ok(kernel_reply);
                 }
             }
         };
-        self.commit_receipt_locked(
-            &mut state,
-            envelope,
+        let command_digest =
+            command_request_digest_v2(&envelope.command).map_err(|_| corrupt_store())?;
+        let command_fact_id = self.inner.ids.fact();
+        let draft = command_receipt_draft(
+            command_fact_id.clone(),
             command.run_id,
             exact_epoch(run.epoch),
+            envelope.request_id.clone(),
+            command_digest,
+            MutationCommandKindV2::InvocationCancel,
             MutationCommandResultV2::InvocationCancel {
                 reply: reply.clone(),
             },
+        );
+        let kernel_reply = KernelReplyV2::InvocationCancelResult(reply);
+        let receipt = build_receipt(&kernel_reply)?;
+        self.commit_locked_with_public_receipt_and_authority_material(
+            &mut state,
+            vec![draft],
+            receipt,
+            Some(command_fact_id),
+            Vec::new(),
         )?;
-        Ok(KernelReplyV2::InvocationCancelResult(reply))
-    }
-
-    pub(super) fn cancel_invocation_command(
-        &self,
-        envelope: &KernelCommandEnvelopeV2,
-        command: InvocationCancelV2,
-    ) -> AuthorityResult<InvocationCancelReplyV2> {
-        match self.cancel_invocation(envelope, command)? {
-            KernelReplyV2::InvocationCancelResult(reply) => Ok(reply),
-            _ => Err(corrupt_store()),
-        }
+        Ok(kernel_reply)
     }
 
     fn commit_receipt_locked(
@@ -2322,10 +2624,51 @@ impl AuthorityService {
         Ok(reply)
     }
 
+    fn record_semantic_error_with_public_receipt<F>(
+        &self,
+        state: &mut AuthorityState,
+        envelope: &KernelCommandEnvelopeV2,
+        run_id: RunId,
+        epoch_context: CommandEpochContextV2,
+        error: RecordedCommandErrorV2,
+        build_receipt: F,
+    ) -> AuthorityResult<KernelReplyV2>
+    where
+        F: FnOnce(&KernelReplyV2) -> AuthorityResult<PublicCommandReceiptV2>,
+    {
+        let reply = KernelReplyV2::Error(recorded_error_to_error(error.clone()));
+        let command_digest =
+            command_request_digest_v2(&envelope.command).map_err(|_| corrupt_store())?;
+        let command_fact_id = self.inner.ids.fact();
+        let draft = command_receipt_draft(
+            command_fact_id.clone(),
+            run_id,
+            epoch_context,
+            envelope.request_id.clone(),
+            command_digest,
+            envelope.command.mutation_kind().ok_or_else(corrupt_store)?,
+            MutationCommandResultV2::RecordedSemanticError { error },
+        );
+        let receipt = build_receipt(&reply)?;
+        self.commit_locked_with_public_receipt_and_authority_material(
+            state,
+            vec![draft],
+            receipt,
+            Some(command_fact_id),
+            Vec::new(),
+        )?;
+        Ok(reply)
+    }
+
     fn predicted_high_water(&self, batch_len: usize) -> AuthorityResult<u64> {
-        self.high_water()?
-            .checked_add(batch_len as u64)
-            .ok_or_else(storage_fault)
+        let batch_len = u64::try_from(batch_len).map_err(|_| storage_fault())?;
+        let high_water = self
+            .high_water()?
+            .checked_add(batch_len)
+            .ok_or_else(storage_fault)?;
+        validate_cross_language_safe_u64_v2("ledgerSequence", high_water)
+            .map_err(|_| storage_fault())?;
+        Ok(high_water)
     }
 
     fn high_water(&self) -> AuthorityResult<u64> {
@@ -2340,6 +2683,9 @@ impl AuthorityService {
         state: &AuthorityState,
         drafts: &[KernelFactDraftV2],
     ) -> AuthorityResult<()> {
+        if state.storage_faulted {
+            return Err(storage_fault());
+        }
         if drafts.is_empty() {
             return Err(corrupt_store());
         }

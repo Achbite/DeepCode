@@ -1,6 +1,6 @@
 use super::authority::{
     canonicalize_network_scope_url, canonicalize_requested_workspace_path, invalid_field,
-    resolve_workspace_binding, storage_fault, PrepareFailure,
+    prepare_failure_error, resolve_workspace_binding, storage_fault, PrepareFailure,
 };
 use super::model::{AuthorityResult, WorkspaceBinding};
 use super::service::{
@@ -11,11 +11,13 @@ use super::service::{
 use crate::executors::{KernelExecutorConfig, SecretProvider};
 use deepcode_kernel_abi::v2::{
     command_request_digest_v2, idempotency_key_hash_v2, invocation_policy_evaluation_digest_v2,
-    settings_ceiling_digest_v2, AuthorizationFactV2, AuthorizationIdentityV2,
+    settings_ceiling_digest_v2, validate_cross_language_safe_json_value_v2,
+    validate_cross_language_safe_u64_v2, AuthorizationFactV2, AuthorizationIdentityV2,
     CapabilityAwaitingIdentityV2, CapabilityLeaseFactIdentityV2, CapabilityLeaseRevokeReasonV2,
-    CommandRequestDigestV2, CommandRequestId, ControlEpoch, ControlFactV2, CorrelationRefV2,
-    CorrelationSetV2, FactId, InputId, InvocationAuthorityV2, InvocationFactV2, InvocationId,
-    KernelFactEnvelopeV2, KernelFactPayloadV2, NetworkTargetObservationDigestV2, OperationId,
+    CommandEpochContextV2, CommandReceiptIdentityV2, CommandRequestDigestV2, CommandRequestId,
+    CommandRequestIdentityV2, ControlEpoch, ControlFactV2, CorrelationRefV2, CorrelationSetV2,
+    FactId, InputId, InvocationAuthorityV2, InvocationFactV2, InvocationId, KernelFactEnvelopeV2,
+    KernelFactPayloadV2, MutationCommandResultV2, NetworkTargetObservationDigestV2, OperationId,
     RecordedAtV2, RepositoryAreaV2, ResourceAccessV2, ResourceScopeV2, RunId,
     RunRetirementReasonCodeV2, SettingsCeilingDigestV2, ToolContextInvalidationIdentityV2,
     ToolContextInvalidationReasonV2, UserDecisionRefV2, WorkspaceBindingDigestV2,
@@ -25,10 +27,10 @@ use deepcode_kernel_abi::v2_command::{
     CapabilityScopePreviewReplyV2, CapabilityScopePreviewV2, CommandHandlingV2,
     ControlEpochAdvanceV2, DeadlineRequestV2, EpochPreconditionV2, InvalidFieldViolationV2,
     InvalidRelationV2, InvalidRequestReasonV2, KernelCommandEnvelopeV2,
-    KernelCommandResponseEnvelopeV2, KernelCommandV2, KernelErrorV2, KernelFactDomainProjectionV2,
-    KernelFactLineageV2, KernelFactProjectionPageV2, KernelFactProjectionV2,
-    KernelFactsQueryScopedV2, KernelReplyV2, RunOpenReplyV2, RunOpenV2, ToolContextGetReplyV2,
-    ToolContextGetV2, ToolIntentSubmitReplyV2, ToolIntentSubmitV2,
+    KernelCommandResponseEnvelopeV2, KernelCommandV2, KernelErrorV2, KernelFactProjectionPageV2,
+    KernelFactProjectionV2, KernelFactsQueryScopedV2, KernelReplyV2, MutationCommandKindV2,
+    RunOpenReplyV2, RunOpenV2, ToolContextGetReplyV2, ToolContextGetV2,
+    ToolIntentRejectionReasonV2, ToolIntentSubmitReplyV2, ToolIntentSubmitV2,
 };
 use deepcode_kernel_abi::KernelError as AbiKernelError;
 use deepcode_kernel_abi::{
@@ -92,10 +94,14 @@ fn response(
     request_id: CommandRequestId,
     result: AuthorityResult<(KernelReplyV2, CommandHandlingV2)>,
 ) -> KernelCommandResponseEnvelopeV2 {
-    let (reply, handling) = match result {
+    let (mut reply, mut handling) = match result {
         Ok(value) => value,
         Err(error) => (KernelReplyV2::Error(error), CommandHandlingV2::Evaluated),
     };
+    if reply.validate().is_err() {
+        reply = KernelReplyV2::Error(storage_fault());
+        handling = CommandHandlingV2::Evaluated;
+    }
     KernelCommandResponseEnvelopeV2::Correlated {
         server_abi_version: deepcode_kernel_abi::KERNEL_ABI_V2_VERSION.to_owned(),
         request_id,
@@ -212,9 +218,8 @@ fn canonical_invocation(
             }
         }
         KernelCanonicalInvocation::WebFetch { url, .. } => {
-            let (canonical_url, _) = canonicalize_network_scope_url(url).map_err(|_| {
-                invalid_field("rawArguments.url", InvalidFieldViolationV2::OutOfRange)
-            })?;
+            let (canonical_url, _) = canonicalize_network_scope_url(url)
+                .map_err(|failure| prepare_failure_error("rawArguments.url", failure))?;
             *url = canonical_url;
         }
         _ => {}
@@ -290,16 +295,7 @@ fn exact_targets_for_invocation(
     let workspace_target = |path: &str, access| {
         canonicalize_requested_workspace_path(workspace, path)
             .map(|path| ScopeTargetKey::Workspace { path, access })
-            .map_err(|failure| match failure {
-                PrepareFailure::Kernel(error) => error,
-                PrepareFailure::Target(reason) => {
-                    let _ = reason;
-                    invalid_field(
-                        "rawArguments",
-                        InvalidFieldViolationV2::PathEscapesWorkspace,
-                    )
-                }
-            })
+            .map_err(|failure| prepare_failure_error("rawArguments", failure))
     };
     let target = match invocation {
         Input::FsRead { path, .. }
@@ -321,14 +317,8 @@ fn exact_targets_for_invocation(
             query: query.clone(),
         },
         Input::WebFetch { url, .. } => {
-            let (url, reviewed_target_digest) =
-                canonicalize_network_scope_url(url).map_err(|failure| match failure {
-                    PrepareFailure::Kernel(error) => error,
-                    PrepareFailure::Target(reason) => {
-                        let _ = reason;
-                        invalid_field("rawArguments.url", InvalidFieldViolationV2::OutOfRange)
-                    }
-                })?;
+            let (url, reviewed_target_digest) = canonicalize_network_scope_url(url)
+                .map_err(|failure| prepare_failure_error("rawArguments.url", failure))?;
             ScopeTargetKey::NetworkUrl {
                 url,
                 reviewed_target_digest,
@@ -453,97 +443,7 @@ fn plan_action_correlations(plan_action_id: &PlanActionIdV2) -> AuthorityResult<
 }
 
 fn project_fact(fact: KernelFactEnvelopeV2) -> AuthorityResult<KernelFactProjectionV2> {
-    let run_id = fact.payload.run_id().clone();
-    let operation_id = fact.payload.operation_id().cloned();
-    let plan_action_id = authorization_plan_action(&fact.payload);
-    let capability_lease = fact.payload.capability_lease();
-    let effect_id = effect_id(&fact.payload);
-    let mut resource_ids = fact
-        .payload
-        .resource_ids()
-        .into_iter()
-        .cloned()
-        .collect::<Vec<_>>();
-    resource_ids.sort_by(|left, right| left.as_str().cmp(right.as_str()));
-    resource_ids.dedup();
-    let encoded = serde_json::to_value(&fact.payload).map_err(|_| storage_fault())?;
-    let fact_value = encoded.get("fact").cloned().unwrap_or_else(|| json!({}));
-    let fact_kind = fact_value
-        .get("kind")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown")
-        .to_owned();
-    let details = fact_value
-        .get("data")
-        .cloned()
-        .filter(Value::is_object)
-        .unwrap_or_else(|| json!({}));
-    let domain = match fact.payload {
-        KernelFactPayloadV2::Control(_) => KernelFactDomainProjectionV2::Control,
-        KernelFactPayloadV2::Authorization(_) => KernelFactDomainProjectionV2::Authorization,
-        KernelFactPayloadV2::Invocation(_) => KernelFactDomainProjectionV2::Invocation,
-        KernelFactPayloadV2::Effect(_) => KernelFactDomainProjectionV2::Effect,
-        KernelFactPayloadV2::Resource(_) => KernelFactDomainProjectionV2::Resource,
-        KernelFactPayloadV2::Cleanup(_) => KernelFactDomainProjectionV2::Cleanup,
-    };
-    let projection = KernelFactProjectionV2 {
-        abi_version: fact.abi_version,
-        fact_id: fact.fact_id,
-        ledger_sequence: fact.ledger_sequence,
-        run_sequence: fact.run_sequence,
-        recorded_at: fact.recorded_at,
-        domain,
-        fact_kind,
-        lineage: KernelFactLineageV2 {
-            run_id,
-            control_epoch: fact.payload.control_epoch(),
-            plan_action_ids: plan_action_id.into_iter().collect(),
-            operation_id,
-            capability_lease,
-            invocation_id: fact.payload.invocation_id().cloned(),
-            attempt_id: fact.payload.attempt_id().cloned(),
-            effect_id,
-            resource_ids,
-        },
-        details,
-    };
-    projection.validate().map_err(|_| storage_fault())?;
-    Ok(projection)
-}
-
-fn authorization_plan_action(payload: &KernelFactPayloadV2) -> Option<PlanActionIdV2> {
-    use AuthorizationFactV2 as Fact;
-    match payload {
-        KernelFactPayloadV2::Authorization(
-            Fact::ScopePreviewed { identity, .. }
-            | Fact::CapabilityDenied { identity, .. }
-            | Fact::ExpansionDenied { identity, .. },
-        ) => Some(identity.plan_action_id.clone()),
-        KernelFactPayloadV2::Authorization(
-            Fact::CapabilityIssued { identity, .. }
-            | Fact::ExpansionAllowed { identity, .. }
-            | Fact::LeaseRevoked { identity, .. }
-            | Fact::LeaseSuperseded { identity, .. },
-        ) => Some(identity.plan_action_id.clone()),
-        KernelFactPayloadV2::Authorization(Fact::CapabilityAwaiting { identity, .. }) => {
-            Some(identity.plan_action_id.clone())
-        }
-        _ => None,
-    }
-}
-
-fn effect_id(payload: &KernelFactPayloadV2) -> Option<deepcode_kernel_abi::v2::EffectId> {
-    use deepcode_kernel_abi::v2::EffectFactV2 as Fact;
-    match payload {
-        KernelFactPayloadV2::Effect(
-            Fact::ToolObserved { identity, .. }
-            | Fact::ToolObservedAfterCancel { identity, .. }
-            | Fact::ToolObservedAfterDeadline { identity, .. }
-            | Fact::ToolObservedAfterCancelAndDeadline { identity, .. }
-            | Fact::ToolIndeterminate { identity, .. },
-        ) => Some(identity.effect_id.clone()),
-        _ => None,
-    }
+    KernelFactProjectionV2::from_envelope(&fact).map_err(|_| storage_fault())
 }
 
 fn lower_hex(bytes: &[u8]) -> String {
@@ -1238,12 +1138,15 @@ fn public_receipt(
     reply: &DurablePublicReplyV2,
     settlement_fact_id: Option<FactId>,
 ) -> AuthorityResult<PublicCommandReceiptV2> {
+    let reply_json = serde_json::to_value(reply).map_err(|_| storage_fault())?;
+    validate_cross_language_safe_json_value_v2("replyJson", &reply_json)
+        .map_err(|_| storage_fault())?;
     Ok(PublicCommandReceiptV2 {
         command_request_id: request_id,
         command_request_digest: request_digest,
         command_kind: command_kind.into(),
         run_id,
-        reply_json: serde_json::to_value(reply).map_err(|_| storage_fault())?,
+        reply_json,
         settlement_fact_id,
     })
 }
@@ -1280,36 +1183,57 @@ fn public_command_run_id(command: &KernelCommandV2) -> Option<RunId> {
     }
 }
 
-fn kernel_reply_settlement_fact(reply: &KernelReplyV2) -> Option<FactId> {
-    match reply {
-        KernelReplyV2::ToolIntentSubmission(ToolIntentSubmitReplyV2::Admitted {
-            admission_fact_id,
-            ..
-        }) => Some(admission_fact_id.clone()),
-        KernelReplyV2::ToolIntentSubmission(ToolIntentSubmitReplyV2::AwaitingCapability {
-            awaiting_fact_id,
-            ..
-        }) => Some(awaiting_fact_id.clone()),
-        KernelReplyV2::ToolIntentSubmission(ToolIntentSubmitReplyV2::Rejected {
-            rejection_fact_id,
-            ..
-        }) => Some(rejection_fact_id.clone()),
-        KernelReplyV2::ControlEpochAdvanced(reply) => Some(reply.epoch_fact_id.clone()),
-        KernelReplyV2::InvocationCancelResult(
-            deepcode_kernel_abi::v2_command::InvocationCancelReplyV2::Requested { fact_id, .. }
-            | deepcode_kernel_abi::v2_command::InvocationCancelReplyV2::AlreadyRequested {
-                fact_id,
-                ..
-            },
-        ) => Some(fact_id.clone()),
-        KernelReplyV2::InvocationCancelResult(
-            deepcode_kernel_abi::v2_command::InvocationCancelReplyV2::AlreadyTerminal {
-                terminal_fact_id,
-                ..
-            },
-        ) => Some(terminal_fact_id.clone()),
-        _ => None,
-    }
+fn classify_tool_intent_rejection(
+    error: &KernelErrorV2,
+) -> Option<(ToolIntentRejectionReasonV2, String)> {
+    let classified = match error {
+        KernelErrorV2::StaleControlEpoch { .. } => (
+            ToolIntentRejectionReasonV2::StaleControlEpoch,
+            "Refresh the current control epoch before re-planning.",
+        ),
+        KernelErrorV2::ToolContextStale { .. } => (
+            ToolIntentRejectionReasonV2::StaleToolContext,
+            "Refresh ToolContext before submitting another tool intent.",
+        ),
+        KernelErrorV2::ToolNotRegistered { .. } => (
+            ToolIntentRejectionReasonV2::ToolNotRegistered,
+            "Choose a tool present in the current Kernel ToolContext.",
+        ),
+        KernelErrorV2::ToolUnavailable { .. } => (
+            ToolIntentRejectionReasonV2::ToolUnavailable,
+            "Refresh ToolContext and choose a tool that is currently ready.",
+        ),
+        KernelErrorV2::InvalidRequest {
+            reason: InvalidRequestReasonV2::DeadlineOutOfContract { .. },
+        } => (
+            ToolIntentRejectionReasonV2::InvalidArguments,
+            "Use a deadline within the current tool contract.",
+        ),
+        KernelErrorV2::InvalidRequest {
+            reason:
+                InvalidRequestReasonV2::InvalidField {
+                    field_path,
+                    violation: InvalidFieldViolationV2::PathEscapesWorkspace,
+                },
+        } if field_path.starts_with("rawArguments") => (
+            ToolIntentRejectionReasonV2::InvalidArguments,
+            "Use a workspace-relative path that resolves inside the bound workspace.",
+        ),
+        KernelErrorV2::InvalidRequest {
+            reason: InvalidRequestReasonV2::InvalidField { field_path, .. },
+        } if field_path.starts_with("rawArguments") => (
+            ToolIntentRejectionReasonV2::InvalidArguments,
+            "Use arguments accepted by the current Kernel tool contract.",
+        ),
+        KernelErrorV2::InvalidRequest {
+            reason: InvalidRequestReasonV2::InvalidField { field_path, .. },
+        } if field_path == "authority" => (
+            ToolIntentRejectionReasonV2::PlanActionRequired,
+            "Persist and confirm a PlanAction before invoking this mutation tool.",
+        ),
+        _ => return None,
+    };
+    Some((classified.0, classified.1.to_owned()))
 }
 
 fn user_decision_settlement_fact(reply: &UserDecisionReplyV2) -> Option<FactId> {
@@ -2032,10 +1956,6 @@ impl PublicIdMint {
 
     fn run_id(&self) -> RunId {
         RunId::new(self.raw("run")).expect("Kernel-minted RunId is valid")
-    }
-
-    fn command_id(&self) -> CommandRequestId {
-        CommandRequestId::new(self.raw("command")).expect("Kernel-minted CommandRequestId is valid")
     }
 
     fn invocation_id(&self) -> InvocationId {
@@ -3883,19 +3803,22 @@ impl KernelSessionServiceV2 {
             }
             KernelCommandV2::ControlEpochAdvance(command) => {
                 let current_run = self.run_record(&command.run_id)?;
-                let superseded_capability_count = self
-                    .inner
-                    .state
-                    .lock()
-                    .map_err(|_| storage_fault())?
-                    .leases
-                    .values()
-                    .filter(|lease| lease.run_id == command.run_id)
-                    .count() as u64;
-                let internal = KernelCommandEnvelopeV2::new(
-                    self.inner.ids.command_id(),
-                    KernelCommandV2::ControlEpochAdvance(command.clone()),
-                );
+                let superseded_capability_count = u64::try_from(
+                    self.inner
+                        .state
+                        .lock()
+                        .map_err(|_| storage_fault())?
+                        .leases
+                        .values()
+                        .filter(|lease| lease.run_id == command.run_id)
+                        .count(),
+                )
+                .map_err(|_| storage_fault())?;
+                validate_cross_language_safe_u64_v2(
+                    "supersededCapabilityCount",
+                    superseded_capability_count,
+                )
+                .map_err(|_| storage_fault())?;
                 let public_request_id = envelope.request_id.clone();
                 let public_digest = digest.clone();
                 let public_run_id = command.run_id.clone();
@@ -3904,7 +3827,7 @@ impl KernelSessionServiceV2 {
                     .inner
                     .authority
                     .advance_epoch_with_public_receipt_and_authority_material(
-                        &internal,
+                        envelope,
                         command.clone(),
                         superseded_capability_count,
                         vec![AuthorityMaterialMutationV2::TransitionRunEpoch {
@@ -3961,15 +3884,28 @@ impl KernelSessionServiceV2 {
                 reply
             }
             KernelCommandV2::InvocationCancel(command) => {
-                let internal = KernelCommandEnvelopeV2::new(
-                    self.inner.ids.command_id(),
-                    KernelCommandV2::InvocationCancel(command.clone()),
-                );
-                KernelReplyV2::InvocationCancelResult(
-                    self.inner
-                        .authority
-                        .cancel_invocation_command(&internal, command)?,
-                )
+                let public_request_id = envelope.request_id.clone();
+                let public_digest = digest.clone();
+                let public_run_id = command.run_id.clone();
+                let command_kind = envelope.command.kind();
+                let reply = self.inner.authority.cancel_invocation_with_public_receipt(
+                    envelope,
+                    command,
+                    move |reply| {
+                        public_receipt(
+                            public_request_id,
+                            public_digest,
+                            command_kind,
+                            Some(public_run_id),
+                            &DurablePublicReplyV2::Kernel {
+                                reply: reply.clone(),
+                            },
+                            None,
+                        )
+                    },
+                )?;
+                receipt_persisted = true;
+                reply
             }
             KernelCommandV2::RunOpen(_) => {
                 return Err(invalid_field(
@@ -3979,6 +3915,9 @@ impl KernelSessionServiceV2 {
             }
         };
         if !receipt_persisted {
+            if envelope.command.mutation_kind().is_some() {
+                return Err(storage_fault());
+            }
             let stored = DurablePublicReplyV2::Kernel {
                 reply: reply.clone(),
             };
@@ -3988,7 +3927,7 @@ impl KernelSessionServiceV2 {
                 envelope.command.kind(),
                 public_command_run_id(&envelope.command),
                 stored,
-                kernel_reply_settlement_fact(&reply),
+                None,
             )?;
             if !matches!(persisted, DurablePublicReplyV2::Kernel { .. }) {
                 return Err(storage_fault());
@@ -4048,17 +3987,18 @@ impl KernelSessionServiceV2 {
             }
         };
         let workspace = self.inner.authority.workspace_for_run(&command.run_id)?;
-        let targets = match normalize_requested_targets(
-            &workspace,
-            &command.requested_resources,
-        ) {
+        let targets = match normalize_requested_targets(&workspace, &command.requested_resources) {
             Ok(value) => value,
-            Err(_) => {
+            Err(failure) => {
+                let error = prepare_failure_error("requestedResources", failure);
+                if matches!(error, KernelErrorV2::FactStoreUnavailable { .. }) {
+                    return Err(error);
+                }
                 return Ok((CapabilityScopePreviewReplyV2::Rejected {
                     tool_id: command.tool_id,
                     reason: deepcode_kernel_abi::v2_command::CapabilityScopeRejectionReasonV2::RequestedScopeInvalid,
                     guidance: "Use canonical workspace-relative resources within this run.".to_owned(),
-                }, false))
+                }, false));
             }
         };
         let prepared = self.prepare_preview(
@@ -4081,6 +4021,9 @@ impl KernelSessionServiceV2 {
         let reply = CapabilityScopePreviewReplyV2::Previewed {
             preview: prepared.record.clone(),
         };
+        KernelReplyV2::CapabilityScopePreviewed(reply.clone())
+            .validate()
+            .map_err(|_| storage_fault())?;
         {
             let mut state = self.inner.state.lock().map_err(|_| storage_fault())?;
             let preview_id = prepared.record.preview_id.clone();
@@ -4280,13 +4223,19 @@ impl KernelSessionServiceV2 {
             .as_ref()
             .map(|lease| lease.reference.lease_id.clone())
             .unwrap_or_else(|| self.inner.ids.lease_id());
-        let version = CapabilityLeaseVersionV2::new(
-            previous
-                .as_ref()
-                .map(|lease| lease.reference.version.get().saturating_add(1))
-                .unwrap_or(1),
-        )
-        .map_err(|_| storage_fault())?;
+        let version = previous
+            .as_ref()
+            .map(|lease| {
+                lease
+                    .reference
+                    .version
+                    .get()
+                    .checked_add(1)
+                    .ok_or_else(storage_fault)
+            })
+            .transpose()?
+            .unwrap_or(1);
+        let version = CapabilityLeaseVersionV2::new(version).map_err(|_| storage_fault())?;
         let reference = CapabilityLeaseRefV2 {
             lease_id: lease_id.clone(),
             version,
@@ -4968,6 +4917,21 @@ impl KernelSessionServiceV2 {
         &self,
         template: DurableFactPageV2,
     ) -> AuthorityResult<KernelFactProjectionPageV2> {
+        validate_cross_language_safe_u64_v2(
+            "requestedAfterLedgerSequence",
+            template.requested_after_ledger_sequence,
+        )
+        .map_err(|_| storage_fault())?;
+        validate_cross_language_safe_u64_v2("snapshotHighWater", template.snapshot_high_water)
+            .map_err(|_| storage_fault())?;
+        validate_cross_language_safe_u64_v2(
+            "nextAfterLedgerSequence",
+            template.next_after_ledger_sequence,
+        )
+        .map_err(|_| storage_fault())?;
+        for fact in &template.facts {
+            fact.validate().map_err(|_| storage_fault())?;
+        }
         let next_continuation = if template.has_more {
             let mut issued = None;
             for _ in 0..4 {
@@ -5395,6 +5359,29 @@ impl KernelSessionServiceV2 {
         command: ToolIntentSubmitV2,
         public_command: Option<PublicCommandContext>,
     ) -> AuthorityResult<ToolIntentSubmitReplyV2> {
+        let rejected_command = command.clone();
+        let rejected_public_command = public_command.clone();
+        match self.submit_tool_intent_inner(command, public_command) {
+            Ok(reply) => Ok(reply),
+            Err(error) => {
+                let Some((reason, guidance)) = classify_tool_intent_rejection(&error) else {
+                    return Err(error);
+                };
+                self.record_tool_intent_rejection(
+                    rejected_command,
+                    rejected_public_command,
+                    reason,
+                    guidance,
+                )
+            }
+        }
+    }
+
+    fn submit_tool_intent_inner(
+        &self,
+        command: ToolIntentSubmitV2,
+        public_command: Option<PublicCommandContext>,
+    ) -> AuthorityResult<ToolIntentSubmitReplyV2> {
         let run = self.run_record(&command.run_id)?;
         if run.control_epoch != command.expected_control_epoch {
             return Err(KernelErrorV2::StaleControlEpoch {
@@ -5405,24 +5392,51 @@ impl KernelSessionServiceV2 {
         }
         let context = self.build_tool_context(&command.run_id, run.context_version)?;
         if command.tool_context_ref != context.context_ref() {
-            return Err(invalid_field(
-                "toolContextRef",
-                InvalidFieldViolationV2::InvalidRelation,
-            ));
+            return Err(KernelErrorV2::ToolContextStale {
+                submitted: command.tool_context_ref.clone(),
+                current: context.context_ref(),
+            });
         }
         let descriptor = self
-            .ready_descriptor(&command.run_id, &command.tool_id)
-            .map_err(|reason| {
-            invalid_field(
-                "toolId",
-                match reason {
-                    deepcode_kernel_abi::v2_command::CapabilityScopeRejectionReasonV2::ToolNotRegistered => {
-                        InvalidFieldViolationV2::InvalidEnum
-                    }
-                    _ => InvalidFieldViolationV2::OutOfRange,
-                },
-            )
+            .inner
+            .inventory
+            .tools
+            .iter()
+            .find(|descriptor| descriptor.tool_id == command.tool_id)
+            .cloned()
+            .ok_or_else(|| KernelErrorV2::ToolNotRegistered {
+                tool_id: command.tool_id.clone(),
             })?;
+        let (availability, settings_allowed) = {
+            let state = self.inner.state.lock().map_err(|_| storage_fault())?;
+            let availability = state
+                .runtime_availability
+                .get(&(command.run_id.clone(), command.tool_id.clone()))
+                .copied()
+                .unwrap_or(descriptor.availability);
+            let settings = state
+                .run_settings
+                .get(&command.run_id)
+                .ok_or_else(storage_fault)?;
+            (
+                availability,
+                settings_allow(settings, descriptor.effect_scope),
+            )
+        };
+        if availability != ToolAvailabilityV2::Ready {
+            return Err(KernelErrorV2::ToolUnavailable {
+                tool_id: command.tool_id.clone(),
+                availability,
+            });
+        }
+        if !settings_allowed {
+            return self.record_tool_intent_rejection(
+                command,
+                public_command,
+                ToolIntentRejectionReasonV2::SettingsDenied,
+                "Enable this tool scope in Settings before re-planning.".to_owned(),
+            );
+        }
         let invocation = canonical_invocation(&command.tool_id, &command.raw_arguments)?;
         match command.authority.clone() {
             ToolIntentAuthorityV2::ContextRead { .. } => {
@@ -5441,14 +5455,12 @@ impl KernelSessionServiceV2 {
                 plan_action_id,
                 lease,
             } => {
-                let workspace = self.inner.authority.workspace_for_run(&command.run_id)?;
-                let actual_targets = exact_targets_for_invocation(&workspace, &invocation)?;
-                if let Some(reference) = lease {
+                let explicit_lease = if let Some(reference) = lease {
                     let existing = {
                         let state = self.inner.state.lock().map_err(|_| storage_fault())?;
                         state.leases.get(&reference.lease_id).cloned()
                     };
-                    if let Some(existing) = existing.filter(|record| {
+                    let Some(existing) = existing.filter(|record| {
                         record.reference == reference
                             && record.run_id == command.run_id
                             && record.control_epoch == command.expected_control_epoch
@@ -5456,39 +5468,43 @@ impl KernelSessionServiceV2 {
                             && record.plan_action_id == plan_action_id
                             && record.tool_id == command.tool_id
                             && record.context_ref == command.tool_context_ref
-                    }) {
-                        if target_set_contains(&existing.approved_targets, &actual_targets) {
-                            return self.execute_with_lease(
-                                command,
-                                self.inner.ids.invocation_id(),
-                                &existing,
-                                &descriptor,
-                                public_command,
-                            );
-                        }
-                        let expanded = union_targets(&existing.approved_targets, &actual_targets);
-                        let delta = actual_targets
-                            .iter()
-                            .filter(|target| !existing.approved_targets.contains(target))
-                            .cloned()
-                            .collect();
-                        return self.await_capability(
+                    }) else {
+                        return self.record_tool_intent_rejection(
                             command,
-                            plan_revision,
-                            plan_action_id,
-                            descriptor,
-                            expanded,
-                            delta,
+                            public_command,
+                            ToolIntentRejectionReasonV2::CapabilityLeaseStale,
+                            "Refresh the approved capability lease before retrying.".to_owned(),
+                        );
+                    };
+                    Some(existing)
+                } else {
+                    None
+                };
+                let workspace = self.inner.authority.workspace_for_run(&command.run_id)?;
+                let actual_targets = exact_targets_for_invocation(&workspace, &invocation)?;
+                if let Some(existing) = explicit_lease {
+                    if target_set_contains(&existing.approved_targets, &actual_targets) {
+                        return self.execute_with_lease(
+                            command,
+                            self.inner.ids.invocation_id(),
+                            &existing,
+                            &descriptor,
                             public_command,
                         );
                     }
+                    let expanded = union_targets(&existing.approved_targets, &actual_targets);
+                    let delta = actual_targets
+                        .iter()
+                        .filter(|target| !existing.approved_targets.contains(target))
+                        .cloned()
+                        .collect();
                     return self.await_capability(
                         command,
                         plan_revision,
                         plan_action_id,
                         descriptor,
-                        actual_targets,
-                        Vec::new(),
+                        expanded,
+                        delta,
                         public_command,
                     );
                 }
@@ -5583,11 +5599,41 @@ impl KernelSessionServiceV2 {
                         .lock()
                         .map_err(|_| storage_fault())?
                         .previews
-                        .insert(preview_id, prepared);
-                    self.await_existing_preview(command, public_command)
+                        .insert(preview_id.clone(), prepared);
+                    self.await_preview(command, preview_id, public_command)
                 }
             }
         }
+    }
+
+    fn record_tool_intent_rejection(
+        &self,
+        command: ToolIntentSubmitV2,
+        public_command: Option<PublicCommandContext>,
+        reason: ToolIntentRejectionReasonV2,
+        guidance: String,
+    ) -> AuthorityResult<ToolIntentSubmitReplyV2> {
+        let public_command = public_command.ok_or_else(storage_fault)?;
+        let run_id = command.run_id.clone();
+        self.inner.authority.reject_tool_intent_with_public_receipt(
+            command.run_id,
+            command.operation_id,
+            command.expected_control_epoch,
+            reason,
+            guidance,
+            move |reply| {
+                public_receipt(
+                    public_command.request_id,
+                    public_command.request_digest,
+                    public_command.command_kind,
+                    Some(run_id),
+                    &DurablePublicReplyV2::Kernel {
+                        reply: KernelReplyV2::ToolIntentSubmission(reply.clone()),
+                    },
+                    None,
+                )
+            },
+        )
     }
 
     fn await_capability(
@@ -5623,29 +5669,30 @@ impl KernelSessionServiceV2 {
             .lock()
             .map_err(|_| storage_fault())?
             .previews
-            .insert(preview_id, prepared);
-        self.await_existing_preview(command, public_command)
+            .insert(preview_id.clone(), prepared);
+        self.await_preview(command, preview_id, public_command)
     }
 
-    fn await_existing_preview(
+    fn await_preview(
         &self,
         command: ToolIntentSubmitV2,
+        preview_id: CapabilityScopePreviewIdV2,
         public_command: Option<PublicCommandContext>,
     ) -> AuthorityResult<ToolIntentSubmitReplyV2> {
         let prepared = {
             let state = self.inner.state.lock().map_err(|_| storage_fault())?;
             state
                 .previews
-                .values()
-                .filter(|preview| {
-                    preview.record.run_id == command.run_id
-                        && preview.record.operation_id == command.operation_id
-                        && preview.record.control_epoch == command.expected_control_epoch
-                })
-                .max_by_key(|preview| preview.record.preview_id.as_str().to_owned())
+                .get(&preview_id)
                 .cloned()
                 .ok_or_else(storage_fault)?
         };
+        if prepared.record.run_id != command.run_id
+            || prepared.record.operation_id != command.operation_id
+            || prepared.record.control_epoch != command.expected_control_epoch
+        {
+            return Err(storage_fault());
+        }
         let invocation_id = self.inner.ids.invocation_id();
         let durable_pending = DurablePendingIntentV2::from_command(
             &command,
@@ -5656,14 +5703,8 @@ impl KernelSessionServiceV2 {
             ToolIntentAuthorityV2::PlanAction { lease, .. } => lease.clone(),
             ToolIntentAuthorityV2::ContextRead { .. } => None,
         };
-        let pending_material = AuthorityMaterialMutationV2::Put {
-            material: pending_intent_material(
-                &durable_pending,
-                AUTHORITY_MATERIAL_AWAITING,
-                pending_lease,
-            )?,
-            fact_index: 0,
-        };
+        let pending_material =
+            pending_intent_material(&durable_pending, AUTHORITY_MATERIAL_AWAITING, pending_lease)?;
         let idempotency_key_hash =
             idempotency_key_hash_v2(&command.run_id, &command.idempotency_key)
                 .map_err(|_| storage_fault())?;
@@ -5692,13 +5733,18 @@ impl KernelSessionServiceV2 {
             let preview = prepared.record.clone();
             let public_invocation_id = invocation_id.clone();
             let accepted_control_epoch = command.expected_control_epoch;
+            let command_request_id = public_command.request_id.clone();
+            let command_request_digest = public_command.request_digest.clone();
             let outcome = self
                 .inner
                 .authority
-                .append_payloads_with_public_receipt_and_authority_material_builder(
-                    vec![KernelFactPayloadV2::Authorization(payload)],
-                    Some(0),
-                    vec![pending_material],
+                .append_built_payloads_with_public_receipt_and_authority_material(
+                    2,
+                    0,
+                    vec![AuthorityMaterialMutationV2::Put {
+                        material: pending_material,
+                        fact_index: 1,
+                    }],
                     move |fact_ids, ledger_sequences| {
                         let reply = ToolIntentSubmitReplyV2::AwaitingCapability {
                             run_id: run_id.clone(),
@@ -5706,24 +5752,48 @@ impl KernelSessionServiceV2 {
                             accepted_control_epoch,
                             invocation_id: public_invocation_id.clone(),
                             preview: preview.clone(),
-                            awaiting_fact_id: fact_ids[0].clone(),
-                            awaiting_batch_high_water: ledger_sequences[0],
+                            awaiting_fact_id: fact_ids[1].clone(),
+                            awaiting_batch_high_water: ledger_sequences[1],
                         };
-                        public_receipt(
+                        let command_recorded =
+                            KernelFactPayloadV2::Control(ControlFactV2::CommandRecorded {
+                                identity: CommandReceiptIdentityV2 {
+                                    run_id: run_id.clone(),
+                                    epoch_context: CommandEpochContextV2::Exact {
+                                        control_epoch: accepted_control_epoch,
+                                    },
+                                    command_request_identity: CommandRequestIdentityV2 {
+                                        command_request_id: command_request_id.clone(),
+                                        command_request_digest: command_request_digest.clone(),
+                                    },
+                                },
+                                command_kind: MutationCommandKindV2::ToolIntentSubmit,
+                                result: MutationCommandResultV2::ToolIntentSubmission {
+                                    reply: reply.clone(),
+                                },
+                            });
+                        let receipt = public_receipt(
                             public_command.request_id,
                             public_command.request_digest,
                             public_command.command_kind,
-                            Some(run_id),
+                            Some(run_id.clone()),
                             &DurablePublicReplyV2::Kernel {
                                 reply: KernelReplyV2::ToolIntentSubmission(reply),
                             },
                             None,
-                        )
+                        )?;
+                        Ok((
+                            vec![
+                                command_recorded,
+                                KernelFactPayloadV2::Authorization(payload),
+                            ],
+                            receipt,
+                        ))
                     },
                 )?;
             match outcome.receipt {
                 PutPublicCommandReceiptOutcomeV2::Inserted(_) => {
-                    outcome.facts.into_iter().next().ok_or_else(storage_fault)?
+                    outcome.facts.into_iter().nth(1).ok_or_else(storage_fault)?
                 }
                 PutPublicCommandReceiptOutcomeV2::ExistingSame(_)
                 | PutPublicCommandReceiptOutcomeV2::DigestConflict { .. } => {
@@ -5735,7 +5805,10 @@ impl KernelSessionServiceV2 {
                 .authority
                 .append_payloads_with_authority_material(
                     vec![KernelFactPayloadV2::Authorization(payload)],
-                    vec![pending_material],
+                    vec![AuthorityMaterialMutationV2::Put {
+                        material: pending_material,
+                        fact_index: 0,
+                    }],
                 )?
                 .facts
                 .into_iter()
@@ -5932,7 +6005,15 @@ impl KernelSessionServiceV2 {
                 .cloned();
             let version = previous
                 .as_ref()
-                .map(|lease| lease.reference.version.get().saturating_add(1))
+                .map(|lease| {
+                    lease
+                        .reference
+                        .version
+                        .get()
+                        .checked_add(1)
+                        .ok_or_else(storage_fault)
+                })
+                .transpose()?
                 .unwrap_or(1);
             let lease_id = previous
                 .as_ref()

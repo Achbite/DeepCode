@@ -8,9 +8,9 @@ use crate::tool_protocol_v2::{
     ToolContextRefV2, TrustLeaseDigestV2, TrustPolicyIdV2,
 };
 use crate::v2::{
-    decode_strict_json, invalid_value, typed_digest, validate_wire_abi_header,
-    CommandRequestDigestV2, CommandRequestId, ControlEpoch, FactId, InputId, RunId,
-    UserDecisionRefV2, V2ValidationError, V2WireDecodeError,
+    decode_strict_json, invalid_value, typed_digest, validate_cross_language_safe_json_value_v2,
+    validate_wire_abi_header, CommandRequestDigestV2, CommandRequestId, ControlEpoch, FactId,
+    InputId, RunId, UserDecisionRefV2, V2ValidationError, V2WireDecodeError,
 };
 use crate::v2_command::{CommandHandlingV2, KernelWireErrorV2};
 use crate::KERNEL_ABI_V2_VERSION;
@@ -257,6 +257,32 @@ pub enum UserDecisionResponseEnvelopeV2 {
     },
 }
 
+impl UserDecisionResponseEnvelopeV2 {
+    pub fn validate(&self) -> Result<(), V2ValidationError> {
+        let server_abi_version = match self {
+            Self::Correlated {
+                server_abi_version,
+                reply,
+                ..
+            } => {
+                reply.validate()?;
+                server_abi_version
+            }
+            Self::UncorrelatedWireFailure {
+                server_abi_version, ..
+            } => server_abi_version,
+        };
+        if server_abi_version != KERNEL_ABI_V2_VERSION {
+            return Err(V2ValidationError::UnsupportedAbiVersion {
+                actual: server_abi_version.clone(),
+            });
+        }
+        let encoded = serde_json::to_value(self)
+            .map_err(|_| invalid_value("userDecisionResponse", "must serialize"))?;
+        validate_cross_language_safe_json_value_v2("userDecisionResponse", &encoded)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
     tag = "kind",
@@ -299,6 +325,38 @@ pub enum UserDecisionReplyV2 {
         current: ControlEpoch,
     },
     Error(UserDecisionErrorV2),
+}
+
+impl UserDecisionReplyV2 {
+    pub fn validate(&self) -> Result<(), V2ValidationError> {
+        let ledger_sequence = match self {
+            Self::CapabilityIssued {
+                ledger_sequence, ..
+            }
+            | Self::CapabilityDenied {
+                ledger_sequence, ..
+            }
+            | Self::ScopeExpansionRecorded {
+                ledger_sequence, ..
+            }
+            | Self::ScopeExpansionDenied {
+                ledger_sequence, ..
+            }
+            | Self::TrustGranted {
+                ledger_sequence, ..
+            }
+            | Self::Revoked {
+                ledger_sequence, ..
+            } => Some(*ledger_sequence),
+            Self::Stale { .. } | Self::Error(_) => None,
+        };
+        if ledger_sequence == Some(0) {
+            return Err(invalid_value("ledgerSequence", "must be greater than zero"));
+        }
+        let encoded = serde_json::to_value(self)
+            .map_err(|_| invalid_value("userDecisionReply", "must serialize"))?;
+        validate_cross_language_safe_json_value_v2("userDecisionReply", &encoded)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

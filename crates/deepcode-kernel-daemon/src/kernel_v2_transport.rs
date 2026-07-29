@@ -454,6 +454,9 @@ pub(crate) fn apply_authorized_user_decision(
         handling,
         reply,
     };
+    response
+        .validate()
+        .map_err(|_| KernelV2HttpErrorCode::ServiceUnavailable)?;
     permit
         .complete()
         .map_err(|_| KernelV2HttpErrorCode::ServiceUnavailable)?;

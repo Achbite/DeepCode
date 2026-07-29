@@ -28,6 +28,9 @@ import {
   sessionKernelFactsCaughtUpV2,
 } from './lineage.js';
 import {
+  sessionKernelFactBarriersPendingV2,
+} from './factBarriers.js';
+import {
   projectSessionProviderFactsV2,
 } from './providerFactProjection.js';
 import {
@@ -672,6 +675,7 @@ export class SessionKernelProviderTurnsV2 {
     if (
       state.kernelWakeHint
       || !sessionKernelFactsCaughtUpV2(state.lineage)
+      || sessionKernelFactBarriersPendingV2(state)
     ) {
       throw new SessionKernelProviderTurnError(
         'session_kernel_facts_not_caught_up',
@@ -857,18 +861,34 @@ function latestPlanActionLease(
 ): CapabilityLeaseRefV2 | undefined {
   const operationIds =
     state.lineage.planActions[planActionId]?.operationIds ?? [];
-  let latest: CapabilityLeaseRefV2 | undefined;
+  const leases: CapabilityLeaseRefV2[] = [];
   for (const operationId of operationIds) {
-    for (
-      const lease of
-      state.lineage.operations[operationId]?.leases ?? []
-    ) {
-      if (!latest || lease.version >= latest.version) {
-        latest = lease;
-      }
-    }
+    leases.push(
+      ...(state.lineage.operations[operationId]?.leases ?? [])
+    );
   }
-  return latest ? { ...latest } : undefined;
+  if (leases.length === 0) return undefined;
+  const latestVersion = leases.reduce(
+    (maximum, lease) => Math.max(maximum, lease.version),
+    -1
+  );
+  const candidates = leases.filter(
+    (lease) => lease.version === latestVersion
+  );
+  const expected = candidates[0]!;
+  if (
+    candidates.some(
+      (lease) =>
+        lease.leaseId !== expected.leaseId
+        || lease.scopeDigest !== expected.scopeDigest
+    )
+  ) {
+    throw new SessionKernelProviderTurnError(
+      'session_kernel_plan_action_lease_conflict',
+      `PlanAction ${planActionId} has conflicting lease identities at version ${latestVersion}.`
+    );
+  }
+  return { ...expected };
 }
 
 function safeErrorCode(error: unknown): string {

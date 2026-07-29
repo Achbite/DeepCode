@@ -37,12 +37,13 @@ for script in \
   scripts/tests/static-contracts.sh \
   scripts/tests/repository-required.sh \
   scripts/tests/kernel-v2-contracts.sh \
+  scripts/tests/session-v2-contracts.sh \
   scripts/tests/session-smoke.sh
 do
   bash -n "$script"
 done
 
-/usr/bin/python3 -I -S - "$ROOT_DIR/scripts/test-controller.py" <<'PY'
+/usr/bin/python3 -B -I -S - "$ROOT_DIR/scripts/test-controller.py" <<'PY'
 from pathlib import Path
 import sys
 
@@ -50,7 +51,7 @@ path = Path(sys.argv[1])
 compile(path.read_text(encoding="utf-8"), str(path), "exec")
 PY
 
-/usr/bin/python3 -I -S - "$ROOT_DIR/scripts/test-change-gate.py" <<'PY'
+/usr/bin/python3 -B -I -S - "$ROOT_DIR/scripts/test-change-gate.py" <<'PY'
 from pathlib import Path
 import sys
 
@@ -58,7 +59,7 @@ path = Path(sys.argv[1])
 compile(path.read_text(encoding="utf-8"), str(path), "exec")
 PY
 
-/usr/bin/python3 -I -S - "$ROOT_DIR/scripts/tests/legacy-cutover-contracts.py" <<'PY'
+/usr/bin/python3 -B -I -S - "$ROOT_DIR/scripts/tests/legacy-cutover-contracts.py" <<'PY'
 from pathlib import Path
 import sys
 
@@ -66,8 +67,8 @@ path = Path(sys.argv[1])
 compile(path.read_text(encoding="utf-8"), str(path), "exec")
 PY
 
-/usr/bin/python3 -I -S ./scripts/tests/controller-contracts.py
-/usr/bin/python3 -I -S ./scripts/tests/test-change-gate-contracts.py
+/usr/bin/python3 -B -I -S ./scripts/tests/controller-contracts.py
+/usr/bin/python3 -B -I -S ./scripts/tests/test-change-gate-contracts.py
 
 bash ./scripts/check-architecture.sh
 bash ./scripts/test-branch-flow.sh

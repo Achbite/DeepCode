@@ -29,6 +29,7 @@ import {
   checkpointSessionKernelStateV2,
   cloneSessionKernelLoopStateV2,
   createSessionReviewFactAccumulatorV2,
+  recordSessionOperationPlanActionBindingV2,
 } from './state.js';
 import {
   applySessionToolContextReplyV2,
@@ -43,6 +44,10 @@ import type {
 import {
   SESSION_KERNEL_FACT_KINDS_V2,
 } from './factKinds.js';
+import {
+  registerSessionKernelFactBarrierV2,
+  sessionKernelFactBarriersPendingV2,
+} from './factBarriers.js';
 
 export type SessionKernelPublicRequestOutcomeV2 =
   | { kind: 'toolContextGet'; reply: ToolContextGetReplyV2 }
@@ -560,11 +565,20 @@ function applyPublicRequestOutcome(
       );
       break;
     case 'factsQuery': {
+      const previousReview = state.review
+        ? JSON.stringify(state.review)
+        : undefined;
       const result = reconcileSessionKernelFactsPageV2(state, outcome.reply);
       host.replaceState(result.state);
-      if (result.caughtUp) {
+      const reviewReady =
+        result.caughtUp
+        && !sessionKernelFactBarriersPendingV2(result.state);
+      if (reviewReady) {
         result.state.review = buildSessionKernelReviewV2(result.state, now);
       }
+      const reviewChanged =
+        result.state.review !== undefined
+        && JSON.stringify(result.state.review) !== previousReview;
       events.push(host.event(
         `${record.requestId}:facts`,
         'kernelFacts.reconciled',
@@ -609,13 +623,20 @@ function applyPublicRequestOutcome(
             guidance: typeof fact.details.guidance === 'string'
               ? fact.details.guidance
               : undefined,
-            scopeDelta: fact.details.scopeDelta,
+            scopeDelta: authorizationScopeDelta(
+              fact.factKind,
+              fact.details
+            ),
             details: fact.details,
           },
           fact.recordedAt
         ));
       }
-      if (result.state.review) {
+      if (
+        reviewReady
+        && reviewChanged
+        && result.state.review
+      ) {
         events.push(host.event(
           `${record.requestId}:review:${result.state.review.revision}`,
           'review.revised',
@@ -658,8 +679,30 @@ function applyPublicRequestOutcome(
       if (state.activeWait?.kind !== 'manualRecovery') {
         state.activeWait = undefined;
       }
+      registerSessionKernelFactBarrierV2(state, {
+        requestId: record.requestId,
+        source: 'controlEpochAdvance',
+        minimumHighWater: outcome.reply.commandBatchHighWater,
+        requiredFactIds: [
+          outcome.reply.epochFactId,
+          ...(outcome.reply.cancellation.kind === 'none'
+            ? []
+            : [outcome.reply.cancellation.data.cancellationFactId]),
+        ],
+      });
       break;
     case 'invocationCancel':
+      if (
+        outcome.reply.kind === 'requested'
+        || outcome.reply.kind === 'alreadyRequested'
+      ) {
+        registerSessionKernelFactBarrierV2(state, {
+          requestId: record.requestId,
+          source: 'invocationCancel',
+          minimumHighWater: outcome.reply.data.ledgerSequence,
+          requiredFactIds: [outcome.reply.data.factId],
+        });
+      }
       break;
   }
   return events;
@@ -676,11 +719,57 @@ function applyToolIntentReply(
 ): void {
   if (record.intent.kind !== 'toolIntentSubmit') return;
   const intent = record.intent.payload.intent;
-  state.lineage = recordSessionToolIntentSubmissionV2(
-    state.lineage,
-    intent,
-    reply
-  );
+  const planActionAuthority =
+    intent.authority.kind === 'planAction'
+      ? intent.authority.data
+      : undefined;
+  const stillCurrentEpoch =
+    intent.expectedControlEpoch === state.controlEpoch;
+  const stillCurrentAuthority =
+    stillCurrentEpoch
+    && (
+      !planActionAuthority
+      || (
+        planActionAuthority.planRevision
+          === state.plan?.planRevision
+        && state.plan?.actions.some(
+          (action) =>
+            action.manifest.planActionId
+              === planActionAuthority.planActionId
+        )
+      )
+    );
+  registerSessionKernelFactBarrierV2(state, {
+    requestId: record.requestId,
+    source: 'toolIntentSubmit',
+    minimumHighWater: reply.kind === 'admitted'
+      ? reply.data.admissionBatchHighWater
+      : reply.kind === 'awaitingCapability'
+        ? reply.data.awaitingBatchHighWater
+        : reply.data.rejectionBatchHighWater,
+    requiredFactIds: [
+      reply.kind === 'admitted'
+        ? reply.data.admissionFactId
+        : reply.kind === 'awaitingCapability'
+          ? reply.data.awaitingFactId
+          : reply.data.rejectionFactId,
+    ],
+  });
+  if (stillCurrentAuthority) {
+    if (planActionAuthority) {
+      recordSessionOperationPlanActionBindingV2(state, {
+        operationId: intent.operationId,
+        planActionId: planActionAuthority.planActionId,
+        planRevision: planActionAuthority.planRevision,
+        controlEpoch: intent.expectedControlEpoch,
+      });
+    }
+    state.lineage = recordSessionToolIntentSubmissionV2(
+      state.lineage,
+      intent,
+      reply
+    );
+  }
   events.push(host.event(
     `${record.requestId}:intent`,
     'toolIntent.submitted',
@@ -701,9 +790,9 @@ function applyToolIntentReply(
     record.startedAt
   ));
 
-  const stillCurrentEpoch =
-    intent.expectedControlEpoch === state.controlEpoch;
   if (
+    stillCurrentAuthority
+    &&
     reply.kind === 'rejected'
     && reply.data.reason === 'capabilityLeaseStale'
     && intent.authority.kind === 'planAction'
@@ -713,14 +802,17 @@ function applyToolIntentReply(
       intent.authority.data.planActionId
     );
   }
-  if (reply.kind === 'admitted' && stillCurrentEpoch) {
+  if (reply.kind === 'admitted' && stillCurrentAuthority) {
     state.activeWait = {
       kind: 'invocation',
       operationId: reply.data.operationId,
       invocationId: reply.data.invocationId,
       sinceHighWater: reply.data.admissionBatchHighWater,
     };
-  } else if (reply.kind === 'awaitingCapability' && stillCurrentEpoch) {
+  } else if (
+    reply.kind === 'awaitingCapability'
+    && stillCurrentAuthority
+  ) {
     state.activeWait = {
       kind: 'capability',
       operationId: reply.data.operationId,
@@ -744,7 +836,7 @@ function applyToolIntentReply(
       reply.data.reason === 'runBusy'
       || reply.data.reason === 'capacityExceeded'
     )
-    && stillCurrentEpoch
+    && stillCurrentAuthority
   ) {
     state.activeWait = {
       kind: 'backpressure',
@@ -767,7 +859,10 @@ function applyToolIntentReply(
       reason: 'indeterminate',
       factIds: [reply.data.rejectionFactId],
     };
-  } else if (reply.kind === 'rejected' && stillCurrentEpoch) {
+  } else if (
+    reply.kind === 'rejected'
+    && stillCurrentAuthority
+  ) {
     state.activeWait = undefined;
     appendUniqueGuidance(state.pendingGuidance, reply.data.guidance);
   }
@@ -797,6 +892,33 @@ function authorizationDecisionPreviewId(
     const previewId =
       (record.identity as Record<string, unknown>).previewId;
     return typeof previewId === 'string' ? previewId : undefined;
+  }
+  return undefined;
+}
+
+function authorizationScopeDelta(
+  factKind: string,
+  details: Record<string, unknown>
+): Record<string, string> | undefined {
+  if (
+    factKind
+      === SESSION_KERNEL_FACT_KINDS_V2.authorization.expansionAllowed
+    && typeof details.previousScopeDigest === 'string'
+    && typeof details.expandedScopeDigest === 'string'
+  ) {
+    return {
+      previousScopeDigest: details.previousScopeDigest,
+      expandedScopeDigest: details.expandedScopeDigest,
+    };
+  }
+  if (
+    factKind
+      === SESSION_KERNEL_FACT_KINDS_V2.authorization.expansionDenied
+    && typeof details.requestedScopeDigest === 'string'
+  ) {
+    return {
+      requestedScopeDigest: details.requestedScopeDigest,
+    };
   }
   return undefined;
 }

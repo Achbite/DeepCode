@@ -15,7 +15,7 @@ fi
 
 GROUP="$1"
 case "$GROUP" in
-  communication|tools|paths|authorization) ;;
+  communication|tools|paths|loop) ;;
   *)
     printf '[FAIL] unknown Session smoke group: %s\n' "$GROUP" >&2
     exit 2
@@ -38,9 +38,32 @@ for tool in node pnpm; do
   fi
 done
 
+LOG_DIR="$(mktemp -d "${TMPDIR:-/tmp}/deepcode-session-smoke.XXXXXX")"
+trap 'rm -rf "$LOG_DIR"' EXIT
+
+run_quiet() {
+  local label="$1"
+  shift
+  local log_path="$LOG_DIR/$(printf '%s' "$label" | tr ' /' '__').log"
+  if "$@" >"$log_path" 2>&1; then
+    return 0
+  fi
+  while IFS= read -r line; do
+    printf '[FAIL] %s\n' "$line" >&2
+  done <"$log_path"
+  printf '[FAIL] %s\n' "$label" >&2
+  exit 1
+}
+
 printf '[INFO] Session smoke group=%s: TypeScript build\n' "$GROUP"
-pnpm --filter @deepcode/protocol build
-pnpm --filter @deepcode/session-core build
+run_quiet "Protocol production build" \
+  pnpm --filter @deepcode/protocol build
+run_quiet "Session production build" \
+  pnpm --filter @deepcode/session-core build
+[ ! -e userspace/session-core/dist/__tests__ ] || {
+  printf '[FAIL] Session production output contains test assets\n' >&2
+  exit 1
+}
 
 printf '[INFO] Session smoke group=%s: registered runtime-path checks\n' "$GROUP"
-node "userspace/session-core/dist/__tests__/smoke/runner.js" "$GROUP"
+node "userspace/session-core/tests/smoke/runner.mjs" "$GROUP"

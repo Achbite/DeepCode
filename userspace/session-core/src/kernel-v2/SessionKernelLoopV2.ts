@@ -1,7 +1,14 @@
-import type { CapabilityScopePreviewReplyV2 } from '@deepcode/protocol';
+import type {
+  CapabilityScopePreviewReplyV2,
+  ControlEpochAdvancedReplyV2,
+} from '@deepcode/protocol';
 import {
   nextSessionKernelFactsQueryV2,
+  sessionKernelFactsCaughtUpV2,
 } from './lineage.js';
+import {
+  sessionKernelFactBarriersPendingV2,
+} from './factBarriers.js';
 import type {
   SessionKernelLoopPortsV2,
   SessionKernelStoredOperationResultRefV2,
@@ -119,7 +126,9 @@ export class SessionKernelLoopV2 {
           providerTurnId
         ),
         transitionBlocked: () =>
-          this.authorityTransitionActive || this.maintenanceActive,
+          this.authorityTransitionActive
+          || this.maintenanceActive
+          || this.pendingUserInputFences.size > 0,
         requireNoPendingRequests: () => this.requireNoPendingRequests(),
         requirePlanProjected: () => this.requirePlanProjected(),
         requirePlanAccepted: () => this.requireAcceptedPlan(),
@@ -474,6 +483,7 @@ export class SessionKernelLoopV2 {
   async persistUserInputBeforeFence(
     input: SessionUserInputRecordV2
   ): Promise<number> {
+    this.requireNoPendingUserInputTransition();
     const durableInput =
       await this.ports.persistence.loadInput(
         this.state.runId,
@@ -508,6 +518,7 @@ export class SessionKernelLoopV2 {
    * recovered with its exact persisted identity after the epoch advances.
    */
   fenceProviderForUserInput(): number {
+    this.requireNoPendingUserInputTransition();
     const providerFence = this.providers.supersedeForUserInput();
     const requestQuiescence = this.requests.supersedeForUserInput();
     this.pendingUserInputFences.add(providerFence.generation);
@@ -531,6 +542,8 @@ export class SessionKernelLoopV2 {
     generation: number
   ): Promise<void> {
     let transitionStarted = false;
+    let liveFence = false;
+    let transitionCompleted = false;
     try {
       if (!Number.isSafeInteger(generation) || generation < 1) {
         throw new SessionKernelLoopError(
@@ -545,6 +558,7 @@ export class SessionKernelLoopV2 {
           'User input transition does not match a live local fence.'
         );
       }
+      liveFence = true;
       await quiescence;
       this.beginAuthorityTransition();
       transitionStarted = true;
@@ -553,14 +567,16 @@ export class SessionKernelLoopV2 {
       await this.saveCheckpoint();
 
       await this.advancePendingInput(oldInvocationId);
-      await this.reconcileFactsInternal();
       await this.requests.replay('effect');
       await this.reconcileFactsInternal();
       await this.ensureInputProjected(input);
-      this.providers.releaseUserInputFence(generation);
+      transitionCompleted = true;
     } finally {
-      this.userInputQuiescence.delete(generation);
-      this.pendingUserInputFences.delete(generation);
+      if (liveFence && transitionCompleted) {
+        this.providers.releaseUserInputFence(generation);
+        this.userInputQuiescence.delete(generation);
+        this.pendingUserInputFences.delete(generation);
+      }
       if (transitionStarted) {
         this.authorityTransitionActive = false;
       }
@@ -742,6 +758,13 @@ export class SessionKernelLoopV2 {
         this.state,
         this.ports.clock.now()
       );
+      if (
+        this.state.review?.status === 'final'
+        && JSON.stringify(this.state.review)
+          === JSON.stringify(review)
+      ) {
+        return cloneJson(review);
+      }
       this.state.review = review;
       await this.saveCheckpoint();
       await this.project(
@@ -757,7 +780,8 @@ export class SessionKernelLoopV2 {
   }
 
   async recover(): Promise<void> {
-    this.beginMaintenance('recover');
+    let recovered = false;
+    this.beginMaintenance('recover', true);
     try {
       const oldInvocationId = activeInvocationId(this.state);
       if (this.state.pendingEpochInput) {
@@ -765,7 +789,6 @@ export class SessionKernelLoopV2 {
       } else {
         await this.requests.replay('control');
       }
-      await this.reconcileFactsInternal();
       await this.requests.replay('effect');
       await this.reconcileFactsInternal();
       await this.ensurePlanProjected();
@@ -775,7 +798,15 @@ export class SessionKernelLoopV2 {
       }
       await this.ensurePlanActionSettlementsProjected();
       await this.ports.projection.flushPending(this.state.runId);
+      recovered = true;
     } finally {
+      if (recovered) {
+        for (const generation of this.pendingUserInputFences) {
+          this.providers.releaseUserInputFence(generation);
+        }
+        this.pendingUserInputFences.clear();
+        this.userInputQuiescence.clear();
+      }
       this.endMaintenance();
     }
   }
@@ -783,7 +814,13 @@ export class SessionKernelLoopV2 {
   private async advancePendingInput(
     oldInvocationId?: string
   ): Promise<void> {
-    await this.requests.replay('control');
+    const replayed = await this.requests.replay('control');
+    if (replayed?.kind === 'controlEpochAdvance') {
+      await this.ensureEpochCancellation(
+        replayed.reply,
+        oldInvocationId
+      );
+    }
     const input = this.state.pendingEpochInput;
     if (!input) return;
     const outcome = await this.requests.execute(
@@ -803,6 +840,13 @@ export class SessionKernelLoopV2 {
       outcome,
       'controlEpochAdvance'
     ).reply;
+    await this.ensureEpochCancellation(reply, oldInvocationId);
+  }
+
+  private async ensureEpochCancellation(
+    reply: ControlEpochAdvancedReplyV2,
+    oldInvocationId?: string
+  ): Promise<void> {
     if (reply.cancellation.kind === 'none' && oldInvocationId) {
       await this.requests.execute(
         this.requests.newRecord({
@@ -885,6 +929,16 @@ export class SessionKernelLoopV2 {
     plan: SessionNaturalLanguagePlanV2
   ): Promise<void> {
     this.requireNoPendingRequests();
+    if (
+      this.state.kernelWakeHint
+      || !sessionKernelFactsCaughtUpV2(this.state.lineage)
+      || sessionKernelFactBarriersPendingV2(this.state)
+    ) {
+      throw new SessionKernelLoopError(
+        'session_kernel_plan_change_facts_pending',
+        'Plan cannot change before exact Kernel command facts are reconciled.'
+      );
+    }
     if (
       this.state.activeWait
       && this.state.activeWait.kind !== 'backpressure'
@@ -1063,11 +1117,18 @@ export class SessionKernelLoopV2 {
     this.authorityTransitionActive = true;
   }
 
-  private beginMaintenance(operation: string): void {
+  private beginMaintenance(
+    operation: string,
+    allowPendingUserInputRecovery = false
+  ): void {
     if (
       this.authorityTransitionActive
       || this.maintenanceActive
       || this.providers.isReserved()
+      || (
+        this.pendingUserInputFences.size > 0
+        && !allowPendingUserInputRecovery
+      )
     ) {
       throw new SessionKernelLoopError(
         'session_kernel_operation_concurrent',
@@ -1085,6 +1146,15 @@ export class SessionKernelLoopV2 {
     this.resolveMaintenanceQuiescence?.();
     this.resolveMaintenanceQuiescence = undefined;
     this.maintenanceQuiescence = Promise.resolve();
+  }
+
+  private requireNoPendingUserInputTransition(): void {
+    if (this.pendingUserInputFences.size > 0) {
+      throw new SessionKernelLoopError(
+        'session_kernel_user_input_recovery_required',
+        'The prior persisted user input transition must recover before another input can be fenced.'
+      );
+    }
   }
 
   private requireNoPendingRequests(): void {

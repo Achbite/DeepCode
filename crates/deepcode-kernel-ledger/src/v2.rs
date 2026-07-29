@@ -1,7 +1,13 @@
 use deepcode_kernel_abi::v2::{
-    query_digest_v2, AuthorizationFactV2, CleanupFactV2, CommandRequestDigestV2, CommandRequestId,
-    ControlFactV2, FactId, InvocationFactV2, KernelFactDraftV2, KernelFactEnvelopeV2,
-    KernelFactPayloadV2, RecordedAtV2, ResourceFactV2, RunId, FACT_STORE_SCHEMA_CONTRACT_V2,
+    query_digest_v2, validate_cross_language_safe_json_value_v2,
+    validate_cross_language_safe_u64_v2, AuthorizationFactV2, CancellationSourceV2, CleanupFactV2,
+    CommandRequestDigestV2, CommandRequestId, ControlFactV2, FactId, InvocationFactV2,
+    KernelFactDraftV2, KernelFactEnvelopeV2, KernelFactPayloadV2, MutationCommandResultV2,
+    RecordedAtV2, ResourceFactV2, RunId, FACT_STORE_SCHEMA_CONTRACT_V2,
+};
+use deepcode_kernel_abi::v2_command::{
+    ControlCancellationReplyV2, InvocationCancelReplyV2, InvocationPhaseV2, KernelErrorV2,
+    KernelReplyV2, MutationCommandKindV2, RecordedCommandErrorV2, ToolIntentSubmitReplyV2,
 };
 use deepcode_kernel_abi::{
     CapabilityLeaseIdV2, CapabilityLeaseRefV2, CapabilityLeaseVersionV2, CapabilityScopeDigestV2,
@@ -15,10 +21,11 @@ use rusqlite::{
 };
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -267,7 +274,26 @@ pub enum ConsumeFactQueryContinuationOutcomeV2 {
 #[derive(Debug, Clone)]
 enum DatabaseTarget {
     File(PathBuf),
-    SharedMemory(String),
+    SharedMemory { uri: String, access: Arc<Mutex<()>> },
+}
+
+struct QueryConnection<'a> {
+    connection: Connection,
+    _shared_memory_access: Option<MutexGuard<'a, ()>>,
+}
+
+impl Deref for QueryConnection<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.connection
+    }
+}
+
+impl DerefMut for QueryConnection<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.connection
+    }
 }
 
 impl DatabaseTarget {
@@ -280,7 +306,7 @@ impl DatabaseTarget {
                     | OpenFlags::SQLITE_OPEN_NO_MUTEX,
             )
             .map_err(|error| store_error("open_writer", error)),
-            Self::SharedMemory(uri) => Connection::open_with_flags(
+            Self::SharedMemory { uri, .. } => Connection::open_with_flags(
                 uri,
                 OpenFlags::SQLITE_OPEN_READ_WRITE
                     | OpenFlags::SQLITE_OPEN_CREATE
@@ -291,7 +317,8 @@ impl DatabaseTarget {
         }
     }
 
-    fn query_connection(&self) -> KernelResult<Connection> {
+    fn query_connection(&self) -> KernelResult<QueryConnection<'_>> {
+        let shared_memory_access = self.shared_memory_access();
         let connection = match self {
             Self::File(path) => Connection::open_with_flags(
                 path,
@@ -301,7 +328,7 @@ impl DatabaseTarget {
             // A named shared-cache memory database cannot be opened with SQLite's
             // READ_ONLY flag. query_only makes this independent connection
             // application-read-only while the writer connection keeps the database alive.
-            Self::SharedMemory(uri) => Connection::open_with_flags(
+            Self::SharedMemory { uri, .. } => Connection::open_with_flags(
                 uri,
                 OpenFlags::SQLITE_OPEN_READ_WRITE
                     | OpenFlags::SQLITE_OPEN_URI
@@ -318,11 +345,25 @@ impl DatabaseTarget {
         connection
             .pragma_update(None, "query_only", true)
             .map_err(|error| store_error("configure_query_only", error))?;
-        Ok(connection)
+        Ok(QueryConnection {
+            connection,
+            _shared_memory_access: shared_memory_access,
+        })
+    }
+
+    fn shared_memory_access(&self) -> Option<MutexGuard<'_, ()>> {
+        match self {
+            Self::File(_) => None,
+            Self::SharedMemory { access, .. } => Some(
+                access
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            ),
+        }
     }
 
     fn is_memory(&self) -> bool {
-        matches!(self, Self::SharedMemory(_))
+        matches!(self, Self::SharedMemory { .. })
     }
 }
 
@@ -469,7 +510,13 @@ impl CanonicalFactStore {
             "file:deepcode-kernel-v2-{}-{id}?mode=memory&cache=shared",
             std::process::id()
         );
-        Self::start(DatabaseTarget::SharedMemory(uri), true)
+        Self::start(
+            DatabaseTarget::SharedMemory {
+                uri,
+                access: Arc::new(Mutex::new(())),
+            },
+            true,
+        )
     }
 
     fn start(target: DatabaseTarget, initialize_schema: bool) -> KernelResult<Self> {
@@ -1127,6 +1174,7 @@ fn writer_main(
     receiver: Receiver<WriterCommand>,
     ready: SyncSender<KernelResult<()>>,
 ) {
+    let initialization_access = target.shared_memory_access();
     let mut connection = match target.writer_connection() {
         Ok(connection) => connection,
         Err(error) => {
@@ -1141,8 +1189,10 @@ fn writer_main(
     if ready.send(Ok(())).is_err() {
         return;
     }
+    drop(initialization_access);
 
     while let Ok(command) = receiver.recv() {
+        let _shared_memory_access = target.shared_memory_access();
         match command {
             WriterCommand::Append { drafts, response } => {
                 let _ = response.send(append_batch_transaction(&mut connection, drafts));
@@ -1923,6 +1973,17 @@ fn append_batch_in_transaction(
         )
         .map_err(|error| store_error("read_ledger_high_water", error))?;
     let mut next_ledger_sequence = sqlite_u64(global_high_water, "ledgerSequence")?;
+    let batch_len = u64::try_from(drafts.len()).map_err(|_| {
+        store_error_message(
+            "allocate_ledger_sequence",
+            "fact batch length exceeds the supported sequence range",
+        )
+    })?;
+    let final_ledger_sequence = next_ledger_sequence.checked_add(batch_len).ok_or_else(|| {
+        store_error_message("allocate_ledger_sequence", "ledger sequence overflow")
+    })?;
+    validate_cross_language_safe_u64_v2("ledgerSequence", final_ledger_sequence)
+        .map_err(|error| invalid_fact_error("allocate_ledger_sequence", error.to_string()))?;
     let recorded_at = transaction
         .query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')", [], |row| {
             row.get::<_, String>(0)
@@ -1932,29 +1993,43 @@ fn append_batch_in_transaction(
             RecordedAtV2::new(value)
                 .map_err(|error| invalid_fact_error("record_transaction_time", error.to_string()))
         })?;
+    let mut run_batch_counts = BTreeMap::<String, u64>::new();
+    for draft in &drafts {
+        let count = run_batch_counts
+            .entry(draft.payload.run_id().as_str().to_owned())
+            .or_default();
+        *count = count.checked_add(1).ok_or_else(|| {
+            store_error_message("allocate_run_sequence", "run fact batch length overflow")
+        })?;
+    }
     let mut run_high_waters = BTreeMap::<String, u64>::new();
+    for (run_id, batch_count) in run_batch_counts {
+        let high_water = transaction
+            .query_row(
+                "SELECT run_sequence_high_water FROM run_state WHERE run_id = ?1",
+                params![run_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|error| store_error("read_run_high_water", error))?
+            .map(|value| sqlite_u64(value, "runSequence"))
+            .transpose()?
+            .unwrap_or(0);
+        let final_run_sequence = high_water
+            .checked_add(batch_count)
+            .ok_or_else(|| store_error_message("allocate_run_sequence", "run sequence overflow"))?;
+        validate_cross_language_safe_u64_v2("runSequence", final_run_sequence)
+            .map_err(|error| invalid_fact_error("allocate_run_sequence", error.to_string()))?;
+        run_high_waters.insert(run_id, high_water);
+    }
     let mut envelopes = Vec::with_capacity(drafts.len());
 
     for draft in drafts {
         let run_id = draft.payload.run_id().as_str().to_string();
-        let run_high_water = match run_high_waters.get(&run_id) {
-            Some(high_water) => *high_water,
-            None => {
-                let high_water = transaction
-                    .query_row(
-                        "SELECT run_sequence_high_water FROM run_state WHERE run_id = ?1",
-                        params![run_id],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .optional()
-                    .map_err(|error| store_error("read_run_high_water", error))?
-                    .map(|value| sqlite_u64(value, "runSequence"))
-                    .transpose()?
-                    .unwrap_or(0);
-                run_high_waters.insert(run_id.clone(), high_water);
-                high_water
-            }
-        };
+        let run_high_water = run_high_waters
+            .get(&run_id)
+            .copied()
+            .ok_or_else(|| store_error_message("allocate_run_sequence", "run batch missing"))?;
         next_ledger_sequence = next_ledger_sequence.checked_add(1).ok_or_else(|| {
             store_error_message("allocate_ledger_sequence", "ledger sequence overflow")
         })?;
@@ -2175,6 +2250,13 @@ fn validate_authority_material_mutations(
                         "run-epoch transition requires a non-zero epoch and lifecycle set",
                     ));
                 }
+                validate_cross_language_safe_u64_v2("controlEpoch", *through_control_epoch)
+                    .map_err(|error| {
+                        invalid_fact_error(
+                            "validate_authority_material_mutation",
+                            error.to_string(),
+                        )
+                    })?;
                 for lifecycle in expected_lifecycles {
                     validate_authority_material_token("expectedLifecycle", lifecycle)?;
                 }
@@ -2210,12 +2292,16 @@ fn validate_authority_material_draft(material: &AuthorityMaterialDraftV2) -> Ker
             "controlEpoch must be greater than zero",
         ));
     }
+    validate_cross_language_safe_u64_v2("controlEpoch", material.control_epoch)
+        .map_err(|error| invalid_fact_error("validate_authority_material", error.to_string()))?;
     if !material.payload_json.is_object() {
         return Err(store_error_message(
             "validate_authority_material",
             "payloadJson must be an object",
         ));
     }
+    validate_cross_language_safe_json_value_v2("payloadJson", &material.payload_json)
+        .map_err(|error| invalid_fact_error("validate_authority_material", error.to_string()))?;
     if contains_ephemeral_capability(&material.payload_json) {
         return Err(store_error_message(
             "validate_authority_material",
@@ -2796,22 +2882,89 @@ fn put_public_command_receipt_in_transaction(
         return Ok(compare_public_command_receipt(existing, &receipt));
     }
 
+    validate_public_command_receipt_settlement(transaction, &mut receipt)?;
+    let encoded = serde_json::to_string(&receipt.reply_json)
+        .map_err(|error| store_error_message("encode_public_command_reply", error.to_string()))?;
+    transaction
+        .execute(
+            "INSERT INTO public_command_receipts (
+                 command_request_id, command_request_digest, command_kind, run_id,
+                 reply_json, settlement_fact_id, recorded_at
+             ) VALUES (
+                 ?1, ?2, ?3, ?4, ?5, ?6, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             )",
+            params![
+                receipt.command_request_id.as_str(),
+                receipt.command_request_digest.as_str(),
+                receipt.command_kind.as_str(),
+                receipt.run_id.as_ref().map(RunId::as_str),
+                encoded,
+                receipt.settlement_fact_id.as_ref().map(FactId::as_str),
+            ],
+        )
+        .map_err(|error| store_error("insert_public_command_receipt", error))?;
+    Ok(PutPublicCommandReceiptOutcomeV2::Inserted(receipt))
+}
+
+fn validate_public_command_receipt_settlement(
+    connection: &Connection,
+    receipt: &mut PublicCommandReceiptV2,
+) -> KernelResult<()> {
+    let mutation_kind = match receipt.command_kind.as_str() {
+        "toolIntentSubmit" => Some(MutationCommandKindV2::ToolIntentSubmit),
+        "controlEpochAdvance" => Some(MutationCommandKindV2::ControlEpochAdvance),
+        "invocationCancel" => Some(MutationCommandKindV2::InvocationCancel),
+        _ => None,
+    };
+    if mutation_kind.is_some() && receipt.settlement_fact_id.is_none() {
+        return Err(store_error_message(
+            "validate_public_command_receipt",
+            "mutation receipt requires its CommandRecorded settlement fact",
+        ));
+    }
     if let Some(settlement_fact_id) = &receipt.settlement_fact_id {
-        let settlement_json = transaction
-            .query_row(
-                "SELECT envelope_json FROM kernel_facts WHERE fact_id = ?1",
-                params![settlement_fact_id.as_str()],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(|error| store_error("read_receipt_settlement_fact", error))?
-            .ok_or_else(|| {
-                store_error_message(
+        let settlement = read_receipt_fact(
+            connection,
+            settlement_fact_id,
+            "read_receipt_settlement_fact",
+        )?;
+        if let Some(expected_command_kind) = mutation_kind {
+            let KernelFactPayloadV2::Control(ControlFactV2::CommandRecorded {
+                identity,
+                command_kind,
+                result,
+            }) = &settlement.payload
+            else {
+                return Err(store_error_message(
                     "validate_public_command_receipt",
-                    "settlementFactId does not identify a durable Kernel fact",
-                )
-            })?;
-        let settlement = decode_envelope(&settlement_json, "decode_receipt_settlement_fact")?;
+                    "mutation settlementFactId must identify its CommandRecorded fact",
+                ));
+            };
+            if command_kind != &expected_command_kind
+                || identity.command_request_identity.command_request_id
+                    != receipt.command_request_id
+                || identity.command_request_identity.command_request_digest
+                    != receipt.command_request_digest
+            {
+                return Err(store_error_message(
+                    "validate_public_command_receipt",
+                    "mutation receipt identity does not match its CommandRecorded fact",
+                ));
+            }
+            let expected_reply = serde_json::json!({
+                "kind": "kernel",
+                "data": {
+                    "reply": kernel_reply_for_mutation_result(result)
+                }
+            });
+            if receipt.reply_json != expected_reply {
+                return Err(store_error_message(
+                    "validate_public_command_receipt",
+                    "mutation receipt reply does not match its CommandRecorded result",
+                ));
+            }
+            validate_mutation_result_facts(connection, &settlement, result)?;
+        }
         if receipt.command_kind == "runOpen" {
             let KernelFactPayloadV2::Control(ControlFactV2::RunOpened {
                 public_request_id,
@@ -2851,28 +3004,415 @@ fn put_public_command_receipt_in_transaction(
             "runId is required for every durable public command receipt",
         ));
     }
+    Ok(())
+}
 
-    let encoded = serde_json::to_string(&receipt.reply_json)
-        .map_err(|error| store_error_message("encode_public_command_reply", error.to_string()))?;
-    transaction
-        .execute(
-            "INSERT INTO public_command_receipts (
-                 command_request_id, command_request_digest, command_kind, run_id,
-                 reply_json, settlement_fact_id, recorded_at
-             ) VALUES (
-                 ?1, ?2, ?3, ?4, ?5, ?6, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-             )",
-            params![
-                receipt.command_request_id.as_str(),
-                receipt.command_request_digest.as_str(),
-                receipt.command_kind.as_str(),
-                receipt.run_id.as_ref().map(RunId::as_str),
-                encoded,
-                receipt.settlement_fact_id.as_ref().map(FactId::as_str),
-            ],
+fn read_receipt_fact(
+    connection: &Connection,
+    fact_id: &FactId,
+    operation: &'static str,
+) -> KernelResult<KernelFactEnvelopeV2> {
+    let envelope_json = connection
+        .query_row(
+            "SELECT envelope_json FROM kernel_facts WHERE fact_id = ?1",
+            params![fact_id.as_str()],
+            |row| row.get::<_, String>(0),
         )
-        .map_err(|error| store_error("insert_public_command_receipt", error))?;
-    Ok(PutPublicCommandReceiptOutcomeV2::Inserted(receipt))
+        .optional()
+        .map_err(|error| store_error(operation, error))?
+        .ok_or_else(|| {
+            store_error_message(
+                "validate_public_command_receipt",
+                "receipt references a Kernel fact that is not durable",
+            )
+        })?;
+    decode_envelope(&envelope_json, operation)
+}
+
+fn kernel_reply_for_mutation_result(result: &MutationCommandResultV2) -> KernelReplyV2 {
+    match result {
+        MutationCommandResultV2::ToolIntentSubmission { reply } => {
+            KernelReplyV2::ToolIntentSubmission(reply.clone())
+        }
+        MutationCommandResultV2::EpochAdvance { reply } => {
+            KernelReplyV2::ControlEpochAdvanced(reply.clone())
+        }
+        MutationCommandResultV2::InvocationCancel { reply } => {
+            KernelReplyV2::InvocationCancelResult(reply.clone())
+        }
+        MutationCommandResultV2::RecordedSemanticError { error } => {
+            KernelReplyV2::Error(kernel_error_for_recorded_error(error))
+        }
+    }
+}
+
+fn kernel_error_for_recorded_error(error: &RecordedCommandErrorV2) -> KernelErrorV2 {
+    match error {
+        RecordedCommandErrorV2::ControlEpochAlreadyExists { run_id, current } => {
+            KernelErrorV2::ControlEpochAlreadyExists {
+                run_id: run_id.clone(),
+                current: *current,
+            }
+        }
+        RecordedCommandErrorV2::ControlEpochExhausted { run_id, current } => {
+            KernelErrorV2::ControlEpochExhausted {
+                run_id: run_id.clone(),
+                current: *current,
+            }
+        }
+        RecordedCommandErrorV2::StaleControlEpoch {
+            run_id,
+            submitted,
+            current,
+        } => KernelErrorV2::StaleControlEpoch {
+            run_id: run_id.clone(),
+            submitted: *submitted,
+            current: *current,
+        },
+        RecordedCommandErrorV2::InvocationNotFound {
+            run_id,
+            invocation_id,
+        } => KernelErrorV2::InvocationNotFound {
+            run_id: run_id.clone(),
+            invocation_id: invocation_id.clone(),
+        },
+        RecordedCommandErrorV2::InvocationNotOwnedByRun {
+            run_id,
+            invocation_id,
+        } => KernelErrorV2::InvocationNotOwnedByRun {
+            run_id: run_id.clone(),
+            invocation_id: invocation_id.clone(),
+        },
+    }
+}
+
+fn validate_mutation_result_facts(
+    connection: &Connection,
+    command: &KernelFactEnvelopeV2,
+    result: &MutationCommandResultV2,
+) -> KernelResult<()> {
+    match result {
+        MutationCommandResultV2::ToolIntentSubmission { reply } => match reply {
+            ToolIntentSubmitReplyV2::Admitted {
+                run_id,
+                operation_id,
+                accepted_control_epoch,
+                invocation_id,
+                attempt_id,
+                admission_fact_id,
+                admission_batch_high_water,
+                ..
+            } => {
+                let admission =
+                    read_receipt_fact(connection, admission_fact_id, "read_admission_fact")?;
+                let KernelFactPayloadV2::Invocation(InvocationFactV2::ToolIntentAdmitted {
+                    identity,
+                    ..
+                }) = &admission.payload
+                else {
+                    return Err(receipt_fact_mismatch(
+                        "admissionFactId must identify ToolIntentAdmitted",
+                    ));
+                };
+                if identity.run_id != *run_id
+                    || identity.control_epoch != *accepted_control_epoch
+                    || identity.operation_id != *operation_id
+                    || identity.invocation_id != *invocation_id
+                    || identity.attempt_id != *attempt_id
+                    || identity.causation_fact_id != command.fact_id
+                    || admission.ledger_sequence > *admission_batch_high_water
+                {
+                    return Err(receipt_fact_mismatch(
+                        "admitted reply does not match ToolIntentAdmitted identity",
+                    ));
+                }
+                require_batch_high_water(connection, run_id, *admission_batch_high_water)?;
+            }
+            ToolIntentSubmitReplyV2::AwaitingCapability {
+                run_id,
+                operation_id,
+                accepted_control_epoch,
+                invocation_id,
+                preview,
+                awaiting_fact_id,
+                awaiting_batch_high_water,
+            } => {
+                let awaiting =
+                    read_receipt_fact(connection, awaiting_fact_id, "read_awaiting_fact")?;
+                let KernelFactPayloadV2::Authorization(AuthorizationFactV2::CapabilityAwaiting {
+                    identity,
+                    preview_id,
+                    tool_id,
+                    canonical_arguments_digest,
+                    scope_digest,
+                    tool_contract_digest,
+                    context_ref,
+                }) = &awaiting.payload
+                else {
+                    return Err(receipt_fact_mismatch(
+                        "awaitingFactId must identify CapabilityAwaiting",
+                    ));
+                };
+                if identity.run_id != *run_id
+                    || identity.control_epoch != *accepted_control_epoch
+                    || identity.operation_id != *operation_id
+                    || identity.invocation_id != *invocation_id
+                    || identity.plan_revision != preview.plan_revision
+                    || identity.plan_action_id != preview.plan_action_id
+                    || preview_id != &preview.preview_id
+                    || tool_id != &preview.tool_id
+                    || canonical_arguments_digest != &preview.canonical_arguments_digest
+                    || scope_digest != &preview.scope_digest
+                    || tool_contract_digest != &preview.tool_contract_digest
+                    || context_ref != &preview.context_ref
+                    || awaiting.ledger_sequence != *awaiting_batch_high_water
+                {
+                    return Err(receipt_fact_mismatch(
+                        "awaiting reply does not match CapabilityAwaiting identity",
+                    ));
+                }
+            }
+            ToolIntentSubmitReplyV2::Rejected { .. } => {
+                if command.fact_id
+                    != match reply {
+                        ToolIntentSubmitReplyV2::Rejected {
+                            rejection_fact_id, ..
+                        } => rejection_fact_id.clone(),
+                        _ => unreachable!(),
+                    }
+                {
+                    return Err(receipt_fact_mismatch(
+                        "rejected reply must bind the CommandRecorded fact",
+                    ));
+                }
+            }
+        },
+        MutationCommandResultV2::EpochAdvance { reply } => {
+            let epoch =
+                read_receipt_fact(connection, &reply.epoch_fact_id, "read_epoch_advanced_fact")?;
+            let KernelFactPayloadV2::Control(ControlFactV2::EpochAdvanced { identity, .. }) =
+                &epoch.payload
+            else {
+                return Err(receipt_fact_mismatch(
+                    "epochFactId must identify EpochAdvanced",
+                ));
+            };
+            if identity.run_id != reply.run_id
+                || identity.control_epoch != reply.accepted_control_epoch
+                || identity.causation_fact_id != command.fact_id
+            {
+                return Err(receipt_fact_mismatch(
+                    "epoch reply does not match EpochAdvanced identity",
+                ));
+            }
+            match &reply.cancellation {
+                ControlCancellationReplyV2::Requested {
+                    cancel_request_id,
+                    invocation_id,
+                    cancellation_fact_id,
+                } => {
+                    let cancellation = validate_cancellation_fact(
+                        connection,
+                        cancellation_fact_id,
+                        &reply.run_id,
+                        cancel_request_id,
+                        invocation_id,
+                    )?;
+                    let KernelFactPayloadV2::Control(ControlFactV2::CancellationRequested {
+                        identity,
+                        source,
+                        ..
+                    }) = &cancellation.payload
+                    else {
+                        unreachable!()
+                    };
+                    if identity.control_epoch != reply.accepted_control_epoch
+                        || identity.causation_fact_id != reply.epoch_fact_id
+                        || source != &CancellationSourceV2::EpochAdvance
+                        || cancellation.ledger_sequence != reply.command_batch_high_water
+                    {
+                        return Err(receipt_fact_mismatch(
+                            "epoch cancellation does not match the advanced epoch",
+                        ));
+                    }
+                }
+                ControlCancellationReplyV2::AlreadyRequested {
+                    cancel_request_id,
+                    invocation_id,
+                    cancellation_fact_id,
+                } => {
+                    validate_cancellation_fact(
+                        connection,
+                        cancellation_fact_id,
+                        &reply.run_id,
+                        cancel_request_id,
+                        invocation_id,
+                    )?;
+                    if epoch.ledger_sequence != reply.command_batch_high_water {
+                        return Err(receipt_fact_mismatch(
+                            "epoch high-water must end at EpochAdvanced when cancellation already exists",
+                        ));
+                    }
+                }
+                ControlCancellationReplyV2::None {} => {
+                    if epoch.ledger_sequence != reply.command_batch_high_water {
+                        return Err(receipt_fact_mismatch(
+                            "epoch high-water must end at EpochAdvanced without cancellation",
+                        ));
+                    }
+                }
+            }
+        }
+        MutationCommandResultV2::InvocationCancel { reply } => match reply {
+            InvocationCancelReplyV2::Requested {
+                cancel_request_id,
+                invocation_id,
+                fact_id,
+                ledger_sequence,
+            } => {
+                let cancellation = validate_cancellation_fact(
+                    connection,
+                    fact_id,
+                    command.payload.run_id(),
+                    cancel_request_id,
+                    invocation_id,
+                )?;
+                let KernelFactPayloadV2::Control(ControlFactV2::CancellationRequested {
+                    identity,
+                    source,
+                    ..
+                }) = &cancellation.payload
+                else {
+                    unreachable!()
+                };
+                if identity.causation_fact_id != command.fact_id
+                    || source != &CancellationSourceV2::ExplicitCommand
+                    || cancellation.ledger_sequence != *ledger_sequence
+                {
+                    return Err(receipt_fact_mismatch(
+                        "requested cancellation does not match its canonical fact",
+                    ));
+                }
+            }
+            InvocationCancelReplyV2::AlreadyRequested {
+                cancel_request_id,
+                invocation_id,
+                fact_id,
+                ledger_sequence,
+            } => {
+                let cancellation = validate_cancellation_fact(
+                    connection,
+                    fact_id,
+                    command.payload.run_id(),
+                    cancel_request_id,
+                    invocation_id,
+                )?;
+                if cancellation.ledger_sequence != *ledger_sequence {
+                    return Err(receipt_fact_mismatch(
+                        "existing cancellation ledger sequence does not match its fact",
+                    ));
+                }
+            }
+            InvocationCancelReplyV2::NoActiveInvocation { .. } => {}
+            InvocationCancelReplyV2::AlreadyTerminal {
+                invocation_id,
+                terminal_fact_id,
+                terminal_phase,
+            } => {
+                let terminal =
+                    read_receipt_fact(connection, terminal_fact_id, "read_terminal_fact")?;
+                if terminal.payload.run_id() != command.payload.run_id()
+                    || terminal.payload.invocation_id() != Some(invocation_id)
+                    || terminal_invocation_phase(&terminal.payload) != Some(*terminal_phase)
+                {
+                    return Err(receipt_fact_mismatch(
+                        "terminal cancellation reply does not match its terminal fact",
+                    ));
+                }
+            }
+        },
+        MutationCommandResultV2::RecordedSemanticError { .. } => {}
+    }
+    Ok(())
+}
+
+fn validate_cancellation_fact(
+    connection: &Connection,
+    fact_id: &FactId,
+    run_id: &RunId,
+    cancel_request_id: &deepcode_kernel_abi::v2::CancelRequestId,
+    invocation_id: &deepcode_kernel_abi::v2::InvocationId,
+) -> KernelResult<KernelFactEnvelopeV2> {
+    let cancellation = read_receipt_fact(connection, fact_id, "read_cancellation_fact")?;
+    let KernelFactPayloadV2::Control(ControlFactV2::CancellationRequested { identity, .. }) =
+        &cancellation.payload
+    else {
+        return Err(receipt_fact_mismatch(
+            "cancellation fact reference must identify CancellationRequested",
+        ));
+    };
+    if &identity.run_id != run_id
+        || &identity.cancel_request_id != cancel_request_id
+        || &identity.invocation_id != invocation_id
+    {
+        return Err(receipt_fact_mismatch(
+            "cancellation reply identity does not match its canonical fact",
+        ));
+    }
+    Ok(cancellation)
+}
+
+fn terminal_invocation_phase(payload: &KernelFactPayloadV2) -> Option<InvocationPhaseV2> {
+    match payload {
+        KernelFactPayloadV2::Invocation(InvocationFactV2::ToolFailedBeforeEffect { .. }) => {
+            Some(InvocationPhaseV2::FailedBeforeEffect)
+        }
+        KernelFactPayloadV2::Invocation(InvocationFactV2::ToolCancelledBeforeEffect { .. }) => {
+            Some(InvocationPhaseV2::CancelledBeforeEffect)
+        }
+        KernelFactPayloadV2::Invocation(InvocationFactV2::ToolTimedOutBeforeEffect { .. }) => {
+            Some(InvocationPhaseV2::TimedOutBeforeEffect)
+        }
+        KernelFactPayloadV2::Invocation(InvocationFactV2::ToolCompleted { .. }) => {
+            Some(InvocationPhaseV2::Completed)
+        }
+        KernelFactPayloadV2::Invocation(InvocationFactV2::ToolFailedAfterObservedEffect {
+            ..
+        }) => Some(InvocationPhaseV2::FailedAfterObservedEffect),
+        KernelFactPayloadV2::Invocation(InvocationFactV2::ToolIndeterminate { .. }) => {
+            Some(InvocationPhaseV2::Indeterminate)
+        }
+        _ => None,
+    }
+}
+
+fn require_batch_high_water(
+    connection: &Connection,
+    run_id: &RunId,
+    high_water: u64,
+) -> KernelResult<()> {
+    let high_water = i64::try_from(high_water).map_err(|_| {
+        receipt_fact_mismatch("reply batch high-water exceeds SQLite integer range")
+    })?;
+    let exists = connection
+        .query_row(
+            "SELECT 1 FROM kernel_facts WHERE ledger_sequence = ?1 AND run_id = ?2",
+            params![high_water, run_id.as_str()],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|error| store_error("read_receipt_batch_high_water", error))?
+        .is_some();
+    if !exists {
+        return Err(receipt_fact_mismatch(
+            "reply batch high-water does not identify a fact in its run",
+        ));
+    }
+    Ok(())
+}
+
+fn receipt_fact_mismatch(message: &str) -> KernelError {
+    store_error_message("validate_public_command_receipt", message)
 }
 
 fn compare_public_command_receipt(
@@ -2916,7 +3456,7 @@ fn read_public_command_receipt(
     let Some((digest, command_kind, run_id, reply_json, settlement_fact_id)) = row else {
         return Ok(None);
     };
-    let receipt =
+    let mut receipt =
         PublicCommandReceiptV2 {
             command_request_id: command_request_id.clone(),
             command_request_digest: CommandRequestDigestV2::parse(digest).map_err(|error| {
@@ -2934,6 +3474,7 @@ fn read_public_command_receipt(
             )?,
         };
     validate_public_command_receipt(&receipt)?;
+    validate_public_command_receipt_settlement(connection, &mut receipt)?;
     Ok(Some(receipt))
 }
 
@@ -2956,6 +3497,9 @@ fn validate_public_command_receipt(receipt: &PublicCommandReceiptV2) -> KernelRe
             "replyJson must be an object",
         ));
     }
+    validate_cross_language_safe_json_value_v2("replyJson", &receipt.reply_json).map_err(
+        |error| store_error_message("validate_public_command_receipt", error.to_string()),
+    )?;
     if contains_ephemeral_capability(&receipt.reply_json) {
         return Err(store_error_message(
             "validate_public_command_receipt",
@@ -3020,6 +3564,14 @@ fn put_fact_query_continuation_transaction(
     connection: &mut Connection,
     continuation: FactQueryContinuationDraftV2,
 ) -> KernelResult<PutFactQueryContinuationOutcomeV2> {
+    validate_cross_language_safe_u64_v2("snapshotHighWater", continuation.snapshot_high_water)
+        .map_err(|error| {
+            invalid_fact_error("validate_fact_query_continuation", error.to_string())
+        })?;
+    validate_cross_language_safe_u64_v2("afterLedgerSequence", continuation.after_ledger_sequence)
+        .map_err(|error| {
+            invalid_fact_error("validate_fact_query_continuation", error.to_string())
+        })?;
     if continuation.after_ledger_sequence > continuation.snapshot_high_water {
         return Err(store_error_message(
             "validate_fact_query_continuation",
@@ -3210,6 +3762,10 @@ fn resolve_fact_query_continuation(
     token: &FactQueryContinuationV2,
     expected: &FactQueryContinuationExpectationV2,
 ) -> KernelResult<ResolveFactQueryContinuationOutcomeV2> {
+    validate_cross_language_safe_u64_v2("afterLedgerSequence", expected.after_ledger_sequence)
+        .map_err(|error| {
+            invalid_fact_error("resolve_fact_query_continuation", error.to_string())
+        })?;
     let token_hash = continuation_token_hash(token)?;
     let Some(stored) = read_fact_query_continuation(connection, &token_hash)? else {
         return Ok(ResolveFactQueryContinuationOutcomeV2::NotFound);
@@ -3241,6 +3797,10 @@ fn consume_fact_query_continuation_transaction(
     expected: FactQueryContinuationExpectationV2,
     consumer: FactQueryContinuationConsumerV2,
 ) -> KernelResult<ConsumeFactQueryContinuationOutcomeV2> {
+    validate_cross_language_safe_u64_v2("afterLedgerSequence", expected.after_ledger_sequence)
+        .map_err(|error| {
+            invalid_fact_error("consume_fact_query_continuation", error.to_string())
+        })?;
     let token_hash = continuation_token_hash(&token)?;
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -3360,13 +3920,18 @@ fn read_fact_query_continuation(
     let decode_error = |error: deepcode_kernel_abi::v2::V2ValidationError| {
         invalid_fact_error("decode_fact_query_continuation", error.to_string())
     };
-    Ok(Some(DurableFactQueryContinuationV2 {
+    let continuation = DurableFactQueryContinuationV2 {
         run_id: RunId::new(run_id).map_err(&decode_error)?,
         snapshot_high_water: sqlite_u64(snapshot_high_water, "snapshotHighWater")?,
         after_ledger_sequence: sqlite_u64(after_ledger_sequence, "afterLedgerSequence")?,
         created_at: RecordedAtV2::new(created_at).map_err(&decode_error)?,
         expires_at: RecordedAtV2::new(expires_at).map_err(&decode_error)?,
-    }))
+    };
+    validate_cross_language_safe_u64_v2("snapshotHighWater", continuation.snapshot_high_water)
+        .map_err(|error| invalid_fact_error("decode_fact_query_continuation", error.to_string()))?;
+    validate_cross_language_safe_u64_v2("afterLedgerSequence", continuation.after_ledger_sequence)
+        .map_err(|error| invalid_fact_error("decode_fact_query_continuation", error.to_string()))?;
+    Ok(Some(continuation))
 }
 
 fn durable_continuation_matches_draft(
@@ -3773,7 +4338,10 @@ fn high_water_with_connection(connection: &Connection) -> KernelResult<u64> {
             |row| row.get::<_, i64>(0),
         )
         .map_err(|error| store_error("read_ledger_high_water", error))?;
-    sqlite_u64(value, "ledgerSequence")
+    let value = sqlite_u64(value, "ledgerSequence")?;
+    validate_cross_language_safe_u64_v2("ledgerSequence", value)
+        .map_err(|error| invalid_fact_error("read_ledger_high_water", error.to_string()))?;
+    Ok(value)
 }
 
 fn run_high_waters_with_connection(
@@ -3795,10 +4363,13 @@ fn run_high_waters_with_connection(
     for row in rows {
         let (run_id, high_water) =
             row.map_err(|error| store_error("read_run_high_water", error))?;
+        let high_water = sqlite_u64(high_water, "runSequence")?;
+        validate_cross_language_safe_u64_v2("runSequence", high_water)
+            .map_err(|error| invalid_fact_error("read_run_high_water", error.to_string()))?;
         high_waters.push(RunSequenceHighWater {
             run_id: RunId::new(run_id)
                 .map_err(|error| invalid_fact_error("read_run_high_water", error.to_string()))?,
-            run_sequence_high_water: sqlite_u64(high_water, "runSequence")?,
+            run_sequence_high_water: high_water,
         });
     }
     Ok(high_waters)

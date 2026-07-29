@@ -1,4 +1,7 @@
 export const SESSION_KERNEL_FACT_KINDS_V2 = Object.freeze({
+  control: Object.freeze({
+    commandRecorded: 'commandRecorded',
+  }),
   authorization: Object.freeze({
     capabilityIssued: 'capabilityIssued',
     capabilityDenied: 'capabilityDenied',
@@ -6,9 +9,11 @@ export const SESSION_KERNEL_FACT_KINDS_V2 = Object.freeze({
     expansionDenied: 'expansionDenied',
     scopePreviewed: 'scopePreviewed',
     contextInvalidated: 'contextInvalidated',
+    leaseRevoked: 'leaseRevoked',
+    leaseSuperseded: 'leaseSuperseded',
   }),
   invocation: Object.freeze({
-    rejected: 'rejected',
+    admitted: 'toolIntentAdmitted',
     completed: 'toolCompleted',
     failedBeforeEffect: 'toolFailedBeforeEffect',
     cancelledBeforeEffect: 'toolCancelledBeforeEffect',

@@ -31,11 +31,11 @@ use deepcode_kernel_abi::v2::{
 use deepcode_kernel_abi::v2_command::{
     ControlCancellationReplyV2, ControlEpochAdvanceV2, ControlEpochAdvancedReplyV2,
     DeadlineRequestV2, EpochPreconditionV2, InvalidFieldViolationV2, InvalidRequestReasonV2,
-    InvocationCancelReplyV2, InvocationCancelV2, KernelErrorV2, KernelReplyV2,
-    MutationCommandKindV2, RecordedCommandErrorV2, StorageFaultCodeV2, ToolIntentSubmitReplyV2,
+    InvocationCancelReplyV2, InvocationCancelV2, KernelErrorV2, MutationCommandKindV2,
+    RecordedCommandErrorV2, StorageFaultCodeV2, ToolIntentSubmitReplyV2,
 };
 use deepcode_kernel_abi::ToolIdV2;
-use deepcode_kernel_abi::{CanonicalArgumentsDigestV2, ToolContractDigestV2};
+use deepcode_kernel_abi::{CanonicalArgumentsDigestV2, KernelError, ToolContractDigestV2};
 use deepcode_kernel_tools::kernel_internal::{
     measure_kernel_output_payload, normalize_canonical_platform_path,
     validate_canonical_invocation, KernelCanonicalInvocation, KernelDeleteTarget,
@@ -63,11 +63,6 @@ pub(super) enum TargetResolutionFailure {
     ResolverUnavailable,
     SymlinkPolicyViolation,
     WrongObjectKind,
-}
-
-pub(super) enum RunCommandCheck {
-    Current(RunRecord),
-    Recorded(KernelReplyV2),
 }
 
 pub(super) const fn exact_epoch(control_epoch: ControlEpoch) -> CommandEpochContextV2 {
@@ -111,6 +106,25 @@ pub(super) fn invalid_field(
             field_path: field_path.into(),
             violation,
         },
+    }
+}
+
+pub(super) fn prepare_failure_error(
+    field_path: impl Into<String>,
+    failure: PrepareFailure,
+) -> KernelErrorV2 {
+    match failure {
+        PrepareFailure::Kernel(error) => error,
+        PrepareFailure::Target(TargetResolutionFailure::ResolverUnavailable) => storage_fault(),
+        PrepareFailure::Target(TargetResolutionFailure::SymlinkPolicyViolation) => {
+            invalid_field(field_path, InvalidFieldViolationV2::PathEscapesWorkspace)
+        }
+        PrepareFailure::Target(
+            TargetResolutionFailure::AlreadyExists
+            | TargetResolutionFailure::NetworkTargetRejected
+            | TargetResolutionFailure::NotFound
+            | TargetResolutionFailure::WrongObjectKind,
+        ) => invalid_field(field_path, InvalidFieldViolationV2::OutOfRange),
     }
 }
 
@@ -219,10 +233,19 @@ pub(super) fn plan_epoch_advance(
             },
         });
     };
+    let Ok(new_epoch) = ControlEpoch::new(next) else {
+        return Ok(EpochAdvancePlan::Recorded {
+            current_epoch: run.epoch,
+            error: RecordedCommandErrorV2::ControlEpochExhausted {
+                run_id: run_id.clone(),
+                current: run.epoch,
+            },
+        });
+    };
     Ok(EpochAdvancePlan::Ready {
         epoch_context: exact_epoch(run.epoch),
         previous_epoch: Some(run.epoch),
-        new_epoch: ControlEpoch::new(next).expect("checked non-zero epoch"),
+        new_epoch,
     })
 }
 
@@ -1980,8 +2003,14 @@ fn resolve_network_target(url: &str) -> Result<ResolvedNetwork, PrepareFailure> 
             TargetResolutionFailure::NetworkTargetRejected,
         ));
     }
-    let reviewed = review_http_target(url)
-        .map_err(|_| PrepareFailure::Target(TargetResolutionFailure::NetworkTargetRejected))?;
+    let reviewed = review_http_target(url).map_err(|error| {
+        PrepareFailure::Target(match error {
+            KernelError::InvalidCommand(_) | KernelError::PermissionDenied(_) => {
+                TargetResolutionFailure::NetworkTargetRejected
+            }
+            _ => TargetResolutionFailure::ResolverUnavailable,
+        })
+    })?;
     if reviewed
         .resolved_addresses
         .iter()

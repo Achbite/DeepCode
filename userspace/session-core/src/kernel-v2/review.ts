@@ -3,9 +3,13 @@ import {
   sha256Hash,
 } from '../cache/canonicalizer.js';
 import { sessionKernelFactsCaughtUpV2 } from './lineage.js';
+import {
+  sessionKernelFactBarriersPendingV2,
+} from './factBarriers.js';
 import type { SessionKernelLoopStateV2 } from './state.js';
-import type {
-  SessionKernelReviewV2,
+import {
+  SESSION_KERNEL_REVIEW_PROJECTION_V2,
+  type SessionKernelReviewV2,
   SessionReviewFactCategoryAccumulatorV2,
   SessionReviewFactCoverageV2,
   SessionReviewPlannedActionV2,
@@ -20,21 +24,30 @@ export function buildSessionKernelReviewV2(
   state: SessionKernelLoopStateV2,
   createdAt: string
 ): SessionKernelReviewV2 {
-  if (!sessionKernelFactsCaughtUpV2(state.lineage)) {
+  if (
+    state.kernelWakeHint
+    || !sessionKernelFactsCaughtUpV2(state.lineage)
+    || sessionKernelFactBarriersPendingV2(state)
+  ) {
     throw new SessionKernelReviewError(
       'session_kernel_review_snapshot_incomplete',
-      'Review requires a fully reconciled Kernel snapshot.'
+      'Review requires a fully reconciled Kernel snapshot with every exact command fact observed.'
     );
   }
   const snapshotHighWater = state.lineage.cursor.snapshotHighWater;
   const planActionSettlementDigest = sha256Hash(canonicalJson(
-    Object.values(state.planActionSettlements).sort(
-      (left, right) =>
-        left.planActionId.localeCompare(right.planActionId)
-    )
+    {
+      projectionVersion: SESSION_KERNEL_REVIEW_PROJECTION_V2,
+      settlements: Object.values(state.planActionSettlements).sort(
+        (left, right) =>
+          left.planActionId.localeCompare(right.planActionId)
+      ),
+    }
   ));
   if (
     state.review
+    && state.review.projectionVersion
+      === SESSION_KERNEL_REVIEW_PROJECTION_V2
     && state.review.snapshotHighWater === snapshotHighWater
     && state.review.planRevision === state.plan?.planRevision
     && JSON.stringify(state.review.planDecision)
@@ -46,7 +59,14 @@ export function buildSessionKernelReviewV2(
   }
   const planned = plannedActions(state);
   const reviewFacts = state.reviewFacts;
+  const observedCurrentPlanActions =
+    state.plan?.planRevision
+      ? reviewFacts.observedEffectPlanActions[
+          state.plan.planRevision
+        ] ?? {}
+      : {};
   return {
+    projectionVersion: SESSION_KERNEL_REVIEW_PROJECTION_V2,
     revision: (state.review?.revision ?? 0) + 1,
     status: 'draft',
     ...(state.plan?.planRevision
@@ -72,10 +92,7 @@ export function buildSessionKernelReviewV2(
     actualEffects: cloneJson(reviewFacts.actualEffects.samples),
     unexecuted: planned.filter(
       (action) =>
-        !sessionKernelPlanActionSettledV2(
-          state,
-          action.planActionId
-        )
+        !observedCurrentPlanActions[action.planActionId]
     ),
     denied: cloneJson(reviewFacts.denied.samples),
     rejections: cloneJson(reviewFacts.rejections.samples),
@@ -129,10 +146,12 @@ export function canFinalizeSessionKernelReviewV2(
     !state.plan
     || state.planDecision?.planRevision !== state.plan.planRevision
     || state.planDecision.decision !== 'accept'
+    || state.kernelWakeHint
     || !sessionKernelFactsCaughtUpV2(state.lineage)
     || state.activeWait
     || state.providerTurn?.status === 'active'
     || Object.keys(state.publicRequests).length > 0
+    || sessionKernelFactBarriersPendingV2(state)
     || state.pendingGuidance.length > 0
   ) {
     return false;
@@ -163,6 +182,9 @@ export function finalizeSessionKernelReviewV2(
     );
   }
   const draft = buildSessionKernelReviewV2(state, finalizedAt);
+  if (draft.status === 'final') {
+    return draft;
+  }
   return {
     ...draft,
     status: 'final',

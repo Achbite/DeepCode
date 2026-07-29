@@ -513,6 +513,54 @@ export class KernelV2WireError extends Error {
   }
 }
 
+export function decodeKernelCommandEnvelopeV2(
+  value: unknown
+): KernelCommandEnvelopeV2 {
+  const data = exactRecord(
+    value,
+    ['abiVersion', 'requestId', 'command'],
+    'Kernel v2 command envelope'
+  );
+  requireAbi(data.abiVersion);
+  return {
+    abiVersion: KERNEL_ABI_V2_VERSION,
+    requestId: identity(data.requestId, 'requestId'),
+    command: decodeKernelCommandV2(data.command),
+  };
+}
+
+export function decodeToolIntentV2(value: unknown): ToolIntentV2 {
+  const data = exactRecord(
+    value,
+    [
+      'runId',
+      'expectedControlEpoch',
+      'operationId',
+      'idempotencyKey',
+      'toolId',
+      'rawArguments',
+      'authority',
+      'deadline',
+      'toolContextRef',
+    ],
+    'ToolIntent'
+  );
+  return {
+    runId: identity(data.runId, 'runId'),
+    expectedControlEpoch: positiveInteger(
+      data.expectedControlEpoch,
+      'expectedControlEpoch'
+    ),
+    operationId: identity(data.operationId, 'operationId'),
+    idempotencyKey: wireText(data.idempotencyKey, 'idempotencyKey'),
+    toolId: toolId(data.toolId),
+    rawArguments: decodeRawToolArgumentsV2(data.rawArguments),
+    authority: decodeToolIntentAuthority(data.authority),
+    deadline: decodeDeadlineRequest(data.deadline),
+    toolContextRef: decodeContextRef(data.toolContextRef),
+  };
+}
+
 export function decodeKernelCommandResponseEnvelopeV2(
   value: unknown
 ): KernelCommandResponseEnvelopeV2 {
@@ -623,6 +671,398 @@ export function isJsonObjectV2(value: unknown): value is JsonObjectV2 {
     && typeof value === 'object'
     && !Array.isArray(value)
     && Object.values(value as Record<string, unknown>).every(isJsonValue);
+}
+
+function decodeKernelCommandV2(value: unknown): KernelCommandV2 {
+  const command = tagged(value, 'Kernel v2 command');
+  switch (command.kind) {
+    case 'runOpen':
+      return { kind: command.kind, data: decodeRunOpen(command.data) };
+    case 'toolContextGet':
+      return {
+        kind: command.kind,
+        data: decodeToolContextGet(command.data),
+      };
+    case 'capabilityScopePreview':
+      return {
+        kind: command.kind,
+        data: decodeCapabilityScopePreview(command.data),
+      };
+    case 'toolIntentSubmit':
+      return {
+        kind: command.kind,
+        data: decodeToolIntentV2(command.data),
+      };
+    case 'kernelFactsQueryScoped':
+      return {
+        kind: command.kind,
+        data: decodeKernelFactsQueryScoped(command.data),
+      };
+    case 'controlEpochAdvance':
+      return {
+        kind: command.kind,
+        data: decodeControlEpochAdvance(command.data),
+      };
+    case 'invocationCancel':
+      return {
+        kind: command.kind,
+        data: decodeInvocationCancel(command.data),
+      };
+    default:
+      throw new KernelV2WireError(
+        `Unsupported Kernel command kind ${command.kind}.`
+      );
+  }
+}
+
+function decodeRunOpen(value: unknown): RunOpenV2 {
+  const data = exactRecord(
+    value,
+    ['workspaceBindingRef', 'inputId', 'opaqueInputRef'],
+    'RunOpen command'
+  );
+  return {
+    workspaceBindingRef: identity(
+      data.workspaceBindingRef,
+      'workspaceBindingRef'
+    ),
+    inputId: identity(data.inputId, 'inputId'),
+    opaqueInputRef: wireText(data.opaqueInputRef, 'opaqueInputRef'),
+  };
+}
+
+function decodeToolContextGet(value: unknown): ToolContextGetV2 {
+  const data = exactRecord(
+    value,
+    ['runId', 'knownContext'],
+    'ToolContextGet command',
+    ['knownContext']
+  );
+  return {
+    runId: identity(data.runId, 'runId'),
+    ...(data.knownContext != null
+      ? { knownContext: decodeContextRef(data.knownContext) }
+      : {}),
+  };
+}
+
+function decodeCapabilityScopePreview(
+  value: unknown
+): CapabilityScopePreviewV2 {
+  const data = exactRecord(
+    value,
+    [
+      'runId',
+      'expectedControlEpoch',
+      'planRevision',
+      'planActionId',
+      'operationId',
+      'idempotencyKey',
+      'toolId',
+      'rawArguments',
+      'requestedResources',
+      'deadline',
+      'toolContextRef',
+    ],
+    'CapabilityScopePreview command'
+  );
+  const requestedResources = array(
+    data.requestedResources,
+    'requestedResources'
+  ).map(decodeRequestedResource);
+  if (requestedResources.length === 0 || requestedResources.length > 256) {
+    throw new KernelV2WireError(
+      'requestedResources must contain 1..=256 entries.'
+    );
+  }
+  return {
+    runId: identity(data.runId, 'runId'),
+    expectedControlEpoch: positiveInteger(
+      data.expectedControlEpoch,
+      'expectedControlEpoch'
+    ),
+    planRevision: identity(data.planRevision, 'planRevision'),
+    planActionId: identity(data.planActionId, 'planActionId'),
+    operationId: identity(data.operationId, 'operationId'),
+    idempotencyKey: wireText(data.idempotencyKey, 'idempotencyKey'),
+    toolId: toolId(data.toolId),
+    rawArguments: decodeRawToolArgumentsV2(data.rawArguments),
+    requestedResources,
+    deadline: decodeDeadlineRequest(data.deadline),
+    toolContextRef: decodeContextRef(data.toolContextRef),
+  };
+}
+
+function decodeKernelFactsQueryScoped(
+  value: unknown
+): KernelFactsQueryScopedV2 {
+  const data = exactRecord(
+    value,
+    ['runId', 'afterLedgerSequence', 'limit', 'continuation'],
+    'KernelFactsQueryScoped command',
+    ['continuation']
+  );
+  const limit = positiveInteger(data.limit, 'limit');
+  if (limit > 1000) {
+    throw new KernelV2WireError('limit must not exceed 1000.');
+  }
+  return {
+    runId: identity(data.runId, 'runId'),
+    afterLedgerSequence: nonNegativeInteger(
+      data.afterLedgerSequence,
+      'afterLedgerSequence'
+    ),
+    limit,
+    ...(data.continuation != null
+      ? { continuation: identity(data.continuation, 'continuation') }
+      : {}),
+  };
+}
+
+function decodeControlEpochAdvance(value: unknown): ControlEpochAdvanceV2 {
+  const data = exactRecord(
+    value,
+    ['runId', 'precondition', 'inputId', 'opaqueInputRef'],
+    'ControlEpochAdvance command'
+  );
+  return {
+    runId: identity(data.runId, 'runId'),
+    precondition: decodeEpochPrecondition(data.precondition),
+    inputId: identity(data.inputId, 'inputId'),
+    opaqueInputRef: wireText(data.opaqueInputRef, 'opaqueInputRef'),
+  };
+}
+
+function decodeInvocationCancel(value: unknown): InvocationCancelV2 {
+  const data = exactRecord(
+    value,
+    [
+      'runId',
+      'expectedControlEpoch',
+      'target',
+      'reasonCode',
+      'reason',
+    ],
+    'InvocationCancel command',
+    ['reason']
+  );
+  return {
+    runId: identity(data.runId, 'runId'),
+    expectedControlEpoch: positiveInteger(
+      data.expectedControlEpoch,
+      'expectedControlEpoch'
+    ),
+    target: decodeInvocationCancelTarget(data.target),
+    reasonCode: oneOf(
+      data.reasonCode,
+      ['userRequested', 'epochSuperseded'] as const,
+      'reasonCode'
+    ),
+    ...(data.reason != null
+      ? { reason: wireText(data.reason, 'reason') }
+      : {}),
+  };
+}
+
+function decodeDeadlineRequest(value: unknown): DeadlineRequestV2 {
+  const request = tagged(value, 'deadline request');
+  if (request.kind === 'contractDefault') {
+    exactRecord(request.data, [], 'contract-default deadline');
+    return { kind: request.kind, data: {} };
+  }
+  if (request.kind === 'exactMilliseconds') {
+    const data = exactRecord(
+      request.data,
+      ['value'],
+      'exact-milliseconds deadline'
+    );
+    return {
+      kind: request.kind,
+      data: { value: positiveUint32(data.value, 'deadline.value') },
+    };
+  }
+  throw new KernelV2WireError(
+    `Unsupported deadline request kind ${request.kind}.`
+  );
+}
+
+function decodeRequestedResource(value: unknown): RequestedResourceV2 {
+  const resource = tagged(value, 'requested resource');
+  switch (resource.kind) {
+    case 'workspacePath': {
+      const data = exactRecord(
+        resource.data,
+        ['path', 'access'],
+        'workspace-path resource'
+      );
+      return {
+        kind: resource.kind,
+        data: {
+          path: boundedText(data.path, 'requestedResource.path', 16 * 1024),
+          access: oneOf(
+            data.access,
+            ['read', 'write'] as const,
+            'requestedResource.access'
+          ),
+        },
+      };
+    }
+    case 'repository': {
+      const data = exactRecord(
+        resource.data,
+        ['area'],
+        'repository resource'
+      );
+      return {
+        kind: resource.kind,
+        data: {
+          area: oneOf(
+            data.area,
+            ['state', 'index', 'history'] as const,
+            'requestedResource.area'
+          ),
+        },
+      };
+    }
+    case 'networkUrl': {
+      const data = exactRecord(
+        resource.data,
+        ['url'],
+        'network-url resource'
+      );
+      return {
+        kind: resource.kind,
+        data: {
+          url: boundedText(data.url, 'requestedResource.url', 16 * 1024),
+        },
+      };
+    }
+    case 'networkQuery': {
+      const data = exactRecord(
+        resource.data,
+        ['query'],
+        'network-query resource'
+      );
+      return {
+        kind: resource.kind,
+        data: {
+          query: boundedText(
+            data.query,
+            'requestedResource.query',
+            16 * 1024
+          ),
+        },
+      };
+    }
+    case 'exactInvocation': {
+      const data = exactRecord(
+        resource.data,
+        ['invocationDigest'],
+        'exact-invocation resource'
+      );
+      return {
+        kind: resource.kind,
+        data: {
+          invocationDigest: digest(
+            data.invocationDigest,
+            'exactInvocationDigest'
+          ),
+        },
+      };
+    }
+    default:
+      throw new KernelV2WireError(
+        `Unsupported requested resource kind ${resource.kind}.`
+      );
+  }
+}
+
+function decodeToolIntentAuthority(value: unknown): ToolIntentAuthorityV2 {
+  const authority = tagged(value, 'ToolIntent authority');
+  if (authority.kind === 'planAction') {
+    const data = exactRecord(
+      authority.data,
+      ['planRevision', 'planActionId', 'lease'],
+      'plan-action authority',
+      ['lease']
+    );
+    return {
+      kind: authority.kind,
+      data: {
+        planRevision: identity(data.planRevision, 'planRevision'),
+        planActionId: identity(data.planActionId, 'planActionId'),
+        ...(data.lease != null
+          ? { lease: decodeLeaseRef(data.lease) }
+          : {}),
+      },
+    };
+  }
+  if (authority.kind === 'contextRead') {
+    const data = exactRecord(
+      authority.data,
+      ['purpose'],
+      'context-read authority'
+    );
+    return {
+      kind: authority.kind,
+      data: {
+        purpose: boundedText(data.purpose, 'contextRead.purpose', 1024),
+      },
+    };
+  }
+  throw new KernelV2WireError(
+    `Unsupported ToolIntent authority kind ${authority.kind}.`
+  );
+}
+
+function decodeEpochPrecondition(value: unknown): EpochPreconditionV2 {
+  const precondition = tagged(value, 'epoch precondition');
+  if (precondition.kind === 'noCurrentEpoch') {
+    exactRecord(precondition.data, [], 'no-current-epoch precondition');
+    return { kind: precondition.kind, data: {} };
+  }
+  if (precondition.kind === 'exact') {
+    const data = exactRecord(
+      precondition.data,
+      ['controlEpoch'],
+      'exact epoch precondition'
+    );
+    return {
+      kind: precondition.kind,
+      data: {
+        controlEpoch: positiveInteger(data.controlEpoch, 'controlEpoch'),
+      },
+    };
+  }
+  throw new KernelV2WireError(
+    `Unsupported epoch precondition kind ${precondition.kind}.`
+  );
+}
+
+function decodeInvocationCancelTarget(
+  value: unknown
+): InvocationCancelTargetV2 {
+  const target = tagged(value, 'invocation cancel target');
+  if (target.kind === 'currentForRun') {
+    exactRecord(target.data, [], 'current-for-run cancel target');
+    return { kind: target.kind, data: {} };
+  }
+  if (target.kind === 'exact') {
+    const data = exactRecord(
+      target.data,
+      ['invocationId'],
+      'exact invocation cancel target'
+    );
+    return {
+      kind: target.kind,
+      data: {
+        invocationId: identity(data.invocationId, 'invocationId'),
+      },
+    };
+  }
+  throw new KernelV2WireError(
+    `Unsupported invocation cancel target kind ${target.kind}.`
+  );
 }
 
 function decodeKernelReplyV2(value: unknown): KernelReplyV2 {
@@ -782,7 +1222,7 @@ function decodeToolIntentReply(value: unknown): ToolIntentSubmitReplyV2 {
           'effectiveDeadlineMs'
         ),
         admissionFactId: identity(data.admissionFactId, 'admissionFactId'),
-        admissionBatchHighWater: nonNegativeInteger(
+        admissionBatchHighWater: positiveInteger(
           data.admissionBatchHighWater,
           'admissionBatchHighWater'
         ),
@@ -803,19 +1243,32 @@ function decodeToolIntentReply(value: unknown): ToolIntentSubmitReplyV2 {
       ],
       'awaiting-capability ToolIntent'
     );
+    const runId = identity(data.runId, 'runId');
+    const operationId = identity(data.operationId, 'operationId');
+    const acceptedControlEpoch = positiveInteger(
+      data.acceptedControlEpoch,
+      'acceptedControlEpoch'
+    );
+    const preview = decodeScopePreviewRecord(data.preview);
+    if (
+      preview.runId !== runId
+      || preview.operationId !== operationId
+      || preview.controlEpoch !== acceptedControlEpoch
+    ) {
+      throw new KernelV2WireError(
+        'awaitingCapability preview must match runId, operationId, and acceptedControlEpoch.'
+      );
+    }
     return {
       kind: reply.kind,
       data: {
-        runId: identity(data.runId, 'runId'),
-        operationId: identity(data.operationId, 'operationId'),
-        acceptedControlEpoch: positiveInteger(
-          data.acceptedControlEpoch,
-          'acceptedControlEpoch'
-        ),
+        runId,
+        operationId,
+        acceptedControlEpoch,
         invocationId: identity(data.invocationId, 'invocationId'),
-        preview: decodeScopePreviewRecord(data.preview),
+        preview,
         awaitingFactId: identity(data.awaitingFactId, 'awaitingFactId'),
-        awaitingBatchHighWater: nonNegativeInteger(
+        awaitingBatchHighWater: positiveInteger(
           data.awaitingBatchHighWater,
           'awaitingBatchHighWater'
         ),
@@ -865,7 +1318,7 @@ function decodeToolIntentReply(value: unknown): ToolIntentSubmitReplyV2 {
         ),
         guidance: text(data.guidance, 'ToolIntent rejection guidance'),
         rejectionFactId: identity(data.rejectionFactId, 'rejectionFactId'),
-        rejectionBatchHighWater: nonNegativeInteger(
+        rejectionBatchHighWater: positiveInteger(
           data.rejectionBatchHighWater,
           'rejectionBatchHighWater'
         ),
@@ -1014,7 +1467,13 @@ function decodeFactPage(value: unknown): KernelFactProjectionPageV2 {
       'Kernel facts request cursor must not exceed snapshotHighWater.'
     );
   }
-  const facts = array(data.facts, 'facts').map(decodeFact);
+  const rawFacts = array(data.facts, 'facts');
+  if (rawFacts.length > 1000) {
+    throw new KernelV2WireError(
+      'Kernel fact projection page must not exceed 1000 facts.'
+    );
+  }
+  const facts = rawFacts.map(decodeKernelFactProjectionV2);
   let previous = requestedAfterLedgerSequence;
   for (const fact of facts) {
     if (
@@ -1067,7 +1526,9 @@ function decodeFactPage(value: unknown): KernelFactProjectionPageV2 {
   };
 }
 
-function decodeFact(value: unknown): KernelFactProjectionV2 {
+export function decodeKernelFactProjectionV2(
+  value: unknown
+): KernelFactProjectionV2 {
   const data = exactRecord(
     value,
     [
@@ -1095,7 +1556,7 @@ function decodeFact(value: unknown): KernelFactProjectionV2 {
     factId: identity(data.factId, 'factId'),
     ledgerSequence: positiveInteger(data.ledgerSequence, 'ledgerSequence'),
     runSequence: positiveInteger(data.runSequence, 'runSequence'),
-    recordedAt: text(data.recordedAt, 'recordedAt'),
+    recordedAt: recordedAt(data.recordedAt),
     domain: oneOf(
       data.domain,
       [
@@ -1108,7 +1569,7 @@ function decodeFact(value: unknown): KernelFactProjectionV2 {
       ] as const,
       'fact domain'
     ),
-    factKind: text(data.factKind, 'factKind'),
+    factKind: wireText(data.factKind, 'factKind'),
     lineage: decodeFactLineage(data.lineage),
     details,
   };
@@ -1138,8 +1599,16 @@ function decodeFactLineage(value: unknown): KernelFactLineageV2 {
       'effectId',
     ]
   );
-  const planActionIds = stringArray(data.planActionIds, 'planActionIds');
-  const resourceIds = stringArray(data.resourceIds, 'resourceIds');
+  const planActionIds = identityArray(
+    data.planActionIds,
+    'planActionIds'
+  );
+  const resourceIds = identityArray(data.resourceIds, 'resourceIds');
+  if (planActionIds.length > 256 || resourceIds.length > 256) {
+    throw new KernelV2WireError(
+      'Kernel fact lineage identifier lists must not exceed 256 entries.'
+    );
+  }
   assertStrictlySorted(planActionIds, 'planActionIds');
   assertStrictlySorted(resourceIds, 'resourceIds');
   return {
@@ -1188,7 +1657,7 @@ function decodeControlEpochAdvanced(
       'supersededCapabilityCount'
     ),
     cancellation: decodeControlCancellation(data.cancellation),
-    commandBatchHighWater: nonNegativeInteger(
+    commandBatchHighWater: positiveInteger(
       data.commandBatchHighWater,
       'commandBatchHighWater'
     ),
@@ -1439,7 +1908,10 @@ function tagged(
 
 function toolId(value: unknown): string {
   const output = identity(value, 'toolId');
-  if (!/^[a-z][a-z0-9_-]*(?:\.[a-z][a-z0-9_-]*)+$/.test(output)) {
+  if (
+    new TextEncoder().encode(output).byteLength > 128
+    || !/^[a-z][a-z0-9_-]*(?:\.[a-z][a-z0-9_-]*)+$/.test(output)
+  ) {
     throw new KernelV2WireError('toolId must be a lowercase namespaced identity.');
   }
   return output;
@@ -1482,6 +1954,90 @@ function positiveInteger(value: unknown, field: string): number {
   return output;
 }
 
+function positiveUint32(value: unknown, field: string): number {
+  const output = positiveInteger(value, field);
+  if (output > 0xffff_ffff) {
+    throw new KernelV2WireError(`${field} must fit in an unsigned 32-bit integer.`);
+  }
+  return output;
+}
+
+function wireText(value: unknown, field: string): string {
+  const output = boundedText(value, field, 16 * 1024);
+  if (output.trim() !== output) {
+    throw new KernelV2WireError(
+      `${field} must not contain surrounding whitespace.`
+    );
+  }
+  return output;
+}
+
+function boundedText(
+  value: unknown,
+  field: string,
+  maximumBytes: number
+): string {
+  const output = text(value, field);
+  if (
+    new TextEncoder().encode(output).byteLength > maximumBytes
+    || /[\u0000-\u001f\u007f-\u009f]/u.test(output)
+  ) {
+    throw new KernelV2WireError(
+      `${field} must contain at most ${maximumBytes} bytes without control characters.`
+    );
+  }
+  return output;
+}
+
+function recordedAt(value: unknown): string {
+  const output = text(value, 'recordedAt');
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})\.(\d{3})Z$/.exec(
+    output
+  );
+  if (!match) {
+    throw new KernelV2WireError(
+      'recordedAt must use YYYY-MM-DDTHH:MM:SS.sssZ.'
+    );
+  }
+  const [, yearText, monthText, dayText, hourText, minuteText, secondText] =
+    match;
+  const year = Number(yearText);
+  const month = Number(monthText);
+  const day = Number(dayText);
+  const hour = Number(hourText);
+  const minute = Number(minuteText);
+  const second = Number(secondText);
+  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth = [
+    0,
+    31,
+    leapYear ? 29 : 28,
+    31,
+    30,
+    31,
+    30,
+    31,
+    31,
+    30,
+    31,
+    30,
+    31,
+  ][month] ?? 0;
+  if (
+    year === 0
+    || day < 1
+    || day > daysInMonth
+    || hour > 23
+    || minute > 59
+    || second > 59
+  ) {
+    throw new KernelV2WireError(
+      'recordedAt contains an out-of-range component.'
+    );
+  }
+  return output;
+}
+
 function boolean(value: unknown, field: string): boolean {
   if (typeof value !== 'boolean') {
     throw new KernelV2WireError(`${field} must be a boolean.`);
@@ -1504,6 +2060,12 @@ function nonNegativeInteger(value: unknown, field: string): number {
 
 function stringArray(value: unknown, field: string): string[] {
   return array(value, field).map((item) => text(item, `${field} item`));
+}
+
+function identityArray(value: unknown, field: string): string[] {
+  return array(value, field).map((item) =>
+    identity(item, `${field} item`)
+  );
 }
 
 function array(value: unknown, field: string): unknown[] {
@@ -1560,12 +2122,23 @@ function oneOf<const T extends readonly string[]>(
 
 function assertStrictlySorted(values: readonly string[], field: string): void {
   for (let index = 1; index < values.length; index += 1) {
-    if (values[index - 1]! >= values[index]!) {
+    if (compareUtf8(values[index - 1]!, values[index]!) >= 0) {
       throw new KernelV2WireError(
         `${field} must be strictly sorted and unique.`
       );
     }
   }
+}
+
+function compareUtf8(left: string, right: string): number {
+  const leftBytes = new TextEncoder().encode(left);
+  const rightBytes = new TextEncoder().encode(right);
+  const sharedLength = Math.min(leftBytes.length, rightBytes.length);
+  for (let index = 0; index < sharedLength; index += 1) {
+    const difference = leftBytes[index]! - rightBytes[index]!;
+    if (difference !== 0) return difference;
+  }
+  return leftBytes.length - rightBytes.length;
 }
 
 function isJsonValue(value: unknown): value is JsonValueV2 {
@@ -1596,8 +2169,8 @@ function isBoundedRawJson(value: unknown, depth: number): boolean {
   }
   if (!value || typeof value !== 'object') return false;
   return Object.entries(value).every(
-    ([key, item]) => key.length <= 1024
-      && !/[\u0000-\u001f\u007f]/.test(key)
+    ([key, item]) => new TextEncoder().encode(key).byteLength <= 1024
+      && !/[\u0000-\u001f\u007f-\u009f]/u.test(key)
       && isBoundedRawJson(item, depth + 1)
   );
 }

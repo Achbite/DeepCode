@@ -21,6 +21,7 @@ pub const MAX_CORRELATION_REFS_V2: usize = 256;
 pub const MAX_FACT_WIRE_BYTES_V2: usize = 5 * 1024 * 1024;
 pub const MAX_FACT_PAGE_BYTES_V2: usize = 8 * 1024 * 1024;
 pub const MAX_PAGE_ITEMS_V2: usize = 1_000;
+pub const MAX_CROSS_LANGUAGE_SAFE_INTEGER_V2: u64 = 9_007_199_254_740_991;
 const MAX_CANONICAL_DEPTH: usize = 32;
 
 macro_rules! string_id {
@@ -88,6 +89,7 @@ impl ControlEpoch {
         if value == 0 {
             return Err(zero_value("controlEpoch"));
         }
+        validate_cross_language_safe_u64_v2("controlEpoch", value)?;
         Ok(Self(value))
     }
 
@@ -981,6 +983,251 @@ pub enum MutationCommandResultV2 {
     },
 }
 
+impl MutationCommandResultV2 {
+    pub fn validate_for_command(
+        &self,
+        command_kind: crate::v2_command::MutationCommandKindV2,
+    ) -> Result<(), V2ValidationError> {
+        use crate::v2_command::{
+            MutationCommandKindV2 as Command, RecordedCommandErrorV2 as Error,
+        };
+
+        match self {
+            Self::ToolIntentSubmission { reply } => reply.validate()?,
+            Self::EpochAdvance { reply } => reply.validate()?,
+            Self::InvocationCancel { reply } => reply.validate()?,
+            Self::RecordedSemanticError { .. } => {}
+        }
+        let matches_command = match (command_kind, self) {
+            (Command::ToolIntentSubmit, Self::ToolIntentSubmission { .. })
+            | (Command::ControlEpochAdvance, Self::EpochAdvance { .. })
+            | (Command::InvocationCancel, Self::InvocationCancel { .. }) => true,
+            (
+                Command::ControlEpochAdvance,
+                Self::RecordedSemanticError {
+                    error:
+                        Error::ControlEpochAlreadyExists { .. }
+                        | Error::ControlEpochExhausted { .. }
+                        | Error::StaleControlEpoch { .. },
+                },
+            ) => true,
+            (
+                Command::InvocationCancel,
+                Self::RecordedSemanticError {
+                    error:
+                        Error::StaleControlEpoch { .. }
+                        | Error::InvocationNotFound { .. }
+                        | Error::InvocationNotOwnedByRun { .. },
+                },
+            ) => true,
+            _ => false,
+        };
+        if !matches_command {
+            return Err(invalid_value(
+                "fact.commandResult",
+                "must match commandKind and its semantic error family",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_recorded_envelope(
+        &self,
+        identity: &CommandReceiptIdentityV2,
+        fact_id: &FactId,
+        ledger_sequence: u64,
+    ) -> Result<(), V2ValidationError> {
+        let exact_epoch = match &identity.epoch_context {
+            CommandEpochContextV2::Exact { control_epoch } => Some(*control_epoch),
+            CommandEpochContextV2::NoCurrentEpoch {} => None,
+        };
+        match self {
+            Self::ToolIntentSubmission { reply } => {
+                let (run_id, control_epoch) = match reply {
+                    crate::v2_command::ToolIntentSubmitReplyV2::Admitted {
+                        run_id,
+                        accepted_control_epoch,
+                        admission_fact_id,
+                        admission_batch_high_water,
+                        ..
+                    } => {
+                        if admission_fact_id == fact_id
+                            || *admission_batch_high_water <= ledger_sequence
+                        {
+                            return Err(invalid_value(
+                                "fact.result.reply",
+                                "admitted reply must reference a later admission fact",
+                            ));
+                        }
+                        (run_id, accepted_control_epoch)
+                    }
+                    crate::v2_command::ToolIntentSubmitReplyV2::AwaitingCapability {
+                        run_id,
+                        accepted_control_epoch,
+                        awaiting_fact_id,
+                        awaiting_batch_high_water,
+                        ..
+                    } => {
+                        if awaiting_fact_id == fact_id
+                            || *awaiting_batch_high_water <= ledger_sequence
+                        {
+                            return Err(invalid_value(
+                                "fact.result.reply",
+                                "awaiting reply must reference a later authorization fact",
+                            ));
+                        }
+                        (run_id, accepted_control_epoch)
+                    }
+                    crate::v2_command::ToolIntentSubmitReplyV2::Rejected {
+                        run_id,
+                        current_control_epoch,
+                        rejection_fact_id,
+                        rejection_batch_high_water,
+                        ..
+                    } => {
+                        if rejection_fact_id != fact_id
+                            || *rejection_batch_high_water != ledger_sequence
+                        {
+                            return Err(invalid_value(
+                                "fact.result.reply",
+                                "rejected reply must reference the enclosing CommandRecorded fact",
+                            ));
+                        }
+                        (run_id, current_control_epoch)
+                    }
+                };
+                if run_id != &identity.run_id || exact_epoch != Some(*control_epoch) {
+                    return Err(invalid_value(
+                        "fact.result.reply",
+                        "ToolIntent reply run and epoch must match CommandRecorded identity",
+                    ));
+                }
+            }
+            Self::EpochAdvance { reply } => {
+                if reply.run_id != identity.run_id
+                    || reply.epoch_fact_id == *fact_id
+                    || reply.command_batch_high_water <= ledger_sequence
+                {
+                    return Err(invalid_value(
+                        "fact.result.reply",
+                        "epoch reply must reference this command and a later EpochAdvanced fact",
+                    ));
+                }
+                let expected_epoch = match exact_epoch {
+                    Some(previous) => previous.get().checked_add(1),
+                    None => Some(1),
+                };
+                if expected_epoch != Some(reply.accepted_control_epoch.get()) {
+                    return Err(invalid_value(
+                        "fact.result.reply.acceptedControlEpoch",
+                        "must advance the CommandRecorded epoch context exactly once",
+                    ));
+                }
+            }
+            Self::InvocationCancel { reply } => {
+                let Some(control_epoch) = exact_epoch else {
+                    return Err(invalid_value(
+                        "fact.epochContext",
+                        "InvocationCancel requires an exact control epoch",
+                    ));
+                };
+                match reply {
+                    crate::v2_command::InvocationCancelReplyV2::Requested {
+                        fact_id: cancellation_fact_id,
+                        ledger_sequence: cancellation_ledger_sequence,
+                        ..
+                    } => {
+                        if cancellation_fact_id == fact_id
+                            || *cancellation_ledger_sequence <= ledger_sequence
+                        {
+                            return Err(invalid_value(
+                                "fact.result.reply",
+                                "requested cancellation must reference a later cancellation fact",
+                            ));
+                        }
+                    }
+                    crate::v2_command::InvocationCancelReplyV2::AlreadyRequested {
+                        fact_id: cancellation_fact_id,
+                        ledger_sequence: cancellation_ledger_sequence,
+                        ..
+                    } => {
+                        if cancellation_fact_id == fact_id
+                            || *cancellation_ledger_sequence >= ledger_sequence
+                        {
+                            return Err(invalid_value(
+                                "fact.result.reply",
+                                "existing cancellation must predate this CommandRecorded fact",
+                            ));
+                        }
+                    }
+                    crate::v2_command::InvocationCancelReplyV2::NoActiveInvocation {
+                        run_id,
+                        control_epoch: reply_epoch,
+                    } if run_id == &identity.run_id && *reply_epoch == control_epoch => {}
+                    crate::v2_command::InvocationCancelReplyV2::AlreadyTerminal {
+                        terminal_fact_id,
+                        ..
+                    } if terminal_fact_id != fact_id => {}
+                    _ => {
+                        return Err(invalid_value(
+                            "fact.result.reply",
+                            "InvocationCancel reply must match CommandRecorded identity",
+                        ))
+                    }
+                }
+            }
+            Self::RecordedSemanticError { error } => {
+                let error_run_id = match error {
+                    crate::v2_command::RecordedCommandErrorV2::ControlEpochAlreadyExists {
+                        run_id,
+                        current,
+                    }
+                    | crate::v2_command::RecordedCommandErrorV2::ControlEpochExhausted {
+                        run_id,
+                        current,
+                    } => {
+                        if exact_epoch != Some(*current) {
+                            return Err(invalid_value(
+                                "fact.epochContext",
+                                "recorded epoch error must bind the current control epoch",
+                            ));
+                        }
+                        run_id
+                    }
+                    crate::v2_command::RecordedCommandErrorV2::StaleControlEpoch {
+                        run_id,
+                        current,
+                        ..
+                    } => {
+                        if exact_epoch != Some(*current) {
+                            return Err(invalid_value(
+                                "fact.epochContext",
+                                "stale epoch error must bind the current control epoch",
+                            ));
+                        }
+                        run_id
+                    }
+                    crate::v2_command::RecordedCommandErrorV2::InvocationNotFound {
+                        run_id,
+                        ..
+                    }
+                    | crate::v2_command::RecordedCommandErrorV2::InvocationNotOwnedByRun {
+                        run_id,
+                        ..
+                    } => run_id,
+                };
+                if error_run_id != &identity.run_id {
+                    return Err(invalid_value(
+                        "fact.result.error.runId",
+                        "must match CommandRecorded runId",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
     tag = "kind",
@@ -1370,7 +1617,17 @@ impl KernelFactEnvelopeV2 {
         if self.run_sequence == 0 {
             return Err(zero_value("runSequence"));
         }
+        validate_cross_language_safe_u64_v2("ledgerSequence", self.ledger_sequence)?;
+        validate_cross_language_safe_u64_v2("runSequence", self.run_sequence)?;
         self.payload.validate()?;
+        if let KernelFactPayloadV2::Control(ControlFactV2::CommandRecorded {
+            identity,
+            result,
+            ..
+        }) = &self.payload
+        {
+            result.validate_recorded_envelope(identity, &self.fact_id, self.ledger_sequence)?;
+        }
         let bytes =
             serde_json::to_vec(self).map_err(|_| invalid_value("fact", "must serialize"))?;
         if bytes.len() > MAX_FACT_WIRE_BYTES_V2 {
@@ -1415,6 +1672,14 @@ impl KernelFactPayloadV2 {
                     "RunTransportRebound must advance beyond the initial transport generation",
                 ));
             }
+        }
+        if let Self::Control(ControlFactV2::CommandRecorded {
+            command_kind,
+            result,
+            ..
+        }) = self
+        {
+            result.validate_for_command(*command_kind)?;
         }
         if let Self::Control(ControlFactV2::RunRetired {
             reason: Some(reason),
@@ -1500,6 +1765,9 @@ impl KernelFactPayloadV2 {
                 return Err(zero_value("cleanupAttempt"));
             }
         }
+        let encoded =
+            serde_json::to_value(self).map_err(|_| invalid_value("fact", "must serialize"))?;
+        validate_cross_language_safe_json_value_v2("fact", &encoded)?;
         Ok(())
     }
 
@@ -1557,6 +1825,20 @@ impl KernelFactPayloadV2 {
 
     pub fn operation_id(&self) -> Option<&OperationId> {
         match self {
+            Self::Control(ControlFactV2::CommandRecorded {
+                command_kind: crate::v2_command::MutationCommandKindV2::ToolIntentSubmit,
+                result: MutationCommandResultV2::ToolIntentSubmission { reply },
+                ..
+            }) => Some(match reply {
+                crate::v2_command::ToolIntentSubmitReplyV2::Admitted { operation_id, .. }
+                | crate::v2_command::ToolIntentSubmitReplyV2::AwaitingCapability {
+                    operation_id,
+                    ..
+                }
+                | crate::v2_command::ToolIntentSubmitReplyV2::Rejected { operation_id, .. } => {
+                    operation_id
+                }
+            }),
             Self::Control(_) => None,
             Self::Authorization(fact) => fact.operation_id(),
             Self::Invocation(fact) => Some(fact.identity().operation_id),
@@ -2350,16 +2632,48 @@ fn write_canonical_number(
     Ok(())
 }
 
+pub fn validate_cross_language_safe_u64_v2(
+    field: &'static str,
+    value: u64,
+) -> Result<(), V2ValidationError> {
+    if value > MAX_CROSS_LANGUAGE_SAFE_INTEGER_V2 {
+        return Err(invalid_value(field, "must be an IEEE-754 safe integer"));
+    }
+    Ok(())
+}
+
+pub fn validate_cross_language_safe_json_value_v2(
+    field: &'static str,
+    value: &Value,
+) -> Result<(), V2ValidationError> {
+    let mut pending = vec![value];
+    while let Some(value) = pending.pop() {
+        match value {
+            Value::Array(values) => pending.extend(values),
+            Value::Object(values) => pending.extend(values.values()),
+            Value::Number(number) if cross_language_safe_integer_number_v2(number).is_none() => {
+                return Err(invalid_value(
+                    field,
+                    "contains a number that is not an IEEE-754 safe integer",
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn cross_language_safe_integer_number_v2(number: &serde_json::Number) -> Option<i64> {
-    const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
     if let Some(value) = number.as_i64() {
-        return (value.unsigned_abs() <= MAX_SAFE_INTEGER).then_some(value);
+        return (value.unsigned_abs() <= MAX_CROSS_LANGUAGE_SAFE_INTEGER_V2).then_some(value);
     }
     if let Some(value) = number.as_u64() {
-        return (value <= MAX_SAFE_INTEGER).then_some(value as i64);
+        return (value <= MAX_CROSS_LANGUAGE_SAFE_INTEGER_V2).then_some(value as i64);
     }
     let value = number.as_f64()?;
-    (value.is_finite() && value.fract() == 0.0 && value.abs() <= MAX_SAFE_INTEGER as f64)
+    (value.is_finite()
+        && value.fract() == 0.0
+        && value.abs() <= MAX_CROSS_LANGUAGE_SAFE_INTEGER_V2 as f64)
         .then_some(value as i64)
 }
 

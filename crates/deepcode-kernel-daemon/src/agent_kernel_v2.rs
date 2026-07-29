@@ -2770,6 +2770,12 @@ fn restore_authority_revoke_outcome_v2(
                 "Durable authority revoke Kernel response is invalid.",
             )
         })?;
+    response.validate().map_err(|_| {
+        AgentKernelV2Error::invalid(
+            "host_authority_revoke_outcome_invalid",
+            "Durable authority revoke Kernel response violates the v2 wire contract.",
+        )
+    })?;
     let expected_request_id =
         CommandRequestId::new(caller_binding_string_v2(binding, "requestId")?).map_err(|_| {
             AgentKernelV2Error::invalid(

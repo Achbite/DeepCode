@@ -5,12 +5,14 @@ import type {
 } from '@deepcode/protocol';
 import {
   createSessionKernelLineageStateV2,
+  registerSessionOperationPlanActionLineageV2,
   registerSessionPlanActionLineageV2,
   type SessionKernelLineageStateV2,
 } from './lineage.js';
 import {
   createSessionToolContextStateV2,
   type SessionToolContextStateV2,
+  validateSessionToolContextStateV2,
 } from './toolContext.js';
 import {
   validateAgentInputAttachmentsV2,
@@ -23,6 +25,8 @@ import {
   SESSION_KERNEL_CHECKPOINT_V2_SCHEMA,
   SESSION_KERNEL_LOOP_V2_SCHEMA,
   type SessionActiveWaitV2,
+  type SessionKernelFactBarrierV2,
+  type SessionOperationPlanActionBindingV2,
   type SessionKernelPublicRequestRecordV2,
   type SessionKernelReviewV2,
   type SessionNaturalLanguagePlanV2,
@@ -41,6 +45,11 @@ const MAX_SESSION_PROVIDER_OUTCOME_COUNT = 128;
 const MAX_SESSION_PROVIDER_OUTCOME_BYTES = 256 * 1024;
 const MAX_SESSION_PLAN_ACTIONS = 256;
 const MAX_SESSION_PLAN_BYTES = 512 * 1024;
+// One PlanAction drive admits at most 256 Provider calls. The per-Plan ceiling
+// covers 256 actions at the default 32-call budget without allowing the
+// theoretical 65,536-entry Cartesian worst case into every checkpoint.
+const MAX_SESSION_OPERATIONS_PER_PLAN_ACTION = 256;
+const MAX_SESSION_OPERATION_PLAN_BINDINGS = 8_192;
 
 export interface SessionKernelLoopStateV2 {
   schemaVersion: typeof SESSION_KERNEL_LOOP_V2_SCHEMA;
@@ -70,6 +79,11 @@ export interface SessionKernelLoopStateV2 {
   providerOutcomes: SessionProviderOutcomeRecordV2[];
   providerOutcomeHistoryOmittedCount: number;
   planActionSettlements: Record<string, SessionPlanActionSettlementV2>;
+  operationPlanActionBindings: Record<
+    string,
+    SessionOperationPlanActionBindingV2
+  >;
+  factBarriers: Record<string, SessionKernelFactBarrierV2>;
   publicRequests: Partial<
     Record<
       SessionKernelPublicRequestRecordV2['lane'],
@@ -132,6 +146,8 @@ export function createSessionKernelLoopStateV2(
     providerOutcomes: [],
     providerOutcomeHistoryOmittedCount: 0,
     planActionSettlements: {},
+    operationPlanActionBindings: {},
+    factBarriers: {},
     publicRequests: {},
     kernelWakeHint: false,
     checkpointRevision: 0,
@@ -171,6 +187,7 @@ export function restoreSessionKernelLoopStateV2(
   positiveEpoch(state.controlEpoch);
   validateSessionContextMemoryV2(state.sessionMemory);
   validateProviderProfile(state.providerProfile);
+  validateSessionToolContextStateV2(state.toolContext);
   state.inputs.forEach(validateUserInput);
   currentSessionUserInputV2(state);
   state.inputHistoryOmittedCount = nonnegativeSafeInteger(
@@ -217,14 +234,28 @@ export function restoreSessionKernelLoopStateV2(
   state.providerOutcomeHistoryOmittedCount +=
     boundedOutcomes.omittedCount;
   state.planActionSettlements ??= {};
+  validateOperationPlanActionBindings(
+    state.operationPlanActionBindings,
+    state
+  );
+  validateFactBarriers(state.factBarriers);
   state.factHistoryOmittedCount = nonnegativeSafeInteger(
-    state.factHistoryOmittedCount ?? 0,
+    state.factHistoryOmittedCount,
     'factHistoryOmittedCount'
   );
-  state.reviewFacts ??= createSessionReviewFactAccumulatorV2(
-    state.controlEpoch,
-    0
-  );
+  if (
+    !state.factsById
+    || typeof state.factsById !== 'object'
+    || Array.isArray(state.factsById)
+    || Object.keys(state.factsById).length > 0
+    || state.factHistoryOmittedCount !== 0
+  ) {
+    throw new SessionKernelStateError(
+      'session_kernel_checkpoint_fact_projection_present',
+      'Checkpoint must not persist replayable Kernel fact projection state.'
+    );
+  }
+  validateReviewFactAccumulator(state.reviewFacts, state);
   for (const [planActionId, settlement] of Object.entries(
     state.planActionSettlements
   )) {
@@ -250,6 +281,7 @@ export function restoreSessionKernelLoopStateV2(
       cancellationReason: 'shutdown',
     };
   }
+  state.lineage = rebuildSessionKernelLineageV2(state);
   return state;
 }
 
@@ -273,9 +305,14 @@ export function recordSessionPlanV2(
   let next = cloneSessionKernelLoopStateV2(state);
   if (next.plan?.planRevision !== plan.planRevision) {
     next.planActionSettlements = {};
+    next.operationPlanActionBindings = {};
     next.previews = {};
     next.planDecision = undefined;
     next.projectedPlanDecisionKey = undefined;
+    next.lineage.taskPlanActions = {};
+    next.lineage.planActions = {};
+    next.lineage.operations = {};
+    next.lineage.invocations = {};
   }
   if (
     next.plan
@@ -369,6 +406,7 @@ export function recordSessionUserInputV2(
   next.projectedPlanDecisionKey = undefined;
   next.previews = {};
   next.planActionSettlements = {};
+  next.operationPlanActionBindings = {};
   next.factsById = {};
   next.factHistoryOmittedCount = 0;
   next.reviewFacts = createSessionReviewFactAccumulatorV2(
@@ -427,27 +465,96 @@ export function currentSessionUserInputV2(
   return cloneJson(input);
 }
 
+export function recordSessionOperationPlanActionBindingV2(
+  state: SessionKernelLoopStateV2,
+  input: SessionOperationPlanActionBindingV2
+): void {
+  requiredIdentity(input.operationId, 'operationId');
+  requiredIdentity(input.planActionId, 'planActionId');
+  requiredIdentity(input.planRevision, 'planRevision');
+  positiveEpoch(input.controlEpoch);
+  const plan = state.plan;
+  if (
+    !plan ||
+    input.controlEpoch !== state.controlEpoch
+    || input.planRevision !== plan.planRevision
+  ) {
+    throw new SessionKernelStateError(
+      'session_kernel_operation_plan_binding_stale',
+      'Dynamic operation binding does not belong to the current Plan epoch and revision.'
+    );
+  }
+  const action = plan.actions.find(
+    (candidate) =>
+      candidate.manifest.planActionId === input.planActionId
+  );
+  if (!action) {
+    throw new SessionKernelStateError(
+      'session_kernel_operation_plan_binding_missing',
+      'Dynamic operation binding does not belong to the current Plan.'
+    );
+  }
+  const manifestOwner = plan.actions.find(
+    (candidate) =>
+      candidate.manifest.operationId === input.operationId
+  );
+  if (
+    manifestOwner
+    && manifestOwner.manifest.planActionId !== input.planActionId
+  ) {
+    throw new SessionKernelStateError(
+      'session_kernel_operation_plan_binding_conflict',
+      'Dynamic operation identity conflicts with another current PlanAction.'
+    );
+  }
+  const existing =
+    state.operationPlanActionBindings[input.operationId];
+  if (existing && JSON.stringify(existing) !== JSON.stringify(input)) {
+    throw new SessionKernelStateError(
+      'session_kernel_operation_plan_binding_conflict',
+      `Operation ${input.operationId} is already bound to another current PlanAction.`
+    );
+  }
+  if (!existing) {
+    const bindings = Object.values(
+      state.operationPlanActionBindings
+    );
+    if (
+      bindings.length >= MAX_SESSION_OPERATION_PLAN_BINDINGS
+      || bindings.filter(
+        (binding) =>
+          binding.planActionId === input.planActionId
+      ).length >= MAX_SESSION_OPERATIONS_PER_PLAN_ACTION
+    ) {
+      throw new SessionKernelStateError(
+        'session_kernel_operation_plan_binding_limit',
+        'Current Plan operation bindings exceed the durable Session safety limit.'
+      );
+    }
+  }
+  state.operationPlanActionBindings[input.operationId] =
+    cloneJson(input);
+}
+
 export function checkpointSessionKernelStateV2(
   state: SessionKernelLoopStateV2,
   savedAt: string
 ): SessionKernelCheckpointV2 {
   const next = cloneSessionKernelLoopStateV2(state);
   next.checkpointRevision += 1;
+  validateOperationPlanActionBindings(
+    next.operationPlanActionBindings,
+    next
+  );
   next.factsById = {};
   next.factHistoryOmittedCount = 0;
   next.reviewFacts = createSessionReviewFactAccumulatorV2(
     state.reviewFacts.controlEpoch,
     state.reviewFacts.coverageAfterLedgerSequence
   );
-  next.lineage = createSessionKernelLineageStateV2(next.runId);
-  for (const action of next.plan?.actions ?? []) {
-    next.lineage = registerSessionPlanActionLineageV2(
-      next.lineage,
-      {
-        taskId: action.taskId,
-        manifest: action.manifest,
-      }
-    );
+  next.lineage = rebuildSessionKernelLineageV2(next);
+  for (const barrier of Object.values(next.factBarriers)) {
+    barrier.observedFactIds = [];
   }
   return {
     schemaVersion: SESSION_KERNEL_CHECKPOINT_V2_SCHEMA,
@@ -455,6 +562,28 @@ export function checkpointSessionKernelStateV2(
     savedAt,
     state: next,
   };
+}
+
+/**
+ * Drops only Session's replayable Kernel projection. Canonical facts remain
+ * in Kernel and are queried again from sequence zero. Session-owned Plan,
+ * requests, waits, and fact barriers remain durable.
+ */
+export function resetSessionKernelFactProjectionV2(
+  state: SessionKernelLoopStateV2
+): void {
+  state.factsById = {};
+  state.factHistoryOmittedCount = 0;
+  state.reviewFacts = createSessionReviewFactAccumulatorV2(
+    state.reviewFacts.controlEpoch,
+    state.reviewFacts.coverageAfterLedgerSequence
+  );
+  state.lineage = rebuildSessionKernelLineageV2(state);
+  for (const barrier of Object.values(state.factBarriers)) {
+    barrier.observedFactIds = [];
+  }
+  state.review = undefined;
+  state.kernelWakeHint = true;
 }
 
 export function createSessionReviewFactAccumulatorV2(
@@ -480,9 +609,246 @@ export function createSessionReviewFactAccumulatorV2(
     cleanup: category(),
     indeterminate: category(),
     priorEpochLateFacts: category(),
+    observedEffectPlanActions: {},
     authorizedOperationSequences: {},
     pendingCleanupByResource: {},
   };
+}
+
+function rebuildSessionKernelLineageV2(
+  state: SessionKernelLoopStateV2
+): SessionKernelLineageStateV2 {
+  let lineage = createSessionKernelLineageStateV2(state.runId);
+  for (const action of state.plan?.actions ?? []) {
+    lineage = registerSessionPlanActionLineageV2(
+      lineage,
+      {
+        taskId: action.taskId,
+        manifest: action.manifest,
+      }
+    );
+  }
+  for (
+    const binding of Object.values(
+      state.operationPlanActionBindings
+    ).sort((left, right) =>
+      left.operationId.localeCompare(right.operationId)
+    )
+  ) {
+    const action = state.plan?.actions.find(
+      (candidate) =>
+        candidate.manifest.planActionId === binding.planActionId
+    );
+    if (!action) {
+      throw new SessionKernelStateError(
+        'session_kernel_operation_plan_binding_missing',
+        'Persisted operation binding does not belong to the current Plan.'
+      );
+    }
+    lineage = registerSessionOperationPlanActionLineageV2(
+      lineage,
+      {
+        operationId: binding.operationId,
+        planActionId: binding.planActionId,
+        toolId: action.manifest.toolId,
+      }
+    );
+  }
+  return lineage;
+}
+
+function validateOperationPlanActionBindings(
+  bindings: Record<string, SessionOperationPlanActionBindingV2>,
+  state: SessionKernelLoopStateV2
+): void {
+  if (
+    !bindings
+    || typeof bindings !== 'object'
+    || Array.isArray(bindings)
+  ) {
+    throw new SessionKernelStateError(
+      'session_kernel_operation_plan_bindings_invalid',
+      'Session operation-to-PlanAction bindings are invalid.'
+    );
+  }
+  const plan = state.plan;
+  const bindingEntries = Object.entries(bindings);
+  if (bindingEntries.length > MAX_SESSION_OPERATION_PLAN_BINDINGS) {
+    throw new SessionKernelStateError(
+      'session_kernel_operation_plan_binding_limit',
+      'Current Plan operation bindings exceed the durable Session safety limit.'
+    );
+  }
+  if (!plan) {
+    if (bindingEntries.length > 0) {
+      throw new SessionKernelStateError(
+        'session_kernel_operation_plan_bindings_invalid',
+        'Operation bindings cannot exist without a current Plan.'
+      );
+    }
+    return;
+  }
+  const perPlanActionCount = new Map<string, number>();
+  for (const [operationId, binding] of bindingEntries) {
+    if (
+      !binding
+      || binding.operationId !== operationId
+      || binding.controlEpoch !== state.controlEpoch
+      || binding.planRevision !== plan.planRevision
+      || !plan.actions.some(
+        (action) =>
+          action.manifest.planActionId === binding.planActionId
+      )
+    ) {
+      throw new SessionKernelStateError(
+        'session_kernel_operation_plan_bindings_invalid',
+        'Persisted operation binding is stale or does not match the current Plan.'
+      );
+    }
+    const operationCount =
+      (perPlanActionCount.get(binding.planActionId) ?? 0) + 1;
+    if (operationCount > MAX_SESSION_OPERATIONS_PER_PLAN_ACTION) {
+      throw new SessionKernelStateError(
+        'session_kernel_operation_plan_binding_limit',
+        'A PlanAction exceeds the durable Session operation-binding safety limit.'
+      );
+    }
+    perPlanActionCount.set(binding.planActionId, operationCount);
+    requiredIdentity(operationId, 'operationBinding.operationId');
+    requiredIdentity(
+      binding.planActionId,
+      'operationBinding.planActionId'
+    );
+    requiredIdentity(
+      binding.planRevision,
+      'operationBinding.planRevision'
+    );
+    positiveEpoch(binding.controlEpoch);
+    const manifestOwner = plan.actions.find(
+      (action) =>
+        action.manifest.operationId === operationId
+    );
+    if (
+      manifestOwner
+      && manifestOwner.manifest.planActionId
+        !== binding.planActionId
+    ) {
+      throw new SessionKernelStateError(
+        'session_kernel_operation_plan_bindings_invalid',
+        'Persisted operation identity conflicts with another current PlanAction.'
+      );
+    }
+  }
+}
+
+function validateReviewFactAccumulator(
+  accumulator: SessionReviewFactAccumulatorV2,
+  state: SessionKernelLoopStateV2
+): void {
+  const expectedEpoch = state.pendingEpochInput
+    ? state.controlEpoch + 1
+    : state.controlEpoch;
+  if (
+    !accumulator
+    || typeof accumulator !== 'object'
+    || Array.isArray(accumulator)
+    || accumulator.controlEpoch !== expectedEpoch
+  ) {
+    throw new SessionKernelStateError(
+      'session_kernel_review_facts_invalid',
+      'Session Review fact accumulator does not match the active epoch boundary.'
+    );
+  }
+  nonnegativeSafeInteger(
+    accumulator.coverageAfterLedgerSequence,
+    'reviewFacts.coverageAfterLedgerSequence'
+  );
+  const categories = [
+    accumulator.scopeExpansions,
+    accumulator.actualEffects,
+    accumulator.denied,
+    accumulator.rejections,
+    accumulator.cleanup,
+    accumulator.indeterminate,
+    accumulator.priorEpochLateFacts,
+  ];
+  const evidenceMaps = [
+    accumulator.observedEffectPlanActions,
+    accumulator.authorizedOperationSequences,
+    accumulator.pendingCleanupByResource,
+  ];
+  if (
+    categories.some(
+      (category) =>
+        !category
+        || typeof category !== 'object'
+        || Array.isArray(category)
+        || category.totalCount !== 0
+        || !Array.isArray(category.samples)
+        || category.samples.length !== 0
+    )
+    || evidenceMaps.some(
+      (evidence) =>
+        !evidence
+        || typeof evidence !== 'object'
+        || Array.isArray(evidence)
+        || Object.keys(evidence).length !== 0
+    )
+  ) {
+    throw new SessionKernelStateError(
+      'session_kernel_checkpoint_fact_projection_present',
+      'Checkpoint must rebuild Review fact evidence from canonical Kernel facts.'
+    );
+  }
+}
+
+function validateFactBarriers(
+  barriers: Record<string, SessionKernelFactBarrierV2>
+): void {
+  if (
+    !barriers
+    || typeof barriers !== 'object'
+    || Array.isArray(barriers)
+  ) {
+    throw new SessionKernelStateError(
+      'session_kernel_fact_barriers_invalid',
+      'Session Kernel checkpoint fact barriers are invalid.'
+    );
+  }
+  for (const [requestId, barrier] of Object.entries(barriers)) {
+    requiredIdentity(requestId, 'factBarrier.requestId');
+    if (
+      !barrier
+      || barrier.requestId !== requestId
+      || (
+        barrier.source !== 'toolIntentSubmit'
+        && barrier.source !== 'controlEpochAdvance'
+        && barrier.source !== 'invocationCancel'
+      )
+      || !Number.isSafeInteger(barrier.minimumHighWater)
+      || barrier.minimumHighWater <= 0
+      || !Array.isArray(barrier.requiredFactIds)
+      || barrier.requiredFactIds.length === 0
+      || !Array.isArray(barrier.observedFactIds)
+      || barrier.observedFactIds.length !== 0
+    ) {
+      throw new SessionKernelStateError(
+        'session_kernel_fact_barriers_invalid',
+        'Session Kernel checkpoint fact barrier shape is invalid.'
+      );
+    }
+    const required = new Set(
+      barrier.requiredFactIds.map((factId) =>
+        requiredIdentity(factId, 'factBarrier.requiredFactId')
+      )
+    );
+    if (required.size !== barrier.requiredFactIds.length) {
+      throw new SessionKernelStateError(
+        'session_kernel_fact_barriers_invalid',
+        'Session Kernel checkpoint fact barrier identities must be unique.'
+      );
+    }
+  }
 }
 
 export function cloneSessionKernelLoopStateV2(

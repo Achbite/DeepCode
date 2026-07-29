@@ -26,6 +26,8 @@ export const SESSION_KERNEL_LOOP_V2_SCHEMA =
   'deepcode.session.kernel-loop.v2' as const;
 export const SESSION_KERNEL_CHECKPOINT_V2_SCHEMA =
   'deepcode.session.kernel-checkpoint.v2' as const;
+export const SESSION_KERNEL_REVIEW_PROJECTION_V2 =
+  'deepcode.session.kernel-review-projection.v2' as const;
 export const SESSION_PROVIDER_PROFILE_BOOTSTRAP_V2_SCHEMA =
   'deepcode.host.provider-profile-bootstrap.v2' as const;
 export const SESSION_PROVIDER_CONTEXT_RECEIPT_V2_SCHEMA =
@@ -299,6 +301,24 @@ export interface SessionKernelPublicRequestRecordV2 {
   attemptCount: number;
 }
 
+export interface SessionKernelFactBarrierV2 {
+  requestId: string;
+  source:
+    | 'toolIntentSubmit'
+    | 'controlEpochAdvance'
+    | 'invocationCancel';
+  minimumHighWater: number;
+  requiredFactIds: string[];
+  observedFactIds: string[];
+}
+
+export interface SessionOperationPlanActionBindingV2 {
+  operationId: string;
+  planActionId: string;
+  planRevision: string;
+  controlEpoch: number;
+}
+
 export interface SessionProviderTurnRecordV2 {
   providerTurnId: string;
   controlEpoch: number;
@@ -317,6 +337,7 @@ export interface SessionReviewFactRefV2 {
   factKind: string;
   controlEpoch?: number;
   planActionIds: string[];
+  sessionPlanActionId?: string;
   resourceIds: string[];
   operationId?: string;
   invocationId?: string;
@@ -339,6 +360,17 @@ export interface SessionReviewFactAccumulatorV2 {
   cleanup: SessionReviewFactCategoryAccumulatorV2;
   indeterminate: SessionReviewFactCategoryAccumulatorV2;
   priorEpochLateFacts: SessionReviewFactCategoryAccumulatorV2;
+  observedEffectPlanActions: Record<
+    string,
+    Record<
+      string,
+      {
+        factId: string;
+        ledgerSequence: number;
+        effectId?: string;
+      }
+    >
+  >;
   authorizedOperationSequences: Record<string, number>;
   pendingCleanupByResource: Record<
     string,
@@ -358,6 +390,7 @@ export interface SessionReviewPlannedActionV2 {
 }
 
 export interface SessionKernelReviewV2 {
+  projectionVersion: typeof SESSION_KERNEL_REVIEW_PROJECTION_V2;
   revision: number;
   status: 'draft' | 'final';
   planRevision?: string;

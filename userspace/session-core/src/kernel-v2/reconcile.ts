@@ -4,6 +4,7 @@ import type {
 } from '@deepcode/protocol';
 import {
   clearSessionCapabilityLeasesV2,
+  invalidateSessionCapabilityLeaseV2,
   recordSessionCapabilityLeaseV2,
   reduceSessionKernelFactsV2,
   sessionKernelFactsCaughtUpV2,
@@ -14,7 +15,11 @@ import {
   SESSION_KERNEL_OBSERVED_EFFECT_FACT_KINDS_V2,
 } from './factKinds.js';
 import {
-  requireSessionToolContextRefreshV2,
+  reconcileSessionKernelFactBarriersV2,
+  sessionKernelFactBarriersPendingV2,
+} from './factBarriers.js';
+import {
+  recordSessionToolContextInvalidationV2,
 } from './toolContext.js';
 import {
   canonicalJson,
@@ -32,6 +37,16 @@ import type {
 const CAPABILITY_ALLOWED_FACTS = new Set<string>([
   SESSION_KERNEL_FACT_KINDS_V2.authorization.capabilityIssued,
   SESSION_KERNEL_FACT_KINDS_V2.authorization.expansionAllowed,
+]);
+
+const CAPABILITY_LEASE_EVIDENCE_FACTS = new Set<string>([
+  ...CAPABILITY_ALLOWED_FACTS,
+  SESSION_KERNEL_FACT_KINDS_V2.invocation.admitted,
+]);
+
+const CAPABILITY_LEASE_INVALIDATION_FACTS = new Set<string>([
+  SESSION_KERNEL_FACT_KINDS_V2.authorization.leaseRevoked,
+  SESSION_KERNEL_FACT_KINDS_V2.authorization.leaseSuperseded,
 ]);
 
 const CAPABILITY_DENIED_FACTS = new Set<string>([
@@ -68,7 +83,11 @@ export function reconcileSessionKernelFactsPageV2(
 ): SessionKernelReconcileResultV2 {
   const previousWait = JSON.stringify(state.activeWait);
   let next = cloneSessionKernelLoopStateV2(state);
-  next.lineage = reduceSessionKernelFactsV2(next.lineage, page);
+  next.lineage = reduceSessionKernelFactsV2(
+    next.lineage,
+    page,
+    next.controlEpoch
+  );
   const newFacts = page.facts;
   for (const fact of newFacts) {
     const recent = compactRecentFact(fact);
@@ -84,19 +103,54 @@ export function reconcileSessionKernelFactsPageV2(
       && fact.factKind
         === SESSION_KERNEL_FACT_KINDS_V2.authorization.contextInvalidated
     ) {
-      next.toolContext = requireSessionToolContextRefreshV2(
+      next.toolContext = recordSessionToolContextInvalidationV2(
         next.toolContext,
-        'kernelFact'
+        fact.details
       );
       next.lineage = clearSessionCapabilityLeasesV2(next.lineage);
       next.previews = {};
     }
     if (
       fact.domain === 'authorization'
-      && CAPABILITY_ALLOWED_FACTS.has(fact.factKind)
+      && CAPABILITY_LEASE_INVALIDATION_FACTS.has(fact.factKind)
       && fact.lineage.capabilityLease
       && fact.lineage.operationId
       && fact.lineage.planActionIds.length === 1
+      && fact.lineage.controlEpoch === next.controlEpoch
+      && factPlanRevision(fact) === next.plan?.planRevision
+      && factOperationBelongsToCurrentPlanAction(
+        next,
+        fact.lineage.operationId,
+        fact.lineage.planActionIds[0]!
+      )
+    ) {
+      next.lineage = invalidateSessionCapabilityLeaseV2(
+        next.lineage,
+        {
+          planActionId: fact.lineage.planActionIds[0]!,
+          lease: fact.lineage.capabilityLease,
+        }
+      );
+    }
+    if (
+      (
+        fact.domain === 'authorization'
+        || fact.domain === 'invocation'
+      )
+      && CAPABILITY_LEASE_EVIDENCE_FACTS.has(fact.factKind)
+      && fact.lineage.capabilityLease
+      && fact.lineage.operationId
+      && fact.lineage.planActionIds.length === 1
+      && fact.lineage.controlEpoch === next.controlEpoch
+      && next.lineage.planActions[
+        fact.lineage.planActionIds[0]!
+      ]
+      && factPlanRevision(fact) === next.plan?.planRevision
+      && factOperationBelongsToCurrentPlanAction(
+        next,
+        fact.lineage.operationId,
+        fact.lineage.planActionIds[0]!
+      )
     ) {
       next.lineage = recordSessionCapabilityLeaseV2(next.lineage, {
         operationId: fact.lineage.operationId,
@@ -105,14 +159,20 @@ export function reconcileSessionKernelFactsPageV2(
       });
     }
   }
+  reconcileSessionKernelFactBarriersV2(next, newFacts);
   boundRecentFacts(next);
-  next.kernelWakeHint = false;
+  const lineageCaughtUp =
+    sessionKernelFactsCaughtUpV2(next.lineage);
+  const factBarriersPending =
+    sessionKernelFactBarriersPendingV2(next);
+  next.kernelWakeHint =
+    !lineageCaughtUp || factBarriersPending;
   next = resolveActiveWait(next, newFacts);
   return {
     state: next,
     newFactIds: newFacts.map((fact) => fact.factId),
     waitChanged: previousWait !== JSON.stringify(next.activeWait),
-    caughtUp: sessionKernelFactsCaughtUpV2(next.lineage),
+    caughtUp: lineageCaughtUp && !factBarriersPending,
   };
 }
 
@@ -259,17 +319,7 @@ function detailText(
   fact: KernelFactProjectionV2,
   field: string
 ): string | undefined {
-  const nestedFact = fact.details.fact;
-  const nestedData =
-    typeof nestedFact === 'object'
-    && nestedFact !== null
-    && !Array.isArray(nestedFact)
-    && typeof nestedFact.data === 'object'
-    && nestedFact.data !== null
-    && !Array.isArray(nestedFact.data)
-      ? nestedFact.data
-      : undefined;
-  const value = fact.details[field] ?? nestedData?.[field];
+  const value = fact.details[field];
   return typeof value === 'string' && value.trim() ? value : undefined;
 }
 
@@ -379,6 +429,23 @@ function recordReviewFact(
     )
   ) {
     appendReviewSample(state.reviewFacts.actualEffects, fact);
+    const planRevision = factPlanRevision(fact);
+    if (planRevision) {
+      const observedForRevision =
+        state.reviewFacts.observedEffectPlanActions[planRevision]
+        ?? {};
+      for (const planActionId of fact.lineage.planActionIds) {
+        observedForRevision[planActionId] = {
+          factId: fact.factId,
+          ledgerSequence: fact.ledgerSequence,
+          ...(fact.lineage.effectId
+            ? { effectId: fact.lineage.effectId }
+            : {}),
+        };
+      }
+      state.reviewFacts.observedEffectPlanActions[planRevision] =
+        observedForRevision;
+    }
   }
   if (
     fact.domain === 'authorization'
@@ -386,11 +453,16 @@ function recordReviewFact(
   ) {
     appendReviewSample(state.reviewFacts.denied, fact);
     appendReviewSample(state.reviewFacts.rejections, fact);
-  } else if (
-    fact.factKind
-      === SESSION_KERNEL_FACT_KINDS_V2.invocation.rejected
-  ) {
-    appendReviewSample(state.reviewFacts.rejections, fact);
+  } else if (isRejectedToolIntentCommandFact(fact)) {
+    const sessionPlanActionId = operationId
+      ? state.operationPlanActionBindings[operationId]
+        ?.planActionId
+      : undefined;
+    appendReviewSample(
+      state.reviewFacts.rejections,
+      fact,
+      sessionPlanActionId
+    );
   }
   if (fact.domain === 'cleanup') {
     appendReviewSample(state.reviewFacts.cleanup, fact);
@@ -448,12 +520,88 @@ function recordPriorEpochLateFact(
   }
 }
 
+function isRejectedToolIntentCommandFact(
+  fact: KernelFactProjectionV2
+): boolean {
+  if (
+    fact.domain !== 'control'
+    || fact.factKind
+      !== SESSION_KERNEL_FACT_KINDS_V2.control.commandRecorded
+  ) {
+    return false;
+  }
+  const result = fact.details.result;
+  if (!isJsonRecord(result) || result.kind !== 'toolIntentSubmission') {
+    return false;
+  }
+  const resultData = result.data;
+  if (!isJsonRecord(resultData)) return false;
+  const reply = resultData.reply;
+  return isJsonRecord(reply) && reply.kind === 'rejected';
+}
+
+function isJsonRecord(
+  value: unknown
+): value is Record<string, unknown> {
+  return typeof value === 'object'
+    && value !== null
+    && !Array.isArray(value);
+}
+
+function factPlanRevision(
+  fact: KernelFactProjectionV2
+): string | undefined {
+  const identity = fact.details.identity;
+  if (!isJsonRecord(identity)) return undefined;
+  if (typeof identity.planRevision === 'string') {
+    return identity.planRevision;
+  }
+  const authority = identity.authority;
+  if (!isJsonRecord(authority) || authority.kind !== 'planAction') {
+    return undefined;
+  }
+  const data = authority.data;
+  return isJsonRecord(data) && typeof data.planRevision === 'string'
+    ? data.planRevision
+    : undefined;
+}
+
+function factOperationBelongsToCurrentPlanAction(
+  state: SessionKernelLoopStateV2,
+  operationId: string,
+  planActionId: string
+): boolean {
+  const binding = state.operationPlanActionBindings[operationId];
+  if (binding) {
+    return binding.controlEpoch === state.controlEpoch
+      && binding.planRevision === state.plan?.planRevision
+      && binding.planActionId === planActionId;
+  }
+  const factDerivedOperation = state.lineage.operations[operationId];
+  const currentPlanAction = state.lineage.planActions[planActionId];
+  if (
+    factDerivedOperation?.planActionId === planActionId
+    && currentPlanAction?.planRevision === state.plan?.planRevision
+  ) {
+    return true;
+  }
+  return state.plan?.actions.some(
+    (action) =>
+      action.manifest.operationId === operationId
+      && action.manifest.planActionId === planActionId
+  ) ?? false;
+}
+
 function appendReviewSample(
   category: SessionReviewFactCategoryAccumulatorV2,
-  fact: KernelFactProjectionV2
+  fact: KernelFactProjectionV2,
+  sessionPlanActionId?: string
 ): void {
   category.totalCount += 1;
-  const reference = toReviewFactRef(fact);
+  const reference = toReviewFactRef(
+    fact,
+    sessionPlanActionId
+  );
   if (
     category.samples.length
       < MAX_REVIEW_FACT_SAMPLES_PER_CATEGORY
@@ -494,7 +642,8 @@ function updatePendingCleanup(
 }
 
 function toReviewFactRef(
-  fact: KernelFactProjectionV2
+  fact: KernelFactProjectionV2,
+  sessionPlanActionId?: string
 ): SessionReviewFactRefV2 {
   const originalDetails = canonicalJson(fact.details);
   const originalFact = canonicalJson(fact);
@@ -521,6 +670,9 @@ function toReviewFactRef(
         MAX_REVIEW_LINEAGE_IDS
       ),
     ],
+    ...(sessionPlanActionId
+      ? { sessionPlanActionId }
+      : {}),
     resourceIds: [
       ...fact.lineage.resourceIds.slice(
         0,

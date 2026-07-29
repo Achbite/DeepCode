@@ -10,6 +10,7 @@ use crate::tool_protocol_v2::{
 };
 use crate::v2::{
     decode_strict_json, empty_field, field_too_large, invalid_value, too_many_values,
+    validate_cross_language_safe_json_value_v2, validate_cross_language_safe_u64_v2,
     validate_wire_abi_header, zero_value, AttemptId, CancelRequestId, CommandRequestDigestV2,
     CommandRequestId, ControlEpoch, CorrelationRefV2, EffectId, FactId, InputId, InvocationId,
     KernelFactEnvelopeV2, OperationId, ResourceId, ResourceScopeV2, RunId, V2ValidationError,
@@ -202,6 +203,7 @@ pub struct KernelFactsQueryScopedV2 {
 
 impl KernelFactsQueryScopedV2 {
     pub fn validate(&self) -> Result<(), V2ValidationError> {
+        validate_cross_language_safe_u64_v2("afterLedgerSequence", self.after_ledger_sequence)?;
         validate_page_limit(self.limit, "limit")
     }
 }
@@ -302,6 +304,24 @@ pub enum KernelReplyV2 {
     ControlEpochAdvanced(ControlEpochAdvancedReplyV2),
     InvocationCancelResult(InvocationCancelReplyV2),
     Error(KernelErrorV2),
+}
+
+impl KernelReplyV2 {
+    pub fn validate(&self) -> Result<(), V2ValidationError> {
+        match self {
+            Self::RunOpened(reply) => reply.validate()?,
+            Self::ToolContext(reply) => reply.validate()?,
+            Self::CapabilityScopePreviewed(reply) => reply.validate()?,
+            Self::ToolIntentSubmission(reply) => reply.validate()?,
+            Self::KernelFactsProjected(reply) => reply.validate()?,
+            Self::ControlEpochAdvanced(reply) => reply.validate()?,
+            Self::InvocationCancelResult(reply) => reply.validate()?,
+            Self::Error(_) => {}
+        }
+        let encoded =
+            serde_json::to_value(self).map_err(|_| invalid_value("reply", "must serialize"))?;
+        validate_cross_language_safe_json_value_v2("reply", &encoded)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -558,13 +578,60 @@ impl ToolIntentSubmitReplyV2 {
         match self {
             Self::Admitted {
                 effective_deadline_ms,
+                admission_batch_high_water,
                 ..
-            } if *effective_deadline_ms == 0 => Err(zero_value("effectiveDeadlineMs")),
-            Self::AwaitingCapability { preview, .. } => preview.validate(),
-            Self::Rejected { guidance, .. } => {
-                validate_optional_text("guidance", Some(guidance.as_str()))
+            } => {
+                if *effective_deadline_ms == 0 {
+                    return Err(zero_value("effectiveDeadlineMs"));
+                }
+                if *admission_batch_high_water == 0 {
+                    return Err(zero_value("admissionBatchHighWater"));
+                }
+                validate_cross_language_safe_u64_v2(
+                    "admissionBatchHighWater",
+                    *admission_batch_high_water,
+                )
             }
-            _ => Ok(()),
+            Self::AwaitingCapability {
+                run_id,
+                operation_id,
+                accepted_control_epoch,
+                preview,
+                awaiting_batch_high_water,
+                ..
+            } => {
+                preview.validate()?;
+                if run_id != &preview.run_id
+                    || operation_id != &preview.operation_id
+                    || accepted_control_epoch != &preview.control_epoch
+                {
+                    return Err(invalid_value(
+                        "awaitingCapability.preview",
+                        "must match the reply runId, operationId, and acceptedControlEpoch",
+                    ));
+                }
+                if *awaiting_batch_high_water == 0 {
+                    return Err(zero_value("awaitingBatchHighWater"));
+                }
+                validate_cross_language_safe_u64_v2(
+                    "awaitingBatchHighWater",
+                    *awaiting_batch_high_water,
+                )
+            }
+            Self::Rejected {
+                guidance,
+                rejection_batch_high_water,
+                ..
+            } => {
+                validate_optional_text("guidance", Some(guidance.as_str()))?;
+                if *rejection_batch_high_water == 0 {
+                    return Err(zero_value("rejectionBatchHighWater"));
+                }
+                validate_cross_language_safe_u64_v2(
+                    "rejectionBatchHighWater",
+                    *rejection_batch_high_water,
+                )
+            }
         }
     }
 }
@@ -636,16 +703,23 @@ pub struct KernelFactProjectionV2 {
 impl KernelFactProjectionV2 {
     pub fn from_envelope(envelope: &KernelFactEnvelopeV2) -> Result<Self, V2ValidationError> {
         envelope.validate()?;
-        let details = serde_json::to_value(&envelope.payload)
+        let encoded_payload = serde_json::to_value(&envelope.payload)
             .map_err(|_| invalid_value("fact.details", "must serialize"))?;
-        let fact_kind = details
+        let encoded_fact = encoded_payload
             .as_object()
             .and_then(|object| object.get("fact"))
             .and_then(Value::as_object)
-            .and_then(|object| object.get("kind"))
+            .ok_or_else(|| invalid_value("fact.details", "must contain a typed fact"))?;
+        let fact_kind = encoded_fact
+            .get("kind")
             .and_then(Value::as_str)
             .ok_or_else(|| invalid_value("fact.details", "must contain a typed fact kind"))?
             .to_owned();
+        let details = encoded_fact
+            .get("data")
+            .filter(|value| value.is_object())
+            .cloned()
+            .ok_or_else(|| invalid_value("fact.details", "must contain object fact data"))?;
         let domain = match &envelope.payload {
             crate::v2::KernelFactPayloadV2::Control(_) => KernelFactDomainProjectionV2::Control,
             crate::v2::KernelFactPayloadV2::Authorization(_) => {
@@ -672,6 +746,14 @@ impl KernelFactProjectionV2 {
         }
         plan_action_ids.sort();
         plan_action_ids.dedup();
+        let mut resource_ids = envelope
+            .payload
+            .resource_ids()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        resource_ids.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        resource_ids.dedup();
         let lineage = KernelFactLineageV2 {
             run_id: envelope.payload.run_id().clone(),
             control_epoch: envelope.payload.control_epoch(),
@@ -681,12 +763,7 @@ impl KernelFactProjectionV2 {
             invocation_id: envelope.payload.invocation_id().cloned(),
             attempt_id: envelope.payload.attempt_id().cloned(),
             effect_id: envelope.payload.effect_id().cloned(),
-            resource_ids: envelope
-                .payload
-                .resource_ids()
-                .into_iter()
-                .cloned()
-                .collect(),
+            resource_ids,
         };
         let projection = Self {
             abi_version: envelope.abi_version.clone(),
@@ -711,10 +788,13 @@ impl KernelFactProjectionV2 {
         if self.run_sequence == 0 {
             return Err(zero_value("runSequence"));
         }
+        validate_cross_language_safe_u64_v2("ledgerSequence", self.ledger_sequence)?;
+        validate_cross_language_safe_u64_v2("runSequence", self.run_sequence)?;
         validate_text("factKind", &self.fact_kind)?;
         if !self.details.is_object() {
             return Err(invalid_value("details", "must be a JSON object"));
         }
+        validate_cross_language_safe_json_value_v2("details", &self.details)?;
         self.lineage.validate()
     }
 }
@@ -732,6 +812,15 @@ pub struct KernelFactProjectionPageV2 {
 
 impl KernelFactProjectionPageV2 {
     pub fn validate(&self) -> Result<(), V2ValidationError> {
+        validate_cross_language_safe_u64_v2(
+            "requestedAfterLedgerSequence",
+            self.requested_after_ledger_sequence,
+        )?;
+        validate_cross_language_safe_u64_v2("snapshotHighWater", self.snapshot_high_water)?;
+        validate_cross_language_safe_u64_v2(
+            "nextAfterLedgerSequence",
+            self.next_after_ledger_sequence,
+        )?;
         if self.facts.len() > MAX_PAGE_ITEMS_V2 {
             return Err(too_many_values("facts", MAX_PAGE_ITEMS_V2));
         }
@@ -789,6 +878,19 @@ pub struct ControlEpochAdvancedReplyV2 {
     pub command_batch_high_water: u64,
 }
 
+impl ControlEpochAdvancedReplyV2 {
+    pub fn validate(&self) -> Result<(), V2ValidationError> {
+        validate_cross_language_safe_u64_v2(
+            "supersededCapabilityCount",
+            self.superseded_capability_count,
+        )?;
+        if self.command_batch_high_water == 0 {
+            return Err(zero_value("commandBatchHighWater"));
+        }
+        validate_cross_language_safe_u64_v2("commandBatchHighWater", self.command_batch_high_water)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
     tag = "kind",
@@ -841,6 +943,27 @@ pub enum InvocationCancelReplyV2 {
         terminal_fact_id: FactId,
         terminal_phase: InvocationPhaseV2,
     },
+}
+
+impl InvocationCancelReplyV2 {
+    pub fn validate(&self) -> Result<(), V2ValidationError> {
+        let ledger_sequence = match self {
+            Self::Requested {
+                ledger_sequence, ..
+            }
+            | Self::AlreadyRequested {
+                ledger_sequence, ..
+            } => Some(*ledger_sequence),
+            Self::NoActiveInvocation { .. } | Self::AlreadyTerminal { .. } => None,
+        };
+        let Some(ledger_sequence) = ledger_sequence else {
+            return Ok(());
+        };
+        if ledger_sequence == 0 {
+            return Err(zero_value("ledgerSequence"));
+        }
+        validate_cross_language_safe_u64_v2("ledgerSequence", ledger_sequence)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

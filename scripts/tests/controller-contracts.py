@@ -23,9 +23,13 @@ SMOKE_SUITE_IDS = [
     "session.smoke.communication",
     "session.smoke.tools",
     "session.smoke.paths",
-    "session.smoke.authorization",
+    "session.smoke.loop",
 ]
-REQUIRED_SUITE_IDS = ["repository.required", "kernel.v2.contracts"]
+REQUIRED_SUITE_IDS = [
+    "repository.required",
+    "kernel.v2.contracts",
+    "session.v2.contracts",
+]
 ALL_SUITE_IDS = ["repository.static", *REQUIRED_SUITE_IDS, *SMOKE_SUITE_IDS]
 
 
@@ -145,13 +149,13 @@ def assert_registry_and_selection(controller) -> None:
                 "id": "communication.unregistered_growth_1",
                 "incidentRef": "fixture:case-budget",
                 "invariant": "fixture",
-                "sourcePath": "userspace/session-core/src/__tests__/smoke/communicationSmoke.ts",
+                "sourcePath": "userspace/session-core/tests/smoke/communication.mjs",
             })
             suite["cases"].append({
                 "id": "communication.unregistered_growth_2",
                 "incidentRef": "fixture:case-budget",
                 "invariant": "fixture",
-                "sourcePath": "userspace/session-core/src/__tests__/smoke/communicationSmoke.ts",
+                "sourcePath": "userspace/session-core/tests/smoke/communication.mjs",
             })
             break
     try:
@@ -208,7 +212,7 @@ def assert_machine_list(controller) -> None:
         "communication",
         "tools",
         "paths",
-        "authorization",
+        "loop",
     ]
     assert all(suite["cases"] for suite in smoke_payloads)
 
@@ -241,6 +245,11 @@ def assert_internal_runners_are_guarded() -> None:
             "kernel-v2-contracts.sh",
             [],
             "use bash ./test.sh --suite kernel.v2.contracts",
+        ),
+        (
+            "session-v2-contracts.sh",
+            [],
+            "use bash ./test.sh --suite session.v2.contracts",
         ),
     ):
         completed = subprocess.run(
@@ -331,7 +340,11 @@ def assert_isolated_public_entrypoint() -> None:
             "profiles": {
                 "required": {
                     "description": "Required fixture profile.",
-                    "suites": ["repository.required", "kernel.v2.contracts"],
+                    "suites": [
+                        "repository.required",
+                        "kernel.v2.contracts",
+                        "session.v2.contracts",
+                    ],
                 },
                 "static": {
                     "description": "Static fixture profile.",
@@ -346,6 +359,7 @@ def assert_isolated_public_entrypoint() -> None:
                     "suites": [
                         "repository.required",
                         "kernel.v2.contracts",
+                        "session.v2.contracts",
                         "session.smoke.fixture",
                     ],
                 },
@@ -353,6 +367,7 @@ def assert_isolated_public_entrypoint() -> None:
             "suites": [
                 fixture_suite("repository.required", True),
                 fixture_suite("kernel.v2.contracts", True),
+                fixture_suite("session.v2.contracts", True),
                 fixture_suite("repository.static", False),
                 fixture_suite("session.smoke.fixture", False, kind="smoke"),
             ],
@@ -381,6 +396,7 @@ def assert_isolated_public_entrypoint() -> None:
         assert [suite["id"] for suite in payload["suites"]] == [
             "repository.required",
             "kernel.v2.contracts",
+            "session.v2.contracts",
             "repository.static",
             "session.smoke.fixture",
         ]
@@ -405,6 +421,7 @@ def assert_isolated_public_entrypoint() -> None:
         assert receipt["worktree"]["indexTrusted"] is True
         assert receipt["results"][0]["id"] == "repository.required"
         assert receipt["results"][1]["id"] == "kernel.v2.contracts"
+        assert receipt["results"][2]["id"] == "session.v2.contracts"
 
         required_receipt = run_receipt("--profile", "required")
         assert required_receipt["authoritative"] is True

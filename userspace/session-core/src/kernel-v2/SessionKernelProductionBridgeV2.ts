@@ -44,6 +44,9 @@ import {
   sessionKernelFactsCaughtUpV2,
 } from './lineage.js';
 import {
+  sessionKernelFactBarriersPendingV2,
+} from './factBarriers.js';
+import {
   decodeAgentInputAttachmentsV2,
 } from './inputAttachmentsV2.js';
 import {
@@ -2635,7 +2638,8 @@ function sessionKernelFactsAreReady(
   state: SessionKernelLoopStateV2
 ): boolean {
   return !state.kernelWakeHint
-    && sessionKernelFactsCaughtUpV2(state.lineage);
+    && sessionKernelFactsCaughtUpV2(state.lineage)
+    && !sessionKernelFactBarriersPendingV2(state);
 }
 
 function awaitingKernelFacts(

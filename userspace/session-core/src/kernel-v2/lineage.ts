@@ -133,6 +133,35 @@ export function registerSessionPlanActionLineageV2(
 }
 
 /**
+ * Restores Session-owned correlation for a dynamic operation. This records no
+ * Kernel authority, invocation, attempt, effect, or fact evidence.
+ */
+export function registerSessionOperationPlanActionLineageV2(
+  state: SessionKernelLineageStateV2,
+  input: {
+    operationId: string;
+    planActionId: string;
+    toolId: string;
+  }
+): SessionKernelLineageStateV2 {
+  const current = cloneLineageState(state);
+  const planAction = current.planActions[input.planActionId];
+  if (!planAction) {
+    throw new SessionKernelLineageError(
+      'session_kernel_plan_action_lineage_missing',
+      `PlanAction ${input.planActionId} is not present in Session lineage.`
+    );
+  }
+  const operation = current.operations[input.operationId]
+    ?? emptyOperation(input.operationId);
+  bindOperationPlanAction(operation, input.planActionId);
+  bindOperationTool(operation, input.toolId);
+  appendUnique(planAction.operationIds, operation.operationId);
+  current.operations[operation.operationId] = operation;
+  return current;
+}
+
+/**
  * Records only Kernel-issued opaque lease references. Session does not copy or
  * derive the canonical scope that produced the lease.
  */
@@ -145,40 +174,68 @@ export function recordSessionCapabilityLeaseV2(
   }
 ): SessionKernelLineageStateV2 {
   const current = cloneLineageState(state);
+  const planAction = current.planActions[input.planActionId];
+  if (!planAction) {
+    throw new SessionKernelLineageError(
+      'session_kernel_plan_action_lineage_missing',
+      `PlanAction ${input.planActionId} is not present in Session lineage.`
+    );
+  }
   const operation = current.operations[input.operationId]
     ?? emptyOperation(input.operationId);
   bindOperationPlanAction(operation, input.planActionId);
-  const existing = operation.leases.find(
-    (lease) => lease.leaseId === input.lease.leaseId
-      && lease.version === input.lease.version
+  appendUnique(planAction.operationIds, input.operationId);
+  current.operations[operation.operationId] = operation;
+  const planActionOperations = Object.values(current.operations)
+    .filter((candidate) =>
+      candidate.planActionId === input.planActionId
+    );
+  const matchingLeaseVersions = planActionOperations.flatMap(
+    (candidate) => candidate.leases.filter(
+      (lease) => lease.leaseId === input.lease.leaseId
+    )
   );
-  if (existing && existing.scopeDigest !== input.lease.scopeDigest) {
-    throw new SessionKernelLineageError(
-      'session_kernel_lease_identity_conflict',
-      `Lease ${input.lease.leaseId} version ${input.lease.version} changed scope digest.`
-    );
+  for (const existing of matchingLeaseVersions) {
+    if (
+      existing.version === input.lease.version
+      && existing.scopeDigest !== input.lease.scopeDigest
+    ) {
+      throw new SessionKernelLineageError(
+        'session_kernel_lease_identity_conflict',
+        `Lease ${input.lease.leaseId} version ${input.lease.version} changed scope digest.`
+      );
+    }
   }
-  const newestExistingVersion = operation.leases
-    .filter((lease) => lease.leaseId === input.lease.leaseId)
-    .reduce(
-      (newest, lease) => Math.max(newest, lease.version),
-      -1
-    );
+  const newestExistingVersion = matchingLeaseVersions.reduce(
+    (newest, lease) => Math.max(newest, lease.version),
+    -1
+  );
   if (newestExistingVersion > input.lease.version) {
-    current.operations[operation.operationId] = operation;
     return current;
   }
-  if (!existing) operation.leases.push({ ...input.lease });
-  operation.leases = operation.leases.filter(
-    (lease) =>
-      lease.leaseId !== input.lease.leaseId
-      || lease.version === input.lease.version
-  );
-  operation.leases.sort(
-    (left, right) => left.version - right.version
-      || left.leaseId.localeCompare(right.leaseId)
-  );
-  current.operations[operation.operationId] = operation;
+  for (const candidate of planActionOperations) {
+    candidate.leases = candidate.leases.filter(
+      (lease) =>
+        lease.leaseId !== input.lease.leaseId
+        || lease.version >= input.lease.version
+    );
+  }
+  const target = current.operations[input.operationId]!;
+  if (
+    !target.leases.some(
+      (lease) =>
+        lease.leaseId === input.lease.leaseId
+        && lease.version === input.lease.version
+    )
+  ) {
+    target.leases.push({ ...input.lease });
+  }
+  for (const candidate of planActionOperations) {
+    candidate.leases.sort(
+      (left, right) => left.version - right.version
+        || left.leaseId.localeCompare(right.leaseId)
+    );
+  }
   return current;
 }
 
@@ -195,6 +252,36 @@ export function clearSessionCapabilityLeasesV2(
       continue;
     }
     operation.leases = [];
+  }
+  return current;
+}
+
+export function invalidateSessionCapabilityLeaseV2(
+  state: SessionKernelLineageStateV2,
+  input: {
+    planActionId: string;
+    lease: CapabilityLeaseRefV2;
+  }
+): SessionKernelLineageStateV2 {
+  const current = cloneLineageState(state);
+  for (const operation of Object.values(current.operations)) {
+    if (operation.planActionId !== input.planActionId) continue;
+    const exact = operation.leases.find(
+      (lease) =>
+        lease.leaseId === input.lease.leaseId
+        && lease.version === input.lease.version
+    );
+    if (exact && exact.scopeDigest !== input.lease.scopeDigest) {
+      throw new SessionKernelLineageError(
+        'session_kernel_lease_identity_conflict',
+        `Lease ${input.lease.leaseId} version ${input.lease.version} changed scope digest.`
+      );
+    }
+    operation.leases = operation.leases.filter(
+      (lease) =>
+        lease.leaseId !== input.lease.leaseId
+        || lease.version > input.lease.version
+    );
   }
   return current;
 }
@@ -224,26 +311,7 @@ export function recordSessionToolIntentSubmissionV2(
     appendUnique(planAction.operationIds, intent.operationId);
   }
   current.operations[intent.operationId] = operation;
-  if (intent.authority.kind === 'planAction' && intent.authority.data.lease) {
-    current = recordSessionCapabilityLeaseV2(current, {
-      operationId: intent.operationId,
-      planActionId: intent.authority.data.planActionId,
-      lease: intent.authority.data.lease,
-    });
-  }
   const recordedOperation = current.operations[intent.operationId]!;
-  if (reply.kind === 'admitted' && reply.data.lease) {
-    const planActionId = intent.authority.kind === 'planAction'
-      ? intent.authority.data.planActionId
-      : undefined;
-    if (planActionId) {
-      current = recordSessionCapabilityLeaseV2(current, {
-        operationId: intent.operationId,
-        planActionId,
-        lease: reply.data.lease,
-      });
-    }
-  }
   const invocationId = reply.kind === 'admitted'
     || reply.kind === 'awaitingCapability'
     ? reply.data.invocationId
@@ -264,7 +332,8 @@ export function recordSessionToolIntentSubmissionV2(
 
 export function reduceSessionKernelFactsV2(
   state: SessionKernelLineageStateV2,
-  page: KernelFactProjectionPageV2
+  page: KernelFactProjectionPageV2,
+  currentControlEpoch: number
 ): SessionKernelLineageStateV2 {
   if (page.requestedAfterLedgerSequence !== state.cursor.afterLedgerSequence) {
     throw new SessionKernelLineageError(
@@ -292,7 +361,11 @@ export function reduceSessionKernelFactsV2(
         `Kernel fact ${fact.factId} did not advance the durable ledger sequence.`
       );
     }
-    current = reduceFactLineage(current, fact);
+    current = reduceFactLineage(
+      current,
+      fact,
+      currentControlEpoch
+    );
     current.factCount += 1;
     current.lastFactId = fact.factId;
     current.lastFactSequence = fact.ledgerSequence;
@@ -343,7 +416,8 @@ export function sessionKernelFactsCaughtUpV2(
 
 function reduceFactLineage(
   state: SessionKernelLineageStateV2,
-  fact: KernelFactProjectionV2
+  fact: KernelFactProjectionV2,
+  currentControlEpoch: number
 ): SessionKernelLineageStateV2 {
   if (fact.lineage.runId !== state.runId) {
     throw runMismatch(state.runId, fact.lineage.runId);
@@ -352,7 +426,15 @@ function reduceFactLineage(
   if (operationId) {
     const operation = state.operations[operationId] ?? emptyOperation(operationId);
     if (fact.lineage.planActionIds.length === 1) {
-      bindOperationPlanAction(operation, fact.lineage.planActionIds[0]!);
+      const planActionId = fact.lineage.planActionIds[0]!;
+      bindOperationPlanAction(operation, planActionId);
+      const currentPlanAction =
+        fact.lineage.controlEpoch === currentControlEpoch
+          ? state.planActions[planActionId]
+          : undefined;
+      if (currentPlanAction) {
+        appendUnique(currentPlanAction.operationIds, operationId);
+      }
     }
     operation.factCount += 1;
     operation.lastFactId = fact.factId;
