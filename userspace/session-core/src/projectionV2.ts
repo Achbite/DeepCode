@@ -67,6 +67,7 @@ export function buildNarrativeTimelineProjection(
   const auxiliaryEvents = (input.auxiliaryEvents ?? []).filter(
     (event) => !committedEventIds.has(event.id)
   );
+  const currentRunEvents = eventsForLatestRun(input.events);
   const context: ProjectionContext = {
     sessionId: input.sessionId,
     committedEventIds,
@@ -103,7 +104,7 @@ export function buildNarrativeTimelineProjection(
     updateTurnStatus(turn, event, payload, block);
   }
 
-  const interactionProjection = buildInteractionProjection(input.events);
+  const interactionProjection = buildInteractionProjection(currentRunEvents);
   const turns = convergeTerminalTurnBlocks(settleInteractionBlocks(
     context.turns
       .filter((turn) => turn.blocks.length > 0)
@@ -133,7 +134,7 @@ export function buildNarrativeTimelineProjection(
       ?? new Date(0).toISOString(),
     turns,
     eventCount: input.events.length,
-    taskProjection: buildTaskProjection(input.events),
+    taskProjection: buildTaskProjection(currentRunEvents),
     interactionProjection,
     runProjection: buildRunProjection(input.events),
     tokenUsageProjection:
@@ -317,9 +318,10 @@ function interactionDecisionState(
 export function findLatestPendingPermission(
   events: AgentEvent[]
 ): PendingPermissionProjection | null {
+  const currentRunEvents = eventsForLatestRun(events);
   const resolved = new Set<string>();
-  for (let index = events.length - 1; index >= 0; index -= 1) {
-    const event = events[index];
+  for (let index = currentRunEvents.length - 1; index >= 0; index -= 1) {
+    const event = currentRunEvents[index];
     if (!event) continue;
     const payload = recordValue(event.payload);
     if (!payload) continue;
@@ -969,21 +971,26 @@ function buildInteractionProjection(
 }
 
 function buildRunProjection(events: AgentEvent[]): AgentTimelineRunProjection | undefined {
-  let runId: string | undefined;
+  const runId = latestExplicitRunId(events);
+  if (!runId) return undefined;
+
   let status: AgentTimelineRunProjection['status'] = 'active';
   let phase: AgentTimelineRunProjection['phase'] = 'preparing';
   let waitReason: string | undefined;
   let activeInteractionId: string | undefined;
   for (const event of events) {
     const payload = recordValue(event.payload);
-    runId = stringValue(payload?.runId) ?? runId;
+    if (stringValue(payload?.runId) !== runId) continue;
     if (event.kind === 'tool_call') phase = 'executing';
     if (event.kind === 'tool_result') phase = 'validating';
     if (event.kind === 'assistant_msg') {
       status = 'succeeded';
       phase = 'settled';
     }
-    if (event.kind === 'error') {
+    if (
+      event.kind === 'error'
+      && eventStatus(event, payload) === 'failed'
+    ) {
       status = 'failed';
       phase = 'settled';
     }
@@ -1018,7 +1025,6 @@ function buildRunProjection(events: AgentEvent[]): AgentTimelineRunProjection | 
       }
     }
   }
-  if (!runId) return undefined;
   return {
     runId,
     revision: events.length,
@@ -1031,6 +1037,22 @@ function buildRunProjection(events: AgentEvent[]): AgentTimelineRunProjection | 
       status: 'unavailable',
     },
   };
+}
+
+function eventsForLatestRun(events: AgentEvent[]): AgentEvent[] {
+  const runId = latestExplicitRunId(events);
+  if (!runId) return events;
+  return events.filter((event) => {
+    const payload = recordValue(event.payload);
+    return stringValue(payload?.runId) === runId;
+  });
+}
+
+function latestExplicitRunId(events: AgentEvent[]): string | undefined {
+  return events.reduce<string | undefined>((latest, event) => {
+    const payload = recordValue(event.payload);
+    return stringValue(payload?.runId) ?? latest;
+  }, undefined);
 }
 
 const MAX_PROVIDER_USAGE_TOKENS_V2 = 1_000_000_000_000;

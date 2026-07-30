@@ -20,8 +20,12 @@ import {
 import type {
   SessionNaturalLanguagePlanV2,
   SessionProviderResultMetadataV2,
+  SessionProviderToolCallReceiptV2,
   SessionProviderTurnInputV2,
   SessionProviderTurnOutputV2,
+} from './types.js';
+import {
+  SESSION_PROVIDER_TOOL_CALL_RECEIPT_V2_SCHEMA,
 } from './types.js';
 
 export interface SessionProviderPlanActionDraftV2 {
@@ -48,10 +52,13 @@ export type SessionKernelProviderBackendOutputV2 = (
       plan: SessionProviderPlanDraftV2;
     }
   | {
-      kind: 'nativeToolCall';
-      callId: string;
-      toolId: string;
-      arguments: unknown;
+      kind: 'nativeToolCalls';
+      calls: Array<{
+        callId: string;
+        toolName: string;
+        toolId: string;
+        arguments: RawToolArgumentsV2;
+      }>;
     }
   | {
       kind: 'text';
@@ -63,6 +70,7 @@ export type SessionKernelProviderBackendOutputV2 = (
     }
 ) & {
   providerResult: SessionProviderResultMetadataV2;
+  responseDigest: string;
 };
 
 /**
@@ -80,9 +88,10 @@ export interface SessionKernelProviderAdapterV2
   extends SessionKernelProviderPortV2 {}
 
 /**
- * Only a provider-native tool call or one exact standalone ToolIntent frame
- * enters the executable lane. Prose, fenced JSON, and embedded objects remain
- * answers and can never trigger execution.
+ * Only provider-native tool calls or one exact standalone ToolIntent frame
+ * enter the executable lane. The complete response is reduced to a safe
+ * receipt before Session can persist and admit the ordered call queue. Prose,
+ * fenced JSON, and embedded objects remain answers and can never execute.
  */
 export class StrictSessionKernelProviderAdapterV2
 implements SessionKernelProviderAdapterV2 {
@@ -112,20 +121,34 @@ implements SessionKernelProviderAdapterV2 {
           ),
           providerResult: output.providerResult,
         };
-      case 'nativeToolCall':
-        const nativeToolId =
-          requiredToolId(output.toolId);
-        requirePermittedTool(input, nativeToolId);
+      case 'nativeToolCalls': {
+        const sources = output.calls.map((call) => {
+          const nativeToolId = requiredToolId(call.toolId);
+          requirePermittedTool(input, nativeToolId);
+          return {
+            source: 'providerNative' as const,
+            callId: requiredIdentity(call.callId, 'callId'),
+            toolId: nativeToolId,
+            arguments: cloneJson(call.arguments),
+          };
+        });
         return {
           kind: 'toolIntent',
-          source: {
-            source: 'providerNative',
-            callId: requiredIdentity(output.callId, 'callId'),
-            toolId: nativeToolId,
-            arguments: output.arguments,
-          },
+          sources,
+          receipt: providerToolCallReceipt(
+            input.providerTurnId,
+            output.responseDigest,
+            output.calls.map((call) => ({
+              callId: call.callId,
+              toolName: call.toolName,
+              toolId: call.toolId,
+              arguments: call.arguments,
+            })),
+            this.clock.now()
+          ),
           providerResult: output.providerResult,
         };
+      }
       case 'text':
         if (!output.text.trim()) {
           return {
@@ -140,10 +163,22 @@ implements SessionKernelProviderAdapterV2 {
           requirePermittedTool(input, frame.toolId);
           return {
             kind: 'toolIntent',
-            source: {
+            sources: [{
               source: 'textFrame',
               frame: output.text,
-            },
+            }],
+            receipt: providerToolCallReceipt(
+              input.providerTurnId,
+              output.responseDigest,
+              [{
+                callId: `text-${sha256Hash(output.text.trim())
+                  .slice('sha256:'.length)}`,
+                toolName: frame.toolId,
+                toolId: frame.toolId,
+                arguments: frame.arguments,
+              }],
+              this.clock.now()
+            ),
             providerResult: output.providerResult,
           };
         }
@@ -162,6 +197,61 @@ implements SessionKernelProviderAdapterV2 {
         };
     }
   }
+}
+
+function providerToolCallReceipt(
+  providerTurnId: string,
+  responseDigest: string,
+  calls: Array<{
+    callId: string;
+    toolName: string;
+    toolId: string;
+    arguments: RawToolArgumentsV2;
+  }>,
+  recordedAt: string
+): SessionProviderToolCallReceiptV2 {
+  if (calls.length === 0 || calls.length > 32) {
+    throw new SessionKernelProviderAdapterError(
+      'session_kernel_provider_tool_call_count_invalid',
+      'Provider tool calls must contain 1..=32 entries.'
+    );
+  }
+  const callIds = new Set<string>();
+  for (const call of calls) {
+    const callId = requiredIdentity(call.callId, 'callId');
+    if (callIds.has(callId)) {
+      throw new SessionKernelProviderAdapterError(
+        'session_kernel_provider_tool_call_identity_duplicate',
+        'Provider tool-call identities must be unique within one response.'
+      );
+    }
+    callIds.add(callId);
+  }
+  return {
+    schemaVersion: SESSION_PROVIDER_TOOL_CALL_RECEIPT_V2_SCHEMA,
+    providerTurnId: requiredIdentity(providerTurnId, 'providerTurnId'),
+    responseDigest: requiredDigest(responseDigest, 'responseDigest'),
+    callCount: calls.length,
+    calls: calls.map((call, index) => ({
+      ordinal: index + 1,
+      callId: requiredIdentity(call.callId, 'callId'),
+      toolName: requiredIdentity(call.toolName, 'toolName'),
+      toolId: requiredToolId(call.toolId),
+      argumentsDigest: sha256Hash(canonicalJson(call.arguments)),
+    })),
+    recordedAt: requiredIdentity(recordedAt, 'recordedAt'),
+  };
+}
+
+function requiredDigest(value: string, field: string): string {
+  const digest = requiredIdentity(value, field);
+  if (!/^sha256:[0-9a-f]{64}$/u.test(digest)) {
+    throw new SessionKernelProviderAdapterError(
+      'session_kernel_provider_digest_invalid',
+      `${field} is not a canonical sha256 digest.`
+    );
+  }
+  return digest;
 }
 
 function requirePermittedTool(
@@ -385,6 +475,10 @@ function requiredText(
     );
   }
   return value;
+}
+
+function cloneJson<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
 }
 
 export class SessionKernelProviderAdapterError extends Error {

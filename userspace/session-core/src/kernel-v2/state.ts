@@ -22,6 +22,11 @@ import {
   type SessionContextMemoryV2,
 } from './sessionMemory.js';
 import {
+  abortSessionProviderToolCallQueueV2,
+  validateSessionProviderToolCallQueueV2,
+  type SessionProviderToolCallQueueV2,
+} from './providerToolCallQueue.js';
+import {
   SESSION_KERNEL_CHECKPOINT_V2_SCHEMA,
   SESSION_KERNEL_LOOP_V2_SCHEMA,
   type SessionActiveWaitV2,
@@ -77,6 +82,7 @@ export interface SessionKernelLoopStateV2 {
   activeWait?: SessionActiveWaitV2;
   pendingGuidance: string[];
   providerTurn?: SessionProviderTurnRecordV2;
+  providerToolCallQueue?: SessionProviderToolCallQueueV2;
   providerOutcomes: SessionProviderOutcomeRecordV2[];
   providerOutcomeHistoryOmittedCount: number;
   planActionSettlements: Record<string, SessionPlanActionSettlementV2>;
@@ -236,6 +242,43 @@ export function restoreSessionKernelLoopStateV2(
   state.providerOutcomeHistoryOmittedCount +=
     boundedOutcomes.omittedCount;
   state.planActionSettlements ??= {};
+  if (state.providerToolCallQueue) {
+    validateSessionProviderToolCallQueueV2(
+      state.providerToolCallQueue,
+      {
+        runId: state.runId,
+        controlEpoch: state.controlEpoch,
+      }
+    );
+  }
+  if (
+    state.providerToolCallQueue?.status === 'active'
+    && (
+      state.providerTurn?.providerTurnId
+        !== state.providerToolCallQueue.providerTurnId
+      || state.providerTurn.controlEpoch
+        !== state.providerToolCallQueue.controlEpoch
+      || state.providerTurn.status !== 'awaitingTools'
+    )
+  ) {
+    throw new SessionKernelStateError(
+      'session_kernel_provider_tool_call_queue_turn_mismatch',
+      'Active Provider tool calls do not match the durable Provider turn.'
+    );
+  }
+  if (
+    state.providerTurn?.status === 'awaitingTools'
+    && (
+      state.providerToolCallQueue?.status !== 'active'
+      || state.providerToolCallQueue.providerTurnId
+        !== state.providerTurn.providerTurnId
+    )
+  ) {
+    throw new SessionKernelStateError(
+      'session_kernel_provider_tool_call_turn_queue_missing',
+      'Provider turn awaits tools without a matching durable queue.'
+    );
+  }
   validateOperationPlanActionBindings(
     state.operationPlanActionBindings,
     state
@@ -405,6 +448,11 @@ export function recordSessionUserInputV2(
       next.inputs.some((record) => record.inputId === inputId)
   );
   next.pendingEpochInput = cloneJson(input);
+  abortSessionProviderToolCallQueueV2(
+    next,
+    'userInput',
+    input.recordedAt
+  );
   next.plan = undefined;
   next.planDecision = undefined;
   next.projectedPlanRevision = undefined;
@@ -551,6 +599,15 @@ export function checkpointSessionKernelStateV2(
     next.operationPlanActionBindings,
     next
   );
+  if (next.providerToolCallQueue) {
+    validateSessionProviderToolCallQueueV2(
+      next.providerToolCallQueue,
+      {
+        runId: next.runId,
+        controlEpoch: next.controlEpoch,
+      }
+    );
+  }
   next.factsById = {};
   next.factHistoryOmittedCount = 0;
   next.reviewFacts = createSessionReviewFactAccumulatorV2(

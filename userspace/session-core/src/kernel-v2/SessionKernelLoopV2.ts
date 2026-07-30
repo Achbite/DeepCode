@@ -2,6 +2,7 @@ import type {
   CapabilityScopePreviewReplyV2,
   ControlEpochAdvancedReplyV2,
   InvocationCancelReplyV2,
+  KernelFactProjectionV2,
 } from '@deepcode/protocol';
 import {
   nextSessionKernelFactsQueryV2,
@@ -33,6 +34,7 @@ import {
   checkpointSessionKernelStateV2,
   cloneSessionKernelLoopStateV2,
   createSessionKernelLoopStateV2,
+  recordSessionProviderOutcomeV2,
   recordSessionPlanDecisionV2,
   recordSessionPlanV2,
   recordSessionUserInputV2,
@@ -41,6 +43,10 @@ import {
   type SessionKernelInitialStateV2,
   type SessionKernelLoopStateV2,
 } from './state.js';
+import {
+  markSessionProviderToolCallQueueOutcomeRecordedV2,
+  reconcileSessionProviderToolCallQueueV2,
+} from './providerToolCallQueue.js';
 import {
   toolContextRefV2,
 } from './toolContext.js';
@@ -149,6 +155,8 @@ export class SessionKernelLoopV2 {
           await this.project(projectionId, kind, data, recordedAt);
         },
         reconcileFacts: () => this.reconcileFactsInternal(),
+        settleProviderToolCallQueue: () =>
+          this.settleProviderToolCallQueue(),
         recordProviderPlan: (plan) =>
           this.persistPlan(plan),
         settlePlanActionCompleted: (
@@ -514,6 +522,12 @@ export class SessionKernelLoopV2 {
     return this.providers.run(request);
   }
 
+  async resumePendingProviderToolCalls():
+  Promise<SessionKernelLoopResultV2 | undefined> {
+    if (this.state.runCancellation) return undefined;
+    return this.providers.resumePendingToolCalls();
+  }
+
   async handleUserInput(
     input: SessionUserInputRecordV2,
     nextTurn: SessionProviderTurnRequestV2
@@ -551,6 +565,7 @@ export class SessionKernelLoopV2 {
         };
         await this.saveCheckpoint();
       }
+      await this.settleProviderToolCallQueue();
       let cancellation = currentRunCancellation(this.state, input);
 
       await this.requests.replay('control');
@@ -851,6 +866,7 @@ export class SessionKernelLoopV2 {
       const oldInvocationId = activeInvocationId(this.state);
       this.state = recordSessionUserInputV2(this.state, input);
       await this.saveCheckpoint();
+      await this.settleProviderToolCallQueue();
 
       await this.advancePendingInput(oldInvocationId);
       await this.ensureInputProjected(input);
@@ -1164,7 +1180,10 @@ export class SessionKernelLoopV2 {
   }
 
   private async reconcileFactsInternal(): Promise<void> {
-    await this.requests.replay('query');
+    const replayed = await this.requests.replay('query');
+    if (replayed?.kind === 'factsQuery') {
+      await this.settleProviderToolCallQueue(replayed.reply.facts);
+    }
     for (let pageIndex = 0; pageIndex < this.maxFactsPages; pageIndex += 1) {
       const query = nextSessionKernelFactsQueryV2(
         this.state.lineage,
@@ -1186,10 +1205,111 @@ export class SessionKernelLoopV2 {
         outcome,
         'factsQuery'
       ).reply;
-      if (!page.hasMore) return;
+      await this.settleProviderToolCallQueue(page.facts);
+      if (!page.hasMore) {
+        return;
+      }
     }
     this.state.kernelWakeHint = true;
     await this.saveCheckpoint();
+  }
+
+  private async settleProviderToolCallQueue(
+    observedFacts: readonly KernelFactProjectionV2[] = []
+  ): Promise<void> {
+    const reconciliation = reconcileSessionProviderToolCallQueueV2(
+      this.state,
+      this.ports.clock.now(),
+      observedFacts
+    );
+    const queue = this.state.providerToolCallQueue;
+    if (!queue) return;
+    if (reconciliation.changed) {
+      await this.saveCheckpoint();
+    }
+    if (queue.status === 'active' || queue.outcomeRecorded) return;
+
+    if (
+      queue.status === 'aborted'
+      && queue.abortReason !== 'userInput'
+      && queue.abortReason !== 'runCancelled'
+    ) {
+      const guidance = [
+        'The ordered Provider tool-call sequence stopped after',
+        queue.abortReason ?? 'an execution failure',
+        `(${queue.calls.filter((call) =>
+          call.status === 'unexecuted'
+        ).length} queued call(s) were not executed).`,
+      ].join(' ');
+      if (!this.state.pendingGuidance.includes(guidance)) {
+        this.state.pendingGuidance.push(guidance);
+      }
+    }
+    const outcome = {
+      providerTurnId: queue.providerTurnId,
+      outputKind: 'toolIntent',
+      recordedAt: queue.settledAt ?? this.ports.clock.now(),
+      summary: queue.status === 'completed'
+        ? `Completed ${queue.calls.length} ordered Provider tool call(s).`
+        : [
+            'Aborted ordered Provider tool calls:',
+            queue.abortReason ?? 'unknown',
+            `unexecuted=${queue.calls.filter((call) =>
+              call.status === 'unexecuted'
+            ).length}`,
+          ].join(' '),
+      toolCallReceipt: cloneJson(queue.receipt),
+      providerResult: cloneJson(queue.providerResult),
+    } as const;
+    if (queue.status === 'completed') {
+      await this.project(
+        `provider:${queue.providerTurnId}:completed`,
+        'provider.completed',
+        {
+          providerTurnId: queue.providerTurnId,
+          controlEpoch: queue.controlEpoch,
+          outputKind: 'toolIntent',
+          result: {
+            kind: 'orderedToolCallsCompleted',
+            callCount: queue.calls.length,
+          },
+          toolCallReceipt: queue.receipt,
+          providerOutcome: queue.providerResult,
+        },
+        queue.settledAt
+      );
+    } else {
+      await this.project(
+        `provider:${queue.providerTurnId}:tool-calls-aborted`,
+        'diagnostic',
+        {
+          providerTurnId: queue.providerTurnId,
+          status: 'blocked',
+          code: 'session_kernel_provider_tool_calls_aborted',
+          stage: 'provider.toolCallQueue',
+          reason: queue.abortReason,
+          unexecutedOrdinals: queue.calls
+            .filter((call) => call.status === 'unexecuted')
+            .map((call) => call.ordinal),
+          toolCallReceipt: queue.receipt,
+        },
+        queue.settledAt
+      );
+    }
+    const previousOutcomes = cloneJson(this.state.providerOutcomes);
+    const previousOmittedCount =
+      this.state.providerOutcomeHistoryOmittedCount;
+    try {
+      recordSessionProviderOutcomeV2(this.state, outcome);
+      markSessionProviderToolCallQueueOutcomeRecordedV2(this.state);
+      await this.saveCheckpoint();
+    } catch (error) {
+      this.state.providerOutcomes = previousOutcomes;
+      this.state.providerOutcomeHistoryOmittedCount =
+        previousOmittedCount;
+      queue.outcomeRecorded = false;
+      throw error;
+    }
   }
 
   private async ensurePlanProjected(): Promise<void> {

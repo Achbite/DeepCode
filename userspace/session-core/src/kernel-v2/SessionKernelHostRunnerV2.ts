@@ -18,6 +18,7 @@ import type {
   SessionActiveWaitV2,
   SessionKernelLoopResultV2,
   SessionKernelReviewV2,
+  SessionProviderTurnTargetV2,
   SessionProviderTurnRequestV2,
   SessionProviderProfileBootstrapV2,
   SessionPlanDecisionV2,
@@ -60,6 +61,11 @@ export type SessionPlanActionDriveStepV2 =
       kind: 'budgetExhausted';
       providerCallBudget: number;
       completedProviderCalls: number;
+    }
+  | {
+      kind: 'toolCallsProgressed';
+      completedCallCount: number;
+      remainingCallCount: number;
     }
   | {
       kind: 'interrupted';
@@ -138,7 +144,25 @@ export class SessionKernelHostRunnerV2 {
   async runInitialTurn(
     guidance: string[] = []
   ): Promise<SessionKernelLoopResultV2> {
-    const recordedPlan = this.loop.snapshot().plan;
+    let snapshot = this.loop.snapshot();
+    const queued = snapshot.providerToolCallQueue;
+    if (
+      queued
+      && (queued.status === 'active' || !queued.outcomeRecorded)
+    ) {
+      requirePlanningToolCallQueue(queued.target);
+      const resumed =
+        await this.loop.resumePendingProviderToolCalls();
+      if (resumed) return resumed;
+      snapshot = this.loop.snapshot();
+      if (snapshot.activeWait) {
+        throw new SessionKernelHostRunnerError(
+          'session_kernel_initial_queue_wait_unreported',
+          'Recovered Provider tool calls entered an ActiveWait without a Session result.'
+        );
+      }
+    }
+    const recordedPlan = snapshot.plan;
     if (recordedPlan) {
       return { kind: 'plan', plan: recordedPlan };
     }
@@ -216,6 +240,7 @@ export class SessionKernelHostRunnerV2 {
   async runPlanAction(
     planActionId: string,
     expectedPlanRevision: string,
+    remainingToolCallBudget: number,
     guidance: string[] = []
   ): Promise<SessionKernelLoopResultV2> {
     const state = this.loop.snapshot();
@@ -225,6 +250,7 @@ export class SessionKernelHostRunnerV2 {
       reason: 'planExecution',
       target: { kind: 'planAction', planActionId },
       guidance,
+      remainingToolCallBudget,
     });
   }
 
@@ -329,6 +355,19 @@ export class SessionKernelHostRunnerV2 {
       options.providerCallBudget
     );
     let state = this.loop.snapshot();
+    const unsettledTerminalQueue = state.providerToolCallQueue;
+    if (
+      unsettledTerminalQueue
+      && unsettledTerminalQueue.status !== 'active'
+      && !unsettledTerminalQueue.outcomeRecorded
+    ) {
+      requirePlanActionToolCallQueue(
+        unsettledTerminalQueue.target,
+        planActionId
+      );
+      await this.loop.resumePendingProviderToolCalls();
+      state = this.loop.snapshot();
+    }
     if (state.activeWait) {
       return {
         kind: 'waiting',
@@ -341,20 +380,48 @@ export class SessionKernelHostRunnerV2 {
         guidance: [...state.pendingGuidance],
       };
     }
-    const completedProviderCalls =
-      planActionProviderCallCount(state, planActionId);
-    if (completedProviderCalls >= budget) {
-      return {
-        kind: 'budgetExhausted',
-        providerCallBudget: budget,
-        completedProviderCalls,
-      };
+    let result: SessionKernelLoopResultV2 | undefined;
+    const queued = state.providerToolCallQueue;
+    if (
+      queued
+      && (queued.status === 'active' || !queued.outcomeRecorded)
+    ) {
+      requirePlanActionToolCallQueue(
+        queued.target,
+        planActionId
+      );
+      result = await this.loop.resumePendingProviderToolCalls();
+      state = this.loop.snapshot();
+      if (state.activeWait) {
+        return {
+          kind: 'waiting',
+          wait: cloneJson(state.activeWait),
+        };
+      }
+      if (state.pendingGuidance.length > 0) {
+        return {
+          kind: 'replanRequired',
+          guidance: [...state.pendingGuidance],
+        };
+      }
     }
-    const result = await this.runPlanAction(
-      planActionId,
-      expectedPlanRevision,
-      options.guidance
-    );
+    if (!result) {
+      const completedProviderCalls =
+        planActionProviderCallCount(state, planActionId);
+      if (completedProviderCalls >= budget) {
+        return {
+          kind: 'budgetExhausted',
+          providerCallBudget: budget,
+          completedProviderCalls,
+        };
+      }
+      result = await this.runPlanAction(
+        planActionId,
+        expectedPlanRevision,
+        budget - completedProviderCalls,
+        options.guidance
+      );
+    }
     state = this.loop.snapshot();
     if (state.activeWait) {
       return {
@@ -379,6 +446,28 @@ export class SessionKernelHostRunnerV2 {
         kind: 'replanRequired',
         guidance: [...state.pendingGuidance],
       };
+    }
+    if (result.kind === 'admitted') {
+      const queue = state.providerToolCallQueue;
+      if (
+        queue
+        && queue.providerTurnId === state.providerTurn?.providerTurnId
+      ) {
+        const calls = queue.calls;
+        return {
+          kind: 'toolCallsProgressed',
+          completedCallCount: calls.filter(
+            (call) => call.status === 'completed'
+          ).length,
+          remainingCallCount: calls.filter(
+            (call) =>
+              call.status === 'pending'
+              || call.status === 'submitting'
+              || call.status === 'awaitingCapability'
+              || call.status === 'awaitingInvocation'
+          ).length,
+        };
+      }
     }
     throw new SessionKernelHostRunnerError(
       'session_kernel_drive_result_unsettled',
@@ -463,6 +552,21 @@ export class SessionKernelHostRunnerV2 {
     ) {
       return undefined;
     }
+    if (
+      state.providerToolCallQueue
+      && (
+        state.providerToolCallQueue.status === 'active'
+        || !state.providerToolCallQueue.outcomeRecorded
+      )
+    ) {
+      requirePlanningToolCallQueue(
+        state.providerToolCallQueue.target
+      );
+      const resumed =
+        await this.loop.resumePendingProviderToolCalls();
+      if (resumed) return resumed;
+      if (this.loop.snapshot().activeWait) return undefined;
+    }
     return this.runProviderTurn({
       reason: 'recovery',
       target: { kind: 'planning' },
@@ -482,6 +586,21 @@ export class SessionKernelHostRunnerV2 {
       || Object.keys(state.publicRequests).length > 0
     ) {
       return undefined;
+    }
+    if (
+      state.providerToolCallQueue
+      && (
+        state.providerToolCallQueue.status === 'active'
+        || !state.providerToolCallQueue.outcomeRecorded
+      )
+    ) {
+      requirePlanningToolCallQueue(
+        state.providerToolCallQueue.target
+      );
+      const resumed =
+        await this.loop.resumePendingProviderToolCalls();
+      if (resumed) return resumed;
+      if (this.loop.snapshot().activeWait) return undefined;
     }
     return this.runProviderTurn({
       reason: 'recovery',
@@ -548,7 +667,7 @@ function normalizeProviderCallBudget(value: number | undefined): number {
   if (!Number.isSafeInteger(budget) || budget <= 0 || budget > 256) {
     throw new SessionKernelHostRunnerError(
       'session_kernel_drive_budget_invalid',
-      'PlanAction Provider-call budget must be an integer between 1 and 256.'
+      'PlanAction Provider tool-call budget must be an integer between 1 and 256.'
     );
   }
   return budget;
@@ -616,6 +735,32 @@ function requirePlanActionUnsettled(
     throw new SessionKernelHostRunnerError(
       'session_kernel_plan_action_already_settled',
       `PlanAction ${planActionId} is already settled.`
+    );
+  }
+}
+
+function requirePlanningToolCallQueue(
+  target: SessionProviderTurnTargetV2
+): void {
+  if (target.kind !== 'planning' && target.kind !== 'contextRead') {
+    throw new SessionKernelHostRunnerError(
+      'session_kernel_planning_tool_call_queue_target_invalid',
+      'Planning continuation cannot advance a PlanAction tool-call queue.'
+    );
+  }
+}
+
+function requirePlanActionToolCallQueue(
+  target: SessionProviderTurnTargetV2,
+  planActionId: string
+): void {
+  if (
+    target.kind !== 'planAction'
+    || target.planActionId !== planActionId
+  ) {
+    throw new SessionKernelHostRunnerError(
+      'session_kernel_plan_action_tool_call_queue_target_invalid',
+      'PlanAction continuation does not match the durable Provider tool-call queue.'
     );
   }
 }

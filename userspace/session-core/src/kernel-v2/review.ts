@@ -28,6 +28,10 @@ export function buildSessionKernelReviewV2(
     state.kernelWakeHint
     || !sessionKernelFactsCaughtUpV2(state.lineage)
     || sessionKernelFactBarriersPendingV2(state)
+    || (
+      state.providerToolCallQueue
+      && !state.providerToolCallQueue.outcomeRecorded
+    )
   ) {
     throw new SessionKernelReviewError(
       'session_kernel_review_snapshot_incomplete',
@@ -150,6 +154,12 @@ export function canFinalizeSessionKernelReviewV2(
     || !sessionKernelFactsCaughtUpV2(state.lineage)
     || state.activeWait
     || state.providerTurn?.status === 'active'
+    || state.providerTurn?.status === 'awaitingTools'
+    || state.providerToolCallQueue?.status === 'active'
+    || (
+      state.providerToolCallQueue
+      && !state.providerToolCallQueue.outcomeRecorded
+    )
     || Object.keys(state.publicRequests).length > 0
     || sessionKernelFactBarriersPendingV2(state)
     || state.pendingGuidance.length > 0

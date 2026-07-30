@@ -33,6 +33,8 @@ export const SESSION_PROVIDER_PROFILE_BOOTSTRAP_V2_SCHEMA =
   'deepcode.host.provider-profile-bootstrap.v2' as const;
 export const SESSION_PROVIDER_CONTEXT_RECEIPT_V2_SCHEMA =
   'deepcode.session.provider-context-receipt.v2' as const;
+export const SESSION_PROVIDER_TOOL_CALL_RECEIPT_V2_SCHEMA =
+  'deepcode.session.provider-tool-call-receipt.v2' as const;
 
 export interface SessionProviderProfileBootstrapV2 {
   schemaVersion: typeof SESSION_PROVIDER_PROFILE_BOOTSTRAP_V2_SCHEMA;
@@ -87,6 +89,27 @@ export interface SessionProviderResultMetadataV2 {
   provider?: string;
   model?: string;
   usage?: Record<string, unknown>;
+}
+
+export interface SessionProviderToolCallReceiptItemV2 {
+  ordinal: number;
+  callId: string;
+  toolName: string;
+  toolId: string;
+  argumentsDigest: string;
+}
+
+/**
+ * Safe durable evidence for one Provider response. Raw response text and tool
+ * arguments deliberately remain outside this receipt.
+ */
+export interface SessionProviderToolCallReceiptV2 {
+  schemaVersion: typeof SESSION_PROVIDER_TOOL_CALL_RECEIPT_V2_SCHEMA;
+  providerTurnId: string;
+  responseDigest: string;
+  callCount: number;
+  calls: SessionProviderToolCallReceiptItemV2[];
+  recordedAt: string;
 }
 
 export interface SessionPlanActionV2 {
@@ -152,6 +175,11 @@ export interface SessionProviderTurnRequestV2 {
     | 'recovery';
   target: SessionProviderTurnTargetV2;
   guidance?: string[];
+  /**
+   * Remaining Kernel tool-call admissions for this PlanAction drive. This is
+   * Session control state and is never included in Provider context.
+   */
+  remainingToolCallBudget?: number;
 }
 
 /**
@@ -201,6 +229,7 @@ export interface SessionProviderOutcomeRecordV2 {
   outputKind: SessionProviderTurnOutputV2['kind'];
   recordedAt: string;
   summary?: string;
+  toolCallReceipt?: SessionProviderToolCallReceiptV2;
   providerResult: SessionProviderResultMetadataV2;
 }
 
@@ -212,7 +241,8 @@ export type SessionProviderTurnOutputV2 =
     }
   | {
       kind: 'toolIntent';
-      source: ProviderKernelToolSourceV2;
+      sources: ProviderKernelToolSourceV2[];
+      receipt: SessionProviderToolCallReceiptV2;
       providerResult: SessionProviderResultMetadataV2;
     }
   | {
@@ -327,7 +357,14 @@ export interface SessionProviderTurnRecordV2 {
   factProjection: SessionProviderFactProjectionReceiptV2;
   contextAssembly: SessionProviderContextReceiptV2;
   startedAt: string;
-  status: 'active' | 'cancelled' | 'completed' | 'stale' | 'failed';
+  status:
+    | 'active'
+    | 'awaitingTools'
+    | 'cancelled'
+    | 'completed'
+    | 'aborted'
+    | 'stale'
+    | 'failed';
   cancellationReason?:
     | 'userInput'
     | 'runCancelled'

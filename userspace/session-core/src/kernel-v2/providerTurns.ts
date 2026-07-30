@@ -37,6 +37,12 @@ import {
   buildSessionProviderContextV2,
 } from './providerContext.js';
 import {
+  abortSessionProviderToolCallQueueV2,
+  activeSessionProviderToolCallQueueV2,
+  createSessionProviderToolCallQueueV2,
+  prepareSessionProviderToolCallSubmissionV2,
+} from './providerToolCallQueue.js';
+import {
   decodeProviderToolIntentTextFrameV2,
   normalizeProviderKernelToolIntentV2,
   type ProviderKernelToolSourceV2,
@@ -47,6 +53,8 @@ import type {
   SessionNaturalLanguagePlanV2,
   SessionPlanActionSettlementV2,
   SessionKernelProjectionEventV2,
+  SessionKernelPublicRequestRecordV2,
+  SessionProviderTurnTargetV2,
   SessionProviderTurnRequestV2,
 } from './types.js';
 
@@ -63,6 +71,8 @@ export interface SessionKernelProviderTurnHostV2 {
   ): Promise<void>;
 
   reconcileFacts(): Promise<void>;
+
+  settleProviderToolCallQueue(): Promise<void>;
 
   recordProviderPlan(
     plan: SessionNaturalLanguagePlanV2
@@ -147,7 +157,15 @@ export class SessionKernelProviderTurnsV2 {
     this.providerAbort = undefined;
     this.reservation = undefined;
     const state = this.host.readState();
-    if (state.providerTurn?.status === 'active') {
+    abortSessionProviderToolCallQueueV2(
+      state,
+      cancellationReason,
+      this.ports.clock.now()
+    );
+    if (
+      state.providerTurn?.status === 'active'
+      || state.providerTurn?.status === 'awaitingTools'
+    ) {
       state.providerTurn.status = 'cancelled';
       state.providerTurn.cancellationReason = cancellationReason;
     }
@@ -319,7 +337,7 @@ export class SessionKernelProviderTurnsV2 {
       }
 
       let result: SessionKernelLoopResultV2 | undefined;
-      let toolIntent: ToolIntentV2 | undefined;
+      let queuedToolIntents = false;
       const outputCommit = this.beginAdmissionCommit(
         reservation,
         generation
@@ -341,7 +359,41 @@ export class SessionKernelProviderTurnsV2 {
               ...(output.guidance ? { guidance: output.guidance } : {}),
             };
           } else {
-            toolIntent = this.normalizeOutput(output.source, request);
+            if (
+              request.target.kind === 'planAction'
+              && output.sources.length
+                > request.remainingToolCallBudget!
+            ) {
+              throw new SessionKernelProviderTurnError(
+                'session_kernel_provider_tool_call_budget_exceeded',
+                [
+                  'Provider output exceeds the remaining PlanAction tool-call',
+                  `budget (${output.sources.length} requested,`,
+                  `${request.remainingToolCallBudget} remaining).`,
+                ].join(' ')
+              );
+            }
+            const intents = output.sources.map((source, index) =>
+              this.normalizeOutput(
+                source,
+                request,
+                index,
+                output.sources.length
+              )
+            );
+            const latest = this.host.readState();
+            latest.providerToolCallQueue =
+              createSessionProviderToolCallQueueV2({
+                providerTurnId,
+                controlEpoch: latest.controlEpoch,
+                target: request.target,
+                receipt: output.receipt,
+                providerResult: output.providerResult,
+                intents,
+              });
+            latest.providerTurn!.status = 'awaitingTools';
+            await this.host.saveCheckpoint();
+            queuedToolIntents = true;
           }
         } catch (error) {
           if (this.resultIsStale(
@@ -371,9 +423,9 @@ export class SessionKernelProviderTurnsV2 {
         this.endAdmissionCommit(outputCommit);
       }
 
-      if (toolIntent) {
+      if (queuedToolIntents) {
         try {
-          result = await this.submitIntentOnce(toolIntent);
+          result = await this.submitNextQueuedIntent();
         } catch (error) {
           if (this.resultIsStale(
             reservation,
@@ -382,31 +434,7 @@ export class SessionKernelProviderTurnsV2 {
           )) {
             return await this.settleStale(providerTurnId);
           }
-          const failureCommit = this.beginAdmissionCommit(
-            reservation,
-            generation
-          );
-          if (!failureCommit) {
-            return await this.settleStale(providerTurnId);
-          }
-          try {
-            const latest = this.host.readState();
-            if (latest.providerTurn?.providerTurnId === providerTurnId) {
-              latest.providerTurn.status = 'failed';
-              await this.host.saveCheckpoint();
-              await this.host.project(
-                `provider:${providerTurnId}:failed`,
-                'diagnostic',
-                {
-                  providerTurnId,
-                  code: safeErrorCode(error),
-                  stage: 'provider.outputAdmission',
-                }
-              );
-            }
-          } finally {
-            this.endAdmissionCommit(failureCommit);
-          }
+          await this.host.settleProviderToolCallQueue();
           throw error;
         }
         if (this.resultIsStale(
@@ -425,6 +453,7 @@ export class SessionKernelProviderTurnsV2 {
         }
         try {
           await this.host.reconcileFacts();
+          await this.host.settleProviderToolCallQueue();
         } finally {
           this.endAdmissionCommit(reconcileCommit);
         }
@@ -438,6 +467,9 @@ export class SessionKernelProviderTurnsV2 {
           'session_kernel_provider_result_missing',
           'Provider output admission did not produce a Session result.'
         );
+      }
+      if (output.kind === 'toolIntent') {
+        return result;
       }
       const terminalCommit = this.beginAdmissionCommit(
         reservation,
@@ -501,6 +533,70 @@ export class SessionKernelProviderTurnsV2 {
     }
   }
 
+  /**
+   * Advances only the next durable call from an already accepted Provider
+   * response. No new Provider request is made while this queue is active.
+   */
+  async resumePendingToolCalls():
+  Promise<SessionKernelLoopResultV2 | undefined> {
+    const existing = this.host.readState().providerToolCallQueue;
+    if (!existing) return undefined;
+    if (existing.status !== 'active') {
+      if (!existing.outcomeRecorded) {
+        await this.host.settleProviderToolCallQueue();
+      }
+      return undefined;
+    }
+    const queued = existing;
+    const reservation = this.begin();
+    const generation = this.authorityGeneration;
+    const providerTurnId = queued.providerTurnId;
+    try {
+      const submitting = queued.calls.find(
+        (candidate) => candidate.status === 'submitting'
+      );
+      if (submitting) {
+        this.assertMayReplayQueuedSubmission(submitting.requestId!);
+        const result = await this.submitNextQueuedIntent();
+        if (this.resultIsStale(
+          reservation,
+          providerTurnId,
+          generation
+        )) {
+          return await this.settleStale(providerTurnId);
+        }
+        await this.host.reconcileFacts();
+        await this.host.settleProviderToolCallQueue();
+        return result;
+      }
+      this.assertMayReconcileProviderBoundary();
+      await this.host.reconcileFacts();
+      await this.host.settleProviderToolCallQueue();
+      if (!this.boundaryIsCurrent(reservation, generation)) {
+        return await this.settleStale(providerTurnId);
+      }
+      const state = this.host.readState();
+      if (!activeSessionProviderToolCallQueueV2(state)) return undefined;
+      if (state.activeWait) return undefined;
+      this.assertMayAdvanceQueuedToolCall();
+      const result = await this.submitNextQueuedIntent();
+      if (this.resultIsStale(
+        reservation,
+        providerTurnId,
+        generation
+      )) {
+        return await this.settleStale(providerTurnId);
+      }
+      await this.host.reconcileFacts();
+      await this.host.settleProviderToolCallQueue();
+      return result;
+    } finally {
+      if (this.reservation === reservation) {
+        this.reservation = undefined;
+      }
+    }
+  }
+
   private async refreshToolContextAtBoundary(): Promise<void> {
     const state = this.host.readState();
     if (!state.toolContext.refreshRequired) return;
@@ -531,6 +627,34 @@ export class SessionKernelProviderTurnsV2 {
     this.host.requireNoPendingRequests();
   }
 
+  private assertMayReplayQueuedSubmission(requestId: string): void {
+    if (this.userInputFenceGeneration !== undefined) {
+      throw new SessionKernelProviderTurnError(
+        'session_kernel_user_input_admission_fenced',
+        'Queued submission recovery is fenced until the ordered user input transition is durable.'
+      );
+    }
+    if (this.host.transitionBlocked()) {
+      throw new SessionKernelProviderTurnError(
+        'session_kernel_authority_transition_active',
+        'A serialized Session authority transition is active.'
+      );
+    }
+    const pending = this.requests.pendingRecords();
+    if (
+      pending.some((record) =>
+        record.lane !== 'effect'
+        || record.requestId !== requestId
+        || record.intent.kind !== 'toolIntentSubmit'
+      )
+    ) {
+      throw new SessionKernelProviderTurnError(
+        'session_kernel_provider_tool_call_recovery_conflict',
+        'Queued Provider recovery found another unresolved Kernel request.'
+      );
+    }
+  }
+
   private boundaryIsCurrent(
     reservation: symbol,
     generation: number
@@ -542,7 +666,9 @@ export class SessionKernelProviderTurnsV2 {
 
   private normalizeOutput(
     source: ProviderKernelToolSourceV2,
-    request: SessionProviderTurnRequestV2
+    request: SessionProviderTurnRequestV2,
+    index: number,
+    callCount: number
   ): ToolIntentV2 {
     const state = this.host.readState();
     const toolId = providerSourceToolId(source);
@@ -618,12 +744,27 @@ export class SessionKernelProviderTurnsV2 {
         'A contextRead turn cannot invoke a mutation tool.'
       );
     }
+    const contextReadIdentity = callCount === 1
+      ? {
+          operationId: request.target.operationId,
+          idempotencyKey: request.target.idempotencyKey,
+        }
+      : providerCallIdentity(
+          state,
+          source,
+          [
+            'contextRead',
+            request.target.operationId,
+            request.target.idempotencyKey,
+            String(index + 1),
+          ].join(':')
+        );
     return normalizeProviderKernelToolIntentV2(source, {
       runId: state.runId,
       controlEpoch: state.controlEpoch,
-      operationId: request.target.operationId,
+      operationId: contextReadIdentity.operationId,
       authority: contextReadAuthorityV2(request.target.purpose),
-      idempotencyKey: request.target.idempotencyKey,
+      idempotencyKey: contextReadIdentity.idempotencyKey,
       toolContext: state.toolContext.bundle,
       ...(request.target.deadline
         ? { deadline: request.target.deadline }
@@ -631,15 +772,104 @@ export class SessionKernelProviderTurnsV2 {
     });
   }
 
-  private async submitIntentOnce(
-    intent: ToolIntentV2
-  ): Promise<SessionKernelLoopResultV2> {
-    const outcome = await this.requests.execute(
-      this.requests.newRecord({
-        kind: 'toolIntentSubmit',
-        payload: { intent },
-      })
+  private async submitNextQueuedIntent():
+  Promise<SessionKernelLoopResultV2> {
+    const reservation = this.reservation;
+    const generation = this.authorityGeneration;
+    if (!reservation) {
+      throw new SessionKernelProviderTurnError(
+        'session_kernel_provider_tool_call_reservation_missing',
+        'Queued Provider submission requires a live Session reservation.'
+      );
+    }
+    const state = this.host.readState();
+    const queue = activeSessionProviderToolCallQueueV2(state);
+    const item = queue?.calls.find((candidate) =>
+      candidate.status !== 'completed'
     );
+    if (
+      !queue
+      || !item
+      || (
+        item.status !== 'pending'
+        && item.status !== 'submitting'
+      )
+    ) {
+      throw new SessionKernelProviderTurnError(
+        'session_kernel_provider_tool_call_queue_missing',
+        'No resumable Provider tool call is available to submit.'
+      );
+    }
+    let request: SessionKernelPublicRequestRecordV2;
+    if (item.status === 'pending') {
+      this.refreshPendingPlanActionLease(queue.target, item.intent);
+      request = this.requests.newRecord({
+        kind: 'toolIntentSubmit',
+        payload: { intent: item.intent },
+      });
+      prepareSessionProviderToolCallSubmissionV2(state, {
+        operationId: item.intent.operationId,
+        requestId: request.requestId,
+        requestStartedAt: request.startedAt,
+      });
+      await this.host.saveCheckpoint();
+    } else {
+      const pending = state.publicRequests.effect;
+      if (pending) {
+        if (
+          pending.requestId !== item.requestId
+          || pending.intent.kind !== 'toolIntentSubmit'
+          || canonicalJson(pending.intent.payload.intent)
+            !== canonicalJson(item.intent)
+        ) {
+          throw new SessionKernelProviderTurnError(
+            'session_kernel_provider_tool_call_request_conflict',
+            'The pending Kernel effect request does not match the durable Provider tool call.'
+          );
+        }
+        request = pending;
+      } else {
+        request = {
+          requestId: item.requestId!,
+          lane: 'effect',
+          intent: {
+            kind: 'toolIntentSubmit',
+            payload: { intent: item.intent },
+          },
+          startedAt: item.requestStartedAt!,
+          attemptCount: 1,
+        };
+      }
+    }
+    try {
+      const current = activeSessionProviderToolCallQueueV2(
+        this.host.readState()
+      )?.calls.find((candidate) =>
+        candidate.status === 'submitting'
+      );
+      if (
+        !this.boundaryIsCurrent(reservation, generation)
+        || current?.requestId !== request.requestId
+        || current.intent.operationId !== item.intent.operationId
+      ) {
+        throw new SessionKernelProviderTurnError(
+          'session_kernel_provider_tool_call_submission_superseded',
+          'Queued Provider submission was superseded before Kernel dispatch.'
+        );
+      }
+      const result = await this.submitIntentOnce(request);
+      await this.host.settleProviderToolCallQueue();
+      return result;
+    } catch (error) {
+      await this.host.settleProviderToolCallQueue();
+      throw error;
+    }
+  }
+
+  private async submitIntentOnce(
+    request: SessionKernelPublicRequestRecordV2
+  ): Promise<SessionKernelLoopResultV2> {
+    const outcome = await this.requests.execute(request);
     const reply = expectSessionKernelPublicRequestOutcomeV2(
       outcome,
       'toolIntentSubmit'
@@ -686,6 +916,31 @@ export class SessionKernelProviderTurnsV2 {
     };
   }
 
+  private refreshPendingPlanActionLease(
+    target: SessionProviderTurnTargetV2,
+    intent: ToolIntentV2
+  ): void {
+    if (target.kind !== 'planAction') return;
+    if (
+      intent.authority.kind !== 'planAction'
+      || intent.authority.data.planActionId !== target.planActionId
+    ) {
+      throw new SessionKernelProviderTurnError(
+        'session_kernel_provider_tool_call_authority_mismatch',
+        'Queued Provider tool-call authority no longer matches its PlanAction.'
+      );
+    }
+    const lease = latestPlanActionLease(
+      this.host.readState(),
+      target.planActionId
+    );
+    if (lease) {
+      intent.authority.data.lease = lease;
+    } else {
+      delete intent.authority.data.lease;
+    }
+  }
+
   private assertMayRun(request: SessionProviderTurnRequestV2): void {
     const state = this.host.readState();
     if (this.userInputFenceGeneration !== undefined) {
@@ -717,7 +972,32 @@ export class SessionKernelProviderTurnsV2 {
         `Provider execution is blocked by ${state.activeWait.kind}.`
       );
     }
+    if (activeSessionProviderToolCallQueueV2(state)) {
+      throw new SessionKernelProviderTurnError(
+        'session_kernel_provider_tool_call_queue_active',
+        'A new Provider turn cannot start before the prior ordered tool-call queue settles.'
+      );
+    }
+    if (
+      state.providerToolCallQueue
+      && !state.providerToolCallQueue.outcomeRecorded
+    ) {
+      throw new SessionKernelProviderTurnError(
+        'session_kernel_provider_tool_call_settlement_required',
+        'A settled Provider tool-call sequence must be durably projected before another Provider turn.'
+      );
+    }
     if (request.target.kind === 'planAction') {
+      if (
+        !Number.isSafeInteger(request.remainingToolCallBudget)
+        || request.remainingToolCallBudget! <= 0
+        || request.remainingToolCallBudget! > 256
+      ) {
+        throw new SessionKernelProviderTurnError(
+          'session_kernel_provider_tool_call_budget_invalid',
+          'A PlanAction Provider turn requires a remaining tool-call budget between 1 and 256.'
+        );
+      }
       this.host.requirePlanProjected();
       this.host.requirePlanAccepted();
       sessionPlanActionV2(state, request.target.planActionId);
@@ -727,6 +1007,38 @@ export class SessionKernelProviderTurnsV2 {
           `PlanAction ${request.target.planActionId} is already settled.`
         );
       }
+    } else if (request.remainingToolCallBudget !== undefined) {
+      throw new SessionKernelProviderTurnError(
+        'session_kernel_provider_tool_call_budget_unexpected',
+        'Only a PlanAction Provider turn may carry a tool-call budget.'
+      );
+    }
+  }
+
+  private assertMayAdvanceQueuedToolCall(): void {
+    const state = this.host.readState();
+    this.host.requireNoPendingRequests();
+    if (
+      state.kernelWakeHint
+      || !sessionKernelFactsCaughtUpV2(state.lineage)
+      || sessionKernelFactBarriersPendingV2(state)
+    ) {
+      throw new SessionKernelProviderTurnError(
+        'session_kernel_facts_not_caught_up',
+        'The next queued Provider tool call is blocked until canonical Kernel facts are caught up.'
+      );
+    }
+    if (state.activeWait) {
+      throw new SessionKernelProviderTurnError(
+        'session_kernel_active_wait',
+        `Queued tool execution is blocked by ${state.activeWait.kind}.`
+      );
+    }
+    if (!activeSessionProviderToolCallQueueV2(state)) {
+      throw new SessionKernelProviderTurnError(
+        'session_kernel_provider_tool_call_queue_missing',
+        'No active Provider tool-call queue is available.'
+      );
     }
   }
 
@@ -740,7 +1052,12 @@ export class SessionKernelProviderTurnsV2 {
       || generation !== this.authorityGeneration
       || turn?.providerTurnId !== providerTurnId
       || turn.controlEpoch !== this.host.readState().controlEpoch
-      || (turn.status !== 'active' && turn.status !== 'completed');
+      || (
+        turn.status !== 'active'
+        && turn.status !== 'awaitingTools'
+        && turn.status !== 'completed'
+        && turn.status !== 'aborted'
+      );
   }
 
   private async settleStale(
@@ -754,7 +1071,9 @@ export class SessionKernelProviderTurnsV2 {
       providerTurn
       && (
         providerTurn.status === 'active'
+        || providerTurn.status === 'awaitingTools'
         || providerTurn.status === 'completed'
+        || providerTurn.status === 'aborted'
       )
     ) {
       providerTurn.status = 'stale';

@@ -177,37 +177,64 @@ implements SessionKernelProviderBackendV2 {
       response.data,
       this.profileId
     );
-    if (calls.length > 1) {
+    const responseDigest = sha256Hash(canonicalJson(response.data));
+    if (calls.length > 32) {
       throw new SessionKernelProviderTransportError(
-        'session_kernel_provider_multiple_calls',
-        'One Provider turn may submit at most one Kernel tool call.'
+        'session_kernel_provider_tool_call_count_exceeded',
+        'One Provider turn may return at most 32 ordered Kernel tool calls.'
       );
     }
-    if (calls.length === 1) {
-      const call = calls[0]!;
-      const toolId = encodedNames.get(call.name);
-      if (!toolId) {
-        throw new SessionKernelProviderTransportError(
-          'session_kernel_provider_tool_name_unknown',
-          'Provider returned a tool name outside the current encoded ToolContext.'
-        );
-      }
+    if (calls.length > 0) {
+      const decodedCalls = calls.map((call) => {
+        const toolId = encodedNames.get(call.name);
+        if (!toolId) {
+          throw new SessionKernelProviderTransportError(
+            'session_kernel_provider_tool_name_unknown',
+            'Provider returned a tool name outside the current encoded ToolContext.'
+          );
+        }
+        return {
+          callId: requiredIdentity(call.id, 'callId'),
+          toolName: requiredIdentity(call.name, 'toolName'),
+          toolId,
+          arguments: decodeProviderNativeArguments(call.arguments),
+        };
+      });
       return {
-        kind: 'nativeToolCall',
-        callId: requiredIdentity(call.id, 'callId'),
-        toolId,
-        arguments: call.arguments,
+        kind: 'nativeToolCalls',
+        calls: decodedCalls,
         providerResult,
+        responseDigest,
       };
     }
     const text = assistant.content ?? '';
-    if (!text.trim()) return { kind: 'noTool', providerResult };
+    if (!text.trim()) {
+      return { kind: 'noTool', providerResult, responseDigest };
+    }
     if (input.target.kind === 'planning') {
       const plan = decodeProviderPlanDraftFrame(text);
-      if (plan) return { kind: 'plan', plan, providerResult };
+      if (plan) {
+        return { kind: 'plan', plan, providerResult, responseDigest };
+      }
     }
-    return { kind: 'text', text, providerResult };
+    return { kind: 'text', text, providerResult, responseDigest };
   }
+}
+
+function decodeProviderNativeArguments(
+  value: unknown
+): RawToolArgumentsV2 {
+  if (typeof value !== 'string') return decodeRawToolArgumentsV2(value);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value) as unknown;
+  } catch {
+    throw new SessionKernelProviderTransportError(
+      'session_kernel_provider_tool_arguments_invalid',
+      'Provider-native tool arguments are not valid JSON.'
+    );
+  }
+  return decodeRawToolArgumentsV2(parsed);
 }
 
 function assertProviderToolContextBindingV2(

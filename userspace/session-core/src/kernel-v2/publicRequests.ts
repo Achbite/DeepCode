@@ -48,6 +48,10 @@ import {
   registerSessionKernelFactBarrierV2,
   sessionKernelFactBarriersPendingV2,
 } from './factBarriers.js';
+import {
+  abortSessionProviderToolCallQueueV2,
+  markSessionProviderToolCallSubmittedV2,
+} from './providerToolCallQueue.js';
 
 export type SessionKernelPublicRequestOutcomeV2 =
   | { kind: 'toolContextGet'; reply: ToolContextGetReplyV2 }
@@ -361,6 +365,14 @@ export class SessionKernelPublicRequestsV2 {
     );
     try {
       this.removePending(record);
+      if (record.intent.kind === 'toolIntentSubmit') {
+        abortSessionProviderToolCallQueueV2(
+          this.host.readState(),
+          'submissionFailed',
+          this.ports.clock.now(),
+          record.intent.payload.intent.operationId
+        );
+      }
       const checkpoint = checkpointSessionKernelStateV2(
         this.host.readState(),
         this.ports.clock.now()
@@ -584,6 +596,10 @@ function applyPublicRequestOutcome(
       const reviewReady =
         result.caughtUp
         && !sessionKernelFactBarriersPendingV2(result.state)
+        && (
+          !result.state.providerToolCallQueue
+          || result.state.providerToolCallQueue.outcomeRecorded
+        )
         && result.state.plan !== undefined;
       if (reviewReady) {
         result.state.review = buildSessionKernelReviewV2(result.state, now);
@@ -808,6 +824,14 @@ function applyToolIntentReply(
       reply
     );
   }
+  markSessionProviderToolCallSubmittedV2(
+    state,
+    {
+      requestId: record.requestId,
+      reply,
+    },
+    now
+  );
   events.push(host.event(
     `${record.requestId}:intent`,
     'toolIntent.submitted',

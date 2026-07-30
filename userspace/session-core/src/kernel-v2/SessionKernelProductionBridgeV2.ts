@@ -2799,6 +2799,8 @@ function continuationForDriveStep(
         completedProviderCalls: step.completedProviderCalls,
         ...requiredPlanActionFields(planAction),
       };
+    case 'toolCallsProgressed':
+      return readyToDriveOrFinalize(state, planAction);
     case 'interrupted':
       throw new SessionKernelProductionBridgeError(
         'session_kernel_production_stale_continuation_unbound'

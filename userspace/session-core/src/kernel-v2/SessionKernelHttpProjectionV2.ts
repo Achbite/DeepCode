@@ -852,6 +852,7 @@ function publicPresentation(
         channel: 'error',
         visibility: 'conversation',
         fields: {
+          status: textField(data, 'status') ?? 'failed',
           code: textField(data, 'code') ?? 'session_kernel_diagnostic',
           providerTurnId: textField(data, 'providerTurnId'),
           message: textField(data, 'message')
