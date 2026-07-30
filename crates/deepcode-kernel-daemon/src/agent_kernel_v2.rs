@@ -300,19 +300,22 @@ pub(crate) async fn open_agent_kernel_run_v2(
     );
     let opened = state
         .kernel_session_v2
-        .open_and_spawn_initial(HostKernelRunSpawnInputV2 {
-            session_id: session_id.to_string(),
-            host_run_id: host_run_id.clone(),
-            caller_request_id: binding.caller_request_id.clone(),
-            caller_request_digest: binding.request_digest.clone(),
-            run_open_request_id,
-            operation_request_id,
-            provider_profile,
-            prior_session_events,
-            workspace: prepared_workspace.workspace(),
-            initial_input,
-            operation,
-        })
+        .open_and_spawn_initial(
+            HostKernelRunSpawnInputV2 {
+                session_id: session_id.to_string(),
+                host_run_id: host_run_id.clone(),
+                caller_request_id: binding.caller_request_id.clone(),
+                caller_request_digest: binding.request_digest.clone(),
+                run_open_request_id,
+                operation_request_id,
+                provider_profile,
+                prior_session_events,
+                workspace: prepared_workspace.workspace(),
+                initial_input,
+                operation,
+            },
+            || drop(settings_transition),
+        )
         .await;
     let opened = match opened {
         Ok(opened) => opened,
@@ -377,7 +380,6 @@ pub(crate) async fn open_agent_kernel_run_v2(
             return Err(final_error);
         }
     };
-    drop(settings_transition);
     if let Err(error) =
         drive_agent_kernel_run_v2(state, &opened.active_run, opened.initial_operation).await
     {

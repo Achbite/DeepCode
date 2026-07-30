@@ -816,9 +816,7 @@ fn record_config_modified_audit(
     }
 }
 
-fn config_value_hash(
-    value: &Value,
-) -> Result<String, crate::host_v2_storage::HostV2StorageError> {
+fn config_value_hash(value: &Value) -> Result<String, crate::host_v2_storage::HostV2StorageError> {
     crate::host_v2_storage::stable_json_sha256(value)
 }
 

@@ -180,9 +180,7 @@ fn write_stable_json(
     }
     match value {
         Value::Null => output.extend_from_slice(b"null"),
-        Value::Bool(value) => {
-            output.extend_from_slice(if *value { b"true" } else { b"false" })
-        }
+        Value::Bool(value) => output.extend_from_slice(if *value { b"true" } else { b"false" }),
         Value::Number(number) => {
             if let Ok(canonical) = canonical_json_bytes(value) {
                 output.extend_from_slice(&canonical);

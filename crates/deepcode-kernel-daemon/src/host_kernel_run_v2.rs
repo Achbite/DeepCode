@@ -178,6 +178,11 @@ pub(crate) struct HostKernelRunOpenedV2 {
     pub(crate) initial_operation: HostKernelOperationSettlementReceiptV2,
 }
 
+struct HostKernelRunStartedV2 {
+    active_run: HostActiveRunRecordV2,
+    initial_operation: HostKernelOperationCompletionReceiverV2,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) enum HostKernelStartupRecoveryPhaseV2 {
@@ -567,10 +572,10 @@ impl HostKernelRunCoordinatorV2 {
     /// Owns the complete first-turn transition. Durable Opening precedes the
     /// Host-only RunOpen, and a dispatch attempt is durable before any request
     /// byte can reach the Session bridge.
-    pub(crate) async fn open_and_spawn_initial(
+    async fn open_and_start_initial(
         &self,
         input: HostKernelRunSpawnInputV2,
-    ) -> Result<HostKernelRunOpenedV2, HostV2StorageError> {
+    ) -> Result<HostKernelRunStartedV2, HostV2StorageError> {
         validate_spawn_input(&input)?;
         let turn = self
             .host_services
@@ -631,9 +636,9 @@ impl HostKernelRunCoordinatorV2 {
                         .host_services
                         .active_runs_v2
                         .resolve(&input.session_id, &input.host_run_id)?;
-                    return Ok(HostKernelRunOpenedV2 {
+                    return Ok(HostKernelRunStartedV2 {
                         active_run,
-                        initial_operation,
+                        initial_operation: completed_operation(initial_operation),
                     });
                 }
                 let completion = self.prepare_initial_dispatch(
@@ -648,10 +653,9 @@ impl HostKernelRunCoordinatorV2 {
                     .active_runs_v2
                     .resolve(&input.session_id, &input.host_run_id)?;
                 drop(turn);
-                let initial_operation = await_operation_completion(completion).await?;
-                return Ok(HostKernelRunOpenedV2 {
+                return Ok(HostKernelRunStartedV2 {
                     active_run,
-                    initial_operation,
+                    initial_operation: completion,
                 });
             }
             HostKernelStoredRunLifecycleV2::Retired => {
@@ -748,9 +752,24 @@ impl HostKernelRunCoordinatorV2 {
             }
         };
         drop(turn);
-        let initial_operation = await_operation_completion(completion).await?;
-        Ok(HostKernelRunOpenedV2 {
+        Ok(HostKernelRunStartedV2 {
             active_run: receipt.record,
+            initial_operation: completion,
+        })
+    }
+
+    /// Invokes `registered` after the active Run and first dispatch are
+    /// durable, but before waiting on Session/Provider completion.
+    pub(crate) async fn open_and_spawn_initial(
+        &self,
+        input: HostKernelRunSpawnInputV2,
+        registered: impl FnOnce(),
+    ) -> Result<HostKernelRunOpenedV2, HostV2StorageError> {
+        let started = self.open_and_start_initial(input).await?;
+        registered();
+        let initial_operation = await_operation_completion(started.initial_operation).await?;
+        Ok(HostKernelRunOpenedV2 {
+            active_run: started.active_run,
             initial_operation,
         })
     }
