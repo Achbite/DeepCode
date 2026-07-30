@@ -906,6 +906,16 @@ def main(argv: list[str] | None = None) -> int:
         len(suite_ids) == len(required_gate_suite_ids)
         and set(suite_ids) == required_gate_suite_ids
     )
+    required_gate_complete = (
+        selected_by == "profile:required"
+        and selected_all_required
+        and overall_exit == 0
+        and not worktree_before["dirty"]
+        and registry_head_bound
+        and controller_head_bound
+        and asset_manifest_before["headBound"]
+        and identity_stable
+    )
 
     receipt = {
         "schemaVersion": 1,
@@ -932,14 +942,10 @@ def main(argv: list[str] | None = None) -> int:
         "controllerHeadBound": controller_head_bound,
         "selectedAssets": asset_manifest_before,
         "selectedAssetsStable": asset_manifest_after == asset_manifest_before,
-        "authoritative": selected_by == "profile:required"
-        and selected_all_required
-        and overall_exit == 0
-        and not worktree_before["dirty"]
-        and registry_head_bound
-        and controller_head_bound
-        and asset_manifest_before["headBound"]
-        and identity_stable,
+        "authoritative": False,
+        "finalAcceptance": False,
+        "evidenceRole": "supporting-evidence-only",
+        "requiredGateComplete": required_gate_complete,
         "startedAt": started_at,
         "finishedAt": utc_now(),
         "durationSeconds": round(time.monotonic() - run_started, 3),

@@ -17,7 +17,7 @@
   },
   "profiles": {
     "required": {
-      "description": "Authoritative repository integration gate containing every and only requiredGate suite; it never runs smoke checks or degrades to host static checks.",
+      "description": "Required repository integration evidence gate containing every and only requiredGate suite; it never runs smoke checks or degrades to host static checks.",
       "suites": [
         "repository.required",
         "kernel.v2.contracts",
@@ -32,7 +32,7 @@
       ]
     },
     "smoke": {
-      "description": "Non-authoritative Session runtime-path checks grouped by historical failure class.",
+      "description": "Supporting Session runtime-path checks grouped by historical failure class.",
       "suites": [
         "session.smoke.communication",
         "session.smoke.tools",
@@ -41,7 +41,7 @@
       ]
     },
     "full": {
-      "description": "Non-authoritative run of the required integration gate followed by every registered smoke group.",
+      "description": "Supporting run of the required integration gate followed by every registered smoke group.",
       "suites": [
         "repository.required",
         "kernel.v2.contracts",
