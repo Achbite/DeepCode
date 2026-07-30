@@ -215,6 +215,21 @@ fn session_run_start_admission_lock(session_id: &str) -> std::sync::Arc<tokio::s
     lock
 }
 
+fn session_run_cancel_admission_lock(session_id: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    use std::sync::{Arc, Mutex, OnceLock, Weak};
+
+    static LOCKS: OnceLock<Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>> = OnceLock::new();
+    let locks = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut locks = locks.lock().expect("Session run cancel lock registry");
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(session_id).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    locks.insert(session_id.to_string(), Arc::downgrade(&lock));
+    lock
+}
+
 pub(crate) async fn agent_session_run_start(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
@@ -370,7 +385,7 @@ pub(crate) async fn agent_session_run_cancel(
     {
         return response;
     }
-    let mutation_lock = session_run_start_admission_lock(&session_id);
+    let mutation_lock = session_run_cancel_admission_lock(&session_id);
     let _mutation_guard = mutation_lock.lock_owned().await;
     match cancel_agent_kernel_run_v2(&state, &session_id, &run_id, &body.caller_request_id).await {
         Ok(Some(host_run_id)) => run_response(&state, &session_id, &host_run_id),

@@ -116,17 +116,40 @@ export class SessionKernelProviderTurnsV2 {
     generation: number;
     quiescence: Promise<void>;
   } {
+    return this.supersedeForAuthorityTransition(
+      'userInput',
+      'userInput'
+    );
+  }
+
+  supersedeForRunCancellation(): {
+    generation: number;
+    quiescence: Promise<void>;
+  } {
+    return this.supersedeForAuthorityTransition(
+      'runCancelled',
+      'userRequested'
+    );
+  }
+
+  private supersedeForAuthorityTransition(
+    cancellationReason: 'userInput' | 'runCancelled',
+    abortReason: 'userInput' | 'userRequested'
+  ): {
+    generation: number;
+    quiescence: Promise<void>;
+  } {
     this.authorityGeneration += 1;
     this.userInputFenceGeneration = this.authorityGeneration;
     const quiescence =
       this.admissionCommit?.settled ?? Promise.resolve();
-    this.providerAbort?.controller.abort('userInput');
+    this.providerAbort?.controller.abort(abortReason);
     this.providerAbort = undefined;
     this.reservation = undefined;
     const state = this.host.readState();
     if (state.providerTurn?.status === 'active') {
       state.providerTurn.status = 'cancelled';
-      state.providerTurn.cancellationReason = 'userInput';
+      state.providerTurn.cancellationReason = cancellationReason;
     }
     return {
       generation: this.authorityGeneration,
@@ -736,6 +759,9 @@ export class SessionKernelProviderTurnsV2 {
     ) {
       providerTurn.status = 'stale';
       await this.host.saveCheckpoint();
+    }
+    if (state.runCancellation) {
+      return { kind: 'staleProviderResult', providerTurnId };
     }
     await this.host.project(
       `provider:${providerTurnId}:stale`,

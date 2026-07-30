@@ -19,6 +19,9 @@ import type {
   SessionKernelHostProjectionSinkV2,
 } from './SessionKernelHttpPersistenceV2.js';
 import type {
+  SessionKernelProjectionReceiptV2,
+} from './ports.js';
+import type {
   SessionKernelProjectionEventV2,
 } from './types.js';
 import type {
@@ -159,7 +162,7 @@ implements SessionKernelHostProjectionSinkV2 {
   async publish(
     event: SessionKernelProjectionEventV2,
     projectionHistory: SessionKernelProjectionEventV2[]
-  ): Promise<void> {
+  ): Promise<SessionKernelProjectionReceiptV2> {
     assertNoTransportCapabilities(event);
     const projectionId = requiredIdentity(
       event.projectionId,
@@ -275,6 +278,11 @@ implements SessionKernelHostProjectionSinkV2 {
     ) {
       throw invalidProjectionReply();
     }
+    return {
+      projectionId,
+      projectionDigest,
+      delivered: true,
+    };
   }
 
   private priorEventsForProjection(): Promise<AgentEvent[]> {
@@ -794,6 +802,23 @@ function publicPresentation(
           providerTurnId: textField(data, 'providerTurnId'),
           controlEpoch: data?.controlEpoch,
           summary: 'Session provider turn was superseded.',
+        },
+      };
+    case 'run.cancelled':
+      return {
+        kind: 'session_run_state',
+        channel: 'progress',
+        visibility: 'conversation',
+        fields: {
+          status: 'cancelled',
+          reason: 'userRequested',
+          callerRequestId: textField(data, 'callerRequestId'),
+          cancelOperationId: textField(data, 'cancelOperationId'),
+          controlEpoch: data?.controlEpoch,
+          facts: data?.facts === undefined
+            ? undefined
+            : cloneJson(data.facts),
+          summary: 'Session Run was cancelled after canonical Kernel facts reconciled.',
         },
       };
     case 'wait.changed': {

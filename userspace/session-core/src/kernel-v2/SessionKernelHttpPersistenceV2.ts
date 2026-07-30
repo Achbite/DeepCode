@@ -1,7 +1,9 @@
 import { canonicalJson, sha256Hash } from '../cache/canonicalizer.js';
 import type {
   SessionKernelPersistencePortV2,
+  SessionKernelProjectionReceiptV2,
   SessionKernelProjectionPortV2,
+  SessionKernelStoredOperationResultV2,
   SessionKernelStoredOperationResultRefV2,
 } from './ports.js';
 import type { SessionKernelCheckpointV2 } from './state.js';
@@ -569,6 +571,50 @@ implements SessionKernelPersistencePortV2 {
     };
   }
 
+  async loadOperationResult(
+    operationRequestId: string
+  ): Promise<SessionKernelStoredOperationResultV2 | undefined> {
+    requiredIdentity(operationRequestId, 'operationRequestId');
+    const recordId = [
+      'session-kernel-v2',
+      this.runId,
+      `operation-result:${operationRequestId}`,
+    ].join(':');
+    const record = (await this.loadRecords()).find(
+      (candidate) => candidate.recordId === recordId
+    );
+    if (!record) return undefined;
+    const data = exactObject(
+      record.data,
+      [
+        'schemaVersion',
+        'operationRequestId',
+        'resultDigest',
+        'result',
+      ],
+      'session_kernel_operation_result_invalid'
+    );
+    const resultDigest = requiredDigest(
+      data.resultDigest,
+      'resultDigest'
+    );
+    if (
+      record.recordKind !== 'operationResult'
+      || data.schemaVersion !== SESSION_KERNEL_OPERATION_RESULT_V2_SCHEMA
+      || data.operationRequestId !== operationRequestId
+      || sha256Hash(canonicalJson(data.result)) !== resultDigest
+    ) {
+      throw new SessionKernelPersistenceError(
+        'session_kernel_operation_result_invalid',
+        `Operation result ${operationRequestId} is not exact durable v2 data.`
+      );
+    }
+    return {
+      resultDigest,
+      result: cloneJson(data.result),
+    };
+  }
+
   persistProjection(
     event: SessionKernelProjectionEventV2
   ): Promise<void> {
@@ -843,7 +889,7 @@ export interface SessionKernelHostProjectionSinkV2 {
   publish(
     event: SessionKernelProjectionEventV2,
     projectionHistory: SessionKernelProjectionEventV2[]
-  ): Promise<void>;
+  ): Promise<SessionKernelProjectionReceiptV2>;
 }
 
 export class DurableSessionKernelProjectionV2
@@ -854,15 +900,23 @@ implements SessionKernelProjectionPortV2 {
     private readonly sink?: SessionKernelHostProjectionSinkV2
   ) {}
 
-  async project(event: SessionKernelProjectionEventV2): Promise<void> {
+  async project(
+    event: SessionKernelProjectionEventV2
+  ): Promise<SessionKernelProjectionReceiptV2> {
     await this.persistence.persistProjection(event);
     if (this.sink) {
-      await this.sink.publish(
+      const receipt = await this.sink.publish(
         cloneJson(event),
         await this.projectionHistoryThrough(event.projectionId)
       );
       await this.persistence.persistProjectionDelivered(event);
+      return receipt;
     }
+    return {
+      projectionId: event.projectionId,
+      projectionDigest: sha256Hash(canonicalJson(event)),
+      delivered: false,
+    };
   }
 
   async flushPending(runId: string): Promise<void> {
@@ -915,6 +969,7 @@ const SESSION_KERNEL_PROJECTION_KINDS_V2 = new Set<
   'authorization.decided',
   'review.revised',
   'planAction.completed',
+  'run.cancelled',
   'wait.changed',
   'diagnostic',
 ]);

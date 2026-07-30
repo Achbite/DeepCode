@@ -29,6 +29,7 @@ import {
   type SessionOperationPlanActionBindingV2,
   type SessionKernelPublicRequestRecordV2,
   type SessionKernelReviewV2,
+  type SessionRunCancellationV2,
   type SessionNaturalLanguagePlanV2,
   type SessionPlanDecisionV2,
   type SessionProviderTurnRecordV2,
@@ -91,6 +92,7 @@ export interface SessionKernelLoopStateV2 {
     >
   >;
   review?: SessionKernelReviewV2;
+  runCancellation?: SessionRunCancellationV2;
   kernelWakeHint: boolean;
   checkpointRevision: number;
 }
@@ -239,6 +241,9 @@ export function restoreSessionKernelLoopStateV2(
     state
   );
   validateFactBarriers(state.factBarriers);
+  if (state.runCancellation) {
+    validateRunCancellation(state.runCancellation, state);
+  }
   state.factHistoryOmittedCount = nonnegativeSafeInteger(
     state.factHistoryOmittedCount,
     'factHistoryOmittedCount'
@@ -1051,6 +1056,228 @@ function validateProviderProfile(
       'Session provider profile bootstrap is not exact v2.'
     );
   }
+}
+
+function validateRunCancellation(
+  cancellation: SessionRunCancellationV2,
+  state: SessionKernelLoopStateV2
+): void {
+  requiredIdentity(cancellation.callerRequestId, 'callerRequestId');
+  requiredIdentity(cancellation.cancelOperationId, 'cancelOperationId');
+  requiredText(cancellation.requestedAt, 'requestedAt');
+  if (
+    !/^sha256:[0-9a-f]{64}$/u.test(cancellation.callerRequestDigest)
+    || ![
+      'requested',
+      'kernelSettled',
+      'factsReconciled',
+      'projected',
+    ].includes(cancellation.status)
+  ) {
+    throw new SessionKernelStateError(
+      'session_kernel_run_cancellation_invalid',
+      'Session Run cancellation identity or status is invalid.'
+    );
+  }
+  if (cancellation.invocationCancelRequestId) {
+    requiredIdentity(
+      cancellation.invocationCancelRequestId,
+      'invocationCancelRequestId'
+    );
+  }
+  if (
+    cancellation.status !== 'requested'
+    && (
+      !cancellation.invocationCancelRequestId
+      || !cancellation.cancellation
+    )
+  ) {
+    throw new SessionKernelStateError(
+      'session_kernel_run_cancellation_invalid',
+      'Settled Session Run cancellation has no Kernel reply.'
+    );
+  }
+  if (cancellation.cancellation) {
+    validateInvocationCancelReply(cancellation.cancellation, state);
+  }
+  if (
+    cancellation.status === 'requested'
+    && (
+      cancellation.cancellation
+      || cancellation.facts
+      || cancellation.cancelledAt
+      || cancellation.projection
+    )
+  ) {
+    throw new SessionKernelStateError(
+      'session_kernel_run_cancellation_invalid',
+      'Requested Session Run cancellation cannot carry settled evidence.'
+    );
+  }
+  if (
+    cancellation.status === 'kernelSettled'
+    && (
+      cancellation.facts
+      || cancellation.cancelledAt
+      || cancellation.projection
+    )
+  ) {
+    throw new SessionKernelStateError(
+      'session_kernel_run_cancellation_invalid',
+      'Kernel-settled Session Run cancellation cannot carry unreconciled facts or projection evidence.'
+    );
+  }
+  if (
+    cancellation.status === 'factsReconciled'
+    || cancellation.status === 'projected'
+  ) {
+    const facts = cancellation.facts;
+    if (
+      !facts
+      || !Number.isSafeInteger(facts.afterLedgerSequence)
+      || facts.afterLedgerSequence < 0
+      || !Number.isSafeInteger(facts.snapshotHighWater)
+      || facts.snapshotHighWater < 0
+      || facts.afterLedgerSequence < facts.snapshotHighWater
+      || !Number.isSafeInteger(facts.runSequenceHighWater)
+      || facts.runSequenceHighWater < 0
+      || facts.caughtUp !== true
+      || facts.pendingFactBarrierCount !== 0
+      || !cancellation.cancelledAt
+    ) {
+      throw new SessionKernelStateError(
+        'session_kernel_run_cancellation_invalid',
+        'Session Run cancellation facts proof is invalid.'
+      );
+    }
+    requiredText(cancellation.cancelledAt, 'cancelledAt');
+  }
+  if (cancellation.status === 'projected') {
+    if (
+      !cancellation.projection
+      || !/^sha256:[0-9a-f]{64}$/u.test(
+        cancellation.projection.projectionDigest
+      )
+    ) {
+      throw new SessionKernelStateError(
+        'session_kernel_run_cancellation_invalid',
+        'Projected Session Run cancellation has no delivery receipt.'
+      );
+    }
+    requiredIdentity(
+      cancellation.projection.projectionId,
+      'projectionId'
+    );
+    if (
+      cancellation.projection.projectionId
+        !== `run:${state.runId}:cancel:${cancellation.cancelOperationId}:settled`
+    ) {
+      throw new SessionKernelStateError(
+        'session_kernel_run_cancellation_invalid',
+        'Projected Session Run cancellation has a non-deterministic projection identity.'
+      );
+    }
+  } else if (cancellation.projection) {
+    throw new SessionKernelStateError(
+      'session_kernel_run_cancellation_invalid',
+      'Unprojected Session Run cancellation cannot carry a delivery receipt.'
+    );
+  }
+}
+
+function validateInvocationCancelReply(
+  value: unknown,
+  state: SessionKernelLoopStateV2
+): void {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw invalidRunCancellationReply();
+  }
+  const reply = value as Record<string, unknown>;
+  if (!hasExactFields(reply, ['kind', 'data'])) {
+    throw invalidRunCancellationReply();
+  }
+  const data = reply.data;
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    throw invalidRunCancellationReply();
+  }
+  const fields = data as Record<string, unknown>;
+  if (reply.kind === 'requested' || reply.kind === 'alreadyRequested') {
+    if (
+      !hasExactFields(fields, [
+        'cancelRequestId',
+        'invocationId',
+        'factId',
+        'ledgerSequence',
+      ])
+      || typeof fields.cancelRequestId !== 'string'
+      || typeof fields.invocationId !== 'string'
+      || typeof fields.factId !== 'string'
+      || !Number.isSafeInteger(fields.ledgerSequence)
+      || Number(fields.ledgerSequence) < 1
+    ) {
+      throw invalidRunCancellationReply();
+    }
+    requiredIdentity(fields.cancelRequestId, 'cancelRequestId');
+    requiredIdentity(fields.invocationId, 'invocationId');
+    requiredIdentity(fields.factId, 'factId');
+    return;
+  }
+  if (reply.kind === 'noActiveInvocation') {
+    if (
+      !hasExactFields(fields, ['runId', 'controlEpoch'])
+      || fields.runId !== state.runId
+      || fields.controlEpoch !== state.controlEpoch
+    ) {
+      throw invalidRunCancellationReply();
+    }
+    return;
+  }
+  if (reply.kind === 'alreadyTerminal') {
+    const terminalPhases = new Set([
+      'attemptPrepared',
+      'executing',
+      'failedBeforeEffect',
+      'cancelledBeforeEffect',
+      'timedOutBeforeEffect',
+      'completed',
+      'failedAfterObservedEffect',
+      'indeterminate',
+    ]);
+    if (
+      !hasExactFields(fields, [
+        'invocationId',
+        'terminalFactId',
+        'terminalPhase',
+      ])
+      || typeof fields.invocationId !== 'string'
+      || typeof fields.terminalFactId !== 'string'
+      || typeof fields.terminalPhase !== 'string'
+      || !terminalPhases.has(fields.terminalPhase)
+    ) {
+      throw invalidRunCancellationReply();
+    }
+    requiredIdentity(fields.invocationId, 'invocationId');
+    requiredIdentity(fields.terminalFactId, 'terminalFactId');
+    return;
+  }
+  throw invalidRunCancellationReply();
+}
+
+function hasExactFields(
+  value: Record<string, unknown>,
+  fields: string[]
+): boolean {
+  const keys = Object.keys(value).sort();
+  const expected = [...fields].sort();
+  return keys.length === expected.length
+    && keys.every((key, index) => key === expected[index]);
+}
+
+function invalidRunCancellationReply(): SessionKernelStateError {
+  return new SessionKernelStateError(
+    'session_kernel_run_cancellation_invalid',
+    'Kernel cancellation reply is not exact durable v2 data.'
+  );
 }
 
 function boundedInputHistory(

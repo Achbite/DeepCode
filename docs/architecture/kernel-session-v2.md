@@ -242,6 +242,21 @@ persist Session input
 Cancellation is not rollback. Late decisions for stale epochs, contexts,
 leases, cancelled invocations, or terminal invocations have no effect.
 
+An explicit user cancellation uses a private, high-priority Host–Session
+control operation. It does not wait for the ordinary Provider-operation
+admission lane and does not occupy the ordinary Run caller drive. Session first
+fences new Provider output and effect/query transport, replays only pending
+authority-reducing control requests, and submits the public
+`InvocationCancel(currentForRun, userRequested)`. A pending mutation is never
+first-dispatched or replayed by cancellation; without a no-effect proof the Run
+becomes indeterminate and is safety-retired. Otherwise Session reconciles exact
+fact barriers, checkpoints, and publishes a durably acknowledged
+`run.cancelled` projection. Only after Host validates that exact caller,
+operation, facts, and projection correlation may it retire Kernel authority and
+the Host Run; the owned bridge is removed last. A lost or unverifiable
+acknowledgement triggers safety cleanup, but it is indeterminate and must never
+be presented as canonical cancellation.
+
 The only execution fact store is the SQLite canonical fact store. Its public
 domains are Control, Authorization, Invocation, Effect, Resource, and Cleanup.
 Facts are queried with a run capability and a bounded ledger cursor. Status and

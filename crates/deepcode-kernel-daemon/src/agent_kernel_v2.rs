@@ -994,7 +994,9 @@ pub(crate) async fn cancel_agent_kernel_run_v2(
             return Ok(Some(replayed_host_run_id));
         }
         if binding.drive_state == HostCallerRequestDriveStateV2::Driving {
-            return recover_driving_caller_request_v2(state, binding).map(Some);
+            return recover_or_resume_driving_cancel_v2(state, binding)
+                .await
+                .map(Some);
         }
     }
     let Some(active) = state
@@ -1013,6 +1015,17 @@ pub(crate) async fn cancel_agent_kernel_run_v2(
     };
     require_route_run_identity_v2(&active, route_run_id)?;
     ensure_agent_run_cache_v2(state, &active)?;
+    let cancel_operation_id = stable_identity_v2(
+        "operation-cancel",
+        &json!({
+            "schemaVersion": "deepcode.host.cancel-operation-identity.v2",
+            "sessionId": session_id,
+            "hostRunId": active.host_run_id,
+            "runId": active.run_id,
+            "callerRequestId": caller_request_id,
+            "callerRequestDigest": request_digest,
+        }),
+    )?;
     let binding = match existing {
         Some(binding) => binding,
         None => state
@@ -1026,6 +1039,8 @@ pub(crate) async fn cancel_agent_kernel_run_v2(
                 response_identity: json!({
                     "hostRunId": active.host_run_id,
                     "runId": active.run_id,
+                    "operationRequestId": cancel_operation_id,
+                    "cancelOperationId": cancel_operation_id,
                 }),
                 recorded_at: now_rfc3339_utc_v2(),
             })
@@ -1033,29 +1048,39 @@ pub(crate) async fn cancel_agent_kernel_run_v2(
     };
     if caller_binding_string_v2(&binding, "hostRunId")? != active.host_run_id
         || caller_binding_string_v2(&binding, "runId")? != active.run_id
+        || caller_binding_string_v2(&binding, "operationRequestId")? != cancel_operation_id
+        || caller_binding_string_v2(&binding, "cancelOperationId")? != cancel_operation_id
     {
         return Err(AgentKernelV2Error::invalid(
             "host_caller_request_run_conflict",
             "Durable Host cancellation is bound to a different Run.",
         ));
     }
-    let binding = match claim_caller_drive_or_restore_v2(state, binding)? {
+    let binding = match claim_cancel_drive_or_restore_v2(state, binding).await? {
         CallerDriveAdmissionV2::Acquired(binding) => binding,
         CallerDriveAdmissionV2::Replayed(host_run_id) => return Ok(Some(host_run_id)),
     };
     if let Err(error) = state
         .kernel_session_v2
-        .retire_run_for_caller(
+        .cancel_run_for_caller(
             session_id,
             &active.host_run_id,
             &active.run_id,
             &binding.caller_request_id,
             &binding.request_digest,
+            &cancel_operation_id,
         )
         .await
         .map_err(AgentKernelV2Error::from_storage)
     {
-        settle_caller_error_outcome_v2(state, &binding, &error, true)?;
+        let error = safety_retire_failed_cancel_v2(
+            state,
+            &binding,
+            &active.host_run_id,
+            &active.run_id,
+            error,
+        )
+        .await?;
         return Err(error);
     }
     mark_agent_run_v2(
@@ -2906,6 +2931,41 @@ async fn claim_user_input_drive_or_restore_v2(
         .map(CallerDriveAdmissionV2::Replayed)
 }
 
+async fn claim_cancel_drive_or_restore_v2(
+    state: &AppState,
+    binding: HostCallerRequestBindingReceiptV2,
+) -> Result<CallerDriveAdmissionV2, AgentKernelV2Error> {
+    if let Some(host_run_id) = restore_caller_run_outcome_v2(state, &binding)? {
+        return Ok(CallerDriveAdmissionV2::Replayed(host_run_id));
+    }
+    if binding.drive_state == HostCallerRequestDriveStateV2::Driving {
+        return recover_or_resume_driving_cancel_v2(state, &binding)
+            .await
+            .map(CallerDriveAdmissionV2::Replayed);
+    }
+    let claim = state
+        .host_services
+        .kernel_operations_v2
+        .claim_caller_request_control_drive(
+            &binding.session_id,
+            &binding.caller_request_id,
+            &binding.request_kind,
+            &binding.request_digest,
+            &state.host_services.active_runs_v2.owner_instance_id(),
+            &now_rfc3339_utc_v2(),
+        )
+        .map_err(AgentKernelV2Error::from_storage)?;
+    if claim.acquired {
+        return Ok(CallerDriveAdmissionV2::Acquired(claim.binding));
+    }
+    if let Some(host_run_id) = restore_caller_run_outcome_v2(state, &claim.binding)? {
+        return Ok(CallerDriveAdmissionV2::Replayed(host_run_id));
+    }
+    recover_or_resume_driving_cancel_v2(state, &claim.binding)
+        .await
+        .map(CallerDriveAdmissionV2::Replayed)
+}
+
 fn claim_caller_drive_or_restore_v2(
     state: &AppState,
     binding: HostCallerRequestBindingReceiptV2,
@@ -3023,6 +3083,213 @@ async fn recover_or_resume_driving_user_input_v2(
     .await
 }
 
+async fn recover_or_resume_driving_cancel_v2(
+    state: &AppState,
+    binding: &HostCallerRequestBindingReceiptV2,
+) -> Result<String, AgentKernelV2Error> {
+    let host_run_id = caller_binding_string_v2(binding, "hostRunId")?;
+    let run_id = caller_binding_string_v2(binding, "runId")?;
+    let preflight_active = match state
+        .host_services
+        .active_runs_v2
+        .resolve(&binding.session_id, &host_run_id)
+    {
+        Ok(active) => {
+            if active.run_id != run_id {
+                return fail_driving_cancel_v2(
+                    state,
+                    binding,
+                    &active.host_run_id,
+                    &active.run_id,
+                    AgentKernelV2Error::invalid(
+                        "host_caller_request_run_conflict",
+                        "Durable cancellation identity does not match its exact active Host Run.",
+                    ),
+                )
+                .await;
+            }
+            Some(active)
+        }
+        Err(error)
+            if matches!(
+                error.code,
+                "host_active_run_not_found" | "host_active_run_retiring"
+            ) =>
+        {
+            None
+        }
+        Err(error) => {
+            return fail_driving_cancel_v2(
+                state,
+                binding,
+                &host_run_id,
+                &run_id,
+                AgentKernelV2Error::from_storage(error),
+            )
+            .await;
+        }
+    };
+    let evidence = match state
+        .host_services
+        .kernel_operations_v2
+        .caller_control_request_recovery_evidence(
+            &binding.session_id,
+            &binding.caller_request_id,
+            &binding.request_kind,
+            &binding.request_digest,
+        ) {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            let error = AgentKernelV2Error::from_storage(error);
+            if let Some(active) = preflight_active.as_ref() {
+                return fail_driving_cancel_v2(
+                    state,
+                    binding,
+                    &active.host_run_id,
+                    &active.run_id,
+                    error,
+                )
+                .await;
+            }
+            return Err(error);
+        }
+    };
+    if let Some(host_run_id) = restore_caller_run_outcome_v2(state, &evidence.binding)? {
+        return Ok(host_run_id);
+    }
+    if evidence.binding.request_kind != HOST_CANCEL_REQUEST_KIND_V2
+        || evidence.binding.drive_state != HostCallerRequestDriveStateV2::Driving
+    {
+        let error = AgentKernelV2Error::invalid(
+            "host_caller_request_indeterminate",
+            recovery_indeterminate_message_v2(&evidence),
+        );
+        if evidence.run_lifecycle == Some(HostKernelStoredRunLifecycleV2::Active) {
+            return fail_driving_cancel_v2(state, &evidence.binding, &host_run_id, &run_id, error)
+                .await;
+        }
+        settle_caller_error_outcome_v2(state, &evidence.binding, &error, true)?;
+        return Err(error);
+    }
+    if evidence.run_lifecycle != Some(HostKernelStoredRunLifecycleV2::Active) {
+        if let Some(run) = recovered_run_snapshot_v2(&evidence)? {
+            let host_run_id = run.run_id.clone();
+            settle_caller_run_snapshot_v2(state, &evidence.binding, run)?;
+            return Ok(host_run_id);
+        }
+        let error = AgentKernelV2Error::invalid(
+            "host_caller_request_indeterminate",
+            recovery_indeterminate_message_v2(&evidence),
+        );
+        settle_caller_error_outcome_v2(state, &evidence.binding, &error, true)?;
+        return Err(error);
+    }
+    if evidence.first_operation_pending {
+        return fail_driving_cancel_v2(
+            state,
+            &evidence.binding,
+            &host_run_id,
+            &run_id,
+            AgentKernelV2Error::invalid(
+                "host_caller_request_indeterminate",
+                "The exact cancellation has an unresolved Session dispatch; automatic redispatch is unsafe.",
+            ),
+        )
+        .await;
+    }
+    let cancel_operation_id = match caller_binding_string_v2(&evidence.binding, "cancelOperationId")
+    {
+        Ok(cancel_operation_id) => cancel_operation_id,
+        Err(error) => {
+            return fail_driving_cancel_v2(state, &evidence.binding, &host_run_id, &run_id, error)
+                .await;
+        }
+    };
+    let operation_request_id =
+        match caller_binding_string_v2(&evidence.binding, "operationRequestId") {
+            Ok(operation_request_id) => operation_request_id,
+            Err(error) => {
+                return fail_driving_cancel_v2(
+                    state,
+                    &evidence.binding,
+                    &host_run_id,
+                    &run_id,
+                    error,
+                )
+                .await;
+            }
+        };
+    if operation_request_id != cancel_operation_id {
+        return fail_driving_cancel_v2(
+            state,
+            &evidence.binding,
+            &host_run_id,
+            &run_id,
+            AgentKernelV2Error::invalid(
+                "host_caller_request_operation_conflict",
+                "Durable cancellation operation identities do not match.",
+            ),
+        )
+        .await;
+    }
+    let active = match require_active_agent_kernel_run_v2(
+        state,
+        &evidence.binding.session_id,
+        Some(&run_id),
+    ) {
+        Ok(active) => active,
+        Err(error) => {
+            return fail_driving_cancel_v2(state, &evidence.binding, &host_run_id, &run_id, error)
+                .await;
+        }
+    };
+    if active.host_run_id != host_run_id || active.run_id != run_id {
+        return fail_driving_cancel_v2(
+            state,
+            &evidence.binding,
+            &host_run_id,
+            &run_id,
+            AgentKernelV2Error::invalid(
+                "host_caller_request_run_conflict",
+                "Durable cancellation is bound to a different active Run.",
+            ),
+        )
+        .await;
+    }
+    if let Err(error) = ensure_agent_run_cache_v2(state, &active) {
+        return fail_driving_cancel_v2(state, &evidence.binding, &host_run_id, &run_id, error)
+            .await;
+    }
+    if let Err(error) = state
+        .kernel_session_v2
+        .cancel_run_for_caller(
+            &evidence.binding.session_id,
+            &host_run_id,
+            &run_id,
+            &evidence.binding.caller_request_id,
+            &evidence.binding.request_digest,
+            &cancel_operation_id,
+        )
+        .await
+        .map_err(AgentKernelV2Error::from_storage)
+    {
+        return fail_driving_cancel_v2(state, &evidence.binding, &host_run_id, &run_id, error)
+            .await;
+    }
+    mark_agent_run_v2(
+        state,
+        &host_run_id,
+        "cancelled",
+        Some(
+            "Kernel–Session v2 Run cancellation was recovered from canonical Session evidence."
+                .to_string(),
+        ),
+        None,
+    );
+    settle_caller_run_outcome_v2(state, &evidence.binding, &host_run_id)?;
+    Ok(host_run_id)
+}
+
 fn recover_driving_caller_request_v2(
     state: &AppState,
     binding: &HostCallerRequestBindingReceiptV2,
@@ -3093,7 +3360,8 @@ fn recovered_run_snapshot_v2(
                 == Some(evidence.binding.caller_request_id.as_str())
             && evidence.retirement_request_digest.as_deref()
                 == Some(evidence.binding.request_digest.as_str());
-        return Ok(caused_retirement.then(|| {
+        let canonical_cancellation = cancel_settlement_matches_binding_v2(evidence)?;
+        return Ok((caused_retirement && canonical_cancellation).then(|| {
             recovered_agent_run_state_v2(
                 evidence,
                 host_run_id,
@@ -3174,6 +3442,63 @@ fn recovered_run_snapshot_v2(
         ))),
         _ => Ok(None),
     }
+}
+
+fn cancel_settlement_matches_binding_v2(
+    evidence: &HostCallerRequestRecoveryEvidenceV2,
+) -> Result<bool, AgentKernelV2Error> {
+    let Some(settlement) = evidence.first_settlement.as_ref() else {
+        return Ok(false);
+    };
+    let operation_request_id = caller_binding_string_v2(&evidence.binding, "operationRequestId")?;
+    let cancel_operation_id = caller_binding_string_v2(&evidence.binding, "cancelOperationId")?;
+    if operation_request_id != cancel_operation_id
+        || settlement.operation_request_id != operation_request_id
+        || continuation_kind_v2(settlement) != Some("terminalRunCancelled")
+    {
+        return Ok(false);
+    }
+    let HostKernelOperationSettlementV2::Succeeded { response, .. } = &settlement.settlement else {
+        return Ok(false);
+    };
+    let outcome = response.get("outcome");
+    let facts = outcome.and_then(|value| value.get("facts"));
+    let projection = outcome.and_then(|value| value.get("projection"));
+    Ok(
+        response.get("operationKind").and_then(Value::as_str) == Some("cancelRun")
+            && outcome
+                .and_then(|value| value.get("kind"))
+                .and_then(Value::as_str)
+                == Some("runCancelled")
+            && outcome
+                .and_then(|value| value.get("callerRequestId"))
+                .and_then(Value::as_str)
+                == Some(evidence.binding.caller_request_id.as_str())
+            && outcome
+                .and_then(|value| value.get("callerRequestDigest"))
+                .and_then(Value::as_str)
+                == Some(evidence.binding.request_digest.as_str())
+            && outcome
+                .and_then(|value| value.get("cancelOperationId"))
+                .and_then(Value::as_str)
+                == Some(cancel_operation_id.as_str())
+            && facts
+                .and_then(|value| value.get("caughtUp"))
+                .and_then(Value::as_bool)
+                == Some(true)
+            && facts
+                .and_then(|value| value.get("pendingFactBarrierCount"))
+                .and_then(Value::as_u64)
+                == Some(0)
+            && projection
+                .and_then(|value| value.get("projectionId"))
+                .and_then(Value::as_str)
+                .is_some()
+            && projection
+                .and_then(|value| value.get("projectionDigest"))
+                .and_then(Value::as_str)
+                .is_some(),
+    )
 }
 
 fn recovered_agent_run_state_v2(
@@ -3365,16 +3690,23 @@ fn settle_caller_run_snapshot_v2(
             "Host caller request Run snapshot does not match its durable identity.",
         ));
     }
-    let evidence = state
-        .host_services
-        .kernel_operations_v2
-        .caller_request_recovery_evidence(
+    let operation_store = &state.host_services.kernel_operations_v2;
+    let evidence = if binding.request_kind == HOST_CANCEL_REQUEST_KIND_V2 {
+        operation_store.caller_control_request_recovery_evidence(
             &binding.session_id,
             &binding.caller_request_id,
             &binding.request_kind,
             &binding.request_digest,
         )
-        .map_err(AgentKernelV2Error::from_storage)?;
+    } else {
+        operation_store.caller_request_recovery_evidence(
+            &binding.session_id,
+            &binding.caller_request_id,
+            &binding.request_kind,
+            &binding.request_digest,
+        )
+    }
+    .map_err(AgentKernelV2Error::from_storage)?;
     let first_operation = evidence.first_settlement.as_ref().map(|settlement| {
         json!({
             "operationRequestId": settlement.operation_request_id,
@@ -3443,6 +3775,53 @@ fn settle_caller_error_outcome_v2(
         )
         .map_err(AgentKernelV2Error::from_storage)?;
     Ok(())
+}
+
+async fn safety_retire_failed_cancel_v2(
+    state: &AppState,
+    binding: &HostCallerRequestBindingReceiptV2,
+    host_run_id: &str,
+    run_id: &str,
+    cancellation_error: AgentKernelV2Error,
+) -> Result<AgentKernelV2Error, AgentKernelV2Error> {
+    let retirement = state
+        .kernel_session_v2
+        .safety_retire_cancel_run(&binding.session_id, host_run_id, run_id)
+        .await;
+    let final_error = match &retirement {
+        Ok(_) => cancellation_error,
+        Err(retirement_error) => AgentKernelV2Error::invalid(
+            "host_kernel_cancel_safety_retirement_pending",
+            format!(
+                "Cancellation became indeterminate after {}; run-wide safety retirement remains pending after {}",
+                cancellation_error.code, retirement_error.code
+            ),
+        ),
+    };
+    mark_agent_run_v2(
+        state,
+        host_run_id,
+        "failed",
+        Some(format!(
+            "Run cancellation is indeterminate and cannot be reported as cancelled: {}",
+            final_error.message
+        )),
+        None,
+    );
+    if retirement.is_ok() {
+        settle_caller_error_outcome_v2(state, binding, &final_error, true)?;
+    }
+    Ok(final_error)
+}
+
+async fn fail_driving_cancel_v2(
+    state: &AppState,
+    binding: &HostCallerRequestBindingReceiptV2,
+    host_run_id: &str,
+    run_id: &str,
+    error: AgentKernelV2Error,
+) -> Result<String, AgentKernelV2Error> {
+    Err(safety_retire_failed_cancel_v2(state, binding, host_run_id, run_id, error).await?)
 }
 
 fn typed_input_id(purpose: &str, material: &Value) -> Result<InputId, AgentKernelV2Error> {
@@ -3621,6 +4000,13 @@ fn mark_agent_run_v2(
     let Some(run) = runs.get_mut(host_run_id) else {
         return;
     };
+    let terminal_transition_allowed = run.status == "failed" && status == "cancelled";
+    if matches!(run.status.as_str(), "completed" | "failed" | "cancelled")
+        && run.status != status
+        && !terminal_transition_allowed
+    {
+        return;
+    }
     run.status = status.to_string();
     run.updated_at = now_text();
     run.message = message;

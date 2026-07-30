@@ -1,11 +1,12 @@
 use crate::host_kernel_operation_store_v2::{
     HostKernelBootstrapActivationV2, HostKernelBootstrapInitialInputV2,
     HostKernelBootstrapRecordV2, HostKernelDispatchAttemptStateV2, HostKernelDispatchPrepareV2,
-    HostKernelDispatchRecoveryV2, HostKernelOperationPreparedV2, HostKernelOperationRefV2,
+    HostKernelDispatchRecoveryV2, HostKernelOperationCallerCorrelationV2,
+    HostKernelOperationPreparedV2, HostKernelOperationRefV2,
     HostKernelOperationSettlementReceiptV2, HostKernelOperationSettlementV2,
     HostKernelOperationStoreV2, HostKernelPendingOperationV2, HostKernelRunOpeningInputV2,
-    HostKernelRunOpeningRecordV2, HostKernelStartupReconciliationV2,
-    HostKernelStoredRunLifecycleV2,
+    HostKernelRunOpeningRecordV2, HostKernelStartupCancelRecoveryV2,
+    HostKernelStartupReconciliationV2, HostKernelStoredRunLifecycleV2,
 };
 use crate::host_run_broker_v2::{
     HostActiveRunBrokerV2, HostActiveRunRecordV2, HostActiveRunRegistrationV2,
@@ -19,12 +20,17 @@ use crate::kernel_v2_transport::KernelV2TransportState;
 use crate::session_bootstrap_v2::{HostProviderProfileBootstrapV2, HostSessionPriorEventsV2};
 use crate::session_kernel_v2_store::SessionKernelV2Store;
 use crate::AgentInputAttachmentV2;
-use deepcode_kernel_abi::v2::{CommandRequestId, InputId, RunId, RunRetirementReasonCodeV2};
+use deepcode_kernel_abi::v2::{
+    CancellationReasonCodeV2, CancellationSourceV2, CommandRequestId, ControlFactV2, FactId,
+    InputId, InvocationFactV2, KernelFactEnvelopeV2, KernelFactPayloadV2, RunId,
+    RunRetirementReasonCodeV2,
+};
 use deepcode_kernel_abi::v2_command::{
-    KernelCommandEnvelopeV2, KernelCommandResponseEnvelopeV2, KernelCommandV2, KernelReplyV2,
-    RunOpenReplyV2, RunOpenV2,
+    InvocationCancelReplyV2, InvocationPhaseV2, KernelCommandEnvelopeV2,
+    KernelCommandResponseEnvelopeV2, KernelCommandV2, KernelReplyV2, RunOpenReplyV2, RunOpenV2,
 };
 use deepcode_kernel_abi::{RunCapabilityV2, WorkspaceBindingRefV2};
+use deepcode_kernel_ledger::v2::CanonicalFactReader;
 use deepcode_kernel_runtime::v2::SettingsCeilingV2;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -145,6 +151,11 @@ pub(crate) enum HostKernelBridgeOperationV2 {
     ReconcileFacts {
         observed_high_water: u64,
     },
+    CancelRun {
+        caller_request_id: String,
+        caller_request_digest: String,
+        cancel_operation_id: String,
+    },
     FinalizeReview {
         expected_plan_revision: String,
     },
@@ -201,6 +212,8 @@ pub(crate) enum HostKernelOperationRecoveryStateV2 {
     LostDispatchResumed,
     RecoveredDispatchSettled,
     ObservedResponseSettled,
+    CancellationEvidenceRecoveredAndRetired,
+    CancellationSafetyRetired,
     BlockedIndeterminate,
     BlockedByIndeterminate,
     BlockedByRecoveryFailure,
@@ -274,6 +287,7 @@ impl HostKernelStartupRecoveryStatusV2 {
                     HostKernelOperationRecoveryStateV2::BlockedIndeterminate
                         | HostKernelOperationRecoveryStateV2::BlockedByIndeterminate
                         | HostKernelOperationRecoveryStateV2::BlockedByRecoveryFailure
+                        | HostKernelOperationRecoveryStateV2::CancellationSafetyRetired
                         | HostKernelOperationRecoveryStateV2::RecoveryFailed
                 )
             }) {
@@ -284,6 +298,11 @@ impl HostKernelStartupRecoveryStatusV2 {
             HostKernelStartupRecoveryPhaseV2::Ready
         };
     }
+}
+
+enum HostKernelStartupCancelDispositionV2 {
+    CanonicalRetired,
+    SafetyRetired { evidence_error_code: &'static str },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -497,22 +516,39 @@ impl HostKernelRunCoordinatorV2 {
         .await
     }
 
-    pub(crate) async fn retire_run_for_caller(
+    pub(crate) async fn safety_retire_cancel_run(
         &self,
         session_id: &str,
         host_run_id: &str,
         run_id: &str,
-        caller_request_id: &str,
-        request_digest: &str,
     ) -> Result<HostRunRetirementReceiptV2, HostV2StorageError> {
-        self.retire_run_with_caller_correlation(
-            session_id,
-            host_run_id,
-            run_id,
-            RunRetirementReasonCodeV2::HostRequested,
-            Some((caller_request_id, request_digest)),
-        )
-        .await
+        let key = HostKernelLiveRunKeyV2 {
+            session_id: session_id.to_string(),
+            host_run_id: host_run_id.to_string(),
+            run_id: run_id.to_string(),
+        };
+        match self
+            .retire_run_with_caller_correlation(
+                session_id,
+                host_run_id,
+                run_id,
+                RunRetirementReasonCodeV2::HostRequested,
+                None,
+            )
+            .await
+        {
+            Ok(receipt) => Ok(receipt),
+            Err(error) => match self.remove_live_bridge(&key) {
+                Ok(_) => Err(error),
+                Err(cleanup_error) => Err(HostV2StorageError::io(
+                    "host_kernel_cancel_safety_retirement_pending",
+                    format!(
+                        "Cancellation became indeterminate after {}; safety retirement also failed to remove its live Session bridge after {}",
+                        error.code, cleanup_error.code
+                    ),
+                )),
+            },
+        }
     }
 
     async fn retire_run_with_caller_correlation(
@@ -528,6 +564,25 @@ impl HostKernelRunCoordinatorV2 {
             .active_runs_v2
             .begin_session_turn(session_id)
             .await?;
+        self.retire_run_with_turn_and_caller_correlation(
+            &turn,
+            session_id,
+            host_run_id,
+            run_id,
+            retirement_reason,
+            caller_correlation,
+        )
+    }
+
+    fn retire_run_with_turn_and_caller_correlation(
+        &self,
+        turn: &crate::host_run_broker_v2::HostSessionTurnGuardV2,
+        session_id: &str,
+        host_run_id: &str,
+        run_id: &str,
+        retirement_reason: RunRetirementReasonCodeV2,
+        caller_correlation: Option<(&str, &str)>,
+    ) -> Result<HostRunRetirementReceiptV2, HostV2StorageError> {
         let bootstrap = self
             .host_services
             .kernel_operations_v2
@@ -538,13 +593,8 @@ impl HostKernelRunCoordinatorV2 {
                 "Run retirement does not match the exact durable bootstrap",
             ));
         }
-        self.remove_live_bridge(&HostKernelLiveRunKeyV2 {
-            session_id: session_id.to_string(),
-            host_run_id: host_run_id.to_string(),
-            run_id: run_id.to_string(),
-        })?;
         let receipt = self.host_services.retire_kernel_run_with_turn_v2(
-            &turn,
+            turn,
             host_run_id,
             run_id,
             retirement_reason,
@@ -574,6 +624,11 @@ impl HostKernelRunCoordinatorV2 {
                 )?;
             }
         }
+        self.remove_live_bridge(&HostKernelLiveRunKeyV2 {
+            session_id: session_id.to_string(),
+            host_run_id: host_run_id.to_string(),
+            run_id: run_id.to_string(),
+        })?;
         Ok(receipt)
     }
 
@@ -834,6 +889,7 @@ impl HostKernelRunCoordinatorV2 {
                     .clone(),
             ),
             operation_request_id: operation_request_id.to_string(),
+            caller_correlation: None,
             production_frame: frame.clone(),
             recorded_at: crate::utils::now_text(),
         };
@@ -859,6 +915,170 @@ impl HostKernelRunCoordinatorV2 {
         let completion = self.prepare_and_dispatch(&live, operation_ref, frame)?;
         drop(turn);
         await_operation_completion(completion).await
+    }
+
+    pub(crate) async fn cancel_run_for_caller(
+        &self,
+        session_id: &str,
+        host_run_id: &str,
+        run_id: &str,
+        caller_request_id: &str,
+        caller_request_digest: &str,
+        cancel_operation_id: &str,
+    ) -> Result<(), HostV2StorageError> {
+        let turn = self
+            .host_services
+            .active_runs_v2
+            .begin_session_turn(session_id)
+            .await?;
+        let bootstrap = self
+            .host_services
+            .kernel_operations_v2
+            .get_bootstrap(session_id, host_run_id)?;
+        if bootstrap.run_id != run_id {
+            return Err(HostV2StorageError::conflict(
+                "host_kernel_cancel_run_identity_conflict",
+                "Run cancellation does not match the exact durable bootstrap",
+            ));
+        }
+        let operation = HostKernelBridgeOperationV2::CancelRun {
+            caller_request_id: caller_request_id.to_string(),
+            caller_request_digest: caller_request_digest.to_string(),
+            cancel_operation_id: cancel_operation_id.to_string(),
+        };
+        let frame =
+            production_request_frame_from_bootstrap(&bootstrap, cancel_operation_id, &operation)?;
+        let prepared = || HostKernelOperationPreparedV2 {
+            session_id: bootstrap.session_id.clone(),
+            host_run_id: bootstrap.host_run_id.clone(),
+            run_id: bootstrap.run_id.clone(),
+            bootstrap_digest: bootstrap.bootstrap_digest.clone(),
+            provider_profile_revision_digest: Some(
+                bootstrap
+                    .provider_profile
+                    .provider_profile_revision_digest
+                    .clone(),
+            ),
+            operation_request_id: cancel_operation_id.to_string(),
+            caller_correlation: Some(HostKernelOperationCallerCorrelationV2 {
+                caller_request_id: caller_request_id.to_string(),
+                request_kind: "agent.run.cancel.v2".to_string(),
+                request_digest: caller_request_digest.to_string(),
+            }),
+            production_frame: frame.clone(),
+            recorded_at: crate::utils::now_text(),
+        };
+        let existing = self
+            .host_services
+            .kernel_operations_v2
+            .prepared_operation(prepared())?;
+        let cancellation_operation = match self.host_services.kernel_operations_v2.settlement(
+            session_id,
+            host_run_id,
+            cancel_operation_id,
+        )? {
+            Some(settlement) => settlement,
+            None => {
+                let key = HostKernelLiveRunKeyV2 {
+                    session_id: session_id.to_string(),
+                    host_run_id: host_run_id.to_string(),
+                    run_id: run_id.to_string(),
+                };
+                let live = self.live_bridge(&key)?;
+                if live.bootstrap_digest != bootstrap.bootstrap_digest {
+                    return Err(HostV2StorageError::conflict(
+                        "host_kernel_live_bridge_bootstrap_conflict",
+                        "Live Session bridge does not match the durable Run bootstrap",
+                    ));
+                }
+                if live.child.try_wait()?.is_some() {
+                    live.failed.store(true, Ordering::Release);
+                }
+                if live.failed.load(Ordering::Acquire) {
+                    return Err(HostV2StorageError::conflict(
+                        "host_kernel_live_bridge_unavailable",
+                        "Session bridge is not live and cannot accept cancellation",
+                    ));
+                }
+                if existing.is_none() {
+                    self.host_services
+                        .kernel_operations_v2
+                        .prepare_operation(prepared())?;
+                }
+                let completion = self.prepare_and_dispatch(
+                    &live,
+                    operation_ref(&bootstrap, cancel_operation_id),
+                    frame,
+                )?;
+                await_operation_completion(completion).await?
+            }
+        };
+        let acknowledgement = self.validate_cancel_run_settlement_against_kernel(
+            &cancellation_operation,
+            session_id,
+            host_run_id,
+            run_id,
+            caller_request_id,
+            caller_request_digest,
+            cancel_operation_id,
+        )?;
+        self.host_services
+            .projection_v2
+            .require_durable_run_cancelled_projection(
+                session_id,
+                host_run_id,
+                run_id,
+                &acknowledgement.projection_id,
+                &acknowledgement.projection_digest,
+                &acknowledgement.projection_data,
+            )?;
+        self.retire_run_with_turn_and_caller_correlation(
+            &turn,
+            session_id,
+            host_run_id,
+            run_id,
+            RunRetirementReasonCodeV2::HostRequested,
+            Some((caller_request_id, caller_request_digest)),
+        )?;
+        Ok(())
+    }
+
+    fn validate_cancel_run_settlement_against_kernel(
+        &self,
+        settlement: &HostKernelOperationSettlementReceiptV2,
+        session_id: &str,
+        host_run_id: &str,
+        run_id: &str,
+        caller_request_id: &str,
+        caller_request_digest: &str,
+        cancel_operation_id: &str,
+    ) -> Result<ValidatedCancelRunAcknowledgementV2, HostV2StorageError> {
+        let typed_run_id = RunId::new(run_id.to_string()).map_err(|_| {
+            HostV2StorageError::conflict(
+                "host_kernel_cancel_run_identity_invalid",
+                "Cancel acknowledgement contains an invalid Kernel Run identity",
+            )
+        })?;
+        let service = self.kernel_transport.service();
+        let kernel_run_sequence_high_water = service
+            .run_sequence_high_water(&typed_run_id)
+            .map_err(|_| {
+                HostV2StorageError::io(
+                    "host_kernel_cancel_fact_boundary_unavailable",
+                    "Canonical Kernel Run fact boundary is unavailable for cancellation validation",
+                )
+            })?;
+        validate_cancel_run_settlement(
+            settlement,
+            session_id,
+            host_run_id,
+            run_id,
+            caller_request_id,
+            caller_request_digest,
+            cancel_operation_id,
+            kernel_run_sequence_high_water,
+            &service.fact_reader(),
+        )
     }
 
     async fn reconcile_kernel_facts_before_operation(
@@ -921,6 +1141,7 @@ impl HostKernelRunCoordinatorV2 {
                             .clone(),
                     ),
                     operation_request_id: operation_request_id.clone(),
+                    caller_correlation: None,
                     production_frame: frame.clone(),
                     recorded_at: crate::utils::now_text(),
                 },
@@ -993,6 +1214,7 @@ impl HostKernelRunCoordinatorV2 {
                         .clone(),
                 ),
                 operation_request_id: operation_request_id.to_string(),
+                caller_correlation: None,
                 production_frame: frame.clone(),
                 recorded_at: crate::utils::now_text(),
             },
@@ -1665,6 +1887,53 @@ impl HostKernelRunCoordinatorV2 {
                 .record_startup_error("unsupported_history_schema");
         }
 
+        for cancellation in &reconciliation.cancel_recoveries {
+            match self.recover_startup_cancel(cancellation).await {
+                Ok(HostKernelStartupCancelDispositionV2::CanonicalRetired) => {
+                    if let Some(operation) = &cancellation.pending_operation {
+                        recovery_status.operations.push(startup_operation_status(
+                            operation,
+                            HostKernelOperationRecoveryStateV2::CancellationEvidenceRecoveredAndRetired,
+                            None,
+                        ));
+                    }
+                }
+                Ok(HostKernelStartupCancelDispositionV2::SafetyRetired {
+                    evidence_error_code,
+                }) => {
+                    let safety_code = "host_kernel_cancel_startup_safety_retired";
+                    recovery_status.record_error(evidence_error_code);
+                    recovery_status.record_error(safety_code);
+                    self.host_services
+                        .active_runs_v2
+                        .record_startup_error(evidence_error_code);
+                    self.host_services
+                        .active_runs_v2
+                        .record_startup_error(safety_code);
+                    if let Some(operation) = &cancellation.pending_operation {
+                        recovery_status.operations.push(startup_operation_status(
+                            operation,
+                            HostKernelOperationRecoveryStateV2::CancellationSafetyRetired,
+                            Some(evidence_error_code),
+                        ));
+                    }
+                }
+                Err(error) => {
+                    recovery_status.record_error(error.code);
+                    self.host_services
+                        .active_runs_v2
+                        .record_startup_error(error.code);
+                    if let Some(operation) = &cancellation.pending_operation {
+                        recovery_status.operations.push(startup_operation_status(
+                            operation,
+                            HostKernelOperationRecoveryStateV2::RecoveryFailed,
+                            Some(error.code),
+                        ));
+                    }
+                }
+            }
+        }
+
         for opening in &reconciliation.opening_runs {
             if let Err(error) = self.recover_opening_run(opening).await {
                 recovery_status.record_error(error.code);
@@ -1965,6 +2234,158 @@ impl HostKernelRunCoordinatorV2 {
         Ok(reconciliation)
     }
 
+    async fn recover_startup_cancel(
+        &self,
+        recovery: &HostKernelStartupCancelRecoveryV2,
+    ) -> Result<HostKernelStartupCancelDispositionV2, HostV2StorageError> {
+        let canonical = self
+            .recover_startup_cancel_settlement(recovery)
+            .and_then(|settlement| {
+                self.validate_cancel_run_settlement_against_kernel(
+                    &settlement,
+                    &recovery.bootstrap.session_id,
+                    &recovery.bootstrap.host_run_id,
+                    &recovery.bootstrap.run_id,
+                    &recovery.binding.caller_request_id,
+                    &recovery.binding.request_digest,
+                    &recovery.cancel_operation_id,
+                )
+            })
+            .and_then(|acknowledgement| {
+                self.host_services
+                    .projection_v2
+                    .require_durable_run_cancelled_projection(
+                        &recovery.bootstrap.session_id,
+                        &recovery.bootstrap.host_run_id,
+                        &recovery.bootstrap.run_id,
+                        &acknowledgement.projection_id,
+                        &acknowledgement.projection_digest,
+                        &acknowledgement.projection_data,
+                    )
+            });
+        let turn = self
+            .host_services
+            .active_runs_v2
+            .begin_session_turn(&recovery.bootstrap.session_id)
+            .await?;
+        match canonical {
+            Ok(()) => {
+                self.retire_run_with_turn_and_caller_correlation(
+                    &turn,
+                    &recovery.bootstrap.session_id,
+                    &recovery.bootstrap.host_run_id,
+                    &recovery.bootstrap.run_id,
+                    RunRetirementReasonCodeV2::HostRequested,
+                    Some((
+                        &recovery.binding.caller_request_id,
+                        &recovery.binding.request_digest,
+                    )),
+                )
+                .map_err(|error| {
+                    HostV2StorageError::io(
+                        "host_kernel_cancel_startup_retirement_pending",
+                        format!(
+                            "Canonical startup cancellation was recovered, but Host retirement remains pending after {}",
+                            error.code
+                        ),
+                    )
+                })?;
+                Ok(HostKernelStartupCancelDispositionV2::CanonicalRetired)
+            }
+            Err(evidence_error) => {
+                self.retire_run_with_turn_and_caller_correlation(
+                    &turn,
+                    &recovery.bootstrap.session_id,
+                    &recovery.bootstrap.host_run_id,
+                    &recovery.bootstrap.run_id,
+                    RunRetirementReasonCodeV2::HostRequested,
+                    None,
+                )
+                .map_err(|retirement_error| {
+                    HostV2StorageError::io(
+                        "host_kernel_cancel_startup_safety_retirement_pending",
+                        format!(
+                            "Cancellation recovery evidence is incomplete after {}; safety retirement remains pending after {}",
+                            evidence_error.code, retirement_error.code
+                        ),
+                    )
+                })?;
+                Ok(HostKernelStartupCancelDispositionV2::SafetyRetired {
+                    evidence_error_code: evidence_error.code,
+                })
+            }
+        }
+    }
+
+    fn recover_startup_cancel_settlement(
+        &self,
+        recovery: &HostKernelStartupCancelRecoveryV2,
+    ) -> Result<HostKernelOperationSettlementReceiptV2, HostV2StorageError> {
+        if let Some(settlement) = &recovery.settlement {
+            return Ok(settlement.clone());
+        }
+        let operation = recovery.pending_operation.as_ref().ok_or_else(|| {
+            HostV2StorageError::not_found(
+                "host_kernel_cancel_startup_operation_missing",
+                "Driving cancellation has no durable Session operation",
+            )
+        })?;
+        let attempt = operation.latest_attempt.as_ref().ok_or_else(|| {
+            HostV2StorageError::not_found(
+                "host_kernel_cancel_startup_attempt_missing",
+                "Driving cancellation has no durable dispatch attempt",
+            )
+        })?;
+        if attempt.state == HostKernelDispatchAttemptStateV2::ResponseObserved {
+            return self.settle_observed_operation(operation);
+        }
+        if !matches!(
+            attempt.state,
+            HostKernelDispatchAttemptStateV2::Committed
+                | HostKernelDispatchAttemptStateV2::Indeterminate
+        ) {
+            return Err(HostV2StorageError::conflict(
+                "host_kernel_cancel_startup_attempt_unproven",
+                "Cancellation dispatch has no recoverable post-write response evidence",
+            ));
+        }
+        let response = self
+            .host_services
+            .session_kernel_v2
+            .recover_operation_result_for_host(
+                &operation.session_id,
+                &operation.run_id,
+                &operation.operation_request_id,
+            )?
+            .ok_or_else(|| {
+                HostV2StorageError::not_found(
+                    "session_kernel_cancel_operation_result_missing",
+                    "Cancellation response is not durable in the Session operation-result store",
+                )
+            })?;
+        let operation_ref = pending_operation_ref(operation);
+        self.host_services.kernel_operations_v2.observe_response(
+            &operation_ref,
+            &attempt.attempt_id,
+            &attempt.owner_instance_id,
+            response.clone(),
+            &crate::utils::now_text(),
+        )?;
+        let key = HostKernelLiveRunKeyV2 {
+            session_id: operation.session_id.clone(),
+            host_run_id: operation.host_run_id.clone(),
+            run_id: operation.run_id.clone(),
+        };
+        let settlement = settlement_from_observed_response(&key, &response)?;
+        self.host_services.kernel_operations_v2.settle_operation(
+            &operation_ref,
+            &attempt.attempt_id,
+            &attempt.owner_instance_id,
+            settlement,
+            &crate::utils::now_text(),
+        )
+    }
+
     fn settle_observed_operation(
         &self,
         operation: &HostKernelPendingOperationV2,
@@ -2256,6 +2677,18 @@ fn production_request_frame_from_bootstrap(
     operation: &HostKernelBridgeOperationV2,
 ) -> Result<Value, HostV2StorageError> {
     validate_bridge_operation(operation)?;
+    if let HostKernelBridgeOperationV2::CancelRun {
+        cancel_operation_id,
+        ..
+    } = operation
+    {
+        if cancel_operation_id != operation_request_id {
+            return Err(HostV2StorageError::conflict(
+                "host_kernel_cancel_operation_identity_conflict",
+                "Cancel operation identity must equal the outer operation request identity",
+            ));
+        }
+    }
     let request = json!({
         "schemaVersion": SESSION_KERNEL_PRODUCTION_REQUEST_V2_SCHEMA,
         "sessionId": bootstrap.session_id,
@@ -2292,6 +2725,27 @@ fn production_request_frame_from_bootstrap(
 fn validate_bridge_operation(
     operation: &HostKernelBridgeOperationV2,
 ) -> Result<(), HostV2StorageError> {
+    if let HostKernelBridgeOperationV2::CancelRun {
+        caller_request_id,
+        caller_request_digest,
+        cancel_operation_id,
+    } = operation
+    {
+        crate::host_v2_storage::validate_bounded_identity(
+            caller_request_id,
+            "callerRequestId",
+            512,
+        )?;
+        crate::host_v2_storage::validate_sha256_digest(
+            caller_request_digest,
+            "callerRequestDigest",
+        )?;
+        crate::host_v2_storage::validate_bounded_identity(
+            cancel_operation_id,
+            "cancelOperationId",
+            512,
+        )?;
+    }
     let plan_pair = match operation {
         HostKernelBridgeOperationV2::ResumeAfterBackpressure {
             plan_action_id,
@@ -2921,6 +3375,445 @@ fn validate_success_response(
                 "Successful Session bridge response has no continuation",
             )
         })
+}
+
+struct ValidatedCancelRunAcknowledgementV2 {
+    projection_id: String,
+    projection_digest: String,
+    projection_data: Value,
+}
+
+fn validate_cancel_run_settlement(
+    settlement: &HostKernelOperationSettlementReceiptV2,
+    session_id: &str,
+    host_run_id: &str,
+    run_id: &str,
+    caller_request_id: &str,
+    caller_request_digest: &str,
+    cancel_operation_id: &str,
+    kernel_run_sequence_high_water: u64,
+    fact_reader: &CanonicalFactReader,
+) -> Result<ValidatedCancelRunAcknowledgementV2, HostV2StorageError> {
+    if settlement.operation_request_id != cancel_operation_id {
+        return Err(HostV2StorageError::conflict(
+            "host_kernel_cancel_settlement_identity_conflict",
+            "Cancel settlement does not match the exact cancel operation identity",
+        ));
+    }
+    let HostKernelOperationSettlementV2::Succeeded { response, .. } = &settlement.settlement else {
+        return Err(HostV2StorageError::conflict(
+            "host_kernel_cancel_not_acknowledged",
+            "Session did not acknowledge canonical Run cancellation",
+        ));
+    };
+    let response = exact_response_object(
+        response,
+        &[
+            "schemaVersion",
+            "ok",
+            "sessionId",
+            "hostRunId",
+            "runId",
+            "operationGeneration",
+            "authorityGeneration",
+            "operationKind",
+            "causalState",
+            "state",
+            "outcome",
+            "continuation",
+        ],
+        "Session cancel response",
+    )?;
+    if response.get("schemaVersion").and_then(Value::as_str)
+        != Some(SESSION_KERNEL_PRODUCTION_RESPONSE_V2_SCHEMA)
+        || response.get("ok").and_then(Value::as_bool) != Some(true)
+        || response.get("sessionId").and_then(Value::as_str) != Some(session_id)
+        || response.get("hostRunId").and_then(Value::as_str) != Some(host_run_id)
+        || response.get("runId").and_then(Value::as_str) != Some(run_id)
+        || response.get("operationKind").and_then(Value::as_str) != Some("cancelRun")
+    {
+        return Err(HostV2StorageError::conflict(
+            "host_kernel_cancel_response_identity_conflict",
+            "Session cancel acknowledgement does not match the exact Run",
+        ));
+    }
+    let outcome = exact_response_object(
+        response.get("outcome").ok_or_else(|| {
+            HostV2StorageError::invalid(
+                "host_kernel_cancel_outcome_invalid",
+                "Session cancel acknowledgement has no outcome",
+            )
+        })?,
+        &[
+            "kind",
+            "callerRequestId",
+            "callerRequestDigest",
+            "cancelOperationId",
+            "controlEpoch",
+            "cancellation",
+            "facts",
+            "projection",
+        ],
+        "Session cancel outcome",
+    )?;
+    if outcome.get("kind").and_then(Value::as_str) != Some("runCancelled")
+        || outcome.get("callerRequestId").and_then(Value::as_str) != Some(caller_request_id)
+        || outcome.get("callerRequestDigest").and_then(Value::as_str) != Some(caller_request_digest)
+        || outcome.get("cancelOperationId").and_then(Value::as_str) != Some(cancel_operation_id)
+    {
+        return Err(HostV2StorageError::conflict(
+            "host_kernel_cancel_outcome_identity_conflict",
+            "Session cancel outcome changed immutable caller or operation identity",
+        ));
+    }
+    crate::host_v2_storage::validate_sha256_digest(caller_request_digest, "callerRequestDigest")?;
+    let control_epoch = outcome
+        .get("controlEpoch")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            HostV2StorageError::invalid(
+                "host_kernel_cancel_outcome_invalid",
+                "Session cancel outcome has no valid control epoch",
+            )
+        })?;
+    let cancellation_value = outcome.get("cancellation").cloned().ok_or_else(|| {
+        HostV2StorageError::invalid(
+            "host_kernel_cancel_outcome_invalid",
+            "Session cancel outcome has no Kernel cancellation result",
+        )
+    })?;
+    let cancellation: InvocationCancelReplyV2 = serde_json::from_value(cancellation_value.clone())
+        .map_err(|_| {
+            HostV2StorageError::invalid(
+                "host_kernel_cancel_reply_invalid",
+                "Session cancel outcome contains an invalid public Kernel cancellation reply",
+            )
+        })?;
+    cancellation.validate().map_err(|_| {
+        HostV2StorageError::invalid(
+            "host_kernel_cancel_reply_invalid",
+            "Session cancel outcome contains an invalid public Kernel cancellation reply",
+        )
+    })?;
+    validate_invocation_cancel_reply_fact(fact_reader, run_id, control_epoch, &cancellation)?;
+    if let InvocationCancelReplyV2::NoActiveInvocation {
+        run_id: cancelled_run_id,
+        control_epoch: cancelled_control_epoch,
+    } = &cancellation
+    {
+        if cancelled_run_id.as_str() != run_id || cancelled_control_epoch.get() != control_epoch {
+            return Err(HostV2StorageError::conflict(
+                "host_kernel_cancel_reply_identity_conflict",
+                "Kernel no-active-invocation reply does not match the cancelled Run",
+            ));
+        }
+    }
+    let facts_value = outcome.get("facts").cloned().ok_or_else(|| {
+        HostV2StorageError::invalid(
+            "host_kernel_cancel_facts_invalid",
+            "Session cancel outcome has no reconciled facts boundary",
+        )
+    })?;
+    let facts = exact_response_object(
+        &facts_value,
+        &[
+            "afterLedgerSequence",
+            "snapshotHighWater",
+            "runSequenceHighWater",
+            "caughtUp",
+            "pendingFactBarrierCount",
+        ],
+        "Session cancel facts",
+    )?;
+    let after_ledger_sequence = cancel_u64_field(facts, "afterLedgerSequence")?;
+    let snapshot_high_water = cancel_u64_field(facts, "snapshotHighWater")?;
+    let run_sequence_high_water = cancel_u64_field(facts, "runSequenceHighWater")?;
+    if after_ledger_sequence < snapshot_high_water
+        || run_sequence_high_water != kernel_run_sequence_high_water
+        || facts.get("caughtUp").and_then(Value::as_bool) != Some(true)
+        || facts.get("pendingFactBarrierCount").and_then(Value::as_u64) != Some(0)
+    {
+        return Err(HostV2StorageError::conflict(
+            "host_kernel_cancel_facts_incomplete",
+            "Session cancellation did not reconcile its exact Kernel fact boundary",
+        ));
+    }
+    let state = response
+        .get("state")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            HostV2StorageError::invalid(
+                "host_kernel_cancel_state_invalid",
+                "Session cancel acknowledgement has no state summary",
+            )
+        })?;
+    if state.get("controlEpoch").and_then(Value::as_u64) != Some(control_epoch)
+        || state
+            .get("factsAfterLedgerSequence")
+            .and_then(Value::as_u64)
+            != Some(after_ledger_sequence)
+        || state.get("factsSnapshotHighWater").and_then(Value::as_u64) != Some(snapshot_high_water)
+        || state
+            .get("factsRunSequenceHighWater")
+            .and_then(Value::as_u64)
+            != Some(run_sequence_high_water)
+        || state
+            .get("pendingRequestLanes")
+            .and_then(Value::as_array)
+            .is_none_or(|lanes| !lanes.is_empty())
+    {
+        return Err(HostV2StorageError::conflict(
+            "host_kernel_cancel_state_conflict",
+            "Session cancel state does not match its reconciled cancellation outcome",
+        ));
+    }
+    let projection = exact_response_object(
+        outcome.get("projection").ok_or_else(|| {
+            HostV2StorageError::invalid(
+                "host_kernel_cancel_projection_invalid",
+                "Session cancel outcome has no projection acknowledgement",
+            )
+        })?,
+        &["projectionId", "projectionDigest"],
+        "Session cancel projection",
+    )?;
+    let projection_id = projection
+        .get("projectionId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            HostV2StorageError::invalid(
+                "host_kernel_cancel_projection_invalid",
+                "Session cancel outcome has no projection identity",
+            )
+        })?
+        .to_string();
+    let projection_digest = projection
+        .get("projectionDigest")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            HostV2StorageError::invalid(
+                "host_kernel_cancel_projection_invalid",
+                "Session cancel outcome has no projection digest",
+            )
+        })?
+        .to_string();
+    crate::host_v2_storage::validate_bounded_identity(&projection_id, "projectionId", 512)?;
+    crate::host_v2_storage::validate_sha256_digest(&projection_digest, "projectionDigest")?;
+    let expected_projection_id = format!("run:{run_id}:cancel:{cancel_operation_id}:settled");
+    if projection_id != expected_projection_id {
+        return Err(HostV2StorageError::conflict(
+            "host_kernel_cancel_projection_identity_conflict",
+            "Session cancel projection identity is not deterministic for the exact cancellation",
+        ));
+    }
+    let continuation = exact_response_object(
+        response.get("continuation").ok_or_else(|| {
+            HostV2StorageError::invalid(
+                "host_kernel_cancel_continuation_invalid",
+                "Session cancel acknowledgement has no terminal continuation",
+            )
+        })?,
+        &[
+            "kind",
+            "cancelOperationId",
+            "projectionId",
+            "projectionDigest",
+        ],
+        "Session cancel continuation",
+    )?;
+    if continuation.get("kind").and_then(Value::as_str) != Some("terminalRunCancelled")
+        || continuation
+            .get("cancelOperationId")
+            .and_then(Value::as_str)
+            != Some(cancel_operation_id)
+        || continuation.get("projectionId").and_then(Value::as_str) != Some(projection_id.as_str())
+        || continuation.get("projectionDigest").and_then(Value::as_str)
+            != Some(projection_digest.as_str())
+    {
+        return Err(HostV2StorageError::conflict(
+            "host_kernel_cancel_continuation_conflict",
+            "Session cancel continuation does not match the exact durable projection",
+        ));
+    }
+    Ok(ValidatedCancelRunAcknowledgementV2 {
+        projection_id,
+        projection_digest,
+        projection_data: json!({
+            "callerRequestId": caller_request_id,
+            "callerRequestDigest": caller_request_digest,
+            "cancelOperationId": cancel_operation_id,
+            "controlEpoch": control_epoch,
+            "cancellation": cancellation_value,
+            "facts": facts_value,
+        }),
+    })
+}
+
+fn validate_invocation_cancel_reply_fact(
+    fact_reader: &CanonicalFactReader,
+    run_id: &str,
+    control_epoch: u64,
+    reply: &InvocationCancelReplyV2,
+) -> Result<(), HostV2StorageError> {
+    match reply {
+        InvocationCancelReplyV2::Requested {
+            cancel_request_id,
+            invocation_id,
+            fact_id,
+            ledger_sequence,
+        } => validate_cancellation_requested_fact(
+            fact_reader,
+            ExpectedCancellationRequestedFactV2 {
+                run_id,
+                required_control_epoch: Some(control_epoch),
+                cancel_request_id: cancel_request_id.as_str(),
+                invocation_id: invocation_id.as_str(),
+                fact_id,
+                ledger_sequence: *ledger_sequence,
+                require_user_command: true,
+            },
+        ),
+        InvocationCancelReplyV2::AlreadyRequested {
+            cancel_request_id,
+            invocation_id,
+            fact_id,
+            ledger_sequence,
+        } => validate_cancellation_requested_fact(
+            fact_reader,
+            ExpectedCancellationRequestedFactV2 {
+                run_id,
+                required_control_epoch: None,
+                cancel_request_id: cancel_request_id.as_str(),
+                invocation_id: invocation_id.as_str(),
+                fact_id,
+                ledger_sequence: *ledger_sequence,
+                require_user_command: false,
+            },
+        ),
+        InvocationCancelReplyV2::NoActiveInvocation { .. } => Ok(()),
+        InvocationCancelReplyV2::AlreadyTerminal {
+            invocation_id,
+            terminal_fact_id,
+            terminal_phase,
+        } => {
+            let fact = required_cancel_fact(fact_reader, terminal_fact_id)?;
+            if &fact.fact_id != terminal_fact_id
+                || fact.payload.run_id().as_str() != run_id
+                || fact.payload.invocation_id().map(|id| id.as_str())
+                    != Some(invocation_id.as_str())
+                || terminal_invocation_phase_v2(&fact.payload) != Some(*terminal_phase)
+            {
+                return Err(HostV2StorageError::conflict(
+                    "host_kernel_cancel_fact_identity_conflict",
+                    "Kernel terminal cancellation reply does not match its canonical invocation fact",
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
+struct ExpectedCancellationRequestedFactV2<'a> {
+    run_id: &'a str,
+    required_control_epoch: Option<u64>,
+    cancel_request_id: &'a str,
+    invocation_id: &'a str,
+    fact_id: &'a FactId,
+    ledger_sequence: u64,
+    require_user_command: bool,
+}
+
+fn validate_cancellation_requested_fact(
+    fact_reader: &CanonicalFactReader,
+    expected: ExpectedCancellationRequestedFactV2<'_>,
+) -> Result<(), HostV2StorageError> {
+    let fact = required_cancel_fact(fact_reader, expected.fact_id)?;
+    let KernelFactPayloadV2::Control(ControlFactV2::CancellationRequested {
+        identity,
+        source,
+        reason_code,
+        ..
+    }) = &fact.payload
+    else {
+        return Err(HostV2StorageError::conflict(
+            "host_kernel_cancel_fact_identity_conflict",
+            "Kernel cancellation reply does not reference a canonical CancellationRequested fact",
+        ));
+    };
+    if &fact.fact_id != expected.fact_id
+        || fact.ledger_sequence != expected.ledger_sequence
+        || identity.run_id.as_str() != expected.run_id
+        || expected
+            .required_control_epoch
+            .is_some_and(|control_epoch| identity.control_epoch.get() != control_epoch)
+        || identity.invocation_id.as_str() != expected.invocation_id
+        || identity.cancel_request_id.as_str() != expected.cancel_request_id
+        || (expected.require_user_command
+            && (*source != CancellationSourceV2::ExplicitCommand
+                || *reason_code != CancellationReasonCodeV2::UserRequested))
+    {
+        return Err(HostV2StorageError::conflict(
+            "host_kernel_cancel_fact_identity_conflict",
+            "Kernel cancellation reply changed its canonical Run, invocation, request, epoch, sequence, or source",
+        ));
+    }
+    Ok(())
+}
+
+fn required_cancel_fact(
+    fact_reader: &CanonicalFactReader,
+    fact_id: &FactId,
+) -> Result<KernelFactEnvelopeV2, HostV2StorageError> {
+    fact_reader
+        .get_by_fact_id(fact_id.as_str())
+        .map_err(|_| {
+            HostV2StorageError::io(
+                "host_kernel_cancel_fact_lookup_unavailable",
+                "Canonical Kernel cancellation fact lookup is unavailable",
+            )
+        })?
+        .ok_or_else(|| {
+            HostV2StorageError::conflict(
+                "host_kernel_cancel_fact_missing",
+                "Kernel cancellation reply references a missing canonical fact",
+            )
+        })
+}
+
+fn terminal_invocation_phase_v2(payload: &KernelFactPayloadV2) -> Option<InvocationPhaseV2> {
+    match payload {
+        KernelFactPayloadV2::Invocation(InvocationFactV2::ToolFailedBeforeEffect { .. }) => {
+            Some(InvocationPhaseV2::FailedBeforeEffect)
+        }
+        KernelFactPayloadV2::Invocation(InvocationFactV2::ToolCancelledBeforeEffect { .. }) => {
+            Some(InvocationPhaseV2::CancelledBeforeEffect)
+        }
+        KernelFactPayloadV2::Invocation(InvocationFactV2::ToolTimedOutBeforeEffect { .. }) => {
+            Some(InvocationPhaseV2::TimedOutBeforeEffect)
+        }
+        KernelFactPayloadV2::Invocation(InvocationFactV2::ToolCompleted { .. }) => {
+            Some(InvocationPhaseV2::Completed)
+        }
+        KernelFactPayloadV2::Invocation(InvocationFactV2::ToolFailedAfterObservedEffect {
+            ..
+        }) => Some(InvocationPhaseV2::FailedAfterObservedEffect),
+        KernelFactPayloadV2::Invocation(InvocationFactV2::ToolIndeterminate { .. }) => {
+            Some(InvocationPhaseV2::Indeterminate)
+        }
+        _ => None,
+    }
+}
+
+fn cancel_u64_field(
+    value: &serde_json::Map<String, Value>,
+    field: &'static str,
+) -> Result<u64, HostV2StorageError> {
+    value.get(field).and_then(Value::as_u64).ok_or_else(|| {
+        HostV2StorageError::invalid(
+            "host_kernel_cancel_facts_invalid",
+            format!("Session cancel facts has no valid {field}"),
+        )
+    })
 }
 
 fn resolve_stored_success_response(

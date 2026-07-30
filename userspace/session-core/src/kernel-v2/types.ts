@@ -3,6 +3,7 @@ import type {
   LlmChatMessage,
   CapabilityScopePreviewRecordV2,
   DeadlineRequestV2,
+  InvocationCancelReplyV2,
   KernelFactProjectionV2,
   RawToolArgumentsV2,
   ScopeManifestV2,
@@ -327,7 +328,37 @@ export interface SessionProviderTurnRecordV2 {
   contextAssembly: SessionProviderContextReceiptV2;
   startedAt: string;
   status: 'active' | 'cancelled' | 'completed' | 'stale' | 'failed';
-  cancellationReason?: 'userInput' | 'superseded' | 'shutdown';
+  cancellationReason?:
+    | 'userInput'
+    | 'runCancelled'
+    | 'superseded'
+    | 'shutdown';
+}
+
+export interface SessionRunCancellationV2 {
+  callerRequestId: string;
+  callerRequestDigest: string;
+  cancelOperationId: string;
+  requestedAt: string;
+  status:
+    | 'requested'
+    | 'kernelSettled'
+    | 'factsReconciled'
+    | 'projected';
+  invocationCancelRequestId?: string;
+  cancellation?: InvocationCancelReplyV2;
+  facts?: {
+    afterLedgerSequence: number;
+    snapshotHighWater: number;
+    runSequenceHighWater: number;
+    caughtUp: true;
+    pendingFactBarrierCount: 0;
+  };
+  cancelledAt?: string;
+  projection?: {
+    projectionId: string;
+    projectionDigest: string;
+  };
 }
 
 export interface SessionReviewFactRefV2 {
@@ -469,6 +500,7 @@ export interface SessionKernelProjectionEventV2 {
     | 'authorization.decided'
     | 'review.revised'
     | 'planAction.completed'
+    | 'run.cancelled'
     | 'wait.changed'
     | 'diagnostic';
   data: unknown;

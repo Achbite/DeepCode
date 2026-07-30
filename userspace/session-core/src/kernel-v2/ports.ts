@@ -16,6 +16,17 @@ export interface SessionKernelStoredOperationResultRefV2 {
   resultDigest: string;
 }
 
+export interface SessionKernelStoredOperationResultV2 {
+  resultDigest: string;
+  result: unknown;
+}
+
+export interface SessionKernelProjectionReceiptV2 {
+  projectionId: string;
+  projectionDigest: string;
+  delivered: boolean;
+}
+
 export interface SessionKernelPersistencePortV2 {
   loadCheckpoint(runId: string): Promise<SessionKernelCheckpointV2 | undefined>;
 
@@ -69,6 +80,10 @@ export interface SessionKernelPersistencePortV2 {
     result: unknown,
     recordedAt: string
   ): Promise<SessionKernelStoredOperationResultRefV2>;
+
+  loadOperationResult(
+    operationRequestId: string
+  ): Promise<SessionKernelStoredOperationResultV2 | undefined>;
 }
 
 export interface SessionKernelProviderPortV2 {
@@ -82,7 +97,9 @@ export interface SessionKernelProjectionPortV2 {
    * Implementations must deduplicate by event.projectionId. Durable Kernel
    * requests can replay after an unknown transport outcome.
    */
-  project(event: SessionKernelProjectionEventV2): Promise<void>;
+  project(
+    event: SessionKernelProjectionEventV2
+  ): Promise<SessionKernelProjectionReceiptV2>;
 
   flushPending(runId: string): Promise<void>;
 }

@@ -2,8 +2,8 @@ use crate::host_run_broker_v2::HostActiveRunBrokerV2;
 use crate::host_v2_storage::{
     append_json_line_durable, canonical_json_bytes, canonical_sha256,
     reject_transport_capabilities, sha256_path_component, validate_bounded_identity,
-    validate_safe_session_identity, value_without_field, with_storage_path_lock,
-    HostV2StorageError, HostV2StorageErrorKind,
+    validate_safe_session_identity, validate_sha256_digest, value_without_field,
+    with_storage_path_lock, HostV2StorageError, HostV2StorageErrorKind,
 };
 use crate::kernel_v2_transport::RUN_TRANSPORT_CAPABILITY_HEADER;
 use crate::prelude::*;
@@ -275,6 +275,90 @@ impl SessionKernelV2Store {
                 "session_kernel_operation_result_reference_conflict",
                 "Stored Session operation result has no durable result payload",
             )
+        })
+    }
+
+    /// Reads the deterministic Session operation-result record during
+    /// Host-owned startup reconciliation. This intentionally bypasses the
+    /// process-private Run transport capability because a restarted Host has
+    /// not rebound or resumed the Session bridge yet. The full persistence
+    /// stream, record digest, deterministic record identity, result digest,
+    /// and Session/Run identities are still verified before any value is
+    /// returned.
+    pub(crate) fn recover_operation_result_for_host(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        operation_request_id: &str,
+    ) -> Result<Option<Value>, HostV2StorageError> {
+        validate_safe_session_identity(session_id)?;
+        validate_bounded_identity(run_id, "runId", 512)?;
+        validate_bounded_identity(operation_request_id, "operationRequestId", 512)?;
+        let record_id =
+            format!("session-kernel-v2:{run_id}:operation-result:{operation_request_id}");
+        let path = self.run_store_path(session_id, run_id)?;
+        with_storage_path_lock(&path, || {
+            let Some(record) = read_run_store(&path, session_id, run_id)?
+                .into_iter()
+                .find(|record| record.record_id == record_id)
+            else {
+                return Ok(None);
+            };
+            if record.record_kind != SessionKernelPersistenceRecordKindV2::OperationResult {
+                return Err(HostV2StorageError::conflict(
+                    "session_kernel_operation_result_identity_conflict",
+                    "Deterministic operation-result identity is bound to another record kind",
+                ));
+            }
+            let data = record.data.as_object().ok_or_else(|| {
+                HostV2StorageError::conflict(
+                    "session_kernel_operation_result_invalid",
+                    "Recovered Session operation result has an invalid durable envelope",
+                )
+            })?;
+            let expected_fields = [
+                "schemaVersion",
+                "operationRequestId",
+                "resultDigest",
+                "result",
+            ];
+            if data.len() != expected_fields.len()
+                || expected_fields
+                    .iter()
+                    .any(|field| !data.contains_key(*field))
+                || data.get("schemaVersion").and_then(Value::as_str)
+                    != Some(SESSION_KERNEL_OPERATION_RESULT_V2_SCHEMA)
+                || data.get("operationRequestId").and_then(Value::as_str)
+                    != Some(operation_request_id)
+            {
+                return Err(HostV2StorageError::conflict(
+                    "session_kernel_operation_result_identity_conflict",
+                    "Recovered Session operation result changed its exact durable envelope",
+                ));
+            }
+            let result_digest = data
+                .get("resultDigest")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    HostV2StorageError::conflict(
+                        "session_kernel_operation_result_invalid",
+                        "Recovered Session operation result has no result digest",
+                    )
+                })?;
+            validate_sha256_digest(result_digest, "resultDigest")?;
+            let result = data.get("result").ok_or_else(|| {
+                HostV2StorageError::conflict(
+                    "session_kernel_operation_result_invalid",
+                    "Recovered Session operation result has no durable result payload",
+                )
+            })?;
+            if canonical_sha256(result)? != result_digest {
+                return Err(HostV2StorageError::conflict(
+                    "session_kernel_operation_result_digest_mismatch",
+                    "Recovered Session operation result failed its inner result digest",
+                ));
+            }
+            Ok(Some(result.clone()))
         })
     }
 
@@ -745,6 +829,131 @@ impl SessionKernelProjectionSinkV2 {
             projection_digest: request.projection_digest,
             replayed,
         })
+    }
+
+    pub(crate) fn require_durable_run_cancelled_projection(
+        &self,
+        session_id: &str,
+        host_run_id: &str,
+        run_id: &str,
+        projection_id: &str,
+        projection_digest: &str,
+        expected_data: &Value,
+    ) -> Result<(), HostV2StorageError> {
+        validate_safe_session_identity(session_id)?;
+        for (field, value) in [
+            ("hostRunId", host_run_id),
+            ("runId", run_id),
+            ("projectionId", projection_id),
+        ] {
+            validate_bounded_identity(value, field, 512)?;
+        }
+        validate_sha256_digest(projection_digest, "projectionDigest")?;
+        reject_transport_capabilities(expected_data)?;
+        let projection_path = self.projection_path(session_id, host_run_id)?;
+        let mut durable_projection = None;
+        for value in read_bounded_json_lines(&projection_path)? {
+            let request: SessionKernelHostProjectionRequestV2 = serde_json::from_value(value)
+                .map_err(|_| {
+                    HostV2StorageError::conflict(
+                        "session_kernel_projection_record_invalid",
+                        "Host projection store contains an invalid strict v2 record",
+                    )
+                })?;
+            validate_projection_request(&request, session_id, host_run_id)?;
+            if request.projection_id == projection_id {
+                durable_projection = Some(request);
+                break;
+            }
+        }
+        let request = durable_projection.ok_or_else(|| {
+            HostV2StorageError::not_found(
+                "session_kernel_cancel_projection_missing",
+                "Canonical Session cancellation projection is not durable in the Host",
+            )
+        })?;
+        if request.projection_digest != projection_digest
+            || request.event.projection_id != projection_id
+            || request.event.run_id != run_id
+            || request.event.kind != "run.cancelled"
+            || &request.event.data != expected_data
+        {
+            return Err(HostV2StorageError::conflict(
+                "session_kernel_cancel_projection_conflict",
+                "Canonical Session cancellation projection changed exact identity or content",
+            ));
+        }
+        let agent_path = public_agent_event_path(self.sessions_dir.as_ref(), session_id)?;
+        let mut public_agent_event = None;
+        for value in read_bounded_json_lines(&agent_path)? {
+            let record = decode_public_agent_event_record(value, session_id)?;
+            if record.projection_id == projection_id {
+                public_agent_event = Some(record);
+                break;
+            }
+        }
+        let public_agent_event = public_agent_event.ok_or_else(|| {
+            HostV2StorageError::not_found(
+                "session_kernel_cancel_public_event_missing",
+                "Canonical Session cancellation AgentEvent is not durable",
+            )
+        })?;
+        if public_agent_event.projection_digest != projection_digest
+            || public_agent_event.agent_event != request.agent_event
+            || public_agent_event
+                .agent_event
+                .get("kind")
+                .and_then(Value::as_str)
+                != Some("session_run_state")
+            || public_agent_event
+                .agent_event
+                .pointer("/payload/projectionKind")
+                .and_then(Value::as_str)
+                != Some("run.cancelled")
+            || public_agent_event
+                .agent_event
+                .pointer("/payload/status")
+                .and_then(Value::as_str)
+                != Some("cancelled")
+        {
+            return Err(HostV2StorageError::conflict(
+                "session_kernel_cancel_public_event_conflict",
+                "Canonical Session cancellation AgentEvent does not match its Host projection",
+            ));
+        }
+        let timeline_path = public_timeline_path(self.sessions_dir.as_ref(), session_id)?;
+        let timeline = read_public_timeline_records(&timeline_path, session_id)?
+            .into_iter()
+            .find(|record| record.projection_id == projection_id)
+            .ok_or_else(|| {
+                HostV2StorageError::not_found(
+                    "session_kernel_cancel_public_timeline_missing",
+                    "Canonical Session cancellation timeline is not durable",
+                )
+            })?;
+        if timeline.projection_digest != projection_digest
+            || timeline
+                .timeline
+                .pointer("/runProjection/runId")
+                .and_then(Value::as_str)
+                != Some(run_id)
+            || timeline
+                .timeline
+                .pointer("/runProjection/status")
+                .and_then(Value::as_str)
+                != Some("cancelled")
+            || timeline
+                .timeline
+                .pointer("/runProjection/phase")
+                .and_then(Value::as_str)
+                != Some("settled")
+        {
+            return Err(HostV2StorageError::conflict(
+                "session_kernel_cancel_public_timeline_conflict",
+                "Canonical Session cancellation timeline has conflicting identity or terminal state",
+            ));
+        }
+        Ok(())
     }
 
     fn prior_events_page(
@@ -1361,6 +1570,7 @@ fn validate_projection_request(
             | "review.revised"
             | "planAction.skipped"
             | "planAction.completed"
+            | "run.cancelled"
             | "wait.changed"
             | "diagnostic"
     ) {

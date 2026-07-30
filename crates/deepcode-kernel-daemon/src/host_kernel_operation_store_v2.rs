@@ -14,6 +14,7 @@ use rusqlite::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -32,6 +33,7 @@ const PRODUCTION_REQUEST_SCHEMA_V2: &str = "deepcode.session.kernel-production-r
 const PREFETCHED_RUN_SCHEMA_V2: &str = "deepcode.session.prefetched-kernel-run.v2";
 const SESSION_BOOTSTRAP_MATERIAL_SCHEMA_V2: &str =
     "deepcode.host.kernel-session-bootstrap-material.v2";
+const HOST_CANCEL_REQUEST_KIND_V2: &str = "agent.run.cancel.v2";
 const SQLITE_USER_VERSION_V2: i64 = 5;
 
 const MAX_BOOTSTRAP_BYTES: usize = 8 * 1024 * 1024;
@@ -213,10 +215,18 @@ pub(crate) struct HostKernelOperationPreparedV2 {
     pub(crate) bootstrap_digest: String,
     pub(crate) provider_profile_revision_digest: Option<String>,
     pub(crate) operation_request_id: String,
+    pub(crate) caller_correlation: Option<HostKernelOperationCallerCorrelationV2>,
     /// The complete production frame is a strict safe DTO. Host transport and
     /// process launch details are rejected before it becomes durable.
     pub(crate) production_frame: Value,
     pub(crate) recorded_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct HostKernelOperationCallerCorrelationV2 {
+    pub(crate) caller_request_id: String,
+    pub(crate) request_kind: String,
+    pub(crate) request_digest: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -307,10 +317,20 @@ pub(crate) struct HostKernelOperationSettlementReceiptV2 {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) struct HostKernelStartupCancelRecoveryV2 {
+    pub(crate) bootstrap: HostKernelBootstrapRecordV2,
+    pub(crate) binding: HostCallerRequestBindingReceiptV2,
+    pub(crate) cancel_operation_id: String,
+    pub(crate) pending_operation: Option<HostKernelPendingOperationV2>,
+    pub(crate) settlement: Option<HostKernelOperationSettlementReceiptV2>,
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct HostKernelStartupReconciliationV2 {
     pub(crate) opening_runs: Vec<HostKernelRunOpeningRecordV2>,
     pub(crate) active_runs: Vec<HostKernelBootstrapRecordV2>,
     pub(crate) pending_operations: Vec<HostKernelPendingOperationV2>,
+    pub(crate) cancel_recoveries: Vec<HostKernelStartupCancelRecoveryV2>,
     pub(crate) unsupported_history_runs: Vec<(String, String)>,
     pub(crate) attempts_marked_indeterminate: usize,
 }
@@ -541,6 +561,116 @@ impl HostKernelOperationStoreV2 {
         })
     }
 
+    /// Claims a high-priority control request without replacing the ordinary
+    /// semantic caller that may still be driving the Run. The exact control
+    /// operation is correlated separately when it is prepared.
+    pub(crate) fn claim_caller_request_control_drive(
+        &self,
+        session_id: &str,
+        caller_request_id: &str,
+        request_kind: &str,
+        request_digest: &str,
+        owner_instance_id: &str,
+        started_at: &str,
+    ) -> Result<HostCallerRequestDriveClaimReceiptV2, HostV2StorageError> {
+        validate_caller_request_identity(
+            session_id,
+            caller_request_id,
+            request_kind,
+            request_digest,
+        )?;
+        validate_bounded_identity(owner_instance_id, "driveOwnerInstanceId", 256)?;
+        validate_bounded_identity(started_at, "driveStartedAt", 1024)?;
+        self.with_write_transaction(|transaction| {
+            let stored = stored_caller_request(transaction, session_id, caller_request_id)?
+                .ok_or_else(|| {
+                    HostV2StorageError::not_found(
+                        "host_caller_request_not_found",
+                        "Host caller request must be bound before control admission",
+                    )
+                })?;
+            let existing =
+                decode_caller_request_binding(stored, request_kind, request_digest, true)?;
+            if existing.outcome.is_some()
+                || existing.drive_state == HostCallerRequestDriveStateV2::Driving
+            {
+                return Ok(HostCallerRequestDriveClaimReceiptV2 {
+                    binding: existing,
+                    acquired: false,
+                });
+            }
+            let host_run_id = existing
+                .response_identity
+                .get("hostRunId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    HostV2StorageError::conflict(
+                        "host_caller_request_identity_invalid",
+                        "Host control request has no exact Host Run identity",
+                    )
+                })?;
+            let run_id = existing
+                .response_identity
+                .get("runId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    HostV2StorageError::conflict(
+                        "host_caller_request_identity_invalid",
+                        "Host control request has no exact Kernel Run identity",
+                    )
+                })?;
+            let run = stored_run_by_session_host(transaction, session_id, host_run_id)?
+                .ok_or_else(|| {
+                    HostV2StorageError::not_found(
+                        "host_caller_request_run_not_found",
+                        "Host control request is bound to a missing Run",
+                    )
+                })?;
+            if parse_run_lifecycle(&run.lifecycle)? != HostKernelStoredRunLifecycleV2::Active
+                || run.run_id.as_deref() != Some(run_id)
+            {
+                return Err(HostV2StorageError::conflict(
+                    "host_caller_request_run_not_active",
+                    "Host control request cannot acquire a non-active Run",
+                ));
+            }
+            let changed = transaction
+                .execute(
+                    "UPDATE host_caller_requests
+                     SET drive_state = 'Driving', drive_owner_instance_id = ?1,
+                         drive_started_at = ?2
+                     WHERE session_id = ?3 AND caller_request_id = ?4
+                       AND drive_state = 'Bound' AND outcome_json IS NULL",
+                    params![owner_instance_id, started_at, session_id, caller_request_id],
+                )
+                .map_err(|error| {
+                    database_error("host_caller_control_request_drive_claim_failed", error)
+                })?;
+            if changed != 1 {
+                return Err(HostV2StorageError::conflict(
+                    "host_caller_request_drive_claim_conflict",
+                    "Host control request drive ownership changed before durable admission",
+                ));
+            }
+            let stored = stored_caller_request(transaction, session_id, caller_request_id)?
+                .ok_or_else(|| {
+                    HostV2StorageError::io(
+                        "host_caller_request_drive_claim_lost",
+                        "Drive-owned Host control request disappeared before commit",
+                    )
+                })?;
+            Ok(HostCallerRequestDriveClaimReceiptV2 {
+                binding: decode_caller_request_binding(
+                    stored,
+                    request_kind,
+                    request_digest,
+                    false,
+                )?,
+                acquired: true,
+            })
+        })
+    }
+
     pub(crate) fn settle_caller_request(
         &self,
         session_id: &str,
@@ -649,6 +779,39 @@ impl HostKernelOperationStoreV2 {
         request_kind: &str,
         request_digest: &str,
     ) -> Result<HostCallerRequestRecoveryEvidenceV2, HostV2StorageError> {
+        self.caller_request_recovery_evidence_inner(
+            session_id,
+            caller_request_id,
+            request_kind,
+            request_digest,
+            true,
+        )
+    }
+
+    pub(crate) fn caller_control_request_recovery_evidence(
+        &self,
+        session_id: &str,
+        caller_request_id: &str,
+        request_kind: &str,
+        request_digest: &str,
+    ) -> Result<HostCallerRequestRecoveryEvidenceV2, HostV2StorageError> {
+        self.caller_request_recovery_evidence_inner(
+            session_id,
+            caller_request_id,
+            request_kind,
+            request_digest,
+            false,
+        )
+    }
+
+    fn caller_request_recovery_evidence_inner(
+        &self,
+        session_id: &str,
+        caller_request_id: &str,
+        request_kind: &str,
+        request_digest: &str,
+        require_run_drive: bool,
+    ) -> Result<HostCallerRequestRecoveryEvidenceV2, HostV2StorageError> {
         validate_caller_request_identity(
             session_id,
             caller_request_id,
@@ -677,7 +840,7 @@ impl HostKernelOperationStoreV2 {
                 })?;
             validate_bounded_identity(host_run_id, "hostRunId", 512)?;
             let run = stored_run_by_session_host(connection, session_id, host_run_id)?;
-            if let Some(run) = run.as_ref() {
+            if let Some(run) = run.as_ref().filter(|_| require_run_drive) {
                 if run.drive_caller_request_id.as_deref()
                     != Some(binding.caller_request_id.as_str())
                     || run.drive_request_digest.as_deref() != Some(binding.request_digest.as_str())
@@ -727,6 +890,12 @@ impl HostKernelOperationStoreV2 {
                 .response_identity
                 .get("operationRequestId")
                 .and_then(Value::as_str);
+            if !require_run_drive && first_operation_request_id.is_none() {
+                return Err(HostV2StorageError::conflict(
+                    "host_caller_request_operation_identity_missing",
+                    "Host control request recovery requires an exact operation identity",
+                ));
+            }
             let first_operation = first_operation_request_id
                 .map(|operation_request_id| {
                     validate_operation_identity(operation_request_id)?;
@@ -1205,6 +1374,8 @@ impl HostKernelOperationStoreV2 {
                     "Operation provider revision does not match the immutable bootstrap",
                 ));
             }
+            let caller_correlation =
+                prepared_operation_caller_correlation(transaction, &run, &prepared)?;
             if let Some(existing) =
                 stored_operation_by_request(transaction, &prepared.operation_request_id)?
             {
@@ -1214,6 +1385,14 @@ impl HostKernelOperationStoreV2 {
                     && existing.bootstrap_digest == prepared.bootstrap_digest
                     && existing.provider_revision_digest
                         == prepared.provider_profile_revision_digest
+                    && existing.caller_request_id
+                        == caller_correlation
+                            .as_ref()
+                            .map(|correlation| correlation.0.clone())
+                    && existing.caller_request_digest
+                        == caller_correlation
+                            .as_ref()
+                            .map(|correlation| correlation.1.clone())
                 {
                     validate_stored_operation(&existing)?;
                     decode_stored_production_frame(&existing)?;
@@ -1257,8 +1436,12 @@ impl HostKernelOperationStoreV2 {
                         run.id,
                         next_sequence,
                         prepared.operation_request_id,
-                        run.drive_caller_request_id,
-                        run.drive_request_digest,
+                        caller_correlation
+                            .as_ref()
+                            .map(|correlation| correlation.0.as_str()),
+                        caller_correlation
+                            .as_ref()
+                            .map(|correlation| correlation.1.as_str()),
                         prepared.run_id,
                         prepared.bootstrap_digest,
                         prepared.provider_profile_revision_digest,
@@ -1294,6 +1477,8 @@ impl HostKernelOperationStoreV2 {
                     "Operation provider revision does not match the immutable bootstrap",
                 ));
             }
+            let caller_correlation =
+                prepared_operation_caller_correlation(connection, &run, &prepared)?;
             let Some(existing) =
                 stored_operation_by_request(connection, &prepared.operation_request_id)?
             else {
@@ -1304,6 +1489,14 @@ impl HostKernelOperationStoreV2 {
                 || existing.run_id != prepared.run_id
                 || existing.bootstrap_digest != prepared.bootstrap_digest
                 || existing.provider_revision_digest != prepared.provider_profile_revision_digest
+                || existing.caller_request_id
+                    != caller_correlation
+                        .as_ref()
+                        .map(|correlation| correlation.0.clone())
+                || existing.caller_request_digest
+                    != caller_correlation
+                        .as_ref()
+                        .map(|correlation| correlation.1.clone())
             {
                 return Err(HostV2StorageError::conflict(
                     "host_kernel_operation_request_conflict",
@@ -1955,12 +2148,28 @@ impl HostKernelOperationStoreV2 {
                         })?,
                 );
             }
+            let cancel_recoveries = query_startup_cancel_recoveries(transaction, &active_runs)?;
+            let cancel_run_keys = cancel_recoveries
+                .iter()
+                .map(|recovery| {
+                    (
+                        recovery.bootstrap.session_id.clone(),
+                        recovery.bootstrap.host_run_id.clone(),
+                    )
+                })
+                .collect::<HashSet<_>>();
+            active_runs.retain(|bootstrap| {
+                !cancel_run_keys
+                    .contains(&(bootstrap.session_id.clone(), bootstrap.host_run_id.clone()))
+            });
             let mut pending_operations = Vec::new();
             for stored in &stored_runs {
                 if unsupported_run_row_ids.contains(&stored.id) {
                     continue;
                 }
                 if parse_run_lifecycle(&stored.lifecycle)? == HostKernelStoredRunLifecycleV2::Active
+                    && !cancel_run_keys
+                        .contains(&(stored.session_id.clone(), stored.host_run_id.clone()))
                 {
                     pending_operations.extend(query_pending_operations_for_run(
                         transaction,
@@ -1979,6 +2188,7 @@ impl HostKernelOperationStoreV2 {
                 opening_runs,
                 active_runs,
                 pending_operations,
+                cancel_recoveries,
                 unsupported_history_runs,
                 attempts_marked_indeterminate: marked,
             })
@@ -2268,6 +2478,7 @@ struct PreparedOperationV2 {
     bootstrap_digest: String,
     provider_profile_revision_digest: Option<String>,
     operation_request_id: String,
+    caller_correlation: Option<HostKernelOperationCallerCorrelationV2>,
     production_frame: Value,
     production_frame_json: String,
     production_frame_digest: String,
@@ -2293,6 +2504,14 @@ impl PreparedOperationV2 {
         if let Some(digest) = &input.provider_profile_revision_digest {
             validate_sha256_digest(digest, "providerProfileRevisionDigest")?;
         }
+        if let Some(correlation) = &input.caller_correlation {
+            validate_caller_request_identity(
+                &input.session_id,
+                &correlation.caller_request_id,
+                &correlation.request_kind,
+                &correlation.request_digest,
+            )?;
+        }
         validate_production_frame(&input.production_frame, &input.operation_request_id)?;
         let production_frame_json = canonical_json_string(&input.production_frame)?;
         let production_frame_digest = canonical_sha256(&input.production_frame)?;
@@ -2303,12 +2522,72 @@ impl PreparedOperationV2 {
             bootstrap_digest: input.bootstrap_digest,
             provider_profile_revision_digest: input.provider_profile_revision_digest,
             operation_request_id: input.operation_request_id,
+            caller_correlation: input.caller_correlation,
             production_frame: input.production_frame,
             production_frame_json,
             production_frame_digest,
             recorded_at: input.recorded_at,
         })
     }
+}
+
+fn prepared_operation_caller_correlation(
+    connection: &Connection,
+    run: &StoredRunV2,
+    prepared: &PreparedOperationV2,
+) -> Result<Option<(String, String)>, HostV2StorageError> {
+    let Some(correlation) = &prepared.caller_correlation else {
+        return match (
+            run.drive_caller_request_id.clone(),
+            run.drive_request_digest.clone(),
+        ) {
+            (None, None) => Ok(None),
+            (Some(caller_request_id), Some(request_digest)) => {
+                Ok(Some((caller_request_id, request_digest)))
+            }
+            _ => Err(corrupt(
+                "Host Kernel Run contains a partial caller drive correlation",
+            )),
+        };
+    };
+    let stored = stored_caller_request(
+        connection,
+        &prepared.session_id,
+        &correlation.caller_request_id,
+    )?
+    .ok_or_else(|| {
+        HostV2StorageError::not_found(
+            "host_caller_request_not_found",
+            "Explicit operation caller correlation has no durable caller request",
+        )
+    })?;
+    let binding = decode_caller_request_binding(
+        stored,
+        &correlation.request_kind,
+        &correlation.request_digest,
+        true,
+    )?;
+    if binding.drive_state != HostCallerRequestDriveStateV2::Driving || binding.outcome.is_some() {
+        return Err(HostV2StorageError::conflict(
+            "host_kernel_operation_caller_not_driving",
+            "Explicit operation caller correlation is not an unsettled driving request",
+        ));
+    }
+    let identity = &binding.response_identity;
+    if identity.get("hostRunId").and_then(Value::as_str) != Some(prepared.host_run_id.as_str())
+        || identity.get("runId").and_then(Value::as_str) != Some(prepared.run_id.as_str())
+        || identity.get("operationRequestId").and_then(Value::as_str)
+            != Some(prepared.operation_request_id.as_str())
+    {
+        return Err(HostV2StorageError::conflict(
+            "host_kernel_operation_caller_identity_conflict",
+            "Explicit operation caller correlation does not match the exact Run and operation",
+        ));
+    }
+    Ok(Some((
+        correlation.caller_request_id.clone(),
+        correlation.request_digest.clone(),
+    )))
 }
 
 struct StoredCallerRequestV2 {
@@ -4314,6 +4593,236 @@ fn validate_stored_attempt(attempt: &StoredAttemptV2) -> Result<(), HostV2Storag
         }
         _ => Ok(()),
     }
+}
+
+fn query_startup_cancel_recoveries(
+    connection: &Connection,
+    active_runs: &[HostKernelBootstrapRecordV2],
+) -> Result<Vec<HostKernelStartupCancelRecoveryV2>, HostV2StorageError> {
+    let mut statement = connection
+        .prepare(&format!(
+            "SELECT {} FROM host_caller_requests
+             WHERE request_kind = ?1
+               AND drive_state = 'Driving'
+               AND outcome_json IS NULL
+             ORDER BY id",
+            CALLER_REQUEST_COLUMNS
+        ))
+        .map_err(|error| database_error("host_kernel_cancel_startup_query_failed", error))?;
+    let rows = statement
+        .query_map(
+            params![HOST_CANCEL_REQUEST_KIND_V2],
+            StoredCallerRequestV2::from_row,
+        )
+        .map_err(|error| database_error("host_kernel_cancel_startup_query_failed", error))?;
+    let mut recoveries = Vec::new();
+    let mut claimed_runs = HashSet::new();
+    for row in rows {
+        let stored =
+            row.map_err(|error| database_error("host_kernel_cancel_startup_query_failed", error))?;
+        let request_digest = stored.request_digest.clone();
+        let binding = decode_caller_request_binding(
+            stored,
+            HOST_CANCEL_REQUEST_KIND_V2,
+            &request_digest,
+            true,
+        )?;
+        if binding.drive_state != HostCallerRequestDriveStateV2::Driving
+            || binding.outcome.is_some()
+        {
+            return Err(corrupt(
+                "Startup cancellation query returned a non-driving or settled caller request",
+            ));
+        }
+        let identity = exact_object_fields(
+            &binding.response_identity,
+            &[
+                "hostRunId",
+                "runId",
+                "operationRequestId",
+                "cancelOperationId",
+            ],
+            &[
+                "hostRunId",
+                "runId",
+                "operationRequestId",
+                "cancelOperationId",
+            ],
+            "Host cancellation response identity",
+        )?;
+        let host_run_id = startup_cancel_identity(identity, "hostRunId")?.to_string();
+        let run_id = startup_cancel_identity(identity, "runId")?.to_string();
+        let operation_request_id =
+            startup_cancel_identity(identity, "operationRequestId")?.to_string();
+        let cancel_operation_id =
+            startup_cancel_identity(identity, "cancelOperationId")?.to_string();
+        if operation_request_id != cancel_operation_id {
+            return Err(HostV2StorageError::conflict(
+                "host_kernel_cancel_operation_identity_conflict",
+                "Durable cancellation operation identities do not match",
+            ));
+        }
+        let Some(bootstrap) = active_runs.iter().find(|bootstrap| {
+            bootstrap.session_id == binding.session_id && bootstrap.host_run_id == host_run_id
+        }) else {
+            // Retired and unsupported-history Runs are already excluded from
+            // ordinary startup recovery. Their exact caller outcome remains
+            // available to the Agent recovery path.
+            continue;
+        };
+        if bootstrap.run_id != run_id {
+            return Err(HostV2StorageError::conflict(
+                "host_kernel_cancel_run_identity_conflict",
+                "Durable cancellation caller is bound to another Kernel Run",
+            ));
+        }
+        let run_key = (binding.session_id.clone(), host_run_id.clone());
+        if !claimed_runs.insert(run_key) {
+            return Err(HostV2StorageError::conflict(
+                "host_kernel_cancel_startup_ambiguous",
+                "More than one unsettled cancellation caller is bound to the same active Run",
+            ));
+        }
+        let run = stored_run_by_session_host(connection, &binding.session_id, &host_run_id)?
+            .ok_or_else(|| {
+                HostV2StorageError::not_found(
+                    "host_kernel_cancel_run_not_found",
+                    "Startup cancellation is bound to a missing Host Run",
+                )
+            })?;
+        if parse_run_lifecycle(&run.lifecycle)? != HostKernelStoredRunLifecycleV2::Active
+            || run.run_id.as_deref() != Some(run_id.as_str())
+        {
+            return Err(HostV2StorageError::conflict(
+                "host_kernel_cancel_run_not_active",
+                "Startup cancellation is not bound to the exact active Run",
+            ));
+        }
+        let operation = stored_operation_by_request(connection, &cancel_operation_id)?;
+        let (pending_operation, settlement) = match operation {
+            Some(operation) => {
+                validate_stored_operation(&operation)?;
+                if operation.run_row_id != run.id
+                    || operation.run_id != run_id
+                    || operation.caller_request_id.as_deref()
+                        != Some(binding.caller_request_id.as_str())
+                    || operation.caller_request_digest.as_deref()
+                        != Some(binding.request_digest.as_str())
+                {
+                    return Err(HostV2StorageError::conflict(
+                        "host_kernel_cancel_operation_correlation_conflict",
+                        "Startup cancellation operation changed its exact Run or caller correlation",
+                    ));
+                }
+                let production_frame = decode_stored_production_frame(&operation)?;
+                validate_frame_against_bootstrap(&production_frame, bootstrap)?;
+                validate_startup_cancel_operation_frame(
+                    &production_frame,
+                    &binding,
+                    &cancel_operation_id,
+                )?;
+                if operation.settlement_digest.is_some() {
+                    (
+                        None,
+                        Some(verified_settlement_receipt(connection, &operation)?),
+                    )
+                } else {
+                    let latest_attempt = latest_attempt(connection, operation.id)?
+                        .map(|attempt| attempt_receipt(&operation, attempt))
+                        .transpose()?;
+                    (
+                        Some(HostKernelPendingOperationV2 {
+                            session_id: binding.session_id.clone(),
+                            host_run_id: host_run_id.clone(),
+                            run_id: run_id.clone(),
+                            bootstrap_digest: bootstrap.bootstrap_digest.clone(),
+                            operation_sequence: positive_u64(
+                                operation.operation_sequence,
+                                "operationSequence",
+                            )?,
+                            operation_request_id: cancel_operation_id.clone(),
+                            production_frame,
+                            latest_attempt,
+                        }),
+                        None,
+                    )
+                }
+            }
+            None => (None, None),
+        };
+        recoveries.push(HostKernelStartupCancelRecoveryV2 {
+            bootstrap: bootstrap.clone(),
+            binding,
+            cancel_operation_id,
+            pending_operation,
+            settlement,
+        });
+    }
+    Ok(recoveries)
+}
+
+fn startup_cancel_identity<'a>(
+    identity: &'a serde_json::Map<String, Value>,
+    field: &'static str,
+) -> Result<&'a str, HostV2StorageError> {
+    let value = identity.get(field).and_then(Value::as_str).ok_or_else(|| {
+        HostV2StorageError::conflict(
+            "host_kernel_cancel_identity_invalid",
+            format!("Durable cancellation identity has no exact {field}"),
+        )
+    })?;
+    validate_bounded_identity(value, field, 512)?;
+    Ok(value)
+}
+
+fn validate_startup_cancel_operation_frame(
+    frame: &Value,
+    binding: &HostCallerRequestBindingReceiptV2,
+    cancel_operation_id: &str,
+) -> Result<(), HostV2StorageError> {
+    let operation = frame
+        .pointer("/request/operation")
+        .ok_or_else(|| corrupt("Startup cancellation frame has no operation"))?;
+    let operation = exact_object_fields(
+        operation,
+        &["kind", "data"],
+        &["kind", "data"],
+        "Startup cancellation operation",
+    )?;
+    if operation.get("kind").and_then(Value::as_str) != Some("cancelRun") {
+        return Err(HostV2StorageError::conflict(
+            "host_kernel_cancel_operation_kind_conflict",
+            "Caller-correlated startup operation is not cancelRun",
+        ));
+    }
+    let data = exact_object_fields(
+        operation
+            .get("data")
+            .ok_or_else(|| corrupt("Startup cancellation operation has no data"))?,
+        &[
+            "callerRequestId",
+            "callerRequestDigest",
+            "cancelOperationId",
+        ],
+        &[
+            "callerRequestId",
+            "callerRequestDigest",
+            "cancelOperationId",
+        ],
+        "Startup cancellation operation data",
+    )?;
+    if data.get("callerRequestId").and_then(Value::as_str)
+        != Some(binding.caller_request_id.as_str())
+        || data.get("callerRequestDigest").and_then(Value::as_str)
+            != Some(binding.request_digest.as_str())
+        || data.get("cancelOperationId").and_then(Value::as_str) != Some(cancel_operation_id)
+    {
+        return Err(HostV2StorageError::conflict(
+            "host_kernel_cancel_operation_correlation_conflict",
+            "Startup cancellation frame changed its exact caller or operation identity",
+        ));
+    }
+    Ok(())
 }
 
 fn query_pending_operations_for_run(

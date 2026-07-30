@@ -1,16 +1,20 @@
 import type {
   CapabilityScopePreviewReplyV2,
   ControlEpochAdvancedReplyV2,
+  InvocationCancelReplyV2,
 } from '@deepcode/protocol';
 import {
   nextSessionKernelFactsQueryV2,
   sessionKernelFactsCaughtUpV2,
 } from './lineage.js';
 import {
+  registerSessionKernelFactBarrierV2,
   sessionKernelFactBarriersPendingV2,
 } from './factBarriers.js';
 import type {
   SessionKernelLoopPortsV2,
+  SessionKernelProjectionReceiptV2,
+  SessionKernelStoredOperationResultV2,
   SessionKernelStoredOperationResultRefV2,
 } from './ports.js';
 import {
@@ -45,12 +49,38 @@ import type {
   SessionKernelProjectionEventV2,
   SessionKernelPublicRequestRecordV2,
   SessionKernelReviewV2,
+  SessionRunCancellationV2,
   SessionNaturalLanguagePlanV2,
   SessionPlanActionSettlementV2,
   SessionPlanDecisionV2,
   SessionProviderTurnRequestV2,
   SessionUserInputRecordV2,
 } from './types.js';
+
+export interface SessionKernelRunCancelInputV2 {
+  callerRequestId: string;
+  callerRequestDigest: string;
+  cancelOperationId: string;
+}
+
+export interface SessionKernelRunCancelResultV2 {
+  callerRequestId: string;
+  callerRequestDigest: string;
+  cancelOperationId: string;
+  controlEpoch: number;
+  cancellation: InvocationCancelReplyV2;
+  facts: {
+    afterLedgerSequence: number;
+    snapshotHighWater: number;
+    runSequenceHighWater: number;
+    caughtUp: true;
+    pendingFactBarrierCount: 0;
+  };
+  projection: {
+    projectionId: string;
+    projectionDigest: string;
+  };
+}
 
 export interface SessionKernelLoopV2Options {
   factsPageLimit?: number;
@@ -76,6 +106,10 @@ export class SessionKernelLoopV2 {
   private maintenanceQuiescence: Promise<void> = Promise.resolve();
   private resolveMaintenanceQuiescence?: () => void;
   private readonly pendingUserInputFences = new Set<number>();
+  private runCancellationFence?: {
+    generation: number;
+    quiescence: Promise<void>;
+  };
   private checkpointWrites: Promise<void> = Promise.resolve();
   private pendingPlanDecision?: SessionPlanDecisionV2;
   private readonly userInputQuiescence = new Map<
@@ -111,8 +145,9 @@ export class SessionKernelLoopV2 {
       {
         readState: () => this.state,
         saveCheckpoint: () => this.saveCheckpoint(),
-        project: (projectionId, kind, data, recordedAt) =>
-          this.project(projectionId, kind, data, recordedAt),
+        project: async (projectionId, kind, data, recordedAt) => {
+          await this.project(projectionId, kind, data, recordedAt);
+        },
         reconcileFacts: () => this.reconcileFactsInternal(),
         recordProviderPlan: (plan) =>
           this.persistPlan(plan),
@@ -128,7 +163,8 @@ export class SessionKernelLoopV2 {
         transitionBlocked: () =>
           this.authorityTransitionActive
           || this.maintenanceActive
-          || this.pendingUserInputFences.size > 0,
+          || this.pendingUserInputFences.size > 0
+          || Boolean(this.runCancellationFence),
         requireNoPendingRequests: () => this.requireNoPendingRequests(),
         requirePlanProjected: () => this.requirePlanProjected(),
         requirePlanAccepted: () => this.requireAcceptedPlan(),
@@ -261,6 +297,14 @@ export class SessionKernelLoopV2 {
       operationRequestId,
       result,
       this.ports.clock.now()
+    );
+  }
+
+  loadOperationResult(
+    operationRequestId: string
+  ): Promise<SessionKernelStoredOperationResultV2 | undefined> {
+    return this.ports.persistence.loadOperationResult(
+      operationRequestId
     );
   }
 
@@ -458,6 +502,12 @@ export class SessionKernelLoopV2 {
   async runProviderTurn(
     request: SessionProviderTurnRequestV2
   ): Promise<SessionKernelLoopResultV2> {
+    if (this.state.runCancellation) {
+      throw new SessionKernelLoopError(
+        'session_kernel_run_cancelled',
+        'A cancelled Session Run cannot start another Provider turn.'
+      );
+    }
     if (request.target.kind === 'planAction') {
       this.requireAcceptedPlan();
     }
@@ -468,10 +518,243 @@ export class SessionKernelLoopV2 {
     input: SessionUserInputRecordV2,
     nextTurn: SessionProviderTurnRequestV2
   ): Promise<SessionKernelLoopResultV2> {
+    this.requireRunAcceptsUserInput();
     const generation =
       await this.persistUserInputBeforeFence(input);
     await this.applyFencedUserInput(input, generation);
     return this.runProviderTurn(nextTurn);
+  }
+
+  async cancelRun(
+    input: SessionKernelRunCancelInputV2
+  ): Promise<SessionKernelRunCancelResultV2> {
+    validateRunCancelInput(input);
+    const prior = this.state.runCancellation;
+    if (prior) {
+      requireExactRunCancellation(prior, input);
+      if (prior.status === 'projected') {
+        await this.ports.projection.flushPending(this.state.runId);
+        return completedRunCancellation(prior, this.state.controlEpoch);
+      }
+    }
+    const fence = this.fenceForRunCancellation();
+    let transitionStarted = false;
+    try {
+      await fence.quiescence;
+      this.beginAuthorityTransition();
+      transitionStarted = true;
+      if (!this.state.runCancellation) {
+        this.state.runCancellation = {
+          ...cloneJson(input),
+          requestedAt: this.ports.clock.now(),
+          status: 'requested',
+        };
+        await this.saveCheckpoint();
+      }
+      let cancellation = currentRunCancellation(this.state, input);
+
+      await this.requests.replay('control');
+      cancellation = currentRunCancellation(this.state, input);
+
+      if (!cancellation.cancellation) {
+        let request: SessionKernelPublicRequestRecordV2;
+        if (cancellation.invocationCancelRequestId) {
+          request = {
+            requestId: cancellation.invocationCancelRequestId,
+            lane: 'control',
+            intent: {
+              kind: 'invocationCancel',
+              payload: {
+                expectedControlEpoch: this.state.controlEpoch,
+                target: { kind: 'currentForRun', data: {} },
+                reasonCode: 'userRequested',
+                reason: 'The trusted user requested this Session Run to stop.',
+              },
+            },
+            startedAt: cancellation.requestedAt,
+            attemptCount: 1,
+          };
+        } else {
+          request = this.requests.newRecord({
+            kind: 'invocationCancel',
+            payload: {
+              expectedControlEpoch: this.state.controlEpoch,
+              target: { kind: 'currentForRun', data: {} },
+              reasonCode: 'userRequested',
+              reason: 'The trusted user requested this Session Run to stop.',
+            },
+          });
+          cancellation.invocationCancelRequestId = request.requestId;
+          await this.saveCheckpoint();
+        }
+        expectSessionKernelPublicRequestOutcomeV2(
+          await this.requests.execute(request),
+          'invocationCancel'
+        );
+      }
+      cancellation = currentRunCancellation(this.state, input);
+      if (!cancellation.cancellation) {
+        throw new SessionKernelLoopError(
+          'session_kernel_run_cancellation_reply_missing',
+          'Kernel cancellation settled without a durable correlated reply.'
+        );
+      }
+      await this.requests.replay('query');
+      cancellation = currentRunCancellation(this.state, input);
+      if (!cancellation.cancellation) {
+        throw new SessionKernelLoopError(
+          'session_kernel_run_cancellation_reply_missing',
+          'Kernel cancellation reply disappeared during query reconciliation.'
+        );
+      }
+      if (this.requests.pending('effect')) {
+        throw new SessionKernelLoopError(
+          'session_kernel_run_cancellation_effect_indeterminate',
+          'A pending mutation has no safe no-effect proof; Run cancellation remains indeterminate and must not replay that mutation.'
+        );
+      }
+
+      await this.proveRunCancellationFacts(cancellation.cancellation);
+      cancellation = currentRunCancellation(this.state, input);
+      if (cancellation.status !== 'factsReconciled') {
+        cancellation.facts = cancellationFacts(this.state);
+        cancellation.cancelledAt = this.ports.clock.now();
+        cancellation.status = 'factsReconciled';
+        await this.saveCheckpoint();
+      }
+      const event = this.event(
+        `cancel:${cancellation.cancelOperationId}:settled`,
+        'run.cancelled',
+        {
+          callerRequestId: cancellation.callerRequestId,
+          callerRequestDigest: cancellation.callerRequestDigest,
+          cancelOperationId: cancellation.cancelOperationId,
+          controlEpoch: this.state.controlEpoch,
+          cancellation: cancellation.cancellation,
+          facts: cancellation.facts,
+        },
+        cancellation.cancelledAt
+      );
+      const projection = await this.ports.projection.project(event);
+      if (
+        !projection.delivered
+        || projection.projectionId !== event.projectionId
+      ) {
+        throw new SessionKernelLoopError(
+          'session_kernel_run_cancellation_projection_unconfirmed',
+          'Session Run cancellation projection was not durably acknowledged by Host.'
+        );
+      }
+      cancellation = currentRunCancellation(this.state, input);
+      cancellation.projection = {
+        projectionId: projection.projectionId,
+        projectionDigest: projection.projectionDigest,
+      };
+      cancellation.status = 'projected';
+      await this.saveCheckpoint();
+      return completedRunCancellation(
+        cancellation,
+        this.state.controlEpoch
+      );
+    } finally {
+      this.providers.releaseUserInputFence(fence.generation);
+      if (this.runCancellationFence === fence) {
+        this.runCancellationFence = undefined;
+      }
+      if (transitionStarted) {
+        this.authorityTransitionActive = false;
+      }
+    }
+  }
+
+  private fenceForRunCancellation(): {
+    generation: number;
+    quiescence: Promise<void>;
+  } {
+    if (this.runCancellationFence) {
+      return this.runCancellationFence;
+    }
+    if (this.pendingUserInputFences.size > 0) {
+      throw new SessionKernelLoopError(
+        'session_kernel_run_cancellation_transition_busy',
+        'Session Run cancellation must serialize after the current user-input transition.'
+      );
+    }
+    const providerFence =
+      this.providers.supersedeForRunCancellation();
+    this.runCancellationFence = {
+      generation: providerFence.generation,
+      quiescence: Promise.all([
+        providerFence.quiescence,
+        this.requests.supersedeForRunCancellation(),
+        this.maintenanceQuiescence,
+      ]).then(() => undefined),
+    };
+    return this.runCancellationFence;
+  }
+
+  private async proveRunCancellationFacts(
+    reply: InvocationCancelReplyV2
+  ): Promise<void> {
+    await this.drainCancellationFacts();
+    const requiredFactId = reply.kind === 'alreadyTerminal'
+      ? reply.data.terminalFactId
+      : reply.kind === 'requested'
+        || reply.kind === 'alreadyRequested'
+        ? reply.data.factId
+        : undefined;
+    if (requiredFactId) {
+      const requestId = this.state.runCancellation
+        ?.invocationCancelRequestId;
+      if (!requestId) {
+        throw new SessionKernelLoopError(
+          'session_kernel_run_cancellation_request_missing',
+          'Session Run cancellation fact proof has no request identity.'
+        );
+      }
+      registerSessionKernelFactBarrierV2(this.state, {
+        requestId,
+        source: 'invocationCancel',
+        minimumHighWater: Math.max(
+          1,
+          this.state.runCancellation?.facts?.snapshotHighWater
+            ?? this.state.lineage.cursor.snapshotHighWater
+        ),
+        requiredFactIds: [requiredFactId],
+      });
+      await this.saveCheckpoint();
+      await this.drainCancellationFacts();
+    }
+    if (
+      !sessionKernelFactsCaughtUpV2(this.state.lineage)
+      || sessionKernelFactBarriersPendingV2(this.state)
+    ) {
+      throw new SessionKernelLoopError(
+        'session_kernel_run_cancellation_facts_unsettled',
+        'Session Run cancellation cannot settle before canonical Kernel facts and exact barriers converge.'
+      );
+    }
+  }
+
+  private async drainCancellationFacts(): Promise<void> {
+    let previousAfter = -1;
+    for (;;) {
+      await this.reconcileFactsInternal();
+      if (
+        sessionKernelFactsCaughtUpV2(this.state.lineage)
+        && !sessionKernelFactBarriersPendingV2(this.state)
+      ) {
+        return;
+      }
+      const after = this.state.lineage.cursor.afterLedgerSequence;
+      if (after <= previousAfter) {
+        throw new SessionKernelLoopError(
+          'session_kernel_run_cancellation_facts_stalled',
+          'Canonical Kernel facts made no progress while settling Session Run cancellation.'
+        );
+      }
+      previousAfter = after;
+    }
   }
 
   /**
@@ -483,6 +766,7 @@ export class SessionKernelLoopV2 {
   async persistUserInputBeforeFence(
     input: SessionUserInputRecordV2
   ): Promise<number> {
+    this.requireRunAcceptsUserInput();
     this.requireNoPendingUserInputTransition();
     const durableInput =
       await this.ports.persistence.loadInput(
@@ -518,6 +802,7 @@ export class SessionKernelLoopV2 {
    * recovered with its exact persisted identity after the epoch advances.
    */
   fenceProviderForUserInput(): number {
+    this.requireRunAcceptsUserInput();
     this.requireNoPendingUserInputTransition();
     const providerFence = this.providers.supersedeForUserInput();
     const requestQuiescence = this.requests.supersedeForUserInput();
@@ -560,6 +845,7 @@ export class SessionKernelLoopV2 {
       }
       liveFence = true;
       await quiescence;
+      this.requireRunAcceptsUserInput();
       this.beginAuthorityTransition();
       transitionStarted = true;
       const oldInvocationId = activeInvocationId(this.state);
@@ -568,7 +854,9 @@ export class SessionKernelLoopV2 {
 
       await this.advancePendingInput(oldInvocationId);
       await this.ensureInputProjected(input);
-      await this.requests.replay('effect');
+      if (!this.state.runCancellation) {
+        await this.requests.replay('effect');
+      }
       await this.reconcileFactsInternal();
       transitionCompleted = true;
     } finally {
@@ -660,6 +948,7 @@ export class SessionKernelLoopV2 {
       this.authorityTransitionActive
       || this.maintenanceActive
       || this.providers.isReserved()
+      || Boolean(this.state.runCancellation)
       || this.pendingUserInputFences.size > 0
     ) {
       return;
@@ -783,6 +1072,12 @@ export class SessionKernelLoopV2 {
     let recovered = false;
     this.beginMaintenance('recover', true);
     try {
+      if (this.state.runCancellation?.status === 'projected') {
+        this.requireNoPendingRequests();
+        await this.ports.projection.flushPending(this.state.runId);
+        recovered = true;
+        return;
+      }
       const oldInvocationId = activeInvocationId(this.state);
       if (this.state.pendingEpochInput) {
         await this.advancePendingInput(oldInvocationId);
@@ -792,7 +1087,9 @@ export class SessionKernelLoopV2 {
       for (const input of this.state.inputs) {
         await this.ensureInputProjected(input);
       }
-      await this.requests.replay('effect');
+      if (!this.state.runCancellation) {
+        await this.requests.replay('effect');
+      }
       await this.reconcileFactsInternal();
       await this.ensurePlanProjected();
       await this.ensurePlanDecisionProjected();
@@ -1117,6 +1414,15 @@ export class SessionKernelLoopV2 {
     this.authorityTransitionActive = true;
   }
 
+  private requireRunAcceptsUserInput(): void {
+    if (this.state.runCancellation) {
+      throw new SessionKernelLoopError(
+        'session_kernel_run_cancelled',
+        'A cancelled Session Run cannot accept another user input.'
+      );
+    }
+  }
+
   private beginMaintenance(
     operation: string,
     allowPendingUserInputRecovery = false
@@ -1125,6 +1431,11 @@ export class SessionKernelLoopV2 {
       this.authorityTransitionActive
       || this.maintenanceActive
       || this.providers.isReserved()
+      || Boolean(this.runCancellationFence)
+      || (
+        Boolean(this.state.runCancellation)
+        && operation !== 'recover'
+      )
       || (
         this.pendingUserInputFences.size > 0
         && !allowPendingUserInputRecovery
@@ -1187,8 +1498,8 @@ export class SessionKernelLoopV2 {
     kind: SessionKernelProjectionEventV2['kind'],
     data: unknown,
     recordedAt?: string
-  ): Promise<void> {
-    await this.ports.projection.project(
+  ): Promise<SessionKernelProjectionReceiptV2> {
+    return this.ports.projection.project(
       this.event(projectionId, kind, data, recordedAt)
     );
   }
@@ -1211,6 +1522,111 @@ export class SessionKernelLoopV2 {
       data: data === undefined ? null : data,
     };
   }
+}
+
+function validateRunCancelInput(
+  input: SessionKernelRunCancelInputV2
+): void {
+  for (const [field, value] of [
+    ['callerRequestId', input.callerRequestId],
+    ['cancelOperationId', input.cancelOperationId],
+  ] as const) {
+    if (
+      !value
+      || value.trim() !== value
+      || new TextEncoder().encode(value).byteLength > 512
+      || /[\u0000-\u001f\u007f-\u009f]/u.test(value)
+    ) {
+      throw new SessionKernelLoopError(
+        'session_kernel_run_cancellation_identity_invalid',
+        `${field} is not a bounded exact identity.`
+      );
+    }
+  }
+  if (!/^sha256:[0-9a-f]{64}$/u.test(input.callerRequestDigest)) {
+    throw new SessionKernelLoopError(
+      'session_kernel_run_cancellation_digest_invalid',
+      'callerRequestDigest is not a canonical SHA-256 digest.'
+    );
+  }
+}
+
+function requireExactRunCancellation(
+  cancellation: SessionRunCancellationV2,
+  input: SessionKernelRunCancelInputV2
+): void {
+  if (
+    cancellation.callerRequestId !== input.callerRequestId
+    || cancellation.callerRequestDigest !== input.callerRequestDigest
+    || cancellation.cancelOperationId !== input.cancelOperationId
+  ) {
+    throw new SessionKernelLoopError(
+      'session_kernel_run_cancellation_identity_conflict',
+      'Session Run cancellation is already bound to another caller or operation.'
+    );
+  }
+}
+
+function currentRunCancellation(
+  state: SessionKernelLoopStateV2,
+  input: SessionKernelRunCancelInputV2
+): SessionRunCancellationV2 {
+  const cancellation = state.runCancellation;
+  if (!cancellation) {
+    throw new SessionKernelLoopError(
+      'session_kernel_run_cancellation_missing',
+      'The durable Session Run cancellation disappeared during reconciliation.'
+    );
+  }
+  requireExactRunCancellation(cancellation, input);
+  return cancellation;
+}
+
+function cancellationFacts(
+  state: SessionKernelLoopStateV2
+): SessionKernelRunCancelResultV2['facts'] {
+  if (
+    !sessionKernelFactsCaughtUpV2(state.lineage)
+    || sessionKernelFactBarriersPendingV2(state)
+  ) {
+    throw new SessionKernelLoopError(
+      'session_kernel_run_cancellation_facts_unsettled',
+      'Session Run cancellation facts are not canonical and caught up.'
+    );
+  }
+  return {
+    afterLedgerSequence: state.lineage.cursor.afterLedgerSequence,
+    snapshotHighWater: state.lineage.cursor.snapshotHighWater,
+    runSequenceHighWater: state.lineage.factCount,
+    caughtUp: true,
+    pendingFactBarrierCount: 0,
+  };
+}
+
+function completedRunCancellation(
+  cancellation: SessionRunCancellationV2,
+  controlEpoch: number
+): SessionKernelRunCancelResultV2 {
+  if (
+    cancellation.status !== 'projected'
+    || !cancellation.cancellation
+    || !cancellation.facts
+    || !cancellation.projection
+  ) {
+    throw new SessionKernelLoopError(
+      'session_kernel_run_cancellation_incomplete',
+      'Session Run cancellation has not reached its durable terminal projection.'
+    );
+  }
+  return {
+    callerRequestId: cancellation.callerRequestId,
+    callerRequestDigest: cancellation.callerRequestDigest,
+    cancelOperationId: cancellation.cancelOperationId,
+    controlEpoch,
+    cancellation: cloneJson(cancellation.cancellation),
+    facts: cloneJson(cancellation.facts),
+    projection: cloneJson(cancellation.projection),
+  };
 }
 
 function activeInvocationId(

@@ -118,9 +118,19 @@ export class SessionKernelPublicRequestsV2 {
    * fences are never aborted or replaced with a new identity.
    */
   supersedeForUserInput(): Promise<void> {
+    return this.supersedeForAuthorityTransition('userInput');
+  }
+
+  supersedeForRunCancellation(): Promise<void> {
+    return this.supersedeForAuthorityTransition('userRequested');
+  }
+
+  private supersedeForAuthorityTransition(
+    reason: 'userInput' | 'userRequested'
+  ): Promise<void> {
     const barriers = [
-      this.supersedeTransportAttempt('effect'),
-      this.supersedeTransportAttempt('query'),
+      this.supersedeTransportAttempt('effect', reason),
+      this.supersedeTransportAttempt('query', reason),
     ].filter(
       (barrier): barrier is Promise<void> => Boolean(barrier)
     );
@@ -303,13 +313,14 @@ export class SessionKernelPublicRequestsV2 {
   }
 
   private supersedeTransportAttempt(
-    lane: 'effect' | 'query'
+    lane: 'effect' | 'query',
+    reason: 'userInput' | 'userRequested'
   ): Promise<void> | undefined {
     const attempt = this.inFlight.get(lane);
     if (!attempt) return undefined;
     if (attempt.phase === 'preparing') {
       attempt.superseded = true;
-      attempt.controller.abort('userInput');
+      attempt.controller.abort(reason);
       return attempt.preparingSettled.then(() => {
         attempt.resolveTransportSuperseded();
         this.detachSupersededAttempt(lane, attempt);
@@ -317,7 +328,7 @@ export class SessionKernelPublicRequestsV2 {
     }
     if (attempt.phase === 'transport') {
       attempt.superseded = true;
-      attempt.controller.abort('userInput');
+      attempt.controller.abort(reason);
       attempt.resolveTransportSuperseded();
       this.detachSupersededAttempt(lane, attempt);
       return Promise.resolve();
@@ -695,6 +706,29 @@ function applyPublicRequestOutcome(
       });
       break;
     case 'invocationCancel':
+      if (record.intent.kind !== 'invocationCancel') {
+        throw new SessionKernelPublicRequestError(
+          'session_kernel_public_outcome_kind_mismatch',
+          'Invocation cancellation outcome lost its persisted request correlation.'
+        );
+      }
+      if (record.intent.payload.reasonCode === 'userRequested') {
+        const cancellation = state.runCancellation;
+        if (
+          !cancellation
+          || cancellation.invocationCancelRequestId
+            !== record.requestId
+        ) {
+          throw new SessionKernelPublicRequestError(
+            'session_kernel_run_cancellation_identity_mismatch',
+            'User-requested Kernel cancellation does not match the durable Session Run cancellation.'
+          );
+        }
+        cancellation.cancellation = JSON.parse(
+          JSON.stringify(outcome.reply)
+        ) as InvocationCancelReplyV2;
+        cancellation.status = 'kernelSettled';
+      }
       if (
         outcome.reply.kind === 'requested'
         || outcome.reply.kind === 'alreadyRequested'

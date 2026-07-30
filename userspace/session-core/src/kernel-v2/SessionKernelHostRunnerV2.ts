@@ -2,12 +2,15 @@ import type { CapabilityScopePreviewReplyV2 } from '@deepcode/protocol';
 import {
   SessionKernelLoopV2,
   type SessionKernelLoopV2Options,
+  type SessionKernelRunCancelInputV2,
+  type SessionKernelRunCancelResultV2,
 } from './SessionKernelLoopV2.js';
 import {
   sessionKernelLoopPortsFromHostV2,
   type SessionKernelHostAdaptersV2,
 } from './SessionKernelHostAdaptersV2.js';
 import type {
+  SessionKernelStoredOperationResultV2,
   SessionKernelStoredOperationResultRefV2,
 } from './ports.js';
 import type { SessionKernelLoopStateV2 } from './state.js';
@@ -118,6 +121,18 @@ export class SessionKernelHostRunnerV2 {
       operationRequestId,
       result
     );
+  }
+
+  loadOperationResult(
+    operationRequestId: string
+  ): Promise<SessionKernelStoredOperationResultV2 | undefined> {
+    return this.loop.loadOperationResult(operationRequestId);
+  }
+
+  cancelRun(
+    input: SessionKernelRunCancelInputV2
+  ): Promise<SessionKernelRunCancelResultV2> {
+    return this.loop.cancelRun(input);
   }
 
   async runInitialTurn(

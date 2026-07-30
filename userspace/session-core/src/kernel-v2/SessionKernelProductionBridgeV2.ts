@@ -1,5 +1,6 @@
 import type {
   CapabilityScopePreviewReplyV2,
+  InvocationCancelReplyV2,
 } from '@deepcode/protocol';
 import {
   canonicalJson,
@@ -200,6 +201,15 @@ export interface SessionKernelProductionFinalizeReviewV2 {
   };
 }
 
+export interface SessionKernelProductionCancelRunV2 {
+  kind: 'cancelRun';
+  data: {
+    callerRequestId: string;
+    callerRequestDigest: string;
+    cancelOperationId: string;
+  };
+}
+
 export type SessionKernelProductionOperationV2 =
   | SessionKernelProductionInitialTurnV2
   | SessionKernelProductionResumePlanActionV2
@@ -212,7 +222,8 @@ export type SessionKernelProductionOperationV2 =
   | SessionKernelProductionObserveCapabilityDecisionV2
   | SessionKernelProductionReconcileWakeV2
   | SessionKernelProductionReconcileFactsV2
-  | SessionKernelProductionFinalizeReviewV2;
+  | SessionKernelProductionFinalizeReviewV2
+  | SessionKernelProductionCancelRunV2;
 
 /**
  * Exact safe JSON sent by the Rust Host over stdin. The run capability is
@@ -307,6 +318,25 @@ export type SessionKernelProductionOutcomeV2 =
   | {
       kind: 'reviewFinalized';
       review: SessionKernelReviewV2;
+    }
+  | {
+      kind: 'runCancelled';
+      callerRequestId: string;
+      callerRequestDigest: string;
+      cancelOperationId: string;
+      controlEpoch: number;
+      cancellation: InvocationCancelReplyV2;
+      facts: {
+        afterLedgerSequence: number;
+        snapshotHighWater: number;
+        runSequenceHighWater: number;
+        caughtUp: true;
+        pendingFactBarrierCount: 0;
+      };
+      projection: {
+        projectionId: string;
+        projectionDigest: string;
+      };
     };
 
 export interface SessionKernelProductionStoredResultV2 {
@@ -411,6 +441,12 @@ export type SessionKernelProductionContinuationV2 =
       kind: 'terminalReview';
       reviewRevision: number;
       snapshotHighWater: number;
+    }
+  | {
+      kind: 'terminalRunCancelled';
+      cancelOperationId: string;
+      projectionId: string;
+      projectionDigest: string;
     };
 
 export interface SessionKernelProductionSuccessV2 {
@@ -516,6 +552,12 @@ export class SessionKernelProductionActorV2 {
   private inputTransitionTail: Promise<void> = Promise.resolve();
   private userInputDrain: Promise<void> = Promise.resolve();
   private activeOrdinary?: SessionKernelProductionActiveOperationV2;
+  private terminalCancellation?: {
+    operationRequestId: string;
+    callerRequestId: string;
+    callerRequestDigest: string;
+    cancelOperationId: string;
+  };
   private operationSequence = 0;
   private authorityGeneration = 0;
   private accessSequence = 0;
@@ -622,6 +664,10 @@ export class SessionKernelProductionActorV2 {
     }
     try {
       this.requireActorIdentity(request);
+      requireCancelFrameCorrelation(
+        frame.operationRequestId,
+        request.operation
+      );
     } catch (error) {
       return this.storeReceipt(
         frame.operationRequestId,
@@ -640,10 +686,14 @@ export class SessionKernelProductionActorV2 {
       this.authorityGeneration;
     let execution: Promise<SessionKernelProductionSuccessV2>;
     try {
-      execution = this.schedule(request, {
+      execution = this.schedule(
+        request,
+        frame.operationRequestId,
+        {
         operationGeneration,
         authorityGeneration,
-      });
+        }
+      );
     } catch (error) {
       execution = Promise.reject(error);
     }
@@ -652,7 +702,8 @@ export class SessionKernelProductionActorV2 {
         settleResponseFrameDurably(
           frame.operationRequestId,
           result,
-          this.activeRunner
+          this.activeRunner,
+          request.operation.kind === 'cancelRun'
         )
       )
       .catch((error: unknown) =>
@@ -676,12 +727,29 @@ export class SessionKernelProductionActorV2 {
 
   private schedule(
     request: SessionKernelProductionRequestV2,
+    operationRequestId: string,
     generation: {
       operationGeneration: number;
       authorityGeneration: number;
     }
   ): Promise<SessionKernelProductionSuccessV2> {
     const runner = this.runnerFor(request);
+    if (request.operation.kind === 'cancelRun') {
+      return this.scheduleCancelRun(
+        runner,
+        {
+          ...request,
+          operation: request.operation,
+        },
+        operationRequestId,
+        generation.operationGeneration
+      );
+    }
+    if (this.terminalCancellation) {
+      throw new SessionKernelProductionBridgeError(
+        'session_kernel_production_run_cancelled'
+      );
+    }
     if (request.operation.kind === 'userInput') {
       return this.scheduleUserInput(
         runner,
@@ -700,6 +768,11 @@ export class SessionKernelProductionActorV2 {
     const execution = predecessor.then(async () => {
       await this.userInputDrain;
       const activeRunner = await runner;
+      if (activeRunner.snapshot().runCancellation) {
+        throw new SessionKernelProductionBridgeError(
+          'session_kernel_production_run_cancelled'
+        );
+      }
       if (
         generation.authorityGeneration
           !== this.authorityGeneration
@@ -783,6 +856,128 @@ export class SessionKernelProductionActorV2 {
     return execution;
   }
 
+  private scheduleCancelRun(
+    runner: Promise<SessionKernelHostRunnerV2>,
+    request: SessionKernelProductionRequestV2 & {
+      operation: SessionKernelProductionCancelRunV2;
+    },
+    operationRequestId: string,
+    operationGeneration: number
+  ): Promise<SessionKernelProductionSuccessV2> {
+    const identity = {
+      operationRequestId,
+      ...request.operation.data,
+    };
+    if (
+      this.terminalCancellation
+      && JSON.stringify(this.terminalCancellation)
+        !== JSON.stringify(identity)
+    ) {
+      throw new SessionKernelProductionBridgeError(
+        'session_kernel_production_run_cancellation_conflict'
+      );
+    }
+    this.terminalCancellation = identity;
+    const authorityGeneration = ++this.authorityGeneration;
+    this.markActiveOrdinarySuperseded('userRequested');
+    const predecessor = this.inputTransitionTail;
+    const transition = predecessor.then(async () => {
+      const activeRunner = await runner;
+      const durableCancellation =
+        activeRunner.snapshot().runCancellation;
+      if (durableCancellation) {
+        const durableIdentity = {
+          operationRequestId:
+            durableCancellation.cancelOperationId,
+          callerRequestId:
+            durableCancellation.callerRequestId,
+          callerRequestDigest:
+            durableCancellation.callerRequestDigest,
+          cancelOperationId:
+            durableCancellation.cancelOperationId,
+        };
+        this.terminalCancellation = durableIdentity;
+        if (
+          JSON.stringify(durableIdentity)
+            !== JSON.stringify(identity)
+        ) {
+          throw new SessionKernelProductionBridgeError(
+            'session_kernel_production_run_cancellation_conflict'
+          );
+        }
+      }
+      const stored = await activeRunner.loadOperationResult(
+        operationRequestId
+      );
+      if (stored) {
+        return {
+          activeRunner,
+          stored: decodeStoredRunCancellationSuccess(
+            stored.result,
+            request,
+            operationRequestId
+          ),
+        };
+      }
+      const causalState = activeRunner.snapshot();
+      const cancellation = await activeRunner.cancelRun(
+        request.operation.data
+      );
+      return {
+        activeRunner,
+        causalState,
+        outcome: {
+          kind: 'runCancelled',
+          ...cancellation,
+        } satisfies SessionKernelProductionOutcomeV2,
+      };
+    });
+    this.inputTransitionTail = transition.then(
+      () => undefined,
+      () => undefined
+    );
+    this.userInputDrain = this.inputTransitionTail;
+    const execution = transition.then((settled) => {
+      if ('stored' in settled && settled.stored) {
+        return settled.stored;
+      }
+      return buildProductionSuccess(
+        settled.activeRunner,
+        request,
+        {
+          operationGeneration,
+          authorityGeneration,
+          causalState: settled.causalState,
+          superseded: false,
+        },
+        settled.outcome
+      );
+    });
+    return execution.catch((error: unknown) => {
+      const durableCancellation =
+        this.runnerSnapshot()?.runCancellation;
+      if (durableCancellation) {
+        this.terminalCancellation = {
+          operationRequestId:
+            durableCancellation.cancelOperationId,
+          callerRequestId:
+            durableCancellation.callerRequestId,
+          callerRequestDigest:
+            durableCancellation.callerRequestDigest,
+          cancelOperationId:
+            durableCancellation.cancelOperationId,
+        };
+      } else if (
+        this.terminalCancellation
+        && JSON.stringify(this.terminalCancellation)
+          === JSON.stringify(identity)
+      ) {
+        this.terminalCancellation = undefined;
+      }
+      throw error;
+    });
+  }
+
   private scheduleUserInput(
     runner: Promise<SessionKernelHostRunnerV2>,
     request: SessionKernelProductionRequestV2 & {
@@ -796,12 +991,20 @@ export class SessionKernelProductionActorV2 {
     const predecessor = this.inputTransitionTail;
     const transition = predecessor.then(async () => {
       const activeRunner = await runner;
+      if (
+        this.terminalCancellation
+        || activeRunner.snapshot().runCancellation
+      ) {
+        throw new SessionKernelProductionBridgeError(
+          'session_kernel_production_run_cancelled'
+        );
+      }
       const fenceGeneration =
         await activeRunner.persistUserInputBeforeFence(
           request.operation.data.input
         );
       const authorityGeneration = ++this.authorityGeneration;
-      this.markActiveOrdinarySuperseded();
+      this.markActiveOrdinarySuperseded('userInput');
       this.ordinaryTail = Promise.resolve();
       await activeRunner.applyFencedUserInput(
         request.operation.data.input,
@@ -840,6 +1043,23 @@ export class SessionKernelProductionActorV2 {
           }
         );
       }
+      if (
+        input.authorityGeneration !== this.authorityGeneration
+        || this.terminalCancellation
+      ) {
+        return buildProductionSuccess(
+          input.activeRunner,
+          request,
+          {
+            ...context,
+            superseded: true,
+          },
+          {
+            kind: 'userInputSuperseded',
+            inputId: request.operation.data.input.inputId,
+          }
+        );
+      }
       const result =
         await input.activeRunner.runUserInputProviderTurn(
           request.operation.data.guidance
@@ -861,14 +1081,16 @@ export class SessionKernelProductionActorV2 {
     return execution;
   }
 
-  private markActiveOrdinarySuperseded(): void {
+  private markActiveOrdinarySuperseded(
+    reason: 'userInput' | 'userRequested'
+  ): void {
     const active = this.activeOrdinary;
     const turn = this.runnerSnapshot()?.providerTurn;
     if (!active) {
       return;
     }
     active.superseded = true;
-    active.controller.abort('userInput');
+    active.controller.abort(reason);
     if (turn?.status === 'active') {
       active.supersededProviderTurnId = turn.providerTurnId;
     }
@@ -1219,6 +1441,10 @@ async function executeProductionOperation(
       throw new SessionKernelProductionBridgeError(
         'session_kernel_production_user_input_actor_lane_required'
       );
+    case 'cancelRun':
+      throw new SessionKernelProductionBridgeError(
+        'session_kernel_production_run_cancellation_actor_lane_required'
+      );
     case 'replan':
       return {
         kind: 'replanResult',
@@ -1353,11 +1579,31 @@ export function decodeSessionKernelProductionRequestFrameV2(
   value: unknown
 ): SessionKernelProductionRequestFrameV2 {
   const envelope = decodeProductionRequestFrameEnvelope(value);
+  const request =
+    decodeSessionKernelProductionRequestV2(envelope.request);
+  requireCancelFrameCorrelation(
+    envelope.operationRequestId,
+    request.operation
+  );
   return {
     schemaVersion: SESSION_KERNEL_PRODUCTION_REQUEST_FRAME_V2_SCHEMA,
     operationRequestId: envelope.operationRequestId,
-    request: decodeSessionKernelProductionRequestV2(envelope.request),
+    request,
   };
+}
+
+function requireCancelFrameCorrelation(
+  operationRequestId: string,
+  operation: SessionKernelProductionOperationV2
+): void {
+  if (
+    operation.kind === 'cancelRun'
+    && operation.data.cancelOperationId !== operationRequestId
+  ) {
+    throw invalidProductionRequest(
+      'session_kernel_production_run_cancellation_identity_mismatch'
+    );
+  }
 }
 
 function decodeProductionRequestFrameEnvelope(
@@ -1859,9 +2105,253 @@ function decodeOperation(
       },
     };
   }
+  if (tagged.kind === 'cancelRun') {
+    const body = exactObject(
+      data,
+      [
+        'callerRequestId',
+        'callerRequestDigest',
+        'cancelOperationId',
+      ]
+    );
+    return {
+      kind: tagged.kind,
+      data: {
+        callerRequestId: identity(
+          body.callerRequestId,
+          'callerRequestId'
+        ),
+        callerRequestDigest: sha256Digest(
+          body.callerRequestDigest,
+          'callerRequestDigest'
+        ),
+        cancelOperationId: identity(
+          body.cancelOperationId,
+          'cancelOperationId'
+        ),
+      },
+    };
+  }
   throw invalidProductionRequest(
     'session_kernel_production_operation_unsupported'
   );
+}
+
+function decodeStoredRunCancellationSuccess(
+  value: unknown,
+  request: SessionKernelProductionRequestV2 & {
+    operation: SessionKernelProductionCancelRunV2;
+  },
+  operationRequestId: string
+): SessionKernelProductionSuccessV2 {
+  const response = exactObject(
+    value,
+    [
+      'schemaVersion',
+      'ok',
+      'sessionId',
+      'hostRunId',
+      'runId',
+      'operationGeneration',
+      'authorityGeneration',
+      'operationKind',
+      'causalState',
+      'state',
+      'outcome',
+      'continuation',
+    ]
+  );
+  const outcome = exactObject(
+    response.outcome,
+    [
+      'kind',
+      'callerRequestId',
+      'callerRequestDigest',
+      'cancelOperationId',
+      'controlEpoch',
+      'cancellation',
+      'facts',
+      'projection',
+    ]
+  );
+  const projection = exactObject(
+    outcome.projection,
+    ['projectionId', 'projectionDigest']
+  );
+  const continuation = exactObject(
+    response.continuation,
+    [
+      'kind',
+      'cancelOperationId',
+      'projectionId',
+      'projectionDigest',
+    ]
+  );
+  const facts = exactObject(
+    outcome.facts,
+    [
+      'afterLedgerSequence',
+      'snapshotHighWater',
+      'runSequenceHighWater',
+      'caughtUp',
+      'pendingFactBarrierCount',
+    ]
+  );
+  const data = request.operation.data;
+  if (
+    response.schemaVersion !== SESSION_KERNEL_PRODUCTION_RESPONSE_V2_SCHEMA
+    || response.ok !== true
+    || response.sessionId !== request.sessionId
+    || response.hostRunId !== request.hostRunId
+    || response.runId !== request.runId
+    || response.operationKind !== 'cancelRun'
+    || !Number.isSafeInteger(response.operationGeneration)
+    || Number(response.operationGeneration) < 1
+    || !Number.isSafeInteger(response.authorityGeneration)
+    || Number(response.authorityGeneration) < 1
+    || outcome.kind !== 'runCancelled'
+    || outcome.callerRequestId !== data.callerRequestId
+    || outcome.callerRequestDigest !== data.callerRequestDigest
+    || outcome.cancelOperationId !== operationRequestId
+    || !Number.isSafeInteger(outcome.controlEpoch)
+    || Number(outcome.controlEpoch) < 1
+    || facts.caughtUp !== true
+    || facts.pendingFactBarrierCount !== 0
+    || !storedHighWater(facts.afterLedgerSequence)
+    || !storedHighWater(facts.snapshotHighWater)
+    || !storedHighWater(facts.runSequenceHighWater)
+    || continuation.kind !== 'terminalRunCancelled'
+    || continuation.cancelOperationId !== operationRequestId
+    || continuation.projectionId !== projection.projectionId
+    || continuation.projectionDigest !== projection.projectionDigest
+  ) {
+    throw new SessionKernelProductionBridgeError(
+      'session_kernel_production_stored_run_cancellation_invalid'
+    );
+  }
+  identity(projection.projectionId, 'projectionId');
+  sha256Digest(projection.projectionDigest, 'projectionDigest');
+  decodeStoredInvocationCancelReply(
+    outcome.cancellation,
+    request.runId,
+    Number(outcome.controlEpoch)
+  );
+  assertNoTransportCapabilities(response);
+  return cloneJson(
+    response
+  ) as unknown as SessionKernelProductionSuccessV2;
+}
+
+function decodeStoredInvocationCancelReply(
+  value: unknown,
+  runId: string,
+  controlEpoch: number
+): InvocationCancelReplyV2 {
+  const reply = exactObject(value, ['kind', 'data']);
+  if (
+    reply.kind === 'requested'
+    || reply.kind === 'alreadyRequested'
+  ) {
+    const data = exactObject(
+      reply.data,
+      ['cancelRequestId', 'invocationId', 'factId', 'ledgerSequence']
+    );
+    if (
+      !Number.isSafeInteger(data.ledgerSequence)
+      || Number(data.ledgerSequence) < 1
+    ) {
+      throw new SessionKernelProductionBridgeError(
+        'session_kernel_production_stored_run_cancellation_invalid'
+      );
+    }
+    return {
+      kind: reply.kind,
+      data: {
+        cancelRequestId: identity(
+          data.cancelRequestId,
+          'cancelRequestId'
+        ),
+        invocationId: identity(data.invocationId, 'invocationId'),
+        factId: identity(data.factId, 'factId'),
+        ledgerSequence: Number(data.ledgerSequence),
+      },
+    };
+  }
+  if (reply.kind === 'noActiveInvocation') {
+    const data = exactObject(
+      reply.data,
+      ['runId', 'controlEpoch']
+    );
+    if (
+      data.runId !== runId
+      || data.controlEpoch !== controlEpoch
+    ) {
+      throw new SessionKernelProductionBridgeError(
+        'session_kernel_production_stored_run_cancellation_invalid'
+      );
+    }
+    return {
+      kind: reply.kind,
+      data: { runId, controlEpoch },
+    };
+  }
+  if (reply.kind === 'alreadyTerminal') {
+    const data = exactObject(
+      reply.data,
+      ['invocationId', 'terminalFactId', 'terminalPhase']
+    );
+    const phases = new Set([
+      'attemptPrepared',
+      'executing',
+      'failedBeforeEffect',
+      'cancelledBeforeEffect',
+      'timedOutBeforeEffect',
+      'completed',
+      'failedAfterObservedEffect',
+      'indeterminate',
+    ] as const);
+    if (
+      typeof data.terminalPhase !== 'string'
+      || !phases.has(
+        data.terminalPhase as
+          | 'attemptPrepared'
+          | 'executing'
+          | 'failedBeforeEffect'
+          | 'cancelledBeforeEffect'
+          | 'timedOutBeforeEffect'
+          | 'completed'
+          | 'failedAfterObservedEffect'
+          | 'indeterminate'
+      )
+    ) {
+      throw new SessionKernelProductionBridgeError(
+        'session_kernel_production_stored_run_cancellation_invalid'
+      );
+    }
+    return {
+      kind: reply.kind,
+      data: {
+        invocationId: identity(data.invocationId, 'invocationId'),
+        terminalFactId: identity(
+          data.terminalFactId,
+          'terminalFactId'
+        ),
+        terminalPhase:
+          data.terminalPhase as
+            Extract<
+              InvocationCancelReplyV2,
+              { kind: 'alreadyTerminal' }
+            >['data']['terminalPhase'],
+      },
+    };
+  }
+  throw new SessionKernelProductionBridgeError(
+    'session_kernel_production_stored_run_cancellation_invalid'
+  );
+}
+
+function storedHighWater(value: unknown): boolean {
+  return Number.isSafeInteger(value) && Number(value) >= 0;
 }
 
 function decodeGuidance(value: unknown): string[] {
@@ -1960,6 +2450,14 @@ function productionContinuation(
     return {
       kind: 'userInputSuperseded',
       inputId: outcome.inputId,
+    };
+  }
+  if (outcome.kind === 'runCancelled') {
+    return {
+      kind: 'terminalRunCancelled',
+      cancelOperationId: outcome.cancelOperationId,
+      projectionId: outcome.projection.projectionId,
+      projectionDigest: outcome.projection.projectionDigest,
     };
   }
   const planAction = planActionContinuationContext(
@@ -2819,13 +3317,16 @@ function settleResponseFrame(
 async function settleResponseFrameDurably(
   operationRequestId: string,
   response: SessionKernelProductionSuccessV2,
-  runner: SessionKernelHostRunnerV2 | undefined
+  runner: SessionKernelHostRunnerV2 | undefined,
+  forceStore = false
 ): Promise<SessionKernelProductionSettledFrameV2> {
   const direct = productionResponseFrame(
     operationRequestId,
     response
   );
   if (
+    !forceStore
+    &&
     direct.byteLength
       <= SESSION_KERNEL_PRODUCTION_MAX_FRAME_BYTES
   ) {
